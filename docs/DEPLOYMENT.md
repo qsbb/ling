@@ -166,6 +166,26 @@ docker logs ling-api-1 2>&1 | grep -E 'connector_(connected|disconnected|reconne
 docker logs ling-api-1 2>&1 | grep '"severity_text": "ERROR"'
 ```
 
+### 一轮对话的完整链路
+
+```
+turn_started → reply_decision_made → turn_completed
+                                   ↘ delivery_failed
+```
+
+| 事件 | 回答什么 |
+|---|---|
+| `turn_started` | 这轮什么时候开始、谁触发（web / connector）、用的哪个配置修订 |
+| `reply_decision_made` | 回不回、为什么（`skip_code` 受控枚举） |
+| `turn_completed` | 结束了没有、产出了几段、投递完整不完整（`outcome`） |
+| `delivery_failed` | 哪一段没送到、平台给的状态、是否可重试 |
+
+按 trace_id 串起来就是一条完整证据链：
+
+```bash
+docker logs ling-api-1 2>&1 | grep '<trace_id>' | grep -E 'turn_|delivery_'
+```
+
 「她为什么没回这条消息」查这一条：
 
 ```bash

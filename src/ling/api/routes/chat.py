@@ -447,6 +447,20 @@ async def send_turn(
             source_ref=f"msg:{user_msg.message_id}",
         )
 
+    emit_event(
+        logger,
+        logging.INFO,
+        event_name="turn_started",
+        message="轮次开始",
+        attributes={
+            "turn_id": turn.id,
+            "window_id": window.id,
+            "is_group": getattr(window, "visibility", "") == "group_scope",
+            "source": "web",
+            "config_revision": effective.revision,
+        },
+    )
+
     # 「她为什么没回」的唯一权威记录（Web 路径）。
     # 与连接器入站路径用同一个事件名与同一套受控 skip_code，
     # 这样"为什么没回"在两个入口的日志里是同一个查询。

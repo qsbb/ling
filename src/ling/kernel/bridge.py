@@ -317,6 +317,19 @@ class InboundBridge:
             client_turn_id=envelope.external_event_id,
             config_revision=effective.revision,
         )
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="turn_started",
+            message="轮次开始",
+            attributes={
+                "turn_id": turn.id,
+                "window_id": window.id,
+                "is_group": is_group,
+                "source": "connector",
+                "config_revision": effective.revision,
+            },
+        )
         user_row = await conversation.add_message(
             window.id,
             role="user",
@@ -347,6 +360,19 @@ class InboundBridge:
             source_account=f"{envelope.connector_instance}:{envelope.account_ref or ''}",
         )
         if not reply_text:
+            # 轮次跑完了却没产出文本：这是"她说不出话"，与"决定不说"不同。
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="turn_completed",
+                message="轮次结束但没有可交付文本",
+                attributes={
+                    "turn_id": turn.id,
+                    "outcome": "no_text",
+                    "turn_state": str(state),
+                    "is_group": is_group,
+                },
+            )
             return BridgeResult(
                 accepted=True,
                 reason=f"轮次结束但没有可交付文本（state={state}）",
@@ -364,6 +390,20 @@ class InboundBridge:
             text=reply_text,
             subject_id=subject_id,
             expression=expression or {},
+        )
+        emit_event(
+            logger,
+            logging.INFO if delivered else logging.WARNING,
+            event_name="turn_completed",
+            message="轮次完成" if delivered else "轮次完成但投递不完整",
+            attributes={
+                "turn_id": turn.id,
+                "outcome": "delivered" if delivered else "partial_delivery",
+                "turn_state": str(state),
+                "is_group": is_group,
+                "parts_total": parts_total,
+                "parts_sent": parts_sent,
+            },
         )
         return BridgeResult(
             accepted=True,
@@ -761,11 +801,25 @@ class InboundBridge:
             )
             # `delivered` 是**唯一**判据，不再在这里另写一种拼法
             if not outcome.delivered:
-                logger.info(
-                    "第 %d/%d 段未送达（%s），停止后续段",
-                    index,
-                    len(parts),
-                    outcome.detail or outcome.state,
+                # 「为什么没送达」的唯一权威记录：状态、错误码、第几段。
+                # 不记正文——投递失败不代表可以把内容抄进日志。
+                emit_event(
+                    logger,
+                    logging.WARNING,
+                    event_name="delivery_failed",
+                    message="这一段没送达，停止后续段",
+                    attributes={
+                        "channel": getattr(self._connector, "connector_id", ""),
+                        "delivery_state": str(getattr(outcome, "state", "")),
+                        "error_code": str(
+                            getattr(getattr(outcome, "receipt", None), "state", "") or ""
+                        ),
+                        "detail": (outcome.detail or "")[:200],
+                        "part_ordinal": index,
+                        "parts_total": len(parts),
+                        "retriable": bool(getattr(outcome, "retriable", False)),
+                        "is_group": is_group,
+                    },
                 )
                 break
             sent += 1
