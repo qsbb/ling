@@ -1,0 +1,84 @@
+[project]
+name = "ling"
+version = "0.1.0"
+description = "ling：独立的拟人化 AI 角色系统（会话优先）"
+readme = "README.md"
+requires-python = ">=3.12"
+# GNU AGPL-3.0-or-later（网络 copyleft）。
+#
+# 选它的目的只有一个：**不允许拿了之后不开源**。
+# 谁把它作为网络服务提供给别人用，就必须把自己的修改以同一许可公开。
+#
+# 注意：AGPL **不禁止商业使用**——商用是被允许的，前提是遵守开源义务。
+# 想闭源商用的必须另行取得商业授权（双许可，见 README「许可」一节）。
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "qsbb", email = "86879267+qsbb@users.noreply.github.com" }]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "sqlalchemy[asyncio]>=2.0.35,<2.1",
+  "asyncpg>=0.29,<1",
+  "aiosqlite>=0.20,<1",
+  "alembic>=1.13,<2",
+  "httpx>=0.27,<1",
+  "python-multipart>=0.0.9,<1",
+  "cryptography>=43,<47",
+  # OneBot 反向 WebSocket 入站（connectors/onebot/ws_client.py）。
+  # 原本靠 uvicorn[standard] 传递进来，但那是间接依赖——
+  # 哪天换个 server 实现就会静默消失。
+  "websockets>=12,<18",
+  # 动图拆帧（domains/media/describe.py）。视觉接口对 GIF 通常只取第一帧，
+  # 而第一帧经常是片头/黑场——不拆帧就会出现"她看了动图说这是黑色图片"。
+  "pillow>=10,<14",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.6,<1",
+  "mypy>=1.11,<2",
+]
+# 本地开发/CI 使用的便携 PostgreSQL（无 Docker 时的真实数据库测试）
+# 便携 PostgreSQL 由 scripts/dev_pg.sh 在 Python 3.11 侧 venv 安装（pgserver 无 cp313 wheel）
+
+[project.scripts]
+ling-api = "ling.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ling", "connectors"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+markers = [
+  "w0_web: W0 Web 定向回归（允许在任何阶段运行）",
+  "w1_qq: W1 QQ 专项（W3 之前不得运行）",
+  "w2_module: W2 模块专项（W3 之前不得运行）",
+]
+# 默认排除 W1/W2 专项：避免无筛选的全量 pytest 顺带执行未获准用例。
+# W3 时用 -m "w1_qq or w2_module" 显式启动。
+addopts = "-q -m 'not w1_qq and not w2_module'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008", "E501"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["ling"]
+ignore_missing_imports = true
+warn_unused_ignores = false

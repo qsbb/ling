@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# --- Node ---
+node_modules/
+dist/
+.vite/
+playwright-report/
+test-results/
+blob-report/
+
+# --- 本地运行数据（绝不入库）---
+.data/
+*.sqlite3
+*.db
+logs/
+.run/
+
+# --- 密钥与本地配置 ---
+.env
+.env.*
+!.env.example
+secrets/
+deploy/secrets/*
+
+# --- 并行工作树 ---
+.worktrees/
+
+# --- 编辑器/系统 ---
+.DS_Store
+.idea/
+.vscode/
+
+# 证书与密钥文件：绝不允许入库
+*.pem
+*.key
+deploy/certs/
+# E2E 截图产物
+shots/

@@ -1,0 +1,26 @@
+.git
+.worktrees
+node_modules
+**/node_modules
+.venv
+**/.venv
+dist
+**/dist
+__pycache__
+**/__pycache__
+.pytest_cache
+.data
+logs
+.env
+.env.*
+!.env.example
+playwright-report
+test-results
+docs
+evals
+tests
+
+# macOS 在 tar/复制时生成的 AppleDouble 元数据文件（._xxx），
+# 会被 Alembic 当成迁移脚本加载并因 null 字节报错。
+**/._*
+._*
