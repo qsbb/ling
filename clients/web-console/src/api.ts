@@ -32,6 +32,7 @@ import type {
   MergeResult,
   UnmergeResult,
   UserInfo,
+  DashboardResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -174,6 +175,9 @@ export const api = {
   /* ------------------------------------------------------------ 认证 */
   me(): Promise<AuthResponse> {
     return request<AuthResponse>('/v1/auth/me');
+  },
+  dashboard(): Promise<DashboardResponse> {
+    return request<DashboardResponse>('/v1/dashboard');
   },
   changePassword(current: string, next: string): Promise<void> {
     return request<void>('/v1/auth/password', jsonInit('POST', { current, new: next }));

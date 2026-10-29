@@ -425,3 +425,25 @@ export interface UnmergeResult {
   was_merged_into?: string;
   restored_memories: number;
 }
+
+export type DashboardStatus = 'ok' | 'empty' | 'unavailable';
+
+export interface DashboardSection {
+  status: DashboardStatus;
+  as_of: string;
+  data?: Record<string, unknown> | null;
+}
+
+export interface DashboardResponse {
+  schema_version: string;
+  generated_at: string;
+  timezone: string;
+  sections: {
+    activity: DashboardSection;
+    affect: DashboardSection;
+    proactive: DashboardSection;
+    memories: DashboardSection;
+    relationship: DashboardSection;
+    connectivity: DashboardSection;
+  };
+}

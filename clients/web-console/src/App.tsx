@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api';
 import { ChatPage } from './components/ChatPage';
 import { ChangePasswordView } from './components/ChangePasswordView';
+import { DashboardPage } from './components/DashboardPage';
 import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
 import { DialoguePage } from './components/DialoguePage';
@@ -51,6 +52,8 @@ export default function App() {
 
   const handleLogin = (response: AuthResponse) => {
     setAuth({ status: 'authenticated', user: response.user, testMode: response.test_mode });
+    // 登录后先给总览，而不是直接把聊天框推到人脸上
+    navigate('/dashboard');
   };
 
   const handleLogout = useCallback(() => {
@@ -59,7 +62,7 @@ export default function App() {
       .catch(() => undefined)
       .finally(() => {
         setAuth({ status: 'anonymous' });
-        navigate(routePath({ name: 'chat', sessionId: null }));
+        navigate('/dashboard');
       });
   }, []);
 
@@ -100,6 +103,10 @@ export default function App() {
     setSidebarOpen(false);
     navigate(routePath({ name: 'chat', sessionId: null }));
   };
+  const goDashboard = () => {
+    setSidebarOpen(false);
+    navigate('/dashboard');
+  };
 
   // 首次安装的随机口令还没改：整页接管，不给任何绕过入口。
   // 后端也会在改密前对所有 /v1/auth/* 之外的请求返回 403，这里是同一件事的两侧。
@@ -125,7 +132,13 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        {route.name === 'chat' ? (
+        {route.name === 'dashboard' ? (
+          <DashboardPage
+            onOpenNow={goLife}
+            onOpenChat={goChat}
+            onOpenSettings={goSettings}
+          />
+        ) : route.name === 'chat' ? (
           <button
             type="button"
             className="icon-button app-header__menu"
@@ -141,6 +154,13 @@ export default function App() {
         </button>
         <div className="app-header__spacer" />
         <nav className="app-header__nav" aria-label="主导航">
+          <button
+            type="button"
+            className={`header-link ${route.name === 'dashboard' ? 'header-link--active' : ''}`}
+            onClick={goDashboard}
+          >
+            总览
+          </button>
           <button
             type="button"
             className={`header-link ${route.name === 'settings' ? 'header-link--active' : ''}`}

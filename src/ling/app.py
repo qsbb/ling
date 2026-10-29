@@ -296,6 +296,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
+    from ling.api.routes import dashboard as dashboard_routes
+
+    app.include_router(dashboard_routes.router, prefix="/v1")
     # W2 管理端点：已实现未测试；前端未开放入口，只供鉴权后的 API 使用
     app.include_router(manage.router, prefix="/v1")
     if settings.qq_enabled:

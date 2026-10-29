@@ -12,6 +12,7 @@
 import { useSyncExternalStore } from 'react';
 
 export type Route =
+  | { name: 'dashboard' }
   | { name: 'chat'; sessionId: string | null }
   | { name: 'now' }
   | { name: 'settings' }
@@ -26,6 +27,7 @@ export type Route =
 export function parseRoute(pathname: string): Route {
   const path = pathname.replace(/\/+$/, '') || '/';
   // 子路由必须先判，否则 /settings/model 会被 /settings 吃掉
+  if (path === '/dashboard') return { name: 'dashboard' };
   if (path === '/life') return { name: 'now' };
   if (path === '/settings/model') return { name: 'model' };
   if (path === '/settings/memory') return { name: 'memory' };
@@ -48,6 +50,8 @@ export function parseRoute(pathname: string): Route {
 
 export function routePath(route: Route): string {
   switch (route.name) {
+    case 'dashboard':
+      return '/dashboard';
     case 'now':
       return '/life';
     case 'settings':

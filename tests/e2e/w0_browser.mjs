@@ -79,6 +79,29 @@ async function login(page) {
     ).catch(() => {});
     await page.waitForTimeout(800);
   }
+
+  // 登录后默认落到「总览」（她此刻怎样），而这一组用例测的是聊天链路，
+  // 所以显式进聊天页。
+  //
+  // **用应用内导航（点 ling 标识），不要 page.goto**：goto 会整页重载，
+  // SPA 里已加载的会话列表全丢，composer 要等重新拉完才可用——实测
+  // 发送按钮 30 秒都点不到。点链接则只切路由。
+  // **不能用"有没有 textarea"判断是否在聊天页**：总览页上聊天组件仍挂在
+  // DOM 里（实测 3 个 textarea），判断会永远为假，于是停在不带发送按钮的
+  // 总览页，后续点击超时。用发送按钮本身作为信号。
+  if ((await page.locator('button[aria-label="发送消息"]').count()) === 0) {
+    const brand = page.locator('button.brand').first();
+    if (await brand.count()) await brand.click();
+    await page
+      .waitForFunction(() => !!document.querySelector('textarea'), { timeout: 20000 })
+      .catch(() => {});
+    // 等发送按钮真的可点（会话就绪之前它是 disabled）
+    await page
+      .waitForSelector('button[aria-label="发送消息"]:not([disabled])', { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
   const stillLogin = await page.locator('input[type="password"]').count();
   const hasComposer = await page.locator('textarea').count();
   return stillLogin === 0 && hasComposer > 0;
