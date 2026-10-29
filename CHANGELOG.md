@@ -8,6 +8,8 @@
 ### 新增
 - 审计日志与安全日志：`ling.audit` / `ling.security` 独立命名空间，
   配置发布、记忆撤回、授权变更、改密都留痕；账号标识只写 HMAC 哈希
+- 群聊轮询与主动联系的结构化事件：每个群窗口的结论（含"没回"）、
+  主动投递被门控的原因，都能只看日志回答
 - worker 启动时探测供应商可达性：连不上会明确报 `worker_provider_unreachable`
   并给出检查方向，不再只表现为"能力悄悄变差"
 - 轮次生命周期日志：`turn_started` / `turn_completed` / `delivery_failed`，

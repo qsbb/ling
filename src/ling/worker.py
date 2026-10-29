@@ -752,7 +752,13 @@ async def handle_proactive_dispatch(payload: dict) -> None:
     connector = proactive_connector()
     if connector is None:
         # 没有可用渠道时**什么都不做**，不标失败——这不是候选的问题。
-        logger.info("主动投递跳过：没有可主动推送的渠道")
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="proactive_dispatch_skipped",
+            message="主动投递跳过：没有可主动推送的渠道",
+            attributes={"reason_code": "no_proactive_channel"},
+        )
         return
 
     async with session_scope() as session:
@@ -770,14 +776,30 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             subject_timezone=settings.user_timezone,
         )
     if stats.get("skipped"):
-        logger.info("主动投递跳过：%s", stats["skipped"])
+        # 门控跳过要写清**为什么**：勿扰时段、日限额、没有会话…
+        # 这些是"她今天没主动找你"的全部原因，不记就只能猜。
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="proactive_dispatch_skipped",
+            message="主动投递被门控跳过",
+            attributes={
+                "reason_code": str(stats["skipped"])[:120],
+                "considered": stats.get("considered"),
+            },
+        )
     elif stats.get("sent") or stats.get("failed") or stats.get("rejected"):
-        logger.info(
-            "主动投递：发出 %s、失败 %s、无会话 %s（候选 %s）",
-            stats.get("sent"),
-            stats.get("failed"),
-            stats.get("rejected"),
-            stats.get("considered"),
+        emit_event(
+            logger,
+            logging.INFO if not stats.get("failed") else logging.WARNING,
+            event_name="proactive_dispatched",
+            message="主动投递完成",
+            attributes={
+                "sent": stats.get("sent"),
+                "failed": stats.get("failed"),
+                "rejected": stats.get("rejected"),
+                "considered": stats.get("considered"),
+            },
         )
 
 
@@ -796,7 +818,13 @@ async def handle_proactive_draft(payload: dict) -> None:
 
     router = _MEMORY_ROUTER
     if router is None:
-        logger.info("草稿生成跳过：模型路由未就绪")
+        emit_event(
+            logger,
+            logging.WARNING,
+            event_name="proactive_draft_skipped",
+            message="草稿生成跳过：模型路由未就绪",
+            attributes={"reason_code": "model_router_unavailable"},
+        )
         return
 
     settings = get_settings()
@@ -918,7 +946,13 @@ async def handle_attention_tick(payload: dict) -> None:
     shadow = bool(payload.get("shadow", True))
     router = _MEMORY_ROUTER
     if router is None:
-        logger.info("群聊轮询跳过：模型路由未就绪")
+        emit_event(
+            logger,
+            logging.WARNING,
+            event_name="attention_tick_skipped",
+            message="群聊轮询跳过：模型路由未就绪",
+            attributes={"reason_code": "model_router_unavailable"},
+        )
         return
 
     settings = get_settings()
@@ -971,19 +1005,40 @@ async def handle_attention_tick(payload: dict) -> None:
             baseline += result.baseline_calls
             if result.decision == "replied":
                 replied += 1
-                logger.info(
-                    "群聊轮询：窗口 %s 决定回应（影子=%s，未发送）", window_id, shadow
-                )
+            # **每个窗口都记一条**，包括"没回"。
+            # 只记"决定回应"的话，"她为什么在群里不吭声"就查不到了——
+            # 而那才是绝大多数情况。decision/reason 与私聊用同一套语义。
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="attention_window_polled",
+                message="群聊轮询：窗口决策完成",
+                attributes={
+                    "window_id": window_id,
+                    "decision": result.decision,
+                    "reason": result.reason or "",
+                    "unseen_count": result.unseen_count,
+                    "llm_calls": result.llm_calls,
+                    "baseline_calls": result.baseline_calls,
+                    "shadow": shadow,
+                },
+            )
 
-    if calls or baseline:
+    if polls or calls or baseline:
         saved = max(0, baseline - calls)
-        logger.info(
-            "群聊轮询：%d 个窗口，决策调用 %d 次（逐条基线 %d 次，省 %d），决定回应 %d 次",
-            polls,
-            calls,
-            baseline,
-            saved,
-            replied,
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="attention_tick_completed",
+            message="群聊轮询完成",
+            attributes={
+                "windows_polled": polls,
+                "llm_calls": calls,
+                "baseline_calls": baseline,
+                "saved_calls": saved,
+                "replied": replied,
+                "shadow": shadow,
+            },
         )
 
 

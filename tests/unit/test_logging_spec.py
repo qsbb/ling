@@ -288,3 +288,33 @@ async def test_unreachable_provider_is_reported_not_silent(monkeypatch) -> None:
     attrs = events[-1].attributes
     assert attrs["port"] == 1
     assert "hint" in attrs
+
+
+# ---------------------------------------------------------------- 群聊与主动
+
+
+def test_worker_emits_structured_attention_and_proactive_events() -> None:
+    """群聊轮询与主动联系必须有可检索的事件名。
+
+    这两条是"她为什么在群里不吭声""她今天为什么没主动找我"的唯一答案。
+    原来只有自然语言日志，而且"没回"的情况完全不记——而那才是绝大多数。
+    """
+    import inspect
+
+    from ling import worker
+
+    source = inspect.getsource(worker)
+    for event in (
+        "attention_window_polled",
+        "attention_tick_completed",
+        "attention_tick_skipped",
+        "proactive_dispatch_skipped",
+        "proactive_dispatched",
+        "proactive_draft_skipped",
+    ):
+        assert event in source, f"缺少事件 {event}"
+
+    # 每个窗口都要记，不能只在"决定回应"时记
+    assert "result.decision == \"replied\"" in source
+    idx = source.index("attention_window_polled")
+    assert idx > 0

@@ -203,6 +203,24 @@ docker logs ling-api-1 2>&1 | grep reply_decision_made | grep '"skip_code"'
 措辞在 `reason` 里，事实在 `skip_code` 里。同一个事件名在「连接器入站」与
 「Web 对话」两条路径都会发，所以一条查询就能覆盖两个入口。
 
+### 群聊轮询与主动联系
+
+| 事件 | 回答什么 |
+|---|---|
+| `attention_tick_completed` | 这轮刷了几个群、花了几次决策调用、省了几次、回了几个 |
+| `attention_window_polled` | **每个**群窗口的结论，包括"没回"（带 `decision` / `reason` / 未读数） |
+| `attention_tick_skipped` | 为什么整轮没跑（如模型路由未就绪） |
+| `proactive_dispatched` | 发了几条、失败几条、被拒几条 |
+| `proactive_dispatch_skipped` | 为什么没发（`reason_code`：勿扰/限额/没有可用渠道…） |
+| `proactive_draft_skipped` | 草稿为什么没生成 |
+
+```bash
+# 她今天为什么没在群里说话
+docker logs ling-worker-1 2>&1 | grep attention_window_polled | grep '"decision": "ignored"'
+# 她今天为什么没主动找我
+docker logs ling-worker-1 2>&1 | grep proactive_dispatch_skipped
+```
+
 ### 审计日志与安全日志（独立命名空间）
 
 | 命名空间 | 回答什么问题 | 典型事件 |
