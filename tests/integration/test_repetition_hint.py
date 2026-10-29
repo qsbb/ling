@@ -115,3 +115,22 @@ async def test_hint_actually_reaches_the_prompt(logged_in) -> None:
     joined = "\n".join(m.content for m in compiled.messages)
     assert "收尾" in joined, "重复提醒没有进到提示里"
     assert TAIL in joined
+
+
+async def test_paraphrased_catchphrase_is_still_caught() -> None:
+    """换了措辞的同一条口头禅也要抓到。
+
+    实测她不会原样重复，而是变着说法用同一条口头禅：
+    「朋友的朋友就是我的朋友。」/「朋友的朋友就是朋友，别客气呀。」
+    整句比对永远不触发——所以需要短语级检测 + 扩到最长公共子串。
+    """
+    from ling.capabilities.repetition import repetition_hint
+
+    paraphrased = [
+        "这天气适合溜达。\n朋友的朋友就是我的朋友，有空约饭呗？",
+        "正读冒险故事集呢。\n朋友的朋友就是我的朋友。",
+        "晚饭还没吃呢。\n朋友的朋友就是朋友，别客气呀。",
+    ]
+    hint = repetition_hint(paraphrased)
+    assert hint is not None, "换了措辞就漏了"
+    assert "朋友的朋友就是" in hint
