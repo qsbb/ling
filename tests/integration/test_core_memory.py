@@ -273,3 +273,42 @@ async def test_persona_traits_reach_the_context(logged_in: TestEnv) -> None:
     text = await _compile(logged_in, await _window(logged_in))
     assert "group_chat" in text, f"上下文里没有 traits：{text[:300]}"
     assert "群里看到感兴趣的就接一句" in text
+
+
+async def test_recall_pool_is_bounded(web_env, monkeypatch) -> None:
+    """召回候选查询必须带 LIMIT。
+
+    原来按 subject **无 LIMIT 全量取回**再在 Python 里算相关度：3 条记忆时
+    没问题，几千条就是每轮扫全表——成本随记忆总量线性增长，数据少时完全
+    看不出来。
+
+    **不能断言"返回条数 ≤ N"**：召回本身还有 limit 参数，去掉 SQL LIMIT
+    结果条数也不会超（第一版就这么写，负例照样绿）。所以直接抓那条 SQL，
+    断言里面真有 LIMIT。
+    """
+    from ling.contracts.v1 import Visibility
+    from ling.domains.memory import service as mem_mod
+    from ling.infra.db import session_scope
+
+    statements: list[str] = []
+    async with session_scope() as session:
+        svc = mem_mod.MemoryService(session)
+        original = session.execute
+
+        async def _capture(stmt, *a, **k):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if isinstance(stmt, object):
+                text = str(stmt)
+                if "memories" in text and "retracted" in text:
+                    statements.append(text)
+            return await original(stmt, *a, **k)
+
+        session.execute = _capture  # type: ignore[method-assign]
+        await svc.recall(
+            subject_id=web_env.subject_id,
+            query="任意",
+            visibility_allow={Visibility.subject_private},
+            limit=5,
+        )
+
+    assert statements, "没抓到召回查询"
+    assert any("LIMIT" in s.upper() for s in statements), "召回查询没有上界"

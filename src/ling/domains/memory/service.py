@@ -279,6 +279,11 @@ def _score(query_tokens: set[str], text: str, confidence: float) -> float:
     return round(jaccard * (0.5 + 0.5 * confidence), 6)
 
 
+# 召回候选池上界。取"最近更新的 N 条"再精排：既保住近期相关性，
+# 又让每轮成本与记忆总量解耦（原来是无 LIMIT 全量扫）。
+RECALL_CANDIDATE_LIMIT = 500
+
+
 class MemoryService:
     def __init__(
         self,
@@ -444,15 +449,22 @@ class MemoryService:
 
         subjects = await IdentityService(self._session).subject_group(subject_id)
 
+        # **必须有上界**。原实现按 subject 全量取回再在 Python 里算相关度：
+        # 记忆只有 3 条时看不出问题，涨到几千条就是每轮对话扫全表 + 全量 BM25。
+        # 这里按最近更新取一个候选池——真正的排序仍在下面做，
+        # 池子只是保证"每轮成本不随记忆总量增长"。
         rows = list(
             (
                 await self._session.execute(
-                    select(MemoryRow).where(
+                    select(MemoryRow)
+                    .where(
                         MemoryRow.subject_id.in_(list(subjects)),
                         MemoryRow.retracted.is_(False),
                         # 归档 = 保留期到期，不再参与检索（数据仍在，可审计）
                         MemoryRow.archived_at.is_(None),
                     )
+                    .order_by(MemoryRow.updated_at.desc())
+                    .limit(RECALL_CANDIDATE_LIMIT)
                 )
             ).scalars()
         )
