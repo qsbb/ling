@@ -99,6 +99,33 @@ async def change_password(
     return Response(status_code=204)
 
 
+class AccountBody(BaseModel):
+    current: str = Field(min_length=1, max_length=256)
+    username: str = Field(min_length=3, max_length=64)
+
+
+@router.patch("/auth/account")
+async def change_account(body: AccountBody, auth: CurrentAuth, session: DbSession) -> dict:
+    """改登录名。**要求当前口令**，改完吊销其它会话。
+
+    为什么不在 GET /v1/auth/me 里做：那是个只读探测，混进写操作会让
+    前端的"刷新登录态"变成有副作用的请求。
+    """
+    name = await IdentityService(session).change_username(
+        auth.user.id,
+        current=body.current,
+        username=body.username,
+        keep_token=auth.token,
+    )
+    audit_event(
+        "account_renamed",
+        actor=auth.user.id,
+        target_type="user",
+        target_id=auth.user.id,
+    )
+    return {"username": name}
+
+
 @router.post("/auth/logout")
 async def logout(
     auth: CurrentAuth, session: DbSession, response: Response, settings: SettingsDep

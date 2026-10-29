@@ -179,6 +179,13 @@ export const api = {
   dashboard(): Promise<DashboardResponse> {
     return request<DashboardResponse>('/v1/dashboard');
   },
+  changeAccount(current: string, username: string): Promise<{ username: string }> {
+    return request<{ username: string }>(
+      '/v1/auth/account',
+      jsonInit('PATCH', { current, username }),
+    );
+  },
+
   changePassword(current: string, next: string): Promise<void> {
     return request<void>('/v1/auth/password', jsonInit('POST', { current, new: next }));
   },

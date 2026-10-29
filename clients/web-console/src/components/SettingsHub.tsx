@@ -128,6 +128,20 @@ export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
         <button
           type="button"
           className="settings-hub__card"
+          onClick={() => onOpen('/settings/account')}
+          data-testid="open-account"
+        >
+          <span className="settings-hub__index">≡</span>
+          <span className="settings-hub__body">
+            <span className="settings-hub__label">登录名与密码</span>
+            <span className="settings-hub__verb">
+              改你自己的登录凭据；改完其它设备上的登录会失效
+            </span>
+          </span>
+        </button>
+        <button
+          type="button"
+          className="settings-hub__card"
           onClick={() => onOpen('/settings/identity')}
           data-testid="open-identity"
         >

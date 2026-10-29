@@ -97,6 +97,12 @@ class SceneView:
         return f"你此刻的状态：{label}{suffix}"
 
 
+# 与 ``view()`` 里判定 resting 的阈值**必须是同一个数**：
+# 低于它开始恢复精力，高于它继续衰减。两处漂开会出现"判定为累、
+# 却在扣精力"这种自相矛盾的状态。
+REST_RECOVER_THRESHOLD = 25
+
+
 class PresenceService:
     """生活状态的唯一写入方。"""
 
@@ -138,8 +144,15 @@ class PresenceService:
             last = last.replace(tzinfo=UTC)
         elapsed_hours = max(0.0, (now - last).total_seconds() / 3600.0) if last else 0.0
         if elapsed_hours > 0:
+            # 低精力时是**恢复**而不是继续衰减：没有这条，精力只减不增，
+            # 迟早卡在 resting 上永久不接话（见 REST_RECOVER_THRESHOLD 注释）。
+            rate = (
+                self._policy.energy_recover_per_hour
+                if float(row.energy) <= REST_RECOVER_THRESHOLD
+                else -self._policy.energy_decay_per_hour
+            )
             row.energy = _clamp(
-                float(row.energy) - self._policy.energy_decay_per_hour * elapsed_hours,
+                float(row.energy) + rate * elapsed_hours,
                 MIN_ENERGY,
                 MAX_ENERGY,
             )
@@ -167,7 +180,7 @@ class PresenceService:
         row = await self.settle(now=now)
         energy = int(row.energy)
         load = int(row.social_load)
-        if energy <= 25:
+        if energy <= REST_RECOVER_THRESHOLD:
             availability = "resting"
         elif energy <= 50 or load >= 75:
             availability = "low"

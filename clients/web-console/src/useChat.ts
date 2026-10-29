@@ -380,6 +380,20 @@ export function useChat(
             retriable: explained.retriable || finalState === 'failed',
             local: false,
           });
+        } else if (data.decision === 'silence' && !serverMessage && !accumulated) {
+          // 她选择不说话。**不能**留一个空气泡——那会渲染成「（无内容）」，
+          // 看起来像生成失败，和"她这次不想说"完全是两回事。
+          // 理由挂到用户那条消息上，界面上显示「她没回：<原因>」。
+          removeActor();
+          if (userKey) {
+            updateUser({
+              state: 'completed',
+              local: false,
+              silenceReason: data.decision_reason || '她这次没有开口',
+            });
+          }
+          setActiveTurn(null);
+          return;
         } else if (serverMessage) {
           updateActor({
             messageId: serverMessage.message_id,

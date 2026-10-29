@@ -270,6 +270,15 @@ export interface TurnFinalData {
   error?: ErrorPayload;
   retried?: boolean;
   replayed?: boolean;
+  /**
+   * `silence` 表示她**选择**不回（不是失败、也不是没收到）。
+   * 服务端此时给 `message: null`，前端不能就此画一个空气泡。
+   */
+  decision?: string;
+  decision_reason?: string;
+  decision_hard?: boolean;
+  model_status?: string;
+  silent_ack?: boolean;
 }
 
 /* ---------------------------------------------------------------- 设置分类法 */

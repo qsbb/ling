@@ -22,7 +22,8 @@ export type Route =
   | { name: 'life' }
   | { name: 'privacy' }
   | { name: 'persona' }
-  | { name: 'identity' };
+  | { name: 'identity' }
+  | { name: 'account' };
 
 export function parseRoute(pathname: string): Route {
   const path = pathname.replace(/\/+$/, '') || '/';
@@ -37,6 +38,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
   if (path === '/settings/identity') return { name: 'identity' };
+  if (path === '/settings/account') return { name: 'account' };
   const match = /^\/s\/([^/]+)$/.exec(path);
   if (match && match[1]) {
     try {
@@ -70,6 +72,8 @@ export function routePath(route: Route): string {
       return '/persona';
     case 'identity':
       return '/settings/identity';
+    case 'account':
+      return '/settings/account';
     case 'chat':
       return route.sessionId ? `/s/${encodeURIComponent(route.sessionId)}` : '/';
   }

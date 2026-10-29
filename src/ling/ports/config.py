@@ -67,6 +67,13 @@ class LifePolicy:
     scene_ttl_minutes: int = 15
     # 每小时消耗的精力（0-100 量表）。
     energy_decay_per_hour: float = 1.5
+    # 每小时**恢复**的精力：只在精力低到"该歇了"的时候生效。
+    #
+    # 没有这一项的话，精力只减不增，跑到一定小时数就永远是 resting，
+    # 于是她**永久不接话**——表现是"她突然不理我了"，日志里却只有
+    # 一条正常的 `skip_code=resting`。（实测开发库跑到第三天精力 18，
+    # 私聊被静默。）有了恢复项，状态变成一个循环：累了→歇→回血→能聊。
+    energy_recover_per_hour: float = 8.0
     # 每轮对话增加的社交负担。
     social_load_per_turn: float = 3.0
     # 每小时恢复的社交负担。

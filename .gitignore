@@ -46,3 +46,6 @@ deploy/secrets/*
 deploy/certs/
 # E2E 截图产物
 shots/
+
+# E2E 用的 playwright 目录是指向 .data 的符号链接，不进版本库
+tests/e2e/node_modules

@@ -67,6 +67,13 @@ interface CardProps {
   section: DashboardSection;
   span?: 'wide' | 'half' | 'third';
   action?: { label: string; onClick: () => void };
+  /**
+   * 空态也渲染内容。
+   *
+   * 只给"空本身分几个子类"的卡片用——例如今天的安排：日程空、承诺空、
+   * 目标空是三件事，用一句"没有数据"盖掉，就看不出是哪种空。
+   */
+  renderWhenEmpty?: boolean;
   children: (data: Record<string, unknown>) => React.ReactNode;
 }
 
@@ -76,7 +83,7 @@ interface CardProps {
  * 三态在这里一次处理完：加载中/空/失败各有各的样子，领域卡片只管
  * "拿到数据之后怎么画"。这样任何一块的失败都不会传染给整页。
  */
-function Card({ title, section, span = 'half', action, children }: CardProps) {
+function Card({ title, section, span = 'half', action, renderWhenEmpty, children }: CardProps) {
   const status = section?.status ?? 'unavailable';
   return (
     <section className={`dash-card dash-card--${span}`} data-testid={`dash-${title}`}>
@@ -94,7 +101,7 @@ function Card({ title, section, span = 'half', action, children }: CardProps) {
       <div className="dash-card__body">
         {status === 'unavailable' ? (
           <p className="dash-card__muted">暂时读不到这块数据。</p>
-        ) : status === 'empty' ? (
+        ) : status === 'empty' && !renderWhenEmpty ? (
           <p className="dash-card__muted">{emptyText(title)}</p>
         ) : (
           children((section.data as Record<string, unknown>) ?? {})
@@ -257,7 +264,7 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
           )}
         </Card>
 
-        <Card title="今天的安排" span="half" section={s.agenda}>
+        <Card title="今天的安排" span="half" section={s.agenda} renderWhenEmpty>
           {(d) => {
             const plans = (d.plans as Array<Record<string, unknown>>) ?? [];
             const commitments = (d.commitments as Array<Record<string, unknown>>) ?? [];

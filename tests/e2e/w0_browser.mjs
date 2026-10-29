@@ -302,7 +302,18 @@ async function runDesktop(browser) {
   const streamingVisible = /生成中|正在输入|停止/.test(mid || '');
   record('桌面：发送后进入生成状态', streamingVisible);
   const reply = await waitForReply(page);
-  record('桌面：收到逐段流式回复', reply.length > 5, `长度 ${reply.length}`);
+  // 与手机那条同一标准：「她不回」是用户自己设的偏好（休息/忙时不接话），
+  // 但要**说清原因**，且不能留空气泡。没回也没原因才是故障。
+  const deskSilence = await page.locator('[data-testid="silence-reason"]').count() > 0;
+  const deskText = (await page.textContent('body')) || '';
+  if (reply.length > 5) {
+    record('桌面：收到逐段流式回复', true, `长度 ${reply.length}`);
+  } else if (deskSilence) {
+    record('桌面：不回时给出了原因', true, (deskText.match(/她没回：[^\n]{0,24}/) || [''])[0]);
+    record('桌面：静默不留空气泡', !/（无内容）/.test(deskText));
+  } else {
+    record('桌面：收到逐段流式回复', false, `长度 ${reply.length}；也没有静默原因`);
+  }
   if (mode === true) {
     record('桌面：回复带测试模式标记', /测试模式/.test(reply));
   } else {
@@ -430,17 +441,24 @@ async function runMobile(browser) {
     : { total: 0, last: 'no-session', active: null };
   const pageText = (await page.locator('body').textContent()) || '';
   const providerDown = /供应商不可用|model_unavailable/.test(pageText);
+  // 「她不回」是**用户自己设定的偏好**（休息/忙时不接话），不是故障。
+  // 但静默必须被解释：界面上要有「她没回：<原因>」那一行。所以这里
+  // 不把静默直接算过——那样"消息被静默吞掉"这种真故障也会变绿。
+  const silenceExplained = await page.locator('[data-testid="silence-reason"]').count() > 0;
+  // 她选择不回时**不许留空气泡**：那会渲染成「（无内容）」，
+  // 看起来像生成失败，和"她这次不想说"完全是两回事。
+  record('手机：静默不留空气泡', !/（无内容）/.test(pageText));
   if (reply.length > 10) {
     record('手机：发送并收到回复', true, `长度 ${reply.length}`);
+  } else if (silenceExplained) {
+    record('手机：不回时给出了原因', true, (pageText.match(/她没回：[^\n]{0,24}/) || [''])[0]);
   } else if (providerDown) {
-    // 环境问题：模型供应商此刻不可用。界面本身是对的（它显示了可执行的错误
-    // 提示与重试按钮），所以既不算通过也不算失败——单列 SKIP。
     skip('手机：发送并收到回复', '模型供应商不可用（环境问题，界面已给出可执行提示）');
   } else {
     record(
       '手机：发送并收到回复',
       false,
-      `长度 ${reply.length}；服务端消息 ${diag.total} 条，最后一条 ${diag.last}，进行中 ${diag.active || '无'}`,
+      `长度 ${reply.length}；服务端消息 ${diag.total} 条，最后一条 ${diag.last}，进行中 ${diag.active || '无'}；也没有静默原因`,
     );
   }
   await shot(page, 'mobile-02-reply');
@@ -620,9 +638,25 @@ async function runDashboard(browser) {
   await page.waitForTimeout(1500);
 
   const body = (await page.textContent('body')) || '';
-  const titles = ['此刻', '情绪', '主动联系', '最近记住的事', '关系', '渠道与模型'];
+  const titles = [
+    '此刻',
+    '情绪',
+    '可用性',
+    '主动联系',
+    '今天的安排',
+    '最近记住的事',
+    '近期生活',
+    '关系',
+    '渠道与模型',
+  ];
   const missing = titles.filter((x) => !body.includes(x));
-  record('总览：六块卡片都在', missing.length === 0, missing.join(','));
+  record('总览：九块卡片都在', missing.length === 0, missing.join(','));
+
+  // 安排卡必须把"打算做"和"答应对方的事"分开写，不能合成一份清单
+  record(
+    '总览：日程与承诺分开表达',
+    body.includes('打算做') && body.includes('答应对方的事'),
+  );
 
   // 每块都要能标出"更新于"，否则等于假装实时
   record('总览：标注了数据更新时间', /更新于\s*\d{1,2}:\d{2}/.test(body));
@@ -644,6 +678,35 @@ async function runDashboard(browser) {
 
   record('总览：无未捕获的前端异常', consoleErrors.length === 0, consoleErrors[0] || '');
   await shot(page, 'dashboard-01-overview');
+  await context.close();
+}
+
+async function runAccountPage(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  await login(page);
+
+  const settingsBtn = page.locator('button.header-link:has-text("设置")').first();
+  await settingsBtn.click();
+  await page.waitForTimeout(1000);
+
+  const entry = page.locator('[data-testid="open-account"]').first();
+  record('账号：设置中心里有入口', (await entry.count()) > 0);
+  if ((await entry.count()) === 0) {
+    await context.close();
+    return;
+  }
+  await entry.click();
+  await page.waitForTimeout(900);
+  const body = (await page.textContent('body')) || '';
+  record('账号：页面打开', /登录名|密码/.test(body));
+  record('账号：说明改的是登录凭据', body.includes('不改她的人设'));
+
+  // 没填当前密码时保存按钮必须是禁用的——这是"改名要验证是你"的前端一侧
+  const saveName = page.locator('button[type="submit"]:has-text("保存登录名")').first();
+  record('账号：未确认当前密码时不能提交', (await saveName.count()) > 0 && (await saveName.isDisabled()));
+
+  await shot(page, 'account-01-page');
   await context.close();
 }
 
@@ -678,6 +741,7 @@ try {
   await runMobile(browser);
   await runFailureRetry(browser);
   await runSettingsPage(browser);
+  await runAccountPage(browser);
   await runDashboard(browser);
 } finally {
   await browser.close();

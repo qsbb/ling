@@ -202,6 +202,53 @@ class IdentityService:
             row.revoked_at = utcnow()
         await self._session.flush()
 
+    async def change_username(
+        self, user_id: str, *, current: str, username: str, keep_token: str | None = None
+    ) -> str:
+        """改登录名。要求当前口令确认，改完**吊销其它会话**。
+
+        为什么要验证当前口令：cookie 被盗时，改名字是"接管账号"的第一步
+        （改成攻击者习惯的账号名，后续社工更容易）。只验 session 不够。
+        """
+        name = username.strip()
+        if len(name) < 3 or len(name) > 64:
+            raise LingError(ErrorCode.invalid_request, "用户名需 3-64 个字符", status_code=422)
+
+        user = await self._session.get(User, user_id)
+        if user is None or user.disabled:
+            raise unauthorized("账号不可用")
+        if not verify_password(current, user.password_hash):
+            raise unauthorized("当前密码不正确")
+
+        # 重名检查要不区分大小写：`Ling` 和 `ling` 登录时看起来一样。
+        taken = (
+            await self._session.execute(
+                select(User).where(
+                    func.lower(User.username) == name.lower(), User.id != user_id
+                )
+            )
+        ).scalars().first()
+        if taken is not None:
+            raise LingError(ErrorCode.invalid_request, "这个用户名已被占用", status_code=409)
+
+        user.username = name
+        # 与改密码同一策略：吊销其它会话，**保留当前这次登录**。
+        # 不保留的话，用户点"保存"就被踢下线，得重新登录两次。
+        keep_hash = hash_token(keep_token) if keep_token else None
+        rows = (
+            await self._session.execute(
+                select(AuthSession).where(AuthSession.user_id == user_id)
+            )
+        ).scalars()
+        for row in rows:
+            if row.revoked_at is not None:
+                continue
+            if keep_hash is not None and row.token_hash == keep_hash:
+                continue
+            row.revoked_at = utcnow()
+        await self._session.flush()
+        return name
+
     async def logout(self, token: str) -> None:
         row = (
             await self._session.execute(

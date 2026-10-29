@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api';
 import { ChatPage } from './components/ChatPage';
+import { AccountPage } from './components/AccountPage';
 import { ChangePasswordView } from './components/ChangePasswordView';
 import { DashboardPage } from './components/DashboardPage';
 import { LoginView } from './components/LoginView';
@@ -217,6 +218,19 @@ export default function App() {
           <LifePage onBack={goSettings} />
         ) : route.name === 'privacy' ? (
           <ConsentPage onBack={goSettings} />
+        ) : route.name === 'account' ? (
+          <AccountPage
+            username={auth.user.username}
+            onBack={goSettings}
+            onRenamed={(name) => {
+              setAuth({
+                status: 'authenticated',
+                user: { ...auth.user, username: name },
+                testMode: auth.testMode,
+              });
+            }}
+            onLogout={handleLogout}
+          />
         ) : route.name === 'identity' ? (
           <IdentityPage onBack={goSettings} />
         ) : (

@@ -211,3 +211,46 @@ async def test_unknown_scene_state_rejected(logged_in: TestEnv) -> None:
     async with session_scope() as session:
         with pytest.raises(ValueError):
             await _svc(session).commit_scene(state="做梦")
+
+
+async def _force_energy(energy: int) -> None:
+    from sqlalchemy import update
+
+    from ling.infra.models import PresenceState
+
+    async with session_scope() as session:
+        await _svc(session).settle()
+    async with session_scope() as session:
+        await session.execute(
+            update(PresenceState).where(PresenceState.actor_id == ACTOR).values(energy=energy)
+        )
+
+
+async def test_resting_energy_recovers(logged_in: TestEnv) -> None:
+    """累到该歇了的时候，精力必须**回升**。
+
+    只减不增的话，跑够小时数就永远 resting，于是永久不接话——外面看到的是
+    "她突然不理我了"，日志里只有一条正常的 `skip_code=resting`。
+    """
+    await _force_energy(10)
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        svc = _svc(session)
+        low = await svc.view(now=now)
+        later = await svc.view(now=now + timedelta(hours=5))
+    assert low.availability == "resting"
+    assert later.energy > low.energy, f"歇了 5 小时精力没回升：{low.energy} → {later.energy}"
+
+
+async def test_energy_never_sticks_at_the_floor(logged_in: TestEnv) -> None:
+    """跑很久之后仍然能聊——不允许永久卡在 resting。
+
+    这条是上面那个 bug 的回归位：把恢复速率改成 0，它会红。
+    """
+    await _force_energy(10)
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        svc = _svc(session)
+        # 每 6 小时看一次，模拟"她过日子"式的时间推进，共 3 天
+        views = [await svc.view(now=now + timedelta(hours=6 * i)) for i in range(1, 13)]
+    assert any(v.availability != "resting" for v in views), "三天里一次都没恢复到可以说话"

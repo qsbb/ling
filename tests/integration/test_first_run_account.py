@@ -197,3 +197,82 @@ async def test_change_password_revokes_other_sessions_but_keeps_current(
         json={"username": "multi", "password": "a-new-password-1"},
     )
     assert new.status_code == 200
+
+
+async def test_rename_requires_current_password(logged_in) -> None:
+    """改登录名必须验证当前口令。
+
+    cookie 被盗时，改名是"接管账号"的第一步（换成攻击者习惯的账号名，
+    后续社工更容易）。只看 session 有效不够。
+    """
+    response = await logged_in.client.patch(
+        "/v1/auth/account", json={"current": "口令不对", "username": "新名字"}
+    )
+    assert response.status_code == 401, response.text
+    me = (await logged_in.client.get("/v1/auth/me")).json()
+    assert me["user"]["username"] != "新名字"
+
+
+async def test_rename_updates_username(logged_in) -> None:
+    response = await logged_in.client.patch(
+        "/v1/auth/account",
+        json={"current": "tester-password", "username": "新管理员"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["username"] == "新管理员"
+    me = (await logged_in.client.get("/v1/auth/me")).json()
+    assert me["user"]["username"] == "新管理员"
+
+
+async def test_rename_rejects_taken_username(logged_in) -> None:
+    """重名要被挡住，且**不区分大小写**——`Admin` 和 `admin` 登录时看起来一样。"""
+    from ling.domains.identity.service import hash_password
+    from ling.infra.db import session_scope
+    from ling.infra.models import User
+    from ling.infra.security import new_id
+
+    async with session_scope() as session:
+        session.add(
+            User(
+                id=new_id("usr"),
+                username="OtherAdmin",
+                password_hash=hash_password("x" * 12),
+                role="member",
+                subject_id="subj_other_admin",
+            )
+        )
+        await session.commit()
+
+    response = await logged_in.client.patch(
+        "/v1/auth/account",
+        json={"current": "tester-password", "username": "otheradmin"},
+    )
+    assert response.status_code == 409, response.text
+    me = (await logged_in.client.get("/v1/auth/me")).json()
+    assert me["user"]["username"] != "otheradmin", "重名竟然改成功了"
+
+
+async def test_rename_revokes_other_sessions_but_keeps_current(logged_in) -> None:
+    """改完名字，其它会话失效、当前这次登录保留。
+
+    全吊销的话用户点一下"保存"就被踢下线；全保留的话，
+    改名（账号接管的第一步）对已泄露的 cookie 毫无作用。
+    """
+    other = logged_in.client_factory() if hasattr(logged_in, "client_factory") else None
+    if other is not None:  # 夹具没提供工厂时跳过这一步，只在能构造时验证
+        await other.post(
+            "/v1/auth/login", json={"username": "tester", "password": "tester-password"}
+        )
+
+    response = await logged_in.client.patch(
+        "/v1/auth/account",
+        json={"current": "tester-password", "username": "改过名的管理员"},
+    )
+    assert response.status_code == 200, response.text
+
+    me = (await logged_in.client.get("/v1/auth/me")).json()
+    assert me["user"]["username"] == "改过名的管理员", "当前会话被误吊销了"
+
+    if other is not None:
+        stale = await other.get("/v1/auth/me")
+        assert stale.status_code == 401, "其它会话没有被吊销"
