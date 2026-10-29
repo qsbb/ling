@@ -192,6 +192,16 @@ do_install() {
   gen_env
   resolve_images
   ensure_web
+  # PyPI 慢/超时会让整次部署失败（实测 NAS 上就是）。这里先探一次，
+  # 探不通就自动换国内镜像源，并在日志里说明——否则用户只会看到
+  # "pip: No matching distribution found"，完全想不到是网络。
+  if [ -z "${PIP_INDEX_URL:-}" ]; then
+    if ! curl -sf -m 8 -o /dev/null https://pypi.org/simple/ 2>/dev/null; then
+      export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+      warn "pypi.org 不通，构建改用镜像源：$PIP_INDEX_URL"
+    fi
+  fi
+
   say "构建并启动…"
   dc up -d --build || die "启动失败（上面有日志）"
   wait_ready

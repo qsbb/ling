@@ -1556,3 +1556,31 @@ def test_worker_container_has_network_egress() -> None:
     assert "internal" in networks, f"worker 丢了内网访问：networks={networks}"
     # 网络定义本身没变
     assert data["networks"]["internal"].get("internal") is True
+
+
+def test_deploy_build_can_survive_slow_pypi() -> None:
+    """镜像构建必须能扛住 PyPI 慢/超时。
+
+    实测在 NAS 上整次部署因 `ReadTimeoutError` 失败，报错是
+    "No matching distribution found for build"——看起来像缺包，
+    实际是网络。所以三件事都要在：
+
+    1. Dockerfile 有 `--retries/--timeout`
+    2. Dockerfile 支持 `PIP_INDEX_URL` 换镜像源
+    3. compose **两个服务**都把 `PIP_INDEX_URL` 透传进构建
+       （漏一个，那个镜像仍会失败）
+    """
+    import yaml
+    from pathlib import Path
+
+    dockerfile = Path("deploy/Dockerfile.api").read_text()
+    assert "--retries" in dockerfile, "构建没有重试，慢网络必挂"
+    assert "PIP_INDEX_URL" in dockerfile, "构建不支持换镜像源"
+
+    data = yaml.safe_load(Path("deploy/compose.yaml").read_text())
+    for svc in ("api", "worker"):
+        args = data["services"][svc]["build"].get("args") or {}
+        assert "PIP_INDEX_URL" in args, f"{svc} 没透传 PIP_INDEX_URL"
+
+    install = Path("deploy/install.sh").read_text()
+    assert "pypi.tuna" in install, "install.sh 没有自动换源"

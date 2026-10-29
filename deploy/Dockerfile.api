@@ -20,8 +20,15 @@ COPY src ./src
 # 静默产出一个没有 connectors 的镜像，表现为容器里 QQ/NapCat 全部连不上，
 # 日志只说"缺少凭据"或干脆没有日志。dev 里正常、容器里死掉，就是这种坑。
 COPY connectors ./connectors
-RUN pip install --no-cache-dir build \
- && pip wheel --no-cache-dir --wheel-dir /wheels . \
+# PyPI 在部分网络环境下**超时频繁**（实测 NAS 上 `ReadTimeoutError`
+# 导致整次部署失败）。这里加两个东西：
+#   1. `--retries/--timeout`：给慢网络留余地，而不是一次超时就放弃
+#   2. `PIP_INDEX_URL`：允许换镜像源（国内可用清华源），默认仍是官方 PyPI
+ARG PIP_INDEX_URL=""
+RUN pip install --no-cache-dir --retries 5 --timeout 60 \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} build \
+ && pip wheel --no-cache-dir --retries 5 --timeout 60 \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} --wheel-dir /wheels . \
  && ls /wheels
 
 

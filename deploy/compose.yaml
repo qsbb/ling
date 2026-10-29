@@ -102,6 +102,8 @@ services:
       dockerfile: deploy/Dockerfile.api
       args:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
+        # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
     environment:
       <<: *app-env
@@ -180,6 +182,8 @@ services:
       dockerfile: deploy/Dockerfile.api
       args:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
+        # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
     command: ["worker"]
     deploy:
