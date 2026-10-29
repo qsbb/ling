@@ -1024,13 +1024,16 @@ async def handle_attention_tick(payload: dict) -> None:
                 },
             )
 
-    # **无条件记一条**：连"这轮没有窗口到期"也要能查到。
-    # 否则"轮询跑了但什么都没做"和"轮询压根没跑"在日志里长得一样，
+    # **无条件记一条**，但空轮询降到 DEBUG。
+    #
+    # 无条件：否则"轮询跑了但没窗口到期"和"轮询压根没跑"在日志里长得一样，
     # 而那正是排查"她为什么几小时没在群里说话"时的第一个岔路口。
+    # 降级：tick 间隔只有几秒，空轮询全记 INFO 会把日志刷满（实测部署实例上
+    # 每 6 秒一条），真正的信号就被淹了。要排查时把级别调到 DEBUG 即可。
     saved = max(0, baseline - calls)
     emit_event(
         logger,
-        logging.INFO,
+        logging.INFO if polls else logging.DEBUG,
         event_name="attention_tick_completed",
         message="群聊轮询完成",
         attributes={

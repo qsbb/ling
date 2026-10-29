@@ -318,3 +318,20 @@ def test_worker_emits_structured_attention_and_proactive_events() -> None:
     assert "result.decision == \"replied\"" in source
     idx = source.index("attention_window_polled")
     assert idx > 0
+
+
+def test_empty_attention_tick_is_debug_not_info() -> None:
+    """空轮询必须降到 DEBUG。
+
+    无条件记录是对的（否则"没轮询"和"轮询了但没窗口到期"分不清），
+    但 tick 间隔只有几秒——实测在部署实例上每 6 秒一条 INFO，
+    几天就能把日志刷满，真正的信号全被淹掉。
+    """
+    import inspect
+
+    from ling import worker
+
+    source = inspect.getsource(worker)
+    assert "logging.INFO if polls else logging.DEBUG" in source, (
+        "空轮询没有降级——会刷屏"
+    )
