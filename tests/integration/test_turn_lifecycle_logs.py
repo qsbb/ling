@@ -35,11 +35,16 @@ async def test_web_turn_emits_start_and_decision(logged_in, caplog) -> None:
 
     started = _events(caplog, "turn_started")
     decided = _events(caplog, "reply_decision_made")
+    completed = _events(caplog, "turn_completed")
     assert started, [r.getMessage() for r in caplog.records]
     assert decided, "决策事件缺失"
+    # 链路必须闭环：只有"开始"没有"结束"，排查时仍然得猜这轮怎么了
+    assert completed, "轮次结束事件缺失"
+    assert completed[-1].attributes["outcome"] in {"delivered", "no_text", "partial_delivery"}
 
     attrs = started[-1].attributes
     assert attrs["source"] == "web"
+    assert completed[-1].attributes["turn_id"] == attrs["turn_id"]
     assert attrs["turn_id"]
     assert attrs["config_revision"] >= 0
 

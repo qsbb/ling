@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, File, Request, UploadFile
@@ -553,12 +554,27 @@ async def send_turn(
     )
     async def _guarded() -> AsyncIterator[bytes]:
         produced = False
+        started_at = time.perf_counter()
         async for chunk in _forward(queue, started=started):
             if b"event: delta" in chunk:
                 produced = True
             yield chunk
         if produced:
             _mark_group_turn(request, window.visibility, window.id)
+        # 流结束 = 这一轮结束。与 connector 路径用同一个事件名，
+        # 这样一条 trace 的链路在两个入口长得一样。
+        emit_event(
+            logger,
+            logging.INFO if produced else logging.WARNING,
+            event_name="turn_completed",
+            message="轮次完成" if produced else "轮次结束但没有产出",
+            attributes={
+                "turn_id": turn.id,
+                "outcome": "delivered" if produced else "no_text",
+                "source": "web",
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+            },
+        )
 
     return StreamingResponse(
         _guarded(), media_type="text/event-stream", headers=SSE_HEADERS
