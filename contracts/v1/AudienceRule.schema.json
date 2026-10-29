@@ -1,0 +1,72 @@
+{
+  "$defs": {
+    "Visibility": {
+      "enum": [
+        "actor_private",
+        "subject_private",
+        "window_private",
+        "group_scope",
+        "public",
+        "admin_only"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/AudienceRule.schema.json",
+  "additionalProperties": false,
+  "description": "受众规则：谁能看到哪一类内容。",
+  "properties": {
+    "allow_cross_window": {
+      "default": false,
+      "title": "Allow Cross Window",
+      "type": "boolean"
+    },
+    "note": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Note"
+    },
+    "owner_subject_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Owner Subject Id"
+    },
+    "requires_explicit_consent": {
+      "default": true,
+      "title": "Requires Explicit Consent",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility"
+    }
+  },
+  "required": [
+    "visibility"
+  ],
+  "title": "AudienceRule",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

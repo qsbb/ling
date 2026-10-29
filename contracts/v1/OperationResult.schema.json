@@ -1,0 +1,118 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "enum": [
+        "invalid_request",
+        "unauthorized",
+        "forbidden",
+        "not_found",
+        "conflict",
+        "rate_limited",
+        "provider_unavailable",
+        "provider_timeout",
+        "provider_error",
+        "cancelled",
+        "unsupported_capability",
+        "config_invalid",
+        "secret_missing",
+        "internal"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    },
+    "OperationState": {
+      "description": "外部动作/投递状态。计划不等于完成。",
+      "enum": [
+        "proposed",
+        "running",
+        "succeeded",
+        "failed",
+        "uncertain",
+        "cancelled"
+      ],
+      "title": "OperationState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/OperationResult.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "detail": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Detail"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "kind": {
+      "title": "Kind",
+      "type": "string"
+    },
+    "operation_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "receipt_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：回执按 operation_id 查，不从这里引用",
+      "title": "Receipt Ref"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/OperationState"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation_id",
+    "kind",
+    "state",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "OperationResult",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

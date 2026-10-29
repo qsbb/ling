@@ -1,0 +1,174 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "enum": [
+        "invalid_request",
+        "unauthorized",
+        "forbidden",
+        "not_found",
+        "conflict",
+        "rate_limited",
+        "provider_unavailable",
+        "provider_timeout",
+        "provider_error",
+        "cancelled",
+        "unsupported_capability",
+        "config_invalid",
+        "secret_missing",
+        "internal"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    },
+    "Origin": {
+      "description": "经历来源。六者永不混写为同一种事实。",
+      "enum": [
+        "simulated",
+        "user_statement",
+        "external_observation",
+        "verified_source",
+        "tool_receipt",
+        "model_inference"
+      ],
+      "title": "Origin",
+      "type": "string"
+    },
+    "TurnState": {
+      "description": "一个聊天轮次的服务端权威状态。",
+      "enum": [
+        "pending",
+        "streaming",
+        "stopping",
+        "completed",
+        "stopped",
+        "failed"
+      ],
+      "title": "TurnState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/ChatMessage.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "attempt": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "handled_as": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Handled As"
+    },
+    "handled_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Handled Reason"
+    },
+    "message_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Message Id",
+      "type": "string"
+    },
+    "model_label": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Label"
+    },
+    "origin": {
+      "$ref": "#/$defs/Origin",
+      "default": "user_statement"
+    },
+    "role": {
+      "enum": [
+        "user",
+        "actor",
+        "system"
+      ],
+      "title": "Role",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sequence": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/TurnState",
+      "default": "completed"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "turn_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Turn Id"
+    }
+  },
+  "required": [
+    "message_id",
+    "role",
+    "text",
+    "created_at"
+  ],
+  "title": "ChatMessage",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

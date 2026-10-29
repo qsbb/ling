@@ -1,0 +1,74 @@
+{
+  "$id": "https://ling.local/contracts/v1/SessionRecord.schema.json",
+  "additionalProperties": false,
+  "description": "会话窗口的权威记录（不是浏览器缓存）。",
+  "properties": {
+    "actor_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Actor Id",
+      "type": "string"
+    },
+    "archived": {
+      "default": false,
+      "title": "Archived",
+      "type": "boolean"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "message_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Message Count",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "session_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Session Id",
+      "type": "string"
+    },
+    "subject_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Subject Id",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "window_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Window Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "actor_id",
+    "subject_id",
+    "window_id",
+    "title",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "SessionRecord",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

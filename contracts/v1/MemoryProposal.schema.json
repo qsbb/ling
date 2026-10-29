@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "Origin": {
+      "description": "经历来源。六者永不混写为同一种事实。",
+      "enum": [
+        "simulated",
+        "user_statement",
+        "external_observation",
+        "verified_source",
+        "tool_receipt",
+        "model_inference"
+      ],
+      "title": "Origin",
+      "type": "string"
+    },
+    "Visibility": {
+      "enum": [
+        "actor_private",
+        "subject_private",
+        "window_private",
+        "group_scope",
+        "public",
+        "admin_only"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/MemoryProposal.schema.json",
+  "additionalProperties": false,
+  "description": "模型提出的记忆候选，必须带证据；由 Memory 域决定是否落库。",
+  "properties": {
+    "confidence": {
+      "default": 0.5,
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "kind": {
+      "enum": [
+        "episode",
+        "assertion",
+        "procedure"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "origin": {
+      "$ref": "#/$defs/Origin"
+    },
+    "proposal_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Proposal Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_event_ids": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Source Event Ids",
+      "type": "array"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility"
+    }
+  },
+  "required": [
+    "proposal_id",
+    "kind",
+    "text",
+    "origin",
+    "source_event_ids",
+    "visibility"
+  ],
+  "title": "MemoryProposal",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

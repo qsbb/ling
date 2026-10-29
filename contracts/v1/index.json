@@ -1,0 +1,18 @@
+{
+  "contracts": {
+    "ActionIntent": "ActionIntent.schema.json",
+    "AudienceRule": "AudienceRule.schema.json",
+    "CapabilityDescriptor": "CapabilityDescriptor.schema.json",
+    "ChatMessage": "ChatMessage.schema.json",
+    "ContextContribution": "ContextContribution.schema.json",
+    "DeliveryReceipt": "DeliveryReceipt.schema.json",
+    "ErrorResponse": "ErrorResponse.schema.json",
+    "HandoffCapsule": "HandoffCapsule.schema.json",
+    "InteractionEnvelope": "InteractionEnvelope.schema.json",
+    "MemoryProposal": "MemoryProposal.schema.json",
+    "OperationResult": "OperationResult.schema.json",
+    "RuntimeScope": "RuntimeScope.schema.json",
+    "SessionRecord": "SessionRecord.schema.json"
+  },
+  "schema_version": "v1"
+}

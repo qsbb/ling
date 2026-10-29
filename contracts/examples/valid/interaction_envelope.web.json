@@ -1,0 +1,9 @@
+{
+  "schema_version": "v1",
+  "connector_instance": "web-console",
+  "external_event_id": "web-msg-0001",
+  "window_ref": "win_demo",
+  "modality": "text",
+  "parts": [{ "modality": "text", "text": "在吗" }],
+  "origin": "user_statement"
+}
