@@ -83,7 +83,14 @@ async def qqbot_events(request: Request) -> JSONResponse:
             "确认回调地址后应尽量关掉"
         )
     if not verified and not (is_validation and connector.config.allow_unsigned_validation):
-        logger.warning("QQ 机器人回调验签失败（op=%s）", op)
+        from ling.audit import security_event
+
+        security_event(
+            "signature_invalid",
+            outcome="denied",
+            channel="qqbot",
+            reason_code=f"op={op}",
+        )
         raise LingError(ErrorCode.forbidden, "QQ 机器人回调验签失败", status_code=403)
 
     if is_validation:

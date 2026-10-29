@@ -183,6 +183,27 @@ docker logs ling-api-1 2>&1 | grep reply_decision_made | grep '"skip_code"'
 措辞在 `reason` 里，事实在 `skip_code` 里。同一个事件名在「连接器入站」与
 「Web 对话」两条路径都会发，所以一条查询就能覆盖两个入口。
 
+### 审计日志与安全日志（独立命名空间）
+
+| 命名空间 | 回答什么问题 | 典型事件 |
+|---|---|---|
+| `ling.audit` | **谁**在什么时候**改了什么** | `audit_config_published`、`audit_config_rolled_back`、`audit_provider_secret_set`、`audit_memory_retracted`、`audit_memory_forgotten`、`audit_memory_superseded`、`audit_consent_changed`、`audit_password_changed` |
+| `ling.security` | **谁**被拒绝了、为什么 | `security_auth_failed`、`security_inbound_denied`、`security_signature_invalid`、`security_must_change_password_blocked` |
+
+```bash
+# 最近谁动过配置
+docker logs ling-api-1 2>&1 | grep '"log_kind": "audit"' | grep config_
+# 谁被白名单拦下来了（只有哈希，没有原值）
+docker logs ling-api-1 2>&1 | grep security_inbound_denied
+```
+
+**审计字段只放计数、枚举、ID、版本号**，绝不放消息正文或记忆内容。
+外部账号标识在安全日志里只写 HMAC 哈希（用低熵字符串做裸哈希可以被字典
+反查，所以用带密钥的 HMAC）。
+
+> 目前审计只落日志，不落库。要做长期留存时，只需在
+> `ling/audit.py` 的两个函数里加一个 sink，所有调用点一行都不用改。
+
 连接器状态机的事件名是固定的：`connector_config_missing`、
 `connector_hello`、`connector_connected`、`connector_resumed`、
 `connector_disconnected`、`connector_reconnect_failed`、

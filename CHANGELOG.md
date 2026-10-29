@@ -6,6 +6,8 @@
 ## [Unreleased]
 
 ### 新增
+- 审计日志与安全日志：`ling.audit` / `ling.security` 独立命名空间，
+  配置发布、记忆撤回、授权变更、改密都留痕；账号标识只写 HMAC 哈希
 - 决策可观测：`reply_decision_made` 事件 + 受控 `skip_code` 枚举，
   只看日志就能回答「她为什么没回这条消息」
 - 结构化日志：一行一条 JSON、`trace_id` 贯穿请求与响应头、字段名级脱敏、

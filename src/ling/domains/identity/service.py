@@ -116,6 +116,16 @@ class IdentityService:
         ).scalar_one_or_none()
         if user is None or user.disabled or not verify_password(password, user.password_hash):
             # 不区分“用户不存在”与“口令错误”，避免账号枚举
+            # 安全事件：记"哪个用户名试过 + 结果"，**不记口令**。
+            # 也不区分"用户不存在"与"口令错误"（避免账号枚举）。
+            from ling.audit import security_event
+
+            security_event(
+                "auth_failed",
+                outcome="denied",
+                account_ref=username,
+                reason_code="bad_credentials",
+            )
             raise unauthorized("用户名或口令不正确")
         token = new_token()
         expires_at = datetime.now(UTC) + timedelta(days=14)

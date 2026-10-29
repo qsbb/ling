@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from ling.api.deps import ConfigDep, CurrentAuth, RouterDep
 from ling.api.errors import LingError
+from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
 from ling.settings.service import PROFILE_DEGRADATIONS, RESERVED_PROFILES
 
@@ -266,6 +267,14 @@ async def publish(
         secret = await config.read_secret(pid)
         if secret:
             request.app.state.secret_cache[pid] = secret
+    # 配置发布是"改了系统行为"的动作，必须留痕：谁、从哪个修订、改成哪个
+    audit_event(
+        "config_published",
+        actor=auth.user.id,
+        target_type="config_revision",
+        target_id=str(revision),
+        attributes={"from_revision": body.revision},
+    )
     return {"published_revision": revision}
 
 
@@ -280,6 +289,13 @@ async def rollback(
         secret = await config.read_secret(pid)
         if secret:
             request.app.state.secret_cache[pid] = secret
+    audit_event(
+        "config_rolled_back",
+        actor=auth.user.id,
+        target_type="config_revision",
+        target_id=str(revision),
+        attributes={"to_revision": body.to_revision},
+    )
     return {"published_revision": revision}
 
 
@@ -292,6 +308,13 @@ async def set_secret(
     config: ConfigDep,
 ) -> dict[str, object]:
     status = await config.set_secret(provider_id, body.secret)
+    # 只记"哪个 provider 的密钥被换了"，**绝不记密钥本身**
+    audit_event(
+        "provider_secret_set",
+        actor=auth.user.id,
+        target_type="provider",
+        target_id=provider_id,
+    )
     request.app.state.secret_cache[provider_id] = body.secret.strip()
     request.app.state.registry.invalidate(provider_id)
     return {"provider_id": provider_id, **status}

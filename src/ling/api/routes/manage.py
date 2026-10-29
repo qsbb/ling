@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
+from ling.audit import audit_event
 from ling.config import Settings
 from ling.contracts.v1 import (
     ActionIntent,
@@ -132,6 +133,14 @@ async def retract_memory(
     ok = await MemoryService(session).retract(memory_id, reason=body.reason)
     if not ok:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
+    # 撤回是"数据不再被使用"的动作，必须可追溯。只记 ID 与原因码，不记内容。
+    audit_event(
+        "memory_retracted",
+        actor=auth.user.id,
+        target_type="memory",
+        target_id=memory_id,
+        reason_code=(body.reason or "")[:64],
+    )
     return {"memory_id": memory_id, "retracted": True}
 
 
@@ -145,12 +154,27 @@ async def supersede_memory(
     )
     if new_id_value is None:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
+    audit_event(
+        "memory_superseded",
+        actor=auth.user.id,
+        target_type="memory",
+        target_id=memory_id,
+        attributes={"new_memory_id": new_id_value},
+    )
     return {"memory_id": new_id_value, "supersedes": memory_id}
 
 
 @router.post("/memory/forget")
 async def forget_all(auth: CurrentAuth, session: DbSession) -> dict:
     count = await MemoryService(session).forget_subject(auth.user.subject_id)
+    # 一次清空整份记忆：只记数量，不记清掉了什么
+    audit_event(
+        "memory_forgotten",
+        actor=auth.user.id,
+        target_type="subject",
+        target_id=auth.user.subject_id,
+        attributes={"retracted_count": count},
+    )
     return {"retracted": count}
 
 
@@ -530,6 +554,14 @@ async def set_consent(body: ConsentBody, auth: CurrentAuth, session: DbSession) 
             )
     except ValueError as exc:
         raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
+    # 授权变更直接决定"她能看什么/能做什么"，是审计里最该有的一类
+    audit_event(
+        "consent_changed",
+        actor=auth.user.id,
+        target_type="consent",
+        target_id=view.scope,
+        attributes={"granted": view.granted, "revision": view.revision},
+    )
     return {"scope": view.scope, "granted": view.granted, "revision": view.revision}
 
 

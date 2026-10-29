@@ -64,7 +64,15 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
             "出入许可已关闭（LING_ACCESS_MODE=off）：任何账号都能跟她对话"
         )
     if not decision.allowed:
-        logger.info("拒绝入站：sender=%s（%s）", envelope.account_ref, decision.reason)
+        from ling.audit import security_event
+
+        security_event(
+            "inbound_denied",
+            outcome="denied",
+            account_ref=envelope.account_ref,
+            reason_code=decision.reason[:64],
+            attributes={"connector": getattr(connector, "connector_id", "")},
+        )
         return {
             "accepted": False,
             "reason": decision.reason,

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
+from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
 from ling.domains.identity.service import IdentityService
 
@@ -88,6 +89,12 @@ async def change_password(
         current=body.current,
         new=body.new,
         keep_token=auth.token,
+    )
+    audit_event(
+        "password_changed",
+        actor=auth.user.id,
+        target_type="user",
+        target_id=auth.user.id,
     )
     return Response(status_code=204)
 
