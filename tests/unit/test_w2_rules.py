@@ -1570,8 +1570,9 @@ def test_deploy_build_can_survive_slow_pypi() -> None:
     3. compose **两个服务**都把 `PIP_INDEX_URL` 透传进构建
        （漏一个，那个镜像仍会失败）
     """
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     dockerfile = Path("deploy/Dockerfile.api").read_text()
     assert "--retries" in dockerfile, "构建没有重试，慢网络必挂"
