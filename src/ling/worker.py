@@ -1249,6 +1249,19 @@ async def handle_life_plan(payload: dict) -> None:
             return
         if not routine.is_awake(now):
             return
+        # 离休息时间不足 40 分钟就不排了：排了也没时间做完，
+        # 只会让"她正在做一件马上要被打断的事"。
+        minutes_now = local.hour * 60 + local.minute
+        if 0 <= routine.rest_minute - minutes_now < 40:
+            _LAST_PLAN_DATE = today
+            emit_event(
+                logger,
+                logging.DEBUG,
+                event_name="life_plans_proposed",
+                message="今日日程未生成：临近休息时间",
+                attributes={"created": 0, "reason_code": "too_close_to_rest"},
+            )
+            return
         if await agenda.upcoming():
             # 已经有在手的计划（可能是昨天排的、还没做完），不重复排
             _LAST_PLAN_DATE = today
@@ -1267,11 +1280,17 @@ async def handle_life_plan(payload: dict) -> None:
             if effective.profiles.get("memory.extract")
             else "dialogue.fast"
         )
+        # **必须告诉它现在几点**。不说的话模型会顺着"今天"排上午的时间，
+        # 而此刻已经是下午/晚上——那些时段全被"过去不排"的规则丢掉，
+        # 结果是"parsed=3 但 created=0"（实测在部署实例上就是这样）。
+        now_local = local.strftime("%H:%M")
         prompt = (
             f"你是{persona.display_name}。你的人设片段：\n"
             f"{(persona.system_prompt or '')[:1200]}\n\n"
-            f"今天是 {today}。请为**今天**安排 1-3 件你会做的日常小事。\n"
+            f"今天是 {today}，现在已经是 {now_local}。\n"
+            "请为**今天剩下的时间**安排 1-3 件你会做的日常小事。\n"
             "要求：\n"
+            f"- 所有时间必须**晚于 {now_local}**，且早于夜里休息\n"
             "- 只安排符合你性格与身份的小事（看书、散步、收拾、做手工之类）\n"
             "- 时间用 24 小时制 HH:MM，每件 30-120 分钟\n"
             "- 不要安排吃饭睡觉这种不需要记录的\n"

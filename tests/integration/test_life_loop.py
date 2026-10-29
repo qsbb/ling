@@ -166,3 +166,33 @@ async def test_past_time_slots_are_not_scheduled(web_env, monkeypatch) -> None:
 
     await worker.handle_life_plan({})
     assert await _plan_count() == 0
+
+
+async def test_prompt_tells_the_model_what_time_it_is(web_env, monkeypatch) -> None:
+    """prompt 必须包含"现在几点"，并要求只排后面的时间。
+
+    实测踩过：不说现在几点，模型会顺着"今天"排上午的时间，而此刻已是
+    下午——那些时段全被"过去不排"丢掉，结果是 parsed=3 但 created=0，
+    界面永远没有日程。
+    """
+    from ling import worker
+
+    captured: list[str] = []
+
+    class _CapturingRouter(_Router):
+        async def stream(self, *_args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            for msg in kwargs.get("messages") or []:
+                captured.append(msg.content)
+            async for item in super().stream():
+                yield item
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", _CapturingRouter("[]"))
+    monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
+    monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
+
+    await worker.handle_life_plan({})
+
+    assert captured, "没有向模型发出请求"
+    prompt = captured[0]
+    assert "现在已经是" in prompt, "prompt 没告诉模型当前时间"
+    assert "晚于" in prompt, "prompt 没有约束只用后面的时间"
