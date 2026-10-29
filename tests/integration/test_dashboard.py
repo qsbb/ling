@@ -6,7 +6,17 @@ import pytest
 
 pytestmark = pytest.mark.w0_web
 
-SECTION_KEYS = {"activity", "affect", "proactive", "memories", "relationship", "connectivity"}
+SECTION_KEYS = {
+    "activity",
+    "affect",
+    "presence",
+    "proactive",
+    "agenda",
+    "memories",
+    "timeline",
+    "relationship",
+    "connectivity",
+}
 
 
 async def test_dashboard_returns_all_sections_with_status(logged_in) -> None:
@@ -157,3 +167,48 @@ async def test_rollback_failure_does_not_raise() -> None:
 
     result = await _guard("probe", boom(), _BadSession())
     assert result["status"] == SECTION_UNAVAILABLE
+
+
+async def test_agenda_keeps_plans_commitments_goals_apart(logged_in) -> None:
+    """日程、承诺、目标必须分开给，不许合成一份"今天要做什么"。
+
+    计划是她"打算"做的（`tentative` 时还可能变），承诺是她答应了对方的事。
+    合并成一个列表会让人以为两者等价——用户会据此决定能不能当约定依赖。
+    """
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    section = body["sections"]["agenda"]
+    assert section["status"] in {"ok", "empty"}
+    if section["status"] == "ok":
+        data = section["data"]
+        assert {"plans", "commitments", "goals"} <= set(data), list(data)
+        for key in ("plans", "commitments", "goals"):
+            assert isinstance(data[key], list), key
+
+
+async def test_presence_exposes_single_availability_conclusion(logged_in) -> None:
+    """可用性只给一个结论，不给前端各自解读数值。
+
+    每个调用方自己按 energy 划阈值的话，界面和提示词迟早给出互相矛盾的
+    "她累不累"。
+    """
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    section = body["sections"]["presence"]
+    assert section["status"] in {"ok", "unavailable"}
+    if section["status"] == "ok":
+        data = section["data"]
+        assert data["availability"] in {"available", "low", "resting"}, data
+        assert data["describe"], "没有给表达层用的那句话"
+
+
+async def test_timeline_is_empty_not_fake(logged_in) -> None:
+    """没有可展示的生活事件时必须是 empty，不能编一条出来。"""
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    section = body["sections"]["timeline"]
+    assert section["status"] in {"ok", "empty", "unavailable"}
+    if section["status"] == "empty":
+        assert not section["data"]
+    if section["status"] == "ok":
+        for item in section["data"]["items"]:
+            # 每条都要带来源，否则无法判断它是观察到的还是推断的
+            assert item["origin"], item
+            assert item["occurred_at"], item

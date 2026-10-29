@@ -441,8 +441,11 @@ export interface DashboardResponse {
   sections: {
     activity: DashboardSection;
     affect: DashboardSection;
+    presence: DashboardSection;
     proactive: DashboardSection;
+    agenda: DashboardSection;
     memories: DashboardSection;
+    timeline: DashboardSection;
     relationship: DashboardSection;
     connectivity: DashboardSection;
   };

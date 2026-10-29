@@ -34,6 +34,18 @@ const STATE_LABEL: Record<string, string> = {
   cancelled: '取消',
 };
 
+const AVAILABILITY_LABEL: Record<string, string> = {
+  available: '可以聊',
+  low: '有点乏',
+  resting: '在休息',
+};
+
+const PLAN_LEVEL_LABEL: Record<string, string> = {
+  tentative: '还没定',
+  confirmed: '已约定',
+  soft: '随口提的',
+};
+
 const ORIGIN_LABEL: Record<string, string> = {
   simulated: '模拟',
   user_statement: '你说的',
@@ -212,6 +224,20 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
           )}
         </Card>
 
+        <Card title="可用性" span="half" section={s.presence}>
+          {(d) => (
+            <>
+              <p className="dash-now__line">
+                <strong>{AVAILABILITY_LABEL[String(d.availability)] ?? String(d.availability ?? '')}</strong>
+                <span className="dash-now__kind">
+                  精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
+                </span>
+              </p>
+              <p className="dash-card__muted">{String(d.describe ?? '')}</p>
+            </>
+          )}
+        </Card>
+
         <Card title="主动联系" span="half" section={s.proactive}>
           {(d) => (
             <>
@@ -231,6 +257,50 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
           )}
         </Card>
 
+        <Card title="今天的安排" span="half" section={s.agenda}>
+          {(d) => {
+            const plans = (d.plans as Array<Record<string, unknown>>) ?? [];
+            const commitments = (d.commitments as Array<Record<string, unknown>>) ?? [];
+            const goals = (d.goals as Array<Record<string, unknown>>) ?? [];
+            return (
+              <>
+                <p className="dash-card__muted">打算做（可能变）</p>
+                {plans.length === 0 ? (
+                  <p className="dash-card__muted">今天没有登记的日程。</p>
+                ) : (
+                  <ul className="dash-list">
+                    {plans.map((v) => (
+                      <li key={String(v.plan_id)} className="dash-list__row">
+                        <span className="dash-list__kind">{formatClock(String(v.start_at ?? ''))}</span>
+                        <span className="dash-list__text">{String(v.title ?? '')}</span>
+                        <span className="dash-list__meta">{PLAN_LEVEL_LABEL[String(v.commitment_level)] ?? ''}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="dash-card__muted">答应对方的事</p>
+                {commitments.length === 0 ? (
+                  <p className="dash-card__muted">没有待履行的承诺。</p>
+                ) : (
+                  <ul className="dash-list">
+                    {commitments.map((c) => (
+                      <li key={String(c.commitment_id)} className="dash-list__row">
+                        <span className="dash-list__kind">{String(c.due_at ?? '').slice(5, 16).replace('T', ' ')}</span>
+                        <span className="dash-list__text">{String(c.text ?? '')}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {goals.length > 0 ? (
+                  <p className="dash-card__muted">
+                    进行中的目标：{goals.map((g) => String(g.title ?? '')).join('、')}
+                  </p>
+                ) : null}
+              </>
+            );
+          }}
+        </Card>
+
         <Card title="最近记住的事" span="wide" section={s.memories}>
           {(d) => {
             const items = (d.items as Array<Record<string, unknown>>) ?? [];
@@ -242,6 +312,25 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
                     <span className="dash-list__text">{String(m.text ?? '')}</span>
                     <span className="dash-list__meta">
                       {ORIGIN_LABEL[String(m.origin)] ?? String(m.origin ?? '')}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            );
+          }}
+        </Card>
+
+        <Card title="近期生活" span="wide" section={s.timeline}>
+          {(d) => {
+            const items = (d.items as Array<Record<string, unknown>>) ?? [];
+            return (
+              <ul className="dash-list">
+                {items.map((e) => (
+                  <li key={String(e.experience_id)} className="dash-list__row">
+                    <span className="dash-list__kind">{String(e.occurred_at ?? '').slice(5, 16).replace('T', ' ')}</span>
+                    <span className="dash-list__text">{String(e.summary ?? '')}</span>
+                    <span className="dash-list__meta">
+                      {ORIGIN_LABEL[String(e.origin)] ?? String(e.origin ?? '')}
                     </span>
                   </li>
                 ))}

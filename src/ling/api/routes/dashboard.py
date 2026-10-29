@@ -45,7 +45,11 @@ from fastapi import APIRouter
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.domains.activity.service import ActivityService
 from ling.domains.affect.service import AffectService
+from ling.domains.agenda.service import AgendaService
+from ling.domains.goals.service import GoalsService
+from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
+from ling.domains.presence.service import PresenceService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
 
@@ -211,6 +215,95 @@ async def get_dashboard(
             },
         )
 
+    async def presence() -> dict:
+        """可用性：精力、社交负担，以及**唯一的**结论 availability。
+
+        不暴露原始数值的判断方式给前端各自解读——那会出现每处一套阈值。
+        """
+        service = PresenceService(session, actor_id=actor_id)
+        view = await service.view()
+        return _section(
+            SECTION_OK,
+            {
+                "availability": view.availability,
+                "energy": view.energy,
+                "social_load": view.social_load,
+                # `describe()` 是给表达层的一句话：正常时它**故意返回空串**
+                # （正常不需要额外约束）。首屏上留白会让人以为没读到，
+                # 所以这里补一句人话，但实质仍是那个唯一结论。
+                "describe": view.describe() or "状态正常，可以随时说话",
+            },
+        )
+
+    async def agenda() -> dict:
+        """今天的安排。日程、承诺、目标**分开**给，不许互相冒充。
+
+        合成一个"今天要做什么"的列表会让人以为计划等于承诺：计划是她
+        "打算"做的事（tentative 甚至可能变），承诺是她答应了对方的事。
+        """
+        service = AgendaService(session, actor_id=actor_id)
+        plans = await service.upcoming(limit=5)
+        goals_service = GoalsService(session, actor_id=actor_id)
+        commitments = await goals_service.list_commitments(subject_id)
+        goals = await goals_service.list_goals(state="active")
+
+        if not plans and not commitments and not goals:
+            return _section(SECTION_EMPTY)
+        return _section(
+            SECTION_OK,
+            {
+                "plans": [
+                    {
+                        "plan_id": v.plan_id,
+                        "title": v.title,
+                        "start_at": v.start_at.isoformat(),
+                        "end_at": v.end_at.isoformat(),
+                        "commitment_level": v.commitment_level,
+                        "state": v.state,
+                    }
+                    for v in plans
+                ],
+                "commitments": [
+                    {
+                        "commitment_id": c.commitment_id,
+                        "text": c.text,
+                        "due_at": c.due_at.isoformat(),
+                        "state": c.state,
+                    }
+                    for c in commitments[:5]
+                ],
+                "goals": [
+                    {"goal_id": g.goal_id, "title": g.title, "state": g.state}
+                    for g in goals[:5]
+                ],
+            },
+        )
+
+    async def timeline() -> dict:
+        """近期生活：已发生的事件，带来源。
+
+        不是"她最近的念头"——内部推理不能当角色经历展示。
+        """
+        service = SelfTimelineService(session, actor_id=actor_id)
+        events = await service.recent(days=3, limit=5)
+        if not events:
+            return _section(SECTION_EMPTY)
+        return _section(
+            SECTION_OK,
+            {
+                "items": [
+                    {
+                        "experience_id": e.experience_id,
+                        "kind": e.kind,
+                        "summary": e.summary,
+                        "origin": e.origin,
+                        "occurred_at": e.occurred_at.isoformat(),
+                    }
+                    for e in events
+                ]
+            },
+        )
+
     async def connectivity() -> dict:
         from ling.capabilities.channels import (
             qqbot_config,
@@ -288,6 +381,9 @@ async def get_dashboard(
         "memories": await _guard("memories", memories(), session),
         "relationship": await _guard("relationship", relationship(), session),
         "connectivity": await _guard("connectivity", connectivity(), session),
+        "presence": await _guard("presence", presence(), session),
+        "agenda": await _guard("agenda", agenda(), session),
+        "timeline": await _guard("timeline", timeline(), session),
     }
 
     return {
