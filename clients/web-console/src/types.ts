@@ -1,0 +1,425 @@
+/** ling Web API v1 的类型定义（与 docs/API-WEB-V1.md 对齐）。 */
+
+export type TurnState = 'pending' | 'streaming' | 'stopping' | 'completed' | 'stopped' | 'failed';
+
+export interface SessionRecord {
+  schema_version: string;
+  session_id: string;
+  actor_id: string;
+  subject_id: string;
+  window_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+  archived: boolean;
+}
+
+export interface ChatMessage {
+  schema_version: string;
+  message_id: string;
+  turn_id: string | null;
+  role: 'user' | 'actor' | 'system';
+  text: string;
+  state: TurnState;
+  created_at: string;
+  sequence: number;
+  origin: string;
+  error_code: string | null;
+  model_label: string | null;
+  // 她怎么处置这条消息。replied / ignored / missed。
+  // 沉默时 handled_reason 说明为什么——不能让消息看起来凭空消失。
+  handled_as?: string | null;
+  handled_reason?: string | null;
+}
+
+export interface TurnView {
+  turn_id: string;
+  state: TurnState;
+  attempt: number;
+  model_label: string | null;
+  error_code: string | null;
+  retriable: boolean;
+}
+
+export interface MessagesResponse {
+  messages: ChatMessage[];
+  active_turn: TurnView | null;
+}
+
+export interface UserInfo {
+  id: string;
+  username: string;
+  role: string;
+  subject_id: string;
+  display_name: string;
+}
+
+export interface AuthResponse {
+  schema_version: string;
+  user: UserInfo;
+  config_revision: number;
+  test_mode: boolean;
+  csrf_token: string;
+}
+
+export interface ErrorPayload {
+  code: string;
+  message: string;
+  retriable: boolean;
+  detail?: string | null;
+  trace_id?: string | null;
+}
+
+export interface StopResponse {
+  turn_id: string;
+  state: TurnState;
+  was_running?: boolean;
+}
+
+/* ---------------------------------------------------------------- 设置 */
+
+export interface ProviderView {
+  provider_id: string;
+  kind: string;
+  base_url: string | null;
+  enabled: boolean;
+  has_secret: boolean;
+  secret_last4: string;
+  secret_fingerprint: string;
+  extra: Record<string, unknown>;
+}
+
+export interface ProfileView {
+  profile: string;
+  provider_id: string;
+  model_id: string;
+  fallback_provider_id: string | null;
+  fallback_model_id: string | null;
+  enabled: boolean;
+  temperature: number;
+  max_tokens: number | null;
+  timeout_seconds: number;
+  daily_cost_limit: number | null;
+}
+
+export interface RevisionView {
+  revision: number;
+  state: string;
+  created_at: string | null;
+  published_at: string | null;
+  note: string | null;
+  validation_errors: ValidationIssue[];
+}
+
+export interface ValidationIssue {
+  field: string;
+  message: string;
+  /** error 阻断发布；warning 只提示（例如某个供应商还没存密钥）。 */
+  severity?: 'error' | 'warning';
+}
+
+export interface MemoryPolicy {
+  relative_score_floor: number;
+  rerank_top_n: number;
+  recency_half_life_days: number;
+  max_retention_days: number;
+}
+
+export interface LifePolicy {
+  scene_ttl_minutes: number;
+  energy_decay_per_hour: number;
+  social_load_per_turn: number;
+  social_load_decay_per_hour: number;
+  max_live_plans: number;
+}
+
+export interface DialoguePolicy {
+  group_turn_budget: number;
+  proactive_daily_limit: number;
+  quiet_start_minute: number;
+  quiet_end_minute: number;
+  private_may_stay_silent: number | boolean;
+  group_mention_requires_reply: number | boolean;
+  rest_may_skip: number | boolean;
+}
+
+export interface SettingsConfig {
+  schema_version: string;
+  revision: number;
+  test_mode: boolean;
+  memory: MemoryPolicy;
+  life: LifePolicy;
+  dialogue: DialoguePolicy;
+  providers: ProviderView[];
+  profiles: ProfileView[];
+  revisions: RevisionView[];
+  known_kinds: string[];
+  known_profiles: string[];
+  reserved_profiles?: Record<string, string>;
+  /** 未绑定职责 → 具体会失去什么。系统不报错，只会静默降级。 */
+  unbound_degradations?: Record<string, string>;
+}
+
+export interface DraftResponse {
+  revision: number;
+  state: string;
+  validation_errors: ValidationIssue[];
+}
+
+export interface SecretStatus {
+  provider_id: string;
+  has_secret: boolean;
+  last4: string;
+  fingerprint: string;
+}
+
+export interface ProbeResult {
+  provider_id: string;
+  ok: boolean;
+  detail: string;
+  latency_ms: number;
+  models: string[];
+}
+
+export interface ProviderDraftInput {
+  provider_id: string;
+  kind: string;
+  base_url: string | null;
+  enabled: boolean;
+  extra?: Record<string, unknown>;
+}
+
+export interface ProfileDraftInput {
+  profile: string;
+  provider_id: string;
+  model_id: string;
+  fallback_provider_id: string | null;
+  fallback_model_id: string | null;
+  enabled: boolean;
+  temperature: number;
+  max_tokens: number | null;
+  timeout_seconds: number;
+  daily_cost_limit: number | null;
+}
+
+/* ---------------------------------------------------------------- 角色 */
+
+export interface Persona {
+  persona_id: string;
+  revision: number;
+  name: string;
+  display_name: string;
+  system_prompt: string;
+  traits: Record<string, unknown>;
+  boundaries: string[];
+}
+
+export interface PersonaUpdate {
+  display_name?: string;
+  system_prompt?: string;
+  traits?: Record<string, unknown>;
+  boundaries?: string[];
+}
+
+export interface TimelineEvent {
+  id: string;
+  type: string;
+  origin: string;
+  visibility: string;
+  revision: number;
+  occurred_at: string | null;
+  window_id: string | null;
+  summary: string;
+}
+
+export interface TimelineResponse {
+  events: TimelineEvent[];
+}
+
+/* ---------------------------------------------------------------- SSE */
+
+export interface SseEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+export interface TurnStartedData {
+  turn_id: string;
+  state: TurnState;
+  user_message?: ChatMessage;
+  test_mode?: boolean;
+  config_revision?: number;
+  retried?: boolean;
+  replayed?: boolean;
+}
+
+export interface DeltaData {
+  text: string;
+  turn_id?: string;
+}
+
+export interface TurnFinalData {
+  turn_id: string;
+  state: TurnState;
+  text?: string;
+  model_label?: string | null;
+  message?: ChatMessage | null;
+  error?: ErrorPayload;
+  retried?: boolean;
+  replayed?: boolean;
+}
+
+/* ---------------------------------------------------------------- 设置分类法 */
+
+export type StorageKind = 'config_revision' | 'env' | 'business_table' | 'secret_store';
+
+export interface TaxonomyGroup {
+  key: string;
+  label: string;
+  defaults_to: StorageKind;
+}
+
+export interface TaxonomyCategory {
+  index: number;
+  key: string;
+  label: string;
+  /** 一句话：改这一类是在改什么 */
+  verb: string;
+  /** 硬边界问题，末尾带问号 */
+  boundary: string;
+  available: boolean;
+  /** GET 可达的入口；null 表示尚无设置面，前端不得渲染入口 */
+  editable_route: string | null;
+  status_route: string | null;
+  groups: TaxonomyGroup[];
+}
+
+export interface TaxonomyResponse {
+  categories: TaxonomyCategory[];
+  summary: { total: number; editable: number; pending: number };
+}
+
+/* ---------------------------------------------------------------- 授权 */
+
+export interface ConsentRecord {
+  scope: string;
+  granted: boolean;
+  revision: number;
+  valid_until: string | null;
+  note: string | null;
+}
+
+export interface ConsentsResponse {
+  consents: ConsentRecord[];
+  known_scopes: string[];
+  defaults: Record<string, boolean>;
+}
+
+export interface ConsentUpdate {
+  scope: string;
+  granted: boolean;
+  valid_until?: string | null;
+  note?: string | null;
+}
+
+/* ---------------------------------------------------------------- 生活 */
+
+export interface ActivityRecord {
+  activity_id: string;
+  kind: string;
+  state: string;
+  origin: string;
+  note: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  completion_evidence: string | null;
+}
+
+export interface ActivityResponse {
+  current: ActivityRecord | null;
+  history: ActivityRecord[];
+  note: string;
+}
+
+export interface GoalRecord {
+  goal_id: string;
+  title: string;
+  horizon: string;
+  state: string;
+  progress: number;
+  note: string | null;
+}
+
+export interface GoalsResponse {
+  goals: GoalRecord[];
+}
+
+export interface ProactiveOpportunity {
+  opportunity_id: string;
+  kind: string;
+  /** 内部推理：她为什么会想找你。不是要发出去的话。 */
+  reason: string;
+  /** 生成好的开场白。null = 还没生成。 */
+  draft_text: string | null;
+  expires_at: string;
+}
+
+export interface ProactiveResponse {
+  pending: ProactiveOpportunity[];
+  gate: boolean;
+  gate_reasons: string[];
+  /** 主动发送是否真的实现了。false 时候选只会过期，不会变成消息。 */
+  delivery_implemented?: boolean;
+  /** 开场白生成是否实现。 */
+  draft_implemented?: boolean;
+  /** 主动发送是否**开启**（与"是否实现"是两件事）。 */
+  delivery_enabled?: boolean;
+  note?: string;
+}
+
+
+export interface MediaUploadResponse {
+  evidence_id: string;
+  kind: string;
+  mime: string;
+  bytes: number;
+  note: string;
+}
+
+
+/* ------------------------------------------------------------ 多用户与账号 */
+
+export interface AccountRow {
+  account_id: string;
+  connector_instance: string;
+  external_account_id: string;
+  proof: string;
+  revoked: boolean;
+}
+
+export interface SubjectRow {
+  subject_id: string;
+  display_name: string;
+  trust_level: string;
+  /** 非空表示这个 subject 已被合并到别人名下（值就是那个人）。 */
+  merged_into: string | null;
+  accounts: AccountRow[];
+}
+
+export interface SubjectsResponse {
+  subjects: SubjectRow[];
+}
+
+export interface MergeResult {
+  source_id: string;
+  target_id: string;
+  /** 恒为 0：合并只写指针，不搬数据。非零说明实现被改坏了。 */
+  moved: number;
+}
+
+export interface UnmergeResult {
+  source_id: string;
+  was_merged_into?: string;
+  restored_memories: number;
+}
