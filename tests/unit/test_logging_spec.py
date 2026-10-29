@@ -389,3 +389,35 @@ def test_at_most_three_plans_a_day() -> None:
         f'{{"title":"t{i}","start":"1{i}:00","minutes":30}}' for i in range(6)
     ) + "]"
     assert len(parse_plan_json(many)) == 3
+
+
+# ---------------------------------------------------------------- 名字前缀
+
+
+def test_strip_self_prefix_removes_only_her_own_name() -> None:
+    """她照抄示例对话格式给自己加的前缀要剥掉；引用别人的话不动。
+
+    实测来源：人格里「示例语气」是一段带名字的对话记录（`她：…`），
+    模型照着学，开始在每条消息前加「她：」。这是格式残留，不是她的表达。
+    """
+    from ling.capabilities.naming import strip_self_prefix
+
+    text = "她：下午维护完就闲啦。\n她：打算去溜溜。\n她：你呢？"
+    cleaned, changed = strip_self_prefix(text, "她")
+    assert changed is True
+    assert cleaned == "下午维护完就闲啦。\n打算去溜溜。\n你呢？"
+
+    # 引用对方的话不能动
+    other = "对方：你说的对，我记下了。"
+    assert strip_self_prefix(other, "她") == (other, False)
+
+    # 名字为空时不剥任何东西
+    assert strip_self_prefix(text, "") == (text, False)
+
+
+def test_strip_self_prefix_handles_halfwidth_colon_and_spaces() -> None:
+    from ling.capabilities.naming import strip_self_prefix
+
+    cleaned, changed = strip_self_prefix("她: 在呢", "她")
+    assert changed is True
+    assert cleaned == "在呢"

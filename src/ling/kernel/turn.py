@@ -207,6 +207,8 @@ class TurnCoordinator:
         actor_id: str,
         persona_id: str,
         cancels: CancelRegistry,
+        # 她的显示名。用于剥掉"她：…"这种照抄示例格式的前缀。
+        display_name: str = "",
         arbiter: SpeakerArbiter | None = None,
         stream_log: StreamLog | None = None,
         turn_control: object | None = None,
@@ -215,6 +217,7 @@ class TurnCoordinator:
         self._router = router
         self._actor_id = actor_id
         self._persona_id = persona_id
+        self._display_name = display_name
         self._cancels = cancels
         # 多端同时说话时，同一角色同一时刻只在一个窗口"说"（设计文档 §5）
         self._arbiter = arbiter
@@ -628,6 +631,16 @@ class TurnCoordinator:
             cleaned, stripped = strip_service_tail(delivered)
             if stripped:
                 delivered = cleaned
+
+            # 她偶尔会照抄人设里"示例语气"的对话记录格式，给自己每条加
+            # 「她：」前缀。这是格式残留，不是她的表达——剥掉。
+            from ling.capabilities.naming import display_name_for, strip_self_prefix
+
+            _name = self._display_name or await display_name_for(self._persona_id)
+            _cleaned, _stripped = strip_self_prefix(delivered, _name)
+            if _stripped:
+                delivered = _cleaned
+                logger.info("已剥离她自己加的名字前缀")
             # 她可能选了 @/引用/拍一拍。**标记要从正文里剥掉**，
             # 否则发出去的话里会残留"[at:123]"这种说明书。
             # 解析顺序在分段之前：标记不该参与分段边界判断。

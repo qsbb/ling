@@ -49,6 +49,11 @@ async def update_persona(
         traits=body.traits,
         boundaries=body.boundaries,
     )
+    # 改名后要立刻失效名字缓存：否则"剥离自己名字前缀"还在按旧名判断，
+    # 新前缀就漏过去了。
+    from ling.capabilities.naming import invalidate_names
+
+    invalidate_names()
     # 角色设定变更属于权威时间线的一部分：管理员要能追溯"为什么语气变了"
     changed = [
         name
