@@ -49,3 +49,36 @@ async def test_degradation_text_is_actionable(logged_in: TestEnv) -> None:  # no
         # 中文信息密度高，「不能识别语音消息」8 个字已经说清了
         assert len(why) >= 6, f"{profile} 的说明太短，看不出后果：{why}"
         assert "未配置" not in why, f"{profile} 只说了没配置，没说失去什么：{why}"
+
+
+def test_proactive_status_reports_every_channel(monkeypatch) -> None:
+    """主动推送不可用时，**每个渠道的原因都要报出来**。
+
+    实测踩过：部署实例上 qqbot 配好了（只是平台没给主动推送权限），
+    而 `proactive_connector_status()` 只查 OneBot，于是界面只说
+    「OneBot 连接器已禁用」。用户去配 OneBot，照样发不出去，
+    真正的原因一个字都没提到。
+    """
+    from ling.capabilities import channels
+
+    class _Caps:
+        def __init__(self, *, enabled: bool, proactive: bool) -> None:
+            self.enabled = enabled
+            self.supports_proactive = proactive
+
+    class _OneBot:
+        def capabilities(self):  # noqa: ANN201
+            return _Caps(enabled=False, proactive=False)
+
+    monkeypatch.setattr(channels, "build_onebot_connector", lambda: _OneBot())
+    monkeypatch.setattr(
+        channels,
+        "qqbot_connector_status",
+        lambda: (None, "QQ 官方机器人默认只支持被动回复：主动推送需在开放平台单独申请"),
+    )
+
+    connector, reason = channels.proactive_connector_status()
+    assert connector is None
+    assert "OneBot" in reason
+    assert "QQ 官方机器人" in reason, "qqbot 的原因被吞了"
+    assert "开放平台" in reason

@@ -123,20 +123,37 @@ def proactive_connector_status() -> tuple[ChannelConnector | None, str | None]:
     - 连接器压根没配好 → 去配 OneBot
     - 配好了但没声明支持主动推送 → 去打开那个开关
     """
+    # **两个渠道都要如实报**。
+    #
+    # 原来只查 OneBot：部署实例上 qqbot 明明配好了（只是平台没给主动权限），
+    # 界面却只说「OneBot 连接器已禁用」。用户会去配 OneBot，然后照样发不出去，
+    # 而真正的原因（官方机器人需要单独申请主动推送权限）一个字都没提到。
+    reasons: list[str] = []
+
     try:
-        connector = build_onebot_connector()
+        onebot = build_onebot_connector()
     except Exception as exc:  # noqa: BLE001 - 构造失败按"没配好"处理
-        return None, f"OneBot 连接器不可用（{type(exc).__name__}），先检查连接配置"
-    caps = connector.capabilities()
-    if not caps.enabled:
-        return None, "OneBot 连接器已禁用（LING_QQ_ENABLED=0）"
-    if not caps.supports_proactive:
-        return (
-            None,
-            "当前实例没有声明支持主动推送（LING_ONEBOT_PROACTIVE=0）："
-            "确认该 QQ 号能主动发消息后设为 1",
-        )
-    return connector, None
+        onebot = None
+        reasons.append(f"OneBot 连接器不可用（{type(exc).__name__}），先检查连接配置")
+    if onebot is not None:
+        caps = onebot.capabilities()
+        if caps.enabled and caps.supports_proactive:
+            return onebot, None
+        if not caps.enabled:
+            reasons.append("OneBot 连接器已禁用（LING_QQ_ENABLED=0）")
+        else:
+            reasons.append(
+                "OneBot 没有声明支持主动推送（LING_ONEBOT_PROACTIVE=0）："
+                "确认该 QQ 号能主动发消息后设为 1"
+            )
+
+    qqconn, qqreason = qqbot_connector_status()
+    if qqconn is not None:
+        return qqconn, None
+    if qqreason:
+        reasons.append(qqreason)
+
+    return None, "；".join(reasons) if reasons else "没有可用的主动推送渠道"
 
 
 def qqbot_connector_status() -> tuple[ChannelConnector | None, str | None]:
