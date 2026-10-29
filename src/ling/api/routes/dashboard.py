@@ -223,13 +223,15 @@ async def get_dashboard(
         # （实测在部署实例上就报错了）。configured 只看凭据，主动能力单独说。
         channels: list[dict] = []
         try:
-            config = qqbot_config()
+            qq_config = qqbot_config()
             _connector, status_reason = qqbot_connector_status()
             channels.append(
                 {
                     "channel": "qqbot",
-                    "configured": config.configured,
-                    "reason": "" if config.configured else "凭据不全（APP_ID / CLIENT_SECRET）",
+                    "configured": qq_config.configured,
+                    "reason": ""
+                    if qq_config.configured
+                    else "凭据不全（APP_ID / CLIENT_SECRET）",
                     # 主动推送能力是平台权限，不是配置
                     "proactive_ready": _connector is not None,
                     "proactive_reason": status_reason or "",

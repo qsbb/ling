@@ -90,6 +90,14 @@ async def test_connectivity_separates_configured_from_proactive(
     assert qq["configured"] is True, qq
     assert qq["proactive_ready"] is False, qq
     assert "主动推送" in qq["proactive_reason"]
+    # 关键：打桩 qqbot 的配置**不能影响**模型绑定那一段。
+    # 曾经这里因为局部变量 `config` 遮蔽了外层的 ConfigDep，导致读模型绑定
+    # 时调到 QQBotConfig.effective() → AttributeError 被吞 → 显示"未绑定"。
+    assert "bound_model_roles" in data
+    assert isinstance(data["bound_model_roles"], list)
+    # 测试环境有 bootstrap 绑定，所以这里必须非空；
+    # 一旦被遮蔽成 AttributeError → 空列表，这条会红
+    assert data["bound_model_roles"], "模型绑定被读成空——检查 config 变量是否被遮蔽"
 
 
 async def test_failed_section_does_not_poison_the_rest(logged_in, monkeypatch) -> None:
