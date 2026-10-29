@@ -46,6 +46,17 @@ function record(name, ok, detail = '') {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
 }
+
+/**
+ * 因**环境**原因无法验证的项（例如模型供应商此刻不可用）。
+ *
+ * 与 PASS 分开记：既不能算通过（那是假绿），也不该算失败（界面没坏）。
+ * 汇总里单列出来，谁看都知道"这条没验成，原因是环境"。
+ */
+function skip(name, why) {
+  results.push({ name, ok: null, detail: why });
+  console.log(`SKIP  ${name} — ${why}`);
+}
 async function shot(page, name) {
   const file = path.join(SHOTS, `${name}.png`);
   await page.screenshot({ path: file, fullPage: false });
@@ -172,7 +183,17 @@ async function waitForReply(page, { timeout = 30000 } = {}) {
       const nodes = Array.from(document.querySelectorAll('[data-role="actor"], .message.actor, .msg-actor'));
       return nodes.length ? nodes[nodes.length - 1].textContent || '' : '';
     });
-    if (text && text === last) {
+    // **空气泡不算"稳定"**。角色气泡在第一个 token 到达前是空的，
+    // 原来的写法会把空字符串判成"连续稳定 3 次"直接返回，于是
+    // "收到回复"这条用例偶发拿到长度 0（实测出现 1/20 的概率）。
+    // 空的时候继续等，把稳定判定的预算留给真正有内容的时候。
+    if (!text) {
+      last = '';
+      stableCount = 0;
+      await page.waitForTimeout(250);
+      continue;
+    }
+    if (text === last) {
       stableCount += 1;
       if (stableCount >= 3) return text;
     } else {
@@ -182,6 +203,61 @@ async function waitForReply(page, { timeout = 30000 } = {}) {
     await page.waitForTimeout(250);
   }
   return last;
+}
+
+/**
+ * 从**服务端**取最后一条角色消息的正文。
+ *
+ * 为什么不只看 DOM：流式过程中气泡里会先出现「正在回应…」占位符，
+ * `waitForReply` 会把这个占位符当成回复返回——于是用例"通过"，
+ * 但通过的是占位符不是回复（实测抓到过长度 14 的假通过）。
+ * 轮次结束后以服务端落库的文本为准，断言的才是真的。
+ */
+async function lastActorText(page, sessionId) {
+  return page.evaluate(async (sid) => {
+    const r = await fetch(`/v1/sessions/${sid}/messages`, { credentials: 'same-origin' });
+    if (!r.ok) return '';
+    const data = await r.json();
+    const actors = (data.messages || []).filter((m) => m.role === 'actor');
+    return actors.length ? actors[actors.length - 1].text || '' : '';
+  }, sessionId);
+}
+
+/**
+ * 按**内容**去服务端找承载这条消息的会话，并等它产生角色回复。
+ *
+ * 为什么不用 URL 里的 sessionId：移动端发送前停在总览，发送瞬间会新建
+ * 会话并跳转；读 URL 的时机稍早就会拿到"空会话"，于是永远读到 0 条消息
+ * （实测就这么假失败过）。以服务端数据为准，时序问题就不存在了。
+ */
+async function waitForReplyByText(page, sentText, { timeout = 60000 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const found = await page.evaluate(async (needle) => {
+      const r = await fetch('/v1/sessions', { credentials: 'same-origin' });
+      if (!r.ok) return null;
+      const list = (await r.json()).sessions || [];
+      for (const s of list.slice(0, 5)) {
+        const mr = await fetch(`/v1/sessions/${s.session_id}/messages`, {
+          credentials: 'same-origin',
+        });
+        if (!mr.ok) continue;
+        const msgs = (await mr.json()).messages || [];
+        if (!msgs.some((m) => m.role === 'user' && (m.text || '').includes(needle))) continue;
+        const actors = msgs.filter((m) => m.role === 'actor');
+        return {
+          sessionId: s.session_id,
+          actorCount: actors.length,
+          last: actors.length ? actors[actors.length - 1].text || '' : '',
+          total: msgs.length,
+        };
+      }
+      return null;
+    }, sentText);
+    if (found && found.last.length > 0) return found;
+    await page.waitForTimeout(1000);
+  }
+  return null;
 }
 
 async function runDesktop(browser) {
@@ -320,9 +396,53 @@ async function runMobile(browser) {
 
   const sidMobile = await currentSessionId(page);
   if (sidMobile) await waitUntilIdle(page, sidMobile);
-  await sendMessage(page, '手机上也要能聊天');
-  const reply = await waitForReply(page);
-  record('手机：发送并收到回复', reply.length > 10, `长度 ${reply.length}`);
+  const mobileText = '手机上也要能聊天';
+  await sendMessage(page, mobileText);
+  // 以服务端为准：按消息内容找到承载它的会话，再等角色回复出现。
+  // 不依赖 URL 或 DOM 的时序（移动端发送会新建会话并跳转，读早一步就空）。
+  const hit = await waitForReplyByText(page, mobileText);
+  const sidAfter = hit ? hit.sessionId : null;
+  let reply = hit ? hit.last : '';
+
+  // 模型供应商偶发不可用（真实的 429/超时），真实用户会点重试。
+  // 这里也重试一次，避免把"环境抖动"记成"界面坏了"——但**只重试一次**，
+  // 重试还失败就如实判失败，不能把持续性故障赖过去。
+  if (reply.length === 0) {
+    const retryBtn = page.locator('button:has-text("重试")').first();
+    if (await retryBtn.count()) {
+      await retryBtn.click().catch(() => {});
+      const again = await waitForReplyByText(page, mobileText);
+      reply = again ? again.last : '';
+    }
+  }
+
+  const diag = sidAfter
+    ? await page.evaluate(async (sid) => {
+        const r = await fetch(`/v1/sessions/${sid}/messages`, { credentials: 'same-origin' });
+        const d = await r.json();
+        const msgs = d.messages || [];
+        return {
+          total: msgs.length,
+          last: msgs.length ? `${msgs[msgs.length - 1].role}/${msgs[msgs.length - 1].state}` : 'none',
+          active: d.active_turn || null,
+        };
+      }, sidAfter)
+    : { total: 0, last: 'no-session', active: null };
+  const pageText = (await page.locator('body').textContent()) || '';
+  const providerDown = /供应商不可用|model_unavailable/.test(pageText);
+  if (reply.length > 10) {
+    record('手机：发送并收到回复', true, `长度 ${reply.length}`);
+  } else if (providerDown) {
+    // 环境问题：模型供应商此刻不可用。界面本身是对的（它显示了可执行的错误
+    // 提示与重试按钮），所以既不算通过也不算失败——单列 SKIP。
+    skip('手机：发送并收到回复', '模型供应商不可用（环境问题，界面已给出可执行提示）');
+  } else {
+    record(
+      '手机：发送并收到回复',
+      false,
+      `长度 ${reply.length}；服务端消息 ${diag.total} 条，最后一条 ${diag.last}，进行中 ${diag.active || '无'}`,
+    );
+  }
   await shot(page, 'mobile-02-reply');
 
   await openSidebar(page);
@@ -490,12 +610,18 @@ try {
   await browser.close();
 }
 
-const failed = results.filter((r) => !r.ok);
+const failed = results.filter((r) => r.ok === false);
+const skipped = results.filter((r) => r.ok === null);
+const passed = results.filter((r) => r.ok === true);
 console.log('\n==== 汇总 ====');
-console.log(`通过 ${results.length - failed.length}/${results.length}`);
+console.log(`通过 ${passed.length}/${results.length}${skipped.length ? `（另有 ${skipped.length} 项因环境跳过）` : ''}`);
+if (skipped.length) {
+  console.log('跳过（环境原因，未验证）：');
+  for (const s of skipped) console.log(` - ${s.name}：${s.detail}`);
+}
 if (failed.length) {
   console.log('失败项：');
   for (const f of failed) console.log(` - ${f.name} ${f.detail}`);
   process.exit(1);
 }
-console.log('全部通过');
+console.log(skipped.length ? '其余全部通过' : '全部通过');
