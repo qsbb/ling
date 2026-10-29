@@ -326,7 +326,11 @@ async def upload_media(
         "kind": "image",
         "mime": mime,
         "bytes": len(data),
-        "note": "发消息时把这个 evidence_id 放进 media_evidence_ids 即可",
+        # **别指路到不存在的字段**。原来这里写着"把 evidence_id 放进
+        # media_evidence_ids"，而 `SendTurnBody` 根本没有这个字段——照着做
+        # 什么也不会发生。真实链路是：上传 → worker 用视觉模型描述 →
+        # 下一轮自动进她的上下文（同一窗口，最多 3 张）。
+        "note": "图片会在被识别后自动进入该会话的下一轮对话，无需额外传参",
     }
 
 
