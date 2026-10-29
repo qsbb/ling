@@ -68,12 +68,24 @@ def _section(status: str, data: Any = None) -> dict:
     }
 
 
-async def _guard(name: str, coro: Any) -> dict:
-    """跑一个片段的查询；失败只标记这一块，不影响整页。"""
+async def _guard(name: str, coro: Any, session: Any) -> dict:
+    """跑一个片段的查询；失败只标记这一块，不影响整页。
+
+    **失败后必须 rollback**：所有片段共用同一个请求级 session，一条失败的
+    查询会让它进入"需要回滚"状态，后面每一块都会跟着报错——表面上像
+    "每块都读不到"，实际只坏了一块（实测在部署实例上：记忆那块的失败把
+    会话搞脏，于是模型绑定也被读成空）。
+    """
     try:
         return await coro
     except Exception as exc:  # noqa: BLE001 - 单块失败不能拖垮首屏
-        logger.warning("仪表盘片段 %s 查询失败：%s", name, type(exc).__name__)
+        logger.warning(
+            "仪表盘片段 %s 查询失败：%s: %s", name, type(exc).__name__, exc
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - 回滚都失败就交给上层的请求生命周期
+            logger.warning("仪表盘片段 %s 回滚失败", name)
         return _section(SECTION_UNAVAILABLE)
 
 
@@ -254,7 +266,12 @@ async def get_dashboard(
                 for name, binding in effective.profiles.items()
                 if getattr(binding, "provider_id", None)
             ]
-        except Exception:  # noqa: BLE001 - 读不到就按未绑定报
+        except Exception as exc:  # noqa: BLE001 - 读不到就按未绑定报
+            # 不静默：这条一旦吞掉，界面会显示"没绑定模型"，
+            # 而真实原因是读配置出错——两者排查方向完全相反。
+            logger.warning(
+                "仪表盘读模型绑定失败：%s: %s", type(exc).__name__, exc
+            )
             bound = []
 
         return _section(
@@ -263,12 +280,12 @@ async def get_dashboard(
         )
 
     sections = {
-        "activity": await _guard("activity", activity()),
-        "affect": await _guard("affect", affect()),
-        "proactive": await _guard("proactive", proactive()),
-        "memories": await _guard("memories", memories()),
-        "relationship": await _guard("relationship", relationship()),
-        "connectivity": await _guard("connectivity", connectivity()),
+        "activity": await _guard("activity", activity(), session),
+        "affect": await _guard("affect", affect(), session),
+        "proactive": await _guard("proactive", proactive(), session),
+        "memories": await _guard("memories", memories(), session),
+        "relationship": await _guard("relationship", relationship(), session),
+        "connectivity": await _guard("connectivity", connectivity(), session),
     }
 
     return {

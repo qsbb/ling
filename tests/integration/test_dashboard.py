@@ -90,3 +90,62 @@ async def test_connectivity_separates_configured_from_proactive(
     assert qq["configured"] is True, qq
     assert qq["proactive_ready"] is False, qq
     assert "主动推送" in qq["proactive_reason"]
+
+
+async def test_failed_section_does_not_poison_the_rest(logged_in, monkeypatch) -> None:
+    """一块查询失败后，其它块照常返回（整页不变成错误页）。"""
+    from ling.domains.memory.service import MemoryService
+
+    async def boom(self, *_args, **_kwargs):  # noqa: ANN001
+        raise RuntimeError("模拟数据库错误")
+
+    monkeypatch.setattr(MemoryService, "list_memories", boom)
+
+    response = await logged_in.client.get("/v1/dashboard")
+    assert response.status_code == 200, response.text
+    sections = response.json()["sections"]
+    assert sections["memories"]["status"] == "unavailable"
+    assert sections["relationship"]["status"] == "ok"
+    assert sections["connectivity"]["status"] == "ok"
+
+
+async def test_failed_section_rolls_back_the_shared_session() -> None:
+    """失败后必须回滚：所有块共用同一个请求级 session。
+
+    一条失败的查询会让 session 进入"需要回滚"状态，后面每一块都会跟着报错。
+    实测在部署实例上就是这个现象：记忆那块失败，把模型绑定也读成空——
+    界面上看着"没配模型"，其实模型是好的。**一块坏、全员背锅**的假象
+    比直接报错难查得多，所以这里直接断言回滚被调用。
+    """
+    from ling.api.routes.dashboard import SECTION_UNAVAILABLE, _guard
+
+    class _Session:
+        def __init__(self) -> None:
+            self.rollbacks = 0
+
+        async def rollback(self) -> None:
+            self.rollbacks += 1
+
+    session = _Session()
+
+    async def boom():  # noqa: ANN202
+        raise RuntimeError("模拟查询失败")
+
+    result = await _guard("probe", boom(), session)
+    assert result["status"] == SECTION_UNAVAILABLE
+    assert session.rollbacks == 1, "失败片段没有回滚共享 session"
+
+
+async def test_rollback_failure_does_not_raise() -> None:
+    """回滚本身再失败，也不能把整页拖垮。"""
+    from ling.api.routes.dashboard import SECTION_UNAVAILABLE, _guard
+
+    class _BadSession:
+        async def rollback(self) -> None:
+            raise RuntimeError("回滚也炸了")
+
+    async def boom():  # noqa: ANN202
+        raise RuntimeError("查询失败")
+
+    result = await _guard("probe", boom(), _BadSession())
+    assert result["status"] == SECTION_UNAVAILABLE
