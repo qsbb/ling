@@ -58,10 +58,39 @@ class DecisionContext:
     has_meaningful_text: bool = True
 
 
+# 「为什么没回」的**受控枚举**。
+#
+# 为什么不让它自由文本：自由文本没法聚合。想问"最近她因为什么不回消息"时，
+# 得到的是几十种措辞各异的句子。事实用枚举，措辞放 reason。
+SKIP_CODES: frozenset[str] = frozenset(
+    {
+        "private_direct",  # 私聊直接对话，应当回复（不是跳过，便于统计分母）
+        "clarify_no_text",  # 私聊收到无文本内容，先澄清
+        "group_mentioned",  # 群里被点名/明确要求
+        "group_thread_continuation",  # 接着她的话说，属于延续
+        "group_no_meaningful_text",  # 纯表情/图片
+        "group_budget_exceeded",  # 群内发言配额用尽
+        "group_question_not_addressed",  # 泛问句，未指向她
+        "group_not_addressed",  # 普通群聊，未指向她
+        "model_chose_silence",  # 弹性区间里模型决定不接话
+        "model_replied",  # 弹性区间里模型决定接话
+        "resting",  # 她在休息/忙，这条先放着
+        "access_denied",  # 出入许可拦下
+        "quiet_hours",  # 勿扰时段
+        "duplicate_event",  # 重复事件
+        "no_meaningful_text",  # 通用：没有可回的内容
+        "connector_unavailable",  # 渠道不可用，投不出去
+    }
+)
+
+
 @dataclass
 class DecisionResult:
     decision: TurnDecision
     reason: str
+    # 「为什么」的机器可读结论。必须落在 SKIP_CODES 里——
+    # reason 是给人看的措辞，skip_code 是拿来检索聚合的事实。
+    skip_code: str = "group_not_addressed"
     # True 表示这是硬规则结论，不需要也不允许模型推翻
     hard: bool = True
     # 需要在群里"无声存在"时的建议动作（表情回应等），平台不支持则为 None
@@ -103,10 +132,12 @@ class DecisionEngine:
                 return DecisionResult(
                     decision=TurnDecision.clarify,
                     reason="私聊收到无文本内容，先问清对方想说什么",
+                    skip_code="clarify_no_text",
                 )
             return DecisionResult(
                 decision=TurnDecision.reply,
                 reason="私聊里用户直接对角色说话，必须回应",
+                skip_code="private_direct",
             )
 
         # ---------- 群聊：硬性不答 ----------
@@ -114,6 +145,7 @@ class DecisionEngine:
             return DecisionResult(
                 decision=TurnDecision.silence,
                 reason="群聊里的纯表情/图片不构成对角色的发问，不插话",
+                skip_code="group_no_meaningful_text",
                 silent_ack="react",
             )
 
@@ -122,6 +154,7 @@ class DecisionEngine:
             return DecisionResult(
                 decision=TurnDecision.reply,
                 reason="群里被点名或明确要求回答，必须回应（豁免频率限制）",
+                skip_code="group_mentioned",
             )
 
         # 群内已刷屏：硬性不答，避免变成噪音源
@@ -132,6 +165,7 @@ class DecisionEngine:
                     f"本群近期角色已发言 {ctx.recent_actor_turns} 次"
                     f"（上限 {ctx.group_turn_budget}），本轮不插话"
                 ),
+                skip_code="group_budget_exceeded",
                 silent_ack="react",
             )
 
@@ -140,6 +174,7 @@ class DecisionEngine:
             return DecisionResult(
                 decision=TurnDecision.reply,
                 reason="消息接着角色的话说，属于对话延续",
+                skip_code="group_thread_continuation",
                 hard=False,
             )
 
@@ -148,6 +183,7 @@ class DecisionEngine:
             return DecisionResult(
                 decision=TurnDecision.silence,
                 reason="群聊里的泛问句，未指向角色；默认不接话，交由模型判断是否值得插话",
+                skip_code="group_question_not_addressed",
                 hard=False,
             )
 
@@ -155,6 +191,7 @@ class DecisionEngine:
         return DecisionResult(
             decision=TurnDecision.silence,
             reason="群聊里的普通聊天，没有指向角色，不插话",
+            skip_code="group_not_addressed",
             silent_ack="react",
         )
 

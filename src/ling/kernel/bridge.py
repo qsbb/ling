@@ -37,6 +37,7 @@ from ling.kernel.autonomy import (
     make_situation_reader,
 )
 from ling.kernel.decision import DecisionContext, classify_text
+from ling.logging_setup import emit_event
 
 if TYPE_CHECKING:
     from ling.infra.models import Turn
@@ -263,6 +264,21 @@ class InboundBridge:
             await self._record_followup(
                 decision, subject_id=subject_id, window_id=window.id, message_id=msg.message_id
             )
+            # 「她为什么没回」的唯一权威记录。skip_code 是受控枚举，
+            # reason 是措辞——只看日志就能回答这个问题，不用读代码。
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="reply_decision_made",
+                message="决定不回应",
+                attributes={
+                    "decision": "silence",
+                    "skip_code": decision.skip_code,
+                    "hard_rule": decision.hard,
+                    "is_group": is_group,
+                    "reason": decision.reason,
+                },
+            )
             await self._session.commit()
             return BridgeResult(
                 accepted=True,
@@ -274,6 +290,20 @@ class InboundBridge:
                 media_note=media_note,
                 handled_as="ignored",
             )
+
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="reply_decision_made",
+            message="决定回应",
+            attributes={
+                "decision": decision.decision.value,
+                "skip_code": decision.skip_code,
+                "hard_rule": decision.hard,
+                "is_group": is_group,
+                "reason": decision.reason,
+            },
+        )
 
         # 4) 建轮次 + 落用户消息
         conversation = ConversationService(

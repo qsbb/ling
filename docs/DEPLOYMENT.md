@@ -166,6 +166,23 @@ docker logs ling-api-1 2>&1 | grep -E 'connector_(connected|disconnected|reconne
 docker logs ling-api-1 2>&1 | grep '"severity_text": "ERROR"'
 ```
 
+「她为什么没回这条消息」查这一条：
+
+```bash
+docker logs ling-api-1 2>&1 | grep reply_decision_made | grep '"skip_code"'
+```
+
+```json
+{"event_name": "reply_decision_made", "message": "决定不回应",
+ "attributes": {"decision": "silence", "skip_code": "group_not_addressed",
+                "hard_rule": true, "is_group": true,
+                "reason": "群聊里的普通聊天，没有指向角色，不插话"}}
+```
+
+`skip_code` 是**受控枚举**（`SKIP_CODES`），不是自由文本——自由文本没法聚合。
+措辞在 `reason` 里，事实在 `skip_code` 里。同一个事件名在「连接器入站」与
+「Web 对话」两条路径都会发，所以一条查询就能覆盖两个入口。
+
 连接器状态机的事件名是固定的：`connector_config_missing`、
 `connector_hello`、`connector_connected`、`connector_resumed`、
 `connector_disconnected`、`connector_reconnect_failed`、

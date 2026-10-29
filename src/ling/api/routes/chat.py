@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, File, Request, UploadFile
@@ -33,6 +34,9 @@ from ling.contracts.v1 import ErrorCode, TurnState
 from ling.kernel.autonomy import TurnChoice
 from ling.kernel.decision import TurnDecision
 from ling.kernel.turn import TurnCoordinator, TurnStreamEvent
+from ling.logging_setup import emit_event
+
+logger = logging.getLogger("ling.api.chat")
 
 router = APIRouter(tags=["chat"])
 
@@ -443,6 +447,27 @@ async def send_turn(
             source_ref=f"msg:{user_msg.message_id}",
         )
 
+    # 「她为什么没回」的唯一权威记录（Web 路径）。
+    # 与连接器入站路径用同一个事件名与同一套受控 skip_code，
+    # 这样"为什么没回"在两个入口的日志里是同一个查询。
+    emit_event(
+        logger,
+        logging.INFO,
+        event_name="reply_decision_made",
+        message="决定回应" if decision.respond else "决定不回应",
+        attributes={
+            "decision": "reply" if decision.respond else "silence",
+            # 机器可读的「为什么」，与日志里的同一套枚举
+            "skip_code": decision.skip_code,
+            "hard_rule": decision.hard,
+            "source": "web",
+            # 与连接器路径字段对齐：同一个查询要看得出群聊还是私聊
+            "is_group": getattr(window, "visibility", "") == "group_scope",
+            "model_status": getattr(decision.model_status, "value", ""),
+            "reason": decision.reason,
+        },
+    )
+
     if not decision.respond:
         # 沉默不是丢弃：消息已落库，只是不产生 actor 回复。
         # 前端需要知道"角色选择了不说话"，而不是永远等一个不会来的回复。
@@ -506,6 +531,8 @@ async def send_turn(
             "config_revision": effective.revision,
             "decision": "reply" if decision.respond else "silence",
             "decision_reason": decision.reason,
+            # 机器可读的「为什么」，与日志里同一套受控枚举
+            "skip_code": decision.skip_code,
             "decision_hard": decision.hard,
             "model_status": decision.model_status.value,
         },

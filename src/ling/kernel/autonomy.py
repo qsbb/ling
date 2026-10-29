@@ -159,6 +159,13 @@ class TurnChoice:
     # 决策时她的处境（便于事后复盘"当时为什么这么说"）
     availability: str = ""
     load_band: str = ""
+    # 「为什么」的受控枚举（见 decision.SKIP_CODES）。空字符串表示没有结论。
+    skip_code: str = ""
+
+    @property
+    def decision(self) -> TurnDecision:
+        """把 respond 折回三态里的两态，便于日志与调用方统一读。"""
+        return TurnDecision.reply if self.respond else TurnDecision.silence
 
     @property
     def hard(self) -> bool:
@@ -220,6 +227,7 @@ class AutonomyTurnService:
                 silent_ack=baseline.silent_ack,
                 availability=situation.availability,
                 load_band=situation.load_band,
+                skip_code=baseline.skip_code,
             )
 
         if not self._model_may_decide(ctx, policy, baseline):
@@ -230,6 +238,7 @@ class AutonomyTurnService:
                 baseline=baseline.decision.value,
                 baseline_hard=baseline.hard,
                 silent_ack=baseline.silent_ack,
+                skip_code=baseline.skip_code,
             )
 
         # ---- 处境：在歇着时先不进入决策 ----
@@ -244,6 +253,7 @@ class AutonomyTurnService:
                 baseline_hard=False,
                 availability=situation.availability,
                 load_band=situation.load_band,
+                skip_code="resting",
             )
 
         # ---- 模型参与 ----
@@ -257,6 +267,7 @@ class AutonomyTurnService:
                 baseline=baseline.decision.value,
                 baseline_hard=baseline.hard,
                 silent_ack=baseline.silent_ack,
+                skip_code=baseline.skip_code,
             )
 
         respond, reason, length, followup = verdict
@@ -272,6 +283,7 @@ class AutonomyTurnService:
             silent_ack=None if respond else baseline.silent_ack,
             availability=situation.availability if situation else "",
             load_band=situation.load_band if situation else "",
+            skip_code="model_replied" if respond else "model_chose_silence",
         )
 
     # ---------------------------------------------------------------- 内部
