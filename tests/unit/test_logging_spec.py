@@ -216,3 +216,75 @@ def test_extract_degradation_records_reason_not_just_type() -> None:
     assert "error_kind" in source, "降级日志没有记录原因分类"
     # 也不能退回去只打类型名
     assert 'type(exc).__name__)\n        return fallback_candidates' not in source
+
+
+# ---------------------------------------------------------------- 出网探测
+
+
+async def test_unreachable_provider_is_reported_not_silent(monkeypatch) -> None:
+    """连不上供应商时要喊出来，而不是只让能力悄悄变差。
+
+    实测背景：worker 只挂 `internal`（无外网）时，所有模型调用失败、
+    记忆提炼降级成正则，日志里只有一句"降级"，api 那边一切正常——
+    几天都没人发现"她怎么记不住事"。
+    """
+    import logging as _logging
+    import socket
+
+    from ling import worker
+
+    def _boom(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise OSError("Network is unreachable")
+
+    monkeypatch.setattr(socket, "create_connection", _boom)
+
+    records: list[_logging.LogRecord] = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Grab()
+    worker.logger.addHandler(handler)
+    worker.logger.setLevel(_logging.INFO)
+    try:
+        # 直接测探测函数对"连不上"的处理：用一个必然连不上的地址
+
+        class _P:
+            base_url = "http://127.0.0.1:1/v1"
+
+        class _Eff:
+            providers = {"p": _P()}
+
+        class _Svc:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            async def effective(self):  # noqa: ANN201
+                return _Eff()
+
+
+        class _Scope:
+            async def __aenter__(self):  # noqa: ANN204
+                return None
+
+            async def __aexit__(self, *_exc):  # noqa: ANN002
+                return False
+
+        monkeypatch.setattr(worker, "session_scope", lambda: _Scope())
+        monkeypatch.setattr("ling.settings.service.ConfigService", _Svc)
+        monkeypatch.setattr(
+            "ling.infra.security.SecretBox", lambda *_a, **_k: object()
+        )
+        await worker._probe_provider_reachability()
+    finally:
+        worker.logger.removeHandler(handler)
+
+    events = [
+        r for r in records
+        if getattr(r, "event_name", "") == "worker_provider_unreachable"
+    ]
+    assert events, [r.getMessage() for r in records]
+    attrs = events[-1].attributes
+    assert attrs["port"] == 1
+    assert "hint" in attrs

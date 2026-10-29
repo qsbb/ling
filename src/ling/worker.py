@@ -89,6 +89,11 @@ async def init_memory_router() -> bool:
         logger.info(
             "记忆提炼模型路由已就绪（%d 个凭据，配置 rev=%d）", written, revision
         )
+        # **主动探一次出网**。凭据齐、路由就绪，不等于这个进程能连到模型：
+        # 实测踩过 worker 只挂 `internal`（无外网）而 api 正常——所有模型
+        # 调用静默失败、降级成正则，日志里只有一句"降级"，看起来毫无异常。
+        # 这里在启动时把"连不上"喊出来，而不是等人几天后觉得"她怎么记不住事"。
+        await _probe_provider_reachability()
         return True
     except Exception as exc:  # noqa: BLE001
         logger.info("模型路由预热失败，记忆提炼将走正则降级: %s", type(exc).__name__)
@@ -224,6 +229,64 @@ async def _extract_candidates(
             },
         )
         return fallback_candidates(user_text)
+
+
+async def _probe_provider_reachability() -> None:
+    """探测本进程能否连到已绑定的模型供应商。
+
+    只做 TCP 连接（不发业务请求）：目的是区分"配置错了"和"这个进程压根
+    出不了网"。连不上就报 WARNING 并指明 host——这类故障不会让进程退出，
+    只会让能力悄悄变差，所以必须显式喊出来。
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        settings = get_settings()
+        from ling.infra.security import SecretBox
+        from ling.settings.service import ConfigService
+
+        async with session_scope() as session:
+            effective = await ConfigService(
+                session,
+                SecretBox(settings),
+                test_mode_default=settings.test_mode,
+                persona_id=settings.persona_id,
+            ).effective()
+            targets = {
+                (getattr(p, "base_url", None) or "")
+                for p in effective.providers.values()
+            }
+    except Exception as exc:  # noqa: BLE001 - 探测本身失败不该影响启动
+        logger.info("供应商可达性探测跳过: %s", type(exc).__name__)
+        return
+
+    for base_url in sorted(t for t in targets if t):
+        parsed = urlparse(base_url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            continue
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+        except OSError as exc:
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="worker_provider_unreachable",
+                message="worker 连不上模型供应商：本进程可能没有出网",
+                attributes={
+                    "host": host,
+                    "port": port,
+                    "error_type": type(exc).__name__,
+                    # 给出可执行方向，而不是让人去猜
+                    "hint": "检查该容器是否同时接入了可出网网络（compose networks）",
+                },
+            )
+            continue
+        logger.info("供应商可达：%s:%d", host, port)
+
 
 
 Handler = Callable[[dict], Awaitable[None]]
