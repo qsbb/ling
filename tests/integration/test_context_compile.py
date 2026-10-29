@@ -419,3 +419,39 @@ def test_rollup_keeps_previous_summary() -> None:
 
     text = render_rollup([], prev_summary="之前聊过做饭")
     assert text == "之前聊过做饭"
+
+
+async def test_affect_rows_queried_once_per_turn(web_env) -> None:
+    """情绪行一轮只查一次：第二次调用必须走缓存、不再碰数据库。
+
+    `current()` 与 `for_window()` 读同一张表同一批行，上下文装配两个都调——
+    原来每轮白扫两遍。这里用"把 execute 打桩成会炸"来证明第二次没查库，
+    而不是数包装函数调用次数（那样数的是调用，不是查询）。
+    """
+    from ling.domains.affect.service import AffectService
+    from ling.infra.db import session_scope
+
+    async with session_scope() as session:
+        svc = AffectService(session)
+        first = await svc._rows()  # noqa: SLF001 - 先真实查一次
+
+        async def _boom(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+            raise AssertionError("第二次读情绪又查库了")
+
+        session.execute = _boom  # type: ignore[method-assign]
+        second = await svc._rows()  # noqa: SLF001
+        await svc.current()
+        await svc.for_window("win_any")
+    assert second == first
+
+
+async def test_affect_write_invalidates_cache(web_env) -> None:
+    """写入后必须失效缓存，否则同一轮里会读到旧情绪。"""
+    from ling.domains.affect.service import AffectService
+    from ling.infra.db import session_scope
+
+    async with session_scope() as session:
+        svc = AffectService(session)
+        await svc._rows()  # noqa: SLF001 - 先填缓存
+        svc.invalidate()
+        assert svc.__dict__.get("_rows_cache") is None

@@ -131,7 +131,8 @@ async def test_life_tick_starts_an_activity_from_a_due_plan(web_env, monkeypatch
     from ling.domains.agenda.service import AgendaService
     from ling.infra.db import session_scope
 
-    now = datetime.now(UTC)
+    _freeze_clock(monkeypatch, worker)
+    now = _frozen_now()
     async with session_scope() as session:
         agenda = AgendaService(session, actor_id="actor_ling")
         await agenda.propose_plan(

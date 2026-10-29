@@ -512,8 +512,11 @@ class ContextCompiler:
         except Exception:  # noqa: BLE001 - 关系读不到不应阻断对话
             pass
 
-        # 窗口短记忆（过期即不注入）
+        # 窗口短记忆（过期即不注入）。
+        # **只读一次**：下面装配摘要层还要用同一行（原实现读了两遍，
+        # 中间没有任何写入——每轮白多一次数据库往返）。
         ctx = await self._conversation.read_window_context(window_id)
+        self._window_ctx_cache = ctx
         if ctx is not None and (ctx.topic or ctx.open_questions):
             parts = []
             if ctx.topic:
@@ -715,7 +718,8 @@ class ContextCompiler:
 
         # --- 分层装配：摘要层 + 最近原文层 ---
         # 1) 摘要层：已滚出原文窗口的早期对话
-        window_ctx = await self._conversation.read_window_context(window_id)
+        # 复用上面已经读过的那一行（见 `_window_ctx_cache`）
+        window_ctx = getattr(self, "_window_ctx_cache", None)
         if window_ctx is not None and window_ctx.summary:
             messages.append(
                 ChatMessageIn(

@@ -50,13 +50,30 @@ class AffectService:
         self._actor_id = actor_id
 
     async def _rows(self) -> list[AffectState]:
-        return list(
+        """同一轮里只查一次。
+
+        `current()` 与 `for_window()` 读的是**同一张表同一批行**，而上下文
+        装配会两个都调——原来等于每轮白扫两遍。服务实例按请求创建，缓存在
+        实例上不会跨轮串味。
+
+        写入后必须 `invalidate()`，否则会读到旧情绪。
+        """
+        cached = self.__dict__.get("_rows_cache")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        rows = list(
             (
                 await self._session.execute(
                     select(AffectState).where(AffectState.actor_id == self._actor_id)
                 )
             ).scalars()
         )
+        self._rows_cache = rows
+        return rows
+
+    def invalidate(self) -> None:
+        """写操作后调用，避免继续读到缓存里的旧情绪。"""
+        self.__dict__.pop("_rows_cache", None)
 
     async def current(self) -> AffectView:
         """读取**全局**语气趋势（跨窗口可用）。
@@ -177,6 +194,7 @@ class AffectService:
         await self._session.execute(
             sa_update(AffectState).where(AffectState.id == row.id).values(**values)
         )
+        self.invalidate()
         await self._session.flush()
         return await self.current()
         await self._session.flush()
