@@ -61,3 +61,32 @@ async def test_connectivity_reports_unbound_models(logged_in) -> None:
     assert isinstance(data["channels"], list)
     for ch in data["channels"]:
         assert set(ch) >= {"channel", "configured", "reason"}
+
+
+async def test_connectivity_separates_configured_from_proactive(
+    logged_in, monkeypatch
+) -> None:
+    """「凭据齐全」和「能主动推送」是两件事，不能混成一个 configured。
+
+    实测踩过：`qqbot_connector_status()` 在"有凭据但没申请主动推送"时返回
+    (None, 原因)，仪表盘拿它判断 configured，于是把配好的渠道显示成
+    "未配置"——用户会去翻凭据，而真正的问题是平台权限。
+    """
+
+    class _Cfg:
+        configured = True
+
+    monkeypatch.setattr(
+        "ling.capabilities.channels.qqbot_config", lambda: _Cfg()
+    )
+    monkeypatch.setattr(
+        "ling.capabilities.channels.qqbot_connector_status",
+        lambda: (None, "主动推送需在开放平台单独申请"),
+    )
+
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    data = body["sections"]["connectivity"]["data"]
+    qq = next(c for c in data["channels"] if c["channel"] == "qqbot")
+    assert qq["configured"] is True, qq
+    assert qq["proactive_ready"] is False, qq
+    assert "主动推送" in qq["proactive_reason"]

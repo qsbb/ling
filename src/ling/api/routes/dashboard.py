@@ -200,16 +200,27 @@ async def get_dashboard(
         )
 
     async def connectivity() -> dict:
-        from ling.capabilities.channels import qqbot_connector_status
+        from ling.capabilities.channels import (
+            qqbot_config,
+            qqbot_connector_status,
+        )
 
+        # **"配置齐备"与"能主动推送"是两件事**。
+        # `qqbot_connector_status()` 在"凭据齐全但没申请主动推送"时会返回
+        # (None, 原因)——用它判断 configured 会把配好的渠道误报成未配置
+        # （实测在部署实例上就报错了）。configured 只看凭据，主动能力单独说。
         channels: list[dict] = []
         try:
-            connector, reason = qqbot_connector_status()
+            config = qqbot_config()
+            _connector, status_reason = qqbot_connector_status()
             channels.append(
                 {
                     "channel": "qqbot",
-                    "configured": connector is not None,
-                    "reason": reason or "",
+                    "configured": config.configured,
+                    "reason": "" if config.configured else "凭据不全（APP_ID / CLIENT_SECRET）",
+                    # 主动推送能力是平台权限，不是配置
+                    "proactive_ready": _connector is not None,
+                    "proactive_reason": status_reason or "",
                 }
             )
         except Exception as exc:  # noqa: BLE001
