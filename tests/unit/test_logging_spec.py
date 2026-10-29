@@ -335,3 +335,57 @@ def test_empty_attention_tick_is_debug_not_info() -> None:
     assert "logging.INFO if polls else logging.DEBUG" in source, (
         "空轮询没有降级——会刷屏"
     )
+
+
+# ---------------------------------------------------------------- 日程解析
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '[{"title":"看两章小说","start":"10:30","minutes":60}]',
+        '```json\n[{"title":"看两章小说","start":"10:30","minutes":60}]\n```',
+        '好的，我安排一下：\n[{"title":"看两章小说","start":"10:30","minutes":60}]\n就这样。',
+        '{"title":"看两章小说","start":"10:30","minutes":60}',
+    ],
+)
+def test_parse_plan_json_is_lenient_but_strict(raw: str) -> None:
+    """模型输出常见三种干扰：代码块包裹、前后解释、只给一个对象。
+
+    都可以接受，但**条目本身必须合格**——没有 title 或时间格式不对的一律丢。
+    宁可今天少做一件，也不要写进一条看不出是什么的日程。
+    """
+    from ling.worker import parse_plan_json
+
+    plans = parse_plan_json(raw)
+    assert len(plans) == 1
+    assert plans[0]["title"] == "看两章小说"
+    assert plans[0]["start"] == "10:30"
+    assert plans[0]["minutes"] == 60
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "我没什么安排", "[", "[]", '[{"start":"10:30"}]', '[{"title":"x","start":"十点半"}]'],
+)
+def test_parse_plan_json_rejects_garbage(raw: str) -> None:
+    from ling.worker import parse_plan_json
+
+    assert parse_plan_json(raw) == []
+
+
+def test_plan_minutes_are_clamped() -> None:
+    """模型给离谱时长时收进合理区间，而不是照单全收。"""
+    from ling.worker import parse_plan_json
+
+    assert parse_plan_json('[{"title":"x","start":"9:00","minutes":9999}]')[0]["minutes"] == 180
+    assert parse_plan_json('[{"title":"x","start":"9:00","minutes":1}]')[0]["minutes"] == 15
+
+
+def test_at_most_three_plans_a_day() -> None:
+    from ling.worker import parse_plan_json
+
+    many = "[" + ",".join(
+        f'{{"title":"t{i}","start":"1{i}:00","minutes":30}}' for i in range(6)
+    ) + "]"
+    assert len(parse_plan_json(many)) == 3

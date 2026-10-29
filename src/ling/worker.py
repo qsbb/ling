@@ -16,7 +16,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, timedelta
 
 from sqlalchemy import select, update
 
@@ -1150,6 +1150,192 @@ async def _plan_window_ended(session, plan_id: str, *, now):  # noqa: ANN001, AN
     return plan_row is not None and _as_aware(plan_row.end_at) <= now
 
 
+
+LIFE_PLAN_SECONDS = 600.0
+# 今天是否已经尝试排过日程（进程内）。多副本会各自尝试一次，
+# 但 `max_live_plans` 是硬上限，不会排爆。
+_LAST_PLAN_DATE: str = ""
+
+
+def parse_plan_json(text: str) -> list[dict]:
+    """从模型输出里抠出日程数组。**宽容但不猜**。
+
+    模型经常加解释、用 ```json 包裹、或者只写一个对象。这里只接受
+    带 title 的条目，其它一律丢弃——宁可她今天少做一件，也不要写进
+    一条看不出是什么的日程。
+    """
+    import json
+    import re
+
+    if not text:
+        return []
+    cleaned = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", cleaned, re.S)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start >= 0 and end > start:
+        cleaned = cleaned[start : end + 1]
+    try:
+        data = json.loads(cleaned)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        start_at = str(item.get("start") or "").strip()
+        if not title or not re.fullmatch(r"\d{1,2}:\d{2}", start_at):
+            continue
+        try:
+            minutes = int(item.get("minutes") or 60)
+        except (TypeError, ValueError):
+            minutes = 60
+        minutes = max(15, min(180, minutes))
+        out.append({"title": title[:120], "start": start_at, "minutes": minutes})
+    return out[:3]
+
+
+@handler("life.plan")
+async def handle_life_plan(payload: dict) -> None:
+    """让她**自己排今天的日程**。
+
+    为什么需要这一步：`life.tick` 只在"有到点的计划"时才开活动，而计划
+    从来没有来源——于是活动表永远是空的，界面上"她此刻在做什么"永远
+    "没有登记中的活动"。她因此没有生活，只有一个能聊天的空壳。
+
+    设计取舍：
+    - 一天只排一次（醒来之后、且当天还没有在手的计划）
+    - 只安排"与人格相符的日常小事"，吃饭睡觉这类不需要记录
+    - 模型给不出可用结果就**不排**，绝不硬编"她在看书"
+    """
+    global _LAST_PLAN_DATE
+
+    from ling.domains.agenda.service import AgendaService
+    from ling.domains.persona.service import PersonaService
+    from ling.infra.security import SecretBox
+    from ling.ports.model import ChatMessageIn
+    from ling.settings.service import ConfigService
+
+    settings = get_settings()
+    router = _MEMORY_ROUTER
+    if router is None:
+        emit_event(
+            logger,
+            logging.WARNING,
+            event_name="life_plan_skipped",
+            message="日程未生成：模型路由未就绪",
+            attributes={"reason_code": "model_router_unavailable"},
+        )
+        return
+
+    actor_id = settings.actor_id
+    async with session_scope() as session:
+        agenda = AgendaService(session, actor_id=actor_id)
+        routine = await agenda.routine()
+        now = utcnow()
+        from ling.domains.agenda.service import _tz
+
+        local = now.astimezone(_tz(routine.timezone))
+        today = local.date().isoformat()
+
+        if today == _LAST_PLAN_DATE:
+            return
+        if not routine.is_awake(now):
+            return
+        if await agenda.upcoming():
+            # 已经有在手的计划（可能是昨天排的、还没做完），不重复排
+            _LAST_PLAN_DATE = today
+            return
+
+        persona = await PersonaService(session, settings.persona_id).get()
+        config = ConfigService(
+            session,
+            SecretBox(settings),
+            test_mode_default=settings.test_mode,
+            persona_id=settings.persona_id,
+        )
+        effective = await config.effective()
+        profile = (
+            "memory.extract"
+            if effective.profiles.get("memory.extract")
+            else "dialogue.fast"
+        )
+        prompt = (
+            f"你是{persona.display_name}。你的人设片段：\n"
+            f"{(persona.system_prompt or '')[:1200]}\n\n"
+            f"今天是 {today}。请为**今天**安排 1-3 件你会做的日常小事。\n"
+            "要求：\n"
+            "- 只安排符合你性格与身份的小事（看书、散步、收拾、做手工之类）\n"
+            "- 时间用 24 小时制 HH:MM，每件 30-120 分钟\n"
+            "- 不要安排吃饭睡觉这种不需要记录的\n"
+            "只输出 JSON 数组，不要解释：\n"
+            '[{"title":"看两章小说","start":"10:30","minutes":60}]'
+        )
+        chunks: list[str] = []
+        try:
+            async for chunk, _outcome in router.stream(  # type: ignore[attr-defined]
+                effective,
+                profile=profile,
+                messages=[ChatMessageIn(role="user", content=prompt)],
+                allow_fallback=False,
+            ):
+                if chunk.delta:
+                    chunks.append(chunk.delta)
+        except Exception as exc:  # noqa: BLE001 - 排不出日程不该影响别的任务
+            kind = getattr(getattr(exc, "kind", None), "value", "") or type(exc).__name__
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="life_plan_skipped",
+                message="日程未生成：模型调用失败",
+                attributes={"reason_code": "model_error", "error_kind": kind},
+            )
+            return
+
+        plans = parse_plan_json("".join(chunks))
+        created = 0
+        for item in plans:
+            hour, minute = (int(x) for x in item["start"].split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                continue
+            start_at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            end_at = start_at + timedelta(minutes=item["minutes"])
+            if end_at <= now.astimezone(_tz(routine.timezone)):
+                continue  # 已经过去的时间段不排
+            try:
+                view = await agenda.propose_plan(
+                    kind="simulated",
+                    title=item["title"],
+                    start_at=start_at.astimezone(UTC),
+                    end_at=end_at.astimezone(UTC),
+                    commitment_level="tentative",
+                )
+            except ValueError:
+                continue
+            if view is not None:
+                created += 1
+
+        _LAST_PLAN_DATE = today
+        emit_event(
+            logger,
+            logging.INFO if created else logging.WARNING,
+            event_name="life_plans_proposed",
+            message="今日日程已安排" if created else "今日日程未生成",
+            attributes={
+                "created": created,
+                "parsed": len(plans),
+                "date": today,
+                "reason_code": "" if created else "model_returned_no_usable_plan",
+            },
+        )
+
 @handler("life.tick")
 async def handle_life_tick(payload: dict) -> None:
     """生活推进：只在**时段边界或到点计划**时动手。
@@ -1803,6 +1989,7 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
     PeriodicJob("attention.tick", handle_attention_tick, {"shadow": True}, ATTENTION_TICK_SECONDS),
     PeriodicJob("embedding.backfill", handle_embedding_backfill, {}, EMBEDDING_BACKFILL_SECONDS),
     PeriodicJob("intent.tick", handle_intent_tick, {}, PROACTIVE_COLLECT_SECONDS),
+    PeriodicJob("life.plan", handle_life_plan, {}, LIFE_PLAN_SECONDS),
     PeriodicJob("life.tick", handle_life_tick, {}, LIFE_TICK_SECONDS),
     PeriodicJob("media.describe", handle_media_describe, {}, MEDIA_DESCRIBE_SECONDS),
     PeriodicJob("proactive.collect", handle_proactive_collect, {"shadow": True}, PROACTIVE_COLLECT_SECONDS),

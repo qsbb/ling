@@ -203,6 +203,16 @@ docker logs ling-api-1 2>&1 | grep reply_decision_made | grep '"skip_code"'
 措辞在 `reason` 里，事实在 `skip_code` 里。同一个事件名在「连接器入站」与
 「Web 对话」两条路径都会发，所以一条查询就能覆盖两个入口。
 
+### 她的日程（life.plan / life.tick）
+
+| 事件 | 说明 |
+|---|---|
+| `life_plans_proposed` | 今天排了几件（`created` / `parsed` / `date`）；没排出时带 `reason_code` |
+
+规则：**一天只排一次**（醒来后、当天没有在手计划时）；模型不可用或给不出
+可用条目就**不排**，也绝不硬编"她在看书"。已经过去的时段不排——否则下午
+打开界面会看到"她正在做一件早就该结束的事"，比空着更假。
+
 ### 群聊轮询与主动联系
 
 | 事件 | 回答什么 |
