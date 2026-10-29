@@ -29,8 +29,9 @@ ACTOR = "actor_ling"
 DEFAULTS = {
     "group_turn_budget": 3,
     "proactive_daily_limit": 2,
-    "quiet_start_minute": 1380,
-    "quiet_end_minute": 480,
+    # 免打扰默认关闭（起点==终点恒不成立），见 ports/config.py 的说明
+    "quiet_start_minute": 0,
+    "quiet_end_minute": 0,
     # 自主度：私聊可沉默（用户明确要求），群里被 @ 仍必须回
     "private_may_stay_silent": True,
     "group_mention_requires_reply": True,

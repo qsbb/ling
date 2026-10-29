@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -149,9 +149,7 @@ async def supersede_memory(
     memory_id: str, body: MemorySupersede, auth: CurrentAuth, session: DbSession
 ) -> dict:
     await _own_memory_or_404(session, memory_id, auth.user.subject_id)
-    new_id_value = await MemoryService(session).supersede(
-        memory_id, body.text, reason=body.reason
-    )
+    new_id_value = await MemoryService(session).supersede(memory_id, body.text, reason=body.reason)
     if new_id_value is None:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
     audit_event(
@@ -246,9 +244,7 @@ async def get_affect(auth: CurrentAuth, session: DbSession, settings: SettingsDe
             "tone_hint": current.tone_hint(),
             "cause": current.cause,
         },
-        "all": [
-            {"emotion": v.emotion, "intensity": v.intensity} for v in snapshot
-        ],
+        "all": [{"emotion": v.emotion, "intensity": v.intensity} for v in snapshot],
         "note": "情绪只影响措辞，不放宽权限",
     }
 
@@ -455,8 +451,15 @@ async def list_proactive(
     from ling.capabilities.channels import proactive_connector_status
 
     _connector, _why_not = proactive_connector_status()
+    # 免打扰窗必须来自**已发布配置**，不能留给服务里的默认值：
+    # 面板上改了 0-0（关闭）却仍然报「处于勿扰时段（23:00-08:00）」，
+    # 用户会以为设置没保存。这里把生效值显式传下去。
+    _qs = getattr(effective_dialogue, "quiet_start_minute", None) if effective_dialogue else None
+    _qe = getattr(effective_dialogue, "quiet_end_minute", None) if effective_dialogue else None
     gate = await service.gate(
         subject_id=auth.user.subject_id,
+        quiet_start=time(_qs // 60, _qs % 60) if _qs is not None else None,
+        quiet_end=time(_qe // 60, _qe % 60) if _qe is not None else None,
         channel_can_proactive=_connector is not None,
         channel_proactive_reason=_why_not,
         # 必须传用户时区：勿扰时段和"今日已发几条"都按当地作息算。
@@ -495,8 +498,7 @@ async def list_proactive(
             "主动发送已实现但**默认关闭**。开启前建议先看几天草稿，"
             "确认语气合适；未开启时这些话不会真的发出去，到时间会过期。"
             if not (
-                effective_dialogue is not None
-                and effective_dialogue.proactive_delivery_enabled
+                effective_dialogue is not None and effective_dialogue.proactive_delivery_enabled
             )
             else "主动发送已开启。受勿扰时段、每日限额与渠道能力约束。"
         ),
@@ -611,7 +613,10 @@ async def add_knowledge(body: KnowledgeCreate, auth: CurrentAuth, session: DbSes
         )
     except ValueError as exc:
         raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
-    return {"item_id": view.item_id, "valid_until": view.valid_until.isoformat() if view.valid_until else None}
+    return {
+        "item_id": view.item_id,
+        "valid_until": view.valid_until.isoformat() if view.valid_until else None,
+    }
 
 
 # ------------------------------------------------------------------ 会话隔离与跨会话意识
@@ -645,9 +650,7 @@ async def get_isolation(auth: CurrentAuth, session: DbSession) -> dict:
 
 
 @router.put("/isolation")
-async def set_isolation(
-    body: IsolationBody, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def set_isolation(body: IsolationBody, auth: CurrentAuth, session: DbSession) -> dict:
     from ling.domains.awareness.service import AwarenessService, IsolationMode
 
     policy = await AwarenessService(session).set_mode(
@@ -849,9 +852,7 @@ async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
 
 
 @router.put("/core-memory")
-async def upsert_core_memory(
-    body: CoreMemoryBody, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def upsert_core_memory(body: CoreMemoryBody, auth: CurrentAuth, session: DbSession) -> dict:
     """写入或更新核心记忆（同 label 覆盖，避免互相矛盾的重复条目）。"""
     from ling.domains.memory.core import CoreMemoryService
 
@@ -869,9 +870,7 @@ async def upsert_core_memory(
 
 
 @router.delete("/core-memory/{core_id}")
-async def delete_core_memory(
-    core_id: str, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def delete_core_memory(core_id: str, auth: CurrentAuth, session: DbSession) -> dict:
     from ling.domains.memory.core import CoreMemoryService
 
     ok = await CoreMemoryService(session).deactivate(core_id, auth.user.subject_id)
@@ -968,9 +967,7 @@ async def merge_subjects(body: MergeSubjectBody, auth: CurrentAuth, session: DbS
     from ling.domains.identity.service import IdentityService
 
     try:
-        result = await IdentityService(session).merge_subjects(
-            body.source_id, body.target_id
-        )
+        result = await IdentityService(session).merge_subjects(body.source_id, body.target_id)
     except ValueError as exc:
         raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
     return result
@@ -995,9 +992,7 @@ async def unmerge_subject(source_id: str, auth: CurrentAuth, session: DbSession)
 
 
 @router.post("/accounts/bind")
-async def bind_account(
-    body: BindAccountBody, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def bind_account(body: BindAccountBody, auth: CurrentAuth, session: DbSession) -> dict:
     """绑定渠道账号（QQ 号 / 微信 openid 等）。
 
     **这一步是 OneBot/QQ 接入的前置条件**：入站事件要先解析成自然人，
@@ -1031,9 +1026,7 @@ async def bind_account(
 
 
 @router.post("/accounts/{account_id}/prove")
-async def prove_account(
-    account_id: str, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def prove_account(account_id: str, auth: CurrentAuth, session: DbSession) -> dict:
     """把绑定标记为已证明（人工确认账号归属后调用）。"""
     from ling.api.errors import LingError
     from ling.contracts.v1 import ErrorCode
@@ -1054,9 +1047,7 @@ async def prove_account(
 
 
 @router.delete("/accounts/{account_id}")
-async def unbind_account(
-    account_id: str, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def unbind_account(account_id: str, auth: CurrentAuth, session: DbSession) -> dict:
     """解绑。保留 revoked_at 供审计，解绑后不再解析成该自然人。"""
     from ling.api.errors import LingError
     from ling.contracts.v1 import ErrorCode
@@ -1123,7 +1114,9 @@ async def call_tool(
 
     spec = next((s for s in registry.list_specs() if s.tool_id == tool_id), None)
     if spec is None:
-        raise LingError(ErrorCode.unsupported_capability, f"未注册的工具: {tool_id}", status_code=404)
+        raise LingError(
+            ErrorCode.unsupported_capability, f"未注册的工具: {tool_id}", status_code=404
+        )
 
     # 工具执行必须过权限硬门（设计文档 §1 第 7 条）：
     # 不可逆动作与公开发布由系统裁决，不由模型或调用方决定。
@@ -1238,8 +1231,7 @@ async def list_together(request: Request, auth: CurrentAuth, session: DbSession)
             for s in sessions
         ],
         "note": (
-            "共处会话已持久化（重启不丢）。进度只来自客户端真实回报，"
-            "服务端不猜「看到哪了」。"
+            "共处会话已持久化（重启不丢）。进度只来自客户端真实回报，服务端不猜「看到哪了」。"
         ),
     }
 
@@ -1262,9 +1254,7 @@ async def create_together(
 
 
 @router.get("/publishing")
-async def publishing_status(
-    request: Request, auth: CurrentAuth, session: DbSession
-) -> dict:
+async def publishing_status(request: Request, auth: CurrentAuth, session: DbSession) -> dict:
     """发布的授权状态。两层分开报，避免把"宿主有能力"误读成"我已授权"。"""
     from ling.capabilities.publishing import PUBLISH_SCOPE
     from ling.domains.consent.service import ConsentService
@@ -1375,17 +1365,16 @@ async def attention_stats(auth: CurrentAuth, session: DbSession) -> dict:
 
     by_decision = (
         await session.execute(
-            select(AttentionPollLogRow.decision, func.count(AttentionPollLogRow.id))
-            .group_by(AttentionPollLogRow.decision)
+            select(AttentionPollLogRow.decision, func.count(AttentionPollLogRow.id)).group_by(
+                AttentionPollLogRow.decision
+            )
         )
     ).all()
 
     recent = (
         (
             await session.execute(
-                select(AttentionPollLogRow)
-                .order_by(AttentionPollLogRow.polled_at.desc())
-                .limit(20)
+                select(AttentionPollLogRow).order_by(AttentionPollLogRow.polled_at.desc()).limit(20)
             )
         )
         .scalars()
@@ -1500,7 +1489,5 @@ def _qqbot_capabilities(settings: Settings) -> dict:
         "supports_proactive": config.supports_proactive,
         "supports_media": config.supports_media,
         "max_text_length": config.max_text_length,
-        "webhook_signing_configured": bool(
-            config.bot_secret or config.webhook_public_key_hex
-        ),
+        "webhook_signing_configured": bool(config.bot_secret or config.webhook_public_key_hex),
     }

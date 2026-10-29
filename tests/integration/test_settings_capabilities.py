@@ -82,3 +82,4 @@ def test_proactive_status_reports_every_channel(monkeypatch) -> None:
     assert "OneBot" in reason
     assert "QQ 官方机器人" in reason, "qqbot 的原因被吞了"
     assert "开放平台" in reason
+

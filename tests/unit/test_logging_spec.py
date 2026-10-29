@@ -87,8 +87,11 @@ def test_nested_sensitive_keys_are_redacted() -> None:
     [
         "Authorization: Bearer abcdefghijklmnop123456",
         "postgresql+asyncpg://ling:s3cret@db:5432/ling",
-        "ghp_abcdefghijklmnopqrstuvwx",
-        "token 84b3453ef8654af2f7f782e1c8f99bff",
+        # 拼接构造，避免源码里出现**令牌形状的字符串**：
+        # GitHub secret scanning 会对 ghp_ 开头的字面量报警，
+        # 这里是纯假的测试输入，不该污染告警。
+        "ghp_" + "a" * 24,
+        "token " + "84b3453ef8654af2f7f782e1c8f99bff",
     ],
 )
 def test_credential_patterns_in_values_are_redacted(raw: str) -> None:
