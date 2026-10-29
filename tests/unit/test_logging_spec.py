@@ -195,3 +195,24 @@ def test_emit_event_carries_attributes() -> None:
     assert captured
     assert captured[0].event_name == "worker_outbox_claimed"
     assert captured[0].attributes["queue_age_ms"] == 12
+
+
+# ---------------------------------------------------------------- 降级可诊断
+
+
+def test_extract_degradation_records_reason_not_just_type() -> None:
+    """降级日志必须带**原因**，不能只记异常类型名。
+
+    实测背景：worker 报"模型提炼不可用，降级为正则: ModelError" ——
+    可 `ModelError` 有十几种 kind（超时/限流/密钥无效/职责没绑…），
+    类型名一律相同，光看它根本没法排查，只能去读代码。
+    """
+    import inspect
+
+    from ling import worker
+
+    source = inspect.getsource(worker)
+    assert "memory_extract_degraded" in source, "降级事件名缺失"
+    assert "error_kind" in source, "降级日志没有记录原因分类"
+    # 也不能退回去只打类型名
+    assert 'type(exc).__name__)\n        return fallback_candidates' not in source

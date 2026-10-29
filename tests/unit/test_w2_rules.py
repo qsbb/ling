@@ -1533,3 +1533,26 @@ def test_dockerfile_ships_connectors_package() -> None:
     # pyproject 里也要声明，否则打了 wheel 也没它
     pyproject = Path("pyproject.toml").read_text()
     assert "connectors" in pyproject, "pyproject 没把 connectors 打进 wheel"
+
+
+def test_worker_container_has_network_egress() -> None:
+    """worker 必须能出网。
+
+    它要调用模型（记忆提炼、关系更新、主动消息生成）。`internal` 网络是
+    `internal: true`，**没有外网**；worker 只挂它时，所有模型调用都失败，
+    而且不报错——只会打出"模型提炼不可用，降级为正则"，能力悄悄变差。
+    实测在部署实例上就是这样：api 正常、worker 静默降级好几天没人发现。
+
+    这类"配置看着齐全、跑起来也不报错、但功能全废"的故障，必须有测试钉住。
+    """
+    from pathlib import Path
+
+    import yaml
+
+    data = yaml.safe_load(Path("deploy/compose.yaml").read_text())
+    networks = data["services"]["worker"].get("networks") or []
+    assert "edge" in networks, f"worker 没有出网能力：networks={networks}"
+    # internal 仍然要保留：数据库只在内网
+    assert "internal" in networks, f"worker 丢了内网访问：networks={networks}"
+    # 网络定义本身没变
+    assert data["networks"]["internal"].get("internal") is True

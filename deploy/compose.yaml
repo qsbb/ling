@@ -218,7 +218,11 @@ services:
       timeout: 8s
       retries: 3
       start_period: 20s
-    networks: [internal]
+    # **worker 需要出网**：记忆提炼、关系更新、主动消息生成都要调用模型。
+    # 只挂 `internal`（internal: true，无外网）时，worker 会静默降级——
+    # 实测在部署实例上表现为"模型提炼不可用，降级为正则: ModelError"，
+    # 而 api 一切正常，因为 api 在 edge 上。这种故障没有报错，只是能力悄悄变差。
+    networks: [internal, edge]
 
 volumes:
   db-data:

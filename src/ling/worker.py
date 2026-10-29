@@ -34,7 +34,7 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # 用统一配置：worker 和 api 的日志格式、级别、第三方降噪必须一致，
 # 否则一条链路在两个进程里长得不一样，对不起来。
-from ling.logging_setup import setup_logging  # noqa: E402 - 需要先设好环境
+from ling.logging_setup import emit_event, setup_logging  # noqa: E402
 
 setup_logging(role="worker")
 logger = logging.getLogger("ling.worker")
@@ -206,7 +206,23 @@ async def _extract_candidates(
         # 模型明确给出空结果，说明"确实没有可记的"，不用正则硬凑
         return parse_candidates("".join(chunks))
     except Exception as exc:  # noqa: BLE001 - 提炼失败不能影响主流程
-        logger.info("模型提炼不可用，降级为正则: %s", type(exc).__name__)
+        # **只记异常类型是不够的**：`ModelError` 有十几种原因（超时、限流、
+        # 密钥无效、职责没绑…），类型名一律是 "ModelError"，光看它没法排查。
+        # 这里记确定性分类（kind）与是否可重试——它们不含正文，可以安全落日志。
+        kind = getattr(getattr(exc, "kind", None), "value", "") or type(exc).__name__
+        emit_event(
+            logger,
+            logging.WARNING,
+            event_name="memory_extract_degraded",
+            message="模型提炼不可用，已降级为正则",
+            attributes={
+                "error_kind": kind,
+                "retriable": bool(getattr(exc, "retriable", False)),
+                # 字段名避开 SENSITIVE_KEYS 里的 "profile"：那个词是为
+                # 用户画像设的，模型职责名不该被一起打码
+                "model_profile": "memory.extract -> dialogue.fast",
+            },
+        )
         return fallback_candidates(user_text)
 
 
