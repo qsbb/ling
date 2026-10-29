@@ -32,14 +32,42 @@ python -m ling
 
 ```bash
 cd /opt/ling
+bash deploy/install.sh              # 一条命令：生成配置、构建、起服务、等就绪
+```
+
+或手动：
+
+```bash
 cp deploy/env.example deploy/.env
-# 编辑 deploy/.env：至少设置 POSTGRES_PASSWORD、LING_BOOTSTRAP_ADMIN_PASSWORD、
-# LING_ROOT_KEY（固定值，用于加密供应商密钥），并把 LING_TEST_MODE 设为 0
+# 编辑 deploy/.env：至少设置 POSTGRES_PASSWORD 与 LING_ROOT_KEY
+# （固定值，用于加密供应商密钥），并把 LING_TEST_MODE 设为 0
 
 cd clients/web-console && pnpm install && pnpm build && cd ../..
 docker compose -f deploy/compose.yaml --project-name ling-dev up -d --build
 curl http://127.0.0.1:8080/readyz
 ```
+
+### 首次登录的账号
+
+`LING_BOOTSTRAP_ADMIN_PASSWORD` **留空**是推荐做法：应用会在首次启动时生成随机
+口令，并打印在日志里：
+
+```
+==============================================================
+  首次安装：已创建管理员账号（口令是随机生成的）
+    用户名  ling
+    密码    xxxxxxxxxxxxxxxx
+==============================================================
+```
+
+```bash
+docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
+```
+
+拿到后登录，系统会**强制要求改密码**（改密前除 `/v1/auth/*` 外全部 403）。
+改密时会吊销其它登录会话，只保留当前这次。
+
+想自己指定初始口令，就显式设置 `LING_BOOTSTRAP_ADMIN_PASSWORD`——此时不会强制改密。
 
 服务：`db`（不暴露端口）、`api`（8080）、`worker`（outbox/恢复）、`web`（构建产物挂载到 api）。
 

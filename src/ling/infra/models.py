@@ -58,6 +58,12 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(32), default="owner")  # owner | member
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 首次安装生成的是随机口令，只打印在启动日志里。置 True 时除 /v1/auth/*
+    # 之外的接口一律拒绝，逼用户先改成自己记得的密码——否则那个随机串
+    # 会永远留在日志和 .env 里，成为长期后门。
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
 
 

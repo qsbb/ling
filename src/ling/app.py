@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -80,20 +81,38 @@ async def _bootstrap(settings: Settings) -> None:
     async with session_scope() as session:
         identity = IdentityService(session)
         await PersonaService(session, settings.persona_id).ensure_default()
-        if settings.bootstrap_admin_password:
-            if await identity.count_users() == 0:
-                await identity.create_user(
-                    username=settings.bootstrap_admin_user,
-                    password=settings.bootstrap_admin_password,
-                    role="owner",
-                    display_name=settings.bootstrap_admin_user,
-                )
-                logger.info("已创建引导管理员账号 %s", settings.bootstrap_admin_user)
-        elif await identity.count_users() == 0:
+        if await identity.count_users() > 0:
+            return
+        # 首次安装：没有配置口令就生成一个随机口令，并**打印到日志**。
+        #
+        # 为什么不再"没配就报错让人去配环境变量"：安装脚本已经把服务拉起来了，
+        # 报错只会让人对着一个起不来的服务猜。随机口令 + 日志打印 + 强制改密，
+        # 三件事一起做才既安全又能让人真的登进去。
+        generated = not settings.bootstrap_admin_password
+        password = settings.bootstrap_admin_password or secrets.token_urlsafe(15)
+        await identity.create_user(
+            username=settings.bootstrap_admin_user,
+            password=password,
+            role="owner",
+            display_name=settings.bootstrap_admin_user,
+            must_change_password=generated,
+        )
+        if generated:
             logger.warning(
-                "没有配置 LING_BOOTSTRAP_ADMIN_PASSWORD，且库中没有用户："
-                "请设置该环境变量后重启，或用 scripts/dev_seed.py 建账号"
+                "\n"
+                "%s\n"
+                "  首次安装：已创建管理员账号（口令是随机生成的）\n"
+                "    用户名  %s\n"
+                "    密码    %s\n"
+                "  登录后会强制要求修改密码。这条口令也只在此处出现一次。\n"
+                "%s",
+                "=" * 64,
+                settings.bootstrap_admin_user,
+                password,
+                "=" * 64,
             )
+        else:
+            logger.info("已创建引导管理员账号 %s", settings.bootstrap_admin_user)
 
 
 @asynccontextmanager

@@ -5,6 +5,7 @@
 #
 #   bash deploy/install.sh                 # 装到当前仓库所在机器
 #   bash deploy/install.sh --port 18080    # 指定对外端口
+#   bash deploy/install.sh --admin-user admin   # 指定管理员用户名
 #   bash deploy/install.sh --status        # 看状态
 #   bash deploy/install.sh --logs api      # 看日志
 #   bash deploy/install.sh --down           # 停掉（保留数据）
@@ -27,10 +28,12 @@ PORT="18080"
 ACTION="install"
 LOG_SVC="api"
 PY_BASE=""
+ADMIN_USER="${ADMIN_USER:-ling}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --project) PROJECT="$2"; shift 2 ;;
+    --admin-user) ADMIN_USER="$2"; export ADMIN_USER; shift 2 ;;
     --python-base) PY_BASE="$2"; shift 2 ;;
     --status) ACTION="status"; shift ;;
     --logs) ACTION="logs"; LOG_SVC="${2:-api}"; shift 2 ;;
@@ -74,15 +77,17 @@ gen_env() {
     return 0
   fi
   say "生成 $envf …"
-  local pw root
-  pw=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+  local root
   root=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
   cat > "$envf" <<EOF
 # 由 deploy/install.sh 生成。**不要提交到仓库**（已在 .gitignore 里）。
 # LING_ROOT_KEY 一旦改变，已加密的通道密钥就解不开了 —— 别随手重生成。
-POSTGRES_PASSWORD=$pw
-LING_BOOTSTRAP_ADMIN=ling
-LING_BOOTSTRAP_ADMIN_PASSWORD=$pw
+POSTGRES_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+# 管理员账号。密码**故意留空**：留空时应用会在首次启动时生成随机口令
+# 并打印到日志，同时要求登录后立刻改密。这样随机口令只作为一次性登船票，
+# 不会被永久写进 .env。
+LING_BOOTSTRAP_ADMIN=${ADMIN_USER:-ling}
+LING_BOOTSTRAP_ADMIN_PASSWORD=
 LING_ROOT_KEY=$root
 LING_TEST_MODE=0
 LING_COOKIE_SECURE=0
@@ -190,18 +195,32 @@ do_install() {
   say "构建并启动…"
   dc up -d --build || die "启动失败（上面有日志）"
   wait_ready
-  local pw
+  local admin pw
+  admin=$(grep '^LING_BOOTSTRAP_ADMIN=' deploy/.env | cut -d= -f2-)
   pw=$(grep '^LING_BOOTSTRAP_ADMIN_PASSWORD=' deploy/.env | cut -d= -f2-)
   cat <<EOF
 
 $(ok "安装完成")
 
   控制台      http://127.0.0.1:$PORT
-  用户名      $(grep '^LING_BOOTSTRAP_ADMIN=' deploy/.env | cut -d= -f2-)
-  密码        $pw
+  用户名      $admin
+EOF
+  if [ -n "$pw" ]; then
+    printf '  密码        %s\n' "$pw"
+  else
+    # 密码是应用在首次启动时随机生成并打到日志里的
+    local logline
+    logline=$(dc logs api 2>/dev/null | grep -A4 '首次安装：已创建管理员账号' | grep '密码' | tail -1 || true)
+    if [ -n "$logline" ]; then
+      printf '  密码        %s\n' "$(printf '%s' "$logline" | sed 's/.*密码 *//')"
+    else
+      printf '  密码        %s\n' "（在启动日志里：bash deploy/install.sh --logs api | grep -A4 首次安装）"
+    fi
+  fi
+  cat <<EOF
 
-  ${DIM}密码也记在 deploy/.env 的 LING_BOOTSTRAP_ADMIN_PASSWORD${RST}
-  ${DIM}这个密码只对全新数据库有效；已有库时不会覆盖已有账号${RST}
+  ${DIM}首次登录会强制要求改密码——随机口令只当一次性登船票${RST}
+  ${DIM}这个账号只在全新数据库上创建；已有库不会覆盖${RST}
 
   常用：
     bash deploy/install.sh --status      # 状态

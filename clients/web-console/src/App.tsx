@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api';
 import { ChatPage } from './components/ChatPage';
+import { ChangePasswordView } from './components/ChangePasswordView';
 import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
 import { DialoguePage } from './components/DialoguePage';
@@ -99,6 +100,27 @@ export default function App() {
     setSidebarOpen(false);
     navigate(routePath({ name: 'chat', sessionId: null }));
   };
+
+  // 首次安装的随机口令还没改：整页接管，不给任何绕过入口。
+  // 后端也会在改密前对所有 /v1/auth/* 之外的请求返回 403，这里是同一件事的两侧。
+  if (auth.status === 'authenticated' && auth.user.must_change_password) {
+    return (
+      <ChangePasswordView
+        username={auth.user.username}
+        onSuccess={() => {
+          setAuth({
+            status: 'authenticated',
+            user: { ...auth.user, must_change_password: false },
+            testMode: auth.testMode,
+          });
+        }}
+        onLogout={() => {
+          void api.logout().catch(() => undefined);
+          setAuth({ status: 'anonymous' });
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app">

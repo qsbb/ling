@@ -27,6 +27,8 @@ class UserView:
     role: str
     subject_id: str
     display_name: str
+    # 首次安装的随机口令还没改过
+    must_change_password: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class IdentityService:
         role: str = "member",
         display_name: str | None = None,
         subject_id: str | None = None,
+        must_change_password: bool = False,
     ) -> UserView:
         existing = (
             await self._session.execute(select(User).where(User.username == username))
@@ -76,6 +79,7 @@ class IdentityService:
             password_hash=hash_password(password),
             role=role,
             subject_id=subject_id,
+            must_change_password=must_change_password,
         )
         self._session.add(user)
         await self._session.flush()
@@ -85,6 +89,7 @@ class IdentityService:
             role=user.role,
             subject_id=user.subject_id,
             display_name=subject.display_name,
+            must_change_password=user.must_change_password,
         )
 
     async def get_user(self, user_id: str) -> UserView | None:
@@ -98,6 +103,7 @@ class IdentityService:
             role=user.role,
             subject_id=user.subject_id,
             display_name=subject.display_name if subject else user.username,
+            must_change_password=user.must_change_password,
         )
 
     # ---------------------------------------------------------- 登录
@@ -131,6 +137,7 @@ class IdentityService:
                 role=user.role,
                 subject_id=user.subject_id,
                 display_name=subject.display_name if subject else user.username,
+                must_change_password=user.must_change_password,
             ),
             token=token,
             expires_at=expires_at,
@@ -152,6 +159,38 @@ class IdentityService:
         if expires_at <= datetime.now(UTC):
             return None
         return await self.get_user(row.user_id)
+
+    async def change_password(
+        self, user_id: str, *, current: str, new: str, keep_token: str | None = None
+    ) -> None:
+        """改密码。校验旧口令；改完清掉 must_change_password 并吊销其它会话。
+
+        为什么要吊销其它会话：改密码的动机通常就是"怀疑泄露"。如果旧 cookie
+        还能继续用，改密码就只是个心理安慰。当前这次登录保留，免得刚改完
+        就被踢下线。
+        """
+        user = await self._session.get(User, user_id)
+        if user is None or user.disabled:
+            raise unauthorized("账号不可用")
+        if not verify_password(current, user.password_hash):
+            raise unauthorized("当前密码不正确")
+
+        user.password_hash = hash_password(new)
+        user.must_change_password = False
+
+        rows = (
+            await self._session.execute(
+                select(AuthSession).where(AuthSession.user_id == user_id)
+            )
+        ).scalars()
+        keep_hash = hash_token(keep_token) if keep_token else None
+        for row in rows:
+            if row.revoked_at is not None:
+                continue
+            if keep_hash is not None and row.token_hash == keep_hash:
+                continue
+            row.revoked_at = utcnow()
+        await self._session.flush()
 
     async def logout(self, token: str) -> None:
         row = (

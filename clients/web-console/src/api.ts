@@ -175,6 +175,9 @@ export const api = {
   me(): Promise<AuthResponse> {
     return request<AuthResponse>('/v1/auth/me');
   },
+  changePassword(current: string, next: string): Promise<void> {
+    return request<void>('/v1/auth/password', jsonInit('POST', { current, new: next }));
+  },
   login(username: string, password: string): Promise<AuthResponse> {
     return request<AuthResponse>('/v1/auth/login', jsonInit('POST', { username, password }));
   },

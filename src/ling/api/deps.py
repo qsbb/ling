@@ -12,8 +12,9 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.errors import unauthorized
+from ling.api.errors import LingError, unauthorized
 from ling.config import Settings
+from ling.contracts.v1 import ErrorCode
 from ling.domains.conversation.service import ConversationService
 from ling.domains.identity.service import IdentityService, UserView
 from ling.domains.persona.service import PersonaService
@@ -56,6 +57,20 @@ async def current_auth(request: Request, session: DbSession) -> AuthContext:
     user = await IdentityService(session).resolve_token(token)
     if user is None:
         raise unauthorized("登录已过期，请重新登录")
+
+    # 首次安装的随机口令没改过之前，除认证接口外一律拒绝。
+    #
+    # 这条闸放在 current_auth 里而不是每个路由自己判断：这里是所有已鉴权
+    # 请求的唯一入口，写在别处早晚会漏一个路由，而漏掉的那条就是后门。
+    if user.must_change_password:
+        path = request.url.path
+        if not path.startswith("/v1/auth/"):
+            raise LingError(
+                ErrorCode.forbidden,
+                "首次登录必须先修改密码",
+                status_code=403,
+                detail="must_change_password",
+            )
     return AuthContext(user=user, token=token)
 
 

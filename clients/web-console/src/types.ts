@@ -53,6 +53,8 @@ export interface UserInfo {
   role: string;
   subject_id: string;
   display_name: string;
+  /** 首次安装的随机口令还没改过；为 true 时后端除 /v1/auth/* 外全部 403 */
+  must_change_password?: boolean;
 }
 
 export interface AuthResponse {

@@ -6,6 +6,8 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
+from ling.api.errors import LingError
+from ling.contracts.v1 import ErrorCode
 from ling.domains.identity.service import IdentityService
 
 router = APIRouter(tags=["auth"])
@@ -22,6 +24,8 @@ class UserOut(BaseModel):
     role: str
     subject_id: str
     display_name: str
+    # 首次安装的随机口令还没改过时为 True；前端据此强制跳改密页
+    must_change_password: bool = False
 
 
 class LoginOut(BaseModel):
@@ -61,6 +65,31 @@ async def login(
         test_mode=effective.test_mode,
         csrf_token="cookie-samesite-lax",
     )
+
+
+class PasswordBody(BaseModel):
+    current: str = Field(min_length=1, max_length=256)
+    new: str = Field(min_length=8, max_length=256)
+
+
+@router.post("/auth/password", status_code=204)
+async def change_password(
+    body: PasswordBody,
+    auth: CurrentAuth,
+    session: DbSession,
+) -> Response:
+    """改密码。改完清掉"必须先改"标记，并吊销其它会话（保留当前这次登录）。"""
+    if body.current == body.new:
+        raise LingError(
+            ErrorCode.invalid_request, "新密码不能与当前密码相同", status_code=422
+        )
+    await IdentityService(session).change_password(
+        auth.user.id,
+        current=body.current,
+        new=body.new,
+        keep_token=auth.token,
+    )
+    return Response(status_code=204)
 
 
 @router.post("/auth/logout")
