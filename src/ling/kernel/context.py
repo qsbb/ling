@@ -629,6 +629,47 @@ class ContextCompiler:
         # persona / constraints，它们被截断比提示长更糟。
         contributions = _apply_total_budget(contributions, compiled_meta)
 
+        # --- 重复提醒：把"你最近老用同一句"这个**事实**给她 ---
+        #
+        # 人设里写着"这些只是举例，话题要换着来"，但模型仍会把最有特色的
+        # 举例当模板反复用（实测：无论问什么，回复都以同两句收尾）。
+        # 代码不规定"怎么说"，但**数她说了几遍是确定性事实**——换不换由她定。
+        from ling.capabilities.repetition import repetition_hint
+
+        # 这里**必须自己查**：历史消息在下面才组装，而这条提示要参与
+        # 总预算计算（`_apply_total_budget` 在这之后马上执行）。
+        # 早期版本读了一个还没赋值的属性，于是提示永远是 None——测试
+        # 只测 helper 时看不出来，是接线错了。
+        _recent_actor: list[str] = []
+        try:
+            from ling.infra.models import Message as _Message
+
+            _rows = (
+                await self._session.execute(
+                    select(_Message.text)
+                    .where(
+                        _Message.window_id == window_id,
+                        _Message.role == "actor",
+                    )
+                    .order_by(_Message.sequence.desc())
+                    .limit(5)
+                )
+            ).all()
+            _recent_actor = [r[0] for r in reversed(_rows) if r[0]]
+        except Exception:  # noqa: BLE001 - 查不到就不提示，不影响主流程
+            _recent_actor = []
+        _hint = repetition_hint(_recent_actor)
+        if _hint:
+            contributions.append(
+                ContextContribution(
+                    lane="constraints",
+                    text=_hint,
+                    origin=Origin.verified_source,
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["constraints"],
+                )
+            )
+
         # --- 表达方式：把"能怎么做"告诉她，选不选由她 ---
         #
         # 不是"群里就替她 @"——那是代码替人设做决定。这里只列可用动作和
@@ -698,6 +739,7 @@ class ContextCompiler:
             if sum(estimate_tokens(m.text) for m in usable) + cost > HISTORY_TOKEN_BUDGET:
                 break
             usable.append(msg)
+
         usable.reverse()
         dropped = [
             m
