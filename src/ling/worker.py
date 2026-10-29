@@ -32,9 +32,11 @@ MAX_BACKOFF_SECONDS = 300
 # 本 worker 实例标识，写入 outbox.processed_by 便于多副本诊断
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-)
+# 用统一配置：worker 和 api 的日志格式、级别、第三方降噪必须一致，
+# 否则一条链路在两个进程里长得不一样，对不起来。
+from ling.logging_setup import setup_logging  # noqa: E402 - 需要先设好环境
+
+setup_logging(role="worker")
 logger = logging.getLogger("ling.worker")
 
 # worker 侧的密钥缓存与模型路由：Provider 构造需要**同步**读密钥，

@@ -125,6 +125,53 @@ deploy/backup/restore_drill.sh \
 | 界面显示“服务端仍在生成” | 上一进程崩溃；重启后 `_recover_dangling_turns` 会标记 failed，可点重试 |
 | `/readyz` 503 | 数据库不可达或迁移未跑 |
 
+## 5.9 日志：字段、级别与怎么查
+
+默认输出一行一条 JSON（容器生产环境）或可读文本（本地）。用
+`LING_LOG_FORMAT=json|text` 显式覆盖，`LING_LOG_LEVEL` 调级别。
+
+### 信封字段
+
+| 字段 | 说明 |
+|---|---|
+| `timestamp` / `severity_text` / `logger` | 标准三件套 |
+| `process_role` | `api` 或 `worker`——两个进程的日志要能分开看 |
+| `event_name` | 稳定的事件名，`snake_case`，**不含动态值**，用于检索聚合 |
+| `message` | 中文说明，给人看 |
+| `attributes` | 动态信息全在这里（计数、耗时、状态码、错误类型） |
+| `trace_id` / `turn_id` / `session_id` | 关联 ID |
+| `redaction_applied` / `redaction_fields` | 有字段被脱敏策略拦下时出现 |
+
+### 脱敏是机制，不是自觉
+
+`SENSITIVE_KEYS` 里的字段名（`content`/`prompt`/`memory`/`token`…）在
+Formatter 层被整值替换成 `[REDACTED]`；值里夹带的 `Bearer xxx`、
+带密码的连接串、长随机串也会被拦。**对话正文与记忆内容永远不会进日志**——
+它们已经有自己的撤回/遗忘机制，日志不该成为另一个不受管的副本。
+
+> 边界说清楚：Formatter 只认字段名和已知模式，判断不了一段中文自然语言
+> 是不是敏感内容。所以真正的保证是"事件字段规范 + 这层拦截 + 测试里塞
+> canary 断言不出现"三件事合力。
+
+### 用 trace_id 查一次请求
+
+```bash
+# 用户报错时把界面上的 ID 发过来，直接定位那一次请求
+docker logs ling-api-1 2>&1 | grep '<trace_id>'
+
+# 看连接器为什么没连上
+docker logs ling-api-1 2>&1 | grep -E 'connector_(connected|disconnected|reconnect_failed|retry_exhausted)'
+
+# 只看错误
+docker logs ling-api-1 2>&1 | grep '"severity_text": "ERROR"'
+```
+
+连接器状态机的事件名是固定的：`connector_config_missing`、
+`connector_hello`、`connector_connected`、`connector_resumed`、
+`connector_disconnected`、`connector_reconnect_failed`、
+`connector_retry_exhausted`。**"没配置""连上了""断开了""重试耗尽了"
+可以各自搜到**，不用再靠猜。
+
 ## 6. 验证状态（哪些验过、哪些没验）
 
 **已验证**（后文 §7–§9 是这些验证的记录）：

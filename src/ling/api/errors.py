@@ -46,14 +46,26 @@ def error_response(
     return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
 
 
-async def ling_error_handler(_: Request, exc: LingError) -> JSONResponse:
-    return error_response(
+async def ling_error_handler(request: Request, exc: LingError) -> JSONResponse:
+    """错误响应里带上 trace_id，并回写同名响应头。
+
+    没有它的话，用户只能报"刚才报错了"；有了它，把界面上的 ID 发过来就能
+    在日志里定位到那一次请求。错误体里也带一份，前端可以直接显示。
+    """
+    from ling.api.observability import TRACE_HEADER, trace_id_of
+
+    trace_id = trace_id_of(request)
+    response = error_response(
         exc.code,
         exc.message,
         status_code=exc.status_code,
         retriable=exc.retriable,
         detail=exc.detail,
+        trace_id=trace_id,
     )
+    if trace_id:
+        response.headers[TRACE_HEADER] = trace_id
+    return response
 
 
 # 常用错误构造器

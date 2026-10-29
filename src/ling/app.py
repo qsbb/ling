@@ -12,10 +12,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
+from starlette.middleware.base import BaseHTTPMiddleware, Response
 
 from ling.api.errors import LingError, ling_error_handler
 from ling.config import Settings, get_settings
@@ -37,7 +38,7 @@ DANGLING_TURN_MINUTES = 10
 
 # **必须在模块导入时配置**：容器用 `uvicorn ling.app:app` 启动，
 # 不走 ling/__main__.py，不在这里配就没有任何 ling 日志。
-setup_logging()
+setup_logging(role="api")
 
 logger = logging.getLogger("ling.app")
 
@@ -285,8 +286,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.add_exception_handler(LingError, ling_error_handler)  # type: ignore[arg-type]
 
+    from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
     from ling.api.routes import settings as settings_routes
+
+    # 最外层：给每个请求一个 trace_id，并记录访问日志。
+    # 必须在路由之前注册，否则 4xx/5xx 走不到这里。
+    app.add_middleware(BaseHTTPMiddleware, dispatch=observability_middleware)
 
     app.include_router(health.router)
     app.include_router(onebot.router)

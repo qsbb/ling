@@ -1493,14 +1493,18 @@ def test_both_entrypoints_configure_logging() -> None:
     # app.py 在**模块级**就调了（uvicorn import 它的那一刻生效）
     src = inspect.getsource(app_module)
     top_level = [
-        line for line in src.splitlines()
-        if line.startswith("setup_logging()")
+        line for line in src.splitlines() if line.startswith("setup_logging(")
     ]
     assert top_level, "app.py 没有在模块级调用 setup_logging()"
 
-    # __main__.py 也要调（开发路径）
-    main_src = Path("src/ling/__main__.py").read_text()
-    assert "setup_logging()" in main_src, "__main__.py 没配日志"
+    # 另外两个入口也要调：开发路径与 worker 进程
+    for entry in ("src/ling/__main__.py", "src/ling/worker.py"):
+        entry_src = Path(entry).read_text()
+        assert "setup_logging(" in entry_src, f"{entry} 没配日志"
+
+    # worker 曾经自己调 basicConfig，格式与 api 不一致——这条防它回来
+    worker_src = Path("src/ling/worker.py").read_text()
+    assert "basicConfig" not in worker_src, "worker 又自己配了一套日志"
 
     # 配置函数本身要幂等且尊重 LING_LOG_LEVEL
     assert callable(logging_setup.setup_logging)

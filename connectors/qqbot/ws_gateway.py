@@ -48,6 +48,8 @@ from typing import Any
 
 logger = logging.getLogger("ling.connectors.qqbot.gateway")
 
+from ling.logging_setup import emit_event  # noqa: E402 - 避免与上面 logger 定义顺序冲突
+
 # 群与单聊消息事件都在这一位里：C2C_MESSAGE_CREATE / GROUP_AT_MESSAGE_CREATE
 # （官方文档「事件订阅 Intents」：GROUP_AND_C2C_EVENT (1 << 25)）
 INTENTS_GROUP_AND_C2C = 1 << 25
@@ -173,10 +175,27 @@ class QQBotGateway:
                 self.state = GatewayState(
                     session_id=str(data.get("session_id") or ""), last_seq=seq
                 )
-                logger.info("QQ 网关已就绪（session=%s）", self.state.session_id[:8])
+                emit_event(
+                    logger,
+                    logging.INFO,
+                    event_name="connector_connected",
+                    message="QQ 网关已就绪",
+                    attributes={
+                        "channel": "qqbot",
+                        "connection_state": "connected",
+                        # session 短哈希就够定位，不落完整值
+                        "session_prefix": (self.state.session_id or "")[:8],
+                    },
+                )
                 return None
             if event == "RESUMED":
-                logger.info("QQ 网关会话已恢复（补发完成，seq=%s）", self.state.last_seq)
+                emit_event(
+                    logger,
+                    logging.INFO,
+                    event_name="connector_resumed",
+                    message="QQ 网关会话已恢复（补发完成）",
+                    attributes={"channel": "qqbot", "last_seq": self.state.last_seq},
+                )
                 return None
 
             # 真正的事件：交给统一受理（与 Webhook 完全同一条路径）
@@ -204,7 +223,16 @@ class QQBotGateway:
             interval = float(data.get("heartbeat_interval") or 0)
             if interval > 0:
                 self._hello_interval_ms = interval
-            logger.info("QQ 网关 Hello（心跳 %.0fms）", interval)
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="connector_hello",
+                message="QQ 网关握手完成",
+                attributes={
+                    "channel": "qqbot",
+                    "heartbeat_interval_ms": interval,
+                },
+            )
             return None
         if op in (11, 7, 9):
             # 心跳 ACK / 服务器要求重连（7）/ 会话失效（9）
@@ -230,7 +258,9 @@ class QQBotGateway:
         import websockets
 
         delay = self._min
+        attempt = 0
         while not self._stopped:
+            attempt += 1
             # 每次连接前先决定"这次是 Identify 还是 Resume"，连上就照做
             action = ACTION_RESUME if self.state.can_resume else ACTION_IDENTIFY
             try:
@@ -277,8 +307,23 @@ class QQBotGateway:
                 self.connected = False
                 decision = action_for_close(getattr(exc, "code", None))
                 self.last_error = f"closed code={getattr(exc, 'code', None)}"
-                logger.warning(
-                    "QQ 网关连接关闭（code=%s）→ %s", getattr(exc, "code", None), decision
+                code = getattr(exc, "code", None)
+                # 状态机事件：连接关闭 / 计划重连 / 永久停止，三种分开记
+                emit_event(
+                    logger,
+                    logging.ERROR if decision == ACTION_STOP else logging.WARNING,
+                    event_name=(
+                        "connector_retry_exhausted"
+                        if decision == ACTION_STOP
+                        else "connector_disconnected"
+                    ),
+                    message="QQ 网关连接关闭",
+                    attributes={
+                        "channel": "qqbot",
+                        "close_code": code,
+                        "next_action": decision,
+                        "connection_state": "disconnected",
+                    },
                 )
                 if decision == ACTION_STOP:
                     self._stopped = True
@@ -288,7 +333,19 @@ class QQBotGateway:
             except Exception as exc:  # noqa: BLE001 - 任何异常都重连
                 self.connected = False
                 self.last_error = f"{type(exc).__name__}: {exc}"[:200]
-                logger.warning("QQ 网关断开：%s", self.last_error)
+                emit_event(
+                    logger,
+                    logging.WARNING,
+                    event_name="connector_reconnect_failed",
+                    message="QQ 网关连接失败，将退避重试",
+                    attributes={
+                        "channel": "qqbot",
+                        "error_type": type(exc).__name__,
+                        "attempt": attempt,
+                        "backoff_s": delay,
+                        "retriable": True,
+                    },
+                )
             finally:
                 self.connected = False
 
