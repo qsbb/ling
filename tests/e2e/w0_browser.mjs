@@ -575,6 +575,78 @@ async function runFailureRetry(browser) {
   }
 }
 
+
+/**
+ * 总览页：登录后的首屏。
+ *
+ * 这一页之前完全没有 E2E 覆盖——登录辅助会直接跳到聊天，总览坏了也测不出来。
+ * 它现在是默认落地页，必须锁住三个最容易坏的属性：
+ * 页面能开、六块都在、**空态和故障态长得不一样**。
+ */
+async function runDashboard(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const consoleErrors = [];
+  page.on('pageerror', (e) => consoleErrors.push(String(e)));
+
+  // **不能用 login() 辅助**：它为了让后续用例能操作聊天，会在登录后点
+  // 标识跳进聊天页——落地页当场就看不到了。这里自己做一次干净登录。
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+  await page
+    .waitForFunction(() => !!document.querySelector('input[type="password"]'), { timeout: 20000 })
+    .catch(() => {});
+  await page.locator('input[name="username"], input').first().fill(USER);
+  await page.locator('input[type="password"]').first().fill(PASS);
+  await page.locator('button[type="submit"]').first().click();
+  await page
+    .waitForFunction(() => !document.querySelector('input[type="password"]'), { timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  record('总览：登录成功', (await page.locator('input[type="password"]').count()) === 0);
+
+  // 登录后应当**落在总览**，而不是直接把聊天框推到人脸上。
+  //
+  // 断言必须发生在**任何兜底导航之前**。之前写成"不是总览就点进去，
+  // 然后断言 URL 是总览"——那个断言永远为真，等于没测（负例验过：把登录
+  // 落地页改回聊天，它照样 PASS）。
+  const landedUrl = page.url();
+  record('总览：这里是默认落地页', /\/dashboard/.test(landedUrl), landedUrl);
+
+  // 兜底只为继续测其它项，不掩盖上面的失败
+  if (!/\/dashboard/.test(page.url())) {
+    const navBtn = page.locator('button.header-link:has-text("总览")').first();
+    if (await navBtn.count()) await navBtn.click();
+  }
+  await page.waitForTimeout(1500);
+
+  const body = (await page.textContent('body')) || '';
+  const titles = ['此刻', '情绪', '主动联系', '最近记住的事', '关系', '渠道与模型'];
+  const missing = titles.filter((x) => !body.includes(x));
+  record('总览：六块卡片都在', missing.length === 0, missing.join(','));
+
+  // 每块都要能标出"更新于"，否则等于假装实时
+  record('总览：标注了数据更新时间', /更新于\s*\d{1,2}:\d{2}/.test(body));
+
+  // 空态必须是"确实没有"，不能和"读不到"混成一句
+  const hasEmpty = /当前没有登记中的活动|暂时没有状态记录|当前没有待处理的候选/.test(body);
+  const hasUnavailable = /暂时读不到这块数据/.test(body);
+  record('总览：空态与故障态可区分', hasEmpty || hasUnavailable,
+    hasEmpty ? '空态' : hasUnavailable ? '故障态' : '两者都没有');
+
+  // 常见故障：整页变成错误页
+  record('总览：没有整页错误', !/读取失败|无法加载/i.test(body));
+
+  // 顶栏能回到聊天
+  const brand = page.locator('button.brand').first();
+  if (await brand.count()) await brand.click();
+  await page.waitForSelector('button[aria-label="发送消息"]:not([disabled])', { timeout: 15000 }).catch(() => {});
+  record('总览：点标识能进聊天', (await page.locator('button[aria-label="发送消息"]').count()) > 0);
+
+  record('总览：无未捕获的前端异常', consoleErrors.length === 0, consoleErrors[0] || '');
+  await shot(page, 'dashboard-01-overview');
+  await context.close();
+}
+
 async function runSettingsPage(browser) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
@@ -606,6 +678,7 @@ try {
   await runMobile(browser);
   await runFailureRetry(browser);
   await runSettingsPage(browser);
+  await runDashboard(browser);
 } finally {
   await browser.close();
 }
