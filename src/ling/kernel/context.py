@@ -812,17 +812,10 @@ class ContextCompiler:
         需要更高质量摘要时，由 worker 用 memory.extract 职责异步重写
         （见 设计文档 §8.1：该职责失败不阻塞主回复）。
         """
-        lines: list[str] = []
-        prev = getattr(window_ctx, "summary", None) if window_ctx is not None else None
-        if prev:
-            lines.append(prev)
-        for msg in dropped:
-            who = "用户" if msg.role == "user" else "ling"
-            text = msg.text.strip().replace("\n", " ")
-            if not text:
-                continue
-            lines.append(f"{who}：{text[:120]}")
-        merged = "\n".join(lines)
+        prev_summary = (
+            getattr(window_ctx, "summary", None) if window_ctx is not None else None
+        )
+        merged = render_rollup(dropped, prev_summary=prev_summary)
         # 摘要也受预算约束，但**不能只留尾部**。
         # 原实现是 `merged[-max_chars:]`——最早的内容被直接丢掉，
         # 而最早的内容往往正是"第一次说的重要事实"，
@@ -884,6 +877,29 @@ def _total_soft_hard() -> tuple[int, int]:
     soft = int(raw_soft) if raw_soft and raw_soft.isdigit() else total
     hard = int(raw_hard) if raw_hard and raw_hard.isdigit() else int(total * 1.2)
     return max(soft, 1), max(hard, soft)
+
+
+def render_rollup(dropped: list, *, prev_summary: str | None = None) -> str:
+    """把溢出的早期消息压成一段"我们刚才聊了什么"的回顾。
+
+    **不要渲染成"名字：内容"的对话记录**。原实现是 `ling：…` / `用户：…`：
+
+    1. `ling` 是代码里的 actor id，不该出现在给模型看的文本里
+    2. 带名字的对话格式会被模型**当成模板模仿**——实测她开始给自己每条
+       消息加「她：」前缀，而代码里没有任何地方会给她加前缀
+
+    所以改成第一人称回顾：这是摘要，不是聊天记录。
+    """
+    lines: list[str] = []
+    if prev_summary:
+        lines.append(prev_summary)
+    for msg in dropped:
+        who = "对方说过" if msg.role == "user" else "我说过"
+        text = (msg.text or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        lines.append(f"{who}「{text[:120]}」")
+    return "\n".join(lines)
 
 
 def _apply_total_budget(

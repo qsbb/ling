@@ -384,3 +384,38 @@ async def test_context_offers_expression_choices(logged_in: TestEnv) -> None:
     # 私聊不该出现 @ ——列了做不到的，她会选了却不发生
     private_only = render_expression_help(is_group=False, supports_poke=False)
     assert "[at:" not in private_only
+
+
+def test_rollup_does_not_look_like_a_transcript() -> None:
+    """滚动摘要不能渲染成"名字：内容"的对话记录。
+
+    两个原因：
+    1. `ling` 是代码里的 actor id，不该进给模型看的文本
+    2. 带名字的对话格式会被模型**当成模板模仿**——实测她开始给自己每条
+       消息加「她：」前缀，而代码里没有任何地方会给她加前缀
+    """
+    from ling.kernel.context import render_rollup
+
+    class _Msg:
+        def __init__(self, role: str, text: str) -> None:
+            self.role = role
+            self.text = text
+
+    dropped = [
+        _Msg("user", "我最近在学做菜"),
+        _Msg("actor", "番茄炒蛋不错的"),
+    ]
+    text = render_rollup(dropped)
+
+    assert "ling：" not in text, "内部 actor id 泄漏进了提示"
+    assert "用户：" not in text, "还在用'名字：内容'的对话记录格式"
+    # 第一人称回顾：说清是谁说的，但不是聊天记录的样子
+    assert "对方说过「我最近在学做菜」" in text
+    assert "我说过「番茄炒蛋不错的」" in text
+
+
+def test_rollup_keeps_previous_summary() -> None:
+    from ling.kernel.context import render_rollup
+
+    text = render_rollup([], prev_summary="之前聊过做饭")
+    assert text == "之前聊过做饭"
