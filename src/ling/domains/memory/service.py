@@ -463,7 +463,11 @@ class MemoryService:
                         # 归档 = 保留期到期，不再参与检索（数据仍在，可审计）
                         MemoryRow.archived_at.is_(None),
                     )
-                    .order_by(MemoryRow.updated_at.desc())
+                    # **只加上界、先不动顺序**：加上 `order_by(updated_at desc)`
+                    # 会打乱向量路径的排序（它按行序对齐打分），实测
+                    # `test_vector_path_ranks_semantic_match` 立刻红。
+                    # 那个耦合本身是 bug，但属于另一件事——先保证成本有界。
+                    # 待办：向量路径改为按 id 对齐打分，然后这里换成按时间取池。
                     .limit(RECALL_CANDIDATE_LIMIT)
                 )
             ).scalars()
