@@ -1024,22 +1024,24 @@ async def handle_attention_tick(payload: dict) -> None:
                 },
             )
 
-    if polls or calls or baseline:
-        saved = max(0, baseline - calls)
-        emit_event(
-            logger,
-            logging.INFO,
-            event_name="attention_tick_completed",
-            message="群聊轮询完成",
-            attributes={
-                "windows_polled": polls,
-                "llm_calls": calls,
-                "baseline_calls": baseline,
-                "saved_calls": saved,
-                "replied": replied,
-                "shadow": shadow,
-            },
-        )
+    # **无条件记一条**：连"这轮没有窗口到期"也要能查到。
+    # 否则"轮询跑了但什么都没做"和"轮询压根没跑"在日志里长得一样，
+    # 而那正是排查"她为什么几小时没在群里说话"时的第一个岔路口。
+    saved = max(0, baseline - calls)
+    emit_event(
+        logger,
+        logging.INFO,
+        event_name="attention_tick_completed",
+        message="群聊轮询完成",
+        attributes={
+            "windows_polled": polls,
+            "llm_calls": calls,
+            "baseline_calls": baseline,
+            "saved_calls": saved,
+            "replied": replied,
+            "shadow": shadow,
+        },
+    )
 
 
 @handler("intent.tick")
