@@ -83,3 +83,48 @@ def test_proactive_status_reports_every_channel(monkeypatch) -> None:
     assert "QQ 官方机器人" in reason, "qqbot 的原因被吞了"
     assert "开放平台" in reason
 
+
+
+async def test_proactive_gate_reads_published_quiet_hours(logged_in: TestEnv) -> None:
+    """免打扰窗必须来自**已发布配置**，不能是服务内部的默认值。
+
+    现象：面板把 quiet 改成 0-0（关闭）并发布后，主动状态仍报
+    「处于勿扰时段（23:00-08:00）」——路由只读了 `proactive_delivery_enabled`，
+    两个 quiet 字段没传下去，gate 退回默认值。设置页保存成功、实际不生效。
+
+    用例设计：先发布一个**覆盖此刻**的窗口，断言确实报勿扰；再发布 0-0，
+    断言不报。只做后者是无效的——默认值本来就是 0-0，改不改都会绿。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    async def _publish(payload: dict) -> None:
+        draft = await logged_in.client.put("/v1/settings/draft", json=payload)
+        assert draft.status_code == 200, draft.text
+        published = await logged_in.client.post(
+            "/v1/settings/publish", json={"revision": draft.json()["revision"]}
+        )
+        assert published.status_code == 200, published.text
+
+    async def _reasons() -> str:
+        body = (await logged_in.client.get("/v1/proactive")).json()
+        return " ".join(body.get("gate_reasons") or [])
+
+    cfg = (await logged_in.client.get("/v1/settings/config")).json()
+    tz = ZoneInfo(cfg.get("user_timezone") or "Asia/Shanghai")
+    now = datetime.now(tz)
+    minute = now.hour * 60 + now.minute
+
+    # 前后各留 3 分钟余量，覆盖"此刻"；跨午夜由 _in_quiet_hours 处理
+    await _publish(
+        {
+            "dialogue": {
+                "quiet_start_minute": (minute - 3) % 1440,
+                "quiet_end_minute": (minute + 3) % 1440,
+            }
+        }
+    )
+    assert "勿扰" in await _reasons(), "发布一个覆盖此刻的勿扰窗，gate 却没识别"
+
+    await _publish({"dialogue": {"quiet_start_minute": 0, "quiet_end_minute": 0}})
+    assert "勿扰" not in await _reasons(), "关闭免打扰后仍报勿扰：已发布配置没被读"
