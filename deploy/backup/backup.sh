@@ -49,15 +49,24 @@ if [ "$VIA_COMPOSE" = "1" ]; then
     exit 3
   fi
   # 墓碑清单同样通过容器取
-  docker compose "${COMPOSE_ARGS[@]}" exec -T db \
+  # **墓碑导出失败不能静默**：`|| true` 会让查询失败时留下一个空文件，
+  # 而 manifest 仍然写着"有墓碑清单"。恢复时按空清单处理，已撤回的记忆
+  # 就会复活——这正是墓碑机制要防的事，反而被备份脚本自己绕过。
+  TOMBSTONE_STATE=ok
+  if ! docker compose "${COMPOSE_ARGS[@]}" exec -T db \
     psql -U "$PG_USER" -d "$PG_DB" -tAc \
     "select id from memories where retracted = true order by id" \
-    > "$OUT_DIR/tombstones-$STAMP.txt" 2>/dev/null || true
+    > "$OUT_DIR/tombstones-$STAMP.txt" 2>/dev/null; then
+    TOMBSTONE_STATE=FAILED
+    rm -f "$OUT_DIR/tombstones-$STAMP.txt"
+    echo "[backup] 警告：墓碑导出失败，本次备份不可用于恢复" >&2
+  fi
   {
     echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "mode=compose"
     echo "dump=ling-$STAMP.dump"
     echo "tombstones=tombstones-$STAMP.txt"
+    echo "tombstones_state=$TOMBSTONE_STATE"
   } > "$OUT_DIR/manifest-$STAMP.txt"
   echo "[backup] 完成：$DUMP_FILE"
   exit 0
@@ -81,9 +90,14 @@ echo "[backup] 导出 schema + 数据"
 pg_dump --no-owner --no-privileges --format=custom --file "$OUT_DIR/ling-$STAMP.dump" "$PG_URL"
 
 echo "[backup] 记录撤回墓碑清单（恢复前必须核对）"
-psql "$PG_URL" -tAc \
+TOMBSTONE_STATE=ok
+if ! psql "$PG_URL" -tAc \
   "SELECT id, retracted_at FROM memories WHERE retracted = true ORDER BY retracted_at" \
-  > "$OUT_DIR/tombstones-$STAMP.txt" || echo "[backup] 警告：读取墓碑失败" >&2
+  > "$OUT_DIR/tombstones-$STAMP.txt"; then
+  TOMBSTONE_STATE=FAILED
+  rm -f "$OUT_DIR/tombstones-$STAMP.txt"
+  echo "[backup] 警告：墓碑导出失败，本次备份不可用于恢复" >&2
+fi
 
 # 加密根密钥必须一起备份，但**要分开存放**：
 # 数据库里的 provider 凭据是 AES-GCM 加密的，根密钥丢了就全部解不开，

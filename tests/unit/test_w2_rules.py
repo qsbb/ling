@@ -1585,3 +1585,32 @@ def test_deploy_build_can_survive_slow_pypi() -> None:
 
     install = Path("deploy/install.sh").read_text()
     assert "pypi.tuna" in install, "install.sh 没有自动换源"
+
+
+def test_backup_records_tombstone_export_failure() -> None:
+    """墓碑导出失败必须留痕，不能靠 `|| true` 假装成功。
+
+    `|| true` 会留下一个空文件，而 manifest 仍写着"有墓碑清单"。
+    恢复时按空清单处理，**已撤回的记忆就会复活**——正是墓碑机制要防的事，
+    结果被备份脚本自己绕过去了。
+    """
+    from pathlib import Path
+
+    script = Path("deploy/backup/backup.sh").read_text()
+    assert "TOMBSTONE_STATE" in script, "没有记录墓碑导出状态"
+    assert "tombstones_state=" in script, "manifest 里没有墓碑状态"
+    # 失败时必须删掉半截文件，避免"空文件当成有效清单"
+    assert 'rm -f "$OUT_DIR/tombstones-$STAMP.txt"' in script
+
+
+def test_restore_drill_verifies_tombstones_against_manifest() -> None:
+    """恢复演练必须把墓碑和备份时记录**对上**，而不只是打印一个数字。
+
+    只打印数字的话，0 也算"校验通过"——而 0 个墓碑恰恰是最危险的信号。
+    """
+    from pathlib import Path
+
+    script = Path("deploy/backup/restore_drill.sh").read_text()
+    assert "tombstones_state=FAILED" in script, "没有拒绝墓碑导出失败的备份"
+    assert "EXPECTED" in script and "RESTORED" in script, "没有做基线对比"
+    assert 'if [[ "$EXPECTED" != "$RESTORED" ]]' in script, "没有不一致的判定"

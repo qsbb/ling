@@ -40,7 +40,37 @@ if [ "$VIA_COMPOSE" = "1" ]; then
      select 'turns='||count(*) from turns union all \
      select 'messages='||count(*) from messages union all \
      select 'memories='||count(*) from memories"
-  echo "[drill] 完成（隔离库 $DRILL_DB 未触碰生产库）"
+  # 墓碑一致性：必须和备份时记录**对上**。只打印数字的话，0 也是"通过"，
+  # 而 0 个墓碑恰恰是最危险的信号（要么导出失败，要么恢复丢了撤回标记，
+  # 已撤回的记忆会复活）。
+  STAMP="$(basename "$DUMP" | sed -E 's/^ling-(.*)\.dump$/\1/')"
+  DIR="$(dirname "$DUMP")"
+  MANIFEST="$DIR/manifest-$STAMP.txt"
+  TOMB_FILE="$DIR/tombstones-$STAMP.txt"
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "[drill] 失败：找不到备份清单 $MANIFEST" >&2
+    exit 1
+  fi
+  if grep -q '^tombstones_state=FAILED' "$MANIFEST"; then
+    echo "[drill] 失败：这份备份的墓碑清单导出失败，不能用于恢复" >&2
+    exit 1
+  fi
+  if [[ ! -f "$TOMB_FILE" ]]; then
+    echo "[drill] 失败：清单说墓碑已导出，但文件不存在（$TOMB_FILE）" >&2
+    exit 1
+  fi
+  EXPECTED="$(awk -F, '{print $1}' "$TOMB_FILE" | sed '/^[[:space:]]*$/d' | sort)"
+  RESTORED="$(docker compose "${COMPOSE_ARGS[@]}" exec -T db \
+    psql -U "$PG_USER" -d "$DRILL_DB" -tAc \
+    "SELECT id FROM memories WHERE retracted = true ORDER BY id" \
+    | sed '/^[[:space:]]*$/d' | sort)"
+  echo "[drill] 墓碑：备份记录 $(printf '%s' "$EXPECTED" | grep -c . || true) 条，恢复后 $(printf '%s' "$RESTORED" | grep -c . || true) 条"
+  if [[ "$EXPECTED" != "$RESTORED" ]]; then
+    echo "[drill] 失败：墓碑不一致——恢复后的库与备份时记录不符" >&2
+    exit 1
+  fi
+
+  echo "[drill] 完成（隔离库 $DRILL_DB 未触碰生产库，墓碑一致）"
   exit 0
 fi
 
@@ -64,7 +94,42 @@ for table in users windows turns messages memories; do
   echo "  $table = $count"
 done
 
-echo "[drill] 校验墓碑仍在"
-psql "$PG_URL" -tAc "SELECT count(*) FROM memories WHERE retracted = true"
+# **墓碑必须和备份时记录的对上**。
+#
+# 原来这里只打印一个数字，没有基准可比——数字是 0 也算"校验通过"，
+# 而"0 个墓碑"恰恰是最危险的信号：要么备份时导出失败（那时 manifest
+# 会写 tombstones_state=FAILED），要么恢复把一个本该有墓碑的库恢复成了
+# 没有墓碑，已撤回的记忆就会复活。
+STAMP="$(basename "$DUMP" | sed -E 's/^ling-(.*)\.dump$/\1/')"
+DIR="$(dirname "$DUMP")"
+MANIFEST="$DIR/manifest-$STAMP.txt"
+TOMB_FILE="$DIR/tombstones-$STAMP.txt"
 
-echo "[drill] 完成：备份可恢复。生产启用前请人工核对墓碑与媒体清单。"
+if [[ ! -f "$MANIFEST" ]]; then
+  echo "[drill] 失败：找不到备份清单 $MANIFEST" >&2
+  exit 1
+fi
+
+if grep -q '^tombstones_state=FAILED' "$MANIFEST"; then
+  echo "[drill] 失败：这份备份的墓碑清单导出失败，不能用于恢复" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TOMB_FILE" ]]; then
+  echo "[drill] 失败：清单说墓碑已导出，但文件不存在（$TOMB_FILE）" >&2
+  exit 1
+fi
+
+echo "[drill] 校验墓碑仍在"
+EXPECTED="$(awk -F, '{print $1}' "$TOMB_FILE" | sed '/^[[:space:]]*$/d' | sort)"
+RESTORED="$(psql "$PG_URL" -tAc "SELECT id FROM memories WHERE retracted = true ORDER BY id" | sed '/^[[:space:]]*$/d' | sort)"
+echo "  备份记录 $(printf '%s' "$EXPECTED" | grep -c . || true) 条，恢复后 $(printf '%s' "$RESTORED" | grep -c . || true) 条"
+
+if [[ "$EXPECTED" != "$RESTORED" ]]; then
+  echo "[drill] 失败：墓碑不一致——恢复后的库与备份时记录不符" >&2
+  echo "  多出来的墓碑可能是备份后新增的撤回（正常，请核对）" >&2
+  echo "  **少了的墓碑是危险的**：那些已撤回的记忆会复活" >&2
+  exit 1
+fi
+
+echo "[drill] 完成：备份可恢复，墓碑一致。"
