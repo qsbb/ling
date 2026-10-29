@@ -203,6 +203,19 @@ docker logs ling-api-1 2>&1 | grep reply_decision_made | grep '"skip_code"'
 措辞在 `reason` 里，事实在 `skip_code` 里。同一个事件名在「连接器入站」与
 「Web 对话」两条路径都会发，所以一条查询就能覆盖两个入口。
 
+### 主动联系走哪条路
+
+`proactive.dispatch` 按顺序找投递面：
+
+1. **外部渠道**：OneBot / QQ 官方机器人（需 `supports_proactive`，官方机器人
+   默认没有，要在开放平台单独申请）
+2. **Web 会话**：没有外部渠道时，草稿直接落成她的一条消息，用户下次打开
+   面板就能看到
+
+两条路都受同一套门控约束：`proactive_delivery_enabled`、勿扰时段、日限额。
+没有可用投递面时，`/v1/proactive` 会**逐个渠道**说明原因——别只报第一个，
+那会让人去配一个根本不是问题的东西。
+
 ### 她的日程（life.plan / life.tick）
 
 | 事件 | 说明 |

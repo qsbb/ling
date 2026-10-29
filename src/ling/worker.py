@@ -751,15 +751,17 @@ async def handle_proactive_dispatch(payload: dict) -> None:
     settings = get_settings()
     connector = proactive_connector()
     if connector is None:
-        # 没有可用渠道时**什么都不做**，不标失败——这不是候选的问题。
+        # 没有外部渠道时**不放弃**：Web 面板也算一个投递面。
+        # 否则在 qqbot 拿不到主动权限、OneBot 没启用的实例上，"主动联系"
+        # 永远只是代码里的空转——她永远不会先开口。
+        # 落库同样受门控（勿扰时段/日限额）与 `proactive_delivery_enabled` 约束。
         emit_event(
             logger,
             logging.INFO,
             event_name="proactive_dispatch_skipped",
-            message="主动投递跳过：没有可主动推送的渠道",
+            message="没有外部主动推送渠道，改投 Web 会话",
             attributes={"reason_code": "no_proactive_channel"},
         )
-        return
 
     async with session_scope() as session:
         config = ConfigService(
@@ -772,6 +774,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             session,
             actor_id=settings.actor_id,
             connector=connector,
+            deliver_to_web=True,
             config_reader=config,
             subject_timezone=settings.user_timezone,
         )

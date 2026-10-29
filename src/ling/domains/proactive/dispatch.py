@@ -38,22 +38,33 @@ logger = logging.getLogger("ling.domains.proactive.dispatch")
 MAX_PER_ROUND = 3
 
 
-async def _target_window_ref(
-    session: AsyncSession, *, subject_id: str
-) -> str | None:
-    """这个人在 QQ 上最近活跃的**私聊**窗口的平台 ref。"""
+async def _target_window(
+    session: AsyncSession, *, subject_id: str, channel: str = "onebot"
+) -> Window | None:
+    """这个人最近活跃的**私聊**窗口。
+
+    `channel` 决定投递到哪个渠道：`onebot` 是平台 ref（发给 QQ），
+    `web` 是本地面板（消息落库，用户下次打开就能看到）。
+    """
     stmt = (
         select(Window)
         .where(
             Window.subject_id == subject_id,
-            Window.channel == "onebot",
+            Window.channel == channel,
             Window.visibility == "subject_private",
             Window.archived.is_(False),
         )
         .order_by(Window.last_message_at.desc().nulls_last())
         .limit(1)
     )
-    row = (await session.execute(stmt)).scalars().first()
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def _target_window_ref(
+    session: AsyncSession, *, subject_id: str, channel: str = "onebot"
+) -> str | None:
+    """平台 ref（发给外部渠道用）。"""
+    row = await _target_window(session, subject_id=subject_id, channel=channel)
     if row is None:
         return None
     # 群窗口的 title 也是 window_ref，但私聊条件已经挡住了
@@ -69,8 +80,16 @@ async def dispatch_pending(
     subject_timezone: str | None = None,
     now: datetime | None = None,
     limit: int = MAX_PER_ROUND,
+    deliver_to_web: bool = False,
 ) -> dict[str, int | str]:
     """把有草稿的候选真的发出去。
+
+    `deliver_to_web=True` 时，没有外部连接器也能投递：把草稿落成**会话里的
+    一条她的消息**，用户下次打开面板就能看到"她主动发过话"。
+
+    为什么需要这条路：部署实例上 qqbot 平台不给主动推送权限、OneBot 没启用，
+    于是"主动联系"这条需求永远只是代码里的空转——她永远不会先开口。
+    Web 投递不带推送通知，但"她确实主动过"这件事成立。
 
     返回统计，便于 worker 日志与运维观察。
     """
@@ -124,6 +143,29 @@ async def dispatch_pending(
             # 门控没过就留着，不标 rejected——它只是"现在还不是时候"
             continue
 
+        if connector is None:
+            # Web 投递：没有外部渠道时的唯一路径。
+            if not deliver_to_web:
+                continue
+            window = await _target_window(
+                session, subject_id=row.subject_id, channel="web"
+            )
+            if window is None:
+                await service.mark(
+                    row.id, state="rejected", reason="没有可投递的 Web 会话"
+                )
+                rejected += 1
+                continue
+            await _append_web_message(
+                session,
+                window_id=window.id,
+                text=str(row.draft_text),
+                opportunity_id=row.id,
+            )
+            await service.mark(row.id, state="sent", reason="web")
+            sent += 1
+            continue
+
         window_ref = await _target_window_ref(session, subject_id=row.subject_id)
         if window_ref is None:
             await service.mark(
@@ -163,6 +205,29 @@ async def dispatch_pending(
             failed += 1
 
     return {"sent": sent, "failed": failed, "rejected": rejected, "considered": len(rows)}
+
+
+async def _append_web_message(
+    session: AsyncSession, *, window_id: str, text: str, opportunity_id: str
+) -> None:
+    """把主动消息落成会话里的一条她的消息。
+
+    `origin=simulated` 标明这是**模拟生成**的内容（不是真实经历、不是用户的
+    话），前端与审计据此区分"她主动说的"和"用户问出来的"。
+    """
+    from ling.contracts.v1 import Origin
+    from ling.domains.conversation.service import ConversationService
+
+    conversation = ConversationService(session)
+    message = await conversation.add_message(
+        window_id, role="actor", text=text, origin=Origin.simulated
+    )
+    logger.info(
+        "主动消息已落库 window=%s message=%s opportunity=%s",
+        window_id,
+        getattr(message, "id", ""),
+        opportunity_id,
+    )
 
 
 __all__ = ["MAX_PER_ROUND", "dispatch_pending"]
