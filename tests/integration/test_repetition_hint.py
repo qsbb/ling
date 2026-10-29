@@ -134,3 +134,24 @@ async def test_paraphrased_catchphrase_is_still_caught() -> None:
     hint = repetition_hint(paraphrased)
     assert hint is not None, "换了措辞就漏了"
     assert "朋友的朋友就是" in hint
+
+
+def test_hint_is_not_in_a_protected_lane() -> None:
+    """重复提醒必须放在**可丢弃**的车道里。
+
+    `constraints` 属于 PROTECTED_LANES——超预算时永不被丢弃。一条
+    "你最近老用同一句"的提示如果放在那里，挤掉的会是隐私说明、回执要求
+    这类硬约束的预算，而它自己恰恰是最该先丢的。
+    """
+    import inspect
+
+    from ling.kernel.context import PROTECTED_LANES, SACRIFICE_ORDER
+
+    source = inspect.getsource(__import__("ling.kernel.context", fromlist=["x"]))
+    marker = source.index("repetition_hint(")
+    snippet = source[marker : marker + 900]
+    lanes = [lane for lane in PROTECTED_LANES if f'lane="{lane}"' in snippet]
+    assert not lanes, f"重复提醒落在了保护车道：{lanes}"
+    assert "capabilities" in snippet, "重复提醒没有放到 capabilities 车道"
+    # 顺带确认它确实在可牺牲顺序里
+    assert "capabilities" in SACRIFICE_ORDER

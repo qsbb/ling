@@ -662,7 +662,11 @@ class ContextCompiler:
         if _hint:
             contributions.append(
                 ContextContribution(
-                    lane="constraints",
+                    # **不能用 constraints 车道**：那是 PROTECTED_LANES，
+                    # 超预算时永不被丢弃。一条"你老用同一句"的提示挤掉的
+                    # 会是隐私说明、回执要求这类硬约束的预算——而它自己
+                    # 恰恰是最该先丢的东西。
+                    lane="capabilities",
                     text=_hint,
                     origin=Origin.verified_source,
                     visibility=Visibility.subject_private,

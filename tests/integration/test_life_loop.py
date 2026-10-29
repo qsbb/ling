@@ -14,12 +14,33 @@ import pytest
 pytestmark = pytest.mark.w0_web
 
 
+# 测试**不能依赖墙上时钟**：`handle_life_plan` 里有一条"离休息不足 40 分钟
+# 就不排"的护栏，晚上跑测试会直接命中，于是三条用例在夜间全红、白天全绿。
+# 固定在一个安全的本地时间（下午 15:00），所有相对时间都从这个基准算。
+FROZEN_LOCAL_HOUR = 15
+
+
+def _frozen_now():
+    """固定在本地 15:00 的当前时刻（转成 UTC 返回）。"""
+    from ling.config import get_settings
+    from ling.domains.agenda.service import _tz
+
+    tz = _tz(get_settings().user_timezone or "Asia/Shanghai")
+    local = datetime.now(tz).replace(hour=FROZEN_LOCAL_HOUR, minute=0, second=0, microsecond=0)
+    return local.astimezone(UTC)
+
+
+def _freeze_clock(monkeypatch, worker) -> None:
+    frozen = _frozen_now()
+    monkeypatch.setattr(worker, "utcnow", lambda: frozen)
+
+
 def _ago(hours_ago: int = 3) -> str:
     """取"N 小时前"的 HH:MM（按角色自己的时区）。"""
     from ling.config import get_settings
     from ling.domains.agenda.service import _tz
 
-    local = (datetime.now(UTC) - timedelta(hours=hours_ago)).astimezone(
+    local = (_frozen_now() - timedelta(hours=hours_ago)).astimezone(
         _tz(get_settings().user_timezone or "Asia/Shanghai")
     )
     return f"{local.hour:02d}:{local.minute:02d}"
@@ -34,7 +55,7 @@ def _soon(hours_ahead: int = 1) -> str:
     from ling.config import get_settings
     from ling.domains.agenda.service import _tz
 
-    local = (datetime.now(UTC) + timedelta(hours=hours_ahead)).astimezone(
+    local = (_frozen_now() + timedelta(hours=hours_ahead)).astimezone(
         _tz(get_settings().user_timezone or "Asia/Shanghai")
     )
     return f"{local.hour:02d}:{local.minute:02d}"
@@ -71,11 +92,14 @@ async def test_life_plan_creates_todays_plans(web_env, monkeypatch) -> None:
     """`life.plan` 要真的把日程排进库里。"""
     from ling import worker
 
+    _freeze_clock(monkeypatch, worker)
+
     router = _Router('[{"title":"翻两页书","start":"' + _soon() + '","minutes":60}]')
     monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
 
     assert router.calls == 1
@@ -86,12 +110,16 @@ async def test_life_plan_does_not_run_twice_a_day(web_env, monkeypatch) -> None:
     """一天只排一次——否则每次 tick 都问一遍模型，白烧钱也白打扰。"""
     from ling import worker
 
+    _freeze_clock(monkeypatch, worker)
+
     router = _Router('[{"title":"翻两页书","start":"' + _soon() + '","minutes":60}]')
     monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
     assert router.calls == 1
 
@@ -133,6 +161,7 @@ async def test_no_plan_when_model_unavailable(web_env, monkeypatch) -> None:
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
     assert await _plan_count() == 0
 
@@ -145,6 +174,7 @@ async def test_garbage_model_output_creates_no_plan(web_env, monkeypatch) -> Non
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
     assert await _plan_count() == 0
 
@@ -164,6 +194,7 @@ async def test_past_time_slots_are_not_scheduled(web_env, monkeypatch) -> None:
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
     assert await _plan_count() == 0
 
@@ -190,6 +221,7 @@ async def test_prompt_tells_the_model_what_time_it_is(web_env, monkeypatch) -> N
     monkeypatch.setattr(worker, "get_settings", lambda: web_env.settings)
     monkeypatch.setattr(worker, "_LAST_PLAN_DATE", "")
 
+    _freeze_clock(monkeypatch, worker)
     await worker.handle_life_plan({})
 
     assert captured, "没有向模型发出请求"
