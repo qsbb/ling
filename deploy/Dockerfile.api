@@ -1,0 +1,56 @@
+# ling API 镜像（amd64/arm64，纯 CPU 即可运行）
+#
+# 多阶段：先装依赖到 venv，再复制到精简运行时；非 root 运行。
+
+# 基础镜像可由构建参数覆盖：离线/内网环境常需使用本地已有镜像仓库
+# 例：docker compose build --build-arg LING_PYTHON_BASE=python:3.12-slim
+ARG LING_PYTHON_BASE=python:3.13-slim
+
+FROM ${LING_PYTHON_BASE} AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_SYSTEM_PYTHON=0
+
+WORKDIR /build
+COPY pyproject.toml README.md ./
+COPY src ./src
+# **必须拷**：pyproject 里声明的 wheel 包含 `connectors`（渠道连接器）。
+# 少这一行的话构建会因为找不到包而打不出完整 wheel——或者在能容忍缺失时
+# 静默产出一个没有 connectors 的镜像，表现为容器里 QQ/NapCat 全部连不上，
+# 日志只说"缺少凭据"或干脆没有日志。dev 里正常、容器里死掉，就是这种坑。
+COPY connectors ./connectors
+RUN pip install --no-cache-dir build \
+ && pip wheel --no-cache-dir --wheel-dir /wheels . \
+ && ls /wheels
+
+
+FROM ${LING_PYTHON_BASE} AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # 让迁移器稳定定位 alembic.ini 与 migrations/（镜像内为 /app）
+    LING_PROJECT_ROOT=/app
+
+RUN groupadd --system --gid 10001 ling \
+ && useradd --system --uid 10001 --gid ling --home-dir /app --shell /usr/sbin/nologin ling \
+ && mkdir -p /app /data /app/web \
+ && chown -R ling:ling /app /data
+
+WORKDIR /app
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+COPY --chown=ling:ling src ./src
+# 同上：入口脚本与部分运行期代码会 `import connectors.*`，镜像里必须有。
+COPY --chown=ling:ling connectors ./connectors
+COPY --chown=ling:ling alembic.ini ./alembic.ini
+COPY --chown=ling:ling migrations ./migrations
+COPY --chown=ling:ling deploy/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER ling
+EXPOSE 8080
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["api"]

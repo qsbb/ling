@@ -1,0 +1,230 @@
+# ling 最小部署：api / web / db / worker
+#
+# 用法（在仓库根目录）：
+#   cp deploy/env.example deploy/.env   # 按需修改口令
+#   docker compose -f deploy/compose.yaml --project-name ling-dev up -d --build
+#   curl http://127.0.0.1:8080/readyz
+#
+# 约束（设计文档 §11）：
+# - 数据库不对外暴露端口，只在内网网络里。
+# - 容器以非 root 运行，根文件系统只读 + tmpfs。
+# - 密钥用 Compose secrets 或受限挂载；非密钥设置由控制台发布。
+# - healthcheck 区分活着（healthz）、数据库就绪（readyz）。
+
+name: ling
+
+# 容器日志上限：个人服务器长期无人值守，默认 json-file 驱动会无限增长，
+# 几个月就能把磁盘写满（写满后数据库会直接不可写）。
+# 50MB × 3 个文件 = 单容器最多 150MB，全部服务合计约 600MB 封顶。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+x-app-env: &app-env
+  LING_ENV: production
+  LING_DATABASE_URL: postgresql+asyncpg://ling:${POSTGRES_PASSWORD:-ling-dev-password}@db:5432/ling
+  LING_REQUIRE_POSTGRES: "1"
+  LING_BOOTSTRAP_ADMIN: ${LING_BOOTSTRAP_ADMIN:-ling}
+  LING_BOOTSTRAP_ADMIN_PASSWORD: ${LING_BOOTSTRAP_ADMIN_PASSWORD:-}
+  LING_TEST_MODE: ${LING_TEST_MODE:-0}
+  LING_ROOT_KEY: ${LING_ROOT_KEY:-}
+  LING_COOKIE_SECURE: ${LING_COOKIE_SECURE:-0}
+  LING_WEB_DIST: /app/web
+  LING_DATA_DIR: /data
+  LING_PROJECT_ROOT: /app
+  # OneBot V11（NapCat / Lagrange / go-cqhttp）。不传这些变量，
+  # 用户即使在 .env 里配好，容器内也读不到 —— 表现为"配了但连不上"。
+  LING_ONEBOT_API_BASE: ${LING_ONEBOT_API_BASE:-}
+  LING_ONEBOT_ACCESS_TOKEN: ${LING_ONEBOT_ACCESS_TOKEN:-}
+  LING_ONEBOT_SECRET: ${LING_ONEBOT_SECRET:-}
+  LING_ONEBOT_SELF_ID: ${LING_ONEBOT_SELF_ID:-}
+  LING_ONEBOT_INSTANCE_ID: ${LING_ONEBOT_INSTANCE_ID:-onebot-default}
+  LING_ONEBOT_SUPPORTS_GROUP: ${LING_ONEBOT_SUPPORTS_GROUP:-1}
+  LING_ONEBOT_PROACTIVE: ${LING_ONEBOT_PROACTIVE:-0}
+  # 语义检索（可选）。只在 env.example 里写是不够的——变量必须真正传进容器，
+  # 否则配了 BGE 也永远走 BM25 降级，表现为"配了却没效果"。
+  # QQ 官方机器人（WebSocket 网关，不需要公网回调地址、不需要扫码）。
+  #
+  # **必须列在这里**：x-app-env 是逐项白名单，不写的变量即使在 .env 里配好
+  # 也进不了容器——表现为"配了 qqbot 却没连上"，而且日志里一句异常都没有。
+  # 这个坑在 OneBot 那一节已经踩过一次，别再踩第二次。
+  LING_QQBOT_ENABLED: ${LING_QQBOT_ENABLED:-0}
+  LING_QQBOT_APP_ID: ${LING_QQBOT_APP_ID:-}
+  LING_QQBOT_CLIENT_SECRET: ${LING_QQBOT_CLIENT_SECRET:-}
+  LING_QQBOT_INSTANCE_ID: ${LING_QQBOT_INSTANCE_ID:-qqbot-default}
+  LING_QQBOT_SANDBOX: ${LING_QQBOT_SANDBOX:-1}
+  LING_QQBOT_PROACTIVE: ${LING_QQBOT_PROACTIVE:-0}
+  LING_QQBOT_SUPPORTS_GROUP: ${LING_QQBOT_SUPPORTS_GROUP:-1}
+  # 出入许可：qqbot 那边名单里放的是 **openid**（不是 QQ 号）
+  LING_ACCESS_MODE: ${LING_ACCESS_MODE:-whitelist}
+  LING_ACCESS_LIST: ${LING_ACCESS_LIST:-}
+  # 勿扰时段与"今日已发几条"按这个时区算；不填会退回 UTC（东八区错 8 小时）
+  LING_USER_TIMEZONE: ${LING_USER_TIMEZONE:-}
+  LING_EMBEDDING_API_BASE: ${LING_EMBEDDING_API_BASE:-}
+  LING_EMBEDDING_ACCOUNT_ID: ${LING_EMBEDDING_ACCOUNT_ID:-}
+  LING_EMBEDDING_API_KEY: ${LING_EMBEDDING_API_KEY:-}
+  LING_EMBEDDING_MODEL: ${LING_EMBEDDING_MODEL:-@cf/baai/bge-m3}
+  LING_RERANK_API_BASE: ${LING_RERANK_API_BASE:-}
+  LING_RERANK_API_KEY: ${LING_RERANK_API_KEY:-}
+  LING_RERANK_MODEL: ${LING_RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+  # 运维端点据此判断备份新鲜度
+  LING_BACKUP_DIR: ${LING_BACKUP_DIR:-}
+  LING_ALERT_WEBHOOK_URL: ${LING_ALERT_WEBHOOK_URL:-}
+  PYTHONUNBUFFERED: "1"
+
+services:
+  db:
+    logging: *default-logging
+    image: ${LING_POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ling
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ling-dev-password}
+      POSTGRES_DB: ling
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # 不发布端口：数据库只在 compose 内网可见
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ling -d ling"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    volumes:
+      # 多副本共享同一份数据卷：root key 与本地回退都需要一致
+      - app-data:/data
+      - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
+    # 多副本时不要用固定 host 端口（会冲突）；由 edge 反代暴露单一入口。
+    # 需要直连调试时设 LING_API_PORT 并只用 --scale api=1。
+    ports: []
+    expose:
+      - "8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal, edge]
+    # 滚动更新：先起新的再停旧的，避免整段不可用。
+    # 多副本的前提是状态不外置在进程内存（见 docs/adr/0005）。
+    deploy:
+      replicas: ${LING_API_REPLICAS:-2}
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+        delay: 2s
+        max_attempts: 5
+
+  # 单一入口：反代到 api 各副本。多副本直连会因 host 端口冲突起不来，
+  # 因此对外只暴露 edge。
+  edge:
+    logging: *default-logging
+    image: ${LING_NGINX_IMAGE:-nginx:alpine}
+    restart: unless-stopped
+    volumes:
+      # 默认挂明文配置，只用于本机/可信 VPN。
+      # 走公网时把 LING_EDGE_CONF 指到 ./nginx-tls.conf，并把证书放到
+      # LING_EDGE_CERTS 指向的目录（见 docs/DEPLOYMENT.md 第 9 节）。
+      - ${LING_EDGE_CONF:-./nginx.conf}:/etc/nginx/conf.d/default.conf:ro
+      - ${LING_EDGE_CERTS:-./certs}:/etc/nginx/certs:ro
+    ports:
+      - "${LING_EDGE_PORT:-8080}:80"
+      # TLS 端口。挂明文配置时不监听 443，这个映射是空转，不影响启动。
+      - "${LING_EDGE_TLS_PORT:-8443}:443"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt: ["no-new-privileges:true"]
+    networks: [edge]
+
+  # worker 可多副本：outbox 用 SELECT ... FOR UPDATE SKIP LOCKED 领取，
+  # handler 靠数据库唯一约束幂等（migration 0008/0009）：
+  #   memory_episodes(turn_id) / memories(turn_id,text) /
+  #   relationship_events(turn_id,kind)
+  # 重试不会产生重复记忆或重复放大关系。
+  worker:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
+    restart: unless-stopped
+    command: ["worker"]
+    deploy:
+      replicas: ${LING_WORKER_REPLICAS:-1}
+    environment:
+      <<: *app-env
+    volumes:
+      - app-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    # worker 的存活信号：能连上数据库并读到 outbox 表（证明依赖就绪、进程可用）
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import asyncio, os, sys
+          async def main() -> int:
+              import asyncpg
+              dsn = os.environ["LING_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+              conn = await asyncpg.connect(dsn, timeout=3)
+              try:
+                  await conn.fetchval("SELECT count(*) FROM outbox_events")
+              finally:
+                  await conn.close()
+              return 0
+          sys.exit(asyncio.run(main()))
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    networks: [internal]
+
+volumes:
+  db-data:
+  app-data:
+
+networks:
+  internal:
+    internal: true
+  edge:
