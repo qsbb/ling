@@ -155,3 +155,53 @@ def test_hint_is_not_in_a_protected_lane() -> None:
     assert "capabilities" in snippet, "重复提醒没有放到 capabilities 车道"
     # 顺带确认它确实在可牺牲顺序里
     assert "capabilities" in SACRIFICE_ORDER
+
+
+def test_lcs_runs_at_most_once_per_carrier_set(monkeypatch) -> None:
+    """同一组载体消息只算一次最长公共子串。
+
+    `repetition_hint()` 在**每轮对话**里都会跑。原来对每个命中的 4 字片段
+    都求一次 LCS（126 字×5 实测 60ms）。同一条消息里的几十个片段往往落在
+    同样那 3 条消息上，逐个算等于把同一份计算重复几十遍。
+    """
+    from ling.capabilities import repetition as rep
+
+    calls = {"n": 0}
+    original = rep._longest_shared
+
+    def _counting(texts):  # noqa: ANN001, ANN202
+        calls["n"] += 1
+        return original(texts)
+
+    monkeypatch.setattr(rep, "_longest_shared", _counting)
+
+    base = "朋友的朋友就是我的朋友我们一起去吃好吃的吧" * 6
+    msgs = [base + f"第{i}句不同收尾。" for i in range(5)]
+    rep.repetition_hint(msgs)
+
+    assert calls["n"] <= 2, f"LCS 被调用了 {calls['n']} 次，去重没生效"
+
+
+def test_reported_phrase_is_readable() -> None:
+    """报出来的短语要能读：限长、去掉首尾标点。
+
+    最长公共子串可能是一整段重复文案，原样塞进提示会变成一堵墙；
+    也可能以句号开头（「。朋友的朋友就是」）。
+    """
+    from ling.capabilities.repetition import MAX_PHRASE_CHARS, repetition_hint
+
+    real = [
+        "这天气适合溜达。\n朋友的朋友就是我的朋友，有空约饭呗？",
+        "正读冒险故事集呢。\n朋友的朋友就是我的朋友。",
+        "晚饭还没吃呢。\n朋友的朋友就是朋友，别客气呀。",
+    ]
+    hint = repetition_hint(real)
+    assert hint is not None
+    assert "「。朋友" not in hint, "短语以句号开头"
+    assert len(hint) < 200
+
+    base = "朋友的朋友就是我的朋友我们一起去吃好吃的吧" * 6
+    long_hint = repetition_hint([base + f"第{i}句。" for i in range(5)])
+    assert long_hint is not None
+    quoted = long_hint.split("「")[1].split("」")[0]
+    assert len(quoted) <= MAX_PHRASE_CHARS, f"短语太长：{len(quoted)} 字"

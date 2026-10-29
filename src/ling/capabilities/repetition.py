@@ -38,6 +38,9 @@ REPEAT_THRESHOLD = 3
 # 短语级：连续几个字跨多条消息出现，就是口头禅
 SHINGLE_CHARS = 4
 SHINGLE_MIN_MESSAGES = 3
+# 报出来的短语要能读：最长公共子串可能是一整段重复的文案，
+# 原样塞进提示会变成一堵墙，反而看不出"是哪句口头禅"。
+MAX_PHRASE_CHARS = 24
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -115,13 +118,26 @@ def repeated_phrase(texts: list[str]) -> str | None:
     # 命中一个 4 字片段后，把**包含它的那些消息**拿出来求最长公共子串，
     # 报出来的才是完整那句口头禅（"朋友就是" → "朋友的朋友就是我的朋友"），
     # 而不是一个碎片。
+    #
+    # **按载体集合去重**：一段文字里的几十个片段往往落在同样那 3 条消息上，
+    # 逐个求 LCS 会把同一份计算重复几十遍（实测 126 字×5 要 60ms）。
+    # 同一组载体只算一次，最坏降到个位数毫秒——这个函数在每轮对话里都跑。
     best = ""
-    for shingle in sorted(hits, key=len, reverse=True):
-        carriers = [t for t in recent if shingle in "".join(t.split())]
-        shared = _longest_shared(["".join(t.split()) for t in carriers])
+    done: set[frozenset[int]] = set()
+    normalized = ["".join(t.split()) for t in recent]
+    for shingle in hits:
+        carriers = frozenset(i for i, text in enumerate(normalized) if shingle in text)
+        if carriers in done:
+            continue
+        done.add(carriers)
+        shared = _longest_shared([normalized[i] for i in sorted(carriers)])
         if len(shared) > len(best):
             best = shared
-    return best if len(best) >= SHINGLE_CHARS else None
+    # 公共子串常以句号/逗号开头结尾，原样展示会变成「。朋友的朋友就是」。
+    best = best.strip("。！？，、；：…\n \t")
+    if len(best) < SHINGLE_CHARS:
+        return None
+    return best[:MAX_PHRASE_CHARS]
 
 
 def _exact_tail_hint(recent: list[str]) -> str | None:
@@ -168,6 +184,7 @@ def repetition_hint(texts: list[str]) -> str | None:
 
 __all__ = [
     "LOOKBACK",
+    "MAX_PHRASE_CHARS",
     "MIN_SENTENCE_CHARS",
     "REPEAT_THRESHOLD",
     "SHINGLE_CHARS",
