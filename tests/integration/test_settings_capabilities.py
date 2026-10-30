@@ -85,7 +85,9 @@ def test_proactive_status_reports_every_channel(monkeypatch) -> None:
 
 
 
-async def test_proactive_gate_reads_published_quiet_hours(logged_in: TestEnv) -> None:
+async def test_proactive_gate_reads_published_quiet_hours(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """免打扰窗必须来自**已发布配置**，不能是服务内部的默认值。
 
     现象：面板把 quiet 改成 0-0（关闭）并发布后，主动状态仍报
@@ -95,8 +97,20 @@ async def test_proactive_gate_reads_published_quiet_hours(logged_in: TestEnv) ->
     用例设计：先发布一个**覆盖此刻**的窗口，断言确实报勿扰；再发布 0-0，
     断言不报。只做后者是无效的——默认值本来就是 0-0，改不改都会绿。
     """
+    from dataclasses import replace
     from datetime import datetime
     from zoneinfo import ZoneInfo
+
+    # clean env 下 `LING_USER_TIMEZONE` 未设置，route 会传 None，gate 直接
+    # 只报时区原因；这样本用例测不到免打扰窗。只在**本用例**临时钉住
+    # app 的 Settings（不动 conftest，也不放宽生产的「未知时区默认拒绝」），
+    # 并用同一个时区计算"此刻"，保证窗口与 gate 判定一致。
+    timezone = "Asia/Shanghai"
+    monkeypatch.setattr(
+        logged_in.app.state,
+        "settings",
+        replace(logged_in.settings, user_timezone=timezone),
+    )
 
     async def _publish(payload: dict) -> None:
         draft = await logged_in.client.put("/v1/settings/draft", json=payload)
@@ -110,8 +124,7 @@ async def test_proactive_gate_reads_published_quiet_hours(logged_in: TestEnv) ->
         body = (await logged_in.client.get("/v1/proactive")).json()
         return " ".join(body.get("gate_reasons") or [])
 
-    cfg = (await logged_in.client.get("/v1/settings/config")).json()
-    tz = ZoneInfo(cfg.get("user_timezone") or "Asia/Shanghai")
+    tz = ZoneInfo(timezone)
     now = datetime.now(tz)
     minute = now.hour * 60 + now.minute
 

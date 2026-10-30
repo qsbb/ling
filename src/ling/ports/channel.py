@@ -48,7 +48,17 @@ class ChannelError(Exception):
 
 @dataclass(frozen=True)
 class OutboundMessage:
-    """要发给平台的一条消息。``operation_id`` 是幂等键。"""
+    """要发给平台的一条消息。
+
+    ``operation_id`` 是**本地** operation 关联 ID（``DeliveryService`` 新建的
+    ``operations`` 行主键），用来把回执、日志和机会上的
+    ``delivery_operation_id`` 对回同一条本地记录。
+
+    它**不是平台侧幂等键**：onebot / qqbot / qq 的 ``connector.send`` 都不把
+    它放进出站 payload（qq 只拿它拼本地 ``receipt_id``），平台看不到这个值，
+    也就不能据它去重或对账——平台侧唯一可核对的凭据是回执里的
+    ``platform_message_id``。
+    """
 
     operation_id: str
     window_ref: str

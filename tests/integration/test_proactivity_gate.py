@@ -321,7 +321,18 @@ async def test_proactive_route_consults_real_capability(
     断言的是原因消失而不是 gate==True：gate 还受勿扰时段和日限额影响，
     而测试不该依赖"现在几点"。
     """
+    from dataclasses import replace
+
     from ling.capabilities import channels
+
+    # 本用例只看「渠道」这条原因，因此把用户时区固定下来：clean env 下
+    # `LING_USER_TIMEZONE` 未设置时 gate 会直接只报时区原因，渠道原因
+    # 根本不会被计算。只在本用例临时替换 app 的 Settings，不动 conftest。
+    monkeypatch.setattr(
+        logged_in.app.state,
+        "settings",
+        replace(logged_in.settings, user_timezone="Asia/Shanghai"),
+    )
 
     class _Caps:
         enabled = True
@@ -335,12 +346,19 @@ async def test_proactive_route_consults_real_capability(
         def capabilities(self):  # noqa: ANN202
             return _Caps()
 
-    monkeypatch.setattr(channels, "proactive_connector", lambda: _Conn())
+    # 打真正的路由接缝：路由直接 import 并调用 proactive_connector_status，
+    # 只替换 proactive_connector 对它无效。
+    monkeypatch.setattr(
+        channels, "proactive_connector_status", lambda: (_Conn(), None)
+    )
     r = await logged_in.client.get("/v1/proactive")
     assert r.status_code == 200, r.text
     reasons = r.json()["gate_reasons"]
     assert not any("渠道不支持" in x for x in reasons), (
         f"能力自检通过了却仍报渠道不支持：{reasons}"
+    )
+    assert not any("连接器不可用" in x for x in reasons), (
+        f"渠道可用却仍报连接器不可用：{reasons}"
     )
 
 
@@ -348,17 +366,32 @@ async def test_proactive_route_reports_missing_channel(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """没有可用渠道时必须如实说不可达——不能假装能发。"""
+    from dataclasses import replace
+
     from ling.capabilities import channels
 
-    monkeypatch.setattr(channels, "proactive_connector", lambda: None)
+    # 本用例断言的是「渠道」这条原因。用户时区未知时 gate 会直接返回
+    # LING_USER_TIMEZONE，渠道原因根本不会被计算（那是隔壁用例的场景）。
+    # 只在本用例临时替换 app 的 Settings；不动 conftest，也不放宽生产的
+    # 「未知时区默认拒绝」策略，避免影响其它用例。
+    monkeypatch.setattr(
+        logged_in.app.state,
+        "settings",
+        replace(logged_in.settings, user_timezone="Asia/Shanghai"),
+    )
+    # 打真正的路由接缝并给出确定的失败原因：路由直接 import 并调用
+    # proactive_connector_status，返回 (None, 原因)，原因原样进入 gate_reasons。
+    monkeypatch.setattr(
+        channels,
+        "proactive_connector_status",
+        lambda: (None, "连接器不可用（测试模拟无主动渠道）"),
+    )
     r = await logged_in.client.get("/v1/proactive")
+    assert r.status_code == 200, r.text
     reasons = r.json()["gate_reasons"]
-    # 理由必须**指名道姓**：原来只有"渠道不支持"，用户会去找一个不存在的
-    # 平台权限。现在要么点出环境变量，要么点出连接器没配好。
-    assert any(
-        ("LING_ONEBOT_PROACTIVE" in x) or ("LING_QQ_ENABLED" in x) or ("连接器不可用" in x)
-        for x in reasons
-    ), f"没说清渠道为什么不可达：{reasons}"
+    assert "连接器不可用（测试模拟无主动渠道）" in reasons, (
+        f"没说清渠道为什么不可达：{reasons}"
+    )
 
 
 async def test_proactive_separates_implemented_from_enabled(logged_in: TestEnv) -> None:

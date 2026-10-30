@@ -1,4 +1,4 @@
-"""Delivery：按渠道能力渲染、发送、幂等与真实回执对账。
+"""Delivery：按渠道能力渲染、发送、记录本地 operation/回执并与平台回执对账。
 
 不变式（设计文档 §1 第 6 条）：
 - 计划不是结果。只有拿到平台真实回执才能标 ``succeeded``。
@@ -28,6 +28,7 @@ from ling.ports.channel import (
 
 @dataclass(frozen=True)
 class DeliveryOutcome:
+    # 本地 operations 行主键。不是平台侧幂等键：connector 不透传 operation_id。
     operation_id: str
     state: OperationState
     receipt: DeliveryReceiptRow | None
@@ -147,10 +148,14 @@ class DeliveryService:
         operation.state = OperationState.running.value
         await self._session.flush()
 
-        # 幂等键必须是我们刚创建的 operation.id，而不是调用方随手填的值。
-        # OutboundMessage 的契约写着"``operation_id`` 是幂等键"，
-        # 但原实现把调用方的 message 原样传给平台——平台收到的键与本地
-        # 记录对不上，重试去重、按 operation 对账都会失配。
+        # 把本地 operation ID 替进 message，保证 connector 拿到的
+        # ``operation_id`` 与刚建的 operation 行是同一个 ID——回执里的
+        # ``operation_id`` 和日志都靠它回到本地记录。
+        #
+        # 它**不是平台侧幂等键**：onebot / qqbot / qq 的 ``send`` 都不把这个值
+        # 放进出站 payload（qq 只拿它拼本地 ``receipt_id``），平台看不到它，
+        # 也就不能按它去重或对账。真正的平台凭据是回执里的
+        # ``platform_message_id``；这里的 replace 只解决本地关联。
         outbound = replace(message, operation_id=operation.id)
 
         try:

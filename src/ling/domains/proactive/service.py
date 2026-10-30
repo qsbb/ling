@@ -222,8 +222,41 @@ class ProactivityService:
         ).scalar_one()
         return int(count or 0)
 
-    async def mark(self, opportunity_id: str, *, state: str, reason: str | None = None) -> None:
-        if state not in {"candidate", "sent", "rejected", "expired", "failed"}:
+    async def mark(
+        self,
+        opportunity_id: str,
+        *,
+        state: str,
+        reason: str | None = None,
+        operation_id: str | None = None,
+        delivery_state: str | None = None,
+    ) -> None:
+        """结算一条机会。
+
+        ``operation_id`` / ``delivery_state`` 是 0027 迁移加的结算字段，之前
+        一直是空的：投递失败时只写 ``state`` 和一句文案，事后既查不到"是哪
+        一次投递"，也分不清"确定没发"和"可能已经发了"。这两个字段在**失败
+        路径**上比成功路径上更重要——成功有回执可查，失败时至少还能对上同一
+        轮那条 warning 日志。
+
+        ``operation_id`` 是**本地** operation 行 ID（`DeliveryService` 新建的
+        那一条），不是平台侧幂等键：onebot/qqbot/qq 的 ``connector.send`` 都
+        不把它透传给平台，平台也无从按它去重或对账。
+
+        ``uncertain`` 与 ``failed`` 是两件事：前者是"平台可能已经收下，结果
+        未知，等对账"，后者是"确定没发出去"。两者都**不能回头再发**（发消息
+        撤不回），但报给运维的话必须说清是哪一种。
+
+        ``operation_id`` **不保证本地有对应行**：回执写库失败时，那次投递的
+        operation / 回执会随 SAVEPOINT 回滚，这里记下的只是本地 operation ID
+        的残留。本地查不到对应记录，它只能和同一轮那条 warning
+        （``operation=``）对上；**不能**用它向平台去重/对账，也**不代表现在有
+        可用的对账**。
+        所以这两列是**审计线索**，不是外键——读的一方必须容忍查不到 operation
+        （见 `ling.domains.proactive.dispatch` 的「已知限制」）。
+        """
+        allowed = {"candidate", "sent", "rejected", "expired", "failed", "uncertain"}
+        if state not in allowed:
             raise ValueError(f"未知机会状态: {state}")
         row = await self._session.get(ProactiveOpportunity, opportunity_id)
         if row is None:
@@ -235,6 +268,12 @@ class ProactivityService:
             row.sent_at = datetime.now(UTC)
         if reason:
             row.rejected_reason = reason[:500]
+        # 结算字段按列宽截断：宁可截断也不能让"记一笔结算"自己抛异常，
+        # 那会把一轮投递的回滚范围放大。
+        if operation_id:
+            row.delivery_operation_id = operation_id[:64]
+        if delivery_state:
+            row.delivery_state = delivery_state[:32]
         await self._session.flush()
 
     async def set_draft(self, opportunity_id: str, *, text: str) -> None:

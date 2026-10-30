@@ -75,8 +75,10 @@ class OneBotV11Connector(ChannelConnector):
         else:
             action = "send_private_msg"
             params = {"user_id": self._target_id(message.window_ref)}
-        # 用 message_id 做幂等键：平台侧不必理解 operation_id，
-        # 但本地回执要靠它对应回 Operation。
+        # 出站 payload 只有目标 id + message 段，**不含 operation_id**：
+        # ``message.operation_id`` 是本地 operation 行 ID，只用来回填下面
+        # 回执里的 ``operation_id``（本地关联）；平台侧收不到这个字段，也不能
+        # 按它去重或对账——平台侧凭据是响应里的 ``data.message_id``。
         params["message"] = build_outbound_segments(
             message.text,
             list(message.media_refs),
