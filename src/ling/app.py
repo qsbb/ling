@@ -289,6 +289,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
     from ling.api.routes import settings as settings_routes
+    from ling.api.routes import version as version_routes
 
     # 最外层：给每个请求一个 trace_id，并记录访问日志。
     # 必须在路由之前注册，否则 4xx/5xx 走不到这里。
@@ -302,6 +303,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
+    app.include_router(version_routes.router, prefix="/v1")
     from ling.api.routes import dashboard as dashboard_routes
 
     app.include_router(dashboard_routes.router, prefix="/v1")

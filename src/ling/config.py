@@ -138,6 +138,23 @@ class Settings:
         )
     )
 
+    # --- 受控 Web 更新通道（默认关闭）---
+    #
+    # API 进程**不接触 Docker socket**：它只把请求写进宿主挂进来的 requests
+    # 目录，并读取宿主执行器写的 status 目录。真正的部署由宿主上的
+    # deploy/update/executor.py 独立完成（见 deploy/update/README.md）。
+    update_enabled: bool = field(default_factory=lambda: _bool("LING_UPDATE_ENABLED", False))
+    update_requests_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("LING_UPDATE_REQUESTS_DIR", "/run/ling-update/requests")
+        )
+    )
+    update_status_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("LING_UPDATE_STATUS_DIR", "/run/ling-update/status")
+        )
+    )
+
     # --- 渠道开关（默认全关：未验证的入口不向用户开放）---
     qq_enabled: bool = field(default_factory=lambda: _bool("LING_QQ_ENABLED", False))
     wechat_enabled: bool = field(default_factory=lambda: _bool("LING_WECHAT_ENABLED", False))
