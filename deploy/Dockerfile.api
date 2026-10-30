@@ -34,6 +34,13 @@ RUN pip install --no-cache-dir --retries 5 --timeout 60 \
 
 FROM ${LING_PYTHON_BASE} AS runtime
 
+# 构建提交标记：由 install.sh 在构建前解析（本检出 git HEAD 的 40 位 sha），
+# 或由宿主更新执行器按 release 的确切提交导出。没有就是空串——运行时
+# /v1/version 报 commit=null，而不是把未知提交伪装成真实提交。
+# 只在 runtime 阶段声明：builder 阶段不需要，也不该影响 wheel 内容。
+ARG LING_COMMIT=""
+ENV LING_COMMIT=${LING_COMMIT}
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \

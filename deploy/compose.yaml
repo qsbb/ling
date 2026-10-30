@@ -104,13 +104,31 @@ services:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
         # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        # 构建提交标记（/v1/version 的 commit）。install.sh 在构建前解析本检出
+        # 的 git HEAD 或宿主执行器传的 LING_COMMIT；为空时运行时报 null，
+        # 不伪造。这只是版本标记，不是发布签名。
+        LING_COMMIT: ${LING_COMMIT:-}
     restart: unless-stopped
     environment:
       <<: *app-env
+      # --- 自助更新通道（默认关闭，只有 api 拿得到）---
+      # 开关默认 0：install.sh 不会自动打开，env.example 也保持关闭。
+      # 打开前必须由宿主完成更新执行器初始化（建目录、赋权、备份）。
+      LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}
+      # 容器内固定路径，不由宿主 .env 覆盖，避免“执行器和 api 各看一个目录”。
+      LING_UPDATE_REQUESTS_DIR: /run/ling-update/requests
+      LING_UPDATE_STATUS_DIR: /run/ling-update/status
     volumes:
       # 多副本共享同一份数据卷：root key 与本地回退都需要一致
       - app-data:/data
       - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
+      # 更新通道：api 只写请求、只读状态；目录在宿主上由更新执行器初始化
+      # 创建并赋权（requests 给 uid 10001；status 只允许宿主写，非 0777）。
+      # worker 不挂这两个目录、也不拿 LING_UPDATE_* 配置；Web 侧永远不接触
+      # Docker socket，也不挂宿主源码树——api 的挂载只有数据卷、只读前端
+      # dist 与这两条更新通道。
+      - ${LING_UPDATE_REQUESTS_HOST:-../.run/update/requests}:/run/ling-update/requests:rw
+      - ${LING_UPDATE_STATUS_HOST:-../.run/update/status}:/run/ling-update/status:ro
     # 多副本时不要用固定 host 端口（会冲突）；由 edge 反代暴露单一入口。
     # 需要直连调试时设 LING_API_PORT 并只用 --scale api=1。
     ports: []
@@ -130,7 +148,9 @@ services:
     security_opt: ["no-new-privileges:true"]
     networks: [internal, edge]
     # 滚动更新：先起新的再停旧的，避免整段不可用。
-    # 多副本的前提是状态不外置在进程内存（见 docs/adr/0005）。
+    # 多副本的前提是状态不外置在进程内存：权威状态都在 PostgreSQL
+    # （见 docs/adr/0001-modular-monolith-and-ownership.md 第 5 条，以及
+    # docs/DEPLOYMENT.md 第 7 节「多副本的前提：状态不能在进程内存」）。
     deploy:
       replicas: ${LING_API_REPLICAS:-2}
       update_config:
@@ -184,6 +204,7 @@ services:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
         # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        LING_COMMIT: ${LING_COMMIT:-}
     restart: unless-stopped
     command: ["worker"]
     deploy:
@@ -191,6 +212,8 @@ services:
     environment:
       <<: *app-env
     volumes:
+      # 只有数据卷：worker 不挂更新通道（没有 requests/status），
+      # 也不拿 LING_UPDATE_* 环境变量，避免后台任务越权触发部署。
       - app-data:/data
     depends_on:
       db:

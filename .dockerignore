@@ -11,6 +11,29 @@ __pycache__
 .pytest_cache
 .data
 logs
+# install.sh 的回退目录与更新通道运行期数据：可能有 docker registry 凭据、
+# 更新请求/状态；绝不能进 build context（旧版回退目录 .home/.docker 一并排除）。
+.run
+.home
+.docker
+.ling-install.lock
+**/.ling-install.lock
+deploy/compose.override.*
+deploy/certs
+deploy/secrets
+# 私钥/证书：.gitignore 已禁止入库，build context 也不该带上（纵深防御）。
+# 现有 Dockerfile 只 COPY 固定源码路径，这里防的是以后新增 COPY 或误把
+# 证书放在仓库其它目录时被一起打包进镜像。
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.crt
+**/*.crt
+*.p12
+**/*.p12
+*.dump
+**/*.dump
 .env
 .env.*
 !.env.example
