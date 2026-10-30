@@ -52,9 +52,21 @@ bash deploy/install.sh
 ```bash
 bash deploy/install.sh --status      # 状态
 bash deploy/install.sh --logs api    # 日志
-bash deploy/install.sh               # 升级
+bash deploy/install.sh               # 升级（在**当前源码**上重新构建并重启）
 bash deploy/install.sh --down        # 停止（数据保留）
 ```
+
+> **升级前必读**
+> `deploy/install.sh` 只会**构建并部署当前这份源码**，不会 `git pull`、也不会去
+> GitHub 下载新版本。仓库目前**还没有发布正式 Release**，自动更新默认关闭
+> （`LING_UPDATE_ENABLED=0`）。想升级要先在宿主机上人工接管：取到新源码后重新运行
+> `install.sh`（它会保留 `deploy/.env` 与数据卷）。
+> 更新执行器（`deploy/update/`，默认不启用）只负责在**已经人工纳管**的机器上按
+> tag/commit 执行同一套安装流程；第一次纳管必须人工完成，见
+> [docs/UPDATES.md](docs/UPDATES.md)。
+> 升级前先备份数据库与 `deploy/.env`。API 容器是只读根文件系统、非 root，**没有
+> Docker socket**，也没有挂宿主源码树；真实 Docker 上的升级/回滚演练**尚未完成**，
+> 不要把自动更新当成已验证能力。
 
 > 首次启动会**生成随机密码并打印在启动日志里**（安装脚本也会把它取出来显示）。
 > 只有 `deploy/install.sh --admin-user <名字>` 能改用户名；默认 `ling`。
@@ -103,6 +115,7 @@ python -m ling                               # → http://127.0.0.1:8080
 | `LING_QQBOT_*` | QQ 官方机器人凭据与开关 |
 | `LING_ONEBOT_*` | OneBot 渠道连接 |
 | `LING_LOG_LEVEL` | 日志级别 |
+| `LING_UPDATE_ENABLED` | 自助更新开关，默认 `0`（关闭）。打开前必须先由宿主人工纳管执行器，见 [UPDATES](docs/UPDATES.md) |
 
 > 渠道的发送者标识是 **openid**（官方机器人）或 **QQ 号**（OneBot），两者不通用。
 > 加白名单时注意用对的那种。详见 [身份设计](docs/IDENTITY-MULTIUSER-DESIGN.md)。
@@ -137,6 +150,7 @@ contracts/       导出的 JSON Schema
 - [API 契约](docs/API-WEB-V1.md)
 - [设置分类](docs/SETTINGS-TAXONOMY.md)
 - [架构决策记录 (ADR)](docs/adr/)
+- [升级与自动更新](docs/UPDATES.md)（默认关闭，未在真实 Docker 上演练）
 - [注意力设计](docs/ATTENTION-DESIGN.md) · [自主性设计](docs/AUTONOMY-DESIGN.md) · [群聊轮询](docs/GROUP-POLLING-DESIGN.md)
 
 ## 开发
@@ -158,6 +172,10 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
+
+发布与升级：仓库目前**没有发布正式 Release**，也没有经过真实 Docker 的升级/回滚
+演练。`install.sh` 只部署当前源码；自助更新默认关闭，第一次升级必须人工纳管，
+见 [docs/UPDATES.md](docs/UPDATES.md)。
 
 ## 安全与隐私
 

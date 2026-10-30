@@ -112,10 +112,62 @@ enabled, temperature, max_tokens?, timeout_seconds, daily_cost_limit?}`。
 | GET | `/readyz` | 数据库就绪（含迁移版本） |
 | GET | `/v1/health/model` | 当前生效 profile 的可用性摘要 |
 
-## 7. 前端必须遵守
+## 7. 版本与更新
+
+更新通道默认关闭（`LING_UPDATE_ENABLED=0`）。打开后 API 也只**写一条请求**，
+不执行部署：构建/切换由宿主机上的独立执行器完成（见
+[UPDATES.md](UPDATES.md)）。API 容器没有 Docker socket。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/v1/version` | `{schema_version, current, commit, web_manifest_sha256}`；`commit` 读构建注入的 `LING_COMMIT`，未知为 `null` |
+| GET | `/v1/version/check-release` | 手动检查 GitHub 最新 Release；保留 `status/current/latest/published_at/html_url/is_newer`，追加 `release_id/target_commit/update_eligible/update_reason` |
+| GET | `/v1/version/update` | 更新通道视图（只读固定 JSON，不发起网络请求） |
+| POST | `/v1/version/update-requests` | owner 提交一次更新请求，`201` + job |
+
+`GET /v1/version/update`：
+
+```json
+{ "schema_version": "v1", "enabled": false, "reason": "disabled",
+  "executor": { "online": false, "last_seen_at": null },
+  "current_job": null }
+```
+
+`current_job` 非空时：
+
+```json
+{ "request_id": "upd_<32 hex>", "state": "queued|running|succeeded|failed|needs_manual",
+  "stage": "queued|preflight|backup|fetch|verify_source|build|deploy|verify|complete",
+  "target_tag": "v0.2.0", "target_commit": "<40 hex>",
+  "created_at": "...", "updated_at": "...", "error_code": null,
+  "message": "服务端固定码表生成" }
+```
+
+`POST /v1/version/update-requests`（owner 专属）：必须
+`Content-Type: application/json`、请求头 `X-Ling-Update: 1`，Cookie 认证必须同源
+（带匹配的 `Origin`）。请求体只接受：
+
+```json
+{ "confirm_tag": "v0.2.0",
+  "expected": { "release_id": 123, "tag": "v0.2.0", "commit": "<40 hex>",
+                "current_version": "0.1.0", "current_commit": "<40 hex>" } }
+```
+
+服务端会重新核验远端 Release 与当前运行版本，任何变化返回 `409`
+（`release_changed` / `installed_version_changed`）。**没有取消或关闭接口**：
+失败只保留 `needs_manual` 语义，由人按 `docs/UPDATES.md` 的恢复步骤处理。
+
+`reason` 固定码：`disabled`、`not_owner`、`executor_offline`、
+`channel_unavailable`、`installed_commit_unknown`、`version_drift`、
+`update_in_progress`、`release_unverifiable`、`not_newer`。
+
+## 8. 前端必须遵守
 
 1. 浏览器不保存权威历史；刷新后从 `/v1/sessions/{id}/messages` 重建。
 2. 流式渲染是**增量展示**，不落本地存储；断线后重取消息接口。
 3. `test_mode = true` 时必须在界面显著位置显示“测试模式：回复由确定性 fake provider 生成”。
 4. 失败必须显示可执行提示（重试按钮 + 具体原因），不得静默吞掉。
 5. 移动端（375×667 起）与桌面（1440×900）都要能完成发送、停止、切换会话。
+6. 更新状态只能按服务端 `enabled/reason/executor/current_job` 展示；`message`
+   直接显示服务端文案，不自行拼接宿主路径或日志。通道关闭（`enabled=false`）
+   时不得显示可点的“更新”入口。
