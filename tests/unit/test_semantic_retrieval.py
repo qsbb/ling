@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from ling.domains.memory.service import RERANK_TOP_N, _cosine
+from ling.domains.memory.service import RERANK_TOP_N, _cosine, _rank_map
 from ling.ports.embedding import EmbeddingError
 
 
@@ -59,6 +61,18 @@ def test_cosine_basics() -> None:
     assert _cosine([1, 0], [0, 1]) == pytest.approx(0.0)
     assert _cosine([], [1, 0]) == 0.0
     assert _cosine([1, 0], [1, 0, 0]) == 0.0  # 维度不一致直接判 0
+
+
+def test_rank_map_aligns_ids_and_shares_ties() -> None:
+    rows = [
+        SimpleNamespace(id="later", score=0.0),
+        SimpleNamespace(id="first", score=1.0),
+        SimpleNamespace(id="same", score=0.0),
+    ]
+    ranks = _rank_map(rows, key=lambda row: -row.score)
+    assert ranks == {"first": 1, "later": 2, "same": 2}
+    # 同一批行的输入顺序不同，名次必须完全一致（行序不能泄漏进 RRF）。
+    assert _rank_map(list(reversed(rows)), key=lambda row: -row.score) == ranks
 
 
 def test_rerank_top_n_is_bounded() -> None:

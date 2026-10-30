@@ -287,3 +287,176 @@ async def test_embedding_model_switch_does_not_crash(logged_in: TestEnv) -> None
     async with session_scope() as session:
         rows = list((await session.execute(select(MemoryEmbeddingRow))).scalars())
     assert len({r.model_id for r in rows}) == 2, f"模型向量没有并存: {[r.model_id for r in rows]}"
+
+
+class _ReversedCandidateResult:
+    """Only the candidate-pool query is reversed; every other query is untouched."""
+
+    def __init__(self, result, rows) -> None:  # noqa: ANN001
+        self._result = result
+        self._rows = rows
+
+    def scalars(self):  # noqa: ANN201
+        return list(reversed(self._rows))
+
+    def __getattr__(self, name: str):  # noqa: ANN401
+        return getattr(self._result, name)
+
+
+def _selects_memory_rows(statement) -> bool:  # noqa: ANN001
+    try:
+        descriptions = statement.column_descriptions
+    except Exception:  # noqa: BLE001 - 非 Select 语句没有这个属性
+        return False
+    from ling.infra.models import MemoryRow
+
+    return any(description.get("entity") is MemoryRow for description in descriptions)
+
+
+class _ReverseCandidateRowsSession:
+    """Proxy session that returns the same MemoryRow result set in reverse order.
+
+    The real database is still queried and every other statement is delegated
+    unchanged.  ``captured_row_orders`` records what the service actually
+    received, so the test can prove it reversed the real row set rather than
+    feeding a hand-built list.
+    """
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._session = session
+        self.captured_row_orders: list[list[str]] = []
+
+    async def execute(self, statement, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        result = await self._session.execute(statement, *args, **kwargs)
+        if _selects_memory_rows(statement):
+            rows = list(result.scalars())
+            # Record the order the service actually receives (reversed).
+            self.captured_row_orders.append(
+                [row.id for row in reversed(rows)]
+            )
+            return _ReversedCandidateResult(result, rows)
+        return result
+
+    def __getattr__(self, name: str):  # noqa: ANN401
+        return getattr(self._session, name)
+
+
+async def test_recall_order_is_stable_when_sql_rows_are_reversed(
+    logged_in: TestEnv,
+) -> None:
+    """真实 ``recall`` 的最终顺序不能取决于候选池 SQL 返回的行序。
+
+    原实现里 RRF 各路的 ``_rank_map`` 对"零分/同分"也强制给出 1..n 的
+    连续名次，名次又按传入列表顺序分配。于是同一批记忆只要数据库返回行序
+    不同，BM25/新近度/重要性三路的同分项就会互换名次，RRF 总分随之变化——
+    语义最相关的记忆可能被挤到后面。这个用例不测 helper，而是：
+    1. 用真实库、真实 ``recall`` 跑一遍；
+    2. 用代理 session 只把候选池同一个 SQL 结果集反转，再跑一遍；
+    3. 断言两次的最终命中 ID/文本顺序完全一致，且语义命中排第一。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    from ling.contracts.v1 import MemoryProposal, Origin, Visibility
+    from ling.domains.memory.service import MemoryService
+    from ling.infra.db import session_scope
+    from ling.infra.models import MemoryRow
+
+    query = "我有什么忌口"
+    texts = [
+        "用户不吃香菜",
+        "用户养了一只橘猫",
+        "用户喜欢喝手冲咖啡",
+        "用户住在杭州西湖区",
+        "用户在做体检预约",
+        "用户喜欢看纪录片",
+    ]
+    semantic_text = texts[0]
+    fixed_created = datetime(2026, 1, 1, tzinfo=UTC)
+    fixed_now = datetime(2026, 6, 1, tzinfo=UTC)
+
+    async with session_scope() as session:
+        service = MemoryService(session)
+        ids: dict[str, str] = {}
+        for index, text in enumerate(texts):
+            memory_id = await service.propose(
+                MemoryProposal(
+                    proposal_id=f"row-order-{index}",
+                    kind="assertion",
+                    text=text,
+                    origin=Origin.user_statement,
+                    source_event_ids=["evt-row-order"],
+                    visibility=Visibility.subject_private,
+                    confidence=0.9,
+                ),
+                subject_id=logged_in.subject_id,
+                turn_id=f"rowOrderT{index}",
+                slot=f"likes_row_order_{index}",
+            )
+            assert memory_id is not None
+            ids[text] = memory_id
+        # Equal created_at/confidence/access_count => BM25, recency and
+        # importance all tie.  Make the semantic row newest so the SQL pool
+        # (updated_at DESC) puts it first; reversing the pool moves it last.
+        await session.execute(
+            update(MemoryRow)
+            .where(MemoryRow.id.in_(list(ids.values())))
+            .values(created_at=fixed_created, updated_at=fixed_created)
+        )
+        await session.execute(
+            update(MemoryRow)
+            .where(MemoryRow.id == ids[semantic_text])
+            .values(updated_at=fixed_created + timedelta(seconds=1))
+        )
+
+    # Only the query and the semantic row have a vector along [1, 0].  All
+    # other texts are orthogonal (the fake's default is [0, 1]).
+    table = {query: [1.0, 0.0], semantic_text: [1.0, 0.0]}
+
+    async with session_scope() as session:
+        normal = await MemoryService(
+            session, embedder=FakeEmbedder(table), reranker=None
+        ).recall(
+            subject_id=logged_in.subject_id,
+            query=query,
+            visibility_allow={Visibility.subject_private},
+            limit=10,
+            now=fixed_now,
+        )
+
+    async with session_scope() as session:
+        reversing = _ReverseCandidateRowsSession(session)
+        reversed_result = await MemoryService(
+            reversing, embedder=FakeEmbedder(table), reranker=None
+        ).recall(
+            subject_id=logged_in.subject_id,
+            query=query,
+            visibility_allow={Visibility.subject_private},
+            limit=10,
+            now=fixed_now,
+        )
+
+    assert reversing.captured_row_orders, "没有拦截到候选池查询"
+    received = reversing.captured_row_orders[0]
+    assert set(received) == set(ids.values()), "反转的不是同一批候选行"
+    assert received[-1] == ids[semantic_text], (
+        f"语义命中没有落在反转后的末尾: {received} semantic={ids[semantic_text]}"
+    )
+
+    normal_ids = [hit.memory_id for hit in normal.hits]
+    reversed_ids = [hit.memory_id for hit in reversed_result.hits]
+    assert normal_ids == reversed_ids, (
+        "候选池 SQL 行序改变了 recall 的最终顺序：\n"
+        f"  正序: {[hit.text for hit in normal.hits]}\n"
+        f"  反序: {[hit.text for hit in reversed_result.hits]}"
+    )
+    assert [hit.text for hit in normal.hits] == [
+        hit.text for hit in reversed_result.hits
+    ]
+    assert normal.hits[0].text == semantic_text, (
+        f"语义命中最相关的记忆没排第一: {[hit.text for hit in normal.hits]}"
+    )
+    assert reversed_result.hits[0].text == semantic_text, (
+        f"反转行序后语义命中不再排第一: {[hit.text for hit in reversed_result.hits]}"
+    )

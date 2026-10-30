@@ -199,9 +199,18 @@ RRF_K = 60
 
 
 def _rank_map(rows: list, *, key) -> dict:  # noqa: ANN001
-    """按 key 排序后给出 1-based 名次。"""
-    ordered = sorted(rows, key=key)
-    return {row.id: i + 1 for i, row in enumerate(ordered)}
+    """按 key 排序后给出 1-based 名次；同分项共享名次，ID 只作稳定排序。"""
+    ordered = sorted(rows, key=lambda row: (key(row), row.id))
+    ranks: dict = {}
+    previous_score = None
+    rank = 0
+    for index, row in enumerate(ordered):
+        score = key(row)
+        if index == 0 or score != previous_score:
+            rank = index + 1
+            previous_score = score
+        ranks[row.id] = rank
+    return ranks
 
 
 def _tokens(text: str) -> set[str]:
@@ -453,7 +462,7 @@ class MemoryService:
         # 记忆只有 3 条时看不出问题，涨到几千条就是每轮对话扫全表 + 全量 BM25。
         # 这里按最近更新取一个候选池——真正的排序仍在下面做，
         # 池子只是保证"每轮成本不随记忆总量增长"。
-        rows = list(
+        fetched_rows = list(
             (
                 await self._session.execute(
                     select(MemoryRow)
@@ -463,15 +472,14 @@ class MemoryService:
                         # 归档 = 保留期到期，不再参与检索（数据仍在，可审计）
                         MemoryRow.archived_at.is_(None),
                     )
-                    # **只加上界、先不动顺序**：加上 `order_by(updated_at desc)`
-                    # 会打乱向量路径的排序（它按行序对齐打分），实测
-                    # `test_vector_path_ranks_semantic_match` 立刻红。
-                    # 那个耦合本身是 bug，但属于另一件事——先保证成本有界。
-                    # 待办：向量路径改为按 id 对齐打分，然后这里换成按时间取池。
+                    # 先确定最近更新的有界候选池；池内语义排序不依赖此行序。
+                    .order_by(MemoryRow.updated_at.desc(), MemoryRow.id.asc())
                     .limit(RECALL_CANDIDATE_LIMIT)
                 )
             ).scalars()
         )
+        # 防御性按主键对齐和去重，确保向量输入/各路 rank 仅含唯一记录。
+        rows = list({row.id: row for row in fetched_rows}.values())
         allowed = {v.value for v in visibility_allow}
         # 第一步：**只做过滤**（权限、有效期、保留期、撤回），不参与打分
         candidates: list[MemoryRow] = []
@@ -538,7 +546,9 @@ class MemoryService:
                     # 命中的作为独立一路参与 RRF，让"沿关系找到"的记忆有额外支持。
                     entity_hits = [r for r in candidates if r.id in _related]
                     _entity_hit_ids = {r.id for r in entity_hits}
-                    rank_entity = {r.id: i + 1 for i, r in enumerate(entity_hits)}
+                    # 关联查询没有语义上的先后；同一实体命中的记录共享名次，
+                    # 避免数据库返回行序影响 RRF。
+                    rank_entity = _rank_map(entity_hits, key=lambda _row: 0)
         except Exception:  # noqa: BLE001 - 实体路故障不影响其他路
             rank_entity = {}
 
@@ -566,6 +576,7 @@ class MemoryService:
         # 这就是参照实现说的"双路检索"——字面命中不到但语义相关时，
         # 单靠 BM25 会整条漏掉（"我有什么忌口" vs "用户不吃香菜" 字面无交集）。
         rank_vector: dict[str, int] = {}
+        vector_scores: dict[str, float] = {}
         if self._embedder is not None:
             vector_scores = await self._vector_scores(query, ordered)
             if vector_scores:
@@ -601,7 +612,14 @@ class MemoryService:
             fused_scores[row.id] = sum(present) / len(present) if present else 0.0
         # MMR 近重复抑制：同一件事被记成多条时只留最相关那条，
         # 否则证据车道会被近似重复占满（参照实现用 MMR，这里用词集 Jaccard 近似）。
-        ordered.sort(key=lambda r: (-fused_scores[r.id], r.id))
+        # 融合分同分时优先语义分，再以 ID 保证确定性，避免候选池 SQL 行序泄漏。
+        ordered.sort(
+            key=lambda r: (
+                -fused_scores[r.id],
+                -vector_scores.get(r.id, 0.0) if self._embedder is not None else 0.0,
+                r.id,
+            )
+        )
         ordered = _mmr_filter(ordered, lambda r: _tokens(r.text), max_similarity=0.7)
 
         scored: list[MemoryHit] = []
@@ -649,6 +667,9 @@ class MemoryService:
             if self._embedder is not None
             else [ep for ep in episode_candidates if ep_bm25.get(ep.id, 0.0) > 0]
         )
+        # 情节查询没有 ORDER BY；先把池子按 id 定序，后面同分同置信度时
+        # 稳定排序不会把数据库行序泄漏到最终结果里。
+        ep_pool = sorted(ep_pool, key=lambda e: e.id)
         rank_ep_bm25 = _rank_map(ep_pool, key=lambda e: -ep_bm25.get(e.id, 0.0))
         rank_ep_recency = _rank_map(
             ep_pool,
@@ -699,6 +720,8 @@ class MemoryService:
         if self._reranker is not None and len(scored) > 1:
             scored = await self._rerank_hits(query, scored)
 
+        # 稳定排序：同分时保留上面已用向量分/ID 定好的顺序；
+        # 情节池已按 id 预排序，所以数据库行序不会泄漏到这里。
         scored.sort(key=lambda h: (-h.score, -h.confidence))
         # 相对相关性下限：只保留与第一名同量级的结果。
         # 不做这一步的话，"limit=6" 会把第 6 名的凑数记忆也塞进证据车道，
