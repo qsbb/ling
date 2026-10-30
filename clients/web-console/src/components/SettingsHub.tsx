@@ -153,6 +153,20 @@ export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
             </span>
           </span>
         </button>
+        <button
+          type="button"
+          className="settings-hub__card"
+          onClick={() => onOpen('/settings/about')}
+          data-testid="open-about"
+        >
+          <span className="settings-hub__index">i</span>
+          <span className="settings-hub__body">
+            <span className="settings-hub__label">关于与版本</span>
+            <span className="settings-hub__verb">
+              查看当前版本与构建提交；手动检查 GitHub 上有没有新 Release
+            </span>
+          </span>
+        </button>
       </div>
     </section>
   );

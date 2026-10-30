@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api';
 import { ChatPage } from './components/ChatPage';
+import { AboutPage } from './components/AboutPage';
 import { AccountPage } from './components/AccountPage';
 import { ChangePasswordView } from './components/ChangePasswordView';
 import { DashboardPage } from './components/DashboardPage';
@@ -233,6 +234,8 @@ export default function App() {
           />
         ) : route.name === 'identity' ? (
           <IdentityPage onBack={goSettings} />
+        ) : route.name === 'about' ? (
+          <AboutPage onBack={goSettings} />
         ) : (
           <PersonaPage onBack={goSettings} />
         )}

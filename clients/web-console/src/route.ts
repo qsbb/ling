@@ -2,7 +2,7 @@
  * 极简路由：聊天（/ 或 /s/{sessionId}）、生活（/life）、设置中心（/settings）、
  * 模型与生成（/settings/model）、记忆与学习（/settings/memory）、
  * 对话与主动性（/settings/dialogue）、生活与活动（/settings/life）、权限与隐私（/settings/privacy）、角色（/persona）、
- * 多用户与账号（/settings/identity）。
+ * 多用户与账号（/settings/identity）、关于与版本（/settings/about）。
  *
  * 设置下挂子路由而不是平铺，是因为分类法有 9 类；平铺会让路由和导航各维护一份。
  *
@@ -23,7 +23,8 @@ export type Route =
   | { name: 'privacy' }
   | { name: 'persona' }
   | { name: 'identity' }
-  | { name: 'account' };
+  | { name: 'account' }
+  | { name: 'about' };
 
 export function parseRoute(pathname: string): Route {
   const path = pathname.replace(/\/+$/, '') || '/';
@@ -35,6 +36,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings/dialogue') return { name: 'dialogue' };
   if (path === '/settings/life') return { name: 'life' };
   if (path === '/settings/privacy') return { name: 'privacy' };
+  if (path === '/settings/about') return { name: 'about' };
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
   if (path === '/settings/identity') return { name: 'identity' };
@@ -74,6 +76,8 @@ export function routePath(route: Route): string {
       return '/settings/identity';
     case 'account':
       return '/settings/account';
+    case 'about':
+      return '/settings/about';
     case 'chat':
       return route.sessionId ? `/s/${encodeURIComponent(route.sessionId)}` : '/';
   }

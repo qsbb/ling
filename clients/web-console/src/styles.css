@@ -2027,6 +2027,228 @@ button {
   font-size: 12px;
 }
 
+/* ---------------------------------------------------------------- 关于与版本 */
+
+.about-facts {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 10px 16px;
+  margin: 0;
+  align-items: baseline;
+}
+
+.about-facts dt {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.about-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.about-facts code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--paper-sunken);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+
+.about-facts__muted {
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+
+.about-release__link {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--accent);
+  font-size: 12.5px;
+}
+
+/* 安装更新：同一张 panel 内用分隔线分区，不嵌第二层卡片。 */
+
+.about-facts--tight {
+  gap: 6px 16px;
+}
+
+.update-job {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+
+.update-job__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.update-job__head strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.update-job__head code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.update-job__detail {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.update-job--failed .update-job__head strong {
+  color: var(--danger);
+}
+
+.update-job--manual .update-job__head strong,
+.update-job--verifying .update-job__head strong {
+  color: var(--warn);
+}
+
+.update-job--succeeded .update-job__head strong {
+  color: var(--ok);
+}
+
+.update-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--paper-sunken);
+  overflow: hidden;
+}
+
+.update-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.update-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  scroll-margin-block: 16px;
+}
+
+.update-confirm code,
+.update-job__head code {
+  overflow-wrap: anywhere;
+}
+
+.update-confirm .field__input {
+  width: 100%;
+}
+
+.update-confirm .panel__actions {
+  flex-wrap: wrap;
+}
+
+.update-confirm__lead {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.update-risk {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 2px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* 人工“重新提交”风险流程：和普通安装确认刻意区分，必须显式勾选风险。 */
+.update-resubmit {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  scroll-margin-block: 16px;
+}
+
+.update-resubmit .panel__note {
+  margin: 0;
+}
+
+.update-resubmit .field__input {
+  width: 100%;
+}
+
+.update-risk-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+  cursor: pointer;
+}
+
+.update-risk-ack input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.banner--info {
+  border-color: var(--line);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+}
+
+@media (max-width: 640px) {
+  .about-facts {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .about-facts dd {
+    margin-bottom: 8px;
+  }
+
+  /* 窄屏：确认区的风险说明和按钮不要挤成一行；按钮占满宽度更好点。 */
+  .update-job__head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .update-confirm .panel__actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .update-confirm .panel__actions .button {
+    width: 100%;
+  }
+
+  .update-risk {
+    padding-left: 16px;
+  }
+}
+
 /* ---------------------------------------------------------------- 授权列表 */
 
 .consent-list {

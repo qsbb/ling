@@ -33,6 +33,11 @@ import type {
   UnmergeResult,
   UserInfo,
   DashboardResponse,
+  VersionInfo,
+  ReleaseCheck,
+  UpdateJob,
+  UpdateStatus,
+  UpdateRequest,
 } from './types';
 
 export class ApiError extends Error {
@@ -108,6 +113,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try {
     response = await fetch(path, { credentials: 'same-origin', ...init });
   } catch (cause) {
+    // 主动取消（unmount/轮询换挡）不是网络故障，交给调用方识别并忽略。
+    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
     throw new ApiError(
       0,
       'network_error',
@@ -327,6 +334,33 @@ export const api = {
       `/v1/accounts/subjects/${encodeURIComponent(sourceId)}/unmerge`,
       jsonInit('POST', {}),
     );
+  },
+
+  /* ------------------------------------------------------------ 关于与版本 */
+  version(): Promise<VersionInfo> {
+    return request<VersionInfo>('/v1/version');
+  },
+  /** 手动触发的只读检查；不下载、不应用更新。 */
+  checkRelease(): Promise<ReleaseCheck> {
+    return request<ReleaseCheck>('/v1/version/check-release');
+  },
+  /** 只读的更新通道状态；不创建任务。 */
+  updateStatus(signal?: AbortSignal): Promise<UpdateStatus> {
+    return request<UpdateStatus>('/v1/version/update', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+  /**
+   * 创建一次更新请求。自定义头 X-Ling-Update 是后端的防误触标记；
+   * 浏览器会自动带上 Origin，服务端据此做同源校验。
+   */
+  requestUpdate(body: UpdateRequest): Promise<UpdateJob> {
+    return request<UpdateJob>('/v1/version/update-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ling-Update': '1' },
+      body: JSON.stringify(body),
+    });
   },
 
   /* ------------------------------------------------------------ 角色 */

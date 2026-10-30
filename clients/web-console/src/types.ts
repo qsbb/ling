@@ -459,3 +459,101 @@ export interface DashboardResponse {
     connectivity: DashboardSection;
   };
 }
+
+/* ------------------------------------------------------------ 关于与版本 */
+
+export interface VersionInfo {
+  schema_version: string;
+  current: string;
+  /** 构建时由 LING_COMMIT 注入；源码运行时为 null。 */
+  commit: string | null;
+  /** 部署清单的 SHA-256；开发模式没有清单时为 null。 */
+  web_manifest_sha256: string | null;
+}
+
+export type ReleaseStatus = 'ok' | 'no_release' | 'unavailable';
+
+export interface ReleaseCheck {
+  schema_version: string;
+  status: ReleaseStatus;
+  current: string;
+  latest: string | null;
+  published_at: string | null;
+  html_url: string | null;
+  /** null 表示版本号无法按 semver 比较，不等于“已是最新”。 */
+  is_newer: boolean | null;
+  /**
+   * 更新通道新增字段。旧服务端不返回时按“不可安装”处理，
+   * 绝不用缺失字段拼出一个安装目标。
+   */
+  release_id?: number | null;
+  target_commit?: string | null;
+  update_eligible?: boolean;
+  update_reason?: string | null;
+}
+
+/* ------------------------------------------------------------ 更新通道 */
+
+export type UpdateReason =
+  | 'disabled'
+  | 'not_owner'
+  | 'executor_offline'
+  | 'channel_unavailable'
+  | 'installed_commit_unknown'
+  | 'version_drift'
+  | 'update_in_progress'
+  | 'release_unverifiable'
+  | 'not_newer';
+
+export type UpdateJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'needs_manual';
+
+export type UpdateStage =
+  | 'queued'
+  | 'preflight'
+  | 'backup'
+  | 'fetch'
+  | 'verify_source'
+  | 'build'
+  | 'deploy'
+  | 'verify'
+  | 'complete';
+
+export interface UpdateJob {
+  request_id: string;
+  state: UpdateJobState;
+  stage: UpdateStage;
+  target_tag: string;
+  target_commit: string;
+  created_at: string;
+  updated_at: string;
+  error_code: string | null;
+  message: string | null;
+}
+
+export interface UpdateExecutor {
+  online: boolean;
+  last_seen_at: string | null;
+}
+
+/** GET /v1/version/update 的只读状态；不发起任何更新。 */
+export interface UpdateStatus {
+  schema_version: string;
+  enabled: boolean;
+  reason: string | null;
+  executor: UpdateExecutor;
+  current_job: UpdateJob | null;
+}
+
+/** POST /v1/version/update-requests 的乐观并发校验字段。 */
+export interface UpdateExpected {
+  release_id: number;
+  tag: string;
+  commit: string;
+  current_version: string;
+  current_commit: string;
+}
+
+export interface UpdateRequest {
+  confirm_tag: string;
+  expected: UpdateExpected;
+}
