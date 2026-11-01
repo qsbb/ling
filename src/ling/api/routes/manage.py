@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, time
+from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
@@ -33,6 +34,9 @@ from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
 from ling.domains.world.service import WorldService
 
+if TYPE_CHECKING:  # 仅为类型标注：core 在端点内按需导入，避免装配期多一层依赖
+    from ling.domains.memory.core import CoreMemoryView
+
 router = APIRouter(tags=["manage"])
 
 
@@ -43,8 +47,27 @@ def _actor_id(settings: SettingsDep) -> str:
 # ------------------------------------------------------------------ 记忆
 
 
+# 列表可见集：默认只看现行记忆；墓碑必须显式 include。
+# 值本身进契约（docs/API-WEB-V1.md §10），不要在客户端猜。
+# 用有序元组：取值顺序就是 /openapi.json 里 `enum` 的顺序，生成客户端
+# 不会看到集合的随机排列。
+MEMORY_INCLUDE_MODES = ("retracted", "archived", "all")
+MEMORY_KINDS = ("episode", "assertion", "procedure")
+# pattern 从 MEMORY_KINDS 派生：端点接受的取值与 /openapi.json 写出的取值
+# 只有一处来源，不会漂移。
+MEMORY_KIND_PATTERN = f"^({'|'.join(MEMORY_KINDS)})$"
+MEMORY_LIMIT_MIN = 1
+MEMORY_LIMIT_MAX = 200
+MEMORY_LIMIT_DEFAULT = 50
+
+
 class MemoryCreate(BaseModel):
-    kind: str = Field(pattern="^(episode|assertion|procedure)$")
+    # 约束一律留在 pydantic 里，**不要**为了错误形状把它挪进端点：
+    # 挪走会让 /openapi.json 丢掉 required/pattern，生成客户端据此拼出
+    # 必被服务端拒绝的请求（task-105 的 Medium 回归）。
+    # 记忆端点上的 RequestValidationError 由 create_app 注册的、按路径前缀
+    # 生效的处理器统一成 ErrorResponse（docs/API-WEB-V1.md §10）。
+    kind: str = Field(pattern=MEMORY_KIND_PATTERN)
     text: str = Field(min_length=1, max_length=4000)
     origin: str = "user_statement"
     visibility: str = "subject_private"
@@ -53,6 +76,8 @@ class MemoryCreate(BaseModel):
 
 
 class MemoryRetract(BaseModel):
+    # 必填 + 1..500：机器契约与运行时是同一条约束。整个 body 缺失时
+    # pydantic 报的也是 RequestValidationError，走同一个前缀处理器。
     reason: str = Field(min_length=1, max_length=500)
 
 
@@ -62,8 +87,48 @@ class MemorySupersede(BaseModel):
 
 
 @router.get("/memory")
-async def list_memory(auth: CurrentAuth, session: DbSession, limit: int = 50) -> dict:
-    rows = await MemoryService(session).list_memories(auth.user.subject_id, limit=limit)
+async def list_memory(
+    auth: CurrentAuth,
+    session: DbSession,
+    # `limit` 的范围只在端点判定，OpenAPI 刻意**不**写 minimum/maximum
+    # （见 docs/API-WEB-V1.md §10）：加进 schema 会改变契约口径。
+    limit: Annotated[
+        int,
+        Query(description="单次最多返回条数，范围 1..200；超出范围返回 422。"),
+    ] = MEMORY_LIMIT_DEFAULT,
+    # `include` 的三值写进 OpenAPI 的 `enum`（`json_schema_extra` 只影响生成的
+    # 文档，不参与运行时校验）；非法值仍由下面的端点级 LingError 统一成 422，
+    # 因此它的 `detail` 是 null 而不是 pydantic 原文。
+    include: Annotated[
+        str | None,
+        Query(
+            description="在默认可见集上追加哪类墓碑：retracted、archived 或 all；其它值返回 422。",
+            json_schema_extra={"enum": list(MEMORY_INCLUDE_MODES)},
+        ),
+    ] = None,
+) -> dict:
+    """列出当前自然人**现行**的长期记忆。
+
+    默认不返回已撤回（``retracted=true``）或已归档（``archived_at`` 非空）
+    的行——它们是墓碑，仍留在库里供证据链追溯，但不该混进"还记得什么"。
+    要取回墓碑用 ``?include=retracted|archived|all``。数据没有删除。
+    """
+    if not MEMORY_LIMIT_MIN <= limit <= MEMORY_LIMIT_MAX:
+        raise LingError(
+            ErrorCode.invalid_request,
+            f"limit 必须在 {MEMORY_LIMIT_MIN}..{MEMORY_LIMIT_MAX} 之间",
+            status_code=422,
+        )
+    if include is not None and include not in MEMORY_INCLUDE_MODES:
+        raise LingError(
+            ErrorCode.invalid_request,
+            "include 只能是 retracted、archived 或 all",
+            status_code=422,
+        )
+    effective = include or "active"
+    service = MemoryService(session)
+    rows = await service.list_memories(auth.user.subject_id, limit=limit, include=effective)
+    total = await service.count_memories(auth.user.subject_id, include=effective)
     return {
         "memories": [
             {
@@ -79,29 +144,55 @@ async def list_memory(auth: CurrentAuth, session: DbSession, limit: int = 50) ->
                 "superseded_by": r.superseded_by,
                 "source_event_ids": r.source_event_ids or [],
                 "valid_until": r.valid_until.isoformat() if r.valid_until else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "archived_at": r.archived_at.isoformat() if r.archived_at else None,
             }
             for r in rows
         ],
-        "note": "已实现未测试：W2 记忆域，未运行专项测试",
+        # 无分页（没有 offset/cursor）；limit 只截断，total/has_more 说明还有没有。
+        "limit": limit,
+        "total": total,
+        "has_more": total > len(rows),
+        "include": include,
+        "note": "默认只含未撤回且未归档的记忆；墓碑用 ?include=retracted|archived|all 取回",
     }
 
 
 @router.post("/memory")
-async def create_memory(body: MemoryCreate, auth: CurrentAuth, session: DbSession) -> dict:
+async def create_memory(
+    body: MemoryCreate, auth: CurrentAuth, session: DbSession, config: ConfigDep
+) -> dict:
     if not body.source_event_ids:
         raise LingError(
             ErrorCode.invalid_request, "记忆必须有 source_event_ids（经历有来源）", status_code=422
         )
+    # Origin/Visibility 是契约枚举。此前直接 Origin(body.origin)，
+    # 非法字符串的 ValueError 不在 LingError 体系里，真实服务返回 500。
+    # 参数问题必须是 422 + 统一错误形状，不能把用户输入变成"服务器错误"。
+    try:
+        origin = Origin(body.origin)
+        visibility = Visibility(body.visibility)
+    except ValueError as exc:
+        raise LingError(
+            ErrorCode.invalid_request,
+            "origin/visibility 不在契约枚举内",
+            status_code=422,
+            detail=str(exc),
+        ) from exc
     proposal = MemoryProposal(
         proposal_id="mp_manual",
         kind=body.kind,  # type: ignore[arg-type]
         text=body.text,
-        origin=Origin(body.origin),
+        origin=origin,
         source_event_ids=body.source_event_ids,
-        visibility=Visibility(body.visibility),
+        visibility=visibility,
         confidence=body.confidence,
     )
-    memory_id = await MemoryService(session).propose(proposal, subject_id=auth.user.subject_id)
+    # 手工写入也要按已发布策略盖保留期（写侧统一在 MemoryService.propose 里盖章）；
+    # 不传 policy 的话这条记忆会落回列默认 365，与设置里的 max_retention_days 无关。
+    memory_id = await MemoryService(session, policy=(await config.effective()).memory).propose(
+        proposal, subject_id=auth.user.subject_id
+    )
     if memory_id is None:
         raise LingError(
             ErrorCode.invalid_request,
@@ -127,10 +218,16 @@ async def _own_memory_or_404(session: object, memory_id: str, subject_id: str): 
 
 @router.post("/memory/{memory_id}/retract")
 async def retract_memory(
-    memory_id: str, body: MemoryRetract, auth: CurrentAuth, session: DbSession
+    memory_id: str,
+    body: MemoryRetract,
+    auth: CurrentAuth,
+    session: DbSession,
 ) -> dict:
+    # reason 的必填/长度由 MemoryRetract 的 pydantic 约束保证（含 body 整体
+    # 缺失），错误形状由 create_app 的前缀处理器统一；这里不再重复校验。
+    reason = body.reason
     await _own_memory_or_404(session, memory_id, auth.user.subject_id)
-    ok = await MemoryService(session).retract(memory_id, reason=body.reason)
+    ok = await MemoryService(session).retract(memory_id, reason=reason)
     if not ok:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
     # 撤回是"数据不再被使用"的动作，必须可追溯。只记 ID 与原因码，不记内容。
@@ -139,17 +236,24 @@ async def retract_memory(
         actor=auth.user.id,
         target_type="memory",
         target_id=memory_id,
-        reason_code=(body.reason or "")[:64],
+        reason_code=reason[:64],
     )
     return {"memory_id": memory_id, "retracted": True}
 
 
 @router.post("/memory/{memory_id}/supersede")
 async def supersede_memory(
-    memory_id: str, body: MemorySupersede, auth: CurrentAuth, session: DbSession
+    memory_id: str,
+    body: MemorySupersede,
+    auth: CurrentAuth,
+    session: DbSession,
+    config: ConfigDep,
 ) -> dict:
     await _own_memory_or_404(session, memory_id, auth.user.subject_id)
-    new_id_value = await MemoryService(session).supersede(memory_id, body.text, reason=body.reason)
+    # 纠正出来的新行沿用旧行的保留期，再被当前策略上限压一次（见 service.supersede）。
+    new_id_value = await MemoryService(session, policy=(await config.effective()).memory).supersede(
+        memory_id, body.text, reason=body.reason
+    )
     if new_id_value is None:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
     audit_event(
@@ -313,6 +417,8 @@ def _activity_dict(view) -> dict:
         "started_at": view.started_at.isoformat() if view.started_at else None,
         "ended_at": view.ended_at.isoformat() if view.ended_at else None,
         "completion_evidence": view.completion_evidence,
+        # 前端 ActivityRecord 必填 origin；漏掉会让生活页渲染出空徽标。
+        "origin": view.origin,
     }
 
 
@@ -362,9 +468,32 @@ async def create_goal(
 
 
 @router.get("/commitments")
-async def list_commitments(auth: CurrentAuth, session: DbSession, settings: SettingsDep) -> dict:
+async def list_commitments(
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    state: str | None = None,
+) -> dict:
+    """承诺列表。**默认只返回仍待履行的 ``active``**。
+
+    契约变更（2026-10）：此前不加状态过滤，``cancelled`` / ``undeliverable``
+    会和待履行的一起返回，界面上"已取消的事"看起来和"还欠着的事"一样。
+    记录**没有删除**，只是默认可见集收窄；查历史要显式传 ``state``：
+
+    - 不传 → ``active``（待履行）
+    - ``?state=cancelled`` / ``undeliverable`` / ``delivered`` / ``missed``
+      → 该状态的记录
+    - ``?state=all`` → 全部状态（含历史）
+    - 其它值 → 422 ``invalid_request``（不静默返回空列表）
+
+    响应新增 ``state_filter`` 回显实际生效的默认值，方便客户端区分
+    "没有待履行"和"我查的是历史"。
+    """
     service = GoalsService(session, actor_id=_actor_id(settings))
-    items = await service.list_commitments(auth.user.subject_id)
+    try:
+        items = await service.list_commitments(auth.user.subject_id, state=state)
+    except ValueError as exc:
+        raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
     return {
         "commitments": [
             {
@@ -378,6 +507,7 @@ async def list_commitments(auth: CurrentAuth, session: DbSession, settings: Sett
             }
             for c in items
         ],
+        "state_filter": state or "active",
         "note": "计划不是结果：只有真实回执才算已履行",
     }
 
@@ -821,7 +951,25 @@ class CoreMemoryBody(BaseModel):
     label: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1, max_length=2000)
     priority: int = Field(default=100, ge=1, le=999)
+    # 作用域是契约枚举，用 pattern 写进 /openapi.json；非法值由记忆端点上
+    # 的 RequestValidationError 前缀处理器转成统一 ErrorResponse。
     scope: str = Field(default="private", pattern="^(private|group|global)$")
+
+
+def _core_memory_dict(
+    view: CoreMemoryView, created_at: datetime | None, updated_at: datetime | None
+) -> dict:
+    """核心记忆的公开字段（列表与 PUT 共用，避免两处形状漂移）。"""
+    return {
+        "core_id": view.core_id,
+        "label": view.label,
+        "text": view.text,
+        "priority": view.priority,
+        "scope": view.scope,
+        "origin_kind": view.origin_kind,
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
 
 
 @router.get("/core-memory")
@@ -833,19 +981,36 @@ async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
     """
     from ling.domains.memory.core import MAX_PER_SUBJECT, CoreMemoryService
 
-    items = await CoreMemoryService(session).list_active(auth.user.subject_id)
+    # 响应回显 limit=20，查询就必须真的带上硬 LIMIT：正常写入受 20 条上限
+    # 保护，但历史/并发数据可能超限，不然会出现"回显 20 却返回 21 条"。
+    items = await CoreMemoryService(session).list_active(
+        auth.user.subject_id, limit=MAX_PER_SUBJECT
+    )
+    # 时间戳只在表里（CoreMemoryRow.created_at/updated_at），CoreMemoryView
+    # 不带它们；这里按 id 补查一次，避免改动 core.py 的视图契约。
+    timestamps: dict[str, tuple[datetime | None, datetime | None]] = {}
+    if items:
+        from sqlalchemy import select
+
+        from ling.infra.models import CoreMemoryRow
+
+        stamp_rows = (
+            await session.execute(
+                select(
+                    CoreMemoryRow.id,
+                    CoreMemoryRow.created_at,
+                    CoreMemoryRow.updated_at,
+                ).where(CoreMemoryRow.id.in_([v.core_id for v in items]))
+            )
+        ).all()
+        timestamps = {row.id: (row.created_at, row.updated_at) for row in stamp_rows}
+
+    payload = []
+    for v in items:
+        created_at, updated_at = timestamps.get(v.core_id, (None, None))
+        payload.append(_core_memory_dict(v, created_at, updated_at))
     return {
-        "items": [
-            {
-                "core_id": v.core_id,
-                "label": v.label,
-                "text": v.text,
-                "priority": v.priority,
-                "scope": v.scope,
-                "origin_kind": v.origin_kind,
-            }
-            for v in items
-        ],
+        "items": payload,
         "limit": MAX_PER_SUBJECT,
         "note": "核心记忆每轮注入，过多会挤占上下文；长尾事实用普通记忆即可",
     }
@@ -855,7 +1020,11 @@ async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
 async def upsert_core_memory(body: CoreMemoryBody, auth: CurrentAuth, session: DbSession) -> dict:
     """写入或更新核心记忆（同 label 覆盖，避免互相矛盾的重复条目）。"""
     from ling.domains.memory.core import CoreMemoryService
+    from ling.infra.models import CoreMemoryRow
 
+    # 响应直接带完整记录（含 priority/scope/时间戳）：页面写完不必再 GET
+    # 一次才能刷新优先级/作用域/时间戳。放在注释里而不是 docstring，是为了
+    # 不让 OpenAPI description 出现与本轮无关的变化。
     try:
         view = await CoreMemoryService(session).upsert(
             subject_id=auth.user.subject_id,
@@ -866,7 +1035,12 @@ async def upsert_core_memory(body: CoreMemoryBody, auth: CurrentAuth, session: D
         )
     except ValueError as exc:
         raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
-    return {"core_id": view.core_id, "label": view.label, "text": view.text}
+    # upsert 内部已 flush，时间戳在同一个 identity map 里可直接读；
+    # 与 GET 列表走同一个字段构造，避免两处形状漂移。
+    row = await session.get(CoreMemoryRow, view.core_id)
+    created_at = row.created_at if row is not None else None
+    updated_at = row.updated_at if row is not None else None
+    return _core_memory_dict(view, created_at, updated_at)
 
 
 @router.delete("/core-memory/{core_id}")

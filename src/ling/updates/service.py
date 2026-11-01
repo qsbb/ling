@@ -311,6 +311,13 @@ class UpdateChannel:
         current_commit: str | None,
         include_reason: bool = True,
     ) -> dict[str, Any]:
+        """``GET /v1/version/update`` 的响应体（只读、脱敏）。
+
+        ``current_job`` 直接来自 ``UpdateJob.to_dict()``，因此可选字段
+        ``backup_warnings``（备份不完整时的告警）也在这里透出：执行器把它写进
+        ``current.json``，缺失时是空数组。它只是**展示字段**，不参与门禁、也不改变
+        状态机语义；旧执行器不写它时 API 照常工作。
+        """
         state = self.executor_state()
         reason = (
             self.gate(role=role, current_version=current_version, current_commit=current_commit)

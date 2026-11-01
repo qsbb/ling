@@ -45,7 +45,7 @@ from fastapi import APIRouter
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.domains.activity.service import ActivityService
 from ling.domains.affect.service import AffectService
-from ling.domains.agenda.service import AgendaService
+from ling.domains.agenda.service import AgendaService, local_today
 from ling.domains.goals.service import GoalsService
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
@@ -102,6 +102,10 @@ async def get_dashboard(
 ) -> dict:
     actor_id = settings.actor_id
     subject_id = auth.user.subject_id
+    # "今天"按**用户配置的本地时区**算，而不是 UTC 或服务器时区：
+    # 响应顶层的 `timezone` 已经是这个值，日程的日界必须与它一致，
+    # 否则东八区 00:00-08:00 的"今天"会退回前一天。
+    user_timezone = settings.user_timezone or "UTC"
 
     async def activity() -> dict:
         current = await ActivityService(session, actor_id=actor_id).current()
@@ -240,9 +244,21 @@ async def get_dashboard(
 
         合成一个"今天要做什么"的列表会让人以为计划等于承诺：计划是她
         "打算"做的事（tentative 甚至可能变），承诺是她答应了对方的事。
+
+        **"今天"的边界**：按配置的用户本地时区（``user_timezone``）取当地
+        日历日 ``[00:00, 次日 00:00)``，只返回 ``start_at`` 落在当天的日程。
+        此前这里直接取 ``upcoming()`` 的前 5 条、不加任何时间窗，于是过期
+        日程会一直留在"今天的安排"里（TASK84 §4.3 实测 10-31 返回 10-30）。
+
+        承诺默认只给仍待履行的 ``active``；``cancelled`` / ``undeliverable``
+        等历史状态不再混进来（见 ``GoalsService.list_commitments``）。
+
+        响应里计划仍带 ``start_at``（ISO-8601、UTC 偏移）：前端用它显示
+        日期并做"不是今天"的第二道兜底，字段名与语义都保持不变。
         """
         service = AgendaService(session, actor_id=actor_id)
-        plans = await service.upcoming(limit=5)
+        today = local_today(user_timezone)
+        plans = await service.upcoming(limit=5, on_date=today, timezone=user_timezone)
         goals_service = GoalsService(session, actor_id=actor_id)
         commitments = await goals_service.list_commitments(subject_id)
         goals = await goals_service.list_goals(state="active")
@@ -389,6 +405,6 @@ async def get_dashboard(
     return {
         "schema_version": "v1",
         "generated_at": datetime.now(UTC).isoformat(),
-        "timezone": settings.user_timezone or "UTC",
+        "timezone": user_timezone,
         "sections": sections,
     }

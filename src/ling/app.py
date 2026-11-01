@@ -12,14 +12,17 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 from starlette.middleware.base import BaseHTTPMiddleware, Response
 
-from ling.api.errors import LingError, ling_error_handler
+from ling.api.errors import LingError, error_response, ling_error_handler
 from ling.config import Settings, get_settings
+from ling.contracts.v1 import ErrorCode
 from ling.domains.identity.service import IdentityService
 from ling.infra.coordination import SpeakLeaseStore, TurnControlStore
 from ling.infra.db import create_all_for_dev, dispose_engine, init_engine, session_scope
@@ -273,6 +276,61 @@ def _safe_db(url: str) -> str:
     return url
 
 
+# 参数校验错误统一成 ErrorResponse 的路径前缀。
+# 只覆盖记忆契约（docs/API-WEB-V1.md §10）承诺的端点；其它路径继续用
+# FastAPI 默认的 `{"detail":[...]}`。不注册成全局处理器是刻意的：那会把
+# "记忆端点的局部统一"扩大成计划外的全局行为变更，其它端点的既有客户端
+# （含本仓库前端）已经在按默认形状解析。
+VALIDATION_ERROR_PREFIXES = ("/v1/memory", "/v1/core-memory")
+
+
+def _validation_scope_matches(path: str) -> bool:
+    """``path`` 是否落在记忆端点下。
+
+    前缀必须**整段**匹配：``/v1/memory``、``/v1/memory/...``、
+    ``/v1/core-memory``、``/v1/core-memory/...`` 命中，``/v1/memoryfoo``
+    不算（目前没有这种路由，但匹配规则不该依赖"恰好没有"）。
+    """
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in VALIDATION_ERROR_PREFIXES
+    )
+
+
+async def memory_request_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> Response:
+    """记忆端点：把 pydantic/FastAPI 的参数校验错误翻译成契约的错误形状。
+
+    参数约束**留在 pydantic 里**（`/openapi.json` 因此写得出
+    required/pattern/minLength），这里只负责翻译响应形状；不在记忆前缀内的
+    路径原样委托 FastAPI 默认处理器，行为与改动前一致。
+    """
+    if not _validation_scope_matches(request.url.path):
+        return await request_validation_exception_handler(request, exc)
+
+    from ling.api.observability import TRACE_HEADER, trace_id_of
+
+    errors = exc.errors()
+    first = errors[0] if errors else {}
+    # loc 形如 ("body","kind") / ("query","limit") / ("body","items",0,"x")；
+    # 去掉下标，留最后一个字段名。整个 body 缺失时 loc 只有 ("body",)。
+    loc = [str(part) for part in first.get("loc", ()) if not isinstance(part, int)]
+    field = loc[-1] if loc and loc[-1] != "body" else "请求体"
+    detail = str(first.get("msg", "")).strip() or None
+    trace_id = trace_id_of(request)
+    response = error_response(
+        ErrorCode.invalid_request,
+        f"{field} 参数不合法",
+        status_code=422,
+        detail=detail,
+        trace_id=trace_id,
+    )
+    if trace_id:
+        response.headers[TRACE_HEADER] = trace_id
+    return response
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(
@@ -285,6 +343,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.add_exception_handler(LingError, ling_error_handler)  # type: ignore[arg-type]
+    # 记忆端点（`/v1/memory*`、`/v1/core-memory*`）的 422 统一成
+    # ErrorResponse；其它路径仍是 FastAPI 默认的 `{"detail":[...]}`。
+    app.add_exception_handler(
+        RequestValidationError, memory_request_validation_handler  # type: ignore[arg-type]
+    )
 
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions

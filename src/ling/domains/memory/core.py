@@ -101,17 +101,25 @@ class CoreMemoryService:
         await self._session.flush()
         return self._view(row)
 
-    async def list_active(self, subject_id: str) -> list[CoreMemoryView]:
-        rows = (
-            await self._session.execute(
-                select(CoreMemoryRow)
-                .where(
-                    CoreMemoryRow.subject_id == subject_id,
-                    CoreMemoryRow.active.is_(True),
-                )
-                .order_by(CoreMemoryRow.priority, CoreMemoryRow.label)
+    async def list_active(
+        self, subject_id: str, *, limit: int | None = None
+    ) -> list[CoreMemoryView]:
+        """列出 active 的核心记忆。
+
+        ``limit`` 供 API 端点传 ``MAX_PER_SUBJECT``，让响应回显的硬上限与
+        实际查询一致；不传时保持旧行为（内部容量检查/渲染需要看全量）。
+        """
+        stmt = (
+            select(CoreMemoryRow)
+            .where(
+                CoreMemoryRow.subject_id == subject_id,
+                CoreMemoryRow.active.is_(True),
             )
-        ).scalars()
+            .order_by(CoreMemoryRow.priority, CoreMemoryRow.label)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        rows = (await self._session.execute(stmt)).scalars()
         return [self._view(r) for r in rows]
 
     async def render(

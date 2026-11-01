@@ -364,8 +364,14 @@ class TurnCoordinator:
                 window = await conversation.get_window_for_turn(
                     window_id, subject_id=subject_id
                 )
+                # **记忆策略随本轮配置快照一起进来**：`config` 是这一轮开始时
+                # 取到的已发布配置，所以"发布后下一轮生效"是天然成立的——
+                # 进行中的轮次继续用旧快照，不会被热改半路换掉。
                 compiled = await ContextCompiler(
-                    session, actor_id=self._actor_id, persona_id=self._persona_id
+                    session,
+                    actor_id=self._actor_id,
+                    persona_id=self._persona_id,
+                    memory_policy=config.memory,
                 ).compile(
                     subject_id=subject_id,
                     window_id=window_id,

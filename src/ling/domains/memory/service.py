@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, Visibility
@@ -35,6 +35,10 @@ from ling.ports.config import MemoryPolicy
 logger = logging.getLogger("ling.domains.memory")
 
 MAX_RETENTION_DAYS = 3650
+
+# "没有重排模型 → rerank_top_n 不生效"这句话每个进程只喊一次
+# （MemoryService 每轮都会构造，不限次会被这句日志淹没）。
+_RERANK_INACTIVE_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -305,6 +309,10 @@ class MemoryService:
         self._session = session
         # 记忆策略来自已发布配置的 memory 段。不传时用默认值，
         # 因此未配置时行为与抽取常量之前完全一致。
+        #
+        # **调用方必须传**：生产里由 ContextCompiler（`kernel/context.py`）与
+        # worker 的 memory.extract / memory.archive 从已发布修订构造后传入。
+        # 不传只该发生在测试与一次性脚本里。
         self._policy = policy or MemoryPolicy()
         # 语义能力可选：未配置时检索退回 BM25+RRF（字面路径），功能不残缺。
         # 参照实现也是"语义路径默认关闭，明确配置后才启用"。
@@ -315,6 +323,55 @@ class MemoryService:
             reranker = reranker or build_reranker()
         self._embedder = embedder
         self._reranker = reranker
+        if reranker is None:
+            self._warn_rerank_inactive()
+
+    def _warn_rerank_inactive(self) -> None:
+        """没有重排模型时，``rerank_top_n`` 是**没有效果**的策略项。
+
+        不能假装它生效：本进程每个轮次都会构造 MemoryService，所以只在
+        每个进程里喊一次（模块级标志），否则日志会被这句话淹没。
+        """
+        global _RERANK_INACTIVE_WARNED
+        if _RERANK_INACTIVE_WARNED:
+            return
+        _RERANK_INACTIVE_WARNED = True
+        logger.info(
+            "未配置重排模型（LING_RERANK_API_KEY）：策略 rerank_top_n=%s 不生效，"
+            "检索按字面/向量两路融合排序",
+            self._policy.rerank_top_n,
+        )
+
+    @property
+    def policy(self) -> MemoryPolicy:
+        """本实例实际使用的策略（便于测试与排障断言"生产到底传了什么"）。"""
+        return self._policy
+
+    # ------------------------------------------------------ 保留期（写入/判定）
+
+    def write_retention_days(self) -> int:
+        """新写入的行该盖多少天保留期：**写的时候策略是多少就盖多少**。
+
+        这是 ``max_retention_days`` 与行级 ``retention_days`` 冲突的裁决
+        （见 ``docs/SETTINGS-TAXONOMY.md`` ④）：
+
+        - 行级 ``retention_days`` 是写入时的**快照 + 更短请求**，不是权威；
+        - 策略 ``max_retention_days`` 是**硬上限**，读写两侧都用
+          ``min(行值, 上限)`` 裁决；
+        - 因此：调小上限立即对所有行生效（隐私安全的方向）；调大上限只对
+          **之后写入**的记忆生效，已有行不被改写（旧行保留期是审计事实）。
+
+        旧实现里行默认 365、策略默认 3650，两个默认值互相打架：设置成 3650
+        永远不会生效，等于对用户说了假话。
+        """
+        return max(1, int(self._policy.max_retention_days))
+
+    def effective_retention_days(self, row: object) -> int:
+        """一条存量记录的**实际**保留天数 = min(行内值, 策略上限)。"""
+        raw = getattr(row, "retention_days", None)
+        # 行内没有值（旧行/外部导入）时，用策略值兜底——不能让"没写"变成 365。
+        row_days = int(raw) if raw is not None else self.write_retention_days()
+        return max(1, min(row_days, self.write_retention_days()))
 
     # ---------------------------------------------------------- 写入
 
@@ -383,6 +440,10 @@ class MemoryService:
             turn_id=turn_id,
             slot=slot,
             value=(value or None),
+            # 保留期**在写入时按当时的已发布策略盖章**。不盖的话，
+            # 列默认值 365 会把策略默认 3650 永远压住（设置里的 3650
+            # 曾经完全不生效），而调小上限又依赖读侧 min() 才能救命。
+            retention_days=self.write_retention_days(),
         )
         self._session.add(row)
         await self._session.flush()
@@ -489,6 +550,7 @@ class MemoryService:
                 continue
             # 保留期是**硬门**，不是排序因素（此前实现的缺口）：
             # 即使归档任务没跑或停摆，到期记忆也绝不能进模型输入。
+            # 判定口径是 min(行值, 当前策略上限)——调小上限立即生效。
             if self._retention_expired(row, now):
                 result.filtered_out += 1
                 continue
@@ -651,10 +713,15 @@ class MemoryService:
             ).scalars()
         )
         allowed = {v.value for v in visibility_allow}
+        # 情节的**召回**同样受 `max_retention_days` 硬门约束：
+        # 策略项的文案是"超过这个天数的记忆不会再被召回"，情节也是记忆。
+        # 只算召回不算归档：`archive_episodes` 的维护期是另一个旋钮
+        # （worker payload 的 episode_days，默认 180 天，先归档就不参与召回）。
         episode_candidates = [
             ep
             for ep in episode_rows
             if ep.visibility in allowed
+            and not self._episode_retention_expired(ep, now)
             and (source_filter is None or source_filter(ep))  # type: ignore[operator]
         ]
         result.filtered_out += len(episode_rows) - len(episode_candidates)
@@ -782,6 +849,10 @@ class MemoryService:
             consent_revision=int(old.consent_revision or 0) + 1,
             retracted=False,
             supersedes=old.id,
+            # 纠正不重置保留期：沿用旧行的有效期口径（再受当前策略上限压）。
+            # 不写这一行的话会落回列默认 365，纠正一次就把长期记忆的
+            # 保留期悄悄砍短——那是没人要求过的副作用。
+            retention_days=self.effective_retention_days(old),
         )
         self._session.add(new_row)
         await self.retract(old.id, reason=reason, superseded_by=new_id_value)
@@ -961,27 +1032,39 @@ class MemoryService:
         await self._session.flush()
         return {"groups": groups, "archived": archived}
 
-    @staticmethod
-    def _retention_expired(row: MemoryRow, now: datetime) -> bool:
-        """保留期是否已过（``created_at + retention_days <= now``）。
+    def _retention_expired(self, row: MemoryRow, now: datetime) -> bool:
+        """保留期是否已过（``created_at + min(行值, 策略上限) <= now``）。
 
         这是"内容保存上限"的判定。它与 ``valid_until`` 是两件事：
         - valid_until：这条事实**现在还算不算数**
         - retention_days：这条记录**最多存多久**
         两者任一到期都不该进入当轮模型输入。
+
+        取 min 而不是"行值优先"：策略是**用户手改的硬上限**，调小必须立刻
+        把旧行挡在门外；否则"我把保留期改成 30 天"只对新记忆生效，
+        就是又一次对用户说假话。行值仍然可以**更短**（显式的更严请求）。
         """
         created = row.created_at
         if created is None:
             return False
         if created.tzinfo is None:
             created = created.replace(tzinfo=UTC)
-        days = int(row.retention_days or 365)
+        days = self.effective_retention_days(row)
         return created + timedelta(days=days) <= now
+
+    def _episode_retention_expired(self, episode: MemoryEpisode, now: datetime) -> bool:
+        """情节的召回保留期（按 ``occurred_at`` 起算，上限取策略值）。"""
+        occurred = getattr(episode, "occurred_at", None)
+        if occurred is None:
+            return False
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=UTC)
+        return occurred + timedelta(days=self.write_retention_days()) <= now
 
     async def archive_expired(self, *, now: datetime | None = None, limit: int = 500) -> int:
         """把保留期已到的记忆与情节归档（不物理删除）。
 
-        判定：``created_at + retention_days < now``。
+        判定：``created_at + min(行值, 策略上限) < now``。
         ``valid_until`` 到期只是"不再作事实使用"（recall 已过滤），
         与"保留期到期"是两件事——前者仍可能被审计，后者进入归档。
 
@@ -1006,15 +1089,22 @@ class MemoryService:
             created = row.created_at
             if created.tzinfo is None:
                 created = created.replace(tzinfo=UTC)
-            days = int(row.retention_days or 365)
+            days = self.effective_retention_days(row)
             if created + timedelta(days=days) <= now:
                 row.archived_at = now
-                row.archive_reason = f"retention_days={days} 到期"
+                row.archive_reason = self._archive_reason(row, days)
                 archived += 1
                 if archived >= limit:
                     break
         await self._session.flush()
         return archived
+
+    def _archive_reason(self, row: MemoryRow, days: int) -> str:
+        """归档理由里写清"是行内的到期，还是被策略上限压下来的到期"。"""
+        row_days = getattr(row, "retention_days", None)
+        if row_days is not None and int(row_days) != days:
+            return f"retention_days={days} 到期（行内 {int(row_days)}，策略上限 {days}）"
+        return f"retention_days={days} 到期"
 
     async def archive_episodes(self, *, older_than_days: int = 180, now: datetime | None = None) -> int:
         """归档很久之前且**没有未撤回断言引用**的情节。
@@ -1373,20 +1463,65 @@ class MemoryService:
         await self._session.flush()
         return affected
 
-    async def list_memories(self, subject_id: str, *, limit: int = 50) -> list[MemoryRow]:
+    @staticmethod
+    def _list_conditions(subject_id: str, include: str) -> list:
+        """列表读取的默认可见集。
+
+        ``include`` 的语义是"在默认可见集上**追加**哪一类墓碑"，不是
+        "只查哪一类"：
+
+        - ``active``（API 默认）：未撤回且未归档
+        - ``retracted``：未撤回 + 已撤回（仍排除已归档）
+        - ``archived``：未归档 + 已归档（仍排除已撤回）
+        - ``all``：不过滤（内部兼容旧调用方；API 需显式 ``?include=all``）
+
+        同时撤回且归档的行只在 ``all`` 里出现。**这里只做可见性过滤，
+        不删数据、不改写任何行**；``valid_until`` 过期也照常返回。
+        """
+        if include not in {"active", "retracted", "archived", "all"}:
+            raise ValueError(f"未知 include: {include}")
+        conditions: list = [MemoryRow.subject_id == subject_id]
+        if include in {"active", "archived"}:
+            conditions.append(MemoryRow.retracted.is_(False))
+        if include in {"active", "retracted"}:
+            conditions.append(MemoryRow.archived_at.is_(None))
+        return conditions
+
+    async def list_memories(
+        self, subject_id: str, *, limit: int = 50, include: str = "all"
+    ) -> list[MemoryRow]:
+        # 默认保持旧的"全部行"行为，避免影响 dashboard 等既有调用方；
+        # HTTP 列表端点显式传 include="active"。
+        # 次级键 memory_id：同一 created_at 多行时，没有它顺序由物理行序决定，
+        # limit 截断会漏行/重复。memory_id 只是**稳定排序键，不表示新旧**
+        # （new_id 是随机 token_hex，id 的大小与创建时间无关）；它保证排序
+        # 确定且可复现。
         return list(
             (
                 await self._session.execute(
                     select(MemoryRow)
-                    .where(MemoryRow.subject_id == subject_id)
-                    .order_by(MemoryRow.created_at.desc())
+                    .where(*self._list_conditions(subject_id, include))
+                    .order_by(MemoryRow.created_at.desc(), MemoryRow.id.desc())
                     .limit(limit)
                 )
             ).scalars()
         )
 
-    async def default_retention(self, days: int = 365) -> datetime:
-        return datetime.now(UTC) + timedelta(days=min(days, self._policy.max_retention_days))
+    async def count_memories(self, subject_id: str, *, include: str = "all") -> int:
+        """与 ``list_memories`` 同一过滤口径的总数（供 total/has_more）。"""
+        total = await self._session.execute(
+            select(func.count())
+            .select_from(MemoryRow)
+            .where(*self._list_conditions(subject_id, include))
+        )
+        return int(total.scalar_one())
+
+    # 说明：这里原来有一个 `default_retention(days=365) -> datetime`。
+    # 它**没有任何生产调用者**，唯一的测试也只测它自己返回的天数——
+    # 于是"策略生效"被测成了绿灯，运行时却从不读策略（本任务修的就是这个）。
+    # 现在保留期统一走 `write_retention_days()`（写入盖章）与
+    # `effective_retention_days(row)`（读/归档裁决），不再保留一个
+    # 只给测试看的入口。
 
 
 def classify_usage(hit: object) -> str:

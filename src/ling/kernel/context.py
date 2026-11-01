@@ -21,6 +21,7 @@ from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.memory.service import MemoryService, RecallResult
 from ling.domains.persona.service import PersonaService, format_traits
+from ling.ports.config import MemoryPolicy
 from ling.ports.model import ChatMessageIn
 
 logger = logging.getLogger("ling.kernel.context")
@@ -142,6 +143,7 @@ class ContextCompiler:
         *,
         actor_id: str = "actor_ling",
         persona_id: str = "persona_ling",
+        memory_policy: MemoryPolicy | None = None,
     ) -> None:
         self._session = session
         self._actor_id = actor_id
@@ -150,7 +152,11 @@ class ContextCompiler:
         self._conversation = ConversationService(
             session, actor_id=actor_id, persona_id=persona_id
         )
-        self._memory = MemoryService(session)
+        # 记忆策略必须由调用方从**已发布配置**传进来（`EffectiveConfig.memory`）。
+        # 这里不自己读库：一轮只该有一份快照，中途发布的新策略属于下一轮。
+        # 不传时退回代码默认值——那正是"设置页能改、运行时从不读"的断链
+        # （`worker.py` / 本文件都只写 `MemoryService(session)`）。
+        self._memory = MemoryService(session, policy=memory_policy)
         self._consent = ConsentService(session)
 
     async def _trust_level(self, subject_id: str) -> str:

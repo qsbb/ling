@@ -28,7 +28,7 @@ import stat
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +61,48 @@ PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 JOB_STATES = ("queued", "running", "succeeded", "failed", "needs_manual")
 ACTIVE_JOB_STATES = ("queued", "running")
 TERMINAL_JOB_STATES = ("succeeded", "failed", "needs_manual")
+
+# 备份告警（``current.json`` 里的**可选**字段 ``backup_warnings``）。
+#
+# 为什么有：媒体归档不完整（``media_state=partial``）时执行器选择「判通过 +
+# 告警」，告警原先只落 ``verify-warnings.txt`` 与备份日志，Web 完全看不到。
+# 这里把它同时放进任务视图，让升级成功但备份不完整的任务在 API/UI 上显式可见。
+#
+# 兼容性：纯加法。字段可选、读取侧宽松（缺失/类型错/单条不合法都只丢告警，
+# 绝不让整个任务变成不可解析），``SCHEMA_VERSION`` 保持 ``v1``——已装机的
+# 执行器固定在 /srv 且不随 Release 更新，升版本会让它直接拒绝加载协议。
+MAX_BACKUP_WARNINGS = 8
+MAX_BACKUP_WARNING_LEN = 200
+# 告警是给 Web 显示的单行摘要：换行/控制字符一律丢弃（防注入多行文本）。
+_WARNING_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sanitize_backup_warnings(value: object) -> tuple[str, ...]:
+    """把任意值收敛成合法告警元组（非字符串/超长/含控制字符的条目**丢弃**）。
+
+    读取侧（``UpdateJob.from_dict``）与写入侧（执行器）共用这一个函数：
+
+    - 读取侧必须宽松：字段缺失 = 旧执行器 = 没有告警，不能报错；单条不合法也
+      只丢那一条——把整个任务判为不可解析会让一次成功的升级显示成协议错误。
+    - 写入侧由 ``UpdateJob.__post_init__`` 严格校验，执行器先用本函数过一遍就不会
+      造出非法 job（写状态失败会连带丢掉真正的升级结果）。
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        return ()
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or len(text) > MAX_BACKUP_WARNING_LEN:
+            continue
+        if _WARNING_CONTROL_RE.search(text):
+            continue
+        items.append(text)
+        if len(items) >= MAX_BACKUP_WARNINGS:
+            break
+    return tuple(items)
+
 
 # 心跳里的执行器状态。**必须显式**写进 heartbeat.json：缺失或未知一律按
 # ``protocol_unsupported`` fail closed，绝不能让“旧执行器 + 新协议”看起来在线。
@@ -494,7 +536,13 @@ def _checked_text(value: object, name: str, *, max_length: int = MAX_TEXT_FIELD)
 
 @dataclass(frozen=True)
 class UpdateJob:
-    """给 Web 看的任务视图：只有固定字段，没有路径/命令/日志。"""
+    """给 Web 看的任务视图：只有固定字段，没有路径/命令/日志。
+
+    ``backup_warnings`` 是**可选**的可加字段（协议仍是 ``v1``）：执行器把
+    ``verify-warnings.txt`` 里的那几条告警同时写进任务视图，让「升级成功但备份
+    不完整」在 API/UI 上可见。旧执行器不写时它是空元组；读取侧永远不会因为它
+    报错（见 :func:`sanitize_backup_warnings`）。
+    """
 
     request_id: str
     state: str
@@ -505,6 +553,7 @@ class UpdateJob:
     updated_at: str
     error_code: str | None = None
     message: str | None = None
+    backup_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not is_request_id(self.request_id):
@@ -523,6 +572,16 @@ class UpdateJob:
             raise ProtocolError("updated_at 非法")
         if self.error_code is not None and self.error_code not in ERROR_MESSAGES:
             raise ProtocolError("error_code 非法")
+        # 写入侧严格：条数/长度/字符都必须在界内（读取侧已由 sanitize 兜底）。
+        if not isinstance(self.backup_warnings, tuple):
+            raise ProtocolError("backup_warnings 必须是元组")
+        if len(self.backup_warnings) > MAX_BACKUP_WARNINGS:
+            raise ProtocolError("backup_warnings 条数过多")
+        for note in self.backup_warnings:
+            if not isinstance(note, str) or not note.strip():
+                raise ProtocolError("backup_warnings 条目非法")
+            if len(note) > MAX_BACKUP_WARNING_LEN or _WARNING_CONTROL_RE.search(note):
+                raise ProtocolError("backup_warnings 条目非法")
 
     @property
     def active(self) -> bool:
@@ -540,11 +599,18 @@ class UpdateJob:
             "updated_at": self.updated_at,
             "error_code": self.error_code,
             "message": job_message(self.state, self.stage, self.error_code),
+            # 纯加法：旧 API 读新 current.json 时忽略这个键；旧执行器不写时
+            # 新版 from_dict 得到空元组。两种组合都不影响状态机语义。
+            "backup_warnings": list(self.backup_warnings),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> UpdateJob | None:
-        """解析宿主写的状态；任何不合法字段都返回 None（调用方回到安全态）。"""
+        """解析宿主写的状态；不合法字段返回 None（调用方回到安全态）。
+
+        ``backup_warnings`` 例外：它是**可选**字段，缺失/类型不对/单条不合法
+        都只收敛成空元组或丢弃那一条，绝不把整个任务判为不可解析。
+        """
         if not isinstance(payload, dict):
             return None
         try:
@@ -557,12 +623,14 @@ class UpdateJob:
                 created_at=payload["created_at"],
                 updated_at=payload["updated_at"],
                 error_code=payload.get("error_code"),
+                backup_warnings=sanitize_backup_warnings(payload.get("backup_warnings")),
             )
         except (KeyError, ProtocolError):
             return None
 
     def with_progress(self, *, state: str | None = None, stage: str | None = None,
-                      error_code: str | None = None) -> UpdateJob:
+                      error_code: str | None = None,
+                      backup_warnings: Sequence[str] | None = None) -> UpdateJob:
         return UpdateJob(
             request_id=self.request_id,
             state=state or self.state,
@@ -572,6 +640,11 @@ class UpdateJob:
             created_at=self.created_at,
             updated_at=iso_now(),
             error_code=error_code,
+            backup_warnings=(
+                self.backup_warnings
+                if backup_warnings is None
+                else sanitize_backup_warnings(list(backup_warnings))
+            ),
         )
 
 
@@ -845,6 +918,8 @@ __all__ = [
     "Heartbeat",
     "JOB_STAGES",
     "JOB_STATES",
+    "MAX_BACKUP_WARNING_LEN",
+    "MAX_BACKUP_WARNINGS",
     "MAX_JSON_BYTES",
     "PENDING_FILE",
     "PENDING_REASON_FIELDS",
@@ -885,6 +960,7 @@ __all__ = [
     "read_pending_file",
     "release_is_newer",
     "remove_file",
+    "sanitize_backup_warnings",
     "seconds_since",
     "tag_version",
     "try_lock",

@@ -18,6 +18,10 @@ from ling.infra.models import CommitmentRow, GoalRow, utcnow
 from ling.infra.security import new_id
 
 COMMITMENT_STATES = {"active", "delivered", "missed", "cancelled", "undeliverable"}
+# 仍在等履约的状态。``delivered`` 已完成、``missed``/``cancelled``/
+# ``undeliverable`` 是已经结束的失败/撤回——它们都是事实，需要可查，
+# 但不属于"还欠着对方的事"，默认可见集不能把它们算进来。
+PENDING_COMMITMENT_STATES = ("active",)
 
 
 @dataclass(frozen=True)
@@ -207,10 +211,36 @@ class GoalsService:
             raise KeyError(f"承诺不存在: {commitment_id}")
         return self._commitment_view(row)
 
-    async def list_commitments(self, subject_id: str | None = None) -> list[CommitmentView]:
+    async def list_commitments(
+        self, subject_id: str | None = None, *, state: str | None = None
+    ) -> list[CommitmentView]:
+        """列出承诺。**默认只返回仍待履行的 ``active``**。
+
+        契约变更（2026-10）：此前这里不加任何 ``state`` 过滤，于是
+        ``cancelled`` / ``undeliverable`` 会和待履行的一起返回，
+        "已取消的事"在界面上长得和"还欠着的事"一模一样。现在默认可见集
+        只含 ``PENDING_COMMITMENT_STATES``；历史状态仍保留在库里，
+        需要时显式查询：
+
+        - ``state=None``（默认）→ ``active``
+        - ``state="cancelled"`` / ``"delivered"`` / ``"missed"`` /
+          ``"undeliverable"`` → 该状态的记录
+        - ``state="all"`` → 全部状态（含历史）
+
+        非法状态抛 ``ValueError``（API 层翻译成 422），不静默返回空列表——
+        拼错状态却看到空结果会被误读成"真没有"。
+        """
+        if state is not None and state != "all" and state not in COMMITMENT_STATES:
+            raise ValueError(
+                f"未知承诺状态: {state}（可选: {', '.join(sorted(COMMITMENT_STATES))}, all）"
+            )
         stmt = select(CommitmentRow).where(CommitmentRow.actor_id == self._actor_id)
         if subject_id:
             stmt = stmt.where(CommitmentRow.subject_id == subject_id)
+        if state is None:
+            stmt = stmt.where(CommitmentRow.state.in_(PENDING_COMMITMENT_STATES))
+        elif state != "all":
+            stmt = stmt.where(CommitmentRow.state == state)
         stmt = stmt.order_by(CommitmentRow.due_at)
         rows = list((await self._session.execute(stmt)).scalars())
         return [self._commitment_view(r) for r in rows]

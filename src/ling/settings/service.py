@@ -681,6 +681,31 @@ def _merge_memory(current: object, patch: dict) -> dict:
     return _merge_fields(current, patch, _MEMORY_BOUNDS)
 
 
+async def published_memory_policy(session: AsyncSession) -> MemoryPolicy:
+    """已发布修订里的 ``memory`` 段（没有已发布修订 → 代码默认值）。
+
+    给**没有 ``EffectiveConfig`` 可用**的进程内路径用：worker 的
+    ``memory.extract`` / ``memory.archive`` 每个 outbox 事件都是一次独立事务，
+    没有一个"轮次级快照"可以继承，所以它们在处理事件时**现读一次**最新
+    已发布修订——发布后下一个事件就生效，不需要重启、也没有进程内缓存
+    需要失效（每个进程各自查库，见 ``docs/SETTINGS-TAXONOMY.md`` ④）。
+
+    会话内核（``ContextCompiler``）**不用**这个函数：它从本轮
+    ``EffectiveConfig.memory`` 拿快照，保证一轮之内策略不漂移。
+    """
+    revision = (
+        await session.execute(
+            select(ConfigRevision)
+            .where(ConfigRevision.state == "published")
+            .order_by(ConfigRevision.revision.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if revision is None:
+        return MemoryPolicy()
+    return _memory_policy(dict(revision.payload or {}).get("memory"))
+
+
 # ------------------------------------------------------------------ 生活策略
 
 

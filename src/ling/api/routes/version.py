@@ -486,7 +486,13 @@ async def check_release(
 async def update_status(
     auth: CurrentAuth, settings: SettingsDep, response: Response
 ) -> dict[str, object]:
-    """更新通道视图：只读固定 JSON，不发起任何网络请求。"""
+    """更新通道视图：只读固定 JSON，不发起任何网络请求。
+
+    ``current_job.backup_warnings`` 是**可选**的加法字段（协议仍 ``v1``）：执行器
+    把「备份不完整」的告警同时写进 ``current.json``，这里原样透出，缺失即空数组。
+    它只影响展示，不参与门禁；owner 权限、请求体 4096 上限与 422 分支都不受影响
+    （那些只属于 ``POST /version/update-requests``，见下方）。
+    """
     response.headers["Cache-Control"] = "no-store"
     channel = UpdateChannel(settings)
     return channel.view(

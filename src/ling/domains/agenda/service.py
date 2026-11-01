@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -44,6 +44,43 @@ def _tz(name: str) -> ZoneInfo:
         # 时区非法时退回 UTC 而不是服务器本地时区——
         # 服务器本地时区会让"我的早上"变成机房所在时区的早上。
         return ZoneInfo("UTC")
+
+
+def resolve_timezone(name: str | None) -> ZoneInfo:
+    """把配置里的 IANA 时区解析成 ``ZoneInfo``；未配置或非法时退回 UTC。
+
+    只用**配置的**时区，不猜服务器本地时区：部署机器的时区与用户无关，
+    按它算"今天"会让同一份数据在不同机器上落到不同日期。
+    """
+    return _tz(name or "UTC")
+
+
+def local_today(
+    timezone: str | None, *, now: datetime | None = None
+) -> date:
+    """给定时区里的"今天"。
+
+    "今天"是人的本地日历概念，必须由用户在配置里声明的时区决定；
+    用 UTC 会让东八区 00:00-08:00 的"今天"退回前一天。
+    """
+    moment = now or utcnow()
+    return moment.astimezone(resolve_timezone(timezone)).date()
+
+
+def local_day_bounds(day: date, timezone: str | None) -> tuple[datetime, datetime]:
+    """本地日 ``[00:00, 次日 00:00)`` 对应的 UTC 半开区间。
+
+    用本地墙钟的 00:00 重新组合两端的边界，而不是 ``start + 24h``：
+    DST 当天只有 23 小时或 25 小时，加固定 24 小时会把边界挪到 01:00 / 23:00，
+    于是当天的最后/最初一小时会被算进错误的一天。
+
+    区间是**左闭右开**：当天 00:00:00 属于今天，次日 00:00:00 属于明天。
+    ``start_at`` 恰好落在边界上的计划只会出现一次。
+    """
+    tz = resolve_timezone(timezone)
+    start = datetime.combine(day, time.min, tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
+    return start.astimezone(UTC), end.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -208,9 +245,33 @@ class AgendaService:
             self._view(r) for r in await self._live_plans() if _aware(r.start_at) <= now
         ]
 
-    async def upcoming(self, *, limit: int | None = None) -> list[PlanView]:
+    async def upcoming(
+        self,
+        *,
+        limit: int | None = None,
+        on_date: date | None = None,
+        timezone: str | None = None,
+    ) -> list[PlanView]:
+        """还没结束的待办计划（``planned`` / ``active``）。
+
+        不带 ``on_date`` 时是"接下来最多 N 件"，供 worker / 自我视图这类
+        **不限日期**的内部调用使用——语义没变，仍然不加时间窗。
+
+        带 ``on_date`` 时只保留 ``start_at`` 落在该**本地日**里的计划，
+        用于"今天的安排"这类按日历切片的地方。本地日由 ``timezone`` 决定
+        （未传时退回角色作息时区）。区间左闭右开，见 ``local_day_bounds``。
+
+        **按 ``start_at`` 归日**：23:30 开始、次日 00:30 结束的计划属于开始那天；
+        昨天 23:30 开始、今天 00:30 结束的计划**不属于今天**（它昨天已经出现过）。
+        这样"今天"和前端按 ``start_at`` 判定的"不是今天"用同一套语义。
+        """
+        rows = await self._live_plans()
+        if on_date is not None:
+            tz_name = timezone or (await self.routine()).timezone
+            start, end = local_day_bounds(on_date, tz_name)
+            rows = [r for r in rows if start <= _aware(r.start_at) < end]
         cap = self._policy.max_live_plans if limit is None else limit
-        return [self._view(r) for r in (await self._live_plans())[:cap]]
+        return [self._view(r) for r in rows[:cap]]
 
     async def set_state(self, plan_id: str, state: str, *, reason: str = "") -> None:
         """推进计划状态。
@@ -301,4 +362,7 @@ __all__ = [
     "AgendaService",
     "PlanView",
     "RoutineView",
+    "local_day_bounds",
+    "local_today",
+    "resolve_timezone",
 ]

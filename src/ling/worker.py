@@ -353,7 +353,12 @@ async def handle_memory_extract(payload: dict) -> None:
         return
 
     async with session_scope() as session:
-        service = MemoryService(session)
+        # 策略**现读**已发布修订：每个 outbox 事件一次事务，没有轮次快照可继承。
+        # 不传的话写入的留期一律落回列默认 365，设置页的 max_retention_days
+        # 永远不生效（本任务修的就是这条断链）。
+        from ling.settings.service import published_memory_policy
+
+        service = MemoryService(session, policy=await published_memory_policy(session))
         source_ids = [f"turn:{turn_id}"]
         # 情节记忆：这一轮发生了什么（长期可检索，承接"上次那个事"）
         summary_parts = []
@@ -1463,10 +1468,13 @@ async def handle_memory_archive(payload: dict) -> None:
     物理删除会断链，且备份恢复可能让已删内容复活。
     """
     from ling.domains.memory.service import MemoryService
+    from ling.settings.service import published_memory_policy
 
     episode_days = int(payload.get("episode_days") or 180)
     async with session_scope() as session:
-        service = MemoryService(session)
+        # 归档判定要跟着已发布策略走：`max_retention_days` 是硬上限，
+        # 行内 retention_days 只能更短（裁决见 docs/SETTINGS-TAXONOMY.md ④）。
+        service = MemoryService(session, policy=await published_memory_policy(session))
         archived_rows = await service.archive_expired()
         archived_episodes = await service.archive_episodes(older_than_days=episode_days)
         # 压缩级联：同槽位的多条低价值记忆并成一条高层摘要。
