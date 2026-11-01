@@ -173,6 +173,18 @@ try:
 except OSError:
     sys.exit(0)
 sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${DOCKER_STDOUT_MODE_LOG}" || true
+          # 同一个文件再取一次，但换成**按路径**：`fstat(3)` 只在"stdout 本身
+          # 就是 `.part`"时才有意义（宿主 `> .part` 由外层 shell 打开，`exec`
+          # 进来后 fd 3 正是它）。一旦改成 `docker … | cat > .part`，fd 3 是管道，
+          # `fstat` 会静默报成 `0o600`（管道没有 0644 这回事）——**检测能力就丢了**。
+          # 路径 stat 不会：文件不存在就一行都不写，用例照样红成 `<未观察到>`。
+          # 所以这两条是各自独立的证据，两条都必须是 600 才算过。
+          '__PYTHON__' -c 'import glob, os, sys
+try:
+    st = os.stat(glob.glob(os.environ["MEDIA_PART_GLOB"])[0])
+except Exception:
+    sys.exit(0)
+sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${DOCKER_STDOUT_MODE_LOG}" || true
         fi
         # 测试注入点：在"媒体阶段失败"**之前**跑一条宿主命令。默认不启用；
         # 用来模拟"回填历史密钥时目录已经写不进去"（`chmod 500 keys/`）。
@@ -1399,6 +1411,15 @@ try:
 except OSError:
     sys.exit(0)
 sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${TAR_STDOUT_MODE_LOG:?}" || true
+  # 同 compose 的替身：再按**路径**取一次。`fstat(3)` 只在"stdout 就是 `.part`"
+  # 时才有意义；写成 `tar -cf - … | cat > .part` 时 fd 3 是管道，fstat 会静默
+  # 报 0600 而丢掉检测能力。路径 stat 不会——文件不在就什么都不写，用例变红。
+  "__PYTHON__" -c 'import glob, os, sys
+try:
+    st = os.stat(glob.glob(os.environ["MEDIA_PART_GLOB"])[0])
+except Exception:
+    sys.exit(0)
+sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${TAR_STDOUT_MODE_LOG:?}" || true
   /bin/cat "${DIRECT_MEDIA_PAYLOAD:?}"
 else
   /bin/cat "${DIRECT_MEDIA_PAYLOAD:?}" > "$TARGET"
@@ -1443,10 +1464,26 @@ def _run_backup_watch(
     patterns: tuple[str, ...],
     **extra: str,
 ) -> tuple[BackupRun, list[tuple[str, int]]]:
-    """跑一次 backup.sh，同时**紧循环** ``stat`` 命中的文件（记录每一眼的权限位）。
+    """跑一次 backup.sh，同时反复 ``stat`` 命中的文件（记录每一眼看到的权限位）。
 
-    这是替身之外的第二路独立观察：替身只报"创建瞬间"，轮询报"存续期间的每一眼"，
-    两者都能发现"中间态 0644"。
+    这是替身之外的第二路独立观察：替身报的是"创建瞬间"，这里报的是"存续期间的每一眼"。
+
+    **关于"漏采样"（独立 QA 的 flaky 报告）**：`chmod 600` 之后 `mv` 成正式名，
+    从 mv 到进程退出只有 ~25 ms（实测 21–30 ms），而一次循环的实际开销是 ~13 ms
+    （`glob` 两次 + 若干 `stat` + `sleep`，不是名义上的 2 ms），所以一个 25 ms 的
+    窗口里只落得进 **2–3 个采样点**。进程一旦被调度走（负载下的常态）让某一个
+    采样点晚个二十几毫秒，就会整段跳过窗口——正式名一次都没被看到，`observed` 里
+    就没有以 `media-` 开头的条目，断言 `final_modes == {0o600}` 拿到的正是空集
+    `set()`。**这是观察手段的采样问题，不是文件被写成了 0644**：替身记录的创建
+    瞬间仍然是 600，终态 `stat` 也仍然是 0600。
+
+    所以这里做两件事，都不靠"多转几圈碰运气"：
+    1. 采样点之间记录**实际间隔**，并把最长的那个间隔交回用例——它能区分
+       "没采到"与"不存在可采的坏状态"；
+    2. 进程退出后**再补一次**终态采样（这时文件已定稿，不可能再变）。
+    真正证明"mv 之后没有 0644 窗口"的是替身在 mv 之前打的那行按路径 stat
+    （见 `_DOCKER_FAKE` / `_TAR_MODE_SHIM` 里的 `MEDIA_PART_GLOB`），
+    这一路只是补充。
     """
     env = dict(base_env)
     env.update(extra)
@@ -1459,16 +1496,26 @@ def _run_backup_watch(
         text=True,
     )
     observed: list[tuple[str, int]] = []
+    longest_gap = 0.0
+    last_sample_at = time.monotonic()
+
+    def _sample() -> None:
+        for pattern in patterns:
+            for path in out.glob(pattern):
+                try:
+                    observed.append((path.name, path.stat().st_mode & 0o777))
+                except OSError:  # 刚好被 mv / 清理掉
+                    continue
+
     try:
         while proc.poll() is None:
-            for pattern in patterns:
-                for path in out.glob(pattern):
-                    try:
-                        observed.append((path.name, path.stat().st_mode & 0o777))
-                    except OSError:  # 刚好被 mv / 清理掉
-                        continue
+            now = time.monotonic()
+            longest_gap = max(longest_gap, now - last_sample_at)
+            last_sample_at = now
+            _sample()
             time.sleep(0.002)
         stdout, stderr = proc.communicate(timeout=120)
+        _sample()  # 终态补采：定稿之后不可能再变，这一次不会再"错过"
     finally:
         if proc.poll() is None:  # pragma: no cover - 只在卡死时触发
             proc.kill()
@@ -1486,6 +1533,7 @@ def _run_backup_watch(
             ),
         ),
         observed,
+        longest_gap,
     )
 
 
@@ -1494,6 +1542,29 @@ def _read_octal_log(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line}
+
+
+def _assert_sampled_0600(
+    observed: list[tuple[str, int]],
+    *,
+    prefix: str,
+    what: str,
+    longest_gap: float,
+    window_hint: str,
+) -> None:
+    """断言轮询到的、以 ``prefix`` 开头的每一眼都只能是 0600。
+
+    漏采样要能被**区分**出来，而不是伪装成"权限坏了"：窗口里一个采样点都没落下时
+    给出的是"这一路没采到"的诊断（连同实测最长采样间隔），而不是让
+    `final_modes == {0o600}` 直接撞上一个空集 ``set()``。
+    """
+    modes = {mode for name, mode in observed if name.startswith(prefix)}
+    assert modes, (
+        f"轮询这一路在{what}的存续窗口里一次都没落下采样点（实测最长采样间隔 "
+        f"{longest_gap * 1000:.1f} ms；{window_hint}）。这是**观察手段的漏采样**，"
+        "不是权限异常——证明权限的是替身记录的那一路，见用例①。"
+    )
+    assert modes == {0o600}, f"轮询到{what}的非 0600 中间态: {sorted(modes)}"
 
 
 def test_compose_media_part_is_created_0600_and_mv_keeps_it(
@@ -1509,19 +1580,23 @@ def test_compose_media_part_is_created_0600_and_mv_keeps_it(
     out = tmp_path / "backup-out"
     out.mkdir()
 
-    run, observed = _run_backup_watch(
+    run, observed, longest_gap = _run_backup_watch(
         out,
         env,
         umask_bits="022",
         patterns=(".media-*.tar.part", "media-*.tar"),
         DOCKER_STDOUT_MODE_LOG=str(mode_log),
+        # 宿主侧 `.part` 的**确切路径**：替身在 mv 之前按路径 stat 它（见 _DOCKER_FAKE）。
+        MEDIA_PART_GLOB=str(out / ".media-*.tar.part"),
         MEDIA_STALL_SECONDS="0.3",
     )
     assert run.proc.returncode == 0, run.outputs()
     manifest = run.manifest()
     media_name = manifest["media"]
 
-    # ① 创建瞬间（替身在 docker 启动那一刻 fstat 脚本的 stdout）：必须是 0600。
+    # ① 创建瞬间（替身在 docker 启动那一刻 stat 脚本的 stdout / 重定向目标）：
+    #    必须是 0600。**这一路是确定性的**——替身是写 `.part` 的那一方，它 stat
+    #    的时候文件一定已经存在，且此后只会被 chmod 收紧、不会再变宽。
     created = _read_octal_log(mode_log)
     assert created == {"600"}, (
         f"媒体 .part 创建时权限是 {sorted(created) or ['<未观察到>']}（应为 600）："
@@ -1529,11 +1604,22 @@ def test_compose_media_part_is_created_0600_and_mv_keeps_it(
     )
 
     # ② 轮询：`.part` 存续期间的每一眼、以及正式名的每一眼，都只能是 0600。
-    part_modes = {mode for name, mode in observed if name.startswith(".media-")}
-    final_modes = {mode for name, mode in observed if name.startswith("media-")}
-    assert part_modes, "整个运行期间一次都没观察到 .part，用例没测到东西"
-    assert part_modes == {0o600}, f"轮询到 .part 的非 0600 中间态: {part_modes}"
-    assert final_modes == {0o600}, f"轮询到正式名的非 0600 中间态: {final_modes}"
+    #    这一路是**补充**观察：mv→退出只有 ~25 ms，负载下可能整段错过，所以漏采样
+    #    单独诊断（见 _assert_sampled_0600），不把"没采到"报成"权限坏了"。
+    _assert_sampled_0600(
+        observed,
+        prefix=".media-",
+        what=".part",
+        longest_gap=longest_gap,
+        window_hint=".part 存续期较长，正常不会漏",
+    )
+    _assert_sampled_0600(
+        observed,
+        prefix="media-",
+        what="正式名",
+        longest_gap=longest_gap,
+        window_hint="mv 到进程退出之间只有约 25 ms",
+    )
 
     # ③ 终态：正式名 0600，且**成功路径不留 .part**。
     assert (out / media_name).stat().st_mode & 0o777 == 0o600
@@ -1567,13 +1653,15 @@ def test_direct_mode_media_part_is_created_0600(
     out = tmp_path / "backup-out"
     out.mkdir()
 
-    run, observed = _run_backup_watch(
+    run, observed, longest_gap = _run_backup_watch(
         out,
         env,
         umask_bits="022",
         patterns=(".media-*.tar.part", "media-*.tar"),
         PATH=f"{shim_dir}{os.pathsep}{env['PATH']}",
         TAR_STDOUT_MODE_LOG=str(mode_log),
+        # 同 compose：替身在 mv 之前按路径 stat `.part`（见 _TAR_MODE_SHIM）。
+        MEDIA_PART_GLOB=str(out / ".media-*.tar.part"),
         DIRECT_MEDIA_PAYLOAD=str(payload),
         TAR_STALL_SECONDS="0.3",
     )
@@ -1584,10 +1672,20 @@ def test_direct_mode_media_part_is_created_0600(
     assert created == {"600"}, (
         f"直接模式媒体 .part 创建时权限是 {sorted(created) or ['<未观察到>']}（应为 600）"
     )
-    part_modes = {mode for name, mode in observed if name.startswith(".media-")}
-    final_modes = {mode for name, mode in observed if name.startswith("media-")}
-    assert part_modes == {0o600}, f"轮询到 .part 的非 0600 中间态: {part_modes}"
-    assert final_modes == {0o600}, f"轮询到正式名的非 0600 中间态: {final_modes}"
+    _assert_sampled_0600(
+        observed,
+        prefix=".media-",
+        what=".part",
+        longest_gap=longest_gap,
+        window_hint=".part 存续期较长，正常不会漏",
+    )
+    _assert_sampled_0600(
+        observed,
+        prefix="media-",
+        what="正式名",
+        longest_gap=longest_gap,
+        window_hint="mv 到进程退出之间只有约 25 ms",
+    )
 
     media_name = run.manifest()["media"]
     assert media_name != "absent"
