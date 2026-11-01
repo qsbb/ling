@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
 # 数据库一致性备份（PostgreSQL + app-data 卷里的根密钥与媒体字节）。
-# 用法：deploy/backup/backup.sh OUT_DIR
+#
+# 用法：deploy/backup/backup.sh OUT_DIR [--prune-keep N] [--prune-days D]
+#                                     [--dry-run] [--force-unlock]
+#
+#   位置参数只有一个 OUT_DIR。其余全是**可选**开关，默认一个都不启用：
+#   - --prune-keep N   成功备份后只保留最近 N 份「dump+manifest+tombstones+media
+#                      齐全且 manifest 可解析」的组合，更早的删掉。**不给就永不删除**
+#                      （默认行为与历史版本完全一致）。
+#                      **口径：N 份含本次新备份**（跑完目录里最多留 N 份完整组合），
+#                      每日备份时历史回看 N−1 天；`--prune-keep 1` 会删光全部历史
+#                      **完整组合**（不合格的组永远不删，见下）。
+#                      零撤回时 tombstones-*.txt 是 **0 字节**，这是合法产物：
+#                      文件存在 + tombstones_state=ok 即算齐全；只有文件缺失或
+#                      state=FAILED 才跳过。
+#                      已知限制：不清理直接模式的 version-*.txt；media_state=partial
+#                      的组也算"四件齐全"，会占用保留名额（可能挤掉更早的干净备份）；
+#                      不合格组永远留在目录里，实际份数可能多于 N。
+#   - --prune-days D   额外的年龄下限：只删 manifest 修改时间早于 D 天的组
+#                      （必须与 --prune-keep 一起给）。按 `find -mtime +D` 的语义
+#                      按整 24h 向下取整：+D 实际匹配年龄 ≥ D+1 天（D=1 是"至少
+#                      两天前"），D 到 D+1 天之间这段不算。
+#   - --dry-run        只打印计划，不写盘、不建目录、不留锁、不删任何文件。
+#   - --force-unlock   强制清掉同目录上遗留/占用的备份锁（见下方退出码 6）。
+#                      **只对已死进程的残留锁用**：对活着的实例强开会让两个进程
+#                      同时写同一批产物，后启动的那份可能因媒体归档不完整 exit 5。
+#
+# 退出码（**这张表就是契约，任何改动必须同步**）：
+#   0  流程正常结束（**不保证产物齐全/可恢复**：可能带 tombstones_state=FAILED、
+#      media=absent、keys_root=absent、media_state=partial，必须看 manifest；
+#      轮转只是告警时也算 0）
+#   1  未分类的意外失败：`set -e` **透传底层命令的状态**（常见 1，例如直接模式
+#      pg_dump 失败；脚本没有显式 `exit 1`）。命令缺失是 127；psql 自身 exit 2
+#      会与"用法/配置错误"同码；其余状态不保证落在 0–7
+#   2  用法或配置错误（缺 OUT_DIR / 未知参数 / --prune-* 取值非法 /
+#      缺 LING_DATABASE_URL / compose 模式缺 docker）
+#   3  pg_dump 失败或导出为空（仅 compose 模式显式映射；直接模式下 pg_dump 的
+#      非零退出码由 `set -e` 原样透传，**不保证是 3**）
+#   4  容器内根密钥读取失败（无法确认密钥状态，本次备份作废）
+#   5  媒体归档**致命**失败（compose：tar rc>=2 或 tar -tf 读不出目录；
+#      直接模式：tar 非零）。compose 的 tar rc=1 是 media_state=partial，
+#      **不算 5**，仍 exit 0
+#   6  **备份锁被占用**（另一个实例正在同一 OUT_DIR 上运行；或残留锁接管失败）
+#   7  缺少 sha256 工具（sha256sum / shasum / openssl 都没有；在任何磁盘动作之前退出）
+#
+# 注：0–7 是脚本显式/常见的状态，**不是封闭集合**；`set -e` 会透传底层命令的
+# 状态（命令缺失 127、psql 自身 exit 2 等），不能假设只会出现这 8 个值。
 #
 # 约束（设计文档 §10）：数据库备份与媒体清单要在同一恢复点验证；
 # 恢复前先核对撤回墓碑，防止旧备份让已删除内容重新可见。
@@ -21,9 +66,112 @@
 # 写临时文件），大文件也不经过内存。任何一步失败都非零退出并清理半成品。
 set -euo pipefail
 
-OUT_DIR="${1:?用法: $0 OUT_DIR}"
+USAGE="用法: $0 OUT_DIR [--prune-keep N] [--prune-days D] [--dry-run] [--force-unlock]"
+
+# 参数错误一律走这里：exit 2 且**在任何磁盘/容器动作之前**退出（fail closed）。
+usage_error() {
+  echo "[backup] $1" >&2
+  echo "${USAGE}" >&2
+  exit 2
+}
+
+# `--prune-keep` / `--prune-days` 的取值校验：只接受正整数。
+# 0 / 负数 / 非数字 / 缺参数 / 前导 0 之外的怪值 一律 fail closed（exit 2）——
+# "轮转"是唯一会删数据的动作，参数不合法时绝不能猜一个值继续跑。
+COUNT_OK=""
+validate_count() {
+  local value="$1" name="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      usage_error "${name} 需要一个正整数（拿到: ${value:-<空>}）"
+      ;;
+  esac
+  # 上限只是防呆（`--prune-keep 999999999999` 之类），不影响正常取值。
+  if [[ ${#value} -gt 6 ]]; then
+    usage_error "${name} 过大（拿到: ${value}）"
+  fi
+  # 去掉前导 0：`08` 之类在 bash 算术里会被当八进制（非法），统一按十进制处理。
+  while [[ ${#value} -gt 1 && "$value" == 0* ]]; do
+    value="${value#0}"
+  done
+  if [[ "$value" == "0" ]]; then
+    usage_error "${name} 必须 >= 1（拿到: $1）"
+  fi
+  COUNT_OK="$value"
+}
+
+OUT_DIR=""
+PRUNE_KEEP=""
+PRUNE_DAYS=""
+DRY_RUN=0
+FORCE_UNLOCK=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prune-keep)
+      [[ $# -ge 2 ]] || usage_error "--prune-keep 缺参数（需要正整数，例如 --prune-keep 14）"
+      validate_count "$2" "--prune-keep"
+      PRUNE_KEEP="${COUNT_OK}"
+      shift 2
+      ;;
+    --prune-keep=*)
+      validate_count "${1#--prune-keep=}" "--prune-keep"
+      PRUNE_KEEP="${COUNT_OK}"
+      shift
+      ;;
+    --prune-days)
+      [[ $# -ge 2 ]] || usage_error "--prune-days 缺参数（需要正整数天数，例如 --prune-days 30）"
+      validate_count "$2" "--prune-days"
+      PRUNE_DAYS="${COUNT_OK}"
+      shift 2
+      ;;
+    --prune-days=*)
+      validate_count "${1#--prune-days=}" "--prune-days"
+      PRUNE_DAYS="${COUNT_OK}"
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --force-unlock)
+      FORCE_UNLOCK=1
+      shift
+      ;;
+    -h|--help)
+      printf '%s\n' "${USAGE}"
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        [[ -z "$OUT_DIR" ]] || usage_error "多余的参数 $1（只接受一个 OUT_DIR）"
+        OUT_DIR="$1"
+        shift
+      done
+      ;;
+    -*)
+      usage_error "未知参数 $1"
+      ;;
+    *)
+      [[ -z "$OUT_DIR" ]] || usage_error "多余的参数 $1（只接受一个 OUT_DIR）"
+      OUT_DIR="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$OUT_DIR" ]]; then
+  usage_error "缺少 OUT_DIR"
+fi
+
+# `--prune-days` 单独给没有意义：没有 keep 上限时"永不删除"是硬性默认值，
+# 静默忽略这个开关比报错更危险（运维会以为自己已经限制住空间）。
+if [[ -n "$PRUNE_DAYS" && -z "$PRUNE_KEEP" ]]; then
+  usage_error "--prune-days 必须与 --prune-keep 一起用（默认永不删除，单独给会被静默忽略）"
+fi
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$OUT_DIR"
 
 # 半成品清理：成功路径会把临时文件 mv 成正式产物，这条 trap 兜底两件事：
 #   1) 删掉 .part / .err 临时文件；
@@ -48,11 +196,89 @@ BACKUP_OK=0
 KEYS_ARCHIVED=0
 KEYS_PREEXISTED=0
 KEYS_PREV=""
+
+# ---------------------------------------------------------------- 并发锁
+#
+# 同目录并发跑两份备份会互相覆盖同一批固定名字的产物（`keys/root.key`、`.part`、
+# 甚至同秒的 STAMP），是两个进程一起写盘的经典事故。这里用**可移植的 mkdir 锁**：
+# `mkdir` 是原子的，成功即持锁，失败即"别人在跑"。
+# 为什么不是 `flock(1)`：macOS 根本没有这个命令；脚本必须 bash 3.2 + 默认 macOS
+# 工具链可用（不依赖 flock / jq / gdate）。
+# 锁目录里写 PID 与启动时间，供"崩溃残留"时判断持有者是否还在（`kill -0`）。
+LOCK_DIR="${OUT_DIR}/.backup.lock"
+LOCK_ACQUIRED=0
+
+lock_pid() {
+  local pid=""
+  if [[ -f "${LOCK_DIR}/pid" ]]; then
+    pid="$(<"${LOCK_DIR}/pid")"
+  fi
+  case "$pid" in
+    ''|*[!0-9]*) printf '%s' "" ; return 0 ;;
+  esac
+  printf '%s' "$pid"
+}
+
+lock_started() {
+  local started=""
+  if [[ -f "${LOCK_DIR}/started_at" ]]; then
+    started="$(<"${LOCK_DIR}/started_at")"
+    started="${started//$'\n'/ }"
+  fi
+  printf '%s' "${started:-未知}"
+}
+
+lock_write_holder() {
+  printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+  printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "${LOCK_DIR}/started_at"
+}
+
+# 拿不到锁就 exit 6（**专用退出码**）：调用方（cron / 更新执行器）据此区分
+# "另一个实例正在跑"和"备份本身失败"——前者重跑即可，后者需要人看。
+acquire_lock() {
+  local pid
+  if [[ "${FORCE_UNLOCK}" == "1" && -d "${LOCK_DIR}" ]]; then
+    echo "[backup] --force-unlock：强制清理备份锁 ${LOCK_DIR}" \
+      "（原持有者 pid=$(lock_pid) 启动时间=$(lock_started)）" >&2
+    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+  fi
+  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+    lock_write_holder
+    LOCK_ACQUIRED=1
+    return 0
+  fi
+  pid="$(lock_pid)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "[backup] 同目录已有备份实例在运行：pid=${pid}，启动时间=$(lock_started)" >&2
+    echo "[backup] 备份锁：${LOCK_DIR}" >&2
+    echo "[backup] 确认那个进程已经死掉/是残留锁时，用 --force-unlock 重跑" >&2
+    exit 6
+  fi
+  # 残留锁（PID 不存在或没写进来）：告警后接管。`kill -0` 对"别人的进程"也会
+  # 因 EPERM 返回非零，那种情况会被当成残留而接管——所以 pid/启动时间都留在
+  # 锁目录里，接管时打印出来，出问题能对得上。
+  echo "[backup] 警告：发现残留备份锁 ${LOCK_DIR}" \
+    "（pid=${pid:-未知} 启动时间=$(lock_started) 已不存在），接管并继续" >&2
+  rm -rf "${LOCK_DIR}" 2>/dev/null || true
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    echo "[backup] 接管残留锁失败（${LOCK_DIR} 仍被占用），请人工检查后重跑" >&2
+    exit 6
+  fi
+  lock_write_holder
+  LOCK_ACQUIRED=1
+}
+
 # 清理里**每条命令都带 `|| true`**：EXIT trap 里任何一条失败（磁盘只读、文件被别人
 # 挪走……）都会被 `set -e` 当成"trap 自己失败"，把脚本原本精心区分的退出码
 # （3 pg_dump / 4 根密钥 / 5 媒体）改写成 1——更糟的是成功路径上会让一次**成功**
 # 的备份变成非零退出。清理只做"尽力而为"，绝不改写结论。
 cleanup_partial() {
+  # 没拿到锁 = 本次一步都没开始（拿锁在产出任何文件之前）。此时**什么都不能删**：
+  # 同一秒启动的两个实例 STAMP 完全相同，被拒的那个若照常清理，会把正在跑的那份
+  # 备份的 dump/媒体删掉——"并发保护"反而变成破坏力。
+  if [[ "${LOCK_ACQUIRED}" != "1" ]]; then
+    return 0
+  fi
   rm -f "${OUT_DIR}/.root.key.part.$$" "${OUT_DIR}/.media-${STAMP}.tar.part" \
     "${OUT_DIR}/.media-${STAMP}.err" 2>/dev/null || true
   if [[ "${BACKUP_OK}" == "1" ]]; then
@@ -84,7 +310,22 @@ cleanup_partial() {
   fi
   echo "[backup] 失败：已清理本次未完成的产物（${OUT_DIR} 里不会留下残缺备份）" >&2
 }
-trap cleanup_partial EXIT
+
+# EXIT trap 同时负责释放并发锁：**成功路径也绝不能留锁**否则下一次 cron 会
+# 永久被 exit 6 拒掉。释放放在半成品清理之后，且同样 `|| true`——
+# 清理失败可以忽略，但绝不能改写脚本原本的退出码。
+release_lock() {
+  if [[ "${LOCK_ACQUIRED}" == "1" ]]; then
+    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+    LOCK_ACQUIRED=0
+  fi
+}
+
+on_exit() {
+  cleanup_partial || true
+  release_lock || true
+}
+trap on_exit EXIT
 
 # 归档根密钥前先给**已有的** `keys/root.key` 留一份原字节副本（0600）。
 # 失败时 `cleanup_partial` 用它把历史备份的密钥放回原位，成功时由 trap 删掉。
@@ -120,7 +361,8 @@ elif command -v openssl >/dev/null 2>&1; then
   SHA256_TOOL=openssl
 else
   echo "[backup] 需要 sha256sum / shasum / openssl 之一来记录产物哈希；都没有就拒绝声称备份完整" >&2
-  exit 6
+  # 7（不是 6）：6 已经留给"并发锁被占用"，退出码表见文件头。
+  exit 7
 fi
 
 sha256_of() {
@@ -151,6 +393,321 @@ if [[ -n "${LING_ROOT_KEY:-}" ]]; then
 else
   KEYS_ENV_SET=false
 fi
+
+# ---------------------------------------------------------------- 保留/轮转策略
+#
+# 媒体是全量副本（`media-*.tar` 每天一份），不轮转就会线性撑满磁盘。但"自动删
+# 备份"也是唯一会毁数据的操作，所以这里的规则是**默认完全不动**：
+#   - 没有 `--prune-keep N` → 一行都不删（与历史行为逐字节一致）；
+#   - 显式开启后，只有"四件齐全 + manifest 可解析"的组合才可能被删；
+#   - 缺一件、缺 manifest、manifest 读不懂（旧版格式）、manifest 与文件对不上
+#     → 整组跳过并告警（**宁可留垃圾，也不删看不懂的东西**）；
+#   - `keys/root.key` **永不**在删除范围内：它没有日期戳，是"当前这把密钥"的
+#     唯一副本，也是所有历史 manifest 里 `keys_root_file=` 指向的那一份
+#     （见 cleanup_partial 上面的长注释）。
+#
+# 已知限制（如实保留，不美化）：
+#   - 删除白名单只含 dump/tombstones/media/manifest，直接模式的 `version-*.txt`
+#     **不会**被轮转清掉（组被删后它可能残留，也不会有孤儿告警）；
+#   - `media_state=partial` 的组同样算"四件齐全"，会占用保留名额，可能挤掉更早的
+#     干净备份（partial 仍可恢复，但恢复前要人工核对 media_ref）。
+PRUNE_STAMPS=()
+
+# 从 manifest 里取 `key=value` 的值；键不存在时返回 1（调用方据此判"不可解析"）。
+# 用纯 bash 读，不引入 sed/awk 的转义陷阱（路径里可能有空格/unicode）。
+manifest_field() {
+  local file="$1" want="$2" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "${want}="*) printf '%s' "${line#*=}"; return 0 ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+# 一组备份是否"四件齐全且 manifest 可解析"。不合格时把**原因**打到 stdout。
+group_problem() {
+  local stamp="$1" manifest dump tombs tombs_state media keys_root
+  manifest="${OUT_DIR}/manifest-${stamp}.txt"
+  if [[ ! -f "$manifest" ]]; then
+    printf '%s' "缺 manifest"
+    return 1
+  fi
+  if ! dump="$(manifest_field "$manifest" dump)" || [[ -z "$dump" ]]; then
+    printf '%s' "manifest 里没有可用的 dump= 字段"
+    return 1
+  fi
+  case "$dump" in
+    */*|.|..)
+      printf '%s' "manifest 的 dump= 不是纯文件名（${dump}）"
+      return 1
+      ;;
+  esac
+  if [[ ! -s "${OUT_DIR}/${dump}" ]]; then
+    printf '%s' "manifest 指向的 ${dump} 不存在或为空"
+    return 1
+  fi
+  if ! tombs_state="$(manifest_field "$manifest" tombstones_state)"; then
+    printf '%s' "manifest 缺 tombstones_state 字段"
+    return 1
+  fi
+  if [[ "$tombs_state" != "ok" ]]; then
+    printf '%s' "墓碑导出状态是 ${tombs_state}（这份备份本来就不可用于恢复）"
+    return 1
+  fi
+  if ! tombs="$(manifest_field "$manifest" tombstones)" || [[ -z "$tombs" ]]; then
+    printf '%s' "manifest 里没有可用的 tombstones= 字段"
+    return 1
+  fi
+  case "$tombs" in
+    */*|.|..)
+      printf '%s' "manifest 的 tombstones= 不是纯文件名（${tombs}）"
+      return 1
+      ;;
+  esac
+  # 墓碑清单**允许是 0 字节**：没有任何撤回记录是最常见的部署形态，此时 `psql`
+  # 查询成功但输出为空，manifest 里 `tombstones_state=ok`。旧实现用 `-s` 判，
+  # 把这种合法产物当成"缺墓碑"，零撤回部署上 `--prune-keep` 会完全空转。
+  # 这里把"文件存在 + 状态 ok"与"内容非空"分开：只有**文件缺失**才判不完整
+  # （状态不是 ok 已在上面的 tombstone_state 检查里跳过）。
+  # **不要**把这条放宽推广到 dump/media：0 字节的 dump 或 media 仍然是坏的，
+  # 它们下面的 `-s` 必须保留。
+  if [[ ! -f "${OUT_DIR}/${tombs}" ]]; then
+    printf '%s' "manifest 指向的 ${tombs} 不存在"
+    return 1
+  fi
+  if ! media="$(manifest_field "$manifest" media)"; then
+    printf '%s' "manifest 缺 media= 字段（旧版备份，无法确认媒体是否齐全）"
+    return 1
+  fi
+  if [[ -z "$media" ]]; then
+    printf '%s' "manifest 的 media= 是空值"
+    return 1
+  fi
+  if [[ "$media" != "absent" ]]; then
+    case "$media" in
+      */*|.|..)
+        printf '%s' "manifest 的 media= 不是纯文件名（${media}）"
+        return 1
+        ;;
+    esac
+    if [[ ! -s "${OUT_DIR}/${media}" ]]; then
+      printf '%s' "manifest 指向的 ${media} 不存在或为空"
+      return 1
+    fi
+  fi
+  # 额外的一条安全网：manifest 声称归档过密钥，但 keys/root.key 已经不在了，
+  # 说明这组备份恢复不出凭据——不删它（等人工判断，别把仅存的线索清掉）。
+  if keys_root="$(manifest_field "$manifest" keys_root)" && [[ "$keys_root" == "present" ]]; then
+    if [[ ! -f "${OUT_DIR}/keys/root.key" ]]; then
+      printf '%s' "manifest 说 keys_root=present，但 keys/root.key 不存在"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# 孤儿产物（没有对应 manifest 的 dump/墓碑/媒体）：**一律不动**，只告警。
+prune_warn_orphans() {
+  local path stamp
+  for path in "${OUT_DIR}"/ling-*.dump "${OUT_DIR}"/tombstones-*.txt \
+    "${OUT_DIR}"/media-*.tar; do
+    [[ -f "$path" ]] || continue
+    stamp="${path##*/}"
+    stamp="${stamp#ling-}"
+    stamp="${stamp#tombstones-}"
+    stamp="${stamp#media-}"
+    stamp="${stamp%.dump}"
+    stamp="${stamp%.txt}"
+    stamp="${stamp%.tar}"
+    if [[ ! -f "${OUT_DIR}/manifest-${stamp}.txt" ]]; then
+      echo "[backup] 轮转告警：孤儿产物 ${path##*/}（没有对应 manifest），不动它" >&2
+    fi
+  done
+}
+
+# 算出计划：把"完整组合"按 stamp 倒序排，keep 之外的（再叠加 --prune-days 的
+# 年龄下限）进 PRUNE_STAMPS。只算不删。
+prune_plan() {
+  local manifest stamp reason old_manifests
+  local rank=0
+  local keep="${PRUNE_KEEP}"
+  local -a complete=() sorted=() selected=()
+  PRUNE_STAMPS=()
+
+  for manifest in "${OUT_DIR}"/manifest-*.txt; do
+    [[ -f "$manifest" ]] || continue
+    stamp="${manifest##*/}"
+    stamp="${stamp#manifest-}"
+    stamp="${stamp%.txt}"
+    case "$stamp" in
+      ''|*[!0-9-]*)
+        echo "[backup] 轮转告警：${manifest##*/} 的文件名不是时间戳格式，不动它" >&2
+        continue
+        ;;
+    esac
+    if reason="$(group_problem "$stamp")"; then
+      complete[${#complete[@]}]="$stamp"
+    else
+      echo "[backup] 轮转告警：跳过组 ${stamp}（${reason}），不动它的任何文件" >&2
+    fi
+  done
+
+  if [[ ${#complete[@]} -eq 0 ]]; then
+    echo "[backup] 轮转：没有可识别的完整备份组合，未做任何删除" >&2
+    return 0
+  fi
+
+  # stamp 形如 YYYYMMDD-HHMMSS，字典序即时间序；倒序 = 最新在前。
+  sorted=($(printf '%s\n' "${complete[@]}" | sort -r))
+
+  if [[ ${#sorted[@]} -le $keep ]]; then
+    echo "[backup] 轮转：完整组合 ${#sorted[@]} 份 <= 保留 ${keep} 份，不删除任何东西"
+    return 0
+  fi
+
+  rank=0
+  for stamp in "${sorted[@]}"; do
+    rank=$((rank + 1))
+    if [[ $rank -le $keep ]]; then
+      continue
+    fi
+    selected[${#selected[@]}]="$stamp"
+  done
+
+  # 年龄下限：只删 manifest 的修改时间早于 D 天的组（`find -mtime +D` 可移植，
+  # 不依赖 `date -d` / `date -v` / `gdate`）。
+  if [[ -n "$PRUNE_DAYS" ]]; then
+    old_manifests="$(find "$OUT_DIR" -maxdepth 1 -type f -name 'manifest-*.txt' \
+      -mtime "+${PRUNE_DAYS}" 2>/dev/null || true)"
+    PRUNE_STAMPS=()
+    for stamp in "${selected[@]}"; do
+      case $'\n'"${old_manifests}"$'\n' in
+        *$'\n'"${OUT_DIR}/manifest-${stamp}.txt"$'\n'*)
+          PRUNE_STAMPS[${#PRUNE_STAMPS[@]}]="$stamp"
+          ;;
+      esac
+    done
+    if [[ ${#PRUNE_STAMPS[@]} -eq 0 ]]; then
+      echo "[backup] 轮转：超出保留份数的 ${#selected[@]} 组里没有早于 ${PRUNE_DAYS} 天的（按 manifest 时间），不删除"
+      return 0
+    fi
+  else
+    PRUNE_STAMPS=()
+    for stamp in "${selected[@]}"; do
+      PRUNE_STAMPS[${#PRUNE_STAMPS[@]}]="$stamp"
+    done
+  fi
+
+  # 输出按时间正序（旧 → 新），日志好读、用例可断言。
+  sorted=($(printf '%s\n' "${PRUNE_STAMPS[@]}" | sort))
+  PRUNE_STAMPS=()
+  for stamp in "${sorted[@]}"; do
+    PRUNE_STAMPS[${#PRUNE_STAMPS[@]}]="$stamp"
+  done
+
+  echo "[backup] 轮转：完整组合 ${#complete[@]} 份，保留最近 ${keep} 份，计划删除 ${#PRUNE_STAMPS[@]} 份：${PRUNE_STAMPS[*]}"
+  return 0
+}
+
+# 删一组：先删大的数据文件，**manifest 最后删**（这样中途被打断时这组立刻变成
+# "不完整"，下次轮转不会再碰它，也不会被 restore_drill 当成有效备份）。
+# 删不掉（目录只读等）时保留 manifest 并告警，绝不假装删掉了。
+prune_delete_group() {
+  local stamp="$1" manifest dump tombs media
+  manifest="${OUT_DIR}/manifest-${stamp}.txt"
+  if ! dump="$(manifest_field "$manifest" dump)" || [[ -z "$dump" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的 manifest 在删除过程中变得不可解析，跳过" >&2
+    return 1
+  fi
+  if ! tombs="$(manifest_field "$manifest" tombstones)" || [[ -z "$tombs" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的 manifest 缺 tombstones，跳过" >&2
+    return 1
+  fi
+  if ! media="$(manifest_field "$manifest" media)" || [[ -z "$media" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的 manifest 缺 media，跳过" >&2
+    return 1
+  fi
+  case "$dump" in */*|.|..) echo "[backup] 轮转告警：组 ${stamp} 的 dump 名不合法，跳过" >&2; return 1 ;; esac
+  case "$tombs" in */*|.|..) echo "[backup] 轮转告警：组 ${stamp} 的 tombstones 名不合法，跳过" >&2; return 1 ;; esac
+  case "$media" in
+    absent) ;;
+    */*|.|..) echo "[backup] 轮转告警：组 ${stamp} 的 media 名不合法，跳过" >&2; return 1 ;;
+  esac
+
+  rm -f -- "${OUT_DIR}/${dump}" "${OUT_DIR}/${tombs}" 2>/dev/null || true
+  if [[ "$media" != "absent" ]]; then
+    rm -f -- "${OUT_DIR}/${media}" 2>/dev/null || true
+  fi
+  if [[ -e "${OUT_DIR}/${dump}" || -e "${OUT_DIR}/${tombs}" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的数据文件删不掉（目录不可写？），保留 manifest 等人工处理" >&2
+    return 1
+  fi
+  if [[ "$media" != "absent" && -e "${OUT_DIR}/${media}" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的 ${media} 删不掉，保留 manifest 等人工处理" >&2
+    return 1
+  fi
+  rm -f -- "$manifest" 2>/dev/null || true
+  if [[ -e "$manifest" ]]; then
+    echo "[backup] 轮转告警：组 ${stamp} 的 manifest 删不掉（目录不可写？）" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 轮转入口：`--prune-keep` 没给就什么都不做（返回 0，绝不删）。
+# 这里的所有失败都只告警 —— 备份本身已经成功，轮转失败不该把它判成失败。
+run_prune() {
+  local stamp deleted=0
+  if [[ -z "$PRUNE_KEEP" ]]; then
+    return 0
+  fi
+  prune_warn_orphans
+  prune_plan
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[backup] dry-run：以上为轮转计划，未删除任何文件"
+    return 0
+  fi
+  if [[ ${#PRUNE_STAMPS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  for stamp in "${PRUNE_STAMPS[@]}"; do
+    if prune_delete_group "$stamp"; then
+      echo "[backup] 轮转：已删除组 ${stamp}（dump/tombstones/media/manifest；keys/root.key 不动）"
+      deleted=$((deleted + 1))
+    fi
+  done
+  echo "[backup] 轮转：本次删除 ${deleted} 组，保留 ${PRUNE_KEEP} 份"
+  return 0
+}
+
+# ---------------------------------------------------------------- 并发锁与目录
+#
+# 顺序很关键：**先建目录 → 立刻拿锁 → 再动容器/数据库**。拿不到锁就直接 exit 6，
+# 不产生任何半成品；拿锁后的一切（含 exit 6 以外的失败）都由 EXIT trap 释放锁。
+if [[ "$DRY_RUN" == "1" ]]; then
+  # dry-run 完全不碰盘：不建目录、不建锁、不跑 docker、不写 dump/manifest、
+  # 不删历史产物。目录不存在时按"首次运行"报告。
+  echo "[backup] dry-run：只打印计划，不备份、不轮转、不建目录、不留锁"
+  echo "[backup] dry-run：目标目录 ${OUT_DIR}"
+  if [[ ! -d "$OUT_DIR" ]]; then
+    echo "[backup] dry-run：目录还不存在（首次运行），没有历史产物可轮转"
+    exit 0
+  fi
+  if [[ -d "${LOCK_DIR}" ]]; then
+    echo "[backup] dry-run：警告：目录上已有备份锁（pid=$(lock_pid) 启动时间=$(lock_started)）；" \
+      "真正运行会以 exit 6 中止（除非 --force-unlock）" >&2
+  fi
+  if [[ -n "$PRUNE_KEEP" ]]; then
+    run_prune
+  else
+    echo "[backup] dry-run：轮转未启用（默认永不删除；要轮转请加 --prune-keep N）"
+  fi
+  exit 0
+fi
+
+mkdir -p "${OUT_DIR}"
+acquire_lock
 
 # 两种运行方式：
 #   1) 直接模式：本机/容器内能连到数据库，用 LING_DATABASE_URL
@@ -277,10 +834,21 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 同上：探测与归档合成一条容器内命令，退出码 3 = 目录不存在。
   # `tar -cf -` 在容器内读、stdout 流式落宿主文件：不把大目录读进内存，
   # 也不在只读根文件系统的容器里写任何东西。
+  #
+  # **创建即 0600**（和根密钥那两条同一条理由）：外层重定向 `> "$MEDIA_TMP"`
+  # 建文件走 `0666 & ~umask`，默认 umask 022 会先落 **0644**，而媒体是用户的
+  # 原图/原声——整个流式传输期间（大媒体可能要几分钟）它都对同机其他用户可读。
+  # 把重定向挪进 `umask 077` 的子 shell 内，文件一出生就是 0600。
+  # 退出码仍是**这条 docker 的**退出码：子 shell 的退出状态就是它最后一条命令的
+  # 状态（`$?` 直接取到 TAR_RC），`umask 077` 不会把它吃掉；下面的 `-eq 3` /
+  # `-ge 2` 判定与原来逐字一致。
   set +e
-  docker compose "${COMPOSE_ARGS[@]}" exec -T api \
-    sh -c 'if [ -d /data/media ]; then exec tar -cf - -C /data media; else exit 3; fi' \
-    > "$MEDIA_TMP" 2>"$MEDIA_ERR"
+  (
+    umask 077
+    docker compose "${COMPOSE_ARGS[@]}" exec -T api \
+      sh -c 'if [ -d /data/media ]; then exec tar -cf - -C /data media; else exit 3; fi' \
+      > "$MEDIA_TMP" 2>"$MEDIA_ERR"
+  )
   TAR_RC=$?
   set -e
   if [[ $TAR_RC -eq 3 ]]; then
@@ -314,8 +882,11 @@ if [ "$VIA_COMPOSE" = "1" ]; then
     fi
     rm -f "$MEDIA_ERR"
     MEDIA_NAME="media-$STAMP.tar"
+    # **先 chmod 再 mv**（与直接模式同一顺序）：反过来的话，`mv` 之后到
+    # `chmod 600` 之间有一个"正式文件名还是 0644"的窗口，恢复脚本/备份同步工具
+    # 完全可能正好在这个窗口里读到它。
+    chmod 600 "$MEDIA_TMP"
     mv -f "$MEDIA_TMP" "$OUT_DIR/$MEDIA_NAME"
-    chmod 600 "$OUT_DIR/$MEDIA_NAME"
     MEDIA_HASH="$(sha256_of "$OUT_DIR/$MEDIA_NAME")"
     echo "[backup] 已归档媒体字节到 $MEDIA_NAME"
   fi
@@ -343,6 +914,9 @@ if [ "$VIA_COMPOSE" = "1" ]; then
     echo "media_sha256=$MEDIA_HASH"
   } > "$OUT_DIR/manifest-$STAMP.txt"
   BACKUP_OK=1
+  # 轮转放在**成功之后**：BACKUP_OK 已经置 1，所以轮转里的任何意外都不会触发
+  # 失败清理（那会把刚做好的这份备份删掉）；run_prune 自身也从不返回非零。
+  run_prune || true
   echo "[backup] 完成：$DUMP_FILE"
   exit 0
 fi
@@ -389,13 +963,15 @@ if [[ -f "$KEY_FILE" ]]; then
   # 先落到临时文件再原子 mv：中途失败不会留下一个被截断的 keys/root.key
   # （半截密钥比没有密钥更坏——它看起来像"已经备好了"）。
   KEYS_TMP="$OUT_DIR/.root.key.part.$$"
-  # 与 compose 模式的重定向不同：`cp` 建目标文件用的是**源文件的 mode & ~umask**
-  # （默认 umask 022 下：源 0600 → 0600，源 0644 → 0644），不是 `0666 & ~umask`。
-  # 下面的 `( umask 077; cp … )` 子 shell 让目标文件**创建时就不带 group/other 位**
-  # （0644/0666 → 0600，带 owner-x 位的源 → 0700），随后 `chmod 600` 兜底。真实部署里
-  # `security.py` 会 `chmod 600`，所以这条窗口平时不出现；收紧是为了覆盖源本身
-  # 就偏宽的情况（`write_text` 与 `chmod` 之间被打断、被别的工具还原成 0644 等）。
-  ( umask 077; cp "$KEY_FILE" "$KEYS_TMP" )
+  # 用 `cat` 重定向而不是 `cp`：`cp` 建目标文件用的是**源文件的 mode & ~umask**，
+  # 所以目标权限取决于源：在这个 `umask 077` 子 shell 里 group/other 位一律被挡掉，
+  # 源 0644 会得到 **0600**（看着"对了"，其实是 umask 兜住的——换成 umask 022 就是
+  # 0644）；而源 0700 会**原样留下 owner-x，目标就是 0700**，窗口期可执行。也就是
+  # 说 `cp` 下**不依赖 umask 的**"精确 0600"只在源恰好是 0600 时成立，其余情况
+  # 只是碰巧更窄、或者仍然偏宽。重定向创建走 `0666 & ~umask`，在 umask 077 下
+  # **恒定 0600**，与源权限无关；随后的 `chmod 600` 只是兜底。真实部署里
+  # `security.py` 会 chmod 600，但这里不依赖它——窗口对任何源权限都关掉。
+  ( umask 077; cat -- "$KEY_FILE" > "$KEYS_TMP" )
   chmod 600 "$KEYS_TMP"
   # 同 compose 模式：覆盖前先给历史那份留原字节副本。
   stash_existing_keys
@@ -427,11 +1003,16 @@ MEDIA_DIR="$DATA_DIR/media"
 if [[ -d "$MEDIA_DIR" ]]; then
   MEDIA_NAME="media-$STAMP.tar"
   MEDIA_TMP="$OUT_DIR/.media-$STAMP.tar.part"
-  if ! tar -cf "$MEDIA_TMP" -C "$DATA_DIR" media; then
+  # 与 compose 模式同一个理由：外层重定向创建 `.part` 走 `0666 & ~umask`
+  # （默认 0644），媒体字节在整个 `tar` 期间都对同机其他用户可读。
+  # 把重定向挪进 `umask 077` 的子 shell 内 → 文件一出生就是 0600；
+  # `if ! ( … )` 判定的仍是 **tar 自己的**退出码（子 shell 最后一条命令）。
+  if ! ( umask 077; tar -cf - -C "$DATA_DIR" media > "$MEDIA_TMP" ); then
     echo "[backup] 媒体归档失败（${MEDIA_DIR}）" >&2
     rm -f "$MEDIA_TMP"
     exit 5
   fi
+  # 先 chmod 再 mv（既有顺序不变）：改名之后不存在"正式名还是 0644"的窗口。
   chmod 600 "$MEDIA_TMP"
   mv -f "$MEDIA_TMP" "$OUT_DIR/$MEDIA_NAME"
   MEDIA_STATE=present
@@ -473,4 +1054,5 @@ media_sha256=$MEDIA_HASH
 MANIFEST
 
 BACKUP_OK=1
+run_prune || true
 echo "[backup] 完成：$OUT_DIR/ling-$STAMP.dump"

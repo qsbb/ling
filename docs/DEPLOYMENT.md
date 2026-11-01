@@ -233,7 +233,7 @@ deploy/backup/backup.sh /path/to/backup
 # 产物（文件名由 backup.sh 的日期戳决定）：
 #   ling-YYYYmmdd-HHMMSS.dump       数据库 dump（pg_dump custom 格式）
 #   manifest-YYYYmmdd-HHMMSS.txt    清单：产物名 + 各产物 sha256 + keys_root/media 状态
-#   tombstones-YYYYmmdd-HHMMSS.txt  撤回墓碑 id（无撤回记录时为空）
+#   tombstones-YYYYmmdd-HHMMSS.txt  撤回墓碑 id（无撤回记录时为空；0 字节是合法产物，轮转也认它）
 #   keys/root.key                   根密钥（0600，**必须与 dump 分开保管**）
 #   media-YYYYmmdd-HHMMSS.tar       app-data:/data/media 的实体文件（图片/语音）
 #   （直接模式另有 version-YYYYmmdd-HHMMSS.txt：`SELECT version()` 的输出；
@@ -550,7 +550,9 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - 长时间（数周）无人值守运行的稳定性
 - 自助更新/升级执行器在**真实 Docker** 上的完整演练（备份、构建、切换、失败恢复）
 - 备份链路的**新增**检查在真机上跑通：`docker compose exec` 的退出码透传、
-  `tar -cf -` 的 stdout 字节干净性、大媒体卷耗时、并发上传时的 `media_state=partial`
+  `tar -cf -` 的 stdout 字节干净性、大媒体卷耗时、并发上传时的 `media_state=partial`、
+  以及媒体/密钥临时文件"创建即 0600"在**真实分钟级流式传输**下的全程观测
+  （本地测试用的是真实文件系统 + 严格 fake 的 docker/tar，不是真实容器）
 - 升级失败后的数据库回滚（执行器只保留备份并转人工，不自动回滚）
 
 > 判断某项是否真的能用，看它有没有对应的测试或本节的验证记录；
@@ -947,7 +949,8 @@ deploy/backup/backup.sh /mnt/backup/ling
 这里填那个名字。
 
 产物五件：`ling-YYYYmmdd-HHMMSS.dump`、`manifest-YYYYmmdd-HHMMSS.txt`、
-`tombstones-YYYYmmdd-HHMMSS.txt`（无撤回记录时为空）、`keys/root.key`
+`tombstones-YYYYmmdd-HHMMSS.txt`（**无撤回记录时是 0 字节，这是合法产物**）、
+`keys/root.key`
 （根密钥）、`media-YYYYmmdd-HHMMSS.tar`（`/data/media` 的实体文件）。
 后两者来自 `app-data` **命名卷**，宿主机上不能直接 `cp`，由 `backup.sh` 通过
 `docker compose exec -T api` 在容器内 `tar`/`cat` 流式取回；卷里没有对应内容时
@@ -959,9 +962,12 @@ manifest 会**显式**写 `keys_root=absent` / `media=absent`，不会静默跳�
 的 `_verify_backup_keys`，且只针对本次升级新建的那份备份目录），cron/历史备份
 目录里的 `keys/root.key` 需要**人工**按 manifest 核对（理由见下面几段）。
 备份**失败**（读取根密钥**出错**——区别于"文件不存在"，后者按 `absent` 记录且
-exit 0；媒体归档失败或不完整）时 `backup.sh` 非零退出，并删掉**本次**已产出的
+exit 0；媒体归档**致命**失败：compose 的 `tar` rc≥2 或 `tar -tf` 读不出目录、
+直接模式 `tar` 非零）时 `backup.sh` 非零退出，并删掉**本次**已产出的
 片段（dump / 墓碑 / 媒体 / `version-*.txt`）——不会留下一个"看起来像备份"的
 残目录。cron 里表现为 `backup.log` 有错误、当天没有新 manifest。
+**注意**：compose 的 `tar` rc=1 只是 `media_state=partial`，脚本仍 exit 0（见下面
+退出码表）；墓碑导出失败也仍 exit 0，只在 manifest 写 `tombstones_state=FAILED`。
 
 `keys/root.key` 是这条清理规则里**唯一特殊**的一件：它**没有日期戳**，而 cron
 每天写的是**同一个**备份目录，所以这个路径同时就是"前一天那份成功备份的密钥
@@ -990,19 +996,38 @@ dump 分开保管"），不要指望备份目录里留着多天的密钥副本�
 > 目录会**放过**，所以判断仍要人工按 manifest 的哈希核对。
 
 `keys/.root.key.prev.<pid>` 与临时文件 `.root.key.part.<pid>` 都是**创建即 0600**
-（`backup.sh` 在 `umask 077` 的子 shell 里做重定向/`cp`）：先按默认 umask 落一个
-0644 再 `chmod 600` 的写法会在两步之间留一个"同机其他用户可读根密钥字节"的窗口，
-cron 路径的备份目录本来就是 0755，所以这件事不是理论风险。**这个 "创建即 0600"
-只覆盖密钥类临时文件**——媒体临时文件 `.media-<STAMP>.tar.part` 在流式写入期间是
-**0644**（默认 umask 022 下；`backup.sh` 的 compose 媒体段由 `docker compose exec`
-的外层重定向创建，直接媒体段由本机 `tar` 自建），要到 `chmod 600` 才收紧：
-compose 模式先 `mv` 成正式名、之后才 `chmod 600`，中间还有极短一段也是 0644；
-直接模式则是先 `chmod 600` 再 `mv`，没有这段尾巴。这是**既有行为**（先前版本
-就是这样，尚未收紧）；它承载的是媒体字节（用户上传的图/语音），不是凭据，所以
-没有按根密钥那套处理——同机可读的风险仍按下面"把备份的父目录自己收紧"来兜。
+（`backup.sh` 在 `umask 077` 的子 shell 里**用重定向创建**：暂存副本与直接模式的
+密钥临时文件是 `cat … > 目标`，compose 模式是 `docker … > 目标`）。这里特意不用
+`cp`：`cp` 会把源文件的 mode 带到目标上（源带 owner-x 位时目标创建瞬间是 0700），
+重定向创建在 `umask 077` 下则恒定 0600，随后的 `chmod 600` 只是兜底。先按默认
+umask 落一个 0644 再 `chmod 600` 的写法会在两步之间留一个"同机其他用户可读根
+密钥字节"的窗口，cron 路径的备份目录本来就是 0755，所以这件事不是理论风险。
+媒体临时文件
+`.media-<STAMP>.tar.part` 走的是**同一条路径**：compose 模式把
+`docker compose exec -T api … sh -c 'tar -cf -'` 的 stdout 重定向放进
+`umask 077` 的子 shell 内，直接模式同样把 `tar -cf - … > "$MEDIA_TMP"` 放进子
+shell 内，所以 `.part` **创建瞬间就是 0600**（随后的 `chmod 600` 只是兜底）。
+两种模式都是**先 `chmod` 再 `mv`**，正式名 `media-<STAMP>.tar` 一出现就是 0600，
+不存在"正式名还是 0644"的中间态；compose 的 `.media-*.err` 也在同一个子 shell 里
+创建，同样是 0600。`umask 077` 只作用于媒体/密钥这两**类**路径（脚本里共 5 处
+子 shell）：同一份备份里的 `manifest-*` / `tombstones-*` / `dump` 仍按外层 umask
+写成 0644（测试断言 `manifest` / `tombstones` 是 0644；`dump` 同样是 0644，
+但测试没有单独断言它，属于实测/umask 行为，见下）。
 
-（墓碑导出失败是唯一**不**非零退出的情形：脚本仍 exit 0，但 manifest 里
-`tombstones_state=FAILED`，执行器与 `restore_drill.sh` 都会据此拒绝这份备份。）
+验证方式：`tests/test_deploy_backup_archive.py` 的
+`test_compose_media_part_is_created_0600_and_mv_keeps_it` 与
+`test_direct_mode_media_part_is_created_0600` 在 umask **022** 下同时做三路观测：
+① 严格替身在**自己启动那一刻** `fstat` 脚本的 stdout（即 `.part`），断言"创建
+瞬间 = `600`"；② 主线程约每 **2ms** 轮询一次（`time.sleep(0.002)`）`.part` 与
+正式名，断言观察到的 mode
+集合**只有** `0o600`（出现任何 0644 中间态即失败）；③ 断言终态正式名 0600、
+成功路径不留 `.part`，且 `manifest` / `tombstones` 仍是 0644（`umask 077` 没有
+泄漏到其它产物）。
+
+（墓碑导出失败仍 exit 0（脚本头部与退出码表已写明），但 manifest 里
+`tombstones_state=FAILED`，执行器与 `restore_drill.sh` 都会据此拒绝这份备份；
+`media_state=partial` 也是 exit 0 的"不完整"情形。所以 **exit 0 不等于产物
+齐全**，必须看 manifest。）
 
 > **项目名已经写进 crontab 行**：`deploy/backup/install-cron.sh`
 > 会把 `LING_COMPOSE_PROJECT` 连同 `LING_BACKUP_VIA_COMPOSE`、`LING_COMPOSE_FILE`、
@@ -1047,14 +1072,120 @@ compose 模式先 `mv` 成正式名、之后才 `chmod 600`，中间还有极短
 
 `media-YYYYmmdd-HHMMSS.tar` 是 `/data/media` 的**全量**副本。两点要有心理准备：
 
-- **空间按天线性累积**：每次备份（含每日 cron）都完整复制一份媒体，本项目
-  **不实现**保留/轮转策略，脚本也**不删**任何历史备份。先
-  `du -sh <部署目录>/data/media`（或 `docker compose exec -T api du -sh /data/media`）
-  估一份的大小，再定盘的容量和轮转办法（例如按日期戳清理旧目录）。
+- **空间按天线性累积，但脚本内置了可选轮转（默认关闭）**：每次备份（含每日 cron）
+  都完整复制一份媒体；不显式给参数时 `backup.sh` **一份都不删**（默认行为与历史
+  版本一致）。开启方式（位置参数仍只有 `OUT_DIR`，开关追加在后面）：
+
+  ```bash
+  # 先干跑：只打印计划，不建目录/不建锁/不跑 docker/不写不删
+  deploy/backup/backup.sh /mnt/backup/ling --prune-keep 14 --dry-run
+  # 确认计划后再真删
+  deploy/backup/backup.sh /mnt/backup/ling --prune-keep 14
+  # 更保守：份数上限 + 年龄下限（--prune-days 必须与 --prune-keep 一起给）
+  deploy/backup/backup.sh /mnt/backup/ling --prune-keep 14 --prune-days 30
+  ```
+
+  `--prune-keep N` 的口径是 **N 份含本次新备份**（本次跑完目录里最多留 N 份完整
+  组合），所以每日备份时**历史回看是 N−1 天**；`--prune-keep 1` 合法，但会
+  **删光全部历史完整组合**、只剩本次这一份（零撤回部署同样如此，只要历史里没有
+  "不合格组"）。**前提是本次备份自己也是完整组合**：如果本次不合格（例如墓碑导出
+  `FAILED`、脚本仍 exit 0），本次不参与保留计数，`--prune-keep 1` 保留的是**最新
+  一份历史完整组**，目录里会有 **2 份** manifest（前提是已有历史完整组；空目录
+  加本次不合格时轮转直接 no-op，目录里只有这 1 份）——即本节末那条"不合格组永远不
+  参与轮转、也不会被删，所以实际 manifest 份数可能多于 N"。实测（直接模式、
+  零撤回、连跑两次）：第一次后目录里 2 份，第二次加 `--prune-keep 1` 后只剩
+  **1 份**；`--prune-keep 2` 在 3 份历史 + 本次的目录里剩 **2 份**。`--prune-days D`
+  是额外的年龄下限：只删 manifest 的 mtime 早于 D 天的组（`find -mtime +D` 按整
+  24h 向下取整，`+30` 实际要等满 **31** 天才命中，30–31 天这段不算；按文件时间
+  取整，不是按组名里的日期），单独给会 exit 2（没有 keep 上限时静默忽略 days 更
+  危险）。
+
+  轮转只删「dump + manifest + tombstones + media 四件齐全、且 manifest 可解析」
+  的组合（`media=absent` 也算齐全——那表示确实没有媒体），并且**真正删除**发生在
+  **本次备份成功之后**（dry-run 只打印计划；备份失败根本不进轮转）：
+
+  - **0 字节墓碑是合法产物**：没有任何撤回记录（最常见）时
+    `tombstones-<STAMP>.txt` 就是 0 字节（`psql` 查询成功、输出为空），manifest
+    里 `tombstones_state=ok`。轮转把"文件存在 + 状态 ok"与"内容非空"分开判：
+    0 字节**算完整组合**，参与保留计数、也能被删；只有**墓碑文件缺失**或
+    `tombstones_state=FAILED` 才整组跳过并告警。注意这条放宽**只针对墓碑**：
+    0 字节的 `dump` / `media` 仍然判坏（见下一条）；
+  - 缺产物、缺 manifest、旧格式 manifest（没有 `media=`）、`tombstones_state=FAILED`、
+    manifest 声称 `keys_root=present` 但 `keys/root.key` 不在 → 整组跳过并告警，
+    一个文件都不动；
+  - 没有 manifest 的孤儿 dump / 墓碑 / 媒体 → 只告警"不动它"；
+  - `keys/root.key` **永不**在删除范围内（它没有日期戳，是当前这把密钥的唯一副本）；
+  - 删除顺序是**先数据文件、manifest 最后删**：中途被打断时这组立刻变成"不完整"，
+    下次轮转不会再碰它，也不会被 `restore_drill.sh` 当成有效备份；
+  - 轮转失败（目录只读等）只告警、不改写备份结论（本次备份仍 exit 0）。
+
+  **不要按日期手工 `rm` 旧产物**：那会绕开"四件齐全 + manifest 可解析"的门槛，
+  很容易删出半组（例如 manifest 还在、`media-*.tar` 已没），等到恢复时才发现备不
+  了；手工删也没有"`keys/root.key` 永不删"这道保险（例如 `rm -rf` 整个旧目录时）。
+  要清理就用上面的开关，并先 `--dry-run` 看计划。
+
+  已知限制（照实写）：轮转**不清理**直接模式的 `version-<STAMP>.txt`（删除白名单
+  只含 dump / tombstones / media / manifest），组被删后它可能残留，也不会有孤儿
+  告警；`media_state=partial` 的组在轮转眼里仍算"四件齐全"，**会占用保留名额**
+  ——当最新的 N 份里有 partial 时，可能挤掉一份更早的干净备份（partial 本身仍可
+  恢复，只是恢复前要人工核对 `media_ref`）；**不合格组永远不参与轮转、也不会被
+  删**（缺产物、缺 manifest、`tombstones_state=FAILED`、旧格式等），所以目录里
+  实际 manifest 份数可能多于 N——"最多 N 份"只对完整组合成立。
+
 - **耗时也随媒体体积增长**：执行器里 `BACKUP_TIMEOUT_SECONDS=1800`（`deploy/update/
-  executor.py`）现在是**含全量媒体打包**的总预算；媒体卷几十 GB / 慢盘时备份会
-  超时 → `backup_failed` → 升级被阻断（fail closed，不丢数据但要重跑）。这种部署
-  应先把媒体轮转掉、或调大该上限。
+  executor.py`）现在是**含当前 `/data/media` 全量打包**的总预算；媒体卷几十 GB /
+  慢盘时备份会超时 → `backup_failed` → 升级被阻断（fail closed，不丢数据但要重跑）。
+  要缩短**本次**打包时间只能从数据量/速度入手：先缩小 `/data/media`（清理不需要的
+  媒体或归档到冷存储）、调大 `BACKUP_TIMEOUT_SECONDS`、或换更快的磁盘/存储。
+  **减少历史备份份数不会让本次 `tar` 变快**：执行器每次备份都新开
+  `backups_dir/<request_id>` 目录、调用 `backup.sh` 时只传位置参数、**从不传
+  `--prune-*`**，本次打包的仍是当前 `/data/media` 全量。轮转（上一段）只省磁盘
+  空间，不是超时的解法。
+
+**并发锁（同一备份目录不能被两个实例同时写）**：`backup.sh` 用 `mkdir` 做原子锁，
+锁目录是 `$OUT_DIR/.backup.lock`，里面写持有者的 `pid` 与 `started_at`（启动时间）。
+拿不到锁时：
+
+- 持有者 PID 仍然存在（`kill -0` 成功）→ 打印 `pid=`、启动时间、锁路径，**exit 6**。
+  第二个实例被拒绝，不会两边一起写盘，也不会删对方的产物（清理逻辑在没拿到锁时
+  直接返回，避免把同秒 STAMP 正在写的文件删掉）；
+- 锁是崩溃残留（`pid` 不存在，或锁目录里没有 `pid` 文件）→ 告警后**接管**并继续；
+  接管再失败（目录仍被占用）仍 exit 6；
+- `--force-unlock` 会先清掉锁再抢。**只应在确认那个进程已经死掉/是残留锁时用**：
+  对**活着的**实例强开会让两个进程同时写同一批固定名字的产物（`keys/root.key`、
+  `.part`、同秒 STAMP）。后启动的那份**通常**会在媒体完整性检查处失败（QA 观察到
+  exit 5），但脚本**没有**对并发两写的最终产物做一致性校验（没有并发场景下的
+  dump/manifest 事后比对），所以**不能保证**任何时序都不会以 exit 0 结束。覆盖
+  已经发生，仍应避免；
+- 正常结束（含失败）由 EXIT trap 释放锁，成功路径**不留锁**，下一次 cron 不会
+  被永久拒掉。若残留锁里的 PID 恰好被无关进程复用，会被当成"还在跑"而 exit 6
+  （安全方向：拒绝运行），人工确认后用 `--force-unlock` 解。
+
+`--dry-run` 不建锁：目录上已有锁时它只告警（打印持有者 pid/启动时间），仍以
+exit 0 返回轮转计划。
+
+`backup.sh` 的退出码（脚本头部注释是契约，两边必须一致）：
+
+| 码 | 含义 |
+|---|---|
+| 0 | **流程正常结束**，但**不保证产物齐全/可恢复**：可能带 `tombstones_state=FAILED`、`media=absent`、`keys_root=absent`、`media_state=partial`，必须看 manifest。轮转只告警也算 0 |
+| 1 | 未分类的意外失败：`set -e` **透传底层命令的状态**（常见 1，例如直接模式 `pg_dump` 失败；脚本**没有**显式 `exit 1`）。命令缺失是 **127**，`psql` 自身 exit 2 会与"用法/配置错误"同码；其余状态不保证落在 0–7 |
+| 2 | 用法/配置错误：缺 `OUT_DIR`、未知参数、`--prune-*` 取值非法、缺 `LING_DATABASE_URL`、compose 模式缺 `docker` |
+| 3 | compose 模式 `pg_dump` 失败或导出为空（直接模式没有显式映射，`pg_dump` 的非零码由 `set -e` 原样透传，**不保证是 3**） |
+| 4 | 容器内根密钥读取失败（无法确认密钥状态，本次备份作废） |
+| 5 | 媒体归档**致命**失败：compose 的 `tar` rc≥2 或 `tar -tf` 读不出目录、直接模式 `tar` 非零。compose 的 `tar` rc=1 是 `media_state=partial`，**不算 5**，仍 exit 0 |
+| 6 | **备份锁被占用**（另一个实例正在同一 `OUT_DIR` 运行；或残留锁接管失败） |
+| 7 | 缺少 sha256 工具（`sha256sum` / `shasum` / `openssl` 都没有；在任何磁盘动作之前退出） |
+
+> 0–7 是脚本**显式或常见**的状态，**不是封闭集合**：`set -e` 会把底层命令的
+> 退出状态原样透传（例如 `psql` 命令缺失 → **127**；`psql` 自身 exit 2 会与
+> "用法/配置错误"同码）。脚本没有显式 `exit 1`，1 只是"常见透传值"。
+
+升级执行器**先看退出码**：非 0 一律判 `backup_failed`（fail closed，**不会**因为 6
+而自动重试；`6` 的语义是"另有一个备份在跑"，确认后重跑即可）。但 **0 不等于成功**：
+它还会用 manifest 再做三层校验（`tombstones_state=ok`、dump 头/哈希、keys/media
+枚举与哈希等），校验不过仍是 `backup_failed`。cron 不解释退出码，只把脚本输出追加
+进 `backup.log`——`6`、0 之后校验失败的告警、以及真正非零的失败都要人去日志里看。
 
 **"看着成功"和"真的备全"是两件事，而且告警不在界面里**。自助更新（§10）在备份后
 会用 manifest 做三层校验，其中"备份通过但**不完整 / 未能校验**"的情形**不会**出现
@@ -1074,14 +1205,17 @@ compose 模式先 `mv` 成正式名、之后才 `chmod 600`，中间还有极短
 恢复 `deploy/.env`）、旧格式 manifest 的"未能校验"。**升级成功也要 `tail` 一下**
 ——`succeeded` 只表示"这一次升级完成了"，不表示"备份完整"。
 
-**既有权限口径（脚本有意不改，避免影响已部署的目录）**：cron 路径下备份目录由
-`mkdir -p` 创建，权限是 **0755**（受 umask 影响）；`dump` / `manifest` /
-`tombstones` 写出来是 **0644**，只有 `media-*.tar` 与 `keys/root.key` 显式
-`chmod 600`。也就是说 dump 里是业务数据、同机其它用户可读——请把备份的**父目录**
-自己收紧（例如 `chmod 700 /mnt/backup/ling`，或建在宿主私有目录下），不要放在
-`/tmp`、Web 根目录或共享盘的可浏览位置。执行器自己的备份目录是 `0700`
-（`state_dir` 也是 `0700`），不受这条影响。需要更严就自己 `chmod`：脚本不会替你
-改（改了会让既有部署上其他属主跑的 cron 写入失败）。
+**既有权限口径（脚本有意不改父目录，避免影响已部署的目录）**：cron 路径下备份目录
+由 `mkdir -p` 创建，权限是 **0755**（受 umask 影响）；`dump` / `manifest` /
+`tombstones` 按外层 umask 写成 **0644**（默认 umask 022，脚本不 chmod 它们）。
+`media-*.tar`、`keys/root.key` 以及 `.root.key.part.*` / `.root.key.prev.*` /
+`.media-*.tar.part` 都是 **0600**——不是"先 0644 再 chmod"，而是创建时就在
+`umask 077` 的子 shell 里落盘；媒体正式名也是先 `chmod` 再 `mv`（见上文）。
+也就是说 dump 里是业务数据、同机其它用户可读——请把备份的**父目录**自己收紧
+（例如 `chmod 700 /mnt/backup/ling`，或建在宿主私有目录下），不要放在 `/tmp`、
+Web 根目录或共享盘的可浏览位置。执行器自己的备份目录是 `0700`（`state_dir` 也是
+`0700`），不受这条影响。需要更严就自己 `chmod` 父目录：脚本不会替你改（改了会让
+既有部署上其他属主跑的 cron 写入失败）。
 
 数据库里的 provider 凭据是加密的，根密钥丢了就全部解不开——表现为"机器人突然
 连不上模型"，很难第一时间想到是密钥问题。恢复顺序见

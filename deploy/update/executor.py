@@ -72,8 +72,12 @@ DEFAULT_MAX_SECONDS = 3600
 #   - 媒体卷很大时，这个 30 分钟可能不够 → 超时 = ``backup_failed`` → 升级被
 #     阻断。这是**有意的 fail closed**（不丢数据、不半路进入构建），代价是运维
 #     要重跑或调大这个值；调大是安全的，调小到"媒体还没流完就构建"才危险。
-#   - 每日 cron 备份会**按天累积全量媒体副本**（本项目**不实现**保留/轮转策略），
-#     空间要运维自己估算并轮转，见 docs/DEPLOYMENT.md §8.1。
+#     要缩短本次打包时间只能缩小 /data/media、调大本值或换更快存储——减少历史
+#     备份份数不会让本次 tar 变快。
+#   - 每日 cron 备份默认**不删**历史全量媒体副本。``backup.sh`` 提供默认关闭的
+#     轮转（``--prune-keep`` / ``--prune-days`` / ``--dry-run``）；执行器调用它时
+#     只传位置参数、**不传任何 ``--prune-*``**，要由 cron 行或人工显式开启，
+#     空间由运维估算并轮转，见 docs/DEPLOYMENT.md §8.1。
 BACKUP_TIMEOUT_SECONDS = 1800
 FETCH_TIMEOUT_SECONDS = 600
 QUICK_TIMEOUT_SECONDS = 120
@@ -1296,6 +1300,25 @@ class InstallLock:
             self._fd = None
 
 
+def _with_backup_warnings(
+    job: Any, warnings: Sequence[str], **progress: Any
+) -> Any:
+    """推进任务状态，并把这些备份告警一起写进任务视图（可选字段）。
+
+    为什么要判能力而不是直接传：已装机器的执行器固定在 /srv 且**不随 Release
+    更新**，它可能加载到还没有 ``backup_warnings`` 的旧协议模块。那种情况下这
+    条告警只留在 ``verify-warnings.txt``/备份日志里——可以接受（缺展示），但
+    **绝不能**因为多传一个关键字参数让写状态本身失败。
+
+    用 ``__dataclass_fields__`` 判能力而不是判模块属性：字段存在就一定能接收，
+    旧协议没有这个字段时退回原调用。
+    """
+    fields = getattr(job, "__dataclass_fields__", {})
+    if warnings and "backup_warnings" in fields:
+        return job.with_progress(backup_warnings=list(warnings), **progress)
+    return job.with_progress(**progress)
+
+
 class Executor:
     """一次更新 = 一串可单测的阶段函数，任何外部命令都可注入。"""
 
@@ -1316,6 +1339,9 @@ class Executor:
         self._clock = clock or time.time
         self._release_lookup = release_lookup or lookup_release
         self._job: Any = None
+        # 当前任务累积的备份告警（媒体归档 partial、旧格式无法校验等）。只用于
+        # 把 verify-warnings.txt 的内容同时透出到 Web；文件落点保持不变。
+        self._backup_warnings: list[str] = []
         self._previous: dict[str, Any] = {}
         self._install_lock: InstallLock | None = None
         self._compose_override: Path | None = None
@@ -1604,7 +1630,11 @@ class Executor:
     def _set_stage(self, stage: str) -> None:
         if self._job is None:
             return
-        self._job = self._job.with_progress(state="running", stage=stage)
+        # 备份阶段之后的每次推进都带上已记录的告警：任务还在跑时就该看得见
+        # "这份备份不完整"，而不是等终态。
+        self._job = _with_backup_warnings(
+            self._job, self._backup_warnings, state="running", stage=stage
+        )
         self.write_job(self._job)
 
     # ------------------------------------------------------------ compose
@@ -2075,6 +2105,7 @@ class Executor:
         self._compose_override = None
         self._expected_mounts = {}
         self._previous = {}
+        self._backup_warnings = []
         # claim_pending 已在 requests 锁内写入 journal start + running 状态，
         # 并用 compare-and-unlink 删掉**本请求**的 pending（不会误删后来的请求）。
         self._job = request.to_job().with_progress(state="running", stage="preflight")
@@ -2544,6 +2575,13 @@ class Executor:
         任务状态里的 ``message`` 由固定码表生成（不能塞自由文本），所以告警必须
         落到宿主私有文件：``state_dir/backups/<id>/verify-warnings.txt``（0600）。
         写不下告警也算失败——否则"告警没写成功"会被读成"没有告警"。
+
+        **同时**（task-76）把同样的几条摘要记到 ``self._backup_warnings``，由
+        ``_finish_success`` / ``_finish_failure`` 写进任务视图的可选字段
+        ``backup_warnings``：文件落点不变（运维仍可 tail），但 Web/API 也能看见
+        「升级成功、备份不完整」。这里用协议层的 ``sanitize_backup_warnings``
+        先把条目收敛到合法范围（单行、有长度上限），避免写状态失败连带丢掉真正的
+        升级结果；旧协议没有这个字段/函数时静默跳过（只少一个展示）。
         """
         text = "".join(f"[backup-verify] {note}\n" for note in notes)
         try:
@@ -2556,6 +2594,23 @@ class Executor:
                     handle.write(text)
         except OSError as exc:
             raise UpdateFailure("backup_failed") from exc
+        self._backup_warnings = self._remember_backup_warnings(notes)
+
+    def _remember_backup_warnings(self, notes: Sequence[str]) -> list[str]:
+        """把告警摘要收集进任务视图用的列表（去重、限界，绝不抛异常）。
+
+        这里刻意**不**失败：文件已经写好了，告警本身是"已知且可控"的；把任务
+        视图的展示字段弄炸只会让一次成功升级变成失败。协议能力探测在
+        ``_with_backup_warnings`` 里做，这里只做纯数据收敛。
+        """
+        sanitize = getattr(self.protocol, "sanitize_backup_warnings", None)
+        merged: list[str] = [*self._backup_warnings, *notes]
+        if callable(sanitize):
+            try:
+                return list(sanitize(merged))
+            except Exception:  # noqa: BLE001 - 展示字段绝不连累任务状态
+                return list(self._backup_warnings)
+        return list(self._backup_warnings)
 
     def _verify_dump_toc(self, out: Path, dump: Path) -> None:
         """用 ``pg_restore --list`` 真读一遍备份，并核对相关对象。
@@ -3178,7 +3233,10 @@ class Executor:
             "replicas": list(runtime.replicas),
         }
         self.write_installed(installed)
-        self._job = self._job.with_progress(state="succeeded", stage="complete")
+        # 升级成功但备份不完整时，告警必须跟着任务一起到 Web（不只是日志文件）。
+        self._job = _with_backup_warnings(
+            self._job, self._backup_warnings, state="succeeded", stage="complete"
+        )
         self.write_job(self._job)
         self.write_heartbeat()
         self.journal("end", request.request_id, state="succeeded")
@@ -3190,7 +3248,13 @@ class Executor:
 
     def _finish_failure(self, request: Any, exc: UpdateFailure, *, stage: str) -> None:
         state = "needs_manual" if exc.manual else "failed"
-        self._job = self._job.with_progress(state=state, stage=stage, error_code=exc.code)
+        self._job = _with_backup_warnings(
+            self._job,
+            self._backup_warnings,
+            state=state,
+            stage=stage,
+            error_code=exc.code,
+        )
         self.write_job(self._job)
         self.journal("end", request.request_id, state=state, code=exc.code, stage=stage)
         self._write_recovery_note(self._job)

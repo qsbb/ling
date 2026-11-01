@@ -110,9 +110,36 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   "created_at": "ISO-8601",
   "updated_at": "ISO-8601",
   "error_code": "固定错误码或 null",
-  "message": "由服务端固定码表生成，不回传宿主日志/路径"
+  "message": "由服务端固定码表生成，不回传宿主日志/路径",
+  "backup_warnings": ["备份不完整/未能校验的告警摘要；没有告警时是 []"]
 }
 ```
+
+#### `backup_warnings`（可选字段，向后兼容）
+
+媒体归档不完整（`media_state=partial`：归档时有文件正在上传，可能漏文件）时，
+执行器**仍然判通过**（升级不替换 `app-data` 卷，硬失败会让每次“上传中提交升级”
+都失败），但必须留痕。这些告警原先只落 `state_dir/backups/<id>/verify-warnings.txt`
+与 `logs/<id>-backup.log`，Web 完全看不到，运维极易忽略——而恢复时缺媒体就是真的缺。
+现在执行器把**同样的几条摘要**同时写进 `current.json` 的 `backup_warnings`，
+`GET /v1/version/update` 原样透出，AboutPage 在结果区显著位置提示。
+
+约定与边界：
+
+- **纯加法、协议仍是 `v1`**：不新增必需属性、不改已有的 `state/stage/message` 语义。
+  旧执行器不写这个键时，API 视为**空数组**（`[]`），不报错、不改变门禁；
+  旧 API 读到新 `current.json` 时忽略这个键（`UpdateJob.from_dict` 只取已知字段）。
+  **不要**为此升 `SCHEMA_VERSION`：已装机器的执行器固定在 `/srv/ling/deploy/update/executor.py`
+  且不随 Release 更新，升版本会让它直接 `protocol_unsupported`，等于把升级通道锁死。
+- **只做展示，不参与门禁**：`needs_manual`/进行中/离线等判定完全不受影响；
+  告警存在也不代表“可更新”或“需人工确认”。
+- **条目是单行摘要、有上限**：最多 8 条、单条 ≤200 字符，含换行/控制字符或超长
+  的条目在读取侧被丢弃（只丢那一条，绝不让整个任务变成不可解析），在写入侧由
+  `UpdateJob.__post_init__` 直接拒绝。
+- **文件落点不变**：`verify-warnings.txt` 与备份日志照旧写（运维仍可 `tail`），
+  `backup_warnings` 只是同一份告警的 Web 视图；细节以文件为准。
+- 旧执行器（/srv 上未更新的那份）不会写这个字段——升级到带该功能的执行器之前，
+  Web 上看不到告警，只有文件里有。
 
 ### `POST /v1/version/update-requests`
 
@@ -143,9 +170,9 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   `needs_manual` 由人工确认。
 - **请求体上限 4096 字节**（`version.py:61` 的 `MAX_UPDATE_BODY_BYTES`），两条路径
   都会在**读 body 之前/之中**直接 422，不会先把超长体完整缓冲：
-  1. `Content-Length` 已经大于 4096 → **读 body 前**就 422（`version.py:677-684`）；
+  1. `Content-Length` 已经大于 4096 → **读 body 前**就 422（`version.py:683-690`）；
   2. 没有 `Content-Length`（chunked）或 header 被伪造时按 chunk 累计，累计到
-     4097 字节立刻停止读取并 422（`version.py:687-697`）。
+     4097 字节立刻停止读取并 422（`version.py:693-703`）。
   两条路径的 `error.detail` 都是 **`request_body_too_large`**
   （`version.py:69` 的 `DETAIL_BODY_TOO_LARGE`），不是文档另起的名字。
 
@@ -154,15 +181,15 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
 
 | HTTP | `error.detail` | 触发条件（代码位置） |
 | --- | --- | --- |
-| 403 | `not_owner` | 角色不是 `owner`（`version.py:723-729`） |
-| 403 | `origin_required` / `origin_mismatch` | Cookie 会话缺 `Origin`；`Origin` 非裸同源（`version.py:613-647`、`731-738`） |
-| 422 | `content_type_required` | `Content-Type` 不是 `application/json`（`version.py:650-658`） |
-| 422 | `update_header_required` | 缺 `X-Ling-Update: 1`（`version.py:659-665`） |
-| 422 | `request_body_too_large` | `Content-Length` > 4096，或 chunk 累计 > 4096（`version.py:668-699`） |
-| 422 | `invalid_request_body` | JSON/schema 不严格匹配：多余或缺失键、`confirm_tag != expected.tag`、tag 不是严格 `vX.Y.Z`、commit 不是 40 位（`version.py:523-586`、`740-748`） |
-| 409 | `update_in_progress` | 已有合法 `pending.json`，或 `current.json` 是 `queued/running`（`service.py:363-364`、`210-231`、`version.py:702-706`） |
-| 409 | `release_changed` / `installed_version_changed` | 重新获取的 Release/版本与 `expected` 不一致，或远端不再更新（`version.py:772-792`、`709-711`） |
-| 503 | 其余 gate reason | 见下表；`version.py:702-706`（只有 `update_in_progress` 是 409，其它 gate 一律 503） |
+| 403 | `not_owner` | 角色不是 `owner`（`version.py:729-735`） |
+| 403 | `origin_required` / `origin_mismatch` | Cookie 会话缺 `Origin`；`Origin` 非裸同源（`version.py:619-653`、`737-744`） |
+| 422 | `content_type_required` | `Content-Type` 不是 `application/json`（`version.py:656-664`） |
+| 422 | `update_header_required` | 缺 `X-Ling-Update: 1`（`version.py:665-671`） |
+| 422 | `request_body_too_large` | `Content-Length` > 4096，或 chunk 累计 > 4096（`version.py:674-705`） |
+| 422 | `invalid_request_body` | JSON/schema 不严格匹配：多余或缺失键、`confirm_tag != expected.tag`、tag 不是严格 `vX.Y.Z`、commit 不是 40 位（`version.py:529-592`、`746-754`） |
+| 409 | `update_in_progress` | 已有合法 `pending.json`，或 `current.json` 是 `queued/running`（`service.py:370-371`、`210-231`、`version.py:708-712`） |
+| 409 | `release_changed` / `installed_version_changed` | 重新获取的 Release/版本与 `expected` 不一致，或远端不再更新（`version.py:778-798`、`715-717`） |
+| 503 | 其余 gate reason | 见下表；`version.py:708-712`（只有 `update_in_progress` 是 409，其它 gate 一律 503） |
 
 `GET /v1/version/update` 的 `reason`、`check-release` 的 `update_reason` 与提交
 被拒时的 `error.detail` 共用同一组 **gate** 固定码（`service.py:32-56` 的
@@ -179,32 +206,35 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
 
 - **协议错误码表**：gate/conflict 类（`not_owner`、`update_in_progress`、
   `release_changed`、`installed_version_changed` 等）来自
-  `protocol.ERROR_MESSAGES`（`protocol.py:110-143`；`message_for()` 见 `:251-256`）；
+  `protocol.ERROR_MESSAGES`（`protocol.py:152-185`；`message_for()` 见 `:293-296`）；
 - **路由层固定字符串**：`origin_required` / `origin_mismatch`、`content_type_required`、
   `update_header_required`、`request_body_too_large`、`invalid_request_body` 的文案
-  直接写在 `version.py` 的校验分支里（`:613-647`、`:650-665`、`:677-697`、`:740-748`），
-  不在码表里——`message_for()` 对这些键返回 `None`。
+  直接写在 `version.py` 的校验分支里（origin 判定 `:619-653`、抛错 `:737-744`；
+  `content_type_required` `:656-664`；`update_header_required` `:665-671`；
+  `request_body_too_large` `:683-703`；`invalid_request_body` 由 `:746-754` 转发
+  `_parse_submission`（`:544-592`）的 detail），不在码表里——`message_for()` 对这些
+  键返回 `None`。
 
 | reason | 触发条件（代码位置） | 前端展示（`AboutPage.tsx`） |
 | --- | --- | --- |
 | `disabled` | `LING_UPDATE_ENABLED=0`（`service.py:257-258`） | 有专门文案“更新通道未启用” |
 | `not_owner` | 角色不是 `owner`（`service.py:259-260`） | 有专门文案 |
-| `channel_unavailable` | requests/status 目录不可用，或 submit 拿不到 `requests/.lock`（`service.py:262-263`、`346-358`） | 有专门文案 |
+| `channel_unavailable` | requests/status 目录不可用，或 submit 拿不到 `requests/.lock`（`service.py:262-263`、`353-365`） | 有专门文案 |
 | `executor_offline` | 心跳缺失/不是 `status=ok`/超过 90s 未更新（`service.py:26-27`、`182-184`、`274-275`） | 有专门文案 |
 | `installed_commit_unknown` | 当前进程拿不到 40 位 `LING_COMMIT`（`service.py:276-277`、`version.py:96-100`） | 有专门文案 |
 | `version_drift` | 心跳里的 `deployed_commit`/`current_version` 与 API 进程不一致（`service.py:278-279`） | 有专门文案 |
-| `update_in_progress` | `current.json` 是 `queued/running`，或存在合法 `pending.json`（`service.py:210-231`、`272-273`、`363-364`）。`needs_manual` 在执行器心跳明确为 `manual` 时先命中 `manual_required`；心跳已过期/缺失时同一个任务也按 `update_in_progress` 挡住（`active_job` 把 `needs_manual` 当门禁，`service.py:210-218`） | 有专门文案 |
-| **`manual_required`** | 执行器心跳显式声明 `status=manual`，即 `current.json` 是 `needs_manual`（`service.py:264-266`；执行器写这一状态见 `executor.py` 的 `_mark_manual()`）：宿主必须先人工恢复并 `adopt-current` | 有专门文案“更新执行器要求人工核验：需在宿主机处理（adopt-current）后才会解除”（`AboutPage.tsx:130`；状态栏/安装按钮走 `REASON_TEXT` `:142`，提交被拒的 503 横幅走 `UPDATE_DETAIL_TEXT` `:187`，同一句字符串）。`needs_manual` 是**任务终态**，另有“上一次更新需要人工处理，完成后才能再次安装”（`MANUAL_BLOCK_TEXT`，`:197`）。存在 `needs_manual` 阻塞任务时状态栏优先显示这句 `MANUAL_BLOCK_TEXT`，而不是门禁文案（`describeStatusNote`，`AboutPage.tsx:281-285`）。**不会**被当成可更新，也不会被当成通道关闭 |
-| **`protocol_unsupported`** | ① 心跳文件存在但**不可读或不是 JSON 对象**（`service.py:153-155` 把读取失败折成 `{}`，`protocol.py:307-332` 读不出对象，`:793-809` 把 `{}` 判为协议不支持），或心跳里 `status` 缺失/未知、schema 不认识（`protocol.py:65-74`、`:793-822`）；② `pending.json` 存在但不可信（符号链接/坏 JSON/未知 schema/字段非法，`protocol.py:726-743`）。gate 与提交都会在**执行任何部署前**拒绝（`service.py:267-271`、`361-362`、`368-369`） | 有专门文案“更新协议不兼容：API 与执行器需要同批升级，重试不会生效”（`AboutPage.tsx:131`；提交被拒的 503 横幅经 `:187` 复用同一句），明确说明重试无效；只有未知码才落到 `当前不可更新（${reason}）`（`:202`） |
+| `update_in_progress` | `current.json` 是 `queued/running`，或存在合法 `pending.json`（`service.py:210-231`、`272-273`、`370-371`）。`needs_manual` 在执行器心跳明确为 `manual` 时先命中 `manual_required`；心跳已过期/缺失时同一个任务也按 `update_in_progress` 挡住（`active_job` 把 `needs_manual` 当门禁，`service.py:210-218`） | 有专门文案 |
+| **`manual_required`** | 执行器心跳显式声明 `status=manual`，即 `current.json` 是 `needs_manual`（`service.py:264-266`；执行器写这一状态有**三条**路径：`_finish_failure()`（构建之后的阶段失败/超时，`exc.manual=True`）、`_terminal()`（journal 损坏/中断/已消费重放等门禁路径）、`_mark_manual()`（上一轮留下 `running` 遗留任务，真实状态未知））：宿主必须先人工恢复并 `adopt-current` | 有专门文案“更新执行器要求人工核验：需在宿主机处理（adopt-current）后才会解除”（`AboutPage.tsx:130`；状态栏/安装按钮走 `REASON_TEXT` `:142`，提交被拒的 503 横幅走 `UPDATE_DETAIL_TEXT` `:187`，同一句字符串）。`needs_manual` 是**任务终态**，另有“上一次更新需要人工处理，完成后才能再次安装”（`MANUAL_BLOCK_TEXT`，`:197`）。存在 `needs_manual` 阻塞任务时状态栏优先显示这句 `MANUAL_BLOCK_TEXT`，而不是门禁文案（`describeStatusNote`，`AboutPage.tsx:281-285`）。**不会**被当成可更新，也不会被当成通道关闭 |
+| **`protocol_unsupported`** | ① 心跳文件存在但**不可读或不是 JSON 对象**（`service.py:153-155` 把读取失败折成 `{}`，`protocol.py:349-374` 读不出对象，`:866-882` 把 `{}` 判为协议不支持），或心跳里 `status` 缺失/未知、schema 不认识（`protocol.py:107-116`、`:866-895`）；② `pending.json` 存在但不可信（符号链接/坏 JSON/未知 schema/字段非法，`protocol.py:799-816`）。gate 与提交都会在**执行任何部署前**拒绝（`service.py:267-271`、`368-369`、`375-376`） | 有专门文案“更新协议不兼容：API 与执行器需要同批升级，重试不会生效”（`AboutPage.tsx:131`；提交被拒的 503 横幅经 `:187` 复用同一句），明确说明重试无效；只有未知码才落到 `当前不可更新（${reason}）`（`:202`） |
 | `release_unverifiable` | Release 不可核验（GitHub 不可达/无 Release/tag 不是严格稳定 tag，`service.py:291-296`） | 有专门文案 |
 | `not_newer` | 远端 tag 不比当前版本新（`service.py:293-294`） | 有专门文案 |
 
 > 11 个 gate reason 在 `AboutPage.tsx` 里都有专门文案：`describeUpdateReason`
 > （`:200-203`）只对**未知码**兜底成 `` `当前不可更新（${reason}）` ``（`:202`）。
-> 提交被拒时的错误横幅由 `explainUpdateError`（`:385-423`）按 `error.detail` 取同一组
-> 文案：`version.py:702-706` 的 `_gate_error` 把除 `update_in_progress`（409）以外的
+> 提交被拒时的错误横幅由 `explainUpdateError`（`:439-477`）按 `error.detail` 取同一组
+> 文案：`version.py:708-712` 的 `_gate_error` 把除 `update_in_progress`（409）以外的
 > gate reason 都编码成 `provider_unavailable` 503，前端按 `detail` 取门禁文案；
-> `detail` 缺失或遇到未知码时用固定兜底串“当前不满足更新条件”（`:399-410`），
+> `detail` 缺失或遇到未知码时用固定兜底串“当前不满足更新条件”（`:453-464`），
 > 不会显示成“模型供应商不可用”（`errors.ts:26-30` 的通用映射只用于
 > 真正的供应商故障）。
 
@@ -279,15 +309,15 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   `src/ling/updates/protocol.py` 的 `SCHEMA_VERSION`（当前 `v1`，`protocol.py:42`）
   与心跳里的 `status` 字段。旧执行器写的心跳没有 `status`（或 schema 不认识）时，
   API **fail closed**：`parse_heartbeat` 把它当成
-  `status=protocol_unsupported`（`protocol.py:65-74`、`793-822`），gate 与提交入口
-  都返回 `protocol_unsupported` 并**拒绝更新**（`service.py:267-271`、`368-369`），
+  `status=protocol_unsupported`（`protocol.py:107-116`、`866-895`），gate 与提交入口
+  都返回 `protocol_unsupported` 并**拒绝更新**（`service.py:267-271`、`375-376`），
   Web 会显示“更新协议不兼容：API 与执行器需要同批升级，重试不会生效”。
   执行器侧对过旧/不完整的协议实现同样 fail closed（`executor.py` 的
   `load_protocol()`：要求 `SCHEMA_VERSION == "v1"` 且 `REQUIRED_PROTOCOL_ATTRS` 齐全，
   否则 `init`/`run` 直接报配置错误）。所以：换新 API 镜像的同一批里要同步宿主上的
   执行器文件，不要只升一半。
 - **`pending.json` 残留会让 API 一直 409**。API 只要看到合法 `pending.json` 就报
-  `update_in_progress`（`service.py:363-364`、`210-231`），**绝不覆盖**（覆盖会吃掉
+  `update_in_progress`（`service.py:370-371`、`210-231`），**绝不覆盖**（覆盖会吃掉
   宿主在途的 claim）。宿主恢复执行器后由它自己做 compare-and-unlink 清理
   （`executor.py` 的 `clear_pending()`：只在终态/中断清理时调用；`claim_pending()`
   在 requests 锁内自己做同一套 compare-and-unlink）；执行器起不来时只能人工在宿主
@@ -409,10 +439,16 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
    就没有可信的回旧镜像路径（见 §8）。
    注意 `manifest-*.txt` 里 `tombstones_state=FAILED` 表示墓碑清单导出失败，
    这份备份**不能**用于恢复（恢复演练脚本也会因此直接失败）。
-   `media-*.tar` 是**全量**媒体副本，每次备份都完整复制一份，本项目**不实现**
-   保留/轮转：每日 cron 会按天累积，空间与耗时都要自己估（见
+   `media-*.tar` 是**全量**媒体副本，每次备份都完整复制一份，默认**不删**历史。
+   `deploy/backup/backup.sh` 提供**默认关闭**的轮转（`--prune-keep N` /
+   `--prune-days D` / `--dry-run`，N 含本次、历史回看 N−1 天；零撤回的空墓碑
+   也是合法产物，正常参与轮转）；执行器调用时只传位置参数、**不传任何
+   `--prune-*`**，所以升级备份目录不会被自动轮转——要轮转得靠 cron 行/人工
+   显式加参数（先 `--dry-run` 看计划）。空间与耗时都要自己估（见
    [DEPLOYMENT.md §8.1](DEPLOYMENT.md#81-定时备份)）；执行器备份超时
-   （`BACKUP_TIMEOUT_SECONDS=1800`）现在含媒体打包，媒体特别大时会超时阻断升级。
+   （`BACKUP_TIMEOUT_SECONDS=1800`）含当前 `/data/media` 全量打包，媒体特别大时
+   应缩小 `/data/media`、调大该上限或换更快存储——减少历史份数不会让本次备份
+   变快。
    定时任务用 `deploy/backup/install-cron.sh /mnt/backup/ling 04:30`（幂等，重复
    执行只留下一条）。它会把 `LING_COMPOSE_PROJECT` 一起写进 crontab 行：
    项目名默认**从 `deploy/install.sh` 的 `PROJECT=` 默认值解析**（与安装器用的

@@ -275,9 +275,16 @@ deploy 阶段）。其余情况（无标记、标记已是 deploy/verify/complet
   `docker compose exec` 的退出码透传与 `tar -cf -` 的字节干净性只有真机能证明）。
 - `media_state=partial` 不阻断升级（有意取舍：升级不替换 `app-data` 卷），只在
   `verify-warnings.txt` 与备份日志里留显式告警——看到它就在恢复前核对 `media_ref`。
-- 备份超时 `BACKUP_TIMEOUT_SECONDS=1800` 现在包含全量媒体打包；媒体卷很大时会
-  超时 → `backup_failed` → 升级阻断（fail closed）。每日备份按天累积全量媒体，
-  **不实现**保留策略，空间与轮转由运维负责。
+- 备份超时 `BACKUP_TIMEOUT_SECONDS=1800` 现在包含当前 `/data/media` 的全量打包；
+  媒体卷很大时会超时 → `backup_failed` → 升级阻断（fail closed）。要缩短本次打包
+  只能缩小 `/data/media`、调大该上限或换更快存储；**减少历史备份份数不会让本次
+  `tar` 变快**（执行器每次备份都新开 `backups_dir/<request_id>`，调用 `backup.sh`
+  时只传位置参数）。`deploy/backup/backup.sh` 提供**默认关闭**的轮转
+  （`--prune-keep N` / `--prune-days D` / `--dry-run`，N 含本次、历史回看 N−1 天；
+  零撤回时 0 字节墓碑是合法产物，正常参与轮转），但执行器调用时只传位置参数、
+  **不带任何 `--prune-*`**，所以升级备份目录不会被它轮转删除；`install-cron.sh`
+  装出来的每日 cron 行同样默认不带。空间与轮转要运维显式开启并自己负责（先
+  `--dry-run` 看计划）；轮转只省磁盘空间，不缩短本次备份时间。
 - `deploy/backup/backup.sh`（另一个 owner 维护）当前只接受 `LING_COMPOSE_FILE` +
   `LING_COMPOSE_PROJECT`，还不接受 `-f override` / `--env-file`。执行器因此把
   **合并后的** compose 模型（base + override + env）落成 `compose-resolved.yaml`
