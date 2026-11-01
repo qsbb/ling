@@ -762,8 +762,15 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 让文件坏掉时 fail fast。
   #
   # 退出码 **2（配置错误）**，绝不是 3：3 是"pg_dump 失败"的契约语义，把配置
-  # 问题混进去会让告警方以为数据库出事。这条校验在任何容器/磁盘动作之前跑
-  # （dump/墓碑/密钥/媒体都还没开始），所以只需清理锁，不留半成品。
+  # 问题混进去会让告警方以为数据库出事。
+  #
+  # 位置说明（**别照抄成"在任何动作之前"**）：这条校验在 `mkdir -p "$OUT_DIR"`
+  # 与 `acquire_lock` **之后**（函数开头就建目录、抢锁，否则并发保护无从谈起）。
+  # 所以配置坏掉时**会留下一个空 OUT_DIR**、锁由 `trap` 释放。真机实测确认过这个
+  # 行为（shots/docker-real/P3-REAL-REVERIFY.md §4）。它拦住的是"导出/墓碑/密钥/
+  # 媒体"这些**会留下半成品**的动作——那些确实都还没开始，所以退出时是干净的，
+  # 只剩一个空目录。这条事实被
+  # `test_compose_config_precheck_runs_after_outdir_creation` 显式锁住。
   if ! compose_config_err="$(docker compose "${COMPOSE_ARGS[@]}" config -q 2>&1)"; then
     echo "[backup] compose 配置校验失败：无法解析 compose 文件（exit 2，配置错误）" >&2
     echo "[backup]   项目名（-p）：${COMPOSE_PROJECT:-（空：会按 compose 文件所在目录名推导，cron 下极易错）}" >&2
@@ -825,10 +832,18 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 否则"api 容器没起来/docker 报错"（也是非零）会被当成"没有密钥"，
   # 于是产出一份 exit 0 但恢复后解不开凭据的备份——正是要防的那种静默。
   #
-  # **密钥完整性必须能自证，不能只靠"别忘了写 -T"**（真机实测，见
-  # shots/docker-real/DOCKER-REAL.md §3.6）：`docker compose exec` 少了 `-T`
-  # 而宿主有 TTY 时 docker 会分配 pty，TTY 层给流加一个前导 `\0`、并把行尾变成
-  # CRLF（实测 44 B → 46 B），**退出码仍是 0**。旧实现只对**归档后**的文件算
+  # **密钥完整性必须能自证，不能只靠"别忘了写 -T"**：`docker compose exec` 少了
+  # `-T` 而宿主有 TTY 时 docker 会分配 pty，TTY 层**可能**给流加前导 `\0`、并把
+  # 行尾变成 CRLF，而**退出码仍是 0**——这是要防的失败形态。
+  #
+  # 关于"44 B → 46 B"这个具体字节数：它是早期在某个 Docker/Compose 版本上观测到的，
+  # **在 Docker 29.6.2 + Compose v5.3.1 上复现不出来**（真机实测：pty 确实被分配，
+  # 但 44 字节哑数据经 stdout 出来仍是 44 B、sha 相同、stderr 未合并，见
+  # shots/docker-real/P3-REAL-REVERIFY.md §5）。所以**不要把这个字节数当成契约**：
+  # 它想表达的是"没有 -T 时字节流可能被污染且不报错"，而不是"一定会多 2 字节"。
+  # 自校验的价值正在于此——不管污染是 2 字节、NUL、还是某个版本上根本不发生，
+  # 只要容器侧哈希与归档字节对不上就 exit 4，不会静默归档。
+  # 旧实现只对**归档后**的文件算
   # sha256 写进 manifest，从不与容器里的原值比对，于是会**静默归档一把坏密钥**
   # ——恢复时库里的 provider 凭据全部解不开，而 manifest 看起来毫无异常
   # （哈希自洽，只是自洽的是坏字节）。
@@ -916,7 +931,7 @@ exec cat /data/root.key
       echo "[backup] 根密钥完整性校验失败：容器内 sha256=${KEYS_CONTAINER_HASH}，" \
         "宿主收到 ${KEYS_LOCAL_BYTES} 字节、sha256=${KEYS_LOCAL_HASH}，" \
         "两者必须一致。最常见的原因是 exec 少了 -T——宿主有 TTY 时 TTY 层会给" \
-        "字节流加 NUL 与 CRLF（真机实测 44 B → 46 B）。本次备份作废，" \
+        "字节流被 TTY 层加 NUL/CRLF 污染。本次备份作废，" \
         "绝不归档一把坏密钥（恢复时 provider 凭据会全部解不开）" >&2
       exit 4
     fi

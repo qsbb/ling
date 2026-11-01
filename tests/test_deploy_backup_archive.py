@@ -202,7 +202,10 @@ case "$SERVICE" in
 sys.stdout.write(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${ROOT_KEY_PAYLOAD:?}")"
         # TTY 语义的两个开关（都模拟"pty 层"对流的加工，容器自己读到的还是原字节）：
         #   MERGED    ：stdout 与 stderr 被合并成一条流（真 pty 就是这样）
-        #   POLLUTED  ：字节流被加料（前导 NUL + LF→CRLF；真机实测 44 B → 46 B）
+        #   POLLUTED  ：字节流被加料（前导 NUL + LF→CRLF）。注意这 2 字节的增量
+        #               是桩里构造的**最坏形态**，不是真机契约：Docker 29.6.2 +
+        #               Compose v5.3.1 上复现不出来（P3-REAL-REVERIFY.md §5）。
+        #               桩要验的是"一旦被污染能否抓到"，不是"一定会多 2 字节"。
         MERGED=0
         if [[ "${FAKE_ROOT_KEY_MERGE_STREAMS:-0}" == "1" ]]; then MERGED=1; fi
         if [[ "$TTY_ALLOCATED" == "1" && "${FAKE_NO_T_MODE:-}" == "pty" ]]; then MERGED=1; fi
@@ -391,6 +394,16 @@ def _tar_bytes(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+# 备份目录里的**正式产物**名字（`leftovers()` 的白名单）。
+# 只看"隐藏与否"会把"多建的空目录/非隐藏杂物"漏掉，所以按名字判断产物：
+#   ling-<STAMP>.dump / tombstones-<STAMP>.txt / media-<STAMP>.tar /
+#   manifest-<STAMP>.txt / version-<STAMP>.txt
+# `keys/` 是产物目录（里面装 root.key），单独放行。
+_ARTIFACT_NAME_RE = re.compile(
+    r"(?:ling|tombstones|media|manifest|version)-\d{8}-\d{6}(?:\.dump|\.txt|\.tar)"
+)
+
+
 @dataclass
 class BackupRun:
     """一次 backup.sh（compose 模式）运行的现场。"""
@@ -420,8 +433,17 @@ class BackupRun:
         return self.proc.stdout + self.proc.stderr
 
     def leftovers(self) -> list[str]:
-        """备份目录里的隐藏半成品（``.xxx.part`` 之类）。"""
-        return sorted(p.name for p in self.out.iterdir() if p.name.startswith("."))
+        """备份目录里**不是正式产物**的一切：隐藏半成品（``.xxx.part``）与非隐藏杂物/目录。
+
+        旧口径只看 ``.`` 开头，于是"脚本多建了一个空目录""多留了一个非隐藏文件"这类
+        副作用永远看不见（真机盲区：``config -q`` 失败前 `mkdir` 已经建出的空目录）。
+        现在改成白名单：凡是名字不在正式产物集合里的条目都算 leftover，不管是否隐藏。
+        """
+        return sorted(
+            p.name
+            for p in self.out.iterdir()
+            if p.name != "keys" and not _ARTIFACT_NAME_RE.fullmatch(p.name)
+        )
 
 
 @pytest.fixture()
@@ -771,10 +793,15 @@ def test_root_key_read_failure_is_fatal(
 # ------------------------------------------------------- 根密钥完整性自校验（P3-4）
 #
 # 真 Docker 实测（`shots/docker-real/DOCKER-REAL.md` §3.6）：`docker compose exec`
-# 少了 `-T` 且宿主有 TTY 时 docker 会分配 pty，TTY 层给流加前导 `\0`、把行尾变成
-# CRLF（44 B → 46 B），**退出码仍是 0**。旧实现只对**归档后**的文件算 sha256 写进
+# 少了 `-T` 且宿主有 TTY 时 docker 会分配 pty，TTY 层**可能**给流加前导 `\0`、把行尾
+# 变成 CRLF，而**退出码仍是 0**。旧实现只对**归档后**的文件算 sha256 写进
 # manifest，从不与容器里的原值比对 → **静默归档一把坏密钥**，恢复时 provider
 # 凭据全部解不开，而 manifest 看起来毫无异常。
+#
+# 注意"44 B → 46 B"那个具体字节数**不是契约**：它在 Docker 29.6.2 + Compose
+# v5.3.1 上复现不出来（pty 确实分配，但字节流干净、sha 相同，见
+# shots/docker-real/P3-REAL-REVERIFY.md §5）。桩里构造的是"最坏形态"，要验的是
+# **一旦被污染能否抓到**，不是"一定会多 2 字节"。
 # 现在归档前后各比一次"容器侧哈希 vs 归档字节哈希"，下面四条把它钉死：
 #   1) 正常（带 `-T`）：两份证据一致 → 绿；
 #   2) 内容被 pty 污染（确定性注入）：哈希对不上 → exit 4、不留坏密钥；
@@ -941,6 +968,100 @@ def test_broken_compose_file_fails_fast_with_exit_two(
     assert list(run.out.glob("manifest-*.txt")) == []
     assert list(run.out.glob("media-*.tar")) == []
     assert run.leftovers() == []
+
+
+def test_compose_config_precheck_runs_after_outdir_creation(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """**记录真机事实**：compose 前置校验发生在 `mkdir`/拿锁**之后**，不是之前。
+
+    backup.sh 的真实顺序是 `mkdir -p "$OUT_DIR"`(L725) → `acquire_lock`(L726) →
+    `config -q`(L767)。所以坏 compose 文件虽然**正确 exit 2**、也确实没导出任何产物，
+    但**目标目录已经被建出来了**（真机实测：`OUT_DIR=/tmp/never-used-dir` 跑完确实出现）。
+
+    这条用例**不是**在要求改代码：空目录的后果很轻，而把校验提到 `mkdir` 之前会牵动
+    锁语义（"先建目录再拿锁"是为了让 `.backup.lock` 有落点）。这里只是把现状**显式
+    锁住**——以后谁调了这三步的顺序（无论往前挪还是往后挪），这条都会红，改的人必须
+    解释清楚，而不是在无人察觉时改变磁盘副作用。
+
+    旧用例抓不到这个盲区的三处原因，这条逐条补上：
+      1. `_run_backup()` 自己先 `out.mkdir()` → 改用不建目录的 `_run_backup_in`；
+      2. `leftovers()` 只列**隐藏**文件，非隐藏的空目录不算 leftover → 这里直接断言
+         `iterdir()` 为空，而不是只看隐藏项；
+      3. `test_broken_compose_file_fails_fast_with_exit_two` 只断言 rc/文案/无产物，
+         **没有**断言目录状态 → 这里补上"目录存在"这条真机事实。
+    """
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    out = tmp_path / "never-used-dir"
+    # 前置条件：目录必须**一开始不存在**，否则"是脚本建的吗"根本无从判断。
+    assert not out.exists()
+
+    # 一份**真的** YAML 语法坏掉的 compose 文件（不是靠 `COMPOSE_CONFIG_EXIT` 注入：
+    # 下面这个 docker 替身会真的用 PyYAML 解析它，失败原因就是文件内容本身）。
+    broken = tmp_path / "broken-compose.yaml"
+    broken.write_text(
+        "services:\n  db:\n    image: postgres:16\n   bad: [unclosed\n", encoding="utf-8"
+    )
+    fake = tmp_path / "bin" / "docker"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        'printf \'docker %s\\n\' "$*" >> "${DOCKER_CALLS:?}"\n'
+        '[ "${1:-}" = "compose" ] || { echo "fake-docker: 只支持 compose" >&2; exit 90; }\n'
+        "shift\n"
+        'FILE=""\nPROJ=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -f) FILE="$2"; shift 2 ;;\n'
+        '    -p) PROJ="$2"; shift 2 ;;\n'
+        '    config) shift; break ;;\n'
+        '    *) echo "fake-docker: 未声明的 compose 参数 $1" >&2; exit 90 ;;\n'
+        "  esac\n"
+        "done\n"
+        '[ -n "$PROJ" ] || { echo "fake-docker: 必须带 -p" >&2; exit 90; }\n'
+        '[ "${1:-}" = "-q" ] || { echo "fake-docker: config 必须带 -q" >&2; exit 90; }\n'
+        "exec '__PYTHON__' -c 'import sys\n"
+        "try:\n"
+        "    import yaml\n"
+        "except ImportError:\n"
+        "    sys.stderr.write(\"fake-docker: PyYAML 不可用\\\\n\"); sys.exit(87)\n"
+        "try:\n"
+        "    yaml.safe_load(open(sys.argv[1], encoding=\"utf-8\"))\n"
+        "except Exception as exc:\n"
+        "    sys.stderr.write(\"yaml: \" + str(exc).splitlines()[0] + \"\\\\n\"); sys.exit(1)\n"
+        "sys.exit(0)' \"$FILE\"\n"
+        # 替身自己自证：文件内容确实解析不了（否则后面断言 rc==2 就失去意义）。
+        .replace("__PYTHON__", sys.executable),
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    run = _run_backup_in(out, env, LING_COMPOSE_FILE=str(broken))
+
+    # 退出码契约不变：坏 compose → 2（配置错误），不是 3。
+    assert run.proc.returncode == 2, run.outputs()
+    assert "compose 配置校验失败" in run.proc.stderr, run.proc.stderr
+    # 校验真的读到了坏文件（而不是因为别的原因失败）。
+    assert "yaml:" in run.proc.stderr, run.proc.stderr
+    # 只调用了那一条 config，没有 exec —— 校验确实拦在导出之前。
+    calls = run.calls("DOCKER_CALLS")
+    assert len(calls) == 1, calls
+    assert "config -q" in calls[0], calls
+
+    # ★ 真机事实：校验发生在 mkdir **之后** → 目录已经被脚本建出来了。
+    assert out.is_dir(), "OUT_DIR 没有被创建：backup.sh 的执行顺序变了？"
+    # 但校验确实拦住了导出：dump / manifest / media 一个都没有。
+    assert list(out.glob("*.dump")) == []
+    assert list(out.glob("manifest-*.txt")) == []
+    assert list(out.glob("media-*.tar")) == []
+    assert list(out.glob("tombstones-*.txt")) == []
+    # 锁已被 EXIT trap 释放：目录是**空的**（这里按"非隐藏 + 隐藏"全量断言，
+    # 不看 `leftovers()` 的隐藏文件口径——那正是旧用例漏掉空目录的原因）。
+    assert not (out / ".backup.lock").exists(), "失败路径留下了备份锁"
+    assert sorted(p.name for p in out.iterdir()) == [], sorted(
+        p.name for p in out.iterdir()
+    )
 
 
 def test_missing_compose_file_is_named_in_the_error(
