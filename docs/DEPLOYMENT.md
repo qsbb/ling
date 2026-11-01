@@ -558,7 +558,7 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - 自助更新/升级执行器在**真实 Docker** 上的完整演练（备份、构建、切换、失败恢复）
 - 备份链路的**新增**检查在真机上跑通：`docker compose exec` 的退出码透传、
   `tar -cf -` 的 stdout 字节干净性、大媒体卷耗时、并发上传时的 `media_state=partial`、
-  以及媒体/密钥临时文件"创建即 0600"在**真实分钟级流式传输**下的全程观测
+  以及媒体/密钥临时文件"创建时 group/other 位全 0"在**真实分钟级流式传输**下的全程观测
   （本地测试用的是真实文件系统 + 严格 fake 的 docker/tar，不是真实容器）
 - 升级失败后的数据库回滚（执行器只保留备份并转人工，不自动回滚）
 
@@ -950,10 +950,17 @@ LING_COMPOSE_FILE=$(pwd)/deploy/compose.yaml \
 deploy/backup/backup.sh /mnt/backup/ling
 ```
 
-`LING_COMPOSE_PROJECT` 不能省：`docker compose -f 路径` 会按**文件所在目录名**
-推导项目名（这里是 `deploy`），而 `install.sh` 默认用 `-p ling`；名字不一致时
-`exec` 找不到正在运行的容器，备份会失败。用 `--project` 改过项目名的话，
-这里填那个名字。
+`LING_COMPOSE_PROJECT` 不能省，两条独立理由：
+
+1. `docker compose -f 路径` 会按**文件所在目录名**推导项目名（这里是 `deploy`），
+   而 `install.sh` 默认用 `-p ling`；名字不一致时 `exec` 找不到正在运行的容器。
+2. **Compose v5 的 `exec` 根本不看 `-f`**（真机实测：`-f /nonexistent.yaml` 仍
+   返回 0 并照常执行）。它按 project + service 的 label 找容器，所以对备份/恢复
+   的 `exec` 而言 **`-p` 是唯一承重的参数**，`-f` 只对 `up`/`config` 有意义。
+   `backup.sh` 在 compose 模式下会先跑一次 `docker compose config -q` 做静态
+   校验（坏文件 → exit 2），因为 `exec` 阶段发现不了 compose 文件的问题。
+
+用 `--project` 改过项目名的话，这里填那个名字。
 
 产物五件：`ling-YYYYmmdd-HHMMSS.dump`、`manifest-YYYYmmdd-HHMMSS.txt`、
 `tombstones-YYYYmmdd-HHMMSS.txt`（**无撤回记录时是 0 字节，这是合法产物**）、

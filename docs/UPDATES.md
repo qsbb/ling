@@ -466,7 +466,7 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
    `--project-name` 同源，不写死 `ling`）；用 `--project` 改过项目名时，安装定时
    任务前显式 `export LING_COMPOSE_PROJECT=<那个名字>`。项目名为什么不能省见
    [DEPLOYMENT.md §8.1](DEPLOYMENT.md#81-定时备份)（`-f 路径` 会按目录名推出
-   `deploy`）。装完仍要 `crontab -l | grep backup.sh` 核对那一行确实带着
+   `deploy`；另外 Compose v5 的 `exec` 不看 `-f`，`-p` 才是承重参数）。装完仍要 `crontab -l | grep backup.sh` 核对那一行确实带着
    `LING_COMPOSE_PROJECT`，并 `tail -f /mnt/backup/ling/backup.log` 看第一次真
    产出了 dump——**“已安装每日备份”不等于“备出来了”**。
 2. 在宿主机取到目标版本源码（`git fetch` 后切到对应 tag/commit，或解压归档）。

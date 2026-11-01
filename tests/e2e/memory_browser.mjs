@@ -102,6 +102,7 @@ console.log(
 // node_modules → 直连 import('playwright')。原来这里只有第一步，取不到就直接
 // exit 2，即使调用方在别处装过 playwright 也用不上。
 const { chromium, origin: PLAYWRIGHT_ORIGIN } = await loadChromium();
+console.log(`Playwright：${PLAYWRIGHT_ORIGIN}`);
 const EXECUTABLE = process.env.CHROME_PATH || undefined;
 
 /* --------------------------------------------------------------- 小工具 */
