@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, api } from './api';
 import {
   MANUAL_BLOCK_TEXT,
+  backupWarnings,
   buildUpdateRequest,
+  describeBackupWarnings,
   describeJob,
   describeRelease,
   describeStage,
@@ -103,8 +105,46 @@ describe('about route', () => {
     expect(routePath({ name: 'about' })).toBe('/settings/about');
   });
 
-  it('不会把未知设置子路径误判成 about', () => {
-    expect(parseRoute('/settings/about-extra')).toEqual({ name: 'chat', sessionId: null });
+  it('未知设置子路径落到 notFound，不再静默回聊天页（契约修正）', () => {
+    // HEAD 曾把这里锁成 `{ name: 'chat', sessionId: null }`：那等于把
+    // 「拼错的设置子路径静默显示聊天页」写成了契约，正是这次要修掉的行为。
+    const route = parseRoute('/settings/about-extra');
+    expect(route).toEqual({ name: 'notFound' });
+    // 未知路径不得冒充聊天路由；「不渲染聊天页指纹（CHAT_MARKERS）」在渲染层
+    // 已由 dashboard.test.ts 的「URL 层的未知路径渲染 unknown-route，不含聊天
+    // 输入框指纹（M1 阻断项）」覆盖，这里只锁路由契约，不重复造渲染用例。
+    expect(route.name).not.toBe('chat');
+    // 兜底也不能反过来生成可导航 URL：生成得了，就说明有人能把错误悄悄导回聊天页。
+    expect(() => routePath(route)).toThrow(/notFound/);
+  });
+});
+
+/**
+ * `parseRoute` 的边界输入。
+ *
+ * 已由 dashboard.test.ts 覆盖的（`/s/` 空 id、`/dashboard/`、`/s/a%2Fb`）不重复；
+ * 这里只补剩余未覆盖的归一化与解码分支。路由测试本该独立成文件，本轮写作用域
+ * 限定在 about.test.ts，故暂放此处（见报告）。
+ */
+describe('parseRoute 边界', () => {
+  it('/settings/ 尾巴上的斜杠归一化为设置页', () => {
+    expect(parseRoute('/settings/')).toEqual({ name: 'settings' });
+    expect(parseRoute('/settings//')).toEqual({ name: 'settings' });
+  });
+
+  it('重复斜杠被归一化：// 等同根路径，/dashboard/// 等同总览', () => {
+    // 既有语义是「先剥掉尾部所有斜杠，剥空按 / 处理」，所以 '//' 是根路径的
+    // 等价写法（聊天首页），不是未知路径；/dashboard/// 也仍是总览。
+    expect(parseRoute('//')).toEqual({ name: 'chat', sessionId: null });
+    expect(parseRoute('/dashboard///')).toEqual({ name: 'dashboard' });
+  });
+
+  it('/s/%E0%A4%A：decodeURIComponent 抛错时保持既有回退语义', () => {
+    // 先证明该输入确实会走到 catch 分支，避免用例将来变成空断言。
+    expect(() => decodeURIComponent('%E0%A4%A')).toThrow(URIError);
+    // 既有回退：解码失败时把原始片段原样当 sessionId（深链仍指向聊天），
+    // 不抛到渲染层，也不因解码异常把地址误判成未知页。
+    expect(parseRoute('/s/%E0%A4%A')).toEqual({ name: 'chat', sessionId: '%E0%A4%A' });
   });
 });
 
@@ -687,6 +727,56 @@ describe('describeJob', () => {
     expect(view.detail).toContain('adopt-current');
     expect(view.detail).toContain('不会自动回滚');
     expect(view.detail).toContain('数据库也不会自动恢复');
+  });
+});
+
+describe('备份告警（backup_warnings）', () => {
+  const PARTIAL =
+    'manifest: media_state=partial（media.tar.zst 归档时有文件正在写入，可能漏掉刚上传的媒体）';
+
+  it('升级成功但带告警时给出显著提示与后果', () => {
+    const note = describeBackupWarnings({
+      ...JOB,
+      state: 'succeeded',
+      stage: 'complete',
+      backup_warnings: [PARTIAL],
+    });
+    expect(note).not.toBeNull();
+    expect(note?.title).toContain('升级成功');
+    expect(note?.title).toContain('备份不完整');
+    // 必须说清后果：媒体可能漏文件 → 恢复时要人工核对 → 细节在 verify-warnings.txt
+    expect(note?.detail).toContain('媒体归档可能漏文件');
+    expect(note?.detail).toContain('恢复时需人工核对');
+    expect(note?.detail).toContain('verify-warnings.txt');
+    expect(note?.items).toEqual([PARTIAL]);
+  });
+
+  it('没有告警（字段缺失/空数组）时不显示任何东西', () => {
+    expect(backupWarnings(JOB)).toEqual([]);
+    expect(backupWarnings(null)).toEqual([]);
+    expect(describeBackupWarnings(JOB)).toBeNull();
+    expect(describeBackupWarnings({ ...JOB, backup_warnings: [] })).toBeNull();
+  });
+
+  it('未知的多余字段与坏条目不会让页面炸掉', () => {
+    const messy = {
+      ...JOB,
+      state: 'succeeded',
+      stage: 'complete',
+      future_field: { nested: true },
+      backup_warnings: ['  ' + PARTIAL + '  ', 5, null, { a: 1 }, ''],
+    } as unknown as UpdateJob;
+    expect(backupWarnings(messy)).toEqual([PARTIAL]);
+    expect(describeBackupWarnings(messy)?.items).toEqual([PARTIAL]);
+
+    const notAnArray = { ...JOB, backup_warnings: 'oops' } as unknown as UpdateJob;
+    expect(backupWarnings(notAnArray)).toEqual([]);
+    expect(describeBackupWarnings(notAnArray)).toBeNull();
+  });
+
+  it('告警条数有上限，多余的不再展示', () => {
+    const many = Array.from({ length: 12 }, (_, index) => `note-${index}`);
+    expect(backupWarnings({ ...JOB, backup_warnings: many })).toHaveLength(8);
   });
 });
 

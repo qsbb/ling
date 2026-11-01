@@ -12,6 +12,8 @@ import { PolicyForm, type PolicyField } from './PolicyForm';
 
 interface LifePageProps {
   onBack: () => void;
+  /** 返回按钮的文字（默认沿用 PolicyForm 的「返回设置」，宿主会传更准确的那句）。 */
+  backLabel?: string;
 }
 
 const FIELDS: PolicyField[] = [
@@ -57,7 +59,7 @@ const FIELDS: PolicyField[] = [
   },
 ];
 
-export function LifePage({ onBack }: LifePageProps) {
+export function LifePage({ onBack, backLabel }: LifePageProps) {
   return (
     <PolicyForm
       title="生活与活动"
@@ -65,6 +67,7 @@ export function LifePage({ onBack }: LifePageProps) {
       fields={FIELDS}
       section="life"
       onBack={onBack}
+      {...(backLabel ? { backLabel } : {})}
     />
   );
 }

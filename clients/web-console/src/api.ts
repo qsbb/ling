@@ -38,6 +38,10 @@ import type {
   UpdateJob,
   UpdateStatus,
   UpdateRequest,
+  CoreMemoryInput,
+  CoreMemoryListResponse,
+  MemoryInclude,
+  MemoryListResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -361,6 +365,56 @@ export const api = {
       headers: { 'Content-Type': 'application/json', 'X-Ling-Update': '1' },
       body: JSON.stringify(body),
     });
+  },
+
+  /* ------------------------------------------------------------ 记忆
+   *
+   * 只调用 docs/API-WEB-V1.md §10 冻结的 8 个端点。刻意**没有**：
+   * 单条详情（GET /v1/memory/{id} 不存在）、分页（没有 offset/cursor）、
+   * memory_episodes / 实体 / 向量 / 检索日志的读取端点。
+   */
+
+  /** 记忆列表。`include` 不传 = 只看现行记忆（未撤回且未归档）。 */
+  listMemories(options: { limit?: number; include?: MemoryInclude | null } = {}): Promise<MemoryListResponse> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
+    if (options.include) query.set('include', options.include);
+    return request<MemoryListResponse>(`/v1/memory?${query.toString()}`);
+  },
+
+  /** 撤回一条记忆：必填理由；重复撤回幂等。 */
+  retractMemory(memoryId: string, reason: string): Promise<{ memory_id: string; retracted: boolean }> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/retract`, jsonInit('POST', { reason }));
+  },
+
+  /** 纠正（supersede）：旧行被置撤回并指向新行，新行 `supersedes` 旧 id。 */
+  supersedeMemory(
+    memoryId: string,
+    text: string,
+    reason = '用户纠正',
+  ): Promise<{ memory_id: string; supersedes: string }> {
+    return request(
+      `/v1/memory/${encodeURIComponent(memoryId)}/supersede`,
+      jsonInit('POST', { text, reason }),
+    );
+  },
+
+  /** 遗忘全部：软清除当前 subject，返回四类受影响行数之和。没有恢复接口。 */
+  forgetAllMemories(): Promise<{ retracted: number }> {
+    return request('/v1/memory/forget', { method: 'POST' });
+  },
+
+  listCoreMemory(): Promise<CoreMemoryListResponse> {
+    return request<CoreMemoryListResponse>('/v1/core-memory');
+  },
+
+  /** 同 label 覆盖（并重新激活），不是新增第二条。 */
+  upsertCoreMemory(body: CoreMemoryInput): Promise<{ core_id: string; label: string; text: string }> {
+    return request('/v1/core-memory', jsonInit('PUT', body));
+  },
+
+  /** 软删除：active=false，数据仍在库里。 */
+  deleteCoreMemory(coreId: string): Promise<{ core_id: string; active: boolean }> {
+    return request(`/v1/core-memory/${encodeURIComponent(coreId)}`, { method: 'DELETE' });
   },
 
   /* ------------------------------------------------------------ 角色 */

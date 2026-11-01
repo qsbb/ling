@@ -128,6 +128,75 @@ export interface MemoryPolicy {
   max_retention_days: number;
 }
 
+/* ------------------------------------------------------------ 记忆内容页 */
+
+/** 契约里 `kind` 是 episode / assertion / procedure 三选一（`contracts/v1`）。 */
+export type MemoryKind = 'episode' | 'assertion' | 'procedure';
+
+/** `GET /v1/memory` 的 include 取值；不传（null）= 只看现行记忆。 */
+export type MemoryInclude = 'retracted' | 'archived' | 'all';
+
+/**
+ * 一条长期记忆（docs/API-WEB-V1.md §10.1 的完整形状）。
+ *
+ * **没有单条详情端点**：详情只能从列表里这一份数据渲染，别再造一个
+ * `GET /v1/memory/{id}` 的假设。
+ */
+export interface MemoryRecord {
+  memory_id: string;
+  kind: string;
+  text: string;
+  origin: string;
+  visibility: string;
+  confidence: number;
+  retracted: boolean;
+  retract_reason: string | null;
+  supersedes: string | null;
+  superseded_by: string | null;
+  source_event_ids: string[];
+  valid_until: string | null;
+  created_at: string | null;
+  archived_at: string | null;
+}
+
+export interface MemoryListResponse {
+  memories: MemoryRecord[];
+  /** 单次返回上限（1..200，默认 50）。**没有分页**：没有 offset / cursor。 */
+  limit: number;
+  /** 当前 include 口径下的总行数（不受 limit 截断）。 */
+  total: number;
+  /** `total > memories.length`：limit 把结果截掉了。 */
+  has_more: boolean;
+  /** 回显请求里的原始值；默认不传时为 null。 */
+  include: string | null;
+  note?: string;
+}
+
+export interface CoreMemoryItem {
+  core_id: string;
+  label: string;
+  text: string;
+  priority: number;
+  scope: string;
+  origin_kind: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CoreMemoryListResponse {
+  items: CoreMemoryItem[];
+  /** 每 subject 上限（后端回显 20）。 */
+  limit: number;
+  note?: string;
+}
+
+export interface CoreMemoryInput {
+  label: string;
+  text: string;
+  priority: number;
+  scope: 'private' | 'group' | 'global';
+}
+
 export interface LifePolicy {
   scene_ttl_minutes: number;
   energy_decay_per_hour: number;
@@ -341,7 +410,11 @@ export interface ActivityRecord {
   kind: string;
   state: string;
   origin: string;
-  note: string | null;
+  /**
+   * 后端 `_activity_dict()` 目前**不返回** note（`ActivityView` 也没有这个字段），
+   * 所以标成可选：前端一律按「可能没有」渲染，不能假定它存在。
+   */
+  note?: string | null;
   started_at: string | null;
   ended_at: string | null;
   completion_evidence: string | null;
@@ -528,6 +601,11 @@ export interface UpdateJob {
   updated_at: string;
   error_code: string | null;
   message: string | null;
+  /**
+   * 备份告警（可选，协议仍是 v1）：执行器把 `verify-warnings.txt` 里的告警同时
+   * 写进任务视图。旧执行器不写这个键，前端必须按“没有告警”处理。
+   */
+  backup_warnings?: string[];
 }
 
 export interface UpdateExecutor {

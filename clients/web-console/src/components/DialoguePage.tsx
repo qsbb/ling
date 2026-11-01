@@ -9,6 +9,11 @@ import { PolicyForm, type PolicyField } from './PolicyForm';
 
 interface DialoguePageProps {
   onBack: () => void;
+  /**
+   * 返回按钮的文字。默认「返回设置」是 PolicyForm 的历史默认值；Step 4 之后
+   * 本页挂在 `/persona?tab=dialogue` 里，宿主会传「返回角色设定」。
+   */
+  backLabel?: string;
 }
 
 const FIELDS: PolicyField[] = [
@@ -66,7 +71,7 @@ const FIELDS: PolicyField[] = [
   },
 ];
 
-export function DialoguePage({ onBack }: DialoguePageProps) {
+export function DialoguePage({ onBack, backLabel }: DialoguePageProps) {
   return (
     <PolicyForm
       title="对话与主动性"
@@ -74,6 +79,7 @@ export function DialoguePage({ onBack }: DialoguePageProps) {
       fields={FIELDS}
       section="dialogue"
       onBack={onBack}
+      {...(backLabel ? { backLabel } : {})}
     />
   );
 }

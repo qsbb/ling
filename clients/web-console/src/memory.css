@@ -1,0 +1,1055 @@
+/*
+ * 记忆内容页（/memory）的样式。
+ *
+ * 为什么单独一个文件：`styles.css` 由并行任务在改，这里只覆写/新增记忆页
+ * 需要的规则，类名统一 `mem-` 前缀（`mem-section` 这类外壳沿用 `panel`），
+ * 不碰其它页面。
+ *
+ * 三条硬约束：
+ * 1. 375px 单列、无横向溢出——所有文本容器 `min-width: 0` + `overflow-wrap: anywhere`，
+ *    输入控件 `max-width: 100%`。
+ * 2. 触控 ≥ 44×44（仅窄屏；桌面保留紧凑字号）。
+ * 3. 危险操作不能只靠颜色区分——危险块同时有图标、文字标题、「不可撤销」文案与虚线边框。
+ */
+
+/*
+ * 中文段落的末行孤字（只剩 2–3 字）在 375 / 320 特别刺眼。
+ * `text-wrap: pretty` 让浏览器在换行时照顾末行（Chrome 117+）；不支持的老浏览器
+ * 会忽略这条声明，退回默认换行，不影响布局。只作用于段落/列表项：按钮 / tab /
+ * 标题本来就较短或 nowrap，不受影响。
+ */
+.page.mem p,
+.page.mem li {
+  text-wrap: pretty;
+}
+
+/*
+ * 实测（Chromium headless 1223）：`pretty` 只保证不出现「单字」末行，中文里
+ * 2–3 字的末行仍会出现——页脚「数据。」、320 诚实边界「200 条。」、调参
+ * 「生效。」、320 记忆正文「很大」。这几处都是短段落/短条目，改用 `balance`
+ * 把各行拉平才真正消掉；浏览器不支持或段落超过 balance 的行数上限时会退回
+ * 默认换行（不会比默认更差；未列入本规则的段落仍由上面的 pretty 照顾）。
+ */
+.page.mem .mem__boundary,
+.page.mem .mem-filters__note,
+.page.mem .mem-foot,
+.page.mem .mem-policy-status p,
+.page.mem .mem-policy-status li,
+.page.mem .mem-item__text {
+  text-wrap: balance;
+}
+
+
+.mem__head {
+  max-width: 980px;
+}
+
+.mem__boundary {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  padding: 8px 10px;
+  border-left: 2px solid var(--line-strong);
+  background: rgba(0, 0, 0, 0.015);
+  border-radius: 0 8px 8px 0;
+  max-width: 760px;
+}
+
+/* ------------------------------------------------------------------ tab */
+
+.mem-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-raised);
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.mem-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  padding: 7px 14px;
+  border-radius: 9px;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.mem-tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--ink);
+}
+
+.mem-tab--active {
+  background: var(--paper);
+  border-color: var(--line-strong);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------- 内容区骨架 */
+
+.mem-content,
+.mem-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/*
+ * PolicyForm 自带 `.page` 外壳（左右内边距按 980px 居中算）。嵌在记忆页里
+ * 时那一层会再缩进一次、还会带一个内层滚动条，所以在这里抹掉外壳的布局，
+ * 只保留它的标题/表单/错误提示。
+ */
+.mem-settings > .page {
+  padding: 0;
+  overflow: visible;
+  flex: none;
+}
+
+.mem-section {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mem-section h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.mem-section .panel__note {
+  margin: 0;
+}
+
+.mem-foot {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* --------------------------------------------------------------- 核心记忆 */
+
+.mem-core-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-core-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.mem-core-item__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.mem-core-item__label {
+  font-weight: 600;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+
+.mem-core-item__meta,
+.mem-core-item__time {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.mem-core-item__text {
+  margin: 6px 0 4px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.mem-core-item__time {
+  margin: 0;
+}
+
+.mem-core-item__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mem-core-form {
+  border-top: 1px dashed var(--line-strong);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mem-core-form__title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-core-form__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+/* --------------------------------------------------------------- 表单控件 */
+
+.mem-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.mem-field--wide {
+  grid-column: 1 / -1;
+}
+
+.mem-field input,
+.mem-field textarea,
+.mem-field select {
+  width: 100%;
+  max-width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.mem-field textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.mem-field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.mem-field--inline select {
+  width: auto;
+  min-width: 96px;
+}
+
+.mem-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mem-action {
+  min-height: 34px;
+}
+
+/* 危险按钮：颜色之外还有边框与文字，不只靠红色区分。 */
+.mem-action--danger {
+  border-color: #d8b4ac;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.mem-action--danger:hover:not(:disabled) {
+  background: #f1d9d3;
+}
+
+/* --------------------------------------------------------------- 筛选区 */
+
+.mem-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.mem-filters__group {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  min-width: 0;
+}
+
+.mem-filters__group legend {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  padding: 0;
+  margin-bottom: 4px;
+  width: 100%;
+}
+
+.mem-filters__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+
+.mem-filters__note {
+  margin: 0;
+  width: 100%;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.mem-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  min-height: 32px;
+  cursor: pointer;
+}
+
+.mem-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.mem-check--strong {
+  font-size: 13px;
+  color: var(--ink);
+  font-weight: 600;
+  min-height: 36px;
+}
+
+/* --------------------------------------------------------------- 列表 */
+
+.mem-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.mem-group {
+  min-width: 0;
+}
+
+.mem-group__title {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.mem-group__count {
+  font-weight: 400;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.mem-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--paper-raised);
+  min-width: 0;
+}
+
+/* 墓碑：虚线边框 + 降低不透明度，形状上就能和现行记忆分开（不只靠颜色）。 */
+.mem-item--tombstone {
+  border-style: dashed;
+  background: var(--paper);
+}
+
+.mem-item__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mem-item__text {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.mem-item__readonly {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  border: 1px dashed var(--line-strong);
+  border-radius: 6px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+.mem-item__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+}
+
+.mem-item__meta {
+  margin: 6px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.mem-item__relative {
+  color: var(--ink-faint);
+}
+
+.mem-item__kind {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.mem-item__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.mem-item__badges:empty {
+  display: none;
+}
+
+.mem-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--ink-soft);
+  background: var(--paper);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.mem-badge--tombstone {
+  border-color: #cbbfa8;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.mem-badge--superseded {
+  border-color: #c7cbb6;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.mem-badge--archived {
+  border-style: dashed;
+  color: var(--ink-soft);
+}
+
+.mem-badge--warn {
+  border-color: #e0c48d;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* --------------------------------------------------------------- 详情 */
+
+.mem-item__detail {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.mem-item__detail summary {
+  cursor: pointer;
+  color: var(--ink-faint);
+  padding: 4px 0;
+  font-size: 11.5px;
+}
+
+.mem-item__detail summary:hover {
+  color: var(--ink);
+}
+
+.mem-detail {
+  margin: 4px 0 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 12px;
+  font-size: 11.5px;
+}
+
+.mem-detail > div {
+  display: contents;
+}
+
+.mem-detail dt {
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.mem-detail dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* --------------------------------------------------------------- 确认/错误 */
+
+.mem-confirm {
+  margin-top: 10px;
+  border: 1px dashed #d8b4ac;
+  border-radius: 9px;
+  background: var(--danger-soft);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mem-confirm--item {
+  margin-top: 8px;
+}
+
+.mem-confirm__title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--danger);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mem-confirm__body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.mem-confirm__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mem-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #eccfc8;
+  border-left: 3px solid var(--danger);
+  border-radius: 9px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  min-width: 0;
+}
+
+.mem-error > svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.mem-error > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.mem-error strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.mem-error p {
+  margin: 3px 0 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * 「设置 → 账号」是账号闸 403 里唯一的可点入口。整段保持 nowrap，
+ * 避免在窄屏把「设置 →」和「账号」拆到两行、看起来像两个词。
+ */
+.mem-error__link {
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+}
+
+.mem-error__link:hover {
+  color: var(--danger);
+}
+
+/*
+ * 触控：inline 链接的行高只有约 19px，窄屏上点不中。用 padding + 负 margin
+ * 把可点区域撑到 ≥44×44，同时不改变行高（不会把整段说明顶开）。403 错误块里
+ * 没有别的控件，放大的命中区不会抢走其它点击目标。
+ */
+@media (max-width: 640px) {
+  .mem-error__link {
+    display: inline-block;
+    padding: 13px 4px;
+    margin: -13px 0;
+  }
+}
+
+.mem-error--inline {
+  background: var(--paper-raised);
+  border-left-color: var(--danger);
+}
+
+.mem-error__trace,
+.mem-error__scope {
+  font-size: 11.5px;
+}
+
+.mem-error__scope {
+  color: var(--ink-faint);
+}
+
+.mem-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-faint);
+  font-size: 13px;
+  min-height: 36px;
+}
+
+.mem-empty {
+  margin: 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 9px;
+  padding: 10px 12px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.mem-empty p {
+  margin: 0;
+}
+
+.mem-empty p + p {
+  margin-top: 4px;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.mem-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.mem-note--warn {
+  border-left: 2px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  padding: 8px 10px;
+  border-radius: 0 8px 8px 0;
+}
+
+/* --------------------------------------------------------------- 危险区 */
+
+.mem-danger {
+  border: 1px dashed var(--danger);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: rgba(157, 69, 58, 0.045);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mem-danger__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--danger);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-danger__body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.mem-danger__irreversible {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  font-weight: 600;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.mem-danger__start {
+  align-self: flex-start;
+}
+
+.mem-danger__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--line-strong);
+  padding-top: 8px;
+}
+
+.mem-danger__list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.8;
+  color: var(--ink-soft);
+}
+
+.mem-danger__result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--line-strong);
+  padding-top: 8px;
+}
+
+.mem-danger__count {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.mem-danger__count strong {
+  font-size: 18px;
+  color: var(--danger);
+  padding: 0 4px;
+}
+
+.mem-danger__confirm-button {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fdf6f2;
+}
+
+.mem-danger__confirm-button:hover:not(:disabled) {
+  background: #8b3a30;
+}
+
+/* --------------------------------------------------------------- 调参 tab */
+
+.mem-policy-status {
+  border: 1px solid #e0c48d;
+  border-left: 3px solid var(--warn);
+  border-radius: 10px;
+  background: var(--warn-soft);
+  padding: 12px 14px;
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.75;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mem-policy-status p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.mem-policy-status__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.mem-policy-status__list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink-soft);
+}
+
+.mem-policy-status__list code {
+  font-size: 11.5px;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.mem-policy-status__foot {
+  color: var(--ink-soft);
+  font-size: 11.5px;
+}
+
+.mem-policy-status code {
+  overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------------- 窄屏 */
+
+@media (max-width: 640px) {
+  .mem-tabs {
+    align-self: stretch;
+  }
+
+  .mem-tab {
+    flex: 1 1 0;
+    min-height: 44px;
+    padding-left: 8px;
+    padding-right: 8px;
+    white-space: normal;
+  }
+
+  /*
+   * 触控目标 ≥44×44（F7 硬约束）。
+   *
+   * 这里覆盖**页面上每一个**可交互元素，而不只是行内操作按钮：
+   * `summary`（详情）、`.ghost-button`（重新读取全部 / 关闭）、表单
+   * input/select/textarea（核心表单 + 筛选）、所有 button，以及
+   * `.mem-check` 这种把原生小复选框包起来的 label（可点击区域 = label）。
+   * 用 min-height / min-width / padding 撑开，不用 transform: scale 之类的
+   * 视觉缩放（那只会让点击区域与视觉尺寸对不上）。
+   *
+   * 桌面（>640px）不进入这个媒体查询，布局与字号保持原样。
+   */
+  .mem button,
+  .mem summary,
+  .mem .mem-check,
+  .mem .mem-check--strong {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* 文字型幽灵按钮（「重新读取全部」「关闭」）：只加 min-* 仍可能只有 40 宽。 */
+  .mem .ghost-button {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 12px;
+  }
+
+  /* 表单控件（含行内筛选的 select）：44 高，靠 padding 撑，不缩字号。 */
+  .mem-field input:not([type='checkbox']):not([type='radio']),
+  .mem-field select,
+  .mem-field textarea,
+  .mem-settings .memory-form__input {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .mem-settings .back-link {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 8px;
+  }
+
+  .mem-check input {
+    width: 20px;
+    height: 20px;
+  }
+
+  /*
+   * <summary> 只有 4px 内边距时高度约 26px。改成 flex 居中 + 44 最小高度，
+   * 并补一个 ▸/▾ 指示符（flex 会吃掉浏览器默认的 disclosure marker，
+   * 没有指示符就看不出「详情」可展开）。
+   */
+  .mem-item__detail summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 0;
+    line-height: 1.5;
+  }
+
+  .mem-item__detail summary::before {
+    content: '▸';
+    flex: none;
+    font-size: 10px;
+    color: var(--ink-faint);
+  }
+
+  .mem-item__detail[open] > summary::before {
+    content: '▾';
+  }
+
+  .mem-core-form__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mem-filters__row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .mem-field--inline {
+    justify-content: space-between;
+    white-space: normal;
+  }
+
+  .mem-field--inline select {
+    min-width: 120px;
+  }
+
+  .mem-item__head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .mem-item__actions {
+    flex-wrap: wrap;
+  }
+
+  .mem-item__actions .button {
+    flex: 1 1 45%;
+  }
+
+  .mem-confirm__actions .button,
+  .mem-form-actions .button {
+    flex: 1 1 45%;
+  }
+
+  .mem-detail {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .mem-detail dd {
+    margin: 0 0 4px;
+  }
+
+  .mem-danger__start {
+    align-self: stretch;
+  }
+}
+
+/*
+ * 320px 档：两个 tab 并排时「记忆与学习（调参）」会被挤成孤字换行
+ * （第二行只剩「参）」），违反「不出现 2–3 字换行」的视觉硬规则。
+ * 这里改成整行堆叠：每个 tab 独占一行，文字保持一行。
+ */
+@media (max-width: 360px) {
+  .mem-tab {
+    flex: 1 1 100%;
+  }
+
+  /*
+   * 320 档的可读宽度：2026-11 复核实测，98 字长正文在这里排成 7 行，末行只剩
+   * 「人。」（1 汉字）。根因不是字号，而是 `text-wrap: balance` 在 Chromium 有
+   * 行数上限（约 6 行），超过就**整段跳过**、退回默认换行，尾行长度不再受控。
+   *
+   * 用布局手段把正文重新塞回 balance 的处理范围：收窄记忆页卡片的横向内边距
+   * （面板 18→14、条目 12→10），再把正文从 13.5px 微调到 13px（见下一条规则），
+   * 正文可读宽度从约 228px 提到约 240px、每行约 18 个汉字。98 字因此从 7 行
+   * 降到 6 行，balance 重新生效，各行被拉平。
+   *
+   * 不截断、不加省略号、不隐藏文字：正文仍然完整可读。375 及更宽不进入这个
+   * 媒体查询（那边本来就在 balance 的行数上限内），布局与字号保持原样。
+   *
+   * 极限（见 TASK123 报告）：这只能覆盖「≤ 6 行」的段落——320 下约 ≤108 字，
+   * 375 下约 ≤120 字。更长的正文仍会被 balance 跳过；在禁止截断/省略的前提下，
+   * 纯 CSS 布局无法保证任意长度的末行都 ≥4 字。
+   */
+  .page.mem .panel {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .page.mem .mem-item {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  /*
+   * 正文再微调半个字号（13.5 → 13px）：配合上面的内边距，320 下每行约 18 个
+   * 汉字，98 字稳定排成 6 行；即使外壳把可用宽度再挤掉约 19px（240 → 221），
+   * 每行还有 17 字、98 字仍是 6 行，不会掉回 7 行。行高保持 1.7（22.1px），
+   * 比原字号只紧一点点，仍可读。
+   */
+  .page.mem .mem-item__text {
+    font-size: 13px;
+    line-height: 1.7;
+  }
+}

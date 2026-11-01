@@ -24,7 +24,9 @@ interface AccountPageProps {
 
 export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPageProps) {
   const [currentForName, setCurrentForName] = useState('');
-  const [newName, setNewName] = useState(username);
+  // 「新的登录名」从空白开始：预填当前值会让人以为"新的"就是旧值，
+  // 并且让下面的"登录名没有变化。"变成一句常驻废话。
+  const [newName, setNewName] = useState('');
   const [namePending, setNamePending] = useState(false);
   const [nameError, setNameError] = useState<ExplainedError | null>(null);
   const [nameDone, setNameDone] = useState('');
@@ -36,8 +38,9 @@ export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPa
   const [passError, setPassError] = useState<ExplainedError | null>(null);
   const [passDone, setPassDone] = useState(false);
 
-  const nameChanged = newName.trim() !== username;
-  const nameTooShort = newName.trim().length > 0 && newName.trim().length < 3;
+  const trimmedName = newName.trim();
+  const nameChanged = trimmedName.length > 0 && trimmedName !== username;
+  const nameTooShort = trimmedName.length > 0 && trimmedName.length < 3;
   const passTooShort = nextPass.length > 0 && nextPass.length < 8;
   const passMismatch = confirmPass.length > 0 && nextPass !== confirmPass;
 
@@ -50,7 +53,8 @@ export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPa
     try {
       const result = await api.changeAccount(currentForName, newName.trim());
       onRenamed(result.username);
-      setNewName(result.username);
+      // 改完之后输入框回到空白：这里要的是"新的登录名"，不是当前值的副本。
+      setNewName('');
       setCurrentForName('');
       setNameDone(`已改为「${result.username}」，其它设备上的登录已失效`);
     } catch (err) {
@@ -98,6 +102,7 @@ export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPa
             <input
               className="input"
               value={newName}
+              placeholder="输入新的登录名（不想改就留空）"
               onChange={(e) => setNewName(e.target.value)}
               autoComplete="username"
             />
@@ -126,7 +131,6 @@ export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPa
           >
             {namePending ? '保存中…' : '保存登录名'}
           </button>
-          {!nameChanged ? <p className="card__hint">登录名没有变化。</p> : null}
         </form>
       </section>
 
@@ -187,7 +191,12 @@ export function AccountPage({ username, onBack, onRenamed, onLogout }: AccountPa
       <section className="card">
         <h2 className="card__title">退出登录</h2>
         <p className="card__hint">退出后需要重新输入账号密码。</p>
-        <button type="button" className="button button--ghost" onClick={onLogout}>
+        <button
+          type="button"
+          className="button button--ghost account-logout"
+          data-testid="account-logout"
+          onClick={onLogout}
+        >
           退出登录
         </button>
       </section>

@@ -36,6 +36,14 @@ interface PolicyFormProps {
   /** 从 /v1/settings/config 的哪一段读初值。 */
   section: 'memory' | 'life' | 'dialogue';
   onBack: () => void;
+  /** 返回按钮文案。记忆页把它当 tab 用，写「返回设置」会指错地方。 */
+  backLabel?: string;
+  /**
+   * 发布成功后的提示。默认文案声称「下一轮对话起生效」——
+   * **只有确认运行时真的读取这一段配置时才能用默认值**。
+   * 记忆的 memory 段截至本次实现尚未接线，调用方必须传诚实文案。
+   */
+  publishedMessage?: string;
 }
 
 type Values = Record<string, number>;
@@ -57,7 +65,15 @@ function hhmmToMinutes(value: string): number {
   return h * 60 + m;
 }
 
-export function PolicyForm({ title, hint, fields, section, onBack }: PolicyFormProps) {
+export function PolicyForm({
+  title,
+  hint,
+  fields,
+  section,
+  onBack,
+  backLabel = '返回设置',
+  publishedMessage = '已发布。新策略会在下一轮对话起生效。',
+}: PolicyFormProps) {
   const [values, setValues] = useState<Values | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -111,7 +127,7 @@ export function PolicyForm({ title, hint, fields, section, onBack }: PolicyFormP
         return;
       }
       await api.publish(draft.revision);
-      setMessage('已发布。新策略会在下一轮对话起生效。');
+      setMessage(publishedMessage);
       await load();
     } catch (err) {
       setError(explainError(err));
@@ -123,7 +139,7 @@ export function PolicyForm({ title, hint, fields, section, onBack }: PolicyFormP
   return (
     <section className="page">
       <button type="button" className="back-link" onClick={onBack}>
-        <ArrowLeftIcon /> 返回设置
+        <ArrowLeftIcon /> {backLabel}
       </button>
 
       <h1 className="page__title">{title}</h1>

@@ -1,0 +1,143 @@
+/*
+ * 人设页 / 生活页的 tab，以及设置中心的分组。
+ *
+ * 为什么单独一个文件：`styles.css` 由并行任务在改，这里只新增领域页 tab
+ * 与设置分组需要的规则，类名统一 `domain-` / `settings-group` 前缀，
+ * 不碰其它页面（与 `memory.css` / `nav.css` / `dashboard.css` 同一个理由）。
+ *
+ * 三条硬约束（与 memory.css 一致）：
+ * 1. 375px 单列、无横向溢出——文本容器 `min-width: 0`，长串 `overflow-wrap: anywhere`；
+ * 2. 触控 ≥ 44×44（仅窄屏；桌面保留紧凑字号）；
+ * 3. 选中态不能只靠颜色：同时有底色、边框与字重变化（色弱可辨）。
+ */
+
+/* ------------------------------------------------------------------ tab */
+
+.domain-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-raised);
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.domain-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  padding: 7px 14px;
+  border-radius: 9px;
+  min-height: 36px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.domain-tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--ink);
+}
+
+.domain-tab--active {
+  background: var(--paper);
+  border-color: var(--line-strong);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* 领域页正文：两个 tab 面板各自是一列，间距与 `.page` 的 gap 一致。 */
+.domain-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+/*
+ * 嵌进 tab 的调参表单自带 `.page` 外壳（左右内边距按 980px 居中算）。
+ * 在 tab 里那一层会再缩进一次、还会多出一个内层滚动条，所以抹掉外壳的布局，
+ * 只保留它的标题/表单/错误提示（与 `memory.css` 里 `.mem-settings > .page` 同理）。
+ */
+.domain-tabpanel > .page {
+  padding: 0;
+  overflow: visible;
+  flex: none;
+}
+
+/* ------------------------------------------------------------- 设置分组 */
+
+.settings-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.settings-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.settings-group__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+}
+
+.settings-group__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 1.7;
+  max-width: 720px;
+}
+
+/* --------------------------------------------------------------- 窄屏 */
+
+@media (max-width: 640px) {
+  .domain-tabs {
+    align-self: stretch;
+  }
+
+  .domain-tab {
+    flex: 1 1 0;
+    min-height: 44px;
+    padding-left: 8px;
+    padding-right: 8px;
+    white-space: normal;
+  }
+
+  /* PolicyForm 嵌在 tab 里的返回按钮：44×44 命中区，不缩字号 */
+  .domain-tabpanel .back-link {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 8px;
+  }
+
+  /* 调参输入框：44 高，靠 padding 撑 */
+  .domain-tabpanel .memory-form__input {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}
+
+@media (max-width: 360px) {
+  .domain-tab {
+    font-size: 13px;
+  }
+}

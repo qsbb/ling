@@ -1,0 +1,212 @@
+/**
+ * 总览页的布局补丁。
+ *
+ * 为什么单独一个文件：`styles.css` 由并行任务在改，这里只在**必须**改布局时
+ * 覆写总览相关的规则，类名沿用 `dash` / `dash-` 前缀，不碰其它页面。
+ *
+ * 修的是什么：`.page` 的横向 padding 是 `max(14px, (100% - 980px) / 2)`——
+ * 那是「正文 980 居中」的老公式，百分比 padding 相对的是**父元素**（`main`）宽度，
+ * 而不是 `.page` 自己的宽度。总览自己又有 `max-width: 1200px; margin: 0 auto`。
+ * 两套居中叠加，1440 视口下算下来是：page 1200 宽，左右各被 230px 的
+ * 老公式 padding 削掉，内容只剩 740px，12 列网格每列 48.8px（要求 ≥ 60px）。
+ * 这里把总览页的横向 gutter 固定成一个小的常数值，让 1200 的宽度真正给到网格。
+ */
+
+.page.dash {
+  padding-left: 22px;
+  padding-right: 22px;
+}
+
+@media (max-width: 900px) {
+  /* 窄屏沿用 styles.css 的窄 gutter，避免手机上白白吃掉 16px。 */
+  .page.dash {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+}
+
+/*
+ * 多列 → 单列的切换点从 900px 提到 940px。
+ *
+ * 900–940 这段：内容宽 856–896px，12 列每列 58.6–61.9px，卡在 60px 下限上，
+ * 与其让它擦边，不如提前塌成单列（这一档本来就是平板竖屏）。
+ * 选择器用 `.dash__grid .dash-card--*`（0,2,0）而不是裸 `.dash-card--*`，
+ * 这样不受 `styles.css` 与本文件的加载顺序影响。
+ */
+@media (max-width: 940px) {
+  .dash__grid .dash-card--wide,
+  .dash__grid .dash-card--half,
+  .dash__grid .dash-card--third {
+    grid-column: span 12;
+  }
+}
+
+/*
+ * 失败态面板。
+ *
+ * 原来这里用的是 `page__error`——而这个类在 `styles.css` 里**根本不存在**
+ * （用 `document.styleSheets` 逐条找过，一条规则都没有），于是「读不到数据」
+ * 只剩一行裸文字：图标飘在文字上方、没有边框底色、也不像告警。
+ * 现在给它一个真的告警外观：左侧色条 + 浅底 + 一行图标/正文/按钮。
+ * 类名带 `dash-` 前缀，不动别的页面；App.tsx 里「无法识别的路由」也复用这个面板。
+ */
+.dash-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--warn);
+  border-radius: 10px;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.dash-error > svg {
+  flex: none;
+}
+
+.dash-error > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.dash-error strong {
+  font-size: 14px;
+}
+
+.dash-error p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  word-break: break-word;
+}
+
+.dash-error .button {
+  flex: none;
+}
+
+/* 「无法识别的路由」面板上的两个出口（回到总览 / 回到聊天）。 */
+.dash-error .dash-error__actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 窄屏：正文与按钮不再挤在同一行，按钮单独占一行。 */
+@media (max-width: 560px) {
+  .dash-error .dash-error__actions {
+    width: 100%;
+  }
+}
+
+/* ---------------------------------------------------------- 分段失败与空态 */
+
+/*
+ * 分段级 `unavailable`（这块读不到）与 `empty`（确实没有）必须长得不一样。
+ *
+ * 原来两者共用 `.dash-card__muted`：同一种 12px 灰字，只有文案不同，
+ * 而"查询失败"和"事实为空"的处理方式完全不同。这里给失败态一个卡内小告警条
+ * （图标 + 淡警示底），与 `empty` 的裸灰字区分开；整页失败仍是 `.dash-error`
+ * 那个横跨全页的大面板，两者分量与范围都不同，不会撞车。
+ */
+.dash-card__unavailable {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.dash-card__unavailable > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ------------------------------------------------------------ 日程/承诺标记 */
+
+/* 日程/承诺右侧的元信息（不是今天、状态、承诺等级）排成一行，靠 gap 分隔。 */
+.dash .dash-list__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dash-list__state {
+  white-space: nowrap;
+}
+
+/* 「不是今天」：后端 agenda 会把过期日程一并返回，日期之外再给一个显式标记。 */
+.dash-list__flag {
+  display: inline-block;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--warn);
+  font-size: 10px;
+  line-height: 1.5;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+/* 已取消 / 送不出去 / 已送到：别让它们看起来和待履行一样。
+ * 选择器必须带 `.dash`（0,2,0）：dashboard.css 先于 styles.css 加载，
+ * 裸类名会被 styles.css 里 `.dash-list__meta` 的灰色压掉（实测过一次）。 */
+.dash .dash-list__meta--inactive {
+  color: var(--warn);
+}
+
+/* ---------------------------------------------------------------- hover 反馈 */
+
+/*
+ * 卡片与「详细」此前没有任何 hover 态（实测前后 computed style 完全一致），
+ * 让人看不出"这里能点 / 这张卡是活的"。卡片只做轻微描边+投影（整卡不可点，
+ * 所以不给 cursor:pointer），按钮再叠一层浅底，两者观感一致。
+ */
+.dash-card {
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.dash-card:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-card);
+}
+
+.dash .dash-card__action {
+  border-radius: 6px;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.dash .dash-card__action:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ------------------------------------------------------------ 手机触控目标 */
+
+/*
+ * 手机上「详细」22.5×17.6、「刷新」51.5×23.2，低于 44×44 的触控下限。
+ * 用 padding + 等量负 margin 把**命中区**撑到 44×44，视觉密度不变
+ * （字号、字距、行高、相对位置都没动，只是可点范围变大）。
+ * 选择器带 `.dash` 前缀（0,2,0）：dashboard.css 在 styles.css 之前加载，
+ * 同等特异度会输给它。
+ */
+@media (max-width: 900px) {
+  .dash .dash__refresh,
+  .dash .dash-card__action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 14px 8px;
+    margin: -14px -8px;
+  }
+}
+

@@ -117,6 +117,13 @@ button {
   background: transparent;
   padding: 4px 6px;
   border-radius: 8px;
+  /*
+   * 触控下限：实测原先 64.77×41.59（矮了 2.41px），窄屏遍历可交互元素时
+   * 它会是唯一不达标的那一个。高度给到 44，宽度本来就够但也一起兜住。
+   * 视觉（字号/间距）不变，只是把命中区撑到 44。
+   */
+  min-height: 44px;
+  min-width: 44px;
 }
 
 .brand:hover {
@@ -2480,6 +2487,17 @@ button {
   background: rgba(0, 0, 0, 0.06);
 }
 
+/* 升级「成功」但备份不完整：结果区里的显著提示。
+   不加粗边框只是个黄色小条，容易被当成噪音略过——而这条的后果是恢复时缺媒体。 */
+.update-backup-warnings {
+  border-width: 2px;
+  border-color: rgba(220, 160, 40, 0.75);
+}
+
+.update-backup-warnings .banner__list {
+  overflow-wrap: anywhere;
+}
+
 
 /* 图片上传：文件输入隐藏，用回形针按钮触发。 */
 .composer__file {
@@ -2794,4 +2812,61 @@ button {
 .dash__foot {
   margin-top: 16px;
   text-align: center;
+}
+
+/* ---------------------------------------------------------------- 视觉修复（TASK-VISUAL-FIX） */
+
+/*
+ * m-1：聊天气泡末行孤字。`mobile-02-chat` 实测 7 行 / 100 字，末行只剩「力。」。
+ * 根因是默认 `text-wrap: wrap` 只按字宽断行、不管末行；`pretty` 会让浏览器
+ * 在断行时照顾末行（Chromium 117+ 支持，148 已稳定）。
+ *
+ * 只加 `pretty` 实测仍剩 7 行、末行「能力。」（2 汉字+句号，仍属孤字）；
+ * `balance` 在 7 行时超出 Chromium 的行数上限被整段跳过，`letter-spacing`
+ * 微调也不足以多容纳一个字。实测把气泡左右内边距 14→10px 后正文降到 6 行，
+ * `pretty` 生效，末行变成「…对话能力。」（完整短语，不再孤字）。
+ * 因此窄屏下只收一点内边距，字号、行高、配色都不动。
+ */
+.message__bubble {
+  text-wrap: pretty;
+}
+
+@media (max-width: 640px) {
+  .message__bubble {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}
+
+/*
+ * m-2：生活页页尾说明末行过短。`mobile-05-life` 实测 2 行，末行只有「设置。」
+ * （3 字）；按钮文案改成「生活节奏」后仍是 2 行、断行位置同样不受控。
+ * 与 m-1 同一修法：让浏览器照顾末行长度（当前实测末行「生活节奏。」5 字）。
+ */
+.life-foot {
+  text-wrap: pretty;
+}
+
+/*
+ * M-2：总览「最近记住的事」在窄屏被单行省略成「…」——375px 下三条记忆
+ * 全部只剩省略号，信息量为零（实测横向溢出 270 / 125 / 111px）。
+ * 窄屏允许两行：`-webkit-line-clamp: 2`，桌面保持上面的单行省略不动。
+ *
+ * 只作用于「最近记住的事」这一张卡：实测把规则下放到所有 `.dash-list__text`
+ * 会把「今天的安排」里 16 字的承诺挤成「…事」两行孤字（本来只差 9px）。
+ *
+ * 选择器带 `.dash` 与卡片 testid（0,3,0）：dashboard.css 先于 styles.css 加载，
+ * 裸类名 `.dash-list__text`（0,1,0）会被压掉——dashboard.css 里的注释提过这个坑。
+ * 注意 `.dash-list__text` 是 flex 子项，`display: -webkit-box` 会被 blockify 成
+ * `flow-root`（实测 computed display 就是 flow-root），但 `-webkit-line-clamp`
+ * 仍按声明值生效：clientHeight 42px = 2 行，scrollHeight 62px = 3 行被裁。
+ */
+@media (max-width: 640px) {
+  .dash .dash-card[data-testid="dash-最近记住的事"] .dash-list__text {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    overflow: hidden;
+  }
 }

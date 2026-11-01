@@ -181,7 +181,7 @@ const UPDATE_DETAIL_TEXT: Record<string, string> = {
   release_unverifiable: '无法校验该 Release 的目标提交',
   not_newer: '该 Release 不比当前版本更新',
   invalid_request_body: '确认信息不完整或已失效', invalid_request: '确认信息不完整或已失效',
-  // 门禁原因：提交被拒时 `version.py:702-706` 的 `_gate_error` 复用
+  // 门禁原因：提交被拒时 `_gate_error`（`version.py:708-712`）复用
   // `provider_unavailable` 错误码（503），必须按这里的文案显示，不能落到
   // `errors.ts` 的“模型供应商不可用”。
   ...GATE_REASON_TEXT,
@@ -297,6 +297,60 @@ export function pollDelayMs(failures: number, mode: PollMode): number {
   return RECOVERY_DELAYS_MS[index] ?? 8000;
 }
 
+/** 与后端 `protocol.MAX_BACKUP_WARNINGS` 对齐；多出来的条目不再展示。 */
+const MAX_BACKUP_WARNINGS = 8;
+
+/**
+ * 任务里的**备份告警**（可选字段 `backup_warnings`，后端协议仍是 v1）。
+ *
+ * 为什么要有这一层：执行器对 `media_state=partial`（媒体归档时有文件正在上传）
+ * 选择「判通过 + 告警」，如果不显式展示，运维只会看到“更新完成”，等到真要恢复
+ * 才发现媒体缺文件。
+ *
+ * 容错：字段缺失（旧执行器不写）、不是数组、条目不是字符串/为空，都只是“没有
+ * 这一条告警”，绝不让页面抛异常；未知的多余字段一律忽略。
+ */
+export function backupWarnings(job: UpdateJob | null | undefined): string[] {
+  const raw: unknown = job?.backup_warnings;
+  if (!Array.isArray(raw)) return [];
+  const notes: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const text = item.trim();
+    if (!text) continue;
+    notes.push(text);
+    if (notes.length >= MAX_BACKUP_WARNINGS) break;
+  }
+  return notes;
+}
+
+export interface BackupWarningNote {
+  title: string;
+  detail: string;
+  items: string[];
+}
+
+/**
+ * 备份告警的界面文案；没有告警时返回 null（页面就不显示任何东西）。
+ *
+ * 文案必须说清后果：备份整体通过 → 升级继续，但媒体归档可能漏文件 →
+ * 恢复时要人工核对 → 细节在宿主机的 `verify-warnings.txt`（不是本页折叠区）。
+ */
+export function describeBackupWarnings(
+  job: UpdateJob | null | undefined,
+): BackupWarningNote | null {
+  const items = backupWarnings(job);
+  if (items.length === 0) return null;
+  const succeeded = job?.state === 'succeeded';
+  return {
+    title: succeeded ? '升级成功，但备份不完整，需要人工核对' : '备份不完整，需要人工核对',
+    detail:
+      '数据库与环境文件的备份完整，但媒体归档可能漏文件（备份时有文件正在上传）；' +
+      '恢复时需人工核对，详见宿主备份目录里的 verify-warnings.txt。',
+    items,
+  };
+}
+
 /**
  * 从 Release 结果里取安装目标。
  * 只有后端明确说 eligible 且 release_id/tag/commit 齐全时才返回；
@@ -396,8 +450,8 @@ export function explainUpdateError(error: unknown): UpdateErrorInfo {
   const code = error instanceof ApiError ? error.code : '';
   const status = error instanceof ApiError ? error.status : 0;
   const detailText = detail ? UPDATE_DETAIL_TEXT[detail] : undefined;
-  // 更新通道的 503 复用 `provider_unavailable` 这个错误码（`version.py:702-706` 的
-  // `_gate_error`，以及 `:765-770` 的 `release_unverifiable`），与模型供应商无关：
+  // 更新通道的 503 复用 `provider_unavailable` 这个错误码（`_gate_error`，`version.py:708-712`；
+  // 以及 `create_update_request` 里 `release_unverifiable` 的分支，`version.py:772-777`），与模型供应商无关：
   // 只按 detail 的门禁文案显示，绝不回落到 `explainError()` 的“模型供应商不可用”
   // 及其“检查供应商地址与密钥”提示。
   if (status === 503 && code === 'provider_unavailable') {
@@ -1315,6 +1369,7 @@ export function AboutPage({ onBack }: AboutPageProps) {
 
   const checkDone = check.status === 'done';
 
+  const backupWarning = describeBackupWarnings(job);
   const jobHeadline = jobView ? (
     <div
       className={`update-job update-job--${jobView.kind}`}
@@ -1326,6 +1381,28 @@ export function AboutPage({ onBack }: AboutPageProps) {
         <strong>{jobView.title}</strong>
         <code>{job?.target_tag}</code>
       </div>
+      {backupWarning ? (
+        // 显著位置、不被折叠：升级「成功」但备份不完整时，这是最容易被忽略、
+        // 后果又最贵的一条（恢复时缺媒体就是真的缺）。
+        <div
+          className="banner banner--warn update-backup-warnings"
+          role="status"
+          data-testid="backup-warnings"
+        >
+          <AlertIcon />
+          <div>
+            <strong data-testid="backup-warnings-title">{backupWarning.title}</strong>
+            <div className="banner__detail" data-testid="backup-warnings-detail">
+              {backupWarning.detail}
+            </div>
+            <ul className="banner__list">
+              {backupWarning.items.map((note, index) => (
+                <li key={`${index}-${note}`}>{note}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
       {job && (job.state === 'queued' || job.state === 'running') ? (
         <div
           className="update-progress"
