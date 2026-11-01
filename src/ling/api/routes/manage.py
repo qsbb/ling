@@ -625,7 +625,7 @@ async def list_proactive(
             else False
         ),
         "note": (
-            "主动发送已实现但**默认关闭**。开启前建议先看几天草稿，"
+            "主动发送已实现，但默认关闭。开启前建议先看几天草稿，"
             "确认语气合适；未开启时这些话不会真的发出去，到时间会过期。"
             if not (
                 effective_dialogue is not None and effective_dialogue.proactive_delivery_enabled

@@ -79,7 +79,7 @@ async def qqbot_events(request: Request) -> JSONResponse:
         # 逃生开关被真正用到了。**必须留痕**：这是唯一一条不验签就能进
         # 对话链路的路径，运维如果忘了关掉它，从日志里要能看出来。
         logger.warning(
-            "QQ 机器人回调**未验签放行**（op=13，LING_QQBOT_ALLOW_UNSIGNED_VALIDATION=1）："
+            "QQ 机器人回调未验签即放行（op=13，LING_QQBOT_ALLOW_UNSIGNED_VALIDATION=1）："
             "确认回调地址后应尽量关掉"
         )
     if not verified and not (is_validation and connector.config.allow_unsigned_validation):

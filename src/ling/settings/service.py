@@ -63,7 +63,7 @@ PROFILE_DEGRADATIONS: dict[str, str] = {
     "speech.asr": "不能识别语音消息",
     "speech.tts": "不能朗读，只有文字",
     "realtime.voice": "不能实时语音对话",
-    "dialogue.fast": "**无法对话**：这是主回复走的路由",
+    "dialogue.fast": "无法对话：这是主回复走的路由",
     "dialogue.group": "群聊没有可用的对话模型（会退回 fast）",
 }
 
