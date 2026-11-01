@@ -16,6 +16,8 @@
  * - POST 响应丢失且未落地时旧 succeeded 不被当成本次成功（最终明确“无法确认”）；
  * - 初次加载断连后恢复；409 当前版本变化后带新 expected 重新确认；
  * - succeeded 但 commit 不匹配时不误报完成；
+ * - succeeded 且带 backup_warnings：结果区显著位置提示“备份不完整 / 媒体归档可能
+ *   漏文件 / 恢复需人工核对 / 见 verify-warnings.txt”，不在折叠区；无告警时不显示；
  * - 门禁原因 manual_required / protocol_unsupported：状态栏专用文案、安装按钮禁用、
  *   没有忽略/取消/强制/自动重试入口；
  * - 提交路径 503 `provider_unavailable`（detail = manual_required / protocol_unsupported）：
@@ -41,8 +43,16 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { resolveShotsDir } from './lib/isolation.mjs';
+
 const RAW_BASE = process.env.BASE_URL;
-const SHOTS = process.env.SHOTS_DIR || path.resolve('shots/update-browser');
+// 截图默认写临时目录：不默认往仓库的 shots/ 里写，免得覆盖别人的证据。
+const SHOTS_INFO = resolveShotsDir('update');
+const SHOTS = SHOTS_INFO.dir;
+console.log(
+  `截图目录：${SHOTS}` +
+    (SHOTS_INFO.fromEnv ? '（SHOTS_DIR 显式指定）' : '（未设 SHOTS_DIR，默认临时目录，不写仓库）'),
+);
 const TARGET_COMMIT = 'c0ffee1234567890abcdef1234567890abcdef12';
 const CURRENT_COMMIT = '7b2370238f0b7e9da1b9e3f3f0b4a4d7f0b8c9a1';
 const SECOND_TARGET = '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d';
@@ -807,6 +817,10 @@ async function scenarioHistoricalSuccess(page, state, prefix) {
   record(`${prefix}：旧成功不显示安装按钮`, (await page.locator('[data-testid="update-install"]').count()) === 0);
   record(`${prefix}：旧成功不阻止再次检查`, body.includes('先检查最新 Release'));
   record(`${prefix}：历史结果没有自动提交`, state.posts.length === 0);
+  record(
+    `${prefix}：没有备份告警时不显示提示`,
+    (await page.locator('[data-testid="backup-warnings"]').count()) === 0,
+  );
 
   await runCheck(page);
   const install = page.locator('[data-testid="update-install"]');
@@ -844,6 +858,71 @@ async function scenarioHistoricalSuccess(page, state, prefix) {
   await scrollToJob(page);
   await assertNoOverflow(page, `${prefix}：旧成功再更新`);
   await shot(page, `${prefix}-second-update`);
+}
+
+/* ------------------------------------------- 升级成功 + 备份告警（task-76） */
+
+/** 成功终态但备份不完整：告警来自 current.json 的可选字段 backup_warnings。 */
+function backupWarningsJob() {
+  return makeJob({
+    request_id: 'req-warn',
+    state: 'succeeded',
+    stage: 'complete',
+    backup_warnings: [
+      'manifest: media_state=partial（media.tar.zst 归档时有文件正在写入，可能漏掉刚上传的媒体）',
+      'manifest: keys_env_set=true（备份时 LING_ROOT_KEY 非空，恢复时必须同时恢复 deploy/.env）',
+    ],
+  });
+}
+
+async function scenarioSuccessWithBackupWarnings(page, state, prefix, navigations, events) {
+  await openAbout(page);
+  record(`${prefix}：升级成功仍然如实显示完成`, await waitForText(page, '更新完成', 15000));
+
+  const banner = page.locator('[data-testid="backup-warnings"]');
+  record(
+    `${prefix}：备份告警提示可见`,
+    (await banner.count()) === 1 && (await banner.first().isVisible()),
+    `count=${await banner.count()}`,
+  );
+  const text = await textOf(page, 'backup-warnings');
+  record(`${prefix}：提示说明媒体可能漏文件`, text.includes('媒体归档可能漏文件'), text);
+  record(`${prefix}：提示要求恢复时人工核对`, text.includes('恢复时需人工核对'));
+  record(`${prefix}：提示指向 verify-warnings.txt`, text.includes('verify-warnings.txt'));
+  record(`${prefix}：标题明确“升级成功但备份不完整”`, text.includes('备份不完整'));
+
+  // 位置要求：必须在结果区里、不在折叠区、也不是“只给一个日志链接”。
+  const placement = await page.evaluate(() => {
+    const node = document.querySelector('[data-testid="backup-warnings"]');
+    const job = document.querySelector('[data-testid="update-job"]');
+    const reload = document.querySelector('[data-testid="update-reload"]');
+    if (!node || !job) return { inJob: false, collapsed: true, beforeReload: false, height: 0 };
+    const collapsed = Boolean(node.closest('details') || node.closest('[hidden]'));
+    const beforeReload = reload
+      ? Boolean(node.compareDocumentPosition(reload) & Node.DOCUMENT_POSITION_FOLLOWING)
+      : false;
+    return {
+      inJob: job.contains(node),
+      collapsed,
+      beforeReload,
+      height: node.getBoundingClientRect().height,
+    };
+  });
+  record(`${prefix}：提示在结果区里`, placement.inJob);
+  record(`${prefix}：提示没有被折叠/隐藏`, placement.collapsed === false);
+  record(`${prefix}：提示在“重新加载”之前（显著位置）`, placement.beforeReload);
+  record(`${prefix}：提示实际占据版面`, placement.height > 20, `h=${placement.height}`);
+  record(
+    `${prefix}：告警条目逐条列出`,
+    (await banner.locator('li').count()) === 2,
+    `li=${await banner.locator('li').count()}`,
+  );
+  record(`${prefix}：没有“忽略/取消”这类绕过入口`, (await page.locator('button').allInnerTexts()).every((t) => !/忽略|取消/.test(t)));
+  record(`${prefix}：没有自动提交`, state.posts.length === 0, `posts=${state.posts.length}`);
+  record(`${prefix}：无 pageerror`, events.pageErrors.length === 0, events.pageErrors[0] || '');
+  await assertNoOverflow(page, `${prefix}：备份告警`);
+  await scrollToJob(page);
+  await shot(page, `${prefix}-backup-warnings`, true);
 }
 
 async function scenarioNeedsManual(page, state, prefix) {
@@ -1702,6 +1781,16 @@ async function runViewport(browser, viewport, name) {
     ['failed-retry', scenarioFailedRetry, makeState()],
     ['historical-success', scenarioHistoricalSuccess, historicalState()],
     ['needs-manual', scenarioNeedsManual, makeState()],
+    [
+      'success-backup-warnings',
+      scenarioSuccessWithBackupWarnings,
+      makeState({
+        // 服务端已经报告新提交 → describeJob 判“更新完成”，同时带备份告警。
+        version: { ...defaultVersion(), current: '0.2.0', commit: TARGET_COMMIT },
+        status: { ...enabledStatus(), current_job: backupWarningsJob() },
+        job: backupWarningsJob(),
+      }),
+    ],
     ['resume', scenarioResume, makeState()],
     ['conflict', scenarioPostConflict, makeState()],
     ['conflict-version', scenarioConflictVersion, makeState()],

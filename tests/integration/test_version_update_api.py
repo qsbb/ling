@@ -194,6 +194,102 @@ async def test_update_view_offline_and_readonly_status(
     assert body["reason"] == "executor_offline"
 
 
+async def test_update_view_exposes_backup_warnings(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    """task-76：升级成功但备份不完整 → 告警在状态接口上可见（不只是日志文件）。"""
+    base = _configure(logged_in, tmp_path)
+    _heartbeat(base)
+    request = _pending(base)
+    notes = [
+        "manifest: media_state=partial（media.tar.zst 归档时有文件正在写入，可能漏掉刚上传的媒体）",
+        "manifest: keys_env_set=true（备份时 LING_ROOT_KEY 非空，恢复时必须同时恢复 deploy/.env）",
+    ]
+    payload = request.to_job().with_progress(
+        state="succeeded", stage="complete", backup_warnings=notes
+    ).to_dict()
+    protocol.atomic_write_json(base / "status" / protocol.CURRENT_FILE, payload, mode=0o644)
+    # 宿主已 claim：pending 不在了，任务才算真正的终态。
+    protocol.remove_file(base / "requests" / protocol.PENDING_FILE)
+
+    response = await logged_in.client.get("/v1/version/update")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["current_job"]["state"] == "succeeded"
+    assert body["current_job"]["backup_warnings"] == notes
+    # 展示字段不参与门禁：成功的终态不阻塞下一次提交。
+    assert body["reason"] is None
+    assert response.headers["cache-control"] == "no-store"
+    assert str(tmp_path) not in response.text
+
+
+async def test_update_view_backup_warnings_absent_defaults_to_empty(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    """旧执行器不写该字段：API 给空数组，不报错、门禁不变。"""
+    base = _configure(logged_in, tmp_path)
+    _heartbeat(base)
+    request = _pending(base)
+    payload = request.to_job().with_progress(state="succeeded", stage="complete").to_dict()
+    payload.pop("backup_warnings", None)
+    protocol.atomic_write_json(base / "status" / protocol.CURRENT_FILE, payload, mode=0o644)
+    protocol.remove_file(base / "requests" / protocol.PENDING_FILE)
+
+    response = await logged_in.client.get("/v1/version/update")
+    assert response.status_code == 200, response.text
+    assert response.json()["current_job"]["backup_warnings"] == []
+
+
+async def test_backup_warnings_do_not_affect_owner_gate_or_body_limit(
+    logged_in: TestEnv, tmp_path: Path, release: dict[str, object]
+) -> None:
+    """加字段不得回归既有的 owner 权限与 422 体积上限。"""
+    base = _configure(logged_in, tmp_path)
+    _heartbeat(base)
+    request = _pending(base)
+    protocol.atomic_write_json(
+        base / "status" / protocol.CURRENT_FILE,
+        request.to_job().with_progress(
+            state="succeeded", stage="complete", backup_warnings=["warn"]
+        ).to_dict(),
+        mode=0o644,
+    )
+    protocol.remove_file(base / "requests" / protocol.PENDING_FILE)
+
+    # non-owner 仍然 403 not_owner（GET 也照旧报告 not_owner）。
+    async with session_scope() as session:
+        await IdentityService(session).create_user(
+            username="member2", password="member-password", role="member"
+        )
+    assert (
+        await logged_in.client.post(
+            "/v1/auth/login", json={"username": "member2", "password": "member-password"}
+        )
+    ).status_code == 200
+    view = await logged_in.client.get("/v1/version/update")
+    assert view.status_code == 200
+    assert view.json()["reason"] == "not_owner"
+    denied = await _post(logged_in)
+    assert denied.status_code == 403
+    assert denied.json()["error"]["detail"] == "not_owner"
+
+    # 换回 owner：体积上限照旧按 Content-Length 在 4097 字节处 422。
+    assert (
+        await logged_in.client.post(
+            "/v1/auth/login",
+            json={"username": "tester", "password": "tester-password"},
+        )
+    ).status_code == 200
+    oversized = await logged_in.client.post(
+        "/v1/version/update-requests",
+        content=b"x" * (version_routes.MAX_UPDATE_BODY_BYTES + 1),
+        headers={**ORIGIN, "X-Ling-Update": "1", "Content-Type": "application/json"},
+    )
+    assert oversized.status_code == 422
+    assert oversized.json()["error"]["detail"] == version_routes.DETAIL_BODY_TOO_LARGE
+    assert not (base / "requests" / protocol.PENDING_FILE).exists()
+
+
 # ---------------------------------------------------------------- check-release
 
 

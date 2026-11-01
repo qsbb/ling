@@ -1,0 +1,531 @@
+# tests/eval/probes.yaml — 检索质量探针集（准确性护栏的唯一事实源）
+#
+# 用途：任何"提速"改动（候选池上界、融合路数、精排开关、MMR 阈值……）都要
+# 用同一套探针 + 同一份固定 seed 合成语料重跑，证明"变快了"不等于"变差了"。
+#
+# 铁律：
+# 1. 探针里**不得**出现真实人名、群号、聊天原句。本文件全部是合成语料，
+#    但结构与真实数据同形（同样的 subject/window/visibility/source 关系）。
+# 2. 语料、探针、评测时钟（`eval_now`）全部固定 → 可重复。
+# 3. 六类探针必须都在：事实召回 / 同义改写 / 时间关系 / 不可召回 /
+#    隐私隔离 / 黑话别名。缺一类就有一类退化测不出来。
+#
+# 跑法见 tests/eval/README.md，判定口径见
+# shots/ia-research/SPEEDUP-GUARDRAILS.md。
+
+version: 1
+
+# 固定 seed：决定 filler 噪声的插入顺序与置信度抖动。
+seed: 20261101
+
+# 固定评测时钟。所有 created_at / occurred_at / valid_until 都相对它，
+# 不相对"现在"——否则每天跑出来的基线都不一样，没法比。
+eval_now: "2026-01-01T00:00:00Z"
+
+# 隔离 schema（真 PostgreSQL，127.0.0.1:55432/ling_test）。每次运行先 drop 再建，
+# 只碰这一个 schema，不碰 ling / ling_test 里已有的表。
+schema: eval_probe_baseline
+
+# 召回深度：所有指标都在 k=6 上算（与 kernel/context.py 的 limit=6 对齐）。
+k: 6
+
+# ---------------------------------------------------------------- 合成语料
+#
+# 时间字段单位是"天"（相对 eval_now 往前推）：
+#   age_days              → created_at / updated_at
+#   occurred_age_days     → 情节的 occurred_at
+#   valid_until_offset    → 正数=未来仍然成立；负数=已失效（历史事实）
+#
+# visibility / source_visibility / source_window_id 三者决定隐私边界，
+# 必须与真实写入路径同形（见 domains/memory/service.py propose()）。
+corpus:
+  subjects:
+    # 同一个人，同时活跃在私聊窗口与两个群窗口。
+    alpha: subj_eval_alpha
+
+  windows:
+    # 同一个人：一个私聊窗口 + 两个互不相干的群窗口。
+    # 群窗口的 visibility 必须是 group_scope——那正是 AudienceSnapshot.is_group
+    # 的判定依据，也是"群 A 不进群 B"的战场。
+    dm:
+      id: win_eval_dm
+      visibility: subject_private
+    group_a:
+      id: win_eval_group_a
+      visibility: group_scope
+    group_b:
+      id: win_eval_group_b
+      visibility: group_scope
+
+  # -------------------------------------------------------------- 断言（事实）
+  #
+  # 字段说明：
+  #   key        探针引用用的稳定标识（不会进库）
+  #   slot       提取器的语义槽位（与真实写入一致）
+  #   age_days   created_at / updated_at 相对 eval_now 的天数（越大越旧）
+  #   visibility 记录自身的可见范围
+  #   source     来源可见范围 + 来源窗口（决定跨受众过滤）
+  #
+  # 年龄刻意拉开：近的 3~15 天、中的 20~70 天、远的 90~600 天。
+  # 这样"候选池上界从 500 砍到 50"这类改动会**优先丢掉最旧的那批**，
+  # 探针才能在数字上看见它。
+  memories:
+    - key: name
+      text: "用户的名字是阿澄"
+      slot: name
+      confidence: 0.90
+      age_days: 5
+    - key: likes_tea
+      text: "用户喜欢喝乌龙茶"
+      slot: likes
+      confidence: 0.85
+      age_days: 8
+    - key: allergy
+      text: "用户不能吃花生和腰果"
+      slot: allergy
+      confidence: 0.85
+      age_days: 20
+    - key: lives_in
+      text: "用户住在青梧里七号楼"
+      slot: lives_in
+      confidence: 0.90
+      age_days: 3
+    - key: pet_cat
+      text: "用户养了一只猫，叫团子"
+      slot: pet_name
+      confidence: 0.80
+      age_days: 30
+    - key: occupation
+      text: "用户的工作是做地图数据标注"
+      slot: occupation
+      confidence: 0.80
+      age_days: 45
+    - key: sleep
+      text: "用户睡得很晚，凌晨两点才睡"
+      slot: sleep
+      confidence: 0.70
+      age_days: 40
+    - key: cafe
+      text: "用户常去一家叫云栖的咖啡馆"
+      slot: place_favorite
+      confidence: 0.75
+      age_days: 60
+    - key: guitar
+      text: "用户会弹木吉他，练了三年"
+      slot: skill
+      confidence: 0.70
+      age_days: 90
+    - key: hometown
+      text: "用户的老家在海盐县"
+      slot: hometown
+      confidence: 0.85
+      age_days: 120
+    - key: noise
+      text: "用户受不了键盘青轴的声音"
+      slot: dislike
+      confidence: 0.60
+      age_days: 15
+    - key: birthday
+      text: "用户的生日是四月十七号"
+      slot: birthday
+      confidence: 0.80
+      age_days: 70
+    - key: sister
+      text: "用户的姐姐叫阿棠，在药房上班"
+      slot: family_sister
+      confidence: 0.80
+      age_days: 25
+    # 实体路专用：与探针「我妈提过的那个人」**字面零重叠**。
+    # 只有沿实体关系才找得到——这正是实体路存在的理由。
+    - key: mom_person
+      text: "用户妈妈介绍过一个在药房做事的亲戚"
+      slot: family_relative
+      confidence: 0.80
+      age_days: 28
+    # 隐私项：私聊里的敏感事实，群里一个字都不能出现。
+    - key: secret_health
+      text: "用户去年做过一次膝盖手术"
+      slot: health_event
+      confidence: 0.85
+      age_days: 35
+    # ---------------------------------------------------------- 群 A / 群 B
+    - key: ga_hiking
+      text: "群里周末常去爬北坡的山"
+      slot: group_activity
+      confidence: 0.75
+      age_days: 4
+      visibility: group_scope
+      source_visibility: group_scope
+      source_window: group_a
+    - key: ga_craft
+      text: "群里在筹备一个叫青苔的手工项目"
+      slot: group_project
+      confidence: 0.75
+      age_days: 10
+      visibility: group_scope
+      source_visibility: group_scope
+      source_window: group_a
+    - key: gb_bbq
+      text: "群里约了周六去河边烤肉"
+      slot: group_activity
+      confidence: 0.70
+      age_days: 6
+      visibility: group_scope
+      source_visibility: group_scope
+      source_window: group_b
+    # 公开项：群窗口**应该**看得到。用来防"一刀切锁死"的过度拦截改动。
+    - key: public_note
+      text: "公开约定：周五晚上不排任何事"
+      slot: public_rule
+      confidence: 0.85
+      age_days: 9
+      visibility: public
+      source_visibility: public
+
+  # -------------------------------------------------------------- 情节（经历）
+  episodes:
+    - key: ep_first_meet
+      summary: "第一次见面是在一个安静的馆子，聊了两个小时"
+      window: dm
+      visibility: subject_private
+      source_visibility: subject_private
+      occurred_age_days: 200
+    - key: ep_group_a
+      summary: "上次在群里一起对了一版手工项目的图纸"
+      window: group_a
+      visibility: group_scope
+      source_visibility: group_scope
+      occurred_age_days: 20
+    - key: ep_dm_recent
+      summary: "上周一起去河边走了走"
+      window: dm
+      visibility: subject_private
+      source_visibility: subject_private
+      occurred_age_days: 14
+
+  # -------------------------------------------------------------- 实体与别名
+  entities:
+    - key: ent_ma
+      name: "妈"
+      kind: person
+      # 别名归并由 KINSHIP_ALIASES + 别名表做，不调模型（确定性可复现）
+      aliases: ["母亲", "老妈"]
+      links: [mom_person]
+    - key: ent_tuanzi
+      name: "团子"
+      kind: pet
+      aliases: ["喵喵"]
+      links: [pet_cat]
+
+  # 噪声填充：数量必须明显大于 RECALL_CANDIDATE_LIMIT 的**变异值**，
+  # 否则"把候选池 500 改成 50"这种退化在探针上根本看不见。
+  #
+  # 模板用词刻意与所有探针查询**零重合**（不含"提过/上次/那个"这类探测词），
+  # 否则噪声会靠 2-gram 蹭进结果、把真命中挤到第 2 名，
+  # 基线里就会混进"探针被污染"的假退化。
+  filler:
+    prefix: filler
+    count: 60
+    age_days_range: [1, 12]
+    template: "记录 {n:02d}：收纳盒摆在柜子第二层"
+
+  # 已失效的旧事实（历史事实探针用）：现在不成立，但问"以前"时必须能想起来。
+  historical:
+    - key: old_town
+      text: "用户以前住在雨竹巷"
+      slot: lives_in_old
+      confidence: 0.8
+      age_days: 600
+      valid_until_offset_days: -200
+
+# ---------------------------------------------------------------- 探针
+#
+# 每条探针的字段：
+#   id        稳定标识（基线 JSON 里的键；改名等于新建基线）
+#   type      fact | paraphrase | temporal | unrecallable | privacy | alias
+#   query     合成查询（**不含任何真实数据**）
+#   expect    期望命中的语料 key 列表（第一项是"首选"）
+#   window    以哪个窗口的身份检索（dm | group_a | group_b）
+#   mode      隔离模式：per_window（默认）| continuous | sealed
+#   history   是否带 include_history（问"以前"时为 true）
+#   forbid    绝对不得出现的语料 key（隐私探针的核心断言）
+#   forbid_all: true → 任何命中都算失败（不可召回项用）
+#   skip_if   {"capability": "glossary"} → 词条层未上线时标 skip，不冒充通过
+#
+# 六类探针数量（共 42 条）：
+#   fact 12 / paraphrase 8 / temporal 5 / unrecallable 6 / privacy 7 / alias 4
+probes:
+  # ============================================================ ① 事实召回
+  # 最基础的一类：问法贴近原句，必须召回，且排第一。
+  # 这一类的 nDCG@6 掉得最多时，说明改动伤到了"根本能召回"的部分。
+  - id: fact-name
+    type: fact
+    query: "我叫什么名字"
+    expect: [name]
+    window: dm
+  - id: fact-likes-tea
+    type: fact
+    query: "我喜欢喝什么茶"
+    expect: [likes_tea]
+    window: dm
+  - id: fact-allergy
+    type: fact
+    query: "我对花生过敏吗"
+    expect: [allergy]
+    window: dm
+  - id: fact-lives-in
+    type: fact
+    query: "我现在住在哪里"
+    expect: [lives_in]
+    window: dm
+  - id: fact-pet
+    type: fact
+    query: "我养的猫叫什么"
+    expect: [pet_cat]
+    window: dm
+  - id: fact-occupation
+    type: fact
+    query: "我是做什么工作的"
+    expect: [occupation]
+    window: dm
+  - id: fact-sleep
+    type: fact
+    query: "我几点才睡"
+    expect: [sleep]
+    window: dm
+  - id: fact-cafe
+    type: fact
+    query: "我常去哪家咖啡馆"
+    expect: [cafe]
+    window: dm
+  - id: fact-guitar
+    type: fact
+    query: "我会弹什么乐器"
+    expect: [guitar]
+    window: dm
+  - id: fact-hometown
+    type: fact
+    query: "我老家在哪"
+    expect: [hometown]
+    window: dm
+  - id: fact-birthday
+    type: fact
+    query: "我生日是哪天"
+    expect: [birthday]
+    window: dm
+  - id: fact-sister
+    type: fact
+    query: "我姐姐在哪上班"
+    expect: [sister]
+    window: dm
+
+  # ============================================================ ② 同义改写
+  # 换一种说法仍然要召回：这是"语义没退化成纯字面匹配"的证明。
+  # 在无 embedding 的配置下，这一类靠 2-gram 部分重合仍应命中；
+  # 若某改动让它整体归零，说明 BM25 语料/切词被破坏了。
+  - id: syn-allergy
+    type: paraphrase
+    query: "坚果类我是不是不能碰"
+    expect: [allergy]
+    window: dm
+  - id: syn-cafe
+    type: paraphrase
+    query: "云栖那家店我常去吗"
+    expect: [cafe]
+    window: dm
+  - id: syn-lives
+    type: paraphrase
+    query: "青梧里那边是不是我住的地方"
+    expect: [lives_in]
+    window: dm
+  - id: syn-occupation
+    type: paraphrase
+    query: "地图标注那份活儿是我在干吗"
+    expect: [occupation]
+    window: dm
+  - id: syn-sleep
+    type: paraphrase
+    query: "我作息是不是特别晚，常常凌晨才睡"
+    expect: [sleep]
+    window: dm
+  - id: syn-sister
+    type: paraphrase
+    query: "阿棠跟我是亲戚吗"
+    expect: [sister]
+    window: dm
+  - id: syn-pet
+    type: paraphrase
+    query: "家里那只猫是团子吧"
+    expect: [pet_cat]
+    window: dm
+  - id: syn-guitar
+    type: paraphrase
+    query: "木吉他我练了多久了"
+    expect: [guitar]
+    window: dm
+
+  # ============================================================ ③ 时间/关系
+  # "我们第一次见面"这类问题问的是**经历**，不是断言。
+  # 情节路径（episode）被误删/被 RRF 压没时，这一类会先塌。
+  - id: time-first-meet
+    type: temporal
+    query: "我们第一次见面是什么时候"
+    expect: [ep_first_meet]
+    window: dm
+  - id: time-recent-walk
+    type: temporal
+    query: "上周我们一起去河边的事还记得吗"
+    expect: [ep_dm_recent]
+    window: dm
+  - id: time-history-town
+    type: temporal
+    query: "我以前住在哪里"
+    expect: [old_town]
+    window: dm
+    history: true
+  - id: time-current-town
+    # 反例面：问"现在"时，已失效的旧住址**不该**压过当前值。
+    type: temporal
+    query: "我现在住在哪里"
+    expect: [lives_in]
+    forbid: [old_town]
+    window: dm
+  - id: time-mom-person
+    type: temporal
+    query: "我妈提过的那个人后来怎样"
+    expect: [mom_person]
+    window: dm
+
+  # ============================================================ ④ 不可召回
+  # 库里没有的东西必须返回空。这一类是"防乱编"的护栏：
+  # 任何提速改动（放宽相对分数下限、去掉 MMR、放大候选池后硬塞 limit 条）
+  # 都会先把空结果率打下来，同时把这一类打成"有命中"。
+  # forbid_all 为真时：**任何一条命中都算失败**，不看排名。
+  - id: unrecallable-crypto
+    type: unrecallable
+    query: "那个币涨到多少了"
+    window: dm
+    forbid_all: true
+  - id: unrecallable-dentist
+    type: unrecallable
+    query: "我拔智齿是哪家诊所"
+    window: dm
+    forbid_all: true
+  - id: unrecallable-car
+    type: unrecallable
+    query: "我那辆车的车牌号是多少"
+    window: dm
+    forbid_all: true
+  - id: unrecallable-exam
+    type: unrecallable
+    query: "我考研报的哪个学校"
+    window: dm
+    forbid_all: true
+  - id: unrecallable-landlord
+    type: unrecallable
+    query: "我房东姓什么来着"
+    window: dm
+    forbid_all: true
+  - id: unrecallable-colleague
+    type: unrecallable
+    # 语料里唯一的"数据标注"是**用户自己**的工作，同事的工号库里没有。
+    query: "我同事工号多少"
+    window: dm
+    forbid_all: true
+
+  # ============================================================ ⑤ 隐私隔离
+  # 群 A 的私密内容绝不出现在群 B；私聊敏感事实绝不进任何群。
+  # 隐私命中数必须**恒为 0**——这不是"允许波动"的指标，是一条红线。
+  #
+  # 写法要点：`expect: []` + `forbid: [...]`。
+  # 既写 expect 又写 forbid 同一项，就是自相矛盾的探针（会把 recall 和
+  # 泄漏数同时算错）——基线第一版踩过这个坑。
+  #
+  # 每条"不得出现"都配一条**同组正向对照**（在内容自己的窗口里必须召回）：
+  # 否则"整条链路全空"也会让隐私探针变绿，那是假绿。
+  - id: privacy-group-a-not-in-b
+    type: privacy
+    query: "周末去爬北坡的山是谁组织的"
+    expect: []
+    forbid: [ga_hiking, ga_craft]
+    window: group_b
+  - id: privacy-group-a-visible-in-a
+    # 正向对照：同一句话在它自己的群里必须召回。
+    type: privacy
+    query: "周末去爬北坡的山是谁组织的"
+    expect: [ga_hiking]
+    forbid: []
+    window: group_a
+  - id: privacy-group-b-not-in-a
+    type: privacy
+    query: "河边烤肉是谁约的"
+    expect: []
+    forbid: [gb_bbq]
+    window: group_a
+  - id: privacy-group-b-visible-in-b
+    type: privacy
+    query: "河边烤肉是谁约的"
+    expect: [gb_bbq]
+    forbid: []
+    window: group_b
+  - id: privacy-group-a-craft-in-b
+    type: privacy
+    query: "青苔那个手工项目进展到哪了"
+    expect: []
+    forbid: [ga_craft]
+    window: group_b
+  - id: privacy-secret-health-in-a
+    type: privacy
+    query: "膝盖手术恢复得怎么样"
+    expect: []
+    forbid: [secret_health]
+    window: group_a
+  - id: privacy-secret-health-in-b
+    type: privacy
+    query: "手术之后还疼吗"
+    expect: []
+    forbid: [secret_health]
+    window: group_b
+  - id: privacy-dm-not-in-group
+    type: privacy
+    query: "第一次见面聊了什么"
+    expect: []
+    forbid: [ep_first_meet, ep_dm_recent]
+    window: group_a
+  - id: privacy-public-visible-in-group
+    # 反向断言：公开约定在群里**必须**可见。
+    # 防止"为了不泄漏而一刀切"的过度拦截——那同样是可用性退化。
+    type: privacy
+    query: "周五晚上有安排吗"
+    expect: [public_note]
+    forbid: []
+    window: group_a
+
+  # ============================================================ ⑥ 黑话/别名
+  # 词条层（glossary）尚未上线时标 skip，**不冒充通过**。
+  # 这几条现在能跑出数字的是别名归并（KINSHIP_ALIASES + 别名表），
+  # 那部分不依赖词条层，所以 expect 里只放实体关联能串起来的记忆。
+  - id: alias-ma-to-mom-person
+    type: alias
+    query: "老妈说的那个人是谁"
+    expect: [mom_person]
+    window: dm
+  - id: alias-mother-to-mom-person
+    type: alias
+    query: "母亲介绍的那个亲戚"
+    expect: [mom_person]
+    window: dm
+  - id: alias-tuanzi-pet
+    type: alias
+    query: "喵喵最近怎么样"
+    expect: [pet_cat]
+    window: dm
+  - id: alias-glossary-pending
+    # 真正的黑话（"小绿"=某项目代号）需要词条层才能解析。
+    # 词条层不存在 → skip。写死成 fail 会让基线永远红，写死成 pass 就是自欺。
+    type: alias
+    query: "小绿那边进度如何"
+    expect: []
+    window: dm
+    skip_if:
+      capability: glossary

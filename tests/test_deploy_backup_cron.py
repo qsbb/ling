@@ -335,3 +335,37 @@ def test_backup_script_must_be_executable(cron_repo: CronRepo) -> None:
     assert "找不到可执行的备份脚本" in proc.stderr
     assert not cron_repo.state.exists()
     assert cron_repo.crontab_calls() == []
+
+
+def test_prune_stays_off_by_default_but_is_documented(cron_repo: CronRepo) -> None:
+    """TASK75 #2(d)：安装时**不开启删除**，只在注释里给出推荐参数。
+
+    每日全量媒体副本会线性累积，但"装一次就决定删历史备份"不该是安装脚本的
+    默认行为——所以生成的 crontab 行里一个 `--prune-*` 都不能有；推荐值以注释
+    形式写在 install-cron.sh 里，并在结尾注意事项里提示。
+    """
+    proc = cron_repo.run(str(cron_repo.backup_dir), "04:30")
+    assert proc.returncode == 0, proc.stderr
+
+    line = _only_backup_line(cron_repo)
+    # 默认行为必须与历史版本一致：永不删除。
+    assert "--prune" not in line, line
+    assert "--dry-run" not in line, line
+    assert "--force-unlock" not in line, line
+
+    # 推荐参数以注释形式存在（不在被安装的那一行里）。
+    script = (cron_repo.repo / "deploy" / "backup" / "install-cron.sh").read_text(encoding="utf-8")
+    assert "--prune-keep 14" in script
+    assert "--prune-days 30" in script
+    assert "--dry-run" in script
+    assert "默认不开启删除" in script or "默认关闭" in script
+    # 推荐参数不能混进真正被安装的那一行：`LINE=` 的定义里不许出现任何轮转开关。
+    line_assignments = [raw for raw in script.splitlines() if raw.strip().startswith("LINE=")]
+    assert line_assignments, "install-cron.sh 里找不到 LINE= 定义"
+    for raw in line_assignments:
+        assert "--prune" not in raw, f"轮转参数混进了 crontab 行: {raw}"
+
+    # 结尾注意事项里要能看到怎么开、以及锁的退出码。
+    assert "--prune-keep" in proc.stdout
+    assert "--dry-run" in proc.stdout
+    assert "exit 6" in proc.stdout

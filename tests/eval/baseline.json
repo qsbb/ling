@@ -1,0 +1,608 @@
+{
+  "probes_file": "probes.yaml",
+  "seed": 20261101,
+  "eval_now": "2026-01-01T00:00:00Z",
+  "schema": "eval_probe_baseline",
+  "generated_at": "2026-11-01T01:38:17+00:00",
+  "guardrail": {
+    "recall_at_6_drop_abs": 0.02,
+    "privacy_hits_max": 0,
+    "empty_rate_rise_abs": 0.03,
+    "ndcg_at_6_drop_abs": 0.05,
+    "mrr_drop_abs": 0.05
+  },
+  "metrics": {
+    "k": 6,
+    "probes_total": 44,
+    "probes_ok": 43,
+    "probes_skip": 1,
+    "probes_error": 0,
+    "recall_at_k": 1.0,
+    "ndcg_at_k": 0.9881,
+    "mrr": 0.9839,
+    "empty_rate": 0.0,
+    "privacy_hits": 0,
+    "unrecallable_hits": 0,
+    "by_type": {
+      "alias": {
+        "count": 3,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "mrr": 1.0,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      },
+      "fact": {
+        "count": 12,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "mrr": 1.0,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      },
+      "paraphrase": {
+        "count": 8,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "mrr": 1.0,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      },
+      "privacy": {
+        "count": 9,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "mrr": 1.0,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      },
+      "temporal": {
+        "count": 5,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 0.9262,
+        "mrr": 0.9,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      },
+      "unrecallable": {
+        "count": 6,
+        "recall_at_k": 0.0,
+        "ndcg_at_k": 0.0,
+        "mrr": 0.0,
+        "empty_rate": 0.0,
+        "privacy_hits": 0,
+        "unrecallable_hits": 0
+      }
+    }
+  },
+  "probes": [
+    {
+      "id": "fact-name",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "name"
+      ],
+      "expect": [
+        "name"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-likes-tea",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "likes_tea"
+      ],
+      "expect": [
+        "likes_tea"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-allergy",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "allergy"
+      ],
+      "expect": [
+        "allergy"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-lives-in",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "lives_in"
+      ],
+      "expect": [
+        "lives_in"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-pet",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "pet_cat"
+      ],
+      "expect": [
+        "pet_cat"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-occupation",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "occupation"
+      ],
+      "expect": [
+        "occupation"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-sleep",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "sleep"
+      ],
+      "expect": [
+        "sleep"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-cafe",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "cafe"
+      ],
+      "expect": [
+        "cafe"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-guitar",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "guitar"
+      ],
+      "expect": [
+        "guitar"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-hometown",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "hometown"
+      ],
+      "expect": [
+        "hometown"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-birthday",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "birthday"
+      ],
+      "expect": [
+        "birthday"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "fact-sister",
+      "type": "fact",
+      "status": "ok",
+      "hits": [
+        "sister"
+      ],
+      "expect": [
+        "sister"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-allergy",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "allergy"
+      ],
+      "expect": [
+        "allergy"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-cafe",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "cafe"
+      ],
+      "expect": [
+        "cafe"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-lives",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "lives_in"
+      ],
+      "expect": [
+        "lives_in"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-occupation",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "occupation"
+      ],
+      "expect": [
+        "occupation"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-sleep",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "sleep"
+      ],
+      "expect": [
+        "sleep"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-sister",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "sister",
+        "mom_person"
+      ],
+      "expect": [
+        "sister"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-pet",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "pet_cat"
+      ],
+      "expect": [
+        "pet_cat"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "syn-guitar",
+      "type": "paraphrase",
+      "status": "ok",
+      "hits": [
+        "guitar"
+      ],
+      "expect": [
+        "guitar"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "time-first-meet",
+      "type": "temporal",
+      "status": "ok",
+      "hits": [
+        "ep_first_meet",
+        "secret_health"
+      ],
+      "expect": [
+        "ep_first_meet"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "time-recent-walk",
+      "type": "temporal",
+      "status": "ok",
+      "hits": [
+        "ep_dm_recent"
+      ],
+      "expect": [
+        "ep_dm_recent"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "time-history-town",
+      "type": "temporal",
+      "status": "ok",
+      "hits": [
+        "lives_in",
+        "old_town"
+      ],
+      "expect": [
+        "old_town"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "time-current-town",
+      "type": "temporal",
+      "status": "ok",
+      "hits": [
+        "lives_in"
+      ],
+      "expect": [
+        "lives_in"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "time-mom-person",
+      "type": "temporal",
+      "status": "ok",
+      "hits": [
+        "mom_person"
+      ],
+      "expect": [
+        "mom_person"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-crypto",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-dentist",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-car",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-exam",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-landlord",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "unrecallable-colleague",
+      "type": "unrecallable",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-group-a-not-in-b",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-group-a-visible-in-a",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [
+        "ga_hiking"
+      ],
+      "expect": [
+        "ga_hiking"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-group-b-not-in-a",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-group-b-visible-in-b",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [
+        "gb_bbq"
+      ],
+      "expect": [
+        "gb_bbq"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-group-a-craft-in-b",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-secret-health-in-a",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-secret-health-in-b",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-dm-not-in-group",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "privacy-public-visible-in-group",
+      "type": "privacy",
+      "status": "ok",
+      "hits": [
+        "public_note"
+      ],
+      "expect": [
+        "public_note"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "alias-ma-to-mom-person",
+      "type": "alias",
+      "status": "ok",
+      "hits": [
+        "mom_person"
+      ],
+      "expect": [
+        "mom_person"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "alias-mother-to-mom-person",
+      "type": "alias",
+      "status": "ok",
+      "hits": [
+        "mom_person"
+      ],
+      "expect": [
+        "mom_person"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "alias-tuanzi-pet",
+      "type": "alias",
+      "status": "ok",
+      "hits": [
+        "pet_cat"
+      ],
+      "expect": [
+        "pet_cat"
+      ],
+      "leaked": [],
+      "note": ""
+    },
+    {
+      "id": "alias-glossary-pending",
+      "type": "alias",
+      "status": "skip",
+      "hits": [],
+      "expect": [],
+      "leaked": [],
+      "note": "词条层未上线（skip，不计入通过）"
+    }
+  ]
+}

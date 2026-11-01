@@ -246,6 +246,66 @@ def test_host_message_is_replaced_by_fixed_text(tmp_path: Path) -> None:
     assert str(tmp_path) not in rendered
 
 
+def test_view_exposes_backup_warnings_from_current_json(tmp_path: Path) -> None:
+    """升级成功但备份不完整：告警必须从 current.json 透出到 Web 视图。"""
+    requests, status = _dirs(tmp_path)
+    _heartbeat(status)
+    request = _write_pending(requests)
+    notes = ["manifest: media_state=partial（media.tar.zst 归档时有文件正在写入，可能漏掉刚上传的媒体）"]
+    protocol.atomic_write_json(
+        status / protocol.CURRENT_FILE,
+        request.to_job().with_progress(
+            state="succeeded", stage="complete", backup_warnings=notes
+        ).to_dict(),
+        mode=0o644,
+    )
+    # 模拟宿主已经把请求 claim 掉（否则 active_job 是那条 queued 请求）。
+    protocol.remove_file(requests / protocol.PENDING_FILE)
+    channel = service.UpdateChannel(_settings(tmp_path))
+    view = channel.view(role="owner", current_version="1.0.0", current_commit=GOOD_COMMIT)
+    assert view["current_job"]["state"] == "succeeded"
+    assert view["current_job"]["backup_warnings"] == notes
+    # 展示字段不改变状态机语义：仍然是成功的终态，且不阻塞下一次提交。
+    assert view["reason"] is None
+    assert channel.executor_state().active_job is None
+
+
+def test_view_backup_warnings_default_to_empty_for_old_executor(tmp_path: Path) -> None:
+    """旧执行器不写该字段：视图给空数组，不得报错、不得改变门禁。"""
+    requests, status = _dirs(tmp_path)
+    _heartbeat(status)
+    request = _write_pending(requests)
+    payload = request.to_job().with_progress(state="succeeded", stage="complete").to_dict()
+    payload.pop("backup_warnings", None)
+    protocol.atomic_write_json(status / protocol.CURRENT_FILE, payload, mode=0o644)
+    protocol.remove_file(requests / protocol.PENDING_FILE)
+    channel = service.UpdateChannel(_settings(tmp_path))
+    view = channel.view(role="owner", current_version="1.0.0", current_commit=GOOD_COMMIT)
+    assert view["current_job"]["backup_warnings"] == []
+    assert view["reason"] is None
+    assert channel.gate(role="owner", current_version="1.0.0", current_commit=GOOD_COMMIT) is None
+
+
+def test_view_backup_warnings_do_not_bypass_gates(tmp_path: Path) -> None:
+    """带告警也不等于“可更新”：needs_manual 仍然挡住提交，角色门禁照旧。"""
+    requests, status = _dirs(tmp_path)
+    _heartbeat(status, executor_status="manual")
+    request = _write_pending(requests)
+    protocol.atomic_write_json(
+        status / protocol.CURRENT_FILE,
+        request.to_job().with_progress(
+            state="needs_manual", error_code="verify_failed", backup_warnings=["warn"]
+        ).to_dict(),
+        mode=0o644,
+    )
+    channel = service.UpdateChannel(_settings(tmp_path))
+    view = channel.view(role="owner", current_version="1.0.0", current_commit=GOOD_COMMIT)
+    assert view["current_job"]["backup_warnings"] == ["warn"]
+    assert view["reason"] == "manual_required"
+    member = channel.view(role="member", current_version="1.0.0", current_commit=GOOD_COMMIT)
+    assert member["reason"] == "not_owner"
+
+
 def test_malformed_status_files_are_ignored(tmp_path: Path) -> None:
     """坏文件不能伪装成“在线且空闲”：不可信的 pending 必须 fail closed。"""
     requests, status = _dirs(tmp_path)

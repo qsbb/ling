@@ -5,16 +5,90 @@
  *  登录 → 发送 → 逐段流式 → 停止 → 失败提示与重试 → 刷新历史 →
  *  会话切换 → 设置发布生效 → 手机尺寸可用（无遮挡）。
  *
- * 用法（后端需已运行在 BASE_URL）：
- *   node w0_browser.mjs
+ * 用法：
+ *   node tests/e2e/w0_browser.mjs
+ *     → 默认**自起隔离栈**：一次性真库 + 真 API + 真 Vite dev，端口随机高位。
+ *   BASE_URL=http://127.0.0.1:<隔离端口> node tests/e2e/w0_browser.mjs
+ *     → 复用外部实例（必须显式给出，且不能是共享的 8080）。
  *
  * 输出：逐项 PASS/FAIL 与截图路径；任一项失败则以非 0 退出。
+ *
+ * 隔离（硬约束，TASK141）：本脚本是唯一「跑真栈、真库，并且**会写库**」的浏览器实测
+ * （登录、发消息、建会话、发布配置），所以它必须自证「我写的是自己建的库」：
+ *
+ * - 默认自起真栈：`CREATE DATABASE ling_w0_e2e_<运行 id>`（UTC 时间戳 + pid + 随机），
+ *   结束时**只 DROP 本次亲手建的那一个**；不做「先 DROP 再 CREATE」，也绝不碰
+ *   `ling` / `ling_test` / 别人的库（DROP 边界在 `lib/isolation.mjs`）。
+ * - 端口一律随机高位（≥20000），**显式避开 8080 与 55432**；Vite 用 `--strictPort`；
+ *   收尾 kill 进程组并用 `lsof` 复查端口确实没人监听。
+ * - `LING_DATA_DIR` 指临时目录，不读仓库 `.data/`（那里有真实根密钥）。
+ * - **8080 拦截**：`BASE_URL` 显式给出且命中 8080 时**硬失败**（exit 2）并打印可照做的
+ *   指引，不静默跑。理由：8080 是共享的开发端口，本机若正跑着开发实例，这个脚本的
+ *   写操作会**直接写进那个真库**且没有任何提示。用的是与 `dashboard_browser.mjs:78-84`、
+ *   `update_browser.mjs:81` 同一套 `failConfig`；**默认值也再不是 8080**。
+ * - 环境变量：BASE_URL（可选；给了就复用外部实例）、LING_USER / LING_PASS（默认
+ *   `ling` / `ling-dev-password`，与自起栈的引导管理员一致）、SHOTS_DIR（默认临时目录）、
+ *   CHROME_PATH、LING_PGPORT（默认 55432）、E2E_DB_NAME、KEEP_SERVERS=1。
  */
+import { spawn, execFileSync } from 'node:child_process';
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const BASE_URL = process.env.BASE_URL || 'http://127.0.0.1:8080';
+import {
+  createIsolatedDatabase,
+  dropOwnedDatabase,
+  makeRunId,
+  onTermination,
+  resolveShotsDir,
+} from './lib/isolation.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..', '..');
+const RUN_ID = makeRunId();
+const PG_PORT = Number(process.env.LING_PGPORT || 55432);
+const PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
+/** 共享 / 保留端口：既不能当 BASE_URL，也不能当本次自起服务的端口。 */
+const FORBIDDEN_PORTS = new Set([8080, PG_PORT]);
+
+/* ------------------------------------------------------------ 配置闸门 */
+
+/** 照抄 `dashboard_browser.mjs:78-84`：配置不对就硬失败，绝不带着错配置往下跑。 */
+function failConfig(message) {
+  console.error(`配置错误：${message}`);
+  console.error('用法：node tests/e2e/w0_browser.mjs                                # 自起隔离栈（默认）');
+  console.error('      BASE_URL=http://127.0.0.1:<隔离端口> node tests/e2e/w0_browser.mjs  # 复用外部实例');
+  process.exit(2);
+}
+
+const RAW_BASE = process.env.BASE_URL;
+/** 实际访问的前端地址：复用外部实例时来自 BASE_URL；自起时由 `bootIsolatedStack()` 填。 */
+let BASE_URL = null;
+
+if (RAW_BASE) {
+  let parsed;
+  try {
+    parsed = new URL(RAW_BASE);
+  } catch {
+    failConfig(`BASE_URL 不是合法 URL：${RAW_BASE}`);
+  }
+  if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(parsed.hostname)) {
+    failConfig(`BASE_URL 必须指向本机隔离实例，收到 ${parsed.hostname}`);
+  }
+  const port = parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80;
+  if (port === 8080) {
+    failConfig(
+      'BASE_URL 不能是共享的 8080：那上面若有开发实例，本脚本的登录/发消息/建会话' +
+        '会直接写进它的真库，且没有任何提示。请去掉 BASE_URL 让脚本自起隔离栈' +
+        '（默认做法），或显式指向一个随机高位端口（例如 47901）。',
+    );
+  }
+  if (!Number.isInteger(port) || port <= 0) failConfig(`BASE_URL 端口不合法：${RAW_BASE}`);
+  BASE_URL = RAW_BASE;
+}
 
 // 先等就绪再开跑。
 // 不等的话，服务刚重启时会出"假失败"：登录拿到 200、紧接着的
@@ -34,12 +108,302 @@ async function waitReady(timeoutMs = 60000) {
   }
   return false;
 }
-const EXECUTABLE = process.env.CHROME_PATH ||
-  process.env.CHROME_PATH;
+const EXECUTABLE = process.env.CHROME_PATH || undefined;
 const USER = process.env.LING_USER || 'ling';
 const PASS = process.env.LING_PASS || 'ling-dev-password';
-const SHOTS = process.env.SHOTS_DIR || path.resolve('shots');
+// 截图默认写临时目录：不默认往仓库的 shots/ 里写，免得覆盖别人的证据。
+const SHOTS_INFO = resolveShotsDir('w0', RUN_ID);
+const SHOTS = SHOTS_INFO.dir;
 fs.mkdirSync(SHOTS, { recursive: true });
+console.log(
+  `截图 / 日志目录：${SHOTS}` +
+    (SHOTS_INFO.fromEnv ? '（SHOTS_DIR 显式指定）' : '（未设 SHOTS_DIR，默认临时目录，不写仓库）'),
+);
+
+/* --------------------------------------------------------- 隔离栈（默认路径） */
+
+/**
+ * 为什么本脚本要自起栈，而不是「有 BASE_URL 就行」：
+ * 它做的是**写操作**（登录、发消息、建会话、发布配置）。让「写哪儿」取决于一个
+ * 环境变量，就等于让一次误配把测试数据写进别人的库。自起栈把「写」的对象变成
+ * 本次运行亲手 CREATE 的那个库——这时才谈得上「跑完能自己删干净」。
+ *
+ * 复用外部实例（显式 BASE_URL）仍然保留：CI 里已有栈、或调试别人的实例时需要它。
+ * 那条路径的残余风险写在脚本头部与 README（本次库无法自证，只能靠调用方保证）。
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function waitUntil(fn, label, timeout = 20_000, interval = 150) {
+  const deadline = Date.now() + timeout;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = await fn();
+      if (last) return last;
+    } catch (error) {
+      last = error;
+    }
+    await sleep(interval);
+  }
+  throw new Error(
+    `等待超时：${label}（最后结果：${last instanceof Error ? last.message : String(last)}）`,
+  );
+}
+
+/** 随机高位端口：**显式**避开 8080 / 55432，而不是「碰巧没抽到」。 */
+async function freePort() {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const port = await new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.unref();
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        server.close(() => resolve(address.port));
+      });
+    });
+    if (port >= 20_000 && !FORBIDDEN_PORTS.has(port)) return port;
+  }
+  throw new Error('无法找到可用的高位端口（连续 12 次都落在受限区间）');
+}
+
+function listeningOn(port) {
+  try {
+    return execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).trim();
+  } catch (error) {
+    if (error.status === 1) return '';
+    throw error;
+  }
+}
+
+function startProcess(label, command, args, options) {
+  const fd = fs.openSync(options.logPath, 'a');
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    detached: true,
+    stdio: ['ignore', fd, fd],
+  });
+  fs.closeSync(fd);
+  child.__label = label;
+  child.on('exit', (code, signal) => {
+    // 0 = 正常退出；143 = 被本脚本自己 SIGTERM 收掉。两者都不算失败。
+    const normal = code === null || code === 0 || code === 143;
+    if (!normal) console.error(`[${label}] 进程退出 code=${code} signal=${signal}，日志：${options.logPath}`);
+  });
+  return child;
+}
+
+async function stopProcess(child, label) {
+  if (!child || child.exitCode !== null) return;
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      /* 已经没了 */
+    }
+  }
+  const exited = await Promise.race([
+    new Promise((resolve) => child.once('exit', () => resolve(true))),
+    sleep(6_000).then(() => false),
+  ]);
+  if (!exited) {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      /* 已经没了 */
+    }
+    console.log(`[${label}] 未在 6s 内退出，已 SIGKILL`);
+  }
+}
+
+async function httpStatus(url) {
+  try {
+    const response = await fetch(url);
+    return response.status;
+  } catch {
+    return 0;
+  }
+}
+
+/** 本次运行自建的库名；**只有它**会被 DROP（边界见 lib/isolation.mjs）。 */
+let DB_NAME = null;
+const servers = [];
+let apiBase = null;
+let webPort = null;
+let apiPort = null;
+let tmpRoot = null;
+/** 复用外部实例时，本脚本不拥有它，收尾时也不能杀它。 */
+let ownsStack = false;
+
+async function bootIsolatedStack() {
+  // 1) 库：先 CREATE，被占用就换名；只删本次自己建的。
+  const created = createIsolatedDatabase({
+    tag: 'w0',
+    pgPort: PG_PORT,
+    python: PYTHON,
+    repoRoot: REPO_ROOT,
+    runId: RUN_ID,
+  });
+  DB_NAME = created.name;
+
+  // 2) API：真 PostgreSQL + 临时数据目录（不读仓库 .data/ 里的真实根密钥）。
+  apiPort = await freePort();
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ling-w0-e2e-'));
+  const dataDir = path.join(tmpRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  const apiLog = path.join(SHOTS, 'api.log');
+  fs.writeFileSync(apiLog, '');
+  const apiEnv = {
+    ...process.env,
+    LING_ENV: 'dev',
+    LING_HOST: '127.0.0.1',
+    LING_PORT: String(apiPort),
+    LING_DATABASE_URL: `postgresql+asyncpg://ling@127.0.0.1:${PG_PORT}/${DB_NAME}`,
+    LING_BOOTSTRAP_ADMIN: USER,
+    LING_BOOTSTRAP_ADMIN_PASSWORD: PASS,
+    // 显式给口令 → must_change_password=false，不会撞上「首次登录必须先改密」的闸。
+    LING_TEST_MODE: '1',
+    LING_DATA_DIR: dataDir,
+    LING_COOKIE_NAME: 'w0_e2e_sid',
+    LING_ONEBOT_WS_PORT: '',
+    LING_QQ_ENABLED: '0',
+    LING_QQBOT_ENABLED: '0',
+    LING_UPDATE_ENABLED: '0',
+    LING_ACCESS_MODE: 'off',
+    LING_USER_TIMEZONE: 'Asia/Shanghai',
+    // 前端由 Vite dev 提供（它负责 /v1、/healthz、/readyz 代理）。
+    LING_WEB_DIST: '',
+  };
+  const apiChild = startProcess('api', PYTHON, ['-m', 'ling'], {
+    cwd: REPO_ROOT,
+    env: apiEnv,
+    logPath: apiLog,
+  });
+  servers.push({ child: apiChild, label: `api:${apiPort}` });
+  apiBase = `http://127.0.0.1:${apiPort}`;
+
+  await waitUntil(
+    async () => (await httpStatus(`${apiBase}/healthz`)) === 200,
+    `API ${apiBase}/healthz 就绪（日志 ${apiLog}）`,
+    60_000,
+  );
+  const ready = await httpStatus(`${apiBase}/readyz`);
+  assert(ready === 200, `API 就绪检查失败（HTTP ${ready}）：见 ${apiLog}`);
+
+  // 3) 前端：Vite dev，随机高位端口 + --strictPort（被占用就失败，不偷偷换端口）。
+  webPort = await freePort();
+  const webLog = path.join(SHOTS, 'vite.log');
+  fs.writeFileSync(webLog, '');
+  const viteBin = path.join(REPO_ROOT, 'clients', 'web-console', 'node_modules', 'vite', 'bin', 'vite.js');
+  const webChild = startProcess(
+    'web',
+    process.execPath,
+    [viteBin, '--port', String(webPort), '--strictPort', '--host', '127.0.0.1'],
+    {
+      cwd: path.join(REPO_ROOT, 'clients', 'web-console'),
+      env: { ...process.env, LING_API_TARGET: apiBase },
+      logPath: webLog,
+    },
+  );
+  servers.push({ child: webChild, label: `web:${webPort}` });
+  BASE_URL = `http://127.0.0.1:${webPort}`;
+
+  await waitUntil(
+    async () => (await httpStatus(`${BASE_URL}/`)) === 200,
+    `前端 ${BASE_URL} 就绪（日志 ${webLog}）`,
+    60_000,
+  );
+
+  ownsStack = true;
+  console.log(
+    `隔离栈：库 ${DB_NAME}@127.0.0.1:${PG_PORT} · API ${apiBase} · 前端 ${BASE_URL}` +
+      `（跑完 kill 进程组 + 只删这个库）`,
+  );
+}
+
+/* ---------------------------------------------------------- 收尾（幂等 + 单飞） */
+
+const cleanupState = { done: false, portsClean: true, dbDropped: false, dbError: null };
+/** 收尾只跑一次；**后来者等这一次跑完**，而不是拿一个「已经开始但没结束」的结果就走。 */
+let cleanupPromise = null;
+/** 收到 SIGINT/SIGTERM 时的信号名；决定最终退出码（130 / 143）。 */
+let interruptedSignal = null;
+
+/**
+ * 收尾顺序：kill 服务进程组 → `lsof` 复查端口 → 只删本次自建的库。
+ * 先 kill 再删库：DROP 只对本次 `CREATE DATABASE` 亲手建的名字执行，与进程无关，
+ * 但残留连接会让 DROP 需要 `WITH (FORCE)`；先把写库的进程停掉更干净。
+ *
+ * **必须单飞**（TASK141 实测踩过）：原来的写法是「`done` 标记一置就立刻返回」，
+ * 于是 Ctrl-C / SIGTERM 时会出现两个调用者——信号处理器在杀进程、主流程的
+ * `finally` 拿到的却是「已 done」的空结果，然后主流程继续往下走并 `process.exit()`，
+ * **把还在 await 的收尾直接切断**。留下的现场是：API 进程还活着、自建库还在
+ * `pg_database` 里，而脚本已经打印了「退出码 1」。所以这里改成返回同一个 Promise：
+ * 谁先到谁真正执行，后来者等它结束。
+ */
+function cleanupResources() {
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    cleanupState.done = true;
+
+    if (!ownsStack) {
+      // 复用外部实例：本脚本没有它的所有权，不杀、不删，只把这件事说清楚。
+      cleanupState.dbDropped = true;
+      return cleanupState;
+    }
+
+    if (process.env.KEEP_SERVERS === '1') {
+      console.log(
+        `KEEP_SERVERS=1：API ${apiBase} / 前端 ${BASE_URL} 保留` +
+          (DB_NAME ? `、测试库 ${DB_NAME}（调试完请手动删）` : ''),
+      );
+      return cleanupState;
+    }
+
+    for (const server of servers.reverse()) {
+      await stopProcess(server.child, server.label);
+    }
+    for (const port of [apiPort, webPort]) {
+      if (!port) continue;
+      const still = listeningOn(port);
+      if (still) {
+        console.error(`端口 ${port} 仍在监听：\n${still}`);
+        cleanupState.portsClean = false;
+      } else {
+        console.log(`端口 ${port} 已释放`);
+      }
+    }
+
+    if (DB_NAME) {
+      try {
+        dropOwnedDatabase({ name: DB_NAME, pgPort: PG_PORT, python: PYTHON, repoRoot: REPO_ROOT });
+        cleanupState.dbDropped = true;
+      } catch (error) {
+        cleanupState.dbError = error?.message || String(error);
+        console.error(`\nFAIL  清理本次测试库失败：${cleanupState.dbError}`);
+      }
+    } else {
+      cleanupState.dbDropped = true;
+    }
+    return cleanupState;
+  })();
+  return cleanupPromise;
+}
+
+onTermination(async (signal) => {
+  // 记下信号：主流程的 finally 与这里**共用同一个收尾 Promise**，两边都等它跑完，
+  // 并且都用同一个退出码（130 / 143）。否则会出现「收尾其实成功了，但主流程先
+  // 打印退出码 1」这种自相矛盾的输出——实测踩过。
+  interruptedSignal = signal;
+  await cleanupResources();
+});
 
 const results = [];
 function record(name, ok, detail = '') {
@@ -101,7 +465,7 @@ async function login(page) {
   // DOM 里（实测 3 个 textarea），判断会永远为假，于是停在不带发送按钮的
   // 总览页，后续点击超时。用发送按钮本身作为信号。
   if ((await page.locator('button[aria-label="发送消息"]').count()) === 0) {
-    const brand = page.locator('button.brand').first();
+    const brand = page.locator('[data-testid="brand-home"]').first();
     if (await brand.count()) await brand.click();
     await page
       .waitForFunction(() => !!document.querySelector('textarea'), { timeout: 20000 })
@@ -632,7 +996,7 @@ async function runDashboard(browser) {
 
   // 兜底只为继续测其它项，不掩盖上面的失败
   if (!/\/dashboard/.test(page.url())) {
-    const navBtn = page.locator('button.header-link:has-text("总览")').first();
+    const navBtn = page.locator('[data-testid="nav-dashboard"]').first();
     if (await navBtn.count()) await navBtn.click();
   }
   await page.waitForTimeout(1500);
@@ -670,8 +1034,8 @@ async function runDashboard(browser) {
   // 常见故障：整页变成错误页
   record('总览：没有整页错误', !/读取失败|无法加载/i.test(body));
 
-  // 顶栏能回到聊天
-  const brand = page.locator('button.brand').first();
+  // 顶栏 logo 能回到聊天（`brand-home`；`nav-chat` 只属于左导航「对话」项）
+  const brand = page.locator('[data-testid="brand-home"]').first();
   if (await brand.count()) await brand.click();
   await page.waitForSelector('button[aria-label="发送消息"]:not([disabled])', { timeout: 15000 }).catch(() => {});
   record('总览：点标识能进聊天', (await page.locator('button[aria-label="发送消息"]').count()) > 0);
@@ -686,7 +1050,7 @@ async function runAccountPage(browser) {
   const page = await context.newPage();
   await login(page);
 
-  const settingsBtn = page.locator('button.header-link:has-text("设置")').first();
+  const settingsBtn = page.locator('[data-testid="nav-settings"]').first();
   await settingsBtn.click();
   await page.waitForTimeout(1000);
 
@@ -714,7 +1078,7 @@ async function runSettingsPage(browser) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
   await login(page);
-  const settingsBtn = page.locator('button.header-link:has-text("设置")').first();
+  const settingsBtn = page.locator('[data-testid="nav-settings"]').first();
   if (await settingsBtn.count()) {
     await settingsBtn.click();
     await page.waitForTimeout(1200);
@@ -730,21 +1094,49 @@ async function runSettingsPage(browser) {
   await context.close();
 }
 
-if (!(await waitReady())) {
-  console.error(`服务未就绪：${BASE_URL}/readyz`);
-  process.exit(1);
-}
+/* ---------------------------------------------------------------- main */
 
-const browser = await chromium.launch({ executablePath: EXECUTABLE });
+let exitCode = 0;
+let browser = null;
 try {
+  if (BASE_URL) {
+    // 复用外部实例：本脚本不拥有它，也不会删它的库。这条路径的残余风险是
+    // 「写的到底是哪个库」只能由调用方保证——所以 BASE_URL 必须显式给、必须
+    // 不是 8080，且脚本会把它打印出来（见文件头部的 8080 闸门）。
+    console.log(`复用外部实例：BASE_URL=${BASE_URL}（不自起栈、不自建库）`);
+  } else {
+    await bootIsolatedStack();
+  }
+
+  if (!(await waitReady())) {
+    throw new Error(`服务未就绪：${BASE_URL}/readyz`);
+  }
+
+  browser = await chromium.launch({ executablePath: EXECUTABLE });
+  console.log(`浏览器：${browser.version()}${EXECUTABLE ? `（CHROME_PATH=${EXECUTABLE}）` : '（内置缓存）'}`);
   await runDesktop(browser);
   await runMobile(browser);
   await runFailureRetry(browser);
   await runSettingsPage(browser);
   await runAccountPage(browser);
   await runDashboard(browser);
+} catch (error) {
+  console.error(`\nFAIL  ${error instanceof Error ? error.message : String(error)}`);
+  exitCode = 1;
 } finally {
-  await browser.close();
+  if (browser) await browser.close().catch(() => {});
+  // 正常结束、断言失败、Ctrl-C/SIGTERM 都走这里：kill 进程组 → lsof 复查端口
+  // → 只删本次自建的库。若信号处理器已经先到，这里等的是**同一个** Promise，
+  // 不会把它的收尾切断（见 cleanupResources 的注释）。
+  const state = await cleanupResources();
+  if (!state.portsClean) exitCode = 1;
+  if (state.dbError) exitCode = 1;
+  if (!state.dbDropped && process.env.KEEP_SERVERS !== '1' && DB_NAME) exitCode = 1;
+  // 被信号打断时用约定的退出码（130/143），而不是笼统的 1：
+  // 调用方（CI、批跑脚本）靠它区分「断言失败」与「被 Ctrl-C / SIGTERM 打断」。
+  // 打断时一定有半截断言没跑完（浏览器已关），所以这里让信号码优先，
+  // 并在汇总里如实说明「收尾已跑完、断言未跑完」。
+  if (interruptedSignal) exitCode = interruptedSignal === 'SIGINT' ? 130 : 143;
 }
 
 const failed = results.filter((r) => r.ok === false);
@@ -759,6 +1151,13 @@ if (skipped.length) {
 if (failed.length) {
   console.log('失败项：');
   for (const f of failed) console.log(` - ${f.name} ${f.detail}`);
-  process.exit(1);
+  exitCode = 1;
 }
-console.log(skipped.length ? '其余全部通过' : '全部通过');
+if (exitCode === 0) console.log(skipped.length ? '其余全部通过' : '全部通过');
+else if (interruptedSignal) console.log(`被 ${interruptedSignal} 打断（收尾已跑完），退出码 ${exitCode}`);
+else console.log(`退出码 ${exitCode}`);
+console.log(
+  `截图 / 日志目录：${SHOTS}` +
+    (SHOTS_INFO.fromEnv ? '（SHOTS_DIR 显式指定，会写到那里）' : '（默认临时目录；设 SHOTS_DIR 可改）'),
+);
+process.exit(exitCode);

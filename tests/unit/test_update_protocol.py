@@ -121,6 +121,94 @@ def test_invalid_jobs_rejected(overrides: dict[str, object]) -> None:
     assert protocol.UpdateJob.from_dict(payload) is None
 
 
+# -------------------------------------------------- 备份告警（可选字段，task-76）
+
+
+def test_job_backup_warnings_default_to_empty_when_absent() -> None:
+    """旧执行器不写该字段：API 必须当成空数组，不得报错。"""
+    payload = _job(state="succeeded", stage="complete").to_dict()
+    payload.pop("backup_warnings", None)
+    parsed = protocol.UpdateJob.from_dict(payload)
+    assert parsed is not None
+    assert parsed.backup_warnings == ()
+    assert parsed.to_dict()["backup_warnings"] == []
+
+
+def test_job_backup_warnings_are_round_tripped() -> None:
+    notes = (
+        "manifest: media_state=partial（media.tar.zst 归档时有文件正在写入，可能漏掉刚上传的媒体）",
+        "manifest 缺少 dump_sha256（旧格式）：未能校验 dump 字节",
+    )
+    job = _job(state="succeeded", stage="complete", backup_warnings=notes)
+    payload = job.to_dict()
+    assert payload["backup_warnings"] == list(notes)
+    parsed = protocol.UpdateJob.from_dict(payload)
+    assert parsed is not None
+    assert parsed.backup_warnings == notes
+    # 状态机语义不变：告警不改变 state/stage/message。
+    assert parsed.state == "succeeded"
+    assert parsed.to_dict()["message"] == protocol.STAGE_MESSAGES["complete"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "not-a-list",
+        {"a": 1},
+        123,
+        ["ok-note", 5, ""],
+        ["x" * (protocol.MAX_BACKUP_WARNING_LEN + 1)],
+        ["two\nlines"],
+    ],
+)
+def test_job_backup_warnings_sanitized_on_read(raw: object) -> None:
+    """类型错/超长/多行/非字符串条目：只丢那一条，绝不把整个任务判为不可解析。"""
+    payload = _job(state="succeeded", stage="complete").to_dict()
+    payload["backup_warnings"] = raw
+    parsed = protocol.UpdateJob.from_dict(payload)
+    assert parsed is not None
+    assert parsed.state == "succeeded"
+    assert all(isinstance(note, str) and note for note in parsed.backup_warnings)
+    assert len(parsed.backup_warnings) <= 1
+    assert not any("\n" in note for note in parsed.backup_warnings)
+
+
+def test_job_backup_warnings_are_capped() -> None:
+    raw = [f"note-{index}" for index in range(protocol.MAX_BACKUP_WARNINGS + 4)]
+    assert len(protocol.sanitize_backup_warnings(raw)) == protocol.MAX_BACKUP_WARNINGS
+
+
+def test_job_unknown_fields_are_ignored_for_forward_compat() -> None:
+    """新执行器的多余字段不能把旧 api 的视图变成“无法解析”。"""
+    payload = _job(state="succeeded", stage="complete").to_dict()
+    payload["future_field"] = "whatever"
+    payload["backup_warnings"] = ["warn"]
+    parsed = protocol.UpdateJob.from_dict(payload)
+    assert parsed is not None
+    assert parsed.backup_warnings == ("warn",)
+
+
+def test_with_progress_keeps_backup_warnings_unless_overridden() -> None:
+    job = _job(state="running", stage="backup", backup_warnings=("warn",))
+    assert job.with_progress(state="running", stage="fetch").backup_warnings == ("warn",)
+    assert job.with_progress(state="succeeded", stage="complete").backup_warnings == ("warn",)
+    assert (
+        job.with_progress(state="succeeded", stage="complete", backup_warnings=[]).backup_warnings
+        == ()
+    )
+
+
+def test_job_rejects_illegal_backup_warnings() -> None:
+    """写入侧严格：非法条目直接拒绝，绝不让脏数据落到 current.json。"""
+    with pytest.raises(protocol.ProtocolError):
+        _job(backup_warnings=["two\nlines"])
+    with pytest.raises(protocol.ProtocolError):
+        _job(backup_warnings=["x" * (protocol.MAX_BACKUP_WARNING_LEN + 1)])
+    with pytest.raises(protocol.ProtocolError):
+        _job(backup_warnings=[5])
+
+
 def test_unknown_error_code_has_no_message() -> None:
     assert protocol.message_for("nope") is None
     assert protocol.message_for(None) is None
