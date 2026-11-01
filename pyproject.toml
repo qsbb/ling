@@ -1,6 +1,6 @@
 [project]
 name = "ling"
-version = "0.1.0"
+version = "0.0.1"
 description = "ling：独立的拟人化 AI 角色系统（会话优先）"
 readme = "README.md"
 requires-python = ">=3.12"

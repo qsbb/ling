@@ -1,7 +1,7 @@
 {
   "name": "ling-web-console",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "ling Web 控制台：会话优先的聊天界面（W0）",
   "scripts": {

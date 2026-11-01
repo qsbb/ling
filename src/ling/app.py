@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 from starlette.middleware.base import BaseHTTPMiddleware, Response
 
+from ling import __version__
 from ling.api.errors import LingError, error_response, ling_error_handler
 from ling.config import Settings, get_settings
 from ling.contracts.v1 import ErrorCode
@@ -335,7 +336,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(
         title="ling",
-        version="0.1.0",
+        version=__version__,
         description="独立的拟人化 AI 角色系统（会话优先）",
         lifespan=lifespan,
         docs_url="/api/docs" if settings.env != "production" else None,

@@ -47,6 +47,8 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
+from ling import __version__
+
 # 字段名命中这些就整值替换。**宁可多拦**：漏一个的成本远大于多打一个 [REDACTED]。
 SENSITIVE_KEYS: frozenset[str] = frozenset(
     {
@@ -267,7 +269,7 @@ class TextFormatter(logging.Formatter):
 
 def _service_meta() -> tuple[str, str]:
     service = os.environ.get("LING_LOG_SERVICE", "ling")
-    version = os.environ.get("LING_VERSION", "0.1.0")
+    version = os.environ.get("LING_VERSION") or __version__
     return service, version
 
 

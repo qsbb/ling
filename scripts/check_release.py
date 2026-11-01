@@ -144,6 +144,51 @@ def parsed_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+
+# 需要扫的源码目录：只扫 Python 源码，不扫测试（测试里的版本号是 fixture，
+# 故意写死成某个值来验比较逻辑，改它没有意义）。
+# **只扫这两个文件**，不扫整个源码树。原因：全树扫会把 `capabilities/tools.py`
+# 里 `ToolSpec.version="1.0.0"` 这种**工具规格自身的版本号**当成应用版本误报。
+# 那三处是每个工具独立的 ABI 版本，与应用版本无关，永远不该跟着 pyproject 走。
+# 真正容易不同步的是"应用版本在别处又被硬编码一份"的地方，历史上就是这两个：
+#   - app.py 的 FastAPI(version=...)  → 决定 /api/openapi.json 的 info.version
+#   - logging_setup.py 的日志服务版本 → 决定启动日志里的 version 字段
+_VERSION_SCAN_FILES = (
+    "src/ling/app.py",
+    "src/ling/logging_setup.py",
+)
+# 版本字面量形如 "1.2.3" / '1.2.3'；只认这种完整三段式，避免误伤
+# 0.1 之类的浮点或注释里的半截版本。
+_VERSION_LITERAL_RE = re.compile(r"""["'](\d+\.\d+\.\d+)["']""")
+
+
+def find_stale_version_literals(root: Path, expected: str) -> list[tuple[str, int]]:
+    """找出源码里残留的、与 expected 不同的三段式版本字面量。
+
+    为什么需要它：`app.py` 的 FastAPI `version=` 和 `logging_setup.py` 的
+    服务版本曾经各自写死一份字面量，`check_release.py` 只看 pyproject /
+    `__init__.py` / `package.json` 三处，于是改版本时这两份会静默不同步——
+    `/v1/version` 说一个数、`/api/openapi.json` 说另一个数。
+    现在两处都改成引用 `__version__`，这个检查是**防止有人再写回去**。
+
+    返回 [(相对路径, 行号)]，空列表表示干净。
+    """
+    hits: list[tuple[str, int]] = []
+    for rel_path in _VERSION_SCAN_FILES:
+        path = root / rel_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for match in _VERSION_LITERAL_RE.finditer(line):
+                if match.group(1) != expected:
+                    hits.append((str(path.relative_to(root)), lineno))
+    return hits
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parsed_args(argv)
@@ -177,6 +222,16 @@ def main(argv: list[str] | None = None) -> int:
         }
     except ValueError as exc:
         return fail(str(exc))
+
+    # 另外两处是**同一版本号的硬编码副本**：FastAPI 的 `version=` 与日志里的
+    # 服务版本。它们不在 tag 一致性检查的历史范围内（历史上是写死的字面量），
+    # 一旦与 pyproject 不同步，`/v1/version` 与 `/api/openapi.json` 会报两个
+    # 不同的版本号，而 CI 的 tag 检查**发现不了**。所以这里也扫一遍源码：
+    # 只要某文件里还残留与 expected 不同的旧版本字面量，就判失败。
+    stale = find_stale_version_literals(root, expected)
+    if stale:
+        detail = "；".join(f"{path}:{line}" for path, line in stale)
+        return fail(f"源码里还有与 {expected} 不一致的版本字面量：{detail}")
 
     mismatched = {name: value for name, value in versions.items() if value != expected}
     if mismatched:
