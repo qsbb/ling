@@ -78,6 +78,29 @@
 
 ## 运行
 
+### 前置条件：先装 `clients/web-console` 的依赖
+
+playwright 是 `clients/web-console` 的 devDependency（跟 `pnpm-lock.yaml` 一致），
+**仓库根没有 `node_modules`**。所以第一次跑（或干净检出）必须先装一次：
+
+```bash
+pnpm -C clients/web-console install
+```
+
+所有 e2e 脚本都通过 `tests/e2e/lib/playwright.mjs` 的 `loadChromium()` 解析 playwright，
+顺序是：① `clients/web-console`（正式安装位置）→ ② 仓库根 `node_modules` →
+③ 直连 `import('playwright')`（全局装过的人）。三者都失败时脚本以 **exit 2** 退出，
+并打印每一次尝试的原因 + 上面那条修复命令——不会只甩一个 `ERR_MODULE_NOT_FOUND`。
+
+> 不装就直接跑，报错长这样（实测干净检出）：
+> `配置错误：找不到 playwright。` + 三行「哪一级、为什么没成」
+> + `修复：pnpm -C clients/web-console install`，退出码 2。
+
+后端 API 还需要仓库的 Python 虚拟环境（`.venv`，见根 `README.md` 的 `uv venv` 一节）；
+`memory` / `nav` / `w0` 三个会自起真 API 的脚本都靠它连 PostgreSQL。
+
+### 默认一条命令（`w0_browser.mjs`）
+
 **默认一条命令，自起隔离栈**（一次性真库 + 真 API + 真 Vite，端口随机 ≥20000）：
 
 ```bash

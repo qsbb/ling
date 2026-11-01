@@ -29,9 +29,11 @@
  * - 环境变量：BASE_URL（可选；给了就复用外部实例）、LING_USER / LING_PASS（默认
  *   `ling` / `ling-dev-password`，与自起栈的引导管理员一致）、SHOTS_DIR（默认临时目录）、
  *   CHROME_PATH、LING_PGPORT（默认 55432）、E2E_DB_NAME、KEEP_SERVERS=1。
+ * - **前置依赖**：playwright 装在 `clients/web-console`（devDependency），仓库根没有
+ *   `node_modules`。干净检出先跑一次 `pnpm -C clients/web-console install`，否则解析不到
+ *   playwright（解析顺序与报错见 `lib/playwright.mjs`）。后端 API 还要求仓库 `.venv`。
  */
 import { spawn, execFileSync } from 'node:child_process';
-import { chromium } from 'playwright';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -45,6 +47,7 @@ import {
   onTermination,
   resolveShotsDir,
 } from './lib/isolation.mjs';
+import { loadChromium } from './lib/playwright.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -108,6 +111,11 @@ async function waitReady(timeoutMs = 60000) {
   }
   return false;
 }
+// playwright 解析放在 lib/playwright.mjs：`clients/web-console` → 仓库根 node_modules
+// → 直连 import，三者都失败时给可照做的修复命令（exit 2），而不是裸的
+// ERR_MODULE_NOT_FOUND。原来这里是裸 `import { chromium } from 'playwright'`，
+// 干净检出（无仓库根 node_modules）照 README 跑就 exit 1。
+const { chromium, origin: PLAYWRIGHT_ORIGIN } = await loadChromium();
 const EXECUTABLE = process.env.CHROME_PATH || undefined;
 const USER = process.env.LING_USER || 'ling';
 const PASS = process.env.LING_PASS || 'ling-dev-password';
@@ -1113,6 +1121,7 @@ try {
   }
 
   browser = await chromium.launch({ executablePath: EXECUTABLE });
+  console.log(`Playwright：${PLAYWRIGHT_ORIGIN}`);
   console.log(`浏览器：${browser.version()}${EXECUTABLE ? `（CHROME_PATH=${EXECUTABLE}）` : '（内置缓存）'}`);
   await runDesktop(browser);
   await runMobile(browser);

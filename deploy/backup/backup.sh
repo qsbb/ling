@@ -37,7 +37,8 @@
 #      缺 LING_DATABASE_URL / compose 模式缺 docker）
 #   3  pg_dump 失败或导出为空（仅 compose 模式显式映射；直接模式下 pg_dump 的
 #      非零退出码由 `set -e` 原样透传，**不保证是 3**）
-#   4  容器内根密钥读取失败（无法确认密钥状态，本次备份作废）
+#   4  容器内根密钥读取失败**或完整性自校验失败**（容器侧 sha256 与归档字节
+#      不一致 / 容器没回传哈希；无法确认密钥状态，本次备份作废）
 #   5  媒体归档**致命**失败（compose：tar rc>=2 或 tar -tf 读不出目录；
 #      直接模式：tar 非零）。compose 的 tar rc=1 是 media_state=partial，
 #      **不算 5**，仍 exit 0
@@ -64,6 +65,10 @@
 # 取数方式：`docker compose exec -T api` 在容器内 `tar`/`cat`，stdout 直接落到
 # 宿主机备份目录——命名卷在宿主不可直接访问；api 根文件系统只读（不在容器内
 # 写临时文件），大文件也不经过内存。任何一步失败都非零退出并清理半成品。
+# **`-T` 是承重的**（真机实测）：少了它且宿主有 TTY 时 docker 会分配 pty，TTY 层
+# 给字节流加 NUL/CRLF 而**退出码仍是 0**。媒体侧会因 `tar -tf` 读不出目录而响亮
+# 失败（exit 5），根密钥侧却会静默写坏——所以根密钥那条自带"容器侧哈希 vs 归档
+# 字节哈希"的自校验（见下方根密钥段），不再依赖"记得写 -T"。
 set -euo pipefail
 
 USAGE="用法: $0 OUT_DIR [--prune-keep N] [--prune-days D] [--dry-run] [--force-unlock]"
@@ -279,7 +284,8 @@ cleanup_partial() {
   if [[ "${LOCK_ACQUIRED}" != "1" ]]; then
     return 0
   fi
-  rm -f "${OUT_DIR}/.root.key.part.$$" "${OUT_DIR}/.media-${STAMP}.tar.part" \
+  rm -f "${OUT_DIR}/.root.key.part.$$" "${OUT_DIR}/.root.key.sha.$$" \
+    "${OUT_DIR}/.media-${STAMP}.tar.part" \
     "${OUT_DIR}/.media-${STAMP}.err" 2>/dev/null || true
   if [[ "${BACKUP_OK}" == "1" ]]; then
     if [[ -n "${KEYS_PREV}" ]]; then
@@ -327,18 +333,28 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# 归档根密钥前先给**已有的** `keys/root.key` 留一份原字节副本（0600）。
+# 归档根密钥前先给**已有的** `keys/root.key` 留一份原字节副本（创建时 group/other
+# 位即为 0，常见文件系统上是 0600，见下）。
 # 失败时 `cleanup_partial` 用它把历史备份的密钥放回原位，成功时由 trap 删掉。
 # 为什么是"复制"而不是"移走"：复制不会出现"文件暂时不存在"的窗口——进程被
 # kill -9 打断时，`keys/root.key` 仍在原地（最坏只是多一个 `.root.key.prev.<pid>`
 # 垃圾）。这里只复制**本目录内**已经落盘的那份副本，用重定向完成，不再调外部
 # `cp`（命名卷里的密钥没法靠宿主 `cp` 取，见文件头的取数方式说明）。
 #
-# **创建即 0600**：重定向创建文件走 `0666 & ~umask`，默认 umask 022 会先落一个
-# **0644**，随后的 `chmod 600` 之间就有一个"同机其他用户可读根密钥字节"的窗口
-# （cron 路径的备份目录本来就是 0755）。所以把重定向放进 `umask 077` 的子 shell
-# **内**执行——重定向在子 shell 里做，文件一出生就是 0600（子 shell 内的 `cat`
-# 失败仍会让整个子 shell 非零退出，fail closed 语义不变）。
+# **创建瞬间就必须"同机其他用户读不到"**：重定向创建文件走 `0666 & ~umask`，默认
+# umask 022 会先落一个 **0644**，随后的 `chmod 600` 之间就有一个"同机其他用户可读
+# 根密钥字节"的窗口（cron 路径的备份目录本来就是 0755）。所以把重定向放进
+# `umask 077` 的子 shell **内**执行——重定向在子 shell 里做，文件一出生 group/other
+# 位就是 0（子 shell 内的 `cat` 失败仍会让整个子 shell 非零退出，fail closed 语义
+# 不变）。
+#
+# 这里要保证的不变量是 **`mode & 0o077 == 0`**（group / other 位全为 0），**不是**
+# "恰好 0600"。`0600` 只是"常见 umask + 常见文件系统"下的**结果**：在 ext4/xfs 上
+# `0666 & ~077` 就是 0600；而 NAS 的 btrfs + Synology `trimacl` 上，同一段代码建
+# 出来的文件是 **0700**（owner 多了一个 x 位，group/other 仍是 0）——同样安全，
+# 因为真正要挡的是"同机其他用户"，不是 owner 自己的 x 位。所以注释、测试断言都
+# 以 `mode & 0o077 == 0` 为准；只有显式 `chmod 600` 之后的**正式产物**才断言精确
+# 0600（那是脚本自己设的，与 umask/文件系统无关）。
 stash_existing_keys() {
   KEYS_PREV=""
   KEYS_PREEXISTED=0
@@ -718,9 +734,15 @@ acquire_lock
 # 不给这条路的话，"已安装每日备份"实际上一份都备不出来。
 VIA_COMPOSE="${LING_BACKUP_VIA_COMPOSE:-0}"
 COMPOSE_FILE="${LING_COMPOSE_FILE:-deploy/compose.yaml}"
-# 项目名必须显式给：`docker compose -f 路径` 会按**文件所在目录名**推导项目名，
-# 从 cron 里跑时目录往往与真实项目名不同（实测：项目叫 ling-verify，
-# 目录叫 deploy），于是 exec 找不到正在运行的容器。
+# 项目名必须显式给。两条独立理由：
+#   1) `docker compose -f 路径` 会按**文件所在目录名**推导项目名，从 cron 里跑时
+#      目录往往与真实项目名不同（实测：项目叫 ling-verify，目录叫 deploy）；
+#   2) **Compose v5 的 `exec` 根本不看 `-f`**：它按 project + service 的 label
+#      找正在运行的容器（真机实测：`-f /nonexistent.yaml` 仍 rc=0 且命令照常
+#      执行；`-f` 指向插值必失败的 compose 也 rc=0）。所以对 exec 而言
+#      **`-p` 是唯一承重的参数**，`-f` 在这里只起"留个自证路径"的作用。
+#      项目名对不上 → docker 报 `service "db" is not running`，和"db 容器挂了"
+#      文案一模一样，运维极易查错方向。
 COMPOSE_PROJECT="${LING_COMPOSE_PROJECT:-}"
 COMPOSE_ARGS=(-f "$COMPOSE_FILE")
 if [ -n "$COMPOSE_PROJECT" ]; then
@@ -732,6 +754,31 @@ if [ "$VIA_COMPOSE" = "1" ]; then
     echo "[backup] compose 模式需要 docker" >&2
     exit 2
   fi
+  # ---- 前置静态校验：compose 文件必须能被解析 ----
+  # `exec` 不看 `-f`（见上），所以一份坏掉的 compose 文件在 exec 阶段**完全
+  # 不会被发现**：备份照样 exit 0，直到某天 `up`/`config` 才炸——那时是恢复/
+  # 升级现场，最不该出现"配置坏了"的时刻。这里用 `config -q` 做一次纯静态
+  # 解析（不连 docker daemon、不拉镜像、不启容器，cron 每日跑的开销可以忽略），
+  # 让文件坏掉时 fail fast。
+  #
+  # 退出码 **2（配置错误）**，绝不是 3：3 是"pg_dump 失败"的契约语义，把配置
+  # 问题混进去会让告警方以为数据库出事。这条校验在任何容器/磁盘动作之前跑
+  # （dump/墓碑/密钥/媒体都还没开始），所以只需清理锁，不留半成品。
+  if ! compose_config_err="$(docker compose "${COMPOSE_ARGS[@]}" config -q 2>&1)"; then
+    echo "[backup] compose 配置校验失败：无法解析 compose 文件（exit 2，配置错误）" >&2
+    echo "[backup]   项目名（-p）：${COMPOSE_PROJECT:-（空：会按 compose 文件所在目录名推导，cron 下极易错）}" >&2
+    echo "[backup]   compose 文件（-f）：${COMPOSE_FILE}" >&2
+    if [ ! -f "$COMPOSE_FILE" ]; then
+      echo "[backup]   → 该路径不是一个存在的文件（LING_COMPOSE_FILE 指错了？）" >&2
+    fi
+    echo "[backup]   → 也可能是项目名与 compose 里的 name/top-level name 冲突，或插值变量未设置" >&2
+    if [ -n "$compose_config_err" ]; then
+      echo "[backup]   docker compose config 输出：" >&2
+      printf '%s\n' "$compose_config_err" >&2
+    fi
+    echo "[backup]   （exec 不看 -f，所以坏文件不会在 exec 阶段暴露；这条校验就是补这个洞）" >&2
+    exit 2
+  fi
   PG_DB="${LING_DB_NAME:-ling}"
   PG_USER="${LING_DB_USER:-ling}"
   DUMP_FILE="$OUT_DIR/ling-$STAMP.dump"
@@ -739,7 +786,16 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   if ! docker compose "${COMPOSE_ARGS[@]}" exec -T db \
       pg_dump --no-owner --no-privileges --format=custom \
       -U "$PG_USER" -d "$PG_DB" > "$DUMP_FILE"; then
-    echo "[backup] pg_dump 失败（容器是否在运行？COMPOSE_FILE=${COMPOSE_FILE}）" >&2
+    # 这一条**同时**覆盖两种失败，而 docker 给它们的文案是同一句：
+    #   - db 容器真没起来；
+    #   - **项目名错**（`-p` 与真实项目名不一致 / 没给 `-p` 而按目录名推导），
+    #     于是 exec 找不到容器，报 `service "db" is not running`。
+    # 所以提示里必须带上"项目名"这条线索，否则运维会直奔 db 容器去查。
+    # **退出码仍是 3**（pg_dump 失败语义，契约不变）。
+    echo "[backup] pg_dump 失败（可能原因：db 容器没在运行；**或项目名/COMPOSE_PROJECT 不对**——" \
+      "Compose v5 的 exec 按 project+service label 找容器、不看 -f，项目名不一致时报的正是" \
+      "service \"db\" is not running。项目名=${COMPOSE_PROJECT:-（空，按目录名推导）}，" \
+      "COMPOSE_FILE=${COMPOSE_FILE}）" >&2
     rm -f "$DUMP_FILE"
     exit 3
   fi
@@ -768,27 +824,106 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 探测与读取合成**一条**容器内命令，用专用退出码 3 表示"文件不存在"：
   # 否则"api 容器没起来/docker 报错"（也是非零）会被当成"没有密钥"，
   # 于是产出一份 exit 0 但恢复后解不开凭据的备份——正是要防的那种静默。
+  #
+  # **密钥完整性必须能自证，不能只靠"别忘了写 -T"**（真机实测，见
+  # shots/docker-real/DOCKER-REAL.md §3.6）：`docker compose exec` 少了 `-T`
+  # 而宿主有 TTY 时 docker 会分配 pty，TTY 层给流加一个前导 `\0`、并把行尾变成
+  # CRLF（实测 44 B → 46 B），**退出码仍是 0**。旧实现只对**归档后**的文件算
+  # sha256 写进 manifest，从不与容器里的原值比对，于是会**静默归档一把坏密钥**
+  # ——恢复时库里的 provider 凭据全部解不开，而 manifest 看起来毫无异常
+  # （哈希自洽，只是自洽的是坏字节）。
+  # 现在在**同一次** exec 里多拿一份证据：容器先对 /data/root.key 算一次哈希写到
+  # stderr（`sha256=<hex>`），再把同一份字节写到 stdout；宿主把 stderr 收进临时
+  # 文件，取出容器侧哈希，与归档字节的哈希**逐字符比对**：
+  #   - 一致 → 正常归档；
+  #   - 不一致 / 拿不到容器侧哈希 → exit 4（"无法确认密钥状态，本次备份作废"），
+  #     清理半成品，**绝不**写 keys/root.key，**绝不**写 manifest。
+  # 日志里只出现哈希，**绝不**出现密钥内容；stderr 临时文件只解析、不回显
+  # （无 -T 时 pty 会把两条流合并，那个文件里也可能有密钥字节），用完即删。
   KEYS_STATE=absent
   KEYS_FILE=-
   KEYS_SOURCE=none
   KEYS_HASH=-
   KEYS_TMP="$OUT_DIR/.root.key.part.$$"
+  # 容器侧哈希的中转文件（`umask 077` 子 shell 里创建 → group/other 位为 0，常见
+  # 文件系统上是 0600，用完即删）。
+  KEYS_HASH_TMP="$OUT_DIR/.root.key.sha.$$"
+  # 容器内脚本：**一次** exec 同时给出"内容"（stdout）与"容器侧真实哈希"
+  # （stderr）。哈希只能走 stderr——stdout 必须是可直接落盘的纯密钥字节流。
+  # 容器内退出码：3 = 文件不存在（宿主据此记 absent）；6 = 容器里没有
+  # sha256sum / shasum / openssl 任何一种哈希工具；5 = 算了但结果为空。
+  # 5 / 6 由宿主一律判成"无法确认"（exit 4），绝不放过未经验证的字节。
+  KEYS_READ_SCRIPT='
+if [ ! -f /data/root.key ]; then exit 3; fi
+if command -v sha256sum >/dev/null 2>&1; then
+  h=$(sha256sum /data/root.key | cut -d" " -f1)
+elif command -v shasum >/dev/null 2>&1; then
+  h=$(shasum -a 256 /data/root.key | cut -d" " -f1)
+elif command -v openssl >/dev/null 2>&1; then
+  h=$(openssl dgst -sha256 -r /data/root.key | cut -d" " -f1)
+else
+  exit 6
+fi
+[ -n "$h" ] || exit 5
+printf "sha256=%s\n" "$h" >&2
+exec cat /data/root.key
+'
   # 与 `stash_existing_keys` 同一个理由（而且这条窗口更长：跨 `docker compose
   # exec` 的一次网络往返）：`> "$KEYS_TMP"` 若在外层做，文件先以 umask 推出的
   # **0644** 落盘，`chmod 600` 要等容器读完才执行。把重定向挪进 `umask 077`
-  # 的子 shell 里，文件从创建那一刻就是 0600，根密钥字节全程不落 0644。
+  # 的子 shell 里，文件从创建那一刻 group/other 位就是 0，根密钥字节全程不落
+  # 0644。判定口径是 `mode & 0o077 == 0`，不要求恰好 0600（btrfs + trimacl 的
+  # NAS 上这里会是 0700，同样安全，见 `stash_existing_keys` 上方的长注释）。
   set +e
   (
     umask 077
-    docker compose "${COMPOSE_ARGS[@]}" exec -T api \
-      sh -c 'if [ -f /data/root.key ]; then exec cat /data/root.key; else exit 3; fi' \
-      > "$KEYS_TMP" 2>/dev/null
+    docker compose "${COMPOSE_ARGS[@]}" exec -T api sh -c "$KEYS_READ_SCRIPT" \
+      > "$KEYS_TMP" 2>"$KEYS_HASH_TMP"
   )
   KEY_RC=$?
   set -e
+  # 取容器侧哈希：只认最后一行 `sha256=<64 位小写十六进制>`。
+  # 不用量词正则（`{64}`）是为了 BSD/GNU awk 都稳；长度与字符集分两步判。
+  # docker/compose 自己的告警也在这条 stderr 上，所以只挑这一种形状。
+  KEYS_CONTAINER_HASH=""
+  if [[ -f "$KEYS_HASH_TMP" ]]; then
+    KEYS_CONTAINER_HASH="$(awk '
+      { line = $0
+        gsub(/\r/, "", line)          # 行尾若被 CRLF 化也照收（值本身必须是纯 hex）
+        if (substr(line, 1, 7) == "sha256=") {
+          v = substr(line, 8)
+          gsub(/[ \t]/, "", v)
+          if (length(v) == 64 && v ~ /^[0-9a-f]+$/) last = v
+        } }
+      END { if (last != "") print last }
+    ' "$KEYS_HASH_TMP" 2>/dev/null)" || true
+  fi
   if [[ $KEY_RC -eq 0 ]] && [[ -s "$KEYS_TMP" ]]; then
+    # ① **归档前**先自校验，且故意放在 stash / mv **之前**：字节不对时连历史那份
+    #    `keys/root.key` 都不碰——不需要走"先覆盖再回填"那条更危险的路。
+    KEYS_LOCAL_HASH="$(sha256_of "$KEYS_TMP")"
+    KEYS_LOCAL_BYTES="$(wc -c < "$KEYS_TMP" | tr -d '[:space:]')"
+    if [[ -z "$KEYS_CONTAINER_HASH" ]]; then
+      rm -f "$KEYS_TMP" "$KEYS_HASH_TMP"
+      echo "[backup] 容器内没有回传 /data/root.key 的 sha256；" \
+        "无法证明归档字节就是容器里那把密钥，本次备份作废" >&2
+      echo "[backup]   → 最常见的原因是 exec 少了 -T：pty 把 stdout/stderr 合并成" \
+        "一条流，哈希行跟着密钥字节一起落到 stdout，stderr 什么都不剩" >&2
+      exit 4
+    fi
+    if [[ "$KEYS_CONTAINER_HASH" != "$KEYS_LOCAL_HASH" ]]; then
+      rm -f "$KEYS_TMP" "$KEYS_HASH_TMP"
+      echo "[backup] 根密钥完整性校验失败：容器内 sha256=${KEYS_CONTAINER_HASH}，" \
+        "宿主收到 ${KEYS_LOCAL_BYTES} 字节、sha256=${KEYS_LOCAL_HASH}，" \
+        "两者必须一致。最常见的原因是 exec 少了 -T——宿主有 TTY 时 TTY 层会给" \
+        "字节流加 NUL 与 CRLF（真机实测 44 B → 46 B）。本次备份作废，" \
+        "绝不归档一把坏密钥（恢复时 provider 凭据会全部解不开）" >&2
+      exit 4
+    fi
+    rm -f "$KEYS_HASH_TMP"
     mkdir -p "$OUT_DIR/keys"
-    # 兜底再收一次（创建时已是 0600）；文件内容不进任何日志（只记哈希）。
+    # 兜底再收一次（创建时 group/other 位已是 0；这一行把它收成精确 0600，
+    # 正式产物因此与 umask / 文件系统无关）；文件内容不进任何日志（只记哈希）。
     chmod 600 "$KEYS_TMP"
     # 覆盖前先给历史那份 keys/root.key 留原字节副本（失败时清理逻辑原样放回）。
     stash_existing_keys
@@ -800,7 +935,17 @@ if [ "$VIA_COMPOSE" = "1" ]; then
     KEYS_FILE=keys/root.key
     KEYS_SOURCE=file
     KEYS_HASH="$(sha256_of "$OUT_DIR/keys/root.key")"
-    echo "[backup] 已归档根密钥到 keys/root.key（务必与 dump 分开存放）"
+    # ② **归档后**再核对一次：落盘的那份文件必须仍是容器侧那把密钥。
+    #    `mv` 只是同一目录内的改名（字节不变），这条理论上打不着；留着是因为
+    #    密钥是整条链上唯一"错了就不可逆"的东西，多一次断言比少一次便宜。
+    #    走到这里说明已经动过历史密钥，失败时由 cleanup_partial 原样回填。
+    if [[ "$KEYS_HASH" != "$KEYS_CONTAINER_HASH" ]]; then
+      echo "[backup] 根密钥完整性校验失败：归档后 keys/root.key 的 sha256=${KEYS_HASH}" \
+        "与容器内 ${KEYS_CONTAINER_HASH} 不一致；本次备份作废" >&2
+      exit 4
+    fi
+    echo "[backup] 已归档根密钥到 keys/root.key（务必与 dump 分开存放）" \
+      "—— 容器侧与归档字节的 sha256 一致：${KEYS_HASH}"
     if [[ "${KEYS_ENV_SET}" == "true" ]]; then
       echo "[backup] 警告：备份时 LING_ROOT_KEY 非空，应用**优先用环境变量**，" \
         "所以实际生效的根密钥可能不是 keys/root.key 这一把（manifest 记 " \
@@ -808,19 +953,27 @@ if [ "$VIA_COMPOSE" = "1" ]; then
         "只回灌 keys/root.key 不够" >&2
     fi
   elif [[ $KEY_RC -ne 3 ]]; then
-    rm -f "$KEYS_TMP"
+    rm -f "$KEYS_TMP" "$KEYS_HASH_TMP"
     echo "[backup] 读取容器内 /data/root.key 失败（exit=${KEY_RC}）；" \
       "无法确认根密钥状态，本次备份作废" >&2
+    # 5 / 6 是容器内脚本自己给的语义：6 = 三种哈希工具都没有，5 = 算出来是空的。
+    # 两者都意味着"容器侧哈希拿不到"，一律 exit 4（绝不归档未经验证的字节）。
+    if [[ $KEY_RC -eq 6 ]]; then
+      echo "[backup]   → 容器里没有 sha256sum / shasum / openssl 任何一种哈希工具，" \
+        "没有容器侧哈希就无法证明归档字节是原密钥" >&2
+    elif [[ $KEY_RC -eq 5 ]]; then
+      echo "[backup]   → 容器内算出的哈希是空的（读 /data/root.key 失败？）" >&2
+    fi
     exit 4
   elif [[ -n "${LING_ROOT_KEY:-}" ]]; then
     # 密钥来自环境变量（deploy/.env）：没有文件可归档，只能靠 env 备份，
     # 因此这里显式写 absent + source=env，而不是装作"已经备好了"。
     KEYS_SOURCE=env
-    rm -f "$KEYS_TMP"
+    rm -f "$KEYS_TMP" "$KEYS_HASH_TMP"
     echo "[backup] 根密钥来自环境变量 LING_ROOT_KEY（未落盘）；请确认 deploy/.env 已单独安全保管" >&2
   else
     KEYS_SOURCE=none
-    rm -f "$KEYS_TMP"
+    rm -f "$KEYS_TMP" "$KEYS_HASH_TMP"
     echo "[backup] 警告：容器内没有 /data/root.key，环境里也没有 LING_ROOT_KEY；" \
       "这份备份恢复到新卷后，provider 凭据将无法解密" >&2
   fi
@@ -835,10 +988,14 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # `tar -cf -` 在容器内读、stdout 流式落宿主文件：不把大目录读进内存，
   # 也不在只读根文件系统的容器里写任何东西。
   #
-  # **创建即 0600**（和根密钥那两条同一条理由）：外层重定向 `> "$MEDIA_TMP"`
-  # 建文件走 `0666 & ~umask`，默认 umask 022 会先落 **0644**，而媒体是用户的
-  # 原图/原声——整个流式传输期间（大媒体可能要几分钟）它都对同机其他用户可读。
-  # 把重定向挪进 `umask 077` 的子 shell 内，文件一出生就是 0600。
+  # **创建瞬间就"同机其他用户读不到"**（和根密钥那两条同一条理由）：外层重定向
+  # `> "$MEDIA_TMP"` 建文件走 `0666 & ~umask`，默认 umask 022 会先落 **0644**，
+  # 而媒体是用户的**原图/原声**——整个流式传输期间（大媒体可能要几分钟）它都对
+  # 同机其他用户可读。把重定向挪进 `umask 077` 的子 shell 内，文件一出生
+  # group/other 位就是 0。口径仍是 **`mode & 0o077 == 0`**（不是"恰好 0600"）：
+  # ext4 上得 0600，NAS 的 btrfs + trimacl 上得 0700，两者同样安全——真正要挡的
+  # 是"同机其他用户"。正式产物 `media-<STAMP>.tar` 在 `mv` 前有显式
+  # `chmod 600`，那条才断言精确 0600。
   # 退出码仍是**这条 docker 的**退出码：子 shell 的退出状态就是它最后一条命令的
   # 状态（`$?` 直接取到 TAR_RC），`umask 077` 不会把它吃掉；下面的 `-eq 3` /
   # `-ge 2` 判定与原来逐字一致。
@@ -967,9 +1124,11 @@ if [[ -f "$KEY_FILE" ]]; then
   # 所以目标权限取决于源：在这个 `umask 077` 子 shell 里 group/other 位一律被挡掉，
   # 源 0644 会得到 **0600**（看着"对了"，其实是 umask 兜住的——换成 umask 022 就是
   # 0644）；而源 0700 会**原样留下 owner-x，目标就是 0700**，窗口期可执行。也就是
-  # 说 `cp` 下**不依赖 umask 的**"精确 0600"只在源恰好是 0600 时成立，其余情况
-  # 只是碰巧更窄、或者仍然偏宽。重定向创建走 `0666 & ~umask`，在 umask 077 下
-  # **恒定 0600**，与源权限无关；随后的 `chmod 600` 只是兜底。真实部署里
+  # 说 `cp` 下**不依赖 umask 的**"同机其他用户读不到"只在源恰好 group/other 位为 0
+  # 时成立，其余情况只是碰巧更窄、或者仍然偏宽。重定向创建走 `0666 & ~umask`，在
+  # umask 077 下**恒定满足 `mode & 0o077 == 0`**，与源权限无关（具体值是 0600 还是
+  # 0700 取决于文件系统：ext4 得 0600，NAS 的 btrfs + trimacl 得 0700，两者都安全）；
+  # 随后的 `chmod 600` 只是兜底，并把正式产物收成精确 0600。真实部署里
   # `security.py` 会 chmod 600，但这里不依赖它——窗口对任何源权限都关掉。
   ( umask 077; cat -- "$KEY_FILE" > "$KEYS_TMP" )
   chmod 600 "$KEYS_TMP"
@@ -1005,7 +1164,9 @@ if [[ -d "$MEDIA_DIR" ]]; then
   MEDIA_TMP="$OUT_DIR/.media-$STAMP.tar.part"
   # 与 compose 模式同一个理由：外层重定向创建 `.part` 走 `0666 & ~umask`
   # （默认 0644），媒体字节在整个 `tar` 期间都对同机其他用户可读。
-  # 把重定向挪进 `umask 077` 的子 shell 内 → 文件一出生就是 0600；
+  # 把重定向挪进 `umask 077` 的子 shell 内 → 创建瞬间就 `mode & 0o077 == 0`
+  # （ext4 得 0600，btrfs + trimacl 得 0700，两者同样安全；正式名由下面显式的
+  # `chmod 600` 收成精确 0600）；
   # `if ! ( … )` 判定的仍是 **tar 自己的**退出码（子 shell 最后一条命令）。
   if ! ( umask 077; tar -cf - -C "$DATA_DIR" media > "$MEDIA_TMP" ); then
     echo "[backup] 媒体归档失败（${MEDIA_DIR}）" >&2

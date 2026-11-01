@@ -47,7 +47,7 @@ ROOT_KEY_BODY = "cm9vdC1rZXktc2VjcmV0LWJvZHktZm9yLXRlc3Q="
 DSN_PASSWORD = "S3cr3t-Db-Pa55w0rd"
 
 # 严格 fake docker：只认 backup.sh 真正用到的 argv；其余一律非零退出。
-_DOCKER_FAKE = r"""#!/usr/bin/env bash
+_DOCKER_FAKE_TEMPLATE = r"""#!/usr/bin/env bash
 # 严格 fake：未声明的 compose 子命令/服务直接失败（不允许"默认成功"）。
 set -euo pipefail
 printf 'docker %s\n' "$*" >> "${DOCKER_CALLS:?}"
@@ -63,6 +63,7 @@ shift
 
 COMPOSE_FILE_ARG=""
 COMPOSE_PROJECT_ARG=""
+SUBCOMMAND=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f)
@@ -75,7 +76,8 @@ while [[ $# -gt 0 ]]; do
       COMPOSE_PROJECT_ARG="$2"
       shift 2
       ;;
-    exec)
+    exec|config)
+      SUBCOMMAND="$1"
       shift
       break
       ;;
@@ -89,8 +91,40 @@ done
 # 本仓库约定：cron/执行器都会显式给项目名，避免按目录名推导。
 [[ -n "$COMPOSE_PROJECT_ARG" ]] || fail "compose 调用必须带 -p（项目名不能靠目录名推导）"
 
-[[ "${1:-}" == "-T" ]] || fail "exec 必须带 -T（不加会在 cron 里分配 TTY）"
-shift
+# `config -q`：backup.sh 的前置静态校验（compose 文件坏掉时 exit 2 fail fast）。
+# 真 docker 的行为：解析失败 → 非零 + 诊断到 stderr。这里用 COMPOSE_CONFIG_EXIT
+# 注入"坏文件"，用 COMPOSE_CONFIG_ERR 注入诊断文案。
+if [[ "$SUBCOMMAND" == "config" ]]; then
+  [[ "${1:-}" == "-q" ]] || fail "config 必须带 -q（只做静态校验，不打印解析结果）"
+  shift
+  [[ $# -eq 0 ]] || fail "config -q 之后不应再有参数，收到 $1"
+  # 与真 docker 一致：文件不存在本身就是一个解析失败。
+  if [[ "${COMPOSE_CONFIG_EXIT:-0}" != "0" || ! -f "$COMPOSE_FILE_ARG" ]]; then
+    printf '%s\n' "${COMPOSE_CONFIG_ERR:-fake-docker: compose 文件无法解析}" >&2
+    exit "${COMPOSE_CONFIG_EXIT:-1}"
+  fi
+  exit 0
+fi
+
+# `-T`：cron 场景必须带（不加会分配 TTY）。默认桩**直接拒绝**（与历史一致）；
+# `FAKE_NO_T_MODE` 打开时按真 docker 的行为**分配 pty**（模拟"宿主有 TTY"）：
+#   - `pollute`：内容被 TTY 层加料（前导 NUL + LF→CRLF），容器侧哈希仍走 stderr
+#     —— 宿主的"容器侧哈希 vs 归档字节哈希"比对必须**红**；
+#   - `pty`：完全按真 pty 行为，stdout/stderr 被合并成一条流 —— 宿主连哈希都收不到。
+# 两个模式用来做"去掉 -T 会不会被抓住"的变异验证（见文件末尾的用例）。
+TTY_ALLOCATED=0
+if [[ "${1:-}" == "-T" ]]; then
+  shift
+elif [[ -n "${FAKE_NO_T_MODE:-}" ]]; then
+  # 变异模式：**任何一条** exec 少了 `-T` 都当"分配了 pty"处理。
+  # 必须对**所有** exec 生效（不能只对根密钥那条）——否则第一个没带 `-T` 的
+  # db exec 会以 90 失败，脚本在根密钥阶段之前就以 4 退出，于是"红"得毫无意义
+  # （分不清是密钥自校验抓到的，还是别的命令撞死的）。
+  # 注意**不能 shift**：`-T` 本来就没出现，`$1` 已经是服务名了。
+  TTY_ALLOCATED=1
+else
+  fail "exec 必须带 -T（不加会在 cron 里分配 TTY）"
+fi
 
 SERVICE="${1:-}"
 shift
@@ -158,6 +192,41 @@ case "$SERVICE" in
       *"/data/root.key"*)
         [[ "${ROOT_KEY_EXISTS:-0}" == "0" ]] || exit 3
         [[ "${ROOT_KEY_CAT_FAIL:-0}" == "0" ]] || exit 1
+        # 与 backup.sh 里那条容器内命令**同一语义**：先对同一份字节算 sha256 写到
+        # stderr（`sha256=<hex>`），再把字节写到 stdout —— 宿主因此能在**一次** exec
+        # 里同时拿到"内容"与"容器侧真实哈希"两份证据。
+        if [[ "${ROOT_KEY_NO_HASH_TOOL:-0}" == "1" ]]; then
+          exit 6            # 容器里没有任何哈希工具（真脚本的 exit 6）
+        fi
+        KEY_HASH="$('__PYTHON__' -c 'import hashlib, sys
+sys.stdout.write(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${ROOT_KEY_PAYLOAD:?}")"
+        # TTY 语义的两个开关（都模拟"pty 层"对流的加工，容器自己读到的还是原字节）：
+        #   MERGED    ：stdout 与 stderr 被合并成一条流（真 pty 就是这样）
+        #   POLLUTED  ：字节流被加料（前导 NUL + LF→CRLF；真机实测 44 B → 46 B）
+        MERGED=0
+        if [[ "${FAKE_ROOT_KEY_MERGE_STREAMS:-0}" == "1" ]]; then MERGED=1; fi
+        if [[ "$TTY_ALLOCATED" == "1" && "${FAKE_NO_T_MODE:-}" == "pty" ]]; then MERGED=1; fi
+        POLLUTED=0
+        if [[ "$TTY_ALLOCATED" == "1" ]]; then POLLUTED=1; fi
+        if [[ "${FAKE_ROOT_KEY_TTY_POLLUTION:-0}" == "1" ]]; then POLLUTED=1; fi
+        if [[ "$MERGED" == "1" ]]; then
+          # 合并流：容器侧哈希和密钥字节一起从 stdout 出来，宿主在 stderr 上
+          # **拿不到任何哈希** —— 只能 fail closed。
+          '__PYTHON__' -c 'import sys
+data = open(sys.argv[1], "rb").read()
+sys.stdout.buffer.write(b"\0" + data.replace(b"\n", b"\r\n"))' "${ROOT_KEY_PAYLOAD:?}"
+          printf 'sha256=%s\r\n' "${KEY_HASH}"
+          exit 0
+        fi
+        printf 'sha256=%s\n' "${KEY_HASH}" >&2
+        if [[ "$POLLUTED" == "1" ]]; then
+          # 哈希是容器**在 TTY 之外**对原文件算的，内容却被 TTY 层改过 →
+          # 宿主侧"容器哈希 vs 归档字节哈希"必然对不上。
+          '__PYTHON__' -c 'import sys
+data = open(sys.argv[1], "rb").read()
+sys.stdout.buffer.write(b"\0" + data.replace(b"\n", b"\r\n"))' "${ROOT_KEY_PAYLOAD:?}"
+          exit 0
+        fi
         cat "${ROOT_KEY_PAYLOAD:?}"
         ;;
       *"/data/media"*)
@@ -165,6 +234,11 @@ case "$SERVICE" in
         # 记录 stdout（宿主侧的 `.media-*.tar.part`）在**本条命令刚启动**这一刻的
         # 权限位 = 脚本 chmod 之前的"创建瞬间" mode。fd 3 才是脚本自己的 stdout：
         # `>>` 重定向会把子进程的 fd 1 换成本日志文件。
+        #
+        # 模拟钩子（默认空操作）：NAS 用例把它换成"chmod 700 $MEDIA_PART_GLOB"，
+        # 复现 btrfs + trimacl 上"创建即 0700"的语义（见
+        # `test_compose_media_part_nas_btrfs_0700_is_also_safe`）。
+        _DOCKER_CREATE_HOOK
         if [[ -n "${DOCKER_STDOUT_MODE_LOG:-}" ]]; then
           exec 3>&1
           '__PYTHON__' -c 'import os, stat, sys
@@ -178,7 +252,7 @@ sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${DOCKER_STDOUT_MODE_LOG}" 
           # 进来后 fd 3 正是它）。一旦改成 `docker … | cat > .part`，fd 3 是管道，
           # `fstat` 会静默报成 `0o600`（管道没有 0644 这回事）——**检测能力就丢了**。
           # 路径 stat 不会：文件不存在就一行都不写，用例照样红成 `<未观察到>`。
-          # 所以这两条是各自独立的证据，两条都必须是 600 才算过。
+          # 所以这两条是各自独立的证据，两条都必须 group/other 位为 0 才算过。
           '__PYTHON__' -c 'import glob, os, sys
 try:
     st = os.stat(glob.glob(os.environ["MEDIA_PART_GLOB"])[0])
@@ -366,6 +440,11 @@ def backup_env(tmp_path: Path) -> dict[str, object]:
     root_key.write_text(ROOT_KEY_BODY, encoding="utf-8")
     tombstones = tmp_path / "tombstones.payload"
     tombstones.write_text("mem_aaa\nmem_bbb\n", encoding="utf-8")
+    # backup.sh 的前置校验会 `docker compose … config -q`；严格 fake 按真 docker
+    # 的行为把"文件不存在"也算解析失败，所以正常路径必须有一份**真实存在**的
+    # compose 文件（内容不影响 fake，它只 stat 路径）。
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
@@ -689,10 +768,122 @@ def test_root_key_read_failure_is_fatal(
     assert run.leftovers() == []
 
 
+# ------------------------------------------------------- 根密钥完整性自校验（P3-4）
+#
+# 真 Docker 实测（`shots/docker-real/DOCKER-REAL.md` §3.6）：`docker compose exec`
+# 少了 `-T` 且宿主有 TTY 时 docker 会分配 pty，TTY 层给流加前导 `\0`、把行尾变成
+# CRLF（44 B → 46 B），**退出码仍是 0**。旧实现只对**归档后**的文件算 sha256 写进
+# manifest，从不与容器里的原值比对 → **静默归档一把坏密钥**，恢复时 provider
+# 凭据全部解不开，而 manifest 看起来毫无异常。
+# 现在归档前后各比一次"容器侧哈希 vs 归档字节哈希"，下面四条把它钉死：
+#   1) 正常（带 `-T`）：两份证据一致 → 绿；
+#   2) 内容被 pty 污染（确定性注入）：哈希对不上 → exit 4、不留坏密钥；
+#   3) 容器没回传哈希（流被合并 / 没有哈希工具）：fail closed → exit 4；
+#   4) `-T` 缺失的**变异哨兵**：桩只在没 `-T` 时才污染，所以只要脚本带着 `-T`
+#      就绿；谁把 `-T` 删掉，这条立刻红（变异记录见 `shots/docker-real/P3-4-KEYS.md`）。
+
+
+def test_keys_archive_hash_matches_container_side(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """带 `-T`：容器侧哈希与归档字节一致，manifest 记的就是这份哈希（绿）。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    run = _run_backup(tmp_path, env)
+    assert run.proc.returncode == 0, run.outputs()
+    key = run.out / "keys" / "root.key"
+    assert key.read_bytes() == ROOT_KEY_BODY.encode("utf-8")
+    assert run.manifest()["keys_root_sha256"] == _sha256(key)
+    # 成功日志里要能看到"校验通过"（运维能据此确认这次真的验过）。
+    assert "sha256 一致" in run.proc.stdout, run.outputs()
+    # 密钥内容绝不落日志（只允许哈希）。
+    assert ROOT_KEY_BODY not in run.outputs()
+    assert run.leftovers() == []
+
+
+def test_keys_hash_mismatch_is_fatal_and_keeps_previous_key(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """内容被 pty 污染（确定性注入）→ exit 4；历史密钥一根汗毛都不动、不留坏密钥。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    out = tmp_path / "backup-out"
+    snapshot = _seed_previous_backup(out)
+    run = _run_backup_in(out, env, FAKE_ROOT_KEY_TTY_POLLUTION="1")
+
+    assert run.proc.returncode == 4, run.outputs()
+    assert "根密钥完整性校验失败" in run.proc.stderr, run.proc.stderr
+    # 容器侧哈希与宿主侧哈希都在告警里（可诊断），但**没有密钥字节**。
+    assert _sha256(backup_env["root_key"]) in run.proc.stderr, run.proc.stderr
+    assert ROOT_KEY_BODY not in run.outputs()
+    # 失败发生在 stash/mv **之前**：历史那份逐字节不变，也没有 .prev 残留。
+    _assert_previous_backup_intact(out, snapshot)
+    assert (out / "keys" / "root.key").read_bytes() == PREVIOUS_KEY_BODY.encode("utf-8")
+    assert [p.name for p in (out / "keys").iterdir()] == ["root.key"]
+    # 本次的 dump/墓碑/媒体/manifest 全部清掉，临时文件零残留。
+    assert list(out.glob("manifest-*.txt")) == [out / f"manifest-{PREVIOUS_STAMP}.txt"]
+    assert run.leftovers() == []
+
+
+@pytest.mark.parametrize(
+    ("extra_env", "hint", "why"),
+    [
+        # 真 pty：容器 stdout/stderr 合并，哈希落进 stdout（与密钥字节混在一起）。
+        # 容器命令本身 rc=0、字节也在，**只有哈希不见** → 走"没回传"那条分支。
+        ({"FAKE_ROOT_KEY_MERGE_STREAMS": "1"}, "exec 少了 -T", "没有回传"),
+        # 容器里没有 sha256sum/shasum/openssl：容器内脚本 exit 6（算不出哈希），
+        # 宿主把它当"读取失败"处理 → 走 exit!=3 那条分支。
+        ({"ROOT_KEY_NO_HASH_TOOL": "1"}, "没有 sha256sum", "读取容器内"),
+    ],
+)
+def test_keys_hash_unavailable_from_container_fails_closed(
+    tmp_path: Path,
+    backup_env: dict[str, object],
+    extra_env: dict[str, str],
+    hint: str,
+    why: str,
+) -> None:
+    """拿不到容器侧哈希 → 不归档、exit 4（绝不"没验过就当过了"）。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    run = _run_backup(tmp_path, env, **extra_env)
+    assert run.proc.returncode == 4, run.outputs()
+    assert why in run.proc.stderr, run.proc.stderr
+    assert hint in run.proc.stderr, run.proc.stderr
+    assert not (run.out / "keys" / "root.key").exists()
+    assert list(run.out.glob("manifest-*.txt")) == []
+    assert run.leftovers() == []
+
+
+@pytest.mark.parametrize("mode", ["pollute", "pty"])
+def test_missing_tty_flag_is_caught_by_key_hash_check(
+    tmp_path: Path, backup_env: dict[str, object], mode: str
+) -> None:
+    """变异哨兵：桩开着"没 `-T` 就按 pty 处理"的模式，脚本带 `-T` 时必须**绿**。
+
+    这条用例本身不删 `-T`（不能改产品脚本）；它的作用是：**一旦有人把
+    `deploy/backup/backup.sh` 里根密钥那条 `exec -T` 的 `-T` 删掉**，桩会立刻
+    按 pty 污染/合并输出 → 哈希对不上或拿不到 → 脚本 exit 4 → 本用例变红。
+    这正是"新校验真的能抓住坏密钥"的回归证据（见 P3-4-KEYS.md 的变异记录）。
+    """
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    run = _run_backup(tmp_path, env, FAKE_NO_T_MODE=mode)
+    assert run.proc.returncode == 0, run.outputs()
+    key = run.out / "keys" / "root.key"
+    assert key.read_bytes() == ROOT_KEY_BODY.encode("utf-8")
+    assert run.manifest()["keys_root_sha256"] == _sha256(key)
+
+
 def test_undeclared_docker_argv_fails(
     tmp_path: Path, backup_env: dict[str, object]
 ) -> None:
-    """严格 fake 自证：未声明的 compose 参数会让 backup.sh 失败（fake 不兜底成功）。"""
+    """严格 fake 自证：未声明的 compose 参数会让 backup.sh 失败（fake 不兜底成功）。
+
+    这条 fake 连 `config` 都拒绝，所以现在**更早**就失败了：前置静态校验是脚本
+    里第一条 compose 调用，坏/拒答的 compose 环境在这里就会 exit 2，而不是走到
+    exec/pg_dump。断言随之改到这条路径上（同时确认没有 manifest、没碰容器）。
+    """
     fake = (tmp_path / "bin" / "docker")
     fake.write_text(
         "#!/usr/bin/env bash\nprintf 'docker %s\\n' \"$*\" >> \"${DOCKER_CALLS:?}\"\n"
@@ -704,8 +895,128 @@ def test_undeclared_docker_argv_fails(
     env = backup_env["env"]
     assert isinstance(env, dict)
     run = _run_backup(tmp_path, env)
-    assert run.proc.returncode != 0
+    assert run.proc.returncode == 2, run.outputs()
+    assert "compose 配置校验失败" in run.proc.stderr
+    # 前置校验在任何容器动作之前：既没有 exec，也没有 dump。
+    assert not any("exec" in line for line in run.calls("DOCKER_CALLS")), run.calls(
+        "DOCKER_CALLS"
+    )
+    assert list(run.out.glob("manifest-*.txt")) == []
+    assert list(run.out.glob("*.dump")) == []
+
+
+# ---------------------------------------------------------------- 前置 compose 校验
+#
+# 真机实测（Compose v5.3.1）：`docker compose exec` **不看 `-f`**，只按
+# project + service 的 label 找容器——`-f /nonexistent.yaml` 仍 rc=0 且命令照常
+# 执行。所以一份坏掉的 compose 文件在备份流程里**永远不会暴露**，直到某天
+# `up`/`config` 才炸。下面两条把"前置静态校验"钉死：坏文件 exit 2（不是 3），
+# 正常文件照旧跑完。
+
+
+def test_broken_compose_file_fails_fast_with_exit_two(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """compose 文件解析失败 → **exit 2**（配置错误），且在任何容器动作之前。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    run = _run_backup(
+        tmp_path,
+        env,
+        COMPOSE_CONFIG_EXIT="1",
+        COMPOSE_CONFIG_ERR="yaml: line 3: could not find expected ':'",
+    )
+    assert run.proc.returncode == 2, run.outputs()
+    assert "compose 配置校验失败" in run.proc.stderr
+    # 退出码不能退化成 3：3 是"pg_dump 失败"的契约语义，配置问题混进去会误导排查。
+    assert run.proc.returncode != 3
+    # 报错要可诊断：说清是 compose 文件还是项目名的问题，并带上 docker 的原文。
+    assert "ling-test" in run.proc.stderr, run.proc.stderr
+    assert "could not find expected" in run.proc.stderr
+    # 校验发生在 exec / dump / 密钥 / 媒体之前：只有那一条 config，没有 exec。
+    assert not any("exec" in line for line in run.calls("DOCKER_CALLS")), run.calls(
+        "DOCKER_CALLS"
+    )
+    assert list(run.out.glob("*.dump")) == []
+    assert list(run.out.glob("manifest-*.txt")) == []
+    assert list(run.out.glob("media-*.tar")) == []
+    assert run.leftovers() == []
+
+
+def test_missing_compose_file_is_named_in_the_error(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """`LING_COMPOSE_FILE` 指错（文件不存在）时，报错要点名"路径不是一个存在的文件"。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    missing = tmp_path / "nope" / "compose.yaml"
+    run = _run_backup(tmp_path, env, LING_COMPOSE_FILE=str(missing))
+    assert run.proc.returncode == 2, run.outputs()
+    assert "compose 配置校验失败" in run.proc.stderr
+    assert "不是一个存在的文件" in run.proc.stderr, run.proc.stderr
+    assert str(missing) in run.proc.stderr
+    assert not any("exec" in line for line in run.calls("DOCKER_CALLS")), run.calls(
+        "DOCKER_CALLS"
+    )
+
+
+def test_valid_compose_file_still_backs_up_normally(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """正常路径不受影响：校验通过后照旧产出一份完整备份（exit 0）。"""
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    run = _run_backup(tmp_path, env)
+    assert run.proc.returncode == 0, run.outputs()
+    # 校验只做一次，且用的是 -q（纯静态解析，不打印解析结果）。
+    config_calls = [line for line in run.calls("DOCKER_CALLS") if "config" in line]
+    assert len(config_calls) == 1, run.calls("DOCKER_CALLS")
+    assert config_calls[0].endswith("config -q"), config_calls[0]
+    assert "compose 配置校验失败" not in run.outputs()
+    assert run.manifest()["mode"] == "compose"
+
+
+def test_pg_dump_failure_message_names_project_hint(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """exec 失败（含**项目名错**）时，提示必须带上"项目名/COMPOSE_PROJECT"线索。
+
+    Compose v5 给"项目名对不上"的文案就是 `service "db" is not running`——和
+    "db 容器真挂了"一模一样。旧提示只说"容器是否在运行？"，运维会直奔 db 容器去
+    查而忽略项目名。**退出码仍是 3**（契约不变）。
+    """
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    # 只让 exec 失败，前置校验仍通过：把 compose 文件删掉会先被 config 拦住，
+    # 所以这里用一个"config 放行、exec 报 not running"的替身。
+    fake = tmp_path / "bin" / "docker"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'docker %s\\n' \"$*\" >> \"${DOCKER_CALLS:?}\"\n"
+        "for a in \"$@\"; do\n"
+        "  if [[ \"$a\" == 'config' ]]; then exit 0; fi\n"
+        "  if [[ \"$a\" == 'exec' ]]; then\n"
+        "    echo 'service \"db\" is not running' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        "echo 'fake-docker: 未声明调用' >&2\n"
+        "exit 90\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    run = _run_backup(tmp_path, env)
+    assert run.proc.returncode == 3, run.outputs()
+    # 契约：exit 3 是 pg_dump 失败，不许改成 2。
+    assert run.proc.returncode != 2
     assert "pg_dump 失败" in run.proc.stderr
+    # 新线索：项目名可能错（而不是"容器没起来"这一种解释）。
+    assert "COMPOSE_PROJECT" in run.proc.stderr, run.proc.stderr
+    assert "项目名" in run.proc.stderr, run.proc.stderr
+    # 具体值也要在，否则无法照着排查。
+    assert "ling-test" in run.proc.stderr, run.proc.stderr
+    assert list(run.out.glob("*.dump")) == []
     assert list(run.out.glob("manifest-*.txt")) == []
 
 
@@ -881,7 +1192,7 @@ def _backup_argv(out: Path, umask_bits: str | None) -> list[str]:
     """backup.sh 的 argv；给 umask 时用一个外层 shell 显式设好再 exec。
 
     umask 必须显式给：用例结果不能随宿主/CI 的默认 umask 漂移（本用例断言的正是
-    "umask 022 下文件创建即 0600"）。
+    "umask 022 下重定向创建的文件 group/other 位为 0"，见 `_assert_no_group_other`）。
     """
     if umask_bits is None:
         return ["bash", str(BACKUP_SH), str(out)]
@@ -894,6 +1205,53 @@ def _backup_argv(out: Path, umask_bits: str | None) -> list[str]:
         str(BACKUP_SH),
         str(out),
     ]
+
+
+# ------------------------------------------------ "同机其他用户读不到"的唯一判据
+#
+# 真 Docker 验证（`shots/docker-real/DOCKER-REAL.md` §5 #3）发现：Synology NAS 的
+# `/vol2`（btrfs + `trimacl`）上，**所有新建文件恒为 0700**——`umask 077` 得 700、
+# `umask 022` 也得 700，`mkdir` 得 700；而本机 `/tmp`（ext4）上正常 600。
+#
+# 所以脚本能保证、也**只需要**保证的不变量是：
+#
+#     mode & 0o077 == 0      # group / other 无任何权限位
+#
+# 而不是"恰好 0600"。`0600` 只是 ext4/xfs 上 `0666 & ~077` 的结果；btrfs +
+# trimacl 上同一段代码给 0700（owner 多了 x 位，group/other 仍是 0），**同样安全**
+# ——真正要挡的是"同机其他用户"，不是 owner 自己的 x 位。把断言钉在精确 0600 上，
+# 等于把"宿主的文件系统"当成产品契约：这套测试原样跑在 NAS 的 /vol2 上会红。
+#
+# 检测能力**没有**被放宽：umask 077 → 022 的变异会让文件变成 0644，
+# `0o644 & 0o077 == 0o044 != 0`，下面这些断言照样红。
+#
+# 唯一保留"精确 0600"的是**显式 `chmod 600` 之后的正式产物**
+# （`keys/root.key`、`media-<STAMP>.tar`）：那是脚本自己设的，与 umask 和文件系统
+# 无关，所以精确断言仍然成立、也必须保留。
+
+GROUP_OTHER_BITS = 0o077
+
+
+def _assert_no_group_other(mode: int, what: str) -> None:
+    """断言 ``mode`` 的 group/other 位全为 0（= 同机其他用户读不到）。
+
+    失败信息同时给出精确 mode 与"哪几位漏了"，方便一眼看出是 0644（umask 没生效）
+    还是别的形状。
+    """
+    leaked = mode & GROUP_OTHER_BITS
+    assert leaked == 0, (
+        f"{what}创建时权限是 {mode:04o}（应为 group/other 位全 0，即 mode & 0o077 == 0）："
+        f"泄漏位 {leaked:04o}，同机其他用户可读"
+    )
+
+
+def _assert_modes_no_group_other(modes: set[str] | set[int], what: str) -> None:
+    """对替身/轮询记下的一组权限位做 ``_assert_no_group_other``（空集即"没测到东西"）。"""
+    assert modes, f"{what}一次都没观察到，用例没测到东西"
+    # 两种来源都要支持：替身日志是八进制字符串（"600"），轮询是 int（0o600）。
+    parsed = {int(mode, 8) if isinstance(mode, str) else mode for mode in modes}
+    for mode in sorted(parsed):
+        _assert_no_group_other(mode, what)
 
 
 def _mode_records(log: Path) -> list[tuple[str, str]]:
@@ -911,9 +1269,14 @@ def _mode_records(log: Path) -> list[tuple[str, str]]:
 def test_stashed_key_copy_and_keys_tmp_are_created_0600(
     tmp_path: Path, backup_env: dict[str, object]
 ) -> None:
-    """umask 022 下：`.root.key.prev.<pid>` 与 `KEYS_TMP` **创建即 0600**，无 0644 窗口。
+    """umask 022 下：`.root.key.prev.<pid>` 与 `KEYS_TMP` **创建瞬间 group/other 位为 0**。
 
-    这是 task65 N1 的回归点。观察方式两路并进：
+    这是 task65 N1 的回归点。判据是 `mode & 0o077 == 0`，**不是**"恰好 0600"：ext4
+    上 `0666 & ~077` 就是 0600，而 NAS 的 btrfs + trimacl 上同一段代码给 0700
+    （owner 多一个 x 位，group/other 仍是 0），同样安全——见 `GROUP_OTHER_BITS`
+    上方的说明。umask 077→022 的变异会让它变成 0644，断言照样红。
+
+    观察方式两路并进：
     1. `cat` 替身在"还没 chmod"的时刻记录重定向目标的权限位（确定性证据）；
     2. 主线程轮询暂存副本，记录运行期间看到的每一个权限位（不依赖替身）。
     """
@@ -950,11 +1313,10 @@ def test_stashed_key_copy_and_keys_tmp_are_created_0600(
 
     # ① KEYS_TMP：`( umask 077; docker … > "$KEYS_TMP" )` 的目标文件。容器读到的
     #    密钥字节就是写进它的，创建时若是 0644 就等于把根密钥对同机用户公开。
+    #    判据是 `mode & 0o077 == 0`（不是精确 0600）：NAS 的 btrfs + trimacl 上这里
+    #    是 0700，group/other 位仍是 0，同样安全（见 `GROUP_OTHER_BITS` 上方说明）。
     keys_tmp_modes = {mode for target, mode in records if target == root_key_payload}
-    assert keys_tmp_modes == {"600"}, (
-        f"KEYS_TMP 创建时权限是 {sorted(keys_tmp_modes)}（应为 600）："
-        "根密钥字节在 chmod 之前存在一个可读窗口"
-    )
+    _assert_modes_no_group_other(keys_tmp_modes, "KEYS_TMP")
 
     # ② 暂存副本 `keys/.root.key.prev.<pid>`：stash 里 `cat <keys/root.key> > $KEYS_PREV`。
     prev_modes = {
@@ -962,15 +1324,14 @@ def test_stashed_key_copy_and_keys_tmp_are_created_0600(
         for target, mode in records
         if target == str(out / "keys" / "root.key")
     }
-    assert prev_modes == {"600"}, (
-        f"暂存密钥副本创建时权限是 {sorted(prev_modes)}（应为 600）"
-    )
+    _assert_modes_no_group_other(prev_modes, "暂存密钥副本")
 
-    # ③ 轮询到的中间态也必须全是 0600（防止"替身没被调到"式的空过）。
+    # ③ 轮询到的中间态也必须 group/other 位全 0（防止"替身没被调到"式的空过）。
     assert observed, "运行期间一次都没观察到暂存副本，用例没测到东西"
-    assert set(observed) == {0o600}, f"轮询到非 0600 的中间态: {observed}"
+    _assert_modes_no_group_other(set(observed), "轮询到的暂存副本中间态")
 
-    # 成功路径：暂存副本零残留，正式产物 0600。
+    # 成功路径：暂存副本零残留，正式产物是显式 `chmod 600` 后的**精确 0600**
+    # （与 umask / 文件系统无关，所以这里保留精确断言）。
     assert [p.name for p in (out / "keys").iterdir()] == ["root.key"]
     assert ((out / "keys" / "root.key").stat().st_mode & 0o777) == 0o600
     assert run.leftovers() == []
@@ -982,14 +1343,15 @@ def test_stashed_key_copy_and_keys_tmp_are_created_0600(
 def test_direct_mode_keys_tmp_is_created_0600(
     tmp_path: Path, direct_env: dict[str, object]
 ) -> None:
-    """直接模式的 `KEYS_TMP`（`cat 源 > 目标`）同样创建即 0600。
+    """直接模式的 `KEYS_TMP`（`cat 源 > 目标`）同样创建瞬间 group/other 位为 0。
 
     源 `root.key` 在这里故意是 **0644**（写文件不 chmod）。若回退成 `cp`，目标
     权限是**源 mode & ~umask**：脚本那个 `umask 077` 子 shell 会挡掉 group/other，
-    所以 0644 源只得到 **0600**——看着"对了"，其实是 umask 兜住的，精确权限并不
-    由代码保证；而**带 owner-x 的源（0700）会原样留下 0700**，窗口期可执行。只有
-    `umask 077` 下的重定向创建走 `0666 & ~umask`，对任何源权限都恒定 0600。这正是
-    把直接模式从 `cp` 改成 `cat > 目标` 的回归点。
+    所以 0644 源只得到 group/other 位为 0（ext4 上是 0600）——看着"对了"，其实是
+    umask 兜住的，精确权限并不由代码保证；而**带 owner-x 的源（0700）会原样留下
+    0700**，窗口期可执行。只有 `umask 077` 下的重定向创建走 `0666 & ~umask`，对任何
+    源权限都恒定满足 `mode & 0o077 == 0`。这正是把直接模式从 `cp` 改成
+    `cat > 目标` 的回归点。
     """
     env = direct_env["env"]
     assert isinstance(env, dict)
@@ -1024,9 +1386,7 @@ def test_direct_mode_keys_tmp_is_created_0600(
         for target, mode in _mode_records(mode_log)
         if target == str(source_key)
     }
-    assert tmp_modes == {"600"}, (
-        f"直接模式的 KEYS_TMP 创建时权限是 {sorted(tmp_modes)}（应为 600）"
-    )
+    _assert_modes_no_group_other(tmp_modes, "直接模式的 KEYS_TMP")
     assert run.leftovers() == []
 
 
@@ -1404,6 +1764,8 @@ if [ -n "${TAR_STALL_SECONDS:-}" ]; then
   sleep "${TAR_STALL_SECONDS}"
 fi
 if [ "$TARGET" = "-" ]; then
+  # 模拟 NAS 的 btrfs + trimacl（见 `_tar_mode_shim` 的说明）。
+  _TAR_CREATE_HOOK
   exec 3>&1
   "__PYTHON__" -c 'import os, stat, sys
 try:
@@ -1423,6 +1785,8 @@ sys.stdout.write("%o\n" % (st.st_mode & 0o777))' >> "${TAR_STDOUT_MODE_LOG:?}" |
   /bin/cat "${DIRECT_MEDIA_PAYLOAD:?}"
 else
   /bin/cat "${DIRECT_MEDIA_PAYLOAD:?}" > "$TARGET"
+  # 模拟 NAS 的 btrfs + trimacl（见 `_tar_mode_shim` 的说明）。
+  _TAR_CREATE_HOOK
   "__PYTHON__" -c 'import os, stat, sys
 try:
     st = os.stat(sys.argv[1])
@@ -1432,6 +1796,25 @@ sys.stdout.write("%o\n" % (st.st_mode & 0o777))' "$TARGET" >> "${TAR_STDOUT_MODE
 fi
 exit 0
 """.replace("__PYTHON__", _PYTHON)
+
+# 直接模式 `tar` 替身的"创建瞬间"钩子：默认是空操作（下面两个 `.part` 用例按宿主
+# 文件系统的真实行为观察）；NAS 用例把它换成"模拟 btrfs + trimacl 建出 0700"。
+_TAR_CREATE_HOOK = ":"
+_DOCKER_CREATE_HOOK = ":"
+
+def _docker_fake(create_hook: str = _DOCKER_CREATE_HOOK) -> str:
+    """按 ``create_hook`` 生成一份 compose 模式的 ``docker`` 替身脚本。"""
+    return _DOCKER_FAKE_TEMPLATE.replace("_DOCKER_CREATE_HOOK", create_hook)
+
+
+# 默认（空操作钩子）的成品替身：模板里的占位符必须在这里被替换掉，否则生成出来的
+# 脚本里那一行就是一条不存在的命令（`_DOCKER_CREATE_HOOK: command not found`）。
+_DOCKER_FAKE = _docker_fake()
+
+
+def _tar_mode_shim(create_hook: str = _TAR_CREATE_HOOK) -> str:
+    """按 ``create_hook`` 生成一份直接模式的 ``tar`` 替身脚本。"""
+    return _TAR_MODE_SHIM.replace("_TAR_CREATE_HOOK", create_hook)
 
 
 def _run_backup_with(
@@ -1544,7 +1927,7 @@ def _read_octal_log(path: Path) -> set[str]:
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line}
 
 
-def _assert_sampled_0600(
+def _assert_sampled_no_group_other(
     observed: list[tuple[str, int]],
     *,
     prefix: str,
@@ -1552,11 +1935,15 @@ def _assert_sampled_0600(
     longest_gap: float,
     window_hint: str,
 ) -> None:
-    """断言轮询到的、以 ``prefix`` 开头的每一眼都只能是 0600。
+    """断言轮询到的、以 ``prefix`` 开头的每一眼都 ``mode & 0o077 == 0``。
+
+    判据与替身那一路一致：**不是**"恰好 0600"（NAS 的 btrfs + trimacl 给 0700，
+    同样安全，见 `GROUP_OTHER_BITS` 上方的说明）；umask 077→022 的变异给 0644，
+    `0o644 & 0o077 != 0`，照样红。
 
     漏采样要能被**区分**出来，而不是伪装成"权限坏了"：窗口里一个采样点都没落下时
-    给出的是"这一路没采到"的诊断（连同实测最长采样间隔），而不是让
-    `final_modes == {0o600}` 直接撞上一个空集 ``set()``。
+    给出的是"这一路没采到"的诊断（连同实测最长采样间隔），而不是让权限集合断言
+    直接撞上一个空集 ``set()``。
     """
     modes = {mode for name, mode in observed if name.startswith(prefix)}
     assert modes, (
@@ -1564,13 +1951,14 @@ def _assert_sampled_0600(
         f"{longest_gap * 1000:.1f} ms；{window_hint}）。这是**观察手段的漏采样**，"
         "不是权限异常——证明权限的是替身记录的那一路，见用例①。"
     )
-    assert modes == {0o600}, f"轮询到{what}的非 0600 中间态: {sorted(modes)}"
+    _assert_modes_no_group_other(modes, f"轮询到的{what}中间态")
 
 
 def test_compose_media_part_is_created_0600_and_mv_keeps_it(
     tmp_path: Path, backup_env: dict[str, object]
 ) -> None:
-    """compose 模式：`.part` **创建即 0600**，mv 后正式名仍是 0600，全程无 0644。
+    """compose 模式：`.part` **创建瞬间 group/other 位为 0**（ext4 上是 0600，
+    NAS 的 btrfs + trimacl 上是 0700），mv 后正式名是显式 chmod 过的 0600。
 
     前置条件是 umask 022（否则 0644 这个回归点根本不会出现）。
     """
@@ -1595,25 +1983,25 @@ def test_compose_media_part_is_created_0600_and_mv_keeps_it(
     media_name = manifest["media"]
 
     # ① 创建瞬间（替身在 docker 启动那一刻 stat 脚本的 stdout / 重定向目标）：
-    #    必须是 0600。**这一路是确定性的**——替身是写 `.part` 的那一方，它 stat
-    #    的时候文件一定已经存在，且此后只会被 chmod 收紧、不会再变宽。
+    #    group/other 位必须是 0。**这一路是确定性的**——替身是写 `.part` 的那一方，
+    #    它 stat 的时候文件一定已经存在，且此后只会被 chmod 收紧、不会再变宽。
+    #    注意断言的是 `mode & 0o077 == 0` 而不是精确 0600：NAS 的 btrfs + trimacl
+    #    给 0700（见 GROUP_OTHER_BITS 上方的说明）。umask 077→022 的变异会让它变成
+    #    0644，这里照样红。
     created = _read_octal_log(mode_log)
-    assert created == {"600"}, (
-        f"媒体 .part 创建时权限是 {sorted(created) or ['<未观察到>']}（应为 600）："
-        "整个流式传输期间媒体字节对同机其他用户可读"
-    )
+    _assert_modes_no_group_other(created, "compose 模式的媒体 .part")
 
-    # ② 轮询：`.part` 存续期间的每一眼、以及正式名的每一眼，都只能是 0600。
+    # ② 轮询：`.part` 存续期间的每一眼、以及正式名的每一眼，group/other 位都必须为 0。
     #    这一路是**补充**观察：mv→退出只有 ~25 ms，负载下可能整段错过，所以漏采样
-    #    单独诊断（见 _assert_sampled_0600），不把"没采到"报成"权限坏了"。
-    _assert_sampled_0600(
+    #    单独诊断（见 _assert_sampled_no_group_other），不把"没采到"报成"权限坏了"。
+    _assert_sampled_no_group_other(
         observed,
         prefix=".media-",
         what=".part",
         longest_gap=longest_gap,
         window_hint=".part 存续期较长，正常不会漏",
     )
-    _assert_sampled_0600(
+    _assert_sampled_no_group_other(
         observed,
         prefix="media-",
         what="正式名",
@@ -1637,7 +2025,7 @@ def test_compose_media_part_is_created_0600_and_mv_keeps_it(
 def test_direct_mode_media_part_is_created_0600(
     tmp_path: Path, direct_env: dict[str, object]
 ) -> None:
-    """直接模式：`( umask 077; tar -cf - … > .part )` 同样创建即 0600。
+    """直接模式：`( umask 077; tar -cf - … > .part )` 同样创建瞬间 group/other 位为 0。
 
     直接模式原来用 `tar -cf "$MEDIA_TMP"` 自建文件，权限 `0666 & ~umask` = 0644，
     而且**没有** `tar -tf` 完整性兜底，这里连成功路径一起验。
@@ -1645,7 +2033,7 @@ def test_direct_mode_media_part_is_created_0600(
     env = dict(direct_env["env"])  # type: ignore[arg-type]
     shim_dir = tmp_path / "tar-bin"
     shim_dir.mkdir()
-    _write_executable(shim_dir / "tar", _TAR_MODE_SHIM)
+    _write_executable(shim_dir / "tar", _tar_mode_shim())
     payload = tmp_path / "direct-media.tar"
     payload.write_bytes(_tar_bytes({"media/ev_new.jpg": b"new-jpeg-bytes"}))
 
@@ -1669,17 +2057,15 @@ def test_direct_mode_media_part_is_created_0600(
     assert run.calls("TAR_CALLS"), "tar 替身没被调用，用例没测到东西"
 
     created = _read_octal_log(mode_log)
-    assert created == {"600"}, (
-        f"直接模式媒体 .part 创建时权限是 {sorted(created) or ['<未观察到>']}（应为 600）"
-    )
-    _assert_sampled_0600(
+    _assert_modes_no_group_other(created, "直接模式媒体 .part")
+    _assert_sampled_no_group_other(
         observed,
         prefix=".media-",
         what=".part",
         longest_gap=longest_gap,
         window_hint=".part 存续期较长，正常不会漏",
     )
-    _assert_sampled_0600(
+    _assert_sampled_no_group_other(
         observed,
         prefix="media-",
         what="正式名",
@@ -1692,6 +2078,212 @@ def test_direct_mode_media_part_is_created_0600(
     assert (out / media_name).stat().st_mode & 0o777 == 0o600
     # umask 077 没有泄漏：manifest 仍是 0644。
     assert next(out.glob("manifest-*.txt")).stat().st_mode & 0o777 == 0o644
+    assert run.leftovers() == []
+
+
+# 同一个 NAS 模拟，但按**文件描述符**改：`cat` 替身不知道重定向目标叫什么，只知道
+# 它是 fd 3（`exec 3>&1` 复制到的那个 fd）。`os.fchmod(3, 0o700)` 改的正是它。
+_NAS_TRIMACL_FD_HOOK = (
+    '"__PYTHON__" -c \'import os; os.fchmod(3, 0o700)\' 2>/dev/null || true'
+).replace("__PYTHON__", _PYTHON)
+
+
+def _nas_trimacl_create_hook(*paths: str) -> str:
+    """模拟 NAS（btrfs + Synology ``trimacl``）的文件创建语义：**恒为 0700**。
+
+    真 Docker 验证（`shots/docker-real/DOCKER-REAL.md` §5 #3）实测：在 NAS 的
+    `/vol2` 上，`umask 077` 得 700、`umask 022` 也得 700、`mkdir` 得 700——也就是说
+    **创建权限与 umask 无关**，`0666 & ~umask` 这条公式在那儿不成立。
+
+    这里用桩把这套语义搬进测试：把 ``paths`` 里已存在的文件 chmod 成 0700（替换
+    "创建"这一步的效果）。替身随后记录的"创建瞬间 mode"因此就是 0700，与 ext4
+    上的 0600 只差 owner 的 x 位——group/other 位仍是 0，安全性质完全相同。
+    """
+    # 调用方传进来的就是 shell 片段本身（含 `$VAR` / `${VAR:?}` 之类的展开），
+    # 所以这里**不能**再加引号——再加就成了字面量 `""${MEDIA_PART_GLOB}""`。
+    hook = f"chmod 700 {' '.join(paths)} 2>/dev/null || true"
+    return hook
+
+
+def test_compose_media_part_nas_btrfs_0700_is_also_safe(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """NAS 行为也被接受：`.part` 创建瞬间是 **0700**（btrfs + trimacl）时用例必须**绿**。
+
+    这条是给"将来真在 NAS 上跑这套测试"的保险。NAS 上 `umask 077` 建文件得 0700
+    （不是 ext4 的 0600），旧断言 `created == {"600"}` 会红成假失败。安全要保证的
+    从来不是"恰好 0600"，而是 `mode & 0o077 == 0`——0700 满足它，所以这里必须过。
+
+    做法：docker 替身在 `.part` 建好之后、记录权限之前，把它 chmod 成 0700（模拟
+    NAS 的创建语义）。断言仍走与真实用例**同一套** `_assert_modes_no_group_other`
+    / `_assert_sampled_no_group_other`，所以它同时证明了"放宽后的断言确实接受 0700"。
+    """
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    shim_dir = tmp_path / "bin-nas"
+    shim_dir.mkdir()
+    _write_executable(
+        shim_dir / "docker",
+        _docker_fake(_nas_trimacl_create_hook("$MEDIA_PART_GLOB")),
+    )
+    mode_log = tmp_path / "media-create-mode-nas.log"
+    out = tmp_path / "backup-out"
+    out.mkdir()
+
+    run, observed, longest_gap = _run_backup_watch(
+        out,
+        env,
+        umask_bits="022",
+        patterns=(".media-*.tar.part", "media-*.tar"),
+        PATH=f"{shim_dir}{os.pathsep}{env['PATH']}",
+        DOCKER_STDOUT_MODE_LOG=str(mode_log),
+        MEDIA_PART_GLOB=str(out / ".media-*.tar.part"),
+        MEDIA_STALL_SECONDS="0.3",
+    )
+    assert run.proc.returncode == 0, run.outputs()
+
+    # 自证"这次真的模拟到了 NAS 语义"：替身记录到的创建瞬间必须是 700。
+    # 若桩没生效（还是宿主真实的 600），下面的断言就变成了在测 ext4，用例没意义。
+    created = _read_octal_log(mode_log)
+    assert created == {"700"}, (
+        f"NAS 模拟没生效：替身记录到的创建瞬间是 {sorted(created) or ['<未观察到>']}，"
+        "应为 700（btrfs + trimacl）。这条自证不成立时用例没有测到 NAS 行为。"
+    )
+    _assert_modes_no_group_other(created, "NAS 上的媒体 .part")
+
+    # 轮询这一路同理：`.part` 存续期间（桩在 docker 启动时就把它改成 0700 了）与
+    # 正式名（显式 `chmod 600` 之后）都必须 group/other 位为 0。
+    _assert_sampled_no_group_other(
+        observed,
+        prefix=".media-",
+        what=".part",
+        longest_gap=longest_gap,
+        window_hint=".part 存续期较长，正常不会漏",
+    )
+    _assert_sampled_no_group_other(
+        observed,
+        prefix="media-",
+        what="正式名",
+        longest_gap=longest_gap,
+        window_hint="mv 到进程退出之间只有约 25 ms",
+    )
+
+    # 正式产物不受影响：脚本显式 `chmod 600`，与 umask / 文件系统无关，所以这条
+    # 仍然精确断言 0600——NAS 上也必须成立。
+    media_name = run.manifest()["media"]
+    assert (out / media_name).stat().st_mode & 0o777 == 0o600
+    assert run.leftovers() == []
+
+
+def test_direct_mode_media_part_nas_btrfs_0700_is_also_safe(
+    tmp_path: Path, direct_env: dict[str, object]
+) -> None:
+    """直接模式同上：`tar` 替身模拟 btrfs + trimacl 建出 **0700** 的 `.part`，用例必须绿。
+
+    与 compose 那条对称：证明直接模式的 `.part` 断言在 NAS 的 0700 下也成立，而
+    `mv` + `chmod 600` 之后的正式名仍是精确 0600。
+    """
+    env = dict(direct_env["env"])  # type: ignore[arg-type]
+    shim_dir = tmp_path / "tar-bin-nas"
+    shim_dir.mkdir()
+    _write_executable(
+        shim_dir / "tar",
+        _tar_mode_shim(_nas_trimacl_create_hook("${MEDIA_PART_GLOB:?}")),
+    )
+    payload = tmp_path / "direct-media.tar"
+    payload.write_bytes(_tar_bytes({"media/ev_new.jpg": b"new-jpeg-bytes"}))
+
+    mode_log = tmp_path / "tar-create-mode-nas.log"
+    out = tmp_path / "backup-out"
+    out.mkdir()
+
+    run, observed, longest_gap = _run_backup_watch(
+        out,
+        env,
+        umask_bits="022",
+        patterns=(".media-*.tar.part", "media-*.tar"),
+        PATH=f"{shim_dir}{os.pathsep}{env['PATH']}",
+        TAR_STDOUT_MODE_LOG=str(mode_log),
+        MEDIA_PART_GLOB=str(out / ".media-*.tar.part"),
+        DIRECT_MEDIA_PAYLOAD=str(payload),
+        TAR_STALL_SECONDS="0.3",
+    )
+    assert run.proc.returncode == 0, run.outputs()
+    assert run.calls("TAR_CALLS"), "tar 替身没被调用，用例没测到东西"
+
+    created = _read_octal_log(mode_log)
+    assert created == {"700"}, (
+        f"NAS 模拟没生效：直接模式替身记录到的创建瞬间是 "
+        f"{sorted(created) or ['<未观察到>']}，应为 700（btrfs + trimacl）"
+    )
+    _assert_modes_no_group_other(created, "NAS 上的直接模式媒体 .part")
+
+    _assert_sampled_no_group_other(
+        observed,
+        prefix=".media-",
+        what=".part",
+        longest_gap=longest_gap,
+        window_hint=".part 存续期较长，正常不会漏",
+    )
+    _assert_sampled_no_group_other(
+        observed,
+        prefix="media-",
+        what="正式名",
+        longest_gap=longest_gap,
+        window_hint="mv 到进程退出之间只有约 25 ms",
+    )
+
+    media_name = run.manifest()["media"]
+    assert (out / media_name).stat().st_mode & 0o777 == 0o600
+    assert run.leftovers() == []
+
+
+def test_keys_tmp_nas_btrfs_0700_is_also_safe(
+    tmp_path: Path, direct_env: dict[str, object]
+) -> None:
+    """根密钥临时文件同理：直接模式 `KEYS_TMP` 创建瞬间是 **0700** 时必须**绿**。
+
+    `cat` 替身在被调用时把目标文件 chmod 成 0700（模拟 NAS 的 btrfs + trimacl），
+    随后记录的"创建瞬间 mode"就是 700；`_assert_modes_no_group_other` 必须接受它。
+    正式产物 `keys/root.key` 走显式 `chmod 600`，仍精确断言 0600。
+    """
+    env = direct_env["env"]
+    assert isinstance(env, dict)
+    source_key = Path(str(direct_env["data"])) / "root.key"
+
+    shim_dir = tmp_path / "cat-bin-nas"
+    shim_dir.mkdir()
+    _write_executable(
+        shim_dir / "cat",
+        _CAT_MODE_SHIM.replace(
+            "exec 3>&1\n",
+            "exec 3>&1\n" + _NAS_TRIMACL_FD_HOOK + "\n",
+        ),
+    )
+    mode_log = tmp_path / "cat-modes-nas.log"
+
+    out = tmp_path / "backup-out"
+    out.mkdir()
+    # 直接模式的 tar 替身必然失败（exit 2），密钥步骤在它之前——正好只有密钥可观察。
+    run = _run_backup_in(
+        out,
+        env,
+        umask_bits="022",
+        PATH=f"{shim_dir}{os.pathsep}{env['PATH']}",
+        CAT_MODE_LOG=str(mode_log),
+        CAT_STALL_SECONDS="0.2",
+    )
+    assert run.proc.returncode == 5, run.outputs()
+
+    tmp_modes = {
+        mode for target, mode in _mode_records(mode_log) if target == str(source_key)
+    }
+    # 自证：桩确实把创建瞬间改成了 700（否则这里测的还是宿主文件系统）。
+    assert tmp_modes == {"700"}, (
+        f"NAS 模拟没生效：KEYS_TMP 创建瞬间是 {sorted(tmp_modes) or ['<未观察到>']}，"
+        "应为 700（btrfs + trimacl）"
+    )
+    _assert_modes_no_group_other(tmp_modes, "NAS 上的 KEYS_TMP")
     assert run.leftovers() == []
 
 

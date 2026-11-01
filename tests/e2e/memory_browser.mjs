@@ -61,7 +61,6 @@
  *   E2E_MUTATION=small-touch  自检用：把触控目标压小，验证 44×44 审计确实会失败
  */
 import { spawn, execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -76,6 +75,7 @@ import {
   onTermination,
   resolveShotsDir,
 } from './lib/isolation.mjs';
+import { loadChromium } from './lib/playwright.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -98,18 +98,9 @@ console.log(
 
 /* --------------------------------------------------------------- playwright */
 
-async function loadChromium() {
-  const fromWebConsole = createRequire(path.join(REPO_ROOT, 'clients', 'web-console', 'package.json'));
-  try {
-    const mod = fromWebConsole('playwright');
-    return { chromium: mod.chromium, origin: `clients/web-console (playwright ${fromWebConsole('playwright/package.json')?.version})` };
-  } catch (error) {
-    console.error(`配置错误：找不到 playwright（${error?.message}）`);
-    console.error('修复：cd clients/web-console && pnpm install');
-    process.exit(2);
-  }
-}
-
+// 解析顺序与失败提示都在 lib/playwright.mjs：`clients/web-console` → 仓库根
+// node_modules → 直连 import('playwright')。原来这里只有第一步，取不到就直接
+// exit 2，即使调用方在别处装过 playwright 也用不上。
 const { chromium, origin: PLAYWRIGHT_ORIGIN } = await loadChromium();
 const EXECUTABLE = process.env.CHROME_PATH || undefined;
 

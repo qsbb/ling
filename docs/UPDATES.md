@@ -417,7 +417,12 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
 
 1. 备份：默认 Compose 部署没有发布 db 端口、宿主机也没有 DSN，所以用 compose
    模式（`LING_COMPOSE_PROJECT` 必须与真实项目名一致，`install.sh` 默认
-   `-p ling`；用 `--project` 改过就填那个）：
+   `-p ling`；用 `--project` 改过就填那个）。**项目名是唯一承重的参数**：
+   Compose v5 的 `docker compose exec` 按 project + service 的 label 找容器，
+   **不看 `-f`**（`-f` 只对 `up`/`config` 有意义），项目名对不上时报
+   `service "db" is not running`——那与"db 容器真挂了"文案相同，先怀疑项目名。
+   `backup.sh` 会在备份前用 `-f` 做一次 `config -q` 静态校验，compose 文件坏掉
+   时以 **exit 2**（配置错误，不是 pg_dump 的 3）fail fast：
 
    ```bash
    LING_BACKUP_VIA_COMPOSE=1 \

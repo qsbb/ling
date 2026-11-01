@@ -224,8 +224,14 @@ docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
 
 ```bash
 # 备份（数据库 dump + 墓碑清单 + app-data 卷里的 root.key 与 media 字节）。
-# 默认 compose 不发布 db 端口、宿主机也没有 DSN，所以要用 compose 模式；
-# 两个项目变量不能省（原因见 §8.1）：
+# 默认 compose 不发布 db 端口、宿主机也没有 DSN，所以要用 compose 模式。
+# **`LING_COMPOSE_PROJECT` 必填且承重**：Compose v5 的 `docker compose exec`
+# 是按 **project + service 的 label** 找正在运行的容器，**不看 `-f`**
+# （真机实测：`-f /nonexistent.yaml` 仍 rc=0 且命令照常执行；`-f` 指向插值
+# 必失败的 compose 也 rc=0）。项目名对不上就是 `service "db" is not running`
+# ——这时该查的是**项目名**，不是 db 容器。`-f` 只对 `up`/`config` 这类"读文件"
+# 的子命令有意义，脚本因此仍带着它，并在备份前先用 `config -q` 做一次静态
+# 校验（compose 文件坏掉时 exit 2，不会等到 `up` 才暴露）：
 LING_BACKUP_VIA_COMPOSE=1 \
 LING_COMPOSE_PROJECT=ling \
 LING_COMPOSE_FILE="$(pwd)/deploy/compose.yaml" \
@@ -254,7 +260,8 @@ deploy/backup/restore_drill.sh \
 > 能直连数据库的环境；默认 Compose 部署没有发布 db 端口，直接跑会以
 > “缺少 LING_DATABASE_URL”失败——那不是“备份已完成”。`LING_COMPOSE_PROJECT`
 > 必须与真实 Compose 项目名一致（`install.sh` 默认 `-p ling`），否则
-> `docker compose exec` 找不到容器。
+> `docker compose exec` 找不到容器（报 `service "db" is not running`，
+> 与"db 容器挂了"是同一句文案——**先怀疑项目名**）。
 
 `manifest-*.txt` 里每个产物都带哈希与状态：`dump_sha256`、`tombstones_sha256`、
 `keys_root_sha256`、`media_sha256`，以及 `keys_root=present|absent`、
@@ -995,21 +1002,34 @@ dump 分开保管"），不要指望备份目录里留着多天的密钥副本�
 > `restore_drill.sh` **不**校验 keys——它只核对 dump / 墓碑 / 媒体三份哈希，遇到这种
 > 目录会**放过**，所以判断仍要人工按 manifest 的哈希核对。
 
-`keys/.root.key.prev.<pid>` 与临时文件 `.root.key.part.<pid>` 都是**创建即 0600**
-（`backup.sh` 在 `umask 077` 的子 shell 里**用重定向创建**：暂存副本与直接模式的
-密钥临时文件是 `cat … > 目标`，compose 模式是 `docker … > 目标`）。这里特意不用
-`cp`：`cp` 会把源文件的 mode 带到目标上（源带 owner-x 位时目标创建瞬间是 0700），
-重定向创建在 `umask 077` 下则恒定 0600，随后的 `chmod 600` 只是兜底。先按默认
-umask 落一个 0644 再 `chmod 600` 的写法会在两步之间留一个"同机其他用户可读根
-密钥字节"的窗口，cron 路径的备份目录本来就是 0755，所以这件事不是理论风险。
+`keys/.root.key.prev.<pid>` 与临时文件 `.root.key.part.<pid>` 都是**创建瞬间就
+"同机其他用户读不到"**（`backup.sh` 在 `umask 077` 的子 shell 里**用重定向创建**：
+暂存副本与直接模式的密钥临时文件是 `cat … > 目标`，compose 模式是 `docker … > 目标`）。
+这里特意不用 `cp`：`cp` 会把源文件的 mode 带到目标上（源带 owner-x 位时目标创建
+瞬间是 0700），重定向创建在 `umask 077` 下则恒定满足 `mode & 0o077 == 0`，随后的
+`chmod 600` 只是兜底。先按默认 umask 落一个 0644 再 `chmod 600` 的写法会在两步之间
+留一个"同机其他用户可读根密钥字节"的窗口，cron 路径的备份目录本来就是 0755，所以
+这件事不是理论风险。
+
+> **口径是 `mode & 0o077 == 0`，不是"恰好 0600"**：`0600` 只是"常见 umask + 常见
+> 文件系统"下的**结果**（ext4/xfs 上 `0666 & ~077` 就是 0600）。真 Docker 验证
+> （`shots/docker-real/DOCKER-REAL.md` §5 #3）在 Synology NAS 的 `/vol2`
+>（btrfs + `trimacl`）上实测：**所有新建文件恒为 0700**（`umask 077` 得 700、
+> `umask 022` 也得 700、`mkdir` 得 700）——owner 多一个 x 位，group/other 仍是 0，
+> 所以**同样安全**。真正要挡的是"同机其他用户"，不是 owner 自己的 x 位；测试断言
+> 也因此钉在 `mode & 0o077 == 0` 上（否则这套测试原样跑在 NAS 上会红），只有显式
+> `chmod 600` 之后的**正式产物**才断言精确 0600。
+
 媒体临时文件
 `.media-<STAMP>.tar.part` 走的是**同一条路径**：compose 模式把
 `docker compose exec -T api … sh -c 'tar -cf -'` 的 stdout 重定向放进
 `umask 077` 的子 shell 内，直接模式同样把 `tar -cf - … > "$MEDIA_TMP"` 放进子
-shell 内，所以 `.part` **创建瞬间就是 0600**（随后的 `chmod 600` 只是兜底）。
-两种模式都是**先 `chmod` 再 `mv`**，正式名 `media-<STAMP>.tar` 一出现就是 0600，
-不存在"正式名还是 0644"的中间态；compose 的 `.media-*.err` 也在同一个子 shell 里
-创建，同样是 0600。`umask 077` 只作用于媒体/密钥这两**类**路径（脚本里共 5 处
+shell 内，所以 `.part` **创建瞬间就满足 `mode & 0o077 == 0`**（ext4 上是 0600，
+NAS 的 btrfs + trimacl 上是 0700；随后的 `chmod 600` 只是兜底）。
+两种模式都是**先 `chmod` 再 `mv`**，正式名 `media-<STAMP>.tar` 一出现就是精确
+0600（显式 `chmod`，与 umask / 文件系统无关），不存在"正式名还是 0644"的中间态；
+compose 的 `.media-*.err` 也在同一个子 shell 里
+创建，同样是"group/other 位为 0"。`umask 077` 只作用于媒体/密钥这两**类**路径（脚本里共 5 处
 子 shell）：同一份备份里的 `manifest-*` / `tombstones-*` / `dump` 仍按外层 umask
 写成 0644——**这是「默认 umask 022 下」的口径**，脚本不 chmod 它们；ambient
 `umask 077` 下同样的文件会是 0600，所以别把 0644 当成脚本保证（测试断言
@@ -1020,11 +1040,16 @@ shell 内，所以 `.part` **创建瞬间就是 0600**（随后的 `chmod 600` �
 `test_compose_media_part_is_created_0600_and_mv_keeps_it` 与
 `test_direct_mode_media_part_is_created_0600` 在 umask **022** 下同时做三路观测：
 ① 严格替身在**自己启动那一刻** `fstat` 脚本的 stdout（即 `.part`），断言"创建
-瞬间 = `600`"；② 主线程约每 **2ms** 轮询一次（`time.sleep(0.002)`）`.part` 与
+瞬间 `mode & 0o077 == 0`"（不是精确 600：NAS 上会是 700，同样安全；出现 0644 即
+失败）；② 主线程约每 **2ms** 轮询一次（`time.sleep(0.002)`）`.part` 与
 正式名，断言观察到的 mode
-集合**只有** `0o600`（出现任何 0644 中间态即失败）；③ 断言终态正式名 0600、
+集合**全部满足** `mode & 0o077 == 0`（出现任何 0644 中间态即失败）；③ 断言终态
+正式名 0600（显式 `chmod` 后的精确值）、
 成功路径不留 `.part`，且 `manifest` / `tombstones` 仍是 0644（`umask 077` 没有
-泄漏到其它产物）。
+泄漏到其它产物）。另有 `test_compose_media_part_nas_btrfs_0700_is_also_safe` /
+`test_direct_mode_media_part_nas_btrfs_0700_is_also_safe` /
+`test_keys_tmp_nas_btrfs_0700_is_also_safe` 三条用例把 `.part` 与 `KEYS_TMP` 的
+"创建瞬间"桩成 NAS 的 **0700**，证明这套断言在 btrfs + trimacl 上同样通过。
 
 （墓碑导出失败仍 exit 0（脚本头部与退出码表已写明），但 manifest 里
 `tombstones_state=FAILED`，执行器与 `restore_drill.sh` 都会据此拒绝这份备份；
@@ -1174,7 +1199,7 @@ exit 0 返回轮转计划。
 | 1 | 未分类的意外失败：`set -e` **透传底层命令的状态**（常见 1，例如直接模式 `pg_dump` 失败；脚本**没有**显式 `exit 1`）。命令缺失是 **127**，`psql` 自身 exit 2 会与"用法/配置错误"同码；其余状态不保证落在 0–7 |
 | 2 | 用法/配置错误：缺 `OUT_DIR`、未知参数、`--prune-*` 取值非法、缺 `LING_DATABASE_URL`、compose 模式缺 `docker` |
 | 3 | compose 模式 `pg_dump` 失败或导出为空（直接模式没有显式映射，`pg_dump` 的非零码由 `set -e` 原样透传，**不保证是 3**） |
-| 4 | 容器内根密钥读取失败（无法确认密钥状态，本次备份作废） |
+| 4 | 容器内根密钥读取失败**或完整性自校验失败**（容器侧 `sha256` 与归档字节不一致 / 容器没回传哈希；无法确认密钥状态，本次备份作废） |
 | 5 | 媒体归档**致命**失败：compose 的 `tar` rc≥2 或 `tar -tf` 读不出目录、直接模式 `tar` 非零。compose 的 `tar` rc=1 是 `media_state=partial`，**不算 5**，仍 exit 0 |
 | 6 | **备份锁被占用**（另一个实例正在同一 `OUT_DIR` 运行；或残留锁接管失败） |
 | 7 | 缺少 sha256 工具（`sha256sum` / `shasum` / `openssl` 都没有；在任何磁盘动作之前退出） |
