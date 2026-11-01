@@ -1,7 +1,7 @@
 # 功能设置分类法（现状）
 
 > **这份文档描述现状，不是许愿池。**
-> 每条结论后面都给 `文件:行号`。文档与代码不一致时以代码为准，并修文档。
+> 每条结论后面都给 `文件` + 符号锚点（导出常量 / 函数名 / 测试用例名）。文档与代码不一致时以代码为准，并修文档。
 >
 > 本次 IA（Step 4「设置瘦身与重组」）之后，**前端设置中心只剩 3 组**；
 > 后端 9 类 taxonomy **没有改**。这两件事的关系见 §1，那是全文最容易读错的地方。
@@ -15,14 +15,14 @@
 | 权威 | 位置 | 回答什么问题 | 本次 IA 是否改动 |
 |---|---|---|---|
 | **后端分类法** | `src/ling/settings/taxonomy.py` 的 `CATEGORIES` | 「这个设置项属于哪一类决策」「它从哪个 API 编辑」 | **未改**（仍是 9 类） |
-| **前端设置中心** | `clients/web-console/src/components/SettingsHub.tsx:57` 的 `SETTINGS_GROUPS` | 「哪些页面出现在 `/settings` 页面上」 | **改了**（6 类 → 3 组） |
+| **前端设置中心** | `clients/web-console/src/components/SettingsHub.tsx` 的 `SETTINGS_GROUPS` | 「哪些页面出现在 `/settings` 页面上」 | **改了**（6 类 → 3 组） |
 
 **关键区分：后端分类 ≠ 前端设置入口。**
 
-- `editable_route`（`taxonomy.py:60-71`）表达的是**「这一类从哪进去编辑」**——
+- `editable_route`（`taxonomy.py` 的 `Category.editable_route`）表达的是**「这一类从哪进去编辑」**——
   它回答数据/接口归属，**不是**「这个东西应该出现在 `/settings` 页面上」。
 - 前端 `/settings` 只渲染**程序与运维**（判据：有领域对象、有列表-详情生命周期的算内容页，
-  纯实例配置才算设置 —— `SettingsHub.tsx:2-19` 的注释）。
+  纯实例配置才算设置 —— `SettingsHub.tsx` 的文件头注释）。
 - 于是 ④记忆与学习、⑤对话与主动性、⑧生活与活动 的 `editable_route` **仍然是**
   `/v1/settings/config` 的对应段落（它们仍然是设置项），但它们的**编辑入口挂在各自的领域页**，
   不在设置中心。**没有删除任何设置项，只是换了住处。**
@@ -30,10 +30,10 @@
 ### 0.1 当前事实（一句话版）
 
 - 后端：**9 类**，其中 `editable_route` 非 None 的 **6 类**。
-  被测试锁死：`tests/unit/test_settings_taxonomy.py:164` `test_editable_count_is_exactly_six_today`
+  被测试锁死：`tests/unit/test_settings_taxonomy.py` 的 `test_editable_count_is_exactly_six_today`
   （断言 `labels == ["对话与主动性","权限与隐私","模型与生成","生活与活动","记忆与学习","身份与人格"]`）。
-- 前端：`/settings` 下 **3 组 / 5 张入口卡 + 1 个中心页**（`SettingsHub.tsx:57-116`）。
-- 迁出 3 类：旧地址有**精确重定向**（`route.ts:53-57`），新地址是 tab 深链。
+- 前端：`/settings` 下 **3 组 / 5 张入口卡 + 1 个中心页**（`SettingsHub.tsx` 的 `SETTINGS_GROUPS`）。
+- 迁出 3 类：旧地址有**精确重定向**（`route.ts` 的 `LEGACY_REDIRECTS`），新地址是 tab 深链。
 
 > **历史矛盾已删除。** 旧版本 §0 写「前端 `/settings` 只渲染这 6 类」，
 > 旧 §7 又写「3 类尚无设置面（②⑤⑧）」——同一份文档同时声称 ⑤⑧ 有/没有设置面。
@@ -43,18 +43,18 @@
 
 ## 1. 前端设置中心的真实结构（3 组）
 
-来源：`clients/web-console/src/components/SettingsHub.tsx:57-116`
+来源：`clients/web-console/src/components/SettingsHub.tsx` 的 `SETTINGS_GROUPS`
 
 | 组 `key` | 组名 | 入口 | path | 为什么这个在设置里 |
 |---|---|---|---|---|
-| `security`<br>(`:59`) | **安全与隐私** | ① 权限与隐私 | `/settings/privacy`<br>(`:68`) | 主体权利：同意可撤回、有有效期、有可见范围。这是**准许裁决**，不是行为偏好，且必须能随时撤销。 |
-| | | ② 多用户与账号 | `/settings/identity`<br>(`:75`) | 身份归属：合并只写 `subjects.merged_into` 指针、可拆开。是账号层运维，不是「她是谁」的人设内容。 |
-| | | ③ 登录名与密码 | `/settings/account`<br>(`:82`) | 你自己的登录凭据，改完其它设备失效。纯账号运维，与她的行为无关。 |
-| `model`<br>(`:88`) | **模型与密钥** | ④ 模型与生成 | `/settings/model`<br>(`:97`) | 实例能力：provider、密钥、职责绑定、草稿→发布→回滚。「谁来算」是程序配置，不属于任何领域页。 |
-| `maintenance`<br>(`:103`) | **维护与关于** | ⑤ 关于与版本 | `/settings/about`<br>(`:111`) | 运维动作：看版本、手动查 GitHub Release、按门禁安装。是「服务怎么跑」，不是她怎么表现。 |
+| `security`<br>(`SETTINGS_GROUPS` 的 `security` 组) | **安全与隐私** | ① 权限与隐私 | `/settings/privacy`<br>(`security` 组的 `privacy` 条目) | 主体权利：同意可撤回、有有效期、有可见范围。这是**准许裁决**，不是行为偏好，且必须能随时撤销。 |
+| | | ② 多用户与账号 | `/settings/identity`<br>(`security` 组的 `identity` 条目) | 身份归属：合并只写 `subjects.merged_into` 指针、可拆开。是账号层运维，不是「她是谁」的人设内容。 |
+| | | ③ 登录名与密码 | `/settings/account`<br>(`security` 组的 `account` 条目) | 你自己的登录凭据，改完其它设备失效。纯账号运维，与她的行为无关。 |
+| `model`<br>(`SETTINGS_GROUPS` 的 `model` 组) | **模型与密钥** | ④ 模型与生成 | `/settings/model`<br>(`model` 组的 `model` 条目) | 实例能力：provider、密钥、职责绑定、草稿→发布→回滚。「谁来算」是程序配置，不属于任何领域页。 |
+| `maintenance`<br>(`SETTINGS_GROUPS` 的 `maintenance` 组) | **维护与关于** | ⑤ 关于与版本 | `/settings/about`<br>(`maintenance` 组的 `about` 条目) | 运维动作：看版本、手动查 GitHub Release、按门禁安装。是「服务怎么跑」，不是她怎么表现。 |
 
 **路由侧对应**：`/settings` 下仍归属设置的共 6 条
-（`route.ts:70-76` 与 `nav.test.ts:239-246` 的 `settingsPaths` 逐一对应）：
+（`route.ts` 的 `parseRoute` 中 `/settings/*` 各分支，与 `nav.test.ts` 里「`/settings/* 全部高亮「设置」（子页不再是无归属页，SHOTS_REPORT §5.7）`」用例的 `settingsPaths` 逐一对应）：
 
 ```
 /settings          → SettingsHub（中心页）
@@ -65,12 +65,12 @@
 /settings/about    → AboutPage（关于与版本）
 ```
 
-`/settings/about` 仍是版本号 badge 的落点（`Navigation.tsx:70`），
-且 `tests/e2e/update_browser.mjs:545` 仍以它为目标——这条地址**不许消失**。
+`/settings/about` 仍是版本号 badge 的落点（`Navigation.tsx` 的 `VERSION_NAV`），
+且 `tests/e2e/update_browser.mjs` 的 `openAbout` 仍以它为目标——这条地址**不许消失**。
 
 ### 1.1 迁出的 3 类：只指路，不是入口
 
-`SettingsHub.tsx:119-123`：
+`SettingsHub.tsx` 的 `MOVED_HINT`：
 
 ```ts
 const MOVED_HINT = [
@@ -80,14 +80,14 @@ const MOVED_HINT = [
 ];
 ```
 
-渲染在 `SettingsHub.tsx:211-223`：底部一行灰字 + `link-button`，
+渲染在 `SettingsHub.tsx` 的 `MOVED_HINT.map(...)` 处：底部一行灰字 + `link-button`，
 **不挂在 `settings-groups` 的卡片网格里**。做成卡片就等于没迁（用户原话是「不要再放到设置里」）。
 
 ### 1.2 taxonomy 挂了不挡路
 
-`SettingsHub.tsx:129-149`：`api.taxonomy()` 失败只 `setError` 显示一条 banner（`:163-177`），
+`SettingsHub.tsx` 的 `load` 与 `decorate`：`api.taxonomy()` 失败只 `setError` 显示一条 banner（错误 banner 渲染块），
 入口卡片用**本文件的文案**；只有 `privacy` / `model` 两张卡在成功时用后端 `label`/`verb` 覆盖
-（`decorate`，`:144-149`）。旧实现是 taxonomy 一失败，设置中心一个入口都不剩。
+（`decorate`）。旧实现是 taxonomy 一失败，设置中心一个入口都不剩。
 
 ---
 
@@ -99,7 +99,7 @@ const MOVED_HINT = [
 | ⑤ 对话与主动性 | `/settings/dialogue` | `/persona?tab=dialogue` | 人设页「对话与主动性」tab |
 | ⑧ 生活与活动（节奏） | `/settings/life` | `/life?tab=rhythm` | 生活页「生活节奏」tab |
 
-### 2.1 重定向表是**精确表**（`route.ts:53-57`）
+### 2.1 重定向表是**精确表**（`route.ts` 的 `LEGACY_REDIRECTS`）
 
 ```ts
 export const LEGACY_REDIRECTS: Readonly<Record<string, string>> = {
@@ -109,18 +109,18 @@ export const LEGACY_REDIRECTS: Readonly<Record<string, string>> = {
 };
 ```
 
-- 精确键查找：`route.ts:63-64` 用 `LEGACY_REDIRECTS[path]`，**不是** `startsWith`、不是正则。
-- 表外兜底是 `notFound`：`route.ts:85`。
-- 三条旧地址**已从路由表删除**（`route.ts:66-84` 没有它们的 case），否则「迁出」只是加了个跳板。
+- 精确键查找：`route.ts` 的 `parseRoute` 用 `LEGACY_REDIRECTS[path]`，**不是** `startsWith`、不是正则。
+- 表外兜底是 `notFound`：`parseRoute` 末尾的 `notFound` 分支。
+- 三条旧地址**已从路由表删除**（`parseRoute` 的 case 表里没有它们），否则「迁出」只是加了个跳板。
 - **不许改成 `/settings/*` 通配**：通配会把拼错的 `/settings/memroy` 也悄悄导到能用的页面，
-  `notFound` 要暴露的东西就再也暴露不出来。锁在 `dashboard.test.ts:281-294`
-  与 `nav.test.ts:310-322`（后者是「表外必须 notFound」的逐条版）。
+  `notFound` 要暴露的东西就再也暴露不出来。锁在 `dashboard.test.ts` 的「表外路径一律 notFound（重定向不许掩盖真 404）」
+  与 `nav.test.ts` 的「表外路径一律 notFound（重定向表不许变成通配）」（后者是「表外必须 notFound」的逐条版）。
 
 ### 2.2 跳转用 `replace`，不是 `push`
 
 改地址栏不在 `route.ts` 里做（它保持纯函数，单测可直接断言），在壳层 effect：
 
-`App.tsx:282-284`
+`App.tsx` 的 `AppShell` 里 `legacyTo` 的 effect（`navigate(legacyTo, { replace: true })`）
 
 ```ts
 const legacyTo = route.name === 'legacyRedirect' ? route.to : null;
@@ -129,24 +129,24 @@ useEffect(() => {
 }, [legacyTo]);
 ```
 
-`navigate` 的 `replace` 分支走 `history.replaceState`（`route.ts:167-173`）。
+`navigate` 的 `replace` 分支走 `history.replaceState`（`route.ts` 的 `navigate` 中 `replace` 分支）。
 理由：旧书签不该在后退栈里留一层，否则点一次后退又被重定向回来。
 
-首帧不闪 404：`App.tsx:95-100` 的 `legacyRedirect` 分支直接渲染**目标页内容**。
+首帧不闪 404：`App.tsx` 的 `mainPage` 里 `legacyRedirect` 分支直接渲染**目标页内容**。
 
 ### 2.3 tab 深链（新地址必须可分享、可刷新、可后退）
 
 `clients/web-console/src/tabs.ts`：
 
-| 函数 | 行 | 行为 |
+| 函数 | 定义 | 行为 |
 |---|---|---|
-| `personaTabFromHref` | `tabs.ts:35-40` | `?tab=dialogue` → `dialogue`；旧路径 `/settings/dialogue` 也认；**未知值 → `persona`，不抛异常** |
-| `personaTabHref` | `tabs.ts:42-44` | `dialogue` → `/persona?tab=dialogue`，否则 `/persona` |
-| `lifeTabFromHref` | `tabs.ts:52-57` | `?tab=rhythm` → `rhythm`；旧路径 `/settings/life` 也认；**未知值 → `now`，不抛异常** |
-| `lifeTabHref` | `tabs.ts:59-61` | `rhythm` → `/life?tab=rhythm`，否则 `/life` |
+| `personaTabFromHref` | `tabs.ts` | `?tab=dialogue` → `dialogue`；旧路径 `/settings/dialogue` 也认；**未知值 → `persona`，不抛异常** |
+| `personaTabHref` | `tabs.ts` | `dialogue` → `/persona?tab=dialogue`，否则 `/persona` |
+| `lifeTabFromHref` | `tabs.ts` | `?tab=rhythm` → `rhythm`；旧路径 `/settings/life` 也认；**未知值 → `now`，不抛异常** |
+| `lifeTabHref` | `tabs.ts` | `rhythm` → `/life?tab=rhythm`，否则 `/life` |
 
-页面接入：`PersonaPage.tsx:40-41`、`LifeNowPage.tsx:67-68`。
-记忆页的同类函数是 `MemoryPage.tsx:561` `memoryTabFromHref`（`?tab=settings` ↔ `/memory?tab=settings`）。
+页面接入：`PersonaPage.tsx` 的 `personaTabFromHref`、`LifeNowPage.tsx` 的 `lifeTabFromHref`。
+记忆页的同类函数是 `MemoryPage.tsx` 的 `memoryTabFromHref`（`?tab=settings` ↔ `/memory?tab=settings`）。
 
 **为什么 `*TabFromHref` 同时认旧路径**：重定向发生在壳层 effect 里，首帧地址还是旧的；
 只认 `?tab=` 会先开错 tab 再跳一次。契约测试见 `tabs.test.ts`（12 用例，含往返一致与「不抛异常」）。
@@ -196,24 +196,24 @@ useEffect(() => {
 
 ### 3.1 每类的 `editable_route` 与「前端入口在哪」
 
-| # | 类 | `editable_route` | taxonomy.py 行 | 前端编辑入口（现状） |
+| # | 类 | `editable_route` | 类 `key` | 前端编辑入口（现状） |
 |---|---|---|---|---|
-| ① | 身份与人格 | `/v1/persona` | `:85` | `/persona`（人设页，**不在设置**） |
-| ② | 语言与声音 | `None` | `:90` | 无（见 §6） |
-| ③ | 模型与生成 | `/v1/settings/config` | `:110` | **`/settings/model`** |
-| ④ | 记忆与学习 | `/v1/settings/config` | `:127` | `/memory?tab=settings`（**不在设置**） |
-| ⑤ | 对话与主动性 | `/v1/settings/config` | `:142` | `/persona?tab=dialogue`（**不在设置**） |
-| ⑥ | 渠道与连接 | `None` | `:148` | 无 |
-| ⑦ | 权限与隐私 | `/v1/consents` | `:168` | **`/settings/privacy`** |
-| ⑧ | 生活与活动 | `/v1/settings/config` | `:184` | `/life?tab=rhythm`（**不在设置**） |
-| ⑨ | 系统与部署 | `None` | `:189` | 无（部署/env） |
+| ① | 身份与人格 | `/v1/persona` | `identity` | `/persona`（人设页，**不在设置**） |
+| ② | 语言与声音 | `None` | `expression` | 无（见 §6） |
+| ③ | 模型与生成 | `/v1/settings/config` | `model` | **`/settings/model`** |
+| ④ | 记忆与学习 | `/v1/settings/config` | `memory` | `/memory?tab=settings`（**不在设置**） |
+| ⑤ | 对话与主动性 | `/v1/settings/config` | `dialogue` | `/persona?tab=dialogue`（**不在设置**） |
+| ⑥ | 渠道与连接 | `None` | `channel` | 无 |
+| ⑦ | 权限与隐私 | `/v1/consents` | `privacy` | **`/settings/privacy`** |
+| ⑧ | 生活与活动 | `/v1/settings/config` | `life` | `/life?tab=rhythm`（**不在设置**） |
+| ⑨ | 系统与部署 | `None` | `system` | 无（部署/env） |
 
 加粗的只有 2 类（③⑦）真正出现在设置中心；①④⑤⑧ 的编辑面在各自领域页；
 ②⑥⑨ 还没有前端设置面。
 
 > `editable_route` 为 `None` 表示这一类**还没有设置面**，前端不得为它渲染入口
-> （`taxonomy.py:11-17`、`:60-71`）。这个字段是诚实性锚：
-> `tests/unit/test_settings_taxonomy.py:112` 验证每个非 None 的路由真的存在于 FastAPI 路由表。
+> （见 `taxonomy.py` 模块头注释里 `editable_route` 的说明、`Category.editable_route` 字段与 `Category.available`）。这个字段是诚实性锚：
+> `tests/unit/test_settings_taxonomy.py` 的 `test_editable_route_exists_in_app` 验证每个非 None 的路由真的存在于 FastAPI 路由表。
 
 ### 3.2 为什么 ③④⑤⑧ 共用 `/v1/settings/config`
 
@@ -468,12 +468,12 @@ reflection           planning
 
 1. 先用 §5 的判定序列确定**归属**（9 类里哪一类）。
 2. 再问**入口该在哪**：是纯实例配置/运维（→ `/settings`），还是领域行为调参（→ 该领域页的 tab）？
-3. 若放 `/settings`：必须在 `SettingsHub.tsx:57` 的 `SETTINGS_GROUPS` 里加卡，并写清「为什么这个在设置里」。
+3. 若放 `/settings`：必须在 `SettingsHub.tsx` 的 `SETTINGS_GROUPS` 里加卡，并写清「为什么这个在设置里」。
    不要新建空壳页——Ling 没有语言/主题/CORS/限流这些配置项。
 4. 若放领域页：用 `tabs.ts` 的 `*TabHref` 约定，`?tab=` 深链，**未知值回默认 tab 且不抛异常**。
-5. 后端 `taxonomy.py` 的 `editable_route` 指向**真实存在**的 GET 端点（`test_settings_taxonomy.py:112` 会验）。
-   若因此改变了「可编辑类数」，**主动**更新 `test_editable_count_is_exactly_six_today`（`:164`）。
-6. 加/改设置项要同时改本文件对应小节，并给 `文件:行号`。
+5. 后端 `taxonomy.py` 的 `editable_route` 指向**真实存在**的 GET 端点（`test_settings_taxonomy.py` 的 `test_editable_route_exists_in_app` 会验）。
+   若因此改变了「可编辑类数」，**主动**更新 `test_editable_count_is_exactly_six_today`。
+6. 加/改设置项要同时改本文件对应小节，并给 `文件` + 符号锚点。
 
 ---
 
@@ -481,18 +481,18 @@ reflection           planning
 
 | 断言 | 出处 |
 |---|---|
-| 设置中心 3 组 | `clients/web-console/src/components/SettingsHub.tsx:57-116` |
-| 迁出项只指路 | `SettingsHub.tsx:119-123`、`:211-223` |
-| taxonomy 失败不挡路 | `SettingsHub.tsx:129-149`、`:163-177` |
-| 重定向表三条 | `clients/web-console/src/route.ts:53-57` |
-| 精确查找 + notFound 兜底 | `route.ts:63-64`、`:85` |
-| `/settings/about` 仍在 | `route.ts:72`、`Navigation.tsx:70`、`tests/e2e/update_browser.mjs:545` |
-| `replace: true` | `App.tsx:282-284`、`route.ts:167-173` |
-| 首帧渲染目标页 | `App.tsx:95-100` |
-| tab 深链 | `clients/web-console/src/tabs.ts:35-61`、`PersonaPage.tsx:40`、`LifeNowPage.tsx:67`、`MemoryPage.tsx:561` |
-| 后端 9 类 | `src/ling/settings/taxonomy.py:74-198`（`CATEGORIES`；各 `label` 在 :78/:90/:102/:116/:132/:148/:161/:173/:189） |
-| 可编辑恰好 6 类（测试锁） | `tests/unit/test_settings_taxonomy.py:164` |
-| `editable_route` 诚实性锚 | `taxonomy.py:11-17`、`:60-71`、`test_settings_taxonomy.py:112` |
-| 表外必须 notFound（测试） | `dashboard.test.ts:281-294`、`nav.test.ts:310-322`、`about.test.ts:108-118` |
+| 设置中心 3 组 | `clients/web-console/src/components/SettingsHub.tsx` 的 `SETTINGS_GROUPS` |
+| 迁出项只指路 | `SettingsHub.tsx` 的 `MOVED_HINT` 定义与 `MOVED_HINT.map(...)` 渲染处 |
+| taxonomy 失败不挡路 | `SettingsHub.tsx` 的 `load` / `decorate`、错误 banner 渲染块 |
+| 重定向表三条 | `clients/web-console/src/route.ts` 的 `LEGACY_REDIRECTS` |
+| 精确查找 + notFound 兜底 | `route.ts` 的 `parseRoute`（精确键查找、`notFound` 兜底） |
+| `/settings/about` 仍在 | `route.ts` 的 `parseRoute` 里 `/settings/about` 分支、`Navigation.tsx` 的 `VERSION_NAV`、`update_browser.mjs` 的 `openAbout` |
+| `replace: true` | `App.tsx` 的 `AppShell` 里 `legacyTo` effect、`route.ts` 的 `navigate` 中 `replace` 分支 |
+| 首帧渲染目标页 | `App.tsx` 的 `mainPage` 里 `legacyRedirect` 分支 |
+| tab 深链 | `tabs.ts` 的 `personaTabFromHref` / `personaTabHref` / `lifeTabFromHref` / `lifeTabHref`、`PersonaPage.tsx` 的 `personaTabFromHref` 接入、`LifeNowPage.tsx` 的 `lifeTabFromHref` 接入、`MemoryPage.tsx` 的 `memoryTabFromHref` |
+| 后端 9 类 | `src/ling/settings/taxonomy.py` 的 `CATEGORIES`（各 `label` 见各类的 `label=` 字段） |
+| 可编辑恰好 6 类（测试锁） | `tests/unit/test_settings_taxonomy.py` 的 `test_editable_count_is_exactly_six_today` |
+| `editable_route` 诚实性锚 | `taxonomy.py` 模块头注释里 `editable_route` 的说明、`Category.editable_route` 字段、`test_settings_taxonomy.py` 的 `test_editable_route_exists_in_app` |
+| 表外必须 notFound（测试） | `dashboard.test.ts` 的「表外路径一律 notFound（重定向不许掩盖真 404）」、`nav.test.ts` 的「表外路径一律 notFound（重定向表不许变成通配）」、`about.test.ts` 的「未知设置子路径落到 notFound，不再静默回聊天页（契约修正）」 |
 | tab 契约测试 | `clients/web-console/src/tabs.test.ts`（12 用例） |
 </content>
