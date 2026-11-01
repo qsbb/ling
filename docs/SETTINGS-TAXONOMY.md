@@ -397,7 +397,9 @@ useEffect(() => {
 
 ### 6.2 `LING_ONEBOT_PROACTIVE` 是探测结果而非用户设置
 
-**原状**：`capabilities/channels.py:28,42-50` 把它读成 `supports_proactive`，
+**原状**：`capabilities/channels.py` 里有两处把它读成 `supports_proactive`：
+`onebot_config()` 的 `OneBotConfig(...)` 调用里读 `LING_ONEBOT_PROACTIVE`，
+`qqbot_config()` 的 `supports_proactive=bool(get("qqbot_proactive"))`，
 但这个事实没有暴露在任何接口上，设置面看起来像一个可以随便开关的偏好。
 
 **修法**：`GET /v1/channels` 新增 `onebot.capabilities_readonly`

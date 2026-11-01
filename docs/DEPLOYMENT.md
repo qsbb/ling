@@ -1011,8 +1011,10 @@ shell 内，所以 `.part` **创建瞬间就是 0600**（随后的 `chmod 600` �
 不存在"正式名还是 0644"的中间态；compose 的 `.media-*.err` 也在同一个子 shell 里
 创建，同样是 0600。`umask 077` 只作用于媒体/密钥这两**类**路径（脚本里共 5 处
 子 shell）：同一份备份里的 `manifest-*` / `tombstones-*` / `dump` 仍按外层 umask
-写成 0644（测试断言 `manifest` / `tombstones` 是 0644；`dump` 同样是 0644，
-但测试没有单独断言它，属于实测/umask 行为，见下）。
+写成 0644——**这是「默认 umask 022 下」的口径**，脚本不 chmod 它们；ambient
+`umask 077` 下同样的文件会是 0600，所以别把 0644 当成脚本保证（测试断言
+`manifest` / `tombstones` 是 0644；`dump` 同样是 0644，但测试没有单独断言它，
+属于实测/umask 行为，见下）。
 
 验证方式：`tests/test_deploy_backup_archive.py` 的
 `test_compose_media_part_is_created_0600_and_mv_keeps_it` 与

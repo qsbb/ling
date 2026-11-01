@@ -19,19 +19,20 @@
 
 | # | 事实 | 证据 |
 |---|---|---|
-| 1 | **私聊没有沉默路径**，每条文本必回 | `decision.py:128-141`，注释明写"沉默会被当成坏了"（`:131`） |
-| 2 | **群聊沉默 = 没看见**，消息根本不落库 | `bridge.py:138` 在 `_ensure_turn` 之前 return |
-| 3 | **弹性区间是死的**，模型从未参与 | `chat.py:147` 读 `app.state.config_service`，该属性不存在 |
+| 1 | **私聊没有沉默路径**，每条文本必回 | `decision.py` 的 `DecisionEngine.decide()` 私聊分支（`if not ctx.is_group` 内 `not ctx.has_meaningful_text` 那一支）：注释明写"空消息在私聊里也回一句澄清，而不是沉默（沉默会被当成坏了）" |
+| 2 | ~~群聊沉默 = 没看见，消息不落库~~ → **群里普通消息不即时决策** | `bridge.py` 的 `plain_group` 分支（`_defer_group_attention()` 为真时）：`add_message(..., attention_state="unseen")` 后返回 `decision="deferred_attention"`——**消息是落库的**，只是这一轮不决策 |
+| 3 | **弹性区间是死的**，模型从未参与 | 旧实现读 `app.state.config_service`（该属性不存在），现仅存于 `chat.py` 的 `_group_turn_budget()` / `_choose_by_autonomy()` docstring 注释；配置已改由依赖注入传入 |
 | 4 | **QQ 路径根本不问模型** | `bridge._decide` 直接 `DecisionEngine().decide(ctx)` |
 
 > **时效说明（2026-11-01 复核）**：§0 记录的是**设计期快照**，其中 #2/#3/#4 所述
-> 行为在当前实现中已不成立：#2 现在沉默也落库（`bridge.py:248-292`，写
-> `handled_as=ignored` + `attention_state=seen`，注释"沉默不等于没看见"）；#3 的
-> 弹性区间已真正交给模型（Web 侧 `chat.py:104-119` 的 `_choose_by_autonomy`，旧
-> 实现见 `chat.py:91-118` 的注释）；#4 的 `bridge._decide` 也不再直接调
-> `DecisionEngine().decide(ctx)`，而是走与 Web 同一个 `AutonomyTurnService`
-> （`bridge.py:652-670`）。只有 #1 仍然成立，行号已漂移到 `decision.py:128-141`。
-> 保留原文是为了说明当时的动机，引用时请以本条为准。
+> 行为在当前实现中已不成立：#2 现在沉默也落库（`bridge.py` 的 `_decide` 之后
+> `if not decision.respond:` 分支，写 `handled_as="ignored"` + `attention_state="seen"`，
+> 注释"沉默不等于没看见"）；#3 的弹性区间已真正交给模型（Web 侧 `chat.py` 的
+> `_choose_by_autonomy()`，旧实现在 `_group_turn_budget()` 与它自己的 docstring 里
+> 留了说明）；#4 的 `bridge._decide` 也不再直接调 `DecisionEngine().decide(ctx)`，
+> 而是走与 Web 同一个 `AutonomyTurnService`（`bridge.py` 的 `_decide()` 末尾
+> `return await AutonomyTurnService(...).choose(ctx, text=text)`）。
+> 只有 #1 仍然成立。保留原文是为了说明当时的动机，引用时请以本条为准。
 
 再加三个"声明了但从未接通"的字段：`silent_ack`（只被塞进 API 响应给前端看，
 从没真发过表情）、`defer`（从未产生）、`avatar_action`（从未使用）。
