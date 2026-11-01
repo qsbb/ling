@@ -739,10 +739,18 @@ COMPOSE_FILE="${LING_COMPOSE_FILE:-deploy/compose.yaml}"
 #      目录往往与真实项目名不同（实测：项目叫 ling-verify，目录叫 deploy）；
 #   2) **Compose v5 的 `exec` 根本不看 `-f`**：它按 project + service 的 label
 #      找正在运行的容器（真机实测：`-f /nonexistent.yaml` 仍 rc=0 且命令照常
-#      执行；`-f` 指向插值必失败的 compose 也 rc=0）。所以对 exec 而言
-#      **`-p` 是唯一承重的参数**，`-f` 在这里只起"留个自证路径"的作用。
-#      项目名对不上 → docker 报 `service "db" is not running`，和"db 容器挂了"
-#      文案一模一样，运维极易查错方向。
+#      执行；`-f` 指向插值必失败的 compose 也 rc=0）。`-f` 在这里只起"留个自证
+#      路径"的作用。
+#
+#      **项目名（`-p`）是否承重，取决于 compose 文件里有没有顶层 `name:`**：
+#        - 有 `name: ling`（本仓库 `deploy/compose.yaml` 就是）→ 它覆盖了"按目录名
+#          推导项目名"的默认行为，**不给 `-p` 也照样命中**（真机实测 rc=0）；
+#        - **没有** `name:` → 项目名按 compose 文件所在目录名推导（这里是
+#          `deploy`），与 `install.sh` 的 `-p ling` 不一致，`exec` 就找不到容器，
+#          docker 报 `service "db" is not running`——和"db 容器挂了"文案一模一样，
+#          运维极易查错方向。
+#      所以 cron/备份脚本里**仍然要给 `-p`**（不能依赖 compose 恰好写了 `name:`，
+#      也不能保证运维没改过项目名），但说"唯一承重参数"是错的。
 COMPOSE_PROJECT="${LING_COMPOSE_PROJECT:-}"
 COMPOSE_ARGS=(-f "$COMPOSE_FILE")
 if [ -n "$COMPOSE_PROJECT" ]; then
@@ -767,7 +775,7 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 位置说明（**别照抄成"在任何动作之前"**）：这条校验在 `mkdir -p "$OUT_DIR"`
   # 与 `acquire_lock` **之后**（函数开头就建目录、抢锁，否则并发保护无从谈起）。
   # 所以配置坏掉时**会留下一个空 OUT_DIR**、锁由 `trap` 释放。真机实测确认过这个
-  # 行为（shots/docker-real/P3-REAL-REVERIFY.md §4）。它拦住的是"导出/墓碑/密钥/
+  # 行为（shots/docker-real/P3-REAL-REVERIFY.md 的 B-2）。它拦住的是"导出/墓碑/密钥/
   # 媒体"这些**会留下半成品**的动作——那些确实都还没开始，所以退出时是干净的，
   # 只剩一个空目录。这条事实被
   # `test_compose_config_precheck_runs_after_outdir_creation` 显式锁住。
@@ -839,7 +847,7 @@ if [ "$VIA_COMPOSE" = "1" ]; then
   # 关于"44 B → 46 B"这个具体字节数：它是早期在某个 Docker/Compose 版本上观测到的，
   # **在 Docker 29.6.2 + Compose v5.3.1 上复现不出来**（真机实测：pty 确实被分配，
   # 但 44 字节哑数据经 stdout 出来仍是 44 B、sha 相同、stderr 未合并，见
-  # shots/docker-real/P3-REAL-REVERIFY.md §5）。所以**不要把这个字节数当成契约**：
+  # shots/docker-real/P3-REAL-REVERIFY.md 的 C-4）。所以**不要把这个字节数当成契约**：
   # 它想表达的是"没有 -T 时字节流可能被污染且不报错"，而不是"一定会多 2 字节"。
   # 自校验的价值正在于此——不管污染是 2 字节、NUL、还是某个版本上根本不发生，
   # 只要容器侧哈希与归档字节对不上就 exit 4，不会静默归档。

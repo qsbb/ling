@@ -955,8 +955,17 @@ deploy/backup/backup.sh /mnt/backup/ling
 1. `docker compose -f 路径` 会按**文件所在目录名**推导项目名（这里是 `deploy`），
    而 `install.sh` 默认用 `-p ling`；名字不一致时 `exec` 找不到正在运行的容器。
 2. **Compose v5 的 `exec` 根本不看 `-f`**（真机实测：`-f /nonexistent.yaml` 仍
-   返回 0 并照常执行）。它按 project + service 的 label 找容器，所以对备份/恢复
-   的 `exec` 而言 **`-p` 是唯一承重的参数**，`-f` 只对 `up`/`config` 有意义。
+   返回 0 并照常执行）。它按 project + service 的 label 找容器，`-f` 只对
+   `up`/`config` 有意义。
+
+   项目名（`-p`）是否承重**取决于 compose 文件有没有顶层 `name:`**：
+   - 有 `name: ling`（本仓库 `deploy/compose.yaml` 就是）→ 它覆盖了"按目录名
+     推导"，**不给 `-p` 也照样命中**（真机实测 rc=0）
+   - **没有** `name:` → 按目录名推导成 `deploy`，与 `install.sh` 的 `-p ling`
+     不一致，`exec` 找不到容器
+
+   所以 cron/备份**仍然要给 `-p`**（不能依赖 compose 恰好写了 `name:`），
+   但别理解成"`-p` 是唯一承重参数"。
    `backup.sh` 在 compose 模式下会先跑一次 `docker compose config -q` 做静态
    校验（坏文件 → exit 2），因为 `exec` 阶段发现不了 compose 文件的问题。
 

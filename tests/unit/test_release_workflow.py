@@ -294,3 +294,106 @@ def test_release_workflow_verifies_then_reuses_ci_then_publishes() -> None:
         step.get("run", "") for step in jobs["verify"]["steps"] if isinstance(step, dict)
     )
     assert "--tag" in run and '"$RELEASE_TAG"' in run
+
+
+# ---------------------------------------------------------------------------
+# 版本字面量扫描（src/ling/app.py / src/ling/logging_setup.py）
+# ---------------------------------------------------------------------------
+
+
+def _write_scan_file(root: Path, rel_path: str, body: str) -> None:
+    path = root / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+_SCAN_FILE_PREFIX = (
+    '"""stub — 只被静态扫描，不导入也不执行"""\n\n'
+    "from ling import __version__\n\n"
+    "SERVICE_VERSION = __version__\n"
+)
+
+
+def test_stale_literal_in_app_py_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """app.py 里又写回死版本 → 判失败（防 /api/openapi.json 报另一个版本号）。"""
+    write_versions(tmp_path, "0.0.1")
+    _write_scan_file(
+        tmp_path,
+        "src/ling/app.py",
+        'from ling import __version__\n\napp = FastAPI(version="0.1.0")\n',
+    )
+    assert check_release.main(["--tag", "v0.0.1", "--root", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    # 失败信息是 path:line，行号精确到放字面量的那一行
+    assert "src/ling/app.py:3" in err
+
+
+def test_stale_literal_in_logging_setup_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """logging_setup.py 里又写回死版本 → 判失败（防启动日志报另一个版本号）。"""
+    write_versions(tmp_path, "0.0.1")
+    _write_scan_file(
+        tmp_path,
+        "src/ling/logging_setup.py",
+        'from ling import __version__\n\nSERVICE_VERSION = "0.1.0"\n',
+    )
+    assert check_release.main(["--tag", "v0.0.1", "--root", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "src/ling/logging_setup.py:3" in err
+
+
+def test_scan_files_referencing_version_constant_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """两个被扫文件都引用 __version__（不含字面量）→ 通过，且没有"未找到"提示。"""
+    write_versions(tmp_path, "0.1.0")
+    _write_scan_file(
+        tmp_path,
+        "src/ling/app.py",
+        "from ling import __version__\n\napp = FastAPI(version=__version__)\n",
+    )
+    _write_scan_file(tmp_path, "src/ling/logging_setup.py", _SCAN_FILE_PREFIX)
+    assert check_release.main(["--tag", "v0.1.0", "--root", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "未找到" not in captured.out
+    assert captured.err == ""
+
+
+def test_tool_spec_version_outside_scan_scope_is_ignored(tmp_path: Path) -> None:
+    """capabilities/tools.py 的 ToolSpec.version="1.0.0" 是工具 ABI 版本，不扫 → 通过。
+
+    这是防误报回归：如果把 _VERSION_SCAN_FILES 扩成整棵源码树，这条会红。
+    """
+    write_versions(tmp_path, "0.1.0")
+    _write_scan_file(
+        tmp_path,
+        "src/ling/app.py",
+        "from ling import __version__\n\napp = FastAPI(version=__version__)\n",
+    )
+    _write_scan_file(tmp_path, "src/ling/logging_setup.py", _SCAN_FILE_PREFIX)
+    _write_scan_file(
+        tmp_path,
+        "src/ling/capabilities/tools.py",
+        'TOOL_SPEC_VERSION = "1.0.0"\n',
+    )
+    assert check_release.main(["--tag", "v0.1.0", "--root", str(tmp_path)]) == 0
+
+
+def test_missing_scan_files_are_reported_but_not_fatal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """夹具里没有 app.py / logging_setup.py：放行（exit 0）但必须打印"未检查"。"""
+    write_versions(tmp_path, "0.1.0")
+    assert check_release.main(["--tag", "v0.1.0", "--root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "注意：未找到 src/ling/app.py，本次未检查（临时夹具下正常）" in out
+    assert "注意：未找到 src/ling/logging_setup.py，本次未检查（临时夹具下正常）" in out
+
+
+def test_find_stale_version_literals_contract_on_repository() -> None:
+    """真实仓库：返回值是 (hits, skipped) 二元组，两个被扫文件都在、且没有旧字面量。"""
+    version = check_release.read_pyproject_version(REPO_ROOT / "pyproject.toml")
+    hits, skipped = check_release.find_stale_version_literals(REPO_ROOT, version)
+    assert hits == []
+    assert skipped == []

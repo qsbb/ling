@@ -162,7 +162,9 @@ _VERSION_SCAN_FILES = (
 _VERSION_LITERAL_RE = re.compile(r"""["'](\d+\.\d+\.\d+)["']""")
 
 
-def find_stale_version_literals(root: Path, expected: str) -> list[tuple[str, int]]:
+def find_stale_version_literals(
+    root: Path, expected: str
+) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
     """找出源码里残留的、与 expected 不同的三段式版本字面量。
 
     为什么需要它：`app.py` 的 FastAPI `version=` 和 `logging_setup.py` 的
@@ -171,22 +173,31 @@ def find_stale_version_literals(root: Path, expected: str) -> list[tuple[str, in
     `/v1/version` 说一个数、`/api/openapi.json` 说另一个数。
     现在两处都改成引用 `__version__`，这个检查是**防止有人再写回去**。
 
-    返回 [(相对路径, 行号)]，空列表表示干净。
+    返回 ``(hits, skipped)``：
+
+    - ``hits``：[(相对路径, 行号)]，空列表表示干净。
+    - ``skipped``：[(相对路径, 原因)]，列出**本次没检查到**的文件。缺失是允许的
+      ——测试夹具只造 pyproject / ``__init__.py`` / package.json，不会造
+      ``app.py``，所以缺文件不能报错；但"扫了 0 个文件还说过"必须说出来，
+      否则扫描范围缩小是静默的。调用方负责把 ``skipped`` 打印给用户。
     """
     hits: list[tuple[str, int]] = []
+    skipped: list[tuple[str, str]] = []
     for rel_path in _VERSION_SCAN_FILES:
         path = root / rel_path
         if not path.is_file():
+            skipped.append((rel_path, "未找到"))
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            skipped.append((rel_path, "无法读取"))
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             for match in _VERSION_LITERAL_RE.finditer(line):
                 if match.group(1) != expected:
                     hits.append((str(path.relative_to(root)), lineno))
-    return hits
+    return hits, skipped
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,7 +239,12 @@ def main(argv: list[str] | None = None) -> int:
     # 一旦与 pyproject 不同步，`/v1/version` 与 `/api/openapi.json` 会报两个
     # 不同的版本号，而 CI 的 tag 检查**发现不了**。所以这里也扫一遍源码：
     # 只要某文件里还残留与 expected 不同的旧版本字面量，就判失败。
-    stale = find_stale_version_literals(root, expected)
+    stale, skipped = find_stale_version_literals(root, expected)
+    # 缺失文件仍然放行（测试夹具里没有 app.py），但要显式说出来：
+    # 否则有人把 _VERSION_SCAN_FILES 或目录结构改坏，扫描范围缩水也没人发现。
+    for rel_path, reason in skipped:
+        hint = "（临时夹具下正常）" if reason == "未找到" else ""
+        print(f"注意：{reason} {rel_path}，本次未检查{hint}")
     if stale:
         detail = "；".join(f"{path}:{line}" for path, line in stale)
         return fail(f"源码里还有与 {expected} 不一致的版本字面量：{detail}")
