@@ -350,13 +350,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         RequestValidationError, memory_request_validation_handler  # type: ignore[arg-type]
     )
 
+    from ling.api.body_limit import BodySizeLimitMiddleware
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
     from ling.api.routes import settings as settings_routes
     from ling.api.routes import version as version_routes
 
+    # 请求体上限（**先**注册 = 在**内层**）。原来是 nginx 的
+    # `client_max_body_size 32m`，删掉反代后由应用自己承担；它只读
+    # Content-Length、绝不消费 body 流（否则 SSE 流式回复会被破坏），
+    # 所以可以安全地待在 observability 里面。
+    app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_body_bytes)
+
     # 最外层：给每个请求一个 trace_id，并记录访问日志。
-    # 必须在路由之前注册，否则 4xx/5xx 走不到这里。
+    #
+    # **后**注册 = 更外层。`add_middleware` 内部是 `user_middleware.insert(0, …)`，
+    # 即后注册的排在列表最前、在 `build_middleware_stack` 里最后被包 → 最外层。
+    # 所以这里必须是最后注册的那一个（`user_middleware` 会是
+    # `['BaseHTTPMiddleware', 'BodySizeLimitMiddleware']`）。
+    #
+    # 顺序别调过来。BodySizeLimit 必须在**内层**，这样它返回的 413 才经过这里：
+    # 响应带上 `X-Trace-Id`、错误体里的 `trace_id` 不再是 null，访问日志里也有
+    # 一条 413。超大请求恰恰是最需要排查的那类——反过来的话 413 在日志之前
+    # 就返回了，用户报"上传失败"时只能看到一个 trace_id 为 null 的错误。
+    #
+    # 多包一层的代价可以忽略：超限判定只看 `Content-Length` 头，body 一个字节
+    # 都不会被读进内存，拒绝路径不会因此变贵。
     app.add_middleware(BaseHTTPMiddleware, dispatch=observability_middleware)
 
     app.include_router(health.router)

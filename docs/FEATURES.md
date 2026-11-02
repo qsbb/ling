@@ -227,7 +227,9 @@ export LING_ONEBOT_SELF_ID=<机器人QQ号>
 export LING_ONEBOT_INSTANCE_ID=napcat-main
 ```
 
-NapCat/SL 的上报地址填 `http://<ling-host>:8080/v1/onebot/events`。
+NapCat/SL 的上报地址填 `http://<ling-host>:8080/v1/onebot/events`（8080 是本地开发
+模式的默认端口，`python -m ling` 直接监听它，与容器内固定的 6520 无关；容器部署请改用
+`deploy/.env` 的 `LING_PORT`，默认是 `http://<ling-host>:6520/v1/onebot/events`）。
 
 **必须先绑定账号**才能收到回复：未证明的绑定会被拒绝（这是有意的，防止误绑陌生人）。
 

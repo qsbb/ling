@@ -98,29 +98,27 @@ BACKUP_KEYS_ROOT_COMBOS = (
 BACKUP_MEDIA_STATES = ("present", "partial", "absent")
 # 与 API 共享的 pending 所有权锁：host claim/clear 与 API submit 必须同一把锁。
 REQUESTS_LOCK_TIMEOUT_SECONDS = 10.0
-# api 容器内监听端口（deploy/compose.yaml 的 expose: 8080）。逐副本就绪探针在
-# 容器内直接访问它，不经过 edge；edge 的 301 只代表“有东西在 80 上”。
-API_READYZ_PORT = 8080
-# 宿主 edge 探活：只接受 2xx；2s × 60 ≈ 2 分钟（与安装/滚动更新上限相当）。
-EDGE_READY_ATTEMPTS = 60
-EDGE_READY_INTERVAL_SECONDS = 2.0
+# api 容器内监听端口（deploy/compose.yaml 的 expose: 6520）。逐副本就绪探针在
+# 容器内直接访问它；宿主侧发布端口由 LING_PORT 决定，可以不同。
+API_READYZ_PORT = 6520
+# 宿主 api 探活：只接受 2xx；2s × 60 ≈ 2 分钟（与安装/滚动更新上限相当）。
+API_READY_ATTEMPTS = 60
+API_READY_INTERVAL_SECONDS = 2.0
 API_READYZ_PATH = "/readyz"
 # 需要记录旧镜像 ID 的服务（回退必须两个都有，缺一不可）。
 IMAGE_SERVICES = ("api", "worker")
 # 允许 release 改变的挂载目标：前端目录由本次 release 提供，更新通道目录由
-# 配置给出绝对来源。证书/data/nginx 配置等其它 bind 一律固定为当前运行来源。
+# 配置给出绝对来源。其它 bind 一律固定为当前运行来源。
 WEB_MOUNT_TARGET = "/app/web"
 UPDATE_MOUNT_TARGETS = ("/run/ling-update/requests", "/run/ling-update/status")
-EDGE_CONF_TARGET = "/etc/nginx/conf.d/default.conf"
-EDGE_CERTS_TARGET = "/etc/nginx/certs"
 # 这些 bind 的宿主来源若不是"运行数据"以外的绝对路径，就必须逐字节保持不变。
 API_UID = 10001
 API_GID = 10001
 CAPTURE_LIMIT = 64 * 1024
 MAX_REPLICAS = 32
 # 逐副本就绪探针：在**容器内**访问 127.0.0.1:{port}/readyz，只接受 2xx。
-# urllib 的默认 opener 会跟随 3xx（TLS edge 会把 80 上的 /readyz 301 到 https），
-# 那只能证明 edge 在服务，不能证明副本 ready；这里显式拒绝重定向并禁用代理。
+# urllib 的默认 opener 会跟随 3xx；一个 301 只证明"有东西在应答"，不能证明
+# 副本 ready（前置 TLS 反代、配置写错都会 301）。这里显式拒绝重定向并禁用代理。
 READYZ_SCRIPT = (
     "import json, urllib.error, urllib.request\n"
     "class _NoRedirect(urllib.request.HTTPRedirectHandler):\n"
@@ -199,12 +197,26 @@ class CommandTimeout(ExecutorError):
 
 
 class UpdateFailure(ExecutorError):
-    """执行阶段失败。``manual`` 为真表示无法证明服务未切换，需要人工确认。"""
+    """执行阶段失败。``manual`` 为真表示无法证明服务未切换，需要人工确认。
 
-    def __init__(self, code: str, *, manual: bool = False, stage: str | None = None) -> None:
+    ``detail`` 是**只给宿主看**的可读补充（打印到执行器 stdout、写进
+    ``recovery-<id>.txt``）：Web 侧的 message 永远由固定错误码表生成，宿主
+    文本不回传（见 ``src/ling/updates/protocol.py`` 的 ERROR_MESSAGES）。所以
+    这里只放服务名、目标路径这类非敏感事实，不放挂载来源、口令或配置内容。
+    """
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        manual: bool = False,
+        stage: str | None = None,
+        detail: str | None = None,
+    ) -> None:
         self.code = code
         self.manual = manual
         self.stage = stage
+        self.detail = detail
         super().__init__(code)
 
 
@@ -964,17 +976,6 @@ class MountPlan:
     expected: dict[str, dict[str, Mount]]
 
 
-def _under_root(source: str, root: Path) -> str | None:
-    """source 是否位于 root 之下；是则返回相对路径（posix）。"""
-    try:
-        relative = Path(source).relative_to(root)
-    except ValueError:
-        return None
-    if not relative.parts:
-        return None
-    return relative.as_posix()
-
-
 def _exists(path: str, *, want_dir: bool) -> bool:
     candidate = Path(path)
     try:
@@ -989,11 +990,41 @@ def _exists(path: str, *, want_dir: bool) -> bool:
     return stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
 
 
+def describe_service_set_change(
+    current: dict[str, dict[str, Mount]], candidate: dict[str, dict[str, Mount]]
+) -> str | None:
+    """服务集合差异的可读说明；集合一致时返回 ``None``。
+
+    只用于**诊断**（stdout / ``recovery-<id>.txt``），不改变判据：服务集合
+    必须一致这条 fail-closed 规则仍由 ``plan_runtime_override`` 执行——跨拓扑
+    更新（例如删掉 edge 反代）本来就得人工迁移（见 docs/DEPLOYMENT.md 的
+    「从 edge 拓扑迁移」）。这里只把“为什么被拒”从单个 code 变成一句话，
+    免得运维对着 ``compose_bind_changed`` 猜。只含服务名，不含挂载来源/端口。
+    """
+    current_names = sorted(current)
+    candidate_names = sorted(candidate)
+    if current_names == candidate_names:
+        return None
+    removed = [name for name in current_names if name not in candidate]
+    added = [name for name in candidate_names if name not in current]
+    before = "、".join(current_names)
+    after = "、".join(candidate_names)
+    parts = [f"服务集合从（{before}）变成（{after}）"]
+    if removed:
+        parts.append("少了 " + "、".join(removed))
+    if added:
+        parts.append("多了 " + "、".join(added))
+    parts.append(
+        "跨拓扑变更不做自动更新：请按 docs/DEPLOYMENT.md「从 edge 拓扑迁移（旧部署升级必读）」"
+        "人工完成迁移后再重建基线（adopt-current）"
+    )
+    return "；".join(parts)
+
+
 def plan_runtime_override(
     *,
     current: dict[str, dict[str, Mount]],
     candidate: dict[str, dict[str, Mount]],
-    live_root: Path,
     release_root: Path,
     requests_dir: Path,
     status_dir: Path,
@@ -1007,10 +1038,8 @@ def plan_runtime_override(
     - 命名卷（``type: volume``）来源必须一致；
     - ``/app/web`` 指向本次 release 的 dist（唯一允许改来源的挂载）；
     - 更新通道固定指向执行器配置的绝对目录；
-    - nginx 配置：当前来自 live release 时允许换成新 release 的同名文件
-      （明文/TLS 的选择因此保持不变），否则固定为当前绝对路径；
-    - 证书目录：固定为当前绝对路径（证书是运行数据，不在 release 树里）；
-    - 其它 bind 全部固定为当前运行来源。
+    - 其它 bind 全部固定为当前运行来源（nginx 反代已从 compose 删除，
+      因此不再有"允许跟着 release 换的配置/证书"这一类特例）。
     """
     if set(current) != set(candidate):
         return None
@@ -1075,17 +1104,6 @@ def plan_runtime_override(
             elif target in UPDATE_MOUNT_TARGETS:
                 source = str(requests_dir if target.endswith("/requests") else status_dir)
                 read_only = target.endswith("/status")
-                if not _exists(source, want_dir=True):
-                    return None
-            elif target == EDGE_CONF_TARGET:
-                relative = _under_root(before.source, live_root)
-                source = str(release_root / relative) if relative else before.source
-                read_only = True
-                if not _exists(source, want_dir=False):
-                    return None
-            elif target == EDGE_CERTS_TARGET:
-                source = before.source
-                read_only = True
                 if not _exists(source, want_dir=True):
                     return None
             else:
@@ -2907,15 +2925,12 @@ class Executor:
     def _plan_and_verify_override(self, request: Any, release_root: Path) -> None:
         """用真实 ``docker compose config`` 固定运行 bind 来源，并落盘私有 override。
 
-        候选 release 换了根目录后，compose 里 ``./certs``、``./nginx-tls.conf``
-        等相对路径会静默指向新 release 树（证书不存在 → TLS 起不来）。这里：
-        证书固定为当前绝对路径；nginx 配置若当前来自 live release，则换成新
-        release 的同名文件（明文/TLS 选择不变）；更新通道固定为配置目录；
+        候选 release 换了根目录后，compose 里 ``./.run/update/requests`` 一类
+        相对路径会静默指向新 release 树。这里：更新通道固定为配置目录；
         ``/app/web`` 指向新 dist；其它来源全部钉死为当前运行值。任何未知挂载
         变化都拒绝（``compose_bind_changed``）。不手写 YAML：override 是 JSON
         （合法 YAML 子集），最终再用 compose 自己解析一遍做逐项比对。
         """
-        live_root = self._live_root()
         current_payload = self._compose_config_json()
         candidate_payload = self._compose_config_json(root=release_root, override=None)
         if current_payload is None or candidate_payload is None:
@@ -2924,10 +2939,15 @@ class Executor:
         candidate = parse_compose_config(candidate_payload)
         if current is None or candidate is None:
             raise UpdateFailure("source_invalid")
+        # 判据不变：服务集合不一致仍然拒绝（跨拓扑更新必须人工迁移）。这里只是
+        # 在拒绝之前把差异说清楚——旧 edge 拓扑升到本版本时，唯一的反馈原本只有
+        # 一个 compose_bind_changed，重试也不会成功（manual=False）。
+        service_set_change = describe_service_set_change(current, candidate)
+        if service_set_change is not None:
+            raise UpdateFailure("compose_bind_changed", detail=service_set_change)
         plan = plan_runtime_override(
             current=current,
             candidate=candidate,
-            live_root=live_root,
             release_root=release_root,
             requests_dir=Path(os.path.realpath(self.config.requests_dir)),
             status_dir=Path(os.path.realpath(self.config.status_dir)),
@@ -2982,16 +3002,6 @@ class Executor:
                 "LING_INSTALL_LOCK_FD": str(self._install_fd()),
             }
         )
-        # 安装器若尚未支持 LING_INSTALL_COMPOSE_OVERRIDE，至少用环境变量把
-        # TLS 配置/证书这两个最关键的相对路径固定成绝对路径（compose 模板本来
-        # 就由它们插值），避免换 release 后证书目录静默变成候选树里的空目录。
-        for mounts in self._expected_mounts.values():
-            conf = mounts.get(EDGE_CONF_TARGET)
-            if conf is not None and conf.type == "bind":
-                env["LING_EDGE_CONF"] = conf.source
-            certs = mounts.get(EDGE_CERTS_TARGET)
-            if certs is not None and certs.type == "bind":
-                env["LING_EDGE_CERTS"] = certs.source
         stop = threading.Event()
         watcher = threading.Thread(
             target=self._watch_phase, args=(phase, stop), name="install-phase", daemon=True
@@ -3081,16 +3091,17 @@ class Executor:
         return False, "build_failed"
 
     def _verify_deployed(self, request: Any, release_root: Path) -> RuntimeInfo:
-        """逐副本验证 commit/version/就绪/manifest，最后再验 edge 只返回 2xx。
+        """逐副本验证 commit/version/就绪/manifest，最后再验宿主端口只返回 2xx。
 
-        只看 edge 或 compose health 都不够：``/readyz`` 可能被 TLS 配置 301，
-        health 也可能停留在“容器活着”。这里要求：
+        只看 compose health 都不够：health 可能停留在"容器活着"，``/readyz``
+        也可能被前置 TLS 反代 301。这里要求：
 
         - compose 解析出的期望副本数全部在运行（``_runtime_info``）；
         - **每个** api 副本在容器内访问 ``127.0.0.1:{port}/readyz`` 得到 2xx；
         - 每个副本的 commit/version 与目标一致；
         - 每个容器的 ``/app/web`` 清单哈希与本次 release 的 dist 一致；
-        - edge 对宿主 ``/readyz`` 严格返回 2xx（3xx 判失败，不跟随）。
+        - 宿主端口（``LING_PORT``，api 直连）对 ``/readyz`` 严格返回 2xx
+          （3xx 判失败，不跟随）。
         """
         expected_version = self.protocol.tag_version(request.target_tag)
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS
@@ -3115,7 +3126,7 @@ class Executor:
             time.sleep(3)
         if runtime is None:
             raise UpdateFailure("verify_failed", manual=True)
-        if not self._wait_edge_ready():
+        if not self._wait_api_ready():
             raise UpdateFailure("verify_failed", manual=True)
         return runtime
 
@@ -3192,16 +3203,20 @@ class Executor:
                 return False
         return True
 
-    def _wait_edge_ready(self) -> bool:
-        """宿主 edge 的 ``/readyz`` **只接受 2xx**。
+    def _wait_api_ready(self) -> bool:
+        """宿主端口上的 api ``/readyz`` **只接受 2xx**。
 
-        不跟随重定向（带着 Origin/Host 去连外部域名不可控），也**不接受 3xx**：
-        301 只能说明 80 端口上有东西在应答，可能是 TLS 跳转、可能是配置错。
-        逐副本就绪已由容器内探针独立证明；edge 必须真的 2xx 才算部署成功。
+        api 现在是直连入口（没有 nginx 反代），但"只接受 2xx"这条不放宽：
+
+        - 不跟随重定向（带着 Origin/Host 去连外部域名不可控）；
+        - **3xx 判失败**：301 只说明端口上有东西在应答，可能是用户自己加了
+          TLS 前置反代、可能是配错；那不是"这个 release 的 api 在服务"的证据；
+        - 逐副本就绪已由容器内探针独立证明；宿主端口必须真的 2xx 才算部署成功，
+          否则"容器 healthy 但宿主端口连不上"这种故障会被盖章成成功。
         """
         url = f"http://127.0.0.1:{self.config.port}/readyz"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-        for _ in range(EDGE_READY_ATTEMPTS):
+        for _ in range(API_READY_ATTEMPTS):
             try:
                 with opener.open(url, timeout=3) as response:
                     status = getattr(response, "status", 0)
@@ -3212,7 +3227,7 @@ class Executor:
                 pass
             except (urllib.error.URLError, TimeoutError, OSError):
                 pass
-            time.sleep(EDGE_READY_INTERVAL_SECONDS)
+            time.sleep(API_READY_INTERVAL_SECONDS)
         return False
 
     def _finish_success(
@@ -3257,10 +3272,16 @@ class Executor:
         )
         self.write_job(self._job)
         self.journal("end", request.request_id, state=state, code=exc.code, stage=stage)
-        self._write_recovery_note(self._job)
-        print(f"[executor] 更新{'需要人工确认' if exc.manual else '失败'}：{exc.code}（stage={stage}）")
+        self._write_recovery_note(self._job, detail=exc.detail)
+        message = (
+            f"[executor] 更新{'需要人工确认' if exc.manual else '失败'}："
+            f"{exc.code}（stage={stage}）"
+        )
+        if exc.detail:
+            message = f"{message}；{exc.detail}"
+        print(message)
 
-    def _write_recovery_note(self, job: Any) -> None:
+    def _write_recovery_note(self, job: Any, *, detail: str | None = None) -> None:
         backup = self.config.backups_dir / job.request_id
         lines = [
             "ling 更新失败/中断记录（宿主私有，不含在 Web 响应里）",
@@ -3272,6 +3293,10 @@ class Executor:
             f"target_commit={job.target_commit}",
             f"updated_at={job.updated_at}",
         ]
+        # detail 只来自本进程的诊断（服务名/目标路径），不含挂载来源与口令；
+        # Web 的 message 仍由固定错误码表生成，这段文本只留在宿主上。
+        if detail:
+            lines.append(f"detail={detail}")
         if backup.is_dir():
             lines.append(f"backup_dir={backup}")
         if self._previous:
@@ -3476,7 +3501,7 @@ class Executor:
            副本一致、版本文件与运行版本一致、live 备份脚本可执行；
         4. api 与 worker 的运行镜像 ID 都能完整读出（每服务唯一）；
         5. 运行容器的真实挂载与「该 release + 该 override」的 compose 模型逐项
-           一致（挂载来源/只读位/服务集合），且 edge ``/readyz`` 严格 2xx。
+           一致（挂载来源/只读位/服务集合），且宿主端口 ``/readyz`` 严格 2xx。
 
         任一条不满足都会抛 ``installed_commit_unknown``：**不写 installed、不解除
         门禁**，人工需要先补齐完整来源（显式提供 release 根/override）或重新安装
@@ -3516,7 +3541,7 @@ class Executor:
                     raise UpdateFailure("installed_commit_unknown")
                 images[service] = list(identity["image_ids"])
                 containers[service] = list(identity["containers"])
-            if not self._wait_edge_ready():
+            if not self._wait_api_ready():
                 raise UpdateFailure("installed_commit_unknown")
             previous = self.read_installed()
             # tag 只在“记录的 tag 与运行版本配对”时保留，否则置空：

@@ -14,10 +14,13 @@ state_dir = "/var/lib/ling-update"
 # 与 API 容器共享的通道目录。API 只能写 requests，status 只能读。
 requests_dir = "/run/ling-update/requests"
 status_dir = "/run/ling-update/status"
-# compose 项目名与对外端口（与 deploy/.env 的 LING_EDGE_PORT 保持一致）。
-# port 是宿主 edge 的 /readyz 探活端口：只接受 2xx，301 判失败。
+# compose 项目名与对外端口。**port 必须与你 deploy/.env 里的 LING_PORT 一致**：
+# 执行器探的是 api 直接发布在宿主上的 /readyz（edge 已删除），只接受 2xx，
+# 301 判失败（那说明端口上另有反代在应答，不能证明本 release 的 api 就绪）。
+# 默认部署（env.example）是 6520；历史配置里的 18080 是删掉 edge 反代之前的
+# 旧对外端口，照抄它只会探到一个没人监听的端口，然后 verify_failed。
 project = "ling"
-port = 18080
+port = 6520
 # 原环境文件（绝对路径；可以是 symlink，指向跨 release 共享的原始 env）。
 # 执行器只读它；release/deploy/.env 是指向它 realpath 的受控 symlink（不复制
 # 内容），install.sh 的安装锁锚点因此与当前部署一致。

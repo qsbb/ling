@@ -138,6 +138,14 @@ class Settings:
         )
     )
 
+    # 单个请求体大小上限（字节）。默认 32 MiB，与原来 nginx 的
+    # `client_max_body_size 32m` 对齐 —— 删掉反代之后这条限制必须由应用
+    # 自己承担，否则一个超大上传就能把进程内存吃光（uvicorn 会把 body
+    # 读进内存）。见 ling/api/body_limit.py。
+    max_body_bytes: int = field(
+        default_factory=lambda: _int("LING_MAX_BODY_BYTES", 32 * 1024 * 1024)
+    )
+
     # --- 受控 Web 更新通道（默认关闭）---
     #
     # API 进程**不接触 Docker socket**：它只把请求写进宿主挂进来的 requests

@@ -14,7 +14,7 @@ Compose 的解释仍需在部署机单独验证。
   拒绝；共享锁 FD 可安全升级；FD 指向别的文件也拒绝；
 - 锁文件本身只接受普通文件：symlink（含指向 deploy/.env 的）/目录/FIFO 被拒，
   目标文件字节不变（不跟随、不截断），已有内容也不会被写；
-- 对外端口以 Compose 解析出的 edge 发布端口为准（这里只覆盖 wiring 层的夹具，
+- 对外端口以 Compose 解析出的 api 发布端口为准（这里只覆盖 wiring 层的夹具，
   端到端断言在 tests/test_deploy_install.py）；
 - LING_INSTALL_PHASE_FILE 的阶段顺序 build → deploy → verify → complete；
 - LING_COMMIT 格式错误在构建前中止，且不写阶段标记；
@@ -22,8 +22,8 @@ Compose 的解释仍需在部署机单独验证。
   只导出到进程环境、显式值不被覆盖、默认镜像回退只换同一 tag 且不跨主版本；
 - 新生成的 .env 不写死本检出的绝对 dist；
 - 宿主 override 的内容不变量：不能搬走 /app/web，也不能搬走/换身份持久命名卷
-  （db-data/app-data 的 identity 与使用服务/target/只读），合法 edge 绝对 bind
-  不受影响；FIFO override 被拒；
+  （db-data/app-data 的 identity 与使用服务/target/只读），合法的更新通道绝对
+  bind 不受影响；FIFO override 被拒；
 - HOME 回退到仓库内已忽略的 .run/home、.run/docker，且不删除/搬移旧目录。
 """
 
@@ -160,17 +160,19 @@ def _compose_config(repo: Path) -> str:
                     "volumes": [
                         {"type": "bind", "source": dist, "target": "/app/web", "read_only": True}
                     ],
+                    # 真实 Compose 的 config 输出是长语法；install.sh 的就绪/状态
+                    # 端口只认这里 target=6520 的发布端口（容器内固定 6520）。
+                    "ports": [
+                        {
+                            "mode": "ingress",
+                            "target": 6520,
+                            "published": "18080",
+                            "protocol": "tcp",
+                        }
+                    ],
                 },
                 "worker": {
                     "build": {"args": {"PIP_INDEX_URL": "", "LING_COMMIT": "${LING_COMMIT:-}"}}
-                },
-                "edge": {
-                    "image": "nginx:alpine",
-                    # 真实 Compose 的 config 输出是长语法；install.sh 的就绪/状态
-                    # 端口只认这里的 target=80 发布端口。
-                    "ports": [
-                        {"mode": "ingress", "target": 80, "published": "18080", "protocol": "tcp"}
-                    ],
                 },
             }
         }
@@ -290,7 +292,7 @@ def stop_holder(holder: subprocess.Popen[str]) -> None:
 def test_compose_only_api_gets_update_channel() -> None:
     text = COMPOSE.read_text(encoding="utf-8")
     assert "docker.sock" not in text
-    api = text.split("  api:\n", 1)[1].split("  edge:\n", 1)[0]
+    api = text.split("  api:\n", 1)[1].split("  worker:\n", 1)[0]
     worker = text.split("  worker:\n", 1)[1].split("\nvolumes:\n", 1)[0]
 
     assert "LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}" in api
@@ -363,9 +365,15 @@ def test_env_example_has_no_duplicate_or_dead_keys() -> None:
         keys.append(line.split("=", 1)[0].strip())
     duplicates = sorted({key for key in keys if keys.count(key) > 1})
     assert not duplicates, f"env.example 重复定义：{duplicates}"
-    # 端口只有一个发布来源；LING_API_PORT 从未被 compose 读取，删掉避免误导。
-    assert "LING_EDGE_PORT" in keys
+    # 端口只有一个发布来源（LING_PORT，api 的宿主发布端口）。
+    # LING_API_PORT 从未被 compose 读取；LING_EDGE_PORT 随 edge 服务一起删除。
+    assert "LING_PORT" in keys
     assert "LING_API_PORT" not in keys
+    assert "LING_EDGE_PORT" not in keys
+    assert "LING_EDGE_CONF" not in keys
+    assert "LING_EDGE_CERTS" not in keys
+    assert "LING_EDGE_TLS_PORT" not in keys
+    assert "LING_NGINX_IMAGE" not in keys
     # 构建期 PyPI 源与备份目录都要在模板里说明（check_compose 也要求）。
     assert "PIP_INDEX_URL" in keys
     assert "LING_BACKUP_DIR" in keys
@@ -879,7 +887,7 @@ def test_unwritable_home_falls_back(
 # 内容感知的 compose 替身：真的按 -f 顺序合并 override 并解释 env 优先级
 # ---------------------------------------------------------------------------
 # 仍然是 stub-only：它只实现 install.sh 会读的字段（/app/web 挂载、顶层命名卷、
-# build args、db/edge image），不访问网络、不启动容器。它让“override 内容会不会
+# build args、db image、api 发布端口），不访问网络、不启动容器。它让“override 内容会不会
 # 搬走 /app/web 或持久数据卷”这类用例跑在解析结果上，而不是只比对命令行参数；
 # 真实 Docker Compose 的合并语义仍必须在部署机单独验证。
 
@@ -1001,6 +1009,16 @@ BASE_MODEL = {
             }
         },
         "environment": {"LING_WEB_DIST": "/app/web"},
+        # 与 deploy/compose.yaml 的 api ports 一致：install.sh 等待就绪/看状态
+        # 时用的就是这个 target=6520 的发布端口（容器内固定 6520）。
+        "ports": [
+            {
+                "mode": "ingress",
+                "target": 6520,
+                "published": "${LING_PORT:-6520}",
+                "protocol": "tcp",
+            }
+        ],
         "volumes": [
             {"type": "volume", "source": "app-data", "target": "/data", "read_only": False},
             {
@@ -1019,33 +1037,6 @@ BASE_MODEL = {
                 "type": "bind",
                 "source": "${LING_UPDATE_STATUS_HOST:-../.run/update/status}",
                 "target": "/run/ling-update/status",
-                "read_only": True,
-            },
-        ],
-    },
-    "edge": {
-        "image": "${LING_NGINX_IMAGE:-nginx:alpine}",
-        # 与 deploy/compose.yaml 的 edge ports 一致：install.sh 等待就绪/看状态
-        # 时用的就是这个 target=80 的发布端口。
-        "ports": [
-            {
-                "mode": "ingress",
-                "target": 80,
-                "published": "${LING_EDGE_PORT:-8080}",
-                "protocol": "tcp",
-            }
-        ],
-        "volumes": [
-            {
-                "type": "bind",
-                "source": "${LING_EDGE_CONF:-./nginx.conf}",
-                "target": "/etc/nginx/conf.d/default.conf",
-                "read_only": True,
-            },
-            {
-                "type": "bind",
-                "source": "${LING_EDGE_CERTS:-./certs}",
-                "target": "/etc/nginx/certs",
                 "read_only": True,
             },
         ],
@@ -1137,7 +1128,7 @@ if sub == "build":
         + json.dumps(
             {
                 key: os.environ.get(key)
-                for key in ("LING_PYTHON_BASE", "LING_POSTGRES_IMAGE", "LING_NGINX_IMAGE")
+                for key in ("LING_PYTHON_BASE", "LING_POSTGRES_IMAGE")
             },
             sort_keys=True,
         )
@@ -1194,7 +1185,6 @@ log(
         {
             "python": model["services"]["api"]["build"]["args"]["LING_PYTHON_BASE"],
             "postgres": model["services"]["db"]["image"],
-            "nginx": model["services"]["edge"]["image"],
             "web": web,
         },
         sort_keys=True,
@@ -1271,7 +1261,12 @@ def test_generated_env_uses_relative_web_dist(emulated_repo: tuple[Path, dict[st
     assert not any(line.startswith("LING_WEB_DIST_HOST=/") for line in text.splitlines())
     assert "LING_PYTHON_BASE" not in text
     assert "LING_POSTGRES_IMAGE" not in text
+    # nginx 基础镜像随 edge 服务一起删除，新生成的 .env 不该再出现它。
     assert "LING_NGINX_IMAGE" not in text
+    # 端口只有一个来源：LING_PORT（api 的宿主发布端口）。
+    effective_port = [line for line in text.splitlines() if line.startswith("LING_PORT=")]
+    assert len(effective_port) == 1
+    assert "LING_EDGE_PORT" not in text
 
 
 @pytest.mark.parametrize("kind", ["regular", "readonly", "symlink"])
@@ -1315,8 +1310,7 @@ def test_explicit_env_file_images_are_preserved_without_probing(
         repo,
         DEFAULT_ENV
         + 'LING_PYTHON_BASE="python:3.12-slim"\n'
-        + "LING_POSTGRES_IMAGE=postgres:17-alpine\n"
-        + "LING_NGINX_IMAGE=nginx:1.27-alpine\n",
+        + "LING_POSTGRES_IMAGE=postgres:17-alpine\n",
     )
     before = env_bytes(repo)
 
@@ -1327,7 +1321,6 @@ def test_explicit_env_file_images_are_preserved_without_probing(
     assert emulator_images(calls) == {
         "python": "python:3.12-slim",
         "postgres": "postgres:17-alpine",
-        "nginx": "nginx:1.27-alpine",
         "web": str((repo / "clients" / "web-console" / "dist").resolve()),
     }
     assert "docker pull" not in calls
@@ -1348,7 +1341,7 @@ def test_shell_environment_images_are_preserved(
         repo,
         env,
         LING_COMMIT=VALID_COMMIT,
-        EMU_PULL_OK="postgres:16-alpine,nginx:alpine",
+        EMU_PULL_OK="postgres:16-alpine",
         LING_PYTHON_BASE="python:3.11-slim",
         LING_POSTGRES_IMAGE="postgres:17-alpine",
     )
@@ -1378,7 +1371,7 @@ def test_python_base_flag_is_exported_only(
         "--python-base",
         "registry.local/library/python:3.13-slim",
         LING_COMMIT=VALID_COMMIT,
-        EMU_PULL_OK="postgres:16-alpine,nginx:alpine",
+        EMU_PULL_OK="postgres:16-alpine",
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1408,7 +1401,8 @@ def test_implicit_images_fall_back_to_same_tag_mirror(
     assert data["LING_PYTHON_BASE"] == "docker.1panel.live/library/python:3.13-slim"
     # 必须保持同一个 tag，绝不跨 Postgres 主版本。
     assert data["LING_POSTGRES_IMAGE"] == "docker.1panel.live/library/postgres:16-alpine"
-    assert data["LING_NGINX_IMAGE"] == "docker.1panel.live/library/nginx:alpine"
+    # nginx 基础镜像已经不需要了：解析结果里不再有它。
+    assert "LING_NGINX_IMAGE" not in data
     assert "postgres:18" not in calls
     assert "postgres:18" not in proc.stdout + proc.stderr
     assert "同一 tag 的镜像源" in proc.stdout
@@ -1417,7 +1411,7 @@ def test_implicit_images_fall_back_to_same_tag_mirror(
     last = emulator_images_history(calls)[-1]
     assert last["python"] == "docker.1panel.live/library/python:3.13-slim"
     assert last["postgres"] == "docker.1panel.live/library/postgres:16-alpine"
-    assert last["nginx"] == "docker.1panel.live/library/nginx:alpine"
+    assert "nginx" not in last
 
 
 def test_image_fallback_fails_closed_without_touching_env(
@@ -1590,9 +1584,15 @@ def test_override_cannot_change_volume_identity_or_external(
     assert "external-app-data" not in proc.stderr
 
 
-def test_legit_override_for_edge_binds_still_starts(
+def test_legit_override_for_update_channel_binds_still_starts(
     emulated_repo: tuple[Path, dict[str, str]], tmp_path: Path
 ) -> None:
+    """合法的更新通道绝对 bind 不能因为"来源变了"就被误拒。
+
+    原来这条用例用的是 edge 的 nginx 配置/证书 bind；edge 服务删掉之后，
+    同样"合法且必须允许"的例子换成了更新通道的两个目录（宿主绝对路径、
+    与 compose 默认的相对路径不同）。
+    """
     repo, env = emulated_repo
     write_env(repo, DEFAULT_ENV)
 
@@ -1602,22 +1602,6 @@ def test_legit_override_for_edge_binds_still_starts(
         tmp_path,
         {
             "services": {
-                "edge": {
-                    "volumes": [
-                        {
-                            "type": "bind",
-                            "source": "/srv/ling/nginx-tls.conf",
-                            "target": "/etc/nginx/conf.d/default.conf",
-                            "read_only": True,
-                        },
-                        {
-                            "type": "bind",
-                            "source": "/srv/ling/certs",
-                            "target": "/etc/nginx/certs",
-                            "read_only": True,
-                        },
-                    ]
-                },
                 "api": {
                     "volumes": [
                         {
@@ -1633,7 +1617,7 @@ def test_legit_override_for_edge_binds_still_starts(
                             "read_only": True,
                         },
                     ]
-                },
+                }
             }
         },
     )
@@ -1657,13 +1641,13 @@ def test_anonymous_data_volume_does_not_cause_false_reject(
         tmp_path,
         {
             "services": {
-                "edge": {
+                "api": {
                     "volumes": [
                         {
                             "type": "bind",
-                            "source": "/srv/ling/certs",
-                            "target": "/etc/nginx/certs",
-                            "read_only": True,
+                            "source": "/run/ling-update/requests",
+                            "target": "/run/ling-update/requests",
+                            "read_only": False,
                         }
                     ]
                 }

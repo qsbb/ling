@@ -86,8 +86,7 @@ def fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "LING_WEB_DIST_HOST",
         "LING_PYTHON_BASE",
         "LING_POSTGRES_IMAGE",
-        "LING_NGINX_IMAGE",
-        "LING_EDGE_PORT",
+        "LING_PORT",
         "COMPOSE_FILE",
         "COMPOSE_PROJECT_NAME",
     ):
@@ -261,13 +260,13 @@ if "config" in args:
     base = compose_file.resolve().parent
     source = raw_source if os.path.isabs(raw_source) else str((base / raw_source).resolve())
     worker_pip = os.environ.get("STUB_WORKER_PIP_INDEX", pip_value or "")
-    # Compose 的端口语义：edge 发布 `${LING_EDGE_PORT:-8080}`，shell 优先于
-    # --env-file。install.sh 的就绪/状态端口必须来自这里的解析结果。
-    if "LING_EDGE_PORT" in os.environ:
-        edge_port = os.environ["LING_EDGE_PORT"]
+    # Compose 的端口语义：api 发布 `${LING_PORT:-6520}:6520`（容器内固定 6520），
+    # shell 优先于 --env-file。install.sh 的就绪/状态端口必须来自这里的解析结果。
+    if "LING_PORT" in os.environ:
+        api_port = os.environ["LING_PORT"]
     else:
-        edge_port = values.get("LING_EDGE_PORT", "") or "8080"
-    log("config-edge-port " + edge_port)
+        api_port = values.get("LING_PORT", "") or "6520"
+    log("config-api-port " + api_port)
     config = {
         "services": {
             "api": {
@@ -281,14 +280,13 @@ if "config" in args:
                         "read_only": True,
                     }
                 ],
-            },
-            "edge": {
-                "image": "nginx:alpine",
+                # 与 deploy/compose.yaml 的 api ports 一致：容器内固定 6520，
+                # 宿主端口由 LING_PORT 决定。install.sh 只认 target=6520。
                 "ports": [
                     {
                         "mode": "ingress",
-                        "target": 80,
-                        "published": edge_port,
+                        "target": 6520,
+                        "published": api_port,
                         "protocol": "tcp",
                     }
                 ],
@@ -523,7 +521,7 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
 
 
 # ---------------------------------------------------------------------------
-# 对外端口：就绪等待 / 摘要 / --status 都取 Compose 解析出的 edge 发布端口
+# 对外端口：就绪等待 / 摘要 / --status 都取 Compose 解析出的 api 发布端口
 # ---------------------------------------------------------------------------
 
 
@@ -536,15 +534,15 @@ def console_url(stdout: str) -> str:
     return line.split()[-1]
 
 
-@pytest.mark.parametrize("edge_port", ["8080", "9090"])
-def test_existing_env_edge_port_drives_readiness_and_summary(
-    fake_repo: tuple[Path, dict[str, str]], edge_port: str
+@pytest.mark.parametrize("api_port", ["6520", "9090"])
+def test_existing_env_api_port_drives_readiness_and_summary(
+    fake_repo: tuple[Path, dict[str, str]], api_port: str
 ) -> None:
-    """已有 .env 的 LING_EDGE_PORT 才是真实发布端口；install 不能等 18080。"""
+    """已有 .env 的 LING_PORT 才是真实发布端口；install 不能等 18080。"""
     repo, env = fake_repo
     env_file = repo / "deploy" / ".env"
     env_file.write_text(
-        f"POSTGRES_PASSWORD=db-password\nLING_ROOT_KEY=root-key\nLING_EDGE_PORT={edge_port}\n",
+        f"POSTGRES_PASSWORD=db-password\nLING_ROOT_KEY=root-key\nLING_PORT={api_port}\n",
         encoding="utf-8",
     )
     before = env_file.read_bytes()
@@ -554,27 +552,27 @@ def test_existing_env_edge_port_drives_readiness_and_summary(
     assert proc.returncode == 0, proc.stderr
     curls = readyz_curls(calls)
     assert curls, calls
-    assert all(f"127.0.0.1:{edge_port}/readyz" in line for line in curls), curls
+    assert all(f"127.0.0.1:{api_port}/readyz" in line for line in curls), curls
     assert all("18080" not in line for line in curls), curls
-    assert console_url(proc.stdout) == f"http://127.0.0.1:{edge_port}"
+    assert console_url(proc.stdout) == f"http://127.0.0.1:{api_port}"
     # 安装器不写已有 env；也不把 compose 配置（含口令）打到输出里。
     assert env_file.read_bytes() == before
     assert '"services"' not in proc.stdout + proc.stderr
 
 
-@pytest.mark.parametrize("edge_port", ["8080", "9090"])
-def test_status_uses_existing_env_edge_port(
-    fake_repo: tuple[Path, dict[str, str]], edge_port: str
+@pytest.mark.parametrize("api_port", ["6520", "9090"])
+def test_status_uses_existing_env_api_port(
+    fake_repo: tuple[Path, dict[str, str]], api_port: str
 ) -> None:
     repo, env = fake_repo
-    (repo / "deploy" / ".env").write_text(f"LING_EDGE_PORT={edge_port}\n", encoding="utf-8")
+    (repo / "deploy" / ".env").write_text(f"LING_PORT={api_port}\n", encoding="utf-8")
 
     proc, calls = run_install(repo, env, "--status")
 
     assert proc.returncode == 0, proc.stderr
     curls = readyz_curls(calls)
     assert curls, calls
-    assert all(f"127.0.0.1:{edge_port}/readyz" in line for line in curls), curls
+    assert all(f"127.0.0.1:{api_port}/readyz" in line for line in curls), curls
     assert all("18080" not in line for line in curls), curls
 
 
@@ -582,14 +580,14 @@ def test_restart_waits_on_compose_resolved_port(
     fake_repo: tuple[Path, dict[str, str]],
 ) -> None:
     repo, env = fake_repo
-    (repo / "deploy" / ".env").write_text("LING_EDGE_PORT=8080\n", encoding="utf-8")
+    (repo / "deploy" / ".env").write_text("LING_PORT=6520\n", encoding="utf-8")
 
     proc, calls = run_install(repo, env, "--restart")
 
     assert proc.returncode == 0, proc.stderr
     assert " restart" in calls
     curls = readyz_curls(calls)
-    assert curls and all("127.0.0.1:8080/readyz" in line for line in curls), curls
+    assert curls and all("127.0.0.1:6520/readyz" in line for line in curls), curls
     assert all("18080" not in line for line in curls), curls
 
 
@@ -602,9 +600,11 @@ def test_fresh_install_keeps_default_port_and_documented_replicas(
 
     assert proc.returncode == 0, proc.stderr
     values = env_file_values(repo / "deploy" / ".env")
-    assert values["LING_EDGE_PORT"] == "18080"
-    # 与 compose 默认（${LING_API_REPLICAS:-2}）、env.example、文档一致。
-    assert values["LING_API_REPLICAS"] == "2"
+    assert values["LING_PORT"] == "18080"
+    # 与 compose 默认（${LING_API_REPLICAS:-1}）、env.example、文档一致。
+    # 必须是 1：api 自己发布固定 host 端口，compose 非 swarm 模式下 ports
+    # 只能给一个容器，2 副本会端口冲突。
+    assert values["LING_API_REPLICAS"] == "1"
     curls = readyz_curls(calls)
     assert curls and all("127.0.0.1:18080/readyz" in line for line in curls), curls
     assert console_url(proc.stdout) == "http://127.0.0.1:18080"
@@ -620,7 +620,7 @@ def test_port_option_only_affects_fresh_env(
 
     assert proc.returncode == 0, proc.stderr
     values = env_file_values(repo / "deploy" / ".env")
-    assert values["LING_EDGE_PORT"] == "18081"
+    assert values["LING_PORT"] == "18081"
     curls = readyz_curls(calls)
     assert curls and all("127.0.0.1:18081/readyz" in line for line in curls), curls
     assert console_url(proc.stdout) == "http://127.0.0.1:18081"
@@ -632,21 +632,21 @@ def test_port_option_conflicting_with_existing_env_fails_fast(
     """安装器不写已有 .env，所以 --port 与真实发布端口冲突时必须 fail closed。"""
     repo, env = fake_repo
     env_file = repo / "deploy" / ".env"
-    env_file.write_text("LING_EDGE_PORT=8080\n", encoding="utf-8")
+    env_file.write_text("LING_PORT=6520\n", encoding="utf-8")
     before = env_file.read_bytes()
 
     proc, calls = run_install(repo, env, "--port", "18080")
 
     assert proc.returncode != 0
     assert "--port 18080" in proc.stderr
-    assert "LING_EDGE_PORT" in proc.stderr
-    assert "8080" in proc.stderr
+    assert "LING_PORT" in proc.stderr
+    assert "6520" in proc.stderr
     assert "up -d" not in calls
     assert readyz_curls(calls) == []
     assert env_file.read_bytes() == before
 
 
-def test_unresolvable_edge_port_fails_closed_without_guessing(
+def test_unresolvable_api_port_fails_closed_without_guessing(
     fake_repo: tuple[Path, dict[str, str]],
 ) -> None:
     repo, env = fake_repo
@@ -677,6 +677,99 @@ def test_unresolvable_edge_port_fails_closed_without_guessing(
     assert "对外端口" in proc.stderr
     assert readyz_curls(calls) == []
     assert "up -d" not in calls
+
+
+def test_compose_yaml_publishes_api_on_6520() -> None:
+    """真实 compose 里 api 必须发布 target=6520（容器内固定端口）。
+
+    这条是"端口来源从 edge 换成 api"的静态契约：容器内 6520（entrypoint 的
+    uvicorn、expose、healthcheck 三处一致），宿主端口由 LING_PORT 决定。
+    """
+    text = (REPO_ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    assert '      - "${LING_PORT:-6520}:6520"' in text
+    assert '      - "6520"' in text
+    # 三处一致：entrypoint / expose / healthcheck 都是 6520。
+    entrypoint = (REPO_ROOT / "deploy" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert '"${LING_PORT:-6520}"' in entrypoint
+    assert "127.0.0.1:6520/readyz" in text
+    # 不能再出现旧的 edge/8080 端口。
+    assert "LING_EDGE_PORT" not in text
+    assert "edge:" not in text
+
+
+def test_api_port_with_wrong_container_target_fails_closed(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """api 发布了端口，但 target 不是 6520 → 不认它，fail closed。
+
+    这条锁住"只认 target=6520"：override 随便加一条 8080 的映射不能被当成
+    对外入口，否则安装器会对着一个不是 API 的端口等就绪。
+    """
+    repo, env = fake_repo
+    make_prebuilt(repo, env)
+    config = json.dumps(
+        {
+            "services": {
+                "api": {
+                    "build": {"args": {"PIP_INDEX_URL": ""}},
+                    "environment": {"LING_WEB_DIST": "/app/web"},
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": str(dist_dir(repo)),
+                            "target": "/app/web",
+                            "read_only": True,
+                        }
+                    ],
+                    "ports": [
+                        {"mode": "ingress", "target": 8080, "published": "9090", "protocol": "tcp"}
+                    ],
+                },
+                "worker": {"build": {"args": {"PIP_INDEX_URL": ""}}},
+            }
+        }
+    )
+
+    proc, calls = run_install(repo, env, "--prebuilt-web", STUB_CONFIG_JSON=config)
+
+    assert proc.returncode != 0
+    assert "target=6520" in proc.stderr
+    assert readyz_curls(calls) == []
+    assert "up -d" not in calls
+
+
+def test_api_short_syntax_port_is_recognized(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """短语法 `"6520:6520"` 也要认（Compose 的 `config` 输出可能是短语法）。"""
+    repo, env = fake_repo
+    make_prebuilt(repo, env)
+    config = json.dumps(
+        {
+            "services": {
+                "api": {
+                    "build": {"args": {"PIP_INDEX_URL": ""}},
+                    "environment": {"LING_WEB_DIST": "/app/web"},
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": str(dist_dir(repo)),
+                            "target": "/app/web",
+                            "read_only": True,
+                        }
+                    ],
+                    "ports": ["127.0.0.1:7000:6520/tcp"],
+                },
+                "worker": {"build": {"args": {"PIP_INDEX_URL": ""}}},
+            }
+        }
+    )
+
+    proc, calls = run_install(repo, env, "--prebuilt-web", STUB_CONFIG_JSON=config)
+
+    assert proc.returncode == 0, proc.stderr
+    curls = readyz_curls(calls)
+    assert curls and all("127.0.0.1:7000/readyz" in line for line in curls), curls
 
 
 def test_status_without_resolvable_port_does_not_guess(
@@ -1383,14 +1476,11 @@ def test_compose_config_secrets_are_not_printed(
                             "read_only": True,
                         }
                     ],
-                },
-                "worker": {"build": {"args": {"PIP_INDEX_URL": ""}}},
-                "edge": {
-                    "image": "nginx:alpine",
                     "ports": [
-                        {"mode": "ingress", "target": 80, "published": "18080", "protocol": "tcp"}
+                        {"mode": "ingress", "target": 6520, "published": "6520", "protocol": "tcp"}
                     ],
                 },
+                "worker": {"build": {"args": {"PIP_INDEX_URL": ""}}},
             }
         }
     )
@@ -1585,3 +1675,115 @@ def test_compose_default_mount_is_the_dist_checked_by_installer() -> None:
     compose = (REPO_ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
     assert "${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro" in compose
     assert "LING_WEB_DIST: /app/web" in compose
+
+
+# ---------------------------------------------------------------------------
+# 删除 edge 后的新行为：--remove-orphans 与废弃键检测
+# ---------------------------------------------------------------------------
+
+
+def _compose_command(calls: str, subcommand: str) -> list[str]:
+    """docker stub 记录的 compose 调用（按子命令过滤，子命令是独立 argv）。"""
+    return [
+        line
+        for line in calls.splitlines()
+        if line.startswith("docker compose") and subcommand in line.split()
+    ]
+
+
+def test_remove_orphans_is_passed_on_up(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """`up` 必须带 --remove-orphans：否则删掉 edge 后旧容器会作为孤儿继续占用旧端口。
+
+    断言整条命令的结尾，而不是子串：少这个标志时 `up -d --no-build` 仍然
+    成立，子串断言抓不到回退。
+    """
+    repo, env = fake_repo
+
+    proc, calls = run_install(repo, env)
+
+    assert proc.returncode == 0, proc.stderr
+    ups = _compose_command(calls, "up")
+    assert len(ups) == 1, calls
+    assert ups[0].endswith(" up -d --no-build --remove-orphans"), ups[0]
+
+
+def test_remove_orphans_is_passed_on_down(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """`--down` 也必须带 --remove-orphans（旧 edge 容器不在新 compose 里）。"""
+    repo, env = fake_repo
+
+    proc, calls = run_install(repo, env, "--down")
+
+    assert proc.returncode == 0, proc.stderr
+    downs = _compose_command(calls, "down")
+    assert len(downs) == 1, calls
+    assert downs[0].endswith(" down --remove-orphans"), downs[0]
+    # 不带 -v：数据卷不能被 `--down` 顺手删掉。
+    assert " -v" not in downs[0], downs[0]
+
+
+def test_deprecated_edge_port_warns_without_leaking_its_value(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """`.env` 只有 LING_EDGE_PORT 时必须点名废弃键、说明端口变默认值、且不回显值。"""
+    repo, env = fake_repo
+    (repo / "deploy" / ".env").write_text("LING_EDGE_PORT=20443\n", encoding="utf-8")
+
+    proc, calls = run_install(repo, env)
+
+    assert proc.returncode == 0, proc.stderr
+    output = proc.stdout + proc.stderr
+    assert "检测到已废弃的键 LING_EDGE_PORT" in proc.stdout
+    # 值不泄露：20443 只存在于 .env 与 compose 插值里，不能出现在输出中。
+    assert "20443" not in output, output
+    # 必须说清“端口会变成默认值”，而不是只含糊地说键废弃了。
+    assert "默认 6520" in proc.stdout
+    assert "从它变成了 6520" in proc.stdout
+    curls = readyz_curls(calls)
+    assert curls and all("127.0.0.1:6520/readyz" in line for line in curls), curls
+    assert console_url(proc.stdout) == "http://127.0.0.1:6520"
+
+
+def test_deprecated_edge_port_with_ling_port_uses_ling_port(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """两个键都在时仍告警，但端口必须按 LING_PORT，不能提“从旧键漂移”。"""
+    repo, env = fake_repo
+    (repo / "deploy" / ".env").write_text(
+        "LING_EDGE_PORT=20443\nLING_PORT=6521\n", encoding="utf-8"
+    )
+
+    proc, calls = run_install(repo, env)
+
+    assert proc.returncode == 0, proc.stderr
+    output = proc.stdout + proc.stderr
+    assert "检测到已废弃的键 LING_EDGE_PORT" in proc.stdout
+    assert "20443" not in output, output
+    assert "从它变成了" not in proc.stdout
+    curls = readyz_curls(calls)
+    assert curls and all("127.0.0.1:6521/readyz" in line for line in curls), curls
+    assert all("6520" not in line for line in curls), curls
+    assert console_url(proc.stdout) == "http://127.0.0.1:6521"
+
+
+def test_env_without_port_keys_uses_compose_default_without_deprecation(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    """两个键都没有时不得告警，并明说用的是 compose 默认值。"""
+    repo, env = fake_repo
+    (repo / "deploy" / ".env").write_text(
+        "POSTGRES_PASSWORD=db-password\nLING_ROOT_KEY=root-key\n", encoding="utf-8"
+    )
+
+    proc, calls = run_install(repo, env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "废弃" not in proc.stdout + proc.stderr
+    assert "deploy/.env 里没有 LING_PORT" in proc.stdout
+    assert "本次用的是 compose 默认值" in proc.stdout
+    curls = readyz_curls(calls)
+    assert curls and all("127.0.0.1:6520/readyz" in line for line in curls), curls
+    assert console_url(proc.stdout) == "http://127.0.0.1:6520"

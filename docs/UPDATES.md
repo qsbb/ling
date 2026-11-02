@@ -359,14 +359,25 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   安装器在**继承来的 FD 本身**上要求 `flock(LOCK_EX|LOCK_NB)` 成功，并用独立
   probe 证明该 inode 确实有持有者：别人持锁时传一个同 inode 但未加锁的 FD 会被
   拒绝，共享锁不会被当成互斥；没有“跳过锁”的开关。
-- 对外端口只有一处来源：Compose 解析出的 edge 发布端口（`LING_EDGE_PORT`）。
-  安装器的 `/readyz` 等待、安装摘要与 `--status` 都用它，不再假定 18080；已有
-  `.env` 时按真实端口工作，`--port` 与真实端口冲突则直接失败（安装器不写已有
-  env），不会对着错端口等 120 秒。
+- 对外端口只有一处来源：Compose 解析出的 **api** 发布端口（`target=6520`，
+  宿主端口由 `LING_PORT` 决定）。安装器的 `/readyz` 等待、安装摘要与 `--status`
+  都用它，不再假定 18080；已有 `.env` 时按真实端口工作，`--port` 与真实端口
+  冲突则直接失败（安装器不写已有 env），不会对着错端口等 120 秒。解析不出
+  确定的 `target=6520` 端口就 fail closed。
+- **会检测已废弃的 edge 键**：`install` 与 `--status` 都**只读**检查
+  `deploy/.env` 里是否还有 `LING_EDGE_PORT` / `LING_EDGE_TLS_PORT` /
+  `LING_EDGE_CONF` / `LING_EDGE_CERTS` / `LING_NGINX_IMAGE`，命中就逐条告警
+  （说明该改成 `LING_PORT`、并同步对外地址），**不打印值、不改写 `.env`**。
+  端口归因也改准了：`.env` 与 shell 都没有 `LING_PORT` 时明说“用的是 compose
+  默认值”，并指名“从 `LING_EDGE_PORT` 变成了该端口”。升级路径见 §7.1。
+- **拓扑变化不会留下孤儿容器（兜底）**：`start_services()` 的 `docker compose up`
+  与 `--down` 都带 `--remove-orphans`，只清本项目（`--project-name`，默认 `ling`）
+  里已不在 compose 文件中的容器；`down` 不加 `-v`，数据卷不受影响。它**不能**
+  替代“先 `down` 清场再升级”：旧容器已经占着宿主端口时，先按 §7.1 第 1 步停掉。
 - 宿主可传 `LING_INSTALL_COMPOSE_OVERRIDE=<绝对路径>` 追加一个 compose 文件：
   `docker compose -f deploy/compose.yaml -f <override> …`，始终保留
-  `--env-file deploy/.env`。它用于跨独立 release 固定 bind 来源（edge 配置/证书、
-  更新通道目录等）。安装器只校验并使用这个路径，**不复制、不改写、不直接解析**
+  `--env-file deploy/.env`。它用于跨独立 release 固定 bind 来源（更新通道目录
+  等）。安装器只校验并使用这个路径，**不复制、不改写、不直接解析**
   它的文本（解析交给 Compose；文件可以是 JSON，即 YAML 的子集），也不把它写进
   `deploy/.env`；文件必须存在且是普通文件（拒绝 symlink/目录/FIFO、≤1 MiB）。
   解析结果还要通过不变量：不能把 `/app/web` 指到本次 release 之外（fail-closed，
@@ -386,8 +397,8 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   搬移**（它们会让旧 checkout 变 dirty，还会把 registry 配置带进 build context）。
   显式 `DOCKER_CONFIG` 不可写/建不出来时只告警、不重置——让 docker 自己报错，
   避免把 `--down`/`--logs` 这类恢复路径提前堵死。
-- **`deploy/.env` 只读**：安装器不追加、不改写它。基础镜像（python/postgres/
-  nginx）的解析结果只 `export` 到本次进程环境（Compose 的 shell > env-file
+- **`deploy/.env` 只读**：安装器不追加、不改写它。基础镜像（python/postgres）
+  的解析结果只 `export` 到本次进程环境（Compose 的 shell > env-file
   优先级让 build/up 用到）；显式配置（shell / `--python-base` / env-file）一律
   保留，只有“默认值且官方名不可用”才换**同一 tag** 的镜像源，绝不跨主版本，
   两处都拿不到就 fail closed。
@@ -395,7 +406,7 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   web-console/dist`），不再写本检出绝对路径——canonical env 可能被多个 release
   共享。已存在的绝对值不会被自动修改；**手动升级另一棵树时要显式
   `export LING_WEB_DIST_HOST=<那棵树>/clients/web-console/dist`**，且保留当前
-  runtime 其它 bind 的完整上下文（持久 override、edge 配置/证书、更新通道）。
+  runtime 其它 bind 的完整上下文（持久 override、更新通道）。
   更新执行器本来就会传自己 release 的 dist，这一条只影响人工升级。
 - 发布顺序仍是：构建前端暂存 → 构建镜像 → 起容器 → `/readyz` → 最后发布前端。
   任一阶段失败都不会发布新前端。
@@ -475,7 +486,7 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
    重新构建镜像、滚动重启并发布前端。若这份 checkout 和 canonical env 不在同一
    棵树，且 env 里 `LING_WEB_DIST_HOST` 是旧树的绝对路径，手动运行前先
    `export LING_WEB_DIST_HOST="$(pwd)/clients/web-console/dist"`（并保留
-   `LING_INSTALL_COMPOSE_OVERRIDE`、edge 配置/证书等其它 bind 上下文）。
+   `LING_INSTALL_COMPOSE_OVERRIDE`、更新通道等其它 bind 上下文）。
 4. 检查 `bash deploy/install.sh --status` 与 `/readyz`，登录确认版本
    （`/v1/version` 的 `commit` 应等于目标 sha）。
 
@@ -486,6 +497,64 @@ commit/version。**确认 source_root 已经具备新版的 `.gitignore` /
 把 `LING_UPDATE_ENABLED` 改成 1。改完必须让 api **重建/重启**（`docker compose
 … up -d`，必要时 `--force-recreate`）；`restart` 不会重新读取 `.env`/环境变量，
 开关不会生效。
+
+### 7.1 从 edge 拓扑迁移（旧部署升级必做）
+
+这一节只针对**已经跑着旧拓扑**的机器：`docker ps` 里有 `ling-edge-1`，
+`deploy/.env` 里是 `LING_EDGE_PORT=20443`（可能还有 `LING_EDGE_TLS_PORT` /
+`LING_EDGE_CONF` / `LING_EDGE_CERTS` / `LING_NGINX_IMAGE`）。新版本删掉了
+`edge` 服务，api 直接发布 `LING_PORT`：那些键在 compose 里**没有任何引用**，
+端口会静默变成 `LING_PORT` 的默认值 6520，而 OneBot 上报、防火墙、外部反代
+还指着旧端口。**自助更新走不通这条路**——旧 live release 的 compose 有
+`edge`、新 release 没有，服务集合不一致会在 plan 阶段直接判
+`compose_bind_changed`（`manual=False`，重试不会成功，这是有意的
+fail-closed 判据）；必须先人工迁移。
+
+完整步骤与逐条自查见
+[DEPLOYMENT.md §7「从 edge 拓扑迁移」](DEPLOYMENT.md#从-edge-拓扑迁移旧部署升级必读)，
+这里只列关键动作与执行器部分：
+
+1. **停旧拓扑并清 orphan**（在更新代码之前跑；若已同步代码，`edge` 不在新
+   compose 里，必须靠 `--remove-orphans` 才会被清掉）：
+
+   ```bash
+   cd /path/to/ling        # 你的部署目录，见 DEPLOYMENT.md §1
+   docker compose -f deploy/compose.yaml --project-name ling --env-file deploy/.env \
+     down --remove-orphans
+   ```
+
+   `/path/to/ling` 代指仓库根目录（DEPLOYMENT.md §1/§2 的示例写的是 `/opt/ling`），
+   实际路径以你的部署为准。
+
+   不带 `--remove-orphans` 时 `edge` 会作为孤儿容器继续运行、继续占着
+   20443/8443，而它的上游 api 已经没人监听（表现为 502）。`down` 不加 `-v`
+   不删数据卷。项目名用安装时的（默认 `ling`）。
+
+   **风险**：`--remove-orphans` 的作用域是整个 compose 项目（默认 `ling`），
+   同一个项目里你自己手工创建、但不在 compose 文件中的容器**也会被删掉**；
+   要保留的请换项目名或改用独立 `docker run`。
+2. **改 `deploy/.env`**：删掉上面那 5 个键；加 `LING_PORT=20443`（保持对外地址
+   不变）或 `LING_PORT=6520`（换新端口）。安装器只读这份文件，不会替你改；`--status`
+   与 `install` 都会逐条点名残留的废弃键（只读检测，不回显值）。
+3. **更新代码树后跑安装器**：`bash deploy/install.sh`。安装器的 `up` 与 `--down`
+   现在都带 `--remove-orphans`（兜底，清本项目孤儿容器，含同一项目里手工创建、
+   不在 compose 文件中的容器，见第 1 步的风险）；但旧容器已经占着端口时
+   仍要先做第 1 步的 `down`，别指望安装过程替你解决端口冲突。
+4. **同步执行器并重建基线**：
+   - `/etc/ling-update.toml` 的 `port` 改成新的 `LING_PORT`（它用这个端口探宿主
+     `/readyz`，不改就永远 `verify_failed`）；
+   - `sudo python3 deploy/update/executor.py --config /etc/ling-update.toml adopt-current`
+     —— 核验并**记下**“现在实际运行的是什么”，同时解除 `needs_manual` 门禁；
+     不能完全自证时它会拒绝（不写 installed、不解除门禁）。命令语义见
+     `deploy/update/README.md` 第三节，失败处理见本文 §8。
+   - 被 `compose_bind_changed` 拒过的话，宿主 stdout 与
+     `state_dir/recovery-<request_id>.txt` 里有具体差异（例如“服务集合从
+     （api、db、edge、worker）变成（api、db、worker）；少了 edge”）；Web 上
+     仍只显示固定文案，这是协议设计（见 §3）。
+5. **验证**：`curl http://127.0.0.1:<端口>/readyz` 返回 200；`docker ps` 里
+   **不应再有** `ling-edge-1`；`bash deploy/install.sh --status` 无废弃键告警。
+6. **外部集成自查**：OneBot/NapCat 的 HTTP 上报地址（`/v1/onebot/events`）、
+   防火墙/安全组放行的端口、外部反代 upstream、书签与客户端配置。
 
 ## 8. 人工恢复步骤
 
@@ -588,6 +657,9 @@ commit/version。**确认 source_root 已经具备新版的 `.gitignore` /
 - 真实 Docker 上的完整升级演练（备份 → 构建 → 切换 → 失败恢复）**尚未完成**；
   本文所有“能跑通”的证据都来自 stub-only 测试（docker/pnpm/curl 都是替身），
   **不能**当成真实部署通过；
+- **从 edge 拓扑迁移的整条链路**（`down --remove-orphans` → 改 `.env` →
+  `install.sh` → `adopt-current`）同样**没有在真实 Docker 上演练过**（见 §7.1）；
+  迁移前先备份，并按 DEPLOYMENT.md §7 的第 5、6 步逐条核对；
 - 升级失败后的数据库自动回滚**没有实现**，也不打算自动做；
 - 宿主执行器需要 root 才能创建 `/run/ling-update/*` 与备份/切换容器；
 - 本仓库没有发布正式 Release，所以当前任何“检查更新”都会得到 `no_release`；

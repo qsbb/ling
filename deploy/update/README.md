@@ -183,16 +183,17 @@ Web ◀──GET /v1/version/update──────────── API（�
   调 `release/deploy/install.sh --project P --port N`，导出 `LING_COMMIT`、
   `LING_WEB_DIST_HOST`、`LING_UPDATE_REQUESTS_HOST`、`LING_UPDATE_STATUS_HOST`、
   `LING_UPDATE_ENABLED=1`、`LING_INSTALL_PHASE_FILE`、`LING_INSTALL_LOCK_FD`
-  与 `LING_INSTALL_COMPOSE_OVERRIDE`；并把 `LING_EDGE_CONF`/`LING_EDGE_CERTS`
-  固定为规划出的绝对来源（安装器尚未支持 override 时的兜底）。安装器自己
+  与 `LING_INSTALL_COMPOSE_OVERRIDE`。安装器自己
   构建镜像、启动、发布前端；本执行器只通过阶段标记判断失败有没有发生在切换之后。
 - **verify**：先按 compose 期望副本数拿到**全部**运行副本，再在**每个 api
-  容器内**探 `127.0.0.1:8080/readyz`：探针显式禁用重定向与代理，只接受 2xx
-  （`urllib` 默认会跟随 3xx，那是 edge 在应答，不是副本就绪）；同时要求每个
+  容器内**探 `127.0.0.1:6520/readyz`：探针显式禁用重定向与代理，只接受 2xx
+  （`urllib` 默认会跟随 3xx；301 只说明端口上有东西在应答，不是副本就绪）；
+  同时要求每个
   副本的 commit/version 都等于目标。然后校验 web manifest：release 的
   `.ling-web-manifest.json`（schema=1、含 `index.html` 与至少一个 asset、
   sha256 与 dist 文件一致），并逐个副本读容器内 `/app/web/.ling-web-manifest.json`
-  比对。最后探宿主 edge `/readyz`，**严格只接受 2xx**（301 判失败，不跟随）。
+  比对。最后探宿主端口（`LING_PORT`，api 直连）上的 `/readyz`，**严格只接受
+  2xx**（301 判失败，不跟随）。
   全部通过才写 `installed.json`（含 api/worker 旧 image ID 集合、容器 ID、
   commit/version、备份目录、override 路径、副本 ID）并把任务置为
   `succeeded/complete`。
@@ -248,7 +249,7 @@ deploy 阶段）。其余情况（无标记、标记已是 deploy/verify/complet
   等于运行版本、live 备份脚本可执行；
 - api 与 worker 的镜像 ID 都能完整读出（每服务唯一）；
 - 运行容器的真实挂载与「该 release + 该 override」的 compose 模型逐项一致，且
-  edge `/readyz` 严格 2xx。
+  宿主端口 `/readyz` 严格 2xx。
 
 任一条不满足：**不写 installed、不解除门禁**——旧 `release_root`/旧 override 配
 新运行 commit 的半切换状态绝不会被盖章。此时先补齐完整来源（显式
@@ -291,8 +292,9 @@ deploy 阶段）。其余情况（无标记、标记已是 deploy/verify/complet
   交给它，并重新解析比对与安装所用模型完全一致；同时仍传 `LING_COMPOSE_ENV_FILE`
   / `LING_COMPOSE_OVERRIDE` 供脚本后续支持。脚本若支持，应当把它们分别拼成
   `--env-file` 与额外的 `-f`（与安装器同 canonical 值）。
-- 逐副本就绪探针固定访问容器内 `127.0.0.1:8080/readyz`（compose 里 api 的
-  `expose: 8080`）；改端口要同时改 `executor.py` 的 `API_READYZ_PORT`。
+- 逐副本就绪探针固定访问容器内 `127.0.0.1:6520/readyz`（compose 里 api 的
+  `expose: 6520`）；改容器内端口要同时改 `executor.py` 的 `API_READYZ_PORT`。
+  宿主侧端口（`LING_PORT`）是另一回事，由安装器按 compose 解析结果决定。
 - API 侧 GitHub 查询（Release/tag）固定 `trust_env=False` + `proxy=None` +
   不跟随重定向，并流式限长 256KB；这也意味着**不支持**通过环境代理访问 GitHub，
   需要代理的环境必须改为在网络上放行直连。

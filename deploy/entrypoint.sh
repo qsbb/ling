@@ -47,7 +47,7 @@ case "$MODE" in
   api)
     wait_for_db
     migrate
-    exec python -m uvicorn ling.app:app --host 0.0.0.0 --port "${LING_PORT:-8080}" \
+    exec python -m uvicorn ling.app:app --host 0.0.0.0 --port "${LING_PORT:-6520}" \
       --proxy-headers --forwarded-allow-ips='*' --no-server-header
     ;;
   worker)

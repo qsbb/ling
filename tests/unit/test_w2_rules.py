@@ -1551,11 +1551,21 @@ def test_worker_container_has_network_egress() -> None:
 
     data = yaml.safe_load(Path("deploy/compose.yaml").read_text())
     networks = data["services"]["worker"].get("networks") or []
-    assert "edge" in networks, f"worker 没有出网能力：networks={networks}"
+    # 出网口叫 `egress`（原来叫 `edge`，随 nginx 容器一起改名）：它是**普通
+    # bridge**，才有外网。改名时最容易犯的错是把 api/worker 只留在 `internal`
+    # 上——那会让它们彻底失去外网，而且不报错。
+    assert "egress" in networks, f"worker 没有出网能力：networks={networks}"
     # internal 仍然要保留：数据库只在内网
     assert "internal" in networks, f"worker 丢了内网访问：networks={networks}"
-    # 网络定义本身没变
+    # internal 必须是 internal: true（否则 db 会被暴露到宿主网络）
     assert data["networks"]["internal"].get("internal") is True
+    # egress **绝对不能**是 internal: true，否则等于没有出网口。
+    # （compose 里 `egress:` 后面不写值 → YAML 解析成 None，也算合法默认）
+    egress_def = data["networks"].get("egress") or {}
+    assert egress_def.get("internal") is not True, (
+        "egress 被设成 internal: true —— api/worker 会失去全部外网访问"
+        "（QQ、embedding、LLM 全废），而且不会报错"
+    )
 
 
 def test_deploy_build_can_survive_slow_pypi() -> None:

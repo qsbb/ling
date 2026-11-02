@@ -49,24 +49,24 @@ TARGET_TAG = "v1.2.0"
 RELEASE_ID = 4242
 REPLICA_IDS = ("111111111111", "222222222222")
 
+# 注意：api 上不再有 nginx 配置/证书 bind —— edge 服务已从 compose 删除，
+# 现在 api 的 bind 只有前端 dist、更新通道与持久数据卷。
 BASE_COMPOSE = """services:
   api:
     volumes:
       - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./certs:/etc/nginx/certs:ro
       - app-data:/data
 """
 
-EDGE_COMPOSE = """services:
+# 带宿主绝对更新通道的 compose：用来测"更新通道目录被钉成绝对来源"，
+# 原来这两条断言挂在 edge 的 nginx 配置/证书上（那两类挂载已经不存在了）。
+UPDATE_CHANNEL_COMPOSE = """services:
   api:
     volumes:
       - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
+      - ${LING_UPDATE_REQUESTS_HOST:-./requests}:/run/ling-update/requests
+      - ${LING_UPDATE_STATUS_HOST:-./status}:/run/ling-update/status:ro
       - app-data:/data
-  edge:
-    volumes:
-      - ${LING_EDGE_CONF:-./nginx-tls.conf}:/etc/nginx/conf.d/default.conf:ro
-      - ${LING_EDGE_CERTS:-./certs}:/etc/nginx/certs:ro
 """
 
 ENV_TEXT = "POSTGRES_PASSWORD=secret\nLING_ROOT_KEY=root-secret\n"
@@ -264,11 +264,9 @@ ASSET_BYTES = b"console.log(1)\n"
 # 运行容器 ID（12 位十六进制，满足 CONTAINER_ID_RE）。
 WORKER_IDS = ("333333333333",)
 DB_ID = "444444444444"
-EDGE_ID = "555555555555"
 API_IMAGE = "sha256:" + "a" * 64
 WORKER_IMAGE = "sha256:" + "b" * 64
 DB_IMAGE = "sha256:" + "d" * 64
-EDGE_IMAGE = "sha256:" + "e" * 64
 
 
 def _manifest_bytes() -> bytes:
@@ -394,10 +392,10 @@ def _compose_payload(
 
 
 class FakeExecutor(executor.Executor):
-    edge_ready = True
+    api_ready = True
 
-    def _wait_edge_ready(self) -> bool:  # noqa: D102 - 测试替身
-        return self.edge_ready
+    def _wait_api_ready(self) -> bool:  # noqa: D102 - 测试替身
+        return self.api_ready
 
 
 class Runner:
@@ -483,12 +481,10 @@ class Runner:
             return list(self.worker_containers)
         if service == "db":
             return [DB_ID]
-        if service == "edge":
-            return [EDGE_ID]
         return []
 
     def service_of(self, container_id: str) -> str | None:
-        for service in ("api", "worker", "db", "edge"):
+        for service in ("api", "worker", "db"):
             if container_id in self.containers(service):
                 return service
         return None
@@ -546,8 +542,6 @@ class Runner:
             return self.image_worker
         if service == "db":
             return DB_IMAGE
-        if service == "edge":
-            return EDGE_IMAGE
         return self.image_api
 
     def runtime(self, container_id: str) -> tuple[str, str]:
@@ -975,44 +969,38 @@ def test_release_with_bundled_env_is_refused(tmp_path: Path) -> None:
     assert instance._process.install_calls() == []  # type: ignore[attr-defined]
 
 
-def test_private_override_pins_tls_selection_and_certs(tmp_path: Path) -> None:
-    env_text = ENV_TEXT + "LING_EDGE_CONF=./nginx-tls.conf\n"
+def test_private_override_pins_update_channel_to_absolute_dirs(tmp_path: Path) -> None:
+    """更新通道目录必须钉成执行器配置的绝对路径，不跟 release 根漂移。
+
+    原来这条用例测的是 edge 的 nginx 配置/证书；edge 服务删除后，
+    同一类"允许 override 改来源、但必须钉死"的挂载只剩更新通道。
+    """
+    external_requests = tmp_path / "ext-requests"
+    external_status = tmp_path / "ext-status"
+    external_requests.mkdir()
+    external_status.mkdir()
+    env_text = (
+        ENV_TEXT
+        + f"LING_UPDATE_REQUESTS_HOST={external_requests}\n"
+        + f"LING_UPDATE_STATUS_HOST={external_status}\n"
+    )
     instance, protocol, _ = _setup(
-        tmp_path, compose_text=EDGE_COMPOSE, env_text=env_text
+        tmp_path, compose_text=UPDATE_CHANNEL_COMPOSE, env_text=env_text
     )
     _write_pending(instance.config, protocol, _request())
     assert instance.execute_once() == "ran"
     installed = instance.read_installed()
-    release_root = Path(installed["release_root"])
-    live_root = instance.config.source_root
     override = json.loads(Path(installed["compose_override"]).read_text(encoding="utf-8"))
-    edge = {
-        entry["target"]: entry for entry in override["services"]["edge"]["volumes"]
-    }
-    # TLS 选择保留：仍用新 release 的 nginx-tls.conf，而不是退回明文配置。
-    assert edge["/etc/nginx/conf.d/default.conf"]["source"] == str(
-        (release_root / "deploy" / "nginx-tls.conf").resolve()
-    )
-    # 证书是运行数据：固定为当前（旧）部署的绝对目录，不跟 release 漂移。
-    assert edge["/etc/nginx/certs"]["source"] == str((live_root / "deploy" / "certs").resolve())
-    assert edge["/etc/nginx/certs"]["read_only"] is True
-    # 即使安装器还不支持 override，也通过环境变量把 TLS 选择/证书钉成绝对路径。
+    api = {entry["target"]: entry for entry in override["services"]["api"]["volumes"]}
+    # 来源是执行器配置的绝对目录（realpath 过），不是 release 树里的相对路径。
+    assert api["/run/ling-update/requests"]["source"] == str(instance.config.requests_dir)
+    assert api["/run/ling-update/requests"]["read_only"] is False
+    assert api["/run/ling-update/status"]["source"] == str(instance.config.status_dir)
+    assert api["/run/ling-update/status"]["read_only"] is True
+    # 安装器即使拿到 override，也不该再被塞 nginx 的 conf/certs 环境变量。
     install_env = instance._process.install_calls()[0].env or {}  # type: ignore[attr-defined]
-    assert install_env["LING_EDGE_CONF"] == edge["/etc/nginx/conf.d/default.conf"]["source"]
-    assert install_env["LING_EDGE_CERTS"] == edge["/etc/nginx/certs"]["source"]
-
-
-def test_external_nginx_conf_stays_absolute(tmp_path: Path) -> None:
-    external = tmp_path / "custom-nginx.conf"
-    external.write_text("# custom\n", encoding="utf-8")
-    env_text = ENV_TEXT + f"LING_EDGE_CONF={external}\n"
-    instance, protocol, _ = _setup(tmp_path, compose_text=EDGE_COMPOSE, env_text=env_text)
-    _write_pending(instance.config, protocol, _request())
-    assert instance.execute_once() == "ran"
-    installed = instance.read_installed()
-    override = json.loads(Path(installed["compose_override"]).read_text(encoding="utf-8"))
-    edge = {entry["target"]: entry for entry in override["services"]["edge"]["volumes"]}
-    assert edge["/etc/nginx/conf.d/default.conf"]["source"] == str(external)
+    assert "LING_EDGE_CONF" not in install_env
+    assert "LING_EDGE_CERTS" not in install_env
 
 
 def test_update_channel_mounts_are_allowed(tmp_path: Path) -> None:
@@ -1048,18 +1036,142 @@ def test_changed_bind_mount_refused(tmp_path: Path) -> None:
     assert instance._process.install_calls() == []  # type: ignore[attr-defined]
 
 
-def test_changed_certs_source_is_pinned_not_rejected(tmp_path: Path) -> None:
-    """候选 release 自带 certs 目录也不会改变运行来源（override 钉死）。"""
-    changed = BASE_COMPOSE.replace("./certs:/etc/nginx/certs:ro", "./new-certs:/etc/nginx/certs:ro")
-    instance, protocol, _ = _setup(tmp_path, candidate_compose_text=changed)
+# 旧 edge 拓扑：live release 的 compose 里有 edge，候选 release 已经没有。
+EDGE_COMPOSE = """services:
+  api:
+    volumes:
+      - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
+      - app-data:/data
+  edge:
+    volumes:
+      - ${LING_EDGE_CONF:-./nginx.conf}:/etc/nginx/conf.d/default.conf:ro
+"""
+
+
+def _mounts(service: str, *targets: str) -> dict[str, executor.Mount]:
+    """只关心服务集合的用例：挂载内容随便给，函数不使用它。"""
+    return {
+        target: executor.Mount(
+            service=service,
+            target=target,
+            type="volume",
+            source="app-data",
+            read_only=False,
+        )
+        for target in targets
+    }
+
+
+def test_describe_service_set_change_is_none_when_sets_match() -> None:
+    current = {"api": _mounts("api", "/app/web"), "worker": _mounts("worker")}
+    # 键顺序不同不算变化（比较的是集合）。
+    candidate = {"worker": _mounts("worker"), "api": _mounts("api", "/app/web")}
+    assert executor.describe_service_set_change(current, candidate) is None
+    assert executor.describe_service_set_change({}, {}) is None
+
+
+def test_describe_service_set_change_names_removed_edge() -> None:
+    current = {
+        "api": _mounts("api", "/app/web"),
+        "db": _mounts("db", "/var/lib/postgresql/data"),
+        "edge": _mounts("edge", "/etc/nginx/conf.d/default.conf"),
+        "worker": _mounts("worker"),
+    }
+    candidate = {
+        "api": _mounts("api", "/app/web"),
+        "db": _mounts("db", "/var/lib/postgresql/data"),
+        "worker": _mounts("worker"),
+    }
+
+    text = executor.describe_service_set_change(current, candidate)
+
+    assert text is not None
+    assert "服务集合从" in text
+    assert "少了 edge" in text
+    assert "多了" not in text
+    assert "docs/DEPLOYMENT.md" in text
+
+
+def test_describe_service_set_change_names_added_service() -> None:
+    current = {"api": _mounts("api", "/app/web"), "worker": _mounts("worker")}
+    candidate = {
+        **current,
+        "metrics": _mounts("metrics", "/etc/metrics"),
+    }
+
+    text = executor.describe_service_set_change(current, candidate)
+
+    assert text is not None
+    assert "多了 metrics" in text
+    assert "少了" not in text
+
+
+def test_describe_service_set_change_reports_both_directions() -> None:
+    current = {"api": _mounts("api", "/app/web"), "edge": _mounts("edge", "/etc/nginx")}
+    candidate = {"api": _mounts("api", "/app/web"), "metrics": _mounts("metrics", "/m")}
+
+    text = executor.describe_service_set_change(current, candidate)
+
+    assert text is not None
+    assert "少了 edge" in text
+    assert "多了 metrics" in text
+    # 只给服务名，不泄露挂载来源（这里 source 都是 app-data，不能被写进说明）。
+    assert "/etc/nginx" not in text
+
+
+def test_cross_topology_update_reports_service_set_change_and_stays_retryable(
+    tmp_path: Path,
+) -> None:
+    """旧 compose 有 edge、新 compose 没有：拒绝原因要写清，且不是 needs_manual。
+
+    这道门禁是 fail-closed 的跨拓扑保护（manual=False）：本更新器不做拓扑迁移，
+    但必须让运维看懂“服务集合变了”，而不是只看到一个 compose_bind_changed。
+    """
+    instance, protocol, _ = _setup(
+        tmp_path, compose_text=EDGE_COMPOSE, candidate_compose_text=BASE_COMPOSE
+    )
+    _write_pending(instance.config, protocol, _request())
+
+    instance.execute_once()
+
+    # state=failed（不是 needs_manual）即 manual=False：此处还没动过任何容器。
+    _assert_job(instance, "failed", "compose_bind_changed", "verify_source")
+    assert instance._process.install_calls() == []  # type: ignore[attr-defined]
+    note = next(instance.config.state_dir.glob("recovery-*.txt")).read_text(encoding="utf-8")
+    assert "detail=" in note
+    assert "少了 edge" in note
+    assert "服务集合从" in note
+
+
+def test_changed_unknown_bind_source_is_pinned_to_running_source(tmp_path: Path) -> None:
+    """候选 release 换了某个 bind 的相对路径：override 仍钉死当前运行来源。
+
+    edge 的 nginx 配置/证书特例删掉之后，"非 /app/web、非更新通道"的 bind
+    走通用分支：来源固定为当前运行值（不跟 release 漂移，也不被拒绝）。
+    """
+    changed = BASE_COMPOSE.replace(
+        "      - app-data:/data\n",
+        "      - app-data:/data\n      - ./extra:/etc/ling-extra:ro\n",
+    )
+    # 当前部署也带这个 bind（来源是 live release 里的 ./extra），候选 release
+    # 把它指向自己树里的 ./extra —— 来源不同，但必须钉回当前运行来源。
+    current = changed
+    instance, protocol, _ = _setup(
+        tmp_path,
+        compose_text=current,
+        candidate_compose_text=changed,
+        env_text=ENV_TEXT,
+    )
+    (instance.config.source_root / "deploy" / "extra").write_text("x\n", encoding="utf-8")
     _write_pending(instance.config, protocol, _request())
     assert instance.execute_once() == "ran"
     installed = instance.read_installed()
     override = json.loads(Path(installed["compose_override"]).read_text(encoding="utf-8"))
     api = {entry["target"]: entry for entry in override["services"]["api"]["volumes"]}
-    assert api["/etc/nginx/certs"]["source"] == str(
-        (instance.config.source_root / "deploy" / "certs").resolve()
+    assert api["/etc/ling-extra"]["source"] == str(
+        (instance.config.source_root / "deploy" / "extra").resolve()
     )
+    assert api["/etc/ling-extra"]["read_only"] is True
 
 
 # ---------------------------------------------------------------- 门控/阶段
@@ -1664,7 +1776,7 @@ def test_needs_manual_blocks_pending_until_adopt(tmp_path: Path) -> None:
     _assert_job(instance, "needs_manual", "verify_failed")
     installs_before = len(instance._process.install_calls())  # type: ignore[attr-defined]
 
-    # adopt-current 在完全自证（取两把锁 + 核验副本/挂载/镜像/edge）之后才解除门禁。
+    # adopt-current 在完全自证（取两把锁 + 核验副本/挂载/镜像/宿主端口）之后才解除门禁。
     assert instance.adopt_current().commit == TARGET_COMMIT
     assert _current(instance) is None
     assert len(instance._process.install_calls()) == installs_before  # type: ignore[attr-defined]
@@ -1912,10 +2024,10 @@ def test_invalid_pending_fails_closed_without_removal(tmp_path: Path) -> None:
     assert instance._process.install_calls() == []  # type: ignore[attr-defined]
 
 
-# ================================================================ QA B2：逐副本就绪 + edge 2xx
+# ================================================================ QA B2：逐副本就绪 + 宿主端口 2xx
 
 
-def _edge_server(mode: str) -> Any:
+def _api_server(mode: str) -> Any:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -1941,24 +2053,29 @@ def _edge_server(mode: str) -> Any:
     return server
 
 
-def test_edge_ready_accepts_only_2xx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """301/503 都不能算部署成功；不跟随重定向（不连外部域名）。"""
-    monkeypatch.setattr(executor, "EDGE_READY_ATTEMPTS", 2)
-    monkeypatch.setattr(executor, "EDGE_READY_INTERVAL_SECONDS", 0.0)
+def test_api_ready_accepts_only_2xx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """301/503 都不能算部署成功；不跟随重定向（不连外部域名）。
+
+    api 现在是直连入口（没有 nginx 反代），但"只接受 2xx"没有放宽：
+    用户自己加了 TLS 前置反代时 /readyz 会 301，那证明不了本 release 的
+    api 在服务。
+    """
+    monkeypatch.setattr(executor, "API_READY_ATTEMPTS", 2)
+    monkeypatch.setattr(executor, "API_READY_INTERVAL_SECONDS", 0.0)
     root = _make_repo(tmp_path)
     protocol = executor.load_protocol(root)
     config = dataclasses.replace(_config(tmp_path, root), port=0)
-    server = _edge_server("redirect")
+    server = _api_server("redirect")
     try:
         config = dataclasses.replace(config, port=server.server_address[1])
         instance = executor.Executor(config, protocol, process=FakeProcess())
-        assert instance._wait_edge_ready() is False
+        assert instance._wait_api_ready() is False
 
         server.mode = "error"  # type: ignore[attr-defined]
-        assert instance._wait_edge_ready() is False
+        assert instance._wait_api_ready() is False
 
         server.mode = "ok"  # type: ignore[attr-defined]
-        assert instance._wait_edge_ready() is True
+        assert instance._wait_api_ready() is True
     finally:
         server.shutdown()
         server.server_close()

@@ -3,7 +3,7 @@
 # 用法（在仓库根目录）：
 #   cp deploy/env.example deploy/.env   # 按需修改口令
 #   docker compose -f deploy/compose.yaml --project-name ling-dev up -d --build
-#   curl http://127.0.0.1:8080/readyz
+#   curl http://127.0.0.1:6520/readyz
 #
 # 约束（设计文档 §11）：
 # - 数据库不对外暴露端口，只在内网网络里。
@@ -15,7 +15,7 @@ name: ling
 
 # 容器日志上限：个人服务器长期无人值守，默认 json-file 驱动会无限增长，
 # 几个月就能把磁盘写满（写满后数据库会直接不可写）。
-# 50MB × 3 个文件 = 单容器最多 150MB，全部服务合计约 600MB 封顶。
+# 50MB × 3 个文件 = 单容器最多 150MB，3 个服务（db/api/worker）合计约 450MB 封顶。
 x-logging: &default-logging
   driver: json-file
   options:
@@ -34,6 +34,10 @@ x-app-env: &app-env
   LING_WEB_DIST: /app/web
   LING_DATA_DIR: /data
   LING_PROJECT_ROOT: /app
+  # 单个请求体上限（字节）。默认 32MiB，等于原 nginx 的 `client_max_body_size 32m`。
+  # 同样受"逐项白名单"约束：不写这一行，用户在 .env 里配了也进不了容器，
+  # 永远停在 32MiB，而且不会有任何提示。
+  LING_MAX_BODY_BYTES: ${LING_MAX_BODY_BYTES:-}
   # OneBot V11（NapCat / Lagrange / go-cqhttp）。不传这些变量，
   # 用户即使在 .env 里配好，容器内也读不到 —— 表现为"配了但连不上"。
   LING_ONEBOT_API_BASE: ${LING_ONEBOT_API_BASE:-}
@@ -111,6 +115,12 @@ services:
     restart: unless-stopped
     environment:
       <<: *app-env
+      # 容器内监听端口**固定** 6520：entrypoint.sh 的 uvicorn、healthcheck、
+      # expose 三处都写这个值；只有**宿主**发布端口是可变的
+      # （`ports: "${LING_PORT:-6520}:6520"` 里的前一段）。
+      # 为什么不让容器内端口也跟着 LING_PORT 变：那样三处都得插值，任何一处
+      # 漏了就变成"宿主发布 A、容器监听 B"，healthcheck 永远红、readyz 永远连不上。
+      LING_PORT: "6520"
       # --- 自助更新通道（默认关闭，只有 api 拿得到）---
       # 开关默认 0：install.sh 不会自动打开，env.example 也保持关闭。
       # 打开前必须由宿主完成更新执行器初始化（建目录、赋权、备份）。
@@ -129,16 +139,20 @@ services:
       # dist 与这两条更新通道。
       - ${LING_UPDATE_REQUESTS_HOST:-../.run/update/requests}:/run/ling-update/requests:rw
       - ${LING_UPDATE_STATUS_HOST:-../.run/update/status}:/run/ling-update/status:ro
-    # 多副本时不要用固定 host 端口（会冲突）；由 edge 反代暴露单一入口。
-    # 需要直连调试时设 LING_API_PORT 并只用 --scale api=1。
-    ports: []
+    # 直接发布宿主端口（不再有 nginx 反代）：浏览器/CLI 直连 api。
+    # 前一段是宿主端口（`LING_PORT`，默认 6520），后一段是容器内固定 6520。
+    # 代价是 host 端口只能给**一个**容器，因此 deploy.replicas 默认 1
+    # （见下方 deploy 段）；要恢复多副本必须自己前置反代（deploy/nginx.conf
+    # 保留给这种用法，但它不再是一个 compose 服务）。
+    ports:
+      - "${LING_PORT:-6520}:6520"
     expose:
-      - "8080"
+      - "6520"
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:6520/readyz', timeout=3).status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -146,13 +160,13 @@ services:
     read_only: true
     tmpfs: ["/tmp"]
     security_opt: ["no-new-privileges:true"]
-    networks: [internal, edge]
-    # 滚动更新：先起新的再停旧的，避免整段不可用。
-    # 多副本的前提是状态不外置在进程内存：权威状态都在 PostgreSQL
-    # （见 docs/adr/0001-modular-monolith-and-ownership.md 第 5 条，以及
-    # docs/DEPLOYMENT.md 第 7 节「多副本的前提：状态不能在进程内存」）。
+    networks: [internal, egress]
+    # 副本数默认 1：api 现在自己发布固定 host 端口（`LING_PORT`），
+    # 而 compose **非 swarm 模式**下 `ports` 只能给一个容器 —— 2 个副本会
+    # 直接端口冲突，第二个起不来。多副本前提（状态不在进程内存）本身仍然
+    # 成立，但对外暴露必须另有反代（见 deploy/nginx.conf 的说明）。
     deploy:
-      replicas: ${LING_API_REPLICAS:-2}
+      replicas: ${LING_API_REPLICAS:-1}
       update_config:
         order: start-first
         parallelism: 1
@@ -161,34 +175,6 @@ services:
         condition: on-failure
         delay: 2s
         max_attempts: 5
-
-  # 单一入口：反代到 api 各副本。多副本直连会因 host 端口冲突起不来，
-  # 因此对外只暴露 edge。
-  edge:
-    logging: *default-logging
-    image: ${LING_NGINX_IMAGE:-nginx:alpine}
-    restart: unless-stopped
-    volumes:
-      # 默认挂明文配置，只用于本机/可信 VPN。
-      # 走公网时把 LING_EDGE_CONF 指到 ./nginx-tls.conf，并把证书放到
-      # LING_EDGE_CERTS 指向的目录（见 docs/DEPLOYMENT.md 第 9 节）。
-      - ${LING_EDGE_CONF:-./nginx.conf}:/etc/nginx/conf.d/default.conf:ro
-      - ${LING_EDGE_CERTS:-./certs}:/etc/nginx/certs:ro
-    ports:
-      - "${LING_EDGE_PORT:-8080}:80"
-      # TLS 端口。挂明文配置时不监听 443，这个映射是空转，不影响启动。
-      - "${LING_EDGE_TLS_PORT:-8443}:443"
-    depends_on:
-      api:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    security_opt: ["no-new-privileges:true"]
-    networks: [edge]
 
   # worker 可多副本：outbox 用 SELECT ... FOR UPDATE SKIP LOCKED 领取，
   # handler 靠数据库唯一约束幂等（migration 0008/0009）：
@@ -248,14 +234,19 @@ services:
     # **worker 需要出网**：记忆提炼、关系更新、主动消息生成都要调用模型。
     # 只挂 `internal`（internal: true，无外网）时，worker 会静默降级——
     # 实测在部署实例上表现为"模型提炼不可用，降级为正则: ModelError"，
-    # 而 api 一切正常，因为 api 在 edge 上。这种故障没有报错，只是能力悄悄变差。
-    networks: [internal, edge]
+    # 而 api 一切正常，因为 api 在 egress 上。这种故障没有报错，只是能力悄悄变差。
+    networks: [internal, egress]
 
 volumes:
   db-data:
   app-data:
 
 networks:
+  # 只有 db/api/worker 之间通信，**没有外网出口**。
   internal:
     internal: true
-  edge:
+  # api 与 worker 的出网口（普通 bridge）。删掉 nginx 容器之后这个名字
+  # 更贴近真实用途：它不是"边缘入口"，只是 egress。**不要**给它加
+  # `internal: true`——那会让 api/worker 彻底失去外网（连不上 QQ、
+  # embedding、LLM、告警 webhook），而且不报错，只是能力悄悄变差。
+  egress:

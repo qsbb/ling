@@ -61,11 +61,16 @@
 # 交给 Compose。详见 docs/DEPLOYMENT.md 的「Compose override」一节。
 #
 # 对外端口：就绪等待、安装摘要与 --status 用的端口**不是**脚本写死的默认值，
-# 而是 `docker compose config` 解析出的 edge 服务 target=80 的发布端口——也就是
-# Compose 实际会发布到宿主的那个端口（deploy/.env 的 LING_EDGE_PORT、shell 同名
-# 变量、宿主 override 都只体现在这个解析结果里）。--port 只影响新生成 .env 的
-# LING_EDGE_PORT；已有 .env 时若 --port 与 Compose 实际端口冲突，脚本 fail closed
-# 并提示改 env，绝不按猜测端口等 120 秒。解析失败也不猜端口。
+# 而是 `docker compose config` 解析出的 **api** 服务发布到宿主的端口——也就是
+# Compose 实际会发布到宿主的那个端口（deploy/.env 的 LING_PORT、shell 同名
+# 变量、宿主 override 都只体现在这个解析结果里）。不再有 nginx 反代，
+# api 自己就是对外入口（容器内固定监听 6520，宿主端口由 LING_PORT 决定）。
+# --port 只影响新生成 .env 的 LING_PORT；已有 .env 时若 --port 与 Compose
+# 实际端口冲突，脚本 fail closed 并提示改 env，绝不按猜测端口等 120 秒。
+# 解析失败也不猜端口。
+# 旧 edge 拓扑留在 .env 里的键（LING_EDGE_PORT / LING_EDGE_TLS_PORT /
+# LING_EDGE_CONF / LING_EDGE_CERTS / LING_NGINX_IMAGE）已经失效：install 与
+# --status 都会**只读**检测并逐条告警，不改写 .env，也不回显它们的值。
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -1113,8 +1118,8 @@ def check_persistent_volumes(base, merged):
 
     比较两件事：基础 compose 声明的顶层卷 identity（name/driver/driver_opts/
     external），以及基础 compose 里每一处命名卷挂载的 服务/target/只读/卷身份。
-    换掉或删掉任何一处都拒绝；新增挂载、以及合法的 edge 配置/证书 bind 不受
-    影响。本次 release 的 /app/web 由上面的不变量单独核对。
+    换掉或删掉任何一处都拒绝；新增的未知 bind 挂载不受这里影响（它由宿主的
+    override 自己负责）。本次 release 的 /app/web 由上面的不变量单独核对。
     """
     base_defs = top_volume_defs(base)
     merged_defs = top_volume_defs(merged)
@@ -1197,18 +1202,26 @@ def service_image(services, name):
     return image if isinstance(image, str) else ""
 
 
-def edge_published_port(services):
-    """edge 服务 target=80 的宿主发布端口（Compose 解析后的最终值）。
+API_CONTAINER_PORT = 6520
+
+
+def api_published_port(services):
+    """api 服务容器端口 6520 的宿主发布端口（Compose 解析后的最终值）。
 
     这是“Compose 实际会发布到哪个端口”的唯一权威来源：deploy/.env 的
-    LING_EDGE_PORT、shell 同名变量、宿主 override 都只体现在这个解析结果里。
-    取不到（缺 edge/ports、端口是区间/随机分配、非数字）就返回空串，由调用方
-    fail closed——绝不回退到脚本里写死的默认端口去等就绪。
+    LING_PORT、shell 同名变量、宿主 override 都只体现在这个解析结果里。
+    取不到（缺 api/ports、没有 target=6520、端口是区间/随机分配、非数字）
+    就返回空串，由调用方 fail closed——绝不回退到脚本里写死的默认端口去等就绪。
+
+    为什么认 target=6520 而不是“api 的任意发布端口”：容器内监听端口是固定的
+    （entrypoint.sh 的 uvicorn、healthcheck、expose 都是 6520），只有宿主侧
+    端口可变。要求 target 精确等于 6520 才能证明“这个映射发布的就是 API”，
+    否则 override 加一条别的端口映射就会被误当成对外入口。
     """
-    edge = services.get("edge")
-    if not isinstance(edge, dict):
+    api = services.get("api")
+    if not isinstance(api, dict):
         return ""
-    ports = edge.get("ports")
+    ports = api.get("ports")
     if not isinstance(ports, list):
         return ""
     for item in ports:
@@ -1222,15 +1235,15 @@ def edge_published_port(services):
                 container_port = target
             elif isinstance(target, str) and target.strip().isdigit():
                 container_port = int(target.strip())
-            if container_port != 80:
+            if container_port != API_CONTAINER_PORT:
                 continue
             published = item.get("published")
         elif isinstance(item, str):
-            # 兼容短语法 "18080:80" / "127.0.0.1:18080:80/tcp"。
+            # 兼容短语法 "6520:6520" / "127.0.0.1:18080:6520/tcp"。
             parts = item.split(":")
             if len(parts) < 2:
                 continue
-            if parts[-1].split("/")[0].strip() != "80":
+            if parts[-1].split("/")[0].strip() != str(API_CONTAINER_PORT):
                 continue
             published = parts[-2].strip()
         else:
@@ -1292,12 +1305,11 @@ print(
     json.dumps(
         {
             "web": source,
-            "edge_port": edge_published_port(services),
+            "api_port": api_published_port(services),
             "images": {
                 "python": build_arg(services.get("api") or {}, "LING_PYTHON_BASE"),
                 "worker_python": build_arg(services.get("worker") or {}, "LING_PYTHON_BASE"),
                 "postgres": service_image(services, "db"),
-                "nginx": service_image(services, "edge"),
             },
         },
         sort_keys=True,
@@ -1326,37 +1338,83 @@ print(value if isinstance(value, str) else "")
 ' "$COMPOSE_LAYOUT" "$1"
 }
 
-# --- 对外端口：以 Compose 解析出的 edge 发布端口为准 ----------------------
+# --- 废弃键检测：只读 deploy/.env，不改写、不回显值 ----------------------
+# edge 反代已删除：这些键在 deploy/compose.yaml 里**没有任何引用**，留在 .env
+# 里只会让人以为端口/证书还在生效。典型后果是静默漂移——旧部署的
+# LING_EDGE_PORT=20443 不再起作用，api 按 LING_PORT 的默认值 6520 起，而 OneBot
+# 上报地址、防火墙规则、外部反代、书签仍指着旧端口。所以命中就明确点名。
+# 只判断“键是否存在”（grep -q 不输出任何内容），不解析值、不改写 .env：
+# .env 是宿主持有的 canonical env，本脚本只读。
+DEPRECATED_ENV_KEYS="LING_EDGE_PORT LING_EDGE_TLS_PORT LING_EDGE_CONF LING_EDGE_CERTS LING_NGINX_IMAGE"
+
+env_has_key() {
+  # $1=键名。只认 deploy/.env（普通文件或指向普通文件的 symlink）；允许
+  # `export` 前缀与前导空白，**不打印匹配行**（值可能是端口/路径，一律不回显）。
+  [ -f deploy/.env ] || return 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" deploy/.env 2>/dev/null
+}
+
+warn_deprecated_env_keys() {
+  local key hit=0
+  for key in $DEPRECATED_ENV_KEYS; do
+    env_has_key "$key" || continue
+    hit=1
+    warn "检测到已废弃的键 ${key}：edge 反代已移除，api 现在直接监听 LING_PORT（默认 6520）。请把这些键替换为 LING_PORT，并确认对外地址（OneBot 上报、防火墙、外部反代）已同步更新。"
+  done
+  if [ "$hit" = "1" ]; then
+    warn "从 edge 拓扑迁移的完整步骤见 docs/DEPLOYMENT.md「从 edge 拓扑迁移（旧部署升级必读）」；自助更新执行器配置里的 port 也要同步改。"
+  fi
+}
+
+# --- 对外端口：以 Compose 解析出的 api 发布端口为准 ----------------------
 # USE_PORT = “Compose 实际会把服务发布到宿主哪个端口”。它绝不等于脚本里写死的
-# 默认值：deploy/.env 的 LING_EDGE_PORT、shell 同名变量、宿主 override 都只体现
+# 默认值：deploy/.env 的 LING_PORT、shell 同名变量、宿主 override 都只体现
 # 在 `docker compose config` 的解析结果里。install 复用 verify_compose_layout 的
 # 同一次解析（不额外调用 Compose）；restart / --status 在这里现解析一次（只读）。
 # 取不到就返回非 0，由调用方 fail closed 或明确告警——不按猜测端口等 120 秒。
 USE_PORT=""
 
-adopt_compose_edge_port() {
+adopt_compose_api_port() {
   local port
-  port=$(layout_field edge_port)
+  port=$(layout_field api_port)
   if [ -z "$port" ]; then
-    die "无法从 compose 配置确定对外端口（edge 没有 target=80 的确定发布端口）；安装器不按猜测的端口等待就绪。请检查 deploy/compose.yaml 的 edge ports 与 deploy/.env 的 LING_EDGE_PORT"
+    die "无法从 compose 配置确定对外端口（api 没有 target=6520 的确定发布端口）；安装器不按猜测的端口等待就绪。请检查 deploy/compose.yaml 的 api ports 与 deploy/.env 的 LING_PORT"
   fi
   if [ "$PORT_EXPLICIT" = "1" ] && [ "$port" != "$PORT" ]; then
-    die "--port ${PORT} 与 compose 实际发布的端口 ${port} 不一致（后者来自 deploy/.env 的 LING_EDGE_PORT 或 shell 环境）。安装器不写 deploy/.env，请改 deploy/.env 的 LING_EDGE_PORT 或去掉 --port"
+    die "--port ${PORT} 与 compose 实际发布的端口 ${port} 不一致（后者来自 deploy/.env 的 LING_PORT 或 shell 环境）。安装器不写 deploy/.env，请改 deploy/.env 的 LING_PORT 或去掉 --port"
   fi
   if [ "$port" != "$PORT" ]; then
-    warn "对外端口以 compose 解析结果为准：${port}（脚本默认是 ${PORT}；这里来自 deploy/.env 的 LING_EDGE_PORT 或 shell 环境）"
+    # 归因必须准确：`.env` 里没有 LING_PORT、shell 也没有时，端口是 compose 的
+    # 默认值（${LING_PORT:-6520}），不是“来自 deploy/.env 或 shell 环境”。
+    # 旧 edge 部署尤其容易踩：他们的 .env 只有 LING_EDGE_PORT，那句话会把原因
+    # 说反，让“端口从 20443 漂到 6520”看起来像用户自己配的。
+    local port_source no_ling_port=0
+    if [ -n "${LING_PORT:-}" ]; then
+      port_source="来自 shell 环境的 LING_PORT"
+    elif env_has_key LING_PORT; then
+      port_source="来自 deploy/.env 的 LING_PORT"
+    else
+      no_ling_port=1
+      port_source="deploy/.env 里没有 LING_PORT，shell 环境也没有；本次用的是 compose 默认值"
+    fi
+    warn "对外端口以 compose 解析结果为准：${port}（${port_source}；脚本默认是 ${PORT}）"
+    # 只有“确实没有 LING_PORT、但有旧键 LING_EDGE_PORT”时才指名说漂移：
+    # 用户已经改好 LING_PORT 的情况下再提旧键只会让人以为还是旧端口。
+    if [ "$no_ling_port" = "1" ] && env_has_key LING_EDGE_PORT; then
+      warn "旧 .env 里的 LING_EDGE_PORT 已不再生效（edge 反代已移除）：对外端口从它变成了 ${port}。要保持原来的对外地址，就把 .env 里的 LING_EDGE_PORT 改成 LING_PORT=${port}，并同步 OneBot 上报地址、防火墙与外部反代。"
+    fi
   fi
   USE_PORT="$port"
   ok "对外端口（compose 解析）：${USE_PORT}"
 }
 
-# restart / --status 用：单独解析一次，取 edge 的 target=80 宿主端口。
-# 规则与 compose_layout 里的 edge_published_port 一致（dict 长语法与短语法都认），
+# restart / --status 用：单独解析一次，取 api 的 target=6520 宿主端口。
+# 规则与 compose_layout 里的 api_published_port 一致（dict 长语法与短语法都认），
 # 但只做端口判定，不校验 /app/web 与持久卷——诊断/重启不该因为别的不变量失败
 # 而连端口都拿不到。只输出端口数字，绝不打印配置内容。
-compose_edge_port() {
+compose_api_port() {
   need_tmp
-  local py state="$TMP_BASE/edge-port.state"
+  local py state="$TMP_BASE/api-port.state"
   local -a pipe_rc
   USE_PORT=""
   py=$(cat <<'PY'
@@ -1378,12 +1436,12 @@ if not isinstance(config, dict):
 services = config.get("services")
 if not isinstance(services, dict):
     fail("compose 配置里没有 services")
-edge = services.get("edge")
-if not isinstance(edge, dict):
-    fail("compose 配置里没有 edge 服务")
-ports = edge.get("ports")
+api = services.get("api")
+if not isinstance(api, dict):
+    fail("compose 配置里没有 api 服务")
+ports = api.get("ports")
 if not isinstance(ports, list):
-    fail("compose 配置里 edge 没有发布端口")
+    fail("compose 配置里 api 没有发布端口")
 for item in ports:
     published = None
     if isinstance(item, dict):
@@ -1395,14 +1453,14 @@ for item in ports:
             container_port = target
         elif isinstance(target, str) and target.strip().isdigit():
             container_port = int(target.strip())
-        if container_port != 80:
+        if container_port != 6520:
             continue
         published = item.get("published")
     elif isinstance(item, str):
         parts = item.split(":")
         if len(parts) < 2:
             continue
-        if parts[-1].split("/")[0].strip() != "80":
+        if parts[-1].split("/")[0].strip() != "6520":
             continue
         published = parts[-2].strip()
     else:
@@ -1413,7 +1471,7 @@ for item in ports:
     if text.isdigit() and 0 < int(text) < 65536:
         print(text)
         raise SystemExit(0)
-fail("compose 配置里 edge 的 target=80 端口不是确定的宿主端口（可能是区间/随机分配）")
+fail("compose 配置里 api 的 target=6520 端口不是确定的宿主端口（可能是区间/随机分配）")
 PY
 )
   rm -f "$state"
@@ -1431,14 +1489,14 @@ PY
   USE_PORT=$(cat "$state")
   rm -f "$state"
   case "$USE_PORT" in
-    ''|*[!0-9]*) USE_PORT=""; printf '无法确定 edge 的对外端口\n' >&2; return 4 ;;
+    ''|*[!0-9]*) USE_PORT=""; printf '无法确定 api 的对外端口\n' >&2; return 4 ;;
   esac
   return 0
 }
 
 ensure_use_port() {
   [ -n "$USE_PORT" ] && return 0
-  compose_edge_port
+  compose_api_port
 }
 
 verify_compose_layout() {
@@ -1465,9 +1523,9 @@ verify_compose_layout() {
   actual=$(real_path "$source") || die "无法解析 compose 挂载目录"
   expected=$(real_path "$LIVE_DIST") || die "无法解析本次校验的前端目录"
   [ "$actual" = "$expected" ] || die \
-    "compose 实际挂载到 /app/web 的目录不是本次校验产物（实际：${actual}；应为：${expected}）；拒绝启动旧前端包。请检查 deploy/.env 或环境变量 LING_WEB_DIST_HOST（挂载源以 docker compose config 的解析结果为准；deploy/.env 请使用 KEY=VALUE）。若宿主传了 LING_INSTALL_COMPOSE_OVERRIDE，它不能把 /app/web 指到本次发布之外：固定 bind 来源只应针对 /app/web 以外的目标（edge 配置/证书、更新通道目录等），前端产物永远由本次 release 自己提供。"
+    "compose 实际挂载到 /app/web 的目录不是本次校验产物（实际：${actual}；应为：${expected}）；拒绝启动旧前端包。请检查 deploy/.env 或环境变量 LING_WEB_DIST_HOST（挂载源以 docker compose config 的解析结果为准；deploy/.env 请使用 KEY=VALUE）。若宿主传了 LING_INSTALL_COMPOSE_OVERRIDE，它不能把 /app/web 指到本次发布之外：固定 bind 来源只应针对 /app/web 以外的目标（更新通道目录、运行数据等），前端产物永远由本次 release 自己提供。"
   ok "compose 实际挂载的 /app/web 与本次校验产物一致"
-  adopt_compose_edge_port
+  adopt_compose_api_port
 }
 
 build_web() {
@@ -1618,7 +1676,11 @@ build_images() {
 
 start_services() {
   local rc=0
-  dc up -d --no-build || rc=$?
+  # --remove-orphans：同一个 compose 项目里、但已经不在 compose 文件中的容器
+  # （典型：删掉 edge 服务后留下的 ling-edge-1）默认会被 `up` 留下继续运行，
+  # 甚至继续占着旧宿主端口。这里只清本项目（--project-name 固定）的孤儿，
+  # 不会碰别的项目。
+  dc up -d --no-build --remove-orphans || rc=$?
   if [ "$rc" -eq 0 ]; then
     ok "容器已启动"
     return 0
@@ -1658,11 +1720,13 @@ LING_BOOTSTRAP_ADMIN_PASSWORD=
 LING_ROOT_KEY=$root
 LING_TEST_MODE=0
 LING_COOKIE_SECURE=0
-LING_EDGE_PORT=$PORT
-# 与 deploy/compose.yaml 的默认值（replicas: ${LING_API_REPLICAS:-2}）、
-# env.example 和文档保持一致：一条命令装出来的就是“默认 2 副本”，
-# 不要让新生成的 .env 悄悄把副本数改成 1（多副本/滚动更新语义会变）。
-LING_API_REPLICAS=2
+LING_PORT=$PORT
+# api 自己发布固定宿主端口（LING_PORT），而 compose 非 swarm 模式下
+# `ports` 只能给一个容器 —— 2 副本会端口冲突、第二个起不来。
+# 所以这里与 compose 默认值（replicas: ${LING_API_REPLICAS:-1}）保持一致：
+# 一条命令装出来的就是 1 副本。要多副本必须自己前置反代（deploy/nginx.conf
+# 保留给那种用法，但它不再是 compose 服务）。
+LING_API_REPLICAS=1
 LING_WORKER_REPLICAS=1
 # 前端挂载源：相对 deploy/ 的默认值。**不要写死绝对路径**——这份 .env 可能被
 # 多个 release 树共享（symlink），绝对路径会指向生成时的旧树，让后续手动安装
@@ -1752,11 +1816,10 @@ resolve_images() {
         "docker.1panel.live/library/python:3.13-slim" "python 基础镜像"
     fi
   fi
-  # Postgres / nginx：显式选择永远不覆盖；默认值失败也只在同一 tag 上换镜像源。
+  # Postgres：显式选择永远不覆盖；默认值失败也只在同一 tag 上换镜像源。
+  # 不再解析 nginx 基础镜像：compose 里已经没有反代服务了。
   ensure_image LING_POSTGRES_IMAGE postgres "postgres:16-alpine" \
     "docker.1panel.live/library/postgres:16-alpine" "Postgres 基础镜像"
-  ensure_image LING_NGINX_IMAGE nginx "nginx:alpine" \
-    "docker.1panel.live/library/nginx:alpine" "nginx 基础镜像"
 }
 
 # --- PyPI 源探测（必须在 compose build 之前）------------------------------
@@ -1889,7 +1952,7 @@ wait_ready() {
   # 端口以 Compose 解析结果为准（install 已在 verify_compose_layout 得到，
   # restart 在这里现解析）。解析不出来就中止：绝不对着猜的端口等 120 秒。
   if ! ensure_use_port; then
-    die "无法从 compose 配置确定对外端口（未打印配置内容，避免泄露 .env）；安装器不按猜测的端口判断就绪。请检查 deploy/.env 的 LING_EDGE_PORT 与 deploy/compose.yaml 的 edge ports"
+    die "无法从 compose 配置确定对外端口（未打印配置内容，避免泄露 .env）；安装器不按猜测的端口判断就绪。请检查 deploy/.env 的 LING_PORT 与 deploy/compose.yaml 的 api ports"
   fi
   say "等待 API 就绪（http://127.0.0.1:${USE_PORT}/readyz）…"
   local i
@@ -1935,6 +1998,9 @@ do_install() {
   phase_write build
   # 再确定构建提交：格式错误在构建前中止，而不是部署后才发现。
   resolve_commit
+  # edge 反代删除后遗留在 .env 里的键（只读检测，不改写 .env）：在几分钟的
+  # 前端/镜像构建之前就说清楚，而不是装完报“安装完成”才发现对外端口已经变了。
+  warn_deprecated_env_keys
   # 先完成前端暂存构建/校验，再碰 .env、镜像和容器；构建失败绝不启动。
   # 构建若误改在线 dist，会从发布前备份还原；成功时在线 dist 保持旧版本。
   ensure_web
@@ -2023,18 +2089,22 @@ case "$ACTION" in
     ;;
   install) do_install ;;
   status)
-    # 只读诊断：端口同样取 Compose 解析结果（已有 .env 的 LING_EDGE_PORT 才
-    # 是真实发布的端口）。拿不到端口就明确说明“没有检查 /readyz”，
+    # 用户可能只跑 --status 就想知道现状：旧 .env 里残留的 LING_EDGE_* 必须在
+    # 这里说清楚（同样是只读检测，不改写 .env）。
+    warn_deprecated_env_keys
+    # 只读诊断：端口同样取 Compose 解析结果（已有 .env 的 LING_PORT 才是
+    # 真实发布的端口）。拿不到端口就明确说明“没有检查 /readyz”，
     # 绝不拿脚本默认端口冒充结论。
     dc ps || warn "docker compose ps 失败（容器列表不可用）"
     say ""
     if ensure_use_port; then
+      say "  对外端口    http://127.0.0.1:${USE_PORT}（compose 解析结果，不是脚本默认值）"
       curl -s -m 5 "http://127.0.0.1:${USE_PORT}/readyz" || warn "readyz 不通（端口 ${USE_PORT}，来自 compose 解析）"
     else
-      warn "无法从 compose 配置确定对外端口；本次没有检查 /readyz（可先确认 deploy/.env 的 LING_EDGE_PORT）"
+      warn "无法从 compose 配置确定对外端口；本次没有检查 /readyz（可先确认 deploy/.env 的 LING_PORT）"
     fi
     ;;
   logs)    dc logs --tail 80 -f "$LOG_SVC" ;;
-  down)    dc down; ok "已停止（数据卷保留）" ;;
+  down)    dc down --remove-orphans; ok "已停止（数据卷保留；不在 compose 里的旧容器/孤儿容器一并移除，卷不删）" ;;
   restart) preflight; dc restart; wait_ready ;;
 esac

@@ -65,6 +65,8 @@ COPY --chown=ling:ling deploy/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 USER ling
-EXPOSE 8080
+# 容器内固定监听 6520（entrypoint 的 uvicorn / compose 的 expose 与 healthcheck
+# 都是这个值）。EXPOSE 只是元数据，不影响监听，但写错会让人以为容器在 8080。
+EXPOSE 6520
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["api"]

@@ -22,7 +22,7 @@ cd clients/web-console && pnpm install && pnpm build && cd ../..
 . scripts/dev_env.sh
 export LING_WEB_DIST=$PWD/clients/web-console/dist
 python -m ling
-# → http://127.0.0.1:8080
+# → http://127.0.0.1:8080（开发默认端口，与容器里的 6520 无关）
 ```
 
 开发默认 `LING_TEST_MODE=1`，对话由确定性 fake provider 生成，界面显著标注
@@ -34,7 +34,7 @@ python -m ling
 cd /opt/ling
 bash deploy/install.sh              # 一条命令：生成配置、构建、起服务、等就绪
 # 结束时会打印实际控制台地址：新生成的 .env 默认 18080，已有 .env 则按
-# LING_EDGE_PORT。--port 可以改新生成 .env 的端口。
+# LING_PORT。--port 可以改新生成 .env 的端口。
 ```
 
 或手动：
@@ -46,21 +46,29 @@ cp deploy/env.example deploy/.env
 
 cd clients/web-console && pnpm install && pnpm build && cd ../..
 docker compose -f deploy/compose.yaml --project-name ling-dev up -d --build
-curl http://127.0.0.1:8080/readyz
+curl http://127.0.0.1:6520/readyz
 ```
 
-**端口只有一个来源**：Compose 发布到宿主的端口由 `deploy/.env` 的
-`LING_EDGE_PORT`（compose 默认 8080）决定。安装器的就绪等待、安装摘要与
-`--status` 都以 `docker compose config` 解析出的**实际发布端口**为准，不再假定
-脚本里写死的 18080：
+**端口只有一个来源**：api 容器内**固定**监听 6520（`entrypoint.sh` 的 uvicorn、
+`expose`、`healthcheck` 三处一致），宿主发布端口由 `deploy/.env` 的 `LING_PORT`
+决定（compose 默认 6520）。安装器的就绪等待、安装摘要与 `--status` 都以
+`docker compose config` 解析出的**api 实际发布端口**（`target=6520`）为准，
+不再假定脚本里写死的 18080：
 
-- 新装（没有 `deploy/.env`）时安装器生成 `LING_EDGE_PORT=18080`，也可以用
-  `--port 8080` 改；摘要里打印的就是真实端口。
-- 已有 `.env`（例如照 `env.example` 用了 8080）时，安装器按 8080 等 `/readyz`
-  并打印 8080，不会再错等 18080。
+- 新装（没有 `deploy/.env`）时安装器生成 `LING_PORT=18080`，也可以用
+  `--port 6520` 改；摘要里打印的就是真实端口。
+- 已有 `.env`（例如照 `env.example` 用了 6520）时，安装器按 6520 等 `/readyz`
+  并打印 6520，不会再错等 18080。
 - 已有 `.env` 时 `--port` **不会**改写它（安装器不写已有 env）；如果
-  `--port` 与真实发布端口冲突，安装器直接失败并让你改 `LING_EDGE_PORT`，
+  `--port` 与真实发布端口冲突，安装器直接失败并让你改 `LING_PORT`，
   绝不静默等一个错端口。
+- 解析不出 `target=6520` 的确定发布端口（缺 ports、区间/随机分配、或只有
+  别的 target）时安装器 **fail closed**，不会对着猜的端口等 120 秒。
+- **从旧的 edge 拓扑升级**（`docker ps` 里有 `ling-edge-1`、`.env` 里是
+  `LING_EDGE_PORT=20443`）**必须先按 §7「从 edge 拓扑迁移」做一遍**：那些键
+  已经不起作用，不迁移的话对外端口会从 20443 静默变成 `LING_PORT` 的默认值
+  6520，而 OneBot 上报、防火墙、外部反代还指着旧端口。安装器与 `--status`
+  都会检测并点名这些废弃键（只读，不改写 `.env`）。
 
 ### 首次登录的账号
 
@@ -84,8 +92,9 @@ docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
 
 想自己指定初始口令，就显式设置 `LING_BOOTSTRAP_ADMIN_PASSWORD`——此时不会强制改密。
 
-服务：`db`（不暴露端口）、`api`（容器内 8080，不发布宿主端口）、`worker`
-（outbox/恢复）、`edge`（唯一入口，发布 `LING_EDGE_PORT`）、前端产物只读挂到 api 的 `/app/web`。
+服务：`db`（不暴露端口）、`api`（容器内固定 6520，**自己发布宿主端口 `LING_PORT`**，
+默认 6520）、`worker`（outbox/恢复）、前端产物只读挂到 api 的 `/app/web`。
+**没有 `edge`/nginx 服务**：api 就是对外入口（详见 §7）。
 
 启动顺序：`db` 健康 → `api` 等库 → 跑迁移 → 起服务。迁移失败时 api 不启动。
 
@@ -113,16 +122,17 @@ docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
   env（例如 `/srv/ling/shared/ling.env`），锁落在它真实所在的目录，跨 release
   也只有一把锁；安装器**不覆盖、不追加**已存在的 `.env`（普通文件、只读文件、
   symlink 都保持字节不变），也不会把密钥复制到 release 树里。基础镜像
-  （python/postgres/nginx）的解析结果只 `export` 到本次进程环境，不写回 env。
+  （python/postgres）的解析结果只 `export` 到本次进程环境，不写回 env。
 - **新生成的 `.env` 不再写死本检出的绝对 dist**：`LING_WEB_DIST_HOST` 用相对
   `deploy/` 的默认值 `../clients/web-console/dist`。canonical env 被多个
   release 共享时，绝对值会指向上一个 release 树，让后续**手动**安装挂到旧前端
   并在校验时 fail-closed（更新执行器会自己传本次 release 的 dist，不受影响）。
   已存在的绝对值不会被自动修改：在另一棵树手动升级时显式
   `export LING_WEB_DIST_HOST="$(pwd)/clients/web-console/dist"`，并保留
-  `LING_INSTALL_COMPOSE_OVERRIDE`、edge 配置/证书等其它 bind 上下文。
+  `LING_INSTALL_COMPOSE_OVERRIDE`、更新通道目录等其它 bind 上下文。
 - **基础镜像显式选择不会被替换**：shell / `--python-base` / env-file 里的
-  `LING_PYTHON_BASE`、`LING_POSTGRES_IMAGE`、`LING_NGINX_IMAGE` 一律原样保留；
+  `LING_PYTHON_BASE`、`LING_POSTGRES_IMAGE` 一律原样保留（`LING_NGINX_IMAGE`
+  随 edge 服务一起删除，安装器不再解析它）；
   只有“默认值且官方名不可用”才换成**同一 tag** 的镜像源（`postgres:16-alpine`
   不会退成 18），两处都拿不到就 fail closed。
 - **构建提交**：构建前解析本检出 `git rev-parse HEAD`（40 位）或显式
@@ -170,7 +180,7 @@ docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
   失败；`--build-web-only` 不碰 Docker，会忽略并告警。
 - **override 不能搬走 `/app/web`**：安装器的不变量是“compose 实际挂载的
   `/app/web` == 本次校验过的产物”。固定 bind 来源只应针对 `/app/web` 以外的
-  目标（edge 配置/证书、更新通道目录等）；把 `/app/web` 指到别处会让安装
+  目标（更新通道目录、运行数据等）；把 `/app/web` 指到别处会让安装
   fail-closed（报“不是本次校验产物”）。
 - **override 也不能搬走持久数据卷**：有 override 时安装器会让 Compose 分别解析
   “基础 compose”和“base+override”，要求：
@@ -182,8 +192,7 @@ docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
   把 `/data` 换成一个空卷、改 `db-data` 的来源、把 `app-data` 声明成
   external、或删掉这些挂载，都会被拒绝（构建/`up` 之前）。匿名卷（Compose 不写
   `source`）按“没有跨重启身份”处理，不会因为每次解析的随机名被误判；override
-  新增挂载、合法的 edge 配置/证书绝对源、更新通道目录，以及本次 release 的
-  `/app/web` 更新不受影响。失败信息只报服务名/卷名，不打印 compose config
+  新增挂载、更新通道目录的绝对源，以及本次 release 的 `/app/web` 更新不受影响。失败信息只报服务名/卷名，不打印 compose config
   （里面有数据库口令与 root key）。
 - **override 是宿主信任输入，不是安全沙箱**：安装器只保证上面两条结构不变量
   （`/app/web` 身份 + 持久命名卷身份），**没有安全 allowlist**。override 可以
@@ -542,8 +551,11 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 
 **已验证**（后文 §7–§9 是这些验证的记录）：
 
-- Docker Compose 单机部署：`api` / `worker` / `db` / `edge` 全部起得来，`/readyz` 通过
-- 多副本 + edge 反代：滚动更新期间不断服
+- Docker Compose 单机部署：`api` / `worker` / `db` 全部起得来，`/readyz` 通过
+- 多副本 + 前置反代（`deploy/nginx.conf`，**不再是 compose 服务**）：**旧 edge 拓扑下**
+  验证过滚动更新期间不断服；改为 api 直连（edge 已删除）后，这个组合**本次没有复验**
+- 删掉 edge、api 直连 6520：**只在 stub 测试与静态 YAML 解析里验证过**，
+  未在真实 Docker 上跑（见 §7 的「改动后」小节）
 - 备份 → 恢复 → 校验整条链在真实部署上跑通（**口径**：真机上验过的是
   "dump + 墓碑清单 → 隔离库恢复 → 关键表/墓碑一致"这一段；之后新增的
   `root.key`/媒体归档、产物 sha256、`media_ref` 覆盖检查只有**本地 fake**
@@ -556,6 +568,9 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - 公网部署所需的域名、TLS、反代加固
 - 长时间（数周）无人值守运行的稳定性
 - 自助更新/升级执行器在**真实 Docker** 上的完整演练（备份、构建、切换、失败恢复）
+- 从 edge 拓扑迁移的**整条链路**（`down --remove-orphans` → 改 `.env` →
+  `install.sh` → `adopt-current`）只在 stub 测试与文档里走过，**没有在真实
+  Docker 上演练**；迁移前请务必先备份，并按 §7 的第 5、6 步逐条核对
 - 备份链路的**新增**检查在真机上跑通：`docker compose exec` 的退出码透传、
   `tar -cf -` 的 stdout 字节干净性、大媒体卷耗时、并发上传时的 `media_state=partial`、
   以及媒体/密钥临时文件"创建时 group/other 位全 0"在**真实分钟级流式传输**下的全程观测
@@ -565,23 +580,145 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 > 判断某项是否真的能用，看它有没有对应的测试或本节的验证记录；
 > 只写了代码没有记录的地方，按未验证对待。
 
-## 7. 多副本部署（已验证）
+## 7. 拓扑：api 直连（改动后）
 
 ```bash
 # deploy/.env
-LING_API_REPLICAS=2          # api 副本数
-LING_EDGE_PORT=8080          # 对外只暴露 edge
-LING_NGINX_IMAGE=nginx:alpine
+LING_API_REPLICAS=1          # **必须是 1**，见下
+LING_PORT=6520               # api 的宿主发布端口
 
 docker compose -f deploy/compose.yaml --project-name ling up -d --build
 ```
 
-拓扑：`edge(nginx):80 → api×N:8080`，`worker`、`db` 不对外。
+拓扑：`浏览器/CLI → api:6520`，`worker`、`db` 不对外。
+网络有两张：`internal`（`internal: true`，无外网，只有 db/api/worker 之间通信）
+和 `egress`（普通 bridge，api 与 worker 靠它出网访问 OneBot / embedding /
+rerank / LLM / 告警 webhook）。
 
-### 为什么 api 不发布 host 端口
+> **`egress` 绝对不能加 `internal: true`**。加了之后 api/worker 会彻底失去外网，
+> 而且不报错——worker 表现为"模型提炼不可用，降级为正则: ModelError"，api
+> 表现为"QQ 连不上、语义检索永远走 BM25"。这个坑踩过一次，别再踩。
 
-多副本发布同一 host 端口会冲突。对外只经 edge，内部用 Compose DNS
-（服务名 `api` 解析到所有副本，nginx upstream 轮询即负载均衡）。
+### 为什么副本数只能是 1
+
+api 自己发布固定 host 端口（`ports: "${LING_PORT:-6520}:6520"`）。Compose
+**非 swarm 模式**下 `ports` 只能给一个容器：2 个副本会直接端口冲突，第二个
+容器起不来。所以 `deploy/compose.yaml` 的默认值改成了
+`replicas: ${LING_API_REPLICAS:-1}`，`env.example` 与 `install.sh` 生成的
+`.env` 也都是 1。
+
+多副本的前提（状态不在进程内存）本身仍然成立（见下方小节），但要真的跑
+多副本，必须自己前置一层反代：
+
+1. 自己在 compose 里加一个 Caddy/nginx 容器，或者用宿主上的 nginx；
+2. upstream 指到 `api:6520`（容器内服务名解析到所有副本，轮询即负载均衡）；
+3. 把 api 的 `ports` 收回成只 `expose`，只暴露反代端口；
+4. 把 `LING_API_REPLICAS` 调上去。
+
+`deploy/nginx.conf` / `deploy/nginx-tls.conf` 保留给这种用法（顶部注释写了
+完整步骤），但它们**不再是 compose 服务**，Ling 不会替你启动。
+
+### 原来的 edge 拓扑（历史记录，已删除）
+
+删之前是 `edge(nginx):80 → api×N:8080`：`edge` 发布 `LING_EDGE_PORT`
+（默认 8080）与 `LING_EDGE_TLS_PORT`（默认 8443），api 只 `expose` 不发布
+host 端口。删掉的原因：单副本个人部署里这层纯属多一个容器、多一份配置漂移
+风险（证书路径跟着 release 树漂），而 nginx 提供的唯一硬价值
+（`client_max_body_size 32m`）现在由应用自己承担
+（`LING_MAX_BODY_BYTES`，默认 32MB，见 `src/ling/api/body_limit.py`）。
+
+还在跑这套旧拓扑的机器，按下一节迁移；直接升级会静默改端口并留下占端口的
+`edge` 孤儿容器。
+
+### 从 edge 拓扑迁移（旧部署升级必读）
+
+**这一节只针对已经在跑旧拓扑的机器**：`docker ps` 里有 `ling-edge-1`，
+`deploy/.env` 里是 `LING_EDGE_PORT=20443`（可能还有 `LING_EDGE_TLS_PORT` /
+`LING_EDGE_CONF` / `LING_EDGE_CERTS` / `LING_NGINX_IMAGE`）。新版本删掉了
+`edge`，api 直接发布 `LING_PORT`；新 compose 里没有 `edge`，旧容器不会自己
+消失，`.env` 里那些键也不再有任何引用。**不做下面这几步，升级会静默断链**：
+对外端口从 `LING_EDGE_PORT` 漂到 `LING_PORT` 的默认值 6520，而 OneBot 上报、
+防火墙、外部反代、书签还都指着 20443。
+
+1. **先停掉旧拓扑并清 orphan。**
+
+   ```bash
+   cd /path/to/ling        # 你的部署目录，见本文 §1
+   docker compose -f deploy/compose.yaml --project-name ling --env-file deploy/.env \
+     down --remove-orphans
+   ```
+
+   本文示例统一用 `/path/to/ling` 代指仓库根目录（§1/§2 里写作 `/opt/ling`）；
+   实际路径以你的部署为准，不要照抄示例。
+
+   - 在**更新代码之前**跑最稳（此时 `deploy/compose.yaml` 还是带 `edge` 的旧
+     版本，`down` 会正常停掉它）。如果你已经先同步了代码，这条命令也照样执行——
+     只是此时 `edge` 已经不在 compose 文件里，**必须靠 `--remove-orphans`** 才会
+     被清掉；不加的话它会作为 orphan 继续运行、继续占着 20443/8443，而它反代的
+     上游 api 已经没人监听，用户看到的就是 502。
+   - `--remove-orphans` 的作用域是**整个 compose 项目**（默认 `ling`），不是只针对
+     `edge`：同一个项目里**你自己手工创建、但不在 compose 文件中的容器也会被删掉**。
+     迁移前先确认没有要紧的手工容器；要保留的请换一个项目名（`--project-name`）
+     或改用独立的 `docker run` 起。
+   - 项目名用安装时的那个（`install.sh` 默认 `ling`，用 `--project` 改过就填那个；
+     `-p` 省略时 Compose 按 compose 文件的顶层 `name:` 推，老版本这里也是 `ling`）。
+   - `down` **会停服务**（有停机窗口），但**不会删数据卷**：不加 `-v` 就不存在
+     `db-data` / `app-data` 被删的风险。
+2. **改 `deploy/.env`**（这份文件安装器只读，不会替你改）：
+   - 删掉 `LING_EDGE_PORT`、`LING_EDGE_TLS_PORT`、`LING_EDGE_CONF`、
+     `LING_EDGE_CERTS`、`LING_NGINX_IMAGE`；
+   - 加 `LING_PORT=20443`（**保持对外地址不变**，OneBot/防火墙/书签都不用动），
+     或者 `LING_PORT=6520`（换新端口，那么第 6 步的对外集成都要跟着改）；
+   - 证书和 nginx 配置如果还要用，改成你自己的前置反代（见 §9.1）——Ling 的
+     compose 不会再把它挂进去。
+3. **把代码树更新到新版本，在该树跑一次安装器。**
+
+   ```bash
+   bash deploy/install.sh --status      # 先看现状；会逐条点名 .env 里残留的废弃键
+   bash deploy/install.sh               # 构建 → 启动 → 等 /readyz → 发布前端
+   ```
+
+   安装器现在给 `docker compose up` 和 `--down` 都带 `--remove-orphans`（只清
+   本项目 `ling` 的孤儿容器，不碰别的项目；但同一个项目里你手工创建、不在
+   compose 文件中的容器也在清理范围内，见第 1 步）。这是**兜底**，不是第 1 步的替代：
+   旧容器已经占着宿主端口时，别指望 `up` 顺手把冲突解决掉——先 `down` 清场再
+   安装。安装摘要里打印的端口就是 compose 解析出的真实端口。
+4. **更新执行器（如果装了自助更新）。** 两件事都要做：
+   - 把执行器配置里的 `port` 改成新的 `LING_PORT`（`/etc/ling-update.toml`；
+     它用这个端口探宿主 `/readyz`，不改就永远 `verify_failed`）；
+   - **重建基线**：让执行器核验并记下“现在实际运行的是什么”。
+
+   ```bash
+   sudo python3 deploy/update/executor.py --config /etc/ling-update.toml adopt-current
+   ```
+
+   `adopt-current` 会先取宿主锁与安装锁，再逐副本自证 commit/version、容器
+   挂载与宿主端口 `/readyz` 2xx；**不能自证就拒绝**（不写 installed、不解除
+   `needs_manual` 门禁）。命令语义见 `deploy/update/README.md` 第三节，
+   失败处理见 [UPDATES.md](UPDATES.md) §4/§8。
+
+   > 跨拓扑更新**不要**指望自助更新：旧 live release 的 compose 有 `edge`、
+   > 新 release 没有，plan 阶段判「服务集合必须一致」不成立，直接
+   > `compose_bind_changed`（`manual=False`，重试也不会成功）。这个判据是
+   > fail-closed 的安全设计，不会放宽；必须先按本节人工迁移，再重建基线。
+   > 执行器现在会把差异写清楚（例如“服务集合从（api、db、edge、worker）变成
+   > （api、db、worker）；少了 edge”），落在宿主 stdout 与
+   > `state_dir/recovery-<request_id>.txt` 里（Web 上仍只显示固定文案）。
+5. **验证。**
+
+   ```bash
+   # 端口换成你实际用的 LING_PORT；期望 200
+   curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:6520/readyz
+   # 不应再出现 ling-edge-1
+   docker ps --format '{{.Names}}' | grep -E '^ling-(api|worker|db|edge)-'
+   bash deploy/install.sh --status
+   ```
+
+6. **外部集成自查**（端口只要变了，这些都要逐条核对）：
+   - OneBot / NapCat 的 HTTP 上报地址：`http://<宿主>:<端口>/v1/onebot/events`；
+   - 防火墙 / 安全组 / 端口映射：旧 20443、8443 → 新的 `LING_PORT`；
+   - 外部反代（Nginx / Caddy / 1Panel 等）的 upstream 与监听端口；
+   - 书签、手机端/客户端配置、监控与告警里的 URL。
 
 ### 多副本的前提：状态不能在进程内存
 
@@ -593,10 +730,11 @@ docker compose -f deploy/compose.yaml --project-name ling up -d --build
 - 流式片段续传 → 多实例下 resume 退化为权威快照（前端仍拿到完整文本）
 - 群发言频率 → 实际限额约为单实例 × 副本数（宽松方向）
 
-### nginx 必须关闭 buffering
+### 前置反代（如果自己加了）必须关闭 buffering
 
 `deploy/nginx.conf` 里 `/v1/` 段设了 `proxy_buffering off` 与 300 秒超时。
-不关的话 SSE 会被 nginx 攒成一整段，流式就失效了。
+不关的话 SSE 会被 nginx 攒成一整段，流式就失效了。Caddy 等价写法是
+`flush_interval -1`。**直连 api 时不需要这一层**，uvicorn 自己就是逐条刷出。
 实测：delta 每 50ms 到达一次，26 个事件总耗时 1.3 秒。
 
 ### worker 保持单副本
@@ -631,7 +769,8 @@ LING_ONEBOT_INSTANCE_ID=onebot-main
 
 NapCat 侧要开：
 - **HTTP 服务器**：端口 5700（对应 `LING_ONEBOT_API_BASE`）
-- **HTTP 上报（反向 HTTP）**：地址填 `http://<ling 地址>:8080/v1/onebot/events`
+- **HTTP 上报（反向 HTTP）**：地址填 `http://<ling 地址>:6520/v1/onebot/events`
+  （用你自己的 `LING_PORT`）
 - 上报的 **secret / token** 与上面两项保持一致
 
 ### 6.1.1 谁能跟她说话（出入许可）
@@ -678,7 +817,7 @@ ling 的 OneBot 连接器是 **HTTP-only**（`connectors/onebot/` 里没有 WebS
       {
         "name": "ling",
         "enable": true,
-        "url": "http://<ling 所在机器>:8080/v1/onebot/events",
+        "url": "http://<ling 所在机器>:6520/v1/onebot/events",
         "messagePostFormat": "array",
         "reportSelfMessage": false,
         "token": "",
@@ -701,7 +840,7 @@ ling 的 OneBot 连接器是 **HTTP-only**（`connectors/onebot/` 里没有 WebS
 连通后应该看到这样的记录（数值为示例）：
 
 ```
-NapCat 日志：HTTP上报服务: http://<ling-host>:8080/v1/onebot/events, : 已启动
+NapCat 日志：HTTP上报服务: http://<ling-host>:6520/v1/onebot/events, : 已启动
 ling 响应：  {"accepted":true,"decision":"reply","delivered":true,
              "parts_total":2,"parts_sent":2}
 NapCat 日志：<bot> | 发送 -> 私聊 (10001) 第一条测试消息
@@ -717,17 +856,17 @@ NapCat 日志：<bot> | 发送 -> 私聊 (10001) 第一条测试消息
 OneBot 事件要先解析成自然人。**未绑定会被直接拒绝**（不猜身份）：
 
 ```bash
-TOKEN=$(curl -s -X POST http://127.0.0.1:8080/v1/auth/login \
+TOKEN=$(curl -s -X POST http://127.0.0.1:6520/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"ling","password":"<你的密码>"}' -c /tmp/c.txt >/dev/null && echo ok)
 
 # 绑定（proof=pending：先建立关系，不能用于身份解析）
-curl -b /tmp/c.txt -X POST http://127.0.0.1:8080/v1/accounts/bind \
+curl -b /tmp/c.txt -X POST http://127.0.0.1:6520/v1/accounts/bind \
   -H 'Content-Type: application/json' \
   -d '{"connector_instance":"onebot-main","external_account_id":"<QQ号>"}'
 
 # 确认账号确实属于本人后，升级为已证明（此后才能解析身份）
-curl -b /tmp/c.txt -X POST http://127.0.0.1:8080/v1/accounts/<account_id>/prove
+curl -b /tmp/c.txt -X POST http://127.0.0.1:6520/v1/accounts/<account_id>/prove
 ```
 
 `proof=pending` 只能建关系、不能解析身份——否则"自称某账号"就能拿到那个人的记忆。
@@ -736,11 +875,11 @@ curl -b /tmp/c.txt -X POST http://127.0.0.1:8080/v1/accounts/<account_id>/prove
 
 ```bash
 # OneBot 连通性（调 get_login_info）
-curl http://127.0.0.1:8080/v1/onebot/health
+curl http://127.0.0.1:6520/v1/onebot/health
 
 # 在 QQ 里给机器人发一条私聊，应收到回复；
 # 服务器侧可核对：
-curl -b /tmp/c.txt http://127.0.0.1:8080/v1/accounts   # 绑定状态
+curl -b /tmp/c.txt http://127.0.0.1:6520/v1/accounts   # 绑定状态
 ```
 
 事件上报**业务失败也返回 200**（否则 OneBot 会反复重投），
@@ -846,7 +985,7 @@ LING_QQBOT_ALLOW_UNSIGNED_VALIDATION=0  # 平台不给 op=13 签名时才开
 `connector_instance` 填 `LING_QQBOT_INSTANCE_ID`：
 
 ```bash
-curl -b /tmp/c.txt -X POST http://127.0.0.1:8080/v1/accounts/bind \
+curl -b /tmp/c.txt -X POST http://127.0.0.1:6520/v1/accounts/bind \
   -H 'Content-Type: application/json' \
   -d '{"connector_instance":"qqbot-main","external_account_id":"<openid>"}'
 ```
@@ -863,7 +1002,7 @@ ling 日志里找 `拒绝入站：sender=<openid>`（白名单模式下）或直
 1. **凭据能不能换到 token**（不涉及消息权限）：
 
    ```bash
-   curl -s http://127.0.0.1:8080/v1/qqbot/health | python -m json.tool
+   curl -s http://127.0.0.1:6520/v1/qqbot/health | python -m json.tool
    ```
 
    期望 `ok: true`，`detail` 里写着 `鉴权通过 ... 消息收发权限未验证`。
@@ -1267,8 +1406,8 @@ Web 根目录或共享盘的可浏览位置。执行器自己的备份目录是 
 ### 8.2 运维状态端点
 
 ```bash
-# 端口按 deploy/.env 的 LING_EDGE_PORT（安装器默认 18080，env.example 示例 8080）
-curl -b cookies.txt "http://127.0.0.1:${LING_EDGE_PORT:-8080}/v1/health/ops"
+# 端口按 deploy/.env 的 LING_PORT（安装器默认 18080，env.example 示例 6520）
+curl -b cookies.txt "http://127.0.0.1:${LING_PORT:-6520}/v1/health/ops"
 ```
 
 返回每个检查项的 `severity` 与 `action`（只有出问题时才给建议）：
@@ -1392,7 +1531,7 @@ worker 每 5 分钟检查一次（比小时级的维护任务密得多——"它
 手动验证一次（不用等 worker）：
 
 ```bash
-curl -b cookies.txt -X POST http://127.0.0.1:8080/v1/health/ops/notify
+curl -b cookies.txt -X POST http://127.0.0.1:6520/v1/health/ops/notify
 ```
 
 **实测完整闭环**：未配备份 → worker 推送成功并记录 `count=1`、
@@ -1417,12 +1556,16 @@ await replay_dead_events()   # 把 dead 重新入队
 
 | 你怎么访问 | 需要 TLS 吗 |
 | --- | --- |
-| 只在同一台机器 / 可信 VPN / SSH 隧道内 | **不必须**（默认 `nginx.conf` 明文即可） |
-| 手机在外网直连、或暴露到公网 | **必须** |
+| 只在同一台机器 / 可信 VPN / SSH 隧道内 | **不必须**（api 直连 6520，明文 HTTP） |
+| 手机在外网直连、或暴露到公网 | **必须**（自己前置一层 TLS 反代，见 §9.1） |
 
 判断标准不是"是不是自己的服务器"，而是**登录凭证与私聊内容会不会经过不可信网络**。
 
-### 9.1 启用 TLS
+### 9.1 启用 TLS（自己前置反代）
+
+**Ling 默认不再自带 TLS**：`edge` 服务已删除，api 直连 6520 且是明文。
+要上 HTTPS 就得自己在前置一层，`deploy/nginx-tls.conf` 是一份可直接用的
+示例配置（顶部注释有完整步骤）：
 
 ```bash
 # 1) 生成自签证书（内部使用足够；浏览器会提示不受信任）
@@ -1431,25 +1574,37 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout deploy/certs/privkey.pem -out deploy/certs/fullchain.pem \
   -subj "/CN=ling.local"
 
-# 2) 切到 TLS 配置并打开 cookie Secure
-export LING_EDGE_CONF=./nginx-tls.conf
-export LING_EDGE_CERTS=./certs
+# 2) 自己起一个反代容器（Ling 不替你启动它），把 nginx-tls.conf 与 certs
+#    挂进去，upstream 指向 api:6520；同时把 api 的 ports 收回成只 expose。
+
+# 3) 打开 cookie Secure
 export LING_COOKIE_SECURE=1        # 少了这一条，凭证仍可能走明文
-docker compose -f deploy/compose.yaml up -d
 ```
 
 `LING_COOKIE_SECURE=1` 不是可选项：上了 TLS 但 cookie 不带 Secure，
 浏览器仍可能在明文请求里带上会话 cookie。`scripts/check_compose.py`
 会在检测到 443 端口时强制要求 `env.example` 里有这一项。
 
+更省事的替代方案是 Caddy（自动签证书）：
+
+```
+api.example.com {
+    reverse_proxy api:6520 {
+        flush_interval -1   # SSE 必须逐条刷出，等价于 proxy_buffering off
+    }
+}
+```
+
 ### 9.2 证书用 certbot 签发
 
 `nginx-tls.conf` 已放行 `/.well-known/acme-challenge/`，
 把 webroot 指到 `/var/www/certbot` 即可用 certbot 的 webroot 模式签发。
+（前提是你确实用了这份配置作为前置反代。）
 
 ### 9.3 TLS 下的 SSE
 
-`proxy_buffering off` 在 TLS 配置里同样必须存在，否则流式回复会被攒成整段。
+如果你用 `nginx-tls.conf` 前置，`proxy_buffering off` 在 TLS 配置里同样必须存在，
+否则流式回复会被攒成整段。
 
 **实测**（远端 Docker，自签证书，上游每 100ms 发一条）：
 
@@ -1524,3 +1679,10 @@ compose up -d --force-recreate api
 真实部署请把 `LING_UPDATE_REQUESTS_HOST` / `LING_UPDATE_STATUS_HOST` 显式设成
 宿主绝对路径（如 `/run/ling-update/requests`），与执行器配置里的
 `requests_dir` / `status_dir` 保持一致；仓库里的相对默认值只用于本机试验。
+
+**跨拓扑更新会被拒绝，这是有意的**：服务集合必须一致（新增/删除服务一律拒绝）
+是 fail-closed 判据。旧 live release 的 compose 有 `edge`、新 release 没有时，
+执行器在 plan 阶段直接判 `compose_bind_changed`（`manual=False`，**重试也不会
+成功**），并在宿主 stdout 与 `state_dir/recovery-<request_id>.txt` 里写明
+“服务集合从（…）变成（…）”（Web 上仍只显示固定文案）。遇到它不要反复点更新，
+按 §7「从 edge 拓扑迁移」人工迁移后再 `adopt-current` 重建基线。
