@@ -1,0 +1,133 @@
+{
+  "$defs": {
+    "Visibility": {
+      "enum": [
+        "actor_private",
+        "subject_private",
+        "window_private",
+        "group_scope",
+        "public",
+        "admin_only"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/RuntimeScope.schema.json",
+  "additionalProperties": false,
+  "description": "服务器解析出的本轮权威作用域。客户端传入的同名字段只作提示。",
+  "properties": {
+    "account_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Account Id"
+    },
+    "actor_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Actor Id",
+      "type": "string"
+    },
+    "config_revision": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Config Revision",
+      "type": "integer"
+    },
+    "consent_revision": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Consent Revision",
+      "type": "integer"
+    },
+    "device_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Device Id"
+    },
+    "persona_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Persona Id",
+      "type": "string"
+    },
+    "scene_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：场景由 presence 域持有，不在作用域里",
+      "title": "Scene Id"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "subject_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Subject Id",
+      "type": "string"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trace Id"
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility",
+      "default": "subject_private"
+    },
+    "window_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Window Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "actor_id",
+    "persona_id",
+    "subject_id",
+    "window_id"
+  ],
+  "title": "RuntimeScope",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

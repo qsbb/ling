@@ -1,0 +1,36 @@
+# 反向 WS 模式的可选 compose override：**只加一条端口映射**。
+#
+# 基础 `deploy/compose.yaml` 刻意不发布 `LING_ONEBOT_WS_PORT`——不配 WS 的
+# 部署不该多出一个对外端口（理由与替代方案见那份文件里 api 的 `ports` 注释）。
+# 要用反向 WS（ling 当服务端、NapCat 连进来）时，复制这份文件并追加 -f：
+#
+#   cp deploy/compose.ws.example.yaml deploy/compose.override.ws.yaml
+#   docker compose -f deploy/compose.yaml -f deploy/compose.override.ws.yaml \
+#     --project-name ling --env-file deploy/.env up -d
+#
+# 安装器路径（install.sh 会把它追加成第二个 -f，且始终保留 --env-file）：
+#
+#   LING_INSTALL_COMPOSE_OVERRIDE="$PWD/deploy/compose.override.ws.yaml" \
+#     bash deploy/install.sh
+#
+# 前置条件（缺一不可）：
+#
+# 1. `deploy/.env` 里 `LING_ONEBOT_WS_PORT=6799`（与下面 ports 的两段一致）；
+# 2. `LING_ONEBOT_WS_TOKEN=<随机串>` —— **没有 token 时服务端拒绝启动**，
+#    端口一开就等于把"往对话链路推事件"的能力交给任何能连上的人；
+# 3. `LING_ONEBOT_WS_HOST=0.0.0.0` —— 默认 127.0.0.1 在容器里等于只有容器
+#    自己能连，宿主上的 NapCat 依然连不进来；
+# 4. NapCat 侧 `onebot11_<QQ>.json` 的 `network.websocketClients[]` 填
+#    `url: "ws://<ling 宿主机 IP>:6799"`、`token: <同一个串>`、`enable: true`。
+#
+# **Compose 的 `ports` 是追加而不是覆盖**：这里只加 WS 那一条，
+# `deploy/compose.yaml` 里 api 的 `${LING_PORT:-6520}:6520` 仍然生效。
+#
+# 变量用 `:?`（必填）而不是 `:-`（带默认值）：漏配时 Compose 会在解析阶段
+# 直接报错并指名缺哪个变量，而不是发布一个 ":" 这样的非法条目（后者报错
+# 信息完全指不到原因）。这也是基础 compose 里不能写条件端口映射的原因。
+
+services:
+  api:
+    ports:
+      - "${LING_ONEBOT_WS_PORT:?WS 模式必须先在 deploy/.env 配 LING_ONEBOT_WS_PORT}:${LING_ONEBOT_WS_PORT:?WS 模式必须先在 deploy/.env 配 LING_ONEBOT_WS_PORT}"

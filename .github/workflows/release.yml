@@ -1,0 +1,623 @@
+name: release
+
+# 两个入口：
+#   1) 稳定版 tag 推送 vX.Y.Z（预发布/构建后缀一律不触发）；
+#   2) 手动 workflow_dispatch（正式发版前验证流水线：**只**推 sha-<commit> 镜像，
+#      不打 vX.Y.Z / latest，也不创建 Release）。
+#
+# 门禁顺序（后一个必须等前一个，任一门禁失败都不会走到后面的发布动作）：
+#   verify → ci + mobile → image → updater-image → release
+#
+# 发布前必须同时满足：
+#   1) tag == pyproject.toml version == src/ling/__init__.py __version__
+#      == clients/web-console/package.json version；
+#   2) tag 指向的提交是 main 的祖先（fetch-depth: 0）；
+#   3) 复用 ci.yml / mobile.yml 的全部检查并且全部通过；
+#   4) api 镜像（ling-api）与更新器镜像（ling-updater）都构建并推送成功，
+#      两个 index digest 都已写进各自 job 的 summary。
+# 之后才 gh release create。源码 tag/commit 就是更新源：这里不上传任何可执行
+# 资产，也没有 descriptor/HMAC。可编辑的 Release 正文**不是**摘要的可信来源：
+# 宿主部署只认 image / updater-image job summary 里的 index digest
+# （ghcr.io/qsbb/ling-api@sha256:... 与 ghcr.io/qsbb/ling-updater@sha256:...）。
+# Release 正文里附的两个 digest 只方便复制；正文可编辑，不作数。
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+# 默认最小权限；只有 release job 需要写 contents，image job 单独持 packages: write。
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      # 版本号在这里解析一次，image job 用它写 OCI 标注（不在两处各算一遍，
+      # 免得标注和 Release tag 对不上）。
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4（SHA 解析方式见文件末尾）
+        with:
+          # 祖先检查要完整历史与 main 引用
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.13"
+      - name: 解析源码版本
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"].strip())')"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::pyproject.toml 的 version 不是 X.Y.Z：'$version'"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "pyproject version = $version"
+      - name: 校验 tag 与版本号
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 手动触发没有发布 tag：只要求三处版本号自洽（等价于"如果现在打
+            # v$VERSION，check_release 会不会过"），不查 tag 存在性与祖先关系。
+            python scripts/check_release.py --tag "v$VERSION"
+          else
+            python scripts/check_release.py --tag "$RELEASE_TAG" --check-ancestor --main-ref origin/main
+          fi
+
+  ci:
+    needs: verify
+    # 直接复用日常 CI（push/pull_request 也还照旧触发）。
+    uses: ./.github/workflows/ci.yml
+
+  mobile:
+    needs: verify
+    # 移动端有自己的一套工具链（Flutter），日常按 paths 触发；发版时显式跑一次，
+    # 免得"release 只保证 Python/Web 能跑，App 编译不过也照样发"。
+    uses: ./.github/workflows/mobile.yml
+
+  image:
+    needs: [verify, ci, mobile]
+    # PR/fork 不构建、不推送镜像：本 job 持有 packages: write，而来自 fork 的
+    # 代码不得接触这个 token。release.yml 本身没有 pull_request 触发，这里再
+    # 显式挡一次（也挡住 fork 上的 tag 推送 / 手动触发）。
+    if: >-
+      github.event_name != 'pull_request' && github.repository == 'qsbb/ling'
+    runs-on: ubuntu-latest
+    # **恰好**这两项：读源码 + 推 GHCR。没有 contents: write（本 job 不建
+    # Release），也没有 id-token / attestations（本次不用 GitHub 原生构建证明；
+    # 若将来要，按设计 §3 单独授最小权限，不要顺手给它 contents: write）。
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # 镜像名与上面的 `github.repository == 'qsbb/ling'` 是同一件事的两处固定值：
+      # 仓库改名/迁 owner 时必须一起改，否则本 job 会被 if 静默跳过（等于不发镜像，
+      # 但不发 Release 也会被 needs 连带挡掉——宁可这样也不要推错仓库的 package）。
+      IMAGE: ghcr.io/qsbb/ling-api
+    # release job 把这个 digest 写进 Release 正文（正文可编辑，只方便复制；
+    # 可信来源仍是本 job 的 summary 与 deploy/releases.json）。
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 1
+      - name: 计算镜像 tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::GITHUB_SHA 不是完整 40 位提交号：'$GITHUB_SHA'"
+            exit 1
+          fi
+          release_tag=""
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # 发布 tag 推送才额外推 vX.Y.Z 与 latest。tag 名已在 verify job 里
+            # 校验过（稳定版且等于三处版本号）；这里只再挡一次格式，防止把
+            # 分支名之类的东西当 tag 推上去。
+            case "$GITHUB_REF_NAME" in
+              v[0-9]*.[0-9]*.[0-9]*) release_tag="$GITHUB_REF_NAME" ;;
+              *) echo "::error::不是稳定版 tag：'$GITHUB_REF_NAME'"; exit 1 ;;
+            esac
+          fi
+          {
+            echo 'tags<<TAGS'
+            # sha-<完整提交> 永远推：它是可追溯的不可变标签。
+            echo "$IMAGE:sha-$GITHUB_SHA"
+            if [ -n "$release_tag" ]; then
+              echo "$IMAGE:$release_tag"
+              # latest 只是方便人看；宿主部署必须用 index digest（设计 §3/§4）。
+              echo "$IMAGE:latest"
+            fi
+            echo 'TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+        with:
+          # runtime 阶段要在 arm64 上 pip install（asyncpg 等是二进制 wheel），
+          # 所以 arm64 靠 QEMU 跑；Web 阶段用 $BUILDPLATFORM，不受影响。
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: 构建并推送（linux/amd64 + linux/arm64）
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 构建身份：三处标注与镜像内 LING_COMMIT 都从同一组 ARG 取值，
+          # 见 deploy/Dockerfile.api 的 runtime 阶段。
+          build-args: |
+            LING_COMMIT=${{ github.sha }}
+            LING_VERSION=${{ needs.verify.outputs.version }}
+            LING_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          # 不用 buildx 的自动证明（provenance/sbom）：本次没有 id-token 权限，
+          # 也不希望 index 里混进 attestation manifest。是否需要原生证明见设计 §3。
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: 记录 index digest 并交叉校验
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::buildx 没有返回合法的 index digest：'$DIGEST'"
+            exit 1
+          fi
+          # 独立核算：registry 里 index 的**原始字节** sha256 必须等于 buildx
+          # 报告的 digest。两者不一致说明我们记录错了摘要（或推的不是这个 ref）。
+          # imagetools 自身不可用时不阻断（那是工具问题），但不静默当成通过。
+          cross='（imagetools 交叉校验不可用，仅记录 buildx 报告的 digest）'
+          platforms='（未校验）'
+          if docker buildx imagetools inspect --raw "$IMAGE:sha-$GITHUB_SHA" > /tmp/index.json 2>/tmp/imagetools.err; then
+            computed="sha256:$(sha256sum /tmp/index.json | cut -d' ' -f1)"
+            if [ "$computed" != "$DIGEST" ]; then
+              echo "::error::index digest 不一致：buildx=$DIGEST 原始字节=$computed"
+              exit 1
+            fi
+            cross="原始 index 字节 sha256 = \`$computed\`（与 buildx 报告一致）"
+            # index 必须是 amd64 + arm64 两平台：少了哪个，多架构 tag 就名不副实，
+            # 那种机器拉下来会直接失败（或悄悄跑到别的架构层）。
+            platforms="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(sorted(str((m.get("platform") or {}).get("architecture", "?")) for m in (d.get("manifests") or []))))' /tmp/index.json)"
+            case "$platforms" in
+              amd64,arm64) ;;
+              *)
+                echo "::error::index 的平台不是 amd64 + arm64：'$platforms'"
+                exit 1
+                ;;
+            esac
+          else
+            echo "::warning::imagetools 交叉校验不可用：$(head -n 2 /tmp/imagetools.err | tr '\n' ' ')"
+          fi
+          {
+            echo "## 镜像 ${IMAGE}"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 镜像 | \`$IMAGE\` |"
+            echo "| **index digest（宿主部署唯一依据）** | \`$DIGEST\` |"
+            echo "| 源提交 | \`$GITHUB_SHA\` |"
+            echo "| 版本 | \`$VERSION\` |"
+            echo "| index 内的平台 | \`$platforms\` |"
+            echo "| tags | \`$(printf '%s' "$TAGS" | tr '\n' ' ' | sed 's/ $//')\` |"
+            echo ""
+            echo "宿主部署引用（不要用 latest 或单独的可变 tag）："
+            echo ""
+            echo '```'
+            echo "$IMAGE@$DIGEST"
+            echo '```'
+            echo ""
+            echo "- $cross"
+            echo "- 说明：多架构 tag 指向的 index digest 不是任一平台 image ID；宿主拉取后仍需按平台核对。"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 核对镜像标注、LING_COMMIT 与镜像内 Web 清单
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref="$IMAGE@$DIGEST"
+          # 按 index digest 拉：宿主将来也是这么拉的。runner 是 amd64，这里核对的
+          # 是 amd64 那一层；两个平台由同一次 buildx 调用、同一组 build-arg 生成。
+          docker pull "$ref"
+          label() {
+            docker image inspect --format '{{ index .Config.Labels "'"$1"'" }}' "$ref"
+          }
+          # /v1/version 的 commit 直接读容器 env 里的 LING_COMMIT；不启动
+          # entrypoint（不需要数据库），只覆盖入口跑一次 python。
+          env_commit="$(docker run --rm --entrypoint python "$ref" -c 'import os; print(os.environ.get("LING_COMMIT", ""))')"
+          label_commit="$(label org.opencontainers.image.revision)"
+          label_version="$(label org.opencontainers.image.version)"
+          label_source="$(label org.opencontainers.image.source)"
+
+          # 镜像内的 Web 清单必须能对着**镜像内的文件**重新校验通过：这是"清单
+          # 确实由这份镜像内容生成"的当场证明（整个过程不需要数据库）。
+          docker run --rm --entrypoint python "$ref" \
+            /app/deploy/web_manifest.py verify /app clients/web-console /app/web .ling-web-manifest.json
+          manifest_sha="$(docker run --rm --entrypoint python "$ref" -c 'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("/app/web/.ling-web-manifest.json").read_bytes()).hexdigest())')"
+          amd64_id="$(docker image inspect --format '{{.Id}}' "$ref")"
+
+          problems=""
+          note() { problems="${problems}${problems:+；}$1"; }
+          [ "$env_commit" = "$EXPECTED_COMMIT" ] || note "容器内 LING_COMMIT='$env_commit'≠'$EXPECTED_COMMIT'"
+          [ "$label_commit" = "$EXPECTED_COMMIT" ] || note "标注 revision='$label_commit'≠'$EXPECTED_COMMIT'"
+          [ "$label_version" = "$EXPECTED_VERSION" ] || note "标注 version='$label_version'≠'$EXPECTED_VERSION'"
+          [ "$label_source" = "$EXPECTED_SOURCE" ] || note "标注 source='$label_source'≠'$EXPECTED_SOURCE'"
+          printf '%s' "$manifest_sha" | grep -Eq '^[0-9a-f]{64}$' || note "镜像内清单摘要不是 64 位 hex：'$manifest_sha'"
+
+          if [ -n "$problems" ]; then
+            echo "::error::镜像标注与构建身份不一致：$problems"
+            exit 1
+          fi
+          {
+            echo ""
+            echo "### 构建身份核对（/v1/version ↔ OCI 标注）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 容器内 \`LING_COMMIT\` | \`$env_commit\` |"
+            echo "| \`org.opencontainers.image.revision\` | \`$label_commit\` |"
+            echo "| \`org.opencontainers.image.version\` | \`$label_version\` |"
+            echo "| \`org.opencontainers.image.source\` | \`$label_source\` |"
+            echo "| 镜像内清单 sha256（= \`GET /v1/version\` 的 \`web_manifest_sha256\`） | \`$manifest_sha\` |"
+            echo "| amd64 层 image ID（本次拉取所得） | \`$amd64_id\` |"
+            echo ""
+            echo "容器内 env、OCI 标注与源提交三者一致；镜像内清单已通过 \`web_manifest.py verify\`，"
+            echo "所以部署后 \`GET /v1/version\` 报的 commit / 清单摘要与标注对得上。"
+            echo "多架构 index digest 不是这个 image ID，宿主拉取后仍需按平台核对。"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 删除本次运行用的 registry 凭据
+        if: always()
+        run: docker logout ghcr.io || true
+
+  updater-image:
+    needs: [verify, ci, mobile, image]
+    # 与 image job 同一条理由：本 job 也持有 packages: write，来自 fork 的代码
+    # 不得接触这个 token（release.yml 没有 pull_request 触发，这里再挡一次）。
+    # 排在 image 之后是门禁顺序：api 镜像都发不出去时没必要再花 arm64 的构建时间。
+    if: >-
+      github.event_name != 'pull_request' && github.repository == 'qsbb/ling'
+    runs-on: ubuntu-latest
+    # 与 image job **完全一致**：恰好读源码 + 推 GHCR。没有 contents: write
+    # （不建 Release），也没有 id-token / attestations。
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # 与上面 `github.repository == 'qsbb/ling'` 是同一件事的两处固定值：改名/迁
+      # owner 时必须一起改，否则本 job 被 if 静默跳过（Release 也会被 needs 挡掉）。
+      IMAGE: ghcr.io/qsbb/ling-updater
+    # release job 用这个 digest 写 Release 正文（正文可编辑，不是可信来源）。
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 1
+      - name: 计算更新器镜像 tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::GITHUB_SHA 不是完整 40 位提交号：'$GITHUB_SHA'"
+            exit 1
+          fi
+          release_tag=""
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # tag 名已在 verify job 校验过（稳定版且等于三处版本号）；这里只再挡
+            # 一次格式，防止把分支名之类的东西当 tag 推上去。
+            case "$GITHUB_REF_NAME" in
+              v[0-9]*.[0-9]*.[0-9]*) release_tag="$GITHUB_REF_NAME" ;;
+              *) echo "::error::不是稳定版 tag：'$GITHUB_REF_NAME'"; exit 1 ;;
+            esac
+          fi
+          {
+            echo 'tags<<TAGS'
+            # sha-<完整提交> 永远推：可追溯的不可变标签。
+            echo "$IMAGE:sha-$GITHUB_SHA"
+            if [ -n "$release_tag" ]; then
+              echo "$IMAGE:$release_tag"
+            fi
+            # **刻意不推 latest**：更新器按 index digest 固定部署（compose.yaml 里
+            # 的 LING_UPDATER_IMAGE 就是 digest 插值），一个会动的 latest 只会
+            # 增加"被误用成部署目标"的面。api 镜像的 latest 是给人看的，这里不需要。
+            echo 'TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+        with:
+          # arm64 上要跑 `apk add`（python3/bash/coreutils），必须 QEMU 模拟。
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: 构建并推送更新器镜像（linux/amd64 + linux/arm64）
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: deploy/updater/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 构建身份写进 OCI 标注；下面的"内容冒烟检查"会拉回来逐项核对。
+          build-args: |
+            LING_COMMIT=${{ github.sha }}
+            LING_VERSION=${{ needs.verify.outputs.version }}
+            LING_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          # 与 image job 相同：不要 buildx 的自动证明（没有 id-token，也不想让
+          # index 里混进 attestation manifest）。
+          provenance: false
+          sbom: false
+          # cache scope 显式分开：api 与 updater 的层毫无交集，共用一个 scope 只会
+          # 互相淘汰（默认 scope 是全局的 buildkit）。
+          cache-from: type=gha,scope=ling-updater
+          cache-to: type=gha,mode=max,scope=ling-updater
+      - name: 记录 index digest 并交叉校验
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::buildx 没有返回合法的 index digest：'$DIGEST'"
+            exit 1
+          fi
+          # 与 image job 同一套独立核算：registry 里 index 的**原始字节** sha256
+          # 必须等于 buildx 报告的 digest；平台必须恰为 amd64 + arm64。
+          cross='（imagetools 交叉校验不可用，仅记录 buildx 报告的 digest）'
+          platforms='（未校验）'
+          if docker buildx imagetools inspect --raw "$IMAGE:sha-$GITHUB_SHA" > /tmp/index.json 2>/tmp/imagetools.err; then
+            computed="sha256:$(sha256sum /tmp/index.json | cut -d' ' -f1)"
+            if [ "$computed" != "$DIGEST" ]; then
+              echo "::error::index digest 不一致：buildx=$DIGEST 原始字节=$computed"
+              exit 1
+            fi
+            cross="原始 index 字节 sha256 = \`$computed\`（与 buildx 报告一致）"
+            platforms="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(sorted(str((m.get("platform") or {}).get("architecture", "?")) for m in (d.get("manifests") or []))))' /tmp/index.json)"
+            case "$platforms" in
+              amd64,arm64) ;;
+              *)
+                echo "::error::index 的平台不是 amd64 + arm64：'$platforms'"
+                exit 1
+                ;;
+            esac
+          else
+            echo "::warning::imagetools 交叉校验不可用：$(head -n 2 /tmp/imagetools.err | tr '\n' ' ')"
+          fi
+          {
+            echo "## 更新器镜像 ${IMAGE}"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 镜像 | \`$IMAGE\` |"
+            echo "| **index digest（更新器部署唯一依据）** | \`$DIGEST\` |"
+            echo "| 源提交 | \`$GITHUB_SHA\` |"
+            echo "| 版本 | \`$VERSION\` |"
+            echo "| index 内的平台 | \`$platforms\` |"
+            echo "| tags | \`$(printf '%s' "$TAGS" | tr '\n' ' ' | sed 's/ $//')\` |"
+            echo ""
+            echo "宿主部署引用（写进 \`LING_UPDATER_IMAGE\`，不要用 tag 或 latest）："
+            echo ""
+            echo '```'
+            echo "LING_UPDATER_IMAGE=$IMAGE@$DIGEST"
+            echo '```'
+            echo ""
+            echo "- $cross"
+            echo "- 说明：多架构 tag 指向的 index digest 不是任一平台 image ID；更新器镜像**没有** latest 标签。"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 核对镜像内容、非 root 与只读根下的启动
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref="$IMAGE@$DIGEST"
+          docker pull "$ref"
+          label() {
+            docker image inspect --format '{{ index .Config.Labels "'"$1"'" }}' "$ref"
+          }
+          problems=""
+          note() { problems="${problems}${problems:+；}$1"; }
+
+          # 1) 入口在**只读根**、无网络、非 root 的容器里真的能起来：`--help` 走
+          #    argparse，不碰 daemon、不写任何路径。镜像若偷偷依赖可写根，这里会
+          #    以 EROFS 失败。
+          if ! docker run --rm --read-only --network none \
+                --tmpfs /tmp:rw,noexec,nosuid,size=64m "$ref" --help \
+                > /tmp/updater-help.txt 2>/tmp/updater-help.err; then
+            note "只读根下 updater.py --help 失败：$(head -n 3 /tmp/updater-help.err | tr '\n' ' ')"
+          fi
+          grep -q -- '--publish-py' /tmp/updater-help.txt \
+            || note "updater.py --help 里没有 --publish-py（入口不是 updater.py？）"
+
+          # 2) 三样硬依赖：docker CLI / compose **插件** / python3。
+          #    `docker compose version` 不需要 daemon，所以这里能跑。
+          tools="$(docker run --rm --read-only --network none --tmpfs /tmp \
+            --entrypoint sh "$ref" \
+            -c 'docker --version; docker compose version; python3 --version' 2>&1)" \
+            || note "依赖自检命令失败：$(printf '%s' "$tools" | head -n 2 | tr '\n' ' ')"
+          printf '%s' "$tools" | grep -q 'Docker version' \
+            || note "docker CLI 不可用：$tools"
+          printf '%s' "$tools" | grep -q 'Docker Compose version' \
+            || note "compose 插件不可用（`docker compose` 不是插件形态）：$tools"
+          #    版本必须落在 **CI 覆盖的范围**（ci.yml 的 matrix 是 3.12/3.13），
+          #    不是"大于等于 3.12"。原来的 `3\.(1[2-9]|[2-9][0-9])` 把 3.14 也当
+          #    合格，于是 `apk add python3` 悄悄给出 3.14 时这里照样绿——而那正是
+          #    2026-11 这次 `catalog.py validate` 在镜像里炸掉的直接原因。Dockerfile
+          #    在构建期就断言过同一个区间，这里是运行期的第二道（不同检查点）。
+          printf '%s' "$tools" | grep -Eq '^Python 3\.1[23]\.' \
+            || note "镜像内 python3 不在 CI 覆盖范围（3.12/3.13）：$tools"
+
+          # 3) 发行包代码逐条在位，且镜像内 `catalog.py validate` 能对镜像内那份
+          #    releases.json 通过（证明"只依赖发行包代码 + 纯标准库"）。
+          for path in \
+            /app/updater.py \
+            /srv/ling-code/release/publish.py \
+            /srv/ling-code/release/catalog.py \
+            /srv/ling-code/backup/backup.sh \
+            /srv/ling-code/backup/restore_drill.sh \
+            /srv/ling-code/releases.json
+          do
+            docker run --rm --read-only --network none --tmpfs /tmp \
+              --entrypoint sh "$ref" -c "test -r '$path'" \
+              || note "镜像里缺少/不可读：$path"
+          done
+          if ! catalog_out="$(docker run --rm --read-only --network none --tmpfs /tmp \
+                --entrypoint python3 "$ref" \
+                /srv/ling-code/release/catalog.py validate 2>&1)"; then
+            note "镜像内 catalog.py validate 失败：$(printf '%s' "$catalog_out" | head -n 2 | tr '\n' ' ')"
+          fi
+
+          # 4) 非 root 与"镜像里没有 socket"。socket 只能是运行时挂载；镜像里出现
+          #    一个 socket 文件说明构建方式错了。
+          user_field="$(docker image inspect --format '{{.Config.User}}' "$ref")"
+          [ "$user_field" = "10002:10002" ] \
+            || note "镜像默认用户不是 10002:10002：'$user_field'"
+          runtime_uid="$(docker run --rm --read-only --network none --tmpfs /tmp \
+            --entrypoint sh "$ref" -c 'id -u')"
+          [ "$runtime_uid" = "10002" ] \
+            || note "容器内实际 uid='$runtime_uid'≠10002（镜像默认用户被覆盖？）"
+          if docker run --rm --read-only --network none --tmpfs /tmp \
+               --entrypoint sh "$ref" -c 'test -e /var/run/docker.sock'; then
+            note "镜像里不该有 /var/run/docker.sock（socket 只能在运行时挂载）"
+          fi
+
+          # 5) 构建身份：标注必须与本次提交/版本/仓库一致。
+          label_commit="$(label org.opencontainers.image.revision)"
+          label_version="$(label org.opencontainers.image.version)"
+          label_source="$(label org.opencontainers.image.source)"
+          [ "$label_commit" = "$EXPECTED_COMMIT" ] || note "标注 revision='$label_commit'≠'$EXPECTED_COMMIT'"
+          [ "$label_version" = "$EXPECTED_VERSION" ] || note "标注 version='$label_version'≠'$EXPECTED_VERSION'"
+          [ "$label_source" = "$EXPECTED_SOURCE" ] || note "标注 source='$label_source'≠'$EXPECTED_SOURCE'"
+
+          if [ -n "$problems" ]; then
+            echo "::error::更新器镜像内容核对失败：$problems"
+            exit 1
+          fi
+          {
+            echo ""
+            echo "### 更新器镜像内容核对"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 默认用户 | \`$user_field\` |"
+            echo "| 容器内 uid | \`$runtime_uid\` |"
+            echo "| docker / compose / python3 | \`$(printf '%s' "$tools" | tr '\n' ';' | sed 's/;$//')\` |"
+            echo "| 内置目录 | \`/app/updater.py\` + \`/srv/ling-code/{release,backup,releases.json}\` |"
+            echo "| 只读根启动 | \`--read-only --network none\` 下 \`updater.py --help\` 通过 |"
+            echo "| 镜像内目录校验 | \`catalog.py validate\` 通过 |"
+            echo "| 标注 revision / version / source | \`$label_commit\` / \`$label_version\` / \`$label_source\` |"
+            echo ""
+            echo "这些检查**没有**替代真实构建验证：镜像能否构建、arm64 能否在 QEMU 下跑起来，"
+            echo "由本 job 自己的 buildx 结果回答（构建失败即 job 红）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 删除本次运行用的 registry 凭据
+        if: always()
+        run: docker logout ghcr.io || true
+
+  release:
+    needs: [ci, mobile, image, updater-image]
+    # 手动触发只验证流水线，不建 Release。tag 推送才发布。
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 创建 GitHub Release（正文附两个 index digest）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          API_DIGEST: ${{ needs.image.outputs.digest }}
+          UPDATER_DIGEST: ${{ needs.updater-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # digest 缺一个就不发：它是 job outputs（不是正文），到这里还没值，
+          # 说明上游 job 没跑完/没输出，宁可红也不要发一个没有摘要的 Release。
+          for entry in "ling-api=$API_DIGEST" "ling-updater=$UPDATER_DIGEST"; do
+            name="${entry%%=*}"
+            digest="${entry#*=}"
+            if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::$name 没有合法的 index digest（'$digest'）：拒绝创建 Release"
+              exit 1
+            fi
+          done
+          # 先按正文模板取 GitHub 自动生成的 notes，再拼上 digest 段，最后**一次**
+          # 创建。顺序很重要：生成 notes 失败时 Release 根本还没被建出来，不会留下
+          # 一个"已发布但缺摘要"的版本（先 create 再 edit 的写法有这个窗口）。
+          body="$(mktemp)"
+          gh api --method POST "repos/$GH_REPO/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" --jq .body > "$body"
+          {
+            cat "$body"
+            echo
+            echo "## 部署用 index digest"
+            echo
+            echo "| 镜像 | index digest |"
+            echo "| --- | --- |"
+            echo "| \`ghcr.io/qsbb/ling-api\` | \`$API_DIGEST\` |"
+            echo "| \`ghcr.io/qsbb/ling-updater\` | \`$UPDATER_DIGEST\` |"
+            echo
+            echo "宿主部署引用（两个都要用 digest，不要用 tag）："
+            echo
+            echo '```'
+            echo "LING_APP_IMAGE=ghcr.io/qsbb/ling-api@$API_DIGEST"
+            echo "LING_UPDATER_IMAGE=ghcr.io/qsbb/ling-updater@$UPDATER_DIGEST"
+            echo '```'
+            echo
+            echo "> **本正文是可编辑内容，不是摘要的可信来源。** 部署只认对应 workflow run"
+            echo "> 的 job summary 里记录的 index digest（以及仓库内 \`deploy/releases.json\`"
+            echo "> 目录里的记录）。上面两个值只方便人复制；粘贴前请与 summary 核对。"
+          } > "$body.final"
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file "$body.final"
+
+# ---------------------------------------------------------------------------
+# actions 固定到完整 commit SHA
+#
+# 解析方式（2026-11-03 首次执行，2026-11-04 为 updater-image job 复核一遍；
+# gh 已登录 github.com）：
+#   gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq .object.sha
+# 若 .object.type == "tag"（annotated tag），再取一层：
+#   gh api repos/<owner>/<repo>/git/tags/<上面那个 sha> --jq .object.sha
+# 本次六个 tag 都是 lightweight tag（type=commit），所以第一条命令给出的就是
+# 提交 SHA；每条都在注释里记了对应 tag。updater-image 没有引入新 action：
+# checkout / setup-qemu / setup-buildx / login / build-push 全部复用下表同一个
+# SHA（同一个 action 在同一份文件里出现两种版本只会让缓存与排查更难）。
+#
+#   action                          tag  完整 SHA
+#   actions/checkout                v4   11d5960a326750d5838078e36cf38b85af677262
+#   actions/setup-python            v5   a26af69be951a213d495a4c3e4e4022e16d87065
+#   docker/setup-qemu-action        v3   c7c53464625b32c7a7e944ae62b3e17d2b600130
+#   docker/setup-buildx-action      v3   8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+#   docker/login-action             v3   c94ce9fb468520275223c153574b00df6fe4bcc9
+#   docker/build-push-action        v6   10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+#
+# 升级 action 时重复上面的解析并把新 SHA 写回对应行，不要退回 @vN。
+# ---------------------------------------------------------------------------

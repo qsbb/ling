@@ -1,0 +1,313 @@
+{
+  "$defs": {
+    "InputPart": {
+      "additionalProperties": false,
+      "properties": {
+        "media_ref": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Ref"
+        },
+        "mime_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mime Type"
+        },
+        "modality": {
+          "$ref": "#/$defs/Modality"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        }
+      },
+      "required": [
+        "modality"
+      ],
+      "title": "InputPart",
+      "type": "object"
+    },
+    "Modality": {
+      "enum": [
+        "text",
+        "audio",
+        "image",
+        "video",
+        "structured"
+      ],
+      "title": "Modality",
+      "type": "string"
+    },
+    "Origin": {
+      "description": "经历来源。六者永不混写为同一种事实。",
+      "enum": [
+        "simulated",
+        "user_statement",
+        "external_observation",
+        "verified_source",
+        "tool_receipt",
+        "model_inference"
+      ],
+      "title": "Origin",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/InteractionEnvelope.schema.json",
+  "additionalProperties": false,
+  "description": "入站交互信封。渠道只做协议翻译，不改写语义。",
+  "properties": {
+    "account_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Account Ref"
+    },
+    "audience_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：受众由 window_ref + visibility 决定，不从信封传",
+      "title": "Audience Ref"
+    },
+    "connector_instance": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Connector Instance",
+      "type": "string"
+    },
+    "consent_revision": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Consent Revision"
+    },
+    "device_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：目前没有设备概念，读它永远得到 None",
+      "title": "Device Ref"
+    },
+    "event_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Id"
+    },
+    "external_event_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "External Event Id",
+      "type": "string"
+    },
+    "media_refs": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Media Refs",
+      "type": "array"
+    },
+    "mentions_actor": {
+      "default": false,
+      "title": "Mentions Actor",
+      "type": "boolean"
+    },
+    "modality": {
+      "$ref": "#/$defs/Modality",
+      "default": "text"
+    },
+    "occurred_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Occurred At"
+    },
+    "origin": {
+      "$ref": "#/$defs/Origin",
+      "default": "user_statement"
+    },
+    "parts": {
+      "items": {
+        "$ref": "#/$defs/InputPart"
+      },
+      "title": "Parts",
+      "type": "array"
+    },
+    "received_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Received At"
+    },
+    "reply_to": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reply To"
+    },
+    "scene_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：场景由 presence 域推断，不从信封传",
+      "title": "Scene Ref"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sender_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "发送者显示名，仅作标签；同名不同人靠 account_ref 区分",
+      "title": "Sender Name"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trace Id"
+    },
+    "turn_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：入站时轮次还不存在（由 bridge 创建）",
+      "title": "Turn Ref"
+    },
+    "window_ref": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Window Ref",
+      "type": "string"
+    }
+  },
+  "required": [
+    "connector_instance",
+    "external_event_id",
+    "window_ref"
+  ],
+  "title": "InteractionEnvelope",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

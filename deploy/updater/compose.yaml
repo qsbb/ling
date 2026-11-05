@@ -1,0 +1,187 @@
+# 独立更新器 Compose 项目（`ling-updater`）——设计 §4 的「更新器与信任边界」。
+#
+# 这是一个**独立**的 Compose 项目，与应用主文件（`deploy/compose.image.yaml`，
+# 项目名 `ling`）没有任何 `-f` 叠加关系，也**不**在这里定义 api/worker/db：
+# 它只跑一个常驻更新器容器，`docker compose -p ling-updater up -d` 不会重建应用，
+# 应用 `compose up` 也不会重建更新器（设计 §4：「不随每次 API 重启而重建自己」）。
+#
+# 为什么它必须单独、必须挂 Docker socket
+# =====================================
+# 更新器要停/起应用容器、拉镜像、单次执行迁移、在容器网络内验证，这些只有
+# Docker socket 能做。**挂 socket 就等于能控制宿主**：这不是加固能消除的风险，
+# 只能限制谁能用（只有这一个容器）、限制它写哪儿（只读根 + 三个 rw 目录：
+# 请求/状态/备份，加两个 rw 单文件：`.env` 与安装锁）、限制它的入口（固定镜像
+# digest、参数全走环境变量、不接受请求里的 shell/路径）。
+#
+# 所需内容（镜像由 CI 以固定 digest 发布，本仓库暂未附带构建，属于下一批）：
+# - python3.13（更新器与 publish.py 都只用标准库）、bash、coreutils/sha256sum
+#   （`deploy/backup/backup.sh` 的依赖）、docker CLI（只作为 socket 客户端）；
+# - entrypoint 固定为 `python3 /app/updater.py`，**不要**在 compose 里传
+#   `command:`：所有参数都从环境变量映射，Compose 不能成为 argv/shell 注入面。
+#
+# 用法（宿主）：
+#   # 1) 应用安装根、更新器目录与更新器 env 由 `ling install` 准备：
+#   #    - 写出 `.env`（0600）与 `updater/.env`（0600，本文件的 `--env-file`）；
+#   #    - 预建 0600 的 `.ling-install.lock`（单文件挂载的源必须已存在）；
+#   #    - 创建 `updater/requests`（2770 + setgid）、`updater/requests/archive`
+#   #      （2750）、`updater/state`（0750）；更新通道共享组 = `LING_UPDATER_GID`；
+#   #    - 把 `.env`/锁/上述目录/备份目录 chown 成 `LING_UPDATER_UID:GID`。
+#   #    安装状态 `layout.updater` 与 `updater` 记录这些宿主路径、socket、gid
+#   #    与 `layout.updater.update_channel`（权限方案 + 实际 stat）。
+#   # 2) 本文件**不**替你建宿主目录、也不放宽权限；缺目录就起不来（有意的）。
+#   #    `<requests>` 要让 API 的 uid 10001 可写、其他不可写——靠**共享组**
+#   #    （见下面「API 与更新器的共享组」），不是 0777。
+#   # 3) 静态核对 / 启动（`ling install --with-updater` 会替你做这两步；手工排查时用）：
+#   docker compose -p ling-updater -f deploy/updater/compose.yaml \
+#     --env-file <安装根>/updater/.env config -q
+#   docker compose -p ling-updater -f deploy/updater/compose.yaml \
+#     --env-file <安装根>/updater/.env up -d
+#   # 缺 LING_UPDATER_IMAGE / LING_UPDATER_GID / LING_DOCKER_GID 任何一个，
+#   # `config` 都会直接失败——不会静默回退到 root 或 latest。
+#
+# 挂载与权限（**只有这个容器**挂 docker socket）
+# ===========================================
+# | 宿主路径                             | 容器内                        | 权限 | 为什么 |
+# | ------------------------------------ | ----------------------------- | ---- | ------ |
+# | Docker socket                        | /var/run/docker.sock          | rw   | 只能靠它操作 daemon（socket 不能只读挂） |
+# | 受限 env（**单文件**）               | /srv/ling/.env                | rw   | 更新成功后必须把目标摘要真正写回宿主 `.env`；否则任何一次手动 `compose up` 都退回旧镜像 |
+# | 跨工具安装锁（**单文件**，预先存在） | /srv/ling/.ling-install.lock  | rw   | 与 install.sh / ling install / publish.py 的 `.ling-install.lock` 是同一把（flock 在文件 inode 上，必须挂在宿主同一个文件上） |
+# | compose 文件组                        | /srv/ling/compose             | ro   | `config`/`pull`/`run`/`up`/备份必须用同一组 `-f`；更新器**不**改写 compose |
+# | 发行包 deploy 目录（publish/backup） | /srv/ling-code（只读）        | ro   | 复用 `publish.py` 与 `backup.sh`，不另写一套发布实现 |
+# | 请求目录（API 写请求）               | /run/ling-updater/requests    | rw   | 更新器读请求、`rename` 认领、归档到 `archive/`；API 靠共享组写进请求文件 |
+# | 状态目录（持久）                     | /var/lib/ling-updater         | rw   | 持久任务/单飞锁/私有日志/维护门禁副本/脱敏状态/env 回滚副本；`status.json` 就在这里 |
+# | 备份根目录（与 cron 同一个）         | /var/lib/ling-backups         | rw   | 复用 `backup.sh` 写本次快照；已迁移后失败**不**恢复 dump |
+#
+# 为什么是三个精确挂载、而不是整目录
+# ---------------------------------
+# 早先的 `${LING_INSTALL_DIR}:/srv/ling:ro` 是**错的**：整个安装目录只读，更新器
+# 改不了 `.env`，只能靠 `LING_APP_IMAGE` 覆盖插值启动，宿主上持久化的配置仍指向
+# 旧摘要——手动一次 `docker compose up` 就把服务退回旧镜像，更新等于没做；而且
+# 环境所在目录只读，`.ling-install.lock` 也建不出来，与 install.sh / publish.py
+# 之间没有互斥。现在只放开更新器**真正需要**的两个单文件，compose 文件组仍然只读。
+#
+# 注意：
+# - 两个单文件 bind mount 的**源**必须已存在：`.env` 由安装器写出，
+#   `.ling-install.lock` 由安装器预建（0600，`ling install` 的 create_layout
+#   负责）。Docker 不会替你创建缺的源文件，缺了会直接启动失败——这是有意的：
+#   宁可起不来，也不要一个拿不到跨工具锁的更新器。
+# - 更新器只获得「写这两个文件」的能力：`.env` 是原地重写（同目录建临时文件
+#   不可能，见 `write_env_in_place`），锁文件只 open/flock、从不改名换 inode。
+# - 私有的 GHCR 包需要宿主的 docker 凭据（`~/.docker/config.json`）。本文件
+#   **不**默认挂它；需要时用一份受控 override 只读追加，不要写进仓库。
+# - 更新器不发布任何端口、不接公网入站；`updater-egress` 只是为了
+#   `docker manifest inspect`（CLI 侧发起的注册表查询）能在本机通网。
+# - `read_only: true` + `tmpfs` + `no-new-privileges` + `cap_drop: ALL`
+#   只能收窄容器内的写面；socket 的宿主级风险依旧存在（见上）。
+#
+# 非 root 与宿主权限（谁负责什么）
+# ==============================
+# 容器进程是**非 root**（`user:` 必填 uid/gid + `group_add:` socket gid），
+# 所以下面这些宿主路径必须让那个 uid/gid 真的能读写，否则只是换个方式坏掉：
+#
+# | 宿主路径                        | 期望 | 由谁准备 |
+# | ------------------------------- | ---- | -------- |
+# | `<安装根>/.env`（单文件 ro→rw） | 0600 | `ling install` 写出，随后 chown 给更新器 uid/gid（根安装时是 10002，以安装者身份安装时是同 uid，属主天然匹配） |
+# | `<安装根>/.ling-install.lock`   | 0600 | 安装器预建并 chown，flock 用的是宿主同一个 inode |
+# | `<安装根>/updater/state`        | 0750 | 安装器创建并 chown；持久任务/锁/日志/脱敏状态（`status.json` 0644 给 API 只读） |
+# | `<安装根>/updater/requests`     | 2770 | 安装器创建并 chown；setgid 让 API 写出的请求文件继承**共享组**，更新器按组读 |
+# | `<安装根>/updater/requests/archive` | 2750 | 安装器预建：更新器 `mkdir(0700)` 只在缺目录时生效，缺了它 API 读不到归档就 fail closed |
+# | 备份根目录                      | 目录本身可写 | 已存在则安装器 chown（不改 mode）；`--with-updater` 时缺目录会创建（父目录必须在） |
+# | `<安装根>/compose`（ro）        | 0700 | 安装器创建；只读挂载，更新器读得到即可 |
+#
+# API 与更新器的共享组
+# ====================
+# API 容器（uid 10001/gid 10001）与更新器（uid 10002 或安装者 uid）是不同 uid，
+# 所以请求目录的写权限只能靠**共享组**：共享组 = `LING_UPDATER_GID`（更新器主组，
+# 也是安装器创建这些目录时的属组——普通用户安装也能设上，不需要 root）。
+# API 在 `deploy/compose.image.yaml` 里用 `group_add: ${LING_UPDATE_SHARED_GID}`
+# 加入同一个 gid：requests 的组写位让它写请求、state 的组读位让它读 status.json。
+# 更新器这边**不需要**额外的 `group_add`：它的主组就是共享组（owner 位 + 组位
+# 都成立），所以本文件的 `group_add` 只有 docker socket 的 gid。
+#
+# 如果安装器不是 root、却显式要求 `LING_UPDATER_UID/GID=10002`，chown 会失败：
+# 此时 `--with-updater` **拒绝启动**（不启动一个读不到 0600 `.env` 的更新器），
+# 并给出“以 root 重跑或改回安装者身份”的下一步。普通安装只记录该问题，不影响应用。
+# 本文件**不**加 `privileged`，也**不**把 `read_only` 去掉来“绕过”权限问题。
+
+name: ling-updater
+
+services:
+  updater:
+    # 固定 digest（必填插值）：没配 / 配了 latest 或可变 tag 都直接失败，
+    # 免得「更新器被一次 `pull latest` 换掉」而不自知。
+    image: ${LING_UPDATER_IMAGE:?更新器必须是固定 digest：ghcr.io/qsbb/ling-updater@sha256:<64 位 hex>，不接受 latest/可变 tag/空值}
+    restart: unless-stopped
+    # 非 root：这里**没有** root 默认值。镜像本身是 `USER 10002:10002`，但 compose
+    # 的 `user:` 会覆盖镜像默认值，所以两个值都必须显式给出：
+    #   LING_UPDATER_UID  容器内进程 uid（缺省 10002，与镜像一致）；
+    #   LING_UPDATER_GID  容器内主组 gid（**必填**：宿主上 `.env`/安装锁/状态/请求/
+    #                     备份这些文件与目录由安装器按这个 gid chown；缺省成 0 就
+    #                     等于“悄悄用 root 跑”，正是本批要消灭的行为）。
+    # `ling install` 会把实际选定的值写进更新器 `.env`（本文件经 `--env-file`
+    # 读取），所以正常安装路径不需要手工 export 这两个变量。
+    user: "${LING_UPDATER_UID:-10002}:${LING_UPDATER_GID:?更新器主组 gid 必填：请显式给出容器内运行组（通常 10002，与镜像一致；不要留空、不要用 0）}"
+    # Docker socket 的组 gid **各宿主不同**（systemd 常见 998/999/994，Docker
+    # Desktop / 群晖 / NAS 又不同），猜不得，也不能靠 `user:` 的主组去凑——这里
+    # 显式要求一个单独的补充组：容器进程 = uid LING_UPDATER_UID + 主组
+    # LING_UPDATER_GID + 补充组 LING_DOCKER_GID，socket 的 group 位因此生效。
+    # 取法：`stat -c %g /var/run/docker.sock`（macOS：`stat -f %g <socket>`）。
+    group_add:
+      - "${LING_DOCKER_GID:?请显式给出宿主 docker socket 的 gid（stat -c %g /var/run/docker.sock）；缺失时拒绝启动，不回退 root}"
+    environment:
+      # 容器内路径全部固定；宿主路径只在 volumes 里出现。
+      LING_UPDATER_REQUESTS_DIR: /run/ling-updater/requests
+      LING_UPDATER_STATE_DIR: /var/lib/ling-updater
+      LING_UPDATER_STATUS_FILE: /var/lib/ling-updater/status.json
+      LING_COMPOSE_FILE: /srv/ling/compose/compose.image.yaml
+      LING_COMPOSE_ENV_FILE: /srv/ling/.env
+      LING_COMPOSE_PROJECT: ${LING_APP_COMPOSE_PROJECT:-ling}
+      # 可选 override（例如镜像模式的 WS 端口）：必须与应用同一组 -f。
+      # 留空 = 只有主文件；指向的文件也要落在 /srv/ling/compose 只读挂载里。
+      LING_COMPOSE_OVERRIDE: ${LING_APP_COMPOSE_OVERRIDE:-}
+      LING_BACKUP_DIR: /var/lib/ling-backups
+      LING_UPDATER_BACKUP_SCRIPT: /srv/ling-code/backup/backup.sh
+      LING_UPDATER_PUBLISH_PY: /srv/ling-code/release/publish.py
+      LING_UPDATER_POLL_SECONDS: ${LING_UPDATER_POLL_SECONDS:-5}
+      PYTHONUNBUFFERED: "1"
+      # 只读根 + 只读挂载：不写 .pyc，避免每次导入都产生无意义的写入尝试。
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      # 1) Docker socket：**只有更新器**挂它。socket 无法只读挂载（CLI 要写）。
+      - ${LING_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # 2) 受限 env（**单文件 rw**）：更新成功必须把 LING_APP_IMAGE 真正写回宿主。
+      #    别退回「整目录只读 + 进程环境覆盖」——那会让宿主配置永远停在旧摘要。
+      - ${LING_INSTALL_DIR:?请给应用安装根目录（含 compose/、.env 与 .ling-install.lock）}/.env:/srv/ling/.env:rw
+      # 3) 跨工具安装锁（**单文件 rw**，必须预先存在）：与 install.sh / ling install /
+      #    publish.py 同一把 flock。flock 绑在 inode 上，所以必须挂宿主同一个文件，
+      #    不能用目录/临时文件替代；安装器预建（0600）。
+      - ${LING_INSTALL_DIR:?请给应用安装根目录（含 compose/、.env 与 .ling-install.lock）}/.ling-install.lock:/srv/ling/.ling-install.lock:rw
+      # 4) 应用 compose 文件组（**只读目录**）：安装器布局 <安装根>/compose/compose.image.yaml
+      - ${LING_INSTALL_DIR:?请给应用安装根目录（含 compose/、.env 与 .ling-install.lock）}/compose:/srv/ling/compose:ro
+      # 5) 发行包的 deploy 目录（只读）：publish.py / backup.sh / web_manifest.py
+      - ${LING_UPDATER_CODE_DIR:?请给发行包 deploy 目录（含 release/publish.py 与 backup/backup.sh）}:/srv/ling-code:ro
+      # 6) 请求目录（rw）：安装器创建 **2770 + setgid** 并 chown 给更新器 uid/共享组。
+      #    API 用 `group_add` 加入同一个组写请求；setgid 让 API 写出的 0640
+      #    请求文件继承共享组，更新器按"组"读得到。**不要**放宽成 0777。
+      - ${LING_UPDATER_REQUESTS_DIR:?请给请求目录（API 可写、其他不可写）}:/run/ling-updater/requests
+      # 7) 状态目录（rw，持久）：任务/锁/私有日志/维护门禁副本/脱敏状态/env 回滚副本。
+      #    安装器创建 0750（属组=共享组）：API 以只读方式挂同一个目录，能读
+      #    0644 的 `status.json`；里面的私有文件都是 0600，API 读不到内容。
+      - ${LING_UPDATER_STATE_DIR:?请给更新器状态目录（0750，持久；API 只读挂载）}:/var/lib/ling-updater
+      # 8) 备份根目录（rw）：与 cron 的 LING_BACKUP_DIR 必须是同一个
+      - ${LING_BACKUP_DIR:?请给备份根目录（与 cron 的 LING_BACKUP_DIR 一致）}:/var/lib/ling-backups
+    # 只读根**不要**为了绕开非 root 写权限而放开：宿主侧该 chown 的由安装器做，
+    # 容器内需要写的只有挂进来的那几个目录（+/tmp tmpfs）。也不要加 privileged。
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    # 不发布任何端口：更新器没有 HTTP 入口，只能通过宿主文件与 docker socket 被驱动。
+    networks: [updater-egress]
+
+networks:
+  # 普通 bridge：只用于 `docker manifest inspect`（注册表查询由 CLI 发起）。
+  # 不要设 internal: true —— 那样连不上 GHCR，预检会一直失败；
+  # 也不要给这个网络加任何宿主端口映射。
+  updater-egress: {}

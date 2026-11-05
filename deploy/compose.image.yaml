@@ -1,0 +1,310 @@
+# ling 镜像部署主文件（镜像模式）。
+#
+# **与 deploy/compose.yaml 择一，禁止叠加**：那份是源码模式主文件，带 build:、
+# 前端 dist bind 与更新通道 bind；两份一起 -f 会让旧的 build/挂载继续生效。
+# 镜像模式只叠加**本文件**的 WS override（deploy/compose.image.ws.example.yaml）。
+#
+# 用法（部署目录里只放本文件、受限 env 与发布脚本，宿主不需要源码树）：
+#
+#   # 1) deploy/.env（0600）里写固定摘要，不要写 latest 或可变 tag：
+#   #    LING_APP_IMAGE=ghcr.io/qsbb/ling-api@sha256:<64 位十六进制 index digest>
+#   # 2) 先静态核对（缺 LING_APP_IMAGE 时这一步直接失败）：
+#   docker compose -f deploy/compose.image.yaml --project-name ling \
+#     --env-file deploy/.env config -q
+#   # 3) 拉取并切换（拉取前先备份，见 docs/IMAGE-DEPLOYMENT-DESIGN.md §5）：
+#   docker compose -f deploy/compose.image.yaml --project-name ling \
+#     --env-file deploy/.env pull api worker
+#
+# 与源码模式 compose.yaml 的差别（依据 docs/IMAGE-DEPLOYMENT-DESIGN.md §4）：
+# - api/worker 只认同一个**必填**镜像 LING_APP_IMAGE。缺值/空值时
+#   `docker compose config` 直接报错并指名缺哪个变量，不会悄悄回退到别的镜像。
+# - 没有 build:、没有 `/app/web` 前端 bind、没有任何源码 bind：Web 构建产物
+#   已烤进镜像，`LING_WEB_DIST=/app/web` 继续生效。
+# - API 默认 LING_RUN_MIGRATIONS=0：迁移是发布流程里的**一次显式动作**
+#   （`run --rm --no-deps -e LING_RUN_MIGRATIONS=1 api migrate`），
+#   不让 api 启动时反复隐式迁移。
+# - 更新通道**只接 api**：`/run/ling-update/requests`（rw）与
+#   `/run/ling-update/status`（ro）两条挂载的宿主路径都是**必填插值**（由
+#   `ling install` 写进受限 .env）——缺值时 `docker compose config` 直接失败，
+#   不会静默少挂一条（少挂的后果是 POST 必然被拒，而且看不出原因）。
+#   API 只加入这两个目录的**共享组**（`group_add`），worker 一条都不挂。
+#   `LING_UPDATE_ENABLED` 仍固定 "0"：挂上目录 ≠ 打开开关，执行器协议尚未验收，
+#   网页更新还没正式启用。
+# - 配置与密钥仍由宿主受限 .env 注入，不写进镜像。
+#
+# 约束（沿用源码模式）：
+# - 数据库不对外暴露端口，只在内网网络里。
+# - 容器以非 root 运行，根文件系统只读 + tmpfs。
+# - healthcheck 区分活着（healthz）、数据库就绪（readyz）。
+
+name: ling
+
+# 容器日志上限：个人服务器长期无人值守，默认 json-file 驱动会无限增长，
+# 几个月就能把磁盘写满（写满后数据库会直接不可写）。
+# 50MB × 3 个文件 = 单容器最多 150MB，3 个服务（db/api/worker）合计约 450MB 封顶。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+x-app-env: &app-env
+  LING_ENV: production
+  LING_DATABASE_URL: postgresql+asyncpg://ling:${POSTGRES_PASSWORD:-ling-dev-password}@db:5432/ling
+  LING_REQUIRE_POSTGRES: "1"
+  LING_BOOTSTRAP_ADMIN: ${LING_BOOTSTRAP_ADMIN:-ling}
+  LING_BOOTSTRAP_ADMIN_PASSWORD: ${LING_BOOTSTRAP_ADMIN_PASSWORD:-}
+  LING_TEST_MODE: ${LING_TEST_MODE:-0}
+  LING_ROOT_KEY: ${LING_ROOT_KEY:-}
+  LING_COOKIE_SECURE: ${LING_COOKIE_SECURE:-0}
+  LING_WEB_DIST: /app/web
+  LING_DATA_DIR: /data
+  LING_PROJECT_ROOT: /app
+  # 单个请求体上限（字节）。默认 32MiB，等于原 nginx 的 `client_max_body_size 32m`。
+  # 同样受"逐项白名单"约束：不写这一行，用户在 .env 里配了也进不了容器，
+  # 永远停在 32MiB，而且不会有任何提示。
+  LING_MAX_BODY_BYTES: ${LING_MAX_BODY_BYTES:-}
+  # OneBot V11（NapCat / Lagrange / go-cqhttp）。不传这些变量，
+  # 用户即使在 .env 里配好，容器内也读不到 —— 表现为"配了但连不上"。
+  LING_ONEBOT_API_BASE: ${LING_ONEBOT_API_BASE:-}
+  LING_ONEBOT_ACCESS_TOKEN: ${LING_ONEBOT_ACCESS_TOKEN:-}
+  LING_ONEBOT_SECRET: ${LING_ONEBOT_SECRET:-}
+  LING_ONEBOT_SELF_ID: ${LING_ONEBOT_SELF_ID:-}
+  LING_ONEBOT_INSTANCE_ID: ${LING_ONEBOT_INSTANCE_ID:-onebot-default}
+  LING_ONEBOT_SUPPORTS_GROUP: ${LING_ONEBOT_SUPPORTS_GROUP:-1}
+  LING_ONEBOT_PROACTIVE: ${LING_ONEBOT_PROACTIVE:-0}
+  # 反向 WS **服务端**（ling 监听、NapCat 连过来）。这三项原本**根本没列**，
+  # 于是设了也进不了容器：表现为"配了 WS 端口却永远没监听"，
+  # 而且日志里没有任何异常。WS 默认不启用（LING_ONEBOT_WS_PORT 留空即可）。
+  #
+  # LING_ONEBOT_WS_TOKEN **必填**（配了端口就必须同时配它）：没有 token 时
+  # WS 服务端会**拒绝启动**（fail-closed），端口一开就等于把"往对话链路推事件"
+  # 的能力交给任何能连上的人。
+  # LING_ONEBOT_WS_HOST 默认 127.0.0.1，只有显式改成 0.0.0.0 才对外。
+  LING_ONEBOT_WS_PORT: ${LING_ONEBOT_WS_PORT:-}
+  LING_ONEBOT_WS_TOKEN: ${LING_ONEBOT_WS_TOKEN:-}
+  LING_ONEBOT_WS_HOST: ${LING_ONEBOT_WS_HOST:-127.0.0.1}
+  # 反向 WS **客户端**（ling 主动连 NapCat 的 wsServer）。这条原来**完全没列**，
+  # 于是设了也进不了容器——表现为"配了 WS 地址，容器里一次都没连过"，
+  # 而且日志里一句异常都没有。走这个方向时本机不需要开任何入站端口。
+  LING_ONEBOT_WS_URL: ${LING_ONEBOT_WS_URL:-}
+  # 媒体域名白名单（逗号分隔，可覆盖默认的 QQ/微信图床）。留空 = 用默认值。
+  LING_ONEBOT_MEDIA_HOSTS: ${LING_ONEBOT_MEDIA_HOSTS:-}
+  # 语义检索（可选）。只在 env.example 里写是不够的——变量必须真正传进容器，
+  # 否则配了 BGE 也永远走 BM25 降级，表现为"配了却没效果"。
+  # QQ 官方机器人（WebSocket 网关，不需要公网回调地址、不需要扫码）。
+  #
+  # **必须列在这里**：x-app-env 是逐项白名单，不写的变量即使在 .env 里配好
+  # 也进不了容器——表现为"配了 qqbot 却没连上"，而且日志里一句异常都没有。
+  # 这个坑在 OneBot 那一节已经踩过一次，别再踩第二次。
+  LING_QQBOT_ENABLED: ${LING_QQBOT_ENABLED:-0}
+  LING_QQBOT_APP_ID: ${LING_QQBOT_APP_ID:-}
+  LING_QQBOT_CLIENT_SECRET: ${LING_QQBOT_CLIENT_SECRET:-}
+  LING_QQBOT_INSTANCE_ID: ${LING_QQBOT_INSTANCE_ID:-qqbot-default}
+  LING_QQBOT_SANDBOX: ${LING_QQBOT_SANDBOX:-1}
+  LING_QQBOT_PROACTIVE: ${LING_QQBOT_PROACTIVE:-0}
+  LING_QQBOT_SUPPORTS_GROUP: ${LING_QQBOT_SUPPORTS_GROUP:-1}
+  # 出入许可：qqbot 那边名单里放的是 **openid**（不是 QQ 号）
+  LING_ACCESS_MODE: ${LING_ACCESS_MODE:-whitelist}
+  LING_ACCESS_LIST: ${LING_ACCESS_LIST:-}
+  # 勿扰时段与"今日已发几条"按这个时区算；不填会退回 UTC（东八区错 8 小时）
+  LING_USER_TIMEZONE: ${LING_USER_TIMEZONE:-}
+  LING_EMBEDDING_API_BASE: ${LING_EMBEDDING_API_BASE:-}
+  LING_EMBEDDING_ACCOUNT_ID: ${LING_EMBEDDING_ACCOUNT_ID:-}
+  LING_EMBEDDING_API_KEY: ${LING_EMBEDDING_API_KEY:-}
+  LING_EMBEDDING_MODEL: ${LING_EMBEDDING_MODEL:-@cf/baai/bge-m3}
+  LING_RERANK_API_BASE: ${LING_RERANK_API_BASE:-}
+  LING_RERANK_API_KEY: ${LING_RERANK_API_KEY:-}
+  LING_RERANK_MODEL: ${LING_RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+  # 运维端点据此判断备份新鲜度
+  LING_BACKUP_DIR: ${LING_BACKUP_DIR:-}
+  LING_ALERT_WEBHOOK_URL: ${LING_ALERT_WEBHOOK_URL:-}
+  # 界面「日志」页能看的最近条数（内存环形缓冲）。**必须列在这里**：
+  # x-app-env 是逐项白名单，不写的变量在 .env 里配了也进不了容器——
+  # 表现为「界面上永远只有 500 条」，而且没有任何提示。
+  LING_LOG_BUFFER_SIZE: ${LING_LOG_BUFFER_SIZE:-}
+  PYTHONUNBUFFERED: "1"
+
+services:
+  db:
+    logging: *default-logging
+    image: ${LING_POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ling
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ling-dev-password}
+      POSTGRES_DB: ling
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # 不发布端口：数据库只在 compose 内网可见
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ling -d ling"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    logging: *default-logging
+    # 必填插值：宿主没配 LING_APP_IMAGE 时 `docker compose config` 直接失败。
+    # api 与 worker 必须是**同一个**摘要（同一镜像，靠 entrypoint 参数区分角色），
+    # 所以两处的 image: 逐字符相同，改动时两处一起改（check_compose.py 会断言）。
+    image: ${LING_APP_IMAGE:?镜像模式必须先在受限 env 配置 LING_APP_IMAGE（固定摘要，格式见 deploy/env.example），不接受空值或 latest}
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      # **当前运行摘要**必须让 api 自己看得见：它与上面 `image:` 是同一条必填
+      # 插值、同一个源值，所以"跑的是哪个摘要"对进程可见——API 才能判断自己
+      # 处于镜像模式，并核对请求里的 `expected_current_digest`。
+      # 不写这一项时（实测 api 只有 47 个变量，其中没有它）API 既判断不出镜像
+      # 模式、也拿不到当前摘要：`GET /v1/version/image-update` 会一直报
+      # `current_image_unknown`，POST 直接 409 —— 网页更新等于不可用。
+      # 用 `?` 而不是 `:-`：缺值让 `docker compose config` 直接失败，不允许容器
+      # 跑在"当前摘要未知"的状态里。
+      LING_APP_IMAGE: ${LING_APP_IMAGE:?镜像模式必须先在受限 env 配置 LING_APP_IMAGE（固定摘要，格式见 deploy/env.example），不接受空值或 latest}
+      # 容器内监听端口**固定** 6520：entrypoint.sh 的 uvicorn、healthcheck、
+      # expose 三处都写这个值；只有**宿主**发布端口是可变的
+      # （`ports:` 里前一段的 LING_PORT）。
+      LING_PORT: "6520"
+      # 镜像模式默认**不**在启动时迁移：迁移由发布流程单次显式执行，
+      # 失败就不启动新 API（设计 §4/§5）。需要单次迁移时用：
+      #   run --rm --no-deps -e LING_RUN_MIGRATIONS=1 api migrate
+      LING_RUN_MIGRATIONS: "0"
+      # 网页更新的开关仍写死 0：通道目录已经挂上（见下面 volumes），但更新器
+      # 协议/执行器还没验收，只改 .env 打不开它——避免"开了开关却没人执行"。
+      # 两个容器内路径**只写在 api 的 environment 里**（不进 x-app-env）：
+      # 容器内路径固定、不由宿主 .env 覆盖，宿主侧路径只出现在 `volumes:`。
+      # 刻意不给 worker 这两行——worker 连"路径是什么"都不该知道，这样将来
+      # 即使有人误给它挂上目录，它也没有可用的落点（纵深防御）。
+      LING_UPDATE_REQUESTS_DIR: /run/ling-update/requests
+      LING_UPDATE_STATUS_DIR: /run/ling-update/status
+      LING_UPDATE_ENABLED: "0"
+    # 共享组：`ling install` 把宿主 requests/state 目录的属组设成更新器 gid，
+    # requests 目录带 setgid，于是 API 写出的请求文件继承该组、更新器按组读得到。
+    # API 镜像自己的 gid 是 10001，与更新器的 10002 不同 uid，**只有**加入这个
+    # 共享组才写得进请求目录、读得到状态。`:?` 必填：缺值时 config 直接失败，
+    # 不会让权限悄悄失效（那会表现成 POST 500/EACCES，很难追）。
+    group_add:
+      - "${LING_UPDATE_SHARED_GID:?请给共享组 gid（安装器写入 .env：更新器与请求/状态目录的属组）}"
+    volumes:
+      # 多副本共享同一份数据卷：root key 与本地回退都需要一致。
+      # **没有** /app/web bind（Web 已烤进镜像）、没有源码 bind、没有 Docker socket。
+      - app-data:/data
+      # 更新通道（设计：「API 仅获得**写请求/读状态**的最小目录权限」）。
+      # 只有 api 挂；worker 一条都不挂。requests 必须 rw（原子写请求文件）、
+      # status 必须 ro（只读 status.json；更新器是唯一写者，API 写不了才伪造不了
+      # 状态）。宿主路径用必填插值：缺值直接失败，不允许"静默少挂"。
+      - ${LING_UPDATE_REQUESTS_HOST:?请给宿主 requests 目录（安装器写入 .env）}:/run/ling-update/requests:rw
+      - ${LING_UPDATE_STATUS_HOST:?请给宿主状态目录（安装器写入 .env）}:/run/ling-update/status:ro
+    # 直接发布宿主端口：浏览器/CLI 直连 api。
+    # 前一段是宿主端口（`LING_PORT`，默认 6520），后一段是容器内固定 6520。
+    # 容器内端口不跟着 LING_PORT 变：否则三处插值漏一处就变成"宿主发布 A、
+    # 容器监听 B"，healthcheck 永远红。
+    #
+    # --- 反向 WS 端口不在这份文件里发布 ---
+    # 不配 WS 的部署不该多出一个对外端口，而 Compose 的 `ports` 不能条件发布。
+    # 要用反向 WS 时叠加 `deploy/compose.image.ws.example.yaml`（只加一条端口），
+    # 即：docker compose -f deploy/compose.image.yaml -f <该 override> ...
+    #
+    # 副本数默认 1：api 自己发布固定 host 端口，非 swarm 模式下 `ports` 只能给
+    # 一个容器，2 个副本会直接端口冲突。
+    ports:
+      - "${LING_PORT:-6520}:6520"
+    expose:
+      - "6520"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:6520/readyz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal, egress]
+    deploy:
+      replicas: ${LING_API_REPLICAS:-1}
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+        delay: 2s
+        max_attempts: 5
+
+  # worker 可多副本：outbox 用 SELECT ... FOR UPDATE SKIP LOCKED 领取，
+  # handler 靠数据库唯一约束幂等（migration 0008/0009）。
+  worker:
+    logging: *default-logging
+    # 与 api 同一个镜像摘要（逐字符相同的插值表达式）。
+    image: ${LING_APP_IMAGE:?镜像模式必须先在受限 env 配置 LING_APP_IMAGE（固定摘要，格式见 deploy/env.example），不接受空值或 latest}
+    restart: unless-stopped
+    command: ["worker"]
+    deploy:
+      replicas: ${LING_WORKER_REPLICAS:-1}
+    environment:
+      <<: *app-env
+      # 与 api 同一条必填插值：worker 跑的是同一个镜像摘要，把它自己跑的摘要
+      # 也暴露给进程内诊断（/v1/version 之类的核对不依赖"猜"）。
+      # worker 拿不到 LING_RUN_MIGRATIONS / LING_UPDATE_ENABLED / LING_UPDATE_*_DIR，
+      # 也不挂更新通道目录（entrypoint 的 worker 分支只等数据库然后启动进程）。
+      LING_APP_IMAGE: ${LING_APP_IMAGE:?镜像模式必须先在受限 env 配置 LING_APP_IMAGE（固定摘要，格式见 deploy/env.example），不接受空值或 latest}
+    volumes:
+      # 只有数据卷：worker 不挂更新通道（没有 requests/status），也没有共享组。
+      # 那两个更新通道路径只写在 api 的 environment 里（不进 x-app-env），
+      # worker 连路径都拿不到；没有挂载 + 不知道落点 = 后台任务无法越权触发部署。
+      - app-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    # worker 的存活信号：能连上数据库并读到 outbox 表（证明依赖就绪、进程可用）
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import asyncio, os, sys
+          async def main() -> int:
+              import asyncpg
+              dsn = os.environ["LING_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+              conn = await asyncpg.connect(dsn, timeout=3)
+              try:
+                  await conn.fetchval("SELECT count(*) FROM outbox_events")
+              finally:
+                  await conn.close()
+              return 0
+          sys.exit(asyncio.run(main()))
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    # worker 需要出网：记忆提炼、关系更新、主动消息生成都要调用模型。
+    # 只挂 internal（无外网）时 worker 会静默降级（"模型提炼不可用"），不报错。
+    networks: [internal, egress]
+
+volumes:
+  # 键名沿用源码模式：项目名 ling + 键名 ⇒ 实际卷名 ling_db-data / ling_app-data。
+  # 不要给它们加 name:/external:，否则会换到另一个卷上（历史数据在旧卷里）。
+  db-data:
+  app-data:
+
+networks:
+  # 只有 db/api/worker 之间通信，**没有外网出口**。
+  internal:
+    internal: true
+  # api 与 worker 的出网口（普通 bridge）。**不要**加 `internal: true`——
+  # 那会让 api/worker 彻底失去外网（连不上 QQ、embedding、LLM、告警 webhook），
+  # 而且不报错，只是能力悄悄变差。
+  egress:

@@ -1,0 +1,184 @@
+# ling API 镜像（amd64/arm64，纯 CPU 即可运行）
+#
+# 三阶段：
+#   web     Node 22 + pnpm：冻结锁文件装依赖并构建前端，产出 /web/dist
+#   builder Python：把 pyproject 声明的东西打成 wheel
+#   runtime 精简运行时：wheel + 源码 + 阶段 1 的 Web dist，非 root 运行
+#
+# 镜像**自带** Web 静态文件（不再靠 compose 把宿主 dist bind 到 /app/web）：
+# 仓库根的 `.dockerignore` 排除了 `**/dist`，所以"宿主先构建、再 COPY dist"
+# 这条路走不通；而且那会让镜像内容依赖宿主工具链。设计见
+# docs/IMAGE-DEPLOYMENT-DESIGN.md §3。
+
+# 基础镜像可由构建参数覆盖：离线/内网环境常需使用本地已有镜像仓库
+# 例：docker compose build --build-arg LING_PYTHON_BASE=python:3.12-slim
+ARG LING_PYTHON_BASE=python:3.13-slim
+
+# ---------------------------------------------------------------------------
+# 阶段 1：Web（Node 22 + pnpm 9）
+# ---------------------------------------------------------------------------
+# `--platform=$BUILDPLATFORM`：Web 产物与 CPU 架构无关，放在构建机本地架构上
+# 跑（amd64 runner 直接跑 Node/tsc/vite），arm64 构建不必为此走 QEMU 模拟。
+# 需要 BuildKit：`docker buildx build` 与 `docker compose build` 的默认后端都是它。
+FROM --platform=$BUILDPLATFORM node:22-slim AS web
+
+# pnpm 版本**钉死**，并且与 .github/workflows/ci.yml 的 web job（`version: 9`）
+# 同一主版本：CI 上验证过的安装/构建组合，就是镜像里跑的这套。
+# 不要改成"装最新版"：pnpm 10+ 默认不执行依赖的 build script，`pnpm install
+# --frozen-lockfile` 会以 `ERR_PNPM_IGNORED_BUILDS: esbuild` 退出 1（本机
+# pnpm 12.15.0 实测）。镜像里靠显式 `--ignore-scripts` 处理，理由见下面
+# install 那行的注释。
+ARG PNPM_VERSION=9.15.9
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    npm_config_update_notifier=false
+RUN npm install --global --no-fund --no-audit "pnpm@${PNPM_VERSION}"
+
+WORKDIR /web
+
+# 先只拷清单再装依赖：这两个文件没变时，下面的 install 层直接命中缓存，
+# 改前端源码不会触发重装。
+COPY clients/web-console/package.json clients/web-console/pnpm-lock.yaml ./
+
+# `--ignore-scripts` 是**刻意**的，不是绕过失败：
+#   1) devDependencies 里有 playwright：它的 postinstall 会下载整套浏览器
+#      （100MB+），镜像不需要（构建只跑 `tsc --noEmit` + `vite build`）。
+#   2) esbuild 的 postinstall 只做本地校验/链接，真正的可执行文件来自可选
+#      平台包（@esbuild/linux-x64 / -arm64）。本机实测（pnpm 9.15.9 与
+#      12.15.0，macOS arm64）：跳过 script 后 `pnpm build` 照样通过，产物
+#      哈希与仓库里已有的 dist 一致。
+#   3) 带上它之后，pnpm 12 的 IGNORED_BUILDS 检查也不会触发（实测退出 0），
+#      于是同一条命令在 pnpm 9 与 12 上都成立。
+# 真正的安装失败（网络、锁文件与 package.json 不同步）仍然以非零退出让构建红：
+# 这里没有 `|| true`，也不靠"node_modules 存在"糊过去。
+RUN pnpm install --frozen-lockfile --ignore-scripts
+
+# 其余 Web 源码。`.dockerignore` 已排除 `**/node_modules` 与 `**/dist`，
+# 宿主残留的 dist 不会漏进来（下面会自己重新构建）。
+COPY clients/web-console/ ./
+
+# `pnpm build` = `tsc --noEmit -p tsconfig.json && vite build`（见 package.json）：
+# 类型错误在构建阶段就让镜像失败，而不是产出一个能开机但白屏的镜像。
+RUN pnpm build && test -f dist/index.html
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2：Python wheel
+# ---------------------------------------------------------------------------
+FROM ${LING_PYTHON_BASE} AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_SYSTEM_PYTHON=0
+
+WORKDIR /build
+COPY pyproject.toml README.md ./
+COPY src ./src
+# **必须拷**：pyproject 里声明的 wheel 包含 `connectors`（渠道连接器）。
+# 少这一行的话构建会因为找不到包而打不出完整 wheel——或者在能容忍缺失时
+# 静默产出一个没有 connectors 的镜像，表现为容器里 QQ/NapCat 全部连不上，
+# 日志只说"缺少凭据"或干脆没有日志。dev 里正常、容器里死掉，就是这种坑。
+COPY connectors ./connectors
+# PyPI 在部分网络环境下**超时频繁**（实测 NAS 上 `ReadTimeoutError`
+# 导致整次部署失败）。这里加两个东西：
+#   1. `--retries/--timeout`：给慢网络留余地，而不是一次超时就放弃
+#   2. `PIP_INDEX_URL`：允许换镜像源（国内可用清华源），默认仍是官方 PyPI
+ARG PIP_INDEX_URL=""
+RUN pip install --no-cache-dir --retries 5 --timeout 60 \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} build \
+ && pip wheel --no-cache-dir --retries 5 --timeout 60 \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} --wheel-dir /wheels . \
+ && ls /wheels
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3：运行时
+# ---------------------------------------------------------------------------
+FROM ${LING_PYTHON_BASE} AS runtime
+
+# 构建提交标记：由 CI（release.yml 的 image job）或 install.sh 在构建前解析
+# （发布提交的 40 位 sha）。没有就是空串——运行时 /v1/version 报 commit=null，
+# 而不是把未知提交伪装成真实提交。只在 runtime 阶段声明：builder 阶段不需要，
+# 也不该影响 wheel 内容。
+ARG LING_COMMIT=""
+# 版本与仓库来源：CI 传 tag 对应版本与仓库 URL；源码模式不传时为空串。
+# 它们与 LING_COMMIT 一起**同时**写进 ENV 和 OCI 标注（同一个 ARG 来源），
+# 所以"镜像内 env"与"OCI 标注"不会各说一套；CI 还会按摘要把镜像拉回来
+# 再核对一次（release.yml 的「核对镜像标注」步骤）。
+ARG LING_VERSION=""
+ARG LING_SOURCE="https://github.com/qsbb/ling"
+ENV LING_COMMIT=${LING_COMMIT}
+
+LABEL org.opencontainers.image.title="ling-api" \
+      org.opencontainers.image.source="${LING_SOURCE}" \
+      org.opencontainers.image.version="${LING_VERSION}" \
+      org.opencontainers.image.revision="${LING_COMMIT}"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # 让迁移器稳定定位 alembic.ini 与 migrations/（镜像内为 /app）
+    LING_PROJECT_ROOT=/app
+
+RUN groupadd --system --gid 10001 ling \
+ && useradd --system --uid 10001 --gid ling --home-dir /app --shell /usr/sbin/nologin ling \
+ && mkdir -p /app /data /app/web \
+ && chown -R ling:ling /app /data
+
+WORKDIR /app
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+COPY --chown=ling:ling src ./src
+# 同上：入口脚本与部分运行期代码会 `import connectors.*`，镜像里必须有。
+COPY --chown=ling:ling connectors ./connectors
+COPY --chown=ling:ling alembic.ini ./alembic.ini
+COPY --chown=ling:ling migrations ./migrations
+
+# --- Web 产物 + 清单（设计 §3：Web 随镜像交付，清单必须实际生成并校验）---
+
+# 阶段 1 的构建结果。只拷 dist：node_modules 与构建缓存都不进运行时。
+COPY --from=web --chown=ling:ling /web/dist /app/web
+
+# 下面是 deploy/web_manifest.py 的 `release_inputs` 全部输入，缺一个就 fail closed：
+#   仓库根：pyproject.toml / README.md / alembic.ini
+#   deploy/：Dockerfile.api / entrypoint.sh（本文件与入口脚本也进清单哈希）
+#   src / connectors / migrations 全树（上面已经拷了）
+#   clients/web-console：package.json / pnpm-lock.yaml / index.html /
+#                        tsconfig.json / vite.config.ts 与 src 全树
+# 保留这份 Web 源码与 deploy 输入，是为了让"镜像内清单 ↔ 镜像内文件"可被
+# 独立复核（在容器里也能手动重跑 verify）。**不放** .env、token、Docker socket
+# 或宿主 .run：那些也不在 .dockerignore 放行的范围内。
+COPY --chown=ling:ling pyproject.toml README.md ./
+COPY --chown=ling:ling deploy/Dockerfile.api deploy/entrypoint.sh deploy/web_manifest.py ./deploy/
+COPY --chown=ling:ling \
+     clients/web-console/package.json \
+     clients/web-console/pnpm-lock.yaml \
+     clients/web-console/index.html \
+     clients/web-console/tsconfig.json \
+     clients/web-console/vite.config.ts \
+     ./clients/web-console/
+COPY --chown=ling:ling clients/web-console/src ./clients/web-console/src
+
+# 在镜像内**生成并校验**清单：不是只看文件在不在。缺少输入、dist 里有 symlink、
+# 哈希对不上，任何一种都让构建失败。
+# 清单落在 /app/web/.ling-web-manifest.json，/v1/version 的
+# web_manifest_sha256 就是它的 sha256。chown 放在最后：上一步以 root 写入，
+# 而容器以 UID 10001 只读运行，必须让 ling 能读。
+RUN python3 /app/deploy/web_manifest.py create /app clients/web-console /app/web .ling-web-manifest.json \
+ && python3 /app/deploy/web_manifest.py verify /app clients/web-console /app/web .ling-web-manifest.json \
+ && chown -R ling:ling /app/web
+
+# 入口脚本跟着清单输入走 `deploy/entrypoint.sh` 这个仓库内路径（清单里记的是
+# 该路径的哈希），因此镜像内路径从 /app/entrypoint.sh 变成
+# /app/deploy/entrypoint.sh。仓库内没有其它地方引用旧路径（compose 不覆盖
+# entrypoint；`run ... api migrate` 走的是 CMD）。
+RUN chmod +x /app/deploy/entrypoint.sh
+
+USER ling
+# 容器内固定监听 6520（entrypoint 的 uvicorn / compose 的 expose 与 healthcheck
+# 都是这个值）。EXPOSE 只是元数据，不影响监听，但写错会让人以为容器在 8080。
+EXPOSE 6520
+ENTRYPOINT ["/app/deploy/entrypoint.sh"]
+CMD ["api"]

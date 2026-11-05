@@ -1,0 +1,24 @@
+name: ling_mobile
+description: ling 手机参考客户端（W2：已实现，未测试）
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  # 语音三项依赖（shared_preferences / record / audioplayers）**已删除**：
+  # `lib/` 里零引用（`lib/voice/` 只有一个 README，没有 Dart 代码）。
+  # 留着它们会让 `pub get` 多拉三个插件，并让"语音已就绪"看起来像真的。
+  # 真接语音时按 lib/voice/README.md 的流水线重新加。
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

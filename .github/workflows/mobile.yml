@@ -1,0 +1,52 @@
+name: mobile
+
+# clients/mobile 是**独立可编译单元**（自己的 pubspec），但此前完全没有门禁：
+# `flutter analyze` 一跑就有一个 error（`api/ling_api.dart` 的 retry 路径），
+# 也就是说整个 App 在有人手动跑分析之前一直是编译不过的状态。
+#
+# 单开一个 workflow 而不是塞进 ci.yml：Flutter SDK 的下载/缓存首跑要几分钟，
+# 只在 `clients/mobile/**` 变更时才值得付这个成本。触发条件写在 `on.push.paths`，
+# 所以不碰移动端的 PR 不会因为这条被拖慢（也不会因为没有跑而显示成"待检查"）。
+#
+# `workflow_call` 让 release.yml 能显式复用（被调用时 paths 过滤器不生效，
+# 于是每次发版都会真的分析一遍移动端）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clients/mobile/**"
+      - ".github/workflows/mobile.yml"
+  pull_request:
+    paths:
+      - "clients/mobile/**"
+      - ".github/workflows/mobile.yml"
+  workflow_call:
+
+# 只读：分析/单测不需要任何写权限。
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/mobile
+    steps:
+      - uses: actions/checkout@v4
+      # channel: stable 没钉小版本：这里没法在 GitHub 上验证某个具体版本的可用性，
+      # 钉一个查不到版本号会让整条流水线永久红。首次在 Actions 上跑通后，
+      # 建议改成 `flutter-version: "x.y.z"`（与本地验证过的版本一致）。
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          # 缓存 SDK 与 pub 缓存，第二次起省掉 SDK 下载的几分钟。
+          cache: true
+      - name: 安装依赖
+        run: flutter pub get
+      - name: 静态分析
+        # flutter analyze 有 error/warning 就非零退出，正是这里要的门禁。
+        run: flutter analyze
+      - name: 单元测试
+        # test/contracts_test.dart 只解析契约形状，不需要真实后端。
+        run: flutter test

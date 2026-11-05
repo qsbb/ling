@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "Origin": {
+      "description": "经历来源。六者永不混写为同一种事实。",
+      "enum": [
+        "simulated",
+        "user_statement",
+        "external_observation",
+        "verified_source",
+        "tool_receipt",
+        "model_inference"
+      ],
+      "title": "Origin",
+      "type": "string"
+    },
+    "Visibility": {
+      "enum": [
+        "actor_private",
+        "subject_private",
+        "window_private",
+        "group_scope",
+        "public",
+        "admin_only"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/ContextContribution.schema.json",
+  "additionalProperties": false,
+  "description": "ContextCompiler 的一条车道贡献，含来源、受众、有效期与预算。",
+  "properties": {
+    "lane": {
+      "enum": [
+        "persona",
+        "self_state",
+        "scene",
+        "relationship",
+        "world",
+        "short_memory",
+        "core_memory",
+        "evidence",
+        "knowledge",
+        "media",
+        "goals",
+        "capabilities",
+        "constraints"
+      ],
+      "title": "Lane",
+      "type": "string"
+    },
+    "origin": {
+      "$ref": "#/$defs/Origin"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_event_ids": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Source Event Ids",
+      "type": "array"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "token_budget": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Token Budget",
+      "type": "integer"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility"
+    }
+  },
+  "required": [
+    "lane",
+    "text",
+    "origin",
+    "visibility"
+  ],
+  "title": "ContextContribution",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

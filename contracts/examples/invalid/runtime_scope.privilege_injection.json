@@ -1,0 +1,9 @@
+{
+  "schema_version": "v1",
+  "actor_id": "actor_ling",
+  "persona_id": "persona_ling",
+  "subject_id": "subj_demo",
+  "window_id": "win_demo",
+  "visibility": "admin_only",
+  "client_claimed_admin": true
+}

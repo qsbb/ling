@@ -1,0 +1,15 @@
+# Flutter / Dart 构建产物。
+#
+# 为什么这里需要一个 .gitignore：`flutter pub get` / `flutter analyze` 会
+# 在工作树里生成 `.dart_tool/`、`build/`，并把 `analysis_options.yaml`
+# 补上 `exclude: build/**`。不挡住这些，CI 每次跑都会留下脏文件，
+# 而且本地和 CI 的树不一致。
+#
+# `pubspec.lock` **要提交**（不在这里忽略）：移动端是应用不是库，
+# 锁住依赖版本才能让 CI 和本地解析到同一套包。
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml

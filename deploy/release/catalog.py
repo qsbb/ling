@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""可信发布目录（``deploy/releases.json``）的校验与追加工具（纯标准库）。
+
+设计依据
+========
+``docs/EASY-INSTALL-UPDATE-DESIGN.md``：
+
+> 可信发布目录只列已通过门禁、可从已知版本升级的稳定目标，记录最低更新器协议
+> 版本、是否有迁移、预计下载大小及必要的版本跨度。
+
+同一份设计也写明「可编辑的 Release 正文**不是**摘要可信来源」。所以「目标摘要」
+只有三个可能来源，这里选了第三条：
+
+1. CI 构建证明（attestation）：本仓库 Stage 1 的 ``provenance: false`` 明确关掉了；
+2. 更新器内跑 ``gh``/Sigstore 验证：与「更新器只保留最小可信代码」冲突；
+3. **随代码提交的目录**：digest 本身内容寻址，改动经由 GitHub 签名提交 + 评审，
+   更新器从**自己的发行包目录**只读加载，不联网、不引入新依赖。
+
+本批只落更新器真正用得到的字段：``min_from``（版本跨度）与 ``has_migration``
+（是否有迁移）。最低更新器协议版本 / 预计下载大小目前没有任何使用方，**不预留
+空字段**——空字段会被当成"已支持"的假象。
+
+文件格式（schema 1）
+====================
+::
+
+    {
+      "schema": 1,
+      "releases": [
+        {
+          "version": "0.0.2",                   # 严格 semver，不带 v 前缀
+          "digest": "ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>",
+          "commit": "<40 位小写 hex>",
+          "min_from": ["0.0.1"],                # 允许从哪些版本升到它
+          "has_migration": true,
+          "released_at": "2026-11-04T00:00:00Z" # 严格 UTC，Z 结尾
+        }
+      ]
+    }
+
+硬规则（校验与追加共用同一套，见 :func:`parse_catalog`）：
+
+- 根对象只有 ``schema`` / ``releases`` 两个键，``schema`` 必须是整数 ``1``；
+- 每条记录**恰好**六个键，缺一个、多一个都算非法（拼错字段名比缺字段更危险）；
+- ``version`` 是严格 semver；``digest`` 只认 ``ghcr.io/qsbb/ling-api@sha256:<64 hex>``；
+  ``commit`` 是 40 位小写 hex；``min_from`` 是**非空**、无重复、不含自己的 semver 数组；
+  ``has_migration`` 是 JSON 布尔；``released_at`` 是 ``YYYY-MM-DDTHH:MM:SSZ``；
+- 全文件 ``version`` 不重复、``digest`` 不重复；条目数有上限（避免畸形文件放大内存）。
+
+**不按发布时间排序**：``validate`` 只校验内容、不看顺序；``add`` 写出时按 version
+语义排序只是为了让 diff 稳定。使用方（更新器、API）必须自己按 semver 比较，
+不能依赖文件里的先后——排错序的目录文件仍然是一条合法目录。
+
+权限：目录文件不涉密，``add`` 写成 ``0644``；``validate`` 只拒绝**其他人可写**
+（``0o002``）的文件。目录文件被改坏时更新器必须 fail closed（``available_targets=[]``
++ 明确原因），绝不"猜"一个目标。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+SCHEMA = 1
+CATALOG_NAME = "releases.json"
+# 目录文件随代码提交、人工评审：上限只是防止畸形文件把更新器内存放大。
+MAX_CATALOG_BYTES = 256 * 1024
+MAX_RELEASES = 512
+MAX_MIN_FROM = 64
+WRITE_MODE = 0o644
+
+DIGEST_RE = re.compile(r"^ghcr\.io/qsbb/ling-api@sha256:[0-9a-f]{64}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+# 严格 semver：数值段不允许前导 0；预发布/构建段按 semver 的字符集。
+SEMVER_RE = re.compile(
+    r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
+    r"(?:-(?P<pre>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+RELEASED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# 字段顺序只影响写出的文件长相（便于人工评审），不参与任何语义。
+RELEASE_KEYS = ("version", "digest", "commit", "min_from", "has_migration", "released_at")
+ROOT_KEYS = ("schema", "releases")
+
+DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / CATALOG_NAME
+
+
+class CatalogError(ValueError):
+    """目录文件不可用；``code`` 是机器可读的固定码（文案不参与判断）。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"
+
+
+def _fail(code: str, message: str) -> CatalogError:
+    return CatalogError(code, message)
+
+
+# ---------------------------------------------------------------- semver
+
+
+def version_key(version: str) -> tuple[int, int, int, tuple[Any, ...]]:
+    """semver 排序键：``0.0.10`` > ``0.0.9``；正式版 > 同一核心的预发布版。
+
+    不接受无法解析的版本：目录里的 ``version`` 必须严格 semver，调用方不该
+    用"猜"的方式比较字符串。
+    """
+    if not isinstance(version, str):
+        raise _fail("version_invalid", "version 必须是字符串")
+    match = SEMVER_RE.fullmatch(version)
+    if match is None:
+        raise _fail("version_invalid", f"version 不是严格 semver：{version!r}")
+    if match["pre"] is None:
+        pre: tuple[Any, ...] = (1,)
+    else:
+        # 数值标识符按数值比较且小于字母标识符（semver §11）。
+        pre = (
+            0,
+            tuple(
+                (0, int(part), "") if part.isdigit() else (1, 0, part)
+                for part in str(match["pre"]).split(".")
+            ),
+        )
+    return (int(match["major"]), int(match["minor"]), int(match["patch"]), pre)
+
+
+def sort_releases(releases: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 version 语义排序（返回新列表，不改入参、不改文件）。"""
+    items = list(releases)
+    return sorted(items, key=lambda item: version_key(item["version"]))
+
+
+# ---------------------------------------------------------------- 校验
+
+
+def _validate_release(raw: object, index: int) -> dict[str, Any]:
+    where = f"releases[{index}]"
+    if not isinstance(raw, dict):
+        raise _fail("release_not_object", f"{where} 必须是 JSON 对象")
+    keys = set(raw)
+    missing = [key for key in RELEASE_KEYS if key not in keys]
+    if missing:
+        raise _fail("release_field_missing", f"{where} 缺字段：{missing}")
+    extra = sorted(keys - set(RELEASE_KEYS))
+    if extra:
+        raise _fail("release_field_unknown", f"{where} 有未知字段：{extra}")
+
+    version = raw["version"]
+    if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
+        raise _fail("version_invalid", f"{where}.version 不是严格 semver：{version!r}")
+
+    digest = raw["digest"]
+    if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+        raise _fail(
+            "digest_invalid",
+            f"{where}.digest 必须是 ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>",
+        )
+
+    commit = raw["commit"]
+    if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None:
+        raise _fail("commit_invalid", f"{where}.commit 必须是 40 位小写 hex")
+
+    min_from = raw["min_from"]
+    if not isinstance(min_from, list):
+        raise _fail("min_from_invalid", f"{where}.min_from 必须是字符串数组")
+    if not min_from:
+        raise _fail("min_from_empty", f"{where}.min_from 不能为空（必须说明从哪些版本可升到它）")
+    if len(min_from) > MAX_MIN_FROM:
+        raise _fail("min_from_invalid", f"{where}.min_from 条目过多（上限 {MAX_MIN_FROM}）")
+    seen: set[str] = set()
+    normalized_min_from: list[str] = []
+    for item in min_from:
+        if not isinstance(item, str) or SEMVER_RE.fullmatch(item) is None:
+            raise _fail("min_from_invalid", f"{where}.min_from 里有非 semver 项：{item!r}")
+        if item == version:
+            raise _fail("min_from_self", f"{where}.min_from 不能包含自己（{version}）")
+        if item in seen:
+            raise _fail("min_from_duplicate", f"{where}.min_from 有重复项：{item}")
+        seen.add(item)
+        normalized_min_from.append(item)
+
+    has_migration = raw["has_migration"]
+    if not isinstance(has_migration, bool):
+        raise _fail("has_migration_invalid", f"{where}.has_migration 必须是 JSON 布尔")
+
+    released_at = raw["released_at"]
+    if not isinstance(released_at, str):
+        raise _fail("released_at_invalid", f"{where}.released_at 必须是字符串")
+    try:
+        datetime.strptime(released_at, RELEASED_AT_FORMAT)
+    except ValueError as exc:
+        raise _fail(
+            "released_at_invalid",
+            f"{where}.released_at 必须是 UTC 时间 {RELEASED_AT_FORMAT}Z 形式：{released_at!r}",
+        ) from exc
+
+    return {
+        "version": version,
+        "digest": digest,
+        "commit": commit,
+        "min_from": normalized_min_from,
+        "has_migration": has_migration,
+        "released_at": released_at,
+    }
+
+
+def parse_catalog(raw: bytes) -> dict[str, Any]:
+    """解析并严格校验目录文件的字节；返回规范化结构（只含已知字段）。
+
+    抛 :class:`CatalogError`；不做任何 I/O、不改任何文件、不看条目顺序。
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        raise _fail("not_bytes", "目录内容必须是字节")
+    if len(raw) > MAX_CATALOG_BYTES:
+        raise _fail("too_large", f"目录文件超过 {MAX_CATALOG_BYTES} 字节")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fail("not_utf8", "目录文件必须是 UTF-8") from exc
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise _fail("not_json", "目录文件不是合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise _fail("not_object", "目录根必须是 JSON 对象")
+    missing = [key for key in ROOT_KEYS if key not in payload]
+    if missing:
+        raise _fail("root_field_missing", f"目录根缺字段：{missing}")
+    extra = sorted(set(payload) - set(ROOT_KEYS))
+    if extra:
+        raise _fail("root_field_unknown", f"目录根有未知字段：{extra}")
+    schema = payload["schema"]
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise _fail("schema_invalid", "schema 必须是整数 1")
+    if schema != SCHEMA:
+        raise _fail("schema_unsupported", f"不认识的目录 schema：{schema}")
+
+    releases_raw = payload["releases"]
+    if not isinstance(releases_raw, list):
+        raise _fail("releases_not_list", "releases 必须是数组")
+    if len(releases_raw) > MAX_RELEASES:
+        raise _fail("too_many_releases", f"releases 条目过多（上限 {MAX_RELEASES}）")
+
+    releases: list[dict[str, Any]] = []
+    versions: set[str] = set()
+    digests: set[str] = set()
+    for index, item in enumerate(releases_raw):
+        entry = _validate_release(item, index)
+        if entry["version"] in versions:
+            raise _fail("version_duplicate", f"version 重复：{entry['version']}")
+        if entry["digest"] in digests:
+            raise _fail("digest_duplicate", f"digest 重复：{entry['digest']}")
+        versions.add(entry["version"])
+        digests.add(entry["digest"])
+        releases.append(entry)
+    return {"schema": SCHEMA, "releases": releases}
+
+
+# ---------------------------------------------------------------- 文件 I/O
+
+
+def load_catalog(path: Path) -> dict[str, Any]:
+    """读取并校验目录文件：普通文件、有大小上限、不接受其他人可写。"""
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise _fail("not_found", f"发布目录文件不存在：{path}") from exc
+    except OSError as exc:
+        raise _fail("unreadable", f"发布目录文件不可读：{path}（{type(exc).__name__}）") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise _fail("not_a_file", f"发布目录必须是普通文件（不接受符号链接/目录）：{path}")
+    if info.st_size > MAX_CATALOG_BYTES:
+        raise _fail("too_large", f"发布目录文件超过 {MAX_CATALOG_BYTES} 字节：{path}")
+    if stat.S_IMODE(info.st_mode) & 0o002:
+        raise _fail("unsafe_permissions", f"发布目录不能是其他人可写（应 0644/0600）：{path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise _fail("unreadable", f"发布目录文件不可读：{path}（{type(exc).__name__}）") from exc
+    return parse_catalog(raw)
+
+
+def render_catalog(catalog: dict[str, Any]) -> str:
+    """稳定序列化：固定字段顺序 + 缩进 + 结尾换行（便于人工评审 diff）。"""
+    releases = [{key: entry[key] for key in RELEASE_KEYS} for entry in catalog.get("releases", [])]
+    payload = {"schema": SCHEMA, "releases": releases}
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_catalog(path: Path, catalog: dict[str, Any]) -> None:
+    """原子写回目录文件（同目录临时文件 + ``os.replace``），权限固定 0644。"""
+    directory = path.parent
+    if not directory.is_dir():
+        raise _fail("not_found", f"发布目录所在目录不存在：{directory}")
+    data = render_catalog(catalog).encode("utf-8")
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
+    except OSError as exc:
+        raise _fail("write_failed", f"无法创建临时文件（{type(exc).__name__}）") from exc
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, WRITE_MODE)
+        os.replace(tmp, path)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise _fail("write_failed", f"写入发布目录失败（{type(exc).__name__}）") from exc
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).strftime(RELEASED_AT_FORMAT)
+
+
+# ---------------------------------------------------------------- 追加
+
+
+def add_release(
+    path: Path,
+    *,
+    version: str,
+    digest: str,
+    commit: str,
+    min_from: Sequence[str],
+    has_migration: bool,
+    released_at: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """往目录里追加一条；返回 ``(catalog, state)``，``state`` 是 ``added``/``unchanged``。
+
+    幂等：同 ``version`` 已存在且 ``digest`` 相同、其它字段也一致 → **不写文件**、
+    返回 ``unchanged``。同 version 不同 digest → ``version_digest_conflict``；
+    同 version/digest 但字段不同 → ``entry_conflict``；digest 已被别的 version
+    占用 → ``digest_duplicate``。所有分支都只抛 :class:`CatalogError`，不静默覆盖。
+    """
+    entry = {
+        "version": version,
+        "digest": digest,
+        "commit": commit,
+        "min_from": list(min_from),
+        "has_migration": has_migration,
+        "released_at": released_at or utc_now(),
+    }
+    # 新条目与整份目录走**同一套**校验：不允许"新增一条绕过校验"。
+    parse_catalog(render_catalog({"schema": SCHEMA, "releases": [entry]}).encode("utf-8"))
+
+    if path.exists():
+        catalog = load_catalog(path)
+    else:
+        if not path.parent.is_dir():
+            raise _fail("not_found", f"发布目录所在目录不存在：{path.parent}")
+        catalog = {"schema": SCHEMA, "releases": []}
+
+    for existing in catalog["releases"]:
+        if existing["digest"] == digest and existing["version"] != version:
+            raise _fail(
+                "digest_duplicate",
+                f"digest 已被 {existing['version']} 使用：{digest}",
+            )
+        if existing["version"] != version:
+            continue
+        if existing["digest"] != digest:
+            raise _fail(
+                "version_digest_conflict",
+                f"{version} 已存在且 digest 不同（目录 {existing['digest']} ≠ 新 {digest}）",
+            )
+        same = (
+            existing["commit"] == commit
+            and existing["min_from"] == list(min_from)
+            and existing["has_migration"] is has_migration
+        )
+        if not same:
+            raise _fail(
+                "entry_conflict",
+                f"{version} 已存在且 digest 相同，但 commit/min_from/has_migration 不同；"
+                "已发布的条目不要用脚本改写，请人工评审后改目录文件",
+            )
+        return catalog, "unchanged"
+
+    merged = {"schema": SCHEMA, "releases": [*catalog["releases"], entry]}
+    merged["releases"] = sort_releases(merged["releases"])
+    merged = parse_catalog(render_catalog(merged).encode("utf-8"))
+    write_catalog(path, merged)
+    return merged, "added"
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def _describe(entry: dict[str, Any]) -> str:
+    migration = "yes" if entry["has_migration"] else "no"
+    return (
+        f"  {entry['version']}  {entry['digest']}  "
+        f"migration={migration}  min_from={','.join(entry['min_from'])}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="catalog.py",
+        description="可信发布目录（deploy/releases.json）的校验与追加工具",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_validate = sub.add_parser("validate", help="校验目录文件（CI 门禁）")
+    p_validate.add_argument(
+        "--catalog", default=str(DEFAULT_CATALOG), help=f"目录文件路径（默认 {CATALOG_NAME}）"
+    )
+
+    p_add = sub.add_parser("add", help="把一条发布记录加进目录（幂等）")
+    p_add.add_argument(
+        "--catalog", default=str(DEFAULT_CATALOG), help=f"目录文件路径（默认 {CATALOG_NAME}）"
+    )
+    p_add.add_argument("--version", required=True, help="严格 semver，例如 0.0.2")
+    p_add.add_argument(
+        "--digest", required=True, help="ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>"
+    )
+    p_add.add_argument("--commit", required=True, help="40 位小写 hex 源提交")
+    p_add.add_argument(
+        "--min-from",
+        dest="min_from",
+        action="append",
+        required=True,
+        help="允许从哪个版本升级到它；可重复或用逗号分隔（至少一个）",
+    )
+    migration = p_add.add_mutually_exclusive_group(required=True)
+    migration.add_argument("--has-migration", action="store_true", help="目标版本含数据库迁移")
+    migration.add_argument("--no-migration", action="store_true", help="目标版本不含数据库迁移")
+    # 帮助文本里**不能**出现裸 `%`：argparse 会对 help 做 `%` 格式化
+    # （`HelpFormatter._expand_help` 里的 `help % params`）。把 strftime 用的
+    # `RELEASED_AT_FORMAT`（`%Y-%m-%dT%H:%M:%SZ`）插进来，`%Y` 就成了格式符：
+    # Python 3.12/3.13 下 `add --help` 抛
+    # `ValueError: unsupported format character 'Y'`；Python 3.14 起 argparse 把
+    # 这个校验提前到**构造 parser 时**，于是连 `catalog.py validate` 都直接炸
+    # （2026-11 CI 的 updater-image job 实跑抓到的那次）。
+    # 也不要用 `%%` 转义——那只会让 `--help` 里显示成 `%%`。这里直接写人类可读的
+    # 字面格式，取值与 `RELEASED_AT_FORMAT` 的有效输出一致（`tests` 里有扫描用例
+    # 保证 parser 里所有展示字符串都不含 `%`）。
+    p_add.add_argument(
+        "--released-at",
+        default="",
+        help="UTC 发布时间 YYYY-MM-DDTHH:MM:SSZ（默认现在）",
+    )
+    return parser
+
+
+def _min_from_values(raw: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    for item in raw:
+        for part in item.split(","):
+            text = part.strip()
+            if text:
+                values.append(text)
+    return values
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    path = Path(args.catalog).expanduser()
+    try:
+        if args.command == "validate":
+            catalog = load_catalog(path)
+        else:
+            catalog, state = add_release(
+                path,
+                version=args.version,
+                digest=args.digest,
+                commit=args.commit,
+                min_from=_min_from_values(args.min_from),
+                has_migration=bool(args.has_migration),
+                released_at=args.released_at.strip() or None,
+            )
+    except CatalogError as error:
+        print(f"{args.command.upper()} FAILED {error.code}: {error.message}", file=sys.stderr)
+        return 2
+    if args.command == "add":
+        print(f"{state.upper()} {args.version} {args.digest}")
+    print(f"OK schema={SCHEMA} releases={len(catalog['releases'])}")
+    for entry in sort_releases(catalog["releases"]):
+        print(_describe(entry))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

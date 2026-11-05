@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# --- Node ---
+node_modules/
+dist/
+.vite/
+playwright-report/
+test-results/
+blob-report/
+
+# --- 本地运行数据（绝不入库）---
+.data/
+*.sqlite3
+*.db
+logs/
+# .run/ 同时是更新通道相对默认值（../.run/update/*）和 install.sh 在“没有可用
+# HOME”时的回退目录（.run/home、.run/docker）——绝不入库，也不进 build context。
+.run/
+# install.sh 的跨 release 安装锁（运行期文件；可能在 deploy/ 或共享 .env 目录）
+.ling-install.lock
+# 旧版 install.sh 的回退目录。新版本改用 .run/home / .run/docker，不再创建它们；
+# 保留忽略规则只为不让历史目录把 checkout 弄脏（脚本不删不搬）。
+/.home/
+/.docker/
+# 宿主/更新执行器生成的 Compose override（固定 bind 来源）。可能含宿主绝对路径，
+# 不进版本库；install.sh 只把它当作 `-f` 追加参数，不复制也不改写其内容。
+deploy/compose.override.*
+
+# --- 密钥与本地配置 ---
+.env
+.env.*
+!.env.example
+secrets/
+deploy/secrets/*
+
+# --- 并行工作树 ---
+.worktrees/
+
+# --- 编辑器/系统 ---
+.DS_Store
+.idea/
+.vscode/
+
+# 证书与密钥文件：绝不允许入库
+*.pem
+*.key
+deploy/certs/
+# E2E 截图产物
+shots/
+
+# E2E 用的 playwright 目录是指向 .data 的符号链接，不进版本库
+tests/e2e/node_modules

@@ -1,0 +1,95 @@
+{
+  "$defs": {
+    "Modality": {
+      "enum": [
+        "text",
+        "audio",
+        "image",
+        "video",
+        "structured"
+      ],
+      "title": "Modality",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/CapabilityDescriptor.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "capability_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Capability Id",
+      "type": "string"
+    },
+    "enabled": {
+      "default": false,
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "max_text_length": {
+      "default": 4096,
+      "minimum": 1,
+      "title": "Max Text Length",
+      "type": "integer"
+    },
+    "modalities": {
+      "items": {
+        "$ref": "#/$defs/Modality"
+      },
+      "title": "Modalities",
+      "type": "array"
+    },
+    "receipt_reliability": {
+      "default": "best_effort",
+      "enum": [
+        "none",
+        "best_effort",
+        "confirmed"
+      ],
+      "title": "Receipt Reliability",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "supports_edit": {
+      "default": false,
+      "title": "Supports Edit",
+      "type": "boolean"
+    },
+    "supports_group": {
+      "default": false,
+      "title": "Supports Group",
+      "type": "boolean"
+    },
+    "supports_media": {
+      "default": false,
+      "title": "Supports Media",
+      "type": "boolean"
+    },
+    "supports_private": {
+      "default": true,
+      "title": "Supports Private",
+      "type": "boolean"
+    },
+    "supports_proactive": {
+      "default": false,
+      "title": "Supports Proactive",
+      "type": "boolean"
+    },
+    "version": {
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "capability_id",
+    "version"
+  ],
+  "title": "CapabilityDescriptor",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

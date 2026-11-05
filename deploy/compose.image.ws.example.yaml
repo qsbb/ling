@@ -1,0 +1,42 @@
+# 镜像模式的**可选**反向 WS override：只加一条端口映射。
+#
+# 这是 `deploy/compose.image.yaml`（镜像模式主文件）的 override，**不是**源码
+# 模式那份 `deploy/compose.ws.example.yaml`。两者只对应各自的主文件，混用等于
+# 把 `-f` 文件组配错：源码模式那份的注释、安装器路径与主文件都对不上。
+#
+# 基础 `compose.image.yaml` 刻意不发布 WS 端口——不配 WS 的部署不该多出一个
+# 对外端口，而 Compose 的 `ports` 不能条件发布（变量留空会解析成非法条目）。
+# 要用反向 WS（ling 当服务端、NapCat 连进来）时，复制这份文件并追加 -f：
+#
+#   cp deploy/compose.image.ws.example.yaml deploy/compose.override.ws.yaml
+#   docker compose \
+#     -f deploy/compose.image.yaml \
+#     -f deploy/compose.override.ws.yaml \
+#     --project-name ling --env-file deploy/.env up -d
+#
+# 从 `config`、`pull`、`run`、`up` 到备份和恢复演练**必须**用同一组 `-f`
+# 文件和同一个项目名，否则会命中另一套拓扑（设计 §4）。
+#
+# 前置条件（缺一不可）：
+#
+# 1. 受限 `deploy/.env` 里 `LING_ONEBOT_WS_PORT=6799`（与下面 ports 的两段一致）；
+# 2. `LING_ONEBOT_WS_TOKEN=<随机串>` —— **没有 token 时服务端拒绝启动**，
+#    端口一开就等于把"往对话链路推事件"的能力交给任何能连上的人；
+# 3. `LING_ONEBOT_WS_HOST=0.0.0.0` —— 默认 127.0.0.1 在容器里等于只有容器
+#    自己能连，宿主上的 NapCat 依然连不进来；
+# 4. NapCat 侧 `onebot11_<QQ>.json` 的 `network.websocketClients[]` 填
+#    `url: "ws://<ling 宿主机 IP>:6799"`、`token: <同一个串>`、`enable: true`。
+#
+# **Compose 的 `ports` 是追加而不是覆盖**：这里只加 WS 那一条，
+# `compose.image.yaml` 里 api 的 `${LING_PORT:-6520}:6520` 仍然生效。
+#
+# 变量用 `:?`（必填）而不是 `:-`（带默认值）：漏配时 Compose 在解析阶段直接
+# 报错并指名缺哪个变量，而不是发布一个 ":" 这样的非法条目。
+#
+# 这份 override **只允许**出现 api.ports；不要在这里加 image:/build:/volumes:，
+# 镜像版本、构建方式与挂载都属于主文件（`scripts/check_compose.py` 会断言）。
+
+services:
+  api:
+    ports:
+      - "${LING_ONEBOT_WS_PORT:?WS 模式必须先在受限 env 配 LING_ONEBOT_WS_PORT}:${LING_ONEBOT_WS_PORT:?WS 模式必须先在受限 env 配 LING_ONEBOT_WS_PORT}"

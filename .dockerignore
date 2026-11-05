@@ -1,0 +1,76 @@
+# 注意：镜像构建（deploy/Dockerfile.api，三阶段）会在**镜像内**构建 Web，
+# 并调用 deploy/web_manifest.py 生成/校验前端清单。下面这些路径是构建输入，
+# **不能**排除，否则 `pnpm build` 或清单生成会直接失败（fail closed，不是静默降级）：
+#   clients/web-console/{package.json,pnpm-lock.yaml,index.html,tsconfig.json,
+#                        vite.config.ts,src/**}
+#   pyproject.toml、README.md、alembic.ini
+#   deploy/{Dockerfile.api,entrypoint.sh,web_manifest.py}
+#   src/**、connectors/**、migrations/**
+# 改这个文件时请对照 Dockerfile 的 COPY 列表一起看。
+.git
+.worktrees
+node_modules
+**/node_modules
+.venv
+**/.venv
+# dist 排除是**安全**的：Web 在镜像内重新构建（vite 的 emptyOutDir 会清空输出），
+# 宿主或仓库里残留的 dist 进 build context 只会污染结果。
+dist
+**/dist
+__pycache__
+**/__pycache__
+.pytest_cache
+.data
+logs
+# install.sh 的回退目录与更新通道运行期数据：可能有 docker registry 凭据、
+# 更新请求/状态；绝不能进 build context（旧版回退目录 .home/.docker 一并排除）。
+.run
+.home
+.docker
+.ling-install.lock
+**/.ling-install.lock
+deploy/compose.override.*
+deploy/certs
+deploy/secrets
+# 私钥/证书：.gitignore 已禁止入库，build context 也不该带上（纵深防御）。
+# 现有 Dockerfile 只 COPY 固定源码路径，这里防的是以后新增 COPY 或误把
+# 证书放在仓库其它目录时被一起打包进镜像。
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.crt
+**/*.crt
+*.p12
+**/*.p12
+*.dump
+**/*.dump
+# .env 是**根锚定**的：.dockerignore 与 .gitignore 不同，不带斜杠的模式只匹配
+# 仓库根（这也是上面每类都要写 "x" + "**/x" 两行的原因）。真实部署口令在
+# deploy/.env（install.sh 从 env.example 生成），只写 `.env` 会让它进 build
+# context——所以必须再排除任意层级的 .env/.env.*（设计 §3：绝不进 context）。
+.env
+.env.*
+**/.env
+**/.env.*
+# 否定规则必须排在排除规则之后。仓库里真正的模板是 deploy/env.example，
+# 它不匹配任何 .env* 模式；这条只为不改变既有行为（根目录 .env.example 若存在
+# 仍然放行）。
+!.env.example
+playwright-report
+test-results
+# 上面两条只挡仓库根：clients/web-console 里跑过 playwright 测试时也会生成
+# 同名目录，而 Web 阶段是整目录 COPY，所以一并挡掉（测试产物不需要进镜像）。
+**/playwright-report
+**/test-results
+# 移动端（Flutter）与镜像无关：自有 pubspec 与 CI，48MB 上下文没必要传给
+# builder。API/Web 两个阶段都不 COPY 它。
+clients/mobile
+docs
+evals
+tests
+
+# macOS 在 tar/复制时生成的 AppleDouble 元数据文件（._xxx），
+# 会被 Alembic 当成迁移脚本加载并因 null 字节报错。
+**/._*
+._*

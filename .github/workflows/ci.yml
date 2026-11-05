@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml 在打 tag 时直接复用这套检查：所有 CI 通过才允许创建 Release。
+  workflow_call:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # pyproject 的 `requires-python = ">=3.12"` 是**下限**，所以下限本身必须真跑一次：
+    # 只在 3.13 上绿，等于没验证 3.12 用户装得上、跑得动。
+    # fail-fast: false —— 两个版本各自跑完，才能看出"只有 3.12 挂在某处"这类版本差异。
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    # 集成测试要真实 PostgreSQL（测试不拿 sqlite 冒充），所以起一个服务容器。
+    # 少了这段，CI 一推就红，比没有 CI 更糟。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ling
+          POSTGRES_PASSWORD: ling
+          POSTGRES_DB: ling_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U ling"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LING_TEST_DATABASE_URL: postgresql+asyncpg://ling:ling@127.0.0.1:55432/ling_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: 安装
+        run: |
+          python -m pip install -U pip build
+          pip install -e ".[dev]"
+      - name: 静态检查
+        run: |
+          # 用 `ruff check .` 而不是列目录：原来列的是 `src tests connectors deploy/update`，
+          # 已经漏掉 migrations/（46 个迁移脚本 + env.py，只在部署时跑）和 scripts/
+          # （check_release.py 决定能不能发版）。都是"平时不碰、一碰就是生产"的代码，
+          # 手工白名单只会继续漏；仓库当前整体就只剩 1 个既有违例（见下），
+          # 全量规则不会比白名单多出额外噪声。CONTRIBUTING.md 写的也是 `ruff check .`。
+          # 唯一的既有违例：src/ling/capabilities/chunking.py:230 SIM108（不在本条改动范围内）。
+          # 不加 `ruff format --check`：仓库级 format 基线本来就有大量未通过项，
+          # 把它开成门禁会逼着一次全仓重排，与本条检查无关。
+          ruff check .
+          mypy src connectors
+          # 兜底语法检查：执行器即使将来被排除出 ruff，也不能连编译都过不去。
+          python -m py_compile deploy/update/*.py
+          # 部署脚本也要能被 bash 解析（bash 3.2 兼容；不执行任何命令）。
+          for script in deploy/install.sh deploy/entrypoint.sh deploy/backup/*.sh; do
+            bash -n "$script"
+          done
+      - name: 校验可信发布目录（catalog.py validate）
+        # 独立具名 step，不埋进 `静态检查` 的多行 run 里：发布目录是"网页更新
+        # 按钮能指向哪个目标"的唯一信任锚（deploy/releases.json），它坏掉时
+        # 必须在 job 列表上一眼看到是哪条门禁红，而不是从一堆 ruff/mypy 输出里找。
+        # 只用标准库（catalog.py 文件头写明），所以不需要额外装依赖；release.yml
+        # 通过 `uses: ./.github/workflows/ci.yml` 复用本 job，打 tag 发版时同样会跑。
+        run: python deploy/release/catalog.py validate
+      - name: 迁移链 + alembic check
+        # 迁移冒烟单跑一步：它在非 PostgreSQL 环境会 **skip**（不是 fail），
+        # 埋在整包 pytest 里会静默消失。先确认端口真的可连，再把这一步的成败
+        # 单独暴露在 job 列表上——省得"迁移链断了"被误读成业务测试的问题。
+        run: |
+          python - <<'PY'
+          import socket
+          socket.create_connection(("127.0.0.1", 55432), timeout=5).close()
+          print("postgres 55432 可连")
+          PY
+          pytest tests/integration/test_migrations.py -q
+      - name: 测试
+        run: pytest tests -q
+        env:
+          LING_TEST_MODE: "1"
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/web-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: clients/web-console/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build

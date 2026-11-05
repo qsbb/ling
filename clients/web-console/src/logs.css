@@ -1,0 +1,264 @@
+/*
+ * 运行日志页（/logs）的样式。
+ *
+ * 为什么单独一个文件：`styles.css` 由并行任务在改，这里只加日志页需要的规则，
+ * 类名统一 `logs-` / `logs__` 前缀，不碰其它页面。
+ *
+ * 三条约束：
+ * 1. 列表是**等宽字体**、按列对齐：日志排查靠的是快速扫读时间与 logger，
+ *    比例字体里每一行的列宽都在变，扫不动。
+ * 2. 长消息**必须换行**（`overflow-wrap: anywhere`）而不是横向滚动：日志里
+ *    有 URL、文件路径、没有空格的长串，横向滚动会让"看完整一行"变成操作。
+ * 3. 375px 单列、无横向溢出；触控目标 ≥44×44（仅窄屏）。
+ */
+
+.page.logs-page {
+  /* 列表自己滚，页面不再整体滚动：顶部控件要一直看得见 */
+  overflow: hidden;
+  gap: 12px;
+  /* 让下面的 viewport 能算出剩余高度（flex: 1 + min-height: 0） */
+  min-height: 0;
+}
+
+.logs__boundary {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  padding: 8px 10px;
+  border-left: 2px solid var(--line-strong);
+  background: rgba(0, 0, 0, 0.015);
+  border-radius: 0 8px 8px 0;
+  text-wrap: pretty;
+}
+
+/* ------------------------------------------------------------------ 控件行 */
+
+.logs__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  flex: none;
+}
+
+.logs__control {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.logs__control--grow {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+.logs__control-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-faint);
+}
+
+.logs__select,
+.logs__input {
+  max-width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.logs__count {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  /* 条数说明会换行，别把按钮挤走 */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ 列表 */
+
+.logs__viewport {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  /* 滚动容器自己留内边距：最后一行不会被圆角切掉 */
+  padding: 6px 0;
+}
+
+.logs__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.logs__row {
+  display: grid;
+  /* 时间 / 级别 / logger 固定列宽，消息吃掉剩下的；等宽字体下三列会真的对齐 */
+  grid-template-columns: 84px 62px minmax(90px, 190px) minmax(0, 1fr);
+  gap: 10px;
+  padding: 2px 12px;
+  border-left: 2px solid transparent;
+  align-items: baseline;
+}
+
+.logs__row:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.logs__row--error {
+  border-left-color: var(--danger);
+  background: rgba(157, 69, 58, 0.045);
+}
+
+.logs__row--warning {
+  border-left-color: var(--warn);
+  background: rgba(125, 95, 34, 0.04);
+}
+
+.logs__row--debug {
+  color: var(--ink-faint);
+}
+
+.logs__time {
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.logs__level {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  /* 级别列定宽 + 等宽字体：四种长度的级别名（INFO/WARNING）不会把消息列推歪 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logs__level--error {
+  color: var(--danger);
+}
+
+.logs__level--warning {
+  color: var(--warn);
+}
+
+.logs__level--info {
+  color: var(--ink-soft);
+}
+
+.logs__level--debug {
+  color: var(--ink-faint);
+}
+
+.logs__logger {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logs__message {
+  color: var(--ink);
+  /* 长 URL / 路径 / 无空格串必须能断行，否则整页横向滚动 */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  min-width: 0;
+}
+
+.logs__row--debug .logs__message {
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------------ 状态 */
+
+.logs__empty-row {
+  list-style: none;
+}
+
+.logs__empty {
+  margin: 24px 16px 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.logs__empty-hint {
+  margin: 0 16px 24px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  text-wrap: pretty;
+}
+
+.logs__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 30vh;
+  color: var(--ink-faint);
+  font-size: 13px;
+}
+
+/* ------------------------------------------------------------------ 窄屏 */
+
+@media (max-width: 900px) {
+  /* 手机上给列表更多高度：控件行占掉两行之后，剩下的空间不够看几行日志 */
+  .page.logs-page {
+    padding: 14px 12px 18px;
+  }
+
+  /* 375px 放不下四列：时间与级别并到第一行，logger 与消息在下面。
+     不改成横向滚动——那会让"读一条完整日志"变成左右拖。 */
+  .logs__row {
+    grid-template-columns: 84px minmax(0, 1fr);
+    grid-template-areas:
+      'time level'
+      'logger logger'
+      'message message';
+    row-gap: 1px;
+    padding: 6px 10px;
+  }
+
+  .logs__time {
+    grid-area: time;
+  }
+
+  .logs__level {
+    grid-area: level;
+  }
+
+  .logs__logger {
+    grid-area: logger;
+  }
+
+  .logs__message {
+    grid-area: message;
+  }
+
+  .logs__count {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  /* 触控目标 ≥44×44（下拉/输入/按钮都要够得着） */
+  .logs__select,
+  .logs__input,
+  .logs__toolbar .button {
+    min-height: 44px;
+  }
+}

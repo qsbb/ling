@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "Visibility": {
+      "enum": [
+        "actor_private",
+        "subject_private",
+        "window_private",
+        "group_scope",
+        "public",
+        "admin_only"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/HandoffCapsule.schema.json",
+  "additionalProperties": false,
+  "description": "同人跨端交接胶囊：默认 30 分钟、仅本人已绑定私聊端。",
+  "properties": {
+    "capsule_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Capsule Id",
+      "type": "string"
+    },
+    "consent_revision": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Consent Revision",
+      "type": "integer"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "expires_at": {
+      "format": "date-time",
+      "title": "Expires At",
+      "type": "string"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "recent_topic": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Recent Topic"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "short_quote": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Short Quote"
+    },
+    "source_window_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Source Window Id",
+      "type": "string"
+    },
+    "subject_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Subject Id",
+      "type": "string"
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility",
+      "default": "subject_private"
+    }
+  },
+  "required": [
+    "capsule_id",
+    "subject_id",
+    "source_window_id",
+    "created_at",
+    "expires_at"
+  ],
+  "title": "HandoffCapsule",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

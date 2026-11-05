@@ -1,0 +1,29 @@
+# ling 更新执行器 systemd 单元示例。
+#
+# 安装：
+#   sudo install -m 0644 deploy/update/ling-update.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ling-update
+#
+# 前置：已执行 `sudo deploy/update/executor.py --config /etc/ling-update.toml init`
+# 并完成 adopt-current。执行器需要 docker 权限与读写 state_dir 的权限，还需要
+# 出网访问 https://api.github.com（固定 qsbb/ling，只读查询 Release/tag）。
+[Unit]
+Description=ling host update executor (no Docker socket in API)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+# 需要 root 才能调用 docker 与把 requests_dir 的属组设为 API gid。
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /srv/ling/deploy/update/executor.py --config /etc/ling-update.toml run
+Restart=on-failure
+RestartSec=5
+# 执行器会写宿主私有日志/备份；不要设置 ProtectSystem=strict 之类会挡住
+# state_dir 的沙箱选项。stdout/stderr 只落在 journal，不进入 Web。
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

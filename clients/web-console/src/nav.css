@@ -1,0 +1,465 @@
+/**
+ * 外壳：左导航（rail ↔ 展开）、窄屏抽屉、浮层层级。
+ *
+ * 为什么单独一个文件（和 `dashboard.css` / `memory.css` 同一个理由）：
+ * `styles.css` 由并行任务在改，这里只加新类名（`sidenav__*` / `nav-drawer__*` /
+ * `app__*`），不重写既有规则；唯一动到 `styles.css` 的地方是 `.brand` 的触控高度，
+ * 那是已知不合规项（实测 64.77×41.59 < 44×44），必须当场修掉。
+ *
+ * 视觉全部沿用 `styles.css` 既有 token（`--paper*` / `--ink*` / `--line*` /
+ * `--accent*`），不引入新色板；圆角与阴影也用 `--radius-*` / `--shadow-*`。
+ */
+
+:root {
+  /* 侧栏两档宽度（用户拍板的 56 ↔ 200） */
+  --nav-w-rail: 56px;
+  --nav-w-expanded: 200px;
+  /* 窄屏可点区域的最小边长（F7 硬约束） */
+  --tap-min: 44px;
+  /* 浮层层级：scrim < 会话列表 < 导航抽屉 scrim < 导航抽屉。
+     导航抽屉永远在最上面——它是所有页面共用的那一片。 */
+  --z-overlay-scrim: 40;
+  --z-overlay-session: 50;
+  --z-overlay-nav-scrim: 60;
+  --z-overlay-nav: 70;
+}
+
+/* ------------------------------------------------------------ 外壳骨架 */
+
+/*
+ * 页头仍然横贯整宽（brand / 用户名 / 登出留在原处，Step 4 才收），
+ * 左导航在页头之下与正文并列：两列 flex，侧栏 flex:none，正文 flex:1。
+ * 不用 absolute/负 margin —— 侧栏与内容区不重叠，也不会产生横向滚动。
+ */
+.app__body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.app__column {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main {
+  min-width: 0;
+}
+
+/* 页头里的「打开导航」：窄屏才出现（由 JS 按同一断点决定是否渲染） */
+.app-header__nav-toggle {
+  display: none;
+}
+
+/*
+ * 桌面账号区（用户名 + 退出）。窄屏由抽屉底部的 `nav-account` 承接，
+ * App.tsx 按同一断点只渲染其中一份（避免两个 `nav-logout`）。
+ */
+.app-header__account {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------ 桌面侧栏 */
+
+.sidenav {
+  flex: none;
+  width: var(--nav-w-rail);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 6px;
+  border-right: 1px solid var(--line);
+  background: rgba(247, 244, 237, 0.55);
+  overflow-x: hidden;
+  overflow-y: auto;
+  transition: width 0.18s ease;
+}
+
+.sidenav[data-expanded='true'] {
+  width: var(--nav-w-expanded);
+  padding: 10px 10px;
+}
+
+.sidenav__toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 40px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-faint);
+}
+
+.sidenav__toggle:hover {
+  background: rgba(0, 0, 0, 0.045);
+  color: var(--ink);
+}
+
+.sidenav__chevron {
+  transition: transform 0.18s ease;
+}
+
+/* rail 态：箭头朝右（点一下展开），展开态朝左（点一下收起） */
+.sidenav__chevron--rail {
+  transform: rotate(180deg);
+}
+
+.sidenav__nav {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidenav__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidenav__list-item {
+  min-width: 0;
+}
+
+.sidenav__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.sidenav__item:hover {
+  background: rgba(0, 0, 0, 0.045);
+  color: var(--ink);
+}
+
+.sidenav__item--active {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.sidenav__item--active:hover {
+  background: var(--accent-soft);
+}
+
+.sidenav__item--active .sidenav__icon {
+  color: var(--accent);
+}
+
+.sidenav__icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: inherit;
+}
+
+.sidenav__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * rail 态：文字「视觉隐藏」而不是 `display:none`。
+ * `display:none` 会把按钮的可访问名字一起删掉，读屏与 Playwright 的
+ * `getByRole(name)` 都会读到一个没有名字的按钮。
+ */
+.sidenav[data-expanded='false'] .sidenav__item {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.sidenav[data-expanded='false'] .sidenav__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.sidenav__foot {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidenav__version {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.sidenav__version:hover {
+  border-color: var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.sidenav__version-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+.sidenav__version-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 折叠时版本号只留一个小圆点：`v0…` 这种省略号比没有更难看，也读不出信息。
+ * 版本号本身仍在 `title` / `aria-label` 上（鼠标悬停与读屏都能拿到）。
+ */
+.sidenav[data-expanded='false'] .sidenav__version {
+  align-self: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  justify-content: center;
+}
+
+.sidenav[data-expanded='false'] .sidenav__version-text {
+  display: none;
+}
+
+.sidenav[data-expanded='false'] .sidenav__version-dot {
+  width: 6px;
+  height: 6px;
+}
+
+/* ------------------------------------------------------------ 窄屏抽屉 */
+
+/*
+ * 抽屉 portal 到 `document.body`：`.app-header` 的 backdrop-filter 会形成
+ * 包含块，`position: fixed; inset: 0` 放进 header 里只会盖住 header 本身。
+ * 这里的两层 z-index 就是「scrim < 抽屉」：scrim 60、面板 70，
+ * 而会话列表在 50，所以抽屉一定盖在它上面（两片本来也互斥）。
+ */
+.nav-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay-nav);
+  display: flex;
+}
+
+.nav-drawer__scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay-nav-scrim);
+  border: 0;
+  padding: 0;
+  background: rgba(35, 30, 24, 0.36);
+  cursor: pointer;
+}
+
+.nav-drawer__panel {
+  position: relative;
+  z-index: var(--z-overlay-nav);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(84vw, 300px);
+  height: 100%;
+  padding: 12px 10px 16px;
+  background: var(--paper-sunken);
+  border-right: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-soft);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.nav-drawer__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.nav-drawer__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-drawer__close {
+  flex: none;
+}
+
+/*
+ * 抽屉底部的账号区（用户名 + 退出登录）。
+ *
+ * 它是窄屏的账号归宿：页头在 ≤900 不渲染账号区（用户名与退出在页头会被
+ * 挤没），所以「能退出」这件事不能只留在桌面。放在 `aria-label="主导航"`
+ * 之外：退出是动作，不是导航目的地（见 Navigation.tsx 的注释）。
+ */
+.nav-drawer__account {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.nav-drawer__user {
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-drawer__logout {
+  color: var(--ink-soft);
+}
+
+/*
+ * 账号页的「退出登录」：抽屉把退出放到手边之后，它成了移动端的主路径之一。
+ * 实测原尺寸 85.09×39.59（高差 4.41px），窄屏触控下限是 44×44。
+ * 只补命中区，字号/内边距/视觉密度一律不动。
+ *
+ * 「85.09×39.59」是**实测快照**（2026-11-01 实测，若样式演进需重新量）：
+ * 它不是设计目标，只是「当时差多少才不达标」的记录。改过字号/内边距/字体之后
+ * 这组数字就过期了，重新量一遍再决定要不要动这里，不要拿它当常量。
+ */
+.account-logout {
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+}
+
+/* ------------------------------------------------------------ 响应式 */
+
+/*
+ * >900：聊天页那个「打开会话列表」的 ≡ 必须真的不可见。
+ *
+ * 为什么是隐藏、而不是把它做成桌面上真能开能关的会话列表开关：
+ * `>900` 时 `.chat-layout` 是 `292px + 1fr` 的两列网格，会话列表本来就是
+ * **常驻的一列**，没有一个「关着」的状态可供打开；这个按钮在桌面点了只会
+ * 置 `aria-expanded` 并锁住 body 滚动，页面毫无变化（QA-TASK102 §5③ 实测），
+ * 还把 brand 从 x=16 挤到 x=62。要让它「真能开能关」，得新增一套桌面会话
+ * 列表折叠功能（内容区重排、重新打开的入口、新的布局断言），那是另一件事，
+ * 不在这一步的收尾范围里。`≤900` 时它仍是真入口（覆盖式会话列表），
+ * 所以只隐藏、不删除。
+ *
+ * 选择器写成 `.app-header .app-header__menu`（0,2,0）：`styles.css` 里
+ * `.icon-button { display:inline-flex }`（0,1,0，源码顺序在后）会覆盖
+ * `.app-header__menu { display:none }`——这正是 QA-TASK102 L1 的成因。
+ * 提高一级优先级后，即使有人把 nav.css 的 import 挪到 styles.css 前面，
+ * 桌面也不会再冒出这个死按钮。
+ */
+@media (min-width: 901px) {
+  .app-header .app-header__menu {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  /*
+   * 侧栏与「打开导航」由 JS 按同一断点切换渲染（rail 不在 DOM 里 → 不会有
+   * 隐藏的重复 testid）。这里再兜一层：万一 CSS 与 JS 的断点漂了，
+   * 宁可不要侧栏，也不要让 1440 的 rail 挤在 375 的屏幕里。
+   */
+  .app-header__nav-toggle {
+    display: inline-flex;
+  }
+
+  .sidenav {
+    display: none;
+  }
+
+  /* 外壳可交互元素窄屏 ≥44×44（F7） */
+  .app-header .brand,
+  .app-header .icon-button,
+  .app-header .header-link {
+    min-width: var(--tap-min);
+    min-height: var(--tap-min);
+  }
+
+  .nav-drawer__panel .sidenav__item {
+    min-height: var(--tap-min);
+    font-size: 14.5px;
+  }
+
+  .nav-drawer__panel .sidenav__version {
+    min-height: var(--tap-min);
+    padding: 4px 12px;
+    font-size: 12px;
+  }
+
+  .nav-drawer__close {
+    width: var(--tap-min);
+    height: var(--tap-min);
+  }
+
+  /* 会话列表浮层的层级对齐 token（原先是写死的 40） */
+  .sidebar {
+    z-index: var(--z-overlay-session);
+  }
+
+  .sidebar__scrim {
+    z-index: var(--z-overlay-scrim);
+  }
+
+  .sidebar__panel {
+    z-index: var(--z-overlay-session);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidenav,
+  .sidenav__chevron {
+    transition: none;
+  }
+}

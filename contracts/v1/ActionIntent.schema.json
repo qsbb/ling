@@ -1,0 +1,60 @@
+{
+  "$id": "https://ling.local/contracts/v1/ActionIntent.schema.json",
+  "additionalProperties": false,
+  "description": "模型提出的行动候选；确定性代码决定是否执行。",
+  "properties": {
+    "intent_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Intent Id",
+      "type": "string"
+    },
+    "kind": {
+      "title": "Kind",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "requires_confirmation": {
+      "default": true,
+      "title": "Requires Confirmation",
+      "type": "boolean"
+    },
+    "reversible": {
+      "default": false,
+      "title": "Reversible",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "target_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "保留位：动作对象由 payload 内的字段表达，目前不由这里指定",
+      "title": "Target Ref"
+    }
+  },
+  "required": [
+    "intent_id",
+    "kind"
+  ],
+  "title": "ActionIntent",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}
