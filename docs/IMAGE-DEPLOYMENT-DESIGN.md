@@ -134,6 +134,23 @@ GHCR 若为私有，宿主使用只有该 package `read:packages` 的凭据，�
 | 5 | 收口文档与旧路径 | 更新 `docs/DEPLOYMENT.md`、`docs/UPDATES.md`、`deploy/env.example`、相关测试；纠正 `UPDATES.md` 中“尚无正式 Release”的过期表述；明确旧安装器仅支持源码模式 |
 | 6（另议） | 镜像版 Web 更新执行器 | 完成 digest 绑定、宿主权限、状态机、人工门禁、真实 Docker 升级和恢复演练后，才讨论启用 `LING_UPDATE_ENABLED=1` |
 
+> **实施变更（开关与发布预检解耦）**：上表第 6 行的"启用"不再受 `publish.py` 的
+> 预检阻拦。`publish.py` 曾经硬要求 api 的 `LING_UPDATE_ENABLED` 必须是 `"0"`，
+> 否则 `failed_preflight` / `compose_env`——这条来自 P2 的人工发布脚本，与网页
+> 更新通道**互锁**（点更新 → 开关必须=1 → 更新器 → 预检要求=0 → 必然失败；生产
+> 实测 201 之后停在 `failed_not_started` / `compose_env`）。已删除。
+>
+> 安全性依据：并发**不靠开关值**保证，靠 `deploy/updater/updater.py` 的**两把锁**
+> ——`updater.lock` 单飞（flock 包住「读任务、认领请求、处理」整段，请求文件
+> `rename` 认领，同一 `request_id` 不处理两次）；跨工具 `.ling-install.lock`
+> 复用 `publish.InstallLock`，与 `install.sh` / `ling install` / 人工 `publish.py` /
+> 宿主执行器**同一把**，从处理请求前持有到验证结束，拿不到就**立即**
+> `needs_manual(install_lock_busy)`（不等待、不跳过）。开关的观察值改为写进发布
+> 记录 `record.compose_env`，事后可审计。同一处**保留**了
+> `LING_RUN_MIGRATIONS` 必须为 `"0"` 的断言（迁移必须是发布流程里的一次显式动作）。
+> 回归：`tests/test_release_publish.py` 的 `compose_env` 用例 +
+> `tests/test_updater.py::test_web_update_chain_passes_preflight_with_switch_on`。
+
 测试应覆盖镜像内静态文件/manifest、`/v1/version` 与镜像标注一致性、两架构拉取、Compose 挂载解析、迁移单次执行、备份恢复及失败注入；现有 `tests/test_deploy_install.py`、`tests/test_deploy_update_wiring.py`、`tests/test_update_executor.py` 针对源码模式的断言不能简单删除，新增镜像模式测试并显式划分旧契约。
 
 ## 8. 尚待现场确认

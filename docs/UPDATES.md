@@ -867,6 +867,10 @@ fail-closed 判据）；必须先人工迁移。
   `.ling-install.lock` → 维护门禁 → 复用 `publish.py` 的预检/拉取/备份/迁移门禁 →
   把目标摘要写回受限 `.env` 的 `LING_APP_IMAGE` → 容器网络内验证 → 才发布宿主端口
   → 写**脱敏**状态文件。
+- `publish.py` 的预检**不再要求** `LING_UPDATE_ENABLED=0`（见 §10.7）：那条断言曾
+  让「网页点更新 → 201 → 更新器 → 预检」必然失败在 `compose_env`。现在开关=1 也
+  能跑完，并发由上面那两把锁（`updater.lock` + `.ling-install.lock`）保证，观察到的
+  开关值写进私有发布记录 `record.compose_env`。
 - 它不信任请求里的任何东西，也不跑目标镜像里的部署脚本：发布逻辑只从发行包里那份
   只读 `publish.py` 加载。
 - 私有文件（`task.json`、`journal.log`、`release-<id>.json`）留在状态目录，
@@ -904,9 +908,26 @@ fail-closed 判据）；必须先人工迁移。
 
 ### 10.7 开关（`LING_UPDATE_ENABLED` 默认 0）与打开它的前置条件
 
-- 默认 0；镜像模式主文件 `deploy/compose.image.yaml` 里这一项是**字面量 `"0"`**，
-  **只改 `.env` 打不开它**——这是有意的：挂上目录 ≠ 打开开关，避免“开关开了却没
-  人执行”。
+- 默认 0；镜像模式主文件 `deploy/compose.image.yaml` 里这一项是**插值且默认 0**
+  （`${LING_UPDATE_ENABLED:-0}`；正规打开入口是 `ling install --with-updater
+  --enable-updates`，它会在受限 `.env` 里**显式写 1**）。默认关的语义是"网页可以
+  发起更新"这个**入口**默认不开——挂上目录 ≠ 打开开关，开关打开 ≠ 可以并发升级。
+- **开关不影响发布预检**：`publish.py` 曾经硬要求 api 的 `LING_UPDATE_ENABLED`
+  必须是 `"0"`，否则 `failed_preflight` / `compose_env`。那条断言来自 P2 的人工
+  发布脚本（写在网页更新之前），后来没人清理，于是和更新通道**互锁**：点「更新」
+  → API 要开关=1 才收请求 → 更新器接手 → 调 `publish.py` → 这里要开关=0 → 必然
+  失败（实测 `POST /v1/version/image-update-requests` 返回 201 之后停在
+  `failed_not_started` / `preflight_failed` / `compose_env`）。现在：**开关=0 或 1
+  都能跑**，观察到的值写进发布记录 `record.compose_env` 供事后审计。
+- 并发不由开关值保证，由 `deploy/updater/updater.py` 的**两把锁**保证：
+  `updater.lock` 单飞（flock 包住「读任务、认领请求、处理」整段，请求文件用
+  `rename` 认领，同一 `request_id` 不处理两次）；跨工具 `.ling-install.lock`
+  （与 `install.sh` / `ling install` / 人工 `publish.py` / 宿主执行器**同一把**，
+  从处理请求前持有到验证结束，拿不到就**立即** `needs_manual(install_lock_busy)`，
+  不等待）。
+- 仍然**保留**的断言是 `LING_RUN_MIGRATIONS` 必须为 `"0"`：迁移必须是发布流程里
+  的一次显式动作（`run --rm --no-deps -e LING_RUN_MIGRATIONS=1 api migrate`），不
+  能让 api 启动时隐式迁移。它和开关无关，删开关那条时**没有**一起删。
 - **不要把两条通道的开关混为一谈**：镜像模式主文件的 `LING_UPDATE_ENABLED`
   默认取 `0`（插值，显式打开才为 1）；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
   `install.sh` **子进程环境**里设 `LING_UPDATE_ENABLED=1`（源码模式通道自己的
@@ -944,6 +965,11 @@ fail-closed 判据）；必须先人工迁移。
     `no_available_target`、网页按钮禁用。这是**诚实可用**（通道代码就绪、
     没有可用目标），不是 bug；要出现目标，先有正式发布并把条目 `catalog.py add`
     进去。
+- **这里列的不再包含"`publish.py` 要求开关=0"**：那条断言已删除（§10.7）。
+  开关=1 时更新器→`publish.py` 的预检不再抛 `failed_preflight` / `compose_env`；
+  `tests/test_updater.py::test_web_update_chain_passes_preflight_with_switch_on`
+  与 `tests/test_release_publish.py` 的开关用例钉住这一点。上表三条仍是"不能宣称
+  可一键更新"的**真实**原因。
 - **待现场确认**：GHCR package 可见性、宿主架构、真实部署路径与端口、更新器在
   目标 NAS 上的 Docker socket/gid 对应关系（`ling install` 会 `stat` socket 取 gid，
   但实际取值未在现场核对过）。

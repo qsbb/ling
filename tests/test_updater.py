@@ -2421,6 +2421,85 @@ def test_install_lock_is_released_after_success(ws: Workspace) -> None:
         probe.release()
 
 
+# ---------------------------------------------------------------- 开关不再互锁
+#
+# 网页一键更新的真实顺序：用户点「更新」→ `POST /v1/version/image-update-requests`
+# （要求 `LING_UPDATE_ENABLED=1` 才收）→ 更新器接手 → 调 `publish.py`。而
+# `publish.py` 的预检**曾经**硬要求 `LING_UPDATE_ENABLED=0`，于是两边互锁，功能
+# 从来走不通（生产实测：201 之后 failed_not_started / preflight_failed /
+# compose_env）。下面这条走**真实入口**（真跑 `updater.py`，它自己按路径加载
+# `publish.py`），在 compose 模型里把开关设成 1，证明整条链能走完。
+#
+# 并发不靠开关值保证：`updater.lock` 单飞 + 跨工具 `.ling-install.lock`，
+# 见上面「跨工具安装锁」那组用例（锁被占用时**立即** needs_manual，不等待）。
+
+
+def test_web_update_chain_passes_preflight_with_switch_on(ws: Workspace) -> None:
+    """开关=1 时更新器 → publish 预检必须放行，且记录里留下开关实况。"""
+    config = _config_json(ws.http.port)
+    config["services"]["api"]["environment"]["LING_UPDATE_ENABLED"] = "1"
+    ws.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    write_request(ws)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    # 失败码里不能再出现 compose_env / preflight_failed（那正是互锁的症状）。
+    assert "compose_env" not in result.stderr, result.stderr
+    task = ws.task()
+    assert task["state"] == "succeeded"
+    assert task["failure"] is None
+
+    # 发布记录是更新器跑 publish.Context 时写的私有 JSON：开关的**观察值**在里面。
+    records = sorted(ws.state_dir.glob(f"release-{REQUEST_ID}.json"))
+    assert len(records) == 1, sorted(ws.state_dir.iterdir())
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["status"] == "success"
+    assert record["compose_env"] == {
+        "LING_UPDATE_ENABLED": "1",
+        "LING_RUN_MIGRATIONS": "0",
+    }
+    # 迁移仍然只有那一次显式动作（开关=1 没有让 api 变成"启动即迁移"）。
+    migrate_calls = [line for line in ws.compose_calls() if " run " in line]
+    assert len(migrate_calls) == 1, migrate_calls
+    assert "LING_RUN_MIGRATIONS=1" in migrate_calls[0]
+
+
+def test_install_lock_is_checked_immediately_not_waited_on(ws: Workspace) -> None:
+    """锁被占用时必须**立即** needs_manual：等待会让网页一直转圈到超时。
+
+    与 `test_install_lock_busy_needs_manual_and_touches_nothing` 的分工：那条证明
+    "什么都不做"，这条证明"没有等"。变异（把非阻塞 flock 改成阻塞等待）会让这里
+    以超时/耗时断言失败，而不是含糊地挂在 CI 里。
+    """
+    write_request(ws)
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(ws.lock_file)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert helper.stdout is not None
+        assert helper.stdout.readline().strip() == "locked"
+        started = time.monotonic()
+        result = run_updater(ws, timeout=30)
+        elapsed = time.monotonic() - started
+        # 持锁者仍然活着（stdin 还没关）——所以这不是"等到了别人释放"。
+        assert helper.poll() is None
+    finally:
+        if helper.stdin is not None:
+            helper.stdin.close()
+        helper.wait(timeout=10)
+
+    assert result.returncode == 17, (result.stdout, result.stderr)
+    assert elapsed < 15, f"锁被占用时等待了 {elapsed:.1f}s，应当立即返回"
+    task = ws.task()
+    assert task["state"] == "needs_manual"
+    assert task["failure"] == {"code": "install_lock_busy", "stage": "prepare"}
+    assert ws.docker_state()["running"] == {"api": True, "worker": True}
+    assert ws.docker_state()["alembic_version"] == HEAD_OLD
+
+
 # ---------------------------------------------------------------- 可信发布目录
 #
 # 设计依据：docs/EASY-INSTALL-UPDATE-DESIGN.md「可信发布目录只列已通过门禁、

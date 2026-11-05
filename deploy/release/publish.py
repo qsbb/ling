@@ -755,6 +755,13 @@ def new_record(options: Options) -> dict[str, Any]:
             "install": None,
             "backup": None,
         },
+        # 预检时从**合并后模型**观察到的 api 开关值（只审计，不判定）。
+        # `LING_UPDATE_ENABLED` 不再是门禁：并发由 updater.lock + InstallLock
+        # 两把锁保证，开关只表示"网页可以发起更新"。见 check_compose_model 的注释。
+        "compose_env": {
+            "LING_UPDATE_ENABLED": None,
+            "LING_RUN_MIGRATIONS": None,
+        },
         "volumes": {},
         "previous": {
             "api": None,
@@ -1685,6 +1692,16 @@ class Context:
                     f"{service_name} 没有把 {volume_key} 挂到 {target}",
                 )
         api_env = service_environment(api)
+        # 审计：把**观察到的**两个开关值写进发布记录。它们只记录、不判定，事后要能
+        # 回答"这次发布时网页更新开关是什么状态"。放在下面的门禁**之前**：预检在
+        # 后面失败时，记录里也留得下当时观察到的值。
+        self.record["compose_env"] = {
+            "LING_UPDATE_ENABLED": api_env.get("LING_UPDATE_ENABLED"),
+            "LING_RUN_MIGRATIONS": api_env.get("LING_RUN_MIGRATIONS"),
+        }
+        # 这条**保留**：迁移必须是发布流程里的一次显式动作
+        # （`run --rm --no-deps -e LING_RUN_MIGRATIONS=1 api migrate`）。api 启动时
+        # 隐式迁移会让"迁移有没有发生"失去证据，也让失败发生在维护窗口之外。
         if api_env.get("LING_RUN_MIGRATIONS") != "0":
             raise PublishError(
                 EXIT_PREFLIGHT,
@@ -1692,13 +1709,24 @@ class Context:
                 "compose_env",
                 "api 的 LING_RUN_MIGRATIONS 不是 0；镜像模式必须由发布流程单次显式迁移",
             )
-        if api_env.get("LING_UPDATE_ENABLED") != "0":
-            raise PublishError(
-                EXIT_PREFLIGHT,
-                "failed_preflight",
-                "compose_env",
-                "api 的 LING_UPDATE_ENABLED 不是 0；本阶段不允许 Web 一键更新",
-            )
+        # 这里**曾经**有一条硬断言：`LING_UPDATE_ENABLED` 必须是 `"0"`，否则
+        # `failed_preflight`/`compose_env`（"本阶段不允许 Web 一键更新"）。
+        # 它来自 P2 的人工发布脚本，写在网页一键更新功能之前，后来一直没人清理，
+        # 于是和更新通道**互锁**：用户点更新 → API 要求开关=1 才收请求 → 更新器
+        # 接手 → 调本脚本 → 这里要求开关=0 → 必然失败
+        # （实测 201 之后 stop 在 failed_not_started / compose_env）。
+        #
+        # 为什么现在可以安全去掉：**并发不由开关值保证，由锁保证**，共两把
+        # （见 deploy/updater/updater.py 设计文档「两把锁」）：
+        #   1. 单飞：`<state-dir>/updater.lock` 的 flock 包住「读任务、认领请求、
+        #      处理」整段，请求文件用 rename 认领（并发只有一个成功），同一
+        #      `request_id` 不会被处理两次；
+        #   2. 跨工具安装锁：复用本文件的 `InstallLock`，与 install.sh /
+        #      `ling install` / 手动 publish.py / 宿主更新执行器**同一把锁**，
+        #      从处理请求前持有到验证结束，拿不到就立即 `needs_manual`。
+        # 所以"开关=1 会并发升级"这个担心不成立；开关只表示"网页可以发起更新"，
+        # 实际执行仍然单飞、仍然与人工发布互斥。删除后开关的观察值照常进
+        # `record["compose_env"]`，事后可审计。
         if api_env.get("LING_PORT") != "6520":
             raise PublishError(
                 EXIT_PREFLIGHT,

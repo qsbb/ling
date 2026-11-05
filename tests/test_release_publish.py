@@ -1393,6 +1393,133 @@ def test_worker_without_healthcheck_fails_preflight(
     assert record["failure"]["step"] == "compose_healthcheck"
 
 
+# ------------------------------------------ 预检：api 开关（compose_env 门禁）
+#
+# 历史：`check_compose_model` 曾要求 `LING_UPDATE_ENABLED` 必须是 `"0"`（P2 人工
+# 发布脚本的"本阶段不允许 Web 一键更新"），而网页更新又要求它是 `"1"` 才收请求。
+# 两边互锁，功能从来走不通（生产实测：201 之后 failed_not_started / compose_env）。
+# 并发已由「updater.lock 单飞 + 跨工具 .ling-install.lock」两把锁解决，所以那条
+# 断言删掉；`LING_RUN_MIGRATIONS == "0"` **保留**（迁移必须是发布流程里的一次显式
+# 动作），观察到的两个开关值写进发布记录供事后审计。
+
+
+def _compose_env_preflight(publish: Any, model: dict[str, Any]) -> Any:
+    """只跑 compose 模型门禁并返回 context（为了读它写下的发布记录）。
+
+    不走 `run_publish`：开关门禁要能独立于其它预检失败被观察，直接调门禁函数才能
+    让变异（把断言加回去 / 删掉迁移断言 / 不写记录）各自只红对应用例。
+    """
+    options = publish.Options(
+        target=TARGET,
+        target_hex=TARGET_HEX,
+        compose_file=REAL_IMAGE_COMPOSE,
+        compose_override=None,
+        env_file=REPO_ROOT / "deploy" / ".env",
+        project=str(model.get("name") or "ling"),
+        backup_dir=Path("/nonexistent/ling-backups"),
+        backup_script=Path("/nonexistent/backup.sh"),
+        record_path=Path("/nonexistent/release.json"),
+        snapshot_dir=Path("/nonexistent/release-test"),
+        source_commit=None,
+        ready_timeout=2.0,
+        health_timeout=2.0,
+        migrate_timeout=10.0,
+        backup_timeout=10.0,
+    )
+    context = publish.Context(options)
+    context.config = model
+    context.check_compose_model()
+    return context
+
+
+def _model_with_api_env(**overrides: Any) -> dict[str, Any]:
+    """真实 compose 模型 + 覆盖 api 的开关值（`None` = 删掉该键）。"""
+    model = _real_image_compose_model(16520)
+    env = model["services"]["api"]["environment"]
+    for key, value in overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return model
+
+
+@pytest.mark.parametrize(
+    ("switch", "expected"),
+    [
+        ("1", "1"),  # 网页一键更新开着：更新器接手后必须能过预检（原来这里必红）
+        ("0", "0"),  # 关着：老路径不能因为删断言一起坏掉
+        (None, None),  # 模型里干脆没有这个键：不是失败条件，记录为 null
+    ],
+)
+def test_update_enabled_switch_is_not_a_preflight_gate(
+    switch: str | None, expected: str | None
+) -> None:
+    publish = _publish_module()
+    context = _compose_env_preflight(
+        publish, _model_with_api_env(LING_UPDATE_ENABLED=switch)
+    )
+    # 门禁跑完了（没抛）：开关只是被观察到，不是失败条件。
+    assert context.record["compose_env"]["LING_UPDATE_ENABLED"] == expected
+    assert context.record["compose_env"]["LING_RUN_MIGRATIONS"] == "0"
+
+
+def test_run_migrations_must_stay_zero_even_when_switch_is_on() -> None:
+    """`LING_RUN_MIGRATIONS` 的断言不能跟着开关那条一起被删掉。
+
+    api 启动时隐式迁移会让"迁移有没有发生"失去证据；stage 必须是 `compose_env`。
+    """
+    publish = _publish_module()
+    with pytest.raises(publish.PublishError) as excinfo:
+        _compose_env_preflight(
+            publish,
+            _model_with_api_env(LING_UPDATE_ENABLED="1", LING_RUN_MIGRATIONS="1"),
+        )
+    assert excinfo.value.exit_code == publish.EXIT_PREFLIGHT
+    assert excinfo.value.status == "failed_preflight"
+    assert excinfo.value.step == "compose_env"
+    assert "LING_RUN_MIGRATIONS" in excinfo.value.message
+
+
+@pytest.mark.parametrize("switch", ["0", "1"])
+def test_publish_record_keeps_observed_update_switch(ws: Workspace, switch: str) -> None:
+    """发布记录里必须有**观察到的**开关值（切到 0 或 1 都要能事后审计）。
+
+    走真实入口 `run_publish`：记录是脚本自己写的 JSON，不是内存里的字典。
+    """
+    config = _config_json(ws.http.port)
+    config["services"]["api"]["environment"]["LING_UPDATE_ENABLED"] = switch
+    ws.config_path.write_text(json.dumps(config), encoding="utf-8")
+    result = run_publish(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    record = ws.record()
+    assert record["compose_env"] == {
+        "LING_UPDATE_ENABLED": switch,
+        "LING_RUN_MIGRATIONS": "0",
+    }
+
+
+def test_update_switch_on_survives_the_whole_publish_run(ws: Workspace) -> None:
+    """开关=1 时**整条发布链**都要走通，不能只在预检里放行。
+
+    原来这条会停在 exit 10 / `failed_preflight` / `compose_env`——这正是生产里
+    「网页点更新 → 201 → 更新器 failed_not_started」的最后一环。
+    """
+    config = _config_json(ws.http.port)
+    config["services"]["api"]["environment"]["LING_UPDATE_ENABLED"] = "1"
+    ws.config_path.write_text(json.dumps(config), encoding="utf-8")
+    result = run_publish(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    record = ws.record()
+    assert record["status"] == "success"
+    assert record["failure"] is None
+    assert record["compose_env"]["LING_UPDATE_ENABLED"] == "1"
+    # 迁移仍然只有那一次显式动作（开关=1 没有让 api 变成"启动即迁移"）。
+    migrate_calls = [line for line in compose_calls(ws) if " run " in line]
+    assert len(migrate_calls) == 1, migrate_calls
+    assert "LING_RUN_MIGRATIONS=1" in migrate_calls[0]
+
+
 # ------------------------------- 预检：更新通道挂载白名单（真实 compose 文件）
 
 
