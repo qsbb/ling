@@ -85,8 +85,8 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/settings/config` | `{revision, state, test_mode, providers[], profiles[], revisions[]}` |
-| PUT | `/v1/settings/draft` | `{providers?, profiles?, test_mode?}` → 新草稿修订 `{revision, validation_errors}` |
+| GET | `/v1/settings/config` | `{revision, state, test_mode, log_access_denials, providers[], profiles[], revisions[]}` |
+| PUT | `/v1/settings/draft` | `{providers?, profiles?, test_mode?, log_access_denials?}` → 新草稿修订 `{revision, validation_errors}` |
 | POST | `/v1/settings/publish` | `{revision}` → `{published_revision}`（校验失败 422 + 错误列表） |
 | POST | `/v1/settings/rollback` | `{to_revision}` → `{published_revision}` |
 | PUT | `/v1/settings/providers/{provider_id}/secret` | `{secret}` → `{last4, fingerprint}`（永不回显原文） |
@@ -95,6 +95,10 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 
 `profiles[]` 每项：`{profile, provider_id, model_id, fallback_provider_id?, fallback_model_id?,
 enabled, temperature, max_tokens?, timeout_seconds, daily_cost_limit?}`。
+
+`log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
+**只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过
+修订时取环境变量 `LING_LOG_ACCESS_DENIALS`。
 
 ## 5. 角色与时间线
 

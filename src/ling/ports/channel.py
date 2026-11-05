@@ -34,6 +34,13 @@ class ChannelErrorKind(StrEnum):
     # `uncertain == rejected` 为 True，且从值反序列化只会得到 rejected——
     # "结果未知"被降级成"明确失败"，重试就会造成重复消息。
     uncertain = "delivery_uncertain"
+    # 明确「收到但不处理」的事件（心跳、已读回执之类）。
+    #
+    # 与 ``unsupported`` 的区别只在**日志**上，但那个区别很重要：``unsupported``
+    # 说明"这类事件我们还没实现"，值得记一条让人看见；``ignored`` 说明
+    # "这类事件按设计就该静默丢掉"，记下来只会把日志缓冲刷满——OneBot 的
+    # 心跳每 30 秒一条，两天就能把 500 条缓冲里的有效日志全挤出去。
+    ignored = "ignored_event"
 
 
 class ChannelError(Exception):
@@ -64,6 +71,10 @@ class OutboundMessage:
     window_ref: str
     text: str
     reply_to: str | None = None
+    # **出站**媒体引用，故意不套 `contracts.v1.MediaRef`：入站那个类型只允许
+    # http/https 或不透明 id（防 SSRF），而出站要交给平台自己解析——OneBot 的
+    # `file` 还接受本地路径与 base64，收紧只会把能发的东西变少。方向不同，
+    # 信任也不同：这里的值由我们自己产生，不是外部输入。
     media_refs: list[str] = field(default_factory=list)
     is_group: bool = False
     # 要 @ 的平台账号（QQ 号）。群里多人说话时用它消歧——

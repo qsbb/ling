@@ -346,6 +346,11 @@ class LogEntry:
     attributes: dict[str, Any]
     trace_id: str | None = None
     turn_id: str | None = None
+
+    @property
+    def kind(self) -> str:
+        """`runtime` / `behavior` / `audit` / `security`（默认 runtime）。"""
+        return _log_kind_of(self)
     session_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -355,6 +360,9 @@ class LogEntry:
             "level": self.level,
             "logger": self.logger,
             "message": self.message,
+            # 分类由后端算好下发，前端不要再从 attributes 里猜一遍——
+            # 两处各判一次早晚会不一致。
+            "kind": self.kind,
         }
         if self.event_name:
             payload["event_name"] = self.event_name
@@ -553,11 +561,24 @@ def configure_log_buffer(capacity: int) -> None:
                 break
 
 
+# 日志分流的取值。`runtime` 是**默认**：绝大多数日志没有显式 `log_kind`，
+# 它们本来就属于"系统内部在干什么"。
+LOG_KINDS: tuple[str, ...] = ("runtime", "behavior", "audit", "security")
+
+
+def _log_kind_of(entry: LogEntry) -> str:
+    """一条日志属于哪一类。没有标注的一律算 `runtime`。"""
+    raw = entry.attributes.get("log_kind")
+    value = str(raw) if raw else "runtime"
+    return value if value in LOG_KINDS else "runtime"
+
+
 def recent_logs(
     limit: int = 200,
     level: str | None = None,
     logger: str | None = None,
     query: str | None = None,
+    kind: str | None = None,
 ) -> list[LogEntry]:
     """取缓冲里**时间正序**的最后 `limit` 条，按条件过滤。
 
@@ -581,6 +602,12 @@ def recent_logs(
         # 普通前缀匹配（不是按 `.` 分段）：`logger=ling.api.ac` 也要能命中
         # `ling.api.access`，调用方少打一个字时不该得到空列表。
         entries = [entry for entry in entries if entry.logger.startswith(logger)]
+    if kind:
+        if kind not in LOG_KINDS:
+            # 与 level 同一条原则：不认识的筛选值要报错，不能静默忽略——
+            # 否则使用者以为在看"处理日志"，实际拿到的是全部。
+            raise ValueError(f"未知日志分类：{kind}")
+        entries = [entry for entry in entries if _log_kind_of(entry) == kind]
     if needle:
         entries = [entry for entry in entries if needle in entry.message.lower()]
     if limit < 0:

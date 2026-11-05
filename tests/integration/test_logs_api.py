@@ -116,7 +116,12 @@ async def test_admin_role_is_accepted(logged_in: TestEnv) -> None:
 
     response = await logged_in.client.get("/v1/logs")
     assert response.status_code == 200, response.text
-    assert set(response.json()) == {"items", "buffered", "capacity"}
+    assert set(response.json()) == {
+        "items",
+        "buffered",
+        "capacity",
+        "denied_total",
+    }
 
 
 # ------------------------------------------------------------ 响应形状
@@ -131,7 +136,10 @@ async def test_response_shape_and_ascending_order(logged_in: TestEnv) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
 
-    assert set(body) == {"items", "buffered", "capacity"}
+    # `denied_total` 是入站被拒的累计次数：关掉逐条拒绝日志之后，
+    # "最近被拒了多少次"仍然要答得上来。
+    assert set(body) == {"items", "buffered", "capacity", "denied_total"}
+    assert isinstance(body["denied_total"], int) and body["denied_total"] >= 0
     assert body["capacity"] >= 1
     assert body["buffered"] >= 1
 

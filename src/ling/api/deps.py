@@ -96,6 +96,7 @@ def config_service(request: Request, session: DbSession) -> ConfigService:
         request.app.state.secret_box,
         test_mode_default=settings.test_mode,
         persona_id=settings.persona_id,
+        log_denials_default=settings.log_access_denials,
     )
 
 

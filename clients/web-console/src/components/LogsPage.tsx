@@ -27,7 +27,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
-import type { LogEntry, LogLevel, LogsResponse } from '../types';
+import type { LogEntry, LogKind, LogLevel, LogsResponse } from '../types';
 import { AlertIcon, RefreshIcon } from './Icons';
 import '../logs.css';
 
@@ -148,6 +148,18 @@ export function describeCounts(shown: number, buffered: number, capacity: number
   return `${head} · ${tail}`;
 }
 
+/**
+ * 被白名单拒掉的入站条数。
+ *
+ * 这个数字与「是否逐条写拒绝日志」**无关**：关掉逐条 WARNING 之后，它是
+ * 界面里唯一还能回答"最近有没有人在扫我的机器人"的证据。所以即使为 0 也
+ * 要显示——0 也是答案（"没人被拒"），而不是隐藏整个字段让人以为没这功能。
+ */
+export function describeDenials(deniedTotal: number): string {
+  if (deniedTotal <= 0) return '本进程还没有拒绝过入站消息';
+  return `本进程已拒绝 ${deniedTotal} 条入站消息（白名单/出入许可）`;
+}
+
 /** 一条日志的主行（时间 级别 logger 消息）——四种信息缺一不可定位。 */
 export function logLineParts(entry: LogEntry): {
   time: string;
@@ -237,6 +249,9 @@ export type LogsView =
 
 export type LogLevelFilter = LogLevel | 'all';
 
+/** 「全部」之外的四个分类与后端 `LOG_KINDS` 同源（见 types.ts 的 LogKind）。 */
+export type LogKindFilter = LogKind | 'all';
+
 /**
  * 权限不足的文案单独写：`explainError` 里的 `forbidden` 是给会话/记忆写的
  * （"没有权限访问该会话"），放在这一页会指错方向。其余错误码仍走通用解释，
@@ -255,10 +270,12 @@ export function logsErrorCopy(error: unknown): ExplainedError {
 }
 
 export interface LogsToolbarProps {
+  kind: LogKindFilter;
   level: LogLevelFilter;
   search: string;
   paused: boolean;
   counts: string;
+  onKind: (kind: LogKindFilter) => void;
   onLevel: (level: LogLevelFilter) => void;
   onSearch: (value: string) => void;
   onTogglePause: () => void;
@@ -267,10 +284,12 @@ export interface LogsToolbarProps {
 
 /** 顶部一行控件：级别 / 搜索 / 暂停 / 条数。单独导出以便 SSR 断言。 */
 export function LogsToolbar({
+  kind,
   level,
   search,
   paused,
   counts,
+  onKind,
   onLevel,
   onSearch,
   onTogglePause,
@@ -278,6 +297,24 @@ export function LogsToolbar({
 }: LogsToolbarProps) {
   return (
     <div className="logs__toolbar" data-testid="logs-toolbar">
+      <label className="logs__control">
+        <span className="logs__control-label">分类</span>
+        <select
+          className="logs__select"
+          data-testid="logs-kind"
+          value={kind}
+          onChange={(event) => onKind(event.target.value as LogKindFilter)}
+        >
+          {/* 默认「全部」：不预设筛选，避免有人以为"日志丢了"。
+              要只看她的处理过程时选「处理」。 */}
+          <option value="all">全部</option>
+          <option value="runtime">运行</option>
+          <option value="behavior">处理</option>
+          <option value="audit">审计</option>
+          <option value="security">安全</option>
+        </select>
+      </label>
+
       <label className="logs__control">
         <span className="logs__control-label">级别</span>
         <select
@@ -393,6 +430,7 @@ export function LogsList({ items, level }: LogsListProps) {
 /* ==================================================================== 页面 */
 
 export function LogsPage() {
+  const [kind, setKind] = useState<LogKindFilter>('all');
   const [level, setLevel] = useState<LogLevelFilter>('all');
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -430,6 +468,9 @@ export function LogsPage() {
       api.getLogs(
         {
           limit: LOG_LIMIT,
+          // 分类原样交给后端筛选：前端再滤一遍会让「buffered」与实际显示
+          // 对不上，而人没法分辨差在哪。
+          kind: kind === 'all' ? null : kind,
           level: level === 'all' ? null : level,
           // 搜索词原样交给后端：前端不再过滤一遍，否则"前端滤掉的行"与接口
           // 说的 `buffered` 会对不上，而人没法分辨差在哪。
@@ -437,7 +478,7 @@ export function LogsPage() {
         },
         signal,
       ),
-    [level, debouncedSearch],
+    [kind, level, debouncedSearch],
   );
 
   useEffect(() => {
@@ -505,11 +546,22 @@ export function LogsPage() {
         凭据类内容已在服务端脱敏成 [REDACTED]，界面不做还原。
       </p>
 
+      {/* 关掉逐条拒绝日志之后，这个计数是界面里唯一还能回答
+          "最近有没有人在扫我的机器人"的证据（见 `describeDenials`）。 */}
+      {view.status === 'ready' ? (
+        <p className="logs__boundary" data-testid="logs-denied-total">
+          {describeDenials(view.data.denied_total)}。逐条拒绝日志可以在设置里关掉，
+          这个计数不受那个开关影响。
+        </p>
+      ) : null}
+
       <LogsToolbar
         level={level}
         search={search}
         paused={paused}
         counts={counts}
+        kind={kind}
+        onKind={setKind}
         onLevel={setLevel}
         onSearch={setSearch}
         onTogglePause={() => setPaused((value) => !value)}

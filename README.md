@@ -116,6 +116,7 @@ python -m ling                               # → http://127.0.0.1:8080
 | `LING_ONEBOT_*` | OneBot 渠道连接 |
 | `LING_LOG_LEVEL` | 日志级别 |
 | `LING_LOG_BUFFER_SIZE` | 界面「日志」页能看的最近条数（内存环形缓冲），默认 500 |
+| `LING_LOG_ACCESS_DENIALS` | 白名单拒绝是否逐条写日志，默认开启。关掉只少日志，拒绝与计数照旧（设置页也可改，发布后即生效） |
 | `LING_UPDATE_ENABLED` | 自助更新开关，默认 `0`（关闭）。打开前必须先由宿主人工纳管执行器，见 [UPDATES](docs/UPDATES.md) |
 
 > 渠道的发送者标识是 **openid**（官方机器人）或 **QQ 号**（OneBot），两者不通用。

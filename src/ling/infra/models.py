@@ -1001,6 +1001,50 @@ class WorldPlace(Base, TimestampMixin):
     items: Mapped[list] = mapped_column(JSON, default=list)
 
 
+class PhoneStateRow(Base, TimestampMixin):
+    """她跟手机的关系：上次什么时候看、下次什么时候看、此刻在不在看。
+
+    ## 为什么单独一张表
+
+    不用 `activities.checkpoint` 塞：那是**某个活动自己的进度快照**，
+    生命周期跟着活动走（活动结束就冻结）。看手机是**跨活动**的持续状态——
+    写日记时也在看手机，出去吃饭时也在看手机，它不属于任何一个活动。
+
+    ## 为什么"下次"要单独存，而不是算出来
+
+    因为它**不是**"上次 + 固定间隔"。规则是：这次看完了才开始计时，
+    而且在忙、在睡、刚聊完都会改间隔。存下来才能回答界面上那句
+    「下次看手机 17:05」——现算的话每次刷新数字都不一样，人会看出来假。
+
+    ## 状态机
+
+    ``idle``（没在看）→ 到点了 / 被 @ 叫醒 → ``watching``（在看）
+    → 收起 → 回到 ``idle``，**并把下次时间从现在起算**。
+    """
+
+    __tablename__ = "phone_states"
+
+    actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # idle | watching
+    state: Mapped[str] = mapped_column(String(16), default="idle")
+    # 在看的时候在看哪个应用/哪个窗口（"QQ · 摸鱼群"）；不看的时候为空
+    watching_app: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    watching_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    watching_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_looked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_look_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    # 上一轮看的时候有没有接话（给界面显示「没接话」/「回了谁」）
+    last_result: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 那段时间本来在做什么（"在写日记"），界面上用来解释为什么是这个间隔
+    last_context: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
 class ActivityRow(Base, TimestampMixin):
     """活动进程状态机：proposed → running → paused/completed/failed/cancelled。"""
 

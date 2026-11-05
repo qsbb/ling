@@ -118,12 +118,15 @@ class DraftResult:
 class ConfigService:
     def __init__(
         self, session: AsyncSession, secret_box: SecretBox, *, test_mode_default: bool = True,
-        persona_id: str = "persona_ling"
+        persona_id: str = "persona_ling", log_denials_default: bool = True
     ) -> None:
         self._session = session
         self._box = secret_box
         self._test_mode_default = test_mode_default
         self._persona_id = persona_id
+        # `LING_LOG_ACCESS_DENIALS`。只在"没有已发布修订"或"修订里没有这个键"
+        # （旧修订）时兜底；发布过带该键的修订之后以修订为准。
+        self._log_denials_default = log_denials_default
 
     # ---------------------------------------------------------- 读取
 
@@ -141,7 +144,11 @@ class ConfigService:
         """生效快照。没有已发布修订时返回引导配置（测试模式下绑定 fake）。"""
         published = await self.published_revision()
         if published is None:
-            return bootstrap_config(test_mode=self._test_mode_default, persona_id=self._persona_id)
+            return bootstrap_config(
+                test_mode=self._test_mode_default,
+                persona_id=self._persona_id,
+                log_access_denials=self._log_denials_default,
+            )
         payload: dict = dict(published.payload or {})
         providers: dict[str, ProviderConfig] = {}
         for raw in list(payload.get("providers") or []):
@@ -179,6 +186,11 @@ class ConfigService:
             providers=providers,
             profiles=profiles,
             test_mode=bool(payload.get("test_mode", False)),
+            # 旧修订没有这个键：退回环境变量给的默认值（默认 True），
+            # 而不是把"没配过"当成"关掉"。
+            log_access_denials=bool(
+                payload.get("log_access_denials", self._log_denials_default)
+            ),
             persona_id=payload.get("persona_id", self._persona_id),
             memory=_memory_policy(payload.get("memory")),
             life=_life_policy(payload.get("life")),
@@ -204,6 +216,7 @@ class ConfigService:
         providers: list[dict] | None = None,
         profiles: list[dict] | None = None,
         test_mode: bool | None = None,
+        log_access_denials: bool | None = None,
         memory: dict | None = None,
         life: dict | None = None,
         dialogue: dict | None = None,
@@ -240,6 +253,7 @@ class ConfigService:
                 for b in base.profiles.values()
             ],
             "test_mode": base.test_mode,
+            "log_access_denials": base.log_access_denials,
             "persona_id": base.persona_id,
             "memory": _policy_to_dict(base.memory),
             "life": _life_to_dict(base.life),
@@ -311,6 +325,9 @@ class ConfigService:
 
         if test_mode is not None:
             current_payload["test_mode"] = test_mode
+
+        if log_access_denials is not None:
+            current_payload["log_access_denials"] = bool(log_access_denials)
 
         issues = await self.validate_payload(current_payload)
         next_rev = await self._next_revision_number()

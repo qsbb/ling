@@ -507,6 +507,24 @@ class GroupAttentionScheduler:
             )
         )
         await self._session.flush()
+
+        # 行为日志：**人话**，回答"她刚才看了什么、怎么想的"。
+        # 放这里是因为 `_log` 是轮询的唯一出口——放在各处调用点早晚会漏一条，
+        # 而漏掉的那条恰好是最需要解释的"她为什么没说话"。
+        from ling.audit import behavior_event
+
+        narration = _narrate_poll(result)
+        if narration:
+            behavior_event(
+                "attention_watch",
+                narration,
+                outcome=result.decision,
+                attributes={
+                    "window_ref": result.window_id,
+                    "unseen": result.unseen_count,
+                    "decision": result.decision,
+                },
+            )
         return poll_log_id
 
     def _interval(self, cursor: AttentionCursorRow, moment: datetime) -> timedelta:
@@ -521,6 +539,32 @@ class GroupAttentionScheduler:
             if focused_until > moment:
                 base = self._focus
         return base + timedelta(seconds=_jitter_seconds(cursor.window_id))
+
+
+def _narrate_poll(result: PollResult) -> str:
+    """把一次轮询结果说成一句人话。
+
+    **不写死"不想说/不用说/不合适"**：``result.reason`` 是模型在弹性区间里
+    自己给的措辞（见 ``AutonomyTurnService.choose``），硬规则路径给的也是
+    可读句子。这里只负责把它拼进一个完整的叙述，不改写、不挑选。
+    """
+    if result.decision == "empty":
+        return ""
+    if result.decision == "replied":
+        return f"看了下，{result.unseen_count} 条新消息，决定接话"
+    if result.decision in {"skipped", "ignored"}:
+        tail = f"：{result.reason}" if result.reason else ""
+        return f"看了下 {result.unseen_count} 条新消息，没接话{tail}"
+    if result.decision == "missed":
+        tail = f"：{result.reason}" if result.reason else ""
+        return f"有 {result.unseen_count} 条消息，但没来得及看{tail}"
+    if result.decision == "reply_failed":
+        tail = f"：{result.reason}" if result.reason else ""
+        return f"决定接话，但没发出去{tail}"
+    if result.decision == "failed":
+        tail = f"：{result.reason}" if result.reason else ""
+        return f"看消息时出错了{tail}"
+    return ""
 
 
 def _jitter_seconds(window_id: str) -> int:

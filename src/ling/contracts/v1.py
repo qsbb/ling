@@ -8,16 +8,81 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 SCHEMA_VERSION: Literal["v1"] = "v1"
 
 IdStr = Annotated[str, Field(min_length=1, max_length=128)]
+
+# 媒体引用：与 ``IdStr`` **故意不同**。
+#
+# ``media_refs`` 装的不是内部 ID，而是渠道给的外部引用。QQ 的图片 URL 实测
+# 300+ 字符（``https://multimedia.nt.qq.com.cn/download?appid=...``），用
+# 128 字符的 ``IdStr`` 会**在入站校验处整条消息被拒**——用户发"一张图 +
+# 一句话"，机器人毫无反应，而且正文也一起丢了。长度上限按 URL 的实际需要
+# 给到 2048（HTTP 客户端与 CDN 常见实现的上限）。
+#
+# 但**不能**放任成任意字符串：这个值最终会交给 ``fetch_media(media_ref)``
+# 去取字节（见 ``domains/media/describe.py`` 与各 connector 的 fetch_media），
+# ``file:``/``data:`` 之类等于开 SSRF 与本地文件读取的口子。规则：
+#
+#   * 带 scheme 的（``xxx://…`` 或 ``xxx:…``）**只允许 http/https**，
+#     且必须能解析出主机名；
+#   * **不带 scheme 的**视为不透明 id / 文件名，原样放行。这不是"宽松"，
+#     而是 OneBot v11 的真实形态：image/voice/video/file 段的 ``file`` 字段
+#     是"文件名或文件 id"，``url`` 是可选的——
+#     ``connectors/onebot/message.py`` 的 ``ref = data.get("url") or data.get("file")``
+#     就是为这种实现兜底的；CQ 码字符串 ``[CQ:image,file=abc.jpg]`` 也只有
+#     file、没有 url。把这些拒掉，等于对另一批部署重新制造同一个 bug。
+#     不认识的形态由 ``fetch_media`` 自己拒绝（它只认 http/https）。
+_MEDIA_REF_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*):")
+
+
+def _validate_media_ref(value: str) -> str:
+    """媒体引用校验：有 scheme 的只放行 http/https，其余按不透明 id 放行。
+
+    只校验、不改写：改写会在入库与下载之间引入两份不同的值。
+    """
+    text = value.strip()
+    match = _MEDIA_REF_SCHEME.match(text)
+    if match is None:
+        return value
+    scheme = match.group("scheme").lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(
+            f"媒体引用只允许 http/https，或不带 scheme 的 id，收到 {scheme!r}"
+        )
+    if not urlsplit(text).hostname:
+        raise ValueError("媒体引用的 http(s) URL 缺少主机名")
+    return value
+
+
+MediaRef = Annotated[
+    str,
+    Field(min_length=1, max_length=2048),
+    AfterValidator(_validate_media_ref),
+]
+
+
+def media_ref_is_valid(value: str) -> bool:
+    """这条外部媒体引用是否满足 ``MediaRef``？
+
+    给**渠道层**用的：一条坏引用（``file:``、超长 URL）只该让那个附件失效，
+    不该让整条消息连正文一起被契约拒掉。渠道在构造信封前用它逐条过滤，
+    ``MediaRef`` 仍然是最后一道闸（防止别的生产者绕过过滤）。
+    """
+    try:
+        _validate_media_ref(value)
+    except ValueError:
+        return False
+    return 1 <= len(value) <= 2048
 
 
 def new_id(prefix: str) -> str:
@@ -167,7 +232,7 @@ class AudienceRule(StrictModel):
 class InputPart(StrictModel):
     modality: Modality
     text: str | None = None
-    media_ref: IdStr | None = None
+    media_ref: MediaRef | None = None
     mime_type: str | None = None
 
 
@@ -208,7 +273,10 @@ class InteractionEnvelope(StrictModel):
     modality: Modality = Modality.text
     parts: list[InputPart] = Field(default_factory=list)
     reply_to: IdStr | None = None
-    media_refs: list[IdStr] = Field(default_factory=list)
+    media_refs: list[MediaRef] = Field(
+        default_factory=list,
+        description="外部媒体引用（URL 或渠道不透明 id）；长度与协议见 MediaRef",
+    )
     # 渠道层能直接判断的"是不是在跟机器人说话"（@、引用机器人消息）。
     # 必须由渠道提供：正文里 @ 已被剥离，靠文本反推会永远得到"没点名"，
     # 群聊就永远不会接话。

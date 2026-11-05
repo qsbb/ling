@@ -67,6 +67,8 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const [providerDrafts, setProviderDrafts] = useState<ProviderDraftInput[]>([]);
   const [profileDrafts, setProfileDrafts] = useState<ProfileDraftInput[]>([]);
   const [testModeDraft, setTestModeDraft] = useState(false);
+  // 与 testModeDraft 同层：实例级开关，走草稿→发布，不做本地持久化。
+  const [logDenialsDraft, setLogDenialsDraft] = useState(true);
   const [note, setNote] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<ExplainedError | null>(null);
@@ -90,6 +92,9 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         const data = await api.settingsConfig();
         setConfig(data);
         setTestModeDraft((current) => (resetDrafts ? data.test_mode : current));
+        setLogDenialsDraft((current) =>
+          resetDrafts ? data.log_access_denials : current,
+        );
         if (resetDrafts) {
           setProviderDrafts(
             data.providers.map((provider) => ({
@@ -143,6 +148,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         providers: providerDrafts,
         profiles: profileDrafts,
         test_mode: testModeDraft,
+        log_access_denials: logDenialsDraft,
         note: note.trim() || undefined,
       });
       setDraft(result);
@@ -373,6 +379,27 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         <p className="panel__note">
           测试模式下对话由确定性 fake provider 生成，界面会持续显示“测试模式”横幅；
           它证明链路可用，不代表真实模型能力。
+        </p>
+      </section>
+
+      <section className="panel">
+        <div className="panel__head">
+          <h2>入站拒绝日志</h2>
+          <label className="switch">
+            <input
+              type="checkbox"
+              data-testid="log-access-denials"
+              checked={logDenialsDraft}
+              onChange={(event) => setLogDenialsDraft(event.target.checked)}
+            />
+            <span>{logDenialsDraft ? '逐条记录' : '不逐条记录'}</span>
+          </label>
+        </div>
+        <p className="panel__note">
+          白名单拒绝是安全边界，始终生效：关掉这条只是不再为每条陌生消息写一行
+          WARNING，拒绝本身、计数都不受影响。被拒次数在「日志」页顶部可以看到，
+          用来回答「最近有没有人在扫我的机器人」——所以关日志不等于眼不见为净。
+          与测试模式一样，改动走草稿→发布，发布后立即生效。
         </p>
       </section>
 

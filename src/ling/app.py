@@ -176,7 +176,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 预热已保存的供应商密钥（只解密到进程内存，不落日志）
     async with session_scope() as session:
         svc = ConfigService(session, box, test_mode_default=settings.test_mode,
-                            persona_id=settings.persona_id)
+                            persona_id=settings.persona_id,
+                            log_denials_default=settings.log_access_denials)
         effective = await svc.effective()
         for pid in effective.providers:
             try:

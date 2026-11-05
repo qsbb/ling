@@ -12,12 +12,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from ling.contracts.v1 import Modality
+from ling.contracts.v1 import Modality, media_ref_is_valid
 from ling.ports.channel import ChannelError, ChannelErrorKind
+
+logger = logging.getLogger("ling.connectors.qqbot.message")
 
 # 事件类型（官方 ``t`` 字段）。只列本连接器真的会处理/明确拒绝的。
 EVENT_C2C_MESSAGE_CREATE = "C2C_MESSAGE_CREATE"
@@ -185,8 +188,13 @@ def _media_refs(attachments: object) -> list[str]:
         if not isinstance(item, dict):
             continue
         url = item.get("url")
-        if isinstance(url, str) and url.startswith("https://"):
-            refs.append(url)
+        if not isinstance(url, str) or not url.startswith("https://"):
+            continue
+        # 超长/畸形 URL 只丢这个附件，不丢整条消息（理由见 OneBot 侧的同名过滤）。
+        if not media_ref_is_valid(url):
+            logger.warning("丢弃不合格的媒体附件 URL（长度 %d）：只影响该附件", len(url))
+            continue
+        refs.append(url)
     return refs
 
 

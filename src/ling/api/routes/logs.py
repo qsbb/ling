@@ -33,7 +33,12 @@ from fastapi import APIRouter, Query
 from ling.api.deps import CurrentAuth
 from ling.api.errors import LingError
 from ling.contracts.v1 import ErrorCode
-from ling.logging_setup import LEVEL_ORDER, log_buffer_stats, recent_logs
+from ling.logging_setup import (
+    LEVEL_ORDER,
+    LOG_KINDS,
+    log_buffer_stats,
+    recent_logs,
+)
 
 router = APIRouter(tags=["logs"])
 
@@ -68,6 +73,15 @@ async def list_logs(
         str | None,
         Query(description="对 message 做不区分大小写的子串匹配。"),
     ] = None,
+    kind: Annotated[
+        LogKind | None,
+        Query(
+            description=(
+                "日志分类：runtime（运行，默认）/ behavior（处理，她怎么想怎么做）"
+                "/ audit / security；不传表示全部。"
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
     """返回本进程最近 `limit` 条日志，**时间正序**。
 
@@ -98,17 +112,30 @@ async def list_logs(
     # `recent_logs` 对未知级别会抛 ValueError；这里的 level 由 Literal 把关，
     # 走不到那条路。**不做 try/except 兜底**：真出现了说明类型与实现脱节，
     # 那是 500 也该暴露的 bug，不是可以吞掉的输入问题。
-    entries = recent_logs(limit=limit, level=level, logger=logger, query=q)
+    entries = recent_logs(
+        limit=limit, level=level, logger=logger, query=q, kind=kind
+    )
     stats = log_buffer_stats()
+    # 入站被拒的累计次数。**与日志开关无关**：`LING_LOG_ACCESS_DENIALS=0`
+    # 之后逐条 WARNING 不再写，但"最近被拒了多少次"仍然要答得上来，否则就
+    # 是眼不见为净。这里直接读进程内计数，不查库。
+    from ling.kernel.inbound_intake import denied_total
+
     return {
         "items": [entry.to_dict() for entry in entries],
         "buffered": stats.buffered,
         "capacity": stats.capacity,
+        "denied_total": denied_total(),
     }
 
 
 # 允许的级别列表作为模块常量导出：前端下拉框的取值应与后端**同一份**来源，
 # 手抄一份到前端就会漂（例如后端加了 critical，前端下拉里没有）。
+# 与后端 `LOG_KINDS` **同一份来源**（这里直接引用，不手抄），
+# 前端下拉框也应从这里取。
+LogKind = Literal["runtime", "behavior", "audit", "security"]
+KINDS: tuple[str, ...] = LOG_KINDS
+
 LEVELS: tuple[str, ...] = tuple(LEVEL_ORDER)
 
 __all__ = ["LEVELS", "LOG_LIMIT_DEFAULT", "LOG_LIMIT_MAX", "LOG_VIEWER_ROLES", "router"]

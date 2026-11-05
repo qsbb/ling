@@ -127,6 +127,38 @@ class Settings:
             if part.strip()
         )
     )
+    # 白名单**群**：这些群里的所有人都能进她的上下文（不主动接话），
+    # 被 @ / 引用时仍可回复。
+    #
+    # 与 `access_list`（发送者）分开：一个是"谁"，一个是"在哪"。
+    # 混成一个集合的后果是"把群号当人号加进去"，然后困惑为什么没用。
+    access_groups: frozenset[str] = field(
+        default_factory=lambda: frozenset(
+            part.strip()
+            for part in (os.environ.get("LING_ACCESS_GROUPS") or "").split(",")
+            if part.strip()
+        )
+    )
+    # 「看一眼手机」时，一次最多带多少条群消息进上下文。
+    #
+    # 为什么要有上限：不在白名单的群可能一天刷几千条，全塞进上下文既贵又把
+    # 真正重要的内容淹掉。人的做法也是"扫一眼最近的"，不会从头翻。
+    observe_window_messages: int = field(
+        default_factory=lambda: _int("LING_OBSERVE_WINDOW_MESSAGES", 30)
+    )
+    # 白名单拒绝是否逐条写日志。
+    #
+    # 默认 **True**（保持既有行为）：拒绝本身是安全边界，不该无声无息。
+    # 但机器人被拉进人多的群之后，"每一条陌生群消息一条 WARNING" 会在两小时内
+    # 把 500 条内存缓冲刷满，真正的故障日志被挤出去——那时你既看不到故障，
+    # 也看不出有人在扫你的机器人。
+    #
+    # 关掉**只影响日志**，不影响拒绝：`check_access` 照常执行，消息照常不进
+    # 对话链路，拒绝次数照常累加（见 `/v1/logs` 的 `denied_total`）。
+    # 要的是"不刷屏但仍可观测"，不是"眼不见为净"。
+    log_access_denials: bool = field(
+        default_factory=lambda: _bool("LING_LOG_ACCESS_DENIALS", True)
+    )
     user_timezone: str | None = field(
         default_factory=lambda: os.environ.get("LING_USER_TIMEZONE") or None
     )

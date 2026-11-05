@@ -284,10 +284,21 @@ class OneBotV11Connector(ChannelConnector):
         @ 与引用作为结构化字段保留，供决策层判断"是不是在跟我说话"。
         """
         post_type = str(payload.get("post_type") or "")
+        if post_type == "meta_event":
+            # 心跳和生命周期**静默丢弃**，不记日志。
+            #
+            # 心跳每 30 秒一条，两天就能把 500 条内存缓冲里的有效日志全挤出去；
+            # 而它证明的是"连接还活着"，这件事连接层已经在做（WS 断开、异常
+            # 结束、鉴权失败都有 WARNING）。用 ``ignored`` 而不是 ``unsupported``：
+            # 后者会让 inbound_intake 记一条"忽略事件"，那正是刷屏的来源。
+            raise ChannelError(
+                ChannelErrorKind.ignored,
+                f"meta_event:{payload.get('meta_event_type') or ''}",
+            )
         if post_type != "message":
-            # notice/request/meta_event 目前不进入对话链路。
-            # 它们仍有价值（入群、撤回、戳一戳），但要先有对应处理策略，
-            # 不能当普通消息塞给模型。
+            # notice/request 目前不进入对话链路。
+            # 它们仍有价值（入群、撤回、戳一戳、加好友请求），但要先有对应
+            # 处理策略，不能当普通消息塞给模型。
             raise ChannelError(
                 ChannelErrorKind.unsupported, f"暂不处理 OneBot 事件类型: {post_type}"
             )

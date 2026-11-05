@@ -22,6 +22,25 @@
 
 ## [Unreleased]
 
+### 修复
+- **QQ 长媒体 URL 让整条消息被拒**：`InputPart.media_ref` / `InteractionEnvelope.media_refs`
+  以前套 128 字符的 `IdStr`，而 QQ 图片 URL 实测 300+ 字符——pydantic 在入站校验处
+  拒掉整条消息，正文一起丢（表现为"发了一张图 + 一句话，机器人毫无反应"）。新增
+  `MediaRef`（上限 2048，带 scheme 时只允许 http/https）。渠道层先逐条过滤：
+  坏引用只丢**那一个附件**，正文照常进信封；OneBot `file` 字段那种不带 scheme
+  的不透明 id 仍然放行
+- **入站拒绝日志刷屏**：白名单拒绝在生产上 2 小时刷了约 180 条 WARNING，把 500 条
+  内存缓冲里的故障日志挤了出去。新增 `log_access_denials` 开关（`LING_LOG_ACCESS_DENIALS`
+  是默认值，设置页「模型设置 → 入站拒绝日志」发布后生效）。关掉**只停日志**：
+  拒绝照旧、被拒计数照旧
+- OneBot `meta_event`（心跳等）不再记一条"忽略事件"：每 30 秒一条，两天就能把
+  500 条缓冲刷满，而"连接还活着"由连接层负责
+
+### 新增
+- `denied_total`：本进程启动以来被白名单拒掉的入站条数，经 `GET /v1/logs` 与
+  `GET /v1/onebot/health` 暴露，日志页顶部直接显示。重启归零、多副本各算各的
+  （它是观测指标，不是审计证据——审计仍走 `security_event`）
+
 ## [0.0.1] - 2026-11-03
 
 首个正式发布。仓库此前从未打过 tag，所以下面「Unreleased」里的全部历史改动

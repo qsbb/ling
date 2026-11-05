@@ -96,15 +96,25 @@ class ProviderRegistry:
         self._signatures.pop(provider_id, None)
 
 
-def bootstrap_config(*, test_mode: bool = True, persona_id: str = "persona_ling") -> EffectiveConfig:
+def bootstrap_config(
+    *,
+    test_mode: bool = True,
+    persona_id: str = "persona_ling",
+    log_access_denials: bool = True,
+) -> EffectiveConfig:
     """没有任何已发布修订时的引导配置。
 
     测试模式下所有对话职责绑定 fake provider；非测试模式则不绑定任何真实模型，
     因此对话会明确失败并提示“尚未配置模型”，而不是偷偷用假回复冒充模型。
+
+    ``log_access_denials`` 来自环境变量（``LING_LOG_ACCESS_DENIALS``），
+    作为"还没发布过配置修订"时的默认值；一旦设置页保存并发布了修订，
+    以修订里的值为准（与 ``test_mode`` 同一个模式）。
     """
     if not test_mode:
         return EffectiveConfig(revision=0, providers={}, profiles={}, test_mode=False,
-                               persona_id=persona_id)
+                               persona_id=persona_id,
+                               log_access_denials=log_access_denials)
     providers = {
         "fake": ProviderConfig(
             provider_id="fake",
@@ -124,7 +134,8 @@ def bootstrap_config(*, test_mode: bool = True, persona_id: str = "persona_ling"
             timeout_seconds=30.0,
         )
     return EffectiveConfig(revision=0, providers=providers, profiles=profiles, test_mode=True,
-                           persona_id=persona_id)
+                           persona_id=persona_id,
+                           log_access_denials=log_access_denials)
 
 
 __all__ = ["ProviderRegistry", "UnknownProviderError", "bootstrap_config"]

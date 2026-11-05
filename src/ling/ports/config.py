@@ -185,6 +185,18 @@ class EffectiveConfig:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     profiles: dict[str, ProfileBinding] = field(default_factory=dict)
     test_mode: bool = False
+    # 入站白名单拒绝是否逐条写日志。**只影响日志量，不影响拒绝本身**：
+    # `check_access` 照常裁决，被拒消息照常不进对话链路，拒绝次数由进程内
+    # 计数器单独累加（`GET /v1/logs` 与 `GET /v1/onebot/health` 暴露）。
+    #
+    # 与 `test_mode` 一样是**实例级**开关（不属于记忆/生活/对话任何一个领域），
+    # 所以放在顶层。默认 True = 改动前的行为。
+    #
+    # 为什么在配置修订里而不是纯环境变量：设置页的开关必须是**真的**——
+    # 按了没反应、或者要重启才生效的开关，比没有这个开关更糟。环境变量
+    # `LING_LOG_ACCESS_DENIALS` 提供的是"还没有任何已发布修订时"的默认值
+    # （见 `Settings.log_access_denials`），与 `test_mode` 同一个模式。
+    log_access_denials: bool = True
     persona_id: str = "persona_ling"
     memory: MemoryPolicy = field(default_factory=MemoryPolicy)
     life: LifePolicy = field(default_factory=LifePolicy)

@@ -6,7 +6,7 @@
         "media_ref": {
           "anyOf": [
             {
-              "maxLength": 128,
+              "maxLength": 2048,
               "minLength": 1,
               "type": "string"
             },
@@ -164,8 +164,9 @@
       "type": "string"
     },
     "media_refs": {
+      "description": "外部媒体引用（URL 或渠道不透明 id）；长度与协议见 MediaRef",
       "items": {
-        "maxLength": 128,
+        "maxLength": 2048,
         "minLength": 1,
         "type": "string"
       },

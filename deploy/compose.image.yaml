@@ -130,6 +130,9 @@ x-app-env: &app-env
   # x-app-env 是逐项白名单，不写的变量在 .env 里配了也进不了容器——
   # 表现为「界面上永远只有 500 条」，而且没有任何提示。
   LING_LOG_BUFFER_SIZE: ${LING_LOG_BUFFER_SIZE:-}
+  # 白名单拒绝是否逐条写日志。**只是"还没发布过配置修订"时的默认值**；
+  # 设置页发布过的修订优先（与 LING_TEST_MODE 同一个模式）。
+  LING_LOG_ACCESS_DENIALS: ${LING_LOG_ACCESS_DENIALS:-}
   PYTHONUNBUFFERED: "1"
 
 services:

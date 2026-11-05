@@ -10,10 +10,13 @@ OneBot 的 ``message`` 字段有两种等价形态：
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 
-from ling.contracts.v1 import InputPart, Modality
+from ling.contracts.v1 import InputPart, Modality, media_ref_is_valid
+
+logger = logging.getLogger("ling.connectors.onebot.message")
 
 # CQ 码： escaped 字符按 OneBot 规范处理（&#91; &#93; &#44; &amp;）
 _CQ_RE = re.compile(r"\[CQ:([a-zA-Z0-9_.-]+)((?:,[^\]]*)?)\]")
@@ -105,9 +108,19 @@ def _handle_segment(
         if reply_id is not None:
             result.reply_to_message_id = str(reply_id)
     elif seg_type in {"image", "voice", "video", "file"}:
-        ref = data.get("url") or data.get("file")
+        ref = str(data.get("url") or data.get("file") or "")
         if ref:
-            result.media_refs.append(str(ref))
+            # 坏引用只丢**这个附件**，不丢整条消息：契约层会拒绝带坏引用的
+            # 信封，而正文对用户仍然有价值——"这图什么意思"不该跟着一张
+            # 打不开的图片一起消失。过滤规则与 `MediaRef` 同一份。
+            if media_ref_is_valid(ref):
+                result.media_refs.append(ref)
+            else:
+                logger.warning(
+                    "丢弃不合格的媒体引用（类型 %s，长度 %d）：只影响该附件",
+                    seg_type,
+                    len(ref),
+                )
             _append_text(result, f"[{seg_type}]")
     elif seg_type == "face":
         _append_text(result, "[表情]")

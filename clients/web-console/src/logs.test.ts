@@ -25,6 +25,7 @@ import {
   LogsList,
   LogsToolbar,
   describeCounts,
+  describeDenials,
   formatLogTime,
   formatLogTimestampFull,
   isNearBottom,
@@ -51,8 +52,13 @@ function entry(overrides: Partial<LogEntry> = {}): LogEntry {
   };
 }
 
-function response(items: LogEntry[], buffered = items.length, capacity = 500): LogsResponse {
-  return { items, buffered, capacity };
+function response(
+  items: LogEntry[],
+  buffered = items.length,
+  capacity = 500,
+  deniedTotal = 0,
+): LogsResponse {
+  return { items, buffered, capacity, denied_total: deniedTotal };
 }
 
 /* ------------------------------------------------------------------ 路由 */
@@ -171,6 +177,18 @@ describe('条数说明不把「最近 N 条」说成「全部日志」', () => {
 
   it('缓冲为空时说空，不说"全部 0 条"', () => {
     expect(describeCounts(0, 0, 500)).toContain('缓冲为空');
+  });
+});
+
+describe('被拒入站计数：关掉逐条日志后仍然可见', () => {
+  it('0 也照实显示，不隐藏字段', () => {
+    expect(describeDenials(0)).toContain('还没有拒绝');
+  });
+
+  it('非 0 时给出具体数字和范围', () => {
+    const text = describeDenials(180);
+    expect(text).toContain('180');
+    expect(text).toContain('本进程');
   });
 });
 
@@ -312,10 +330,12 @@ describe('渲染结构（SSR）', () => {
   it('工具栏有级别下拉、搜索框、暂停按钮与条数', () => {
     const html = renderToStaticMarkup(
       h(LogsToolbar, {
+        kind: 'all',
         level: 'all',
         search: '',
         paused: false,
         counts: '已显示 3 条 · 缓冲 3/500',
+        onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
@@ -336,10 +356,12 @@ describe('渲染结构（SSR）', () => {
   it('暂停时按钮变成「继续」并报出 aria-pressed', () => {
     const html = renderToStaticMarkup(
       h(LogsToolbar, {
+        kind: 'all',
         level: 'all',
         search: 'x',
         paused: true,
         counts: '',
+        onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
@@ -449,5 +471,60 @@ describe('常量与后端契约对齐', () => {
   it('单次拉取条数不超过后端上限 1000', () => {
     expect(LOG_LIMIT).toBeLessThanOrEqual(1000);
     expect(LOG_LIMIT).toBeGreaterThan(0);
+  });
+});
+
+describe('日志分类（运行 / 处理）', () => {
+  it('工具栏有分类下拉，默认「全部」', () => {
+    const html = renderToStaticMarkup(
+      h(LogsToolbar, {
+        kind: 'all',
+        level: 'all',
+        search: '',
+        paused: false,
+        counts: '',
+        onKind: NOOP,
+        onLevel: NOOP,
+        onSearch: NOOP,
+        onTogglePause: NOOP,
+        onRefresh: NOOP,
+      }),
+    );
+    expect(html).toContain('data-testid="logs-kind"');
+    expect(html).toContain('>处理<');
+    expect(html).toContain('>运行<');
+  });
+
+  it('选了「处理」时下拉回显处理', () => {
+    const html = renderToStaticMarkup(
+      h(LogsToolbar, {
+        kind: 'behavior',
+        level: 'all',
+        search: '',
+        paused: false,
+        counts: '',
+        onKind: NOOP,
+        onLevel: NOOP,
+        onSearch: NOOP,
+        onTogglePause: NOOP,
+        onRefresh: NOOP,
+      }),
+    );
+    // React SSR 会把选中项标成 selected
+    expect(html).toMatch(/value="behavior"[^>]*selected/);
+  });
+
+  it('每行带 kind 时能标出来（不靠 attributes 猜）', () => {
+    const html = renderToStaticMarkup(
+      h(LogsList, {
+        level: 'all',
+        items: [
+          entry({ message: '看了下测试群，没接话', kind: 'behavior' }),
+          entry({ message: '请求完成', kind: 'runtime' }),
+        ],
+      }),
+    );
+    expect(html).toContain('看了下测试群，没接话');
+    expect(html).toContain('请求完成');
   });
 });

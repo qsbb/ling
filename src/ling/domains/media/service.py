@@ -150,6 +150,10 @@ class MediaEvidenceService:
             subject_id=subject_id,
             window_id=window_id,
             kind=kind,
+            # 列宽 512。契约的 `MediaRef` 上限是 2048（见 contracts/v1.py），
+            # 超过 512 的外部引用会在这里被**静默截断**，之后 fetch_media
+            # 拿到的是一个坏 URL。真实 QQ 图片 URL 约 300–400 字符，暂时够用；
+            # 要根治得加宽这一列（迁移），不要在契约层假装 2048 已完全支持。
             media_ref=media_ref[:512],
             origin=origin,
             visibility=visibility,

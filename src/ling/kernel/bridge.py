@@ -88,6 +88,10 @@ class InboundBridge:
         # 私聊里没绑定过的号是否自动注册成独立自然人（不合并）。默认关：
         # 白名单已经在管"谁能说话"，这一项管的是"说完之后挂在谁名下"。
         auto_register_private: bool = False,
+        # 这条消息只能看、不能主动回（准入判定的 `observe_only`）。
+        # 与 `_defer_group_attention` 的区别：那个是**配置**说"群消息先放着"，
+        # 这个是**这条消息**没有回复资格——哪怕配置允许立即回，也不该开口。
+        observe_only: bool = False,
         persona_id: str = "persona_ling",
         actor_id: str = "actor_ling",
     ) -> None:
@@ -103,6 +107,7 @@ class InboundBridge:
         self._test_mode_default = test_mode_default
         self._group_mention_on_reply = group_mention_on_reply
         self._auto_register_private = auto_register_private
+        self._observe_only = observe_only
         self._persona_id = persona_id
         self._actor_id = actor_id
 
@@ -249,8 +254,13 @@ class InboundBridge:
         # 用户要求"人不是整天都看着群，有人 @ 就看一下，或者刷到刚好就看一下"。
         # 这条只推迟**决策**，消息仍然落库并标 unseen——"还没看"和
         # "看了不回"必须能分开。被 @ / 叫名字 / 紧急内容不受影响。
+        # `observe_only`：她看得见，但**不主动开口**。强制走延迟路径，
+        # 不看 `_defer_group_attention` 的配置——那个开关是"要不要把普通群消息
+        # 先放着"，管的是策略；这里管的是资格（这个人/这个群有没有资格让她
+        # 主动说话）。把两件事合并，配置一改就会让陌生人获得发言权。
+        observe = self._observe_only
         plain_group = is_group and not addressed and not _looks_urgent(text)
-        if plain_group and await self._defer_group_attention():
+        if observe or (plain_group and await self._defer_group_attention()):
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )

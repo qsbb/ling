@@ -70,6 +70,8 @@ async def web_env(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestEnv]:
         # 会在用例里覆盖这一项。
         access_mode="off",
         access_list=frozenset(),
+        # 同上：别让开发机 shell 里的 LING_LOG_ACCESS_DENIALS 漏进测试。
+        log_access_denials=True,
         # **测试不绑真实端口**：WS 服务端会占用 6799，和开发机上跑着的
         # 服务冲突（实测 `address already in use` 让整组测试 setup 失败）。
         # 需要测服务端行为时直接构造 OneBotWsServer，不经过 app 生命周期。

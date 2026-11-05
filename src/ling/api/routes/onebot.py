@@ -90,7 +90,19 @@ async def onebot_health(request: Request, auth: CurrentAuth) -> dict:
     历史上它没有鉴权也没缓存，等于对外提供"读机器人 QQ 号 + 无限打 NapCat"
     两个能力，而且首次安装未改密时（``must_change_password`` 闸在
     ``current_auth`` 里）照样暴露。缓存见 ``OneBotV11Connector.health``。
+
+    ``denied_total`` 是**本进程**启动以来被白名单拒掉的入站条数，与
+    ``log_access_denials`` 开关无关——关掉逐条日志之后，"最近有没有人在扫
+    我的机器人"仍然要答得上来（见 `ling.kernel.inbound_intake`）。
+    多副本部署时各进程各算各的，这里读到的是被命中的那个进程。
     """
+    from ling.kernel.inbound_intake import denied_total
+
     connector = _connector(request)
     ok, detail = await connector.health()
-    return {"ok": ok, "detail": detail, "instance": connector.instance_id}
+    return {
+        "ok": ok,
+        "detail": detail,
+        "instance": connector.instance_id,
+        "denied_total": denied_total(),
+    }

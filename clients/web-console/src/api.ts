@@ -254,6 +254,7 @@ export const api = {
     providers?: ProviderDraftInput[];
     profiles?: ProfileDraftInput[];
     test_mode?: boolean;
+    log_access_denials?: boolean;
     memory?: Partial<MemoryPolicy>;
     life?: Partial<LifePolicy>;
     dialogue?: Partial<DialoguePolicy>;
@@ -452,6 +453,7 @@ export const api = {
     if (params.level) query.set('level', params.level);
     if (params.logger) query.set('logger', params.logger);
     if (params.q) query.set('q', params.q);
+    if (params.kind) query.set('kind', params.kind);
     const suffix = query.toString();
     return request<LogsResponse>(`/v1/logs${suffix ? `?${suffix}` : ''}`, {
       cache: 'no-store',

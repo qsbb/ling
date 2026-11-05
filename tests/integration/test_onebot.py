@@ -216,7 +216,25 @@ async def test_normalize_rejects_non_message_event(logged_in: TestEnv) -> None:
     connector = OneBotV11Connector(CONFIG)
     with pytest.raises(ChannelError) as exc:
         connector.normalize_inbound({"post_type": "meta_event"})
-    assert exc.value.kind is ChannelErrorKind.unsupported
+    # 心跳用 `ignored` 而不是 `unsupported`：前者让 inbound_intake **不记日志**。
+    # 心跳每 30 秒一条，记下来会把 500 条缓冲里的有效日志挤出去。
+    assert exc.value.kind is ChannelErrorKind.ignored
+
+
+async def test_normalize_heartbeat_is_silent_but_notice_is_logged(
+    logged_in: TestEnv,
+) -> None:
+    """心跳静默、其它未实现事件仍要说一声——两者不能混成同一种。"""
+    connector = OneBotV11Connector(CONFIG)
+    with pytest.raises(ChannelError) as heartbeat:
+        connector.normalize_inbound(
+            {"post_type": "meta_event", "meta_event_type": "heartbeat"}
+        )
+    assert heartbeat.value.kind is ChannelErrorKind.ignored
+
+    with pytest.raises(ChannelError) as notice:
+        connector.normalize_inbound({"post_type": "notice"})
+    assert notice.value.kind is ChannelErrorKind.unsupported
 
 
 # ------------------------------------------------------------------ 发送

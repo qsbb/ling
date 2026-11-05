@@ -92,6 +92,8 @@ class DraftBody(BaseModel):
     providers: list[ProviderIn] | None = None
     profiles: list[ProfileIn] | None = None
     test_mode: bool | None = None
+    # 入站白名单拒绝是否逐条写日志。只影响日志量，不影响拒绝本身。
+    log_access_denials: bool | None = None
     memory: MemoryPolicyIn | None = None
     life: LifePolicyIn | None = None
     dialogue: DialoguePolicyIn | None = None
@@ -168,6 +170,8 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
         "schema_version": "v1",
         "revision": effective.revision,
         "test_mode": effective.test_mode,
+        # 与 `test_mode` 同级：实例级开关，不属于任何领域策略。
+        "log_access_denials": effective.log_access_denials,
         "providers": providers,
         "memory": {
             "relative_score_floor": effective.memory.relative_score_floor,
@@ -248,6 +252,7 @@ async def save_draft(
         providers=[p.model_dump() for p in body.providers] if body.providers else None,
         profiles=[p.model_dump() for p in body.profiles] if body.profiles else None,
         test_mode=body.test_mode,
+        log_access_denials=body.log_access_denials,
         memory=body.memory.model_dump(exclude_none=True) if body.memory else None,
         life=body.life.model_dump(exclude_none=True) if body.life else None,
         dialogue=(
@@ -270,6 +275,10 @@ async def publish(
     revision = await config.publish(body.revision, published_by=auth.user.id)
     request.app.state.registry.invalidate()
     request.app.state.secret_cache.clear()
+    # 「入站拒绝日志」开关也在配置修订里，而受理路径把它缓存在 app.state
+    # （TTL 见 inbound_intake）。发布/回滚发生在控制面，本进程的缓存立刻
+    # 失效，别让用户等一个 TTL 才看到开关生效。
+    request.app.state._log_denials_cache = None
     for pid in (await config.effective()).providers:
         secret = await config.read_secret(pid)
         if secret:
@@ -292,6 +301,10 @@ async def rollback(
     revision = await config.rollback(body.to_revision)
     request.app.state.registry.invalidate()
     request.app.state.secret_cache.clear()
+    # 「入站拒绝日志」开关也在配置修订里，而受理路径把它缓存在 app.state
+    # （TTL 见 inbound_intake）。发布/回滚发生在控制面，本进程的缓存立刻
+    # 失效，别让用户等一个 TTL 才看到开关生效。
+    request.app.state._log_denials_cache = None
     for pid in (await config.effective()).providers:
         secret = await config.read_secret(pid)
         if secret:

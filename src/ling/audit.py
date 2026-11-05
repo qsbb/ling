@@ -35,9 +35,15 @@ from ling.logging_setup import emit_event
 
 audit_logger = logging.getLogger("ling.audit")
 security_logger = logging.getLogger("ling.security")
+behavior_logger = logging.getLogger("ling.behavior")
 
 AUDIT = "audit"
 SECURITY = "security"
+# 运行日志：api、连接、调度这类**系统内部**的事实。
+RUNTIME = "runtime"
+# 行为日志：她**作为一个人的经历**——收到了谁的话、看了哪个群、
+# 决定接不接、为什么、在忙什么。读起来应该像日记，不像 trace。
+BEHAVIOR = "behavior"
 
 
 def hash_account_ref(raw: str | None) -> str:
@@ -155,8 +161,53 @@ _SECURITY_MESSAGES: dict[str, str] = {
 
 __all__ = [
     "AUDIT",
+    "BEHAVIOR",
+    "RUNTIME",
     "SECURITY",
     "audit_event",
+    "behavior_event",
     "hash_account_ref",
     "security_event",
 ]
+
+
+def behavior_event(
+    action: str,
+    message: str,
+    *,
+    outcome: str = "ok",
+    attributes: dict[str, Any] | None = None,
+) -> None:
+    """记一条**行为**日志：她经历了什么、怎么想的、做了什么。
+
+    ## 与 audit / security 的区别
+
+    - ``audit``  到底谁改了什么（可追责的事实）
+    - ``security`` 谁被拒绝了、为什么（安全边界）
+    - ``behavior`` 她收到了谁的话、看了哪个群、接不接、为什么——**读起来
+      像日记**，用来回答"她刚才在忙什么""她有没有看群"这类问题
+
+    ``message`` 必须是**人话**，不是事件名：写「看了下 XX 群，他们在聊游戏，
+    插不上嘴，没说话」，不要写「poll_window result=silent」。
+
+    ## 为什么正文可以进这里
+
+    行为日志和审计日志的约束**刻意不同**：审计只放计数/枚举/ID，因为要长期
+    留存；行为日志是"她这一生经历了什么"的叙述，没有说话人就无法还原。
+    但它仍然只进内存环形缓冲（与运行日志同一条管道），**不落库、不外发**，
+    保留时长受 500 条上限约束。
+    """
+    payload: dict[str, Any] = {
+        "log_kind": BEHAVIOR,
+        "action": action,
+        "outcome": outcome,
+    }
+    if attributes:
+        payload["attributes"] = attributes
+    emit_event(
+        behavior_logger,
+        logging.INFO,
+        event_name=action,
+        message=message,
+        attributes=payload,
+    )

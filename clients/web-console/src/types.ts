@@ -220,6 +220,11 @@ export interface SettingsConfig {
   schema_version: string;
   revision: number;
   test_mode: boolean;
+  /**
+   * 入站白名单拒绝是否逐条写日志。**只影响日志量，不影响拒绝本身**。
+   * 它存在配置修订里（与 `test_mode` 同层），所以开关走草稿→发布流程。
+   */
+  log_access_denials: boolean;
   memory: MemoryPolicy;
   life: LifePolicy;
   dialogue: DialoguePolicy;
@@ -555,10 +560,20 @@ export interface LogEntry {
   message: string;
   event_name?: string;
   attributes?: Record<string, unknown>;
+  /**
+   * 日志分类：`runtime`（运行）/ `behavior`（处理）/ `audit` / `security`。
+   *
+   * 由**后端**算好下发，前端不再从 `attributes.log_kind` 里猜一遍——
+   * 两处各判一次早晚会不一致。
+   */
+  kind?: LogKind;
   trace_id?: string;
   turn_id?: string;
   session_id?: string;
 }
+
+/** 与后端 `LOG_KINDS` 同一份取值。 */
+export type LogKind = 'runtime' | 'behavior' | 'audit' | 'security';
 
 export interface LogsResponse {
   /** **时间正序**：最新的在最后。 */
@@ -567,6 +582,13 @@ export interface LogsResponse {
   buffered: number;
   /** 缓冲容量（进程启动时的 `LING_LOG_BUFFER_SIZE`）。 */
   capacity: number;
+  /**
+   * **本进程**启动以来被白名单拒掉的入站条数。
+   *
+   * 与"是否逐条写日志"的开关无关：关掉逐条 WARNING 之后，这个数字仍然
+   * 要能回答"最近有没有人在扫我的机器人"。多副本时各进程各算各的。
+   */
+  denied_total: number;
 }
 
 export interface LogQuery {
@@ -574,6 +596,8 @@ export interface LogQuery {
   level?: LogLevel | null;
   logger?: string | null;
   q?: string | null;
+  /** 空值表示不筛选（不要传空串，那是语义不同的请求）。 */
+  kind?: LogKind | null;
 }
 
 /* ------------------------------------------------------------ 关于与版本 */
