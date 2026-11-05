@@ -824,12 +824,65 @@ def test_image_services_expose_current_digest_in_environment(
         assert data["services"][service]["image"] == value, service
 
 
-def test_image_update_enabled_must_be_zero(
+SWITCH_INTERP = "      LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}\n"
+
+
+def test_real_image_compose_switch_is_interpolated() -> None:
+    """**真实的** deploy/compose.image.yaml：开关必须来自插值。
+
+    缺陷现场：那份文件把 `LING_UPDATE_ENABLED` 写死成 `"0"`，用户改 `.env`
+    也没用，只能去安装目录手改 compose。这里钉住仓库里的真实文件。
+    """
+    data = yaml.safe_load(
+        (REPO_ROOT / "deploy" / "compose.image.yaml").read_text(encoding="utf-8")
+    )
+    api_env = data["services"]["api"]["environment"]
+    assert api_env["LING_UPDATE_ENABLED"] == "${LING_UPDATE_ENABLED:-0}"
+    assert "LING_UPDATE_ENABLED" not in data["services"]["worker"]["environment"]
+
+
+def test_image_update_switch_must_be_interpolation_with_zero_default(
     compose_check: tuple[ModuleType, Path], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """镜像模式初期必须 LING_UPDATE_ENABLED=0 → 改成 1 必须 FAIL。"""
+    """基线必须 PASS；改成字面量 `"0"`（本缺陷）或 `"1"` 都必须 FAIL。"""
     module, repo = compose_check
-    _edit(repo, IMAGE, '      LING_UPDATE_ENABLED: "0"\n', '      LING_UPDATE_ENABLED: "1"\n')
+    assert module.main() == 0, capsys.readouterr().out
+
+    # 字面量 "0"：用户改 .env 打不开 → FAIL（这正是缺陷现场）。
+    _edit(repo, IMAGE, SWITCH_INTERP, '      LING_UPDATE_ENABLED: "0"\n')
+    assert module.main() == 1
+    out = capsys.readouterr().out
+    assert "LING_UPDATE_ENABLED" in out
+    assert "插值" in out
+
+
+def test_image_update_switch_rejects_literal_one(
+    compose_check: tuple[ModuleType, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """字面量 "1" 把默认值变成开启 → FAIL。"""
+    module, repo = compose_check
+    _edit(repo, IMAGE, SWITCH_INTERP, '      LING_UPDATE_ENABLED: "1"\n')
+
+    assert module.main() == 1
+    assert "LING_UPDATE_ENABLED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "      LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-1}\n",  # 默认开
+        "      LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED}\n",  # 没有默认值
+        "      LING_UPDATE_ENABLED: ${LING_UPDATE_OTHER:-0}\n",  # 换个变量名
+    ],
+)
+def test_image_update_switch_other_forms_fail(
+    compose_check: tuple[ModuleType, Path],
+    capsys: pytest.CaptureFixture[str],
+    replacement: str,
+) -> None:
+    """连插值也不是万能的：默认值必须是 0、变量名必须是它本体。"""
+    module, repo = compose_check
+    _edit(repo, IMAGE, SWITCH_INTERP, replacement)
 
     assert module.main() == 1
     assert "LING_UPDATE_ENABLED" in capsys.readouterr().out
@@ -865,8 +918,8 @@ def test_image_rejects_source_only_vars(
     _edit(
         repo,
         IMAGE,
-        "      LING_UPDATE_ENABLED: \"0\"\n",
-        "      LING_UPDATE_ENABLED: \"0\"\n      LING_COMMIT: ${LING_COMMIT:-}\n",
+        SWITCH_INTERP,
+        SWITCH_INTERP + "      LING_COMMIT: ${LING_COMMIT:-}\n",
     )
 
     assert module.main() == 1

@@ -24,8 +24,9 @@
 > 故障注入里的 head 不一致 / 并发请求 / 旧执行器残留（其余 14 类已做）、中断中任务的对账
 > （仅单测）、生产库有真实数据时的恢复（生产库 `messages=0`/`memories=0`）、arm64 运行、
 > 浏览器端到端点一遍。
-> `LING_UPDATE_ENABLED` 在镜像主文件里仍写死 `"0"`，发布目录
-> `deploy/releases.json` 仍是空骨架（真实部署会 `no_available_target`）。详见
+> 镜像主文件的 `LING_UPDATE_ENABLED` 默认 `0`（插值，可用
+> `ling install --with-updater --enable-updates` 打开）；仓库里的 `deploy/releases.json`
+> 仍是空骨架（真实部署会 `no_available_target`）。详见
 > `docs/UPDATES.md` §10 与 `shots/deploy-research/P5-DRILL.md`。
 >
 > **实施变更（缺陷 6）**：自动探活**不再**打 `/v1/version`（该端点挂 `CurrentAuth`，未鉴权
@@ -89,7 +90,7 @@ GHCR 若为私有，宿主使用只有该 package `read:packages` 的凭据，�
 > 关闭通道时不需要创建它们"已过期（本段前半句 `--env-file`/cron 的过期见上文 P1 标注）：正常
 > 安装流程都会准备 `<dir>/updater/{requests,state}` 和更新器 `.env`（requests 2770 + 共享组、
 > state 0750，对应 `deploy/compose.image.yaml` 的 `group_add`），与这次是否拉起更新器无关；
-> 拉起仍要显式 `--with-updater`，`LING_UPDATE_ENABLED` 仍写死 `"0"`。
+> 拉起仍要显式 `--with-updater`；网页更新开关由 `--enable-updates` 决定，默认 `0`。
 
 ## 5. 人工发布协议（首版）
 

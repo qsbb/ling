@@ -442,6 +442,65 @@ def test_doctor_ignores_commented_out_update_switch(ops: Ops) -> None:
     assert "[ok] 更新通道" in result.stdout, result.stdout
 
 
+def test_doctor_reports_update_switch_off_with_howto(ops: Ops) -> None:
+    """开关是 0：显示 `update.enabled=false` + **打开方法**，且不说“尚未实现”。"""
+    install_ok(ops)
+
+    with serving(ops.ws):
+        result = ops.run(doctor_argv(ops), env={"STUB_CRON_LINE": cron_line(ops)})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "[ok] 更新通道" in result.stdout, result.stdout
+    assert "update.enabled=false" in result.stdout
+    assert "LING_UPDATE_ENABLED=0" in result.stdout
+    assert "网页更新未启用" in result.stdout
+    # 不是“不可用”，而是给出可执行的两条路。
+    assert "--enable-updates" in result.stdout
+    assert "LING_UPDATE_ENABLED 改成 1" in result.stdout
+    combined = result.stdout + result.stderr
+    assert "尚未实现" not in combined
+    assert "执行器未实现" not in combined
+
+
+def test_doctor_reports_update_switch_on(ops: Ops) -> None:
+    """开关是 1（更新器已拉起）：`update.enabled=true`，不再说“未启用”。
+
+    这里直接装成开启状态：`.env` 写 1 + 安装记录 update.enabled=true +
+    更新器记录为已拉起 —— 三项一致时 doctor 只应报 ok。
+    """
+    with late_readyz(ops.ws) as server:
+        result = run_install(
+            ops.ws,
+            extra=[
+                "--updater-digest",
+                UPDATER_TARGET,
+                "--with-updater",
+                "--enable-updates",
+                "--docker-gid",
+                "999",
+            ],
+        )
+        assert server.wait_ready(10.0)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    # 开关开着时更新器**必须真在跑**（这份记录里 started=true，实况也要一致）。
+    docker_state = ops.ws.state()
+    docker_state["containers"]["updater"] = own_updater_container(ops)
+    ops.ws.write_state(docker_state)
+    (ops.ws.install_dir / "updater" / "state" / "status.json").write_text(
+        json.dumps({"schema": 1, "protocol": 1}), encoding="utf-8"
+    )
+
+    with serving(ops.ws):
+        result = ops.run(doctor_argv(ops), env={"STUB_CRON_LINE": cron_line(ops)})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "[ok] 更新通道" in result.stdout, result.stdout
+    assert "update.enabled=true" in result.stdout
+    assert "LING_UPDATE_ENABLED=1" in result.stdout
+    assert "网页更新未启用" not in result.stdout
+    combined = result.stdout + result.stderr
+    assert "尚未实现" not in combined
+    assert "执行器未实现" not in combined
+
+
 def test_doctor_reports_recorded_vs_live_digest_mismatch(ops: Ops) -> None:
     install_ok(ops)
     docker_state = ops.ws.state()
@@ -1044,6 +1103,46 @@ def test_status_recorded_port_fallback_is_warn_not_ok(ops: Ops) -> None:
     assert "未与实况核对，200 只算警告" in row, row
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "警告，不按 OK 处理" in result.stdout, result.stdout
+
+
+def test_status_shows_update_enabled_and_howto(ops: Ops) -> None:
+    """status 必须显示 update.enabled 当前值；0 时给出**具体怎么开**。"""
+    install_ok(ops)
+
+    with serving(ops.ws):
+        result = ops.run(status_argv(ops))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "[OK  ] 网页一键更新（update.enabled）" in result.stdout, result.stdout
+    assert "update.enabled=false" in result.stdout or "0（未启用）" in result.stdout
+    assert "LING_UPDATE_ENABLED" in result.stdout
+    assert "--enable-updates" in result.stdout
+    assert "尚未实现" not in result.stdout
+
+
+def test_status_shows_update_enabled_true(ops: Ops) -> None:
+    """开关是 1（实况 compose 模型解析出 1）：status 说已启用，不说“未启用”。"""
+    with late_readyz(ops.ws) as server:
+        result = run_install(
+            ops.ws,
+            extra=[
+                "--updater-digest",
+                UPDATER_TARGET,
+                "--with-updater",
+                "--enable-updates",
+                "--docker-gid",
+                "999",
+            ],
+        )
+        assert server.wait_ready(10.0)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    with serving(ops.ws):
+        result = ops.run(status_argv(ops))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "[OK  ] 网页一键更新（update.enabled）" in result.stdout, result.stdout
+    assert "1（已启用）" in result.stdout
+    assert "**已启用**" in result.stdout
+    assert "尚未实现" not in result.stdout
 
 
 def test_status_uses_live_port_and_flags_stale_record(ops: Ops) -> None:

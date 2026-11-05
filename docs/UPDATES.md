@@ -71,7 +71,8 @@ Web ◀──GET /v1/version/update──────────── API（�
 
 > 镜像模式用的是另一份主文件 `deploy/compose.image.yaml`：宿主路径是**必填插值**
 > （缺值 `docker compose config` 直接失败），还要 `LING_UPDATE_SHARED_GID`，
-> 并且 `LING_UPDATE_ENABLED` 在那份文件里**写死 `"0"`**。详见 §10 与
+> 并且 `LING_UPDATE_ENABLED` 在那份文件里**默认 `0`**（插值，可用
+> `ling install --with-updater --enable-updates` 打开）。详见 §10 与
 > [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐)。
 
 Compose 只给 **api** 注入这三个变量：
@@ -792,8 +793,9 @@ fail-closed 判据）；必须先人工迁移。
 >   head 不一致 / 并发请求 / 旧执行器残留（这三项依赖真实升级场景）；中断中任务的真实
 >   对账（只有 3 条单测 + 变异验证）；生产库有真实数据时的恢复（生产库 `messages=0`/
 >   `memories=0`）；arm64 运行（镜像双架构已构建，宿主是 x86_64）；浏览器端到端点一遍。
-> - **不能宣称“网页一键更新可用”**：`LING_UPDATE_ENABLED` 在镜像模式主文件里仍
->   写死 `"0"`，真实原因是**缺第二个镜像摘要、双次升级演练未完成**；
+> - **不能宣称“网页一键更新可用”**：`LING_UPDATE_ENABLED` 默认 `0`（插值，
+>   可用 `ling install --with-updater --enable-updates` 打开），但**默认关**的真实
+>   原因是**缺第二个镜像摘要、双次升级演练未完成**；
 >   `deploy/releases.json` 仍是空列表，真实部署会显示
 >   `no_available_target` 并禁用按钮（见 §10.8）。
 
@@ -905,8 +907,8 @@ fail-closed 判据）；必须先人工迁移。
 - 默认 0；镜像模式主文件 `deploy/compose.image.yaml` 里这一项是**字面量 `"0"`**，
   **只改 `.env` 打不开它**——这是有意的：挂上目录 ≠ 打开开关，避免“开关开了却没
   人执行”。
-- **不要把两条通道的开关混为一谈**：镜像模式的主文件把 `LING_UPDATE_ENABLED`
-  写死为 `0`；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
+- **不要把两条通道的开关混为一谈**：镜像模式主文件的 `LING_UPDATE_ENABLED`
+  默认取 `0`（插值，显式打开才为 1）；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
   `install.sh` **子进程环境**里设 `LING_UPDATE_ENABLED=1`（源码模式通道自己的
   开关，只影响那个子进程，不写宿主 `.env`）。两者不共用同一套开关。
 - 打开前必须同时满足（设计 §7 第 2 条）：**先在隔离项目完成一次新装 + 两次连续

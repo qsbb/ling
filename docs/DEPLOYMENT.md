@@ -1788,7 +1788,7 @@ status 里的心跳来回答 `executor.online`，但没有任何路径会去写 
 
 > 镜像模式的主文件 `deploy/compose.image.yaml` 不是这样：两条宿主路径是**必填
 > 插值**（缺值 `config` 直接失败），还要 `LING_UPDATE_SHARED_GID`（API 靠
-> `group_add` 进共享组），而 `LING_UPDATE_ENABLED` 在那份文件里**写死 `"0"`**
+> `group_add` 进共享组），而 `LING_UPDATE_ENABLED` 在那份文件里是**插值且默认 `0`**（`${LING_UPDATE_ENABLED:-0}`）
 > ——只改 `.env` 打不开。见 §11。
 
 宿主准备（**显式人工执行**，`install.sh` 不会替你启用）：
@@ -1983,7 +1983,7 @@ python3 deploy/release/publish.py \
 隔离项目 `ling-drill` 上真机跑通了三次连续升级；生产 `ling` 已于 2026-11-05 迁到
 镜像模式，但**两次连续网页升级没在生产上走完**——目前只发布过一个镜像摘要
 （`42bba216`），没有第二个 digest。镜像模式 compose 里 `LING_UPDATE_ENABLED` 仍
-写死 `0`，`deploy/releases.json` 还是空目录（真实部署会显示 `no_available_target`）。
+默认 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改 `.env` 打开），仓库里的 `deploy/releases.json` 仍是空骨架（真实部署会显示 `no_available_target`）。
 所以现在仍不要对用户宣称"可以在网页里更新"（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
@@ -2005,7 +2005,7 @@ python3 deploy/release/publish.py \
 | 变量 | 模式 | 说明 |
 | --- | --- | --- |
 | `LING_APP_IMAGE` | **镜像模式必填** | 固定 `ghcr.io/qsbb/ling-api@sha256:<64 位 hex>`；`compose.image.yaml` 里是 `:?` 必填插值，缺值 `config` 直接失败；不认可变 tag |
-| `LING_UPDATE_ENABLED` | 两种模式 | 默认 `0`；镜像模式主文件里写死 `"0"`，改 `.env` 不生效 |
+| `LING_UPDATE_ENABLED` | 两种模式 | 默认 `0`；镜像模式也是插值（`${LING_UPDATE_ENABLED:-0}`），改用 `ling install --with-updater --enable-updates` 或编辑 `.env` 后重启 api |
 | `LING_UPDATE_REQUESTS_HOST` / `LING_UPDATE_STATUS_HOST` | 镜像模式必填 | 宿主绝对路径；API 分别 `rw` / `ro` 挂载。源码模式有相对默认值（只适合本机试验） |
 | `LING_UPDATE_SHARED_GID` | **镜像模式必填**、源码模式不需要 | 共享组 gid：requests 目录要被 api（uid 10001）与更新器（另一个 uid）同时用；`ling install` 会写它并设目录权限。不要写 0 |
 | `LING_UPDATER_IMAGE` | 可选 | 更新器镜像摘要；只影响网页更新，缺失即"网页更新不可用" |
@@ -2013,7 +2013,7 @@ python3 deploy/release/publish.py \
 字段级注释（含会被拒绝的写法）都在 [`deploy/env.example`](../deploy/env.example)，
 本节不复制。
 
-> **两条通道不共用同一套开关**：镜像模式主文件把 `LING_UPDATE_ENABLED` 写死为
+> **两条通道不共用同一套开关**：镜像模式主文件的 `LING_UPDATE_ENABLED` 默认取
 > `0`；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
 > `install.sh` **子进程环境**里设 `LING_UPDATE_ENABLED=1`（只影响该子进程，不写
 > 宿主 `.env`）。看到仓库里有 `=1` 不代表镜像模式开关被打开。

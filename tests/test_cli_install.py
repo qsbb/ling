@@ -51,6 +51,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LING_PY = REPO_ROOT / "deploy" / "cli" / "ling.py"
@@ -888,7 +889,9 @@ def _config_json(
                 "environment": {
                     "LING_ENV": "production",
                     "LING_RUN_MIGRATIONS": "0",
-                    "LING_UPDATE_ENABLED": "0",
+                    # 与真实 compose.image.yaml 同形：开关**来自插值**，由 stub 按
+                    # `--env-file` 解析。写死 "0" 就测不出"安装器有没有把值写进 .env"。
+                    "LING_UPDATE_ENABLED": "${LING_UPDATE_ENABLED:-0}",
                     "LING_PORT": str(DEFAULT_PORT),
                 },
                 "ports": [
@@ -1751,6 +1754,7 @@ def test_install_still_refuses_non_empty_compose_dir(ws: Workspace) -> None:
 
 
 def test_install_state_never_enables_web_update(ws: Workspace) -> None:
+    """默认安装：开关**显式**写 0，摘要给出**打开方法**（而不是“不可用”）。"""
     result = run_install(ws, readyz=True)
     assert result.returncode == 0, (result.stdout, result.stderr)
     state_text = (ws.install_dir / "install-state.json").read_text(encoding="utf-8")
@@ -1761,15 +1765,22 @@ def test_install_state_never_enables_web_update(ws: Workspace) -> None:
     for text in (state_text, env_text, compose_text):
         assert "LING_UPDATE_ENABLED=1" not in text
         assert '"enabled": true' not in text
+    # 开关要**显式写 0**（留空看不出意图），且 compose 副本保留插值形式。
+    assert "LING_UPDATE_ENABLED=0" in env_text
+    assert "LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}" in compose_text
     state = json.loads(state_text)
-    assert state["update"] == {
-        "enabled": False,
-        "protocol": 1,
-        "reason": "网页更新执行器尚未实现（设计 §7 第 6 项）；本次安装未启用",
-    }
+    assert state["update"]["enabled"] is False
+    assert state["update"]["protocol"] == 1
+    assert "LING_UPDATE_ENABLED=0" in state["update"]["reason"]
+    assert "打开方法" in state["update"]["reason"]
+    assert "尚未实现" not in state["update"]["reason"]
     combined = result.stdout + result.stderr
     assert "更新已启用" not in combined
     assert "不可一键更新" in result.stdout
+    # 摘要必须给**具体怎么开**，不能只说“不可用”。
+    assert "--enable-updates" in result.stdout
+    assert "LING_UPDATE_ENABLED 改成 1" in result.stdout
+    assert "尚未实现" not in combined
 
 
 # ---------------------------------------------------------------- 更新器准备
@@ -1919,8 +1930,8 @@ def test_install_wires_update_channel_host_dirs_and_shared_group(ws: Workspace) 
     # 必填插值要的是**宿主绝对路径**，相对路径会按 compose 项目目录解析到别处。
     assert app_env["LING_UPDATE_REQUESTS_HOST"].startswith("/")
     assert app_env["LING_UPDATE_STATUS_HOST"].startswith("/")
-    # 开关仍未打开：接线 ≠ 启用。
-    assert "LING_UPDATE_ENABLED" not in app_env
+    # 开关默认关，但必须**显式写 0**（留空看不出意图）；接线 ≠ 启用。
+    assert app_env["LING_UPDATE_ENABLED"] == "0"
     compose_text = (ws.install_dir / "compose" / "compose.image.yaml").read_text(
         encoding="utf-8"
     )
@@ -1988,6 +1999,49 @@ def test_install_env_provides_every_required_interpolation(ws: Workspace) -> Non
     env_values = _updater_env_lines(ws.install_dir / ".env")
     missing = sorted(required - set(env_values))
     assert not missing, (missing, "安装器没给这些必填插值写值；真机 config 会失败")
+
+
+# ---------------------------------------------------------------- 真实 compose.image.yaml 的开关
+
+
+REAL_IMAGE_COMPOSE = REPO_ROOT / "deploy" / "compose.image.yaml"
+
+
+def _real_api_update_switch(env_file: Path | None) -> str:
+    """按 Compose 口径解析**真实** `deploy/compose.image.yaml` 的开关值。
+
+    只看 `${VAR:-默认}`：Compose 的优先级是「进程环境 > --env-file > 默认值」。
+    这里故意不认进程环境（用例自己 monkeypatch 清掉），只测文件与默认值两条。
+    """
+    data = yaml.safe_load(REAL_IMAGE_COMPOSE.read_text(encoding="utf-8"))
+    raw = data["services"]["api"]["environment"]["LING_UPDATE_ENABLED"]
+    assert isinstance(raw, str), raw
+    match = re.fullmatch(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*))?\}", raw)
+    assert match is not None, f"开关不是插值：{raw!r}"
+    name, default = match.group(1), match.group(2)
+    values = _updater_env_lines(env_file) if env_file is not None else {}
+    return values.get(name) or (default or "")
+
+
+def test_real_image_compose_switch_follows_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缺陷回归：真实主文件的开关必须**来自插值**，改 .env 就能生效。
+
+    改前写死 `"0"`：用户只能在安装目录里手改 `compose/compose.image.yaml`。
+    这里直接解析仓库里那份真实文件，钉住"设 1 → 1、不设 → 0"。
+    """
+    monkeypatch.delenv("LING_UPDATE_ENABLED", raising=False)
+    data = yaml.safe_load(REAL_IMAGE_COMPOSE.read_text(encoding="utf-8"))
+    raw = data["services"]["api"]["environment"]["LING_UPDATE_ENABLED"]
+    assert raw == "${LING_UPDATE_ENABLED:-0}", raw
+    # worker 一条都不能有（纵深防御：不给它落点）。
+    assert "LING_UPDATE_ENABLED" not in data["services"]["worker"]["environment"]
+
+    assert _real_api_update_switch(None) == "0"
+    env_file = tmp_path / "deploy.env"
+    env_file.write_text("LING_UPDATE_ENABLED=1\n", encoding="utf-8")
+    assert _real_api_update_switch(env_file) == "1"
 
 
 def test_install_updater_env_records_digest_but_does_not_start_by_default(
@@ -2113,6 +2167,7 @@ def test_install_rejects_root_as_updater_user(ws: Workspace) -> None:
 
 
 def test_install_with_updater_never_enables_web_update(ws: Workspace) -> None:
+    """拉起更新器 ≠ 打开开关：不给 --enable-updates 时 .env 仍显式写 0。"""
     result = run_install(
         ws,
         extra=["--updater-digest", UPDATER_TARGET, "--with-updater", "--docker-gid", "1"],
@@ -2126,11 +2181,53 @@ def test_install_with_updater_never_enables_web_update(ws: Workspace) -> None:
     for text in (combined, state_text, app_env, updater_env):
         assert "LING_UPDATE_ENABLED=1" not in text
         assert "更新已启用" not in text
+    assert "LING_UPDATE_ENABLED=0" in app_env
     state = json.loads(state_text)
     assert state["update"]["enabled"] is False
     assert state["update"]["protocol"] == 1
-    # 更新器起了，但摘要里只能出现「仍未启用」这类诚实表述。
-    assert "网页更新仍未启用" in result.stdout
+    # 摘要要说“未启用”并给打开方法；不能把默认关说成“没实现”。
+    assert "网页更新未启用" in result.stdout
+    assert "--enable-updates" in result.stdout
+    assert "尚未实现" not in combined
+
+
+def test_install_enable_updates_writes_switch_on(ws: Workspace) -> None:
+    """`--with-updater --enable-updates`：.env 写 1、状态 enabled=true、摘要说已启用。"""
+    result = run_install(
+        ws,
+        extra=[
+            "--updater-digest",
+            UPDATER_TARGET,
+            "--with-updater",
+            "--enable-updates",
+            "--docker-gid",
+            "1",
+        ],
+        readyz=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    env_values = _updater_env_lines(ws.install_dir / ".env")
+    assert env_values["LING_UPDATE_ENABLED"] == "1"
+    state = ws.install_state()
+    assert state["update"]["enabled"] is True
+    assert state["update"]["protocol"] == 1
+    assert "网页更新已启用" in result.stdout
+    assert "LING_UPDATE_ENABLED=1" in state["update"]["reason"]
+    assert "尚未实现" not in (result.stdout + result.stderr)
+
+
+def test_install_enable_updates_without_updater_fails(ws: Workspace) -> None:
+    """只给 --enable-updates：非 0 退出，并说明“没有更新器就没有执行者”."""
+    result = run_install(ws, extra=["--enable-updates"], readyz=True)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    combined = result.stdout + result.stderr
+    assert "--enable-updates" in combined
+    assert "--with-updater" in combined
+    assert "执行者" in combined
+    # 用法错误：什么都不该被创建，也不该发起任何 docker 调用。
+    assert not ws.install_dir.exists()
+    assert not [line for line in ws.calls() if "docker" in line]
 
 
 # ---------------------------------------------------------------- 更新器项目名派生 / 冲突守卫

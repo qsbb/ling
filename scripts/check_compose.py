@@ -80,6 +80,13 @@ UPDATE_MOUNTS: dict[str, str] = {
 # 共享组变量：`ling install` 把宿主 requests/state 的属组设成更新器 gid，
 # API 容器靠这个补充组写请求、读状态。
 UPDATE_SHARED_GID_VAR = "LING_UPDATE_SHARED_GID"
+# 网页更新开关：必须是插值且**默认解析为 0**（`${LING_UPDATE_ENABLED:-0}`）。
+# 写死 "0" = 用户改 `.env` 也打不开（只能去安装目录手改 compose）；
+# 写死 "1" = 默认就开。两者都不是"默认关、可显式开"。
+UPDATE_ENABLED_VAR = "LING_UPDATE_ENABLED"
+UPDATE_ENABLED_SWITCH_RE = re.compile(
+    r"^\$\{" + re.escape(UPDATE_ENABLED_VAR) + r"(:?-0)\}$"
+)
 REQUIRED_INTERPOLATION_RE = re.compile(
     r"^\$\{([A-Za-z_][A-Za-z0-9_]*):\?[^}]*\}$"
 )
@@ -288,6 +295,20 @@ def interpolation_default(expr: str) -> str | None:
             argument = rest[len(op) :]
             return None if op in {":+", "+"} else argument
     return None
+
+
+def update_switch_off_by_default(value: object) -> bool:
+    """`LING_UPDATE_ENABLED` 是否**来自插值且默认解析为 0**。
+
+    只接受 `${LING_UPDATE_ENABLED:-0}`（以及等价写法 `${LING_UPDATE_ENABLED-0}`）：
+
+    - 写死 `"0"`：用户改 `.env` 也打不开（本缺陷现场），FAIL；
+    - 写死 `"1"`：默认值直接变成开启，FAIL；
+    - 裸 `${LING_UPDATE_ENABLED}`：没有默认值，缺值时是空串，FAIL；
+    - `${OTHER:-0}` 之类复用别的变量：改名换姓地绕开门禁，FAIL。
+    """
+    text = str(value).strip()
+    return UPDATE_ENABLED_SWITCH_RE.match(text) is not None
 
 
 def is_host_bind(source: str) -> bool:
@@ -696,10 +717,15 @@ def check_image_structure(data: dict, text: str, label: str, errors: list[str]) 
             f"单次迁移用 run -e LING_RUN_MIGRATIONS=1），实际 {migrations!r}"
         )
     update_enabled = api_env.get("LING_UPDATE_ENABLED")
-    if str(update_enabled) != "0":
+    # 开关必须**来自插值且默认解析为 0**：`LING_UPDATE_ENABLED=0` 是写死的
+    # 字面量，用户改 `--env-file` 里的 `.env` 也没用（缺陷现场：开关打不开、
+    # 只能去安装目录手改 compose）。`"1"` 则把默认值变成开启。两者都必须 FAIL。
+    if not update_switch_off_by_default(update_enabled):
         errors.append(
-            f"[{label}] api 初期必须固定 LING_UPDATE_ENABLED=0（更新通道未启用），"
-            f"实际 {update_enabled!r}"
+            f"[{label}] api 的 LING_UPDATE_ENABLED 必须写成插值 "
+            f"${{LING_UPDATE_ENABLED:-0}}（来自 --env-file，默认解析为 0），"
+            f"实际 {update_enabled!r}：字面量 \"0\" 用户改 .env 也打不开，"
+            "字面量 \"1\" 会把默认值变成开启"
         )
     worker_env = service_environment(worker)
     if "LING_UPDATE_ENABLED" in worker_env and str(worker_env["LING_UPDATE_ENABLED"]) != "0":

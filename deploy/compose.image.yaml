@@ -28,8 +28,15 @@
 #   `ling install` 写进受限 .env）——缺值时 `docker compose config` 直接失败，
 #   不会静默少挂一条（少挂的后果是 POST 必然被拒，而且看不出原因）。
 #   API 只加入这两个目录的**共享组**（`group_add`），worker 一条都不挂。
-#   `LING_UPDATE_ENABLED` 仍固定 "0"：挂上目录 ≠ 打开开关，执行器协议尚未验收，
-#   网页更新还没正式启用。
+#   `LING_UPDATE_ENABLED` 是**插值且默认 0**（`${LING_UPDATE_ENABLED:-0}`）：
+#   挂上目录 ≠ 打开开关。默认关是发布证据/演练门槛：要打开必须同时满足
+#   ①更新器镜像已配置（`--updater-digest` + `--with-updater`）、
+#   ②可信发布目录（`<发行包 deploy>/releases.json`，即更新器容器里的
+#      `/srv/ling-code/releases.json`）里已有可升到当前版本的条目、③有完整恢复点
+#   （`ling backup` + `ling restore-drill` 四件齐全）。三条不齐就保持 0——
+#   开了开关却没有执行者、或没有可回滚的恢复点，网页更新只会失败在半路。
+#   **worker 不注入**：它连“开关/路径是什么”都不该知道，将来即使误挂上目录
+#   也没有可用落点——那是纵深防御，与 api 这个开关是两件事，不要一起改。
 # - 配置与密钥仍由宿主受限 .env 注入，不写进镜像。
 #
 # 约束（沿用源码模式）：
@@ -172,15 +179,19 @@ services:
       # 失败就不启动新 API（设计 §4/§5）。需要单次迁移时用：
       #   run --rm --no-deps -e LING_RUN_MIGRATIONS=1 api migrate
       LING_RUN_MIGRATIONS: "0"
-      # 网页更新的开关仍写死 0：通道目录已经挂上（见下面 volumes），但更新器
-      # 协议/执行器还没验收，只改 .env 打不开它——避免"开了开关却没人执行"。
+      # 网页更新的开关：**插值，默认 0**（与源码模式 compose.yaml 同一口径）。
+      # 默认关不是“没实现”——更新器（deploy/updater/）是实现了的，只是有发布
+      # 证据/演练门槛：打开前必须有更新器镜像（`--updater-digest` + 更新器项目
+      # 已拉起）、发布目录里要有条目、要有完整恢复点（`ling backup` +
+      # `ling restore-drill`）。正规途径是 `ling install --with-updater
+      # --enable-updates`（它的 `.env` 里会显式写 1），不要再手改这份文件。
       # 两个容器内路径**只写在 api 的 environment 里**（不进 x-app-env）：
       # 容器内路径固定、不由宿主 .env 覆盖，宿主侧路径只出现在 `volumes:`。
-      # 刻意不给 worker 这两行——worker 连"路径是什么"都不该知道，这样将来
-      # 即使有人误给它挂上目录，它也没有可用的落点（纵深防御）。
+      # 刻意不给 worker 这两行/这个开关——worker 连"路径是什么"都不该知道，
+      # 这样将来即使有人误给它挂上目录，它也没有可用的落点（纵深防御）。
       LING_UPDATE_REQUESTS_DIR: /run/ling-update/requests
       LING_UPDATE_STATUS_DIR: /run/ling-update/status
-      LING_UPDATE_ENABLED: "0"
+      LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}
     # 共享组：`ling install` 把宿主 requests/state 目录的属组设成更新器 gid，
     # requests 目录带 setgid，于是 API 写出的请求文件继承该组、更新器按组读得到。
     # API 镜像自己的 gid 是 10001，与更新器的 10002 不同 uid，**只有**加入这个

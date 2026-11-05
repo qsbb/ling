@@ -12,7 +12,8 @@
 > 不是演练。**仍未完成**：两次连续网页升级（只发布过一个摘要 `42bba216`，缺第二个 digest）、
 > head 不一致 / 并发请求 / 旧执行器残留的故障注入、中断中任务的对账（仅单测）、生产库有
 > 真实数据时的恢复（生产库仍是零数据）、arm64 运行、真实浏览器端到端点一遍。开关仍未打开
-> （`LING_UPDATE_ENABLED` 在镜像主文件里写死 0），发布目录
+> （`LING_UPDATE_ENABLED` 默认 0，插值；可用 `ling install --with-updater --enable-updates`
+> 或编辑 `.env` 打开——默认关是演练门槛，不是"没实现"），发布目录
 > `deploy/releases.json` 仍是空骨架（真实部署 `no_available_target`、按钮禁用）。
 > 下文"现状/未实现"段落保留为设计时的论证与验收门槛，现状以 `docs/UPDATES.md` §10 为准。
 

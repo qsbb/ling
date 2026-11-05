@@ -74,6 +74,8 @@ import（安装包不装依赖）。需要 Python 3.9+。
 ``--source-commit``          ``LING_INSTALL_SOURCE_COMMIT``
 ``--updater-digest``         ``LING_UPDATER_IMAGE``（可选；缺失=不配置更新器）
 ``--with-updater``           （无；显式拉起独立项目 ``<项目名>-updater``）
+``--enable-updates``         （无；写 ``LING_UPDATE_ENABLED=1``，必须配合
+                             ``--with-updater``；不给时显式写 0）
 ``--docker-socket``          ``LING_DOCKER_SOCKET`` / ``DOCKER_HOST=unix://``
 ``--docker-gid``             ``LING_DOCKER_GID``（默认从 socket ``stat`` 读出）
 ``--project``                ``LING_COMPOSE_PROJECT``（默认 ``ling``）
@@ -84,8 +86,10 @@ import（安装包不装依赖）。需要 Python 3.9+。
 更新器（独立 Compose 项目 ``<项目名>-updater``，默认 ``ling-updater``）
 ========================================================================
 更新器**不随应用 Compose 项目启动**（设计 §4）。安装器负责准备好它的宿主侧
-前提，但**默认不拉起**——网页更新尚未正式支持，安装器不会显示“已启用”，
-``update.enabled`` 恒为 ``false``：
+前提，但**默认不拉起**（``--with-updater`` 才拉）。网页更新开关独立记录在
+``update.enabled``：默认 ``false``，只有同时给 ``--with-updater
+--enable-updates`` 才为 ``true``（那时受限 .env 里显式写
+``LING_UPDATE_ENABLED=1``）。默认关是**发布证据/演练门槛**，不是“没实现”：
 
 - 创建 ``<dir>/updater/{requests,state}``（0700）与 ``<dir>/updater/.env``
   （0600，更新器 Compose 的 ``--env-file``；只含宿主路径/socket/gid/运行身份，
@@ -188,9 +192,10 @@ import（安装包不装依赖）。需要 Python 3.9+。
 本命令**不做**的事
 ==================
 - 不下载安装包、不校验发布签名/证明：摘要只证明"取到了这组字节"（设计 §3.1）。
-- 不做网页一键更新：网页更新执行器尚未实现（设计 §7 第 6 项），因此安装
-  状态里 ``update.enabled`` 恒为 ``false``，也**不会**写
-  ``LING_UPDATE_ENABLED=1``；摘要里只可能显示"不可一键更新"。
+- 网页更新的**执行者不在本命令里**：更新器是独立 Compose 项目，由
+  ``--with-updater`` 拉起；网页更新开关由 ``--enable-updates`` 决定（两者必须
+  同时给，否则退出码 2）。默认仍是关：受限 ``.env`` 里**显式**写
+  ``LING_UPDATE_ENABLED=0``（留空看不出意图），不会因为"更新器在跑"就打开。
 - 安装阶段**不**执行备份/恢复演练：``ling backup``/``ling restore-drill``/
   ``ling doctor`` 是安装之后的独立救援入口（本批已实现），安装器只检查备份
   目录与最近恢复点，并如实说明"可使用但不可一键更新"。
@@ -1092,10 +1097,11 @@ def updater_mounts(layout: Layout, *, with_updater: bool = False) -> dict[str, A
         "note": (
             f"更新器由独立项目 {project} 运行；"
             + (
-                "本次安装用 --with-updater 显式拉起（网页更新仍未启用）"
+                "本次安装用 --with-updater 显式拉起"
                 if with_updater
-                else "本次安装不自动拉起（未用 --with-updater；网页更新未启用）"
+                else "本次安装不自动拉起（未用 --with-updater）"
             )
+            + "（网页更新开关见 update.enabled，由 --enable-updates 决定）"
         ),
     }
 
@@ -1129,7 +1135,9 @@ def update_channel_plan(options: InstallOptions) -> dict[str, Any]:
         "stat": {},
         "note": (
             "API 仅写请求/读状态：requests 2770 + 共享组（setgid 让请求文件继承组），"
-            "state 0750（API 只读 status.json，写不了状态）；网页更新开关仍是 0"
+            "state 0750（API 只读 status.json，写不了状态）；"
+            f"网页更新开关 {UPDATE_ENABLED_VAR}="
+            f"{'1' if options.enable_updates else '0'}"
         ),
     }
 
@@ -1202,6 +1210,40 @@ def updater_host_paths(options: InstallOptions) -> dict[str, Any]:
             },
         ],
     }
+
+
+UPDATE_ENABLED_VAR = "LING_UPDATE_ENABLED"
+# 打开网页更新要满足的三条（安装摘要/status/doctor 共用同一句话，避免各写一套）：
+# 更新器镜像已配置、发布目录里已有条目、有完整恢复点。
+UPDATE_ENABLE_HOWTO = (
+    "打开方法：`ling install --with-updater --enable-updates`；"
+    "或在现有部署上备好更新器镜像/发布目录条目/完整恢复点后，"
+    f"把受限 .env 的 {UPDATE_ENABLED_VAR} 改成 1 并 `docker compose ... up -d api`"
+)
+# 默认关是**门槛**，不是“没实现”——这句话在摘要/status/doctor 里一字不改地复用。
+UPDATE_NOT_IMPLEMENTED_NOTE = (
+    "更新器本身是已交付的（deploy/updater/）：默认关只是发布证据/演练门槛，"
+    "不是缺功能"
+)
+
+
+def update_reason_for(options: InstallOptions) -> str:
+    """安装记录 ``update.reason``：说明开关是开还是关、以及为什么。"""
+    if options.enable_updates:
+        return (
+            "已按 --with-updater --enable-updates 启用：受限 .env 写 "
+            f"{UPDATE_ENABLED_VAR}=1，API 把更新请求写进发布目录，由 "
+            f"{updater_project_for(options.project)} 项目执行"
+        )
+    if options.with_updater:
+        return (
+            "更新器已拉起，但没给 --enable-updates：受限 .env 显式写 "
+            f"{UPDATE_ENABLED_VAR}=0；{UPDATE_ENABLE_HOWTO}"
+        )
+    return (
+        "本次安装未启用网页更新（未给 --with-updater --enable-updates）：受限 .env 显式写 "
+        f"{UPDATE_ENABLED_VAR}=0；{UPDATE_ENABLE_HOWTO}"
+    )
 
 
 def new_state(options: InstallOptions) -> dict[str, Any]:
@@ -1296,14 +1338,15 @@ def new_state(options: InstallOptions) -> dict[str, Any]:
             "reason": "本次安装尚未产生恢复点",
         },
         "update": {
-            "enabled": False,
+            "enabled": bool(options.enable_updates),
             "protocol": UPDATER_PROTOCOL,
-            "reason": "网页更新执行器尚未实现（设计 §7 第 6 项）；本次安装未启用",
+            "reason": update_reason_for(options),
         },
         # 更新器运行时事实（与 `layout.updater` 的路径/身份分开记）：
         # 镜像 digest 只能来自发行包/CI 的发布证据（`--updater-digest` 或
         # `LING_UPDATER_IMAGE`）；缺失时**如实记 None**，绝不编一个 digest。
-        # `update.enabled` 恒为 false：这里只说明"更新器起了没有"，不是"网页更新开了"。
+        # `update.enabled` 记的是**网页更新开关**（由 --enable-updates 决定，
+        # 见 :func:`update_reason_for`），不是"更新器起了没有"——后者在下面这块。
         # `project` 记**实际用的**项目名：doctor/status 后续优先读它（见
         # :func:`updater_project_of`），不再按应用项目名重新派生。
         "updater": {
@@ -1319,7 +1362,7 @@ def new_state(options: InstallOptions) -> dict[str, Any]:
             "reason": (
                 "更新器镜像未配置（缺 --updater-digest / LING_UPDATER_IMAGE）：网页更新不可用"
                 if options.updater_digest is None
-                else "更新器镜像已记录；网页更新仍未启用（设计 §7 第 6 项）"
+                else "更新器镜像已记录；本次安装未拉起更新器（网页更新开关单独记录）"
             ),
         },
         "checks": {},
@@ -1362,6 +1405,9 @@ class InstallOptions:
     updater_uid: int
     updater_gid: int
     updater_user_source: str
+    # 网页更新开关（写进受限 .env 的 LING_UPDATE_ENABLED）。只可能为 True 当
+    # with_updater 也为 True：参数解析阶段已拒绝"只有开关没有执行者"。
+    enable_updates: bool = False
     host_arch: str = field(default_factory=host_arch)
 
     @property
@@ -1573,8 +1619,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "安装完成后显式拉起独立 Compose 项目 <项目名>-updater（默认 ling-updater；"
             "项目名由 --project 派生，多实例不会互相接管；需要 --updater-digest 与"
-            "可确定的 docker socket gid）。默认**不拉起**：更新器存在是网页更新的前提，"
-            "但网页更新尚未正式支持，安装器不会声称网页更新可用。"
+            "可确定的 docker socket gid）。默认**不拉起**。"
+            "要真正打开网页更新，还要同时给 --enable-updates。"
+        ),
+    )
+    install.add_argument(
+        "--enable-updates",
+        action="store_true",
+        help=(
+            "打开网页一键更新：与 --with-updater 一起用时在受限 .env 显式写 "
+            "LING_UPDATE_ENABLED=1。**只给本参数、不给 --with-updater 会直接失败**："
+            "没有更新器就没有执行者，开了开关只会让 POST 永远没人接。"
+            "默认（不给本参数）仍写 LING_UPDATE_ENABLED=0，且是**显式写**，"
+            "不留空——留空看不出意图。"
         ),
     )
     install.add_argument(
@@ -2071,6 +2128,27 @@ def resolve_install_options(args: argparse.Namespace) -> InstallOptions:
         updater_digest_hex = updater_match.group(1)
 
     with_updater = bool(getattr(args, "with_updater", False))
+    enable_updates = bool(getattr(args, "enable_updates", False))
+    # 开关与执行者必须成对：`LING_UPDATE_ENABLED=1` 只是"许可"，真正部署的是
+    # `<项目名>-updater` 那个独立项目。只给开关不给更新器 = 网页上的按钮永远
+    # 没人接（POST 写进 requests 目录却没人消费），是**明确失败**而不是警告。
+    if enable_updates and not with_updater:
+        raise LingError(
+            EXIT_USAGE,
+            "failed_usage",
+            "arguments",
+            (
+                "--enable-updates 必须与 --with-updater 一起用："
+                "没有更新器就没有执行者，只打开开关会让网页更新永远停在"
+                "“已提交、没人执行”。"
+            ),
+            [
+                "加上 --with-updater（并给出 --updater-digest / LING_UPDATER_IMAGE）后重试；"
+                "只想装应用就别给 --enable-updates（.env 会显式写 LING_UPDATE_ENABLED=0）。",
+                "打开前请先备好更新器镜像、发布目录条目与完整恢复点"
+                "（`ling backup` + `ling restore-drill`）。",
+            ],
+        )
     if with_updater and updater_digest is None:
         raise LingError(
             EXIT_USAGE,
@@ -2281,6 +2359,7 @@ def resolve_install_options(args: argparse.Namespace) -> InstallOptions:
         updater_digest=updater_digest,
         updater_digest_hex=updater_digest_hex,
         with_updater=with_updater,
+        enable_updates=enable_updates,
         updater_code_dir=updater_code_dir,
         updater_compose_file=updater_compose_file,
         docker_socket=docker_socket,
@@ -2382,8 +2461,12 @@ def render_env(options: InstallOptions, secret_values: dict[str, str]) -> str:
         "# 共享组 gid：api 容器用 group_add 加入它才写得进 requests、读得到状态。",
         f"LING_UPDATE_SHARED_GID={options.updater_gid}",
         "",
-        "# 网页一键更新尚未正式启用：compose.image.yaml 把 LING_UPDATE_ENABLED 固定为 0，",
-        "# 这里刻意不提供该变量（写了也不生效，避免误以为“已在 env 里打开”）。",
+        "# 网页一键更新的开关（compose.image.yaml 里是 ${LING_UPDATE_ENABLED:-0}，",
+        "# 所以**这里显式写值**：0=关、1=开）。不写空：留空看不出意图，",
+        "# 也让 compose 落回默认值、与本文件的说法不一致。",
+        "# 1 只由 `--with-updater --enable-updates` 写出：开关需要执行者，",
+        "# 且打开前应有完整恢复点（ling backup + ling restore-drill）。",
+        f"LING_UPDATE_ENABLED={'1' if options.enable_updates else '0'}",
         "",
     ]
     return "\n".join(lines)
@@ -2403,7 +2486,10 @@ def preflight_env_values(options: InstallOptions) -> dict[str, str]:
     - ``LING_APP_IMAGE`` / ``LING_POSTGRES_IMAGE``：``${VAR:?}`` 必填插值与库镜像；
     - ``LING_API_REPLICAS`` / ``LING_WORKER_REPLICAS``：``deploy.replicas``；
     - ``LING_UPDATE_REQUESTS_HOST`` / ``LING_UPDATE_STATUS_HOST`` /
-      ``LING_UPDATE_SHARED_GID``：更新通道的**必填**插值（宿主路径 + 共享组）。
+      ``LING_UPDATE_SHARED_GID``：更新通道的**必填**插值（宿主路径 + 共享组）；
+    - ``LING_UPDATE_ENABLED``：网页更新开关的**最终值**（0/1）。它改变 api 容器
+      的环境，预检模型必须与落盘后那份一致——否则"预检通过、落盘后 config 才
+      发现开关不是 0"这类差异只会在装完之后才暴露。
 
     口令/根密钥类变量（``POSTGRES_PASSWORD``/``LING_ROOT_KEY`` 等）**刻意不在这里**：
     它们只填容器环境变量、不改变模型结构，而预检阶段不生成密钥；落盘之后
@@ -2420,6 +2506,7 @@ def preflight_env_values(options: InstallOptions) -> dict[str, str]:
         "LING_UPDATE_REQUESTS_HOST": str(layout.updater_requests_dir),
         "LING_UPDATE_STATUS_HOST": str(layout.updater_state_dir),
         "LING_UPDATE_SHARED_GID": str(options.updater_gid),
+        "LING_UPDATE_ENABLED": "1" if options.enable_updates else "0",
     }
 
 
@@ -2500,7 +2587,8 @@ def render_updater_env(options: InstallOptions) -> str:
         "# 发行包 deploy 目录（只读挂进容器：release/publish.py、backup/backup.sh）。",
         f"LING_UPDATER_CODE_DIR={options.updater_code_dir}",
         "",
-        "# 本文件不含 LING_UPDATE_ENABLED：网页更新尚未正式支持，安装器不会打开它。",
+        "# 本文件不含 LING_UPDATE_ENABLED：那个开关属于**应用**的受限 .env",
+        "# （<dir>/.env），由 api 容器读取；更新器只消费请求目录，不该自己开它。",
         "",
     ]
     return "\n".join(lines)
@@ -3518,10 +3606,20 @@ class Installer:
                     ["使用 compose.image.yaml，不要与源码模式 compose.yaml 叠加。"],
                 )
         api_env = service_environment(api)
-        if api_env.get("LING_UPDATE_ENABLED") != "0":
+        # 开关的**唯一来源**是受限 .env（compose 里是 ${LING_UPDATE_ENABLED:-0}）。
+        # 这里核对"解析结果 == 本次安装要的值"：安装器不给开关，就不许 compose
+        # 模型里出现 1（宿主 shell 里残留的同名变量会被 docker_env/--env-file
+        # 的实际值覆盖，真出现了说明有人手工改过 compose 或 env）。
+        expected_updates = "1" if self.o.enable_updates else "0"
+        if api_env.get("LING_UPDATE_ENABLED") != expected_updates:
             fail(
-                "compose 的 api 环境里 LING_UPDATE_ENABLED 不是 0；"
-                "网页更新未实现前安装器不允许启用"
+                "compose 的 api 环境里 LING_UPDATE_ENABLED 是 "
+                f"{api_env.get('LING_UPDATE_ENABLED')!r}，本次安装要的是 "
+                f"{expected_updates!r}；开关只能由 --enable-updates（0/1）决定。",
+                [
+                    "检查是否有宿主 shell 导出的 LING_UPDATE_ENABLED（Compose 里"
+                    "进程环境优先于 --env-file），以及 compose 文件是否被改成字面量。",
+                ],
             )
         if api_env.get("LING_RUN_MIGRATIONS") != "0":
             fail(
@@ -3811,7 +3909,14 @@ class Installer:
         self.say("  已有实例    未发现同名项目/容器/卷（不会覆盖）")
         self.say("  已有 .env   无（安装器不会覆盖已有受限配置）")
         self.say("")
-        self.say("  网页一键更新：不可用（尚未实现）——安装后只会显示“不可一键更新”")
+        self.say("  网页一键更新："
+                 + (
+                     "**将启用**（.env 写 LING_UPDATE_ENABLED=1，"
+                     f"请求由 {self.updater_project} 执行）"
+                     if self.o.enable_updates
+                     else "将保持关闭（.env 显式写 LING_UPDATE_ENABLED=0；"
+                     "要开加 --with-updater --enable-updates）"
+                 ))
         if self.o.updater_digest is None:
             self.say(
                 "  更新器      未配置（缺 --updater-digest）：网页更新不可用，本次不会拉起"
@@ -3872,7 +3977,8 @@ class Installer:
         self.log.emit(
             f"预检：将显式拉起独立项目 {self.updater_project}（"
             f"uid/gid {self.o.updater_uid}:{self.o.updater_gid}，"
-            f"socket gid {self.o.docker_gid}；网页更新仍未启用）"
+            f"socket gid {self.o.docker_gid}；网页更新开关 "
+            f"{'1' if self.o.enable_updates else '0'}）"
         )
 
     def preflight(self) -> None:
@@ -5463,14 +5569,14 @@ class Installer:
     def start_updater(self) -> None:
         """`--with-updater` 时**显式**拉起独立项目 `<应用项目名>-updater`；否则什么都不做。
 
-        默认不拉起（设计 §4/§7）：更新器存在是网页更新的前提，但网页更新尚未正式
-        支持，安装器不会因为「更新器在跑」就宣称“更新已启用”。更新器启动失败是
+        默认不拉起（设计 §4/§7）。拉起更新器 ≠ 打开网页更新：开关是独立的
+        ``update.enabled``（由 ``--enable-updates`` 决定）。更新器启动失败是
         真实的安装失败（应用已迁移，退出码 16），不静默吞掉。
         """
         if not self.o.with_updater:
             self.log.emit(
-                "未使用 --with-updater：不拉起更新器（网页更新未启用；"
-                "安装状态 update.enabled 恒为 false）"
+                "未使用 --with-updater：不拉起更新器（网页更新开关 "
+                f"{'1' if self.o.enable_updates else '0'}）"
             )
             return
         assert self.o.updater_digest is not None
@@ -5525,13 +5631,14 @@ class Installer:
                 "started": True,
                 "started_at": utc_now(),
                 "compose_argv": argv,
-                "reason": "更新器已按固定摘要拉起；网页更新仍未启用（设计 §7 第 6 项）",
+                "reason": "更新器已按固定摘要拉起；网页更新开关见 update.enabled",
             }
         )
         self.state["status"] = "updater_started"
         self.write_state()
         self.log.emit(
-            f"更新器项目 {self.updater_project} 已启动（网页更新仍未启用；"
+            f"更新器项目 {self.updater_project} 已启动（网页更新开关 "
+            f"{'1' if self.o.enable_updates else '0'}；"
             "是否在跑以 `ling doctor` 的实况为准）"
         )
 
@@ -5793,17 +5900,17 @@ class Installer:
             }
         )
         self.state["update"] = {
-            "enabled": False,
+            "enabled": bool(self.o.enable_updates),
             "protocol": UPDATER_PROTOCOL,
-            "reason": "网页更新执行器尚未实现（设计 §7 第 6 项）；本次安装未启用",
+            "reason": update_reason_for(self.o),
         }
-        # 更新器：只记录「配置了什么、起没起」，`update.enabled` 仍是 false。
+        # 更新器：只记录「配置了什么、起没起」；`update.enabled` 记的是开关本身。
         self.state["updater"]["started"] = self.updater_started
         if not self.updater_started and self.state["updater"].get("started_at") is None:
             self.state["updater"]["reason"] = (
                 "更新器镜像未配置（缺 --updater-digest / LING_UPDATER_IMAGE）：网页更新不可用"
                 if self.o.updater_digest is None
-                else "更新器镜像已记录，但本次安装未拉起（未用 --with-updater）；网页更新未启用"
+                else "更新器镜像已记录，但本次安装未拉起（未用 --with-updater）"
             )
         self.state["status"] = "complete"
         self.state["finished_at"] = utc_now()
@@ -5848,38 +5955,77 @@ class Installer:
         if self.o.test_mode:
             self.say("  测试模式    **已启用：不会调用真实模型**")
         self.say("")
-        self.say("  一键更新    不可用（未启用）：网页更新尚未实现，本次安装没有启用它。")
+        if self.o.enable_updates:
+            self.say(
+                "  一键更新    网页更新已启用（LING_UPDATE_ENABLED=1）："
+                "更新请求由 "
+                f"{self.updater_project} 项目执行；是否在跑以 `ling doctor` 为准。"
+            )
+        else:
+            self.say(
+                "  一键更新    网页更新未启用（LING_UPDATE_ENABLED=0，"
+                "已显式写进受限 .env）。"
+            )
+            self.say("              打开方法（本机重装时）：")
+            self.say(
+                f"                  ling install --with-updater "
+                f"--updater-digest {UPDATER_REPOSITORY}@sha256:<64 位 hex> "
+                "--enable-updates"
+            )
+            self.say(
+                "              或在现有部署上确认 ① 更新器镜像已配置且 "
+                f"{self.updater_project} 在跑 ② <dir>/updater/requests "
+                "里已有发布条目 ③ 有完整恢复点"
+                "（`ling backup` + `ling restore-drill`）后，"
+            )
+            self.say(
+                f"              把 {self.layout.env_file} 的 LING_UPDATE_ENABLED 改成 1"
+                "，再 `docker compose ... up -d api`。"
+            )
+            self.say("              " + UPDATE_NOT_IMPLEMENTED_NOTE + "。")
         if self.o.updater_digest is None:
             self.say(
                 "  更新器      未配置（缺 --updater-digest / LING_UPDATER_IMAGE）："
-                "网页更新不可用；安装器不会声称它可用。"
+                "没有执行者，网页更新不可用；安装器不会声称它可用。"
             )
         elif self.updater_started:
             self.say(
                 f"  更新器      已按固定摘要拉起（项目 {self.updater_project}）："
-                f"{self.o.updater_digest}；网页更新仍未启用"
+                f"{self.o.updater_digest}"
                 f"（协议 {UPDATER_PROTOCOL}；是否在跑以 `ling doctor` 为准）。"
             )
         else:
             self.say(
                 f"  更新器      固定摘要已记录：{self.o.updater_digest}；"
-                "本次安装未拉起（未用 --with-updater）；网页更新仍未启用。"
+                "本次安装未拉起（未用 --with-updater）。"
             )
         if not backup.get("restore_point_ready"):
-            self.say(
-                "  备份验收    尚无完整恢复点 → **可使用但不可一键更新**；"
-                "请先运行 `ling backup` 并做一次 `ling restore-drill`（隔离库，不碰生产库）。"
-            )
+            if self.o.enable_updates:
+                # 开关开着却没有恢复点 = 能点更新但回不来：必须说清，别只说“不可一键更新”。
+                self.say(
+                    "  备份验收    **尚无完整恢复点**：更新开关已打开，但更新前请先完成"
+                    "`ling backup` + `ling restore-drill`（无恢复点的更新等于无法回滚）。"
+                )
+            else:
+                self.say(
+                    "  备份验收    尚无完整恢复点 → **可使用但不可一键更新**；"
+                    "请先运行 `ling backup` 并做一次 `ling restore-drill`（隔离库，不碰生产库）。"
+                )
+        elif self.o.enable_updates:
+            self.say("  备份验收    最近恢复点四个部件齐全（网页更新已启用，可回滚）。")
         else:
             self.say(
-                "  备份验收    最近恢复点四个部件齐全，但仍**不可一键更新**"
-                "（网页更新未实现）。"
+                "  备份验收    最近恢复点四个部件齐全；网页更新开关仍是 0，"
+                "打开方法见上。"
             )
         self.say("")
         self.say(
-            "  未完成项    定期备份 + 恢复演练（`ling backup` / `ling restore-drill`）；"
-            "网页更新执行器（设计 §7 第 6 项）。"
+            "  未完成项    定期备份 + 恢复演练（`ling backup` / `ling restore-drill`）。"
         )
+        if not self.o.enable_updates:
+            self.say(
+                "              网页更新开关（默认关；要开按上面的命令加 --enable-updates）。"
+            )
         self.print_password_once()
         self.say("")
         self.say("下一步：")
@@ -6246,10 +6392,16 @@ def status_command(args: argparse.Namespace) -> int:
             say(config_problem)
 
     live_image = None
+    live_update_enabled: bool | None = None
     if config is not None:
         services = config.get("services") or {}
         api = services.get("api") or {}
         live_image = api.get("image")
+        # 开关的**实况**只能从 compose 模型取：api 的 LING_UPDATE_ENABLED 是
+        # ${LING_UPDATE_ENABLED:-0}，解析出来的值就是容器真正收到的值。
+        live_switch = service_environment(api).get("LING_UPDATE_ENABLED")
+        if live_switch is not None:
+            live_update_enabled = str(live_switch).strip() not in {"", "0"}
     if config is None:
         live_port, live_problem = None, config_problem
     else:
@@ -6513,12 +6665,23 @@ def status_command(args: argparse.Namespace) -> int:
         )
     update = (state or {}).get("update") or {}
     if update:
+        recorded_update = "1（已启用）" if update.get("enabled") else "0（未启用）"
+        if live_update_enabled is not None:
+            live_update = "1（已启用）" if live_update_enabled else "0（未启用）"
+            update_ok = live_update_enabled == bool(update.get("enabled"))
+            update_note = "来自 docker compose config 的 api 环境"
+        else:
+            live_update = recorded_update
+            update_ok = False
+            update_note = f"读不到实况（{config_problem or 'compose 模型不可用'}）；按记录显示"
         rows.append(
             CompareRow(
-                "网页一键更新",
-                "未启用（设计 §7 第 6 项未实现）",
-                "未启用" if not update.get("enabled") else "记录声称已启用（不可信）",
-                not update.get("enabled"),
+                "网页一键更新（update.enabled）",
+                recorded_update,
+                live_update,
+                update_ok,
+                update_note,
+                warn=live_update_enabled is None,
             )
         )
 
@@ -6570,8 +6733,33 @@ def status_command(args: argparse.Namespace) -> int:
         )
     else:
         say("结论：实况与安装记录一致，/readyz 200，卷身份匹配。")
-    say("     网页一键更新：未启用（设计 §7 第 6 项未实现）——不影响当前使用。")
+    if update_enabled_for_display(state, live_update_enabled):
+        say("     网页一键更新：**已启用**（update.enabled=1）——请求由")
+        say(
+            f"     {updater_project_of(state)} 项目执行；它没在跑时请求会停在发布目录里。"
+        )
+    else:
+        say("     网页一键更新：未启用（update.enabled=0）——不影响当前使用。")
+        say("     更新器是**已实现**的（默认关是发布证据/演练门槛），打开方法：")
+        say(
+            "       ling install --with-updater --enable-updates"
+            "（或在现有部署上备好更新器/发布目录/恢复点后把 .env 的 "
+            "LING_UPDATE_ENABLED 改成 1 并 up -d api）。"
+        )
     return EXIT_OK
+
+
+def update_enabled_for_display(
+    state: dict[str, Any] | None, live: bool | None
+) -> bool:
+    """网页更新开关该按什么显示：**实况优先**，取不到才退回安装记录。
+
+    ``live`` 来自 ``docker compose config`` 里 api 的 ``LING_UPDATE_ENABLED``
+    （``None`` = 读不到实况）。status/doctor 共用这一口径，避免两处各说一套。
+    """
+    if live is not None:
+        return live
+    return bool(((state or {}).get("update") or {}).get("enabled"))
 
 
 def _status_containers(runner: Runner, project: str, service: str) -> list[dict[str, str]]:
@@ -7924,8 +8112,22 @@ def _doctor_backup(
 
 
 def _doctor_update(
-    state: dict[str, Any] | None, env_values: dict[str, str], rows: list[DoctorRow]
+    state: dict[str, Any] | None,
+    env_values: dict[str, str],
+    rows: list[DoctorRow],
+    live_switch: bool | None = None,
 ) -> None:
+    """更新通道：**显示 update.enabled 的当前值**，关着就说怎么开。
+
+    ``live_switch`` 来自 ``docker compose config`` 里 api 的
+    ``LING_UPDATE_ENABLED``（``None`` = 读不到实况，退回 .env/记录）。
+
+    三件事必须分清（旧实现把它们糊成一句“执行器没做”，是错的）：
+
+    1. **开关关着是正常状态**，不是故障 → ``ok``，并给出打开方法；
+    2. 开关关着但 ``.env`` 里写了 1 → ``fail``（写了却没进模型 = 部署不一致）；
+    3. 开关开着但更新器没配置/没在跑 → ``fail``（没有执行者，网页按钮永远没人接）。
+    """
     if state is None:
         rows.append(
             DoctorRow(
@@ -7935,35 +8137,84 @@ def _doctor_update(
             )
         )
         return
-    update = state.get("update") or {}
-    enabled = bool(update.get("enabled"))
     # 按**解析后的键值**判断，不是子串匹配：`LING_UPDATE_ENABLED = 1`、
     # `export LING_UPDATE_ENABLED=1`、`LING_UPDATE_ENABLED="1"` 都必须发现。
-    switch_on = env_values.get("LING_UPDATE_ENABLED") == "1"
+    env_switch_on = env_values.get("LING_UPDATE_ENABLED") == "1"
+    recorded = bool((state.get("update") or {}).get("enabled"))
+    enabled = env_switch_on if live_switch is None else live_switch
+    env_desc = f"LING_UPDATE_ENABLED={'1' if env_switch_on else '0'}"
+    value_desc = f"update.enabled={'true' if enabled else 'false'}"
+    source = (
+        "来自 docker compose config 的 api 环境"
+        if live_switch is not None
+        else "来自受限 .env（compose 模型读不到）"
+    )
+    updater = state.get("updater") or {}
+    updater_image = str(updater.get("image") or "")
+    updater_started = bool(updater.get("started"))
+    if live_switch is not None and live_switch != env_switch_on:
+        rows.append(
+            DoctorRow(
+                LEVEL_FAIL,
+                "更新通道",
+                f"{value_desc}（{source}），但受限 .env 里是 {env_desc}：两处不一致，"
+                "多半是 compose 被手改成了字面量（应写 ${LING_UPDATE_ENABLED:-0}）",
+            )
+        )
+        return
     if enabled:
+        if not updater_image:
+            rows.append(
+                DoctorRow(
+                    LEVEL_FAIL,
+                    "更新通道",
+                    f"{value_desc}（{source}，{env_desc}），"
+                    "但没有配置更新器镜像（LING_UPDATER_IMAGE）："
+                    "没有执行者，网页更新会一直是“已提交、没人执行”",
+                )
+            )
+        elif not updater_started:
+            rows.append(
+                DoctorRow(
+                    LEVEL_WARN,
+                    "更新通道",
+                    f"{value_desc}（{source}，{env_desc}）；"
+                    f"更新器 {updater_project_of(state)} 按记录未拉起，"
+                    "请确认容器在跑（`ling doctor` 的“更新器”一行是实况）",
+                )
+            )
+        else:
+            rows.append(
+                DoctorRow(
+                    LEVEL_OK,
+                    "更新通道",
+                    f"{value_desc}（{source}，{env_desc}）；"
+                    f"请求由 {updater_project_of(state)} 项目执行",
+                )
+            )
+        return
+    if recorded:
         rows.append(
             DoctorRow(
-                LEVEL_FAIL,
+                LEVEL_WARN,
                 "更新通道",
-                "安装记录声称 update.enabled=true（不可信：网页更新执行器未实现）",
+                f"安装记录写 update.enabled=true，但实况/受限 .env 是 {env_desc}："
+                "以实况为准，按未启用处理",
             )
         )
-    elif switch_on:
-        rows.append(
-            DoctorRow(
-                LEVEL_FAIL,
-                "更新通道",
-                "受限 .env 出现 LING_UPDATE_ENABLED=1；本命令不会开启它，请人工核对来源",
-            )
+        return
+    rows.append(
+        DoctorRow(
+            LEVEL_OK,
+            "更新通道",
+            f"{value_desc}（{source}，{env_desc}）。网页更新未启用——这是**默认**且"
+            "不是故障：更新器是已实现的，默认关是发布证据/演练门槛。"
+            f"要打开：`ling install --with-updater --enable-updates`，"
+            "或在现有部署上备好更新器镜像/发布目录条目/完整恢复点后，"
+            "把受限 .env 的 LING_UPDATE_ENABLED 改成 1 并 `docker compose ... up -d api`"
+            "（本命令只读，绝不在此开启）",
         )
-    else:
-        rows.append(
-            DoctorRow(
-                LEVEL_OK,
-                "更新通道",
-                "update.enabled=false（本命令只读，绝不在此开启）",
-            )
-        )
+    )
 
 
 def _doctor_updater(
@@ -8109,7 +8360,7 @@ def _doctor_updater(
             DoctorRow(
                 LEVEL_OK,
                 "更新器",
-                "；".join(detail_bits) + "（digest 与记录一致；网页更新仍未启用）",
+                "；".join(detail_bits) + "（digest 与记录一致；网页更新开关见 update.enabled）",
             )
         )
 
@@ -8237,10 +8488,30 @@ def doctor_command(args: argparse.Namespace) -> int:
     _doctor_http(runner, rows, options, state)
     _doctor_backup(runner, state, rows, max_age)
     env_values = parse_env_file(options.env_file)
-    _doctor_update(state, env_values, rows)
+    _doctor_update(state, env_values, rows, live_switch=_doctor_live_update_switch(runner, options))
     _doctor_updater(runner, state, rows, docker_available=available)
     _doctor_registry(runner, state, rows)
     return _render_doctor(rows)
+
+
+def _doctor_live_update_switch(
+    runner: Runner, options: StatusOptions
+) -> bool | None:
+    """api 的 ``LING_UPDATE_ENABLED`` 实况（来自 compose 模型）；读不到返回 ``None``。
+
+    只读：与 status 走同一个 :func:`_compose_config_model` 入口。读不到时不猜，
+    由调用方退回受限 ``.env`` 并按“未与实况核对”的口径说明。
+    """
+    if not options.env_file.is_file():
+        return None
+    config, _problem = _compose_config_model(runner, options)
+    if config is None:
+        return None
+    api = (config.get("services") or {}).get("api") or {}
+    value = service_environment(api).get("LING_UPDATE_ENABLED")
+    if value is None:
+        return None
+    return str(value).strip() not in {"", "0"}
 
 
 # ---------------------------------------------------------------- adopt
@@ -8477,8 +8748,11 @@ def adopt_command(args: argparse.Namespace) -> int:
         raise refuse(
             "update_channel",
             "compose 模型里 api 的 LING_UPDATE_ENABLED=1：更新通道是开着的，"
-            "adopt 不会登记一个已打开的更新通道。",
-            ["先按设计把它固定回 0（compose.image.yaml 的既有取值），再 adopt。"],
+            "adopt 只登记**默认关**的部署，不会替一个已打开的通道背书。",
+            [
+                "关掉开关（受限 .env 写 LING_UPDATE_ENABLED=0）后重跑 adopt；"
+                "要开着用更新，请走 `ling install --with-updater --enable-updates`。",
+            ],
         )
 
     volume_names: dict[str, str] = {}
@@ -8972,7 +9246,7 @@ def adopt_command(args: argparse.Namespace) -> int:
         )
     state["layout"]["updater"]["note"] = (
         "adopt 现场登记：更新器挂载按安装布局推导；是否在跑见 updater.started；"
-        "网页更新仍未启用"
+        "网页更新开关见 update.enabled（adopt 只登记，默认关）"
     )
     state["listen"].update(
         {
@@ -9062,8 +9336,9 @@ def adopt_command(args: argparse.Namespace) -> int:
         "enabled": False,
         "protocol": UPDATER_PROTOCOL,
         "reason": (
-            "adopt 只登记实况：绝不开启更新通道"
-            "（compose 的 LING_UPDATE_ENABLED 固定为 0）"
+            "adopt 只登记**默认关**的部署：登记的这份 compose 解析出 "
+            "LING_UPDATE_ENABLED=0（开关要打开请走 "
+            "`ling install --with-updater --enable-updates`）"
         ),
     }
     state["updater"] = {
@@ -9079,10 +9354,10 @@ def adopt_command(args: argparse.Namespace) -> int:
             sha256_file(updater_env_path) if updater_env_path.is_file() else None
         ),
         "reason": (
-            "adopt：更新器容器在运行；网页更新仍未启用（update.enabled=false）"
+            "adopt：更新器容器在运行（网页更新开关仍是 0，见 update.enabled）"
             if updater_started
             else (
-                "adopt：更新器镜像已配置但未在运行；网页更新未启用"
+                "adopt：更新器镜像已配置但未在运行"
                 if updater_image
                 else "adopt：未观察到更新器镜像/容器（网页更新不可用）"
             )
@@ -9266,7 +9541,7 @@ def adopt_command(args: argparse.Namespace) -> int:
         + (
             f"在运行（{running_updater[0]['name']}，镜像 {updater_live_ref or '未知'}）"
             if updater_started
-            else "未在运行（网页更新仍未启用）"
+            else "未在运行（是否该在跑见 update.enabled）"
         )
     )
 
@@ -9297,7 +9572,10 @@ def adopt_command(args: argparse.Namespace) -> int:
         f"  unknown    {len(unverified)} 项无法从实况推断（status/doctor 会按 unknown 显示，"
         "不会算 OK）"
     )
-    say("  更新通道   update.enabled=false（本命令绝不写 LING_UPDATE_ENABLED=1）")
+    say(
+        "  更新通道   update.enabled=0（本命令只登记默认关的部署，"
+        "绝不写 LING_UPDATE_ENABLED=1）"
+    )
     say("")
     say("下一步：")
     say("  * `ling doctor`：只读核对这份基线（不应再出现“安装记录里没有基线”）。")

@@ -1287,7 +1287,7 @@ def test_strip_service_ports_on_real_compose() -> None:
     assert stripped.count("ports: []") == 1
     for needle in (
         "LING_RUN_MIGRATIONS: \"0\"",
-        "LING_UPDATE_ENABLED: \"0\"",
+        "LING_UPDATE_ENABLED: ${LING_UPDATE_ENABLED:-0}",
         "- app-data:/data",
         "      - db-data:/var/lib/postgresql/data",
         "      - \"6520\"",
