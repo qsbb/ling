@@ -60,3 +60,6 @@ shots/
 
 # E2E 用的 playwright 目录是指向 .data 的符号链接，不进版本库
 tests/e2e/node_modules
+
+# 个人交接笔记属于工作文档，不是产品文档：只留本地 .data/handoffs/，不进公开仓库
+docs/HANDOFF-*.md
