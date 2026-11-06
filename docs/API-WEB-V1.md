@@ -89,9 +89,14 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | PUT | `/v1/settings/draft` | `{providers?, profiles?, test_mode?, log_access_denials?}` → 新草稿修订 `{revision, validation_errors}` |
 | POST | `/v1/settings/publish` | `{revision}` → `{published_revision}`（校验失败 422 + 错误列表） |
 | POST | `/v1/settings/rollback` | `{to_revision}` → `{published_revision}` |
+| GET | `/v1/settings/health` | `{revision, test_mode, profiles, health}`；`health` 键为 `provider_id/model_id`，**不含**上游错误原文（必鉴权） |
 | PUT | `/v1/settings/providers/{provider_id}/secret` | `{secret}` → `{last4, fingerprint}`（永不回显原文） |
 | DELETE | `/v1/settings/providers/{provider_id}/secret` | 删除凭据 |
-| POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[]}` |
+| POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
+
+`providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4, ...}`。
+`models[]` 每项：`{model_id, note, enabled}`——它是**给人看的目录**，不是路由白名单：
+停用的模型不会出现在新的职责绑定下拉里，但已绑定的职责仍会按原样调用。
 
 `profiles[]` 每项：`{profile, provider_id, model_id, fallback_provider_id?, fallback_model_id?,
 enabled, temperature, max_tokens?, timeout_seconds, daily_cost_limit?}`。
@@ -104,9 +109,13 @@ enabled, temperature, max_tokens?, timeout_seconds, daily_cost_limit?}`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/persona` | `{persona_id, revision, display_name, system_prompt, traits, boundaries}` |
+| GET | `/v1/persona` | `{persona_id, revision, display_name, system_prompt, traits, boundaries, scenario_prompts, scenarios[]}` |
 | PUT | `/v1/persona` | 同形状（部分字段）→ 新修订；立即影响后续轮次 |
 | GET | `/v1/actor/timeline?limit=50` | `{events: [{id, type, origin, visibility, occurred_at, summary}]}` |
+
+`scenarios[]` 每项：`{key, label, when, text, default_text, custom}`。`scenario_prompts`
+只存**覆盖**（键：`private` / `group` / `group_mentioned` / `group_unaddressed`）；
+某个键给空串或整组不带该键 = 使用内置默认。未知键返回 400，不会静默丢弃。
 
 ## 6. 健康
 
