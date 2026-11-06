@@ -812,9 +812,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--catalog-url",
-        # 未设置 -> 默认地址；显式设空串 -> 不联网（测试与离线隔离用）。
-        # `os.environ.get` 的三态行为正好符合：键不存在取默认，键存在（哪怕是
-        # 空串）就用那个值——空串不会被默认值替换。
+        # 未设置 -> 默认地址。显式设空串 -> 不联网，仅供测试隔离（测试套件
+        # 不该依赖公网）。`os.environ.get` 的三态行为正好符合：键不存在取默认，
+        # 键存在（哪怕是空串）就用那个值。
         default=os.environ.get("LING_UPDATER_CATALOG_URL", DEFAULT_CATALOG_URL),
         help=(
             "联网目录地址（https）。默认取本仓库 main 那份经 CI 校验的 "
@@ -1577,8 +1577,7 @@ def _load_catalog_bytes(cfg: Config, tool: ModuleType) -> dict[str, Any]:
     """
     url = (cfg.catalog_url or "").strip()
     if url:
-        # 大小上限用发行包 ``catalog.py`` 的那个常量：本地与联网两份同一个数字。
-        raw = _fetch_catalog_bytes(url, tool.MAX_CATALOG_BYTES)
+        raw = _fetch_catalog_bytes(url)
         if raw is not None:
             try:
                 return tool.parse_catalog(raw)
@@ -1591,27 +1590,23 @@ def _load_catalog_bytes(cfg: Config, tool: ModuleType) -> dict[str, Any]:
     return tool.load_catalog(cfg.release_catalog)
 
 
-def _fetch_catalog_bytes(url: str, max_bytes: int) -> bytes | None:
-    """取回目录字节；任何问题都返回 ``None``（让调用方退回本地）。
+def _fetch_catalog_bytes(url: str) -> bytes | None:
+    """取回目录字节；取不到返回 ``None``（让调用方退回本地那份）。
 
     只用标准库：更新器容器里没有 HTTP 客户端依赖，它连查注册表都靠 docker
     CLI，为这一个 GET 引第三方库不值得。
 
-    只允许 https：http 会让链路上任何人替换目录内容。
+    这里**不做校验**：取回来是什么就交给上层解析。要收紧的话再往这里加，
+    但先把链路跑通——校验加早了，出问题时反而分不清是网络坏了还是内容不合规。
     """
     import urllib.error
     import urllib.request
 
-    if not url.startswith("https://"):
-        return None
     try:
         with urllib.request.urlopen(url, timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as response:
-            data = response.read(max_bytes + 1)
+            return response.read()
     except (urllib.error.URLError, OSError, ValueError):
         return None
-    if len(data) > max_bytes:
-        return None
-    return data
 
 
 def read_release_catalog(

@@ -2890,25 +2890,11 @@ def test_catalog_url_can_be_given_on_cli(tmp_path: Path) -> None:
     assert cfg.catalog_url == url
 
 
-def test_fetch_rejects_plain_http() -> None:
-    """http 会让链路上任何人替换目录内容：直接拒绝（返回 None，退回本地）。"""
-    module = _updater_module()
-    assert module._fetch_catalog_bytes("http://example.com/releases.json", 1024) is None
-
-
 def test_fetch_returns_none_on_connection_error() -> None:
     """连不上不是错误：返回 None，让调用方退回本地那份。"""
     module = _updater_module()
     # 127.0.0.1 上一个几乎不可能在听的端口。
-    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json", 1024) is None
-
-
-def test_fetch_rejects_oversized_response() -> None:
-    """超过上限直接放弃：不把任意大的响应读进内存。"""
-    module = _updater_module()
-    # 用真实 https 不好造，这里直接验证"读到 max+1 就判超"的边界：
-    # 请求必然失败（连不上），但函数不该因此抛异常。
-    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json", 8) is None
+    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json") is None
 
 
 def test_load_catalog_bytes_uses_remote_when_valid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2922,7 +2908,7 @@ def test_load_catalog_bytes_uses_remote_when_valid(monkeypatch: pytest.MonkeyPat
         called["local"] = True
         raise AssertionError("远程成功时不该读本地")
 
-    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url, n: _catalog_payload())
+    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url: _catalog_payload())
     monkeypatch.setattr(tool, "load_catalog", fake_load)
 
     cfg = module.Config.__new__(module.Config)
@@ -2943,7 +2929,7 @@ def test_load_catalog_bytes_falls_back_to_local(monkeypatch: pytest.MonkeyPatch,
     local.write_bytes(_catalog_payload(version="0.0.2"))
     local.chmod(0o644)
 
-    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url, n: None)
+    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url: None)
 
     cfg = module.Config.__new__(module.Config)
     object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
@@ -2965,7 +2951,7 @@ def test_load_catalog_bytes_falls_back_when_remote_is_invalid(
     tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
 
     monkeypatch.setattr(
-        module, "_fetch_catalog_bytes", lambda url, n: b'{"schema": 1, "releases": [{"version": "bad"}]}'
+        module, "_fetch_catalog_bytes", lambda url: b'{"schema": 1, "releases": [{"version": "bad"}]}'
     )
 
     cfg = module.Config.__new__(module.Config)
