@@ -982,6 +982,10 @@ def ws(tmp_path: Path, http_state: Any) -> Workspace:
     for key in list(env):
         if key.startswith(("LING_", "COMPOSE_", "DOCKER_")):
             env.pop(key, None)
+    # 这个变量默认指向 GitHub 上的真实目录。测试必须显式关掉，否则"目录缺失
+    # 应报 catalog_missing"这类用例会真的去拉公网那份、然后断言失败——
+    # 而且测试套件会变成需要网络的（离线机器上全红）。
+    env["LING_UPDATER_CATALOG_URL"] = ""
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"):
         env.pop(key, None)
     env.update(
@@ -2811,8 +2815,12 @@ def _catalog_payload(version: str = "0.0.3", **overrides: Any) -> bytes:
     )
 
 
-def test_catalog_url_defaults_to_none(tmp_path: Path) -> None:
-    """不配就**不联网**：已部署实例的行为必须与改动前完全一样。"""
+def test_catalog_url_defaults_to_repo_main(tmp_path: Path) -> None:
+    """默认指向本仓库 main 那份经 CI 校验的目录。
+
+    为什么不默认关：不打开这条路就是死的——目录只读挂载、升级只换 app 镜像
+    不动更新器自己，本地那份永远停在安装时的版本，一键更新只能成功一次。
+    """
     module = _updater_module()
     cfg = module.parse_config(
         [
@@ -2825,7 +2833,43 @@ def test_catalog_url_defaults_to_none(tmp_path: Path) -> None:
             "--publish-py", str(PUBLISH_PY),
         ]
     )
-    assert cfg.catalog_url is None
+    assert cfg.catalog_url == (
+        "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
+    )
+
+
+def test_idle_refresh_is_throttled_not_per_poll() -> None:
+    """空闲时低频重读目录：不是每轮 5 秒都抓一次。
+
+    主循环 5 秒一轮，但轮的是**请求目录**（有没有人要更新），不是 GitHub。
+    每轮都抓一次 = 所有部署实例每 5 秒打一次 raw.githubusercontent.com。
+    所以刷新要按时间节流。
+    """
+    updater = _updater_module()
+    writer = updater.StatusWriter.__new__(updater.StatusWriter)
+    calls: list[int] = []
+
+    def fake_refresh() -> None:
+        calls.append(1)
+        writer._catalog_checked_at = time.monotonic()
+
+    writer._catalog_checked_at = 0.0
+    writer.refresh_release_catalog = fake_refresh
+
+    # 首次：还没读过（0），必须读一次。
+    writer.refresh_release_catalog_if_due()
+    assert len(calls) == 1
+
+    # 紧接着再问：没到间隔，不该再读。这就是"不会每 5 秒抓一次"。
+    writer.refresh_release_catalog_if_due()
+    assert len(calls) == 1
+
+    # 拨回超过间隔，应当再读。
+    writer._catalog_checked_at = (
+        time.monotonic() - updater.CATALOG_REFRESH_INTERVAL_SECONDS - 1
+    )
+    writer.refresh_release_catalog_if_due()
+    assert len(calls) == 2
 
 
 def test_catalog_url_can_be_given_on_cli(tmp_path: Path) -> None:
@@ -2909,8 +2953,14 @@ def test_load_catalog_bytes_falls_back_to_local(monkeypatch: pytest.MonkeyPatch,
     assert [entry["version"] for entry in catalog["releases"]] == ["0.0.2"]
 
 
-def test_load_catalog_bytes_rejects_invalid_remote(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """远程内容非法 -> 交给 parse_catalog 抛错（调用方按既有方式收敛成原因码）。"""
+def test_load_catalog_bytes_falls_back_when_remote_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """远程内容格式坏了 -> **退回本地那份**，不让整条通道变红。
+
+    仓库里一次写错的提交不该让所有人的网页更新按钮失效——本地那份好的目录
+    仍然可用。坏内容本身不会被采信：校验照跑，失败后换来源。
+    """
     module = _updater_module()
     tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
 
@@ -2922,16 +2972,14 @@ def test_load_catalog_bytes_rejects_invalid_remote(monkeypatch: pytest.MonkeyPat
     object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
     object.__setattr__(cfg, "release_catalog", tmp_path / "releases.json")
 
-    with pytest.raises(Exception) as exc:
-        module._load_catalog_bytes(cfg, tool)
-    # catalog.py 的固定错误码，不是我们另造一套。
-    assert getattr(exc.value, "code", "") in {
-        "release_field_missing",
-        "digest_invalid",
-        "commit_invalid",
-        "min_from_invalid",
-        "semver_invalid",
-    }
+    local = tmp_path / "releases.json"
+    local.write_bytes(_catalog_payload(version="0.0.2"))
+    local.chmod(0o644)
+    object.__setattr__(cfg, "release_catalog", local)
+
+    catalog = module._load_catalog_bytes(cfg, tool)
+    # 用的是本地那份（远程那份坏的没有被采信）。
+    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.2"]
 
 
 def test_parse_config_derives_catalog_paths_from_the_distribution(tmp_path: Path) -> None:

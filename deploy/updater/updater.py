@@ -266,8 +266,18 @@ MAINT_UNKNOWN = "unknown"
 
 # 可信发布目录（见模块 docstring「可信发布目录」一节的硬规则）。
 RELEASE_CATALOG_NAME = "releases.json"
+# 默认的联网目录地址：本仓库 main 分支那份、经 CI 校验的 releases.json。
+#
+# 默认打开是因为不打开这条路就是死的：目录文件只读挂载、升级只换 app 镜像
+# 不动更新器自己，所以本地那份永远停在安装时的版本——一键更新只能成功一次。
+DEFAULT_CATALOG_URL = (
+    "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
+)
 # 联网取目录的超时（秒）。更新器是常驻轮询进程，一次卡死会拖住整个通道。
 CATALOG_FETCH_TIMEOUT_SECONDS = 10.0
+# 空闲时重读发布目录的间隔（秒）。发版是低频事件，5 分钟足够；
+# 比主循环的 5 秒轮询慢两个数量级，不会把 GitHub 打成限流。
+CATALOG_REFRESH_INTERVAL_SECONDS = 300.0
 RELEASE_CATALOG_TOOL = "catalog.py"
 # 读受限 env 时的大小上限：只为一个 KEY= 行，不需要把任意大的文件读进内存。
 ENV_FILE_MAX_BYTES = 64 * 1024
@@ -724,14 +734,18 @@ class Config:
     # 打开这个地址后，更新器先从它取目录（仍然交给发行包的 ``catalog.py``
     # 做同一套严格校验），取不到再退回本地那份。
     #
-    # ## 为什么默认留空
+    # ## 默认指向本仓库 main
     #
-    # 打开它等于把「谁能改 GitHub 上的仓库」当成升级授权依据。更新器是个无凭据
-    # 的容器，它没法验证"这份内容是 owner 批准的"，只能验证 HTTPS 连到了 GitHub。
-    # 这是运维要显式做的信任决定，不能因为一次代码更新就让已部署实例突然出网。
+    # 这等于把「谁能改这个仓库的 main」当成升级授权依据。更新器无凭据，它没法
+    # 验证"这是 owner 批准的"，只能验证 HTTPS 连到了 GitHub——这是这套机制真实
+    # 的信任边界，写在这里而不是含糊过去。
     #
-    # 放在最后是因为 dataclass 要求：有默认值的字段不能排在无默认值的字段前面。
-    catalog_url: str | None = None
+    # 取的是**仓库里那份经 CI 校验的结构化 JSON**，不是 Release 正文（正文是
+    # 自由格式 Markdown、可事后编辑，而这份文件每次提交都走 catalog.py 门禁）。
+    #
+    # 页面更新只有这一种方式，所以这里直接给默认值，不做成"可关闭开关"。
+    #
+    catalog_url: str | None
 
 
 def _env(name: str, default: str = "") -> str:
@@ -798,11 +812,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--catalog-url",
-        default=_env("LING_UPDATER_CATALOG_URL"),
+        # 未设置 -> 默认地址；显式设空串 -> 不联网（测试与离线隔离用）。
+        # `os.environ.get` 的三态行为正好符合：键不存在取默认，键存在（哪怕是
+        # 空串）就用那个值——空串不会被默认值替换。
+        default=os.environ.get("LING_UPDATER_CATALOG_URL", DEFAULT_CATALOG_URL),
         help=(
-            "可选的联网目录地址（https）。配了它就先从该地址取 releases.json，"
-            "取不到再退回本地那份。留空（默认）= 只读本地，行为与从前完全一样。"
-            "示例：https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
+            "联网目录地址（https）。默认取本仓库 main 那份经 CI 校验的 "
+            "releases.json；取不到时退回本地那份。"
         ),
     )
     parser.add_argument(
@@ -1561,11 +1577,17 @@ def _load_catalog_bytes(cfg: Config, tool: ModuleType) -> dict[str, Any]:
     """
     url = (cfg.catalog_url or "").strip()
     if url:
-        # 大小上限直接取发行包 ``catalog.py`` 的那个常量：本地与联网两份
-        # 用同一个数字，不另立一套。
-        raw = _fetch_catalog_bytes(url, getattr(tool, "MAX_CATALOG_BYTES", 256 * 1024))
+        # 大小上限用发行包 ``catalog.py`` 的那个常量：本地与联网两份同一个数字。
+        raw = _fetch_catalog_bytes(url, tool.MAX_CATALOG_BYTES)
         if raw is not None:
-            return tool.parse_catalog(raw)
+            try:
+                return tool.parse_catalog(raw)
+            except Exception:  # noqa: BLE001
+                # 远程那份格式坏了（例如仓库里一次写错的提交）也**退回本地**。
+                # 不接这一层的话，一次坏提交会让整条更新通道变红——本地那份
+                # 好的目录反而不被使用，而用户只是想在网页上点一下更新。
+                # 坏内容本身不会被采信：校验仍然先跑，只是失败后换了来源。
+                pass
     return tool.load_catalog(cfg.release_catalog)
 
 
@@ -1709,6 +1731,8 @@ class StatusWriter:
         self._last: str | None = None
         self._gate: dict[str, Any] | None = None
         self._catalog: dict[str, Any] | None = None
+        # 上次重读目录的时间（monotonic）；0 表示还没读过。
+        self._catalog_checked_at = 0.0
         self._targets: list[dict[str, Any]] = []
         self._recommended: dict[str, Any] | None = None
 
@@ -1717,11 +1741,29 @@ class StatusWriter:
         return self._gate
 
     def refresh_release_catalog(self) -> dict[str, Any]:
-        """重读可信发布目录并重算可用目标/推荐目标（本地只读，不联网）。"""
+        """重读发布目录并重算可用目标/推荐目标（可能联网，见 ``catalog_url``）。"""
         self._catalog, self._targets, self._recommended = read_release_catalog(
             self.cfg, self.pub, self.tool
         )
+        self._catalog_checked_at = time.monotonic()
         return self._catalog
+
+    def refresh_release_catalog_if_due(self) -> None:
+        """空闲时低频重读目录，让"之后发布的版本"能被看到。
+
+        为什么不是每轮都读：主循环 5 秒一轮，那是查**请求目录**（有没有人要
+        更新），不是查 GitHub。每轮都抓一次等于所有部署实例每 5 秒打一次
+        raw.githubusercontent.com——没必要，也可能被限流。
+
+        为什么又必须重读：目录只在启动和任务结束时刷新，空闲时一直用缓存。
+        发版之后没有新任务、也没重启的话，页面会一直显示"没有新版本"——
+        那正是"一键更新只能成功一次"的另一半。
+
+        5 分钟一次：发版是低频事件，用户点「检查更新」也只是重读 status.json，
+        最多等 5 分钟就能看到。任务执行前的即时复核不受影响（那一条照旧）。
+        """
+        if time.monotonic() - self._catalog_checked_at >= CATALOG_REFRESH_INTERVAL_SECONDS:
+            self.refresh_release_catalog()
 
     def write(self, state: str, task: dict[str, Any] | None, *, force: bool = False) -> None:
         gate = self._gate if self._gate is not None else self.refresh_backup_gate()
@@ -3185,6 +3227,8 @@ def run_once(updater: Updater) -> int:
             return EXIT_NEEDS_MANUAL
         candidates = pending_requests(cfg)
         if not candidates:
+            # 空闲也要低频重读目录：否则发版之后页面一直显示"没有新版本"。
+            updater.status.refresh_release_catalog_if_due()
             updater.status.write("idle", task)
             return EXIT_OK
         claimed = claim_request(cfg, candidates[0])
