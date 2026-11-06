@@ -962,7 +962,9 @@ IMAGE_CATALOG_REASON_MESSAGES: dict[str, str] = {
 IMAGE_INCOMPATIBLE_MESSAGES: dict[str, str] = {
     "not_in_min_from": "当前版本不在这条目标的升级跨度内（min_from 不含当前版本）",
     "not_newer": "目标版本不高于当前版本（只允许升级，不提供降级）",
-    "current_version_unknown": "无法确认当前安装版本（当前镜像摘要不在发布目录里）",
+    # 当前版本现在读运行中 api 镜像的 `org.opencontainers.image.version` 标注
+    # （目录里已经没有 digest，"摘要不在目录里"这条旧解释不再成立）。
+    "current_version_unknown": "无法确认当前安装版本（读不到运行中 api 镜像的版本标注）",
     "version_uncomparable": "目标版本或当前版本不是可比较的 semver",
 }
 

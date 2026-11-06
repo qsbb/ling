@@ -493,6 +493,17 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   顺序是有意的：`generate-notes` 失败时 Release 还没建出来，不会留下“已发布但缺
   摘要”的版本（先 create 再 edit 的写法有这个窗口）。任一 digest 不是合法
   `sha256:<64 hex>` 就 `::error::` 并退出——宁可 job 红，也不发没有摘要的 Release。
+
+> **正文里的 index digest 是「部署参考」，不是网页更新的唯一来源。**
+> 可信发布目录（`deploy/releases.json`）**不再记录 digest**（见 §10.3 与
+> `deploy/release/catalog.py` 文件头）：网页更新时由**更新器自己**在刷新目录时跑
+> `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>`，取**本机架构**那条
+> 平台 manifest 的 digest 当目标摘要。两者是同一个多架构镜像的不同层引用：
+> index digest 在多架构清单那一层，平台 manifest digest 在本机架构的子清单那一层；
+> `publish.py` 的 `verify_repo_digests` 两者都接受
+> （`{target_hex} ∪ {target_platform_digest}`），拉取后的平台/提交/当前摘要复核
+> 一步不少。人工 `publish.py --digest` 与 `ling install --digest` 仍按正文里的
+> **index digest** 走。
 - 权限最小化：仓库默认 `contents: read`；`image` / `updater-image` 恰好
   `contents: read` + `packages: write`（没有 `contents: write`，也没有
   `id-token` / `attestations`——本次不用 GitHub 原生构建证明）；只有 `release`
@@ -500,8 +511,9 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   tag → SHA 对照表），不退回 `@vN`。
 - 不构建/上传可执行资产（**因此目前也没有可下载的安装包**），不生成
   descriptor/HMAC。源码模式的更新源就是 GitHub 源码 tag/commit；镜像模式的目标
-  摘要来自 CI job summary 与仓库内的 `deploy/releases.json`——**Release 正文可编辑，
-  不是摘要的可信来源**，只方便人复制。
+  摘要由更新器在刷新目录时从 registry 解析（`v<version>` tag → 本机平台的 manifest
+  digest），Release 正文里的 index digest 只是给人复制的便利——**Release 正文可
+  编辑，从来不是摘要的可信来源**。
 
 ## 7. 源码模式怎么升级（人工路径）
 
@@ -862,11 +874,15 @@ fail-closed 判据）；必须先人工迁移。
 - 独立 Compose 项目（`deploy/updater/compose.yaml`），**不随应用 compose 启停**；
   API/worker 不挂 Docker socket、不执行部署。`ling install` 只准备宿主侧前提
   （`<dir>/updater/{requests,state}`、`<dir>/updater/.env`），且**默认不拉起**它。
-- 处理顺序：轮询请求目录 → **自己重新校验**（目录内兼容目标、digest 格式、拉取后
-  `LING_COMMIT == OCI revision`、平台、当前运行摘要）→ 抢跨工具安装锁
-  `.ling-install.lock` → 维护门禁 → 复用 `publish.py` 的预检/拉取/备份/迁移门禁 →
-  把目标摘要写回受限 `.env` 的 `LING_APP_IMAGE` → 容器网络内验证 → 才发布宿主端口
-  → 写**脱敏**状态文件。
+- 处理顺序：轮询请求目录 → **自己重新校验**（目录内兼容目标、**按版本重新解析目标
+  摘要**、digest 格式、拉取后 `LING_COMMIT == OCI revision`、平台、当前运行摘要）→
+  抢跨工具安装锁 `.ling-install.lock` → 维护门禁 → 复用 `publish.py` 的预检/拉取/
+  备份/迁移门禁 → 把目标摘要写回受限 `.env` 的 `LING_APP_IMAGE` → 容器网络内验证 →
+  才发布宿主端口 → 写**脱敏**状态文件。
+- **当前版本读运行中 api 镜像的 OCI 标注** `org.opencontainers.image.version`，不再
+  靠「`.env` 摘要 ↔ 目录」反查：目录里已经没有 digest，而运行中的容器才是"现在跑
+  的是哪一版"的实测事实。读不到标注/容器不在运行 → `current_version_unknown`，
+  所有目标不兼容，绝不猜。
 - `publish.py` 的预检**不再要求** `LING_UPDATE_ENABLED=0`（见 §10.7）：那条断言曾
   让「网页点更新 → 201 → 更新器 → 预检」必然失败在 `compose_env`。现在开关=1 也
   能跑完，并发由上面那两把锁（`updater.lock` + `.ling-install.lock`）保证，观察到的
@@ -942,9 +958,11 @@ fail-closed 判据）；必须先人工迁移。
 - 打开还需要更新器镜像来自发布证据（`--updater-digest` / `LING_UPDATER_IMAGE`），
   以及 `LING_UPDATE_SHARED_GID` 对应的目录权限（`requests` 带 setgid、属组是它）。
 - **要真正有可用目标，还必须先做正式发布**：CI 构建并推送镜像后，把条目用
-  `python3 deploy/release/catalog.py add ...` 写进发布目录（`deploy/releases.json`
-  的 schema 1 列表），随发行包/挂载交给更新器。仓库里这份文件仍是空骨架
-  `{"schema": 1, "releases": []}`；只打开开关不会凭空出现目标。
+  `python3 deploy/release/catalog.py add --version ... --commit ... --min-from ...
+  --has-migration` 写进发布目录（`deploy/releases.json` 的 schema 1 列表；**没有
+  `--digest`**，摘要由更新器自己解析），随发行包/挂载交给更新器。仓库里现在有
+  `0.0.3` 一条；只打开开关不会凭空出现目标——目标还必须"比当前版本新"且当前版本在
+  它的 `min_from` 里。
 
 ### 10.8 现在真能做什么、还不能宣称什么
 
@@ -960,11 +978,11 @@ fail-closed 判据）；必须先人工迁移。
     无法演练（生产本身已于 2026-11-05 迁到镜像模式，见 §10 开头）；
   - 镜像模式里开关还没打开（设计门槛的"中断中任务对账"未真机证明，head 不一致 /
     并发请求 / 旧执行器残留的故障注入也未做）；
-  - `deploy/releases.json` 目前是空列表（`{"schema": 1, "releases": []}`），
-    所以**当前仓库产物下的真实行为**是：`GET /v1/version/image-update` 给出
-    `no_available_target`、网页按钮禁用。这是**诚实可用**（通道代码就绪、
-    没有可用目标），不是 bug；要出现目标，先有正式发布并把条目 `catalog.py add`
-    进去。
+  - `deploy/releases.json` 目前只有 `0.0.3` 一条（`min_from` 为 `0.0.2`）。部署机
+    当前版本**不在它的 `min_from` 里**（例如还是 0.0.2 之前的构建）时，
+    `GET /v1/version/image-update` 会给 `no_available_target`、网页按钮禁用。
+    这是**诚实可用**（通道代码就绪、没有可用目标），不是 bug；要出现目标，先有
+    正式发布并把条目 `catalog.py add` 进去。
 - **这里列的不再包含"`publish.py` 要求开关=0"**：那条断言已删除（§10.7）。
   开关=1 时更新器→`publish.py` 的预检不再抛 `failed_preflight` / `compose_env`；
   `tests/test_updater.py::test_web_update_chain_passes_preflight_with_switch_on`

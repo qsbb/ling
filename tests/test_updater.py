@@ -46,7 +46,10 @@ OLD_REF = f"ghcr.io/qsbb/ling-api@sha256:{OLD_HEX}"
 COMMIT = "b" * 40
 OLD_COMMIT = "d" * 40
 OTHER_COMMIT = "e" * 40
-PLATFORM_DIGEST = "9" * 64
+# registry 给**本机平台**的 manifest digest。目录里没有 digest 之后，目标摘要由
+# 更新器 `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>` 现场解析，所以
+# 这个值必须等于 TARGET_HEX：一次成功更新的请求目标就是"解析出来的摘要"。
+PLATFORM_DIGEST = TARGET_HEX
 HOST_ARCH = {
     "x86_64": "amd64",
     "amd64": "amd64",
@@ -64,8 +67,8 @@ T0 = "2026-11-04T00:00:00Z"
 # 不能引入新镜像。
 UPDATER_IMAGE = f"ghcr.io/qsbb/ling-updater@sha256:{'7' * 64}"
 
-# 可信发布目录（deploy/releases.json）里的版本 ↔ 摘要映射：
-# 当前安装的版本 = `.env` 里 LING_APP_IMAGE（OLD_REF）在目录里反查到的版本。
+# 当前版本不再"读 .env 的摘要去目录里反查"，而是读**运行中 api 镜像**的
+# `org.opencontainers.image.version` 标注（目录里已经没有 digest 了）。
 CURRENT_VERSION = "0.0.1"
 TARGET_VERSION = "0.0.2"
 RELEASED_AT = "2026-11-04T00:00:00Z"
@@ -143,6 +146,19 @@ def save_state(state):
     STATE.write_text(json.dumps(state), encoding="utf-8")
 
 
+def image_labels(version_env, default, revision):
+    """镜像的 OCI 标注；`version_env` 传空串表示**没有** version 标注（旧镜像）。
+
+    当前版本就是从这条标注读出来的，所以它必须是 stub 里可调的开关：
+    `STUB_OLD_VERSION=""` 模拟"运行中镜像没带 version 标注"。
+    """
+    labels = {"org.opencontainers.image.revision": revision}
+    version = os.environ.get(version_env, default)
+    if version:
+        labels["org.opencontainers.image.version"] = version
+    return labels
+
+
 def target_image():
     return {
         "Id": "sha256:target-image",
@@ -152,12 +168,11 @@ def target_image():
         "Size": 100 * 1024 * 1024,
         "Config": {
             "Env": ["LING_COMMIT=" + os.environ["STUB_COMMIT"]],
-            "Labels": {
-                "org.opencontainers.image.revision": os.environ.get(
-                    "STUB_LABEL_COMMIT", os.environ["STUB_COMMIT"]
-                ),
-                "org.opencontainers.image.version": "9.9.9",
-            },
+            "Labels": image_labels(
+                "STUB_TARGET_VERSION",
+                "0.0.2",
+                os.environ.get("STUB_LABEL_COMMIT", os.environ["STUB_COMMIT"]),
+            ),
         },
     }
 
@@ -171,7 +186,9 @@ def old_image():
         "Size": 90 * 1024 * 1024,
         "Config": {
             "Env": ["LING_COMMIT=" + os.environ["STUB_OLD_COMMIT"]],
-            "Labels": {"org.opencontainers.image.revision": os.environ["STUB_OLD_COMMIT"]},
+            "Labels": image_labels(
+                "STUB_OLD_VERSION", "0.0.1", os.environ["STUB_OLD_COMMIT"]
+            ),
         },
     }
 
@@ -331,11 +348,32 @@ if args[0] == "info":
     sys.exit(0)
 
 if args[0] == "manifest":
+    # 目标摘要现在**只**来自这里：更新器按 `ghcr.io/qsbb/ling-api:v<version>` 问
+    # registry，取本机平台的 manifest digest。下面几个开关模拟失败形态，让
+    # `digest_unresolved` 的每一条分支都能被测到。
+    fail = int(os.environ.get("STUB_MANIFEST_EXIT", "0"))
+    if fail:
+        sys.stderr.write("manifest unknown（stub）\n")
+        sys.exit(fail)
+    raw = os.environ.get("STUB_MANIFEST_RAW")
+    if raw:
+        print(raw)
+        sys.exit(0)
+    if os.environ.get("STUB_MANIFEST_SHAPE") == "single":
+        # 单架构 manifest：文档里没有自己的摘要，更新器必须判"解析不出来"。
+        emit_json({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        })
+        sys.exit(0)
     manifest_arch = os.environ.get("STUB_MANIFEST_ARCH", os.environ["STUB_HOST_ARCH"])
+    host_digest = os.environ.get(
+        "STUB_MANIFEST_DIGEST", "sha256:" + os.environ["STUB_PLATFORM_DIGEST"]
+    )
     emit_json({
         "manifests": [
             {
-                "digest": "sha256:" + os.environ["STUB_PLATFORM_DIGEST"],
+                "digest": host_digest,
                 "platform": {"os": "linux", "architecture": manifest_arch},
             },
             {
@@ -821,16 +859,18 @@ def _config_json(port: int) -> dict[str, Any]:
 def catalog_entry(
     version: str = TARGET_VERSION,
     *,
-    digest: str = TARGET,
     commit: str = COMMIT,
     min_from: list[str] | None = None,
     has_migration: bool = True,
     released_at: str = RELEASED_AT,
 ) -> dict[str, Any]:
-    """目录里的一条发布记录（结构必须与 deploy/release/catalog.py 的 schema 一致）。"""
+    """目录里的一条发布记录（结构必须与 deploy/release/catalog.py 的 schema 一致）。
+
+    **没有 digest 字段**：目标摘要由更新器刷新时从 registry 解析，目录只放发布
+    决策。多写一个 `digest` 会被 `catalog.py` 判成未知字段（整份目录不可信）。
+    """
     return {
         "version": version,
-        "digest": digest,
         "commit": commit,
         "min_from": [CURRENT_VERSION] if min_from is None else min_from,
         "has_migration": has_migration,
@@ -841,13 +881,13 @@ def catalog_entry(
 def catalog_releases() -> list[dict[str, Any]]:
     """默认目录：当前装的 0.0.1 + 目标 0.0.2（可用目标=0.0.2）。
 
-    当前版本是**反查**出来的：`.env` 里 LING_APP_IMAGE=OLD_REF，目录里 OLD_REF
-    对应 0.0.1，所以当前版本=0.0.1，0.0.2 的 min_from 含 0.0.1 → 兼容。
+    当前版本**不来自目录**：它读运行中 api 镜像的
+    `org.opencontainers.image.version` 标注（stub 默认 `0.0.1`）。目标摘要同理由
+    `docker manifest inspect ...:v0.0.2` 解析（stub 给本机平台 `TARGET_HEX`）。
     """
     return [
         catalog_entry(
             CURRENT_VERSION,
-            digest=OLD_REF,
             commit=OLD_COMMIT,
             min_from=["0.0.0"],
             has_migration=False,
@@ -1262,6 +1302,37 @@ def calls_with(ws: Workspace, needle: str) -> list[str]:
     return [line for line in ws.calls() if needle in line]
 
 
+# 目录里没有 digest 之后，**刷新目录本身**要发只读 docker 调用：`docker info`
+# （宿主架构）、`docker ps` / `inspect` / `image inspect`（运行中 api 的版本标注）、
+# `docker manifest inspect`（解析目标摘要）。这不是"碰了环境"，是"读事实"。
+#
+# 所以「一条 docker 调用都没有」不再等于「什么都没变」——那样断言只会把设计本身
+# 判成失败。真正该断言的是：**没有任何会改变环境的调用**（compose/pull/run/stop/
+# 备份脚本/HTTP/写文件）。下面这个 helper 就是这把尺子。
+_READ_ONLY_CALLS = (
+    "docker info",
+    "docker ps ",
+    "docker inspect ",
+    "docker image inspect ",
+    "docker manifest inspect ",
+)
+
+
+def mutating_calls(ws: Workspace) -> list[str]:
+    """除「只读事实查询」之外的所有外部动作（变更 compose / 备份 / HTTP / …）。"""
+    return [line for line in ws.calls() if not line.startswith(_READ_ONLY_CALLS)]
+
+
+def manifest_inspect_refs(ws: Workspace) -> list[str]:
+    """本轮真正问过 registry 的 tag（按顺序）。"""
+    refs: list[str] = []
+    for line in ws.calls():
+        if not line.startswith("docker manifest inspect "):
+            continue
+        refs.append(line[len("docker manifest inspect ") :].strip())
+    return refs
+
+
 def index_of(ws: Workspace, needle: str) -> int:
     for index, line in enumerate(ws.calls()):
         if needle in line:
@@ -1564,11 +1635,13 @@ def test_updater_compose_documents_installer_owned_permissions() -> None:
         f"docker.io/qsbb/ling-api@sha256:{'a' * 64}",
     ],
 )
-def test_only_valid_digest_is_accepted_without_docker(ws: Workspace, digest: str) -> None:
+def test_only_valid_digest_is_accepted_without_any_change(
+    ws: Workspace, digest: str
+) -> None:
     write_request(ws, target=digest)
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     assert not (ws.state_dir / "task.json").exists()
     # 拒绝的请求会被认领后归档（否则下一轮会无限重试同一个坏请求）。
     assert not (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
@@ -1579,7 +1652,7 @@ def test_only_valid_digest_is_accepted_without_docker(ws: Workspace, digest: str
 def test_no_request_writes_idle_status(ws: Workspace) -> None:
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     status = ws.status()
     assert status["updater"]["state"] == "idle"
     assert status["task"] is None
@@ -1595,7 +1668,7 @@ def test_idle_status_backup_gate_matches_backup_dir(ws: Workspace) -> None:
     manifest = write_manifest(ws, "20260101-000000")
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     status = ws.status()
     gate = status["backup_gate"]
     assert set(gate) == BACKUP_GATE_KEYS
@@ -1680,19 +1753,19 @@ def test_invalid_expected_current_values_are_rejected(ws: Workspace) -> None:
     write_request(ws, expected="latest")
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
     write_request(ws, request_id=REQUEST_ID_B, commit="f" * 39)
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
 
 def test_already_on_target_is_rejected(ws: Workspace) -> None:
     write_request(ws, expected=TARGET)
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
 
 def test_unknown_fields_are_rejected(ws: Workspace) -> None:
@@ -1701,19 +1774,19 @@ def test_unknown_fields_are_rejected(ws: Workspace) -> None:
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
     assert "未定义字段" in result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
 
 def test_missing_or_false_operator_confirmation_is_rejected(ws: Workspace) -> None:
     write_request(ws, operator="true")
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
     write_request(ws, request_id=REQUEST_ID_B, drop=("operator_confirmed",))
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
 
 
 def test_duplicate_request_id_is_rejected(ws: Workspace) -> None:
@@ -1723,7 +1796,7 @@ def test_duplicate_request_id_is_rejected(ws: Workspace) -> None:
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 2, result.stderr
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     assert not (ws.state_dir / "task.json").exists()
 
 
@@ -2327,7 +2400,7 @@ def test_needs_manual_blocks_new_tasks_until_acknowledged(ws: Workspace) -> None
     assert result.returncode == 17, (result.stdout, result.stderr)
     # 上一个任务没有人工收口前，新请求不被认领，也不新建第二次任务。
     assert (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     assert ws.task()["request_id"] == REQUEST_ID_B
 
     ack = run_updater(ws, extra=["--acknowledge-manual", REQUEST_ID_B])
@@ -2382,7 +2455,7 @@ def test_single_flight_second_instance_is_busy(ws: Workspace) -> None:
             helper.stdin.close()
         helper.wait(timeout=10)
     assert result.returncode == 3, (result.stdout, result.stderr)
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     assert (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
 
 
@@ -2413,8 +2486,12 @@ def test_install_lock_busy_needs_manual_and_touches_nothing(ws: Workspace) -> No
     assert ws.compose_calls() == []
     assert [line for line in ws.calls() if line.startswith("docker-env")] == []
     assert not [line for line in ws.calls() if line.startswith("backup ")]
-    # 只有一次只读的宿主架构探测（在拿锁之前发生，用于构造 Options）。
-    assert all(line.startswith("docker info") for line in ws.calls()), ws.calls()
+    # 只有只读探测：启动时的目录刷新（ps/inspect/manifest）与宿主架构（docker info），
+    # 全部发生在拿锁之前；没有任何变更类命令。
+    assert mutating_calls(ws) == []
+    assert all(
+        line.startswith(_READ_ONLY_CALLS) for line in ws.calls()
+    ), ws.calls()
 
     task = ws.task()
     assert task["state"] == "needs_manual"
@@ -2531,19 +2608,25 @@ def test_install_lock_is_checked_immediately_not_waited_on(ws: Workspace) -> Non
 # 设计依据：docs/EASY-INSTALL-UPDATE-DESIGN.md「可信发布目录只列已通过门禁、
 # 可从已知版本升级的稳定目标」+「可编辑的 Release 正文不是摘要可信来源」。
 #
-# 这里锁死四条硬规则：
-# 1. 当前版本由 `.env` 的摘要**反查**目录得到（不猜、不问 Docker）；
-# 2. 只允许升级：目标 version 不高于当前版本 → **不出现**在 available_targets；
-# 3. 版本跨度：当前版本不在目标 min_from 里 → compatible=false + 原因；
-# 4. 目录缺失/坏/工具缺失 → available_targets=[] + 明确 reason（不静默、不假装）。
+# 这里锁死六条硬规则：
+# 1. **当前版本读运行中 api 镜像的 `org.opencontainers.image.version` 标注**，
+#    不读 `.env` 的摘要、不猜（目录里已经没有 digest，反查那条走不通了）；
+# 2. **目标摘要现场解析**：`docker manifest inspect ...:v<version>` 取本机平台的
+#    manifest digest；解析不出来 → compatible=false + `digest_unresolved`；
+# 3. 只允许升级：目标 version 不高于当前版本 → **不出现**在 available_targets；
+# 4. 版本跨度：当前版本不在目标 min_from 里 → compatible=false + 原因；
+# 5. 执行前复核会**重新解析**：请求里的 target_digest 必须等于现在解析出来的值；
+# 6. 目录缺失/坏/工具缺失 → available_targets=[] + 明确 reason（不静默、不假装）。
 
 
 def test_idle_status_exposes_compatible_recommended_target(ws: Workspace) -> None:
     """有兼容目标时：available_targets 只列目标，recommended_target 指向它。"""
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    # 读目录是本地只读文件操作：idle **不产生任何 Docker 调用**。
-    assert ws.calls() == []
+    # 刷新目录现在只发**只读** docker 调用（读当前版本 + 解析摘要），没有变更。
+    assert mutating_calls(ws) == []
+    # 摘要来自 tag 的 manifest inspect，而不是目录文件；问的就是这个版本。
+    assert manifest_inspect_refs(ws) == ["ghcr.io/qsbb/ling-api:v0.0.2"]
     status = ws.status()
     assert status["release_catalog"] == {
         "state": "ok",
@@ -2571,18 +2654,16 @@ def test_idle_status_exposes_compatible_recommended_target(ws: Workspace) -> Non
 
 def test_recommended_target_is_the_greatest_compatible_version(ws: Workspace) -> None:
     """多目标时推荐**版本最大**的兼容目标（不依赖文件顺序）。"""
-    newest = "ghcr.io/qsbb/ling-api@sha256:" + "7" * 64
     ws.write_catalog(
         [
             catalog_entry(
                 CURRENT_VERSION,
-                digest=OLD_REF,
                 commit=OLD_COMMIT,
                 min_from=["0.0.0"],
                 has_migration=False,
             ),
             # 故意把新版本写在前面：使用方不能依赖文件顺序。
-            catalog_entry("0.0.10", digest=newest, commit=COMMIT, min_from=[CURRENT_VERSION]),
+            catalog_entry("0.0.10", commit=COMMIT, min_from=[CURRENT_VERSION]),
             catalog_entry(TARGET_VERSION, min_from=[CURRENT_VERSION]),
         ]
     )
@@ -2593,16 +2674,26 @@ def test_recommended_target_is_the_greatest_compatible_version(ws: Workspace) ->
         "0.0.10",
     ]
     assert status["recommended_target"]["version"] == "0.0.10"
-    assert status["recommended_target"]["digest"] == newest
+    # 摘要不是目录给的（目录里没有 digest）：两个目标都在同一次刷新里按各自 tag
+    # 解析；stub 的 registry 对同一个平台只回一个 digest，所以这里两者相同。
+    assert status["recommended_target"]["digest"] == TARGET
+    assert sorted(manifest_inspect_refs(ws)) == [
+        "ghcr.io/qsbb/ling-api:v0.0.10",
+        "ghcr.io/qsbb/ling-api:v0.0.2",
+    ]
 
 
 def test_target_outside_min_from_is_incompatible_with_reason(ws: Workspace) -> None:
-    """当前版本不在 min_from 里：不兼容 + 原因，且没有推荐目标。"""
+    """当前版本不在 min_from 里：不兼容 + 原因，且没有推荐目标。
+
+    不兼容的目标 `digest` 是 **null**：既然不会被推荐，就没必要为它打一次
+    registry（每次刷新都要打）。API 侧的白名单投影会丢掉没有 digest 的条目，
+    而前端只消费 `target`/`recommended_target`，所以这不影响页面。
+    """
     ws.write_catalog(
         [
             catalog_entry(
                 CURRENT_VERSION,
-                digest=OLD_REF,
                 commit=OLD_COMMIT,
                 min_from=["0.0.0"],
                 has_migration=False,
@@ -2616,7 +2707,7 @@ def test_target_outside_min_from_is_incompatible_with_reason(ws: Workspace) -> N
     assert status["available_targets"] == [
         {
             "version": TARGET_VERSION,
-            "digest": TARGET,
+            "digest": None,
             "commit": COMMIT,
             "has_migration": True,
             "compatible": False,
@@ -2624,34 +2715,40 @@ def test_target_outside_min_from_is_incompatible_with_reason(ws: Workspace) -> N
         }
     ]
     assert status["recommended_target"] is None
+    # 没有兼容目标 → 一次 registry 都不问（省掉的是外部调用，不是校验）。
+    assert manifest_inspect_refs(ws) == []
 
 
 def test_target_not_newer_is_not_offered_at_all(ws: Workspace) -> None:
     """不许降级：目标版本不高于当前版本时**不出现**，也就没有推荐目标。"""
     ws.write_catalog(
         [
-            # 当前装的是 0.0.2（摘要 OLD_REF），目录里 0.0.1 比它旧。
+            # 当前跑的是 0.0.2（镜像标注），目录里 0.0.1 比它旧。
             catalog_entry(
                 TARGET_VERSION,
-                digest=OLD_REF,
                 commit=OLD_COMMIT,
                 min_from=[CURRENT_VERSION],
                 has_migration=False,
             ),
-            catalog_entry(CURRENT_VERSION, digest=TARGET, commit=COMMIT, min_from=["0.0.0"]),
+            catalog_entry(CURRENT_VERSION, commit=COMMIT, min_from=["0.0.0"]),
         ]
     )
-    assert run_updater(ws).returncode == 0
+    # 当前版本改由运行中镜像的标注给出（原来靠 .env 摘要在目录里反查）。
+    result = run_updater(ws, env={"STUB_OLD_VERSION": TARGET_VERSION})
+    assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
     assert status["release_catalog"]["current_version"] == TARGET_VERSION
     assert status["available_targets"] == []
     assert status["recommended_target"] is None
+    assert manifest_inspect_refs(ws) == []
 
 
 def test_missing_catalog_yields_no_targets_and_reason(ws: Workspace) -> None:
     ws.release_catalog.unlink()
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
+    # 目录文件都没有 → 不去问 Docker（先校验目录，再问 Docker）。
+    assert ws.calls() == []
     status = ws.status()
     assert status["release_catalog"] == {
         "state": "missing",
@@ -2711,16 +2808,17 @@ def test_missing_catalog_tool_is_reported_not_fatal(ws: Workspace, tmp_path: Pat
 
 
 def test_unknown_current_version_blocks_all_targets(ws: Workspace) -> None:
-    """当前摘要不在目录里：当前版本未知 → 所有目标不兼容，绝不猜当前版本。"""
+    """运行中镜像**没有** version 标注：当前版本未知 → 所有目标不兼容，绝不猜。"""
     ws.write_catalog([catalog_entry(TARGET_VERSION)])
-    assert run_updater(ws).returncode == 0
+    result = run_updater(ws, env={"STUB_OLD_VERSION": ""})
+    assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
     assert status["release_catalog"]["state"] == "ok"
     assert status["release_catalog"]["current_version"] is None
     assert status["available_targets"] == [
         {
             "version": TARGET_VERSION,
-            "digest": TARGET,
+            "digest": None,
             "commit": COMMIT,
             "has_migration": True,
             "compatible": False,
@@ -2728,20 +2826,134 @@ def test_unknown_current_version_blocks_all_targets(ws: Workspace) -> None:
         }
     ]
     assert status["recommended_target"] is None
+    assert manifest_inspect_refs(ws) == []
 
 
-def test_target_outside_catalog_is_rejected_before_any_docker_call(ws: Workspace) -> None:
-    """请求里的 digest 格式合格但不在目录里 → 拒绝，一个 Docker 调用都不发。"""
+def test_current_version_comes_from_the_image_label_not_the_env_digest(
+    ws: Workspace,
+) -> None:
+    """当前版本只认镜像标注，**不**看 `.env` 的 LING_APP_IMAGE。
+
+    `.env` 里的摘要已经和目录无关（目录里没有 digest 了），而且它可以被手改、
+    也可能改了还没重建容器。这里故意把 `.env` 指向一个**不在**任何地方出现的
+    摘要：当前版本仍必须是镜像标注的 0.0.1。
+    """
+    ws.env_file.write_text(
+        "POSTGRES_PASSWORD=super-secret-password\n"
+        f"LING_APP_IMAGE=ghcr.io/qsbb/ling-api@sha256:{'e' * 64}\n"
+        f"LING_ROOT_KEY={ROOT_KEY}\n",
+        encoding="utf-8",
+    )
+    ws.env_file.chmod(0o600)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_catalog"]["current_version"] == CURRENT_VERSION
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+    # 当前版本是**问 Docker 读标注**得来的：ps → inspect 容器 → image inspect。
+    assert calls_with(ws, "docker image inspect sha256:old-image"), ws.calls()
+
+
+def test_non_semver_version_label_is_treated_as_unknown(ws: Workspace) -> None:
+    """标注不是严格 semver（构建时 LING_VERSION 没传上）→ 当前版本未知。
+
+    状态文件里只放严格 semver 或 null：不把任意标注文本当"当前版本"喂给版本比较。
+    """
+    result = run_updater(ws, env={"STUB_OLD_VERSION": "unknown"})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_catalog"]["current_version"] is None
+    assert status["available_targets"][0]["incompatible_reason"] == (
+        "current_version_unknown"
+    )
+    assert status["recommended_target"] is None
+
+
+def test_target_digest_is_resolved_for_the_host_arch(ws: Workspace) -> None:
+    """解析出来的是**本机架构**那条 manifest 的 digest，不是别的平台的。
+
+    把 registry 报的两条平台掉个个儿（本机那条 = `f`*64）：解析结果必须跟着变，
+    说明选的是 `platform.architecture == 宿主机架构` 那条，而不是"取第一条"。
+    """
+    result = run_updater(
+        ws,
+        env={"STUB_MANIFEST_ARCH": OTHER_ARCH, "STUB_OTHER_ARCH": HOST_ARCH},
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    target = ws.status()["recommended_target"]
+    assert target["digest"] == f"ghcr.io/qsbb/ling-api@sha256:{'f' * 64}"
+    # 宿主架构来自 docker daemon（与 publish 的 Options.host_arch 同源）。
+    assert calls_with(ws, "docker info --format {{.Architecture}}"), ws.calls()
+
+
+@pytest.mark.parametrize(
+    ("env", "why"),
+    [
+        ({"STUB_MANIFEST_EXIT": "1"}, "命令非 0（tag 不存在 / 无权限 / 网络不通）"),
+        ({"STUB_MANIFEST_RAW": "{not json"}, "输出不是 JSON"),
+        ({"STUB_MANIFEST_SHAPE": "single"}, "单架构 manifest：文档里没有自己的摘要"),
+        ({"STUB_MANIFEST_ARCH": "riscv64"}, "index 里没有本机平台"),
+        ({"STUB_MANIFEST_DIGEST": "sha256:short"}, "digest 长度不对"),
+        ({"STUB_MANIFEST_DIGEST": "md5:deadbeef"}, "digest 不是 sha256"),
+    ],
+)
+def test_unresolved_digest_marks_the_target_incompatible(
+    ws: Workspace, env: dict[str, str], why: str
+) -> None:
+    """摘要解析失败的每一种形态都只有一条结果：`digest_unresolved`，不推荐、不顶替。"""
+    result = run_updater(ws, env=env)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_catalog"]["current_version"] == CURRENT_VERSION
+    assert status["available_targets"] == [
+        {
+            "version": TARGET_VERSION,
+            "digest": None,
+            "commit": COMMIT,
+            "has_migration": True,
+            "compatible": False,
+            "incompatible_reason": "digest_unresolved",
+        }
+    ]
+    assert status["recommended_target"] is None, why
+    # 解析失败不会把请求放行。
+    write_request(ws)
+    ws.reset()
+    rejected = run_updater(ws, env=env)
+    assert rejected.returncode == 2, (rejected.stdout, rejected.stderr)
+    assert mutating_calls(ws) == []
+    assert not (ws.state_dir / "task.json").exists()
+
+
+def test_digest_changed_at_the_registry_is_rejected_before_any_change(ws: Workspace) -> None:
+    """执行前复核会**重新解析**：registry 现在给的摘要变了 → 拒绝，什么都不做。
+
+    请求里的 target_digest 是 TARGET，但这一轮 registry 对本机平台报的是别的
+    digest（模拟 tag 被重推 / 发布被替换）。旧实现只比对目录里的静态值，这里必须
+    以"现在解析出来的摘要"为准。
+    """
+    write_request(ws)
+    rotated = "b" * 64
+    result = run_updater(ws, env={"STUB_PLATFORM_DIGEST": rotated})
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert mutating_calls(ws) == []
+    assert not (ws.state_dir / "task.json").exists()
+    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
+    assert "目标摘要不等于任何兼容版本" in journal
+
+
+def test_target_outside_catalog_is_rejected_before_any_change(ws: Workspace) -> None:
+    """请求里的 digest 格式合格，但不等于现在解析出来的任何兼容摘要 → 拒绝。"""
     outside = "ghcr.io/qsbb/ling-api@sha256:" + "e" * 64
     write_request(ws, target=outside)
     result = run_updater(ws)
     assert result.returncode == 2, (result.stdout, result.stderr)
-    assert ws.calls() == []
+    assert mutating_calls(ws) == []
     assert not (ws.state_dir / "task.json").exists()
     assert ws.status()["updater"]["state"] == "idle"
     assert ws.status()["task"] is None
     journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
-    assert "可信发布目录" in journal
+    assert "目标摘要不等于任何兼容版本" in journal
     # 请求被认领归档（不会无限重试），没有被执行。
     assert not (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
     assert (ws.requests_dir / "archive" / f"claimed-{REQUEST_ID}.json").exists()
@@ -2753,29 +2965,36 @@ def test_catalog_broken_rejects_request_without_touching_anything(ws: Workspace)
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 2, (result.stdout, result.stderr)
+    assert mutating_calls(ws) == []
+    # 目录都不可信了，**一条 docker 调用都不发**：没有版本/摘要值得去问
+    # （`read_release_catalog` 先校验目录，再问 Docker）。
     assert ws.calls() == []
     assert not (ws.state_dir / "task.json").exists()
     journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
     assert "可信发布目录不可用" in journal
 
 
-def test_catalog_entry_with_invalid_digest_blocks_the_whole_catalog(ws: Workspace) -> None:
-    """目标来自目录，但目录里那条 digest 格式非法 → 整份目录不可信，请求被拒。"""
+def test_legacy_catalog_entry_with_digest_blocks_the_whole_catalog(ws: Workspace) -> None:
+    """旧目录（条目里还带 digest）→ 整份目录不可信，请求被拒。
+
+    目录已经不负责目标摘要了。读到 `digest` 字段要**显式拒绝**而不是顺手忽略：
+    静默兼容会留下"到底还有没有 digest 在生效"的两种事实。
+    """
     ws.write_catalog(
         [
             catalog_entry(
                 CURRENT_VERSION,
-                digest=OLD_REF,
                 commit=OLD_COMMIT,
                 min_from=["0.0.0"],
                 has_migration=False,
             ),
-            catalog_entry(TARGET_VERSION, digest="ghcr.io/qsbb/ling-api:latest"),
+            {**catalog_entry(TARGET_VERSION), "digest": OLD_REF},
         ]
     )
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 2, (result.stdout, result.stderr)
+    assert mutating_calls(ws) == []
     assert ws.calls() == []
     assert not (ws.state_dir / "task.json").exists()
     status = ws.status()
@@ -2785,7 +3004,7 @@ def test_catalog_entry_with_invalid_digest_blocks_the_whole_catalog(ws: Workspac
 
 
 def test_successful_update_moves_the_current_version_in_the_catalog(ws: Workspace) -> None:
-    """更新成功后受限 env 指向目标摘要 → 当前版本变成 0.0.2，0.0.2 不再是目标。"""
+    """更新成功后运行中镜像的 version 标注变成 0.0.2，0.0.2 不再是目标。"""
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -2803,7 +3022,6 @@ def _catalog_payload(version: str = "0.0.3", **overrides: Any) -> bytes:
     """一份合法的目录字节（结构与 deploy/release/catalog.py 的 schema 一致）。"""
     entry = {
         "version": version,
-        "digest": "ghcr.io/qsbb/ling-api@sha256:" + "a" * 64,
         "commit": "b" * 40,
         "min_from": ["0.0.1"],
         "has_migration": True,

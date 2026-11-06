@@ -3,10 +3,12 @@
 保护的是「可信发布目录」的硬约束，而不是实现细节：
 
 - 目录文件（``deploy/releases.json``）是**信任锚**：校验必须严格到"多一个字段、
-  少一个字段、类型不对、格式不对、重复 version/digest"全部拒绝，且绝不"顺手
-  修一下"；
-- ``add`` 必须**幂等**：同 version 同 digest 重跑不改文件；同 version 不同 digest
-  直接失败（静默覆盖等于把已发布的摘要换成另一个）；
+  少一个字段、类型不对、格式不对、重复 version"全部拒绝，且绝不"顺手修一下"。
+  特别是**旧目录里的 ``digest`` 字段必须被拒绝**（``release_field_unknown``）：
+  目录已经不负责目标摘要，静默忽略会留下"到底有没有 digest 在生效"的两种事实；
+- ``add`` 必须**幂等**：同 version 且 commit/min_from/has_migration 全同重跑不改
+  文件；同 version 但字段不同 → ``version_conflict``（已发布的条目只能人工评审后
+  改）。同版本**重新打包镜像**（digest 变了）不再是冲突——目录里没有 digest 了；
 - ``validate`` **不看顺序**：排错序的目录文件仍然合法；排序只是使用方的事，
   ``add`` 写出时按 version 排序只为让 diff 稳定。
 """
@@ -29,9 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PY = REPO_ROOT / "deploy" / "release" / "catalog.py"
 REPO_CATALOG = REPO_ROOT / "deploy" / "releases.json"
 
-DIGEST = "ghcr.io/qsbb/ling-api@sha256:" + "a" * 64
-DIGEST_B = "ghcr.io/qsbb/ling-api@sha256:" + "b" * 64
-DIGEST_C = "ghcr.io/qsbb/ling-api@sha256:" + "c" * 64
+# 旧目录里那条 digest（0.0.3 的 index digest）：只用来证明它现在**非法**。
+LEGACY_DIGEST = "ghcr.io/qsbb/ling-api@sha256:" + "a" * 64
 COMMIT = "1" * 40
 COMMIT_B = "2" * 40
 RELEASED_AT = "2026-11-04T00:00:00Z"
@@ -52,7 +53,6 @@ catalog = _catalog_module()
 def release(
     version: str = "0.0.2",
     *,
-    digest: str = DIGEST,
     commit: str = COMMIT,
     min_from: list[str] | None = None,
     has_migration: bool = True,
@@ -60,12 +60,12 @@ def release(
 ) -> dict[str, Any]:
     return {
         "version": version,
-        "digest": digest,
         "commit": commit,
         "min_from": ["0.0.1"] if min_from is None else min_from,
         "has_migration": has_migration,
         "released_at": released_at,
     }
+
 
 
 def write(path: Path, payload: object, *, mode: int = 0o644) -> Path:
@@ -103,9 +103,11 @@ def test_repository_catalog_is_valid_and_lists_real_releases() -> None:
     releases = parsed["releases"]
     assert releases, "仓库目录里至少要有一条真实发布记录（否则网页更新没有可用目标）"
     for release in releases:
-        # 每条都必须带完整 digest/commit：目录是更新的**唯一**可信来源，
-        # 少一个字段就等于让更新器去猜。
-        assert release["digest"].startswith("ghcr.io/qsbb/ling-api@sha256:")
+        # 目录只负责**发布决策**（版本/源提交/跨度/迁移），不再负责目标摘要：
+        # 摘要由更新器刷新时从 registry 解析。所以这里断言的字段集合必须是
+        # catalog.py 的 RELEASE_KEYS，多一个（尤其是 `digest`）都会被 parse 拒绝。
+        assert set(release) == set(catalog.RELEASE_KEYS)
+        assert "digest" not in release
         assert len(release["commit"]) == 40
         assert release["min_from"]
     # 权限位仍然不许组/世界可写：目录被改等于更新目标被改。
@@ -131,8 +133,8 @@ def test_valid_catalog_roundtrips_and_normalizes() -> None:
 def test_multiple_releases_are_accepted_out_of_order() -> None:
     """`validate` **不按发布时间/版本排序**：排错序的文件仍然合法。"""
     payload = good(
-        release("0.0.10", digest=DIGEST_C, commit=COMMIT_B, min_from=["0.0.9"]),
-        release("0.0.2", digest=DIGEST, commit=COMMIT, min_from=["0.0.1"]),
+        release("0.0.10", commit=COMMIT_B, min_from=["0.0.9"]),
+        release("0.0.2", commit=COMMIT, min_from=["0.0.1"]),
     )
     parsed = catalog.parse_catalog(json.dumps(payload).encode("utf-8"))
     assert [item["version"] for item in parsed["releases"]] == ["0.0.10", "0.0.2"]
@@ -140,9 +142,9 @@ def test_multiple_releases_are_accepted_out_of_order() -> None:
 
 def test_sort_releases_uses_semver_not_lexicographic_or_file_order() -> None:
     entries = [
-        release("0.0.10", digest=DIGEST_C, commit=COMMIT_B, min_from=["0.0.9"]),
-        release("0.0.9", digest=DIGEST_B, commit=COMMIT_B, min_from=["0.0.1"]),
-        release("0.0.2", digest=DIGEST, commit=COMMIT, min_from=["0.0.1"]),
+        release("0.0.10", commit=COMMIT_B, min_from=["0.0.9"]),
+        release("0.0.9", commit=COMMIT_B, min_from=["0.0.1"]),
+        release("0.0.2", commit=COMMIT, min_from=["0.0.1"]),
     ]
     assert [item["version"] for item in catalog.sort_releases(entries)] == [
         "0.0.2",
@@ -181,9 +183,6 @@ def test_prerelease_sorts_before_release_of_same_core() -> None:
         (good(release("v0.0.2")), "version_invalid"),
         (good(release("0.00.2")), "version_invalid"),
         (good(release("latest")), "version_invalid"),
-        (good(release(digest="ghcr.io/qsbb/ling-api:latest")), "digest_invalid"),
-        (good(release(digest="ghcr.io/qsbb/ling-api@sha256:" + "A" * 64)), "digest_invalid"),
-        (good(release(digest="docker.io/qsbb/ling-api@sha256:" + "a" * 64)), "digest_invalid"),
         (good(release(commit="1" * 39)), "commit_invalid"),
         (good(release(commit="A" * 40)), "commit_invalid"),
         (good(release(min_from=[])), "min_from_empty"),
@@ -198,16 +197,15 @@ def test_prerelease_sorts_before_release_of_same_core() -> None:
         (
             good(
                 release("0.0.2"),
-                release("0.0.2", digest=DIGEST_B, commit=COMMIT_B),
+                release("0.0.2", commit=COMMIT_B),
             ),
             "version_duplicate",
         ),
+        # 旧目录（带 digest）必须被**显式拒绝**，不能读的时候顺手忽略：
+        # 否则"目录里到底还有没有 digest 在生效"又会变成两种事实。
         (
-            good(
-                release("0.0.2"),
-                release("0.0.3", commit=COMMIT_B, min_from=["0.0.2"]),
-            ),
-            "digest_duplicate",
+            good({**release("0.0.2"), "digest": LEGACY_DIGEST}),
+            "release_field_unknown",
         ),
     ],
 )
@@ -235,7 +233,6 @@ def test_too_many_releases_is_rejected() -> None:
     releases = [
         release(
             f"0.0.{index + 2}",
-            digest=f"ghcr.io/qsbb/ling-api@sha256:{index + 2:064x}",
             commit=f"{index + 2:040x}",
         )
         for index in range(catalog.MAX_RELEASES + 1)
@@ -288,7 +285,6 @@ def test_add_appends_and_writes_sorted_file(tmp_path: Path) -> None:
     merged, state = catalog.add_release(
         path,
         version="0.0.10",
-        digest=DIGEST_C,
         commit=COMMIT_B,
         min_from=["0.0.2"],
         has_migration=False,
@@ -310,7 +306,6 @@ def test_add_is_idempotent_and_does_not_touch_the_file(tmp_path: Path) -> None:
     merged, state = catalog.add_release(
         path,
         version="0.0.2",
-        digest=DIGEST,
         commit=COMMIT,
         min_from=["0.0.1"],
         has_migration=True,
@@ -322,67 +317,64 @@ def test_add_is_idempotent_and_does_not_touch_the_file(tmp_path: Path) -> None:
     assert merged["releases"] == [release()]
 
 
-def test_add_same_version_different_digest_fails(tmp_path: Path) -> None:
+def test_add_same_version_with_different_fields_fails(tmp_path: Path) -> None:
+    """同 version 但 commit/min_from/has_migration 不同 → version_conflict，不改文件。
+
+    已发布的条目是信任锚：换源提交/换跨度必须人工评审后改目录，不能一条 `add`
+    就静默改写。（同版本**重新打包镜像**不是冲突：目录里已经没有 digest 了。）
+    """
     path = tmp_path / "releases.json"
     write(path, good(release("0.0.2")))
     before = path.read_bytes()
-    with pytest.raises(catalog.CatalogError) as info:
-        catalog.add_release(
-            path,
-            version="0.0.2",
-            digest=DIGEST_B,
-            commit=COMMIT,
-            min_from=["0.0.1"],
-            has_migration=True,
-        )
-    assert info.value.code == "version_digest_conflict"
-    assert path.read_bytes() == before
+    for overrides in (
+        {"commit": COMMIT_B},
+        {"min_from": ["0.0.0"]},
+        {"has_migration": False},
+    ):
+        values = {
+            "version": "0.0.2",
+            "commit": COMMIT,
+            "min_from": ["0.0.1"],
+            "has_migration": True,
+            **overrides,
+        }
+        with pytest.raises(catalog.CatalogError) as info:
+            catalog.add_release(path, **values)
+        assert info.value.code == "version_conflict", overrides
+        assert path.read_bytes() == before
 
 
-def test_add_same_version_and_digest_but_other_fields_fails(tmp_path: Path) -> None:
+def test_add_allows_another_version_with_the_same_commit(tmp_path: Path) -> None:
+    """不同版本共用同一个源提交是合法的（重新打包/纯元数据发版都会这样）。
+
+    旧的 ``digest_duplicate`` 规则随 digest 一起去掉了：目录不再记录摘要，
+    「同一个提交产出两个版本条目」不该被工具挡住。
+    """
     path = tmp_path / "releases.json"
     write(path, good(release("0.0.2")))
-    with pytest.raises(catalog.CatalogError) as info:
-        catalog.add_release(
-            path,
-            version="0.0.2",
-            digest=DIGEST,
-            commit=COMMIT,
-            min_from=["0.0.0"],
-            has_migration=True,
-        )
-    assert info.value.code == "entry_conflict"
-
-
-def test_add_digest_used_by_another_version_fails(tmp_path: Path) -> None:
-    path = tmp_path / "releases.json"
-    write(path, good(release("0.0.2")))
-    with pytest.raises(catalog.CatalogError) as info:
-        catalog.add_release(
-            path,
-            version="0.0.3",
-            digest=DIGEST,
-            commit=COMMIT_B,
-            min_from=["0.0.2"],
-            has_migration=True,
-        )
-    assert info.value.code == "digest_duplicate"
+    merged, state = catalog.add_release(
+        path,
+        version="0.0.3",
+        commit=COMMIT,
+        min_from=["0.0.2"],
+        has_migration=True,
+    )
+    assert state == "added"
+    assert [item["version"] for item in merged["releases"]] == ["0.0.2", "0.0.3"]
 
 
 @pytest.mark.parametrize(
-    ("version", "digest", "commit", "min_from", "code"),
+    ("version", "commit", "min_from", "code"),
     [
-        ("0.0", DIGEST_B, COMMIT_B, ["0.0.2"], "version_invalid"),
-        ("0.0.3", "ghcr.io/qsbb/ling-api:latest", COMMIT_B, ["0.0.2"], "digest_invalid"),
-        ("0.0.3", DIGEST_B, "z" * 40, ["0.0.2"], "commit_invalid"),
-        ("0.0.3", DIGEST_B, COMMIT_B, [], "min_from_empty"),
-        ("0.0.3", DIGEST_B, COMMIT_B, ["0.0.3"], "min_from_self"),
+        ("0.0", COMMIT_B, ["0.0.2"], "version_invalid"),
+        ("0.0.3", "z" * 40, ["0.0.2"], "commit_invalid"),
+        ("0.0.3", COMMIT_B, [], "min_from_empty"),
+        ("0.0.3", COMMIT_B, ["0.0.3"], "min_from_self"),
     ],
 )
 def test_add_validates_the_new_entry(
     tmp_path: Path,
     version: str,
-    digest: str,
     commit: str,
     min_from: list[str],
     code: str,
@@ -394,7 +386,6 @@ def test_add_validates_the_new_entry(
         catalog.add_release(
             path,
             version=version,
-            digest=digest,
             commit=commit,
             min_from=min_from,
             has_migration=True,
@@ -408,7 +399,6 @@ def test_add_creates_the_file_when_the_directory_exists(tmp_path: Path) -> None:
     merged, state = catalog.add_release(
         path,
         version="0.0.2",
-        digest=DIGEST,
         commit=COMMIT,
         min_from=["0.0.1"],
         has_migration=True,
@@ -417,6 +407,8 @@ def test_add_creates_the_file_when_the_directory_exists(tmp_path: Path) -> None:
     assert state == "added"
     assert catalog.load_catalog(path) == merged
     assert path.read_text(encoding="utf-8").startswith("{\n  \"schema\": 1,")
+    # 写出来的文件里**没有** digest：目录只放发布决策。
+    assert "digest" not in path.read_text(encoding="utf-8")
 
 
 def test_add_refuses_a_missing_directory(tmp_path: Path) -> None:
@@ -424,7 +416,6 @@ def test_add_refuses_a_missing_directory(tmp_path: Path) -> None:
         catalog.add_release(
             tmp_path / "nope" / "releases.json",
             version="0.0.2",
-            digest=DIGEST,
             commit=COMMIT,
             min_from=["0.0.1"],
             has_migration=True,
@@ -439,7 +430,6 @@ def test_add_refuses_when_existing_catalog_is_invalid(tmp_path: Path) -> None:
         catalog.add_release(
             path,
             version="0.0.2",
-            digest=DIGEST,
             commit=COMMIT,
             min_from=["0.0.1"],
             has_migration=True,
@@ -484,8 +474,6 @@ def test_cli_add_is_idempotent(tmp_path: Path) -> None:
         str(path),
         "--version",
         "0.0.2",
-        "--digest",
-        DIGEST,
         "--commit",
         COMMIT,
         "--min-from",
@@ -513,8 +501,6 @@ def test_cli_add_accepts_comma_separated_min_from(tmp_path: Path) -> None:
         str(path),
         "--version",
         "0.0.3",
-        "--digest",
-        DIGEST,
         "--commit",
         COMMIT,
         "--min-from",
@@ -538,8 +524,6 @@ def test_cli_add_requires_a_migration_choice(tmp_path: Path) -> None:
         str(path),
         "--version",
         "0.0.2",
-        "--digest",
-        DIGEST,
         "--commit",
         COMMIT,
         "--min-from",
@@ -550,6 +534,7 @@ def test_cli_add_requires_a_migration_choice(tmp_path: Path) -> None:
 
 
 def test_cli_reports_conflict_with_exit_code_two(tmp_path: Path) -> None:
+    """同版本换源提交 → version_conflict + 退出码 2（不静默改写已发布条目）。"""
     path = write(tmp_path / "releases.json", good(release("0.0.2")))
     result = run_cli(
         "add",
@@ -557,16 +542,14 @@ def test_cli_reports_conflict_with_exit_code_two(tmp_path: Path) -> None:
         str(path),
         "--version",
         "0.0.2",
-        "--digest",
-        DIGEST_B,
         "--commit",
-        COMMIT,
+        COMMIT_B,
         "--min-from",
         "0.0.1",
         "--has-migration",
     )
     assert result.returncode == 2
-    assert "version_digest_conflict" in result.stderr
+    assert "version_conflict" in result.stderr
 
 
 def test_cli_written_file_is_valid_and_world_readable_only(tmp_path: Path) -> None:
@@ -578,8 +561,6 @@ def test_cli_written_file_is_valid_and_world_readable_only(tmp_path: Path) -> No
         str(path),
         "--version",
         "0.0.2",
-        "--digest",
-        DIGEST,
         "--commit",
         COMMIT,
         "--min-from",

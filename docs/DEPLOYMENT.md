@@ -1874,8 +1874,9 @@ compose up -d --force-recreate api
 
 ### 11.2 完整流程（全新安装）
 
-1. **从可信发布目录取一个固定摘要。** 目录文件是 `deploy/releases.json`
-   （schema 1，`version` ↔ `digest` 的映射，格式与校验规则见
+1. **从可信发布目录挑一个版本，再去 Release 正文取它的 index digest。** 目录文件是
+   `deploy/releases.json`（schema 1，只记录**发布决策**：`version`、源 `commit`、
+   `min_from`、`has_migration`、`released_at`；格式与校验规则见
    `deploy/release/catalog.py` 文件头）：
 
    ```bash
@@ -1886,10 +1887,24 @@ compose up -d --force-recreate api
    > 3.9/3.10 时会直接 `ImportError`）；CI 用 `setup-python` 安装的版本跑，没问题。
    > `ling` / `publish.py` 本身不需要第三方依赖，也没有这个版本限制。
 
-   > **现状**：仓库里的 `deploy/releases.json` 现在是空列表
-   > （`{"schema": 1, "releases": []}`），也就是说**目前没有可用的镜像目标**。
-   > 发布新版本时按上面的格式追加一条（digest 与源提交来自该次 release workflow
-   > 的 job summary），不要手填一个"看起来像"的摘要。
+   > **目录里没有 digest。** 目标摘要是"构建之后才存在"的值，而目录条目是"构建
+   > 之前就要提交"的发布元数据，两者顺序相反；过去要求先写死 digest，导致每发一版
+   > 都要「构建 → 取 digest → 手改目录 → 再提交」，重新打包同一版本还会被 `add`
+   > 拒绝。现在：
+   >
+   > - **人工装/人工升**：digest 从该次 release workflow 的 job summary 或 Release
+   >   正文里取（**index digest**：`ghcr.io/qsbb/ling-api@sha256:<64 hex>`），交给
+   >   `ling install --digest` / `publish.py --digest`；
+   > - **网页更新**：由更新器在刷新目录时自己解析
+   >   `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>`，取**本机架构**那条
+   >   平台 manifest 的 digest。两者都被 `publish.py` 的 `verify_repo_digests` 接受，
+   >   拉取后照旧核提交/平台/当前摘要。
+   >
+   > 所以"发版"只需要一次提交：把版本/源提交/跨度写进目录（`catalog.py add`），
+   > **不需要**再回来补 digest。
+
+   > **现状**：仓库里的 `deploy/releases.json` 目前有 `0.0.3`（`min_from` 0.0.2，
+   > 含迁移）。发布新版本时按上面的格式追加一条，不要手填一个"看起来像"的摘要。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -1999,7 +2014,7 @@ python3 deploy/release/publish.py \
 隔离项目 `ling-drill` 上真机跑通了三次连续升级；生产 `ling` 已于 2026-11-05 迁到
 镜像模式，但**两次连续网页升级没在生产上走完**——目前只发布过一个镜像摘要
 （`42bba216`），没有第二个 digest。镜像模式 compose 里 `LING_UPDATE_ENABLED` 仍
-默认 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改 `.env` 打开），仓库里的 `deploy/releases.json` 仍是空骨架（真实部署会显示 `no_available_target`）。
+默认 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改 `.env` 打开）。仓库里的 `deploy/releases.json` 现在有 `0.0.3` 一条（`min_from` 为 `0.0.2`，且**不含 digest**：摘要由更新器刷新目录时从 registry 解析）；部署机当前版本不在那条的 `min_from` 里时，网页仍会显示 `no_available_target`。
 所以现在仍不要对用户宣称"可以在网页里更新"（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 

@@ -8,13 +8,34 @@
 > 可信发布目录只列已通过门禁、可从已知版本升级的稳定目标，记录最低更新器协议
 > 版本、是否有迁移、预计下载大小及必要的版本跨度。
 
-同一份设计也写明「可编辑的 Release 正文**不是**摘要可信来源」。所以「目标摘要」
-只有三个可能来源，这里选了第三条：
+**目录里没有 digest**（2026-11 去掉）。原因不是嫌它多余，而是它原来放错了地方：
+目标摘要是「构建**之后**才存在」的值，而目录条目是「构建**之前**就要提交」的发布
+元数据。两者顺序相反，于是每发一版都得走一遍
 
-1. CI 构建证明（attestation）：本仓库 Stage 1 的 ``provenance: false`` 明确关掉了；
-2. 更新器内跑 ``gh``/Sigstore 验证：与「更新器只保留最小可信代码」冲突；
-3. **随代码提交的目录**：digest 本身内容寻址，改动经由 GitHub 签名提交 + 评审，
-   更新器从**自己的发行包目录**只读加载，不联网、不引入新依赖。
+    构建镜像 → 等 CI 吐出 digest → 手工改 releases.json → 再提交一次
+
+而且 ``catalog.py add`` 遇到「同版本不同 digest」还会直接拒绝（旧码
+``version_digest_conflict``）——重新打包镜像（digest 变了、版本号没变）会被自己的
+工具挡住，逼着人改 JSON，而人工改的东西正好是信任锚。**这是设计缺陷，不是操作
+失误**：把「构建产物的事实」写进「构建前的元数据」，顺序天然矛盾。
+
+现在目录只回答「有哪些版本、能从哪升上来、有没有迁移」这三件**发布决策**；目标
+摘要改由**更新器在刷新目录时自己解析**（``docker manifest inspect
+ghcr.io/qsbb/ling-api:v<version>``，取本机架构的平台 manifest digest），也就是
+"要用的时候才去问 registry"。这样：
+
+- 发版只需一次提交（版本/commit/跨度是构建前就确定的事实）；
+- 重新打包同一版本不再需要改目录——digest 由 registry 现场回答；
+- 信任锚仍是**随代码提交 + 评审**的那份目录（版本、commit、跨度），digest 来自
+  registry 的不可变内容寻址，走的是更新器**本来就有的** docker 凭据通道
+  （与 ``docker pull`` 同一条），不新增密钥、不引入签名/attestation。
+
+代价写在这里，免得下一个人重新踩：目录不再"自带"目标摘要，所以更新器每次刷新
+目录要打 1~2 次 registry（按 ``CATALOG_REFRESH_INTERVAL_SECONDS`` 节流，见
+``updater.py``）；解析失败必须 fail closed（该目标 ``compatible=false`` +
+``digest_unresolved``），**绝不**猜一个 digest。``provenance: false`` 的前提没变：
+digest 的可信度来自「registry 内容寻址 + 拉取后核 ``LING_COMMIT == OCI
+revision`` + 平台 / 当前运行摘要复核」，不是来自签名。
 
 本批只落更新器真正用得到的字段：``min_from``（版本跨度）与 ``has_migration``
 （是否有迁移）。最低更新器协议版本 / 预计下载大小目前没有任何使用方，**不预留
@@ -29,7 +50,6 @@
       "releases": [
         {
           "version": "0.0.2",                   # 严格 semver，不带 v 前缀
-          "digest": "ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>",
           "commit": "<40 位小写 hex>",
           "min_from": ["0.0.1"],                # 允许从哪些版本升到它
           "has_migration": true,
@@ -41,11 +61,13 @@
 硬规则（校验与追加共用同一套，见 :func:`parse_catalog`）：
 
 - 根对象只有 ``schema`` / ``releases`` 两个键，``schema`` 必须是整数 ``1``；
-- 每条记录**恰好**六个键，缺一个、多一个都算非法（拼错字段名比缺字段更危险）；
-- ``version`` 是严格 semver；``digest`` 只认 ``ghcr.io/qsbb/ling-api@sha256:<64 hex>``；
-  ``commit`` 是 40 位小写 hex；``min_from`` 是**非空**、无重复、不含自己的 semver 数组；
-  ``has_migration`` 是 JSON 布尔；``released_at`` 是 ``YYYY-MM-DDTHH:MM:SSZ``；
-- 全文件 ``version`` 不重复、``digest`` 不重复；条目数有上限（避免畸形文件放大内存）。
+- 每条记录**恰好**五个键，缺一个、多一个都算非法（拼错字段名比缺字段更危险）。
+  多出来的 ``digest`` 就是非法字段——旧目录文件必须被**显式拒绝**，不能"读的时候
+  顺手忽略"，否则"目录里到底还有没有 digest 在生效"又会变成两种事实；
+- ``version`` 是严格 semver；``commit`` 是 40 位小写 hex；``min_from`` 是**非空**、
+  无重复、不含自己的 semver 数组；``has_migration`` 是 JSON 布尔；
+  ``released_at`` 是 ``YYYY-MM-DDTHH:MM:SSZ``；
+- 全文件 ``version`` 不重复；条目数有上限（避免畸形文件放大内存）。
 
 **不按发布时间排序**：``validate`` 只校验内容、不看顺序；``add`` 写出时按 version
 语义排序只是为了让 diff 稳定。使用方（更新器、API）必须自己按 semver 比较，
@@ -78,7 +100,6 @@ MAX_RELEASES = 512
 MAX_MIN_FROM = 64
 WRITE_MODE = 0o644
 
-DIGEST_RE = re.compile(r"^ghcr\.io/qsbb/ling-api@sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # 严格 semver：数值段不允许前导 0；预发布/构建段按 semver 的字符集。
 SEMVER_RE = re.compile(
@@ -88,7 +109,8 @@ SEMVER_RE = re.compile(
 )
 RELEASED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # 字段顺序只影响写出的文件长相（便于人工评审），不参与任何语义。
-RELEASE_KEYS = ("version", "digest", "commit", "min_from", "has_migration", "released_at")
+# 没有 ``digest``：目标摘要在更新器刷新目录时从 registry 解析（见文件头）。
+RELEASE_KEYS = ("version", "commit", "min_from", "has_migration", "released_at")
 ROOT_KEYS = ("schema", "releases")
 
 DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / CATALOG_NAME
@@ -163,13 +185,6 @@ def _validate_release(raw: object, index: int) -> dict[str, Any]:
     if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
         raise _fail("version_invalid", f"{where}.version 不是严格 semver：{version!r}")
 
-    digest = raw["digest"]
-    if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
-        raise _fail(
-            "digest_invalid",
-            f"{where}.digest 必须是 ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>",
-        )
-
     commit = raw["commit"]
     if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None:
         raise _fail("commit_invalid", f"{where}.commit 必须是 40 位小写 hex")
@@ -210,7 +225,6 @@ def _validate_release(raw: object, index: int) -> dict[str, Any]:
 
     return {
         "version": version,
-        "digest": digest,
         "commit": commit,
         "min_from": normalized_min_from,
         "has_migration": has_migration,
@@ -257,15 +271,11 @@ def parse_catalog(raw: bytes) -> dict[str, Any]:
 
     releases: list[dict[str, Any]] = []
     versions: set[str] = set()
-    digests: set[str] = set()
     for index, item in enumerate(releases_raw):
         entry = _validate_release(item, index)
         if entry["version"] in versions:
             raise _fail("version_duplicate", f"version 重复：{entry['version']}")
-        if entry["digest"] in digests:
-            raise _fail("digest_duplicate", f"digest 重复：{entry['digest']}")
         versions.add(entry["version"])
-        digests.add(entry["digest"])
         releases.append(entry)
     return {"schema": SCHEMA, "releases": releases}
 
@@ -335,7 +345,6 @@ def add_release(
     path: Path,
     *,
     version: str,
-    digest: str,
     commit: str,
     min_from: Sequence[str],
     has_migration: bool,
@@ -343,14 +352,19 @@ def add_release(
 ) -> tuple[dict[str, Any], str]:
     """往目录里追加一条；返回 ``(catalog, state)``，``state`` 是 ``added``/``unchanged``。
 
-    幂等：同 ``version`` 已存在且 ``digest`` 相同、其它字段也一致 → **不写文件**、
-    返回 ``unchanged``。同 version 不同 digest → ``version_digest_conflict``；
-    同 version/digest 但字段不同 → ``entry_conflict``；digest 已被别的 version
-    占用 → ``digest_duplicate``。所有分支都只抛 :class:`CatalogError`，不静默覆盖。
+    幂等：同 ``version`` 已存在且 ``commit``/``min_from``/``has_migration`` 全同 →
+    **不写文件**、返回 ``unchanged``（``released_at`` 不参与比较：那是"第一次记录
+    的时间"，重跑一次不该因为时间戳变了就报冲突）。同 ``version`` 但字段不同 →
+    ``version_conflict``：已发布的条目**不允许**被脚本静默改写，必须人工评审后改
+    目录文件——目录是信任锚，"同版本换了源提交/跨度"是要上评审的事，不是一次
+    ``add`` 能定的。
+
+    为什么不再有 ``--digest`` / ``version_digest_conflict`` / ``digest_duplicate``：
+    目录里没有 digest 了（见文件头）。重新打包同一版本**本来就该是允许的、无需
+    改目录的操作**——正是旧的 ``version_digest_conflict`` 把它变成了人工事故。
     """
     entry = {
         "version": version,
-        "digest": digest,
         "commit": commit,
         "min_from": list(min_from),
         "has_migration": has_migration,
@@ -367,18 +381,8 @@ def add_release(
         catalog = {"schema": SCHEMA, "releases": []}
 
     for existing in catalog["releases"]:
-        if existing["digest"] == digest and existing["version"] != version:
-            raise _fail(
-                "digest_duplicate",
-                f"digest 已被 {existing['version']} 使用：{digest}",
-            )
         if existing["version"] != version:
             continue
-        if existing["digest"] != digest:
-            raise _fail(
-                "version_digest_conflict",
-                f"{version} 已存在且 digest 不同（目录 {existing['digest']} ≠ 新 {digest}）",
-            )
         same = (
             existing["commit"] == commit
             and existing["min_from"] == list(min_from)
@@ -386,9 +390,10 @@ def add_release(
         )
         if not same:
             raise _fail(
-                "entry_conflict",
-                f"{version} 已存在且 digest 相同，但 commit/min_from/has_migration 不同；"
-                "已发布的条目不要用脚本改写，请人工评审后改目录文件",
+                "version_conflict",
+                f"{version} 已存在且 commit/min_from/has_migration 与本条不同；"
+                "已发布的条目不要用脚本改写，请人工评审后改目录文件"
+                "（同版本重新打包镜像不需要改目录：digest 由更新器解析）",
             )
         return catalog, "unchanged"
 
@@ -405,7 +410,7 @@ def add_release(
 def _describe(entry: dict[str, Any]) -> str:
     migration = "yes" if entry["has_migration"] else "no"
     return (
-        f"  {entry['version']}  {entry['digest']}  "
+        f"  {entry['version']}  commit={entry['commit']}  "
         f"migration={migration}  min_from={','.join(entry['min_from'])}"
     )
 
@@ -427,9 +432,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog", default=str(DEFAULT_CATALOG), help=f"目录文件路径（默认 {CATALOG_NAME}）"
     )
     p_add.add_argument("--version", required=True, help="严格 semver，例如 0.0.2")
-    p_add.add_argument(
-        "--digest", required=True, help="ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>"
-    )
     p_add.add_argument("--commit", required=True, help="40 位小写 hex 源提交")
     p_add.add_argument(
         "--min-from",
@@ -479,7 +481,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             catalog, state = add_release(
                 path,
                 version=args.version,
-                digest=args.digest,
                 commit=args.commit,
                 min_from=_min_from_values(args.min_from),
                 has_migration=bool(args.has_migration),
@@ -489,7 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{args.command.upper()} FAILED {error.code}: {error.message}", file=sys.stderr)
         return 2
     if args.command == "add":
-        print(f"{state.upper()} {args.version} {args.digest}")
+        print(f"{state.upper()} {args.version}")
     print(f"OK schema={SCHEMA} releases={len(catalog['releases'])}")
     for entry in sort_releases(catalog["releases"]):
         print(_describe(entry))

@@ -75,12 +75,15 @@
         "reason": null | "catalog_missing|catalog_unreadable|catalog_invalid|
                  catalog_schema_unsupported|catalog_tool_missing",
         "entries": 3,                       # 目录里的发布条数（只用于展示）
-        "current_version": "0.0.1" | null   # 按**当前镜像摘要**在目录里反查到的版本
+        "current_version": "0.0.1" | null   # 运行中 api 镜像的 OCI version 标注
       },
       "available_targets": [
-        {"version": "0.0.2", "digest": "...", "commit": "...",
+        {"version": "0.0.2",
+         "digest": "ghcr.io/qsbb/ling-api@sha256:..." | null,  # null = 没解析/不兼容
+         "commit": "...",
          "has_migration": true, "compatible": true|false,
-         "incompatible_reason": null | "not_in_min_from|current_version_unknown|..."}
+         "incompatible_reason": null | "not_in_min_from|current_version_unknown|
+                                digest_unresolved|..."}
       ],
       "recommended_target": null | {"version": "...", "digest": "...",
                                     "commit": "...", "has_migration": ...}
@@ -120,23 +123,45 @@ releases.json``），校验与排序复用发行包里那份 ``deploy/release/ca
 
 判定规则（都在 :func:`release_targets` 里，**不依赖文件顺序**）：
 
-1. **当前版本**由 ``受限 env`` 里的 ``LING_APP_IMAGE`` 在目录里**反查**得到
-   （目录就是"版本 ↔ 摘要"的可信映射）。反查不到 → 当前版本未知，所有目标
-   ``compatible=false`` + ``incompatible_reason="current_version_unknown"``，
-   ``recommended_target=null``（**不猜**当前版本，也不拿"看起来像"的目标放行）。
+1. **当前版本**读**运行中 api 容器**的镜像标注 ``org.opencontainers.image.version``
+   （:func:`current_running_version`）。为什么不再读 ``.env`` 里的
+   ``LING_APP_IMAGE`` 去目录反查：目录里**已经没有 digest**，「摘要 ↔ 版本」的
+   映射不存在，反查这条走不通；而运行中的容器本来就是"现在到底跑的是哪一版"的
+   实测事实（``.env`` 可以被手改，也可能改了还没重建容器）。读不到标注 / 容器
+   不在运行 / 标注不是严格 semver → 当前版本未知，所有目标 ``compatible=false``
+   + ``incompatible_reason="current_version_unknown"``，``recommended_target=null``
+   （**不猜**当前版本，也不拿"看起来像"的目标放行）。
 2. **只允许升级**：目标 ``version`` 必须**严格大于**当前版本，否则该条**不出现在**
    ``available_targets`` 里（设计要求「不提供随意选旧版本或一键降级」）。
 3. **版本跨度**：当前版本必须在该目标的 ``min_from`` 里；不在 → 兼容=false +
    原因（``not_in_min_from``）。
-4. ``recommended_target`` = **版本最大的那一条兼容目标**；没有兼容目标就是 null。
+4. **目标摘要现解析**（:func:`resolve_target_digest`）：目录里没有 digest，所以对
+   每个**兼容**目标跑一次 ``docker manifest inspect
+   ghcr.io/qsbb/ling-api:v<version>``，取 ``linux/<宿主架构>`` 那条平台 manifest
+   的 digest 当 ``target_digest``。解析失败（没有 ``manifests`` / 没有本机平台 /
+   命令非 0 / JSON 坏 / digest 不过 ``DIGEST_RE``）→ 该目标 ``compatible=false``
+   + ``incompatible_reason="digest_unresolved"``，**绝不**用 tag 或旧缓存顶替。
+   可用目标通常只有 1~2 个，所以每次刷新就 1~2 次 manifest inspect。
+5. ``recommended_target`` = **版本最大的那一条兼容目标**；没有兼容目标就是 null。
 
 目录缺失 / 不可解析 / 校验失败 → ``available_targets=[]`` + 明确原因（``state``
 与 ``reason``），**绝不**假装有目标，也**绝不**静默。
 
-即使目标来自目录，更新器仍**独立复核**：请求里的 ``target_digest`` 必须是自己
-目录里的**兼容目标**之一（否则 ``target_not_in_catalog``，一个字节都不改），
-之后照旧核 digest 格式、拉取后核 ``LING_COMMIT == OCI revision``、平台、当前
-运行 digest，并复用 publish 的全部门禁。
+即使目标来自目录，更新器仍**独立复核**：请求里的 ``target_digest`` 必须等于
+「某个兼容版本**现在**从 registry 解析出来的摘要」（否则 ``target_not_in_catalog``，
+一个字节都不改）——所以执行前那次复核会**重新解析** manifest，而不是拿 status
+里的旧缓存比对；之后照旧核 digest 格式、拉取后核 ``LING_COMMIT == OCI revision``、
+平台、当前运行 digest，并复用 publish 的全部门禁。
+
+关于「index digest 还是平台 manifest digest」：目录还带 digest 的时代记的是多架构
+**index** digest（CI Release 正文里那个）。更新器现在解析出来的是**本机架构的平台
+manifest** digest——`publish.verify_repo_digests` 两者是一等值（``accepted =
+{target_hex} ∪ {target_platform_digest}``），`probe_registry_manifest` 遇到非 index
+也会明说「平台将在 pull 后按 image inspect 核对」。为什么不解析 index digest：
+``docker manifest inspect`` 的输出里**没有** index 自己的摘要（OCI index 文档不含
+自身哈希，``-v`` 只多给平台 descriptor），而 ``buildx imagetools --raw`` 要在只读
+根、非 root、``HOME=/nonexistent`` 的更新器容器里初始化 builder——真机跑不通就会
+让整条更新通道 fail closed，代价远大于「摘要取本机平台那一层」。
 
 维护门禁（设计 §4/§5 的硬要求）
 ===============================
@@ -279,8 +304,13 @@ CATALOG_FETCH_TIMEOUT_SECONDS = 10.0
 # 比主循环的 5 秒轮询慢两个数量级，不会把 GitHub 打成限流。
 CATALOG_REFRESH_INTERVAL_SECONDS = 300.0
 RELEASE_CATALOG_TOOL = "catalog.py"
-# 读受限 env 时的大小上限：只为一个 KEY= 行，不需要把任意大的文件读进内存。
-ENV_FILE_MAX_BYTES = 64 * 1024
+# 解析目标摘要时 `docker manifest inspect` 的超时（秒）。与 publish 的
+# `probe_registry_manifest` 同一个量级：registry 慢就慢在这条命令上，超时就当
+# 解析失败（fail closed），不能让状态刷新把主循环拖死。
+MANIFEST_INSPECT_TIMEOUT_SECONDS = 60.0
+# 「现在跑的是哪一版」只认这个 OCI 标注（`deploy/Dockerfile.api` 从
+# `LING_VERSION` 写进去，与 pyproject / `ling.__version__` 同源）。
+VERSION_LABEL = "org.opencontainers.image.version"
 CATALOG_STATE_OK = "ok"
 CATALOG_STATE_MISSING = "missing"
 CATALOG_STATE_INVALID = "invalid"
@@ -306,6 +336,10 @@ CATALOG_REASON_BY_CODE = {
 INCOMPATIBLE_NOT_IN_MIN_FROM = "not_in_min_from"
 INCOMPATIBLE_CURRENT_VERSION_UNKNOWN = "current_version_unknown"
 INCOMPATIBLE_VERSION_UNCOMPARABLE = "version_uncomparable"
+# 目录里没有 digest 之后新出现的一种"不可用"：版本可用，但**摘要解析不出来**。
+# 只加这一个码，不为"命令非 0 / 没 manifests / 没有本机平台 / digest 格式不对"
+# 各开一个——对用户是同一件事：这条目标现在装不了，而且我们**不知道**该拉哪个摘要。
+INCOMPATIBLE_DIGEST_UNRESOLVED = "digest_unresolved"
 
 EXIT_OK = 0
 EXIT_REJECTED = 2
@@ -452,6 +486,10 @@ def load_publish(path: Path) -> ModuleType:
         "ARCH_ALIASES",
         "write_atomic",
         "utc_now",
+        # 目录里没有 digest 之后，摘要解析要复用发行包的仓库常量与 Runner：
+        # 「去哪个仓库问」和「怎么跑 docker」都不该在更新器里另立一套。
+        "IMAGE_REPOSITORY",
+        "Runner",
     )
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
@@ -1438,60 +1476,165 @@ def release_catalog_block(
     }
 
 
-def env_image_ref(env_file: Path, digest_re: re.Pattern[str]) -> str | None:
-    """从受限 env 里读 ``LING_APP_IMAGE``（当前安装的镜像摘要，只读）。
+def docker_runner(pub: ModuleType) -> Any:
+    """状态刷新用的 docker Runner：**复用**发行包的实现，不自己拼 subprocess。
 
-    为什么读文件而不是问 API/容器：``.env`` 就是"现在装的是哪个摘要"的**宿主
-    事实**（更新成功后也是更新器自己写回去的），读它不需要 Docker、不需要 HTTP
-    鉴权，也不会在 idle 轮询里产生任何外部调用。解析口径与 publish 的写入口径
-    一致：``KEY=`` 行、可带 ``export`` 前缀、重复时**最后一行生效**（与 compose
-    的 env 文件语义一致）。摘要格式仍走发行包的 ``DIGEST_RE``（不另立一套）。
+    与 publish 用同一个 ``Runner``（同一套超时/rc/输出语义），所以「更新器读容器
+    实况」和「publish 读容器实况」不会变成两种事实。日志用一个独立的 ``Logger``：
+    状态刷新的 argv 只进 stderr，不混进 ``journal.log``——那里放的是"这次更新做了
+    什么"，而状态刷新是每几分钟一次的后台旁路。
     """
-    try:
-        info = env_file.lstat()
-    except OSError:
-        return None
-    if not stat.S_ISREG(info.st_mode) or info.st_size > ENV_FILE_MAX_BYTES:
-        return None
-    try:
-        text = env_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    pattern = re.compile(r"^\s*(?:export\s+)?LING_APP_IMAGE\s*=(.*)$")
-    value: str | None = None
-    for line in text.splitlines():
-        match = pattern.match(line)
-        if match is None:
-            continue
-        raw = match.group(1).strip()
-        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
-            raw = raw[1:-1].strip()
-        value = raw or None
-    if value is None or digest_re.fullmatch(value) is None:
-        return None
-    return value
+    return pub.Runner(pub.Logger())
 
 
-def current_catalog_version(catalog: dict[str, Any], image_ref: str | None) -> str | None:
-    """按**当前镜像摘要**在目录里反查版本（目录就是可信的"版本 <-> 摘要"映射）。
+def _docker_json_object(runner: Any, argv: Sequence[str]) -> dict[str, Any] | None:
+    """跑一条**只读** docker 命令，取 JSON 数组里的第一个对象；任何异常都返回 None。
 
-    反查不到（摘要不在目录里）返回 None：调用方必须按"当前版本未知"处理，
-    **不能**猜成某个版本——猜错就会把一次跨度过大的升级放行。
+    调用方一律按"读不到"处理（当前版本未知 / 摘要解析失败）：这里不是唯一定义
+    错误的地方，任何一条读不出来都不该让更新器崩，也不该让它猜。
     """
-    if image_ref is None:
+    result = runner.run(list(argv))
+    if result.returncode != 0:
         return None
-    for entry in catalog.get("releases", []):
-        if not isinstance(entry, dict) or entry.get("digest") != image_ref:
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    return data[0]
+
+
+def current_running_version(cfg: Config, runner: Any) -> str | None:
+    """读**运行中 api 容器**所用镜像的 ``org.opencontainers.image.version`` 标注。
+
+    为什么是这条路径（而不是读 ``.env`` 的摘要去目录里反查）：目录里**已经没有
+    digest**，"摘要 ↔ 版本"的映射不存在。而「现在跑的是哪一版」本来就有实测答案
+    ——运行中的容器的镜像标注。命令序列与 publish 的
+    ``inspect_previous_containers`` 完全一致（``docker ps`` 按 compose 标签找唯一
+    容器 → ``docker inspect --type container`` 拿 image ID → ``docker image
+    inspect`` 读标注），只是这里只读、只关心 api。
+
+    任何一个环节不成立都返回 None（→ 调用方按 ``current_version_unknown`` 处理，
+    所有目标不兼容）：0 个/多个 api 容器、容器不在 running、镜像没标注、标注是
+    空串。**不**退回 ``.env``、**不**猜。
+    """
+    listed = runner.run(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"label=com.docker.compose.project={cfg.project}",
+            "--filter",
+            "label=com.docker.compose.service=api",
+            "--format",
+            "{{.ID}}|{{.Names}}|{{.State}}",
+        ]
+    )
+    if listed.returncode != 0:
+        return None
+    rows = [line for line in listed.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        return None
+    fields = rows[0].split("|")
+    if len(fields) != 3 or fields[2].strip() != "running":
+        return None
+    container = _docker_json_object(
+        runner, ["docker", "inspect", "--type", "container", fields[0].strip()]
+    )
+    if container is None:
+        return None
+    image_id = container.get("Image")
+    if not isinstance(image_id, str) or not image_id:
+        return None
+    image = _docker_json_object(runner, ["docker", "image", "inspect", image_id])
+    if image is None:
+        return None
+    config = image.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    if not isinstance(labels, dict):
+        return None
+    version = labels.get(VERSION_LABEL)
+    return version if isinstance(version, str) and version.strip() else None
+
+
+def resolve_target_digest(
+    pub: ModuleType, runner: Any, version: str, host_arch: str
+) -> str | None:
+    """把 ``v<version>`` 这个 tag 在 registry 上解析成**本机平台**的镜像摘要。
+
+    ``docker manifest inspect`` 打的是 tag 上的 index（多架构清单）；``manifests[]``
+    里每条是某个平台的 manifest，各带自己的 ``digest``。取 ``os=linux`` 且
+    ``architecture=<宿主架构>`` 的那条，拼成
+    ``ghcr.io/qsbb/ling-api@sha256:<64 hex>``。
+
+    为什么取**平台** digest 而不是 index digest：见模块 docstring 末段（``docker
+    manifest inspect`` 的输出里没有 index 自己的摘要，而 buildx 那条路在只读根 +
+    非 root + 无 HOME 的更新器容器里不可靠）。这个值正是 publish 的
+    ``target_platform_digest``，``verify_repo_digests`` 本来就接受它。
+
+    以下情况全部返回 None（调用方记 ``digest_unresolved``，绝不顶替）：
+    命令非 0 / 输出不是 JSON 对象 / 顶层没有 ``manifests``（单架构 manifest，
+    它的摘要不在文档里）/ 没有匹配本机平台的那条 / digest 拼出来不过
+    ``DIGEST_RE``。格式校验不另立一套：发行包的 ``DIGEST_RE`` 就是协议接受的那个
+    形状，拉取后 publish 还会再核一遍。
+    """
+    ref = f"{pub.IMAGE_REPOSITORY}:v{version}"
+    result = runner.run(
+        ["docker", "manifest", "inspect", ref], timeout=MANIFEST_INSPECT_TIMEOUT_SECONDS
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    manifests = data.get("manifests")
+    if not isinstance(manifests, list):
+        return None
+    for item in manifests:
+        if not isinstance(item, dict):
             continue
-        version = entry.get("version")
-        return version if isinstance(version, str) else None
+        platform = item.get("platform")
+        if not isinstance(platform, dict):
+            continue
+        if platform.get("os") != "linux" or platform.get("architecture") != host_arch:
+            continue
+        digest = item.get("digest")
+        if not isinstance(digest, str):
+            return None
+        image_ref = f"{pub.IMAGE_REPOSITORY}@{digest}"
+        if pub.DIGEST_RE.fullmatch(image_ref) is None:
+            return None
+        return image_ref
     return None
+
+
+def _digest_resolver(pub: ModuleType, runner: Any) -> Callable[[str], str | None]:
+    """构造「版本 -> 本机平台摘要」的解析器；宿主架构只问一次（多条目标共用）。
+
+    宿主架构走 :func:`daemon_arch`（docker daemon 自报，拿不到才退回进程架构）：
+    它与 ``publish.Options.host_arch`` 是同一个来源，拉取后的平台复核才对得上。
+    延迟到第一次真正要解析时才探测——没有兼容目标的那次刷新不该白问一次 daemon。
+    """
+    arch: str | None = None
+
+    def resolve(version: str) -> str | None:
+        nonlocal arch
+        if arch is None:
+            arch = daemon_arch(pub)
+        return resolve_target_digest(pub, runner, version, arch)
+
+    return resolve
 
 
 def release_targets(
     tool: ModuleType | None,
     catalog: dict[str, Any] | None,
     current_version: str | None,
+    resolve_digest: Callable[[str], str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """把目录投影成"可用目标"列表 + 推荐目标（供状态文件与网页使用）。
 
@@ -1500,7 +1643,15 @@ def release_targets(
     1. 目标 ``version`` 必须**严格大于**当前版本，否则该条**不出现**（不提供降级）；
     2. 当前版本必须在该目标的 ``min_from`` 里，否则 ``compatible=false`` + 原因；
     3. 当前版本未知 -> 所有条目 ``compatible=false`` + ``current_version_unknown``；
-    4. ``recommended`` = 版本最大的**兼容**目标（没有则 None）。
+    4. 兼容目标还要**现场解析摘要**（``resolve_digest``）：目录里没有 digest 了，
+       解析不出来 → ``compatible=false`` + ``digest_unresolved``；所以
+       ``compatible=True`` 的目标**一定**带 digest；
+    5. ``recommended`` = 版本最大的**兼容**目标（没有则 None）。
+
+    不兼容的目标 ``digest`` 是 ``None``：既然不会被推荐，就没必要为它打一次
+    registry（每次刷新都要打）；而 API 侧的白名单投影本来就会丢掉没有合法 digest
+    的条目——所以这些条目只出现在更新器自己的 status.json 里（带原因码），不影响
+    页面：前端只消费 ``target`` / ``recommended_target``。
 
     目录缺失/不可用时 ``catalog`` 是 None，结果同样是空列表——"没有可用目标"，
     绝不是"随便给一个"。
@@ -1532,6 +1683,7 @@ def release_targets(
         if current_key is not None and key is not None and key <= current_key:
             # 只允许升级：同版本/更旧的目标不是"可用目标"，直接不出现。
             continue
+        digest: str | None = None
         if current_key is None:
             compatible = False
             reason: str | None = INCOMPATIBLE_CURRENT_VERSION_UNKNOWN
@@ -1544,9 +1696,15 @@ def release_targets(
         else:
             compatible = True
             reason = None
+        if compatible:
+            digest = resolve_digest(entry["version"]) if resolve_digest is not None else None
+            if digest is None:
+                # 版本可用、摘要解析不出来：只有这一条码（见常量处说明）。
+                compatible = False
+                reason = INCOMPATIBLE_DIGEST_UNRESOLVED
         target = {
             "version": entry["version"],
-            "digest": entry["digest"],
+            "digest": digest,
             "commit": entry["commit"],
             "has_migration": entry["has_migration"],
             "compatible": compatible,
@@ -1610,13 +1768,19 @@ def _fetch_catalog_bytes(url: str) -> bytes | None:
 
 
 def read_release_catalog(
-    cfg: Config, pub: ModuleType, tool: ModuleType | None
+    cfg: Config, pub: ModuleType, tool: ModuleType | None, runner: Any | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
     """读目录 -> ``(block, available_targets, recommended_target)``。
 
     任何失败都收敛成固定的 ``state``/``reason`` 码（**不**把异常文本、路径写进
     状态文件），并且 ``available_targets=[]``：宁可明说"没有可用目标"，也不要
     静默或假装有目标。
+
+    这个函数**会碰 Docker**（只读）：当前版本要读运行中 api 镜像的标注，兼容目标
+    要 ``docker manifest inspect`` 现场解析摘要。调用方按 5 分钟节流（见
+    ``StatusWriter.refresh_release_catalog_if_due``），不要放进 5 秒的主轮询里。
+    目录本身读不出来时**一条 Docker 调用都不发**（先解析、后问 Docker）：目录都
+    不可信了，没有任何版本/摘要值得去问。
     """
     if tool is None:
         empty = release_catalog_block(
@@ -1641,10 +1805,18 @@ def read_release_catalog(
             [],
             None,
         )
-    current_version = current_catalog_version(
-        catalog, env_image_ref(cfg.env_file, pub.DIGEST_RE)
+    docker = runner if runner is not None else docker_runner(pub)
+    current_version = current_running_version(cfg, docker)
+    if current_version is not None:
+        try:
+            # 标注不是严格 semver（例如构建时 LING_VERSION 没传上）一律按未知处理：
+            # 状态文件里的 current_version 只放严格 semver 或 null，不放任意文本。
+            tool.version_key(current_version)
+        except Exception:  # noqa: BLE001
+            current_version = None
+    targets, recommended = release_targets(
+        tool, catalog, current_version, _digest_resolver(pub, docker)
     )
-    targets, recommended = release_targets(tool, catalog, current_version)
     return (
         release_catalog_block(CATALOG_STATE_OK, None, len(releases), current_version),
         targets,
@@ -1715,8 +1887,14 @@ class StatusWriter:
 
     ``release_catalog`` / ``available_targets`` / ``recommended_target`` 同理：
     它们**不含时间戳**（只有状态码、计数、当前版本与目标列表），所以重算也不会
-    让内容抖动；刷新时机与恢复点门禁完全一致（启动、每处理完一个任务）。读目录
-    与读受限 env 都是本地只读文件，idle 轮询**不产生任何 Docker/网络调用**。
+    让内容抖动；刷新时机与恢复点门禁完全一致（启动、每处理完一个任务）。
+
+    **这一组刷新会碰 Docker（只读）**——目录里没有 digest 之后，当前版本要读运行
+    中 api 镜像的 ``org.opencontainers.image.version`` 标注，兼容目标要
+    ``docker manifest inspect`` 现场解析摘要。所以它们被
+    :meth:`refresh_release_catalog_if_due` 的 5 分钟节流挡着，**绝不能**放进 5 秒
+    的主轮询：每轮问一次 registry 等于所有部署实例每 5 秒打一次 GHCR。目录文件
+    的读取与校验仍然是本地只读文件操作，而且**先校验目录再问 Docker**。
     """
 
     def __init__(self, cfg: Config, pub: ModuleType, tool: ModuleType | None = None) -> None:
@@ -1736,7 +1914,12 @@ class StatusWriter:
         return self._gate
 
     def refresh_release_catalog(self) -> dict[str, Any]:
-        """重读发布目录并重算可用目标/推荐目标（可能联网，见 ``catalog_url``）。"""
+        """重读发布目录并重算可用目标/推荐目标。
+
+        会发三类只读调用：可能联网取目录（``catalog_url``）、``docker ps`` /
+        ``inspect`` / ``image inspect`` 读当前版本、每个兼容目标一次
+        ``docker manifest inspect`` 解析摘要。
+        """
         self._catalog, self._targets, self._recommended = read_release_catalog(
             self.cfg, self.pub, self.tool
         )
@@ -1756,6 +1939,10 @@ class StatusWriter:
 
         5 分钟一次：发版是低频事件，用户点「检查更新」也只是重读 status.json，
         最多等 5 分钟就能看到。任务执行前的即时复核不受影响（那一条照旧）。
+
+        这次节流现在不只省 GitHub：刷新还会 ``docker manifest inspect``（1~2 次）
+        并在 ``docker ps/inspect`` 里读当前版本，所以"每轮都刷"会变成每 5 秒打一次
+        GHCR + 一次容器实况查询。节流是这两类外部调用的**唯一**闸门。
         """
         if time.monotonic() - self._catalog_checked_at >= CATALOG_REFRESH_INTERVAL_SECONDS:
             self.refresh_release_catalog()
@@ -2614,7 +2801,9 @@ class Updater:
         # 第一次更新之前永远"不可安装"）。
         self.status.refresh_backup_gate()
         # 可信发布目录同理：idle 也要有"可用目标"，否则网页的「更新」按钮永远
-        # 「暂无可用目标」。读目录/读受限 env 都是本地只读文件，不碰 Docker。
+        # 「暂无可用目标」。这一刷只发**只读** docker 调用（docker ps/inspect 读
+        # 运行中 api 的版本标注、兼容目标的 docker manifest inspect），不发任何
+        # 变更命令；启动时算一次也是状态文件里「当前版本」的唯一来源。
         self.status.refresh_release_catalog()
         self.context_class = make_context_class(pub)
         self.task: dict[str, Any] | None = None
@@ -2671,11 +2860,15 @@ class Updater:
 
     # -------------------------------------------------- 单次处理
     def assert_target_in_catalog(self, target: str) -> None:
-        """请求的目标必须是**自己目录**里的兼容目标之一（不信任 API/页面/请求）。
+        """请求的目标必须是**现在**能从 registry 解析出来的兼容摘要之一。
 
-        这里**重新读一遍目录**，不用 :class:`StatusWriter` 的缓存：缓存可能是几
-        分钟前的，而"执行前再核一次"必须是真的再核一次。目录不可用也算拒绝
-        （``catalog_unavailable``）：无法证明的目标一律不执行，一个字节都不改。
+        请求里只有 ``target_digest``，没有版本号，所以"按 version 复核"在这里的
+        落法就是：**重新读目录 + 重新解析每个兼容目标的摘要**，再看这个 digest
+        是否等于其中一条。不用 :class:`StatusWriter` 的缓存：缓存可能是几分钟前
+        的，而"执行前再核一次"必须是真的再核一次（这一条还会再打 1~2 次
+        ``docker manifest inspect``，正是要确认 registry 现在说的还是同一个摘要）。
+        目录不可用也算拒绝（``catalog_unavailable``）：无法证明的目标一律不执行，
+        一个字节都不改。
         """
         block, targets, _ = read_release_catalog(self.cfg, self.pub, self.tool)
         if block["state"] != CATALOG_STATE_OK:
@@ -2695,9 +2888,10 @@ class Updater:
             EXIT_REJECTED,
             "target_not_in_catalog",
             "prepare",
-            "目标摘要不在可信发布目录的可用目标里（未列出，或与当前版本不兼容）",
+            "目标摘要不等于任何兼容版本此刻解析出来的摘要"
+            "（版本未列出、与当前版本不兼容，或 registry 现在给的是别的摘要）",
             [
-                "从网页「目标版本」里重新提交；目标只能来自可信发布目录。",
+                "从网页「目标版本」里重新提交；目标只能来自可信发布目录 + registry 解析。",
                 "不要手改请求文件：更新器只执行目录里的兼容目标。",
             ],
         )
@@ -2710,8 +2904,9 @@ class Updater:
             raise UpdaterError(
                 EXIT_REJECTED, "duplicate_request", "prepare", "该任务 ID 已处理过"
             )
-        # 目标必须来自目录：digest 格式合格只是必要条件，**可用性**由目录决定。
-        # 这一步在任何 Docker 调用之前（拉取/备份/迁移都还没开始）。
+        # 目标必须来自目录：digest 格式合格只是必要条件，**可用性**由「目录 + 现在
+        # 解析出来的摘要」决定。这一步在任何变更类 Docker 调用之前（拉取/备份/
+        # 迁移都还没开始），只发只读查询（manifest inspect / ps / inspect）。
         self.assert_target_in_catalog(target)
         self.task = new_task(self.pub, request, target_hex, expected_commit)
         self.persist()
