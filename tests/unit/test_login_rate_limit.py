@@ -73,10 +73,19 @@ def test_failure_during_lock_does_not_extend_it() -> None:
     keys = _keys(ip=None)
     for _ in range(LoginRateLimiter.FAILURE_THRESHOLD):
         limiter.record_failure(keys)
-    before = limiter.retry_after(keys)
+    # 比**锁定截止时刻**，不比剩余秒数。
+    #
+    # `retry_after()` 返回「截止时刻 − 当前时间」，随真实时间**递减**：两次调用
+    # 之间隔几十微秒就少几十微秒，而 `pytest.approx` 默认相对容差 1e-6 在截止
+    # 时刻约 60 秒时只允许 **60 微秒**的差。串行跑通常刚好在容差内；`pytest-xdist`
+    # 并行跑时 CPU 争用把间隔拉大，就会稳定假红（CI 上 py3.12 与 py3.13 同时红过）。
+    #
+    # 截止时刻是「有没有被延长」的精确答案，与当前时间无关，也不受调度抖动影响
+    # ——要测的不变量本来就是它不变。
+    deadline = dict(limiter._locked_until)  # noqa: SLF001 - 测的就是内部时钟
     for _ in range(20):
         assert limiter.record_failure(keys) == 0.0
-    assert limiter.retry_after(keys) == pytest.approx(before)
+    assert limiter._locked_until == deadline  # noqa: SLF001
 
 
 def test_success_resets() -> None:
