@@ -628,6 +628,7 @@ def make_group_chooser(
             AutonomyTurnService,
             make_persona_reader,
             make_situation_reader,
+            scenario_key_for,
         )
         from ling.kernel.decision import DecisionContext
 
@@ -658,7 +659,7 @@ def make_group_chooser(
                 subject_id=speaker_subject_id,
             ),
             persona_reader=make_persona_reader(
-                session, persona_id=persona_id
+                session, persona_id=persona_id, scenario=scenario_key_for(ctx)
             ),
         ).choose(ctx, text=batch_text)
 

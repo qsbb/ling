@@ -36,6 +36,7 @@ from ling.kernel.autonomy import (
     _looks_urgent,
     make_persona_reader,
     make_situation_reader,
+    scenario_key_for,
 )
 from ling.kernel.decision import DecisionContext, classify_text
 from ling.logging_setup import emit_event
@@ -708,7 +709,7 @@ class InboundBridge:
                 subject_id=None if is_group else subject_id,
             ),
             persona_reader=make_persona_reader(
-                self._session, persona_id=self._persona_id
+                self._session, persona_id=self._persona_id, scenario=scenario_key_for(ctx)
             ),
         ).choose(ctx, text=text)
 

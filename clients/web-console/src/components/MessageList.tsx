@@ -1,5 +1,6 @@
-import { formatClock } from '../format';
+import { formatClock, formatModelLabel } from '../format';
 import { retryLabel } from '../errors';
+import { usePersonaName } from '../personaName';
 import type { LiveTurn, UiMessage } from '../useChat';
 import type { TurnView } from '../types';
 import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
@@ -117,7 +118,11 @@ function ActorMeta({
         ) : null}
         {statusText(message, liveTurnId)}
       </span>
-      {message.modelLabel ? <span className="message__model">{message.modelLabel}</span> : null}
+      {message.modelLabel ? (
+        <span className="message__model" title={message.modelLabel}>
+          {formatModelLabel(message.modelLabel)}
+        </span>
+      ) : null}
       {message.attempt > 1 ? <span className="message__attempt">第 {message.attempt} 次尝试</span> : null}
       {message.state === 'stopped' && message.turnId ? (
         <button
@@ -144,6 +149,7 @@ export function MessageList({
   onOpenSettings,
 }: MessageListProps) {
   const liveTurnId = live?.turnId ?? null;
+  const actorName = usePersonaName();
   const showGeneratingRow =
     activeTurn !== null &&
     (live === null || live.turnId !== activeTurn.turn_id) &&
@@ -195,7 +201,7 @@ export function MessageList({
               </div>
             ) : null}
             <div className="message__body">
-              {!isUser ? <div className="message__author">ling</div> : null}
+              {!isUser ? <div className="message__author">{actorName}</div> : null}
               <div className={`message__bubble ${streaming ? 'message__bubble--streaming' : ''}`}>
                 {message.text ? (
                   <span className="message__text">{message.text}</span>
@@ -257,7 +263,7 @@ export function MessageList({
             <span className="message__avatar-pulse" />
           </div>
           <div className="message__body">
-            <div className="message__author">ling</div>
+            <div className="message__author">{actorName}</div>
             <div className="message__bubble message__bubble--streaming">
               <span className="message__typing" aria-label="服务端仍在生成">
                 <i />

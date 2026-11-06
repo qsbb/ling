@@ -128,6 +128,10 @@ class Persona(Base, TimestampMixin):
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     traits: Mapped[dict] = mapped_column(JSON, default=dict)
     boundaries: Mapped[list] = mapped_column(JSON, default=list)
+    # 场景覆盖：只存**写过的那些场景**，没写的不落库，读时回落到
+    # `domains/persona/scenarios.py` 的内置默认。存"生效文本"会把默认值
+    # 复制进每一行——以后想改默认，已有的人设永远收不到。
+    scenario_prompts: Mapped[dict] = mapped_column(JSON, default=dict)
     published: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

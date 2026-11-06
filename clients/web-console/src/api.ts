@@ -20,6 +20,7 @@ import type {
   SecretStatus,
   SessionRecord,
   SettingsConfig,
+  ModelHealthResponse,
   ConsentsResponse,
   ConsentUpdate,
   StopResponse,
@@ -291,6 +292,10 @@ export const api = {
       `/v1/settings/providers/${encodeURIComponent(providerId)}/probe`,
       { method: 'POST' },
     );
+  },
+  /** 最近调用健康度：键是 `provider_id/model_id`，不含错误原文。 */
+  settingsHealth(): Promise<ModelHealthResponse> {
+    return request<ModelHealthResponse>('/v1/settings/health');
   },
 
   /* ------------------------------------------------------------ 媒体 */

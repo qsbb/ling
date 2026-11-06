@@ -49,6 +49,17 @@ export function formatDuration(seconds: number): string {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
 }
 
+/**
+ * 模型标识在服务端记成 `provider/model`（如 `hy3gw2/hy3`），那是内部称呼。
+ * 气泡上只露模型名，完整标识放在 title 里，排查时还看得到。
+ */
+export function formatModelLabel(value: string): string {
+  const text = value.trim();
+  const slash = text.lastIndexOf('/');
+  if (slash === -1) return text;
+  return text.slice(slash + 1) || text;
+}
+
 export function truncate(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }

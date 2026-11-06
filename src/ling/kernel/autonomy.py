@@ -496,17 +496,37 @@ __all__ = [
     "ModelStatus",
     "TurnChoice",
     "make_persona_reader",
+    "scenario_key_for",
 ]
 
 
-def make_persona_reader(session: object, *, persona_id: str):
+def scenario_key_for(ctx: DecisionContext) -> str:
+    """这次决策属于哪个场景键。
+
+    命名必须与 `domains/persona/scenarios.py` 的目录一致——那边是**唯一**
+    的人设侧定义，这里只负责"现在是哪个"。两边走散的话，界面上的输入框
+    会写着"群里被点名"，而实际注入的是另一条。
+    """
+    if not ctx.is_group:
+        return "private"
+    if ctx.mentioned or ctx.explicitly_asked:
+        return "group_mentioned"
+    return "group_unaddressed"
+
+
+def make_persona_reader(session: object, *, persona_id: str, scenario: str | None = None):
     """构造人设读取器。把人设带进"要不要开口"的决策里。
 
     之前决策只知道场景和处境，**不知道她是谁**——于是四个群聊场景
     全判"不插话"，因为提示词里恰好写着"别人之间的对话通常不该插话"。
+
+    ``scenario`` 决定额外带上哪条场景提示词（见 `domains/persona/scenarios`）。
+    不传就不注入——**不要在这里猜一个默认场景**：猜错等于拿私聊的规矩
+    去管群聊。
     """
 
     async def _read() -> str:
+        from ling.domains.persona.scenarios import render
         from ling.domains.persona.service import PersonaService
 
         view = await PersonaService(session, persona_id).get(persona_id)  # type: ignore[arg-type]
@@ -523,6 +543,11 @@ def make_persona_reader(session: object, *, persona_id: str):
         # 边界是操作者自己定的，属于"她是谁"的一部分，要一起给
         for item in view.boundaries or []:
             parts.append(f"- {item}")
+        # 场景提示放在最后：它是对"这一场"的补丁，读起来应该紧贴判断。
+        if scenario:
+            hint = render(getattr(view, "scenario_prompts", None), scenario)
+            if hint:
+                parts.append(f"这一场的处理方式：{hint}")
         return "\n".join(parts).strip()
 
     return _read

@@ -1,0 +1,1687 @@
+/*
+ * 模型设置页（供应商 / 职责绑定）。
+ *
+ * 与全站共用暖纸底色，但这一页的绿更深一点：它要表达「正在生效」的状态，
+ * 用 accent 太浅会和「已停用」的灰分不开。所有类名以 `ms-` 开头，
+ * 避免和 styles.css 里的 .provider / .profile-card 等旧类互相影响。
+ *
+ * 三条硬约束：
+ * 1. 375px 单列、无横向溢出（`min-width: 0` + `overflow-wrap: anywhere`）；
+ * 2. 触控 ≥ 44×44（窄屏），桌面保留紧凑密度；
+ * 3. 状态不能只靠颜色：都有文字/图标，色弱可辨。
+ */
+
+.model-page {
+  --ms-card: #fdfbf6;
+  --ms-card-strong: #fffdf8;
+  --ms-line: #e6ddcd;
+  --ms-line-strong: #d7cbb8;
+  --ms-ink: #2f2b24;
+  --ms-muted: #8a8172;
+  --ms-faint: #a99f8e;
+  --ms-accent: #3f6b4f;
+  --ms-accent-dark: #27432f;
+  --ms-accent-soft: #e7efe6;
+  --ms-warn: #8a5a1f;
+  --ms-warn-soft: #f7ead2;
+  --ms-danger: #9d453a;
+  --ms-danger-soft: #f6e6e1;
+  gap: 14px;
+  padding-top: 18px;
+}
+
+.model-page .ms-muted {
+  color: var(--ms-muted);
+}
+
+/* ------------------------------------------------------------------ 页头 */
+
+.ms-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  padding-top: 2px;
+}
+
+.ms-head__main {
+  min-width: 0;
+}
+
+.ms-head__title {
+  margin: 10px 0 3px;
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: 0.015em;
+  line-height: 1.25;
+  color: var(--ms-ink);
+}
+
+.ms-head__sub {
+  margin: 0;
+  color: var(--ms-muted);
+  font-size: 12.5px;
+  max-width: 620px;
+  overflow-wrap: anywhere;
+}
+
+.ms-head__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.ms-revision {
+  font-size: 11.5px;
+  color: var(--ms-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ tab */
+
+.ms-tabs {
+  display: flex;
+  gap: 26px;
+  border-bottom: 1px solid var(--ms-line);
+  margin-top: 2px;
+}
+
+.ms-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  background: transparent;
+  padding: 10px 1px 11px;
+  color: var(--ms-muted);
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+.ms-tab:hover {
+  color: var(--ms-ink);
+}
+
+.ms-tab--active {
+  color: var(--ms-ink);
+  font-weight: 600;
+}
+
+.ms-tab--active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ms-accent);
+}
+
+.ms-tab__count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #eee7da;
+  color: var(--ms-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-tab--active .ms-tab__count {
+  background: var(--ms-accent-soft);
+  color: var(--ms-accent);
+}
+
+.ms-tab__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ms-warn);
+  display: inline-block;
+}
+
+/* ------------------------------------------------------------------ 通用 */
+
+.ms-card {
+  background: var(--ms-card);
+  border: 1px solid var(--ms-line);
+  border-radius: 18px;
+  box-shadow: 0 1px 2px rgba(58, 48, 34, 0.04), 0 12px 30px rgba(58, 48, 34, 0.045);
+  min-width: 0;
+}
+
+.ms-chip {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: #ede7db;
+  color: var(--ms-muted);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.ms-chip--on {
+  background: var(--ms-accent-soft);
+  color: var(--ms-accent);
+}
+
+.ms-chip--bad {
+  background: var(--ms-danger-soft);
+  color: var(--ms-danger);
+}
+
+.ms-chip--test {
+  background: var(--ms-warn-soft);
+  color: var(--ms-warn);
+}
+
+.ms-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 13px;
+  border: 1px solid var(--ms-line-strong);
+  border-radius: 9px;
+  background: var(--ms-card-strong);
+  color: var(--ms-ink);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.ms-btn:hover:not(:disabled) {
+  background: #f5efe3;
+}
+
+.ms-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.ms-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ms-btn--primary {
+  background: var(--ms-accent-dark);
+  border-color: var(--ms-accent-dark);
+  color: #faf7ef;
+}
+
+.ms-btn--primary:hover:not(:disabled) {
+  background: #1d3425;
+}
+
+.ms-btn--sm {
+  min-height: 30px;
+  padding: 4px 11px;
+  font-size: 12px;
+}
+
+.ms-btn--icon {
+  width: 34px;
+  padding: 0;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--ms-muted);
+}
+
+.ms-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ms-faint);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.ms-icon-btn:hover {
+  background: rgba(80, 66, 45, 0.06);
+  color: var(--ms-ink);
+}
+
+.ms-link {
+  border: 0;
+  background: transparent;
+  padding: 2px 3px;
+  color: var(--ms-accent);
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 5px;
+}
+
+.ms-link:hover:not(:disabled) {
+  background: var(--ms-accent-soft);
+}
+
+.ms-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ms-link--danger {
+  color: var(--ms-danger);
+}
+
+.ms-link--danger:hover:not(:disabled) {
+  background: var(--ms-danger-soft);
+}
+
+.ms-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ms-field__label {
+  font-size: 11.5px;
+  color: var(--ms-faint);
+  letter-spacing: 0.02em;
+}
+
+.ms-field--wide {
+  grid-column: 1 / -1;
+}
+
+.ms-input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--ms-line-strong);
+  border-radius: 9px;
+  background: var(--ms-card-strong);
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--ms-ink);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ms-input:focus {
+  outline: none;
+  border-color: #b9af99;
+  box-shadow: 0 0 0 3px rgba(63, 107, 79, 0.1);
+}
+
+.ms-input:disabled {
+  background: #f2ede3;
+  color: var(--ms-faint);
+}
+
+.ms-input--mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.ms-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+
+.ms-form-grid--compact {
+  margin-top: 10px;
+}
+
+.ms-hint {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ms-faint);
+  overflow-wrap: anywhere;
+}
+
+.ms-error-text {
+  margin: 6px 0 0;
+  color: var(--ms-danger);
+  font-size: 12px;
+}
+
+.ms-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ms-muted);
+}
+
+.ms-note--quiet {
+  padding: 0 24px 4px;
+}
+
+/* ------------------------------------------------------------------ 布局 */
+
+.ms-layout {
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+/* ------------------------------------------------------------------ 左栏 */
+
+.ms-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ms-rail__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 2px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--ms-faint);
+}
+
+.ms-rail__count {
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-rail__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ms-rail-item {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ms-ink);
+  min-width: 0;
+}
+
+.ms-rail-item:hover {
+  background: rgba(255, 253, 248, 0.6);
+}
+
+.ms-rail-item--active {
+  background: var(--ms-card-strong);
+  border-color: var(--ms-line);
+  box-shadow: 0 1px 2px rgba(58, 48, 34, 0.04);
+}
+
+.ms-rail-item__main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ms-rail-item__name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-rail-item__meta {
+  font-size: 10.5px;
+  color: var(--ms-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: #eee7da;
+  color: #8a7d68;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.ms-glyph--active {
+  background: var(--ms-accent-soft);
+  color: var(--ms-accent);
+}
+
+.ms-glyph--lg {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  font-size: 17px;
+}
+
+.ms-add-rail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 4px;
+  padding: 10px;
+  border: 1px dashed var(--ms-line-strong);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--ms-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ms-add-rail:hover {
+  color: var(--ms-ink);
+  background: rgba(255, 253, 248, 0.55);
+}
+
+.ms-new-provider {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--ms-line);
+  border-radius: 12px;
+  background: var(--ms-card-strong);
+}
+
+.ms-new-provider__actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ------------------------------------------------------------------ 供应商详情 */
+
+.ms-provider-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px 14px;
+}
+
+.ms-provider-head__id {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ms-provider-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+.ms-kind {
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--ms-muted);
+  background: #efe9dd;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.ms-provider-meta {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  color: var(--ms-faint);
+  overflow-wrap: anywhere;
+}
+
+.ms-inline-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--ms-muted);
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.ms-dirtybar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 24px 14px;
+  padding: 7px 10px;
+  border: 1px solid #e3d8bc;
+  border-radius: 9px;
+  background: #faf3e2;
+  color: var(--ms-warn);
+  font-size: 11.5px;
+}
+
+.ms-dirtybar__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ms-warn);
+  flex-shrink: 0;
+}
+
+.ms-dirtybar__spacer {
+  flex: 1;
+}
+
+.ms-form-grid {
+  padding: 4px 24px 0;
+}
+
+.ms-secret {
+  padding: 18px 24px 0;
+}
+
+.ms-secret__summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 5px;
+  min-height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--ms-line);
+  border-radius: 9px;
+  background: #f7f2e8;
+}
+
+.ms-secret__mask {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--ms-faint);
+  letter-spacing: 0.12em;
+  font-size: 12px;
+}
+
+.ms-secret__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--ms-muted);
+}
+
+.ms-secret__status--missing {
+  color: var(--ms-warn);
+}
+
+.ms-secret__spacer {
+  flex: 1;
+}
+
+.ms-secret__edit {
+  display: flex;
+  gap: 8px;
+  margin-top: 5px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.ms-secret__edit .ms-input {
+  flex: 1 1 220px;
+}
+
+/* ------------------------------------------------------------------ 模型 */
+
+.ms-models {
+  margin: 20px 24px 0;
+  border-top: 1px solid var(--ms-line);
+}
+
+.ms-models__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px 0 8px;
+  flex-wrap: wrap;
+}
+
+.ms-models__head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ms-muted);
+}
+
+.ms-models__head .ms-muted {
+  font-size: 10.5px;
+}
+
+.ms-model-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ms-model {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 40px 28px;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 2px;
+  border-top: 1px solid #efe8db;
+  min-width: 0;
+}
+
+.ms-model--off .ms-model__id {
+  color: var(--ms-faint);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.ms-model__main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ms-model__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  color: var(--ms-ink);
+  overflow-wrap: anywhere;
+}
+
+.ms-model__roles {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.ms-model__nobind {
+  font-size: 10.5px;
+}
+
+.ms-rolechip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--ms-accent-soft);
+  color: var(--ms-accent);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.ms-model-add {
+  display: flex;
+  gap: 8px;
+  padding: 10px 0 2px;
+  border-top: 1px solid #efe8db;
+  flex-wrap: wrap;
+}
+
+.ms-model-add .ms-input {
+  flex: 1 1 240px;
+}
+
+.ms-add-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  color: var(--ms-accent);
+  font-size: 12px;
+  padding: 9px 2px 4px;
+  cursor: pointer;
+  border-top: 1px solid #efe8db;
+  width: 100%;
+  text-align: left;
+}
+
+.ms-add-model:hover {
+  color: var(--ms-accent-dark);
+}
+
+.ms-found {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: #f3f5ec;
+  border: 1px solid #dde4d3;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.ms-found__label {
+  font-size: 11px;
+  color: var(--ms-muted);
+}
+
+.ms-found__items {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.ms-found__chip {
+  border: 1px solid #cfd8c4;
+  background: var(--ms-card-strong);
+  color: var(--ms-accent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+
+.ms-found__chip:hover {
+  background: var(--ms-accent-soft);
+}
+
+.ms-empty {
+  padding: 30px 24px;
+  text-align: center;
+  color: var(--ms-muted);
+  font-size: 13px;
+}
+
+.ms-empty--models {
+  padding: 14px 0 10px;
+  text-align: left;
+  font-size: 12.5px;
+}
+
+.ms-empty p {
+  margin: 0 0 4px;
+}
+
+/* ------------------------------------------------------------------ 底部 / 探测 */
+
+.ms-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 12px 24px 16px;
+  border-top: 1px solid var(--ms-line);
+  background: #faf6ed;
+  border-radius: 0 0 18px 18px;
+  flex-wrap: wrap;
+}
+
+.ms-probe {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ms-muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ms-probe--ok {
+  color: #446a4b;
+}
+
+.ms-probe--danger {
+  color: var(--ms-danger);
+}
+
+.ms-card-foot__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.ms-menu-wrap {
+  position: relative;
+}
+
+.ms-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--ms-line);
+  border-radius: 10px;
+  background: var(--ms-card-strong);
+  box-shadow: 0 10px 26px rgba(58, 48, 34, 0.14);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+}
+
+.ms-menu button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--ms-ink);
+  cursor: pointer;
+}
+
+.ms-menu button:hover {
+  background: #f3eee4;
+}
+
+/* ------------------------------------------------------------------ 运行设置 */
+
+.ms-run {
+  border: 1px solid var(--ms-line);
+  border-radius: 14px;
+  background: rgba(253, 251, 246, 0.7);
+}
+
+.ms-run > summary {
+  cursor: pointer;
+  padding: 11px 16px;
+  font-size: 12.5px;
+  color: var(--ms-muted);
+  list-style: none;
+}
+
+.ms-run > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ms-run > summary::before {
+  content: '›';
+  display: inline-block;
+  margin-right: 8px;
+  transform: rotate(0deg);
+  transition: transform 0.15s ease;
+  color: var(--ms-faint);
+}
+
+.ms-run[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.ms-run__body {
+  padding: 2px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-top: 1px solid var(--ms-line);
+}
+
+.ms-run__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding-top: 12px;
+}
+
+.ms-run__row strong {
+  font-size: 12.5px;
+}
+
+.ms-run__row p {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  line-height: 1.7;
+  max-width: 620px;
+}
+
+/* ------------------------------------------------------------------ 职责绑定 */
+
+.ms-roles {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ms-roles__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 4px 2px 2px;
+}
+
+.ms-roles__head h2 {
+  margin: 0 0 3px;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.ms-roles__head p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  max-width: 640px;
+}
+
+.ms-roles__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.ms-dirty {
+  font-size: 11.5px;
+  color: var(--ms-warn);
+  white-space: nowrap;
+}
+
+.ms-role-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ms-role {
+  background: var(--ms-card);
+  border: 1px solid var(--ms-line);
+  border-radius: 16px;
+  padding: 16px 18px 12px;
+  box-shadow: 0 1px 2px rgba(58, 48, 34, 0.035);
+  display: grid;
+  grid-template-columns: minmax(180px, 0.85fr) minmax(280px, 1.15fr);
+  gap: 8px 22px;
+  align-items: start;
+  min-width: 0;
+}
+
+.ms-role__head {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.ms-role__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: #f0eadf;
+  color: #7c6f5a;
+  flex-shrink: 0;
+}
+
+.ms-role__title {
+  min-width: 0;
+}
+
+.ms-role__title h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ms-role__title code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--ms-faint);
+}
+
+.ms-role__title p {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ms-muted);
+}
+
+.ms-role__fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 9px;
+  min-width: 0;
+}
+
+.ms-role__empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ms-warn);
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ms-role__foot {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #efe8db;
+  font-size: 11.5px;
+  flex-wrap: wrap;
+}
+
+.ms-role__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ms-role__status--ok {
+  color: #446a4b;
+}
+
+.ms-role__status--warn {
+  color: var(--ms-warn);
+}
+
+.ms-role__status--danger {
+  color: var(--ms-danger);
+}
+
+.ms-role__status--idle {
+  color: var(--ms-faint);
+}
+
+.ms-role__advanced {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+}
+
+.ms-role__advanced > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--ms-faint);
+  list-style: none;
+  display: inline-block;
+  padding: 2px 0;
+}
+
+.ms-role__advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ms-role__advanced > summary::before {
+  content: '›';
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+
+.ms-role__advanced[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.ms-role__advanced-body {
+  padding: 4px 0 2px;
+}
+
+.ms-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--ms-muted);
+}
+
+.ms-checkbox input {
+  accent-color: var(--ms-accent);
+}
+
+.ms-role--compact {
+  padding: 12px 14px 9px;
+  grid-template-columns: minmax(140px, 0.7fr) minmax(260px, 1.3fr);
+}
+
+.ms-role--compact .ms-role__icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+}
+
+.ms-role--compact .ms-role__title h3 {
+  font-size: 13px;
+}
+
+.ms-role--compact .ms-role__foot {
+  padding-top: 6px;
+}
+
+.ms-extra {
+  border: 1px dashed var(--ms-line-strong);
+  border-radius: 14px;
+  padding: 4px 14px 12px;
+}
+
+.ms-extra > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  font-size: 12.5px;
+  color: var(--ms-muted);
+  list-style: none;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.ms-extra > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ms-extra > summary::before {
+  content: '›';
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+  color: var(--ms-faint);
+}
+
+.ms-extra[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.ms-extra > summary .ms-muted {
+  font-size: 11px;
+}
+
+.ms-extra .ms-role-list {
+  margin-top: 4px;
+}
+
+/* ------------------------------------------------------------------ 提示 / 状态点 */
+
+.ms-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+.ms-dot--ok {
+  background: #4f7a58;
+}
+
+.ms-dot--warn {
+  background: #b8862f;
+}
+
+.ms-dot--danger {
+  background: var(--ms-danger);
+}
+
+.ms-dot--idle {
+  background: #c5bbaa;
+}
+
+.ms-switch {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  border: 0;
+  padding: 2px;
+  background: #ddd5c6;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.16s ease;
+}
+
+.ms-switch__thumb {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fffdf8;
+  box-shadow: 0 1px 2px rgba(58, 48, 34, 0.2);
+  transition: transform 0.18s ease;
+}
+
+.ms-switch--on {
+  background: var(--ms-accent);
+}
+
+.ms-switch--on .ms-switch__thumb {
+  transform: translateX(16px);
+}
+
+.ms-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ms-banner {
+  border-radius: 11px;
+  padding: 9px 13px;
+  font-size: 12.5px;
+  border: 1px solid var(--ms-line);
+  background: var(--ms-card-strong);
+}
+
+.ms-banner--ok {
+  border-color: #cfdcc6;
+  background: #edf3e8;
+  color: #3f6447;
+}
+
+.ms-banner--error {
+  border-color: #eccfc8;
+  background: var(--ms-danger-soft);
+  color: var(--ms-danger);
+}
+
+.ms-banner--warn {
+  border-color: #e8d7b4;
+  background: var(--ms-warn-soft);
+  color: var(--ms-warn);
+}
+
+.ms-banner__detail {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--ms-muted);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.ms-issues {
+  border: 1px solid #eccfc8;
+  background: #fbf1ee;
+  border-radius: 11px;
+  padding: 9px 13px;
+  font-size: 12px;
+  color: var(--ms-danger);
+}
+
+.ms-issues--warn {
+  border-color: #e8d7b4;
+  background: var(--ms-warn-soft);
+  color: var(--ms-warn);
+}
+
+.ms-issues ul {
+  margin: 5px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ms-issues code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
+
+.ms-footnote {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--ms-faint);
+  max-width: 760px;
+}
+
+/* ------------------------------------------------------------------ 修订历史 */
+
+.ms-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+
+.ms-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(38, 34, 29, 0.34);
+  backdrop-filter: blur(2px);
+}
+
+.ms-modal__card {
+  position: relative;
+  width: min(720px, 100%);
+  max-height: min(78vh, 720px);
+  overflow: auto;
+  background: var(--ms-card);
+  border: 1px solid var(--ms-line);
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgba(38, 34, 29, 0.28);
+  padding: 18px 20px 12px;
+}
+
+.ms-modal__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--ms-line);
+}
+
+.ms-modal__head h2 {
+  margin: 0 0 2px;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.ms-modal__head p {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.ms-revisions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ms-revision-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 2px;
+  border-bottom: 1px solid #efe8db;
+  flex-wrap: wrap;
+}
+
+.ms-revision-row:last-child {
+  border-bottom: 0;
+}
+
+.ms-revision-row__main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.ms-revision-row__main strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.ms-revision-row__side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.ms-revision-row__note {
+  font-size: 11.5px;
+  color: var(--ms-muted);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ 响应式 */
+
+@media (max-width: 900px) {
+  .ms-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .ms-rail__list {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 3px;
+    scrollbar-width: thin;
+  }
+
+  .ms-rail-item {
+    min-width: 205px;
+    border-color: var(--ms-line);
+    background: rgba(253, 251, 246, 0.55);
+  }
+
+  .ms-add-rail {
+    margin-top: 0;
+  }
+
+  .ms-role {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .ms-role__fields {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .ms-roles__head {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .ms-roles__actions {
+    align-self: stretch;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 620px) {
+  .model-page {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .ms-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .ms-head__meta {
+    justify-content: flex-start;
+  }
+
+  .ms-head__title {
+    font-size: 23px;
+  }
+
+  .ms-tabs {
+    gap: 20px;
+  }
+
+  .ms-tab {
+    min-height: 44px;
+    font-size: 14px;
+  }
+
+  .ms-form-grid,
+  .ms-role__fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 窄屏把供应商横排改成整行竖排，避免第二张卡被裁掉且没有滑动提示 */
+  .ms-rail__list {
+    flex-direction: column;
+    overflow-x: visible;
+    padding-bottom: 0;
+  }
+
+  .ms-rail-item {
+    min-width: 0;
+  }
+
+  .ms-provider-head {
+    flex-direction: column;
+    padding: 16px 16px 12px;
+    gap: 8px;
+  }
+
+  .ms-inline-switch {
+    margin-top: 0;
+  }
+
+  .ms-dirtybar,
+  .ms-form-grid,
+  .ms-secret,
+  .ms-models {
+    margin-left: 16px;
+    margin-right: 16px;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .ms-dirtybar {
+    margin: 0 16px 12px;
+    padding: 8px 10px;
+  }
+
+  .ms-card-foot {
+    padding: 12px 16px 14px;
+  }
+
+  /* 窄屏的密钥行：省略装饰性掩码，让「更换 / 删除」留在同一行 */
+  .ms-secret__summary {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    padding: 8px 11px;
+  }
+
+  .ms-secret__mask {
+    display: none;
+  }
+
+  .ms-secret__spacer {
+    flex: 1 1 0;
+  }
+
+  .ms-model {
+    grid-template-columns: minmax(0, 1fr) 38px 30px;
+    grid-template-areas:
+      'main switch remove'
+      'roles roles roles';
+    gap: 6px 10px;
+    padding: 11px 0;
+  }
+
+  .ms-model__main {
+    grid-area: main;
+  }
+
+  .ms-model .ms-switch {
+    grid-area: switch;
+  }
+
+  .ms-model .ms-icon-btn {
+    grid-area: remove;
+  }
+
+  .ms-model__roles {
+    grid-area: roles;
+    justify-content: flex-start;
+  }
+
+  .ms-model-add {
+    flex-direction: column;
+  }
+
+  .ms-model-add .ms-btn {
+    min-height: 40px;
+  }
+
+  .ms-btn,
+  .ms-input {
+    min-height: 44px;
+  }
+
+  .ms-btn--sm {
+    min-height: 38px;
+  }
+
+  .ms-icon-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .ms-switch {
+    width: 44px;
+    height: 26px;
+  }
+
+  .ms-switch__thumb {
+    width: 22px;
+    height: 22px;
+  }
+
+  .ms-switch--on .ms-switch__thumb {
+    transform: translateX(18px);
+  }
+
+  .ms-run__row {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .ms-revision-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .ms-revision-row__side {
+    margin-left: 0;
+  }
+
+  .ms-modal {
+    padding: 10px;
+  }
+
+  .ms-modal__card {
+    max-height: 88vh;
+    padding: 14px 14px 10px;
+  }
+}

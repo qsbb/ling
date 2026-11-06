@@ -2870,3 +2870,96 @@ button {
     overflow: hidden;
   }
 }
+
+/* ------------------------------------------------------------ 人设：场景处理
+ *
+ * 「场景处理」是同一个表单里的第二段，不是另一张卡片：它和名字 / 人格
+ * 一起构成一份人设，分两次保存会让"改了名字但场景没存"变成可能的中间态。
+ * 所以只隔一条分隔线，保存按钮仍然只有一个。
+ *
+ * 每条场景用"淡底 + 细边"分组，而不是纯列表：默认文本放在 textarea 的
+ * placeholder 里，空框本身要有边界，否则四块空白会糊成一片，看不出
+ * 哪块对应哪个场合。
+ */
+.scenario-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.scenario-block__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.scenario-block__head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.scenarios {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.scenario {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper);
+  padding: 10px 12px;
+}
+
+.scenario__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scenario__label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.scenario__state {
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 99px;
+  background: var(--paper-sunken);
+  color: var(--ink-faint);
+}
+
+.scenario__state--custom {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.scenario__reset {
+  margin-left: auto;
+}
+
+.scenario__when {
+  margin: 3px 0 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+}
+
+.scenario__input {
+  background: var(--paper-raised);
+  min-height: 74px;
+}
+
+/* 占位提示就是默认文本：它是"读得清的内容"，不是装饰，别用默认浏览器那种
+ * 浅到几乎看不见的灰。 */
+.scenario__input::placeholder {
+  color: #8b8274;
+  opacity: 1;
+}

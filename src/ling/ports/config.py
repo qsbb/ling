@@ -167,6 +167,26 @@ class DialoguePolicy:
 
 
 @dataclass(frozen=True)
+class ProviderModel:
+    """供应商目录里的一个模型。
+
+    这是**给人看的清单**，不是路由白名单：``enabled=False`` 的模型仍然
+    可以被旧修订里的职责绑定，路由照旧会调它——但在设置页里它不会再被
+    推荐、也不能被新绑定选中。要真正停掉一个模型，请把绑定改到别的模型。
+
+    ``note`` 是自由文本（例如「上下文 128K · 支持图片」），服务端不解析；
+    它只用来在设置页解释"这个模型是干什么的"。
+    """
+
+    model_id: str
+    note: str = ""
+    enabled: bool = True
+
+    def to_dict(self) -> dict[str, object]:
+        return {"model_id": self.model_id, "note": self.note, "enabled": self.enabled}
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     provider_id: str
     kind: str  # fake | openai_compatible | local
@@ -175,6 +195,7 @@ class ProviderConfig:
     secret_last4: str = ""
     enabled: bool = True
     extra: dict = field(default_factory=dict)
+    models: tuple[ProviderModel, ...] = ()
 
 
 @dataclass(frozen=True)

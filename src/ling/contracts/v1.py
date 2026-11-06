@@ -336,6 +336,10 @@ class ContextContribution(StrictModel):
         "goals",
         "capabilities",
         "constraints",
+        # 场景提示：人设里写的"这种场合怎么处理"。单独一条车道而不是
+        # 并进 persona，因为它可能为空、也可能被单独截断——混进人格车道
+        # 之后，"人格被截了一半"和"这个场景没写"在日志里长得一样。
+        "scenario",
     ]
     text: str
     origin: Origin

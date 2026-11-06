@@ -81,6 +81,19 @@ export interface StopResponse {
 
 /* ---------------------------------------------------------------- 设置 */
 
+/**
+ * 供应商目录里的一个模型。
+ *
+ * 它是**给人看的清单**，不是路由白名单：停用的模型不会出现在新的职责绑定
+ * 下拉里，但已经绑给它的职责仍会照常调用——所以界面要把这种旧绑定标成
+ * 「需要检查」，而不是假装它已经不可用。
+ */
+export interface ProviderModel {
+  model_id: string;
+  note: string;
+  enabled: boolean;
+}
+
 export interface ProviderView {
   provider_id: string;
   kind: string;
@@ -90,6 +103,7 @@ export interface ProviderView {
   secret_last4: string;
   secret_fingerprint: string;
   extra: Record<string, unknown>;
+  models: ProviderModel[];
 }
 
 export interface ProfileView {
@@ -257,6 +271,27 @@ export interface ProbeResult {
   detail: string;
   latency_ms: number;
   models: string[];
+  /** 探测是只读的；这个时间戳只用于界面标注"检查发生在什么时候"。 */
+  checked_at?: string;
+}
+
+/**
+ * 供应商/模型的最近调用健康度（`GET /v1/settings/health`）。
+ *
+ * `health` 的键是 `provider_id/model_id`。服务端刻意不返回 `last_error`
+ * 原文（可能带上游地址、请求 id），设置页只该说"正常/失败/熔断"。
+ */
+export interface ModelHealthEntry {
+  consecutive_failures: number;
+  open: boolean;
+  last_latency_ms: number | null;
+}
+
+export interface ModelHealthResponse {
+  revision: number;
+  test_mode: boolean;
+  health: Record<string, ModelHealthEntry>;
+  profiles: Record<string, { provider_id: string; model_id: string; enabled: boolean }>;
 }
 
 export interface ProviderDraftInput {
@@ -265,6 +300,8 @@ export interface ProviderDraftInput {
   base_url: string | null;
   enabled: boolean;
   extra?: Record<string, unknown>;
+  /** 不传 = 不改动服务端已有清单；新建供应商时传 []。 */
+  models?: ProviderModel[];
 }
 
 export interface ProfileDraftInput {
@@ -282,6 +319,22 @@ export interface ProfileDraftInput {
 
 /* ---------------------------------------------------------------- 角色 */
 
+/**
+ * 一个场景在人设下的样子。
+ *
+ * `text` 是生效值，`default_text` 是内置默认——两个都给是刻意的：界面上
+ * 空着的输入框用默认值当占位提示，"恢复默认"也只需要清空，不用前端自己
+ * 存一份默认（那份迟早和服务端走散）。
+ */
+export interface PersonaScenario {
+  key: string;
+  label: string;
+  when: string;
+  text: string;
+  default_text: string;
+  custom: boolean;
+}
+
 export interface Persona {
   persona_id: string;
   revision: number;
@@ -290,6 +343,9 @@ export interface Persona {
   system_prompt: string;
   traits: Record<string, unknown>;
   boundaries: string[];
+  /** 只含覆盖，不含默认。 */
+  scenario_prompts: Record<string, string>;
+  scenarios: PersonaScenario[];
 }
 
 export interface PersonaUpdate {
@@ -297,6 +353,8 @@ export interface PersonaUpdate {
   system_prompt?: string;
   traits?: Record<string, unknown>;
   boundaries?: string[];
+  /** 整组替换：空串 = 恢复默认，缺键 = 没有覆盖。 */
+  scenario_prompts?: Record<string, string>;
 }
 
 export interface TimelineEvent {

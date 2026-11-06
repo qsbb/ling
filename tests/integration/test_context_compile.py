@@ -455,3 +455,79 @@ async def test_affect_write_invalidates_cache(web_env) -> None:
         await svc._rows()  # noqa: SLF001 - 先填缓存
         svc.invalidate()
         assert svc.__dict__.get("_rows_cache") is None
+
+
+# ---------------------------------------------------------------- 场景提示词
+
+
+def _lane_text(compiled, lane: str) -> str:
+    return "\n".join(c.text for c in compiled.contributions if c.lane == lane)
+
+
+async def test_private_turn_injects_private_scenario_only(logged_in: TestEnv) -> None:
+    """私聊只带私聊那条；群聊那条不能顺带进来。
+
+    两段同时进提示词时，模型会按"更保守"的那条办——群里那套"少说话"
+    会让私聊也变得爱答不理。
+    """
+    await logged_in.client.put(
+        "/v1/persona",
+        json={
+            "scenario_prompts": {
+                "private": "私聊里可以顺着对方的话多聊两句",
+                "group": "群里只接一句就走",
+            }
+        },
+    )
+    session_id, subject_id = await _window(logged_in)
+    async with session_scope() as session:
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id,
+            window_id=session_id,
+            user_text="在吗",
+            is_group=False,
+        )
+    scenario = _lane_text(compiled, "scenario")
+    assert "顺着对方的话多聊两句" in scenario
+    assert "群里只接一句就走" not in scenario
+
+
+async def test_group_turn_injects_group_scenario_without_private_override(
+    logged_in: TestEnv,
+) -> None:
+    await logged_in.client.put(
+        "/v1/persona",
+        json={
+            "scenario_prompts": {
+                "private": "私聊里可以顺着对方的话多聊两句",
+                "group": "群里只接一句就走",
+            }
+        },
+    )
+    session_id, subject_id = await _window(logged_in, visibility="group_scope")
+    async with session_scope() as session:
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id,
+            window_id=session_id,
+            user_text="今天谁在",
+            is_group=True,
+        )
+    scenario = _lane_text(compiled, "scenario")
+    assert "群里只接一句就走" in scenario
+    assert "顺着对方的话多聊两句" not in scenario
+
+
+async def test_scenario_lane_uses_default_when_not_overridden(logged_in: TestEnv) -> None:
+    """没写覆盖时也要有提示——默认值不是文档，是要进提示词的。"""
+    from ling.domains.persona.scenarios import SCENARIO_BY_KEY
+
+    session_id, subject_id = await _window(logged_in)
+    async with session_scope() as session:
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id,
+            window_id=session_id,
+            user_text="嗨",
+            is_group=False,
+        )
+    assert "此刻的场景" in _lane_text(compiled, "scenario")
+    assert SCENARIO_BY_KEY["private"].default in _lane_text(compiled, "scenario")

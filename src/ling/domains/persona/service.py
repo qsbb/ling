@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.persona.scenarios import clean_overrides
 from ling.infra.models import Persona, utcnow
 
 DEFAULT_SYSTEM_PROMPT = """你是 ling，一个有自己的生活节奏、情绪和记忆的角色。
@@ -48,6 +49,9 @@ class PersonaView:
     system_prompt: str
     traits: dict
     boundaries: list[str]
+    # 只含**覆盖**，不含默认。读的地方一律走 `scenarios.effective_text()`，
+    # 否则"默认值改了，已有人设还念旧版"这种错会到处复制。
+    scenario_prompts: dict = field(default_factory=dict)
 
 
 class PersonaService:
@@ -66,6 +70,7 @@ class PersonaService:
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
                 traits=dict(DEFAULT_TRAITS),
                 boundaries=list(DEFAULT_BOUNDARIES),
+                scenario_prompts={},
                 published=True,
             )
             self._session.add(persona)
@@ -86,6 +91,7 @@ class PersonaService:
         system_prompt: str | None = None,
         traits: dict | None = None,
         boundaries: list[str] | None = None,
+        scenario_prompts: dict | None = None,
         persona_id: str | None = None,
     ) -> PersonaView:
         pid = persona_id or self._default_id
@@ -100,6 +106,11 @@ class PersonaService:
             persona.traits = dict(traits)
         if boundaries is not None:
             persona.boundaries = list(boundaries)
+        if scenario_prompts is not None:
+            # 整组替换，不是逐键合并：前端交上来的是"当前的全部覆盖"。
+            # 逐键合并会让"删掉这一条"无法表达——缺键既可能是"没改"
+            # 也可能是"清空"，两种意思在同一个 payload 里分不开。
+            persona.scenario_prompts = clean_overrides(scenario_prompts)
         persona.revision = int(persona.revision or 0) + 1
         persona.updated_at = utcnow()
         await self._session.flush()
@@ -119,6 +130,7 @@ class PersonaService:
             system_prompt=p.system_prompt,
             traits=dict(p.traits or {}),
             boundaries=list(p.boundaries or []),
+            scenario_prompts=dict(p.scenario_prompts or {}),
         )
 
 

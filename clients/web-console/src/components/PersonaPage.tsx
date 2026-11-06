@@ -20,10 +20,106 @@ import { explainError, type ExplainedError } from '../errors';
 import { formatSessionTime } from '../format';
 import { navigate, useLocationHref } from '../route';
 import { personaTabFromHref, personaTabHref, type PersonaTab } from '../tabs';
-import type { Persona, TimelineEvent } from '../types';
+import type { Persona, PersonaScenario, TimelineEvent } from '../types';
 import { DialoguePage } from './DialoguePage';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
 import { PageTabPanel, PageTabs, type PageTabSpec } from './PageTabs';
+
+/** 与服务端 `domains/persona/scenarios.py` 的 MAX_SCENARIO_CHARS 对齐。 */
+const MAX_SCENARIO_CHARS = 600;
+
+/**
+ * 把编辑中的草稿收成 PUT 的 payload。
+ *
+ * **空串不发送**：接口是整组替换语义，缺键就是"没有覆盖"，于是"清空"
+ * 和"恢复默认"是同一条路径。发送空串反而是另一种意思（服务端也会把它
+ * 丢掉），两种写法在日志里看起来一样、行为靠实现细节撑着，不值得。
+ */
+export function scenarioPayload(drafts: Record<string, string>): Record<string, string> {
+  const payload: Record<string, string> = {};
+  for (const [key, value] of Object.entries(drafts)) {
+    const text = value.trim();
+    if (text) payload[key] = text;
+  }
+  return payload;
+}
+
+/** 服务端给的覆盖 → 编辑草稿。默认值不进草稿：它由占位提示展示。 */
+export function scenarioDraftsFrom(persona: Persona): Record<string, string> {
+  return { ...(persona.scenario_prompts ?? {}) };
+}
+
+interface ScenarioEditorProps {
+  scenarios: PersonaScenario[];
+  drafts: Record<string, string>;
+  onChange: (key: string, value: string) => void;
+}
+
+/**
+ * 「场景处理」区：同一份人设，在不同场合该怎么处理。
+ *
+ * 空着的输入框不是"没写"，而是"用默认"——所以占位提示直接显示默认文本，
+ * 而不是放一句"请输入"。想看清默认到底写了什么，不应该需要先删掉自己的话。
+ */
+export function ScenarioEditor({ scenarios, drafts, onChange }: ScenarioEditorProps) {
+  const customCount = scenarios.filter(
+    (s) => (drafts[s.key] ?? '').trim().length > 0,
+  ).length;
+
+  return (
+    <div className="scenario-block">
+      <div className="scenario-block__head">
+        <h3>场景处理</h3>
+        <span className="panel__count">
+          {customCount > 0 ? `${customCount} 条自己写的` : '全部用默认'}
+        </span>
+      </div>
+      <p className="panel__note">
+        不同场合她该怎么做，会在这个场合真的出现时注入提示词。空着就用默认（灰色字），
+        写了自己的话按你写的来。
+      </p>
+      <div className="scenarios">
+        {scenarios.map((scenario) => {
+          const draft = drafts[scenario.key] ?? '';
+          const custom = draft.trim().length > 0;
+          return (
+            <div className="scenario" key={scenario.key}>
+              <div className="scenario__head">
+                <span className="scenario__label">{scenario.label}</span>
+                <span
+                  className={`scenario__state${custom ? ' scenario__state--custom' : ''}`}
+                >
+                  {custom ? '自己写的' : '默认'}
+                </span>
+                {custom ? (
+                  <button
+                    type="button"
+                    className="button button--small scenario__reset"
+                    onClick={() => onChange(scenario.key, '')}
+                    data-testid={`scenario-reset-${scenario.key}`}
+                  >
+                    恢复默认
+                  </button>
+                ) : null}
+              </div>
+              <p className="scenario__when">{scenario.when}</p>
+              <textarea
+                className="field__input field__textarea scenario__input"
+                rows={3}
+                maxLength={MAX_SCENARIO_CHARS}
+                aria-label={`${scenario.label}的处理方式`}
+                placeholder={scenario.default_text}
+                value={draft}
+                onChange={(event) => onChange(scenario.key, event.target.value)}
+                data-testid={`scenario-input-${scenario.key}`}
+              />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 interface PersonaPageProps {
   /** 离开本页（回对话）。 */
@@ -78,6 +174,8 @@ function PersonaSettings() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [traitsText, setTraitsText] = useState('{}');
   const [boundariesText, setBoundariesText] = useState('');
+  // 场景覆盖的编辑草稿：只有"自己写过"的键会出现在这里，默认值靠占位提示展示。
+  const [scenarioDrafts, setScenarioDrafts] = useState<Record<string, string>>({});
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -95,6 +193,7 @@ function PersonaSettings() {
       setSystemPrompt(current.system_prompt);
       setTraitsText(JSON.stringify(current.traits ?? {}, null, 2));
       setBoundariesText(current.boundaries.join('\n'));
+      setScenarioDrafts(scenarioDraftsFrom(current));
       setEvents(timeline.events);
     } catch (error) {
       setLoadError(explainError(error));
@@ -135,8 +234,10 @@ function PersonaSettings() {
         system_prompt: systemPrompt,
         traits,
         boundaries,
+        scenario_prompts: scenarioPayload(scenarioDrafts),
       });
       setPersona(updated);
+      setScenarioDrafts(scenarioDraftsFrom(updated));
       setMessage(`已保存为修订 #${updated.revision}，后续轮次立即生效`);
       const timeline = await api.timeline(50);
       setEvents(timeline.events);
@@ -233,6 +334,16 @@ function PersonaSettings() {
             onChange={(event) => setBoundariesText(event.target.value)}
           />
         </label>
+
+        {persona ? (
+          <ScenarioEditor
+            scenarios={persona.scenarios}
+            drafts={scenarioDrafts}
+            onChange={(key, value) =>
+              setScenarioDrafts((prev) => ({ ...prev, [key]: value }))
+            }
+          />
+        ) : null}
 
         {formError ? (
           <div className="banner banner--error" role="alert">

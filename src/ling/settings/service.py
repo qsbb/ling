@@ -28,6 +28,7 @@ from ling.ports.config import (
     MemoryPolicy,
     ProfileBinding,
     ProviderConfig,
+    ProviderModel,
 )
 
 KNOWN_PROVIDER_KINDS = {"fake", "openai_compatible", "local"}
@@ -163,6 +164,7 @@ class ConfigService:
                 secret_last4=raw.get("secret_last4", ""),
                 enabled=bool(raw.get("enabled", True)),
                 extra=dict(raw.get("extra") or {}),
+                models=_provider_models(raw.get("models")),
             )
         profiles: dict[str, ProfileBinding] = {}
         for raw in list(payload.get("profiles") or []):
@@ -234,6 +236,7 @@ class ConfigService:
                     "secret_last4": p.secret_last4,
                     "enabled": p.enabled,
                     "extra": dict(p.extra),
+                    "models": [m.to_dict() for m in p.models],
                 }
                 for p in base.providers.values()
             ],
@@ -280,6 +283,14 @@ class ConfigService:
                 if not pid:
                     continue
                 existing = merged.get(pid, {})
+                # 模型清单：**没传就是"没改"**，不能把旧清单清空。
+                # 旧版控制台 / 第三方客户端保存供应商时不会带 models，
+                # 若按 pydantic 默认值 [] 处理，一次无关的保存就会把目录清掉。
+                models = (
+                    _clean_models(raw["models"])
+                    if "models" in raw
+                    else list(existing.get("models", []))
+                )
                 # 密钥字段不由前端传入；保留库中已知状态
                 merged[pid] = {
                     "provider_id": pid,
@@ -289,6 +300,7 @@ class ConfigService:
                     "secret_last4": existing.get("secret_last4", ""),
                     "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
                     "extra": dict(raw.get("extra", existing.get("extra", {}))),
+                    "models": models,
                 }
             current_payload["providers"] = list(merged.values())
 
@@ -373,6 +385,43 @@ class ConfigService:
                         )
                     )
 
+            # 模型清单：空 id 是错误（前端不会提交，但 API 可能）；
+            # 重复 id 在 `_clean_models` 里已按"最后一条生效"归一化，
+            # 所以这里只需要拦住空值。
+            models = cfg.get("models") or []
+            if not isinstance(models, list):
+                issues.append(
+                    ValidationIssue(f"providers.{pid}.models", "models 必须是数组")
+                )
+            else:
+                for index, model in enumerate(models):
+                    if not isinstance(model, dict) or not str(
+                        model.get("model_id", "")
+                    ).strip():
+                        issues.append(
+                            ValidationIssue(
+                                f"providers.{pid}.models[{index}].model_id",
+                                "模型 ID 不能为空",
+                            )
+                        )
+
+        # 同一时刻只启用一家：这是设置页的默认心智模型（另一家留着备用，
+        # 而不是同时分流）。做成 warning 而不是 error，是因为跨供应商回退
+        # 需要两家都启用；直接阻断会让已有配置无法再保存。
+        enabled_providers = [
+            pid for pid, cfg in providers.items() if cfg.get("enabled", True)
+        ]
+        if len(enabled_providers) > 1:
+            issues.append(
+                ValidationIssue(
+                    "providers",
+                    f"同时启用了 {len(enabled_providers)} 家供应商"
+                    f"（{'、'.join(enabled_providers)}）。同一时刻只建议启用一家；"
+                    "只有在配置跨供应商回退时才需要多家同时启用。",
+                    severity="warning",
+                )
+            )
+
         seen_profiles: set[str] = set()
         for raw in payload.get("profiles", []):
             prof = raw.get("profile", "")
@@ -393,6 +442,32 @@ class ConfigService:
                     ValidationIssue(
                         f"profiles.{prof}.provider_id",
                         "非测试模式下不能把职责绑定到 fake provider（会冒充模型能力）",
+                    )
+                )
+            # 停用 ≠ 解绑：旧绑定还在，调用会失败。发布时不拦（用户可能
+            # 只是临时停用再切回来），但必须在设置页说清"需要检查"。
+            if not providers[pid].get("enabled", True):
+                issues.append(
+                    ValidationIssue(
+                        f"profiles.{prof}.provider_id",
+                        f"供应商 {pid} 已停用，这个职责调用时会失败",
+                        severity="warning",
+                    )
+                )
+            registered = {
+                str(m.get("model_id", "")).strip(): m
+                for m in providers[pid].get("models") or []
+                if isinstance(m, dict)
+            }
+            bound_model = (raw.get("model_id") or "").strip()
+            if bound_model and bound_model in registered and not registered[
+                bound_model
+            ].get("enabled", True):
+                issues.append(
+                    ValidationIssue(
+                        f"profiles.{prof}.model_id",
+                        f"模型 {bound_model} 已在 {pid} 的清单里停用，这个职责仍指向它",
+                        severity="warning",
                     )
                 )
             if not (raw.get("model_id") or "").strip():
@@ -435,6 +510,14 @@ class ConfigService:
                         ValidationIssue(
                             f"profiles.{prof}.fallback_provider_id",
                             "非测试模式下不能用 fake provider 作为回退（会冒充模型能力）",
+                        )
+                    )
+                elif not providers[fb_pid].get("enabled", True):
+                    issues.append(
+                        ValidationIssue(
+                            f"profiles.{prof}.fallback_provider_id",
+                            f"回退供应商 {fb_pid} 已停用，回退不会生效",
+                            severity="warning",
                         )
                     )
                 if not (raw.get("fallback_model_id") or "").strip():
@@ -723,6 +806,55 @@ _LIFE_BOUNDS: dict[str, tuple[float, float]] = {
     "social_load_decay_per_hour": (0.0, 100.0),
     "max_live_plans": (1, 20),
 }
+
+
+def _clean_models(raw: object) -> list[dict[str, object]]:
+    """把模型清单归一化成可以写进修订 payload 的形状。
+
+    规则（都是为了让"同一份清单"在前后端是同一个东西）：
+
+    - 兼容旧客户端直接传 ``["m1", "m2"]``；
+    - ``model_id`` / ``note`` 去首尾空白，note 最多 200 字；
+    - 同一个 id 只留最后一条——重名不会变成两行幽灵条目；
+    - ``enabled`` 只认显式的 ``false``，其余都当启用；
+    - 空 id **保留**，交给 ``validate_payload`` 报错，不静默吞掉。
+    """
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict[str, object]] = []
+    index: dict[str, int] = {}
+    for item in raw:
+        if isinstance(item, str):
+            item = {"model_id": item}
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("model_id", "") or "").strip()
+        entry: dict[str, object] = {
+            "model_id": model_id,
+            "note": str(item.get("note", "") or "").strip()[:200],
+            "enabled": item.get("enabled", True) is not False,
+        }
+        if model_id and model_id in index:
+            cleaned[index[model_id]] = entry
+        elif model_id:
+            index[model_id] = len(cleaned)
+            cleaned.append(entry)
+        else:
+            cleaned.append(entry)
+    return cleaned
+
+
+def _provider_models(raw: object) -> tuple[ProviderModel, ...]:
+    """修订 payload → 生效快照里的模型清单（空 id 不进入运行期快照）。"""
+    return tuple(
+        ProviderModel(
+            model_id=str(item["model_id"]),
+            note=str(item.get("note", "")),
+            enabled=bool(item.get("enabled", True)),
+        )
+        for item in _clean_models(raw)
+        if item["model_id"]
+    )
 
 
 def _clamp_in(

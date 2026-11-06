@@ -122,6 +122,7 @@ async def _choose_by_autonomy(
         AutonomyTurnService,
         make_persona_reader,
         make_situation_reader,
+        scenario_key_for,
     )
 
     return await AutonomyTurnService(
@@ -134,7 +135,9 @@ async def _choose_by_autonomy(
             subject_id=subject_id,
         ),
         persona_reader=make_persona_reader(
-            config_session, persona_id=__import__("ling.config", fromlist=["get_settings"]).get_settings().persona_id
+            config_session,
+            persona_id=__import__("ling.config", fromlist=["get_settings"]).get_settings().persona_id,
+            scenario=scenario_key_for(ctx),  # type: ignore[arg-type]
         ),
     ).choose(ctx, text=text)  # type: ignore[arg-type]
 

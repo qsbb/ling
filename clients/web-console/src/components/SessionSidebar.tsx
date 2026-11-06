@@ -57,6 +57,12 @@ export function SessionSidebar({
     setEditingId(null);
   };
 
+  // 空气泡是新建后没说话的会话。留着它们只会把真对话挤出视野，
+  // 所以除当前这条正在看以外，不占列表位置（消息还被服务端留着）。
+  const visible = sessions.filter(
+    (session) => session.message_count > 0 || session.session_id === currentId,
+  );
+
   return (
     <div className={`sidebar ${open ? 'sidebar--open' : ''}`} aria-label="会话列表">
       <button type="button" className="sidebar__scrim" aria-label="关闭会话列表" onClick={onClose} />
@@ -76,10 +82,10 @@ export function SessionSidebar({
         </button>
 
         <nav className="sidebar__list" aria-label="我的会话">
-          {sessions.length === 0 ? (
+          {visible.length === 0 ? (
             <p className="sidebar__empty">还没有会话</p>
           ) : (
-            sessions.map((session) => {
+            visible.map((session) => {
               const active = session.session_id === currentId;
               const editing = editingId === session.session_id;
               return (

@@ -81,6 +81,9 @@ DEFAULT_BUDGETS: dict[str, int] = {
     "goals": 800,
     "capabilities": 300,
     "constraints": 1200,
+    # 场景提示是**补丁**：一段话说明"此刻这种场合怎么处理"。给多了它就会
+    # 和人格车道抢预算，而它本来就该是短句。
+    "scenario": 600,
 }
 
 
@@ -216,6 +219,26 @@ class ContextCompiler:
                 token_budget=DEFAULT_BUDGETS["constraints"],
             )
         )
+
+        # 场景提示：只有"此刻真的成立"的那一条进来。
+        #
+        # 回复路径只知道私聊/群聊（`is_group`）；"被点名/没被点名"是**要不要
+        # 开口**的判断，走 `kernel/autonomy.py` 的决策提示，不在这里。两条路
+        # 各注入各的，避免同一段话进两次提示词。
+        from ling.domains.persona.scenarios import render
+
+        scenario_key = "group" if is_group else "private"
+        scenario_text = render(getattr(persona, "scenario_prompts", None), scenario_key)
+        if scenario_text:
+            contributions.append(
+                ContextContribution(
+                    lane="scenario",
+                    text=f"此刻的场景：{scenario_text}",
+                    origin=Origin.user_statement,
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["scenario"],
+                )
+            )
 
         # --- 统一取数出口（隐私边界在此）---
         # 所有进入模型输入的内容都经 AudienceSnapshot 裁决：

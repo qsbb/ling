@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
@@ -9,6 +11,7 @@ from ling.api.deps import ConfigDep, CurrentAuth, RouterDep
 from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
+from ling.infra.models import utcnow
 from ling.settings.service import PROFILE_DEGRADATIONS, RESERVED_PROFILES
 
 router = APIRouter(tags=["settings"])
@@ -30,12 +33,22 @@ _OFFERABLE_PROFILES: tuple[str, ...] = (
 )
 
 
+class ModelIn(BaseModel):
+    """供应商目录里的一项。服务端只存，不用它做路由白名单。"""
+
+    model_id: str = Field(min_length=1, max_length=200)
+    note: str = Field(default="", max_length=200)
+    enabled: bool = True
+
+
 class ProviderIn(BaseModel):
     provider_id: str = Field(min_length=1, max_length=64)
     kind: str = "fake"
     base_url: str | None = None
     enabled: bool = True
     extra: dict = Field(default_factory=dict)
+    # 不传 = 不改动已有清单（见 `save_draft` 路由的 exclude_unset）。
+    models: list[ModelIn] = Field(default_factory=list)
 
 
 class ProfileIn(BaseModel):
@@ -164,6 +177,7 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
                 "secret_last4": status["last4"],
                 "secret_fingerprint": status["fingerprint"],
                 "extra": p.extra,
+                "models": [m.to_dict() for m in p.models],
             }
         )
     return {
@@ -249,7 +263,13 @@ async def save_draft(
     body: DraftBody, auth: CurrentAuth, config: ConfigDep
 ) -> dict[str, object]:
     result = await config.save_draft(
-        providers=[p.model_dump() for p in body.providers] if body.providers else None,
+        # exclude_unset：老客户端不带 models 时表示"别动清单"，
+        # 而不是用默认值 [] 把已保存的模型目录清空。
+        providers=(
+            [p.model_dump(exclude_unset=True) for p in body.providers]
+            if body.providers
+            else None
+        ),
         profiles=[p.model_dump() for p in body.profiles] if body.profiles else None,
         test_mode=body.test_mode,
         log_access_denials=body.log_access_denials,
@@ -355,13 +375,25 @@ async def probe_provider(
     provider_id: str, auth: CurrentAuth, config: ConfigDep, router_: RouterDep
 ) -> dict[str, object]:
     effective = await config.effective()
+    started = time.monotonic()
     result = await router_.probe(effective, provider_id)
+    # 有的 provider 自己量了延迟（fake 是 0），有的没有（OpenAI 兼容接口的
+    # probe 只拉 /models）。没有就由路由补上整次探测的墙钟时间——界面要显示
+    # 「多少毫秒」，null 会变成「null 毫秒」。
+    latency_ms = (
+        result.latency_ms
+        if result.latency_ms is not None
+        else int((time.monotonic() - started) * 1000)
+    )
     return {
         "provider_id": provider_id,
         "ok": result.ok,
         "detail": result.detail,
-        "latency_ms": result.latency_ms,
+        "latency_ms": latency_ms,
         "models": result.models,
+        # 探测是**只读**的：不写修订、也不会把结果变成新的配置。
+        # 时间戳只用于界面标注"这次检查发生在什么时候"。
+        "checked_at": utcnow().isoformat(),
     }
 
 

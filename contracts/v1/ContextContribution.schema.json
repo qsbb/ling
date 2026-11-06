@@ -44,7 +44,8 @@
         "media",
         "goals",
         "capabilities",
-        "constraints"
+        "constraints",
+        "scenario"
       ],
       "title": "Lane",
       "type": "string"
