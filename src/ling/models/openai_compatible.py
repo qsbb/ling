@@ -73,8 +73,11 @@ class OpenAICompatibleProvider:
             "model": request.model_id,
             "messages": [_encode_message(m) for m in request.messages],
             "stream": True,
-            "temperature": request.temperature,
         }
+        # 温度只在调用方明确给了才发：默认不发，让上游用自己的默认值。
+        # 各家为对话调好的默认值通常比我们统一填一个 0.8 更合适。
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
         if request.max_tokens:
             payload["max_tokens"] = request.max_tokens
         if request.profile.startswith("dialogue"):

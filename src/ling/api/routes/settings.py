@@ -49,19 +49,27 @@ class ProviderIn(BaseModel):
     extra: dict = Field(default_factory=dict)
     # 不传 = 不改动已有清单（见 `save_draft` 路由的 exclude_unset）。
     models: list[ModelIn] = Field(default_factory=list)
+    # 传输与额度属于**供应商**：同一家下面所有职责共用一份超时和额度。
+    # -1 = 不限制（前端留空时也提交 -1，见 ProvidersPanel）。
+    timeout_seconds: float = 60.0
+    max_output_tokens: int | None = None
+    daily_token_limit: int | None = None
 
 
 class ProfileIn(BaseModel):
+    """一个职责绑定：只回答"交给哪家供应商的哪个模型"。
+
+    超时 / 输出上限 / 日额度**不在这里**：它们是供应商的属性
+    （见 ``ProviderIn``）。旧客户端可能仍会带这几个键，pydantic 默认忽略
+    未知字段，所以不会因此 422，也不会悄悄覆盖供应商的设置。
+    """
+
     profile: str
     provider_id: str
     model_id: str
     fallback_provider_id: str | None = None
     fallback_model_id: str | None = None
     enabled: bool = True
-    temperature: float = 0.8
-    max_tokens: int | None = None
-    timeout_seconds: float = 60.0
-    daily_cost_limit: float | None = None
 
 
 class MemoryPolicyIn(BaseModel):
@@ -178,6 +186,9 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
                 "secret_fingerprint": status["fingerprint"],
                 "extra": p.extra,
                 "models": [m.to_dict() for m in p.models],
+                "timeout_seconds": p.timeout_seconds,
+                "max_output_tokens": p.max_output_tokens,
+                "daily_token_limit": p.daily_token_limit,
             }
         )
     return {
@@ -222,10 +233,6 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
                 "fallback_provider_id": b.fallback_provider_id,
                 "fallback_model_id": b.fallback_model_id,
                 "enabled": b.enabled,
-                "temperature": b.temperature,
-                "max_tokens": b.max_tokens,
-                "timeout_seconds": b.timeout_seconds,
-                "daily_cost_limit": b.daily_cost_limit,
             }
             for b in effective.profiles.values()
         ],
@@ -240,7 +247,7 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             }
             for r in revisions
         ],
-        "known_kinds": ["fake", "openai_compatible", "local"],
+        "known_kinds": ["fake", "openai_compatible", "anthropic", "chat_responses", "local"],
         # 只列出**绑定后真的会生效**的角色。
         # 保留角色见 settings/service.py::RESERVED_PROFILES，
         # 它们绑定了没有任何效果，展示出来等于承诺不存在的能力。
@@ -424,6 +431,30 @@ async def model_health(
         "profiles": {
             name: {"provider_id": b.provider_id, "model_id": b.model_id, "enabled": b.enabled}
             for name, b in effective.profiles.items()
+        },
+    }
+
+
+@router.get("/settings/usage")
+async def provider_usage(
+    request: Request, auth: CurrentAuth, config: ConfigDep
+) -> dict[str, object]:
+    """今天各供应商已用了多少 token。
+
+    单独一条端点、单独一次查询，而不是塞进 ``/settings/config``：那条会被
+    前端在每次保存后重读，用量却每轮对话都在变，混在一起会让"配置变了"
+    和"数字变了"分不清。
+    """
+    store = getattr(request.app.state, "quota", None)
+    if store is None:
+        return {"day": None, "usage": {}}
+    effective = await config.effective()
+    snapshot = await store.snapshot(list(effective.providers))
+    return {
+        "day": store.today().isoformat(),
+        "usage": snapshot,
+        "limits": {
+            pid: cfg.daily_limit_effective() for pid, cfg in effective.providers.items()
         },
     }
 

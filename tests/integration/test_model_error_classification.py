@@ -87,6 +87,7 @@ async def test_provider_401_raises_auth_kind() -> None:
             provider_id="fake401",
             base_url=f"http://127.0.0.1:{port}",
             api_key="sk-not-valid",
+            # 这个超时是 provider 自己的（连接层），不是职责绑定的那一个。
             timeout_seconds=5.0,
         )
         request = ModelRequest(

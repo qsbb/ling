@@ -51,6 +51,11 @@ function blockingErrors(issues: ValidationIssue[]): ValidationIssue[] {
 export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const [config, setConfig] = useState<SettingsConfig | null>(null);
   const [health, setHealth] = useState<ModelHealthResponse | null>(null);
+  // 今日 token 用量。取不到就是空对象：额度显示是锦上添花，
+  // 不该因为这条端点失败而让整个设置页打不开。
+  const [usage, setUsage] = useState<
+    Record<string, { day: string; used_tokens: number; estimated: boolean }>
+  >({});
   const [providers, setProviders] = useState<ProviderDraftInput[]>([]);
   const [profiles, setProfiles] = useState<ProfileDraftInput[]>([]);
   const [testMode, setTestMode] = useState(false);
@@ -63,19 +68,24 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const [message, setMessage] = useState<PanelMessage | null>(null);
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // 职责页一次只展开一行：展开 A 再点 B，A 自动收起。
+  // 这样"其余四行的状态仍在视野里"才成立——同时开五行等于回到卡片堆。
+  const [openRole, setOpenRole] = useState<string | null>(null);
   const [revisionBusy, setRevisionBusy] = useState<number | null>(null);
 
   const loadConfig = useCallback(
     async (resetDrafts: boolean) => {
       setLoadError(null);
       try {
-        const [nextConfig, nextHealth] = await Promise.all([
+        const [nextConfig, nextHealth, nextUsage] = await Promise.all([
           api.settingsConfig(),
           // 健康度是锦上添花：接口失败不该让整页打不开。
           api.settingsHealth().catch(() => null),
+          api.settingsUsage().catch(() => null),
         ]);
         setConfig(nextConfig);
         setHealth(nextHealth);
+        setUsage(nextUsage?.usage ?? {});
         if (resetDrafts) {
           const drafts = nextConfig.providers.map(toProviderDraft);
           setProviders(drafts);
@@ -381,6 +391,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
           logDenials={logDenials}
           onTestMode={setTestMode}
           onLogDenials={setLogDenials}
+          usage={usage}
         />
       </div>
 
@@ -393,6 +404,10 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
           dirtyCount={rolesDirty}
           saving={saving}
           onPatchProfile={patchProfile}
+          openRole={openRole}
+          onToggleRole={(profile) =>
+            setOpenRole((current) => (current === profile ? null : profile))
+          }
           onDiscard={discardRoles}
           onSave={() => void save()}
           onGoProviders={(providerId) => {

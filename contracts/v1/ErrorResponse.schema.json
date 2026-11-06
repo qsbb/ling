@@ -65,6 +65,7 @@
         "unsupported_capability",
         "config_invalid",
         "secret_missing",
+        "quota_exhausted",
         "internal"
       ],
       "title": "ErrorCode",

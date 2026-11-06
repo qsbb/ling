@@ -538,6 +538,46 @@ async function runDesktop(browser) {
   ok('桌面：/settings/* 让「设置」高亮（子页不再无归属）');
   await shot(page, 'desktop-02-settings-highlight');
 
+  // 模型设置页的两个**位置性**约定。这两条都曾经是"改完就退回旧样子"
+  // 的地方，用浏览器实测钉住：
+  //   1. 「高级配置」必须在模型清单**下方**（先答"有哪些模型"，
+  //      再答"怎么连、能用多少"）；
+  //   2. 「单次输出上限 / 日限额」清空后显示灰色 -1（不限制），
+  //      而不是留一个空框让人猜。
+  await gotoPage(page, '/settings/model');
+  await page.waitForSelector('.ms-card', { timeout: 20_000 });
+  const advLayout = await page.evaluate(() => {
+    const adv = document.querySelector('.ms-adv');
+    const models = document.querySelector('.ms-models');
+    if (!adv || !models) return { present: false };
+    return {
+      present: true,
+      advTop: adv.getBoundingClientRect().top,
+      modelsTop: models.getBoundingClientRect().top,
+    };
+  });
+  assert(advLayout.present, '模型设置页没有渲染「高级配置」或模型清单');
+  assert(
+    advLayout.advTop > advLayout.modelsTop,
+    `「高级配置」应排在模型清单下方：advanced.top=${Math.round(advLayout.advTop)} models.top=${Math.round(advLayout.modelsTop)}`,
+  );
+  ok('桌面：高级配置排在模型清单下方');
+
+  const limits = await page.evaluate(() =>
+    [...document.querySelectorAll('.ms-adv input')].map((input) => ({
+      value: input.value,
+      placeholder: input.placeholder,
+    })),
+  );
+  assert(limits.length === 3, `高级配置应有 3 个输入，实际 ${limits.length}`);
+  for (const limit of limits.slice(1)) {
+    assert(
+      limit.placeholder === '-1',
+      `额度输入框的虚字应为 -1（不限制），实际「${limit.placeholder}」`,
+    );
+  }
+  ok('桌面：输出上限与日限额的虚字是 -1', limits.map((l) => `${l.value || '∅'}(${l.placeholder})`).join(' / '));
+
   // 旧路径 /settings/memory 的例外：URL 前缀是 /settings，显示的是记忆页内容，
   // 所以高亮「记忆」——按内容归类，而不是按地址栏前缀归类。
   await gotoPage(page, '/settings/memory');

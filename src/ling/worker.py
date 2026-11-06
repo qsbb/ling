@@ -84,8 +84,15 @@ async def init_memory_router() -> bool:
             for pid in list(_SECRET_CACHE):
                 if pid not in enabled:
                     _SECRET_CACHE.pop(pid, None)
+        # 记忆提炼走的是同一家供应商，也就该记同一份额度——否则 worker
+        # 这边用的 token 不计数，用户在设置页看到的"今日已用"会偏小，
+        # 而额度判断却在 api 进程里按那个偏小的数放行。
+        from ling.infra.db import get_session_factory
+        from ling.models.quota import TokenQuotaStore
+
         _MEMORY_ROUTER = ModelRouter(
-            ProviderRegistry(lambda pid: _SECRET_CACHE.get(pid))
+            ProviderRegistry(lambda pid: _SECRET_CACHE.get(pid)),
+            TokenQuotaStore(get_session_factory(), timezone=settings.user_timezone),
         )
         _SECRET_CACHE_REVISION = revision
         logger.info(

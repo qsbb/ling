@@ -104,8 +104,22 @@ export interface ProviderView {
   secret_fingerprint: string;
   extra: Record<string, unknown>;
   models: ProviderModel[];
+  /**
+   * 传输与额度属于**供应商**：同一家下面所有职责共用一份。
+   * `-1`（或 null）= 不限制。
+   */
+  timeout_seconds: number;
+  max_output_tokens: number | null;
+  daily_token_limit: number | null;
 }
 
+/**
+ * 一个职责绑定：只回答"交给哪家供应商的哪个模型"。
+ *
+ * 超时 / 输出上限 / 日额度**不在这里**——它们在 `ProviderView` 上。
+ * 原来这四项挂在这里，同一家供应商下的五个职责各有各的一份，
+ * 改一次要改五处，而且默认值会悄悄盖掉供应商的设置。
+ */
 export interface ProfileView {
   profile: string;
   provider_id: string;
@@ -113,10 +127,6 @@ export interface ProfileView {
   fallback_provider_id: string | null;
   fallback_model_id: string | null;
   enabled: boolean;
-  temperature: number;
-  max_tokens: number | null;
-  timeout_seconds: number;
-  daily_cost_limit: number | null;
 }
 
 export interface RevisionView {
@@ -302,6 +312,11 @@ export interface ProviderDraftInput {
   extra?: Record<string, unknown>;
   /** 不传 = 不改动服务端已有清单；新建供应商时传 []。 */
   models?: ProviderModel[];
+  timeout_seconds: number;
+  /** `-1` = 不限制（输入框留空时提交 -1）。 */
+  max_output_tokens: number | null;
+  /** `-1` = 不限制。 */
+  daily_token_limit: number | null;
 }
 
 export interface ProfileDraftInput {
@@ -311,10 +326,6 @@ export interface ProfileDraftInput {
   fallback_provider_id: string | null;
   fallback_model_id: string | null;
   enabled: boolean;
-  temperature: number;
-  max_tokens: number | null;
-  timeout_seconds: number;
-  daily_cost_limit: number | null;
 }
 
 /* ---------------------------------------------------------------- 角色 */

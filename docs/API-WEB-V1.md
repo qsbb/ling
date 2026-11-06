@@ -93,13 +93,23 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | PUT | `/v1/settings/providers/{provider_id}/secret` | `{secret}` → `{last4, fingerprint}`（永不回显原文） |
 | DELETE | `/v1/settings/providers/{provider_id}/secret` | 删除凭据 |
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
+| GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
 
-`providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4, ...}`。
+`providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4,
+timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
+`kind` 取值：`fake | openai_compatible | anthropic | chat_responses | local`。
 `models[]` 每项：`{model_id, note, enabled}`——它是**给人看的目录**，不是路由白名单：
 停用的模型不会出现在新的职责绑定下拉里，但已绑定的职责仍会按原样调用。
 
+**传输与额度属于供应商，不属于职责**：`timeout_seconds`（秒，1~600）、
+`max_output_tokens`、`daily_token_limit` 三项对这家供应商下的所有模型生效。
+后两项填 `-1` 表示不限制；日额度按**本地日历日**累计，见
+`GET /v1/settings/usage`。
+
 `profiles[]` 每项：`{profile, provider_id, model_id, fallback_provider_id?, fallback_model_id?,
-enabled, temperature, max_tokens?, timeout_seconds, daily_cost_limit?}`。
+enabled}`。原来这里的 `temperature / max_tokens / timeout_seconds / daily_cost_limit`
+已经移除：前三项跟着供应商走，温度改为**不发送**（用上游模型自己的默认值）。
+旧客户端仍可带这些键，服务端会忽略。
 
 `log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
 **只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过

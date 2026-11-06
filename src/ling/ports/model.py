@@ -17,6 +17,13 @@ from typing import Protocol, runtime_checkable
 class ProviderKind(StrEnum):
     fake = "fake"
     openai_compatible = "openai_compatible"
+    # Anthropic 原生 Messages API（``/v1/messages``）。与 OpenAI 兼容接口
+    # 的差别不只是路径：请求体、SSE 事件名、system 的位置、图片编码都不同，
+    # 所以必须是一个独立适配器，而不是给兼容接口换个 base_url 就能顶替。
+    anthropic = "anthropic"
+    # OpenAI 的 Responses API（``/v1/responses``）。同样不是 /chat/completions
+    # 的别名：事件流、输入结构、用量字段都不同。
+    chat_responses = "chat_responses"
     local = "local"
 
 
@@ -56,7 +63,12 @@ class ModelRequest:
 
     model_id: str
     messages: list[ChatMessageIn]
-    temperature: float = 0.8
+    # ``None`` = **不发送**这个字段，让上游用自己的默认温度。
+    #
+    # 原来是固定 0.8：那时它是职责绑定里的可调项。现在温度不再是可配置项
+    # （改它只影响措辞，不影响成本与能力，而各家默认值本来就是为对话调好的），
+    # 所以默认**不发**，而不是继续发一个我们自己编的数字。
+    temperature: float | None = None
     max_tokens: int | None = None
     # 追踪与复现：记录到 turn 上，便于审计“为什么这样说”
     profile: str = "dialogue.fast"
@@ -82,6 +94,10 @@ class ModelErrorKind(StrEnum):
     auth = "unauthorized"
     missing_secret = "secret_missing"
     unsupported = "unsupported_capability"
+    # 这一家供应商今天的 token 额度用完了。**必须与 error 分开**：
+    # 它不是故障（换一家、等明天都能好），而"provider 出错"会让用户去
+    # 检查密钥和地址，方向完全错。
+    quota_exhausted = "quota_exhausted"
 
 
 class ModelError(Exception):

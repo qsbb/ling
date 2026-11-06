@@ -166,8 +166,9 @@ useEffect(() => {
 │   └─ 声音呈现 ····· 语速·音色·何时发语音而非文字
 ├─③ 模型与生成 ────────────── 改「谁来算」
 │   ├─ 职责绑定 ····· ModelRole 全集（见 §6）
-│   ├─ 供应商与凭证 · provider(fake/openai_compatible/local) + 密钥
-│   └─ 推理与回退 ··· temperature·max_tokens·fallback 顺序
+│   ├─ 供应商与凭证 · provider(fake/openai_compatible/anthropic/chat_responses/local) + 密钥
+│   └─ 推理与回退 ··· 超时·单次输出上限·日额度（均按供应商，-1=不限制）·fallback 顺序
+│                      （温度不再是配置项：请求不发该字段，用上游默认值）
 ├─④ 记忆与学习 ────────────── 改「它记住/学会什么」
 │   ├─ 记忆形成 ····· 抽取阈值·保留期·压缩级联
 │   ├─ 召回 ········· top_k·融合权重·重排开关

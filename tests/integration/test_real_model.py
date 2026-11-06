@@ -46,6 +46,8 @@ async def _publish_real_profile(env: TestEnv) -> None:
                     "kind": "openai_compatible",
                     "base_url": BASE_URL,
                     "enabled": True,
+                    # 超时现在属于供应商，不再是职责绑定的一项。
+                    "timeout_seconds": 90,
                 }
             ],
             # 非测试模式下所有已绑定的对话职责都必须指向真实供应商，
@@ -55,8 +57,6 @@ async def _publish_real_profile(env: TestEnv) -> None:
                     "profile": profile,
                     "provider_id": "real",
                     "model_id": MODEL_ID,
-                    "temperature": 0.7,
-                    "timeout_seconds": 90,
                 }
                 for profile in ("dialogue.fast", "dialogue.deep", "dialogue.group")
             ],
@@ -150,6 +150,8 @@ async def test_bad_key_surfaces_actionable_error(logged_in: TestEnv) -> None:
                     "kind": "openai_compatible",
                     "base_url": BASE_URL,
                     "enabled": True,
+                    # 超时现在属于供应商，不再是职责绑定的一项。
+                    "timeout_seconds": 90,
                 }
             ],
             "profiles": [
@@ -157,7 +159,6 @@ async def test_bad_key_surfaces_actionable_error(logged_in: TestEnv) -> None:
                     "profile": profile,
                     "provider_id": "real",
                     "model_id": MODEL_ID,
-                    "timeout_seconds": 30,
                 }
                 for profile in ("dialogue.fast", "dialogue.deep", "dialogue.group")
             ],

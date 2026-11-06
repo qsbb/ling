@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import sqlalchemy as sa
 from sqlalchemy import (
@@ -335,6 +335,44 @@ class ProviderCredential(Base):
     ciphertext: Mapped[str] = mapped_column(Text)
     last4: Mapped[str] = mapped_column(String(8), default="")
     fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProviderTokenUsage(Base):
+    """供应商当日已用 token。一行 = 一家供应商 + 一个本地日。
+
+    ## 为什么单独一张表，而不是塞进 config_revisions 的 payload
+
+    用量是**运行事实**，不是配置。塞进修订里会让每次调用都写一条新修订，
+    修订历史会被用量刷成噪音，而回滚一份旧修订会连带把用量"回滚"掉。
+
+    ## 为什么主键是 (provider_id, day)
+
+    额度是"这家今天能用多少"。按职责分行会让同一家出现五行，加起来才是真实
+    消耗——而任何一行单独看都不完整，超限判断必须先求和，那是每轮调用都要
+    多一次聚合。用复合主键让"读一次就是全部"。
+
+    ## 为什么 day 是 DATE 而不是时间戳
+
+    额度按**本地日历日**清零（`ling.models.quota.local_day`）。存日期而不是
+    时间戳，是为了让"跨天"这件事只是一次主键失配，不需要任何清理任务。
+
+    ``estimated=True`` 表示这一格里有调用没拿到供应商的 usage 回执，数值来自
+    本地估算。显示时必须区分，否则用户会把估算值当成账单。
+    """
+
+    __tablename__ = "provider_token_usage"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "day", name="uq_provider_token_day"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String(64), index=True)
+    day: Mapped[date] = mapped_column(sa.Date, index=True)
+    tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -1546,6 +1584,7 @@ __all__ = [
     "OutboxEvent",
     "Persona",
     "ProviderCredential",
+    "ProviderTokenUsage",
     "Subject",
     "Turn",
     "User",

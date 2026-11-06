@@ -293,6 +293,14 @@ export const api = {
       { method: 'POST' },
     );
   },
+  /** 今日各供应商已用 token。取不到时页面照常工作，只是不显示用量。 */
+  settingsUsage(): Promise<{
+    day: string | null;
+    usage: Record<string, { day: string; used_tokens: number; estimated: boolean }>;
+    limits: Record<string, number | null>;
+  }> {
+    return request('/v1/settings/usage');
+  },
   /** 最近调用健康度：键是 `provider_id/model_id`，不含错误原文。 */
   settingsHealth(): Promise<ModelHealthResponse> {
     return request<ModelHealthResponse>('/v1/settings/health');

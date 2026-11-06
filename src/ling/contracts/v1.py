@@ -172,6 +172,7 @@ class ErrorCode(StrEnum):
     unsupported_capability = "unsupported_capability"
     config_invalid = "config_invalid"
     secret_missing = "secret_missing"
+    quota_exhausted = "quota_exhausted"
     internal = "internal"
 
 

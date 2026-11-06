@@ -419,7 +419,6 @@ def _fast_config():
         profiles={
             "dialogue.fast": ProfileBinding(
                 profile="dialogue.fast", provider_id="fake", model_id="deterministic",
-                timeout_seconds=20.0,
             )
         },
         test_mode=True,

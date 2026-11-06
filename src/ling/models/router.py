@@ -14,8 +14,9 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from ling.models.quota import TokenQuotaStore, estimate_tokens_for
 from ling.models.registry import ProviderRegistry, UnknownProviderError
-from ling.ports.config import EffectiveConfig, ProfileBinding
+from ling.ports.config import EffectiveConfig, ProfileBinding, ProviderConfig
 from ling.ports.model import (
     ChatMessageIn,
     ModelChunk,
@@ -60,9 +61,17 @@ class ModelRouter:
     BREAKER_THRESHOLD = 3
     BREAKER_COOLDOWN_SECONDS = 20.0
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(
+        self,
+        registry: ProviderRegistry,
+        quota: TokenQuotaStore | None = None,
+    ) -> None:
         self._registry = registry
         self._health: dict[str, HealthRecord] = {}
+        # 额度记账是可选的：worker 的记忆提炼、单元测试与离线脚本里没有
+        # 数据库会话，也不该为了"记个数"去连库。没有 quota 时行为与从前一致
+        # （不限额），而不是偷偷按某个默认值拦调用。
+        self._quota = quota
 
     # ---------------------------------------------------------- 解析
 
@@ -87,13 +96,12 @@ class ModelRouter:
             return binding
         if not binding.fallback_provider_id or not binding.fallback_model_id:
             return None
+        # 回退候选只换"谁"，不换超时/额度：那些跟着 provider 走，
+        # 由 `_request_for` 从 ProviderConfig 里取。
         return ProfileBinding(
             profile=binding.profile,
             provider_id=binding.fallback_provider_id,
             model_id=binding.fallback_model_id,
-            temperature=binding.temperature,
-            max_tokens=binding.max_tokens,
-            timeout_seconds=binding.timeout_seconds,
         )
 
     def _provider(self, config: EffectiveConfig, binding: ProfileBinding) -> ModelProvider:
@@ -111,6 +119,61 @@ class ModelRouter:
                 retriable=False,
             )
         return provider
+
+    # ---------------------------------------------------------- 额度
+
+    async def _quota_block(self, pcfg: ProviderConfig | None) -> ModelError | None:
+        """今天的额度用完了就返回一个错误，否则 None。
+
+        额度只拦"这一家"，不拦整轮：有备用供应商时调用方会换下一家。
+        """
+        if self._quota is None or pcfg is None:
+            return None
+        limit = pcfg.daily_limit_effective()
+        if limit is None:
+            return None
+        used = await self._quota.used(pcfg.provider_id)
+        if used < limit:
+            return None
+        logger.warning(
+            "供应商 %s 今日额度已用完（%d/%d tokens），本轮跳过它",
+            pcfg.provider_id,
+            used,
+            limit,
+        )
+        return ModelError(
+            ModelErrorKind.quota_exhausted,
+            f"供应商 {pcfg.provider_id} 今天的 token 额度已用完"
+            f"（已用 {used} / 上限 {limit}）。换一家供应商、提高额度，或等明天重置。",
+            retriable=False,
+        )
+
+    async def _record_usage(
+        self,
+        provider_id: str,
+        provider: ModelProvider,
+        messages: list[ChatMessageIn],
+        outcome: StreamOutcome,
+    ) -> None:
+        """把这次调用的 token 记进当日额度。
+
+        优先用供应商回执（``provider.last_usage``）；没有回执时按文本估算，
+        并标记 ``estimated``——否则不支持 usage 的兼容端点会永远显示 0，
+        额度就成了摆设。记账失败**不能**影响这一轮回复：额度是记账，
+        回复才是用户要的东西。
+        """
+        if self._quota is None:
+            return
+        try:
+            usage = getattr(provider, "last_usage", None)
+            if usage is not None and usage.total_tokens > 0:
+                await self._quota.record(provider_id, int(usage.total_tokens))
+                return
+            if outcome.text:
+                tokens = estimate_tokens_for(messages, outcome.text)
+                await self._quota.record(provider_id, tokens, estimated=True)
+        except Exception as exc:  # noqa: BLE001 - 记账失败不影响回复
+            logger.warning("token 用量记账失败（%s）：%s", provider_id, exc)
 
     # ---------------------------------------------------------- 调用
 
@@ -173,15 +236,27 @@ class ModelRouter:
                 continue
 
             provider = self._provider(config, candidate)
+            # 超时与输出上限属于**供应商**（"这家怎么连"），不属于职责。
+            # 拿不到供应商配置时退回 ModelRequest 的默认值：那种情况本身
+            # 会在 `_provider` 里报错，不该在这里再造一个静默分支。
+            pcfg = config.providers.get(candidate.provider_id)
+            quota_block = await self._quota_block(pcfg)
+            if quota_block is not None:
+                # 这一家今天的额度用完了：不调用，直接当作这一候选不可用。
+                # 有回退就换下一家，没有就把原因交给上层——静默失败会让
+                # 用户以为"她今天不想说话"。
+                last_error = quota_block
+                continue
             request = ModelRequest(
                 model_id=candidate.model_id,
                 messages=messages,
-                temperature=candidate.temperature,
-                max_tokens=candidate.max_tokens,
+                # 温度不再由我们决定：不传 = 不发这个字段，用上游默认值。
+                temperature=None,
+                max_tokens=pcfg.max_output_effective() if pcfg is not None else None,
                 profile=profile,
                 config_revision=config.revision,
                 trace_id=trace_id,
-                timeout_seconds=candidate.timeout_seconds,
+                timeout_seconds=pcfg.timeout_seconds if pcfg is not None else 60.0,
             )
             outcome = StreamOutcome(target=target, fallback_used=index > 0)
             started = time.monotonic()
@@ -196,6 +271,7 @@ class ModelRouter:
                 health.consecutive_failures = 0
                 health.last_latency_ms = int((time.monotonic() - started) * 1000)
                 health.last_error = None
+                await self._record_usage(candidate.provider_id, provider, messages, outcome)
                 return
             except asyncio.CancelledError:
                 # 用户主动停止：不算 provider 故障

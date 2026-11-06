@@ -23,7 +23,6 @@ import {
   StatusDot,
   formatAgo,
   hostOf,
-  kindLabel,
   providerEquals,
   providerGlyph,
   roleShort,
@@ -50,6 +49,62 @@ interface Props {
   logDenials: boolean;
   onTestMode: (value: boolean) => void;
   onLogDenials: (value: boolean) => void;
+  /** 今日 token 用量（键是 provider_id）。取不到时为空对象。 */
+  usage: Record<string, { day: string; used_tokens: number; estimated: boolean }>;
+}
+
+/** `-1` / null → null（不限制）；其余原样。 */
+function limitOf(value: number | null): number | null {
+  if (value === null || value < 0) return null;
+  return value;
+}
+
+function limitLabel(value: number | null): string {
+  const effective = limitOf(value);
+  if (effective === null) return '不限制';
+  return effective.toLocaleString();
+}
+
+/**
+ * 额度输入框：**留空显示灰色的 -1**，代表不限制。
+ *
+ * 为什么不直接用 placeholder="不限制"：用户会以为"空着"和"填 0"是两回事，
+ * 而服务端的约定只有 -1 这一个"关掉"的值。让空输入框直接显示 -1，
+ * 等于把约定摊在界面上——用户看到的是一个真实会提交的值，不是提示文字。
+ */
+function LimitField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number | null;
+  onChange: (value: number | null) => void;
+}) {
+  const shown = value === null || value < 0 ? '' : String(value);
+  return (
+    <label className="ms-field">
+      <span className="ms-field__label">{label}</span>
+      <input
+        className="ms-input"
+        type="number"
+        min={-1}
+        value={shown}
+        // 空值时显示 -1 作为灰色虚字（placeholder），用户一旦输入就变成实值。
+        placeholder="-1"
+        onChange={(event) => {
+          const raw = event.target.value.trim();
+          if (raw === '') {
+            // 清空 = 提交 -1（不限制），而不是 null（"没设置"）。
+            onChange(-1);
+            return;
+          }
+          const next = Number.parseInt(raw, 10);
+          onChange(Number.isFinite(next) ? next : -1);
+        }}
+      />
+    </label>
+  );
 }
 
 function newModelError(models: ProviderModel[], modelId: string): string {
@@ -76,6 +131,7 @@ export function ProvidersPanel({
   logDenials,
   onTestMode,
   onLogDenials,
+  usage: usageMap,
 }: Props) {
   const [newProviderOpen, setNewProviderOpen] = useState(false);
   const [newProvider, setNewProvider] = useState({
@@ -92,7 +148,6 @@ export function ProvidersPanel({
   const [secretBusy, setSecretBusy] = useState(false);
   const [probeBusy, setProbeBusy] = useState(false);
   const [probes, setProbes] = useState<Record<string, ProbeResult>>({});
-  const [menuOpen, setMenuOpen] = useState(false);
   const runRef = useRef<HTMLDetailsElement>(null);
   const [actionError, setActionError] = useState('');
 
@@ -110,6 +165,7 @@ export function ProvidersPanel({
     : undefined;
   const isDirty = Boolean(selected && (!baseline || !providerEquals(selected, baseline)));
   const probe = selected ? probes[selected.provider_id] : undefined;
+  const usage = selected ? usageMap[selected.provider_id] : undefined;
   const missingFromProbe = useMemo(() => {
     if (!probe?.ok) return [];
     const known = new Set((selected?.models ?? []).map((model) => model.model_id));
@@ -164,6 +220,12 @@ export function ProvidersPanel({
       base_url: newProvider.base_url.trim() || null,
       enabled: false,
       models: [],
+      // 新供应商的默认值：60 秒超时、200k 输出上限、200k 日额度。
+      // 后两项是**具体数字**而不是"不限制"：一个默认敞开的上限等于没有上限，
+      // 用户第一次接上中转站就会被它的账单教育。留空（前端提交 -1）才是不限制。
+      timeout_seconds: 60,
+      max_output_tokens: 200000,
+      daily_token_limit: 200000,
     });
     setNewProvider({ provider_id: '', kind: 'openai_compatible', base_url: '' });
     setNewProviderError('');
@@ -259,7 +321,6 @@ export function ProvidersPanel({
                     setAddingModel(false);
                     setModelError('');
                     setSecretEditing(null);
-                    setMenuOpen(false);
                   }}
                   aria-current={active ? 'true' : undefined}
                 >
@@ -362,24 +423,57 @@ export function ProvidersPanel({
                 <div>
                   <h2 className="ms-provider-title">
                     {selected.provider_id}
-                    <span className="ms-kind">{kindLabel(selected.kind)}</span>
                   </h2>
                   <p className="ms-provider-meta">
-                    {selected.kind === 'fake' ? '内置测试供应商' : hostOf(selected.base_url)} ·{' '}
                     {(selected.models ?? []).length} 个模型
                     {roleCount > 0 ? ` · ${roleCount} 个职责在用` : ''}
                     {probe?.checked_at ? ` · 上次检查 ${formatAgo(probe.checked_at)}` : ''}
                   </p>
                 </div>
               </div>
-              <label className="ms-inline-switch">
-                <span>{selected.enabled ? '使用中' : '已停用'}</span>
-                <MsSwitch
-                  checked={selected.enabled}
-                  label={`${selected.provider_id} 启用`}
-                  onChange={(value) => onPatch(selected.provider_id, { enabled: value })}
-                />
-              </label>
+              <div className="ms-provider-head__actions">
+                <label className="ms-inline-switch">
+                  <span>启用</span>
+                  <MsSwitch
+                    checked={selected.enabled}
+                    label={`${selected.provider_id} 启用`}
+                    onChange={(value) => onPatch(selected.provider_id, { enabled: value })}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="ms-btn"
+                  disabled={!canProbe || probeBusy}
+                  title={
+                    !persisted.has(selected.provider_id)
+                      ? '先保存这家供应商，才能测试连接'
+                      : isDirty
+                        ? '先保存改动，测试的才是你正在编辑的配置'
+                        : '测试已保存的配置'
+                  }
+                  onClick={() => void runProbe()}
+                >
+                  <RefreshIcon size={13} /> {probeBusy ? '检查中…' : '测试连接'}
+                </button>
+                <button
+                  type="button"
+                  className="ms-btn ms-btn--primary"
+                  onClick={onSave}
+                  disabled={saving || dirtyCount === 0}
+                  title={dirtyCount > 0 ? '把这次改动保存生效' : '没有未保存的改动'}
+                >
+                  {saving ? '保存中…' : '保存'}
+                </button>
+                {/* 修订历史仍然要有个入口，但不该占一颗按钮的位置：
+                    收进一个小字链接，改坏的配置才有地方回滚。 */}
+                <button
+                  type="button"
+                  className="ms-link ms-provider-head__history"
+                  onClick={onShowHistory}
+                >
+                  修订历史
+                </button>
+              </div>
             </header>
 
             {selected.enabled ? null : (
@@ -654,6 +748,66 @@ export function ProvidersPanel({
               ) : null}
             </div>
 
+            {/* 高级配置放在**模型下方**：先回答"这家有哪些模型"，
+                再回答"这家怎么连、能用多少"。三项都跟着这家供应商走，
+                不是跟着某个职责走。 */}
+            <details className="ms-adv" open>
+              <summary>
+                <span>高级配置</span>
+                <span className="ms-adv__summary">
+                  超时 {selected.timeout_seconds}s · 输出上限{' '}
+                  {limitLabel(selected.max_output_tokens)} · 日限额{' '}
+                  {limitLabel(selected.daily_token_limit)}
+                </span>
+              </summary>
+              <div className="ms-adv__body">
+                <div className="ms-adv__grid">
+                  <label className="ms-field">
+                    <span className="ms-field__label">超时（秒）</span>
+                    <input
+                      className="ms-input"
+                      type="number"
+                      min={1}
+                      max={600}
+                      value={selected.timeout_seconds}
+                      onChange={(event) =>
+                        onPatch(selected.provider_id, {
+                          timeout_seconds: Number.parseFloat(event.target.value) || 60,
+                        })
+                      }
+                    />
+                  </label>
+                  <LimitField
+                    label="单次输出上限（tokens）"
+                    value={selected.max_output_tokens}
+                    onChange={(value) =>
+                      onPatch(selected.provider_id, { max_output_tokens: value })
+                    }
+                  />
+                  <LimitField
+                    label="日限额（tokens）"
+                    value={selected.daily_token_limit}
+                    onChange={(value) =>
+                      onPatch(selected.provider_id, { daily_token_limit: value })
+                    }
+                  />
+                </div>
+                <p className="ms-adv__note">
+                  超时按秒计；输出上限与日限额填 -1 表示不限制。这三项对这家供应商下的所有模型生效，
+                  温度交给模型默认值。
+                </p>
+                {usage ? (
+                  <p className="ms-adv__usage">
+                    今日已用 {usage.used_tokens.toLocaleString()} tokens
+                    {limitOf(selected.daily_token_limit) !== null
+                      ? ` / 上限 ${limitOf(selected.daily_token_limit)!.toLocaleString()}`
+                      : ' · 无上限'}
+                    {usage.estimated ? '（含估算值：部分调用没拿到供应商回执）' : ''}
+                  </p>
+                ) : null}
+              </div>
+            </details>
+
             {actionError ? (
               <div className="ms-banner ms-banner--error" role="alert">
                 <AlertIcon size={14} /> {actionError}
@@ -661,6 +815,8 @@ export function ProvidersPanel({
             ) : null}
 
             <footer className="ms-card-foot">
+              {/* 底部只留探测结果。测试连接与保存已经提到卡片右上，
+                  它们是"对这家做什么"，不该和"上次检查结果"挤在同一行。 */}
               <div className={`ms-probe ms-probe--${probeTone}`}>
                 <StatusDot tone={probeTone} />
                 {probe ? (
@@ -673,70 +829,6 @@ export function ProvidersPanel({
                 ) : (
                   <span className="ms-muted">还没有检查过连接</span>
                 )}
-              </div>
-              <div className="ms-card-foot__actions">
-                <button
-                  type="button"
-                  className="ms-btn"
-                  disabled={!canProbe || probeBusy}
-                  title={
-                    !persisted.has(selected.provider_id)
-                      ? '先保存这家供应商，才能测试连接'
-                      : isDirty
-                        ? '先保存改动，测试的才是你正在编辑的配置'
-                        : '测试已保存的配置'
-                  }
-                  onClick={() => void runProbe()}
-                >
-                  <RefreshIcon size={13} /> {probeBusy ? '检查中…' : '测试连接'}
-                </button>
-                <button
-                  type="button"
-                  className="ms-btn ms-btn--primary"
-                  onClick={onSave}
-                  disabled={saving || dirtyCount === 0}
-                  title={dirtyCount > 0 ? '把这次改动保存生效' : '没有未保存的改动'}
-                >
-                  {saving ? '保存中…' : '保存'}
-                </button>
-                <div className="ms-menu-wrap">
-                  <button
-                    type="button"
-                    className="ms-btn ms-btn--icon"
-                    aria-label="更多操作"
-                    aria-expanded={menuOpen}
-                    onClick={() => setMenuOpen((value) => !value)}
-                  >
-                    ⋯
-                  </button>
-                  {menuOpen ? (
-                    <div className="ms-menu" role="menu">
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setMenuOpen(false);
-                          onShowHistory();
-                        }}
-                      >
-                        修订历史
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setMenuOpen(false);
-                          if (runRef.current) {
-                            runRef.current.open = true;
-                            runRef.current.scrollIntoView({ block: 'nearest' });
-                          }
-                        }}
-                      >
-                        运行设置
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
               </div>
             </footer>
           </section>

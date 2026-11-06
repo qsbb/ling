@@ -42,6 +42,9 @@ class ProviderRegistry:
                 cfg.base_url or "",
                 cfg.secret_last4,
                 str(cfg.enabled),
+                # 超时变了必须重建：它写在 provider 的 httpx client 上，
+                # 缓存住旧实例等于"改了设置但请求还是按老超时跑"。
+                str(cfg.timeout_seconds),
                 repr(sorted(cfg.extra.items())),
             ]
         )
@@ -75,6 +78,27 @@ class ProviderRegistry:
                 base_url=cfg.base_url or "https://api.openai.com/v1",
                 api_key=secret,
                 kind=ProviderKind(kind),
+                timeout_seconds=cfg.timeout_seconds,
+                secret_hint=self._secret_hint,
+            )
+        if kind == ProviderKind.anthropic.value:
+            from ling.models.anthropic import AnthropicProvider
+
+            return AnthropicProvider(
+                provider_id=cfg.provider_id,
+                base_url=cfg.base_url or "https://api.anthropic.com/v1",
+                api_key=self._secret_reader(cfg.provider_id),
+                timeout_seconds=cfg.timeout_seconds,
+                secret_hint=self._secret_hint,
+            )
+        if kind == ProviderKind.chat_responses.value:
+            from ling.models.chat_responses import ChatResponsesProvider
+
+            return ChatResponsesProvider(
+                provider_id=cfg.provider_id,
+                base_url=cfg.base_url or "https://api.openai.com/v1",
+                api_key=self._secret_reader(cfg.provider_id),
+                timeout_seconds=cfg.timeout_seconds,
                 secret_hint=self._secret_hint,
             )
         raise UnknownProviderError(f"未知 provider 类型: {kind}")
@@ -130,8 +154,6 @@ def bootstrap_config(
             profile=profile,
             provider_id="fake",
             model_id="deterministic",
-            temperature=0.8,
-            timeout_seconds=30.0,
         )
     return EffectiveConfig(revision=0, providers=providers, profiles=profiles, test_mode=True,
                            persona_id=persona_id,

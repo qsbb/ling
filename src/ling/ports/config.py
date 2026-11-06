@@ -13,7 +13,13 @@ from ling.ports.model import ModelTarget
 
 @dataclass(frozen=True)
 class ProfileBinding:
-    """一个职责 profile 的绑定：主模型 + 兼容回退。"""
+    """一个职责 profile 的绑定：主模型 + 兼容回退。
+
+    这里**只有"交给谁"**。超时、输出上限、每日额度都属于供应商
+    （见 ``ProviderConfig``）：它们是"这家怎么连、这家一天能用多少"，
+    不是"这件事该怎么答"。原来把三者放在这里，同一家供应商下的五个职责
+    各有各的超时和额度，改一次要改五处，而且默认值会悄悄覆盖供应商的设置。
+    """
 
     profile: str
     provider_id: str
@@ -21,10 +27,6 @@ class ProfileBinding:
     fallback_provider_id: str | None = None
     fallback_model_id: str | None = None
     enabled: bool = True
-    max_tokens: int | None = None
-    temperature: float = 0.8
-    timeout_seconds: float = 60.0
-    daily_cost_limit: float | None = None
 
 
 @dataclass(frozen=True)
@@ -189,13 +191,38 @@ class ProviderModel:
 @dataclass(frozen=True)
 class ProviderConfig:
     provider_id: str
-    kind: str  # fake | openai_compatible | local
+    kind: str  # fake | openai_compatible | anthropic | chat_responses | local
     base_url: str | None = None
     has_secret: bool = False
     secret_last4: str = ""
     enabled: bool = True
     extra: dict = field(default_factory=dict)
     models: tuple[ProviderModel, ...] = ()
+    # ---------------------------------------------------- 传输与额度
+    #
+    # 这三项**属于供应商，不属于职责**。原来的位置是 `ProfileBinding`，
+    # 结果是同一家供应商下的五个职责各有一份超时和额度，改一次要改五处，
+    # 而它们本来就该是"这家怎么连、这家一天能用多少"。
+    #
+    # 温度不在这里：它已经交给上游模型的默认值（`ModelRequest.temperature=None`
+    # 时不发这个字段）。留一个只影响措辞、不影响成本的旋钮，比没有更糟。
+    timeout_seconds: float = 60.0
+    # 单次请求的输出上限。-1（或 None）= 不限制，不往请求里放 max_tokens。
+    max_output_tokens: int | None = None
+    # 每日 token 额度。-1（或 None）= 不限制。超了之后这一家不再被调用，
+    # 见 `ling.models.quota`。
+    daily_token_limit: int | None = None
+
+    def max_output_effective(self) -> int | None:
+        """把 -1 / None 归一成"不限制"（返回 None）。"""
+        if self.max_output_tokens is None or self.max_output_tokens < 0:
+            return None
+        return self.max_output_tokens or None
+
+    def daily_limit_effective(self) -> int | None:
+        if self.daily_token_limit is None or self.daily_token_limit < 0:
+            return None
+        return self.daily_token_limit or None
 
 
 @dataclass(frozen=True)

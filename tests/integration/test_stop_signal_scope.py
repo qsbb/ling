@@ -72,7 +72,6 @@ def _slow_config() -> EffectiveConfig:
                 profile="dialogue.fast",
                 provider_id="fake",
                 model_id="deterministic",
-                timeout_seconds=60.0,
             )
         },
         test_mode=True,

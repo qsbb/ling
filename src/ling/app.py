@@ -166,7 +166,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.registry = ProviderRegistry(
         secret_reader, lambda pid: app.state.secret_diagnosis.get(pid, "missing")
     )
-    app.state.router = ModelRouter(app.state.registry)
+    # 每日 token 额度：记账表在库里，额度判断在路由里。
+    # 时区取用户的本地时区（"今天"是本地日历日，不是 UTC 日）。
+    from ling.infra.db import get_session_factory
+    from ling.models.quota import TokenQuotaStore
+
+    app.state.quota = TokenQuotaStore(
+        get_session_factory(), timezone=settings.user_timezone
+    )
+    app.state.router = ModelRouter(app.state.registry, app.state.quota)
 
     # 记录本进程加载到哪一版配置；变了就重载（跨副本传播）。
     from ling.settings.refresh import RevisionWatcher, current_revision
@@ -328,6 +336,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await ws_server.stop()
         if qqbot_gateway is not None:
             await qqbot_gateway.stop()
+        # 额度记账的后台落库任务要在引擎关闭前收尾：否则最后几轮的用量
+        # 只留在内存里，下次启动就没了。
+        quota = getattr(app.state, "quota", None)
+        if quota is not None:
+            await quota.aclose()
         await dispose_engine()
 
 

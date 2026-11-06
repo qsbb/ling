@@ -77,6 +77,8 @@ export function roleShort(key: string): string {
 /** 供应商类型：给人看的名字，不是协议名。 */
 export const PROVIDER_KIND_OPTIONS = [
   { value: 'openai_compatible', label: 'OpenAI 兼容' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'chat_responses', label: 'chat responses' },
   { value: 'local', label: '本地服务' },
   { value: 'fake', label: '本地测试' },
 ] as const;
@@ -107,6 +109,9 @@ export function toProviderDraft(view: ProviderView | ProviderDraftInput): Provid
     enabled: view.enabled,
     extra: 'extra' in view ? view.extra : undefined,
     models: ('models' in view ? view.models ?? [] : []).map((model) => ({ ...model })),
+    timeout_seconds: view.timeout_seconds ?? 60,
+    max_output_tokens: view.max_output_tokens ?? null,
+    daily_token_limit: view.daily_token_limit ?? null,
   };
 }
 
@@ -118,10 +123,6 @@ export function toProfileDraft(view: SettingsConfig['profiles'][number]): Profil
     fallback_provider_id: view.fallback_provider_id,
     fallback_model_id: view.fallback_model_id,
     enabled: view.enabled,
-    temperature: view.temperature,
-    max_tokens: view.max_tokens,
-    timeout_seconds: view.timeout_seconds,
-    daily_cost_limit: view.daily_cost_limit,
   };
 }
 
@@ -133,10 +134,6 @@ export function emptyProfile(profile: string, providerId: string, modelId: strin
     fallback_provider_id: null,
     fallback_model_id: null,
     enabled: true,
-    temperature: 0.8,
-    max_tokens: null,
-    timeout_seconds: 60,
-    daily_cost_limit: null,
   };
 }
 
@@ -165,7 +162,10 @@ export function providerEquals(a: ProviderDraftInput, b: ProviderDraftInput): bo
     a.kind === b.kind &&
     (a.base_url ?? '') === (b.base_url ?? '') &&
     a.enabled === b.enabled &&
-    modelsEqual(a.models, b.models)
+    modelsEqual(a.models, b.models) &&
+    a.timeout_seconds === b.timeout_seconds &&
+    (a.max_output_tokens ?? null) === (b.max_output_tokens ?? null) &&
+    (a.daily_token_limit ?? null) === (b.daily_token_limit ?? null)
   );
 }
 
@@ -176,11 +176,7 @@ export function profileEquals(a: ProfileDraftInput, b: ProfileDraftInput): boole
     a.model_id === b.model_id &&
     (a.fallback_provider_id ?? '') === (b.fallback_provider_id ?? '') &&
     (a.fallback_model_id ?? '') === (b.fallback_model_id ?? '') &&
-    a.enabled === b.enabled &&
-    a.temperature === b.temperature &&
-    (a.max_tokens ?? null) === (b.max_tokens ?? null) &&
-    a.timeout_seconds === b.timeout_seconds &&
-    (a.daily_cost_limit ?? null) === (b.daily_cost_limit ?? null)
+    a.enabled === b.enabled
   );
 }
 

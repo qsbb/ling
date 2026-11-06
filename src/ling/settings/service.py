@@ -31,7 +31,18 @@ from ling.ports.config import (
     ProviderModel,
 )
 
-KNOWN_PROVIDER_KINDS = {"fake", "openai_compatible", "local"}
+# 可用的供应商协议。四个真实协议 + fake（测试用）。
+#
+# `anthropic` 与 `chat_responses` 是**独立适配器**，不是给 OpenAI 兼容
+# 换个地址就能顶替的：请求体、SSE 事件名、系统提示位置、图片编码、用量字段
+# 全都不同（见 `ling/models/anthropic.py` 与 `chat_responses.py` 的模块注释）。
+KNOWN_PROVIDER_KINDS = {
+    "fake",
+    "openai_compatible",
+    "anthropic",
+    "chat_responses",
+    "local",
+}
 KNOWN_PROFILES = {role.value for role in ModelRole}
 
 # 这些角色在设置页**不再展示**：绑定了也没有任何效果。
@@ -165,6 +176,9 @@ class ConfigService:
                 enabled=bool(raw.get("enabled", True)),
                 extra=dict(raw.get("extra") or {}),
                 models=_provider_models(raw.get("models")),
+                timeout_seconds=float(raw.get("timeout_seconds", 60.0)),
+                max_output_tokens=raw.get("max_output_tokens"),
+                daily_token_limit=raw.get("daily_token_limit"),
             )
         profiles: dict[str, ProfileBinding] = {}
         for raw in list(payload.get("profiles") or []):
@@ -178,10 +192,6 @@ class ConfigService:
                 fallback_provider_id=raw.get("fallback_provider_id"),
                 fallback_model_id=raw.get("fallback_model_id"),
                 enabled=bool(raw.get("enabled", True)),
-                max_tokens=raw.get("max_tokens"),
-                temperature=float(raw.get("temperature", 0.8)),
-                timeout_seconds=float(raw.get("timeout_seconds", 60.0)),
-                daily_cost_limit=raw.get("daily_cost_limit"),
             )
         return EffectiveConfig(
             revision=published.revision,
@@ -237,6 +247,9 @@ class ConfigService:
                     "enabled": p.enabled,
                     "extra": dict(p.extra),
                     "models": [m.to_dict() for m in p.models],
+                    "timeout_seconds": p.timeout_seconds,
+                    "max_output_tokens": p.max_output_tokens,
+                    "daily_token_limit": p.daily_token_limit,
                 }
                 for p in base.providers.values()
             ],
@@ -248,10 +261,6 @@ class ConfigService:
                     "fallback_provider_id": b.fallback_provider_id,
                     "fallback_model_id": b.fallback_model_id,
                     "enabled": b.enabled,
-                    "max_tokens": b.max_tokens,
-                    "temperature": b.temperature,
-                    "timeout_seconds": b.timeout_seconds,
-                    "daily_cost_limit": b.daily_cost_limit,
                 }
                 for b in base.profiles.values()
             ],
@@ -301,6 +310,15 @@ class ConfigService:
                     "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
                     "extra": dict(raw.get("extra", existing.get("extra", {}))),
                     "models": models,
+                    "timeout_seconds": float(
+                        raw.get("timeout_seconds", existing.get("timeout_seconds", 60.0))
+                    ),
+                    "max_output_tokens": raw.get(
+                        "max_output_tokens", existing.get("max_output_tokens")
+                    ),
+                    "daily_token_limit": raw.get(
+                        "daily_token_limit", existing.get("daily_token_limit")
+                    ),
                 }
             current_payload["providers"] = list(merged.values())
 
@@ -324,14 +342,6 @@ class ConfigService:
                         "fallback_model_id", existing.get("fallback_model_id")
                     ),
                     "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
-                    "max_tokens": raw.get("max_tokens", existing.get("max_tokens")),
-                    "temperature": float(raw.get("temperature", existing.get("temperature", 0.8))),
-                    "timeout_seconds": float(
-                        raw.get("timeout_seconds", existing.get("timeout_seconds", 60.0))
-                    ),
-                    "daily_cost_limit": raw.get(
-                        "daily_cost_limit", existing.get("daily_cost_limit")
-                    ),
                 }
             current_payload["profiles"] = list(merged_profiles.values())
 
@@ -364,7 +374,7 @@ class ConfigService:
             if kind not in KNOWN_PROVIDER_KINDS:
                 issues.append(ValidationIssue(f"providers.{pid}.kind", f"未知供应商类型: {kind}"))
                 continue
-            if kind in {"openai_compatible", "local"}:
+            if kind in {"openai_compatible", "local", "anthropic", "chat_responses"}:
                 base_url = (cfg.get("base_url") or "").strip()
                 if not base_url:
                     issues.append(
@@ -382,6 +392,51 @@ class ConfigService:
                             f"providers.{pid}.secret",
                             "该供应商还没有保存密钥，发布后调用会返回 secret_missing",
                             severity="warning",
+                        )
+                    )
+
+            # 传输与额度：-1 表示不限制，其余必须是正数。
+            # 这些校验放在**供应商**这一层，因为三项都跟着供应商走；
+            # 职责那边只回答"交给谁"，不回答"怎么连、能用多少"。
+            timeout = cfg.get("timeout_seconds", 60.0)
+            try:
+                timeout_val = float(timeout)
+            except (TypeError, ValueError):
+                issues.append(
+                    ValidationIssue(
+                        f"providers.{pid}.timeout_seconds", "timeout_seconds 必须是数字"
+                    )
+                )
+            else:
+                if not 1.0 <= timeout_val <= 600.0:
+                    issues.append(
+                        ValidationIssue(
+                            f"providers.{pid}.timeout_seconds",
+                            "timeout_seconds 必须在 1~600 秒之间",
+                        )
+                    )
+            for key, label in (
+                ("max_output_tokens", "单次输出上限"),
+                ("daily_token_limit", "日限额"),
+            ):
+                raw_value = cfg.get(key)
+                if raw_value is None:
+                    continue
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError):
+                    issues.append(
+                        ValidationIssue(f"providers.{pid}.{key}", f"{label}必须是整数")
+                    )
+                    continue
+                # -1 是"不限制"的约定值；0 和 -2 之类没有含义，拦下来。
+                if value == -1:
+                    continue
+                if value <= 0:
+                    issues.append(
+                        ValidationIssue(
+                            f"providers.{pid}.{key}",
+                            f"{label}必须为正整数，或填 -1 表示不限制",
                         )
                     )
 
@@ -472,30 +527,9 @@ class ConfigService:
                 )
             if not (raw.get("model_id") or "").strip():
                 issues.append(ValidationIssue(f"profiles.{prof}.model_id", "必须填写模型 ID"))
-            temp = raw.get("temperature", 0.8)
-            try:
-                temp_val = float(temp)
-            except (TypeError, ValueError):
-                issues.append(ValidationIssue(f"profiles.{prof}.temperature", "temperature 必须是数字"))
-            else:
-                if not 0.0 <= temp_val <= 2.0:
-                    issues.append(
-                        ValidationIssue(f"profiles.{prof}.temperature", "temperature 必须在 0~2 之间")
-                    )
-            timeout = raw.get("timeout_seconds", 60.0)
-            try:
-                timeout_val = float(timeout)
-            except (TypeError, ValueError):
-                issues.append(
-                    ValidationIssue(f"profiles.{prof}.timeout_seconds", "timeout_seconds 必须是数字")
-                )
-            else:
-                if not 1.0 <= timeout_val <= 600.0:
-                    issues.append(
-                        ValidationIssue(
-                            f"profiles.{prof}.timeout_seconds", "timeout_seconds 必须在 1~600 秒之间"
-                        )
-                    )
+            # 超时 / 输出上限 / 日额度**不在这里校验**：它们属于供应商
+            # （见下面 providers 那一轮）。旧修订里可能还留着这几个键，
+            # 读的时候被忽略即可——不必因为一份旧 payload 就报错。
             fb_pid = raw.get("fallback_provider_id")
             if fb_pid:
                 if fb_pid not in providers:
