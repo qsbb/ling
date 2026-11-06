@@ -521,17 +521,21 @@ class TurnCoordinator:
                                 floor_settled = True
                                 lease_lost = True
                                 continue
-                        elif self._arbiter is not None:
-                            if not self._arbiter.extend(window_id=window_id, turn_id=turn_id):
-                                logger.warning(
-                                    "发言占用续约失败，停止对外输出 turn=%s window=%s",
-                                    turn_id,
-                                    window_id,
-                                )
-                                held_by_me = False
-                                floor_settled = True
-                                lease_lost = True
-                                continue
+                        elif self._arbiter is not None and not self._arbiter.extend(
+                            window_id=window_id, turn_id=turn_id
+                        ):
+                            # 嵌套 if 合成一个条件：语义完全相同（都是"有仲裁器且
+                            # 续约失败"才停），但少一层缩进。CI 的 ruff 版本比本地
+                            # 更严，SIM102 在这里报错会直接挡住发版。
+                            logger.warning(
+                                "发言占用续约失败，停止对外输出 turn=%s window=%s",
+                                turn_id,
+                                window_id,
+                            )
+                            held_by_me = False
+                            floor_settled = True
+                            lease_lost = True
+                            continue
                         await queue.put(
                             TurnStreamEvent(
                                 event="delta",
