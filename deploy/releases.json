@@ -1,4 +1,15 @@
 {
   "schema": 1,
-  "releases": []
+  "releases": [
+    {
+      "version": "0.0.3",
+      "digest": "ghcr.io/qsbb/ling-api@sha256:3f24d2e8d04ed357a206c66604f918d98d2f33cab243bf96e2327b29695204b2",
+      "commit": "86685595fd01d7c5a750167cda314f08d50d9ccb",
+      "min_from": [
+        "0.0.2"
+      ],
+      "has_migration": true,
+      "released_at": "2026-11-06T17:13:41Z"
+    }
+  ]
 }

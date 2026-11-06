@@ -87,10 +87,28 @@ def error_code(payload: object) -> str:
 # ---------------------------------------------------------------- 仓库里的目录
 
 
-def test_repository_catalog_is_valid_and_starts_empty() -> None:
-    """仓库里的目录文件必须能过门禁；当前没有镜像模式正式发布，条目为空。"""
+def test_repository_catalog_is_valid_and_lists_real_releases() -> None:
+    """仓库里的目录文件必须能过门禁，且只列**真实发布过**的版本。
+
+    这条原来断言"条目必须为空"——那是 0.0.2 时代的事实（当时还没有任何
+    镜像模式正式发布，空目录是诚实状态）。v0.0.3 发布后事实变了：目录里
+    该有 0.0.3 这一条，否则部署机上的网页更新永远显示 no_available_target。
+
+    所以断言改成"非空且每条都自洽"，而不是继续钉死"必须为空"：
+    钉死空列表会让"发布后填目录"这件正确的事变成 CI 红灯，
+    而那正是这次 0.0.3 发布要解决的问题。
+    """
     parsed = catalog.load_catalog(REPO_CATALOG)
-    assert parsed == {"schema": 1, "releases": []}
+    assert parsed["schema"] == 1
+    releases = parsed["releases"]
+    assert releases, "仓库目录里至少要有一条真实发布记录（否则网页更新没有可用目标）"
+    for release in releases:
+        # 每条都必须带完整 digest/commit：目录是更新的**唯一**可信来源，
+        # 少一个字段就等于让更新器去猜。
+        assert release["digest"].startswith("ghcr.io/qsbb/ling-api@sha256:")
+        assert len(release["commit"]) == 40
+        assert release["min_from"]
+    # 权限位仍然不许组/世界可写：目录被改等于更新目标被改。
     assert stat.S_IMODE(REPO_CATALOG.stat().st_mode) & 0o022 == 0
 
 
@@ -445,7 +463,8 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
 def test_cli_validate_accepts_repository_catalog() -> None:
     result = run_cli("validate")
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert "OK schema=1 releases=0" in result.stdout
+    # 条数不写死：发布一次就多一条，写死数字会让每次发版都要改测试。
+    assert "OK schema=1 releases=" in result.stdout
 
 
 def test_cli_validate_rejects_broken_catalog(tmp_path: Path) -> None:
