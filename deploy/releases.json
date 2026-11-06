@@ -3,13 +3,13 @@
   "releases": [
     {
       "version": "0.0.3",
-      "digest": "ghcr.io/qsbb/ling-api@sha256:3f24d2e8d04ed357a206c66604f918d98d2f33cab243bf96e2327b29695204b2",
-      "commit": "86685595fd01d7c5a750167cda314f08d50d9ccb",
+      "digest": "ghcr.io/qsbb/ling-api@sha256:2ac091918d9db4e722a75afd104ee645a44e48b57c86e6deb3ed4911555f5224",
+      "commit": "1b50d5db9d9b3bda45de1379495e823a6f152d7a",
       "min_from": [
         "0.0.2"
       ],
       "has_migration": true,
-      "released_at": "2026-11-06T17:13:41Z"
+      "released_at": "2026-11-06T21:20:00Z"
     }
   ]
 }
