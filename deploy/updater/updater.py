@@ -266,6 +266,8 @@ MAINT_UNKNOWN = "unknown"
 
 # 可信发布目录（见模块 docstring「可信发布目录」一节的硬规则）。
 RELEASE_CATALOG_NAME = "releases.json"
+# 联网取目录的超时（秒）。更新器是常驻轮询进程，一次卡死会拖住整个通道。
+CATALOG_FETCH_TIMEOUT_SECONDS = 10.0
 RELEASE_CATALOG_TOOL = "catalog.py"
 # 读受限 env 时的大小上限：只为一个 KEY= 行，不需要把任意大的文件读进内存。
 ENV_FILE_MAX_BYTES = 64 * 1024
@@ -710,6 +712,26 @@ class Config:
     backup_timeout: float
     once: bool
     acknowledge: str
+    # 可选的联网目录地址（``--catalog-url`` / ``LING_UPDATER_CATALOG_URL``）。
+    #
+    # ## 为什么需要它
+    #
+    # 目录文件是随发行包交付、只读挂载的，而升级流程只换 app 镜像、不动更新器
+    # 自己。于是宿主上那份目录永远停在安装时的版本：升到 0.0.3 之后里面没有
+    # 0.0.4，下次发版网页更新照旧「暂无可用的更新目标」——一键更新只能成功
+    # **一次**，之后每次都得人工换更新器镜像。
+    #
+    # 打开这个地址后，更新器先从它取目录（仍然交给发行包的 ``catalog.py``
+    # 做同一套严格校验），取不到再退回本地那份。
+    #
+    # ## 为什么默认留空
+    #
+    # 打开它等于把「谁能改 GitHub 上的仓库」当成升级授权依据。更新器是个无凭据
+    # 的容器，它没法验证"这份内容是 owner 批准的"，只能验证 HTTPS 连到了 GitHub。
+    # 这是运维要显式做的信任决定，不能因为一次代码更新就让已部署实例突然出网。
+    #
+    # 放在最后是因为 dataclass 要求：有默认值的字段不能排在无默认值的字段前面。
+    catalog_url: str | None = None
 
 
 def _env(name: str, default: str = "") -> str:
@@ -773,6 +795,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--publish-py",
         default=_env("LING_UPDATER_PUBLISH_PY"),
         help="发行包里的 deploy/release/publish.py（只读挂载）",
+    )
+    parser.add_argument(
+        "--catalog-url",
+        default=_env("LING_UPDATER_CATALOG_URL"),
+        help=(
+            "可选的联网目录地址（https）。配了它就先从该地址取 releases.json，"
+            "取不到再退回本地那份。留空（默认）= 只读本地，行为与从前完全一样。"
+            "示例：https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
+        ),
     )
     parser.add_argument(
         "--release-catalog",
@@ -892,6 +923,7 @@ def parse_config(argv: Sequence[str] | None) -> Config:
             else publish_py.parent.parent / RELEASE_CATALOG_NAME
         ),
         catalog_tool=publish_py.parent / RELEASE_CATALOG_TOOL,
+        catalog_url=args.catalog_url.strip() or None,
         project=args.project,
         poll_seconds=args.poll_seconds,
         ready_timeout=args.ready_timeout,
@@ -1515,6 +1547,51 @@ def release_targets(
     return targets, recommended
 
 
+def _load_catalog_bytes(cfg: Config, tool: ModuleType) -> dict[str, Any]:
+    """取目录：配了 ``catalog_url`` 就先联网取，取不到再读本地那份。
+
+    联网取回的内容**不落盘**，直接交给发行包的 ``tool.parse_catalog()``
+    校验——和本地那份走**同一套**门禁（schema、digest 格式、commit 格式、
+    min_from、semver）。这里不新增任何校验规则：多一套规则只会多一处会和
+    ``catalog.py`` 走散的地方。
+
+    联网失败**不是错误**：退回本地那份，行为与没配这个地址时完全一样。
+    部署机上的更新器本来就带着一份（可能过期的）本地目录，能升到哪儿就
+    升到哪儿，总比整条通道变红好。
+    """
+    url = (cfg.catalog_url or "").strip()
+    if url:
+        # 大小上限直接取发行包 ``catalog.py`` 的那个常量：本地与联网两份
+        # 用同一个数字，不另立一套。
+        raw = _fetch_catalog_bytes(url, getattr(tool, "MAX_CATALOG_BYTES", 256 * 1024))
+        if raw is not None:
+            return tool.parse_catalog(raw)
+    return tool.load_catalog(cfg.release_catalog)
+
+
+def _fetch_catalog_bytes(url: str, max_bytes: int) -> bytes | None:
+    """取回目录字节；任何问题都返回 ``None``（让调用方退回本地）。
+
+    只用标准库：更新器容器里没有 HTTP 客户端依赖，它连查注册表都靠 docker
+    CLI，为这一个 GET 引第三方库不值得。
+
+    只允许 https：http 会让链路上任何人替换目录内容。
+    """
+    import urllib.error
+    import urllib.request
+
+    if not url.startswith("https://"):
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as response:
+            data = response.read(max_bytes + 1)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if len(data) > max_bytes:
+        return None
+    return data
+
+
 def read_release_catalog(
     cfg: Config, pub: ModuleType, tool: ModuleType | None
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
@@ -1530,7 +1607,7 @@ def read_release_catalog(
         )
         return empty, [], None
     try:
-        catalog = tool.load_catalog(cfg.release_catalog)
+        catalog = _load_catalog_bytes(cfg, tool)
     except Exception as error:  # noqa: BLE001 - 目录不可用一律 fail closed
         code = getattr(error, "code", "")
         reason = CATALOG_REASON_BY_CODE.get(code, CATALOG_REASON_INVALID)

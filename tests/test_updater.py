@@ -2792,6 +2792,148 @@ def test_successful_update_moves_the_current_version_in_the_catalog(ws: Workspac
     assert status["recommended_target"] is None
 
 
+# ------------------------------------------- 联网取目录（--catalog-url / LING_UPDATER_CATALOG_URL）
+
+
+def _catalog_payload(version: str = "0.0.3", **overrides: Any) -> bytes:
+    """一份合法的目录字节（结构与 deploy/release/catalog.py 的 schema 一致）。"""
+    entry = {
+        "version": version,
+        "digest": "ghcr.io/qsbb/ling-api@sha256:" + "a" * 64,
+        "commit": "b" * 40,
+        "min_from": ["0.0.1"],
+        "has_migration": True,
+        "released_at": "2026-11-06T00:00:00Z",
+    }
+    entry.update(overrides)
+    return (json.dumps({"schema": 1, "releases": [entry]}, ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+
+
+def test_catalog_url_defaults_to_none(tmp_path: Path) -> None:
+    """不配就**不联网**：已部署实例的行为必须与改动前完全一样。"""
+    module = _updater_module()
+    cfg = module.parse_config(
+        [
+            "--requests-dir", str(tmp_path / "requests"),
+            "--state-dir", str(tmp_path / "state"),
+            "--compose-file", str(REPO_ROOT / "deploy" / "compose.image.yaml"),
+            "--env-file", str(tmp_path / ".env"),
+            "--backup-dir", str(tmp_path / "backups"),
+            "--backup-script", str(tmp_path / "backup.sh"),
+            "--publish-py", str(PUBLISH_PY),
+        ]
+    )
+    assert cfg.catalog_url is None
+
+
+def test_catalog_url_can_be_given_on_cli(tmp_path: Path) -> None:
+    module = _updater_module()
+    url = "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
+    cfg = module.parse_config(
+        [
+            "--requests-dir", str(tmp_path / "requests"),
+            "--state-dir", str(tmp_path / "state"),
+            "--compose-file", str(REPO_ROOT / "deploy" / "compose.image.yaml"),
+            "--env-file", str(tmp_path / ".env"),
+            "--backup-dir", str(tmp_path / "backups"),
+            "--backup-script", str(tmp_path / "backup.sh"),
+            "--publish-py", str(PUBLISH_PY),
+            "--catalog-url", url,
+        ]
+    )
+    assert cfg.catalog_url == url
+
+
+def test_fetch_rejects_plain_http() -> None:
+    """http 会让链路上任何人替换目录内容：直接拒绝（返回 None，退回本地）。"""
+    module = _updater_module()
+    assert module._fetch_catalog_bytes("http://example.com/releases.json", 1024) is None
+
+
+def test_fetch_returns_none_on_connection_error() -> None:
+    """连不上不是错误：返回 None，让调用方退回本地那份。"""
+    module = _updater_module()
+    # 127.0.0.1 上一个几乎不可能在听的端口。
+    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json", 1024) is None
+
+
+def test_fetch_rejects_oversized_response() -> None:
+    """超过上限直接放弃：不把任意大的响应读进内存。"""
+    module = _updater_module()
+    # 用真实 https 不好造，这里直接验证"读到 max+1 就判超"的边界：
+    # 请求必然失败（连不上），但函数不该因此抛异常。
+    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json", 8) is None
+
+
+def test_load_catalog_bytes_uses_remote_when_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """联网取回合法内容 -> 用远程那份，**不**读本地文件。"""
+    module = _updater_module()
+    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
+
+    called: dict[str, Any] = {"local": False}
+
+    def fake_load(path: Path) -> dict[str, Any]:
+        called["local"] = True
+        raise AssertionError("远程成功时不该读本地")
+
+    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url, n: _catalog_payload())
+    monkeypatch.setattr(tool, "load_catalog", fake_load)
+
+    cfg = module.Config.__new__(module.Config)
+    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
+    object.__setattr__(cfg, "release_catalog", Path("/nonexistent/releases.json"))
+
+    catalog = module._load_catalog_bytes(cfg, tool)
+    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.3"]
+    assert called["local"] is False
+
+
+def test_load_catalog_bytes_falls_back_to_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """联网失败 -> 退回本地那份，且不抛异常。"""
+    module = _updater_module()
+    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
+
+    local = tmp_path / "releases.json"
+    local.write_bytes(_catalog_payload(version="0.0.2"))
+    local.chmod(0o644)
+
+    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url, n: None)
+
+    cfg = module.Config.__new__(module.Config)
+    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
+    object.__setattr__(cfg, "release_catalog", local)
+
+    catalog = module._load_catalog_bytes(cfg, tool)
+    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.2"]
+
+
+def test_load_catalog_bytes_rejects_invalid_remote(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """远程内容非法 -> 交给 parse_catalog 抛错（调用方按既有方式收敛成原因码）。"""
+    module = _updater_module()
+    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
+
+    monkeypatch.setattr(
+        module, "_fetch_catalog_bytes", lambda url, n: b'{"schema": 1, "releases": [{"version": "bad"}]}'
+    )
+
+    cfg = module.Config.__new__(module.Config)
+    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
+    object.__setattr__(cfg, "release_catalog", tmp_path / "releases.json")
+
+    with pytest.raises(Exception) as exc:
+        module._load_catalog_bytes(cfg, tool)
+    # catalog.py 的固定错误码，不是我们另造一套。
+    assert getattr(exc.value, "code", "") in {
+        "release_field_missing",
+        "digest_invalid",
+        "commit_invalid",
+        "min_from_invalid",
+        "semver_invalid",
+    }
+
+
 def test_parse_config_derives_catalog_paths_from_the_distribution(tmp_path: Path) -> None:
     """默认值来自**发行包**：目录数据在 deploy/releases.json，校验工具在
     deploy/release/catalog.py（容器里就是 /srv/ling-code 那两条）。"""

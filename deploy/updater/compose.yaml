@@ -143,6 +143,15 @@ services:
       LING_UPDATER_BACKUP_SCRIPT: /srv/ling-code/backup/backup.sh
       LING_UPDATER_PUBLISH_PY: /srv/ling-code/release/publish.py
       LING_UPDATER_POLL_SECONDS: ${LING_UPDATER_POLL_SECONDS:-5}
+      # 可选：联网取发布目录。留空（默认）= 只读本地那份（行为与从前一致）。
+      #
+      # 为什么需要它：目录文件随发行包交付、只读挂载，而升级只换 app 镜像、
+      # 不动更新器自己——所以本地那份永远停在安装时的版本，网页一键更新
+      # 只能成功一次。打开这个地址后，更新器先从它取目录，取不到再退回本地。
+      #
+      # 打开它意味着信任「谁能改 GitHub 上的仓库」= 升级授权依据。这是运维
+      # 要显式做的选择，所以默认关。
+      LING_UPDATER_CATALOG_URL: ${LING_UPDATER_CATALOG_URL:-}
       PYTHONUNBUFFERED: "1"
       # 只读根 + 只读挂载：不写 .pyc，避免每次导入都产生无意义的写入尝试。
       PYTHONDONTWRITEBYTECODE: "1"
