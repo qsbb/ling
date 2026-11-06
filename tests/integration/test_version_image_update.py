@@ -1423,6 +1423,9 @@ async def test_failure_stage_keeps_real_stage(
         "garbage-stage",
         "下载",
         "",
+        # 超长：旧实现 `_image_text(..., max_length=32)` 只查长度/字符集，超长同样
+        # 会被拒（这一条行为不变，留作锚点）。
+        "x" * 40,
     ],
 )
 async def test_failure_stage_unknown_is_projected_to_none(
