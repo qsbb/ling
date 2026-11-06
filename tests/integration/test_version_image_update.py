@@ -1390,6 +1390,99 @@ async def test_get_unknown_failure_code_is_not_echoed(logged_in: TestEnv, tmp_pa
     assert body["task"]["failure"]["code"] is None
 
 
+# ---------------------------------------------------------------- 阶段口径（stage / failure.stage）
+
+
+@pytest.mark.parametrize("stage", sorted(version_routes.IMAGE_STAGE_MESSAGES))
+async def test_failure_stage_keeps_real_stage(
+    logged_in: TestEnv, tmp_path: Path, stage: str
+) -> None:
+    """``failure.stage`` 是五个真实阶段之一 → 原样保留（前后端口径一致）。"""
+    base = _configure(logged_in, tmp_path)
+    task = _task(state="needs_manual", stage=stage)
+    task["failure"] = {"code": "switch_failed", "stage": stage}
+    _write_status(base, state="needs_manual", task=task)
+    view = (await logged_in.client.get("/v1/version/image-update")).json()
+    assert view["task"]["stage"] == stage
+    assert view["task"]["failure"]["stage"] == stage
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        # 更新器自己的非阶段值：对账、启动、状态自查。
+        "reconcile",
+        "bootstrap",
+        "status",
+        # 复用 publish.py 时 ``failure.step`` 原样落进 ``failure.stage``。
+        "preflight",
+        "pull",
+        "up_api",
+        "env_update",
+        # 明显垃圾值。
+        "garbage-stage",
+        "下载",
+        "",
+    ],
+)
+async def test_failure_stage_unknown_is_projected_to_none(
+    logged_in: TestEnv, tmp_path: Path, stage: str
+) -> None:
+    """未知 ``failure.stage`` → None，且**不透传**到前端。
+
+    回归的是截图里「停止阶段：处理中（阶段不可识别）」：任务已经停了，前端却
+    因为没有匹配的标签把它渲染成"还在跑"。未知值必须投影成 None（前端显示
+    「尚未开始」），并且原文不出现在响应里。
+    """
+    base = _configure(logged_in, tmp_path)
+    task = _task(state="needs_manual", stage="verify")
+    task["failure"] = {"code": "switch_failed", "stage": stage}
+    _write_status(base, state="needs_manual", task=task)
+    response = await logged_in.client.get("/v1/version/image-update")
+    body = response.json()
+    assert body["task"]["failure"]["stage"] is None
+    # 失败码与文案照旧（只收敛阶段，不放宽别的门禁）。
+    assert body["task"]["failure"]["code"] == "switch_failed"
+    assert body["task"]["failure"]["message"] == version_routes.IMAGE_FAILURE_MESSAGES["switch_failed"]
+    if stage and version_routes.IMAGE_TOKEN_RE.fullmatch(stage):
+        # 只要过得了字符集校验的值曾经会被原样转发；现在一个都不能出现。
+        assert stage not in response.text
+
+
+@pytest.mark.parametrize("stage", ["reconcile", "preflight", "garbage-stage", ""])
+async def test_top_level_stage_unknown_is_projected_to_none(
+    logged_in: TestEnv, tmp_path: Path, stage: str
+) -> None:
+    """顶层 ``stage`` 的同类行为（与 ``failure.stage`` 同一口径）。"""
+    base = _configure(logged_in, tmp_path)
+    _write_status(base, task=_task(state="running", stage=stage))
+    response = await logged_in.client.get("/v1/version/image-update")
+    body = response.json()
+    assert body["task"]["stage"] is None
+    assert body["task"]["stage_message"] is None
+    if stage and version_routes.IMAGE_TOKEN_RE.fullmatch(stage):
+        assert stage not in response.text
+
+
+async def test_stage_and_failure_stage_share_one_whitelist() -> None:
+    """两处必须走同一个 helper：``_image_stage`` 的键集合就是 ``IMAGE_STAGE_MESSAGES``。
+
+    守的是"以后再次分叉"：只要有人在其中一处改回 ``_image_text``，这条用例就红。
+    """
+    assert version_routes._image_stage("verify") == "verify"
+    assert version_routes._image_stage("reconcile") is None
+    assert version_routes._image_stage(None) is None
+    assert version_routes._image_stage(123) is None
+    # 合法阶段恰好是码表的键，不多不少（更新器 ``STAGES`` 与本表一致）。
+    assert {stage for stage in version_routes.IMAGE_STAGE_MESSAGES} == {
+        "prepare",
+        "backup",
+        "migrate",
+        "switch",
+        "verify",
+    }
+
+
 # ---------------------------------------------------------------- 旧端点：显式拒绝 / 行为不变
 
 

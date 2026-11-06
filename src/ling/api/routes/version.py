@@ -1268,6 +1268,22 @@ def _image_choice(value: object, allowed: frozenset[str]) -> str | None:
     return None
 
 
+def _image_stage(value: object) -> str | None:
+    """``stage`` 与 ``failure.stage`` 共用的白名单：只认 ``IMAGE_STAGE_MESSAGES`` 的键。
+
+    两处**必须同一口径**。曾经 ``failure.stage`` 只过长度/字符集校验，于是更新器
+    写进来的非阶段值（``reconcile``、``bootstrap``、``status``，以及复用
+    ``publish.py`` 时的 ``pull``/``preflight``/``up_api`` 等步骤名）会原样透传，
+    前端翻成「处理中（阶段不可识别）」——任务明明已经停了，看起来却像还在跑。
+
+    未知值投影成 ``None``（前端显示「尚未开始」），也不回显原文：状态文件跨信任
+    边界，阶段名同样不是自由文本。
+    """
+    if isinstance(value, str) and value in IMAGE_STAGE_MESSAGES:
+        return value
+    return None
+
+
 def _image_choices(value: object, table: dict[str, str], *, limit: int = IMAGE_MAX_WARNINGS) -> list[str]:
     """把码数组转成文案数组：只保留认识的码，未知码**丢弃**（不回显原文）。"""
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
@@ -1430,7 +1446,7 @@ def _image_failure_view(raw: object) -> dict[str, object] | None:
         return {"code": None, "stage": None, "message": IMAGE_FAILURE_FALLBACK}
     return {
         "code": code,
-        "stage": _image_text(raw.get("stage"), max_length=32),
+        "stage": _image_stage(raw.get("stage")),
         "message": text,
     }
 
@@ -1458,8 +1474,7 @@ def _image_task_view(raw: object) -> dict[str, object] | None:
     maintenance = maintenance_raw if isinstance(maintenance_raw, dict) else {}
     rollback_raw = raw.get("rollback")
     rollback = rollback_raw if isinstance(rollback_raw, dict) else {}
-    stage = raw.get("stage")
-    stage_value = stage if isinstance(stage, str) and stage in IMAGE_STAGE_MESSAGES else None
+    stage_value = _image_stage(raw.get("stage"))
     still_on_old = raw.get("still_on_old_version")
     return {
         "request_id": _image_request_id(raw.get("request_id")),

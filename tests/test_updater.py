@@ -1403,6 +1403,28 @@ def test_failure_code_tables_match_api_side() -> None:
     assert {"migration_failed", "switch_failed"} <= set(updater.FAILURE_TEXT)
 
 
+def test_stage_table_matches_updater_stages() -> None:
+    """阶段码表与更新器的 ``STAGES`` 一致；但 ``failure.stage`` 的来源**更大**。
+
+    ``task.stage`` 只会是 ``STAGES`` 里的五个值；``failure.stage`` 不是——它复用
+    ``PublishError.step`` / ``UpdaterError.stage``，于是可能是 ``pull``、
+    ``preflight``、``up_api``、``reconcile``、``bootstrap`` 等等。这份差异是**有意**
+    的（故障定位要细到哪一步），所以 API 侧必须白名单投影，不能因为"更新器看起来
+    只会写五个阶段"就放宽校验（否则网页显示「处理中（阶段不可识别）」）。
+    """
+    from ling.api.routes import version as version_routes
+
+    updater = _updater_module()
+    # 顺序按 ruff 的要求：变量在左，常量表达式在右（反过来会被判 SIM300
+    # Yoda 条件——它本身无害，但会让 `ruff check .` 这个门禁变红）。
+    assert tuple(version_routes.IMAGE_STAGE_MESSAGES) == updater.STAGES
+
+    # 反证"来源更大"：更新器源码里确实有 STAGES 之外的 stage 值。
+    source = UPDATER_PY.read_text(encoding="utf-8")
+    assert '"stage": "reconcile"' in source
+    assert '"bootstrap"' in source
+
+
 def updater_volume_lines(text: str) -> list[str]:
     """抽出 service 的 ``volumes:`` 条目（不引入 YAML 依赖，只按缩进扫块）。"""
     mounts: list[str] = []

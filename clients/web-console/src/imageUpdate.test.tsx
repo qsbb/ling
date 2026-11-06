@@ -606,6 +606,36 @@ describe('阶段映射', () => {
     expect(imageUpdateStageIndex('download')).toBe(-1);
   });
 
+  it('兜底文案就是「处理中（阶段不可识别）」——写死，防被悄悄改成「尚未开始」', () => {
+    // 后端现在会把未知阶段投影成 null（未知值根本到不了这里），所以这条兜底只对
+    // "后端还没部署新版 + 前端先上"的窗口生效。文案被改掉就等于悄悄改了语义：
+    // 「不可识别」说的是"有值但认不出"，「尚未开始」说的是"没有阶段"。
+    expect(IMAGE_STAGE_UNKNOWN_LABEL).toBe('处理中（阶段不可识别）');
+    expect(imageUpdateStageLabel('garbage-stage')).toBe('处理中（阶段不可识别）');
+    expect(imageUpdateStageLabel('')).toBe('尚未开始');
+    expect(imageUpdateStageLabel(undefined)).toBe('尚未开始');
+  });
+
+  it('后端投影成 null 的失败阶段：不渲染「停止阶段」，也不出现「阶段不可识别」', () => {
+    // 截图里的缺陷就是「停止阶段：处理中（阶段不可识别）」：任务已经停了，文案却
+    // 读起来像还在跑。后端把未知 failure.stage 投影成 null 之后，这一行整块不渲染。
+    const markup = renderPanel({
+      state: {
+        ...initialImageUpdateState(),
+        view: makeView({
+          task: makeTask({
+            state: 'needs_manual',
+            stage: 'verify',
+            failure: { code: 'switch_failed', stage: null, message: '已迁移：目标版本启动或验证失败，更新未完成，需要维护处理' },
+          }),
+        }),
+      },
+    });
+    expect(markup).toContain('已迁移：目标版本启动或验证失败');
+    expect(markup).not.toContain('停止阶段');
+    expect(markup).not.toContain(IMAGE_STAGE_UNKNOWN_LABEL);
+  });
+
   it('更新器状态码也用中文，未知状态不显示码值', () => {
     expect(imageUpdaterStateLabel('idle')).toBe('空闲');
     expect(imageUpdaterStateLabel('needs_manual')).toBe('需要人工处理');
