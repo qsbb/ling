@@ -39,6 +39,8 @@ dependencies = [
 dev = [
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.24,<1",
+  # 并行跑用例：CI 上 3126 个用例串行要 35 分钟，4 核上并行约 10 分钟。
+  "pytest-xdist>=3.6,<4",
   "ruff>=0.6,<1",
   "mypy>=1.11,<2",
 ]

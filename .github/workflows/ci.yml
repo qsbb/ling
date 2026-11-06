@@ -84,7 +84,13 @@ jobs:
           PY
           pytest tests/integration/test_migrations.py -q
       - name: 测试
-        run: pytest tests -q
+        # `-n auto` 用满 runner 的核：3126 个用例串行要 35 分钟，4 核并行约
+        # 5 分钟。集成用例每个模块用自己的 schema（`t_<uuid>`），本来就互不
+        # 干扰，所以并行是安全的——不是"跑得快一点、偶尔假绿"。
+        #
+        # 不用 `-n logical`：那个按超线程数开，对 I/O 密集的用例收益不大，
+        # 反而更容易把 PostgreSQL 连接数顶上去。
+        run: pytest tests -q -n auto
         env:
           LING_TEST_MODE: "1"
 
