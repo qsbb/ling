@@ -24,9 +24,11 @@
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +42,11 @@ from ling.infra.models import ActivityRow, utcnow
 from ling.infra.security import new_id
 
 VALID_STATES = {"proposed", "running", "paused", "completed", "failed", "cancelled"}
+
+# 计划时段结束时**允许**的去向（设计 §3）：paused / cancelled，并留一个
+# `needs_review` 原因码。**绝不**自动 completed——"时间到了"不是"她做完了"。
+SEGMENT_END_REVIEW = "needs_review"
+SEGMENT_END_ACTIONS = ("paused", "cancelled", "noop")
 
 # 允许的状态迁移；其余一律拒绝（确定性硬门，不由模型决定）
 TRANSITIONS: dict[str, set[str]] = {
@@ -73,10 +80,43 @@ class ActivityView:
     origin: str = "simulated"
     plan_id: str | None = None
     visibility: str = "subject_private"
+    # 这条活动由哪个日程叶段启动（新时间轴）。旧 `plan_id` 指的不是同一张表：
+    # 计划时段结束**不是**完成证据，见 `end_schedule_window`。
+    schedule_segment_id: str | None = None
 
     @property
     def is_active(self) -> bool:
         return self.state in {"running", "paused"}
+
+
+@dataclass(frozen=True)
+class SegmentStart:
+    """一次"到段边界起活动"的结果。
+
+    ``action``：``created``（新建并 running）/ ``resumed``（从 paused 恢复）/
+    ``existing``（这一段已经有活动，本次什么都没写）。
+    """
+
+    action: str
+    activity: ActivityView
+
+    @property
+    def created(self) -> bool:
+        return self.action == "created"
+
+
+@dataclass(frozen=True)
+class SegmentWindowEnd:
+    """一次"计划时段结束"的结果。
+
+    ``action``：``paused``（running → paused）/ ``cancelled``（proposed → cancelled）/
+    ``noop``（已经处理过或没有活动）。``reason_code`` 恒为 ``needs_review``：
+    计划结束**不等于**完成，值一次显式复核。
+    """
+
+    action: str
+    reason_code: str
+    activity: ActivityView | None = None
 
 
 class ActivityService:
@@ -93,11 +133,15 @@ class ActivityService:
         origin: str = "simulated",
         source_event_ids: list[str] | None = None,
         visibility: str = "subject_private",
+        schedule_segment_id: str | None = None,
     ) -> ActivityView:
         """新建一个活动。
 
         ``origin`` 必须如实：``simulated`` 是模拟生活（不能冒充真实经历），
         ``tool_receipt`` 是有真实回执的动作，``user_stated`` 是用户刚说的。
+
+        ``schedule_segment_id`` 只在"从新时间轴的叶段启动"时给：它让同一个段
+        的活动可以**唯一去重**（重启/重复 tick 不会各开一个）。
         """
         row = ActivityRow(
             id=new_id("act"),
@@ -110,6 +154,7 @@ class ActivityService:
             origin=origin,
             source_event_ids=list(source_event_ids or []),
             visibility=visibility,
+            schedule_segment_id=schedule_segment_id,
         )
         self._session.add(row)
         await self._session.flush()
@@ -240,4 +285,135 @@ class ActivityService:
             origin=str(row.origin),
             plan_id=row.plan_id,
             visibility=str(row.visibility),
+            schedule_segment_id=row.schedule_segment_id,
         )
+
+    # ---------------------------------------------------------- 日程段边界（阶段 2）
+    #
+    # 设计 §3：**到段边界才动**，而且"计划时段结束"只是边界，不是完成。
+    # 这两个方法就是那条规则的可执行版本：
+    #   - `start_for_segment`：同一个 `schedule_segment_id` **只有一条**活动，
+    #     重启/重复 tick 都不会再开一个；
+    #   - `end_schedule_window`：只允许 paused / cancelled，并留 `needs_review`
+    #     原因码；**绝不**自动 completed（那需要 observed/user_confirmed 证据）。
+
+    async def activity_for_segment(self, segment_id: str) -> ActivityView | None:
+        """这条日程段已经开出来的活动（没有就 ``None``）。"""
+        if not segment_id:
+            return None
+        row = (
+            await self._session.execute(
+                select(ActivityRow)
+                .where(
+                    ActivityRow.actor_id == self._actor_id,
+                    ActivityRow.schedule_segment_id == segment_id,
+                )
+                .order_by(ActivityRow.created_at, ActivityRow.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return self._view(row) if row else None
+
+    async def start_for_segment(
+        self,
+        *,
+        segment_id: str,
+        kind: str,
+        place_id: str | None = None,
+        visibility: str = "subject_private",
+        origin: str = "simulated",
+        source_event_ids: list[str] | None = None,
+        resume: bool = True,
+    ) -> SegmentStart:
+        """到段边界起活动：**按 ``schedule_segment_id`` 唯一去重**。
+
+        三种结果（``SegmentStart.action``）：
+
+        - ``created``：新建并直接进 ``running``；
+        - ``resumed``：这一段之前被暂停过，边界重新到了 → 恢复 ``running``；
+        - ``existing``：已经有活动（running/proposed/终态）→ 原样返回，**不**再写。
+
+        并发：先按段取 PG advisory 事务锁再查-插（其它方言退化为无锁）。
+        ``activities.schedule_segment_id`` 没有唯一索引（迁移不归本任务），
+        所以"重启不重复"靠这把锁 + 先查后插；单进程重复 tick 一定幂等，
+        多 worker 的竞态窗口被这把锁压到事务级。
+        """
+        async with _SegmentLock(self._session, segment_id):
+            existing = await self.activity_for_segment(segment_id)
+            if existing is not None:
+                if (
+                    resume
+                    and existing.state == "paused"
+                    and existing.origin == "simulated"
+                ):
+                    resumed = await self.transition(existing.activity_id, "running")
+                    return SegmentStart("resumed", resumed)
+                return SegmentStart("existing", existing)
+            proposed = await self.propose(
+                kind=kind,
+                place_id=place_id,
+                origin=origin,
+                visibility=visibility,
+                source_event_ids=source_event_ids,
+                schedule_segment_id=segment_id,
+            )
+            running = await self.transition(proposed.activity_id, "running")
+            return SegmentStart("created", running)
+
+    async def end_schedule_window(
+        self, segment_id: str, *, detail: str = "计划时段已结束"
+    ) -> SegmentWindowEnd:
+        """计划时段结束：``running → paused``、``proposed → cancelled``。
+
+        **不允许 completed**：时间到点只能说明"这一段计划结束了"，不能证明
+        "她做完了"。要进 ``self_experiences``，必须有 observed / user_confirmed
+        的完成证据（见 :mod:`ling.domains.evidence`），那不在边界路径里。
+
+        原因码 ``needs_review`` 写进活动自己的 ``checkpoint``（不改日程段的表）：
+        这一段"计划结束但没证据"，值一次显式复核。
+        """
+        view = await self.activity_for_segment(segment_id)
+        if view is None:
+            return SegmentWindowEnd("noop", SEGMENT_END_REVIEW, None)
+        if view.state == "running":
+            paused = await self.transition(
+                view.activity_id,
+                "paused",
+                checkpoint={
+                    **dict(view.checkpoint or {}),
+                    "reason_code": SEGMENT_END_REVIEW,
+                    "closed_by": "schedule_window",
+                    "detail": detail,
+                },
+            )
+            return SegmentWindowEnd("paused", SEGMENT_END_REVIEW, paused)
+        if view.state == "proposed":
+            cancelled = await self.transition(view.activity_id, "cancelled")
+            return SegmentWindowEnd("cancelled", SEGMENT_END_REVIEW, cancelled)
+        # paused / 终态：边界已处理过，不重复写（幂等）。
+        return SegmentWindowEnd("noop", SEGMENT_END_REVIEW, view)
+
+
+class _SegmentLock:
+    """日程段级的 PostgreSQL 事务级 advisory lock（其它方言退化为无锁）。
+
+    ``schedule_segment_id`` 在库里只是普通索引，没有唯一约束（迁移不归本任务），
+    所以"同一段只起一个活动"要靠服务层串行化。锁的 key 只由段 id 决定：
+    两个 worker 同时到边界时，一个插、一个看到已有行。
+    """
+
+    def __init__(self, session: AsyncSession, segment_id: str) -> None:
+        self._session = session
+        self._segment_id = segment_id
+
+    async def __aenter__(self) -> None:
+        bind = self._session.get_bind()
+        if bind.dialect.name != "postgresql":
+            return
+        key = zlib.crc32(f"schedule_segment:{self._segment_id}".encode()) % 2_147_483_648
+        await self._session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": key}
+        )
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None

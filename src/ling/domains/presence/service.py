@@ -22,6 +22,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# 证据种类的判定放在跨域共享的纯规则模块（`domains/evidence.py`，不是某个域）：
+# presence 只读它，不复制"什么算事实"的第二套判据。
+from ling.domains.evidence import FACT_KINDS, EvidenceKind
 from ling.infra.models import PresenceState, SceneCommitRow, utcnow
 from ling.ports.config import LifePolicy
 
@@ -45,6 +48,46 @@ MAX_ENERGY = 100
 MIN_LOAD = 0
 MAX_LOAD = 100
 
+# ---------------------------------------------------------------- 饱腹（阶段 2）
+#
+# 设计 §3：饱腹是**模拟值**，与精力共用同一个 `settled_at` 惰性结算，
+# 不另起"饥饿 tick"。醒时 −5/小时、睡时 −2/小时，clamp 到 0..100，
+# 单次结算最多跨 24 小时（避免停机几天后一觉醒来饿到 0 那种极端跳变）。
+# 这些是工程初值，不是生理模型。
+SATIETY_DECAY_PER_HOUR_AWAKE = 5.0
+SATIETY_DECAY_PER_HOUR_ASLEEP = 2.0
+SATIETY_MAX_SETTLE_HOURS = 24.0
+SATIETY_MIN = 0
+SATIETY_MAX = 100
+# 餐食只有在**完成且有证据**（observed / user_confirmed）时才加：
+# 计划了早餐不等于吃过。区间 20..35 是设计 §3 的工程初值。
+MEAL_SATIETY_GAIN: dict[str, int] = {
+    "breakfast": 20,
+    "lunch": 30,
+    "dinner": 35,
+    "snack": 20,
+    "meal": 25,
+}
+MEAL_KINDS: tuple[str, ...] = tuple(MEAL_SATIETY_GAIN)
+
+# 场景 TTL 续期的**合法原因**（设计 §3）：真实边界事件，或活动仍在运行。
+# 没有这两条之一就不许续期——否则停机后过期场景会被"每分钟一次的空 tick"
+# 续成永久现状，又变成"我还在读书"说三天。
+SCENE_REFRESH_REASON_SEGMENT = "segment_boundary"
+SCENE_REFRESH_REASON_SLEEP = "sleep_boundary"
+SCENE_REFRESH_REASON_COMMITMENT = "commitment_boundary"
+SCENE_REFRESH_REASON_RUNNING = "running_activity"
+SCENE_REFRESH_REASONS = frozenset(
+    {
+        SCENE_REFRESH_REASON_SEGMENT,
+        SCENE_REFRESH_REASON_SLEEP,
+        SCENE_REFRESH_REASON_COMMITMENT,
+        SCENE_REFRESH_REASON_RUNNING,
+    }
+)
+# 剩余 TTL 少于一半时才续：既不让场景在活跃期过期，也不每分钟写一行。
+SCENE_REFRESH_THRESHOLD_RATIO = 0.5
+
 
 def _clamp(value: float, low: int, high: int) -> int:
     return int(max(low, min(high, round(value))))
@@ -57,6 +100,8 @@ class PresenceView:
     # 由精力与负担推出的可打扰程度。这是给表达层用的**唯一**结论，
     # 不让调用方各自解读 energy 数值（那样每个地方都会有一套阈值）。
     availability: str  # available / low / resting
+    # 模拟饱腹（0–100）。低饱腹只影响选择，不阻断直接答复。
+    satiety: int = 70
 
     def describe(self) -> str:
         """给提示词的一句话。刻意简短且不断言生理。"""
@@ -65,6 +110,24 @@ class PresenceView:
         if self.availability == "low":
             return "你精神一般，回复可以短一点"
         return ""
+
+
+@dataclass(frozen=True)
+class SatietyUpdate:
+    """一次"餐食 → 饱腹"的结果（不写表以外的任何地方）。
+
+    ``applied`` 为假时 ``reason_code`` 说明为什么没加：
+    ``evidence_clock_only``（只有时钟/计划，不算吃过）、``unknown_meal_kind``。
+    """
+
+    applied: bool
+    reason_code: str
+    satiety_before: int
+    satiety_after: int
+
+    @property
+    def delta(self) -> int:
+        return self.satiety_after - self.satiety_before
 
 
 @dataclass(frozen=True)
@@ -130,12 +193,19 @@ class PresenceService:
             await self._session.flush()
         return row
 
-    async def settle(self, *, now: datetime | None = None) -> PresenceState:
-        """按**经过时间**结算衰减。
+    async def settle(
+        self, *, now: datetime | None = None, asleep: bool = False
+    ) -> PresenceState:
+        """按**经过时间**结算衰减（精力、社交负担、饱腹）。
 
         幂等的关键：结算后把 ``settled_at`` 推到 ``now``。
         重复调用（重放、双 worker）只会按真正流逝的时间扣一次，
         而不是每次读都扣一次。
+
+        ``asleep=True`` 只影响**饱腹**的衰减速度（睡时 −2/小时、醒时 −5/小时，
+        设计 §3）；精力仍旧沿用已发布配置里的费率，不在本任务里改口径。
+        饱腹的单次结算最多跨 :data:`SATIETY_MAX_SETTLE_HOURS`（24 小时）：
+        停机几天后醒来不该从 70 直接掉到 0。
         """
         now = now or utcnow()
         row = await self._row()
@@ -160,6 +230,17 @@ class PresenceService:
                 float(row.social_load) - self._policy.social_load_decay_per_hour * elapsed_hours,
                 MIN_LOAD,
                 MAX_LOAD,
+            )
+            satiety_rate = (
+                SATIETY_DECAY_PER_HOUR_ASLEEP
+                if asleep
+                else SATIETY_DECAY_PER_HOUR_AWAKE
+            )
+            satiety_hours = min(elapsed_hours, SATIETY_MAX_SETTLE_HOURS)
+            row.satiety = _clamp(
+                float(row.satiety) - satiety_rate * satiety_hours,
+                SATIETY_MIN,
+                SATIETY_MAX,
             )
             row.settled_at = now
             row.revision = int(row.revision or 0) + 1
@@ -186,7 +267,60 @@ class PresenceService:
             availability = "low"
         else:
             availability = "available"
-        return PresenceView(energy=energy, social_load=load, availability=availability)
+        return PresenceView(
+            energy=energy,
+            social_load=load,
+            availability=availability,
+            satiety=int(row.satiety),
+        )
+
+    async def record_meal(
+        self,
+        *,
+        evidence_kind: EvidenceKind | str,
+        meal_kind: str = "meal",
+        now: datetime | None = None,
+    ) -> SatietyUpdate:
+        """餐食**完成且有证据**时才加饱腹（设计 §3）。
+
+        硬门：只有 ``observed`` / ``user_confirmed`` 两种证据才加。计划了餐食、
+        或只有时钟证据（"中午到了"）时**不加**——那正是"把计划当事实"的入口。
+
+        幂等由调用方保证：本方法只处理"一次真实的完成事件"，活动终态本身就
+        是一次性的；``presence_states`` 没有可存事件键的列（迁移不归本任务），
+        所以这里不另造去重表，**也不假装有**去重。
+        """
+        try:
+            kind = EvidenceKind(str(evidence_kind))
+        except ValueError as exc:
+            raise ValueError(f"未知的证据种类: {evidence_kind}") from exc
+        row = await self.settle(now=now)
+        before = int(row.satiety)
+        if kind not in FACT_KINDS:
+            # clock_only：时间到了不等于吃过。原样返回，不写表。
+            return SatietyUpdate(
+                applied=False,
+                reason_code="evidence_clock_only",
+                satiety_before=before,
+                satiety_after=before,
+            )
+        gain = MEAL_SATIETY_GAIN.get(str(meal_kind).strip())
+        if gain is None:
+            return SatietyUpdate(
+                applied=False,
+                reason_code="unknown_meal_kind",
+                satiety_before=before,
+                satiety_after=before,
+            )
+        row.satiety = _clamp(float(before) + gain, SATIETY_MIN, SATIETY_MAX)
+        row.revision = int(row.revision or 0) + 1
+        await self._session.flush()
+        return SatietyUpdate(
+            applied=True,
+            reason_code="",
+            satiety_before=before,
+            satiety_after=int(row.satiety),
+        )
 
     # ---------------------------------------------------------- 当前场景
 
@@ -225,15 +359,58 @@ class PresenceService:
         await self._session.flush()
         return row
 
-    async def clear_scene(self) -> None:
-        """打断/结束时清空——留着旧场景会让它继续自述。"""
+    async def clear_scene(self, *, now: datetime | None = None) -> None:
+        """打断/结束时清空——留着旧场景会让它继续自述。
+
+        ``now`` 可显式传入（调度/测试用固定时刻）；不传就是真实时钟。
+        """
         row = await self._session.get(SceneCommitRow, self._actor_id)
         if row is not None:
             row.state = "unknown"
             row.activity_id = None
             row.place_id = None
-            row.valid_until = utcnow()
+            row.valid_until = now or utcnow()
             await self._session.flush()
+
+    async def refresh_scene_ttl(
+        self,
+        *,
+        reason: str,
+        activity_running: bool = False,
+        ttl: timedelta | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """给**当前**场景续期；不合法就不写（返回 ``False``）。
+
+        设计 §3 的唯一允许条件：**真实边界事件**（段开始/结束、进入睡眠窗、
+        已确认约定到期）或**活动仍在运行**。所以：
+
+        - ``reason`` 必须在 :data:`SCENE_REFRESH_REASONS` 里，或 ``activity_running``
+          为真；两者都没有 → 拒绝续期（这是"停机上三天还说在读书"的洞）；
+        - 场景是 ``unknown`` / 已过期 / 本来就没有 → 不续（过期就是 unknown，
+          不能靠续期把过期状态救回来）；
+        - 剩余 TTL 还超过一半 → 不写（避免每 60 秒一行 churn）。
+
+        返回 ``True`` 表示这一次真的写了 ``valid_until``。
+        """
+        if reason not in SCENE_REFRESH_REASONS and not activity_running:
+            return False
+        moment = now or utcnow()
+        row = await self._session.get(SceneCommitRow, self._actor_id)
+        if row is None:
+            return False
+        valid_until = row.valid_until
+        if valid_until is not None and valid_until.tzinfo is None:
+            valid_until = valid_until.replace(tzinfo=UTC)
+        if str(row.state) == "unknown" or valid_until is None or valid_until <= moment:
+            return False
+        window = ttl or timedelta(minutes=self._policy.scene_ttl_minutes)
+        remaining = valid_until - moment
+        if remaining > window * SCENE_REFRESH_THRESHOLD_RATIO:
+            return False
+        row.valid_until = moment + window
+        await self._session.flush()
+        return True
 
     async def scene(self, *, now: datetime | None = None) -> SceneView:
         """读当前场景。**过期即 unknown**，不沿用旧值。"""
@@ -266,8 +443,18 @@ class PresenceService:
 
 __all__ = [
     "DEFAULT_SCENE_TTL",
+    "MEAL_KINDS",
+    "MEAL_SATIETY_GAIN",
+    "SATIETY_DECAY_PER_HOUR_ASLEEP",
+    "SATIETY_DECAY_PER_HOUR_AWAKE",
+    "SCENE_REFRESH_REASONS",
+    "SCENE_REFRESH_REASON_COMMITMENT",
+    "SCENE_REFRESH_REASON_RUNNING",
+    "SCENE_REFRESH_REASON_SEGMENT",
+    "SCENE_REFRESH_REASON_SLEEP",
     "SCENE_STATES",
     "PresenceService",
     "PresenceView",
+    "SatietyUpdate",
     "SceneView",
 ]

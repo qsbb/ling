@@ -1261,7 +1261,7 @@ def validate_outline(
                 continue
             if cited.state != "confirmed" and not has_hedge_marker(clean_title):
                 problems.append(
-                    f"{label}.title 引用了{_STATE_WORD[cited.state]}意向"
+                    f"{label}.title 引用了{_STATE_WORD.get(cited.state, '候选')}意向"
                     f"「{cited.title}」，但没有用「可能/打算」这类语气："
                     "候选不能写成既成事实"
                 )
@@ -2418,9 +2418,13 @@ class _Reservation:
 
 
 async def _day_call_totals(
-    session: AsyncSession, *, actor_id: str, plan_day: date
+    session: AsyncSession, *, actor_id: str, plan_day: date, kind: str = OUTLINE_KIND
 ) -> tuple[int, int]:
-    """当日该 actor 的 ``outline`` 调用次数与已预留/已用 token 上界。"""
+    """当日该 actor 的 ``kind``（默认大纲）调用次数与已预留/已用 token 上界。
+
+    细化（``refine``）与大纲**各算各的账**：设计 §0 的预算表把它们列成两行，
+    共用一张 ``behavior_model_calls`` 但按 ``kind`` 分开计。
+    """
     rows = (
         await session.execute(
             select(
@@ -2431,7 +2435,7 @@ async def _day_call_totals(
             ).where(
                 BehaviorModelCallRow.actor_id == actor_id,
                 BehaviorModelCallRow.plan_day == plan_day,
-                BehaviorModelCallRow.kind == OUTLINE_KIND,
+                BehaviorModelCallRow.kind == kind,
                 BehaviorModelCallRow.state.in_(["reserved", "committed", "failed"]),
             )
         )
@@ -2454,20 +2458,33 @@ async def _reserve_call(
     idempotency_key: str,
     now: datetime,
     lease_owner: str,
+    kind: str = OUTLINE_KIND,
+    max_calls: int = OUTLINE_MAX_CALLS,
+    daily_token_budget: int = OUTLINE_DAILY_TOKEN_BUDGET,
+    reserved_input_tokens: int = OUTLINE_RESERVED_INPUT_TOKENS,
+    reserved_output_tokens: int = OUTLINE_RESERVED_OUTPUT_TOKENS,
+    lease_seconds: float = OUTLINE_LEASE_SECONDS,
+    attempt: int | None = None,
 ) -> _Reservation | None:
-    """预约一次大纲调用（预算闸 + lease），拿不到返回 ``None``。
+    """预约一次行为模型调用（预算闸 + lease），拿不到返回 ``None``。
+
+    默认参数就是**大纲**的口径（既有调用点行为不变）；细化传自己的
+    ``kind``/上限/预算/租约——设计 §0 把它们列成两张额度。
 
     并发安全三层（设计 §3）：``UNIQUE(actor,kind,key,attempt)`` 让同一 attempt
     只有一个赢家；``lease_until`` 让过期抢占只能开新 attempt；预算表落库，
     重启后旧预留仍计入当日上限，避免重复烧钱。
     """
-    calls, budget = await _day_call_totals(session, actor_id=actor_id, plan_day=plan_day)
-    if calls >= OUTLINE_MAX_CALLS:
+    calls, budget = await _day_call_totals(
+        session, actor_id=actor_id, plan_day=plan_day, kind=kind
+    )
+    if calls >= max_calls:
         return None
-    reserved = OUTLINE_RESERVED_INPUT_TOKENS + OUTLINE_RESERVED_OUTPUT_TOKENS
-    if budget + reserved > OUTLINE_DAILY_TOKEN_BUDGET:
+    reserved = reserved_input_tokens + reserved_output_tokens
+    if budget + reserved > daily_token_budget:
         return None
-    attempt = calls + 1
+    if attempt is None:
+        attempt = calls + 1
     call_id = new_id("bcall")
     try:
         async with session.begin_nested():
@@ -2476,15 +2493,20 @@ async def _reserve_call(
                     id=call_id,
                     actor_id=actor_id,
                     plan_day=plan_day,
-                    kind=OUTLINE_KIND,
+                    kind=kind,
                     window_id="",
                     idempotency_key=idempotency_key,
                     attempt=attempt,
                     state="reserved",
-                    reserved_input_tokens=OUTLINE_RESERVED_INPUT_TOKENS,
-                    reserved_output_tokens=OUTLINE_RESERVED_OUTPUT_TOKENS,
+                    reserved_input_tokens=reserved_input_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
                     lease_owner=lease_owner,
-                    lease_until=now + timedelta(seconds=OUTLINE_LEASE_SECONDS),
+                    lease_until=now + timedelta(seconds=lease_seconds),
+                    # 显式写调用时刻：滚动额度（细化每 3 小时一次）要按**这次**
+                    # 调用的时间算，不能用"行被 flush 的那一瞬"（测试固定时钟时
+                    # 两者会不同）。生产里 `now` 就是真实时钟，行为不变。
+                    created_at=now,
+                    updated_at=now,
                 )
             )
             await session.flush()
@@ -3395,8 +3417,8 @@ async def ensure_day_plan(
                 source_event_ids: list[str] = []
                 if block.intention_id:
                     source_event_ids.append(f"intention:{block.intention_id}")
-                if link is None and block.intention_id and unplaced_reason:
-                    # 引用了该意向却没落成准备段（没空档/资格变了）：只记原因码，
+                if link is None and block.preparation and unplaced_reason:
+                    # 本来要当准备段却没落成（没空档/资格在调用间变了）：只记原因码，
                     # 段本身仍是普通可选块，不冒充"今天要准备"。
                     source_event_ids.append(f"{REASON_TAG_PREFIX}{unplaced_reason}")
                 drafts.append(
@@ -3715,6 +3737,995 @@ async def run_due_outline(
         timezone=timezone,
         timezone_source=timezone_source,
         lease_owner=lease_owner,
+    )
+
+
+# ---------------------------------------------------------------- 近窗细化（阶段 2）
+#
+# 设计 §3：大块是"打算做什么"，小时/分钟是"若无新事，可能怎样做"。全天分钟级
+# 既烧钱又会被现实频繁推翻，所以只在**近窗**细化：距最早未细化段开始不足
+# `REFINE_TRIGGER_MINUTES`、且未来 `REFINE_LOOKAHEAD_HOURS` 小时里确有粗段时才跑。
+#
+# 下面每个数字都是**工程初值**（设计 §0 的预算表），不是研究结论。
+# 每个父段的子段数、子段最短时长、递归层级、每 3 小时滚动次数都有**硬上限**；
+# 上限在代码里判，不交给模型自律。
+
+REFINE_KIND = "refine"
+# 与大纲共用 `memory.extract` 职责：不新开 `planning` 槽位（设计 §0）。
+REFINE_PROFILE = OUTLINE_PROFILE
+
+# 触发与窗口：距最早未细化段开始 ≤ 60 分钟才值得跑；只看未来 3 小时。
+REFINE_TRIGGER_MINUTES = 60
+REFINE_LOOKAHEAD_HOURS = 3
+# 滚动额度：每 3 小时最多 1 次细化调用（独立于"每计划日 4 次"的总量上限）。
+REFINE_ROLLING_HOURS = 3
+REFINE_ROLLING_MAX_CALLS = 1
+# 每计划日上限：设计 §0 的 4 次 / 7,200 token。
+REFINE_MAX_CALLS_PER_DAY = 4
+REFINE_RESERVED_INPUT_TOKENS = 1000
+REFINE_RESERVED_OUTPUT_TOKENS = 800
+REFINE_DAILY_TOKEN_BUDGET = 7200
+REFINE_TIMEOUT_SECONDS = 60.0
+REFINE_LEASE_SECONDS = 120.0
+
+# 单个父段的硬上限：一次最多 4 个子段，每段至少 5 分钟（"5–15 分钟叶段"的下界），
+# 最长不超过 3 小时。递归层级也在这里封死：block → hour → minute，
+# minute 不再细化（`REFINE_LAYER_STEPS` 里没有它）。
+REFINE_MAX_CHILDREN = 4
+REFINE_MIN_CHILD_MINUTES = 5
+REFINE_MAX_CHILD_MINUTES = 180
+REFINE_CHILD_TITLE_CHARS = 40
+REFINE_LAYER_STEPS: dict[str, str] = {"block": "hour", "hour": "minute"}
+REFINE_COARSE_LAYERS: tuple[str, ...] = ("block", "hour")
+
+# 同一窗口只尝试**一次**：失败/空结果当次不重试（设计 §3："CAS 失败丢弃旧响应，
+# 未来窗口再试"）。所以同一幂等键最多一行预算记录，下一轮扫描看到它就跳过。
+REFINE_MAX_ATTEMPTS_PER_WINDOW = 1
+# 剩余窗口太碎（< 30 分钟）就不细化：为塞碎片而调模型是把成本换成噪声。
+REFINE_MIN_WINDOW_MINUTES = 30
+
+REASON_REFINE_INVALID = "refine_invalid"
+REASON_REFINE_EMPTY = "refine_empty"
+REASON_REFINE_STALE = "stale_revision"
+REASON_REFINE_ATTEMPTED = "window_attempted"
+REASON_REFINE_ROLLING = "rolling_limit"
+REASON_REFINE_STALE_TARGET = "stale_target"
+
+
+def _ceil_minute(value: datetime) -> datetime:
+    """向上取整到分钟（窗口起点用它：既稳定成幂等键，又不会落进过去）。"""
+    floored = _aware(value).replace(second=0, microsecond=0)
+    return floored if floored == _aware(value) else floored + timedelta(minutes=1)
+
+
+@dataclass(frozen=True)
+class CoarseSegment:
+    """一个"粗段"：block/hour 层、可变、还有未来部分。
+
+    **"未细化"的操作定义**是"没有 current 子段"：大纲产出的模型大块落库时
+    ``is_leaf=True``（它自己就能启动活动），一旦被细化过就翻成 ``False``
+    并长出子段。所以判据不能只看 ``is_leaf``——否则普通一天永远不会被细化。
+    """
+
+    segment_id: str
+    layer: str
+    kind: str
+    title: str
+    start_at: datetime
+    end_at: datetime
+    place_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RefineTarget:
+    """一次细化作业的目标：**一个**父段 + 一个未来窗口（设计 §3）。"""
+
+    plan_id: str
+    plan_day: date
+    revision: int
+    parent: CoarseSegment
+    window_start: datetime
+    window_end: datetime
+    child_layer: str
+    actor_id: str = ""
+    timezone: str = "UTC"
+    anchors: tuple[Anchor, ...] = ()
+    place_ids: frozenset[str] = frozenset()
+
+    @property
+    def idempotency_key(self) -> str:
+        return refine_key(self.plan_id, self.revision, self.window_start)
+
+
+def refine_key(plan_id: str, revision: int, window_start: datetime) -> str:
+    """幂等键：``refine:{plan_id}:{revision}:{window_start_utc}``（设计 §3）。
+
+    窗口起点用**分钟精度的 UTC**：扫描每 60 秒一次，同一分钟的多次扫描必须
+    落到同一个键上，否则 outbox 与预算表会各记一份，等于每 5 分钟重烧一次。
+    """
+    stamp = _aware(window_start).astimezone(UTC).strftime("%Y%m%dT%H%MZ")
+    return f"{REFINE_KIND}:{plan_id}:{int(revision)}:{stamp}"
+
+
+@dataclass(frozen=True)
+class RefineChild:
+    """校验通过的一个子段（还是意向，不是活动）。"""
+
+    layer: str
+    kind: str
+    title: str
+    start_at: datetime
+    end_at: datetime
+    place_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RefineOutcome:
+    """一次近窗细化的结果。字段可解释，不含 prompt/正文。"""
+
+    state: str  # refined / no_target / unchanged / blocked / failed / busy / stale_target
+    plan_id: str | None = None
+    plan_day: date | None = None
+    parent_id: str | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    revision_before: int = 0
+    revision_after: int = 0
+    children: int = 0
+    calls: int = 0
+    reason_code: str | None = None
+    provider_id: str | None = None
+    idempotency_key: str | None = None
+
+
+class RefineValidationError(ValueError):
+    """细化输出不合约：带**逐条**原因，供日志/行为事件使用（不带原文）。
+
+    与大纲不同，细化**不做修复重试**（设计 §0：每窗口只尝试一次）：
+    非法就保留粗段，把原因记在预算行上。
+    """
+
+    def __init__(self, problems: list[str]) -> None:
+        super().__init__("；".join(problems))
+        self.problems = problems
+
+
+_REFINE_OUTPUT_KEYS = {"parent_id", "children"}
+_REFINE_CHILD_KEYS = {"layer", "start_at", "end_at", "title", "kind", "place_id"}
+
+
+def refine_trigger_due(now: datetime, *, start_at: datetime) -> bool:
+    """这个粗段现在值得细化吗（距开始 ≤ 60 分钟）。
+
+    只判"最早未细化段"：调用方按 ``start_at`` 升序取第一个候选，
+    它不够近就整轮不跑——**不允许**跳过它去细化更远的段，否则每 5 分钟
+    都会换一个父段重烧调用。
+    """
+    return _aware(start_at) <= _ceil_minute(now) + timedelta(
+        minutes=REFINE_TRIGGER_MINUTES
+    )
+
+
+def refine_window(
+    now: datetime, *, start_at: datetime, end_at: datetime
+) -> tuple[datetime, datetime] | None:
+    """这一次要细化的**未来窗口**：``[max(now, 父段起点), min(父段终点, now+3h))``。
+
+    返回 ``None`` 表示"不细化"：父段已经过去（过去永不回填），
+    或剩余窗口太碎（< 30 分钟）。
+    """
+    moment = _ceil_minute(now)
+    parent_end = _aware(end_at)
+    if parent_end <= moment:
+        return None
+    window_start = max(moment, _aware(start_at))
+    window_end = min(parent_end, moment + timedelta(hours=REFINE_LOOKAHEAD_HOURS))
+    if window_end - window_start < timedelta(minutes=REFINE_MIN_WINDOW_MINUTES):
+        return None
+    return window_start, window_end
+
+
+async def load_coarse_segments(
+    session: AsyncSession, *, plan_id: str, now: datetime
+) -> list[CoarseSegment]:
+    """某版计划里**还没细化**的粗段，按 ``start_at`` 升序（只读）。
+
+    "未细化"= ``layer ∈ {block, hour}``、可变（``anchor_kind=''``）、
+    ``end_at > now``（过去的不追补）、**没有 current 子段**。
+
+    ``is_leaf`` 不参与判定：大纲产出的模型大块是 ``is_leaf=True``（自己就能启动
+    活动），细化后翻成 ``False`` 并长出子段。只看 ``is_leaf`` 会让普通一天永远
+    没有候选；只看"有没有子段"才是"细化过没有"的可核对事实。
+    """
+    moment = _aware(now)
+    rows = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == plan_id,
+                    ScheduleSegmentRow.status == "current",
+                    ScheduleSegmentRow.layer.in_(REFINE_COARSE_LAYERS),
+                    ScheduleSegmentRow.anchor_kind == "",
+                    ScheduleSegmentRow.end_at > moment,
+                )
+                .order_by(ScheduleSegmentRow.start_at, ScheduleSegmentRow.id)
+            )
+        ).scalars()
+    )
+    if not rows:
+        return []
+    refined_parent_ids = {
+        str(parent_id)
+        for (parent_id,) in (
+            await session.execute(
+                select(ScheduleSegmentRow.parent_id)
+                .where(
+                    ScheduleSegmentRow.plan_id == plan_id,
+                    ScheduleSegmentRow.status == "current",
+                    ScheduleSegmentRow.parent_id.is_not(None),
+                )
+                .distinct()
+            )
+        ).all()
+        if parent_id
+    }
+    return [
+        CoarseSegment(
+            segment_id=str(item.id),
+            layer=str(item.layer),
+            kind=str(item.kind),
+            title=str(item.title),
+            start_at=_aware(item.start_at),
+            end_at=_aware(item.end_at),
+            place_id=item.place_id,
+        )
+        for item in rows
+        if str(item.id) not in refined_parent_ids
+    ]
+
+
+async def load_refine_target(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    now: datetime,
+    plan_day: date | None = None,
+    timezone: str | None = None,
+) -> RefineTarget | None:
+    """按**固定规则**选这一次要细化的父段与窗口；没有合格目标返回 ``None``。
+
+    选择规则（写死在代码里，不让模型决定）：
+
+    1. 只看**当前计划日**（``now`` 落在该计划窗口内）的 ``current`` 段；
+    2. 候选 = ``layer ∈ {block, hour}``、``anchor_kind = ''``（睡眠/承诺锚点不可
+       细化）、``end_at > now``（过去的不追补）、**没有 current 子段**（= 未细化）；
+    3. 按 ``start_at`` 升序取**第一个**；它距开始还超过 60 分钟就整轮不跑；
+    4. 子段层 = 父层下一层（block→hour、hour→minute）；minute 不再细化；
+    5. 窗口 = :func:`refine_window`；不够 30 分钟就不细化。
+
+    第 3 条就是"避免每 5 分钟反复选同一父段白烧调用"的固定规则：
+    幂等键固定，且同一键只允许一次尝试（见 :data:`REFINE_MAX_ATTEMPTS_PER_WINDOW`）。
+    """
+    moment = _aware(now)
+    if plan_day is None:
+        if timezone is None:
+            timezone, _source = await resolve_plan_timezone(session)
+        plan_day = plan_day_for(moment, timezone)
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    if row is None:
+        return None
+    plan_timezone = str(row.timezone or timezone or "UTC")
+    window_start_at, window_end_at = plan_day_window(plan_day, plan_timezone)
+    if not (window_start_at <= moment < window_end_at):
+        # 不在这一计划日的窗口内（例如 23:59 之后）：不跨日细化。
+        return None
+
+    candidates = await load_coarse_segments(session, plan_id=str(row.id), now=moment)
+    if not candidates:
+        return None
+
+    parent = candidates[0]
+    if not refine_trigger_due(moment, start_at=parent.start_at):
+        return None  # 最早的一段还远：现在细化只会白烧调用
+    child_layer = REFINE_LAYER_STEPS.get(parent.layer)
+    if child_layer is None:
+        return None  # 已经是最细层
+    bounds = refine_window(moment, start_at=parent.start_at, end_at=parent.end_at)
+    if bounds is None:
+        return None
+    window_start, window_end = bounds
+
+    anchor_rows = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == row.id,
+                    ScheduleSegmentRow.status == "current",
+                    ScheduleSegmentRow.anchor_kind != "",
+                    ScheduleSegmentRow.start_at < window_end,
+                    ScheduleSegmentRow.end_at > window_start,
+                )
+                .order_by(ScheduleSegmentRow.start_at)
+            )
+        ).scalars()
+    )
+    anchors = tuple(
+        Anchor(
+            kind=str(item.anchor_kind),
+            start_at=_aware(item.start_at),
+            end_at=_aware(item.end_at),
+            title=str(item.title),
+            protective=str(item.anchor_kind) != SLEEP_ANCHOR,
+        )
+        for item in anchor_rows
+    )
+    places = {str(item["id"]) for item in await _valid_places(session, actor_id)}
+    return RefineTarget(
+        plan_id=str(row.id),
+        plan_day=plan_day,
+        revision=int(row.revision),
+        parent=parent,
+        window_start=window_start,
+        window_end=window_end,
+        child_layer=child_layer,
+        actor_id=str(row.actor_id),
+        timezone=plan_timezone,
+        anchors=anchors,
+        place_ids=frozenset(places),
+    )
+
+
+def parse_refine_output(raw: str) -> tuple[str, list[object]]:
+    """严格解析 ``{"parent_id": "...", "children": [...]}``；不做宽容修。"""
+    text = (raw or "").strip()
+    if not text:
+        raise RefineValidationError(["输出为空"])
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RefineValidationError(
+            [f"不是合法 JSON（{exc.msg} @ {exc.pos}）"]
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RefineValidationError(["顶层必须是 JSON 对象"])
+    extra = set(payload) - _REFINE_OUTPUT_KEYS
+    if extra:
+        raise RefineValidationError([f"顶层有未定义字段：{sorted(extra)}"])
+    parent_id = payload.get("parent_id")
+    if not isinstance(parent_id, str) or not parent_id.strip():
+        raise RefineValidationError(["parent_id 必须是非空字符串"])
+    children = payload.get("children")
+    if not isinstance(children, list):
+        raise RefineValidationError(["children 必须是数组"])
+    return parent_id.strip(), children
+
+
+def validate_refine_children(
+    children: list[object],
+    *,
+    parent: CoarseSegment,
+    child_layer: str,
+    window_start: datetime,
+    window_end: datetime,
+    anchors: Sequence[Anchor] = (),
+    valid_place_ids: set[str] | frozenset[str] = frozenset(),
+) -> list[RefineChild]:
+    """把模型输出校验成可入库的子段；任何一条不合就整份拒收。
+
+    硬约束（设计 §3"只允许落在父块与未来窗口内"）：
+
+    1. 条数 1..``REFINE_MAX_CHILDREN``，层必须正好是父层的下一层（递归层级硬上限）；
+    2. 每条 5..180 分钟，且完整落在**父块**与**未来窗口**的双重交叠内；
+    3. 兄弟之间不重叠（半开区间）；**不要求铺满父块**——没想好的部分保持粗粒度；
+    4. 不压不可移动锚点；地点必须在有效地点表里；
+    5. 标题不许出现"已经/答应了/一定"这类完成或承诺声称（计划不是事实）；
+    6. 未知字段、非分钟精度、缺时区偏移一律拒收。
+
+    返回空列表表示"模型没给出可用的子段"（调用方按 ``refine_empty`` 处理，
+    同样不重试）：不为了填满窗口而造段。
+    """
+    problems: list[str] = []
+    if len(children) > REFINE_MAX_CHILDREN:
+        problems.append(
+            f"子段数 {len(children)} 超过上限 {REFINE_MAX_CHILDREN}（不要写流水账）"
+        )
+    accepted: list[RefineChild] = []
+    for index, raw in enumerate(children):
+        label = f"children[{index}]"
+        if not isinstance(raw, dict):
+            problems.append(f"{label} 不是对象")
+            continue
+        unknown = set(raw) - _REFINE_CHILD_KEYS
+        if unknown:
+            problems.append(f"{label} 有未定义字段：{sorted(unknown)}")
+            continue
+        layer = raw.get("layer")
+        if not isinstance(layer, str) or layer != child_layer:
+            problems.append(f"{label}.layer 必须是 {child_layer}（递归层级硬上限）")
+            continue
+        kind = raw.get("kind")
+        if not isinstance(kind, str) or kind not in MODEL_KINDS:
+            problems.append(f"{label}.kind 不在白名单：{kind!r}")
+            continue
+        title = raw.get("title")
+        if not isinstance(title, str):
+            problems.append(f"{label}.title 必须是字符串")
+            continue
+        clean_title = " ".join(title.split())
+        if not clean_title or len(clean_title) > REFINE_CHILD_TITLE_CHARS:
+            problems.append(
+                f"{label}.title 长度必须在 1..{REFINE_CHILD_TITLE_CHARS}"
+            )
+            continue
+        claim = find_claim_marker(clean_title)
+        if claim is not None:
+            problems.append(
+                f"{label}.title 把意向写成了完成或承诺（出现「{claim}」）："
+                "子段仍是计划，不是已发生的事"
+            )
+            continue
+        place = raw.get("place_id")
+        if place is not None and (
+            not isinstance(place, str) or place not in valid_place_ids
+        ):
+            problems.append(f"{label}.place_id 是未知地点：{place!r}")
+            continue
+        try:
+            start = _parse_iso_minute(raw.get("start_at"), f"{label}.start_at")
+            end = _parse_iso_minute(raw.get("end_at"), f"{label}.end_at")
+        except OutlineValidationError as exc:
+            problems.extend(exc.problems)
+            continue
+        if end <= start:
+            problems.append(f"{label} 的 end_at 必须晚于 start_at")
+            continue
+        duration = end - start
+        if duration < timedelta(minutes=REFINE_MIN_CHILD_MINUTES):
+            problems.append(
+                f"{label} 只有 {int(duration.total_seconds() // 60)} 分钟，"
+                f"短于下限 {REFINE_MIN_CHILD_MINUTES} 分钟"
+            )
+            continue
+        if duration > timedelta(minutes=REFINE_MAX_CHILD_MINUTES):
+            problems.append(
+                f"{label} 超过上限 {REFINE_MAX_CHILD_MINUTES} 分钟"
+            )
+            continue
+        if start < parent.start_at or end > parent.end_at:
+            problems.append(f"{label} 越出父块 [{parent.start_at.isoformat()}, "
+                            f"{parent.end_at.isoformat()})")
+            continue
+        if start < window_start or end > window_end:
+            problems.append(
+                f"{label} 越出未来窗口 [{window_start.isoformat()}, "
+                f"{window_end.isoformat()})"
+            )
+            continue
+        if any(
+            overlaps(start, end, anchor.start_at, anchor.end_at)
+            for anchor in anchors
+        ):
+            problems.append(f"{label} 压到了不可移动锚点")
+            continue
+        accepted.append(
+            RefineChild(
+                layer=layer,
+                kind=kind,
+                title=clean_title,
+                start_at=start,
+                end_at=end,
+                place_id=place,
+            )
+        )
+
+    ordered = sorted(accepted, key=lambda item: item.start_at)
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        if overlaps(previous.start_at, previous.end_at, current.start_at, current.end_at):
+            problems.append(
+                "子段之间重叠："
+                f"{previous.start_at.isoformat()}–{previous.end_at.isoformat()} 与 "
+                f"{current.start_at.isoformat()}–{current.end_at.isoformat()}"
+            )
+    if problems:
+        raise RefineValidationError(problems)
+    return ordered
+
+
+_REFINE_INSTRUCTIONS = """你是角色「{name}」的日程细化器：把一个**已有的粗块**拆成更小的子段。
+
+只输出一个 JSON 对象（不要解释、不要 Markdown 代码块）：
+{{"parent_id":"{parent_id}","children":[{{"layer":"{child_layer}","start_at":"<带时区偏移的 ISO-8601>","end_at":"<同上>","title":"<不超过 40 字>","kind":"<白名单里的一个>","place_id":null}}]}}
+
+硬约束（违反任一条整份输出作废）：
+1. 只允许 {child_layer} 层；最多 {max_children} 个子段，每个至少 {min_minutes} 分钟；
+2. 每个子段必须完整落在父块 [{parent_start}, {parent_end}) 与未来窗口 [{window_start}, {window_end}) 之内；
+3. 子段之间不许重叠；**不要求铺满父块**——没想好的部分保持粗粒度；
+4. 不许压到不可移动锚点（睡眠/已确认约定）；
+5. 不要重复父块本身，不要写睡眠，不要写"已经做完/答应了/一定"这类完成或承诺；
+6. 时间必须带时区偏移、精确到分钟（秒必须为 0），不要写本地朴素时间；
+7. kind 只能取：{kinds}；place_id 只能取输入给出的地点 id 或 null。
+
+输入：
+{snapshot}
+"""
+
+
+def build_refine_prompt(
+    *,
+    target: RefineTarget,
+    now: datetime,
+    persona_name: str = "她",
+) -> str:
+    """拼一次细化的提示词（设计 §0：输入 ≤ 1,000 token）。
+
+    只给**单个父块、近窗与锚点**：不塞人设全文、不塞聊天原文、不塞梦。
+    超预算时先砍地点、再砍锚点标题长度——**绝不**砍窗口边界与硬约束。
+    """
+    def render(*, with_places: bool, anchor_title_chars: int) -> str:
+        snapshot: dict[str, object] = {
+            "now_utc": _aware(now).astimezone(UTC).isoformat(),
+            "plan_day": target.plan_day.isoformat(),
+            "timezone": target.timezone,
+            "parent": {
+                "id": target.parent.segment_id,
+                "layer": target.parent.layer,
+                "kind": target.parent.kind,
+                "title": _short(target.parent.title, REFINE_CHILD_TITLE_CHARS),
+                "start_at": target.parent.start_at.isoformat(),
+                "end_at": target.parent.end_at.isoformat(),
+                "local": [
+                    local_hhmm(target.parent.start_at, target.timezone),
+                    local_hhmm(target.parent.end_at, target.timezone),
+                ],
+                "place_id": target.parent.place_id,
+            },
+            "future_window": {
+                "start_at": target.window_start.isoformat(),
+                "end_at": target.window_end.isoformat(),
+                "local": [
+                    local_hhmm(target.window_start, target.timezone),
+                    local_hhmm(target.window_end, target.timezone),
+                ],
+            },
+            "immutable_anchors": [
+                {
+                    "kind": anchor.kind,
+                    "title": _short(anchor.title, anchor_title_chars),
+                    "start_at": anchor.start_at.isoformat(),
+                    "end_at": anchor.end_at.isoformat(),
+                }
+                for anchor in target.anchors
+            ],
+        }
+        if with_places:
+            snapshot["valid_places"] = sorted(target.place_ids)
+        return _REFINE_INSTRUCTIONS.format(
+            name=persona_name,
+            parent_id=target.parent.segment_id,
+            child_layer=target.child_layer,
+            max_children=REFINE_MAX_CHILDREN,
+            min_minutes=REFINE_MIN_CHILD_MINUTES,
+            kinds=", ".join(sorted(MODEL_KINDS)),
+            parent_start=target.parent.start_at.isoformat(),
+            parent_end=target.parent.end_at.isoformat(),
+            window_start=target.window_start.isoformat(),
+            window_end=target.window_end.isoformat(),
+            snapshot=json.dumps(snapshot, ensure_ascii=False, indent=2),
+        )
+
+    prompt = render(with_places=True, anchor_title_chars=24)
+    if _estimate_text_tokens(prompt) <= REFINE_RESERVED_INPUT_TOKENS:
+        return prompt
+    prompt = render(with_places=False, anchor_title_chars=16)
+    if _estimate_text_tokens(prompt) <= REFINE_RESERVED_INPUT_TOKENS:
+        return prompt
+    # 还超：连锚点标题也省略（约束仍在，模型可保守不压任何时间）。
+    return render(with_places=False, anchor_title_chars=4)
+
+
+async def _refine_attempts_for_key(
+    session: AsyncSession, *, actor_id: str, key: str
+) -> int:
+    """这个幂等键已经尝试过几次（失败/空结果也算一次，不退款）。"""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(BehaviorModelCallRow)
+                .where(
+                    BehaviorModelCallRow.actor_id == actor_id,
+                    BehaviorModelCallRow.kind == REFINE_KIND,
+                    BehaviorModelCallRow.idempotency_key == key,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _recent_refine_calls(
+    session: AsyncSession, *, actor_id: str, now: datetime
+) -> int:
+    """滚动窗口（3 小时）内已经花掉的细化调用次数（含失败的那次）。"""
+    since = _aware(now) - timedelta(hours=REFINE_ROLLING_HOURS)
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(BehaviorModelCallRow)
+                .where(
+                    BehaviorModelCallRow.actor_id == actor_id,
+                    BehaviorModelCallRow.kind == REFINE_KIND,
+                    BehaviorModelCallRow.created_at >= since,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _commit_refinement(
+    session: AsyncSession,
+    *,
+    target: RefineTarget,
+    children: list[RefineChild],
+    now: datetime,
+) -> int:
+    """CAS 提交一次细化：**父段 is_leaf 翻转 + 子段插入在同一事务**。
+
+    - ``day_plans.revision`` 抬一版（WHERE revision = 期望值）；不是期望值就抛
+      :class:`StaleRevisionError`，整个嵌套事务回滚——旧响应不会覆盖新计划；
+    - 父段 ``is_leaf`` 翻成 ``False``（它现在有子段了，只有叶段能启动活动）；
+      父段本身**保留**（不删除、不改时间），所以"父块剩余部分保持粗粒度"成立；
+    - 子段是 ``current``、``is_leaf=True``，``revision_created`` = 新版本号。
+      其它段的 ``revision_created`` 不动：它们仍是 current，只是没被这次改动碰。
+    """
+    new_revision = target.revision + 1
+    async with session.begin_nested():
+        result = await session.execute(
+            update(DayPlanRow)
+            .where(
+                DayPlanRow.id == target.plan_id,
+                DayPlanRow.revision == target.revision,
+            )
+            .values(revision=new_revision, updated_at=now)
+        )
+        if int(getattr(result, "rowcount", 0) or 0) != 1:
+            raise StaleRevisionError(target.revision)
+        parent_result = await session.execute(
+            update(ScheduleSegmentRow)
+            .where(
+                ScheduleSegmentRow.id == target.parent.segment_id,
+                ScheduleSegmentRow.plan_id == target.plan_id,
+                ScheduleSegmentRow.status == "current",
+            )
+            .values(is_leaf=False, updated_at=now)
+        )
+        if int(getattr(parent_result, "rowcount", 0) or 0) != 1:
+            # 父段在模型调用期间被改版/取消：整份细化丢弃，不写半套子段。
+            raise StaleRevisionError(target.revision)
+        for child in children:
+            session.add(
+                ScheduleSegmentRow(
+                    id=new_id("seg"),
+                    plan_id=target.plan_id,
+                    actor_id=target.actor_id,
+                    parent_id=target.parent.segment_id,
+                    parent_key=target.parent.segment_id,
+                    layer=child.layer,
+                    kind=child.kind,
+                    title=child.title,
+                    start_at=child.start_at,
+                    end_at=child.end_at,
+                    place_id=child.place_id,
+                    commitment_level="tentative",
+                    status="current",
+                    is_leaf=True,
+                    anchor_kind="",
+                    source="model",
+                    revision_created=new_revision,
+                    revision_ended=None,
+                    source_event_ids=[f"{REFINE_KIND}:{target.parent.segment_id}"],
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await session.flush()
+    return new_revision
+
+
+async def refine_work(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    now: datetime | None = None,
+    plan_day: date | None = None,
+    timezone: str | None = None,
+    router: object | None = None,
+    config_reader: object | None = None,
+    lease_owner: str | None = None,
+    expect_key: str | None = None,
+) -> RefineOutcome:
+    """跑一次**近窗细化**作业（设计 §3 的 ``refine:`` 事件）。
+
+    一次只细化一个父段、只覆盖未来窗口；**失败一律保留粗段**：
+
+    - 模型不可用 → 0 次调用、不占预算行；
+    - 超时/报错/非法输出/空结果 → 记在预算行上，**当次不重试**；
+    - CAS 失败（别人先提交了新版本）→ 丢弃这次响应，未来窗口再试；
+    - 过去的时间永不回填：窗口起点取"现在向上取整到分钟"与父段起点的较大者。
+
+    调用方负责 commit/rollback；本函数内部只在"预留"和"提交"两处用嵌套事务。
+    """
+    moment = _aware(now or utcnow())
+    target = await load_refine_target(
+        session, actor_id=actor_id, now=moment, plan_day=plan_day, timezone=timezone
+    )
+    if target is None:
+        return RefineOutcome(state="no_target")
+    key = target.idempotency_key
+    base = RefineOutcome(
+        state="unchanged",
+        plan_id=target.plan_id,
+        plan_day=target.plan_day,
+        parent_id=target.parent.segment_id,
+        window_start=target.window_start,
+        window_end=target.window_end,
+        revision_before=target.revision,
+        revision_after=target.revision,
+        idempotency_key=key,
+    )
+    if expect_key is not None and expect_key != key:
+        # 扫描时选的目标已经变了（版本/窗口都不同）：丢弃旧事件，不调模型。
+        return replace(base, state="stale_target", reason_code=REASON_REFINE_STALE_TARGET)
+    attempts = await _refine_attempts_for_key(session, actor_id=actor_id, key=key)
+    if attempts >= REFINE_MAX_ATTEMPTS_PER_WINDOW:
+        return replace(base, reason_code=REASON_REFINE_ATTEMPTED)
+    if await _recent_refine_calls(session, actor_id=actor_id, now=moment) >= (
+        REFINE_ROLLING_MAX_CALLS
+    ):
+        return replace(base, state="blocked", reason_code=REASON_REFINE_ROLLING)
+    if not await _outline_model_ready(router, config_reader):
+        return replace(base, state="blocked", reason_code=REASON_MODEL_UNAVAILABLE)
+
+    owner = lease_owner or f"refine:{new_id('lease')}"
+    reservation = await _reserve_call(
+        session,
+        actor_id=actor_id,
+        plan_day=target.plan_day,
+        idempotency_key=key,
+        now=moment,
+        lease_owner=owner,
+        kind=REFINE_KIND,
+        max_calls=REFINE_MAX_CALLS_PER_DAY,
+        daily_token_budget=REFINE_DAILY_TOKEN_BUDGET,
+        reserved_input_tokens=REFINE_RESERVED_INPUT_TOKENS,
+        reserved_output_tokens=REFINE_RESERVED_OUTPUT_TOKENS,
+        lease_seconds=REFINE_LEASE_SECONDS,
+        attempt=attempts + 1,
+    )
+    if reservation is None:
+        return replace(base, state="blocked", reason_code=REASON_BUDGET_EXHAUSTED)
+
+    prompt = build_refine_prompt(target=target, now=moment)
+    raw = ""
+    try:
+        raw = await _call_outline_model(
+            router=router, config_reader=config_reader, prompt=prompt
+        )
+        parent_id, raw_children = parse_refine_output(raw)
+        if parent_id != target.parent.segment_id:
+            raise RefineValidationError(
+                [f"parent_id 必须是本次给出的父段 id {target.parent.segment_id}"]
+            )
+        children = validate_refine_children(
+            raw_children,
+            parent=target.parent,
+            child_layer=target.child_layer,
+            window_start=target.window_start,
+            window_end=target.window_end,
+            anchors=target.anchors,
+            valid_place_ids=target.place_ids,
+        )
+        if not children:
+            raise RefineValidationError(["children 为空：没有可细化的子段"])
+    except RefineValidationError:
+        await _finish_call(
+            session,
+            call_id=reservation.call_id,
+            state="failed",
+            error_code=REASON_REFINE_INVALID,
+        )
+        return replace(
+            base,
+            state="failed",
+            calls=1,
+            reason_code=REASON_REFINE_INVALID,
+        )
+    except (TimeoutError, ModelError, Exception) as exc:  # noqa: BLE001
+        reason_code = _model_error_code(exc)
+        await _finish_call(
+            session,
+            call_id=reservation.call_id,
+            state="failed",
+            error_code=reason_code,
+        )
+        return replace(base, state="failed", calls=1, reason_code=reason_code)
+
+    try:
+        revision_after = await _commit_refinement(
+            session, target=target, children=children, now=moment
+        )
+    except StaleRevisionError:
+        await _finish_call(
+            session,
+            call_id=reservation.call_id,
+            state="failed",
+            error_code=REASON_REFINE_STALE,
+        )
+        return replace(
+            base, state="busy", calls=1, reason_code=REASON_REFINE_STALE
+        )
+
+    provider_id = _resolved_provider_id(
+        await config_reader.effective(), REFINE_PROFILE  # type: ignore[attr-defined]
+    )
+    await _finish_call(
+        session,
+        call_id=reservation.call_id,
+        state="committed",
+        actual_tokens=_estimate_tokens(prompt, raw),
+        provider_id=provider_id,
+    )
+    return replace(
+        base,
+        state="refined",
+        revision_after=revision_after,
+        children=len(children),
+        calls=1,
+        reason_code=None,
+        provider_id=provider_id,
+    )
+
+
+# ---------------------------------------------------------------- 活动边界（阶段 2）
+#
+# 段边界只是**计划**，不是"她真做完了"。本模块在这里只做**只读**投影：
+# 回答"此刻哪些段/锚点覆盖 now""那条活动来源段是不是已经结束"。
+# 活动的唯一写入方是 `ActivityService`、场景的唯一写入方是 `PresenceService`；
+# 域边界闸门不允许 agenda 直接 import 它们，所以状态变更留在 worker 的组合根。
+
+
+@dataclass(frozen=True)
+class BoundarySegment:
+    """此刻与活动边界相关的一个段（只读投影，不含任何状态写入）。"""
+
+    segment_id: str
+    plan_id: str
+    layer: str
+    kind: str
+    title: str
+    start_at: datetime
+    end_at: datetime
+    place_id: str | None
+    anchor_kind: str
+    commitment_level: str
+    is_leaf: bool
+    # 段的受众范围（旧段为 NULL=未知）。开活动时**只许收窄**，不许放宽。
+    visibility: str | None = None
+
+    @property
+    def is_sleep(self) -> bool:
+        return self.anchor_kind == SLEEP_ANCHOR
+
+    @property
+    def is_confirmed_anchor(self) -> bool:
+        return self.anchor_kind == COMMITMENT_ANCHOR or (
+            self.anchor_kind == "" and self.commitment_level == "confirmed"
+        )
+
+
+@dataclass(frozen=True)
+class BoundaryView:
+    """``now`` 时刻的时间轴投影（**零模型、零状态写入**）。"""
+
+    plan_id: str | None = None
+    plan_day: date | None = None
+    revision: int = 0
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    covering: tuple[BoundarySegment, ...] = ()
+    sleep: BoundarySegment | None = None
+    active_leaf: BoundarySegment | None = None
+    commitment: BoundarySegment | None = None
+
+    def covers_segment(self, segment_id: str | None) -> bool:
+        """这条段此刻是否还覆盖 ``now``（覆盖 = 活动还没到边界）。"""
+        if not segment_id:
+            return False
+        return any(item.segment_id == segment_id for item in self.covering)
+
+    @property
+    def has_plan(self) -> bool:
+        return self.plan_id is not None
+
+
+async def boundary_view(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    now: datetime,
+    plan_day: date | None = None,
+    timezone: str | None = None,
+) -> BoundaryView:
+    """取 ``now`` 时刻的段边界投影（当前计划日）。
+
+    - ``covering``：``current`` 且 ``start_at <= now < end_at`` 的段（含锚点）；
+    - ``sleep``：覆盖此刻的睡眠锚点（有它就不开活动）；
+    - ``active_leaf``：可以启动活动的叶段（``is_leaf`` 且非睡眠、非锚点）；
+      多条重叠时按 ``start_at`` 取**最早**的一条，保证重启后选同一条；
+    - ``commitment``：覆盖此刻的已确认约定（只用于暂停/场景提示，不创建活动）。
+    """
+    moment = _aware(now)
+    if plan_day is None:
+        if timezone is None:
+            timezone, _source = await resolve_plan_timezone(session)
+        plan_day = plan_day_for(moment, timezone)
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    if row is None:
+        return BoundaryView()
+    rows = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == row.id,
+                    ScheduleSegmentRow.status == "current",
+                    ScheduleSegmentRow.start_at <= moment,
+                    ScheduleSegmentRow.end_at > moment,
+                )
+                .order_by(ScheduleSegmentRow.start_at, ScheduleSegmentRow.id)
+            )
+        ).scalars()
+    )
+    covering = tuple(_boundary_segment(item) for item in rows)
+    sleep = next((item for item in covering if item.is_sleep), None)
+    commitment = next((item for item in covering if item.is_confirmed_anchor), None)
+    active_leaf = next(
+        (
+            item
+            for item in covering
+            if item.is_leaf and item.anchor_kind == "" and item.kind != SLEEP_ANCHOR
+        ),
+        None,
+    )
+    return BoundaryView(
+        plan_id=str(row.id),
+        plan_day=row.plan_day,
+        revision=int(row.revision),
+        window_start=_aware(row.window_start_at),
+        window_end=_aware(row.window_end_at),
+        covering=covering,
+        sleep=sleep,
+        active_leaf=active_leaf,
+        commitment=commitment,
+    )
+
+
+def _boundary_segment(row: ScheduleSegmentRow) -> BoundarySegment:
+    return BoundarySegment(
+        segment_id=str(row.id),
+        plan_id=str(row.plan_id),
+        layer=str(row.layer),
+        kind=str(row.kind),
+        title=str(row.title),
+        start_at=_aware(row.start_at),
+        end_at=_aware(row.end_at),
+        place_id=row.place_id,
+        anchor_kind=str(row.anchor_kind or ""),
+        commitment_level=str(row.commitment_level),
+        is_leaf=bool(row.is_leaf),
+        visibility=row.visibility,
     )
 
 
@@ -4377,12 +5388,37 @@ __all__ = [
     "REASON_DEGRADED_LATE",
     "REASON_NEEDS_REVIEW",
     "REASON_PREPARATION_UNPLACED",
+    "REASON_REFINE_ATTEMPTED",
+    "REASON_REFINE_INVALID",
+    "REASON_REFINE_ROLLING",
+    "REASON_REFINE_STALE",
+    "REASON_REFINE_STALE_TARGET",
     "REASON_ROUTINE_CONFLICT",
     "REASON_SLEEP_BOUNDARY",
+    "REFINE_CHILD_TITLE_CHARS",
+    "REFINE_COARSE_LAYERS",
+    "REFINE_DAILY_TOKEN_BUDGET",
+    "REFINE_KIND",
+    "REFINE_LAYER_STEPS",
+    "REFINE_LOOKAHEAD_HOURS",
+    "REFINE_MAX_ATTEMPTS_PER_WINDOW",
+    "REFINE_MAX_CALLS_PER_DAY",
+    "REFINE_MAX_CHILDREN",
+    "REFINE_MAX_CHILD_MINUTES",
+    "REFINE_MIN_CHILD_MINUTES",
+    "REFINE_MIN_WINDOW_MINUTES",
+    "REFINE_PROFILE",
+    "REFINE_ROLLING_HOURS",
+    "REFINE_ROLLING_MAX_CALLS",
+    "REFINE_TIMEOUT_SECONDS",
+    "REFINE_TRIGGER_MINUTES",
     "REPLAN_TODO_TAG",
     "SLEEP_ANCHOR",
     "Anchor",
     "AnchorConflict",
+    "BoundarySegment",
+    "BoundaryView",
+    "CoarseSegment",
     "FutureIntent",
     "FutureIntentZone",
     "IntentProposal",
@@ -4394,14 +5430,20 @@ __all__ = [
     "PersonaProjection",
     "PlannedBlock",
     "PreparationLink",
+    "RefineChild",
+    "RefineOutcome",
+    "RefineTarget",
+    "RefineValidationError",
     "ReplanTodo",
     "RoutineSnapshot",
     "SeamReport",
     "SegmentDraft",
     "StaleRevisionError",
+    "boundary_view",
     "build_memory_zone",
     "build_outline_prompt",
     "build_persona_projection",
+    "build_refine_prompt",
     "build_repair_prompt",
     "contains",
     "display_day_for",
@@ -4415,8 +5457,10 @@ __all__ = [
     "intent_prep_ready",
     "intention_short_id",
     "load_commitment_anchors",
+    "load_coarse_segments",
     "load_day_plan",
     "load_future_intents",
+    "load_refine_target",
     "load_segments",
     "local_hhmm",
     "local_minute_instant",
@@ -4427,10 +5471,15 @@ __all__ = [
     "overlaps",
     "parse_outline_output",
     "parse_outline_payload",
+    "parse_refine_output",
     "plan_day_for",
     "plan_day_length",
     "plan_day_window",
     "plan_preparations",
+    "refine_key",
+    "refine_trigger_due",
+    "refine_window",
+    "refine_work",
     "resolve_anchor_conflicts",
     "resolve_plan_timezone",
     "resolve_zone",
@@ -4440,4 +5489,5 @@ __all__ = [
     "sleep_anchors_for_day",
     "validate_intention_proposals",
     "validate_outline",
+    "validate_refine_children",
 ]
