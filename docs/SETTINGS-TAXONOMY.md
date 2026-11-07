@@ -48,7 +48,7 @@
 | 组 `key` | 组名 | 入口 | path | 为什么这个在设置里 |
 |---|---|---|---|---|
 | `security`<br>(`SETTINGS_GROUPS` 的 `security` 组) | **安全与隐私** | ① 权限与隐私 | `/settings/privacy`<br>(`security` 组的 `privacy` 条目) | 主体权利：同意可撤回、有有效期、有可见范围。这是**准许裁决**，不是行为偏好，且必须能随时撤销。 |
-| | | ② 多用户与账号 | `/settings/identity`<br>(`security` 组的 `identity` 条目) | 身份归属：合并只写 `subjects.merged_into` 指针、可拆开。是账号层运维，不是「她是谁」的人设内容。 |
+| | | ② 多用户与账号 | **已搬出设置**：一级导航「关系」`/relationships`（旧 `/settings/identity` 精确重定向过去） | 身份归属：合并只写 `subjects.merged_into` 指针、可拆开。它问的是「你是谁、谁和谁是一个人」，与人设（她是谁）相邻更连贯，所以不再是设置子页。 |
 | | | ③ 登录名与密码 | `/settings/account`<br>(`security` 组的 `account` 条目) | 你自己的登录凭据，改完其它设备失效。纯账号运维，与她的行为无关。 |
 | `model`<br>(`SETTINGS_GROUPS` 的 `model` 组) | **模型与密钥** | ④ 模型与生成 | `/settings/model`<br>(`model` 组的 `model` 条目) | 实例能力：provider、密钥、职责绑定、草稿→发布→回滚。「谁来算」是程序配置，不属于任何领域页。 |
 | `maintenance`<br>(`SETTINGS_GROUPS` 的 `maintenance` 组) | **维护与关于** | ⑤ 关于与版本 | `/settings/about`<br>(`maintenance` 组的 `about` 条目) | 运维动作：看版本、手动查 GitHub Release、按门禁安装。是「服务怎么跑」，不是她怎么表现。 |
@@ -60,7 +60,7 @@
 /settings          → SettingsHub（中心页）
 /settings/model    → SettingsPage（模型与生成）
 /settings/privacy  → ConsentPage（权限与隐私）
-/settings/identity → IdentityPage（多用户与账号）
+/relationships → IdentityPage（一级导航「关系」；旧 `/settings/identity` 精确重定向到此）
 /settings/account  → AccountPage（登录名与密码）
 /settings/about    → AboutPage（关于与版本）
 ```

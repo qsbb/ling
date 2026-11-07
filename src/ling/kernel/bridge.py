@@ -134,7 +134,7 @@ class InboundBridge:
         # 为什么只注册不合并：给一个号分配身份，和"认定它和主人是同一个人"
         # 是两件事。前者只是让消息有个主体可挂，后者会**共享主人的全部记忆**
         # ——那是安全决定，必须由管理员在后台看过是谁之后手动做
-        # （`/settings/identity` 的合并/拆开），不能由一条私聊自动达成。
+        # （`/relationships` 页的合并/拆开），不能由一条私聊自动达成。
         if subject_id is None and not is_group and self._auto_register_private:
             subject_id = await identity.resolve_or_provision(
                 envelope.connector_instance,
