@@ -1,0 +1,52 @@
+{
+  "$id": "https://ling.local/contracts/v1/IntentTeaserItem.schema.json",
+  "additionalProperties": false,
+  "description": "仪表盘上的一条未来意向摘要（只给有来源的）。",
+  "properties": {
+    "intention_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Intention Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_kind": {
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "target_end_day": {
+      "format": "date",
+      "title": "Target End Day",
+      "type": "string"
+    },
+    "target_start_day": {
+      "format": "date",
+      "title": "Target Start Day",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "intention_id",
+    "title",
+    "target_start_day",
+    "target_end_day",
+    "state",
+    "source_kind"
+  ],
+  "title": "IntentTeaserItem",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

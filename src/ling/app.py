@@ -482,8 +482,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 所以**无条件注册**——不像 qq/qqbot 那样按开关注册。
     app.include_router(logs_routes.router, prefix="/v1")
     from ling.api.routes import dashboard as dashboard_routes
+    from ling.api.routes import life_timeline as life_timeline_routes
 
     app.include_router(dashboard_routes.router, prefix="/v1")
+    # 只读生活时间轴（设计 §7）：双时区、计划/事实分层、未来意向与梦卡片。
+    # 与 dashboard 一样**无条件注册**：它只读本项目自己的表，没有外部依赖。
+    app.include_router(life_timeline_routes.router, prefix="/v1")
     # W2 管理端点：已实现未测试；前端未开放入口，只供鉴权后的 API 使用
     app.include_router(manage.router, prefix="/v1")
     if settings.qq_enabled:

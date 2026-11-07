@@ -11,7 +11,11 @@ SECTION_KEYS = {
     "affect",
     "presence",
     "proactive",
+    # agenda 仍是"最多几件小事"的旧语义；today_outline / intent_teaser 是
+    # 时间轴的摘要与未来意向，**并列**而不是替换它（设计 §7）。
     "agenda",
+    "today_outline",
+    "intent_teaser",
     "memories",
     "timeline",
     "relationship",

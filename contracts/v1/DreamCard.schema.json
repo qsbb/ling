@@ -1,0 +1,63 @@
+{
+  "$id": "https://ling.local/contracts/v1/DreamCard.schema.json",
+  "additionalProperties": false,
+  "description": "一晚的梦（模拟叙事）。**不是事实**，且受众受限。\n\n梦在库里固定 ``origin=simulated`` / ``visibility=actor_private``。非 owner\n读到时只给状态与来源，``title`` / ``narrative`` 为空且 ``restricted=true``\n——\"存在但你看不到\"与\"没有记录\"（``dream=null``）是两件事。",
+  "properties": {
+    "narrative": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Narrative"
+    },
+    "origin": {
+      "title": "Origin",
+      "type": "string"
+    },
+    "restricted": {
+      "default": false,
+      "title": "Restricted",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "status": {
+      "description": "ready / failed / missed / no_dream",
+      "title": "Status",
+      "type": "string"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Title"
+    },
+    "visibility": {
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "origin",
+    "visibility"
+  ],
+  "title": "DreamCard",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

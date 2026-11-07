@@ -1,0 +1,65 @@
+{
+  "$defs": {
+    "OutlineRelation": {
+      "description": "仪表盘「她今天可能做什么」里一条摘要与此刻的关系。\n\n``now`` 是正在进行的段，``next`` 是接下来最近的一段，``anchor`` 是已确认的\n不可移动锚点（约定）。三者**不合并**：把\"正在做\"和\"已约好\"混成一条，\n用户会以为计划等于承诺。",
+      "enum": [
+        "now",
+        "next",
+        "anchor"
+      ],
+      "title": "OutlineRelation",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/TodayOutlineItem.schema.json",
+  "additionalProperties": false,
+  "description": "仪表盘上的一条今日摘要。``relation`` 说明它和\"此刻\"的关系。",
+  "properties": {
+    "end_at": {
+      "format": "date-time",
+      "title": "End At",
+      "type": "string"
+    },
+    "relation": {
+      "$ref": "#/$defs/OutlineRelation"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "segment_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Segment Id"
+    },
+    "start_at": {
+      "format": "date-time",
+      "title": "Start At",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "relation",
+    "title",
+    "start_at",
+    "end_at"
+  ],
+  "title": "TodayOutlineItem",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

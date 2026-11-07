@@ -43,9 +43,25 @@ from typing import Any
 from fastapi import APIRouter
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
+from ling.api.routes.life_timeline import (
+    INTENT_HORIZON_LIMIT,
+    OUTLINE_MAX_ITEMS,
+    TEASER_MAX_ITEMS,
+    intent_horizon,
+    intent_teaser_items,
+    load_actor_day,
+    resolve_actor_timezone,
+    select_today_outline,
+    state_note,
+    viewer_is_owner,
+    visible_to,
+)
+from ling.contracts.v1 import IntentTeaserOut, TimelineState, TodayOutlineOut
 from ling.domains.activity.service import ActivityService
 from ling.domains.affect.service import AffectService
+from ling.domains.agenda.intents import IntentService
 from ling.domains.agenda.service import AgendaService, local_today
+from ling.domains.agenda.timeline import display_day_for, plan_day_for
 from ling.domains.goals.service import GoalsService
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
@@ -53,6 +69,7 @@ from ling.domains.phone.service import PhoneService
 from ling.domains.presence.service import PresenceService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
+from ling.settings.user_preferences import owner_subject_id
 
 logger = logging.getLogger("ling.api.dashboard")
 
@@ -304,6 +321,90 @@ async def get_dashboard(
             },
         )
 
+    async def today_outline() -> dict:
+        """「今天她可能做什么」：时间轴上的 2–3 条摘要。
+
+        与旧的 ``agenda`` **并列、互不改义**：``agenda`` 是"最多几件小事"
+        （计划/承诺/目标），这里回答的是"她这一天的时间轴现在到哪儿了"。
+
+        ## 为什么不是"当前活动"
+
+        `activity` 那块说的是**已发生**的模拟活动进程；这块说的是**计划**。
+        两者可以同时为空、也可以互相矛盾（计划 14:00 看书，实际在聊天），
+        所以必须分开显示——把计划时段说成"正在做"是本项目明令禁止的
+        事实伪造（设计 §1）。``relation`` 字段（now/next/anchor）就是这个
+        区分的载体：``next`` 是"可能"，不是"在做"。
+
+        ## 为什么给两个日期
+
+        ``display_date`` 是**你**的今天（展示时区），``plan_day`` 是**她**的
+        今天（角色规范时区）。两套时区不同时它们可以不是同一天，前端不许
+        用浏览器本地时区再算一次。
+        """
+        moment = datetime.now(UTC)
+        actor_timezone, _source = await resolve_actor_timezone(
+            session, env=settings.user_timezone
+        )
+        view = await load_actor_day(
+            session, actor_id=actor_id, now=moment, actor_timezone=actor_timezone
+        )
+        items = select_today_outline(
+            view.segments, now=moment, limit=OUTLINE_MAX_ITEMS
+        )
+        data = TodayOutlineOut(
+            state=view.state,
+            display_date=display_day_for(moment, user_timezone),
+            display_timezone=user_timezone,
+            plan_day=view.plan_day,
+            actor_timezone=actor_timezone,
+            items=list(items),
+            note=state_note(view.state),
+        )
+        status = SECTION_EMPTY if not items else SECTION_OK
+        if not items and view.state is not TimelineState.empty:
+            # 有计划行却没有可展示的段（还没排、或全被替代）：这不是"没安排"，
+            # 而是"今天暂时没什么特别安排"——状态由 data.state 说清。
+            status = SECTION_OK
+        return _section(status, data.model_dump(mode="json"))
+
+    async def intent_teaser() -> dict:
+        """未来意向的 1–2 条预告，并明确"未来日未生成大纲"。
+
+        为什么只给有来源的：``schedule_intentions`` 里 ``proposed`` 是模型猜的
+        候选；把没有来源的候选放到首屏，等于把"可能"包装成"安排"。这里只取
+        `source_ref` 非空的条目，并把 ``source_kind`` 一起给出，用户能看出
+        是谁提的。
+        """
+        moment = datetime.now(UTC)
+        actor_timezone, _source = await resolve_actor_timezone(
+            session, env=settings.user_timezone
+        )
+        plan_day = plan_day_for(moment, actor_timezone)
+        start_day, end_day = intent_horizon(plan_day)
+        owner_subject = await owner_subject_id(session)
+        is_owner = viewer_is_owner(
+            role=auth.user.role,
+            subject_id=auth.user.subject_id,
+            owner_subject=owner_subject,
+        )
+        views = await IntentService(session, actor_id=actor_id).list_active(
+            start_day=start_day, end_day=end_day, limit=INTENT_HORIZON_LIMIT
+        )
+        visible = [
+            view
+            for view in views
+            if visible_to(view.visibility, is_owner=is_owner)
+        ]
+        items = intent_teaser_items(visible, limit=TEASER_MAX_ITEMS)
+        data = IntentTeaserOut(
+            horizon_unplanned=True,
+            items=list(items),
+            note="未来日尚未生成大纲；这里是意向，不是那一天的安排"
+            if items
+            else "未来 7 天还没有有来源的意向",
+        )
+        return _section(SECTION_OK if items else SECTION_EMPTY, data.model_dump(mode="json"))
+
     async def timeline() -> dict:
         """近期生活：已发生的事件，带来源。
 
@@ -448,6 +549,9 @@ async def get_dashboard(
         "connectivity": await _guard("connectivity", connectivity(), session),
         "presence": await _guard("presence", presence(), session),
         "agenda": await _guard("agenda", agenda(), session),
+        # 新增两块与 agenda 并列：旧 agenda 的"最多几件小事"语义一点不改。
+        "today_outline": await _guard("today_outline", today_outline(), session),
+        "intent_teaser": await _guard("intent_teaser", intent_teaser(), session),
         "timeline": await _guard("timeline", timeline(), session),
         "phone": await _guard("phone", phone(), session),
     }
