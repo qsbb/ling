@@ -302,6 +302,31 @@ class ModelRouter:
                 health.last_error = exc.message
                 if health.consecutive_failures >= self.BREAKER_THRESHOLD:
                     health.opened_until = time.monotonic() + self.BREAKER_COOLDOWN_SECONDS
+                    logger.warning(
+                        "%s 连续失败 %d 次，熔断 %s 秒：这期间不再尝试它",
+                        health_key,
+                        health.consecutive_failures,
+                        int(self.BREAKER_COOLDOWN_SECONDS),
+                    )
+                # **供应商失败必须留一行日志。**
+                #
+                # 原来这里只更新进程内的 health 记录：一次 401 / 模型名不存在
+                # / 供应商 5xx 之后，日志里**一个字都没有**——运维看到的只有
+                # 上游那句「轮次结束但没有可交付文本」。而 health 是内存态，
+                # 重启即失，事后完全无法回溯。
+                #
+                # 只记 code 与供应商/模型，不记 messages 正文（那里面有用户的
+                # 聊天内容）。``_breaker`` 打开的那一刻也顺带说明，否则
+                # "为什么接下来 20 秒都直接失败"又是一条无从解释的现象。
+                logger.warning(
+                    "模型调用失败 provider=%s model=%s profile=%s code=%s retriable=%s：%s",
+                    target.provider_id,
+                    target.model_id,
+                    profile,
+                    exc.kind.value,
+                    exc.retriable,
+                    exc.message[:200],
+                )
                 outcome.error = exc
                 last_error = exc
                 if outcome.delivered_any:
@@ -314,6 +339,19 @@ class ModelRouter:
                 health.last_error = wrapped.message
                 if health.consecutive_failures >= self.BREAKER_THRESHOLD:
                     health.opened_until = time.monotonic() + self.BREAKER_COOLDOWN_SECONDS
+                    logger.warning(
+                        "%s 连续失败 %d 次，熔断 %s 秒：这期间不再尝试它",
+                        health_key,
+                        health.consecutive_failures,
+                        int(self.BREAKER_COOLDOWN_SECONDS),
+                    )
+                logger.warning(
+                    "模型调用抛了非 ModelError 的异常 provider=%s model=%s profile=%s：%s",
+                    target.provider_id,
+                    target.model_id,
+                    profile,
+                    str(exc)[:200],
+                )
                 last_error = wrapped
                 outcome.error = wrapped
                 if outcome.delivered_any:

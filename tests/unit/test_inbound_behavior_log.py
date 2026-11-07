@@ -162,3 +162,56 @@ def test_rejected_message_keeps_its_received_line_only() -> None:
 
     assert _handled_lines() == []
     assert len(recent_logs(kind="behavior")) == 1
+
+
+# ---------------------------------------------------------------- 失败原因必须说清
+
+
+def test_describe_turn_failure_reads_model_error_fields() -> None:
+    """``ModelError`` 那条路填的是 code/message（**没有 detail**）。
+
+    修复前调用方只读 ``detail``，于是最常见的那条失败在日志里只剩
+    「轮次 x 失败：turn.failed |」——用户截图那行就是这么来的。
+    """
+    from ling.kernel.turn import describe_turn_failure
+
+    data = {
+        "turn_id": "turn_x",
+        "state": "failed",
+        "error": {
+            "code": "quota_exhausted",
+            "message": "供应商 main 今天的 token 额度已用完（已用 200431 / 上限 200000）",
+            "retriable": False,
+        },
+    }
+    line = describe_turn_failure(data)
+    assert line.startswith("code=quota_exhausted ")
+    assert "额度已用完" in line
+    assert "retriable=False" in line
+    assert "detail=" not in line, "没有 detail 时不该凭空造一个"
+
+
+def test_describe_turn_failure_reads_internal_detail() -> None:
+    """未捕获异常那条路：原因只存在 ``detail`` 里，丢了就等于没记。"""
+    from ling.kernel.turn import describe_turn_failure
+
+    line = describe_turn_failure(
+        {
+            "error": {
+                "code": "internal",
+                "message": "服务端内部错误，请重试",
+                "retriable": True,
+                "detail": "RuntimeError: boom",
+            }
+        }
+    )
+    assert "code=internal" in line
+    assert "detail=RuntimeError: boom" in line
+    assert "retriable=True" in line
+
+
+def test_describe_turn_failure_never_pretends_to_know() -> None:
+    from ling.kernel.turn import describe_turn_failure
+
+    assert describe_turn_failure({}) == "没有留下原因（error 字段为空）"
+    assert describe_turn_failure(None) == "没有留下原因（error 字段为空）"

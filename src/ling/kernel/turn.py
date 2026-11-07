@@ -261,6 +261,10 @@ class TurnCoordinator:
         # 产生这一轮的渠道账号（"instance:external_id"）。记忆要记下它，
         # 否则同一人多个号合并后无法无损拆分。
         source_account: str | None = None,
+        # 「这条消息是谁说的」——本次称呼（群里 = 群名片优先）。
+        # 只用于给当轮上下文里**最后那句**署名，不落库：库里的
+        # `subjects.display_name` 是人级旁路（见 identity.observe_display_name）。
+        sender_name: str | None = None,
     ) -> asyncio.Queue[TurnStreamEvent | None]:
         queue: asyncio.Queue[TurnStreamEvent | None] = asyncio.Queue()
         token = StopToken()
@@ -276,6 +280,7 @@ class TurnCoordinator:
                 token=token,
                 attempt=attempt,
                 source_account=source_account,
+                sender_name=sender_name,
             ),
             name=f"turn:{turn_id}",
         )
@@ -313,6 +318,7 @@ class TurnCoordinator:
         token: StopToken,
         attempt: int = 1,
         source_account: str | None = None,
+        sender_name: str | None = None,
     ) -> None:
         delivered = ""
         target_label: str | None = None
@@ -409,6 +415,16 @@ class TurnCoordinator:
                     history_limit=20,
                     # 请求路径已把本轮用户消息落库，这里必须排除以免重复输入
                     current_turn_id=turn_id,
+                    # **当前这句**用本次称呼（群里 = 群名片优先）署名，而不是
+                    # 库里那一列：`compile` 会优先用它，改名下一句就生效，
+                    # 不必等 `identity.observe_display_name` 的旁路落库。
+                    #
+                    # 私聊不署名：那里只有一个说话人，前缀只是噪音；而且
+                    # `compile` 的接口文档写明这个参数"群聊才有意义"
+                    # （`is_group=False` 时它也不去库里补名字）。
+                    user_sender_name=(
+                        sender_name if window.visibility == "group_scope" else None
+                    ),
                 )
                 messages = list(compiled.messages)
 
@@ -1121,6 +1137,50 @@ class TurnCoordinator:
         )
 
 
+def describe_turn_failure(data: dict[str, Any] | None) -> str:
+    """把 ``turn.failed`` 事件的 ``error`` 说成一句**能据以行动**的话。
+
+    为什么必须有这个函数：`turn.failed` 的载荷有两条完全不同的来源，而
+    两条路填的字段不一样——
+
+    - ``ModelError`` 那条（`_finalize`，见本模块 §1050 附近）：填
+      ``code / message / retriable``，**没有 ``detail``**；
+    - 未捕获异常那条（`_execute` 的兜底 except）：填 ``code=internal``
+      并把异常原文塞进 ``detail``。
+
+    调用方（`bridge._run_turn`、`worker` 的群聊回应）原来只读 ``detail``。
+    于是**最常见的那条路**（模型/供应商/额度/配置失败）在日志里只剩
+    ``失败：turn.failed |``——冒号后面什么都没有。用户截图里那行
+    「轮次 turn_… 失败: turn.failed」就是这么来的，运维因此无法区分
+    「密钥失效」「模型名不存在」「今天额度用完」「这个职责没有可用模型」
+    ——四种原因的处置完全不同。
+
+    这里把三者拼成一句：``code=… message retriable=…``，且**绝不假装知道**
+    （什么都没有时明确写"没有留下原因"）。
+
+    ``retriable`` 是给"要不要重试"的判断依据，所以只要有就一并说出来：
+    ``quota_exhausted`` / ``unauthorized`` / ``unsupported_capability`` 是
+    **重试无用**（先去改配置或等明天），``provider_timeout`` / 熔断才是
+    "过一会儿再试"。
+    """
+    error = (data or {}).get("error") or {}
+    code = str(error.get("code") or "").strip()
+    message = str(error.get("message") or "").strip()
+    detail = str(error.get("detail") or "").strip()
+    retriable = error.get("retriable")
+    parts: list[str] = []
+    if code:
+        parts.append(f"code={code}")
+    if message:
+        parts.append(message)
+    if detail and detail != message:
+        # 未捕获异常那条路：原文只在这里，丢了就等于没记
+        parts.append(f"detail={detail}")
+    if retriable is not None:
+        parts.append(f"retriable={retriable}")
+    return " ".join(parts) if parts else "没有留下原因（error 字段为空）"
+
+
 def conversation_session(conversation: ConversationService) -> AsyncSession:
     """从 ConversationService 取回它自己的会话（避免重复传入）。"""
     return conversation.session
@@ -1145,6 +1205,7 @@ __all__ = [
     "StopToken",
     "TurnCoordinator",
     "TurnStreamEvent",
+    "describe_turn_failure",
     "drain_queue",
     "message_contract",
 ]

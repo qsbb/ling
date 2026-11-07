@@ -885,7 +885,16 @@ class ContextCompiler:
                         select(_Subject).where(_Subject.id.in_(list(wanted)))
                     )
                 ).scalars().all()
-                speaker_names = {r.id: (r.display_name or "") for r in rows}
+                # 占位符（「群友」「用户」…）**不是名字**：写进提示词会让好几个人
+                # 都叫「群友」，她分不清谁是谁，还会把这个词当成对方的称呼说出去。
+                # 宁可这一条不署名（下面 `if name` 会跳过），也不要编一个。
+                from ling.domains.identity.service import normalize_display_name
+
+                speaker_names = {
+                    r.id: normalized
+                    for r in rows
+                    if (normalized := normalize_display_name(r.display_name))
+                }
 
         for msg in usable:
             role = "user" if msg.role == "user" else "assistant"
@@ -905,11 +914,16 @@ class ContextCompiler:
         # 群聊里 `subject_id` 就是发言人（bridge 传的是说话人，不是窗口主人），
         # 所以名字可以自己查，调用方不必再穿一个参数。
         if is_group and not user_sender_name:
+            from ling.domains.identity.service import normalize_display_name
             from ling.infra.models import Subject as _Subject
 
             row = await self._session.get(_Subject, subject_id)
-            if row is not None and row.display_name:
-                user_sender_name = row.display_name
+            # 占位符不算名字：见上。**调用方传进来的** `user_sender_name` 优先
+            # （那是这条消息里的当下名片，改名下一句就生效）——透传那一行
+            # 在 bridge/turn，属于下一批改动。
+            user_sender_name = normalize_display_name(
+                getattr(row, "display_name", None)
+            )
         current = f"{user_sender_name}：{user_text}" if user_sender_name else user_text
         messages.append(ChatMessageIn(role="user", content=current))
         return CompiledContext(

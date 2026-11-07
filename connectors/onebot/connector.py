@@ -368,11 +368,15 @@ class OneBotV11Connector(ChannelConnector):
         external_event_id = f"{self_id}:{message_id}" if message_id else new_id("obe")
 
         occurred = payload.get("time")
+        # 本次称呼（card 优先）与昵称（人级）分开带走：显示用前者，
+        # 落库更新 `subjects.display_name` 只用后者。
+        sender_name, sender_nickname = _sender_fields(payload)
         return InteractionEnvelope(
             connector_instance=self.instance_id,
             external_event_id=external_event_id,
             account_ref=user_id,
-            sender_name=_sender_name(payload),
+            sender_name=sender_name,
+            sender_nickname=sender_nickname,
             window_ref=window_ref_for(
                 is_group=is_group,
                 target_id=group_id if is_group else user_id,
@@ -608,18 +612,35 @@ def _now():  # noqa: ANN202
     return datetime.now(UTC)
 
 
-def _sender_name(payload: dict) -> str | None:
-    """取发送者显示名。拿不到就返回 None——不要编一个假名字。
+def _sender_fields(payload: dict) -> tuple[str | None, str | None]:
+    """返回 (本次称呼, 昵称)。
 
-    注意：这一项**只用于称呼**。身份解析永远走 account_ref，
-    因为 QQ 群昵称可以随便改、也可以完全重名。
+    - 本次称呼 = ``card or nickname``：**这个群里此刻该叫她/他什么**。
+      群名片是群级字段，私聊事件里根本不存在，所以私聊退回昵称是对的。
+    - 昵称 = 只有 ``nickname``：**这个 QQ 号自己的名字**（跨群）。
+      它是"人级"字段，落库更新 ``subjects.display_name`` 只用它——用群名片
+      写人级列会被"这个人今天在 A 群改了个名片"带着抖（见 docs/GROUP-CARD-RESEARCH.md）。
+
+    两者**分开传**，因为用途不同：显示用前者（改名下一句就生效），
+    落库用后者（跨群稳定）。合成一个值就没法在落库时选择"只用昵称"。
+
+    拿不到就是 ``None``——不要编 "N/A" 之类的占位符（AstrBot 有个 ``"N/A"``
+    字面量的坑，照抄会把占位符写进库）。
     """
     sender = payload.get("sender")
-    if isinstance(sender, dict):
-        for key in ("card", "nickname"):
-            value = sender.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:128]
+    if not isinstance(sender, dict):
+        return None, None
+    card = _clean_name(sender.get("card"))
+    nickname = _clean_name(sender.get("nickname"))
+    return (card or nickname), nickname
+
+
+def _clean_name(value: object) -> str | None:
+    """名字清洗：空白即"没有"，长度对齐 ``subjects.display_name`` 的 128。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text[:128]
     return None
 
 

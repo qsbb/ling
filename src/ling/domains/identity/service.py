@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from asyncio import to_thread
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -28,6 +29,55 @@ from ling.infra.security import (
 )
 
 logger = logging.getLogger("ling.domains.identity")
+
+# 绝不能当成人名写进 ``subjects.display_name`` 的占位符。
+#
+# 为什么单独列一份：AstrBot 那里有个 ``"N/A"`` 字面量会一路进提示词和库
+# （见 docs/GROUP-CARD-RESEARCH.md §A.8），而 ling 的历史遗留是建号时用
+# 「群友」兜底。占位符一旦写进库，**"变了才写"就永远治不好它**——因为
+# 它看起来就是一个合法的名字。所以入口处直接拒掉。
+PLACEHOLDER_DISPLAY_NAMES = frozenset(
+    {"群友", "用户", "未知", "有人", "N/A", "n/a", "none", "None", "unknown", "anonymous"}
+)
+
+# 进程内"上次见到的名字"缓存：``(connector_instance, account_ref) -> 名字``。
+#
+# 作用是**挡掉重复写**：群里同一个人连着说话时，第二条消息不该再查库/写库。
+# 为什么是进程内而不是落库：这是纯性能旁路，丢了最多多一次 UPDATE（幂等）；
+# 多副本各记一份也只是多写一次。上限 4096 条，超了丢最旧的——
+# 缓存无限长在长跑进程里就是内存泄漏。
+_DISPLAY_NAME_CACHE: OrderedDict[tuple[str, str], str] = OrderedDict()
+_DISPLAY_NAME_CACHE_MAX = 4096
+
+
+def normalize_display_name(value: object) -> str | None:
+    """把渠道给的名字清洗成可落库的值；空/占位符返回 ``None``（= 没有名字）。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text in PLACEHOLDER_DISPLAY_NAMES:
+        return None
+    return text[:128]
+
+
+def is_placeholder_display_name(value: object) -> bool:
+    """这个名字是不是占位符（读侧据此决定"不要用它称呼人"）。"""
+    if not isinstance(value, str):
+        return True
+    text = value.strip()
+    return not text or text in PLACEHOLDER_DISPLAY_NAMES
+
+
+def reset_display_name_cache() -> None:
+    """清空进程内名字缓存（测试用）。"""
+    _DISPLAY_NAME_CACHE.clear()
+
+
+def _remember_display_name(key: tuple[str, str], name: str) -> None:
+    _DISPLAY_NAME_CACHE[key] = name
+    _DISPLAY_NAME_CACHE.move_to_end(key)
+    while len(_DISPLAY_NAME_CACHE) > _DISPLAY_NAME_CACHE_MAX:
+        _DISPLAY_NAME_CACHE.popitem(last=False)
 
 
 def _security_event(
@@ -850,6 +900,135 @@ class IdentityService:
         )
         await self._session.flush()
         return subject_id
+
+    async def observe_display_name(
+        self,
+        connector_instance: str,
+        external_account_id: str,
+        *,
+        nickname: str | None = None,
+        sender_name: str | None = None,
+        subject_id: str | None = None,
+    ) -> str | None:
+        """把这次看到的**昵称**同步进 ``subjects.display_name``；变了才写。
+
+        返回写入的新名字；没写（没变/没名字/没这个账号/写失败）返回 ``None``。
+
+        ## 为什么更新放在这里，而不放进 ``resolve_or_provision``
+
+        ``resolve_or_provision`` **只在"未证明"分支**被调用：已绑定的主人/管理员
+        走的是 ``resolve_account``，永远进不了那个函数。把更新塞进去等于
+        "主人的昵称改了永远不生效"——这正是 ling 现在"名字固定不变"的一半原因。
+
+        ## 为什么只用**昵称**（不回退群名片）
+
+        ``subjects.display_name`` 是**人级**的一列。群名片是群级字段，
+        用它写人级列会让同一个人在 A/B 群之间来回抖动，还会把别人的私聊标题
+        一起改掉。群里"此刻该叫这个名片"由当轮上下文负责（bridge 把
+        ``envelope.sender_name`` 透传下去），**不进这一列**。
+
+        ## 已知代价（本轮明确接受）
+
+        ``subjects.display_name`` 仍然是**跨群唯一**的一列（名字是"人"的标签，
+        不是"人在某个群"的标签）。两条具体后果：
+
+        - 一个人在 A 群改了**昵称**，B 群的称呼、私聊标题会一起变；
+        - 更直接的：旧连接器不带 ``sender_nickname`` 时这里会退回 ``sender_name``
+          （即 ``card > nickname`` 的群名片）——**最新群名片会覆盖其他群的称呼**。
+
+        真正"每个群一份名字"需要新表（``channel_member_names``），属于下一批
+        迁移的事（见 docs/GROUP-CARD-RESEARCH.md §C.5）。这里先不偷偷改成
+        每群一份，也把这条代价用
+        ``test_known_cost_legacy_fallback_is_shared_across_groups`` 钉住。
+
+        ## 为什么吞掉异常
+
+        改名是**旁路**：失败只意味着"库里的名字还是旧的"，下一条消息会重试。
+        让它抛出去会变成"因为改名失败而拒收消息"，那个代价大得多。
+
+        但**光 try/except 不够**：一次失败的 ``flush`` 会把这个 session 的
+        事务标成待回滚，调用方随后 commit 会拿到 ``PendingRollbackError``——
+        消息照样被拒收，只是换了个地方炸。所以写库那一步包在 SAVEPOINT 里
+        （见实现处的注释，有实测对照）。
+        """
+        account = (external_account_id or "").strip()
+        if not account:
+            return None
+        # 昵称优先；旧连接器不发昵称时退回本次称呼（card>nickname 的合并值），
+        # 这样不升级连接器也能工作。
+        candidate = normalize_display_name(nickname) or normalize_display_name(sender_name)
+        if candidate is None:
+            # 空名片 + 空昵称：**保持旧值**。空名不是"改名的信号"，
+            # 拿它覆盖只会把好不容易采到的名字擦掉。
+            return None
+
+        key = (connector_instance, account)
+        if _DISPLAY_NAME_CACHE.get(key) == candidate:
+            # 内存 diff 命中：这条消息到此为止，**一次库都不碰**。
+            return None
+
+        try:
+            if subject_id is None:
+                # ``require_proven=False``：群里刚自动建档的群友是 ``proof=pending``，
+                # 默认的"只认已证明"会把他们全判成 None，于是**名字永远更新不了**
+                # ——那正是这个需求要修的 bug 的翻版。这里改的是显示名（标签），
+                # 不涉及任何权限，pending 账号照写。
+                subject_id = await self.resolve_account(
+                    connector_instance, account, require_proven=False
+                )
+            if subject_id is None:
+                # 还没建号（未证明且未自动注册）。建号是
+                # `resolve_or_provision` 的职责，这里不越界；也不写缓存，
+                # 让下一条消息重新判定。
+                return None
+            # 读一行再改，而不是一条 ``UPDATE ... WHERE display_name IS DISTINCT FROM``。
+            #
+            # 两个理由：
+            # 1. 身份域有一条守卫测试禁止**任何** where 里出现名字字段（"绝不按名字
+            #    找人"）。虽然这里按 subject_id 定位、名字只用来判"要不要改"，
+            #    但把这个形状写出来，下一次就会有人照抄成真正的按名字查找。
+            # 2. 读改写在多副本下本身就是幂等的（同名并发写同一个值），
+            #    而"变了才写"的第一步（进程内 diff）已经把 99% 的调用挡在外面，
+            #    这里多一条 SELECT 只发生在"真的改名了"那一次。
+            #
+            # 读取 + 更新整体放进一个 **SAVEPOINT**：真写失败（NOT NULL 违约、
+            # 连接抖动）只回滚这一步，**不把调用方的事务标成"待回滚"**。
+            # 没有 SAVEPOINT 时已实测：flush 抛 IntegrityError 之后，同一个
+            # session 的 commit 变成 ``PendingRollbackError`` —— bridge 接着
+            # 提交这条消息就会失败，等于「改名失败把用户消息拒了」，正是需求里
+            # 明确不允许的那一条。有 SAVEPOINT：commit 照常成功。
+            #
+            # 这一层的前提：调用点**没有别人的未提交改动**（bridge 的建号/绑定
+            # 在调用前已 commit，见 bridge.handle 的身份解析段）。若将来要在
+            # 持有未提交改动的会话里调用，``flush()`` 会把那些改动一起卷进
+            # savepoint，回滚时 ORM 状态会与库不一致——那时应改成独立 session
+            # 的旁路写，不要在这里硬扛。
+            async with self._session.begin_nested():
+                row = await self._session.get(Subject, subject_id)
+                if row is None:
+                    return None
+                if normalize_display_name(row.display_name) == candidate:
+                    # 库里已经是这个名字（可能别的副本先写了）：不产生 UPDATE，
+                    # 但缓存照样记下，后续消息不再查库。
+                    _remember_display_name(key, candidate)
+                    return None
+                row.display_name = candidate
+                row.updated_at = utcnow()
+                await self._session.flush()
+        except Exception as exc:  # noqa: BLE001 - 旁路失败绝不能拒收消息
+            # 失败就把缓存里的判断**删掉**，下一条消息会重新试；
+            # 留着会变成"缓存说写过、其实没写成"。
+            _DISPLAY_NAME_CACHE.pop(key, None)
+            logger.debug(
+                "同步显示名失败（保留旧名，下一条重试）：%s", type(exc).__name__
+            )
+            return None
+
+        _remember_display_name(key, candidate)
+        # 名字是标签不是身份：日志里只说"改名了"，不打印名字本身
+        # （群名片是个人信息，仓库的日志规约要求这类内容脱敏）。
+        logger.info("渠道昵称已更新（subject 显示名变化）")
+        return candidate
 
     async def revoke_account(self, account_id: str) -> ActorAccount:
         """解绑（撤销）渠道账号。

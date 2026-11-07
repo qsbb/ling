@@ -145,7 +145,14 @@ class TokenQuotaStore:
         # 进程退出时 `aclose()` 再补一次。
         await self._flush(provider_id, day)
         self._ensure_flusher()
-        return self._pending[key] + await self._stored(provider_id, day)
+        # 用 `get` 而不是 `[key]`：**记账成功时** `_flush` 会把这一笔从内存里
+        # 扣掉并在扣到 0 时删键，紧接着 `self._pending[key]` 就是 KeyError。
+        #
+        # 这个缺陷的后果不是"记账不准"（库已经写进去了），而是**每一次成功的
+        # 生成都往日志里扔一条** `token 用量记账失败（…）：('fake', date(…))`：
+        # 一条假警报，把真正要看的失败盖掉；`record()` 的返回值也永远拿不到。
+        # 读不懂这句 warning 的人会去查数据库，而那里一切正常。
+        return self._pending.get(key, 0) + await self._stored(provider_id, day)
 
     def _ensure_flusher(self) -> None:
         """确保有一个后台任务在补写。

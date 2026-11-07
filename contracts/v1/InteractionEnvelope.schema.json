@@ -267,6 +267,19 @@
       "description": "发送者显示名，仅作标签；同名不同人靠 account_ref 区分",
       "title": "Sender Name"
     },
+    "sender_nickname": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "发送者昵称（人级、跨群稳定）；缺省时落库退回使用 sender_name",
+      "title": "Sender Nickname"
+    },
     "trace_id": {
       "anyOf": [
         {
