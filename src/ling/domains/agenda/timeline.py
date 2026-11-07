@@ -3765,7 +3765,8 @@ REFINE_MAX_CALLS_PER_DAY = 4
 REFINE_RESERVED_INPUT_TOKENS = 1000
 REFINE_RESERVED_OUTPUT_TOKENS = 800
 REFINE_DAILY_TOKEN_BUDGET = 7200
-REFINE_TIMEOUT_SECONDS = 60.0
+# 超时沿用 `OUTLINE_TIMEOUT_SECONDS`（60 秒）：同一个职责、同一个上限，
+# 不另设一个"细化超时"制造第二套口径；租约比它长，留出提交与回滚的时间。
 REFINE_LEASE_SECONDS = 120.0
 
 # 单个父段的硬上限：一次最多 4 个子段，每段至少 5 分钟（"5–15 分钟叶段"的下界），
@@ -4528,7 +4529,16 @@ async def refine_work(
             valid_place_ids=target.place_ids,
         )
         if not children:
-            raise RefineValidationError(["children 为空：没有可细化的子段"])
+            # 空结果是**失败**而不是"无事可做"：按一次尝试记账，当次不重试。
+            await _finish_call(
+                session,
+                call_id=reservation.call_id,
+                state="failed",
+                error_code=REASON_REFINE_EMPTY,
+            )
+            return replace(
+                base, state="failed", calls=1, reason_code=REASON_REFINE_EMPTY
+            )
     except RefineValidationError:
         await _finish_call(
             session,
@@ -5410,7 +5420,6 @@ __all__ = [
     "REFINE_PROFILE",
     "REFINE_ROLLING_HOURS",
     "REFINE_ROLLING_MAX_CALLS",
-    "REFINE_TIMEOUT_SECONDS",
     "REFINE_TRIGGER_MINUTES",
     "REPLAN_TODO_TAG",
     "SLEEP_ANCHOR",

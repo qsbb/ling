@@ -622,7 +622,7 @@ async def test_empty_children_is_a_failure_not_a_noop(web_env: TestEnv) -> None:
         _at(8 * 60), responses=[json.dumps({"parent_id": ids["work"], "children": []})]
     )
     assert outcome.state == "failed"
-    assert outcome.reason_code == "refine_invalid"
+    assert outcome.reason_code == "refine_empty"
     assert await _children_of(ids["work"]) == []
 
 

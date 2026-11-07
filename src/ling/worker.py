@@ -2087,11 +2087,15 @@ async def _advance_timeline_boundaries(
     # ③ 覆盖此刻的叶段：按段唯一去重起活动（重启/重复 tick 不会各开一个）。
     if view.active_leaf is not None:
         segment = view.active_leaf
+        # 活动可见范围**只许收窄**：段哪怕是 public，"她此刻在做什么"也只是
+        # subject_private；段更严时跟着段走（未知取值按最严处理）。
+        from ling.domains.agenda.intents import strictest_visibility
+
         started = await activity.start_for_segment(
             segment_id=segment.segment_id,
             kind=segment.kind,
             place_id=segment.place_id,
-            visibility=segment.visibility or "subject_private",
+            visibility=strictest_visibility(segment.visibility, "subject_private"),
             origin="simulated",
             source_event_ids=[
                 f"schedule_segment:{segment.segment_id}",
@@ -2100,6 +2104,9 @@ async def _advance_timeline_boundaries(
         )
         if started.action in {"created", "resumed"}:
             actions.append(f"{started.action}:{segment.segment_id}")
+        if started.activity.state != "running":
+            # 这一段的活动已经收尾（取消/已暂停到终态）：不再拿它当"此刻在做什么"。
+            return actions
         target_scene = _scene_state_for_kind(segment.kind)
         scene = await presence.scene(now=now)
         if (
@@ -2928,7 +2935,9 @@ async def _schedule_seam(
     )
 
 
-async def _schedule_refine(session, *, actor_id: str, now: datetime) -> str | None:
+async def _schedule_refine(
+    session, *, actor_id: str, now: datetime, timezone: str | None = None
+) -> str | None:
     """投递一次近窗细化（幂等键 = ``refine:{plan_id}:{revision}:{window_start}``）。
 
     扫描本身**零模型**：只回答"现在有没有该细化的父段"。选择规则完全在
@@ -2941,7 +2950,9 @@ async def _schedule_refine(session, *, actor_id: str, now: datetime) -> str | No
     """
     from ling.domains.agenda.timeline import load_refine_target
 
-    target = await load_refine_target(session, actor_id=actor_id, now=now)
+    target = await load_refine_target(
+        session, actor_id=actor_id, now=now, timezone=timezone
+    )
     if target is None:
         return None
     key = target.idempotency_key
@@ -3163,7 +3174,9 @@ async def handle_life_schedule(payload: dict) -> None:
 
         # ⑤ 近窗细化（阶段 2）：距最早未细化段开始 ≤ 60 分钟、且未来 3 小时里
         # 确有粗段才投一次；幂等键含版本与窗口起点，重复扫描不会重复投。
-        refine_job = await _schedule_refine(session, actor_id=actor_id, now=now)
+        refine_job = await _schedule_refine(
+            session, actor_id=actor_id, now=now, timezone=timezone
+        )
         if refine_job:
             enqueued.append(refine_job)
 
