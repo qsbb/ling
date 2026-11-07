@@ -1,4 +1,4 @@
-"""Worker 派发闸：注册了 handler，就必须有派发源。
+"""Worker 派发闸：注册了 handler，就必须有派发源（或**显式**声明只能手工跑）。
 
 ## 为什么需要这个文件
 
@@ -14,11 +14,24 @@ handler 注册了却没有任何调度来源时，它**等于不存在**：
 所以定时任务统一收进 `PERIODIC_JOBS`，事件驱动的收进 `OUTBOX_TOPICS`。
 两边都查得到才算"能跑"。
 
-## 三条不变式
+## 第三类：只保留手工触发（`LEGACY_MANUAL_TOPICS`）
 
-1. 每个 `HANDLERS` 里的 topic 必须在 `PERIODIC_JOBS` 或 `OUTBOX_TOPICS` 里
-2. `PERIODIC_JOBS` / `OUTBOX_TOPICS` 里的每个 topic 必须真的注册了 handler
+有些 handler **有意**不再自动跑。最典型的是 `life.plan`：新时间轴
+（`life.schedule` + `schedule.outline` + `day_plans`）已经接管"今天/明天做
+什么"，旧路径再自动生成就是同一段时间轴上的第二份安排。
+
+但"不再自动跑"和"忘了接调度"在代码里长得一模一样。如果只是把它从
+`PERIODIC_JOBS` 删掉，闸门会红；如果给它随便塞一个假派发源，闸门会绿而
+事实是假的。所以显式列出 `LEGACY_MANUAL_TOPICS`：**写清楚意图**，同时保留
+手工/运维触发的能力（旧数据修复还得用得上）。
+
+## 四条不变式
+
+1. 每个 `HANDLERS` 里的 topic 必须在 `PERIODIC_JOBS` / `OUTBOX_TOPICS` /
+   `LEGACY_MANUAL_TOPICS` 之一
+2. 后三者里的每个 topic 必须真的注册了 handler
 3. `OUTBOX_TOPICS` 里的每个 topic 必须真的有人在 enqueue 它
+4. `LEGACY_MANUAL_TOPICS` 不得同时出现在自动派发源里（否则"手工"就是空话）
 """
 
 from __future__ import annotations
@@ -28,6 +41,7 @@ import re
 
 from ling.worker import (
     HANDLERS,
+    LEGACY_MANUAL_TOPICS,
     OUTBOX_TOPICS,
     PERIODIC_JOBS,
     _should_run_maintenance,
@@ -35,23 +49,27 @@ from ling.worker import (
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "ling"
 
+PERIODIC_TOPICS = frozenset(job.topic for job in PERIODIC_JOBS)
+
 
 def test_every_handler_has_a_dispatch_source() -> None:
     """注册了却没派发源的 handler = 功能不存在。
 
     这是最要紧的一条：`media.describe` 和 `self.timeline` 都是这么白躺的。
+    有意不自动跑的，必须在 `LEGACY_MANUAL_TOPICS` 里写出来。
     """
-    dispatched = {job.topic for job in PERIODIC_JOBS} | set(OUTBOX_TOPICS)
+    dispatched = PERIODIC_TOPICS | OUTBOX_TOPICS | LEGACY_MANUAL_TOPICS
     orphans = sorted(set(HANDLERS) - dispatched)
     assert not orphans, (
         f"这些 handler 注册了但没有任何派发源：{orphans}\n"
-        f"要么加进 PERIODIC_JOBS（周期任务），要么加进 OUTBOX_TOPICS（事件驱动）。"
+        f"要么加进 PERIODIC_JOBS（周期任务），要么加进 OUTBOX_TOPICS（事件驱动），"
+        f"要么加进 LEGACY_MANUAL_TOPICS（有意只留手工触发）。"
     )
 
 
 def test_no_dispatch_entry_without_a_handler() -> None:
     """反过来：声明了要派发却没人注册 handler，会静默什么都不发生。"""
-    declared = {job.topic for job in PERIODIC_JOBS} | set(OUTBOX_TOPICS)
+    declared = PERIODIC_TOPICS | OUTBOX_TOPICS | LEGACY_MANUAL_TOPICS
     ghosts = sorted(declared - set(HANDLERS))
     assert not ghosts, f"这些 topic 声明了但没注册 handler：{ghosts}"
 
@@ -79,6 +97,44 @@ def test_outbox_topics_are_actually_enqueued() -> None:
         if not re.search(rf'["\']{re.escape(topic)}["\']', blob):
             missing.append(topic)
     assert not missing, f"这些 outbox topic 没人入队：{missing}"
+
+
+def test_legacy_topics_are_not_auto_scheduled() -> None:
+    """`LEGACY_MANUAL_TOPICS` 不能同时挂在自动派发源上。
+
+    两边都列等于"假装手工"：跑到的时候还是会自动生成，闸门却绿着。
+    """
+    overlap = sorted(LEGACY_MANUAL_TOPICS & (PERIODIC_TOPICS | OUTBOX_TOPICS))
+    assert not overlap, f"这些 topic 同时被声明为「只手工」和「自动派发」：{overlap}"
+
+
+def test_legacy_life_plan_is_not_auto_generated_anymore() -> None:
+    """旧 `life.plan` 必须退出自动调度。
+
+    新时间轴启用后，两套并行生成就是两份日程：`agenda_plans` 一套、
+    `day_plans` 一套，`life.tick` 与界面各看一半。这条把"退出自动调度"
+    钉在结构上——不是靠某个进程内变量或某次部署的注释。
+    """
+    assert "life.plan" in LEGACY_MANUAL_TOPICS
+    assert "life.plan" not in PERIODIC_TOPICS, "旧 life.plan 又被排进周期任务了"
+    assert "life.plan" not in OUTBOX_TOPICS, "旧 life.plan 又被当成事件驱动任务了"
+
+
+def test_life_schedule_scan_is_minute_grained() -> None:
+    """`life.schedule` 的扫描周期必须是分钟级。
+
+    21:00 到期点靠这个扫描发现；周期一旦被调成小时级，最坏会晚 59 分钟
+    才投递大纲——而"21:00 前夜为明天生成"是这个方案的全部前提。
+    """
+    job = next(job for job in PERIODIC_JOBS if job.topic == "life.schedule")
+    assert job.interval <= 60.0, f"life.schedule 周期是 {job.interval} 秒，超过 60 秒"
+
+
+def test_new_schedule_topics_are_registered() -> None:
+    """时间轴/梦/结算的四个 outbox topic 必须都在。"""
+    expected = {"schedule.outline", "schedule.seam", "dream.generate", "sleep.settle"}
+    assert expected <= set(HANDLERS)
+    assert expected <= OUTBOX_TOPICS
 
 
 def test_job_intervals_are_sane() -> None:
