@@ -17,6 +17,9 @@ import type {
   MemoryPolicy,
   ProfileDraftInput,
   ProviderDraftInput,
+  QuickConfigPreview,
+  ResolveResponse,
+  SlotDraftInput,
   SecretStatus,
   SessionRecord,
   SettingsConfig,
@@ -264,6 +267,7 @@ export const api = {
   saveDraft(payload: {
     providers?: ProviderDraftInput[];
     profiles?: ProfileDraftInput[];
+    slots?: SlotDraftInput[];
     test_mode?: boolean;
     log_access_denials?: boolean;
     memory?: Partial<MemoryPolicy>;
@@ -272,6 +276,37 @@ export const api = {
     note?: string;
   }): Promise<DraftResponse> {
     return request<DraftResponse>('/v1/settings/draft', jsonInit('PUT', payload));
+  },
+  /**
+   * 按**草稿**算每个职责的生效模型。**只算不写**。
+   *
+   * 界面上的「实际生效」列靠它：改了下拉还没保存，那一列要立刻跟着变。
+   * 但回退规则**不在浏览器里实现**——服务端用与保存完全相同的合并 + 解析
+   * 跑一遍，前端只显示结论。各算一次迟早不一致，而那种不一致查不出来。
+   */
+  settingsResolve(payload: {
+    providers?: ProviderDraftInput[];
+    profiles?: ProfileDraftInput[];
+    slots?: SlotDraftInput[];
+    test_mode?: boolean;
+  }): Promise<ResolveResponse> {
+    return request<ResolveResponse>('/v1/settings/resolve', jsonInit('POST', payload));
+  },
+  /**
+   * 「快速配置」的二次确认：把每个职责指回它自己的槽位会发生什么。
+   *
+   * 返回的 `profiles` 就是点确认后要写入的那份草稿，**不要在浏览器里再拼一次**。
+   */
+  quickConfigPreview(payload: {
+    providers?: ProviderDraftInput[];
+    profiles?: ProfileDraftInput[];
+    slots?: SlotDraftInput[];
+    test_mode?: boolean;
+  }): Promise<QuickConfigPreview> {
+    return request<QuickConfigPreview>(
+      '/v1/settings/quick-config/preview',
+      jsonInit('POST', payload),
+    );
   },
   publish(revision: number): Promise<{ published_revision: number }> {
     return request<{ published_revision: number }>(

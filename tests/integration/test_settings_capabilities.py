@@ -3,11 +3,16 @@
 系统不会因为没绑模型而报错——它会走**降级路径**。看起来一切正常，
 只是能力悄悄变窄：
 
-- `memory.extract` 没绑 → 提炼退回正则表，只能抓「我叫/我喜欢/我住在」
+- `perception.vision` 没绑（或它跟随的「识图」槽位没配）→ 看不到图片内容，
+  媒体描述始终为空
+- `memory.extract` 没配 → 提炼退回正则表，只能抓「我叫/我喜欢/我住在」
   三个句式，"下周三去成都出差"这种自由文本事实完全落空
-- `perception.vision` 没绑 → 看不到图片内容，媒体描述始终为空
 
 用户看到的只是"她好像记不住事"，无从判断是没配模型。所以必须明说。
+
+判据是**解析结果**而不是"有没有一条绑定记录"：上了默认槽位之后，一个
+职责完全可以没有显式绑定却照常工作（跟随槽位），按绑定记录判会把它误报
+成降级，用户于是去补一条本来不需要的绑定。
 """
 
 from __future__ import annotations
@@ -22,16 +27,34 @@ ACTOR = "actor_ling"
 
 
 async def test_unbound_roles_report_what_degrades(logged_in: TestEnv) -> None:  # noqa: ARG001
-    """未绑定职责必须说清会失去什么。"""
+    """没有可用模型的职责必须说清会失去什么。"""
     body = (await logged_in.client.get("/v1/settings/config")).json()
     degradations = body["unbound_degradations"]
-    # 测试环境只绑了 dialogue.*，所以记忆提炼必然在降级名单里
-    assert "memory.extract" in degradations, (
-        f"没提示记忆提炼在降级路径上：{list(degradations)}"
+    # 测试环境的引导配置只绑对话与提炼，「识图」槽位没配 → vision 必然在
+    # 降级名单里。
+    assert "perception.vision" in degradations, (
+        f"没提示看图片在降级路径上：{list(degradations)}"
     )
-    # 措辞必须准确：它是"改用主对话模型代跑"，不是"退回正则表"。
-    # 我一开始写成后者，那是错的——代码用的是 dialogue.fast，模型路径一直有效。
-    assert "主对话模型" in degradations["memory.extract"], degradations["memory.extract"]
+    assert "图片" in degradations["perception.vision"], degradations["perception.vision"]
+
+    # 测试环境的引导配置绑了 dialogue.* + memory.extract，所以它们不该报降级；
+    # 没绑的那些才报（这条断言防止"降级提示永远挂着"变成噪音）。
+    assert "dialogue.fast" not in degradations
+    assert "memory.extract" not in degradations
+
+
+def test_memory_extract_degradation_says_regex_not_borrowed_model() -> None:
+    """提炼的降级说明**必须写成"退回正则"**，不能说"改用主对话模型代跑"。
+
+    那条跨角色回退已经删掉了（见 `EffectiveConfig.resolve_profile`：只回退
+    一层，不允许套娃）。措辞与代码不一致时，用户会照着提示去"检查主对话
+    模型"，而那里根本没救——他要做的是配「创作」槽位或显式绑定提炼。
+    """
+    from ling.settings.service import PROFILE_DEGRADATIONS
+
+    text = PROFILE_DEGRADATIONS["memory.extract"]
+    assert "正则" in text, text
+    assert "主对话模型" not in text, text
 
 
 async def test_bound_roles_are_not_reported_as_degraded(logged_in: TestEnv) -> None:  # noqa: ARG001

@@ -12,7 +12,7 @@ import { api } from '../../api';
 import { explainError } from '../../errors';
 import type {
   ProbeResult,
-  ProfileDraftInput,
+  ProfileResolution,
   ProviderDraftInput,
   ProviderModel,
   SettingsConfig,
@@ -33,7 +33,8 @@ import {
 interface Props {
   config: SettingsConfig;
   providers: ProviderDraftInput[];
-  profiles: ProfileDraftInput[];
+  /** 服务端算的「谁在用哪个模型」。职责标签与删除确认都读它。 */
+  resolutions: ProfileResolution[];
   selectedId: string | null;
   saving: boolean;
   /** 「供应商」页里没保存的改动数（含其他家与运行设置），决定保存按钮是否可用。 */
@@ -116,7 +117,7 @@ function newModelError(models: ProviderModel[], modelId: string): string {
 export function ProvidersPanel({
   config,
   providers,
-  profiles,
+  resolutions,
   selectedId,
   saving,
   dirtyCount,
@@ -192,7 +193,7 @@ export function ProvidersPanel({
   };
 
   const removeModel = (model: ProviderModel) => {
-    const bound = rolesForModel(profiles, selected?.provider_id ?? '', model.model_id);
+    const bound = rolesForModel(resolutions, selected?.provider_id ?? '', model.model_id);
     if (
       bound.length > 0 &&
       !window.confirm(
@@ -294,7 +295,7 @@ export function ProvidersPanel({
   const probeTone = probe ? (probe.ok ? 'ok' : 'danger') : 'idle';
   const roleCount = selected
     ? (selected.models ?? []).reduce(
-        (total, model) => total + rolesForModel(profiles, selected.provider_id, model.model_id).length,
+        (total, model) => total + rolesForModel(resolutions, selected.provider_id, model.model_id).length,
         0,
       )
     : 0;
@@ -625,7 +626,7 @@ export function ProvidersPanel({
                   </div>
                 ) : null}
                 {(selected.models ?? []).map((model) => {
-                  const bound = rolesForModel(profiles, selected.provider_id, model.model_id);
+                  const bound = rolesForModel(resolutions, selected.provider_id, model.model_id);
                   return (
                     <div className={`ms-model${model.enabled ? '' : ' ms-model--off'}`} key={model.model_id}>
                       <div className="ms-model__main">

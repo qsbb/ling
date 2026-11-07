@@ -12,7 +12,15 @@ from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import utcnow
-from ling.ports.model import provider_capabilities, required_capability
+from ling.ports.config import BindingMode, EffectiveConfig, ResolvedProfile
+from ling.ports.model import (
+    SLOT_HINTS,
+    SLOT_LABELS,
+    SLOT_ORDER,
+    provider_capabilities,
+    required_capability,
+    slot_for_profile,
+)
 from ling.settings.service import (
     KNOWN_PROVIDER_KINDS,
     PROFILE_DEGRADATIONS,
@@ -76,11 +84,22 @@ class ProfileIn(BaseModel):
     """
 
     profile: str
-    provider_id: str
-    model_id: str
+    provider_id: str = ""
+    model_id: str = ""
     fallback_provider_id: str | None = None
     fallback_model_id: str | None = None
     enabled: bool = True
+    # ``explicit``（默认）/ ``slot``。**默认必须是 explicit**：旧客户端不带
+    # 这个键，而它们的每一条都是显式选择，按 slot 读会把现有部署全作废。
+    mode: str = BindingMode.explicit.value
+
+
+class SlotIn(BaseModel):
+    """一个默认槽位。四项都空 = 把这个槽位清回"没配"。"""
+
+    slot: str
+    provider_id: str = ""
+    model_id: str = ""
 
 
 class MemoryPolicyIn(BaseModel):
@@ -123,6 +142,7 @@ class DialoguePolicyIn(BaseModel):
 class DraftBody(BaseModel):
     providers: list[ProviderIn] | None = None
     profiles: list[ProfileIn] | None = None
+    slots: list[SlotIn] | None = None
     test_mode: bool | None = None
     # 入站白名单拒绝是否逐条写日志。只影响日志量，不影响拒绝本身。
     log_access_denials: bool | None = None
@@ -130,6 +150,22 @@ class DraftBody(BaseModel):
     life: LifePolicyIn | None = None
     dialogue: DialoguePolicyIn | None = None
     note: str | None = None
+
+
+class ResolveBody(BaseModel):
+    """算「那它到底会跑哪个模型」时带上的**草稿**。
+
+    三项都可不传：不传的部分按**当前已生效**配置算。界面会在两种时候调它——
+    改了下拉还没保存时（要立刻看到「实际生效」跟着变），以及快速配置的
+    二次确认（要列出"点下去会变成什么"）。
+
+    **只算不写**：这个 body 不会产生修订，也不会碰数据库。
+    """
+
+    providers: list[ProviderIn] | None = None
+    profiles: list[ProfileIn] | None = None
+    slots: list[SlotIn] | None = None
+    test_mode: bool | None = None
 
 
 class PublishBody(BaseModel):
@@ -142,6 +178,79 @@ class RollbackBody(BaseModel):
 
 class SecretBody(BaseModel):
     secret: str = Field(min_length=1, max_length=4096)
+
+
+# ---------------------------------------------------------------- 视图拼装
+#
+# 这几个函数是「槽位是什么、职责最后会跑什么」的**唯一出口**。它们都只读
+# `EffectiveConfig.resolve_profile()` 的结论，绝不自己再判一次——前端更不
+# 许算：两边各算一次，迟早会出现"界面写 A、实际跑 B"，而那种 bug 没有
+# 任何报错可查。
+
+
+def _effective_view(resolved: ResolvedProfile) -> dict[str, str] | None:
+    if not resolved.usable or not resolved.provider_id or not resolved.model_id:
+        return None
+    return {"provider_id": resolved.provider_id, "model_id": resolved.model_id}
+
+
+def _resolution_view(resolved: ResolvedProfile) -> dict[str, object]:
+    requested = None
+    if resolved.requested_provider_id:
+        requested = {
+            "provider_id": resolved.requested_provider_id,
+            "model_id": resolved.requested_model_id,
+        }
+    return {
+        "profile": resolved.profile,
+        "slot": resolved.slot,
+        "source": resolved.source.value,
+        "effective": _effective_view(resolved),
+        "requested": requested,
+        "fell_back": resolved.fell_back,
+        "enabled": resolved.enabled,
+        "reason": resolved.reason,
+    }
+
+
+def _slot_views(config: EffectiveConfig) -> list[dict[str, object]]:
+    """四个默认槽位 + 各自「谁在跟着我」。
+
+    ``roles`` 让界面能直接写出"3 个职责跟着它"，不必再去翻映射表——
+    映射表在服务端（`ports/model.py::PROFILE_SLOTS`），前端拿一份手抄的
+    迟早不同步。
+    """
+    roles_by_slot: dict[str, list[str]] = {}
+    for profile in _OFFERABLE_PROFILES:
+        key = slot_for_profile(profile)
+        if key is not None:
+            roles_by_slot.setdefault(key.value, []).append(profile)
+    views: list[dict[str, object]] = []
+    for key in SLOT_ORDER:
+        slot = config.slots.get(key.value)
+        configured = bool(slot and slot.configured)
+        views.append(
+            {
+                "slot": key.value,
+                "label": SLOT_LABELS[key],
+                "hint": SLOT_HINTS[key],
+                "provider_id": slot.provider_id if slot else "",
+                "model_id": slot.model_id if slot else "",
+                "configured": configured,
+                # 「可用」= 供应商 enabled 且模型 enabled（见
+                # `EffectiveConfig.is_usable`）。槽位没配 ≠ 槽位坏了，
+                # 所以两个字段分开给。
+                "usable": config.is_usable(
+                    slot.provider_id if slot else "", slot.model_id if slot else ""
+                ),
+                "roles": roles_by_slot.get(key.value, []),
+            }
+        )
+    return views
+
+
+def _resolution_views(config: EffectiveConfig) -> list[dict[str, object]]:
+    return [_resolution_view(config.resolve_profile(profile)) for profile in _OFFERABLE_PROFILES]
 
 
 @router.get("/settings/taxonomy")
@@ -258,9 +367,17 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
                 "fallback_provider_id": b.fallback_provider_id,
                 "fallback_model_id": b.fallback_model_id,
                 "enabled": b.enabled,
+                # 这条绑定是"自己指定"还是"跟随默认槽位"。少了它，前端拿到的
+                # 是一串空 provider_id，只能靠猜来判断是不是"跟随"。
+                "mode": b.mode.value,
             }
             for b in effective.profiles.values()
         ],
+        # 四个默认槽位（快速 / 创作 / 识图 / 日常）。
+        "slots": _slot_views(effective),
+        # **每个职责最后会跑哪个模型**——服务端算，前端只显示。
+        # 这一份同时是 `POST /settings/resolve` 的返回形状，两边共用一个拼装函数。
+        "profile_resolutions": _resolution_views(effective),
         "revisions": [
             {
                 "revision": r.revision,
@@ -297,13 +414,17 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
         # 看起来一切正常，只是能力悄悄变窄。用户只会觉得"她好像记不住事"，
         # 无从判断是没配模型。
         #
+        # 判据是**解析结果**，不是"有没有一条绑定记录"：上了默认槽位之后，
+        # `dialogue.group` 完全可以没有显式绑定却照常工作（跟随「日常」），
+        # 按"有没有绑定"判会把它误报成降级，用户去补一条本来不需要的绑定。
+        #
         # 嵌入/重排要额外看**环境变量**：只在"绑定与环境变量都没有"时才算降级，
         # 否则会把用 env 配好的部署报成语义检索失效。
         "unbound_degradations": {
             profile: PROFILE_DEGRADATIONS[profile]
             for profile in _OFFERABLE_PROFILES
             if profile in PROFILE_DEGRADATIONS
-            and not (effective.profiles.get(profile) and effective.profiles[profile].enabled)
+            and not effective.resolve_profile(profile).usable
             # 来源**不是** None 说明这份能力已经能用（绑定或环境变量），
             # 不该再报降级；不在 memory_sources 里的角色没有"环境变量也算
             # 配置"这回事，一律按未绑定处理。
@@ -354,6 +475,7 @@ async def save_draft(
             else None
         ),
         profiles=[p.model_dump() for p in body.profiles] if body.profiles else None,
+        slots=[s.model_dump() for s in body.slots] if body.slots else None,
         test_mode=body.test_mode,
         log_access_denials=body.log_access_denials,
         memory=body.memory.model_dump(exclude_none=True) if body.memory else None,
@@ -368,6 +490,145 @@ async def save_draft(
         "revision": result.revision,
         "state": result.state,
         "validation_errors": [i.to_dict() for i in result.validation_errors],
+    }
+
+
+def _quick_config_rows(
+    before: EffectiveConfig, after: EffectiveConfig
+) -> list[dict[str, object]]:
+    """快速配置点下去之后，每条职责会变成什么。
+
+    这里**不做任何解析**：`before` / `after` 都是服务端算好的快照，
+    这个函数只负责把两次结果摆到同一行里，并给出一句"变化"。
+    """
+    rows: list[dict[str, object]] = []
+    for profile in _OFFERABLE_PROFILES:
+        key = slot_for_profile(profile)
+        if key is None:
+            continue
+        old = before.resolve_profile(profile)
+        new = after.resolve_profile(profile)
+        old_model = _effective_view(old)
+        new_model = _effective_view(new)
+        if new_model is None:
+            change = f"仍然不可用：{new.reason}"
+            kind = "unavailable"
+        elif old_model is None:
+            change = "修复不可用"
+            kind = "repair"
+        elif old_model == new_model:
+            change = "与现在相同"
+            kind = "same"
+        else:
+            # 说清"被覆盖的是什么"，而不是只说"会变"——用户按下去之前
+            # 得能判断这次覆盖值不值。
+            change = f"覆盖你选的 {old_model['model_id']}"
+            kind = "override"
+        rows.append(
+            {
+                "profile": profile,
+                "slot": key.value,
+                "slot_label": SLOT_LABELS[key],
+                "model_id": new_model["model_id"] if new_model else None,
+                "provider_id": new_model["provider_id"] if new_model else None,
+                "change": change,
+                "change_kind": kind,
+            }
+        )
+    return rows
+
+
+@router.post("/settings/resolve")
+async def resolve_draft(
+    body: ResolveBody, auth: CurrentAuth, config: ConfigDep
+) -> dict[str, object]:
+    """按**草稿**算每个职责的生效模型。**只算不写。**
+
+    界面上的「实际生效」列就靠它：用户改了下拉还没保存，那一列必须立刻跟着
+    变；但**不能在浏览器里算**——回退规则实现两遍，两边迟早不一致。所以
+    前端把草稿发过来，服务端用与保存完全相同的合并 + 解析跑一遍。
+    """
+    view = await config.resolve_preview(
+        providers=[p.model_dump(exclude_unset=True) for p in body.providers]
+        if body.providers
+        else None,
+        profiles=[p.model_dump() for p in body.profiles] if body.profiles else None,
+        slots=[s.model_dump() for s in body.slots] if body.slots else None,
+        test_mode=body.test_mode,
+    )
+    return {
+        "schema_version": "v1",
+        "slots": _slot_views(view),
+        "profile_resolutions": _resolution_views(view),
+    }
+
+
+@router.post("/settings/quick-config/preview")
+async def quick_config_preview(
+    body: ResolveBody, auth: CurrentAuth, config: ConfigDep
+) -> dict[str, object]:
+    """「快速配置」的二次确认：把每个职责指回它自己的槽位，会发生什么。
+
+    **语义是全量覆盖**：所有有槽位的职责都会被改成「跟随默认」，用户单独
+    指定过的模型（含"我特意换了个贵的"）一并清掉。做成"只填空、不动显式"
+    的话，点完看起来什么都没发生，用户会以为按钮坏了——所以弹窗必须把
+    "将要覆盖哪几条"摆在明面上，这也是这里返回逐行 ``change`` 的原因。
+
+    ``memory.embed`` / ``memory.rerank`` 不参与：它们没有槽位（嵌入与重排
+    是另一套协议），指过去只会把它们指成不可用。
+
+    返回的 ``profiles`` 是**点确认后应当写入的那份草稿**，前端照发即可，
+    不要在浏览器里再拼一次。
+    """
+    before = await config.resolve_preview(
+        providers=[p.model_dump(exclude_unset=True) for p in body.providers]
+        if body.providers
+        else None,
+        profiles=[p.model_dump() for p in body.profiles] if body.profiles else None,
+        slots=[s.model_dump() for s in body.slots] if body.slots else None,
+        test_mode=body.test_mode,
+    )
+    current = {b.profile: b for b in before.profiles.values()}
+    next_profiles: list[dict[str, object]] = []
+    for profile in _OFFERABLE_PROFILES:
+        if slot_for_profile(profile) is None:
+            continue
+        existing = current.get(profile)
+        next_profiles.append(
+            {
+                "profile": profile,
+                "provider_id": "",
+                "model_id": "",
+                "fallback_provider_id": None,
+                "fallback_model_id": None,
+                # 只管"用谁的模型"，不管"这个职责开不开"：用户主动关掉的
+                # 职责不该被一个配置按钮悄悄打开。
+                "enabled": existing.enabled if existing else True,
+                "mode": BindingMode.slot.value,
+            }
+        )
+    after = await config.resolve_preview(
+        providers=[p.model_dump(exclude_unset=True) for p in body.providers]
+        if body.providers
+        else None,
+        profiles=next_profiles,
+        slots=[s.model_dump() for s in body.slots] if body.slots else None,
+        test_mode=body.test_mode,
+    )
+    rows = _quick_config_rows(before, after)
+    return {
+        "schema_version": "v1",
+        "rows": rows,
+        "profiles": next_profiles,
+        "summary": {
+            "total": len(rows),
+            "overrides": sum(1 for row in rows if row["change_kind"] == "override"),
+            "unchanged": sum(1 for row in rows if row["change_kind"] == "same"),
+            "repairs": sum(1 for row in rows if row["change_kind"] == "repair"),
+            "still_unavailable": sum(
+                1 for row in rows if row["change_kind"] == "unavailable"
+            ),
+        },
     }
 
 

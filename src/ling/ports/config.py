@@ -6,9 +6,31 @@ ConfigService 实现本协议；Router 只读生效快照，不读草稿。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from ling.ports.model import ModelTarget
+from ling.ports.model import SLOT_LABELS, ModelTarget, slot_for_profile
+
+
+class ResolutionSource(StrEnum):
+    """生效模型是怎么来的。**只有这三种**，界面文案也按它分三种样式。"""
+
+    explicit = "explicit"
+    slot = "slot"
+    unavailable = "unavailable"
+
+
+class BindingMode(StrEnum):
+    """职责怎么拿到模型：自己指定，或跟随默认槽位。
+
+    两种状态**只能用一个显式字段表达**，不能靠"`provider_id` 是不是空的"
+    来猜：空字符串在这个 schema 里已经有别的含义（"没绑过"），
+    再叠一层就会让"没绑"和"跟随默认"再也分不开——而这两件事在界面上
+    长得完全不一样（一个是需要处理，一个是正常状态）。
+    """
+
+    explicit = "explicit"
+    slot = "slot"
 
 
 @dataclass(frozen=True)
@@ -27,6 +49,33 @@ class ProfileBinding:
     fallback_provider_id: str | None = None
     fallback_model_id: str | None = None
     enabled: bool = True
+    # ``slot`` = 跟随该职责所属的默认槽位（见 `ports.model.PROFILE_SLOTS`），
+    # 此时 ``provider_id`` / ``model_id`` 不参与解析。
+    #
+    # 默认 ``explicit``：旧修订里没有这个键，而它们全都是显式绑定，
+    # 所以"缺键 = 显式"让旧配置一字不改地继续生效。
+    mode: BindingMode = BindingMode.explicit
+
+    @property
+    def follows_slot(self) -> bool:
+        return self.mode is BindingMode.slot
+
+
+@dataclass(frozen=True)
+class ModelSlot:
+    """一个默认槽位：`(provider_id, model_id)`。
+
+    槽位和职责绑定是**同一层的东西**（都只是"交给谁"），所以不放密钥、
+    不放超时——那些跟着供应商走。
+    """
+
+    slot: str
+    provider_id: str = ""
+    model_id: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.provider_id and self.model_id)
 
 
 @dataclass(frozen=True)
@@ -226,12 +275,56 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class ResolvedProfile:
+    """一个职责**最终会跑在哪个模型上**，以及这个结论是怎么来的。
+
+    这是全系统唯一的裁决结果：设置页显示它、路由调用它、worker 判断
+    "能不能提炼"也看它。任何地方再算一遍"那它到底用哪个"，
+    迟早会和这里不一致——界面上写着 A、实际跑着 B，是这个仓库反复踩过的坑。
+
+    ``source`` 只有三种取值，**没有第四种**：
+
+    - ``explicit``：用用户单独指定的那个 `(provider, model)`；
+    - ``slot``：跟随时用它所属槽位的模型（也包括"单独指定的那个坏了，
+      于是落回槽位"——同一条路，只是 `requested` 有值、界面标成「已回退」）；
+    - ``unavailable``：没有可用模型，``reason`` 说明是哪一步断的。
+    """
+
+    profile: str
+    source: ResolutionSource
+    provider_id: str | None = None
+    model_id: str | None = None
+    # 该职责所属的槽位（没有默认槽位的角色为 None）。
+    slot: str | None = None
+    # 用户单独指定过什么。只有"指定了但没用上"时才非空——界面靠它把
+    # 「继承」（从来没单独选过）和「已回退」（选了，但那个坏了）分开。
+    requested_provider_id: str | None = None
+    requested_model_id: str | None = None
+    # ``unavailable`` 的具体原因。**给用户直接看的中文**，不要 "ERR_X"。
+    reason: str = ""
+    # 这个职责是否被启用。界面上「已停用」和「不可用」是两回事：
+    # 前者是用户主动关的（别去"修"它），后者是配置断了（该去补）。
+    enabled: bool = True
+
+    @property
+    def usable(self) -> bool:
+        return self.source is not ResolutionSource.unavailable
+
+    @property
+    def fell_back(self) -> bool:
+        """单独指定过、但最后没用上——界面上要标「已回退」。"""
+        return self.source is ResolutionSource.slot and self.requested_provider_id is not None
+
+
+@dataclass(frozen=True)
 class EffectiveConfig:
     """一个 config revision 的生效快照。一次轮次固定用它。"""
 
     revision: int
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     profiles: dict[str, ProfileBinding] = field(default_factory=dict)
+    # 四个默认槽位，键是 `ProviderSlot` 的值。缺键 = 那个槽位没配。
+    slots: dict[str, ModelSlot] = field(default_factory=dict)
     test_mode: bool = False
     # 入站白名单拒绝是否逐条写日志。**只影响日志量，不影响拒绝本身**：
     # `check_access` 照常裁决，被拒消息照常不进对话链路，拒绝次数由进程内
@@ -253,6 +346,125 @@ class EffectiveConfig:
     def binding(self, profile: str) -> ProfileBinding | None:
         return self.profiles.get(profile)
 
+    # ------------------------------------------------------------ 可用性
+
+    def is_usable(self, provider_id: str | None, model_id: str | None) -> bool:
+        """**「可用」的定义**：供应商 ``enabled`` **且** 模型 ``enabled``。
+
+        全系统只认这一个判据。设置页的绿点、槽位能不能用、回退要不要触发，
+        全都是它——各写一份的结果是"界面说能用、调用报 provider 已停用"。
+
+        两个刻意的例外，都是为了让旧配置继续工作：
+
+        - 模型 ID 不在该供应商的清单里时按**可用**处理。清单是给人看的目录，
+          不是路由白名单（见 ``ProviderModel`` 的注释）：把 id 写进绑定却忘了
+          加进目录，是常见状态，路由一直照调不误。判成"不可用"会让设置页
+          凭空红一片，而实际调用完全正常。
+        - 供应商不存在 / 被停用 / 模型被明确标了 ``enabled=False`` → 真的不可用。
+        """
+        if not provider_id or not model_id:
+            return False
+        cfg = self.providers.get(provider_id)
+        if cfg is None or not cfg.enabled:
+            return False
+        for model in cfg.models:
+            if model.model_id == model_id:
+                return model.enabled
+        return True
+
+    def slot_of(self, profile: str) -> str | None:
+        key = slot_for_profile(profile)
+        return key.value if key is not None else None
+
+    def resolve_profile(self, profile: str) -> ResolvedProfile:
+        """职责 → 最终生效的模型。**只回退一层，不允许套娃。**
+
+        判定顺序（每一步都写在这里，没有别处再判一遍）：
+
+        1. 单独指定了、且那个 `(provider, model)` 可用 → 用它（``explicit``）。
+        2. 否则用它**所属槽位**的模型（``slot``）。单独指定的坏了也走这一格。
+        3. 槽位没配 / 不可用 → ``unavailable``，``reason`` 说清断在哪。
+        4. **到此为止**。不会再去试别的槽位、也不会借另一个角色的模型。
+
+        第 4 条是硬约束，不是偷懒：允许二级跳转的话，用户看到的"生效模型"
+        会依赖一条他看不见的链条，出问题时既没法解释也没法复现。宁可报
+        「不可用」让他去补一个槽位，也不要猜他想用哪个。
+
+        ``mode=slot`` 的绑定直接跳过第 1 步：它明确表示"我要跟着槽位走"，
+        此时 ``provider_id`` / ``model_id`` 里的残留值不该有任何作用。
+        """
+        binding = self.profiles.get(profile)
+        slot_key = slot_for_profile(profile)
+        slot_name = slot_key.value if slot_key is not None else None
+        slot = self.slots.get(slot_name) if slot_name is not None else None
+
+        # 职责被停用是一个**独立决定**，不是"不可用"：用户主动关掉它，
+        # 不该被任何回退"修好"。
+        if binding is not None and not binding.enabled:
+            return ResolvedProfile(
+                profile=profile,
+                source=ResolutionSource.unavailable,
+                slot=slot_name,
+                reason="这个职责被停用了：在「职责绑定」里重新打开它",
+                enabled=False,
+            )
+
+        # 只有 `mode=explicit` 的绑定才参与第 1 步。`mode=slot` 的绑定里
+        # 即使残留着 model_id 也不该有任何作用（那是它切过来之前的样子）。
+        explicit = (
+            binding
+            if binding is not None and binding.mode is BindingMode.explicit
+            else None
+        )
+        requested_provider_id = explicit.provider_id if explicit else None
+        requested_model_id = explicit.model_id if explicit else None
+
+        # 1. 单独指定，且可用。
+        if explicit is not None and self.is_usable(
+            explicit.provider_id, explicit.model_id
+        ):
+            return ResolvedProfile(
+                profile=profile,
+                source=ResolutionSource.explicit,
+                provider_id=explicit.provider_id,
+                model_id=explicit.model_id,
+                slot=slot_name,
+            )
+
+        # 2. 该职责的槽位。**只有这一个**，不再往下找。
+        if slot is not None and self.is_usable(slot.provider_id, slot.model_id):
+            return ResolvedProfile(
+                profile=profile,
+                source=ResolutionSource.slot,
+                provider_id=slot.provider_id,
+                model_id=slot.model_id,
+                slot=slot_name,
+                requested_provider_id=requested_provider_id,
+                requested_model_id=requested_model_id,
+            )
+
+        # 3. 到这里就没有了。
+        label = SLOT_LABELS[slot_key] if slot_key is not None else ""
+        if slot_name is None:
+            reason = "这个职责只能单独指定模型：它没有默认槽位"
+        elif slot is None or not slot.configured:
+            reason = f"「{label}」槽位还没有配模型"
+        else:
+            reason = (
+                f"「{label}」槽位配的 {slot.provider_id} · {slot.model_id} 不可用"
+                "（供应商或模型被停用了）"
+            )
+        if explicit is not None and explicit.provider_id:
+            reason += "，你单独指定的模型也不可用"
+        return ResolvedProfile(
+            profile=profile,
+            source=ResolutionSource.unavailable,
+            slot=slot_name,
+            requested_provider_id=requested_provider_id,
+            requested_model_id=requested_model_id,
+            reason=reason,
+        )
+
 
 @runtime_checkable
 class ConfigReader(Protocol):
@@ -269,12 +481,16 @@ class ModelRouter(Protocol):
 
 
 __all__ = [
+    "BindingMode",
     "ConfigReader",
     "DialoguePolicy",
     "EffectiveConfig",
     "LifePolicy",
     "MemoryPolicy",
     "ModelRouter",
+    "ModelSlot",
     "ProfileBinding",
     "ProviderConfig",
+    "ResolvedProfile",
+    "ResolutionSource",
 ]

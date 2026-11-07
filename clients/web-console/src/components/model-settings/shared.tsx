@@ -7,11 +7,14 @@
  */
 
 import type {
+  BindingMode,
   ProfileDraftInput,
+  ProfileResolution,
   ProviderDraftInput,
   ProviderModel,
   ProviderView,
   SettingsConfig,
+  SlotView,
 } from '../../types';
 
 export interface RoleMeta {
@@ -22,7 +25,14 @@ export interface RoleMeta {
   hint: string;
 }
 
-/** 设置页主视图里的三个职责：日常、深度、看图片。 */
+/**
+ * 设置页主视图里真会生效的四个职责。
+ *
+ * `dialogue.deep` **不在这里**：全仓没有代码按那个角色请求模型，列着它
+ * 等于承诺"绑上会更聪明"（服务端也把它放进了 `reserved_profiles`）。
+ * 这份清单还会再与服务端返回的 `known_profiles` 求交集，两边各自的增删
+ * 都不会让界面多出一行没用的东西。
+ */
 export const PRIMARY_ROLES: RoleMeta[] = [
   {
     key: 'dialogue.fast',
@@ -31,10 +41,10 @@ export const PRIMARY_ROLES: RoleMeta[] = [
     hint: '她平时回消息用的模型，最常走的一条路',
   },
   {
-    key: 'dialogue.deep',
-    label: '深度对话',
-    short: '深度',
-    hint: '需要想清楚再回的时候用，比如长问题、情绪重的话',
+    key: 'dialogue.group',
+    label: '群聊',
+    short: '群聊',
+    hint: '群里的回复单独走一条路由',
   },
   {
     key: 'perception.vision',
@@ -42,23 +52,16 @@ export const PRIMARY_ROLES: RoleMeta[] = [
     short: '图片',
     hint: '把图片转成描述，她才能"看见"你发的东西',
   },
-];
-
-/** 三个次要职责收在「更多职责」里：不常改，但改不了会真的少能力。 */
-export const EXTRA_ROLES: RoleMeta[] = [
-  {
-    key: 'dialogue.group',
-    label: '群聊',
-    short: '群聊',
-    hint: '群里的回复单独走一条路由；不配就退回日常模型',
-  },
   {
     key: 'memory.extract',
     label: '记忆提炼',
     short: '记忆',
-    hint: '从对话里抽长期记忆；不配就由日常模型代跑',
+    hint: '从对话里抽长期记忆，决定她记不记得住',
   },
 ];
+
+/** 不常改、但改不了会真的少能力的那几条。 */
+export const EXTRA_ROLES: RoleMeta[] = [];
 
 const ALL_ROLES = [...PRIMARY_ROLES, ...EXTRA_ROLES];
 
@@ -123,10 +126,16 @@ export function toProfileDraft(view: SettingsConfig['profiles'][number]): Profil
     fallback_provider_id: view.fallback_provider_id,
     fallback_model_id: view.fallback_model_id,
     enabled: view.enabled,
+    mode: view.mode ?? 'explicit',
   };
 }
 
-export function emptyProfile(profile: string, providerId: string, modelId: string): ProfileDraftInput {
+export function emptyProfile(
+  profile: string,
+  providerId: string,
+  modelId: string,
+  mode: BindingMode = 'explicit',
+): ProfileDraftInput {
   return {
     profile,
     provider_id: providerId,
@@ -134,7 +143,48 @@ export function emptyProfile(profile: string, providerId: string, modelId: strin
     fallback_provider_id: null,
     fallback_model_id: null,
     enabled: true,
+    mode,
   };
+}
+
+/**
+ * 服务端**没有**这条职责的记录时的草稿。
+ *
+ * 默认按「跟随槽位」：这是改版后的正常状态，不是"没配"。用 `explicit` 当默认
+ * 会让界面上每个没动过的职责都显示成"选了空模型"。
+ */
+export function missingProfile(profile: string): ProfileDraftInput {
+  return emptyProfile(profile, '', '', 'slot');
+}
+
+/** 槽位键 → 中文名。来源是服务端返回的 `slots`，不是前端手抄的常量。 */
+export function slotLabel(slots: SlotView[] | undefined, key: string | null): string {
+  if (!key) return '';
+  return slots?.find((slot) => slot.slot === key)?.label ?? key;
+}
+
+/** 一行职责在界面上属于哪一态。四种，决定边框、标签、颜色。 */
+export type RoleRowState = 'explicit' | 'inherit' | 'fell_back' | 'unavailable';
+
+export function rowStateOf(resolution: ProfileResolution | undefined): RoleRowState {
+  if (!resolution || resolution.source === 'unavailable') return 'unavailable';
+  if (resolution.fell_back) return 'fell_back';
+  return resolution.source === 'explicit' ? 'explicit' : 'inherit';
+}
+
+/** 行尾一句话：这个模型是怎么来的，或者为什么没有。 */
+export function effectiveNote(
+  resolution: ProfileResolution | undefined,
+  slots: SlotView[] | undefined,
+): string {
+  if (!resolution) return '正在计算…';
+  if (resolution.source === 'unavailable') return resolution.reason;
+  if (resolution.source === 'explicit') return '你单独选的';
+  const label = slotLabel(slots, resolution.slot);
+  if (resolution.fell_back) {
+    return `你选的 ${resolution.requested?.model_id ?? '那个模型'} 不可用，暂时用「${label}」`;
+  }
+  return `跟随「${label}」`;
 }
 
 /** 模型清单的稳定比较（顺序有意义：用户看到的就是这个顺序）。 */
@@ -170,8 +220,11 @@ export function providerEquals(a: ProviderDraftInput, b: ProviderDraftInput): bo
 }
 
 export function profileEquals(a: ProfileDraftInput, b: ProfileDraftInput): boolean {
+  // `mode` 必须参与比较：只把 mode 从 slot 改成 explicit（而 provider/model
+  // 恰好没动）也是一次真实改动，漏判会让「保存」按钮一直是灰的。
   return (
     a.profile === b.profile &&
+    a.mode === b.mode &&
     a.provider_id === b.provider_id &&
     a.model_id === b.model_id &&
     (a.fallback_provider_id ?? '') === (b.fallback_provider_id ?? '') &&
@@ -180,14 +233,22 @@ export function profileEquals(a: ProfileDraftInput, b: ProfileDraftInput): boole
   );
 }
 
-/** 这份草稿里指向该模型的职责（用于模型行右侧的职责标签）。 */
+/**
+ * 这个模型**实际在服务哪些职责**（用于模型行右侧的职责标签）。
+ *
+ * 用服务端的解析结果，不是"谁的 provider_id/model_id 等于它"：
+ * 跟随槽位的职责自己那两个字段是空的，按字段比对会让一个正被「快速」
+ * 用着的模型显示成"未绑定职责"——用户于是放心把它停用，然后对话就断了。
+ */
 export function rolesForModel(
-  profiles: ProfileDraftInput[],
+  resolutions: ProfileResolution[],
   providerId: string,
   modelId: string,
-): ProfileDraftInput[] {
-  return profiles.filter(
-    (profile) => profile.provider_id === providerId && profile.model_id === modelId,
+): ProfileResolution[] {
+  return resolutions.filter(
+    (resolution) =>
+      resolution.effective?.provider_id === providerId &&
+      resolution.effective?.model_id === modelId,
   );
 }
 

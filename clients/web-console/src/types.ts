@@ -97,6 +97,11 @@ export interface ProviderModel {
 export interface ProviderView {
   provider_id: string;
   kind: string;
+  /**
+   * 这家**能服务哪些能力**（chat / embed / rerank …）。
+   * 默认槽位只收 chat：把嵌入供应商填进「快速」，发布能成功、调用必失败。
+   */
+  capabilities?: string[];
   base_url: string | null;
   enabled: boolean;
   has_secret: boolean;
@@ -127,6 +132,87 @@ export interface ProfileView {
   fallback_provider_id: string | null;
   fallback_model_id: string | null;
   enabled: boolean;
+  /**
+   * `explicit` = 用户单独指定了这个模型；`slot` = 跟随默认槽位
+   * （此时 provider_id / model_id 一定是空的）。
+   */
+  mode: BindingMode;
+}
+
+export type BindingMode = 'explicit' | 'slot';
+
+/** 生效模型是怎么来的。**只有这三种**，界面按它分三种样式。 */
+export type ResolutionSource = 'explicit' | 'slot' | 'unavailable';
+
+/**
+ * 一个职责**最后会跑哪个模型**——由服务端算好，前端只显示。
+ *
+ * 前端**不要**自己根据 `profiles` / `slots` 再判一次：回退规则实现两遍，
+ * 两边迟早不一致，症状是"界面写着 A、实际跑 B"，用户永远查不出来。
+ */
+export interface ProfileResolution {
+  profile: string;
+  /** 该职责所属的槽位（嵌入/重排没有槽位 → null）。 */
+  slot: string | null;
+  source: ResolutionSource;
+  effective: { provider_id: string; model_id: string } | null;
+  /** 用户单独指定过什么。只有"指定了但没用上"时才非空（界面标「已回退」）。 */
+  requested: { provider_id: string; model_id: string } | null;
+  fell_back: boolean;
+  enabled: boolean;
+  /** `unavailable` 的具体原因，中文，可直接显示。 */
+  reason: string;
+}
+
+/** 四个默认槽位之一。 */
+export interface SlotView {
+  slot: string;
+  label: string;
+  hint: string;
+  provider_id: string;
+  model_id: string;
+  configured: boolean;
+  /** 供应商 enabled **且** 模型 enabled。没配 ≠ 坏了，所以两个字段分开。 */
+  usable: boolean;
+  /** 哪些职责跟着它（服务端算的，别在前端抄一份映射表）。 */
+  roles: string[];
+}
+
+export interface SlotDraftInput {
+  slot: string;
+  provider_id: string;
+  model_id: string;
+}
+
+/** 快速配置二次确认里的一行。 */
+export interface QuickConfigRow {
+  profile: string;
+  slot: string;
+  slot_label: string;
+  provider_id: string | null;
+  model_id: string | null;
+  change: string;
+  change_kind: 'override' | 'same' | 'repair' | 'unavailable';
+}
+
+export interface QuickConfigPreview {
+  schema_version: string;
+  rows: QuickConfigRow[];
+  /** 点确认后应当写入的那份草稿，原样发回 `saveDraft` 即可。 */
+  profiles: ProfileDraftInput[];
+  summary: {
+    total: number;
+    overrides: number;
+    unchanged: number;
+    repairs: number;
+    still_unavailable: number;
+  };
+}
+
+export interface ResolveResponse {
+  schema_version: string;
+  slots: SlotView[];
+  profile_resolutions: ProfileResolution[];
 }
 
 export interface RevisionView {
@@ -257,6 +343,13 @@ export interface SettingsConfig {
   revisions: RevisionView[];
   known_kinds: string[];
   known_profiles: string[];
+  /** 四个默认槽位（快速 / 创作 / 识图 / 日常）。 */
+  slots: SlotView[];
+  /**
+   * 每个职责最后会跑哪个模型。**服务端算的**，界面「实际生效」那一列直接用它。
+   * 改草稿时用 `POST /settings/resolve` 拿同一份结论，不要在浏览器里重算。
+   */
+  profile_resolutions: ProfileResolution[];
   reserved_profiles?: Record<string, string>;
   /** 未绑定职责 → 具体会失去什么。系统不报错，只会静默降级。 */
   unbound_degradations?: Record<string, string>;
@@ -387,6 +480,8 @@ export interface ProfileDraftInput {
   fallback_provider_id: string | null;
   fallback_model_id: string | null;
   enabled: boolean;
+  /** `slot` = 跟随该职责的默认槽位；此时上面两项会被服务端清成空串。 */
+  mode: BindingMode;
 }
 
 /* ---------------------------------------------------------------- 角色 */

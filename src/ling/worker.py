@@ -223,23 +223,19 @@ async def _extract_candidates(
                     ),
                 )
             ]
-            # **优先用 memory.extract 职责**，没绑才退回 dialogue.fast。
+            # **只用 `memory.extract` 一个职责**，不借主对话模型。
             #
-            # 原来这里硬编码 `profile="dialogue.fast"`，于是设置页里的
-            # `memory.extract` 是个幽灵：绑了也没有任何效果，因为从来没人
-            # 按这个职责请求模型。用户会以为自己换了提炼模型，其实没换。
+            # 从前这里是"没绑专用模型就退回 dialogue.fast"。上了默认槽位之后
+            # 这条路必须删掉：那是**跨角色回退**，界面会显示「记忆提炼 不可用」，
+            # 实际却在跑主对话的模型——两边说的话不一样，用户永远查不出来。
+            # 现在没配就是没有，走下面的正则降级，并在设置页说清丢了什么。
             #
-            # 退回 dialogue.fast 是刻意的：没绑专用模型时提炼仍然工作，
-            # 而不是整段失效——提炼质量差点好过完全不提炼。
-            profile = (
-                "memory.extract"
-                if effective.profiles.get("memory.extract")
-                else "dialogue.fast"
-            )
+            # 能不能提炼**不在这里判断**：`resolve_profile` 说了算，
+            # 它把「显式 → 创作槽位 → 不可用」判完，路由再据此抛错。
             chunks: list[str] = []
             async for chunk, _outcome in router.stream(  # type: ignore[attr-defined]
                 effective,
-                profile=profile,
+                profile="memory.extract",
                 messages=messages,
                 # 提炼失败就用降级路径，不要让路由再换模型重试
                 allow_fallback=False,
@@ -263,7 +259,7 @@ async def _extract_candidates(
                 "retriable": bool(getattr(exc, "retriable", False)),
                 # 字段名避开 SENSITIVE_KEYS 里的 "profile"：那个词是为
                 # 用户画像设的，模型职责名不该被一起打码
-                "model_profile": "memory.extract -> dialogue.fast",
+                "model_profile": "memory.extract",
             },
         )
         return fallback_candidates(user_text)
@@ -1764,9 +1760,17 @@ async def handle_life_plan(payload: dict) -> None:
             persona_id=settings.persona_id,
         )
         effective = await config.effective()
+        # 排日程**没有自己的职责**（`planning` 至今没有实现，见
+        # RESERVED_PROFILES），只能借一个。借的顺序写在这里，判据用同一份
+        # `resolve_profile`：优先 `memory.extract`（"想清楚再写"那条路），
+        # 它不可用再借主对话。
+        #
+        # 这是**应用层给自己找模型的降级**，不是职责回退：它不会出现在设置页
+        # 的「实际生效」里——那一列只报职责自己的解析结果，否则又变成
+        # "界面一个说法、运行另一个说法"。
         profile = (
             "memory.extract"
-            if effective.profiles.get("memory.extract")
+            if effective.resolve_profile("memory.extract").usable
             else "dialogue.fast"
         )
         # **必须告诉它现在几点**。不说的话模型会顺着"今天"排上午的时间，

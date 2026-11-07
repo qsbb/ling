@@ -331,7 +331,7 @@ async def test_env_only_deployment_is_not_reported_as_degraded(
     assert "memory.embed" not in body["unbound_degradations"]
     assert "memory.rerank" not in body["unbound_degradations"]
     # 别的降级提示不能被这条过滤顺手抹掉（否则就是另一种假绿）。
-    assert "memory.extract" in body["unbound_degradations"]
+    assert "perception.vision" in body["unbound_degradations"]
 
 
 async def test_unconfigured_memory_roles_say_what_degrades(

@@ -165,7 +165,7 @@ useEffect(() => {
 │   ├─ 说话方式 ····· 正式度·分句长度·口语化·颜文字
 │   └─ 声音呈现 ····· 语速·音色·何时发语音而非文字
 ├─③ 模型与生成 ────────────── 改「谁来算」
-│   ├─ 职责绑定 ····· ModelRole 全集（见 §6）
+│   ├─ 职责绑定 ····· ModelRole 全集（见 §6）；可跟随四个默认槽位（见 §7）
 │   ├─ 供应商与凭证 · provider(fake/openai_compatible/anthropic/chat_responses/local) + 密钥
 │   └─ 推理与回退 ··· 超时·单次输出上限·日额度（均按供应商，-1=不限制）·fallback 顺序
 │                      （温度不再是配置项：请求不发该字段，用上游默认值）
@@ -427,6 +427,28 @@ reflection           planning
 ```
 
 **注意**：`reflection` / `planning` 暂无独立配置入口，是否有真实调用点待验证。
+
+### 7.1 四个默认槽位
+
+用户先给四件常做的事各挑一个模型（`快速 / 创作 / 识图 / 日常`），再决定某条职责
+要不要单独指定。没单独指定的职责就跟着**自己那个**槽位走：
+
+| 职责 | 槽位 |
+| --- | --- |
+| `dialogue.fast` | 快速 |
+| `dialogue.group` | 日常 |
+| `perception.vision` | 识图 |
+| `memory.extract` | 创作 |
+| `memory.embed` / `memory.rerank` | 没有槽位（嵌入/重排是另一套协议，只能单独指定） |
+
+槽位和职责绑定一样存在配置修订里（`payload.slots`），跟着发布/回滚走；
+`profiles[].mode` 只有 `explicit`（缺省）与 `slot` 两个值。
+
+**生效解析只回退一层**：显式绑定（可用）→ 该职责所属槽位 → 不可用。
+不试别的槽位、不借别的角色的模型。实现只有一份
+（`ling/ports/config.py::EffectiveConfig.resolve_profile`），运行期路由、
+设置页的「实际生效」列、`unbound_degradations` 全都读它。
+所以这条解析属于 ③ 组：改它就会改"谁来算"。
 
 ---
 

@@ -41,6 +41,32 @@ class _RecordingRouter:
         yield ModelChunk(done=True), StreamOutcome(text=payload)
 
 
+class _StrictRouter(_RecordingRouter):
+    """模拟真实路由：职责没有可用模型就抛 ``ModelError``。
+
+    `_RecordingRouter` 无论如何都会返回内容，用它测不出"模型不可用会怎样"。
+    真实路由的判据是 `EffectiveConfig.resolve_profile`，没有可用模型就抛
+    `unsupported`——所以替身也得抛，否则测的是一条不存在的路径。
+    """
+
+    def __init__(self, *, usable: set[str]) -> None:
+        super().__init__()
+        self.usable = usable
+
+    async def stream(self, config, *, profile, messages, **kw):  # noqa: ANN001, ANN003
+        if profile not in self.usable:
+            from ling.ports.model import ModelError, ModelErrorKind
+
+            self.profiles.append(profile)
+            raise ModelError(
+                ModelErrorKind.unsupported,
+                f"职责 {profile} 没有可用模型：这个职责只能单独指定模型",
+                retriable=False,
+            )
+        async for item in super().stream(config, profile=profile, messages=messages, **kw):
+            yield item
+
+
 def _bind(monkeypatch: pytest.MonkeyPatch, *, bind_extract: bool) -> None:
     """让 ConfigService.effective() 返回"绑了 / 没绑 memory.extract"的配置。"""
     from ling.settings import service as settings_service
@@ -83,26 +109,37 @@ async def test_extract_uses_memory_extract_when_bound(
     )
 
 
-async def test_extract_falls_back_to_dialogue_fast_when_unbound(
+async def test_extract_never_borrows_another_role_when_unbound(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # noqa: ARG001
-    """没绑专用模型时退回主对话模型，而不是整段失效。
+    """没绑专用模型时**不再**借主对话模型代跑，而是退回正则。
 
-    提炼质量差点好过完全不提炼。
+    这是刻意的行为改变。从前这里会偷偷用 `dialogue.fast`，于是设置页显示
+    「记忆提炼 不可用」、实际却在跑主对话的模型——界面一个说法、运行另一个
+    说法，用户既看不出来也查不到。
+
+    「只回退一层」现在对提练同样成立：显式 → 创作槽位 → 不可用（正则）。
     """
     import ling.worker as w
 
     _bind(monkeypatch, bind_extract=False)
-    router = _RecordingRouter()
+    router = _StrictRouter(usable=set())
     monkeypatch.setattr(w, "_MEMORY_ROUTER", router)
 
-    await w._extract_candidates(  # noqa: SLF001
+    candidates = await w._extract_candidates(  # noqa: SLF001
         user_text="我对花生过敏", actor_text="记住了", is_group=False
     )
 
-    assert router.profiles == ["dialogue.fast"], (
-        f"没绑专用模型时应退回 dialogue.fast，实际 {router.profiles}"
+    # 请求的职责永远是 memory.extract——不会悄悄换成 dialogue.fast。
+    assert router.profiles == ["memory.extract"], (
+        f"没绑专用模型时不该借别的职责，实际请求了 {router.profiles}"
     )
+    # 模型不可用 → 结果与"只走正则表"完全一致（不多不少）。
+    from ling.domains.memory.extract import fallback_candidates
+
+    assert [c.text for c in candidates] == [
+        c.text for c in fallback_candidates(user_text="我对花生过敏")
+    ]
 
 
 async def test_extract_still_returns_candidates(

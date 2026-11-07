@@ -19,8 +19,12 @@ import { formatSessionTime } from '../format';
 import type {
   ModelHealthResponse,
   ProfileDraftInput,
+  ProfileResolution,
   ProviderDraftInput,
+  QuickConfigPreview,
   SettingsConfig,
+  SlotDraftInput,
+  SlotView,
   ValidationIssue,
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
@@ -28,7 +32,7 @@ import { ProvidersPanel } from './model-settings/ProvidersPanel';
 import { RolesPanel } from './model-settings/RolesPanel';
 import {
   MessageBanner,
-  emptyProfile,
+  missingProfile,
   profileEquals,
   providerEquals,
   toProfileDraft,
@@ -58,6 +62,13 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   >({});
   const [providers, setProviders] = useState<ProviderDraftInput[]>([]);
   const [profiles, setProfiles] = useState<ProfileDraftInput[]>([]);
+  const [slots, setSlots] = useState<SlotDraftInput[]>([]);
+  // 「实际生效」由**服务端**算。这里存的是最近一次 `/settings/resolve` 的结果；
+  // 前端不根据 profiles/slots 自己推一份，两份算法迟早不一致。
+  const [resolutions, setResolutions] = useState<ProfileResolution[]>([]);
+  const [slotViews, setSlotViews] = useState<SlotView[]>([]);
+  const [quickConfig, setQuickConfig] = useState<QuickConfigPreview | null>(null);
+  const [quickConfigBusy, setQuickConfigBusy] = useState(false);
   const [testMode, setTestMode] = useState(false);
   const [logDenials, setLogDenials] = useState(true);
   const [tab, setTab] = useState<Tab>('providers');
@@ -68,9 +79,6 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const [message, setMessage] = useState<PanelMessage | null>(null);
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
-  // 职责页一次只展开一行：展开 A 再点 B，A 自动收起。
-  // 这样"其余四行的状态仍在视野里"才成立——同时开五行等于回到卡片堆。
-  const [openRole, setOpenRole] = useState<string | null>(null);
   const [revisionBusy, setRevisionBusy] = useState<number | null>(null);
 
   const loadConfig = useCallback(
@@ -86,10 +94,19 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         setConfig(nextConfig);
         setHealth(nextHealth);
         setUsage(nextUsage?.usage ?? {});
+        setResolutions(nextConfig.profile_resolutions ?? []);
+        setSlotViews(nextConfig.slots ?? []);
         if (resetDrafts) {
           const drafts = nextConfig.providers.map(toProviderDraft);
           setProviders(drafts);
           setProfiles(nextConfig.profiles.map(toProfileDraft));
+          setSlots(
+            (nextConfig.slots ?? []).map((slot) => ({
+              slot: slot.slot,
+              provider_id: slot.provider_id,
+              model_id: slot.model_id,
+            })),
+          );
           setTestMode(nextConfig.test_mode);
           setLogDenials(nextConfig.log_access_denials);
           setSelectedId((current) => {
@@ -118,6 +135,75 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
     void loadConfig(true);
   }, [loadConfig]);
 
+  // 草稿一变就问一次服务端「那现在每个职责会跑哪个模型」。
+  //
+  // 为什么要问、而不是在本文件里按 profiles/slots 推一遍：回退规则（显式 →
+  // 所属槽位 → 不可用，只走一层）只能有一份实现。前端再写一遍，迟早会出现
+  // "界面写 A、实际跑 B"，而那种不一致没有任何报错可查。
+  //
+  // 250ms 防抖：改一个下拉不该立刻打一发请求，但也不能慢到用户以为界面卡住。
+  useEffect(() => {
+    if (loading) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void api
+        .settingsResolve({
+          providers: providers.map((provider) => ({
+            ...provider,
+            models: provider.models ?? [],
+          })),
+          profiles,
+          slots,
+        })
+        .then((preview) => {
+          if (cancelled) return;
+          setResolutions(preview.profile_resolutions);
+          setSlotViews(preview.slots);
+        })
+        // 预览失败不用弹窗：已生效的那份仍在，用户按保存时服务端还会再判一次。
+        .catch(() => undefined);
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [loading, providers, profiles, slots]);
+
+  const requestQuickConfig = async () => {
+    setQuickConfigBusy(true);
+    try {
+      const preview = await api.quickConfigPreview({
+        providers: providers.map((provider) => ({
+          ...provider,
+          models: provider.models ?? [],
+        })),
+        profiles,
+        slots,
+      });
+      setQuickConfig(preview);
+    } catch (error) {
+      const explained = explainError(error);
+      setMessage({
+        kind: 'error',
+        text: `快速配置算不出来：${explained.reason}`,
+        detail: explained.detail ?? explained.hint,
+      });
+    } finally {
+      setQuickConfigBusy(false);
+    }
+  };
+
+  /**
+   * 应用快速配置：把服务端返回的那份 profiles 原样写进草稿。
+   *
+   * 不在前端拼"每条都改成跟随槽位"——那样又是两处算法。服务端已经算好
+   * 该写什么，照抄即可。写入后仍需按「保存」才生效（弹窗里也写了这句）。
+   */
+  const applyQuickConfig = (next: ProfileDraftInput[]) => {
+    setProfiles(next.map((item) => ({ ...item })));
+    setQuickConfig(null);
+  };
+
   useEffect(() => {
     if (!historyOpen) return;
     const onKey = (event: KeyboardEvent) => {
@@ -132,6 +218,11 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
     return {
       providers: config.providers.map(toProviderDraft),
       profiles: config.profiles.map(toProfileDraft),
+      slots: (config.slots ?? []).map((slot) => ({
+        slot: slot.slot,
+        provider_id: slot.provider_id,
+        model_id: slot.model_id,
+      })),
       testMode: config.test_mode,
       logDenials: config.log_access_denials,
     };
@@ -147,8 +238,17 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
     for (const base of baseline.profiles) {
       if (!profiles.some((profile) => profile.profile === base.profile)) count += 1;
     }
+    // 默认槽位和职责在同一个「保存」下生效，所以算在同一笔改动里：
+    // 分成两笔会让用户改了槽位、按钮却显示"没有未保存的改动"。
+    for (const slot of slots) {
+      const base = baseline.slots.find((item) => item.slot === slot.slot);
+      if (!base) continue;
+      if (base.provider_id !== slot.provider_id || base.model_id !== slot.model_id) {
+        count += 1;
+      }
+    }
     return count;
-  }, [baseline, profiles]);
+  }, [baseline, profiles, slots]);
 
   const providersDirty = useMemo(() => {
     if (!baseline) return 0;
@@ -182,9 +282,23 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const patchProfile = (profile: string, patch: Partial<ProfileDraftInput>) => {
     setProfiles((current) => {
       if (!current.some((item) => item.profile === profile)) {
-        return [...current, { ...emptyProfile(profile, '', ''), ...patch, profile }];
+        // 服务端还没有这条记录：默认按「跟随槽位」起步（这是改版后的正常
+        // 状态），而不是"选了空模型"。
+        return [...current, { ...missingProfile(profile), ...patch, profile }];
       }
       return current.map((item) => (item.profile === profile ? { ...item, ...patch } : item));
+    });
+  };
+
+  const patchSlot = (slot: string, patch: Partial<SlotDraftInput>) => {
+    setSlots((current) => {
+      if (!current.some((item) => item.slot === slot)) {
+        return [
+          ...current,
+          { slot, provider_id: '', model_id: '', ...patch },
+        ];
+      }
+      return current.map((item) => (item.slot === slot ? { ...item, ...patch } : item));
     });
   };
 
@@ -198,6 +312,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const discardRoles = () => {
     if (!baseline) return;
     setProfiles(baseline.profiles.map((profile) => ({ ...profile })));
+    setSlots(baseline.slots.map((slot) => ({ ...slot })));
   };
 
   const save = async () => {
@@ -208,6 +323,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
       const draft = await api.saveDraft({
         providers: providers.map((provider) => ({ ...provider, models: provider.models ?? [] })),
         profiles,
+        slots,
         test_mode: testMode,
         log_access_denials: logDenials,
       });
@@ -376,7 +492,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         <ProvidersPanel
           config={config}
           providers={providers}
-          profiles={profiles}
+          resolutions={resolutions}
           selectedId={selectedId}
           saving={saving}
           dirtyCount={providersDirty}
@@ -400,20 +516,21 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
           config={config}
           providers={providers}
           profiles={profiles}
+          slots={slots}
+          resolutions={resolutions}
+          slotViews={slotViews}
+          quickConfig={quickConfig}
+          quickConfigBusy={quickConfigBusy}
           health={health}
           dirtyCount={rolesDirty}
           saving={saving}
           onPatchProfile={patchProfile}
-          openRole={openRole}
-          onToggleRole={(profile) =>
-            setOpenRole((current) => (current === profile ? null : profile))
-          }
+          onPatchSlot={patchSlot}
           onDiscard={discardRoles}
           onSave={() => void save()}
-          onGoProviders={(providerId) => {
-            setSelectedId(providerId);
-            setTab('providers');
-          }}
+          onRequestQuickConfig={() => void requestQuickConfig()}
+          onCloseQuickConfig={() => setQuickConfig(null)}
+          onApplyQuickConfig={applyQuickConfig}
         />
       </div>
 

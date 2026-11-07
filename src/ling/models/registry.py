@@ -164,7 +164,12 @@ def bootstrap_config(
     # 代码按它发起请求（见 docs/MODEL-ROLES-AUDIT.md），绑了等于没有：
     # 引导配置里"已绑定"的样子会让设置页显示它已就绪。它现在在
     # `settings/service.py::RESERVED_PROFILES`。
-    for profile in ("dialogue.fast", "dialogue.group"):
+    #
+    # `memory.extract` 也在这一组里，理由不是"它很常见"，而是**不绑就会
+    # 掉能力**：从前它没绑时 worker 会偷偷退回 `dialogue.fast` 代跑；撤掉
+    # 那条跨角色回退之后（见 `EffectiveConfig.resolve_profile`），测试模式
+    # 下它会直接落到正则提炼，和"测试模式把能跑的路径都跑一遍"相悖。
+    for profile in ("dialogue.fast", "dialogue.group", "memory.extract"):
         profiles[profile] = ProfileBinding(
             profile=profile,
             provider_id="fake",

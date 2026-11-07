@@ -115,6 +115,76 @@ def kind_supports_profile(kind: str, profile: str) -> bool:
     return need in provider_capabilities(kind)
 
 
+# ---------------------------------------------------------------- 默认槽位
+#
+# 四个「默认模型」槽位：用户先给四件**常做的事**各挑一个模型，再决定每个
+# 职责要不要单独指定。没单独指定的职责就跟着自己那个槽位走。
+#
+# 为什么不合并成一个"默认模型"：四件事对模型的要求真的不同——回消息要快，
+# 看图片必须有视觉能力，写东西值得用贵的。合成一个就得在快与好之间二选一，
+# 而用户明明可以两个都要。
+class ProviderSlot(StrEnum):
+    """默认槽位的稳定键。**已发布的契约**：不要改成中文，也不要换拼写。"""
+
+    fast = "fast"
+    creation = "creation"
+    vision = "vision"
+    daily = "daily"
+
+
+# 展示顺序与**给人看的名字**。名字放服务端而不是前端，理由与
+# `PROFILE_CAPABILITIES` 相同：同一个概念在界面、校验提示、错误文案里
+# 出现三次，写在前端就会和服务端走散。前端只负责排版。
+SLOT_ORDER: tuple[ProviderSlot, ...] = (
+    ProviderSlot.fast,
+    ProviderSlot.creation,
+    ProviderSlot.vision,
+    ProviderSlot.daily,
+)
+
+SLOT_LABELS: dict[ProviderSlot, str] = {
+    ProviderSlot.fast: "快速",
+    ProviderSlot.creation: "创作",
+    ProviderSlot.vision: "识图",
+    ProviderSlot.daily: "日常",
+}
+
+# 槽位名旁边的半句话。**要说清"它能干什么"而不是"它是什么"**：
+# 「快速」与「日常」只差两个字，不解释的话用户分不出主对话该放哪个。
+SLOT_HINTS: dict[ProviderSlot, str] = {
+    ProviderSlot.fast: "回消息最常走的一条路，要快",
+    ProviderSlot.creation: "想清楚再写：提炼、创作、要质量的活",
+    ProviderSlot.vision: "必须能看图：把图片转成文字描述",
+    ProviderSlot.daily: "群里闲聊，可以慢一点、便宜一点",
+}
+
+
+# 角色 → 它跟随哪个默认槽位。**没有默认值的角色不要出现在这张表里**：
+# 缺席就是"这个角色只能显式绑定"（`memory.embed` / `memory.rerank` 就是
+# 这种：嵌入与重排是另一套协议，混进 chat 槽位只会选出调不通的组合）。
+#
+# 键必须与 `contracts/v1.ModelRole` 的取值一致
+# （`tests/unit/test_default_slots.py` 盯着这一点）。
+PROFILE_SLOTS: dict[str, ProviderSlot] = {
+    "dialogue.fast": ProviderSlot.fast,
+    "dialogue.group": ProviderSlot.daily,
+    "perception.vision": ProviderSlot.vision,
+    # 记忆提炼放「创作」而不是「快速」：
+    # - 「快速」是主回复链路，最在意延迟；提炼是每轮结束后的异步任务，
+    #   慢一点没关系，但质量直接决定"她记不记得住"。
+    # - `dialogue.deep` 被移出可绑清单之后，「创作」会一个成员都没有，
+    #   等于留一个永远空着的槽位给用户看。
+    # 代价见 `ports/config.py::EffectiveConfig.resolve_profile`：未绑定时
+    # 提炼不再"借主对话模型代跑"，而是直接报不可用并退回正则。
+    "memory.extract": ProviderSlot.creation,
+}
+
+
+def slot_for_profile(profile: str) -> ProviderSlot | None:
+    """这个角色跟随哪个槽位；没有默认槽位的角色返回 None。"""
+    return PROFILE_SLOTS.get(profile)
+
+
 @dataclass(frozen=True)
 class ImagePart:
     """一张图。``url`` 是 https 地址或 data URL（base64）。

@@ -22,20 +22,26 @@ from ling.infra.models import ConfigRevision, ProviderCredential, utcnow
 from ling.infra.security import SecretBox, new_id
 from ling.models.registry import bootstrap_config
 from ling.ports.config import (
+    BindingMode,
     DialoguePolicy,
     EffectiveConfig,
     LifePolicy,
     MemoryPolicy,
+    ModelSlot,
     ProfileBinding,
     ProviderConfig,
     ProviderModel,
 )
 from ling.ports.model import (
+    SLOT_LABELS,
+    SLOT_ORDER,
     ModelCapability,
     ProviderKind,
+    ProviderSlot,
     kind_supports_profile,
     provider_capabilities,
     required_capability,
+    slot_for_profile,
 )
 
 # 可用的供应商协议：**从 `ProviderKind` 推导**，不在这里再抄一份。
@@ -71,20 +77,29 @@ KNOWN_PROFILES = {role.value for role in ModelRole}
 #
 # 注意这里混了两类，不能混着说：
 # - 能力缺失（没绑就真的做不到）：vision、memory.embed、memory.rerank
-# - 质量降级（能工作，但用不到专用模型）：memory.extract（会退回
-#   dialogue.fast 代跑）、dialogue.group（会退回 fast）
+# - 质量降级（还能工作，但退回一条更笨的路）：memory.extract（退回正则）、
+#   dialogue.group（群里干脆不回）。
+#
+# 这两类从前是"退回另一个角色的模型"（extract/group 都借 dialogue.fast），
+# 现在**没有那条路了**：`EffectiveConfig.resolve_profile` 只回退一层，
+# 借别人的模型就是套娃——界面会显示"不可用"，实际却在跑另一个角色的模型。
 #
 # 只列**有明确降级后果**的职责；没有列的角色缺绑定不会静默降级。
 #
 # 语音三项（speech.asr / speech.tts / realtime.voice）**不在这里**，
 # 也不在可绑清单里：它们的绑定路径压根不存在。见 RESERVED_PROFILES。
 PROFILE_DEGRADATIONS: dict[str, str] = {
+    # 记忆提炼**不再借主对话模型代跑**。从前未绑定时它偷偷用 `dialogue.fast`，
+    # 而设置页把这条说成"改用主对话模型代跑"——那正是这次要消灭的东西：
+    # 那是一层跨角色回退，用户看到的"生效模型"会依赖一条他看不见的链条。
+    # 现在没配就真的没有，退回正则，并在这里说清丢掉的是什么。
     "memory.extract": (
-        "提炼会改用主对话模型代跑（仍能工作，但换不了更适合提炼的模型）"
+        "提炼退回正则：只认「我叫/我喜欢/我住在」几种句式，"
+        "「下周三去成都」这种自由文本的事实会整条丢掉"
     ),
     "perception.vision": "看不到用户发来的图片内容，媒体描述始终为空",
     "dialogue.fast": "无法对话：这是主回复走的路由",
-    "dialogue.group": "群聊没有可用的对话模型（会退回 fast）",
+    "dialogue.group": "群里不会回复：它只跟随自己的「日常」槽位，不再借主对话的模型",
     # 嵌入/重排的降级是**静默**的：检索照常返回结果，只是只剩字面匹配。
     # 用户感知是"换个说法就想不起来"，而这恰恰是语义检索要解决的问题。
     # 注意：只有环境变量也没配时才报降级（见 `/settings/config` 的
@@ -221,6 +236,112 @@ def _provider_shape_issues(pid: str, cfg: dict) -> list[ValidationIssue]:
     return issues
 
 
+def _resolves(payload: dict, profile: str) -> bool:
+    """这份 payload 里，这个职责最终有没有模型可用。
+
+    复用**运行时那个**解析函数，而不是在这里再写一条"有没有绑定"的判断：
+    后者在上槽位之后就不再等价了——`dialogue.fast` 完全可以没有任何显式
+    绑定却照常工作（跟随「快速」槽位），此时报"必须绑定"是在拦一份能用的
+    配置。
+    """
+    try:
+        config = effective_from_payload(
+            payload, revision=0, persona_default="", log_denials_default=True
+        )
+    except (TypeError, ValueError, KeyError, AttributeError):
+        # payload 本身有毛病时另有专门的错误，这里不重复报。
+        return True
+    return config.resolve_profile(profile).usable
+
+
+def _slot_issues(payload: dict, providers: dict[str, dict]) -> list[ValidationIssue]:
+    """默认槽位的校验。
+
+    槽位是**回退的唯一去处**，所以错的槽位比错的绑定更贵：绑定错了只影响
+    一个职责，槽位错了会把所有跟随它的职责一起带进"不可用"。
+    """
+    issues: list[ValidationIssue] = []
+    known = {slot.value for slot in SLOT_ORDER}
+    seen: set[str] = set()
+    for raw in payload.get("slots") or []:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("slot") or "").strip()
+        if key not in known:
+            issues.append(ValidationIssue(f"slots.{key or '?'}", f"未知槽位: {key}"))
+            continue
+        if key in seen:
+            issues.append(ValidationIssue(f"slots.{key}", "同一槽位只能配一次"))
+        seen.add(key)
+        field = f"slots.{key}"
+        label = SLOT_LABELS[ProviderSlot(key)]
+        pid = str(raw.get("provider_id") or "").strip()
+        mid = str(raw.get("model_id") or "").strip()
+        if not pid and not mid:
+            continue
+        if not pid:
+            issues.append(
+                ValidationIssue(f"{field}.provider_id", f"「{label}」槽位给了模型却没给供应商")
+            )
+            continue
+        cfg = providers.get(pid)
+        if cfg is None:
+            issues.append(
+                ValidationIssue(f"{field}.provider_id", f"「{label}」槽位的供应商未登记: {pid}")
+            )
+            continue
+        if not mid:
+            issues.append(
+                ValidationIssue(f"{field}.model_id", f"「{label}」槽位必须填写模型 ID")
+            )
+            continue
+        kind = str(cfg.get("kind") or "")
+        if not payload.get("test_mode") and kind == "fake":
+            issues.append(
+                ValidationIssue(
+                    f"{field}.provider_id",
+                    "非测试模式下不能把默认槽位配成 fake provider（会冒充模型能力）",
+                )
+            )
+        # 四个槽位全部服务于对话类职责，所以它们要的是 `chat` 能力。
+        # 把嵌入/重排供应商填进槽位，发布能成功、调用必失败。
+        if kind in KNOWN_PROVIDER_KINDS and ModelCapability.chat not in provider_capabilities(
+            kind
+        ):
+            offered = "/".join(
+                sorted(c.value for c in provider_capabilities(kind))
+            ) or "无"
+            issues.append(
+                ValidationIssue(
+                    f"{field}.provider_id",
+                    f"「{label}」槽位要用对话模型，而供应商 {pid} 是 {kind}"
+                    f"（提供：{offered}）。换个对话供应商，否则跟随它的职责全都跑不起来。",
+                )
+            )
+        if not cfg.get("enabled", True):
+            issues.append(
+                ValidationIssue(
+                    f"{field}.provider_id",
+                    f"「{label}」槽位的供应商 {pid} 已停用，跟随它的职责都会变成不可用",
+                    severity="warning",
+                )
+            )
+        registered = {
+            str(m.get("model_id", "")).strip(): m
+            for m in cfg.get("models") or []
+            if isinstance(m, dict)
+        }
+        if mid in registered and not registered[mid].get("enabled", True):
+            issues.append(
+                ValidationIssue(
+                    f"{field}.model_id",
+                    f"「{label}」槽位用的模型 {mid} 已在 {pid} 的清单里停用",
+                    severity="warning",
+                )
+            )
+    return issues
+
+
 class ConfigService:
     def __init__(
         self, session: AsyncSession, secret_box: SecretBox, *, test_mode_default: bool = True,
@@ -255,52 +376,11 @@ class ConfigService:
                 persona_id=self._persona_id,
                 log_access_denials=self._log_denials_default,
             )
-        payload: dict = dict(published.payload or {})
-        providers: dict[str, ProviderConfig] = {}
-        for raw in list(payload.get("providers") or []):
-            pid = raw.get("provider_id")
-            if not pid:
-                continue
-            providers[pid] = ProviderConfig(
-                provider_id=pid,
-                kind=raw.get("kind", "fake"),
-                base_url=raw.get("base_url"),
-                has_secret=bool(raw.get("has_secret")),
-                secret_last4=raw.get("secret_last4", ""),
-                enabled=bool(raw.get("enabled", True)),
-                extra=dict(raw.get("extra") or {}),
-                models=_provider_models(raw.get("models")),
-                timeout_seconds=float(raw.get("timeout_seconds", 60.0)),
-                max_output_tokens=raw.get("max_output_tokens"),
-                daily_token_limit=raw.get("daily_token_limit"),
-            )
-        profiles: dict[str, ProfileBinding] = {}
-        for raw in list(payload.get("profiles") or []):
-            prof = raw.get("profile")
-            if not prof:
-                continue
-            profiles[prof] = ProfileBinding(
-                profile=prof,
-                provider_id=raw.get("provider_id", ""),
-                model_id=raw.get("model_id", ""),
-                fallback_provider_id=raw.get("fallback_provider_id"),
-                fallback_model_id=raw.get("fallback_model_id"),
-                enabled=bool(raw.get("enabled", True)),
-            )
-        return EffectiveConfig(
+        return effective_from_payload(
+            dict(published.payload or {}),
             revision=published.revision,
-            providers=providers,
-            profiles=profiles,
-            test_mode=bool(payload.get("test_mode", False)),
-            # 旧修订没有这个键：退回环境变量给的默认值（默认 True），
-            # 而不是把"没配过"当成"关掉"。
-            log_access_denials=bool(
-                payload.get("log_access_denials", self._log_denials_default)
-            ),
-            persona_id=payload.get("persona_id", self._persona_id),
-            memory=_memory_policy(payload.get("memory")),
-            life=_life_policy(payload.get("life")),
-            dialogue=_dialogue_policy(payload.get("dialogue")),
+            persona_default=self._persona_id,
+            log_denials_default=self._log_denials_default,
         )
 
     async def list_revisions(self, limit: int = 20) -> list[ConfigRevision]:
@@ -321,6 +401,7 @@ class ConfigService:
         *,
         providers: list[dict] | None = None,
         profiles: list[dict] | None = None,
+        slots: list[dict] | None = None,
         test_mode: bool | None = None,
         log_access_denials: bool | None = None,
         memory: dict | None = None,
@@ -330,120 +411,18 @@ class ConfigService:
         created_by: str | None = None,
     ) -> DraftResult:
         base = await self.effective()
-        current_payload: dict = {
-            "providers": [
-                {
-                    "provider_id": p.provider_id,
-                    "kind": p.kind,
-                    "base_url": p.base_url,
-                    "has_secret": p.has_secret,
-                    "secret_last4": p.secret_last4,
-                    "enabled": p.enabled,
-                    "extra": dict(p.extra),
-                    "models": [m.to_dict() for m in p.models],
-                    "timeout_seconds": p.timeout_seconds,
-                    "max_output_tokens": p.max_output_tokens,
-                    "daily_token_limit": p.daily_token_limit,
-                }
-                for p in base.providers.values()
-            ],
-            "profiles": [
-                {
-                    "profile": b.profile,
-                    "provider_id": b.provider_id,
-                    "model_id": b.model_id,
-                    "fallback_provider_id": b.fallback_provider_id,
-                    "fallback_model_id": b.fallback_model_id,
-                    "enabled": b.enabled,
-                }
-                for b in base.profiles.values()
-            ],
-            "test_mode": base.test_mode,
-            "log_access_denials": base.log_access_denials,
-            "persona_id": base.persona_id,
-            "memory": _policy_to_dict(base.memory),
-            "life": _life_to_dict(base.life),
-            "dialogue": _dialogue_to_dict(base.dialogue),
-        }
-
-        if memory is not None:
-            current_payload["memory"] = _merge_memory(current_payload["memory"], memory)
-
-        if life is not None:
-            current_payload["life"] = _merge_fields(
-                current_payload["life"], life, _LIFE_BOUNDS
-            )
-
-        if dialogue is not None:
-            current_payload["dialogue"] = _merge_fields(
-                current_payload["dialogue"], dialogue, _DIALOGUE_BOUNDS
-            )
-
-        if providers is not None:
-            merged: dict[str, dict] = {p["provider_id"]: p for p in current_payload["providers"]}
-            for raw in providers:
-                pid = raw.get("provider_id")
-                if not pid:
-                    continue
-                existing = merged.get(pid, {})
-                # 模型清单：**没传就是"没改"**，不能把旧清单清空。
-                # 旧版控制台 / 第三方客户端保存供应商时不会带 models，
-                # 若按 pydantic 默认值 [] 处理，一次无关的保存就会把目录清掉。
-                models = (
-                    _clean_models(raw["models"])
-                    if "models" in raw
-                    else list(existing.get("models", []))
-                )
-                # 密钥字段不由前端传入；保留库中已知状态
-                merged[pid] = {
-                    "provider_id": pid,
-                    "kind": raw.get("kind", existing.get("kind", "fake")),
-                    "base_url": raw.get("base_url", existing.get("base_url")),
-                    "has_secret": existing.get("has_secret", False),
-                    "secret_last4": existing.get("secret_last4", ""),
-                    "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
-                    "extra": dict(raw.get("extra", existing.get("extra", {}))),
-                    "models": models,
-                    "timeout_seconds": float(
-                        raw.get("timeout_seconds", existing.get("timeout_seconds", 60.0))
-                    ),
-                    "max_output_tokens": raw.get(
-                        "max_output_tokens", existing.get("max_output_tokens")
-                    ),
-                    "daily_token_limit": raw.get(
-                        "daily_token_limit", existing.get("daily_token_limit")
-                    ),
-                }
-            current_payload["providers"] = list(merged.values())
-
-        if profiles is not None:
-            merged_profiles: dict[str, dict] = {
-                p["profile"]: p for p in current_payload["profiles"]
-            }
-            for raw in profiles:
-                prof = raw.get("profile")
-                if not prof:
-                    continue
-                existing = merged_profiles.get(prof, {"profile": prof})
-                merged_profiles[prof] = {
-                    "profile": prof,
-                    "provider_id": raw.get("provider_id", existing.get("provider_id", "")),
-                    "model_id": raw.get("model_id", existing.get("model_id", "")),
-                    "fallback_provider_id": raw.get(
-                        "fallback_provider_id", existing.get("fallback_provider_id")
-                    ),
-                    "fallback_model_id": raw.get(
-                        "fallback_model_id", existing.get("fallback_model_id")
-                    ),
-                    "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
-                }
-            current_payload["profiles"] = list(merged_profiles.values())
-
-        if test_mode is not None:
-            current_payload["test_mode"] = test_mode
-
-        if log_access_denials is not None:
-            current_payload["log_access_denials"] = bool(log_access_denials)
+        current_payload = payload_from_effective(base)
+        _apply_patch(
+            current_payload,
+            providers=providers,
+            profiles=profiles,
+            slots=slots,
+            memory=memory,
+            life=life,
+            dialogue=dialogue,
+            test_mode=test_mode,
+            log_access_denials=log_access_denials,
+        )
 
         issues = await self.validate_payload(current_payload)
         next_rev = await self._next_revision_number()
@@ -459,6 +438,44 @@ class ConfigService:
         self._session.add(row)
         await self._session.flush()
         return DraftResult(revision=row.revision, state=row.state, validation_errors=issues)
+
+    async def resolve_preview(
+        self,
+        *,
+        providers: list[dict] | None = None,
+        profiles: list[dict] | None = None,
+        slots: list[dict] | None = None,
+        test_mode: bool | None = None,
+    ) -> EffectiveConfig:
+        """按**当前草稿**算每个职责的生效模型。**只算，不写库。**
+
+        界面上的「实际生效」列、快速配置的二次确认，全都要一个答案：
+        "我这样改完，每个职责最后会跑哪个模型？"。
+
+        这个答案**不能在浏览器里算**：回退规则要是前端再实现一遍，两边
+        迟早不一致——而这类不一致的症状是"界面说在用 A，实际调的是 B"，
+        用户永远查不出来。所以让前端把草稿发过来，服务端用**与保存完全
+        同一段合并逻辑**（`_apply_patch`）拼出 payload，再用**与运行时
+        完全同一个** `resolve_profile` 解析。
+
+        合并逻辑共用是关键：另写一份"预览用的合并"迟早与 save_draft 分叉，
+        于是预览说"会生效"、保存后却是另一回事。
+        """
+        base = await self.effective()
+        payload = payload_from_effective(base)
+        _apply_patch(
+            payload,
+            providers=providers,
+            profiles=profiles,
+            slots=slots,
+            test_mode=test_mode,
+        )
+        return effective_from_payload(
+            payload,
+            revision=base.revision,
+            persona_default=self._persona_id,
+            log_denials_default=self._log_denials_default,
+        )
 
     async def validate_payload(self, payload: dict) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
@@ -572,6 +589,21 @@ class ConfigService:
             if prof in seen_profiles:
                 issues.append(ValidationIssue(f"profiles.{prof}", "同一职责只能绑定一次"))
             seen_profiles.add(prof)
+            mode = _binding_mode(raw)
+            if mode is BindingMode.slot:
+                # 「跟随槽位」时 provider/model 不参与解析，校验它们毫无意义
+                # （而且会误导：填着旧值却根本不生效）。只需要确认这个职责
+                # **有槽位可跟**——`memory.embed` 之类没有默认值的角色，
+                # 选"跟随"就等于把自己关掉。
+                if slot_for_profile(prof) is None:
+                    issues.append(
+                        ValidationIssue(
+                            f"profiles.{prof}.mode",
+                            f"{prof} 没有默认槽位（嵌入/重排走另一套协议），"
+                            "必须单独指定模型，不能选「跟随默认」",
+                        )
+                    )
+                continue
             pid = raw.get("provider_id")
             if not pid or pid not in providers:
                 issues.append(
@@ -681,10 +713,16 @@ class ConfigService:
                         )
                     )
 
-        if not payload.get("test_mode") and "dialogue.fast" not in seen_profiles:
+        if not payload.get("test_mode") and not _resolves(payload, "dialogue.fast"):
             issues.append(
-                ValidationIssue("profiles.dialogue.fast", "非测试模式下必须绑定 dialogue.fast")
+                ValidationIssue(
+                    "profiles.dialogue.fast",
+                    "非测试模式下 dialogue.fast 必须有一个能用的模型："
+                    "单独指定它，或者把「快速」槽位配好（主回复走的就是这条路）",
+                )
             )
+
+        issues.extend(_slot_issues(payload, providers))
         return issues
 
     async def publish(self, revision: int, *, published_by: str | None = None) -> int:
@@ -920,7 +958,296 @@ __all__ = [
     "PROFILE_DEGRADATIONS",
     "RESERVED_PROFILES",
     "ValidationIssue",
+    "effective_from_payload",
+    "payload_from_effective",
 ]
+
+
+# ------------------------------------------------------- 修订 payload ⇄ 快照
+#
+# 这一对函数是**唯一**的翻译层。从前 `effective()` 里手写一份解析、
+# `save_draft()` 里手写一份反向拼装，两边靠人肉对齐：加一个字段（这次是
+# `slots` 与 `mode`）就要记得两边都改，漏改的那一边不会报错，只会静默
+# 丢字段——用户保存一次，槽位就没了。
+
+
+def payload_from_effective(config: EffectiveConfig) -> dict:
+    """生效快照 → 可写进修订的 payload。草稿以它为底。
+
+    **必须双向完备**：`effective_from_payload(payload_from_effective(x))`
+    要能还原 ``x``。少写一个键的代价不是报错，而是"用户只改了模型清单，
+    顺手把槽位清空了"——这种 bug 没有异常可看，只能靠这条不变式守住。
+    """
+    slots = dict(config.slots)
+    return {
+        "providers": [
+            {
+                "provider_id": p.provider_id,
+                "kind": p.kind,
+                "base_url": p.base_url,
+                "has_secret": p.has_secret,
+                "secret_last4": p.secret_last4,
+                "enabled": p.enabled,
+                "extra": dict(p.extra),
+                "models": [m.to_dict() for m in p.models],
+                "timeout_seconds": p.timeout_seconds,
+                "max_output_tokens": p.max_output_tokens,
+                "daily_token_limit": p.daily_token_limit,
+            }
+            for p in config.providers.values()
+        ],
+        "profiles": [
+            {
+                "profile": b.profile,
+                "provider_id": b.provider_id,
+                "model_id": b.model_id,
+                "fallback_provider_id": b.fallback_provider_id,
+                "fallback_model_id": b.fallback_model_id,
+                "enabled": b.enabled,
+                "mode": b.mode.value,
+            }
+            for b in config.profiles.values()
+        ],
+        # 只写已配置的槽位：空槽位写进 payload 只会让修订历史里多四条噪音，
+        # 而且"删掉一条槽位"和"把它置空"会变成两种状态。
+        "slots": [
+            {
+                "slot": key.value,
+                "provider_id": slots[key.value].provider_id,
+                "model_id": slots[key.value].model_id,
+            }
+            for key in SLOT_ORDER
+            if key.value in slots and slots[key.value].configured
+        ],
+        "test_mode": config.test_mode,
+        "log_access_denials": config.log_access_denials,
+        "persona_id": config.persona_id,
+        "memory": _policy_to_dict(config.memory),
+        "life": _life_to_dict(config.life),
+        "dialogue": _dialogue_to_dict(config.dialogue),
+    }
+
+
+def _apply_patch(
+    payload: dict,
+    *,
+    providers: list[dict] | None = None,
+    profiles: list[dict] | None = None,
+    slots: list[dict] | None = None,
+    memory: dict | None = None,
+    life: dict | None = None,
+    dialogue: dict | None = None,
+    test_mode: bool | None = None,
+    log_access_denials: bool | None = None,
+) -> None:
+    """把一次改动合进 payload。**原地改**，调用方持有同一个 dict。
+
+    ``save_draft`` 与 ``resolve_preview`` 共用它——预览和保存要是各写一份
+    合并逻辑，迟早分叉，于是预览说"会生效"、保存后却是另一回事。
+    """
+    if memory is not None:
+        payload["memory"] = _merge_memory(payload["memory"], memory)
+
+    if life is not None:
+        payload["life"] = _merge_fields(payload["life"], life, _LIFE_BOUNDS)
+
+    if dialogue is not None:
+        payload["dialogue"] = _merge_fields(payload["dialogue"], dialogue, _DIALOGUE_BOUNDS)
+
+    if providers is not None:
+        merged: dict[str, dict] = {p["provider_id"]: p for p in payload["providers"]}
+        for raw in providers:
+            pid = raw.get("provider_id")
+            if not pid:
+                continue
+            existing = merged.get(pid, {})
+            # 模型清单：**没传就是"没改"**，不能把旧清单清空。
+            # 旧版控制台 / 第三方客户端保存供应商时不会带 models，
+            # 若按 pydantic 默认值 [] 处理，一次无关的保存就会把目录清掉。
+            models = (
+                _clean_models(raw["models"])
+                if "models" in raw
+                else list(existing.get("models", []))
+            )
+            # 密钥字段不由前端传入；保留库中已知状态
+            merged[pid] = {
+                "provider_id": pid,
+                "kind": raw.get("kind", existing.get("kind", "fake")),
+                "base_url": raw.get("base_url", existing.get("base_url")),
+                "has_secret": existing.get("has_secret", False),
+                "secret_last4": existing.get("secret_last4", ""),
+                "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
+                "extra": dict(raw.get("extra", existing.get("extra", {}))),
+                "models": models,
+                "timeout_seconds": float(
+                    raw.get("timeout_seconds", existing.get("timeout_seconds", 60.0))
+                ),
+                "max_output_tokens": raw.get(
+                    "max_output_tokens", existing.get("max_output_tokens")
+                ),
+                "daily_token_limit": raw.get(
+                    "daily_token_limit", existing.get("daily_token_limit")
+                ),
+            }
+        payload["providers"] = list(merged.values())
+
+    if profiles is not None:
+        merged_profiles: dict[str, dict] = {p["profile"]: p for p in payload["profiles"]}
+        for raw in profiles:
+            prof = raw.get("profile")
+            if not prof:
+                continue
+            existing = merged_profiles.get(prof, {"profile": prof})
+            mode = raw.get("mode", existing.get("mode", BindingMode.explicit.value))
+            merged_profiles[prof] = {
+                "profile": prof,
+                # `mode=slot` 时这两项**没有意义**，一律清成空串：留着旧值
+                # 会让"跟随槽位"看起来像是还在用那个模型（修订历史里也是）。
+                "provider_id": (
+                    ""
+                    if mode == BindingMode.slot.value
+                    else raw.get("provider_id", existing.get("provider_id", ""))
+                ),
+                "model_id": (
+                    ""
+                    if mode == BindingMode.slot.value
+                    else raw.get("model_id", existing.get("model_id", ""))
+                ),
+                "fallback_provider_id": raw.get(
+                    "fallback_provider_id", existing.get("fallback_provider_id")
+                ),
+                "fallback_model_id": raw.get(
+                    "fallback_model_id", existing.get("fallback_model_id")
+                ),
+                "enabled": bool(raw.get("enabled", existing.get("enabled", True))),
+                "mode": mode,
+            }
+        payload["profiles"] = list(merged_profiles.values())
+
+    if slots is not None:
+        merged_slots: dict[str, dict] = {
+            str(entry.get("slot")): dict(entry) for entry in payload.get("slots") or []
+        }
+        for raw in slots:
+            key = str(raw.get("slot") or "").strip()
+            if not key:
+                continue
+            provider_id = str(raw.get("provider_id") or "").strip()
+            model_id = str(raw.get("model_id") or "").strip()
+            if not provider_id and not model_id:
+                # 两项都空 = 把这个槽位清回"没配"。
+                merged_slots.pop(key, None)
+                continue
+            merged_slots[key] = {
+                "slot": key,
+                "provider_id": provider_id,
+                "model_id": model_id,
+            }
+        # 按固定顺序写回：修订历史里同一份配置不该因为 dict 顺序不同
+        # 显示成两次不一样的改动。
+        payload["slots"] = [
+            merged_slots[key.value] for key in SLOT_ORDER if key.value in merged_slots
+        ] + [
+            entry
+            for key, entry in merged_slots.items()
+            if key not in {slot.value for slot in SLOT_ORDER}
+        ]
+
+    if test_mode is not None:
+        payload["test_mode"] = test_mode
+
+    if log_access_denials is not None:
+        payload["log_access_denials"] = bool(log_access_denials)
+
+
+def _binding_mode(raw: dict) -> BindingMode:
+    """修订里的一条 profile 是显式绑定还是跟随槽位。
+
+    缺键 → ``explicit``：这个键是跟着默认槽位一起加的，之前的每条绑定
+    都是显式选择，所以"没写"只能按显式读——按 slot 读会把所有老部署的
+    绑定一次性作废。
+    """
+    raw_mode = str(raw.get("mode") or "").strip()
+    try:
+        return BindingMode(raw_mode)
+    except ValueError:
+        return BindingMode.explicit
+
+
+def _slot_entries(raw: object) -> dict[str, ModelSlot]:
+    """修订里的 ``slots`` → 快照里的槽位表。脏数据一律忽略，不炸。"""
+    slots: dict[str, ModelSlot] = {}
+    if not isinstance(raw, list):
+        return slots
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("slot") or "").strip()
+        if key not in {slot.value for slot in SLOT_ORDER}:
+            continue
+        provider_id = str(item.get("provider_id") or "").strip()
+        model_id = str(item.get("model_id") or "").strip()
+        if not provider_id or not model_id:
+            continue
+        slots[key] = ModelSlot(slot=key, provider_id=provider_id, model_id=model_id)
+    return slots
+
+
+def effective_from_payload(
+    payload: dict,
+    *,
+    revision: int,
+    persona_default: str,
+    log_denials_default: bool,
+) -> EffectiveConfig:
+    """修订 payload → 生效快照。运行期与设置页预览共用这一个解析。"""
+    providers: dict[str, ProviderConfig] = {}
+    for raw in list(payload.get("providers") or []):
+        pid = raw.get("provider_id")
+        if not pid:
+            continue
+        providers[pid] = ProviderConfig(
+            provider_id=pid,
+            kind=raw.get("kind", "fake"),
+            base_url=raw.get("base_url"),
+            has_secret=bool(raw.get("has_secret")),
+            secret_last4=raw.get("secret_last4", ""),
+            enabled=bool(raw.get("enabled", True)),
+            extra=dict(raw.get("extra") or {}),
+            models=_provider_models(raw.get("models")),
+            timeout_seconds=float(raw.get("timeout_seconds", 60.0)),
+            max_output_tokens=raw.get("max_output_tokens"),
+            daily_token_limit=raw.get("daily_token_limit"),
+        )
+    profiles: dict[str, ProfileBinding] = {}
+    for raw in list(payload.get("profiles") or []):
+        prof = raw.get("profile")
+        if not prof:
+            continue
+        mode = _binding_mode(raw)
+        profiles[prof] = ProfileBinding(
+            profile=prof,
+            provider_id="" if mode is BindingMode.slot else raw.get("provider_id", ""),
+            model_id="" if mode is BindingMode.slot else raw.get("model_id", ""),
+            fallback_provider_id=raw.get("fallback_provider_id"),
+            fallback_model_id=raw.get("fallback_model_id"),
+            enabled=bool(raw.get("enabled", True)),
+            mode=mode,
+        )
+    return EffectiveConfig(
+        revision=revision,
+        providers=providers,
+        profiles=profiles,
+        slots=_slot_entries(payload.get("slots")),
+        test_mode=bool(payload.get("test_mode", False)),
+        # 旧修订没有这个键：退回环境变量给的默认值（默认 True），
+        # 而不是把"没配过"当成"关掉"。
+        log_access_denials=bool(payload.get("log_access_denials", log_denials_default)),
+        persona_id=payload.get("persona_id", persona_default),
+        memory=_memory_policy(payload.get("memory")),
+        life=_life_policy(payload.get("life")),
+        dialogue=_dialogue_policy(payload.get("dialogue")),
+    )
 
 
 # ------------------------------------------------------------------ 记忆策略

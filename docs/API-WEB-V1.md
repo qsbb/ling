@@ -86,7 +86,7 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/v1/settings/config` | `{revision, state, test_mode, log_access_denials, providers[], profiles[], revisions[]}` |
-| PUT | `/v1/settings/draft` | `{providers?, profiles?, test_mode?, log_access_denials?}` → 新草稿修订 `{revision, validation_errors}` |
+| PUT | `/v1/settings/draft` | `{providers?, profiles?, slots?, test_mode?, log_access_denials?}` → 新草稿修订 `{revision, validation_errors}` |
 | POST | `/v1/settings/publish` | `{revision}` → `{published_revision}`（校验失败 422 + 错误列表） |
 | POST | `/v1/settings/rollback` | `{to_revision}` → `{published_revision}` |
 | GET | `/v1/settings/health` | `{revision, test_mode, profiles, health}`；`health` 键为 `provider_id/model_id`，**不含**上游错误原文（必鉴权） |
@@ -95,6 +95,8 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
 | GET | `/v1/settings/connectors` | `{schema_version, as_of, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, fields[], runtime}]}`；**只读**接入器诊断，`fields[].kind=secret` 只回 `set` 不回值（必鉴权） |
+| POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
+| POST | `/v1/settings/quick-config/preview` | 同上的 body → `{rows[], profiles[], summary}`；快速配置的二次确认（全量覆盖，`profiles` 就是确认后要写入的那份） |
 
 `providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4,
 timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
@@ -108,11 +110,55 @@ timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
 `GET /v1/settings/usage`。
 
 `profiles[]` 每项：`{profile, provider_id, model_id, fallback_provider_id?, fallback_model_id?,
-enabled}`。原来这里的 `temperature / max_tokens / timeout_seconds / daily_cost_limit`
+enabled, mode}`。原来这里的 `temperature / max_tokens / timeout_seconds / daily_cost_limit`
 已经移除：前三项跟着供应商走，温度改为**不发送**（用上游模型自己的默认值）。
 旧客户端仍可带这些键，服务端会忽略。
 
-### 4.1 接入器（渠道）
+### 4.1 默认槽位与「实际生效」
+
+四个默认槽位（`slots[]` 每项 `{slot, label, hint, provider_id, model_id, configured,
+usable, roles[]}`，键固定为 `fast / creation / vision / daily`，中文名
+`快速 / 创作 / 识图 / 日常`）。它们和职责绑定一样**存在配置修订里**，跟着发布/回滚走。
+
+角色 → 槽位的映射固定在服务端（`ling/ports/model.py::PROFILE_SLOTS`）：
+
+| 职责 | 槽位 |
+| --- | --- |
+| `dialogue.fast` | 快速 |
+| `dialogue.group` | 日常 |
+| `perception.vision` | 识图 |
+| `memory.extract` | 创作 |
+| `memory.embed` / `memory.rerank` | **没有槽位**（另一套协议，只能单独指定） |
+
+职责怎么拿到模型：`profiles[].mode` 只有两个值。`explicit`（**缺省值**）表示
+"用 `provider_id/model_id`"，`slot` 表示"跟随我所属的槽位"（此时那两项会被清成空串）。
+旧修订没有这个键，一律按 `explicit` 读——按 slot 读会把所有存量绑定一次性作废。
+
+**生效解析只回退一层，不允许套娃**（`EffectiveConfig.resolve_profile`，全系统唯一实现）：
+
+1. 单独指定了、且 `(provider, model)` 可用 → `source=explicit`；
+2. 否则用**该职责所属槽位**的模型 → `source=slot`（单独指定的坏了也走这里）；
+3. 槽位没配 / 不可用 → `source=unavailable`，`reason` 说清断在哪；
+4. 到此为止。不试别的槽位，也不借别的角色的模型。
+
+「可用」= 供应商 `enabled` **且** 模型 `enabled`。模型 ID 不在该供应商的目录里时
+按可用处理（目录是给人看的清单，不是路由白名单）。
+
+`profile_resolutions[]` 每项 `{profile, slot, source, effective, requested, fell_back,
+enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
+`{provider_id, model_id}` 或 `null`。界面上的「实际生效」列直接用它，**前端不重算**
+——改草稿时调 `POST /settings/resolve`，它用与保存完全相同的合并 + 解析。
+
+`requested` 只在"单独指定过但没用上"时非空，配合 `fell_back` 让界面把
+「继承」（从来没单独选过）和「已回退」（选了但坏了）分开。
+
+`POST /settings/quick-config/preview` 的语义是**全量覆盖**：把所有有槽位的职责
+改回「跟随默认」，用户单独指定的也一并清掉。`rows[]` 每项
+`{profile, slot, slot_label, provider_id, model_id, change, change_kind}`，
+`change_kind` 取 `override / same / repair / unavailable`——弹窗必须把
+"将要覆盖哪几条"摆在明面上，确认后仍需保存才生效。
+
+### 4.2 接入器（渠道）
 
 `GET /v1/settings/connectors` 是**只读**诊断：渠道配置全在宿主部署目录的 `.env`
 （`LING_ONEBOT_*` / `LING_QQBOT_*`），密钥只在宿主上。这条端点回答三件事——

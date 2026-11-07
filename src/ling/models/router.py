@@ -75,14 +75,41 @@ class ModelRouter:
 
     # ---------------------------------------------------------- 解析
 
-    def resolve(self, config: EffectiveConfig, profile: str) -> tuple[ModelTarget, ProfileBinding]:
-        binding = config.binding(profile)
-        if binding is None or not binding.enabled:
+    def _resolved_binding(
+        self, config: EffectiveConfig, profile: str
+    ) -> tuple[ProfileBinding, str]:
+        """职责 → 真正要调的那家/那个模型。
+
+        **判定只有一份**：`EffectiveConfig.resolve_profile`（显式 → 所属槽位 →
+        不可用，只走一层）。这里不再自己判"有没有绑定"——上了默认槽位之后，
+        "有没有绑定"和"有没有可用模型"已经不是一回事了，各判一次的结果是
+        路由认为没有模型可调、而设置页显示一切正常。
+
+        返回的 ``ProfileBinding`` 是**解析之后**的样子（provider/model 已经
+        换成真正要调的），调用方不用再关心它是显式来的还是槽位来的。
+        """
+        resolved = config.resolve_profile(profile)
+        if not resolved.usable or not resolved.provider_id or not resolved.model_id:
             raise ModelError(
                 ModelErrorKind.unsupported,
-                f"职责 {profile} 尚未绑定模型，请在设置里配置后再试",
+                f"职责 {profile} 没有可用模型：{resolved.reason}。请在设置里配置后再试",
                 retriable=False,
             )
+        stored = config.profiles.get(profile)
+        binding = ProfileBinding(
+            profile=profile,
+            provider_id=resolved.provider_id,
+            model_id=resolved.model_id,
+            # 调用时回退（这一家挂了换下一家）仍然只看显式配置那条。
+            # 「跟随槽位」的绑定在保存时就把这两项清空了，所以它不会
+            # 凭空多出一层回退——"只回退一层"对两条路都成立。
+            fallback_provider_id=stored.fallback_provider_id if stored else None,
+            fallback_model_id=stored.fallback_model_id if stored else None,
+        )
+        return binding, resolved.reason
+
+    def resolve(self, config: EffectiveConfig, profile: str) -> tuple[ModelTarget, ProfileBinding]:
+        binding, _reason = self._resolved_binding(config, profile)
         target = ModelTarget(
             provider_id=binding.provider_id,
             model_id=binding.model_id,
@@ -190,13 +217,7 @@ class ModelRouter:
 
         回退只发生在**尚未产出任何文本**时。
         """
-        binding = config.binding(profile)
-        if binding is None or not binding.enabled:
-            raise ModelError(
-                ModelErrorKind.unsupported,
-                f"职责 {profile} 尚未绑定模型，请在设置里配置后再试",
-                retriable=False,
-            )
+        binding, _reason = self._resolved_binding(config, profile)
 
         candidates = [binding]
         if allow_fallback:
