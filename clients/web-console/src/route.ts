@@ -2,8 +2,8 @@
  * 极简路由：聊天（/ 或 /s/{sessionId}）、总览（/dashboard）、记忆（/memory）、
  * 角色（/persona）、关系（/relationships）、生活（/life）、日志（/logs）、
  * 设置中心（/settings）、模型与生成（/settings/model）、
- * 权限与隐私（/settings/privacy）、登录名与密码（/settings/account）、
- * 关于与版本（/settings/about）。
+ * 权限与隐私（/settings/privacy）、接入器（/settings/connectors）、
+ * 登录名与密码（/settings/account）、关于与版本（/settings/about）。
  *
  * **设置只放程序与运维**（DESIGN §2）：行为调参回到它所属的领域页 ——
  * 记忆与学习在 `/memory?tab=settings`、对话与主动性在 `/persona?tab=dialogue`、
@@ -36,6 +36,11 @@ export type Route =
   | { name: 'relationships' }
   | { name: 'account' }
   | { name: 'about' }
+  /**
+   * 接入器（`GET /v1/settings/connectors`）：她从哪条线收发消息。
+   * 是设置子页——渠道配置属于实例运维，不是她那一边的内容。
+   */
+  | { name: 'connectors' }
   /** 运行日志（`GET /v1/logs`）。一级导航项，不是设置子页。 */
   | { name: 'logs' }
   /** 旧地址命中精确重定向表：由壳层用 `replace` 换掉，不是一页内容。 */
@@ -85,6 +90,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings/model') return { name: 'model' };
   if (path === '/settings/privacy') return { name: 'privacy' };
   if (path === '/settings/about') return { name: 'about' };
+  if (path === '/settings/connectors') return { name: 'connectors' };
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
   // 「关系」是一级页：它和 `/persona`、`/life` 平级，不是 `/settings/*` 的子项。
@@ -147,6 +153,8 @@ export function routePath(route: Route): string {
       return '/settings/account';
     case 'about':
       return '/settings/about';
+    case 'connectors':
+      return '/settings/connectors';
     case 'logs':
       return '/logs';
     case 'chat':

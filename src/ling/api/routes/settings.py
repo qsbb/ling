@@ -7,7 +7,7 @@ import time
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from ling.api.deps import ConfigDep, CurrentAuth, RouterDep
+from ling.api.deps import ConfigDep, CurrentAuth, RouterDep, SettingsDep
 from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
@@ -311,6 +311,33 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
                 profile in memory_sources and memory_sources[profile] is not None
             )
         },
+    }
+
+
+@router.get("/settings/connectors")
+async def get_connectors(
+    request: Request, auth: CurrentAuth, settings: SettingsDep
+) -> dict[str, object]:
+    """接入器（渠道连接器）的**只读**诊断：凭据齐不齐、连没连上、改哪里。
+
+    **必须鉴权**：这条端点把部署的接入方式摊开（有哪些入站端口、开了哪个
+    渠道、凭据设了没有）。它不含任何密钥明文（见
+    ``ling.settings.connectors``：``kind="secret"`` 的字段连值都不进视图对象），
+    但"哪个变量设了、监听在哪个端口"本身就是部署指纹，不该匿名可读。
+
+    ``configured`` 不在这里另判一遍：QQ 官方机器人复用
+    ``QQBotConfig.configured``，与总览的 ``connectivity`` 段同源；否则会出现
+    "总览说配好了、设置页说没配"这种自相矛盾，而用户无从判断谁对。
+
+    状态只读进程里**已经存在**的对象，不发网络探测：设置页会被反复打开，
+    把它做成探活会让每次打开都对外打一次 QQ 开放平台。
+    """
+    from ling.settings.connectors import connector_views
+
+    return {
+        "schema_version": "v1",
+        "as_of": utcnow().isoformat(),
+        "connectors": connector_views(settings, request.app.state),
     }
 
 

@@ -37,9 +37,14 @@ ONEBOT_CFG = OneBotConfig(
     instance_id="onebot-health",
 )
 
-# 四个必须鉴权的只读端点
+# 必须鉴权的只读端点。
+#
+# `/v1/settings/connectors` 在列：它把部署的接入方式摊开（开了哪个渠道、
+# 监听哪个端口、凭据设了没有）。不含密钥明文（见 ling/settings/connectors.py），
+# 但"哪个变量设了"本身就是部署指纹，不该匿名可读。
 PROTECTED_ENDPOINTS: tuple[str, ...] = (
     "/v1/settings/health",
+    "/v1/settings/connectors",
     "/v1/health/model",
     "/v1/onebot/health",
     "/v1/qqbot/health",

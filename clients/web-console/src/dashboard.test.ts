@@ -196,6 +196,7 @@ const ROUTE_NAME_SET = {
   relationships: true,
   account: true,
   about: true,
+  connectors: true,
   logs: true,
   legacyRedirect: true,
   notFound: true,
@@ -231,7 +232,7 @@ describe('路由表与页面表一一对应', () => {
     expect(parseRoute('/s/')).toEqual({ name: 'notFound' });
   });
 
-  it('已知路由零回归：11 条真实地址 + /s/{id} 深链', () => {
+  it('已知路由零回归：12 条真实地址 + /s/{id} 深链', () => {
     expect(parseRoute('/')).toEqual({ name: 'chat', sessionId: null });
     expect(parseRoute('/s/sess-1')).toEqual({ name: 'chat', sessionId: 'sess-1' });
     expect(parseRoute('/s/a%2Fb')).toEqual({ name: 'chat', sessionId: 'a/b' });
@@ -247,6 +248,7 @@ describe('路由表与页面表一一对应', () => {
     expect(parseRoute('/relationships/')).toEqual({ name: 'relationships' });
     expect(parseRoute('/settings/account')).toEqual({ name: 'account' });
     expect(parseRoute('/settings/about')).toEqual({ name: 'about' });
+    expect(parseRoute('/settings/connectors')).toEqual({ name: 'connectors' });
     expect(parseRoute('/persona')).toEqual({ name: 'persona' });
     expect(parseRoute('/memory')).toEqual({ name: 'memory' });
   });

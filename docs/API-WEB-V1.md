@@ -94,6 +94,7 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | DELETE | `/v1/settings/providers/{provider_id}/secret` | 删除凭据 |
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
+| GET | `/v1/settings/connectors` | `{schema_version, as_of, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, fields[], runtime}]}`；**只读**接入器诊断，`fields[].kind=secret` 只回 `set` 不回值（必鉴权） |
 
 `providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4,
 timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
@@ -110,6 +111,24 @@ timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
 enabled}`。原来这里的 `temperature / max_tokens / timeout_seconds / daily_cost_limit`
 已经移除：前三项跟着供应商走，温度改为**不发送**（用上游模型自己的默认值）。
 旧客户端仍可带这些键，服务端会忽略。
+
+### 4.1 接入器（渠道）
+
+`GET /v1/settings/connectors` 是**只读**诊断：渠道配置全在宿主部署目录的 `.env`
+（`LING_ONEBOT_*` / `LING_QQBOT_*`），密钥只在宿主上。这条端点回答三件事——
+凭据齐不齐（`configured`）、现在通不通（`status`）、缺的那项该改哪个变量
+（`fields[]` + `guidance`）。
+
+`status` 四值：`not_configured`（还没填齐）/ `disabled`（凭据齐了但渠道开关关着，
+只在 QQ 官方机器人上出现）/ `configured_disconnected`（配齐了但当前没连上）/
+`connected`。**不要把它压成"可用/不可用"**：这四者的下一步完全不同。
+
+`status_reason` 是稳定的码，`status_message` 是它对应的中文（码表见
+`ling/settings/connectors.py::CONNECTOR_REASON_TEXT`，前端只显示文案）。
+`fields[]` 每项 `{name, label, kind, set, value, source}`，`name` 是真实环境变量名，
+`kind=secret` 的项 `value` **恒为 null**、只有 `set`；`kind=switch` 的 `value` 是"开"/"关"。
+`runtime` 报进程里能直接看到的连接数与已收帧数（没有可观察的连接对象时为 null）；
+**这条端点不发网络探测**，设置页会被反复打开，不能拿它当探活。
 
 `log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
 **只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过

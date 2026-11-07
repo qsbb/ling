@@ -7,6 +7,7 @@ import { ChangePasswordView } from './components/ChangePasswordView';
 import { DashboardPage } from './components/DashboardPage';
 import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
+import { ConnectorsPage } from './components/ConnectorsPage';
 import { LifeNowPage } from './components/LifeNowPage';
 import { LogsPage } from './components/LogsPage';
 import { MemoryPage } from './components/MemoryPage';
@@ -95,6 +96,9 @@ export function mainPage(props: MainPageProps): ReactElement {
       return <IdentityPage onBack={goChat} />;
     case 'about':
       return <AboutPage onBack={goSettings} />;
+    case 'connectors':
+      // 接入器：只读诊断（值在宿主 `.env`，页面不给编辑入口）。
+      return <ConnectorsPage onBack={goSettings} />;
     case 'persona':
       return <PersonaPage onBack={goChat} />;
     case 'legacyRedirect':

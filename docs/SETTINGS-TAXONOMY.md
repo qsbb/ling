@@ -204,13 +204,18 @@ useEffect(() => {
 | ③ | 模型与生成 | `/v1/settings/config` | `model` | **`/settings/model`** |
 | ④ | 记忆与学习 | `/v1/settings/config` | `memory` | `/memory?tab=settings`（**不在设置**） |
 | ⑤ | 对话与主动性 | `/v1/settings/config` | `dialogue` | `/persona?tab=dialogue`（**不在设置**） |
-| ⑥ | 渠道与连接 | `None` | `channel` | 无 |
+| ⑥ | 渠道与连接 | `None` | `channel` | **`/settings/connectors`**（接入器，**只读**诊断） |
 | ⑦ | 权限与隐私 | `/v1/consents` | `privacy` | **`/settings/privacy`** |
 | ⑧ | 生活与活动 | `/v1/settings/config` | `life` | `/life?tab=rhythm`（**不在设置**） |
 | ⑨ | 系统与部署 | `None` | `system` | 无（部署/env） |
 
-加粗的只有 2 类（③⑦）真正出现在设置中心；①④⑤⑧ 的编辑面在各自领域页；
-②⑥⑨ 还没有前端设置面。
+加粗的只有 3 类（③⑥⑦）真正出现在设置中心；①④⑤⑧ 的编辑面在各自领域页；
+②⑨ 还没有前端设置面。
+
+> ⑥ 的状态面是 `GET /v1/settings/connectors`（`status_route` 仍指向 `/v1/channels`，
+> 那份报的是**渠道能力位**）。它的 `editable_route` 保持 `None`：接入配置与密钥只在
+> 宿主部署目录的 `.env`，网页可编辑要先回答"存哪、密钥怎么加密、改完怎么重启"。
+> 接入器页只回答"凭据齐不齐、现在通不通、该改哪个变量"。
 
 > `editable_route` 为 `None` 表示这一类**还没有设置面**，前端不得为它渲染入口
 > （见 `taxonomy.py` 模块头注释里 `editable_route` 的说明、`Category.editable_route` 字段与 `Category.available`）。这个字段是诚实性锚：

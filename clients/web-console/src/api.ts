@@ -23,6 +23,7 @@ import type {
   ModelHealthResponse,
   ConsentsResponse,
   ConsentUpdate,
+  ConnectorsResponse,
   StopResponse,
   TaxonomyResponse,
   ActivityResponse,
@@ -250,6 +251,15 @@ export const api = {
   /* ------------------------------------------------------------ 设置 */
   settingsConfig(): Promise<SettingsConfig> {
     return request<SettingsConfig>('/v1/settings/config');
+  },
+  /**
+   * 接入器（渠道）的只读诊断。
+   *
+   * 不带任何参数：值在宿主 `.env` 里，这条端点只报告"设了没有、通没通"，
+   * 密钥值连后端视图对象都不进（见 `ling/settings/connectors.py`）。
+   */
+  connectors(): Promise<ConnectorsResponse> {
+    return request<ConnectorsResponse>('/v1/settings/connectors');
   },
   saveDraft(payload: {
     providers?: ProviderDraftInput[];

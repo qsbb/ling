@@ -268,6 +268,67 @@ export interface DraftResponse {
   validation_errors: ValidationIssue[];
 }
 
+/**
+ * 接入器（`GET /v1/settings/connectors`）的只读视图。
+ *
+ * 四态而不是三态：`disabled` 只出现在 QQ 官方机器人上——凭据配好了但渠道开关
+ * 是关的。把它说成"未连接"是错的（连接从没被尝试过），去查连接只会白费时间。
+ */
+export type ConnectorStatus =
+  | 'not_configured'
+  | 'disabled'
+  | 'configured_disconnected'
+  | 'connected';
+
+export type ConnectorFieldKind = 'secret' | 'text' | 'switch';
+
+/**
+ * 一项配置。**密钥只有 `set`**（`kind==='secret'` 时 `value` 恒为 null）：
+ * 后端连值都不放进视图对象，页面不存在"显示/隐藏密钥"这条路径。
+ */
+export interface ConnectorField {
+  /** 环境变量名（真实变量名由后端从代码推导，前端不得自造） */
+  name: string;
+  label: string;
+  kind: ConnectorFieldKind;
+  /** 这一项有没有生效值（switch 恒为 true，值看 value） */
+  set: boolean;
+  value: string | null;
+  /** 值来自哪里。目前只有 env：改它要去宿主部署目录的 `.env`。 */
+  source: string;
+}
+
+export interface ConnectorRuntime {
+  /** 当前连接数；null = 这条路径没有可观察的连接对象（例如只配了 HTTP 上报） */
+  connections: number | null;
+  /** 已收帧/事件数；null 同上。已连接但恒为 0 本身是有用的结论。 */
+  received: number | null;
+}
+
+export interface ConnectorView {
+  id: string;
+  label: string;
+  /** 凭据齐不齐（与总览 connectivity 同源，不另判一套） */
+  configured: boolean;
+  enabled: boolean;
+  status: ConnectorStatus;
+  status_reason: string;
+  status_message: string;
+  /** 一句"怎么改"，点名真实环境变量 */
+  guidance: string;
+  /** 本轮恒为 false：值在宿主 `.env`，页面不给编辑入口 */
+  editable: boolean;
+  storage: string;
+  fields: ConnectorField[];
+  runtime: ConnectorRuntime;
+}
+
+export interface ConnectorsResponse {
+  schema_version: string;
+  as_of: string;
+  connectors: ConnectorView[];
+}
+
 export interface SecretStatus {
   provider_id: string;
   has_secret: boolean;
