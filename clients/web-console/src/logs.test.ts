@@ -18,6 +18,10 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_LOG_KIND,
+  DEFAULT_LOG_SETTINGS,
+  KIND_LABELS,
+  LOGS_SETTINGS_PANEL_ID,
   LOG_LIMIT,
   LOG_POLL_MS,
   LOG_SEARCH_DEBOUNCE_MS,
@@ -25,24 +29,102 @@ import {
   LogsHeader,
   LogsList,
   LogsPage,
+  LogsSettings,
   LogsToolbar,
   describeCounts,
   describeDenials,
+  describeKindFilter,
   formatLogTime,
   formatLogTimestampFull,
+  isDefaultLogSettings,
   isNearBottom,
   levelRank,
   levelTone,
   logLineParts,
   logsErrorCopy,
+  logsRequestParams,
+  settingsDismissAction,
+  shouldAutoScroll,
   startLogPolling,
+  toggleLogSetting,
+  type LogSettings,
 } from './components/LogsPage';
 import { ApiError } from './api';
 import { LEGACY_REDIRECTS, parseRoute, routePath } from './route';
 import { activeNavId } from './components/Navigation';
+import type { LogKindFilter, LogLevelFilter } from './components/LogsPage';
 import type { LogEntry, LogsResponse } from './types';
 
 const NOOP = () => undefined;
+
+/** 工具栏的渲染助手：只关心被断言的那几项，其余用默认值。 */
+function renderToolbar(
+  overrides: {
+    kind?: LogKindFilter;
+    level?: LogLevelFilter;
+    search?: string;
+    paused?: boolean;
+  } = {},
+): string {
+  return renderToStaticMarkup(
+    h(LogsToolbar, {
+      kind: overrides.kind ?? 'all',
+      level: overrides.level ?? 'all',
+      search: overrides.search ?? '',
+      paused: overrides.paused ?? false,
+      onKind: NOOP,
+      onLevel: NOOP,
+      onSearch: NOOP,
+      onTogglePause: NOOP,
+      onRefresh: NOOP,
+    }),
+  );
+}
+
+/** 设置面板的渲染助手（开/关、设置值由用例决定）。 */
+function renderSettings(
+  overrides: Partial<{
+    open: boolean;
+    settings: LogSettings;
+  }> = {},
+): string {
+  return renderToStaticMarkup(
+    h(LogsSettings, {
+      // 默认渲染成"打开"——面板里的东西只有打开才看得见
+      open: overrides.open ?? true,
+      settings: overrides.settings ?? DEFAULT_LOG_SETTINGS,
+      onOpenChange: NOOP,
+      onToggle: NOOP,
+      onReset: NOOP,
+    }),
+  );
+}
+
+/**
+ * 取某个 `data-testid` 对应的 `<input …>` 开标签。
+ *
+ * 只搜 `'checked'` 会假绿（属性顺序一变就废），所以取整个标签再判断。
+ */
+function inputTag(html: string, testId: string): string {
+  const match = html.match(new RegExp(`<input[^>]*data-testid="${testId}"[^>]*>`));
+  return match?.[0] ?? '';
+}
+
+/**
+ * 取某个下拉框的整段 `<select …>…</select>`。
+ *
+ * 断言"选中项"时必须限定在同一个下拉里：级别下拉也有 `value="all"`，
+ * 直接在整页 HTML 上搜会搜到别的控件的 selected。
+ */
+function selectBlock(html: string, testId: string): string {
+  const at = html.indexOf(`data-testid="${testId}"`);
+  if (at < 0) return '';
+  const open = html.lastIndexOf('<select', at);
+  const end = html.indexOf('</select>', at);
+  return open < 0 || end < 0 ? '' : html.slice(open, end + '</select>'.length);
+}
+
+
 
 function entry(overrides: Partial<LogEntry> = {}): LogEntry {
   return {
@@ -329,26 +411,15 @@ describe('轮询：暂停是真的停，恢复后继续', () => {
 /* ------------------------------------------------------------------ 渲染 */
 
 describe('渲染结构（SSR）', () => {
-  it('工具栏有分类/级别下拉、搜索框、暂停按钮与显示方法名开关', () => {
-    const html = renderToStaticMarkup(
-      h(LogsToolbar, {
-        kind: 'all',
-        level: 'all',
-        search: '',
-        paused: false,
-        showLogger: false,
-        onKind: NOOP,
-        onLevel: NOOP,
-        onSearch: NOOP,
-        onTogglePause: NOOP,
-        onRefresh: NOOP,
-        onToggleLogger: NOOP,
-      }),
-    );
+  it('工具栏有分类/级别下拉、搜索框、暂停与刷新；方法名开关**不在**工具栏', () => {
+    const html = renderToolbar();
     expect(html).toContain('data-testid="logs-level"');
     expect(html).toContain('data-testid="logs-search"');
     expect(html).toContain('data-testid="logs-pause"');
-    expect(html).toContain('data-testid="logs-show-logger"');
+    expect(html).toContain('data-testid="logs-refresh"');
+    // 显示方法名已经搬进右上角的设置面板：工具栏里再留一个入口就会有两份状态
+    expect(html).not.toContain('data-testid="logs-show-logger"');
+    expect(html).not.toContain('显示方法名');
     // 条数说明已经归页头：工具栏里不能再出现它（以前它会换行成一条横贯的窄带）
     expect(html).not.toContain('data-testid="logs-count"');
     expect(html).not.toContain('已显示');
@@ -360,21 +431,7 @@ describe('渲染结构（SSR）', () => {
   });
 
   it('暂停时按钮变成「继续」并报出 aria-pressed', () => {
-    const html = renderToStaticMarkup(
-      h(LogsToolbar, {
-        kind: 'all',
-        level: 'all',
-        search: 'x',
-        paused: true,
-        showLogger: false,
-        onKind: NOOP,
-        onLevel: NOOP,
-        onSearch: NOOP,
-        onTogglePause: NOOP,
-        onRefresh: NOOP,
-        onToggleLogger: NOOP,
-      }),
-    );
+    const html = renderToolbar({ search: 'x', paused: true });
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain('继续');
     // 暂停态下不该还写着「暂停」——按钮文字是状态，不是动作标签
@@ -447,7 +504,9 @@ describe('渲染结构（SSR）', () => {
 describe('条数说明在页头，不在列表上方占一条窄带', () => {
   it('页头把 describeCounts 的原文原样显示在标题旁', () => {
     const counts = describeCounts(200, 500, 500);
-    const html = renderToStaticMarkup(h(LogsHeader, { counts }));
+    const html = renderToStaticMarkup(
+      h(LogsHeader, { counts, kindHint: describeKindFilter('behavior') }),
+    );
     expect(html).toContain('data-testid="logs-head"');
     expect(html).toContain('page__head');
     expect(html).toContain('日志');
@@ -455,6 +514,9 @@ describe('条数说明在页头，不在列表上方占一条窄带', () => {
     expect(html).toContain('已显示 200 条');
     expect(html).toContain('缓冲已满');
     expect(html).toContain('更早的已被覆盖');
+    // 当前分类也写在页头里：分类默认「处理」，不说明会被当成"日志少了"
+    expect(html).toContain('data-testid="logs-kind-hint"');
+    expect(html).toContain('处理');
   });
 
   it('页面里条数说明位于页头与工具栏之间，工具栏之后不再有它', () => {
@@ -470,6 +532,20 @@ describe('条数说明在页头，不在列表上方占一条窄带', () => {
     expect(html.slice(toolbarAt)).not.toContain('logs__count');
     // 加载态也走页头，而不是另起一条
     expect(html).toContain('正在读取…');
+  });
+
+  it('设置按钮在页头右侧（排在工具栏之前），不是工具栏里的一项', () => {
+    const html = renderToStaticMarkup(h(LogsPage));
+    const headAt = html.indexOf('data-testid="logs-head"');
+    const actionsAt = html.indexOf('data-testid="logs-head-actions"');
+    const toggleAt = html.indexOf('data-testid="logs-settings-toggle"');
+    const toolbarAt = html.indexOf('data-testid="logs-toolbar"');
+    expect(actionsAt).toBeGreaterThan(headAt);
+    expect(toggleAt).toBeGreaterThan(actionsAt);
+    expect(toggleAt).toBeLessThan(toolbarAt);
+    expect(html).toContain('logs__head-actions');
+    // 工具栏里没有第二个设置入口
+    expect(html.slice(toolbarAt)).not.toContain('logs-settings-toggle');
   });
 });
 
@@ -506,13 +582,242 @@ describe('方法名（logger）开关：默认不显示，打开才显示', () =
     expect(html).not.toContain('logs__list--no-logger');
   });
 
-  it('页面默认关闭：开关未勾选（默认值来自页面状态，不是测试传进去的）', () => {
+  it('开关在设置面板里，且默认关（页面默认不渲染 logger 列）', () => {
+    // 页面默认面板是关着的，所以页面上看不到这个开关——但更要紧的是它不能
+    // 又出现在工具栏里（两处入口 = 两份状态，迟早不同步）
+    const page = renderToStaticMarkup(h(LogsPage));
+    expect(page).not.toContain('data-testid="logs-show-logger"');
+    expect(renderToolbar()).not.toContain('logs-show-logger');
+    // 默认值本身是"关"：列表按默认设置渲染时不带 logger 列
+    expect(DEFAULT_LOG_SETTINGS.showLogger).toBe(false);
+    expect(
+      renderToStaticMarkup(
+        h(LogsList, { level: 'all', showLogger: DEFAULT_LOG_SETTINGS.showLogger, items: rows }),
+      ),
+    ).toContain('logs__list--no-logger');
+
+    // 打开设置面板：开关在里面，且默认未勾选（默认值来自 DEFAULT_LOG_SETTINGS，
+    // 不是测试传进去的）
+    const panel = renderSettings();
+    const input = inputTag(panel, 'logs-show-logger');
+    expect(input).not.toBe('');
+    expect(input).not.toContain('checked');
+    expect(panel).toContain('显示方法名');
+  });
+
+  it('面板里勾上时是 checked（状态真的从设置对象来）', () => {
+    const panel = renderSettings({ settings: { ...DEFAULT_LOG_SETTINGS, showLogger: true } });
+    expect(inputTag(panel, 'logs-show-logger')).toContain('checked');
+    // 列表侧同步：同一份 settings 打开后就渲染 logger 列
+    const html = renderToStaticMarkup(
+      h(LogsList, { level: 'all', showLogger: true, showMillis: true, items: rows }),
+    );
+    expect(html).toContain('ling.kernel.bridge');
+    expect(html).not.toContain('logs__list--no-logger');
+  });
+});
+
+/* -------------------------------------------------------------- 默认分类 */
+
+describe('分类初值是「处理」', () => {
+  it('DEFAULT_LOG_KIND 是 behavior，不是 all', () => {
+    expect(DEFAULT_LOG_KIND).toBe('behavior');
+    expect(KIND_LABELS.behavior).toBe('处理');
+  });
+
+  it('页面一进来分类下拉就选中「处理」（不是「全部」）', () => {
+    const kindSelect = selectBlock(renderToStaticMarkup(h(LogsPage)), 'logs-kind');
+    // React SSR 把选中项标成 selected；「全部」不能被选中
+    expect(kindSelect).toContain('value="behavior" selected');
+    expect(kindSelect).not.toContain('value="all" selected');
+    // 级别下拉仍是「全部」——分类的默认值不该顺带改掉别的筛选
+    expect(selectBlock(renderToStaticMarkup(h(LogsPage)), 'logs-level')).toContain(
+      'value="all" selected',
+    );
+  });
+
+  it('页头写明当前只看处理过程（否则条数变少会被当成日志丢了）', () => {
     const html = renderToStaticMarkup(h(LogsPage));
-    // 取整个 input 标签再判断：只搜 'checked' 的话属性顺序一变就假绿
-    const input = html.match(/<input[^>]*logs-show-logger[^>]*>/);
-    expect(input).not.toBeNull();
-    expect(input?.[0]).not.toContain('checked');
+    const hint = describeKindFilter(DEFAULT_LOG_KIND);
+    expect(html).toContain('data-testid="logs-kind-hint"');
+    expect(html).toContain(hint);
+    expect(hint).toContain('处理过程');
+    // 切到「全部」时不再说"只看处理"，而是明说当前是全部
+    expect(describeKindFilter('all')).toContain('全部');
+    expect(describeKindFilter('all')).not.toContain('只看');
+    expect(describeKindFilter('runtime')).toContain('运行');
+  });
+
+  it('切换分类后请求参数跟着变（behavior → runtime → 全部是 null）', () => {
+    expect(logsRequestParams('behavior', 'all', '')).toEqual({
+      limit: LOG_LIMIT,
+      kind: 'behavior',
+      level: null,
+      q: null,
+    });
+    expect(logsRequestParams('runtime', 'all', '').kind).toBe('runtime');
+    // 「全部」必须翻译成 null，不能是空串：空串是"筛一个空分类"，结果恒为空
+    expect(logsRequestParams('all', 'all', '').kind).toBeNull();
+    // 级别与搜索词同样如此（顺带确认搜索词 trim）
+    expect(logsRequestParams('all', 'error', '  超时  ')).toEqual({
+      limit: LOG_LIMIT,
+      kind: null,
+      level: 'error',
+      q: '超时',
+    });
+  });
+
+  it('切换后的下拉回显（工具栏不自己假设默认值）', () => {
+    expect(selectBlock(renderToolbar({ kind: 'behavior' }), 'logs-kind')).toContain(
+      'value="behavior" selected',
+    );
+    expect(selectBlock(renderToolbar({ kind: 'runtime' }), 'logs-kind')).toContain(
+      'value="runtime" selected',
+    );
+    expect(selectBlock(renderToolbar({ kind: 'all' }), 'logs-kind')).toContain(
+      'value="all" selected',
+    );
+  });
+
+  it('空列表先说是分类筛掉的，而不是"后端没日志"', () => {
+    const html = renderToStaticMarkup(
+      h(LogsList, { level: 'all', kind: 'behavior', showLogger: false, items: [] }),
+    );
+    expect(html).toContain('分类筛选');
+    expect(html).toContain('处理');
+    // 没有分类筛选时才说"服务刚启动"
+    const plain = renderToStaticMarkup(h(LogsList, { level: 'all', showLogger: false, items: [] }));
+    expect(plain).toContain('服务刚启动');
+  });
+});
+
+/* -------------------------------------------------------------- 设置面板 */
+
+describe('设置面板（右上角）', () => {
+  it('默认值：方法名关、自动跟到最新开、毫秒开', () => {
+    expect(DEFAULT_LOG_SETTINGS).toEqual({
+      showLogger: false,
+      followLatest: true,
+      showMillis: true,
+    });
+    expect(isDefaultLogSettings(DEFAULT_LOG_SETTINGS)).toBe(true);
+  });
+
+  it('关闭时不渲染面板，但按钮报 aria-expanded="false"', () => {
+    const html = renderSettings({ open: false });
+    expect(html).toContain('data-testid="logs-settings-toggle"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('data-testid="logs-settings-panel"');
+    // 面板里的开关一个都不在（关掉就是关掉，不是藏起来）
+    expect(html).not.toContain('logs-show-logger');
+    expect(html).toContain('设置');
+  });
+
+  it('打开时按钮报 aria-expanded="true"，面板带 role=dialog 与 aria-controls 指向的 id', () => {
+    const html = renderSettings({ open: true });
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain(`aria-controls="${LOGS_SETTINGS_PANEL_ID}"`);
+    expect(html).toContain('aria-haspopup="dialog"');
+    expect(html).toContain('data-testid="logs-settings-panel"');
+    expect(html).toContain(`id="${LOGS_SETTINGS_PANEL_ID}"`);
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('aria-label="日志设置"');
+  });
+
+  it('面板里有三项设置 + 恢复默认，顺序固定', () => {
+    const html = renderSettings();
+    const loggerAt = html.indexOf('data-testid="logs-show-logger"');
+    const followAt = html.indexOf('data-testid="logs-follow-latest"');
+    const millisAt = html.indexOf('data-testid="logs-show-millis"');
+    const resetAt = html.indexOf('data-testid="logs-settings-reset"');
+    expect(loggerAt).toBeGreaterThan(-1);
+    expect(followAt).toBeGreaterThan(loggerAt);
+    expect(millisAt).toBeGreaterThan(followAt);
+    expect(resetAt).toBeGreaterThan(millisAt);
     expect(html).toContain('显示方法名');
+    expect(html).toContain('自动跟到最新');
+    expect(html).toContain('时间显示毫秒');
+    expect(html).toContain('恢复默认');
+    // 默认状态下两个"开"的开关是勾上的
+    expect(inputTag(html, 'logs-follow-latest')).toContain('checked');
+    expect(inputTag(html, 'logs-show-millis')).toContain('checked');
+  });
+
+  it('「恢复默认」在已是默认值时置灰（点了没反应比置灰更糟）', () => {
+    expect(renderSettings()).toMatch(/data-testid="logs-settings-reset"[^>]*disabled/);
+    const changed = renderSettings({
+      settings: { showLogger: true, followLatest: false, showMillis: false },
+    });
+    expect(changed).not.toMatch(/data-testid="logs-settings-reset"[^>]*disabled/);
+  });
+
+  it('toggleLogSetting 只翻一项，其余不动', () => {
+    const once = toggleLogSetting(DEFAULT_LOG_SETTINGS, 'showLogger');
+    expect(once).toEqual({ showLogger: true, followLatest: true, showMillis: true });
+    expect(isDefaultLogSettings(once)).toBe(false);
+    // 翻两次回到默认
+    expect(toggleLogSetting(once, 'showLogger')).toEqual(DEFAULT_LOG_SETTINGS);
+    // 原对象不被改（不可变更新）
+    expect(DEFAULT_LOG_SETTINGS.showLogger).toBe(false);
+    expect(toggleLogSetting(DEFAULT_LOG_SETTINGS, 'followLatest').followLatest).toBe(false);
+    expect(toggleLogSetting(DEFAULT_LOG_SETTINGS, 'showMillis').showMillis).toBe(false);
+  });
+
+  it('Esc 无条件关面板；点面板外才关（点里面、别的键都不关）', () => {
+    expect(settingsDismissAction({ type: 'keydown', key: 'Escape', inside: false })).toBe(true);
+    // 焦点还在按钮上（inside=false）或已进面板（inside=true）都要关
+    expect(settingsDismissAction({ type: 'keydown', key: 'Escape', inside: true })).toBe(true);
+    // 别的键不关：Tab / 方向键在面板里还要用
+    for (const key of ['Tab', 'Enter', 'ArrowDown', 'a']) {
+      expect(settingsDismissAction({ type: 'keydown', key, inside: true })).toBe(false);
+    }
+    // 点面板外关，点里面不关
+    expect(settingsDismissAction({ type: 'mousedown', inside: false })).toBe(true);
+    expect(settingsDismissAction({ type: 'mousedown', inside: true })).toBe(false);
+    // 触摸设备走 touchstart，语义与 mousedown 一致
+    expect(settingsDismissAction({ type: 'touchstart', inside: false })).toBe(true);
+    expect(settingsDismissAction({ type: 'touchstart', inside: true })).toBe(false);
+    // 不相干的事件不理
+    expect(settingsDismissAction({ type: 'click', inside: false })).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------ 自动跟到最新 */
+
+describe('自动跟到最新 / 时间毫秒：开关真的改变行为', () => {
+  it('默认开着；只有"开着且本来就贴底"才自动滚', () => {
+    expect(DEFAULT_LOG_SETTINGS.followLatest).toBe(true);
+    expect(shouldAutoScroll(true, true)).toBe(true);
+    // 用户往上翻着读报错：不能被新日志拽回底部
+    expect(shouldAutoScroll(true, false)).toBe(false);
+    // 关掉开关：即使本来就贴底也不再自动滚
+    expect(shouldAutoScroll(false, true)).toBe(false);
+    expect(shouldAutoScroll(false, false)).toBe(false);
+  });
+
+  it('毫秒关掉时时间只到秒，打开时带三位毫秒', () => {
+    const timestamp = '2026-11-05T01:02:03.456+00:00';
+    expect(formatLogTime(timestamp)).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3}$/);
+    expect(formatLogTime(timestamp, true).endsWith('.456')).toBe(true);
+    const secondOnly = formatLogTime(timestamp, false);
+    expect(secondOnly).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    expect(secondOnly).not.toContain('.');
+    // 解析不了的仍然原样返回（关毫秒不是"编一个 00"）
+    expect(formatLogTime('不是时间', false)).toBe('不是时间');
+  });
+
+  it('列表按 showMillis 渲染时间，悬停的完整时间始终带毫秒', () => {
+    const withMillis = renderToStaticMarkup(
+      h(LogsList, { level: 'all', showLogger: false, showMillis: true, items: [entry()] }),
+    );
+    expect(withMillis).toMatch(/>\d{2}:\d{2}:\d{2}\.\d{3}</);
+    const noMillis = renderToStaticMarkup(
+      h(LogsList, { level: 'all', showLogger: false, showMillis: false, items: [entry()] }),
+    );
+    expect(noMillis).toMatch(/>\d{2}:\d{2}:\d{2}</);
+    expect(noMillis).not.toMatch(/>\d{2}:\d{2}:\d{2}\.\d{3}</);
+    // title 上是完整时间，关掉毫秒不影响它（还能查同秒先后）
+    expect(noMillis).toMatch(/title="2026-11-0[45] \d{2}:\d{2}:\d{2}\.\d{3}"/);
   });
 });
 
@@ -563,46 +868,14 @@ describe('常量与后端契约对齐', () => {
   });
 });
 
-describe('日志分类（运行 / 处理）', () => {
-  it('工具栏有分类下拉，默认「全部」', () => {
-    const html = renderToStaticMarkup(
-      h(LogsToolbar, {
-        kind: 'all',
-        level: 'all',
-        search: '',
-        paused: false,
-        showLogger: false,
-        onKind: NOOP,
-        onLevel: NOOP,
-        onSearch: NOOP,
-        onTogglePause: NOOP,
-        onRefresh: NOOP,
-        onToggleLogger: NOOP,
-      }),
-    );
+describe('日志分类的选项与行内容', () => {
+  it('工具栏的分类下拉里五个选项齐全（少一个就有一个分类用不了）', () => {
+    const html = renderToolbar();
     expect(html).toContain('data-testid="logs-kind"');
-    expect(html).toContain('>处理<');
-    expect(html).toContain('>运行<');
-  });
-
-  it('选了「处理」时下拉回显处理', () => {
-    const html = renderToStaticMarkup(
-      h(LogsToolbar, {
-        kind: 'behavior',
-        level: 'all',
-        search: '',
-        paused: false,
-        showLogger: false,
-        onKind: NOOP,
-        onLevel: NOOP,
-        onSearch: NOOP,
-        onTogglePause: NOOP,
-        onRefresh: NOOP,
-        onToggleLogger: NOOP,
-      }),
-    );
-    // React SSR 会把选中项标成 selected
-    expect(html).toMatch(/value="behavior"[^>]*selected/);
+    for (const [value, label] of Object.entries(KIND_LABELS)) {
+      expect(html).toContain(`value="${value}"`);
+      expect(html).toContain(`>${label}<`);
+    }
   });
 
   it('每行带 kind 时能标出来（不靠 attributes 猜）', () => {
