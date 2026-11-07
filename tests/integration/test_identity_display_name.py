@@ -457,7 +457,10 @@ async def test_current_sentence_uses_the_live_card_not_the_database(
             user_sender_name="新名片",
         )
     text = "\n".join(message.content for message in compiled.messages)
-    assert "新名片：这一句" in text
+    # 名片是"本次称呼"，必须当轮生效；同时把**库里那个稳定的名字**放进括号。
+    # 不带括号的话，历史里的「旧名：」和当前的「新名片：」在同一个提示词里
+    # 指同一个人却顶着两个名字——模型会把"新名片"当成群里另一个人（串人）。
+    assert "新名片（旧名）：这一句" in text, text
     assert "旧名：这一句" not in text
 
 
