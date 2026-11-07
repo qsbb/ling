@@ -292,12 +292,34 @@ _BAD_DIGESTS = [
 def test_02_updater_rejects_bad_digest_with_zero_compose_calls(
     updater_ws: upd_harness.Workspace, digest: str
 ) -> None:
-    """清单第 2 条：格式错/别 registry/latest/大写/63/65 位/非 hex → 一个 docker 都不跑。"""
+    """清单第 2 条：格式错/别 registry/latest/大写/63/65 位/非 hex → 不产生任何变更动作。
+
+    ## 为什么只读探测是允许的（811ffa6 起）
+
+    更新器**启动时**会刷新一次可信发布目录：读运行中 api 镜像的版本标注
+    （``docker ps`` → ``inspect`` → ``image inspect``），并对自己目录里那些
+    **固定**的 ``v<version>`` tag 做 ``docker manifest inspect``。这一组调用
+    （`test_updater._READ_ONLY_CALLS`）与请求内容无关、也不改任何东西——
+    811ffa6 把 ``test_updater.py`` 里同族用例改成
+    ``mutating_calls(ws) == []``，这里当时漏改了。
+
+    ## 这里真正守住的两件事（比"零调用"更强）
+
+    1. **没有任何变更类调用**：不 compose up/down/pull、不备份、不发 HTTP、
+       不写任务文件（``task.json`` 不存在、目录里也没有新任务）；
+    2. **坏摘要一次都没被转发给 docker**：它连 argv 都没进过——格式校验在
+       ``validate_request_identity`` 里就结束，早于任何目录/摘要解析。
+       机器可验证的形式是：启动刷新问 registry 的那些引用**全部来自可信目录**
+       （``ghcr.io/qsbb/ling-api:v<version>``），没有任何一条是请求里的字符串。
+       这比"零调用"更该守——请求值压根没被使用，而不是"只读所以无所谓"。
+    """
     upd_harness.write_request(updater_ws, target=digest)
     result = upd_harness.run_updater(updater_ws)
     assert result.returncode == 2, (digest, result.stdout, result.stderr)
-    # 「零 compose 调用」在这里是更强的：整条 docker 调用链为空。
-    assert updater_ws.calls() == [], (digest, updater_ws.calls())
+    assert upd_harness.mutating_calls(updater_ws) == [], (digest, updater_ws.calls())
+    # 只读探测只问可信目录里的 tag；坏目标没有变成任何一条 docker 参数。
+    for ref in upd_harness.manifest_inspect_refs(updater_ws):
+        assert ref.startswith("ghcr.io/qsbb/ling-api:v"), (digest, ref)
     assert not (updater_ws.state_dir / "task.json").exists()
     assert updater_ws.status()["task"] is None
     # 被拒绝后认领归档，避免下一轮无限重试同一个坏请求。
@@ -487,7 +509,10 @@ def test_04_updater_backup_gate_reports_media_partial(
     assert gate["complete"] is True  # manifest 结构完整，但媒体不完整
     assert gate["media_state"] == "partial"
     assert gate["reason"] == "media_partial"
-    assert updater_ws.calls() == []
+    # 幂等：只写状态，不迁移、不 compose、不写任务。启动时的目录刷新会做只读
+    # 探测（读容器镜像版本 + 对目录里固定的 tag 做 manifest inspect），
+    # 那是读事实，不是变更——见 `test_updater._READ_ONLY_CALLS` 的注释。
+    assert upd_harness.mutating_calls(updater_ws) == [], updater_ws.calls()
 
 
 # ================================================================ 清单第 5 条
@@ -547,7 +572,8 @@ def test_05_updater_backup_gate_reports_keys_missing(
     assert gate["keys_root"] == "absent"
     assert gate["keys_env_set"] == "false"
     assert gate["reason"] == "keys_missing"
-    assert updater_ws.calls() == []
+    # 同上：只读探测之外零调用（不迁移、不 compose、不写任务）。
+    assert upd_harness.mutating_calls(updater_ws) == [], updater_ws.calls()
 
 
 # ================================================================ 清单第 6 条
@@ -921,7 +947,10 @@ def test_10_restart_after_migration_stops_at_manual_gate_without_new_task(
     updater_ws.reset()
     again = upd_harness.run_updater(updater_ws)
     assert again.returncode == 17, (again.stdout, again.stderr)
-    assert updater_ws.calls() == []
+    # 「一步都不动」= 没有任何**变更**动作。人工门禁要重写状态文件，写之前会
+    # 刷一次目录（只读：容器镜像版本 + 固定 tag 的 manifest inspect），
+    # 那不改环境；`test_updater._READ_ONLY_CALLS` 是这把尺子。
+    assert upd_harness.mutating_calls(updater_ws) == [], updater_ws.calls()
     assert updater_ws.task()["request_id"] == REQUEST_ID_B
     assert (updater_ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
 
@@ -1021,8 +1050,8 @@ def test_12_updater_ignores_legacy_source_mode_artifacts(
 ) -> None:
     """清单第 12 条（更新器侧）：旧 pending.json/current.json/heartbeat.json 不被执行。
 
-    「忽略」是设计允许的处置，但必须真的不执行源码通道：零 docker 调用、没有
-    新任务、原文件原样保留。
+    「忽略」是设计允许的处置，但必须真的不执行源码通道：没有任何**变更类**
+    docker 调用（只读的目录/版本探测除外）、没有新任务、原文件原样保留。
     """
     pending = updater_ws.requests_dir / "pending.json"
     pending.write_text(
@@ -1051,7 +1080,7 @@ def test_12_updater_ignores_legacy_source_mode_artifacts(
     result = upd_harness.run_updater(updater_ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
     # 没走错通道：源码模式的 pending 不会变成 docker 任务。
-    assert updater_ws.calls() == []
+    assert upd_harness.mutating_calls(updater_ws) == [], updater_ws.calls()
     assert not (updater_ws.state_dir / "task.json").exists()
     status = updater_ws.status()
     assert status["updater"]["state"] == "idle"
@@ -1150,8 +1179,9 @@ def test_13_updater_duplicate_request_id_replay_is_rejected_without_second_task(
     upd_harness.write_request(updater_ws, REQUEST_ID)
     second = upd_harness.run_updater(updater_ws)
     assert second.returncode == 2, (second.stdout, second.stderr)
-    # 重放没有触发任何 docker 调用，也没有第二个任务/第二次成功。
-    assert updater_ws.calls() == []
+    # 重放没有触发任何**变更**调用（只读的启动目录刷新除外），也没有第二个
+    # 任务/第二次成功。重放判定读的是 archive 目录，早于任何 docker 解析。
+    assert upd_harness.mutating_calls(updater_ws) == [], updater_ws.calls()
     assert len(_compose(updater_ws, "pull")) == 0
     task = updater_ws.task()
     assert task["request_id"] == REQUEST_ID
