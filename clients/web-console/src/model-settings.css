@@ -355,6 +355,31 @@
   overflow-wrap: anywhere;
 }
 
+/* 「发布前还差…」：是提示不是错误，用琥珀色，和红色的校验失败分开。 */
+.ms-hint--warn {
+  color: var(--ms-warn);
+}
+
+.ms-shape {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 10px 24px 0;
+  padding: 8px 11px;
+  border: 1px solid #e2cda2;
+  border-radius: 10px;
+  background: var(--ms-warn-soft);
+  color: var(--ms-warn);
+  font-size: 11.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.ms-shape svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
 .ms-error-text {
   margin: 6px 0 0;
   color: var(--ms-danger);
@@ -1674,6 +1699,26 @@
   color: var(--ms-faint);
 }
 
+/* 历史槽位绑了嵌入/重排：不藏起来，但在卡片里说清它会失败。 */
+.ms-slot__warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid #d9a79d;
+  border-radius: 8px;
+  background: var(--ms-danger-soft);
+  color: var(--ms-danger);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.ms-slot__warn svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
 /* ------------------------------------------------------ 职责行（一行一模型） */
 
 .ms-role-row {
@@ -1731,6 +1776,7 @@
 
 .ms-role-row__pick {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   min-width: 0;
@@ -1741,12 +1787,45 @@
   min-width: 0;
 }
 
+/*
+ * 历史绑定与能力不匹配：这是**警告不是错误**——用户没做错什么，只是后端
+ * 新增了能力层。下拉里保留那一家（不要悄悄消失），并用整行说明为什么
+ * 发布会被拦下。放在 pick 列里会在桌面挤成五六行，所以单独占一行。
+ */
+.ms-role-row__warn {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 7px 10px;
+  border: 1px solid #d9a79d;
+  border-radius: 8px;
+  background: var(--ms-danger-soft);
+  color: var(--ms-danger);
+  font-size: 11.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.ms-role-row__warn svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
 /* 三种来源的边框语义。**不能只靠颜色**：边框形状（实线/虚线）也一起变，
    否则色弱用户分不出「单独指定」和「继承」。 */
 .ms-select--inherit {
   border-style: dashed;
   border-color: var(--ms-line-strong);
   color: var(--ms-muted);
+}
+
+/* 环境变量提供的能力：没有网页绑定，但也不是"不可用"。虚线 + 琥珀色，
+   和灰色虚线（继承）区分开，文字标签同时写明「环境变量」。 */
+.ms-select--env {
+  border-style: dashed;
+  border-color: #d9c08a;
+  color: var(--ms-warn);
 }
 
 .ms-select--fell_back {
@@ -1796,6 +1875,16 @@
 
 .ms-role-row--legacy .ms-role-row__effective-model {
   color: #8a6d1f;
+}
+
+/*
+ * 环境变量提供：和「旧版兼容」的琥珀色同族，但用实线边框——它不是兼容
+ * 逻辑兜出来的，而是用户自己配在宿主环境里的真实来源。
+ */
+.ms-badge--env {
+  border-color: #d9c08a;
+  background: #fdf6e3;
+  color: var(--ms-warn);
 }
 
 .ms-badge--fell_back,
@@ -1848,6 +1937,41 @@
   justify-self: start;
   text-align: left;
   font-size: 11px;
+}
+
+/*
+ * 「配置来源」单独占一行（grid 的第 5 个孩子自动换行到 1/-1）。
+ * 嵌入/重排有两种来源：网页绑定与环境变量。看不清来源，用户就会把
+ * "env 已经配好"误认为"网页没配 = 没生效"——这正是这一轮要修的问题。
+ */
+.ms-role-row__source {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 7px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ms-muted);
+  overflow-wrap: anywhere;
+}
+
+.ms-role-row__source-label {
+  font-size: 10.5px;
+  color: var(--ms-faint);
+  letter-spacing: 0.02em;
+}
+
+.ms-role-row__source--binding {
+  color: var(--ms-accent);
+}
+
+.ms-role-row__source--env {
+  color: var(--ms-warn);
+}
+
+.ms-role-row__source--none {
+  color: var(--ms-danger);
 }
 
 .ms-link--faint {
@@ -1909,14 +2033,22 @@
 
 .ms-roles__counts {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 6px 0 0;
   font-size: 11.5px;
   color: var(--ms-muted);
 }
 
+/* 计数项整体换行，不要在「6 个职 / 责」这种位置被压断。
+   375 下多出「来自环境变量」一项后，不换行会挤成两行碎字。 */
+.ms-roles__counts > span {
+  white-space: nowrap;
+}
+
 .ms-roles__counts--warn { color: var(--ms-warn); }
 .ms-roles__counts--danger { color: var(--ms-danger); }
+.ms-roles__counts--env { color: var(--ms-warn); }
 
 /* 底部保存栏：和供应商页同一套"改动未保存 + 撤销 / 保存" */
 .ms-savebar {
@@ -2057,6 +2189,13 @@
     margin-right: 16px;
     padding-left: 0;
     padding-right: 0;
+  }
+
+  /* 提示条自己带左右内边距：和上面那组不同，不能把 padding 清掉，
+     否则文字会贴着边框。 */
+  .ms-shape {
+    margin-left: 16px;
+    margin-right: 16px;
   }
 
   .ms-dirtybar {

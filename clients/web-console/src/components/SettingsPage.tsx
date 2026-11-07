@@ -267,9 +267,24 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
 
   const patchProvider = (providerId: string, patch: Partial<ProviderDraftInput>) => {
     setProviders((current) =>
-      current.map((provider) =>
-        provider.provider_id === providerId ? { ...provider, ...patch } : provider,
-      ),
+      current.map((provider) => {
+        if (provider.provider_id !== providerId) return provider;
+        const next = { ...provider, ...patch };
+        if (patch.kind !== undefined && patch.kind !== provider.kind) {
+          // 类型变了，服务端上次告诉我们的能力对新类型不再成立。清空后
+          // 按"未知"处理（失败关闭）：保存前不把这家列进职责/槽位下拉，
+          // 免得界面拿旧能力做一个可能错的过滤。
+          //
+          // 改回原类型时把能力恢复回来：否则"A→B→A"看起来没改动（保存
+          // 按钮是灰的），但草稿里的能力已经丢了，下拉会一直少这一家。
+          const original = baseline?.providers.find(
+            (item) => item.provider_id === providerId,
+          );
+          next.capabilities =
+            original && original.kind === patch.kind ? original.capabilities : undefined;
+        }
+        return next;
+      }),
     );
   };
 

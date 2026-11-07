@@ -26,7 +26,7 @@ export interface RoleMeta {
 }
 
 /**
- * 设置页主视图里真会生效的四个职责。
+ * 设置页主视图里真会生效的职责。
  *
  * `dialogue.deep` **不在这里**：全仓没有代码按那个角色请求模型，列着它
  * 等于承诺"绑上会更聪明"（服务端也把它放进了 `reserved_profiles`）。
@@ -60,8 +60,26 @@ export const PRIMARY_ROLES: RoleMeta[] = [
   },
 ];
 
-/** 不常改、但改不了会真的少能力的那几条。 */
-export const EXTRA_ROLES: RoleMeta[] = [];
+/**
+ * 记忆检索的两条职责：它们不是 chat 协议，也没有默认槽位。
+ *
+ * 列在这里而不是和 PRIMARY_ROLES 混在一起，是为了让分组文案能说清
+ * "这两条只在检索时触发"。是否真的渲染仍由服务端 `known_profiles` 决定。
+ */
+export const EXTRA_ROLES: RoleMeta[] = [
+  {
+    key: 'memory.embed',
+    label: '嵌入',
+    short: '嵌入',
+    hint: '把文字存成向量；换个说法也能想起来，靠的是它',
+  },
+  {
+    key: 'memory.rerank',
+    label: '重排',
+    short: '重排',
+    hint: '先粗筛再精排，让真正相关的那条排在前面',
+  },
+];
 
 const ALL_ROLES = [...PRIMARY_ROLES, ...EXTRA_ROLES];
 
@@ -84,10 +102,32 @@ export const PROVIDER_KIND_OPTIONS = [
   { value: 'chat_responses', label: 'chat responses' },
   { value: 'local', label: '本地服务' },
   { value: 'fake', label: '本地测试' },
+  // 非对话能力：请求体与返回结构都和 chat 不同，所以单独列出来，
+  // 不混进「OpenAI 兼容」里让用户换个地址就以为能用。
+  { value: 'cloudflare_embedding', label: '嵌入（Cloudflare）' },
+  { value: 'siliconflow_rerank', label: '重排（SiliconFlow）' },
 ] as const;
 
 export function kindLabel(kind: string): string {
   return PROVIDER_KIND_OPTIONS.find((item) => item.value === kind)?.label ?? kind;
+}
+
+/** 能力 → 人话。服务端传的是 `chat` / `embed` / `rerank` 这类机器名。 */
+export function capabilityLabel(capability: string): string {
+  switch (capability) {
+    case 'chat':
+      return '对话';
+    case 'embed':
+      return '嵌入';
+    case 'rerank':
+      return '重排';
+    case 'tts':
+      return '语音合成';
+    case 'asr':
+      return '语音识别';
+    default:
+      return capability;
+  }
 }
 
 /** `https://192.0.2.10:3002/v1` → `192.0.2.10:3002`。 */
@@ -104,6 +144,157 @@ export function providerGlyph(providerId: string): string {
   return first ? first.toUpperCase() : '?';
 }
 
+/* ------------------------------------------------------- 供应商能力过滤 */
+
+/**
+ * 这家供应商**已知**的能力；`null` = 还不知道（草稿里刚改过 kind 或新建）。
+ *
+ * 能力来自 `/settings/config` 的 `capabilities`，前端**不维护 kind → 能力表**：
+ * 那种表一旦和后端走散，界面就会把调不通的组合列出来。
+ */
+export function knownCapabilities(provider: ProviderDraftInput): string[] | null {
+  return Array.isArray(provider.capabilities) ? provider.capabilities : null;
+}
+
+/**
+ * 这家能不能服务需要 `capability` 的角色。
+ *
+ * - 角色没有能力要求（`null`/`undefined`）→ 一律放行（服务端不对它做约束）；
+ * - 能力未知 → **不放行**（失败关闭）：新供应商要保存一次、改了 kind 的要
+ *   保存后重新读，界面宁可不列，也不列一个可能调不通的组合。
+ */
+export function providerHasCapability(
+  provider: ProviderDraftInput,
+  capability: string | null | undefined,
+): boolean {
+  if (!capability) return true;
+  const capabilities = knownCapabilities(provider);
+  return capabilities !== null && capabilities.includes(capability);
+}
+
+/**
+ * 某个职责的下拉选项：具备该能力的供应商，**加上当前已绑的那一家**。
+ *
+ * 当前绑定即使能力不匹配也要留着——历史配置从下拉里消失会让用户以为
+ * "从来没绑过"，然后随手换一个。调用方负责给它加警告。
+ */
+export function providersForProfile(
+  providers: ProviderDraftInput[],
+  capability: string | null | undefined,
+  currentProviderId: string | null | undefined,
+): ProviderDraftInput[] {
+  return providers.filter(
+    (provider) =>
+      provider.provider_id === currentProviderId ||
+      providerHasCapability(provider, capability),
+  );
+}
+
+/**
+ * 默认槽位（快速/创作/识图/日常）只收对话供应商。
+ *
+ * 嵌入/重排填进槽位会"发布成功、调用必失败"，所以这里按服务端给的能力
+ * 过滤；当前已绑的那家保留，供界面标警告。
+ */
+export function providersForChatSlot(
+  providers: ProviderDraftInput[],
+  currentProviderId: string,
+): ProviderDraftInput[] {
+  return providers.filter(
+    (provider) =>
+      (provider.enabled || provider.provider_id === currentProviderId) &&
+      (provider.provider_id === currentProviderId ||
+        providerHasCapability(provider, 'chat')),
+  );
+}
+
+/** 已经绑了、但供应商标称的能力不含职责所需的那一种（历史配置）。 */
+export function bindingCapabilityMismatch(
+  provider: ProviderDraftInput | undefined,
+  capability: string | null | undefined,
+): boolean {
+  if (!provider || !capability) return false;
+  const capabilities = knownCapabilities(provider);
+  return capabilities !== null && !capabilities.includes(capability);
+}
+
+/* ----------------------------------------------------- 供应商必填项提示 */
+
+export interface ProviderFieldIssue {
+  /** 与后端 `validate_payload` 的 field 同名，方便用户对照发布时的报错。 */
+  field: string;
+  message: string;
+}
+
+/**
+ * 供应商表单的**提前提示**：条件和后端 `_provider_shape_issues` 一致，
+ * 但后端仍是唯一真相——这里只显示"还差什么"，不阻止保存草稿。
+ *
+ * 为什么不比后端更严：
+ * - 密钥只由后端记 warning（草稿里也没有 `has_secret`），这里不要求；
+ * - Cloudflare 的 `account_id` 与 `base_url` 是**二选一**（老部署只用
+ *   `LING_EMBEDDING_API_BASE`），只给 base_url 也合法；
+ * - fake 是进程内实现，没有端点也不需要密钥。
+ */
+export function providerShapeIssues(input: {
+  provider_id?: string;
+  kind: string;
+  base_url?: string | null;
+  extra?: Record<string, unknown> | null;
+}): ProviderFieldIssue[] {
+  const providerId = (input.provider_id ?? '').trim() || 'new';
+  const kind = input.kind;
+
+  // fake 没有连接信息可填；后端对它是直接返回的。
+  if (kind === 'fake') return [];
+
+  const issues: ProviderFieldIssue[] = [];
+  const baseUrl = (input.base_url ?? '').trim();
+  const isChat =
+    kind === 'openai_compatible' ||
+    kind === 'anthropic' ||
+    kind === 'chat_responses' ||
+    kind === 'local';
+  const isRerank = kind === 'siliconflow_rerank';
+  const isEmbed = kind === 'cloudflare_embedding';
+  const validUrl = /^https?:\/\//.test(baseUrl);
+
+  if (isChat || isRerank) {
+    if (!baseUrl) {
+      issues.push({
+        field: `providers.${providerId}.base_url`,
+        message: isChat
+          ? '兼容接口必须提供 API 地址（base_url）'
+          : '重排供应商必须提供 API 地址（base_url，例如 https://api.siliconflow.cn/v1）',
+      });
+    } else if (!validUrl) {
+      issues.push({
+        field: `providers.${providerId}.base_url`,
+        message: 'API 地址必须以 http:// 或 https:// 开头',
+      });
+    }
+  }
+
+  if (isEmbed) {
+    const rawAccountId = input.extra?.account_id;
+    const accountId = rawAccountId == null ? '' : String(rawAccountId).trim();
+    if (!accountId && !baseUrl) {
+      issues.push({
+        field: `providers.${providerId}.extra.account_id`,
+        message:
+          'Cloudflare 嵌入需要账号 ID（extra.account_id，对应环境变量 LING_EMBEDDING_ACCOUNT_ID），或直接给出完整 API 地址',
+      });
+    } else if (baseUrl && !validUrl) {
+      issues.push({
+        field: `providers.${providerId}.base_url`,
+        message: 'API 地址必须以 http:// 或 https:// 开头',
+      });
+    }
+  }
+
+  return issues;
+}
+
 export function toProviderDraft(view: ProviderView | ProviderDraftInput): ProviderDraftInput {
   return {
     provider_id: view.provider_id,
@@ -111,6 +302,7 @@ export function toProviderDraft(view: ProviderView | ProviderDraftInput): Provid
     base_url: view.base_url,
     enabled: view.enabled,
     extra: 'extra' in view ? view.extra : undefined,
+    capabilities: 'capabilities' in view ? view.capabilities : undefined,
     models: ('models' in view ? view.models ?? [] : []).map((model) => ({ ...model })),
     timeout_seconds: view.timeout_seconds ?? 60,
     max_output_tokens: view.max_output_tokens ?? null,
@@ -217,12 +409,35 @@ export function modelsEqual(
   });
 }
 
+/**
+ * `extra` 的稳定比较：键顺序不该影响"有没有改"。
+ *
+ * Cloudflare 的 `account_id` 就存在这里；漏掉这一项会让「保存」一直是灰的，
+ * 用户填了账号 ID 却按不下去（或者按下去也没带上）。
+ */
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
+}
+
+export function extraEquals(
+  left: Record<string, unknown> | undefined,
+  right: Record<string, unknown> | undefined,
+): boolean {
+  return stableJson(left ?? {}) === stableJson(right ?? {});
+}
+
 export function providerEquals(a: ProviderDraftInput, b: ProviderDraftInput): boolean {
   return (
     a.provider_id === b.provider_id &&
     a.kind === b.kind &&
     (a.base_url ?? '') === (b.base_url ?? '') &&
     a.enabled === b.enabled &&
+    extraEquals(a.extra, b.extra) &&
     modelsEqual(a.models, b.models) &&
     a.timeout_seconds === b.timeout_seconds &&
     (a.max_output_tokens ?? null) === (b.max_output_tokens ?? null) &&
@@ -340,6 +555,26 @@ export function RoleIcon({ role, size = 16 }: { role: string; size?: number }) {
       <svg {...common}>
         <path d="M6.5 3.5h7v13h-7z" />
         <path d="M8.5 7h3M8.5 10h3M8.5 13h2" />
+      </svg>
+    );
+  }
+  if (role === 'memory.embed') {
+    // 一串点连成向量：和「记忆提炼」的文档图标分开。
+    return (
+      <svg {...common}>
+        <circle cx="4" cy="10" r="1.3" />
+        <circle cx="10" cy="5.5" r="1.3" />
+        <circle cx="10" cy="14.5" r="1.3" />
+        <circle cx="16" cy="10" r="1.3" />
+        <path d="M5.1 9.3l3.8-2.9M5.1 10.7l3.8 2.9M11.1 6.4l3.8 2.9M11.1 13.6l3.8-2.9" />
+      </svg>
+    );
+  }
+  if (role === 'memory.rerank') {
+    return (
+      <svg {...common}>
+        <path d="M3.5 5.5h8M3.5 10h6M3.5 14.5h4" />
+        <path d="M13.5 13.5V6.5M11.5 8.5l2-2 2 2" />
       </svg>
     );
   }

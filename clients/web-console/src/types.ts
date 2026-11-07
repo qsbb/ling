@@ -350,10 +350,27 @@ export interface SettingsConfig {
    * 改草稿时用 `POST /settings/resolve` 拿同一份结论，不要在浏览器里重算。
    */
   profile_resolutions: ProfileResolution[];
+  /**
+   * 每个职责**需要哪种能力**（chat / embed / rerank …）。
+   * 绑定下拉据此过滤：`profile_capabilities[role]` 必须出现在供应商的
+   * `capabilities` 里。**服务端是唯一真源**，前端不自己维护 kind → 能力表。
+   */
+  profile_capabilities?: Record<string, string | null>;
+  /**
+   * 嵌入/重排当前的能力来源：`binding`（网页绑定）/ `env`（环境变量）/
+   * `null`（都没有 = 该能力实际关闭）。
+   *
+   * 为什么不能只看"有没有绑定"：老部署用的是 `LING_EMBEDDING_*` /
+   * `LING_RERANK_*`，把 env 配好的部署报成"没配"，用户会去乱改。
+   */
+  memory_sources?: Record<string, MemorySource>;
   reserved_profiles?: Record<string, string>;
   /** 未绑定职责 → 具体会失去什么。系统不报错，只会静默降级。 */
   unbound_degradations?: Record<string, string>;
 }
+
+/** 记忆类能力（嵌入/重排）当前由什么提供。`null` = 两处都没配。 */
+export type MemorySource = 'binding' | 'env' | null;
 
 export interface DraftResponse {
   revision: number;
@@ -464,6 +481,14 @@ export interface ProviderDraftInput {
   base_url: string | null;
   enabled: boolean;
   extra?: Record<string, unknown>;
+  /**
+   * 这家**能服务哪些能力**。只读，来自 `/settings/config`。
+   *
+   * 草稿里改了 kind 时会丢掉（服务端上次说的能力对新类型不成立），
+   * 保存后重新读回。`undefined` = 还不确定，界面按"失败关闭"处理：
+   * 新供应商要保存一次才会出现在职责/槽位的下拉里。
+   */
+  capabilities?: string[];
   /** 不传 = 不改动服务端已有清单；新建供应商时传 []。 */
   models?: ProviderModel[];
   timeout_seconds: number;

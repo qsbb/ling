@@ -24,6 +24,7 @@
 
 import { useMemo, useState } from 'react';
 import type {
+  MemorySource,
   ModelHealthResponse,
   ProfileDraftInput,
   ProfileResolution,
@@ -38,8 +39,12 @@ import {
   EXTRA_ROLES,
   PRIMARY_ROLES,
   RoleIcon,
+  bindingCapabilityMismatch,
+  capabilityLabel,
   effectiveNote,
   kindLabel,
+  providersForChatSlot,
+  providersForProfile,
   roleLabel,
   rowStateOf,
   slotLabel,
@@ -104,6 +109,8 @@ const STATE_LABEL: Record<string, string> = {
   fell_back: '已回退',
   legacy: '旧版兼容',
   unavailable: '不可用',
+  // 不是"没配"：环境变量正在提供这项能力，只是不在网页绑定里。
+  env: '环境变量',
 };
 
 /* ------------------------------------------------------------------ 槽位 */
@@ -123,15 +130,18 @@ function SlotCard({
 }) {
   const providerId = slotDraft?.provider_id ?? view.provider_id;
   const modelId = slotDraft?.model_id ?? view.model_id;
-  // 默认槽位只收对话供应商：嵌入/重排填进来，发布能成功、调用必失败。
-  const chatProviders = providers.filter(
-    (provider) => provider.enabled || provider.provider_id === providerId,
-  );
+  // 默认槽位只收**对话**供应商：嵌入/重排填进来，发布能成功、调用必失败。
+  // 能力来自服务端（`capabilities`）；当前已绑的那家即使不匹配也留着，
+  // 由下面的警告说明，不在下拉里悄悄消失。
+  const chatProviders = providersForChatSlot(providers, providerId);
   const provider = providers.find((item) => item.provider_id === providerId);
   const models = (provider?.models ?? []).filter(
     (model) => model.enabled || model.model_id === modelId,
   );
   const roles = view.roles.map(roleLabel);
+  // 历史槽位可能存着嵌入/重排供应商：后端发布校验目前只管绑定，不管槽位，
+  // 所以界面必须自己说出来。
+  const providerMismatch = bindingCapabilityMismatch(provider, 'chat');
 
   return (
     <div className={`ms-slot${providerId ? ' ms-slot--set' : ''}`}>
@@ -189,6 +199,12 @@ function SlotCard({
           )}
         </div>
       )}
+      {providerMismatch ? (
+        <span className="ms-slot__warn" role="status">
+          <AlertIcon size={12} />
+          这家不提供对话能力，填进默认槽位会发布成功、调用必失败；换一家对话供应商。
+        </span>
+      ) : null}
       <div className="ms-slot__foot">
         {roles.length > 0 ? (
           <span>{roles.join(' / ')} 跟着它</span>
@@ -209,6 +225,8 @@ function RoleRow({
   providers,
   slots,
   health,
+  requiredCapability,
+  memorySource,
   onPatch,
 }: {
   meta: RoleMeta;
@@ -217,19 +235,44 @@ function RoleRow({
   providers: ProviderDraftInput[];
   slots: SlotView[];
   health: ModelHealthResponse | null;
+  /** 服务端 `profile_capabilities[role]`。null = 这个角色不受能力约束。 */
+  requiredCapability: string | null;
+  /** 服务端 `memory_sources[role]`；undefined = 这个角色不报来源。 */
+  memorySource: MemorySource | undefined;
   onPatch: (patch: Partial<ProfileDraftInput>) => void;
 }) {
-  const state = rowStateOf(resolution);
+  const draftExplicit =
+    profile?.mode === 'explicit' && Boolean(profile.provider_id);
+  // 环境变量提供的记忆能力没有绑定，`profile_resolutions` 会说「不可用」。
+  // 那是真的（网页绑定确实没有），但能力本身是开着的——不能把这两件事
+  // 混成一个红字，否则用户会去"修"一个正在工作的配置。
+  const envSourced = memorySource === 'env' && !draftExplicit;
+  const state = envSourced ? 'env' : rowStateOf(resolution);
+  // 嵌入/重排没有默认槽位，下拉里不该出现「跟随默认」：选了它也解析不出
+  // 模型。服务端的 `slot: null` 是唯一判据（不要在前端按角色名硬编码）。
+  const followAllowed = resolution === undefined || resolution.slot !== null;
   // 还没拿到服务端结论时不要编一个槽位名出来：`跟随默认 · 默认` 读起来像
   // 真有这么个槽位。宁可只写「跟随默认」。
   const followLabel = resolution?.slot
     ? `跟随默认 · ${slotLabel(slots, resolution.slot)}`
     : '跟随默认';
+  const unboundLabel = memorySource === 'env' ? '未绑定 · 使用环境变量' : '未绑定';
   // 停用的供应商/模型也要留在下拉里：旧绑定可能正指着它们，藏起来会让
   // 用户以为"没选"，然后重选一个自己其实想留着的东西。
-  const providerOptions = providers.filter(
+  const selectable = providers.filter(
     (item) => item.enabled || item.provider_id === profile?.provider_id,
   );
+  // 能力过滤：只列具备该能力的供应商。**当前已绑的那家始终保留**，
+  // 历史错配由下面的警告说明——从列表里消失会让人以为从来没绑过。
+  const providerOptions = providersForProfile(
+    selectable,
+    requiredCapability,
+    profile?.provider_id,
+  );
+  const boundProvider = providers.find((item) => item.provider_id === profile?.provider_id);
+  const providerMismatch =
+    Boolean(profile?.mode === 'explicit' && profile.provider_id) &&
+    bindingCapabilityMismatch(boundProvider, requiredCapability);
   const effective = resolution?.effective ?? null;
   // 熔断/延迟按 `provider/model` 记在服务端。**只显示，不推断**：它是"上次
   // 真的调了"的证据，不是配置判断——所以不参与「可用/不可用」的结论。
@@ -257,8 +300,8 @@ function RoleRow({
           onChange={(event) => {
             const picked = parseRoleSelectValue(event.target.value);
             if (!picked) {
-              // 「跟随默认」：把单独指定清掉。留着旧值会让"跟随"看起来
-              // 还在用那个模型（服务端也会清，这里同步是为了草稿诚实）。
+              // 「跟随默认 / 未绑定」：把单独指定清掉。留着旧值会让"跟随"
+              // 看起来还在用那个模型（服务端也会清，这里同步是为了草稿诚实）。
               onPatch({ mode: 'slot', provider_id: '', model_id: '' });
               return;
             }
@@ -269,7 +312,7 @@ function RoleRow({
             });
           }}
         >
-          <option value={FOLLOW_SLOT}>{followLabel}</option>
+          <option value={FOLLOW_SLOT}>{followAllowed ? followLabel : unboundLabel}</option>
           {providerOptions.map((provider) => (
             <optgroup
               key={provider.provider_id}
@@ -294,9 +337,24 @@ function RoleRow({
 
       <span className="ms-role-row__effective">
         <span className="ms-role-row__effective-head">实际生效</span>
-        {effective ? (
+        {envSourced ? (
           <span className="ms-role-row__effective-model">
-            {state === 'unavailable' ? <AlertIcon size={12} /> : <CheckIcon size={12} />}
+            <CheckIcon size={12} />
+            环境变量
+          </span>
+        ) : effective ? (
+          <span
+            className={`ms-role-row__effective-model${
+              state === 'unavailable' || providerMismatch
+                ? ' ms-role-row__effective-model--bad'
+                : ''
+            }`}
+          >
+            {state === 'unavailable' || providerMismatch ? (
+              <AlertIcon size={12} />
+            ) : (
+              <CheckIcon size={12} />
+            )}
             {effective.model_id}
           </span>
         ) : (
@@ -305,7 +363,17 @@ function RoleRow({
             不可用
           </span>
         )}
-        <span className="ms-role-row__effective-note">{effectiveNote(resolution, slots)}</span>
+        {envSourced ? (
+          <span className="ms-role-row__effective-note">
+            正在用环境变量里配的模型；具体模型名不在网页配置里
+          </span>
+        ) : providerMismatch ? (
+          <span className="ms-role-row__effective-note ms-role-row__effective-note--bad">
+            你单独选的，但这家不具备这个职责需要的能力
+          </span>
+        ) : (
+          <span className="ms-role-row__effective-note">{effectiveNote(resolution, slots)}</span>
+        )}
         {record?.open ? (
           <span className="ms-role-row__effective-note ms-role-row__effective-note--bad">
             连续失败，已暂时熔断
@@ -339,8 +407,45 @@ function RoleRow({
           </button>
         )}
       </span>
+
+      {providerMismatch ? (
+        <span className="ms-role-row__warn" role="status">
+          <AlertIcon size={12} />
+          <span>
+            已绑的 {boundProvider?.provider_id ?? profile?.provider_id} 只提供「
+            {knownCapabilityText(boundProvider)}」，这个职责需要「
+            {capabilityLabel(requiredCapability ?? '')}」；发布会被服务端拦下，
+            换一家具备该能力的供应商。
+          </span>
+        </span>
+      ) : null}
+
+      {memorySource !== undefined && (memorySource === 'binding' || !draftExplicit) ? (
+        <span
+          className={`ms-role-row__source ms-role-row__source--${
+            memorySource === 'binding' ? 'binding' : memorySource === 'env' ? 'env' : 'none'
+          }`}
+          role="status"
+        >
+          <span className="ms-role-row__source-label">配置来源</span>
+          {memorySource === 'binding' ? (
+            <span>来自网页绑定</span>
+          ) : memorySource === 'env' ? (
+            <span>来自环境变量，改成网页绑定后环境变量不再生效。</span>
+          ) : (
+            <span>没有配置：这项能力现在是关的。</span>
+          )}
+        </span>
+      ) : null}
     </div>
   );
+}
+
+/** 供应商已知能力 → 人话；未知时直接说"能力未确认"。 */
+function knownCapabilityText(provider: ProviderDraftInput | undefined): string {
+  const capabilities = provider?.capabilities;
+  if (!capabilities) return '能力未确认';
+  return capabilities.map(capabilityLabel).join('/');
 }
 
 /* ------------------------------------------------------------- 快速配置 */
@@ -441,7 +546,13 @@ function QuickConfigDialog({
 const GROUPS: { title: string; note: string; keys: string[] }[] = [
   { title: '对话', note: '2 个 · 主回复链', keys: ['dialogue.fast', 'dialogue.group'] },
   { title: '感知', note: '1 个 · 只在发图时触发', keys: ['perception.vision'] },
-  { title: '记忆', note: '1 个 · 每轮结束异步跑', keys: ['memory.extract'] },
+  // 嵌入/重排不是对话协议，也没有默认槽位：它们只在这里显式绑定，
+  // 或者由环境变量提供（来源写在每一行下方）。
+  {
+    title: '记忆',
+    note: '3 个 · 提炼与检索',
+    keys: ['memory.extract', 'memory.embed', 'memory.rerank'],
+  },
 ];
 
 export function RolesPanel({
@@ -481,17 +592,32 @@ export function RolesPanel({
   );
   // 只渲染服务端说"可绑"的角色：界面上多一行绑了没用的，比少一行更糟。
   const offerable = useMemo(() => new Set(config.known_profiles ?? []), [config.known_profiles]);
+  const profileCapabilities = config.profile_capabilities ?? {};
+  const memorySources = useMemo(
+    () => config.memory_sources ?? {},
+    [config.memory_sources],
+  );
 
   const counts = useMemo(() => {
-    const result = { explicit: 0, inherit: 0, fellBack: 0, unavailable: 0 };
+    const result = { explicit: 0, inherit: 0, fellBack: 0, unavailable: 0, env: 0 };
     for (const resolution of resolutions) {
-      if (resolution.source === 'explicit') result.explicit += 1;
-      else if (resolution.source === 'unavailable') result.unavailable += 1;
-      else if (resolution.fell_back) result.fellBack += 1;
-      else result.inherit += 1;
+      // 环境变量提供的记忆能力没有绑定：`profile_resolutions` 会报不可用，
+      // 但能力其实是开着的。把它从「不可用」里拿出来单列，否则标题会对着
+      // 一个正常部署说"2 个不可用"。
+      if (memorySources[resolution.profile] === 'env') {
+        result.env += 1;
+      } else if (resolution.source === 'explicit') {
+        result.explicit += 1;
+      } else if (resolution.source === 'unavailable') {
+        result.unavailable += 1;
+      } else if (resolution.fell_back) {
+        result.fellBack += 1;
+      } else {
+        result.inherit += 1;
+      }
     }
     return result;
-  }, [resolutions]);
+  }, [resolutions, memorySources]);
 
   return (
     <section className="ms-roles" aria-label="模型与生成">
@@ -518,6 +644,12 @@ export function RolesPanel({
               <>
                 <span>·</span>
                 <span className="ms-roles__counts--danger">{counts.unavailable} 个不可用</span>
+              </>
+            ) : null}
+            {counts.env > 0 ? (
+              <>
+                <span>·</span>
+                <span className="ms-roles__counts--env">{counts.env} 个来自环境变量</span>
               </>
             ) : null}
           </p>
@@ -576,6 +708,14 @@ export function RolesPanel({
                     providers={providers}
                     slots={slotViews}
                     health={health}
+                    requiredCapability={profileCapabilities[key] ?? null}
+                    memorySource={
+                      // `hasOwnProperty` 而不是 `?? null`：键存在且值为 null
+                      // 表示"两处都没配"，与"服务端没报这个角色"是两回事。
+                      Object.prototype.hasOwnProperty.call(memorySources, key)
+                        ? memorySources[key]
+                        : undefined
+                    }
                     onPatch={(patch) => onPatchProfile(key, patch)}
                   />
                 );

@@ -20,11 +20,15 @@ import type {
 import { AlertIcon, CheckIcon, PlusIcon, RefreshIcon } from '../Icons';
 import {
   MsSwitch,
+  PROVIDER_KIND_OPTIONS,
   StatusDot,
+  capabilityLabel,
   formatAgo,
   hostOf,
+  kindLabel,
   providerEquals,
   providerGlyph,
+  providerShapeIssues,
   roleShort,
   rolesForModel,
   toProviderDraft,
@@ -114,6 +118,23 @@ function newModelError(models: ProviderModel[], modelId: string): string {
   return '';
 }
 
+/** API 地址输入框的占位提示：三种协议写法不一样，别让人对着一个空框猜。 */
+function baseUrlPlaceholder(kind: string): string {
+  if (kind === 'fake') return '内置供应商不需要地址';
+  if (kind === 'cloudflare_embedding') {
+    return '可留空（用账号 ID 拼官方端点），或填完整地址';
+  }
+  if (kind === 'siliconflow_rerank') return 'https://api.siliconflow.cn/v1';
+  return 'https://…/v1';
+}
+
+/** 模型 ID 的例子按能力分开：嵌入/重排的模型名和 chat 完全不同。 */
+function modelIdPlaceholder(kind: string): string {
+  if (kind === 'cloudflare_embedding') return '模型 ID，例如 @cf/baai/bge-m3';
+  if (kind === 'siliconflow_rerank') return '模型 ID，例如 BAAI/bge-reranker-v2-m3';
+  return '模型 ID，例如 gpt-4o-mini';
+}
+
 export function ProvidersPanel({
   config,
   providers,
@@ -139,6 +160,10 @@ export function ProvidersPanel({
     provider_id: '',
     kind: 'openai_compatible',
     base_url: '',
+    // Cloudflare 的账号 ID 存在 `extra.account_id`（对应
+    // `LING_EMBEDDING_ACCOUNT_ID`）。放这里而不是顶层字段，是因为它是
+    // 供应商的私有连接参数，服务端 `ProviderIn.extra` 已经能收。
+    account_id: '',
   });
   const [newProviderError, setNewProviderError] = useState('');
   const [addingModel, setAddingModel] = useState(false);
@@ -172,6 +197,57 @@ export function ProvidersPanel({
     const known = new Set((selected?.models ?? []).map((model) => model.model_id));
     return probe.models.filter((modelId) => !known.has(modelId)).slice(0, 8);
   }, [probe, selected]);
+
+  // 类型下拉以**服务端**的 `known_kinds` 为准：后端不认识的类型不该出现在
+  // 这里，后端新加的类型则不用等前端发版。标签仍然来自前端的共用表，
+  // 认不出来时 `kindLabel` 会原样显示 kind。
+  const selectedKind = selected?.kind;
+  const kindOptions = useMemo<{ value: string; label: string }[]>(() => {
+    const known = new Set(config.known_kinds ?? []);
+    // 服务端没报（旧后端 / 测试夹具）时不把下拉清空：那是比"少一个过滤"更糟的
+    // 失败——用户连类型都选不了。
+    const options: { value: string; label: string }[] = (
+      known.size > 0
+        ? PROVIDER_KIND_OPTIONS.filter((option) => known.has(option.value))
+        : [...PROVIDER_KIND_OPTIONS]
+    ).map((option) => ({ value: option.value, label: option.label }));
+    // 当前这家的 kind 不在清单里（服务端更新前后短暂不一致）时也要能显示，
+    // 否则 `<select>` 会退化成空白，用户以为类型丢了。
+    if (selectedKind && !options.some((option) => option.value === selectedKind)) {
+      options.push({ value: selectedKind, label: kindLabel(selectedKind) });
+    }
+    return options;
+  }, [config.known_kinds, selectedKind]);
+
+  // 「还差什么」只是提前提示：条件与后端一致，但**不阻止**保存草稿。
+  // 发布时后端仍会再判一次（它是唯一真相）。
+  const shapeIssues = selected ? providerShapeIssues(selected) : [];
+  const newProviderIssues = providerShapeIssues({
+    provider_id: newProvider.provider_id,
+    kind: newProvider.kind,
+    base_url: newProvider.base_url,
+    extra: newProvider.account_id.trim()
+      ? { account_id: newProvider.account_id.trim() }
+      : {},
+  });
+
+  const accountIdOf = (provider: ProviderDraftInput): string => {
+    const value = provider.extra?.account_id;
+    return typeof value === 'string' ? value : '';
+  };
+
+  const patchAccountId = (provider: ProviderDraftInput, value: string) => {
+    const extra = { ...(provider.extra ?? {}) };
+    if (value.trim()) extra.account_id = value;
+    else delete extra.account_id;
+    onPatch(provider.provider_id, { extra });
+  };
+
+  // 嵌入/重排没有 `/chat/completions` 形状的端点，`ModelRouter.probe` 对它们
+  // 只会报"不是对话供应商"。按钮不该长得像能用。
+  const probeUnsupported = Boolean(
+    selected?.capabilities && !selected.capabilities.includes('chat'),
+  );
 
   const patchModels = (models: ProviderModel[]) => {
     if (!selected) return;
@@ -220,6 +296,9 @@ export function ProvidersPanel({
       kind: newProvider.kind,
       base_url: newProvider.base_url.trim() || null,
       enabled: false,
+      extra: newProvider.account_id.trim()
+        ? { account_id: newProvider.account_id.trim() }
+        : {},
       models: [],
       // 新供应商的默认值：60 秒超时、200k 输出上限、200k 日额度。
       // 后两项是**具体数字**而不是"不限制"：一个默认敞开的上限等于没有上限，
@@ -228,7 +307,12 @@ export function ProvidersPanel({
       max_output_tokens: 200000,
       daily_token_limit: 200000,
     });
-    setNewProvider({ provider_id: '', kind: 'openai_compatible', base_url: '' });
+    setNewProvider({
+      provider_id: '',
+      kind: 'openai_compatible',
+      base_url: '',
+      account_id: '',
+    });
     setNewProviderError('');
     setNewProviderOpen(false);
   };
@@ -291,7 +375,9 @@ export function ProvidersPanel({
   };
 
   const saved = selected ? config.providers.find((p) => p.provider_id === selected.provider_id) : null;
-  const canProbe = Boolean(selected && persisted.has(selected.provider_id) && !isDirty);
+  const canProbe = Boolean(
+    selected && persisted.has(selected.provider_id) && !isDirty && !probeUnsupported,
+  );
   const probeTone = probe ? (probe.ok ? 'ok' : 'danger') : 'idle';
   const roleCount = selected
     ? (selected.models ?? []).reduce(
@@ -331,7 +417,13 @@ export function ProvidersPanel({
                   <span className="ms-rail-item__main">
                     <span className="ms-rail-item__name">{provider.provider_id}</span>
                     <span className="ms-rail-item__meta">
-                      {provider.kind === 'fake' ? '本地测试' : hostOf(provider.base_url)}
+                      {provider.kind === 'fake'
+                        ? '本地测试'
+                        : provider.capabilities && !provider.capabilities.includes('chat')
+                          ? // 嵌入/重排可能只填账号 ID、没有 base_url，
+                            // 显示"未填写地址"会让人以为没配好。
+                            kindLabel(provider.kind)
+                          : hostOf(provider.base_url)}
                     </span>
                   </span>
                   <span
@@ -372,9 +464,11 @@ export function ProvidersPanel({
                     setNewProvider((current) => ({ ...current, kind: event.target.value }))
                   }
                 >
-                  <option value="openai_compatible">OpenAI 兼容</option>
-                  <option value="local">本地服务</option>
-                  <option value="fake">本地测试</option>
+                  {kindOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label className="ms-field">
@@ -382,12 +476,37 @@ export function ProvidersPanel({
                 <input
                   className="ms-input"
                   value={newProvider.base_url}
-                  placeholder="https://…/v1"
+                  placeholder={baseUrlPlaceholder(newProvider.kind)}
                   onChange={(event) =>
                     setNewProvider((current) => ({ ...current, base_url: event.target.value }))
                   }
                 />
               </label>
+              {newProvider.kind === 'cloudflare_embedding' ? (
+                <label className="ms-field">
+                  <span className="ms-field__label">账号 ID（Account ID）</span>
+                  <input
+                    className="ms-input ms-input--mono"
+                    value={newProvider.account_id}
+                    placeholder="例如 023e105f4ecef8ad9ca31a8372d0c353"
+                    onChange={(event) =>
+                      setNewProvider((current) => ({
+                        ...current,
+                        account_id: event.target.value,
+                      }))
+                    }
+                  />
+                  <span className="ms-hint">
+                    写到供应商的 extra.account_id（对应环境变量
+                    LING_EMBEDDING_ACCOUNT_ID）。填了它就可以不填 API 地址。
+                  </span>
+                </label>
+              ) : null}
+              {newProviderIssues.length > 0 ? (
+                <p className="ms-hint ms-hint--warn">
+                  发布前还差：{newProviderIssues.map((issue) => issue.message).join('；')}
+                </p>
+              ) : null}
               {newProviderError ? (
                 <p className="ms-error-text" role="alert">
                   {newProviderError}
@@ -427,6 +546,9 @@ export function ProvidersPanel({
                   </h2>
                   <p className="ms-provider-meta">
                     {(selected.models ?? []).length} 个模型
+                    {selected.capabilities && selected.capabilities.length > 0
+                      ? ` · 提供 ${selected.capabilities.map(capabilityLabel).join(' / ')}`
+                      : ''}
                     {roleCount > 0 ? ` · ${roleCount} 个职责在用` : ''}
                     {probe?.checked_at ? ` · 上次检查 ${formatAgo(probe.checked_at)}` : ''}
                   </p>
@@ -446,11 +568,13 @@ export function ProvidersPanel({
                   className="ms-btn"
                   disabled={!canProbe || probeBusy}
                   title={
-                    !persisted.has(selected.provider_id)
-                      ? '先保存这家供应商，才能测试连接'
-                      : isDirty
-                        ? '先保存改动，测试的才是你正在编辑的配置'
-                        : '测试已保存的配置'
+                    probeUnsupported
+                      ? '嵌入 / 重排供应商没有对话端点，不经过模型路由，不能测试连接'
+                      : !persisted.has(selected.provider_id)
+                        ? '先保存这家供应商，才能测试连接'
+                        : isDirty
+                          ? '先保存改动，测试的才是你正在编辑的配置'
+                          : '测试已保存的配置'
                   }
                   onClick={() => void runProbe()}
                 >
@@ -513,24 +637,58 @@ export function ProvidersPanel({
                     onPatch(selected.provider_id, { kind: event.target.value })
                   }
                 >
-                  <option value="openai_compatible">OpenAI 兼容</option>
-                  <option value="local">本地服务</option>
-                  <option value="fake">本地测试</option>
+                  {kindOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label className="ms-field ms-field--wide">
-                <span className="ms-field__label">API 地址</span>
+                <span className="ms-field__label">
+                  API 地址{selected.kind === 'cloudflare_embedding' ? '（可留空）' : ''}
+                </span>
                 <input
                   className="ms-input ms-input--mono"
                   value={selected.base_url ?? ''}
-                  placeholder={selected.kind === 'fake' ? '内置供应商不需要地址' : 'https://…/v1'}
+                  placeholder={baseUrlPlaceholder(selected.kind)}
                   disabled={selected.kind === 'fake'}
                   onChange={(event) =>
                     onPatch(selected.provider_id, { base_url: event.target.value || null })
                   }
                 />
               </label>
+              {selected.kind === 'cloudflare_embedding' ? (
+                <label className="ms-field ms-field--wide">
+                  <span className="ms-field__label">账号 ID（Account ID）</span>
+                  <input
+                    className="ms-input ms-input--mono"
+                    value={accountIdOf(selected)}
+                    placeholder="例如 023e105f4ecef8ad9ca31a8372d0c353"
+                    onChange={(event) => patchAccountId(selected, event.target.value)}
+                  />
+                  <span className="ms-hint">
+                    写到供应商的 extra.account_id（对应环境变量
+                    LING_EMBEDDING_ACCOUNT_ID）。填了它就可以不填 API 地址；两样都给也合法。
+                  </span>
+                </label>
+              ) : null}
             </div>
+
+            {shapeIssues.length > 0 ? (
+              <div className="ms-shape" role="status">
+                <AlertIcon size={13} />
+                <span>
+                  发布前还差：{shapeIssues.map((issue) => issue.message).join('；')}
+                  （可以先保存草稿，发布时服务端会再判一次）
+                </span>
+              </div>
+            ) : null}
+            {selected.capabilities === undefined ? (
+              <p className="ms-hint ms-hint--warn">
+                这家供应商的能力还没被服务端确认（新建或刚改过类型）。保存一次后，它才会出现在职责与默认槽位的下拉里。
+              </p>
+            ) : null}
 
             <div className="ms-secret">
               <span className="ms-field__label">密钥</span>
@@ -621,7 +779,9 @@ export function ProvidersPanel({
                   <div className="ms-empty ms-empty--models">
                     <p>还没有模型清单。</p>
                     <p className="ms-muted">
-                      手动添加，或保存后点「测试连接」让服务端把 /models 里返回的模型带回来。
+                      {probeUnsupported
+                        ? '嵌入 / 重排供应商没有 /models 端点，请手动添加模型 ID。'
+                        : '手动添加，或保存后点「测试连接」让服务端把 /models 里返回的模型带回来。'}
                     </p>
                   </div>
                 ) : null}
@@ -674,7 +834,7 @@ export function ProvidersPanel({
                     className="ms-input"
                     autoFocus
                     value={newModel.model_id}
-                    placeholder="模型 ID，例如 gpt-4o-mini"
+                    placeholder={modelIdPlaceholder(selected.kind)}
                     aria-label="新模型 ID"
                     onChange={(event) =>
                       setNewModel((current) => ({ ...current, model_id: event.target.value }))
@@ -744,7 +904,9 @@ export function ProvidersPanel({
 
               {(selected.models ?? []).length > 0 && roleCount === 0 ? (
                 <p className="ms-hint">
-                  这一家的模型还没有职责在用。去「职责绑定」把日常、深度或看图片指过来，它才会真的接活。
+                  {probeUnsupported
+                    ? '这一家的模型还没有职责在用。去「职责绑定」把嵌入或重排指过来，它才会真的接活。'
+                    : '这一家的模型还没有职责在用。去「职责绑定」把日常、群聊、看图或记忆指过来，它才会真的接活。'}
                 </p>
               ) : null}
             </div>

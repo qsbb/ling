@@ -22,7 +22,17 @@ import {
   parseRoleSelectValue,
   roleSelectValue,
 } from './components/model-settings/RolesPanel';
-import { effectiveNote, profileEquals, rowStateOf } from './components/model-settings/shared';
+import { ProvidersPanel } from './components/model-settings/ProvidersPanel';
+import {
+  effectiveNote,
+  kindLabel,
+  profileEquals,
+  providerEquals,
+  providerShapeIssues,
+  providersForChatSlot,
+  providersForProfile,
+  rowStateOf,
+} from './components/model-settings/shared';
 import type {
   ProfileDraftInput,
   ProfileResolution,
@@ -37,12 +47,47 @@ const PROVIDERS: ProviderDraftInput[] = [
   {
     provider_id: 'main',
     kind: 'openai_compatible',
+    capabilities: ['chat'],
     base_url: 'https://192.0.2.10/v1',
     enabled: true,
     models: [
       { model_id: 'm-fast', note: '', enabled: true },
       { model_id: 'm-big', note: '', enabled: true },
     ],
+    timeout_seconds: 60,
+    max_output_tokens: null,
+    daily_token_limit: null,
+  },
+];
+
+/**
+ * 一家对话 + 一家嵌入 + 一家重排。
+ *
+ * `capabilities` 是**服务端**给的，测试里原样带上：界面的过滤只认这个字段，
+ * 不认 kind。三家的集合故意两两不相交，任何"没按能力过滤"的实现都会在
+ * 下拉里多出一家。
+ */
+const MEMORY_PROVIDERS: ProviderDraftInput[] = [
+  ...PROVIDERS,
+  {
+    provider_id: 'cf',
+    kind: 'cloudflare_embedding',
+    capabilities: ['embed'],
+    base_url: null,
+    enabled: true,
+    extra: { account_id: 'acc-123' },
+    models: [{ model_id: '@cf/baai/bge-m3', note: '', enabled: true }],
+    timeout_seconds: 60,
+    max_output_tokens: null,
+    daily_token_limit: null,
+  },
+  {
+    provider_id: 'sf',
+    kind: 'siliconflow_rerank',
+    capabilities: ['rerank'],
+    base_url: 'https://api.siliconflow.cn/v1',
+    enabled: true,
+    models: [{ model_id: 'BAAI/bge-reranker-v2-m3', note: '', enabled: true }],
     timeout_seconds: 60,
     max_output_tokens: null,
     daily_token_limit: null,
@@ -159,8 +204,42 @@ const CONFIG: SettingsConfig = {
   known_kinds: ['openai_compatible'],
   // 故意不含 memory.extract：那条由「记忆」组的过滤逻辑决定渲不渲染。
   known_profiles: ['dialogue.fast', 'dialogue.group', 'perception.vision'],
+  profile_capabilities: {
+    'dialogue.fast': 'chat',
+    'dialogue.group': 'chat',
+    'perception.vision': 'chat',
+    'memory.extract': 'chat',
+  },
+  memory_sources: {},
   slots: SLOTS,
   profile_resolutions: [],
+};
+
+/**
+ * 可绑六条职责的配置：用来验证嵌入/重排的能力过滤与来源展示。
+ *
+ * `known_profiles` 仍由服务端决定；这里照抄 `/settings/config` 在
+ * 6ba679b 之后的形状。
+ */
+const CAPABILITY_CONFIG: SettingsConfig = {
+  ...CONFIG,
+  known_profiles: [
+    'dialogue.fast',
+    'dialogue.group',
+    'perception.vision',
+    'memory.extract',
+    'memory.embed',
+    'memory.rerank',
+  ],
+  profile_capabilities: {
+    ...CONFIG.profile_capabilities,
+    'memory.embed': 'embed',
+    'memory.rerank': 'rerank',
+  },
+  memory_sources: {
+    'memory.embed': null,
+    'memory.rerank': null,
+  },
 };
 
 const NOOP = () => undefined;
@@ -170,11 +249,12 @@ function render(overrides: {
   resolutions?: ProfileResolution[];
   quickConfig?: QuickConfigPreview | null;
   config?: SettingsConfig;
+  providers?: ProviderDraftInput[];
 } = {}): string {
   return renderToStaticMarkup(
     <RolesPanel
       config={overrides.config ?? CONFIG}
-      providers={PROVIDERS}
+      providers={overrides.providers ?? PROVIDERS}
       profiles={overrides.profiles ?? []}
       slots={SLOT_DRAFTS}
       resolutions={overrides.resolutions ?? []}
@@ -191,6 +271,38 @@ function render(overrides: {
       onRequestQuickConfig={NOOP}
       onCloseQuickConfig={NOOP}
       onApplyQuickConfig={NOOP}
+    />,
+  );
+}
+
+/** 「供应商」视图的渲染夹具：只关心当前这一家的表单。 */
+function renderProvider(provider: ProviderDraftInput, knownKinds: string[] = []): string {
+  return renderToStaticMarkup(
+    <ProvidersPanel
+      config={{
+        ...CONFIG,
+        known_kinds:
+          knownKinds.length > 0
+            ? knownKinds
+            : ['openai_compatible', 'cloudflare_embedding', 'siliconflow_rerank', 'local', 'fake'],
+      }}
+      providers={[provider]}
+      resolutions={[]}
+      selectedId={provider.provider_id}
+      saving={false}
+      dirtyCount={1}
+      onSelect={NOOP}
+      onPatch={NOOP}
+      onAddProvider={NOOP}
+      onDiscard={NOOP}
+      onSave={NOOP}
+      onSecretsChanged={NOOP}
+      onShowHistory={NOOP}
+      testMode={false}
+      logDenials={true}
+      onTestMode={NOOP}
+      onLogDenials={NOOP}
+      usage={{}}
     />,
   );
 }
@@ -460,6 +572,261 @@ describe('草稿比较', () => {
   it('完全相同则是没改', () => {
     const a = profile({ profile: 'dialogue.fast', mode: 'explicit', provider_id: 'main', model_id: 'm' });
     expect(profileEquals(a, { ...a })).toBe(true);
+  });
+
+  it('extra 里的账号 ID 也算改动，否则 Cloudflare 的表单保存不了', () => {
+    const base = PROVIDERS[0]!;
+    expect(providerEquals(base, { ...base, extra: { account_id: 'acc-123' } })).toBe(false);
+    // `undefined` 与空对象是同一个意思：没改。
+    expect(providerEquals({ ...base, extra: undefined }, { ...base, extra: {} })).toBe(true);
+    // 键顺序不影响比较结果。
+    expect(
+      providerEquals(
+        { ...base, extra: { account_id: 'acc', region: 'eu' } },
+        { ...base, extra: { region: 'eu', account_id: 'acc' } },
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('两种新供应商类型的必填项', () => {
+  it('Cloudflare 嵌入：account_id 与 base_url 二选一，两个都没有才报错', () => {
+    expect(kindLabel('cloudflare_embedding')).toBe('嵌入（Cloudflare）');
+
+    const missing = providerShapeIssues({
+      provider_id: 'cf',
+      kind: 'cloudflare_embedding',
+    });
+    expect(missing.map((issue) => issue.field)).toContain(
+      'providers.cf.extra.account_id',
+    );
+
+    // 账号 ID 存在 extra.account_id（对应 LING_EMBEDDING_ACCOUNT_ID）。
+    expect(
+      providerShapeIssues({
+        provider_id: 'cf',
+        kind: 'cloudflare_embedding',
+        extra: { account_id: 'acc-123' },
+      }),
+    ).toEqual([]);
+
+    // 只给完整 base_url 也合法：环境变量那套一直支持这种配法，
+    // 前端不能比后端更严。
+    expect(
+      providerShapeIssues({
+        provider_id: 'cf',
+        kind: 'cloudflare_embedding',
+        base_url: 'https://proxy.example/cf/ai/v1',
+      }),
+    ).toEqual([]);
+  });
+
+  it('SiliconFlow 重排：只要 base_url，不套用 Cloudflare 的 account_id 规则', () => {
+    expect(kindLabel('siliconflow_rerank')).toBe('重排（SiliconFlow）');
+
+    const missing = providerShapeIssues({
+      provider_id: 'sf',
+      kind: 'siliconflow_rerank',
+    });
+    expect(missing.map((issue) => issue.field)).toEqual(['providers.sf.base_url']);
+    expect(missing.some((issue) => issue.field.includes('account_id'))).toBe(false);
+
+    expect(
+      providerShapeIssues({
+        provider_id: 'sf',
+        kind: 'siliconflow_rerank',
+        base_url: 'https://api.siliconflow.cn/v1',
+      }),
+    ).toEqual([]);
+  });
+
+  it('表单：Cloudflare 显示账号 ID 输入；SiliconFlow 不显示它', () => {
+    const cf = MEMORY_PROVIDERS.find((item) => item.provider_id === 'cf')!;
+    const cfHtml = renderProvider({ ...cf, extra: {} });
+    expect(cfHtml).toContain('嵌入（Cloudflare）');
+    expect(cfHtml).toContain('账号 ID（Account ID）');
+    // 两样都没填时给出"发布前还差…"，但不拦保存草稿。
+    expect(cfHtml).toContain('发布前还差');
+
+    const sf = MEMORY_PROVIDERS.find((item) => item.provider_id === 'sf')!;
+    const sfHtml = renderProvider(sf);
+    expect(sfHtml).toContain('重排（SiliconFlow）');
+    expect(sfHtml).not.toContain('账号 ID（Account ID）');
+  });
+});
+
+/** 从渲染结果里切出某个下拉的内容：用来断言"选项里有没有某一家"。 */
+function selectMarkup(html: string, label: string): string {
+  const start = html.indexOf(`aria-label="${label}"`);
+  const end = html.indexOf('</select>', start);
+  return start >= 0 && end > start ? html.slice(start, end) : '';
+}
+
+describe('按能力过滤绑定下拉', () => {
+  it('每个职责只列具备该能力的供应商', () => {
+    // 这是这轮设计的核心收益：选不到调不通的组合。
+    expect(
+      providersForProfile(MEMORY_PROVIDERS, 'chat', null).map((item) => item.provider_id),
+    ).toEqual(['main']);
+    expect(
+      providersForProfile(MEMORY_PROVIDERS, 'embed', null).map((item) => item.provider_id),
+    ).toEqual(['cf']);
+    expect(
+      providersForProfile(MEMORY_PROVIDERS, 'rerank', null).map((item) => item.provider_id),
+    ).toEqual(['sf']);
+  });
+
+  it('渲染出来的下拉也按能力分开：嵌入里没有对话供应商', () => {
+    const html = render({ providers: MEMORY_PROVIDERS, config: CAPABILITY_CONFIG });
+    const embed = selectMarkup(html, '嵌入 用哪个模型');
+    expect(embed).toContain('cf');
+    expect(embed).not.toContain('main');
+    expect(embed).not.toContain('sf');
+
+    const chat = selectMarkup(html, '日常对话 用哪个模型');
+    expect(chat).toContain('main');
+    expect(chat).not.toContain('cf');
+    expect(chat).not.toContain('sf');
+
+    const rerank = selectMarkup(html, '重排 用哪个模型');
+    expect(rerank).toContain('sf');
+    expect(rerank).not.toContain('main');
+    expect(rerank).not.toContain('cf');
+  });
+
+  it('默认槽位只收对话供应商；当前已绑的那家保留（不能悄悄消失）', () => {
+    expect(providersForChatSlot(MEMORY_PROVIDERS, '').map((item) => item.provider_id)).toEqual([
+      'main',
+    ]);
+    // 历史槽位指向嵌入供应商：保留它，让界面能标警告。
+    expect(providersForChatSlot(MEMORY_PROVIDERS, 'cf').map((item) => item.provider_id)).toEqual([
+      'main',
+      'cf',
+    ]);
+  });
+
+  it('能力未知（新建 / 刚改类型）时失败关闭，不猜它能做什么', () => {
+    const cf = MEMORY_PROVIDERS.find((item) => item.provider_id === 'cf')!;
+    const unknown: ProviderDraftInput = { ...cf, capabilities: undefined };
+    expect(providersForProfile([unknown], 'embed', null)).toEqual([]);
+    // 但当前已绑的那家仍然保留，否则历史配置会从界面消失。
+    expect(providersForProfile([unknown], 'embed', 'cf')).toHaveLength(1);
+  });
+});
+
+describe('历史绑定与能力不匹配', () => {
+  it('已绑的对话供应商出现在嵌入职责里时，保留选项并标警告', () => {
+    const html = render({
+      providers: MEMORY_PROVIDERS,
+      config: CAPABILITY_CONFIG,
+      profiles: [
+        profile({
+          profile: 'memory.embed',
+          mode: 'explicit',
+          provider_id: 'main',
+          model_id: 'm-fast',
+        }),
+      ],
+      resolutions: [
+        resolution({
+          profile: 'memory.embed',
+          source: 'explicit',
+          effective: { provider_id: 'main', model_id: 'm-fast' },
+        }),
+      ],
+    });
+
+    // 不能悄悄消失：当前绑定的选项还在，用户能看到自己绑了什么。
+    expect(html).toContain('main::m-fast');
+    // 但必须说清为什么不匹配、发布会被拦下。
+    expect(html).toContain('只提供「对话」');
+    expect(html).toContain('这个职责需要「嵌入」');
+    expect(html).toContain('发布会被服务端拦下');
+  });
+});
+
+describe('memory_sources：嵌入/重排的配置来自哪', () => {
+  it('env：说清来自环境变量，并提示改成网页绑定后 env 不再生效', () => {
+    const html = render({
+      providers: MEMORY_PROVIDERS,
+      config: {
+        ...CAPABILITY_CONFIG,
+        memory_sources: { 'memory.embed': 'env', 'memory.rerank': null },
+      },
+      profiles: [],
+      resolutions: [
+        resolution({
+          profile: 'memory.embed',
+          source: 'unavailable',
+          reason: '这个职责只能单独指定模型：它没有默认槽位',
+        }),
+        resolution({
+          profile: 'memory.rerank',
+          source: 'unavailable',
+          reason: '重排还没有配',
+        }),
+      ],
+    });
+
+    expect(html).toContain('来自环境变量，改成网页绑定后环境变量不再生效');
+    expect(html).toContain('ms-badge--env');
+    // 环境变量正在提供能力，不能把这一行报成「不可用」并附上"只能单独指定"。
+    expect(html).not.toContain('这个职责只能单独指定模型');
+    // 标题计数也要把它算成"来自环境变量"，不能对着正常部署说不可用。
+    expect(html).toContain('1 个来自环境变量');
+  });
+
+  it('binding / null：分别说成网页绑定与没有配置', () => {
+    const bound = render({
+      providers: MEMORY_PROVIDERS,
+      config: {
+        ...CAPABILITY_CONFIG,
+        memory_sources: { 'memory.embed': 'binding', 'memory.rerank': null },
+      },
+      profiles: [
+        profile({
+          profile: 'memory.embed',
+          mode: 'explicit',
+          provider_id: 'cf',
+          model_id: '@cf/baai/bge-m3',
+        }),
+      ],
+      resolutions: [
+        resolution({
+          profile: 'memory.embed',
+          source: 'explicit',
+          effective: { provider_id: 'cf', model_id: '@cf/baai/bge-m3' },
+        }),
+        resolution({
+          profile: 'memory.rerank',
+          source: 'unavailable',
+          reason: '重排还没有配',
+        }),
+      ],
+    });
+    expect(bound).toContain('来自网页绑定');
+    expect(bound).toContain('没有配置：这项能力现在是关的');
+
+    const none = render({
+      providers: MEMORY_PROVIDERS,
+      config: {
+        ...CAPABILITY_CONFIG,
+        memory_sources: { 'memory.embed': null, 'memory.rerank': null },
+      },
+      resolutions: [
+        resolution({
+          profile: 'memory.embed',
+          source: 'unavailable',
+          reason: '这个职责只能单独指定模型：它没有默认槽位',
+        }),
+        resolution({
+          profile: 'memory.rerank',
+          source: 'unavailable',
+          reason: '重排还没有配',
+        }),
+      ],
+    });
+    expect(none).toContain('没有配置：这项能力现在是关的');
   });
 });
 
