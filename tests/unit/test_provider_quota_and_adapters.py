@@ -457,3 +457,76 @@ def test_token_quota_store_accepts_factory() -> None:
     params = inspect.signature(TokenQuotaStore.__init__).parameters
     assert "session_factory" in params
     assert "timezone" in params
+
+
+# ---------------------------------------------------------------- 记账返回值
+
+
+class _QuotaRow:
+    """一张 `provider_token_usage` 行（够用就好）。"""
+
+    def __init__(self) -> None:
+        self.tokens = 0
+        self.estimated = False
+        self.updated_at = None
+
+
+class _QuotaResult:
+    def __init__(self, row: _QuotaRow | None) -> None:
+        self._row = row
+
+    def scalar_one_or_none(self) -> _QuotaRow | None:
+        return self._row
+
+
+class _QuotaSession:
+    def __init__(self, db: dict) -> None:
+        self._db = db
+        self._pending_row: _QuotaRow | None = None
+
+    async def __aenter__(self):  # noqa: ANN204
+        return self
+
+    async def __aexit__(self, *args):  # noqa: ANN002, ANN003
+        return False
+
+    async def execute(self, stmt):  # noqa: ANN001, ANN201
+        return _QuotaResult(self._db["row"])
+
+    def add(self, row):  # noqa: ANN001
+        self._pending_row = row
+
+    async def commit(self) -> None:
+        if self._pending_row is not None:
+            self._db["row"] = self._pending_row
+            self._pending_row = None
+
+
+class _QuotaFactory:
+    def __init__(self, db: dict) -> None:
+        self._db = db
+
+    def __call__(self):  # noqa: ANN204
+        return _QuotaSession(self._db)
+
+
+@pytest.mark.asyncio
+async def test_record_returns_running_total_after_a_successful_write() -> None:
+    """``record()`` 成功落库后必须返回**当天累计**，且不能抛异常。
+
+    实测缺陷（2026-11-07）：``_flush`` 成功时会把这一笔从内存里扣掉、扣到 0
+    就删键，紧接着的 ``self._pending[key]`` 于是抛 ``KeyError``。后果不是
+    "账不准"（库已经写进去了），而是**每一次成功的生成都往日志里扔一条**
+    ``token 用量记账失败（x）：('x', date(...))``——一条假警报。运维看到它
+    会去查数据库，而那里一切正常；真正的失败反而被这句噪声盖住。
+    """
+    db: dict = {"row": None}
+    store = TokenQuotaStore(_QuotaFactory(db))  # type: ignore[arg-type]
+
+    assert await store.record("p1", 300) == 300
+    assert await store.record("p1", 200) == 500
+    # 内存里已经没有待写增量了（都写进去了），读数仍然对
+    assert store._pending == {}
+    assert await store.used("p1") == 500
+    # 收掉后台补写任务：否则 pytest 退出时会报 "Task was destroyed"
+    await store.aclose()

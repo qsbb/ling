@@ -1308,6 +1308,7 @@ async def _reply_in_group_window(  # noqa: ANN001
     reply_text = ""
     state = "unknown"
     expression: dict | None = None
+    failure = ""
     while True:
         try:
             event = await asyncio.wait_for(queue.get(), timeout=180.0)
@@ -1323,13 +1324,21 @@ async def _reply_in_group_window(  # noqa: ANN001
             reply_text = str(message.get("text") or "")
             expression = data.get("expression") or expression
             if name == "turn.failed":
-                detail = (data.get("error") or {}).get("detail") or ""
+                # 与入站桥同一段说明（`describe_turn_failure`）：``ModelError``
+                # 那条路不填 ``detail``，只读 detail 会让日志只剩
+                # 「失败：turn.failed |」——用户无从知道该改密钥、模型名还是额度。
+                from ling.kernel.turn import describe_turn_failure
+
+                failure = describe_turn_failure(data)
                 logger.warning(
-                    "群聊回应轮次 %s 失败：%s | %s", turn.id, name, str(detail)[:300]
+                    "群聊回应轮次 %s 失败（%s）：%s", turn.id, state, failure
                 )
     reply_text = reply_text.strip()
     if not reply_text:
-        return False, f"生成没有产出文本（state={state}）"
+        # 失败原因要回到调用方：它会被写成"她没开口"的理由，
+        # 只留 ``state=`` 等于把可执行的线索丢掉。
+        why = f"state={state}" + (f"，{failure}" if failure else "")
+        return False, f"生成没有产出文本（{why}）"
 
     channel = str(window.channel or "")
     if channel in {"", "web"}:

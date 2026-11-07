@@ -260,6 +260,19 @@ class InteractionEnvelope(StrictModel):
         default=None,
         description="发送者显示名，仅作标签；同名不同人靠 account_ref 区分",
     )
+    # 发送者的**昵称**（账号自己的名字，跨群稳定），与 ``sender_name`` 分开。
+    #
+    # 为什么要两档：
+    # - ``sender_name`` 是**本次称呼**（群名片优先）——显示用，改名下一句就生效；
+    # - ``sender_nickname`` 是**人级**字段——落库更新 ``subjects.display_name``
+    #   只能用它。用群名片写人级列，会被"他在某个群改了个名片"带着在群之间抖动，
+    #   而且别人的私聊标题也会跟着变（见 docs/GROUP-CARD-RESEARCH.md）。
+    #
+    # 旧连接器不发这个字段也能跑（默认 None），此时落库侧退回用 ``sender_name``。
+    sender_nickname: str | None = Field(
+        default=None,
+        description="发送者昵称（人级、跨群稳定）；缺省时落库退回使用 sender_name",
+    )
     device_ref: IdStr | None = Field(
         default=None, description="保留位：目前没有设备概念，读它永远得到 None"
     )

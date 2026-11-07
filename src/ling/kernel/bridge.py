@@ -39,6 +39,7 @@ from ling.kernel.autonomy import (
     scenario_key_for,
 )
 from ling.kernel.decision import DecisionContext, classify_text
+from ling.kernel.turn import describe_turn_failure
 from ling.logging_setup import emit_event
 
 if TYPE_CHECKING:
@@ -133,7 +134,11 @@ class InboundBridge:
             subject_id = await identity.resolve_or_provision(
                 envelope.connector_instance,
                 envelope.account_ref or "",
-                display_name=getattr(envelope, "sender_name", None),
+                # 建档写的是**昵称**（人级、跨群稳定），不是群名片。
+                # 用名片建号 = "首条消息就把这个群的称呼写成这个人的名字"，
+                # 之后 A/B 群互相覆盖，是跨群污染的源头。老连接器不发
+                # ``sender_nickname`` 时才退回 ``sender_name``。
+                display_name=envelope.sender_nickname or getattr(envelope, "sender_name", None),
             )
         # 私聊里没绑定过的号**注册成独立自然人**，不并到任何人身上。
         #
@@ -145,7 +150,9 @@ class InboundBridge:
             subject_id = await identity.resolve_or_provision(
                 envelope.connector_instance,
                 envelope.account_ref or "",
-                display_name=getattr(envelope, "sender_name", None),
+                # 同上一处：人名取昵称，不取群名片（私聊本来就没有名片，
+                # 但连接器实现可能把备注/别名塞进 sender_name，逻辑统一）。
+                display_name=envelope.sender_nickname or getattr(envelope, "sender_name", None),
             )
             if subject_id is not None:
                 logger.info(
@@ -168,6 +175,33 @@ class InboundBridge:
                 accepted=False,
                 reason="渠道账号尚未绑定到已证明的自然人，需走绑定流程",
             )
+
+        # 1.5) 名字旁路：把这次看到的**昵称**同步进 `subjects.display_name`。
+        #
+        # 为什么需要：上面两处建号只在"没绑过"时跑（`resolve_or_provision`），
+        # 已绑定的主人/管理员走的是 `resolve_account`，**永远进不去**——于是
+        # 名字一写进库就固定不变。这正是"群名片不要固定不变"要修的那一半：
+        # 会话标题、历史署名读的都是这一列，不更新它们就永远叫旧名字。
+        #
+        # 为什么只传昵称：`subjects.display_name` 是**人级**列，群名片是群级
+        # 字段；用它写人级列会让同一个人在 A/B 群之间来回抖（跨群污染）。
+        # 群里"此刻该叫这个名片"由当轮上下文负责（见下面 `sender_name` 的透传）。
+        #
+        # 为什么放在 subject_id 判空**之后**：没有 subject 就没有可写的行，
+        # 而这条分支本来就整条不收，名字也就无从谈起。
+        #
+        # 它是**旁路**，不是前置条件：`observe_display_name` 内部吞异常并用
+        # SAVEPOINT 包住写库（失败不会把调用方事务标成待回滚），所以
+        # "改名失败"绝不会变成"这条消息拒收"。建号那一步
+        # （`resolve_or_provision`）内部已经 flush 过，这里 SAVEPOINT 里只有
+        # 名字这一步的读写。
+        await identity.observe_display_name(
+            envelope.connector_instance,
+            envelope.account_ref or "",
+            nickname=envelope.sender_nickname,
+            sender_name=envelope.sender_name,
+            subject_id=subject_id,
+        )
 
         # 2) 窗口：群聊按**群**共享，不按发言人区分。
         #
@@ -430,7 +464,7 @@ class InboundBridge:
         await self._session.commit()
 
         # 5) 跑轮次，收集最终文本
-        reply_text, state, expression = await self._run_turn(
+        reply_text, state, expression, error = await self._run_turn(
             window_id=window.id,
             subject_id=subject_id,
             turn_id=turn.id,
@@ -438,9 +472,21 @@ class InboundBridge:
             effective=effective,
             # "instance:external_id" —— 记忆按它记录来源账号
             source_account=f"{envelope.connector_instance}:{envelope.account_ref or ''}",
+            # **这一条消息**里的称呼（群名片优先）。必须透传到
+            # `compile(user_sender_name=...)`：库里那一列是旁路，改名后
+            # 当轮就该用新名片，而不是等落库再下一轮才生效。
+            sender_name=envelope.sender_name,
         )
         if not reply_text:
             # 轮次跑完了却没产出文本：这是"她说不出话"，与"决定不说"不同。
+            #
+            # ``error`` 是**为什么**（code + 原因）。它必须同时进结构化事件
+            # 与 ``reason``：
+            # - 事件里可检索（"今天有多少轮是 quota_exhausted"）；
+            # - ``reason`` 会被行为日志拼成「没接话（…）」，而那是用户唯一
+            #   会去读的那一行。原来这里只有 ``state=failed``，等于告诉他
+            #   "出错了"，却不告诉他去改哪里。
+            code = str((error or {}).get("code") or "")
             emit_event(
                 logger,
                 logging.WARNING,
@@ -451,11 +497,17 @@ class InboundBridge:
                     "outcome": "no_text",
                     "turn_state": str(state),
                     "is_group": is_group,
+                    "error_code": code or None,
+                    "detail": describe_turn_failure({"error": error}) if error else None,
                 },
             )
             return BridgeResult(
                 accepted=True,
-                reason=f"轮次结束但没有可交付文本（state={state}）",
+                reason=(
+                    f"轮次结束但没有可交付文本（state={state}，error={code}）"
+                    if code
+                    else f"轮次结束但没有可交付文本（state={state}）"
+                ),
                 subject_id=subject_id,
                 window_id=window.id,
                 turn_id=turn.id,
@@ -799,7 +851,18 @@ class InboundBridge:
         text: str,
         effective: object,
         source_account: str | None = None,
-    ) -> tuple[str, str, dict | None]:
+        # 这条消息里的称呼（群里 = 群名片优先）。与 `source_account` 一样，
+        # 它属于"这一条消息"，不是"这个人"，所以只能沿调用链透传，
+        # 不能从库里读——库里那一列是旁路同步的结果，可能还没写进去。
+        sender_name: str | None = None,
+    ) -> tuple[str, str, dict | None, dict | None]:
+        """跑一轮，返回 ``(正文, 状态, 表达方式, 失败原因)``。
+
+        第四个返回值是 ``turn.failed`` 事件里的 ``error`` 原样字典
+        （``code / message / retriable``，未捕获异常那条路多一个 ``detail``）。
+        它必须往上传：调用方要拿 ``code`` 写进"没有可交付文本"的原因里，
+        否则运维只知道轮次失败、不知道去改哪里。正常结束时为 ``None``。
+        """
         import asyncio
 
         queue = await self._coordinator.run_turn(  # type: ignore[attr-defined]
@@ -810,10 +873,13 @@ class InboundBridge:
             config=effective,
             # 记忆要记下"是哪个号说的"，合并后才能无损拆分
             source_account=source_account,
+            # 「当前这句是谁说的」——群里用它给最后一行署名（群名片优先）
+            sender_name=sender_name,
         )
         reply_text = ""
         state = "unknown"
         expression: dict | None = None
+        error: dict | None = None
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=180.0)
@@ -833,15 +899,22 @@ class InboundBridge:
                     # 失败原因原来只塞在 SSE 事件里，**日志里一个字都没有**。
                     # 于是"她没回"在运维侧不可解释：既可能是模型挂了，
                     # 也可能是权限/窗口/上下文的问题。这里必须留痕。
-                    detail = (data.get("error") or {}).get("detail") or ""
+                    #
+                    # 而且不能只读 ``detail``：``ModelError`` 那条路填的是
+                    # ``code/message``，``detail`` 是空的——只读 detail 正是
+                    # "失败：turn.failed |" 后面什么都没有的原因。
+                    error = dict(data.get("error") or {})
                     logger.warning(
-                        "轮次 %s 失败：%s | %s", turn_id, name, str(detail)[:300]
+                        "轮次 %s 失败（%s）：%s",
+                        turn_id,
+                        state,
+                        describe_turn_failure(data),
                     )
         # 出站前再洗一次：`turn.completed` 的正文已经干净，但"她的话"最终
         # 是从这里发出去的——半截标记（模型被打断时的残片）必须在这一步也挡住。
         from ling.domains.media.watch import clean_reply_text
 
-        return clean_reply_text(reply_text).strip(), state, expression
+        return clean_reply_text(reply_text).strip(), state, expression, error
 
     async def _deliver(
         self,
