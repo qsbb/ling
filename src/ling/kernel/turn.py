@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -213,6 +214,11 @@ class TurnCoordinator:
         stream_log: StreamLog | None = None,
         turn_control: object | None = None,
         speak_lease: object | None = None,
+        # 已解密供应商密钥的同步读取器（provider_id → secret）。嵌入/重排
+        # 的 provider 要在构造时同步拿密钥，而数据库是异步的，所以两条路径
+        # 都是"进程内预热一份缓存、构造时同步读"（API 用 app.state.secret_cache，
+        # worker 用 _SECRET_CACHE）。不传 = 只用环境变量装配语义检索。
+        secret_reader: Callable[[str], str | None] | None = None,
     ) -> None:
         self._router = router
         self._actor_id = actor_id
@@ -229,6 +235,7 @@ class TurnCoordinator:
         # 多副本部署下"同一角色同时只在一个窗口说话"必须靠数据库，
         # 进程内 arbiter 只覆盖单进程。
         self._speak_lease = speak_lease
+        self._secret_reader = secret_reader
 
     async def run_turn(
         self,
@@ -379,6 +386,10 @@ class TurnCoordinator:
                     actor_id=self._actor_id,
                     persona_id=self._persona_id,
                     memory_policy=config.memory,
+                    # 嵌入/重排的绑定也随这一轮快照走：同一轮内的检索不该
+                    # 因为别人在设置页换了模型而中途换掉向量空间。
+                    model_config=config,
+                    secret_reader=self._secret_reader,
                 ).compile(
                     subject_id=subject_id,
                     window_id=window_id,

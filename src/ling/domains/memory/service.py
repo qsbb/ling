@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -30,7 +31,7 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.infra.security import new_id
-from ling.ports.config import MemoryPolicy
+from ling.ports.config import EffectiveConfig, MemoryPolicy
 
 logger = logging.getLogger("ling.domains.memory")
 
@@ -330,6 +331,8 @@ class MemoryService:
         embedder: object | None = None,
         reranker: object | None = None,
         policy: MemoryPolicy | None = None,
+        config: EffectiveConfig | None = None,
+        secret_reader: Callable[[str], str | None] | None = None,
     ) -> None:
         self._session = session
         # 记忆策略来自已发布配置的 memory 段。不传时用默认值，
@@ -341,11 +344,16 @@ class MemoryService:
         self._policy = policy or MemoryPolicy()
         # 语义能力可选：未配置时检索退回 BM25+RRF（字面路径），功能不残缺。
         # 参照实现也是"语义路径默认关闭，明确配置后才启用"。
+        #
+        # ``config`` 是已发布配置快照：有了它，`build_embedding` 才会先看
+        # 网页绑定（memory.embed / memory.rerank），没绑定才退回环境变量。
+        # 不传 = 只看环境变量——那正是"设置页绑了也不生效"的旧行为，所以
+        # 凡是会走到检索的调用方都必须传（见 `kernel/context.py`）。
         if embedder is None or reranker is None:
             from ling.domains.memory.providers import build_embedding, build_reranker
 
-            embedder = embedder or build_embedding()
-            reranker = reranker or build_reranker()
+            embedder = embedder or build_embedding(config, secret_reader=secret_reader)
+            reranker = reranker or build_reranker(config, secret_reader=secret_reader)
         self._embedder = embedder
         self._reranker = reranker
         if reranker is None:
@@ -362,8 +370,8 @@ class MemoryService:
             return
         _RERANK_INACTIVE_WARNED = True
         logger.info(
-            "未配置重排模型（LING_RERANK_API_KEY）：策略 rerank_top_n=%s 不生效，"
-            "检索按字面/向量两路融合排序",
+            "未配置重排模型（设置页绑定 memory.rerank，或环境变量 LING_RERANK_API_KEY）："
+            "策略 rerank_top_n=%s 不生效，检索按字面/向量两路融合排序",
             self._policy.rerank_top_n,
         )
 

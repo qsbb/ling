@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select, update
 
@@ -25,6 +26,9 @@ from ling.config import get_settings
 from ling.domains.media.errors import MediaRefError
 from ling.infra.db import dispose_engine, init_engine, session_scope
 from ling.infra.models import OutboxEvent, Turn, utcnow
+
+if TYPE_CHECKING:
+    from ling.ports.config import EffectiveConfig
 
 # 单条 outbox 事件的最多尝试次数。达到后转 "dead" 等人工重放，
 # 不静默丢弃（注意：五次失败不等于记忆应该永久缺席）。
@@ -108,6 +112,31 @@ async def init_memory_router() -> bool:
         logger.info("模型路由预热失败，记忆提炼将走正则降级: %s", type(exc).__name__)
         _MEMORY_ROUTER = None
         return False
+
+
+async def _published_config(session) -> EffectiveConfig | None:  # noqa: ANN001
+    """现读已发布配置（worker 侧每次事务读一次，不跨事件缓存）。
+
+    给**要按职责绑定装配 provider** 的路径用（目前是向量补算：它必须和
+    检索侧用同一个嵌入模型，否则补出来的向量按 model_id 对不上、等于白跑）。
+    与 ``published_memory_policy`` 同一条理由：worker 没有"轮次快照"可继承，
+    发布后下一个事件就该生效。读失败按"没有任何绑定"处理——那时退回环境
+    变量，而不是让整个事件失败。
+    """
+    try:
+        from ling.infra.security import SecretBox
+        from ling.settings.service import ConfigService
+
+        settings = get_settings()
+        return await ConfigService(
+            session,
+            SecretBox(settings),
+            test_mode_default=settings.test_mode,
+            persona_id=settings.persona_id,
+        ).effective()
+    except Exception as exc:  # noqa: BLE001 - 读不到配置就走环境变量
+        logger.info("已发布配置读取失败，按未绑定处理: %s", type(exc).__name__)
+        return None
 
 
 # 槽位 → 实体类型。只有"可被反复提及的对象"才建实体；
@@ -1085,9 +1114,14 @@ async def handle_embedding_backfill(payload: dict) -> None:
     from ling.infra.models import MemoryEmbeddingRow, MemoryEpisode, MemoryRow
     from ling.ports.embedding import EmbeddingError
 
-    embedder = build_embedding()
+    # **必须和检索侧用同一个来源**：向量行按 `(memory_id, model_id)` 存，
+    # 补算若用了环境变量那套、检索却用网页绑定的模型，补出来的向量会被
+    # 检索当成"另一个模型的历史数据"直接忽略——补算白跑，而且谁都看不出来。
+    async with session_scope() as session:
+        config = await _published_config(session)
+    embedder = build_embedding(config, secret_reader=_SECRET_CACHE.get)
     if embedder is None:
-        logger.info("向量补算跳过：未配置 embedding 提供方")
+        logger.info("向量补算跳过：未配置 embedding 提供方（网页绑定或 LING_EMBEDDING_*）")
         return
     model_id = str(getattr(embedder, "model_id", "") or "")
     batch = int(payload.get("batch") or 32)
@@ -1209,6 +1243,8 @@ async def _reply_in_group_window(  # noqa: ANN001
         actor_id=settings.actor_id,
         persona_id=settings.persona_id,
         cancels=CancelRegistry(),
+        # 群聊自动回复同样走记忆检索：没有这个读取器就只能用环境变量那套。
+        secret_reader=_SECRET_CACHE.get,
     )
     queue = await coordinator.run_turn(
         window_id=window.id,

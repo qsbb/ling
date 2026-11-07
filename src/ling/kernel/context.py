@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -21,7 +22,7 @@ from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.memory.service import MemoryService, RecallResult
 from ling.domains.persona.service import PersonaService, format_traits
-from ling.ports.config import MemoryPolicy
+from ling.ports.config import EffectiveConfig, MemoryPolicy
 from ling.ports.model import ChatMessageIn
 
 logger = logging.getLogger("ling.kernel.context")
@@ -147,6 +148,8 @@ class ContextCompiler:
         actor_id: str = "actor_ling",
         persona_id: str = "persona_ling",
         memory_policy: MemoryPolicy | None = None,
+        model_config: EffectiveConfig | None = None,
+        secret_reader: Callable[[str], str | None] | None = None,
     ) -> None:
         self._session = session
         self._actor_id = actor_id
@@ -159,7 +162,17 @@ class ContextCompiler:
         # 这里不自己读库：一轮只该有一份快照，中途发布的新策略属于下一轮。
         # 不传时退回代码默认值——那正是"设置页能改、运行时从不读"的断链
         # （`worker.py` / 本文件都只写 `MemoryService(session)`）。
-        self._memory = MemoryService(session, policy=memory_policy)
+        #
+        # ``model_config`` / ``secret_reader`` 同理：嵌入与重排现在也走
+        # 职责绑定（memory.embed / memory.rerank），装配它们要"已发布配置 +
+        # 已解密密钥"这两样，而检索发生在本编译器里。不传时会退回环境变量
+        # （旧部署的行为），传了则绑定优先。
+        self._memory = MemoryService(
+            session,
+            policy=memory_policy,
+            config=model_config,
+            secret_reader=secret_reader,
+        )
         self._consent = ConsentService(session)
 
     async def _trust_level(self, subject_id: str) -> str:

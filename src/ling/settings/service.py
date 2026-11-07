@@ -30,30 +30,37 @@ from ling.ports.config import (
     ProviderConfig,
     ProviderModel,
 )
+from ling.ports.model import (
+    ModelCapability,
+    ProviderKind,
+    kind_supports_profile,
+    provider_capabilities,
+    required_capability,
+)
 
-# 可用的供应商协议。四个真实协议 + fake（测试用）。
+# 可用的供应商协议：**从 `ProviderKind` 推导**，不在这里再抄一份。
+#
+# 原来是一份手写集合，于是每加一个 kind 都要记得来改这里——忘了的症状是
+# "新供应商能存进草稿，却校验不过"，而错误信息只说"未知供应商类型"，
+# 完全指向不存在的拼写问题。唯一真源放在 `ports/model.ProviderKind`。
 #
 # `anthropic` 与 `chat_responses` 是**独立适配器**，不是给 OpenAI 兼容
 # 换个地址就能顶替的：请求体、SSE 事件名、系统提示位置、图片编码、用量字段
 # 全都不同（见 `ling/models/anthropic.py` 与 `chat_responses.py` 的模块注释）。
-KNOWN_PROVIDER_KINDS = {
-    "fake",
-    "openai_compatible",
-    "anthropic",
-    "chat_responses",
-    "local",
-}
+KNOWN_PROVIDER_KINDS = {kind.value for kind in ProviderKind}
 KNOWN_PROFILES = {role.value for role in ModelRole}
 
 # 这些角色在设置页**不再展示**：绑定了也没有任何效果。
 #
 # 两类原因，不能混着说：
-# - 无实现：reflection / planning / moderation.advisory 至今没有任何代码
-#   请求它们。展示出来等于承诺一个不存在的能力。
-# - 配置分裂：memory.embed / memory.rerank 的能力**是存在的**，但走
-#   `build_embedding()` / `build_reranker()` 读环境变量（LING_EMBEDDING_*、
-#   LING_RERANK_*），完全不经过模型绑定。在界面上绑一个模型给它，
-#   不会有任何变化——而用户会以为生效了。
+# - 无实现：reflection / planning / moderation.advisory / dialogue.deep
+#   至今没有任何代码请求它们。展示出来等于承诺一个不存在的能力。
+# - 没有 provider：语音三项的入站链路是真的，但没有任何代码按模型职责
+#   去构造 provider，绑上去不会有任何代码读它。
+#
+# （memory.embed / memory.rerank 曾经也在这里，理由是"配置走环境变量"。
+#  现在它们有绑定入口了：`domains/memory/providers.py` 先读绑定、读不到
+#  才退回环境变量，所以从保留名单挪到了可绑清单。）
 #
 # `KNOWN_PROFILES` 仍然接受它们（兼容已存在的草稿），只是不再主动提供。
 # 某个职责没绑定模型时，**具体会失去什么**。
@@ -63,7 +70,7 @@ KNOWN_PROFILES = {role.value for role in ModelRole}
 # 始终为空，用户只会觉得"她看不见我发的图"，无从判断是没配模型。
 #
 # 注意这里混了两类，不能混着说：
-# - 能力缺失（没绑就真的做不到）：vision
+# - 能力缺失（没绑就真的做不到）：vision、memory.embed、memory.rerank
 # - 质量降级（能工作，但用不到专用模型）：memory.extract（会退回
 #   dialogue.fast 代跑）、dialogue.group（会退回 fast）
 #
@@ -78,12 +85,23 @@ PROFILE_DEGRADATIONS: dict[str, str] = {
     "perception.vision": "看不到用户发来的图片内容，媒体描述始终为空",
     "dialogue.fast": "无法对话：这是主回复走的路由",
     "dialogue.group": "群聊没有可用的对话模型（会退回 fast）",
+    # 嵌入/重排的降级是**静默**的：检索照常返回结果，只是只剩字面匹配。
+    # 用户感知是"换个说法就想不起来"，而这恰恰是语义检索要解决的问题。
+    # 注意：只有环境变量也没配时才报降级（见 `/settings/config` 的
+    # `memory_sources`），否则会把 env 部署误报成没配。
+    "memory.embed": "向量检索不可用：同义词、换个说法就召回不到（只剩字面匹配）",
+    "memory.rerank": "不做精排：候选集按融合分数排序，真正相关的那条可能排在后面",
 }
 
 RESERVED_PROFILES: dict[str, str] = {
     "reflection": "尚无实现：目前没有任何代码请求这个角色",
     "planning": "尚无实现：目前没有任何代码请求这个角色",
     "moderation.advisory": "尚无实现：目前没有任何代码请求这个角色",
+    # 深度对话：**设置页曾经列着它**，但全仓没有任何代码按这个角色发起
+    # 请求（`turn.py` 的默认值恒为 `dialogue.fast`，没有任何调用方传 deep）。
+    # 列出来等于承诺"绑上就会更聪明"，实际零效果——和语音那三项同一个错。
+    # 等真的做出快/慢路由（并且能解释"为什么这次走了 deep"）再挪回可绑清单。
+    "dialogue.deep": "尚无实现：目前没有任何代码请求这个角色",
     # 语音三项：**入站链路是真的**（`POST /speech/segments` 落库，
     # `SpeechService.record_partial/record_final`），但**没有任何代码按
     # 模型职责去构造 provider**——`AsrProvider` / `TtsProvider` 全仓只有
@@ -95,8 +113,6 @@ RESERVED_PROFILES: dict[str, str] = {
     "speech.asr": "尚无实现：入站语音分段已落库，但没有按模型职责构造的 ASR provider",
     "speech.tts": "尚无实现：没有出站 TTS provider，绑定后不会有任何朗读",
     "realtime.voice": "尚无实现：没有实时语音会话实现，绑定后不会有任何效果",
-    "memory.embed": "由环境变量配置（LING_EMBEDDING_*），不走模型绑定",
-    "memory.rerank": "由环境变量配置（LING_RERANK_*），不走模型绑定",
 }
 
 
@@ -125,6 +141,84 @@ class DraftResult:
     revision: int
     state: str
     validation_errors: list[ValidationIssue] = field(default_factory=list)
+
+
+def _provider_shape_issues(pid: str, cfg: dict) -> list[ValidationIssue]:
+    """按**能力**校验供应商的必填项。
+
+    不同能力要的连接信息不一样，不能共用一套规则（那正是"把嵌入塞进对话
+    下拉"会踩的坑）：
+
+    - ``chat``（openai_compatible / local / anthropic / chat_responses）：
+      必须给 base_url——它们的端点没有可推导的默认值。
+    - ``embed``（Cloudflare）：要 ``account_id``（存在 ``extra.account_id``，
+      对应环境变量 ``LING_EMBEDDING_ACCOUNT_ID``）。base_url 可以不给：
+      ``CloudflareEmbedding`` 会用 account_id 拼出官方端点；给了就必须是
+      http(s)。只给 base_url 不给 account_id 也放行——环境变量那套一直
+      支持这种配置（``LING_EMBEDDING_API_BASE``），不能因为进了界面就
+      要求用户多填一项。
+    - ``rerank``（SiliconFlow）：必须给 base_url，它没有"按账号拼端点"的规则。
+
+    密钥一律只 **warning**：发布不该因为"还没填密钥"被锁死（错误分类会在
+    调用时给 ``secret_missing``），但界面上必须能看出"还没配完"。
+    """
+
+    issues: list[ValidationIssue] = []
+    kind = str(cfg.get("kind") or "")
+    # fake 是进程内的确定性实现：没有端点，也不需要密钥。原来那套 chat
+    # 校验把它排除在外，这里保持同一行为——否则每个测试配置都会多出一条
+    # "还没保存密钥"的警告，而那条警告对 fake 没有意义。
+    if kind == ProviderKind.fake.value:
+        return issues
+    capabilities = provider_capabilities(kind)
+    base_url = str(cfg.get("base_url") or "").strip()
+
+    if ModelCapability.chat in capabilities or ModelCapability.rerank in capabilities:
+        # 提示语按能力分开写："兼容接口"是 chat 的说法，套在重排供应商上
+        # 会让人以为要配的是一家 OpenAI 兼容端点。
+        missing_hint = (
+            "兼容接口必须提供 base_url"
+            if ModelCapability.chat in capabilities
+            else "重排供应商必须提供 base_url（例如 https://api.siliconflow.cn/v1）"
+        )
+        if not base_url:
+            issues.append(ValidationIssue(f"providers.{pid}.base_url", missing_hint))
+        elif not (base_url.startswith("http://") or base_url.startswith("https://")):
+            issues.append(
+                ValidationIssue(
+                    f"providers.{pid}.base_url", "base_url 必须以 http:// 或 https:// 开头"
+                )
+            )
+
+    if ModelCapability.embed in capabilities:
+        extra = cfg.get("extra") if isinstance(cfg.get("extra"), dict) else {}
+        account_id = str((extra or {}).get("account_id") or "").strip()
+        if not account_id and not base_url:
+            issues.append(
+                ValidationIssue(
+                    f"providers.{pid}.extra.account_id",
+                    "Cloudflare 嵌入需要 account_id（供应商的 extra.account_id，"
+                    "对应环境变量 LING_EMBEDDING_ACCOUNT_ID），或直接给出完整 base_url",
+                )
+            )
+        if base_url and not (
+            base_url.startswith("http://") or base_url.startswith("https://")
+        ):
+            issues.append(
+                ValidationIssue(
+                    f"providers.{pid}.base_url", "base_url 必须以 http:// 或 https:// 开头"
+                )
+            )
+
+    if capabilities and not cfg.get("has_secret"):
+        issues.append(
+            ValidationIssue(
+                f"providers.{pid}.secret",
+                "该供应商还没有保存密钥，发布后调用会返回 secret_missing",
+                severity="warning",
+            )
+        )
+    return issues
 
 
 class ConfigService:
@@ -374,26 +468,7 @@ class ConfigService:
             if kind not in KNOWN_PROVIDER_KINDS:
                 issues.append(ValidationIssue(f"providers.{pid}.kind", f"未知供应商类型: {kind}"))
                 continue
-            if kind in {"openai_compatible", "local", "anthropic", "chat_responses"}:
-                base_url = (cfg.get("base_url") or "").strip()
-                if not base_url:
-                    issues.append(
-                        ValidationIssue(f"providers.{pid}.base_url", "兼容接口必须提供 base_url")
-                    )
-                elif not (base_url.startswith("http://") or base_url.startswith("https://")):
-                    issues.append(
-                        ValidationIssue(
-                            f"providers.{pid}.base_url", "base_url 必须以 http:// 或 https:// 开头"
-                        )
-                    )
-                if not cfg.get("has_secret"):
-                    issues.append(
-                        ValidationIssue(
-                            f"providers.{pid}.secret",
-                            "该供应商还没有保存密钥，发布后调用会返回 secret_missing",
-                            severity="warning",
-                        )
-                    )
+            issues.extend(_provider_shape_issues(pid, cfg))
 
             # 传输与额度：-1 表示不限制，其余必须是正数。
             # 这些校验放在**供应商**这一层，因为三项都跟着供应商走；
@@ -463,15 +538,26 @@ class ConfigService:
         # 同一时刻只启用一家：这是设置页的默认心智模型（另一家留着备用，
         # 而不是同时分流）。做成 warning 而不是 error，是因为跨供应商回退
         # 需要两家都启用；直接阻断会让已有配置无法再保存。
-        enabled_providers = [
-            pid for pid, cfg in providers.items() if cfg.get("enabled", True)
-        ]
-        if len(enabled_providers) > 1:
+        #
+        # **按能力分组**，不能把所有启用的供应商混在一起数：嵌入与重排是
+        # 另一套接口（cloudflare_embedding / siliconflow_rerank），同时启用
+        # 「一家对话 + 一家嵌入」是**正常配置**，混着数会把它报成"同时启用
+        # 2 家"，用户照着提示去停用，语义检索就没了。
+        enabled_by_capability: dict[ModelCapability, list[str]] = {}
+        for pid, cfg in providers.items():
+            if not cfg.get("enabled", True):
+                continue
+            for capability in sorted(provider_capabilities(str(cfg.get("kind") or ""))):
+                enabled_by_capability.setdefault(capability, []).append(pid)
+        for capability, pids in enabled_by_capability.items():
+            if len(pids) < 2:
+                continue
+            label = "" if capability is ModelCapability.chat else f"{capability.value} 能力的"
             issues.append(
                 ValidationIssue(
                     "providers",
-                    f"同时启用了 {len(enabled_providers)} 家供应商"
-                    f"（{'、'.join(enabled_providers)}）。同一时刻只建议启用一家；"
+                    f"同时启用了 {len(pids)} 家{label}供应商"
+                    f"（{'、'.join(pids)}）。同一时刻只建议启用一家；"
                     "只有在配置跨供应商回退时才需要多家同时启用。",
                     severity="warning",
                 )
@@ -497,6 +583,25 @@ class ConfigService:
                     ValidationIssue(
                         f"profiles.{prof}.provider_id",
                         "非测试模式下不能把职责绑定到 fake provider（会冒充模型能力）",
+                    )
+                )
+            # 能力必须对得上：把 memory.embed 绑到对话供应商，发布也不会报错，
+            # 但装配时只会拿到 None——语义检索静默失效。这正是这次要修的毛病，
+            # 所以在发布前就拦下（error，不是 warning）。
+            kind = str(providers[pid].get("kind") or "")
+            need = required_capability(prof)
+            if (
+                need is not None
+                and kind in KNOWN_PROVIDER_KINDS
+                and not kind_supports_profile(kind, prof)
+            ):
+                offered = provider_capabilities(kind)
+                issues.append(
+                    ValidationIssue(
+                        f"profiles.{prof}.provider_id",
+                        f"{prof} 需要「{need.value}」能力，而供应商 {pid} 是 {kind}"
+                        f"（提供：{'/'.join(sorted(c.value for c in offered)) or '无'}）。"
+                        "选一个具备该能力的供应商，否则发布后这个职责不会真正生效。",
                     )
                 )
             # 停用 ≠ 解绑：旧绑定还在，调用会失败。发布时不拦（用户可能
@@ -552,6 +657,21 @@ class ConfigService:
                             f"profiles.{prof}.fallback_provider_id",
                             f"回退供应商 {fb_pid} 已停用，回退不会生效",
                             severity="warning",
+                        )
+                    )
+                elif (
+                    need is not None
+                    and str(providers[fb_pid].get("kind") or "") in KNOWN_PROVIDER_KINDS
+                    and not kind_supports_profile(
+                        str(providers[fb_pid].get("kind") or ""), prof
+                    )
+                ):
+                    # 回退也必须是同一个能力：换一家"能连但不具备该能力"的
+                    # 供应商，等于把主路失败偷偷换成另一种失败。
+                    issues.append(
+                        ValidationIssue(
+                            f"profiles.{prof}.fallback_provider_id",
+                            f"回退供应商 {fb_pid} 不具备「{need.value}」能力",
                         )
                     )
                 if not (raw.get("fallback_model_id") or "").strip():

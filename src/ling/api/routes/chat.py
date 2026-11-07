@@ -68,6 +68,9 @@ def _coordinator(request: Request, settings: SettingsDep, router_: RouterDep) ->
         stream_log=getattr(request.app.state, "stream_log", None),
         turn_control=getattr(request.app.state, "turn_control", None),
         speak_lease=getattr(request.app.state, "speak_lease", None),
+        # 嵌入/重排的 provider 构造时要同步拿密钥；本进程的缓存由启动预热与
+        # `_refresh_config_if_stale` 维护。拿不到就退回环境变量（旧部署）。
+        secret_reader=getattr(request.app.state, "secret_cache", {}).get,
     )
 
 

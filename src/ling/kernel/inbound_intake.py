@@ -246,6 +246,9 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
                 stream_log=getattr(state, "stream_log", None),
                 turn_control=getattr(state, "turn_control", None),
                 speak_lease=getattr(state, "speak_lease", None),
+                # 与 Web 路径同源：本进程预热过的密钥缓存。入站轮次同样会
+                # 走记忆检索，没有它就只能用环境变量那条腿。
+                secret_reader=getattr(state, "secret_cache", {}).get,
             )
         bridge = InboundBridge(
             session,

@@ -7,10 +7,15 @@
 | 角色 | 情况 |
 | --- | --- |
 | `reflection` / `planning` / `moderation.advisory` | 至今**没有任何代码请求**它们 |
-| `memory.embed` / `memory.rerank` | 能力**存在**，但走环境变量（`LING_EMBEDDING_*` / `LING_RERANK_*`），完全不经过模型绑定 |
+| `dialogue.deep` | 同样没有任何代码按它请求（`turn.py` 的默认值恒为 fast） |
+| `speech.asr` / `speech.tts` / `realtime.voice` | 没有按模型职责构造的 provider |
 
-用户看到的是一份"可选职责"清单，其中五分之二绑上去什么都不会发生。
+用户看到的是一份"可选职责"清单，其中一半绑上去什么都不会发生。
 这不是崩溃，是**承诺了不存在的能力**——和契约里的幻影字段同一类问题。
+
+（`memory.embed` / `memory.rerank` 曾经也在这张表里，理由是"配置走环境
+变量"。现在它们真的读绑定了：`domains/memory/providers.py` 先读绑定、
+没绑定才退回环境变量，所以回到了可绑清单。）
 
 ## 规则
 
@@ -51,6 +56,11 @@ DEFINITION_ONLY = {
     # 把它算作"已被请求"会让保留名单永远不能收进这三个角色——而这正是
     # 它们该待的地方：绑了零效果，却显示成"已绑定"。
     "ports/speech.py",
+    # `ports/model.py` 的 `PROFILE_CAPABILITIES` 是**能力声明表**（"这个角色
+    # 要哪种能力"），不是"现在去请求这个角色"。和上面 speech 的
+    # `SPEECH_PROFILE_REQUIREMENTS` 同一类。把它算进"已被请求"，会让
+    # `dialogue.deep` 永远不能进保留名单——而它恰恰没有任何调用方。
+    "ports/model.py",
 }
 
 
@@ -157,6 +167,29 @@ def test_turn_decision_has_no_dead_member() -> None:
     assert members == {"reply", "silence", "clarify"}, (
         f"TurnDecision 的成员变了，确认新增的都被真正使用：{members}"
     )
+
+
+def test_dialogue_deep_is_reserved_not_offerable() -> None:
+    """`dialogue.deep` 的最终裁决：**不再可绑**，进保留名单并写明原因。
+
+    它曾经在可绑清单里，而全仓没有任何代码按这个角色发起请求
+    （见 docs/MODEL-ROLES-AUDIT.md）。列着它等于承诺"绑上就会更聪明"，
+    实际零效果——和语音三项是同一个错。
+
+    这条同时守住"别把它悄悄加回来"：真要加回可绑清单，得先有代码按
+    `dialogue.deep` 请求模型（那时 `test_role_is_requested_or_declared_reserved`
+    与 `test_reserved_profiles_are_not_still_requested` 会一起要求把它
+    从保留名单里删掉），而不是只改一行清单。
+    """
+    from ling.api.routes.settings import _OFFERABLE_PROFILES
+
+    assert "dialogue.deep" not in _OFFERABLE_PROFILES, (
+        "dialogue.deep 又出现在可绑清单里了：除非真有代码按它请求模型，"
+        "否则这又是一个绑了不生效的入口"
+    )
+    assert "dialogue.deep" in RESERVED_PROFILES
+    reason = RESERVED_PROFILES["dialogue.deep"]
+    assert "尚无实现" in reason, f"原因没说清属于哪一类：{reason}"
 
 
 def test_degradation_map_only_covers_offerable_roles() -> None:

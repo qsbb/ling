@@ -58,7 +58,9 @@ async def _publish_real_profile(env: TestEnv) -> None:
                     "provider_id": "real",
                     "model_id": MODEL_ID,
                 }
-                for profile in ("dialogue.fast", "dialogue.deep", "dialogue.group")
+                # 只绑**真会被请求**的对话角色。`dialogue.deep` 已移进
+                # RESERVED_PROFILES（全仓没有代码按它请求，绑了零效果）。
+                for profile in ("dialogue.fast", "dialogue.group")
             ],
             "test_mode": False,
         },
@@ -160,7 +162,9 @@ async def test_bad_key_surfaces_actionable_error(logged_in: TestEnv) -> None:
                     "provider_id": "real",
                     "model_id": MODEL_ID,
                 }
-                for profile in ("dialogue.fast", "dialogue.deep", "dialogue.group")
+                # 只绑**真会被请求**的对话角色。`dialogue.deep` 已移进
+                # RESERVED_PROFILES（全仓没有代码按它请求，绑了零效果）。
+                for profile in ("dialogue.fast", "dialogue.group")
             ],
             "test_mode": False,
         },

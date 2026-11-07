@@ -101,6 +101,17 @@ class ProviderRegistry:
                 timeout_seconds=cfg.timeout_seconds,
                 secret_hint=self._secret_hint,
             )
+        if kind in {
+            ProviderKind.cloudflare_embedding.value,
+            ProviderKind.siliconflow_rerank.value,
+        }:
+            # 这两种不是对话供应商：它们服务于 memory.embed / memory.rerank，
+            # 由 `domains/memory/providers.py` 装配，**不经过 ModelRouter**
+            # （chat 的流式协议它们一条都不满足）。说清这一点，比让用户看到
+            # 「未知 provider 类型」然后去怀疑自己拼错了 kind 要有用。
+            raise UnknownProviderError(
+                f"{kind} 不是对话供应商：它服务于记忆的嵌入/重排，不经过模型路由"
+            )
         raise UnknownProviderError(f"未知 provider 类型: {kind}")
 
     def provider_for(self, config: EffectiveConfig, binding: ProfileBinding) -> ModelProvider:
@@ -149,7 +160,11 @@ def bootstrap_config(
         )
     }
     profiles: dict[str, ProfileBinding] = {}
-    for profile in ("dialogue.fast", "dialogue.deep", "dialogue.group"):
+    # 只绑**真会被请求**的角色。`dialogue.deep` 曾在这里，但全仓没有任何
+    # 代码按它发起请求（见 docs/MODEL-ROLES-AUDIT.md），绑了等于没有：
+    # 引导配置里"已绑定"的样子会让设置页显示它已就绪。它现在在
+    # `settings/service.py::RESERVED_PROFILES`。
+    for profile in ("dialogue.fast", "dialogue.group"):
         profiles[profile] = ProfileBinding(
             profile=profile,
             provider_id="fake",

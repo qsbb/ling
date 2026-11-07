@@ -12,7 +12,12 @@ from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import utcnow
-from ling.settings.service import PROFILE_DEGRADATIONS, RESERVED_PROFILES
+from ling.ports.model import provider_capabilities, required_capability
+from ling.settings.service import (
+    KNOWN_PROVIDER_KINDS,
+    PROFILE_DEGRADATIONS,
+    RESERVED_PROFILES,
+)
 
 router = APIRouter(tags=["settings"])
 
@@ -20,16 +25,22 @@ router = APIRouter(tags=["settings"])
 # 只列**绑定后真的会生效**的：保留角色见 RESERVED_PROFILES，
 # 它们绑定了没有任何效果，展示出来等于承诺一个不存在的能力。
 #
-# 语音三项（speech.asr / speech.tts / realtime.voice）已移到
-# RESERVED_PROFILES：入站分段是真的，但**没有按模型职责构造的 provider**，
-# 绑上去不会改变任何行为。用户看到"已绑定"却听不见任何声音，
-# 比看不到这个入口更糟。
+# `dialogue.deep` 已移进 RESERVED_PROFILES：审计确认全仓没有任何代码按它
+# 发起请求（见 docs/MODEL-ROLES-AUDIT.md），列着它等于承诺"绑上会更聪明"。
+#
+# 语音三项（speech.asr / speech.tts / realtime.voice）也在 RESERVED_PROFILES：
+# 入站分段是真的，但**没有按模型职责构造的 provider**，绑上去不会改变任何
+# 行为。用户看到"已绑定"却听不见任何声音，比看不到这个入口更糟。
+#
+# `memory.embed` / `memory.rerank` 从保留名单挪到这里：它们现在**真的**读
+# 绑定（`domains/memory/providers.py`：先读绑定，没绑定才退回环境变量）。
 _OFFERABLE_PROFILES: tuple[str, ...] = (
     "dialogue.fast",
-    "dialogue.deep",
     "dialogue.group",
     "perception.vision",
     "memory.extract",
+    "memory.embed",
+    "memory.rerank",
 )
 
 
@@ -172,6 +183,14 @@ async def get_taxonomy(auth: CurrentAuth) -> dict:
 async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
     effective = await config.effective()
     revisions = await config.list_revisions(limit=30)
+    # 嵌入/重排的能力现在有两种来源：网页绑定或环境变量。**前端必须能区分**——
+    # 只看"有没有绑定"会把 env 部署报成"语义检索不可用"，用户会去乱配一通。
+    from ling.domains.memory.providers import embedding_source, rerank_source
+
+    memory_sources = {
+        "memory.embed": embedding_source(effective),
+        "memory.rerank": rerank_source(effective),
+    }
     providers = []
     for p in effective.providers.values():
         status = await config.secret_status(p.provider_id)
@@ -179,6 +198,12 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             {
                 "provider_id": p.provider_id,
                 "kind": p.kind,
+                # 这家**能服务哪些能力**。前端的绑定下拉据此过滤：把
+                # memory.embed 选到一家对话供应商上，服务端会拒绝发布
+                # （见 validate_payload），但不该让用户先选错再被报错。
+                "capabilities": sorted(
+                    capability.value for capability in provider_capabilities(p.kind)
+                ),
                 "base_url": p.base_url,
                 "enabled": p.enabled,
                 "has_secret": bool(status["has_secret"]),
@@ -247,20 +272,44 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             }
             for r in revisions
         ],
-        "known_kinds": ["fake", "openai_compatible", "anthropic", "chat_responses", "local"],
+        "known_kinds": sorted(KNOWN_PROVIDER_KINDS),
         # 只列出**绑定后真的会生效**的角色。
         # 保留角色见 settings/service.py::RESERVED_PROFILES，
         # 它们绑定了没有任何效果，展示出来等于承诺不存在的能力。
         "known_profiles": [p for p in _OFFERABLE_PROFILES],
+        # 每个角色**需要哪种能力**。前端拿它去过滤供应商下拉：
+        # `profile_capabilities[role] in provider["capabilities"]`。
+        #
+        # 为什么保留 `known_profiles` 的字符串数组、另加一份映射，而不是把
+        # 两份合并成对象数组：`known_profiles` 是已发布的响应字段，改形状会
+        # 让旧客户端（含本文档发布时的控制台）拿到自己解析不了的东西。新增
+        # 字段是兼容的，删改字段不是。
+        "profile_capabilities": {
+            profile: (cap.value if (cap := required_capability(profile)) else None)
+            for profile in _OFFERABLE_PROFILES
+        },
         "reserved_profiles": dict(RESERVED_PROFILES),
+        # 嵌入/重排当前的能力来源：``binding``（网页绑定）/ ``env``（环境变量）
+        # / null（都没有 = 该能力实际关闭）。只读展示；下面的
+        # `unbound_degradations` 也读它，用来避免把 env 部署报成"没配"。
+        "memory_sources": memory_sources,
         # **未绑定职责会失去什么**。系统不会因此报错，它会走降级路径——
         # 看起来一切正常，只是能力悄悄变窄。用户只会觉得"她好像记不住事"，
         # 无从判断是没配模型。
+        #
+        # 嵌入/重排要额外看**环境变量**：只在"绑定与环境变量都没有"时才算降级，
+        # 否则会把用 env 配好的部署报成语义检索失效。
         "unbound_degradations": {
             profile: PROFILE_DEGRADATIONS[profile]
             for profile in _OFFERABLE_PROFILES
             if profile in PROFILE_DEGRADATIONS
             and not (effective.profiles.get(profile) and effective.profiles[profile].enabled)
+            # 来源**不是** None 说明这份能力已经能用（绑定或环境变量），
+            # 不该再报降级；不在 memory_sources 里的角色没有"环境变量也算
+            # 配置"这回事，一律按未绑定处理。
+            and not (
+                profile in memory_sources and memory_sources[profile] is not None
+            )
         },
     }
 

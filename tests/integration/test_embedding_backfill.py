@@ -86,7 +86,9 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch) -> _StubEmbedder:
     import ling.domains.memory.providers as providers
 
     stub = _StubEmbedder()
-    monkeypatch.setattr(providers, "build_embedding", lambda: stub)
+    # 补算现在会带"已发布配置 + 密钥读取器"两个参数（绑定优先、env 兜底），
+    # 桩必须接受它们，否则打的是桩的签名错、不是真实的装配路径。
+    monkeypatch.setattr(providers, "build_embedding", lambda *a, **kw: stub)
     return stub
 
 
@@ -142,7 +144,7 @@ async def test_backfill_skips_without_provider(logged_in: TestEnv, monkeypatch) 
     """没配 embedding 提供方时安静跳过，不报错、不写空向量。"""
     import ling.domains.memory.providers as providers
 
-    monkeypatch.setattr(providers, "build_embedding", lambda: None)
+    monkeypatch.setattr(providers, "build_embedding", lambda *a, **kw: None)
     await _seed_memories(2)
     await handle_embedding_backfill({})
 

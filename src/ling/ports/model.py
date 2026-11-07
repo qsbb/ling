@@ -25,6 +25,94 @@ class ProviderKind(StrEnum):
     # 的别名：事件流、输入结构、用量字段都不同。
     chat_responses = "chat_responses"
     local = "local"
+    # ---------------------------------------------------- 非对话能力
+    #
+    # 这两个**不是** chat 协议的别名，也不是"给兼容接口换个 base_url"：
+    # 请求体与返回结构完全不同（见 `models/cloudflare_embedding.py` 与
+    # `models/siliconflow_rerank.py` 的模块注释）。放进同一个下拉里，
+    # 用户会选出"发布成功、调用必失败"的组合，所以它们各自带**能力标记**，
+    # 由绑定按能力过滤（见 `PROVIDER_CAPABILITIES`）。
+    cloudflare_embedding = "cloudflare_embedding"
+    siliconflow_rerank = "siliconflow_rerank"
+
+
+class ModelCapability(StrEnum):
+    """模型角色**需要**什么能力，也是供应商**提供**什么能力。
+
+    一个 kind 声明一组能力，一个角色声明需要一种；设置页用
+    `capabilities(kind) ⊇ {role.capability}` 过滤下拉，服务端用同一条
+    判据拦住调不通的绑定（`settings/service.py::validate_payload`）。
+
+    为什么要这层而不是"按 kind 手写 if"：kind 与角色的对应关系一旦散落
+    在界面、校验、装配三处，加一个供应商就要改三处，漏一处就是静默错配。
+
+    ``tts`` / ``asr`` 本期**只定义不启用**：语音 provider 还没实现，
+    先落枚举是因为它是公开契约——等 provider 写出来再改成员，
+    已经存下来的 kind → capability 表要跟着改一遍。
+    """
+
+    chat = "chat"
+    embed = "embed"
+    rerank = "rerank"
+    tts = "tts"
+    asr = "asr"
+
+
+# 每个供应商 kind 提供哪些能力。**必须穷举** ProviderKind 的每个成员：
+# 漏一个就等于那个 kind 不提供任何能力（`provider_capabilities` 返回空集，
+# 任何角色绑上去都会被校验拦下），是失败关闭的方向，不是静默放行。
+PROVIDER_CAPABILITIES: dict[ProviderKind, frozenset[ModelCapability]] = {
+    ProviderKind.fake: frozenset({ModelCapability.chat}),
+    ProviderKind.openai_compatible: frozenset({ModelCapability.chat}),
+    ProviderKind.anthropic: frozenset({ModelCapability.chat}),
+    ProviderKind.chat_responses: frozenset({ModelCapability.chat}),
+    ProviderKind.local: frozenset({ModelCapability.chat}),
+    ProviderKind.cloudflare_embedding: frozenset({ModelCapability.embed}),
+    ProviderKind.siliconflow_rerank: frozenset({ModelCapability.rerank}),
+}
+
+
+# 角色 → 它需要的能力。键必须与 `contracts/v1.ModelRole` 的取值一致
+# （`tests/unit/test_provider_capabilities.py` 盯着这一点）。
+#
+# 没有列进来的角色（reflection / planning / moderation.advisory /
+# realtime.voice）意味着**服务端不对它们做能力约束**：它们既不在可绑清单里，
+# 也没有任何代码请求，给它们编一个能力只会凭空多一条假规则。
+PROFILE_CAPABILITIES: dict[str, ModelCapability] = {
+    "dialogue.fast": ModelCapability.chat,
+    "dialogue.deep": ModelCapability.chat,
+    "dialogue.group": ModelCapability.chat,
+    "perception.vision": ModelCapability.chat,
+    "memory.extract": ModelCapability.chat,
+    "memory.embed": ModelCapability.embed,
+    "memory.rerank": ModelCapability.rerank,
+    # 语音两项：能力已定义，但**没有任何 kind 提供**（provider 尚未实现）。
+    # 于是把 speech.* 绑到任何现有供应商都会被校验拦下——这正是我们要的：
+    # 在那之前，任何"绑定成功"都是假的。
+    "speech.tts": ModelCapability.tts,
+    "speech.asr": ModelCapability.asr,
+}
+
+
+def provider_capabilities(kind: str) -> frozenset[ModelCapability]:
+    """某个 kind 提供的能力。未知 kind → **空集**（失败关闭）。"""
+    try:
+        return PROVIDER_CAPABILITIES[ProviderKind(kind)]
+    except ValueError:
+        return frozenset()
+
+
+def required_capability(profile: str) -> ModelCapability | None:
+    """某个角色需要的能力；没声明约束的角色返回 None。"""
+    return PROFILE_CAPABILITIES.get(profile)
+
+
+def kind_supports_profile(kind: str, profile: str) -> bool:
+    """这个 kind 能不能服务这个角色。没有能力要求的角色一律放行。"""
+    need = required_capability(profile)
+    if need is None:
+        return True
+    return need in provider_capabilities(kind)
 
 
 @dataclass(frozen=True)
@@ -167,7 +255,10 @@ class ModelTarget:
 
 
 __all__ = [
+    "PROFILE_CAPABILITIES",
+    "PROVIDER_CAPABILITIES",
     "ChatMessageIn",
+    "ModelCapability",
     "ModelChunk",
     "ModelError",
     "ModelErrorKind",
@@ -177,4 +268,7 @@ __all__ = [
     "ProbeResult",
     "ProviderKind",
     "Usage",
+    "kind_supports_profile",
+    "provider_capabilities",
+    "required_capability",
 ]
