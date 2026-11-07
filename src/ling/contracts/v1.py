@@ -739,120 +739,6 @@ class IntentTeaserOut(StrictModel):
     note: str | None = None
 
 
-# ---------------------------------------------------------------- 提示词快照（只读）
-
-
-class PromptSnapshotState(StrEnum):
-    """「查看本次提示词」的三种状态。**必须互相区分**。
-
-    - ``available``：这一轮的快照还在保留期内，`sections` 是真正发出去的内容；
-    - ``expired``：**曾经有过**快照，但已过保留期或正文已被清理任务清空。
-      元数据（`created_at` / `expires_at` / `model` / `token_total`）仍在，
-      `sections` 为空——内容确实没了，不是没存过；
-    - ``unavailable``：**从来没存下来**（捕获失败，或这条消息早于本功能）。
-
-    三者混成一种的话，用户看到"打不开"时分不清该重试、该关掉功能、还是
-    本来就该没有——而"沉默/失败都要能被解释"是这个项目的基本要求。
-    """
-
-    available = "available"
-    expired = "expired"
-    unavailable = "unavailable"
-
-
-class PromptBlock(StrEnum):
-    """快照里一段内容的语义块。由**编译器在装配时标注**，不是事后猜的。
-
-    ``key`` 是闭集：新车道没写进映射表时落到 ``other``，不会静默算进别的组。
-    """
-
-    system = "system"
-    persona = "persona"
-    memory = "memory"
-    plan = "plan"
-    media = "media"
-    summary = "summary"
-    history = "history"
-    input = "input"
-    other = "other"
-
-
-class PromptSnapshotModel(StrictModel):
-    """这一轮**实际解析到**的模型（与 `resolve_profile` 同一份结论）。"""
-
-    schema_version: Literal["v1"] = SCHEMA_VERSION
-    provider_id: str | None = None
-    model_id: str | None = None
-    profile: str | None = None
-    config_revision: int | None = None
-    # 解析来源：explicit / slot / legacy_fallback / unavailable。
-    # 同一份 provider/model 可能来自"单独指定"或"跟随槽位"，处置完全不同。
-    source: str | None = None
-
-
-class PromptSnapshotItem(StrictModel):
-    """快照里的一条消息。``index`` 是它在**真实 messages 数组**里的下标。
-
-    截断后下标会跳号——这是**故意的**：跳号说明中间被丢掉了，
-    而不是"她当时只看到这些"。
-    """
-
-    schema_version: Literal["v1"] = SCHEMA_VERSION
-    index: int = Field(ge=0)
-    role: str
-    content: str
-    tokens: int = Field(default=0, ge=0)
-    # 历史条目专有：谁说的、什么时候（群里最需要这两项）
-    sender: str | None = None
-    at: datetime | None = None
-    # 这条正文因快照超上限被截过（与整份快照的 `truncated` 是两件事）
-    truncated: bool = False
-    # 原始车道名（persona / evidence / media …），便于排查"这块是谁注入的"
-    lane: str | None = None
-
-
-class PromptSnapshotSection(StrictModel):
-    """一个语义块的展示分组。``label`` 直接给前端显示，**不要在前端再翻译**。"""
-
-    schema_version: Literal["v1"] = SCHEMA_VERSION
-    key: PromptBlock
-    label: str
-    # 组内所有条目同角色时就是那个角色；混合（如历史里 user/assistant）时
-    # 为 ``mixed``——不要自己挑一个代表角色，那会让读者误判这一段的结构。
-    role: str
-    tokens: int = Field(default=0, ge=0)
-    # 默认折叠（目前只有 history）：内容长、但通常不需要一眼看完。
-    collapsed: bool = False
-    items: list[PromptSnapshotItem] = Field(default_factory=list)
-
-
-class PromptSnapshotOut(StrictModel):
-    """`GET /v1/messages/{message_id}/prompt` 的响应。
-
-    ``token_total`` 是**这一轮实际发出去**的估算总量；截断时它仍包含没存进
-    `sections` 的部分，所以**不必等于** `sum(section.tokens)`。
-    """
-
-    schema_version: Literal["v1"] = SCHEMA_VERSION
-    state: PromptSnapshotState
-    message_id: IdStr
-    # 这条消息属于哪一轮。没有（旧数据）时为 null。
-    turn_id: IdStr | None = None
-    created_at: datetime | None = None
-    expires_at: datetime | None = None
-    model: PromptSnapshotModel | None = None
-    token_total: int = Field(
-        default=0,
-        ge=0,
-        description="这一轮实际发出去的 token 估算总量（含因超限未存进 sections 的部分）",
-    )
-    truncated: bool = False
-    dropped_items: int = Field(default=0, ge=0)
-    sections: list[PromptSnapshotSection] = Field(default_factory=list)
-    # 给人看的一句状态说明（expired / unavailable 时解释原因，纯文本）
-    note: str | None = None
-
-
 # ---------------------------------------------------------------- 错误
 
 
@@ -900,12 +786,6 @@ __all__ = [
     "OperationState",
     "Origin",
     "OutlineRelation",
-    "PromptBlock",
-    "PromptSnapshotItem",
-    "PromptSnapshotModel",
-    "PromptSnapshotOut",
-    "PromptSnapshotSection",
-    "PromptSnapshotState",
     "RuntimeScope",
     "SessionRecord",
     "TimelineState",

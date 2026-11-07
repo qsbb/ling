@@ -200,98 +200,6 @@ if _SCALE != 1.0:
     HISTORY_TOKEN_BUDGET = max(400, int(HISTORY_TOKEN_BUDGET * _SCALE))
 
 
-@dataclass(frozen=True)
-class CompiledMessage:
-    """一条要发给模型的消息 + 它的**语义块归属**。
-
-    ## 为什么块归属必须由编译器直接给出
-
-    「查看本次提示词」要按块分组（人设 / 记忆 / 摘要 / 历史 / 这次输入 / 媒体）。
-    事后拿正文去猜（"这段以『以下是你查到的外部资料』开头，所以是知识库"）
-    一定会猜错：知识库与证据都用 system 角色、都含中文、措辞会随版本改。
-    所以装配的**那一刻**就把 `lane`（车道名）与 `key`（展示分组）一起记下来，
-    并把 `messages` 直接由这份标注生成——保证"发给模型的"与"快照里记的"
-    是同一份数据，而不是两份各自拼出来的近似物。
-
-    ``sender`` / ``at`` 只有历史消息有：群里"这条是谁说的、什么时候"是读快照
-    的人最需要的信息，而正文里的署名前缀是模型看的形态（``阿岚：…``）。
-    """
-
-    role: str
-    content: str
-    # 展示分组：system / persona / memory / summary / history / input / media / plan / other
-    key: str
-    # 生产者车道名（persona / evidence / media …）。比 key 细，用于排查
-    # "这块到底是谁注入的"；同一个 key 下可能有多个 lane。
-    lane: str
-    sender: str | None = None
-    at: datetime | None = None
-
-
-def lane_key(lane: str) -> str:
-    """车道名 → 展示分组 key。
-
-    这是一张**显式**的表，不是按名字前缀猜的：
-    新增车道却没写进来时落到 ``other``（界面上仍然看得见、只是没归组），
-    而不是被静默算进某个不相干的组里。
-    """
-    return LANE_TO_KEY.get(lane, "other")
-
-
-# 车道 → 展示分组。
-#
-# 分组的依据是**读者要回答的问题**，不是代码结构：
-# - 「system」人设与规则：她是谁、边界、此刻场景、能用什么表达方式；
-# - 「memory」记忆与关系：为什么她会提起这件事（证据/核心记忆/知识/
-#   短记忆/关系/自我状态/跨会话意识都在这一组，因为它们都是"她记得的"）；
-# - 「plan」：与"打算做什么"有关的目标（目前车道 `goals`，将来议程也归这里）；
-# - 「media」单独一组：图/语音/视频的描述是最容易被误读的一块
-#   （"她是不是假装看过"），必须能一眼看见它到底注入了什么。
-LANE_TO_KEY: dict[str, str] = {
-    "persona": "system",
-    "constraints": "system",
-    "scenario": "system",
-    "capabilities": "system",
-    "evidence": "memory",
-    "core_memory": "memory",
-    "knowledge": "memory",
-    "short_memory": "memory",
-    "relationship": "memory",
-    "self_state": "memory",
-    "world": "memory",
-    "goals": "plan",
-    "media": "media",
-}
-
-# key → 给人看的标签。前端**直接用这个 label**，不要在前端再翻译一遍：
-# 两处各写一份的结果是文案改了但只有一边生效。
-KEY_LABELS: dict[str, str] = {
-    "system": "人设与规则",
-    "persona": "人设",
-    "memory": "记忆与关系",
-    "summary": "更早的对话（摘要）",
-    "history": "之前的对话",
-    "input": "这次她收到的",
-    "media": "媒体",
-    "plan": "计划与目标",
-    "other": "其他注入",
-}
-
-# 分组在响应里的**固定顺序**：从"她是谁"到"她刚收到什么"，与阅读动机一致。
-# 只输出真正有内容的分组（不会为了凑顺序塞空壳）。
-KEY_ORDER: tuple[str, ...] = (
-    "system",
-    "persona",
-    "memory",
-    "plan",
-    "media",
-    "summary",
-    "history",
-    "input",
-    "other",
-)
-
-
 @dataclass
 class CompiledContext:
     messages: list[ChatMessageIn]
@@ -302,10 +210,6 @@ class CompiledContext:
     # 本轮冻结的受众快照对象。供内核复用（PolicyGate 裁决等），
     # 不放进 meta 是因为 meta 会被序列化进事件。
     snapshot: object | None = None
-    # 与 ``messages`` **逐条对应**的标注（同一顺序、同一内容）。
-    # 单独给一份而不是塞进 messages：``ChatMessageIn`` 是供应商端口的
-    # 入参类型，多带字段要么被供应商拒、要么在适配器里被丢掉。
-    annotated: list[CompiledMessage] = field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -1045,17 +949,8 @@ class ContextCompiler:
         # 于是 capabilities 两段永远不进总预算，注释却写着"要参与"）。
         contributions = _apply_total_budget(contributions, compiled_meta)
 
-        # 每条消息在装配的**这一刻**就打上语义块标签（见 ``CompiledMessage``）。
-        # `messages` 由这份标注生成，不是另拼一遍——两次拼装迟早会不一致，
-        # 而"快照说他看到的"与"实际发出去的"不一致，正好是这功能最不该犯的错。
-        annotated: list[CompiledMessage] = [
-            CompiledMessage(
-                role="system",
-                content=c.text,
-                key=lane_key(c.lane),
-                lane=c.lane,
-            )
-            for c in contributions
+        messages: list[ChatMessageIn] = [
+            ChatMessageIn(role="system", content=c.text) for c in contributions
         ]
 
         # --- 分层装配：摘要层 + 最近原文层 ---
@@ -1063,15 +958,13 @@ class ContextCompiler:
         # 复用上面已经读过的那一行（见 `_window_ctx_cache`）
         window_ctx = getattr(self, "_window_ctx_cache", None)
         if window_ctx is not None and window_ctx.summary:
-            annotated.append(
-                CompiledMessage(
+            messages.append(
+                ChatMessageIn(
                     role="system",
                     content=(
                         f"本窗口较早的对话摘要（截至第 {window_ctx.summary_through_sequence} 条，"
                         f"共 {window_ctx.summary_message_count} 条）：\n{window_ctx.summary}"
                     ),
-                    key="summary",
-                    lane="summary",
                 )
             )
 
@@ -1198,18 +1091,7 @@ class ContextCompiler:
                 content = f"{name}：{content}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
-            annotated.append(
-                CompiledMessage(
-                    role=role,
-                    content=content,
-                    key="history",
-                    lane="history",
-                    # 群里这条是谁说的（历史署名用的那个名字）；私聊/她自己的
-                    # 发言没有署名，留 None 而不是编一个。
-                    sender=name if role == "user" else None,
-                    at=getattr(msg, "created_at", None),
-                )
-            )
+            messages.append(ChatMessageIn(role=role, content=content))
 
         # 3) 溢出部分压缩进摘要（不调用模型：确定性抽取，避免每轮增加延迟与费用）
         if dropped:
@@ -1257,23 +1139,14 @@ class ContextCompiler:
             # 群里有人在说话，而不是用户在跟她说话。
             user_sender_name = None
         current = f"{user_sender_name}：{user_text}" if user_sender_name else user_text
-        annotated.append(
-            CompiledMessage(
-                role="user",
-                content=current,
-                key="input",
-                lane="input",
-                sender=user_sender_name,
-            )
-        )
+        messages.append(ChatMessageIn(role="user", content=current))
         return CompiledContext(
-            messages=[ChatMessageIn(role=m.role, content=m.content) for m in annotated],
+            messages=messages,
             contributions=contributions,
             memory_ids=[h.memory_id for h in recall.hits],
             filtered_memories=recall.filtered_out,
             meta=compiled_meta,
             snapshot=snapshot,
-            annotated=annotated,
         )
 
     async def _rollup_summary(
@@ -1329,18 +1202,7 @@ class ContextCompiler:
         return f"{UNTRUSTED_WRAPPER}\n[来源: {source}]\n{text}"
 
 
-__all__ = [
-    "KEY_LABELS",
-    "KEY_ORDER",
-    "LANE_TO_KEY",
-    "CompiledContext",
-    "CompiledMessage",
-    "ContextCompiler",
-    "DEFAULT_BUDGETS",
-    "UNTRUSTED_WRAPPER",
-    "estimate_tokens",
-    "lane_key",
-]
+__all__ = ["CompiledContext", "ContextCompiler", "DEFAULT_BUDGETS", "UNTRUSTED_WRAPPER"]
 
 
 # ---------------------------------------------------------------- 总预算

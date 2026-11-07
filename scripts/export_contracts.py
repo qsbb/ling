@@ -42,14 +42,6 @@ EXPORTED = [
     "TodayOutlineItem",
     "IntentTeaserOut",
     "IntentTeaserItem",
-    # 「查看本次提示词」：某条回复当时真正发给模型的上下文（只读快照）。
-    # 枚举 `PromptBlock` / `PromptSnapshotState` **不单独导出**（导出器只处理
-    # Object 契约）；它们的取值已内联在 `PromptSnapshotSection.key` 与
-    # `PromptSnapshotOut.state` 的 schema enum 里，前端从那里取即可。
-    "PromptSnapshotItem",
-    "PromptSnapshotModel",
-    "PromptSnapshotOut",
-    "PromptSnapshotSection",
 ]
 
 
