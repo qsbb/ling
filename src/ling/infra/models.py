@@ -1618,6 +1618,51 @@ SEGMENT_SOURCES: tuple[str, ...] = ("model", "rule", "baseline", "user")
 BEHAVIOR_CALL_STATES: tuple[str, ...] = ("reserved", "committed", "failed", "expired")
 DREAM_STATUSES: tuple[str, ...] = ("ready", "failed", "missed", "no_dream")
 
+# ------------------------------------------------------------ 长程意向（§3A/§6）
+#
+# 意向是"有目标日期区间、**没有**执行时段"的目标，和 `day_plans` 的段是两种东西：
+# `confirmed` 只代表"用户对这个目标/日期作过明确确认"，**不是**某时段的承诺。
+# 硬锚点只能来自 commitments / confirmed agenda_plans / 周期规则 occurrence。
+INTENTION_STATES: tuple[str, ...] = (
+    "proposed",
+    "planned",
+    "confirmed",
+    "completed",
+    "missed",
+    "abandoned",
+    "expired_unknown",
+)
+INTENTION_TERMINAL_STATES: tuple[str, ...] = (
+    "completed",
+    "missed",
+    "abandoned",
+    "expired_unknown",
+)
+# 模型只能创 `proposed`；`user`/`actor`/`recurrence` 才允许带来源的 `planned`。
+INTENTION_SOURCE_KINDS: tuple[str, ...] = ("model", "user", "actor", "recurrence")
+# 意向类别：与段的活动类别同一套标签，另加 `travel`/`other`。**不含 sleep**：
+# 睡眠只由作息锚点产生，不能靠一条"想睡觉"的意向变成时间轴上的段。
+INTENTION_KINDS: tuple[str, ...] = (
+    "meal",
+    "work",
+    "study",
+    "reading",
+    "exercise",
+    "walk",
+    "chore",
+    "errand",
+    "leisure",
+    "social",
+    "hobby",
+    "rest",
+    "commute",
+    "travel",
+    "free",
+    "other",
+)
+# 周期规则**本批只建表、不做展开**（设计 §6：等夜间输入装配那一批再接）。
+RECURRENCE_RULE_STATES: tuple[str, ...] = ("active", "paused", "cancelled")
+
 
 def _in_check(column: str, values: tuple[str, ...], *, name: str) -> CheckConstraint:
     """生成 ``column IN ('a','b')`` 的 CHECK。
@@ -1672,6 +1717,200 @@ class DayPlanRow(Base, TimestampMixin):
     last_error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
 
 
+class ScheduleIntentionRow(Base, TimestampMixin):
+    """一条**有目标日期区间、没有执行时段**的长程意向（设计 §3A）。
+
+    ## 三个对象必须分清
+
+    - ``day_plans(D)``：某一天可修订的候选时间轴；
+    - ``schedule_intentions``：指向未来日期区间的**有来源目标**，尚无时段；
+    - ``commitments`` / confirmed ``agenda_plans`` / 周期 occurrence：才可能提供
+      D 的**不可移动时间锚点**。
+
+    所以 ``state='confirmed'`` **不是**"某个时段已经约好"：它只表示用户对这个
+    目标/日期作过明确确认，仍然是高优先**软偏好**。把 `confirmed` 当硬占用会
+    让"周五想旅行"凭空堵掉整周的时间轴。
+
+    本表也**不承载**完成事实：``completed`` 只保存证据引用，事实入库仍归
+    ``activities`` + 完成证据链，绝不写 ``self_experiences``。
+
+    ## 唯一性与幂等
+
+    ``UNIQUE(actor_id, source_kind, source_ref, target_start_day, target_end_day)``
+    是"同一来源重放返回原 ID"的凭据。**不用**标题或 JSON 做唯一性：标题会改，
+    JSON 在 PostgreSQL 里没有稳定的相等语义。
+
+    ## 状态与证据
+
+    - ``proposed`` 模型/歧义候选，``planned`` 有明确来源的愿望，``confirmed``
+      有**独立确认来源**（CHECK 要求 ``confirmation_source_ref`` 非空）；
+    - 终态 ``completed/missed/abandoned/expired_unknown`` 不可复活；
+    - 终态必须带证据引用，**只有** ``expired_unknown`` 例外——"过期 = 不知道"，
+      没有证据就不能写成 ``missed``。
+
+    ## 两个版本号
+
+    ``revision`` 是写入方的乐观锁（每次变更 +1）；``horizon_rev`` 只跟**展望
+    投影**相关的变更走（状态/目标区间/priority/准备依赖/可见范围），夜间
+    D+1…D+7 输入快照用它做 CAS。反复进入 prompt/展望**不构成升级证据**，也不会
+    改动这两个值。
+
+    ## 保留期（本批只写约定，清理任务不实现）
+
+    终态正文 90 天后归档为"ID/状态/来源哈希/时间"的审计摘要，审计摘要至少留
+    1 年；被计划段或决定引用的行不提前删。
+    """
+
+    __tablename__ = "schedule_intentions"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "source_kind",
+            "source_ref",
+            "target_start_day",
+            "target_end_day",
+            name="uq_schedule_intentions_source",
+        ),
+        Index(
+            "ix_schedule_intentions_actor_horizon",
+            "actor_id",
+            "target_start_day",
+            "state",
+        ),
+        CheckConstraint(
+            "target_end_day >= target_start_day",
+            name="ck_schedule_intentions_window",
+        ),
+        # 目标跨度 ≤ 90 天（设计 §6）。写成减法而不是 `date + 90`：Date 加整数
+        # 在 PostgreSQL 是"加天数"，但在 sqlite/其它方言里没有同义语义。
+        CheckConstraint(
+            "target_end_day - target_start_day <= 90",
+            name="ck_schedule_intentions_span",
+        ),
+        CheckConstraint(
+            "(prep_due_day IS NULL) = (prep_source_ref IS NULL)",
+            name="ck_schedule_intentions_prep_pair",
+        ),
+        CheckConstraint(
+            "prep_due_day IS NULL OR prep_due_day < target_start_day",
+            name="ck_schedule_intentions_prep_due",
+        ),
+        CheckConstraint(
+            "state != 'confirmed' OR confirmation_source_ref IS NOT NULL",
+            name="ck_schedule_intentions_confirmed_source",
+        ),
+        CheckConstraint("priority BETWEEN 0 AND 100", name="ck_schedule_intentions_priority"),
+        CheckConstraint("revision >= 1", name="ck_schedule_intentions_revision"),
+        CheckConstraint("horizon_rev >= 1", name="ck_schedule_intentions_horizon_rev"),
+        _in_check("state", INTENTION_STATES, name="ck_schedule_intentions_state"),
+        _in_check(
+            "source_kind",
+            INTENTION_SOURCE_KINDS,
+            name="ck_schedule_intentions_source_kind",
+        ),
+        _in_check("kind", INTENTION_KINDS, name="ck_schedule_intentions_kind"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    # 目标区间用 `target_timezone` 的**本地日期**表达（与 plan_day 同为午夜日），
+    # 不是 UTC 日期：解析/展示都按 IANA 时区投影，不能拿服务器时区推断。
+    target_start_day: Mapped[date] = mapped_column(Date)
+    target_end_day: Mapped[date] = mapped_column(Date)
+    target_timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    # 类别（受 INTENTION_KINDS 白名单约束）；标题只是短主题，不参与唯一性。
+    kind: Mapped[str] = mapped_column(String(32), default="other")
+    title: Mapped[str] = mapped_column(String(120))
+    state: Mapped[str] = mapped_column(String(24), default="proposed")
+    # model / user / actor / recurrence
+    source_kind: Mapped[str] = mapped_column(String(16))
+    # 来源 ID：turn_id / commitment_id / recurrence_rule_id / 上游 intention_id。
+    # 撤回时按它递归传播（下游意向用 `source_ref=<上游 intention_id>` 表示派生）。
+    source_ref: Mapped[str] = mapped_column(String(160))
+    # 授权/证据引用：`confirm()` 写确认来源；终态写完成/失败/撤回的依据。
+    # 终态会覆盖确认时的值，所以**确认来源另存** `confirmation_source_ref`。
+    resolution_evidence_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    confirmation_source_ref: Mapped[str | None] = mapped_column(
+        String(160), nullable=True
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 前置依赖（§3A）：只有**另有来源**的准备依据才允许落准备段；二者同空或同非空。
+    # 用户确认"目标"不顺带确认模型猜的准备事项。
+    prep_source_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    prep_due_day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 0-100。展望排序在同状态内用它打破平手，不改变状态优先级。
+    priority: Mapped[int] = mapped_column(Integer, default=50)
+    horizon_rev: Mapped[int] = mapped_column(Integer, default=1)
+    # actor_private / subject_private / window_private / group_scope / public
+    visibility: Mapped[str] = mapped_column(String(32), default="actor_private")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ScheduleRecurrenceRuleRow(Base, TimestampMixin):
+    """用户确认的周期规则：**精确本地时段 + 有效期**（设计 §6）。
+
+    ## 本批只建表，展开**未启用**
+
+    这一批只落结构与约束：没有任何代码会读它生成 occurrence、也不会把它变成
+    时间轴上的硬锚点。展开要在夜间输入装配/周期接线那一批做，并且必须：
+
+    - 只在**用户确认了精确时段和有效期**后建 ``active``（`confirmation_source_ref`
+      必填且每 actor 唯一）；
+    - 按 ``weekday`` 在角色本地墙钟展开到 D 窗口，跨午夜拆成各计划日内的片段；
+    - 从不让"通常周四上课"这种软习惯自动变成硬锚点。
+
+    ``end_local_minute`` 允许到 1440（本地 24:00），表示"到当天结束"；跨午夜
+    请建两条规则，而不是写 ``end < start``——那会让 DST/日界换算失去唯一定义。
+    """
+
+    __tablename__ = "schedule_recurrence_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "confirmation_source_ref",
+            name="uq_schedule_recurrence_rule_source",
+        ),
+        CheckConstraint("weekday BETWEEN 0 AND 6", name="ck_schedule_recurrence_weekday"),
+        CheckConstraint(
+            "start_local_minute BETWEEN 0 AND 1439 AND "
+            "end_local_minute BETWEEN 1 AND 1440",
+            name="ck_schedule_recurrence_minutes",
+        ),
+        CheckConstraint(
+            "end_local_minute > start_local_minute",
+            name="ck_schedule_recurrence_range",
+        ),
+        CheckConstraint(
+            "effective_end_day >= effective_start_day",
+            name="ck_schedule_recurrence_effective",
+        ),
+        _in_check("state", RECURRENCE_RULE_STATES, name="ck_schedule_recurrence_state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    # 规则属于谁（可空：单角色部署里是角色自己的固定安排）
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 0=周一 … 6=周日（与设计 §6 一致；Python 的 weekday() 同一口径）
+    weekday: Mapped[int] = mapped_column(Integer)
+    start_local_minute: Mapped[int] = mapped_column(Integer)
+    end_local_minute: Mapped[int] = mapped_column(Integer)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    effective_start_day: Mapped[date] = mapped_column(Date)
+    effective_end_day: Mapped[date] = mapped_column(Date)
+    # active / paused / cancelled
+    state: Mapped[str] = mapped_column(String(16), default="active")
+    # 用户确认的凭据（消息/确认记录 ID）。**不是**模型输出，模型无权建 active 规则。
+    confirmation_source_ref: Mapped[str] = mapped_column(String(160))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+
+
 class ScheduleSegmentRow(Base, TimestampMixin):
     """日程时间轴上的一个段（大块 / 小时 / 分钟）。
 
@@ -1715,6 +1954,13 @@ class ScheduleSegmentRow(Base, TimestampMixin):
             ["world_places.id"],
             name="fk_schedule_segments_place",
         ),
+        # 长程扩展（§6）：为某条意向准备的段。单列 FK 足够——意向属于 actor，
+        # 服务层再校验"段与意向同 actor"，没有复合键可借。
+        ForeignKeyConstraint(
+            ["intention_id"],
+            ["schedule_intentions.id"],
+            name="fk_schedule_segments_intention",
+        ),
         UniqueConstraint(
             "plan_id",
             "revision_created",
@@ -1725,6 +1971,7 @@ class ScheduleSegmentRow(Base, TimestampMixin):
         ),
         Index("ix_schedule_segments_actor_window", "actor_id", "start_at", "end_at"),
         Index("ix_schedule_segments_plan_rev", "plan_id", "revision_created"),
+        Index("ix_schedule_segments_intention_status", "intention_id", "status"),
         CheckConstraint("end_at > start_at", name="ck_schedule_segments_order"),
         # 根段 ``parent_id IS NULL`` 且 ``parent_key = ''``；子段两者都非空。
         # **不能**写成 ``length(parent_key) > 0``：那会把根段（空串是唯一键的
@@ -1743,6 +1990,12 @@ class ScheduleSegmentRow(Base, TimestampMixin):
         CheckConstraint(
             "commitment_level IN ('tentative', 'confirmed')",
             name="ck_schedule_segments_commitment",
+        ),
+        # `intention_id` 与 `preparation_for_day` 同空或同非空：只有"为某目标日
+        # 准备的段"才引用意向，普通段不能只挂一半的关联。
+        CheckConstraint(
+            "(intention_id IS NULL) = (preparation_for_day IS NULL)",
+            name="ck_schedule_segments_preparation_pair",
         ),
     )
 
@@ -1774,6 +2027,13 @@ class ScheduleSegmentRow(Base, TimestampMixin):
     # 在哪一版被结束（superseded 时填）；NULL = 仍是当前版本
     revision_ended: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # 长程扩展（§6）：这条段是为哪条意向/哪个目标日做准备。旧段保持 NULL，
+    # **不猜来源**；两列由 CHECK 保证同空或同非空。
+    intention_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    preparation_for_day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 受众范围。新建准备段时由服务层取来源里**最严**的那个（见
+    # `domains/agenda/intents.strictest_visibility`）；旧段为 NULL（未知，不猜）。
+    visibility: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class ScheduleChangeRequestRow(Base, TimestampMixin):
@@ -2043,6 +2303,8 @@ __all__ = [
     "DayPlanRow",
     "DreamReportRow",
     "ScheduleChangeRequestRow",
+    "ScheduleIntentionRow",
+    "ScheduleRecurrenceRuleRow",
     "ScheduleSegmentRow",
     "SleepSettlementRow",
     "SpeechSegment",
