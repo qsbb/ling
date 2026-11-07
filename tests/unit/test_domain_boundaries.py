@@ -107,6 +107,19 @@ ALLOWED: dict[tuple[str, str], str] = {
         "授权记录是 consent 域的权威状态，媒体只读 .granted/.revision，"
         "绝不写它。如果改成在 media 里自己判断，撤权时就会出现两份事实。"
     ),
+    ("dream/service.py", "ling.domains.affect.service"): (
+        "跨夜结算要改 affect_states，而它的唯一写入方是 AffectService"
+        "（apply_sleep_settlement 只处理 global 分量的线性衰减、跨夜下限和"
+        "valence/arousal 回归）。dream 不自己拼 SQL 写 affect 的表：公式留在 "
+        "affect，dream 只负责「哪一晚、要不要结算、唯一键幂等」。"
+    ),
+    ("dream/service.py", "ling.domains.agenda.service"): (
+        "梦的睡眠日按「醒来所在本地日」算，需要作息 wake/rest。作息按 actor 存在 "
+        "agenda 域，AgendaService.routine() 是它的公开读取入口；dream 只读，不写"
+        "作息、不碰 agenda 的表。（agenda.timeline.sleep_anchors_for_day 不是 "
+        ".service 模块，闸门不允许直接 import；dream 用与之逐字同规则的墙钟/DST "
+        "换算得到 wake 瞬时，等价性由 tests/unit/test_dream_service.py 对拍。)"
+    ),
     ("memory/self_timeline.py", "ling.domains.agenda.service"): (
         "只取 routine().timezone 一个字段，用来算「今天」在角色本地时区的起点。"
         "作息（含时区）按 actor 存在 agenda 域的 actor_routines 里，"
