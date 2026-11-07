@@ -500,12 +500,18 @@ function QuickConfigDialog({
               <tbody>
                 {preview.rows.map((row) => (
                   <tr key={row.profile} className={`ms-quick__row--${row.change_kind}`}>
-                    <td>
+                    {/*
+                      `data-label` 是窄屏堆叠布局用的：375px 下四列表格会把
+                      `perception.vision`、`fast-mini` 这类标识符拆成一字一行，
+                      整个 diff 变得不可读。窄屏改成"每条一段、标签在左值在右"，
+                      标签就取这里的值——和表头共用同一份文案，不会说岔。
+                    */}
+                    <td data-label="职责">
                       {roleLabel(row.profile)} <code>{row.profile}</code>
                     </td>
-                    <td>{row.slot_label}</td>
-                    <td>{row.model_id ?? '—'}</td>
-                    <td>{row.change}</td>
+                    <td data-label="配置为">{row.slot_label}</td>
+                    <td data-label="具体模型">{row.model_id ?? '—'}</td>
+                    <td data-label="变化">{row.change}</td>
                   </tr>
                 ))}
               </tbody>

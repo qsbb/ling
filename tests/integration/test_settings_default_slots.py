@@ -491,3 +491,41 @@ async def test_dialogue_fast_can_follow_slot_outside_test_mode(logged_in: TestEn
     # 收尾：把测试模式改回去，别影响同库的其它用例
     restore = await _draft(logged_in, {"test_mode": True})
     await logged_in.client.post("/v1/settings/publish", json={"revision": restore["revision"]})
+
+
+async def test_quick_config_reports_mode_change_even_when_model_is_same(
+    logged_in: TestEnv,
+) -> None:
+    """**关键**：单独指定的模型和槽位恰好相同时，快速配置仍然在改东西。
+
+    它把"你的单独指定"换成"跟随默认"——模型这一刻一样，但以后改槽位它就会
+    跟着漂。只比生效模型的话会报成「与现在相同」，用户点下去才发现自己的选择
+    被换掉了，这跟不给 diff 没区别。
+
+    这是视觉验收实测出来的：确认弹窗说"没有需要覆盖的单独指定"，点确认后那条
+    从「单独指定」变成「继承」，产生一处未保存改动。
+    """
+    await _publish_slots(logged_in)
+    # 「快速」槽位是 m-fast；把日常对话**单独指定**成同一个 m-fast
+    body = await _draft(
+        logged_in,
+        {
+            "providers": [MAIN],
+            "profiles": [
+                {"profile": "dialogue.fast", "provider_id": "main", "model_id": "m-fast"},
+            ],
+        },
+    )
+    await logged_in.client.post("/v1/settings/publish", json={"revision": body["revision"]})
+
+    response = await logged_in.client.post(
+        "/v1/settings/quick-config/preview",
+        json={"providers": [MAIN]},
+    )
+    assert response.status_code == 200, response.text
+    rows = {row["profile"]: row for row in response.json()["rows"]}
+    row = rows["dialogue.fast"]
+    # 模型没变，但绑定方式要变 —— 必须报成"会覆盖"，不能报"与现在相同"
+    assert row["change_kind"] == "override", row
+    assert "跟随默认" in row["change"], row
+    assert "单独指定" in row["change"], row

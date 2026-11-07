@@ -2324,3 +2324,83 @@
     grid-column: 1 / -1;
   }
 }
+
+/*
+ * 窄屏：快速配置的 diff 表格改成"每条一段"。
+ *
+ * 四列表格在 375px 下每列只剩约 80px，配上 `overflow-wrap: anywhere` 会把
+ * `perception.vision`、`fast-mini` 这种标识符拆成一字一行 —— 而这个弹窗存在的
+ * 唯一意义就是让人看清"点下去会发生什么"，读不了的 diff 等于没有。
+ *
+ * 用 `data-label` 取表头文案，不在这里另写一份中文，避免两处说岔。
+ */
+@media (max-width: 700px) {
+  .ms-quick thead {
+    display: none;
+  }
+
+  .ms-quick,
+  .ms-quick tbody,
+  .ms-quick tr,
+  .ms-quick td {
+    display: block;
+    width: auto;
+  }
+
+  .ms-quick tr {
+    padding: 10px 0;
+    border-bottom: 1px solid #efe8db;
+  }
+
+  .ms-quick tr:last-child {
+    border-bottom: 0;
+  }
+
+  .ms-quick td {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 3px 0;
+    border-bottom: 0;
+    /* 标识符不许在任意位置断开：那是"可读"与"不可读"的分界。 */
+    overflow-wrap: break-word;
+    word-break: normal;
+  }
+
+  .ms-quick td::before {
+    content: attr(data-label);
+    flex: 0 0 4.5em;
+    font-size: 11px;
+    color: var(--ms-muted);
+  }
+
+  .ms-quick td code {
+    margin-left: 0;
+  }
+}
+
+/*
+ * 触控目标：窄屏下所有可点元素 ≥44×44。
+ *
+ * 桌面鼠标能点 21px 高的「停用」，手指点不到 —— 视觉验收实测移动端有 10 个
+ * 控件低于这个尺寸。用 `min-height` 把命中区撑开，不改字号与排版密度，
+ * 所以桌面观感不受影响（媒体查询只在窄屏生效）。
+ */
+@media (max-width: 700px) {
+  .ms-btn,
+  .ms-btn--sm,
+  .ms-icon-btn,
+  .ms-badge--action,
+  .ms-role-row button,
+  .ms-modal__foot button,
+  .ms-select,
+  .ms-input {
+    min-height: 44px;
+  }
+
+  .ms-icon-btn,
+  .ms-badge--action,
+  .ms-role-row button {
+    min-width: 44px;
+  }
+}

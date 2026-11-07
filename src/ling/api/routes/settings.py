@@ -515,6 +515,17 @@ def _quick_config_rows(
         new = after.resolve_profile(profile)
         old_model = _effective_view(old)
         new_model = _effective_view(new)
+        # 光比"生效模型"不够：**绑定方式本身也会被快速配置改掉**。
+        # 用户单独指定了 X，而槽位恰好也是 X 时，模型没变、但他的选择被换成了
+        # "跟随默认"——以后改槽位它就会跟着漂。只比模型会把它报成"与现在相同"，
+        # 点了才知道发生了改动，这和不给 diff 没区别。
+        old_binding = before.profiles.get(profile)
+        new_binding = after.profiles.get(profile)
+        mode_changed = (
+            old_binding is not None
+            and new_binding is not None
+            and old_binding.mode is not new_binding.mode
+        )
         # 旧版兼容是**另一条轴**：那个模型既不是用户选的、也不是槽位来的。
         # 文案上必须分开，否则会写成"覆盖你选的 X"，而用户从没选过 X。
         if new.source is ResolutionSource.legacy_fallback:
@@ -529,9 +540,17 @@ def _quick_config_rows(
         elif old_model is None:
             change = "修复不可用"
             kind = "repair"
-        elif old_model == new_model:
+        elif old_model == new_model and not mode_changed:
             change = "与现在相同"
             kind = "same"
+        elif old_model == new_model and mode_changed:
+            # 模型一样但绑定方式变了：说清"你的单独指定会被改成跟随默认"，
+            # 而不是含糊地说"会变"。
+            change = (
+                f"模型仍是 {new_model['model_id']}，但你的单独指定会被改成"
+                f"「跟随默认 · {SLOT_LABELS[key]}」"
+            )
+            kind = "override"
         elif old.source is ResolutionSource.legacy_fallback:
             change = f"原来借的是 {old_model['model_id']}，之后改用 {new_model['model_id']}"
             kind = "override"
