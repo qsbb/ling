@@ -200,7 +200,10 @@ def _snapshot_model_info(
     用 ``resolve_profile`` 而不是自己读绑定：全系统只有一份解析规则，
     快照里写一套、路由里跑另一套的话，这份快照会解释错原因。
     """
-    info: dict[str, object] = {"profile": profile, "config_revision": config.revision}
+    info: dict[str, object] = {
+        "profile": profile,
+        "config_revision": getattr(config, "revision", None),
+    }
     try:
         resolved = config.resolve_profile(profile)
     except Exception:  # noqa: BLE001 - 记不下来不该影响快照本身
