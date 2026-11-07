@@ -17,6 +17,9 @@
  * 已迁出的三类（记忆与学习 ④、对话与主动性 ⑤、生活与活动 ⑧）**不在设置里**，
  * 它们在各自的领域页（记忆页 / 人设页 / 生活页）。底部那条灰字只是指路，
  * 不是入口——把入口留在这里就等于没迁。
+ *
+ * 「多用户与账号」同理已经离开设置：它成了一级导航「关系」（`/relationships`）。
+ * 它不在底部那行灰字里指路，因为左边导航本来就一直看得见，再指一次是多话。
  */
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
@@ -51,14 +54,18 @@ interface SettingsGroup {
 }
 
 /**
- * 三组 / 六个页面（DESIGN §2 的表）。顺序即渲染顺序：
+ * 三组 / 四个页面（DESIGN §2 的表）。顺序即渲染顺序：
  * 安全与隐私（一跳可达的权利与凭据）→ 模型与密钥（实例能力）→ 维护与关于（运维动作）。
+ *
+ * 条目数比原先少一个：「多用户与账号」已搬成一级导航「关系」（`/relationships`），
+ * 设置里不再留入口。留一条就是"迁出"没做干净——旧路径会经由
+ * `LEGACY_REDIRECTS` 精确跳到新地址，这里再放一个按钮只会让人以为它还在设置里。
  */
 export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   {
     key: 'security',
     title: '安全与隐私',
-    note: '主体权利与凭据。同意可以撤回、账号可以合并、密码可以改——都在一跳之内。',
+    note: '主体权利与凭据。同意可以撤回、密码可以改——都在一跳之内。',
     entries: [
       {
         key: 'privacy',
@@ -67,13 +74,6 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
         verb: '谁能看到什么：同意、撤回、有效期。撤回后新数据不再采集。',
         path: '/settings/privacy',
         testid: 'open-privacy',
-      },
-      {
-        key: 'identity',
-        label: '多用户与账号',
-        verb: '把同一个人的多个号认成一个人；合并只写指针，可随时拆开。',
-        path: '/settings/identity',
-        testid: 'open-identity',
       },
       {
         key: 'account',

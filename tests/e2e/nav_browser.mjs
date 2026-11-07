@@ -496,21 +496,25 @@ async function runDesktop(browser) {
   assert(
     JSON.stringify(railOrder) ===
       JSON.stringify([
-        'nav-dashboard', 'nav-chat', 'nav-memory', 'nav-persona',
+        'nav-dashboard', 'nav-chat', 'nav-memory', 'nav-persona', 'nav-relationships',
         'nav-life', 'nav-logs', 'nav-settings', 'nav-version',
       ]),
     `左导航顺序不对：${railOrder.join(' → ')}`,
   );
-  ok('桌面：导航顺序 总览→对话→记忆→人设→生活→日志→设置→版本', railOrder.join(' → '));
+  ok(
+    '桌面：导航顺序 总览→对话→记忆→人设→关系→生活→日志→设置→版本',
+    railOrder.join(' → '),
+  );
 
   await shot(page, 'desktop-01-dashboard');
 
-  // 七项可达
+  // 八项可达（关系是从设置里搬出来的一级页，和其余内容项同权）
   const routes = [
     ['nav-dashboard', '/dashboard'],
     ['nav-chat', '/'],
     ['nav-memory', '/memory'],
     ['nav-persona', '/persona'],
+    ['nav-relationships', '/relationships'],
     ['nav-life', '/life'],
     ['nav-logs', '/logs'],
     ['nav-settings', '/settings'],
@@ -526,7 +530,7 @@ async function runDesktop(browser) {
     assert(dims.scrollWidth <= dims.innerWidth, `${href} 出现横向滚动：${dims.scrollWidth}/${dims.innerWidth}`);
     await shot(page, `desktop-page-${testid.replace('nav-', '')}`);
   }
-  ok('桌面：七项导航都可达、URL 正确、当前项唯一');
+  ok('桌面：八项导航都可达、URL 正确、当前项唯一');
 
   // /settings/* 与 /s/:id 的高亮
   await gotoPage(page, '/settings/model');
@@ -585,6 +589,20 @@ async function runDesktop(browser) {
   assert(current.count === 1 && current.testid === 'nav-memory', `/settings/memory 应高亮记忆，实际 ${JSON.stringify(current)}`);
   ok('桌面：旧路径 /settings/memory 高亮「记忆」（按内容，不按前缀）');
   await shot(page, 'desktop-04-memory-settings');
+
+  // 旧路径 /settings/identity → 一级页 /relationships（「多用户与账号」改名「关系」）。
+  // 两条都要验：地址真的被 replace 掉（不是只渲染了目标页），当前项是「关系」
+  // 而不是「设置」——后者会让从旧书签进来的人看到设置亮一下再跳走。
+  await gotoPage(page, '/settings/identity');
+  const landed = await waitPath(page, '/relationships');
+  assert(landed, `/settings/identity 应重定向到 /relationships，实际 ${await pathOf(page)}`);
+  current = await currentNav(page);
+  assert(
+    current.count === 1 && current.testid === 'nav-relationships',
+    `/settings/identity 应高亮「关系」，实际 ${JSON.stringify(current)}`,
+  );
+  ok('桌面：旧路径 /settings/identity 重定向到 /relationships 并高亮「关系」', await pathOf(page));
+  await shot(page, 'desktop-04b-relationships-legacy');
 
   // 进一次聊天页：`GET /v1/sessions` 会给该主体确保一个默认会话窗口，
   // 之后才有真实的 `/s/:id` 可以验证高亮（不是编一个不存在的 id）。

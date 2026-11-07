@@ -1,5 +1,10 @@
 /**
- * 多用户与账号：谁是谁，以及「这几个号是不是同一个人」。
+ * 关系：谁是谁，以及「这几个号是不是同一个人」。
+ *
+ * 它是**一级导航页**（`/relationships`），不再是设置子页。用户原话是
+ * 「设置里面的多用户与账号移到左边导航栏，叫『关系』」——判定标准与设置
+ * 瘦身时那条一致：谁和谁是一伙的是内容，不是实例配置。因此这里没有
+ * 「返回设置」，返回键回到聊天（与人设、生活两页同一套外壳）。
  *
  * ## 这一页最重要的性质：合并不搬数据
  *
@@ -15,6 +20,11 @@
  *
  * 页面上显示昵称，但**合并/拆开的依据是账号**。两个都叫「小明」的人不会被
  * 合并——那正是要避免的误判。
+ *
+ * ## 这次只换了位置与外壳
+ *
+ * 标题、返回键、入口。加载/合并/拆开/错误提示的逻辑与参数一行未改——
+ * 这是信息架构调整，不是重写页面。
  */
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
@@ -178,11 +188,12 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
 
   return (
     <section className="page">
+      {/* 一级页：返回键回聊天，不是回设置（它已经不在设置里了）。 */}
       <button type="button" className="back-link" onClick={onBack}>
-        <ArrowLeftIcon /> 返回设置
+        <ArrowLeftIcon /> 返回聊天
       </button>
 
-      <h1 className="page__title">多用户与账号</h1>
+      <h1 className="page__title">关系</h1>
       <p className="page__hint">
         同一个人在多个平台、或者一个平台上有多个号时，可以把它们认成同一个人。
         <strong>合并只写一个指针，不搬任何数据</strong>——合错了点「拆开」就还原，

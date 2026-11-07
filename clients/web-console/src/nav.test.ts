@@ -24,7 +24,8 @@ import {
   activeNavId,
   type NavSectionId,
 } from './components/Navigation';
-import { LEGACY_REDIRECTS, parseRoute, type Route } from './route';
+import { LEGACY_REDIRECTS, parseRoute, routePath, type Route } from './route';
+import { SETTINGS_GROUPS } from './components/SettingsHub';
 import {
   NAV_EXPANDED_KEY,
   overlayReducer,
@@ -49,22 +50,26 @@ const NOOP = () => undefined;
  * 用户拍板的顺序：总览（落地）→ 对话 → 记忆 → 人设 → 生活 → 日志，
  * 底部设置 + 版本号。
  *
- * **六项内容导航是硬契约**：`nav-logs` 插在「生活」与「设置」之间（日志是
- * 常驻运维入口，但要排在五个领域页之后）。这里手写而不是从 `PRIMARY_NAV`
- * 派生——派生出来的期望会跟着实现一起变，删掉一项也测不出来。
+ * **七项内容导航是硬契约**：`nav-relationships`（关系）插在「人设」与「生活」
+ * 之间——它和人设是同一个问题的两半（她是谁 / 你是谁、谁和谁是一个人），
+ * 落位理由写在 `Navigation.tsx` 的 `PRIMARY_NAV` 上。
+ * `nav-logs` 仍排在「生活」与「设置」之间（常驻运维入口，排在领域页之后）。
+ * 这里手写而不是从 `PRIMARY_NAV` 派生——派生出来的期望会跟着实现一起变，
+ * 删掉一项也测不出来。
  */
 const EXPECTED_ORDER = [
   'nav-dashboard',
   'nav-chat',
   'nav-memory',
   'nav-persona',
+  'nav-relationships',
   'nav-life',
   'nav-logs',
   'nav-settings',
   'nav-version',
 ];
 
-const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '生活', '日志', '设置'];
+const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '关系', '生活', '日志', '设置'];
 
 function renderShell(route: Route): string {
   return renderToStaticMarkup(
@@ -125,29 +130,32 @@ function activeTestId(html: string): string | null {
 /* ------------------------------------------------------------------ 顺序 */
 
 describe('一级导航的顺序（用户拍板的 A 方案）', () => {
-  it('左导航按「总览 → 对话 → 记忆 → 人设 → 生活 → 日志 → 设置 → 版本」排列', () => {
+  it('左导航按「总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志 → 设置 → 版本」排列', () => {
     // **断顺序**，不是「都在」：`toEqual` 对数组元素与位置同时生效，
-    // 把「记忆」挪到「人设」后面、把「日志」塞到「生活」之前、或把「设置」
-    // 提到列表里，这条都会红。
+    // 把「记忆」挪到「人设」后面、把「日志」塞到「生活」之前、把「关系」
+    // 挤到「人设」前面、或把「设置」提到列表里，这条都会红。
     //
-    // 这条也是「日志」项的落位契约：它必须**在生活之后、设置之前**。
-    // 只断言「nav-logs 存在」的话，把它放到最前面也能全绿——那是另一种导航。
+    // 两条落位契约：`nav-logs` 必须**在生活之后、设置之前**；
+    // `nav-relationships` 必须**在人设之后、生活之前**。
+    // 只断言「某项存在」的话，把它放到最前面也能全绿——那是另一种导航。
     expect(testidsIn(navigationRegion(renderShell({ name: 'dashboard' })))).toEqual(EXPECTED_ORDER);
     // 显式再断一次相邻关系，失败信息能直接指出是哪一项挤错了位置
     const order = testidsIn(navigationRegion(renderShell({ name: 'dashboard' })));
     expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-life') + 1);
     expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-settings') - 1);
+    expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-persona') + 1);
+    expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-life') - 1);
   });
 
   it('导航文字的顺序同样是契约（testid 对但文字错也算错）', () => {
     expect(labelsIn(navigationRegion(renderShell({ name: 'dashboard' })))).toEqual(EXPECTED_LABELS);
   });
 
-  it('设置与版本号固定在底部（不在六项内容导航里面）', () => {
+  it('设置与版本号固定在底部（不在七项内容导航里面）', () => {
     const region = navigationRegion(renderShell({ name: 'dashboard' }));
     const listEnd = region.indexOf('sidenav__foot');
     expect(listEnd, '找不到底部区域').toBeGreaterThanOrEqual(0);
-    // 六项内容项都在底部区域之前，设置与版本在之后
+    // 七项内容项都在底部区域之前，设置与版本在之后
     for (const item of PRIMARY_NAV) {
       expect(region.indexOf(`data-testid="${item.testid}"`)).toBeLessThan(listEnd);
     }
@@ -195,9 +203,15 @@ const ALL_ROUTES: Array<{ route: Route; label: string; highlight: string | null 
   { route: { name: 'settings' }, label: '/settings', highlight: 'nav-settings' },
   { route: { name: 'model' }, label: '/settings/model', highlight: 'nav-settings' },
   { route: { name: 'privacy' }, label: '/settings/privacy', highlight: 'nav-settings' },
-  { route: { name: 'identity' }, label: '/settings/identity', highlight: 'nav-settings' },
   { route: { name: 'account' }, label: '/settings/account', highlight: 'nav-settings' },
   { route: { name: 'about' }, label: '/settings/about', highlight: 'nav-settings' },
+  // 「关系」是一级页：高亮它自己，不是「设置」。留在 settings 分组里的话，
+  // 打开关系页时左导航会指向一个不是当前页的地方。
+  {
+    route: { name: 'relationships' },
+    label: '/relationships',
+    highlight: 'nav-relationships',
+  },
   {
     route: { name: 'legacyRedirect', to: '/memory?tab=settings' },
     label: '/settings/memory（旧）',
@@ -212,6 +226,12 @@ const ALL_ROUTES: Array<{ route: Route; label: string; highlight: string | null 
     route: { name: 'legacyRedirect', to: '/life?tab=rhythm' },
     label: '/settings/life（旧）',
     highlight: 'nav-life',
+  },
+  {
+    // 旧地址的高亮必须是「关系」——否则从旧书签进来会先亮一下「设置」再跳走。
+    route: { name: 'legacyRedirect', to: '/relationships' },
+    label: '/settings/identity（旧）',
+    highlight: 'nav-relationships',
   },
   { route: { name: 'notFound' }, label: '/qa-no-such-route', highlight: null },
 ];
@@ -254,12 +274,13 @@ describe('当前项：aria-current="page" 唯一且指对地方', () => {
 
   it('/settings/* 全部高亮「设置」（子页不再是无归属页，SHOTS_REPORT §5.7）', () => {
     // Step 4 之后 /settings 下只剩这些**留在设置里**的子页：
-    // 记忆/对话/生活三条旧地址已迁出，它们是重定向，不再属于这个前缀。
+    // 记忆/对话/生活三条旧地址已迁出，它们是重定向，不再属于这个前缀；
+    // 「多用户与账号」也搬成了一级导航「关系」，`/settings/identity` 现在
+    // 同样只是一个重定向，所以**不在这张表里**——它落到的页高亮「关系」。
     const settingsPaths = [
       '/settings',
       '/settings/model',
       '/settings/privacy',
-      '/settings/identity',
       '/settings/account',
       '/settings/about',
     ];
@@ -277,9 +298,11 @@ describe('当前项：aria-current="page" 唯一且指对地方', () => {
     expect(activeNavId(parseRoute('/settings/memory'))).toBe('memory');
     expect(activeNavId(parseRoute('/settings/dialogue'))).toBe('persona');
     expect(activeNavId(parseRoute('/settings/life'))).toBe('life');
+    // 「关系」同理：`/settings/identity` 的前缀也是 /settings，但目标页是关系。
+    expect(activeNavId(parseRoute('/settings/identity'))).toBe('relationships');
   });
 
-  it('三个旧地址：重定向目标与高亮一一对应（表是唯一权威）', () => {
+  it('四个旧地址：重定向目标与高亮一一对应（表是唯一权威）', () => {
     for (const [from, to] of Object.entries(LEGACY_REDIRECTS)) {
       const route = parseRoute(from);
       expect(route, `${from} 没有命中重定向表`).toEqual({ name: 'legacyRedirect', to });
@@ -304,7 +327,7 @@ describe('当前项：aria-current="page" 唯一且指对地方', () => {
  * `/settings/*` 通配重定向，这条会立刻红——通配会把拼错的设置子路径
  * 也悄悄导到一个能用的页面，`notFound` 要暴露的东西就再也暴露不出来。
  */
-describe('旧地址重定向表：三条精确命中，表外一律 notFound', () => {
+describe('旧地址重定向表：四条精确命中，表外一律 notFound', () => {
   it('/settings/memory → /memory?tab=settings（记忆与学习回到记忆页）', () => {
     expect(parseRoute('/settings/memory')).toEqual({
       name: 'legacyRedirect',
@@ -326,6 +349,17 @@ describe('旧地址重定向表：三条精确命中，表外一律 notFound', (
     });
   });
 
+  it('/settings/identity → /relationships（多用户与账号搬成一级导航「关系」）', () => {
+    // 与上面三条不同：这是一次**页面搬家**，目标是整页，没有 tab 可带。
+    expect(parseRoute('/settings/identity')).toEqual({
+      name: 'legacyRedirect',
+      to: '/relationships',
+    });
+    // 新地址是一条真实的一级路由，而不是设置子页
+    expect(parseRoute('/relationships')).toEqual({ name: 'relationships' });
+    expect(routePath({ name: 'relationships' })).toBe('/relationships');
+  });
+
   it('表外路径一律 notFound（重定向表不许变成通配）', () => {
     // 拼错的旧地址：看起来像迁移过的，但表里没有它
     expect(parseRoute('/settings/unknown')).toEqual({ name: 'notFound' });
@@ -334,8 +368,49 @@ describe('旧地址重定向表：三条精确命中，表外一律 notFound', (
     // 表外但没有通配兜底的兄弟路径
     expect(parseRoute('/settings/policy')).toEqual({ name: 'notFound' });
     expect(parseRoute('/settings/memroy')).toEqual({ name: 'notFound' });
+    // 关系搬家的同款拼写错误也不能被导走
+    expect(parseRoute('/settings/identty')).toEqual({ name: 'notFound' });
+    expect(parseRoute('/relationshps')).toEqual({ name: 'notFound' });
     // 反证：通配「/settings/* → /settings」的写法会让上面几条全都变成 settings
     expect(parseRoute('/settings/unknown')).not.toEqual({ name: 'settings' });
+  });
+});
+
+/**
+ * 设置中心里**不再有**「关系」入口（用户原话：把多用户与账号移到左边导航栏）。
+ *
+ * 只断言"导航里多了关系"是不够的：设置里那条入口留着，用户仍然会从设置点进去，
+ * 那这次搬迁就只是多了一个入口、少了一件该做的事。这里直接盯 `SETTINGS_GROUPS`
+ * 这份数据表——它是设置页唯一的入口来源。
+ */
+describe('设置中心不再提供「关系」入口', () => {
+  it('没有任何设置条目指向 /settings/identity', () => {
+    const entries = SETTINGS_GROUPS.flatMap((group) => group.entries);
+    expect(entries.map((entry) => entry.path)).not.toContain('/settings/identity');
+    expect(entries.map((entry) => entry.testid)).not.toContain('open-identity');
+    // 标签也不能再出现旧名字（改名要改干净，别留一个「多用户与账号」的按钮）
+    expect(entries.map((entry) => entry.label)).not.toContain('多用户与账号');
+  });
+
+  it('所有设置条目都指向"留在设置里的真实子页"，不是旧地址', () => {
+    const entries = SETTINGS_GROUPS.flatMap((group) => group.entries);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      // 旧地址只该由书签/外链命中；设置页自己不能长出一条会立刻跳走的入口
+      expect(LEGACY_REDIRECTS[entry.path], `${entry.key} 指向了旧地址 ${entry.path}`).toBeUndefined();
+      expect(parseRoute(entry.path).name, `${entry.path} 不是真实路由`).not.toBe('notFound');
+      expect(parseRoute(entry.path).name, `${entry.path} 会立刻重定向`).not.toBe('legacyRedirect');
+      // 入口必须是留在设置里的页（高亮「设置」），否则设置页会把人送到别的导航项下
+      expect(activeNavId(parseRoute(entry.path)), `${entry.path} 不属于设置`).toBe('settings');
+    }
+  });
+
+  it('关系确实在别处：主导航里有一项「关系」指向 /relationships', () => {
+    const item = PRIMARY_NAV.find((nav) => nav.id === 'relationships');
+    expect(item, '主导航里没有 relationships 这一项').toBeDefined();
+    expect(item?.label).toBe('关系');
+    expect(item?.path).toBe('/relationships');
+    expect(item?.testid).toBe('nav-relationships');
   });
 });
 

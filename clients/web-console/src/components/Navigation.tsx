@@ -7,10 +7,11 @@
  * 当前项用 `aria-current="page"` 表达，不靠 class 名。
  *
  * 两条硬约束决定了这里的形状：
- * 1. **顺序是产品契约**（用户拍板 A 方案）：总览 → 对话 → 记忆 → 人设 → 生活 →
- *    日志，底部固定「设置」+ 版本号。顺序写在 `PRIMARY_NAV` 里，测试按顺序断言。
+ * 1. **顺序是产品契约**：总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志，
+ *    底部固定「设置」+ 版本号。顺序写在 `PRIMARY_NAV` 里，测试按顺序断言。
  *    「日志」排在「生活」之后、「设置」之前：它和设置在性质上是一类（程序与运维），
  *    但它是**常驻入口**——出问题时第一件事就是看它，不该再进设置里点两层。
+ *    「关系」插在「人设」与「生活」之间，理由见 `PRIMARY_NAV` 上的注释。
  * 2. 抽屉必须 **portal 到 body**：`.app-header` 有 `backdrop-filter: blur(10px)`，
  *    它会让 header 成为 `position: fixed` 的包含块——抽屉若留在 header 里，
  *    `inset: 0` 只盖住 header 自己那 56px，正文照样露在下面。
@@ -29,6 +30,7 @@ import {
   LogsIcon,
   MemoryIcon,
   PersonaIcon,
+  RelationshipsIcon,
   SettingsIcon,
 } from './Icons';
 
@@ -38,6 +40,7 @@ export type NavSectionId =
   | 'chat'
   | 'memory'
   | 'persona'
+  | 'relationships'
   | 'life'
   | 'logs'
   | 'settings';
@@ -55,12 +58,22 @@ export interface NavItemSpec {
  *
  * 手写而不是从 `Route` 派生：派生出来的期望值会跟着实现一起消失，
  * 删掉一项时测试仍然全绿。这里少一项、换一次顺序，`nav.test.ts` 都会红。
+ *
+ * **「关系」为什么插在「人设」和「生活」之间**（从设置里搬出来时的落位判断）：
+ * - 它与人设是同一个问题的两半——「她是谁」（人设）与「你是谁、谁和谁是一个人」
+ *   （关系）。挨着放，读导航时是一条连贯的线；若塞到「对话」「记忆」之间，
+ *   会被读成"聊天/记忆的设置"，而它其实是关于人的内容。
+ * - 它不该贴到底部的「设置」旁边：那里只放程序与运维，关系是内容不是配置——
+ *   这正是它被搬出设置的原因，落位再靠过去就等于没搬。
+ * - 放在「生活」之前，是为了不动已经定好的「生活 → 日志 → 设置」这条尾巴
+ *   （日志是常驻运维入口，必须紧挨设置那一侧）。
  */
 export const PRIMARY_NAV: readonly NavItemSpec[] = [
   { id: 'dashboard', testid: 'nav-dashboard', label: '总览', path: '/dashboard' },
   { id: 'chat', testid: 'nav-chat', label: '对话', path: '/' },
   { id: 'memory', testid: 'nav-memory', label: '记忆', path: '/memory' },
   { id: 'persona', testid: 'nav-persona', label: '人设', path: '/persona' },
+  { id: 'relationships', testid: 'nav-relationships', label: '关系', path: '/relationships' },
   { id: 'life', testid: 'nav-life', label: '生活', path: '/life' },
   { id: 'logs', testid: 'nav-logs', label: '日志', path: '/logs' },
 ];
@@ -86,6 +99,7 @@ const ICONS: Record<NavSectionId, ReactElement> = {
   chat: <ChatIcon />,
   memory: <MemoryIcon />,
   persona: <PersonaIcon />,
+  relationships: <RelationshipsIcon />,
   life: <LifeIcon />,
   logs: <LogsIcon />,
   settings: <SettingsIcon />,
@@ -95,13 +109,16 @@ const ICONS: Record<NavSectionId, ReactElement> = {
  * 路由 → 高亮哪一项。
  *
  * - `/` 与 `/s/:id` 都算「对话」（`/s/:id` 只是当前会话的指针，不是新的一页）；
- * - `/settings` 与它下面所有子页都高亮「设置」——这是 SHOTS_REPORT §5.7 里
- *   「打开设置子页时顶栏没有任何一项是当前页」的直接修复；
- * - `/life` 对应「生活」（路由名仍叫 `now`，重命名是后面步骤的事）。
+ * - `/settings` 与它下面**仍留在设置里**的子页都高亮「设置」——这是 SHOTS_REPORT
+ *   §5.7 里「打开设置子页时顶栏没有任何一项是当前页」的直接修复；
+ * - `/life` 对应「生活」（路由名仍叫 `now`，重命名是后面步骤的事）；
+ * - `/relationships` 是**自己的一项**，不再算「设置」：把它留在 settings 分组里，
+ *   打开关系页时左导航会指向一个不是当前页的地方。
  *
- * **旧路径（Step 4 迁出设置的那三条）按目标页的高亮算**，不按地址栏前缀：
- * `/settings/memory` 现在只是一个 `replace` 前的中间态，它真正会停在
- * `/memory?tab=settings`——高亮「设置」再闪成「记忆」等于把中间态画给用户看。
+ * **旧路径按目标页的高亮算**，不按地址栏前缀：`/settings/memory` 现在只是一个
+ * `replace` 前的中间态，它真正会停在 `/memory?tab=settings`——高亮「设置」再
+ * 闪成「记忆」等于把中间态画给用户看。同理 `/settings/identity` 的高亮必须是
+ * 「关系」而不是「设置」，否则从旧书签进来会先亮一下设置再跳走。
  * 目标页的高亮由 `legacyRedirectTarget` 给出，与 `replace` 之后完全一致。
  */
 export function activeNavId(route: Route): NavSectionId | null {
@@ -114,6 +131,8 @@ export function activeNavId(route: Route): NavSectionId | null {
       return 'memory';
     case 'persona':
       return 'persona';
+    case 'relationships':
+      return 'relationships';
     case 'now':
       return 'life';
     case 'logs':
@@ -121,7 +140,6 @@ export function activeNavId(route: Route): NavSectionId | null {
     case 'settings':
     case 'model':
     case 'privacy':
-    case 'identity':
     case 'account':
     case 'about':
       return 'settings';

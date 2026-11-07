@@ -90,14 +90,15 @@ export function mainPage(props: MainPageProps): ReactElement {
           onLogout={onLogout}
         />
       );
-    case 'identity':
-      return <IdentityPage onBack={goSettings} />;
+    case 'relationships':
+      // 一级页：返回键回聊天（它不再属于设置，别把「返回设置」留在这儿）。
+      return <IdentityPage onBack={goChat} />;
     case 'about':
       return <AboutPage onBack={goSettings} />;
     case 'persona':
       return <PersonaPage onBack={goChat} />;
     case 'legacyRedirect':
-      // 旧地址（`/settings/memory` 等三条）的首帧：`replace` 在壳层的 effect 里，
+      // 旧地址（`/settings/memory` 等四条）的首帧：`replace` 在壳层的 effect 里，
       // 所以这一帧地址还是旧的。这里**直接渲染目标页的内容**，而不是先画一帧
       // 「无法识别的路由」——否则每次点旧书签都会闪一下 404。
       // 递归只有一层：`legacyRedirectTarget` 对"目标又是旧地址"返回 `notFound`。

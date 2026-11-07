@@ -164,6 +164,23 @@ export function PersonaIcon({ size = 17, className }: IconProps) {
 }
 
 /**
+ * 关系：两个并排的人——前面那个画全，后面那个只露半边。
+ *
+ * 不能复用 `PersonaIcon`：人设是「她是谁」（一个人），关系是「谁和谁是一伙的」
+ * （至少两个人）。同一个图标出现在两个导航项上，只能靠文字区分，扫一眼分不出来。
+ */
+export function RelationshipsIcon({ size = 17, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <circle cx="9" cy="8" r="3.2" />
+      <path d="M3.2 19.4c.8-3 3.1-4.7 5.8-4.7s5 1.7 5.8 4.7" />
+      <path d="M15.6 5.4a3 3 0 0 1 0 5.6" />
+      <path d="M16.9 14.9c2.4.3 4 1.8 4.7 4.3" />
+    </svg>
+  );
+}
+
+/**
  * 日志：一叠带横线的纸。
  *
  * 不画「终端窗口里的 `>_`」：那个形状在这套图标里会被读成"命令行工具"，

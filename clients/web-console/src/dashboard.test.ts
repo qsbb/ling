@@ -192,7 +192,7 @@ const ROUTE_NAME_SET = {
   memory: true,
   privacy: true,
   persona: true,
-  identity: true,
+  relationships: true,
   account: true,
   about: true,
   logs: true,
@@ -230,7 +230,7 @@ describe('路由表与页面表一一对应', () => {
     expect(parseRoute('/s/')).toEqual({ name: 'notFound' });
   });
 
-  it('已知路由零回归：10 条真实地址 + /s/{id} 深链', () => {
+  it('已知路由零回归：11 条真实地址 + /s/{id} 深链', () => {
     expect(parseRoute('/')).toEqual({ name: 'chat', sessionId: null });
     expect(parseRoute('/s/sess-1')).toEqual({ name: 'chat', sessionId: 'sess-1' });
     expect(parseRoute('/s/a%2Fb')).toEqual({ name: 'chat', sessionId: 'a/b' });
@@ -240,14 +240,17 @@ describe('路由表与页面表一一对应', () => {
     expect(parseRoute('/settings')).toEqual({ name: 'settings' });
     expect(parseRoute('/settings/model')).toEqual({ name: 'model' });
     expect(parseRoute('/settings/privacy')).toEqual({ name: 'privacy' });
-    expect(parseRoute('/settings/identity')).toEqual({ name: 'identity' });
+    // 「关系」成了一级页：它自己是一条真实路由……
+    expect(parseRoute('/relationships')).toEqual({ name: 'relationships' });
+    // ……而 `/settings/identity` 只剩重定向（下面那条用例逐条钉住目标）。
+    expect(parseRoute('/relationships/')).toEqual({ name: 'relationships' });
     expect(parseRoute('/settings/account')).toEqual({ name: 'account' });
     expect(parseRoute('/settings/about')).toEqual({ name: 'about' });
     expect(parseRoute('/persona')).toEqual({ name: 'persona' });
     expect(parseRoute('/memory')).toEqual({ name: 'memory' });
   });
 
-  it('旧地址命中精确重定向表：/settings/memory、/settings/dialogue、/settings/life', () => {
+  it('旧地址命中精确重定向表：三条 tab 深链 + 一条页面搬家', () => {
     // Step 4 把这三类的调参迁回各自的领域页（设置只放程序与运维）。
     // 旧地址必须**指出去**，而不是继续当一页内容渲染——否则「迁出」只是加了个别名。
     expect(parseRoute('/settings/memory')).toEqual({
@@ -262,21 +265,66 @@ describe('路由表与页面表一一对应', () => {
       name: 'legacyRedirect',
       to: '/life?tab=rhythm',
     });
+    // 「多用户与账号」搬家成一级导航「关系」：整页搬，没有 tab 可带。
+    expect(parseRoute('/settings/identity')).toEqual({
+      name: 'legacyRedirect',
+      to: '/relationships',
+    });
     // 尾斜杠同样命中（和真实路由的尾斜杠处理一致）
     expect(parseRoute('/settings/memory/')).toEqual({
       name: 'legacyRedirect',
       to: '/memory?tab=settings',
     });
+    expect(parseRoute('/settings/identity/')).toEqual({
+      name: 'legacyRedirect',
+      to: '/relationships',
+    });
   });
 
-  it('重定向目标必须是**真实路由**，且带 tab 深链', () => {
+  /**
+   * 表本身就是契约：**全等**，不是"遍历表里的每一条"。
+   *
+   * 遍历写法（`for (const [from, to] of Object.entries(LEGACY_REDIRECTS))`）
+   * 只能发现"表里某一条坏了"，发现不了"表里**多**了一条"——多出来的那条
+   * 会把一个本该 404 的地址悄悄导走，而这正是精确表要防的事。
+   * 全等断言把「加了新条目」也变成需要显式改测试的动作。
+   */
+  it('重定向表就是这四条，一条不多一条不少', () => {
+    expect(LEGACY_REDIRECTS).toEqual({
+      '/settings/memory': '/memory?tab=settings',
+      '/settings/dialogue': '/persona?tab=dialogue',
+      '/settings/life': '/life?tab=rhythm',
+      '/settings/identity': '/relationships',
+    });
+  });
+
+  /**
+   * 旧断言是「**每一条**目标都必须带 `?tab=`」。
+   *
+   * 它对 `/settings/identity → /relationships` 不成立，也不该成立：那是整页搬家，
+   * 目标页没有 tab 可带，硬造一个 `?tab=` 反而是错的地址。
+   *
+   * 所以按来源分成两类，各自用更准确的条件，**不是删掉断言**：
+   * - 三条「行为调参回领域页」的旧地址：原样要求带 `?tab=`（一条不少）；
+   * - 一条「页面搬家」的旧地址：目标必须**精确等于** `/relationships`
+   *   （比"含 ?tab="更严——`toContain('?tab=')` 允许尾巴上多挂任何东西）。
+   * 通用的「目标必须是真实路由 / 不循环 / 不引 hash」对四条仍然都生效。
+   */
+  it('重定向目标必须是真实路由、不循环、不引 hash 路由', () => {
     for (const [from, to] of Object.entries(LEGACY_REDIRECTS)) {
       const target = parseRoute(to.split('?')[0] ?? '/');
       expect(target.name, `${from} 的目标 ${to} 不是真实路由`).not.toBe('notFound');
       expect(target.name, `${from} 的目标又指向旧地址（会循环）`).not.toBe('legacyRedirect');
-      expect(to, `${from} 的目标 ${to} 没有 tab 深链`).toContain('?tab=');
       expect(to, `${from} 的目标用了 hash 路由`).not.toContain('#');
     }
+  });
+
+  it('三条 tab 深链仍带 ?tab=，搬家那条目标精确等于 /relationships', () => {
+    for (const from of ['/settings/memory', '/settings/dialogue', '/settings/life']) {
+      expect(LEGACY_REDIRECTS[from], `${from} 不在表里`).toBeDefined();
+      expect(LEGACY_REDIRECTS[from], `${from} 的目标没有 tab 深链`).toContain('?tab=');
+    }
+    expect(LEGACY_REDIRECTS['/settings/identity']).toBe('/relationships');
   });
 
   it('表外路径一律 notFound（重定向不许掩盖真 404）', () => {
@@ -286,6 +334,11 @@ describe('路由表与页面表一一对应', () => {
       '/settings/memory/extra',
       '/settings/dialogue/extra',
       '/settings/life/extra',
+      // 「关系」搬家的同类反证：拼错的 identity 与多一段的子路径都不能被导走
+      '/settings/identty',
+      '/settings/identity/extra',
+      '/relationships/extra',
+      '/relationshps',
       '/settings/policy',
       '/settings/whatever',
       '/settings/nope',
@@ -308,6 +361,14 @@ describe('路由表与页面表一一对应', () => {
     const life = renderRoute(parseRoute('/settings/life'));
     expect(life).not.toContain('data-testid="unknown-route"');
     expect(life).toContain('生活节奏');
+
+    // 「关系」搬家：旧地址首帧直接渲染关系页。标题是新的「关系」，
+    // 返回键回聊天——它已经不是设置子页了，不能还写着「返回设置」。
+    const relationships = renderRoute(parseRoute('/settings/identity'));
+    expect(relationships).not.toContain('data-testid="unknown-route"');
+    expect(relationships).toContain('<h1 class="page__title">关系</h1>');
+    expect(relationships).toContain('返回聊天');
+    expect(relationships).not.toContain('返回设置');
   });
 
   it('routePath 拒绝为 notFound 生成可导航 URL', () => {
