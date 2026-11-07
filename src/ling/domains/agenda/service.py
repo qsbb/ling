@@ -310,6 +310,37 @@ class AgendaService:
         row.revision = int(row.revision or 0) + 1
         await self._session.flush()
 
+    # ---------------------------------------------------------- 日计划（时间轴）
+
+    async def ensure_day_plan(
+        self,
+        *,
+        router: object | None = None,
+        config_reader: object | None = None,
+        plan_day: date | None = None,
+        now: datetime | None = None,
+        timezone: str | None = None,
+        lease_owner: str | None = None,
+    ):  # noqa: ANN201 - 返回 timeline.OutlineOutcome（延迟导入避免循环）
+        """确保某个**计划日**有一版大纲（阶段 1 的唯一写入入口）。
+
+        实现全在 ``agenda/timeline.py``：这里只转发，理由与 ``propose_plan``
+        相同——日程的写入必须只有一个门，``AgendaService`` 是那个门。
+        没有 worker 定时接线之前，测试与未来的 worker 都直接调它。
+        """
+        from ling.domains.agenda.timeline import ensure_day_plan
+
+        return await ensure_day_plan(
+            self._session,
+            actor_id=self._actor_id,
+            router=router,
+            config_reader=config_reader,
+            plan_day=plan_day,
+            now=now,
+            timezone=timezone,
+            lease_owner=lease_owner,
+        )
+
     # ---------------------------------------------------------- 时段边界
 
     def next_boundary(self, routine: RoutineView, *, now: datetime) -> datetime:
