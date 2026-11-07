@@ -103,11 +103,14 @@ async def _reset(logged_in: TestEnv) -> None:  # noqa: ARG001
     await _clean()
 
 
-async def _make_evidence(*, ref: str = "obj/pic.jpg") -> str:
+async def _make_evidence(*, ref: str = "obj/pic.jpg", kind: str = "image") -> str:
+    """登记一条证据。``kind`` 只为"视频不会被自动换职责"那条用例服务。"""
     await _grant()
     async with session_scope() as session:
         svc = MediaEvidenceService(session, actor_id=ACTOR)
-        view = await svc.record(subject_id=SUBJECT, window_id=WINDOW, media_ref=ref)
+        view = await svc.record(
+            subject_id=SUBJECT, window_id=WINDOW, media_ref=ref, kind=kind
+        )
         return view.evidence_id
 
 
@@ -166,6 +169,41 @@ async def test_describe_sends_image_to_vision_profile(logged_in: TestEnv) -> Non
     message = call["messages"][0]
     assert len(message.images) == 1, "图没送进去"
     assert message.images[0].url.startswith("data:image/png;base64,")
+
+
+async def test_video_evidence_is_not_auto_routed_to_video_profile(  # noqa: ARG001
+    logged_in: TestEnv,
+) -> None:
+    """kind=video **不会**自动改职责——视频要由调用方显式指定才读。
+
+    用户的要求是「不是每个视频都去读，只有她自己主动想读那个视频时才读」
+    （逐条自动描述白烧 token，而她当时可能根本用不上）。所以
+    `MediaDescriber` 只认构造时给的 ``profile``，**不按 evidence.kind 偷偷
+    切换**：接上"她想看才看"的入口时，由那一侧显式传
+    ``profile=VIDEO_PROFILE``。
+
+    这条钉住的是"没有偷偷改职责"：默认路径与改动前完全一致。
+    """
+    evidence_id = await _make_evidence(ref="obj/clip.mp4", kind="video")
+    router = _StubRouter(text="一段街上遛狗的视频")
+
+    async def fetch(_ref: str) -> tuple[bytes, str]:
+        # 真正的视频文件 Pillow 打不开，`expand_animation` 会原样返回。
+        return b"fake-mp4-bytes", "video/mp4"
+
+    async with session_scope() as session:
+        svc = MediaEvidenceService(session, actor_id=ACTOR)
+        evidence = await svc.get(evidence_id, window_id=WINDOW)
+        assert evidence is not None and evidence.kind == "video"
+        describer = MediaDescriber(
+            service=svc, fetch_media=fetch, router=router, config_reader=_StubConfig()
+        )
+        await describer.describe_one(evidence)
+
+    assert router.seen, "没有调用模型"
+    assert router.seen[0]["profile"] == "perception.vision", (
+        "职责被按 kind 自动切换了：视频必须由调用方显式指定 VIDEO_PROFILE"
+    )
 
 
 async def test_already_described_is_not_redone(logged_in: TestEnv) -> None:  # noqa: ARG001

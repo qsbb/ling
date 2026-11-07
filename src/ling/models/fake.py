@@ -35,6 +35,15 @@ def _persona_name(messages: list[ChatMessageIn]) -> str:
 
 def build_fake_reply(messages: list[ChatMessageIn], *, model_id: str) -> str:
     """根据输入生成稳定、可预测的回复（同一输入必得同一输出）。"""
+    for msg in messages:
+        if getattr(msg, "videos", ()):
+            # 假供应商模拟"不支持原生视频输入"的真实供应商：让"退回抽帧"
+            # 这条兜底路径在测试里真的被走到，而不是被 mock 掉。
+            raise ModelError(
+                ModelErrorKind.unsupported,
+                "假供应商不支持原生视频输入",
+                retriable=False,
+            )
     last_user = ""
     image_count = 0
     for msg in reversed(messages):

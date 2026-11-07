@@ -106,7 +106,15 @@ async def get_dashboard(
     # "今天"按**用户配置的本地时区**算，而不是 UTC 或服务器时区：
     # 响应顶层的 `timezone` 已经是这个值，日程的日界必须与它一致，
     # 否则东八区 00:00-08:00 的"今天"会退回前一天。
-    user_timezone = settings.user_timezone or "UTC"
+    #
+    # 时区**只从这里取**：`ling/settings/user_preferences.py`（DB 偏好 > env
+    # > Asia/Shanghai）。原来这里 `or "UTC"`，于是设置里根本没有时区却按 UTC
+    # 划日界——用户看到的"今天"和她的勿扰时段是两个时区算出来的。
+    from ling.settings.user_preferences import load_user_timezone
+
+    user_timezone, timezone_source = await load_user_timezone(
+        session, subject_id=subject_id, env=settings.user_timezone
+    )
 
     async def activity() -> dict:
         current = await ActivityService(session, actor_id=actor_id).current()
@@ -448,5 +456,8 @@ async def get_dashboard(
         "schema_version": "v1",
         "generated_at": datetime.now(UTC).isoformat(),
         "timezone": user_timezone,
+        # 这个时区是用户自己设的、环境变量给的，还是默认值？界面上的
+        # "今天"就按它算，用户有权知道它从哪来（分不清时就以为是自己的设置）。
+        "timezone_source": timezone_source.value,
         "sections": sections,
     }

@@ -70,6 +70,7 @@ operation_id，平台也无从按它去重或对账。
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 
 from sqlalchemy import select
@@ -192,6 +193,7 @@ async def dispatch_pending(
     connector: object,
     config_reader: object,
     subject_timezone: str | None = None,
+    subject_timezones: Mapping[str, str] | None = None,
     now: datetime | None = None,
     limit: int = MAX_PER_ROUND,
     deliver_to_web: bool = False,
@@ -204,6 +206,11 @@ async def dispatch_pending(
     为什么需要这条路：部署实例上 qqbot 平台不给主动推送权限、OneBot 没启用，
     于是"主动联系"这条需求永远只是代码里的空转——她永远不会先开口。
     Web 投递不带推送通知，但"她确实主动过"这件事成立。
+
+    ``subject_timezone`` 是**实例级兜底**；``subject_timezones`` 是逐个
+    subject 的偏好（``ling/settings/user_preferences.py::timezone_by_subject``）。
+    两者都要：多用户部署里每个人的"今天"和勿扰时段不同，而没设过偏好的
+    subject 必须回退到同一个默认值，不能顺手借用别人的时区。
 
     返回统计，便于 worker 日志与运维观察。
     """
@@ -254,10 +261,17 @@ async def dispatch_pending(
     for row in rows:
         gate = gate_cache.get(row.subject_id)
         if gate is None:
+            # 每个人的时区：自己的偏好 > 实例级兜底。别把某一个人的时区
+            # 套给别人——那等于让别人的勿扰时段按"我"的作息算。
             gate = await service.gate(
                 subject_id=row.subject_id,
                 now=moment,
-                subject_timezone=subject_timezone,
+                subject_timezone=(
+                    subject_timezones.get(row.subject_id)
+                    if subject_timezones is not None
+                    else None
+                )
+                or subject_timezone,
                 channel_can_proactive=True,
             )
             gate_cache[row.subject_id] = gate

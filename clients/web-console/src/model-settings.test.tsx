@@ -32,6 +32,7 @@ import {
   providersForChatSlot,
   providersForProfile,
   rowStateOf,
+  visibleRoleKeys,
 } from './components/model-settings/shared';
 import type {
   ProfileDraftInput,
@@ -126,6 +127,17 @@ const SLOTS: SlotView[] = [
     roles: ['perception.vision'],
   },
   {
+    // 视频是**独立**槽位：能看图片的模型大多看不了视频，用户要能分开绑。
+    slot: 'video',
+    label: '视频',
+    hint: '必须能看懂视频',
+    provider_id: '',
+    model_id: '',
+    configured: false,
+    usable: false,
+    roles: ['perception.video'],
+  },
+  {
     slot: 'daily',
     label: '日常',
     hint: '群里闲聊',
@@ -203,11 +215,17 @@ const CONFIG: SettingsConfig = {
   revisions: [],
   known_kinds: ['openai_compatible'],
   // 故意不含 memory.extract：那条由「记忆」组的过滤逻辑决定渲不渲染。
-  known_profiles: ['dialogue.fast', 'dialogue.group', 'perception.vision'],
+  known_profiles: [
+    'dialogue.fast',
+    'dialogue.group',
+    'perception.vision',
+    'perception.video',
+  ],
   profile_capabilities: {
     'dialogue.fast': 'chat',
     'dialogue.group': 'chat',
     'perception.vision': 'chat',
+    'perception.video': 'chat',
     'memory.extract': 'chat',
   },
   memory_sources: {},
@@ -227,6 +245,7 @@ const CAPABILITY_CONFIG: SettingsConfig = {
     'dialogue.fast',
     'dialogue.group',
     'perception.vision',
+    'perception.video',
     'memory.extract',
     'memory.embed',
     'memory.rerank',
@@ -503,15 +522,79 @@ describe('职责行渲染', () => {
 });
 
 describe('默认槽位卡片', () => {
-  it('四个槽位都在，配过的那张写明模型与"谁跟着它"', () => {
+  it('五个槽位都在，配过的那张写明模型与"谁跟着它"', () => {
     const html = render();
-    for (const label of ['快速', '创作', '识图', '日常']) {
+    for (const label of ['快速', '创作', '识图', '视频', '日常']) {
       expect(html).toContain(label);
     }
     expect(html).toContain('m-fast');
     expect(html).toContain('日常对话 跟着它');
     // 没配的槽位不能显示成一个假模型
     expect(html).toContain('还没有配模型');
+  });
+
+  it('「视频」是独立槽位：卡片自己写着"谁跟着它"，不和识图混用', () => {
+    const html = render();
+    // 槽位卡片的 hint 来自服务端 `SLOT_HINTS`，不是前端编的
+    expect(html).toContain('必须能看懂视频');
+    // 职责行「看视频」由 PRIMARY_ROLES ∩ known_profiles 决定
+    expect(html).toContain('看视频');
+    expect(html).toContain('perception.video');
+  });
+});
+
+describe('摘要计数与徽标必须一一对应（验收 M2/R4）', () => {
+  it('旧版兼容**单列**，不再算进「继承」', () => {
+    const html = render({
+      resolutions: [
+        resolution({
+          profile: 'dialogue.fast',
+          source: 'explicit',
+          effective: { provider_id: 'main', model_id: 'm-fast' },
+        }),
+        resolution({ profile: 'dialogue.group', source: 'slot', slot: 'daily' }),
+        resolution({ profile: 'perception.vision', source: 'legacy_fallback', slot: 'creation' }),
+        resolution({ profile: 'perception.video', source: 'unavailable', reason: 'x' }),
+      ],
+    });
+    // 4 行 = 1 单独指定 + 1 继承 + 1 旧版兼容 + 1 不可用
+    expect(html).toContain('4 个职责');
+    expect(html).toContain('1 个单独指定');
+    expect(html).toContain('1 个继承');
+    expect(html).toContain('1 个旧版兼容');
+    expect(html).toContain('1 个不可用');
+    // 徽标里也各有一个
+    expect(html).toContain('旧版兼容');
+  });
+
+  it('没有旧版兼容时不显示这一项（不写 0 占位）', () => {
+    const html = render({
+      resolutions: [resolution({ profile: 'dialogue.fast', source: 'explicit' })],
+    });
+    expect(html).not.toContain('个旧版兼容');
+  });
+
+  it('「可见职责」= 服务端 known_profiles ∩ 分组：tab 与列表同一个数', () => {
+    // CAPABILITY_CONFIG 的 known_profiles 是 7 条，与列表行数一致
+    expect(visibleRoleKeys(CAPABILITY_CONFIG.known_profiles)).toHaveLength(7);
+    // 服务端没说的角色不渲染（多一行绑了没用，比少一行更糟）
+    expect(visibleRoleKeys(['dialogue.fast'])).toEqual(['dialogue.fast']);
+    expect(visibleRoleKeys([])).toEqual([]);
+    expect(visibleRoleKeys(undefined)).toEqual([]);
+    // 拼错/未知的角色名不占一行
+    expect(visibleRoleKeys(['dialogue.fast', 'no.such.role'])).toEqual(['dialogue.fast']);
+  });
+});
+
+describe('行尾说明不留 1–3 字孤行（验收 R1/R3）', () => {
+  it('旧版兼容说明缩短：「（旧版行为）」交给徽标说，行尾不重复', () => {
+    const html = render({
+      resolutions: [
+        resolution({ profile: 'dialogue.fast', source: 'legacy_fallback', slot: 'creation' }),
+      ],
+    });
+    expect(html).toContain('没配模型，暂时借主对话的模型代跑');
+    expect(html).not.toContain('（旧版行为）');
   });
 });
 
@@ -548,6 +631,8 @@ describe('快速配置二次确认', () => {
   it('逐条列出「职责 → 槽位 → 具体模型 → 变化」，并把要覆盖的说在前面', () => {
     const html = render({ quickConfig: preview });
     expect(html).toContain('快速配置');
+    // 桌面端列宽不够时让表格横向滚动，而不是把 daily-chat 拆成 daily-/chat
+    expect(html).toContain('ms-quick-wrap');
     expect(html).toContain('覆盖你选的 m-big');
     expect(html).toContain('仍然不可用');
     expect(html).toContain('会覆盖 1 条你单独选的');

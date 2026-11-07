@@ -1617,7 +1617,9 @@
 
 .ms-slots {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* 按可用宽度自动排：槽位从 4 个变成 5 个（多了「视频」），写死
+     `repeat(4, …)` 会让第五张卡单独掉到下一行、右边空三格。 */
+  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
   gap: 10px;
   margin-top: 12px;
 }
@@ -1633,7 +1635,7 @@
   background: var(--ms-card);
 }
 
-/* 配过模型的槽位描边深一点：四个槽位里"还没填"的那几个要一眼看出来。 */
+/* 配过模型的槽位描边深一点：槽位里"还没填"的那几个要一眼看出来。 */
 .ms-slot--set {
   border-color: var(--ms-line-strong);
   background: var(--ms-card-strong);
@@ -1723,8 +1725,11 @@
 
 .ms-role-row {
   display: grid;
-  /* 职责 · 下拉 · 实际生效。窄屏会退化成单列，见文件末尾的媒体查询。 */
-  grid-template-columns: auto minmax(140px, 1fr) minmax(180px, 280px) minmax(160px, 220px);
+  /* 职责 · 下拉 · 实际生效。窄屏会退化成单列，见文件末尾的媒体查询。
+     最后一列从 220 放宽到 264：验收实测「这个职责只能单独指定模型：它没有
+     默认槽位」(20 字 × 11px = 220px) 正好卡在 220 上，末行只剩「位」；
+     「没配模型，暂时借主对话的模型代跑」同理。放宽 + pretty 一起解决。 */
+  grid-template-columns: auto minmax(140px, 1fr) minmax(180px, 280px) minmax(160px, 264px);
   align-items: center;
   gap: 12px;
   padding: 11px 16px;
@@ -1926,6 +1931,8 @@
   font-size: 11px;
   color: var(--ms-muted);
   overflow-wrap: anywhere;
+  /* 中文长句优先把字挤在上一行，不留 1–3 字孤行（R1/R3）。 */
+  text-wrap: pretty;
 }
 
 .ms-role-row__effective-note--bad {
@@ -2012,6 +2019,35 @@
   color: var(--ms-faint);
 }
 
+/* 表格外面这层只为"宁可横向滚，也不要把词拆断"：验收实测桌面端把
+   `daily-chat` 折成 `daily-/chat`、`vision-see` 折成 `vision-/see`。 */
+.ms-quick-wrap {
+  overflow-x: auto;
+}
+
+/*
+ * 桌面（>700px）：表头与标识符一律不折行。
+ *
+ * 验收实测 1440 下「配置为」列只有 48.4px，折成「配置」/「为」（1 字孤行）；
+ * 具体模型列 71.5px，`daily-chat` 被连字符拆开。右边「变化」是中文长句，
+ * 折行本身没问题，但要 `text-wrap: pretty` 管住 1–3 字孤行。
+ */
+@media (min-width: 701px) {
+  .ms-quick th {
+    white-space: nowrap;
+  }
+
+  .ms-quick td:nth-child(2),
+  .ms-quick td:nth-child(3),
+  .ms-quick td code {
+    white-space: nowrap;
+  }
+
+  .ms-quick td:last-child {
+    text-wrap: pretty;
+  }
+}
+
 /* 变化按"要不要动手"分级：覆盖是提醒，仍然不可用是警告。 */
 .ms-quick__row--override td:last-child { color: var(--ms-warn); }
 .ms-quick__row--unavailable td:last-child { color: var(--ms-danger); }
@@ -2049,6 +2085,9 @@
 .ms-roles__counts--warn { color: var(--ms-warn); }
 .ms-roles__counts--danger { color: var(--ms-danger); }
 .ms-roles__counts--env { color: var(--ms-warn); }
+/* 旧版兼容：与徽标同一档颜色。它必须**单列**——混进「继承」会让摘要
+   说 4 个继承、而徽标里只有 3 个（验收 M2/R4）。 */
+.ms-roles__counts--legacy { color: #8a6d1f; }
 
 /* 底部保存栏：和供应商页同一套"改动未保存 + 撤销 / 保存" */
 .ms-savebar {
@@ -2120,7 +2159,7 @@
     justify-content: flex-end;
   }
 
-  /* 四个槽位退成两列：一行四个在平板上会把模型名挤到换行。 */
+  /* 槽位在平板上退成两列：一行五个会把模型名挤到换行。 */
   .ms-slots {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2403,4 +2442,63 @@
   .ms-role-row button {
     min-width: 44px;
   }
+
+  /* 验收 M3/R5 残留：「返回设置」80×28；时区「保存时区」73×32、输入框 39.6。
+     时区小节在设置中心（不在模型页），所以只借用这份文件的触控规则，不碰
+     它的颜色变量。 */
+  .ms-head .back-link,
+  .ms-timezone .button,
+  .ms-timezone .field__input {
+    min-height: 44px;
+  }
+
+  .ms-head .back-link,
+  .ms-timezone .button {
+    min-width: 44px;
+  }
+
+  /* 设置中心自己的「返回聊天」也是同一种返回按钮（验收 M3 的同族残留）。 */
+  .settings-hub__back {
+    min-height: 44px;
+  }
+}
+
+/* 时区说明文字同样不允许 1–3 字孤行（验收 O3）。 */
+.ms-timezone .field__label {
+  text-wrap: pretty;
+}
+
+/*
+ * 设置中心的「媒体与视频」单选项（`SettingsHub.tsx::VideoModeSection`）。
+ *
+ * `label` 默认是 `display:inline`，两个选项会挤成一整段：桌面连在一起，
+ * 375 下第二个 radio 掉进句中，文字被拆成「原生视频输 / 入：…」（验收 B2）。
+ * 每个选项独占一行、radio 与文字顶对齐；可点区域 ≥44 高（radio 本体可以
+ * 保持 13×13，手指点的是 label），这与「窄屏触控 ≥44」是同一条要求。
+ */
+.settings-group__body label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 0;
+  line-height: 1.65;
+  cursor: pointer;
+  /* 中文换行没有词边界，浏览器按字断行很容易在末行剩 1–3 个字
+     （验收实测 1440 下「…并记录原因。」末行是「原因。」）。
+     `pretty` 在 Chrome 对中文不生效（试过，仍剩「原因。」），改用 `balance`：
+     这几行文本都很短，均分两行/四行即可，不存在"每行都变短"的代价。 */
+  text-wrap: balance;
+}
+
+.settings-group__body label input[type='radio'] {
+  flex: 0 0 auto;
+  /* 与首行文字的中线对齐；radio 比行高小，不顶对齐会悬在半空。 */
+  margin-top: 4px;
+}
+
+.settings-group__body legend {
+  font-size: 12px;
+  color: var(--ink-faint);
+  padding: 0 0 4px;
 }

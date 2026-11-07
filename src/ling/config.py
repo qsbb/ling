@@ -13,6 +13,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# 用户时区的**默认值**（IANA 名）。
+#
+# 为什么默认不是 UTC：不设时区时 `proactive` 会拒绝判断勿扰时段、整条主动
+# 联系停掉；而绝大多数部署的用户就在东八区。默认值必须是一个**真实可用**的
+# 时区，不能是"未知"——"未知"最终只会退化成某个没人检查的兜底（原来就是 UTC）。
+#
+# 这个常量只是默认值，不是解析规则。解析优先级（DB 偏好 > 环境变量 > 这里）
+# 只有一份实现：`ling/settings/user_preferences.py`。
+DEFAULT_USER_TIMEZONE = "Asia/Shanghai"
+
 
 def _bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -159,6 +169,11 @@ class Settings:
     log_access_denials: bool = field(
         default_factory=lambda: _bool("LING_LOG_ACCESS_DENIALS", True)
     )
+    # 用户时区的**环境变量层**。这不是唯一来源：解析优先级是
+    # 数据库偏好（`user_preferences.timezone`）> 这个环境变量 >
+    # `DEFAULT_USER_TIMEZONE`，唯一实现在
+    # `ling/settings/user_preferences.py`。这里只负责把 env 读出来，
+    # 不要在任何调用点直接 `settings.user_timezone or "UTC"`。
     user_timezone: str | None = field(
         default_factory=lambda: os.environ.get("LING_USER_TIMEZONE") or None
     )

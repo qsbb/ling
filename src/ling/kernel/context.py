@@ -88,6 +88,19 @@ DEFAULT_BUDGETS: dict[str, int] = {
 }
 
 
+def _as_local_hint(value: object) -> str:
+    """把时间写成 `` 12:21 ``（两侧带空格）这种给提示读的样子。
+
+    不做时区换算：上下文里只需要"大概什么时候"，而按服务器本地时区换算
+    在跨时区部署时会整体偏——差 8 小时比只显示钟点更容易误导。
+    """
+    hour = getattr(value, "hour", None)
+    minute = getattr(value, "minute", None)
+    if hour is None or minute is None:  # pragma: no cover - 防御
+        return " "
+    return f" {hour:02d}:{minute:02d} "
+
+
 def _budget_scale() -> float:
     """整体缩放系数，来自 `LING_CONTEXT_BUDGET_SCALE`。
 
@@ -446,6 +459,63 @@ class ContextCompiler:
                 )
             )
             compiled_meta["media_items"] = len(media_items)
+
+        # 没看过的视频：给她一行**可执行**的提示。
+        #
+        # 视频默认不自动读（白烧 token），所以这一行是她唯一知道"有个视频
+        # 可以看"的途径。三件事必须同时说清：是谁发的/什么时候、怎么表达
+        # "我想看"（标记语法）、以及这个标记不会发给对方——不写最后一句，
+        # 她会担心自己说了句人看不懂的话而不敢用。
+        try:
+            from ling.domains.media.service import MediaEvidenceService
+            from ling.domains.media.video import short_ref_for
+            from ling.infra.models import Subject as _Subject
+
+            videos = await MediaEvidenceService(
+                self._session, actor_id=self._actor_id
+            ).undescribed_videos(window_id=window_id, limit=3)
+        except Exception as exc:  # noqa: BLE001 - 视频提示失败不影响本轮
+            videos = []
+            compiled_meta["video_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        if videos:
+            names: dict[str, str] = {}
+            wanted = {v.subject_id for v in videos if v.subject_id}
+            if wanted:
+                rows = (
+                    await self._session.execute(
+                        select(_Subject.id, _Subject.display_name).where(
+                            _Subject.id.in_(list(wanted))
+                        )
+                    )
+                ).all()
+                names = {sid: str(name or "").strip() for sid, name in rows}
+            lines = []
+            for video in videos:
+                sender = names.get(video.subject_id or "") or "有人"
+                when = ""
+                if video.created_at is not None:
+                    when = _as_local_hint(video.created_at)
+                ref = short_ref_for(video.evidence_id)
+                lines.append(
+                    f"- {sender}{when}发了个视频，你还没看。想看就写 <<看视频 {ref}>>"
+                    "（这条标记不会发出去）。"
+                )
+            contributions.append(
+                ContextContribution(
+                    lane="media",
+                    text=(
+                        "这个窗口里有你还没看过的视频：\n"
+                        + "\n".join(lines)
+                        + "\n只有你写了标记，才会去看；没写就当没看见，别假装看过。"
+                    ),
+                    # 这是**我们自己**的状态提示，不是对方说的话
+                    origin=Origin.model_inference,
+                    visibility=Visibility.window_private,
+                    source_event_ids=[v.evidence_id for v in videos],
+                    token_budget=DEFAULT_BUDGETS["media"],
+                )
+            )
+            compiled_meta["unseen_videos"] = len(videos)
 
         # 自我状态（情绪）：分层注入，受隔离模式约束（ADR-0004 修正）。
         # - sealed：**完全不注入**。否则"完全隔离"名不副实——别的窗口造成的

@@ -16,6 +16,7 @@ OneBot 直接用 QQ 号。因此账号绑定的 ``external_account_id`` 是 QQ �
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -72,6 +73,19 @@ class OneBotV11Connector(ChannelConnector):
         # 缓存有效期（秒）。探活是运维动作，10 秒的陈旧度完全够用。
         self.health_cache_seconds = 10.0
         self._health_clock = time.monotonic
+        # 群名缓存：``group_id -> (monotonic 时间戳, 群名或 None)``。
+        #
+        # 为什么不落库：群名是**平台侧的展示信息**，不是业务事实。为它加一个
+        # 数据库列要迁移、要回填、还要处理"群改名了什么时候失效"——而它
+        # 丢了的代价只是界面显示「群 100200400」。进程内缓存 + 前端回退
+        # 已经够用，并且重启后第一次读会自动重新采集。
+        self._group_name_cache: dict[str, tuple[float, str | None]] = {}
+        self.group_name_ttl = 6 * 3600.0  # 采集成功后的复用时长
+        self.group_name_miss_ttl = 300.0  # 采集失败后的静默时长（别一直打 NapCat）
+        # 单次采集超时。**故意比 `config.timeout_seconds` 短**：这条外呼挂在
+        # 读接口上，等 15 秒的群名不如先显示「群 123」。
+        self.group_name_timeout = 2.0
+        self.group_name_cache_max = 512
 
     # ------------------------------------------------------------ 出站
 
@@ -295,6 +309,33 @@ class OneBotV11Connector(ChannelConnector):
                 ChannelErrorKind.ignored,
                 f"meta_event:{payload.get('meta_event_type') or ''}",
             )
+        if post_type == "message_sent":
+            # **机器人自己发出去的消息的回显**（NapCat/LLOneBot 的
+            # ``reportSelfMessage``）。按设计没有要处理的东西：
+            #
+            # 正文、收件人、平台消息 id 都在 ``send()`` 的返回值里，
+            # 再把它当成入站消息送进对话链路，等于让她对着自己说话。
+            # 但它**每发一条就跟着来一条**，按"未处理事件"记一条 INFO
+            # （浏览器行为日志里显示成「忽略事件: 暂不处理 OneBot 事件类型:
+            # message_sent」）会把真正有用的日志挤出去。
+            #
+            # 所以归到 ``ignored``：inbound_intake 对它**不记行为日志**。
+            # 想确认"这条到底发出去没有"时看下面这行 DEBUG——里面的
+            # ``message_id`` 就是 ``send()`` 回执里的 ``platform_message_id``，
+            # 两条日志对得上就说明平台确实收下了。
+            #
+            # 这里**不补写回执**：``DeliveryReceiptRow`` 必须挂在
+            # ``operation_id`` 上，而回显事件里没有这个值；拿它凑一条
+            # "已送达"只能证明平台存在这条消息，属于伪造送达证据。
+            message_id = payload.get("message_id")
+            logger.debug(
+                "出站回显（自己发出的消息，按设计忽略）：message_id=%s target=%s",
+                message_id,
+                payload.get("target_id"),
+            )
+            raise ChannelError(
+                ChannelErrorKind.ignored, f"message_sent:{message_id or ''}"
+            )
         if post_type != "message":
             # notice/request 目前不进入对话链路。
             # 它们仍有价值（入群、撤回、戳一戳、加好友请求），但要先有对应
@@ -485,6 +526,71 @@ class OneBotV11Connector(ChannelConnector):
         result = await self._probe_login()
         self._health_cache = (now + self.health_cache_seconds, result)
         return result
+
+    async def fetch_group_name(self, group_id: str) -> str | None:
+        """采集群名（``get_group_info``）。**拿不到就返回 ``None``，绝不抛**。
+
+        ## 为什么采集放在连接器里
+
+        群名是平台侧的事实，只有连接器知道怎么问（OneBot 的
+        ``get_group_info``；换成 QQ 官方机器人就是另一个动作）。上层的
+        对话/接口层只该问"这个群叫什么"，不该认识 ``group_id`` 以外的协议细节。
+
+        ## 为什么带缓存、还给失败也缓存
+
+        调用点是**读侧**（会话列表），没有缓存的话每开一次页面就打一遍
+        NapCat；群多的时候就是一阵外呼风暴。成功缓存久一点（群名很少改），
+        失败缓存短一点（NapCat 刚恢复时别让界面长时间空着）。
+
+        ## 为什么失败要吞掉
+
+        群名只是标题，不是对话必需信息。``get_group_info`` 在不少 OneBot
+        实现里根本没实现（404 → ``unsupported``），也可能因为断连超时。
+        为了一个标题让会话列表 500，是拿"次要信息"换"主功能"。
+        调用方拿到 ``None`` 时前端回退成「群 {id}」。
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return None
+        now = time.monotonic()
+        cached = self._group_name_cache.get(gid)
+        if cached is not None:
+            stamped, cached_name = cached
+            ttl = self.group_name_ttl if cached_name else self.group_name_miss_ttl
+            if now - stamped < ttl:
+                return cached_name
+
+        name: str | None = None
+        try:
+            data = await asyncio.wait_for(
+                self._call("get_group_info", {"group_id": gid}),
+                timeout=self.group_name_timeout,
+            )
+            if isinstance(data, dict):
+                raw = data.get("group_name")
+                if isinstance(raw, str) and raw.strip():
+                    # 截到与 windows.title / subjects.display_name 同级的长度：
+                    # 契约里这不是长文本字段，超长只会在界面上被裁一次。
+                    name = raw.strip()[:128]
+        except (ChannelError, TimeoutError) as exc:
+            # 超时也走这里：``asyncio.wait_for`` 抛的是内建 TimeoutError。
+            logger.debug("采集群名失败（回退为无名）：group=%s %s", gid, type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - 采集是尽力而为，不能影响读侧
+            logger.debug("采集群名异常（回退为无名）：group=%s %s", gid, type(exc).__name__)
+
+        self._group_name_cache[gid] = (now, name)
+        self._trim_group_name_cache()
+        return name
+
+    def _trim_group_name_cache(self) -> None:
+        """缓存只保留最近的若干群，防止长跑进程里字典无限长。"""
+        if len(self._group_name_cache) <= self.group_name_cache_max:
+            return
+        # 按时间戳丢最旧的：群名的价值随"最近是否活跃"衰减，不需要 LRU。
+        for gid, _ in sorted(self._group_name_cache.items(), key=lambda kv: kv[1][0])[
+            : len(self._group_name_cache) - self.group_name_cache_max
+        ]:
+            self._group_name_cache.pop(gid, None)
 
     async def _probe_login(self) -> tuple[bool, str]:
         try:

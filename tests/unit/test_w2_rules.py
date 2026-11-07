@@ -1226,11 +1226,72 @@ async def test_vision_actually_sends_multiple_frames() -> None:
         router=_FakeRouter(),
         config_reader=_Cfg(),
     )
+    # 职责不按 kind 自动切换（视频要由调用方显式指定），这里就是默认路径。
     await describer._ask_vision(_gif_bytes(), "image/gif")
     assert len(captured.get("images") or []) >= 2, (
         f"只送了 {len(captured.get('images') or [])} 帧——动图被当成单帧处理了"
     )
     assert "关键帧" in captured.get("content", ""), "多帧时没告诉模型这是同一段动图"
+
+
+async def test_media_describer_never_switches_profile_by_kind() -> None:
+    """职责只来自构造参数，**不按 evidence.kind 偷换**。
+
+    用户的要求是「不是每个视频都去读，只有她自己主动想读那个视频时才读」
+    （逐条自动描述白烧 token）。所以 `MediaDescriber` 默认用 `profile` 参数
+    （识图），视频要由那一侧的调用方显式传 `VIDEO_PROFILE`。
+
+    这条防的是"顺手把 kind=video 自动路由到 perception.video"：那样队列里
+    每个视频都会被读一遍，而且用户以为"她还没想看"的时候 token 已经烧掉了。
+    """
+    from types import SimpleNamespace
+
+    from ling.domains.media.describe import MediaDescriber
+    from ling.domains.media.service import EvidenceView
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    seen: list[str] = []
+
+    class _Router:
+        async def stream(self, config, *, profile, messages, **kw):  # noqa: ANN001, ANN003, ARG002
+            seen.append(profile)
+            yield ModelChunk(delta="一段视频"), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text="一段视频")
+
+    class _Svc:
+        async def describe(self, evidence_id, *, window_id, description, description_origin):  # noqa: ANN001, ARG002
+            return SimpleNamespace(description=description)
+
+    class _Cfg:
+        async def effective(self):  # noqa: ANN202
+            return object()
+
+    async def _fetch(_ref: str) -> tuple[bytes, str]:
+        return b"fake-mp4", "video/mp4"
+
+    evidence = EvidenceView(
+        evidence_id="media_1",
+        window_id="win_1",
+        kind="video",
+        media_ref="obj/clip.mp4",
+        origin="user_upload",
+        visibility="window_private",
+        description=None,
+        description_origin=None,
+        expires_at=None,
+    )
+    describer = MediaDescriber(
+        service=_Svc(),  # type: ignore[arg-type]
+        fetch_media=_fetch,
+        router=_Router(),
+        config_reader=_Cfg(),
+    )
+    await describer.describe_one(evidence)
+
+    assert seen == ["perception.vision"], (
+        f"职责被按 kind 自动切换了：{seen}。视频必须由调用方显式指定职责。"
+    )
 
 
 # ---------------------------------------------------------------- 表达方式由她选

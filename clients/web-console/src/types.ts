@@ -13,6 +13,20 @@ export interface SessionRecord {
   updated_at: string;
   message_count: number;
   archived: boolean;
+  /**
+   * 群名 / 对方昵称。**读不到就是 null**：渠道窗口的 `title` 是
+   * `onebot-default:group:100200400` 这类机器键，拿它当标题等于什么都没说。
+   * 界面按 `channel` + `peer_id` 回退成「群 100200400」「私聊 100200301」，
+   * 不编名字。旧服务端没有这个字段。
+   */
+  display_name?: string | null;
+  /**
+   * 渠道名：`web` 或连接器 id（如 `onebot-default`）。
+   * 只在 `title` 解析不出窗口键时用于判断这条会话是群聊还是私聊。
+   */
+  channel?: string;
+  /** 群号 / QQ 号。没有具体对端（网页会话）时为 null。 */
+  peer_id?: string | null;
 }
 
 export interface ChatMessage {
@@ -31,6 +45,13 @@ export interface ChatMessage {
   // 沉默时 handled_reason 说明为什么——不能让消息看起来凭空消失。
   handled_as?: string | null;
   handled_reason?: string | null;
+  /**
+   * 发言人显示名：群名片优先、其次昵称。
+   * 缺失时**不要编名字**——界面只把 `sender_id` 当标签（`成员 100200300`）。
+   */
+  sender_name?: string | null;
+  /** 发言人的平台号码（QQ 号）或 subject id；和名字分两行显示，不要挤一起。 */
+  sender_id?: string | null;
 }
 
 export interface TurnView {
@@ -164,7 +185,7 @@ export interface ProfileResolution {
   reason: string;
 }
 
-/** 四个默认槽位之一。 */
+/** 一个默认槽位（快速 / 创作 / 识图 / 视频 / 日常）。 */
 export interface SlotView {
   slot: string;
   label: string;
@@ -343,7 +364,7 @@ export interface SettingsConfig {
   revisions: RevisionView[];
   known_kinds: string[];
   known_profiles: string[];
-  /** 四个默认槽位（快速 / 创作 / 识图 / 日常）。 */
+  /** 默认槽位（快速 / 创作 / 识图 / 视频 / 日常）。 */
   slots: SlotView[];
   /**
    * 每个职责最后会跑哪个模型。**服务端算的**，界面「实际生效」那一列直接用它。
@@ -635,6 +656,46 @@ export interface TaxonomyResponse {
   categories: TaxonomyCategory[];
   summary: { total: number; editable: number; pending: number };
 }
+
+/* ---------------------------------------------------------------- 用户偏好 */
+
+/** 时区从哪一层来：你自己设的 / 环境变量 / 默认值。 */
+export type TimezoneSource = 'preference' | 'env' | 'default';
+
+/**
+ * `GET|PUT /v1/settings/preferences` 的响应。
+ *
+ * `timezone` 是**生效值**，`stored` 是库里存的原值（null = 没设过）。
+ * 两个都要：只给生效值，用户会把默认值当成自己设过的；只给 stored，
+ * 界面无法回答"那现在到底按哪个时区算"。
+ */
+export interface UserPreferencesResponse {
+  schema_version: string;
+  timezone: string;
+  source: TimezoneSource;
+  stored: string | null;
+  /** `LING_USER_TIMEZONE` 的值（null = 没配）。 */
+  env: string | null;
+  default: string;
+  /** 常用时区的建议列表；**不是白名单**，任何合法 IANA 名都能填。 */
+  common: string[];
+  /** 视频读取模式（生效值）：`frames` 抽帧 / `native` 原生视频输入。 */
+  video_mode: VideoMode;
+  /** 可选值（顺序即展示顺序）。 */
+  video_modes: VideoMode[];
+  video_mode_default: VideoMode;
+}
+
+/**
+ * 视频读取模式。
+ *
+ * - `frames`：抽帧——任何供应商都能用，按固定间隔抽几帧交给视频模型；
+ * - `native`：原生视频输入——把视频原样交给模型，只有部分供应商支持，
+ *   不支持时后端自动退回抽帧并在日志里记原因。
+ *
+ * 两种模式都只在**她主动想看**（回复里写了标记）时才读。
+ */
+export type VideoMode = 'frames' | 'native';
 
 /* ---------------------------------------------------------------- 授权 */
 

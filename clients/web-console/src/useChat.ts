@@ -48,6 +48,10 @@ export interface UiMessage {
   attempt: number;
   /** 她选择不回时的理由。非空才显示。 */
   silenceReason: string | null;
+  /** 发言人显示名（群名片优先、其次昵称）。她自己的消息与网页自己发的话都是 null。 */
+  senderName: string | null;
+  /** 发言人的平台号码（QQ 号）。界面上和名字分两行，不挤成 `@号码 名字`。 */
+  senderId: string | null;
 }
 
 export interface LiveTurn {
@@ -64,6 +68,15 @@ export interface Notice {
   kind: 'error' | 'info';
   text: string;
   detail?: string;
+}
+
+/**
+ * 服务端把"没有"给成 null / undefined / 空串都算没有。
+ * 空串会渲染出一行空白署名，比缺字段更难看，所以统一折成 null。
+ */
+function optionalText(value: string | null | undefined): string | null {
+  const text = (value ?? '').trim();
+  return text || null;
 }
 
 function buildServerMessage(message: ChatMessage): UiMessage {
@@ -93,6 +106,8 @@ function buildServerMessage(message: ChatMessage): UiMessage {
       message.handled_as === 'ignored' || message.handled_as === 'missed'
         ? (message.handled_reason ?? '')
         : null,
+    senderName: optionalText(message.sender_name),
+    senderId: optionalText(message.sender_id),
   };
 }
 
@@ -120,6 +135,8 @@ function emptyActor(key: string, turnId: string | null): UiMessage {
     local: true,
     attempt: 1,
     silenceReason: null,
+    senderName: null,
+    senderId: null,
   };
 }
 
@@ -441,6 +458,8 @@ export function useChat(
                 errorMessage: null,
                 errorDetail: null,
                 errorCode: null,
+                senderName: optionalText(data.user_message.sender_name),
+                senderId: optionalText(data.user_message.sender_id),
               });
             } else if (userKey) {
               updateUser({ state: 'completed', local: false });
@@ -586,6 +605,8 @@ export function useChat(
           local: true,
           attempt: 1,
           silenceReason: null,
+          senderName: null,
+          senderId: null,
         },
       ]);
       void pump({

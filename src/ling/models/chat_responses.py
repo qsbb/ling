@@ -213,6 +213,12 @@ class ChatResponsesProvider:
 
 
 def _encode_item(message: ChatMessageIn) -> dict[str, Any]:
+    if getattr(message, "videos", ()):
+        raise ModelError(
+            ModelErrorKind.unsupported,
+            "Responses 接口不支持原生视频输入",
+            retriable=False,
+        )
     blocks: list[dict[str, Any]] = []
     text_type = "output_text" if message.role == "assistant" else "input_text"
     if message.content:

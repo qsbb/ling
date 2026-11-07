@@ -88,6 +88,20 @@ async def init_memory_router() -> bool:
             for pid in list(_SECRET_CACHE):
                 if pid not in enabled:
                     _SECRET_CACHE.pop(pid, None)
+            # token 额度按**本地日**清零，与总览/勿扰用同一份时区解析
+            # （DB 偏好 > LING_USER_TIMEZONE > Asia/Shanghai）。继续写死
+            # `settings.user_timezone` 的话，用户在设置页填的时区对额度日界
+            # 无效——"今天已用"会在本地凌晨前的某个时刻被清零。
+            from ling.settings.user_preferences import (
+                effective_user_timezone,
+                owner_subject_id,
+            )
+
+            quota_timezone = await effective_user_timezone(
+                session,
+                subject_id=await owner_subject_id(session),
+                env=settings.user_timezone,
+            )
         # 记忆提炼走的是同一家供应商，也就该记同一份额度——否则 worker
         # 这边用的 token 不计数，用户在设置页看到的"今日已用"会偏小，
         # 而额度判断却在 api 进程里按那个偏小的数放行。
@@ -96,7 +110,7 @@ async def init_memory_router() -> bool:
 
         _MEMORY_ROUTER = ModelRouter(
             ProviderRegistry(lambda pid: _SECRET_CACHE.get(pid)),
-            TokenQuotaStore(get_session_factory(), timezone=settings.user_timezone),
+            TokenQuotaStore(get_session_factory(), timezone=quota_timezone),
         )
         _SECRET_CACHE_REVISION = revision
         logger.info(
@@ -800,7 +814,23 @@ _MEDIA_SUFFIX_MIME = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
+    # 视频后缀必须写在这里：本地落盘的 mp4 一旦被标成 image/jpeg，
+    # 原生视频模式会发出 `data:image/jpeg;base64,<整段 mp4>`，供应商那边
+    # 要么报错要么"看到坏字节"——那是**看起来能看、其实看到的是垃圾**的
+    # 静默错误，比直接失败糟得多。
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
 }
+
+# 后缀不认识时**不猜**：给一个中性类型，让上层（如视频描述）自己按
+# `application/octet-stream` 处理/拒绝，而不是伪装成某一种已知格式。
+_UNKNOWN_MEDIA_MIME = "application/octet-stream"
 
 
 def _media_root_default() -> Path:
@@ -873,7 +903,9 @@ def make_media_fetcher(
                 raise MediaRefError(
                     f"媒体 {len(data)} 字节超过上限 {limit} 字节: {resolved}"
                 )
-            return data, _MEDIA_SUFFIX_MIME.get(resolved.suffix.lower(), "image/jpeg")
+            return data, _MEDIA_SUFFIX_MIME.get(
+                resolved.suffix.lower(), _UNKNOWN_MEDIA_MIME
+            )
         if connector is None:
             raise RuntimeError("没有可用渠道下载远程媒体")
         return await connector.fetch_media(media_ref)  # type: ignore[attr-defined]
@@ -933,7 +965,13 @@ async def handle_media_describe(payload: dict) -> None:
                 persona_id=settings.persona_id,
             ),
         )
-        for window_id in await service.windows_with_pending(limit=10):
+        # **视频不在这里读**：视频只在她主动写 ``<<看视频 mX>>`` 时才读
+        # （见 domains/media/video.py 与 domains/media/watch.py）。自动队列
+        # 里留着它，等于每 60 秒把群里每一段视频都送进视频模型——那是白烧
+        # token，而她当时可能根本用不上。
+        for window_id in await service.windows_with_pending(
+            limit=10, exclude_kinds=("video",)
+        ):
             outcome = await describer.describe_pending(window_id=window_id, limit=limit)
             described += outcome.described
             failed += outcome.failed
@@ -1007,13 +1045,28 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             test_mode_default=settings.test_mode,
             persona_id=settings.persona_id,
         )
+        # 时区**必须走同一份解析**（DB 偏好 > env > 默认）。多用户部署里
+        # 每个人的"今天"不同：逐个 subject 的偏好放进 mapping，没设过的人
+        # 回退到实例子级默认，绝不借用别人的时区。
+        from ling.settings.user_preferences import (
+            load_user_timezone,
+            owner_subject_id,
+            timezone_by_subject,
+        )
+
+        instance_timezone, _tz_source = await load_user_timezone(
+            session,
+            subject_id=await owner_subject_id(session),
+            env=settings.user_timezone,
+        )
         stats = await dispatch_pending(
             session,
             actor_id=settings.actor_id,
             connector=connector,
             deliver_to_web=True,
             config_reader=config,
-            subject_timezone=settings.user_timezone,
+            subject_timezone=instance_timezone,
+            subject_timezones=await timezone_by_subject(session),
         )
     if stats.get("skipped"):
         # 门控跳过要写清**为什么**：勿扰时段、日限额、没有会话…

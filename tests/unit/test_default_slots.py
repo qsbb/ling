@@ -110,6 +110,21 @@ def test_embed_and_rerank_have_no_slot() -> None:
     assert "memory.rerank" not in PROFILE_SLOTS
 
 
+def test_video_role_follows_its_own_slot() -> None:
+    """看视频跟随「视频」槽位，**不**跟识图共用。
+
+    合成一个槽位，用户就只能在"图片配便宜的视觉模型"和"视频配能读多帧的
+    模型"之间二选一。能力仍按 `chat` 判（见
+    `test_provider_capabilities.py::test_perception_video_uses_chat_capability`）。
+    """
+    assert PROFILE_SLOTS["perception.video"] is ProviderSlot.video
+    assert PROFILE_CAPABILITIES["perception.video"] is ModelCapability.chat
+    assert SLOT_LABELS[ProviderSlot.video] == "视频"
+    # 说明里必须写清"能看懂视频"：这是用户挑模型的唯一依据
+    assert "视频" in SLOT_HINTS[ProviderSlot.video]
+    assert "看懂" in SLOT_HINTS[ProviderSlot.video]
+
+
 # ---------------------------------------------------------------- 四条规则
 
 

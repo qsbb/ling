@@ -37,6 +37,7 @@ import {
   providerEquals,
   toProfileDraft,
   toProviderDraft,
+  visibleRoleKeys,
   type PanelMessage,
 } from './model-settings/shared';
 import '../model-settings.css';
@@ -482,7 +483,12 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
           onClick={() => setTab('roles')}
         >
           职责绑定
-          <span className="ms-tab__count">{profiles.length}</span>
+          {/* 数字必须等于**列表行数**（服务端 known_profiles ∩ 分组），
+              不是草稿里的绑定记录条数：后者只有 5 条，而列表有 7 行，
+              tab 写 5 会让人以为有两条职责没渲染。 */}
+          <span className="ms-tab__count">
+            {visibleRoleKeys(config?.known_profiles).length}
+          </span>
         </button>
       </div>
 

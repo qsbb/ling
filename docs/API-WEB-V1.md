@@ -97,6 +97,8 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | GET | `/v1/settings/connectors` | `{schema_version, as_of, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, fields[], runtime}]}`；**只读**接入器诊断，`fields[].kind=secret` 只回 `set` 不回值（必鉴权） |
 | POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
 | POST | `/v1/settings/quick-config/preview` | 同上的 body → `{rows[], profiles[], summary}`；快速配置的二次确认（全量覆盖，`profiles` 就是确认后要写入的那份） |
+| GET | `/v1/settings/preferences` | `{schema_version, timezone, source, stored, env, default, common[], video_mode, video_modes[], video_mode_default}`；`source` 为 `preference` / `env` / `default`（必鉴权） |
+| PUT | `/v1/settings/preferences` | `{timezone?, video_mode?}` → 同上；**缺字段 / `null` = 这次不改，显式空串 `""` = 清掉**；非法值 `400 invalid_request`。**不进配置修订**：保存即生效，不跟发布/回滚走（详见 §4.3） |
 
 `providers[]` 每项：`{provider_id, kind, base_url, enabled, models[], secret_last4,
 timeout_seconds, max_output_tokens, daily_token_limit, ...}`。
@@ -116,9 +118,12 @@ enabled, mode}`。原来这里的 `temperature / max_tokens / timeout_seconds / 
 
 ### 4.1 默认槽位与「实际生效」
 
-四个默认槽位（`slots[]` 每项 `{slot, label, hint, provider_id, model_id, configured,
-usable, roles[]}`，键固定为 `fast / creation / vision / daily`，中文名
-`快速 / 创作 / 识图 / 日常`）。它们和职责绑定一样**存在配置修订里**，跟着发布/回滚走。
+五个默认槽位（`slots[]` 每项 `{slot, label, hint, provider_id, model_id, configured,
+usable, roles[]}`，键固定为 `fast / creation / vision / video / daily`，中文名
+`快速 / 创作 / 识图 / 视频 / 日常`）。它们和职责绑定一样**存在配置修订里**，跟着发布/回滚走。
+`video`（看视频）与 `vision`（识图）是**两个**槽位：能看图片的模型大多看不了视频，
+合成一个用户就只能二选一。`perception.video` 的能力仍按 `chat` 判——不新增 `video`
+能力，否则所有现有供应商都会被判不匹配。
 
 角色 → 槽位的映射固定在服务端（`ling/ports/model.py::PROFILE_SLOTS`）：
 
@@ -127,6 +132,7 @@ usable, roles[]}`，键固定为 `fast / creation / vision / daily`，中文名
 | `dialogue.fast` | 快速 |
 | `dialogue.group` | 日常 |
 | `perception.vision` | 识图 |
+| `perception.video` | 视频 |
 | `memory.extract` | 创作 |
 | `memory.embed` / `memory.rerank` | **没有槽位**（另一套协议，只能单独指定） |
 
@@ -179,6 +185,45 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 `log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
 **只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过
 修订时取环境变量 `LING_LOG_ACCESS_DENIALS`。
+
+### 4.3 用户偏好（时区 / 视频读取方式）
+
+`GET` / `PUT /v1/settings/preferences` 读写**用户自己的**两条偏好：时区
+（`timezone`）与视频读取方式（`video_mode`）。它们存在 `user_preferences`
+（按 subject 一行），**不进配置修订**：保存即生效，不跟发布/回滚走——回滚一次旧配置
+不该把"我在东八区"一起回滚掉。
+
+**请求体：两个字段都可选**
+
+| 字段 | 类型 | 缺字段 / `null` | 显式 `""` | 合法值 |
+| --- | --- | --- | --- | --- |
+| `timezone` | `str \| null` | 这次不改 | 清掉（回退环境变量 → 默认 `Asia/Shanghai`） | IANA 名，如 `Asia/Shanghai` |
+| `video_mode` | `"frames" \| "native" \| null` | 这次不改 | 清掉（回退默认 `frames`） | `frames`（抽帧）/ `native`（原生视频输入） |
+
+**缺字段 ≠ 清空（这条是本端点最重要的约定）**：两个偏好共用同一条 PUT，前端也是
+各发各的（改时区只发 `timezone`、切视频方式只发 `video_mode`）。如果缺字段等于清空，
+切一次视频方式就会把时区**静默**清回默认——页面显示「已保存」，刷新后才变成
+"没有设置过"。所以只有**显式空串 `""`** 才表示清空；`null` 与缺字段一律按"不改"。
+
+非法值返回 `400 invalid_request`（`timezone` 的 `detail` 会给出 IANA 名的正确写法），
+**整条请求不落库**：同一次请求里的另一个字段也不会生效（事务回滚）。
+
+**响应**
+
+| 字段 | 含义 |
+| --- | --- |
+| `timezone` | 时区**生效值**（已按 DB 偏好 → `LING_USER_TIMEZONE` → 默认 的优先级解析） |
+| `source` | 这个时区从哪来：`preference`（你自己设的）/ `env`（环境变量）/ `default`（`Asia/Shanghai`） |
+| `stored` | 库里存的时区原值；`null` = 没设过。与生效值分开，界面才能说清"这是默认值，不是你设的" |
+| `env` / `default` | 环境变量里的值（`null` = 没配）/ 默认值 |
+| `common` | 常用时区**建议**；不是白名单，任何合法 IANA 名都能填 |
+| `video_mode` | 视频读取方式**生效值**（没设过就是 `frames`） |
+| `video_modes` | 可选值列表（顺序即展示顺序） |
+| `video_mode_default` | 默认值（当前 `frames`；原生输入不被供应商支持时，运行期会退回抽帧并记原因） |
+
+> 响应里**没有** `video_mode_source` / `stored_video_mode`：视频方式只有"显式设过"
+> 与"回退默认"两态，界面用 `video_mode === video_mode_default` 即可表达。将来若要
+> 区分"选过 `frames`"和"从没选过"，需要另加字段（属接口变更，不是文档遗漏）。
 
 ## 5. 角色与时间线
 
@@ -264,7 +309,8 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 
 ### 9.1 `GET /v1/dashboard` 的「今天的安排」
 
-- `timezone` 仍是响应顶层字段，取 `LING_USER_TIMEZONE`（未配置时 `UTC`）。
+- `timezone` 仍是响应顶层字段，取解析后的用户时区：DB 偏好（`PUT /v1/settings/preferences`）
+  > `LING_USER_TIMEZONE` > `Asia/Shanghai`；`timezone_source` 标明来源（`preference` / `env` / `default`）。
   **「今天」按这个本地时区的日历日 `[00:00, 次日 00:00)` 计算**，不是 UTC，
   也不是服务器所在时区。
 - `sections.agenda.data.plans[]` 只含 `start_at` 落在上述本地日内的

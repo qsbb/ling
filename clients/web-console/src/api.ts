@@ -29,6 +29,8 @@ import type {
   ConnectorsResponse,
   StopResponse,
   TaxonomyResponse,
+  UserPreferencesResponse,
+  VideoMode,
   ActivityResponse,
   GoalsResponse,
   ProactiveResponse,
@@ -379,6 +381,39 @@ export const api = {
   /** 分类法是导航的唯一来源；前端不自己抄类名。 */
   taxonomy(): Promise<TaxonomyResponse> {
     return request<TaxonomyResponse>('/v1/settings/taxonomy');
+  },
+  /**
+   * 用户自己的偏好（当前只有时区）。
+   *
+   * **不进 `/settings/draft`**：时区是用户的事实，不是配置修订；跟发布/回滚
+   * 绑定会让"改个时区"变成一次部署动作。
+   */
+  userPreferences(): Promise<UserPreferencesResponse> {
+    return request<UserPreferencesResponse>('/v1/settings/preferences');
+  },
+  /**
+   * 写时区。传空串 = 清掉偏好，回退到环境变量/默认值。
+   *
+   * 非法 IANA 名由服务端拒绝（400 `invalid_request`），前端**不自己维护
+   * 时区清单**：那份清单一定会过期，而服务端有 tzdata。
+   */
+  setTimezone(timezone: string): Promise<UserPreferencesResponse> {
+    return request<UserPreferencesResponse>(
+      '/v1/settings/preferences',
+      jsonInit('PUT', { timezone }),
+    );
+  },
+  /**
+   * 改"怎么看视频"（用户偏好，**不在模型页**）。
+   *
+   * 与 {@link setTimezone} 共用一条 PUT：两者都是 `user_preferences` 的一列，
+   * 分开两个端点只会让"保存一半"变得可能。
+   */
+  setVideoMode(videoMode: VideoMode): Promise<UserPreferencesResponse> {
+    return request<UserPreferencesResponse>(
+      '/v1/settings/preferences',
+      jsonInit('PUT', { video_mode: videoMode }),
+    );
   },
   consents(): Promise<ConsentsResponse> {
     return request<ConsentsResponse>('/v1/consents');

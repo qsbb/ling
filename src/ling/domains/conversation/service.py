@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -18,9 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.api.errors import not_found
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, SessionRecord, TurnState
 from ling.infra.models import (
+    ActorAccount,
     HandoffCapsuleRow,
     IdempotencyKey,
     Message,
+    Subject,
     Turn,
     Window,
     WindowContext,
@@ -30,6 +33,43 @@ from ling.infra.security import new_id
 
 DEFAULT_WINDOW_TITLE = "新的对话"
 MAX_TITLE_LEN = 60
+
+# 渠道窗口 ``title`` 里存的平台窗口标识形如 ``<instance>:<kind>:<target>``，
+# kind 只可能是这两种。其它形态一律当作"不是平台标识"——
+# web 窗口的 title 是用户随手起的名字，长得像 ref 也不能当群号用。
+WINDOW_REF_KINDS = frozenset({"group", "private"})
+
+
+def split_window_ref(ref: str) -> tuple[str, str, str] | None:
+    """拆 ``<instance>:<kind>:<target>``；不是这个形态就返回 ``None``。"""
+    head, sep, target = (ref or "").rpartition(":")
+    if not sep or not target:
+        return None
+    instance, sep2, kind = head.rpartition(":")
+    if not sep2 or not instance or kind not in WINDOW_REF_KINDS:
+        return None
+    return instance, kind, target
+
+
+def window_target(window: Window) -> tuple[str, str, str | None]:
+    """(渠道, 会话类型, 平台对端 id)。
+
+    为什么从 ``title`` 里拆：渠道窗口的 title **就是**平台窗口标识
+    （见 ``bridge._ensure_window``），投递侧（worker、proactive dispatch）
+    也一直这么用。除此之外没有任何一处存着群号/对端 QQ，所以这里就地解析，
+    不为"界面上显示个副标题"去加一列。
+
+    web 窗口一律返回空：那里的 title 是用户起的会话名，可能恰好长成
+    ``a:group:b``，把它当群号显示出来只会误导人。
+    """
+    channel = str(getattr(window, "channel", "") or "web")
+    if channel == "web":
+        return "web", "", None
+    parts = split_window_ref(str(getattr(window, "title", "") or ""))
+    if parts is None:
+        return channel, "", None
+    _instance, kind, target = parts
+    return channel, kind, target
 
 
 @dataclass(frozen=True)
@@ -50,6 +90,11 @@ class MessageView:
     handled_reason: str | None = None
     # 谁说的（群聊里必须有，否则"刚才那句是谁说的"无从得知）
     sender_subject_id: str | None = None
+    # 发言人的**人话名字**（群名片优先，其次昵称）。读侧 join ``subjects``
+    # 得来；历史消息没有名字时是 ``None``——不编占位符。
+    sender_name: str | None = None
+    # 发言人的平台账号（QQ 号）；解析不到时由调用方退回 subject id。
+    sender_id: str | None = None
 
     def to_contract(self) -> ChatMessage:
         return ChatMessage(
@@ -66,6 +111,8 @@ class MessageView:
             attempt=self.attempt,
             handled_as=self.handled_as,
             handled_reason=self.handled_reason,
+            sender_name=self.sender_name,
+            sender_id=self.sender_id,
         )
 
 
@@ -199,7 +246,17 @@ class ConversationService:
         return await self.create_window(subject_id=subject_id)
 
     @staticmethod
-    def to_session_record(window: Window) -> SessionRecord:
+    def to_session_record(
+        window: Window, *, display_name: str | None = None
+    ) -> SessionRecord:
+        """窗口 → 契约记录。
+
+        ``display_name`` 由调用方（接口层）经过**平台采集**之后传进来——
+        那是外呼（OneBot ``get_group_info``），不属于本域职责，本域也不该
+        为了一个标题去认识连接器。采集不到就传 ``None``，前端按
+        ``channel`` + ``peer_id`` 自己回退成「群 100…」。
+        """
+        channel, _kind, peer_id = window_target(window)
         return SessionRecord(
             session_id=window.id,
             actor_id=window.actor_id,
@@ -210,7 +267,51 @@ class ConversationService:
             updated_at=_as_utc(window.updated_at),
             message_count=window.message_count or 0,
             archived=bool(window.archived),
+            display_name=display_name,
+            channel=channel,
+            peer_id=peer_id,
         )
+
+    async def peer_display_names(
+        self, windows: Sequence[Window]
+    ) -> dict[str, str | None]:
+        """私聊窗口 id → 对端昵称（``subjects.display_name``）。群/网页窗口不出现。
+
+        ## 为什么私聊要在这里补、群不在这里补
+
+        群名是**平台侧事实**，只有连接器知道（``get_group_info``），所以由
+        接口层外呼采集后传进来；私聊对端的名字我们**本来就有**——入站时身份域
+        按群名片/昵称写进了 ``subjects.display_name``。不查它，界面就只能把
+        标题回退成「私聊 100200301」，而同一个窗口的消息气泡上已经写着
+        「阿岚 100200301」：同一个页面里同一个人，标题是号码、气泡是名字。
+
+        ## 为什么按 ``window.subject_id`` 而不是回查 ``actor_accounts``
+
+        私聊窗口的 ``subject_id`` 就是**对端**（群窗口才是主人，见
+        ``bridge._ensure_window``），这是本域已有的权威关系，一次批量查询就够，
+        不必再按 ``(connector_instance, external_account_id)`` 兜一圈。
+
+        查不到（窗口指向的 subject 已不存在、名字是空白）就返回 ``None``，
+        由前端回退——不编名字。
+        """
+        wanted = {
+            w.subject_id
+            for w in windows
+            if w.subject_id and window_target(w)[1] == "private"
+        }
+        if not wanted:
+            return {}
+        rows = (
+            await self._session.execute(
+                select(Subject.id, Subject.display_name).where(Subject.id.in_(list(wanted)))
+            )
+        ).all()
+        names = {subject_id: str(name or "").strip() for subject_id, name in rows}
+        return {
+            w.id: (names.get(w.subject_id) or None)
+            for w in windows
+            if window_target(w)[1] == "private"
+        }
 
     # ---------------------------------------------------------- 轮次
 
@@ -541,7 +642,78 @@ class ConversationService:
         stmt = stmt.order_by(Message.sequence.desc()).limit(max(1, min(limit, 500)))
         rows = list((await self._session.execute(stmt)).scalars())
         rows.reverse()
-        return [self._to_view(r) for r in rows]
+        names, accounts = await self._sender_labels(window_id, rows)
+        return [
+            self._to_view(
+                r,
+                sender_name=names.get(r.sender_subject_id or ""),
+                # 账号解析不到就用 subject id 兜底：前端要的是"同一个人
+                # 始终同一个值"，具体是 QQ 号还是 subj_xxx 都能分组。
+                sender_id=accounts.get(r.sender_subject_id or "") or r.sender_subject_id,
+            )
+            for r in rows
+        ]
+
+    async def _sender_labels(
+        self, window_id: str, rows: list[Message]
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """``sender_subject_id`` → (显示名, 平台账号)。
+
+        ## 名字：读侧 join，不新增字段
+
+        ``subjects.display_name`` 在入站时已经由身份域写好（群名片优先，
+        其次昵称，见 ``bridge.handle`` 与 ``identity.resolve_or_provision``）。
+        历史消息没采到名字的就是没有——返回 ``None``，不用占位符冒充，
+        前端会退回显示号码。
+
+        ## 账号：只在与"实例内唯一"时使用
+
+        ``messages`` 表只存 subject_id，不存 QQ 号（不为此加列）。这里按
+        窗口所属实例回查 ``actor_accounts``：
+        同一个人在这个实例下**只有一个有效账号**时用它，否则退回 subject id。
+        一个 subject 绑了两个 QQ 号时，历史消息到底是哪个号发的已经无从判断，
+        猜一个号码比给个不透明 id 更糟。
+        """
+        wanted = {r.sender_subject_id for r in rows if r.sender_subject_id}
+        if not wanted:
+            return {}, {}
+        ids = list(wanted)
+        name_rows = (
+            await self._session.execute(
+                select(Subject.id, Subject.display_name).where(Subject.id.in_(ids))
+            )
+        ).all()
+        names = {
+            subject_id: str(name or "").strip()
+            for subject_id, name in name_rows
+            if str(name or "").strip()
+        }
+
+        accounts: dict[str, str] = {}
+        window = await self._session.get(Window, window_id)
+        parts = split_window_ref(str(getattr(window, "title", "") or "")) if window else None
+        # web 窗口（以及 title 已被改名的窗口）没有平台实例，无从回查账号；
+        # 那时 sender_id 就是 subject id，对前端足够。
+        if parts is not None:
+            instance = parts[0]
+            account_rows = (
+                await self._session.execute(
+                    select(ActorAccount.subject_id, ActorAccount.external_account_id).where(
+                        ActorAccount.connector_instance == instance,
+                        ActorAccount.subject_id.in_(ids),
+                        ActorAccount.revoked_at.is_(None),
+                    )
+                )
+            ).all()
+            seen: dict[str, list[str]] = {}
+            for subject_id, external_id in account_rows:
+                seen.setdefault(subject_id, []).append(str(external_id))
+            accounts = {
+                subject_id: found[0]
+                for subject_id, found in seen.items()
+                if len(found) == 1
+            }
+        return names, accounts
 
     async def active_turn(self, window_id: str) -> Turn | None:
         return (
@@ -609,7 +781,12 @@ class ConversationService:
         return int(getattr(result, "rowcount", 0) or 0)
 
     @staticmethod
-    def _to_view(row: Message) -> MessageView:
+    def _to_view(
+        row: Message,
+        *,
+        sender_name: str | None = None,
+        sender_id: str | None = None,
+    ) -> MessageView:
         return MessageView(
             message_id=row.id,
             turn_id=row.turn_id,
@@ -625,6 +802,8 @@ class ConversationService:
             handled_as=row.handled_as,
             handled_reason=row.handled_reason,
             sender_subject_id=row.sender_subject_id,
+            sender_name=sender_name,
+            sender_id=sender_id,
         )
 
     # ---------------------------------------------------------- 窗口短记忆

@@ -37,12 +37,29 @@ from ling.domains.media.service import (
     MediaEvidenceError,
     MediaEvidenceService,
 )
-from ling.ports.model import ChatMessageIn, ImagePart, ModelError
+from ling.domains.media.video import (
+    MAX_VIDEO_BYTES,
+    extract_frames,
+    guess_video_suffix,
+)
+from ling.ports.model import ChatMessageIn, ImagePart, ModelError, ModelErrorKind, VideoPart
 
 logger = logging.getLogger("ling.domains.media.describe")
 
 # 视觉能力绑定的职责名。没绑就不该硬编一个模型去猜。
 VISION_PROFILE = "perception.vision"
+
+# 视频职责名（`ModelRole.perception.video` / 「视频」默认槽位）。
+#
+# **这里没有"kind=video 就自动走它"的路由**，这是刻意的：用户的要求是
+# "只有她主动想读那个视频时才去读"（逐条视频描述会白烧 token，而她当时
+# 可能根本用不上）。所以视频描述要由**调用方显式指定**这个职责才会发生
+# （构造 `MediaDescriber(profile=VIDEO_PROFILE)`，或未来的"她决定看一眼"
+# 入口），默认路径与以前完全一致——`self._profile`（识图）。
+#
+# 为什么与识图分成两个职责：能看图片的模型大多**看不了视频**，合成一个
+# 用户就只能二选一（给图片配便宜的，视频跟着废；或给视频配贵的，图片也贵）。
+VIDEO_PROFILE = "perception.video"
 
 # 只描述看到的，不做推断以外的加工。**不要**让它"顺便猜用户在做什么"——
 # 描述越界就会把猜测伪装成观察。
@@ -50,6 +67,20 @@ DESCRIBE_PROMPT = (
     "你在看用户发来的一张图片。请只描述图上直接可见的内容："
     "有哪些人/物、在做什么、场景是什么。"
     "看不清就说不确定，不要猜测图片之外的背景、地点或人物身份。"
+    "用一两句中文回答，不要加解释、不要提问。"
+)
+
+# 视频专用提示。**不能沿用图片那句**：对着视频说"这是一张图片"会让模型
+# 按单帧作答（描述成一张截图），"在动什么、大概是什么内容"整个丢掉。
+#
+# 目前**没有调用方**：等"她想看才看"的入口接线时，那一侧必须用这句，
+# 而不是 `DESCRIBE_PROMPT`。先留在这里，是因为它属于"怎么问"的一部分，
+# 写在未来的调用方只会被抄错。
+VIDEO_DESCRIBE_PROMPT = (
+    "你在看用户发来的一段视频。请描述这段视频里发生了什么："
+    "画面里有谁/什么、在做什么、场景是什么。"
+    "如果是按时间先后给出的几帧，请把它们当成同一段视频来描述。"
+    "看不清就说不确定，不要猜测视频之外的背景、地点或人物身份。"
     "用一两句中文回答，不要加解释、不要提问。"
 )
 
@@ -114,6 +145,24 @@ def expand_animation(data: bytes, mime: str) -> list[tuple[bytes, str]]:
 
 # fetch_media(media_ref) -> (bytes, mime_type)
 MediaFetcher = Callable[[str], Awaitable[tuple[bytes, str]]]
+
+
+@dataclass(frozen=True)
+class VideoRead:
+    """一次"看视频"的结果。字段都是给行为日志与调用方解释用的。"""
+
+    text: str
+    mode: str  # native | frames | cached
+    frames: int = 0
+    fps: float = 0.0
+    long_video: bool = False
+    # 原生模式失败后退回抽帧的原因（None = 没用退回路径）
+    fallback_reason: str | None = None
+    cached: bool = False
+
+
+class MediaReadError(Exception):
+    """视频太大/取不到内容这类"读不了"的错误（不是模型故障）。"""
 
 
 @dataclass
@@ -193,6 +242,8 @@ class MediaDescriber:
             # 重试它不会变出内容来。
             raise MediaRefPermanentError("媒体内容为空")
 
+        # 职责**不按 kind 自动切换**：视频要由调用方显式指定 VIDEO_PROFILE
+        # （见该常量的注释——"她想看才看"，逐条自动描述会白烧 token）。
         text = await self._ask_vision(data, mime)
         if not text.strip():
             # 空回复等于没看到。留空，不写占位符，下一轮再试。
@@ -214,6 +265,111 @@ class MediaDescriber:
                 str(exc), retriable=False, terminal=True, source=SOURCE_BUSINESS
             ) from exc
         return view.description or ""
+
+    async def describe_video(self, evidence: EvidenceView, *, mode: str = "frames") -> VideoRead:
+        """**按需**读一段视频（她在回复里写了 ``<<看视频 mX>>``）。
+
+        与 ``describe_one`` 的区别：视频默认不进自动队列（见 ``describe_pending``），
+        只在她说要看时调用。两条硬规则不变：写回时仍然走
+        ``MediaEvidenceService.describe``（撤权/过期会拒），描述仍然是推断。
+
+        ``mode``：
+        - ``frames``（默认）：抽帧后当多张图交给视频模型，任何供应商都能用；
+        - ``native``：把视频原样交给模型。供应商不支持时**自动退回抽帧**，
+          并把原因带回去（``fallback_reason``）——不静默、也不伪装成功。
+
+        **同一条证据只读一次**：已经有描述就直接用缓存，不再调模型。
+        """
+        if evidence.description:
+            return VideoRead(
+                text=evidence.description, mode="cached", cached=True
+            )
+
+        try:
+            data, mime = await self._fetch(evidence.media_ref)
+        except MediaRefError as exc:
+            raise MediaRefPermanentError(f"媒体引用不可用: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - 下载失败种类很多
+            raise MediaDescribeError(
+                f"视频下载失败: {type(exc).__name__}", source=SOURCE_OTHER
+            ) from exc
+        if not data:
+            raise MediaRefPermanentError("视频内容为空")
+        if len(data) > MAX_VIDEO_BYTES:
+            raise MediaReadError(f"视频太大（{len(data) // (1024 * 1024)}MB）")
+
+        fallback_reason: str | None = None
+        # 媒体类型不是视频（例如本地落盘的后缀不认识、或引用缺 mime）时
+        # **不要**硬塞给原生模式：那会发出 `data:application/octet-stream`，
+        # 供应商要么报错要么"看到坏字节"。退回抽帧——ffmpeg 自己会看容器头，
+        # 比我们猜后缀准。
+        mime = (mime or "").strip().lower()
+        if mode == "native" and not mime.startswith("video/"):
+            fallback_reason = f"媒体类型不是视频（{mime or '未知'}），改走抽帧"
+        if mode == "native" and fallback_reason is None:
+            try:
+                text = await self._ask(
+                    prompt=VIDEO_DESCRIBE_PROMPT,
+                    videos=(VideoPart.from_bytes(data, mime),),
+                    profile=VIDEO_PROFILE,
+                )
+                read = VideoRead(text=text, mode="native")
+            except MediaDescribeError as exc:
+                # ``_ask`` 会把 ModelError 统一转成 MediaDescribeError，
+                # 所以这里按 ``model_kind`` 判断"是不是不支持"。
+                if exc.model_kind not in (
+                    ModelErrorKind.unsupported,
+                    ModelErrorKind.unsupported.value,
+                ):
+                    raise
+                # 供应商明确说不支持原生视频：退回抽帧，并记下原因。
+                fallback_reason = f"供应商不支持原生视频输入（{exc}）"
+        if mode != "native" or fallback_reason is not None:
+            sample = await extract_frames(data, suffix=guess_video_suffix(mime))
+            prompt = VIDEO_DESCRIBE_PROMPT
+            if sample.long_video:
+                prompt = (
+                    f"{VIDEO_DESCRIBE_PROMPT}"
+                    f"（这段视频较长，你只看到全片等间隔取样的 {sample.count} 帧，"
+                    "请在描述里说明这只是其中一部分。）"
+                )
+            text = await self._ask(
+                prompt=prompt,
+                images=tuple(
+                    ImagePart.from_bytes(frame, "image/jpeg") for frame in sample.frames
+                ),
+                profile=VIDEO_PROFILE,
+            )
+            read = VideoRead(
+                text=text,
+                mode="frames",
+                frames=sample.count,
+                fps=sample.fps,
+                long_video=sample.long_video,
+                fallback_reason=fallback_reason,
+            )
+
+        if not read.text.strip():
+            raise MediaDescribeError("模型没有返回任何描述", source=SOURCE_OTHER)
+        try:
+            view = await self._service.describe(
+                evidence.evidence_id,
+                window_id=evidence.window_id,
+                description=read.text,
+                description_origin=ORIGIN_MODEL,
+            )
+        except MediaEvidenceError as exc:
+            raise MediaDescribeError(
+                str(exc), retriable=False, terminal=True, source=SOURCE_BUSINESS
+            ) from exc
+        return VideoRead(
+            text=view.description or read.text,
+            mode=read.mode,
+            frames=read.frames,
+            fps=read.fps,
+            long_video=read.long_video,
+            fallback_reason=read.fallback_reason,
+        )
 
     async def describe_pending(self, *, window_id: str, limit: int = 5) -> DescribeOutcome:
         """跑一个窗口的待办。单条失败不中断其余。
@@ -239,7 +395,12 @@ class MediaDescriber:
         ``break``，记一条 WARNING，其余证据原样留在队列里。
         """
         outcome = DescribeOutcome()
-        pending = await self._service.pending(window_id=window_id, limit=limit)
+        # **视频不进自动描述队列**：读视频是"她主动说要看"才发生的事
+        # （见 `domains/media/video.py`）。一视同仁地跑，等于把群里每一段
+        # 视频都送进视频模型——白烧 token，而她当时可能根本用不上。
+        pending = await self._service.pending(
+            window_id=window_id, limit=limit, exclude_kinds=("video",)
+        )
         for evidence in pending:
             try:
                 await self.describe_one(evidence)
@@ -283,7 +444,6 @@ class MediaDescriber:
         return outcome
 
     async def _ask_vision(self, data: bytes, mime: str) -> str:
-        config = await self._config_reader.effective()  # type: ignore[attr-defined]
         frames = expand_animation(data, mime)
         # 多帧时明确告诉模型这是同一段动图的先后帧。不说的话它会把四张图
         # 当成四件不同的事，描述成"图一…图二…"，读起来像在逐张报菜名。
@@ -294,20 +454,33 @@ class MediaDescriber:
                 "请把它们当成**同一段动画**来描述：在动什么、大致是什么内容。"
                 "只说直接看得见的，看不清就说不确定，不要编。用一两句中文回答。"
             )
+        return await self._ask(
+            prompt=prompt,
+            images=tuple(
+                ImagePart.from_bytes(payload, m or "image/jpeg") for payload, m in frames
+            ),
+        )
+
+    async def _ask(
+        self,
+        *,
+        prompt: str,
+        images: tuple[ImagePart, ...] = (),
+        videos: tuple[VideoPart, ...] = (),
+        profile: str | None = None,
+    ) -> str:
+        """一次视觉/视频调用。``profile`` 不给就用构造时绑定的职责。"""
+        config = await self._config_reader.effective()  # type: ignore[attr-defined]
         messages = [
-            ChatMessageIn(
-                role="user",
-                content=prompt,
-                images=tuple(
-                    ImagePart.from_bytes(payload, m or "image/jpeg")
-                    for payload, m in frames
-                ),
-            )
+            ChatMessageIn(role="user", content=prompt, images=images, videos=videos)
         ]
         chunks: list[str] = []
         try:
             async for chunk, outcome in self._router.stream(  # type: ignore[attr-defined]
-                config, profile=self._profile, messages=messages, allow_fallback=False
+                config,
+                profile=profile or self._profile,
+                messages=messages,
+                allow_fallback=False,
             ):
                 if chunk.delta:
                     chunks.append(chunk.delta)
@@ -343,8 +516,12 @@ def _model_failure(error: ModelError) -> MediaDescribeError:
 
 __all__ = [
     "DESCRIBE_PROMPT",
+    "VIDEO_DESCRIBE_PROMPT",
+    "VIDEO_PROFILE",
     "VISION_PROFILE",
     "DescribeOutcome",
+    "MediaReadError",
+    "VideoRead",
     "MediaDescribeError",
     "MediaDescriber",
 ]

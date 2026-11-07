@@ -53,6 +53,12 @@ class BridgeResult:
 
     accepted: bool
     reason: str
+    # 她**做了什么**（一句话，例如「先放着，等她刷到」）。与 ``reason``
+    # （为什么这么做）刻意分开：日志层把它拼成「动作（理由）」。
+    # 以前动作也写在 reason 里，日志就成了「先放着，等她刷到（群里的普通
+    # 消息，先放着，等她刷到）」——同一句话说两遍。
+    # 为空表示由日志层按 decision 决定（"回了" / "没接话"）。
+    action: str | None = None
     subject_id: str | None = None
     window_id: str | None = None
     turn_id: str | None = None
@@ -184,7 +190,13 @@ class InboundBridge:
         # 媒体必须在文本判断**之前**登记，否则纯图片消息会被整条丢掉，
         # 连"收到过一张图"都留不下痕迹，描述任务也就无从捡起。
         media_ids, media_note = await self._ingest_media(
-            envelope, subject_id=subject_id, window_id=window.id
+            envelope,
+            subject_id=subject_id,
+            window_id=window.id,
+            # 群窗口的 subject_id 是**主人**（见上面 window_subject 的取值）：
+            # 主人授权一次 media.inbound，群里谁发的图都能被描述。
+            # 私聊窗口下两者本来就是同一个人。
+            owner_subject_id=window.subject_id,
         )
 
         # 「是不是冲她说的」要在"有没有可读文本"**之前**算：
@@ -218,7 +230,12 @@ class InboundBridge:
             await self._session.commit()
             return BridgeResult(
                 accepted=True,
-                reason="被 @ 了，等一句正文补充",
+                # 「被 @ 了，等补充一句正文」是**理由**；动作由 action 给，
+                # 两者拼起来才是「先放着（被 @ 了，等补充一句正文）」。
+                # reason 里保留"补充"字样：接口返回与排查日志都靠它说明
+                # "还在等对方补一句"，不能让调用方只剩一个 decision 值。
+                reason="被 @ 了，等补充一句正文",
+                action="先放着",
                 subject_id=subject_id,
                 window_id=window.id,
                 decision="deferred_attention",
@@ -273,9 +290,22 @@ class InboundBridge:
                 sender_subject_id=subject_id,
             )
             await self._session.commit()
+            # ``reason`` 只写**理由**，不写动作。
+            #
+            # 动作（"先放着，等她刷到"）由日志层按 ``decision`` 补——两处
+            # 各写一份必然重复，这正是「先放着，等她刷到（群里的普通消息，
+            # 先放着，等她刷到）」那条日志的成因。
+            #
+            # 两种走法的理由不同，**不能共用一句**：
+            #   observe_only  是**资格**问题（这个人/群没权力让她主动开口），
+            #                 换个配置也不该变；
+            #   普通群消息     是**策略**问题（配置说群消息先攒着）。
+            # 混着说会让"为什么没回"在日志里说谎。
+            reason = "只能看，没资格让她主动开口" if observe else "群里的普通消息"
             return BridgeResult(
                 accepted=True,
-                reason="群里的普通消息，先放着，等她刷到",
+                reason=reason,
+                action="先放着，等她刷到",
                 subject_id=subject_id,
                 window_id=window.id,
                 decision="deferred_attention",
@@ -326,7 +356,13 @@ class InboundBridge:
             await self._session.commit()
             return BridgeResult(
                 accepted=True,
-                reason=f"决定不回应：{decision.reason}",
+                # 只给**理由**，动作（"没接话"）由日志层按 decision 补。
+                # 这里原来写的是「决定不回应：{reason}」，日志于是成了
+                # 「没接话（决定不回应：…）」——同一句话说了两遍。
+                # 去掉前缀之后，返回给调用方的 reason 与**落库的
+                # handled_reason** 更是同一个值（上面 add_message 存的就是
+                # ``decision.reason``），不会出现"日志里的理由和库里的不一样"。
+                reason=decision.reason,
                 subject_id=subject_id,
                 window_id=window.id,
                 decision="silence",
@@ -494,13 +530,22 @@ class InboundBridge:
         )
 
     async def _ingest_media(
-        self, envelope: InteractionEnvelope, *, subject_id: str, window_id: str
+        self,
+        envelope: InteractionEnvelope,
+        *,
+        subject_id: str,
+        window_id: str,
+        owner_subject_id: str | None = None,
     ) -> tuple[list[str], str | None]:
         """登记这条消息里的媒体证据，返回 (证据 id 列表, 失败原因)。
 
         设计取舍：**媒体登记失败不阻断文本轮次**。一张图描述不了不应该
         让整句"这图什么意思"也聊不下去。但失败原因必须带出去，
         不能静默——否则用户不知道为什么发了图角色毫无反应。
+
+        ``owner_subject_id``：会话主人。授权判据是「发言人本人**或**主人」
+        之一——主人授权一次，群里别人发的图也能被描述。不传就退化成
+        "只认发言人"，与加这个参数之前的行为一致。
 
         注意这里只登记、不描述：描述要调视觉模型，属于另一条链路。
         """
@@ -521,7 +566,7 @@ class InboundBridge:
 
         service = MediaEvidenceService(self._session, actor_id=self._actor_id)
         recorded: list[str] = []
-        failure: str | None = None
+        failures: list[str] = []
         for ref in refs:
             try:
                 view = await service.record(
@@ -530,13 +575,24 @@ class InboundBridge:
                     media_ref=ref,
                     kind=kinds.get(ref, "image"),
                     source_event_id=f"{envelope.external_event_id}:{ref}",
+                    consent_subjects=(owner_subject_id,) if owner_subject_id else (),
                 )
             except MediaEvidenceError as exc:
-                failure = str(exc)
-                logger.info("媒体证据未登记 ref=%s 原因=%s", ref, exc)
+                failures.append(str(exc))
                 continue
             recorded.append(view.evidence_id)
-        return recorded, failure
+        if failures:
+            # 一条消息里 N 个媒体只记**一行**汇总。
+            #
+            # 原来每个 ref 单独一行 INFO：群里有人一次发 9 张图，就是 9 行
+            # 一模一样的「未授权描述入站媒体」——真问题被自己的重复淹掉。
+            # 拒绝本身没变：仍然逐条失败、仍然把原因带回给调用方，
+            # 只是日志从"每个 ref 一行"压成"这条消息一行"。
+            reasons = "；".join(dict.fromkeys(failures))
+            logger.info(
+                "收到 %d 个媒体，跳过 %d 个：%s", len(refs), len(failures), reasons
+            )
+        return recorded, (failures[0] if failures else None)
 
     async def _ensure_turn(
         self,
@@ -781,7 +837,11 @@ class InboundBridge:
                     logger.warning(
                         "轮次 %s 失败：%s | %s", turn_id, name, str(detail)[:300]
                     )
-        return reply_text.strip(), state, expression
+        # 出站前再洗一次：`turn.completed` 的正文已经干净，但"她的话"最终
+        # 是从这里发出去的——半截标记（模型被打断时的残片）必须在这一步也挡住。
+        from ling.domains.media.watch import clean_reply_text
+
+        return clean_reply_text(reply_text).strip(), state, expression
 
     async def _deliver(
         self,

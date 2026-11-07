@@ -22,7 +22,9 @@ import {
   LOG_POLL_MS,
   LOG_SEARCH_DEBOUNCE_MS,
   STICK_THRESHOLD_PX,
+  LogsHeader,
   LogsList,
+  LogsPage,
   LogsToolbar,
   describeCounts,
   describeDenials,
@@ -327,25 +329,29 @@ describe('轮询：暂停是真的停，恢复后继续', () => {
 /* ------------------------------------------------------------------ 渲染 */
 
 describe('渲染结构（SSR）', () => {
-  it('工具栏有级别下拉、搜索框、暂停按钮与条数', () => {
+  it('工具栏有分类/级别下拉、搜索框、暂停按钮与显示方法名开关', () => {
     const html = renderToStaticMarkup(
       h(LogsToolbar, {
         kind: 'all',
         level: 'all',
         search: '',
         paused: false,
-        counts: '已显示 3 条 · 缓冲 3/500',
+        showLogger: false,
         onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
         onRefresh: NOOP,
+        onToggleLogger: NOOP,
       }),
     );
     expect(html).toContain('data-testid="logs-level"');
     expect(html).toContain('data-testid="logs-search"');
     expect(html).toContain('data-testid="logs-pause"');
-    expect(html).toContain('data-testid="logs-count"');
+    expect(html).toContain('data-testid="logs-show-logger"');
+    // 条数说明已经归页头：工具栏里不能再出现它（以前它会换行成一条横贯的窄带）
+    expect(html).not.toContain('data-testid="logs-count"');
+    expect(html).not.toContain('已显示');
     // 四个级别 + 「全部」都在下拉里（少一个就有一个筛选用不了）
     for (const value of ['all', 'debug', 'info', 'warning', 'error']) {
       expect(html).toContain(`value="${value}"`);
@@ -360,12 +366,13 @@ describe('渲染结构（SSR）', () => {
         level: 'all',
         search: 'x',
         paused: true,
-        counts: '',
+        showLogger: false,
         onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
         onRefresh: NOOP,
+        onToggleLogger: NOOP,
       }),
     );
     expect(html).toContain('aria-pressed="true"');
@@ -374,10 +381,11 @@ describe('渲染结构（SSR）', () => {
     expect(html).not.toContain('>暂停</button>');
   });
 
-  it('每行有 时间 / 级别 / logger / 消息四段，级别同时用文字与 class 表达', () => {
+  it('每行有 时间 / 级别 / logger / 消息四段（开关打开时），级别同时用文字与 class 表达', () => {
     const html = renderToStaticMarkup(
       h(LogsList, {
         level: 'all',
+        showLogger: true,
         items: [
           entry({ level: 'error', logger: 'ling.api', message: '炸了' }),
           entry({ level: 'warning', logger: 'ling.worker', message: '要慢' }),
@@ -399,7 +407,11 @@ describe('渲染结构（SSR）', () => {
 
   it('认不出来的级别原样显示（不改写成 info）', () => {
     const html = renderToStaticMarkup(
-      h(LogsList, { level: 'all', items: [entry({ level: 'critical', message: '严重' })] }),
+      h(LogsList, {
+        level: 'all',
+        showLogger: false,
+        items: [entry({ level: 'critical', message: '严重' })],
+      }),
     );
     expect(html).toContain('>CRITICAL<');
     // 颜色档归到了 error（这个可以有），但文字不能变
@@ -407,11 +419,13 @@ describe('渲染结构（SSR）', () => {
   });
 
   it('空列表说清「后端暂无日志」并解释为什么会空', () => {
-    const html = renderToStaticMarkup(h(LogsList, { level: 'all', items: [] }));
+    const html = renderToStaticMarkup(h(LogsList, { level: 'all', showLogger: false, items: [] }));
     expect(html).toContain('data-testid="logs-empty"');
     expect(html).toContain('后端暂无日志');
     // 有级别筛选时给出下一步动作，而不是让人对着空白发呆
-    const filtered = renderToStaticMarkup(h(LogsList, { level: 'error', items: [] }));
+    const filtered = renderToStaticMarkup(
+      h(LogsList, { level: 'error', showLogger: false, items: [] }),
+    );
     expect(filtered).toContain('切回「全部」');
   });
 
@@ -419,11 +433,86 @@ describe('渲染结构（SSR）', () => {
     const html = renderToStaticMarkup(
       h(LogsList, {
         level: 'all',
+        showLogger: false,
         items: [entry({ message: '<script>alert(1)</script>' })],
       }),
     );
     expect(html).not.toContain('<script>');
     expect(html).toContain('&lt;script&gt;');
+  });
+});
+
+/* -------------------------------------------------------------- 页头条数说明 */
+
+describe('条数说明在页头，不在列表上方占一条窄带', () => {
+  it('页头把 describeCounts 的原文原样显示在标题旁', () => {
+    const counts = describeCounts(200, 500, 500);
+    const html = renderToStaticMarkup(h(LogsHeader, { counts }));
+    expect(html).toContain('data-testid="logs-head"');
+    expect(html).toContain('page__head');
+    expect(html).toContain('日志');
+    // 语义不在渲染层加工：describeCounts 说什么就显示什么
+    expect(html).toContain('已显示 200 条');
+    expect(html).toContain('缓冲已满');
+    expect(html).toContain('更早的已被覆盖');
+  });
+
+  it('页面里条数说明位于页头与工具栏之间，工具栏之后不再有它', () => {
+    const html = renderToStaticMarkup(h(LogsPage));
+    const headAt = html.indexOf('data-testid="logs-head"');
+    const countAt = html.indexOf('data-testid="logs-count"');
+    const toolbarAt = html.indexOf('data-testid="logs-toolbar"');
+    expect(headAt).toBeGreaterThanOrEqual(0);
+    expect(countAt).toBeGreaterThan(headAt);
+    expect(countAt).toBeLessThan(toolbarAt);
+    // 工具栏及之后（列表上方那段）没有条数说明——红框里那条窄带就此消失
+    expect(html.slice(toolbarAt)).not.toContain('logs-count');
+    expect(html.slice(toolbarAt)).not.toContain('logs__count');
+    // 加载态也走页头，而不是另起一条
+    expect(html).toContain('正在读取…');
+  });
+});
+
+/* -------------------------------------------------------------- 方法名开关 */
+
+describe('方法名（logger）开关：默认不显示，打开才显示', () => {
+  const rows = [
+    entry({ logger: 'ling.kernel.bridge', message: '桥接就绪' }),
+    entry({ logger: 'ling.connectors.onebot.ws_server', message: '收到事件' }),
+  ];
+
+  it('关闭时不渲染 logger 列（不是藏起来），也不给列宽留空位', () => {
+    const html = renderToStaticMarkup(
+      h(LogsList, { level: 'all', showLogger: false, items: rows }),
+    );
+    expect(html).not.toContain('ling.kernel.bridge');
+    expect(html).not.toContain('ling.connectors.onebot.ws_server');
+    // DOM 里根本没有那一列：空占位格会把消息列挤窄
+    expect(html).not.toContain('logs__logger');
+    // 由修饰类把列宽换成三列（时间/级别/消息），见 logs.css
+    expect(html).toContain('logs__list--no-logger');
+    // 时间、级别、消息都还在，顺序不变
+    expect(html).toContain('<time');
+    expect(html).toContain('>INFO<');
+    expect(html).toContain('桥接就绪');
+    expect(html).toContain('收到事件');
+  });
+
+  it('打开时每行显示 logger 名，并去掉「无 logger」的列宽修饰', () => {
+    const html = renderToStaticMarkup(h(LogsList, { level: 'all', showLogger: true, items: rows }));
+    expect(html).toContain('ling.kernel.bridge');
+    expect(html).toContain('ling.connectors.onebot.ws_server');
+    expect(html).toContain('logs__logger');
+    expect(html).not.toContain('logs__list--no-logger');
+  });
+
+  it('页面默认关闭：开关未勾选（默认值来自页面状态，不是测试传进去的）', () => {
+    const html = renderToStaticMarkup(h(LogsPage));
+    // 取整个 input 标签再判断：只搜 'checked' 的话属性顺序一变就假绿
+    const input = html.match(/<input[^>]*logs-show-logger[^>]*>/);
+    expect(input).not.toBeNull();
+    expect(input?.[0]).not.toContain('checked');
+    expect(html).toContain('显示方法名');
   });
 });
 
@@ -482,12 +571,13 @@ describe('日志分类（运行 / 处理）', () => {
         level: 'all',
         search: '',
         paused: false,
-        counts: '',
+        showLogger: false,
         onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
         onRefresh: NOOP,
+        onToggleLogger: NOOP,
       }),
     );
     expect(html).toContain('data-testid="logs-kind"');
@@ -502,12 +592,13 @@ describe('日志分类（运行 / 处理）', () => {
         level: 'all',
         search: '',
         paused: false,
-        counts: '',
+        showLogger: false,
         onKind: NOOP,
         onLevel: NOOP,
         onSearch: NOOP,
         onTogglePause: NOOP,
         onRefresh: NOOP,
+        onToggleLogger: NOOP,
       }),
     );
     // React SSR 会把选中项标成 selected
@@ -518,6 +609,7 @@ describe('日志分类（运行 / 处理）', () => {
     const html = renderToStaticMarkup(
       h(LogsList, {
         level: 'all',
+        showLogger: false,
         items: [
           entry({ message: '看了下测试群，没接话', kind: 'behavior' }),
           entry({ message: '请求完成', kind: 'runtime' }),
