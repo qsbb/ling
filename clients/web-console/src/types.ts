@@ -68,6 +68,60 @@ export interface MessagesResponse {
   active_turn: TurnView | null;
 }
 
+/* ---------------------------------------------------------------- 提示词快照 */
+
+/**
+ * 「她这次看到了什么」快照的三态。
+ *
+ * `expired` / `unavailable` **不是**空内容：它们各自有一句人话，界面必须把
+ * 那句话显示出来。把三态都渲染成"没有条目"会让人以为提示词真的是空的。
+ */
+export type PromptSnapshotState = 'available' | 'expired' | 'unavailable';
+
+/** 快照里的一段注入内容。`key` 是机器键（system/memory/…），`label` 是人话标题。 */
+export interface PromptSection {
+  key: string;
+  label: string;
+  role?: string | null;
+  tokens?: number | null;
+  /** 后端建议默认折叠（例如很长的历史）。前端仍会自己按长度兜底。 */
+  collapsed?: boolean;
+  items: PromptItem[];
+}
+
+/** 一条注入项。有 `sender` 时界面显示发言人，否则回退到 `role`。 */
+export interface PromptItem {
+  role?: string | null;
+  sender?: string | null;
+  content: string;
+  at?: string | null;
+}
+
+/** 这一轮真正使用的模型与职责（拿不到时整块为 null）。 */
+export interface PromptModelInfo {
+  provider_id: string | null;
+  model_id: string | null;
+  profile: string | null;
+}
+
+/**
+ * `GET /v1/messages/{message_id}/prompt` 的响应。
+ *
+ * 契约里 `items` 与 `model` 是内联结构；这里给它们起了名字（字段名一字未改），
+ * 只是为了让组件与测试不必重复写匿名类型。
+ */
+export interface PromptSnapshotOut {
+  state: PromptSnapshotState;
+  message_id: string;
+  turn_id: string | null;
+  created_at: string | null;
+  expires_at: string | null;
+  model: PromptModelInfo | null;
+  token_total: number | null;
+  truncated: boolean;
+  sections: PromptSection[];
+}
+
 export interface UserInfo {
   id: string;
   username: string;

@@ -12,6 +12,7 @@ import type {
   Persona,
   PersonaUpdate,
   ProbeResult,
+  PromptSnapshotOut,
   DialoguePolicy,
   LifePolicy,
   MemoryPolicy,
@@ -233,6 +234,18 @@ export const api = {
     const query = new URLSearchParams({ limit: String(limit) });
     return request<MessagesResponse>(
       `/v1/sessions/${encodeURIComponent(sessionId)}/messages?${query.toString()}`,
+    );
+  },
+  /**
+   * 她这次回复时**完整看到的东西**（系统提示词、记忆、历史、用户输入…）。
+   *
+   * 只有消息所有者能读；不是自己的消息、消息不存在、快照已过保留期都由
+   * 服务端决定，前端不按本地字段猜。404 在界面上的落点是「这次没有记录」，
+   * 不是空白内容——见 `PromptDrawer.tsx` 的三态映射。
+   */
+  messagePrompt(messageId: string): Promise<PromptSnapshotOut> {
+    return request<PromptSnapshotOut>(
+      `/v1/messages/${encodeURIComponent(messageId)}/prompt`,
     );
   },
 

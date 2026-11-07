@@ -4,6 +4,7 @@ import { usePersonaName } from '../personaName';
 import type { LiveTurn, UiMessage } from '../useChat';
 import type { TurnView } from '../types';
 import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
+import { PROMPT_DRAWER_ID, PROMPT_ENTRY_LABEL } from './PromptDrawer';
 
 /**
  * 会话类型决定「谁在说话」怎么读。
@@ -44,6 +45,15 @@ interface MessageListProps {
   onStop: () => void;
   onOpenSettings: () => void;
   variant?: DialogueVariant;
+  /**
+   * 「她这次看到了什么」入口是否可见：只有 owner 能看（后端对其他人 404）。
+   * 默认关，既有页面与测试不受影响。
+   */
+  promptEnabled?: boolean;
+  /** 当前抽屉打开的那条消息（按 `key` 比，再点同一条 = 收起）。 */
+  promptOpenKey?: string | null;
+  /** 点击入口。第二个参数是入口元素本身，关闭抽屉后要把焦点还给它。 */
+  onOpenPrompt?: (message: UiMessage, trigger: HTMLElement) => void;
 }
 
 const SETTINGS_CODES = new Set([
@@ -318,6 +328,9 @@ export function MessageList({
   onStop,
   onOpenSettings,
   variant = 'web',
+  promptEnabled = false,
+  promptOpenKey = null,
+  onOpenPrompt,
 }: MessageListProps) {
   const liveTurnId = live?.turnId ?? null;
   const actorName = usePersonaName();
@@ -460,6 +473,24 @@ export function MessageList({
                   variant={variant}
                 />
               )}
+              {/*
+                她的消息下面那行小字：她这一轮到底看到了什么。
+                没有 turn_id / 已经被归档的消息**也要能点**——服务端 404 时
+                抽屉里给「这次没有记录」，不在入口上提前猜。
+              */}
+              {message.role === 'actor' && promptEnabled && onOpenPrompt ? (
+                <button
+                  type="button"
+                  className="message__prompt"
+                  data-testid="prompt-entry"
+                  aria-haspopup="dialog"
+                  aria-expanded={promptOpenKey === message.key}
+                  aria-controls={PROMPT_DRAWER_ID}
+                  onClick={(event) => onOpenPrompt(message, event.currentTarget)}
+                >
+                  {PROMPT_ENTRY_LABEL}
+                </button>
+              ) : null}
               {row.silence ? <SilenceNote note={row.silence} /> : null}
             </div>
           </li>
