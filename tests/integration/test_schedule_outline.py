@@ -33,6 +33,10 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import func, select
 
+from ling.domains.agenda.intents import (
+    CONFIRM_ENTRY_USER,
+    IntentService,
+)
 from ling.domains.agenda.timeline import (
     PHASE_CATCHUP,
     PHASE_DUE,
@@ -44,6 +48,7 @@ from ling.domains.agenda.timeline import (
     Anchor,
     build_persona_projection,
     ensure_day_plan,
+    intention_short_id,
     load_day_plan,
     load_segments,
     local_minute_instant,
@@ -60,8 +65,11 @@ from ling.infra.models import (
     ActorRoutineRow,
     BehaviorModelCallRow,
     CommitmentRow,
+    CoreMemoryRow,
     DayPlanRow,
+    MemoryRow,
     Persona,
+    ScheduleIntentionRow,
     ScheduleSegmentRow,
     SelfExperienceRow,
 )
@@ -73,6 +81,7 @@ from ling.ports.config import (
     ProviderModel,
 )
 from ling.ports.model import ModelChunk
+from ling.settings.user_preferences import owner_subject_id
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -1097,3 +1106,468 @@ async def test_agenda_service_forwards_timeline_entries(web_env: TestEnv) -> Non
         assert todo is not None
         assert todo.tag == REPLAN_TODO_TAG
         assert todo.segment_ids
+
+
+# ---------------------------------------------------------------- 长程意向输入（§3A）
+#
+# 这一组守设计 §3A 的验收：
+# 1. `proposed` / `confirmed` 的意向都**不占时段**（确认目标 ≠ 确认时段）；
+# 2. 引用意向只能用它给出的短 ID；候选引用必须带"可能/打算"语气；
+# 3. "为未来目标做准备"的段要**同时**满足：confirmed + 另有可信截止依据
+#    （`prep_source_ref`）+ D 有空档；没有依据就不许写"今天买票"；
+# 4. 模型新提议只落 `proposed`，越权（给 confirmed）整份拒收；
+# 5. 进 prompt 之前先做过期清理（零模型）。
+
+
+async def _create_intent(
+    *,
+    state: str = "planned",
+    source_kind: str = "user",
+    source_ref: str = "turn:seed",
+    title: str = "周五去杭州看展",
+    start_day: date | None = None,
+    end_day: date | None = None,
+    prep_source_ref: str | None = None,
+    prep_due_day: date | None = None,
+    visibility: str = "actor_private",
+    now=None,  # noqa: ANN001
+):  # noqa: ANN201
+    """建一条意向（可选直接 confirmed）；返回 ``IntentView``。"""
+    target_start = start_day or (PLAN_DAY + timedelta(days=4))
+    target_end = end_day or target_start
+    # `confirmed` 只能走 confirm() 的两条授权入口；create 只建 proposed/planned。
+    created_state = "planned" if state == "confirmed" else state
+    async with session_scope() as session:
+        service = IntentService(session, actor_id=ACTOR)
+        view = await service.create(
+            kind="travel",
+            title=title,
+            target_start_day=target_start,
+            target_end_day=target_end,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            state=created_state,
+            target_timezone=TZ,
+            visibility=visibility,
+            prep_source_ref=prep_source_ref,
+            prep_due_day=prep_due_day,
+            now=now or NOW,
+        )
+        if state == "confirmed":
+            view = await service.confirm(
+                view.intention_id,
+                entry=CONFIRM_ENTRY_USER,
+                evidence_ref="turn:confirmed-seed",
+                now=now or NOW,
+            )
+    return view
+
+
+def _outline_with_citation(
+    short_id: str,
+    *,
+    title: str,
+    start_minute: int = 10 * 60,
+    end_minute: int = 11 * 60,
+    proposals: list[dict[str, object]] | None = None,
+) -> str:
+    """一段引用某意向 + 一段普通可选块（10:00 落在睡眠锚点之间的大空档里）。"""
+    segments: list[dict[str, object]] = [
+        {
+            "kind": "errand",
+            "title": title,
+            "start_at": _iso(start_minute),
+            "end_at": _iso(end_minute),
+            "place_id": None,
+            "flexibility": "flexible",
+            "intention_id": short_id,
+        },
+        {
+            "kind": "reading",
+            "title": "看会儿书",
+            "start_at": _iso(14 * 60),
+            "end_at": _iso(15 * 60),
+            "place_id": None,
+            "flexibility": "flexible",
+        },
+    ]
+    payload: dict[str, object] = {"segments": segments}
+    if proposals is not None:
+        payload["intention_proposals"] = proposals
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _segment_titled(rows: list[ScheduleSegmentRow], needle: str) -> list[ScheduleSegmentRow]:
+    return [row for row in rows if needle in str(row.title)]
+
+
+async def test_proposed_intent_is_prompt_input_but_never_a_segment(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """`proposed` 只影响候选与措辞：进 prompt，但不写成时间轴正文。"""
+    await _seed()
+    intent = await _create_intent(state="proposed", source_kind="model", title="去看看海")
+    short = intention_short_id(intent.intention_id)
+
+    outcome, router = await _work(PHASE_DUE, responses=[_valid_outline()], now=NOW)
+
+    assert outcome.state == "ready", outcome
+    assert len(router.prompts) == 1
+    prompt = router.prompts[0]
+    # 进的是**短字段**：短 ID + 标题 + 状态；不是整行、也不是正文。
+    assert short in prompt, "意向必须带短 ID 出现在输入里"
+    assert "去看看海" in prompt
+    assert '"future_intents"' in prompt
+    assert intent.intention_id not in prompt, "prompt 里不应出现完整内部 id（省 token）"
+
+    # 时间轴上只有睡眠锚点 + 模型块：没有任何段引用意向。
+    rows = await _segments()
+    assert [row for row in rows if row.intention_id] == []
+    assert _segment_titled(rows, "去看看海") == []
+    assert outcome.preparations == 0
+
+    # 反复进入夜间输入**不构成确认证据**：状态与版本都不动。
+    async with session_scope() as session:
+        row = await session.get(ScheduleIntentionRow, intent.intention_id)
+        assert row is not None
+        assert row.state == "proposed"
+        assert row.revision == intent.revision
+
+    _, activities, experiences, _segments_count = await _counts()
+    assert activities == 0 and experiences == 0, "计划不是事实：不许写活动/经历"
+
+
+async def test_confirmed_target_still_does_not_reserve_a_time_slot(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """确认"周五想旅行"不等于占住任何钟点（与阶段 1.75a 的断言一致）。"""
+    await _seed()
+    intent = await _create_intent(state="confirmed", title="周五去杭州看展")
+    short = intention_short_id(intent.intention_id)
+
+    outcome, router = await _work(PHASE_DUE, responses=[_valid_outline()], now=NOW)
+
+    assert outcome.state == "ready", outcome
+    assert outcome.intents_in_prompt == 1
+    assert short in router.prompts[0]
+    # 只有 D 的两段睡眠锚点 + 两个模型块；D+4 上没有任何段/计划行。
+    assert outcome.segments == 4, outcome
+    async with session_scope() as session:
+        plans = list(
+            (await session.execute(select(DayPlanRow))).scalars()
+        )
+        assert [row.plan_day for row in plans] == [PLAN_DAY]
+        segments = list((await session.execute(select(ScheduleSegmentRow))).scalars())
+    assert all(row.plan_id == plans[0].id for row in segments)
+    assert [row for row in segments if row.intention_id] == []
+    assert _segment_titled(segments, "周五去杭州看展") == []
+
+
+async def test_preparation_without_trusted_source_is_never_written(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """D+4 旅行 confirmed 但**没有** prep_source_ref：不许生成"今天买票"。"""
+    await _seed()
+    intent = await _create_intent(state="confirmed", title="周五去杭州看展")
+    assert intent.prep_source_ref is None
+    short = intention_short_id(intent.intention_id)
+    bad = _outline_with_citation(short, title="今天把去杭州的票买了")
+
+    outcome, router = await _work(PHASE_DUE, responses=[bad, bad], now=NOW)
+
+    # 两次都非法 → 规则兜底；关键是**没有**落下任何"准备/买票"的段。
+    assert outcome.state == "degraded", outcome
+    assert outcome.reason_code == "outline_invalid", outcome
+    assert len(router.prompts) == 2
+    assert "还没有准备资格" in router.prompts[1], router.prompts[1][-400:]
+    rows = await _segments()
+    assert _segment_titled(rows, "买票") == []
+    assert [row for row in rows if row.intention_id] == []
+    assert outcome.preparations == 0
+
+
+async def test_preparation_is_attached_with_strictest_visibility(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """有可信依据 + D 有空档：生成准备段，并写 intention_id / preparation_for_day。"""
+    await _seed()
+    target_day = PLAN_DAY + timedelta(days=4)
+    intent = await _create_intent(
+        state="confirmed",
+        title="周五去杭州看展",
+        # 意向本身故意标成 public：准备段的可见范围**取最严**，不能被它带宽。
+        visibility="public",
+        prep_source_ref="commitment:seed-ticket",
+        prep_due_day=PLAN_DAY,
+    )
+    short = intention_short_id(intent.intention_id)
+
+    outcome, _router = await _work(
+        PHASE_DUE,
+        responses=[
+            _outline_with_citation(short, title="给周五的旅行做准备"),
+        ],
+        now=NOW,
+    )
+
+    assert outcome.state == "ready", outcome
+    assert outcome.preparations == 1, outcome
+    rows = await _segments()
+    prepared = [row for row in rows if row.intention_id]
+    assert len(prepared) == 1
+    segment = prepared[0]
+    assert str(segment.intention_id) == intent.intention_id
+    assert segment.preparation_for_day == target_day
+    # 三道来源里最严的那个：段（未知）→ 意向（public）→ 来源（未知按最严）。
+    assert segment.visibility == "actor_private"
+    # 审计足迹：意向 id + 确认来源（不带标题）。
+    assert f"intention:{intent.intention_id}" in segment.source_event_ids
+    assert "turn:confirmed-seed" in segment.source_event_ids
+    # 准备段仍是**计划**：没有活动、没有经历。
+    _, activities, experiences, _ = await _counts()
+    assert activities == 0 and experiences == 0
+
+
+async def test_completion_claim_in_title_is_rejected_and_repaired(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """标题写成"已经去了" → 整份拒收；同预算内修好后仍可 ready。"""
+    await _seed()
+    claim = json.dumps(
+        {
+            "segments": [
+                {
+                    "kind": "leisure",
+                    "title": "已经去了杭州看展",
+                    "start_at": _iso(9 * 60),
+                    "end_at": _iso(10 * 60),
+                    "place_id": None,
+                    "flexibility": "flexible",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    outcome, router = await _work(
+        PHASE_DUE, responses=[claim, _valid_outline()], now=NOW
+    )
+
+    assert outcome.state == "ready", outcome
+    assert outcome.calls == 2
+    assert "完成或承诺" in router.prompts[1], router.prompts[1][-400:]
+    rows = await _segments()
+    assert [row for row in rows if "已经" in str(row.title)] == []
+    assert {row.title for row in rows if row.status == "current"} == {
+        "吃早饭",
+        "写代码",
+        "睡觉",
+    }
+
+
+async def test_model_proposal_cannot_escalate_to_confirmed(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """模型新提议越权（直接给 confirmed）→ 整份拒收，一行都不落。"""
+    await _seed()
+    intent = await _create_intent(state="proposed", source_kind="model")
+    short = intention_short_id(intent.intention_id)
+    escalated = _outline_with_citation(
+        short,
+        title="可能去杭州看展",
+        proposals=[
+            {
+                "theme": "周末去杭州看展",
+                "target_start_day": (PLAN_DAY + timedelta(days=5)).isoformat(),
+                "target_end_day": (PLAN_DAY + timedelta(days=5)).isoformat(),
+                "source_ref": short,
+                "state": "confirmed",
+            }
+        ],
+    )
+
+    outcome, router = await _work(PHASE_DUE, responses=[escalated, escalated], now=NOW)
+
+    assert outcome.state == "degraded", outcome
+    assert outcome.proposed_intentions == 0
+    assert "未定义字段" in router.prompts[1]
+    async with session_scope() as session:
+        rows = list((await session.execute(select(ScheduleIntentionRow))).scalars())
+    assert len(rows) == 1, "越权提议不许落任何新行"
+    assert rows[0].state == "proposed"
+
+
+async def test_model_proposal_lands_as_proposed_only(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """合法提议只能落 `proposed`，且 source_ref 用输入短 ID 回查的上游内部 id。"""
+    await _seed()
+    intent = await _create_intent(state="planned", title="想去看展")
+    short = intention_short_id(intent.intention_id)
+    target = PLAN_DAY + timedelta(days=6)
+    payload = _outline_with_citation(
+        short,
+        title="可能去看展",
+        proposals=[
+            {
+                "theme": "周末去杭州看展",
+                "target_start_day": target.isoformat(),
+                "target_end_day": target.isoformat(),
+                "source_ref": short,
+            }
+        ],
+    )
+
+    outcome, _router = await _work(PHASE_DUE, responses=[payload], now=NOW)
+
+    assert outcome.state == "ready", outcome
+    assert outcome.proposed_intentions == 1
+    async with session_scope() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ScheduleIntentionRow).order_by(
+                        ScheduleIntentionRow.created_at
+                    )
+                )
+            ).scalars()
+        )
+    created = [row for row in rows if row.title == "周末去杭州看展"]
+    assert len(created) == 1
+    assert created[0].state == "proposed"
+    assert created[0].source_kind == "model"
+    # 上游是内部 id：撤回上游时 `_downstream` 才找得到这条派生提议。
+    assert created[0].source_ref == intent.intention_id
+
+
+async def test_outline_work_expires_stale_intentions_before_prompt(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """进 prompt 前先做**零模型**惰性过期：目标日已过的意向不再影响今天。"""
+    await _seed()
+    long_ago = NOW - timedelta(days=30)
+    stale = await _create_intent(
+        state="confirmed",
+        title="很久以前想去的地方",
+        start_day=(long_ago + timedelta(days=3)).date(),
+        end_day=(long_ago + timedelta(days=3)).date(),
+        now=long_ago,
+    )
+
+    outcome, router = await _work(PHASE_DUE, responses=[_valid_outline()], now=NOW)
+
+    assert outcome.state == "ready", outcome
+    assert "很久以前想去的地方" not in router.prompts[0]
+    async with session_scope() as session:
+        row = await session.get(ScheduleIntentionRow, stale.intention_id)
+        assert row is not None
+    assert row.state == "expired_unknown", "目标日已过且无证据 = 不知道，不是 missed"
+
+
+async def test_memory_zone_is_audience_filtered(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """记忆区：owner 的核心记忆/结构化摘要进 prompt，窗口级内容不进。"""
+    await _seed()
+    # 用**真实**的 owner subject（bootstrap 管理员那一条）：owner 记忆按它归属。
+    async with session_scope() as session:
+        subject = await owner_subject_id(session)
+    assert subject, "测试环境必须有 owner 账号"
+    async with session_scope() as session:
+        session.add(
+            CoreMemoryRow(
+                id="core_1",
+                subject_id=subject,
+                label="称呼",
+                text="主人叫我灵",
+                priority=10,
+                active=True,
+            )
+        )
+        session.add(
+            MemoryRow(
+                id="mem_ok",
+                subject_id=subject,
+                kind="assertion",
+                text="她喜欢看书",
+                origin="user_statement",
+                visibility="subject_private",
+                slot="like",
+                value="看书",
+                confidence=0.9,
+            )
+        )
+        session.add(
+            MemoryRow(
+                id="mem_window",
+                subject_id=subject,
+                kind="assertion",
+                text="某群的秘密",
+                origin="user_statement",
+                visibility="window_private",
+                slot="secret",
+                value="某群的秘密",
+                confidence=0.9,
+            )
+        )
+
+    outcome, router = await _work(PHASE_DUE, responses=[_valid_outline()], now=NOW)
+
+    assert outcome.state == "ready", outcome
+    prompt = router.prompts[0]
+    assert '"memory"' in prompt
+    assert "称呼：主人叫我灵" in prompt
+    assert "like：看书" in prompt
+    assert "某群的秘密" not in prompt, "窗口级记忆不得进按 actor 归并的夜间计划"
+    assert "她喜欢看书" not in prompt, "结构化摘要只给 slot：value，不给整段正文"
+
+
+async def test_late_phase_stays_zero_model_and_still_expires_intents(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """`late` 相位：仍然零模型（连一次模型调用都不许有），过期清理照做。
+
+    设计 §3A 把"过期"定义成确定性状态机；把它放在相位判断之前，`late` 就既能
+    保持零模型，又不会让一个已过目标日的意向在醒后继续污染活跃集。
+    """
+    await _seed()
+    long_ago = NOW - timedelta(days=20)
+    stale = await _create_intent(
+        state="proposed",
+        source_kind="model",
+        source_ref="outline:stale",
+        title="很久以前想去看看",
+        start_day=(long_ago + timedelta(days=2)).date(),
+        end_day=(long_ago + timedelta(days=2)).date(),
+        now=long_ago,
+    )
+    calls_before = await _model_calls()
+    wake = WINDOW_START + timedelta(hours=8, minutes=1)  # 醒点之后 → late
+
+    outcome, router = await _work(PHASE_LATE, responses=[_valid_outline()], now=wake)
+
+    assert outcome.phase == PHASE_LATE, outcome
+    assert router.prompts == [], "late 相位结构上不许调模型"
+    assert await _model_calls() == calls_before, "零模型分支不许新增预算行"
+    async with session_scope() as session:
+        row = await session.get(ScheduleIntentionRow, stale.intention_id)
+        assert row is not None
+    assert row.state == "expired_unknown"
+
+
+async def test_seam_check_needs_no_model_and_writes_no_facts(
+    web_env: TestEnv,  # noqa: ARG001
+) -> None:
+    """午夜接缝仍是零模型：接缝校验不读意向、也不写活动/经历。"""
+    await _seed()
+    await _create_intent(state="confirmed", title="周五去杭州看展")
+    outcome, _router = await _work(PHASE_DUE, responses=[_valid_outline()], now=NOW)
+    assert outcome.state == "ready", outcome
+    calls_before = await _model_calls()
+
+    async with session_scope() as session:
+        report = await seam_check(session, PLAN_DAY, actor_id=ACTOR, now=NOW)
+
+    assert report.state in ("unchanged", "no_plan", "annotated"), report
+    assert await _model_calls() == calls_before
+    _, activities, experiences, _segments_count = await _counts()
+    assert activities == 0 and experiences == 0
