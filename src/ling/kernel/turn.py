@@ -412,7 +412,13 @@ class TurnCoordinator:
                     window_id=window_id,
                     user_text=user_text,
                     is_group=window.visibility == "group_scope",
-                    history_limit=20,
+                    # **不要在这里给条数上限。** 这里原来是 `history_limit=20`：
+                    # 那个值不是"上下文里放 20 条"，而是"一次性只从库里取 20 条"，
+                    # 于是第 21 条往回的消息既不在原文里、也不在编译器的
+                    # `dropped` 里，**永远不会被压进摘要**——长会话里会出现一段
+                    # 谁都看不见的永久缺口（实测 31 条的窗口丢掉第 1~11 条）。
+                    # 放多少由 `HISTORY_TOKEN_BUDGET` 决定，取数按页往回走，
+                    # 见 `ContextCompiler.compile` 里"原文层"的装配。
                     # 请求路径已把本轮用户消息落库，这里必须排除以免重复输入
                     current_turn_id=turn_id,
                     # **当前这句**用本次称呼（群里 = 群名片优先）署名，而不是
@@ -600,6 +606,12 @@ class TurnCoordinator:
 
                 # 出口清洗：剥掉 <<看视频 mX>>（幂等，再剥一次也不出错）。
                 # 顺带丢掉"半个标记"的尾巴——模型被打断时会出现这种残片。
+                #
+                # 清洗前先记下**原始字数**：清洗之后正文可能是空的，而"模型
+                # 一个字都没说"与"说了 37 个字、全是标记被洗空了"是两种完全
+                # 不同的故障（前者查模型/上下文，后者查标记与出口清洗）。
+                # 只报"没有可交付文本"会把两者混成一种，运维无从下手。
+                raw_chars = len(delivered)
                 delivered, watch_refs = parse_watch_markers(delivered)
                 if watch_refs:
                     # 她这一轮想看一眼视频。**先读，再决定怎么收尾**：
@@ -635,6 +647,7 @@ class TurnCoordinator:
                     floor_held=held_by_me,
                     floor_lost=lease_lost,
                     source_account=source_account,
+                    raw_chars=raw_chars,
                 )
         except asyncio.CancelledError:
             # 进程关闭或超时强制取消：尽力落库
@@ -882,6 +895,10 @@ class TurnCoordinator:
         # 与"从未取得"是两件事，对外要给出不同的可审计原因。
         floor_lost: bool = False,
         source_account: str | None = None,
+        # 出口清洗**之前**模型流出来的原始字数。用来区分「模型没说话」与
+        # 「说了但被洗空（全是标记/半截标记）」——两者处置完全不同，
+        # 只报"没有可交付文本"等于把它们混成一种。
+        raw_chars: int = 0,
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -980,8 +997,28 @@ class TurnCoordinator:
         # 它是在消息创建时按"她的决定"写的（决定回 → replied），但决定回
         # 不等于真的回了——用户可能在生成到一半按了停止，那时一个字都没发。
         # 记意图却让外面读成结果，就是假的完整感。
-        if state is TurnState.completed and delivered:
+        #
+        # 「完成」也有两种：真的把她的话交出去了，以及**生成了却没交出去**
+        # （发言权被另一个窗口占着 / 正文被标记洗空）。后者以前会落进第一个
+        # 分支，于是库里写着 `replied`、对方一个字都没收到——最难查的组合。
+        if state is TurnState.completed and delivered and floor_held:
             await conversation.correct_handled_for_turn(turn_id, outcome="replied")
+        elif state is TurnState.completed and delivered:
+            await conversation.correct_handled_for_turn(
+                turn_id,
+                outcome="failed",
+                reason="另一个窗口正在说话，本轮内容没有对外交付",
+            )
+        elif state is TurnState.completed and not delivered:
+            await conversation.correct_handled_for_turn(
+                turn_id,
+                outcome="failed",
+                reason=(
+                    f"正文被出口清洗洗空了（原始 {raw_chars} 字）"
+                    if raw_chars
+                    else "生成结束但没有任何正文"
+                ),
+            )
         elif state is TurnState.stopped and not delivered:
             await conversation.correct_handled_for_turn(
                 turn_id, outcome="stopped", reason="被中断，没有生成内容"
@@ -1102,6 +1139,10 @@ class TurnCoordinator:
                     # 每一轮都要能回答"为什么说/没说"（可审计）
                     "decision": "deferred_by_floor" if suppressed else "reply",
                     "chunks": planned_chunks,
+                    # 清洗前的原始字数：调用方据此区分「模型没说话」与
+                    # 「说了但被洗空」。**不记正文**——它可能正是被禁止外发的
+                    # 标记残片，而且日志只需要一个数字。
+                    "raw_chars": raw_chars,
                     # 她选了什么表达方式（@ / 引用 / 拍一拍）。
                     # 投递层据此真的做出来；正文里已经剥掉了标记。
                     "expression": (

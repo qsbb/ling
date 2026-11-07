@@ -79,6 +79,82 @@ class BridgeResult:
     parts_sent: int = 0
 
 
+@dataclass
+class TurnResult:
+    """一轮生成跑完之后，`bridge` 需要知道的**全部**事实。
+
+    为什么不是一个四元组：这份东西每加一项都在回答同一个问题——"她到底
+    说出去没有、没说出去是因为什么"。四元组只能塞下正文/状态/表达/错误，
+    于是「生成了但被发言仲裁压住」「说了 37 个字全被标记洗空」这两类
+    **必须区分**的结局被压成同一个"没有可交付文本"，运维只能猜。
+    """
+
+    # 清洗过、真正可以交付的正文（空 = 这一轮没有可交付的话）
+    text: str = ""
+    state: str = "unknown"
+    expression: dict | None = None
+    # ``turn.failed`` 的 error 原样字典（code/message/retriable[/detail]）
+    error: dict | None = None
+    # 生成了内容但**没有对外交付**时的原因（`turn.completed` 的
+    # ``suppressed_reason``：另一个窗口正在说话 / 中途失去发言权）。
+    suppressed_reason: str | None = None
+    # 出口清洗**之前**的原始字数：区分「模型没说话」与「说了被洗空」
+    raw_chars: int = 0
+
+    @property
+    def suppressed(self) -> bool:
+        return bool(self.suppressed_reason)
+
+
+def describe_no_text(result: TurnResult) -> str:
+    """轮次跑完了却没有可交付正文：**必须说出是哪一种**。
+
+    三条完全不同的路，处置也完全不同，以前它们都只说一句
+    「轮次结束但没有可交付文本（state=completed）」：
+
+    - 被发言仲裁压住 → 另一个窗口正在说话（等内容/等租约，不是模型问题）
+    - 正文被出口清洗洗空 → 只写了 ``<<看视频 m3>>`` / 半截标记（查标记）
+    - 模型真的什么都没输出 → 查模型/上下文/提示词
+
+    带 ``error`` 的那条（``state=failed``）保持原有措辞不变：它是线上
+    2026-11-07 事故里唯一能据以行动的句子，改它等于把已知的锚点拔掉。
+    """
+    state = result.state
+    code = str((result.error or {}).get("code") or "")
+    if result.suppressed_reason:
+        return (
+            f"她生成了 {result.raw_chars} 字但没有对外交付："
+            f"{result.suppressed_reason}"
+        )
+    if code:
+        return f"轮次结束但没有可交付文本（state={state}，error={code}）"
+    if result.raw_chars:
+        return (
+            f"正文被出口清洗洗空了（原始 {result.raw_chars} 字，"
+            "例如只写了「<<看视频 m3>>」这类标记或半截标记）"
+        )
+    return f"轮次结束但没有可交付文本（state={state}）"
+
+
+def describe_delivery(delivered: bool, *, parts_sent: int, parts_total: int) -> str:
+    """投递之后的一句话结论：**发了几段就是几段**。
+
+    为什么不能一律写"已回复"：`parts_sent == 0` 时对方一个字都没收到，
+    而 `0 < parts_sent < parts_total` 是"她说了前半句、后半句永远没到"——
+    后者比全失败更难发现，因为用户会以为她只想说那么一句。
+
+    措辞里带上 ``1/3`` 这种数字，运维不用翻 DB 就能判断是"哪一次没发全"。
+    """
+    if delivered:
+        return "已回复"
+    if parts_total <= 0:
+        # 一段都没规划出来：正文非空却切不出段，属于上游 bug，别声称发过
+        return "已回复（未规划出可发送的段）"
+    if parts_sent <= 0:
+        return f"投递失败（0/{parts_total} 段发出，对方没有收到）"
+    return f"部分送达（{parts_sent}/{parts_total} 段发出，后面的段没到）"
+
+
 class InboundBridge:
     """渠道事件 → 一轮对话 → 回复。"""
 
@@ -464,7 +540,7 @@ class InboundBridge:
         await self._session.commit()
 
         # 5) 跑轮次，收集最终文本
-        reply_text, state, expression, error = await self._run_turn(
+        turn_result = await self._run_turn(
             window_id=window.id,
             subject_id=subject_id,
             turn_id=turn.id,
@@ -477,6 +553,7 @@ class InboundBridge:
             # 当轮就该用新名片，而不是等落库再下一轮才生效。
             sender_name=envelope.sender_name,
         )
+        reply_text = turn_result.text
         if not reply_text:
             # 轮次跑完了却没产出文本：这是"她说不出话"，与"决定不说"不同。
             #
@@ -486,7 +563,14 @@ class InboundBridge:
             # - ``reason`` 会被行为日志拼成「没接话（…）」，而那是用户唯一
             #   会去读的那一行。原来这里只有 ``state=failed``，等于告诉他
             #   "出错了"，却不告诉他去改哪里。
-            code = str((error or {}).get("code") or "")
+            #
+            # 但 **error 不是唯一的原因**：被发言仲裁压住、以及"说了但正文
+            # 全被标记洗空"都不会带 error。以前这两条都和"模型什么都没说"
+            # 共用同一句 `state=completed`，于是"她明明回了却没发出来"
+            # 在日志里长得跟"她不想说"一模一样。`describe_no_text` 把它们
+            # 分开说。
+            code = str((turn_result.error or {}).get("code") or "")
+            reason = describe_no_text(turn_result)
             emit_event(
                 logger,
                 logging.WARNING,
@@ -495,25 +579,40 @@ class InboundBridge:
                 attributes={
                     "turn_id": turn.id,
                     "outcome": "no_text",
-                    "turn_state": str(state),
+                    "turn_state": str(turn_result.state),
                     "is_group": is_group,
                     "error_code": code or None,
-                    "detail": describe_turn_failure({"error": error}) if error else None,
+                    "detail": (
+                        describe_turn_failure({"error": turn_result.error})
+                        if turn_result.error
+                        else None
+                    ),
+                    # 三个可区分的数字/字符串：原始字数、是否被压、
+                    # 以及那句人话原因（行为日志里用的是同一个值）。
+                    "raw_chars": turn_result.raw_chars,
+                    "suppressed": turn_result.suppressed,
+                    "suppressed_reason": turn_result.suppressed_reason,
+                    "reason": reason,
                 },
+            )
+            # 生成出来了、却一个字都没发出去：那条用户消息不能记成"已回复"。
+            # 库里原来会留着创建时的 `replied`（`_finalize` 只校正
+            # "完成且有正文"这一种），于是"她说回了"与"对方没收到"
+            # 同时成立，排查时只能靠猜。
+            await conversation.correct_handled_for_turn(
+                turn.id, outcome="failed", reason=reason
             )
             return BridgeResult(
                 accepted=True,
-                reason=(
-                    f"轮次结束但没有可交付文本（state={state}，error={code}）"
-                    if code
-                    else f"轮次结束但没有可交付文本（state={state}）"
-                ),
+                reason=reason,
                 subject_id=subject_id,
                 window_id=window.id,
                 turn_id=turn.id,
                 decision="reply",
                 media_evidence_ids=media_ids,
                 media_note=media_note,
+                # 生成出来了、却一个字都没发出去：那条用户消息不能记成"已回复"。
+                handled_as="failed",
             )
 
         # 6) 投递（分段顺序发，每段独立 Operation 与回执，可对账）
@@ -521,7 +620,7 @@ class InboundBridge:
             envelope=envelope,
             text=reply_text,
             subject_id=subject_id,
-            expression=expression or {},
+            expression=turn_result.expression or {},
         )
         emit_event(
             logger,
@@ -531,15 +630,30 @@ class InboundBridge:
             attributes={
                 "turn_id": turn.id,
                 "outcome": "delivered" if delivered else "partial_delivery",
-                "turn_state": str(state),
+                "turn_state": str(turn_result.state),
                 "is_group": is_group,
                 "parts_total": parts_total,
                 "parts_sent": parts_sent,
             },
         )
+        # 「回了」只能在**真的发出去**之后说。
+        #
+        # 原来这里无论 `delivered` 是什么都写 ``reason="已回复"``，于是投递
+        # 全失败时行为日志成了「想回但没发出去（已回复）」——同一行里自相
+        # 矛盾，运维读到的是"她说回了"，而对方一个字都没收到。逐段发出的
+        # 情况则必须说清楚发了几段，否则"她只说了半句"永远查不出来。
+        reason = describe_delivery(delivered, parts_sent=parts_sent, parts_total=parts_total)
+        handled_as = "replied" if delivered else "failed"
+        if not delivered:
+            # 消息处置结果按**投递事实**改写：`turn._finalize` 记的是"生成了
+            # 正文"，而"生成成功"不等于"对方收到了"。两处都记同一件事时，
+            # 以更晚、更接近投递末端的那一处为准。
+            await conversation.correct_handled_for_turn(
+                turn.id, outcome="failed", reason=reason
+            )
         return BridgeResult(
             accepted=True,
-            reason="已回复",
+            reason=reason,
             subject_id=subject_id,
             window_id=window.id,
             turn_id=turn.id,
@@ -548,7 +662,7 @@ class InboundBridge:
             delivered=delivered,
             media_evidence_ids=media_ids,
             media_note=media_note,
-            handled_as="replied",
+            handled_as=handled_as,
             parts_total=parts_total,
             parts_sent=parts_sent,
         )
@@ -855,13 +969,19 @@ class InboundBridge:
         # 它属于"这一条消息"，不是"这个人"，所以只能沿调用链透传，
         # 不能从库里读——库里那一列是旁路同步的结果，可能还没写进去。
         sender_name: str | None = None,
-    ) -> tuple[str, str, dict | None, dict | None]:
-        """跑一轮，返回 ``(正文, 状态, 表达方式, 失败原因)``。
+    ) -> TurnResult:
+        """跑一轮，返回 ``TurnResult``（正文/状态/表达方式/失败原因/为什么没交付）。
 
-        第四个返回值是 ``turn.failed`` 事件里的 ``error`` 原样字典
+        失败原因（``error``）是 ``turn.failed`` 事件里的原样字典
         （``code / message / retriable``，未捕获异常那条路多一个 ``detail``）。
         它必须往上传：调用方要拿 ``code`` 写进"没有可交付文本"的原因里，
         否则运维只知道轮次失败、不知道去改哪里。正常结束时为 ``None``。
+
+        ``suppressed_reason`` 是 ``turn.completed`` 自带的"生成了但没对外
+        交付"的原因（发言权被另一个窗口占着）。它以前被这里**整条丢掉**：
+        事件里写着"另一个窗口正在说话，内容未对外交付"，而 bridge 只能说
+        "没有可交付文本（state=completed）"——两种完全不同的故障在日志里
+        长得一模一样。
         """
         import asyncio
 
@@ -880,6 +1000,8 @@ class InboundBridge:
         state = "unknown"
         expression: dict | None = None
         error: dict | None = None
+        suppressed_reason: str | None = None
+        raw_chars = 0
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=180.0)
@@ -895,6 +1017,10 @@ class InboundBridge:
                 message = data.get("message") or {}
                 reply_text = str(message.get("text") or "")
                 expression = data.get("expression") or expression
+                # 事件里已经有这两个事实，就必须接住（见 docstring）。
+                suppressed_reason = str(data.get("suppressed_reason") or "") or None
+                with contextlib.suppress(TypeError, ValueError):
+                    raw_chars = int(data.get("raw_chars") or 0)
                 if name == "turn.failed":
                     # 失败原因原来只塞在 SSE 事件里，**日志里一个字都没有**。
                     # 于是"她没回"在运维侧不可解释：既可能是模型挂了，
@@ -914,7 +1040,19 @@ class InboundBridge:
         # 是从这里发出去的——半截标记（模型被打断时的残片）必须在这一步也挡住。
         from ling.domains.media.watch import clean_reply_text
 
-        return clean_reply_text(reply_text).strip(), state, expression, error
+        cleaned = clean_reply_text(reply_text).strip()
+        if not cleaned and reply_text:
+            # 事件里带来的正文非空，在**这一层**被洗空了：这不是"模型没说话"。
+            # 原始字数取两者之间较大的那个，`describe_no_text` 才说得清。
+            raw_chars = max(raw_chars, len(reply_text))
+        return TurnResult(
+            text=cleaned,
+            state=state,
+            expression=expression,
+            error=error,
+            suppressed_reason=suppressed_reason,
+            raw_chars=raw_chars,
+        )
 
     async def _deliver(
         self,
@@ -1013,6 +1151,29 @@ class InboundBridge:
                 )
                 break
             sent += 1
+
+        if sent < len(parts):
+            # 分段投递的**汇总**：前面几段已经真的发出去了，后面的段既不重试
+            # 也不补发（渠道明确拒收时盲目重发只会刷屏）。所以必须把
+            # 「发了几段、还剩几段没尝试」说清楚——否则事后只能从
+            # `operations` 里数行，而**没尝试发的那几段根本没有行**
+            # （没有 operation / 没有回执），DB 里看不出它们存在。
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="delivery_aborted",
+                message=(
+                    f"投递中止：{sent}/{len(parts)} 段已发出，"
+                    f"剩余 {len(parts) - sent} 段没有尝试发送"
+                ),
+                attributes={
+                    "channel": getattr(self._connector, "connector_id", ""),
+                    "parts_sent": sent,
+                    "parts_total": len(parts),
+                    "parts_not_attempted": len(parts) - sent,
+                    "is_group": is_group,
+                },
+            )
 
         return (sent == len(parts), sent, len(parts))
 
