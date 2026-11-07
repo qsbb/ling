@@ -108,7 +108,38 @@ class OneBotV11Connector(ChannelConnector):
             getattr(message, "reply_to", None),
         )
 
-        data = await self._call(action, params)
+        # 装饰段（引用 / @）被平台拒收时，**不能连正文一起丢掉**。
+        #
+        # 为什么会发生：她可以自己选表达方式（`capabilities/expression_choice`），
+        # 而提示里写的是 ``[quote:消息序号]`` / ``[at:QQ号]``——上下文里
+        # **从来没有给过她真实的消息 id 或 QQ 号**（`kernel/context.py` 只给
+        # 名字）。于是她写出来的引用 id 常常对不上任何平台消息，NapCat 的
+        # `send_*_msg` 会整条拒收（``retcode=100``）。
+        #
+        # 结果是"她决定了回、正文也生成了，对方一个字都没收到"，而本地只知道
+        # "这段没送达"。引用是**装饰**，正文才是话本身：平台明确拒收
+        # （``rejected``）说明这一条根本没发出去，此时去掉装饰重发一次，
+        # 宁可少一个 @ 也不能让她的话消失。
+        #
+        # 只在 ``rejected`` 上重试：``uncertain``（异步提交/响应不是 JSON）
+        # 可能**已经发出去了**，重发就是重复消息；``unreachable`` /
+        # ``unauthorized`` 重发也不会有不同结果。
+        mentions = list(getattr(message, "mentions", None) or [])
+        reply_to = getattr(message, "reply_to", None)
+        degraded: str | None = None
+        try:
+            data = await self._call(action, params)
+        except ChannelError as exc:
+            if not (mentions or reply_to) or exc.kind is not ChannelErrorKind.rejected:
+                raise
+            degraded = exc.message
+            logger.warning(
+                "装饰段被平台拒收，去掉引用/@ 重发一次（正文不丢）：%s", exc.message
+            )
+            params["message"] = build_outbound_segments(
+                message.text, list(message.media_refs)
+            )
+            data = await self._call(action, params)
 
         # 拍一拍：**独立动作**，不是消息段。发完再拍。
         #
@@ -139,6 +170,12 @@ class OneBotV11Connector(ChannelConnector):
             ),
             platform_message_id=platform_message_id,
             observed_at=_now(),
+            # 降级重发过就如实写进回执：事后对账时能看出"这条为什么少了引用"。
+            detail=(
+                f"已去掉引用/@ 重发（平台拒收装饰段：{degraded}）"
+                if degraded
+                else None
+            ),
         )
 
     async def query_receipt(self, query: ReceiptQuery) -> DeliveryReceipt:
