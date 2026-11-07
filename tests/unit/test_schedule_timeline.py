@@ -23,28 +23,40 @@ import pytest
 
 from ling.domains.agenda.timeline import (
     MIN_SLEEP_MINUTES,
+    OUTLINE_RESERVED_INPUT_TOKENS,
     PHASE_CATCHUP,
     PHASE_DUE,
     PHASE_LATE,
     REASON_NEEDS_REVIEW,
+    REASON_PREPARATION_UNPLACED,
     REASON_ROUTINE_CONFLICT,
     Anchor,
+    FutureIntent,
+    FutureIntentZone,
     OutlineValidationError,
     RoutineSnapshot,
+    build_outline_prompt,
     contains,
     display_day_for,
     display_day_window,
+    find_claim_marker,
+    fit_future_intents,
+    fit_memory_zone,
+    has_hedge_marker,
     local_minute_instant,
     outline_due_at,
     outline_due_decision,
     overlaps,
+    parse_outline_output,
     parse_outline_payload,
     plan_day_for,
     plan_day_length,
     plan_day_window,
+    plan_preparations,
     resolve_anchor_conflicts,
     rule_outline,
     sleep_anchors_for_day,
+    validate_intention_proposals,
     validate_outline,
 )
 
@@ -690,3 +702,433 @@ def test_rule_outline_only_uses_anchors_and_skips_past() -> None:
     assert all(draft.anchor_kind for draft in drafts)
     # 锚点是不可移动段：不是叶段
     assert all(draft.is_leaf is False for draft in drafts)
+
+
+# ---------------------------------------------------------------- 未来意向输入（§3A）
+
+PLAN_DAY = date(2026, 11, 7)
+HORIZON_END = date(2026, 11, 14)
+
+
+def _intent(
+    *,
+    short_id: str = "i0a1b2c",
+    intention_id: str = "intent_0a1b2c3d4e5f6071829304a5",
+    state: str = "confirmed",
+    prep_ready: bool = False,
+    title: str = "周五去杭州看展",
+    start_day: date = date(2026, 11, 11),
+    end_day: date | None = None,
+) -> FutureIntent:
+    return FutureIntent(
+        short_id=short_id,
+        intention_id=intention_id,
+        kind="travel",
+        title=title,
+        target_start_day=start_day,
+        target_end_day=end_day or start_day,
+        state=state,
+        source_kind="user",
+        priority=50,
+        prep_ready=prep_ready,
+    )
+
+
+def _zone(*items: FutureIntent) -> FutureIntentZone:
+    return FutureIntentZone(
+        items=tuple(items), horizon_start=PLAN_DAY, horizon_end=HORIZON_END
+    )
+
+
+def _validate_with_intents(
+    segments: list[object], *, zone: FutureIntentZone, anchors: list[Anchor] | None = None
+):  # noqa: ANN201
+    start, end = plan_day_window(PLAN_DAY, SHANGHAI)
+    return validate_outline(
+        segments,
+        window_start=start,
+        window_end=end,
+        not_before=start + timedelta(hours=1),
+        anchors=anchors or [],
+        valid_place_ids=set(),
+        future_intents=zone,
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["已经去了杭州", "答应了陪她看展", "一定要早点睡", "必须去一趟", "票买好了"],
+)
+def test_outline_rejects_completion_and_promise_claims(title: str) -> None:
+    """计划段不是事实、也不是承诺：声称完成/承诺的标题整份拒收。"""
+    start, _ = plan_day_window(PLAN_DAY, SHANGHAI)
+    t = lambda hour: (start + timedelta(hours=hour)).isoformat()  # noqa: E731
+    with pytest.raises(OutlineValidationError) as excinfo:
+        _validate([_segment(t(2), t(3), title=title)])
+    assert any("完成或承诺" in item for item in excinfo.value.problems)
+
+
+def test_claim_markers_ignore_negations_and_hedges() -> None:
+    """否定形式（不一定/不保证）不算声称；"可能/打算"是允许的语气。"""
+    assert find_claim_marker("不一定去") is None
+    assert find_claim_marker("不保证能到") is None
+    assert find_claim_marker("可能去杭州") is None
+    assert find_claim_marker("已经回来了") == "已经"
+    assert has_hedge_marker("也许去看看") is True
+    assert has_hedge_marker("去杭州看展") is False
+
+
+def test_outline_rejects_unknown_intention_short_id() -> None:
+    """引用意向只能用输入给出的短 ID；编造的 ID 与自由文本都不通过。"""
+    start, _ = plan_day_window(PLAN_DAY, SHANGHAI)
+    t = lambda hour: (start + timedelta(hours=hour)).isoformat()  # noqa: E731
+    zone = _zone(_intent())
+    with pytest.raises(OutlineValidationError) as excinfo:
+        _validate_with_intents(
+            [_segment(t(2), t(3), intention_id="i_not_given")], zone=zone
+        )
+    assert any("不在本次输入里" in item for item in excinfo.value.problems)
+
+    with pytest.raises(OutlineValidationError) as excinfo:
+        _validate_with_intents(
+            [_segment(t(2), t(3), intention_id="周五去杭州看展")], zone=zone
+        )
+    assert any("不在本次输入里" in item for item in excinfo.value.problems)
+
+
+def test_outline_rejects_citing_confirmed_target_without_prep_source() -> None:
+    """确认了目标 ≠ 确认了准备事项：没有 prep_source_ref 就不许为它写准备段。"""
+    start, _ = plan_day_window(PLAN_DAY, SHANGHAI)
+    t = lambda hour: (start + timedelta(hours=hour)).isoformat()  # noqa: E731
+    zone = _zone(_intent(state="confirmed", prep_ready=False))
+    with pytest.raises(OutlineValidationError) as excinfo:
+        _validate_with_intents(
+            [_segment(t(2), t(3), title="为周五的旅行买票", intention_id="i0a1b2c")],
+            zone=zone,
+        )
+    assert any("还没有准备资格" in item for item in excinfo.value.problems)
+
+
+def test_outline_requires_hedge_when_citing_candidate() -> None:
+    """引用 proposed/planned 的候选时，标题必须带"可能/打算"语气。"""
+    start, _ = plan_day_window(PLAN_DAY, SHANGHAI)
+    t = lambda hour: (start + timedelta(hours=hour)).isoformat()  # noqa: E731
+    zone = _zone(_intent(state="proposed", prep_ready=False))
+
+    with pytest.raises(OutlineValidationError) as excinfo:
+        _validate_with_intents(
+            [_segment(t(2), t(3), title="去杭州看展", intention_id="i0a1b2c")],
+            zone=zone,
+        )
+    assert any("候选不能写成既成事实" in item for item in excinfo.value.problems)
+
+    blocks = _validate_with_intents(
+        [_segment(t(2), t(3), title="可能去杭州看展", intention_id="i0a1b2c")],
+        zone=zone,
+    )
+    # 候选引用只是来源链接：短 ID 回查到了内部 id，但**没有**准备资格。
+    assert blocks[0].intention_short_id == "i0a1b2c"
+    assert blocks[0].intention_id == "intent_0a1b2c3d4e5f6071829304a5"
+    assert blocks[0].preparation is False
+
+
+def test_outline_marks_confirmed_prep_ready_citation() -> None:
+    """已确认 + 有可信依据的引用才带上"准备"资格（还要过空档门才落库）。"""
+    start, _ = plan_day_window(PLAN_DAY, SHANGHAI)
+    t = lambda hour: (start + timedelta(hours=hour)).isoformat()  # noqa: E731
+    zone = _zone(_intent(state="confirmed", prep_ready=True))
+    blocks = _validate_with_intents(
+        [_segment(t(2), t(3), title="给周五的旅行做准备", intention_id="i0a1b2c")],
+        zone=zone,
+    )
+    assert blocks[0].preparation is True
+    assert blocks[0].intention_id == "intent_0a1b2c3d4e5f6071829304a5"
+
+
+# ---------------------------------------------------------------- 模型新提议
+
+
+def _proposal(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "theme": "周末想去杭州看展",
+        "target_start_day": "2026-11-11",
+        "target_end_day": "2026-11-12",
+        "source_ref": "i0a1b2c",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_proposals_reject_state_escalation_and_unknown_fields() -> None:
+    """模型只能提议候选：给 state/priority/可见范围一律拒收（越权）。"""
+    zone = _zone(_intent(state="proposed"))
+    for extra in ({"state": "confirmed"}, {"priority": 90}, {"visibility": "public"}):
+        with pytest.raises(OutlineValidationError) as excinfo:
+            validate_intention_proposals(
+                [_proposal(**extra)],
+                future_intents=zone,
+                memory=None,
+                plan_day=PLAN_DAY,
+                today=PLAN_DAY,
+            )
+        assert any("未定义字段" in item for item in excinfo.value.problems)
+
+
+def test_proposals_reject_free_text_source_and_overflow() -> None:
+    zone = _zone(_intent(state="proposed"))
+    with pytest.raises(OutlineValidationError) as excinfo:
+        validate_intention_proposals(
+            [_proposal(source_ref="用户昨天说想去杭州")],
+            future_intents=zone,
+            memory=None,
+            plan_day=PLAN_DAY,
+            today=PLAN_DAY,
+        )
+    assert any("自由文本来源不通过" in item for item in excinfo.value.problems)
+
+    with pytest.raises(OutlineValidationError) as excinfo:
+        validate_intention_proposals(
+            [_proposal(), _proposal(), _proposal()],
+            future_intents=zone,
+            memory=None,
+            plan_day=PLAN_DAY,
+            today=PLAN_DAY,
+        )
+    assert any("超过上限" in item for item in excinfo.value.problems)
+
+
+def test_proposals_map_short_id_to_upstream_intention() -> None:
+    """短 ID 落库时换成上游**内部 id**：撤回才能沿 source_ref 递归传播。"""
+    zone = _zone(_intent(state="proposed"))
+    memory = fit_memory_zone(
+        experiences=["上午在窗边读书，阳光很好"],
+        relationship_notes=[],
+        core_memories=[],
+        owner_summaries=[],
+    )
+    accepted = validate_intention_proposals(
+        [_proposal(), _proposal(source_ref="e1", theme="想在下午去书店")],
+        future_intents=zone,
+        memory=memory,
+        plan_day=PLAN_DAY,
+        today=PLAN_DAY,
+    )
+    assert accepted[0].upstream_intention_id == "intent_0a1b2c3d4e5f6071829304a5"
+    assert accepted[0].source_ref == "intent_0a1b2c3d4e5f6071829304a5"
+    # 记忆来源没有内部 id 可指，用可回查、无正文的引用串。
+    assert accepted[1].upstream_intention_id is None
+    assert accepted[1].source_ref == "outline:2026-11-07:e1"
+    # prep_hint 只作候选提示，**不进**数据模型（更不会成为 prep_source_ref）。
+    hinted = validate_intention_proposals(
+        [_proposal(prep_hint="提前买票")],
+        future_intents=zone,
+        memory=None,
+        plan_day=PLAN_DAY,
+        today=PLAN_DAY,
+    )
+    assert not hasattr(hinted[0], "prep_source_ref")
+
+
+def test_parse_outline_output_accepts_optional_proposals_only() -> None:
+    output = parse_outline_output('{"segments": [], "intention_proposals": []}')
+    assert output.segments == []
+    assert output.proposals == []
+    # 旧名仍然只返回 segments（既有调用点按数组用）。
+    assert parse_outline_payload('{"segments": [], "intention_proposals": []}') == []
+    with pytest.raises(OutlineValidationError):
+        parse_outline_output('{"segments": [], "intention_proposals": {}}')
+    with pytest.raises(OutlineValidationError):
+        parse_outline_output('{"segments": [], "intention_proposals": [], "x": 1}')
+
+
+# ---------------------------------------------------------------- 两块输入的上限
+
+
+def test_fit_future_intents_drops_lowest_priority_first() -> None:
+    """超预算时**从尾部整条删**（尾部就是列表里优先级最低的），不截半句。"""
+    items = [
+        _intent(
+            short_id=f"i{index:06x}",
+            intention_id=f"intent_{index:024x}",
+            title="周末去杭州看展",
+            start_day=date(2026, 11, 7) + timedelta(days=index),
+        )
+        for index in range(10)
+    ]
+    full = fit_future_intents(items, horizon_start=PLAN_DAY, horizon_end=HORIZON_END)
+    assert len(full.items) == 10, "10 条短字段必须装得进意向区预算"
+    assert full.truncated is False
+
+    small = fit_future_intents(
+        items, horizon_start=PLAN_DAY, horizon_end=HORIZON_END, token_limit=80
+    )
+    assert 0 < len(small.items) < 10
+    assert small.truncated is True
+    assert [item.short_id for item in small.items] == [
+        item.short_id for item in items[: len(small.items)]
+    ]
+    assert small.omitted == 10 - len(small.items)
+
+
+def test_fit_memory_zone_keeps_experiences_before_owner_summaries() -> None:
+    """预算紧时先删低优先级桶：经历 > 关系 > 核心记忆 > owner 摘要。"""
+    zone = fit_memory_zone(
+        experiences=["上午在窗边读书，阳光很好，心情不错"],
+        relationship_notes=["当前主要对话者：很熟"],
+        core_memories=["称呼：主人叫我灵"],
+        owner_summaries=["like：看书"],
+        token_limit=60,
+    )
+    assert [item.text for item in zone.evidenced_experiences] == [
+        "上午在窗边读书，阳光很好，心情不错"
+    ]
+    assert zone.owner_summaries == ()
+    assert zone.truncated is True
+    assert [item.short_id for item in zone.evidenced_experiences] == ["e1"]
+
+
+def test_outline_prompt_carries_zones_and_stays_inside_input_budget() -> None:
+    """两块都要进 prompt，且**总输入**不许超过预算行预留的 token。"""
+    start, end = plan_day_window(PLAN_DAY, SHANGHAI)
+    now = start.replace(minute=10)
+    routine = _routine(8, 23)
+    zone = _zone(
+        _intent(state="confirmed", prep_ready=True),
+        _intent(
+            short_id="i0a1b2d",
+            intention_id="intent_0a1b2c3d4e5f6071829304b6",
+            state="proposed",
+            title="也许想去看海",
+            start_day=date(2026, 11, 13),
+        ),
+    )
+    memory = fit_memory_zone(
+        experiences=["上午在窗边读书，阳光很好"] * 5,
+        relationship_notes=["当前主要对话者：很熟"],
+        core_memories=["称呼：主人叫我灵"] * 6,
+        owner_summaries=["like：看书"] * 4,
+    )
+    from ling.kernel.context import estimate_tokens
+
+    persona = {"name": "灵", "identity": "称呼：灵"}
+    for key in ("personality", "values", "habits", "interests", "boundaries"):
+        persona[key] = [("内容" * 14)[:30]] * 4
+    persona["scenario_rules"] = ["私聊：更亲密，可以说想你"]
+    persona["relationships"] = ["当前主要对话者：很熟；边界 2 条，例如 不问隐私"]
+    persona["situation"] = ["此刻：在聊天（模拟）"]
+
+    prompt = build_outline_prompt(
+        persona=persona,
+        plan_day=PLAN_DAY,
+        timezone=SHANGHAI,
+        now=now,
+        window_start=start,
+        window_end=end,
+        not_before=max(now, start),
+        routine=routine,
+        anchors=sleep_anchors_for_day(PLAN_DAY, SHANGHAI, routine),
+        experiences=[item.text for item in memory.evidenced_experiences],
+        presence={"energy": 70, "satiety": 60},
+        places=[{"id": f"place_{index}", "name": "书房里的落地窗边"} for index in range(12)],
+        intents=zone,
+        memory=memory,
+    )
+    assert '"future_intents"' in prompt
+    assert "i0a1b2c" in prompt and "i0a1b2d" in prompt
+    assert '"prep_ready": [' in prompt
+    assert "周五去杭州看展" in prompt
+    assert "也许想去看海" in prompt
+    assert '"memory"' in prompt
+    assert "上午在窗边读书" in prompt
+    # 总输入预算是硬上限（预算行按它预留，超了就等于拿"应该够"当事实）。
+    assert estimate_tokens(prompt) <= OUTLINE_RESERVED_INPUT_TOKENS
+
+
+# ---------------------------------------------------------------- 准备段的空档门
+
+
+def _planning_anchor(start: datetime, end: datetime, title: str = "约定：上午有事") -> Anchor:
+    return Anchor(kind="commitment", start_at=start, end_at=end, title=title, protective=True)
+
+
+def test_plan_preparations_requires_a_usable_gap() -> None:
+    start, end = plan_day_window(PLAN_DAY, SHANGHAI)
+    not_before = start
+    zone = _zone(_intent(state="confirmed", prep_ready=True))
+    block = validate_outline(
+        [
+            _segment(
+                (start + timedelta(hours=10)).isoformat(),
+                (start + timedelta(hours=11)).isoformat(),
+                title="给周五的旅行做准备",
+                intention_id="i0a1b2c",
+            )
+        ],
+        window_start=start,
+        window_end=end,
+        not_before=not_before,
+        anchors=[],
+        valid_place_ids=set(),
+        future_intents=zone,
+    )
+    links, reason = plan_preparations(
+        block,
+        future_intents=zone,
+        anchors=sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(8, 23)),
+        window_start=start,
+        window_end=end,
+        not_before=not_before,
+    )
+    assert reason is None
+    assert len(links) == 1
+    assert links[0].intention_id == "intent_0a1b2c3d4e5f6071829304a5"
+    assert links[0].preparation_for_day == date(2026, 11, 11)
+
+    # 一整天被约定塞满（只剩 20 分钟的碎片缝）：不算"有空档"。
+    busy = [
+        _planning_anchor(start + timedelta(hours=8), start + timedelta(hours=10)),
+        _planning_anchor(start + timedelta(hours=10, minutes=20), end),
+    ]
+    links, reason = plan_preparations(
+        block,
+        future_intents=zone,
+        anchors=busy,
+        window_start=start,
+        window_end=end,
+        not_before=not_before,
+    )
+    assert links == []
+    assert reason == REASON_PREPARATION_UNPLACED
+
+
+def test_plan_preparations_skips_citations_without_qualification() -> None:
+    """引用了但意向不够格（没准备依据）：不绑定，只记原因码。"""
+    start, end = plan_day_window(PLAN_DAY, SHANGHAI)
+    zone = _zone(_intent(state="proposed"))
+    block = validate_outline(
+        [
+            _segment(
+                (start + timedelta(hours=10)).isoformat(),
+                (start + timedelta(hours=11)).isoformat(),
+                title="可能去看展",
+                intention_id="i0a1b2c",
+            )
+        ],
+        window_start=start,
+        window_end=end,
+        not_before=start,
+        anchors=[],
+        valid_place_ids=set(),
+        future_intents=zone,
+    )
+    links, reason = plan_preparations(
+        block,
+        future_intents=zone,
+        anchors=sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(8, 23)),
+        window_start=start,
+        window_end=end,
+        not_before=start,
+    )
+    assert links == []
+    # 没有"准备资格"的引用不算"落不下去"：它是普通可选块。
+    assert reason is None
