@@ -41,12 +41,28 @@ D 的 ``[00:00,08:00)`` 由 D 自己的计划直接产出，**不再**继承 D�
   则 ``degraded_late``（只补确定性锚点，不再调模型）。
 - 锚点裁剪与冲突 :func:`resolve_anchor_conflicts`：保护窗裁到 D 内、
   同级硬约定冲突都保留、承诺与预计睡眠冲突时保留承诺并标原因码。
-- 人设投影 :func:`build_persona_projection`：确定性结构化、受众过滤、
-  **≤400 输入 token**（粗略估算，见 ``token_estimate.method``）。
+- 人设投影 :func:`build_persona_projection`：确定性结构化、关系只给定性摘要
+  （不带他人标识/私聊细节）、**≤400 输入 token**（粗略估算，见
+  ``PersonaProjection.estimate_method``），完整 ``system_prompt`` 不进日程输入。
 
 调度接线在 ``worker.py`` 的 ``life.schedule``（只查 DB 到期边界）+
 ``life.outline`` / ``life.seam`` 两个 outbox handler。本模块只提供可调用入口，
 没有定时器/循环。
+
+接线时按这三步取入口（本模块**不**替你决定"现在该不该跑"，只回答"跑哪一个
+目标日、能不能调模型"）：
+
+.. code-block:: python
+
+    timezone, _source = await resolve_plan_timezone(session)
+    routine = ...          # ActorRoutineRow 的 wake_minute/rest_minute
+    target, phase = outline_due_decision(now, timezone=timezone,
+                                        wake_minute=routine.wake_minute)
+    outcome = await outline_work(session, target, phase, actor_id=actor_id,
+                                router=router, config_reader=cfg, now=now)
+
+    seam = await seam_check(session, plan_day, actor_id=actor_id, now=now)   # 零模型
+    todo = await on_new_confirmed_anchor(session, plan_day, anchor, ...)     # 零模型
 """
 
 from __future__ import annotations
@@ -54,7 +70,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -71,6 +87,8 @@ from ling.infra.models import (
     DayPlanRow,
     Persona,
     PresenceState,
+    RelationshipState,
+    SceneCommitRow,
     ScheduleSegmentRow,
     SelfExperienceRow,
     WorldPlace,
@@ -191,6 +209,119 @@ PHASE_LATE = "late"  # 已到/过了 D 的醒点：只补确定性锚点，不�
 MAX_EXPERIENCE_SUMMARIES = 5
 MAX_PLACES = 12
 EXPERIENCE_LOOKBACK_HOURS = 72
+
+# ---------------------------------------------------------------- 人设投影限额
+#
+# 设计 §3：人设进大纲 prompt 的硬上限是 **400 输入 token**，边界与作息相关习惯
+# 优先，超预算时先删可选场景与口癖细节。这些条数是**工程初值**，不是研究结论。
+PERSONA_TOKEN_LIMIT = 400
+PERSONA_MAX_ITEMS = 4  # 每类先限条数，再按优先级压 token
+PERSONA_MAX_ITEM_CHARS = 60  # 单条长度上限（先截断再加长裁剪）
+PERSONA_MAX_RELATIONSHIPS = 2
+PERSONA_MAX_SCENARIO_RULES = 2
+# 缺字段的占位。**不能**从空白处编人格。
+PERSONA_UNKNOWN = "未知"
+# token 估算口径：复用项目里预算裁剪那把"尺子"，并**如实**说明它只是粗略估算。
+# 继续用它的理由：如果这里另写一套估算，"预算裁剪说放得下、记账说超了"会互相矛盾。
+PERSONA_ESTIMATE_METHOD = (
+    "粗略估算：ling.kernel.context.estimate_tokens（中文≈1 token/字，"
+    "英文≈4 字符/token），不是 provider tokenizer"
+)
+
+# 人设投影的裁剪顺序（设计 §3：先删可选场景与口癖细节，绝不先挤边界/核心价值观/
+# 作息相关习惯）。列表越靠前越先被删。
+_PERSONA_TRIM_ORDER: tuple[str, ...] = (
+    "scenario_rules",
+    "interests",
+    "relationships",
+    "situation",
+    "personality",
+)
+
+# traits 是**使用者自由填的 dict**（人设页给的是 JSON 编辑器），所以只按稳定的
+# 键名关键词归类，不假定它有固定 schema：认不出来的一律归"性格/风格"，
+# 宁可少解释一条，也不丢一条。
+_TRAIT_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "values",
+        (
+            "value",
+            "principle",
+            "belief",
+            "ethic",
+            "boundar",
+            "价值观",
+            "原则",
+            "信念",
+            "在意",
+            "禁忌",
+        ),
+    ),
+    (
+        "habits",
+        (
+            "habit",
+            "routine",
+            "sleep",
+            "wake",
+            "作息",
+            "习惯",
+            "生活",
+            "睡",
+            "起床",
+            "夜猫",
+            "晨",
+        ),
+    ),
+    (
+        "interests",
+        (
+            "interest",
+            "hobby",
+            "like",
+            "love",
+            "taste",
+            "兴趣",
+            "爱好",
+            "喜欢",
+            "口癖",
+            "口头禅",
+        ),
+    ),
+)
+
+# 场景状态 → 人能读的一句话（"当前处境"用）。未知/过期一律"未知"。
+_SCENE_LABELS: dict[str, str] = {
+    "chat": "在聊天",
+    "focus": "在做需要专注的事",
+    "rest": "在休息",
+    "errand": "在外面办事",
+    "unknown": "不知道在做什么",
+}
+
+# 场景键 → 展示标签（只影响 prompt 那行字怎么读，不是判定规则）。
+# 这里**不 import persona 域**：域边界闸门不允许跨域 import 实现。
+_SCENARIO_LABELS: dict[str, str] = {
+    "private": "私聊",
+    "group": "群聊",
+    "group_mentioned": "群里被点名",
+    "group_unaddressed": "群里没被点名",
+}
+# 稳定顺序：先取最贴近日程的场景覆盖，其余按键名排序（确定性优先）。
+_SCENARIO_ORDER: tuple[str, ...] = (
+    "private",
+    "group",
+    "group_mentioned",
+    "group_unaddressed",
+)
+
+# 关系数值只做**定性**投影：设计 §3 明确"不含信任数值"。
+_FAMILIARITY_LEVELS: tuple[tuple[float, str], ...] = (
+    (0.7, "很熟"),
+    (0.4, "比较熟"),
+    (0.15, "有点熟"),
+)
+_FAMILIARITY_DEFAULT = "还生疏"
 
 _OUTLINE_INSTRUCTIONS = """你是角色「{name}」的日计划器。
 
@@ -326,6 +457,58 @@ def local_hhmm(instant: datetime, timezone: str) -> str:
     return _aware(instant).astimezone(resolve_zone(timezone)).strftime("%H:%M")
 
 
+def outline_due_decision(
+    now: datetime,
+    *,
+    timezone: str,
+    wake_minute: int | None,
+    plan_day: date | None = None,
+) -> tuple[date, str]:
+    """现在该为**哪个目标日 D** 生成大纲、处在哪个相位（纯计算，不碰数据库）。
+
+    三档（设计 §3「catch-up」）：
+
+    - ``PHASE_DUE``：本地 21:00 已到，正常为**明天**生成（``D = 本地日 + 1``）；
+      21:00–24:00 仍属于 D−1 的生活，所以这是生成时刻，不是日界；
+    - ``PHASE_CATCHUP``：错过了 21:00，但还在 D 的 ``wake_minute`` **之前**
+      ——可以用同一作业补跑，且只排 ``now`` 之后（过午夜不回填）；
+    - ``PHASE_LATE``：已到/过了 D 的醒点（含 ``wake_minute=None``，
+      即作息没有有效睡眠窗、午夜之后就算晚到）：只补确定性锚点，**零模型**。
+
+    ``plan_day`` 显式传入时**只按 D 自己的边界分档**（供补跑/测试）：窗口起点
+    之前算 ``due``、窗口起点到醒点之间算 ``catchup``、醒点及以后算 ``late``。
+    注意：这里是"能不能调模型/从哪儿开始排"的判据，**不是**"现在该不该跑"的
+    判据——是否到期由调度（``life.schedule`` 查 DB 边界）决定。
+
+    ``wake_minute=None`` 表示没有有效睡眠窗（``wake == rest``）：午夜之后没有
+    "醒前"可言，直接算晚到，不编一个不存在的醒点。
+    """
+    moment = _aware(now)
+    zone = resolve_zone(timezone)
+    local_day = moment.astimezone(zone).date()
+
+    if plan_day is None:
+        # 21:00 一过就为**明天**到期；没到 21:00 时，最近一个待补的目标日就是今天
+        # （它的 21:00 是昨天，早过了）。
+        if moment >= outline_due_at(local_day + timedelta(days=1), timezone):
+            return local_day + timedelta(days=1), PHASE_DUE
+        target = local_day
+    else:
+        target = plan_day
+
+    window_start, _window_end = plan_day_window(target, timezone)
+    if moment < window_start:
+        # 目标日窗口还没开始：要么正是 D−1 21:00 的正常到期点，要么调用方显式
+        # 要求提前排 D。两种都属于"可以正常调模型"。
+        return target, PHASE_DUE
+    if wake_minute is None:
+        return target, PHASE_LATE
+    wake = _local_minute_instant(target, int(wake_minute) % (24 * 60), zone)
+    if moment < wake:
+        return target, PHASE_CATCHUP
+    return target, PHASE_LATE
+
+
 # ---------------------------------------------------------------- 锚点
 
 
@@ -449,6 +632,194 @@ def sleep_anchors_for_day(
     return anchors
 
 
+def _anchor_key(anchor: Anchor) -> str:
+    """锚点的可追溯标签：优先来源 id，否则用"种类@起点"（不含正文）。"""
+    if anchor.source_id:
+        return anchor.source_id
+    return f"{anchor.kind}@{anchor.start_at.isoformat()}"
+
+
+def _with_reason_codes(anchor: Anchor, *codes: str) -> Anchor:
+    """给锚点加上原因码（去重、保序）；没有新码时原样返回。"""
+    merged = tuple(dict.fromkeys((*anchor.reason_codes, *codes)))
+    if merged == anchor.reason_codes:
+        return anchor
+    return replace(anchor, reason_codes=merged)
+
+
+def _subtract_interval(
+    start: datetime, end: datetime, cuts: list[tuple[datetime, datetime]]
+) -> list[tuple[datetime, datetime]]:
+    """从 ``[start,end)`` 里挖掉若干区间，返回按时间排序的剩余片段。"""
+    pieces: list[tuple[datetime, datetime]] = [(_aware(start), _aware(end))]
+    for cut_start, cut_end in cuts:
+        remaining: list[tuple[datetime, datetime]] = []
+        for piece_start, piece_end in pieces:
+            if cut_end <= piece_start or cut_start >= piece_end:
+                remaining.append((piece_start, piece_end))
+                continue
+            if piece_start < cut_start:
+                remaining.append((piece_start, cut_start))
+            if cut_end < piece_end:
+                remaining.append((cut_end, piece_end))
+        pieces = remaining
+    return sorted((item for item in pieces if item[0] < item[1]), key=lambda item: item[0])
+
+
+def _minutes(start: datetime, end: datetime) -> int:
+    return max(0, int((_aware(end) - _aware(start)).total_seconds() // 60))
+
+
+def resolve_anchor_conflicts(
+    anchors: list[Anchor] | tuple[Anchor, ...],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    routine: RoutineSnapshot,
+) -> tuple[list[Anchor], list[AnchorConflict]]:
+    """把候选锚点裁决成 D 的可用集合，并**由代码**记下所有冲突。
+
+    裁决规则全部来自设计 §3「约定/安排输入与优先级」，这里不做任何模型判断：
+
+    1. **承诺保护窗裁到 D 内**：``[due, due+60)`` 伸进次日凌晨的部分被裁掉，
+       否则 D−1 23:30 的约定会变成对 D 凌晨的跨午夜声明。
+       （完全落在 D 外的锚点直接丢弃：它不属于这一天。）
+    2. **同级硬约定冲突：两边都留**、两边都带 ``needs_review``，冲突清单里
+       记下两个来源 id。不让代码或模型选一个"赢家"，履约由各自状态机解决。
+       完全同一区间的两条视为同一条约定的两种来源，**不报冲突**（否则每晚
+       都会因为同一件事被记一次）。
+    3. **承诺 × 预计睡眠：保留承诺**，预计睡眠缩短/分裂并标 ``routine_conflict``；
+       若剩余睡眠 < :data:`MIN_SLEEP_MINUTES` 再加 ``needs_review``。
+       承诺本身既不动、也不带冲突码——"睡眠下限"不能当成暗中撤销承诺的理由。
+    4. ``wake == rest``（没有有效睡眠窗）时**不造**睡眠锚点，也不假造一个醒点。
+
+    睡眠锚点必须由调用方用**规范时区**算好传进来（:func:`sleep_anchors_for_day`）。
+    这里不按 ``routine.timezone`` 现场推算：那是作息表里的旧值，不参与日界计算。
+
+    返回 ``(anchors, conflicts)``；``anchors`` 按开始时间排序，冲突码同时挂在
+    相关锚点上（落库时进段的 ``source_event_ids``）和冲突清单里（供日报/审计）。
+    """
+    conflicts: list[AnchorConflict] = []
+    wake = int(routine.wake_minute) % (24 * 60)
+    rest = int(routine.rest_minute) % (24 * 60)
+    no_sleep_window = wake == rest
+
+    sleep_inputs: list[Anchor] = []
+    hard: list[Anchor] = []
+    for anchor in anchors:
+        start = _aware(anchor.start_at)
+        end = _aware(anchor.end_at)
+        if anchor.kind == SLEEP_ANCHOR:
+            if no_sleep_window or start >= end:
+                # 作息没有有效睡眠窗：不造睡眠。调用方若传进来，也不照抄。
+                continue
+            sleep_inputs.append(replace(anchor, start_at=start, end_at=end))
+            continue
+        clipped_start = max(start, _aware(window_start))
+        clipped_end = min(end, _aware(window_end))
+        if clipped_start >= clipped_end:
+            continue
+        hard.append(
+            anchor
+            if (clipped_start, clipped_end) == (start, end)
+            else replace(anchor, start_at=clipped_start, end_at=clipped_end)
+        )
+
+    # 同级硬约定：两两相交就两边都留、两边都带 needs_review。
+    for index in range(len(hard)):
+        for other in range(index + 1, len(hard)):
+            left, right = hard[index], hard[other]
+            if (left.start_at, left.end_at) == (right.start_at, right.end_at):
+                continue
+            if not overlaps(left.start_at, left.end_at, right.start_at, right.end_at):
+                continue
+            hard[index] = _with_reason_codes(hard[index], REASON_NEEDS_REVIEW)
+            hard[other] = _with_reason_codes(hard[other], REASON_NEEDS_REVIEW)
+            conflicts.append(
+                AnchorConflict(
+                    reason_code=REASON_NEEDS_REVIEW,
+                    anchor_ids=(_anchor_key(left), _anchor_key(right)),
+                    detail=f"同级硬约定重叠，两边都保留：{left.title}｜{right.title}",
+                )
+            )
+
+    # 承诺 × 预计睡眠：承诺留着，睡眠被挖短/挖断。
+    trimmed: list[tuple[Anchor, list[tuple[datetime, datetime]], list[Anchor]]] = []
+    before_trim = 0
+    for sleep in sleep_inputs:
+        before_trim += _minutes(sleep.start_at, sleep.end_at)
+        cuts = [
+            item
+            for item in hard
+            if overlaps(sleep.start_at, sleep.end_at, item.start_at, item.end_at)
+        ]
+        pieces = (
+            _subtract_interval(
+                sleep.start_at, sleep.end_at, [(item.start_at, item.end_at) for item in cuts]
+            )
+            if cuts
+            else [(sleep.start_at, sleep.end_at)]
+        )
+        trimmed.append((sleep, pieces, cuts))
+        for cut in cuts:
+            remaining = sum(_minutes(start, end) for start, end in pieces)
+            conflicts.append(
+                AnchorConflict(
+                    reason_code=REASON_ROUTINE_CONFLICT,
+                    anchor_ids=(_anchor_key(sleep), _anchor_key(cut)),
+                    detail=f"承诺压在预计睡眠上，保留承诺：{cut.title}；睡眠剩余 {remaining} 分钟",
+                )
+            )
+
+    sleep_minutes = sum(
+        _minutes(start, end) for _sleep, pieces, _cuts in trimmed for start, end in pieces
+    )
+    had_routine_conflict = any(cuts for _sleep, _pieces, cuts in trimmed)
+    below_floor = had_routine_conflict and sleep_minutes < MIN_SLEEP_MINUTES
+    if below_floor:
+        conflicts.append(
+            AnchorConflict(
+                reason_code=REASON_NEEDS_REVIEW,
+                anchor_ids=tuple(
+                    _anchor_key(sleep) for sleep, _pieces, cuts in trimmed if cuts
+                ),
+                detail=(
+                    f"承诺占用后剩余预计睡眠 {sleep_minutes} 分钟 < 下限 "
+                    f"{MIN_SLEEP_MINUTES} 分钟，标 needs_review（不改作息、不取消承诺）"
+                ),
+            )
+        )
+
+    resolved: list[Anchor] = []
+    for sleep, pieces, cuts in trimmed:
+        extra: list[str] = []
+        if cuts:
+            extra.append(REASON_ROUTINE_CONFLICT)
+        if below_floor:
+            # 这一天的预计睡眠已经被压到保护下限以下：**剩下的睡眠段也要带码**，
+            # 否则被完全覆盖的那一段什么都不剩，原因码就无处可查。
+            extra.append(REASON_NEEDS_REVIEW)
+        for start, end in pieces:
+            if (start, end) == (sleep.start_at, sleep.end_at) and not extra:
+                resolved.append(sleep)
+                continue
+            resolved.append(
+                replace(
+                    _with_reason_codes(sleep, *extra), start_at=start, end_at=end
+                )
+            )
+    resolved.extend(hard)
+    resolved.sort(key=lambda item: (item.start_at, item.end_at))
+
+    plan = AnchorPlan(
+        anchors=resolved,
+        conflicts=conflicts,
+        sleep_minutes=sleep_minutes,
+        sleep_minutes_before_trim=before_trim,
+    )
+    return plan.anchors, plan.conflicts
+
+
 async def load_commitment_anchors(
     session: AsyncSession, *, actor_id: str, window_start: datetime, window_end: datetime
 ) -> list[Anchor]:
@@ -457,6 +828,9 @@ async def load_commitment_anchors(
     来源两类，都是**已经存在的事实**，不是这次大纲要生成的内容：
     - ``commitments``（对人的承诺，``state=active``）；
     - ``agenda_plans`` 里 ``commitment_level=confirmed`` 的约定。
+
+    每条锚点都带可追溯的 ``source_id``（``commitment:<id>`` /
+    ``agenda_plan:<id>``）：冲突清单与段的 ``source_event_ids`` 要能指回来源。
     """
     anchors: list[Anchor] = []
     pad = timedelta(minutes=COMMITMENT_PROTECTIVE_MINUTES)
@@ -479,6 +853,7 @@ async def load_commitment_anchors(
                 end_at=due + pad,
                 title=f"约定：{_short(str(row.text), 40)}",
                 protective=True,
+                source_id=f"commitment:{row.id}",
             )
         )
     plans = (
@@ -499,6 +874,7 @@ async def load_commitment_anchors(
                 start_at=_aware(row.start_at),
                 end_at=_aware(row.end_at),
                 title=f"约定：{_short(str(row.title), 40)}",
+                source_id=f"agenda_plan:{row.id}",
             )
         )
     anchors.sort(key=lambda item: item.start_at)
@@ -717,6 +1093,8 @@ class OutlineOutcome:
     routine_revision: int = 0
     # 作息表里的时区与规范时区不一致（旧值冲突）。不阻断，但要能看见。
     routine_timezone_conflict: bool = False
+    # 本次走的是哪个相位（due/catchup/late）。`ensure_day_plan` 直接调时不填。
+    phase: str = ""
 
 
 async def _routine_snapshot(session: AsyncSession, actor_id: str) -> RoutineSnapshot:
@@ -754,15 +1132,301 @@ async def resolve_plan_timezone(session: AsyncSession) -> tuple[str, str]:
     return name, source.value
 
 
-async def _persona_summary(session: AsyncSession, persona_id: str) -> dict[str, object]:
+@dataclass(frozen=True)
+class PersonaProjection:
+    """写进大纲 prompt 的**结构化**人设投影（不是完整 ``system_prompt``）。
+
+    ``token_estimate`` 是粗略估算（见 :data:`PERSONA_ESTIMATE_METHOD`）：
+    它用来保证不超 :data:`PERSONA_TOKEN_LIMIT`，不冒充 provider 的精确计数。
+    缺字段一律 :data:`PERSONA_UNKNOWN`，不从空白处编人格。
+    """
+
+    identity: str = PERSONA_UNKNOWN
+    name: str = ""
+    personality: tuple[str, ...] = ()
+    values: tuple[str, ...] = ()
+    habits: tuple[str, ...] = ()
+    interests: tuple[str, ...] = ()
+    boundaries: tuple[str, ...] = ()
+    scenario_rules: tuple[str, ...] = ()
+    relationships: tuple[str, ...] = ()
+    situation: tuple[str, ...] = ()
+    token_estimate: int = 0
+    token_limit: int = PERSONA_TOKEN_LIMIT
+    estimate_method: str = PERSONA_ESTIMATE_METHOD
+    truncated: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        """给提示词用的普通 dict（``name`` 保留给模板里的 ``{name}``）。"""
+        return {
+            "name": self.name,
+            "identity": self.identity,
+            "personality": list(self.personality),
+            "values": list(self.values),
+            "habits": list(self.habits),
+            "interests": list(self.interests),
+            "boundaries": list(self.boundaries),
+            "scenario_rules": list(self.scenario_rules),
+            "relationships": list(self.relationships),
+            "situation": list(self.situation),
+        }
+
+
+_PERSONA_SECTION_KEYS: tuple[str, ...] = (
+    "personality",
+    "values",
+    "habits",
+    "interests",
+    "boundaries",
+    "scenario_rules",
+    "relationships",
+    "situation",
+)
+
+
+def _estimate_projection_tokens(payload: dict[str, object]) -> int:
+    """粗略 token 估算：与预算裁剪同一把尺子（见 ``PERSONA_ESTIMATE_METHOD``）。"""
+    from ling.kernel.context import estimate_tokens
+
+    return estimate_tokens(json.dumps(payload, ensure_ascii=False))
+
+
+def _trait_bucket(key: str) -> str:
+    lowered = key.lower()
+    for bucket, keywords in _TRAIT_BUCKETS:
+        if any(word in lowered for word in keywords):
+            return bucket
+    # 认不出来的键归"性格/风格"：宁可少解释一条，也不丢一条。
+    return "personality"
+
+
+def _familiarity_level(value: float) -> str:
+    for threshold, label in _FAMILIARITY_LEVELS:
+        if value >= threshold:
+            return label
+    return _FAMILIARITY_DEFAULT
+
+
+def _scenario_rules(overrides: dict[str, str]) -> list[str]:
+    """``scenario_prompts`` 里**写过的**场景覆盖 → 短规则（只取前 N 条）。
+
+    这里**不 import persona 域**（域边界闸门不允许跨域 import 实现），所以只有
+    一份"键 → 展示标签"的映射：它只影响 prompt 里那行字怎么读，不影响任何判定。
+    未知键直接用键名，不丢信息。
+    """
+    if not overrides:
+        return []
+    ordered = [key for key in _SCENARIO_ORDER if key in overrides]
+    ordered.extend(
+        sorted(key for key in overrides if key not in _SCENARIO_ORDER)
+    )
+    rules: list[str] = []
+    for key in ordered:
+        text = overrides[key].strip()
+        if not text:
+            continue
+        rules.append(
+            f"{_SCENARIO_LABELS.get(key, key)}：{_short(text, PERSONA_MAX_ITEM_CHARS)}"
+        )
+        if len(rules) >= PERSONA_MAX_SCENARIO_RULES:
+            break
+    return rules
+
+
+async def _persona_relationships(session: AsyncSession, actor_id: str) -> list[str]:
+    """1–2 段重要关系的**定性**摘要（不含他人标识、私聊细节与信任数值）。"""
+    from ling.settings.user_preferences import owner_subject_id
+
+    owner = await owner_subject_id(session)
+    rows = list(
+        (
+            await session.execute(
+                select(RelationshipState)
+                .where(RelationshipState.actor_id == actor_id)
+                .order_by(
+                    RelationshipState.familiarity.desc(),
+                    RelationshipState.trust.desc(),
+                    RelationshipState.subject_id,
+                )
+                .limit(PERSONA_MAX_RELATIONSHIPS)
+            )
+        ).scalars()
+    )
+    summaries: list[str] = []
+    for row in rows:
+        label = (
+            "当前主要对话者"
+            if owner and str(row.subject_id) == owner
+            else "另一位亲近的人"
+        )
+        bits = [f"{label}：{_familiarity_level(float(row.familiarity or 0.0))}"]
+        boundaries = [
+            str(item).strip() for item in (row.boundaries or []) if str(item).strip()
+        ]
+        if boundaries:
+            bits.append(f"边界 {len(boundaries)} 条，例如 {_short(boundaries[0], 24)}")
+        summaries.append("；".join(bits))
+    return summaries
+
+
+async def _persona_situation(
+    session: AsyncSession, actor_id: str, now: datetime
+) -> list[str]:
+    """当前处境：软作息 + 此刻场景（**模拟状态**，过期就是未知）。"""
+    lines: list[str] = []
+    routine = await session.get(ActorRoutineRow, actor_id)
+    if routine is not None:
+        lines.append(
+            f"作息：{_minute_hhmm(int(routine.wake_minute))} 醒 / "
+            f"{_minute_hhmm(int(routine.rest_minute))} 歇（软作息，可被打断）"
+        )
+    scene = await session.get(SceneCommitRow, actor_id)
+    if scene is not None:
+        valid_until = scene.valid_until
+        if valid_until is None or _aware(valid_until) > now:
+            state = str(scene.state)
+            lines.append(f"此刻：{_SCENE_LABELS.get(state, PERSONA_UNKNOWN)}（模拟）")
+        else:
+            lines.append("此刻：未知（场景已过期）")
+    return lines
+
+
+async def build_persona_projection(
+    session: AsyncSession,
+    persona_id: str,
+    *,
+    actor_id: str | None = None,
+    now: datetime | None = None,
+) -> PersonaProjection:
+    """人设 → 有界、确定性的结构化投影（设计 §3「persona_summary 构造」）。
+
+    几点是**硬约束**，不是风格选择：
+
+    - **不塞完整 ``system_prompt``**：正文可能几千字，每晚全文截断喂进去既超预算、
+      又把安全边界和写作风格混在一起。关键设定应由人设编辑/迁移提取成可审计的
+      结构化短项（``traits`` / ``boundaries`` / ``scenario_prompts``）。
+    - **缺字段写"未知"**：空白处不编人格。
+    - **先限条数、单条长度，再压到 ≤400 输入 token**：超预算时按固定优先级
+      先删可选场景与口癖细节，**绝不先挤掉**边界、价值观与作息相关习惯。
+    - ``traits`` 是使用者自由填的 dict，所以只按稳定的键名关键词归类；
+      认不出的键归"性格/风格"（不丢信息）。
+    - 关系只做定性摘要：不带他人标识、私聊细节或信任数值（设计 §3 关系上限）。
+    - token 数是**粗略估算**并如实标注（:data:`PERSONA_ESTIMATE_METHOD`）。
+    """
+    moment = _aware(now or utcnow())
+    actor = actor_id or _settings_actor_id()
     persona = await session.get(Persona, persona_id)
-    if persona is None:
-        return {}
-    traits = persona.traits if isinstance(persona.traits, dict) else {}
-    return {
-        "name": str(persona.display_name or persona.name or "她"),
-        "traits": {str(k): v for k, v in list(traits.items())[:8]},
+
+    name = ""
+    traits: dict[str, object] = {}
+    boundary_items: list[str] = []
+    scenario_overrides: dict[str, str] = {}
+    if persona is not None:
+        name = _short(str(persona.display_name or persona.name or "").strip(), 24)
+        if isinstance(persona.traits, dict):
+            traits = {str(key): value for key, value in persona.traits.items()}
+        boundary_items = [
+            _short(str(item).strip(), PERSONA_MAX_ITEM_CHARS)
+            for item in (persona.boundaries or [])
+            if str(item).strip()
+        ]
+        if isinstance(persona.scenario_prompts, dict):
+            scenario_overrides = {
+                str(key): str(value)
+                for key, value in persona.scenario_prompts.items()
+                if str(value).strip()
+            }
+
+    identity = f"称呼：{name}" if name else PERSONA_UNKNOWN
+
+    buckets: dict[str, list[str]] = {
+        "personality": [],
+        "values": [],
+        "habits": [],
+        "interests": [],
     }
+    for key in sorted(traits):
+        value = traits[key]
+        if value is None or value == "":
+            continue
+        text = _short(str(value).strip(), PERSONA_MAX_ITEM_CHARS)
+        if not text:
+            continue
+        bucket = _trait_bucket(key)
+        if len(buckets[bucket]) >= PERSONA_MAX_ITEMS:
+            continue
+        buckets[bucket].append(f"{_short(key, 16)}：{text}")
+
+    sections: dict[str, list[str]] = {
+        "personality": buckets["personality"],
+        "values": buckets["values"],
+        "habits": buckets["habits"],
+        "interests": buckets["interests"],
+        "boundaries": boundary_items[:PERSONA_MAX_ITEMS],
+        "scenario_rules": _scenario_rules(scenario_overrides),
+        "relationships": await _persona_relationships(session, actor),
+        "situation": await _persona_situation(session, actor, moment),
+    }
+    for key in _PERSONA_SECTION_KEYS:
+        if not sections[key]:
+            sections[key] = [PERSONA_UNKNOWN]
+
+    def payload() -> dict[str, object]:
+        return {"name": name, "identity": identity, **{k: list(v) for k, v in sections.items()}}
+
+    estimate = _estimate_projection_tokens(payload())
+    truncated = False
+
+    # ① 先按固定优先级删**条数**（每类至少留一条，留的是优先级最高的那条）。
+    for key in _PERSONA_TRIM_ORDER:
+        while estimate > PERSONA_TOKEN_LIMIT and len(sections[key]) > 1:
+            sections[key] = sections[key][:-1]
+            truncated = True
+            estimate = _estimate_projection_tokens(payload())
+
+    # ② 再压**单条长度**（可选段先压，边界/价值观/习惯最后压，但一样要压）：
+    #    极端的长文本只能截断，不能靠"删掉边界"来省预算。
+    for limit in (40, 24, 12):
+        if estimate <= PERSONA_TOKEN_LIMIT:
+            break
+        for key in (*_PERSONA_TRIM_ORDER, "values", "habits", "boundaries"):
+            sections[key] = [_short(item, limit) for item in sections[key]]
+        truncated = True
+        estimate = _estimate_projection_tokens(payload())
+
+    # ③ 极端兜底（例如边界本身就超长）：每类留一条压到 12 字，称呼也压短。
+    #    保证"≤400"是硬保证，而不是"大概能过"。
+    if estimate > PERSONA_TOKEN_LIMIT:
+        for key in _PERSONA_SECTION_KEYS:
+            sections[key] = [_short(sections[key][0], 12)]
+        name = _short(name, 8)
+        identity = _short(identity, 16)
+        truncated = True
+        estimate = _estimate_projection_tokens(payload())
+
+    return PersonaProjection(
+        identity=identity,
+        name=name,
+        personality=tuple(sections["personality"]),
+        values=tuple(sections["values"]),
+        habits=tuple(sections["habits"]),
+        interests=tuple(sections["interests"]),
+        boundaries=tuple(sections["boundaries"]),
+        scenario_rules=tuple(sections["scenario_rules"]),
+        relationships=tuple(sections["relationships"]),
+        situation=tuple(sections["situation"]),
+        token_estimate=estimate,
+        truncated=truncated,
+    )
+
+
+async def _persona_summary(session: AsyncSession, persona_id: str) -> dict[str, object]:
+    """旧名转发：阶段 1.5 起人设摘要走 :func:`build_persona_projection`。
+
+    保留这个名字是因为 ``build_outline_prompt`` 与既有调用点都按 dict 用；
+    真正的内容（结构化、有界、缺字段写"未知"）在投影里。
+    """
+    return (await build_persona_projection(session, persona_id)).as_dict()
 
 
 async def _experience_summary(
@@ -1066,6 +1730,12 @@ def rule_outline(
     """确定性兜底：**只**用作息与已确认约定铺时间轴，不编可选活动。
 
     "今天暂时没什么特别安排"是合法结果——比拿模型幻觉填满更像人。
+
+    锚点自带的 ``source_id`` 与原因码（``routine_conflict`` / ``needs_review``）
+    写进段的 ``source_event_ids``（``reason:<code>``）：这是设计 §6 规定的
+    **原因码落点之一**，不加列、不加表。已经**完全过去**的锚点不写
+    （"过去永不回填"）；部分落在起点之前的锚点整段保留——它描述的是作息
+    预期（预计睡眠），不是"已经做过的事"。
     """
     drafts: list[SegmentDraft] = []
     for anchor in anchors:
@@ -1074,6 +1744,10 @@ def rule_outline(
         if anchor.end_at <= not_before:
             # 整段都在可变起点之前：当作历史，不再写进新版本。
             continue
+        source_event_ids: list[str] = []
+        if anchor.source_id:
+            source_event_ids.append(anchor.source_id)
+        source_event_ids.extend(f"{REASON_TAG_PREFIX}{code}" for code in anchor.reason_codes)
         drafts.append(
             SegmentDraft(
                 kind=SLEEP_ANCHOR if anchor.kind == SLEEP_ANCHOR else "commitment",
@@ -1086,6 +1760,7 @@ def rule_outline(
                 anchor_kind=anchor.kind,
                 commitment_level="confirmed",
                 source="baseline" if anchor.kind == SLEEP_ANCHOR else "rule",
+                source_event_ids=source_event_ids,
             )
         )
     return drafts
@@ -1106,6 +1781,9 @@ class SegmentDraft:
     commitment_level: str = "tentative"
     source: str = "model"
     parent_id: str | None = None
+    # 来源 id 与 ``reason:<code>``。原因码只落这里和 `day_plans.last_error_code`
+    # （设计 §6），不新增列/表。
+    source_event_ids: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- 计划行
@@ -1289,7 +1967,7 @@ async def _commit_revision(
                     source=draft.source,
                     revision_created=new_revision,
                     revision_ended=None,
-                    source_event_ids=[],
+                    source_event_ids=list(draft.source_event_ids),
                     created_at=now,
                     updated_at=now,
                 )
@@ -1317,6 +1995,7 @@ async def ensure_day_plan(
     timezone: str | None = None,
     timezone_source: str | None = None,
     lease_owner: str | None = None,
+    force: bool = False,
 ) -> OutlineOutcome:
     """确保某个**计划日**有一版可用大纲（幂等）。
 
@@ -1327,6 +2006,10 @@ async def ensure_day_plan(
     （:func:`plan_day_window`），并允许 ``now < window_start`` 的**预生成**
     （D−1 21:00 的正常路径，可变起点 = ``max(now, window_start)``）。
     不传才按 ``now`` 推当前计划日。
+
+    ``force=True`` 跳过"快照没变就返回 unchanged"的短路，用于醒前 catch-up
+    补试（设计 §3：仅当原因是**可恢复**且预算仍有余量时才补试）。默认 ``False``
+    时行为与阶段 1 完全一致：同一计划日同一快照只生成一次。
 
     流程：解析规范时区 → 取/建计划行 → 快照没变就直接返回原结论 → 预算+lease
     → 调模型 → 严格校验（非法修一次）→ 失败写规则大纲 + ``degraded`` →
@@ -1361,7 +2044,12 @@ async def ensure_day_plan(
         str(row.timezone) == timezone
         and int(row.routine_revision) == routine.revision
     )
-    if row.state in ("ready", "degraded") and int(row.revision) > 0 and snapshot_same:
+    if (
+        row.state in ("ready", "degraded")
+        and int(row.revision) > 0
+        and snapshot_same
+        and not force
+    ):
         return _outcome(
             row,
             state="unchanged",
@@ -1382,16 +2070,24 @@ async def ensure_day_plan(
         session, actor_id=actor_id, window_start=window_start, window_end=window_end
     )
     # D 的睡眠锚点：作息与 D 的午夜窗口求交，至多两段，都在 D 内。
-    anchors = sorted(
+    # 冲突裁决**由代码做**（设计 §3）：承诺保护窗裁到 D 内、同级硬约定两边都留、
+    # 承诺压睡眠时保留承诺并标原因码。裁决结果同时进 prompt 与段的原因码。
+    anchors, anchor_conflicts = resolve_anchor_conflicts(
         [*sleep_anchors_for_day(plan_day, timezone, routine), *commitment_anchors],
-        key=lambda item: item.start_at,
+        window_start=window_start,
+        window_end=window_end,
+        routine=routine,
     )
 
     # 可变起点：过去永不回填；catch-up 也从 now 开始。
     not_before = max(now, window_start)
     places = await _valid_places(session, actor_id)
     place_ids = {item["id"] for item in places}
-    persona = await _persona_summary(session, persona_id=await _resolve_persona_id(session))
+    persona = (
+        await build_persona_projection(
+            session, await _resolve_persona_id(session), actor_id=actor_id, now=now
+        )
+    ).as_dict()
     experiences = await _experience_summary(session, actor_id=actor_id, now=now)
     presence = await _presence_snapshot(session, actor_id)
 
@@ -1520,6 +2216,14 @@ async def ensure_day_plan(
         if reason_code is None:
             reason_code = "model_unavailable"
 
+    # 锚点冲突需要人工/系统复核时，用 `day_plans.last_error_code` 留一个码
+    # （设计 §6 的原因是"不加列不加表"）。只放 needs_review：`routine_conflict`
+    # 是局部取舍，已经落在段的 `reason:` 上，不必把整天标成"有错"。
+    if reason_code is None and any(
+        item.reason_code == REASON_NEEDS_REVIEW for item in anchor_conflicts
+    ):
+        reason_code = REASON_NEEDS_REVIEW
+
     # 锚点总是入库（模型版也要有睡眠/承诺段），且与模型段不重叠（已校验）。
     anchor_drafts = rule_outline(
         anchors=anchors,
@@ -1570,6 +2274,136 @@ async def ensure_day_plan(
     )
 
 
+# 相位的"严重度"：late > catchup > due。相位只允许**减少**模型使用，
+# 不允许把过期的 due 当成"还能正常调模型"——否则醒到一半还在为早上烧钱。
+_PHASE_SEVERITY: dict[str, int] = {
+    PHASE_DUE: 0,
+    PHASE_CATCHUP: 1,
+    PHASE_LATE: 2,
+}
+
+
+def _effective_phase(*, requested: str, actual: str) -> str:
+    """取请求相位与实际相位里**更保守**的那个（相位不能凭空放宽）。"""
+    if requested not in _PHASE_SEVERITY:
+        raise ValueError(f"未知的大纲相位：{requested!r}（只能是 due/catchup/late）")
+    if _PHASE_SEVERITY[requested] >= _PHASE_SEVERITY[actual]:
+        return requested
+    return actual
+
+
+async def _tag_degraded_late(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    plan_day: date,
+    now: datetime,
+    outcome: OutlineOutcome,
+) -> OutlineOutcome:
+    """醒点及以后仍没有 ready：把原因码钉成 ``degraded_late``（不增 revision）。
+
+    只改 ``day_plans.last_error_code`` 这一个落点：时间轴形状没变，所以不需要
+    新版本；已经 ready 的计划**不**降级（它不需要这个码）。
+    """
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    if row is None or str(row.state) == "ready":
+        return outcome
+    if str(row.last_error_code or "") != REASON_DEGRADED_LATE:
+        row.last_error_code = REASON_DEGRADED_LATE
+        row.updated_at = now
+        await session.flush()
+    return replace(outcome, reason_code=REASON_DEGRADED_LATE)
+
+
+async def outline_work(
+    session: AsyncSession,
+    plan_day: date,
+    phase: str,
+    *,
+    actor_id: str,
+    router: object | None = None,
+    config_reader: object | None = None,
+    now: datetime | None = None,
+    timezone: str | None = None,
+    timezone_source: str | None = None,
+    lease_owner: str | None = None,
+) -> OutlineOutcome:
+    """按**目标日 + 相位**跑一次大纲作业（调度唯一该调的入口）。
+
+    这是把 `ensure_day_plan` 的"取输入 → 调用 → 校验 → 提交/降级"包成可复用
+    入口的那一层，相位只决定"能不能调模型、从哪儿开始排"：
+
+    - ``due``（D−1 21:00 正常到期）：正常调模型，可变起点 = ``max(now, D 00:00)``；
+    - ``catchup``（错过 21:00、但还没到 D 的醒点）：可以补跑，但**只排 ``now``
+      之后**（过午夜不回填）。若前一次失败的原因是**可恢复**的
+      （:data:`RETRYABLE_REASON_CODES`）且预算仍有剩余，会真正补试一次；
+      非法输出/预算耗尽等终态不重试（设计 §3「catch-up」）。
+    - ``late``（已到/过了 D 的醒点）：**零模型**，只补未过去的确定性锚点与空档，
+      原因码钉成 ``degraded_late``；醒后新约定走事件局部重排，不在这里补造早晨。
+
+    相位只会**更保守**：调用方给 ``due``、但按 ``now`` 其实已经过了醒点，会
+    自动降成 ``late``（不烧一次注定过期的模型调用）。反过来不会"升级"。
+    """
+    moment = _aware(now or utcnow())
+    if phase not in _PHASE_SEVERITY:
+        raise ValueError(f"未知的大纲相位：{phase!r}（只能是 due/catchup/late）")
+    if timezone is None:
+        timezone, timezone_source = await resolve_plan_timezone(session)
+    else:
+        timezone_source = timezone_source or "explicit"
+    routine = await _routine_snapshot(session, actor_id)
+    _target, actual = outline_due_decision(
+        moment,
+        timezone=timezone,
+        wake_minute=routine.wake_minute,
+        plan_day=plan_day,
+    )
+    effective = _effective_phase(requested=phase, actual=actual)
+
+    if effective == PHASE_LATE:
+        # 零模型：把 router/config_reader 显式置空，结构上堵死模型调用。
+        outcome = await ensure_day_plan(
+            session,
+            actor_id=actor_id,
+            router=None,
+            config_reader=None,
+            plan_day=plan_day,
+            now=moment,
+            timezone=timezone,
+            timezone_source=timezone_source,
+            lease_owner=lease_owner,
+        )
+        tagged = await _tag_degraded_late(
+            session, actor_id=actor_id, plan_day=plan_day, now=moment, outcome=outcome
+        )
+        return replace(tagged, phase=effective)
+
+    force = False
+    if effective == PHASE_CATCHUP:
+        row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+        if (
+            row is not None
+            and str(row.state) != "ready"
+            and str(row.last_error_code or "") in RETRYABLE_REASON_CODES
+        ):
+            # 醒前补试：只在"原因可恢复"时重跑；同一作业、同一预算闸。
+            force = True
+
+    outcome = await ensure_day_plan(
+        session,
+        actor_id=actor_id,
+        router=router,
+        config_reader=config_reader,
+        plan_day=plan_day,
+        now=moment,
+        timezone=timezone,
+        timezone_source=timezone_source,
+        lease_owner=lease_owner,
+        force=force,
+    )
+    return replace(outcome, phase=effective)
+
+
 async def run_due_outline(
     session: AsyncSession,
     *,
@@ -1594,6 +2428,12 @@ async def run_due_outline(
     - 当前计划日已 ready/degraded 且快照没变：幂等返回 unchanged。
 
     这里**没有**定时器/循环，也没有 outbox：只提供可调用的入口。
+
+    **阶段 1.5b 之后新代码不要用它**：调度应改成"先
+    :func:`outline_due_decision` 定目标日/相位，再 :func:`outline_work`"，
+    这样 21:00 到期、醒前补跑、醒后零模型三档才有明确判据（尤其"距 rest 40
+    分钟"这条旧判据与设计 §3 的"截止理由是 D 的醒点"不符）。本函数保留是为了
+    不悄悄改掉既有调用与测试的语义。
     """
     now = _aware(now or utcnow())
     timezone, timezone_source = await resolve_plan_timezone(session)
@@ -1643,6 +2483,496 @@ async def run_due_outline(
     )
 
 
+# ---------------------------------------------------------------- 接缝与新锚点
+
+
+@dataclass(frozen=True)
+class SeamReport:
+    """一次午夜接缝校验的结果（**零模型**，字段都是可解释的）。"""
+
+    plan_day: date
+    state: str = "unchanged"  # no_plan / unchanged / superseded / annotated / busy
+    plan_id: str = ""
+    revision_before: int = 0
+    revision_after: int = 0
+    # 被置为 superseded 的可选段（冲突且还没开始的那部分）
+    superseded_segment_ids: tuple[str, ...] = ()
+    # 与锚点冲突、但**已经开始/已过去**的段：不可动，只能报出来等人工处置
+    frozen_segment_ids: tuple[str, ...] = ()
+    # 硬的确认锚点（来源 id）
+    anchor_ids: tuple[str, ...] = ()
+    # 两日睡眠边界在 UTC 上重叠的描述（理论上是时区变更后的旧值残留）
+    boundary_conflicts: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+    # 结构性零模型：这里没有 router 参数，永远 0 次。
+    calls: int = 0
+
+    @property
+    def changed(self) -> bool:
+        """这一遍**有没有改动计划**（版本推进，或给段补了睡眠边界码）。"""
+        return self.state in ("superseded", "annotated") or (
+            self.revision_after != self.revision_before
+        )
+
+
+def _movable_segment(segment: ScheduleSegmentRow) -> bool:
+    """能不能被锚点冲突"动到"：只有**未确认的可选段**才可动。
+
+    睡眠/承诺锚点（``anchor_kind`` 非空）与 confirmed 的约定都不是可替换候选：
+    它们本身就是不可移动锚点，或者属于别的状态机。
+    """
+    return str(segment.anchor_kind) == "" and str(segment.commitment_level) != "confirmed"
+
+
+async def _sleep_boundary_overlaps(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    plan_day: date,
+    my_segments: list[ScheduleSegmentRow],
+) -> list[tuple[ScheduleSegmentRow, str]]:
+    """D−1 与 D 的**预计睡眠**在 UTC 上是否重叠（零模型，只读检查）。
+
+    正常情况下两天的睡眠段各自落在自己的午夜窗口内，不会重叠；能重叠的只有
+    "旧时区/旧作息留下的段还没被清掉"这类接缝残留。这里**不移动任何段**，
+    只把重叠报出来（并给 D 侧那段补一个原因码）。
+    """
+    previous = await load_day_plan(
+        session, actor_id=actor_id, plan_day=plan_day - timedelta(days=1)
+    )
+    if previous is None:
+        return []
+    previous_segments = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == previous.id,
+                    ScheduleSegmentRow.status == "current",
+                    ScheduleSegmentRow.anchor_kind == SLEEP_ANCHOR,
+                )
+                .order_by(ScheduleSegmentRow.start_at)
+            )
+        ).scalars()
+    )
+    mine = [item for item in my_segments if str(item.anchor_kind) == SLEEP_ANCHOR]
+    overlaps_found: list[tuple[ScheduleSegmentRow, str]] = []
+    for day_before in previous_segments:
+        for current in mine:
+            if not overlaps(
+                _aware(day_before.start_at),
+                _aware(day_before.end_at),
+                _aware(current.start_at),
+                _aware(current.end_at),
+            ):
+                continue
+            detail = (
+                f"D−1 的预计睡眠 {_aware(day_before.start_at).isoformat()}→"
+                f"{_aware(day_before.end_at).isoformat()} 与 D 的 "
+                f"{_aware(current.start_at).isoformat()}→"
+                f"{_aware(current.end_at).isoformat()} 重叠"
+            )
+            overlaps_found.append((current, detail))
+    return overlaps_found
+
+
+async def seam_check(
+    session: AsyncSession,
+    plan_day: date,
+    *,
+    actor_id: str | None = None,
+    now: datetime | None = None,
+) -> SeamReport:
+    """午夜接缝校验：**零模型**复核 D−1 晚上新入库的已确认锚点与 D 现有段。
+
+    设计 §2「21:00–24:00 接缝」+ §3 的 ``seam:{actor}:{plan_day}:…`` 作业：
+    21:00 之后新确认的约定、时区/作息变化一旦入库，D 的计划可能已经和它冲突；
+    00:00 这一遍只做**确定性**修补，不重新生成：
+
+    - 与硬的确认锚点（``CommitmentRow`` active / confirmed ``agenda_plans``）
+      冲突、且**还没开始**的可选段 → ``status=superseded`` +
+      ``source_event_ids`` 追加 ``reason:needs_review``，整日 ``revision+1``；
+    - 已经开始的段**不动**（过去/进行中的是历史），只在报告里列出来；
+    - 校验 D−1 与 D 的预计睡眠边界：重叠只补 ``reason:sleep_boundary_conflict``
+      并报出来，**不移动段**（动睡眠段需要人/阶段 3 的判断）；
+    - 没有变化就不写任何东西：**不增 revision**、不写重复原因码，重复调用结果相同。
+
+    这里没有 router 参数：接缝校验**结构上**不可能调模型（``calls`` 恒为 0）。
+
+    实现上**不复刻"当晚新增"这个时间窗判据**：D 窗口内所有 active 的
+    ``CommitmentRow`` 与 confirmed 的 ``agenda_plans`` 都参与比对。理由——能被
+    新锚点碰撞的段，21:00 的生成本来就排不进去（那时锚点已存在），所以两种取法
+    效果等价；按 `created_at` 先过滤反而会漏掉"恢复/迁移后才确认"的迟到锚点。
+    """
+    moment = _aware(now or utcnow())
+    actor = actor_id or _settings_actor_id()
+    row = await load_day_plan(session, actor_id=actor, plan_day=plan_day)
+    if row is None:
+        # 还没有这一天的计划：没有"现有段"可复核。21:00 作业会按当时的锚点生成。
+        return SeamReport(plan_day=plan_day, state="no_plan")
+
+    window_start = _aware(row.window_start_at)
+    window_end = _aware(row.window_end_at)
+    routine = await _routine_snapshot(session, actor)
+    commitment_anchors = await load_commitment_anchors(
+        session, actor_id=actor, window_start=window_start, window_end=window_end
+    )
+    hard, _anchor_conflicts = resolve_anchor_conflicts(
+        commitment_anchors,
+        window_start=window_start,
+        window_end=window_end,
+        routine=routine,
+    )
+
+    segments = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == row.id,
+                    ScheduleSegmentRow.status == "current",
+                )
+                .order_by(ScheduleSegmentRow.start_at)
+            )
+        ).scalars()
+    )
+    floor = max(moment, window_start)
+
+    supersede: list[tuple[ScheduleSegmentRow, Anchor]] = []
+    frozen: list[str] = []
+    for segment in segments:
+        if not _movable_segment(segment):
+            continue
+        hit = next(
+            (
+                anchor
+                for anchor in hard
+                if overlaps(
+                    _aware(segment.start_at),
+                    _aware(segment.end_at),
+                    anchor.start_at,
+                    anchor.end_at,
+                )
+            ),
+            None,
+        )
+        if hit is None:
+            continue
+        if _aware(segment.start_at) < floor:
+            frozen.append(str(segment.id))
+            continue
+        supersede.append((segment, hit))
+
+    boundary = await _sleep_boundary_overlaps(
+        session, actor_id=actor, plan_day=plan_day, my_segments=segments
+    )
+    # 只把**新**的重叠当成变化：同一个原因码已经写过就不再写（幂等）。
+    boundary_new = [
+        (segment, detail)
+        for segment, detail in boundary
+        if f"{REASON_TAG_PREFIX}{REASON_SLEEP_BOUNDARY}"
+        not in {
+            str(item) for item in (segment.source_event_ids or [])
+        }
+    ]
+
+    expected = int(row.revision)
+    reason_codes: list[str] = []
+    state = "unchanged"
+    if not supersede and not boundary_new:
+        # 没有变化：**不写任何东西**（不刷 updated_at、不增 revision、不重复写码）。
+        # 已有的睡眠边界重叠仍然报出来，方便排障，但它不构成本次改动。
+        return SeamReport(
+            plan_day=plan_day,
+            state="unchanged",
+            plan_id=str(row.id),
+            revision_before=expected,
+            revision_after=expected,
+            frozen_segment_ids=tuple(frozen),
+            anchor_ids=tuple(_anchor_key(item) for item in hard),
+            boundary_conflicts=tuple(detail for _segment, detail in boundary),
+        )
+
+    new_revision = expected + 1 if supersede else expected
+    try:
+        async with session.begin_nested():
+            if supersede:
+                result = await session.execute(
+                    update(DayPlanRow)
+                    .where(DayPlanRow.id == row.id, DayPlanRow.revision == expected)
+                    .values(
+                        revision=new_revision,
+                        last_error_code=REASON_NEEDS_REVIEW,
+                        updated_at=moment,
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    raise StaleRevisionError(expected)
+                for segment, anchor in supersede:
+                    segment.status = "superseded"
+                    segment.revision_ended = new_revision
+                    segment.source_event_ids = _append_unique(
+                        segment.source_event_ids,
+                        f"{REASON_TAG_PREFIX}{REASON_NEEDS_REVIEW}",
+                        *_anchor_source_ids(anchor),
+                    )
+                    segment.updated_at = moment
+            for segment, _detail in boundary_new:
+                segment.source_event_ids = _append_unique(
+                    segment.source_event_ids,
+                    f"{REASON_TAG_PREFIX}{REASON_SLEEP_BOUNDARY}",
+                )
+                segment.updated_at = moment
+            if not supersede:
+                # 只有睡眠边界注解：段身份/形状没变，不增 revision，只留原因码。
+                await session.execute(
+                    update(DayPlanRow)
+                    .where(DayPlanRow.id == row.id, DayPlanRow.revision == expected)
+                    .values(last_error_code=REASON_SLEEP_BOUNDARY, updated_at=moment)
+                )
+            await session.flush()
+    except StaleRevisionError:
+        return SeamReport(
+            plan_day=plan_day,
+            state="busy",
+            plan_id=str(row.id),
+            revision_before=expected,
+            revision_after=expected,
+            superseded_segment_ids=(),
+            frozen_segment_ids=tuple(frozen),
+            anchor_ids=tuple(_anchor_key(item) for item in hard),
+            reason_codes=("stale_revision",),
+        )
+
+    await session.refresh(row)
+    if supersede:
+        state = "superseded"
+        reason_codes.append(REASON_NEEDS_REVIEW)
+    if boundary_new:
+        state = "superseded" if supersede else "annotated"
+        reason_codes.append(REASON_SLEEP_BOUNDARY)
+    return SeamReport(
+        plan_day=plan_day,
+        state=state,
+        plan_id=str(row.id),
+        revision_before=expected,
+        revision_after=int(row.revision),
+        superseded_segment_ids=tuple(str(item.id) for item, _anchor in supersede),
+        frozen_segment_ids=tuple(frozen),
+        anchor_ids=tuple(_anchor_key(item) for item in hard),
+        boundary_conflicts=tuple(detail for _segment, detail in boundary),
+        reason_codes=tuple(reason_codes),
+    )
+
+
+def _anchor_source_ids(anchor: Anchor) -> tuple[str, ...]:
+    return (anchor.source_id,) if anchor.source_id else ()
+
+
+def _replan_candidate(segment: ScheduleSegmentRow) -> bool:
+    """哪些段属于"局部重排"的候选。
+
+    - 硬约定（``anchor_kind=commitment``）不是候选：它本身就是不可移动锚点；
+    - 预计睡眠（``anchor_kind=sleep``）**是**候选：承诺压上去时它要缩短/分裂
+      （只是不能被"取消"——保留承诺是硬规则）；
+    - 其余只有未确认的可选段可以被换掉。
+    """
+    kind = str(segment.anchor_kind)
+    if kind == COMMITMENT_ANCHOR:
+        return False
+    if kind == SLEEP_ANCHOR:
+        return True
+    return str(segment.commitment_level) != "confirmed"
+
+
+@dataclass(frozen=True)
+class ReplanTodo:
+    """"需要局部重排"的待办（阶段 1.5 只登记，不加表、不调模型）。
+
+    真正做局部重排的是阶段 3：它按 ``plan_id + segment_ids + [range_start,
+    range_end)`` 取范围，模型只能改这段，范围外的段和硬锚点原样保留。
+    """
+
+    plan_day: date
+    plan_id: str
+    anchor_ids: tuple[str, ...]
+    segment_ids: tuple[str, ...]
+    range_start: datetime
+    range_end: datetime
+    reason_codes: tuple[str, ...] = ()
+    tag: str = REPLAN_TODO_TAG
+    registered: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "plan_day": self.plan_day.isoformat(),
+            "plan_id": self.plan_id,
+            "anchor_ids": list(self.anchor_ids),
+            "segment_ids": list(self.segment_ids),
+            "range_start": self.range_start.isoformat(),
+            "range_end": self.range_end.isoformat(),
+            "reason_codes": list(self.reason_codes),
+            "tag": self.tag,
+            "registered": self.registered,
+        }
+
+
+def _replan_range(
+    anchor: Anchor,
+    affected: list[ScheduleSegmentRow],
+    hard: list[Anchor],
+    *,
+    floor: datetime,
+    window_end: datetime,
+) -> tuple[datetime, datetime]:
+    """要局部重排的那一段：**受影响段 ∪ 新锚点**，再被相邻硬锚点界住。
+
+    局部性是硬要求（设计 §2/§4）：不扩展到整天。所以范围从"与新锚点相交的段"
+    出发，而不是从"这一天的空档"出发；相邻硬约定只用来**收窄**范围——已经
+    确认的约定、睡前的空档都不归这次重排管。
+    """
+    start = min(
+        [_aware(anchor.start_at), *(_aware(item.start_at) for item in affected)]
+    )
+    end = max([_aware(anchor.end_at), *(_aware(item.end_at) for item in affected)])
+    start = max(start, floor)
+    end = min(end, window_end)
+    for other in hard:
+        if (other.start_at, other.end_at) == (anchor.start_at, anchor.end_at):
+            continue
+        if other.end_at <= _aware(anchor.start_at):
+            start = max(start, other.end_at)
+        elif other.start_at >= _aware(anchor.end_at):
+            end = min(end, other.start_at)
+    return start, end
+
+
+async def on_new_confirmed_anchor(
+    session: AsyncSession,
+    plan_day: date,
+    anchor: Anchor,
+    *,
+    actor_id: str | None = None,
+    now: datetime | None = None,
+) -> ReplanTodo | None:
+    """新确认的约定落地后，**同一事务里**即时复核同一计划日（零模型）。
+
+    设计 §2：21:00–24:00 之间用户确认了"D 07:00 的事"，事件处理器要立刻找
+    受影响的 D 计划——不然只能等到 00:00 的接缝校验，会丢掉及时修订。
+    阶段 1.5 这里**只登记待办**：给受影响的可选段（含会被裁剪的预计睡眠）打上
+    ``todo:replan`` 标记并返回 :class:`ReplanTodo`，真正的模型局部重排属阶段 3。
+
+    定位方式不加表：标记写在段自己的 ``source_event_ids`` 里（都是 ``JSON`` 列），
+    阶段 3 读 D 的当前段时按标记过滤即可拿到范围。
+
+    - ``anchor`` 是**已确认**的锚点（``load_commitment_anchors`` 的形状）；
+      完全落在 D 窗口外的锚点返回 ``None``（它不影响这一天）。
+    - 没有计划行、或没有任何会被影响的段 → ``None``：没有局部重排可做
+      （21:00 的作业/接缝校验会按当时锚点生成）。
+    - **不增 revision、不调模型、不改段状态**：登记待办不是"已经改过计划"。
+    """
+    moment = _aware(now or utcnow())
+    actor = actor_id or _settings_actor_id()
+    row = await load_day_plan(session, actor_id=actor, plan_day=plan_day)
+    if row is None:
+        return None
+    window_start = _aware(row.window_start_at)
+    window_end = _aware(row.window_end_at)
+    clipped = _clip_anchor(anchor, window_start=window_start, window_end=window_end)
+    if clipped is None:
+        return None
+
+    routine = await _routine_snapshot(session, actor)
+    commitment_anchors = await load_commitment_anchors(
+        session, actor_id=actor, window_start=window_start, window_end=window_end
+    )
+    hard, conflicts = resolve_anchor_conflicts(
+        [*commitment_anchors, clipped],
+        window_start=window_start,
+        window_end=window_end,
+        routine=routine,
+    )
+    segments = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == row.id,
+                    ScheduleSegmentRow.status == "current",
+                )
+                .order_by(ScheduleSegmentRow.start_at)
+            )
+        ).scalars()
+    )
+    floor = max(moment, window_start)
+    affected = [
+        segment
+        for segment in segments
+        if _replan_candidate(segment)
+        and _aware(segment.end_at) > floor
+        and overlaps(
+            _aware(segment.start_at),
+            _aware(segment.end_at),
+            clipped.start_at,
+            clipped.end_at,
+        )
+    ]
+    if not affected:
+        return None
+
+    touched = False
+    for segment in affected:
+        merged = _append_unique(
+            segment.source_event_ids,
+            REPLAN_TODO_TAG,
+            *_anchor_source_ids(clipped),
+        )
+        if merged == [str(item) for item in (segment.source_event_ids or [])]:
+            # 已经登记过：重复调用**不写**（幂等，连 updated_at 都不动）。
+            continue
+        segment.source_event_ids = merged
+        segment.updated_at = moment
+        touched = True
+    if touched:
+        await session.flush()
+
+    start, end = _replan_range(
+        clipped, affected, hard, floor=floor, window_end=window_end
+    )
+    reason_codes = tuple(
+        dict.fromkeys(item.reason_code for item in conflicts)
+    )
+    anchor_ids = tuple(
+        dict.fromkeys(
+            _anchor_key(item)
+            for item in hard
+            if (item.start_at, item.end_at) == (clipped.start_at, clipped.end_at)
+        )
+    )
+    return ReplanTodo(
+        plan_day=plan_day,
+        plan_id=str(row.id),
+        anchor_ids=anchor_ids or _anchor_source_ids(clipped),
+        segment_ids=tuple(str(item.id) for item in affected),
+        range_start=start,
+        range_end=end,
+        reason_codes=reason_codes,
+    )
+
+
+def _clip_anchor(
+    anchor: Anchor, *, window_start: datetime, window_end: datetime
+) -> Anchor | None:
+    """把锚点裁到 D 内；与 D 没有交集时返回 ``None``。"""
+    start = max(_aware(anchor.start_at), _aware(window_start))
+    end = min(_aware(anchor.end_at), _aware(window_end))
+    if start >= end:
+        return None
+    if (start, end) == (_aware(anchor.start_at), _aware(anchor.end_at)):
+        return anchor
+    return replace(anchor, start_at=start, end_at=end)
+
+
 # ---------------------------------------------------------------- 内部工具
 
 
@@ -1681,6 +3011,33 @@ async def _resolve_persona_id(session: AsyncSession) -> str:
         return get_settings().persona_id
     except Exception:  # noqa: BLE001 - 配置不可读时用默认 id
         return "persona_ling"
+
+
+def _settings_actor_id() -> str:
+    """角色 actor id 的单一默认值（``LING_ACTOR_ID``，默认 ``actor_ling``）。
+
+    只有"没有显式传 actor_id"的入口才用它：``seam_check`` / ``on_new_confirmed_anchor``
+    这类按计划日工作的函数，单角色部署里 actor 就是配置里的那一个。
+    """
+    from ling.config import get_settings
+
+    try:
+        return get_settings().actor_id
+    except Exception:  # noqa: BLE001 - 配置不可读时用默认 id
+        return "actor_ling"
+
+
+def _append_unique(existing: object, *values: str) -> list[str]:
+    """把值追加到 JSON 列表里（去重、保序），用于 ``source_event_ids``。
+
+    "不写重复原因码"是接缝幂等的判据之一：同一个 ``reason:<code>`` 只留一次。
+    """
+    items = [str(item) for item in existing] if isinstance(existing, list) else []
+    merged = list(items)
+    for value in values:
+        if value and value not in merged:
+            merged.append(value)
+    return merged
 
 
 def _resolved_provider_id(effective: object, profile: str) -> str | None:
@@ -1753,6 +3110,7 @@ __all__ = [
     "CATCH_UP_MIN_MINUTES_BEFORE_REST",
     "COMMITMENT_ANCHOR",
     "COMMITMENT_PROTECTIVE_MINUTES",
+    "MIN_SLEEP_MINUTES",
     "MODEL_KINDS",
     "OUTLINE_DAILY_TOKEN_BUDGET",
     "OUTLINE_DUE_MINUTE",
@@ -1761,16 +3119,32 @@ __all__ = [
     "OUTLINE_MAX_CALLS",
     "OUTLINE_PROFILE",
     "OUTLINE_TIMEOUT_SECONDS",
+    "PERSONA_ESTIMATE_METHOD",
+    "PERSONA_TOKEN_LIMIT",
+    "PERSONA_UNKNOWN",
+    "PHASE_CATCHUP",
+    "PHASE_DUE",
+    "PHASE_LATE",
     "PLAN_DAY_START_MINUTE",
+    "REASON_DEGRADED_LATE",
+    "REASON_NEEDS_REVIEW",
+    "REASON_ROUTINE_CONFLICT",
+    "REASON_SLEEP_BOUNDARY",
+    "REPLAN_TODO_TAG",
     "SLEEP_ANCHOR",
     "Anchor",
+    "AnchorConflict",
     "OutlineOutcome",
     "OutlineValidationError",
+    "PersonaProjection",
     "PlannedBlock",
+    "ReplanTodo",
     "RoutineSnapshot",
+    "SeamReport",
     "SegmentDraft",
     "StaleRevisionError",
     "build_outline_prompt",
+    "build_persona_projection",
     "build_repair_prompt",
     "contains",
     "display_day_for",
@@ -1781,16 +3155,21 @@ __all__ = [
     "load_segments",
     "local_hhmm",
     "local_minute_instant",
+    "on_new_confirmed_anchor",
     "outline_due_at",
+    "outline_due_decision",
+    "outline_work",
     "overlaps",
     "parse_outline_payload",
     "plan_day_for",
     "plan_day_length",
     "plan_day_window",
+    "resolve_anchor_conflicts",
     "resolve_plan_timezone",
     "resolve_zone",
     "rule_outline",
     "run_due_outline",
+    "seam_check",
     "sleep_anchors_for_day",
     "validate_outline",
 ]
