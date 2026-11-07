@@ -384,3 +384,158 @@ def test_recent_two_migrations_downgrade_then_upgrade(
         finally:
             command.upgrade(config, "head")
     assert _current_version(migrated_db.url) == migrated_db.head
+
+
+# --------------------------------------------------------------------------- #
+# e) 0052 长程意向：结构、唯一键与"降一级再升回来"
+# --------------------------------------------------------------------------- #
+
+
+def _columns(url: str, table: str) -> dict[str, tuple[str, str]]:
+    """``column_name -> (data_type, is_nullable)``。"""
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT column_name, data_type, is_nullable "
+            "FROM information_schema.columns "
+            f"WHERE table_schema = 'public' AND table_name = '{table}'",
+        )
+    )
+    return {str(name): (str(data_type), str(nullable)) for name, data_type, nullable in rows}
+
+
+def _constraint_defs(url: str, table: str, contype: str) -> list[str]:
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            f"WHERE conrelid = '{table}'::regclass AND contype = '{contype}'",
+        )
+    )
+    return [str(row[0]) for row in rows]
+
+
+def test_schedule_intentions_schema(migrated_db: MigratedDatabase) -> None:
+    """0052：意向表、段的三个可空列、周期规则表都按设计 §6 落库。"""
+    columns = _columns(migrated_db.url, "schedule_intentions")
+    required = {
+        "id",
+        "actor_id",
+        "target_start_day",
+        "target_end_day",
+        "target_timezone",
+        "kind",
+        "title",
+        "state",
+        "source_kind",
+        "source_ref",
+        "resolution_evidence_ref",
+        "prep_source_ref",
+        "prep_due_day",
+        "priority",
+        "horizon_rev",
+        "visibility",
+        "revision",
+        "created_at",
+        "updated_at",
+    }
+    missing = required - set(columns)
+    assert not missing, f"schedule_intentions 缺少列: {sorted(missing)}"
+    for nullable_col in ("resolution_evidence_ref", "prep_source_ref", "prep_due_day"):
+        assert columns[nullable_col][1] == "YES", f"{nullable_col} 应当可空"
+
+    # 幂等键：来源 + 目标区间（**不**用标题/JSON 做唯一性）
+    unique_defs = _constraint_defs(migrated_db.url, "schedule_intentions", "u")
+    expected = (
+        "UNIQUE (actor_id, source_kind, source_ref, target_start_day, target_end_day)"
+    )
+    assert any(expected in definition for definition in unique_defs), unique_defs
+
+    # 状态/来源/类别都有 CHECK（DB 白名单），服务层再判一次。
+    checks = _constraint_defs(migrated_db.url, "schedule_intentions", "c")
+    joined = "\n".join(checks)
+    for state in ("proposed", "planned", "confirmed", "expired_unknown"):
+        assert state in joined, f"state CHECK 缺少 {state}: {joined}"
+    for source_kind in ("model", "user", "actor", "recurrence"):
+        assert source_kind in joined, f"source_kind CHECK 缺少 {source_kind}"
+    assert "target_end_day >= target_start_day" in joined
+    assert "expired_unknown" in joined
+
+    indexes = asyncio.run(
+        _fetch(
+            migrated_db.url,
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' "
+            "AND indexname = 'ix_schedule_intentions_actor_horizon'",
+        )
+    )
+    assert len(indexes) == 1, indexes
+    assert "actor_id" in str(indexes[0][0])
+    assert "target_start_day" in str(indexes[0][0])
+    assert "state" in str(indexes[0][0])
+
+    # 段的三个长程扩展列必须**可空**（旧段不回填、不猜来源）
+    segment_columns = _columns(migrated_db.url, "schedule_segments")
+    for name in ("intention_id", "preparation_for_day", "visibility"):
+        assert name in segment_columns, f"schedule_segments 缺少列 {name}"
+        assert segment_columns[name][1] == "YES", f"{name} 必须可空（旧段不回填）"
+    segment_fks = _constraint_defs(migrated_db.url, "schedule_segments", "f")
+    assert any(
+        "FOREIGN KEY (intention_id) REFERENCES schedule_intentions(id)" in definition
+        for definition in segment_fks
+    ), segment_fks
+
+    # 周期规则：用户确认 + 精确时段 + 有效期；本批只建表，未启用展开。
+    recurrence = _columns(migrated_db.url, "schedule_recurrence_rules")
+    for name in (
+        "weekday",
+        "start_local_minute",
+        "end_local_minute",
+        "timezone",
+        "effective_start_day",
+        "effective_end_day",
+        "confirmation_source_ref",
+    ):
+        assert name in recurrence, f"schedule_recurrence_rules 缺少列 {name}"
+    recurrence_uniques = _constraint_defs(
+        migrated_db.url, "schedule_recurrence_rules", "u"
+    )
+    assert any(
+        "UNIQUE (actor_id, confirmation_source_ref)" in definition
+        for definition in recurrence_uniques
+    ), recurrence_uniques
+
+
+def test_0052_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
+    """0052 可以单独回滚：新表/新列消失，再升回来结构完整。"""
+    parent = "0051_day_plans_schedule"
+    config = _alembic_config(migrated_db.url)
+    with _database_url_env(migrated_db.url):
+        try:
+            command.downgrade(config, "-1")
+            assert _current_version(migrated_db.url) == parent
+            tables = {
+                str(row[0])
+                for row in asyncio.run(
+                    _fetch(
+                        migrated_db.url,
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public'",
+                    )
+                )
+            }
+            assert "schedule_intentions" not in tables
+            assert "schedule_recurrence_rules" not in tables
+            segment_columns = _columns(migrated_db.url, "schedule_segments")
+            for name in ("intention_id", "preparation_for_day", "visibility"):
+                assert name not in segment_columns
+            # 阶段 1 的表与行必须原样可读（回滚不碰 day_plans/schedule_segments）
+            assert "day_plans" in tables and "schedule_segments" in tables
+        finally:
+            command.upgrade(config, "head")
+
+    assert _current_version(migrated_db.url) == migrated_db.head
+    restored = _columns(migrated_db.url, "schedule_intentions")
+    assert "resolution_evidence_ref" in restored
+    segment_columns = _columns(migrated_db.url, "schedule_segments")
+    assert "intention_id" in segment_columns
