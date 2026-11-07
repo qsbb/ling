@@ -507,12 +507,17 @@ def test_schedule_intentions_schema(migrated_db: MigratedDatabase) -> None:
 
 
 def test_0052_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
-    """0052 可以单独回滚：新表/新列消失，再升回来结构完整。"""
+    """0052 可以单独回滚：新表/新列消失，再升回来结构完整。
+
+    回滚目标**显式写成 revision**，不用 ``-1``：链上每加一个迁移，``-1``
+    指向的就不是 0052 了（0053 落地时这条用例正是因此变红的）。用例要验的
+    是"0052 自己能退"，不是"head 是谁"。
+    """
     parent = "0051_day_plans_schedule"
     config = _alembic_config(migrated_db.url)
     with _database_url_env(migrated_db.url):
         try:
-            command.downgrade(config, "-1")
+            command.downgrade(config, parent)
             assert _current_version(migrated_db.url) == parent
             tables = {
                 str(row[0])
@@ -539,3 +544,95 @@ def test_0052_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
     assert "resolution_evidence_ref" in restored
     segment_columns = _columns(migrated_db.url, "schedule_segments")
     assert "intention_id" in segment_columns
+
+
+# --------------------------------------------------------------------------- #
+# f) 0053 提示词快照：一轮一份、保留期、索引
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_snapshots_schema(migrated_db: MigratedDatabase) -> None:
+    """0053：「查看本次提示词」的表结构，事件顺序语义都靠它兜住。"""
+    columns = _columns(migrated_db.url, "prompt_snapshots")
+    required = {
+        "id",
+        "actor_id",
+        "turn_id",
+        "window_id",
+        "message_id",
+        "created_at",
+        "expires_at",
+        "schema_version",
+        "size_bytes",
+        "truncated",
+        "payload",
+    }
+    missing = required - set(columns)
+    assert not missing, f"prompt_snapshots 缺少列: {sorted(missing)}"
+    # 回复落库**之前**就写快照，所以 message_id 必须可空；
+    # payload 也要可空：到期后正文被清空（行留作"曾经有过"的墓碑）。
+    for nullable_col in ("message_id", "payload"):
+        assert columns[nullable_col][1] == "YES", f"{nullable_col} 应当可空"
+
+    # **一轮一份**：turn_id 唯一。重试覆盖，不按 attempt 追加——
+    # 按 attempt 存会随重试次数膨胀，且同一轮的旧提示词既没人看又多一份泄漏面。
+    unique_defs = _constraint_defs(migrated_db.url, "prompt_snapshots", "u")
+    assert any("UNIQUE (turn_id)" in definition for definition in unique_defs), (
+        unique_defs
+    )
+
+    # 读路径的复合索引 (actor_id, created_at)
+    indexes = asyncio.run(
+        _fetch(
+            migrated_db.url,
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' "
+            "AND indexname = 'ix_prompt_snapshots_actor_created'",
+        )
+    )
+    assert len(indexes) == 1, indexes
+    assert "actor_id" in str(indexes[0][0]) and "created_at" in str(indexes[0][0])
+
+    # 回填后才命中：message_id 也有索引（否则按消息查要全表扫）
+    message_indexes = asyncio.run(
+        _fetch(
+            migrated_db.url,
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' "
+            "AND indexname = 'ix_prompt_snapshots_message'",
+        )
+    )
+    assert len(message_indexes) == 1, message_indexes
+
+    checks = "\n".join(_constraint_defs(migrated_db.url, "prompt_snapshots", "c"))
+    assert "size_bytes >= 0" in checks
+    assert "schema_version >= 1" in checks
+    assert "expires_at > created_at" in checks
+
+
+def test_0053_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
+    """0053 可以单独回滚：只删本表与索引，不碰任何对话数据。"""
+    parent = "0052_schedule_intentions"
+    config = _alembic_config(migrated_db.url)
+    with _database_url_env(migrated_db.url):
+        try:
+            command.downgrade(config, parent)
+            assert _current_version(migrated_db.url) == parent
+            tables = {
+                str(row[0])
+                for row in asyncio.run(
+                    _fetch(
+                        migrated_db.url,
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public'",
+                    )
+                )
+            }
+            assert "prompt_snapshots" not in tables
+            # 回滚快照**不删任何对话数据**：消息、轮次、意向表都原样还在
+            assert {"messages", "turns", "schedule_intentions"} <= tables
+        finally:
+            command.upgrade(config, "head")
+
+    assert _current_version(migrated_db.url) == migrated_db.head
+    assert "payload" in _columns(migrated_db.url, "prompt_snapshots")

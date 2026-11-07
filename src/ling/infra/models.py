@@ -292,6 +292,64 @@ class WindowContext(Base):
     )
 
 
+class PromptSnapshot(Base):
+    """一次回复**实际发给模型**的上下文快照（对话页「查看本次提示词」）。
+
+    为什么要有：她说的每句话都由一大段注入内容决定（人设、记忆、摘要、
+    历史、媒体描述…）。没有快照时，"她为什么这么说"只能靠猜——而所有
+    注入来源都写着"尽力而为"，所以出问题时连"当时到底注入了什么"都拿不到。
+
+    ## 三条硬约束
+
+    1. **一轮一份**：``turn_id`` 唯一。重试（attempt+1）**覆盖**同一行，
+       不按 attempt 追加——否则这张表会随重试次数膨胀，而且同一轮的旧
+       提示词既没人看、又多一份泄漏面。
+    2. **写快照绝不阻塞出话**：捕获点用**独立事务**写入，任何异常只记日志。
+    3. **单条 ≤ ``PROMPT_SNAPSHOT_MAX_BYTES``**（见 ``kernel/turn.py``）：
+       超了就丢中间段、保留 system 与最后 N 条，并置 ``truncated=True``。
+
+    ## 保留期
+
+    ``expires_at`` = 写入时刻 + 7 天。到期后 ``payload`` 由维护任务清空
+    （``size_bytes=0``，行本身作为"这一轮**曾经**有过快照"的墓碑短暂保留），
+    再放一段时间才真删。这样读接口才能把「过期」与「从没存下来」分开——
+    把两者混成一种，等于把"内容按保留期清掉了"报成"从来没有过"。
+
+    ``message_id`` 可空：快照在**回复落库之前**就写了（比消息更早），
+    回复落库后由 ``TurnCoordinator._finalize`` 回填。不加外键：快照的写入
+    与消息生命周期无关，重试删旧消息时也不该因为外键把快照挡住。
+    """
+
+    __tablename__ = "prompt_snapshots"
+    __table_args__ = (
+        UniqueConstraint("turn_id", name="uq_prompt_snapshots_turn"),
+        Index("ix_prompt_snapshots_actor_created", "actor_id", "created_at"),
+        # 读接口按消息反查快照；清理任务扫过期时间。名字必须与
+        # `0053_prompt_snapshots.py` 逐字一致（否则 autogenerate 会把它当成
+        # "该删的索引"，下一个迁移就真删了）。
+        Index("ix_prompt_snapshots_message", "message_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    turn_id: Mapped[str] = mapped_column(String(64))
+    window_id: Mapped[str] = mapped_column(String(64))
+    message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # payload 的**结构**版本（不是契约 v1）。结构变了就升它，老行照原样读，
+    # 读侧按版本决定怎么渲染——不要把老快照读崩。
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 真正要发出去的那份 messages（+ 每条的语义块标签与 token 估算）。
+    # 到期后由维护任务清空正文，只留 model / token_total 这类非内容元数据；
+    # 这里**不存**原始用户输入之外的任何东西（输入本来就在 messages 里）。
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 class HandoffCapsuleRow(Base):
     """同人跨端交接胶囊。默认 30 分钟，仅本人已绑定私聊端。"""
 
@@ -2280,6 +2338,7 @@ __all__ = [
     "MemoryRetrievalLog",
     "MemoryRow",
     "ProactiveOpportunity",
+    "PromptSnapshot",
     "RelationshipEvent",
     "RelationshipState",
     "CoreMemoryRow",
