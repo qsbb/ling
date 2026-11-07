@@ -19,7 +19,7 @@ from ling.domains.memory.self_timeline import (
     dedupe_key_for,
 )
 from ling.infra.db import session_scope
-from ling.infra.models import SelfExperienceRow
+from ling.infra.models import ActivityRow, SelfExperienceRow
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -28,18 +28,32 @@ ACTOR = "actor_ling"
 
 
 async def _completed_activity(
-    env: TestEnv, *, evidence: str = "读完了第二章", record: bool = True
+    env: TestEnv,
+    *,
+    evidence: str = "读完了第二章",
+    record: bool = True,
+    origin: str = "simulated",
+    evidence_kind: str | None = None,
 ) -> str:
     """造一个已完成的活动；``record=True`` 时按生产链路派生经历。
 
     生产里由 `self.timeline` handler 的 backfill 完成派生，
     所以涉及"读时间线"的测试必须先派生——只完成活动是不会有经历的。
+
+    ``origin`` 默认 ``simulated``（模拟生活），但**默认证据种类仍是
+    ``observed``**：这是"真的读完了第二章"这种有观测支撑的情形，
+    属于事实侧；纯时钟证据（``clock_only``）由 ``test_clock_only_*`` 单独覆盖。
     """
     async with session_scope() as session:
         svc = ActivityService(session, actor_id=ACTOR)
-        act = await svc.propose(kind="reading")
+        act = await svc.propose(kind="reading", origin=origin)
         await svc.transition(act.activity_id, "running")
-        await svc.transition(act.activity_id, "completed", completion_evidence=evidence)
+        await svc.transition(
+            act.activity_id,
+            "completed",
+            completion_evidence=evidence,
+            evidence_kind=evidence_kind or "observed",
+        )
     if record:
         async with session_scope() as session:
             await SelfTimelineService(session, actor_id=ACTOR).record_completed_activity(
@@ -222,10 +236,11 @@ async def test_nothing_injected_when_no_experience(logged_in: TestEnv) -> None:
     assert "self_timeline" not in view.sources()
 
 async def test_plan_window_end_completes_activity(logged_in: TestEnv) -> None:
-    """计划窗口结束后，模拟活动必须能收尾并派生经历。
+    """计划窗口结束后，模拟活动必须能收尾；但收尾证据是 **clock_only**。
 
-    真实缺口：`life.tick` 原来只会"暂停"，活动永远不会 completed，
-    自我时间线就永远是空的——功能写了但永远没数据。
+    真实缺口：`life.tick` 原来只会"暂停"，活动永远不会 completed。
+    P0.5：这条路径写下的证据只说明"计划时段到了"——它**不是**事实，
+    所以收尾之后不许派生自我经历（旧断言 `created >= 1` 正是被堵掉的假事实）。
     """
     from datetime import UTC, datetime, timedelta
 
@@ -269,6 +284,22 @@ async def test_plan_window_end_completes_activity(logged_in: TestEnv) -> None:
         current = await ActivityService(session, actor_id=ACTOR).current()
     assert current is None or current.state != "running", "窗口结束后活动仍在运行"
 
+    # 证据种类必须是 clock_only：从计划时段结束推导出的完成不是真实经历。
+    from ling.domains.evidence import activity_evidence_kind, is_fact_eligible
+
+    async with session_scope() as session:
+        completed = list(
+            (
+                await session.execute(
+                    select(ActivityRow).where(ActivityRow.state == "completed")
+                )
+            ).scalars()
+        )
+        assert completed, "窗口结束后活动没有收尾"
+        kinds = {activity_evidence_kind(row).value for row in completed}
+        assert kinds == {"clock_only"}, kinds
+        assert not any(is_fact_eligible(row) for row in completed)
+
     async with session_scope() as session:
         created = await SelfTimelineService(session, actor_id=ACTOR).backfill()
-    assert created >= 1, "活动收尾后没有派生自我经历"
+    assert created == 0, "clock_only 的收尾证据被 backfill 补成了自我经历"

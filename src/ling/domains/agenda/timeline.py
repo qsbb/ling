@@ -29,11 +29,24 @@ D 的 ``[00:00,08:00)`` 由 D 自己的计划直接产出，**不再**继承 D�
 - 睡眠与 confirmed 承诺是**不可移动锚点**，模型段不得压上去；
 - 段从不物理删除：改版时旧段置 ``superseded`` 并记 ``revision_ended``。
 
-## 阶段 1 的边界
+## 阶段 1.5 做了哪些
 
-只做「日界 + 大纲 + 幂等/预算/兜底」，**不做**近窗细化、提议重排、梦、跨夜情绪
-结算。本模块没有 worker 定时接线，唯一的调度入口是 :func:`run_due_outline`，
-测试里直接调它。
+- 接缝校验 :func:`seam_check`：D 00:00（或恢复后首次检查）**零模型**复核
+  D−1 晚上新入库的已确认锚点、以及两日睡眠边界；冲突的可选段置
+  ``superseded`` 并留原因码，不重生成。
+- 新确认锚点落地 :func:`on_new_confirmed_anchor`：即时复核同一计划日，
+  只登记"需要局部重排"的待办；真正的模型局部重排属阶段 3。
+- catch-up 三档 :func:`outline_due_decision` / :func:`outline_work`：
+  D−1 21:00 到期（``due``）→ 醒前补跑（``catchup``）→ 到时仍无 ready
+  则 ``degraded_late``（只补确定性锚点，不再调模型）。
+- 锚点裁剪与冲突 :func:`resolve_anchor_conflicts`：保护窗裁到 D 内、
+  同级硬约定冲突都保留、承诺与预计睡眠冲突时保留承诺并标原因码。
+- 人设投影 :func:`build_persona_projection`：确定性结构化、受众过滤、
+  **≤400 输入 token**（粗略估算，见 ``token_estimate.method``）。
+
+调度接线在 ``worker.py`` 的 ``life.schedule``（只查 DB 到期边界）+
+``life.outline`` / ``life.seam`` 两个 outbox handler。本模块只提供可调用入口，
+没有定时器/循环。
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.evidence import fact_eligible_experiences
 from ling.infra.models import (
     ActorRoutineRow,
     AgendaPlanRow,
@@ -122,11 +136,56 @@ FLEXIBILITIES: tuple[str, ...] = ("fixed", "flexible")
 SLEEP_ANCHOR = "sleep"
 COMMITMENT_ANCHOR = "commitment"
 # 承诺只有"到期时刻"，没有时长。锚点用 [due, due+60) 作为**保护窗**，
-# 不是"她答应做一小时"——库里没有那个事实，不能编。
+# 不是"她答应做一小时"——库里没有那个事实，不能编。保护窗会被裁到计划日窗口内
+# （否则 D−1 23:30 的承诺会伸进 D 的凌晨，成为跨午夜声明）。
 COMMITMENT_PROTECTIVE_MINUTES = 60
 
-# 同一计划日最多追一次（catch-up）：离休息不足这个余量时只写规则睡眠锚点。
+# 最小修复（P0.5）：阶段 1.5 改版时这条常量被删掉，但 `run_due_outline` 里
+# 仍在引用（`__all__` 也还导出它），于是 `NameError` 让
+# `tests/integration/test_schedule_outline.py` 的显式目标日用例直接红。
+# 值沿用改版前的 40 分钟；**本文件其余逻辑不动**，catch-up 三档判据的重写
+# 归下一步（`outline_due_decision` / `outline_work`）。
 CATCH_UP_MIN_MINUTES_BEFORE_REST = 40
+
+# 睡眠保护下限（分钟）。设计 §4 的工程初值 420 = 7 小时：低于它只标
+# ``needs_review``，**不**因此取消已确认承诺，也不擅自改作息。
+# `LifePolicy` 里目前没有这一项（那里是生活节奏，不是作息），阶段 1.5
+# 先作为 agenda 域常量；要做成可配置项时再显式加进 `LifePolicy`。
+MIN_SLEEP_MINUTES = 420
+
+# 原因码（设计 §6：`degraded_late` / `needs_review` 是**原因码**，不是新的
+# `day_plans.state` 枚举）。落点只有两处，避免加列/加表：
+#   - `schedule_segments.source_event_ids`：`reason:<code>` 与来源 id；
+#   - `day_plans.last_error_code`：只放"最近一次失败/降级/待复核"的单个码。
+REASON_NEEDS_REVIEW = "needs_review"
+REASON_ROUTINE_CONFLICT = "routine_conflict"
+REASON_MIDNIGHT_BOUNDARY = "midnight_boundary"
+REASON_SLEEP_BOUNDARY = "sleep_boundary_conflict"
+REASON_DEGRADED_LATE = "degraded_late"
+REASON_MODEL_UNAVAILABLE = "model_unavailable"
+REASON_OUTLINE_INVALID = "outline_invalid"
+REASON_BUDGET_EXHAUSTED = "budget_exhausted"
+
+# catch-up 何时还值得再试一次（设计 §3「catch-up」）：
+#   - 可恢复：模型暂不可用/超时/报错 —— 醒前可退避补试；
+#   - 终态：非法输出已用满两次预算、预算耗尽、到醒点后的 degraded_late。
+# 不在终态里反复调模型（那是白烧钱，也会让"今天没安排"永远不稳定）。
+RETRYABLE_REASON_CODES: frozenset[str] = frozenset(
+    {REASON_MODEL_UNAVAILABLE, "model_timeout", "model_error"}
+)
+FINAL_REASON_CODES: frozenset[str] = frozenset(
+    {REASON_OUTLINE_INVALID, REASON_BUDGET_EXHAUSTED, REASON_DEGRADED_LATE}
+)
+
+REASON_TAG_PREFIX = "reason:"
+# "需要局部重排"的待办标记。阶段 1.5 只留标记（不加表）：真正的模型局部
+# 重排属阶段 3，谁在阶段 3 接上就从这些标记 + `ReplanTodo` 里取范围。
+REPLAN_TODO_TAG = "todo:replan"
+
+# 大纲相位（纯计算，worker 的 `life.schedule` 与 `run_due_outline` 共用）。
+PHASE_DUE = "due"  # D−1 21:00 之后的正常到期
+PHASE_CATCHUP = "catchup"  # 错过 21:00，但还没到 D 的醒点
+PHASE_LATE = "late"  # 已到/过了 D 的醒点：只补确定性锚点，不再调模型
 
 # 一段经历/一条承诺进 prompt 的上限：prompt 有硬上限，宁可少给。
 MAX_EXPERIENCE_SUMMARIES = 5
@@ -277,6 +336,11 @@ class Anchor:
     ``protective`` 说明这个区间是**保护窗**还是真实时长：
     - 睡眠来自作息，区间就是作息窗；
     - 承诺只有到期时刻，区间是 ``[due, due+60)`` 的保护窗，不代表"她要花一小时"。
+
+    ``source_id`` 是**可追溯的来源 id**（``commitment:<id>`` /
+    ``agenda_plan:<id>``），``reason_codes`` 是这条锚点自带的冲突原因码
+    （``routine_conflict`` / ``needs_review``）：同级硬约定冲突时两边都留、
+    两边都带码，由时间轴显示，**不让模型选一个赢家**。
     """
 
     kind: str  # sleep | commitment
@@ -284,14 +348,57 @@ class Anchor:
     end_at: datetime
     title: str
     protective: bool = False
+    source_id: str = ""
+    reason_codes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": self.kind,
             "title": self.title,
             "start_at": self.start_at.isoformat(),
             "end_at": self.end_at.isoformat(),
         }
+        if self.reason_codes:
+            payload["conflict"] = list(self.reason_codes)
+        return payload
+
+
+@dataclass(frozen=True)
+class AnchorConflict:
+    """一处被**代码**判定（而非模型挑选）的锚点冲突。"""
+
+    reason_code: str
+    anchor_ids: tuple[str, ...]
+    detail: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "reason_code": self.reason_code,
+            "anchors": list(self.anchor_ids),
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class AnchorPlan:
+    """一版锚点集合：裁剪后的睡眠 + 全部硬约定，以及它们的冲突清单。"""
+
+    anchors: list[Anchor]
+    conflicts: list[AnchorConflict]
+    sleep_minutes: int
+    sleep_minutes_before_trim: int
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        codes: list[str] = []
+        for item in self.conflicts:
+            if item.reason_code not in codes:
+                codes.append(item.reason_code)
+        return tuple(codes)
+
+    @property
+    def needs_review(self) -> bool:
+        return REASON_NEEDS_REVIEW in self.reason_codes
 
 
 def sleep_anchors_for_day(
@@ -661,23 +768,33 @@ async def _persona_summary(session: AsyncSession, persona_id: str) -> dict[str, 
 async def _experience_summary(
     session: AsyncSession, *, actor_id: str, now: datetime
 ) -> list[str]:
-    """已证实经历的粗摘要（只取有证据的 ``self_experiences``）。
+    """已证实经历的粗摘要（只取**事实级**的 ``self_experiences``）。
 
     没有证据就没有经历——计划、打算、梦都不能出现在这里。
+    P0.5：只有"证据存在"也还不够。``clock_only``（典型：模拟活动的计划时段结束）
+    不是事实，必须挡在 prompt 之外。判定走
+    :func:`ling.domains.evidence.fact_eligible_experiences`——与自我时间线、
+    控制台事实层、梦境候选同一把闸，并且会回查来源活动的证据种类。
     """
     since = now - timedelta(hours=EXPERIENCE_LOOKBACK_HOURS)
-    rows = (
-        await session.execute(
-            select(SelfExperienceRow.summary)
-            .where(
-                SelfExperienceRow.actor_id == actor_id,
-                SelfExperienceRow.occurred_at >= since,
+    rows = list(
+        (
+            await session.execute(
+                select(SelfExperienceRow)
+                .where(
+                    SelfExperienceRow.actor_id == actor_id,
+                    SelfExperienceRow.occurred_at >= since,
+                )
+                .order_by(SelfExperienceRow.occurred_at.desc())
+                # 多取一些：被读侧排除的行（历史 clock_only）不能占满摘要配额。
+                .limit(MAX_EXPERIENCE_SUMMARIES * 4)
             )
-            .order_by(SelfExperienceRow.occurred_at.desc())
-            .limit(MAX_EXPERIENCE_SUMMARIES)
-        )
-    ).scalars()
-    return [_short(str(item), 120) for item in rows]
+        ).scalars()
+    )
+    eligible = await fact_eligible_experiences(
+        session, rows, limit=MAX_EXPERIENCE_SUMMARIES
+    )
+    return [_short(str(item.summary), 120) for item in eligible]
 
 
 async def _presence_snapshot(session: AsyncSession, actor_id: str) -> dict[str, int] | None:
