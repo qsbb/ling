@@ -1,0 +1,82 @@
+{
+  "$id": "https://ling.local/contracts/v1/PromptSnapshotItem.schema.json",
+  "additionalProperties": false,
+  "description": "快照里的一条消息。``index`` 是它在**真实 messages 数组**里的下标。\n\n截断后下标会跳号——这是**故意的**：跳号说明中间被丢掉了，\n而不是\"她当时只看到这些\"。",
+  "properties": {
+    "at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "At"
+    },
+    "content": {
+      "title": "Content",
+      "type": "string"
+    },
+    "index": {
+      "minimum": 0,
+      "title": "Index",
+      "type": "integer"
+    },
+    "lane": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Lane"
+    },
+    "role": {
+      "title": "Role",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sender": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sender"
+    },
+    "tokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Tokens",
+      "type": "integer"
+    },
+    "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "index",
+    "role",
+    "content"
+  ],
+  "title": "PromptSnapshotItem",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

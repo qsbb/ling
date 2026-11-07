@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, TurnState, new_id
@@ -29,13 +33,16 @@ from ling.domains.media.video import (
     strip_watch_markers,
 )
 from ling.infra.db import session_scope
-from ling.infra.models import ActorEvent, ActorState, OutboxEvent, utcnow
+from ling.infra.models import ActorEvent, ActorState, OutboxEvent, PromptSnapshot, utcnow
 from ling.kernel.arbiter import SpeakerArbiter
-from ling.kernel.context import ContextCompiler
+from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.stream_log import StreamLog
 from ling.models.router import ModelRouter
 from ling.ports.config import EffectiveConfig
 from ling.ports.model import ModelError, ModelErrorKind
+
+if TYPE_CHECKING:
+    from ling.kernel.context import CompiledContext, CompiledMessage
 
 # 排队等待参数：等不到就放弃对外流式（内容仍落库，前端能看到最终消息）
 # 排队最长等待：8 秒（32 × 0.25）。超过就放弃对外流式，
@@ -49,6 +56,327 @@ ARBITER_WAIT_SECONDS = 0.25
 FORCE_CANCEL_AFTER_SECONDS = 3.0
 # 单条消息的文本上限（Web 很大；QQ/微信接入后按渠道能力下调）
 MAX_TEXT_PER_MESSAGE = 4096
+
+# ---------------------------------------------------------------- 提示词快照
+#
+# 「查看本次提示词」：把**这一轮真正发给模型的 messages** 存一份只读快照。
+#
+# 三条硬约束（每一条都对应一个真实故障模式）：
+# 1. **写快照绝不阻塞出话**：任何异常只记日志（带 reason_code）并继续。
+#    快照是审计旁路，不是对话事实；它失败不该让用户等不到回复。
+# 2. **单条 ≤256KB**：超了就丢中间段（保留 system 与最后 N 条）并置
+#    `truncated`。不设上限的话，一个粘贴长文的窗口就能把行写到几 MB。
+# 3. **一轮一份**：`turn_id` 唯一，重试覆盖（不是每 attempt 一条）。
+PROMPT_SNAPSHOT_SCHEMA_VERSION = 1
+PROMPT_SNAPSHOT_MAX_BYTES = 256 * 1024
+# 保留期：7 天。到期后维护任务先清正文、再删墓碑。
+PROMPT_SNAPSHOT_RETENTION_DAYS = 7
+# 墓碑（正文已清空、只剩"这一轮曾经有过快照"）再保留 7 天。
+#
+# 为什么要墓碑：读接口必须把「过期」与「从没存下来」分开。到期直接删行的话，
+# 前端只能把"内容按保留期清掉了"显示成"从来没存过"——那是在报假错。
+# 墓碑本身只有几十字节，不会撑表。
+PROMPT_SNAPSHOT_TOMBSTONE_DAYS = 7
+# 截断时单条正文至少留这么多字符；再小就失去可读性，不如整条丢掉。
+_PROMPT_SNAPSHOT_MIN_CONTENT_CHARS = 200
+_PROMPT_SNAPSHOT_TRUNCATION_MARK = "…（快照超上限，已截断）"
+
+
+def _snapshot_json(value: object) -> str:
+    """稳定序列化：紧凑分隔符 + 不转义中文（体积与可读性都按真实字符算）。"""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _snapshot_size(value: object) -> int:
+    return len(_snapshot_json(value).encode("utf-8"))
+
+
+def _snapshot_entry(item: CompiledMessage, index: int) -> dict[str, object]:
+    """一条消息 → 快照里的一项（含语义块标签与 token 估算）。"""
+    return {
+        "index": index,
+        "role": item.role,
+        "key": item.key,
+        "lane": item.lane,
+        "tokens": estimate_tokens(item.content),
+        "content": item.content,
+        "sender": item.sender,
+        "at": item.at.isoformat() if item.at is not None else None,
+        "truncated": False,
+    }
+
+
+def build_prompt_snapshot_payload(
+    annotated: list[CompiledMessage],
+    *,
+    model: dict[str, object] | None = None,
+    captured_at: object | None = None,
+) -> tuple[dict[str, object], bool]:
+    """把**真正要发出去的那份 messages** 装成快照 payload。
+
+    返回值是 ``(payload, truncated)``。``messages`` 必须与 provider 收到的同源
+    （调用方直接传编译结果，不要重建一份），否则"她看到的"和"我们记的"会是
+    两份各自拼出来的近似物。
+
+    超 ``PROMPT_SNAPSHOT_MAX_BYTES`` 时的截断顺序：
+
+    1. 先保留**所有非历史段**（人设/规则/记忆/摘要/媒体…）与**最后 N 条历史**
+       ——"她当时是谁、记得什么"比"更早那些对话"重要得多；
+    2. 仍超（少见：某一段自己就巨大）→ 从最长的那条正文开始砍半，逐轮直到
+       装得下，并给它打上 ``truncated``；
+    3. 无论走哪条路，``truncated=True`` 且 ``dropped_items`` 如实记丢了几条。
+    """
+    entries = [_snapshot_entry(item, index) for index, item in enumerate(annotated)]
+    token_total = sum(int(entry["tokens"]) for entry in entries)
+    payload: dict[str, object] = {
+        "schema_version": PROMPT_SNAPSHOT_SCHEMA_VERSION,
+        "captured_at": (
+            captured_at.isoformat() if captured_at is not None else utcnow().isoformat()
+        ),
+        "model": model or {},
+        # 这是**这一轮实际发出去**的总量（含后面因超限没存进快照的条目），
+        # 所以它不等于 sections 里 tokens 的加总——两者刻意不同，别互相校对。
+        "token_total": token_total,
+        "truncated": False,
+        "dropped_items": 0,
+        "messages": entries,
+    }
+    if _snapshot_size(payload) <= PROMPT_SNAPSHOT_MAX_BYTES:
+        return payload, False
+
+    # 1) 非历史段全留，历史段二分"还能留最后多少条"。
+    locked = [e for e in entries if e["key"] != "history"]
+    history = [e for e in entries if e["key"] == "history"]
+
+    def _probe(keep_history: int) -> tuple[list[dict[str, object]], int]:
+        keep = {id(e) for e in locked}
+        if keep_history:
+            keep |= {id(e) for e in history[len(history) - keep_history :]}
+        kept = [e for e in entries if id(e) in keep]
+        candidate = {**payload, "truncated": True, "messages": kept}
+        return kept, _snapshot_size(candidate)
+
+    best_kept: list[dict[str, object]] = locked
+    lo, hi = 0, len(history)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        kept, size = _probe(mid)
+        if size <= PROMPT_SNAPSHOT_MAX_BYTES:
+            best_kept, lo = kept, mid + 1
+        else:
+            hi = mid - 1
+
+    # 2) 锁定段自己就超：从最长的正文砍半（保留头部，标出截断）。
+    while _snapshot_size({**payload, "truncated": True, "messages": best_kept}) > (
+        PROMPT_SNAPSHOT_MAX_BYTES
+    ):
+        target = max(best_kept, key=lambda e: len(str(e["content"])), default=None)
+        if target is None:
+            break
+        text = str(target["content"])
+        if len(text) <= _PROMPT_SNAPSHOT_MIN_CONTENT_CHARS:
+            # 已经没有可读的余量了：丢掉最短的那条（保留顺序），如实记数。
+            if len(best_kept) <= 1:
+                break
+            shortest = min(best_kept, key=lambda e: len(str(e["content"])))
+            best_kept = [e for e in best_kept if e is not shortest]
+            continue
+        cut = max(_PROMPT_SNAPSHOT_MIN_CONTENT_CHARS, len(text) // 2)
+        target["content"] = text[:cut] + _PROMPT_SNAPSHOT_TRUNCATION_MARK
+        target["truncated"] = True
+        target["tokens"] = estimate_tokens(str(target["content"]))
+
+    payload["messages"] = best_kept
+    payload["truncated"] = True
+    payload["dropped_items"] = len(entries) - len(best_kept)
+    return payload, True
+
+
+def _snapshot_model_info(
+    config: EffectiveConfig, profile: str
+) -> dict[str, object]:
+    """记录"这一轮打算跑在哪个模型上"（拿不到就记空）。
+
+    用 ``resolve_profile`` 而不是自己读绑定：全系统只有一份解析规则，
+    快照里写一套、路由里跑另一套的话，这份快照会解释错原因。
+    """
+    info: dict[str, object] = {"profile": profile, "config_revision": config.revision}
+    try:
+        resolved = config.resolve_profile(profile)
+    except Exception:  # noqa: BLE001 - 记不下来不该影响快照本身
+        return info
+    info["provider_id"] = getattr(resolved, "provider_id", None)
+    info["model_id"] = getattr(resolved, "model_id", None)
+    info["source"] = getattr(getattr(resolved, "source", None), "value", None)
+    return info
+
+
+async def save_prompt_snapshot(
+    *,
+    actor_id: str,
+    turn_id: str,
+    window_id: str,
+    payload: dict[str, object],
+    truncated: bool,
+    retention_days: int = PROMPT_SNAPSHOT_RETENTION_DAYS,
+) -> bool:
+    """写入/覆盖这一轮的快照（**独立事务**，best-effort）。
+
+    ## 为什么必须是独立事务
+
+    捕获点跑在轮次事务**里面**。用同一个会话写快照有两个真实风险：
+
+    1. 写失败会把整轮事务带脏（PostgreSQL 里一条失败的语句之后所有语句都报
+       ``current transaction is aborted``）——用户等不到回复；
+    2. 轮次事务回滚时快照一起消失，可"模型确实已经被喂了这段内容"。
+
+    独立事务解决两者：快照一旦写成功就是独立的观测记录。代价是它可能记下
+    "发了但整轮失败了"的上下文——那正是事实（模型确实看到了）。
+
+    返回 ``True`` 表示已写入，``False`` 表示失败（调用方只记日志，不抛）。
+    """
+    size_bytes = _snapshot_size(payload)
+    now = utcnow()
+    expires_at = now + timedelta(days=retention_days)
+
+    async def _insert() -> None:
+        async with session_scope() as session:
+            session.add(
+                PromptSnapshot(
+                    id=new_id("psnap"),
+                    actor_id=actor_id,
+                    turn_id=turn_id,
+                    window_id=window_id,
+                    message_id=None,
+                    created_at=now,
+                    expires_at=expires_at,
+                    schema_version=PROMPT_SNAPSHOT_SCHEMA_VERSION,
+                    size_bytes=size_bytes,
+                    truncated=truncated,
+                    payload=payload,
+                )
+            )
+
+    async def _overwrite() -> None:
+        async with session_scope() as session:
+            await session.execute(
+                update(PromptSnapshot)
+                .where(PromptSnapshot.turn_id == turn_id)
+                .values(
+                    window_id=window_id,
+                    # 这一轮新的回复还没落库：旧的 message_id 指向上一 attempt
+                    # 的消息（可能已被 retry 删掉），必须先清空。
+                    message_id=None,
+                    created_at=now,
+                    expires_at=expires_at,
+                    schema_version=PROMPT_SNAPSHOT_SCHEMA_VERSION,
+                    size_bytes=size_bytes,
+                    truncated=truncated,
+                    payload=payload,
+                )
+            )
+
+    try:
+        existing = None
+        async with session_scope() as session:
+            existing = (
+                await session.execute(
+                    select(PromptSnapshot.id).where(
+                        PromptSnapshot.turn_id == turn_id
+                    )
+                )
+            ).scalar_one_or_none()
+        if existing is None:
+            await _insert()
+        else:
+            await _overwrite()
+        return True
+    except IntegrityError:
+        # 同一轮的两个 attempt 同时写（「停止 → 立即重试」时真的会同时跑）：
+        # 唯一约束挡住了后到的那份。改成覆盖——后写的那份才是这一轮真正
+        # 要发给模型的内容。
+        try:
+            await _overwrite()
+            return True
+        except Exception as exc:  # noqa: BLE001 - 快照失败不影响本轮
+            logger.warning(
+                "提示词快照写入失败（不影响本轮回复） turn=%s reason_code=%s detail=%s",
+                turn_id,
+                "prompt_snapshot_write_conflict",
+                f"{type(exc).__name__}: {exc}"[:200],
+            )
+            return False
+    except Exception as exc:  # noqa: BLE001 - 快照失败不影响本轮
+        logger.warning(
+            "提示词快照写入失败（不影响本轮回复） turn=%s reason_code=%s detail=%s",
+            turn_id,
+            "prompt_snapshot_write_failed",
+            f"{type(exc).__name__}: {exc}"[:200],
+        )
+        return False
+
+
+async def purge_expired_prompt_snapshots(
+    session: AsyncSession,
+    *,
+    tombstone_days: int = PROMPT_SNAPSHOT_TOMBSTONE_DAYS,
+) -> dict[str, int]:
+    """清理过期快照：**先清正文，再删墓碑**（维护任务调用）。
+
+    为什么不是到期直接删行：读接口要能说清"这一轮**曾经**有过快照，只是
+    过了保留期"（``expired``）与"从来没存下来"（``unavailable``）。删了行
+    就再也分不开，前端只能把"内容按保留期清掉了"报成"从来没存过"。
+
+    两段：
+
+    1. 已过期且还有正文 → 只保留**非内容**元数据（model / token_total），
+       ``size_bytes`` 归零。读接口据此仍报 ``expired``（不返回 sections）。
+    2. 墓碑再放 ``tombstone_days`` 天 → 真删。
+
+    幂等：两段都是条件 UPDATE/DELETE，重复跑就是 0 行；多副本并发也安全。
+    """
+    now = utcnow()
+    deleted = 0
+    scrubbed = 0
+
+    result = await session.execute(
+        PromptSnapshot.__table__.delete().where(
+            PromptSnapshot.expires_at <= now - timedelta(days=tombstone_days)
+        )
+    )
+    deleted = int(getattr(result, "rowcount", 0) or 0)
+
+    rows = list(
+        (
+            await session.execute(
+                select(PromptSnapshot).where(
+                    PromptSnapshot.expires_at <= now,
+                    PromptSnapshot.size_bytes > 0,
+                )
+            )
+        ).scalars()
+    )
+    for row in rows:
+        meta = row.payload if isinstance(row.payload, dict) else {}
+        row.payload = {
+            "schema_version": int(row.schema_version or PROMPT_SNAPSHOT_SCHEMA_VERSION),
+            "model": meta.get("model") or {},
+            "token_total": int(meta.get("token_total") or 0),
+            "scrubbed": True,
+            "messages": [],
+        }
+        row.size_bytes = 0
+        row.truncated = False
+        scrubbed += 1
+    if rows:
+        await session.flush()
+
+    if scrubbed or deleted:
+        logger.info(
+            "提示词快照清理：清空正文 %d 条，删除过期墓碑 %d 条", scrubbed, deleted
+        )
+    return {"scrubbed": scrubbed, "deleted": deleted}
+
 
 
 @dataclass
@@ -493,6 +821,20 @@ class TurnCoordinator:
                 # 说明书再看到它消失。
                 stream_hold = ""
 
+                # 「查看本次提示词」：在**调模型之前**把真正要发出去的那份
+                # messages 存一份快照（独立事务、best-effort）。
+                #
+                # 位置刻意在权限硬门与停止检查**之后**：被拦下/被停止的轮次
+                # 根本没有调用模型，也就不该留下"她看到过这段"的记录。
+                await self._capture_prompt_snapshot(
+                    window_id=window_id,
+                    turn_id=turn_id,
+                    compiled=compiled,
+                    messages=messages,
+                    config=config,
+                    profile=profile,
+                )
+
                 def _visible(delta: str) -> str:
                     nonlocal stream_hold
                     stream_hold += delta
@@ -751,6 +1093,90 @@ class TurnCoordinator:
             await self._clear_stop_marker(turn_id, attempt)
             await queue.put(None)
 
+    async def _capture_prompt_snapshot(
+        self,
+        *,
+        window_id: str,
+        turn_id: str,
+        compiled: CompiledContext,
+        messages: list[object],
+        config: EffectiveConfig,
+        profile: str,
+    ) -> None:
+        """存一份"这次回复看到的上下文"（best-effort，**绝不阻塞出话**）。
+
+        任何异常都只记日志（带 ``reason_code``）并继续：快照是审计旁路，
+        不是对话事实。它失败时读接口会如实报 ``unavailable``——"没存下来"
+        与"存了但过期"是两件事，不能混。
+
+        保存的是 ``compiled.annotated``（与 ``messages`` 同一份数据 + 语义块
+        标签），长度对不上时退回 ``messages`` 本身并标成 ``other``：**宁可丢掉
+        块标签，也不能把没发出去的东西记成她看到的**。
+        """
+        try:
+            annotated = list(getattr(compiled, "annotated", None) or [])
+            if len(annotated) != len(messages):
+                from ling.kernel.context import CompiledMessage
+
+                logger.info(
+                    "提示词快照的来源与标注不一致，退回未标注版本 turn=%s "
+                    "reason_code=prompt_snapshot_source_mismatch annotated=%d sent=%d",
+                    turn_id,
+                    len(annotated),
+                    len(messages),
+                )
+                annotated = [
+                    CompiledMessage(
+                        role=str(getattr(m, "role", "") or ""),
+                        content=str(getattr(m, "content", "") or ""),
+                        key="other",
+                        lane="other",
+                    )
+                    for m in messages
+                ]
+            payload, truncated = build_prompt_snapshot_payload(
+                annotated, model=_snapshot_model_info(config, profile)
+            )
+            await save_prompt_snapshot(
+                actor_id=self._actor_id,
+                turn_id=turn_id,
+                window_id=window_id,
+                payload=payload,
+                truncated=truncated,
+            )
+        except Exception as exc:  # noqa: BLE001 - 快照失败绝不影响回复
+            logger.warning(
+                "提示词快照捕获失败（本轮照常回复） turn=%s reason_code=%s detail=%s",
+                turn_id,
+                "prompt_snapshot_capture_failed",
+                f"{type(exc).__name__}: {exc}"[:200],
+            )
+
+    async def _bind_snapshot_message(
+        self, conversation: ConversationService, *, turn_id: str, message_id: str
+    ) -> None:
+        """回复落库后把快照指到这条消息（同一事务，best-effort）。
+
+        用 SAVEPOINT 而不是裸 UPDATE：这是**旁路**写入，它失败绝不能把
+        这一轮的事务带脏（PostgreSQL 里一条失败的语句之后所有语句都会报
+        ``current transaction is aborted``）——那会让"回复已经生成好了"
+        变成"整轮失败"。
+        """
+        try:
+            async with conversation.session.begin_nested():
+                await conversation.session.execute(
+                    update(PromptSnapshot)
+                    .where(PromptSnapshot.turn_id == turn_id)
+                    .values(message_id=message_id)
+                )
+        except Exception as exc:  # noqa: BLE001 - 回填失败只少一个入口
+            logger.info(
+                "提示词快照回填 message_id 失败（不影响回复） turn=%s "
+                "reason_code=prompt_snapshot_bind_failed detail=%s",
+                turn_id,
+                f"{type(exc).__name__}: {exc}"[:200],
+            )
+
     async def _clear_stop_marker(self, turn_id: str, attempt: int) -> None:
         """终结后清理本 attempt 的跨实例停止标记（尽力而为）。
 
@@ -993,6 +1419,13 @@ class TurnCoordinator:
             error_detail=error.message if error else None,
             model_label=target_label,
         )
+        # 回复已经落库 → 把提示词快照指到**这条**消息，前端才能从消息点开。
+        # 停止但没正文那一轮也回填：那时消息正文是空的，"她为什么什么都没说"
+        # 恰恰只有快照能解释（被注入的内容里可能就有原因）。
+        if actor_message is not None:
+            await self._bind_snapshot_message(
+                conversation, turn_id=turn_id, message_id=actor_message.message_id
+            )
         # **按实际结果校正**用户消息的处置结果。
         # 它是在消息创建时按"她的决定"写的（决定回 → replied），但决定回
         # 不等于真的回了——用户可能在生成到一半按了停止，那时一个字都没发。

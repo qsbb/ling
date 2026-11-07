@@ -8,14 +8,14 @@ W1/W2 会往 outbox 加 topic；本模块按 topic 注册 handler，未注册的
 
 - `PERIODIC_JOBS`：进程内定时（`life.schedule` 每 60 秒扫 DB 到期边界）；
 - `OUTBOX_TOPICS`：事件驱动（`schedule.outline` / `schedule.seam` /
-  `dream.generate` / `sleep.settle` 都由扫描在到期时投递）；
+  `schedule.refine` / `dream.generate` / `sleep.settle` 都由扫描在到期时投递）；
 - `LEGACY_MANUAL_TOPICS`：**有意**只保留手工触发（`life.plan`：新时间轴
   接管后不再自动生成，见 `handle_life_plan` 的说明）。
 
 ## outbox 的事务边界
 
 认领、执行、确认是三段：认领与确认各是一个短事务，**handler 在事务外跑**。
-模型调用（大纲/梦）因此不会把 `outbox_events` 的行锁和连接一起占住。
+模型调用（大纲/细化/梦）因此不会把 `outbox_events` 的行锁和连接一起占住。
 详见"outbox 事务边界"一节。
 """
 
@@ -797,9 +797,13 @@ async def handle_session_purge(payload: dict) -> None:
     幂等、可多副本并发：`DELETE ... WHERE expires_at <= now` 后跑的那次删 0 行。
     """
     from ling.domains.identity.service import IdentityService
+    from ling.kernel.turn import purge_expired_prompt_snapshots
 
     async with session_scope() as session:
         removed = await IdentityService(session).purge_expired_sessions()
+        # 提示词快照的保留期清理（7 天清正文、再 7 天删墓碑）跟同一个
+        # 小时级维护入口走：都是"删过期行"，不必各起一个定时器。
+        await purge_expired_prompt_snapshots(session)
     if removed:
         logger.info("已清理过期登录会话 %d 条", removed)
 
@@ -1981,6 +1985,157 @@ async def handle_life_plan(payload: dict) -> None:
             },
         )
 
+# ---------------------------------------------------------------- 新时间轴的段边界（阶段 2）
+#
+# 设计 §3：`life.tick` 只在到期边界或事件有动作。**新时间轴（`day_plans`）**的
+# 边界由段决定，不再用"旧 agenda_plans 的计划时段已结束"当时钟证据：
+# 计划结束只允许 `paused` / `cancelled` + `needs_review` 原因码，
+# **绝不**自动 `completed`（完成必须有 observed / user_confirmed 证据）。
+#
+# 旧 clock-only 路径只对旧 `agenda_plans` 的活动生效（它自己的证据闸
+# `ling.domains.evidence` 也仍然兜底）；新时间轴的段整条不走那条路。
+
+# 段类别 → 场景状态。没列到的一律 focus（"手头有事在做"）。
+# `rest` 只给计划里的休息段；`free` 是"没定"，所以场景回 unknown 而不是编一个。
+SCENE_STATE_BY_KIND: dict[str, str] = {
+    "rest": "rest",
+    "social": "chat",
+    "errand": "errand",
+    "walk": "errand",
+    "commute": "errand",
+    "exercise": "errand",
+    "free": "unknown",
+}
+
+
+def _scene_state_for_kind(kind: str) -> str:
+    return SCENE_STATE_BY_KIND.get(str(kind), "focus")
+
+
+async def _advance_timeline_boundaries(
+    session, *, actor_id: str, now: datetime  # noqa: ANN001
+) -> list[str]:
+    """把新时间轴的段边界推进一格（幂等；返回人读的短标签，仅供日志）。
+
+    顺序固定，任何一步都**不写完成**：
+
+    1. 活动来源段已不再覆盖 ``now``（结束 / 被改版 / 被取消）→
+       ``running → paused``、``proposed → cancelled``，原因码 ``needs_review``；
+    2. 覆盖 ``now`` 的睡眠锚点 → 暂停仍在跑的模拟活动、场景 ``rest``；
+       **不创建睡眠活动**（睡眠锚点只是预计休息，不是"她睡着了"）；
+    3. 覆盖 ``now`` 的叶段 → 按 ``schedule_segment_id`` **唯一去重**起活动，
+       场景跟随它；TTL 只在"真实边界事件"或"活动仍 running"时续（设计 §3）；
+    4. 没有覆盖段 → 场景回 ``unknown``（不硬编"我在看书"）。
+    """
+    from ling.domains.activity.service import ActivityService
+    from ling.domains.agenda.timeline import boundary_view
+    from ling.domains.presence.service import (
+        SCENE_REFRESH_REASON_SEGMENT,
+        SCENE_REFRESH_REASON_SLEEP,
+        PresenceService,
+    )
+
+    activity = ActivityService(session, actor_id=actor_id)
+    presence = PresenceService(session, actor_id=actor_id)
+    view = await boundary_view(session, actor_id=actor_id, now=now)
+    actions: list[str] = []
+
+    current = await activity.current()
+    # ① 来源段已经结束（含 superseded/cancelled 的段）：软收尾，绝不 completed。
+    # 只对"还在跑/还没开始"的活动动手：已经 paused 的不重复写（幂等）。
+    if (
+        current is not None
+        and current.schedule_segment_id
+        and current.state in {"running", "proposed"}
+    ):
+        if not view.covers_segment(current.schedule_segment_id):
+            ended = await activity.end_schedule_window(current.schedule_segment_id)
+            actions.append(f"end:{current.schedule_segment_id}:{ended.action}")
+            current = await activity.current()
+    elif (
+        current is not None
+        and current.schedule_segment_id is None
+        and current.plan_id
+        # 切到新时间轴之前就在跑的旧活动：窗口结束也只暂停（不回退成完成路径）。
+        and current.state == "running"
+        and await _plan_window_ended(session, current.plan_id, now=now)
+    ):
+        await activity.transition(current.activity_id, "paused")
+        actions.append(f"end_legacy:{current.activity_id}")
+        current = await activity.current()
+
+    # ② 睡眠锚点覆盖此刻：暂停 + 场景 rest。睡眠不产生活动。
+    if view.sleep is not None:
+        if (
+            current is not None
+            and current.state == "running"
+            and current.origin == "simulated"
+        ):
+            await activity.transition(current.activity_id, "paused")
+            actions.append(f"sleep_pause:{current.activity_id}")
+            current = await activity.current()
+        scene = await presence.scene(now=now)
+        if scene.state != "rest":
+            await presence.commit_scene(state="rest", origin="simulated", now=now)
+            actions.append("scene:rest")
+        elif await presence.refresh_scene_ttl(
+            reason=SCENE_REFRESH_REASON_SLEEP, now=now
+        ):
+            actions.append("scene:rest_ttl")
+        return actions
+
+    # ③ 覆盖此刻的叶段：按段唯一去重起活动（重启/重复 tick 不会各开一个）。
+    if view.active_leaf is not None:
+        segment = view.active_leaf
+        started = await activity.start_for_segment(
+            segment_id=segment.segment_id,
+            kind=segment.kind,
+            place_id=segment.place_id,
+            visibility=segment.visibility or "subject_private",
+            origin="simulated",
+            source_event_ids=[
+                f"schedule_segment:{segment.segment_id}",
+                f"plan:{segment.plan_id}",
+            ],
+        )
+        if started.action in {"created", "resumed"}:
+            actions.append(f"{started.action}:{segment.segment_id}")
+        target_scene = _scene_state_for_kind(segment.kind)
+        scene = await presence.scene(now=now)
+        if (
+            scene.state != target_scene
+            or scene.activity_id != started.activity.activity_id
+        ):
+            await presence.commit_scene(
+                state=target_scene,
+                origin="simulated",
+                activity_id=started.activity.activity_id,
+                place_id=segment.place_id,
+                source_event_ids=[f"schedule_segment:{segment.segment_id}"],
+                now=now,
+            )
+            actions.append(f"scene:{target_scene}")
+        elif started.activity.state == "running":
+            # 真实边界事件（段仍覆盖此刻）+ 活动仍在 running：允许续 TTL。
+            if await presence.refresh_scene_ttl(
+                reason=SCENE_REFRESH_REASON_SEGMENT,
+                activity_running=True,
+                now=now,
+            ):
+                actions.append("scene:ttl")
+        return actions
+
+    # ④ 此刻没有任何覆盖段：场景回 unknown，别拿旧场景自述。
+    # 只有"她还声称在做事、但其实没有活动在跑"时才清：对话场景（chat）由
+    # 对话路径维护，不在这里踩掉。
+    if current is None or current.state != "running":
+        scene = await presence.scene(now=now)
+        if scene.state not in {"unknown", "chat"}:
+            await presence.clear_scene(now=now)
+            actions.append("scene:unknown")
+    return actions
+
+
 @handler("life.tick")
 async def handle_life_tick(payload: dict) -> None:
     """生活推进：只在**时段边界或到点计划**时动手。
@@ -1989,10 +2144,15 @@ async def handle_life_tick(payload: dict) -> None:
     既烧模型又不真实。真实的人是按事件推进的——起床、被打断、
     手头这件事做完了。
 
-    动作范围很小：
-    - 醒着且有到点的计划 → 开一个模拟活动并提交场景
-    - 该歇了 → 暂停当前活动、场景切休息
-    - 其余情况什么都不做（保持现状就是最自然的行为）
+    两条路径**互斥**（按数据判定，不看开关）：
+
+    - **新时间轴已接管**（`day_plans` 有行）→ 交给
+      :func:`_advance_timeline_boundaries`：按段边界开/停活动，计划时段结束
+      只暂停/取消 + `needs_review`，**绝不 completed**；
+    - 否则走旧 `agenda_plans` 路径（下面这段逻辑保持不变）：醒着且有到点的
+      计划 → 开模拟活动；该歇了 → 暂停；旧计划时段结束 → 旧的 clock-only
+      收尾（它的证据种类仍是 `clock_only`，事实读侧（`ling.domains.evidence`）
+      照旧排除它，所以不会因为这条旧路径产生新的"经历"）。
     """
     from ling.domains.activity.service import ActivityService
     from ling.domains.agenda.service import AgendaService
@@ -2005,6 +2165,14 @@ async def handle_life_tick(payload: dict) -> None:
         routine = await agenda.routine()
         presence = PresenceService(session, actor_id=actor_id)
         activity = ActivityService(session, actor_id=actor_id)
+
+        if await _new_timeline_owns(session, actor_id=actor_id):
+            actions = await _advance_timeline_boundaries(
+                session, actor_id=actor_id, now=now
+            )
+            if actions:
+                logger.info("时间轴边界推进: %s", ", ".join(actions))
+            return
 
         awake = routine.is_awake(now)
         current = await activity.current()
@@ -2022,11 +2190,14 @@ async def handle_life_tick(payload: dict) -> None:
         # 计划窗口已结束且活动还在跑 → 收尾（**模拟活动**才有这条路径）。
         # 没有这条路径的话，活动永远不会 completed，自我时间线永远是空的。
         # 证据只描述"模拟活动的窗口结束了"，不冒充真实世界发生了什么。
+        # **只对旧 `agenda_plans` 的活动生效**：带 `schedule_segment_id` 的新时间轴
+        # 活动走上面那条分支，不会到这里（多一层防御，不靠调用顺序）。
         if (
             current is not None
             and current.state == "running"
             and current.origin == "simulated"
             and current.plan_id
+            and current.schedule_segment_id is None
             and await _plan_window_ended(session, current.plan_id, now=now)
         ):
             try:
@@ -2757,6 +2928,42 @@ async def _schedule_seam(
     )
 
 
+async def _schedule_refine(session, *, actor_id: str, now: datetime) -> str | None:
+    """投递一次近窗细化（幂等键 = ``refine:{plan_id}:{revision}:{window_start}``）。
+
+    扫描本身**零模型**：只回答"现在有没有该细化的父段"。选择规则完全在
+    `timeline.load_refine_target` 里（最早未细化段 + 60 分钟触发 + 未来 3 小时
+    窗口），所以重复扫描要么没有目标，要么落在同一个幂等键上——不会被
+    每 60 秒的扫描反复投递、也不会每 5 分钟换一个父段重烧调用。
+
+    预算/滚动额度/失败不重试这些闸门在 `refine_work` 里（那里有事务和账本）；
+    这里只负责"到期投一次"。
+    """
+    from ling.domains.agenda.timeline import load_refine_target
+
+    target = await load_refine_target(session, actor_id=actor_id, now=now)
+    if target is None:
+        return None
+    key = target.idempotency_key
+    enqueued = await _enqueue_once(
+        session,
+        event_id=key,
+        topic="schedule.refine",
+        payload={
+            "actor_id": actor_id,
+            "plan_day": target.plan_day.isoformat(),
+            "parent_id": target.parent.segment_id,
+            "window_start": target.window_start.isoformat(),
+            "idempotency_key": key,
+            "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+    if not enqueued:
+        return None
+    return f"schedule.refine:{target.parent.segment_id}"
+
+
 async def _schedule_dream(
     session, *, actor_id: str, window, now: datetime  # noqa: ANN001
 ) -> bool:
@@ -2848,7 +3055,7 @@ async def _schedule_settlement(
 async def handle_life_schedule(payload: dict) -> None:
     """生活调度扫描：**只查 DB 到期边界，一次模型调用都没有**。
 
-    每 60 秒跑一次，做四件事，全部是"到期才投递"：
+    每 60 秒跑一次，做五件事，全部是"到期才投递"：
 
     1. **过期 lease**：把租约过期的 in-flight outbox 事件放回 pending
        ——worker 被杀/重启后没确认的事件靠这一步补投；
@@ -2859,7 +3066,10 @@ async def handle_life_schedule(payload: dict) -> None:
     4. **梦 / 跨夜结算**：对本地 `今天−1 / 今天 / 今天+1` 三晚调
        `night_window`，在梦窗口内且这一晚无 `dream_reports` 行 → 投
        `dream.generate`；`now >= wake_at` 且无 `sleep_settlements` 行 →
-       投 `sleep.settle`（结算自身幂等）。
+       投 `sleep.settle`（结算自身幂等）；
+    5. **近窗细化**：距"最早未细化段"开始 ≤ 60 分钟、且未来 3 小时里确有粗段
+       → 按 `refine:{plan_id}:{revision}:{window_start}` 投一次
+       `schedule.refine`（零模型；规则见 `timeline.load_refine_target`）。
 
     **`late` 相位不凭空造行**：目标日从来没有跑过作业（库里没有 `day_plans`
     行）时，late 只说明"系统当时不在"，不能拿它伪造一份"从中午开始的一天"。
@@ -2950,6 +3160,12 @@ async def handle_life_schedule(payload: dict) -> None:
                 session, actor_id=actor_id, window=window, now=now
             ):
                 enqueued.append(f"sleep.settle:{sleep_date.isoformat()}")
+
+        # ⑤ 近窗细化（阶段 2）：距最早未细化段开始 ≤ 60 分钟、且未来 3 小时里
+        # 确有粗段才投一次；幂等键含版本与窗口起点，重复扫描不会重复投。
+        refine_job = await _schedule_refine(session, actor_id=actor_id, now=now)
+        if refine_job:
+            enqueued.append(refine_job)
 
     if reclaimed:
         logger.info("回收过期 outbox 租约 %d 条", reclaimed)
@@ -3080,6 +3296,73 @@ async def handle_schedule_seam(payload: dict) -> None:
             "frozen": len(report.frozen_segment_ids),
             "reason_codes": list(report.reason_codes),
             "calls": report.calls,
+        },
+    )
+
+
+@handler("schedule.refine")
+async def handle_schedule_refine(payload: dict) -> None:
+    """跑一次近窗细化：**模型调用在这里**，不在 outbox 的认领事务里。
+
+    `refine_work` 自己按"没有合格目标 → 这个窗口已经试过 → 滚动额度用完 →
+    模型不可用 → 预算耗尽 → 模型超时/非法 → CAS 失败"的顺序判分支，
+    绝大多数分支都是 0 次调用。失败一律**保留粗段**，不重试、不回填过去。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.agenda.timeline import refine_work
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    plan_day = _parse_payload_date(payload, "plan_day")
+    expect_key = str(payload.get("idempotency_key") or "") or None
+    now = utcnow()
+    async with session_scope() as session:
+        outcome = await refine_work(
+            session,
+            actor_id=actor_id,
+            now=now,
+            plan_day=plan_day,
+            router=_MEMORY_ROUTER,
+            config_reader=_config_reader(session),
+            lease_owner=f"{WORKER_ID}/refine",
+            expect_key=expect_key,
+        )
+    logger.info(
+        "细化作业 day=%s parent=%s state=%s revision=%s→%s children=%s calls=%s reason=%s",
+        outcome.plan_day or plan_day,
+        outcome.parent_id or "",
+        outcome.state,
+        outcome.revision_before,
+        outcome.revision_after,
+        outcome.children,
+        outcome.calls,
+        outcome.reason_code or "",
+    )
+    behavior_event(
+        "schedule_refined" if outcome.state == "refined" else "schedule_refine_skipped",
+        (
+            f"把 {outcome.plan_day.isoformat() if outcome.plan_day else '今天'} 的"
+            f"{outcome.parent_id or '一段安排'}细化成 {outcome.children} 个更小的子段"
+            if outcome.state == "refined"
+            else "近窗细化没有改动（保留粗块，不调用或未采用模型输出）"
+        ),
+        outcome="ok" if outcome.state in ("refined", "unchanged", "no_target") else "skip",
+        attributes={
+            "actor_id": actor_id,
+            "target_plan_day": (outcome.plan_day or plan_day).isoformat()
+            if (outcome.plan_day or plan_day)
+            else "",
+            "state": outcome.state,
+            "parent_id": outcome.parent_id or "",
+            "window_start": outcome.window_start.isoformat()
+            if outcome.window_start
+            else "",
+            "window_end": outcome.window_end.isoformat() if outcome.window_end else "",
+            "revision_before": outcome.revision_before,
+            "revision_after": outcome.revision_after,
+            "children": outcome.children,
+            "calls": outcome.calls,
+            "reason_code": outcome.reason_code or "",
         },
     )
 
@@ -3544,6 +3827,7 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     "memory.extract",
     "relationship.update",
     "schedule.outline",
+    "schedule.refine",
     "schedule.seam",
     "sleep.settle",
     "window.summary",

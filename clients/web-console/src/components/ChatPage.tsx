@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatDuration } from '../format';
 import type { UserInfo } from '../types';
-import { useChat } from '../useChat';
+import { useChat, type UiMessage } from '../useChat';
 import { Composer } from './Composer';
 import { AlertIcon, PencilIcon } from './Icons';
 import { MessageList } from './MessageList';
+import {
+  canOpenPromptSnapshot,
+  PromptDrawer,
+  promptEntryAction,
+} from './PromptDrawer';
 import { canRenameSession, describeSession, SessionSidebar } from './SessionSidebar';
 
 interface ChatPageProps {
@@ -45,6 +50,19 @@ export function ChatPage({
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
+  /**
+   * 「她这次看到了什么」抽屉。
+   *
+   * 打开状态按**消息 key** 记（不是 messageId）：本地还没落库的消息没有
+   * messageId，但入口照样可点，抽屉里给「这次没有记录」。两个字段分开存，
+   * 是为了让"点哪一条"和"查哪一条"各自说清。
+   */
+  const [promptOpenKey, setPromptOpenKey] = useState<string | null>(null);
+  const [promptMessageId, setPromptMessageId] = useState<string | null>(null);
+  /** 入口元素：关闭后焦点回到它（否则焦点掉回 <body>，键盘用户得从头 Tab）。 */
+  const promptOpenerRef = useRef<HTMLElement | null>(null);
+  /** 只有 owner 能看完整提示词；后端对其他人一律 404，入口也就不出现。 */
+  const promptEnabled = canOpenPromptSnapshot(user.role);
 
   const session = chat.sessions.find((item) => item.session_id === chat.currentId) ?? null;
   // 标题给人看（群名/昵称），副标题留给机器键；读不到名字时按号码回退。
@@ -94,6 +112,39 @@ export function ChatPage({
     await chat.renameSession(chat.currentId, titleDraft);
     setEditingTitle(false);
   };
+
+  const closePrompt = useCallback(() => {
+    const opener = promptOpenerRef.current;
+    promptOpenerRef.current = null;
+    setPromptOpenKey(null);
+    setPromptMessageId(null);
+    if (!opener) return;
+    // 等这一帧的卸载做完再还焦点：抽屉卸载时若自身还在处理焦点，
+    // 同步 focus 会被随后的清理覆盖掉（表现为焦点掉回 <body>）。
+    window.setTimeout(() => {
+      if (opener.isConnected) opener.focus();
+    }, 0);
+  }, []);
+
+  const togglePrompt = useCallback(
+    (message: UiMessage, trigger: HTMLElement) => {
+      if (promptEntryAction(promptOpenKey, message.key) === 'close') {
+        closePrompt();
+        return;
+      }
+      promptOpenerRef.current = trigger;
+      setPromptOpenKey(message.key);
+      setPromptMessageId(message.messageId);
+    },
+    [closePrompt, promptOpenKey],
+  );
+
+  // 换会话就收起：抽屉里的内容是上一条会话的快照，留着会张冠李戴。
+  useEffect(() => {
+    setPromptOpenKey(null);
+    setPromptMessageId(null);
+    promptOpenerRef.current = null;
+  }, [chat.currentId]);
 
   return (
     <div className="chat-layout">
@@ -236,6 +287,9 @@ export function ChatPage({
               onResend={chat.resend}
               onStop={() => void chat.stop()}
               onOpenSettings={onOpenSettings}
+              promptEnabled={promptEnabled}
+              promptOpenKey={promptOpenKey}
+              onOpenPrompt={togglePrompt}
             />
           )}
         </div>
@@ -266,6 +320,14 @@ export function ChatPage({
           </div>
         ) : null}
       </section>
+
+      {promptEnabled ? (
+        <PromptDrawer
+          open={promptOpenKey !== null}
+          messageId={promptMessageId}
+          onClose={closePrompt}
+        />
+      ) : null}
     </div>
   );
 }
