@@ -6,8 +6,9 @@ import time
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.deps import ConfigDep, CurrentAuth, RouterDep, SettingsDep
+from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
 from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
@@ -51,6 +52,12 @@ _OFFERABLE_PROFILES: tuple[str, ...] = (
     "dialogue.fast",
     "dialogue.group",
     "perception.vision",
+    # 看视频：职责名与「视频」槽位先落地，用户要求能在设置页挑"看视频的模型"。
+    # **注意：媒体描述链路目前没有给它自动路由**（用户要求"她想主动想看才读"，
+    # 逐条自动描述白烧 token）。绑定值会在接线后由调用方显式传
+    # `VIDEO_PROFILE` 时被读取；在那之前绑它不改变任何行为——这一条必须留在
+    # 这里，别让它变成一个没人知道的假入口。
+    "perception.video",
     "memory.extract",
     "memory.embed",
     "memory.rerank",
@@ -183,6 +190,25 @@ class RollbackBody(BaseModel):
 
 class SecretBody(BaseModel):
     secret: str = Field(min_length=1, max_length=4096)
+
+
+class PreferenceBody(BaseModel):
+    """用户偏好（时区 + 视频读取模式）。**缺省 = 不改；显式空串 = 清掉。**
+
+    ## 为什么必须是"缺省不改"
+
+    两个偏好共用一条 PUT，前端也是各发各的（``setTimezone`` 只带 ``timezone``、
+    ``setVideoMode`` 只带 ``video_mode``）。如果缺省值等于"清掉"，那么切一次
+    "怎么看视频"就会静默把时区一起清掉——用户看到的是「已保存」，刷新后才发现
+    回到默认时区（验收 B1 实测，这是数据丢失）。
+
+    所以：``None`` = 这次不碰这个字段；``""`` = 显式清掉（时区回退环境变量/默认，
+    视频模式回退默认 ``frames``）。想改哪个就只发哪个。
+    """
+
+    timezone: str | None = Field(default=None, max_length=64)
+    # 视频读取模式：``frames``（抽帧，默认）/ ``native``（原生视频输入）。
+    video_mode: str | None = Field(default=None, max_length=16)
 
 
 # ---------------------------------------------------------------- 视图拼装
@@ -440,6 +466,124 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
     }
 
 
+async def _preference_view(
+    session: AsyncSession, *, subject_id: str, env: str | None
+) -> dict[str, object]:
+    """偏好的响应形状。GET 与 PUT 共用一份——两个入口拼两份，迟早不一样。"""
+    from ling.settings.user_preferences import (
+        COMMON_TIMEZONES,
+        DEFAULT_USER_TIMEZONE,
+        DEFAULT_VIDEO_MODE,
+        VIDEO_MODES,
+        load_user_timezone,
+        load_video_mode,
+        stored_timezone,
+    )
+
+    name, source = await load_user_timezone(session, subject_id=subject_id, env=env)
+    return {
+        # 视频怎么看（抽帧/原生）：用户偏好，**不在模型页**——它管的是
+        # "怎么把视频交给模型"，不是"用哪个模型"。
+        "video_mode": await load_video_mode(session, subject_id=subject_id),
+        "video_modes": list(VIDEO_MODES),
+        "video_mode_default": DEFAULT_VIDEO_MODE,
+        "schema_version": "v1",
+        "timezone": name,
+        "source": source.value,
+        # 库里存的原值：界面用它显示"你自己填过"，与生效值区分开。
+        "stored": await stored_timezone(session, subject_id),
+        "env": env,
+        "default": DEFAULT_USER_TIMEZONE,
+        "common": list(COMMON_TIMEZONES),
+    }
+
+
+@router.get("/settings/preferences")
+async def get_preferences(
+    auth: CurrentAuth, session: DbSession, settings: SettingsDep
+) -> dict[str, object]:
+    """用户自己的偏好（当前只有时区）。
+
+    **为什么不并进 ``/settings/config``**：那一份是配置修订（草稿→发布→
+    回滚），时区是用户的事实，不进修订、也不该跟着回滚（见
+    ``infra/models.py::UserPreferenceRow``）。混进同一份响应里，前端迟早会
+    拿 ``saveDraft`` 去存它。
+
+    ``source`` 必须回给前端：界面要能说出"现在是默认值，不是你设的"。
+    没有它的话，用户看到 Asia/Shanghai 会以为自己设过。
+    """
+    return await _preference_view(
+        session, subject_id=auth.user.subject_id, env=settings.user_timezone
+    )
+
+
+@router.put("/settings/preferences")
+async def put_preferences(
+    body: PreferenceBody,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+) -> dict[str, object]:
+    """写用户偏好。**只改请求里带了的字段**：``None`` 跳过，``""`` 清掉。
+
+    两个偏好共用一条 PUT，所以"没带这个字段"绝不能等于"清掉它"——
+    否则切一次视频模式就会把时区静默清回默认（验收 B1 的数据丢失）。
+
+    校验在这一层做，并且**给出可执行的提示**：非法名字只回一句"invalid"，
+    用户会去猜是不是少了时区前缀、是不是该写 UTC+8。实际正确的是 IANA 名。
+    """
+    from ling.settings.user_preferences import (
+        clear_user_timezone,
+        clear_video_mode,
+        normalize_timezone,
+        normalize_video_mode,
+        save_user_timezone,
+        save_video_mode,
+    )
+
+    # 时区：None = 这次不改；空串 = 清掉（回退 env → 默认）。
+    if body.timezone is not None:
+        raw = body.timezone
+        if not raw.strip():
+            await clear_user_timezone(session, subject_id=auth.user.subject_id)
+        else:
+            if normalize_timezone(raw) is None:
+                raise LingError(
+                    ErrorCode.invalid_request,
+                    "不是合法的时区名，请填 IANA 名称（例：Asia/Shanghai）",
+                    detail=(
+                        "IANA 名形如「区域/城市」，例如 Asia/Shanghai、Europe/London、"
+                        "America/New_York；不要写 UTC+8 或「东八区」。"
+                    ),
+                )
+            await save_user_timezone(
+                session, subject_id=auth.user.subject_id, raw=raw
+            )
+
+    # 视频模式：None = 这次不改；空串 = 清掉（回退默认 frames）。
+    if body.video_mode is not None:
+        mode = body.video_mode.strip()
+        if not mode:
+            await clear_video_mode(session, subject_id=auth.user.subject_id)
+        else:
+            if normalize_video_mode(mode) is None:
+                raise LingError(
+                    ErrorCode.invalid_request,
+                    "不是合法的视频读取模式",
+                    detail=(
+                        "可选：frames（抽帧，任何供应商都能用）/ "
+                        "native（原生视频输入）。"
+                    ),
+                )
+            await save_video_mode(
+                session, subject_id=auth.user.subject_id, raw=mode
+            )
+
+    return await _preference_view(
+        session, subject_id=auth.user.subject_id, env=settings.user_timezone
+    )
+
+
 @router.get("/settings/connectors")
 async def get_connectors(
     request: Request, auth: CurrentAuth, settings: SettingsDep
@@ -530,9 +674,12 @@ def _quick_config_rows(
         # 文案上必须分开，否则会写成"覆盖你选的 X"，而用户从没选过 X。
         if new.source is ResolutionSource.legacy_fallback:
             kind = "legacy"
+            # 文案要短：这一列桌面约 390px、375 的堆叠布局里只有 ~250px，
+            # 长句会折出 2–3 字孤行（验收 G2 实测末行「配）」）。原因说一半
+            # 就够——"槽位没配"已经解释了为什么给不了它模型。
             change = (
-                f"仍然借主对话模型 {new_model['model_id'] if new_model else ''}"
-                f"（「{SLOT_LABELS[key]}」槽位没配，快速配置给不了它模型）"
+                f"仍然借主对话 {new_model['model_id'] if new_model else ''}"
+                f"（{SLOT_LABELS[key]}槽位没配）"
             )
         elif new_model is None:
             change = f"仍然不可用：{new.reason}"

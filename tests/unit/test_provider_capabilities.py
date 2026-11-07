@@ -120,6 +120,23 @@ def test_chat_profiles_are_served_by_chat_kinds_and_not_by_non_chat_kinds() -> N
     assert not kind_supports_profile("siliconflow_rerank", "memory.extract")
 
 
+def test_perception_video_uses_chat_capability() -> None:
+    """看视频要的是 `chat`，**不是**新造的 `video` 能力。
+
+    这是一条刻意的取舍：能力表回答的是"这个**供应商类型**能不能服务这个
+    角色"。现有对话 kind 的能力集里没有 `video`，新增一个没人能提供的能力
+    会让 `perception.video` 判成"所有供应商都不匹配"——设置页那一行永远红、
+    绑谁都说"这家不支持"。能不能看懂视频取决于**具体模型**（同一个 kind 下
+    既有纯文本也有多模态），所以那句话写在槽位提示里，由用户挑。
+    """
+    assert required_capability("perception.video") is ModelCapability.chat
+    assert "video" not in {c.value for c in ModelCapability}
+    # 至少有一个 kind 能服务它，否则它不该出现在可绑清单里
+    assert kind_supports_profile("openai_compatible", "perception.video")
+    assert kind_supports_profile("fake", "perception.video")
+    assert not kind_supports_profile("cloudflare_embedding", "perception.video")
+
+
 def test_roles_without_declared_capability_are_unconstrained() -> None:
     """没有能力声明的角色不做约束（它们既不可绑，也没有任何代码请求）。"""
     assert required_capability("reflection") is None

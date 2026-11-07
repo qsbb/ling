@@ -26,6 +26,12 @@
 - 于是 ④记忆与学习、⑤对话与主动性、⑧生活与活动 的 `editable_route` **仍然是**
   `/v1/settings/config` 的对应段落（它们仍然是设置项），但它们的**编辑入口挂在各自的领域页**，
   不在设置中心。**没有删除任何设置项，只是换了住处。**
+- 唯一例外是**用户自己的时区**（`GET/PUT /v1/settings/preferences`，存
+  `user_preferences` 表）：它不是"她的行为调参"，而是**你在哪儿**，同时改变 ⑤（何时开口）
+  与 ⑧（"今天"的边界）两个决策，没有哪一类独占它；因此它以「你的本地时间」小节的形式
+  直接放在 `/settings` 页首，**不进配置修订、不走草稿/发布**。
+  解析优先级 DB 偏好 > `LING_USER_TIMEZONE` > `Asia/Shanghai`，
+  唯一实现在 `ling/settings/user_preferences.py`。
 
 ### 0.1 当前事实（一句话版）
 
@@ -165,7 +171,7 @@ useEffect(() => {
 │   ├─ 说话方式 ····· 正式度·分句长度·口语化·颜文字
 │   └─ 声音呈现 ····· 语速·音色·何时发语音而非文字
 ├─③ 模型与生成 ────────────── 改「谁来算」
-│   ├─ 职责绑定 ····· ModelRole 全集（见 §6）；可跟随四个默认槽位（见 §7）
+│   ├─ 职责绑定 ····· ModelRole 全集（见 §6）；可跟随五个默认槽位（见 §7）
 │   ├─ 供应商与凭证 · provider(fake/openai_compatible/anthropic/chat_responses/local) + 密钥
 │   └─ 推理与回退 ··· 超时·单次输出上限·日额度（均按供应商，-1=不限制）·fallback 顺序
 │                      （温度不再是配置项：请求不发该字段，用上游默认值）
@@ -416,21 +422,31 @@ useEffect(() => {
 
 ## 7. ModelRole 全集（③ 职责绑定的实际内容）
 
-来源 `src/ling/contracts/v1.py`，共 13 个：
+来源 `src/ling/contracts/v1.py`，共 14 个：
 
 ```
 dialogue.fast        dialogue.deep        dialogue.group
 memory.extract       memory.embed         memory.rerank
-perception.vision    speech.asr           speech.tts
-realtime.voice       moderation.advisory
+perception.vision    perception.video     speech.asr
+speech.tts           realtime.voice       moderation.advisory
 reflection           planning
 ```
 
 **注意**：`reflection` / `planning` 暂无独立配置入口，是否有真实调用点待验证。
 
-### 7.1 四个默认槽位
+`perception.video`（看视频）是后加的：职责名与「视频」槽位先落地，
+**但媒体描述链路没有给它自动路由**——用户的要求是「不是每个视频都去读，只有
+她自己主动想读那个视频时才读」（逐条自动描述白烧 token）。所以
+`domains/media/describe.py` 的默认行为与以前完全一致（构造时给的 `profile`，即识图）；
+接线时由「她想看才看」那一侧显式传 `VIDEO_PROFILE`（`kind=video` 不会自动切换）。
 
-用户先给四件常做的事各挑一个模型（`快速 / 创作 / 识图 / 日常`），再决定某条职责
+能力仍按 `chat` 判——**不新增 `video` 能力**，否则所有现有供应商都会被判不匹配、
+绑定全红。能不能看懂视频取决于**具体模型**（同一 kind 下既有纯文本也有多模态），
+所以那句话写在槽位说明（`SLOT_HINTS`）里，由用户挑模型。
+
+### 7.1 五个默认槽位
+
+用户先给五件常做的事各挑一个模型（`快速 / 创作 / 识图 / 视频 / 日常`），再决定某条职责
 要不要单独指定。没单独指定的职责就跟着**自己那个**槽位走：
 
 | 职责 | 槽位 |
@@ -438,6 +454,7 @@ reflection           planning
 | `dialogue.fast` | 快速 |
 | `dialogue.group` | 日常 |
 | `perception.vision` | 识图 |
+| `perception.video` | 视频 |
 | `memory.extract` | 创作 |
 | `memory.embed` / `memory.rerank` | 没有槽位（嵌入/重排是另一套协议，只能单独指定） |
 

@@ -168,11 +168,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # 每日 token 额度：记账表在库里，额度判断在路由里。
     # 时区取用户的本地时区（"今天"是本地日历日，不是 UTC 日）。
+    #
+    # 走**唯一解析出口**（DB 偏好 > LING_USER_TIMEZONE > Asia/Shanghai）：
+    # 只读环境变量的话，用户在设置页填的时区对"今天已用"的日界无效，
+    # 额度会在本地凌晨前的某个时刻被清零。
     from ling.infra.db import get_session_factory
     from ling.models.quota import TokenQuotaStore
+    from ling.settings.user_preferences import (
+        effective_user_timezone,
+        owner_subject_id,
+    )
 
+    async with session_scope() as session:
+        quota_timezone = await effective_user_timezone(
+            session,
+            subject_id=await owner_subject_id(session),
+            env=settings.user_timezone,
+        )
     app.state.quota = TokenQuotaStore(
-        get_session_factory(), timezone=settings.user_timezone
+        get_session_factory(), timezone=quota_timezone
     )
     app.state.router = ModelRouter(app.state.registry, app.state.quota)
 

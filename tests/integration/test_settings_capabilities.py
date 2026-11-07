@@ -124,10 +124,9 @@ async def test_proactive_gate_reads_published_quiet_hours(
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    # clean env 下 `LING_USER_TIMEZONE` 未设置，route 会传 None，gate 直接
-    # 只报时区原因；这样本用例测不到免打扰窗。只在**本用例**临时钉住
-    # app 的 Settings（不动 conftest，也不放宽生产的「未知时区默认拒绝」），
-    # 并用同一个时区计算"此刻"，保证窗口与 gate 判定一致。
+    # 把时区**显式钉住**：本用例用同一个时区计算"此刻"，才能保证发布的
+    # 免打扰窗与 gate 判定一致。clean env 下时区会走默认值（Asia/Shanghai），
+    # 结果相同，但显式写出来就不依赖"默认值是什么"这个外部事实。
     timezone = "Asia/Shanghai"
     monkeypatch.setattr(
         logged_in.app.state,

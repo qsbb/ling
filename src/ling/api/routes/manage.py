@@ -589,6 +589,18 @@ async def list_proactive(
     # 的数字，比不显示更糟。免打扰仍显式传（下面两个参数优先于 policy）。
     _qs = getattr(effective_dialogue, "quiet_start_minute", None) if effective_dialogue else None
     _qe = getattr(effective_dialogue, "quiet_end_minute", None) if effective_dialogue else None
+    # 必须传用户时区：勿扰时段和"今日已发几条"都按当地作息算。
+    # 原来这里什么都没传，于是永远按 UTC——东八区用户的
+    # "23:00-08:00 勿扰"实际是 07:00-16:00，白天静音、深夜可打扰。
+    #
+    # 现在走**唯一解析出口**（DB 偏好 > LING_USER_TIMEZONE > Asia/Shanghai）。
+    # 直接读 `settings.user_timezone` 时，没配环境变量就传 None，`gate` 会
+    # 把整条主动联系停掉——生活页那句"用户时区未设置"就是这么来的。
+    from ling.settings.user_preferences import effective_user_timezone
+
+    subject_timezone = await effective_user_timezone(
+        session, subject_id=auth.user.subject_id, env=settings.user_timezone
+    )
     gate = await service.gate(
         subject_id=auth.user.subject_id,
         quiet_start=time(_qs // 60, _qs % 60) if _qs is not None else None,
@@ -600,10 +612,7 @@ async def list_proactive(
         ),
         channel_can_proactive=_connector is not None,
         channel_proactive_reason=_why_not,
-        # 必须传用户时区：勿扰时段和"今日已发几条"都按当地作息算。
-        # 原来这里什么都没传，于是永远按 UTC——东八区用户的
-        # "23:00-08:00 勿扰"实际是 07:00-16:00，白天静音、深夜可打扰。
-        subject_timezone=settings.user_timezone,
+        subject_timezone=subject_timezone,
     )
     return {
         "pending": [

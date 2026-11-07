@@ -1,5 +1,5 @@
 /**
- * 「模型与生成」：四个默认槽位 + 每个职责一行。
+ * 「模型与生成」：五个默认槽位 + 每个职责一行。
  *
  * ## 为什么是「一行一个下拉」（A 方案）
  *
@@ -38,6 +38,7 @@ import { AlertIcon, CheckIcon } from '../Icons';
 import {
   EXTRA_ROLES,
   PRIMARY_ROLES,
+  ROLE_GROUPS,
   RoleIcon,
   bindingCapabilityMismatch,
   capabilityLabel,
@@ -45,9 +46,11 @@ import {
   kindLabel,
   providersForChatSlot,
   providersForProfile,
+  roleBadgeState,
   roleLabel,
-  rowStateOf,
   slotLabel,
+  visibleRoleKeys,
+  type RoleBadgeState,
   type RoleMeta,
 } from './shared';
 
@@ -241,13 +244,17 @@ function RoleRow({
   memorySource: MemorySource | undefined;
   onPatch: (patch: Partial<ProfileDraftInput>) => void;
 }) {
-  const draftExplicit =
-    profile?.mode === 'explicit' && Boolean(profile.provider_id);
   // 环境变量提供的记忆能力没有绑定，`profile_resolutions` 会说「不可用」。
   // 那是真的（网页绑定确实没有），但能力本身是开着的——不能把这两件事
   // 混成一个红字，否则用户会去"修"一个正在工作的配置。
-  const envSourced = memorySource === 'env' && !draftExplicit;
-  const state = envSourced ? 'env' : rowStateOf(resolution);
+  //
+  // 判定与摘要计数共用 `roleBadgeState`：两边各算一次就会漂（验收抓到过
+  // "摘要说 4 个继承、徽标里却有 1 个旧版兼容"）。
+  const state = roleBadgeState(resolution, profile, memorySource);
+  const envSourced = state === 'env';
+  // 「配置来源」那行只在"网页没单独指定"时才需要说明（binding 的由徽标表达）。
+  const draftExplicit =
+    profile?.mode === 'explicit' && Boolean(profile.provider_id);
   // 嵌入/重排没有默认槽位，下拉里不该出现「跟随默认」：选了它也解析不出
   // 模型。服务端的 `slot: null` 是唯一判据（不要在前端按角色名硬编码）。
   const followAllowed = resolution === undefined || resolution.slot !== null;
@@ -488,35 +495,44 @@ function QuickConfigDialog({
           <p className="ms-muted">正在计算…</p>
         ) : (
           <>
-            <table className="ms-quick">
-              <thead>
-                <tr>
-                  <th scope="col">职责</th>
-                  <th scope="col">配置为</th>
-                  <th scope="col">具体模型</th>
-                  <th scope="col">变化</th>
-                </tr>
-              </thead>
-              <tbody>
-                {preview.rows.map((row) => (
-                  <tr key={row.profile} className={`ms-quick__row--${row.change_kind}`}>
-                    {/*
-                      `data-label` 是窄屏堆叠布局用的：375px 下四列表格会把
-                      `perception.vision`、`fast-mini` 这类标识符拆成一字一行，
-                      整个 diff 变得不可读。窄屏改成"每条一段、标签在左值在右"，
-                      标签就取这里的值——和表头共用同一份文案，不会说岔。
-                    */}
-                    <td data-label="职责">
-                      {roleLabel(row.profile)} <code>{row.profile}</code>
-                    </td>
-                    <td data-label="配置为">{row.slot_label}</td>
-                    <td data-label="具体模型">{row.model_id ?? '—'}</td>
-                    <td data-label="变化">{row.change}</td>
+            {/* 桌面宽度不够时让**表格**横向滚动，而不是把 `daily-chat`
+                在连字符处拆成两行。窄屏表格是堆叠布局，用不到这层。 */}
+            <div className="ms-quick-wrap">
+              <table className="ms-quick">
+                <thead>
+                  <tr>
+                    <th scope="col">职责</th>
+                    <th scope="col">配置为</th>
+                    <th scope="col">具体模型</th>
+                    <th scope="col">变化</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {preview.rows.map((row) => (
+                    <tr key={row.profile} className={`ms-quick__row--${row.change_kind}`}>
+                      {/*
+                        `data-label` 是窄屏堆叠布局用的：375px 下四列表格会把
+                        `perception.vision`、`fast-mini` 这类标识符拆成一字一行，
+                        整个 diff 变得不可读。窄屏改成"每条一段、标签在左值在右"，
+                        标签就取这里的值——和表头共用同一份文案，不会说岔。
+                      */}
+                      <td data-label="职责">
+                        {roleLabel(row.profile)} <code>{row.profile}</code>
+                      </td>
+                      <td data-label="配置为">{row.slot_label}</td>
+                      <td data-label="具体模型">{row.model_id ?? '—'}</td>
+                      <td data-label="变化">{row.change}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
 
+            {/*
+              两段式而不是一段长句：375 下这一段只有 ~322px，合成一段时
+              "写入后仍需按页面底部的「保存」才生效。" 会在末行剩 2–3 个字
+              （验收 G3 实测末行「生效。」）。拆成两行后每行都能独立放下。
+            */}
             <p className="ms-muted ms-quick__note">
               {preview.summary.overrides > 0
                 ? `会覆盖 ${preview.summary.overrides} 条你单独选的。`
@@ -524,7 +540,9 @@ function QuickConfigDialog({
               {preview.summary.still_unavailable > 0
                 ? ` 另有 ${preview.summary.still_unavailable} 条仍然不可用：先去把对应的默认模型配好。`
                 : ''}
-              写入后仍需按页面底部的「保存」才生效。
+            </p>
+            <p className="ms-muted ms-quick__note">
+              写入后还要按页面底部的「保存」才生效。
             </p>
 
             <div className="ms-modal__foot">
@@ -548,18 +566,6 @@ function QuickConfigDialog({
 }
 
 /* ------------------------------------------------------------------ 主体 */
-
-const GROUPS: { title: string; note: string; keys: string[] }[] = [
-  { title: '对话', note: '2 个 · 主回复链', keys: ['dialogue.fast', 'dialogue.group'] },
-  { title: '感知', note: '1 个 · 只在发图时触发', keys: ['perception.vision'] },
-  // 嵌入/重排不是对话协议，也没有默认槽位：它们只在这里显式绑定，
-  // 或者由环境变量提供（来源写在每一行下方）。
-  {
-    title: '记忆',
-    note: '3 个 · 提炼与检索',
-    keys: ['memory.extract', 'memory.embed', 'memory.rerank'],
-  },
-];
 
 export function RolesPanel({
   config,
@@ -597,33 +603,45 @@ export function RolesPanel({
     [],
   );
   // 只渲染服务端说"可绑"的角色：界面上多一行绑了没用的，比少一行更糟。
-  const offerable = useMemo(() => new Set(config.known_profiles ?? []), [config.known_profiles]);
+  // 同一份判定也用于 tab 数字与摘要总数（见 SettingsPage），三处不许各算一次。
+  const visibleKeys = useMemo(
+    () => visibleRoleKeys(config.known_profiles),
+    [config.known_profiles],
+  );
+  const visible = useMemo(() => new Set(visibleKeys), [visibleKeys]);
   const profileCapabilities = config.profile_capabilities ?? {};
   const memorySources = useMemo(
     () => config.memory_sources ?? {},
     [config.memory_sources],
   );
 
+  /**
+   * 摘要计数 = 列表徽标计数。
+   *
+   * 逐行调**同一个** `roleBadgeState`，不另写一套 if：验收实测过两边漂开
+   * （摘要说「4 个继承」，而徽标是 3 继承 + 1 旧版兼容）。旧版兼容现在单独
+   * 一档，摘要里也单独列出来——它是"没配模型时借主对话代跑"，既不是用户
+   * 选的，也不是槽位给的。
+   */
   const counts = useMemo(() => {
-    const result = { explicit: 0, inherit: 0, fellBack: 0, unavailable: 0, env: 0 };
-    for (const resolution of resolutions) {
-      // 环境变量提供的记忆能力没有绑定：`profile_resolutions` 会报不可用，
-      // 但能力其实是开着的。把它从「不可用」里拿出来单列，否则标题会对着
-      // 一个正常部署说"2 个不可用"。
-      if (memorySources[resolution.profile] === 'env') {
-        result.env += 1;
-      } else if (resolution.source === 'explicit') {
-        result.explicit += 1;
-      } else if (resolution.source === 'unavailable') {
-        result.unavailable += 1;
-      } else if (resolution.fell_back) {
-        result.fellBack += 1;
-      } else {
-        result.inherit += 1;
-      }
+    const result: Record<RoleBadgeState, number> = {
+      explicit: 0,
+      inherit: 0,
+      fell_back: 0,
+      legacy: 0,
+      unavailable: 0,
+      env: 0,
+    };
+    for (const key of visibleKeys) {
+      const state = roleBadgeState(
+        byResolution.get(key),
+        byProfile.get(key),
+        memorySources[key],
+      );
+      result[state] += 1;
     }
     return result;
-  }, [resolutions, memorySources]);
+  }, [visibleKeys, byResolution, byProfile, memorySources]);
 
   return (
     <section className="ms-roles" aria-label="模型与生成">
@@ -631,19 +649,27 @@ export function RolesPanel({
         <div>
           <h2>每个职责，各指一个模型</h2>
           <p className="ms-muted">
-            先给四件常做的事各挑一个模型，再决定每条职责要不要单独指定。行尾永远是
+            先给五件常做的事各挑一个模型，再决定每条职责要不要单独指定。行尾永远是
             <strong>这一行实际会跑的模型</strong>。
           </p>
           <p className="ms-roles__counts">
-            <span>{resolutions.length} 个职责</span>
+            {/* 总数取**渲染出来的行数**，不是绑定记录条数：tab 上的数字
+                也曾写成 profiles.length(5) 而列表是 7 行。 */}
+            <span>{visibleKeys.length} 个职责</span>
             <span>·</span>
             <span>{counts.explicit} 个单独指定</span>
             <span>·</span>
             <span>{counts.inherit} 个继承</span>
-            {counts.fellBack > 0 ? (
+            {counts.legacy > 0 ? (
               <>
                 <span>·</span>
-                <span className="ms-roles__counts--warn">{counts.fellBack} 个已回退</span>
+                <span className="ms-roles__counts--legacy">{counts.legacy} 个旧版兼容</span>
+              </>
+            ) : null}
+            {counts.fell_back > 0 ? (
+              <>
+                <span>·</span>
+                <span className="ms-roles__counts--warn">{counts.fell_back} 个已回退</span>
               </>
             ) : null}
             {counts.unavailable > 0 ? (
@@ -694,8 +720,8 @@ export function RolesPanel({
       </div>
 
       <div className="ms-role-groups">
-        {GROUPS.map((group) => {
-          const keys = group.keys.filter((key) => metaByKey.has(key) && offerable.has(key));
+        {ROLE_GROUPS.map((group) => {
+          const keys = group.keys.filter((key) => visible.has(key) && metaByKey.has(key));
           if (keys.length === 0) return null;
           return (
             <div className="ms-role-group" key={group.title}>

@@ -269,31 +269,62 @@ export function logsErrorCopy(error: unknown): ExplainedError {
   return explained;
 }
 
+export interface LogsHeaderProps {
+  /** 条数说明由页面状态算出（暂停/加载/失败各有不同文案），页头只负责摆放。 */
+  counts: string;
+}
+
+/**
+ * 页头：标题、渲染规则说明、条数说明。
+ *
+ * 条数说明放在这里而不是工具栏或列表上方：它是"这一页能看到多少"的说明，
+ * 不是一项筛选控件。放在列表正上方会横成一整条窄带（工具栏换行后尤其明显），
+ * 把列表往下挤，所以它归页头。
+ */
+export function LogsHeader({ counts }: LogsHeaderProps) {
+  return (
+    <div className="page__head" data-testid="logs-head">
+      <div>
+        <h1 className="page__title">日志</h1>
+        <p className="page__subtitle">
+          每次最多 {LOG_LIMIT} 条，按时间正序排列，最新的在最下面，每 {LOG_POLL_MS / 1000} 秒自动刷新。
+        </p>
+      </div>
+      <p className="logs__count" data-testid="logs-count">
+        {counts}
+      </p>
+    </div>
+  );
+}
+
 export interface LogsToolbarProps {
   kind: LogKindFilter;
   level: LogLevelFilter;
   search: string;
   paused: boolean;
-  counts: string;
+  /** logger 名默认不显示（列很宽，会挤掉消息），需要按来源排查时才打开。 */
+  showLogger: boolean;
   onKind: (kind: LogKindFilter) => void;
   onLevel: (level: LogLevelFilter) => void;
   onSearch: (value: string) => void;
   onTogglePause: () => void;
   onRefresh: () => void;
+  onToggleLogger: () => void;
 }
 
-/** 顶部一行控件：级别 / 搜索 / 暂停 / 条数。单独导出以便 SSR 断言。 */
+/** 顶部一行控件：分类 / 级别 / 搜索 / 暂停 / 刷新 / 显示方法名。单独导出以便 SSR 断言。 */
 export function LogsToolbar({
   kind,
   level,
   search,
   paused,
-  counts,
+  showLogger,
   onKind,
   onLevel,
   onSearch,
   onTogglePause,
   onRefresh,
+  onToggleLogger,
 }: LogsToolbarProps) {
   return (
     <div className="logs__toolbar" data-testid="logs-toolbar">
@@ -364,9 +395,17 @@ export function LogsToolbar({
         <RefreshIcon /> 刷新
       </button>
 
-      <span className="logs__count" data-testid="logs-count">
-        {counts}
-      </span>
+      {/* 默认关闭：logger 名又长又每行重复（ling.connectors.onebot.ws_server），
+          打开后消息列在窄屏上只剩几个字。要按来源排查时再打开。 */}
+      <label className="logs__toggle" title="每行左侧的 logger 名，例如 ling.behavior">
+        <input
+          type="checkbox"
+          data-testid="logs-show-logger"
+          checked={showLogger}
+          onChange={onToggleLogger}
+        />
+        <span>显示方法名</span>
+      </label>
     </div>
   );
 }
@@ -374,10 +413,15 @@ export function LogsToolbar({
 export interface LogsListProps {
   items: LogEntry[];
   level: LogLevelFilter;
+  /**
+   * 是否显示 logger 名。为 false 时**不渲染那一列**（而不是渲染一个空占位格）：
+   * 留空列会把消息列挤窄，窄屏上消息就只剩几个字。
+   */
+  showLogger: boolean;
 }
 
 /**
- * 日志行。等宽字体、时间/级别/logger/消息四段。
+ * 日志行。等宽字体、时间/级别/消息三段，logger 名可选。
  *
  * 级别**同时用颜色和文字**表达：只靠颜色的话，色觉差异或截图转灰之后就只剩
  * 一串无法区分的行。
@@ -385,9 +429,13 @@ export interface LogsListProps {
  * 刻意**不加** `aria-live`：列表每 2 秒整批重渲染，live region 会让读屏在
  * 每一拍把整屏日志重念一遍，实际效果是这一页对读屏用户完全不可用。
  */
-export function LogsList({ items, level }: LogsListProps) {
+export function LogsList({ items, level, showLogger }: LogsListProps) {
   return (
-    <ol className="logs__list" data-testid="logs-list">
+    <ol
+      // 没有 logger 列时由修饰类换一套列宽（见 logs.css），时间/级别仍定宽对齐
+      className={`logs__list${showLogger ? '' : ' logs__list--no-logger'}`}
+      data-testid="logs-list"
+    >
       {items.map((entry, index) => {
         const parts = logLineParts(entry);
         const tone = levelTone(entry.level);
@@ -405,7 +453,7 @@ export function LogsList({ items, level }: LogsListProps) {
               {parts.time}
             </time>
             <span className={`logs__level logs__level--${tone}`}>{parts.level}</span>
-            <span className="logs__logger">{parts.logger}</span>
+            {showLogger ? <span className="logs__logger">{parts.logger}</span> : null}
             <span className="logs__message">{parts.message}</span>
           </li>
         );
@@ -435,6 +483,9 @@ export function LogsPage() {
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [paused, setPaused] = useState(false);
+  // 默认关：先让人读得清消息。不持久化——这一页是排障时的临时视图，
+  // 记住上次的显示选择反而会让某次排查后"名字突然不见了"成了新谜题。
+  const [showLogger, setShowLogger] = useState(false);
   const [view, setView] = useState<LogsView>({ status: 'loading' });
   const [refreshNonce, setRefreshNonce] = useState(0);
 
@@ -531,14 +582,7 @@ export function LogsPage() {
 
   return (
     <div className="page logs-page" data-testid="logs-page">
-      <div className="page__head">
-        <div>
-          <h1 className="page__title">日志</h1>
-          <p className="page__subtitle">
-            每次最多 {LOG_LIMIT} 条，按时间正序排列，最新的在最下面，每 {LOG_POLL_MS / 1000} 秒自动刷新。
-          </p>
-        </div>
-      </div>
+      <LogsHeader counts={counts} />
 
       <p className="logs__boundary" data-testid="logs-boundary">
         只有本进程：多副本部署时这里看到的是被分到的那一个副本。缓冲写满后最旧的会被覆盖，
@@ -559,13 +603,14 @@ export function LogsPage() {
         level={level}
         search={search}
         paused={paused}
-        counts={counts}
+        showLogger={showLogger}
         kind={kind}
         onKind={setKind}
         onLevel={setLevel}
         onSearch={setSearch}
         onTogglePause={() => setPaused((value) => !value)}
         onRefresh={() => setRefreshNonce((value) => value + 1)}
+        onToggleLogger={() => setShowLogger((value) => !value)}
       />
 
       {view.status === 'error' ? (
@@ -592,7 +637,7 @@ export function LogsPage() {
             <span className="spinner" aria-hidden="true" /> 正在读取日志…
           </div>
         ) : (
-          <LogsList items={items} level={level} />
+          <LogsList items={items} level={level} showLogger={showLogger} />
         )}
       </div>
     </div>

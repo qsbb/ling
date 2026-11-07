@@ -333,14 +333,19 @@ async def test_gate_blocked_leaves_candidate_alone(logged_in: TestEnv) -> None: 
     oid = await _candidate()
     conn = _Connector()
 
-    # 时区未知 → gate 直接拦下（详见 data 里"勿扰时段按 UTC 算"那个修复）
+    # 用**勿扰时段**制造"门控没过"：SAFE_NOW = UTC 04:00，纽约当地 00:00
+    # 落在 23:00-08:00 里。
+    #
+    # 这里原来靠"时区未知 → gate 直接拦下"，那条门已经删掉了：默认时区
+    # （Asia/Shanghai）让缺省也有值，否则"没配一个环境变量"就等于她永远
+    # 不主动开口（见 `ling/settings/user_preferences.py`）。
     async with session_scope() as session:
         await dispatch_pending(
             session,
             actor_id=ACTOR,
             connector=conn,
             config_reader=_Config(enabled=True),
-            subject_timezone=None,
+            subject_timezone="America/New_York",
             now=SAFE_NOW,
         )
     assert conn.sent == [], "门控没过却发了"

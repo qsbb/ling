@@ -1,4 +1,4 @@
-"""默认槽位：四个槽位怎么存、每个职责最后跑哪个模型。
+"""默认槽位：五个槽位怎么存、每个职责最后跑哪个模型。
 
 ## 为什么要有这个文件
 
@@ -77,19 +77,33 @@ async def _publish_slots(env: TestEnv) -> dict:
 # ------------------------------------------------------------ 槽位怎么存
 
 
-async def test_config_exposes_four_slots_with_labels(logged_in: TestEnv) -> None:
-    """四个槽位要有稳定键、中文名、一句说明、以及"谁在跟着我"。"""
+async def test_config_exposes_five_slots_with_labels(logged_in: TestEnv) -> None:
+    """五个槽位要有稳定键、中文名、一句说明、以及"谁在跟着我"。"""
     config = await _config(logged_in)
 
-    assert [s["slot"] for s in config["slots"]] == ["fast", "creation", "vision", "daily"]
+    assert [s["slot"] for s in config["slots"]] == [
+        "fast",
+        "creation",
+        "vision",
+        "video",
+        "daily",
+    ]
     labels = {s["slot"]: s["label"] for s in config["slots"]}
-    assert labels == {"fast": "快速", "creation": "创作", "vision": "识图", "daily": "日常"}
+    assert labels == {
+        "fast": "快速",
+        "creation": "创作",
+        "vision": "识图",
+        "video": "视频",
+        "daily": "日常",
+    }
     for slot in config["slots"]:
         assert slot["hint"].strip(), f"{slot['slot']} 没有说明"
         # 谁跟着它由服务端算（映射表在 ports/model.py，前端不该手抄一份）
         assert isinstance(slot["roles"], list)
     assert _slot(config, "fast")["roles"] == ["dialogue.fast"]
     assert _slot(config, "vision")["roles"] == ["perception.vision"]
+    # 视频是独立槽位：只跟 perception.video，不是和识图共用
+    assert _slot(config, "video")["roles"] == ["perception.video"]
     assert _slot(config, "creation")["roles"] == ["memory.extract"]
 
 

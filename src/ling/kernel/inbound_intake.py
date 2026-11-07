@@ -312,8 +312,14 @@ def _log_inbound_behavior(
     - ``received``  她**收到**了什么（谁、在哪、说了什么）
     - ``handled``   她**怎么处理**的（接话 / 先放着 / 没懂）
 
-    ``result.reason`` 本来就是可读句子（bridge 各处写的都是人话，例如
-    「群里的普通消息，先放着，等她刷到」），这里只做拼接，不重新解释。
+    ## 动作与理由必须来自不同字段
+
+    ``result.reason`` 只放**理由**（「群里的普通消息」）；动作（「先放着，
+    等她刷到」）来自 ``BridgeResult.action``（延后处置由 bridge 说清楚在等
+    什么），没有时由这里按 ``decision`` 补。以前 bridge 把动作也写进了
+    reason，于是日志变成「先放着，等她刷到（群里的普通消息，先放着，
+    等她刷到）」——同一句话说两遍，还占两倍长度。两个字段各写一份是
+    冗余的根源，职责分开之后重复就无从发生。
     """
     from ling.audit import behavior_event
 
@@ -344,23 +350,78 @@ def _log_inbound_behavior(
     delivered = bool(getattr(result, "delivered", False))
     decision = str(getattr(result, "decision", "") or "")
     if decision == "deferred_attention":
-        handled = f"先放着，等她刷到（{reason}）" if reason else "先放着，等她刷到"
+        # 动作由 bridge 给（"先放着，等她刷到" / "先放着，等她补一句正文"）：
+        # 同样是"延后"，等的东西不一样，这里不替它猜。
+        action = str(getattr(result, "action", "") or "") or "先放着，等她刷到"
+        handled = f"{action}（{reason}）" if reason else action
     elif getattr(result, "reply_text", None) and delivered:
         handled = "回了"
     elif getattr(result, "reply_text", None):
         handled = f"想回但没发出去（{reason}）" if reason else "想回但没发出去"
     else:
         handled = f"没接话（{reason}）" if reason else "没接话"
+
+    window_ref = str(getattr(envelope, "window_ref", "") or "")
+    # 她**没开口**的处置（先放着 / 没接话）同一窗口连着出现时只完整记一次。
+    # 开了口（回了 / 想回但没发出去）**每次都记**——那才是用户真正要看的事，
+    # 合并掉等于隐瞒她说过话。
+    if decision in {"deferred_attention", "silence"} and _is_repeated_handled(
+        window_ref, f"{decision}|{handled}"
+    ):
+        return
     behavior_event(
         "inbound_handled",
-        f"对{sender}的话：{handled}",
+        f"对 {sender} 的话：{handled}",
         outcome=decision or ("replied" if delivered else "silent"),
         attributes={
-            "window_ref": getattr(envelope, "window_ref", ""),
+            "window_ref": window_ref,
             "decision": decision,
             "delivered": delivered,
         },
     )
+
+
+# ---------------------------------------------------------------- 处置日志降噪
+
+# 同一窗口、同一句处置的"安静期"（秒）。
+#
+# 群聊热闹时每条普通消息都产生一行「先放着，等她刷到（群里的普通消息）」，
+# 一行信息量都没有，却把 500 条缓冲里的位置占满。这个值决定"多久没有新的
+# 同类处置就再记一次"——不是丢弃，是合并：窗口里重新安静下来之后，
+# 下一条消息会重新完整记一行。
+_HANDLED_NOTE_SECONDS = 120.0
+
+# 记着多少个窗口：只是短时降噪状态，超了就按"最久没说话"淘汰。
+# 不做无界字典——长跑进程里那会随群数一直长。
+_HANDLED_NOTE_MAX_WINDOWS = 512
+
+# ``window_ref -> (上次记下的处置签名, monotonic 时间戳)``。
+_handled_notes: dict[str, tuple[str, float]] = {}
+
+
+def _is_repeated_handled(window_ref: str, signature: str) -> bool:
+    """这句处置刚刚在同一窗口记过吗？（是 → 本次省略，别的什么都不丢）
+
+    只影响 ``inbound_handled`` 这一行：``inbound_received`` 仍然逐条记
+    （那条里有正文，是真正要看的），``handled_reason`` 落库更是完全不受
+    影响——这里从头到尾没碰过数据库和 ``BridgeResult``。
+    """
+    now = time.monotonic()
+    previous = _handled_notes.get(window_ref)
+    repeated = (
+        previous is not None
+        and previous[0] == signature
+        and now - previous[1] < _HANDLED_NOTE_SECONDS
+    )
+    # 时间戳每次都推到"现在"：只要这个窗口还在连着说同类的话，就一直算
+    # 同一段，不再冒新的行；真正安静下来之后再开口，才会重新记。
+    _handled_notes[window_ref] = (signature, now)
+    if len(_handled_notes) > _HANDLED_NOTE_MAX_WINDOWS:
+        for stale, _ in sorted(_handled_notes.items(), key=lambda kv: kv[1][1])[
+            : len(_handled_notes) - _HANDLED_NOTE_MAX_WINDOWS
+        ]:
+            _handled_notes.pop(stale, None)
+    return repeated
 
 
 __all__ = ["process_inbound_payload"]

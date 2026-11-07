@@ -937,7 +937,8 @@ LING_ACCESS_LIST=10001       # 逗号分隔的 QQ 号
 ### 6.1.2 其它运行时开关
 
 ```bash
-LING_USER_TIMEZONE=Asia/Shanghai  # 勿扰时段、每日限额按当地作息算
+LING_USER_TIMEZONE=Asia/Shanghai  # 兜底时区；优先级：设置页填的 > 这个变量 > Asia/Shanghai
+                                  # （勿扰时段、每日限额、「今天」的边界都按它算）
 LING_CONTEXT_BUDGET_SCALE=1.0     # 整体缩放上下文预算（0.5 = 25k token）
 LING_ONEBOT_PROACTIVE=0           # 主动推送能力位（平台权限探测结果，不是偏好）
 ```

@@ -183,6 +183,10 @@ class ModelRole(StrEnum):
     dialogue_deep = "dialogue.deep"
     dialogue_group = "dialogue.group"
     perception_vision = "perception.vision"
+    # 看视频（媒体证据 kind=video）。与 perception.vision 分开：同一个供应商
+    # kind 下既有只认图片的模型，也有能读多帧/视频的模型，合成一个职责就没法
+    # 分别绑定。能力仍按 ``chat`` 判（见 ports/model.py::PROFILE_CAPABILITIES）。
+    perception_video = "perception.video"
     speech_asr = "speech.asr"
     speech_tts = "speech.tts"
     realtime_voice = "realtime.voice"
@@ -363,6 +367,19 @@ class SessionRecord(StrictModel):
     updated_at: datetime
     message_count: int = Field(default=0, ge=0)
     archived: bool = False
+    # 这个会话**叫什么**（群名 / 渠道侧昵称）。``title`` 不承担这个职责：
+    # 渠道窗口的 title 里存的是平台窗口标识（``onebot-x:group:100…``），
+    # 那是投递用的坐标，不是给人看的名字。
+    #
+    # 采集不到就是 ``null``——不要拿"群 100…"或裸 subject id 冒充名字：
+    # 前端能按 ``channel`` + ``peer_id`` 自己回退，编一个假名字反而盖掉了
+    # "我们没采集到"这个事实。
+    display_name: str | None = None
+    # 窗口所在的渠道（``web`` / ``onebot`` / ``qqbot`` …）。前端据它决定
+    # 副标题怎么显示（web 会话没有平台对端）。
+    channel: str = "web"
+    # 平台侧对端 id：群聊是群号、私聊是对方 QQ 号；web 窗口为 ``null``。
+    peer_id: str | None = None
 
 
 class ChatMessage(StrictModel):
@@ -387,6 +404,14 @@ class ChatMessage(StrictModel):
     # DESIGN 的原则是沉默和失败都要能被解释。
     handled_as: str | None = None
     handled_reason: str | None = None
+    # **谁说的**（人话名字）。群聊里是发言人的群名片，没有名片才用昵称。
+    # ``null`` 表示我们确实不知道——历史消息没有采到名字，
+    # 或者这条是她自己说的。不要用 "用户" / "群友" 之类的占位符填空：
+    # 那会让"不知道"看起来像"知道"。
+    sender_name: str | None = None
+    # 发言人的平台标识（QQ 号；解析不到时退回 subject id）。
+    # 前端用它把人分组，所以它必须对同一个人**始终是同一个值**。
+    sender_id: str | None = None
 
 
 # ---------------------------------------------------------------- 能力与回执

@@ -43,24 +43,24 @@ class GateDecision:
     reasons: list[str] = field(default_factory=list)
 
 
-def _resolve_timezone(name: str | None) -> tuple[tzinfo, bool]:
-    """解析用户时区，返回 (时区, 是否显式指定)。
+def _resolve_timezone(name: str | None) -> tzinfo:
+    """解析用户时区。
 
-    第二个返回值让调用方能**说出**"我其实不知道你的时区"，
-    而不是静默按 UTC 算——后者会让勿扰时段在错误的时间生效，
-    而用户只看到"她怎么这个点找我"，无从判断是配置问题。
+    **默认值不在这个文件里**：`lings/settings/user_preferences.py` 是"DB 偏好 >
+    环境变量 > 默认"的唯一实现，调用方（总览、worker、`/v1/proactive`）
+    已经用它算好再传进来。这里只处理"调用方没传"和"传了个坏名字"两种情况，
+    两者都退到同一个默认值——原来这里退到 UTC 并**整条停掉主动联系**，
+    结果是"没配环境变量"这一个原因就能让她再也不主动开口。
 
     注意缺省**不能**用 `datetime.now().astimezone()`（服务器本地时区）：
     那会让同一份代码在不同部署机器上行为不同，且与用户实际作息无关。
     """
-    if name:
-        try:
-            from zoneinfo import ZoneInfo
+    from ling.settings.user_preferences import resolve_timezone
 
-            return ZoneInfo(name), True
-        except Exception:  # noqa: BLE001 - 无效时区名回退到 UTC
-            pass
-    return UTC, False
+    resolved, _source = resolve_timezone(name, None)
+    from zoneinfo import ZoneInfo
+
+    return ZoneInfo(resolved)
 
 
 class ProactivityService:
@@ -152,6 +152,13 @@ class ProactivityService:
         本地时区。服务器在 UTC、用户在东八区时，"22:00-08:00 勿扰"
         会按 UTC 算，等于在用户清醒时静音、在凌晨打扰。
         "今日已发几条"同理，必须按用户当地的"今天"划分。
+
+        **时区缺失不再是一道门**：默认值（``Asia/Shanghai``）由
+        ``lings/settings/user_preferences.py`` 统一给出。以前这里"不知道时区
+        就整条停掉"，方向是对的（不知道就别按错的时段打扰），代价太大：
+        没配一个环境变量 = 她永远不主动开口，而用户只看到一句
+        "用户时区未设置"却找不到能填的地方。现在时区**总是有值**，这道门
+        也就不存在了；"这是默认值不是你设的"由设置页负责说清楚。
         """
         now = now or datetime.now(UTC)
         # 调用方显式传的优先；没传才用策略。这样既能让设置生效，
@@ -162,24 +169,7 @@ class ProactivityService:
         quiet_end = quiet_end or time(qe[0], qe[1])
         if daily_limit is None:
             daily_limit = self._policy.proactive_daily_limit
-        tz, tz_explicit = _resolve_timezone(subject_timezone)
-        if not tz_explicit:
-            # 时区未知时**直接拦下**，不再往下算。
-            #
-            # 取舍：勿扰时段的全部意义就是"不在错误的时间打扰人"。不知道
-            # 用户时区还照常投递，等于这条保护根本不存在——而用户只会觉得
-            # "她怎么这个点找我"，无从判断是配置问题。
-            #
-            # **不再继续算**也很重要：继续按 UTC 算会让 gate_reasons 里出现
-            # "处于勿扰时段（23:00-08:00）"这种我们根本不知道真假的断言。
-            # 不知道就只说不不知道的那一件事。
-            return GateDecision(
-                allowed=False,
-                reasons=[
-                    "用户时区未设置（LING_USER_TIMEZONE），"
-                    "无法判断勿扰时段，已暂停主动联系"
-                ],
-            )
+        tz = _resolve_timezone(subject_timezone)
         reasons: list[str] = []
         if user_opted_out:
             reasons.append("用户已关闭主动联系")

@@ -57,25 +57,36 @@ async def test_quiet_hours_use_subject_timezone(logged_in: TestEnv) -> None:
     assert tokyo.allowed is True, f"东京 08:00 应已出勿扰: {tokyo.reasons}"
 
 
-async def test_missing_timezone_blocks_instead_of_guessing(logged_in: TestEnv) -> None:
-    """时区未知时**暂停**主动联系，而不是按 UTC 硬算并照常打扰。
+async def test_missing_timezone_falls_back_to_default_instead_of_blocking(
+    logged_in: TestEnv,
+) -> None:
+    """时区没传时用**默认时区**（Asia/Shanghai）判断，不再整条停掉。
 
-    取舍：勿扰时段的全部意义就是"不在错误的时间打扰人"。不知道用户时区
-    还照常投递，等于这条保护根本不存在——而用户只会觉得"她怎么这个点找我"，
-    无从判断是配置问题。
+    这是行为变更，理由要写清：以前"不知道时区就暂停主动联系"，方向是对的
+    （宁可不打扰，也不在错误的时间打扰），代价却太大——没配一个环境变量等于
+    她永远不会先开口，而用户只看到一句"用户时区未设置"却找不到能填的地方。
 
-    暂停 + 明说原因可解释；静音时段错位不可解释。
+    现在默认值由 `ling/settings/user_preferences.py` 统一给出（DB 偏好 >
+    环境变量 > Asia/Shanghai），时区**总是有值**。UTC 12:00 = 上海 20:00，
+    不在 22:00-08:00 勿扰窗里，所以这次应当放行。
     """
     utc_1200 = datetime(2030, 6, 1, 12, 0, tzinfo=UTC)
     result = await _gate(logged_in, now=utc_1200, subject_timezone=None)
-    assert result.allowed is False, "时区未知却放行了"
-    assert any("LING_USER_TIMEZONE" in r for r in result.reasons), (
-        f"没说清怎么修：{result.reasons}"
+    assert result.allowed is True, f"默认时区下不该停掉主动联系: {result.reasons}"
+    assert not any("LING_USER_TIMEZONE" in r for r in result.reasons), (
+        f"还在提「时区未设置」: {result.reasons}"
     )
+    # 默认时区是上海：UTC 21:00 = 上海次日 05:00，仍在勿扰窗 —— 证明它真的
+    # 用上海算，而不是"没传就一律放行"。
+    quiet = await _gate(
+        logged_in, now=datetime(2030, 6, 1, 21, 0, tzinfo=UTC), subject_timezone=None
+    )
+    assert quiet.allowed is False
+    assert any("勿扰" in r for r in quiet.reasons), quiet.reasons
 
 
 async def test_known_timezone_lets_the_same_moment_through(logged_in: TestEnv) -> None:
-    """同样的时刻，给了时区就放行——证明拦截的原因确实是"不知道时区"。"""
+    """显式给了时区就按它算——与默认值那条彼此独立。"""
     utc_1200 = datetime(2030, 6, 1, 12, 0, tzinfo=UTC)
     result = await _gate(logged_in, now=utc_1200, subject_timezone="Asia/Shanghai")
     assert result.allowed is True, f"上海 20:00 不该是勿扰: {result.reasons}"
@@ -205,18 +216,25 @@ async def test_all_reasons_collected(logged_in: TestEnv) -> None:
 
 
 def test_resolve_timezone_never_uses_server_local() -> None:
-    """缺省必须 UTC——不能是 `datetime.now().astimezone()`。"""
-    from ling.domains.proactive.service import _resolve_timezone
+    """缺省必须来自**唯一解析出处**，不能是 `datetime.now().astimezone()`。
 
-    tz, explicit = _resolve_timezone(None)
-    assert tz is UTC
-    assert explicit is False, "没传时区时必须能说出「我不知道」"
-    bad, bad_explicit = _resolve_timezone("Not/AZone")
-    assert bad is UTC
-    assert bad_explicit is False, "无效时区名也不能假装知道"
-    good, good_explicit = _resolve_timezone("Asia/Shanghai")
+    服务器本地时区会让同一份代码在不同部署机器上按不同时间判断勿扰，
+    而且与用户实际作息无关。这条同时钉住"默认值不在 proactive 里另写一份"：
+    期望值直接问 `ling/settings/user_preferences.py` 要。
+    """
+    from ling.domains.proactive.service import _resolve_timezone
+    from ling.settings.user_preferences import DEFAULT_USER_TIMEZONE, resolve_timezone
+
+    expected, source = resolve_timezone(None, None)
+    assert expected == DEFAULT_USER_TIMEZONE
+    assert source == "default"
+
+    tz = _resolve_timezone(None)
+    assert str(tz) == expected, "缺省时区与统一解析不一致（有人又写了一层兜底）"
+    # 无效时区名同样回退到默认值，而不是按服务器时区算
+    assert str(_resolve_timezone("Not/AZone")) == expected
+    good = _resolve_timezone("Asia/Shanghai")
     assert str(good) == "Asia/Shanghai"
-    assert good_explicit is True
 
 
 async def test_cross_day_opportunity_counted_by_send_time(logged_in: TestEnv) -> None:
@@ -325,9 +343,8 @@ async def test_proactive_route_consults_real_capability(
 
     from ling.capabilities import channels
 
-    # 本用例只看「渠道」这条原因，因此把用户时区固定下来：clean env 下
-    # `LING_USER_TIMEZONE` 未设置时 gate 会直接只报时区原因，渠道原因
-    # 根本不会被计算。只在本用例临时替换 app 的 Settings，不动 conftest。
+    # 本用例只看「渠道」这条原因，因此把用户时区固定下来（不依赖默认值
+    # 是什么：默认值与它相同，但显式钉住才不会因为改默认值而改变判据）。
     monkeypatch.setattr(
         logged_in.app.state,
         "settings",
@@ -370,10 +387,8 @@ async def test_proactive_route_reports_missing_channel(
 
     from ling.capabilities import channels
 
-    # 本用例断言的是「渠道」这条原因。用户时区未知时 gate 会直接返回
-    # LING_USER_TIMEZONE，渠道原因根本不会被计算（那是隔壁用例的场景）。
-    # 只在本用例临时替换 app 的 Settings；不动 conftest，也不放宽生产的
-    # 「未知时区默认拒绝」策略，避免影响其它用例。
+    # 本用例断言的是「渠道」这条原因，所以把时区钉住（免得日后改默认值时
+    # 这条用例换个含义）。不动 conftest：只影响这一个用例。
     monkeypatch.setattr(
         logged_in.app.state,
         "settings",

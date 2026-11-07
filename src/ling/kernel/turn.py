@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, TurnState, new_id
 from ling.domains.conversation.service import ConversationService, MessageView
+from ling.domains.media.video import (
+    finalize_reply_text,
+    parse_watch_markers,
+    stream_safe,
+    strip_watch_markers,
+)
 from ling.infra.db import session_scope
 from ling.infra.models import ActorEvent, ActorState, OutboxEvent, utcnow
 from ling.kernel.arbiter import SpeakerArbiter
@@ -219,8 +225,13 @@ class TurnCoordinator:
         # 都是"进程内预热一份缓存、构造时同步读"（API 用 app.state.secret_cache，
         # worker 用 _SECRET_CACHE）。不传 = 只用环境变量装配语义检索。
         secret_reader: Callable[[str], str | None] | None = None,
+        # "她说要看视频"时的读取回调：``(window_id, refs) -> 观察文本 | None``。
+        # 不传就用默认装配（自己去找设置/连接器/媒体取用函数，见
+        # `domains/media/watch.py::default_watch_callback`）。
+        watch_video: Callable[[str, list[str]], Awaitable[str | None]] | None = None,
     ) -> None:
         self._router = router
+        self._watch_video = watch_video
         self._actor_id = actor_id
         self._persona_id = persona_id
         self._display_name = display_name
@@ -455,6 +466,17 @@ class TurnCoordinator:
                     )
                     return
 
+                # 标记可能在流式里被切开（``<<看视`` + ``频 m3>>``）。压住的
+                # 只是"看起来是半个标记"的尾巴，其余照常立刻发——用户不该先看到
+                # 说明书再看到它消失。
+                stream_hold = ""
+
+                def _visible(delta: str) -> str:
+                    nonlocal stream_hold
+                    stream_hold += delta
+                    ready, stream_hold = stream_safe(stream_hold)
+                    return strip_watch_markers(ready)
+
                 try:
                     async for chunk, outcome in self._router.stream(
                         config, profile=profile, messages=messages
@@ -491,7 +513,7 @@ class TurnCoordinator:
                                         data={
                                             "turn_id": turn_id,
                                             "state": TurnState.streaming.value,
-                                            "caught_up": delivered,
+                                            "caught_up": strip_watch_markers(delivered),
                                             "note": "排到发言权，补齐排队期间产生的文字",
                                         },
                                     )
@@ -501,9 +523,10 @@ class TurnCoordinator:
                             # 仍在排队：本轮不产生任何对外片段
                             continue
 
+                        visible = _visible(chunk.delta)
                         if self._stream_log is not None:
                             self._stream_log.append(
-                                turn_id=turn_id, attempt=attempt, text=chunk.delta
+                                turn_id=turn_id, attempt=attempt, text=visible
                             )
                         if self._speak_lease is not None:
                             renewed = await self._speak_lease.extend(  # type: ignore[attr-defined]
@@ -547,14 +570,39 @@ class TurnCoordinator:
                             floor_settled = True
                             lease_lost = True
                             continue
+                        if not visible:
+                            # 这一段全是标记（或半个标记）：不要往前端推空片段
+                            continue
                         await queue.put(
                             TurnStreamEvent(
                                 event="delta",
-                                data={"text": chunk.delta, "turn_id": turn_id},
+                                data={"text": visible, "turn_id": turn_id},
                             )
                         )
                 except ModelError as exc:
                     error = exc
+
+                # 出口清洗：剥掉 <<看视频 mX>>（幂等，再剥一次也不出错）。
+                # 顺带丢掉"半个标记"的尾巴——模型被打断时会出现这种残片。
+                delivered, watch_refs = parse_watch_markers(delivered)
+                if watch_refs:
+                    # 她这一轮想看一眼视频。**先读，再决定怎么收尾**：
+                    # 读到后如果正文是空的，就让她接着说一句（见下面），
+                    # 而不是先发一条空消息再补一条。
+                    observation = await self._watch_videos(window_id, watch_refs)
+                    if observation and not delivered.strip():
+                        delivered = await self._follow_up_after_watch(
+                            messages=messages,
+                            observation=observation,
+                            config=config,
+                            profile=profile,
+                            turn_id=turn_id,
+                            token=token,
+                            queue=queue,
+                            held_by_me=held_by_me,
+                        )
+                    # 正文非空时：观察已经写进证据，下一轮上下文会自动带上
+                    # （context.py 的描述块），**不再额外发一条消息**。
 
                 await self._finalize(
                     conversation=conversation,
@@ -718,6 +766,87 @@ class TurnCoordinator:
                 )
         return False
 
+    async def _watch_videos(self, window_id: str, refs: list[str]) -> str | None:
+        """按标记读视频，返回"她看到了什么"（失败/没预算 → ``None``）。
+
+        失败**不抛**：看一眼视频失败不该把整轮做成失败（用户已经等到回复了）。
+        具体原因由 ``media/watch.py`` 写成行为日志，这里只负责不让她假装看过。
+        """
+        callback = self._watch_video
+        if callback is None:
+            from ling.domains.media.watch import default_watch_callback
+
+            callback = default_watch_callback(router=self._router, actor_id=self._actor_id)
+            self._watch_video = callback  # 只装配一次
+        try:
+            return await callback(window_id, list(refs))
+        except Exception as exc:  # noqa: BLE001 - 看视频失败不影响本轮
+            logger.info("看视频回调失败（按没看成处理）：%s", type(exc).__name__)
+            return None
+
+    async def _follow_up_after_watch(
+        self,
+        *,
+        messages: list[object],
+        observation: str,
+        config: EffectiveConfig,
+        profile: str,
+        turn_id: str,
+        token: object,
+        queue: asyncio.Queue[TurnStreamEvent | None],
+        held_by_me: bool,
+    ) -> str:
+        """她这轮只写了标记（正文为空）时，**在同一轮里**再生成一次。
+
+        ## 为什么不是"发一条空消息再补一条"
+
+        用户看到的第一条会是空气泡（或者干脆什么都没有），第二条才是她
+        真正想说的话——中间那段静默没法解释。同一轮里补一次生成，对外
+        仍然只有一条回复，符合"她看了一眼才说话"的直觉。
+
+        读失败/超预算时**根本不会走到这里**（调用方只有在 ``observation``
+        非空时才调）：不能让她说"我看了"，也不能凭空编一句。
+        """
+        from ling.ports.model import ChatMessageIn
+
+        observation_line = ChatMessageIn(
+            role="user",
+            content=(
+                "（你刚看了一眼这个视频，看到的是：\n"
+                f"{observation}\n"
+                "现在用你自己的话接着说，不要提到这条提示，也不要复述标记。）"
+            ),
+        )
+        text = ""
+        hold = ""
+        try:
+            async for chunk, _outcome in self._router.stream(
+                config,
+                profile=profile,
+                messages=[*messages, observation_line],  # type: ignore[list-item]
+            ):
+                if getattr(token, "stopped", False):
+                    break
+                if not chunk.delta:
+                    continue
+                text += chunk.delta
+                hold += chunk.delta
+                ready, hold = stream_safe(hold)
+                visible = strip_watch_markers(ready)
+                if visible and held_by_me:
+                    await queue.put(
+                        TurnStreamEvent(
+                            event="delta",
+                            data={"text": visible, "turn_id": turn_id},
+                        )
+                    )
+        except ModelError as exc:
+            # 补一次生成失败：正文仍然是空的 → 什么都不发（不是伪装成功）
+            logger.info("看视频后的跟进生成失败：%s", exc.kind.value)
+            return ""
+        cleaned, _refs = parse_watch_markers(text)
+        return cleaned
+
     async def _finalize(
         self,
         *,
@@ -747,6 +876,13 @@ class TurnCoordinator:
         else:
             state = TurnState.completed
             code = None
+
+        # 最后一道闸：**完整标记与半截标记**都不许进库/外发。
+        #
+        # 半截标记（``<<看视频 m3``）是模型被打断、或流式最后一段留下的残片：
+        # 它是说明书的碎片，落库后历史渲染里会露出来，外发更糟。这里用的
+        # `finalize_reply_text` = 剥完整标记 + 去半截尾巴，幂等，重复调用无害。
+        delivered = finalize_reply_text(delivered)
 
         actor_message: MessageView | None = None
         # 表达层：先去掉客服式追问，再按语义分段。

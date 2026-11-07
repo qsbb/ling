@@ -188,11 +188,17 @@ def _encode_message(message: object) -> dict[str, Any]:
     role = getattr(message, "role", "user")
     content = getattr(message, "content", "")
     images = tuple(getattr(message, "images", ()) or ())
-    if not images:
+    videos = tuple(getattr(message, "videos", ()) or ())
+    if not images and not videos:
         return {"role": role, "content": content}
     parts: list[dict[str, Any]] = []
     if content:
         parts.append({"type": "text", "text": content})
     for image in images:
         parts.append({"type": "image_url", "image_url": {"url": image.url}})
+    # 原生视频输入：OpenAI 兼容世界里的事实标准是 ``video_url`` 段
+    # （Gemini / Qwen-VL / 豆包 / 智谱 / Kimi 的兼容层都收这个形状）。
+    # 不支持的端点会明确报错，由调用方退回抽帧——这里不做能力猜测。
+    for video in videos:
+        parts.append({"type": "video_url", "video_url": {"url": video.url}})
     return {"role": role, "content": parts}

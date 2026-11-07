@@ -71,13 +71,41 @@
   font-size: 13px;
 }
 
+/* 条数说明在页头右侧（见 LogsHeader）。它以前是工具栏里的最后一项，
+   一旦换行就横成整条窄带压在列表上方；现在只在页头占一行字的宽度。 */
 .logs__count {
-  margin-left: auto;
+  margin: 0;
+  /* 与标题首行大致对齐（标题自带 8px 上边距） */
+  padding-top: 12px;
   font-size: 11.5px;
+  line-height: 1.6;
   color: var(--ink-faint);
-  /* 条数说明会换行，别把按钮挤走 */
+  text-align: right;
+  /* 不设固定宽度：窄屏让它换行，绝不为一行说明撑出横向滚动 */
   min-width: 0;
+  max-width: 46ch;
   overflow-wrap: anywhere;
+}
+
+/* 显示/隐藏 logger 名的开关。做成小药丸，和工具栏里的按钮同一行对齐。 */
+.logs__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--paper-raised);
+  color: var(--ink-soft);
+  font-size: 12px;
+  /* 375px 下靠工具栏自身换行，别把标签拆成两行 */
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.logs__toggle input {
+  accent-color: var(--accent);
+  margin: 0;
 }
 
 /* ------------------------------------------------------------------ 列表 */
@@ -112,6 +140,12 @@
   padding: 2px 12px;
   border-left: 2px solid transparent;
   align-items: baseline;
+}
+
+/* 关掉 logger 列时把那一列**真正去掉**（DOM 里也没有节点，见 LogsList）：
+   只把内容藏起来会留下一个空列，消息列被白白挤窄，窄屏上更明显。 */
+.logs__list--no-logger .logs__row {
+  grid-template-columns: 84px 62px minmax(0, 1fr);
 }
 
 .logs__row:hover {
@@ -234,6 +268,14 @@
     padding: 6px 10px;
   }
 
+  /* 没有 logger 行时连那一行网格也去掉，别留 1px 的空行 */
+  .logs__list--no-logger .logs__row {
+    grid-template-columns: 84px minmax(0, 1fr);
+    grid-template-areas:
+      'time level'
+      'message message';
+  }
+
   .logs__time {
     grid-area: time;
   }
@@ -250,14 +292,18 @@
     grid-area: message;
   }
 
+  /* 页头变纵向（styles.css 的 .page__head）后，条数说明左对齐跟在标题下面 */
   .logs__count {
-    margin-left: 0;
+    padding-top: 0;
+    max-width: none;
     width: 100%;
+    text-align: left;
   }
 
-  /* 触控目标 ≥44×44（下拉/输入/按钮都要够得着） */
+  /* 触控目标 ≥44×44（下拉/输入/按钮/开关都要够得着） */
   .logs__select,
   .logs__input,
+  .logs__toggle,
   .logs__toolbar .button {
     min-height: 44px;
   }

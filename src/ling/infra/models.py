@@ -753,6 +753,38 @@ class SessionPolicyRow(Base, TimestampMixin):
     revision: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class UserPreferenceRow(Base, TimestampMixin):
+    """每个 subject 的**用户自己的**偏好（当前只有时区）。
+
+    为什么单独一张表、而不是塞进 `config_revisions.payload`：
+
+    - 它是**用户的事实**，不是模型/行为配置。修订的语义是"我们怎么跑"，
+      回滚到旧修订不该把"我在东八区"一起回滚掉。
+    - 它决定"今天"的边界（总览日程、主动联系日限额）与勿扰时段落在哪几小时。
+      落进修订意味着改它要走一次发布，而发布失败会让勿扰时段整段算错。
+
+    参照 `SessionPolicyRow` 的做法：按 subject 主键、独立成表、不进修订。
+
+    ``timezone`` 为空 = **没设过**（不是"设成了空字符串"）。解析优先级见
+    ``ling/settings/user_preferences.py``：偏好 → 环境变量 → 默认
+    ``Asia/Shanghai``。这个区分必须保留，否则"清掉偏好、回退默认"会变成
+    一次隐式写入。
+    """
+
+    __tablename__ = "user_preferences"
+
+    subject_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # IANA 名（如 Asia/Shanghai）。写入前已校验；读取时仍再校验一次，
+    # 因为库里可能有手工改过的值。
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 改动次数。便于回答"这人的时区什么时候被改过"，与 SessionPolicyRow 对齐。
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    # 视频读取模式：``frames``（抽帧，默认）/ ``native``（原生视频输入）。
+    # 为空 = 没设过，读侧按 ``frames`` 处理（见 settings/user_preferences.py）。
+    # **用户偏好**，不是模型配置：换个模型不该把"我怎么看视频"重置掉。
+    video_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
 class AwarenessItemRow(Base):
     """跨会话意识条目：派生投影，不是原文（ADR-0004 §3）。
 
@@ -1574,6 +1606,7 @@ __all__ = [
     "SessionPolicyRow",
     "SpeakLeaseRow",
     "TurnControlRow",
+    "UserPreferenceRow",
     "SpeechSegment",
     "WorldPlace",
     "DeliveryReceiptRow",

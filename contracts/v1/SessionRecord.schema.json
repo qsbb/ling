@@ -14,16 +14,45 @@
       "title": "Archived",
       "type": "boolean"
     },
+    "channel": {
+      "default": "web",
+      "title": "Channel",
+      "type": "string"
+    },
     "created_at": {
       "format": "date-time",
       "title": "Created At",
       "type": "string"
+    },
+    "display_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Display Name"
     },
     "message_count": {
       "default": 0,
       "minimum": 0,
       "title": "Message Count",
       "type": "integer"
+    },
+    "peer_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Peer Id"
     },
     "schema_version": {
       "const": "v1",

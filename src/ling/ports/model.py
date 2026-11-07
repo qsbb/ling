@@ -83,6 +83,16 @@ PROFILE_CAPABILITIES: dict[str, ModelCapability] = {
     "dialogue.deep": ModelCapability.chat,
     "dialogue.group": ModelCapability.chat,
     "perception.vision": ModelCapability.chat,
+    # 看视频要的也是 ``chat``，**故意不新增 ``video`` 能力**。
+    #
+    # 理由：能力表是"供应商 kind 能不能服务这个角色"的唯一判据，而现有
+    # 对话 kind 的能力集里没有、也不该凭空出现 ``video``。新增一个没人能
+    # 提供的能力，等于把这一项变成"所有供应商都不匹配"——用户看到一张永远
+    # 红的槽位卡，绑谁都说"这家不支持"，而实际上能不能看懂视频取决于
+    # **具体模型**（同一个 kind 下既有纯文本模型也有多模态模型），
+    # 不是取决于 kind。所以能力这里只表达"它走的是 chat 协议"，
+    # "这个模型看不看得懂视频"由 SLOT_HINTS 说清楚，交给用户选。
+    "perception.video": ModelCapability.chat,
     "memory.extract": ModelCapability.chat,
     "memory.embed": ModelCapability.embed,
     "memory.rerank": ModelCapability.rerank,
@@ -117,18 +127,23 @@ def kind_supports_profile(kind: str, profile: str) -> bool:
 
 # ---------------------------------------------------------------- 默认槽位
 #
-# 四个「默认模型」槽位：用户先给四件**常做的事**各挑一个模型，再决定每个
+# 五个「默认模型」槽位：用户先给五件**常做的事**各挑一个模型，再决定每个
 # 职责要不要单独指定。没单独指定的职责就跟着自己那个槽位走。
 #
-# 为什么不合并成一个"默认模型"：四件事对模型的要求真的不同——回消息要快，
-# 看图片必须有视觉能力，写东西值得用贵的。合成一个就得在快与好之间二选一，
-# 而用户明明可以两个都要。
+# 为什么不合并成一个"默认模型"：五件事对模型的要求真的不同——回消息要快，
+# 看图片/看视频必须有对应的多模态能力，写东西值得用贵的。合成一个就得在
+# 快与好之间二选一，而用户明明可以两个都要。
 class ProviderSlot(StrEnum):
     """默认槽位的稳定键。**已发布的契约**：不要改成中文，也不要换拼写。"""
 
     fast = "fast"
     creation = "creation"
     vision = "vision"
+    # 「看视频」与「识图」是两个槽位，不是同一个：
+    # 同一个 kind 下既有"只认图片"的模型，也有能看视频的模型；动画（GIF/动图）
+    # 走识图槽位还能凑合，真正的视频只有多模态视频模型才看得懂。合成一个
+    # 槽位就必须在"看得清图片"和"看得懂视频"之间二选一。
+    video = "video"
     daily = "daily"
 
 
@@ -139,6 +154,7 @@ SLOT_ORDER: tuple[ProviderSlot, ...] = (
     ProviderSlot.fast,
     ProviderSlot.creation,
     ProviderSlot.vision,
+    ProviderSlot.video,
     ProviderSlot.daily,
 )
 
@@ -146,6 +162,7 @@ SLOT_LABELS: dict[ProviderSlot, str] = {
     ProviderSlot.fast: "快速",
     ProviderSlot.creation: "创作",
     ProviderSlot.vision: "识图",
+    ProviderSlot.video: "视频",
     ProviderSlot.daily: "日常",
 }
 
@@ -155,6 +172,9 @@ SLOT_HINTS: dict[ProviderSlot, str] = {
     ProviderSlot.fast: "回消息最常走的一条路，要快",
     ProviderSlot.creation: "想清楚再写：提炼、创作、要质量的活",
     ProviderSlot.vision: "必须能看图：把图片转成文字描述",
+    # 与「识图」的区别要直接写出来，否则用户会以为"能看图就能看视频"。
+    # 半句"她主动想看时才读"是给成本预期：视频描述不是逐条自动跑的。
+    ProviderSlot.video: "必须能看懂视频：把视频转成文字描述（她主动想看时才读，不逐条自动读）",
     ProviderSlot.daily: "群里闲聊，可以慢一点、便宜一点",
 }
 
@@ -169,6 +189,11 @@ PROFILE_SLOTS: dict[str, ProviderSlot] = {
     "dialogue.fast": ProviderSlot.fast,
     "dialogue.group": ProviderSlot.daily,
     "perception.vision": ProviderSlot.vision,
+    # 视频证据（kind=video）跟「视频」槽位。**注意**：媒体描述链路没有按 kind
+    # 自动切职责（用户要求"她想看才看"，不逐条自动读），接线时由调用方显式
+    # 指定 `VIDEO_PROFILE`。不跟「识图」走：用户可能只想给图片配一个便宜的
+    # 视觉模型，看视频要另找能读多帧的模型——合成一个槽位就没法分别满足。
+    "perception.video": ProviderSlot.video,
     # 记忆提炼放「创作」而不是「快速」：
     # - 「快速」是主回复链路，最在意延迟；提炼是每轮结束后的异步任务，
     #   慢一点没关系，但质量直接决定"她记不记得住"。
@@ -206,6 +231,29 @@ class ImagePart:
 
 
 @dataclass(frozen=True)
+class VideoPart:
+    """一段视频（原生视频输入模式用）。
+
+    与 ``ImagePart`` 同一个理由：端口只传递平台无关的引用（https 或 data URL），
+    具体怎么塞进请求由适配器决定。
+
+    原生视频输入**不是所有供应商都支持**（目前 Gemini / Qwen-VL / 豆包 /
+    智谱 / Kimi 一类才收）。不支持时适配器必须明确报 ``unsupported``，
+    让调用方退回抽帧——静默丢掉视频会让模型凭空回答"我看了"。
+    """
+
+    url: str
+    mime_type: str | None = None
+
+    @classmethod
+    def from_bytes(cls, data: bytes, mime_type: str = "video/mp4") -> VideoPart:
+        import base64
+
+        encoded = base64.b64encode(data).decode("ascii")
+        return cls(url=f"data:{mime_type};base64,{encoded}", mime_type=mime_type)
+
+
+@dataclass(frozen=True)
 class ChatMessageIn:
     role: str  # system | user | assistant
     content: str
@@ -213,6 +261,13 @@ class ChatMessageIn:
     # **不放进 content 里**：把 base64 塞进正文字符串会让日志、截断、
     # 字数预算全部失真，而且"这条消息有多长"变得没法算。
     images: tuple[ImagePart, ...] = ()
+    # 视频同理，且**只有原生视频模式**才填。抽帧模式下视频被拆成
+    # ``images`` 里的若干 JPEG，走的是原来那条路。
+    videos: tuple[VideoPart, ...] = ()
+
+
+def has_videos(messages: list[ChatMessageIn]) -> bool:
+    return any(m.videos for m in messages)
 
 
 @dataclass(frozen=True)
@@ -328,6 +383,8 @@ __all__ = [
     "PROFILE_CAPABILITIES",
     "PROVIDER_CAPABILITIES",
     "ChatMessageIn",
+    "VideoPart",
+    "has_videos",
     "ModelCapability",
     "ModelChunk",
     "ModelError",

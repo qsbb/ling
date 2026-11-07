@@ -223,6 +223,14 @@ def _encode_turn(message: ChatMessageIn) -> dict[str, Any]:
 
     纯文本用字符串形式（Anthropic 两种都收，字符串更短）；带图才切成块数组。
     """
+    if getattr(message, "videos", ()):
+        # Anthropic 的 Messages API 收 image / document，不收视频。
+        # 明确报错让调用方退回抽帧；静默丢弃会让模型"什么都没看到"却照常作答。
+        raise ModelError(
+            ModelErrorKind.unsupported,
+            "Anthropic 接口不支持原生视频输入",
+            retriable=False,
+        )
     if not message.images:
         return {"role": message.role, "content": message.content}
     blocks: list[dict[str, Any]] = []

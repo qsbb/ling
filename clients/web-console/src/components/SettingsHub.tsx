@@ -25,13 +25,33 @@
  *
  * 「多用户与账号」同理已经离开设置：它成了一级导航「关系」（`/relationships`）。
  * 它不在底部那行灰字里指路，因为左边导航本来就一直看得见，再指一次是多话。
+ *
+ * ## 例外：「你的本地时间」为什么在这里（而不是某个领域页）
+ *
+ * 时区**不是"她的行为调参"**，是**你**在哪儿——它没有领域对象、也没有
+ * 列表-详情生命周期，放进记忆/人设/生活页的任何一页都是错的门牌。按
+ * `docs/SETTINGS-TAXONOMY.md` 的分类轴，它同时改变 ⑤（何时开口：勿扰时段、
+ * 每日限额）与 ⑧（"今天"的边界：日程）两个决策，没有哪一类独占它。
+ *
+ * 但它也不能进配置修订：修订跟着发布/回滚走，回滚一次旧配置不该把"我在东八区"
+ * 一起回滚掉。所以后端把它存进 `user_preferences`（按 subject 一行），
+ * 走 `GET/PUT /v1/settings/preferences`——**与草稿/发布无关**，保存即生效。
+ * 这也是它在这一页上唯一一个"保存不需要点发布"的东西，界面上直接写清楚。
  */
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
-import type { TaxonomyResponse } from '../types';
+import type {
+  TaxonomyResponse,
+  TimezoneSource,
+  UserPreferencesResponse,
+  VideoMode,
+} from '../types';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
 import '../settings.css';
+// 时区小节的窄屏触控尺寸规则写在模型页那份 CSS 里（`.ms-timezone` 作用域），
+// 显式 import 让依赖可见：否则哪天模型页被拆成懒加载，这里的 44px 会悄悄失效。
+import '../model-settings.css';
 
 interface SettingsHubProps {
   onBack: () => void;
@@ -142,6 +162,362 @@ const MOVED_HINT = [
   { label: '生活节奏', path: '/life?tab=rhythm' },
 ];
 
+/* ---------------------------------------------------------- 你的本地时间 */
+
+export interface TimezoneFormProps {
+  /** 输入框里的草稿值。空串 = "没设过"（跟着环境变量/默认值走）。 */
+  draft: string;
+  /** 生效值（服务端解析后的结果）。 */
+  effective: string;
+  source: TimezoneSource;
+  /** `LING_USER_TIMEZONE` 的值。null = 没配。 */
+  env: string | null;
+  /** 服务端给的常用时区建议。**不是白名单**：任何 IANA 名都能填。 */
+  common: string[];
+  saving: boolean;
+  dirty: boolean;
+  message: { kind: 'ok' | 'error'; text: string; detail?: string } | null;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onReset: () => void;
+}
+
+/**
+ * 时区表单。**纯展示**：状态在 `TimezoneSection` 里。
+ *
+ * 为什么单独导出：静态渲染测试要断言"默认值 / 环境变量 / 你自己设的"这三句话
+ * 互不串——混成一句"当前 Asia/Shanghai"，用户会以为自己设过。
+ *
+ * 为什么用 `list` + `datalist` 而不是下拉 + "自定义"：
+ * 常用项只是**建议**，"我在 America/Argentina/Ushuaia"这种情况必须能填。
+ * 下拉 + 手填两件控件改同一个值，会出现"下拉显示 A、输入框写着 B"。
+ */
+export function TimezoneForm({
+  draft,
+  effective,
+  source,
+  env,
+  common,
+  saving,
+  dirty,
+  message,
+  onChange,
+  onSave,
+  onReset,
+}: TimezoneFormProps) {
+  // 文案尽量短：窄屏一行放不下时会折行，长句容易在末行剩 1–3 个字
+  // （验收 O3：默认值那句末行只剩「为准。」）。短句 + `text-wrap: pretty`
+  // （见 model-settings.css）一起用。
+  const sourceText =
+    source === 'preference'
+      ? `你自己设的：${effective}。存数据库里，重启和回滚都不变。`
+      : source === 'env'
+        ? `来自环境变量 LING_USER_TIMEZONE=${env ?? ''}。填一个就以你为准。`
+        : `没有设置过，用默认值 ${effective}。填一次就以你为准。`;
+
+  return (
+    <section className="settings-group" data-settings-group="local-time">
+      <div className="settings-group__head">
+        <h2 className="settings-group__title">你的本地时间</h2>
+        <p className="settings-group__note">
+          你在哪个时区。「今天」的边界、免打扰时段、每日主动联系的限额都按它算。
+        </p>
+      </div>
+
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave();
+        }}
+      >
+        {/* form-grid 是自适应网格（auto-fit minmax(170px,1fr)）：375px 下自动
+            变一列，不会把输入框挤出屏幕。 */}
+        <div className="form-grid">
+          <label className="field">
+            <span className="field__label">时区（IANA 名，例：Asia/Shanghai）</span>
+            <input
+              className="field__input"
+              value={draft}
+              list="settings-timezone-options"
+              placeholder={effective}
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="settings-timezone-input"
+              onChange={(event) => onChange(event.target.value)}
+            />
+            {/* 常用项作建议：原生 datalist 在窄屏是系统自己的选择器，
+                不会把页面撑宽，也不需要额外的 CSS。 */}
+            <datalist id="settings-timezone-options">
+              {common.map((tz) => (
+                <option key={tz} value={tz} />
+              ))}
+            </datalist>
+            <span className="field__label">{sourceText}</span>
+          </label>
+        </div>
+
+        <div className="inline-form" role="status">
+          <button
+            type="submit"
+            className="button button--primary button--small"
+            disabled={saving}
+            data-testid="settings-timezone-save"
+          >
+            {saving ? '保存中…' : '保存时区'}
+          </button>
+          <button
+            type="button"
+            className="button button--small"
+            disabled={saving}
+            data-testid="settings-timezone-reset"
+            onClick={onReset}
+          >
+            清空（回退默认）
+          </button>
+          <span className="settings-group__note">
+            {dirty ? '有未保存的改动' : '保存即生效，不走草稿/发布'}
+          </span>
+        </div>
+      </form>
+
+      {message ? (
+        <div className={`banner banner--${message.kind === 'ok' ? 'ok' : 'error'}`} role="status">
+          <div>
+            <strong>{message.text}</strong>
+            {message.detail ? <div className="banner__detail">{message.detail}</div> : null}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * 读取 / 保存用户时区。
+ *
+ * 取不到就只显示一条错误，**不挡住下面的入口**：时区读失败不该让整个设置页
+ * 变成白板（与 taxonomy 同一条理由）。
+ */
+export function TimezoneSection() {
+  const [prefs, setPrefs] = useState<UserPreferencesResponse | null>(null);
+  const [draft, setDraft] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<ExplainedError | null>(null);
+  const [message, setMessage] = useState<TimezoneFormProps['message']>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await api.userPreferences();
+      setPrefs(next);
+      // 输入框显示**库里存的原值**（null → 空串）。把生效值塞进去会让
+      // "默认值"看起来像"你自己设的"。
+      setDraft(next.stored ?? '');
+    } catch (err) {
+      setError(explainError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const submit = async (value: string) => {
+    setSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const next = await api.setTimezone(value);
+      setPrefs(next);
+      setDraft(next.stored ?? '');
+      setMessage({
+        kind: 'ok',
+        text:
+          next.source === 'preference'
+            ? `已保存：现在按 ${next.timezone} 计算「今天」和免打扰时段`
+            : `已清空：回退到 ${next.source === 'env' ? '环境变量' : '默认值'} ${next.timezone}`,
+      });
+    } catch (err) {
+      const explained = explainError(err);
+      setMessage({
+        kind: 'error',
+        text: `保存失败：${explained.reason}`,
+        ...(explained.detail ?? explained.hint
+          ? { detail: explained.detail ?? explained.hint ?? undefined }
+          : {}),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="settings-group" data-settings-group="local-time">
+        <div className="page__loading">
+          <span className="spinner" aria-hidden="true" /> 正在读取时区…
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !prefs) {
+    return (
+      <section className="settings-group" data-settings-group="local-time">
+        <div className="banner banner--error" role="status">
+          <AlertIcon />
+          <div>
+            <strong>没能读取你的时区设置</strong>
+            <div className="banner__detail">
+              {error?.reason ?? '接口没有返回内容'}。下面的入口仍然可用。
+            </div>
+          </div>
+          <button type="button" className="button button--small" onClick={() => void load()}>
+            <RefreshIcon /> 重试
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <TimezoneForm
+      draft={draft}
+      effective={prefs.timezone}
+      source={prefs.source}
+      env={prefs.env}
+      common={prefs.common}
+      saving={saving}
+      dirty={draft.trim() !== (prefs.stored ?? '')}
+      message={message ?? null}
+      onChange={(value) => {
+        setDraft(value);
+        setMessage(null);
+      }}
+      onSave={() => void submit(draft.trim())}
+      onReset={() => void submit('')}
+    />
+  );
+}
+
+/* ------------------------------------------------------------ 媒体与视频 */
+
+/**
+ * 「怎么看视频」：抽帧 / 原生视频输入。
+ *
+ * ## 为什么放这里，不放模型页
+ *
+ * 模型页管的是"用哪个模型"。这一项管的是**怎么把视频交给模型**：抽帧是
+ * 任何供应商都能用的通用做法，原生视频输入只有部分供应商支持。它跟着
+ * 用户偏好走（`user_preferences`），换模型不该把它重置掉。
+ *
+ * ## 为什么要把"只在你想看时才读"写在界面上
+ *
+ * 视频的 token 成本远高于图片，用户最担心的是"它会不会偷偷把群里的视频
+ * 全看一遍"。这句话是承诺，也是事实（后台描述队列**跳过**视频）。
+ */
+export function VideoModeSection() {
+  const [prefs, setPrefs] = useState<UserPreferencesResponse | null>(null);
+  const [error, setError] = useState<ExplainedError | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setPrefs(await api.userPreferences());
+      setError(null);
+    } catch (err) {
+      setError(explainError(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const choose = async (mode: VideoMode) => {
+    if (!prefs || prefs.video_mode === mode) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      const next = await api.setVideoMode(mode);
+      setPrefs(next);
+      setMessage(mode === 'native' ? '已保存：直接把视频交给模型（不支持时会自动退回抽帧）' : '已保存：按固定间隔抽帧');
+    } catch (err) {
+      setError(explainError(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (error && !prefs) {
+    return (
+      <section className="settings-group" data-settings-group="video-mode">
+        <div className="banner banner--error" role="status">
+          <AlertIcon />
+          <div>
+            <strong>没能读取视频读取方式</strong>
+            <div className="banner__detail">{error.reason}</div>
+          </div>
+          <button type="button" className="button button--small" onClick={() => void load()}>
+            <RefreshIcon /> 重试
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  const current = prefs?.video_mode ?? 'frames';
+  return (
+    <section className="settings-group" data-settings-group="video-mode">
+      <div className="settings-group__head">
+        <h2 className="settings-group__title">媒体与视频</h2>
+        <p className="settings-group__note">
+          不是每个视频都会去读：只有她在回复里写标记时才去看。不写标记就不读，
+          群里的视频也不会被自动看一遍。
+        </p>
+        <p className="settings-group__note">
+          {/* 标记单独一段：塞进上一句的括号里会在 375 下把行拆成
+              「如」/「&lt;&lt;看视频…&gt;&gt;」两行（一个字的孤行）。 */}
+          标记形如 <code>&lt;&lt;看视频 m…&gt;&gt;</code>。
+        </p>
+      </div>
+      <fieldset className="settings-group__body" disabled={saving}>
+        <legend>她怎么看视频</legend>
+        <label>
+          <input
+            type="radio"
+            name="video-mode"
+            value="frames"
+            checked={current === 'frames'}
+            onChange={() => void choose('frames')}
+            data-testid="settings-video-mode-frames"
+          />
+          抽帧（默认）：任何供应商都能用；按固定间隔抽几帧交给视频模型看。
+        </label>
+        <label>
+          <input
+            type="radio"
+            name="video-mode"
+            value="native"
+            checked={current === 'native'}
+            onChange={() => void choose('native')}
+            data-testid="settings-video-mode-native"
+          />
+          原生视频输入：直接把视频交给模型；只有部分供应商支持
+          （Gemini / Qwen-VL / 豆包 / 智谱 / Kimi），不支持时会自动退回抽帧并记录原因。
+        </label>
+        <p className="settings-group__note">不论哪种方式，都只有她主动想看时才读。</p>
+        {message ? <p className="settings-group__note" role="status">{message}</p> : null}
+      </fieldset>
+    </section>
+  );
+}
+
 export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
   const [taxonomy, setTaxonomy] = useState<TaxonomyResponse | null>(null);
   const [error, setError] = useState<ExplainedError | null>(null);
@@ -170,15 +546,26 @@ export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
 
   return (
     <section className="page">
-      <button type="button" className="back-link" onClick={onBack}>
+      <button type="button" className="back-link settings-hub__back" onClick={onBack}>
         <ArrowLeftIcon /> 返回聊天
       </button>
 
       <h1 className="page__title">设置</h1>
       <p className="page__hint">
         这里只有程序与运维：凭据、密钥、版本。改她的行为（记什么、说不说话、
-        怎么过日子）跟着各自的页面走，不在这里。
+        怎么过日子）跟着各自的页面走，不在这里。例外是最上面那条
+        「你的本地时间」——那是<strong>你</strong>在哪，不是她的行为。
       </p>
+
+      {/* 用户自己的时区：不进草稿/发布，保存即生效（详见文件头注释）。
+          `ms-timezone` 只用于窄屏触控尺寸规则（model-settings.css 那份），
+          这里不引入模型页的任何颜色/排版变量。 */}
+      <div className="ms-timezone">
+        <TimezoneSection />
+      </div>
+
+      {/* 媒体与视频：同样是用户偏好，保存即生效。 */}
+      <VideoModeSection />
 
       {error ? (
         <div className="banner banner--error" role="status">

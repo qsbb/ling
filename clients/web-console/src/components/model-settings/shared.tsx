@@ -12,6 +12,7 @@ import type {
   ProfileResolution,
   ProviderDraftInput,
   ProviderModel,
+  MemorySource,
   ProviderView,
   SettingsConfig,
   SlotView,
@@ -51,6 +52,15 @@ export const PRIMARY_ROLES: RoleMeta[] = [
     label: '看图片',
     short: '图片',
     hint: '把图片转成描述，她才能"看见"你发的东西',
+  },
+  {
+    // 与「看图片」分开列：能看图片的模型大多看不了视频。合成一条，
+    // 用户就只能二选一——为了图片配便宜的、视频跟着废，或者为了视频配贵的。
+    key: 'perception.video',
+    label: '看视频',
+    short: '视频',
+    // 文案要短：行内这一列只有 ~340px，长句会折出「图共用」3 字孤行（验收 G1）。
+    hint: '把视频转成描述；她主动想看时才读，不和看图共用',
   },
   {
     key: 'memory.extract',
@@ -363,6 +373,64 @@ export type RoleRowState =
   | 'legacy'
   | 'unavailable';
 
+/**
+ * 一行的**界面档位**：`rowStateOf` 再加一档 `env`（环境变量在提供能力）。
+ *
+ * 徽标和摘要计数都调它——两边各算一次，就会出现"摘要说 4 个继承、徽标里却有
+ * 1 个旧版兼容"这种自相矛盾（验收实测过）。
+ */
+export type RoleBadgeState = RoleRowState | 'env';
+
+export function roleBadgeState(
+  resolution: ProfileResolution | undefined,
+  profile: ProfileDraftInput | undefined,
+  memorySource: MemorySource | undefined,
+): RoleBadgeState {
+  const draftExplicit = profile?.mode === 'explicit' && Boolean(profile.provider_id);
+  // 环境变量提供的记忆能力没有绑定，`profile_resolutions` 会说「不可用」。
+  // 那是真的（网页绑定确实没有），但能力本身是开着的——不能把这两件事
+  // 混成一个红字，否则用户会去"修"一个正在工作的配置。
+  const envSourced = memorySource === 'env' && !draftExplicit;
+  return envSourced ? 'env' : rowStateOf(resolution);
+}
+
+/** 职责行的分组。摘要/计数/渲染都按它，**不要**在组件里再抄一份顺序。 */
+export interface RoleGroup {
+  title: string;
+  note: string;
+  keys: string[];
+}
+
+export const ROLE_GROUPS: readonly RoleGroup[] = [
+  { title: '对话', note: '2 个 · 主回复链', keys: ['dialogue.fast', 'dialogue.group'] },
+  {
+    title: '感知',
+    note: '2 个 · 发图或发视频时触发',
+    keys: ['perception.vision', 'perception.video'],
+  },
+  // 嵌入/重排不是对话协议，也没有默认槽位：它们只在这里显式绑定，
+  // 或者由环境变量提供（来源写在每一行下方）。
+  {
+    title: '记忆',
+    note: '3 个 · 提炼与检索',
+    keys: ['memory.extract', 'memory.embed', 'memory.rerank'],
+  },
+];
+
+/**
+ * **界面上真的会渲染出来**的职责，按分组顺序。
+ *
+ * 判据与服务端的 `known_profiles` 求交集：服务端说不可绑的，界面不该出现
+ * 那一行（多一行绑了没用的，比少一行更糟）。tab 上的数字、摘要里的总数、
+ * 实际渲染的行都用这一份——三处各算一次，数字迟早互相矛盾。
+ */
+export function visibleRoleKeys(knownProfiles: readonly string[] | undefined): string[] {
+  const offerable = new Set(knownProfiles ?? []);
+  return ROLE_GROUPS.flatMap((group) => group.keys).filter(
+    (key) => Boolean(roleMeta(key)) && offerable.has(key),
+  );
+}
+
 export function rowStateOf(resolution: ProfileResolution | undefined): RoleRowState {
   if (!resolution || resolution.source === 'unavailable') return 'unavailable';
   // 旧版兼容要**单独一档**：它既不是用户选的，也不是槽位来的，而是"没配时
@@ -381,7 +449,9 @@ export function effectiveNote(
   if (resolution.source === 'unavailable') return resolution.reason;
   if (resolution.source === 'explicit') return '你单独选的';
   if (resolution.source === 'legacy_fallback') {
-    return '没配模型，暂时借主对话模型代跑（旧版行为）';
+    // 文案要短：这一列在 1440 下只有 ~220px，长句会折出 2 字孤行。
+    // 「旧版」这件事由徽标（旧版兼容）说，行尾不重复一遍。
+    return '没配模型，暂时借主对话的模型代跑';
   }
   const label = slotLabel(slots, resolution.slot);
   if (resolution.fell_back) {
@@ -539,6 +609,16 @@ export function RoleIcon({ role, size = 16 }: { role: string; size?: number }) {
         <rect x="2.5" y="4" width="15" height="12" rx="2" />
         <circle cx="7.2" cy="8.2" r="1.2" />
         <path d="M3.2 14.4l3.8-3.6 3 2.8 2.6-2.4 4.2 3.6" />
+      </svg>
+    );
+  }
+  if (role === 'perception.video') {
+    // 胶片框 + 播放三角：与「看图片」的相框一眼分得开。
+    return (
+      <svg {...common}>
+        <rect x="2.5" y="5" width="15" height="10" rx="2" />
+        <path d="M8.5 8.2l4 1.8-4 1.8z" />
+        <path d="M5.5 5v10M14.5 5v10" opacity="0.45" />
       </svg>
     );
   }

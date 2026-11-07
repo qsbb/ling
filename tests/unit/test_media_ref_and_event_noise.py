@@ -253,6 +253,76 @@ def test_onebot_meta_event_is_silently_ignored() -> None:
     assert exc.value.kind is ChannelErrorKind.ignored
 
 
+# ------------------------------------------------------- 自己消息的回显
+
+# OneBot 实现（NapCat/LLOneBot 的 ``reportSelfMessage``）会把**机器人自己
+# 发出去的消息**也上报一遍，``post_type`` 是 ``message_sent``。
+#
+# 以前它落进"暂不处理的事件类型"分支：每发一条回复就多一行
+# 「忽略事件: 暂不处理 OneBot 事件类型: message_sent」，用户看到的是日志
+# 被自己的回显刷满。它按设计就是**没有要处理的东西**，该像心跳一样安静。
+
+
+def _message_sent_event(message_id: object = 4242) -> dict:
+    return {
+        "time": 0,
+        "self_id": 10001,
+        "post_type": "message_sent",
+        "message_type": "group",
+        "sub_type": "normal",
+        "message_id": message_id,
+        "user_id": 10001,  # 机器人自己
+        "target_id": 700000001,
+        "message": [{"type": "text", "data": {"text": "我在"}}],
+        "raw_message": "我在",
+        "sender": {"nickname": "ling"},
+    }
+
+
+def test_onebot_message_sent_is_ignored_not_unsupported() -> None:
+    """自己的回显不是"没实现的能力"，是"按设计不处理"。"""
+    from ling.ports.channel import ChannelError, ChannelErrorKind
+
+    with pytest.raises(ChannelError) as exc:
+        _onebot_connector().normalize_inbound(_message_sent_event())
+    assert exc.value.kind is ChannelErrorKind.ignored
+    # message_id 留在理由里：它是 ``send()`` 回执里 platform_message_id 的
+    # 对账线索，排查"这条到底发出去没有"时只能靠它对上。
+    assert "4242" in exc.value.message
+
+
+def test_notice_is_still_reported_as_unsupported() -> None:
+    """明确不能被顺手"全球化"：notice 等未实现事件仍要让人看见。"""
+    from ling.ports.channel import ChannelError, ChannelErrorKind
+
+    with pytest.raises(ChannelError) as exc:
+        _onebot_connector().normalize_inbound({"post_type": "notice"})
+    assert exc.value.kind is ChannelErrorKind.unsupported
+
+
+@pytest.mark.asyncio
+async def test_message_sent_echo_does_not_reach_behavior_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """端到端：回显不进行为日志、也不产生 INFO/WARNING（最多 DEBUG）。
+
+    这是用户实际看到的那条日志的入口——``normalize_inbound`` 抛什么 kind，
+    决定 ``process_inbound_payload`` 记不记。
+    """
+    app = type("App", (), {"state": object()})()
+    with caplog.at_level(logging.DEBUG):
+        result = await inbound_intake.process_inbound_payload(
+            app, _onebot_connector(), _message_sent_event()
+        )
+
+    assert result["accepted"] is False
+    logged = [r for r in caplog.records if r.name.startswith(("ling.kernel", "ling.behavior"))]
+    assert logged == [], [r.getMessage() for r in logged]
+    # 连"忽略事件"这一行都不该有：它只会把 500 条缓冲挤出去。
+    # 也不许有任何 WARNING/ERROR——那正是用户截图里刷屏的那类行。
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 # ---------------------------------------------------------------- 拒绝日志
 
 

@@ -22,14 +22,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.domains.consent.service import ConsentService
-from ling.infra.models import MediaEvidenceRow, utcnow
+from ling.domains.consent.service import ConsentService, ConsentView
+from ling.infra.models import MediaEvidenceRow, Window, utcnow
 from ling.infra.security import new_id
 
 # 入站媒体能否被描述，取决于这个授权。默认关闭。
@@ -69,6 +70,10 @@ class EvidenceView:
     description: str | None
     description_origin: str | None
     expires_at: datetime | None
+    # 登记时间与上传者。上下文里要写「阿懒 12:21 发了个视频，你还没看」——
+    # 没有这两项就只能写「有个视频」，她不知道是谁发的、什么时候。
+    created_at: datetime | None = None
+    subject_id: str | None = None
     # 引用本身不可用的时间与原因（**永久失败终态**）。
     # 有值 = 不再进待办队列；`description` 仍为 None（没看到 ≠ 内容为空）。
     describe_failed_at: datetime | None = None
@@ -115,11 +120,20 @@ class MediaEvidenceService:
         visibility: str = DEFAULT_VISIBILITY,
         source_event_id: str | None = None,
         expires_at: datetime | None = None,
+        consent_subjects: Sequence[str] | None = None,
     ) -> EvidenceView:
         """登记一条媒体证据。
 
         需要 ``media.inbound`` 授权；没有就拒绝——**不是静默忽略**。
         静默忽略会让"用户发了图但角色没反应"变成一个查不出来的怪现象。
+
+        ``consent_subjects``：除上传者本人之外，**也**算数的授权主体。
+        群聊里调用方传会话主人（``windows.subject_id``）——**主人授权一次，
+        群里别人发的图也能被描述**。不传就是原来的语义：只认上传者本人。
+
+        为什么不是"全局开关"：授权是**按人**记的（``consent_rules`` 一行一个
+        subject），撤权时得知道撤的是谁的。主人授权是"我把这件事的责任揽到
+        自己身上"，不是"所有人自动同意"；两者在审计上完全不同。
         """
         if kind not in KINDS:
             raise MediaEvidenceError(f"未知媒体类型: {kind}")
@@ -130,8 +144,8 @@ class MediaEvidenceService:
         if subject_id is None:
             raise MediaEvidenceError("入站媒体必须带上传者 subject_id")
 
-        consent = await ConsentService(self._session).get(subject_id, INBOUND_SCOPE)
-        if not consent.granted:
+        consent = await self._granted_consent([subject_id, *(consent_subjects or ())])
+        if consent is None:
             raise MediaEvidenceError(
                 f"未授权描述入站媒体（授权记录 scope={INBOUND_SCOPE}）"
             )
@@ -168,6 +182,31 @@ class MediaEvidenceService:
         await self._session.flush()
         return _view(row)
 
+    # ------------------------------------------------------------ 授权判据
+
+    async def _granted_consent(self, subjects: Sequence[str | None]) -> ConsentView | None:
+        """这些主体里**第一个**已授权的授权记录；一个都没有就返回 ``None``。
+
+        顺序即优先级：发言人本人（最具体）在前，会话主人在后。返回整条
+        记录而不只是布尔，是因为调用方要拿它记 ``consent_revision``——
+        必须记**实际生效的那一条**，否则撤权审计时会指到另一个人的授权上。
+        """
+        service = ConsentService(self._session)
+        seen: set[str] = set()
+        for subject in subjects:
+            if not subject or subject in seen:
+                continue
+            seen.add(subject)
+            consent = await service.get(subject, INBOUND_SCOPE)
+            if consent.granted:
+                return consent
+        return None
+
+    async def _window_owner(self, window_id: str) -> str | None:
+        """窗口主人（群窗口的 ``windows.subject_id`` 就是主人，不是发言人）。"""
+        window = await self._session.get(Window, window_id)
+        return getattr(window, "subject_id", None)
+
     async def describe(
         self,
         evidence_id: str,
@@ -180,13 +219,18 @@ class MediaEvidenceService:
 
         窗口不匹配按"不存在"处理（返回错误而不是泄漏存在性）。
         授权在描述时**重新检查**——中途撤权后不能再描述新内容。
+
+        授权主体与登记时同一套规则：上传者本人，**或**这个窗口的主人。
+        只在 ``record`` 那一步放宽是不够的：描述发生在 worker 里，那边
+        从来拿不到"发言人是谁以外的上下文"，只认上传者本人的话，
+        主人授权过的群图仍然会在描述这一步被拒——等于没修。
         """
         row = await self._require(evidence_id, window_id)
         if row.subject_id is None:
             raise MediaEvidenceError("证据没有上传者，无法校验授权")
 
-        consent = await ConsentService(self._session).get(row.subject_id, INBOUND_SCOPE)
-        if not consent.granted:
+        consent = await self._granted_consent([row.subject_id, await self._window_owner(window_id)])
+        if consent is None:
             raise MediaEvidenceError(
                 f"授权已撤销，不能再描述（scope={INBOUND_SCOPE}）"
             )
@@ -246,23 +290,36 @@ class MediaEvidenceService:
             return None
         return _view(row)
 
-    async def pending(self, *, window_id: str, limit: int = 20) -> list[EvidenceView]:
+    async def pending(
+        self,
+        *,
+        window_id: str,
+        limit: int = 20,
+        exclude_kinds: Sequence[str] = (),
+    ) -> list[EvidenceView]:
         """当前窗口里**还没描述**且在有效期内的证据。给描述任务用。
 
         **排除已标成永久失败的行**（`describe_failed_at` 非空）：引用越界/
         超限/形式不支持不会自己变好，每轮重新捞出来重试就是无限重试。
         可重试的失败不写这个字段，所以照旧留在队列里。
+
+        ``exclude_kinds``：**视频必须被排除**。视频只在"她主动说要看"时
+        才读（见 ``domains/media/video.py``）——自动描述会把群里每一段
+        视频都送进视频模型，那是白烧 token，而且她当时可能根本用不上。
         """
+        conditions = [
+            MediaEvidenceRow.actor_id == self._actor_id,
+            MediaEvidenceRow.window_id == window_id,
+            MediaEvidenceRow.description.is_(None),
+            MediaEvidenceRow.describe_failed_at.is_(None),
+        ]
+        if exclude_kinds:
+            conditions.append(MediaEvidenceRow.kind.not_in(list(exclude_kinds)))
         rows = (
             (
                 await self._session.execute(
                     select(MediaEvidenceRow)
-                    .where(
-                        MediaEvidenceRow.actor_id == self._actor_id,
-                        MediaEvidenceRow.window_id == window_id,
-                        MediaEvidenceRow.description.is_(None),
-                        MediaEvidenceRow.describe_failed_at.is_(None),
-                    )
+                    .where(*conditions)
                     .order_by(MediaEvidenceRow.created_at)
                     .limit(limit)
                 )
@@ -299,7 +356,35 @@ class MediaEvidenceService:
         )
         return [_view(row) for row in rows if not _expired(row)]
 
-    async def windows_with_pending(self, *, limit: int = 20) -> list[str]:
+    async def undescribed_videos(self, *, window_id: str, limit: int = 5) -> list[EvidenceView]:
+        """本窗口里**还没看过**的视频（``description IS NULL``），最早的在前。
+
+        上下文要用它写「你还没看」那一行：视频默认不自动读，所以这条提示
+        是她**唯一**知道"有个视频可以看"的途径。已标永久失败的也列出来
+        （看不了 ≠ 不知道有这回事），但重复提示会被 ``describe_failed`` 的原因说明。
+        """
+        rows = (
+            (
+                await self._session.execute(
+                    select(MediaEvidenceRow)
+                    .where(
+                        MediaEvidenceRow.actor_id == self._actor_id,
+                        MediaEvidenceRow.window_id == window_id,
+                        MediaEvidenceRow.kind == "video",
+                        MediaEvidenceRow.description.is_(None),
+                    )
+                    .order_by(MediaEvidenceRow.created_at)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [_view(row) for row in rows if not _expired(row)]
+
+    async def windows_with_pending(
+        self, *, limit: int = 20, exclude_kinds: Sequence[str] = ()
+    ) -> list[str]:
         """有未描述证据的窗口列表。
 
         后台任务按窗口跑（``pending`` 是按窗口设计的，因为描述要绑定上下文），
@@ -310,15 +395,18 @@ class MediaEvidenceService:
         两处不一致的话，一个只剩永久失败证据的窗口会每轮都被列出来，
         `describe_pending` 又捞不到东西——空转，而且日志里看不出原因。
         """
+        conditions = [
+            MediaEvidenceRow.actor_id == self._actor_id,
+            MediaEvidenceRow.description.is_(None),
+            MediaEvidenceRow.describe_failed_at.is_(None),
+        ]
+        if exclude_kinds:
+            conditions.append(MediaEvidenceRow.kind.not_in(list(exclude_kinds)))
         rows = (
             (
                 await self._session.execute(
                     select(MediaEvidenceRow.window_id, MediaEvidenceRow.created_at)
-                    .where(
-                        MediaEvidenceRow.actor_id == self._actor_id,
-                        MediaEvidenceRow.description.is_(None),
-                        MediaEvidenceRow.describe_failed_at.is_(None),
-                    )
+                    .where(*conditions)
                     .order_by(MediaEvidenceRow.created_at)
                     .limit(limit * 10)
                 )
@@ -405,6 +493,8 @@ def _view(row: MediaEvidenceRow) -> EvidenceView:
         description=row.description,
         description_origin=row.description_origin,
         expires_at=row.expires_at,
+        created_at=row.created_at,
+        subject_id=row.subject_id,
         describe_failed_at=row.describe_failed_at,
         describe_failed_reason=row.describe_failed_reason,
     )

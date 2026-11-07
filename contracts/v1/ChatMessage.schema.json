@@ -134,6 +134,30 @@
       "title": "Schema Version",
       "type": "string"
     },
+    "sender_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sender Id"
+    },
+    "sender_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sender Name"
+    },
     "sequence": {
       "default": 0,
       "minimum": 0,

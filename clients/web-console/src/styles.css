@@ -2963,3 +2963,194 @@ button {
   color: #8b8274;
   opacity: 1;
 }
+
+/* -------------------------------------------------------------------------
+   对话页：群名作标题、会话键作副标题、成员名片分层（用户需求第 8 条）。
+
+   全部追加在文件末尾而不是散改既有规则：这些选择器都是新增的，只有
+   `.message__silence` 的旧排版被覆盖（它原来是一行灰字，和「已送达 12:23」
+   挤在一起，读起来分不清哪是她的判断、哪是传输状态）。
+   ---------------------------------------------------------------------- */
+
+/* 会话列表：标题 + 渠道标签一行，机器键一行（CSS 省略，title 属性给全量） */
+.session__heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session__title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session__channel,
+.chat-titlebar__channel {
+  flex: none;
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 0 5px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+}
+
+.session__channel[data-kind='group'],
+.chat-titlebar__channel[data-kind='group'] {
+  color: var(--accent);
+  border-color: #cfd2b8;
+  background: var(--accent-soft);
+}
+
+.session__subtitle {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* 会话头第二行：渠道 + 完整会话键 + 条数；只有键允许被省略 */
+.chat-titlebar__sub {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-titlebar__id {
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-titlebar__stat {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 发言人：名字主行 + 号码小字，不拼成 `@号码 名字` */
+.message__sender {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 0 4px 3px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.message__sender-name {
+  font-family: var(--font-serif);
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  max-width: 14em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.message__sender-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  opacity: 0.85;
+  /* 12em 足够放下 10 位 QQ 号；只有更长的 subject id 才省略。 */
+  max-width: 12em;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 成员头像：名字首字 + 稳定色号；她自己的头像仍是暖色圆点 */
+.message__avatar--member {
+  font-family: var(--font-serif);
+  font-size: 11px;
+  line-height: 1;
+  color: #fbf8f1;
+  border-color: transparent;
+  background: #b6a992;
+}
+
+.message__avatar--member[data-tone='1'] {
+  background: #a89a86;
+}
+
+.message__avatar--member[data-tone='2'] {
+  background: #9da58f;
+}
+
+.message__avatar--member[data-tone='3'] {
+  background: #b3a08c;
+}
+
+/* 群成员的泡泡比她的暗一档：同屏时一眼看出哪句是她说的 */
+.message--inbound .message__bubble {
+  background: var(--paper-sunken);
+}
+
+/* 同一个人连着说：气泡贴近一点，读起来是一段 */
+.message--continued {
+  margin-top: -8px;
+}
+
+/* 她没回的原因：单独一行、小字、中性色，与「已送达 12:23」分层 */
+.message__silence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  margin: 5px 2px 0;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-faint);
+  max-width: 100%;
+}
+
+.message__silence-tag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.5);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+
+.message__silence-text {
+  font-style: italic;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.message__silence-run {
+  flex: none;
+  opacity: 0.75;
+}
+
+/* 合并后的说明解释的是一整段，比单条再淡一点 */
+.message__silence--run {
+  opacity: 0.8;
+}
+
+@media (max-width: 430px) {
+  .message__sender-name {
+    max-width: 9em;
+  }
+
+  /* 窄屏上「生成中」已由右上角徽标表达，标题栏不再重复一遍 */
+  .chat-titlebar__stat--busy {
+    display: none;
+  }
+}

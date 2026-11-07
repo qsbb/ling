@@ -5,7 +5,7 @@ import { useChat } from '../useChat';
 import { Composer } from './Composer';
 import { AlertIcon, PencilIcon } from './Icons';
 import { MessageList } from './MessageList';
-import { SessionSidebar } from './SessionSidebar';
+import { canRenameSession, describeSession, SessionSidebar } from './SessionSidebar';
 
 interface ChatPageProps {
   sessionId: string | null;
@@ -47,6 +47,16 @@ export function ChatPage({
   const titleInputRef = useRef<HTMLInputElement | null>(null);
 
   const session = chat.sessions.find((item) => item.session_id === chat.currentId) ?? null;
+  // 标题给人看（群名/昵称），副标题留给机器键；读不到名字时按号码回退。
+  const heading = session ? describeSession(session) : null;
+  // 拆不出群/私聊的旧渠道窗口按私聊排（署名、靠左），不硬猜。
+  const variant =
+    heading === null || heading.kind === 'web'
+      ? 'web'
+      : heading.kind === 'channel'
+        ? 'private'
+        : heading.kind;
+  const renamable = session ? canRenameSession(session) : false;
   const busy = chat.live !== null || chat.activeTurn !== null;
   const stopping = chat.live?.state === 'stopping' || chat.activeTurn?.state === 'stopping';
   const elapsed = useElapsed(chat.live?.startedAt ?? null);
@@ -75,7 +85,7 @@ export function ChatPage({
 
   const startTitleEdit = () => {
     if (!chat.currentId) return;
-    setTitleDraft(session?.title ?? '');
+    setTitleDraft(heading?.title ?? '');
     setEditingTitle(true);
   };
 
@@ -137,11 +147,29 @@ export function ChatPage({
             </form>
           ) : (
             <div className="chat-titlebar__titles">
-              <h1 className="chat-titlebar__title" data-testid="session-title">
-                {session?.title ?? '对话'}
+              <h1 className="chat-titlebar__title" data-testid="session-title" title={heading?.title}>
+                {heading?.title ?? '对话'}
               </h1>
               <p className="chat-titlebar__sub">
-                {busy ? `生成中${elapsed ? ` · 已等待 ${elapsed}` : '…'}` : `${session?.message_count ?? 0} 条消息`}
+                {heading ? (
+                  <span className="chat-titlebar__channel" data-kind={heading.kind}>
+                    {heading.badge}
+                  </span>
+                ) : null}
+                {heading ? (
+                  // 副标题是完整会话键：能定位到"这条会话连的是哪个群"。
+                  <span className="chat-titlebar__id" title={heading.subtitle}>
+                    {heading.subtitle}
+                  </span>
+                ) : null}
+                <span className="chat-titlebar__stat">
+                  · {session?.message_count ?? 0} 条消息
+                </span>
+                {busy ? (
+                  <span className="chat-titlebar__stat chat-titlebar__stat--busy">
+                    · {elapsed ? `生成中 · 已等待 ${elapsed}` : '生成中…'}
+                  </span>
+                ) : null}
               </p>
             </div>
           )}
@@ -153,7 +181,7 @@ export function ChatPage({
                 生成中
               </span>
             ) : null}
-            {!editingTitle && session ? (
+            {!editingTitle && session && renamable ? (
               <button type="button" className="ghost-button" onClick={startTitleEdit}>
                 <PencilIcon /> 改名
               </button>
@@ -203,6 +231,7 @@ export function ChatPage({
               activeTurn={chat.activeTurn}
               live={chat.live}
               loading={chat.loadingMessages}
+              variant={variant}
               onRetry={chat.retry}
               onResend={chat.resend}
               onStop={() => void chat.stop()}
