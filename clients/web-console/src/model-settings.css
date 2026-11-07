@@ -1782,6 +1782,22 @@
   color: var(--ms-faint);
 }
 
+/*
+ * 旧版兼容：既不是用户选的（不是实线绿），也不是槽位（不是虚线灰），
+ * 更不能跟"不可用"混淆（那是红的、表示真的没有模型）。
+ * 用琥珀色 + 点状边框，和这三种都能一眼分开——不只靠颜色区分。
+ */
+.ms-badge--legacy {
+  border-color: #d9c08a;
+  border-style: dotted;
+  background: #fdf6e3;
+  color: #8a6d1f;
+}
+
+.ms-role-row--legacy .ms-role-row__effective-model {
+  color: #8a6d1f;
+}
+
 .ms-badge--fell_back,
 .ms-badge--unavailable {
   border-color: #d9a79d;

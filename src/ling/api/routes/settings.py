@@ -12,7 +12,12 @@ from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import utcnow
-from ling.ports.config import BindingMode, EffectiveConfig, ResolvedProfile
+from ling.ports.config import (
+    BindingMode,
+    EffectiveConfig,
+    ResolutionSource,
+    ResolvedProfile,
+)
 from ling.ports.model import (
     SLOT_HINTS,
     SLOT_LABELS,
@@ -510,7 +515,15 @@ def _quick_config_rows(
         new = after.resolve_profile(profile)
         old_model = _effective_view(old)
         new_model = _effective_view(new)
-        if new_model is None:
+        # 旧版兼容是**另一条轴**：那个模型既不是用户选的、也不是槽位来的。
+        # 文案上必须分开，否则会写成"覆盖你选的 X"，而用户从没选过 X。
+        if new.source is ResolutionSource.legacy_fallback:
+            kind = "legacy"
+            change = (
+                f"仍然借主对话模型 {new_model['model_id'] if new_model else ''}"
+                f"（「{SLOT_LABELS[key]}」槽位没配，快速配置给不了它模型）"
+            )
+        elif new_model is None:
             change = f"仍然不可用：{new.reason}"
             kind = "unavailable"
         elif old_model is None:
@@ -519,6 +532,9 @@ def _quick_config_rows(
         elif old_model == new_model:
             change = "与现在相同"
             kind = "same"
+        elif old.source is ResolutionSource.legacy_fallback:
+            change = f"原来借的是 {old_model['model_id']}，之后改用 {new_model['model_id']}"
+            kind = "override"
         else:
             # 说清"被覆盖的是什么"，而不是只说"会变"——用户按下去之前
             # 得能判断这次覆盖值不值。

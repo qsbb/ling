@@ -142,7 +142,7 @@ export interface ProfileView {
 export type BindingMode = 'explicit' | 'slot';
 
 /** 生效模型是怎么来的。**只有这三种**，界面按它分三种样式。 */
-export type ResolutionSource = 'explicit' | 'slot' | 'unavailable';
+export type ResolutionSource = 'explicit' | 'slot' | 'legacy_fallback' | 'unavailable';
 
 /**
  * 一个职责**最后会跑哪个模型**——由服务端算好，前端只显示。

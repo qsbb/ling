@@ -206,12 +206,12 @@ def test_slot_pointing_at_disabled_provider_is_unavailable() -> None:
     assert "sensenova-vision" in resolved.reason, resolved.reason
 
 
-def test_no_second_hop_across_roles() -> None:
-    """规则 4（**最重要的一条**）：槽位没配时不许借别的角色的模型。
+def test_no_second_hop_across_slots() -> None:
+    """规则 4（**最重要的一条**）：槽位没配时**不许跳到别的槽位**。
 
     这里「快速」槽位配得妥妥的，而 `memory.extract` 跟着的「创作」没配。
-    从前 worker 会偷偷用 `dialogue.fast` 的模型代跑，于是设置页说"不可用"、
-    实际却在跑主对话模型。现在必须真的不可用。
+    它**不能**因为「快速」有模型就拿去用——那会让设置页的"跟着创作"变成一句
+    谎话，而且用户永远猜不到实际跑的是谁。
     """
     config = _config(
         slots={"fast": ModelSlot("fast", "fast_provider", "qwen-fast")},
@@ -220,9 +220,42 @@ def test_no_second_hop_across_roles() -> None:
     assert config.resolve_profile("dialogue.fast").usable is True
 
     resolved = config.resolve_profile("memory.extract")
+    # 走的是**旧版兼容**那一档，不是槽位：source 明确标出来，界面才能说清
+    # "这个模型不是你要的，是旧版行为在兜"。
+    assert resolved.source is ResolutionSource.legacy_fallback
+    assert resolved.slot == "creation"
+    assert resolved.model_id == "qwen-fast"
+    assert "旧版行为" in resolved.reason, resolved.reason
+
+
+def test_legacy_fallback_never_chains() -> None:
+    """旧版兼容**只借一层、且只借 dialogue.fast**，主对话自己都没模型就报不可用。
+
+    防的是"借不到再往下借"：那条链一旦成立，界面上的"实际生效"就没人能解释了。
+    """
+    # 什么都没配：连 dialogue.fast 自己都不可用
+    config = _config(slots={}, profiles=())
+    resolved = config.resolve_profile("memory.extract")
     assert resolved.source is ResolutionSource.unavailable
     assert resolved.provider_id is None
-    assert "创作" in resolved.reason, resolved.reason
+
+
+def test_legacy_fallback_respects_explicit_disable() -> None:
+    """用户**主动停用**这个职责时，兼容逻辑不许把它"修好"。"""
+    config = _config(
+        slots={"fast": ModelSlot("fast", "fast_provider", "qwen-fast")},
+        profiles=(
+            ProfileBinding(
+                profile="memory.extract",
+                provider_id="",
+                model_id="",
+                enabled=False,
+            ),
+        ),
+    )
+    resolved = config.resolve_profile("memory.extract")
+    assert resolved.source is ResolutionSource.unavailable
+    assert resolved.enabled is False
 
 
 def test_role_without_slot_cannot_be_satisfied_by_any_slot() -> None:

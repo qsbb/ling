@@ -223,6 +223,12 @@ describe('四种来源的判定', () => {
     expect(rowStateOf(undefined)).toBe('unavailable');
     expect(rowStateOf(resolution({ profile: 'a', source: 'unavailable' }))).toBe('unavailable');
     expect(rowStateOf(resolution({ profile: 'a', source: 'explicit' }))).toBe('explicit');
+    /*
+     * 旧版兼容必须**单独一档**：它既不是用户选的，也不是槽位来的，而是
+     * "没配时借主对话模型代跑"的历史行为。混进「继承」会让人以为是自己配的
+     * 槽位在生效；混进「不可用」又会让人去修一个其实在正常工作的地方。
+     */
+    expect(rowStateOf(resolution({ profile: 'a', source: 'legacy_fallback' }))).toBe('legacy');
     expect(rowStateOf(resolution({ profile: 'a', source: 'slot' }))).toBe('inherit');
     expect(
       rowStateOf(resolution({ profile: 'a', source: 'slot', fell_back: true })),

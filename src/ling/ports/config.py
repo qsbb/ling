@@ -13,11 +13,35 @@ from ling.ports.model import SLOT_LABELS, ModelTarget, slot_for_profile
 
 
 class ResolutionSource(StrEnum):
-    """生效模型是怎么来的。**只有这三种**，界面文案也按它分三种样式。"""
+    """生效模型是怎么来的。
+
+    ``legacy_fallback`` 是**旧版兼容**：这两个职责在槽位体系之前就有"未绑定时
+    借主对话模型代跑"的行为（``memory.extract`` 提炼、``dialogue.group`` 群聊）。
+    删掉它会让老部署升级后静默降级——提炼变成正则、群里直接不回，而页面上只
+    显示"不可用"，用户不知道曾经能用。
+
+    它**不是槽位链的一环**：槽位之间仍然只回退一层（见
+    :meth:`EffectiveConfig.resolve_profile` 的规则 4），这一档是另一条轴，
+    单独列出来正是为了让界面能说出"这个模型不是你要的，是旧版行为在兜"。
+    """
 
     explicit = "explicit"
     slot = "slot"
+    legacy_fallback = "legacy_fallback"
     unavailable = "unavailable"
+
+
+# 旧版兼容：这两个职责在槽位体系之前就有"未绑定就借主对话模型代跑"的行为。
+# 只列这两个，且借的永远是 `dialogue.fast`——**不递归**：如果连
+# `dialogue.fast` 自己都解析不出可用模型，就老老实实报不可用。
+#
+# 为什么必须留着：删掉它，老部署升级后提炼会掉成正则、群聊会直接不回，
+# 而页面只显示"不可用"——用户不知道这个能力曾经在。这是"界面说的必须等于
+# 实际发生的"的另一面：实际变差了，界面也得如实说出来。
+LEGACY_BORROW_FROM: dict[str, str] = {
+    "memory.extract": "dialogue.fast",
+    "dialogue.group": "dialogue.fast",
+}
 
 
 class BindingMode(StrEnum):
@@ -282,11 +306,13 @@ class ResolvedProfile:
     "能不能提炼"也看它。任何地方再算一遍"那它到底用哪个"，
     迟早会和这里不一致——界面上写着 A、实际跑着 B，是这个仓库反复踩过的坑。
 
-    ``source`` 只有三种取值，**没有第四种**：
+    ``source`` 四种取值：
 
     - ``explicit``：用用户单独指定的那个 `(provider, model)`；
     - ``slot``：跟随时用它所属槽位的模型（也包括"单独指定的那个坏了，
       于是落回槽位"——同一条路，只是 `requested` 有值、界面标成「已回退」）；
+    - ``legacy_fallback``：旧版兼容，借主对话模型代跑（只有 ``memory.extract``
+      和 ``dialogue.group`` 会走到这里，见 :data:`LEGACY_BORROW_FROM`）；
     - ``unavailable``：没有可用模型，``reason`` 说明是哪一步断的。
     """
 
@@ -377,7 +403,58 @@ class EffectiveConfig:
         return key.value if key is not None else None
 
     def resolve_profile(self, profile: str) -> ResolvedProfile:
-        """职责 → 最终生效的模型。**只回退一层，不允许套娃。**
+        """职责 → 最终生效的模型。**槽位之间只回退一层，不允许套娃。**
+
+        判定顺序（每一步都写在这里，没有别处再判一遍）：
+
+        1. 单独指定了、且那个 `(provider, model)` 可用 → 用它（``explicit``）。
+        2. 否则用它**所属槽位**的模型（``slot``）。单独指定的坏了也走这一格。
+        3. ``memory.extract`` / ``dialogue.group`` 在 1、2 都落空时，
+           **借主对话模型代跑**（``legacy_fallback``）——这是它们在槽位体系
+           之前就有的行为，删掉会让老部署静默降级。
+        4. 仍然没有 → ``unavailable``，``reason`` 说清断在哪。
+        5. **到此为止**。不会再去试别的槽位。
+
+        第 5 条是硬约束，不是偷懒：允许槽位之间二级跳转的话，用户看到的
+        "生效模型"会依赖一条他看不见的链条，出问题时既没法解释也没法复现。
+
+        注意第 3 条**不是**槽位链的一环，是另一条轴：它只对两个具名职责生效、
+        只借 `dialogue.fast`、且不递归（主对话自己都解析不出来就报不可用）。
+        用独立的 ``legacy_fallback`` 标出来，界面才能说清"这个模型不是你要的，
+        是旧版行为在兜"。
+
+        ``mode=slot`` 的绑定直接跳过第 1 步：它明确表示"我要跟着槽位走"，
+        此时 ``provider_id`` / ``model_id`` 里的残留值不该有任何作用。
+        """
+        resolved = self._explicit_or_slot(profile)
+        # 职责被用户主动停用是一个独立决定，不该被兼容逻辑"修好"。
+        if resolved.source is not ResolutionSource.unavailable or resolved.enabled is False:
+            return resolved
+
+        donor_profile = LEGACY_BORROW_FROM.get(profile)
+        if donor_profile is None:
+            return resolved
+        donor = self._explicit_or_slot(donor_profile)
+        if donor.source is ResolutionSource.unavailable or not donor.model_id:
+            # 连兜底的那个角色都没有可用模型 —— 老实报不可用，不再往下借。
+            return resolved
+        return ResolvedProfile(
+            profile=profile,
+            source=ResolutionSource.legacy_fallback,
+            provider_id=donor.provider_id,
+            model_id=donor.model_id,
+            slot=resolved.slot,
+            requested_provider_id=resolved.requested_provider_id,
+            requested_model_id=resolved.requested_model_id,
+            reason=(
+                f"没配模型，暂时借「{donor_profile}」的模型代跑"
+                "（旧版行为；给它配一个槽位或单独指定后就不再借用）"
+            ),
+        )
+
+
+    def _explicit_or_slot(self, profile: str) -> ResolvedProfile:
+        """显式 → 槽位这两步（**不含**旧版兼容那一档）。
 
         判定顺序（每一步都写在这里，没有别处再判一遍）：
 

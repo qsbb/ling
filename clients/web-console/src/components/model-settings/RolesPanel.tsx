@@ -102,6 +102,7 @@ const STATE_LABEL: Record<string, string> = {
   explicit: '单独指定',
   inherit: '继承',
   fell_back: '已回退',
+  legacy: '旧版兼容',
   unavailable: '不可用',
 };
 

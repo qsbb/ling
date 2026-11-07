@@ -181,11 +181,18 @@ async def test_unavailable_says_which_slot_is_empty(logged_in: TestEnv) -> None:
     assert "识图" in vision["reason"], vision["reason"]
 
 
-async def test_memory_extract_does_not_borrow_dialogue_fast(logged_in: TestEnv) -> None:
-    """**关键**：提炼的槽位（创作）没配时，不许去借主对话的模型。
+async def test_memory_extract_borrows_dialogue_fast_but_says_so(logged_in: TestEnv) -> None:
+    """提炼的槽位（创作）没配时：**继续借主对话模型，但必须标出来**。
 
-    从前 worker 会偷偷用 `dialogue.fast` 代跑，于是设置页说"不可用"、实际
-    在跑主对话模型。现在必须真的不可用——即使「快速」槽位配得好好的。
+    这条是这一版最关键的取舍。删掉借用会让老部署升级后静默降级——提炼掉回
+    正则、召回变差，而页面只显示"不可用"，用户不知道这个能力曾经在。那正是
+    这一轮要消灭的那类问题（界面说的 ≠ 实际发生的）。
+
+    反过来保留借用却不标出来，就是旧版的老毛病：页面说"不可用"、其实在跑
+    主对话模型。所以现在两条都要：**行为不退，来源明说**。
+
+    `legacy_fallback` 是独立一档，不是槽位链的一环——槽位之间仍然只回退一层
+    （见 `test_no_second_hop_across_slots`）。
     """
     await _publish_slots(logged_in)
     body = await _draft(
@@ -195,14 +202,16 @@ async def test_memory_extract_does_not_borrow_dialogue_fast(logged_in: TestEnv) 
     await logged_in.client.post("/v1/settings/publish", json={"revision": body["revision"]})
 
     config = await _config(logged_in)
-    assert _resolution(config, "dialogue.fast")["effective"] is not None
+    fast = _resolution(config, "dialogue.fast")
+    assert fast["effective"] is not None
     extract = _resolution(config, "memory.extract")
-    assert extract["source"] == "unavailable"
-    assert extract["effective"] is None
-    assert "创作" in extract["reason"], extract["reason"]
-    # 降级提示要跟着出现，并且说清是"退回正则"
-    assert "memory.extract" in config["unbound_degradations"]
-    assert "正则" in config["unbound_degradations"]["memory.extract"]
+    # 真的借到了主对话的模型（行为不退）
+    assert extract["source"] == "legacy_fallback"
+    assert extract["effective"] == fast["effective"]
+    # 而且说清了这是旧版行为，不是用户配的
+    assert "旧版行为" in extract["reason"], extract["reason"]
+    # 标成 legacy 之后就不该再报"会退回正则"——它并没有退
+    assert "memory.extract" not in config["unbound_degradations"]
 
 
 async def test_disabled_role_is_reported_separately(logged_in: TestEnv) -> None:
@@ -311,7 +320,10 @@ async def test_quick_config_covers_manual_choices(logged_in: TestEnv) -> None:
     # 本来就是跟随 → 「与现在相同」
     assert rows["perception.vision"]["change_kind"] == "same"
     # 槽位没配的那条 → 「仍然不可用」，并给出原因
-    assert rows["memory.extract"]["change_kind"] == "unavailable"
+    # 旧版兼容：创作槽位没配，快速配置给不了它模型，但它仍然会借主对话。
+    # 文案必须说清"还是借"，不能写成"不可用"——那会让人去修一个其实在工作的东西。
+    assert rows["memory.extract"]["change_kind"] == "legacy"
+    assert "借主对话" in rows["memory.extract"]["change"], rows["memory.extract"]
     assert "创作" in rows["memory.extract"]["change"]
 
     # 嵌入/重排不参与：它们没有槽位

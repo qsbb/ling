@@ -164,10 +164,18 @@ export function slotLabel(slots: SlotView[] | undefined, key: string | null): st
 }
 
 /** 一行职责在界面上属于哪一态。四种，决定边框、标签、颜色。 */
-export type RoleRowState = 'explicit' | 'inherit' | 'fell_back' | 'unavailable';
+export type RoleRowState =
+  | 'explicit'
+  | 'inherit'
+  | 'fell_back'
+  | 'legacy'
+  | 'unavailable';
 
 export function rowStateOf(resolution: ProfileResolution | undefined): RoleRowState {
   if (!resolution || resolution.source === 'unavailable') return 'unavailable';
+  // 旧版兼容要**单独一档**：它既不是用户选的，也不是槽位来的，而是"没配时
+  // 借主对话模型代跑"的历史行为。混进「继承」会让人以为是自己配的槽位在生效。
+  if (resolution.source === 'legacy_fallback') return 'legacy';
   if (resolution.fell_back) return 'fell_back';
   return resolution.source === 'explicit' ? 'explicit' : 'inherit';
 }
@@ -180,6 +188,9 @@ export function effectiveNote(
   if (!resolution) return '正在计算…';
   if (resolution.source === 'unavailable') return resolution.reason;
   if (resolution.source === 'explicit') return '你单独选的';
+  if (resolution.source === 'legacy_fallback') {
+    return '没配模型，暂时借主对话模型代跑（旧版行为）';
+  }
   const label = slotLabel(slots, resolution.slot);
   if (resolution.fell_back) {
     return `你选的 ${resolution.requested?.model_id ?? '那个模型'} 不可用，暂时用「${label}」`;
