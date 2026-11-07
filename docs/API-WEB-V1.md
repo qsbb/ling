@@ -232,6 +232,7 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 | GET | `/v1/persona` | `{persona_id, revision, display_name, system_prompt, traits, boundaries, scenario_prompts, scenarios[]}` |
 | PUT | `/v1/persona` | 同形状（部分字段）→ 新修订；立即影响后续轮次 |
 | GET | `/v1/actor/timeline?limit=50` | `{events: [{id, type, origin, visibility, occurred_at, summary}]}` |
+| GET | `/v1/life/timeline?date=YYYY-MM-DD` | 只读生活时间轴（双时区 / 段 / 事实 / 未来意向 / 梦卡片），字段见 §11 |
 
 `scenarios[]` 每项：`{key, label, when, text, default_text, custom}`。`scenario_prompts`
 只存**覆盖**（键：`private` / `group` / `group_mentioned` / `group_unaddressed`）；
@@ -334,6 +335,13 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 这是**对外契约变更**：2026-10 之前该端点不过滤状态，已取消/送不出去的
 承诺会和待履行的一起返回。数据**没有删除**，只是默认可见集收窄。
 响应新增 `state_filter` 回显实际生效的过滤值（默认 `"active"`）。
+
+### 9.3 生活时间轴的两块新摘要（2026-11）
+
+`/v1/dashboard` 新增 `sections.today_outline`（今天她可能做什么：当前段 +
+下一条 + 已确认锚点）与 `sections.intent_teaser`（未来 1–2 条有来源的意向，
+标"未来日未生成大纲"）。两块与旧的 `sections.agenda` **并列**，旧块的
+"最多几件小事"语义不变。字段与语义见 §11.9；端点本身见 §11。
 
 ## 10. 记忆读契约（2026-11 冻结，IA Step 0.5）
 
@@ -456,3 +464,166 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 
 `created_at` / `updated_at` 必须与 `core_memories` 表逐字相等，返回“当前时间”
 占位不算满足契约。
+
+## 11. 生活时间轴（只读，2026-11 新增）
+
+设计依据：`docs/DREAM-SCHEDULE-DESIGN.md` §7（用户可见性与可观测性）与 §9 阶段 5。
+实现：`src/ling/api/routes/life_timeline.py`；契约：`contracts/v1/LifeTimelineOut.schema.json`。
+
+`GET /v1/life/timeline` 把**已经存在**的表（`day_plans` / `schedule_segments` /
+`schedule_intentions` / `activities` / `scene_commits` / `dream_reports`）投影成
+一天的视图。它**不生成、不重排、不调模型**，也**不写任何表**。
+
+### 11.1 查询参数
+
+| 参数 | 默认 | 取值 | 说明 |
+| --- | --- | --- | --- |
+| `date` | 当前登录者时区的今天 | `YYYY-MM-DD` | **展示日**（不是角色计划日）；格式非法由 pydantic 返 `422` |
+
+时区**一律由服务端解析**（`settings/user_preferences.py`：DB 偏好 >
+`LING_USER_TIMEZONE` > `Asia/Shanghai`）。前端**不要**用浏览器本地时区再判一次
+"今天"，也不要自己把 `start_at` 归日。
+
+### 11.2 双时区：展示侧与角色侧
+
+同一个响应里给两套窗口，因为**"你看到的今天"和"她的今天"可以是不同的时间区间**：
+
+| 字段 | 含义 |
+| --- | --- |
+| `display_date` | 这次请求的展示日（用户时区） |
+| `display_timezone` / `display_timezone_source` | 用户时区的生效值与来源（`preference` / `env` / `default`） |
+| `display_window_start_at` / `display_window_end_at` | 展示日的 UTC 半开区间 `[D 00:00, D+1 00:00)`（**用户**时区） |
+| `actor_timezone` / `actor_timezone_source` | 角色规范时区（owner subject 的同一套解析）与来源 |
+| `plan_day` | **角色**计划日（角色本地午夜日）——展示窗口起点落在哪个计划日 |
+| `plan_window_start_at` / `plan_window_end_at` | 该计划日的 UTC 半开区间（**角色**时区） |
+| `outline_due_at` | 生成到期时刻：`plan_day − 1` 角色本地 21:00 的 UTC 瞬时 |
+| `generated_at` | 当前版本**实际提交**时刻（`day_plans.updated_at`）；无计划行时为 `null` |
+
+`outline_due_at` 与 `generated_at` 是两件事："应当什么时候生成"与"实际上什么时候
+生成"。DST 当天窗口可能是 23/25 小时，**不要**用 `+24h` 自己算。
+
+### 11.3 状态：`state` 与 `plan_state`
+
+`plan_state` 是库里 `day_plans.state` 的原值（`pending` / `ready` / `degraded`；
+没有计划行时 `null`）。`state` 是给界面用的投影，**六种必须分别处理**：
+
+| `state` | 含义 | 界面该说什么 |
+| --- | --- | --- |
+| `empty` | 这一天没有计划行 | "这一天还没有安排" |
+| `pending` | 行已建、还没生成（例如 21:00 到期前） | "还没生成" |
+| `ready` | 模型或规则大纲已提交 | 正常展示 |
+| `degraded` | 内容是**规则兜底**（模型不可用/输出被拒收） | "来自规则兜底"，并把 `last_error_code` 作为原因 |
+| `failed` | 最近一次生成**失败**（行仍是 `pending` 且带原因码） | "生成失败" + `last_error_code` |
+| `unavailable` | 这一次**读取出错** | "暂时无法读取" + 重试；**不是**"没安排" |
+
+`degraded_late` / `needs_review` 是 `last_error_code` 里的**原因码**，不是新的
+`day_plans.state` 枚举值。`unavailable` 仍返回 `200`（时区字段照常给出），
+因为界面必须能分辨"没安排"和"读不到"；`401` 只用于未登录。
+
+### 11.4 `segments[]`：计划层（父子段都在）
+
+每条：`segment_id`、`plan_id`、`plan_day`、`parent_id`、`layer`（`block|hour|minute`）、
+`is_leaf`、`status`（恒为 `current`）、`revision`（创建它的计划版本）、`source`
+（`model|rule|baseline|user`）、`anchor_kind`（`''` 可变 / `sleep` / `commitment`）、
+`commitment_level`（`tentative|confirmed`）、`place_id`、`title`、
+`start_at` / `end_at`（**原始**区间）、`display_start_at` / `display_end_at`
+（**裁剪到展示日窗口**后的区间）、`continues_from_previous_day` /
+`continues_next_day`。
+
+- 查询条件是**相交**（`start_at < window_end AND end_at > window_start`），不是
+  "按 `start_at` 归到某一天"：23:30–00:30 的段在两天各自被裁剪成
+  `[23:30,24:00)` 与 `[00:00,00:30)`，并分别带 `continues_next_day=true` /
+  `continues_from_previous_day=true`。**裁剪值不是段的真实起止**，`start_at` /
+  `end_at` 才是。
+- 父子段都会返回（前端要能折叠层级）。子段的 `parent_id` 指父段。
+- `plan_day` **逐段给出**：跨午夜的段属于前一天的计划，这个值与顶层 `plan_day`
+  可能不同。前端不要用 `start_at` 反推归属日。
+- 已替代（`superseded`）的段**不返回**（它们与当前段在时间上重叠），只由顶层
+  `superseded_segment_count` 计数——用来标"计划改动过"。
+- 预计睡眠段 `anchor_kind=sleep` 只表示**预计休息**，不能读成"她睡着了"，
+  也不能当承诺展示。
+
+### 11.5 `facts[]`：事实层（与计划分开）
+
+每条：`activity_id`、`state`（`running|paused|completed|failed`）、`origin`、
+`evidence_kind`、`scene_valid_until`、`started_at`、`ended_at`、`place_id`。
+
+**计划时段结束不会把段改名成"已做"。** 只有 `activities` 里已经发生过的进程
+出现在这里；`evidence_kind=clock_only` 只证明"时间到了"，`observed` /
+`user_confirmed` 才是事实。`scene_valid_until` 只在情景提交**仍有效**时给出
+（过期即 unknown，`null`），且只挂在那条与之对应的活动上。
+
+### 11.6 `intents[]`：未来 7 天的意向（不是日计划）
+
+每条：`intention_id`、`target_start_day`、`target_end_day`、`state`、`source_kind`
+（`model|user|actor|recurrence`）、`visibility`、`priority`。
+
+窗口是角色计划日 **D+1 … D+7**（闭区间），最多 20 条，按"状态 → priority →
+目标日 → id"稳定排序。顶层 `horizon_unplanned=true` 是**契约的一部分**：
+未来日**没有**生成大纲，这些条目是意向/候选，不是那一天的安排。
+`state=confirmed` 只表示用户确认过这个**目标/日期**，不是"某个时段已约好"。
+
+### 11.7 `dream`：梦卡片（模拟叙事）
+
+`{status, origin, visibility, title, narrative, restricted}` 或 `null`。
+`null` = **没有记录**；`restricted=true` = 有记录但你看不到正文。
+
+- 库里固定 `origin=simulated`、`visibility=actor_private`；
+- 非 owner 读到 `title` / `narrative` 均为 `null`，`restricted=true`；
+- `sleep_date` 取角色计划日（醒来所在的角色本地日）。
+
+### 11.8 受众裁决与 `hidden_*` 计数
+
+`visibility=actor_private` 的**段、活动、意向**与**梦**只对 owner 返回正文。
+owner 的判定：`role=owner`，或登录账号绑在 owner 的 subject 上。
+`visibility` 为 `null` 的旧段表示"未知"，**不猜**成私有（按可见处理）。
+
+| 字段 | 含义 |
+| --- | --- |
+| `has_private_content` | 这次响应里有内容被受众裁决隐藏 |
+| `hidden_segment_count` | 被隐藏的当前段数 |
+| `hidden_fact_count` | 被隐藏的活动数 |
+| `hidden_intent_count` | 被隐藏的意向数 |
+| `dream.restricted` | 梦有记录但正文被隐藏 |
+
+隐藏的内容**不出现在**数组里——不要用"空数组"当"没有内容"，两者靠上面的
+计数与 `has_private_content` 区分。
+
+### 11.9 `GET /v1/dashboard` 的两块新摘要（与旧 `agenda` 并列）
+
+`sections.agenda` 的语义**一点不改**（"最多几件小事"：计划/承诺/目标）。
+另加两块：
+
+**`sections.today_outline.data`**（`TodayOutlineOut`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `state` | 同 §11.3（`empty`/`pending`/`ready`/`degraded`/`failed`/`unavailable`） |
+| `display_date` / `display_timezone` | 你的今天（展示时区） |
+| `plan_day` / `actor_timezone` | 她的今天（角色时区）——两者可以不是同一天 |
+| `items[]` | 2–3 条：`{segment_id, relation, title, start_at, end_at}` |
+| `note` | 一句纯文本状态说明（空态/降级/失败各不相同） |
+
+`relation` 三值：`now`（覆盖此刻的叶段）、`next`（接下来最近、**不是**已确认
+锚点的那一段）、`anchor`（最近的已确认锚点）。已过去的段**不会**被拿来填满
+条数；没有就是没有——"下午还没定"不该显示成"安排满了"。
+
+**`sections.intent_teaser.data`**（`IntentTeaserOut`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `horizon_unplanned` | 恒为 `true`：未来日**尚未生成大纲** |
+| `items[]` | 最多 2 条：`{intention_id, title, target_start_day, target_end_day, state, source_kind}` |
+| `note` | 一句纯文本说明 |
+
+只给**有来源**的意向（`source_ref` 非空）；`proposed` 候选不会因为上了首屏
+就升级。两个区块各自独立标 `status`（`ok`/`empty`/`unavailable`），一块失败
+不影响整页。
+
+### 11.10 聊天侧复用同一投影
+
+聊天里问"今天她要干什么"时读**同一份**只读投影：只能说"她**打算/可能**在
+09:00 左右吃早餐；下午还没决定"；只有存在真实的 `activities` 且 scene 未过期
+才能说"模拟生活中正在……"；`tentative` 不能说约好，`confirmed` 必须附来源；
+梦只有用户明确问且受众允许时，以"模拟梦景"呈现。
+

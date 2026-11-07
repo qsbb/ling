@@ -5,14 +5,23 @@
     "CapabilityDescriptor": "CapabilityDescriptor.schema.json",
     "ChatMessage": "ChatMessage.schema.json",
     "ContextContribution": "ContextContribution.schema.json",
+    "DayIntentSummary": "DayIntentSummary.schema.json",
     "DeliveryReceipt": "DeliveryReceipt.schema.json",
+    "DreamCard": "DreamCard.schema.json",
     "ErrorResponse": "ErrorResponse.schema.json",
     "HandoffCapsule": "HandoffCapsule.schema.json",
+    "IntentTeaserItem": "IntentTeaserItem.schema.json",
+    "IntentTeaserOut": "IntentTeaserOut.schema.json",
     "InteractionEnvelope": "InteractionEnvelope.schema.json",
+    "LifeTimelineFact": "LifeTimelineFact.schema.json",
+    "LifeTimelineOut": "LifeTimelineOut.schema.json",
+    "LifeTimelineSegment": "LifeTimelineSegment.schema.json",
     "MemoryProposal": "MemoryProposal.schema.json",
     "OperationResult": "OperationResult.schema.json",
     "RuntimeScope": "RuntimeScope.schema.json",
-    "SessionRecord": "SessionRecord.schema.json"
+    "SessionRecord": "SessionRecord.schema.json",
+    "TodayOutlineItem": "TodayOutlineItem.schema.json",
+    "TodayOutlineOut": "TodayOutlineOut.schema.json"
   },
   "schema_version": "v1"
 }

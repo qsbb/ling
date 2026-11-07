@@ -1,0 +1,139 @@
+{
+  "$defs": {
+    "OutlineRelation": {
+      "description": "仪表盘「她今天可能做什么」里一条摘要与此刻的关系。\n\n``now`` 是正在进行的段，``next`` 是接下来最近的一段，``anchor`` 是已确认的\n不可移动锚点（约定）。三者**不合并**：把\"正在做\"和\"已约好\"混成一条，\n用户会以为计划等于承诺。",
+      "enum": [
+        "now",
+        "next",
+        "anchor"
+      ],
+      "title": "OutlineRelation",
+      "type": "string"
+    },
+    "TimelineState": {
+      "description": "只读生活时间轴的对外状态（设计 §7/§8）。\n\n这几种状态**必须互相区分**，否则\"今天没安排\"和\"读不到今天\"在界面上\n长得一模一样：\n\n- ``empty``：这一天没有计划行——真的没有，不是故障；\n- ``pending``：行已建、大纲还没生成（例如 21:00 到期前）；\n- ``ready``：模型或规则大纲已提交，内容可当计划读；\n- ``degraded``：有行，但内容是规则兜底（模型不可用/输出被拒收）；\n- ``failed``：最近一次生成失败，原因在 ``last_error_code``；\n- ``unavailable``：这一次读取出错，投影拿不到。",
+      "enum": [
+        "ready",
+        "pending",
+        "empty",
+        "degraded",
+        "failed",
+        "unavailable"
+      ],
+      "title": "TimelineState",
+      "type": "string"
+    },
+    "TodayOutlineItem": {
+      "additionalProperties": false,
+      "description": "仪表盘上的一条今日摘要。``relation`` 说明它和\"此刻\"的关系。",
+      "properties": {
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/OutlineRelation"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "segment_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Segment Id"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relation",
+        "title",
+        "start_at",
+        "end_at"
+      ],
+      "title": "TodayOutlineItem",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/TodayOutlineOut.schema.json",
+  "additionalProperties": false,
+  "description": "`GET /v1/dashboard` 的 `sections.today_outline.data`。\n\n与旧的 `sections.agenda` 并列：`agenda` 是\"最多几件小事\"的旧语义，\n这里是她**这一天时间轴**的 2–3 条摘要（当前段 + 下一条 + 已确认锚点）。",
+  "properties": {
+    "actor_timezone": {
+      "title": "Actor Timezone",
+      "type": "string"
+    },
+    "display_date": {
+      "format": "date",
+      "title": "Display Date",
+      "type": "string"
+    },
+    "display_timezone": {
+      "title": "Display Timezone",
+      "type": "string"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/TodayOutlineItem"
+      },
+      "title": "Items",
+      "type": "array"
+    },
+    "note": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Note"
+    },
+    "plan_day": {
+      "format": "date",
+      "title": "Plan Day",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/TimelineState"
+    }
+  },
+  "required": [
+    "state",
+    "display_date",
+    "display_timezone",
+    "plan_day",
+    "actor_timezone"
+  ],
+  "title": "TodayOutlineOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

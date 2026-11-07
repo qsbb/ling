@@ -1,0 +1,146 @@
+{
+  "$id": "https://ling.local/contracts/v1/LifeTimelineSegment.schema.json",
+  "additionalProperties": false,
+  "description": "时间轴上的一个段（大块/小时/分钟）。父子段都会返回，前端据此折叠层级。\n\n``start_at`` / ``end_at`` 是**原始**区间；``display_*`` 是裁剪到展示日窗口\n后的区间。跨午夜的段在两天各自被裁剪，并用 ``continues_*`` 说明还有\n另一半——**不要**把裁剪后的时间当成段的真实起止。",
+  "properties": {
+    "anchor_kind": {
+      "description": "'' 可变段；sleep/commitment 是不可移动锚点",
+      "title": "Anchor Kind",
+      "type": "string"
+    },
+    "commitment_level": {
+      "description": "tentative / confirmed",
+      "title": "Commitment Level",
+      "type": "string"
+    },
+    "continues_from_previous_day": {
+      "default": false,
+      "title": "Continues From Previous Day",
+      "type": "boolean"
+    },
+    "continues_next_day": {
+      "default": false,
+      "title": "Continues Next Day",
+      "type": "boolean"
+    },
+    "display_end_at": {
+      "format": "date-time",
+      "title": "Display End At",
+      "type": "string"
+    },
+    "display_start_at": {
+      "format": "date-time",
+      "title": "Display Start At",
+      "type": "string"
+    },
+    "end_at": {
+      "format": "date-time",
+      "title": "End At",
+      "type": "string"
+    },
+    "is_leaf": {
+      "title": "Is Leaf",
+      "type": "boolean"
+    },
+    "layer": {
+      "title": "Layer",
+      "type": "string"
+    },
+    "parent_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Id"
+    },
+    "place_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Place Id"
+    },
+    "plan_day": {
+      "format": "date",
+      "title": "Plan Day",
+      "type": "string"
+    },
+    "plan_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Plan Id",
+      "type": "string"
+    },
+    "revision": {
+      "default": 0,
+      "description": "创建该段的计划版本号",
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "segment_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Segment Id",
+      "type": "string"
+    },
+    "source": {
+      "description": "model / rule / baseline / user",
+      "title": "Source",
+      "type": "string"
+    },
+    "start_at": {
+      "format": "date-time",
+      "title": "Start At",
+      "type": "string"
+    },
+    "status": {
+      "description": "current / superseded / cancelled",
+      "title": "Status",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "segment_id",
+    "plan_id",
+    "plan_day",
+    "layer",
+    "is_leaf",
+    "status",
+    "source",
+    "anchor_kind",
+    "commitment_level",
+    "title",
+    "start_at",
+    "end_at",
+    "display_start_at",
+    "display_end_at"
+  ],
+  "title": "LifeTimelineSegment",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

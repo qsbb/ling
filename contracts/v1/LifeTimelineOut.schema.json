@@ -1,0 +1,588 @@
+{
+  "$defs": {
+    "DayIntentSummary": {
+      "additionalProperties": false,
+      "description": "未来 7 天展望里的一条长程意向（**不是**那一天的日计划）。\n\n``state=confirmed`` 只表示用户对这个目标/日期作过明确确认，**不是**\n\"某个时段已经约好\"：`schedule_intentions` 永远不提供硬锚点。",
+      "properties": {
+        "intention_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Intention Id",
+          "type": "string"
+        },
+        "priority": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source_kind": {
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "target_end_day": {
+          "format": "date",
+          "title": "Target End Day",
+          "type": "string"
+        },
+        "target_start_day": {
+          "format": "date",
+          "title": "Target Start Day",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intention_id",
+        "target_start_day",
+        "target_end_day",
+        "state",
+        "source_kind",
+        "visibility"
+      ],
+      "title": "DayIntentSummary",
+      "type": "object"
+    },
+    "DreamCard": {
+      "additionalProperties": false,
+      "description": "一晚的梦（模拟叙事）。**不是事实**，且受众受限。\n\n梦在库里固定 ``origin=simulated`` / ``visibility=actor_private``。非 owner\n读到时只给状态与来源，``title`` / ``narrative`` 为空且 ``restricted=true``\n——\"存在但你看不到\"与\"没有记录\"（``dream=null``）是两件事。",
+      "properties": {
+        "narrative": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Narrative"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "string"
+        },
+        "restricted": {
+          "default": false,
+          "title": "Restricted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "status": {
+          "description": "ready / failed / missed / no_dream",
+          "title": "Status",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "origin",
+        "visibility"
+      ],
+      "title": "DreamCard",
+      "type": "object"
+    },
+    "LifeTimelineFact": {
+      "additionalProperties": false,
+      "description": "已发生的活动进程（**不是**计划段）。\n\n``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明\"时间到了\"，\n不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。\n``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。",
+      "properties": {
+        "activity_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Activity Id",
+          "type": "string"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ended At"
+        },
+        "evidence_kind": {
+          "title": "Evidence Kind",
+          "type": "string"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "string"
+        },
+        "place_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Place Id"
+        },
+        "scene_valid_until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scene Valid Until"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "activity_id",
+        "state",
+        "origin",
+        "evidence_kind"
+      ],
+      "title": "LifeTimelineFact",
+      "type": "object"
+    },
+    "LifeTimelineSegment": {
+      "additionalProperties": false,
+      "description": "时间轴上的一个段（大块/小时/分钟）。父子段都会返回，前端据此折叠层级。\n\n``start_at`` / ``end_at`` 是**原始**区间；``display_*`` 是裁剪到展示日窗口\n后的区间。跨午夜的段在两天各自被裁剪，并用 ``continues_*`` 说明还有\n另一半——**不要**把裁剪后的时间当成段的真实起止。",
+      "properties": {
+        "anchor_kind": {
+          "description": "'' 可变段；sleep/commitment 是不可移动锚点",
+          "title": "Anchor Kind",
+          "type": "string"
+        },
+        "commitment_level": {
+          "description": "tentative / confirmed",
+          "title": "Commitment Level",
+          "type": "string"
+        },
+        "continues_from_previous_day": {
+          "default": false,
+          "title": "Continues From Previous Day",
+          "type": "boolean"
+        },
+        "continues_next_day": {
+          "default": false,
+          "title": "Continues Next Day",
+          "type": "boolean"
+        },
+        "display_end_at": {
+          "format": "date-time",
+          "title": "Display End At",
+          "type": "string"
+        },
+        "display_start_at": {
+          "format": "date-time",
+          "title": "Display Start At",
+          "type": "string"
+        },
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "is_leaf": {
+          "title": "Is Leaf",
+          "type": "boolean"
+        },
+        "layer": {
+          "title": "Layer",
+          "type": "string"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Id"
+        },
+        "place_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Place Id"
+        },
+        "plan_day": {
+          "format": "date",
+          "title": "Plan Day",
+          "type": "string"
+        },
+        "plan_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Plan Id",
+          "type": "string"
+        },
+        "revision": {
+          "default": 0,
+          "description": "创建该段的计划版本号",
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "segment_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Segment Id",
+          "type": "string"
+        },
+        "source": {
+          "description": "model / rule / baseline / user",
+          "title": "Source",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        },
+        "status": {
+          "description": "current / superseded / cancelled",
+          "title": "Status",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segment_id",
+        "plan_id",
+        "plan_day",
+        "layer",
+        "is_leaf",
+        "status",
+        "source",
+        "anchor_kind",
+        "commitment_level",
+        "title",
+        "start_at",
+        "end_at",
+        "display_start_at",
+        "display_end_at"
+      ],
+      "title": "LifeTimelineSegment",
+      "type": "object"
+    },
+    "TimelineState": {
+      "description": "只读生活时间轴的对外状态（设计 §7/§8）。\n\n这几种状态**必须互相区分**，否则\"今天没安排\"和\"读不到今天\"在界面上\n长得一模一样：\n\n- ``empty``：这一天没有计划行——真的没有，不是故障；\n- ``pending``：行已建、大纲还没生成（例如 21:00 到期前）；\n- ``ready``：模型或规则大纲已提交，内容可当计划读；\n- ``degraded``：有行，但内容是规则兜底（模型不可用/输出被拒收）；\n- ``failed``：最近一次生成失败，原因在 ``last_error_code``；\n- ``unavailable``：这一次读取出错，投影拿不到。",
+      "enum": [
+        "ready",
+        "pending",
+        "empty",
+        "degraded",
+        "failed",
+        "unavailable"
+      ],
+      "title": "TimelineState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/LifeTimelineOut.schema.json",
+  "additionalProperties": false,
+  "description": "`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。\n\n``generated_at`` 是**当前版本提交时刻**（`day_plans.updated_at`）；\n``outline_due_at`` 是生成到期时刻（D−1 角色本地 21:00）。两者分开：\n\"应当什么时候生成\"和\"实际上什么时候生成\"不是同一件事。",
+  "properties": {
+    "actor_timezone": {
+      "title": "Actor Timezone",
+      "type": "string"
+    },
+    "actor_timezone_source": {
+      "description": "preference / env / default",
+      "title": "Actor Timezone Source",
+      "type": "string"
+    },
+    "display_date": {
+      "format": "date",
+      "title": "Display Date",
+      "type": "string"
+    },
+    "display_timezone": {
+      "title": "Display Timezone",
+      "type": "string"
+    },
+    "display_timezone_source": {
+      "description": "preference / env / default",
+      "title": "Display Timezone Source",
+      "type": "string"
+    },
+    "display_window_end_at": {
+      "format": "date-time",
+      "title": "Display Window End At",
+      "type": "string"
+    },
+    "display_window_start_at": {
+      "format": "date-time",
+      "title": "Display Window Start At",
+      "type": "string"
+    },
+    "dream": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DreamCard"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "facts": {
+      "items": {
+        "$ref": "#/$defs/LifeTimelineFact"
+      },
+      "title": "Facts",
+      "type": "array"
+    },
+    "generated_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Generated At"
+    },
+    "has_private_content": {
+      "default": false,
+      "description": "有内容因受众裁决被隐藏（参见三个 hidden_* 计数）",
+      "title": "Has Private Content",
+      "type": "boolean"
+    },
+    "hidden_fact_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Hidden Fact Count",
+      "type": "integer"
+    },
+    "hidden_intent_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Hidden Intent Count",
+      "type": "integer"
+    },
+    "hidden_segment_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Hidden Segment Count",
+      "type": "integer"
+    },
+    "horizon_unplanned": {
+      "default": true,
+      "description": "未来日**尚未生成大纲**：intents 是展望，不是 D+1…D+7 的日计划",
+      "title": "Horizon Unplanned",
+      "type": "boolean"
+    },
+    "intents": {
+      "items": {
+        "$ref": "#/$defs/DayIntentSummary"
+      },
+      "title": "Intents",
+      "type": "array"
+    },
+    "last_error_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "最近一次失败/降级/待复核的原因码（不含正文）",
+      "title": "Last Error Code"
+    },
+    "note": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "给人看的一句状态说明（纯文本）",
+      "title": "Note"
+    },
+    "outline_due_at": {
+      "format": "date-time",
+      "title": "Outline Due At",
+      "type": "string"
+    },
+    "plan_day": {
+      "format": "date",
+      "title": "Plan Day",
+      "type": "string"
+    },
+    "plan_state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "库里 day_plans.state 原值：pending/ready/degraded；无行为 null",
+      "title": "Plan State"
+    },
+    "plan_window_end_at": {
+      "format": "date-time",
+      "title": "Plan Window End At",
+      "type": "string"
+    },
+    "plan_window_start_at": {
+      "format": "date-time",
+      "title": "Plan Window Start At",
+      "type": "string"
+    },
+    "revision": {
+      "default": 0,
+      "description": "计划版本号；0 = 没有计划行",
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "segments": {
+      "items": {
+        "$ref": "#/$defs/LifeTimelineSegment"
+      },
+      "title": "Segments",
+      "type": "array"
+    },
+    "state": {
+      "$ref": "#/$defs/TimelineState"
+    },
+    "superseded_segment_count": {
+      "default": 0,
+      "description": "同一窗口内已被新版替代的段数（计划改动过的证据）",
+      "minimum": 0,
+      "title": "Superseded Segment Count",
+      "type": "integer"
+    },
+    "timezone_source": {
+      "description": "计划行记录的时区来源；无行时取角色侧解析结果",
+      "title": "Timezone Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "state",
+    "display_date",
+    "display_timezone",
+    "display_timezone_source",
+    "display_window_start_at",
+    "display_window_end_at",
+    "actor_timezone",
+    "actor_timezone_source",
+    "plan_day",
+    "plan_window_start_at",
+    "plan_window_end_at",
+    "outline_due_at",
+    "timezone_source"
+  ],
+  "title": "LifeTimelineOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

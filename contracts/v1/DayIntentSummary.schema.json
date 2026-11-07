@@ -1,0 +1,59 @@
+{
+  "$id": "https://ling.local/contracts/v1/DayIntentSummary.schema.json",
+  "additionalProperties": false,
+  "description": "未来 7 天展望里的一条长程意向（**不是**那一天的日计划）。\n\n``state=confirmed`` 只表示用户对这个目标/日期作过明确确认，**不是**\n\"某个时段已经约好\"：`schedule_intentions` 永远不提供硬锚点。",
+  "properties": {
+    "intention_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Intention Id",
+      "type": "string"
+    },
+    "priority": {
+      "default": 50,
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Priority",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_kind": {
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "target_end_day": {
+      "format": "date",
+      "title": "Target End Day",
+      "type": "string"
+    },
+    "target_start_day": {
+      "format": "date",
+      "title": "Target Start Day",
+      "type": "string"
+    },
+    "visibility": {
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "required": [
+    "intention_id",
+    "target_start_day",
+    "target_end_day",
+    "state",
+    "source_kind",
+    "visibility"
+  ],
+  "title": "DayIntentSummary",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

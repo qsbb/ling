@@ -1,0 +1,93 @@
+{
+  "$id": "https://ling.local/contracts/v1/LifeTimelineFact.schema.json",
+  "additionalProperties": false,
+  "description": "已发生的活动进程（**不是**计划段）。\n\n``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明\"时间到了\"，\n不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。\n``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。",
+  "properties": {
+    "activity_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Activity Id",
+      "type": "string"
+    },
+    "ended_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ended At"
+    },
+    "evidence_kind": {
+      "title": "Evidence Kind",
+      "type": "string"
+    },
+    "origin": {
+      "title": "Origin",
+      "type": "string"
+    },
+    "place_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Place Id"
+    },
+    "scene_valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scene Valid Until"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Started At"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "activity_id",
+    "state",
+    "origin",
+    "evidence_kind"
+  ],
+  "title": "LifeTimelineFact",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

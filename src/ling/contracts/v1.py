@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -196,6 +196,41 @@ class ModelRole(StrEnum):
     reflection = "reflection"
     planning = "planning"
     moderation_advisory = "moderation.advisory"
+
+
+class TimelineState(StrEnum):
+    """只读生活时间轴的对外状态（设计 §7/§8）。
+
+    这几种状态**必须互相区分**，否则"今天没安排"和"读不到今天"在界面上
+    长得一模一样：
+
+    - ``empty``：这一天没有计划行——真的没有，不是故障；
+    - ``pending``：行已建、大纲还没生成（例如 21:00 到期前）；
+    - ``ready``：模型或规则大纲已提交，内容可当计划读；
+    - ``degraded``：有行，但内容是规则兜底（模型不可用/输出被拒收）；
+    - ``failed``：最近一次生成失败，原因在 ``last_error_code``；
+    - ``unavailable``：这一次读取出错，投影拿不到。
+    """
+
+    ready = "ready"
+    pending = "pending"
+    empty = "empty"
+    degraded = "degraded"
+    failed = "failed"
+    unavailable = "unavailable"
+
+
+class OutlineRelation(StrEnum):
+    """仪表盘「她今天可能做什么」里一条摘要与此刻的关系。
+
+    ``now`` 是正在进行的段，``next`` 是接下来最近的一段，``anchor`` 是已确认的
+    不可移动锚点（约定）。三者**不合并**：把"正在做"和"已约好"混成一条，
+    用户会以为计划等于承诺。
+    """
+
+    now = "now"
+    next = "next"
+    anchor = "anchor"
 
 
 # ---------------------------------------------------------------- 作用域
@@ -500,6 +535,210 @@ class MemoryProposal(StrictModel):
     valid_until: datetime | None = None
 
 
+# ---------------------------------------------------------------- 生活时间轴（只读）
+
+# 这一组是**只读投影**的契约（设计 §7）：`GET /v1/life/timeline` 与
+# `GET /v1/dashboard` 的 `today_outline` / `intent_teaser` 两块。
+#
+# 三条不可让步的语义，都在下面字段名里体现：
+#
+# 1. **双时区**：`display_*` 是按**当前登录者**的有效时区裁剪的展示窗口，
+#    `plan_*` / `actor_timezone` 是**角色**的计划日与规范时区。两者可以不同，
+#    前端不许用浏览器本地时区二次判断"今天"。
+# 2. **计划不是事实**：`segments` 是"打算/可能"，`facts` 是已发生的活动进程。
+#    计划时段结束**不会**把段改成"已做"，所以两层分开列，字段也不共用。
+# 3. **空态与故障分开**：`state` 见 :class:`TimelineState`；梦被受众裁决隐藏时
+#    `dream.restricted=true` 而不是 `dream=null`（后者表示"没有记录"）。
+
+
+class LifeTimelineSegment(StrictModel):
+    """时间轴上的一个段（大块/小时/分钟）。父子段都会返回，前端据此折叠层级。
+
+    ``start_at`` / ``end_at`` 是**原始**区间；``display_*`` 是裁剪到展示日窗口
+    后的区间。跨午夜的段在两天各自被裁剪，并用 ``continues_*`` 说明还有
+    另一半——**不要**把裁剪后的时间当成段的真实起止。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    segment_id: IdStr
+    plan_id: IdStr
+    # 这个段属于哪一天的**角色计划日**。通常等于顶层 `plan_day`；
+    # 两套时区不一致、或段跨过午夜时会等于相邻那一天。
+    plan_day: date
+    parent_id: IdStr | None = None
+    layer: str
+    is_leaf: bool
+    status: str = Field(description="current / superseded / cancelled")
+    revision: int = Field(default=0, ge=0, description="创建该段的计划版本号")
+    source: str = Field(description="model / rule / baseline / user")
+    anchor_kind: str = Field(description="'' 可变段；sleep/commitment 是不可移动锚点")
+    commitment_level: str = Field(description="tentative / confirmed")
+    place_id: IdStr | None = None
+    title: str
+    start_at: datetime
+    end_at: datetime
+    display_start_at: datetime
+    display_end_at: datetime
+    continues_from_previous_day: bool = False
+    continues_next_day: bool = False
+
+
+class LifeTimelineFact(StrictModel):
+    """已发生的活动进程（**不是**计划段）。
+
+    ``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明"时间到了"，
+    不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。
+    ``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    activity_id: IdStr
+    state: str
+    origin: str
+    evidence_kind: str
+    scene_valid_until: datetime | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    place_id: IdStr | None = None
+
+
+class DayIntentSummary(StrictModel):
+    """未来 7 天展望里的一条长程意向（**不是**那一天的日计划）。
+
+    ``state=confirmed`` 只表示用户对这个目标/日期作过明确确认，**不是**
+    "某个时段已经约好"：`schedule_intentions` 永远不提供硬锚点。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    intention_id: IdStr
+    target_start_day: date
+    target_end_day: date
+    state: str
+    source_kind: str
+    visibility: str
+    priority: int = Field(default=50, ge=0, le=100)
+
+
+class DreamCard(StrictModel):
+    """一晚的梦（模拟叙事）。**不是事实**，且受众受限。
+
+    梦在库里固定 ``origin=simulated`` / ``visibility=actor_private``。非 owner
+    读到时只给状态与来源，``title`` / ``narrative`` 为空且 ``restricted=true``
+    ——"存在但你看不到"与"没有记录"（``dream=null``）是两件事。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    status: str = Field(description="ready / failed / missed / no_dream")
+    origin: str
+    visibility: str
+    title: str | None = None
+    narrative: str | None = None
+    restricted: bool = False
+
+
+class LifeTimelineOut(StrictModel):
+    """`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。
+
+    ``generated_at`` 是**当前版本提交时刻**（`day_plans.updated_at`）；
+    ``outline_due_at`` 是生成到期时刻（D−1 角色本地 21:00）。两者分开：
+    "应当什么时候生成"和"实际上什么时候生成"不是同一件事。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    state: TimelineState
+    plan_state: str | None = Field(
+        default=None, description="库里 day_plans.state 原值：pending/ready/degraded；无行为 null"
+    )
+    revision: int = Field(default=0, ge=0, description="计划版本号；0 = 没有计划行")
+    last_error_code: str | None = Field(
+        default=None, description="最近一次失败/降级/待复核的原因码（不含正文）"
+    )
+    display_date: date
+    display_timezone: str
+    display_timezone_source: str = Field(description="preference / env / default")
+    display_window_start_at: datetime
+    display_window_end_at: datetime
+    actor_timezone: str
+    actor_timezone_source: str = Field(description="preference / env / default")
+    plan_day: date
+    plan_window_start_at: datetime
+    plan_window_end_at: datetime
+    outline_due_at: datetime
+    timezone_source: str = Field(description="计划行记录的时区来源；无行时取角色侧解析结果")
+    generated_at: datetime | None = None
+    segments: list[LifeTimelineSegment] = Field(default_factory=list)
+    facts: list[LifeTimelineFact] = Field(default_factory=list)
+    intents: list[DayIntentSummary] = Field(default_factory=list)
+    horizon_unplanned: bool = Field(
+        default=True,
+        description="未来日**尚未生成大纲**：intents 是展望，不是 D+1…D+7 的日计划",
+    )
+    dream: DreamCard | None = None
+    superseded_segment_count: int = Field(
+        default=0, ge=0, description="同一窗口内已被新版替代的段数（计划改动过的证据）"
+    )
+    hidden_segment_count: int = Field(default=0, ge=0)
+    hidden_fact_count: int = Field(default=0, ge=0)
+    hidden_intent_count: int = Field(default=0, ge=0)
+    has_private_content: bool = Field(
+        default=False, description="有内容因受众裁决被隐藏（参见三个 hidden_* 计数）"
+    )
+    note: str | None = Field(default=None, description="给人看的一句状态说明（纯文本）")
+
+
+class TodayOutlineItem(StrictModel):
+    """仪表盘上的一条今日摘要。``relation`` 说明它和"此刻"的关系。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    segment_id: IdStr | None = None
+    relation: OutlineRelation
+    title: str
+    start_at: datetime
+    end_at: datetime
+
+
+class TodayOutlineOut(StrictModel):
+    """`GET /v1/dashboard` 的 `sections.today_outline.data`。
+
+    与旧的 `sections.agenda` 并列：`agenda` 是"最多几件小事"的旧语义，
+    这里是她**这一天时间轴**的 2–3 条摘要（当前段 + 下一条 + 已确认锚点）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    state: TimelineState
+    display_date: date
+    display_timezone: str
+    plan_day: date
+    actor_timezone: str
+    items: list[TodayOutlineItem] = Field(default_factory=list)
+    note: str | None = None
+
+
+class IntentTeaserItem(StrictModel):
+    """仪表盘上的一条未来意向摘要（只给有来源的）。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    intention_id: IdStr
+    title: str
+    target_start_day: date
+    target_end_day: date
+    state: str
+    source_kind: str
+
+
+class IntentTeaserOut(StrictModel):
+    """`GET /v1/dashboard` 的 `sections.intent_teaser.data`。
+
+    ``horizon_unplanned=true`` 是给人看的那句话的依据：未来日**没有**生成大纲，
+    这里的条目是意向，不是那一天的安排。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    horizon_unplanned: bool = True
+    items: list[IntentTeaserItem] = Field(default_factory=list)
+    note: str | None = None
+
+
 # ---------------------------------------------------------------- 错误
 
 
@@ -525,22 +764,33 @@ __all__ = [
     "CapabilityDescriptor",
     "ChatMessage",
     "ContextContribution",
+    "DayIntentSummary",
     "DeliveryReceipt",
     "DeliveryState",
+    "DreamCard",
     "ErrorBody",
     "ErrorCode",
     "ErrorResponse",
     "HandoffCapsule",
     "InputPart",
+    "IntentTeaserItem",
+    "IntentTeaserOut",
     "InteractionEnvelope",
+    "LifeTimelineFact",
+    "LifeTimelineOut",
+    "LifeTimelineSegment",
     "MemoryProposal",
     "Modality",
     "ModelRole",
     "OperationResult",
     "OperationState",
     "Origin",
+    "OutlineRelation",
     "RuntimeScope",
     "SessionRecord",
+    "TimelineState",
+    "TodayOutlineItem",
+    "TodayOutlineOut",
     "TurnState",
     "Visibility",
     "new_id",
