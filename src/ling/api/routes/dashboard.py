@@ -49,6 +49,7 @@ from ling.domains.agenda.service import AgendaService, local_today
 from ling.domains.goals.service import GoalsService
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
+from ling.domains.phone.service import PhoneService
 from ling.domains.presence.service import PresenceService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
@@ -390,6 +391,46 @@ async def get_dashboard(
             {"channels": channels, "bound_model_roles": sorted(bound)},
         )
 
+    async def phone() -> dict:
+        """她此刻跟手机的关系（在不在看、看什么、下次什么时候看）。
+
+        为什么要单列一块：她的状态不只是"在做什么活动"，还有一层更日常的
+        ——**她是不是正在低头看手机**。真人一天解锁几十上百次，那段"在忙别的"
+        的时间里她不回消息，不是因为不想理人。把这件事显式画出来，用户才不会
+        把"没秒回"读成"装死"。
+
+        空态与故障必须分开：从没看过手机（没有记录）是**事实**，返回 empty；
+        读取出错由 `_guard` 标成 unavailable。两者在界面上长得不一样。
+        """
+        view = await PhoneService(session, actor_id=actor_id).current()
+        never_looked = (
+            view.last_looked_at is None
+            and view.next_look_at is None
+            and view.watching_since is None
+        )
+        if never_looked:
+            return _section(SECTION_EMPTY)
+        return _section(
+            SECTION_OK,
+            {
+                "state": view.state,
+                "watching_app": view.watching_app,
+                "watching_since": (
+                    view.watching_since.isoformat() if view.watching_since else None
+                ),
+                "last_looked_at": (
+                    view.last_looked_at.isoformat() if view.last_looked_at else None
+                ),
+                "next_look_at": (
+                    view.next_look_at.isoformat() if view.next_look_at else None
+                ),
+                "last_result": view.last_result,
+                # **不**投影 `last_context`：它是 128 字符的自由文本，可能是
+                # "群里在聊……" 这类会带出聊天内容的东西。首屏只需要知道
+                # "她在看/看什么 app/下次什么时候看"，不需要那一段。
+            },
+        )
+
     sections = {
         "activity": await _guard("activity", activity(), session),
         "affect": await _guard("affect", affect(), session),
@@ -400,6 +441,7 @@ async def get_dashboard(
         "presence": await _guard("presence", presence(), session),
         "agenda": await _guard("agenda", agenda(), session),
         "timeline": await _guard("timeline", timeline(), session),
+        "phone": await _guard("phone", phone(), session),
     }
 
     return {

@@ -216,12 +216,51 @@ export function Card({ title, section, span = 'half', action, renderWhenEmpty, c
   );
 }
 
+/**
+ * 「手机」卡片的正文。
+ *
+ * 抽成独立组件只为一个原因：它有三种可区分的样子（正在看 / 放下但有下次 /
+ * 还没安排），而这三种的区别正是用户要看的东西——不抽出来就没法在单测里
+ * 逐种钉住，只能靠整页渲染碰运气。
+ */
+export function PhoneBody({ data }: { data: Record<string, unknown> }) {
+  const watching = String(data.state ?? '') === 'watching';
+  const app = data.watching_app ? String(data.watching_app) : '';
+  return (
+    <>
+      <p className="dash-now__line">
+        <strong>{watching ? '正在看手机' : '手机放下了'}</strong>
+        {watching && app ? <span className="dash-now__kind">{app}</span> : null}
+      </p>
+      {watching && data.watching_since ? (
+        <p className="dash-card__muted">从 {formatClock(String(data.watching_since))} 起</p>
+      ) : null}
+      {!watching && data.last_looked_at ? (
+        <p className="dash-card__muted">上次看是 {formatClock(String(data.last_looked_at))}</p>
+      ) : null}
+      {/*
+        正在看的时候后端不排下一次（状态机规则 2），所以这里写「等她收起手机」，
+        而不是显示一个会跳的数字——那个数字在"正在看"期间根本不存在。
+      */}
+      <p className="dash-card__muted">
+        {watching
+          ? '等她收起手机'
+          : data.next_look_at
+            ? `下次大约 ${formatClock(String(data.next_look_at))}`
+            : '还没安排下一次'}
+      </p>
+    </>
+  );
+}
+
 function emptyText(title: string): string {
   switch (title) {
     case '此刻':
       return '当前没有登记中的活动。';
     case '情绪':
       return '暂时没有状态记录。';
+    case '手机':
+      return '她还没拿起过手机。';
     case '最近记住的事':
       return '还没有可展示的长期记忆。';
     case '关系':
@@ -436,6 +475,15 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
               <p className="dash-card__muted">{String(d.describe ?? '')}</p>
             </>
           )}
+        </Card>
+
+        {/*
+          「手机」单独一块：她低头看手机那段时间不回消息，不是装死。
+          真人一天解锁几十上百次，这段"在忙别的"里她照样在，只是没在看对话。
+          把这层画出来，「没秒回」才不会被读成「不理人」。
+        */}
+        <Card title="手机" span="half" section={s.phone}>
+          {(d) => <PhoneBody data={d} />}
         </Card>
 
         {/*

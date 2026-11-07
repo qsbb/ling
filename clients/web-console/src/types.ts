@@ -605,6 +605,13 @@ export interface DashboardResponse {
     timeline: DashboardSection;
     relationship: DashboardSection;
     connectivity: DashboardSection;
+    /**
+     * 她此刻跟手机的关系。
+     *
+     * 单列一块而不是塞进「此刻」：活动是"她在做什么事"，看手机是"她正低头
+     * 看屏幕"——后者是更短、更频繁的状态切换，两者时间尺度不一样。
+     */
+    phone: DashboardSection;
   };
 }
 

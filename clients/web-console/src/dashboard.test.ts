@@ -29,6 +29,7 @@ import {
   emotionLabel,
   formatDayTime,
   isToday,
+  PhoneBody,
   proactiveDeliveryLine,
   type CardProps,
 } from './components/DashboardPage';
@@ -898,5 +899,61 @@ describe('账号页「新的登录名」（F11）', () => {
     for (const [tag] of buttons) {
       expect(tag, '空输入时提交按钮必须禁用').toContain('disabled=""');
     }
+  });
+});
+
+/* ------------------------------------------------------------ 手机卡片 */
+
+describe('手机卡片', () => {
+  /*
+   * 这三种状态的区分是用户明确要的（「总览没有看到当前手机状态」）：
+   * 她低头看手机那段时间不回消息，不是装死——界面要把这层画出来，
+   * 但「正在看」和「放下了」不能用同一句话糊过去。
+   */
+  it('正在看手机时显示在看什么、从几点起，并说明等她收起', () => {
+    const html = renderToStaticMarkup(
+      h(PhoneBody, {
+        data: {
+          state: 'watching',
+          watching_app: 'qq',
+          watching_since: '2026-11-07T00:30:00+00:00',
+          last_looked_at: null,
+          next_look_at: null,
+        },
+      }),
+    );
+    expect(html).toContain('正在看手机');
+    expect(html).toContain('qq');
+    expect(html).toContain('等她收起手机');
+    // 正在看的时候不该出现一个「下次」时间——那时它并不存在
+    expect(html).not.toContain('下次大约');
+  });
+
+  it('放下手机时显示上次与下次，不说「正在看」', () => {
+    const html = renderToStaticMarkup(
+      h(PhoneBody, {
+        data: {
+          state: 'idle',
+          watching_app: null,
+          watching_since: null,
+          last_looked_at: '2026-11-07T00:20:00+00:00',
+          next_look_at: '2026-11-07T00:40:00+00:00',
+        },
+      }),
+    );
+    expect(html).toContain('手机放下了');
+    expect(html).toContain('上次看是');
+    expect(html).toContain('下次大约');
+    expect(html).not.toContain('正在看手机');
+  });
+
+  it('从没安排过下一次时不说「下次大约」，避免编一个时间', () => {
+    const html = renderToStaticMarkup(
+      h(PhoneBody, {
+        data: { state: 'idle', last_looked_at: '2026-11-07T00:20:00+00:00', next_look_at: null },
+      }),
+    );
+    expect(html).toContain('还没安排下一次');
+    expect(html).not.toContain('下次大约');
   });
 });

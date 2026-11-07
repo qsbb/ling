@@ -16,6 +16,7 @@ SECTION_KEYS = {
     "timeline",
     "relationship",
     "connectivity",
+    "phone",
 }
 
 
@@ -212,3 +213,45 @@ async def test_timeline_is_empty_not_fake(logged_in) -> None:
             # 每条都要带来源，否则无法判断它是观察到的还是推断的
             assert item["origin"], item
             assert item["occurred_at"], item
+
+
+async def test_phone_is_empty_not_fake(logged_in) -> None:
+    """从没看过手机时是 empty（事实），不是编一条 idle 出来。
+
+    空态和故障必须分开：前者是"她还没拿过手机"，后者是"读不到"。
+    混在一起会让人以为功能坏了。
+    """
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    section = body["sections"]["phone"]
+    assert section["status"] in {"empty", "unavailable", "ok"}
+    if section["status"] == "empty":
+        assert not section["data"]
+    # 无论哪种状态，都不许把 last_context 那段自由文本透出来
+    assert "last_context" not in (section.get("data") or {})
+
+
+async def test_phone_visible_when_watching(logged_in) -> None:
+    """正在看手机时，首屏要能看出"她在看什么"。
+
+    这条是用户明确要的（「总览没有看到当前手机状态」）。她低头看手机那段
+    时间不回消息，不是装死——界面得把这件事画出来。
+    """
+    from ling.domains.phone import PhoneService
+    from ling.infra.db import session_scope
+
+    async with session_scope() as session:
+        await PhoneService(session).start_watching(
+            app="qq", context="群里有新消息"
+        )
+        await session.commit()
+
+    body = (await logged_in.client.get("/v1/dashboard")).json()
+    section = body["sections"]["phone"]
+    assert section["status"] == "ok", section
+    data = section["data"]
+    assert data["state"] == "watching"
+    assert data["watching_app"] == "qq"
+    assert data["watching_since"], "看手机要有开始时刻，否则界面只能显示一个不动的状态"
+    assert data["next_look_at"] is None, "正在看的时候不排下一次（规则 2）"
+    # 上下文是自由文本，可能带出聊天内容 —— 只给界面看 app 和时刻
+    assert "last_context" not in data
