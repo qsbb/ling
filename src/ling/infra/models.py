@@ -21,9 +21,12 @@ import sqlalchemy as sa
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -466,12 +469,22 @@ class PresenceState(Base, TimestampMixin):
     """
 
     __tablename__ = "presence_states"
+    __table_args__ = (
+        CheckConstraint(
+            "satiety BETWEEN 0 AND 100", name="ck_presence_states_satiety"
+        ),
+    )
 
     actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # 0-100。低精力只影响表达长度与主动意愿，**不影响是否回答**
     energy: Mapped[int] = mapped_column(Integer, default=70)
     # 0-100。高社交负担时少追问，同样不影响回答
     social_load: Mapped[int] = mapped_column(Integer, default=20)
+    # 0-100 饱腹（模拟值，不是生理指标）。与 energy 共用同一个 `settled_at`
+    # 惰性结算：不另起"饥饿 tick"。默认 70 是**模拟初值**，不伪造过去的餐食。
+    satiety: Mapped[int] = mapped_column(
+        Integer, default=70, server_default=sa.text("70")
+    )
     # 上次结算时间：按经过时间衰减，避免"每次读都扣一次"
     settled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
@@ -1037,6 +1050,14 @@ class AffectState(Base):
         UniqueConstraint(
             "actor_id", "emotion", "scope", "window_id", name="uq_affect_actor_emotion_scope"
         ),
+        CheckConstraint(
+            "valence IS NULL OR valence BETWEEN -1 AND 1",
+            name="ck_affect_states_valence",
+        ),
+        CheckConstraint(
+            "arousal IS NULL OR arousal BETWEEN -1 AND 1",
+            name="ck_affect_states_arousal",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1058,6 +1079,11 @@ class AffectState(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     cause: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Russell 二维连续状态（-1..1）。**可空**：旧行保留 NULL，由读取层按
+    # `emotion` 标签映射；下一次写入才填。不在这里换衰减公式——
+    # 调研建议指数衰减，但源码实际是线性，换公式会让旧情绪突然变长/变短。
+    valence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    arousal: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 # ------------------------------------------------------------------ W2 世界/活动/目标
@@ -1140,6 +1166,15 @@ class ActivityRow(Base, TimestampMixin):
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
     # 谁能知道。私聊促成的活动默认不进群聊
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    # 这条活动由哪个日程段（叶段）启动。可空 = 临时起意/历史活动。
+    # **不复用 `plan_id`**：那一个字符串已经指 `agenda_plans`，
+    # 让同一个字段指两张表会同时失去外键与审计能力。
+    schedule_segment_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("schedule_segments.id", name="fk_activities_schedule_segment"),
+        nullable=True,
+        index=True,
+    )
 
 
 class GoalRow(Base, TimestampMixin):
@@ -1564,6 +1599,402 @@ class TogetherParticipantRow(Base):
 # W2 需要新表时由对应批次提交迁移，主智能体协调 schema owner。
 
 
+# ------------------------------------------------------------------ 她的一天（日程时间轴）
+#
+# 一条硬边界写在最前面：**计划是意向，不是事实**。这里的段只表达"想做什么/
+# 若无新事可能怎样"，完成必须来自 `activities` 的完成证据，梦也不能回灌成经历。
+#
+# 三层（block/hour/minute）都是意向，父子段有意重叠；只有叶段可用于启动活动。
+# 内部时间一律左闭右开 `[start_at, end_at)`，UTC after 入库，展示时由 IANA
+# 时区投影。两个"日"的定义见 `domains/agenda/timeline.py`：
+#   - 展示日：[D 00:00, D+1 00:00)（用户有效时区）
+#   - 计划日：[D 04:00, D+1 04:00)（角色规范时区，以起点日期 D 命名）
+
+DAY_PLAN_STATES: tuple[str, ...] = ("pending", "ready", "degraded")
+SEGMENT_LAYERS: tuple[str, ...] = ("block", "hour", "minute")
+SEGMENT_STATUSES: tuple[str, ...] = ("current", "superseded", "cancelled")
+SEGMENT_ANCHOR_KINDS: tuple[str, ...] = ("", "sleep", "commitment")
+SEGMENT_SOURCES: tuple[str, ...] = ("model", "rule", "baseline", "user")
+BEHAVIOR_CALL_STATES: tuple[str, ...] = ("reserved", "committed", "failed", "expired")
+DREAM_STATUSES: tuple[str, ...] = ("ready", "failed", "missed", "no_dream")
+
+
+def _in_check(column: str, values: tuple[str, ...], *, name: str) -> CheckConstraint:
+    """生成 ``column IN ('a','b')`` 的 CHECK。
+
+    枚举取值在 Python 侧同时导出（上面那几个常量），**服务和数据库各判一次**：
+    只靠 DB 会让"未知取值"在写入时才炸；只靠服务层则手工改库/旧代码能绕过。
+    """
+    joined = ", ".join(f"'{value}'" for value in values)
+    return CheckConstraint(f"{column} IN ({joined})", name=name)
+
+
+class DayPlanRow(Base, TimestampMixin):
+    """一个**计划日**的版本头（D 04:00 → D+1 04:00）。
+
+    ``UNIQUE(actor_id, plan_day)`` 是日界幂等的唯一凭据：同一天只能有一行，
+    所有并发 worker 都在这行上用 CAS ``revision`` 提交，重复调度只增版本、
+    不增日期行。
+    """
+
+    __tablename__ = "day_plans"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "plan_day", name="uq_day_plans_actor_day"),
+        # 复合 FK 的目标：`schedule_segments` 用它保证"段和计划属于同一个 actor"。
+        UniqueConstraint("id", "actor_id", name="uq_day_plans_id_actor"),
+        Index("ix_day_plans_actor_window", "actor_id", "window_start_at"),
+        CheckConstraint("revision >= 0", name="ck_day_plans_revision"),
+        CheckConstraint(
+            "window_end_at > window_start_at", name="ck_day_plans_window"
+        ),
+        _in_check("state", DAY_PLAN_STATES, name="ck_day_plans_state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    # 计划日的起点日期（本地 D 04:00 那天），不是 UTC 日期
+    plan_day: Mapped[date] = mapped_column(Date)
+    # 生成这一版时用的角色规范时区与来源（preference/env/default）
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone_source: Mapped[str] = mapped_column(String(16), default="default")
+    # 排程快照版本：时区**或**作息变化时 +1。幂等键用它，
+    # 让"换了时区要重排"与"同一天重复调度不重排"能区分开。
+    timezone_revision: Mapped[int] = mapped_column(Integer, default=0)
+    routine_revision: Mapped[int] = mapped_column(Integer, default=0)
+    window_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    window_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    # pending（还没生成）/ ready（模型或规则大纲已提交）/ degraded（兜底生成）
+    state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # model / rule / baseline：这一版大纲的可信来源。规则兜底必须能一眼看出来。
+    generation_source: Mapped[str] = mapped_column(String(16), default="rule")
+    # 最近一次失败/降级的确定性原因码（不含正文、不含路径）
+    last_error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+
+
+class ScheduleSegmentRow(Base, TimestampMixin):
+    """日程时间轴上的一个段（大块 / 小时 / 分钟）。
+
+    ## 为什么父子段允许重叠
+
+    大块是"想做什么"，子段是"若无新事可能怎样做"。它们不是并列任务，
+    拿"段与段不许重叠"一刀切会把父子关系判成冲突。
+
+    ## 为什么 `parent_key` 是非空字符串
+
+    PostgreSQL 的 UNIQUE 对 NULL 互不相等：根段若把 `parent_id` 写成 NULL，
+    `UNIQUE(plan_id, revision_created, layer, start_at, parent_key)` 对根段就失效。
+    所以根段用空串（与 `affect_states.window_id` 同一个理由）。
+
+    ## 重叠防护分两层
+
+    - 服务层（`agenda/timeline.py`）在事务里校验：叶段互不重叠、子段落在父段内、
+      不压不可移动锚点；
+    - 数据库层（迁移里，若能装 `btree_gist`）：同 actor 的 `current` 叶段加
+      `EXCLUDE USING gist (actor_id WITH =, tstzrange(start_at,end_at,'[)') WITH &&)`。
+      exclusion **只防叶段**，不限制父子、也不限制历史 superseded 行。
+    """
+
+    __tablename__ = "schedule_segments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["plan_id", "actor_id"],
+            ["day_plans.id", "day_plans.actor_id"],
+            name="fk_schedule_segments_plan_actor",
+        ),
+        # 复合自引用：子段的 parent 必须属于**同一个 plan**。
+        # 只写 parent_id 单列 FK 时，模型给一个别的 plan 的段 ID 也能通过。
+        UniqueConstraint("id", "plan_id", name="uq_schedule_segments_id_plan"),
+        ForeignKeyConstraint(
+            ["parent_id", "plan_id"],
+            ["schedule_segments.id", "schedule_segments.plan_id"],
+            name="fk_schedule_segments_parent_plan",
+        ),
+        ForeignKeyConstraint(
+            ["place_id"],
+            ["world_places.id"],
+            name="fk_schedule_segments_place",
+        ),
+        UniqueConstraint(
+            "plan_id",
+            "revision_created",
+            "layer",
+            "start_at",
+            "parent_key",
+            name="uq_schedule_segments_rev",
+        ),
+        Index("ix_schedule_segments_actor_window", "actor_id", "start_at", "end_at"),
+        Index("ix_schedule_segments_plan_rev", "plan_id", "revision_created"),
+        CheckConstraint("end_at > start_at", name="ck_schedule_segments_order"),
+        # 根段 ``parent_id IS NULL`` 且 ``parent_key = ''``；子段两者都非空。
+        # **不能**写成 ``length(parent_key) > 0``：那会把根段（空串是唯一键的
+        # 防 NULL 手段）全部拒收，而空串正是设计 §6 规定的根段取值。
+        CheckConstraint(
+            "(parent_id IS NULL AND parent_key = '')"
+            " OR (parent_id IS NOT NULL AND length(parent_key) > 0)",
+            name="ck_schedule_segments_parent_key",
+        ),
+        _in_check("layer", SEGMENT_LAYERS, name="ck_schedule_segments_layer"),
+        _in_check("status", SEGMENT_STATUSES, name="ck_schedule_segments_status"),
+        _in_check(
+            "anchor_kind", SEGMENT_ANCHOR_KINDS, name="ck_schedule_segments_anchor"
+        ),
+        _in_check("source", SEGMENT_SOURCES, name="ck_schedule_segments_source"),
+        CheckConstraint(
+            "commitment_level IN ('tentative', 'confirmed')",
+            name="ck_schedule_segments_commitment",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(String(64), index=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 根段为 ''（见类注释：NULL 会绕过唯一约束）
+    parent_key: Mapped[str] = mapped_column(String(64), default="")
+    # block / hour / minute
+    layer: Mapped[str] = mapped_column(String(8), default="block")
+    # 活动类别（meal/work/leisure/...）。受服务层白名单约束。
+    kind: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(120))
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    place_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    commitment_level: Mapped[str] = mapped_column(String(16), default="tentative")
+    # current / superseded / cancelled。**不物理删除**：旧段要能被审计/解释。
+    status: Mapped[str] = mapped_column(String(16), default="current", index=True)
+    # 只有叶段可以启动活动
+    is_leaf: Mapped[bool] = mapped_column(Boolean, default=True)
+    # '' 表示可变段；sleep/commitment 是**不可移动锚点**
+    anchor_kind: Mapped[str] = mapped_column(String(16), default="")
+    # model / rule / baseline / user
+    source: Mapped[str] = mapped_column(String(16), default="model")
+    # 这个段属于哪一版（与 day_plans.revision 对齐）
+    revision_created: Mapped[int] = mapped_column(Integer, default=0)
+    # 在哪一版被结束（superseded 时填）；NULL = 仍是当前版本
+    revision_ended: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class ScheduleChangeRequestRow(Base, TimestampMixin):
+    """一次"临时提议 → 局部重排"的决定记录（阶段 3 才会写）。
+
+    阶段 1 建表是为了让重排链路有地方落审计，**不提前实现决定逻辑**。
+    不存聊天原文：只存 turn/window/计划 id 与决定和原因码。
+    """
+
+    __tablename__ = "schedule_change_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id", "source_turn_id", name="uq_schedule_change_actor_turn"
+        ),
+        Index(
+            "ix_schedule_change_actor_created", "actor_id", "created_at"
+        ),
+        _in_check(
+            "decision", ("accept", "decline", "defer"), name="ck_schedule_change_decision"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_turn_id: Mapped[str] = mapped_column(String(64))
+    window_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("day_plans.id", name="fk_schedule_change_plan"),
+        nullable=True,
+    )
+    base_revision: Mapped[int] = mapped_column(Integer, default=0)
+    decision: Mapped[str] = mapped_column(String(16))
+    reason_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    range_start_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    range_end_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    committed_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class BehaviorModelCallRow(Base):
+    """行为模型调用（大纲/细化/重排/梦）的预算预留与租约。
+
+    ## 为什么预算必须落库
+
+    多 worker 下进程内计数器各算各的，同一计划日会被各副本各烧一份预算。
+    所以"调用前预留"与"job lease"同事务写入这一行：
+    `UNIQUE(actor_id, kind, idempotency_key, attempt)` 让同一 attempt 只有一个
+    赢家；`lease_until` 过期后只能开**新 attempt**（旧 attempt 的预算不退款，
+    与设计稿一致）。明细保留 90 天，provider 的 token 账单不能替代这张表。
+    """
+
+    __tablename__ = "behavior_model_calls"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "kind",
+            "idempotency_key",
+            "attempt",
+            name="uq_behavior_model_calls_attempt",
+        ),
+        Index(
+            "ix_behavior_model_calls_day",
+            "actor_id",
+            "plan_day",
+            "kind",
+            "state",
+        ),
+        Index(
+            "ix_behavior_model_calls_window",
+            "actor_id",
+            "window_id",
+            "created_at",
+        ),
+        _in_check("state", BEHAVIOR_CALL_STATES, name="ck_behavior_model_calls_state"),
+        CheckConstraint(
+            "reserved_input_tokens >= 0 AND reserved_output_tokens >= 0 "
+            "AND (actual_tokens IS NULL OR actual_tokens >= 0)",
+            name="ck_behavior_model_calls_tokens",
+        ),
+        CheckConstraint("attempt >= 1", name="ck_behavior_model_calls_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    plan_day: Mapped[date] = mapped_column(Date)
+    # outline / refine / replan / dream
+    kind: Mapped[str] = mapped_column(String(16))
+    # 聊天窗口（replan 用）。空串代替 NULL：唯一键/索引里 NULL 互不相等。
+    window_id: Mapped[str] = mapped_column(String(64), default="")
+    idempotency_key: Mapped[str] = mapped_column(String(160))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(16), default="reserved")
+    reserved_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    reserved_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    actual_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class DreamReportRow(Base, TimestampMixin):
+    """一晚的梦（模拟叙事）。**结构上与事实隔离**。
+
+    不写 `activities` / `self_experiences` / 事实抽取 outbox：梦是虚构叙事，
+    检索者漏一次过滤就会把"梦到"说成"做过"。固定 origin/visibility 由 CHECK
+    兜底，应用代码写错也进不了事实链。
+    """
+
+    __tablename__ = "dream_reports"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "sleep_date", name="uq_dream_reports_actor_date"),
+        _in_check("status", DREAM_STATUSES, name="ck_dream_reports_status"),
+        CheckConstraint("origin = 'simulated'", name="ck_dream_reports_origin"),
+        CheckConstraint(
+            "visibility = 'actor_private'", name="ck_dream_reports_visibility"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    # 醒来所在本地日期（跨日作息以实际预计醒点定义）
+    sleep_date: Mapped[date] = mapped_column(Date)
+    # ready / failed / missed / no_dream
+    status: Mapped[str] = mapped_column(String(16), default="no_dream")
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    narrative: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mood: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cue_ids: Mapped[list] = mapped_column(JSON, default=list)
+    transform_ids: Mapped[list] = mapped_column(JSON, default=list)
+    origin: Mapped[str] = mapped_column(String(16), default="simulated")
+    visibility: Mapped[str] = mapped_column(String(24), default="actor_private")
+    plan_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("day_plans.id", name="fk_dream_reports_plan"),
+        nullable=True,
+    )
+
+
+class SleepSettlementRow(Base, TimestampMixin):
+    """跨夜情绪/状态结算（阶段 4 才会写）。
+
+    唯一键 `(actor_id, sleep_date)` 让"醒来结算"天然幂等；与梦是否成功**无关**
+    ——梦失败也要结算（否则一次模型故障会连带把情绪冻住）。
+    """
+
+    __tablename__ = "sleep_settlements"
+
+    actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sleep_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    bed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    wake_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 睡前/醒后的 global 情绪快照（只存粗粒度标签与强度，不存原文）
+    global_affect_before: Mapped[dict] = mapped_column(JSON, default=dict)
+    global_affect_after: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_routine_revision: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AffectSignalRow(Base):
+    """日内情绪峰值信号（带 scope 与来源事件），供梦与结算取峰值。
+
+    现有 `affect_states` 只存**当前**衰减值，回看不到"日内峰值"；
+    所以单独留一张只追加的信号表。`window` 作用域的信号**不得跨受众注入**：
+    表里有 window_id，读侧必须按受众过滤。
+    """
+
+    __tablename__ = "affect_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "source_event_id",
+            "scope",
+            "window_id",
+            "emotion",
+            name="uq_affect_signals_event",
+        ),
+        Index("ix_affect_signals_actor_time", "actor_id", "occurred_at"),
+        CheckConstraint("intensity >= 0", name="ck_affect_signals_intensity"),
+        CheckConstraint(
+            "valence IS NULL OR valence BETWEEN -1 AND 1",
+            name="ck_affect_signals_valence",
+        ),
+        CheckConstraint(
+            "arousal IS NULL OR arousal BETWEEN -1 AND 1",
+            name="ck_affect_signals_arousal",
+        ),
+        CheckConstraint("scope IN ('global', 'window')", name="ck_affect_signals_scope"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_event_id: Mapped[str] = mapped_column(String(64))
+    # global（可跨窗口的粗粒度趋势）/ window（只属于某窗口）
+    scope: Mapped[str] = mapped_column(String(16), default="global")
+    # global 存空串而不是 NULL（同 affect_states）
+    window_id: Mapped[str] = mapped_column(String(64), default="")
+    emotion: Mapped[str] = mapped_column(String(32))
+    intensity: Mapped[float] = mapped_column(Float, default=0.0)
+    valence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    arousal: Mapped[float | None] = mapped_column(Float, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
 __all__ = [
     "ActivityRow",
     "ActorAccount",
@@ -1607,6 +2038,13 @@ __all__ = [
     "SpeakLeaseRow",
     "TurnControlRow",
     "UserPreferenceRow",
+    "AffectSignalRow",
+    "BehaviorModelCallRow",
+    "DayPlanRow",
+    "DreamReportRow",
+    "ScheduleChangeRequestRow",
+    "ScheduleSegmentRow",
+    "SleepSettlementRow",
     "SpeechSegment",
     "WorldPlace",
     "DeliveryReceiptRow",
