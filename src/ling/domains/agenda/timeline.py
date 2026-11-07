@@ -1,18 +1,26 @@
-"""她的一天（阶段 1）：两个"日"的边界、时间轴校验与每日大纲生成。
+"""她的一天（阶段 1.5）：两个"日"的边界、时间轴校验与每日大纲生成。
 
 ## 两个日，一个真实时钟
 
 - **展示日**：用户有效时区的 ``[D 00:00, D+1 00:00)``；
-- **计划日**：角色规范时区的 ``[D 04:00, D+1 04:00)``，以起点日期 D 命名。
+- **计划日**：角色规范时区的 ``[D 00:00, D+1 00:00)``，以起点日期 D 命名。
+
+计划日按**午夜**切分：角色本地的日历日期就是 ``plan_day``，没有"凌晨 4 点前算
+前一天"的旧分支（那会让 D 的 00:00–04:00 必须由 D−1 的计划承担，与"前夜为 D 的
+整日生成"不符）。
 
 计划日时区取 ``ling/settings/user_preferences.py`` 的**唯一解析入口**
 （DB 偏好 → ``LING_USER_TIMEZONE`` → 默认），不读服务器时区、也不偷用
 ``actor_routines.timezone`` 另算一套"今天"。作息表里的时区只作为**旧值**：
 若它与规范时区不一致，大纲仍按规范时区排，并把冲突记在 outcome 上（不静默）。
 
-D 04:00 生成的是 **D 04:00 → D+1 04:00 的可变部分**，外加 D 夜里的跨夜睡眠锚点
-（可越过 D+1 04:00）。**D 的 00:00–04:00 只来自 D−1 计划日的跨夜段，绝不回填**：
-"04:00 补排今天"不等于"今天 00:00–04:00 的睡眠是刚生成的"。
+**生成时刻与日界是两件事**：D 的大纲在角色本地 **D−1 21:00** 到期
+（:func:`outline_due_at`），21:00–24:00 仍属于 D−1 的生活，所以 21:00 不是日界，
+只是后台批处理时刻。D 的这一行负责 D 的**整个** ``[D 00:00, D+1 00:00)``，
+包括 D 凌晨的预计睡眠：睡眠锚点由作息"非清醒区间"与 D 的午夜窗口**求交**，
+得到至多两段、都完全归属 D 的规则锚点（:func:`sleep_anchors_for_day`）。
+D 的 ``[00:00,08:00)`` 由 D 自己的计划直接产出，**不再**继承 D−1 的跨夜锚点，
+也没有任何段越过午夜。
 
 ## 时间轴语义（全部左闭右开、UTC 入库）
 
@@ -59,10 +67,16 @@ from ling.ports.model import ChatMessageIn, ModelError
 
 logger = logging.getLogger("ling.domains.agenda.timeline")
 
-# 计划日的起点小时（本地墙钟）。04:00 是**后台排程截点**，不是角色"醒来思考"
-# 的剧情事件：睡眠场景与梦另算（设计 §0）。
-PLAN_DAY_START_HOUR = 4
+# 计划日的起点：角色本地**午夜**（设计 §2）。计划日是本地 ``[D 00:00, D+1 00:00)``，
+# 本地日历日期就是 ``plan_day``；不再有"< 04:00 算前一天"的旧日界。
+PLAN_DAY_START_HOUR = 0
 PLAN_DAY_START_MINUTE = PLAN_DAY_START_HOUR * 60
+
+# 大纲的**生成到期时刻**：目标日 D 的**前一天**本地 21:00（设计 §2）。
+# 生成时刻与日界分离：21:00–24:00 仍属于 D−1 的生活，所以 21:00 不是日界。
+# 按本地墙钟组合再转 UTC，**不能**用"午夜 − 3 小时"推（DST 当天会偏）。
+OUTLINE_DUE_HOUR = 21
+OUTLINE_DUE_MINUTE = OUTLINE_DUE_HOUR * 60
 
 # 大纲只用 `memory.extract` 一个职责（设计 §0：不借 `dialogue.fast`）。
 OUTLINE_PROFILE = "memory.extract"
@@ -188,7 +202,7 @@ def _local_minute_instant(day: date, minute: int, zone: ZoneInfo) -> datetime:
 
 
 def plan_day_window(plan_day: date, timezone: str) -> tuple[datetime, datetime]:
-    """计划日的 UTC 半开区间 ``[D 04:00, D+1 04:00)``（按本地墙钟组合）。"""
+    """计划日的 UTC 半开区间 ``[D 00:00, D+1 00:00)``（按本地墙钟组合）。"""
     zone = resolve_zone(timezone)
     start = _local_minute_instant(plan_day, PLAN_DAY_START_MINUTE, zone)
     end = _local_minute_instant(plan_day + timedelta(days=1), PLAN_DAY_START_MINUTE, zone)
@@ -208,13 +222,23 @@ def local_minute_instant(day: date, minute: int, timezone: str | None) -> dateti
     return _local_minute_instant(day, minute, resolve_zone(timezone))
 
 
+def outline_due_at(plan_day: date, timezone: str) -> datetime:
+    """目标计划日 D 的大纲**到期时刻**：D−1 本地 21:00 的 UTC 瞬时。
+
+    与日界分开：21:00–24:00 仍属于 D−1 的生活，所以这不是"新的一天开始"。
+    按 D−1 的**本地墙钟**组合再转 UTC，**不做** ``window_start − 3h`` 或
+    ``−24h`` 的算术：DST 当天的 21:00 与次日 00:00 之间的偏移关系不由加法决定。
+    DST 规则与 :func:`_local_minute_instant` 一致：本地时刻不存在就顺延到该日
+    下一个有效分钟，重复则取第一次出现（``fold=0``）。
+    """
+    zone = resolve_zone(timezone)
+    due_day = plan_day - timedelta(days=1)
+    return _local_minute_instant(due_day, OUTLINE_DUE_MINUTE, zone)
+
+
 def plan_day_for(instant: datetime, timezone: str | None) -> date:
-    """某个瞬时落在哪个**计划日**（``local < 04:00`` 算前一天）。"""
-    local = _aware(instant).astimezone(resolve_zone(timezone))
-    day = local.date()
-    if local.hour * 60 + local.minute < PLAN_DAY_START_MINUTE:
-        day -= timedelta(days=1)
-    return day
+    """某个瞬时落在哪个**计划日**（角色本地日历日期 = plan_day）。"""
+    return _aware(instant).astimezone(resolve_zone(timezone)).date()
 
 
 def display_day_for(instant: datetime, timezone: str | None) -> date:
@@ -270,35 +294,52 @@ class Anchor:
         }
 
 
-def build_sleep_anchor(
-    plan_day: date, *, timezone: str, rest_minute: int, wake_minute: int
-) -> Anchor | None:
-    """计划日夜里的跨夜睡眠锚点：``D rest`` → ``D+1 wake``（可越过 D+1 04:00）。
+def sleep_anchors_for_day(
+    plan_day: date, timezone: str, routine: RoutineSnapshot
+) -> list[Anchor]:
+    """D 的预计睡眠锚点：作息"非清醒区间"与 D 的**午夜窗口求交**，至多两段。
 
-    存的是完整跨夜区间，不按计划日窗口裁剪：D+1 00:00–04:00 的展示要能显示
-    "在睡觉"，而 D+1 04:00 生成的日计划**不能**回填这一段。
+    设计 §2：D 这一行负责 D 的整日 ``[D 00:00, D+1 00:00)``，D 凌晨的预计睡眠也
+    由 D 自己产出。因此返回的每一段都**完全归属 D**，任何一段都不越过午夜
+    （旧实现给 D 夜写一个跨到 D+1 的锚点，会让 D+1 凌晨同时被两行声明，
+    正是改版要消除的重叠来源）。
 
-    ``rest < 04:00`` 时跳过：那段睡眠属于**D−1** 计划日的夜间锚点，
-    由 D−1 的行负责；D 的 00:00–04:00 不再补一个"已经睡过"。
+    - ``wake=08:00, rest=23:00`` → ``[00:00,08:00)`` 与 ``[23:00,24:00)``；
+    - ``wake=10:00, rest=02:00``（即 rest < wake）→ 只有 ``[02:00,10:00)``；
+      午夜到 02:00 是清醒时间，不造睡眠；
+    - ``wake == rest`` → 作息没有有效睡眠窗，**不造**任何睡眠段
+      （不假定"她一定睡了"，也不补一个全天睡眠）。
+
+    区间左闭右开：``rest=23:00`` 的 ``end`` 是**次日 00:00** 的瞬时，
+    不是 ``D 23:59``；``start < end`` 的单段才保留（DST 极端情况下可能出现
+    两分钟落在同一瞬时，那段直接丢弃，不写零长度锚点）。
     """
-    if rest_minute == wake_minute:
-        # 作息没有有效窗口（全天醒着或没有睡眠段）：不造睡眠锚点，
-        # 也不假定"她一定睡了"。
-        return None
-    if rest_minute < PLAN_DAY_START_MINUTE:
-        return None
-    start = _local_minute_instant(plan_day, rest_minute, resolve_zone(timezone))
-    wake_day = plan_day + timedelta(days=1)
-    end = _local_minute_instant(wake_day, wake_minute, resolve_zone(timezone))
-    if end <= start:
-        return None
-    return Anchor(
-        kind=SLEEP_ANCHOR,
-        start_at=start,
-        end_at=end,
-        title="睡觉",
-        protective=False,
-    )
+    wake = int(routine.wake_minute) % (24 * 60)
+    rest = int(routine.rest_minute) % (24 * 60)
+    if wake == rest:
+        # 现有作息语义：wake == rest 表示"没有有效睡眠窗"，不是"睡了 24 小时"。
+        return []
+    # 非清醒区间 [rest, wake)：rest < wake 时它本身就在同一天内，与 D 的交集就是
+    # 它自己；rest > wake 时它跨过午夜，与 D 的午夜窗口求交拆成两段
+    # （午夜后的头段 + 午夜前的尾段），两段各自都完全归属 D。
+    bounds = [(rest, wake)] if rest < wake else [(0, wake), (rest, 24 * 60)]
+    zone = resolve_zone(timezone)
+    anchors: list[Anchor] = []
+    for start_minute, end_minute in bounds:
+        start = _local_minute_instant(plan_day, start_minute, zone)
+        end = _local_minute_instant(plan_day, end_minute, zone)
+        if start >= end:
+            continue
+        anchors.append(
+            Anchor(
+                kind=SLEEP_ANCHOR,
+                start_at=start,
+                end_at=end,
+                title="睡觉",
+                protective=False,
+            )
+        )
+    return anchors
 
 
 async def load_commitment_anchors(
@@ -1057,7 +1098,7 @@ async def _commit_revision(
 
     async with session.begin_nested():
         # 只动"还没开始"的当前段：已过去的、已经开始的段是历史，不改写。
-        # 锚点若已开始（跨夜睡眠的尾部）也保留，避免把"正在睡"翻成缺口。
+        # 锚点若已开始（当天凌晨那段预计睡眠）也保留，避免把"正在睡"翻成缺口。
         await session.execute(
             update(ScheduleSegmentRow)
             .where(
@@ -1068,7 +1109,7 @@ async def _commit_revision(
             )
             .values(status="superseded", revision_ended=new_revision)
         )
-        # 已经开始的段（跨夜睡眠的尾部、过去的大块）保留原样：改版只排未来。
+        # 已经开始的段（凌晨的预计睡眠、过去的大块）保留原样：改版只排未来。
         kept = list(
             (
                 await session.execute(
@@ -1081,8 +1122,8 @@ async def _commit_revision(
             ).scalars()
         )
         # 新草稿若压到保留段就丢弃：宁可这一版少一块，也不写重叠。
-        # 时区变更跨过 D+1 04:00 时，旧夜睡眠锚点会与新夜锚点重叠——
-        # 这正是设计 §2 说的"跨夜锚点冲突：保留已开始部分、未来接缝规则修补"。
+        # 改规范时区使日界平移时，旧窗口留下的睡眠锚点会与新锚点重叠——
+        # 保留已开始部分，接缝由 00:00 的零模型校验修补（设计 §2）。
         drafts = [
             draft
             for draft in segments
@@ -1165,6 +1206,11 @@ async def ensure_day_plan(
     这是阶段 1 唯一的大纲写入入口，`AgendaService.ensure_day_plan` 只是转发。
     调用方负责 commit/rollback；本函数内部只用嵌套事务保护"抢占/提交"这两处。
 
+    ``plan_day`` 是**显式目标日 D**：传了就用它，窗口取 D 的本地午夜区间
+    （:func:`plan_day_window`），并允许 ``now < window_start`` 的**预生成**
+    （D−1 21:00 的正常路径，可变起点 = ``max(now, window_start)``）。
+    不传才按 ``now`` 推当前计划日。
+
     流程：解析规范时区 → 取/建计划行 → 快照没变就直接返回原结论 → 预算+lease
     → 调模型 → 严格校验（非法修一次）→ 失败写规则大纲 + ``degraded`` →
     CAS 提交一版。
@@ -1215,17 +1261,14 @@ async def ensure_day_plan(
     if not snapshot_same:
         timezone_revision += 1
 
-    anchors = await load_commitment_anchors(
+    commitment_anchors = await load_commitment_anchors(
         session, actor_id=actor_id, window_start=window_start, window_end=window_end
     )
-    sleep_anchor = build_sleep_anchor(
-        plan_day,
-        timezone=timezone,
-        rest_minute=routine.rest_minute,
-        wake_minute=routine.wake_minute,
+    # D 的睡眠锚点：作息与 D 的午夜窗口求交，至多两段，都在 D 内。
+    anchors = sorted(
+        [*sleep_anchors_for_day(plan_day, timezone, routine), *commitment_anchors],
+        key=lambda item: item.start_at,
     )
-    if sleep_anchor is not None:
-        anchors.insert(0, sleep_anchor)
 
     # 可变起点：过去永不回填；catch-up 也从 now 开始。
     not_before = max(now, window_start)
@@ -1416,23 +1459,32 @@ async def run_due_outline(
     actor_id: str,
     router: object | None = None,
     config_reader: object | None = None,
+    plan_day: date | None = None,
     now: datetime | None = None,
     lease_owner: str | None = None,
 ) -> OutlineOutcome | None:
-    """worker 将来要调的函数：**只在到期边界**做一次"确保今天有大纲"。
+    """worker 将来要调的函数：在到期边界做一次"确保 D 有大纲"。
 
-    - 未到 04:00：返回 ``None``（不排明天的计划，不提前烧钱）；
-    - 已过 04:00 但没生成：生成从 ``now`` 开始的剩余部分（catch-up）；
+    ``plan_day`` 是**显式目标日 D**：传了就按 D 的午夜窗口
+    （:func:`plan_day_window`）算，且允许在 ``now < window_start`` 时**预生成**
+    ——那正是 D−1 21:00（:func:`outline_due_at`）的正常路径。不传则退回
+    "按 ``now`` 推当前计划日"的旧行为，未到窗口起点直接返回 ``None``
+    （不提前烧钱）。调度接线不在本模块（下一轮）。
+
+    其余分支（下一轮接调度时细化）：
+    - 当前计划日已过窗口起点但没生成：生成从 ``now`` 开始的剩余部分（catch-up）；
     - 离休息不足 40 分钟：只写规则睡眠锚点并标 ``degraded``（不调模型）；
     - 当前计划日已 ready/degraded 且快照没变：幂等返回 unchanged。
 
-    这里**没有**定时器/循环，也没有 outbox：阶段 1 只提供可调用的入口。
+    这里**没有**定时器/循环，也没有 outbox：只提供可调用的入口。
     """
     now = _aware(now or utcnow())
     timezone, timezone_source = await resolve_plan_timezone(session)
-    plan_day = plan_day_for(now, timezone)
+    explicit_target = plan_day is not None
+    if plan_day is None:
+        plan_day = plan_day_for(now, timezone)
     window_start, window_end = plan_day_window(plan_day, timezone)
-    if now < window_start:
+    if not explicit_target and now < window_start:
         return None
     routine = await _routine_snapshot(session, actor_id)
     rest_instant = _local_minute_instant(
@@ -1586,6 +1638,7 @@ __all__ = [
     "COMMITMENT_PROTECTIVE_MINUTES",
     "MODEL_KINDS",
     "OUTLINE_DAILY_TOKEN_BUDGET",
+    "OUTLINE_DUE_MINUTE",
     "OUTLINE_KIND",
     "OUTLINE_MAX_BLOCKS",
     "OUTLINE_MAX_CALLS",
@@ -1602,7 +1655,6 @@ __all__ = [
     "StaleRevisionError",
     "build_outline_prompt",
     "build_repair_prompt",
-    "build_sleep_anchor",
     "contains",
     "display_day_for",
     "display_day_window",
@@ -1612,6 +1664,7 @@ __all__ = [
     "load_segments",
     "local_hhmm",
     "local_minute_instant",
+    "outline_due_at",
     "overlaps",
     "parse_outline_payload",
     "plan_day_for",
@@ -1621,5 +1674,6 @@ __all__ = [
     "resolve_zone",
     "rule_outline",
     "run_due_outline",
+    "sleep_anchors_for_day",
     "validate_outline",
 ]

@@ -1,20 +1,24 @@
-"""她的一天（阶段 1）：真 PostgreSQL 上的大纲写入与幂等。
+"""她的一天（阶段 1.5）：真 PostgreSQL 上的大纲写入与幂等。
 
-这组用例守四件事（设计 §9 阶段 1 的可程序化验收）：
+这组用例守这几件事（设计 §9 阶段 1.5 的可程序化验收）：
 
 1. 同一个 actor 同一个计划日**只有一行** `day_plans`，重复调用只返回原结论
    （不重复生成、不重复烧预算）；
-2. 模型坏 JSON → ``degraded`` + **规则大纲**（睡眠锚点还在），不把非法结果入库；
-3. 非法结果可以在同预算内修复一次，修好就 ``ready``；
-4. **没有新增 activity / self_experience**——计划不是事实，这是项目硬规则。
+2. 计划日按**午夜**切分：D 的 ``[00:00,08:00)`` 预计睡眠由 D 自己的计划产出，
+   两段睡眠锚点都在 D 内、没有跨夜段；
+3. 模型坏 JSON → ``degraded`` + **规则大纲**（睡眠锚点还在），不把非法结果入库；
+4. 非法结果可以在同预算内修复一次，修好就 ``ready``；
+5. 显式目标日 D 允许在窗口开始前（D−1 21:00）预生成；
+6. **没有新增 activity / self_experience**——计划不是事实，这是项目硬规则。
 
-所有时间都用固定的 ``NOW``（计划日窗口起点 + 10 分钟），不依赖"现在几点"。
+所有时间都用固定的 ``NOW``（计划日窗口起点 + 10 分钟 → 本地 00:10），
+不依赖"现在几点"。
 """
 
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -24,7 +28,9 @@ from ling.domains.agenda.timeline import (
     load_day_plan,
     load_segments,
     local_minute_instant,
+    outline_due_at,
     plan_day_window,
+    run_due_outline,
 )
 from ling.infra.db import session_scope
 from ling.infra.models import (
@@ -50,7 +56,7 @@ ACTOR = "actor_ling"
 TZ = "Asia/Shanghai"
 PLAN_DAY = date(2026, 11, 7)
 WINDOW_START, WINDOW_END = plan_day_window(PLAN_DAY, TZ)
-NOW = WINDOW_START.replace(minute=10)  # 本地 04:10，已过 04:00 边界
+NOW = WINDOW_START.replace(minute=10)  # 本地 00:10，午夜日界后 10 分钟
 
 
 def _iso(minute: int) -> str:
@@ -58,23 +64,23 @@ def _iso(minute: int) -> str:
 
 
 def _valid_outline() -> str:
-    """两段在窗口内、不与睡眠锚点（23:00）重叠的可选块。"""
+    """两段在清醒时段（08:00–23:00）内的可选块，不压两段睡眠锚点。"""
     return json.dumps(
         {
             "segments": [
                 {
                     "kind": "meal",
                     "title": "吃早饭",
-                    "start_at": _iso(5 * 60),
-                    "end_at": _iso(6 * 60),
+                    "start_at": _iso(9 * 60),
+                    "end_at": _iso(10 * 60),
                     "place_id": None,
                     "flexibility": "flexible",
                 },
                 {
                     "kind": "work",
                     "title": "写代码",
-                    "start_at": _iso(9 * 60),
-                    "end_at": _iso(11 * 60),
+                    "start_at": _iso(13 * 60),
+                    "end_at": _iso(15 * 60),
                     "place_id": None,
                     "flexibility": "fixed",
                 },
@@ -201,8 +207,8 @@ async def test_outline_creates_one_row_and_is_idempotent(web_env: TestEnv) -> No
     assert first.source == "model"
     assert first.calls == 1
     assert first.revision == 1
-    # 睡眠锚点 + 两个模型块
-    assert first.segments == 3, first
+    # 两段睡眠锚点（[00:00,08:00) 与 [23:00,24:00)）+ 两个模型块
+    assert first.segments == 4, first
     assert len(router.prompts) == 1
 
     second, same_router = await _outline(responses=[])
@@ -215,15 +221,19 @@ async def test_outline_creates_one_row_and_is_idempotent(web_env: TestEnv) -> No
     plans, activities, experiences, segments = await _counts()
     assert plans == 1, "同一计划日必须只有一行 day_plans"
     assert activities == 0 and experiences == 0, "计划不是事实：不许写活动/经历"
-    assert segments == 3
+    assert segments == 4
 
     async with session_scope() as session:
         row = await load_day_plan(session, actor_id=ACTOR, plan_day=PLAN_DAY)
         assert row is not None
         draft = await load_segments(session, plan_id=str(row.id), revision=row.revision)
     anchors = [item for item in draft if item.anchor_kind == "sleep"]
-    assert len(anchors) == 1, "睡眠锚点必须存在"
-    assert anchors[0].is_leaf is False
+    # D 的 00:00–08:00 由 **D 自己**产出，两段都完全归属 D，没有跨夜段。
+    assert [(item.start_at, item.end_at) for item in anchors] == [
+        (WINDOW_START, WINDOW_START + timedelta(hours=8)),
+        (WINDOW_START + timedelta(hours=23), WINDOW_END),
+    ], "睡眠锚点应当是 D 内的 [00:00,08:00) 与 [23:00,24:00)"
+    assert all(item.is_leaf is False for item in anchors)
     leaves = [item for item in draft if item.is_leaf]
     assert len(leaves) == 2
     # 叶段不重叠（UTC 半开区间）
@@ -243,13 +253,13 @@ async def test_bad_json_degrades_to_rule_outline(web_env: TestEnv) -> None:  # n
     assert outcome.reason_code == "outline_invalid", outcome
     assert outcome.calls == 2, "非法结果在同预算内修复一次"
     assert len(router.prompts) == 2
-    assert outcome.segments == 1, "规则大纲只有睡眠锚点，不编可选活动"
+    assert outcome.segments == 2, "规则大纲只有两段睡眠锚点，不编可选活动"
 
     async with session_scope() as session:
         row = await load_day_plan(session, actor_id=ACTOR, plan_day=PLAN_DAY)
         assert row is not None and row.state == "degraded"
         segments = await load_segments(session, plan_id=str(row.id))
-    assert [item.anchor_kind for item in segments] == ["sleep"]
+    assert [item.anchor_kind for item in segments] == ["sleep", "sleep"]
 
     plans, activities, experiences, _ = await _counts()
     assert plans == 1
@@ -296,7 +306,7 @@ async def test_past_segments_are_rejected(web_env: TestEnv) -> None:  # noqa: AR
                 {
                     "kind": "work",
                     "title": "昨天的事",
-                    "start_at": (WINDOW_START - __import__("datetime").timedelta(minutes=30)).isoformat(),
+                    "start_at": (WINDOW_START - timedelta(minutes=30)).isoformat(),
                     "end_at": WINDOW_START.isoformat(),
                     "place_id": None,
                     "flexibility": "flexible",
@@ -330,7 +340,7 @@ async def test_model_unavailable_uses_rule_outline(web_env: TestEnv) -> None:  #
     assert outcome.state == "degraded", outcome
     assert outcome.reason_code == "model_unavailable"
     assert outcome.calls == 0
-    assert outcome.segments == 1
+    assert outcome.segments == 2
 
 
 async def test_extract_profile_unbound_does_not_borrow_dialogue(web_env: TestEnv) -> None:  # noqa: ARG001
@@ -350,6 +360,41 @@ async def test_extract_profile_unbound_does_not_borrow_dialogue(web_env: TestEnv
     assert outcome.state == "degraded"
     assert outcome.reason_code == "model_unavailable"
     assert router.prompts == [], "没绑职责时不能偷偷换模型"
+
+
+# ---------------------------------------------------------------- 显式目标日
+
+
+async def test_run_due_outline_accepts_explicit_target_day(web_env: TestEnv) -> None:  # noqa: ARG001
+    """显式传 D + D−1 21:00 到期点 → 可以**预生成**（旧代码此时会直接返回 None）。"""
+    await _seed()
+    due = outline_due_at(PLAN_DAY, TZ)
+    assert due < WINDOW_START, "21:00 到期点早于 D 的午夜窗口起点"
+    async with session_scope() as session:
+        outcome = await run_due_outline(
+            session,
+            actor_id=ACTOR,
+            router=None,
+            config_reader=None,
+            plan_day=PLAN_DAY,
+            now=due,
+        )
+    assert outcome is not None, "显式目标日必须能在窗口开始前生成"
+    assert outcome.plan_day == PLAN_DAY
+    assert outcome.state == "degraded"
+    assert outcome.reason_code == "model_unavailable"
+    assert outcome.segments == 2
+
+    async with session_scope() as session:
+        row = await load_day_plan(session, actor_id=ACTOR, plan_day=PLAN_DAY)
+        assert row is not None
+        assert row.window_start_at == WINDOW_START, "D 的窗口起点是本地午夜"
+        assert row.window_end_at == WINDOW_END
+        segments = await load_segments(session, plan_id=str(row.id))
+    assert [item.anchor_kind for item in segments] == ["sleep", "sleep"]
+    # 预生成也绝不回填过去、不越过午夜
+    assert all(item.start_at >= WINDOW_START for item in segments)
+    assert all(item.end_at <= WINDOW_END for item in segments)
 
 
 # ---------------------------------------------------------------- 时区/作息变更
