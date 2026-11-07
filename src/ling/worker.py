@@ -3,6 +3,20 @@
 W0 只需要它存在且能安全空转（Compose 里有 worker 服务）。
 W1/W2 会往 outbox 加 topic；本模块按 topic 注册 handler，未注册的 topic
 保持 pending 并记录原因，绝不静默丢弃。
+
+## 三种派发源（`tests/unit/test_worker_dispatch.py` 会强制对齐）
+
+- `PERIODIC_JOBS`：进程内定时（`life.schedule` 每 60 秒扫 DB 到期边界）；
+- `OUTBOX_TOPICS`：事件驱动（`schedule.outline` / `schedule.seam` /
+  `dream.generate` / `sleep.settle` 都由扫描在到期时投递）；
+- `LEGACY_MANUAL_TOPICS`：**有意**只保留手工触发（`life.plan`：新时间轴
+  接管后不再自动生成，见 `handle_life_plan` 的说明）。
+
+## outbox 的事务边界
+
+认领、执行、确认是三段：认领与确认各是一个短事务，**handler 在事务外跑**。
+模型调用（大纲/梦）因此不会把 `outbox_events` 的行锁和连接一起占住。
+详见"outbox 事务边界"一节。
 """
 
 from __future__ import annotations
@@ -16,7 +30,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1698,9 +1712,15 @@ async def _plan_window_ended(session, plan_id: str, *, now):  # noqa: ANN001, AN
 
 
 
+# 旧路径的周期（600 秒）**已不再使用**：`life.plan` 移出 `PERIODIC_JOBS`，
+# 只剩手工触发。留着这个数字是为了让"它原本多久跑一次"在代码里可查，
+# 而不是让人以为它还在按时跑。
 LIFE_PLAN_SECONDS = 600.0
 # 今天是否已经尝试排过日程（进程内）。多副本会各自尝试一次，
 # 但 `max_live_plans` 是硬上限，不会排爆。
+#
+# 注意：**它不是权威**。进程内状态一重启就归零，所以"旧路径该不该跑"
+# 由 `_new_timeline_owns()` 查 DB 判断；这里只防同一进程内重复排。
 _LAST_PLAN_DATE: str = ""
 
 
@@ -1749,11 +1769,32 @@ def parse_plan_json(text: str) -> list[dict]:
     return out[:3]
 
 
+async def _new_timeline_owns(session, *, actor_id: str) -> bool:  # noqa: ANN001
+    """新时间轴是否已经接管这个 actor（= 旧 `life.plan` 是否必须停手）。
+
+    判据取**数据**而不是开关：`day_plans` 有行，说明新时间轴真的为这个 actor
+    产出过计划（21:00 的 due、凌晨的 catch-up，或醒点后的 late 兜底都会建行）。
+    在这种情况下再让旧路径自动排 1–3 件小事，就是同一段时间轴上两份安排，
+    谁读哪一份取决于读者，没法解释也没法撤。
+
+    不能只看"代码里注册了 life.schedule"：那是**能力**，不是**事实**。
+    也不能看进程内变量：worker 重启后它归零，旧路径会偷偷复活。
+    """
+    from ling.infra.models import DayPlanRow
+
+    row = (
+        await session.execute(
+            select(DayPlanRow.id).where(DayPlanRow.actor_id == actor_id).limit(1)
+        )
+    ).first()
+    return row is not None
+
+
 @handler("life.plan")
 async def handle_life_plan(payload: dict) -> None:
-    """让她**自己排今天的日程**。
+    """**旧**路径：让她自己排今天的 1–3 件小事（已退出自动调度）。
 
-    为什么需要这一步：`life.tick` 只在"有到点的计划"时才开活动，而计划
+    为什么曾经需要它：`life.tick` 只在"有到点的计划"时才开活动，而计划
     从来没有来源——于是活动表永远是空的，界面上"她此刻在做什么"永远
     "没有登记中的活动"。她因此没有生活，只有一个能聊天的空壳。
 
@@ -1761,6 +1802,18 @@ async def handle_life_plan(payload: dict) -> None:
     - 一天只排一次（醒来之后、且当天还没有在手的计划）
     - 只安排"与人格相符的日常小事"，吃饭睡觉这类不需要记录
     - 模型给不出可用结果就**不排**，绝不硬编"她在看书"
+
+    ## 为什么它不再是周期任务
+
+    新时间轴（`life.schedule` + `schedule.outline`）已经接管"今天/明天做什么"。
+    两套一起跑就是**两份日程**：`agenda_plans` 一套、`day_plans` 一套，界面
+    与 `life.tick` 都会各看一半，谁也不知道哪份算数。所以它从
+    `PERIODIC_JOBS` 移出，列进 :data:`LEGACY_MANUAL_TOPICS`——只留手工触发。
+
+    另外还有一道**数据闸**：一旦这个 actor 已经有 `day_plans` 行（新时间轴
+    确实产出过计划），即使有人手工/旧配置把它调起来，也不会再自动生成。
+    旧 `agenda_plans` 仍然可读，手工小事仍走 `AgendaService.propose_plan`，
+    不经过这里。确需重建旧行为时传 ``{"force": true}``——**默认关闭**。
     """
     global _LAST_PLAN_DATE
 
@@ -1771,6 +1824,24 @@ async def handle_life_plan(payload: dict) -> None:
     from ling.settings.service import ConfigService
 
     settings = get_settings()
+
+    # 数据闸放在模型路由检查**之前**：新时间轴接管后，这里该记的是"旧路径
+    # 已停用"，而不是一条会把人带偏的"模型路由未就绪"。
+    if not payload.get("force"):
+        async with session_scope() as session:
+            if await _new_timeline_owns(session, actor_id=settings.actor_id):
+                emit_event(
+                    logger,
+                    logging.INFO,
+                    event_name="life_plan_retired",
+                    message="旧日程生成已停用：新时间轴已接管",
+                    attributes={
+                        "reason_code": "new_timeline_active",
+                        "hint": "手工小事走 AgendaService.propose_plan；确需旧路径传 force=true",
+                    },
+                )
+                return
+
     router = _MEMORY_ROUTER
     if router is None:
         emit_event(
@@ -2423,51 +2494,915 @@ async def refresh_memory_router_if_stale() -> None:
     await init_memory_router()
 
 
-async def drain_outbox(limit: int = 50) -> int:
-    """至少一次处理；消费方按事件 id 幂等。"""
-    await refresh_memory_router_if_stale()
-    processed = 0
-    async with session_scope() as session:
-        rows = list(
-            (
-                await session.execute(
-                    select(OutboxEvent)
-                    .where(OutboxEvent.state == "pending", OutboxEvent.available_at <= utcnow())
-                    .order_by(OutboxEvent.created_at)
-                    .limit(limit)
-                    .with_for_update(skip_locked=True)
+# ---------------------------------------------------------------- 生活调度（life.schedule）
+#
+# 设计 §3：扫描**只查 DB 到期边界**，一次模型调用都不做。真正干活的在
+# `schedule.outline` / `schedule.seam` / `dream.generate` / `sleep.settle`
+# 四个 outbox handler 里——它们各自在自己的连接、自己的事务边界里跑模型。
+#
+# 为什么必须这样切：
+# - 扫描 60 秒一次，拿它调模型会把"每 60 秒"变成"每 60 秒一次的 60 秒调用"；
+# - 到期判断必须能在没有模型、没有出网的进程里回答"该不该跑"；
+# - 投递走 outbox，重启后由 DB 状态补投（进程内计数器 `_LAST_PLAN_DATE`
+#   那种做法一重启就归零，旧路径会偷偷复活）。
+
+# 扫描周期：设计 §3 的工程初值（健康运行时在 21:00–21:01 投递）。
+LIFE_SCHEDULE_SECONDS = 60.0
+
+# 醒前 catch-up 的退避（秒）：只有**可恢复**原因才补试，且同一目标日最多
+# 投递 `OUTLINE_SCHEDULE_MAX_ATTEMPTS` 次（大纲预算本身最多 2 次调用）。
+OUTLINE_SCHEDULE_RETRY_BACKOFF_SECONDS = 900.0
+OUTLINE_SCHEDULE_MAX_ATTEMPTS = 3
+
+# 醒后多久之内还值得补记一条 `missed`（零模型）：只补最近这一晚，
+# 不为几天前没生成的梦翻旧账。
+DREAM_MISSED_MARK_HOURS = 6
+
+
+def _config_reader(session):  # noqa: ANN001, ANN202
+    """构造"已发布配置"读取器（worker 侧唯一来源）。
+
+    单独抽出来是为了让四个 handler 用同一份口径（test_mode/persona 一致），
+    也让集成测试能只替换这一处就拿到可用的模型职责解析结果。
+    """
+    from ling.infra.security import SecretBox
+    from ling.settings.service import ConfigService
+
+    settings = get_settings()
+    return ConfigService(
+        session,
+        SecretBox(settings),
+        test_mode_default=settings.test_mode,
+        persona_id=settings.persona_id,
+    )
+
+
+def _aware_moment(value: datetime | None) -> datetime | None:
+    """DB 读回的时间可能是 naive（sqlite）；统一按 UTC 解释，别拿它直接相减。"""
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _wake_minute_or_none(routine) -> int | None:  # noqa: ANN001
+    """`outline_due_decision` 要的 wake_minute；没有有效睡眠窗时是 ``None``。
+
+    ``wake == rest`` 在作息里的语义是"没有有效睡眠窗"，不是"睡了 24 小时"。
+    把它当 08:00 传下去，会让"午夜之后就算晚到"变成"等到 08:00 才算晚到"。
+    """
+    wake = int(routine.wake_minute) % (24 * 60)
+    rest = int(routine.rest_minute) % (24 * 60)
+    return None if wake == rest else wake
+
+
+async def _enqueue_once(
+    session,  # noqa: ANN001
+    *,
+    event_id: str,
+    topic: str,
+    payload: dict,
+    now: datetime,
+) -> bool:
+    """按主键幂等投递一条 outbox 事件；已经存在（任何状态）就不投。
+
+    幂等键就是**事件 id 本身**：`outbox_events.id` 是主键，重复扫描时
+    先查后插，再加上嵌套事务兜住"两个 worker 同时插"的竞态。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    if await session.get(OutboxEvent, event_id) is not None:
+        return False
+    try:
+        async with session.begin_nested():
+            session.add(
+                OutboxEvent(
+                    id=event_id,
+                    topic=topic,
+                    payload=payload,
+                    available_at=now,
+                    created_at=now,
                 )
-            ).scalars()
+            )
+            await session.flush()
+    except IntegrityError:
+        # 另一个 worker 同时投了同一条：主键兜底，这不是错误。
+        return False
+    return True
+
+
+async def _stale_outline_call_days(
+    session, *, actor_id: str, now: datetime  # noqa: ANN001
+) -> list[date]:
+    """有"过期模型租约"的目标日：那一版大纲预留了预算但没提交。
+
+    预算不退款（设计 §3），但**目标日本身需要补跑**——不补的话这一天永远
+    停在 `pending`，直到醒点后由 late 相位兜底。这里只读，不改那行：
+    过期 attempt 的最终状态归调用它的服务，worker 不替别人写状态。
+    """
+    from ling.domains.agenda.timeline import OUTLINE_KIND
+    from ling.infra.models import BehaviorModelCallRow
+
+    rows = (
+        await session.execute(
+            select(BehaviorModelCallRow.plan_day)
+            .where(
+                BehaviorModelCallRow.actor_id == actor_id,
+                BehaviorModelCallRow.kind == OUTLINE_KIND,
+                BehaviorModelCallRow.state == "reserved",
+                BehaviorModelCallRow.lease_until.is_not(None),
+                BehaviorModelCallRow.lease_until < now,
+            )
+            .distinct()
         )
-        for row in rows:
-            fn = HANDLERS.get(row.topic)
-            if fn is None:
-                row.state = "unhandled"
-                row.last_error = f"没有注册 {row.topic} 的处理器（W1/W2 模块尚未接入）"
+    ).scalars()
+    return [item for item in rows if item is not None]
+
+
+def _like_prefix(value: str) -> str:
+    """把字面量变成 LIKE 前缀模式（转义 ``%`` / ``_`` / ``\\``）。
+
+    actor id 里带下划线（``actor_ling``）时，不转义的 LIKE 会把 ``_`` 当成
+    "任意一个字符"，于是 ``actorXling`` 的事件也会被算进同一个作业。
+    """
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
+async def _schedule_outline(
+    session,  # noqa: ANN001
+    *,
+    actor_id: str,
+    plan_day: date,
+    phase: str,
+    now: datetime,
+    timezone: str,
+    timezone_source: str,
+    routine_revision: int,
+) -> bool:
+    """按"目标日 + 相位"投递一次大纲作业（同一天重复扫描不重复投）。
+
+    幂等键 = 目标日 + 快照版本（tz_rev/routine_rev）+ 尝试号：
+    - 快照没变时 key 稳定 → 重复扫描只看到已有事件，不会再投；
+    - 快照（时区/作息）变了 → 新 key，需要重排（`ensure_day_plan` 自己会
+      判断"快照没变就返回 unchanged"，所以不会白烧模型）；
+    - 可恢复失败（模型暂不可用/超时/报错）→ 醒前最多再补两次，带 15 分钟
+      退避；终态原因码（非法输出/预算耗尽/degraded_late）不再重试。
+    """
+    from ling.domains.agenda.timeline import (
+        FINAL_REASON_CODES,
+        PHASE_LATE,
+        RETRYABLE_REASON_CODES,
+        load_day_plan,
+    )
+
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    tz_rev = int(row.timezone_revision) if row is not None else 0
+    routine_rev = int(row.routine_revision) if row is not None else routine_revision
+    base = f"outline:{actor_id}:{plan_day.isoformat()}:t{tz_rev}:r{routine_rev}"
+    prior = list(
+        (
+            await session.execute(
+                select(OutboxEvent)
+                .where(OutboxEvent.id.like(_like_prefix(base), escape="\\"))
+                .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            )
+        ).scalars()
+    )
+    if any(str(event.state) in ("pending", "in_flight") for event in prior):
+        return False  # 已有在途作业：等它跑完再说
+
+    snapshot_same = (
+        row is not None
+        and str(row.timezone) == timezone
+        and int(row.routine_revision) == routine_revision
+    )
+    if row is None:
+        if phase == PHASE_LATE:
+            # 这一天**从来没跑过作业**（例如刚部署、或者已经过去很久）。
+            # late 相位不会调模型，但凭空造一份"从中午开始的半日时间轴"
+            # 不是补跑，是把"系统当时不在"伪装成"她今天就这样过"。
+            # 真正的晚到是"夜里跑过但没成"——那种行一定存在，见下面分支。
+            return False
+        needs = True
+    elif str(row.state) == "ready":
+        needs = not snapshot_same
+    elif str(row.state) == "degraded":
+        reason = str(row.last_error_code or "")
+        if reason in FINAL_REASON_CODES:
+            needs = False
+        elif not snapshot_same:
+            needs = True
+        else:
+            needs = reason in RETRYABLE_REASON_CODES
+    else:  # pending：占了行但一版都没提交（崩溃/中断）
+        needs = True
+    if not needs:
+        return False
+
+    attempt = len(prior) + 1
+    if attempt > OUTLINE_SCHEDULE_MAX_ATTEMPTS:
+        return False
+    if prior:
+        last = prior[-1]
+        last_at = _aware_moment(last.processed_at or last.created_at)
+        if (
+            str(last.state) == "done"
+            and phase != PHASE_LATE
+            and last_at is not None
+            and now - last_at
+            < timedelta(seconds=OUTLINE_SCHEDULE_RETRY_BACKOFF_SECONDS)
+        ):
+            return False  # 退避窗口内不补试
+    return await _enqueue_once(
+        session,
+        event_id=f"{base}:a{attempt}",
+        topic="schedule.outline",
+        payload={
+            "actor_id": actor_id,
+            "plan_day": plan_day.isoformat(),
+            "phase": phase,
+            "timezone": timezone,
+            "timezone_source": timezone_source,
+            "attempt": attempt,
+            "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+
+
+async def _schedule_seam(
+    session, *, actor_id: str, plan_day: date, now: datetime  # noqa: ANN001
+) -> bool:
+    """投递一次午夜接缝校验（零模型，一天一次，幂等键 = 目标日）。"""
+    from ling.domains.agenda.timeline import load_day_plan
+
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    if row is None:
+        # 还没有这一天的计划：没有"现有段"可复核。等 late/catch-up 建了行，
+        # 下一轮扫描（60 秒后）自然会补上这一遍。
+        return False
+    window_start = _aware_moment(row.window_start_at)
+    if window_start is not None and now < window_start:
+        return False  # 窗口还没开始，接缝无从谈起
+    return await _enqueue_once(
+        session,
+        event_id=f"seam:{actor_id}:{plan_day.isoformat()}",
+        topic="schedule.seam",
+        payload={
+            "actor_id": actor_id,
+            "plan_day": plan_day.isoformat(),
+            "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+
+
+async def _schedule_dream(
+    session, *, actor_id: str, window, now: datetime  # noqa: ANN001
+) -> bool:
+    """梦窗口内投递一次生成（一晚一条，幂等键 = sleep_date）。
+
+    只投"还在窗口里"的：`generate_from`（醒前 60 分钟）到 `late_after`
+    （醒后 30 分钟）。窗口**结束后**还会补一条 `missed` 的投递，限
+    `DREAM_MISSED_MARK_HOURS` 之内——那是为了把"昨晚没生成"记成事实
+    （`status=missed`），不是重试模型；`DreamService.generate` 在这个分支
+    里 0 次调用就直接落行。
+    """
+    from ling.infra.models import DreamReportRow
+
+    existing = (
+        await session.execute(
+            select(DreamReportRow.id)
+            .where(
+                DreamReportRow.actor_id == actor_id,
+                DreamReportRow.sleep_date == window.sleep_date,
+            )
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        return False  # 这一晚已有记录（含 failed/missed/no_dream）——一晚一份
+    in_window = window.generate_from <= now <= window.late_after
+    missed_mark = (
+        window.late_after
+        < now
+        <= window.late_after + timedelta(hours=DREAM_MISSED_MARK_HOURS)
+    )
+    if not (in_window or missed_mark):
+        return False
+    return await _enqueue_once(
+        session,
+        event_id=f"dream:{actor_id}:{window.sleep_date.isoformat()}",
+        topic="dream.generate",
+        payload={
+            "actor_id": actor_id,
+            "sleep_date": window.sleep_date.isoformat(),
+            "bed_at": window.bed_at.isoformat(),
+            "wake_at": window.wake_at.isoformat(),
+            "generate_from": window.generate_from.isoformat(),
+            "due_at": window.due_at.isoformat(),
+            "late_after": window.late_after.isoformat(),
+            "scanned_at": now.isoformat(),
+            # 只让"为什么投了这一条"可解释；handler 会按自己的 now 重算窗口。
+            "phase": "window" if in_window else "missed_mark",
+        },
+        now=now,
+    )
+
+
+async def _schedule_settlement(
+    session, *, actor_id: str, window, now: datetime  # noqa: ANN001
+) -> bool:
+    """醒后补做跨夜结算（与梦无关；唯一键保证只结算一次）。"""
+    from ling.infra.models import SleepSettlementRow
+
+    if now < window.wake_at:
+        return False  # 还没醒：结算没有意义，也不该提前打折
+    existing = (
+        await session.execute(
+            select(SleepSettlementRow.sleep_date)
+            .where(
+                SleepSettlementRow.actor_id == actor_id,
+                SleepSettlementRow.sleep_date == window.sleep_date,
+            )
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        return False
+    return await _enqueue_once(
+        session,
+        event_id=f"sleep_settle:{actor_id}:{window.sleep_date.isoformat()}",
+        topic="sleep.settle",
+        payload={
+            "actor_id": actor_id,
+            "sleep_date": window.sleep_date.isoformat(),
+            "wake_at": window.wake_at.isoformat(),
+            "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+
+
+@handler("life.schedule")
+async def handle_life_schedule(payload: dict) -> None:
+    """生活调度扫描：**只查 DB 到期边界，一次模型调用都没有**。
+
+    每 60 秒跑一次，做四件事，全部是"到期才投递"：
+
+    1. **过期 lease**：把租约过期的 in-flight outbox 事件放回 pending
+       ——worker 被杀/重启后没确认的事件靠这一步补投；
+    2. **大纲**：用 `outline_due_decision` 定"最近一个该有/该补的目标日 D 与
+       相位"（21:00 后是明天/due；凌晨是今天/catchup；醒后是今天/late），
+       加上"过期模型租约"指向的目标日，按幂等键投 `schedule.outline`；
+    3. **午夜接缝**：本地今天已有计划行 → 投一次 `schedule.seam`（零模型）；
+    4. **梦 / 跨夜结算**：对本地 `今天−1 / 今天 / 今天+1` 三晚调
+       `night_window`，在梦窗口内且这一晚无 `dream_reports` 行 → 投
+       `dream.generate`；`now >= wake_at` 且无 `sleep_settlements` 行 →
+       投 `sleep.settle`（结算自身幂等）。
+
+    **`late` 相位不凭空造行**：目标日从来没有跑过作业（库里没有 `day_plans`
+    行）时，late 只说明"系统当时不在"，不能拿它伪造一份"从中午开始的一天"。
+    真正需要 late 兜底的是"夜里跑过、但停在 pending/degraded"的那些行。
+
+    幂等：事件 id 就是幂等键，先查后插 + 主键唯一约束；重复扫描只会看到
+    已经存在的事件，不会重复投递。
+    """
+    from ling.domains.agenda.service import AgendaService
+    from ling.domains.agenda.timeline import (
+        outline_due_decision,
+        plan_day_for,
+        resolve_plan_timezone,
+    )
+    from ling.domains.dream.service import night_window
+    from ling.infra.models import ActorRoutineRow
+
+    actor_id = str(payload.get("actor_id") or get_settings().actor_id)
+    now = utcnow()
+    enqueued: list[str] = []
+    reclaimed = 0
+    async with session_scope() as session:
+        timezone, timezone_source = await resolve_plan_timezone(session)
+        # 作息走 agenda 的公开读取入口；**不**用它表里的 timezone 算日界，
+        # 那个字段只用于冲突检测（设计 §2）。
+        routine = await AgendaService(session, actor_id=actor_id).routine()
+        routine_row = await session.get(ActorRoutineRow, actor_id)
+        routine_revision = int(getattr(routine_row, "revision", 0) or 0)
+        wake_minute = _wake_minute_or_none(routine)
+        local_day = plan_day_for(now, timezone)
+
+        # ① 过期租约：崩溃/重启后没确认的事件重新排队。
+        reclaimed = await _reclaim_expired_outbox_leases(session, now=now)
+
+        # ② 大纲：最近一个该有/该补的目标日（+ 过期模型租约指向的目标日）。
+        candidates: dict[date, str] = {}
+        target, phase = outline_due_decision(
+            now, timezone=timezone, wake_minute=wake_minute
+        )
+        candidates[target] = phase
+        for stale_day in await _stale_outline_call_days(
+            session, actor_id=actor_id, now=now
+        ):
+            # 超过明天的旧目标日不追补（设计 §3「catch-up」）；昨天以前的
+            # 窗口已经结束，补出来的只是给过去编时间轴。
+            if stale_day not in (local_day, local_day + timedelta(days=1)):
                 continue
-            try:
-                await fn(dict(row.payload or {}))
-            except Exception as exc:  # noqa: BLE001 - 单条失败不影响整批
-                row.attempts = int(row.attempts or 0) + 1
-                row.last_error = str(exc)[:500]
-                if row.attempts < MAX_ATTEMPTS:
-                    # 指数退避（此前实现的问题）：不退避的话连续几轮轮询就会
-                    # 把次数耗尽，临时故障也变成永久失败。
-                    delay = min(MAX_BACKOFF_SECONDS, 2 ** row.attempts)
-                    row.state = "pending"
-                    row.available_at = utcnow() + timedelta(seconds=delay)
-                else:
-                    # 不静默放弃：转 "dead" 状态等待人工/运维重放，
-                    # 原始事件仍在库里，派生记忆只是暂缺（不是物理丢失）。
-                    row.state = "dead"
-                logger.warning(
-                    "outbox %s 处理失败（第 %d 次）: %s", row.id, row.attempts, exc
+            _day, stale_phase = outline_due_decision(
+                now,
+                timezone=timezone,
+                wake_minute=wake_minute,
+                plan_day=stale_day,
+            )
+            candidates.setdefault(stale_day, stale_phase)
+        for plan_day, candidate_phase in candidates.items():
+            if await _schedule_outline(
+                session,
+                actor_id=actor_id,
+                plan_day=plan_day,
+                phase=candidate_phase,
+                now=now,
+                timezone=timezone,
+                timezone_source=timezone_source,
+                routine_revision=routine_revision,
+            ):
+                enqueued.append(f"schedule.outline:{plan_day.isoformat()}:{candidate_phase}")
+
+        # ③ 午夜接缝（当前本地日）。
+        if await _schedule_seam(
+            session, actor_id=actor_id, plan_day=local_day, now=now
+        ):
+            enqueued.append(f"schedule.seam:{local_day.isoformat()}")
+
+        # ④ 梦与跨夜结算：三晚。`sleep_date` 是"醒来所在的本地日"，跨午夜
+        # 作息下 bed 在前一天，但仍是同一晚（night_window 负责换算）。
+        for offset in (-1, 0, 1):
+            sleep_date = local_day + timedelta(days=offset)
+            window = await night_window(
+                session, actor_id=actor_id, sleep_date=sleep_date, timezone=timezone
+            )
+            if window is None:
+                continue  # 没有有效睡眠窗：不排梦、不结算
+            if await _schedule_dream(
+                session, actor_id=actor_id, window=window, now=now
+            ):
+                enqueued.append(f"dream.generate:{sleep_date.isoformat()}")
+            if await _schedule_settlement(
+                session, actor_id=actor_id, window=window, now=now
+            ):
+                enqueued.append(f"sleep.settle:{sleep_date.isoformat()}")
+
+    if reclaimed:
+        logger.info("回收过期 outbox 租约 %d 条", reclaimed)
+    if enqueued:
+        logger.info("生活调度投递 %d 条: %s", len(enqueued), ", ".join(enqueued))
+
+
+def _parse_payload_date(payload: dict, key: str) -> date | None:
+    """从载荷里取 ISO 日期；缺失/非法一律返回 None（调用方记日志并返回）。"""
+    raw = str(payload.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+@handler("schedule.outline")
+async def handle_schedule_outline(payload: dict) -> None:
+    """跑一次大纲作业：**模型调用在这里，而不在 outbox 的认领事务里**。
+
+    相位只是"上限"：`outline_work` 会按**真实 now** 再判一次，取更保守的
+    那个。所以这条事件即使被延迟执行（重启补投、退避重试），也不会拿一个
+    过期的 `due` 去调模型——到了醒点就自动降成零模型的 `late`。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.agenda.timeline import PHASE_CATCHUP, PHASE_DUE, PHASE_LATE, outline_work
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    plan_day = _parse_payload_date(payload, "plan_day")
+    if plan_day is None:
+        logger.warning("schedule.outline 缺少可解析的 plan_day，跳过: %s", payload)
+        return
+    phase = str(payload.get("phase") or PHASE_DUE)
+    if phase not in (PHASE_DUE, PHASE_CATCHUP, PHASE_LATE):
+        logger.warning("schedule.outline 收到未知相位 %r，按 due 处理", phase)
+        phase = PHASE_DUE
+    now = utcnow()
+    async with session_scope() as session:
+        outcome = await outline_work(
+            session,
+            plan_day,
+            phase,
+            actor_id=actor_id,
+            # 路由没就绪也要走：`ensure_day_plan` 会写规则锚点 + degraded，
+            # 不是"什么都不做"（否则这一天永远没有睡眠/承诺锚点）。
+            router=_MEMORY_ROUTER,
+            config_reader=_config_reader(session),
+            now=now,
+            lease_owner=f"{WORKER_ID}/{plan_day.isoformat()}",
+        )
+    logger.info(
+        "大纲作业完成 day=%s phase=%s state=%s revision=%s segments=%s calls=%s reason=%s",
+        plan_day,
+        outcome.phase or phase,
+        outcome.state,
+        outcome.revision,
+        outcome.segments,
+        outcome.calls,
+        outcome.reason_code or "",
+    )
+    behavior_event(
+        "schedule_outline_committed" if outcome.state == "ready" else "schedule_outline_degraded",
+        (
+            f"系统为 {plan_day.isoformat()} 生成 {outcome.segments} 个意向块"
+            f"（{'模型计划' if outcome.source == 'model' else '规则锚点'}）"
+        ),
+        outcome="ok" if outcome.state == "ready" else "degraded",
+        attributes={
+            "actor_id": actor_id,
+            "target_plan_day": plan_day.isoformat(),
+            "phase": outcome.phase or phase,
+            "state": outcome.state,
+            "revision": outcome.revision,
+            "segments": outcome.segments,
+            "source": outcome.source,
+            "calls": outcome.calls,
+            "reason_code": outcome.reason_code or "",
+            "timezone": outcome.timezone,
+            "timezone_source": outcome.timezone_source,
+        },
+    )
+
+
+@handler("schedule.seam")
+async def handle_schedule_seam(payload: dict) -> None:
+    """午夜接缝校验：**零模型**，只做确定性修补，不重新生成。
+
+    `seam_check` 结构上没有 router 参数（`calls` 恒为 0）。重复执行是安全的：
+    没有变化就不写任何东西、不增 revision、不写重复原因码。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.agenda.timeline import seam_check
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    plan_day = _parse_payload_date(payload, "plan_day")
+    if plan_day is None:
+        logger.warning("schedule.seam 缺少可解析的 plan_day，跳过: %s", payload)
+        return
+    async with session_scope() as session:
+        report = await seam_check(session, plan_day, actor_id=actor_id, now=utcnow())
+    logger.info(
+        "接缝校验 day=%s state=%s revision=%s→%s superseded=%d frozen=%d",
+        plan_day,
+        report.state,
+        report.revision_before,
+        report.revision_after,
+        len(report.superseded_segment_ids),
+        len(report.frozen_segment_ids),
+    )
+    behavior_event(
+        "schedule_seam_checked",
+        (
+            f"午夜接缝校验（{plan_day.isoformat()}）：{report.state}，"
+            f"未调用模型"
+        ),
+        outcome="ok" if report.state in ("unchanged", "no_plan") else "changed",
+        attributes={
+            "actor_id": actor_id,
+            "target_plan_day": plan_day.isoformat(),
+            "state": report.state,
+            "revision_before": report.revision_before,
+            "revision_after": report.revision_after,
+            "superseded": len(report.superseded_segment_ids),
+            "frozen": len(report.frozen_segment_ids),
+            "reason_codes": list(report.reason_codes),
+            "calls": report.calls,
+        },
+    )
+
+
+@handler("dream.generate")
+async def handle_dream_generate(payload: dict) -> None:
+    """生成某一晚的梦（一晚一份；模型调用在 outbox 事务外）。
+
+    `DreamService.generate` 自己按"已有记录 → 没有睡眠窗 → 还没到睡前 →
+    已过醒后 30 分钟 → 候选不足两源 → 模型不可用"的顺序判分支，绝大多数
+    分支都是 0 次调用。所以重复投递只是多一次 DB 判断，不会多写一份梦。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.dream.service import STATUS_READY, DreamService
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    sleep_date = _parse_payload_date(payload, "sleep_date")
+    if sleep_date is None:
+        logger.warning("dream.generate 缺少可解析的 sleep_date，跳过: %s", payload)
+        return
+    async with session_scope() as session:
+        outcome = await DreamService(
+            session, actor_id=actor_id, persona_id=settings.persona_id
+        ).generate(
+            sleep_date,
+            now=utcnow(),
+            router=_MEMORY_ROUTER,
+            config_reader=_config_reader(session),
+        )
+    logger.info(
+        "梦作业完成 sleep_date=%s status=%s calls=%s reason=%s",
+        sleep_date,
+        outcome.status,
+        outcome.calls,
+        outcome.reason_code or "",
+    )
+    behavior_event(
+        "dream_ready" if outcome.status == STATUS_READY else f"dream_{outcome.status}",
+        (
+            f"这一晚（{sleep_date.isoformat()}）记下一份梦（模拟叙事）"
+            if outcome.status == STATUS_READY
+            else f"这一晚（{sleep_date.isoformat()}）没有可记录的梦：{outcome.status}"
+        ),
+        outcome="ok" if outcome.status == STATUS_READY else "degraded",
+        attributes={
+            "actor_id": actor_id,
+            "sleep_date": sleep_date.isoformat(),
+            "status": outcome.status,
+            "calls": outcome.calls,
+            "reason_code": outcome.reason_code or "",
+            "sources": outcome.sources,
+        },
+    )
+
+
+@handler("sleep.settle")
+async def handle_sleep_settle(payload: dict) -> None:
+    """跨夜结算（零模型，唯一键幂等）：与梦是否成功**无关**。
+
+    迟到补做时，`AffectService.apply_sleep_settlement` 只碰 `updated_at`
+    不晚于 `wake_at` 的行——醒来之后的新心情不会被回滚成睡前值。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.agenda.timeline import resolve_plan_timezone
+    from ling.domains.dream.service import SleepSettlementService
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    sleep_date = _parse_payload_date(payload, "sleep_date")
+    if sleep_date is None:
+        logger.warning("sleep.settle 缺少可解析的 sleep_date，跳过: %s", payload)
+        return
+    async with session_scope() as session:
+        timezone, _source = await resolve_plan_timezone(session)
+        outcome = await SleepSettlementService(session, actor_id=actor_id).settle(
+            sleep_date, now=utcnow(), timezone=timezone
+        )
+    logger.info(
+        "跨夜结算 sleep_date=%s state=%s components=%d reason=%s",
+        sleep_date,
+        outcome.state,
+        outcome.components,
+        outcome.reason_code or "",
+    )
+    behavior_event(
+        "sleep_settled" if outcome.state == "settled" else "sleep_settle_skipped",
+        (
+            f"睡后心情结算完成（{sleep_date.isoformat()}）"
+            if outcome.state == "settled"
+            else f"睡后心情结算跳过（{sleep_date.isoformat()}）：{outcome.state}"
+        ),
+        attributes={
+            "actor_id": actor_id,
+            "sleep_date": sleep_date.isoformat(),
+            "state": outcome.state,
+            "components": outcome.components,
+            "reason_code": outcome.reason_code or "",
+        },
+    )
+
+
+# ---------------------------------------------------------------- outbox 事务边界
+#
+# ## 改之前是什么样
+#
+#     async with session_scope() as session:          # ← 一个事务包住整批
+#         rows = select(...).with_for_update(skip_locked=True)
+#         for row in rows:
+#             await fn(row.payload)                    # ← 模型调用在这里
+#             row.state = "done"
+#
+# 也就是说：一条 60 秒的大纲/梦模型调用期间，这批行的行锁一直没放。别的
+# worker 用 `SKIP LOCKED` 也领不到它们（和 `pending` 队列里其它**无关**的
+# 事件，只要落在同一个 limit 批次里也一样），还会把连接池里的连接一起占着。
+#
+# ## 现在是什么样
+#
+#     短事务认领并**提交**（state=in_flight + processed_by + available_at=租约到期）
+#     → 事务外 `await fn(payload)`（模型调用在这里，没有任何行锁）
+#     → 短事务确认（done / 退避重排 / dead）
+#
+# 至少一次的语义没变、也不能变：handler 必须先提交、后确认，所以"处理完了但
+# 没确认"的情况一定存在。消费方按事件 id / 唯一键幂等，重复执行只是多跑一次，
+# 不会多写一份数据。崩溃后没确认的 in-flight 事件由**租约到期**重新排队
+# （进程正常退出时还会主动释放，见 `release_outbox_leases`）。
+#
+# `available_at` 在这里有**两种含义**，按 state 区分（表上没有 lease 列，
+# 也不该为了这个改动加迁移）：
+#   - state=pending   → "什么时候可以再试"（退避）
+#   - state=in_flight → "租约什么时候到期"（认领者必须在到期前确认）
+
+# 认领租约（秒）。必须**显著长于**单个 handler 的最坏执行时间：
+# 大纲最多 2 次 60 秒模型调用（timeline.OUTLINE_MAX_CALLS × 超时），梦是 1 次
+# 60 秒。租约不表达"慢"，只表达"进程可能已经死了"——超时由各服务自己的
+# wait_for 负责，这里等太久只会让重启后的补投晚一点。
+OUTBOX_LEASE_SECONDS = 600.0
+
+
+@dataclass(frozen=True)
+class OutboxClaim:
+    """一条**已认领** outbox 事件的执行快照。
+
+    认领事务已经提交，行锁已释放，ORM 行不能再当"还归我管"的东西用。
+    这里只带走执行 handler 需要的字段；状态回写一律以主键重新读一遍为准。
+    """
+
+    event_id: str
+    topic: str
+    payload: dict
+    attempts: int
+
+
+async def _reclaim_expired_outbox_leases(session, *, now: datetime) -> int:  # noqa: ANN001
+    """把租约过期的 in-flight 事件放回 pending（崩溃/重启后补投的唯一入口）。"""
+    result = await session.execute(
+        update(OutboxEvent)
+        .where(
+            OutboxEvent.state == "in_flight",
+            OutboxEvent.available_at <= now,
+        )
+        .values(
+            state="pending",
+            available_at=now,
+            # 清掉所有者：原认领者若还活着，它迟到的确认会因为"租约已不属于
+            # 本实例"而被丢弃，不会把别人刚接手的事件偷偷改掉。
+            processed_by=None,
+            last_error="lease_expired",
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def reclaim_expired_outbox_leases() -> int:
+    """短事务：回收过期租约（`drain_outbox` 每轮开头调一次）。"""
+    now = utcnow()
+    async with session_scope() as session:
+        return await _reclaim_expired_outbox_leases(session, now=now)
+
+
+async def claim_next_outbox_event() -> OutboxClaim | None:
+    """短事务认领**一条**可跑的事件并立即提交。
+
+    为什么一次只认领一条，而不是一批：
+    - 一批认领会把"还没开始跑"的行也标成 in_flight，等于用租约挡住别的
+      worker——锁是没了，吞吐却没恢复，只是把等待从行锁换成了租约；
+    - 一条一认领后，慢事件只拖住它自己，另一条可以立刻被另一个连接领走
+      （`tests/integration/test_life_schedule_worker.py` 用两个真连接验这件事）。
+    代价是每条事件多两个短事务，在这个量级上无关紧要。
+    """
+    now = utcnow()
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(OutboxEvent)
+                .where(
+                    OutboxEvent.state == "pending",
+                    OutboxEvent.available_at <= now,
                 )
-            else:
-                row.state = "done"
-                row.processed_at = utcnow()
-                row.processed_by = WORKER_ID
-                processed += 1
+                .order_by(OutboxEvent.created_at, OutboxEvent.id)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        row.state = "in_flight"
+        row.processed_by = WORKER_ID
+        row.available_at = now + timedelta(seconds=OUTBOX_LEASE_SECONDS)
+        claim = OutboxClaim(
+            event_id=str(row.id),
+            topic=str(row.topic),
+            payload=dict(row.payload or {}),
+            attempts=int(row.attempts or 0),
+        )
+        # 出 `async with` 即提交：handler 在**没有行锁**的事务外跑。
+    return claim
+
+
+async def settle_outbox_event(
+    claim: OutboxClaim, *, ok: bool, error: str | None = None
+) -> None:
+    """短事务确认：成功→done；失败→按退避重排；到上限→dead。"""
+    now = utcnow()
+    async with session_scope() as session:
+        row = await session.get(OutboxEvent, claim.event_id, with_for_update=True)
+        if row is None:  # pragma: no cover - 事件被人工删掉
+            return
+        # 只有**当前**租约的所有者能确认。租约过期被别人回收以后，原认领者
+        # 迟到的确认一律丢弃：宁可让这条事件多跑一次（至少一次），也不能让
+        # 两个 worker 互相覆盖状态。
+        if str(row.state) != "in_flight" or str(row.processed_by or "") != WORKER_ID:
+            logger.info(
+                "outbox %s 的租约已不属于本实例（state=%s），跳过确认",
+                claim.event_id,
+                row.state,
+            )
+            return
+        if ok:
+            row.state = "done"
+            row.processed_at = now
+            row.last_error = None
+            return
+        row.attempts = int(row.attempts or 0) + 1
+        row.last_error = (error or "")[:500]
+        if row.attempts < MAX_ATTEMPTS:
+            # 指数退避（此前实现的问题）：不退避的话连续几轮轮询就会
+            # 把次数耗尽，临时故障也变成永久失败。
+            delay = min(MAX_BACKOFF_SECONDS, 2 ** row.attempts)
+            row.state = "pending"
+            row.available_at = now + timedelta(seconds=delay)
+        else:
+            # 不静默放弃：转 "dead" 状态等待人工/运维重放，
+            # 原始事件仍在库里，派生数据只是暂缺（不是物理丢失）。
+            row.state = "dead"
+        logger.warning(
+            "outbox %s 处理失败（第 %d 次）: %s", claim.event_id, row.attempts, error
+        )
+
+
+async def mark_outbox_unhandled(claim: OutboxClaim) -> None:
+    """没有注册 handler：标 ``unhandled`` 保留在库里，不静默丢弃。"""
+    async with session_scope() as session:
+        row = await session.get(OutboxEvent, claim.event_id, with_for_update=True)
+        if row is None or str(row.state) != "in_flight":
+            return
+        row.state = "unhandled"
+        row.processed_by = WORKER_ID
+        row.last_error = f"没有注册 {claim.topic} 的处理器（W1/W2 模块尚未接入）"
+
+
+async def release_outbox_leases() -> int:
+    """进程正常退出时主动释放自己的租约（不必等过期）。
+
+    崩溃时走不到这里——那种情况由租约到期兜底。两边都留着：正常运行不该
+    让重启后的 worker 白等 10 分钟，崩溃恢复也不能依赖"优雅退出"。
+    """
+    now = utcnow()
+    async with session_scope() as session:
+        result = await session.execute(
+            update(OutboxEvent)
+            .where(
+                OutboxEvent.state == "in_flight",
+                OutboxEvent.processed_by == WORKER_ID,
+            )
+            .values(
+                state="pending",
+                available_at=now,
+                processed_by=None,
+                last_error="lease_released",
+            )
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def drain_outbox(limit: int = 50) -> int:
+    """至少一次处理；消费方按事件 id 幂等。
+
+    每次认领 = 一个短事务，handler 在事务外跑（见本节顶部"改之前/现在"）。
+    `limit` 是"这一轮最多跑几条"，不是"一次锁几条"。
+    """
+    await refresh_memory_router_if_stale()
+    reclaimed = await reclaim_expired_outbox_leases()
+    if reclaimed:
+        logger.info("回收过期 outbox 租约 %d 条", reclaimed)
+    processed = 0
+    for _ in range(max(0, limit)):
+        claim = await claim_next_outbox_event()
+        if claim is None:
+            break
+        fn = HANDLERS.get(claim.topic)
+        if fn is None:
+            await mark_outbox_unhandled(claim)
+            continue
+        # 单条失败不影响这一轮的其它事件；异常只用来决定这条事件的状态。
+        error = await _guarded(claim.topic, fn, claim.payload)
+        await settle_outbox_event(
+            claim,
+            ok=error is None,
+            error=None if error is None else f"{type(error).__name__}: {error}",
+        )
+        if error is None:
+            processed += 1
     return processed
 
 
@@ -2542,6 +3477,13 @@ async def run_forever(poll_seconds: float = 2.0) -> None:
             except TimeoutError:
                 continue
     finally:
+        # 正常退出时主动放掉自己持有的 outbox 租约：否则重启后的 worker 要
+        # 白等一个租约周期（10 分钟）才补投。崩溃走不到这里，那种情况由
+        # 租约到期兜底——两条路都要有，不能只依赖优雅退出。
+        with contextlib.suppress(Exception):
+            released = await release_outbox_leases()
+            if released:
+                logger.info("已释放 outbox 租约 %d 条", released)
         await dispose_engine()
         logger.info("worker 已停止")
 
@@ -2557,7 +3499,8 @@ class PeriodicJob:
 
     所以定时任务统一收进 `PERIODIC_JOBS`，配合
     `tests/unit/test_worker_dispatch.py` 的闸：
-    **每个注册的 topic 必须出现在这里或 outbox 里**。
+    **每个注册的 topic 必须出现在这里、`OUTBOX_TOPICS`、或
+    `LEGACY_MANUAL_TOPICS` 三者之一**。
     """
 
     topic: str
@@ -2574,7 +3517,12 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
     PeriodicJob("attention.tick", handle_attention_tick, {}, ATTENTION_TICK_SECONDS),
     PeriodicJob("embedding.backfill", handle_embedding_backfill, {}, EMBEDDING_BACKFILL_SECONDS),
     PeriodicJob("intent.tick", handle_intent_tick, {}, PROACTIVE_COLLECT_SECONDS),
-    PeriodicJob("life.plan", handle_life_plan, {}, LIFE_PLAN_SECONDS),
+    # 生活调度：只查 DB 到期边界（21:00 目标日、00:00 接缝、梦窗口、结算），
+    # 到期才把真正干活的作业投进 outbox。**这里不调模型**。
+    PeriodicJob("life.schedule", handle_life_schedule, {}, LIFE_SCHEDULE_SECONDS),
+    # `life.plan`（旧的"醒后排 1–3 件小事"）**不在这里**：新时间轴接管后，
+    # 两套并行生成就是两份日程。它被移进 `LEGACY_MANUAL_TOPICS`，只剩手工
+    # 触发；旧 `agenda_plans` 仍可读，手工小事仍走 AgendaService。
     PeriodicJob("life.tick", handle_life_tick, {}, LIFE_TICK_SECONDS),
     PeriodicJob("media.describe", handle_media_describe, {}, MEDIA_DESCRIBE_SECONDS),
     # 收集阶段没有开关：它只登记候选，发不发由 proactive.dispatch 与
@@ -2586,26 +3534,45 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
     PeriodicJob("self.timeline", handle_self_timeline, {}, SELF_TIMELINE_SECONDS),
 )
 
-# 由 outbox 投递的 topic（不是周期任务，是事件驱动）
+# 由 outbox 投递的 topic（不是周期任务，是事件驱动）。
+# `schedule.*` / `dream.*` / `sleep.*` 由 `life.schedule` 在到期边界投递，
+# 真正的模型调用发生在这些 handler 里（认领事务之外，见 outbox 小节）。
 OUTBOX_TOPICS: frozenset[str] = frozenset({
     "commitment.dispatch",
+    "dream.generate",
     "memory.archive",
     "memory.extract",
     "relationship.update",
+    "schedule.outline",
+    "schedule.seam",
+    "sleep.settle",
     "window.summary",
 })
 
+# **只保留手工触发**的 handler。注册它们不是为了自动跑，而是为了：
+# - 运维/接口能显式重放一次（旧数据修复、排查）；
+# - 派发闸门能区分"忘了接调度"和"有意不接"——两者长得一模一样，
+#   所以必须在代码里写出意图，而不是让 handler 独自躺着。
+# `life.plan` 在这里的理由：新时间轴（`life.schedule` + `day_plans`）已经
+# 接管"今天/明天做什么"，旧路径再自动生成就是第二份日程。
+LEGACY_MANUAL_TOPICS: frozenset[str] = frozenset({"life.plan"})
 
-async def _guarded(name: str, fn, payload: dict) -> None:  # noqa: ANN001
-    """跑一个后台任务，失败只记日志。
+
+async def _guarded(name: str, fn, payload: dict) -> BaseException | None:  # noqa: ANN001
+    """跑一个后台任务，失败只记日志并**返回**异常（不抛）。
 
     每件事各自隔离：原来四件事共用一个 try，收集器一炸后面全跳过，
     而它们彼此无关。后台任务之间**不该有隐式依赖**。
+
+    返回异常而不是 None/True：outbox 的确认步骤要拿"这次到底成没成"决定
+    done / 退避重排。周期任务的调用方忽略返回值即可，语义不变。
     """
     try:
         await fn(payload)
     except Exception as exc:  # noqa: BLE001 - worker 不能因一次失败退出
         logger.warning("%s异常: %s", name, exc)
+        return exc
+    return None
 
 
 def registered_topics() -> list[str]:
