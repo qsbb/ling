@@ -5,8 +5,11 @@
 
 - 计划日是本地 ``[D 00:00, D+1 00:00)``，在 DST 当天是 **23/25 小时**（不能用 +24h）；
 - 生成到期时刻与日界分离：D 的大纲在 **D−1 本地 21:00** 到期（``outline_due_at``）；
+- catch-up 三档判据（``outline_due_decision``）：21:00 到期 / 醒前补跑 / 醒后晚到；
 - 不存在的本地时刻要顺延、重复的本地时刻取第一次（``fold=0``）；
 - 睡眠锚点是"作息非清醒区间 ∩ D 的午夜窗口"，至多两段且都完全归属 D；
+- 锚点冲突由**代码**裁决（``resolve_anchor_conflicts``）：承诺裁到 D 内、
+  同级硬约定两边都留、承诺压睡眠时保留承诺并标原因码；
 - 时间轴左闭右开、允许空档、父子段有意重叠、叶段不许重叠、锚点不可移动；
 - 模型输出只接受一个形状，任何越界/过去/未知地点/非分钟精度都整份拒收。
 """
@@ -19,6 +22,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ling.domains.agenda.timeline import (
+    MIN_SLEEP_MINUTES,
+    PHASE_CATCHUP,
+    PHASE_DUE,
+    PHASE_LATE,
+    REASON_NEEDS_REVIEW,
+    REASON_ROUTINE_CONFLICT,
     Anchor,
     OutlineValidationError,
     RoutineSnapshot,
@@ -27,11 +36,13 @@ from ling.domains.agenda.timeline import (
     display_day_window,
     local_minute_instant,
     outline_due_at,
+    outline_due_decision,
     overlaps,
     parse_outline_payload,
     plan_day_for,
     plan_day_length,
     plan_day_window,
+    resolve_anchor_conflicts,
     rule_outline,
     sleep_anchors_for_day,
     validate_outline,
@@ -156,6 +167,94 @@ def test_outline_due_at_follows_wall_clock_across_dst() -> None:
     assert due < window_start
 
 
+# ---------------------------------------------------------------- catch-up 三档
+
+
+def test_outline_due_decision_due_right_after_2100_targets_tomorrow() -> None:
+    """21:00（含）之后到期 → 目标日 D = 本地日 + 1，相位 due。"""
+    day = date(2026, 11, 6)
+    for minute in (21 * 60, 21 * 60 + 1, 23 * 60 + 59):
+        now = local_minute_instant(day, minute, SHANGHAI)
+        assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=8 * 60) == (
+            date(2026, 11, 7),
+            PHASE_DUE,
+        )
+
+
+def test_outline_due_decision_one_minute_before_2100_is_not_due_yet() -> None:
+    """20:59 还不到 21:00，但今天的计划如果还没 ready 就是**晚到**（醒点已过）。"""
+    now = local_minute_instant(date(2026, 11, 6), 20 * 60 + 59, SHANGHAI)
+    assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=8 * 60) == (
+        date(2026, 11, 6),
+        PHASE_LATE,
+    )
+
+
+def test_outline_due_decision_catchup_before_wake() -> None:
+    """错过 21:00、但还在 D 的醒点之前 → 同一目标日 catch-up。"""
+    day = date(2026, 11, 7)
+    for minute in (0, 3 * 60, 7 * 60 + 59):
+        now = local_minute_instant(day, minute, SHANGHAI)
+        assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=8 * 60) == (
+            day,
+            PHASE_CATCHUP,
+        )
+
+
+def test_outline_due_decision_is_late_at_exact_wake_minute() -> None:
+    """"已到/过了醒点"含**醒点那一刻**：08:00 起不再补造早晨。"""
+    day = date(2026, 11, 7)
+    for minute in (8 * 60, 10 * 60, 20 * 60 + 59):
+        now = local_minute_instant(day, minute, SHANGHAI)
+        assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=8 * 60) == (
+            day,
+            PHASE_LATE,
+        )
+    # 21:00 之后"今天的计划还晚着"这件事被"明天到期"盖过（设计 §3：21:00 是
+    # 生成时刻）；要复核今天只能显式传 plan_day。
+    now = local_minute_instant(day, 23 * 60 + 30, SHANGHAI)
+    assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=8 * 60) == (
+        date(2026, 11, 8),
+        PHASE_DUE,
+    )
+
+
+def test_outline_due_decision_explicit_plan_day_wins() -> None:
+    """显式传 D 时用它：同一瞬时（本地 23:30）能判成"今天晚到"或"明天到期"。"""
+    now = local_minute_instant(date(2026, 11, 6), 23 * 60 + 30, SHANGHAI)
+    assert outline_due_decision(
+        now, timezone=SHANGHAI, wake_minute=8 * 60, plan_day=date(2026, 11, 6)
+    ) == (date(2026, 11, 6), PHASE_LATE)
+    assert outline_due_decision(
+        now, timezone=SHANGHAI, wake_minute=8 * 60, plan_day=date(2026, 11, 7)
+    ) == (date(2026, 11, 7), PHASE_DUE)
+
+
+def test_outline_due_decision_without_sleep_window_is_late_after_midnight() -> None:
+    """``wake == rest``（没有有效睡眠窗）→ 午夜之后没有"醒前"，直接晚到。"""
+    now = local_minute_instant(date(2026, 11, 7), 1, SHANGHAI)
+    assert outline_due_decision(now, timezone=SHANGHAI, wake_minute=None) == (
+        date(2026, 11, 7),
+        PHASE_LATE,
+    )
+    # 还没到午夜（D−1 21:00 之后）仍然是正常到期
+    assert outline_due_decision(
+        local_minute_instant(date(2026, 11, 6), 21 * 60, SHANGHAI),
+        timezone=SHANGHAI,
+        wake_minute=None,
+    ) == (date(2026, 11, 7), PHASE_DUE)
+
+
+def test_outline_due_decision_follows_local_wall_clock_across_dst() -> None:
+    """21:00 是**本地墙钟**：美东秋季回拨当天的 21:00 已按 EST 落成 02:00Z。"""
+    assert outline_due_decision(
+        datetime(2026, 11, 2, 2, 0, tzinfo=UTC), timezone=NY, wake_minute=8 * 60
+    ) == (date(2026, 11, 2), PHASE_DUE)
+    assert outline_due_decision(
+        datetime(2026, 11, 2, 1, 59, tzinfo=UTC), timezone=NY, wake_minute=8 * 60
+    ) == (date(2026, 11, 1), PHASE_LATE)
+
+
 def test_display_day_window_uses_local_midnight() -> None:
     start, end = display_day_window(date(2026, 11, 7), SHANGHAI)
     assert start == datetime(2026, 11, 6, 16, 0, tzinfo=UTC)
@@ -250,6 +349,167 @@ def test_sleep_anchor_is_early_morning_only_when_rest_before_wake() -> None:
 def test_sleep_anchor_is_empty_when_wake_equals_rest() -> None:
     """③ wake == rest：现有作息语义是"没有有效睡眠窗"，不凭空造睡眠段。"""
     assert sleep_anchors_for_day(date(2026, 11, 7), SHANGHAI, _routine(9, 9)) == []
+
+
+# ---------------------------------------------------------------- 锚点冲突裁决
+
+
+PLAN_DAY = date(2026, 11, 7)
+WINDOW_START, WINDOW_END = plan_day_window(PLAN_DAY, SHANGHAI)
+
+
+def _at(minute: int) -> datetime:
+    return local_minute_instant(PLAN_DAY, minute, SHANGHAI)
+
+
+def _commitment(
+    start_minute: int, end_minute: int, *, title: str = "约定", source_id: str = ""
+) -> Anchor:
+    return Anchor(
+        kind="commitment",
+        start_at=_at(start_minute),
+        end_at=_at(end_minute),
+        title=title,
+        protective=True,
+        source_id=source_id,
+    )
+
+
+def _resolve(
+    anchors: list[Anchor], *, routine: RoutineSnapshot | None = None
+) -> tuple[list[Anchor], list]:
+    return resolve_anchor_conflicts(
+        anchors,
+        window_start=WINDOW_START,
+        window_end=WINDOW_END,
+        routine=routine or _routine(8, 23),
+    )
+
+
+def test_resolve_clips_commitment_protective_window_to_plan_day() -> None:
+    """承诺保护窗裁到 D 内：23:30 的约定不能伸进次日凌晨。"""
+    anchors, _conflicts = _resolve([_commitment(23 * 60 + 30, 24 * 60 + 30)])
+    assert len(anchors) == 1
+    assert anchors[0].start_at == _at(23 * 60 + 30)
+    assert anchors[0].end_at == WINDOW_END, "保护窗必须在 D 的午夜边界截止"
+
+
+def test_resolve_drops_commitment_entirely_outside_plan_day() -> None:
+    outside = Anchor(
+        kind="commitment",
+        start_at=WINDOW_START - timedelta(hours=3),
+        end_at=WINDOW_START - timedelta(hours=2),
+        title="昨天的约定",
+    )
+    anchors, conflicts = _resolve([outside])
+    assert anchors == []
+    assert conflicts == []
+
+
+def test_resolve_keeps_both_same_level_commitments_with_needs_review() -> None:
+    """同级硬约定冲突：两边都留、两边都带 needs_review，不选赢家。"""
+    left = _commitment(9 * 60, 10 * 60, title="A", source_id="commitment:a")
+    right = _commitment(9 * 60 + 30, 10 * 60 + 30, title="B", source_id="commitment:b")
+    anchors, conflicts = _resolve([left, right])
+
+    assert [item.title for item in anchors] == ["A", "B"], "两边都必须保留"
+    assert all(REASON_NEEDS_REVIEW in item.reason_codes for item in anchors)
+    assert len(conflicts) == 1
+    assert conflicts[0].reason_code == REASON_NEEDS_REVIEW
+    assert conflicts[0].anchor_ids == ("commitment:a", "commitment:b")
+
+
+def test_resolve_does_not_report_conflict_for_identical_interval() -> None:
+    """完全同一区间的两个来源视为同一条约定，不报冲突（否则每晚记一次）。"""
+    anchors, conflicts = _resolve(
+        [
+            _commitment(9 * 60, 10 * 60, title="A", source_id="commitment:a"),
+            _commitment(9 * 60, 10 * 60, title="B", source_id="agenda_plan:b"),
+        ]
+    )
+    assert len(anchors) == 2
+    assert conflicts == []
+
+
+def test_resolve_keeps_commitment_and_shortens_expected_sleep() -> None:
+    """承诺压睡眠：**保留承诺**、睡眠缩短并标 routine_conflict（不移动承诺）。"""
+    sleep = sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(8, 23))
+    assert len(sleep) == 2
+    commitment = _commitment(7 * 60, 8 * 60, title="叫醒", source_id="commitment:wake")
+    anchors, conflicts = _resolve([*sleep, commitment])
+
+    kept = [item for item in anchors if item.kind == "commitment"]
+    assert [(item.start_at, item.end_at) for item in kept] == [
+        (commitment.start_at, commitment.end_at)
+    ], "承诺本身既不动、也不带冲突码"
+    assert kept[0].reason_codes == ()
+
+    morning = [item for item in anchors if item.kind == "sleep" and item.start_at == WINDOW_START]
+    assert len(morning) == 1
+    assert morning[0].end_at == _at(7 * 60), "预计睡眠被裁到 07:00"
+    assert REASON_ROUTINE_CONFLICT in morning[0].reason_codes
+    assert REASON_NEEDS_REVIEW not in morning[0].reason_codes, (
+        "总睡眠还有 7h+1h，未低于下限"
+    )
+    assert [item.reason_code for item in conflicts] == [REASON_ROUTINE_CONFLICT]
+
+
+def test_resolve_splits_expected_sleep_around_commitment() -> None:
+    """睡眠可以**分裂**：01:00–03:00 的约定把凌晨睡眠切成两段，两段都带码。"""
+    sleep = sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(8, 23))
+    anchors, _conflicts = _resolve([*sleep, _commitment(60, 180, title="早课")])
+
+    morning = [
+        item for item in anchors if item.kind == "sleep" and item.end_at <= _at(8 * 60)
+    ]
+    assert [(item.start_at, item.end_at) for item in morning] == [
+        (_at(0), _at(60)),
+        (_at(180), _at(8 * 60)),
+    ]
+    assert all(REASON_ROUTINE_CONFLICT in item.reason_codes for item in morning)
+
+
+def test_resolve_marks_needs_review_when_remaining_sleep_below_floor() -> None:
+    """剩余预计睡眠 < 420 分钟 → 再加 needs_review（仍不取消承诺）。"""
+    sleep = sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(8, 23))
+    commitment = _commitment(0, 8 * 60, title="通宵", source_id="commitment:allnight")
+    anchors, conflicts = _resolve([*sleep, commitment])
+
+    assert [item for item in anchors if item.kind == "commitment"] == [commitment]
+    sleep_left = [item for item in anchors if item.kind == "sleep"]
+    # 凌晨那段被完全覆盖 → 不写零长度锚点；只剩夜里的 [23:00,24:00)
+    assert [(item.start_at, item.end_at) for item in sleep_left] == [
+        (_at(23 * 60), WINDOW_END)
+    ]
+    assert REASON_NEEDS_REVIEW in sleep_left[0].reason_codes
+    assert {item.reason_code for item in conflicts} == {
+        REASON_ROUTINE_CONFLICT,
+        REASON_NEEDS_REVIEW,
+    }
+    floor_conflict = next(
+        item for item in conflicts if item.reason_code == REASON_NEEDS_REVIEW
+    )
+    assert str(MIN_SLEEP_MINUTES) in floor_conflict.detail
+
+
+def test_resolve_does_not_invent_sleep_when_wake_equals_rest() -> None:
+    """wake == rest：作息没有有效睡眠窗，不造睡眠（调用方传进来也不照抄）。"""
+    bogus = sleep_anchors_for_day(PLAN_DAY, SHANGHAI, _routine(9, 9))
+    assert bogus == []
+    anchors, conflicts = _resolve(
+        [
+            Anchor(
+                kind="sleep",
+                start_at=_at(0),
+                end_at=_at(9 * 60),
+                title="睡觉",
+            ),
+            _commitment(12 * 60, 13 * 60),
+        ],
+        routine=_routine(9, 9),
+    )
+    assert [item.kind for item in anchors] == ["commitment"]
+    assert conflicts == []
 
 
 # ---------------------------------------------------------------- 模型输出校验

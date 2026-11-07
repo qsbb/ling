@@ -341,6 +341,70 @@ class AgendaService:
             lease_owner=lease_owner,
         )
 
+    async def outline_work(
+        self,
+        plan_day: date,
+        phase: str,
+        *,
+        router: object | None = None,
+        config_reader: object | None = None,
+        now: datetime | None = None,
+        timezone: str | None = None,
+        lease_owner: str | None = None,
+    ):  # noqa: ANN201 - 返回 timeline.OutlineOutcome（延迟导入避免循环）
+        """按**目标日 + 相位**跑一次大纲作业（调度入口）。
+
+        转发而不是另写一遍：相位（``due`` / ``catchup`` / ``late``）决定
+        "能不能调模型、从哪儿开始排"，这个判断只能有一份实现，否则调度与
+        测试会各说各话（``late`` 零模型是最容易被抄错的一条）。
+        """
+        from ling.domains.agenda.timeline import outline_work
+
+        return await outline_work(
+            self._session,
+            plan_day,
+            phase,
+            actor_id=self._actor_id,
+            router=router,
+            config_reader=config_reader,
+            now=now,
+            timezone=timezone,
+            lease_owner=lease_owner,
+        )
+
+    async def seam_check(
+        self, plan_day: date, *, now: datetime | None = None
+    ):  # noqa: ANN201 - 返回 timeline.SeamReport
+        """午夜接缝校验（**零模型**）：冲突的可选段置 superseded + 原因码。
+
+        与 ``ensure_day_plan`` 同一个门：接缝修补也是日程写入，不能由别的域
+        自己拼 SQL 改段。
+        """
+        from ling.domains.agenda.timeline import seam_check
+
+        return await seam_check(
+            self._session, plan_day, actor_id=self._actor_id, now=now
+        )
+
+    async def on_new_confirmed_anchor(
+        self, plan_day: date, anchor: object, *, now: datetime | None = None
+    ):  # noqa: ANN201 - 返回 timeline.ReplanTodo | None
+        """新确认锚点落地后即时复核同一计划日（**零模型**，只登记待办）。
+
+        由**确认提交方**（承诺/确认安排链路）在同一个事务里调用：这样"锚点已
+        入库"和"受影响的可选段已被标记"不会分成两笔事务（中间崩溃会留下看不见
+        的冲突）。真正的局部重排属阶段 3，这里只落 ``todo:replan``。
+        """
+        from ling.domains.agenda.timeline import on_new_confirmed_anchor
+
+        return await on_new_confirmed_anchor(
+            self._session,
+            plan_day,
+            anchor,  # type: ignore[arg-type] - 运行时是 timeline.Anchor
+            actor_id=self._actor_id,
+            now=now,
+        )
+
     # ---------------------------------------------------------- 时段边界
 
     def next_boundary(self, routine: RoutineView, *, now: datetime) -> datetime:
