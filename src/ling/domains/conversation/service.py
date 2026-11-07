@@ -734,11 +734,19 @@ class ConversationService:
         *,
         limit: int = 200,
         after_sequence: int = 0,
+        before_sequence: int | None = None,
     ) -> list[MessageView]:
         """取**尚未摘要过**的已完成消息作为模型上下文。
 
         ``after_sequence`` 由窗口的 ``summary_through_sequence`` 决定：
         已经压进摘要的消息不必再取。
+
+        ``before_sequence`` 是**往回翻页**的游标（语义与
+        :meth:`list_messages` 的同名参数一致：只取 ``sequence < 它`` 的）。
+        为什么需要它：``limit`` 只是"一次查多少"，不是"上下文里放多少"——
+        后者由 token 预算决定（见 ``kernel.context``）。调用方按页往回取，
+        直到预算用尽，这样长会话里也不会有"第 N 条之后既进不了原文、
+        也永远压不进摘要"的永久缺口。
 
         ``limit`` 的默认值故意放宽（200）而不是 16/20：
         取太少会让更早的消息**既进不了上下文、也永远压不进摘要**——
@@ -752,6 +760,8 @@ class ConversationService:
         ]
         if after_sequence > 0:
             conditions.append(Message.sequence > after_sequence)
+        if before_sequence is not None:
+            conditions.append(Message.sequence < before_sequence)
         stmt = (
             select(Message)
             .where(*conditions)
@@ -864,8 +874,20 @@ class ConversationService:
         row.updated_at = utcnow()
         await self._session.flush()
 
-    async def read_window_context(self, window_id: str) -> WindowContext | None:
-        """读取未过期的窗口短记忆。过期即视为不存在（不返回陈旧指代）。"""
+    async def read_window_context(
+        self, window_id: str, *, expired_ok: bool = False
+    ) -> WindowContext | None:
+        """读取窗口短记忆行。过期即视为不存在（不返回陈旧指代）。
+
+        ``expired_ok=True`` 时**跳过时效过滤**。为什么需要：这一行同时装着
+        两样东西——短记忆（``topic`` / ``open_questions``，有 ``expires_at``）
+        和**滚动摘要**（``summary`` / ``summary_through_sequence``）。
+        只有前者是"闲置即过期"的；按 TTL 把整行当不存在，会让闲置两小时的窗口
+        连摘要一起丢掉，而下一轮还会用空的 ``prev_summary`` 覆盖掉旧摘要
+        ——用户看到的是"她完全不记得我们聊过什么"。
+        调用方（``kernel.context``）用 ``expired_ok=True`` 取回整行，
+        再自己只对短记忆那一段判过期。
+        """
         row = (
             await self._session.execute(
                 select(WindowContext).where(WindowContext.window_id == window_id)
@@ -873,6 +895,8 @@ class ConversationService:
         ).scalar_one_or_none()
         if row is None:
             return None
+        if expired_ok:
+            return row
         if row.expires_at is not None and _as_utc(row.expires_at) <= datetime.now(UTC):
             return None
         return row
