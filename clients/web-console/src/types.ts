@@ -1054,8 +1054,31 @@ export interface SubjectRow {
   accounts: AccountRow[];
 }
 
+/**
+ * `GET /v1/accounts/subjects` 的一页（`docs/API-WEB-V1.md` §13，契约 `SubjectsPage`）。
+ *
+ * **分页是契约的一部分**：`subjects` 默认只有 50 条，看到 `has_more=true` 就必须
+ * 继续 `offset`，不能假设"一次就是全部"——那正是关系页卡死的成因（2000 条 =
+ * 561 KB，前端再按 n² 渲染候选）。
+ *
+ * `total` 是**筛选后**的总行数；`limit` / `offset` / `q` 是服务端回显的实际生效值，
+ * 前端不自己猜默认值。
+ */
 export interface SubjectsResponse {
   subjects: SubjectRow[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+  q: string | null;
+}
+
+/** 取关系列表的参数。全部可选：不带参数时服务端给第一页（50 条）。 */
+export interface SubjectsQuery {
+  limit?: number;
+  offset?: number;
+  /** 服务端筛选词（昵称 / subject_id / 账号外部 id），空串等于不筛选。 */
+  q?: string;
 }
 
 export interface MergeResult {

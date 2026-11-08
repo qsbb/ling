@@ -2609,6 +2609,70 @@ button {
   margin-top: 10px;
 }
 
+/*
+ * 正在合并的那一张卡片。
+ *
+ * 关系页默认每张卡片都是只读摘要，只有点开「合并到…」的那**一张**才展开候选
+ * 下拉（旧实现给每张卡片都渲染全量候选，n 条就是 n² 个 <option>，2000 条
+ * 直接 400 万个节点把浏览器卡死）。所以这里的视觉重点是"当前是哪一张在编辑"：
+ * 加一圈强调色边框，避免用户点开之后分不清选的是谁。
+ */
+.account-card--editing {
+  border-color: var(--accent, #6a7258);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #6a7258) 18%, transparent);
+}
+
+/*
+ * 关系页的搜索框与「加载更多」。
+ *
+ * `min-width: 0` 是关键：flex 容器里 input 的默认固有宽度会撑破 375px 视口
+ * （`min-width: auto` 的经典坑），这里让它可收缩。
+ */
+.identity-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 14px;
+}
+
+.identity-search input {
+  flex: 1 1 180px;
+  min-width: 0;
+  border: 1px solid var(--line-strong, #d8cdb8);
+  border-radius: 9px;
+  background: #fffdf8;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.identity-search input:focus {
+  outline: none;
+  border-color: #b9af99;
+  box-shadow: 0 0 0 3px rgba(106, 114, 88, 0.1);
+}
+
+.identity-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 16px 0 8px;
+}
+
+/*
+ * 「合并到谁」的下拉。只在展开的那一张卡片里出现，最长可能装着已加载的全部
+ * 候选（首屏 50 个，加上"加载更多"后的若干页）。限宽 + 省略，避免长昵称
+ * 把卡片撑出横向滚动。
+ */
+.account-card__actions select {
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line-strong, #d8cdb8);
+  border-radius: 9px;
+  background: #fffdf8;
+}
+
 .badge--muted {
   opacity: 0.65;
 }
@@ -2628,9 +2692,18 @@ button {
 
 /* ------------------------------------------------------------ 总览（仪表盘） */
 
+/*
+ * 总览用满主区宽度（不再限 1200 居中）。
+ *
+ * 实测：1440 视口下主区只有 1148px，而 1200 的上限让它"看起来居中、实际贴左"，
+ * 右边留一条空带；窄一点的桌面（1100–1200）反而被这层限宽挤到只剩 860–960，
+ * 4 个区块要竖着堆。全宽之后每个断点的列宽都实打实给到内容。
+ *
+ * 行宽由卡片自己把关：一列卡最多 3 行、一行一个字条，不会出现"一行字横跨
+ * 整个屏幕"的读不下去。
+ */
 .dash {
-  max-width: 1200px;
-  margin: 0 auto;
+  width: 100%;
 }
 
 /*
@@ -2704,13 +2777,19 @@ button {
 
 /*
  * 12 列网格：卡片按「3 / 6 / 12」占列（`CardSpan`），区块标题占整行。
- * 窄屏塌陷规则集中在 dashboard.css（940 / 768 两档），这里只管桌面。
+ *
+ * `container-type: inline-size`：卡片多宽由视口决定（左导航在 ≤900 会收起、
+ * `.page` 的内边距也随断点变），固定列数在 941–1200 这段会把两张 6 列卡挤成
+ * 340px。改成按网格自身宽度查询后，规则与"这行还能不能放下两张卡"直接对应
+ * （见 dashboard.css 的两条 `@container`）。
  */
 .dash__grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 14px;
   align-items: start;
+  container-type: inline-size;
+  container-name: dashgrid;
 }
 
 .dash-card {

@@ -38,6 +38,7 @@ import type {
   TimelineResponse,
   LifeTimelineOut,
   SubjectsResponse,
+  SubjectsQuery,
   MergeResult,
   UnmergeResult,
   UserInfo,
@@ -452,8 +453,21 @@ export const api = {
   },
 
   /* ------------------------------------------------------------ 多用户与账号 */
-  subjects(): Promise<SubjectsResponse> {
-    return request<SubjectsResponse>('/v1/accounts/subjects');
+  /**
+   * 一页关系（默认 50 条）。**必须看 `has_more`**：这个列表天然无界
+   * （群里见到的每个人都有一行），一次全取会让页面卡死。
+   *
+   * `q` 由**服务端**筛选（昵称 / subject_id / 账号外部 id）；前端不做本地过滤，
+   * 否则"只搜当前页"会骗人。
+   */
+  subjects(query: SubjectsQuery = {}): Promise<SubjectsResponse> {
+    const params = new URLSearchParams();
+    if (query.limit !== undefined) params.set('limit', String(query.limit));
+    if (query.offset !== undefined) params.set('offset', String(query.offset));
+    const q = query.q?.trim();
+    if (q) params.set('q', q);
+    const suffix = params.toString();
+    return request<SubjectsResponse>(`/v1/accounts/subjects${suffix ? `?${suffix}` : ''}`);
   },
   mergeSubjects(body: { source_id: string; target_id: string }): Promise<MergeResult> {
     return request<MergeResult>('/v1/accounts/subjects/merge', jsonInit('POST', body));

@@ -181,6 +181,13 @@ export interface CardProps {
   section: DashboardSection;
   span?: CardSpan;
   /**
+   * 锚点目标。
+   *
+   * 只给「渠道与模型」用：它在页尾，读不到时页顶那条告警要能跳过来，
+   * 否则人得自己判断"她说不出话"是哪里出的问题。
+   */
+  id?: string;
+  /**
    * 卡片右上角的语义标记（如「未安排」）。
    *
    * 只写**结论**：状态码、内部枚举不进这里，人话标签见各自的 `*Label` 映射。
@@ -215,6 +222,7 @@ export function Card({
   title,
   section,
   span = 6,
+  id,
   badge,
   action,
   onRetry,
@@ -223,7 +231,11 @@ export function Card({
 }: CardProps) {
   const status = section?.status ?? 'unavailable';
   return (
-    <section className={`dash-card dash-card--span${span}`} data-testid={`dash-${title}`}>
+    <section
+      className={`dash-card dash-card--span${span}`}
+      data-testid={`dash-${title}`}
+      {...(id ? { id } : {})}
+    >
       <header className="dash-card__head">
         <h3 className="dash-card__title">{title}</h3>
         <div className="dash-card__meta">
@@ -889,6 +901,7 @@ export function DashboardBody({
       <Card
         title="渠道与模型"
         span={12}
+        id="dash-connectivity"
         section={s.connectivity}
         onRetry={onRetry}
         action={{ label: '去设置', onClick: onOpenSettings }}
@@ -1022,12 +1035,13 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
         </div>
       </header>
 
-        {data.sections.connectivity?.status === 'unavailable' ? (
-          // 页尾那块坏了，人在首屏根本滚不下去，而它正是"她没反应"最可能的原因。
-          <a className="dash-jump" href="#dash-connectivity" data-testid="dash-connectivity-alert">
-            渠道与模型这块暂时读不到，点这里看
-          </a>
-        ) : null}
+      {data.sections.connectivity?.status === 'unavailable' ? (
+        // 页尾那块坏了，人在首屏根本滚不下去，而它正是"她没反应"最可能的原因。
+        <a className="dash-jump" href="#dash-connectivity" data-testid="dash-connectivity-alert">
+          渠道与模型这块暂时读不到，点这里看
+        </a>
+      ) : null}
+
       <DashboardBody
         data={data}
         onOpenNow={onOpenNow}
