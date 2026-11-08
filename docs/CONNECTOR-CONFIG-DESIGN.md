@@ -25,7 +25,7 @@
 - AstrBot 的 `update_bot` 是“先持久化、再 reload”；其平台管理器的 reload 代码没有为新实例启动失败恢复旧实例的分支，因此不照搬其失败语义。
 - MaiBot 的主配置更新路由仅返回“配置已保存”；文件监视器与回调是否完成需要另一层运行时状态判断，因此本设计也不以 HTTP 保存返回值替代生效确认。
 - 关于 MaiBot 独立 NapCat 适配器的启动方式，WebUI 的配置文件接口不足以证明；本文不据此推导热重启按钮或命令。
-- **§2 验收**：逐条打开表内官方链接，能定位对应事实；文档不得将 AstrBot 的插件重载当平台重载，也不得声称 MaiBot 独立 NapCat 配置必定热生效。
+- **§2 验收**：脚本提取表内官方 URL 并断言 HTTP 200，逐项匹配目标源码中的 `reload(config)`、`bot_config.toml`、`_stop()`/`_start()` 等证据词；文档断言不把插件重载当平台重载，也不宣称独立 NapCat 配置必定热生效。
 
 ## §3 数据模型、范围与优先级
 
@@ -111,6 +111,23 @@ active(N) --PUT/校验--> pending(N+1) --> activating(N+1)
 ## §6 API 契约、权限与审计
 
 - `GET /v1/settings/connectors` 保留现有诊断结构，新增 `generation`、`activation`、`fields[].{key,kind,source,configured,preview,value,editable}`；非密钥 `value` 可回显，密钥 `value=null`。
+- 示例仅列一个字段；实际 `connectors` 包含 OneBot、QQBot，新增顶层 `access` 存白名单组：
+
+```json
+{
+  "schema_version": "v2",
+  "as_of": "2026-11-09T00:00:00Z",
+  "connectors": [{
+    "id": "onebot", "generation": 12,
+    "activation": {"state": "active", "active_generation": 12},
+    "fields": [{"key": "LING_ONEBOT_ACCESS_TOKEN", "kind": "secret",
+      "source": "db", "configured": true, "preview": "sk-1234••••",
+      "value": null, "editable": true}]
+  }],
+  "access": {"generation": 3, "fields": []}
+}
+```
+
 - `activation` 至少含 `operation_id`、`state`、`active_generation`、`candidate_generation`、`started_at`、`activated_at`、`ack_count`、`expected_count`、`error_code`，不含原始异常。
 - 字段 `source` 限 `db|env|default`；`configured` 表示有效值非空，不等于“DB 有覆盖”；`preview` 仅用于敏感字段，不能放进可提交的字段值。
 - 读接口需要登录；非 owner 的字段可读性按既有登录门槛保留，但敏感 preview/指纹只给 owner，其他身份只得 `configured`；写入口统一 owner。
