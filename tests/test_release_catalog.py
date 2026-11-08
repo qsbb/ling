@@ -114,6 +114,34 @@ def test_repository_catalog_is_valid_and_lists_real_releases() -> None:
     assert stat.S_IMODE(REPO_CATALOG.stat().st_mode) & 0o022 == 0
 
 
+def test_repository_catalog_is_not_behind_the_app_version() -> None:
+    """发布目录**不能落后于应用版本**（这次真踩到的坑）。
+
+    现场：应用已经到 0.0.4，目录里最新还只有 0.0.3 → 部署机点「检查更新」得到
+    「暂无可用的更新目标」，更新器整条链路完全用不了，而代码本身没有任何问题。
+
+    不变量（只在"发布之后忘了填目录"时红，正常发布期间不会误报）：
+    - 目录里的最高版本必须 **>=** 当前应用版本；
+    - 若最高版本高于当前版本，它的 `min_from` **必须包含**当前版本，
+      否则它对新装机的人来说永远不会成为可用目标。
+    """
+    from ling import __version__ as app_version
+
+    parsed = catalog.load_catalog(REPO_CATALOG)
+    versions = [release["version"] for release in parsed["releases"]]
+    newest = max(versions, key=catalog.version_key)
+    assert catalog.version_key(newest) >= catalog.version_key(app_version), (
+        f"发布目录最高版本 {newest} 落后于应用版本 {app_version}："
+        "部署机将永远显示『暂无可用的更新目标』。发版后记得 catalog.py add。"
+    )
+    if newest != app_version:
+        entry = next(r for r in parsed["releases"] if r["version"] == newest)
+        assert app_version in entry["min_from"], (
+            f"{newest} 的 min_from 不含当前版本 {app_version}："
+            "从当前版本升级会被判成 not_in_min_from"
+        )
+
+
 def test_repository_catalog_is_only_group_or_world_non_writable() -> None:
     assert stat.S_IMODE(REPO_CATALOG.stat().st_mode) == 0o644
 

@@ -9,6 +9,15 @@
       ],
       "has_migration": true,
       "released_at": "2026-11-06T21:20:00Z"
+    },
+    {
+      "version": "0.0.4",
+      "commit": "c89031a6cbfa812c38d2fb5792ac28b103d218c6",
+      "min_from": [
+        "0.0.3"
+      ],
+      "has_migration": true,
+      "released_at": "2026-11-08T00:00:00Z"
     }
   ]
 }
