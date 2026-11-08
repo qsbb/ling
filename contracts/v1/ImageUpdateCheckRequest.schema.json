@@ -1,0 +1,20 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateCheckRequest.schema.json",
+  "additionalProperties": false,
+  "description": "``POST /v1/version/image-update-checks`` 的固定请求体。\n\n多一个字段、少一个字段、ID 不是 32 位小写十六进制都会被拒绝（422）。",
+  "properties": {
+    "request_id": {
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id"
+  ],
+  "title": "ImageUpdateCheckRequest",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

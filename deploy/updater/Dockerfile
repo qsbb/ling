@@ -149,6 +149,9 @@ RUN addgroup -S -g 10002 updater \
 # 只拷发行包里真正用得到的代码。四层分开是为了让「改了哪份文件」在缓存与
 # 层历史上看得出来；也方便将来核对镜像内容（updater-image job 会逐条断言存在）。
 COPY --chown=10002:10002 deploy/updater/updater.py /app/updater.py
+# 同目录的 registry 客户端：更新器 `import registry` 找的就是 /app/registry.py
+# （脚本目录=sys.path[0]）。它只用标准库，与 updater.py 同一条"最小可信代码"口径。
+COPY --chown=10002:10002 deploy/updater/registry.py /app/registry.py
 COPY --chown=10002:10002 deploy/release/publish.py deploy/release/catalog.py /srv/ling-code/release/
 COPY --chown=10002:10002 deploy/backup/backup.sh deploy/backup/restore_drill.sh /srv/ling-code/backup/
 COPY --chown=10002:10002 deploy/releases.json /srv/ling-code/releases.json
@@ -157,7 +160,7 @@ COPY --chown=10002:10002 deploy/releases.json /srv/ling-code/releases.json
 # 这份 `releases.json` 是**构建时提交里的**目录，只作 `docker run` 无宿主挂载时的
 # 回退；正式部署按 compose 把发行包目录只读挂到 /srv/ling-code（已评审的那份）。
 RUN chmod 0755 /srv/ling-code/backup/backup.sh /srv/ling-code/backup/restore_drill.sh \
- && chmod 0644 /app/updater.py /srv/ling-code/release/publish.py \
+ && chmod 0644 /app/updater.py /app/registry.py /srv/ling-code/release/publish.py \
               /srv/ling-code/release/catalog.py /srv/ling-code/releases.json
 
 # 只读根文件系统下必须成立的两件事：

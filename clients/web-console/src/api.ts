@@ -44,6 +44,10 @@ import type {
   DashboardResponse,
   VersionInfo,
   ReleaseCheck,
+  ImageUpdateV2,
+  ImageUpdateCheckAck,
+  ImageUpdateSubmission,
+  ImageUpdateSubmissionAck,
   UpdateJob,
   UpdateStatus,
   UpdateRequest,
@@ -464,6 +468,39 @@ export const api = {
   /* ------------------------------------------------------------ 关于与版本 */
   version(): Promise<VersionInfo> {
     return request<VersionInfo>('/v1/version');
+  },
+  /**
+   * 镜像更新卡片（四态）：只读快照，`no-store`。
+   *
+   * 后端做白名单投影；前端不解析目录、不拼摘要、不比较版本。
+   */
+  imageUpdate(signal?: AbortSignal): Promise<ImageUpdateV2> {
+    return request<ImageUpdateV2>('/v1/version/image-update', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+  /**
+   * 触发一次**真正的按需检查**：后端只把请求原子写进 requests 目录，更新器认领后
+   * 重新取目录、解析摘要，结果落回 `status.json`。回执只表示已写入（200/201/202），
+   * 是否检查完还要重读 {@link imageUpdate} 看 `checked_at`。
+   */
+  imageUpdateCheck(requestId: string): Promise<ImageUpdateCheckAck> {
+    return request<ImageUpdateCheckAck>(
+      '/v1/version/image-update-checks',
+      jsonInit('POST', { request_id: requestId }),
+    );
+  },
+  /**
+   * 提交一次镜像更新请求。自定义头 X-Ling-Update 是后端的防误触标记；
+   * 浏览器会自动带上 Origin，服务端据此做同源校验。
+   */
+  requestImageUpdate(body: ImageUpdateSubmission): Promise<ImageUpdateSubmissionAck> {
+    return request<ImageUpdateSubmissionAck>('/v1/version/image-update-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ling-Update': '1' },
+      body: JSON.stringify(body),
+    });
   },
   /** 手动触发的只读检查；不下载、不应用更新。 */
   checkRelease(): Promise<ReleaseCheck> {

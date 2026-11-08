@@ -1,0 +1,46 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageReleaseCheckLatest.schema.json",
+  "additionalProperties": true,
+  "description": "本次检查发现的最高稳定版（registry ``tags/list`` + manifest 解析结果）。",
+  "properties": {
+    "commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit"
+    },
+    "digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Digest"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    }
+  },
+  "title": "ImageReleaseCheckLatest",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

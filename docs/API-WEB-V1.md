@@ -259,6 +259,9 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 | GET | `/v1/version/check-release` | 手动检查 GitHub 最新 Release；保留 `status/current/latest/published_at/html_url/is_newer`，追加 `release_id/target_commit/update_eligible/update_reason` |
 | GET | `/v1/version/update` | 更新通道视图（只读固定 JSON，不发起网络请求） |
 | POST | `/v1/version/update-requests` | owner 提交一次更新请求，`201` + job |
+| GET | `/v1/version/image-update` | **镜像模式**的「检查更新」卡片（四态 + 诊断，见 §7.1） |
+| POST | `/v1/version/image-update-requests` | owner 提交一次固定 digest 的镜像更新，`201`；要求最近 15 分钟内登录 |
+| POST | `/v1/version/image-update-checks` | owner 发起一次**按需检查**（只写刷新请求），`202` 已排队 / `200` 幂等去重 |
 
 `GET /v1/version/update`：
 
@@ -296,6 +299,83 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 `channel_unavailable`、`installed_commit_unknown`、`version_drift`、
 `update_in_progress`、`release_unverifiable`、`not_newer`。
 
+### 7.1 镜像模式：`GET /v1/version/image-update`
+
+镜像部署（`LING_APP_IMAGE` / `LING_RUN_MIGRATIONS=0` / 更新器状态文件任一存在）下，
+网页的「检查更新」用这个端点。**发现版本只有一个事实源**：更新器写的
+`status.json` 顶层 `release_check`（它自己查 GHCR 的 tags/manifest）。API 不读
+可信发布目录——`deploy/releases.json` / `catalog.py` / `min_from` 已经删除
+（[UPDATE-SIMPLIFICATION-DESIGN.md](UPDATE-SIMPLIFICATION-DESIGN.md) §3/§6/§8）。
+
+```json
+{ "schema_version": "v1",
+  "state": "available",              // latest | available | newer_unavailable | unknown
+  "message": "发现新版 v0.0.4，可以更新。",
+  "checked_at": "2026-11-09T06:20:00Z",
+  "current": { "version": "0.0.3", "commit": "<40 hex>", "digest": "ghcr.io/qsbb/ling-api@sha256:…" },
+  "newer": [ { "version": "0.0.4", "commit": null, "has_migration": null,
+               "digest": "ghcr.io/qsbb/ling-api@sha256:…", "compatible": true,
+               "incompatible_reason": null, "incompatible_reason_message": null,
+               "summary": "…", "notes": ["…"], "notes_url": "https://…" } ],
+  "target": { "version": "0.0.4", "digest": "ghcr.io/qsbb/ling-api@sha256:…",
+              "commit": null, "has_migration": null },
+  "task": null,
+  "details": { "release_check": { "state": "ok", "checked_at": "…",
+                                 "check_id": "<32 hex>", "source": "registry",
+                                 "reason": null, "reason_message": null,
+                                 "current": { "version": "0.0.3", "digest": "sha256:…" },
+                                 "latest": { "version": "0.0.4", "digest": "sha256:…",
+                                             "commit": null },
+                                 "tag_count": 12 },
+               "catalog": { "…": "旧形状，从 release_check 派生，一个版本后移除" },
+               "updater": { "online": true, "state": "idle", "protocol": 1, "version": "0.0.3" },
+               "backup_gate": { "restore_point": true, "…": "…" } } }
+```
+
+判定顺序（服务端算，前端不自己比较版本）：
+
+| `state` | 条件 | 主按钮 |
+| --- | --- | --- |
+| `unknown` | 通道/更新器不可用、`release_check` 缺失、`current.version` 读不到，或这次 tags 列表不可信（不可达/认证/限流/超时/没有稳定 tag） | 重新检查 |
+| `newer_unavailable` | 已确认有更高版本，但拿不到安装包摘要或没有本机平台（`target=null`） | 重新检查（**不**提交安装） |
+| `available` | 更高版本 + 摘要已解析 + 安装门禁全过 | 更新到 `target.version` |
+| `latest` | 检查完成（`state=ok`）且没有更高版本 | 检查更新 |
+
+- `message` 是**一句话人话**：不含原因码、`sha256`、路径、原始 ISO 时间
+  （时间形如「检查于 11 月 9 日 14:20」，按用户生效时区）。
+- `checked_at` 只来自 `release_check.checked_at`；**绝不**拿更新器的
+  `updated_at` 顶替（那是"状态文件被写过"的时间）。
+- `newer[].digest` / `target.commit` 允许为 `null`；`has_migration` 只是过渡字段，
+  现在恒为 `null`（迁移是否需要由迁移器判断，见设计 §8）。
+- `details.release_check` 是更新器事实的白名单投影（`reason_detail` 只投影 `null` 或 `throttled`（闭集，自由文本不投影）：
+  那是自由文本，可能带 URL/凭据/异常）。
+- 旧字段 `image_mode/enabled/installable/reason/reason_message/next_actions/
+  updater/backup_gate/catalog/available_targets/request` 保留一个版本；它们的值
+  现在全部从 `release_check` 派生，`reason` 里不再有目录类原因码。
+
+`POST /v1/version/image-update-requests` 仍只接受固定 5 键请求体，且
+`target_digest` 必须等于**这次发现的目标**摘要（否则 `409 target_not_available`）。
+`POST /v1/version/image-update-checks` 的请求体固定为
+`{"request_id": "<32 hex>"}`：只原子写 `refresh-<request_id>.json` 进更新器的
+requests 目录，**不**访问 registry、**不**改 `status.json`。它是只读动作，所以
+**不要求最近登录**（安装请求仍要求）。更新器会把这个 ID 回填进
+`release_check.check_id`，前端据此确认"这次检查"真的完成了。
+
+`release_check.reason` 的闭表（未知码一律降级为「这次查不到」，不回显原文）：
+
+| 类别 | 码 | 首屏那句话 |
+| --- | --- | --- |
+| 列表类（→ `unknown`） | `registry_unreachable` | 连不上镜像仓库 |
+| | `registry_auth_failed` | 认证失败（私有包/凭据失效） |
+| | `registry_rate_limited` | 镜像仓库暂时限流，这次没查完整 |
+| | `registry_timeout` | 查询镜像仓库超时 |
+| | `no_stable_tags` | 镜像仓库里还没有稳定版发布 |
+| 制品类（→ `newer_unavailable`） | `digest_unresolved` | 新版已发布，但取不到安装包 |
+| | `platform_unsupported` | 新版本没有适合这台机器的镜像 |
+
+`release_notes`（`{state: ok|missing|invalid, notes: {"<version>": {summary, items, url}}}`）
+只影响 `newer[].summary/notes/notes_url`；取不到说明**不阻断**安装。
+
 ## 8. 前端必须遵守
 
 1. 浏览器不保存权威历史；刷新后从 `/v1/sessions/{id}/messages` 重建。
@@ -306,6 +386,9 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 6. 更新状态只能按服务端 `enabled/reason/executor/current_job` 展示；`message`
    直接显示服务端文案，不自行拼接宿主路径或日志。通道关闭（`enabled=false`）
    时不得显示可点的“更新”入口。
+7. 镜像模式按 `state` 展示四态、按 `message` 显示那句话：**不得**自己比较版本、
+   自己拼「已是最新」或从 `task`/旧 `available_targets` 造安装目标。`unknown`
+   与 `newer_unavailable` 都没有可提交目标，主按钮只能是「重新检查」。
 
 ## 9. 仪表盘与管理查询：日期 / 状态语义（2026-10 变更）
 

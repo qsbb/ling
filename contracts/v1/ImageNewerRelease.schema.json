@@ -1,0 +1,114 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageNewerRelease.schema.json",
+  "additionalProperties": true,
+  "description": "本次检查发现的更高版本（``compatible=false`` 的也保留）。\n\n事实源是更新器的 ``release_check.latest``（查 GHCR tags/manifest 得出），\n所以列表通常只有一条。与\"可提交目标\"的**关键差别**：``digest`` 允许为 null。\n「有新版但拿不到安装包」是必须能显示给用户的事实（否则页面只剩一句\n\"暂无可更新的版本\"，用户分不清是没发版还是没构建产物）；摘要为空的条目\n永远进不了 ``target``，不能用它构造安装请求。",
+  "properties": {
+    "commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit"
+    },
+    "compatible": {
+      "title": "Compatible",
+      "type": "boolean"
+    },
+    "digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Digest"
+    },
+    "has_migration": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "deprecated": true,
+      "title": "Has Migration"
+    },
+    "incompatible_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Incompatible Reason"
+    },
+    "incompatible_reason_message": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Incompatible Reason Message"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "notes_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Notes Url"
+    },
+    "summary": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Summary"
+    },
+    "version": {
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "version",
+    "compatible"
+  ],
+  "title": "ImageNewerRelease",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

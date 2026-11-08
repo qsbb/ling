@@ -476,6 +476,8 @@ def test_updater_dockerfile_copies_only_the_release_package() -> None:
     ], froms
     allowed = {
         "deploy/updater/updater.py",
+        # 更新器直接问 GHCR 的只读客户端（同目录小模块，updater.py `import registry`）。
+        "deploy/updater/registry.py",
         "deploy/release/publish.py",
         "deploy/release/catalog.py",
         "deploy/backup/backup.sh",

@@ -69,8 +69,8 @@
 #   不可能，见 `write_env_in_place`），锁文件只 open/flock、从不改名换 inode。
 # - 私有的 GHCR 包需要宿主的 docker 凭据（`~/.docker/config.json`）。本文件
 #   **不**默认挂它；需要时用一份受控 override 只读追加，不要写进仓库。
-# - 更新器不发布任何端口、不接公网入站；`updater-egress` 只是为了
-#   `docker manifest inspect`（CLI 侧发起的注册表查询）能在本机通网。
+# - 更新器不发布任何端口、不接公网入站；`updater-egress` 只是为了让版本发现
+#   （更新器进程自己发起的只读 registry 查询）与镜像拉取能在本机通网。
 # - `read_only: true` + `tmpfs` + `no-new-privileges` + `cap_drop: ALL`
 #   只能收窄容器内的写面；socket 的宿主级风险依旧存在（见上）。
 #
@@ -143,17 +143,10 @@ services:
       LING_UPDATER_BACKUP_SCRIPT: /srv/ling-code/backup/backup.sh
       LING_UPDATER_PUBLISH_PY: /srv/ling-code/release/publish.py
       LING_UPDATER_POLL_SECONDS: ${LING_UPDATER_POLL_SECONDS:-5}
-      # 联网取发布目录，**默认打开**，指向本仓库 main 那份 releases.json。
-      #
-      # 为什么需要它：目录文件随发行包交付、只读挂载，而升级只换 app 镜像、
-      # 不动更新器自己——所以本地那份永远停在安装时的版本，网页一键更新
-      # 只能成功一次。
-      #
-      # 打开它意味着信任「谁能改 GitHub 上的仓库」= 升级授权依据。
-      #
-      # 页面更新只有这一种方式，所以直接给默认值，不做成"可关闭开关"——
-      # 一个默认打开、实际没人会关的开关只是多一处要维护的状态。
-      LING_UPDATER_CATALOG_URL: ${LING_UPDATER_CATALOG_URL:-https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json}
+      # **没有** registry / 镜像名 / tag 的配置项：版本发现固定问
+      # `ghcr.io/qsbb/ling-api`（`deploy/updater/registry.py` 的常量），请求方与
+      # compose 都影响不到它。旧的 `LING_UPDATER_CATALOG_URL`（联网取 releases.json）
+      # 已随可信发布目录一起删除——目录不再参与任何判定。
       PYTHONUNBUFFERED: "1"
       # 只读根 + 只读挂载：不写 .pyc，避免每次导入都产生无意义的写入尝试。
       PYTHONDONTWRITEBYTECODE: "1"
@@ -192,7 +185,8 @@ services:
     networks: [updater-egress]
 
 networks:
-  # 普通 bridge：只用于 `docker manifest inspect`（注册表查询由 CLI 发起）。
-  # 不要设 internal: true —— 那样连不上 GHCR，预检会一直失败；
+  # 普通 bridge：只用于更新器**自己**发的只读 HTTPS（GHCR 的 tags/list 与 manifest；
+  # 可选一次 GitHub Release 说明）以及 compose 的镜像拉取。
+  # 不要设 internal: true —— 那样连不上 GHCR，检查与预检会一直失败；
   # 也不要给这个网络加任何宿主端口映射。
   updater-egress: {}

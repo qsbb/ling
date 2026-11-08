@@ -38,56 +38,114 @@
       "created_at": "2026-11-04T00:00:00Z"         # 可选
     }
 
+刷新请求（「检查更新」/按需刷新）
+================================
+同一个请求目录里还有**第二种、前缀不同**的一次性文件（同样是临时文件 +
+``rename``）::
+
+    <requests-dir>/refresh-<32 位小写 hex>.json
+    {"schema": 1, "request_id": "<32 位小写 hex>", "kind": "refresh",
+     "created_at": "2026-11-04T00:00:00Z"}
+
+- 它**只**触发一次只读刷新：查一次 GHCR 的 ``tags/list``、解析最新稳定版 tag 的
+  digest、读运行中 api 镜像的版本标注、读更新说明。不拉镜像、不备份、不迁移、
+  不切容器，也不改任何 compose/env。
+- 与安装请求的区别只有一处：多余的键**忽略并记键名**（刷新是只读的，多一个无关
+  字段不该让用户的检查失败）；``schema``/``kind``/ID/时间格式仍然严格。
+  设计文档里的 ``check_id``/``requested_at`` 与这里的 ``request_id``/``created_at``
+  是同一件事的两个名字，两种写法都认（API 与更新器是两个镜像、并行开发，认错一个
+  名字的后果是"点了检查没反应"）。
+- 幂等：处理过的 ID 记在 ``<state-dir>/refresh.json``（0600），同一个 ID 再写回来
+  不会再查一次；处理完请求文件**删除**。
+- 限流：请求触发的刷新在 ``--refresh-throttle-seconds``（默认 10 秒）内最多真正
+  处理一次；多余的请求文件直接删掉，并把它记成
+  ``release_check.reason_detail="throttled"``——但 **``state``/``latest``/``current``
+  一个字节都不动**（这次没查，就不能改上一次的结论）。自动刷新（启动/每 300 秒）
+  **不**计入这个窗口。
+- 旧更新器（0.0.3）只匹配 ``request-*``，所以它看见 ``refresh-*`` 会原样忽略：
+  不认领、不消费、不阻塞安装通道。
+
 状态协议
 ========
 ``<status-file>``（默认 ``<state-dir>/status.json``，原子写、0644）字段固定，
-**不含**密码、原始日志、备份路径、compose/env 路径::
+**不含**密码、原始日志、备份路径、compose/env 路径、registry 主机或 tag::
 
     {
       "schema": 1, "protocol": 1, "updated_at": "...",
       "updater": {"state": "idle|busy|needs_manual", "version": "1.0.0"},
-      "task": null | {
-        "request_id": "...", "state": "...", "stage": "prepare|backup|migrate|switch|verify",
-        "started_at": "...", "updated_at": "...", "finished_at": ...,
-        "target": {"digest": "...", "commit": "..."},
-        "previous": {"digest": "...", "commit": "..."},
-        "migration": {"attempted": bool, "current_before": ..., "current_after": ...,
-                      "target_head": ...},
-        "backup": {"id": "...", "complete": bool, "tombstones_state": ...,
-                   "media_state": ..., "keys_root": ..., "keys_env_set": ...},
-        "maintenance": {"state": "active|released|unknown", "verified": bool},
-        "rollback": {"attempted": bool, "verified": bool},
-        "still_on_old_version": true|false|null,     # null = 未实测，不敢断言
-        "failure": null | {"code": "...", "stage": "...", "message": "码表文案"},
-        "warnings": ["..."], "next_actions": ["码表文案"]
+      "task": null | { ... 见下 ... },
+      "backup_gate": { ... 见下 ... },
+      "release_catalog": {            # **只读兼容**：不再读目录文件，见下节
+        "state": "unused", "reason": null,
+        "entries": 0, "current_version": "0.0.3" | null,
+        "source": "registry", "checked_at": "2026-11-09T01:00:00Z"
       },
-      "backup_gate": {
-        "restore_point": bool,        # 现在是否**真有**一个可用的恢复点
-        "backup_id": "..." | null,    # manifest 文件名里的时间戳，不含路径
-        "complete": bool,             # manifest 自身结构完整、产物在位
-        "tombstones_state": ..., "media_state": ...,
-        "keys_root": ..., "keys_env_set": ...,
-        "reason": "ok|no_manifest|backup_dir_unreadable|manifest_unreadable|...",
-        "checked_at": "..."
+      "release_check": {              # 版本发现的**唯一**事实来源
+        "state": "ok|failed|unknown",
+        "checked_at": "2026-11-09T00:00:00Z" | null,
+        "check_id": "<32 位小写 hex>" | null,   # 这次检查由哪条刷新请求触发
+        "source": "registry",
+        "reason": null | "registry_unreachable|auth_failed|rate_limited|timeout|
+                 no_stable_tags|manifest_failed|digest_missing|platform_missing",
+        "reason_detail": null | "throttled",
+        "current": {"version": "0.0.3" | null, "digest": "sha256:..." | null},
+        "latest": {"version": "0.0.4", "digest": "sha256:...",
+                   "commit": null} | null,
+        "tag_count": 12
       },
-      "release_catalog": {
-        "state": "ok|missing|invalid",
-        "reason": null | "catalog_missing|catalog_unreadable|catalog_invalid|
-                 catalog_schema_unsupported|catalog_tool_missing",
-        "entries": 3,                       # 目录里的发布条数（只用于展示）
-        "current_version": "0.0.1" | null   # 运行中 api 镜像的 OCI version 标注
-      },
-      "available_targets": [
-        {"version": "0.0.2",
-         "digest": "ghcr.io/qsbb/ling-api@sha256:..." | null,  # null = 没解析/不兼容
-         "commit": "...",
-         "has_migration": true, "compatible": true|false,
-         "incompatible_reason": null | "not_in_min_from|current_version_unknown|
-                                digest_unresolved|..."}
+      "available_targets": [          # 旧形状，内容由 registry 结果推导
+        {"version": "0.0.4",
+         "digest": "ghcr.io/qsbb/ling-api@sha256:..." | null,
+         "commit": null,
+         "has_migration": true,       # 恒 true：迁移前向，入口总跑 migrate
+         "compatible": true|false,
+         "incompatible_reason": null | "current_version_unknown|digest_unresolved"}
       ],
       "recommended_target": null | {"version": "...", "digest": "...",
-                                    "commit": "...", "has_migration": ...}
+                                    "commit": null, "has_migration": true},
+      "release_notes": {              # 只放 latest 那一版
+        "state": "ok|missing|invalid",
+        "reason": null | "notes_invalid|notes_unreadable|notes_too_large|
+                 notes_tool_missing",
+        "notes": {"0.0.4": {"summary": "...", "items": ["..."],
+                            "url": "https://..."|null}}
+      }
     }
+
+``release_check`` 的硬规则（设计 §3/§6）
+--------------------------------------
+1. **只有**完整拿到 tags（允许空页）且选定 tag 的 digest 解析成功，``state`` 才能
+   是 ``ok``；任何一步失败都是 ``failed`` + 固定 ``reason``。**绝不**把失败写成
+   "已是最新"：``ok`` 且 ``available_targets=[]`` 才等于「已是最新」。
+2. ``current.version`` 只来自**运行中 api 镜像**的 ``org.opencontainers.image.version``
+   标注，读不到就是 ``null``（**不**拿 pyproject/``.env`` 猜）。``current.digest``
+   同理来自该镜像的 ``RepoDigests``（``sha256:<hex>`` 形状）。
+3. ``release_check.latest.digest`` 是 registry 的 digest（``sha256:<hex>``）；
+   ``available_targets[].digest`` 是**旧形状**的完整镜像引用
+   （``ghcr.io/qsbb/ling-api@sha256:<hex>``），因为 API 侧按那个形状校验并直接
+   写进安装请求。
+4. ``check_id`` 只在这次检查由 ``refresh-<id>.json`` 触发时回显那个 ID；自动
+   刷新写 ``null``。被限流丢弃的请求也会把 ``check_id`` 回显上去（页面据此知道
+   "我这次点击有结论了"），但 ``state`` 保持上一次的值。
+
+``available_targets`` / ``recommended_target`` 仍是旧 API 读得懂的形状
+--------------------------------------------------------------------
+内容改为由 registry 结果推导（见「版本发现」一节），但字段名/类型不变：
+``compatible`` = 版本比 ``current`` 新**且** digest 非空；``has_migration`` 恒
+``true``（迁移是前向的，更新入口总会跑 migrate，不再由发布目录人工开关）；
+``commit`` 恒 ``null``（registry 的 tag 列表不带提交号，拉取后由 publish 用镜像
+标注核 ``LING_COMMIT == OCI revision``）。``commit=null`` 会让 **0.0.3 的 API**
+把这一条整条丢掉（它要求 40 位 hex），结果是旧页面显示"暂无可用目标"——
+**不崩、不误报已是最新**，这正是旧 API 该有的降级行为。
+
+``release_catalog`` 是**只读兼容**字段
+--------------------------------------
+目录（``deploy/releases.json``）不再参与任何判定，也不再被读取。为了不把旧 API
+的目录状态码伪造为"目录正常"（设计 §7），这个键仍然存在，但 ``state`` 是
+``unused``（两边码表都不认的值 → 都按"未知"处理），``entries`` 恒 0，
+``current_version``/``checked_at`` 照实给。``catalog.py`` 与
+``deploy/releases.json`` 的解析/校验代码暂时留着（桥接期旧更新器还要用），
+但**更新器不再依赖它们**。
 
 恢复点门禁为什么必须是**独立顶层字段**
 ======================================
@@ -110,58 +168,59 @@
 ID/阶段/前后 digest/备份标识/维护门禁副本）、``journal.log``（含命令 argv 与
 原始失败原因的私有日志）、``release-<id>.json``（复用 publish 的发布记录）。
 
-可信发布目录（``deploy/releases.json``）
-========================================
-「更新」按钮需要一个**可用的目标**，而 ``target_digest`` 不能由调用方随口给。
-设计原文：可信发布目录只列已通过门禁、可从已知版本升级的稳定目标；同时明确
-「可编辑的 Release 正文**不是**摘要可信来源」。CI 构建证明在 Stage 1 被关掉
-（``provenance: false``），给更新器塞 ``gh``/Sigstore 又与「只保留最小可信代码」
-冲突——所以**信任锚是操作员装的那份代码**：目录文件随代码提交（GitHub 签名提交
-+ 评审），更新器从**自己的发行包目录**只读加载：``--release-catalog``（默认
-``<--publish-py 的上级目录>/../releases.json``，容器里就是 ``/srv/ling-code/
-releases.json``），校验与排序复用发行包里那份 ``deploy/release/catalog.py``。
+版本从哪来（GHCR，不再有发布目录）
+==================================
+「有没有新版本」只问**一处**：固定的 ``ghcr.io/qsbb/ling-api``（
+:mod:`deploy.updater.registry`，纯标准库）。没有 ``deploy/releases.json``、没有
+``min_from``、没有版本跨度校验，也没有"谁能改仓库 main 谁就能授权升级"的
+间接信任锚：能往这个包里推 stable tag 的人，本来就能决定用户装什么。
 
-判定规则（都在 :func:`release_targets` 里，**不依赖文件顺序**）：
+发现规则（:func:`read_release_check`）：
 
-1. **当前版本**读**运行中 api 容器**的镜像标注 ``org.opencontainers.image.version``
-   （:func:`current_running_version`）。为什么不再读 ``.env`` 里的
-   ``LING_APP_IMAGE`` 去目录反查：目录里**已经没有 digest**，「摘要 ↔ 版本」的
-   映射不存在，反查这条走不通；而运行中的容器本来就是"现在到底跑的是哪一版"的
-   实测事实（``.env`` 可以被手改，也可能改了还没重建容器）。读不到标注 / 容器
-   不在运行 / 标注不是严格 semver → 当前版本未知，所有目标 ``compatible=false``
-   + ``incompatible_reason="current_version_unknown"``，``recommended_target=null``
-   （**不猜**当前版本，也不拿"看起来像"的目标放行）。
-2. **只允许升级**：目标 ``version`` 必须**严格大于**当前版本，否则该条**不出现在**
-   ``available_targets`` 里（设计要求「不提供随意选旧版本或一键降级」）。
-3. **版本跨度**：当前版本必须在该目标的 ``min_from`` 里；不在 → 兼容=false +
-   原因（``not_in_min_from``）。
-4. **目标摘要现解析**（:func:`resolve_target_digest`）：目录里没有 digest，所以对
-   每个**兼容**目标跑一次 ``docker manifest inspect
-   ghcr.io/qsbb/ling-api:v<version>``，取 ``linux/<宿主架构>`` 那条平台 manifest
-   的 digest 当 ``target_digest``。解析失败（没有 ``manifests`` / 没有本机平台 /
-   命令非 0 / JSON 坏 / digest 不过 ``DIGEST_RE``）→ 该目标 ``compatible=false``
-   + ``incompatible_reason="digest_unresolved"``，**绝不**用 tag 或旧缓存顶替。
-   可用目标通常只有 1~2 个，所以每次刷新就 1~2 次 manifest inspect。
-5. ``recommended_target`` = **版本最大的那一条兼容目标**；没有兼容目标就是 null。
+1. ``GET /v2/qsbb/ling-api/tags/list``，401 时按 ``WWW-Authenticate`` 的 Bearer
+   challenge 取**匿名** token 重试，分页按 ``Link`` 跟（最多 5 页），整个检查
+   共用一条总超时（默认 8 秒）。
+2. 只接受**规范化**的 ``vMAJOR.MINOR.PATCH``：``latest``、``sha-*``、预发布
+   （``-rc.1``）、前导零写法一律忽略；按 semver 取最大。
+3. 对选定的 tag 发 ``HEAD .../manifests/v<ver>``（Accept 同时带 OCI index /
+   Docker manifest list / OCI manifest / Docker manifest），取
+   ``Docker-Content-Digest``；HEAD 不可用（405/501）才退回 GET（限流读）。多架构
+   index 再核「宿主平台存在」（缺 → ``platform_missing``）。
+4. **只有拿全了 tag 且 digest 解析成功**才返回 ``state=ok``；任何一步失败都是
+   ``failed`` + 固定原因码。部分结果一律不许当成"完整"。
 
-目录缺失 / 不可解析 / 校验失败 → ``available_targets=[]`` + 明确原因（``state``
-与 ``reason``），**绝不**假装有目标，也**绝不**静默。
+**当前版本**读**运行中 api 容器**的镜像标注 ``org.opencontainers.image.version``
+（:func:`current_running_image`），``current.digest`` 取同一镜像的 ``RepoDigests``。
+为什么不是 ``.env`` 里的 ``LING_APP_IMAGE``：它可以被手改、也可能改了还没重建
+容器；而运行中的容器本来就是"现在到底跑的是哪一版"的实测事实。读不到标注 /
+容器不在运行 / 标注不是严格 semver → ``current.version=null``（**不猜**），
+目标一律 ``compatible=false`` + ``current_version_unknown``。
 
-即使目标来自目录，更新器仍**独立复核**：请求里的 ``target_digest`` 必须等于
-「某个兼容版本**现在**从 registry 解析出来的摘要」（否则 ``target_not_in_catalog``，
-一个字节都不改）——所以执行前那次复核会**重新解析** manifest，而不是拿 status
-里的旧缓存比对；之后照旧核 digest 格式、拉取后核 ``LING_COMMIT == OCI revision``、
-平台、当前运行 digest，并复用 publish 的全部门禁。
+投影成旧形状（:func:`registry_targets`）：**只允许升级**（版本不高于当前版本的
+不出现在 ``available_targets`` 里），摘要非空才 ``compatible=true``，
+``has_migration`` 恒 true（迁移前向，入口总跑 migrate），``commit`` 恒 null。
 
-关于「index digest 还是平台 manifest digest」：目录还带 digest 的时代记的是多架构
-**index** digest（CI Release 正文里那个）。更新器现在解析出来的是**本机架构的平台
-manifest** digest——`publish.verify_repo_digests` 两者是一等值（``accepted =
-{target_hex} ∪ {target_platform_digest}``），`probe_registry_manifest` 遇到非 index
-也会明说「平台将在 pull 后按 image inspect 核对」。为什么不解析 index digest：
-``docker manifest inspect`` 的输出里**没有** index 自己的摘要（OCI index 文档不含
-自身哈希，``-v`` 只多给平台 descriptor），而 ``buildx imagetools --raw`` 要在只读
-根、非 root、``HOME=/nonexistent`` 的更新器容器里初始化 builder——真机跑不通就会
-让整条更新通道 fail closed，代价远大于「摘要取本机平台那一层」。
+安装前复核（设计 §3 末段）
+--------------------------
+``prepare`` 阶段在真正 ``pull`` 之前**重查 registry**：重新列一次 tag，从最新
+稳定版往下逐个解析 digest（最多 :data:`MAX_DRIFT_PROBE_TAGS` 个），要求请求里的
+digest **完全相同**才继续——直接拒绝的失败码是 ``target_digest_drift``（
+"安装包已变化，请重新检查更新"），**绝不**退回"按 tag 拉"。安装引用自始至终是
+``ghcr.io/qsbb/ling-api@sha256:...``，日志与发布记录里不出现 ``:vX.Y.Z`` 形式的
+安装引用（tag 只在只读查询的 URL/参数里出现）。
+
+更新说明（``deploy/update-notes.json`` + 可选 GitHub Release）
+============================================================
+说明**只是展示**，不参与"能不能更新"的判定：
+
+1. 读发行包自带的那份 ``update-notes.json``（与 ``--release-catalog`` 同目录，
+   容器里就是 ``/srv/ling-code/update-notes.json``），用发行包
+   ``catalog.py`` 的 ``parse_notes`` 严格校验（结构/长度/URL 协议）；
+2. 那份文件里没有 **latest** 这一版时，可选再试 GitHub Release 的**精确 tag**
+   （``/repos/qsbb/ling/releases/tags/v<ver>``，超时 5 秒）——失败只影响说明；
+3. 结果只写 ``release_notes.notes`` 里**latest 那一版**，形状固定。
+
+更新说明取不到**绝不**改变 ``release_check``/目标判定。
 
 维护门禁（设计 §4/§5 的硬要求）
 ===============================
@@ -248,6 +307,16 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+# 同目录的 registry 客户端（``deploy/updater/registry.py``，纯标准库）。要动
+# ``sys.path`` 的原因：这个文件既被当脚本跑（``python3 /app/updater.py``，脚本目录
+# 天然在 ``sys.path[0]``），也被测试按路径用 ``importlib`` 加载（那时**不在**
+# sys.path 里）。把脚本自己的目录补进去是两种加载方式都成立的最小做法。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import registry  # noqa: E402  （必须在 sys.path 调整之后）
+
 # ---------------------------------------------------------------- 协议常量
 
 UPDATER_VERSION = "1.0.0"
@@ -277,6 +346,54 @@ REQUEST_REQUIRED = (
     "operator_confirmed",
 )
 
+# ---------------------------------------------------------------- 刷新请求协议
+#
+# 「检查更新」必须让更新器**现在**去问一次 registry；只重读 ``status.json`` 不算
+# 检查（设计 ``docs/UPDATE-UX-DESIGN.md``）。API 不碰 Docker/registry，它只往
+# **同一个**请求目录写一个刷新请求文件，更新器在同一把单飞锁里认领它。
+#
+# 文件名 ``refresh-<32 hex>.json``（与安装请求 ``request-<32 hex>.json`` 同目录、
+# 同原子写：临时文件 + ``rename``；安装请求的匹配规则**只有** ``request-*``，
+# 所以旧更新器看见 ``refresh-*`` 会原样忽略，安装通道完全不受影响）。
+# 内容白名单极简::
+#
+#     {"schema": 1, "request_id": "<32 位小写 hex>", "kind": "refresh",
+#      "created_at": "2026-11-04T00:00:00Z"}
+#
+# 两种字段写法都接受（同一件事的两个名字）：设计文档的按需检查协议写的是
+# ``check_id`` / ``requested_at``，更新器的旧协议写的是 ``request_id`` /
+# ``created_at``。**刻意不在这两个名字之间做二选一**：API 与更新器是两个镜像、
+# 由不同的人并行改，认错一个名字的后果是「点了检查没反应」，而那是最难排查的一类
+# 故障。除了这两个别名，其它键一律**忽略**并把键名记进私有日志（不崩、不拒）：
+# 刷新是只读动作，多一点无关字段不该让用户的检查失败。
+REFRESH_PREFIX = "refresh-"
+REFRESH_KIND = "refresh"
+REFRESH_SCHEMA = 1
+REFRESH_KEYS = frozenset(
+    {"schema", "request_id", "kind", "created_at", "check_id", "requested_at"}
+)
+# 严格 RFC3339（允许小数秒与 Z/偏移两种时区写法）。时间戳不参与任何判定，
+# 但**不能是自由文本**：状态文件里的字段形状必须确定。
+RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+# 请求触发的刷新也要限流：页面被连点时，每一下都去列一次 tag + 解析一次 manifest
+# 会把 GHCR 通道拖死（匿名也有速率上限）。10 秒内最多真正处理一次；多余的请求
+# 文件直接删掉，结果记在 ``release_check.reason_detail="throttled"``——
+# **不改 state**：这次没查，就不能拿它改写上一次的结论。
+REFRESH_THROTTLE_SECONDS = 10.0
+# 幂等用的记忆：处理过的 request_id 记在 ``<state-dir>/refresh.json`` 里。
+# 只留最近这些个（请求文件本来就会被删掉，这里只是防"同一 ID 又被写回来"）。
+REFRESH_STATE_NAME = "refresh.json"
+REFRESH_STATE_SCHEMA = 1
+MAX_REMEMBERED_REFRESHES = 64
+
+# ``release_check.reason_detail`` 目前只有这一个值（其余情况是 null）。
+REASON_DETAIL_THROTTLED = "throttled"
+# 刷新请求本身畸形时的**内部**错误码（只进私有日志与 ``UpdaterError.code``，
+# **不**写进状态文件：``release_check`` 只放 registry 的 8 个原因码）。
+REFRESH_REASON_MALFORMED = "refresh_malformed"
+
 STAGES = ("prepare", "backup", "migrate", "switch", "verify")
 
 TASK_RUNNING = "running"
@@ -289,57 +406,102 @@ MAINT_ACTIVE = "active"
 MAINT_RELEASED = "released"
 MAINT_UNKNOWN = "unknown"
 
-# 可信发布目录（见模块 docstring「可信发布目录」一节的硬规则）。
-RELEASE_CATALOG_NAME = "releases.json"
-# 默认的联网目录地址：本仓库 main 分支那份、经 CI 校验的 releases.json。
+# ---------------------------------------------------------------- 版本发现（GHCR）
 #
-# 默认打开是因为不打开这条路就是死的：目录文件只读挂载、升级只换 app 镜像
-# 不动更新器自己，所以本地那份永远停在安装时的版本——一键更新只能成功一次。
-DEFAULT_CATALOG_URL = (
-    "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
-)
-# 联网取目录的超时（秒）。更新器是常驻轮询进程，一次卡死会拖住整个通道。
-CATALOG_FETCH_TIMEOUT_SECONDS = 10.0
-# 空闲时重读发布目录的间隔（秒）。发版是低频事件，5 分钟足够；
-# 比主循环的 5 秒轮询慢两个数量级，不会把 GitHub 打成限流。
-CATALOG_REFRESH_INTERVAL_SECONDS = 300.0
+# 见模块 docstring「版本从哪来（GHCR，不再有发布目录）」。这里**没有**可配置的
+# registry/镜像名/tag：请求方（网页/API/请求文件）无法影响发现目标。唯一注入点
+# 是 ``registry.REGISTRY_ENV``（测试把 base URL 指到本地 stub）。
+#
+# 一次检查的 ``state``：只有完整拿到 tag 列表**且**选定 tag 的 digest 解析成功
+# 才是 ``ok``；``failed`` 带固定 ``reason``；``unknown`` 表示"还没有查过"
+# （构造完必然立刻查一次，所以它只出现在进程内的占位状态）。
+RELEASE_CHECK_OK = "ok"
+RELEASE_CHECK_FAILED = "failed"
+RELEASE_CHECK_UNKNOWN = "unknown"
+# ``release_check.source``：现在是、将来也只有 registry 这一个事实源。
+RELEASE_CHECK_SOURCE = "registry"
+# 原因码锁定在 registry 客户端的 8 个（不在这里另立一套）。
+RELEASE_CHECK_REASONS = registry.REASONS
+# 空闲时重查 registry 的间隔（秒）。发版是低频事件，5 分钟足够；用户点
+# 「检查更新」走 refresh 请求，**绕过**这个节流。
+CHECK_INTERVAL_SECONDS = 300.0
+# 安装前复核最多从最新 tag 往下探多少个（见 :func:`Updater.assert_target_digest_current`）。
+# 只允许升级 → 正常情况第一次就命中；8 个是"旧页面上的候选"能容忍的纵深上限。
+MAX_DRIFT_PROBE_TAGS = 8
+
+# 发行包里目录文件/校验工具的名字。**目录不再参与判定**，但这两条路径还在用：
+# `--release-catalog` 的默认值与 `update-notes.json` 的同目录定位（发行包布局）。
+RELEASE_CATALOG_NAME = "releases.json"
 RELEASE_CATALOG_TOOL = "catalog.py"
-# 解析目标摘要时 `docker manifest inspect` 的超时（秒）。与 publish 的
-# `probe_registry_manifest` 同一个量级：registry 慢就慢在这条命令上，超时就当
-# 解析失败（fail closed），不能让状态刷新把主循环拖死。
-MANIFEST_INSPECT_TIMEOUT_SECONDS = 60.0
+# ``release_catalog`` 这个顶层键是**只读兼容**：目录不再被读取，所以它的 state 既
+# 不能写 "ok"（那是伪造"目录正常"），也不用旧码表的任何值——两边码表都不认
+# ``unused``，都按"未知"处理。
+RELEASE_CATALOG_UNUSED = "unused"
 # 「现在跑的是哪一版」只认这个 OCI 标注（`deploy/Dockerfile.api` 从
 # `LING_VERSION` 写进去，与 pyproject / `ling.__version__` 同源）。
 VERSION_LABEL = "org.opencontainers.image.version"
-CATALOG_STATE_OK = "ok"
-CATALOG_STATE_MISSING = "missing"
-CATALOG_STATE_INVALID = "invalid"
-# 状态文件里只放**固定码**：文案由 API 自己那份码表翻译（同失败码表的做法）。
-CATALOG_REASON_MISSING = "catalog_missing"
-CATALOG_REASON_UNREADABLE = "catalog_unreadable"
-CATALOG_REASON_INVALID = "catalog_invalid"
-CATALOG_REASON_SCHEMA = "catalog_schema_unsupported"
-CATALOG_REASON_TOOL_MISSING = "catalog_tool_missing"
-# 目录工具（deploy/release/catalog.py）的固定错误码 → 状态文件里的 reason。
-# 未列出的码一律 `catalog_invalid`：宁可说"目录不可信"，也不要漏一种畸形输入。
-CATALOG_REASON_BY_CODE = {
-    "not_found": CATALOG_REASON_MISSING,
-    "not_a_file": CATALOG_REASON_UNREADABLE,
-    "unreadable": CATALOG_REASON_UNREADABLE,
-    "too_large": CATALOG_REASON_UNREADABLE,
-    "unsafe_permissions": CATALOG_REASON_UNREADABLE,
-    "schema_unsupported": CATALOG_REASON_SCHEMA,
+
+# ---------------------------------------------------------------- 更新说明
+#
+# 说明**只是展示**，不参与"能不能更新"的判定。首选发行包自带那份
+# （``update-notes.json``，与 ``--release-catalog`` 同目录），它有就用；里面没有
+# latest 这一版时，可选再试 GitHub Release 的**精确 tag**（不用 releases/latest：
+# 那会把"最新发布"冒充成"你要装的那一版"）。
+NOTES_NAME = "update-notes.json"
+NOTES_STATE_OK = "ok"
+NOTES_STATE_MISSING = "missing"
+NOTES_STATE_INVALID = "invalid"
+# ``release_notes.reason`` 的固定码（文案由 API 自己那份码表翻译）。
+NOTES_REASON_TOOL_MISSING = "notes_tool_missing"
+NOTES_REASON_UNREADABLE = "notes_unreadable"
+NOTES_REASON_TOO_LARGE = "notes_too_large"
+NOTES_REASON_INVALID = "notes_invalid"
+NOTES_REASON_BY_CODE = {
+    "too_large": NOTES_REASON_TOO_LARGE,
+    "unreadable": NOTES_REASON_UNREADABLE,
 }
+# GitHub Release 的固定 endpoint（仓库固定；**不接受**请求方给 URL/仓库/tag）。
+RELEASE_NOTES_API_BASE = "https://api.github.com"
+RELEASE_NOTES_REPO = "qsbb/ling"
+# **只给测试用**的 API base 注入点（把请求指向本地 stub）。生产不设 → 上面那个。
+RELEASE_NOTES_API_ENV = "LING_UPDATER_RELEASE_API"
+# 取 Release 的超时（秒）与响应上限。它只影响"有没有说明"，卡住不能拖慢检查。
+RELEASE_NOTES_API_TIMEOUT_SECONDS = 5.0
+MAX_RELEASE_BODY_BYTES = 256 * 1024
+# 上限与 ``deploy/release/catalog.py`` 的 update-notes 门禁一致：一条摘要 ≤120 字，
+# 最多 8 条、每条 ≤120 字，URL ≤512 字符。**不是**为了"好看"，而是状态文件整个
+# 要压进 API 的 16 KiB 读取上限里。
+MAX_NOTE_ITEMS = 8
+MAX_NOTE_SUMMARY_CHARS = 120
+MAX_NOTE_ITEM_CHARS = 120
+MAX_NOTE_URL_CHARS = 512
+
+# 状态文件的读取上限：API 用 ``read_json_file`` 读 ``status.json``，硬上限是
+# ``MAX_JSON_BYTES = 16 KiB``（``src/ling/updates/protocol.py``，0.0.3 起就有）。
+# 超了不是"部分字段坏了"，而是**整份状态对 API 不可读**——所以在写之前给自己一个
+# 比它低的预算，留出余量。
+#
+# 当前上限下这份文件不会接近预算：一条最大说明（120 字摘要 + 8×120 字条目 +
+# 512 字符链接）加一份最大 task 视图，见 ``tests/test_updater.py`` 的
+# ``test_status_file_stays_under_the_api_read_limit``。
+# 预算是**兜底**：将来谁放宽条目上限或往状态里塞胖字段，这里会把更新内容丢掉，
+# 而不是让整份状态消失。
+STATUS_READ_LIMIT_BYTES = 16 * 1024
+STATUS_NOTES_BUDGET_BYTES = 12 * 1024
 # 目标不可用的原因（API 按自己那份码表翻译）。注意这里**没有** not_newer：
 # 版本不高于当前的目标根本不出现在 available_targets 里（只允许升级），而不是
 # 出现在列表里标成"不兼容"——否则页面会给出一个可以直接点降级的目标。
-INCOMPATIBLE_NOT_IN_MIN_FROM = "not_in_min_from"
+# ``not_in_min_from`` 随目录一起删除了（不再有版本跨度校验）。
 INCOMPATIBLE_CURRENT_VERSION_UNKNOWN = "current_version_unknown"
-INCOMPATIBLE_VERSION_UNCOMPARABLE = "version_uncomparable"
-# 目录里没有 digest 之后新出现的一种"不可用"：版本可用，但**摘要解析不出来**。
-# 只加这一个码，不为"命令非 0 / 没 manifests / 没有本机平台 / digest 格式不对"
-# 各开一个——对用户是同一件事：这条目标现在装不了，而且我们**不知道**该拉哪个摘要。
+# 版本可比较、确实更新，但**摘要解析不出来**：只这一个码，不为"tag 不存在 /
+# index 里没有本机平台 / digest 格式不对"各开一个——对用户是同一件事：这条目标
+# 现在装不了。
 INCOMPATIBLE_DIGEST_UNRESOLVED = "digest_unresolved"
+# 请求的目标摘要**不是**该 tag 现在指向的摘要（tag 被重推 / 用户拿的是过期候选）。
+# 安装前复核直接拒绝，绝不"按 tag 拉"。
+FAILURE_TARGET_DIGEST_DRIFT = "target_digest_drift"
+# 安装前需要重新问 registry，但这次没问成（不可达/限流/超时…）：无法证明就**不装**。
+FAILURE_REGISTRY_UNAVAILABLE = "registry_unavailable"
 
 EXIT_OK = 0
 EXIT_REJECTED = 2
@@ -357,6 +519,11 @@ FAILURE_TEXT = {
     "already_on_target": "请求的目标摘要与当前运行摘要相同，未执行任何操作",
     "duplicate_request": "该任务 ID 已处理过，不重复执行",
     "expected_current_mismatch": "当前运行 digest/提交与请求的期望当前值不一致，未执行任何操作",
+    # ``target_digest_drift`` / ``registry_unavailable`` 刻意**不**进这张表：
+    # 它们只可能在 ``new_task`` 之前抛出（复核不通过就没有任务），所以没有任何
+    # 任务视图会拿它们查文案；而这张表与 API 侧 ``IMAGE_FAILURE_MESSAGES`` 由
+    # ``test_failure_code_tables_match_api_side`` 强制逐字一致——API 那边还没有这两个
+    # 码，先加在这里只会把一条跨侧一致性用例打红。API 侧落地这两个码时，两边一起加。
     "preflight_failed": "预检未通过，未做任何变更",
     "maintenance_gate_failed": "维护门禁的临时 compose 未通过校验，未做任何变更",
     "pull_failed": "拉取镜像或镜像身份复核失败，未进入迁移",
@@ -504,15 +671,20 @@ def load_publish(path: Path) -> ModuleType:
 
 
 def load_catalog_tool(path: Path) -> ModuleType:
-    """按**文件路径**加载发行包里的 ``catalog.py``（发布目录的校验/排序工具）。
+    """按**文件路径**加载发行包里的 ``catalog.py``（现在只用它校验更新说明）。
 
     与 :func:`load_publish` 同一个做法、同一个理由：更新器用的必须是**操作员装的
     那份代码**（信任锚），不是 site-packages 里的同名模块，也不是自己另写一套
     校验——两套规则迟早会不一致，而不一致的那一份就是后门。
 
-    加载失败**不**在启动时退出：目录不可用只影响"有没有可用目标"，不该让更新器
-    连状态都不写（网页会因此看不到任何解释）。这里返回 None，由
-    :func:`read_release_catalog` 记 ``catalog_tool_missing``。
+    **目录不再参与更新判定**（版本的唯一事实源是 GHCR，见模块 docstring），所以
+    这个模块现在只提供 ``parse_notes``/``load_notes``：``update-notes.json`` 的
+    结构/长度/URL 门禁。目录解析与 ``min_from`` 校验代码暂时留在发行包里（桥接期
+    旧更新器还要用），但更新器不再调用它们。
+
+    加载失败**不**在启动时退出：没有更新说明只影响"这一版改了什么"，不该让更新器
+    连状态都不写。这里返回 None，由 :func:`read_release_notes` 记
+    ``notes_tool_missing``。
     """
     if not path.is_file():
         return None
@@ -527,7 +699,7 @@ def load_catalog_tool(path: Path) -> ModuleType:
     except Exception:  # noqa: BLE001 - 加载失败按"目录不可用"处理，不静默降级成放行
         sys.modules.pop(spec.name, None)
         return None
-    required = ("SCHEMA", "CatalogError", "load_catalog", "version_key")
+    required = ("parse_notes", "load_notes")
     if any(not hasattr(module, name) for name in required):
         return None
     return module
@@ -745,12 +917,13 @@ class Config:
     backup_dir: Path
     backup_script: Path
     publish_py: Path
-    # 可信发布目录的数据文件与它的**校验工具**分开：
-    # - 代码永远来自发行包（``<publish-py 所在目录>/catalog.py``，信任锚）；
-    # - 数据路径可由 ``--release-catalog`` 覆盖（默认 ``<publish-py>/../../
-    #   releases.json``，容器里就是 /srv/ling-code/releases.json），
-    #   这样离线演练/测试可以用一份自己的目录而不动发行包。
+    # 发行包里 ``releases.json`` 的路径。**目录已经不被读取**：这个路径现在只用来
+    # 定位同目录的 ``update-notes.json``（更新说明），并保留发行包的目录布局。
+    # 数据路径可由 ``--release-catalog`` 覆盖（默认 ``<publish-py>/../../
+    # releases.json``，容器里就是 /srv/ling-code/releases.json）。
     release_catalog: Path
+    # 发行包里的 ``catalog.py``（按文件路径加载，信任锚来自"操作员装的那份代码"）。
+    # 现在只用它的 ``parse_notes``/``load_notes`` 校验更新说明。
     catalog_tool: Path
     project: str
     poll_seconds: float
@@ -760,30 +933,18 @@ class Config:
     backup_timeout: float
     once: bool
     acknowledge: str
-    # 可选的联网目录地址（``--catalog-url`` / ``LING_UPDATER_CATALOG_URL``）。
-    #
-    # ## 为什么需要它
-    #
-    # 目录文件是随发行包交付、只读挂载的，而升级流程只换 app 镜像、不动更新器
-    # 自己。于是宿主上那份目录永远停在安装时的版本：升到 0.0.3 之后里面没有
-    # 0.0.4，下次发版网页更新照旧「暂无可用的更新目标」——一键更新只能成功
-    # **一次**，之后每次都得人工换更新器镜像。
-    #
-    # 打开这个地址后，更新器先从它取目录（仍然交给发行包的 ``catalog.py``
-    # 做同一套严格校验），取不到再退回本地那份。
-    #
-    # ## 默认指向本仓库 main
-    #
-    # 这等于把「谁能改这个仓库的 main」当成升级授权依据。更新器无凭据，它没法
-    # 验证"这是 owner 批准的"，只能验证 HTTPS 连到了 GitHub——这是这套机制真实
-    # 的信任边界，写在这里而不是含糊过去。
-    #
-    # 取的是**仓库里那份经 CI 校验的结构化 JSON**，不是 Release 正文（正文是
-    # 自由格式 Markdown、可事后编辑，而这份文件每次提交都走 catalog.py 门禁）。
-    #
-    # 页面更新只有这一种方式，所以这里直接给默认值，不做成"可关闭开关"。
-    #
-    catalog_url: str | None
+    # **没有** registry/镜像名/tag 的配置项：发现目标固定是
+    # ``ghcr.io/qsbb/ling-api``（见模块 docstring「版本从哪来」）。请求方
+    # （网页/API/请求文件）无法影响它，配置也不能——否则"registry 地址"就变成
+    # 新的信任面，而它本来只是一个常量。测试通过
+    # ``registry.REGISTRY_ENV``（``LING_UPDATER_REGISTRY``）把 base URL 指到本地
+    # stub，生产不设这个变量。
+
+    # 「检查更新」限流窗口（秒）：请求触发的刷新在窗口内最多真正处理一次，
+    # 多余的请求文件直接删掉（``release_check.reason_detail="throttled"``，
+    # **不改** ``state``）。自动刷新（启动/周期）**不**计入这个窗口——否则一次
+    # 启动就会把用户刚点的检查吃掉。
+    refresh_throttle_seconds: float
 
 
 def _env(name: str, default: str = "") -> str:
@@ -849,24 +1010,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="发行包里的 deploy/release/publish.py（只读挂载）",
     )
     parser.add_argument(
-        "--catalog-url",
-        # 未设置 -> 默认地址。显式设空串 -> 不联网，仅供测试隔离（测试套件
-        # 不该依赖公网）。`os.environ.get` 的三态行为正好符合：键不存在取默认，
-        # 键存在（哪怕是空串）就用那个值。
-        default=os.environ.get("LING_UPDATER_CATALOG_URL", DEFAULT_CATALOG_URL),
-        help=(
-            "联网目录地址（https）。默认取本仓库 main 那份经 CI 校验的 "
-            "releases.json；取不到时退回本地那份。"
-        ),
-    )
-    parser.add_argument(
         "--release-catalog",
         default=_env("LING_UPDATER_RELEASE_CATALOG"),
         help=(
-            "可信发布目录数据文件（默认 <publish-py 的上级目录>/../releases.json，"
-            "容器里就是 /srv/ling-code/releases.json）；校验工具固定从 "
-            "<publish-py 所在目录>/catalog.py 加载"
+            "发行包里 releases.json 的路径（默认 <publish-py 的上级目录>/../"
+            "releases.json，容器里就是 /srv/ling-code/releases.json）。"
+            "**目录已不参与更新判定**：这个路径现在只用来定位同目录的 "
+            "update-notes.json（更新说明）与发行包布局核对。"
         ),
+    )
+    parser.add_argument(
+        "--refresh-throttle-seconds",
+        type=float,
+        default=float(_env("LING_UPDATER_REFRESH_THROTTLE_SECONDS", "10")),
+        help="请求触发的刷新限流窗口秒数（默认 10；窗口内多余的请求直接丢弃）",
     )
     parser.add_argument(
         "--poll-seconds",
@@ -911,6 +1068,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def local_notes_path(cfg: Config) -> Path:
+    """发行包里那份更新说明：与 ``releases.json`` **同目录**（容器里 /srv/ling-code/）。
+
+    为什么还用 ``--release-catalog`` 的路径定位：发行包的目录布局没变（README/
+    Dockerfile 都把它当"deploy 目录"），换一个独立路径参数只会多一个要同步的挂载
+    点。它指向的文件本身**不读**。
+    """
+    return cfg.release_catalog.parent / NOTES_NAME
+
+
 def parse_config(argv: Sequence[str] | None) -> Config:
     args = build_parser().parse_args(argv)
     missing = [
@@ -940,6 +1107,7 @@ def parse_config(argv: Sequence[str] | None) -> Config:
         ("--health-timeout", args.health_timeout),
         ("--migrate-timeout", args.migrate_timeout),
         ("--backup-timeout", args.backup_timeout),
+        ("--refresh-throttle-seconds", args.refresh_throttle_seconds),
     ):
         if value <= 0:
             raise UpdaterError(
@@ -976,8 +1144,11 @@ def parse_config(argv: Sequence[str] | None) -> Config:
             if catalog_raw
             else publish_py.parent.parent / RELEASE_CATALOG_NAME
         ),
+        # 发行包里的 ``catalog.py``：现在只用它校验 ``update-notes.json``
+        # （``parse_notes``/``load_notes``）。目录解析/校验代码还在，但更新器不再
+        # 依赖它。
         catalog_tool=publish_py.parent / RELEASE_CATALOG_TOOL,
-        catalog_url=args.catalog_url.strip() or None,
+        refresh_throttle_seconds=args.refresh_throttle_seconds,
         project=args.project,
         poll_seconds=args.poll_seconds,
         ready_timeout=args.ready_timeout,
@@ -1464,16 +1635,116 @@ def backup_gate(cfg: Config, pub: ModuleType) -> dict[str, Any]:
     return _manifest_gate(manifest, pub)
 
 
-def release_catalog_block(
-    state: str, reason: str | None, entries: int, current_version: str | None
-) -> dict[str, Any]:
-    """``status.json`` 顶层 ``release_catalog``（**只放码与计数**，不放文案/路径）。"""
+def utc_now_text() -> str:
+    """状态文件里的 UTC 时间戳（秒级、``Z`` 结尾，与 ``publish.utc_now`` 同形）。
+
+    只用于状态文件的"什么时候"字段（``release_check.checked_at`` 等）：形状固定、
+    可比对，不是给人看的文案。
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def release_catalog_block(current_version: str | None, checked_at: str) -> dict[str, Any]:
+    """``status.json`` 顶层 ``release_catalog``（**只读兼容**，不再读目录）。
+
+    为什么还要写这个键：仍在跑 0.0.3 的 API 会读它。但目录已经**不参与**任何判定，
+    所以**不能**写 ``state="ok"``（那是伪造"目录正常"，设计 §7 明令禁止），也
+    不该留旧码表的 ``missing``/``invalid``（那会把"我们改成了 registry"说成"目录
+    坏了"）。``unused`` 是两边码表都不认的值 → 都按"未知"处理，既不崩也不撒谎。
+    """
     return {
-        "state": state,
-        "reason": reason,
-        "entries": entries,
+        "state": RELEASE_CATALOG_UNUSED,
+        "reason": None,
+        "entries": 0,
         "current_version": current_version,
+        "source": RELEASE_CHECK_SOURCE,
+        "checked_at": checked_at,
     }
+
+
+def release_check_block(
+    *,
+    state: str,
+    checked_at: str | None,
+    check_id: str | None,
+    reason: str | None,
+    reason_detail: str | None,
+    current: dict[str, Any],
+    latest: dict[str, Any] | None,
+    tag_count: int,
+) -> dict[str, Any]:
+    """``status.json`` 顶层 ``release_check``：**版本发现的唯一事实来源**。
+
+    只放固定码与实测值：``state`` 三值、8 个原因码、当前/最新版本与摘要、tag 计数。
+    没有主机名、没有 URL、没有异常原文（那些只进私有日志）。
+
+    ``latest`` 为 ``null`` 的条件是"这次没解析出最新版"（失败、或只有预发布）——
+    它与 ``state`` 一起被 API 读：``state=ok`` 且 ``latest=None`` 在语义上不可能
+    （``no_stable_tags`` 就是 ``failed``），所以两者不会互相矛盾。
+    """
+    normalized_state = (
+        state if state in (RELEASE_CHECK_OK, RELEASE_CHECK_FAILED, RELEASE_CHECK_UNKNOWN)
+        else RELEASE_CHECK_UNKNOWN
+    )
+    normalized_reason = reason if reason in RELEASE_CHECK_REASONS else None
+    normalized_id = (
+        check_id
+        if isinstance(check_id, str) and REQUEST_ID_RE.fullmatch(check_id)
+        else None
+    )
+    normalized_latest: dict[str, Any] | None = None
+    if isinstance(latest, dict):
+        version = latest.get("version")
+        version_key = _semver_key(version) if isinstance(version, str) else None
+        if version_key is not None:
+            normalized_latest = {
+                "version": version,
+                "digest": _registry_digest(latest.get("digest")),
+                # registry 的 tag 列表不带提交号：拉取后由 publish 用镜像标注核
+                # `LING_COMMIT == OCI revision`。这里**不猜**。
+                "commit": None,
+            }
+    return {
+        "state": normalized_state,
+        "checked_at": checked_at if isinstance(checked_at, str) else None,
+        "check_id": normalized_id,
+        "source": RELEASE_CHECK_SOURCE,
+        "reason": normalized_reason,
+        "reason_detail": reason_detail if isinstance(reason_detail, str) else None,
+        "current": {
+            "version": _semver_text(current.get("version")),
+            "digest": _registry_digest(current.get("digest")),
+        },
+        "latest": normalized_latest,
+        "tag_count": max(0, int(tag_count)),
+    }
+
+
+def _semver_key(value: str | None) -> tuple[int, int, int] | None:
+    """``"0.0.4"`` -> ``(0, 0, 4)``；不是**规范化**的严格 semver 就返回 None。
+
+    复用 registry 客户端的 tag 规则（``v`` 前缀 + 无前导零）：版本号在状态文件里
+    只有一种写法，比较才不会出现 ``0.0.04`` 与 ``0.0.4`` 这种等价物。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    return registry.stable_version(f"v{value}")
+
+
+def _semver_text(value: object) -> str | None:
+    """当前版本只允许**严格 semver** 进状态文件；其它（含空串）一律 null。"""
+    if not isinstance(value, str):
+        return None
+    key = _semver_key(value)
+    return None if key is None else registry.version_text(key)
+
+
+def _registry_digest(value: object) -> str | None:
+    """registry 的摘要形状（``sha256:<64 位小写 hex>``），其它一律 null。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if registry.DIGEST_RE.fullmatch(text) else None
 
 
 def docker_runner(pub: ModuleType) -> Any:
@@ -1490,7 +1761,7 @@ def docker_runner(pub: ModuleType) -> Any:
 def _docker_json_object(runner: Any, argv: Sequence[str]) -> dict[str, Any] | None:
     """跑一条**只读** docker 命令，取 JSON 数组里的第一个对象；任何异常都返回 None。
 
-    调用方一律按"读不到"处理（当前版本未知 / 摘要解析失败）：这里不是唯一定义
+    调用方一律按"读不到"处理（当前版本未知 / 当前摘要未知）：这里不是唯一定义
     错误的地方，任何一条读不出来都不该让更新器崩，也不该让它猜。
     """
     result = runner.run(list(argv))
@@ -1505,19 +1776,22 @@ def _docker_json_object(runner: Any, argv: Sequence[str]) -> dict[str, Any] | No
     return data[0]
 
 
-def current_running_version(cfg: Config, runner: Any) -> str | None:
-    """读**运行中 api 容器**所用镜像的 ``org.opencontainers.image.version`` 标注。
+def current_running_image(
+    cfg: Config, pub: ModuleType, runner: Any
+) -> tuple[str | None, str | None]:
+    """读**运行中 api 容器**所用镜像的 ``(version, digest)``。
 
-    为什么是这条路径（而不是读 ``.env`` 的摘要去目录里反查）：目录里**已经没有
-    digest**，"摘要 ↔ 版本"的映射不存在。而「现在跑的是哪一版」本来就有实测答案
-    ——运行中的容器的镜像标注。命令序列与 publish 的
-    ``inspect_previous_containers`` 完全一致（``docker ps`` 按 compose 标签找唯一
-    容器 → ``docker inspect --type container`` 拿 image ID → ``docker image
-    inspect`` 读标注），只是这里只读、只关心 api。
+    ``version`` 来自 ``org.opencontainers.image.version`` 标注，``digest`` 来自同一
+    镜像的 ``RepoDigests``（``sha256:<hex>`` 形状）。为什么不从 ``.env`` 的
+    ``LING_APP_IMAGE`` 反查：它可以被手改、也可能改了还没重建容器；运行中的容器
+    本来就是"现在到底跑的是哪一版"的实测事实。命令序列与 publish 的
+    ``inspect_previous_containers`` 一致（``docker ps`` 按 compose 标签找唯一容器 →
+    ``docker inspect --type container`` 拿 image ID → ``docker image inspect`` 读
+    标注），只是这里只读、只关心 api。
 
-    任何一个环节不成立都返回 None（→ 调用方按 ``current_version_unknown`` 处理，
-    所有目标不兼容）：0 个/多个 api 容器、容器不在 running、镜像没标注、标注是
-    空串。**不**退回 ``.env``、**不**猜。
+    任何一个环节不成立都返回 ``(None, None)``（→ 调用方按"当前版本未知"处理，
+    目标不兼容）：0 个/多个 api 容器、容器不在 running、镜像没标注、标注不是严格
+    semver。**不**退回 ``.env``、**不**猜。
     """
     listed = runner.run(
         [
@@ -1532,296 +1806,319 @@ def current_running_version(cfg: Config, runner: Any) -> str | None:
         ]
     )
     if listed.returncode != 0:
-        return None
+        return None, None
     rows = [line for line in listed.stdout.splitlines() if line.strip()]
     if len(rows) != 1:
-        return None
+        return None, None
     fields = rows[0].split("|")
     if len(fields) != 3 or fields[2].strip() != "running":
-        return None
+        return None, None
     container = _docker_json_object(
         runner, ["docker", "inspect", "--type", "container", fields[0].strip()]
     )
     if container is None:
-        return None
+        return None, None
     image_id = container.get("Image")
     if not isinstance(image_id, str) or not image_id:
-        return None
+        return None, None
     image = _docker_json_object(runner, ["docker", "image", "inspect", image_id])
     if image is None:
-        return None
+        return None, None
     config = image.get("Config")
     labels = config.get("Labels") if isinstance(config, dict) else None
-    if not isinstance(labels, dict):
-        return None
-    version = labels.get(VERSION_LABEL)
-    return version if isinstance(version, str) and version.strip() else None
-
-
-def resolve_target_digest(
-    pub: ModuleType, runner: Any, version: str, host_arch: str
-) -> str | None:
-    """把 ``v<version>`` 这个 tag 在 registry 上解析成**本机平台**的镜像摘要。
-
-    ``docker manifest inspect`` 打的是 tag 上的 index（多架构清单）；``manifests[]``
-    里每条是某个平台的 manifest，各带自己的 ``digest``。取 ``os=linux`` 且
-    ``architecture=<宿主架构>`` 的那条，拼成
-    ``ghcr.io/qsbb/ling-api@sha256:<64 hex>``。
-
-    为什么取**平台** digest 而不是 index digest：见模块 docstring 末段（``docker
-    manifest inspect`` 的输出里没有 index 自己的摘要，而 buildx 那条路在只读根 +
-    非 root + 无 HOME 的更新器容器里不可靠）。这个值正是 publish 的
-    ``target_platform_digest``，``verify_repo_digests`` 本来就接受它。
-
-    以下情况全部返回 None（调用方记 ``digest_unresolved``，绝不顶替）：
-    命令非 0 / 输出不是 JSON 对象 / 顶层没有 ``manifests``（单架构 manifest，
-    它的摘要不在文档里）/ 没有匹配本机平台的那条 / digest 拼出来不过
-    ``DIGEST_RE``。格式校验不另立一套：发行包的 ``DIGEST_RE`` 就是协议接受的那个
-    形状，拉取后 publish 还会再核一遍。
-    """
-    ref = f"{pub.IMAGE_REPOSITORY}:v{version}"
-    result = runner.run(
-        ["docker", "manifest", "inspect", ref], timeout=MANIFEST_INSPECT_TIMEOUT_SECONDS
+    version = labels.get(VERSION_LABEL) if isinstance(labels, dict) else None
+    digest: str | None = None
+    for reference in image.get("RepoDigests") or []:
+        match = pub.DIGEST_RE.fullmatch(str(reference))
+        if match is not None:
+            digest = f"sha256:{match.group(1)}"
+            break
+    return (
+        version if isinstance(version, str) and version.strip() else None,
+        digest,
     )
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout)
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    manifests = data.get("manifests")
-    if not isinstance(manifests, list):
-        return None
-    for item in manifests:
-        if not isinstance(item, dict):
-            continue
-        platform = item.get("platform")
-        if not isinstance(platform, dict):
-            continue
-        if platform.get("os") != "linux" or platform.get("architecture") != host_arch:
-            continue
-        digest = item.get("digest")
-        if not isinstance(digest, str):
-            return None
-        image_ref = f"{pub.IMAGE_REPOSITORY}@{digest}"
-        if pub.DIGEST_RE.fullmatch(image_ref) is None:
-            return None
-        return image_ref
-    return None
 
 
-def _digest_resolver(pub: ModuleType, runner: Any) -> Callable[[str], str | None]:
-    """构造「版本 -> 本机平台摘要」的解析器；宿主架构只问一次（多条目标共用）。
-
-    宿主架构走 :func:`daemon_arch`（docker daemon 自报，拿不到才退回进程架构）：
-    它与 ``publish.Options.host_arch`` 是同一个来源，拉取后的平台复核才对得上。
-    延迟到第一次真正要解析时才探测——没有兼容目标的那次刷新不该白问一次 daemon。
-    """
-    arch: str | None = None
-
-    def resolve(version: str) -> str | None:
-        nonlocal arch
-        if arch is None:
-            arch = daemon_arch(pub)
-        return resolve_target_digest(pub, runner, version, arch)
-
-    return resolve
-
-
-def release_targets(
-    tool: ModuleType | None,
-    catalog: dict[str, Any] | None,
+def registry_targets(
+    pub: ModuleType,
     current_version: str | None,
-    resolve_digest: Callable[[str], str | None] | None = None,
+    latest_version: str | None,
+    latest_digest: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """把目录投影成"可用目标"列表 + 推荐目标（供状态文件与网页使用）。
+    """把「一次 registry 检查的结论」投影成旧形状的目标列表 + 推荐目标。
 
-    规则（与模块 docstring 一致，且**不依赖文件顺序**）：
+    规则（**只允许升级**，与模块 docstring 一致）：
 
-    1. 目标 ``version`` 必须**严格大于**当前版本，否则该条**不出现**（不提供降级）；
-    2. 当前版本必须在该目标的 ``min_from`` 里，否则 ``compatible=false`` + 原因；
-    3. 当前版本未知 -> 所有条目 ``compatible=false`` + ``current_version_unknown``；
-    4. 兼容目标还要**现场解析摘要**（``resolve_digest``）：目录里没有 digest 了，
-       解析不出来 → ``compatible=false`` + ``digest_unresolved``；所以
-       ``compatible=True`` 的目标**一定**带 digest；
-    5. ``recommended`` = 版本最大的**兼容**目标（没有则 None）。
+    1. 没有最新版（这次没查到 / 没有稳定 tag）→ 空列表，绝不编一个；
+    2. 当前版本未知 → 有最新版也 ``compatible=false`` +
+       ``current_version_unknown``（不能证明"比当前新"，就不许装）；
+    3. 最新版**不高于**当前版本 → 该条**不出现**（不提供降级、也不提供"重装");
+    4. 摘要为空 → ``compatible=false`` + ``digest_unresolved``；
+    5. ``has_migration`` 恒 ``true``：迁移是前向的，更新入口总会跑 migrate，
+       不再由任何发布目录人工开关决定。
 
-    不兼容的目标 ``digest`` 是 ``None``：既然不会被推荐，就没必要为它打一次
-    registry（每次刷新都要打）；而 API 侧的白名单投影本来就会丢掉没有合法 digest
-    的条目——所以这些条目只出现在更新器自己的 status.json 里（带原因码），不影响
-    页面：前端只消费 ``target`` / ``recommended_target``。
-
-    目录缺失/不可用时 ``catalog`` 是 None，结果同样是空列表——"没有可用目标"，
-    绝不是"随便给一个"。
+    只放**最新**这一版：其它 tag 的 digest 没有解析（每个都要打一次 registry），
+    把它们列出来只会是一串"版本在、摘要取不到"的假失败。
     """
-    if tool is None or catalog is None:
+    if latest_version is None:
         return [], None
-    releases = [entry for entry in catalog.get("releases", []) if isinstance(entry, dict)]
-
-    def sort_key(entry: dict[str, Any]) -> tuple[Any, ...]:
-        try:
-            return tool.version_key(entry["version"])
-        except Exception:  # noqa: BLE001 - 目录已校验过；兜底成"排最后"，绝不猜
-            return (1 << 62,)
-
-    ordered = sorted(releases, key=sort_key)
-    current_key: tuple[Any, ...] | None = None
-    if current_version is not None:
-        try:
-            current_key = tool.version_key(current_version)
-        except Exception:  # noqa: BLE001 - 当前版本不可比较 -> 当作未知
-            current_key = None
-    targets: list[dict[str, Any]] = []
-    recommended: dict[str, Any] | None = None
-    for entry in ordered:
-        try:
-            key: tuple[Any, ...] | None = tool.version_key(entry["version"])
-        except Exception:  # noqa: BLE001
-            key = None
-        if current_key is not None and key is not None and key <= current_key:
-            # 只允许升级：同版本/更旧的目标不是"可用目标"，直接不出现。
-            continue
-        digest: str | None = None
-        if current_key is None:
-            compatible = False
-            reason: str | None = INCOMPATIBLE_CURRENT_VERSION_UNKNOWN
-        elif key is None:
-            compatible = False
-            reason = INCOMPATIBLE_VERSION_UNCOMPARABLE
-        elif current_version not in entry.get("min_from", ()):
-            compatible = False
-            reason = INCOMPATIBLE_NOT_IN_MIN_FROM
-        else:
-            compatible = True
-            reason = None
-        if compatible:
-            digest = resolve_digest(entry["version"]) if resolve_digest is not None else None
-            if digest is None:
-                # 版本可用、摘要解析不出来：只有这一条码（见常量处说明）。
-                compatible = False
-                reason = INCOMPATIBLE_DIGEST_UNRESOLVED
-        target = {
-            "version": entry["version"],
-            "digest": digest,
-            "commit": entry["commit"],
-            "has_migration": entry["has_migration"],
-            "compatible": compatible,
-            "incompatible_reason": reason,
+    latest_key = _semver_key(latest_version)
+    if latest_key is None:
+        return [], None
+    reference = (
+        f"{pub.IMAGE_REPOSITORY}@{latest_digest}"
+        if latest_digest is not None
+        and pub.DIGEST_RE.fullmatch(f"{pub.IMAGE_REPOSITORY}@{latest_digest}")
+        else None
+    )
+    current_key = _semver_key(current_version)
+    if current_key is None:
+        compatible, reason = False, INCOMPATIBLE_CURRENT_VERSION_UNKNOWN
+    elif latest_key <= current_key:
+        # 只允许升级：同版本/更旧的目标不是"可用目标"，直接不出现。
+        return [], None
+    else:
+        compatible = reference is not None
+        reason = None if compatible else INCOMPATIBLE_DIGEST_UNRESOLVED
+    target = {
+        "version": latest_version,
+        "digest": reference,
+        "commit": None,
+        "has_migration": True,
+        "compatible": compatible,
+        "incompatible_reason": reason,
+    }
+    recommended = (
+        None
+        if not compatible
+        else {
+            "version": target["version"],
+            "digest": target["digest"],
+            "commit": target["commit"],
+            "has_migration": target["has_migration"],
         }
-        targets.append(target)
-        if compatible:
-            recommended = {
-                "version": target["version"],
-                "digest": target["digest"],
-                "commit": target["commit"],
-                "has_migration": target["has_migration"],
-            }
-    return targets, recommended
+    )
+    return [target], recommended
 
 
-def _load_catalog_bytes(cfg: Config, tool: ModuleType) -> dict[str, Any]:
-    """取目录：配了 ``catalog_url`` 就先联网取，取不到再读本地那份。
+def read_release_check(
+    cfg: Config, pub: ModuleType, runner: Any | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+    """查一次更新 → ``(release_check, available_targets, recommended_target)``。
 
-    联网取回的内容**不落盘**，直接交给发行包的 ``tool.parse_catalog()``
-    校验——和本地那份走**同一套**门禁（schema、digest 格式、commit 格式、
-    min_from、semver）。这里不新增任何校验规则：多一套规则只会多一处会和
-    ``catalog.py`` 走散的地方。
+    顺序：先读**本机事实**（运行中 api 镜像的版本/摘要），再问 registry。这样即使
+    这次查不到新版，状态里仍然有"当前跑的是哪一版"（页面不会连这个都说不出来）。
 
-    联网失败**不是错误**：退回本地那份，行为与没配这个地址时完全一样。
-    部署机上的更新器本来就带着一份（可能过期的）本地目录，能升到哪儿就
-    升到哪儿，总比整条通道变红好。
+    任何失败都收敛成固定的 ``state``/``reason`` 码（**不**把异常文本、主机名写进
+    状态文件），并且 ``available_targets=[]``：宁可明说"这次查不到"，也不要静默、
+    也不要拿上一次的缓存冒充这次的结果。
+
+    这个函数**会碰 Docker**（只读）与网络：``docker ps`` / ``inspect`` /
+    ``image inspect`` 读当前版本，``docker info`` 读宿主架构，再加 1~3 次 registry
+    请求。调用方按 5 分钟节流（见 :meth:`StatusWriter.refresh_release_check_if_due`），
+    不要放进 5 秒的主轮询里。
     """
-    url = (cfg.catalog_url or "").strip()
-    if url:
-        raw = _fetch_catalog_bytes(url)
-        if raw is not None:
-            try:
-                return tool.parse_catalog(raw)
-            except Exception:  # noqa: BLE001
-                # 远程那份格式坏了（例如仓库里一次写错的提交）也**退回本地**。
-                # 不接这一层的话，一次坏提交会让整条更新通道变红——本地那份
-                # 好的目录反而不被使用，而用户只是想在网页上点一下更新。
-                # 坏内容本身不会被采信：校验仍然先跑，只是失败后换了来源。
-                pass
-    return tool.load_catalog(cfg.release_catalog)
+    docker = runner if runner is not None else docker_runner(pub)
+    version, digest = current_running_image(cfg, pub, docker)
+    current = {"version": _semver_text(version), "digest": digest}
+    try:
+        client = registry.RegistryClient()
+        listing = client.stable_tags()
+        latest = listing.latest_version
+        if latest is None:  # pragma: no cover - stable_tags 保证非空
+            raise registry.RegistryError(registry.REASON_NO_STABLE_TAGS, "没有稳定 tag")
+        manifest = client.manifest_digest(latest, host_arch=daemon_arch(pub))
+    except registry.RegistryError as error:
+        block = release_check_block(
+            state=RELEASE_CHECK_FAILED,
+            checked_at=utc_now_text(),
+            check_id=None,
+            reason=error.code,
+            reason_detail=None,
+            current=current,
+            latest=None,
+            tag_count=0,
+        )
+        return block, [], None
+    block = release_check_block(
+        state=RELEASE_CHECK_OK,
+        checked_at=utc_now_text(),
+        check_id=None,
+        reason=None,
+        reason_detail=None,
+        current=current,
+        latest={"version": latest, "digest": manifest.digest, "commit": None},
+        tag_count=listing.count,
+    )
+    targets, recommended = registry_targets(
+        pub, current["version"], latest, manifest.digest
+    )
+    return block, targets, recommended
 
 
-def _fetch_catalog_bytes(url: str) -> bytes | None:
-    """取回目录字节；取不到返回 ``None``（让调用方退回本地那份）。
+# ---------------------------------------------------------------- 更新说明
 
-    只用标准库：更新器容器里没有 HTTP 客户端依赖，它连查注册表都靠 docker
-    CLI，为这一个 GET 引第三方库不值得。
 
-    这里**不做校验**：取回来是什么就交给上层解析。要收紧的话再往这里加，
-    但先把链路跑通——校验加早了，出问题时反而分不清是网络坏了还是内容不合规。
+def _notes_api_base() -> str:
+    """GitHub API 的 base URL：生产固定 ``https://api.github.com``。
+
+    ``LING_UPDATER_RELEASE_API`` 只给测试把请求指到本地 stub（与 registry 的注入点
+    同一条纪律：不接受请求方给 URL）。
+    """
+    injected = os.environ.get(RELEASE_NOTES_API_ENV, "").strip().rstrip("/")
+    return injected or RELEASE_NOTES_API_BASE
+
+
+def _fetch_json(url: str, *, timeout: float) -> Any | None:
+    """GET 一个 JSON（**只**用于 GitHub Release）；任何失败都返回 ``None``。
+
+    只用标准库：更新器镜像很小，为一个可选的展示请求引 HTTP 客户端不值得。
+    失败**不影响** ``release_check``：说明是锦上添花（设计 §5）。
     """
     import urllib.error
     import urllib.request
 
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("User-Agent", f"ling-updater/{UPDATER_VERSION}")
     try:
-        with urllib.request.urlopen(url, timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as response:
-            return response.read()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(MAX_RELEASE_BODY_BYTES)
     except (urllib.error.URLError, OSError, ValueError):
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         return None
 
 
-def read_release_catalog(
-    cfg: Config, pub: ModuleType, tool: ModuleType | None, runner: Any | None = None
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
-    """读目录 -> ``(block, available_targets, recommended_target)``。
+def _note_line(value: object, limit: int) -> str | None:
+    """一段发布文案：折成单行、去掉控制字符、按字数截断（不吐半句 markdown）。"""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    text = "".join(char for char in text if char.isprintable())
+    text = text.strip()
+    if not text:
+        return None
+    return text[:limit]
 
-    任何失败都收敛成固定的 ``state``/``reason`` 码（**不**把异常文本、路径写进
-    状态文件），并且 ``available_targets=[]``：宁可明说"没有可用目标"，也不要
-    静默或假装有目标。
 
-    这个函数**会碰 Docker**（只读）：当前版本要读运行中 api 镜像的标注，兼容目标
-    要 ``docker manifest inspect`` 现场解析摘要。调用方按 5 分钟节流（见
-    ``StatusWriter.refresh_release_catalog_if_due``），不要放进 5 秒的主轮询里。
-    目录本身读不出来时**一条 Docker 调用都不发**（先解析、后问 Docker）：目录都
-    不可信了，没有任何版本/摘要值得去问。
+def _release_body_note(body: object) -> tuple[str | None, list[str]]:
+    """把 Release 正文压成 ``(summary, items)``：首行当摘要，列表项当条目。
+
+    **不改写、不总结、不加重要程度**：这是发布方原话（设计 §附「文案纪律」）。
+    只做折行归一、长度上限与条目数上限——超限的那条按字数截断，不整条丢掉
+    （整条丢掉会让"他写了但页面没有"变成新的困惑）。
     """
-    if tool is None:
-        empty = release_catalog_block(
-            CATALOG_STATE_INVALID, CATALOG_REASON_TOOL_MISSING, 0, None
-        )
-        return empty, [], None
+    summary: str | None = None
+    items: list[str] = []
+    if not isinstance(body, str):
+        return None, items
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("#", "```", "|")):
+            continue
+        is_bullet = stripped[0] in "-*+"
+        text = _note_line(stripped.lstrip("-*+> \t"), MAX_NOTE_ITEM_CHARS)
+        if text is None:
+            continue
+        if is_bullet:
+            if len(items) >= MAX_NOTE_ITEMS:
+                continue
+            items.append(text)
+        elif summary is None:
+            summary = _note_line(text, MAX_NOTE_SUMMARY_CHARS)
+    return summary, items
+
+
+def github_release_note(version: str) -> dict[str, Any] | None:
+    """读 ``v<version>`` 这个**精确 tag** 的 GitHub Release；取不到返回 ``None``。
+
+    为什么不用 ``releases/latest``：那会把"最近一次发布"冒充成"你要装的这一版"。
+    草稿/预发布不算（我们只发稳定版）。正文与链接只作展示，不参与任何判定。
+    """
+    payload = _fetch_json(
+        f"{_notes_api_base()}/repos/{RELEASE_NOTES_REPO}/releases/tags/v{version}",
+        timeout=RELEASE_NOTES_API_TIMEOUT_SECONDS,
+    )
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("draft") is True or payload.get("prerelease") is True:
+        return None
+    summary, items = _release_body_note(payload.get("body"))
+    url = _note_line(payload.get("html_url"), MAX_NOTE_URL_CHARS)
+    if url is not None and not url.startswith("https://"):
+        url = None
+    if summary is None and not items:
+        return None
+    return {"summary": summary, "items": items, "url": url}
+
+
+def _local_notes(
+    cfg: Config, pub: ModuleType, tool: ModuleType | None
+) -> tuple[str, str | None, dict[str, Any]]:
+    """读发行包里那份 ``update-notes.json`` → ``(state, reason, notes)``。"""
+    if tool is None or not hasattr(tool, "parse_notes") or not hasattr(tool, "load_notes"):
+        # 发行包的 catalog.py 太旧（没有更新说明校验器）：按"没有说明"处理。
+        # **不**把它算成检查失败——否则一次更新器/发行包版本错配会把"能不能更新"
+        # 一起打哑。
+        return NOTES_STATE_INVALID, NOTES_REASON_TOOL_MISSING, {}
+    path = local_notes_path(cfg)
     try:
-        catalog = _load_catalog_bytes(cfg, tool)
-    except Exception as error:  # noqa: BLE001 - 目录不可用一律 fail closed
-        code = getattr(error, "code", "")
-        reason = CATALOG_REASON_BY_CODE.get(code, CATALOG_REASON_INVALID)
-        state = (
-            CATALOG_STATE_MISSING
-            if reason == CATALOG_REASON_MISSING
-            else CATALOG_STATE_INVALID
-        )
-        return release_catalog_block(state, reason, 0, None), [], None
-    releases = catalog.get("releases", [])
-    if not isinstance(releases, list):
+        if not path.is_file():
+            return NOTES_STATE_MISSING, None, {}
+        parsed = tool.load_notes(path)
+    except Exception as error:  # noqa: BLE001 - 坏文件只影响更新说明
         return (
-            release_catalog_block(CATALOG_STATE_INVALID, CATALOG_REASON_INVALID, 0, None),
-            [],
-            None,
+            NOTES_STATE_INVALID,
+            NOTES_REASON_BY_CODE.get(getattr(error, "code", ""), NOTES_REASON_INVALID),
+            {},
         )
-    docker = runner if runner is not None else docker_runner(pub)
-    current_version = current_running_version(cfg, docker)
-    if current_version is not None:
-        try:
-            # 标注不是严格 semver（例如构建时 LING_VERSION 没传上）一律按未知处理：
-            # 状态文件里的 current_version 只放严格 semver 或 null，不放任意文本。
-            tool.version_key(current_version)
-        except Exception:  # noqa: BLE001
-            current_version = None
-    targets, recommended = release_targets(
-        tool, catalog, current_version, _digest_resolver(pub, docker)
-    )
-    return (
-        release_catalog_block(CATALOG_STATE_OK, None, len(releases), current_version),
-        targets,
-        recommended,
-    )
+    return NOTES_STATE_OK, None, dict(parsed.get("notes") or {})
+
+
+def read_release_notes(
+    cfg: Config,
+    pub: ModuleType,
+    tool: ModuleType | None,
+    version: str | None,
+) -> dict[str, Any]:
+    """取**latest 那一版**的更新说明 → ``{"state", "reason", "notes"}``（绝不抛错）。
+
+    数据流（设计 §5）：
+
+    1. 发行包自带那份 ``update-notes.json`` 里有这一版 → 用它（**存在即用**）；
+    2. 没有（文件缺失/坏/没这一版）→ 可选再试 GitHub Release 的精确 tag
+       （超时 5 秒，失败只影响说明）；
+    3. 都没有 → ``state`` 如实反映本地那份的状态（``missing``/``invalid``），
+       ``notes={}``。
+
+    更新说明**不参与**"能不能更新"的判定，所以这里永远不抛错、也不 fail closed。
+    """
+    state, reason, table = _local_notes(cfg, pub, tool)
+    if version is None:
+        return {"state": state, "reason": reason, "notes": {}}
+    note = table.get(version)
+    if isinstance(note, dict):
+        summary = _note_line(note.get("summary"), MAX_NOTE_SUMMARY_CHARS)
+        items = [
+            line
+            for line in (
+                _note_line(item, MAX_NOTE_ITEM_CHARS) for item in note.get("items") or []
+            )
+            if line is not None
+        ][:MAX_NOTE_ITEMS]
+        url = _note_line(note.get("url"), MAX_NOTE_URL_CHARS)
+        return {
+            "state": state,
+            "reason": reason,
+            "notes": {version: {"summary": summary, "items": items, "url": url}},
+        }
+    remote = github_release_note(version)
+    if remote is not None:
+        return {"state": NOTES_STATE_OK, "reason": None, "notes": {version: remote}}
+    return {"state": state, "reason": reason, "notes": {}}
 
 
 def status_payload(
@@ -1830,9 +2127,21 @@ def status_payload(
     task: dict[str, Any] | None,
     gate: dict[str, Any],
     catalog: dict[str, Any],
+    check: dict[str, Any],
     targets: list[dict[str, Any]],
     recommended: dict[str, Any] | None,
+    notes: dict[str, Any],
 ) -> dict[str, Any]:
+    """状态文件全文（``schema``/``protocol`` 不变，只加/换顶层键）。
+
+    ``release_check`` / ``release_notes`` 都是**加法**字段：旧 API（0.0.3）对状态
+    文件只按已知键 ``payload.get(...)`` 取值、对 ``release_catalog`` 逐字段重建，
+    多出来的顶层键与子键它根本不看——所以加这些键不会让还在跑旧 API 的机器崩。
+    唯一要守住的是**文件大小**（见 ``STATUS_NOTES_BUDGET_BYTES``）。
+
+    ``release_catalog`` 仍然写（``state="unused"``），因为 0.0.3 的 API 会读它；
+    目录本身已经不参与判定（见 :func:`release_catalog_block`）。
+    """
     return {
         "schema": STATUS_SCHEMA,
         "protocol": PROTOCOL,
@@ -1841,9 +2150,52 @@ def status_payload(
         "task": task_view(task),
         "backup_gate": gate,
         "release_catalog": catalog,
+        "release_check": check,
         "available_targets": targets,
         "recommended_target": recommended,
+        "release_notes": notes,
     }
+
+
+def serialize_status(payload: dict[str, Any]) -> str:
+    """序列化状态文件正文；超预算时丢掉更新内容（见 ``STATUS_NOTES_BUDGET_BYTES``）。
+
+    唯一的兜底：更新内容是"锦上添花"，而整份状态对 API 不可读意味着页面连"当前版本
+    /有没有新版/恢复点"都看不到。所以宁可丢说明，也不让文件越过读取上限——
+    丢了要说清楚（``state=invalid`` + ``notes_too_large``），不假装"这一版没有说明"。
+    """
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if len(text.encode("utf-8")) > STATUS_NOTES_BUDGET_BYTES:
+        payload["release_notes"] = {
+            "state": NOTES_STATE_INVALID,
+            "reason": NOTES_REASON_TOO_LARGE,
+            "notes": {},
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    return text
+
+
+def sanitize_scan_text(payload: dict[str, Any]) -> str:
+    """状态自查用的文本：**不含更新内容的正文**。
+
+    ``release_notes`` 里的 ``summary``/``items`` 是**发布方写的公开文案**（随
+    ``update-notes.json`` 交付，或从发布目录同源取回）。它天然可能包含
+    "password"/"journal.log" 这类词——发布日志本来就会写「修复密码重置」、
+    「入队日志」——把这些词送进"疑似敏感内容"的扫描，会让一次正常发版把**整份
+    状态写入**拒掉（网页从此看不到任何状态）。
+
+    所以自查只扫我们自己构造的部分：更新内容已经过 ``parse_notes`` 的结构/长度/
+    字符集约束，且它不携带本机路径或密钥（不是我们拼进去的）。
+    """
+    trimmed = dict(payload)
+    notes = trimmed.get("release_notes")
+    if isinstance(notes, dict):
+        trimmed["release_notes"] = {
+            "state": notes.get("state"),
+            "reason": notes.get("reason"),
+            "notes": {},
+        }
+    return json.dumps(trimmed, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 def assert_status_sanitized(cfg: Config, text: str) -> None:
@@ -1885,16 +2237,16 @@ class StatusWriter:
     ``write`` 在**从未算过**时兜底算一次，覆盖 ``--acknowledge-manual`` 这类
     不进主循环的入口。
 
-    ``release_catalog`` / ``available_targets`` / ``recommended_target`` 同理：
-    它们**不含时间戳**（只有状态码、计数、当前版本与目标列表），所以重算也不会
-    让内容抖动；刷新时机与恢复点门禁完全一致（启动、每处理完一个任务）。
+    ``release_check`` / ``available_targets`` / ``recommended_target`` /
+    ``release_notes`` 的刷新时机与恢复点门禁完全一致（启动、每处理完一个任务），
+    外加「用户点了检查更新」。**这一组刷新会碰 Docker（只读）与网络**——当前版本
+    读运行中 api 镜像的 OCI 标注，新版本要查 GHCR 的 ``tags/list`` 与 manifest
+    digest。所以它被 :meth:`refresh_release_check_if_due` 的 5 分钟节流挡着，
+    **绝不能**放进 5 秒的主轮询：那样所有部署实例每 5 秒就打一次 GHCR。
 
-    **这一组刷新会碰 Docker（只读）**——目录里没有 digest 之后，当前版本要读运行
-    中 api 镜像的 ``org.opencontainers.image.version`` 标注，兼容目标要
-    ``docker manifest inspect`` 现场解析摘要。所以它们被
-    :meth:`refresh_release_catalog_if_due` 的 5 分钟节流挡着，**绝不能**放进 5 秒
-    的主轮询：每轮问一次 registry 等于所有部署实例每 5 秒打一次 GHCR。目录文件
-    的读取与校验仍然是本地只读文件操作，而且**先校验目录再问 Docker**。
+    失败**不清空**、也不改写上一次的结论：失败的这一轮就是 ``state=failed`` +
+    ``reason``，目标列表为空（"这次查不到"），页面据此说"暂时无法确认"，而
+    **不会**把空列表读成「已是最新」。
     """
 
     def __init__(self, cfg: Config, pub: ModuleType, tool: ModuleType | None = None) -> None:
@@ -1903,64 +2255,141 @@ class StatusWriter:
         self.tool = tool
         self._last: str | None = None
         self._gate: dict[str, Any] | None = None
-        self._catalog: dict[str, Any] | None = None
-        # 上次重读目录的时间（monotonic）；0 表示还没读过。
-        self._catalog_checked_at = 0.0
+        self._check: dict[str, Any] | None = None
+        # 上次查 registry 的时间（monotonic）；0 表示还没查过。
+        self._checked_at = 0.0
         self._targets: list[dict[str, Any]] = []
         self._recommended: dict[str, Any] | None = None
+        self._notes: dict[str, Any] = {
+            "state": NOTES_STATE_MISSING,
+            "reason": None,
+            "notes": {},
+        }
 
+    # ------------------------------------------------------------ 恢复点门禁
     def refresh_backup_gate(self) -> dict[str, Any]:
         self._gate = backup_gate(self.cfg, self.pub)
         return self._gate
 
-    def refresh_release_catalog(self) -> dict[str, Any]:
-        """重读发布目录并重算可用目标/推荐目标。
+    # ------------------------------------------------------------ 版本发现
+    def refresh_release_check(
+        self, *, requested: bool = False, request_id: str | None = None
+    ) -> dict[str, Any]:
+        """查一次更新并重算目标/推荐/更新说明。
 
-        会发三类只读调用：可能联网取目录（``catalog_url``）、``docker ps`` /
-        ``inspect`` / ``image inspect`` 读当前版本、每个兼容目标一次
-        ``docker manifest inspect`` 解析摘要。
+        会发这些**只读**调用：``docker ps``/``inspect``/``image inspect``（当前版本
+        与摘要）、``docker info``（宿主架构，只有真的解析 manifest 时才问）、
+        GHCR 的 ``tags/list`` 与 manifest、以及（可选）一次 GitHub Release。
+
+        ``requested=True``（用户点了「检查更新」）时给这一块带上 ``check_id``，让
+        前端确认"我这次检查完成了"；自动刷新写 ``null``。无论哪种，这一轮的结果
+        都**覆盖**上一次：``state=failed`` + 空目标就是"这次查不到"，不是"已是最新"。
         """
-        self._catalog, self._targets, self._recommended = read_release_catalog(
-            self.cfg, self.pub, self.tool
+        block, targets, recommended = read_release_check(self.cfg, self.pub)
+        if requested and request_id is not None:
+            block = {**block, "check_id": request_id}
+        self._check = block
+        self._targets, self._recommended = targets, recommended
+        latest = block.get("latest")
+        self._notes = read_release_notes(
+            self.cfg,
+            self.pub,
+            self.tool,
+            latest.get("version") if isinstance(latest, dict) else None,
         )
-        self._catalog_checked_at = time.monotonic()
-        return self._catalog
+        self._checked_at = time.monotonic()
+        return self._check
 
-    def refresh_release_catalog_if_due(self) -> None:
-        """空闲时低频重读目录，让"之后发布的版本"能被看到。
+    def record_throttled(self, request_id: str) -> None:
+        """被限流丢弃的刷新请求：回显 ``check_id`` + ``reason_detail=throttled``。
 
-        为什么不是每轮都读：主循环 5 秒一轮，那是查**请求目录**（有没有人要
-        更新），不是查 GitHub。每轮都抓一次等于所有部署实例每 5 秒打一次
-        raw.githubusercontent.com——没必要，也可能被限流。
-
-        为什么又必须重读：目录只在启动和任务结束时刷新，空闲时一直用缓存。
-        发版之后没有新任务、也没重启的话，页面会一直显示"没有新版本"——
-        那正是"一键更新只能成功一次"的另一半。
-
-        5 分钟一次：发版是低频事件，用户点「检查更新」也只是重读 status.json，
-        最多等 5 分钟就能看到。任务执行前的即时复核不受影响（那一条照旧）。
-
-        这次节流现在不只省 GitHub：刷新还会 ``docker manifest inspect``（1~2 次）
-        并在 ``docker ps/inspect`` 里读当前版本，所以"每轮都刷"会变成每 5 秒打一次
-        GHCR + 一次容器实况查询。节流是这两类外部调用的**唯一**闸门。
+        **不改** ``state``/``latest``/``current``/``checked_at``：这次没有真的去查，
+        拿它改写上一次的结论就是把"没查"说成"查过了"。前端靠 ``check_id`` 匹配
+        到自己那次点击、靠 ``reason_detail`` 知道"刚查过，稍后再看"。
         """
-        if time.monotonic() - self._catalog_checked_at >= CATALOG_REFRESH_INTERVAL_SECONDS:
-            self.refresh_release_catalog()
+        block = dict(self._check) if self._check is not None else empty_release_check()
+        block["check_id"] = request_id
+        block["reason_detail"] = REASON_DETAIL_THROTTLED
+        self._check = block
 
+    def summary(self) -> dict[str, Any]:
+        """给私有日志用的一句话摘要（只有码与计数，不含路径/文案/主机名）。"""
+        block = self._check or {}
+        latest = block.get("latest") if isinstance(block.get("latest"), dict) else {}
+        return {
+            "state": str(block.get("state")),
+            "reason": block.get("reason"),
+            "current": (block.get("current") or {}).get("version"),
+            "latest": latest.get("version"),
+            "tags": block.get("tag_count"),
+            "targets": len(self._targets),
+            "notes": str(self._notes.get("state")),
+        }
+
+    def refresh_release_check_if_due(self) -> None:
+        """空闲时低频查一次 registry，让"刚发布的版本"能被看到。
+
+        为什么不是每轮都查：主循环 5 秒一轮，那是查**请求目录**（有没有人要更新），
+        不是查 GHCR。每轮都查等于所有部署实例每 5 秒打一次 GHCR——没必要，也很可能
+        被限流。
+
+        为什么又必须重查：只在启动和任务结束时查的话，发版之后没有新任务、也没重启
+        的机器会一直显示"没有新版本"——那正是"一键更新只能成功一次"的另一半。
+
+        用户点「检查更新」走的是**另一条**路（``refresh-<id>.json``，由主循环立刻
+        处理并绕过这里的闸门）。任务执行前还有一条独立的即时复核（
+        :meth:`Updater.assert_target_digest_current`），不受这里影响。
+        """
+        if time.monotonic() - self._checked_at >= CHECK_INTERVAL_SECONDS:
+            self.refresh_release_check()
+
+    # ------------------------------------------------------------ 写
     def write(self, state: str, task: dict[str, Any] | None, *, force: bool = False) -> None:
         gate = self._gate if self._gate is not None else self.refresh_backup_gate()
-        catalog = (
-            self._catalog if self._catalog is not None else self.refresh_release_catalog()
+        check = (
+            self._check
+            if self._check is not None
+            else self.refresh_release_check()
         )
+        current = (check.get("current") or {}).get("version")
         payload = status_payload(
-            self.pub, state, task, gate, catalog, self._targets, self._recommended
+            self.pub,
+            state,
+            task,
+            gate,
+            release_catalog_block(
+                current if isinstance(current, str) else None,
+                str(check.get("checked_at") or utc_now_text()),
+            ),
+            check,
+            self._targets,
+            self._recommended,
+            self._notes,
         )
-        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        assert_status_sanitized(self.cfg, text)
+        text = serialize_status(payload)
+        assert_status_sanitized(self.cfg, sanitize_scan_text(payload))
         if text == self._last and not force:
             return
         self.pub.write_atomic(self.cfg.status_file, text.encode("utf-8"), 0o644)
         self._last = text
+
+
+def empty_release_check() -> dict[str, Any]:
+    """还没有查过时的占位块（``state=unknown``，其它字段全 null/0）。
+
+    构造 :class:`StatusWriter` 之后第一次 :meth:`StatusWriter.write` 之前会被真实
+    结果覆盖；它的存在只是让"从未查过"这件事也有确定的形状。
+    """
+    return release_check_block(
+        state=RELEASE_CHECK_UNKNOWN,
+        checked_at=None,
+        check_id=None,
+        reason=None,
+        reason_detail=None,
+        current={"version": None, "digest": None},
+        latest=None,
+        tag_count=0,
+    )
 
 
 # ---------------------------------------------------------------- 单飞与认领
@@ -2051,6 +2480,183 @@ def archive_claim(cfg: Config, claimed: Path) -> None:
 
 def already_processed(cfg: Config, request_id: str) -> bool:
     return (cfg.requests_dir / "archive" / f"claimed-{request_id}.json").exists()
+
+
+# ---------------------------------------------------------------- 刷新请求
+
+
+def refresh_id_from_name(name: str) -> str | None:
+    """``refresh-<32 hex>.json`` 里的 ID；不合约定返回 None（调用方直接删掉）。"""
+    if not name.startswith(REFRESH_PREFIX) or not name.endswith(".json"):
+        return None
+    candidate = name[len(REFRESH_PREFIX) : -len(".json")]
+    return candidate if REQUEST_ID_RE.fullmatch(candidate) else None
+
+
+def pending_refreshes(cfg: Config) -> list[Path]:
+    """待处理的刷新请求（按文件名排序，一轮只处理一个；上限由 API 侧保证）。"""
+    try:
+        entries = [
+            path
+            for path in cfg.requests_dir.iterdir()
+            if path.is_file()
+            and path.name.startswith(REFRESH_PREFIX)
+            and refresh_id_from_name(path.name) is not None
+        ]
+    except OSError:
+        return []
+    return sorted(entries, key=lambda item: item.name)
+
+
+def _discard(path: Path) -> None:
+    """删掉处理完的请求文件：它是一次性请求，结论在 ``status.json`` 里。
+
+    删不掉（权限/别人已删）也继续：留着它只会让下一轮再看到同一个 ID，而幂等
+    记录会把它当重复请求再次丢弃。
+    """
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def load_refresh_request(path: Path) -> dict[str, Any]:
+    """严格解析刷新请求；返回 ``{"request_id", "created_at", "ignored"}``。
+
+    与安装请求的区别**只有一个**：多余的键不拒绝，只是忽略并记下键名（见常量处
+    的说明）。真正决定"这条请求是什么"的字段（schema / kind / id / 时间格式）
+    仍然严格——畸形请求不刷新、但也不崩：调用方只记私有日志并删文件。
+    """
+    name_id = refresh_id_from_name(path.name)
+    if name_id is None:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            f"刷新请求文件名不合约定：{path.name}",
+            ["请求方必须写成 refresh-<32 位小写 hex>.json（先写临时文件再 rename）。"],
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            f"刷新请求不可读或不是 JSON：{type(exc).__name__}",
+        ) from exc
+    if not isinstance(data, dict):
+        raise UpdaterError(
+            EXIT_REJECTED, REFRESH_REASON_MALFORMED, "refresh", "刷新请求主体必须是 JSON 对象"
+        )
+    if data.get("schema") != REFRESH_SCHEMA:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            f"不支持的刷新 schema：{data.get('schema')!r}（只接受 {REFRESH_SCHEMA}）",
+        )
+    kind = data.get("kind")
+    if kind is not None and kind != REFRESH_KIND:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            f"刷新请求的 kind 必须是 {REFRESH_KIND!r}",
+        )
+    # 同一件事的两个名字（见常量处）必须一致；只给一个就两处都用它。
+    request_id = data.get("request_id", data.get("check_id"))
+    if not isinstance(request_id, str) or REQUEST_ID_RE.fullmatch(request_id) is None:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            "刷新请求缺 request_id/check_id，或它不是 32 位小写 hex",
+        )
+    if request_id != name_id:
+        raise UpdaterError(
+            EXIT_REJECTED,
+            REFRESH_REASON_MALFORMED,
+            "refresh",
+            "刷新请求里的 ID 与文件名不一致",
+        )
+    for key in ("request_id", "check_id"):
+        if key in data and data[key] != request_id:
+            raise UpdaterError(
+                EXIT_REJECTED,
+                REFRESH_REASON_MALFORMED,
+                "refresh",
+                f"刷新请求的 {key} 与另一个 ID 字段不一致",
+            )
+    created_at: str | None = None
+    for key in ("created_at", "requested_at"):
+        value = data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or RFC3339_RE.fullmatch(value) is None:
+            raise UpdaterError(
+                EXIT_REJECTED,
+                REFRESH_REASON_MALFORMED,
+                "refresh",
+                f"刷新请求的 {key} 必须是 RFC3339 时间",
+            )
+        if created_at is not None and created_at != value:
+            raise UpdaterError(
+                EXIT_REJECTED,
+                REFRESH_REASON_MALFORMED,
+                "refresh",
+                "刷新请求同时给了两个时间字段且不一致",
+            )
+        created_at = value
+    return {
+        "request_id": request_id,
+        "created_at": created_at,
+        "ignored": sorted(set(data) - REFRESH_KEYS),
+    }
+
+
+# 刷新请求的幂等/限流状态（``<state-dir>/refresh.json``，0600）。
+#
+# 为什么要**落盘**：更新器是常驻进程，但它随时可能重启（容器重建、宿主重启），
+# 而 ``refresh-<id>.json`` 是"一次性请求"。没有这份记录时，「同一个 ID 再写一次」
+# 在重启后会被当成新请求再刷一遍——用户连点两下就多打两次 registry。
+# 时间用**墙钟**（``time.time()``）而不是 ``monotonic``：重启后 monotonic 归零，
+# 限流窗口会失效。
+def _empty_refresh_state() -> dict[str, Any]:
+    return {"schema": REFRESH_STATE_SCHEMA, "last_refresh_at": None, "processed": []}
+
+
+def _refresh_state_path(cfg: Config) -> Path:
+    return cfg.state_dir / REFRESH_STATE_NAME
+
+
+def load_refresh_state(cfg: Config) -> dict[str, Any]:
+    """读幂等/限流状态；坏文件按"没记录过"处理（绝不因此崩）。"""
+    try:
+        data = json.loads(_refresh_state_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _empty_refresh_state()
+    if not isinstance(data, dict) or data.get("schema") != REFRESH_STATE_SCHEMA:
+        return _empty_refresh_state()
+    last = data.get("last_refresh_at")
+    processed = data.get("processed")
+    last_at = (
+        float(last)
+        if isinstance(last, int | float) and not isinstance(last, bool)
+        else None
+    )
+    return {
+        "schema": REFRESH_STATE_SCHEMA,
+        "last_refresh_at": last_at,
+        "processed": [item for item in processed if isinstance(item, str)]
+        if isinstance(processed, list)
+        else [],
+    }
+
+
+def save_refresh_state(pub: ModuleType, cfg: Config, state: dict[str, Any]) -> None:
+    """原子写（0600）：状态目录是持久的，半写的文件会让下一轮读不出幂等记录。"""
+    state["processed"] = list(state.get("processed") or [])[-MAX_REMEMBERED_REFRESHES:]
+    payload = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True)
+    pub.write_atomic(_refresh_state_path(cfg), (payload + "\n").encode("utf-8"), 0o600)
 
 
 # ---------------------------------------------------------------- 受限 env 写入
@@ -2800,11 +3406,11 @@ class Updater:
         # **启动时算一次**恢复点门禁：idle 也要有（否则 API 只能看 task，
         # 第一次更新之前永远"不可安装"）。
         self.status.refresh_backup_gate()
-        # 可信发布目录同理：idle 也要有"可用目标"，否则网页的「更新」按钮永远
-        # 「暂无可用目标」。这一刷只发**只读** docker 调用（docker ps/inspect 读
-        # 运行中 api 的版本标注、兼容目标的 docker manifest inspect），不发任何
-        # 变更命令；启动时算一次也是状态文件里「当前版本」的唯一来源。
-        self.status.refresh_release_catalog()
+        # 版本发现同理：idle 也要有"有没有新版本"，否则网页的「更新」按钮永远
+        # 「暂无可用目标」。这一刷只发**只读**调用（docker ps/inspect 读运行中
+        # api 的版本标注 + 一次 GHCR 查询），不发任何变更命令；启动时算一次也是
+        # 状态文件里「当前版本」的唯一来源。
+        self.status.refresh_release_check()
         self.context_class = make_context_class(pub)
         self.task: dict[str, Any] | None = None
         self.log = pub.Logger()
@@ -2859,40 +3465,56 @@ class Updater:
         )
 
     # -------------------------------------------------- 单次处理
-    def assert_target_in_catalog(self, target: str) -> None:
-        """请求的目标必须是**现在**能从 registry 解析出来的兼容摘要之一。
+    def assert_target_digest_current(self, target: str) -> None:
+        """安装前复核：请求里的 digest **必须**是某个稳定 tag 现在指向的摘要。
 
-        请求里只有 ``target_digest``，没有版本号，所以"按 version 复核"在这里的
-        落法就是：**重新读目录 + 重新解析每个兼容目标的摘要**，再看这个 digest
-        是否等于其中一条。不用 :class:`StatusWriter` 的缓存：缓存可能是几分钟前
-        的，而"执行前再核一次"必须是真的再核一次（这一条还会再打 1~2 次
-        ``docker manifest inspect``，正是要确认 registry 现在说的还是同一个摘要）。
-        目录不可用也算拒绝（``catalog_unavailable``）：无法证明的目标一律不执行，
-        一个字节都不改。
+        请求里只有 ``target_digest``，没有版本号，所以"复核该版本 tag"的落法是：
+        重新列一次 tag（从最新稳定版往下，最多 :data:`MAX_DRIFT_PROBE_TAGS` 个），
+        逐个解析 digest，要求与请求里的 digest **完全相同**。
+
+        为什么不用 :class:`StatusWriter` 的缓存：缓存可能是几分钟前的，而"执行前
+        再核一次"必须是真的再核一次。为什么**不**按 tag 拉：tag 是可变的，检查与
+        安装之间被重推就会装上一个没人确认过的镜像——那正是 ``target_digest_drift``
+        要挡住的事（设计 §6「安装包已变化，请重新检查更新」）。
+
+        registry 现在不可达也算拒绝（``registry_unavailable``）：无法证明的目标一律
+        不执行，一个字节都不改——连 ``docker pull`` 都不会发（它本来也拉不到）。
         """
-        block, targets, _ = read_release_catalog(self.cfg, self.pub, self.tool)
-        if block["state"] != CATALOG_STATE_OK:
+        client = registry.RegistryClient()
+        try:
+            listing = client.stable_tags()
+            host_arch = daemon_arch(self.pub)
+            for version in reversed(listing.versions[-MAX_DRIFT_PROBE_TAGS:]):
+                manifest = client.manifest_digest(
+                    registry.version_text(version), host_arch=host_arch
+                )
+                if f"{self.pub.IMAGE_REPOSITORY}@{manifest.digest}" == target:
+                    self.emit(
+                        f"安装前复核通过：v{registry.version_text(version)} 现在仍指向"
+                        f"请求里的摘要（{target}）"
+                    )
+                    return
+        except registry.RegistryError as error:
             raise UpdaterError(
                 EXIT_REJECTED,
-                "catalog_unavailable",
+                FAILURE_REGISTRY_UNAVAILABLE,
                 "prepare",
-                f"可信发布目录不可用（{block['reason']}）：无法证明目标是可用目标",
+                f"安装前无法复核目标摘要（{error.code}）：连不上镜像仓库"
+                "或这次没查成，拒绝按未知状态安装",
                 [
-                    "在发行包里校正 deploy/releases.json（catalog.py validate），"
-                    "再重新提交；不要手改请求文件。",
+                    "稍后重试；检查 NAS 到 ghcr.io 的出网与 DNS。",
+                    "不要按 tag 安装：安装引用只能是已核验的 @sha256:<digest>。",
                 ],
-            )
-        if any(item["digest"] == target and item["compatible"] for item in targets):
-            return
+            ) from error
         raise UpdaterError(
             EXIT_REJECTED,
-            "target_not_in_catalog",
+            FAILURE_TARGET_DIGEST_DRIFT,
             "prepare",
-            "目标摘要不等于任何兼容版本此刻解析出来的摘要"
-            "（版本未列出、与当前版本不兼容，或 registry 现在给的是别的摘要）",
+            "请求的目标摘要不等于任何稳定 tag 此刻指向的摘要"
+            "（tag 被重推、或你拿的是过期候选）",
             [
-                "从网页「目标版本」里重新提交；目标只能来自可信发布目录 + registry 解析。",
-                "不要手改请求文件：更新器只执行目录里的兼容目标。",
+                "回网页重新「检查更新」后再提交；安装包变过就不能沿用旧确认。",
+                "不要手改请求文件：更新器只执行与当前 tag 一致的那个摘要。",
             ],
         )
 
@@ -2904,10 +3526,11 @@ class Updater:
             raise UpdaterError(
                 EXIT_REJECTED, "duplicate_request", "prepare", "该任务 ID 已处理过"
             )
-        # 目标必须来自目录：digest 格式合格只是必要条件，**可用性**由「目录 + 现在
-        # 解析出来的摘要」决定。这一步在任何变更类 Docker 调用之前（拉取/备份/
-        # 迁移都还没开始），只发只读查询（manifest inspect / ps / inspect）。
-        self.assert_target_in_catalog(target)
+        # 目标必须**现在**仍然成立：digest 格式合格只是必要条件，"这个摘要是不是
+        # 某个稳定 tag 此刻指向的那一个"由 registry 现场复核。这一步在任何变更类
+        # Docker 调用之前（拉取/备份/迁移都还没开始），只发只读查询
+        # （GHCR 的 tags/list + manifest、docker info）。
+        self.assert_target_digest_current(target)
         self.task = new_task(self.pub, request, target_hex, expected_commit)
         self.persist()
         self.status.write("busy", self.task, force=True)
@@ -2928,7 +3551,7 @@ class Updater:
         self.status.refresh_backup_gate()
         # 成功后受限 env 已指向目标摘要：当前版本随之变化，目标列表必须重算
         # （否则刚装上的那个版本会继续显示成"可用目标"）。
-        self.status.refresh_release_catalog()
+        self.status.refresh_release_check()
         if self.task is None:
             return
         state = {
@@ -2936,6 +3559,98 @@ class Updater:
             TASK_RUNNING: "busy",
         }.get(str(self.task.get("state")), "idle")
         self.status.write(state, self.task, force=True)
+
+    # -------------------------------------------------- 按需刷新（检查更新）
+    def process_refresh(self, path: Path) -> int:
+        """处理一个 ``refresh-<id>.json``：**立刻**查一次 registry + 读更新说明。
+
+        这条路**只做只读动作**（GHCR 的 tags/list + manifest、``docker
+        ps/inspect`` 读当前版本、可选一次 GitHub Release）：不拉镜像、不备份、
+        不迁移、不切容器。所以它不需要跨工具安装锁——但仍在**单飞锁**里
+        （``run_once`` 拿着），因此不会与安装任务并发。
+
+        顺序：读文件 → 判重（幂等）→ 判限流 → 记账 → 刷新 → 写状态 → 删文件。
+        "记账"在"刷新"之前：中途崩溃时下一次只会把它当重复请求删掉，而不会再来
+        一次（幂等优先于"多查一次"——检查是用户点出来的，重复查没有收益）。
+
+        返回码一律 ``EXIT_OK``：查不到新版本是**记录在状态文件里的结果**，不是更新器
+        进程失败（常驻进程不该因为一次网络故障就认为自己在报错循环里）。
+
+        请求文件在 ``finally`` 里删（无论成功、限流、畸形还是意外）：它是**一次性**
+        请求，留着它只会让下一轮反复看到同一个文件；结论已经写进状态文件了。
+        """
+        try:
+            return self._process_refresh(path)
+        finally:
+            _discard(path)
+
+    def _process_refresh(self, path: Path) -> int:
+        name_id = refresh_id_from_name(path.name)
+        if name_id is None:
+            self.emit(f"删除文件名不合约定的刷新请求：{path.name}")
+            return EXIT_OK
+        state = load_refresh_state(self.cfg)
+        if name_id in state["processed"]:
+            self.emit(f"刷新请求 {name_id} 已处理过（幂等），不再重新查 registry")
+            # 仍然写一次状态：重复请求不改结论，但状态文件必须存在且是最新的
+            # （API 只读它；没有文件时页面只能说"更新器还没写出状态"）。
+            self.status.write("idle", self.task)
+            return EXIT_OK
+        try:
+            request = load_refresh_request(path)
+        except UpdaterError as error:
+            # 畸形请求**不改** ``release_check``：这次既没查 registry，也没有可信的
+            # check_id 可回显（请求体自己就不合法）。只记私有日志、删文件。
+            self.emit(f"刷新请求被拒绝（{error.code}）：{error.detail}")
+            self.status.write("idle", self.task)
+            return EXIT_OK
+        ignored = request.get("ignored") or []
+        if ignored:
+            # 只记**键名**：值可能很大/很怪，私有日志里留个可解释的线索就够了。
+            self.emit(f"刷新请求含未定义字段（已忽略）：{ignored}")
+
+        now = time.time()
+        last = state.get("last_refresh_at")
+        window = self.cfg.refresh_throttle_seconds
+        if isinstance(last, int | float) and now - float(last) < window:
+            self.emit(
+                f"刷新请求 {name_id} 被限流丢弃（{window:g} 秒内只处理一次），未查 registry"
+            )
+            # 回显 check_id（前端要知道"我这次点击有结论了"）+ reason_detail=
+            # throttled；**state/latest/current 一个字节都不动**：这次没查。
+            self.status.record_throttled(name_id)
+            self.status.write("idle", self.task, force=True)
+            return EXIT_OK
+
+        state["processed"] = [*state["processed"], name_id]
+        state["last_refresh_at"] = now
+        try:
+            save_refresh_state(self.pub, self.cfg, state)
+        except OSError as error:
+            # 记不下幂等状态就**不查**：宁可这次检查没做，也不要变成"每次点击都
+            # 真的去打一次 GHCR"。
+            self.emit(f"无法写入刷新状态（{type(error).__name__}），本次不查 registry")
+            self.status.write("idle", self.task, force=True)
+            return EXIT_OK
+        try:
+            # 绕过 5 分钟自动刷新节流：用户点了检查，就必须**现在**去查。
+            self.status.refresh_release_check(requested=True, request_id=name_id)
+            self.status.write("idle", self.task, force=True)
+            summary = self.status.summary()
+            self.emit(
+                f"按需刷新 {name_id} 完成：state={summary['state']}"
+                f"（{summary['reason'] or 'ok'}），current={summary['current']}，"
+                f"latest={summary['latest']}，tags={summary['tags']}，"
+                f"目标 {summary['targets']} 条，更新内容={summary['notes']}"
+            )
+        except Exception as error:  # noqa: BLE001 - 刷新失败必须落地成可读状态
+            # 走到这里说明是更新器自己的 bug（registry 的失败已经被收敛成
+            # ``state=failed``）。状态文件里不留自由文本：只记异常类型进私有日志，
+            # 状态保持上一次检查的结论（页面至少还能看到它，而不是被清空）。
+            self.emit(f"按需刷新 {name_id} 出现未预期异常：{type(error).__name__}")
+            with contextlib.suppress(UpdaterError, OSError):
+                self.status.write("idle", self.task, force=True)
+        return EXIT_OK
 
     def run_pipeline(self, context: Any, gate: MaintenanceGate, request_id: str) -> int:
         assert self.task is not None
@@ -3396,7 +4111,21 @@ def acknowledge_manual(
 
 
 def run_once(updater: Updater) -> int:
-    """单飞：整个「读任务 + 认领 + 处理 + 对账」都在同一把锁里。"""
+    """单飞：整个「读任务 + 认领 + 处理（安装/刷新）+ 对账」都在同一把锁里。
+
+    处理顺序（先后有意义）：
+
+    1. 未完成任务先对账（``running``）、``needs_manual`` 先写状态并停止——安装
+       任务的收尾优先于一切；
+    2. **安装请求先于刷新请求**：设计原文「有安装任务时 refresh 排队」。刷新会打
+       registry 与容器实况，但它读到的"当前版本"马上就会被安装改掉，先刷只会给出
+       一个立刻过期的结论；
+    3. 没有安装请求时处理**一个**刷新请求（``refresh-<id>.json``）；
+    4. 都没有 → 空闲路径（低频重读目录 + 写状态）。
+
+    旧更新器（0.0.3）不认识 ``refresh-*.json``，它只匹配 ``request-*``，所以这些
+    文件在旧更新器眼里是不存在的普通文件：不认领、不消费、不阻塞安装通道。
+    """
     cfg = updater.cfg
     lock = TaskLock(cfg)
     if not lock.acquire():
@@ -3416,32 +4145,35 @@ def run_once(updater: Updater) -> int:
             updater.status.write("needs_manual", task)
             return EXIT_NEEDS_MANUAL
         candidates = pending_requests(cfg)
-        if not candidates:
-            # 空闲也要低频重读目录：否则发版之后页面一直显示"没有新版本"。
-            updater.status.refresh_release_catalog_if_due()
-            updater.status.write("idle", task)
-            return EXIT_OK
-        claimed = claim_request(cfg, candidates[0])
-        if claimed is None:
-            updater.emit("请求已被另一个实例认领")
-            return EXIT_BUSY
-        updater.emit(f"认领请求 {claimed.name}")
-        try:
-            return updater.process(claimed)
-        except UpdaterError as error:
-            updater.emit(f"拒绝请求：{error.detail}")
-            updater.status.write(
-                "needs_manual" if error.exit_code == EXIT_NEEDS_MANUAL else "idle",
-                updater.task,
-                force=True,
-            )
-            return error.exit_code
-        except Exception as error:  # noqa: BLE001 - 认领后的未预期异常不能静默
-            updater.emit(f"处理请求时出现未预期异常：{type(error).__name__}: {error}")
-            updater.status.write("needs_manual", updater.task, force=True)
-            return EXIT_NEEDS_MANUAL
-        finally:
-            archive_claim(cfg, claimed)
+        if candidates:
+            claimed = claim_request(cfg, candidates[0])
+            if claimed is None:
+                updater.emit("请求已被另一个实例认领")
+                return EXIT_BUSY
+            updater.emit(f"认领请求 {claimed.name}")
+            try:
+                return updater.process(claimed)
+            except UpdaterError as error:
+                updater.emit(f"拒绝请求：{error.detail}")
+                updater.status.write(
+                    "needs_manual" if error.exit_code == EXIT_NEEDS_MANUAL else "idle",
+                    updater.task,
+                    force=True,
+                )
+                return error.exit_code
+            except Exception as error:  # noqa: BLE001 - 认领后的未预期异常不能静默
+                updater.emit(f"处理请求时出现未预期异常：{type(error).__name__}: {error}")
+                updater.status.write("needs_manual", updater.task, force=True)
+                return EXIT_NEEDS_MANUAL
+            finally:
+                archive_claim(cfg, claimed)
+        refreshes = pending_refreshes(cfg)
+        if refreshes:
+            return updater.process_refresh(refreshes[0])
+        # 空闲也要低频重读目录：否则发版之后页面一直显示"没有新版本"。
+        updater.status.refresh_release_check_if_due()
+        updater.status.write("idle", task)
+        return EXIT_OK
     finally:
         lock.release()
 

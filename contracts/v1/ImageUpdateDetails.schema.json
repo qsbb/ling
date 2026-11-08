@@ -1,0 +1,473 @@
+{
+  "$defs": {
+    "ImageReleaseCheckCurrent": {
+      "additionalProperties": true,
+      "description": "更新器实测的**当前运行版本**（读运行中 api 镜像的 OCI ``version`` 标注）。",
+      "properties": {
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "title": "ImageReleaseCheckCurrent",
+      "type": "object"
+    },
+    "ImageReleaseCheckDetails": {
+      "additionalProperties": true,
+      "description": "更新器 ``status.json`` 顶层 ``release_check`` 的白名单投影。\n\n这是「有没有新版本」的**唯一**事实源（设计\ndocs/UPDATE-SIMPLIFICATION-DESIGN.md §3）。``reason_detail`` 只投影固定枚举\n``null | \"throttled\"``——更新器那个字段只有这两个值，别的值（自由文本，可能带\nregistry URL、凭据片段或原始异常）一律丢弃。",
+      "properties": {
+        "check_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Id"
+        },
+        "checked_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checked At"
+        },
+        "current": {
+          "$ref": "#/$defs/ImageReleaseCheckCurrent"
+        },
+        "latest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReleaseCheckLatest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "reason_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason Detail"
+        },
+        "reason_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason Message"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "tag_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Tag Count",
+          "type": "integer"
+        }
+      },
+      "title": "ImageReleaseCheckDetails",
+      "type": "object"
+    },
+    "ImageReleaseCheckLatest": {
+      "additionalProperties": true,
+      "description": "本次检查发现的最高稳定版（registry ``tags/list`` + manifest 解析结果）。",
+      "properties": {
+        "commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "title": "ImageReleaseCheckLatest",
+      "type": "object"
+    },
+    "ImageUpdateBackupGateDetails": {
+      "additionalProperties": true,
+      "description": "恢复点诊断：是否真有可用备份、原因与检查时间。",
+      "properties": {
+        "checked_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checked At"
+        },
+        "complete": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Complete"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "reason_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason Message"
+        },
+        "restore_point": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Restore Point"
+        }
+      },
+      "title": "ImageUpdateBackupGateDetails",
+      "type": "object"
+    },
+    "ImageUpdateCatalogDetails": {
+      "additionalProperties": true,
+      "description": "**旧形状**：「目录」诊断，保留一个版本给已在读它的前端。\n\n可信发布目录（``deploy/releases.json``）已经删除，这里的值全部从\n``release_check`` **派生**：``state`` 就是 ``release_check.state``（``ok`` /\n``failed`` / ``unknown``），``entries`` 映射 ``tag_count``，``source`` 是\n``\"registry\"``。新代码请读 ``details.release_check``。",
+      "properties": {
+        "check": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check"
+        },
+        "checked_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checked At"
+        },
+        "current_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Version"
+        },
+        "entries": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entries"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "reason_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason Message"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "state_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State Message"
+        }
+      },
+      "title": "ImageUpdateCatalogDetails",
+      "type": "object"
+    },
+    "ImageUpdateUpdaterDetails": {
+      "additionalProperties": true,
+      "description": "更新器诊断：在线、状态、协议、版本。",
+      "properties": {
+        "online": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Online"
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Protocol"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "title": "ImageUpdateUpdaterDetails",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/ImageUpdateDetails.schema.json",
+  "additionalProperties": false,
+  "description": "「详情/诊断」折叠区；``backup_gate`` 没有任何事实时为 null。",
+  "properties": {
+    "backup_gate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageUpdateBackupGateDetails"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "catalog": {
+      "$ref": "#/$defs/ImageUpdateCatalogDetails"
+    },
+    "release_check": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageReleaseCheckDetails"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "updater": {
+      "$ref": "#/$defs/ImageUpdateUpdaterDetails"
+    }
+  },
+  "required": [
+    "catalog",
+    "updater"
+  ],
+  "title": "ImageUpdateDetails",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

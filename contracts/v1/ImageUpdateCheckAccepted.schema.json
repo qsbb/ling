@@ -1,0 +1,28 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateCheckAccepted.schema.json",
+  "additionalProperties": false,
+  "description": "检查请求回执（202 已排队 / 200 幂等去重）。\n\n**只表示\"已写入\"**，不表示已经检查完：结果要看随后 GET 的 ``checked_at``\n与 ``details.catalog.check``。200 时返回的是**已经在排队/刚刚完成**的那个\n``request_id``，前端要按返回的 ID 核对（可能与请求里的不同）。",
+  "properties": {
+    "accepted": {
+      "title": "Accepted",
+      "type": "boolean"
+    },
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "accepted"
+  ],
+  "title": "ImageUpdateCheckAccepted",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}
