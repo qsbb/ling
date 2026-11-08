@@ -1,0 +1,46 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateCurrent.schema.json",
+  "additionalProperties": false,
+  "description": "当前运行版本/提交/镜像摘要；读不到就是 null（不拿 pyproject 猜）。",
+  "properties": {
+    "commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit"
+    },
+    "digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Digest"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    }
+  },
+  "title": "ImageUpdateCurrent",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

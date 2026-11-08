@@ -1,0 +1,53 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateTaskRow.schema.json",
+  "additionalProperties": true,
+  "description": "最近一次安装任务（只给卡片与详情用，**不参与**发现结论）。\n\n旧任务的全部字段（``request_id``/``target``/``migration``/``backup``/\n``failure``/``warnings``/``next_actions`` …）仍按白名单原样透传一个版本。",
+  "properties": {
+    "failed_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Failed Code"
+    },
+    "stage": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stage"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    }
+  },
+  "required": [
+    "state"
+  ],
+  "title": "ImageUpdateTaskRow",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

@@ -1,0 +1,47 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateTarget.schema.json",
+  "additionalProperties": false,
+  "description": "唯一可提交的目标：只能来自「兼容 + 摘要已解析」的发现条目。",
+  "properties": {
+    "commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit"
+    },
+    "digest": {
+      "title": "Digest",
+      "type": "string"
+    },
+    "has_migration": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "deprecated": true,
+      "title": "Has Migration"
+    },
+    "version": {
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "version",
+    "digest"
+  ],
+  "title": "ImageUpdateTarget",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

@@ -18,15 +18,16 @@
  * 与 protocol_unsupported 是门禁原因，都由宿主处理；前端只如实说明，不提供忽略/
  * 取消/自动重试入口）。
  */
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, api, parseErrorResponse } from '../api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ApiError, api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
+  ImageUpdateCurrentV2,
+  ImageUpdateNewerReleaseV2,
   ImageUpdateSubmission,
-  ImageUpdateSubmissionAck,
-  ImageUpdateTargetRef,
-  ImageUpdateTask,
-  ImageUpdateView,
+  ImageUpdateTargetV2,
+  ImageUpdateTaskV2,
+  ImageUpdateV2,
   ReleaseCheck,
   UpdateJob,
   UpdateRequest,
@@ -34,6 +35,7 @@ import type {
   VersionInfo,
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, CheckIcon, RefreshIcon } from './Icons';
+import '../update-card.css';
 
 /** 任务进行中的轮询间隔：约 3 秒；后端状态也是按这个量级更新的。 */
 const POLL_INTERVAL_MS = 3000;
@@ -2010,30 +2012,47 @@ function SourceAboutPage({ onBack }: AboutPageProps) {
   );
 }
 
-/* ============================================================ 镜像模式更新面板
+/* ==================================================== 镜像模式：更新卡片（四态）
  *
- * 设计依据 docs/EASY-INSTALL-UPDATE-DESIGN.md §1（日常更新）、§5（一次网页更新的
- * 实际顺序）、§6（故障时给用户什么结果）。
+ * 设计依据 `docs/UPDATE-UX-DESIGN.md`（本批的权威）：
  *
- * 与上面的源码模式通道**刻意分开**：`AboutPage` 按 `image_mode` 二选一，镜像模式
- * 不渲染「检查最新 Release / 安装 <tag>」，源码模式不渲染本面板——否则用户分不清
- * 哪个「更新」按钮是真的。
- *
- * 本面板只展示后端给的事实，不自造进度：
- * - 阶段只来自 `task.stage` 的真实码表（prepare/backup/migrate/switch/verify），
- *   **没有百分比、没有剩余时间**（后端本来就不产生这类字段）；
- * - 失败原因与下一步只用后端码表文案（`failure.message` / `next_actions` /
- *   `message` / `next_actions`），前端不另编理由；
- * - 成功必须三项核验（运行容器 digest、应用提交、迁移 head）齐全且一致；
- * - 没有「回退版本」按钮：设计 §6 末行明确禁止会误导的一键恢复。
+ * - 首屏只有：当前版本、**服务端给的一句话结论**、检查时间、一个主按钮。
+ *   三段横幅、原因码墙、安装门禁 notes、目标 `sha256` 都不再上首屏。
+ * - 四态与按钮：已是最新 →「检查更新」；可更新 →「更新到 vX」；
+ *   有新版暂不可用 →「重新检查」；暂不能确认 →「重试检查」。
+ *   活动任务覆盖结论展示（「正在更新 vX：阶段」+「查看进度」），此时不许再检查/安装。
+ *   非 owner 用同一套四态结论，但主按钮是「查看详情」，不写任何请求。
+ * - 「检查更新」是**真检查**：`POST /v1/version/image-update-checks` 写一个检查请求，
+ *   等更新器认领并重新取目录/解析摘要；随后每 2 秒重读 GET，按回执的检查编号匹配
+ *   `details.catalog.check`（对不上时退回 `checked_at` 变新）。最多等 20 秒，超时
+ *   如实说「更新器没有回应」；失败/超时**不清掉上次结论**。
+ * - 「更新内容」只在可更新 / 有新版暂不可用两态出现，内容全部来自后端
+ *   （`notes` 是发布方原话，前端不改写、不总结、不推断）；`notes_url` 才给
+ *   「完整更新日志」链接。
+ * - 详情/诊断默认折叠：digest/commit、目录来源与状态、更新器、恢复点、`newer[]`
+ *   的不可用原因、推荐目标、最近任务。原因码只允许出现在这里，且必须配一句人话。
  */
 
 const IMAGE_REQUEST_ID_RE = /^[0-9a-f]{32}$/;
 const IMAGE_DIGEST_RE = /^ghcr\.io\/qsbb\/ling-api@sha256:[0-9a-f]{64}$/;
 
-/** 进行中的轮询节奏：3 秒（与源码通道一致）；空闲 15 秒（只读本地状态文件，很轻）。 */
+/** 空闲轮询 15 秒、任务进行中 3 秒（只读状态文件，很轻）。 */
 const IMAGE_POLL_ACTIVE_MS = 3000;
 const IMAGE_POLL_IDLE_MS = 15000;
+
+/** 点「检查更新」后每 2 秒读一次，最多等 20 秒。 */
+export const IMAGE_CHECK_POLL_MS = 2000;
+export const IMAGE_CHECK_TIMEOUT_MS = 20000;
+/** 前端去抖：10 秒内重复点击不再发请求（服务端锁与 30 秒限流是最终保证）。 */
+export const IMAGE_CHECK_DEBOUNCE_MS = 10000;
+/** 「更新到 vX」先复用 30 秒内刚完成的检查，不重复打扰更新器。 */
+export const IMAGE_UPDATE_REUSE_CHECK_MS = 30000;
+
+export const IMAGE_CHECK_FAILED_TEXT = '这次检查没成功';
+export const IMAGE_CHECK_TIMEOUT_TEXT = '检查超时（更新器没有回应），你可以稍后重试';
+
+/** 「更新内容」最多平铺 8 条，其余折叠。 */
+export const IMAGE_NOTES_COLLAPSE_LIMIT = 8;
 
 /** 未知阶段/更新器状态的兜底：只给中文，绝不把英文码值打到页面上。 */
 export const IMAGE_STAGE_UNKNOWN_LABEL = '处理中（阶段不可识别）';
@@ -2075,6 +2094,125 @@ export function imageUpdaterStateLabel(state: string | null | undefined): string
   }
 }
 
+/** 任务状态码 → 中文（只用于详情；首屏不出现码值）。 */
+export function imageUpdateTaskStateText(state: string | null | undefined): string {
+  switch (state) {
+    case 'running':
+      return '进行中';
+    case 'queued':
+    case 'pending':
+      return '等待开始';
+    case 'succeeded':
+      return '已完成';
+    case 'failed_not_started':
+      return '失败（未进入迁移）';
+    case 'needs_manual':
+      return '需要人工处理';
+    case 'resolved':
+      return '已人工确认';
+    default:
+      return state ? '状态未识别' : '没有任务记录';
+  }
+}
+
+/**
+ * 失败码 → 人话。设计文档要求：原因码只进详情，且必须配一句人话；
+ * 未知码一律退回「更新器没有给出可读的失败说明」，不显示自由文本。
+ */
+const IMAGE_FAILURE_TEXT: Record<string, string> = {
+  request_rejected: '更新器拒绝了这次请求',
+  already_on_target: '当前已经在目标版本上',
+  duplicate_request: '重复的更新请求',
+  expected_current_mismatch: '提交之后当前运行的版本变了',
+  preflight_failed: '预检没有通过',
+  maintenance_gate_failed: '维护门禁没有通过',
+  pull_failed: '拉取目标镜像失败',
+  backup_failed: '备份没有完成',
+  migration_failed: '数据库迁移失败',
+  switch_failed: '切换新版本失败',
+  old_service_unverified: '没能确认旧服务状态',
+  reconcile_needs_manual: '需要人工对账',
+  state_unreadable: '任务状态读不出来',
+  previous_task_needs_manual: '上次更新还没有处理完',
+  install_lock_busy: '已有更新在执行',
+  env_write_failed: '写入部署配置失败',
+  internal_error: '更新器内部错误',
+};
+
+export function imageUpdateFailureText(code: string | null | undefined): string {
+  if (code === null || code === undefined || code === '') return '没有记录失败码';
+  return IMAGE_FAILURE_TEXT[code] ?? '更新器没有给出可读的失败说明';
+}
+
+/**
+ * 原因码 → 人话。键就是设计文档 §「判定数据与文案映射」里的机器事实；
+ * 未知码只给「暂时无法确认更新条件，请重新检查」，不暴露自由文本。
+ */
+export const IMAGE_REASON_TEXT: Record<string, string> = {
+  digest_unresolved: '新版已发布，但暂时取不到安装包；这不是你的操作问题，请稍后重新检查。',
+  not_in_min_from: '这个版本不能直接跨级安装；请先更新到页面提示的过渡版本，再检查一次。',
+  migration_unavailable: '这个版本需要的数据库迁移尚未备齐；这不是你的操作问题，请等待修复后再检查。',
+  backup_gate_missing: '更新前需要一个可用备份；请先完成一次备份，再重新检查。',
+  update_disabled: '本机尚未启用网页更新；请在部署配置中启用后再检查。',
+  updater_offline: '更新服务暂时没有响应；请确认更新器容器在运行，然后重试。',
+  manual_required: '上次更新尚未处理完；请先展开上次更新，按提示处理后再检查。',
+  catalog_missing: '发布目录暂时不可用；请稍后重试，若持续如此请检查部署包。',
+  catalog_unreadable: '发布目录暂时不可用；请稍后重试，若持续如此请检查部署包。',
+  catalog_invalid: '发布目录暂时不可用；请稍后重试，若持续如此请检查部署包。',
+  catalog_schema_unsupported: '发布目录的格式版本不受支持，请更新部署包后再检查。',
+  catalog_tool_missing: '更新器缺少目录校验工具，请先升级更新器。',
+  catalog_unavailable: '发布目录暂时不可用；请稍后重试，若持续如此请检查部署包。',
+  not_owner: '只有所有者可以发起更新。',
+  no_available_target: '发布目录里没有适用于当前版本的新版本。',
+};
+
+export function imageUpdateReasonText(code: string | null | undefined): string {
+  if (code === null || code === undefined || code === '') {
+    return '暂时无法确认更新条件，请重新检查。';
+  }
+  return IMAGE_REASON_TEXT[code] ?? '暂时无法确认更新条件，请重新检查。';
+}
+
+/** 目录状态码 → 中文（详情用）。 */
+export function imageCatalogStateText(state: string | null | undefined): string {
+  switch (state) {
+    case 'ok':
+      return '正常';
+    case 'missing':
+      return '缺失';
+    case 'invalid':
+      return '无效';
+    default:
+      return '未知';
+  }
+}
+
+/** 目录来源 → 中文（详情用）；`registry` 是当前来源（可信目录已删除，改为直接查 GHCR）。 */
+export function imageCatalogSourceText(source: string | null | undefined): string {
+  switch (source) {
+    case 'registry':
+      return '镜像仓库（GHCR）';
+    case 'remote':
+      return '远程发布目录';
+    case 'local':
+      return '本机发布目录（远程读取失败时的回退）';
+    case 'none':
+      return '没有读到发布目录';
+    default:
+      return '未知';
+  }
+}
+
+/** 恢复点门禁 → 中文。 */
+export function imageBackupGateText(
+  gate: { restore_point?: boolean | null } | null | undefined,
+): string {
+  if (gate === null || gate === undefined) return '未知';
+  if (gate.restore_point === true) return '可用';
+  if (gate.restore_point === false) return '不可用';
+  return '未知';
+}
+
 function shortDigestRef(value: string | null): string {
   if (!value) return '未知';
   const marker = '@sha256:';
@@ -2102,302 +2240,559 @@ export function isValidImageRequestId(value: string): boolean {
   return IMAGE_REQUEST_ID_RE.test(value);
 }
 
-/**
- * 目标来自哪里：可信发布目录 / 已排队请求 / 任务记录 / 外部提供 / 没有目标。
- */
-export type ImageUpdateTargetSource = 'catalog' | 'request' | 'task' | 'external' | 'none';
+/** `0.0.3` / `v0.0.3` 都显示成 `v0.0.3`（不叠两个 v）。 */
+export function imageVersionLabel(version: string | null | undefined): string | null {
+  if (version === null || version === undefined || version.trim() === '') return null;
+  const trimmed = version.trim();
+  return trimmed.startsWith('v') ? trimmed : `v${trimmed}`;
+}
 
-export interface ImageUpdateTarget extends ImageUpdateTargetRef {
-  source: ImageUpdateTargetSource;
-  /** 只有发布目录目标带版本/迁移信息（请求、任务记录里没有版本）。 */
-  version?: string;
-  hasMigration?: boolean;
+/* ------------------------------------------------------------ 检查时间 */
+
+/** 绝对时间：`11 月 9 日 14:20`；读不出时间时 null（不编一个时间）。 */
+export function formatImageCheckTime(checkedAt: string | null | undefined): string | null {
+  if (!checkedAt) return null;
+  const ms = Date.parse(checkedAt);
+  if (Number.isNaN(ms)) return null;
+  const date = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getMonth() + 1} 月 ${date.getDate()} 日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** 相对时间：`刚刚` / `X 分钟前` / `X 小时前` / `X 天前`。 */
+export function formatImageCheckAge(checkedAt: string | null | undefined, nowMs: number): string | null {
+  if (!checkedAt) return null;
+  const ms = Date.parse(checkedAt);
+  if (Number.isNaN(ms)) return null;
+  const delta = nowMs - ms;
+  if (delta < 60_000) return '刚刚';
+  const minutes = Math.floor(delta / 60_000);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+/** 首屏第三行：`检查于 11 月 9 日 14:20（3 分钟前）`；没检查过就说没检查过。 */
+export function describeImageCheckedAt(
+  checkedAt: string | null | undefined,
+  nowMs: number,
+): string {
+  const absolute = formatImageCheckTime(checkedAt);
+  const age = formatImageCheckAge(checkedAt, nowMs);
+  if (absolute === null) return '检查于 未知（还没有成功检查过）';
+  return `检查于 ${absolute}${age === null ? '' : `（${age}）`}`;
+}
+
+/* ------------------------------------------------------------ 真检查 */
+
+export type ImageCheckStatus = 'idle' | 'checking' | 'done' | 'failed' | 'timed_out';
+
+export interface ImageCheckAttempt {
+  status: ImageCheckStatus;
+  /** 最近一次真正发出检查请求的时刻（毫秒）：10 秒去抖用。 */
+  startedAtMs: number | null;
+  /** 最近一次检查收尾（成功或超时）的时刻：30 秒复用用。 */
+  finishedAtMs: number | null;
+  /** 失败/超时的一行人话；成功后清空。 */
+  notice: string | null;
+}
+
+export function initialImageCheckAttempt(): ImageCheckAttempt {
+  return { status: 'idle', startedAtMs: null, finishedAtMs: null, notice: null };
+}
+
+/** 10 秒内重复点击不再发请求；检查进行中也直接挡住。 */
+export function canStartImageCheck(attempt: ImageCheckAttempt, nowMs: number): boolean {
+  if (attempt.status === 'checking') return false;
+  if (attempt.startedAtMs === null) return true;
+  return nowMs - attempt.startedAtMs >= IMAGE_CHECK_DEBOUNCE_MS;
+}
+
+/** 失败/超时要显示的一行人话（成功为 null）。 */
+export function imageCheckNotice(attempt: ImageCheckAttempt): string | null {
+  if (attempt.status === 'failed') return IMAGE_CHECK_FAILED_TEXT;
+  if (attempt.status === 'timed_out') return `${IMAGE_CHECK_FAILED_TEXT}：${IMAGE_CHECK_TIMEOUT_TEXT}`;
+  return null;
 }
 
 /**
- * 目标摘要的唯一来源。
+ * `checked_at` 是否变新。
  *
- * 优先级：后端给的**可信发布目录**目标 → 排队中的请求 → 任务记录。目录目标来自
- * `GET /v1/version/image-update` 的 `target`（后端从更新器状态的
- * `recommended_target` 透出，只给 version/digest/commit/has_migration 四个字段），
- * 是唯一"真正可选"的目标；请求/任务只是"已经发生过或正在排队"的事实。
- *
- * 三者都没有就诚实地说「暂无可用目标」，绝不在前端拼一个目标。
+ * - 上次从来没有成功检查过（baseline=null）：任何非空时间都算新结果；
+ * - 时间相同 = 还是上次的结果，继续等；
+ * - 两个时间都能解析时必须严格变新（时钟回拨不算“这次检查”的结果）；
+ * - 解析不了时，只要字符串变了就当真（宁可多认一次，也不把新结果当旧的）。
  */
-export function imageUpdateTarget(view: ImageUpdateView | null): ImageUpdateTarget {
-  if (view === null) return { digest: null, commit: null, source: 'none' };
-  const catalogTarget = view.target;
-  if (catalogTarget !== null) {
-    return {
-      digest: catalogTarget.digest,
-      commit: catalogTarget.commit,
-      source: 'catalog',
-      version: catalogTarget.version,
-      hasMigration: catalogTarget.has_migration,
-    };
-  }
-  const request = view.request;
-  if (request !== null && request.target_digest !== null) {
-    const commit =
-      view.task !== null && view.task.target.digest === request.target_digest
-        ? view.task.target.commit
-        : null;
-    return { digest: request.target_digest, commit, source: 'request' };
-  }
-  const task = view.task;
-  if (task !== null && task.target.digest !== null) {
-    return { digest: task.target.digest, commit: task.target.commit, source: 'task' };
-  }
-  return { digest: null, commit: null, source: 'none' };
-}
-
-export interface ImageUpdateGate {
-  enabled: boolean;
-  targetDigest: string | null;
-  /** 前端的一致性检查：后端说「可安装」但字段互相矛盾时补一句诚实的说明。 */
-  notes: string[];
-}
-
-/**
- * 「更新」按钮能不能提交。
- *
- * `installable === false` 时不在这里另写理由——后端已经给了 `message` 与
- * `next_actions`（码表脱敏文案），面板原样展示；这里只在**后端说可安装、但字段
- * 互相矛盾**（离线、无恢复点、当前摘要未知、已有任务、没有目标…）时补一句说明，
- * 并把按钮禁用（fail closed）。
- */
-export function imageUpdateGate(
-  view: ImageUpdateView | null,
-  targetDigest?: string | null,
-): ImageUpdateGate {
-  const target = targetDigest === undefined ? imageUpdateTarget(view).digest : targetDigest;
-  if (view === null) {
-    return {
-      enabled: false,
-      targetDigest: target,
-      notes: ['还没有读到更新状态，先点「检查更新」。'],
-    };
-  }
-  const notes: string[] = [];
-  if (!view.image_mode) notes.push('当前不是镜像模式部署，镜像更新通道不可用。');
-  if (view.installable) {
-    if (view.updater.online !== true) notes.push('更新器当前不在线，不能提交。');
-    if (view.backup_gate.restore_point !== true) notes.push('没有可用的恢复点，备份门禁未就绪。');
-    if (view.current.digest === null || view.current.commit === null) {
-      notes.push('当前运行的镜像摘要或提交未知，不能提交。');
-    }
-    if (view.task !== null && view.task.state === 'running') {
-      notes.push('已有更新任务在进行中，等它结束再提交。');
-    }
-    if (view.request !== null) notes.push('已有排队中的更新请求，不能重复提交。');
-    if (target === null) {
-      notes.push(
-        '暂无可用目标：可信发布目录里没有适用于当前版本的新版本，本页不能发起更新。',
-      );
-    } else if (view.current.digest !== null && target === view.current.digest) {
-      notes.push('目标摘要与当前运行摘要相同，不需要更新。');
-    }
-  }
-  const enabled = view.image_mode && view.installable === true && notes.length === 0;
-  return { enabled, targetDigest: target, notes };
-}
-
-export function canSubmitImageUpdate(
-  view: ImageUpdateView | null,
-  targetDigest?: string | null,
+export function isNewCheckTime(
+  next: string | null | undefined,
+  baseline: string | null | undefined,
 ): boolean {
-  return imageUpdateGate(view, targetDigest).enabled;
+  if (!next) return false;
+  if (!baseline) return true;
+  if (next === baseline) return false;
+  const nextMs = Date.parse(next);
+  const baselineMs = Date.parse(baseline);
+  if (Number.isNaN(nextMs) || Number.isNaN(baselineMs)) return true;
+  return nextMs > baselineMs;
 }
 
-/* ---------------------------------------------------------------- 三项核验 */
+export interface ImageCheckResult {
+  status: 'skipped' | 'ok' | 'failed' | 'timed_out';
+  attempt: ImageCheckAttempt;
+  /** `ok` 时是刚读到的视图；失败/超时时是**上次**的视图（结论不清空）。 */
+  view: ImageUpdateV2 | null;
+  notice: string | null;
+}
 
-export type ImageVerificationCheckId = 'container_digest' | 'app_commit' | 'migration_head';
+export interface ImageCheckDeps {
+  /** 写一次检查请求（后端 200/201/202 都算已写入）。 */
+  postCheck: (checkId: string) => Promise<unknown>;
+  /** 重读 GET；轮询期间读失败按「还没好」处理，不抛给用户。 */
+  readView: () => Promise<ImageUpdateV2>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  newCheckId?: () => string;
+  timeoutMs?: number;
+  pollMs?: number;
+}
 
-export interface ImageVerificationCheck {
-  id: ImageVerificationCheckId;
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * 回执里的检查编号：后端可能回同一个已排队/刚完成的 ID（幂等）。拿不到就返回 null，
+ * 此时退回「`checked_at` 变新」判定。
+ */
+export function readCheckIdFromAck(ack: unknown): string | null {
+  if (ack === null || typeof ack !== 'object') return null;
+  const value = (ack as { request_id?: unknown }).request_id;
+  return typeof value === 'string' && IMAGE_REQUEST_ID_RE.test(value) ? value : null;
+}
+
+export interface ImageUpdateCatalogCheckState {
+  checkId: string | null;
+  state: string | null;
+}
+
+/** 读出 `details.catalog.check`（旧更新器没有这个键 → null）。 */
+export function readCatalogCheck(view: ImageUpdateV2 | null): ImageUpdateCatalogCheckState | null {
+  const check = view?.details?.catalog?.check;
+  if (check === null || check === undefined) return null;
+  return {
+    checkId: typeof check.check_id === 'string' ? check.check_id : null,
+    state: typeof check.state === 'string' ? check.state : null,
+  };
+}
+
+/**
+ * 一次真正的按需检查：写请求 → 每 2 秒重读 GET →
+ * `details.catalog.check.check_id` 匹配并到终态、或 `checked_at` 变新，才算完成。
+ *
+ * - POST 失败：`failed`，**保留**上次结论（`view` 原样回传），只加一行「这次检查没成功」；
+ * - 等到 20 秒还没变新：`timed_out`，同样保留上次结论，文案说清更新器没有回应；
+ * - 10 秒内再次调用：`skipped`，一个请求都不发；
+ * - 检查本身以 `failed` 收尾（更新器写了终态）：把新结论交回去（`view`），
+ *   同时保留一行「这次检查没成功」——不能把「检查失败」当成「没检查」。
+ */
+export async function runImageUpdateCheck(
+  attempt: ImageCheckAttempt,
+  previous: ImageUpdateV2 | null,
+  deps: ImageCheckDeps,
+): Promise<ImageCheckResult> {
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? defaultSleep;
+  const newCheckId = deps.newCheckId ?? newImageUpdateRequestId;
+  const timeoutMs = deps.timeoutMs ?? IMAGE_CHECK_TIMEOUT_MS;
+  const pollMs = deps.pollMs ?? IMAGE_CHECK_POLL_MS;
+
+  if (!canStartImageCheck(attempt, now())) {
+    return {
+      status: 'skipped',
+      attempt,
+      view: previous,
+      notice: imageCheckNotice(attempt),
+    };
+  }
+
+  const startedAtMs = now();
+  const checking: ImageCheckAttempt = {
+    status: 'checking',
+    startedAtMs,
+    finishedAtMs: null,
+    notice: null,
+  };
+  let checkId: string;
+  try {
+    checkId = newCheckId();
+  } catch {
+    const failed: ImageCheckAttempt = {
+      ...checking,
+      status: 'failed',
+      finishedAtMs: now(),
+      notice: IMAGE_CHECK_FAILED_TEXT,
+    };
+    return { status: 'failed', attempt: failed, view: previous, notice: imageCheckNotice(failed) };
+  }
+  let ackCheckId: string | null = null;
+  try {
+    ackCheckId = readCheckIdFromAck(await deps.postCheck(checkId));
+  } catch {
+    const failed: ImageCheckAttempt = {
+      ...checking,
+      status: 'failed',
+      finishedAtMs: now(),
+      notice: IMAGE_CHECK_FAILED_TEXT,
+    };
+    return { status: 'failed', attempt: failed, view: previous, notice: imageCheckNotice(failed) };
+  }
+
+  const baseline = previous?.checked_at ?? null;
+  const deadline = startedAtMs + timeoutMs;
+  // 注入的 sleep/now 不推进时钟时也不能死循环。
+  const maxPolls = Math.max(1, Math.ceil(timeoutMs / Math.max(pollMs, 1)) + 2);
+  for (let poll = 0; poll < maxPolls; poll += 1) {
+    await sleep(pollMs);
+    let view: ImageUpdateV2 | null = null;
+    try {
+      view = await deps.readView();
+    } catch {
+      view = null;
+    }
+    if (view !== null) {
+      const catalogCheck = readCatalogCheck(view);
+      const matchesCheck =
+        ackCheckId !== null &&
+        catalogCheck?.checkId === ackCheckId &&
+        catalogCheck.state !== null &&
+        catalogCheck.state !== 'running';
+      const checkedFresh = isNewCheckTime(view.checked_at, baseline);
+      if (matchesCheck || checkedFresh) {
+        const checkFailed = matchesCheck && catalogCheck?.state === 'failed';
+        const done: ImageCheckAttempt = {
+          status: checkFailed ? 'failed' : 'done',
+          startedAtMs,
+          finishedAtMs: now(),
+          notice: checkFailed ? IMAGE_CHECK_FAILED_TEXT : null,
+        };
+        return {
+          status: checkFailed ? 'failed' : 'ok',
+          attempt: done,
+          view,
+          notice: checkFailed ? imageCheckNotice(done) : null,
+        };
+      }
+    }
+    if (now() >= deadline) break;
+  }
+
+  const timedOut: ImageCheckAttempt = {
+    status: 'timed_out',
+    startedAtMs,
+    finishedAtMs: now(),
+    notice: IMAGE_CHECK_TIMEOUT_TEXT,
+  };
+  return {
+    status: 'timed_out',
+    attempt: timedOut,
+    view: previous,
+    notice: imageCheckNotice(timedOut),
+  };
+}
+
+/* ------------------------------------------------------------ 任务 */
+
+export type ImageTaskActivity = 'none' | 'running' | 'queued';
+
+/**
+ * 只有进行中/排队中的任务覆盖结论展示；旧任务不能压住新结论。
+ *
+ * 活动任务来自 `task.state === 'running'`；排队既可能是更新器还没认领的
+ * `request`（后端保留的旧字段），也可能是任务状态直接写 queued/pending。
+ */
+export function imageTaskActivity(view: ImageUpdateV2 | null): ImageTaskActivity {
+  const task = view?.task ?? null;
+  const state = (task?.state ?? '').toLowerCase();
+  if (state === 'running') return 'running';
+  if (state === 'queued' || state === 'pending') return 'queued';
+  if (view?.request != null) return 'queued';
+  return 'none';
+}
+
+/** 首屏任务行：`正在更新 v0.0.4：下载并预检目标镜像` / 排队一句话。 */
+export function describeImageTaskLine(view: ImageUpdateV2 | null): string | null {
+  const activity = imageTaskActivity(view);
+  if (activity === 'queued') return '更新请求已提交，等待开始';
+  if (activity !== 'running') return null;
+  const task = view?.task ?? null;
+  const version = imageVersionLabel(task?.version ?? null);
+  const stage = task?.stage ? imageUpdateStageLabel(task.stage) : '准备中';
+  return version === null ? `正在更新：${stage}` : `正在更新 ${version}：${stage}`;
+}
+
+/** 旧任务收成一行（失败/需要处理/已完成），不占首屏主动作。 */
+export function describeImageLastTaskLine(view: ImageUpdateV2 | null): string | null {
+  const task = view?.task ?? null;
+  if (task === null || imageTaskActivity(view) !== 'none') return null;
+  if (task.state === 'needs_manual') return '上次更新需要处理：先按详情里的失败码处理，再检查。';
+  if (task.state === 'succeeded') {
+    // 不写「更新成功」：三项核验有任何一端缺失/不一致，就只能说「已结束」。
+    const checks = imageUpdateVerification(task, view?.current ?? null);
+    if (checks.some((check) => check.ok === false)) return '上次更新已结束，但三项核验不一致。';
+    if (checks.some((check) => check.ok === null)) {
+      return '上次更新已结束，但三项核验值不全，不能确认成功。';
+    }
+    return '上次更新已完成（三项核验一致）。';
+  }
+  if (task.state === 'failed_not_started' || task.failed_code !== null) {
+    return `上次更新失败：${task.failure?.message ?? imageUpdateFailureText(task.failed_code)}`;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------ 三项核验 */
+
+export interface ImageUpdateCheckValue {
+  id: 'container_digest' | 'app_commit' | 'migration_head';
   label: string;
   /** 任务记录里的期望值（后端白名单投影，可能缺失）。 */
   expected: string | null;
-  /** 现在能实测到的值：当前 API 报告的 digest/commit，或迁移后的 head。 */
+  /** 现在能实测到的值：当前 API 的 digest/commit，或迁移后的实际 head。 */
   actual: string | null;
-  ok: boolean;
+  /** null = 有一端缺失，无法确认（既不算一致，也不算不一致）。 */
+  ok: boolean | null;
 }
 
-export type ImageVerificationState = 'unavailable' | 'unfinished' | 'verified' | 'mismatch';
-
-export interface ImageUpdateVerification {
-  state: ImageVerificationState;
-  checks: ImageVerificationCheck[];
-  verified: boolean;
-}
-
-function verificationCheck(
-  id: ImageVerificationCheckId,
+function verificationValue(
+  id: ImageUpdateCheckValue['id'],
   label: string,
   expected: string | null,
   actual: string | null,
-): ImageVerificationCheck {
-  return { id, label, expected, actual, ok: expected !== null && actual !== null && expected === actual };
+): ImageUpdateCheckValue {
+  return {
+    id,
+    label,
+    expected,
+    actual,
+    ok: expected === null || actual === null ? null : expected === actual,
+  };
 }
 
 /**
- * 成功判定：**只认三项核验**（设计 §1 末句）。
- *
- * 1. 运行容器 digest：任务记录的目标 digest vs 当前 API 自己报告的 digest；
- * 2. 应用提交：任务记录的目标 commit vs 当前 API 的构建提交；
- * 3. 迁移 head：任务记录的目标 head vs 迁移后的实际 head。
- *
- * 任一项缺失或不一致 → 不判成功（不拿「Compose 退出 0」或「页面又连上了」当成功）。
- * 参数是整个视图而不是单独的 task，因为 1/2 必须和**当前进程**报的值比对。
+ * 成功判定只认三项核验（设计 §任务记录）：运行容器 digest、应用提交、迁移 head。
+ * 任一端缺失就返回 `ok: null`——不拿「退出码 0」或「页面又能打开了」当成功。
+ * 卡片本身**不声称**「更新成功」，这三项只作为详情里的诊断事实。
  */
-export function verifyOutcome(view: ImageUpdateView | null): ImageUpdateVerification {
-  const task = view?.task ?? null;
-  if (view === null || task === null) {
-    return {
-      state: 'unavailable',
-      verified: false,
-      checks: [
-        verificationCheck('container_digest', '运行容器 digest', null, null),
-        verificationCheck('app_commit', '应用提交', null, null),
-        verificationCheck('migration_head', '迁移 head', null, null),
-      ],
-    };
-  }
-  const checks = [
-    verificationCheck('container_digest', '运行容器 digest', task.target.digest, view.current.digest),
-    verificationCheck('app_commit', '应用提交', task.target.commit, view.current.commit),
-    verificationCheck(
+export function imageUpdateVerification(
+  task: ImageUpdateTaskV2 | null,
+  current: ImageUpdateCurrentV2 | null,
+): ImageUpdateCheckValue[] {
+  return [
+    verificationValue(
+      'container_digest',
+      '运行容器 digest',
+      task?.target?.digest ?? null,
+      current?.digest ?? null,
+    ),
+    verificationValue(
+      'app_commit',
+      '应用提交',
+      task?.target?.commit ?? null,
+      current?.commit ?? null,
+    ),
+    verificationValue(
       'migration_head',
       '迁移 head',
-      task.migration.target_head,
-      task.migration.current_after,
+      task?.migration?.target_head ?? null,
+      task?.migration?.current_after ?? null,
     ),
   ];
-  const verified = task.state === 'succeeded' && checks.every((check) => check.ok);
-  const state: ImageVerificationState =
-    task.state !== 'succeeded' ? 'unfinished' : verified ? 'verified' : 'mismatch';
-  return { state, checks, verified };
+}
+
+/* ------------------------------------------------------------ 主按钮 */
+
+export type ImageUpdateActionKind =
+  | 'check'
+  | 'update'
+  | 'recheck'
+  | 'retry'
+  | 'details'
+  | 'progress';
+
+export interface ImageUpdateAction {
+  kind: ImageUpdateActionKind;
+  label: string;
+  disabled: boolean;
 }
 
 /**
- * `still_on_old_version` 的三态文案。
- *
- * `null` 表示更新器**没有实测**（后端约定：没实测就不敢断言），必须显示「未能确认」，
- * 不能显示成「仍在旧版本」——那会把一个未知状态说成事实。
+ * 卡片唯一的主按钮。四态各一个；活动任务/非 owner 优先覆盖。
+ * `busy` 时按钮禁用并显示「正在检查…」。
  */
-export function describeImageUpdateOldVersion(task: ImageUpdateTask | null): string {
-  if (task === null) return '没有任务记录，无法判断当前版本状态。';
-  if (task.still_on_old_version === true) return '已实测：仍在旧版本（本次更新没有进入迁移）。';
-  if (task.still_on_old_version === false) return '已实测：当前不在旧版本。';
-  return '未能确认（更新器没有实测旧服务状态）。';
-}
-
-/* ------------------------------------------------------------ 状态与重连 */
-
-export type ImageUpdateTone = 'ok' | 'info' | 'warn' | 'danger';
-
-export interface ImageUpdatePresentation {
-  tone: ImageUpdateTone;
-  title: string;
-  detail: string;
-}
-
-/** 面板顶部的状态横幅：只翻译后端码表 + 三项核验结论，不预测进度。 */
-export function describeImageUpdateState(view: ImageUpdateView | null): ImageUpdatePresentation {
-  if (view === null) {
-    return { tone: 'info', title: '正在读取更新状态', detail: '还没有拿到更新器状态；稍等或点「检查更新」。' };
+export function imageUpdatePrimaryAction(
+  view: ImageUpdateV2 | null,
+  options: { canWrite: boolean; busy?: boolean },
+): ImageUpdateAction {
+  const busy = options.busy === true;
+  if (imageTaskActivity(view) !== 'none') {
+    return { kind: 'progress', label: '查看进度', disabled: false };
   }
-  if (!view.image_mode) {
-    return {
-      tone: 'warn',
-      title: '镜像更新通道不可用',
-      detail: view.message ?? '后端没有把这次部署判定为镜像模式。',
-    };
+  if (!options.canWrite) {
+    return { kind: 'details', label: '查看详情', disabled: false };
   }
-  const task = view.task;
-  if (task === null) {
-    if (view.installable) {
+  const checkingLabel = busy ? '正在检查…' : null;
+  const state = view?.state ?? 'unknown';
+  switch (state) {
+    case 'available': {
+      const version = imageVersionLabel(view?.target?.version ?? null);
+      if (version === null) {
+        return {
+          kind: 'recheck',
+          label: checkingLabel ?? '重新检查',
+          disabled: busy,
+        };
+      }
       return {
-        tone: 'info',
-        title: '可以更新',
-        detail: '更新器在线、恢复点齐全。点「更新」后会先要求二次确认；更新期间服务短暂停机。',
+        kind: 'update',
+        label: checkingLabel ?? `更新到 ${version}`,
+        disabled: busy,
       };
     }
-    return {
-      tone: 'warn',
-      title: '当前不能更新',
-      detail: '后端给出了不可安装的原因与下一步，见下方说明；「更新」按钮已禁用。',
-    };
+    case 'latest':
+      return { kind: 'check', label: checkingLabel ?? '检查更新', disabled: busy };
+    case 'newer_unavailable':
+      return { kind: 'recheck', label: checkingLabel ?? '重新检查', disabled: busy };
+    default:
+      return { kind: 'retry', label: checkingLabel ?? '重试检查', disabled: busy };
   }
-  if (task.state === 'running') {
-    return {
-      tone: 'info',
-      title: '正在更新',
-      detail: `${task.stage_message ?? imageUpdateStageLabel(task.stage)}。页面断线不会中断任务，重连后继续显示同一个任务。`,
-    };
+}
+
+/**
+ * 点「更新到 vX」后的复查结论：目标版本与摘要都没变，才进入现有风险确认。
+ * 版本、摘要、状态任何一项变化都停在这里（由页面显示新结论）。
+ */
+export function imageUpdateConfirmAfterCheck(
+  before: ImageUpdateTargetV2 | null,
+  after: ImageUpdateV2 | null,
+): boolean {
+  if (before === null || after === null) return false;
+  if (after.state !== 'available' || after.target === null) return false;
+  return after.target.version === before.version && after.target.digest === before.digest;
+}
+
+/* ------------------------------------------------------------ 更新内容 */
+
+export function isImageUpdateNotesVisible(view: ImageUpdateV2 | null): boolean {
+  const state = view?.state;
+  return state === 'available' || state === 'newer_unavailable';
+}
+
+function versionParts(version: string): number[] | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
+  if (match === null) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** 严格 x.y.z 比较；任一侧解析不了就返回 0（不猜）。 */
+function compareImageVersion(left: string, right: string): number {
+  const a = versionParts(left);
+  const b = versionParts(right);
+  if (a === null || b === null) return 0;
+  for (let index = 0; index < 3; index += 1) {
+    const x = a[index] ?? 0;
+    const y = b[index] ?? 0;
+    if (x !== y) return x - y;
   }
-  if (task.state === 'succeeded') {
-    const verification = verifyOutcome(view);
-    if (verification.verified) {
-      return {
-        tone: 'ok',
-        title: '更新完成（三项核验通过）',
-        detail: `运行容器 digest、应用提交与迁移 head 与任务记录一致：${shortDigestRef(view.current.digest)}。`,
-      };
+  return 0;
+}
+
+/**
+ * 「更新内容」讲哪一版：
+ *
+ * 1. 有推荐目标 → 只讲目标那一版（目录里没有对应条目就不显示内容，不拿别的新版本
+ *    的说明冒充「这次要装的版本」）；
+ * 2. 有新版暂不可用（没有目标）→ 与后端 `_blocked_reason` 同一口径：先看
+ *    「原因只是摘要没解析（`digest_unresolved`）或没有原因」的那一档，取**最早**
+ *    （最低）一版；这一档为空才取最高新版本——首屏那句话说的是哪一版，内容就
+ *    说哪一版，前端不另造版本关系。
+ */
+export function pickImageUpdateNotesRelease(
+  view: ImageUpdateV2 | null,
+): ImageUpdateNewerReleaseV2 | null {
+  const newer = view?.newer ?? [];
+  if (newer.length === 0) return null;
+  const targetVersion = view?.target?.version ?? null;
+  if (targetVersion !== null) {
+    return newer.find((entry) => entry.version === targetVersion) ?? null;
+  }
+  const direct = newer.filter(
+    (entry) => entry.incompatible_reason === null || entry.incompatible_reason === 'digest_unresolved',
+  );
+  const pool = direct.length > 0 ? direct : newer;
+  let chosen: ImageUpdateNewerReleaseV2 | null = null;
+  for (const entry of pool) {
+    if (chosen === null) {
+      chosen = entry;
+      continue;
     }
-    return {
-      tone: 'warn',
-      title: '更新已结束，但核验未通过',
-      detail: '后端报告任务成功，但三项核验没有全部通过；以下是实测差异，不把这一状态说成「更新完成」。',
-    };
+    const comparison = compareImageVersion(entry.version, chosen.version);
+    if (direct.length > 0 ? comparison < 0 : comparison > 0) chosen = entry;
   }
-  if (task.state === 'failed_not_started') {
-    return {
-      tone: 'warn',
-      title: '更新未开始，未进入迁移',
-      detail:
-        task.still_on_old_version === true
-          ? `${task.state_message}；更新器已实测旧服务正常。`
-          : `${task.state_message}；${describeImageUpdateOldVersion(task)}`,
-    };
-  }
-  if (task.state === 'needs_manual') {
-    return {
-      tone: 'danger',
-      title: '更新未完成，需要维护处理',
-      detail: `${task.state_message}；维护门禁可能仍在（公开端口保持关闭），按任务编号人工核对后再恢复。`,
-    };
-  }
-  return { tone: 'info', title: task.state_message, detail: '该任务已人工确认，不再阻断新的更新。' };
+  return chosen;
 }
 
-export interface ImageConnectionNotice {
-  title: string;
-  detail: string;
+export interface ImageUpdateNotesView {
+  version: string | null;
+  summary: string | null;
+  items: string[];
+  url: string | null;
 }
 
-/** 断线横幅：断线既不是失败也不是完成，任务与 request_id 都保留。 */
-export function describeImageConnection(state: ImageUpdatePanelState): ImageConnectionNotice | null {
-  if (state.connection === 'ok') return null;
-  const requestId = state.taskRequestId ?? state.submittedRequestId;
-  const base =
-    requestId === null
-      ? '暂时读不到更新状态；重连后会继续读取同一个任务。断线不算失败，也不会新建任务。'
-      : `暂时读不到更新状态；后台任务 ${requestId} 不受影响，重连后会继续显示同一个任务。断线不算失败，也不会新建任务。`;
-  // 连续失败才升级成「可执行的恢复指引」，第一次断开先如实说在重连。
-  const hint =
-    state.failures >= 3
-      ? ' 连续多次读不到状态：确认后端进程与网络可用，或稍后点「检查更新」。'
-      : '';
-  return { title: '正在重新连接…', detail: `${base}${hint}` };
+/** 只放行 http(s) 链接；后端给别的 scheme 就不显示「完整更新日志」。 */
+export function isSafeImageUpdateUrl(url: string | null | undefined): url is string {
+  if (typeof url !== 'string' || url.trim() === '') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
 }
 
-/* ------------------------------------------------------ 轮询 / 断线重连模型 */
+/**
+ * 更新内容（只在可更新 / 有新版暂不可用两态返回）。
+ *
+ * `notes` 是发布方原话：不过滤、不改写、不排序；空数组交给页面显示
+ * 「这一版没有提供更新说明」。`summary` 只在后端真的给了才显示。
+ */
+export function imageUpdateNotesView(view: ImageUpdateV2 | null): ImageUpdateNotesView | null {
+  if (view === null || !isImageUpdateNotesVisible(view)) return null;
+  const release = pickImageUpdateNotesRelease(view);
+  const rawNotes = release?.notes ?? [];
+  const items = Array.isArray(rawNotes)
+    ? rawNotes.filter((note): note is string => typeof note === 'string' && note.trim() !== '')
+    : [];
+  const summary =
+    typeof release?.summary === 'string' && release.summary.trim() !== ''
+      ? release.summary.trim()
+      : null;
+  return {
+    version: release?.version ?? view.target?.version ?? null,
+    summary,
+    items,
+    url: isSafeImageUpdateUrl(release?.notes_url) ? release.notes_url : null,
+  };
+}
+
+/* ------------------------------------------------------ 轮询 / 断线重连 */
 
 export type ImageUpdateConnection = 'ok' | 'waiting';
 
 export interface ImageUpdatePanelState {
-  view: ImageUpdateView | null;
+  view: ImageUpdateV2 | null;
   connection: ImageUpdateConnection;
   /** 最近一次成功读到的任务 ID：断线时**保留**，用于说明「还是同一个任务」。 */
   taskRequestId: string | null;
@@ -2419,7 +2814,7 @@ export function initialImageUpdateState(): ImageUpdatePanelState {
  */
 export function applyImageUpdatePoll(
   current: ImageUpdatePanelState,
-  incoming: ImageUpdateView | null,
+  incoming: ImageUpdateV2 | null,
 ): ImageUpdatePanelState {
   if (incoming === null) {
     return { ...current, connection: 'waiting', failures: current.failures + 1 };
@@ -2440,17 +2835,34 @@ export function withSubmittedRequest(
   return { ...current, submittedRequestId: requestId };
 }
 
-/** 下一次轮询的等待时间：断线退避，进行中 3 秒，空闲 15 秒。 */
+export interface ImageConnectionNotice {
+  title: string;
+  detail: string;
+}
+
+/** 断线横幅：断线既不是失败也不是完成，任务与 request_id 都保留。 */
+export function describeImageConnection(state: ImageUpdatePanelState): ImageConnectionNotice | null {
+  if (state.connection === 'ok') return null;
+  const requestId = state.taskRequestId ?? state.submittedRequestId;
+  const base =
+    requestId === null
+      ? '暂时读不到更新状态；重连后会继续读取同一个任务。断线不算失败，也不会新建任务。'
+      : `暂时读不到更新状态；后台任务 ${requestId} 不受影响，重连后会继续显示同一个任务。断线不算失败，也不会新建任务。`;
+  const hint =
+    state.failures >= 3
+      ? ' 连续多次读不到状态：确认后端进程与网络可用，或稍后重试。'
+      : '';
+  return { title: '正在重新连接…', detail: `${base}${hint}` };
+}
+
+/** 下一次轮询的等待时间：断线退避；任务进行中/排队 3 秒，其余 15 秒。 */
 export function imagePollDelayMs(state: ImageUpdatePanelState): number {
   if (state.connection === 'waiting') {
     const index = Math.min(Math.max(state.failures - 1, 0), RECOVERY_DELAYS_MS.length - 1);
     return RECOVERY_DELAYS_MS[index] ?? IMAGE_POLL_ACTIVE_MS;
   }
-  const view = state.view;
-  if (view === null) return IMAGE_POLL_ACTIVE_MS;
-  if (view.task?.state === 'running') return IMAGE_POLL_ACTIVE_MS;
-  if (view.request !== null) return IMAGE_POLL_ACTIVE_MS;
-  return IMAGE_POLL_IDLE_MS;
+  if (state.view === null) return IMAGE_POLL_ACTIVE_MS;
+  return imageTaskActivity(state.view) === 'none' ? IMAGE_POLL_IDLE_MS : IMAGE_POLL_ACTIVE_MS;
 }
 
 /* -------------------------------------------------------------- 提交请求体 */
@@ -2458,11 +2870,11 @@ export function imagePollDelayMs(state: ImageUpdatePanelState): number {
 /**
  * POST 的**固定 5 键**请求体（多一个键后端就 422）。
  *
- * 拿不到目标/当前摘要、目标格式不对、或目标与当前相同，一律返回 null——宁可
- * 不让按钮生效，也不提交一个后端会拒绝的请求。
+ * 目标只取 `view.target.digest`（可信目录 + 摘要已解析）；`task`/请求记录都不回填。
+ * 拿不到目标/当前摘要、目标格式不对、或目标与当前相同，一律返回 null。
  */
 export function buildImageUpdateSubmission(
-  view: ImageUpdateView | null,
+  view: ImageUpdateV2 | null,
   targetDigest: string | null,
   requestId: string,
 ): ImageUpdateSubmission | null {
@@ -2478,12 +2890,6 @@ export function buildImageUpdateSubmission(
     expected_current_commit: view.current.commit,
     operator_confirmed: true,
   };
-}
-
-/** 提交回执丢失后，用同一个 request_id 判断请求是否已经落地（不重复提交）。 */
-export function imageRequestLanded(view: ImageUpdateView | null, requestId: string | null): boolean {
-  if (view === null || requestId === null) return false;
-  return view.request?.request_id === requestId || view.task?.request_id === requestId;
 }
 
 export interface ImageUpdateSubmitError {
@@ -2516,99 +2922,34 @@ export function explainImageSubmitError(error: unknown): ImageUpdateSubmitError 
         refresh: true,
       };
     }
-    return { reason: error.message || '提交被拒绝', hint: '已刷新当前状态；按页面给出的原因与下一步处理。', refresh: true };
+    return {
+      reason: error.message || '提交被拒绝',
+      hint: '已刷新当前状态；按页面给出的原因与下一步处理。',
+      refresh: true,
+    };
   }
   return { reason: '提交失败', hint: '刷新后按状态说明处理。', refresh: true };
 }
 
-/* ------------------------------------------------------------------ 传输层 */
-
-/**
- * 镜像通道的两个端点在这里直接 fetch：`api.ts` 不在本批改动范围内。
- *
- * 401 仍要回到登录表单：下面借用一次 `api.version()`（它走统一的 401 处理）触发
- * 应用层的登录回跳，然后照常把错误交给调用方。
- */
-async function fetchImageUpdateView(signal?: AbortSignal): Promise<ImageUpdateView> {
-  let response: Response;
-  try {
-    response = await fetch('/v1/version/image-update', {
-      credentials: 'same-origin',
-      cache: 'no-store',
-      ...(signal ? { signal } : {}),
-    });
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
-    throw new ApiError(
-      0,
-      'network_error',
-      '无法连接服务端，请确认后端已启动或网络可用',
-      true,
-      cause instanceof Error ? cause.message : null,
-    );
-  }
-  if (response.status === 401) await api.version().catch(() => undefined);
-  if (!response.ok) throw await parseErrorResponse(response);
-  return (await response.json()) as ImageUpdateView;
-}
-
-async function postImageUpdateRequest(
-  body: ImageUpdateSubmission,
-): Promise<ImageUpdateSubmissionAck> {
-  let response: Response;
-  try {
-    response = await fetch('/v1/version/image-update-requests', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', 'X-Ling-Update': '1' },
-      body: JSON.stringify(body),
-    });
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
-    throw new ApiError(
-      0,
-      'network_error',
-      '提交时无法连接服务端，结果未知',
-      true,
-      cause instanceof Error ? cause.message : null,
-    );
-  }
-  if (response.status === 401) await api.version().catch(() => undefined);
-  if (!response.ok) throw await parseErrorResponse(response);
-  return (await response.json()) as ImageUpdateSubmissionAck;
-}
-
 /* ------------------------------------------------------------------ 面板 */
 
-function imageToneClass(tone: ImageUpdateTone): string {
-  switch (tone) {
-    case 'ok':
-      return 'banner--ok';
-    case 'warn':
-      return 'banner--warn';
-    case 'danger':
-      return 'banner--error';
-    default:
-      return 'banner--info';
-  }
-}
-
 export interface ImageUpdatePanelProps {
-  version: VersionInfo | null;
   state: ImageUpdatePanelState;
-  /**
-   * 目标摘要的**显式覆盖**（可选的第二个来源）。
-   *
-   * 默认来源是后端 `GET /v1/version/image-update` 的 `target`（可信发布目录）；
-   * 这个参数只在调用方手里有别的目标摘要时使用。传 null 与不传等价（都不放行），
-   * 目标缺失时页面显示「暂无可用目标」并禁用，绝不假装可以更新。
-   */
-  targetDigest?: string | null;
+  /** owner 才能写检查/安装请求；false 时主按钮是「查看详情」，一个请求都不发。 */
+  canWrite: boolean;
+  /** 正在等一次按需检查的结果（按钮 loading + 「正在检查…」）。 */
+  checking: boolean;
+  /** 失败/超时的一行人话；成功为 null。 */
+  checkNotice: string | null;
   confirming: boolean;
   riskAcknowledged: boolean;
   submitting: boolean;
   submitError: ImageUpdateSubmitError | null;
-  onRefresh: () => void;
+  /** 渲染用的“现在”（测试注入，避免依赖真实时钟）。 */
+  nowMs?: number;
+  /** 测试/嵌入用：详情区默认展开。 */
+  defaultDetailsOpen?: boolean;
+  onCheck: () => void;
   onStartConfirm: () => void;
   onCancelConfirm: () => void;
   onToggleRisk: () => void;
@@ -2616,293 +2957,428 @@ export interface ImageUpdatePanelProps {
 }
 
 /**
- * 纯展示组件：全部输入都来自 props，没有任何 hook/请求，便于用
- * `renderToStaticMarkup` 直接断言「没有百分比、没有剩余时间、没有回退按钮」。
+ * 纯展示组件：全部输入来自 props，没有请求、没有定时器，便于用
+ * `renderToStaticMarkup` 断言首屏只有「当前版本 / 一句话结论 / 检查于 / 一个主按钮」。
  */
 export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
-  const { version, state, confirming, riskAcknowledged, submitting, submitError } = props;
+  const { state, canWrite, checking, checkNotice, confirming, riskAcknowledged, submitting, submitError } =
+    props;
+  const [detailsOpen, setDetailsOpen] = useState(props.defaultDetailsOpen === true);
+  const [taskOpen, setTaskOpen] = useState(false);
+  const [notesExpanded, setNotesExpanded] = useState(false);
+
   const view = state.view;
+  const nowMs = props.nowMs ?? Date.now();
+  const current = view?.current ?? { version: null, commit: null, digest: null };
   const task = view?.task ?? null;
-  const externalTarget = props.targetDigest;
-  const target: ImageUpdateTarget =
-    externalTarget === undefined || externalTarget === null
-      ? imageUpdateTarget(view)
-      : { digest: externalTarget, commit: null, source: 'external' };
-  const gate = imageUpdateGate(view, externalTarget);
-  const presentation = describeImageUpdateState(view);
-  const notice = describeImageConnection(state);
-  const verification = verifyOutcome(view);
-  const stageIndex = imageUpdateStageIndex(task?.stage ?? null);
-  const oldVersionText = describeImageUpdateOldVersion(task);
-  // 断线期间不让人提交：视图可能是断线前的旧状态，POST 也大概率失败。
-  const canStart = gate.enabled && state.connection === 'ok';
+  const target = view?.target ?? null;
+  const newer = view?.newer ?? [];
+  const catalog = view?.details?.catalog ?? {};
+  const updater = view?.details?.updater ?? {};
+  const backupGate = view?.details?.backup_gate ?? null;
+
+  const activity = imageTaskActivity(view);
+  const action = imageUpdatePrimaryAction(view, { canWrite, busy: checking });
+  const connection = describeImageConnection(state);
+  const taskLine = describeImageTaskLine(view);
+  const lastTaskLine = describeImageLastTaskLine(view);
+  const notes = imageUpdateNotesView(view);
+  const notesItems =
+    notes === null
+      ? []
+      : notesExpanded
+        ? notes.items
+        : notes.items.slice(0, IMAGE_NOTES_COLLAPSE_LIMIT);
+  const hiddenNotes = notes === null ? 0 : notes.items.length - notesItems.length;
+  const message = typeof view?.message === 'string' ? view.message.trim() : '';
+  // 活动任务覆盖结论展示（服务端也会把 message 换成进度；这里用同一份结构化事实，
+  // 保证文案固定为「正在更新 vX：阶段」/「更新请求已提交，等待开始」）。
+  const conclusion =
+    activity !== 'none' && taskLine !== null
+      ? taskLine
+      : view === null
+        ? '正在读取更新状态…'
+        : message !== ''
+          ? message
+          : '服务端没有给出结论';
+  const versionLabel = imageVersionLabel(current.version);
+
+  const onPrimary = () => {
+    switch (action.kind) {
+      case 'progress':
+        setTaskOpen((open) => !open);
+        return;
+      case 'details':
+        setDetailsOpen((open) => !open);
+        return;
+      case 'update':
+        props.onStartConfirm();
+        return;
+      default:
+        props.onCheck();
+    }
+  };
 
   return (
-    <section className="panel" data-testid="image-update-panel">
-      <div className="panel__head">
-        <h2>更新（镜像模式）</h2>
-        <span className="panel__count" data-testid="image-update-gate">
-          {gate.enabled ? '可以更新' : '当前不可提交'}
-        </span>
+    <section className="panel update-card" aria-label="更新" data-testid="image-update-panel">
+      <p className="update-card__version" data-testid="image-update-current">
+        {versionLabel === null ? '当前版本未知' : `当前 ${versionLabel}`}
+      </p>
+      <p className="update-card__conclusion" data-testid="image-update-conclusion">
+        {conclusion}
+      </p>
+      <p className="update-card__checked" data-testid="image-update-checked">
+        {describeImageCheckedAt(view?.checked_at ?? null, nowMs)}
+      </p>
+
+      {lastTaskLine !== null ? (
+        <p className="update-card__last-task" data-testid="image-update-last-task">
+          {lastTaskLine}
+        </p>
+      ) : null}
+
+      {connection !== null ? (
+        <div className="update-card__notice update-card__notice--warn" data-testid="image-update-reconnect">
+          <strong>{connection.title}</strong>
+          <span>{connection.detail}</span>
+        </div>
+      ) : null}
+
+      {checkNotice !== null ? (
+        <p className="update-card__notice update-card__notice--warn" data-testid="image-update-check-notice">
+          {checkNotice}
+        </p>
+      ) : null}
+
+      <div className="update-card__actions">
         <button
           type="button"
-          className="button button--small"
-          data-testid="image-update-refresh"
-          onClick={props.onRefresh}
-          disabled={submitting}
+          className="button button--primary update-card__primary"
+          data-testid="image-update-primary"
+          data-action={action.kind}
+          aria-expanded={
+            action.kind === 'progress' ? taskOpen : action.kind === 'details' ? detailsOpen : undefined
+          }
+          onClick={onPrimary}
+          disabled={action.disabled || submitting}
         >
-          <RefreshIcon /> 检查更新
+          {action.label}
         </button>
+        {canWrite || activity !== 'none' ? (
+          <button
+            type="button"
+            className="ghost-button"
+            data-testid="image-update-details-toggle"
+            aria-expanded={detailsOpen}
+            onClick={() => setDetailsOpen((open) => !open)}
+          >
+            详情/诊断 {detailsOpen ? '▴' : '▾'}
+          </button>
+        ) : null}
       </div>
 
-      <dl className="about-facts" data-testid="image-update-facts">
-        <dt>当前版本</dt>
-        <dd>
-          <code>{version?.current ?? '未知'}</code>{' '}
-          <span className="about-facts__muted">
-            {version?.commit ? shortSha(version.commit) : '构建提交未注入'}
-          </span>
-        </dd>
-        <dt>当前 digest</dt>
-        <dd data-testid="image-update-current-digest">
-          {view?.current.digest ? (
-            <code title={view.current.digest}>{shortDigestRef(view.current.digest)}</code>
-          ) : (
-            <span className="about-facts__muted">未知（LING_APP_IMAGE 未注入）</span>
-          )}
-        </dd>
-        <dt>目标版本</dt>
-        <dd data-testid="image-update-target">
-          {target.digest === null ? (
-            <span className="about-facts__muted">暂无可用目标</span>
-          ) : (
-            <>
-              {target.version ? <code>{target.version}</code> : null}
-              <code title={target.digest}>{shortDigestRef(target.digest)}</code>
-              {target.commit ? (
-                <span className="about-facts__muted"> 提交 {shortSha(target.commit)}</span>
-              ) : null}
-              <span className="about-facts__muted">
-                {target.source === 'catalog'
-                  ? '（可信发布目录）'
-                  : target.source === 'request'
-                    ? '（已排队的请求）'
-                    : target.source === 'task'
-                      ? '（任务记录）'
-                      : '（外部提供）'}
-              </span>
-              {target.hasMigration ? (
-                <span className="about-facts__muted"> 含数据库迁移</span>
-              ) : null}
-            </>
-          )}
-        </dd>
-        <dt>更新器</dt>
-        <dd data-testid="image-update-updater">
-          {view ? (
-            <>
-              {view.updater.online ? '在线' : '离线'}
-              {`（${imageUpdaterStateLabel(view.updater.state)}）`}
-              {view.updater.protocol !== null ? (
-                <span className="about-facts__muted"> 协议 v{view.updater.protocol}</span>
-              ) : null}
-            </>
-          ) : (
-            <span className="about-facts__muted">未知</span>
-          )}
-        </dd>
-        <dt>恢复点</dt>
-        <dd data-testid="image-update-backup-gate">
-          {view ? (
-            <>
-              {view.backup_gate.restore_point ? '可用' : '不可用'}
-              {!view.backup_gate.restore_point && view.backup_gate.reason_message ? (
-                <span className="about-facts__muted">：{view.backup_gate.reason_message}</span>
-              ) : null}
-            </>
-          ) : (
-            <span className="about-facts__muted">未知</span>
-          )}
-        </dd>
-      </dl>
-
-      {notice ? (
-        <div className="banner banner--warn" data-testid="image-update-reconnect">
-          <AlertIcon />
-          <div>
-            <strong>{notice.title}</strong>
-            <div className="banner__detail">{notice.detail}</div>
-          </div>
-        </div>
-      ) : null}
-
-      <div className={`banner ${imageToneClass(presentation.tone)}`} data-testid="image-update-state">
-        {presentation.tone === 'ok' ? <CheckIcon /> : <AlertIcon />}
-        <div>
-          <strong>{presentation.title}</strong>
-          <div className="banner__detail">{presentation.detail}</div>
-        </div>
-      </div>
-
-      {view !== null && !view.installable ? (
-        <div className="banner banner--warn" data-testid="image-update-blocked">
-          <AlertIcon />
-          <div>
-            <strong>{view.message ?? '当前不满足更新条件。'}</strong>
-            {view.next_actions.length > 0 ? (
-              <ul className="banner__list" data-testid="image-update-next-actions">
-                {view.next_actions.map((action) => (
-                  <li key={action}>{action}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-
-      {gate.notes.length > 0 ? (
-        <ul className="banner__list" data-testid="image-update-gate-notes">
-          {gate.notes.map((note) => (
-            <li key={note}>{note}</li>
-          ))}
-        </ul>
-      ) : null}
-
-      {task ? (
-        <div className="update-job" data-testid="image-update-task">
-          <div className="update-job__head">
-            <strong>{task.state_message}</strong>
-            <code data-testid="image-update-request-id">
-              {task.request_id ?? state.submittedRequestId ?? '请求编号未记录'}
-            </code>
-          </div>
-          {task.state === 'running' ? (
-            <>
-              <p className="update-job__detail" data-testid="image-update-stage">
-                当前阶段：{task.stage_message ?? imageUpdateStageLabel(task.stage)}
-              </p>
-              <p className="update-job__detail" data-testid="image-update-stage-line">
-                {IMAGE_UPDATE_STAGES.map((stage, index) => (
-                  <span key={stage}>
-                    {index > 0 ? ' → ' : ''}
-                    {imageUpdateStageLabel(stage)}
-                    {index === stageIndex ? '（当前）' : ''}
-                  </span>
-                ))}
-              </p>
-            </>
-          ) : task.stage !== null ? (
-            <p className="update-job__detail" data-testid="image-update-stage">
-              最后阶段：{imageUpdateStageLabel(task.stage)}
+      {notes !== null ? (
+        <section className="update-notes" data-testid="image-update-notes">
+          <h3 className="update-notes__title">
+            更新内容
+            {imageVersionLabel(notes.version) === null
+              ? ''
+              : `（${imageVersionLabel(notes.version) ?? ''}）`}
+          </h3>
+          {notes.summary === null ? null : (
+            <p className="update-notes__summary" data-testid="image-update-notes-summary">
+              {notes.summary}
             </p>
-          ) : null}
-          {task.state !== 'running' ? (
-            <p className="update-job__detail" data-testid="image-update-old-version">
-              {oldVersionText}
+          )}
+          {notes.items.length === 0 ? (
+            <p className="update-notes__empty" data-testid="image-update-notes-empty">
+              这一版没有提供更新说明
             </p>
-          ) : null}
-          {task.warnings.length > 0 ? (
-            <ul className="banner__list" data-testid="image-update-warnings">
-              {task.warnings.map((warning) => (
-                <li key={warning}>{warning}</li>
+          ) : (
+            <ul className="update-notes__list" data-testid="image-update-notes-items">
+              {notesItems.map((item, index) => (
+                <li key={`${index}-${item}`}>{item}</li>
               ))}
             </ul>
+          )}
+          {hiddenNotes > 0 ? (
+            <button
+              type="button"
+              className="ghost-button update-notes__more"
+              data-testid="image-update-notes-more"
+              onClick={() => setNotesExpanded(true)}
+            >
+              展开其余 {hiddenNotes} 条
+            </button>
           ) : null}
-          {task.failure ? (
-            <div className="banner banner--error" data-testid="image-update-failure">
-              <AlertIcon />
-              <div>
-                <strong>{task.failure.message}</strong>
-                {task.failure.stage !== null ? (
-                  <div className="banner__detail">
-                    停止阶段：{imageUpdateStageLabel(task.failure.stage)}
-                  </div>
-                ) : null}
-                {task.next_actions.length > 0 ? (
-                  <ul className="banner__list" data-testid="image-update-failure-actions">
-                    {task.next_actions.map((action) => (
-                      <li key={action}>{action}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-        </div>
+          {notes.url === null ? null : (
+            <a
+              className="update-notes__link"
+              data-testid="image-update-notes-url"
+              href={notes.url}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              完整更新日志
+            </a>
+          )}
+        </section>
       ) : null}
 
-      {task !== null && task.state === 'succeeded' ? (
-        <div className="update-job" data-testid="image-update-verification">
-          <div className="update-job__head">
-            <strong>
-              {verification.verified ? '三项核验通过：更新完成' : '三项核验未通过：不能算更新完成'}
-            </strong>
-          </div>
+      {taskOpen && task !== null ? (
+        <div className="update-task" data-testid="image-update-task-detail">
+          <h3 className="update-details__title">任务进度</h3>
           <dl className="about-facts about-facts--tight">
-            {verification.checks.map((check) => (
-              <Fragment key={check.id}>
-                <dt>{check.label}</dt>
-                <dd data-testid={`image-update-check-${check.id}`}>
-                  {check.ok ? <CheckIcon /> : <AlertIcon />}{' '}
-                  期望 <code title={check.expected ?? undefined}>{shortRef(check.expected)}</code>{' '}
-                  实际 <code title={check.actual ?? undefined}>{shortRef(check.actual)}</code>{' '}
-                  <span className="about-facts__muted">
-                    {check.ok
-                      ? '一致'
-                      : check.expected === null || check.actual === null
-                        ? '缺失，无法确认'
-                        : '不一致'}
-                  </span>
-                </dd>
-              </Fragment>
-            ))}
+            <dt>任务状态</dt>
+            <dd>
+              {task.state_message ?? imageUpdateTaskStateText(task.state)}
+              {task.state ? <span className="about-facts__muted">（{task.state}）</span> : null}
+            </dd>
+            <dt>阶段</dt>
+            <dd>{task.stage_message ?? imageUpdateStageLabel(task.stage)}</dd>
+            <dt>目标版本</dt>
+            <dd>
+              {imageVersionLabel(task.version) ?? (
+                <span className="about-facts__muted">目标版本未记录</span>
+              )}
+            </dd>
+            <dt>失败码</dt>
+            <dd>
+              {task.failed_code === null ? (
+                <span className="about-facts__muted">没有失败码</span>
+              ) : (
+                <>
+                  <code>{task.failed_code}</code>{' '}
+                  {task.failure?.message ?? imageUpdateFailureText(task.failed_code)}
+                </>
+              )}
+            </dd>
+            <dt>三项核验</dt>
+            <dd>
+              <ul className="update-details__list">
+                {imageUpdateVerification(task, current).map((check) => (
+                  <li className="update-details__item" key={check.id}>
+                    {check.label}：
+                    <code title={check.expected ?? undefined}>{shortRef(check.expected)}</code>{' '}
+                    对照 <code title={check.actual ?? undefined}>{shortRef(check.actual)}</code>{' '}
+                    <span className="about-facts__muted">
+                      {check.ok === null ? '缺失，无法确认' : check.ok ? '一致' : '不一致'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </dd>
           </dl>
         </div>
       ) : null}
 
-      {submitError ? (
+      {detailsOpen ? (
+        <div className="update-details" data-testid="image-update-details">
+          <h3 className="update-details__title">详情/诊断</h3>
+          <dl className="about-facts about-facts--tight">
+            <dt>当前版本</dt>
+            <dd data-testid="image-update-detail-version">
+              {current.version === null ? (
+                <span className="about-facts__muted">未知</span>
+              ) : (
+                <code>{current.version}</code>
+              )}
+            </dd>
+            <dt>当前 commit</dt>
+            <dd data-testid="image-update-detail-commit">
+              <code>{shortRef(current.commit)}</code>
+            </dd>
+            <dt>当前 digest</dt>
+            <dd data-testid="image-update-detail-digest">
+              <code title={current.digest ?? undefined}>{shortDigestRef(current.digest)}</code>
+            </dd>
+            <dt>目录来源</dt>
+            <dd data-testid="image-update-detail-catalog-source">
+              {imageCatalogSourceText(catalog.source)}
+            </dd>
+            <dt>目录检查时间</dt>
+            <dd data-testid="image-update-detail-catalog-time">
+              {formatImageCheckTime(catalog.checked_at) ?? '未知'}
+            </dd>
+            <dt>目录状态</dt>
+            <dd data-testid="image-update-detail-catalog-state">
+              {imageCatalogStateText(catalog.state)}
+              {catalog.state_message ? (
+                <span className="about-facts__muted">：{catalog.state_message}</span>
+              ) : null}
+            </dd>
+            <dt>目录原因</dt>
+            <dd data-testid="image-update-detail-catalog-reason">
+              {catalog.reason ? (
+                <>
+                  <code>{catalog.reason}</code>{' '}
+                  {catalog.reason_message ?? imageUpdateReasonText(catalog.reason)}
+                </>
+              ) : (
+                <span className="about-facts__muted">没有原因码</span>
+              )}
+            </dd>
+            <dt>更新器</dt>
+            <dd data-testid="image-update-detail-updater">
+              {updater.online === true ? '在线' : updater.online === false ? '离线' : '未知'}
+              {`（${imageUpdaterStateLabel(updater.state ?? null)}）`}
+              {updater.protocol === null || updater.protocol === undefined ? null : (
+                <span className="about-facts__muted"> · 协议 v{updater.protocol}</span>
+              )}
+            </dd>
+            <dt>恢复点</dt>
+            <dd data-testid="image-update-detail-backup">
+              {imageBackupGateText(backupGate)}
+              {backupGate?.reason ? (
+                <>
+                  {' '}
+                  <code>{backupGate.reason}</code>{' '}
+                  {backupGate.reason_message ?? imageUpdateReasonText(backupGate.reason)}
+                </>
+              ) : null}
+              <span className="about-facts__muted">
+                {' '}
+                · 检查于 {formatImageCheckTime(backupGate?.checked_at) ?? '未知'}
+              </span>
+            </dd>
+            <dt>新版列表</dt>
+            <dd data-testid="image-update-detail-newer">
+              {newer.length === 0 ? (
+                <span className="about-facts__muted">目录里没有更高的版本</span>
+              ) : (
+                <ul className="update-details__list">
+                  {newer.map((entry) => (
+                    <li
+                      className="update-details__item"
+                      key={`${entry.version}:${entry.commit ?? 'unknown'}`}
+                    >
+                      <code>{entry.version}</code>{' '}
+                      {/* 目标版本的构建提交通常拿不到（registry 发现）；没有就整截不渲染。 */}
+                      {entry.commit ? (
+                        <span className="about-facts__muted">（{shortSha(entry.commit)}）</span>
+                      ) : null}
+                      {entry.compatible ? (
+                        <span className="about-facts__muted">可直接安装</span>
+                      ) : entry.incompatible_reason === null ? (
+                        <span className="about-facts__muted">原因未提供</span>
+                      ) : (
+                        <>
+                          <code>{entry.incompatible_reason}</code>{' '}
+                          <span className="about-facts__muted">
+                            {entry.incompatible_reason_message ??
+                              imageUpdateReasonText(entry.incompatible_reason)}
+                          </span>
+                        </>
+                      )}
+                      {/* has_migration 已废弃且当前恒为 null：只说明判定归属，不推断有无迁移。 */}
+                      {entry.has_migration === null || entry.has_migration === undefined ? (
+                        <>
+                          {' '}
+                          <span className="about-facts__muted">迁移由迁移器判断</span>
+                        </>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </dd>
+            <dt>推荐目标</dt>
+            <dd data-testid="image-update-detail-target">
+              {target === null ? (
+                <span className="about-facts__muted">没有可提交的目标</span>
+              ) : (
+                <>
+                  <code>{imageVersionLabel(target.version) ?? target.version}</code>{' '}
+                  <code title={target.digest}>{shortDigestRef(target.digest)}</code>
+                  {/* registry 发现拿不到目标版本的构建提交是常态：没有就不显示这截。 */}
+                  {target.commit ? (
+                    <span className="about-facts__muted">提交 {shortRef(target.commit)}</span>
+                  ) : null}
+                </>
+              )}
+            </dd>
+            <dt>当前请求 ID</dt>
+            <dd data-testid="image-update-detail-request-id">
+              {task?.request_id ? (
+                <code>{task.request_id}</code>
+              ) : view?.request?.request_id ? (
+                <code>{view.request.request_id}</code>
+              ) : (
+                <span className="about-facts__muted">没有进行中的请求</span>
+              )}
+            </dd>
+            <dt>最近任务</dt>
+            <dd data-testid="image-update-detail-task">
+              {task === null ? (
+                <span className="about-facts__muted">没有任务记录</span>
+              ) : (
+                <>
+                  {task.state_message ?? imageUpdateTaskStateText(task.state)}
+                  {task.state ? <span className="about-facts__muted">（{task.state}）</span> : null}
+                  {` · 阶段 ${imageUpdateStageLabel(task.stage)}`}
+                  {task.failed_code === null ? null : (
+                    <>
+                      {' · '}
+                      <code>{task.failed_code}</code>{' '}
+                      {task.failure?.message ?? imageUpdateFailureText(task.failed_code)}
+                    </>
+                  )}
+                </>
+              )}
+            </dd>
+            {task === null ? null : (
+              <>
+                <dt>三项核验</dt>
+                <dd data-testid="image-update-detail-verification">
+                  <ul className="update-details__list">
+                    {imageUpdateVerification(task, current).map((check) => (
+                      <li className="update-details__item" key={check.id}>
+                        {check.label}：
+                        <code title={check.expected ?? undefined}>
+                          {shortRef(check.expected)}
+                        </code>{' '}
+                        对照{' '}
+                        <code title={check.actual ?? undefined}>{shortRef(check.actual)}</code>{' '}
+                        <span className="about-facts__muted">
+                          {check.ok === null ? '缺失，无法确认' : check.ok ? '一致' : '不一致'}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+      ) : null}
+
+      {submitError !== null ? (
         <div className="banner banner--error" data-testid="image-update-submit-error">
           <AlertIcon />
           <div>
             <strong>{submitError.reason}</strong>
-            {submitError.hint ? <div className="banner__detail">{submitError.hint}</div> : null}
+            {submitError.hint !== '' ? <div className="banner__detail">{submitError.hint}</div> : null}
           </div>
         </div>
       ) : null}
 
-      <div className="panel__actions">
-        {!confirming ? (
-          <button
-            type="button"
-            className="button"
-            data-testid="image-update-start"
-            onClick={props.onStartConfirm}
-            disabled={!canStart || submitting}
-          >
-            更新
-          </button>
-        ) : null}
-        {!gate.enabled && !confirming && gate.notes.length > 0 ? (
-          <span className="panel__hint" data-testid="image-update-blocked-hint">
-            {gate.notes[0]}
-          </span>
-        ) : null}
-      </div>
-
       {confirming ? (
         <div className="update-confirm" data-testid="image-update-confirm">
           <p className="update-confirm__lead">
-            确认更新到 {target.digest === null ? '目标摘要' : shortDigestRef(target.digest)}
+            确认更新到{' '}
+            {target === null ? '目标版本' : (imageVersionLabel(target.version) ?? '目标版本')}
           </p>
           <dl className="about-facts">
             <dt>当前</dt>
             <dd>
-              <code>{version?.current ?? '未知'}</code>{' '}
-              <span className="about-facts__muted">{shortDigestRef(view?.current.digest ?? null)}</span>
+              <code>{imageVersionLabel(current.version) ?? '未知'}</code>{' '}
+              <span className="about-facts__muted">{shortDigestRef(current.digest)}</span>
             </dd>
             <dt>目标</dt>
             <dd>
-              <code>{target.digest ?? '未知'}</code>
+              <code title={target?.digest ?? undefined}>
+                {target === null ? '未知' : shortDigestRef(target.digest)}
+              </code>
             </dd>
           </dl>
           <ul className="update-risk">
@@ -2913,7 +3389,9 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               更新前会做一次一致备份；但数据库迁移一旦执行就不可撤销，系统不会自动恢复旧镜像或旧数据，
               失败后需要人工处理。
             </li>
-            <li>是否成功只以运行容器 digest、应用提交与迁移 head 三项核验为准，不以命令退出码或页面重连为准。</li>
+            <li>
+              是否成功只以运行容器 digest、应用提交与迁移 head 三项核验为准，不以命令退出码或页面重连为准。
+            </li>
           </ul>
           <label className="update-risk-ack">
             <input
@@ -2939,7 +3417,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               className="button button--small"
               data-testid="image-update-submit"
               onClick={props.onConfirm}
-              disabled={!riskAcknowledged || submitting || !canStart}
+              disabled={!riskAcknowledged || submitting || !canWrite || target === null}
             >
               {submitting ? '提交中…' : '确认更新并重启'}
             </button>
@@ -2954,25 +3432,38 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
 
 export interface ImageUpdatePageProps {
   onBack: () => void;
-  initialView?: ImageUpdateView | null;
+  initialView?: ImageUpdateV2 | null;
+  /**
+   * 显式给出写权限（测试/嵌入用）。不传时读 `GET /v1/auth/me`，只有 `role=owner`
+   * 才能写检查/安装请求；读不到按只读处理（fail closed）。
+   */
+  initialCanWrite?: boolean | null;
 }
 
-export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageProps) {
+export function ImageUpdatePage({
+  onBack,
+  initialView = null,
+  initialCanWrite = null,
+}: ImageUpdatePageProps) {
   const [state, setState] = useState<ImageUpdatePanelState>(() =>
     initialView === null
       ? initialImageUpdateState()
       : applyImageUpdatePoll(initialImageUpdateState(), initialView),
   );
-  const [version, setVersion] = useState<VersionInfo | null>(null);
+  const [canWrite, setCanWrite] = useState(initialCanWrite === true);
   const [confirming, setConfirming] = useState(false);
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<ImageUpdateSubmitError | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkNotice, setCheckNotice] = useState<string | null>(null);
   const [pollNonce, setPollNonce] = useState(0);
 
   const aliveRef = useRef(true);
   const stateRef = useRef(state);
   const submittingRef = useRef(false);
+  const checkingRef = useRef(false);
+  const attemptRef = useRef<ImageCheckAttempt>(initialImageCheckAttempt());
 
   useEffect(() => {
     stateRef.current = state;
@@ -2986,19 +3477,20 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
   }, []);
 
   useEffect(() => {
-    let disposed = false;
+    if (initialCanWrite !== null) return;
+    let alive = true;
     void (async () => {
       try {
-        const next = await api.version();
-        if (!disposed) setVersion(next);
+        const me = await api.me();
+        if (alive) setCanWrite(me.user.role === 'owner');
       } catch {
-        // 版本号只是展示；读不到时保持「未知」，不猜。
+        if (alive) setCanWrite(false);
       }
     })();
     return () => {
-      disposed = true;
+      alive = false;
     };
-  }, []);
+  }, [initialCanWrite]);
 
   useEffect(() => {
     let disposed = false;
@@ -3014,10 +3506,10 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
 
     const poll = async () => {
       if (disposed) return;
-      let incoming: ImageUpdateView | null = null;
+      let incoming: ImageUpdateV2 | null = null;
       let failed = false;
       try {
-        incoming = await fetchImageUpdateView(controller.signal);
+        incoming = await api.imageUpdate(controller.signal);
       } catch (error) {
         if (isAbortError(error) || disposed) return;
         failed = true;
@@ -3037,10 +3529,83 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
     };
   }, [pollNonce, initialView]);
 
+  const mergeView = useCallback((incoming: ImageUpdateV2) => {
+    const next = applyImageUpdatePoll(stateRef.current, incoming);
+    stateRef.current = next;
+    setState(next);
+  }, []);
+
+  const runCheck = useCallback(async (): Promise<ImageCheckResult> => {
+    if (!canWrite) {
+      // 非 owner 一个写请求都不发（主按钮此时是「查看详情」，这里只是兜底）。
+      return {
+        status: 'skipped',
+        attempt: attemptRef.current,
+        view: stateRef.current.view,
+        notice: imageCheckNotice(attemptRef.current),
+      };
+    }
+    if (checkingRef.current) {
+      return {
+        status: 'skipped',
+        attempt: attemptRef.current,
+        view: stateRef.current.view,
+        notice: imageCheckNotice(attemptRef.current),
+      };
+    }
+    const nowMs = Date.now();
+    if (!canStartImageCheck(attemptRef.current, nowMs)) {
+      return {
+        status: 'skipped',
+        attempt: attemptRef.current,
+        view: stateRef.current.view,
+        notice: imageCheckNotice(attemptRef.current),
+      };
+    }
+    checkingRef.current = true;
+    setChecking(true);
+    setCheckNotice(null);
+    const baselineView = stateRef.current.view;
+    const result = await runImageUpdateCheck(attemptRef.current, baselineView, {
+      postCheck: (checkId) => api.imageUpdateCheck(checkId),
+      readView: () => api.imageUpdate(),
+    });
+    attemptRef.current = result.attempt;
+    // 只有真的读到新视图才合并：POST 失败/超时要保留上次结论。
+    if (result.view !== null && result.view !== baselineView) mergeView(result.view);
+    setCheckNotice(result.notice);
+    checkingRef.current = false;
+    setChecking(false);
+    return result;
+  }, [canWrite, mergeView]);
+
+  const beginUpdate = useCallback(async () => {
+    if (!canWrite) return;
+    const before = stateRef.current.view;
+    if (before === null || before.state !== 'available' || before.target === null) return;
+    const lastFinished = attemptRef.current.finishedAtMs;
+    if (
+      attemptRef.current.status === 'done' &&
+      lastFinished !== null &&
+      Date.now() - lastFinished < IMAGE_UPDATE_REUSE_CHECK_MS
+    ) {
+      setSubmitError(null);
+      setRiskAcknowledged(false);
+      setConfirming(true);
+      return;
+    }
+    const result = await runCheck();
+    if (result.status !== 'ok') return;
+    if (!imageUpdateConfirmAfterCheck(before.target, result.view)) return;
+    setSubmitError(null);
+    setRiskAcknowledged(false);
+    setConfirming(true);
+  }, [canWrite, runCheck]);
+
   const submit = useCallback(async () => {
-    if (submittingRef.current) return;
-    const snapshot = stateRef.current;
-    const target = imageUpdateTarget(snapshot.view);
+    if (submittingRef.current || !canWrite) return;
+    const snapshot = stateRef.current.view;
+    const targetDigest = snapshot?.target?.digest ?? null;
     let requestId: string;
     try {
       requestId = newImageUpdateRequestId();
@@ -3052,23 +3617,22 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
       });
       return;
     }
-    const body = buildImageUpdateSubmission(snapshot.view, target.digest, requestId);
+    const body = buildImageUpdateSubmission(snapshot, targetDigest, requestId);
     if (body === null) {
       setSubmitError({
         reason: '还没有可提交的目标',
-        hint: '先点「检查更新」，确认目标摘要与当前摘要后再提交。',
+        hint: '先检查更新，确认目标摘要与当前摘要后再提交。',
         refresh: true,
       });
       setConfirming(false);
       setRiskAcknowledged(false);
-      setPollNonce((value) => value + 1);
       return;
     }
     submittingRef.current = true;
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const ack = await postImageUpdateRequest(body);
+      const ack = await api.requestImageUpdate(body);
       const next = withSubmittedRequest(stateRef.current, ack.request_id);
       stateRef.current = next;
       setState(next);
@@ -3076,7 +3640,6 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
       setRiskAcknowledged(false);
       setPollNonce((value) => value + 1);
     } catch (error) {
-      // 提交被拒/结果未知：一律收起二次确认，先重新读状态再让人决定下一步。
       setSubmitError(explainImageSubmitError(error));
       setConfirming(false);
       setRiskAcknowledged(false);
@@ -3085,12 +3648,7 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, []);
-
-  const refresh = useCallback(() => {
-    setSubmitError(null);
-    setPollNonce((value) => value + 1);
-  }, []);
+  }, [canWrite]);
 
   return (
     <section className="page">
@@ -3101,17 +3659,19 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
       <h1 className="page__title">关于与版本</h1>
 
       <ImageUpdatePanel
-        version={version}
         state={state}
+        canWrite={canWrite}
+        checking={checking}
+        checkNotice={checkNotice}
         confirming={confirming}
         riskAcknowledged={riskAcknowledged}
         submitting={submitting}
         submitError={submitError}
-        onRefresh={refresh}
+        onCheck={() => {
+          void runCheck();
+        }}
         onStartConfirm={() => {
-          setSubmitError(null);
-          setRiskAcknowledged(false);
-          setConfirming(true);
+          void beginUpdate();
         }}
         onCancelConfirm={() => {
           setConfirming(false);
@@ -3126,9 +3686,10 @@ export function ImageUpdatePage({ onBack, initialView = null }: ImageUpdatePageP
   );
 }
 
+
 /* ------------------------------------------------------------ 模式二选一 */
 
-type ImageModeProbe = { status: 'probing' } | { status: 'done'; imageView: ImageUpdateView | null };
+type ImageModeProbe = { status: 'probing' } | { status: 'done'; imageView: ImageUpdateV2 | null };
 
 function AboutProbe({ onBack }: AboutPageProps) {
   return (
@@ -3160,10 +3721,11 @@ export function AboutPage({ onBack }: AboutPageProps) {
     let alive = true;
     const controller = new AbortController();
     void (async () => {
-      let imageView: ImageUpdateView | null = null;
+      let imageView: ImageUpdateV2 | null = null;
       try {
-        const view = await fetchImageUpdateView(controller.signal);
-        imageView = view.image_mode ? view : null;
+        const view = await api.imageUpdate(controller.signal);
+        // 显式 `image_mode: false` 才是源码模式；字段缺失按镜像模式处理。
+        imageView = view.image_mode === false ? null : view;
       } catch (error) {
         if (isAbortError(error)) return;
         imageView = null;

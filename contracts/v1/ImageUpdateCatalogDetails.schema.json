@@ -1,0 +1,119 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateCatalogDetails.schema.json",
+  "additionalProperties": true,
+  "description": "**旧形状**：「目录」诊断，保留一个版本给已在读它的前端。\n\n可信发布目录（``deploy/releases.json``）已经删除，这里的值全部从\n``release_check`` **派生**：``state`` 就是 ``release_check.state``（``ok`` /\n``failed`` / ``unknown``），``entries`` 映射 ``tag_count``，``source`` 是\n``\"registry\"``。新代码请读 ``details.release_check``。",
+  "properties": {
+    "check": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Check"
+    },
+    "checked_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Checked At"
+    },
+    "current_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Current Version"
+    },
+    "entries": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Entries"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "reason_message": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason Message"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source"
+    },
+    "state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "State"
+    },
+    "state_message": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "State Message"
+    }
+  },
+  "title": "ImageUpdateCatalogDetails",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

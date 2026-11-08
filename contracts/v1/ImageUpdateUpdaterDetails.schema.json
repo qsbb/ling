@@ -1,0 +1,58 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateUpdaterDetails.schema.json",
+  "additionalProperties": true,
+  "description": "更新器诊断：在线、状态、协议、版本。",
+  "properties": {
+    "online": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Online"
+    },
+    "protocol": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Protocol"
+    },
+    "state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "State"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    }
+  },
+  "title": "ImageUpdateUpdaterDetails",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

@@ -76,6 +76,37 @@ revision`` + 平台 / 当前运行摘要复核」，不是来自签名。
 权限：目录文件不涉密，``add`` 写成 ``0644``；``validate`` 只拒绝**其他人可写**
 （``0o002``）的文件。目录文件被改坏时更新器必须 fail closed（``available_targets=[]``
 + 明确原因），绝不"猜"一个目标。
+
+更新内容（``deploy/update-notes.json``）
+======================================
+「这一版改了什么」**不塞进** ``releases.json``：旧更新器（0.0.3）对目录字段是严格
+白名单（见 ``RELEASE_KEYS``），往目录里加任何新键都会让还在跑旧更新器的机器判定
+**整份目录不可信**——那会把它们的更新通道一起打哑。所以更新内容是**并列的另一个
+文件**，旧更新器完全不读它::
+
+    {
+      "schema": 1,
+      "notes": {
+        "0.0.4": {
+          "summary": "日程子系统与发送链路的可靠性修复",   # 必填，≤120 字
+          "items": ["她的一天：…", "…"],                    # ≤8 条，每条 ≤120 字
+          "url": "https://github.com/qsbb/ling/blob/main/CHANGELOG.md"  # 可选
+        }
+      }
+    }
+
+硬规则（与目录同一套风格：多一个键就拒绝，不"读的时候顺手忽略"）：
+
+- 根对象只有 ``schema`` / ``notes`` 两个键，``schema`` 必须是整数 ``1``；
+- ``notes`` 的**键**必须是严格 semver（与目录条目同一套 ``SEMVER_RE``）；条目数有上限；
+- 每条 note 只允许 ``summary`` / ``items`` / ``url``，``summary`` 必填；
+- ``summary`` ≤ 120 字、``items`` ≤ 8 条且每条 ≤ 120 字、``url`` 只允许 http/https
+  且 ≤ 512 字符；文本里不允许控制字符（换行会把网页卡片排版弄坏）；
+- 长度单位是**字符**（``len(str)``），不是字节：中文摘要按字数算。
+
+**校验失败／文件缺失只有一个后果：没有更新内容**。它绝不影响"能不能更新"的判定——
+更新内容不是信任锚，也不参与目标选择；所以 :func:`load_notes` 在文件缺失时返回
+**空结构**而不是抛错，调用方也不需要为它 fail closed。
 """
 
 from __future__ import annotations
@@ -113,7 +144,26 @@ RELEASED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 RELEASE_KEYS = ("version", "commit", "min_from", "has_migration", "released_at")
 ROOT_KEYS = ("schema", "releases")
 
+# 更新内容：**另一个文件**，与目录并列（见文件头「更新内容」一节）。
+# 它不参与"能不能更新"的判定，所以这里的上限只需要防畸形文件把网页卡片弄坏。
+NOTES_NAME = "update-notes.json"
+MAX_NOTES_BYTES = 64 * 1024
+MAX_NOTES = 256
+MAX_NOTE_ITEMS = 8
+MAX_NOTE_SUMMARY_CHARS = 120
+MAX_NOTE_ITEM_CHARS = 120
+MAX_NOTE_URL_CHARS = 512
+# 可选字段的**取值集合**：多一个键就拒绝（拼错字段名比缺字段更危险）。
+NOTE_KEYS = ("summary", "items", "url")
+NOTES_ROOT_KEYS = ("schema", "notes")
+# 只允许 http/https：更新内容里的链接会被网页渲染成可点的「完整更新日志」，
+# 不接受 `javascript:` / `data:` 这类协议。
+NOTE_URL_RE = re.compile(r"^https?://\S+$")
+# 控制字符（含换行/制表）会把卡片排版弄坏，也不该出现在发布文案里。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / CATALOG_NAME
+DEFAULT_NOTES = Path(__file__).resolve().parents[1] / NOTES_NAME
 
 
 class CatalogError(ValueError):
@@ -304,6 +354,134 @@ def load_catalog(path: Path) -> dict[str, Any]:
     return parse_catalog(raw)
 
 
+# ---------------------------------------------------------------- 更新内容
+
+
+def _note_text(raw: object, *, where: str, limit: int) -> str:
+    """note 里的一段文案：非空字符串、不超字数、不含控制字符。"""
+    if not isinstance(raw, str):
+        raise _fail("note_text_invalid", f"{where} 必须是字符串")
+    if not raw.strip():
+        raise _fail("note_text_invalid", f"{where} 不能为空")
+    if _CONTROL_CHARS_RE.search(raw):
+        raise _fail("note_text_invalid", f"{where} 含控制字符（换行/制表等）")
+    # 「字数」= 字符数，不按字节：中文摘要按字数算才符合设计文档的 120 字上限。
+    if len(raw) > limit:
+        raise _fail("note_text_too_long", f"{where} 超过 {limit} 字（{len(raw)} 字）")
+    return raw
+
+
+def _validate_note(raw: object, version: str) -> dict[str, Any]:
+    where = f"notes[{version!r}]"
+    if not isinstance(raw, dict):
+        raise _fail("note_not_object", f"{where} 必须是 JSON 对象")
+    keys = set(raw)
+    if "summary" not in keys:
+        raise _fail("note_field_missing", f"{where} 缺字段：summary")
+    extra = sorted(keys - set(NOTE_KEYS))
+    if extra:
+        raise _fail("note_field_unknown", f"{where} 有未知字段：{extra}")
+    summary = _note_text(
+        raw["summary"], where=f"{where}.summary", limit=MAX_NOTE_SUMMARY_CHARS
+    )
+    items_raw = raw.get("items", [])
+    if not isinstance(items_raw, list):
+        raise _fail("note_items_invalid", f"{where}.items 必须是字符串数组")
+    if len(items_raw) > MAX_NOTE_ITEMS:
+        raise _fail(
+            "note_items_invalid",
+            f"{where}.items 条目过多（上限 {MAX_NOTE_ITEMS}）",
+        )
+    items = [
+        _note_text(item, where=f"{where}.items[{index}]", limit=MAX_NOTE_ITEM_CHARS)
+        for index, item in enumerate(items_raw)
+    ]
+    url = raw.get("url")
+    if url is not None:
+        if not isinstance(url, str) or len(url) > MAX_NOTE_URL_CHARS:
+            raise _fail(
+                "note_url_invalid",
+                f"{where}.url 必须是 ≤{MAX_NOTE_URL_CHARS} 字符的字符串",
+            )
+        if NOTE_URL_RE.fullmatch(url) is None:
+            raise _fail("note_url_invalid", f"{where}.url 只接受 http/https 链接")
+    return {"summary": summary, "items": items, "url": url}
+
+
+def parse_notes(raw: bytes) -> dict[str, Any]:
+    """解析并严格校验 ``update-notes.json`` 的字节；返回规范化结构。
+
+    抛 :class:`CatalogError`（与目录共用同一个异常类型：调用方只需要一套错误码
+    处理）。不做任何 I/O，也不看条目顺序。
+
+    ``notes`` 里的版本**不要求**出现在 ``releases.json`` 里：两个文件各自提交、
+    各自评审，把更新内容绑在目录条目上只会让发布顺序变成新的坑。更新器只挑它
+    真正要展示的那一两条（当前可用目标、最高新版本）。
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        raise _fail("not_bytes", "更新内容必须是字节")
+    if len(raw) > MAX_NOTES_BYTES:
+        raise _fail("too_large", f"更新内容文件超过 {MAX_NOTES_BYTES} 字节")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fail("not_utf8", "更新内容文件必须是 UTF-8") from exc
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise _fail("not_json", "更新内容文件不是合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise _fail("not_object", "更新内容根必须是 JSON 对象")
+    missing = [key for key in NOTES_ROOT_KEYS if key not in payload]
+    if missing:
+        raise _fail("root_field_missing", f"更新内容根缺字段：{missing}")
+    extra = sorted(set(payload) - set(NOTES_ROOT_KEYS))
+    if extra:
+        raise _fail("root_field_unknown", f"更新内容根有未知字段：{extra}")
+    schema = payload["schema"]
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise _fail("schema_invalid", "schema 必须是整数 1")
+    if schema != SCHEMA:
+        raise _fail("schema_unsupported", f"不认识的更新内容 schema：{schema}")
+
+    notes_raw = payload["notes"]
+    if not isinstance(notes_raw, dict):
+        raise _fail("notes_not_object", "notes 必须是「版本 -> 条目」的对象")
+    if len(notes_raw) > MAX_NOTES:
+        raise _fail("notes_too_many", f"notes 条目过多（上限 {MAX_NOTES}）")
+    notes: dict[str, Any] = {}
+    for version, item in notes_raw.items():
+        if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
+            raise _fail("notes_version_invalid", f"notes 的键不是严格 semver：{version!r}")
+        notes[version] = _validate_note(item, version)
+    return {"schema": SCHEMA, "notes": notes}
+
+
+def load_notes(path: Path) -> dict[str, Any]:
+    """读取并校验更新内容文件；**文件缺失返回空结构**（不是异常）。
+
+    为什么缺失不抛错：更新内容只是"有没有说明"，缺了只该显示"这一版没有提供
+    更新说明"，绝不该让调用方（更新器）在刷新目录时崩掉或把目录判成不可用。
+    其它坏情况（不是普通文件、太大、读不了、结构不对）仍然抛
+    :class:`CatalogError`：那些是"文件在、但内容不可信"，调用方要记 ``invalid``。
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"schema": SCHEMA, "notes": {}}
+    except OSError as exc:
+        raise _fail("unreadable", f"更新内容文件不可读：{path}（{type(exc).__name__}）") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise _fail("not_a_file", f"更新内容必须是普通文件（不接受符号链接/目录）：{path}")
+    if info.st_size > MAX_NOTES_BYTES:
+        raise _fail("too_large", f"更新内容文件超过 {MAX_NOTES_BYTES} 字节：{path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise _fail("unreadable", f"更新内容文件不可读：{path}（{type(exc).__name__}）") from exc
+    return parse_notes(raw)
+
+
 def render_catalog(catalog: dict[str, Any]) -> str:
     """稳定序列化：固定字段顺序 + 缩进 + 结尾换行（便于人工评审 diff）。"""
     releases = [{key: entry[key] for key in RELEASE_KEYS} for entry in catalog.get("releases", [])]
@@ -474,9 +652,17 @@ def _min_from_values(raw: Sequence[str]) -> list[str]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     path = Path(args.catalog).expanduser()
+    notes: dict[str, Any] | None = None
     try:
         if args.command == "validate":
             catalog = load_catalog(path)
+            # 同目录下的更新内容文件：**在就校验，不在就跳过**（它是可选的加法
+            # 文件）。同一条 CI 命令顺带守住"发布时把 update-notes.json 写坏"——
+            # 那份文件一旦结构不对，更新器只会记 `release_notes.state=invalid`，
+            # 页面从此看不到更新说明，而且没有任何别的地方会报错。
+            notes_path = path.parent / NOTES_NAME
+            if notes_path.exists():
+                notes = load_notes(notes_path)
         else:
             catalog, state = add_release(
                 path,
@@ -494,6 +680,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"OK schema={SCHEMA} releases={len(catalog['releases'])}")
     for entry in sort_releases(catalog["releases"]):
         print(_describe(entry))
+    if notes is not None:
+        print(f"OK {NOTES_NAME} notes={len(notes['notes'])}")
     return 0
 
 

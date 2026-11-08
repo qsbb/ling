@@ -27,7 +27,7 @@
 11. 断连重连（前端轮询中断后继续）——同一 request_id 延续，不断言失败
 12. 旧执行器残留（源码模式 pending.json / 旧 status）——显式拒绝或忽略
 13. 并发请求（同时两个请求 / 同一 request_id 重放）——单飞、第二个被拒
-14. API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不在目录）
+14. API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不是这次检查发现的那个）
 
 **复用**：``tests/test_release_publish.py`` 的 publish 工作区与 docker stub、
 ``tests/test_updater.py`` 的 updater 工作区与 docker stub、
@@ -1234,7 +1234,7 @@ async def test_13_api_duplicate_request_id_replay_writes_only_one_file(
 
 
 # ================================================================ 清单第 14 条
-# API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不在目录）。
+# API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不是这次发现的那个）。
 
 
 @pytest.mark.parametrize(
@@ -1244,7 +1244,7 @@ async def test_13_api_duplicate_request_id_replay_writes_only_one_file(
         ("offline", "updater_offline"),
         ("protocol", "protocol_unsupported"),
         ("no_restore_point", "backup_gate_missing"),
-        ("target_outside_catalog", "target_not_in_catalog"),
+        ("target_not_discovered", "target_not_available"),
     ],
 )
 @pytest.mark.w0_web
@@ -1285,11 +1285,16 @@ async def test_14_api_gates_reject_with_actionable_reason(
     assert error["message"], case
     # 拒绝必须可执行：页面上的 view 给出原因码表文案 + 至少有一步可操作建议。
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    if case == "target_outside_catalog":
-        # 其余门禁都过，能安装；但目录之外的摘要仍被拒绝（GET 不谎报不可安装）。
+    if case == "target_not_discovered":
+        # 其余门禁都过，能安装；但"不是这次发现的摘要"仍被拒绝
+        # （GET 不谎报不可安装：installable 仍为 true，拒绝只发生在提交时）。
         assert view["installable"] is True
         assert view["reason"] is None
-        assert "可信发布目录" in error["message"]
+        # 四态结论仍是 available，且 **GET 给的就是本次发现的那个摘要**——
+        # 目标只能来自发现，不能由调用方自己编（设计 §10）。
+        assert view["state"] == "available"
+        assert view["target"]["digest"] == api_harness.TARGET_DIGEST
+        assert "这次检查发现" in error["message"]
     else:
         assert view["installable"] is False
         assert view["reason"] == expected_reason
@@ -1299,13 +1304,29 @@ async def test_14_api_gates_reject_with_actionable_reason(
 
 
 @pytest.mark.w0_web
-async def test_14_api_reports_no_available_target_when_catalog_empty(
+async def test_14_api_reports_no_available_target_when_no_newer_version(
     logged_in: Any, tmp_path: Path
 ) -> None:
-    """清单第 14 条补充：目录里没有可用目标 → 不可安装，且原因是 no_available_target。"""
+    """清单第 14 条补充：registry 说没有更高版本 → 不可安装，原因 no_available_target。
+
+    这条顶替的是旧的「目录里没有可用目标」：目录已经删除，"没有可安装目标"现在
+    只有一种可信来源——``release_check.state=ok`` 且 ``latest`` 不高于当前版本。
+    它还钉住一句容易说反的话：这时四态必须是 ``latest``（已是最新），**不是**
+    ``unknown``（查不到）；两者都会让 ``target`` 为空，只有前者允许说"已是最新"。
+    """
     base = api_harness._configure(logged_in, tmp_path)
-    api_harness._write_status(base, available_targets=[], recommended_target=None)
+    api_harness._write_status(
+        base,
+        release_check=api_harness._release_check(
+            latest={
+                "version": api_harness.CURRENT_VERSION,
+                "digest": api_harness.CURRENT_DIGEST_HEX,
+                "commit": None,
+            }
+        ),
+    )
     view = (await logged_in.client.get("/v1/version/image-update")).json()
+    assert view["state"] == "latest"
     assert view["installable"] is False
     assert view["reason"] == "no_available_target"
     assert view["next_actions"]

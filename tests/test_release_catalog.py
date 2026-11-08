@@ -603,6 +603,202 @@ def test_cli_written_file_is_valid_and_world_readable_only(tmp_path: Path) -> No
     assert catalog.load_catalog(path)["releases"][0]["released_at"] == RELEASED_AT
 
 
+# ---------------------------------------------------------------- 更新内容（update-notes.json）
+#
+# 更新内容是**并列的另一个文件**，不是目录的新字段：旧更新器（0.0.3）对
+# `releases.json` 的条目是严格白名单，多一个键就判整份目录不可信——那会把还在跑
+# 旧更新器的机器一起打哑。所以这里守两件事：
+#
+# 1. 目录的字段集合**没变**（更新内容的任何东西都不许漏进 releases.json）；
+# 2. 更新内容自己的校验严格到"多一个键/超长/坏 JSON"全部拒绝，而**文件缺失返回
+#    空结构**（只是没有说明，绝不影响能不能更新）。
+
+# 仓库里那份更新内容（路径常量由 catalog.py 提供，避免测试自己拼一份）。
+REPO_NOTES = catalog.DEFAULT_NOTES
+
+
+def note_doc(**notes: dict[str, Any]) -> dict[str, Any]:
+    return {"schema": 1, "notes": dict(notes)}
+
+
+def a_note(
+    summary: str = "一次可靠性修复",
+    items: list[str] | None = None,
+    url: str | None = "https://github.com/qsbb/ling/blob/main/CHANGELOG.md",
+) -> dict[str, Any]:
+    return {"summary": summary, "items": [] if items is None else items, "url": url}
+
+
+def notes_error_code(payload: object) -> str:
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.parse_notes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    return info.value.code
+
+
+def test_repository_notes_are_valid_and_describe_0_0_4() -> None:
+    """仓库里的更新内容必须能过门禁，且至少覆盖当前的发布版本。"""
+    parsed = catalog.load_notes(REPO_NOTES)
+    assert parsed["schema"] == 1
+    notes = parsed["notes"]
+    assert notes, "仓库里应当带上一版的更新内容（否则页面永远是「没有提供更新说明」）"
+    entry = notes.get("0.0.4")
+    assert entry is not None, sorted(notes)
+    assert len(entry["summary"]) <= catalog.MAX_NOTE_SUMMARY_CHARS
+    assert 1 <= len(entry["items"]) <= catalog.MAX_NOTE_ITEMS
+    for item in entry["items"]:
+        assert len(item) <= catalog.MAX_NOTE_ITEM_CHARS
+    assert entry["url"].startswith("https://github.com/qsbb/ling/")
+    # 权限位：与目录同一口径（组/世界不可写）。
+    assert stat.S_IMODE(REPO_NOTES.stat().st_mode) & 0o022 == 0
+
+
+def test_repository_catalog_does_not_carry_update_notes() -> None:
+    """更新内容不能塞进目录：那会让旧更新器判整份目录不可信。"""
+    parsed = catalog.load_catalog(REPO_CATALOG)
+    assert set(catalog.RELEASE_KEYS) == {
+        "version",
+        "commit",
+        "min_from",
+        "has_migration",
+        "released_at",
+    }
+    raw = json.loads(REPO_CATALOG.read_text(encoding="utf-8"))
+    assert set(raw) == {"schema", "releases"}
+    dumped = json.dumps(raw)
+    assert "notes" not in dumped and "summary" not in dumped
+    assert [entry["version"] for entry in parsed["releases"]]
+
+
+def test_notes_roundtrip_normalizes_optional_fields() -> None:
+    parsed = catalog.parse_notes(
+        json.dumps({"schema": 1, "notes": {"0.0.4": {"summary": "s"}}}).encode("utf-8")
+    )
+    # items 缺省 -> 空数组；url 缺省 -> None（形状固定，网页不用猜）。
+    assert parsed == {
+        "schema": 1,
+        "notes": {"0.0.4": {"summary": "s", "items": [], "url": None}},
+    }
+
+
+def test_notes_length_limits_are_characters_not_bytes() -> None:
+    """120 个汉字（约 360 字节）合法：上限是**字**，不是字节。"""
+    summary = "修" * catalog.MAX_NOTE_SUMMARY_CHARS
+    item = "改" * catalog.MAX_NOTE_ITEM_CHARS
+    body = json.dumps(
+        {"schema": 1, "notes": {"0.0.4": {"summary": summary, "items": [item]}}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert len(body) > catalog.MAX_NOTE_SUMMARY_CHARS * 3
+    parsed = catalog.parse_notes(body)
+    assert parsed["notes"]["0.0.4"]["summary"] == summary
+    assert parsed["notes"]["0.0.4"]["items"] == [item]
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        ([], "not_object"),
+        ({"schema": 1}, "root_field_missing"),
+        ({"notes": {}}, "root_field_missing"),
+        ({"schema": 1, "notes": {}, "extra": 1}, "root_field_unknown"),
+        ({"schema": 2, "notes": {}}, "schema_unsupported"),
+        ({"schema": True, "notes": {}}, "schema_invalid"),
+        ({"schema": 1, "notes": []}, "notes_not_object"),
+        ({"schema": 1, "notes": {"v0.0.4": a_note()}}, "notes_version_invalid"),
+        ({"schema": 1, "notes": {"latest": a_note()}}, "notes_version_invalid"),
+        ({"schema": 1, "notes": {"0.0.4": "x"}}, "note_not_object"),
+        ({"schema": 1, "notes": {"0.0.4": {"items": []}}}, "note_field_missing"),
+        (
+            {"schema": 1, "notes": {"0.0.4": {**a_note(), "extra": 1}}},
+            "note_field_unknown",
+        ),
+        ({"schema": 1, "notes": {"0.0.4": a_note(summary="")}}, "note_text_invalid"),
+        (
+            {"schema": 1, "notes": {"0.0.4": a_note(summary="两行\n摘要")}},
+            "note_text_invalid",
+        ),
+        (
+            {"schema": 1, "notes": {"0.0.4": a_note(summary="长" * 121)}},
+            "note_text_too_long",
+        ),
+        (
+            {"schema": 1, "notes": {"0.0.4": a_note(items=["长" * 121])}},
+            "note_text_too_long",
+        ),
+        ({"schema": 1, "notes": {"0.0.4": a_note(items=["a"] * 9)}}, "note_items_invalid"),
+        ({"schema": 1, "notes": {"0.0.4": a_note(items="不是数组")}}, "note_items_invalid"),
+        ({"schema": 1, "notes": {"0.0.4": a_note(items=[1])}}, "note_text_invalid"),
+        (
+            {"schema": 1, "notes": {"0.0.4": a_note(url="javascript:alert(1)")}},
+            "note_url_invalid",
+        ),
+        (
+            {"schema": 1, "notes": {"0.0.4": a_note(url="https://x.example/" + "a" * 500)}},
+            "note_url_invalid",
+        ),
+    ],
+)
+def test_invalid_notes_are_rejected(payload: object, code: str) -> None:
+    assert notes_error_code(payload) == code
+
+
+def test_notes_reject_bad_bytes_and_bad_json() -> None:
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.parse_notes(b"\xff\xfe\x00")
+    assert info.value.code == "not_utf8"
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.parse_notes(b"{ not json")
+    assert info.value.code == "not_json"
+
+
+def test_notes_too_large_is_rejected_before_parsing() -> None:
+    body = b'{"schema": 1, "notes": {}}' + b" " * catalog.MAX_NOTES_BYTES
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.parse_notes(body)
+    assert info.value.code == "too_large"
+
+
+def test_load_notes_returns_empty_when_the_file_is_missing(tmp_path: Path) -> None:
+    """文件缺失 → **空结构**，不抛给上层（"没有说明"≠"出错"）。"""
+    assert catalog.load_notes(tmp_path / "update-notes.json") == {"schema": 1, "notes": {}}
+
+
+def test_load_notes_rejects_a_directory_and_an_oversized_file(tmp_path: Path) -> None:
+    directory = tmp_path / "notes-dir"
+    directory.mkdir()
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.load_notes(directory)
+    assert info.value.code == "not_a_file"
+    path = tmp_path / "update-notes.json"
+    path.write_bytes(b'{"schema": 1, "notes": {}}' + b" " * catalog.MAX_NOTES_BYTES)
+    with pytest.raises(catalog.CatalogError) as info:
+        catalog.load_notes(path)
+    assert info.value.code == "too_large"
+
+
+def test_cli_validate_also_checks_the_sibling_notes_file(tmp_path: Path) -> None:
+    """`catalog.py validate` 顺手校验同目录的更新内容：**在就校验，不在就跳过**。
+
+    这是"发版时把 update-notes.json 写坏"的唯一自动拦截点：写坏的后果只是更新器
+    记 `release_notes.state=invalid`，页面从此看不到更新说明，别处不会报错。
+    """
+    catalog_path = write(tmp_path / "releases.json", good(release("0.0.4")))
+    # 没有更新内容文件：照旧通过（它是可选的加法文件）。
+    result = run_cli("validate", "--catalog", str(catalog_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "update-notes.json" not in result.stdout
+
+    write(tmp_path / "update-notes.json", note_doc(**{"0.0.4": a_note()}))
+    result = run_cli("validate", "--catalog", str(catalog_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "OK update-notes.json notes=1" in result.stdout
+
+    write(tmp_path / "update-notes.json", {"schema": 1, "notes": {"0.0.4": {"items": []}}})
+    result = run_cli("validate", "--catalog", str(catalog_path))
+    assert result.returncode == 2
+    assert "note_field_missing" in result.stderr
+
+
 # ---------------------------------------------------------------- CLI 帮助文本
 #
 # 背景（2026-11 CI 的 updater-image job 实跑失败）：`--released-at` 的 help 曾经是

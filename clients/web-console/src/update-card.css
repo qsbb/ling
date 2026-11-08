@@ -1,0 +1,217 @@
+/* =========================================================================
+   「关于与版本 → 更新」卡片（docs/UPDATE-UX-DESIGN.md 四态）
+
+   首屏只有：当前版本 / 一句话结论 / 检查时间 / 一个主按钮。
+   这里只补卡片自己的排版；`.panel` / `.button` / `.about-facts` / `.update-confirm`
+   等通用样式仍在 styles.css，不重复定义。
+
+   窄屏纪律：所有容器 `min-width: 0` + `overflow-wrap: anywhere`，长 digest、
+   commit、URL 和发布方写的长句子都只能在卡片内部换行，不允许把页面撑出横向滚动。
+   刻意禁止不换行：这一块的内容长度全由后端决定。
+   ========================================================================= */
+
+.update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.update-card__version {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-card__conclusion {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-card__checked {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-card__last-task {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--warn);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-card__notice {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  background: var(--paper-sunken);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-card__notice strong {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.update-card__notice--warn {
+  border-color: var(--line-strong);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.update-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.update-card__primary {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 更新内容 */
+
+.update-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  min-width: 0;
+}
+
+.update-notes__title,
+.update-details__title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-notes__summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-notes__list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  min-width: 0;
+}
+
+.update-notes__list li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-notes__empty {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.update-notes__link {
+  align-self: flex-start;
+  max-width: 100%;
+  color: var(--accent);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.update-notes__more {
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+/* ---------------------------------------------------------------- 详情 */
+
+.update-details,
+.update-task {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  min-width: 0;
+}
+
+.update-details__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.update-details__item {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.update-details__item code,
+.update-details .about-facts code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--paper-sunken);
+  border-radius: 5px;
+  padding: 2px 6px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .update-card__actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .update-card__actions .button,
+  .update-card__actions .ghost-button {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .update-notes__link {
+    align-self: stretch;
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageUpdateBackupGateDetails.schema.json",
+  "additionalProperties": true,
+  "description": "恢复点诊断：是否真有可用备份、原因与检查时间。",
+  "properties": {
+    "checked_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Checked At"
+    },
+    "complete": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Complete"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "reason_message": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason Message"
+    },
+    "restore_point": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Restore Point"
+    }
+  },
+  "title": "ImageUpdateBackupGateDetails",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

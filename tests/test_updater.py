@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,10 @@ HEAD_OLD = "0044_media_describe_failed"
 HEAD_NEW = "0045_turn_control_attempt"
 REQUEST_ID = "1" * 32
 REQUEST_ID_B = "2" * 32
+# 刷新请求（按需检查）的 ID：与安装请求同一个 32 位小写 hex 空间，但文件名
+# 前缀不同（`refresh-` vs `request-`）。
+REFRESH_ID = "5" * 32
+REFRESH_ID_B = "6" * 32
 T0 = "2026-11-04T00:00:00Z"
 # 更新器**自己的**镜像（固定 digest，与 deploy/updater/compose.yaml 的
 # `LING_UPDATER_IMAGE` 同形）。宿主端口探针必须用它跑一次性容器（缺陷 7），
@@ -83,10 +88,56 @@ STATUS_KEYS = {
     "updater",
     "task",
     "backup_gate",
+    # **只读兼容**：目录不再参与判定，这个键只为"旧 API 不崩"而写。
     "release_catalog",
+    # 版本发现的**唯一**事实来源（新键，`schema`/`protocol` 不变）。
+    "release_check",
     "available_targets",
     "recommended_target",
+    # 更新说明：只放 latest 那一版。
+    "release_notes",
 }
+RELEASE_CHECK_KEYS = {
+    "state",
+    "checked_at",
+    "check_id",
+    "source",
+    "reason",
+    "reason_detail",
+    "current",
+    "latest",
+    "tag_count",
+}
+RELEASE_CHECK_CURRENT_KEYS = {"version", "digest"}
+RELEASE_CHECK_LATEST_KEYS = {"version", "digest", "commit"}
+RELEASE_CHECK_REASONS = {
+    "registry_unreachable",
+    "auth_failed",
+    "rate_limited",
+    "timeout",
+    "no_stable_tags",
+    "manifest_failed",
+    "digest_missing",
+    "platform_missing",
+}
+CATALOG_COMPAT_KEYS = {
+    "state",
+    "reason",
+    "entries",
+    "current_version",
+    "source",
+    "checked_at",
+}
+TARGET_KEYS = {
+    "version",
+    "digest",
+    "commit",
+    "has_migration",
+    "compatible",
+    "incompatible_reason",
+}
+RELEASE_NOTES_KEYS = {"state", "reason", "notes"}
+RELEASE_NOTE_KEYS = {"summary", "items", "url"}
 # 恢复点门禁的固定结构：与 task 无关，由扫描备份目录得到（新增字段，见
 # updater.py 的「恢复点门禁为什么必须是独立顶层字段」）。
 BACKUP_GATE_KEYS = {
@@ -665,24 +716,221 @@ sys.exit(64)
 
 
 class _HTTPState:
+    """本地 HTTP stub：宿主 readyz + **GHCR 替身** + GitHub Release 替身。
+
+    registry 的全部形态都由这里开关控制（分页/token/HEAD/平台/digest 缺失/限流…），
+    用例只改字段，不再依赖真实网络——测试套件在离线机器上必须全绿。
+    """
+
     def __init__(self) -> None:
         self.readyz_status = 200
         self.port = 0
         self.call_log: Path | None = None
+        # ---- GHCR 替身（更新器只认 `/v2/qsbb/ling-api` 这一条仓库）----
+        # 默认：当前跑的 0.0.1（旧摘要）+ 可升到的 0.0.2（请求里的目标摘要）。
+        self.registry_tags: list[str] = [f"v{CURRENT_VERSION}", f"v{TARGET_VERSION}"]
+        self.registry_digests: dict[str, str] = {
+            f"v{CURRENT_VERSION}": "sha256:" + OLD_HEX,
+            f"v{TARGET_VERSION}": "sha256:" + TARGET_HEX,
+        }
+        # 0 = 不翻页；>0 = 每页这么多条（返回 `Link: rel=next`）。
+        self.registry_page_size = 0
+        # True = 先回 401 Bearer challenge，拿到 `/token` 的 token 后才给数据。
+        self.registry_require_token = False
+        # HEAD 的状态码：405/501 用来测"HEAD 不可用 → 退回 GET"。
+        self.registry_head_status = 200
+        # index 里的平台清单；None = 默认 {linux/宿主架构, linux/另一架构}。
+        self.registry_platforms: list[dict[str, str]] | None = None
+        # False = 单平台 manifest（没有 index，也就没有平台清单可核）。
+        self.registry_index = True
+        # False = 不返回 `Docker-Content-Digest`（HEAD 路径下就是"摘要缺失"）。
+        self.registry_digest_header = True
+        # "" / "503" / "429" / "401_then_deny"：整体失败形态。
+        self.registry_fail = ""
+        # 每次 registry 请求前睡这么久（只用于客户端级超时用例）。
+        self.registry_delay = 0.0
+        # ---- GitHub Release 替身（可选更新说明来源）----
+        self.release_body: bytes | None = None
+        self.release_status = 200
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     server: _HTTPServer
 
+    # ------------------------------------------------------------ 记录
+    def _log(self, method: str) -> None:
+        """把请求写进 call log。**registry/github 用独立前缀**。
+
+        为什么前缀要分开：`_READ_ONLY_CALLS` 用前缀区分"只读事实查询"与"变更动作"，
+        而若干用例断言"没有碰宿主 HTTP"（`http GET` 只该是 `/readyz` 探活）。
+        把 registry 请求混进 `http GET` 会让那些断言变成假阳性/假阴性。
+        """
+        state = self.server.http_state
+        if state.call_log is None:
+            return
+        path = self.path
+        if path.startswith("/v2/") or path.startswith("/token"):
+            prefix = "registry"
+        elif path.startswith("/repos/qsbb/ling/releases/"):
+            prefix = "github"
+        else:
+            # UA 用来区分"谁在碰宿主 HTTP"：探针容器带 ling-host-readyz-probe/1；
+            # 进程自己 urlopen 带 ling-updater/<ver>。旧断言按子串匹配，不受影响。
+            prefix = "http"
+        agent = self.headers.get("User-Agent") or ""
+        with state.call_log.open("a", encoding="utf-8") as stream:
+            stream.write(f"{prefix} {method} {path} ua={agent}\n")
+
+    def _send(
+        self,
+        status: int,
+        body: bytes = b"",
+        *,
+        content_type: str = "application/json",
+        headers: dict[str, str] | None = None,
+        send_body: bool = True,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        if send_body and body:
+            self.wfile.write(body)
+
+    # ------------------------------------------------------------ registry
+    def _registry_denied(self, state: _HTTPState) -> bool:
+        """统一处理 registry 的失败形态与被拒的匿名请求（返回 True = 已回包）。"""
+        if state.registry_fail:
+            code = int(state.registry_fail) if state.registry_fail.isdigit() else 503
+            self._send(code, b'{"errors":[{"code":"DENIED"}]}')
+            return True
+        if not state.registry_require_token:
+            return False
+        if self.headers.get("Authorization") == "Bearer stub-registry-token":
+            return False
+        challenge = (
+            "Bearer "
+            f'realm="http://127.0.0.1:{state.port}/token",'
+            'service="ghcr.io",'
+            'scope="repository:qsbb/ling-api:pull"'
+        )
+        self._send(401, b'{"errors":[{"code":"UNAUTHORIZED"}]}',
+                   headers={"WWW-Authenticate": challenge})
+        return True
+
+    def _registry_token(self) -> None:
+        # 匿名 pull token：只需要 shape 对（客户端只读 `token` 字段）。
+        self._send(200, json.dumps({"token": "stub-registry-token"}).encode("utf-8"))
+
+    def _registry_tags(self, state: _HTTPState) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        page = int((query.get("page") or ["1"])[0])
+        tags = list(state.registry_tags)
+        headers: dict[str, str] = {}
+        if state.registry_page_size > 0:
+            size = state.registry_page_size
+            start = (page - 1) * size
+            tags = tags[start : start + size]
+            if page * size < len(state.registry_tags):
+                headers["Link"] = (
+                    f'</v2/qsbb/ling-api/tags/list?page={page + 1}>; rel="next"'
+                )
+        body = json.dumps({"name": "qsbb/ling-api", "tags": tags}).encode("utf-8")
+        self._send(200, body, headers=headers)
+
+    def _manifest_payload(self, state: _HTTPState, tag: str) -> tuple[bytes, str]:
+        if not state.registry_index:
+            payload = {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"digest": "sha256:" + "0" * 64},
+            }
+            return (
+                json.dumps(payload).encode("utf-8"),
+                "application/vnd.oci.image.manifest.v1+json",
+            )
+        platforms = state.registry_platforms
+        if platforms is None:
+            platforms = [
+                {"os": "linux", "architecture": HOST_ARCH},
+                {"os": "linux", "architecture": OTHER_ARCH},
+            ]
+        payload = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "digest": "sha256:" + f"{index}" * 64,
+                    "platform": platform,
+                }
+                for index, platform in enumerate(platforms)
+            ],
+        }
+        return (
+            json.dumps(payload).encode("utf-8"),
+            "application/vnd.oci.image.index.v1+json",
+        )
+
+    def _registry_manifest(self, state: _HTTPState, method: str) -> None:
+        if method == "HEAD" and state.registry_head_status != 200:
+            self._send(state.registry_head_status, b"", send_body=False)
+            return
+        tag = self.path.rsplit("/", 1)[-1]
+        body, content_type = self._manifest_payload(state, tag)
+        digest = state.registry_digests.get(tag)
+        headers: dict[str, str] = {}
+        if state.registry_digest_header and digest is not None:
+            headers["Docker-Content-Digest"] = digest
+        self._send(
+            200 if digest is not None else 404,
+            body if digest is not None else b"",
+            content_type=content_type,
+            headers=headers,
+            send_body=method != "HEAD",
+        )
+
+    def _dispatch_registry(self, state: _HTTPState, method: str) -> bool:
+        path = self.path
+        if path.startswith("/v2/qsbb/ling-api/tags/list"):
+            if self._registry_denied(state):
+                return True
+            self._registry_tags(state)
+            return True
+        if path.startswith("/v2/qsbb/ling-api/manifests/"):
+            if self._registry_denied(state):
+                return True
+            self._registry_manifest(state, method)
+            return True
+        if path.startswith("/v2/"):
+            self._send(404, b'{"errors":[{"code":"NAME_UNKNOWN"}]}')
+            return True
+        return False
+
+    # ------------------------------------------------------------ GitHub
+    def _dispatch_github(self, state: _HTTPState) -> bool:
+        if not self.path.startswith("/repos/qsbb/ling/releases/tags/"):
+            return False
+        if state.release_body is None or state.release_status != 200:
+            self._send(state.release_status, b'{"message":"Not Found"}')
+            return True
+        self._send(200, state.release_body)
+        return True
+
+    # ------------------------------------------------------------ 入口
     def do_GET(self) -> None:  # noqa: N802
         state = self.server.http_state
-        if state.call_log is not None:
-            agent = self.headers.get("User-Agent") or ""
-            with state.call_log.open("a", encoding="utf-8") as stream:
-                # UA 用来区分"谁在碰宿主 HTTP"：探针容器（缺陷 7）带
-                # ling-host-readyz-probe/1；进程自己 urlopen 会带
-                # ling-release-publish/1。旧断言按子串匹配，不受影响。
-                stream.write(f"http GET {self.path} ua={agent}\n")
+        self._log("GET")
+        if state.registry_delay:
+            time.sleep(state.registry_delay)
+        if self.path.startswith("/token"):
+            self._registry_token()
+            return
+        if self._dispatch_registry(state, "GET"):
+            return
+        if self._dispatch_github(state):
+            return
         if self.path == "/readyz":
             status = state.readyz_status
             body = b"ok" if status == 200 else b"not ready"
@@ -695,11 +943,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             status = 404
             body = b"not found"
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send(status, body)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        state = self.server.http_state
+        self._log("HEAD")
+        if state.registry_delay:
+            time.sleep(state.registry_delay)
+        if self._dispatch_registry(state, "HEAD"):
+            return
+        self._send(404, b"", send_body=False)
 
     def log_message(self, *args: Any) -> None:
         return
@@ -856,46 +1109,6 @@ def _config_json(port: int) -> dict[str, Any]:
     }
 
 
-def catalog_entry(
-    version: str = TARGET_VERSION,
-    *,
-    commit: str = COMMIT,
-    min_from: list[str] | None = None,
-    has_migration: bool = True,
-    released_at: str = RELEASED_AT,
-) -> dict[str, Any]:
-    """目录里的一条发布记录（结构必须与 deploy/release/catalog.py 的 schema 一致）。
-
-    **没有 digest 字段**：目标摘要由更新器刷新时从 registry 解析，目录只放发布
-    决策。多写一个 `digest` 会被 `catalog.py` 判成未知字段（整份目录不可信）。
-    """
-    return {
-        "version": version,
-        "commit": commit,
-        "min_from": [CURRENT_VERSION] if min_from is None else min_from,
-        "has_migration": has_migration,
-        "released_at": released_at,
-    }
-
-
-def catalog_releases() -> list[dict[str, Any]]:
-    """默认目录：当前装的 0.0.1 + 目标 0.0.2（可用目标=0.0.2）。
-
-    当前版本**不来自目录**：它读运行中 api 镜像的
-    `org.opencontainers.image.version` 标注（stub 默认 `0.0.1`）。目标摘要同理由
-    `docker manifest inspect ...:v0.0.2` 解析（stub 给本机平台 `TARGET_HEX`）。
-    """
-    return [
-        catalog_entry(
-            CURRENT_VERSION,
-            commit=OLD_COMMIT,
-            min_from=["0.0.0"],
-            has_migration=False,
-        ),
-        catalog_entry(TARGET_VERSION),
-    ]
-
-
 @dataclass
 class Workspace:
     root: Path
@@ -939,20 +1152,29 @@ class Workspace:
         state.update(fields)
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
-    def write_catalog(self, releases: list[dict[str, Any]] | None = None) -> Path:
-        """写一份可信发布目录（默认：当前 0.0.1 → 目标 0.0.2，可升级）。"""
-        payload = {
-            "schema": 1,
-            "releases": catalog_releases() if releases is None else releases,
-        }
-        self.release_catalog.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        self.release_catalog.chmod(0o644)
-        return self.release_catalog
+    def set_registry(
+        self,
+        tags: list[str] | None = None,
+        *,
+        digests: dict[str, str] | None = None,
+    ) -> None:
+        """设置 registry 替身返回的 tag 列表（默认：当前 0.0.1 + 目标 0.0.2）。
 
-    def catalog_entry(self, version: str = TARGET_VERSION, **overrides: Any) -> dict[str, Any]:
-        return catalog_entry(version, **overrides)
+        版本的唯一事实源是 GHCR（见 updater 模块 docstring），所以"发新版"这类
+        场景改的是这里，不再是 `releases.json`。
+        """
+        self.http.registry_tags = (
+            [f"v{CURRENT_VERSION}", f"v{TARGET_VERSION}"] if tags is None else list(tags)
+        )
+        if digests is not None:
+            self.http.registry_digests = dict(digests)
+
+    def status_registry_calls(self) -> list[str]:
+        """本轮打给 GHCR 替身的请求（按顺序）。"""
+        return [line for line in self.calls() if line.startswith("registry ")]
+
+    def status_github_calls(self) -> list[str]:
+        return [line for line in self.calls() if line.startswith("github ")]
 
 
 @pytest.fixture()
@@ -983,9 +1205,12 @@ def ws(tmp_path: Path, http_state: Any) -> Workspace:
     requests_dir.mkdir()
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    # 发行包里那份 `releases.json`：**更新器不再读它**，但路径仍然存在（发行包布局
+    # 没变，`update-notes.json` 与它同目录）。留着它是为了证明"目录缺失/坏掉也
+    # 不影响更新判定"，而不是为了让测试通过。
     release_catalog = deploy / "releases.json"
     release_catalog.write_text(
-        json.dumps({"schema": 1, "releases": catalog_releases()}, indent=2) + "\n",
+        json.dumps({"schema": 1, "releases": []}, indent=2) + "\n",
         encoding="utf-8",
     )
     release_catalog.chmod(0o644)
@@ -1022,10 +1247,11 @@ def ws(tmp_path: Path, http_state: Any) -> Workspace:
     for key in list(env):
         if key.startswith(("LING_", "COMPOSE_", "DOCKER_")):
             env.pop(key, None)
-    # 这个变量默认指向 GitHub 上的真实目录。测试必须显式关掉，否则"目录缺失
-    # 应报 catalog_missing"这类用例会真的去拉公网那份、然后断言失败——
-    # 而且测试套件会变成需要网络的（离线机器上全红）。
-    env["LING_UPDATER_CATALOG_URL"] = ""
+    # registry 与 GitHub Release 的 base URL 都指到本地 stub：测试套件必须离线全绿。
+    # 生产默认值是常量（`https://ghcr.io` / `https://api.github.com`），这两个环境
+    # 变量是**唯一**的注入点，请求方（网页/API/请求文件）影响不到它们。
+    env["LING_UPDATER_REGISTRY"] = f"http://127.0.0.1:{http_state.port}"
+    env["LING_UPDATER_RELEASE_API"] = f"http://127.0.0.1:{http_state.port}"
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"):
         env.pop(key, None)
     env.update(
@@ -1102,6 +1328,60 @@ def write_request(
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     os.replace(tmp, final)
     return final
+
+
+def write_refresh(
+    ws: Workspace,
+    request_id: str = REFRESH_ID,
+    *,
+    extra: dict[str, Any] | None = None,
+    drop: tuple[str, ...] = (),
+    rename_to: str | None = None,
+) -> Path:
+    """写一个刷新请求（``refresh-<id>.json``，与 API 同款：临时文件 + rename）。"""
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "request_id": request_id,
+        "kind": "refresh",
+        "created_at": T0,
+    }
+    payload.update(extra or {})
+    for key in drop:
+        payload.pop(key, None)
+    tmp = ws.requests_dir / f".refresh-{request_id}.json.tmp"
+    final = ws.requests_dir / (rename_to or f"refresh-{request_id}.json")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, final)
+    return final
+
+
+def note(
+    summary: str = "日程子系统与发送链路的可靠性修复",
+    items: list[str] | None = None,
+    url: str | None = "https://github.com/qsbb/ling/blob/main/CHANGELOG.md",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"summary": summary, "items": items if items is not None else []}
+    payload["url"] = url
+    return payload
+
+
+def notes_document(**entries: dict[str, Any]) -> dict[str, Any]:
+    return {"schema": 1, "notes": dict(entries)}
+
+
+def write_notes(ws: Workspace, payload: object) -> Path:
+    """写发行包里那份本地更新内容（与 releases.json 同目录）。"""
+    path = ws.release_catalog.parent / "update-notes.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.chmod(0o644)
+    return path
+
+
+def write_notes_raw(ws: Workspace, body: bytes) -> Path:
+    path = ws.release_catalog.parent / "update-notes.json"
+    path.write_bytes(body)
+    path.chmod(0o644)
+    return path
 
 
 def write_manifest(
@@ -1315,6 +1595,10 @@ _READ_ONLY_CALLS = (
     "docker inspect ",
     "docker image inspect ",
     "docker manifest inspect ",
+    # 版本发现只发 HTTPS 只读请求（`registry` = GHCR 替身，`github` = 可选的
+    # Release 说明）。它们不改环境，但确实是外部调用——节流与"不每轮都查"另有用例。
+    "registry ",
+    "github ",
 )
 
 
@@ -1324,7 +1608,12 @@ def mutating_calls(ws: Workspace) -> list[str]:
 
 
 def manifest_inspect_refs(ws: Workspace) -> list[str]:
-    """本轮真正问过 registry 的 tag（按顺序）。"""
+    """本轮更新器**自己**经 ``docker`` 问过 registry 的引用（按顺序）。
+
+    版本发现改成直连 GHCR 之后，这里只剩 publish 在安装阶段按 **digest** 发的
+    ``docker manifest inspect``（``ghcr.io/qsbb/ling-api@sha256:...``）。旧断言
+    "更新器只问固定 tag"因此仍然成立：列表里不会再出现 ``:vX.Y.Z``。
+    """
     refs: list[str] = []
     for line in ws.calls():
         if not line.startswith("docker manifest inspect "):
@@ -2321,6 +2610,27 @@ def test_status_file_is_sanitized_and_fixed_shape(ws: Workspace) -> None:
     assert set(status) == STATUS_KEYS
     assert set(status["task"]) == TASK_VIEW_KEYS
     assert set(status["updater"]) == {"state", "version"}
+    # 加法字段的形状也是固定码表（不放自由文本、不放路径、不放主机名）。
+    check = status["release_check"]
+    assert set(check) == RELEASE_CHECK_KEYS
+    assert set(check["current"]) == RELEASE_CHECK_CURRENT_KEYS
+    assert set(check["latest"] or {}) == RELEASE_CHECK_LATEST_KEYS
+    assert check["state"] in {"ok", "failed", "unknown"}
+    assert check["source"] == "registry"
+    assert check["reason"] is None or check["reason"] in RELEASE_CHECK_REASONS
+    assert check["reason_detail"] is None
+    assert set(status["release_catalog"]) == CATALOG_COMPAT_KEYS
+    assert status["release_catalog"]["state"] == "unused"
+    assert set(status["release_notes"]) == RELEASE_NOTES_KEYS
+    assert status["release_notes"]["state"] in {"ok", "missing", "invalid"}
+    assert status["release_notes"]["notes"] == {}
+    for target in status["available_targets"]:
+        assert set(target) == TARGET_KEYS
+    # 状态文件里只有**摘要**形式的镜像引用，没有 tag 形式的安装引用、没有主机名
+    # 之外的 registry 细节（主机名本身在 `@sha256:` 引用里，是旧形状的一部分）。
+    assert ":v0.0" not in text
+    assert "/v2/" not in text
+    assert "Docker-Content-Digest" not in text
     # 密码、备份路径、私有日志、发布记录路径一律不出现。
     assert "super-secret-password" not in text
     assert "POSTGRES_PASSWORD" not in text
@@ -2603,42 +2913,54 @@ def test_install_lock_is_checked_immediately_not_waited_on(ws: Workspace) -> Non
     assert ws.docker_state()["alembic_version"] == HEAD_OLD
 
 
-# ---------------------------------------------------------------- 可信发布目录
+# ---------------------------------------------------------------- 版本发现（GHCR）
 #
-# 设计依据：docs/EASY-INSTALL-UPDATE-DESIGN.md「可信发布目录只列已通过门禁、
-# 可从已知版本升级的稳定目标」+「可编辑的 Release 正文不是摘要可信来源」。
+# 设计依据：docs/UPDATE-SIMPLIFICATION-DESIGN.md §3/§7/§8/§9。没有发布目录、
+# 没有 `min_from`、没有版本跨度校验：**版本的唯一事实源是固定仓库的 tags**。
 #
 # 这里锁死六条硬规则：
-# 1. **当前版本读运行中 api 镜像的 `org.opencontainers.image.version` 标注**，
-#    不读 `.env` 的摘要、不猜（目录里已经没有 digest，反查那条走不通了）；
-# 2. **目标摘要现场解析**：`docker manifest inspect ...:v<version>` 取本机平台的
-#    manifest digest；解析不出来 → compatible=false + `digest_unresolved`；
-# 3. 只允许升级：目标 version 不高于当前版本 → **不出现**在 available_targets；
-# 4. 版本跨度：当前版本不在目标 min_from 里 → compatible=false + 原因；
-# 5. 执行前复核会**重新解析**：请求里的 target_digest 必须等于现在解析出来的值；
-# 6. 目录缺失/坏/工具缺失 → available_targets=[] + 明确 reason（不静默、不假装）。
+# 1. 只查 `ghcr.io/qsbb/ling-api`：请求方（网页/API/请求文件）影响不到仓库、
+#    registry 主机或 tag 过滤规则；
+# 2. 只接受严格 `vX.Y.Z`：`latest`/预发布/`sha-*`/前导零写法一律忽略；
+# 3. tags/list 必须**拿全**（分页跟到最后一页、最多 5 页）且选定 tag 的 digest
+#    解析成功，`release_check.state` 才能是 `ok`；
+# 4. **当前版本**只读运行中 api 镜像的 `org.opencontainers.image.version` 标注；
+# 5. 只允许升级：不高于当前版本的 tag 不出现，摘要为空 → `digest_unresolved`；
+# 6. 任何失败都是 `failed` + 固定原因码、目标列表为空——**绝不**写成"已是最新"。
 
 
-def test_idle_status_exposes_compatible_recommended_target(ws: Workspace) -> None:
-    """有兼容目标时：available_targets 只列目标，recommended_target 指向它。"""
+def _check(ws: Workspace) -> dict[str, Any]:
+    return ws.status()["release_check"]
+
+
+def test_idle_status_exposes_latest_as_the_only_target(ws: Workspace) -> None:
+    """默认 registry：当前 0.0.1、最新 0.0.2 → 一条兼容目标 + 推荐目标。"""
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    # 刷新目录现在只发**只读** docker 调用（读当前版本 + 解析摘要），没有变更。
-    assert mutating_calls(ws) == []
-    # 摘要来自 tag 的 manifest inspect，而不是目录文件；问的就是这个版本。
-    assert manifest_inspect_refs(ws) == ["ghcr.io/qsbb/ling-api:v0.0.2"]
+    # 这一刷只发**只读**调用（docker ps/inspect + 一次 GHCR 查询），没有变更。
+    assert mutating_calls(ws) == [], ws.calls()
     status = ws.status()
-    assert status["release_catalog"] == {
-        "state": "ok",
-        "reason": None,
-        "entries": 2,
-        "current_version": CURRENT_VERSION,
+    check = status["release_check"]
+    assert set(check) == RELEASE_CHECK_KEYS
+    assert check["state"] == "ok"
+    assert check["source"] == "registry"
+    assert check["reason"] is None
+    assert check["reason_detail"] is None
+    assert check["check_id"] is None  # 自动刷新没有 check_id
+    assert check["checked_at"].endswith("Z")
+    assert check["current"] == {"version": CURRENT_VERSION, "digest": "sha256:" + OLD_HEX}
+    assert check["latest"] == {
+        "version": TARGET_VERSION,
+        "digest": "sha256:" + TARGET_HEX,
+        "commit": None,
     }
+    # tag 计数是**过滤后**的稳定版数量（0.0.1 + 0.0.2）。
+    assert check["tag_count"] == 2
     assert status["available_targets"] == [
         {
             "version": TARGET_VERSION,
             "digest": TARGET,
-            "commit": COMMIT,
+            "commit": None,
             "has_migration": True,
             "compatible": True,
             "incompatible_reason": None,
@@ -2647,186 +2969,235 @@ def test_idle_status_exposes_compatible_recommended_target(ws: Workspace) -> Non
     assert status["recommended_target"] == {
         "version": TARGET_VERSION,
         "digest": TARGET,
-        "commit": COMMIT,
+        "commit": None,
         "has_migration": True,
     }
+    # 只查了这两个 tag 上的东西：tags/list 一次 + 最新 tag 的 manifest。
+    calls = ws.status_registry_calls()
+    assert calls[0].startswith("registry GET /v2/qsbb/ling-api/tags/list"), calls
+    assert any("/manifests/v0.0.2" in line for line in calls), calls
+    assert not any("/manifests/v0.0.1" in line for line in calls), calls
 
 
-def test_recommended_target_is_the_greatest_compatible_version(ws: Workspace) -> None:
-    """多目标时推荐**版本最大**的兼容目标（不依赖文件顺序）。"""
-    ws.write_catalog(
-        [
-            catalog_entry(
-                CURRENT_VERSION,
-                commit=OLD_COMMIT,
-                min_from=["0.0.0"],
-                has_migration=False,
-            ),
-            # 故意把新版本写在前面：使用方不能依赖文件顺序。
-            catalog_entry("0.0.10", commit=COMMIT, min_from=[CURRENT_VERSION]),
-            catalog_entry(TARGET_VERSION, min_from=[CURRENT_VERSION]),
-        ]
+def test_registry_pagination_is_followed_to_the_last_page(ws: Workspace) -> None:
+    """分页：逐页跟 `Link: rel=next`，拿全后取最大版本（不是第一页最大的）。"""
+    ws.set_registry(
+        ["v0.0.1", "v0.0.2", "v0.0.3"],
+        digests={
+            "v0.0.1": "sha256:" + OLD_HEX,
+            "v0.0.3": "sha256:" + TARGET_HEX,
+        },
     )
-    assert run_updater(ws).returncode == 0
-    status = ws.status()
-    assert [item["version"] for item in status["available_targets"]] == [
-        TARGET_VERSION,
-        "0.0.10",
-    ]
-    assert status["recommended_target"]["version"] == "0.0.10"
-    # 摘要不是目录给的（目录里没有 digest）：两个目标都在同一次刷新里按各自 tag
-    # 解析；stub 的 registry 对同一个平台只回一个 digest，所以这里两者相同。
-    assert status["recommended_target"]["digest"] == TARGET
-    assert sorted(manifest_inspect_refs(ws)) == [
-        "ghcr.io/qsbb/ling-api:v0.0.10",
-        "ghcr.io/qsbb/ling-api:v0.0.2",
-    ]
-
-
-def test_target_outside_min_from_is_incompatible_with_reason(ws: Workspace) -> None:
-    """当前版本不在 min_from 里：不兼容 + 原因，且没有推荐目标。
-
-    不兼容的目标 `digest` 是 **null**：既然不会被推荐，就没必要为它打一次
-    registry（每次刷新都要打）。API 侧的白名单投影会丢掉没有 digest 的条目，
-    而前端只消费 `target`/`recommended_target`，所以这不影响页面。
-    """
-    ws.write_catalog(
-        [
-            catalog_entry(
-                CURRENT_VERSION,
-                commit=OLD_COMMIT,
-                min_from=["0.0.0"],
-                has_migration=False,
-            ),
-            catalog_entry(TARGET_VERSION, min_from=["0.0.9"]),
-        ]
-    )
-    assert run_updater(ws).returncode == 0
-    status = ws.status()
-    assert status["release_catalog"]["current_version"] == CURRENT_VERSION
-    assert status["available_targets"] == [
-        {
-            "version": TARGET_VERSION,
-            "digest": None,
-            "commit": COMMIT,
-            "has_migration": True,
-            "compatible": False,
-            "incompatible_reason": "not_in_min_from",
-        }
-    ]
-    assert status["recommended_target"] is None
-    # 没有兼容目标 → 一次 registry 都不问（省掉的是外部调用，不是校验）。
-    assert manifest_inspect_refs(ws) == []
-
-
-def test_target_not_newer_is_not_offered_at_all(ws: Workspace) -> None:
-    """不许降级：目标版本不高于当前版本时**不出现**，也就没有推荐目标。"""
-    ws.write_catalog(
-        [
-            # 当前跑的是 0.0.2（镜像标注），目录里 0.0.1 比它旧。
-            catalog_entry(
-                TARGET_VERSION,
-                commit=OLD_COMMIT,
-                min_from=[CURRENT_VERSION],
-                has_migration=False,
-            ),
-            catalog_entry(CURRENT_VERSION, commit=COMMIT, min_from=["0.0.0"]),
-        ]
-    )
-    # 当前版本改由运行中镜像的标注给出（原来靠 .env 摘要在目录里反查）。
-    result = run_updater(ws, env={"STUB_OLD_VERSION": TARGET_VERSION})
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    status = ws.status()
-    assert status["release_catalog"]["current_version"] == TARGET_VERSION
-    assert status["available_targets"] == []
-    assert status["recommended_target"] is None
-    assert manifest_inspect_refs(ws) == []
-
-
-def test_missing_catalog_yields_no_targets_and_reason(ws: Workspace) -> None:
-    ws.release_catalog.unlink()
+    ws.http.registry_page_size = 1
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    # 目录文件都没有 → 不去问 Docker（先校验目录，再问 Docker）。
-    assert ws.calls() == []
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["latest"]["version"] == "0.0.3"
+    assert check["tag_count"] == 3
+    assert ws.status()["recommended_target"]["version"] == "0.0.3"
+    pages = [line for line in ws.status_registry_calls() if "tags/list" in line]
+    assert len(pages) == 3, pages
+    assert any("page=3" in line for line in pages), pages
+
+
+def test_registry_ignores_latest_prerelease_and_sha_tags(ws: Workspace) -> None:
+    """`latest`/预发布/`sha-*`/前导零都不算稳定版；取的是最规范的 semver 最大值。"""
+    ws.set_registry(
+        [
+            "latest",
+            "sha-1a2b3c4",
+            "v0.0.2-rc.1",
+            "v0.0.02",  # 前导零：非规范，忽略（否则一个版本号对应两个 tag）
+            f"v{CURRENT_VERSION}",
+            f"v{TARGET_VERSION}",
+        ]
+    )
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["tag_count"] == 2  # 只有 0.0.1 与 0.0.2
+    assert check["latest"]["version"] == TARGET_VERSION
+    # 没有对非规范 tag 发过 manifest 请求。
+    assert not any("-rc" in line or "sha-" in line for line in ws.status_registry_calls())
+
+
+def test_registry_401_challenge_fetches_anonymous_token_and_retries(ws: Workspace) -> None:
+    """401 + Bearer challenge → 去 challenge 指定的授权服务取匿名 token 后重试。"""
+    ws.http.registry_require_token = True
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["latest"]["digest"] == "sha256:" + TARGET_HEX
+    calls = ws.status_registry_calls()
+    assert any("/v2/qsbb/ling-api/tags/list" in line for line in calls), calls
+    token_calls = [line for line in calls if "/token" in line]
+    assert token_calls, calls
+    # scope 必须是只读 pull，service 必须来自 challenge——不接受请求方给作用域。
+    assert "scope=repository%3Aqsbb%2Fling-api%3Apull" in token_calls[0] or (
+        "scope=repository:qsbb/ling-api:pull" in token_calls[0]
+    ), token_calls[0]
+    assert "service=ghcr.io" in token_calls[0], token_calls[0]
+    # 401 之后重试了：tags/list 至少被请求两次（一次被拒 + 一次带 token）。
+    assert len([line for line in calls if "tags/list" in line]) >= 2, calls
+
+
+def test_registry_head_405_falls_back_to_limited_get(ws: Workspace) -> None:
+    """HEAD 不可用（405）→ 退回 GET 限流读，摘要照样能解析出来。"""
+    ws.http.registry_head_status = 405
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["latest"]["digest"] == "sha256:" + TARGET_HEX
+    manifest_calls = [
+        line for line in ws.status_registry_calls() if "/manifests/v0.0.2" in line
+    ]
+    assert any(" HEAD " in line for line in manifest_calls), manifest_calls
+    assert any(" GET " in line for line in manifest_calls), manifest_calls
+
+
+def test_registry_single_platform_manifest_skips_the_index_platform_check(
+    ws: Workspace,
+) -> None:
+    """单平台 manifest：没有 index 可核，平台留给拉取后的 image inspect 复核。"""
+    ws.http.registry_index = False
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["latest"]["digest"] == "sha256:" + TARGET_HEX
+    # 只发了一次 manifest 请求（HEAD 就够，不需要再 GET index）。
+    assert (
+        len([line for line in ws.status_registry_calls() if "/manifests/" in line]) == 1
+    ), ws.status_registry_calls()
+
+
+def test_index_without_the_host_platform_fails_closed(ws: Workspace) -> None:
+    """index 里没有本机平台 → `platform_missing`，目标列表为空（不猜能装）。"""
+    ws.http.registry_platforms = [{"os": "linux", "architecture": OTHER_ARCH}]
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
-    assert status["release_catalog"] == {
-        "state": "missing",
-        "reason": "catalog_missing",
-        "entries": 0,
-        "current_version": None,
-    }
+    assert status["release_check"]["state"] == "failed"
+    assert status["release_check"]["reason"] == "platform_missing"
     assert status["available_targets"] == []
     assert status["recommended_target"] is None
-    # 状态文件里不出现目录路径（跨信任边界只放码）。
-    assert str(ws.release_catalog) not in ws.status_text()
+
+
+def test_missing_docker_content_digest_fails_closed(ws: Workspace) -> None:
+    """HEAD 200 但没有 `Docker-Content-Digest` → `digest_missing`，不算成功。"""
+    ws.http.registry_digest_header = False
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_check"]["state"] == "failed"
+    assert status["release_check"]["reason"] == "digest_missing"
+    assert status["available_targets"] == []
+    assert status["recommended_target"] is None
 
 
 @pytest.mark.parametrize(
-    ("payload", "reason"),
+    ("case", "reason"),
     [
-        ({"schema": 1, "releases": [{"version": "0.0.2"}]}, "catalog_invalid"),
-        ({"schema": 2, "releases": []}, "catalog_schema_unsupported"),
-        ([], "catalog_invalid"),
+        ("unreachable", "registry_unreachable"),
+        ("rate_limited", "rate_limited"),
+        ("auth_failed", "auth_failed"),
+        ("manifest_failed", "manifest_failed"),
+        ("no_stable_tags", "no_stable_tags"),
     ],
 )
-def test_invalid_catalog_yields_no_targets_and_reason(
-    ws: Workspace, payload: object, reason: str
+def test_registry_failures_never_claim_latest(
+    ws: Workspace, case: str, reason: str
 ) -> None:
-    ws.release_catalog.write_text(json.dumps(payload), encoding="utf-8")
+    """每一种失败都是 `failed` + 固定原因码 + 空目标：**绝不**写成"已是最新"。"""
+    if case == "unreachable":
+        ws.http.registry_fail = "503"
+    elif case == "rate_limited":
+        ws.http.registry_fail = "429"
+    elif case == "auth_failed":
+        # 私有包/无凭据：registry 直接 403（匿名也无 token 可换）。
+        ws.http.registry_fail = "403"
+    elif case == "manifest_failed":
+        # tag 在，但 manifest 拿不到（404）。
+        ws.http.registry_digests = {f"v{CURRENT_VERSION}": "sha256:" + OLD_HEX}
+    else:
+        ws.set_registry(["latest", "v0.0.2-rc.1", "sha-1a2b3c4"])
+    result = run_updater(ws)
+    assert result.returncode == 0, (case, result.stdout, result.stderr)
+    status = ws.status()
+    check = status["release_check"]
+    assert check["state"] == "failed", (case, check)
+    assert check["reason"] == reason, (case, check)
+    assert check["latest"] is None, (case, check)
+    assert check["tag_count"] == 0, (case, check)
+    assert check["checked_at"].endswith("Z")  # 失败也要有"什么时候查的"
+    assert status["available_targets"] == [], case
+    assert status["recommended_target"] is None, case
+    # 当前版本是**本机事实**，与"这次查不到"无关，必须照常给出来。
+    assert check["current"]["version"] == CURRENT_VERSION, case
+    assert status["release_catalog"]["current_version"] == CURRENT_VERSION, case
+
+
+def test_registry_timeout_is_reported_as_timeout(http_state: Any) -> None:
+    """registry 卡住 → `timeout`（客户端级用例：不靠 8 秒总超时拖慢整个套件）。
+
+    生产默认总超时是 8 秒（``registry.DEFAULT_TIMEOUT_SECONDS``）。这里把预算压到
+    0.1 秒、让 stub 睡 0.5 秒来验证映射：**读/socket 超时**必须归到 ``timeout``，
+    而不是含糊的 ``registry_unreachable``。
+    """
+    module = _updater_module()
+    http_state.registry_delay = 0.5
+    client = module.registry.RegistryClient(
+        base_url=f"http://127.0.0.1:{http_state.port}", timeout=0.1
+    )
+    with pytest.raises(module.registry.RegistryError) as info:
+        client.stable_tags()
+    assert info.value.code == "timeout", info.value
+    # 生产默认值写死 8 秒（设计 §3「一次检查设总超时」）。
+    assert module.registry.DEFAULT_TIMEOUT_SECONDS == 8.0
+
+
+def test_registry_timeout_is_recorded_in_the_status_as_timeout(ws: Workspace) -> None:
+    """**端到端**：registry 卡住 → `status.release_check` 必须写 `failed`+`timeout`。
+
+    上一条只钉住客户端的码；"超时有没有真的落进状态文件"是另一回事（写入路径、
+    状态刷新的节流、异常收窄任何一处回退都会让它悄悄变成 `ok` 或空状态）。所以
+    这里让 stub 睡过默认的 8 秒总超时，直接断言页面能读到的那份 JSON：
+    `state=failed`、`reason=timeout`、`latest=null`、目标为空。
+    """
+    budget = _updater_module().registry.DEFAULT_TIMEOUT_SECONDS
+    ws.http.registry_delay = budget + 0.5
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
-    assert status["release_catalog"]["state"] == "invalid"
-    assert status["release_catalog"]["reason"] == reason
+    check = status["release_check"]
+    assert check["state"] == "failed"
+    assert check["reason"] == "timeout"
+    assert check["latest"] is None
+    assert check["checked_at"].endswith("Z")  # 失败也要有"什么时候查的"
+    # 空目标 = "这次查不到"，**不是**"没有新版"：绝不能被读成已是最新。
     assert status["available_targets"] == []
     assert status["recommended_target"] is None
+    # 当前版本是实测事实，网络超时不该把它一起抹掉。
+    assert check["current"]["version"] == CURRENT_VERSION
 
 
-def test_world_writable_catalog_is_treated_as_unreadable(ws: Workspace) -> None:
+def test_catalog_file_is_not_read_anymore(ws: Workspace) -> None:
+    """`deploy/releases.json` 坏掉/权限过宽都不影响更新判定：更新器不读它。"""
+    ws.release_catalog.write_text("{ not json", encoding="utf-8")
     ws.release_catalog.chmod(0o666)
-    assert run_updater(ws).returncode == 0
-    status = ws.status()
-    assert status["release_catalog"]["state"] == "invalid"
-    assert status["release_catalog"]["reason"] == "catalog_unreadable"
-    assert status["available_targets"] == []
-
-
-def test_missing_catalog_tool_is_reported_not_fatal(ws: Workspace, tmp_path: Path) -> None:
-    """发行包缺 catalog.py：不退出、不假装有目标，状态里给 catalog_tool_missing。"""
-    release_dir = tmp_path / "release-without-tool"
-    release_dir.mkdir()
-    copy = release_dir / "publish.py"
-    shutil.copyfile(PUBLISH_PY, copy)
-    result = run_updater(ws, extra=["--publish-py", str(copy)])
+    result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
-    assert status["release_catalog"]["state"] == "invalid"
-    assert status["release_catalog"]["reason"] == "catalog_tool_missing"
-    assert status["available_targets"] == []
-    assert status["recommended_target"] is None
-
-
-def test_unknown_current_version_blocks_all_targets(ws: Workspace) -> None:
-    """运行中镜像**没有** version 标注：当前版本未知 → 所有目标不兼容，绝不猜。"""
-    ws.write_catalog([catalog_entry(TARGET_VERSION)])
-    result = run_updater(ws, env={"STUB_OLD_VERSION": ""})
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    status = ws.status()
-    assert status["release_catalog"]["state"] == "ok"
-    assert status["release_catalog"]["current_version"] is None
-    assert status["available_targets"] == [
-        {
-            "version": TARGET_VERSION,
-            "digest": None,
-            "commit": COMMIT,
-            "has_migration": True,
-            "compatible": False,
-            "incompatible_reason": "current_version_unknown",
-        }
-    ]
-    assert status["recommended_target"] is None
-    assert manifest_inspect_refs(ws) == []
+    assert status["release_check"]["state"] == "ok"
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+    # 只读兼容块：state 不能是 "ok"（那等于伪造"目录正常"），也没有旧码表的 reason。
+    assert status["release_catalog"]["state"] == "unused"
+    assert status["release_catalog"]["reason"] is None
+    assert status["release_catalog"]["entries"] == 0
 
 
 def test_current_version_comes_from_the_image_label_not_the_env_digest(
@@ -2834,9 +3205,8 @@ def test_current_version_comes_from_the_image_label_not_the_env_digest(
 ) -> None:
     """当前版本只认镜像标注，**不**看 `.env` 的 LING_APP_IMAGE。
 
-    `.env` 里的摘要已经和目录无关（目录里没有 digest 了），而且它可以被手改、
-    也可能改了还没重建容器。这里故意把 `.env` 指向一个**不在**任何地方出现的
-    摘要：当前版本仍必须是镜像标注的 0.0.1。
+    `.env` 里的摘要与发现无关，而且它可以被手改、也可能改了还没重建容器。这里故意
+    把它指向一个不在任何地方出现的摘要：当前版本仍必须是镜像标注的 0.0.1。
     """
     ws.env_file.write_text(
         "POSTGRES_PASSWORD=super-secret-password\n"
@@ -2848,465 +3218,555 @@ def test_current_version_comes_from_the_image_label_not_the_env_digest(
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
-    assert status["release_catalog"]["current_version"] == CURRENT_VERSION
+    assert status["release_check"]["current"]["version"] == CURRENT_VERSION
     assert status["recommended_target"]["version"] == TARGET_VERSION
     # 当前版本是**问 Docker 读标注**得来的：ps → inspect 容器 → image inspect。
     assert calls_with(ws, "docker image inspect sha256:old-image"), ws.calls()
+    assert "e" * 64 not in ws.status_text()
+
+
+def test_unknown_current_version_blocks_the_target(ws: Workspace) -> None:
+    """运行中镜像**没有** version 标注：当前版本未知 → 目标不兼容，绝不猜。"""
+    result = run_updater(ws, env={"STUB_OLD_VERSION": ""})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_check"]["state"] == "ok"
+    assert status["release_check"]["current"] == {"version": None, "digest": "sha256:" + OLD_HEX}
+    assert status["available_targets"] == [
+        {
+            "version": TARGET_VERSION,
+            "digest": TARGET,
+            "commit": None,
+            "has_migration": True,
+            "compatible": False,
+            "incompatible_reason": "current_version_unknown",
+        }
+    ]
+    assert status["recommended_target"] is None
 
 
 def test_non_semver_version_label_is_treated_as_unknown(ws: Workspace) -> None:
-    """标注不是严格 semver（构建时 LING_VERSION 没传上）→ 当前版本未知。
-
-    状态文件里只放严格 semver 或 null：不把任意标注文本当"当前版本"喂给版本比较。
-    """
+    """标注不是严格 semver（构建时 LING_VERSION 没传上）→ 当前版本未知。"""
     result = run_updater(ws, env={"STUB_OLD_VERSION": "unknown"})
     assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
-    assert status["release_catalog"]["current_version"] is None
+    assert status["release_check"]["current"]["version"] is None
     assert status["available_targets"][0]["incompatible_reason"] == (
         "current_version_unknown"
     )
     assert status["recommended_target"] is None
 
 
-def test_target_digest_is_resolved_for_the_host_arch(ws: Workspace) -> None:
-    """解析出来的是**本机架构**那条 manifest 的 digest，不是别的平台的。
-
-    把 registry 报的两条平台掉个个儿（本机那条 = `f`*64）：解析结果必须跟着变，
-    说明选的是 `platform.architecture == 宿主机架构` 那条，而不是"取第一条"。
-    """
-    result = run_updater(
-        ws,
-        env={"STUB_MANIFEST_ARCH": OTHER_ARCH, "STUB_OTHER_ARCH": HOST_ARCH},
-    )
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    target = ws.status()["recommended_target"]
-    assert target["digest"] == f"ghcr.io/qsbb/ling-api@sha256:{'f' * 64}"
-    # 宿主架构来自 docker daemon（与 publish 的 Options.host_arch 同源）。
-    assert calls_with(ws, "docker info --format {{.Architecture}}"), ws.calls()
-
-
-@pytest.mark.parametrize(
-    ("env", "why"),
-    [
-        ({"STUB_MANIFEST_EXIT": "1"}, "命令非 0（tag 不存在 / 无权限 / 网络不通）"),
-        ({"STUB_MANIFEST_RAW": "{not json"}, "输出不是 JSON"),
-        ({"STUB_MANIFEST_SHAPE": "single"}, "单架构 manifest：文档里没有自己的摘要"),
-        ({"STUB_MANIFEST_ARCH": "riscv64"}, "index 里没有本机平台"),
-        ({"STUB_MANIFEST_DIGEST": "sha256:short"}, "digest 长度不对"),
-        ({"STUB_MANIFEST_DIGEST": "md5:deadbeef"}, "digest 不是 sha256"),
-    ],
-)
-def test_unresolved_digest_marks_the_target_incompatible(
-    ws: Workspace, env: dict[str, str], why: str
-) -> None:
-    """摘要解析失败的每一种形态都只有一条结果：`digest_unresolved`，不推荐、不顶替。"""
-    result = run_updater(ws, env=env)
+def test_target_not_newer_is_not_offered_at_all(ws: Workspace) -> None:
+    """不许降级/重装：最新版不高于当前版本时**不出现**，也就没有推荐目标。"""
+    result = run_updater(ws, env={"STUB_OLD_VERSION": TARGET_VERSION})
     assert result.returncode == 0, (result.stdout, result.stderr)
     status = ws.status()
+    assert status["release_check"]["state"] == "ok"
+    assert status["release_check"]["current"]["version"] == TARGET_VERSION
+    assert status["release_check"]["latest"]["version"] == TARGET_VERSION
+    assert status["available_targets"] == []
+    assert status["recommended_target"] is None
+
+
+def test_registry_failure_keeps_current_version_visible(ws: Workspace) -> None:
+    """查不到新版时页面仍要能说清"当前跑的是哪一版"（本机事实不随网络丢）。"""
+    ws.http.registry_fail = "503"
+    assert run_updater(ws).returncode == 0
+    status = ws.status()
     assert status["release_catalog"]["current_version"] == CURRENT_VERSION
-    assert status["available_targets"] == [
-        {
-            "version": TARGET_VERSION,
-            "digest": None,
-            "commit": COMMIT,
-            "has_migration": True,
-            "compatible": False,
-            "incompatible_reason": "digest_unresolved",
-        }
-    ]
-    assert status["recommended_target"] is None, why
-    # 解析失败不会把请求放行。
-    write_request(ws)
-    ws.reset()
-    rejected = run_updater(ws, env=env)
-    assert rejected.returncode == 2, (rejected.stdout, rejected.stderr)
-    assert mutating_calls(ws) == []
-    assert not (ws.state_dir / "task.json").exists()
+    assert status["release_catalog"]["checked_at"].endswith("Z")
 
 
-def test_digest_changed_at_the_registry_is_rejected_before_any_change(ws: Workspace) -> None:
-    """执行前复核会**重新解析**：registry 现在给的摘要变了 → 拒绝，什么都不做。
+# ---------------------------------------------------------------- 安装前复核（B）
+#
+# 设计 §3 末段：点「更新」时不再要求先点「检查更新」，所以 `prepare` 必须**自己**
+# 重查一次该 tag 的 digest：与请求里的完全相同才继续，不同就 `target_digest_drift`。
+# 安装引用自始至终是 `ghcr.io/qsbb/ling-api@sha256:...`，绝不按 tag 拉。
 
-    请求里的 target_digest 是 TARGET，但这一轮 registry 对本机平台报的是别的
-    digest（模拟 tag 被重推 / 发布被替换）。旧实现只比对目录里的静态值，这里必须
-    以"现在解析出来的摘要"为准。
+
+def test_target_digest_drift_is_rejected_before_any_change(ws: Workspace) -> None:
+    """tag 现在指向别的摘要（被重推）→ 拒绝，什么都不做。
+
+    "什么都不做"不是"没有 docker 变更调用"就够：任务记录、受限 env、compose 副本
+    也必须一个字节都没变（否则一条"先写 env 再复核"的回归会漏过去）。
     """
+    before_env = ws.env_file.read_bytes()
+    before_compose = ws.compose_file.read_bytes()
     write_request(ws)
-    rotated = "b" * 64
-    result = run_updater(ws, env={"STUB_PLATFORM_DIGEST": rotated})
-    assert result.returncode == 2, (result.stdout, result.stderr)
-    assert mutating_calls(ws) == []
-    assert not (ws.state_dir / "task.json").exists()
-    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
-    assert "目标摘要不等于任何兼容版本" in journal
-
-
-def test_target_outside_catalog_is_rejected_before_any_change(ws: Workspace) -> None:
-    """请求里的 digest 格式合格，但不等于现在解析出来的任何兼容摘要 → 拒绝。"""
-    outside = "ghcr.io/qsbb/ling-api@sha256:" + "e" * 64
-    write_request(ws, target=outside)
+    # 只把 0.0.2 的摘要换掉（模拟 tag 被重推）：其它 tag 的 manifest 照常可查，
+    # 否则这次失败会是"manifest 拿不到"而不是"摘要变了"。
+    ws.http.registry_digests = {
+        f"v{CURRENT_VERSION}": "sha256:" + OLD_HEX,
+        f"v{TARGET_VERSION}": "sha256:" + "b" * 64,
+    }
     result = run_updater(ws)
     assert result.returncode == 2, (result.stdout, result.stderr)
-    assert mutating_calls(ws) == []
+    assert mutating_calls(ws) == [], ws.calls()
+    # 没有任务、没有改 env/compose：拒绝发生在 `new_task`/维护门禁**之前**。
     assert not (ws.state_dir / "task.json").exists()
-    assert ws.status()["updater"]["state"] == "idle"
     assert ws.status()["task"] is None
+    assert ws.status()["updater"]["state"] == "idle"
+    assert ws.env_file.read_bytes() == before_env
+    assert ws.compose_file.read_bytes() == before_compose
     journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
-    assert "目标摘要不等于任何兼容版本" in journal
+    assert "target_digest_drift" in journal or "过期候选" in journal, journal[-2000:]
+    # 拒绝码只在私有日志里，状态文件不出现自由文本/漂移细节。
+    assert "target_digest_drift" not in ws.status_text()
     # 请求被认领归档（不会无限重试），没有被执行。
     assert not (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
     assert (ws.requests_dir / "archive" / f"claimed-{REQUEST_ID}.json").exists()
 
 
-def test_catalog_broken_rejects_request_without_touching_anything(ws: Workspace) -> None:
-    """目录坏掉时请求被拒（catalog_unavailable），不拉取/不备份/不切换。"""
-    ws.release_catalog.write_text('{"schema": 1, "releases": [{}]}', encoding="utf-8")
-    write_request(ws)
+def test_target_not_pointed_by_any_tag_is_rejected_before_any_change(ws: Workspace) -> None:
+    """digest 格式合格，但没有任何稳定 tag 指向它 → 拒绝（不按 tag 猜）。"""
+    outside = "ghcr.io/qsbb/ling-api@sha256:" + "e" * 64
+    write_request(ws, target=outside)
     result = run_updater(ws)
     assert result.returncode == 2, (result.stdout, result.stderr)
-    assert mutating_calls(ws) == []
-    # 目录都不可信了，**一条 docker 调用都不发**：没有版本/摘要值得去问
-    # （`read_release_catalog` 先校验目录，再问 Docker）。
-    assert ws.calls() == []
+    assert mutating_calls(ws) == [], ws.calls()
+    assert not (ws.state_dir / "task.json").exists()
+    assert ws.status()["updater"]["state"] == "idle"
+    assert ws.status()["task"] is None
+    assert (ws.requests_dir / "archive" / f"claimed-{REQUEST_ID}.json").exists()
+
+
+def test_registry_unavailable_at_install_time_fails_closed(ws: Workspace) -> None:
+    """装的时候连不上 registry：无法证明摘要 → 不装（不是"按 tag 试试"）。"""
+    write_request(ws)
+    ws.http.registry_fail = "503"
+    result = run_updater(ws)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert mutating_calls(ws) == [], ws.calls()
     assert not (ws.state_dir / "task.json").exists()
     journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
-    assert "可信发布目录不可用" in journal
+    assert "registry_unavailable" in journal or "无法复核目标摘要" in journal, journal[-2000:]
+    # 状态里也如实说"这次查不到"。
+    assert ws.status()["release_check"]["state"] == "failed"
+    assert ws.status()["release_check"]["reason"] == "registry_unreachable"
 
 
-def test_legacy_catalog_entry_with_digest_blocks_the_whole_catalog(ws: Workspace) -> None:
-    """旧目录（条目里还带 digest）→ 整份目录不可信，请求被拒。
-
-    目录已经不负责目标摘要了。读到 `digest` 字段要**显式拒绝**而不是顺手忽略：
-    静默兼容会留下"到底还有没有 digest 在生效"的两种事实。
-    """
-    ws.write_catalog(
-        [
-            catalog_entry(
-                CURRENT_VERSION,
-                commit=OLD_COMMIT,
-                min_from=["0.0.0"],
-                has_migration=False,
-            ),
-            {**catalog_entry(TARGET_VERSION), "digest": OLD_REF},
-        ]
-    )
-    write_request(ws)
-    result = run_updater(ws)
-    assert result.returncode == 2, (result.stdout, result.stderr)
-    assert mutating_calls(ws) == []
-    assert ws.calls() == []
-    assert not (ws.state_dir / "task.json").exists()
-    status = ws.status()
-    assert status["release_catalog"]["state"] == "invalid"
-    assert status["release_catalog"]["reason"] == "catalog_invalid"
-    assert status["available_targets"] == []
-
-
-def test_successful_update_moves_the_current_version_in_the_catalog(ws: Workspace) -> None:
-    """更新成功后运行中镜像的 version 标注变成 0.0.2，0.0.2 不再是目标。"""
+def test_install_reference_is_always_a_digest_never_a_tag(ws: Workspace) -> None:
+    """成功的安装里，**任何**喂给 docker 的镜像引用都是 `@sha256:`，不是 `:vX.Y.Z`。"""
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert f"LING_APP_IMAGE={TARGET}" in ws.env_file.read_text(encoding="utf-8")
-    status = ws.status()
-    assert status["release_catalog"]["current_version"] == TARGET_VERSION
-    assert status["available_targets"] == []
-    assert status["recommended_target"] is None
-
-
-# ------------------------------------------- 联网取目录（--catalog-url / LING_UPDATER_CATALOG_URL）
-
-
-def _catalog_payload(version: str = "0.0.3", **overrides: Any) -> bytes:
-    """一份合法的目录字节（结构与 deploy/release/catalog.py 的 schema 一致）。"""
-    entry = {
-        "version": version,
-        "commit": "b" * 40,
-        "min_from": ["0.0.1"],
-        "has_migration": True,
-        "released_at": "2026-11-06T00:00:00Z",
-    }
-    entry.update(overrides)
-    return (json.dumps({"schema": 1, "releases": [entry]}, ensure_ascii=False) + "\n").encode(
-        "utf-8"
-    )
-
-
-def test_catalog_url_defaults_to_repo_main(tmp_path: Path) -> None:
-    """默认指向本仓库 main 那份经 CI 校验的目录。
-
-    为什么不默认关：不打开这条路就是死的——目录只读挂载、升级只换 app 镜像
-    不动更新器自己，本地那份永远停在安装时的版本，一键更新只能成功一次。
-    """
-    module = _updater_module()
-    cfg = module.parse_config(
-        [
-            "--requests-dir", str(tmp_path / "requests"),
-            "--state-dir", str(tmp_path / "state"),
-            "--compose-file", str(REPO_ROOT / "deploy" / "compose.image.yaml"),
-            "--env-file", str(tmp_path / ".env"),
-            "--backup-dir", str(tmp_path / "backups"),
-            "--backup-script", str(tmp_path / "backup.sh"),
-            "--publish-py", str(PUBLISH_PY),
-        ]
-    )
-    assert cfg.catalog_url == (
-        "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
-    )
-
-
-def test_idle_refresh_is_throttled_not_per_poll() -> None:
-    """空闲时低频重读目录：不是每轮 5 秒都抓一次。
-
-    主循环 5 秒一轮，但轮的是**请求目录**（有没有人要更新），不是 GitHub。
-    每轮都抓一次 = 所有部署实例每 5 秒打一次 raw.githubusercontent.com。
-    所以刷新要按时间节流。
-    """
-    updater = _updater_module()
-    writer = updater.StatusWriter.__new__(updater.StatusWriter)
-    calls: list[int] = []
-
-    def fake_refresh() -> None:
-        calls.append(1)
-        writer._catalog_checked_at = time.monotonic()
-
-    writer._catalog_checked_at = 0.0
-    writer.refresh_release_catalog = fake_refresh
-
-    # 首次：还没读过（0），必须读一次。
-    writer.refresh_release_catalog_if_due()
-    assert len(calls) == 1
-
-    # 紧接着再问：没到间隔，不该再读。这就是"不会每 5 秒抓一次"。
-    writer.refresh_release_catalog_if_due()
-    assert len(calls) == 1
-
-    # 拨回超过间隔，应当再读。
-    writer._catalog_checked_at = (
-        time.monotonic() - updater.CATALOG_REFRESH_INTERVAL_SECONDS - 1
-    )
-    writer.refresh_release_catalog_if_due()
-    assert len(calls) == 2
-
-
-def test_catalog_url_can_be_given_on_cli(tmp_path: Path) -> None:
-    module = _updater_module()
-    url = "https://raw.githubusercontent.com/qsbb/ling/main/deploy/releases.json"
-    cfg = module.parse_config(
-        [
-            "--requests-dir", str(tmp_path / "requests"),
-            "--state-dir", str(tmp_path / "state"),
-            "--compose-file", str(REPO_ROOT / "deploy" / "compose.image.yaml"),
-            "--env-file", str(tmp_path / ".env"),
-            "--backup-dir", str(tmp_path / "backups"),
-            "--backup-script", str(tmp_path / "backup.sh"),
-            "--publish-py", str(PUBLISH_PY),
-            "--catalog-url", url,
-        ]
-    )
-    assert cfg.catalog_url == url
-
-
-def test_fetch_returns_none_on_connection_error() -> None:
-    """连不上不是错误：返回 None，让调用方退回本地那份。"""
-    module = _updater_module()
-    # 127.0.0.1 上一个几乎不可能在听的端口。
-    assert module._fetch_catalog_bytes("https://127.0.0.1:1/x.json") is None
-
-
-def test_load_catalog_bytes_uses_remote_when_valid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """联网取回合法内容 -> 用远程那份，**不**读本地文件。"""
-    module = _updater_module()
-    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
-
-    called: dict[str, Any] = {"local": False}
-
-    def fake_load(path: Path) -> dict[str, Any]:
-        called["local"] = True
-        raise AssertionError("远程成功时不该读本地")
-
-    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url: _catalog_payload())
-    monkeypatch.setattr(tool, "load_catalog", fake_load)
-
-    cfg = module.Config.__new__(module.Config)
-    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
-    object.__setattr__(cfg, "release_catalog", Path("/nonexistent/releases.json"))
-
-    catalog = module._load_catalog_bytes(cfg, tool)
-    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.3"]
-    assert called["local"] is False
-
-
-def test_load_catalog_bytes_falls_back_to_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """联网失败 -> 退回本地那份，且不抛异常。"""
-    module = _updater_module()
-    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
-
-    local = tmp_path / "releases.json"
-    local.write_bytes(_catalog_payload(version="0.0.2"))
-    local.chmod(0o644)
-
-    monkeypatch.setattr(module, "_fetch_catalog_bytes", lambda url: None)
-
-    cfg = module.Config.__new__(module.Config)
-    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
-    object.__setattr__(cfg, "release_catalog", local)
-
-    catalog = module._load_catalog_bytes(cfg, tool)
-    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.2"]
-
-
-def test_load_catalog_bytes_falls_back_when_remote_is_invalid(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """远程内容格式坏了 -> **退回本地那份**，不让整条通道变红。
-
-    仓库里一次写错的提交不该让所有人的网页更新按钮失效——本地那份好的目录
-    仍然可用。坏内容本身不会被采信：校验照跑，失败后换来源。
-    """
-    module = _updater_module()
-    tool = module.load_catalog_tool(REPO_ROOT / "deploy" / "release" / "catalog.py")
-
-    monkeypatch.setattr(
-        module, "_fetch_catalog_bytes", lambda url: b'{"schema": 1, "releases": [{"version": "bad"}]}'
-    )
-
-    cfg = module.Config.__new__(module.Config)
-    object.__setattr__(cfg, "catalog_url", "https://example.com/releases.json")
-    object.__setattr__(cfg, "release_catalog", tmp_path / "releases.json")
-
-    local = tmp_path / "releases.json"
-    local.write_bytes(_catalog_payload(version="0.0.2"))
-    local.chmod(0o644)
-    object.__setattr__(cfg, "release_catalog", local)
-
-    catalog = module._load_catalog_bytes(cfg, tool)
-    # 用的是本地那份（远程那份坏的没有被采信）。
-    assert [entry["version"] for entry in catalog["releases"]] == ["0.0.2"]
-
-
-def test_parse_config_derives_catalog_paths_from_the_distribution(tmp_path: Path) -> None:
-    """默认值来自**发行包**：目录数据在 deploy/releases.json，校验工具在
-    deploy/release/catalog.py（容器里就是 /srv/ling-code 那两条）。"""
-    module = _updater_module()
-    cfg = module.parse_config(
-        [
-            "--requests-dir",
-            str(tmp_path / "requests"),
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--compose-file",
-            str(ws_compose := REPO_ROOT / "deploy" / "compose.image.yaml"),
-            "--env-file",
-            str(tmp_path / ".env"),
-            "--backup-dir",
-            str(tmp_path / "backups"),
-            "--backup-script",
-            str(tmp_path / "backup.sh"),
-            "--publish-py",
-            str(PUBLISH_PY),
-        ]
-    )
-    assert ws_compose.is_file()
-    assert cfg.release_catalog == REPO_ROOT / "deploy" / "releases.json"
-    assert cfg.catalog_tool == REPO_ROOT / "deploy" / "release" / "catalog.py"
-
-
-# ------------------------------- 缺陷 7：宿主端口探活借 host 网络的一次性容器
-#
-# 更新器按安全设计跑在容器里（compose 只给 egress 网络；--network none 的演练里
-# 连它都没有）。它自己打 `127.0.0.1:<宿主端口>/readyz` 永远拿不到 200（容器里的
-# 环回不是宿主的）。所以宿主端口必须由**一次性 --network host 容器**探，镜像用
-# 更新器自己的镜像；并且先 `docker inspect` 证明端口真的发布出去了。
-
-HOST_PROBE_LOG = "host-probe-args "
-
-
-def _flag_value(argv: list[str], flag: str) -> str:
-    assert flag in argv, argv
-    return argv[argv.index(flag) + 1]
-
-
-def _host_probe_argv(ws: Workspace) -> list[str]:
-    lines = [line for line in ws.calls() if line.startswith(HOST_PROBE_LOG)]
-    assert lines, "没有出现宿主端口探针容器：\n" + "\n".join(ws.calls())
-    return json.loads(lines[0][len(HOST_PROBE_LOG) :])
-
-
-def test_host_readyz_probe_uses_updater_image_and_host_network(ws: Workspace) -> None:
-    """容器里的更新器必须借 host 网络容器探宿主端口，镜像=更新器自己的镜像。"""
-    write_request(ws)
-    result = run_updater(ws)
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    argv = _host_probe_argv(ws)
-    # stub 记录的是 argv[1:]（"docker" 由 PATH 解析），首项即子命令。
-    assert argv[:1] == ["run"], argv
-    assert _flag_value(argv, "--network") == "host", argv
-    assert "--pull=never" in argv, argv
-    assert "--read-only" in argv, argv
-    assert _flag_value(argv, "--tmpfs") == "/tmp", argv
-    assert _flag_value(argv, "--entrypoint") == "python", argv
-    # 镜像 = 更新器**自己的**镜像（从容器 ID 反查），不是新引入的镜像。
-    assert argv[argv.index("-c") - 1] == UPDATER_IMAGE, argv
-    # 最小权限：不加 privileged、不挂 docker socket。
-    assert "--privileged" not in argv, argv
-    assert not any("/var/run/docker.sock" in item for item in argv), argv
-    code = argv[argv.index("-c") + 1]
-    assert f"127.0.0.1:{ws.http.port}/readyz" in code, code
-    assert "HTTPRedirectHandler" in code, code
-    # 宿主 HTTP 只由探针容器发（UA 可区分）；更新器进程自己不建这个连接。
-    readyz_lines = [line for line in ws.calls() if "http GET /readyz" in line]
-    assert readyz_lines, ws.calls()
-    assert all("ua=ling-host-readyz-probe/1" in line for line in readyz_lines), readyz_lines
-    assert not [line for line in ws.calls() if "ua=ling-release-publish/1" in line]
-
-
-def test_unpublished_host_port_in_updater_fails_immediately(ws: Workspace) -> None:
-    """端口没发布 → 立即失败（维护门禁没解除），不进入 --ready-timeout 等待。"""
-    write_request(ws)
-    started = time.monotonic()
-    result = run_updater(
-        ws,
-        env={"STUB_HOST_PORT_PUBLISHED": "0"},
-        extra=["--ready-timeout", "180"],
-    )
-    elapsed = time.monotonic() - started
-    assert result.returncode == 16, (result.stdout, result.stderr)
-    assert "维护门禁没解除" in result.stderr, result.stderr[-3000:]
-    assert elapsed < 30, elapsed
-    task = ws.task()
-    assert task["state"] == "needs_manual"
-    assert task["failure"]["code"] == "switch_failed"
-    assert task["failure"]["stage"] == "host_port"
-    assert task["still_on_old_version"] is False
-    assert task["maintenance"]["state"] == "active"
-    # 一次探针都不许起。
-    assert not [line for line in ws.calls() if line.startswith(HOST_PROBE_LOG)]
-
-
-def test_host_readyz_probe_nonzero_keeps_maintenance_and_never_rolls_back(
-    ws: Workspace,
-) -> None:
-    """探针容器返回非 0 → 已迁移后失败：保持维护门禁，不切回旧镜像。"""
-    ws.http.readyz_status = 503
-    write_request(ws)
-    result = run_updater(ws)
-    assert result.returncode == 16, (result.stdout, result.stderr)
-    task = ws.task()
-    assert task["state"] == "needs_manual"
-    assert task["failure"]["code"] == "switch_failed"
-    assert task["failure"]["stage"] == "readyz"
-    assert task["still_on_old_version"] is False
-    assert task["maintenance"]["state"] == "active"
-    assert task["rollback"]["attempted"] is False
-    # 探针确实跑过（host 网络），且没有"切回旧镜像/恢复 dump"。
-    argv = _host_probe_argv(ws)
-    assert _flag_value(argv, "--network") == "host", argv
-    assert not [
+    assert ws.task()["state"] == "succeeded"
+    image_calls = [
         line
         for line in ws.calls()
-        if line.startswith("docker-env up ") and f"LING_APP_IMAGE={OLD_REF}" in line
+        if "LING_APP_IMAGE=" in line and not line.startswith("registry ")
     ]
-    assert not calls_with(ws, "pg_restore")
-    assert "最后 503" in result.stderr, result.stderr[-3000:]
+    assert image_calls, ws.calls()
+    for line in image_calls:
+        value = line.split("LING_APP_IMAGE=", 1)[1].strip()
+        if not value:
+            continue
+        assert value in (TARGET, OLD_REF), line
+        assert ":v" not in value, line
+    # 私有日志里也没有把 tag 当安装引用。
+    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
+    assert "ghcr.io/qsbb/ling-api:v" not in journal, journal[-2000:]
+    assert ":v0.0.2" not in journal, journal[-2000:]
+    # publish 自己那条按 digest 的 manifest 探测仍然在（那是安装阶段的证据）。
+    assert f"docker manifest inspect {TARGET}" in ws.calls()
+
+
+# ---------------------------------------------------------------- 按需刷新（refresh-<id>.json）
+#
+# 设计 §3：浏览器 → API 写 `refresh-<id>.json` → 更新器查 GHCR → 原子写状态文件。
+# 这里锁死的行为：
+# - 刷新请求**立刻**触发一次 registry 检查（绕过 5 分钟自动节流）；
+# - 同一 request_id 幂等；10 秒窗口内重复 → 丢弃 + `reason_detail="throttled"`，
+#   且**不改** `state`（这次没查，就不能改写上一次的结论）；
+# - 畸形请求只删文件、不崩、不查 registry；
+# - 全程不拉镜像、不备份、不迁移、不切容器（只读刷新）。
+
+
+def test_refresh_request_triggers_a_real_registry_check(ws: Workspace) -> None:
+    """写了刷新文件 → 当轮立刻查一次 registry，并回显 `check_id`。"""
+    path = write_refresh(ws)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not path.exists(), "处理完必须删掉刷新请求文件"
+    check = _check(ws)
+    assert check["state"] == "ok"
+    assert check["check_id"] == REFRESH_ID
+    assert check["reason"] is None
+    assert check["checked_at"].endswith("Z")
+    # 证据：这一轮列了**两次** tag —— 启动时自动一次，用户请求又绕过节流查了一次。
+    listings = [line for line in ws.status_registry_calls() if "tags/list" in line]
+    assert len(listings) == 2, ws.calls()
+    # 结论是这次新查出来的。
+    assert ws.status()["recommended_target"]["version"] == TARGET_VERSION
+    # 按需刷新是**只读**的：不 compose up/stop/pull、不备份、不迁移、不碰宿主 HTTP。
+    assert mutating_calls(ws) == [], ws.calls()
+    assert calls_with(ws, "http GET /readyz") == []
+    # 幂等/限流状态落在状态目录里（0600）。
+    state_file = ws.state_dir / "refresh.json"
+    assert state_file.is_file()
+    assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert REFRESH_ID in saved["processed"]
+
+
+def test_same_refresh_id_is_not_processed_twice(ws: Workspace) -> None:
+    """同一个 request_id 再写回来 → 只删文件，不再查（跨进程幂等）。"""
+    write_refresh(ws, REFRESH_ID)
+    assert run_updater(ws).returncode == 0
+    first = _check(ws)
+    assert first["check_id"] == REFRESH_ID
+    ws.reset()
+    # 同一个 ID 又写回来。把限流窗口压到极小，证明"没有查"是因为**幂等**。
+    path = write_refresh(ws, REFRESH_ID)
+    result = run_updater(ws, extra=["--refresh-throttle-seconds", "0.001"])
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not path.exists()
+    # 这一轮只有启动那次自动检查列了 tag；请求没有再触发一次。
+    assert len([line for line in ws.status_registry_calls() if "tags/list" in line]) == 1
+    # `release_check` 是**自动刷新**的结论（重复请求不产生新结论，也不改写它）。
+    assert _check(ws)["check_id"] is None
+    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
+    assert "已处理过（幂等）" in journal, journal[-2000:]
+
+
+def test_refresh_requests_are_rate_limited(ws: Workspace) -> None:
+    """限流窗口内连发：文件删掉、`reason_detail=throttled`、**不**再打 registry。"""
+    write_refresh(ws, REFRESH_ID)
+    assert run_updater(ws).returncode == 0
+    ws.reset()
+    path = write_refresh(ws, REFRESH_ID_B)
+    # 把窗口放大到 1 小时：两次进程调用之间的几秒钟必然落在窗口里（确定性）。
+    result = run_updater(ws, extra=["--refresh-throttle-seconds", "3600"])
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not path.exists(), "被限流丢弃的请求也要删掉，否则会一直堆在目录里"
+    check = _check(ws)
+    assert check["check_id"] == REFRESH_ID_B
+    assert check["reason_detail"] == "throttled"
+    # **不改** state：这次没查，上一次的结论（ok + 最新版）原样留着。
+    assert check["state"] == "ok"
+    assert check["latest"]["version"] == TARGET_VERSION
+    assert check["reason"] is None
+    assert len([line for line in ws.status_registry_calls() if "tags/list" in line]) == 1
+    assert ws.status()["recommended_target"]["version"] == TARGET_VERSION
+
+
+def test_refresh_failure_never_claims_no_new_version(ws: Workspace) -> None:
+    """刷新时 registry 不可达：`state=failed` + 空目标，**不**说"已是最新"。"""
+    write_refresh(ws, REFRESH_ID)
+    ws.http.registry_fail = "503"
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_check"]["check_id"] == REFRESH_ID
+    assert status["release_check"]["state"] == "failed"
+    assert status["release_check"]["reason"] == "registry_unreachable"
+    assert status["available_targets"] == []
+    assert status["recommended_target"] is None
+    # 当前版本是本机实测，与"这次查不到"无关。
+    assert status["release_check"]["current"]["version"] == CURRENT_VERSION
+    # 刷新仍然只读：查不到不代表可以去动容器/备份。
+    assert mutating_calls(ws) == [], ws.calls()
+
+
+def test_refresh_accepts_design_document_field_names_and_ignores_extra_keys(
+    ws: Workspace,
+) -> None:
+    """设计文档写的是 `check_id`/`requested_at`：两种写法都认；多余键只忽略。"""
+    path = write_refresh(
+        ws,
+        REFRESH_ID,
+        extra={"check_id": REFRESH_ID, "requested_at": T0, "tag": "latest"},
+        drop=("request_id", "created_at"),
+    )
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not path.exists()
+    check = _check(ws)
+    assert check["check_id"] == REFRESH_ID
+    assert check["state"] == "ok"
+    # 多余的键**不拒绝**，但键名要进私有日志（可排查"为什么某个字段没生效"）。
+    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
+    assert "未定义字段" in journal, journal[-2000:]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema": 1, "request_id": "%s", "kind": "refresh", "created_at": "nope"}',
+        b'{"schema": 2, "request_id": "%s", "kind": "refresh", "created_at": "%s"}',
+        b'{"schema": 1, "request_id": "%s", "kind": "install", "created_at": "%s"}',
+        b'{"schema": 1, "kind": "refresh", "created_at": "%s"}',
+        b"not json",
+    ],
+)
+def test_malformed_refresh_requests_are_dropped_not_fatal(ws: Workspace, body: bytes) -> None:
+    """畸形刷新请求：删文件、进程不崩、**不查** registry、不改 release_check。"""
+    payload = body.replace(b"%s", REFRESH_ID.encode("utf-8")).replace(
+        b"%s", T0.encode("utf-8")
+    )
+    path = ws.requests_dir / f"refresh-{REFRESH_ID}.json"
+    path.write_bytes(payload)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not path.exists()
+    check = _check(ws)
+    # 这一轮只有启动那次自动检查；畸形请求既没有查、也没有伪造结论。
+    assert check["check_id"] is None
+    assert check["state"] == "ok"
+    assert len([line for line in ws.status_registry_calls() if "tags/list" in line]) == 1
+    journal = (ws.state_dir / "journal.log").read_text(encoding="utf-8")
+    assert "刷新请求被拒绝" in journal, journal[-2000:]
+
+
+def test_refresh_does_not_block_or_consume_install_requests(ws: Workspace) -> None:
+    """同目录两种请求共存：安装请求优先，刷新文件留着下一轮处理（不丢、不乱序）。"""
+    write_request(ws)
+    refresh = write_refresh(ws, REFRESH_ID)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    # 安装任务照旧跑完（旧通道不受影响）。
+    assert ws.task()["state"] == "succeeded"
+    # 刷新请求原样留着：这一轮处理的是安装，刷新排队（设计原文「有安装任务时
+    # refresh 排队」）。
+    assert refresh.exists()
+    assert _check(ws)["check_id"] is None
+
+
+def test_refresh_file_is_not_mistaken_for_an_install_request(ws: Workspace) -> None:
+    """`refresh-*.json` 绝不能被当成安装请求认领/归档。"""
+    write_refresh(ws)
+    assert run_updater(ws).returncode == 0
+    assert list(ws.requests_dir.glob("refresh-*.json")) == []
+    assert list(ws.requests_dir.glob("request-*.json")) == []
+    archive = ws.requests_dir / "archive"
+    assert list(archive.glob("*")) == [], list(archive.glob("*"))
+    # 也没有建任何任务记录。
+    assert not (ws.state_dir / "task.json").exists()
+    assert ws.status()["task"] is None
+
+
+# ---------------------------------------------------------------- 更新说明（release notes）
+#
+# 设计 §5：说明**只是展示**。首选发行包自带的 `deploy/update-notes.json`（存在即用），
+# 里面没有 latest 这一版时可选再试 GitHub Release 的精确 tag；状态文件里只放
+# **latest 那一版**。说明取不到绝不改变"能不能更新"。
+
+
+def _notes_file(ws: Workspace) -> Path:
+    """发行包里那份更新说明（与 `releases.json` 同目录）。"""
+    return ws.release_catalog.parent / "update-notes.json"
+
+
+def test_release_notes_only_contain_the_latest_version(ws: Workspace) -> None:
+    """合法文件 → `state=ok`，且**只含 latest 那一版**（别的版本不进状态）。"""
+    write_notes(
+        ws,
+        notes_document(
+            **{
+                CURRENT_VERSION: note("当前这一版不该出现在状态里", ["x"]),
+                TARGET_VERSION: note(
+                    "日程子系统与发送链路的可靠性修复",
+                    ["她的一天：完成证据分三类", "更早的消息不再消失"],
+                ),
+                "0.0.9": note("还没发布/不在 registry 里", ["不该出现"]),
+            }
+        ),
+    )
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    notes = status["release_notes"]
+    assert set(notes) == RELEASE_NOTES_KEYS
+    assert notes["state"] == "ok"
+    assert notes["reason"] is None
+    assert set(notes["notes"]) == {TARGET_VERSION}, notes
+    entry = notes["notes"][TARGET_VERSION]
+    assert set(entry) == RELEASE_NOTE_KEYS
+    assert entry["summary"] == "日程子系统与发送链路的可靠性修复"
+    assert entry["items"][0] == "她的一天：完成证据分三类"
+    assert entry["url"].startswith("https://")
+    # 目标判定**不受**说明影响。
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+    # 本地那份已经命中了 latest，就不该再去打 GitHub。
+    assert ws.status_github_calls() == []
+
+
+def test_release_notes_missing_is_not_an_error(ws: Workspace) -> None:
+    """没有这份文件，GitHub 也没有 → `state=missing`，目标判定照旧。"""
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_notes"] == {"state": "missing", "reason": None, "notes": {}}
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+    assert status["recommended_target"]["digest"] == TARGET
+    # 本地那份没有 → 试了一次 GitHub 的**精确 tag**（不是 releases/latest）。
+    github = ws.status_github_calls()
+    assert len(github) == 1, github
+    assert f"/releases/tags/v{TARGET_VERSION}" in github[0], github
+
+
+def test_release_notes_fall_back_to_the_github_release(ws: Workspace) -> None:
+    """本地没有这一版 → 用 GitHub Release 的正文（首行摘要 + 列表项）。"""
+    ws.http.release_body = json.dumps(
+        {
+            "tag_name": f"v{TARGET_VERSION}",
+            "html_url": "https://github.com/qsbb/ling/releases/tag/v0.0.2",
+            "draft": False,
+            "prerelease": False,
+            "body": "日程与发送链路修复\n\n- 完成证据分三类\n- 长链接不再整条被拒\n",
+        }
+    ).encode("utf-8")
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    notes = ws.status()["release_notes"]
+    assert notes["state"] == "ok"
+    entry = notes["notes"][TARGET_VERSION]
+    assert entry["summary"] == "日程与发送链路修复"
+    assert entry["items"] == ["完成证据分三类", "长链接不再整条被拒"]
+    assert entry["url"].startswith("https://github.com/qsbb/ling/releases/tag/")
+
+
+def test_release_notes_github_failure_does_not_change_the_target(ws: Workspace) -> None:
+    """GitHub 500：说明取不到（missing），但"有新版"照旧判定。"""
+    ws.http.release_status = 500
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    assert status["release_notes"]["state"] == "missing"
+    assert status["release_notes"]["notes"] == {}
+    assert status["release_check"]["state"] == "ok"
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (b"{ not json", "notes_invalid"),
+        (b"[]", "notes_invalid"),
+        (b'{"schema": 2, "notes": {}}', "notes_invalid"),
+        (b'{"schema": 1, "notes": {}, "extra": 1}', "notes_invalid"),
+        (
+            b'{"schema": 1, "notes": {"0.0.2": {"summary": "s", "extra": "x"}}}',
+            "notes_invalid",
+        ),
+        (
+            b'{"schema": 1, "notes": {"v0.0.2": {"summary": "s"}}}',
+            "notes_invalid",
+        ),
+        (
+            b'{"schema": 1, "notes": {"0.0.2": {"summary": "' + "长".encode() * 121 + b'"}}}',
+            "notes_invalid",
+        ),
+        (b'{"schema": 1, "notes": "x"}', "notes_invalid"),
+    ],
+)
+def test_release_notes_invalid_never_changes_the_target_judgement(
+    ws: Workspace, body: bytes, reason: str
+) -> None:
+    """坏 JSON / 未知字段 / 超长 → `state=invalid`，**目标判定不变**。"""
+    write_notes_raw(ws, body)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    status = ws.status()
+    notes = status["release_notes"]
+    assert notes["state"] == "invalid"
+    assert notes["reason"] == reason
+    assert notes["notes"] == {}
+    # 目标判定与"没有更新说明"时完全一致。
+    assert status["release_check"]["state"] == "ok"
+    assert status["recommended_target"]["version"] == TARGET_VERSION
+    assert status["recommended_target"]["digest"] == TARGET
+    assert [item["compatible"] for item in status["available_targets"]] == [True]
+
+
+def test_release_notes_too_large_is_reported_as_such(ws: Workspace) -> None:
+    """超过大小上限 → `state=invalid` + `notes_too_large`（不是静默丢弃）。"""
+    body = b'{"schema": 1, "notes": {}}' + b" " * (70 * 1024)
+    write_notes_raw(ws, body)
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    notes = ws.status()["release_notes"]
+    assert notes["state"] == "invalid"
+    assert notes["reason"] == "notes_too_large"
+
+
+def test_release_notes_text_cannot_break_the_status_sanitizer(ws: Workspace) -> None:
+    """发布方文案里出现 "password"/"journal.log" 这类词也不能让状态写入失败。
+
+    更新内容是**公开的发布文案**（发布日志本来就会写「修复密码重置」），它不该被
+    当成"疑似敏感内容"。状态文件自查只扫我们自己拼的部分。
+    """
+    write_notes(
+        ws,
+        notes_document(
+            **{
+                TARGET_VERSION: note(
+                    "修复 password 重置与 journal.log 轮转", ["password 不再明文进日志"]
+                )
+            }
+        ),
+    )
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    notes = ws.status()["release_notes"]
+    assert notes["state"] == "ok"
+    assert "password" in notes["notes"][TARGET_VERSION]["summary"]
+
+
+def test_status_serialization_drops_notes_only_when_over_the_api_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """兜底：说明把状态顶过预算时**丢掉说明**，而不是让整份状态不可读。
+
+    API 读 ``status.json`` 有硬上限（``MAX_JSON_BYTES = 16 KiB``）：超了不是"少一个
+    字段"，而是整份状态对 API 不可读。这条把预算压到很小来触发它。
+    """
+    module = _updater_module()
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "protocol": 1,
+        "release_notes": {
+            "state": "ok",
+            "reason": None,
+            "notes": {"0.0.4": {"summary": "长" * 400, "items": [], "url": None}},
+        },
+    }
+    assert json.loads(module.serialize_status(dict(payload)))["release_notes"]["notes"]
+
+    monkeypatch.setattr(module, "STATUS_NOTES_BUDGET_BYTES", 512)
+    text = module.serialize_status(dict(payload))
+    assert len(text.encode("utf-8")) < 2048
+    trimmed = json.loads(text)["release_notes"]
+    assert trimmed["state"] == "invalid"
+    assert trimmed["reason"] == "notes_too_large"
+    assert trimmed["notes"] == {}
+
+
+def test_status_file_stays_under_the_api_read_limit(ws: Workspace) -> None:
+    """合法的**最大**更新说明 + 一份任务视图，仍要远低于 API 的 16 KiB 读取上限。
+
+    这是"加这两个顶层键不会让旧 API 崩"的量化保证：0.0.3 的
+    ``read_json_file(MAX_JSON_BYTES=16 KiB)`` 一超就把整份状态当不可解析。
+    """
+    module = _updater_module()
+    api_limit = 16 * 1024
+    assert api_limit == module.STATUS_READ_LIMIT_BYTES
+    url = "https://example.com/" + "a" * (512 - len("https://example.com/"))
+    big = {
+        "summary": "修" * 120,
+        "items": ["改" * 120 for _ in range(8)],
+        "url": url,
+    }
+    write_notes(ws, notes_document(**{TARGET_VERSION: big}))
+    seed_task(ws, state="needs_manual", stage="switch", attempted=True)
+    result = run_updater(ws)
+    assert result.returncode == 17, (result.stdout, result.stderr)
+    text = ws.status_text()
+    assert len(text.encode("utf-8")) < api_limit, len(text.encode("utf-8"))
+    notes = ws.status()["release_notes"]
+    # 没有触发兜底：那条说明原样在（没有截断、没有改写）。
+    assert notes["state"] == "ok"
+    assert set(notes["notes"]) == {TARGET_VERSION}
+    assert notes["notes"][TARGET_VERSION]["summary"] == "修" * 120
+    assert len(notes["notes"][TARGET_VERSION]["items"]) == 8

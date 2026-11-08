@@ -42,7 +42,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.api.deps import CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
 from ling.config import Settings
-from ling.contracts.v1 import ErrorCode
+from ling.contracts.v1 import (
+    ErrorCode,
+    ImageNewerRelease,
+    ImageReleaseCheckDetails,
+    ImageUpdateBackupGateDetails,
+    ImageUpdateCatalogDetails,
+    ImageUpdateCheckAccepted,
+    ImageUpdateCurrent,
+    ImageUpdateDetails,
+    ImageUpdateState,
+    ImageUpdateTarget,
+    ImageUpdateTaskRow,
+    ImageUpdateUpdaterDetails,
+    ImageUpdateView,
+)
 from ling.infra.models import AuthSession
 from ling.infra.security import hash_token
 from ling.updates import protocol as update_protocol
@@ -90,6 +104,11 @@ _SEMVER = re.compile(
     r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
     r"(?:\+[0-9A-Za-z.-]+)?$"
 )
+
+# 解析后的 semver 键：``(major, minor, patch, prerelease)``。用它做「同一个版本」
+# 的归一（``v0.0.4`` / ``0.0.4`` / ``0.0.4+build`` 是同一版），这样更新说明不会
+# 因为更新器写没写 ``v`` 前缀而漏配。
+_VersionKey = tuple[int, int, int, tuple[int | str, ...]]
 
 router = APIRouter(tags=["version"])
 
@@ -667,7 +686,7 @@ def _origin_problem(request: Request, settings: Settings) -> str | None:
     return None
 
 
-def _require_update_headers(request: Request) -> None:
+def _require_json_content_type(request: Request) -> None:
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if media_type != "application/json":
         raise LingError(
@@ -676,6 +695,16 @@ def _require_update_headers(request: Request) -> None:
             status_code=422,
             detail=DETAIL_CONTENT_TYPE_REQUIRED,
         )
+
+
+def _require_update_headers(request: Request) -> None:
+    """写接口的固定头：``Content-Type: application/json`` + ``X-Ling-Update: 1``。
+
+    ``X-Ling-Update`` 是**防误触标记**（避免表单/普通脚本误打写接口），真正的
+    跨站防护是同源校验。按需检查只能写一条刷新请求、不改任何状态，前端不发这个
+    头，所以它只调 :func:`_require_json_content_type`（安装写接口仍两者都要）。
+    """
+    _require_json_content_type(request)
     if request.headers.get("x-ling-update") != "1":
         raise LingError(
             ErrorCode.invalid_request,
@@ -858,15 +887,16 @@ async def create_update_request(
 #    得出，与任务无关）；只有该字段**缺失**时才回退到 ``task.backup``（兼容旧状态
 #    文件）。原因是死锁：``task`` 要等第一次任务处理完才存在，而第一次任务要先过
 #    恢复点门禁——只看 ``task.backup`` 的话，全新镜像部署的网页更新永远不可安装。
-# 5. **可用目标**（"更新"按钮到底能更新到什么）只来自更新器写的
-#    ``available_targets`` / ``recommended_target``：API **不读**发布目录文件
-#    （镜像模式的 API 根本没有 ``deploy/`` 挂载），也**不接受**调用方给的摘要。
-#    这里仍按白名单逐字段重建，并且自己再核一遍「只允许升级」：目录/状态文件都
-#    跨了一条信任边界，更新器算过不等于 API 可以盲信。``recommended_target`` 必须
-#    与某条**兼容**目标逐字段一致，否则丢弃并退回"版本最大的兼容目标"——这样
-#    「可安装 ⇔ 有目标」永远成立。没有兼容目标 → 不可安装，原因是固定码表文案。
-# 6. 提交时的 ``target_digest`` 必须在该目录的**兼容目标**里，否则 409
-#    ``target_not_in_catalog``：不能绕过目录提交任意摘要。
+# 5. **发现事实只有一个来源**：更新器写的 ``status.json`` 顶层 ``release_check``
+#    （它自己查 registry 的 tags/manifest 得出的脱敏结论）。API **不再读**可信
+#    发布目录：``deploy/releases.json`` / ``catalog.py`` / ``min_from`` /
+#    ``available_targets`` / ``recommended_target`` 都不再是事实源（设计
+#    docs/UPDATE-SIMPLIFICATION-DESIGN.md §3/§6/§8）。这些旧键**缺失或变成占位**
+#    都不许让 API 崩，也**不许**因此把状态说成「已是最新」。
+#    这里仍按白名单逐字段重建，并且自己再核一遍「只允许升级」：状态文件跨了一条
+#    信任边界，更新器算过不等于 API 可以盲信。
+# 6. 提交时的 ``target_digest`` 必须等于**这次发现的那个目标**摘要，否则 409
+#    ``target_not_available``：调用方不能自己编一个摘要来装。
 #
 # 状态码口径（本文件对镜像通道的约定）：
 #
@@ -885,6 +915,9 @@ IMAGE_UPDATE_REQUEST_ARCHIVE = "archive"
 # 32 位小写 hex 的任务 ID，与 ``ghcr.io/qsbb/ling-api@sha256:<64 位小写 hex>``。
 IMAGE_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 IMAGE_DIGEST_RE = re.compile(r"^ghcr\.io/qsbb/ling-api@sha256:[0-9a-f]{64}$")
+# registry 侧给的是裸摘要（``Docker-Content-Digest``），安装请求要的是完整引用。
+IMAGE_DIGEST_HEX_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_DIGEST_PREFIX = "ghcr.io/qsbb/ling-api@"
 IMAGE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # 任务视图里的短标记（backup id / 阶段 / 迁移 revision）：只允许安全字符。
 IMAGE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:-]*$")
@@ -903,6 +936,27 @@ IMAGE_UPDATE_BODY_KEYS = frozenset(
 
 # 更新器写请求文件时的固定结构（与 deploy/updater/updater.py 的 REQUEST_KEYS 一致）。
 IMAGE_UPDATE_REQUEST_SCHEMA = 1
+
+# ---- 「检查更新」按需刷新请求（docs/UPDATE-UX-DESIGN.md §真正的按需检查协议）----
+#
+# API **只写一条刷新请求**进更新器已经在读的 requests 目录：它不访问 GitHub /
+# registry / Docker，不改 ``status.json``，也不会伪造 ``checked_at``。真正的目录
+# 刷新、镜像版本读取与 ``docker manifest inspect`` 由更新器在**单飞锁内**完成。
+#
+# 文件名与内容都是固定结构，和安装请求一样只认 32 位小写 hex：
+#   ``refresh-<id>.json`` / ``claimed-refresh-<id>.json`` / ``archive/``
+# 安装请求仍然只匹配 ``request-*.json``，两条队列互不覆盖。
+IMAGE_CHECK_REQUEST_PREFIX = "refresh-"
+IMAGE_CHECK_CLAIMED_PREFIX = "claimed-refresh-"
+IMAGE_CHECK_REQUEST_SCHEMA = 1
+IMAGE_CHECK_KIND = "refresh"
+# 请求体**只有这一个字段**；``schema``/``kind``/``created_at`` 由 API 自己写。
+IMAGE_CHECK_BODY_KEYS = frozenset({"request_id"})
+# 30 秒内已经完成过一次检查 → 回同一个 ID，不重复打 registry（设计 §按需检查协议）。
+IMAGE_CHECK_DEDUP_SECONDS = 30.0
+# 归档目录里最多扫多少个文件来判定「刚刚检查过」。每次更新一个文件，正常远小于此；
+# 设上限是为了不让一个被塞满的 archive 把 GET/POST 拖成 O(N) 的磁盘扫描。
+IMAGE_CHECK_ARCHIVE_SCAN_LIMIT = 1024
 
 # ``status.json`` 的 ``updated_at`` 超过这个年龄就认为更新器离线。更新器默认 5 秒
 # 轮询一次，空闲时每次都刷新 ``updated_at``；长阶段（备份/迁移）只在阶段边界写，
@@ -944,29 +998,125 @@ IMAGE_MEDIA_STATES = frozenset({"ok", "present", "absent", "partial"})
 IMAGE_KEYS_ROOT_STATES = frozenset({"present", "absent"})
 IMAGE_KEYS_ENV_STATES = frozenset({"true", "false"})
 
-# 更新器 ``status.json`` 顶层 ``release_catalog.reason`` 的码表（可信发布目录）。
-# 同上：状态文件跨信任边界，只翻译认识的码，未知码丢弃（不回显原文）。
-IMAGE_CATALOG_STATE_MESSAGES: dict[str, str] = {
-    "ok": "已读到可信发布目录",
-    "missing": "可信发布目录缺失（发行包里没有 deploy/releases.json）",
-    "invalid": "可信发布目录无法验证（内容或权限不符合固定格式）",
-}
-IMAGE_CATALOG_REASON_MESSAGES: dict[str, str] = {
-    "catalog_missing": "发行包里没有可信发布目录（deploy/releases.json），无法确定可用目标",
-    "catalog_unreadable": "可信发布目录无法读取：不是普通文件、过大或权限过宽",
-    "catalog_invalid": "可信发布目录内容不符合固定格式，已按不可信处理",
-    "catalog_schema_unsupported": "可信发布目录的 schema 不是 1，需要人工核对",
-    "catalog_tool_missing": "更新器发行包里缺少目录校验工具（deploy/release/catalog.py）",
-}
 # 「这条目标为什么不能用」的码表。**故意与更新器各存一份**。
+# 目录（releases.json / min_from）已经删除：只剩两种"版本存在但这次装不了"。
 IMAGE_INCOMPATIBLE_MESSAGES: dict[str, str] = {
-    "not_in_min_from": "当前版本不在这条目标的升级跨度内（min_from 不含当前版本）",
-    "not_newer": "目标版本不高于当前版本（只允许升级，不提供降级）",
-    # 当前版本现在读运行中 api 镜像的 `org.opencontainers.image.version` 标注
-    # （目录里已经没有 digest，"摘要不在目录里"这条旧解释不再成立）。
-    "current_version_unknown": "无法确认当前安装版本（读不到运行中 api 镜像的版本标注）",
-    "version_uncomparable": "目标版本或当前版本不是可比较的 semver",
+    # 新版**确实存在**，只是 registry 里还解析不出这一版的构建产物（tag 指向的
+    # manifest 取不到 / 摘要格式不对），设计明确不许武断说成"网络坏了"。
+    "digest_unresolved": "新版已发布，但取不到这一版的安装包摘要",
+    # 多架构 index 里没有宿主平台（设计 §3：本项目发布 linux/amd64、linux/arm64）。
+    "platform_unsupported": "新版本没有适合这台机器的镜像",
 }
+
+# ---------------------------------------------------------------- 「检查更新」四态
+#
+# 设计依据：docs/UPDATE-SIMPLIFICATION-DESIGN.md §3/§6/§8、docs/UPDATE-UX-DESIGN.md
+# §卡片与四态。**唯一发现事实源**是更新器写的 ``status.json`` 顶层
+# ``release_check``（它查 GHCR tags/manifest 得出的脱敏结论）；API 只做**白名单
+# 投影**与版本比较，不读发布目录、不访问 registry、不自己拼版本/摘要。
+#
+# 判定优先级：通道/更新器（unknown）→ 本次检查是否可信（unknown）→ 当前版本
+# 是否可确认（unknown）→ 有更高版本但拿不到安装包（newer_unavailable）→
+# 可更新（available）→ 已是最新（latest）。
+# 活动安装任务**不改变** state（前端按 task 显示进度），但它会把首屏那句话换成
+# 「更新正在进行中」——见 ``ImageUpdateChannel._active_message``。
+IMAGE_UPDATE_STATES = ("latest", "available", "newer_unavailable", "unknown")
+# ``release_check`` 的三态（更新器自己给）：ok = 完整查询成功；failed = 这次失败；
+# unknown = 还没查/上次被打断。
+IMAGE_RELEASE_CHECK_STATES = frozenset({"ok", "failed", "unknown"})
+# 只接受设计 §3 说的那个固定 registry 来源；别的值等于没有来源证据。
+IMAGE_RELEASE_CHECK_SOURCES = frozenset({"registry"})
+# 检查终态的中文（只进详情诊断，不进首屏那句话）。
+IMAGE_RELEASE_CHECK_STATE_MESSAGES: dict[str, str] = {
+    "ok": "检查完成",
+    "failed": "这次检查没有完成",
+    "unknown": "还没有完整完成过一次检查",
+}
+# ``release_check.reason`` 的闭表。**故意与更新器各存一份**：状态文件跨信任边界，
+# 只翻译认识的码，未知码一律降级（见 ``_image_unknown_clause``）。
+#
+# 两类语义**必须分开**，否则四态会说错话：
+#   - "列表类"：连 tags/list 本身都没拿到/不完整（不可达、认证、限流、超时、
+#     没有稳定版）。这时**不能**断言"有没有新版"，四态只能是 unknown（设计 §6）。
+#   - "制品类"：tag 列表可信、只是这一版的 manifest/摘要/平台拿不到。这时
+#     "有更高版本"是事实，四态是 newer_unavailable（设计 §6 第 3/4 行）。
+IMAGE_RELEASE_ARTIFACT_REASONS = frozenset({"digest_unresolved", "platform_unsupported"})
+IMAGE_RELEASE_REASON_MESSAGES: dict[str, str] = {
+    # ---- 列表类 ----
+    "registry_unreachable": "连不上镜像仓库",
+    "registry_auth_failed": "镜像仓库不认这次查询的凭据（可能是私有包或凭据失效）",
+    "registry_rate_limited": "镜像仓库暂时限流，这次没查完整",
+    "registry_timeout": "查询镜像仓库超时",
+    "no_stable_tags": "镜像仓库里还没有稳定版发布",
+    # ---- 制品类 ----
+    "digest_unresolved": "找到了新版本，但取不到它的安装包摘要",
+    "platform_unsupported": "新版本没有适合这台机器的镜像",
+}
+
+# 更新器那一侧的**历史拼写** → 本文件码表的归一码。只做兼容，不改更新器：
+# ``deploy/updater/registry.py`` 写的是 ``auth_failed`` / ``rate_limited`` /
+# ``timeout`` / ``manifest_failed`` / ``digest_missing`` / ``platform_missing``，
+# 而四态判定、``IMAGE_RELEASE_REASON_MESSAGES`` 与前端码表认的是
+# ``registry_*`` / ``digest_unresolved`` / ``platform_unsupported``。
+#
+# 归一必须发生在"判定状态"**之前**（见 ``_image_release_check_view``）：不做这层，
+# ``platform_missing`` 会被当成未知的列表类失败，错归成「取不到安装包」，
+# ``manifest_failed`` / ``digest_missing`` 的具体文案也丢了。
+#
+# 别名表**不是**兜底：不在这里、也不在码表里的码照旧一律降级为"没有可信原因"，
+# 绝不回显原文（状态文件跨信任边界）。
+IMAGE_RELEASE_REASON_ALIASES: dict[str, str] = {
+    "auth_failed": "registry_auth_failed",
+    "rate_limited": "registry_rate_limited",
+    "timeout": "registry_timeout",
+    "platform_missing": "platform_unsupported",
+    "digest_missing": "digest_unresolved",
+    "manifest_failed": "digest_unresolved",
+}
+
+# ``release_check.reason_detail`` 的白名单：更新器只会写 ``null`` 或
+# ``"throttled"``（同一 ``check_id`` 的刷新请求在 10 秒窗口内重复，被丢弃）。
+# 仍然逐值投影、不原样透传：状态文件跨信任边界，别处写进来的自由文本
+# （URL/凭据/异常消息）一个字都不能出去。前端暂不消费也没关系。
+IMAGE_RELEASE_REASON_DETAILS = frozenset({"throttled"})
+
+# 「暂时无法确认」的**人话短句**：直接拼进「暂时无法确认是否有新版本：{短句}」。
+# 纪律：这里只放给人读的句子，绝不出现码表码 / 摘要 / 路径 / 环境变量名——
+# 原因码走 ``reason`` 与诊断字段，首屏那句话必须是人话。
+IMAGE_UNKNOWN_REASONS: dict[str, str] = {
+    "image_mode_required": "当前部署没有镜像模式的标记（源码模式请用源码更新通道）",
+    "update_channel_unavailable": "API 读不到更新器的状态，或写不了请求目录",
+    "updater_status_missing": "更新器还没有写出状态文件",
+    "updater_status_invalid": "更新器的状态无法识别",
+    "protocol_unsupported": "更新器版本与本机不兼容",
+    "updater_offline": "更新服务暂时没有响应",
+    # 更新器还没写过 ``release_check``（旧更新器，或刚装上还没查过）。
+    "release_check_missing": "更新器还没有报告过检查结果",
+    "current_version_unknown": (
+        "无法确认现在运行的版本（读不到运行中镜像的版本标注，按人工升级流程处理）"
+    ),
+    "version_conflict": "更新器报的当前版本与本机记录不一致",
+}
+# 「有新版暂不可用」的原因短句：拼进「发现新版 v{version}，但暂时不能更新：{短句}」。
+# 顺序口径见文档「原因优先级」：人工门禁/开关 高于 摘要解析。
+IMAGE_UNAVAILABLE_REASONS: dict[str, str] = {
+    "digest_unresolved": "新版已发布，但暂时取不到安装包",
+    "platform_unsupported": "新版本没有适合这台机器的镜像",
+    "backup_gate_missing": "更新前需要一个可用备份，请先完成一次备份",
+    "update_disabled": "本机尚未启用网页更新",
+    "manual_required": "上次更新还没处理完，请先按提示处理上次更新",
+    "current_image_unknown": "无法确认当前运行的是哪一版镜像",
+}
+# 更新说明的硬上限（设计 §附：summary ≤ 120 字、items ≤ 8 条、每条 ≤ 120 字）。
+# 超出/坏掉只是「没有更新内容」，绝不影响能不能更新的判断。
+IMAGE_NOTE_MAX_CHARS = 120
+IMAGE_NOTE_MAX_ITEMS = 8
+IMAGE_NOTE_URL_MAX_CHARS = 512
+# ``release_notes.state`` 的三态（发布方有没有写说明）。
+IMAGE_RELEASE_NOTES_STATES = frozenset({"ok", "missing", "invalid"})
+# ``release_check.tag_count`` 的展示上限：状态文件跨信任边界，不为一个计数提供
+# 渲染/内存放大器（真实 tag 数远小于此）。
+IMAGE_MAX_TAG_COUNT = 100_000
 
 # 更新器 ``status.json`` 顶层 ``backup_gate.reason`` 的码表。**故意与更新器各存
 # 一份**（同失败码表）：状态文件跨信任边界，只翻译认识的码，未知码丢弃。
@@ -1038,8 +1188,8 @@ IMAGE_REASON_MESSAGES: dict[str, str] = {
         "更新前的备份/恢复门禁未就绪"
     ),
     "current_image_unknown": "无法确认当前运行镜像摘要或提交，暂不允许更新",
-    "no_available_target": "暂无可用的更新目标（发布目录里没有适用于当前版本的新版本）",
-    "target_not_in_catalog": "目标摘要不在可信发布目录的可用目标里，拒绝提交",
+    "no_available_target": "暂无可更新的版本（镜像仓库里没有比当前更高、且摘要可用的版本）",
+    "target_not_available": "目标摘要不是这次检查发现的新版本，拒绝提交",
     "installed_image_changed": "当前运行镜像已变化，请重新检查后再提交",
     "installed_version_changed": "当前运行提交已变化，请重新检查后再提交",
     "already_on_target": "目标摘要与当前运行摘要相同，不需要更新",
@@ -1072,7 +1222,7 @@ IMAGE_REASON_STATUS: dict[str, int] = {
     "backup_gate_missing": 409,
     "current_image_unknown": 409,
     "no_available_target": 409,
-    "target_not_in_catalog": 409,
+    "target_not_available": 409,
     "installed_image_changed": 409,
     "installed_version_changed": 409,
     "already_on_target": 409,
@@ -1112,11 +1262,11 @@ IMAGE_REASON_NEXT_ACTIONS: dict[str, tuple[str, ...]] = {
     ),
     "current_image_unknown": ("在宿主把 LING_APP_IMAGE 与 LING_COMMIT 注入 API 容器后重启",),
     "no_available_target": (
-        "核对发行包里的 deploy/releases.json（catalog.py validate）与更新器状态里的"
-        " release_catalog；确认目录里有比当前版本新、且 min_from 含当前版本的目标",
+        "重新检查一次更新；仍然没有目标就核对更新器到镜像仓库（GHCR）的连通性与"
+        "该版本镜像是否发布完整（含本机架构）",
     ),
-    "target_not_in_catalog": (
-        "从网页展示的可用目标里重新提交；目标只能来自可信发布目录，不能手填摘要",
+    "target_not_available": (
+        "重新检查更新后按页面展示的目标重新提交；摘要只能来自这次检查发现的新版本",
     ),
     "installed_image_changed": ("重新打开检查更新，按最新的当前摘要重新提交",),
     "installed_version_changed": ("重新打开检查更新，按最新的当前提交重新提交",),
@@ -1239,9 +1389,35 @@ def _image_text(value: object, *, max_length: int = 64) -> str | None:
 
 
 def _image_digest(value: object) -> str | None:
-    if not isinstance(value, str) or IMAGE_DIGEST_RE.fullmatch(value) is None:
+    """镜像摘要：``ghcr.io/qsbb/ling-api@sha256:<64hex>`` 或裸 ``sha256:<64hex>``。
+
+    裸摘要要归一成**完整引用**：安装请求里的 ``target_digest`` /
+    ``expected_current_digest`` 只能是完整引用（``IMAGE_DIGEST_RE``），而 registry
+    侧的 ``Docker-Content-Digest`` 天然是裸摘要。仓库名不接受调用方输入（设计
+    §10：不让前端/API 任意输入 registry URL 或镜像名），固定成本项目这一个。
+    """
+    if not isinstance(value, str):
         return None
-    return value
+    text = value.strip()
+    if IMAGE_DIGEST_RE.fullmatch(text) is not None:
+        return text
+    if IMAGE_DIGEST_HEX_RE.fullmatch(text) is not None:
+        return f"{IMAGE_DIGEST_PREFIX}{text}"
+    return None
+
+
+def _image_version(value: object) -> str | None:
+    """版本号：必须是可比较的 semver（``v0.0.4`` / ``0.0.4`` 都接受）。
+
+    非 semver（``latest``、``main``、更新时间戳）一律 ``None``：拿一个不能比较的
+    字符串去比大小，等于让「有没有新版」变成一个猜出来的结论。
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 64 or _parse_semver(text) is None:
+        return None
+    return text
 
 
 def _image_commit(value: object) -> str | None:
@@ -1268,6 +1444,22 @@ def _image_choice(value: object, allowed: frozenset[str]) -> str | None:
     if isinstance(value, str) and value in allowed:
         return value
     return None
+
+
+def _image_release_reason(value: object) -> str | None:
+    """把更新器写的 ``release_check.reason`` **归一**成本文件码表里的码。
+
+    三档：原样认识（``IMAGE_RELEASE_REASON_MESSAGES``）→ 别名表
+    （``IMAGE_RELEASE_REASON_ALIASES``，更新器的历史拼写）→ ``None``（丢弃）。
+
+    只有这一个入口：四态判定、``details.release_check.reason`` 回显、首屏那句话
+    都读归一后的码，所以前端码表按归一码查就对得上。
+    """
+    if not isinstance(value, str):
+        return None
+    if value in IMAGE_RELEASE_REASON_MESSAGES:
+        return value
+    return IMAGE_RELEASE_REASON_ALIASES.get(value)
 
 
 def _image_stage(value: object) -> str | None:
@@ -1303,128 +1495,127 @@ def _image_choices(value: object, table: dict[str, str], *, limit: int = IMAGE_M
     return texts
 
 
-def _image_available_targets(
-    raw: object, current_version: str
-) -> list[dict[str, object]]:
-    """投影 ``status.json`` 的 ``available_targets``（逐条白名单 + 去重 + 限长）。"""
-    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
-        return []
-    entries: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for item in raw:
-        entry = _image_target_entry(item, current_version)
-        if entry is None:
-            continue
-        digest = str(entry["digest"])
-        if digest in seen:
-            continue
-        seen.add(digest)
-        entries.append(entry)
-        if len(entries) >= IMAGE_MAX_TARGETS:
-            break
-    return entries
+def _image_release_check_view(raw: object) -> dict[str, object] | None:
+    """``status.json`` 顶层 ``release_check`` 的白名单投影（状态文件不可信）。
 
+    逐字段重建：多出来的键（路径、日志、原始异常）一律进不了响应。``state`` /
+    ``reason`` 只认 API 自己那份码表里的码，未知码丢弃（不回显原文）——
+    丢弃以后四态退回「暂不能确认」，**不会**变成「已是最新」。
 
-def _image_catalog_view(raw: object) -> dict[str, object]:
-    """``status.json`` 顶层 ``release_catalog`` 的白名单视图（状态文件不可信）。
+    ``reason`` 在这里就**归一**（``_image_release_reason``：原码 → 更新器别名 →
+    ``None``）。归一放在投影里而不是判定里，是为了让 ``details.release_check.reason``
+    回显的也是归一码（前端码表按归一码查），判定链只读投影结果，口径自然一致。
 
-    逐字段重建；``state``/``reason`` 只认 API 自己那份码表里的码，未知码丢弃
-    （不回显原文）。目录缺失/坏掉时这里给出**明确原因**，绝不静默。
+    ``reason_detail`` 只放 ``null | "throttled"``（``IMAGE_RELEASE_REASON_DETAILS``）：
+    那是更新器的固定枚举，不是自由文本；别的值一律丢弃——registry URL、凭据片段
+    或异常消息都进不来（设计 §3 末：「不返回认证信息或原始异常」）。
     """
     if not isinstance(raw, dict):
-        return {
-            "state": None,
-            "state_message": None,
-            "reason": None,
-            "reason_message": None,
-            "entries": 0,
-            "current_version": None,
+        return None
+    current_raw = raw.get("current")
+    current = current_raw if isinstance(current_raw, dict) else {}
+    latest_raw = raw.get("latest")
+    latest: dict[str, object] | None = None
+    if isinstance(latest_raw, dict):
+        latest = {
+            "version": _image_version(latest_raw.get("version")),
+            "digest": _image_digest(latest_raw.get("digest")),
+            # 目标版本的构建提交：registry 侧的 tag 元数据里通常没有（更新器写 null），
+            # 只做展示与核对用，不参与"能不能装"的判断。
+            "commit": _image_commit(latest_raw.get("commit")),
         }
-    state = _image_choice(raw.get("state"), frozenset(IMAGE_CATALOG_STATE_MESSAGES))
-    reason = _image_choice(raw.get("reason"), frozenset(IMAGE_CATALOG_REASON_MESSAGES))
-    entries = raw.get("entries")
-    if isinstance(entries, bool) or not isinstance(entries, int) or entries < 0:
-        entries = 0
+    reason = _image_release_reason(raw.get("reason"))
+    tag_count = raw.get("tag_count")
+    if isinstance(tag_count, bool) or not isinstance(tag_count, int) or tag_count < 0:
+        tag_count = 0
     return {
-        "state": state,
-        "state_message": IMAGE_CATALOG_STATE_MESSAGES.get(state) if state else None,
+        "state": _image_choice(raw.get("state"), IMAGE_RELEASE_CHECK_STATES),
+        "checked_at": _image_timestamp(raw.get("checked_at")),
+        "check_id": _image_request_id(raw.get("check_id")),
+        # 只认设计里那个固定来源（registry）；别的值等于没有来源证据。
+        "source": _image_choice(raw.get("source"), IMAGE_RELEASE_CHECK_SOURCES),
         "reason": reason,
-        "reason_message": IMAGE_CATALOG_REASON_MESSAGES.get(reason) if reason else None,
-        "entries": min(entries, IMAGE_MAX_TARGETS),
-        "current_version": _image_text(raw.get("current_version"), max_length=64),
+        "reason_message": IMAGE_RELEASE_REASON_MESSAGES.get(reason) if reason else None,
+        "reason_detail": _image_choice(raw.get("reason_detail"), IMAGE_RELEASE_REASON_DETAILS),
+        "current": {
+            "version": _image_version(current.get("version")),
+            "digest": _image_digest(current.get("digest")),
+        },
+        "latest": latest,
+        "tag_count": min(tag_count, IMAGE_MAX_TAG_COUNT),
     }
 
 
-def _image_target_entry(raw: object, current_version: str) -> dict[str, object] | None:
-    """把更新器的一条可用目标投影成白名单视图；结构不认识就整条丢弃。
+def _image_artifact_reason(release_check: dict[str, object] | None) -> str:
+    """「有更高版本、但这一版装不了」的原因码（只会是制品类两种之一）。
 
-    除了照抄更新器的 ``compatible``，这里**自己再核一遍「只允许升级」**：目标版本
-    必须严格大于当前版本。状态文件跨了一条信任边界，更新器算过的结论 API 仍要复核
-    （与恢复点门禁的做法一致）。
+    列表类原因（不可达/认证/限流/超时/没有稳定 tag）不走这里：那时连"有没有
+    新版"都不能断言，四态只能是 ``unknown``（设计 §6 前两行）。
     """
-    if not isinstance(raw, dict):
-        return None
-    version = raw.get("version")
+    reason = None if release_check is None else release_check.get("reason")
+    if isinstance(reason, str) and reason in IMAGE_RELEASE_ARTIFACT_REASONS:
+        return reason
+    return "digest_unresolved"
+
+
+def _image_newer_releases(
+    release_check: dict[str, object] | None,
+    current_version: str | None,
+    notes: dict[_VersionKey, tuple[str | None, list[str], str | None]],
+) -> list[dict[str, object]]:
+    """``newer``：本次检查发现的**那个**更高版本（没有就是空列表）。
+
+    registry 发现只给一个候选（tags 里最高的稳定版），所以这个列表最多一条；
+    形状不变（``version/commit/has_migration/digest/compatible/incompatible_reason/
+    summary/notes/notes_url``），前端不用改。
+
+    ``current_version`` 未知时返回 ``[]``：没有可信的比较基准就没有「更新」——
+    这时四态本身就是 ``unknown``，空列表**不能**被读成「已是最新」。
+
+    ``digest`` 允许为 null（「有新版但拿不到安装包」必须能显示）；但摘要为 null
+    的条目 ``compatible`` 一定是 false，永远进不了可提交目标。
+    """
+    if current_version is None or release_check is None:
+        return []
+    latest = release_check.get("latest")
+    if not isinstance(latest, dict):
+        return []
+    version = latest.get("version")
     if not isinstance(version, str) or _parse_semver(version) is None:
-        return None
-    digest = _image_digest(raw.get("digest"))
-    commit = _image_commit(raw.get("commit"))
-    has_migration = raw.get("has_migration")
-    compatible_raw = raw.get("compatible")
-    if (
-        digest is None
-        or commit is None
-        or not isinstance(has_migration, bool)
-        # `compatible` 必须是 JSON 布尔：缺字段/字符串都算状态文件不合固定结构，
-        # 整条丢弃——不能把"不知道能不能用"显示成一条目标。
-        or not isinstance(compatible_raw, bool)
-    ):
-        return None
-    compatible = compatible_raw
-    reason = _image_choice(
-        raw.get("incompatible_reason"), frozenset(IMAGE_INCOMPATIBLE_MESSAGES)
+        return []
+    comparison = compare_versions(current_version, version)
+    if comparison is None or comparison <= 0:
+        # 只允许升级：不高于当前版本的不是「新版」。
+        return []
+    digest_value = latest.get("digest")
+    digest = digest_value if isinstance(digest_value, str) else None
+    compatible = digest is not None
+    reason = None if compatible else _image_artifact_reason(release_check)
+    commit_value = latest.get("commit")
+    commit = commit_value if isinstance(commit_value, str) else None
+    parsed = _parse_semver(version)
+    summary, items, url = (None, [], None) if parsed is None else notes.get(
+        parsed, (None, [], None)
     )
-    if compatible:
-        comparison = compare_versions(current_version, version)
-        if comparison is None:
-            compatible, reason = False, "version_uncomparable"
-        elif comparison <= 0:
-            compatible, reason = False, "not_newer"
-    return {
-        "version": version,
-        "digest": digest,
-        "commit": commit,
-        "has_migration": has_migration,
-        "compatible": compatible,
-        "incompatible_reason": reason,
-        "incompatible_reason_message": IMAGE_INCOMPATIBLE_MESSAGES.get(reason) if reason else None,
-    }
-
-
-def _image_max_compatible(available: list[dict[str, object]]) -> dict[str, object] | None:
-    """兼容目标里版本最大的那条（没有就 None）。"""
-    best: dict[str, object] | None = None
-    for item in available:
-        if item.get("compatible") is not True:
-            continue
-        if best is None:
-            best = item
-            continue
-        if (compare_versions(str(best["version"]), str(item["version"])) or 0) > 0:
-            best = item
-    return best
-
-
-def _image_target_payload(item: dict[str, object] | None) -> dict[str, object] | None:
-    """``view.target`` 的固定四字段（只给 version/digest/commit/has_migration）。"""
-    if item is None:
-        return None
-    return {
-        "version": item["version"],
-        "digest": item["digest"],
-        "commit": item["commit"],
-        "has_migration": item["has_migration"],
-    }
+    return [
+        {
+            "version": version,
+            "commit": commit,
+            # 目录（含人工 has_migration 布尔值）已删除：迁移是否需要由迁移器
+            # 在安装时判断（设计 §8）。字段留一个版本，值恒为 null。
+            "has_migration": None,
+            "digest": digest,
+            "compatible": compatible,
+            "incompatible_reason": reason,
+            "incompatible_reason_message": (
+                IMAGE_INCOMPATIBLE_MESSAGES.get(reason) if reason else None
+            ),
+            # 发布方原话：notes = 逐条 items，summary 是单独一行；缺就是空/None。
+            "summary": summary,
+            "notes": list(items),
+            "notes_url": url,
+        }
+    ]
 
 
 def _image_backup_view(backup: dict[str, Any]) -> dict[str, object]:
@@ -1609,6 +1800,196 @@ def _image_pending_request_ids(requests_dir: Path) -> tuple[str, ...]:
     return tuple(ids)
 
 
+def _image_refresh_ids(directory: Path) -> tuple[str, ...]:
+    """目录里**按需刷新**请求的 ID（``refresh-<id>.json`` / ``claimed-refresh-<id>.json``）。
+
+    与 :func:`_image_pending_request_ids` 前缀不同：安装请求永远只认
+    ``request-*.json``，两条队列不会互相冒充。只认普通文件（``lstat``），
+    符号链接/目录一律跳过。
+    """
+    ids: list[str] = []
+    if not update_protocol.directory_ready(directory):
+        return ()
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return ()
+    for path in entries:
+        name = path.name
+        for prefix in (IMAGE_CHECK_REQUEST_PREFIX, IMAGE_CHECK_CLAIMED_PREFIX):
+            if not name.startswith(prefix) or not name.endswith(IMAGE_UPDATE_REQUEST_SUFFIX):
+                continue
+            candidate = name[len(prefix) : -len(IMAGE_UPDATE_REQUEST_SUFFIX)]
+            if IMAGE_REQUEST_ID_RE.fullmatch(candidate) is None:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                ids.append(candidate)
+    return tuple(dict.fromkeys(ids))
+
+
+def _image_recent_refresh(requests_dir: Path, *, now: float) -> str | None:
+    """``archive/`` 里最近 ``IMAGE_CHECK_DEDUP_SECONDS`` 内完成的刷新请求 ID。
+
+    30 秒窗口是**设计给的限流**：刚检查过就不要让用户再触发一次 registry 访问。
+    只读文件名与 mtime，不读内容（内容属于更新器）。
+    """
+    archive = requests_dir / IMAGE_UPDATE_REQUEST_ARCHIVE
+    if not update_protocol.directory_ready(archive):
+        return None
+    try:
+        entries = sorted(archive.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return None
+    best: tuple[float, str] | None = None
+    for path in entries[:IMAGE_CHECK_ARCHIVE_SCAN_LIMIT]:
+        name = path.name
+        for prefix in (IMAGE_CHECK_REQUEST_PREFIX, IMAGE_CHECK_CLAIMED_PREFIX):
+            if not name.startswith(prefix) or not name.endswith(IMAGE_UPDATE_REQUEST_SUFFIX):
+                continue
+            candidate = name[len(prefix) : -len(IMAGE_UPDATE_REQUEST_SUFFIX)]
+            if IMAGE_REQUEST_ID_RE.fullmatch(candidate) is None:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            age = now - info.st_mtime
+            if 0 <= age <= IMAGE_CHECK_DEDUP_SECONDS and (best is None or info.st_mtime > best[0]):
+                best = (info.st_mtime, candidate)
+    return None if best is None else best[1]
+
+
+def _image_note_line(value: object) -> str | None:
+    """一条更新说明：**发布方原话**，只做折行归一与长度上限。
+
+    不总结、不改写、不加重要程度——设计 §附「文案纪律」把这条写死了。
+    控制字符/换行折成单空格，超长的整条丢掉（不截断出半句话）。
+    """
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text or len(text) > IMAGE_NOTE_MAX_CHARS:
+        return None
+    return text
+
+
+def _image_notes_url(value: object) -> str | None:
+    """更新日志链接：只放行 http/https 且有主机名的 URL，其余一律 null。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > IMAGE_NOTE_URL_MAX_CHARS:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    return text
+
+
+def _image_release_notes(
+    raw: object,
+) -> tuple[str | None, dict[_VersionKey, tuple[str | None, list[str], str | None]]]:
+    """``status.json`` 顶层 ``release_notes`` 的白名单投影：``(state, 逐版说明)``。
+
+    每版一条 ``(summary, items, url)``：``summary`` 是设计文档里的那一行
+    （≤120 字），``items`` 是发布方逐条原话（≤8 条、每条 ≤120 字），``url`` 是
+    「完整更新日志」链接。三者**互不冒充**——摘要缺失时前端就不显示摘要，绝不
+    拿第一条 item 顶替（前端契约里 ``summary`` 是独立字段）。
+
+    ``state`` 是更新器自己给的三态（``ok`` / ``missing`` / ``invalid``）：说明
+    「更新内容取不到」是**发布方没写**还是**这次取坏了**，但不参与能不能更新的
+    判断（设计 §10：更新说明不得阻断安装）。
+    形状容错：既接受 ``{"state":"ok","notes":{...}}``，也接受直接给内层
+    ``{"0.0.4":{"summary":...}}``（更新器可能只写内层表）。条目逐字段重建，
+    未知键（路径/日志）进不了响应；坏结构一律当作「没有内容」，绝不编造。
+    """
+    if not isinstance(raw, dict):
+        return None, {}
+    state = _image_choice(raw.get("state"), IMAGE_RELEASE_NOTES_STATES)
+    inner = raw.get("notes")
+    table = inner if isinstance(inner, dict) else raw
+    out: dict[_VersionKey, tuple[str | None, list[str], str | None]] = {}
+    for key, entry in table.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        parsed = _parse_semver(key)
+        if parsed is None:
+            continue
+        items: list[str] = []
+        values = entry.get("items")
+        if isinstance(values, list) and not isinstance(values, (str, bytes)):
+            for value in values:
+                if len(items) >= IMAGE_NOTE_MAX_ITEMS:
+                    break
+                line = _image_note_line(value)
+                if line is not None:
+                    items.append(line)
+        out[parsed] = (
+            _image_note_line(entry.get("summary")),
+            items,
+            _image_notes_url(entry.get("url")),
+        )
+    return state, out
+
+
+def _image_checked_at_text(value: str | None, *, timezone: str | None) -> str | None:
+    """把 ``checked_at`` 的 ISO 时间变成人话（「11 月 9 日 14:20」）。
+
+    ``message`` 里**不许**出现原始 ISO（设计 §卡片与四态：第三行是「检查于 …」）。
+    时区取用户生效时区（DB 偏好 > env > 默认），因为同一句"检查于 06:20"对东八区
+    用户是错的——更新器写的是 UTC。
+    """
+    if value is None:
+        return None
+    moment = update_protocol.parse_iso_timestamp(value)
+    if moment is None:
+        return None
+    if timezone:
+        try:
+            from zoneinfo import ZoneInfo
+
+            moment = moment.astimezone(ZoneInfo(timezone))
+        except Exception:  # noqa: BLE001 - 无 tzdata/坏时区都退回 UTC 展示
+            pass
+    return f"{moment.month} 月 {moment.day} 日 {moment:%H:%M}"
+
+
+def _image_unknown_clause(reason: str) -> str:
+    """「暂不能确认」的人话短句。
+
+    三张表依次查：更新器/通道类（``IMAGE_UNKNOWN_REASONS``）、``release_check``
+    自己的原因码（``IMAGE_RELEASE_REASON_MESSAGES``）、最后给一句固定兜底。
+    """
+    return (
+        IMAGE_UNKNOWN_REASONS.get(reason)
+        or IMAGE_RELEASE_REASON_MESSAGES.get(reason)
+        or "暂时无法确认更新条件"
+    )
+
+
+@dataclass(frozen=True)
+class ImageDiscovery:
+    """四态结论 + 支撑它的事实（``newer`` 可能为空，``target`` 可能为 null）。"""
+
+    state: str
+    message: str
+    checked_at: str | None
+    newer: list[dict[str, object]]
+    target: dict[str, object] | None
+    # 内部原因码（诊断/码表用，**不**进 message）：unknown 的阻断原因或
+    # 「有新版暂不可用」的那一条原因。
+    reason: str | None
+
+
 class ImageUpdateRateLimiter:
     """镜像更新提交的限流：**每进程、按用户**的固定窗口计数。
 
@@ -1679,6 +2060,31 @@ class ImageUpdateSubmission:
     expected_current_commit: str
 
 
+@dataclass(frozen=True)
+class ImageCheckSubmission:
+    """按需刷新请求：客户端只给一个 ``request_id``（32 位小写 hex）。"""
+
+    request_id: str
+
+
+def _parse_image_check_submission(raw: bytes) -> ImageCheckSubmission:
+    """严格解析 ``{"request_id": "<32hex>"}``：多余字段/其它类型一律拒绝。"""
+    if not raw:
+        raise _SubmissionError("invalid_request_body")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _SubmissionError("invalid_request_body") from exc
+    if not isinstance(payload, dict):
+        raise _SubmissionError("invalid_request_body")
+    if set(payload) != IMAGE_CHECK_BODY_KEYS:
+        raise _SubmissionError("invalid_request_body")
+    request_id = payload["request_id"]
+    if not isinstance(request_id, str) or IMAGE_REQUEST_ID_RE.fullmatch(request_id) is None:
+        raise _SubmissionError("invalid_request_id")
+    return ImageCheckSubmission(request_id=request_id)
+
+
 def _parse_image_submission(raw: bytes) -> ImageUpdateSubmission:
     """严格解析固定格式请求体：多一个字段、少一个字段、类型不对都拒绝。"""
     if not raw:
@@ -1728,9 +2134,18 @@ class ImageUpdateChannel:
     所有路径来自进程配置，不接受任何请求参数。
     """
 
-    def __init__(self, settings: Settings, *, now: float | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        now: float | None = None,
+        timezone: str | None = None,
+    ) -> None:
         self.settings = settings
         self._now = time.time() if now is None else now
+        # 只用于把 ``checked_at`` 说成人话（「检查于 11 月 9 日 14:20」）。更新器写的
+        # 是 UTC，直接截 ISO 给东八区用户看会差 8 小时。
+        self.timezone = timezone
         self.requests_dir = Path(settings.update_requests_dir)
         self.status_dir = Path(settings.update_status_dir)
         self.status_path = self.status_dir / IMAGE_UPDATER_STATUS_FILE
@@ -1768,16 +2183,77 @@ class ImageUpdateChannel:
                 task_backup if isinstance(task_backup, dict) else None
             )
         self.updater = self._updater_view()
-        raw_catalog = None if payload is None else payload.get("release_catalog")
-        raw_targets = None if payload is None else payload.get("available_targets")
-        raw_recommended = None if payload is None else payload.get("recommended_target")
-        self.catalog = _image_catalog_view(raw_catalog)
-        self.available_targets = _image_available_targets(raw_targets, current_version())
-        self.target = self._resolve_target(raw_recommended)
+        # ---- 发现事实（唯一来源：更新器写的 ``release_check``）----
+        raw_release_check = None if payload is None else payload.get("release_check")
+        raw_notes = None if payload is None else payload.get("release_notes")
+        self.release_check = _image_release_check_view(raw_release_check)
+        checked_value: object = (
+            None if self.release_check is None else self.release_check.get("checked_at")
+        )
+        self.checked_at: str | None = checked_value if isinstance(checked_value, str) else None
+        self.notes_state, self.release_notes = _image_release_notes(raw_notes)
+        # 发现事实只有在**这次检查可信**时才投影出来：更新器离线、``release_check``
+        # 缺失、tags 列表没查全、当前版本读不出来时，``latest`` 最多只是一个候选。
+        # 把它放进 ``newer``/``target`` 会让页面一边说「暂不能确认」一边给出可点的
+        # 「更新」目标——那正是设计禁止的"拿不可信的旧结果当本次发现"。
+        unknown = self._unknown_reason()
+        self.trusted = unknown is None and not self._listing_failed()
+        self.newer = (
+            _image_newer_releases(
+                self.release_check, self._measured_version(), self.release_notes
+            )
+            if self.trusted
+            else []
+        )
+        self.target = self._install_target(self.newer)
+        # 旧字段（一个版本）：安装语义的可用目标 = 新版里 compatible 的那条。
+        # 目录已删除，这里**不再**读 ``available_targets`` / ``recommended_target``。
+        self.available_targets = [
+            {
+                "version": item["version"],
+                "digest": item["digest"],
+                "commit": item["commit"],
+                "has_migration": item["has_migration"],
+                "compatible": True,
+                "incompatible_reason": None,
+                "incompatible_reason_message": None,
+            }
+            for item in self.newer
+            if item["compatible"] is True
+        ]
+        self.discovery = self._discover()
 
     @property
     def enabled(self) -> bool:
         return bool(self.settings.update_enabled)
+
+    def _measured_version(self) -> str | None:
+        """新旧比较的唯一基准：更新器实测的 ``release_check.current.version``。
+
+        不拿 API 自报的包版本当基准：镜像标签缺失时"猜"一个版本会让四态说错话
+        （设计 §4：「读不到当前标注 → 无法确认当前版本，禁止一键安装」）。
+        """
+        current = None if self.release_check is None else self.release_check.get("current")
+        if not isinstance(current, dict):
+            return None
+        value = current.get("version")
+        return value if isinstance(value, str) else None
+
+    def _version_conflict(self) -> bool:
+        """更新器实测版本与本机自报版本冲突 → 「暂不能确认」。
+
+        两者都来自同一次构建，正常应一致；不一致说明镜像标注与发行包对不上，
+        这时**任何**版本比较都不可信（设计 §判定数据最后一句）。
+        """
+        measured = self._measured_version()
+        if measured is None:
+            return False
+        mine = current_version().strip()
+        measured_key = _parse_semver(measured)
+        mine_key = _parse_semver(mine)
+        if measured_key is None or mine_key is None:
+            return measured.lstrip("vV") != mine.lstrip("vV")
+        return measured_key != mine_key
 
     def _updater_view(self) -> dict[str, object]:
         state = "unknown"
@@ -1812,29 +2288,340 @@ class ImageUpdateChannel:
             "age_seconds": None if age is None else round(age, 1),
         }
 
-    def _resolve_target(self, raw_recommended: object) -> dict[str, object] | None:
-        """``view.target``：更新器推荐的那条，但必须与兼容目标逐字段一致。
+    # ---------------------------------------------------------------- 四态判定
 
-        ``recommended_target`` 与 ``available_targets`` 来自同一个状态文件；如果一个
-        说"推荐"另一个说"不兼容/不存在"，正确的做法不是二选一，而是**不盲信推荐**
-        并按同一份可用目标重新算最大兼容版本——这样「可安装 ⇔ 有目标」永远成立，
-        页面不会出现"后端说能装、但没有目标可提交"的自相矛盾状态。
+    def _unknown_reason(self) -> str | None:
+        """「暂不能确认」的机器原因（顺序 = 设计文档的判定优先级）。
+
+        刻意**不**复用 :meth:`reason`：``reason`` 的第一顺位是安装开关与权限，
+        还把"进行中/人工门禁"这类安装事实也算成不可用原因。四态只回答一个
+        问题——「有没有更高版本、能不能装」，发现所需的事实必须按这个顺序查：
+        通道目录 → 更新器状态/协议/在线 → ``release_check`` → 当前版本。
+
+        ``release_check`` 是唯一发现事实源：它缺失（旧更新器还没升级）时，
+        ``newer=[]`` 只是"没看到"，**绝不**等于「已是最新」。
         """
-        if isinstance(raw_recommended, dict):
-            version = raw_recommended.get("version")
-            digest = _image_digest(raw_recommended.get("digest"))
-            commit = _image_commit(raw_recommended.get("commit"))
-            has_migration = raw_recommended.get("has_migration")
-            for item in self.available_targets:
-                if (
-                    item["compatible"] is True
-                    and item["version"] == version
-                    and item["digest"] == digest
-                    and item["commit"] == commit
-                    and item["has_migration"] is has_migration
-                ):
-                    return item
-        return _image_max_compatible(self.available_targets)
+        if not self.image_mode:
+            return "image_mode_required"
+        if not update_protocol.directory_ready(
+            self.status_dir
+        ) or not update_protocol.directory_ready(self.requests_dir):
+            return "update_channel_unavailable"
+        if self.status_state == _IMAGE_STATUS_MISSING:
+            return "updater_status_missing"
+        if self.status_state == _IMAGE_STATUS_INVALID or self.task_unreadable:
+            return "updater_status_invalid"
+        if self.updater["protocol"] != IMAGE_UPDATER_PROTOCOL:
+            return "protocol_unsupported"
+        if not self.updater["online"]:
+            return "updater_offline"
+        if self.release_check is None or self.release_check.get("state") is None:
+            # 更新器还没写过 ``release_check``（旧更新器 / 字段被写坏）。
+            return "release_check_missing"
+        if self._measured_version() is None:
+            return "current_version_unknown"
+        if self._version_conflict():
+            return "version_conflict"
+        return None
+
+    def _release_check_reason(self) -> str | None:
+        """``release_check`` 自己给的失败原因码（已白名单）；成功/没写为 ``None``。"""
+        if self.release_check is None:
+            return None
+        reason = self.release_check.get("reason")
+        return reason if isinstance(reason, str) else None
+
+    def _listing_failed(self) -> bool:
+        """这次检查的 **tags 列表**是否不可信（不可达/认证/限流/超时/没有稳定 tag）。
+
+        列表不可信时不许断言"有没有新版"（设计 §6 前两行）；只有"制品类"原因
+        （摘要/平台）才允许在确认存在更高版本时说「有新版暂不可用」。
+        """
+        if self.release_check is None:
+            return True
+        state = self.release_check.get("state")
+        if state == "ok":
+            return False
+        reason = self._release_check_reason()
+        return reason not in IMAGE_RELEASE_ARTIFACT_REASONS
+
+    def _install_blocker(self) -> str | None:
+        """会挡住安装、但**不影响**「有没有新版本」的门禁。
+
+        顺序与 :meth:`reason` 一致（开关 → 人工门禁 → 恢复点 → 当前镜像），但
+        刻意不含"进行中"：活动任务的进度由 ``task`` 展示，``state`` 仍按发现结果
+        给（设计 §卡片与四态：「活动任务覆盖结论展示」而不是新增第五种状态）。
+        """
+        if not self.enabled:
+            return "update_disabled"
+        if self.updater["state"] == "needs_manual":
+            return "manual_required"
+        if self.restore_point is None:
+            return "backup_gate_missing"
+        if current_image_ref() is None or _image_commit(build_commit()) is None:
+            return "current_image_unknown"
+        return None
+
+    def _install_target(
+        self, newer: list[dict[str, object]]
+    ) -> dict[str, object] | None:
+        """可提交的目标：**只能**来自兼容且摘要已解析的新版条目。
+
+        摘要为 null 的条目永远进不来——「有新版」不等于「能装」。目录（含
+        ``recommended_target``）已经删除，目标就是 registry 发现的那一版，
+        没有第二意见可对齐。
+        """
+        candidates = [
+            item
+            for item in newer
+            if item.get("compatible") is True and isinstance(item.get("digest"), str)
+        ]
+        if not candidates:
+            return None
+        chosen = candidates[0]
+        return {
+            "version": chosen["version"],
+            "digest": chosen["digest"],
+            # 目标版本的构建提交通常拿不到（registry tag 元数据里没有），如实给 null。
+            "commit": chosen["commit"],
+            # 旧字段（一个版本）：目录删除后不再有人工迁移标记，由迁移器判断。
+            "has_migration": chosen["has_migration"],
+        }
+
+    def _blocked_reason(
+        self,
+        newer: list[dict[str, object]],
+        target: dict[str, object] | None,
+        blocker: str | None,
+    ) -> tuple[str, str]:
+        """「有新版暂不可用」的（原因码，版本）：多个阻碍时只给**一条**。
+
+        优先级照设计：人工门禁/开关/恢复点 高于 摘要解析。
+        """
+        if blocker is not None:
+            version = target["version"] if target is not None else newer[0]["version"]
+            return blocker, str(version)
+        chosen = newer[0]
+        reason = chosen.get("incompatible_reason")
+        return (reason if isinstance(reason, str) else "digest_unresolved"), str(
+            chosen["version"]
+        )
+
+    def _checked_at_suffix(self) -> str:
+        """「（检查于 11 月 9 日 14:20）」；没有可信检查时间就什么都不加。"""
+        text = _image_checked_at_text(self.checked_at, timezone=self.timezone)
+        return f"（检查于 {text}）" if text else ""
+
+    def _discover(self) -> ImageDiscovery:
+        """四态结论 + 一句话人话（不出现码表码/摘要/路径/ISO 时间）。
+
+        判定顺序（设计 §6 + §卡片与四态）：
+
+        1. 通道/更新器/``release_check``/当前版本任一项不可确认 → ``unknown``；
+        2. 这次检查的 tags 列表不可信（不可达/认证/限流/超时/没有稳定 tag）→
+           ``unknown``：这时**不能**断言有没有新版，更不许说「已是最新」；
+        3. 确认存在更高版本、但这一版的摘要/平台拿不到 → ``newer_unavailable``；
+        4. 更高版本 + 摘要齐 + 安装门禁全过 → ``available``；
+        5. 其余（state=ok 且没有更高版本）→ ``latest``。
+        """
+        checked_at = self.checked_at
+        newer = self.newer
+        target = self.target
+        current = self._measured_version()
+        state = None if self.release_check is None else self.release_check.get("state")
+        reason_code = self._release_check_reason()
+        unknown = self._unknown_reason()
+        if unknown is not None:
+            return ImageDiscovery(
+                state="unknown",
+                message=f"暂时无法确认是否有新版本：{_image_unknown_clause(unknown)}。",
+                checked_at=checked_at,
+                newer=newer,
+                target=target,
+                reason=unknown,
+            )
+        if self._listing_failed():
+            # 列表类失败：连"有没有新版"都没查全（设计 §6 第 2 行）。
+            code = reason_code or "release_check_missing"
+            return ImageDiscovery(
+                state="unknown",
+                message=f"暂时无法确认是否有新版本：{_image_unknown_clause(code)}。",
+                checked_at=checked_at,
+                newer=newer,
+                target=target,
+                reason=code,
+            )
+        if not newer:
+            if (
+                state == "ok"
+                and self.release_check is not None
+                and self.release_check.get("latest") is None
+                and self.release_check.get("tag_count") == 0
+            ):
+                # 仓库里连一个稳定版 tag 都没有：没有比较基准，不许说「已是最新」。
+                return ImageDiscovery(
+                    state="unknown",
+                    message=(
+                        "暂时无法确认是否有新版本："
+                        f"{IMAGE_RELEASE_REASON_MESSAGES['no_stable_tags']}。"
+                    ),
+                    checked_at=checked_at,
+                    newer=newer,
+                    target=target,
+                    reason="no_stable_tags",
+                )
+            # state=ok 且没有更高的稳定版：这是**唯一**能说「已是最新」的情形。
+            if state != "ok":
+                code = reason_code or "release_check_missing"
+                return ImageDiscovery(
+                    state="unknown",
+                    message=f"暂时无法确认是否有新版本：{_image_unknown_clause(code)}。",
+                    checked_at=checked_at,
+                    newer=newer,
+                    target=target,
+                    reason=code,
+                )
+            suffix = self._checked_at_suffix()
+            shown = f"当前 v{current}" if current else "当前版本"
+            return ImageDiscovery(
+                state="latest",
+                message=f"{shown} 已是最新{suffix}。",
+                checked_at=checked_at,
+                newer=newer,
+                target=None,
+                reason=None,
+            )
+        blocker = self._install_blocker()
+        if target is not None and blocker is None:
+            return ImageDiscovery(
+                state="available",
+                message=f"发现新版 v{target['version']}，可以更新。",
+                checked_at=checked_at,
+                newer=newer,
+                target=target,
+                reason=None,
+            )
+        code, version = self._blocked_reason(newer, target, blocker)
+        clause = IMAGE_UNAVAILABLE_REASONS.get(code, "暂时无法确认更新条件")
+        return ImageDiscovery(
+            state="newer_unavailable",
+            message=f"发现新版 v{version}，但暂时不能更新：{clause}。",
+            checked_at=checked_at,
+            newer=newer,
+            target=target,
+            reason=code,
+        )
+
+    def _task_target_version(self) -> str | None:
+        """任务实际要装到的版本；**对不上就 None**（前端显示「目标版本未记录」）。
+
+        设计 §任务记录：「任务目标版本仅当发现条目的 digest 匹配时显示」。这里只用
+        两处事实，不猜：
+
+        1. ``newer`` 里摘要相同的条目（目录删除后 ``commit`` 通常两个都是 null，
+           不能再拿提交号当匹配条件）；
+        2. 目标摘要就是**当前运行**摘要（已切换或已成功）→ 更新器实测的当前版本。
+        """
+        if self.task is None:
+            return None
+        raw_target = self.task.get("target")
+        if not isinstance(raw_target, dict):
+            return None
+        digest = raw_target.get("digest")
+        if not isinstance(digest, str):
+            return None
+        for item in self.newer:
+            if item.get("digest") == digest:
+                return str(item["version"])
+        if digest == current_image_ref():
+            return self._measured_version()
+        return None
+
+    def _task_row(self) -> ImageUpdateTaskRow | None:
+        """任务行：新契约的四项＋旧的完整白名单任务（旧键保留一个版本）。
+
+        旧的 ``state/stage/state_message/target/migration/backup/failure...`` 全部
+        保留（``ImageUpdateTaskRow`` 允许加法字段透传）：详情折叠区要阶段、失败码
+        与三项核验值。新加的只有 ``version`` 与 ``failed_code``
+        （``state``/``stage`` 本来就在）。
+        """
+        if self.task is None:
+            return None
+        failure = self.task.get("failure")
+        code = failure.get("code") if isinstance(failure, dict) else None
+        return ImageUpdateTaskRow.model_validate(
+            {
+                **self.task,
+                "version": self._task_target_version(),
+                "failed_code": code if isinstance(code, str) else None,
+            }
+        )
+
+    def _active_message(self) -> str | None:
+        """活动任务把首屏那句话换成进度（``state`` 不变，前端据 state 显示结论）。
+
+        进行中的任务/排队的请求**不允许**再发检查或安装，所以这句话必须存在，
+        否则页面会一边显示"可以更新"一边显示"进行中"。
+        """
+        if self.task is not None and self.task.get("state") == "running":
+            stage = self.task.get("stage_message")
+            version = self._task_target_version()
+            head = f"更新正在进行中（v{version}）" if version else "更新正在进行中"
+            return f"{head}：{stage}。" if stage else f"{head}。"
+        if self.pending_ids:
+            return "更新请求已提交，正在进行中，等待更新器开始。"
+        if self.updater["state"] == "busy":
+            return "更新器正在进行中，还没有报告阶段。"
+        return None
+
+    def _release_check_details(self) -> ImageReleaseCheckDetails | None:
+        """``details.release_check``：更新器那块事实的**白名单原始投影**。
+
+        特意与 ``details.catalog``（旧字段，前端已经在读）分开：这里是"更新器
+        到底说了什么"，``catalog`` 是"卡片需要的那几个派生值"。两者都只含白名单
+        字段，路径/日志/原始异常都进不来；``reason_detail`` 只放固定枚举
+        ``null | "throttled"``，``reason`` 是**归一后**的码。
+        """
+        if self.release_check is None:
+            return None
+        return ImageReleaseCheckDetails.model_validate(self.release_check)
+
+    def _catalog_details(self) -> dict[str, object]:
+        """``details.catalog``（旧字段，前端仍在读）：从 ``release_check`` 派生。
+
+        目录已删除，这个形状保留一个版本，免得前端在过渡期拿不到
+        ``details.catalog.check.check_id``（按需检查的终态核对靠它）。
+        ``entries`` 映射成 ``tag_count``，``current_version`` 映射成更新器实测的
+        当前版本，``check`` 是本轮检查的终态（``state`` 就是 ``release_check.state``）。
+        """
+        raw_state = None if self.release_check is None else self.release_check.get("state")
+        state = raw_state if isinstance(raw_state, str) else None
+        check = None
+        if self.release_check is not None:
+            check = {
+                "check_id": self.release_check.get("check_id"),
+                "state": self.release_check.get("state"),
+                "started_at": None,
+                "finished_at": self.release_check.get("checked_at"),
+                "source": self.release_check.get("source"),
+                "reason": self.release_check.get("reason"),
+                "reason_message": self.release_check.get("reason_message"),
+            }
+        return {
+            "state": None if self.release_check is None else self.release_check.get("state"),
+            "state_message": (
+                IMAGE_RELEASE_CHECK_STATE_MESSAGES.get(state) if state is not None else None
+            ),
+            "reason": None if self.release_check is None else self.release_check.get("reason"),
+            "reason_message": (
+                None if self.release_check is None else self.release_check.get("reason_message")
+            ),
+            "entries": 0 if self.release_check is None else self.release_check.get("tag_count"),
+            "current_version": self._measured_version(),
+            "source": None if self.release_check is None else self.release_check.get("source"),
+            "checked_at": self.checked_at,
+            "check": check,
+        }
 
     def processed(self, request_id: str) -> bool:
         """该任务 ID 是否已被使用过（在目录里，或已被更新器归档）。"""
@@ -1916,32 +2703,174 @@ class ImageUpdateChannel:
             return "no_available_target"
         return None
 
-    def view(self, *, role: str) -> dict[str, object]:
-        """``GET /v1/version/image-update`` 的响应体（只读、白名单、可解释）。"""
+    def check_reason(self) -> str | None:
+        """按需刷新请求的门禁（**与安装门禁分开**）：返回第一个不适用原因。
+
+        刷一次目录是**只读**动作（更新器只重新取目录、读镜像版本、解析摘要），
+        所以这里只要求：镜像拓扑、通道目录可用、更新器在跑且协议兼容。
+
+        刻意**不**看这些：
+
+        - ``update_enabled``：设计 §卡片与四态——「重新检查」即使在安装被禁用时
+          也应可用，否则用户连"到底有没有新版"都没法确认；
+        - 恢复点/当前镜像/进行中：它们挡的是**安装**。安装进行中时刷新请求排队
+          等收尾即可（设计 §按需检查协议），不需要在 API 侧拒绝。
+        """
+        if not self.image_mode:
+            return "image_mode_required"
+        if not update_protocol.directory_ready(
+            self.status_dir
+        ) or not update_protocol.directory_ready(self.requests_dir):
+            return "update_channel_unavailable"
+        if self.status_state == _IMAGE_STATUS_MISSING:
+            return "updater_status_missing"
+        if self.status_state == _IMAGE_STATUS_INVALID:
+            return "updater_status_invalid"
+        if self.updater["protocol"] != IMAGE_UPDATER_PROTOCOL:
+            return "protocol_unsupported"
+        if not self.updater["online"]:
+            return "updater_offline"
+        return None
+
+    def refresh_payload(self, request_id: str, *, created_at: str) -> dict[str, object]:
+        """API 写进刷新请求文件的**固定结构**（无 tag/URL/路径，只有三类字段）。"""
+        return {
+            "schema": IMAGE_CHECK_REQUEST_SCHEMA,
+            "request_id": request_id,
+            "kind": IMAGE_CHECK_KIND,
+            "created_at": created_at,
+        }
+
+    def submit_refresh(
+        self, request_id: str, *, now: float | None = None
+    ) -> tuple[bool, str]:
+        """在 ``requests/.lock`` 内写一条刷新请求；返回 ``(是否新写入, 生效的 ID)``。
+
+        幂等与限流（全部在锁内判定，绝不并发写出第二个文件）：
+
+        1. 同一个 ``request_id`` 已在目录里（``refresh-`` / ``claimed-refresh-``）或
+           已归档 → 不再写，回同一个 ID（200）；
+        2. 目录里还有**别的**未认领刷新请求 → 只回它（一个待处理上限）。旧更新器
+           不认领时也走这条路：**绝不**替它删除文件来放开限流，也绝不塞进安装队列；
+        3. 归档里 30 秒内刚完成过检查 → 回那个 ID，不重复打 registry；
+        4. 否则临时文件 + ``os.replace`` 原子写入 ``refresh-<id>.json``。
+        """
+        moment = time.time() if now is None else now
+        target = self.requests_dir / f"{IMAGE_CHECK_REQUEST_PREFIX}{request_id}.json"
+        if request_id in _image_refresh_ids(self.requests_dir) or self._refresh_archived(
+            request_id
+        ):
+            return False, request_id
+        lock = update_protocol.FileLock(
+            self.requests_dir / ".lock",
+            blocking=True,
+            timeout=SUBMIT_LOCK_TIMEOUT_SECONDS,
+        )
+        try:
+            acquired = lock.acquire()
+        except update_protocol.ProtocolError as exc:
+            raise _image_error("update_channel_unavailable") from exc
+        if not acquired:
+            # 更新器正在认领/清理：这不是本机故障，但也不能并发覆盖。
+            raise _image_error("update_in_progress")
+        try:
+            pending = _image_refresh_ids(self.requests_dir)
+            if request_id in pending or self._refresh_archived(request_id):
+                return False, request_id
+            if pending:
+                return False, pending[0]
+            recent = _image_recent_refresh(self.requests_dir, now=moment)
+            if recent is not None:
+                return False, recent
+            try:
+                update_protocol.atomic_write_json(
+                    target,
+                    self.refresh_payload(request_id, created_at=update_protocol.iso_now()),
+                    mode=0o640,
+                )
+            except (update_protocol.ProtocolError, OSError) as exc:
+                # 目录不可写 / 磁盘满 / rename 失败：一律按通道不可用报告，
+                # 不把半截文件留给更新器（临时文件由 atomic_write_json 自己清掉）。
+                raise _image_error("update_channel_unavailable") from exc
+        finally:
+            lock.release()
+        return True, request_id
+
+    def _refresh_archived(self, request_id: str) -> bool:
+        """该刷新 ID 是否已被更新器归档（认领过就算用过，不再重写）。"""
+        archive = self.requests_dir / IMAGE_UPDATE_REQUEST_ARCHIVE
+        for name in (
+            f"{IMAGE_CHECK_REQUEST_PREFIX}{request_id}{IMAGE_UPDATE_REQUEST_SUFFIX}",
+            f"{IMAGE_CHECK_CLAIMED_PREFIX}{request_id}{IMAGE_UPDATE_REQUEST_SUFFIX}",
+        ):
+            try:
+                if (archive / name).is_file():
+                    return True
+            except OSError:
+                # 读不到归档目录按「可能已用过」处理（fail closed）。
+                return True
+        return False
+
+    def view(self, *, role: str) -> ImageUpdateView:
+        """``GET /v1/version/image-update`` 的响应体（只读、白名单、可解释）。
+
+        新契约（四态）字段在前，旧字段在后并**保留一个版本**：
+        ``image_mode/enabled/installable/reason/next_actions/updater/backup_gate/
+        catalog/available_targets/request`` 语义不变；``message`` 改为四态那句
+        人话（旧码表文案搬到 ``reason_message``）；``target`` 仍是可提交目标，
+        只是摘要为 null 的条目永不出现；``task`` 是旧的完整任务视图再加
+        ``version``/``failed_code`` 两项。
+        """
         reason = self.reason(role=role)
         gate = self._backup_gate_view()
-        return {
-            "schema_version": "v1",
-            "image_mode": self.image_mode,
-            "enabled": self.enabled,
-            "installable": reason is None,
-            "reason": reason,
-            "message": IMAGE_REASON_MESSAGES.get(reason) if reason is not None else None,
-            "next_actions": list(IMAGE_REASON_NEXT_ACTIONS.get(reason, ()))
+        discovery = self.discovery
+        # 活动任务覆盖首屏那句话（state 不变：前端据 state 显示结论/按钮）。
+        message = self._active_message() or discovery.message
+        return ImageUpdateView(
+            # ---- 四态（新契约）----
+            state=ImageUpdateState(discovery.state),
+            message=message,
+            checked_at=discovery.checked_at,
+            current=ImageUpdateCurrent(
+                version=self._measured_version(),
+                commit=_image_commit(build_commit()),
+                digest=current_image_ref(),
+            ),
+            newer=[ImageNewerRelease.model_validate(entry) for entry in discovery.newer],
+            target=(
+                None
+                if discovery.target is None
+                else ImageUpdateTarget.model_validate(discovery.target)
+            ),
+            task=self._task_row(),
+            details=ImageUpdateDetails(
+                # 旧字段（前端仍在读 ``check.check_id``）：从 release_check 派生。
+                catalog=ImageUpdateCatalogDetails.model_validate(self._catalog_details()),
+                updater=ImageUpdateUpdaterDetails.model_validate(self.updater),
+                # 没有可用事实（既没有 backup_gate 也没有 task.backup）时为 null。
+                backup_gate=(
+                    None
+                    if gate.get("source") is None
+                    else ImageUpdateBackupGateDetails.model_validate(gate)
+                ),
+                # 新字段：更新器 ``release_check`` 的白名单原始投影。
+                release_check=self._release_check_details(),
+            ),
+            # ---- 旧字段（保留一个版本，前端迁移完再删）----
+            image_mode=self.image_mode,
+            enabled=self.enabled,
+            installable=reason is None,
+            reason=reason,
+            reason_message=IMAGE_REASON_MESSAGES.get(reason) if reason is not None else None,
+            next_actions=list(IMAGE_REASON_NEXT_ACTIONS.get(reason, ()))
             if reason is not None
             else [],
-            "current": {
-                "digest": current_image_ref(),
-                "commit": _image_commit(build_commit()),
-            },
-            "updater": self.updater,
-            "backup_gate": gate,
-            "catalog": self.catalog,
-            "target": _image_target_payload(self.target),
-            "available_targets": self.available_targets,
-            "task": self.task,
-            "request": self.pending_request(),
-        }
+            updater=self.updater,
+            backup_gate=gate,
+            catalog=self._catalog_details(),
+            available_targets=self.available_targets,
+            request=self.pending_request(),
+        )
 
     def _backup_gate_view(self) -> dict[str, object]:
         """``backup_gate`` 的响应视图：`source` 说明结论来自新字段还是旧任务记录。
@@ -2010,11 +2939,27 @@ def _image_request_payload(
 
 @router.get("/version/image-update")
 async def image_update_status(
-    auth: CurrentAuth, settings: SettingsDep, response: Response
-) -> dict[str, object]:
-    """镜像更新通道视图：只读更新器状态，不可安装时给出码表原因与下一步。"""
+    auth: CurrentAuth,
+    settings: SettingsDep,
+    response: Response,
+    session: DbSession,
+) -> ImageUpdateView:
+    """镜像更新通道视图（四态 + 诊断）：只读更新器状态，结论由服务端算好。
+
+    设计依据：docs/UPDATE-SIMPLIFICATION-DESIGN.md §3/§6、docs/UPDATE-UX-DESIGN.md。
+    ``message`` 是一句话人话，旧字段（``installable``/``reason``/``next_actions`` …）
+    保留一个版本。
+
+    ``session`` 只用来取**用户生效时区**：``checked_at`` 是更新器写的 UTC，
+    首屏要显示「检查于 11 月 9 日 14:20」这样的本地时间。
+    """
     response.headers["Cache-Control"] = "no-store"
-    return ImageUpdateChannel(settings).view(role=auth.user.role)
+    from ling.settings.user_preferences import load_user_timezone
+
+    timezone_name, _source = await load_user_timezone(
+        session, subject_id=auth.user.subject_id, env=settings.user_timezone
+    )
+    return ImageUpdateChannel(settings, timezone=timezone_name).view(role=auth.user.role)
 
 
 @router.post("/version/image-update-requests", status_code=201)
@@ -2070,12 +3015,11 @@ async def create_image_update_request(
     if submission.target_digest == submission.expected_current_digest:
         # 更新器会以 already_on_target 拒绝空任务；API 先给出同样的结论。
         raise _image_error("already_on_target")
-    if submission.target_digest not in {
-        str(item["digest"]) for item in channel.available_targets if item["compatible"] is True
-    }:
-        # 目录之外的摘要一律拒绝：不能绕过可信发布目录提交任意 digest。
-        # （更新器执行前还会用**自己**的目录再核一遍，两边都不放行。）
-        raise _image_error("target_not_in_catalog")
+    discovered = channel.target
+    if discovered is None or submission.target_digest != discovered["digest"]:
+        # 摘要只能来自**这次发现的**那个目标：调用方不能自己编一个（设计 §10）。
+        # 更新器执行前还会按 registry 的 tag→digest 再核一遍，两边都不放行。
+        raise _image_error("target_not_available")
 
     created_at = update_protocol.iso_now()
     payload = _image_request_payload(submission, created_at=created_at)
@@ -2117,3 +3061,65 @@ async def create_image_update_request(
         "expected_current_commit": submission.expected_current_commit,
         "created_at": created_at,
     }
+
+
+@router.post("/version/image-update-checks", status_code=202)
+async def create_image_update_check(
+    auth: CurrentAuth,
+    settings: SettingsDep,
+    request: Request,
+    response: Response,
+) -> ImageUpdateCheckAccepted:
+    """owner 发起一次**按需检查**；只原子写一条刷新请求，不做任何部署。
+
+    顺序（每一步失败都 fail closed，且不写任何文件）：
+
+    1. 所有者权限 → 来源/CSRF → 限流；
+    2. 请求体上限 + 严格 ``{"request_id": "<32hex>"}``（多余字段 422）；
+    3. 刷新门禁（镜像拓扑、通道目录、更新器在线/协议）→ 409；
+    4. ``requests/.lock`` 内做幂等/去重判定，再临时文件 + ``os.replace`` 原子写入。
+
+    **它不改 ``status.json``**：本次检查的事实（``release_check``）只能由更新器
+    自己写。返回 202 只表示"已排队"，200 表示幂等/去重（返回的是已经在排队或
+    刚刚完成的那个 ``request_id``，前端按它核对结果——更新器会把它回填进
+    ``release_check.check_id``）。
+
+    与安装写接口的两处差别，都是**故意的**：
+
+    - **不要求** ``X-Ling-Update`` 头（那是写接口的防误触标记；本接口只写一条
+      只读刷新请求），但同源校验照样生效；
+    - **不要求最近登录**：检查是只读动作（不改宿主、不装东西），只写一条排队
+      请求。旧版这里要最近 15 分钟内登录，用户点「检查更新」拿到 403 却看不懂
+      为什么（docs/UPDATE-SIMPLIFICATION-DESIGN.md §6：给出可执行的一步，不要
+      莫名其妙地拒绝）。安装请求 ``POST /v1/version/image-update-requests`` 的
+      最近登录校验**保持不变**。
+    """
+    response.headers["Cache-Control"] = "no-store"
+    if auth.user.role != "owner":
+        raise _image_error("not_owner")
+    _require_json_content_type(request)
+    origin_problem = _origin_problem(request, settings)
+    if origin_problem is not None:
+        raise LingError(
+            ErrorCode.forbidden,
+            "更新请求来源校验失败",
+            status_code=403,
+            detail=origin_problem,
+        )
+    if not _image_limiter(request).allow(auth.user.id):
+        raise _image_error("rate_limited")
+    raw = await _read_update_body(request)
+    try:
+        submission = _parse_image_check_submission(raw)
+    except _SubmissionError as exc:
+        raise _image_error(exc.detail) from exc
+
+    channel = ImageUpdateChannel(settings)
+    gate_reason = channel.check_reason()
+    if gate_reason is not None:
+        raise _image_error(gate_reason)
+    accepted, request_id = channel.submit_refresh(submission.request_id)
+    if not accepted:
+        # 幂等/去重：同一个 ID 已在排队或刚完成，或已有另一个待处理请求。
+        response.status_code = 200
+    return ImageUpdateCheckAccepted(request_id=request_id, accepted=True)

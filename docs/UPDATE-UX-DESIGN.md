@@ -88,13 +88,13 @@ API 按严格 semver 选最高可信新版本；`target` 仍只能来自兼容�
 ## 真正的按需检查协议
 
 新增 `POST /v1/version/image-update-checks`，仅 owner，沿用安装写接口的会话、来源/CSRF 与 JSON 上限。
-请求体固定为 `{ "check_id": "<32位小写hex>" }`，拒绝多余字段；不需要最近登录或安装风险确认。
+请求体固定为 `{ "request_id": "<32位小写hex>" }`，拒绝多余字段；不需要最近登录或安装风险确认。
 API 不访问 GitHub、registry 或 Docker；它只把检查请求原子写入现有 requests 挂载目录。
 更新器仍运行在独立 compose 项目：两个容器只靠既有 requests/status 共享卷交换请求和结果。
-文件名 `refresh-<check_id>.json`，内容固定为 `schema:1, check_id, requested_at`，无 tag/URL/路径。
+文件名 `refresh-<request_id>.json`，内容固定为 `schema:1, request_id, kind:"refresh", created_at`，无 tag/URL/路径。
 API 复用 `requests/.lock` 与原子临时文件 + rename；安装请求仍仅匹配 `request-*.json`。
 锁内检查 `refresh-*.json`、`claimed-refresh-*.json` 和 `archive/` 中最近 30 秒的检查；
-有待处理请求或 30 秒内已完成检查时返回同一个 `check_id`（200），绝不新写。
+有待处理请求或 30 秒内已完成检查时返回同一个 `request_id`（200），绝不新写。
 旧更新器留下的未认领文件只回同一 ID；后端不得擅自删除它来放开限流。
 每个用户会话前端还需 500 毫秒去抖，点击后即刻禁用；服务端锁与 30 秒限流是最终保证。
 检查请求上限一个，超龄未认领文件不能无限堆积；旧更新器不认领时不覆盖、不塞安装队列。
@@ -107,13 +107,13 @@ API 复用 `requests/.lock` 与原子临时文件 + rename；安装请求仍仅�
 此次刷新绕过**五分钟自动刷新节流**；自动刷新仍维持原间隔，检查完成重置节流计时。
 检查失败仍写可读的 `status.json` 结论；永远不得用旧的兼容目标作为「本次检查发现」的目标。
 
-`status.json` 加法新增 `catalog_check`：`check_id`、`state`（running/succeeded/degraded/failed）、
+`status.json` 加法新增 `catalog_check`：`request_id`、`state`（running/succeeded/degraded/failed）、
 `started_at`、`finished_at`、`source`（remote/local/none）、`reason`（固定码）。
 `release_catalog` 加法新增 `source` 和 `checked_at`；记录远程失败转本地的 `fallback_reason` 固定码。
 状态文件顶层 `schema:1`、`protocol:1` 不变；旧更新器可以忽略 refresh 文件并继续现有安装。
 API 对新增字段逐项白名单验证；缺字段时展示旧状态但不宣称「刚刚检查」或「已是最新」。
 GET `/v1/version/image-update` 加法透出上述脱敏检查元数据及 `newer_releases`，仍 `no-store`。
-前端用 `check_id` 匹配完成结果；状态文件 `updated_at` 变新但 ID 不匹配，不算这次完成。
+前端用 `request_id` 匹配完成结果；状态文件 `updated_at` 变新但 ID 不匹配，不算这次完成。
 
 点击后立刻显示「正在检查…」和「上次检查于 {time}」，不清空上次结论、目标或任务。
 POST 202 仅表示已排队；前端每 2 秒读 GET，直到匹配 ID 的终态或等待 150 秒。
@@ -156,7 +156,7 @@ POST 202 仅表示已排队；前端每 2 秒读 GET，直到匹配 ID 的终态
 4. 有 `not_in_min_from`、无可用过渡版本 → 不提示直接安装 v0.0.4，给「等待补齐」一句话。
 5. 旧失败任务带 `sha256:620b…`、当前无推荐目标 → 首屏没有该摘要和「目标版本」；仅有折叠的「上次更新失败」。
 6. 连点检查 → 前端 500 毫秒内只发一个 POST；POST 后显示 loading 与上次检查时间，不把旧目标说成本次结果。
-7. POST 超时/GET 断线 → 保留旧任务和结论、标记「上次结果」；同一 `check_id` 恢复后正常收尾。
+7. POST 超时/GET 断线 → 保留旧任务和结论、标记「上次结果」；同一 `request_id` 恢复后正常收尾。
 8. 成功任务少一项核验值 → 不显示「更新成功」；`needs_manual` 的处理提示始终可见。
 9. 更新器离线或当前版本与 API 自报冲突 →「暂不能确认」，不显示安装按钮；展开区仍能看诊断字段。
 10. `has_migration=false` 单独出现 → 不显示迁移故障；只有明确预检失败才显示迁移不可用文案。
@@ -179,3 +179,47 @@ API（镜像通道契约测试）：
 21. `digest_unresolved` 与 `not_in_min_from` 都保留版本和原因但无可提交 digest；迁移原因只在确有预检证据时产生。
 
 交付检查：以上断言通过，`git diff --check` 通过；人工看 NAS 断网、空目录、新版已发布但 GHCR 无 tag、旧失败任务四个画面。
+
+---
+
+## 附：版本信息与「更新内容」从哪里来（数据源定稿）
+
+用户追问的第二个问题：**版本信息与更新内容分别从哪儿取**。这里定死，实现不要再各自发挥。
+
+### 1) 三个事实源，各管一段
+
+| 事实 | 唯一来源 | 说明 |
+| --- | --- | --- |
+| **当前装的是哪版** | 运行中 api 镜像的 OCI 标注 `org.opencontainers.image.version` / `org.opencontainers.image.revision` | 更新器实测后写进 `status.json`；API 只投影，不自己拼。镜像标签缺失 → `unknown`，不许拿 `pyproject` 猜。 |
+| **有没有更新的版本、能不能升** | 可信发布目录 `deploy/releases.json`（版本 / `min_from` / `has_migration` / 源提交） | 目录仍是唯一信任锚；摘要仍由更新器现场 `docker manifest inspect` 解析，目录里**不放** digest。 |
+| **这一版改了什么** | 新增 `deploy/update-notes.json`（与人读的 `CHANGELOG.md` 同源，由发版流程生成/校对） | **不塞进 `releases.json`**：旧更新器（0.0.3）对目录字段是**严格白名单**，多一个未知键会判定整份目录不可信 → 会把还在跑旧更新器的机器一起打哑。 |
+
+`deploy/update-notes.json` 形状（加法文件，旧更新器完全不读它）：
+
+```json
+{
+  "schema": 1,
+  "notes": {
+    "0.0.4": {
+      "summary": "日程子系统与发送链路的可靠性修复",
+      "items": ["她的一天：前夜生成次日安排，计划不等于已完成", "…"],
+      "url": "https://github.com/qsbb/ling/blob/main/CHANGELOG.md"
+    }
+  }
+}
+```
+
+约束：`summary` ≤ 120 字，`items` ≤ 8 条、每条 ≤ 120 字，`url` 可选；文件缺失/超限/JSON 坏 → **只是没有更新内容**，绝不影响"能不能更新"的判断。
+
+### 2) 谁去取
+
+- **更新器**在刷新目录的同一个节流周期里顺带取 `update-notes.json`（默认同源：`<catalog_url 的同目录>/update-notes.json`，可用 （`deploy/update-notes.json`，随发行包携带） 覆盖），校验后写进 `status.json` 的 `release_notes`（新增顶层键，**只放当前目标与新版本的条目**，不整份回显）。
+- **API** 只做白名单投影：`newer[].notes` / `newer[].notes_url`；`status.json` 没有该键（旧更新器）→ `notes: []` + 卡片显示「这一版没有提供更新说明」，不编内容。
+- **前端**不联网、不拼 URL、不解析 CHANGELOG。
+
+### 3) 页面怎么用
+
+- 「更新内容」放在**可更新**与**有新版暂不可用**两态里，作为卡片第二屏：`summary` 一行 + `items` 列表（最多 8 条，超出折叠）+ 「完整更新日志」链接（有 `url` 才显示）。
+- 「已是最新」「暂不能确认」两态**不显示**更新内容区（没有目标版本，显示谁的内容都是错的）。
+- 文案纪律：`items` 是**发布方写的原话**，前端不改写、不总结、不加"重要程度"标记；空数组就显示「这一版没有提供更新说明」。
+- 详情折叠区额外给：检查时间、目录来源与状态、更新器在线/协议、恢复点检查时间、目标 digest/commit、最近任务的阶段与失败码。

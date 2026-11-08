@@ -12,7 +12,7 @@ import re
 import uuid
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
@@ -94,6 +94,17 @@ class StrictModel(BaseModel):
     """契约基类：未知字段失败关闭，版本字段必填。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CompatModel(BaseModel):
+    """**加法**契约基类：多出来的字段原样保留（``extra="allow"``）。
+
+    只给「新契约 + 旧字段还要活一个版本」这类响应体用：顶层字段必须逐个**声明**
+    （否则读 schema 的人不知道响应里有什么），嵌套里的历史字段允许透传，不必为了
+    一个过渡期把运行期字段全搬进契约。新代码不要用它——新契约一律 ``StrictModel``。
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
 
 
 # ---------------------------------------------------------------- 枚举
@@ -853,6 +864,267 @@ class PromptSnapshotOut(StrictModel):
     note: str | None = None
 
 
+# ---------------------------------------------------------------- 镜像更新（四态）
+
+
+class ImageUpdateState(StrEnum):
+    """「检查更新」卡片的结论只有四类，优先级由服务端算（前端不自己比较版本）。
+
+    判定顺序（docs/UPDATE-UX-DESIGN.md）：``unknown`` → ``newer_unavailable``
+    → ``available`` → ``latest``。活动安装任务**不**新增第五种状态：``state``
+    仍按发现结果给，进度由 ``task`` 与 ``message`` 表达。
+    """
+
+    latest = "latest"
+    available = "available"
+    newer_unavailable = "newer_unavailable"
+    unknown = "unknown"
+
+
+# 下面这些是卡片里的**片段**对象（不是一个能单独获取的资源），所以不重复带
+# ``schema_version``：版本号只在最外层 ``ImageUpdateView`` 出现一次，和
+# docs/UPDATE-UX-DESIGN.md 给出的响应形状逐字段一致。
+
+
+class ImageUpdateCurrent(StrictModel):
+    """当前运行版本/提交/镜像摘要；读不到就是 null（不拿 pyproject 猜）。"""
+
+    version: str | None = None
+    commit: str | None = None
+    digest: str | None = None
+
+
+class ImageNewerRelease(CompatModel):
+    """本次检查发现的更高版本（``compatible=false`` 的也保留）。
+
+    事实源是更新器的 ``release_check.latest``（查 GHCR tags/manifest 得出），
+    所以列表通常只有一条。与"可提交目标"的**关键差别**：``digest`` 允许为 null。
+    「有新版但拿不到安装包」是必须能显示给用户的事实（否则页面只剩一句
+    "暂无可更新的版本"，用户分不清是没发版还是没构建产物）；摘要为空的条目
+    永远进不了 ``target``，不能用它构造安装请求。
+    """
+
+    version: str
+    # registry 的 tag 元数据里通常没有目标版本的构建提交（更新器写 null），
+    # 所以这里可空；它只用于展示/核对，不参与"能不能装"。
+    commit: str | None = None
+    has_migration: bool | None = Field(
+        default=None,
+        deprecated="旧字段：发布目录已删除，迁移是否需要由迁移器判断；一个版本后移除",
+    )
+    # null = 更新器还没解析出这一版的构建产物摘要（registry 无 tag /
+    # manifest 取不到 / 没有本机平台都归到这里）。
+    digest: str | None = None
+    compatible: bool
+    # 固定码（``digest_unresolved`` / ``platform_unsupported`` …）；只进详情。
+    incompatible_reason: str | None = None
+    incompatible_reason_message: str | None = None
+    # 发布方原话：``summary`` 一行、``notes`` 逐条（≤8 条）；缺失就是 null / []。
+    summary: str | None = None
+    notes: list[str] = Field(default_factory=list)
+    notes_url: str | None = None
+
+
+class ImageUpdateTarget(StrictModel):
+    """唯一可提交的目标：只能来自「兼容 + 摘要已解析」的发现条目。"""
+
+    version: str
+    digest: str
+    # 目标版本的构建提交通常拿不到（registry tag 元数据里没有），如实给 null。
+    commit: str | None = None
+    has_migration: bool | None = Field(
+        default=None,
+        deprecated="旧字段：发布目录已删除，迁移是否需要由迁移器判断；一个版本后移除",
+    )
+
+
+class ImageUpdateTaskRow(CompatModel):
+    """最近一次安装任务（只给卡片与详情用，**不参与**发现结论）。
+
+    旧任务的全部字段（``request_id``/``target``/``migration``/``backup``/
+    ``failure``/``warnings``/``next_actions`` …）仍按白名单原样透传一个版本。
+    """
+
+    state: str
+    stage: str | None = None
+    # 任务目标版本：只有发现条目的摘要对得上（或目标就是当前运行摘要）时才给，
+    # 否则 null —— 前端显示「目标版本未记录」。
+    version: str | None = None
+    # 失败码（白名单内）；成功/未失败为 null。
+    failed_code: str | None = None
+
+
+class ImageUpdateCatalogDetails(CompatModel):
+    """**旧形状**：「目录」诊断，保留一个版本给已在读它的前端。
+
+    可信发布目录（``deploy/releases.json``）已经删除，这里的值全部从
+    ``release_check`` **派生**：``state`` 就是 ``release_check.state``（``ok`` /
+    ``failed`` / ``unknown``），``entries`` 映射 ``tag_count``，``source`` 是
+    ``"registry"``。新代码请读 ``details.release_check``。
+    """
+
+    state: str | None = None
+    state_message: str | None = None
+    # 固定码（``registry_unreachable`` / ``digest_unresolved`` …），只进详情，
+    # 不进首屏那句话。
+    reason: str | None = None
+    reason_message: str | None = None
+    # "registry" = 这次检查真的问了镜像仓库；null = 没有来源证据
+    # （这时不能声称「已是最新」）。
+    source: str | None = None
+    checked_at: str | None = None
+    entries: int | None = None
+    current_version: str | None = None
+    # 本次/上次**按需检查**的终态：
+    # ``check_id`` 与 POST /v1/version/image-update-checks 返回的 ``request_id``
+    # 是同一个值（更新器回填进 ``release_check.check_id``），前端据此确认这次
+    # 检查真的完成了。
+    check: dict[str, Any] | None = None
+
+
+class ImageReleaseCheckCurrent(CompatModel):
+    """更新器实测的**当前运行版本**（读运行中 api 镜像的 OCI ``version`` 标注）。"""
+
+    version: str | None = None
+    # registry 侧的裸摘要（``sha256:<64hex>``）；API 对外统一成完整引用。
+    digest: str | None = None
+
+
+class ImageReleaseCheckLatest(CompatModel):
+    """本次检查发现的最高稳定版（registry ``tags/list`` + manifest 解析结果）。"""
+
+    version: str | None = None
+    digest: str | None = None
+    # registry tag 元数据里通常没有这个版本对应的构建提交，允许 null。
+    commit: str | None = None
+
+
+class ImageReleaseCheckDetails(CompatModel):
+    """更新器 ``status.json`` 顶层 ``release_check`` 的白名单投影。
+
+    这是「有没有新版本」的**唯一**事实源（设计
+    docs/UPDATE-SIMPLIFICATION-DESIGN.md §3）。``reason_detail`` 只投影固定枚举
+    ``null | "throttled"``——更新器那个字段只有这两个值，别的值（自由文本，可能带
+    registry URL、凭据片段或原始异常）一律丢弃。
+    """
+
+    # ok = 这次完整查成功；failed = 这次失败；unknown = 还没查/上次被打断。
+    state: str | None = None
+    checked_at: str | None = None
+    # 本次检查 ID：与 POST /v1/version/image-update-checks 的 ``request_id`` 同值。
+    check_id: str | None = None
+    # "registry"（固定）；别的值等于没有来源证据。
+    source: str | None = None
+    # **归一后**的固定码（``registry_unreachable`` / ``registry_auth_failed`` /
+    # ``registry_rate_limited`` / ``registry_timeout`` / ``no_stable_tags`` /
+    # ``digest_unresolved`` / ``platform_unsupported``）；只进详情。
+    #
+    # 更新器写的是另一套拼写（``auth_failed`` / ``rate_limited`` / ``timeout`` /
+    # ``manifest_failed`` / ``digest_missing`` / ``platform_missing``），API 侧按别名
+    # 表收敛后**才**回显，所以这里永远只出现上面这几个码（前端码表按这个查）。
+    reason: str | None = None
+    reason_message: str | None = None
+    # ``null`` 或 ``"throttled"``（同一 check_id 的刷新请求在限流窗口内被丢弃）。
+    reason_detail: str | None = None
+    current: ImageReleaseCheckCurrent = Field(default_factory=ImageReleaseCheckCurrent)
+    latest: ImageReleaseCheckLatest | None = None
+    tag_count: int = Field(default=0, ge=0)
+
+
+class ImageUpdateUpdaterDetails(CompatModel):
+    """更新器诊断：在线、状态、协议、版本。"""
+
+    online: bool | None = None
+    state: str | None = None
+    protocol: int | None = None
+    version: str | None = None
+
+
+class ImageUpdateBackupGateDetails(CompatModel):
+    """恢复点诊断：是否真有可用备份、原因与检查时间。"""
+
+    restore_point: bool | None = None
+    complete: bool | None = None
+    reason: str | None = None
+    reason_message: str | None = None
+    checked_at: str | None = None
+
+
+class ImageUpdateDetails(StrictModel):
+    """「详情/诊断」折叠区；``backup_gate`` 没有任何事实时为 null。"""
+
+    # 旧形状（一个版本）：从 release_check 派生，前端仍在读 `catalog.check`。
+    catalog: ImageUpdateCatalogDetails
+    updater: ImageUpdateUpdaterDetails
+    backup_gate: ImageUpdateBackupGateDetails | None = None
+    # 新字段：更新器 release_check 的白名单原始投影（唯一发现事实源）。
+    release_check: ImageReleaseCheckDetails | None = None
+
+
+class ImageUpdateView(CompatModel):
+    """``GET /v1/version/image-update``：四态卡片 + 诊断。
+
+    ``message`` 是服务端算好的一句话人话（不含原因码/摘要/路径），前端直接显示。
+    活动任务进行中时它讲进度（「更新正在进行中…」），``state`` 仍是发现结论。
+
+    下半部分是**旧字段**：保留一个版本给尚未迁移的调用方，新代码不要读。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    state: ImageUpdateState
+    message: str
+    checked_at: str | None = None
+    current: ImageUpdateCurrent
+    newer: list[ImageNewerRelease] = Field(default_factory=list)
+    target: ImageUpdateTarget | None = None
+    task: ImageUpdateTaskRow | None = None
+    details: ImageUpdateDetails
+
+    # ---- 旧字段（一个版本后移除）----
+    image_mode: bool = Field(deprecated="旧字段：用 `state` 判断卡片的四态")
+    enabled: bool = Field(deprecated="旧字段：安装开关不再是结论的一部分")
+    installable: bool = Field(deprecated="旧字段：owner 视角下等价于 `state == available`")
+    reason: str | None = Field(deprecated="旧字段：安装门禁的码；新版不进首屏")
+    reason_message: str | None = Field(
+        deprecated="旧字段：安装门禁码表文案；新版一句话正文在 `message`"
+    )
+    next_actions: list[str] = Field(
+        default_factory=list, deprecated="旧字段：新版把下一步写进 `message`"
+    )
+    updater: dict[str, Any] = Field(deprecated="旧字段：见 `details.updater`")
+    backup_gate: dict[str, Any] = Field(deprecated="旧字段：见 `details.backup_gate`")
+    catalog: dict[str, Any] = Field(deprecated="旧字段：见 `details.catalog`")
+    available_targets: list[dict[str, Any]] = Field(
+        default_factory=list,
+        deprecated="旧字段：安装提交仍按这里校验；展示请用 `newer`",
+    )
+    request: dict[str, Any] | None = Field(
+        default=None, deprecated="旧字段：排队中的安装请求（详情区）"
+    )
+
+
+class ImageUpdateCheckRequest(StrictModel):
+    """``POST /v1/version/image-update-checks`` 的固定请求体。
+
+    多一个字段、少一个字段、ID 不是 32 位小写十六进制都会被拒绝（422）。
+    """
+
+    request_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+
+
+class ImageUpdateCheckAccepted(StrictModel):
+    """检查请求回执（202 已排队 / 200 幂等去重）。
+
+    **只表示"已写入"**，不表示已经检查完：结果要看随后 GET 的 ``checked_at``
+    与 ``details.catalog.check``。200 时返回的是**已经在排队/刚刚完成**的那个
+    ``request_id``，前端要按返回的 ID 核对（可能与请求里的不同）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    request_id: str
+    accepted: bool
+
+
 # ---------------------------------------------------------------- 错误
 
 
@@ -885,7 +1157,23 @@ __all__ = [
     "ErrorBody",
     "ErrorCode",
     "ErrorResponse",
+    "CompatModel",
     "HandoffCapsule",
+    "ImageNewerRelease",
+    "ImageReleaseCheckCurrent",
+    "ImageReleaseCheckDetails",
+    "ImageReleaseCheckLatest",
+    "ImageUpdateBackupGateDetails",
+    "ImageUpdateCatalogDetails",
+    "ImageUpdateCheckAccepted",
+    "ImageUpdateCheckRequest",
+    "ImageUpdateCurrent",
+    "ImageUpdateDetails",
+    "ImageUpdateState",
+    "ImageUpdateTarget",
+    "ImageUpdateTaskRow",
+    "ImageUpdateUpdaterDetails",
+    "ImageUpdateView",
     "InputPart",
     "IntentTeaserItem",
     "IntentTeaserOut",

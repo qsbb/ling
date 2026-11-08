@@ -1280,250 +1280,197 @@ export interface UpdateRequest {
   expected: UpdateExpected;
 }
 
-/* ------------------------------------------------- 镜像更新通道（新协议 P5）
+/* ---------------------------------------- 镜像更新卡片（四态契约，docs/UPDATE-UX-DESIGN.md）
  *
- * 依据 `src/ling/api/routes/version.py` 的 `ImageUpdateChannel.view()`：响应是
- * **白名单投影**，更新器状态文件里的自由文本（日志、路径、口令）不会出现在这里。
- * 下面的 `reason` / `failure.code` / `stage` / `updater.state` / `task.state`
- * 都是后端码表值；前端只用映射函数翻译，**不**把它们当自由文本渲染。
- * 未知码（后端更新、前端未同步）一律落到兜底文案，不显示英文原文。
+ * `GET /v1/version/image-update` 的白名单投影 + `POST /v1/version/image-update-checks`
+ * 的回执。前端只按字段渲染：路径、日志、原始异常、密钥都进不来；原因码只出现在
+ * 默认折叠的「详情/诊断」里，并且必须配一句人话。
  */
 
-/** `getImageUpdate` 的 `reason` 码表（后端 `IMAGE_REASON_MESSAGES` 的键）。 */
-export type ImageUpdateReason =
-  | 'image_mode_required'
-  | 'update_disabled'
-  | 'not_owner'
-  | 'update_channel_unavailable'
-  | 'updater_status_missing'
-  | 'updater_status_invalid'
-  | 'protocol_unsupported'
-  | 'updater_offline'
-  | 'manual_required'
-  | 'update_in_progress'
-  | 'backup_gate_missing'
-  | 'current_image_unknown'
-  | 'installed_image_changed'
-  | 'installed_version_changed'
-  | 'already_on_target'
-  | 'duplicate_request_id'
-  | 'recent_login_required'
-  | 'rate_limited'
-  /** 可信发布目录里没有适用于当前版本的新版本：没有目标就不能提交。 */
-  | 'no_available_target'
-  /** 提交的摘要不在目录的兼容目标里（不能绕过目录提交任意摘要）。 */
-  | 'target_not_in_catalog';
+/** 卡片结论只有四类（判定优先级由后端算，前端不加自己的版本比较）。 */
+export type ImageUpdateStateV2 = 'latest' | 'available' | 'newer_unavailable' | 'unknown';
 
-/** 更新器自报状态；状态文件缺失/坏掉时后端给 `unknown`，**不会**伪装成 idle。 */
-export type ImageUpdaterState = 'idle' | 'busy' | 'needs_manual' | 'unknown';
-
-/** 任务终态与进行中（后端 `IMAGE_TASK_STATE_MESSAGES` 的键）。 */
-export type ImageUpdateTaskState =
-  | 'running'
-  | 'succeeded'
-  | 'failed_not_started'
-  | 'needs_manual'
-  | 'resolved';
-
-/**
- * 真实阶段（后端 `IMAGE_STAGE_MESSAGES` 的键，与更新器 `STAGES` 一致）。
- * 不存在"下载百分比/剩余时间"这类字段——后端本来就不产生。
- */
-export type ImageUpdateStage = 'prepare' | 'backup' | 'migrate' | 'switch' | 'verify';
-
-/** 失败码（后端 `IMAGE_FAILURE_MESSAGES` 的键）；未知码后端只给兜底 message。 */
-export type ImageFailureCode =
-  | 'request_rejected'
-  | 'already_on_target'
-  | 'duplicate_request'
-  | 'expected_current_mismatch'
-  | 'preflight_failed'
-  | 'maintenance_gate_failed'
-  | 'pull_failed'
-  | 'backup_failed'
-  | 'migration_failed'
-  | 'switch_failed'
-  | 'old_service_unverified'
-  | 'reconcile_needs_manual'
-  | 'state_unreadable'
-  | 'previous_task_needs_manual'
-  | 'install_lock_busy'
-  | 'env_write_failed'
-  | 'internal_error';
-
-export interface ImageUpdateCurrent {
-  /** `LING_APP_IMAGE`（完整 digest）；后端无法确认时为 null。 */
-  digest: string | null;
-  /** 构建提交（`LING_COMMIT`）；未注入时为 null。 */
-  commit: string | null;
-}
-
-export interface ImageUpdaterView {
-  /** 状态文件新鲜、协议一致、state 已知才算在线（后端按 `updated_at` 判定）。 */
-  online: boolean;
-  state: ImageUpdaterState;
-  protocol: number | null;
+/** 当前运行版本、构建提交与镜像摘要；读不到就是 null，不用 `pyproject` 猜。 */
+export interface ImageUpdateCurrentV2 {
   version: string | null;
-  updated_at: string | null;
-  age_seconds: number | null;
-}
-
-export interface ImageBackupGate {
-  /** 后端自己核实后的结论（不盲信状态文件里的布尔值）。 */
-  restore_point: boolean;
-  complete: boolean;
-  backup_id: string | null;
-  tombstones_state: string | null;
-  media_state: string | null;
-  keys_root: string | null;
-  keys_env_set: string | null;
-  /** 后端码表码；未认识时 null。 */
-  reason: string | null;
-  /** 后端码表文案（已脱敏）；null 表示没有可展示的理由。 */
-  reason_message: string | null;
-  checked_at: string | null;
-  source: 'backup_gate' | 'task' | null;
-}
-
-export interface ImageUpdateFailure {
-  code: ImageFailureCode | null;
-  stage: string | null;
-  /** 码表文案（已脱敏）；未知码时是后端固定兜底句。 */
-  message: string;
-}
-
-export interface ImageUpdateTargetRef {
-  digest: string | null;
   commit: string | null;
+  digest: string | null;
 }
 
-export interface ImageUpdateMigration {
-  attempted: boolean;
-  current_before: string | null;
-  current_after: string | null;
-  target_head: string | null;
-}
-
-export interface ImageUpdateBackupRef {
-  id: string | null;
-  complete: boolean;
-  tombstones_state: string | null;
-  media_state: string | null;
-  keys_root: string | null;
-  keys_env_set: string | null;
-}
-
-export interface ImageUpdateMaintenance {
-  state: 'active' | 'released' | 'unknown' | null;
-  verified: boolean;
-}
-
-export interface ImageUpdateRollback {
-  attempted: boolean;
-  verified: boolean;
-}
-
-export interface ImageUpdateTask {
-  request_id: string | null;
-  state: ImageUpdateTaskState;
-  /** 码表文案。 */
-  state_message: string;
-  stage: ImageUpdateStage | null;
-  /** 码表文案；stage 未知时 null。 */
-  stage_message: string | null;
-  started_at: string | null;
-  updated_at: string | null;
-  finished_at: string | null;
-  target: ImageUpdateTargetRef;
-  previous: ImageUpdateTargetRef;
-  migration: ImageUpdateMigration;
-  backup: ImageUpdateBackupRef;
-  maintenance: ImageUpdateMaintenance;
-  rollback: ImageUpdateRollback;
-  /** null = 更新器没有实测旧服务，**不敢**断言（不能当成"仍在旧版本"）。 */
-  still_on_old_version: boolean | null;
-  failure: ImageUpdateFailure | null;
-  warnings: string[];
-  next_actions: string[];
-}
-
-export interface ImageUpdatePendingRequest {
-  request_id: string;
-  readable: boolean;
-  target_digest: string | null;
-  created_at: string | null;
-}
-
-/**
- * 可信发布目录里的一条目标（后端 `available_targets[i]` 的白名单投影）。
- *
- * 后端把码表码与文案都给了；前端只按字段渲染，**不**自己判断兼容性。
- */
-export interface ImageUpdateAvailableTarget extends ImageUpdateViewTarget {
-  /** 后端复核后的结论：版本必须严格大于当前版本，且当前版本在 min_from 里。 */
+/** 目录里比当前版本高的每一条（`compatible=false` 的也保留，带不可用原因）。 */
+export interface ImageUpdateNewerReleaseV2 {
+  version: string;
+  /**
+   * 目标版本的构建提交。更新器改成直接查 GHCR 之后，registry 的 tag 元数据里
+   * 通常拿不到它，所以是 null；只用于展示/核对，不参与「能不能装」的判断。
+   */
+  commit: string | null;
+  /**
+   * **已废弃**：发布目录（`deploy/releases.json`）已删除，`has_migration` 失去事实源，
+   * 当前后端恒给 null。不要据此推断「包含迁移」或「不需要迁移」——迁移是否需要
+   * 由迁移器在实际执行时判断。
+   */
+  has_migration: boolean | null;
+  /**
+   * 发布方写的原话；前端不改写、不总结。空数组 = 这一版没有提供更新说明。
+   *
+   * 注意：当前后端把 `update-notes.json` 的 `summary` 与 `items` **摊平**进这个
+   * 数组（summary 在前）；契约正文里没有单独的 `summary` 字段，所以前端不猜
+   * 「第一行是不是摘要」——有 `summary` 才渲染摘要行，否则按原样逐条显示。
+   */
+  notes: string[];
+  notes_url: string | null;
   compatible: boolean;
-  /** 后端 `IMAGE_INCOMPATIBLE_MESSAGES` 的键；兼容时为 null。 */
-  incompatible_reason: ImageUpdateIncompatibleReason | null;
-  /** 后端码表文案（已脱敏）；兼容时为 null。 */
-  incompatible_reason_message: string | null;
+  /** 不可用原因码（`digest_unresolved` 等）；只进详情，且必须配一句人话。 */
+  incompatible_reason: string | null;
+  /** 后端码表给的人话（已脱敏）；有就用它，缺省用前端码表兜底。 */
+  incompatible_reason_message?: string | null;
+  digest: string | null;
+  /**
+   * 契约正文只给了 `notes` / `notes_url`；设计文档 §附 的 `update-notes.json` 里
+   * `summary` 是独立字段。后端加法投影时用它；缺失时就**不显示摘要**——不拿第一条
+   * `notes` 冒充摘要，也不自己编一句。
+   */
+  summary?: string | null;
 }
 
-/** 不兼容原因码表（后端 `IMAGE_INCOMPATIBLE_MESSAGES` 的键）。 */
-export type ImageUpdateIncompatibleReason =
-  | 'not_in_min_from'
-  | 'not_newer'
-  | 'current_version_unknown'
-  | 'version_uncomparable';
-
-/** 可信发布目录的读取结论（后端 `release_catalog`）；原因码未知时三项都是 null。 */
-export interface ImageUpdateCatalogView {
-  state: 'ok' | 'missing' | 'invalid' | null;
-  state_message: string | null;
-  reason: string | null;
-  /** 后端码表文案（已脱敏）：目录缺失/坏掉时说清"为什么没有目标"。 */
-  reason_message: string | null;
-  entries: number;
-  /** 按当前镜像摘要反查到的安装版本；反查不到时 null。 */
-  current_version: string | null;
-}
-
-/**
- * 目标版本（后端 `target`）：只给这四个字段。
- *
- * `has_migration` 来自发布目录，用来提示"这次更新会跑数据库迁移"。
- */
-export interface ImageUpdateViewTarget {
+/** 唯一可提交的目标：只能来自「兼容 + 摘要已解析」的目录条目。 */
+export interface ImageUpdateTargetV2 {
   version: string;
   digest: string;
-  commit: string;
-  has_migration: boolean;
+  /**
+   * 目标版本的构建提交。registry 发现拿不到时为 null（这是常态，不是错误）；
+   * 只用于展示，不参与安装校验。
+   */
+  commit: string | null;
 }
 
-/** GET /v1/version/image-update 的响应体。 */
-export interface ImageUpdateView {
-  schema_version: string;
-  image_mode: boolean;
-  enabled: boolean;
-  installable: boolean;
-  reason: ImageUpdateReason | null;
-  /** 后端码表文案（已脱敏）；可安装时为 null。 */
-  message: string | null;
-  /** 后端码表给出的下一步（已脱敏），原样展示。 */
-  next_actions: string[];
-  current: ImageUpdateCurrent;
-  updater: ImageUpdaterView;
-  backup_gate: ImageBackupGate;
-  /** 可信发布目录的读取结论（缺失/坏掉时有明确原因）。 */
-  catalog: ImageUpdateCatalogView;
-  /** 推荐的目标（最新且兼容）；没有可用目标时为 null。 */
-  target: ImageUpdateViewTarget | null;
-  /** 目录里比当前版本新的目标（含不兼容的，带原因）。 */
-  available_targets: ImageUpdateAvailableTarget[];
-  task: ImageUpdateTask | null;
-  request: ImageUpdatePendingRequest | null;
+/**
+ * 最近一次安装任务（只给卡片与详情用；不参与发现结论的判定）。
+ *
+ * 后端把旧的完整任务视图**原样保留**（一个版本）并加 `version` / `failed_code`：
+ * 首屏只用 state/stage/version，详情用 request_id、失败码、目标摘要与迁移 head
+ * 做三项核验。这里全部按可选处理——缺字段时只显示「未知/未提供」，不当成事实。
+ */
+export interface ImageUpdateTaskV2 {
+  /** 任务状态码：`running` / `succeeded` / `failed_not_started` / `needs_manual` / `resolved`。 */
+  state: string;
+  /** 阶段码：`prepare` / `backup` / `migrate` / `switch` / `verify`；未知/缺失为 null。 */
+  stage: string | null;
+  version: string | null;
+  failed_code: string | null;
+  /** 当前请求 ID（设计文档详情区要求）。 */
+  request_id?: string | null;
+  /** 后端码表文案（中文）；缺失时前端按 `state` 翻译。 */
+  state_message?: string | null;
+  stage_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  target?: { digest: string | null; commit: string | null } | null;
+  migration?: {
+    attempted?: boolean;
+    current_before?: string | null;
+    current_after?: string | null;
+    target_head?: string | null;
+  } | null;
+  failure?: { code?: string | null; stage?: string | null; message?: string | null } | null;
+  still_on_old_version?: boolean | null;
 }
 
-/** POST /v1/version/image-update-requests 的**固定 5 键**请求体。 */
+/** 排队中的安装请求（旧字段保留一个版本；四态契约正文没有它，但排队要能显示）。 */
+export interface ImageUpdatePendingRequestV2 {
+  request_id: string;
+  created_at?: string | null;
+  target_digest?: string | null;
+}
+
+/** 按需检查的终态元数据（更新器写 `catalog_check`，API 白名单投影）。 */
+export interface ImageUpdateCatalogCheckDetailsV2 {
+  check_id?: string | null;
+  /** running / succeeded / degraded / failed */
+  state?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  /** remote / local / none */
+  source?: string | null;
+  reason?: string | null;
+}
+
+/** 目录诊断（设计文档详情区：来源、检查时间、状态与原因）。 */
+export interface ImageUpdateCatalogDetailsV2 {
+  state?: string | null;
+  state_message?: string | null;
+  /** 固定码（`catalog_missing` 等），只进详情。 */
+  reason?: string | null;
+  reason_message?: string | null;
+  /** `remote` = 远程发布目录，`local` = 本机回退目录，`none` = 都没有读到。 */
+  source?: string | null;
+  checked_at?: string | null;
+  entries?: number | null;
+  /** 本次/上次按需检查的元数据；旧更新器没有这个键。 */
+  check?: ImageUpdateCatalogCheckDetailsV2 | null;
+}
+
+/** 更新器诊断（在线/状态/协议）。 */
+export interface ImageUpdateUpdaterDetailsV2 {
+  online?: boolean | null;
+  state?: string | null;
+  protocol?: number | null;
+  version?: string | null;
+}
+
+/** 恢复点诊断。 */
+export interface ImageUpdateBackupGateDetailsV2 {
+  restore_point?: boolean | null;
+  complete?: boolean | null;
+  reason?: string | null;
+  reason_message?: string | null;
+  checked_at?: string | null;
+}
+
+export interface ImageUpdateDetailsV2 {
+  catalog: ImageUpdateCatalogDetailsV2;
+  updater: ImageUpdateUpdaterDetailsV2;
+  backup_gate: ImageUpdateBackupGateDetailsV2 | null;
+}
+
+/** `GET /v1/version/image-update` 的响应体（四态卡片）。 */
+export interface ImageUpdateV2 {
+  schema_version: 'v1';
+  state: ImageUpdateStateV2;
+  /** 服务端算好的一句话结论，前端**直接显示**，不自己拼。 */
+  message: string;
+  /** ISO；null = 从来没有成功检查过。 */
+  checked_at: string | null;
+  current: ImageUpdateCurrentV2;
+  newer: ImageUpdateNewerReleaseV2[];
+  target: ImageUpdateTargetV2 | null;
+  task: ImageUpdateTaskV2 | null;
+  /** 排队中的请求；非空 = 已提交、还没开始。旧字段，后端保留一个版本。 */
+  request?: ImageUpdatePendingRequestV2 | null;
+  details: ImageUpdateDetailsV2;
+  /**
+   * 契约正文未列：`AboutPage` 靠它二选一（镜像卡片 / 源码模式页）。缺省按镜像
+   * 模式处理；只有显式 `false` 才走源码模式。
+   */
+  image_mode?: boolean;
+}
+
+/** `POST /v1/version/image-update-checks` 的固定请求体（多余字段会被拒绝）。 */
+export interface ImageUpdateCheckRequest {
+  request_id: string;
+}
+
+/** 检查请求回执（200 复用同一 ID / 201 / 202 排队）：只表示已写入，不表示已完成。 */
+export interface ImageUpdateCheckAck {
+  schema_version?: string;
+  request_id: string;
+  state?: string;
+  state_message?: string;
+  created_at?: string;
+}
+
+/** `POST /v1/version/image-update-requests` 的**固定 5 键**请求体。 */
 export interface ImageUpdateSubmission {
   request_id: string;
   target_digest: string;

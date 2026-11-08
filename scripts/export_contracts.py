@@ -50,6 +50,26 @@ EXPORTED = [
     "PromptSnapshotModel",
     "PromptSnapshotOut",
     "PromptSnapshotSection",
+    # 「检查更新」四态卡片（docs/UPDATE-UX-DESIGN.md）。嵌套片段对象（current /
+    # newer / target / task / details.*）也各自导出：它们是 API 契约的一部分，
+    # 单独写 schema 才能让前端按字段名/类型对齐，而不是对着文档抄。
+    "ImageUpdateView",
+    "ImageUpdateCurrent",
+    "ImageNewerRelease",
+    "ImageUpdateTarget",
+    "ImageUpdateTaskRow",
+    "ImageUpdateDetails",
+    "ImageUpdateCatalogDetails",
+    "ImageUpdateUpdaterDetails",
+    "ImageUpdateBackupGateDetails",
+    # 发现事实（唯一来源：更新器的 `release_check`，见
+    # docs/UPDATE-SIMPLIFICATION-DESIGN.md §3）。
+    "ImageReleaseCheckDetails",
+    "ImageReleaseCheckCurrent",
+    "ImageReleaseCheckLatest",
+    # 按需检查的固定请求体与回执。
+    "ImageUpdateCheckRequest",
+    "ImageUpdateCheckAccepted",
 ]
 
 

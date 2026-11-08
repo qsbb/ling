@@ -1,0 +1,34 @@
+{
+  "$id": "https://ling.local/contracts/v1/ImageReleaseCheckCurrent.schema.json",
+  "additionalProperties": true,
+  "description": "更新器实测的**当前运行版本**（读运行中 api 镜像的 OCI ``version`` 标注）。",
+  "properties": {
+    "digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Digest"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    }
+  },
+  "title": "ImageReleaseCheckCurrent",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

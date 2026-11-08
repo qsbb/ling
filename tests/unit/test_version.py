@@ -446,3 +446,360 @@ def test_release_url_is_restricted_to_this_repository() -> None:
     assert version_routes._safe_release_url("http://evil.example/release") is None
     assert version_routes._safe_release_url("javascript:alert(1)") is None
     assert version_routes._safe_release_url(123) is None
+
+
+# ---------------------------------------------------------------- 四态投影（纯函数）
+#
+# 这些用例不需要数据库与 HTTP：只验证「更新器状态 → 白名单投影 → 四态零件」这一层，
+# 边界（坏结构/超限/未知码）比集成用例更容易穷举。发现事实只有一个来源：
+# ``release_check``（docs/UPDATE-SIMPLIFICATION-DESIGN.md §3）。
+
+_TARGET_DIGEST = "ghcr.io/qsbb/ling-api@sha256:" + "b" * 64
+_TARGET_DIGEST_HEX = "sha256:" + "b" * 64
+
+
+def _release_check(**overrides: object) -> dict[str, object]:
+    raw: dict[str, object] = {
+        "state": "ok",
+        "checked_at": "2026-11-09T06:20:00Z",
+        "check_id": "1" * 32,
+        "source": "registry",
+        "reason": None,
+        "reason_detail": None,
+        "current": {"version": "1.0.0", "digest": "sha256:" + "a" * 64},
+        "latest": {"version": "1.1.0", "digest": _TARGET_DIGEST_HEX, "commit": None},
+        "tag_count": 3,
+    }
+    raw.update(overrides)
+    view = version_routes._image_release_check_view(raw)
+    assert view is not None
+    return view
+
+
+def test_release_check_projection_is_whitelisted() -> None:
+    """投影逐字段重建：多余键进不来，``reason_detail`` 只放固定枚举。"""
+    raw = {
+        "state": "failed",
+        "checked_at": "2026-11-09T06:20:00Z",
+        "check_id": "1" * 32,
+        "source": "registry",
+        "reason": "registry_unreachable",
+        "reason_detail": "dial tcp 140.82.112.33:443: i/o timeout",
+        "current": {"version": "1.0.0", "digest": "sha256:" + "a" * 64},
+        "latest": {"version": "1.1.0", "digest": _TARGET_DIGEST_HEX, "commit": None},
+        "tag_count": 3,
+        "path": "/vol1/1000/ling/status.json",
+        "journal": "journal.log",
+    }
+    view = version_routes._image_release_check_view(raw)
+    assert view is not None
+    assert set(view) == {
+        "state",
+        "checked_at",
+        "check_id",
+        "source",
+        "reason",
+        "reason_message",
+        "reason_detail",
+        "current",
+        "latest",
+        "tag_count",
+    }
+    assert view["reason"] == "registry_unreachable"
+    # ``reason_detail`` 的固定枚举之外（这里是异常文本）一律丢弃，不回显原文。
+    assert view["reason_detail"] is None
+    assert view["current"] == {"version": "1.0.0", "digest": "ghcr.io/qsbb/ling-api@sha256:" + "a" * 64}
+    # 裸摘要归一成安装请求要的完整引用（固定仓库，不接受调用方输入）。
+    assert view["latest"] == {
+        "version": "1.1.0",
+        "digest": _TARGET_DIGEST,
+        "commit": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "written,normalized",
+    [
+        # 更新器的历史拼写 → 本文件码表的归一码（只做兼容，不改更新器）。
+        ("auth_failed", "registry_auth_failed"),
+        ("rate_limited", "registry_rate_limited"),
+        ("timeout", "registry_timeout"),
+        ("platform_missing", "platform_unsupported"),
+        ("digest_missing", "digest_unresolved"),
+        ("manifest_failed", "digest_unresolved"),
+        # 原码本来就认识：原样保留（别名表不许改写归一码）。
+        ("registry_unreachable", "registry_unreachable"),
+        ("platform_unsupported", "platform_unsupported"),
+        # 真正未知的码仍然丢弃，且不回显原文。
+        ("whatever_new_code", None),
+    ],
+)
+def test_release_check_reason_is_normalized_before_anything_else(
+    written: str, normalized: str | None
+) -> None:
+    """``reason`` 在投影时就归一：判定与回显都只看归一码。"""
+    view = version_routes._image_release_check_view(
+        {"state": "failed", "reason": written, "tag_count": 2}
+    )
+    assert view is not None
+    assert view["reason"] == normalized
+    expected_message = (
+        None
+        if normalized is None
+        else version_routes.IMAGE_RELEASE_REASON_MESSAGES[normalized]
+    )
+    assert view["reason_message"] == expected_message
+
+
+def test_release_check_reason_detail_is_a_closed_set() -> None:
+    """``reason_detail`` 只放 ``null | "throttled"``：这就是更新器会写的两个值。"""
+    for written, expected in (
+        (None, None),
+        ("throttled", "throttled"),
+        ("Throttled", None),
+        ("throttled ", None),
+        ("throttled; rm -rf /", None),
+        ("registry 被限流", None),
+    ):
+        view = version_routes._image_release_check_view(
+            {"state": "ok", "reason_detail": written}
+        )
+        assert view is not None
+        assert view["reason_detail"] == expected, written
+
+
+def test_release_check_unknown_state_and_reason_are_dropped() -> None:
+    """码表外的 state/reason 一律丢弃：未知码不能变成"可信结论"。"""
+    view = version_routes._image_release_check_view(
+        {"state": "weird", "reason": "catalog_missing", "source": "local", "tag_count": -5}
+    )
+    assert view is not None
+    assert view["state"] is None
+    assert view["reason"] is None
+    assert view["source"] is None
+    assert view["tag_count"] == 0
+    assert version_routes._image_release_check_view(None) is None
+    assert version_routes._image_release_check_view("not-a-dict") is None
+
+
+def test_digest_accepts_both_forms_and_rejects_the_rest() -> None:
+    assert version_routes._image_digest(_TARGET_DIGEST_HEX) == _TARGET_DIGEST
+    assert version_routes._image_digest(_TARGET_DIGEST) == _TARGET_DIGEST
+    for bad in (
+        None,
+        "",
+        "latest",
+        "ghcr.io/evil/ling-api@sha256:" + "b" * 64,
+        "sha256:" + "b" * 63,
+        "sha256:" + "B" * 64,
+        42,
+    ):
+        assert version_routes._image_digest(bad) is None, bad
+
+
+def test_newer_release_can_have_no_digest() -> None:
+    """摘要为 null 的更高版本必须**保留**（这是「有新版暂不可用」的事实）。"""
+    check = _release_check(latest={"version": "1.1.0", "digest": None, "commit": None})
+    entries = version_routes._image_newer_releases(check, "1.0.0", {})
+    assert len(entries) == 1
+    assert entries[0]["digest"] is None
+    assert entries[0]["compatible"] is False
+    assert entries[0]["incompatible_reason"] == "digest_unresolved"
+
+
+def test_newer_release_keeps_the_registry_failure_reason() -> None:
+    """平台不匹配与摘要缺失都是"装不了"，但原因不同（人要看到对的那句）。"""
+    check = _release_check(
+        state="failed",
+        reason="platform_unsupported",
+        latest={"version": "1.1.0", "digest": None, "commit": None},
+    )
+    [entry] = version_routes._image_newer_releases(check, "1.0.0", {})
+    assert entry["compatible"] is False
+    assert entry["incompatible_reason"] == "platform_unsupported"
+    assert entry["incompatible_reason_message"] == (
+        version_routes.IMAGE_INCOMPATIBLE_MESSAGES["platform_unsupported"]
+    )
+
+
+def test_newer_release_requires_a_known_current_version() -> None:
+    """当前版本未知 → 没有比较基准 → newer 必须是空（空不等于「已是最新」）。"""
+    assert version_routes._image_newer_releases(_release_check(), None, {}) == []
+    assert version_routes._image_newer_releases(None, "1.0.0", {}) == []
+
+
+@pytest.mark.parametrize(
+    "latest",
+    [
+        {"version": "latest", "digest": _TARGET_DIGEST_HEX, "commit": None},
+        {"version": None, "digest": _TARGET_DIGEST_HEX, "commit": None},
+        {"digest": _TARGET_DIGEST_HEX, "commit": None},
+        "not-an-object",
+        None,
+    ],
+    ids=["tag-name", "null-version", "missing-version", "not-object", "null"],
+)
+def test_newer_release_drops_unrecognized_versions(latest: object) -> None:
+    check = _release_check(latest=latest)
+    assert version_routes._image_newer_releases(check, "1.0.0", {}) == []
+
+
+def test_newer_release_ignores_versions_not_above_current() -> None:
+    for version in ("1.0.0", "0.9.0"):
+        check = _release_check(latest={"version": version, "digest": _TARGET_DIGEST_HEX,
+                                       "commit": None})
+        assert version_routes._image_newer_releases(check, "1.0.0", {}) == []
+
+
+def test_release_notes_keep_publisher_wording_and_limits() -> None:
+    state, notes = version_routes._image_release_notes(
+        {
+            "state": "ok",
+            "notes": {
+                "v1.1.0": {
+                    "summary": "  一行摘要  ",
+                    "items": ["  第一条  ", "", "x" * 500, 7, "第二条"],
+                    "url": "https://example.test/CHANGELOG.md",
+                },
+                "bad-version": {"items": ["不该出现"]},
+                "1.1.1": {"items": [f"第{i}条" for i in range(20)]},
+            },
+        }
+    )
+    assert state == "ok"
+    key = version_routes._parse_semver("1.1.0")
+    assert key is not None
+    summary, items, url = notes[key]
+    assert summary == "一行摘要"
+    assert items == ["第一条", "第二条"]  # 空/超长/非字符串丢弃，顺序不变
+    assert url == "https://example.test/CHANGELOG.md"
+    capped = notes[version_routes._parse_semver("1.1.1")]
+    assert len(capped[1]) == version_routes.IMAGE_NOTE_MAX_ITEMS
+
+
+def test_release_notes_state_is_whitelisted() -> None:
+    """``release_notes.state`` 只认 ok/missing/invalid；未知值丢弃（不影响内容）。"""
+    assert version_routes._image_release_notes({"state": "ok"})[0] == "ok"
+    assert version_routes._image_release_notes({"state": "missing"})[0] == "missing"
+    assert version_routes._image_release_notes({"state": "invalid"})[0] == "invalid"
+    assert version_routes._image_release_notes({"state": "weird"})[0] is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "https://",
+        "ftp://example.test/notes",
+        "/vol1/1000/ling/CHANGELOG.md",
+        "",
+    ],
+)
+def test_release_notes_reject_unsafe_urls(url: str) -> None:
+    _state, notes = version_routes._image_release_notes({"1.1.0": {"url": url, "items": ["x"]}})
+    assert notes[version_routes._parse_semver("1.1.0")][2] is None
+
+
+def test_release_notes_absent_or_malformed_is_empty() -> None:
+    for raw in (None, {}, [], "notes", {"notes": []}, {"notes": {"1.1.0": "x"}}):
+        state, notes = version_routes._image_release_notes(raw)
+        assert notes == {}
+        assert state is None
+
+
+def test_checked_at_text_is_human() -> None:
+    """``message`` 里的时间是本地人话，不是原始 ISO。"""
+    assert version_routes._image_checked_at_text(
+        "2026-11-09T06:20:00Z", timezone="Asia/Shanghai"
+    ) == ("11 月 9 日 14:20")
+    assert version_routes._image_checked_at_text(
+        "2026-11-09T06:20:00Z", timezone="UTC"
+    ) == ("11 月 9 日 06:20")
+    # 坏时区/坏时间都退回可读结果或 None，绝不抛异常、也不回显原文。
+    assert version_routes._image_checked_at_text(
+        "2026-11-09T06:20:00Z", timezone="Not/AZone"
+    ) == ("11 月 9 日 06:20")
+    assert version_routes._image_checked_at_text("not-a-time", timezone=None) is None
+    assert version_routes._image_checked_at_text(None, timezone=None) is None
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("updater_offline", "更新服务暂时没有响应"),
+        ("release_check_missing", "更新器还没有报告过检查结果"),
+        ("registry_unreachable", "连不上镜像仓库"),
+        ("registry_auth_failed", "镜像仓库不认这次查询的凭据（可能是私有包或凭据失效）"),
+        ("registry_rate_limited", "镜像仓库暂时限流，这次没查完整"),
+        ("registry_timeout", "查询镜像仓库超时"),
+        ("no_stable_tags", "镜像仓库里还没有稳定版发布"),
+        ("digest_unresolved", "找到了新版本，但取不到它的安装包摘要"),
+        ("platform_unsupported", "新版本没有适合这台机器的镜像"),
+    ],
+)
+def test_unknown_reason_clauses_are_human(reason: str, expected: str) -> None:
+    clause = version_routes._image_unknown_clause(reason)
+    assert clause == expected
+    assert "_" not in clause
+    assert "sha256" not in clause
+
+
+def test_unknown_reason_clause_never_leaks_an_unknown_code() -> None:
+    """码表外的原因不给原文（状态文件跨信任边界），目录时代的码也已不存在。"""
+    assert version_routes._image_unknown_clause("weird_code_from_file") == (
+        "暂时无法确认更新条件"
+    )
+    assert version_routes._image_unknown_clause("catalog_missing") == (
+        "暂时无法确认更新条件"
+    )
+
+
+@pytest.mark.parametrize(
+    "reason", sorted(set(version_routes.IMAGE_UNAVAILABLE_REASONS))
+)
+def test_unavailable_clauses_are_first_screen_safe(reason: str) -> None:
+    clause = version_routes.IMAGE_UNAVAILABLE_REASONS[reason]
+    assert clause and not clause.endswith("。")
+    assert "_" not in clause
+    assert "sha256" not in clause
+    assert "/" not in clause
+
+
+def test_catalog_reason_codes_are_gone() -> None:
+    """目录删除后，那些 reason 不许再出现在任何码表里（回归门禁）。"""
+    forbidden = {
+        "not_in_min_from",
+        "catalog_missing",
+        "catalog_unreadable",
+        "catalog_invalid",
+        "catalog_schema_unsupported",
+        "catalog_tool_missing",
+        "catalog_unavailable",
+        "catalog_state_unknown",
+        "catalog_degraded",
+        "catalog_unverified",
+        "target_not_in_catalog",
+        "not_newer",
+    }
+    for table in (
+        version_routes.IMAGE_UNKNOWN_REASONS,
+        version_routes.IMAGE_UNAVAILABLE_REASONS,
+        version_routes.IMAGE_INCOMPATIBLE_MESSAGES,
+        version_routes.IMAGE_REASON_MESSAGES,
+        version_routes.IMAGE_REASON_STATUS,
+        version_routes.IMAGE_REASON_NEXT_ACTIONS,
+        version_routes.IMAGE_RELEASE_REASON_MESSAGES,
+    ):
+        assert not (forbidden & set(table)), sorted(forbidden & set(table))
+
+
+def test_newer_entry_does_not_echo_free_text() -> None:
+    """状态文件里的自由文本（路径/日志/失败说明）不进 newer 条目。"""
+    check = _release_check()
+    check["path"] = "/vol1/1000/ling/deploy/releases.json"
+    check["message"] = "ssh root@host"
+    [projected] = version_routes._image_newer_releases(check, "1.0.0", {})
+    blob = json.dumps(projected)
+    assert "/vol1/1000" not in blob
+    assert "ssh root@host" not in blob
