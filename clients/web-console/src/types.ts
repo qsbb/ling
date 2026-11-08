@@ -984,6 +984,31 @@ export interface LifeTimelineOut {
   note: string | null;
 }
 
+/**
+ * `POST /v1/life/outline-jobs` 与 `GET /v1/life/outline-jobs/{job_id}` 的响应。
+ *
+ * `state` 是**作业**状态：`queued` / `running` / `ready` / `degraded` /
+ * `failed` / `unchanged`（这次点击什么都没做）/ `blocked`（入队被预算拦下）。
+ * 202 只表示**已提交**，不表示生成成功——还要按 `job_id` 轮询到终态。
+ *
+ * `note` 是**人话**，直接进界面；`reason_code` 只给日志与测试，
+ * 界面上一个字符都不许出现（设计 §0：界面不出现原因码）。
+ */
+export interface OutlineJobOut {
+  schema_version: string;
+  /** `unchanged` 且没有对应的作业事件时可以是 null。 */
+  job_id: string | null;
+  /** 目标日 = **角色计划日**（不是浏览器时区的今天）。 */
+  plan_day: string;
+  state: string;
+  note: string;
+  revision: number;
+  plan_state: string | null;
+  reason_code: string | null;
+  /** 这次调用是否真的新入队（false = 复用了已有作业，或什么都没做）。 */
+  enqueued: boolean;
+}
+
 /** `GET /v1/dashboard` 的 `sections.today_outline.data` 里的一条。 */
 export interface TodayOutlineItem {
   schema_version: string;
@@ -1054,8 +1079,31 @@ export interface SubjectRow {
   accounts: AccountRow[];
 }
 
+/**
+ * `GET /v1/accounts/subjects` 的一页（`docs/API-WEB-V1.md` §13，契约 `SubjectsPage`）。
+ *
+ * **分页是契约的一部分**：`subjects` 默认只有 50 条，看到 `has_more=true` 就必须
+ * 继续 `offset`，不能假设"一次就是全部"——那正是关系页卡死的成因（2000 条 =
+ * 561 KB，前端再按 n² 渲染候选）。
+ *
+ * `total` 是**筛选后**的总行数；`limit` / `offset` / `q` 是服务端回显的实际生效值，
+ * 前端不自己猜默认值。
+ */
 export interface SubjectsResponse {
   subjects: SubjectRow[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+  q: string | null;
+}
+
+/** 取关系列表的参数。全部可选：不带参数时服务端给第一页（50 条）。 */
+export interface SubjectsQuery {
+  limit?: number;
+  offset?: number;
+  /** 服务端筛选词（昵称 / subject_id / 账号外部 id），空串等于不筛选。 */
+  q?: string;
 }
 
 export interface MergeResult {
@@ -1076,7 +1124,8 @@ export type DashboardStatus = 'ok' | 'empty' | 'unavailable';
 export interface DashboardSection {
   status: DashboardStatus;
   as_of: string;
-  data?: Record<string, unknown> | null;
+  /** 只读，不做原地修改：`sections` 里的分段可能是可选的（见 `today_outline`）。 */
+  data?: Readonly<Record<string, unknown>> | null;
 }
 
 export interface DashboardResponse {

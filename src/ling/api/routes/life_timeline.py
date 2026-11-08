@@ -53,14 +53,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.deps import CurrentAuth, DbSession, SettingsDep
+from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
+from ling.api.errors import LingError
 from ling.contracts.v1 import (
     DayIntentSummary,
     DreamCard,
+    ErrorCode,
     IntentTeaserItem,
     LifeTimelineFact,
     LifeTimelineOut,
@@ -906,7 +909,234 @@ async def get_life_timeline(
     )
 
 
+# ---------------------------------------------------------------- 手动生成日程
+
+
+class OutlineJobBody(BaseModel):
+    """`POST /v1/life/outline-jobs` 的请求体。
+
+    - ``plan_day``：**角色计划日**（不是用户看到的展示日）。前端从
+      `GET /v1/life/timeline` 的 ``plan_day`` 拿，不要自己按浏览器时区算。
+    - ``force``：已经生成过也按当前快照重排一版。它**不绕过**预算与幂等。
+    - ``request_id``：同一次点击的幂等键（可选）。前端超时重发时带上它，
+      后端就知道"这还是那一次点击"，不会再排一版。
+    """
+
+    plan_day: date
+    force: bool = False
+    request_id: str | None = Field(default=None, max_length=64)
+
+
+#: "已生成过、这次没有重新生成"。与作业状态分开命名，因为它不是作业状态：
+#: 它表示**这次点击**什么都没做。
+JOB_UNCHANGED_LOCAL = "unchanged"
+
+
+def note_for_unchanged() -> str:
+    return "这一天的日程已经生成过了，这次没有重新生成；要按现在的情况重排，选「重新生成」"
+
+
+def _outline_owner_only(auth: object, owner_subject: str | None) -> bool:
+    """只有主人能触发生成（非 owner 可以读已有内容，但不能让她花钱）。"""
+    return viewer_is_owner(
+        role=str(getattr(getattr(auth, "user", None), "role", "")),
+        subject_id=str(getattr(getattr(auth, "user", None), "subject_id", "")),
+        owner_subject=owner_subject,
+    )
+
+
+@router.post("/life/outline-jobs")
+async def create_outline_job(
+    body: OutlineJobBody,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    config: ConfigDep,
+    model_router: RouterDep,
+    response: Response,
+) -> dict:
+    """手动生成某一天的日程（owner only）。**只入队，不声称已经生成。**
+
+    状态码与含义（前端据此决定按钮与提示）：
+
+    - ``202`` 已入队：``state=queued``（或 ``running``——那一天已经有作业在跑）；
+    - ``200`` 已经生成过、这次没有重新生成：``state=unchanged``；
+    - ``409`` 预算/模型不可用：**不会**静默降级成"生成成功"；
+    - ``422`` 日期不在允许范围（角色本地今天、明天）；
+    - ``429`` 点得太快（``Retry-After``）。
+
+    与 21:00 自动生成**共用**同一条 ``schedule.outline`` 链路：
+    同一天的自动事件正在跑时，这里直接返回那条作业（不重复投）。
+    """
+    from ling.domains.agenda.outline_jobs import (
+        ACTION_REUSE,
+        ACTION_UNCHANGED,
+        MANUAL_OUTLINE_LIMITER,
+        allowed_plan_days,
+        current_plan_day,
+        enqueue_manual_outline,
+        failure_note,
+        job_state,
+        load_job,
+        outline_budget_decision,
+        plan_manual_outline,
+    )
+    from ling.domains.agenda.timeline import resolve_plan_timezone
+
+    owner_subject = await owner_subject_id(session)
+    if not _outline_owner_only(auth, owner_subject):
+        raise LingError(ErrorCode.forbidden, "只有主人可以触发日程生成", status_code=403)
+
+    actor_id = settings.actor_id
+    timezone, timezone_source = await resolve_plan_timezone(session)
+    today = current_plan_day(timezone)
+    first, last = allowed_plan_days(today=today)
+    if not (first <= body.plan_day <= last):
+        raise LingError(
+            ErrorCode.invalid_request,
+            f"只能生成 {first.isoformat()} 或 {last.isoformat()} 的日程",
+            detail=(
+                "计划日按角色本地时区算（当前 "
+                f"{timezone}/{timezone_source}），过去的窗口已经结束，"
+                "更远的日期会自动排。"
+            ),
+            status_code=422,
+        )
+
+    if not MANUAL_OUTLINE_LIMITER.allow(str(auth.user.subject_id)):
+        response.headers["Retry-After"] = str(
+            MANUAL_OUTLINE_LIMITER.retry_after(str(auth.user.subject_id))
+        )
+        raise LingError(ErrorCode.rate_limited, "点得太快了，稍等一下再试", status_code=429)
+
+    plan = await plan_manual_outline(
+        session,
+        actor_id=actor_id,
+        plan_day=body.plan_day,
+        force=body.force,
+        request_id=body.request_id,
+    )
+    logger.debug(
+        "手动生成决策：action=%s planned=%s revision=%s",
+        plan.action,
+        plan.already_planned,
+        plan.plan_revision,
+    )
+    if plan.action in (ACTION_REUSE, ACTION_UNCHANGED) and plan.job_id:
+        job = await load_job(session, job_id=plan.job_id)
+        if job is not None:
+            payload = job.to_payload()
+            payload["enqueued"] = False
+            state = str(payload["state"])
+            if plan.action == ACTION_UNCHANGED:
+                payload["state"] = JOB_UNCHANGED_LOCAL
+                payload["note"] = note_for_unchanged()
+                response.status_code = 200
+            else:
+                response.status_code = 202 if state in {"queued", "running"} else 200
+            return payload
+    if plan.action == ACTION_UNCHANGED:
+        # 已生成过但找不到作业事件（例如计划行是别的途径写的）：照样 200，
+        # 不投递、不增 revision。
+        response.status_code = 200
+        return {
+            "schema_version": "v1",
+            "job_id": None,
+            "plan_day": body.plan_day.isoformat(),
+            "state": JOB_UNCHANGED_LOCAL,
+            "note": note_for_unchanged(),
+            "revision": plan.plan_revision,
+            "plan_state": plan.plan_state,
+            "reason_code": None,
+            "enqueued": False,
+        }
+
+    # 真的需要投递：**先预检预算，再入队**。
+    #
+    # 顺序反过来的话，预算不足时事件已经排进队列，用户看到"排队中"，
+    # 跑完却只是一份规则兜底的 degraded 日程——那是把失败说成了成功。
+    decision = await outline_budget_decision(
+        session,
+        actor_id=actor_id,
+        plan_day=body.plan_day,
+        router=model_router,
+        config_reader=config,
+    )
+    if not decision.allowed:
+        logger.info(
+            "手动生成被预算/模型闸拦下：day=%s reason=%s",
+            body.plan_day,
+            decision.reason_code,
+        )
+        raise LingError(
+            ErrorCode.conflict,
+            failure_note(decision.reason_code),
+            # 原因码只进日志（上面 logger 已经记）；响应里只给人话。
+            detail=f"计划日 {body.plan_day.isoformat()} 的手动生成没有开始。",
+            status_code=409,
+        )
+
+    result = await enqueue_manual_outline(
+        session,
+        actor_id=actor_id,
+        plan_day=body.plan_day,
+        force=body.force,
+        request_id=body.request_id,
+    )
+    await session.commit()
+    response.status_code = 202
+    job = await load_job(session, job_id=result.job_id)
+    if job is not None:
+        payload = job.to_payload()
+        payload["enqueued"] = result.enqueued
+        payload["state"] = job_state(
+            outbox_state="pending" if result.enqueued else "in_flight",
+            plan_state=job.plan_state,
+            plan_revision=job.revision,
+        )
+        payload["note"] = result.note
+        return payload
+    return {
+        "schema_version": "v1",
+        "job_id": result.job_id,
+        "plan_day": body.plan_day.isoformat(),
+        "state": result.state,
+        "note": result.note,
+        "revision": plan.plan_revision,
+        "plan_state": plan.plan_state,
+        "reason_code": None,
+        "enqueued": result.enqueued,
+    }
+
+
+@router.get("/life/outline-jobs/{job_id}")
+async def get_outline_job(
+    job_id: str,
+    auth: CurrentAuth,
+    session: DbSession,
+) -> dict:
+    """按作业 id 查生成进度（owner only）。
+
+    ``state``：``queued`` / ``running`` / ``ready`` / ``degraded`` / ``failed``，
+    外加 ``unchanged``（已生成过、这次没重排）与 ``blocked``（被预算拦下）。
+    前端轮询到终态后重新读一次时间轴即可。`note` 是人话，**不要把
+    `reason_code` 显示给用户**。
+    """
+    from ling.domains.agenda.outline_jobs import load_job
+
+    owner_subject = await owner_subject_id(session)
+    if not _outline_owner_only(auth, owner_subject):
+        raise LingError(
+            ErrorCode.forbidden, "只有主人可以查看日程生成进度", status_code=403
+        )
+    job = await load_job(session, job_id=job_id)
+    if job is None:
+        raise LingError(ErrorCode.not_found, "没有这个生成作业", status_code=404)
+    return job.to_payload()
+
+
 __all__ = [
+    "OutlineJobBody",
     "FACTS_LIMIT",
     "INTENT_HORIZON_DAYS",
     "INTENT_HORIZON_LIMIT",

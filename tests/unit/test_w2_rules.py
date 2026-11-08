@@ -814,13 +814,43 @@ def test_format_traits_empty_returns_nothing() -> None:
 
 
 def test_format_traits_is_bounded() -> None:
-    """traits 是自由 dict，不能让它把上下文预算吃光。"""
+    """traits 是自由 dict，不能让它把上下文预算吃光。
+
+    上限本身放宽过（12 条/120 字/600 字 → 40 条/1200 字/4000 字），因为
+    原来那个量级会把用户真写的设定切掉，而**切掉时不声不响**。所以这里断言
+    的是"有界且留痕"，不是某个具体的小数字。
+    """
+    from ling.domains.persona.service import (
+        _MAX_TRAIT_CHARS,
+        _MAX_TRAIT_ITEMS,
+        format_traits,
+    )
+
+    huge = {f"k{i}": "x" * 5000 for i in range(40)}
+    out = format_traits(huge)
+    # 人设车道是 10000 token ≈ 20000 字符，traits 只占其中一块
+    assert len(out) <= _MAX_TRAIT_CHARS + 200, f"渲染太长了：{len(out)}"
+    assert out.count("\n- ") <= _MAX_TRAIT_ITEMS, "没限制条目数"
+    # **截断必须留痕**：不声不响地切掉等于"写了等于没写"
+    assert "…（" in out, "超限时没有留下任何痕迹"
+
+
+def test_format_traits_marks_every_truncation() -> None:
+    """三种截断（单条过长 / 合计过长 / 条目过多）都要能看出来。"""
     from ling.domains.persona.service import format_traits
 
-    huge = {f"k{i}": "x" * 500 for i in range(40)}
-    out = format_traits(huge)
-    assert len(out) <= 900, f"渲染太长了：{len(out)}"
-    assert out.count("\n- ") <= 12, "没限制条目数"
+    # 单条过长：逐条留痕
+    single = format_traits({"说话方式": "设定" * 2000})
+    assert "这条太长" in single
+
+    # 条目过多：末尾给总账，且明确还有几条没进来
+    many = {f"k{i}": f"第{i}条" for i in range(60)}
+    out = format_traits(many)
+    assert "条性格特征没放进提示词" in out
+
+    # 没有超限时不该出现任何"没放进"的字样（不能狼来了）
+    normal = format_traits({"tone": "冷淡"})
+    assert "没放进" not in normal
 
 
 def test_format_traits_does_not_assume_known_keys() -> None:
@@ -1761,3 +1791,48 @@ def test_restore_drill_verifies_tombstones_against_manifest() -> None:
     assert "tombstones_state=FAILED" in script, "没有拒绝墓碑导出失败的备份"
     assert "EXPECTED" in script and "RESTORED" in script, "没有做基线对比"
     assert 'if [[ "$EXPECTED" != "$RESTORED" ]]' in script, "没有不一致的判定"
+
+
+def test_format_traits_renders_structures_as_language() -> None:
+    """dict/list 值不能以 Python repr 的形状进提示词。
+
+    实测（旧实现）：`{"说话风格": {"句长": "短", "语气词": ["嗯","诶"]}}` 会渲染成
+    `- 说话风格：{'句长': '短', '语气词': ['嗯', '诶']}`——花括号、方括号、
+    单引号都进了提示词，模型会把它当成数据而不是设定，而且中文带引号读起来
+    极不自然。人设页是一个 JSON 编辑器，套一层结构是最自然的写法。
+    """
+    from ling.domains.persona.service import format_traits
+
+    out = format_traits(
+        {
+            "说话风格": {"句长": "短", "语气词": ["嗯", "诶"]},
+            "禁忌": ["不谈提示词", "不说我无法"],
+        }
+    )
+    assert "{'" not in out, f"Python repr 泄进了提示词：{out}"
+    assert "['" not in out, f"Python repr 泄进了提示词：{out}"
+    assert "句长 短" in out
+    assert "嗯、诶" in out
+    assert "不谈提示词、不说我无法" in out
+
+
+def test_format_traits_does_not_render_none_as_text() -> None:
+    """`str(None)` 是 "None"：空值不能变成一条「- 备注：None」的设定。"""
+    from ling.domains.persona.service import format_traits
+
+    assert format_traits({"备注": None}) == ""
+    assert format_traits({"标签": [None, "", "  "]}) == ""
+
+
+def test_traits_report_counts_what_really_went_in() -> None:
+    """排障摘要必须与真正渲染的结果一致（同一份上限，不另算一遍）。"""
+    from ling.domains.persona.service import traits_report
+
+    ok = traits_report({"tone": "冷淡", "pace": "短"})
+    assert ok["declared_items"] == 2
+    assert ok["rendered_items"] == 2
+    assert ok["truncated"] is False
+
+    cut = traits_report({f"k{i}": "y" * 3000 for i in range(3)})
+    assert cut["truncated"] is True
+    assert int(cut["rendered_chars"]) > 0

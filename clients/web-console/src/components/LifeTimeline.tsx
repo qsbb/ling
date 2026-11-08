@@ -19,8 +19,8 @@
  * 状态、梦、意向各有自己的三/四态文案，见下面的映射表——它们之间不能互相
  * 顶替（"读不到"、"没安排"、"还没生成"、"有记录但你看不到"是四件事）。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api } from '../api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api, ApiError } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
   DayIntentSummary,
@@ -28,6 +28,7 @@ import type {
   LifeTimelineFact,
   LifeTimelineOut,
   LifeTimelineSegment,
+  OutlineJobOut,
   TimelineState,
 } from '../types';
 import { AlertIcon, ChevronIcon, RefreshIcon } from './Icons';
@@ -880,34 +881,530 @@ export function LifeTimeline({ timeline, now, defaultCollapsed, onRetry }: LifeT
   );
 }
 
-/* ------------------------------------------------------------ 取数外壳 */
+/* -------------------------------------------------- 手动生成日程（纯函数） */
+
+/** 轮询作业的间隔。1.5 秒：后端一次生成要几秒到十几秒，再密就是打空。 */
+export const OUTLINE_POLL_MS = 1500;
+
+/** 轮询上限 60 秒。超过就**不再说"正在生成"**，改成"稍后刷新看看"——不假装成功。 */
+export const OUTLINE_POLL_MAX_MS = 60_000;
+
+/** 作业的终态：到了就不必再轮询（`blocked` 也终态：它不会自己往下走）。 */
+const OUTLINE_TERMINAL_STATES: ReadonlySet<string> = new Set([
+  'ready',
+  'degraded',
+  'failed',
+  'unchanged',
+  'blocked',
+]);
+
+export function isOutlineTerminal(state: string): boolean {
+  return OUTLINE_TERMINAL_STATES.has(state);
+}
+
+/** 生成成功（拿到一版计划）。`unchanged` 不算：它什么都没做。 */
+export function isOutlineSuccess(state: string): boolean {
+  return state === 'ready' || state === 'degraded';
+}
 
 /**
- * 页面上真正挂的那一块：自己取数、自己重试。
+ * 按钮该显示「生成今天的日程」还是「重新生成」。
+ *
+ * - `ready` / `degraded`：库里有这一天的计划 → 再点就是**重排**（`force:true`，
+ *   会推倒还没开始的段，所以要走二次确认）。
+ * - `empty` / `pending` / `failed`：还没有可用计划 → 普通的「生成」。
+ * - 其余（`unavailable` 等，也就是**读不到**）：不给按钮。读不到不等于没有
+ *   计划，这种情况下点一下可能白花一次生成额度。
+ *
+ * `plan_state=null`（没有计划行）按 `empty` 处理：那正是需要生成的场景。
+ */
+export function scheduleActionFor(
+  planState: string | null | undefined,
+  state: string | null | undefined,
+): 'generate' | 'regenerate' | 'none' {
+  if (state === 'unavailable') return 'none';
+  if (planState === 'ready' || planState === 'degraded') return 'regenerate';
+  if (!planState || planState === 'empty' || planState === 'pending' || planState === 'failed') {
+    return 'generate';
+  }
+  return 'none';
+}
+
+/** 不用 `crypto.randomUUID`：它在非安全上下文里不存在，点了会静默失效。 */
+export function newRequestId(): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `outline-${Date.now().toString(36)}-${random}`;
+}
+
+/**
+ * 提交失败 → 人话。
+ *
+ * 409 用**后端给的 `note`**：人话是后端写的（"今天的生成次数用完了…"），
+ * 前端再抄一份就会两边不一致；拿不到才兜底。`reason_code` 一律不显示。
+ */
+export function submitFailureCopy(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 429) return '点太快了，等几秒再试';
+    if (error.status === 409) return error.message || '现在还不能生成这一天的日程';
+    if (error.status === 422) return '只能生成今天或明天的日程，刷新页面后再试';
+    if (error.status === 404 || error.status === 403) {
+      return '没有权限生成日程；只有主人可以触发生成';
+    }
+  }
+  return explainError(error).reason;
+}
+
+/** 轮询到的作业状态 → 人话。`reason_code` 永远不进这里。 */
+export function jobStateCopy(job: Pick<OutlineJobOut, 'state' | 'note'>): string {
+  switch (job.state) {
+    case 'queued':
+    case 'running':
+      // 提交后**只能说"正在生成"**：202 只代表入队，不代表已经排好。
+      // 后端给了 note 就用它（"已经排上队了，她正在准备"），不自己另写一套。
+      return job.note || '已提交，正在生成…';
+    case 'ready':
+      return job.note || '这一天的日程已经排好了';
+    case 'degraded':
+      return job.note || '模型这次没用上，已按规则铺了睡眠和已确认的安排';
+    case 'failed':
+    case 'blocked':
+      return job.note || '这一天的日程没排出来，可以再试一次';
+    case 'unchanged':
+      return job.note || '今天已经生成过，没有重新生成';
+    default:
+      return job.note || '等待结果…';
+  }
+}
+
+/** 按钮上的字。生成中禁用，所以文案本身就是状态。 */
+export function outlineButtonLabel(action: 'generate' | 'regenerate', busy: boolean): string {
+  if (busy) return '已提交，正在生成…';
+  return action === 'regenerate' ? '重新生成' : '生成今天的日程';
+}
+
+/** 重排的二次确认文案。推倒"还没开始的段"这件事必须写在按钮旁边。 */
+/**
+ * 提交的那一刻到 202 回来之前。
+ *
+ * 文案固定写「已提交，正在生成…」而不分"正在提交/正在生成"两段：中间那几十
+ * 毫秒的差别对用户没有意义，换来的是状态行在两次播报之间跳一下。
+ */
+export const OUTLINE_SUBMITTING_NOTE = '已提交，正在生成…';
+
+export const OUTLINE_FORCE_PROMPT =
+  '重新生成会推倒还没开始的计划段，按现在的情况重排一版。已经过去的和已约好的锚点不会改。';
+
+/** 空闲时的说明：空态/无计划行正是要点的场景，这里不能不说话。 */
+export function outlineIdleHint(action: 'generate' | 'regenerate'): string {
+  return action === 'regenerate'
+    ? '这一天的日程已经生成过；重排会推倒还没开始的计划段，所以需要确认。'
+    : '这一天还没有生成日程。生成只影响计划，不会声称她做过什么。';
+}
+
+/* ------------------------------------------------------ 作业状态机（可测） */
+
+export type OutlineViewPhase =
+  | 'idle'
+  | 'submitting'
+  | 'polling'
+  | 'ready'
+  | 'degraded'
+  | 'unchanged'
+  | 'failed'
+  | 'timeout'
+  | 'error';
+
+export interface OutlineJobView {
+  phase: OutlineViewPhase;
+  /** 人话。**永远不包含 `reason_code`**。 */
+  note: string;
+  jobId: string | null;
+  /** 提交阶段是网络/5xx 失败：可以用同一个 `request_id` 重试。 */
+  retryable?: boolean;
+}
+
+export const OUTLINE_IDLE_VIEW: OutlineJobView = { phase: 'idle', note: '', jobId: null };
+
+/** `POST`/`GET` 的响应 → 界面状态。未知状态一律按失败处理，不猜成功。 */
+export function outlineViewFromJob(job: OutlineJobOut): OutlineJobView {
+  const phase: OutlineViewPhase =
+    job.state === 'queued' || job.state === 'running'
+      ? 'polling'
+      : job.state === 'ready'
+        ? 'ready'
+        : job.state === 'degraded'
+          ? 'degraded'
+          : job.state === 'unchanged'
+            ? 'unchanged'
+            : 'failed';
+  return { phase, note: jobStateCopy(job), jobId: job.job_id };
+}
+
+/** 提交失败 → 界面状态。不显示原因码，只显示人话。 */
+export function outlineViewFromError(error: unknown): OutlineJobView {
+  return {
+    phase: 'error',
+    note: submitFailureCopy(error),
+    jobId: null,
+    // 网络断了/服务端 5xx：这次点击可能根本没落地，值得用同一个 id 再试。
+    retryable: error instanceof ApiError ? error.status === 0 || error.status >= 500 : true,
+  };
+}
+
+/** 轮询到终态（含 unchanged / failed / blocked）。 */
+export function outlineViewTerminal(view: OutlineJobView): boolean {
+  return (
+    view.phase === 'ready' ||
+    view.phase === 'degraded' ||
+    view.phase === 'unchanged' ||
+    view.phase === 'failed'
+  );
+}
+
+export interface OutlineJobApi {
+  createOutlineJob(body: {
+    plan_day: string;
+    force: boolean;
+    request_id: string;
+  }): Promise<OutlineJobOut>;
+  outlineJob(jobId: string): Promise<OutlineJobOut>;
+}
+
+export interface OutlineSchedulerOptions {
+  api: OutlineJobApi;
+  onChange: (view: OutlineJobView) => void;
+  /** 停下来之后（终态或超时）：调用方据此重读时间轴。 */
+  onSettled?: () => void;
+  /** 测试可钉住：默认 1500ms / 60s。 */
+  pollMs?: number;
+  maxMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  makeRequestId?: () => string;
+}
+
+export interface OutlineScheduler {
+  readonly busy: boolean;
+  /** 这次点击的幂等键；提交失败后重试要复用同一个值。 */
+  readonly pendingRequestId: string | null;
+  submit(planDay: string, force: boolean): Promise<OutlineJobView>;
+  /** 用同一个 `request_id` 重发（只有网络/5xx 失败后才需要）。 */
+  retry(): Promise<OutlineJobView | null>;
+}
+
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 一次点击 → 提交 → 轮询到终态的完整流程。
+ *
+ * 两条硬约束：
+ * 1. **同一次点击只发一次**：`inFlight` 期间再点返回同一个 Promise，
+ *    `request_id` 也只有一个（后端据此幂等）。
+ * 2. **超时不假装成功**：60 秒还没到终态就报"还在生成，可以稍后刷新看看"。
+ */
+export function createOutlineScheduler(options: OutlineSchedulerOptions): OutlineScheduler {
+  const pollMs = options.pollMs ?? OUTLINE_POLL_MS;
+  const maxMs = options.maxMs ?? OUTLINE_POLL_MAX_MS;
+  const sleep = options.sleep ?? defaultSleep;
+  const now = options.now ?? (() => Date.now());
+  const makeRequestId = options.makeRequestId ?? newRequestId;
+
+  let inFlight: Promise<OutlineJobView> | null = null;
+  let pending: { requestId: string; planDay: string; force: boolean } | null = null;
+
+  const emit = (view: OutlineJobView): OutlineJobView => {
+    options.onChange(view);
+    return view;
+  };
+
+  const run = async (planDay: string, force: boolean, requestId: string): Promise<OutlineJobView> => {
+    let job: OutlineJobOut;
+    try {
+      job = await options.api.createOutlineJob({ plan_day: planDay, force, request_id: requestId });
+    } catch (error) {
+      const view = emit(outlineViewFromError(error));
+      // 网络/5xx：这次点击还没落地，保留同一个 id 供重试；确定失败就清掉。
+      pending = view.retryable ? { requestId, planDay, force } : null;
+      return view;
+    }
+    // 已经拿到作业（或后端明确说 unchanged）：这次点击的幂等键用完即弃。
+    pending = null;
+    let view = emit(outlineViewFromJob(job));
+
+    if (!isOutlineTerminal(job.state) && job.job_id) {
+      const deadline = now() + maxMs;
+      let pollFailed = false;
+      while (now() < deadline) {
+        await sleep(pollMs);
+        try {
+          const next = await options.api.outlineJob(job.job_id);
+          view = emit(outlineViewFromJob(next));
+          if (isOutlineTerminal(next.state)) break;
+        } catch (error) {
+          // 轮询失败不猜成功：如实报错并停下，让用户自己决定刷新还是重试。
+          // 也不许被下面的"还在生成"覆盖掉——超时是超时，出错是出错。
+          view = emit(outlineViewFromError(error));
+          pollFailed = true;
+          break;
+        }
+      }
+      if (!pollFailed && !outlineViewTerminal(view)) {
+        view = emit({ phase: 'timeout', note: '还在生成，可以稍后刷新看看', jobId: job.job_id });
+      }
+    }
+
+    options.onSettled?.();
+    return view;
+  };
+
+  const start = (planDay: string, force: boolean, requestId: string) => {
+    if (inFlight) return inFlight;
+    inFlight = run(planDay, force, requestId).finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
+
+  return {
+    get busy() {
+      return inFlight !== null;
+    },
+    get pendingRequestId() {
+      return pending?.requestId ?? null;
+    },
+    submit(planDay: string, force: boolean) {
+      // 双重点击：第二次直接复用这一次的 Promise 与 request_id。
+      if (inFlight) return inFlight;
+      const requestId = pending?.requestId ?? makeRequestId();
+      return start(planDay, force, requestId);
+    },
+    retry() {
+      if (!pending) return Promise.resolve(null);
+      return start(pending.planDay, pending.force, pending.requestId);
+    },
+  };
+}
+
+/* ---------------------------------------------------------------- 子组件 */
+
+export interface GenerateScheduleButtonProps {
+  /** 目标计划日（角色计划日），直接取自时间轴——**不按浏览器时区算**。 */
+  planDay: string;
+  action: 'generate' | 'regenerate';
+  /** 已提交、正在生成：按钮禁用并显示状态。 */
+  busy: boolean;
+  /** 状态行文案（人话，来自作业 `note` 或失败翻译）；没有就不渲染那一行。 */
+  status: string | null;
+  /** 状态行是不是失败（决定配色；`aria-live` 两种都播报）。 */
+  statusTone: 'info' | 'error';
+  onGenerate: () => void;
+  /** 重排前的确认文案（内联确认条里那句话）。 */
+  forcePrompt: string;
+}
+
+/**
+ * 「生成今天的日程」/「重新生成」。
+ *
+ * 二次确认**不用** `window.confirm`：它会被浏览器拦、读屏也读不到正文。
+ * 用内联确认条，把"会推倒还没开始的段"这句话直接摆在按钮旁边。
+ */
+export function GenerateScheduleButton({
+  planDay,
+  action,
+  busy,
+  status,
+  statusTone,
+  onGenerate,
+  forcePrompt,
+}: GenerateScheduleButtonProps) {
+  const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => {
+    // 状态一变（比如已经有作业在跑）就收起确认条，避免两次点击叠在一起。
+    if (busy) setConfirming(false);
+  }, [busy]);
+
+  const needsConfirm = action === 'regenerate' && !busy;
+
+  return (
+    <div className="tl-gen" data-testid="tl-generate">
+      <div className="tl-gen__row">
+        <button
+          type="button"
+          className="button button--small tl-gen__button"
+          data-testid="tl-generate-button"
+          data-action={action}
+          data-target-day={planDay}
+          disabled={busy}
+          aria-busy={busy}
+          onClick={() => {
+            if (needsConfirm) {
+              setConfirming(true);
+              return;
+            }
+            onGenerate();
+          }}
+        >
+          {busy ? <span className="spinner" aria-hidden="true" /> : <RefreshIcon />}
+          {outlineButtonLabel(action, busy)}
+        </button>
+        <span className="tl-gen__day" data-testid="tl-generate-day">
+          {action === 'regenerate' ? '按现在的情况重排' : '目标日（她的计划日）'}：
+          <strong>{planDay}</strong>
+        </span>
+      </div>
+
+      {confirming && !busy ? (
+        <div className="tl-gen__confirm" data-testid="tl-generate-confirm" role="group" aria-label="确认重新生成">
+          <p className="tl-gen__confirm-text">{forcePrompt}</p>
+          <div className="tl-gen__confirm-actions">
+            <button
+              type="button"
+              className="button button--small"
+              data-testid="tl-generate-cancel"
+              onClick={() => setConfirming(false)}
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              className="button button--small button--primary"
+              data-testid="tl-generate-confirm-ok"
+              onClick={() => {
+                setConfirming(false);
+                onGenerate();
+              }}
+            >
+              确认重新生成
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {/* 播报用 polite：生成进度不该打断读屏正在读的内容；没有话就不占位。 */}
+      {status ? (
+        <p
+          className={`tl-gen__status tl-gen__status--${statusTone}`}
+          data-testid="tl-generate-status"
+          data-tone={statusTone}
+          role="status"
+          aria-live="polite"
+        >
+          {status}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ 取数外壳 */
+
+/** 取数外壳依赖的接口（测试可换成假实现；生产就是 `api`）。 */
+export interface TimelinePanelApi extends OutlineJobApi {
+  lifeTimeline(): Promise<LifeTimelineOut>;
+}
+
+export interface LifeTimelinePanelProps {
+  title?: string;
+  /** 默认走真实 `api`；测试注入假实现。 */
+  client?: TimelinePanelApi;
+  /** 轮询参数留给测试钉住时间（生产用默认 1.5s / 60s）。 */
+  pollMs?: number;
+  maxMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  makeRequestId?: () => string;
+}
+
+/**
+ * 页面上真正挂的那一块：自己取数、自己重试、自己管「生成今天的日程」。
  *
  * 单独取数（不塞进 `LifeNowPage` 那个 `Promise.all`）是为了让这一块失败时
  * 只坏这一块——原来的三块状态照常显示，反之亦然。
+ *
+ * 生成按钮也放在这里：它要用的是**时间轴的 `plan_day`**（角色计划日），
+ * 只有这一块手里有那个值。按浏览器时区算"今天"在跨日附近会落到另一个
+ * 日期，后端直接 422。
  */
-export function LifeTimelinePanel({ title = '今天的时间轴' }: { title?: string }) {
+export function LifeTimelinePanel({
+  title = '今天的时间轴',
+  client = api,
+  pollMs,
+  maxMs,
+  sleep,
+  makeRequestId,
+}: LifeTimelinePanelProps) {
   const [timeline, setTimeline] = useState<LifeTimelineOut | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ExplainedError | null>(null);
+  const [view, setView] = useState<OutlineJobView>(OUTLINE_IDLE_VIEW);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setTimeline(await api.lifeTimeline());
+      setTimeline(await client.lifeTimeline());
     } catch (cause) {
       setError(explainError(cause));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [client]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 调度器跟着这一块的生命周期走：卸载后不再往已消失的组件里写状态。
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const loadRef = useRef(load);
+  loadRef.current = load;
+
+  const scheduler = useMemo(
+    () =>
+      createOutlineScheduler({
+        api: client,
+        onChange: (next) => {
+          if (mounted.current) setView(next);
+        },
+        onSettled: () => {
+          // 终态后重读时间轴：计划变了，段、版本号、状态都要跟着变。
+          // 卸载后不再取数：轮询可能比组件活得久（最长 60 秒）。
+          if (mounted.current) void loadRef.current();
+        },
+        ...(pollMs === undefined ? {} : { pollMs }),
+        ...(maxMs === undefined ? {} : { maxMs }),
+        ...(sleep === undefined ? {} : { sleep }),
+        ...(makeRequestId === undefined ? {} : { makeRequestId }),
+      }),
+    [client, pollMs, maxMs, sleep, makeRequestId],
+  );
+
+  const action = scheduleActionFor(timeline?.plan_state, timeline?.state);
+  const idleHint =
+    action === 'none'
+      ? '这一次读不到时间轴，暂时不能生成；读取成功后再试。'
+      : outlineIdleHint(action);
+  const busy = timeline !== null && (view.phase === 'submitting' || view.phase === 'polling');
+
+  const start = (force: boolean) => {
+    if (!timeline) return;
+    setView({ phase: 'submitting', note: OUTLINE_SUBMITTING_NOTE, jobId: null });
+    void scheduler.submit(timeline.plan_day, force);
+  };
+
+  // 状态行只报**这次点击**的进展；空闲时说明按钮是干什么的（空态正是要点的场景）。
+  const status = view.phase === 'idle' ? idleHint : view.note;
+  const statusTone: 'info' | 'error' =
+    view.phase === 'error' || view.phase === 'failed' || view.phase === 'timeout'
+      ? 'error'
+      : 'info';
 
   return (
     <div className="tl-panel" data-testid="life-timeline-panel">
@@ -925,6 +1422,23 @@ export function LifeTimelinePanel({ title = '今天的时间轴' }: { title?: st
           </button>
         </div>
       ) : null}
+
+      {/*
+        按钮挂在**读到的计划状态**上：空态/无计划行正是要点它的场景，
+        所以拿到时间轴就渲染，不等段列表非空。
+      */}
+      {timeline && action !== 'none' ? (
+        <GenerateScheduleButton
+          planDay={timeline.plan_day}
+          action={action}
+          busy={busy}
+          status={status}
+          statusTone={statusTone}
+          forcePrompt={OUTLINE_FORCE_PROMPT}
+          onGenerate={() => start(action === 'regenerate')}
+        />
+      ) : null}
+
       {timeline ? (
         <LifeTimeline timeline={timeline} onRetry={() => void load()} />
       ) : null}

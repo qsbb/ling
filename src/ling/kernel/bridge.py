@@ -482,7 +482,7 @@ class InboundBridge:
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )
-            await conversation.add_message(
+            pending_row = await conversation.add_message(
                 window.id,
                 role="user",
                 text=text,
@@ -490,6 +490,9 @@ class InboundBridge:
                 # 群窗口是多个人的：不记谁说的，之后就没法回指"你刚问的"
                 sender_subject_id=subject_id,
             )
+            # 这条消息**落库了**，所以也要记平台 id：撤回时靠它才能找到本地那行。
+            # 只在她回复的路径上记是不够的——群里被撤回的多半是她还没接话的那些。
+            await self._remember_platform_message_id(pending_row.message_id, envelope)
             await GroupAttentionScheduler(
                 self._session, actor_id=self._actor_id
             ).await_supplement(window.id)
@@ -548,13 +551,15 @@ class InboundBridge:
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )
-            await conversation.add_message(
+            observed_row = await conversation.add_message(
                 window.id,
                 role="user",
                 text=text,
                 attention_state="unseen",
                 sender_subject_id=subject_id,
             )
+            # 同上：这条也可能被撤回。映射不属于"回复"，属于"消息存在过"。
+            await self._remember_platform_message_id(observed_row.message_id, envelope)
             await self._session.commit()
             # ``reason`` 只写**理由**，不写动作。
             #
@@ -601,6 +606,7 @@ class InboundBridge:
                 # 走到这里说明已经进过决策，属于"看见但不回"
                 attention_state="seen",
             )
+            await self._remember_platform_message_id(msg.message_id, envelope)
             await self._record_followup(
                 decision, subject_id=subject_id, window_id=window.id, message_id=msg.message_id
             )

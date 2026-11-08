@@ -25,12 +25,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # 证据种类的判定放在跨域共享的纯规则模块（`domains/evidence.py`，不是某个域）：
 # presence 只读它，不复制"什么算事实"的第二套判据。
 from ling.domains.evidence import FACT_KINDS, EvidenceKind
+from ling.domains.fallback import DependencyState, DependencyValue, ResolvedInput
 from ling.infra.models import PresenceState, SceneCommitRow, utcnow
 from ling.ports.config import LifePolicy
 
 # 场景状态。``unknown`` 是**合法且常用**的答案：
 # 没有证据时就说不知道，不硬编一个"我在看书"。
 SCENE_STATES = ("chat", "focus", "rest", "errand", "unknown")
+
+# 回退契约里"上游"的名字（行为日志与响应标记都用它）。
+SCENE_UPSTREAM = "scene"
+
+# 场景不可用（过期 / 未知 / 从没提交过）时的**领域默认**：不冒充任何场景。
+#
+# 为什么默认是 ``unknown`` 而不是 "rest"/"chat"：设计 §4 明令"不把 unknown
+# 改写为 idle/rest"。她只是**不知道**自己在做什么，不是"在休息"：
+# 写成一个具体状态会让表达层说出"我在歇着"这种没有证据的话。
+SCENE_DEFAULT_STATE = "unknown"
+SCENE_DEFAULT_REASON = "场景不明（没有有效场景 / 已过期），按未知处理，不冒充她在做什么"
 
 # 场景默认有效期。太短会让"刚才在干什么"反复变成 unknown；
 # 太长会让旧场景残留。15 分钟是一个普通"手头这件事"的量级。
@@ -138,6 +150,32 @@ class SceneView:
     origin: str
     committed_at: datetime | None
     expired: bool
+
+    def dependency(self) -> DependencyValue[SceneView]:
+        """投影成回退契约要的上游状态。
+
+        - 有有效场景（未过期、不是 unknown）→ ``ready``；
+        - 过期 → ``empty``（**不**是"她还在做"，也不是故障）；
+        - 记录本身缺失 → ``empty``；
+        - ``unknown`` → ``unknown``。
+
+        这三种不可用状态**都不带值**：读侧拿不到任何可断言的场景，
+        只能走领域默认（「不知道」/不注入提示词），见 `scene_default`。
+        """
+        state = str(self.state)
+        if self.expired:
+            return DependencyValue(
+                state=DependencyState.empty,
+                upstream=SCENE_UPSTREAM,
+                reason="场景已过期",
+            )
+        if state == "unknown" or not state:
+            return DependencyValue(
+                state=DependencyState.unknown,
+                upstream=SCENE_UPSTREAM,
+                reason="场景未知",
+            )
+        return DependencyValue(state=DependencyState.ready, upstream=SCENE_UPSTREAM, value=self)
 
     def describe(self) -> str:
         """只在有真实状态时给出一句；unknown/过期返回空字符串。
@@ -441,6 +479,36 @@ class PresenceService:
         )
 
 
+    def resolve_scene(
+        self, view: SceneView
+    ) -> tuple[SceneView, ResolvedInput[SceneView]]:
+        """场景不可用（过期 / 未知）时回退到**领域默认**，而不是让调用点各自判断。
+
+        回退值的来源是 `SCENE_DEFAULT_STATE`（`unknown`），**不是**旧场景：
+        过期场景塞回去就是"我还在读书"说三天，那是本项目明令禁止的事实伪造。
+
+        ``ResolvedInput.value`` 在回退时是一个**合成**的 `SceneView`：
+        `state=unknown`、`origin=unknown`、`expired=True`。调用方拿它渲染
+        「不知道」即可，也不该把它写回 `scene_commits`（本方法只读不写）。
+        """
+        from ling.domains.fallback import log_fallback, resolve_input
+
+        dependency = view.dependency()
+        default = SceneView(
+            state=SCENE_DEFAULT_STATE,
+            activity_id=None,
+            place_id=None,
+            origin="unknown",
+            committed_at=None,
+            expired=True,
+        )
+        resolved = resolve_input(
+            dependency, default=default, default_reason=SCENE_DEFAULT_REASON
+        )
+        log_fallback(resolved, consumer="presence.scene")
+        return resolved.value, resolved
+
+
 __all__ = [
     "DEFAULT_SCENE_TTL",
     "MEAL_KINDS",
@@ -452,7 +520,10 @@ __all__ = [
     "SCENE_REFRESH_REASON_RUNNING",
     "SCENE_REFRESH_REASON_SEGMENT",
     "SCENE_REFRESH_REASON_SLEEP",
+    "SCENE_DEFAULT_REASON",
+    "SCENE_DEFAULT_STATE",
     "SCENE_STATES",
+    "SCENE_UPSTREAM",
     "PresenceService",
     "PresenceView",
     "SatietyUpdate",

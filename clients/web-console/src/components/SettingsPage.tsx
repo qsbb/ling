@@ -12,7 +12,7 @@
  * 先学会控制面的术语。
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import { formatSessionTime } from '../format';
@@ -77,6 +77,12 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<ExplainedError | null>(null);
   const [saving, setSaving] = useState(false);
+  /*
+   * `saving` 是**渲染状态**：同一个事件里连点两次「保存」，两次回调读到的
+   * `saving` 都还是 false，于是发两份 draft+publish（实测点两次 = 发布两次）。
+   * 所以再加一个同步 ref 当闸门——它在第一次点击时立刻置位，不经过 re-render。
+   */
+  const savingRef = useRef(false);
   const [message, setMessage] = useState<PanelMessage | null>(null);
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -333,6 +339,9 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
 
   const save = async () => {
     if (!config) return;
+    // 同一个 tick 内的重复点击也挡住（见 `savingRef` 的注释）。
+    if (savingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     setMessage(null);
     try {
@@ -370,6 +379,7 @@ export function SettingsPage({ onBack, onTestMode }: SettingsPageProps) {
         detail: explained.detail ?? explained.hint,
       });
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };

@@ -23,6 +23,15 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.fallback import (
+    DependencyState,
+    DependencyValue,
+    ResolvedInput,
+    is_usable,
+    log_fallback,
+    resolve_input,
+    state_from_timeline,
+)
 from ling.infra.models import utcnow
 
 DEFAULT_IDLE_MINUTES = 10
@@ -35,6 +44,109 @@ DEFAULT_IDLE_MINUTES = 10
 
 IDLE = "idle"
 WATCHING = "watching"
+# 正在做的活动类别 → 多久看一次手机。日程给不出"现在在做什么"时用
+# `DEFAULT_IDLE_MINUTES`；给了就按这条映射调整（"在忙就拉长"）。
+ACTIVITY_INTERVAL_MINUTES: dict[str, int] = {
+    "sleep": 0,  # 睡着不排下一次（醒来再说）
+    "work": 45,
+    "focus": 45,
+    "study": 45,
+    "meal": 30,
+    "leisure": 15,
+    "errand": 20,
+    "chat": 5,
+}
+UPSTREAM_SCHEDULE = "schedule"
+
+
+@dataclass(frozen=True)
+class ScheduleNow:
+    """从日程读到的"此刻在做什么"——**只是计划**，不是事实。
+
+    `kind` 是她计划里的活动类别（meal/work/...），`ends_at` 是这一段计划的
+    结束时刻。两者都只用来决定"多久看一次手机"这类**行为参数**；
+    任何要断言"她正在做 X"的地方都不该用这里的数据（那是 presence 的事）。
+    """
+
+    kind: str
+    title: str
+    ends_at: datetime | None
+
+
+def schedule_dependency(
+    view: object, *, now: datetime, upstream: str = UPSTREAM_SCHEDULE
+) -> DependencyValue[ScheduleNow]:
+    """把 `ActorDayView`（`api.routes.life_timeline.load_actor_day` 的返回值）
+    折成回退契约要的 `DependencyValue`。
+
+    为什么在这里而不是在 API 里：判定"什么算可用"必须只有一份
+    （`domains/fallback.py`），否则每个调用点都会各自解释一遍 `TimelineState`。
+    """
+    state = state_from_timeline(getattr(view, "state", None))
+    segments = tuple(getattr(view, "segments", ()) or ())
+    if state not in {DependencyState.ready, DependencyState.degraded}:
+        # 空/待生成/失败/读不到：**不拿段凑**——那些段可能属于别的计划日。
+        return DependencyValue(state=state, upstream=upstream)
+    moment = now
+    current = None
+    for seg in segments:
+        start = getattr(seg, "start_at", None)
+        end = getattr(seg, "end_at", None)
+        if start is None or end is None:
+            continue
+        if start <= moment < end:
+            current = seg
+            break
+    if current is None:
+        # 计划是 ready 的，但此刻没有段覆盖——这是"没安排"，不是读不到。
+        return DependencyValue(state=state, upstream=upstream)
+    return DependencyValue(
+        state=state,
+        upstream=upstream,
+        value=ScheduleNow(
+            kind=str(getattr(current, "kind", "") or ""),
+            title=str(getattr(current, "title", "") or ""),
+            ends_at=getattr(current, "end_at", None),
+        ),
+    )
+
+
+def _default_reason(state: DependencyState) -> str:
+    """回退时给用户看的一句话：**说清上游当时是什么状态**。
+
+    一眼能看懂的四类：还没生成 / 没生成出来 / 读不到 / 规则兜底。
+    不写内部错误码（那是日志与测试用的）。
+    """
+    return {
+        DependencyState.empty: f"今天还没有日程，先按默认每 {DEFAULT_IDLE_MINUTES} 分钟看一次手机",
+        DependencyState.pending: f"今天的日程还没生成，先按默认每 {DEFAULT_IDLE_MINUTES} 分钟看一次手机",
+        DependencyState.failed: f"今天的日程没生成成功，先按默认每 {DEFAULT_IDLE_MINUTES} 分钟看一次手机",
+        DependencyState.unavailable: f"日程暂时读不到，先按默认每 {DEFAULT_IDLE_MINUTES} 分钟看一次手机",
+        DependencyState.degraded: (
+            "日程是规则兜底出来的，只当计划参考，先按默认节奏看手机"
+        ),
+        DependencyState.unknown: "日程状态不明，先按默认节奏看手机",
+        DependencyState.ready: f"日程里没有此刻的安排，先按默认每 {DEFAULT_IDLE_MINUTES} 分钟看一次手机",
+    }[state]
+
+
+@dataclass(frozen=True)
+class PhoneInterval:
+    """一次"下次多久看手机"的结论：分钟数 + 它从哪来。
+
+    ``minutes == 0`` 的语义是**不排下一次**（睡着），与 `stop_watching`
+    里 ``next_in_minutes=0`` 一致。
+    """
+
+    minutes: int
+    resolved: ResolvedInput[int]
+
+    @property
+    def used_default(self) -> bool:
+        return self.resolved.used_default
+
+    def notice(self) -> dict[str, object]:
+        return self.resolved.notice()
 
 
 @dataclass(frozen=True)
@@ -158,5 +270,89 @@ class PhoneService:
             await self._session.flush()
         return self._view(row)
 
+    # ------------------------------------------------------------ 上游回退
+    #
+    # 「多久看一次手机」本来该看日程（在忙拉长、睡着不排），但日程是**上游**：
+    # 它可能还没生成（21:00 才到期）、生成失败、或者干脆读不到。这三种情况下
+    # 用本领域自己的 `DEFAULT_IDLE_MINUTES` 跑这一次，并说清楚"这是默认值"。
+    #
+    # **不缓存上游结果**：上游恢复后下一次调用直接读新的；也不把默认值写进
+    # 任何事实表——这里只算一个分钟数，`_apply_interval` 之外不碰数据库。
 
-__all__ = ["DEFAULT_IDLE_MINUTES", "IDLE", "WATCHING", "PhoneService", "PhoneView"]
+    def interval_from_schedule(
+        self, dependency: DependencyValue[ScheduleNow]
+    ) -> PhoneInterval:
+        """按日程决定"下次多久看"；日程不可用就用自己的默认值。
+
+        纯函数：不读库、不写库、不记日志（日志由 `schedule_next_from_upstream`
+        在真正应用时记一次，避免同一个决定记两遍）。
+        """
+        default_minutes = DEFAULT_IDLE_MINUTES
+        # **degraded 可以用在这里**：规则兜底的日程仍然是"她大概要做什么"，
+        # 拿它调"多久看一次手机"这种**行为参数**是安全的。但它绝不能拿来
+        # 断言"她正在做 X"——那条线在 `domains/presence`（事实层）里是严格禁止的。
+        # 这就是 `allow_degraded` 只出现在本函数的原因。
+        if is_usable(dependency.state, allow_degraded=True) and dependency.value is not None:
+            kind = dependency.value.kind
+            if kind in ACTIVITY_INTERVAL_MINUTES:
+                minutes = ACTIVITY_INTERVAL_MINUTES[kind]
+                resolved: ResolvedInput[int] = resolve_input(
+                    DependencyValue(
+                        state=dependency.state,
+                        upstream=dependency.upstream,
+                        value=minutes,
+                    ),
+                    default=default_minutes,
+                    default_reason=_default_reason(dependency.state),
+                    # 与上面的判断同一口径：degraded 允许当**计划参考**。
+                    # 漏传这个参数会让上面刚判定"可用"的值又被判成不可用。
+                    allow_degraded=True,
+                )
+                return PhoneInterval(minutes=resolved.value, resolved=resolved)
+            # 可用但不是我们认识的类别：**不猜**，按默认节奏，但标明是默认。
+            resolved = resolve_input(
+                DependencyValue(state=dependency.state, upstream=dependency.upstream),
+                default=default_minutes,
+                default_reason=(
+                    f"日程里此刻的活动类别「{kind or '空'}」没有对应的看手机节奏，"
+                    f"按默认每 {default_minutes} 分钟一次"
+                ),
+            )
+            return PhoneInterval(minutes=resolved.value, resolved=resolved)
+        # 走「不可用」这条：把上游值摘掉，只保留它的状态（值绝不能顶上去）。
+        resolved = resolve_input(
+            DependencyValue(state=dependency.state, upstream=dependency.upstream),
+            default=default_minutes,
+            default_reason=_default_reason(dependency.state),
+        )
+        return PhoneInterval(minutes=resolved.value, resolved=resolved)
+
+    async def schedule_next_from_upstream(
+        self,
+        dependency: DependencyValue[ScheduleNow],
+        *,
+        now: datetime | None = None,
+    ) -> tuple[PhoneView, PhoneInterval]:
+        """读上游算出的节奏 → 应用到"下次什么时候看"，并记录是否回退。
+
+        回退时记一条**人话**行为日志（`upstream_fallback`，INFO 级）：
+        上游为空是正常状态，不该打成告警。
+        """
+        interval = self.interval_from_schedule(dependency)
+        log_fallback(interval.resolved, consumer="phone.next_look")
+        view = await self.schedule_next(minutes=interval.minutes, now=now)
+        return view, interval
+
+
+__all__ = [
+    "ACTIVITY_INTERVAL_MINUTES",
+    "DEFAULT_IDLE_MINUTES",
+    "IDLE",
+    "UPSTREAM_SCHEDULE",
+    "WATCHING",
+    "PhoneInterval",
+    "PhoneService",
+    "PhoneView",
+    "ScheduleNow",
+    "schedule_dependency",
+]

@@ -80,6 +80,11 @@
       "title": "Supports Proactive",
       "type": "boolean"
     },
+    "supports_recall": {
+      "default": false,
+      "title": "Supports Recall",
+      "type": "boolean"
+    },
     "version": {
       "title": "Version",
       "type": "string"

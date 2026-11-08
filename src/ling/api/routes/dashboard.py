@@ -56,16 +56,27 @@ from ling.api.routes.life_timeline import (
     viewer_is_owner,
     visible_to,
 )
-from ling.contracts.v1 import IntentTeaserOut, TimelineState, TodayOutlineOut
+from ling.contracts.v1 import (
+    FallbackNotice,
+    IntentTeaserOut,
+    TimelineState,
+    TodayOutlineOut,
+)
 from ling.domains.activity.service import ActivityService
 from ling.domains.affect.service import AffectService
 from ling.domains.agenda.intents import IntentService
 from ling.domains.agenda.service import AgendaService, local_today
 from ling.domains.agenda.timeline import display_day_for, plan_day_for
+from ling.domains.fallback import (
+    UPSTREAM_READ_BUDGET_SECONDS,
+    DependencyState,
+    DependencyValue,
+    read_within_budget,
+)
 from ling.domains.goals.service import GoalsService
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
-from ling.domains.phone.service import PhoneService
+from ling.domains.phone.service import PhoneService, ScheduleNow, schedule_dependency
 from ling.domains.presence.service import PresenceService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
@@ -74,6 +85,10 @@ from ling.settings.user_preferences import owner_subject_id
 logger = logging.getLogger("ling.api.dashboard")
 
 router = APIRouter(tags=["dashboard"])
+
+# 首屏读日程的预算。单独命名是为了**可测**（测试把它调小来验证超时回退），
+# 也为了让"首屏最多等多久"这件事有一个能 grep 到的常量。
+SCHEDULE_READ_BUDGET_SECONDS = UPSTREAM_READ_BUDGET_SECONDS
 
 # 首屏只需要摘要，不需要整页数据
 MEMORY_LIMIT = 3
@@ -88,6 +103,40 @@ def _section(status: str, data: Any = None) -> dict:
         "as_of": datetime.now(UTC).isoformat(),
         "data": data,
     }
+
+
+async def _schedule_dependency(
+    session: Any, *, actor_id: str, settings: Any
+) -> DependencyValue[ScheduleNow]:
+    """在**有界预算**内读一次日程，折成回退契约的输入。
+
+    为什么要有界：这一段挂在首屏（以及"下次什么时候看手机"）。日程可能因为
+    生成/查询变慢，而"她什么时候看手机"是轻量信息——不能因为上游慢就整页
+    卡住。超时按 `unavailable` 回退到本域默认值（见 `domains/fallback.py`）。
+    """
+    moment = datetime.now(UTC)
+    actor_timezone, _source = await resolve_actor_timezone(
+        session, env=getattr(settings, "user_timezone", None)
+    )
+
+    async def _read() -> object:
+        return await load_actor_day(
+            session, actor_id=actor_id, now=moment, actor_timezone=actor_timezone
+        )
+
+    read = await read_within_budget(
+        _read(), upstream="schedule", budget=SCHEDULE_READ_BUDGET_SECONDS
+    )
+    if read.state is not DependencyState.ready:
+        return DependencyValue(
+            state=read.state, upstream="schedule", reason=read.reason
+        )
+    return schedule_dependency(read.value, now=moment)
+
+
+def _fallback_payload(notice: dict[str, object]) -> dict[str, object]:
+    """用契约模型把标记定型（形状只有一份，测试也照着它断言）。"""
+    return FallbackNotice.model_validate(notice).model_dump(mode="json")
 
 
 async def _guard(name: str, coro: Any, session: Any) -> dict:
@@ -252,12 +301,23 @@ async def get_dashboard(
         """
         service = PresenceService(session, actor_id=actor_id)
         view = await service.view()
+        # 场景（她此刻在做什么）是有有效期的：过期就是**不知道**，不是"还在做"。
+        # 这里用 presence 域的默认回退（`unknown`），并把"这次是不是回退"标出来，
+        # 免得前端把 unknown 读成"她闲着"。见 `domains/fallback.py`。
+        scene, scene_input = service.resolve_scene(await service.scene())
         return _section(
             SECTION_OK,
             {
                 "availability": view.availability,
                 "energy": view.energy,
                 "social_load": view.social_load,
+                "scene": {
+                    "state": scene.state,
+                    "expired": scene.expired,
+                    # 只给状态，不给自由文本：scene 的 activity/place 属于事实层，
+                    # 首屏不需要，也不该在这里被读成"她正在做 X"。
+                },
+                "fallback": _fallback_payload(scene_input.notice()),
                 # `describe()` 是给表达层的一句话：正常时它**故意返回空串**
                 # （正常不需要额外约束）。首屏上留白会让人以为没读到，
                 # 所以这里补一句人话，但实质仍是那个唯一结论。
@@ -512,17 +572,39 @@ async def get_dashboard(
         读取出错由 `_guard` 标成 unavailable。两者在界面上长得不一样。
         """
         view = await PhoneService(session, actor_id=actor_id).current()
+        # 「下次什么时候看手机」由日程决定（在忙拉长、睡着不排）。日程是**上游**：
+        # 还没生成 / 生成失败 / 读不到时，用本域自己的默认节奏跑这一次，
+        # 并在 `fallback` 里说清"这次用了默认值，因为……"。见 `domains/fallback.py`。
+        interval = PhoneService(
+            session, actor_id=actor_id
+        ).interval_from_schedule(
+            await _schedule_dependency(session, actor_id=actor_id, settings=settings)
+        )
+        fallback = _fallback_payload(interval.notice())
         never_looked = (
             view.last_looked_at is None
             and view.next_look_at is None
             and view.watching_since is None
         )
         if never_looked:
-            return _section(SECTION_EMPTY)
+            # 从没看过手机是**事实**（empty），但"下次该隔多久"是**参数**：
+            # 它照样有值（默认节奏或日程给的），不该跟着状态一起消失——
+            # 否则用户在最常见的空态里反而看不到回退说明。
+            # **不放 `state`**：从没看过就是"没有状态"，编一个 idle 会把
+            # "她没拿过手机"说成"她此刻闲置"。只放参数与它的来源。
+            data: dict[str, object] = {
+                "next_look_interval_minutes": interval.minutes,
+                "fallback": fallback,
+            }
+            return _section(SECTION_EMPTY, data)
         return _section(
             SECTION_OK,
             {
                 "state": view.state,
+                # 上游给出的节奏（或本域默认值）与它的来源。**这是参数，不是事实**：
+                # 它只说"她大概多久看一眼手机"，不说她此刻在做什么。
+                "next_look_interval_minutes": interval.minutes,
+                "fallback": fallback,
                 "watching_app": view.watching_app,
                 "watching_since": (
                     view.watching_since.isoformat() if view.watching_since else None

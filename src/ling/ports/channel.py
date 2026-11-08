@@ -21,6 +21,8 @@ from ling.contracts.v1 import (
     DeliveryReceipt,
     InteractionEnvelope,
     Modality,
+    RecallEvent,
+    RecallReceipt,
 )
 
 
@@ -129,6 +131,23 @@ class ReceiptQuery:
     sent_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class RecallRequest:
+    """一次**主动撤回**的请求（撤回我们自己发出去的那条）。
+
+    ``platform_message_id`` 是**唯一**判据：只有当初发送时拿到的真实回执 id
+    才能指向"平台上那一条"。**不接受**用正文、时间或本地 message_id 去猜——
+    猜错就是撤掉别人的消息，那是不可撤销的破坏。
+
+    ``window_ref`` 与 ``is_group`` 只给实现方拼平台参数用（部分实现要求
+    群号），**不参与"能不能撤"的判定**。
+    """
+
+    platform_message_id: str
+    window_ref: str = ""
+    is_group: bool = False
+
+
 @runtime_checkable
 class ChannelConnector(Protocol):
     connector_id: str
@@ -138,8 +157,15 @@ class ChannelConnector(Protocol):
         """签名与重放窗口校验。任何失败都必须返回 False，不做"宽松通过"。"""
         ...
 
-    def normalize_inbound(self, payload: dict) -> InteractionEnvelope:
-        """把平台 payload 翻译成统一信封；不得在这里解析身份。"""
+    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent:
+        """把平台 payload 翻译成统一信封；不得在这里解析身份。
+
+        **除了信封，还可能返回 :class:`RecallEvent`**（对方撤回了某条消息）。
+        撤回不是一条消息：没有正文、不该触发回复、不该产生 ``messages`` 行，
+        所以它有自己的类型，由 ``inbound_intake`` 用 ``isinstance`` 分流。
+        把撤回硬塞进信封只有两种写法（造一条空发言 / 给信封加"这不是消息"的
+        开关），两种都是在伪造输入。
+        """
         ...
 
     async def fetch_media(self, media_ref: str) -> tuple[bytes, str]:
@@ -158,6 +184,23 @@ class ChannelConnector(Protocol):
         """对账：查询平台侧真实投递状态。"""
         ...
 
+    async def recall(self, request: RecallRequest) -> RecallReceipt:
+        """**主动撤回**我们自己发出去的一条消息（可选能力）。
+
+        什么时候会被调用：用户在界面上对**她自己的**一条消息点"撤回"。
+        实现方必须：
+
+        - 只用 ``platform_message_id`` 定位，**不许**按内容/时间猜；
+        - 拿不到确认就返回 ``uncertain``（**不许**返回 ``recalled``）；
+        - 平台明确不支持时返回 ``unsupported``（**不许**假装成功）；
+        - 时间窗/权限由上层先判（见 `domains/conversation/recall.py`），
+          实现方仍然可以在平台报错时如实映射。
+
+        ``supports_recall=False`` 的渠道不实现这个方法也行——上层会先看
+        ``capabilities().supports_recall``，不会调用它。
+        """
+        ...
+
     def capabilities(self) -> CapabilityDescriptor:
         ...
 
@@ -170,6 +213,7 @@ __all__ = [
     "ChannelError",
     "ChannelErrorKind",
     "OutboundMessage",
+    "RecallRequest",
     "ReceiptQuery",
     "delivery_text_digest",
     "normalize_delivery_text",

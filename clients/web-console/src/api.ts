@@ -37,7 +37,9 @@ import type {
   ProactiveResponse,
   TimelineResponse,
   LifeTimelineOut,
+  OutlineJobOut,
   SubjectsResponse,
+  SubjectsQuery,
   MergeResult,
   UnmergeResult,
   UserInfo,
@@ -405,6 +407,26 @@ export const api = {
     const query = date ? `?date=${encodeURIComponent(date)}` : '';
     return request<LifeTimelineOut>(`/v1/life/timeline${query}`);
   },
+  /**
+   * 手动生成某一天的日程（owner only，`POST /v1/life/outline-jobs`）。
+   *
+   * **`plan_day` 必须来自时间轴的 `plan_day`**：那是角色计划日。按浏览器
+   * 时区算"今天"在跨日附近会落到另一个日期，后端只会回 422。
+   *
+   * 202 = 已入队（不是已生成）：拿 `job_id` 去轮询；200 = 已经生成过、
+   * 这次什么都没做（`state=unchanged`）。失败码由调用方翻译成人话。
+   */
+  createOutlineJob(body: {
+    plan_day: string;
+    force: boolean;
+    request_id: string;
+  }): Promise<OutlineJobOut> {
+    return request<OutlineJobOut>('/v1/life/outline-jobs', jsonInit('POST', body));
+  },
+  /** 按作业 id 读生成进度（终态后调用方重读时间轴）。 */
+  outlineJob(jobId: string): Promise<OutlineJobOut> {
+    return request<OutlineJobOut>(`/v1/life/outline-jobs/${encodeURIComponent(jobId)}`);
+  },
 
   /* ------------------------------------------------ 设置分类法与授权 */
   /** 分类法是导航的唯一来源；前端不自己抄类名。 */
@@ -452,8 +474,21 @@ export const api = {
   },
 
   /* ------------------------------------------------------------ 多用户与账号 */
-  subjects(): Promise<SubjectsResponse> {
-    return request<SubjectsResponse>('/v1/accounts/subjects');
+  /**
+   * 一页关系（默认 50 条）。**必须看 `has_more`**：这个列表天然无界
+   * （群里见到的每个人都有一行），一次全取会让页面卡死。
+   *
+   * `q` 由**服务端**筛选（昵称 / subject_id / 账号外部 id）；前端不做本地过滤，
+   * 否则"只搜当前页"会骗人。
+   */
+  subjects(query: SubjectsQuery = {}): Promise<SubjectsResponse> {
+    const params = new URLSearchParams();
+    if (query.limit !== undefined) params.set('limit', String(query.limit));
+    if (query.offset !== undefined) params.set('offset', String(query.offset));
+    const q = query.q?.trim();
+    if (q) params.set('q', q);
+    const suffix = params.toString();
+    return request<SubjectsResponse>(`/v1/accounts/subjects${suffix ? `?${suffix}` : ''}`);
   },
   mergeSubjects(body: { source_id: string; target_id: string }): Promise<MergeResult> {
     return request<MergeResult>('/v1/accounts/subjects/merge', jsonInit('POST', body));

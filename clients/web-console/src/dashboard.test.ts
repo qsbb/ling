@@ -25,6 +25,7 @@ import { AppShell, mainPage, type MainPageProps } from './App';
 import {
   AgendaBody,
   Card,
+  DashboardBody,
   commitmentStateLabel,
   emotionLabel,
   formatDayTime,
@@ -957,5 +958,195 @@ describe('手机卡片', () => {
     );
     expect(html).toContain('还没安排下一次');
     expect(html).not.toContain('下次大约');
+  });
+});
+
+/* --------------------------------------------- §5 总览布局：区块、降级、空态 */
+
+describe('§5 总览布局：区块顺序与栅格跨度', () => {
+  const asOf = '2026-10-30T05:48:02Z';
+
+  /** 全部 ready 的载荷：只有内容齐全时才能断言"首屏先回答她此刻怎样"。 */
+  function readyPayload() {
+    return {
+      schema_version: 'v1',
+      generated_at: asOf,
+      timezone: 'Asia/Shanghai',
+      sections: {
+        activity: { status: 'ok', as_of: asOf, data: { state: 'running', kind: 'reading', place_id: 'home', origin: 'simulated' } },
+        presence: { status: 'ok', as_of: asOf, data: { availability: 'available', energy: 80, social_load: 10 } },
+        affect: { status: 'ok', as_of: asOf, data: { emotion: 'calm', intensity: 0.4 } },
+        phone: { status: 'ok', as_of: asOf, data: { state: 'idle', last_looked_at: asOf } },
+        proactive: { status: 'ok', as_of: asOf, data: { pending_count: 1, delivery_enabled: true } },
+        today_outline: {
+          status: 'ok',
+          as_of: asOf,
+          data: {
+            schema_version: 'v1',
+            state: 'ready',
+            display_date: '2026-11-08',
+            display_timezone: 'Asia/Shanghai',
+            plan_day: '2026-11-08',
+            actor_timezone: 'Asia/Shanghai',
+            items: [{ schema_version: 'v1', segment_id: 's1', relation: 'now', title: '整理邮件', start_at: asOf, end_at: asOf }],
+            note: null,
+          },
+        },
+        agenda: { status: 'ok', as_of: asOf, data: { plans: [], commitments: [], goals: [] } },
+        intent_teaser: {
+          status: 'ok',
+          as_of: asOf,
+          data: {
+            schema_version: 'v1',
+            horizon_unplanned: true,
+            items: [
+              { schema_version: 'v1', intention_id: 'i1', title: '想去看海', target_start_day: '2026-11-09', target_end_day: '2026-11-09', state: 'planned', source_kind: 'user' },
+            ],
+            note: null,
+          },
+        },
+        timeline: { status: 'ok', as_of: asOf, data: { items: [{ experience_id: 'e1', summary: '散步', origin: 'simulated', occurred_at: asOf }] } },
+        memories: { status: 'ok', as_of: asOf, data: { items: [{ memory_id: 'm1', kind: 'preference', text: '常温美式', origin: 'user_statement' }] } },
+        relationship: { status: 'ok', as_of: asOf, data: { familiarity: 0.9, trust: 0.5 } },
+        connectivity: { status: 'ok', as_of: asOf, data: { channels: [{ channel: 'onebot', configured: true }], bound_model_roles: ['dialogue.fast'] } },
+      },
+    };
+  }
+
+  function renderBody(payload: ReturnType<typeof readyPayload>): string {
+    return renderToStaticMarkup(
+      h(DashboardBody, {
+        data: payload as unknown as Parameters<typeof DashboardBody>[0]['data'],
+        onOpenNow: NOOP,
+        onOpenChat: NOOP,
+        onOpenSettings: NOOP,
+        onRetry: NOOP,
+      }),
+    );
+  }
+
+  it('区块顺序：现在 → 接下来 → 已留下的记录 → 连接状态', () => {
+    const markup = renderBody(readyPayload());
+    const zones = [...markup.matchAll(/data-zone="([^"]+)"/g)].map((m) => m[1]);
+    expect(zones).toEqual(['now', 'next', 'records', 'connectivity']);
+    // 区块标题就是人读到的那四个词
+    for (const title of ['现在', '接下来', '已留下的记录', '连接状态']) {
+      expect(markup).toContain(title);
+    }
+  });
+
+  it('卡片顺序跟着区块走：此刻在最前，渠道与模型在最后', () => {
+    const markup = renderBody(readyPayload());
+    const order = [...markup.matchAll(/data-testid="dash-([^"]+)"/g)].map((m) => m[1]);
+    expect(order[0]).toBe('此刻');
+    expect(order[order.length - 1]).toBe('渠道与模型');
+    // 「接下来」的两块在「已留下的记录」之前——计划不再排在经历后面被误读成事实
+    const nextIdx = order.indexOf('今天的节奏');
+    const recordsIdx = order.indexOf('近期生活');
+    expect(nextIdx).toBeGreaterThan(0);
+    expect(recordsIdx).toBeGreaterThan(nextIdx);
+    // 未来意向排在今天的安排之后、「已留下的记录」之前
+    expect(order.indexOf('未来意向')).toBeGreaterThan(order.indexOf('今天的安排'));
+    expect(order.indexOf('未来意向')).toBeLessThan(recordsIdx);
+  });
+
+  it('栅格跨度：此刻 6、可用性 3、情绪 3、未来意向 12、渠道与模型 12', () => {
+    const markup = renderBody(readyPayload());
+    const span = (title: string) => {
+      const at = markup.indexOf(`data-testid="dash-${title}"`);
+      const open = markup.lastIndexOf('<section', at);
+      return /dash-card--span(\d+)/.exec(markup.slice(open, at))?.[1];
+    };
+    expect(span('此刻')).toBe('6');
+    expect(span('可用性')).toBe('3');
+    expect(span('情绪')).toBe('3');
+    expect(span('未来意向')).toBe('12');
+    expect(span('今天的安排')).toBe('6');
+    expect(span('渠道与模型')).toBe('12');
+  });
+
+  it('每张有内容的卡都带一个明确入口（不把功能藏进"详细"两个字）', () => {
+    const markup = renderBody(readyPayload());
+    expect(markup).toContain('查看生活');
+    expect(markup).toContain('去聊天');
+    expect(markup).toContain('去设置');
+  });
+
+  it('意向不是日程：带「未安排」标记，且不出现「已做」这类既成语', () => {
+    const markup = renderBody(readyPayload());
+    const intentCard = markup.slice(markup.indexOf('data-testid="dash-未来意向"'));
+    expect(intentCard.slice(0, 2000)).toContain('未安排');
+    expect(markup).not.toContain('已做');
+  });
+
+  it('一块坏不影响别块：today_outline 读不到时只有它显示失败态', () => {
+    const payload = readyPayload();
+    payload.sections.today_outline = { status: 'unavailable', as_of: asOf } as never;
+    const markup = renderBody(payload);
+    expect(markup).toContain('暂时读不到这块数据。');
+    expect((markup.match(/暂时读不到这块数据。/g) ?? []).length).toBe(1);
+    expect(markup).toContain('想去看海'); // 未来意向照常
+    expect(markup).toContain('打算做（可能变）'); // 今天的安排照常
+    expect(markup).toContain('在做'); // 此刻照常
+  });
+
+  it('空态各说一句人话：没有记录 ≠ 读不到，也不出现原因码', () => {
+    const payload = readyPayload();
+    payload.sections.timeline = { status: 'empty', as_of: asOf } as never;
+    payload.sections.memories = { status: 'empty', as_of: asOf } as never;
+    payload.sections.phone = { status: 'empty', as_of: asOf } as never;
+    payload.sections.connectivity = { status: 'empty', as_of: asOf } as never;
+    const markup = renderBody(payload);
+    expect(markup).toContain('最近三天还没有记录下什么。');
+    expect(markup).toContain('还没有可展示的长期记忆。');
+    expect(markup).toContain('她还没拿起过手机。');
+    expect(markup).toContain('还没有配置任何渠道，也还没绑定模型职责。');
+    // 原因码（大写下划线枚举）不许漏到界面上
+    expect(markup).not.toMatch(/\b[A-Z]{2,}_[A-Z_]+\b/);
+  });
+
+  it('长列表最多先给 3 行，并明说还有几条（不让卡片无限变高）', () => {
+    const payload = readyPayload();
+    payload.sections.agenda = {
+      status: 'ok',
+      as_of: asOf,
+      data: {
+        plans: [1, 2, 3, 4, 5].map((n) => ({
+          plan_id: `p${n}`,
+          title: `日程${n}`,
+          start_at: '2026-11-09T10:00:00Z',
+          state: 'planned',
+        })),
+        commitments: [],
+        goals: [],
+      },
+    } as never;
+    const markup = renderBody(payload);
+    expect(markup).toContain('日程1');
+    expect(markup).toContain('日程3');
+    expect(markup).not.toContain('日程4');
+    expect(markup).toContain('还有 2 条日程，去生活页看全部。');
+  });
+});
+
+describe('§5 刷新失败：旧卡片不许被错误面板顶掉', () => {
+  /*
+   * 页面级行为，SSR 下 `DashboardPage` 停在加载态，只能钉源码契约。
+   * 两条都是"一次都没拿到"和"这次没刷上"不能长得一样：
+   * 前者可以整页报错，后者必须留着旧卡片、只在页头说一句。
+   */
+  const source = readFileSync(new URL('./components/DashboardPage.tsx', import.meta.url), 'utf8');
+
+  it('只有一次都没拿到时才走整页错误面板', () => {
+    expect(source).toMatch(/if \(!data\) \{/);
+    expect(source).not.toMatch(/if \(error \|\| !data\) \{/);
+    // 页头要有"这次没更新成功"的提示位
+    expect(source).toContain('dash-refresh-failed');
+  });
+
+  it('渠道与模型读不到时，页顶那条告警能跳到页尾那块卡', () => {
+    expect(source).toContain('dash-connectivity-alert');
+    expect(source).toContain('href="#dash-connectivity"');
+    expect(source).toContain('id="dash-connectivity"');
   });
 });

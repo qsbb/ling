@@ -49,6 +49,8 @@ from ling.contracts.v1 import (
     InputPart,
     InteractionEnvelope,
     Modality,
+    OutboundRecallState,
+    RecallReceipt,
     new_id,
 )
 from ling.ports.channel import (
@@ -56,6 +58,7 @@ from ling.ports.channel import (
     ChannelError,
     ChannelErrorKind,
     OutboundMessage,
+    RecallRequest,
     ReceiptQuery,
 )
 
@@ -584,6 +587,28 @@ class QQBotConnector(ChannelConnector):
             ),
         )
 
+    async def recall(self, request: RecallRequest) -> RecallReceipt:
+        """QQ 官方机器人**不支持撤回**已发消息（如实报 unsupported）。
+
+        官方 v2 开放接口里没有"删除已发消息"的能力（``supports_edit`` 也一直
+        是 False，同样原因）。这里**必须返回 ``unsupported`` 而不是抛异常或
+        假装成功**：
+
+        - 假装成功（返回 ``recalled``）会让用户以为撤掉了，而平台上那条还在；
+        - 抛异常会让上层把"这个渠道没这个能力"记成"这次撤回失败"，
+          于是每次点都产生一条失败审计，看起来像故障。
+
+        注意：这是**能力缺失**，不是"这一次没撤成"——所以不发任何网络请求。
+        """
+        return RecallReceipt(
+            receipt_id=new_id("rcpt"),
+            channel=self.connector_id,
+            state=OutboundRecallState.unsupported,
+            platform_message_id=request.platform_message_id or None,
+            observed_at=datetime.now(UTC),
+            detail="QQ 官方机器人接口不支持撤回已发消息",
+        )
+
     def capabilities(self) -> CapabilityDescriptor:
         """能力声明。
 
@@ -600,6 +625,8 @@ class QQBotConnector(ChannelConnector):
             supports_proactive=self._config.supports_proactive,
             # 官方接口不支持编辑已发消息
             supports_edit=False,
+            # 也没有撤回已发消息的接口（见 recall()）
+            supports_recall=False,
             supports_media=self._config.supports_media,
             max_text_length=self._config.max_text_length,
             receipt_reliability="best_effort",

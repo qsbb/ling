@@ -135,9 +135,13 @@ async def test_shape_and_reason_codes(logged_in) -> None:
     """两个渠道都在，字段齐全，状态码都能在码表里查到中文。"""
     body = await _fetch(logged_in)
 
-    assert body["schema_version"] == "v1"
+    # v2：新增 generation / activation / 可编辑字段与白名单组（设计 §6）。
+    assert body["schema_version"] == "v2"
     assert body["as_of"]
     assert [c["id"] for c in body["connectors"]] == ["onebot", "qqbot"]
+    assert body["access"]["id"] == "access"
+    assert body["access"]["generation"] == 0
+    assert body["can_edit"] is True, "owner 应当可以编辑"
 
     for channel in body["connectors"]:
         assert set(channel) >= {
@@ -154,9 +158,18 @@ async def test_shape_and_reason_codes(logged_in) -> None:
             "fields",
             "runtime",
         }
-        # 本轮只读：界面不得把它画成可编辑的表单。
-        assert channel["editable"] is False
-        assert channel["storage"] == "env"
+        # 可配置之后 editable 对 owner 为 True；非 owner 见 test_member_*。
+        assert channel["editable"] is True
+        # 值落 DB（容器只读根目录，写不了 .env）
+        assert channel["storage"] == "db"
+        assert channel["generation"] == 0
+        assert set(channel["activation"]) >= {
+            "state",
+            "active_generation",
+            "candidate_generation",
+            "ack_count",
+            "expected_count",
+        }
         # 状态码必须在码表里，文案来自码表（前端不另维护一份翻译）。
         assert channel["status_reason"] in CONNECTOR_REASON_TEXT
         assert channel["status_message"] == CONNECTOR_REASON_TEXT[channel["status_reason"]]
@@ -164,10 +177,24 @@ async def test_shape_and_reason_codes(logged_in) -> None:
         assert channel["guidance"]
         assert "LING_" in channel["guidance"]
         for field in channel["fields"]:
-            assert set(field) >= {"name", "label", "kind", "set", "value", "source"}
-            assert field["name"].startswith("LING_")
-            assert field["source"] == "env"
+            # `key` 是 v2 契约名；`name`/`set` 是兼容别名（旧前端读它们）。
+            assert set(field) >= {
+                "key",
+                "name",
+                "label",
+                "kind",
+                "set",
+                "value",
+                "source",
+                "configured",
+                "preview",
+                "editable",
+            }
+            assert field["key"] == field["name"]
+            assert field["key"].startswith("LING_")
+            assert field["source"] in {"db", "env", "default"}
             assert isinstance(field["set"], bool)
+            assert field["editable"] is True
 
 
 async def test_requires_auth(web_env) -> None:
@@ -307,7 +334,8 @@ async def test_qqbot_configured_but_channel_disabled(logged_in) -> None:
     assert channel["enabled"] is False
     assert channel["status"] == "disabled"
     assert channel["status_reason"] == "qqbot_channel_disabled"
-    assert _field(channel, "LING_QQBOT_ENABLED")["value"] == "关"
+    # 开关的 `value` 是规范化后的布尔（v2）；人话状态在 status_message。
+    assert _field(channel, "LING_QQBOT_ENABLED")["value"] is False
     assert "LING_QQBOT_ENABLED" in channel["guidance"]
 
 

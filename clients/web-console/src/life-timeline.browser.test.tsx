@@ -376,12 +376,83 @@ function json(body: unknown, status = 200): { status: number; contentType: strin
   return { status, contentType: 'application/json', body: JSON.stringify(body) };
 }
 
+/* -------------------------------------------------- 手动生成日程的模拟 */
+
+export interface OutlineRequest {
+  plan_day: string;
+  force: boolean;
+  request_id: string;
+}
+
+export interface ScheduleCalls {
+  posts: OutlineRequest[];
+  polls: string[];
+  timelineReads: number;
+}
+
+export interface ScheduleMock {
+  /** 第 n 次读时间轴（1 起）返回什么；默认一直是 TIMELINE。 */
+  timeline: (read: number) => unknown;
+  /** POST 的响应；`call` 从 1 起。默认 202 queued。 */
+  create: (body: OutlineRequest, call: number) => { status: number; body: unknown };
+  /** GET 作业的响应；`call` 从 1 起。默认先 running 再 ready。 */
+  poll: (jobId: string, call: number) => { status: number; body: unknown };
+  calls: ScheduleCalls;
+}
+
+export function jobPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 'v1',
+    job_id: 'job-1',
+    plan_day: '2026-11-07',
+    state: 'queued',
+    note: '已经排上队了，她正在准备，稍等一下再看',
+    revision: 1,
+    plan_state: 'pending',
+    reason_code: null,
+    enqueued: true,
+    ...overrides,
+  };
+}
+
+export function scheduleMock(
+  overrides: Omit<Partial<ScheduleMock>, 'calls'> = {},
+): ScheduleMock {
+  return {
+    timeline: overrides.timeline ?? (() => TIMELINE),
+    create: overrides.create ?? (() => ({ status: 202, body: jobPayload() })),
+    poll: overrides.poll ?? ((_jobId, call) => ({
+      status: 200,
+      body: jobPayload({
+        state: call >= 2 ? 'ready' : 'running',
+        note: call >= 2 ? '这一天的日程已经排好了' : '她正在排这一天的日程',
+        plan_state: call >= 2 ? 'ready' : 'pending',
+      }),
+    })),
+    calls: { posts: [], polls: [], timelineReads: 0 },
+  };
+}
+
+/** 空计划（plan_state=null）：这是按钮**最主要**的使用场景。 */
+const EMPTY_TIMELINE = {
+  ...TIMELINE,
+  state: 'empty',
+  plan_state: null,
+  revision: 0,
+  generated_at: null,
+  segments: [],
+  facts: [],
+  intents: [],
+  dream: null,
+};
+
 /* ------------------------------------------------------------ 打开页面 */
 
 async function openRoute(
   path: string,
   viewport: { width: number; height: number },
   waitTestId: string,
+  schedule?: ScheduleMock,
 ): Promise<Page> {
   if (!browser || launchError) throw new Error(launchError ?? '浏览器未启动');
   const context = await browser.newContext({ viewport, reducedMotion: 'reduce' });
@@ -406,7 +477,27 @@ async function openRoute(
     if (pathname === '/v1/persona') return route.fulfill(json({ name: '灵', display_name: '灵' }));
     if (pathname === '/v1/sessions') return route.fulfill(json({ sessions: [] }));
     if (pathname === '/v1/dashboard') return route.fulfill(json(DASHBOARD));
-    if (pathname === '/v1/life/timeline') return route.fulfill(json(TIMELINE));
+    if (pathname === '/v1/life/timeline') {
+      if (schedule) {
+        schedule.calls.timelineReads += 1;
+        return route.fulfill(json(schedule.timeline(schedule.calls.timelineReads)));
+      }
+      return route.fulfill(json(TIMELINE));
+    }
+    if (pathname === '/v1/life/outline-jobs' && route.request().method() === 'POST') {
+      if (!schedule) return route.fulfill(json({ error: { code: 'not_found', message: 'no mock' } }, 404));
+      const body = JSON.parse(route.request().postData() ?? '{}') as OutlineRequest;
+      schedule.calls.posts.push(body);
+      const response = schedule.create(body, schedule.calls.posts.length);
+      return route.fulfill(json(response.body, response.status));
+    }
+    if (pathname.startsWith('/v1/life/outline-jobs/')) {
+      const jobId = decodeURIComponent(pathname.slice('/v1/life/outline-jobs/'.length));
+      if (!schedule) return route.fulfill(json({ error: { code: 'not_found', message: jobId } }, 404));
+      schedule.calls.polls.push(jobId);
+      const response = schedule.poll(jobId, schedule.calls.polls.length);
+      return route.fulfill(json(response.body, response.status));
+    }
     if (pathname === '/v1/activity') {
       return route.fulfill(json({ current: null, history: [], note: '' }));
     }
@@ -442,6 +533,7 @@ async function measure(page: Page): Promise<Record<string, Widths>> {
       body: widths(document.body),
       page: widths(document.querySelector('.app-main .page')),
       timeline: widths(document.querySelector('[data-testid="life-timeline"]')),
+      generate: widths(document.querySelector('[data-testid="tl-generate"]')),
       overview: widths(document.querySelector('.dash__grid')),
     };
   });
@@ -514,6 +606,118 @@ describe('真实浏览器：生活时间轴与总览两块', () => {
       expect(dashWidths.overview?.client ?? 0).toBeLessThanOrEqual(375);
       // relation 标签没有被省略成"此…"：innerText 完整可读。
       expect(await dash.getByText('此刻可能在做').count()).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+});
+
+/**
+ * 手动生成日程：真浏览器里点一遍。
+ *
+ * SSR 测不到的是"点了之后真发了几次请求、轮询几次、按钮什么时候变"。
+ * 这里 `page.route` 记下每一次 POST/GET，断言：
+ * 1. 空计划下按钮就是「生成今天的日程」，目标是时间轴给的 `plan_day`
+ *    （**不是**浏览器今天：夹具里 display_date=11-08、plan_day=11-07）；
+ * 2. 双重点击只 POST 一次；
+ * 3. ready 之后按钮变「重新生成」，点了要先确认（force 只在确认后发）；
+ * 4. 生成条在 375 / 1440 下都不横向溢出。
+ */
+describe('真实浏览器：手动生成日程', () => {
+  it(
+    '1440：空计划 → 点一次 → 正在生成 → ready → 按钮变重新生成（含确认与只发一次）',
+    async (ctx) => {
+      if (skip(ctx)) return;
+      // 提交之前一律是空计划（按钮 = 生成）；提交之后（终态重读）是 ready 的计划。
+      // 不用"第 n 次读取"计数：React 严格模式下开发环境会读两次。
+      const posted = { value: false };
+      const mock = scheduleMock({
+        timeline: () => (posted.value ? TIMELINE : EMPTY_TIMELINE),
+        create: () => {
+          posted.value = true;
+          return { status: 202, body: jobPayload() };
+        },
+      });
+      const page = await openRoute('/life', { width: 1440, height: 900 }, 'life-timeline', mock);
+
+      const button = page.locator('[data-testid="tl-generate-button"]');
+      await button.waitFor();
+      expect(await button.getAttribute('data-action')).toBe('generate');
+      expect((await button.innerText()).trim()).toContain('生成今天的日程');
+      // 目标日是**她的计划日**（夹具的 display_date 是 11-08，故意不同）。
+      expect(await button.getAttribute('data-target-day')).toBe('2026-11-07');
+      await assertNoHorizontalOverflow(page, 'life 1440 生成条', ['page', 'timeline', 'generate']);
+
+      // 双重点击：第二次点在禁用态上，不能变成第二次 POST。
+      await button.click();
+      await button.click({ force: true });
+      // 202 之后按钮立刻进"已提交，正在生成…"并禁用（不是等轮询完才变）。
+      await expect
+        .poll(() => button.innerText(), { timeout: 5000 })
+        .toContain('已提交，正在生成');
+      expect(await button.isDisabled()).toBe(true);
+      await expect
+        .poll(() => mock.calls.posts.length, { timeout: 5000 })
+        .toBe(1);
+      expect(mock.calls.posts[0]).toEqual({
+        plan_day: '2026-11-07',
+        force: false,
+        request_id: expect.any(String),
+      });
+
+      // 轮询到 ready → 按钮变「重新生成」，状态是人话。
+      await expect
+        .poll(() => button.getAttribute('data-action'), { timeout: 15_000 })
+        .toBe('regenerate');
+      expect((await button.innerText()).trim()).toContain('重新生成');
+      expect(await page.locator('[data-testid="tl-generate-status"]').innerText()).toContain(
+        '这一天的日程已经排好了',
+      );
+      expect(mock.calls.polls.length).toBeGreaterThanOrEqual(2);
+      expect(mock.calls.timelineReads).toBeGreaterThanOrEqual(2); // 终态后重读了时间轴
+
+      // 重排：点一下先出确认条，**没确认之前不发请求**。
+      const before = mock.calls.posts.length;
+      await button.click();
+      await page.locator('[data-testid="tl-generate-confirm"]').waitFor();
+      expect(mock.calls.posts.length).toBe(before);
+      await page.locator('[data-testid="tl-generate-confirm-ok"]').click();
+      await expect.poll(() => mock.calls.posts.length, { timeout: 5000 }).toBe(before + 1);
+      expect(mock.calls.posts[before]?.force).toBe(true);
+      await assertNoHorizontalOverflow(page, 'life 1440 重排后', ['page', 'timeline', 'generate']);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    '375：生成条（含状态与确认条）不横向溢出',
+    async (ctx) => {
+      if (skip(ctx)) return;
+      const mock = scheduleMock({
+        timeline: () => EMPTY_TIMELINE,
+        create: () => ({
+          status: 409,
+          body: {
+            error: {
+              code: 'conflict',
+              message: '今天用来生成日程的调用次数用完了，可以在设置里调整预算上限',
+              detail: '计划日 2026-11-07 的手动生成没有开始。',
+            },
+          },
+        }),
+      });
+      const page = await openRoute('/life', { width: 375, height: 667 }, 'life-timeline', mock);
+      const button = page.locator('[data-testid="tl-generate-button"]');
+      await button.waitFor();
+      await assertNoHorizontalOverflow(page, 'life 375 生成条', ['page', 'timeline', 'generate']);
+
+      await button.click();
+      const status = page.locator('[data-testid="tl-generate-status"]');
+      await expect
+        .poll(() => status.innerText(), { timeout: 10_000 })
+        .toContain('今天用来生成日程的调用次数用完了');
+      // 不显示原因码，也不说成功。
+      expect(await page.content()).not.toContain('budget_exhausted');
+      await assertNoHorizontalOverflow(page, 'life 375 409 状态', ['page', 'timeline', 'generate']);
     },
     TIMEOUT,
   );

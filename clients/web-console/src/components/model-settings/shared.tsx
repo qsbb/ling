@@ -15,6 +15,7 @@ import type {
   MemorySource,
   ProviderView,
   SettingsConfig,
+  SlotDraftInput,
   SlotView,
 } from '../../types';
 
@@ -120,6 +121,146 @@ export const PROVIDER_KIND_OPTIONS = [
 
 export function kindLabel(kind: string): string {
   return PROVIDER_KIND_OPTIONS.find((item) => item.value === kind)?.label ?? kind;
+}
+
+/**
+ * 槽位下拉里一个可选项（已经按"能不能选"分好组，渲染层不再判断能力）。
+ *
+ * `provider_label` 就是分组头：`供应商 · 协议`。**不选**的分组头不带模型 ID，
+ * 这样"同名模型分属两家"在界面上也能分清。
+ */
+export interface SlotOption {
+  value: string;
+  provider_id: string;
+  provider_label: string;
+  provider_enabled: boolean;
+  model_id: string;
+  model_enabled: boolean;
+  /** 能不能**新选**它（当前已选但不可用的项仍然返回，只是不许再选）。 */
+  selectable: boolean;
+}
+
+export interface SlotOptions {
+  options: SlotOption[];
+  /** 可以新选的条数；0 = 下拉禁用（但已选项仍显示）。 */
+  selectableCount: number;
+  /** 显示在禁用/空态下的那句人话；空串 = 不需要提示。 */
+  emptyHint: string;
+}
+
+/**
+ * 默认槽位的可选项 —— **纯函数**，便于单测与"同名模型"用例。
+ *
+ * 规则（与设计 §1 一致）：
+ * - 只列能提供 `chat` 的供应商（`providersForChatSlot`，当前已绑的那家保留）；
+ * - 停用的供应商或其模型、以及不提供 chat 的**历史**供应商：选项保留显示，
+ *   但 `selectable=false`（界面上 `disabled`），并说明怎么换；
+ * - 没有供应商 / 没有启用的对话模型 → `selectableCount=0`，给"先添加模型"。
+ */
+export function slotOptions(
+  providers: ProviderDraftInput[],
+  currentProviderId: string,
+  currentModelId: string,
+): SlotOptions {
+  const candidates = providersForChatSlot(providers, currentProviderId);
+  const options: SlotOption[] = [];
+  for (const provider of candidates) {
+    const isCurrentProvider = provider.provider_id === currentProviderId;
+    const groupSelectable =
+      provider.enabled !== false && !bindingCapabilityMismatch(provider, 'chat');
+    const providerEnabled = provider.enabled !== false;
+    const label = `${provider.provider_id}${providerEnabled ? '' : '（已停用）'} · ${kindLabel(
+      provider.kind,
+    )}`;
+    for (const model of provider.models ?? []) {
+      options.push({
+        value: `${provider.provider_id}::${model.model_id}`,
+        provider_id: provider.provider_id,
+        provider_label: label,
+        provider_enabled: providerEnabled,
+        model_id: model.model_id,
+        model_enabled: model.enabled,
+        selectable: groupSelectable && model.enabled,
+      });
+    }
+    // 当前绑着的那家如果连"组"都不可选，也要保证已选项在列表里（历史可见）。
+    const hasCurrent = options.some(
+      (item) => isCurrentProvider && item.model_id === currentModelId,
+    );
+    if (isCurrentProvider && currentModelId && !hasCurrent) {
+      options.push({
+        value: `${provider.provider_id}::${currentModelId}`,
+        provider_id: provider.provider_id,
+        provider_label: label,
+        provider_enabled: providerEnabled,
+        model_id: currentModelId,
+        model_enabled: false,
+        selectable: false,
+      });
+    }
+  }
+  const selectableCount = options.filter((item) => item.selectable).length;
+  const emptyHint =
+    providers.length === 0 || candidates.length === 0
+      ? '先添加供应商和模型'
+      : selectableCount === 0
+        ? '先给供应商添加一个启用的对话模型'
+        : '';
+  return { options, selectableCount, emptyHint };
+}
+
+/** 按 `provider_id` 把可选项分组，保持供应商原有顺序（不重排）。 */
+export function groupSlotOptions(options: SlotOption[]): {
+  providerId: string;
+  label: string;
+  items: SlotOption[];
+}[] {
+  const groups: { providerId: string; label: string; items: SlotOption[] }[] = [];
+  for (const option of options) {
+    const last = groups[groups.length - 1];
+    if (last && last.providerId === option.provider_id) {
+      last.items.push(option);
+    } else {
+      groups.push({
+        providerId: option.provider_id,
+        label: option.provider_label,
+        items: [option],
+      });
+    }
+  }
+  return groups;
+}
+
+/** 槽位下拉的选中值：结构化的 `(provider_id, model_id)` 对。 */
+export function slotSelectValue(providerId: string, modelId: string): string {
+  if (!providerId || !modelId) return '';
+  return `${providerId}::${modelId}`;
+}
+
+/** 选中值 → 结构化对；空值/不完整 → null（调用方据此清空槽位）。 */
+export function parseSlotSelectValue(
+  value: string,
+): { providerId: string; modelId: string } | null {
+  if (!value) return null;
+  const index = value.indexOf('::');
+  if (index <= 0) return null;
+  const providerId = value.slice(0, index);
+  const modelId = value.slice(index + 2);
+  if (!providerId || !modelId) return null;
+  return { providerId, modelId };
+}
+
+/** 草稿里的槽位值是否与已保存的一致（"未保存"标记的唯一判据）。 */
+export function slotDraftDirty(
+  draft: SlotDraftInput | undefined,
+  saved: SlotView | undefined,
+): boolean {
+  const draftProvider = draft?.provider_id ?? '';
+  const draftModel = draft?.model_id ?? '';
+  return (
+    draftProvider !== (saved?.provider_id ?? '') ||
+    draftModel !== (saved?.model_id ?? '')
+  );
 }
 
 /** 能力 → 人话。服务端传的是 `chat` / `embed` / `rerank` 这类机器名。 */

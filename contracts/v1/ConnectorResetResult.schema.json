@@ -1,0 +1,31 @@
+{
+  "$id": "https://ling.local/contracts/v1/ConnectorResetResult.schema.json",
+  "additionalProperties": false,
+  "description": "`POST /v1/settings/connectors/reset` 的逐 scope 结果。\n\n``ok=false`` 表示至少一个 scope 没清成功——那三个 scope 的 active 都保留，\n不出现\"部分恢复默认却报成功\"。",
+  "properties": {
+    "ok": {
+      "title": "Ok",
+      "type": "boolean"
+    },
+    "results": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Results",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok"
+  ],
+  "title": "ConnectorResetResult",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

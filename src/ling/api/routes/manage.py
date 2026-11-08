@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, time
 from typing import TYPE_CHECKING, Annotated
 
@@ -17,6 +18,7 @@ from ling.api.errors import LingError
 from ling.audit import audit_event
 from ling.config import Settings
 from ling.contracts.v1 import (
+    SCHEMA_VERSION,
     ActionIntent,
     ErrorCode,
     MemoryProposal,
@@ -36,6 +38,7 @@ from ling.domains.world.service import WorldService
 
 if TYPE_CHECKING:  # 仅为类型标注：core 在端点内按需导入，避免装配期多一层依赖
     from ling.domains.memory.core import CoreMemoryView
+    from ling.infra.models import Subject
 
 router = APIRouter(tags=["manage"])
 
@@ -1109,40 +1112,179 @@ class MergeSubjectBody(BaseModel):
     target_id: str
 
 
+# ------------------------------------------------------------------ 关系（subjects）
+#
+# 这个列表**天然无界**：`IdentityService.resolve_or_provision` 在群里见到任何
+# 一个新账号就建一个 known 级 subject，跑几个群、几周下来就是几千行。原来它
+# 一次全吐（2000 行 = 561 KB），前端又给每张卡片渲染一个含全部候选的下拉
+# （n² 个 `<option>`），于是「点开关系页就卡死」。
+# 现在：**默认只给一页**（50 条），要更多用 `offset` 翻；`total` / `has_more`
+# 让调用方知道还剩多少，不用自己猜。
+SUBJECTS_LIMIT_DEFAULT = 50
+SUBJECTS_LIMIT_MAX = 200
+
+
+def _escape_like(text: str) -> str:
+    """把用户输入转成 `LIKE` 的字面量片段（`\\`、`%`、`_` 都当普通字符）。
+
+    不转义的话，搜 `100%` 会变成"以 100 开头的所有人"，搜 `_` 会匹配任意字符——
+    用户看到的结果和他输入的字面意思对不上。
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _account_row(a: object) -> dict:
+    return {
+        "account_id": a.id,  # type: ignore[attr-defined]
+        "connector_instance": a.connector_instance,  # type: ignore[attr-defined]
+        "external_account_id": a.external_account_id,  # type: ignore[attr-defined]
+        "proof": a.proof,  # type: ignore[attr-defined]
+        "revoked": a.revoked_at is not None,  # type: ignore[attr-defined]
+    }
+
+
+async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> dict[str, list[dict]]:
+    """只取这一页的账号，仍然是一条 SQL（不是逐条再查）。"""
+    from sqlalchemy import select
+
+    from ling.infra.models import ActorAccount
+
+    if not subject_ids:
+        return {}
+    rows = (
+        (
+            await session.execute(
+                select(ActorAccount)
+                .where(ActorAccount.subject_id.in_(subject_ids))
+                .order_by(ActorAccount.connector_instance, ActorAccount.external_account_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_subject: dict[str, list[dict]] = {}
+    for a in rows:
+        by_subject.setdefault(a.subject_id, []).append(_account_row(a))
+    return by_subject
+
+
+def _subject_row(s: object, by_subject: dict[str, list[dict]]) -> dict:
+    """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
+    return {
+        "subject_id": s.id,  # type: ignore[attr-defined]
+        "display_name": s.display_name,  # type: ignore[attr-defined]
+        "trust_level": getattr(s, "trust_level", "known"),
+        "merged_into": getattr(s, "merged_into", None),
+        "accounts": by_subject.get(s.id, []),  # type: ignore[attr-defined]
+    }
+
+
+async def _subjects_page(
+    session: DbSession, where: list, limit: int, offset: int
+) -> tuple[Sequence[Subject], int]:
+    """按 `Subject.created_at, Subject.id` 的**稳定全序**取一页，并给出总数。
+
+    必须带 `id` 兜底排序：`created_at` 在同一批自动建档里会撞（同一毫秒 / 同一批
+    INSERT 的默认值），只按时间排的话翻页会重复或漏行。
+    """
+    from sqlalchemy import func, select
+
+    from ling.infra.models import Subject
+
+    stmt = select(Subject)
+    count_stmt = select(func.count()).select_from(Subject)
+    for cond in where:
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+    rows = (
+        (
+            await session.execute(
+                stmt.order_by(Subject.created_at, Subject.id).limit(limit).offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = int((await session.execute(count_stmt)).scalar() or 0)
+    return rows, total
+
+
 @router.get("/accounts/subjects")
-async def list_subjects(auth: CurrentAuth, session: DbSession) -> dict:
-    """列出所有 subject 及其账号与合并状态，给"合并/拆分"页面用。
+async def list_subjects(
+    auth: CurrentAuth,
+    session: DbSession,
+    # 范围在端点里判定（与 `list_memory` 同一个口径）：OpenAPI 只写说明、
+    # 不写 minimum/maximum，非法值统一走 422 + 统一错误形状。
+    limit: Annotated[
+        int,
+        Query(description="单次最多返回条数，范围 1..200，默认 50；超出范围返回 422。"),
+    ] = SUBJECTS_LIMIT_DEFAULT,
+    offset: Annotated[
+        int,
+        Query(description="跳过前多少条（按创建时间正序），默认 0；负数返回 422。"),
+    ] = 0,
+    q: Annotated[
+        str | None,
+        Query(
+            description=(
+                "按昵称、subject_id 或任一绑定账号的外部 id 在服务端做子串筛选；留空不筛选。"
+            ),
+        ),
+    ] = None,
+) -> dict:
+    """列出 subject 及其账号与合并状态（分页），给"关系"页面用。
 
     只读。合并是**人的决定**，系统不自动做——这里只把现状摊开。
+
+    分页是必需的而不是优化：这张表会随"群里见过的人"无界增长。默认一页 50 条，
+    `limit` 上限 200；`total` 是**筛选后**的总行数（不是这一页的行数），
+    `has_more` 说明 `offset + len(subjects) < total`。
+
+    「合并到谁」的候选**不随整页返回**：`q` 在服务端搜（昵称 / subject_id /
+    账号 id），页面按需取前 20 条。把全部候选塞进首屏正是这次卡死的形态之一，
+    重演一遍只是把 n 从"几行"换成"几万字节"。
     """
-    from sqlalchemy import select
+    from sqlalchemy import exists, or_
 
     from ling.infra.models import ActorAccount, Subject
 
-    subjects = (await session.execute(select(Subject))).scalars().all()
-    accounts = (await session.execute(select(ActorAccount))).scalars().all()
-    by_subject: dict[str, list[dict]] = {}
-    for a in accounts:
-        by_subject.setdefault(a.subject_id, []).append(
-            {
-                "account_id": a.id,
-                "connector_instance": a.connector_instance,
-                "external_account_id": a.external_account_id,
-                "proof": a.proof,
-                "revoked": a.revoked_at is not None,
-            }
+    if not 1 <= limit <= SUBJECTS_LIMIT_MAX:
+        raise LingError(
+            ErrorCode.invalid_request,
+            f"limit 必须在 1..{SUBJECTS_LIMIT_MAX} 之间",
+            status_code=422,
         )
+    if offset < 0:
+        raise LingError(ErrorCode.invalid_request, "offset 不能为负", status_code=422)
+
+    where: list = []
+    needle = (q or "").strip()
+    if needle:
+        pattern = f"%{_escape_like(needle)}%"
+        # 账号匹配用 EXISTS 而不是 JOIN：JOIN 会让"一个人挂两个号"变成两行，
+        # 分页和 total 就都错了。
+        where.append(
+            or_(
+                Subject.display_name.ilike(pattern, escape="\\"),
+                Subject.id.ilike(pattern, escape="\\"),
+                exists().where(
+                    ActorAccount.subject_id == Subject.id,
+                    ActorAccount.external_account_id.ilike(pattern, escape="\\"),
+                ),
+            )
+        )
+
+    page, total = await _subjects_page(session, where, limit, offset)
+    by_subject = await _accounts_by_subject(session, [s.id for s in page])
+
     return {
-        "subjects": [
-            {
-                "subject_id": s.id,
-                "display_name": s.display_name,
-                "trust_level": getattr(s, "trust_level", "known"),
-                "merged_into": getattr(s, "merged_into", None),
-                "accounts": by_subject.get(s.id, []),
-            }
-            for s in subjects
-        ]
+        "schema_version": SCHEMA_VERSION,
+        "subjects": [_subject_row(s, by_subject) for s in page],
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "has_more": offset + len(page) < total,
+        "q": needle or None,
     }
 
 

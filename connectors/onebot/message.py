@@ -22,6 +22,37 @@ logger = logging.getLogger("ling.connectors.onebot.message")
 _CQ_RE = re.compile(r"\[CQ:([a-zA-Z0-9_.-]+)((?:,[^\]]*)?)\]")
 _CQ_UNESCAPE = (("&#91;", "["), ("&#93;", "]"), ("&#44;", ","), ("&amp;", "&"))
 
+# 带媒体的消息段 → 正文占位。
+#
+# ## 为什么占位是英文标记，而不是 `[语音]`
+#
+# `kernel/bridge.py` 的 `_MEDIA_MARKERS`（`\[(?:image|voice|video|file)\]`）
+# 用这批英文标记剥掉占位、判断"这条消息里有没有真话"：只发一张图/一条语音时
+# 正文只剩占位，剥不掉就会被当成用户发言去回复（那是真实缺陷，注释在
+# bridge.py:512）。占位换成 `[语音]` 会让那条判断失效。
+#
+# 所以：**机器读的部分保持英文段名**（`[voice]`），中文的"这是一条语音"
+# 由 `media_segment_label()` 提供给需要人话的调用方与模型提示文本。
+# `record` 是 OneBot v11 规范里的语音段名（NapCat 发的就是它），`voice`
+# 只是老 CQ 码时代的别名——两者同一条分支、同一套 `media_refs` 规则。
+_MEDIA_SEGMENTS = ("image", "voice", "record", "video", "file")
+
+# 段名 → 中文人话（给模型提示 / 诊断日志用）。
+_MEDIA_LABELS = {
+    "image": "图片",
+    "voice": "语音",
+    "record": "语音",
+    "video": "视频",
+    "file": "文件",
+    "mface": "表情包",
+    "face": "表情",
+}
+
+
+def media_segment_label(seg_type: str) -> str:
+    """段名 → 中文人话；不认识的段名原样返回。"""
+    return _MEDIA_LABELS.get(seg_type, seg_type)
+
 
 @dataclass
 class ParsedMessage:
@@ -107,7 +138,10 @@ def _handle_segment(
         reply_id = data.get("id")
         if reply_id is not None:
             result.reply_to_message_id = str(reply_id)
-    elif seg_type in {"image", "voice", "video", "file"}:
+    elif seg_type in _MEDIA_SEGMENTS:
+        # `record` 是 OneBot **v11 规范**里的语音段名（NapCat 发的就是它）；
+        # `voice` 只是老 CQ 码时代的别名。两者必须走同一条分支——否则语音
+        # 整条被静默丢掉，模型连"用户发过语音"都不知道。
         ref = str(data.get("url") or data.get("file") or "")
         if ref:
             # 坏引用只丢**这个附件**，不丢整条消息：契约层会拒绝带坏引用的
@@ -121,11 +155,29 @@ def _handle_segment(
                     seg_type,
                     len(ref),
                 )
-            _append_text(result, f"[{seg_type}]")
+            # 占位用**规范段名**：`record` 也写成 `[voice]`，与老别名同一形态，
+            # `bridge._MEDIA_MARKERS` 才能把它从"有没有真话"的判断里剥掉。
+            _append_text(result, "[voice]" if seg_type == "record" else f"[{seg_type}]")
+    elif seg_type == "mface":
+        # 表情包：有的实现只给 `summary`、不给 `url`。无论有没有 url 都要留下
+        # 提示——表情包是用户表达的一部分，不能整条消失；有 url 时顺带进
+        # `media_refs`，坏引用照旧只丢该附件。
+        ref = str(data.get("url") or data.get("file") or "")
+        if ref:
+            if media_ref_is_valid(ref):
+                result.media_refs.append(ref)
+            else:
+                logger.warning(
+                    "丢弃不合格的媒体引用（类型 %s，长度 %d）：只影响该附件",
+                    seg_type,
+                    len(ref),
+                )
+        _append_text(result, "[表情包]")
     elif seg_type == "face":
         _append_text(result, "[表情]")
-    # record / mface / dice / rps / shake / share / location 等
-    # 暂不进入正文：它们没有可读文本，硬塞会让模型困惑。
+    # dice / rps / shake / share / location 等**明确不处理**：没有可读文本，
+    # 也没有可下载的媒体（`share` / `location` 的 url 是外部网页或坐标，
+    # 不是附件），硬塞进正文只会让模型困惑。
 
 
 def _append_text(result: ParsedMessage, text: str) -> None:
@@ -180,6 +232,7 @@ __all__ = [
     "ParsedMessage",
     "build_media_segments",
     "build_text_segments",
+    "media_segment_label",
     "parse_message",
     "window_ref_for",
 ]

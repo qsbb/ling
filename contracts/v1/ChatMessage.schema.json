@@ -119,6 +119,44 @@
       "$ref": "#/$defs/Origin",
       "default": "user_statement"
     },
+    "recall_state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Recall State"
+    },
+    "recalled_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Recalled At"
+    },
+    "retracted_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Retracted At"
+    },
     "role": {
       "enum": [
         "user",

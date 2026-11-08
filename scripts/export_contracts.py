@@ -42,6 +42,11 @@ EXPORTED = [
     "TodayOutlineItem",
     "IntentTeaserOut",
     "IntentTeaserItem",
+    # 上游依赖不可用时的回退标记（docs/UX-FIXES-2026-11-09.md §4）：
+    # 消费点（看手机节奏、当前场景）在响应里说清"这次的值是不是默认值"。
+    # 枚举 `FallbackState` / `FallbackSource` 不单独导出（导出器只处理 Object
+    # 契约），取值已内联在 `FallbackNotice.state` / `.source` 的 schema enum 里。
+    "FallbackNotice",
     # 「查看本次提示词」：某条回复当时真正发给模型的上下文（只读快照）。
     # 枚举 `PromptBlock` / `PromptSnapshotState` **不单独导出**（导出器只处理
     # Object 契约）；它们的取值已内联在 `PromptSnapshotSection.key` 与
@@ -50,6 +55,27 @@ EXPORTED = [
     "PromptSnapshotModel",
     "PromptSnapshotOut",
     "PromptSnapshotSection",
+    # 「关系」页的分页列表（docs/API-WEB-V1.md §13）。`subjects` 默认 50 条，
+    # `total` / `has_more` / `q` 与 `SubjectRow` 一起导出：前端只按 schema 里的
+    # 字段名读，不照文档手抄。
+    "SubjectAccountOut",
+    "SubjectRow",
+    "SubjectsPage",
+    # 接入器可配置（docs/CONNECTOR-CONFIG-DESIGN.md §6）：字段只带 source /
+    # configured / preview，**没有**解密后的值；保存结果带 generation 与终态。
+    "ConnectorsOut",
+    "ConnectorView",
+    "ConnectorFieldOut",
+    "ConnectorActivationOut",
+    "ConnectorAccessGroupOut",
+    "ConnectorChangeRequest",
+    "ConnectorChangeAccepted",
+    "ConnectorOperationOut",
+    "ConnectorResetResult",
+    # 主动撤回（出站）：五态回执 + 接口响应。入站的 `RecallEvent` 是另一件事
+    # （对方撤回了什么），不在这里。
+    "RecallReceipt",
+    "RecallMessageOut",
     # 「检查更新」四态卡片（docs/UPDATE-UX-DESIGN.md）。嵌套片段对象（current /
     # newer / target / task / details.*）也各自导出：它们是 API 契约的一部分，
     # 单独写 schema 才能让前端按字段名/类型对齐，而不是对着文档抄。

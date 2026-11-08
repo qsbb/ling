@@ -164,11 +164,44 @@ export function isToday(iso: string | null | undefined, now: Date = new Date()):
   );
 }
 
+/**
+ * 卡片在 12 列网格里占几列。
+ *
+ * 3 列只给「一个短值 + 一句解释」的小卡（可用性/情绪）：再放列表就会每行
+ * 只剩两三个字。长列表一律 6 列起。窄屏怎么塌陷由 `dashboard.css` 统一处理，
+ * 组件不按视口做判断。
+ */
+export type CardSpan = 3 | 6 | 12;
+
+/** 卡片里最多先给几行，剩下的交给原页面的详情入口（§5：不超过 3 行）。 */
+export const CARD_LIST_PREVIEW = 3;
+
 export interface CardProps {
   title: string;
   section: DashboardSection;
-  span?: 'wide' | 'half' | 'third';
+  span?: CardSpan;
+  /**
+   * 锚点目标。
+   *
+   * 只给「渠道与模型」用：它在页尾，读不到时页顶那条告警要能跳过来，
+   * 否则人得自己判断"她说不出话"是哪里出的问题。
+   */
+  id?: string;
+  /**
+   * 卡片右上角的语义标记（如「未安排」）。
+   *
+   * 只写**结论**：状态码、内部枚举不进这里，人话标签见各自的 `*Label` 映射。
+   */
+  badge?: string;
   action?: { label: string; onClick: () => void };
+  /**
+   * 这块读不到时的重试。
+   *
+   * 服务端只有一个聚合 `/v1/dashboard`，所以"重试这一块"实际是重新取整页；
+   * 已经拿到的卡片会原样留着，不会退回加载态，只有仍是 unavailable 的那块
+   * 继续显示告警——这样一次局部失败不会被放大成整页失败。
+   */
+  onRetry?: () => void;
   /**
    * 空态也渲染内容。
    *
@@ -185,13 +218,28 @@ export interface CardProps {
  * 三态在这里一次处理完：加载中/空/失败各有各的样子，领域卡片只管
  * "拿到数据之后怎么画"。这样任何一块的失败都不会传染给整页。
  */
-export function Card({ title, section, span = 'half', action, renderWhenEmpty, children }: CardProps) {
+export function Card({
+  title,
+  section,
+  span = 6,
+  id,
+  badge,
+  action,
+  onRetry,
+  renderWhenEmpty,
+  children,
+}: CardProps) {
   const status = section?.status ?? 'unavailable';
   return (
-    <section className={`dash-card dash-card--${span}`} data-testid={`dash-${title}`}>
+    <section
+      className={`dash-card dash-card--span${span}`}
+      data-testid={`dash-${title}`}
+      {...(id ? { id } : {})}
+    >
       <header className="dash-card__head">
-        <h2 className="dash-card__title">{title}</h2>
+        <h3 className="dash-card__title">{title}</h3>
         <div className="dash-card__meta">
+          {badge ? <span className="dash-card__badge">{badge}</span> : null}
           {/*
             `empty` 也是「查到了，只是内容为空」，它同样带着后端采集时刻的
             `as_of`；不给时间人就没法判断这句"没有内容"是什么时候的结论。
@@ -212,9 +260,15 @@ export function Card({ title, section, span = 'half', action, renderWhenEmpty, c
            * 前者是故障、后者是事实。整页失败用 `.dash-error` 告警面板，
            * 这里用卡内的小号告警条——两者的分量与范围也不同。
            */
-          <p className="dash-card__unavailable" role="status">
-            <AlertIcon size={13} /> 暂时读不到这块数据。
-          </p>
+          <div className="dash-card__unavailable" role="status">
+            <AlertIcon size={13} />
+            <span className="dash-card__unavailable-text">暂时读不到这块数据。</span>
+            {onRetry ? (
+              <button type="button" className="dash-card__retry" onClick={onRetry}>
+                重试
+              </button>
+            ) : null}
+          </div>
         ) : status === 'empty' && !renderWhenEmpty ? (
           <p className="dash-card__muted">{emptyText(title)}</p>
         ) : (
@@ -222,6 +276,22 @@ export function Card({ title, section, span = 'half', action, renderWhenEmpty, c
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * 区块标题（「现在 / 接下来 / 已留下的记录 / 连接状态」）。
+ *
+ * 12 列网格里的整行元素（`grid-column: 1 / -1`）。加它是因为原来 12 张卡
+ * 平铺在同一个网格里，人只能逐张读卡片标题才知道哪张是"此刻"、哪张是
+ * "未来"；区块标题把顺序写死在版面上，而不是留给读者自己归纳。
+ */
+export function DashboardZone({ id, title, hint }: { id: string; title: string; hint: string }) {
+  return (
+    <header className="dash-zone" data-zone={id}>
+      <h2 className="dash-zone__title">{title}</h2>
+      <p className="dash-zone__hint">{hint}</p>
+    </header>
   );
 }
 
@@ -266,14 +336,20 @@ function emptyText(title: string): string {
   switch (title) {
     case '此刻':
       return '当前没有登记中的活动。';
+    case '可用性':
+      return '暂时没有可用性记录。';
     case '情绪':
       return '暂时没有状态记录。';
     case '手机':
       return '她还没拿起过手机。';
+    case '近期生活':
+      return '最近三天还没有记录下什么。';
     case '最近记住的事':
       return '还没有可展示的长期记忆。';
     case '关系':
       return '还没有足够的互动记录。';
+    case '渠道与模型':
+      return '还没有配置任何渠道，也还没绑定模型职责。';
     default:
       return '暂无内容。';
   }
@@ -308,14 +384,21 @@ export function AgendaBody({ data }: { data: Record<string, unknown> }): React.R
   const plans = (data.plans as Array<Record<string, unknown>>) ?? [];
   const commitments = (data.commitments as Array<Record<string, unknown>>) ?? [];
   const goals = (data.goals as Array<Record<string, unknown>>) ?? [];
+  /*
+   * 总览卡片只给前几条：这一块是"扫一眼知道今天有什么"，不是日程表本身。
+   * 剩下的条数必须明说，否则人会以为日程只有前面这几条（尤其在 375px 下，
+   * 看不到的条目没有任何暗示）。完整列表在「生活」页。
+   */
+  const plansShown = plans.slice(0, CARD_LIST_PREVIEW);
+  const commitmentsShown = commitments.slice(0, CARD_LIST_PREVIEW);
   return (
     <>
       <p className="dash-card__muted">打算做（可能变）</p>
-      {plans.length === 0 ? (
+      {plansShown.length === 0 ? (
         <p className="dash-card__muted">今天没有登记的日程。</p>
       ) : (
         <ul className="dash-list">
-          {plans.map((v) => (
+          {plansShown.map((v) => (
             <li key={String(v.plan_id)} className="dash-list__row">
               {/* 必须带日期：后端不按"今天"过滤，昨天的日程也会出现在这张卡里。 */}
               <span className="dash-list__kind">{formatDayTime(String(v.start_at ?? ''))}</span>
@@ -337,12 +420,15 @@ export function AgendaBody({ data }: { data: Record<string, unknown> }): React.R
           ))}
         </ul>
       )}
+      {plans.length > plansShown.length ? (
+        <p className="dash-card__muted">还有 {plans.length - plansShown.length} 条日程，去生活页看全部。</p>
+      ) : null}
       <p className="dash-card__muted">答应对方的事</p>
-      {commitments.length === 0 ? (
+      {commitmentsShown.length === 0 ? (
         <p className="dash-card__muted">没有待履行的承诺。</p>
       ) : (
         <ul className="dash-list">
-          {commitments.map((c) => {
+          {commitmentsShown.map((c) => {
             const state = String(c.state ?? '');
             const inactive = INACTIVE_COMMITMENT_STATES.has(state);
             return (
@@ -360,6 +446,11 @@ export function AgendaBody({ data }: { data: Record<string, unknown> }): React.R
           })}
         </ul>
       )}
+      {commitments.length > commitmentsShown.length ? (
+        <p className="dash-card__muted">
+          还有 {commitments.length - commitmentsShown.length} 条承诺，去生活页看全部。
+        </p>
+      ) : null}
       {goals.length > 0 ? (
         <p className="dash-card__muted">
           进行中的目标：{goals.map((g) => String(g.title ?? '')).join('、')}
@@ -474,13 +565,11 @@ export function TodayOutlineBody({ data }: { data: Record<string, unknown> }): R
   };
   return (
     <>
-      <p className="dash-card__muted">
-        你的今天 {displayDate || '未知'}（{outline.display_timezone ?? '未知'}）
-        {planDay ? ` · 她的计划日 ${planDay}（${outline.actor_timezone ?? '未知'}）` : ''}
-      </p>
+      {/* 「今天是哪天」压在页头（`dash__subtitle`）里，卡片里不再重复一遍。 */}
       {zonesDiffer ? (
         <p className="dash-card__muted" data-testid="dash-outline-tz-note">
-          两边日期不同：这里是你的今天，括号里是她的计划日——时间轴按各自的时区裁剪。
+          两边日期不同：你的今天 {displayDate}（{outline.display_timezone ?? '未知'}）与她的计划日{' '}
+          {planDay}（{outline.actor_timezone ?? '未知'}），时间轴按各自的时区裁剪。
         </p>
       ) : null}
       {items.length === 0 ? (
@@ -507,11 +596,17 @@ export function TodayOutlineBody({ data }: { data: Record<string, unknown> }): R
           ))}
         </ul>
       )}
-      <p className="dash-card__muted" data-testid="dash-outline-state">
-        状态：{outlineStateLabel(state) || '未知'}
-        {state === 'degraded' ? '（内容是规则兜底，不是模型排的）' : ''}
-        {state === 'failed' ? '（最近一次生成失败；原因码在生活页时间轴上）' : ''}
-      </p>
+      {/*
+        状态一行只在**需要提醒**时才出现：已生成是常态，占一行只会把有用的
+        摘要挤下去；规则兜底 / 生成失败 才是人需要知道的。
+      */}
+      {state === 'ready' ? null : (
+        <p className="dash-card__muted" data-testid="dash-outline-state">
+          状态：{outlineStateLabel(state) || '未知'}
+          {state === 'degraded' ? '（内容是规则兜底，不是模型排的）' : ''}
+          {state === 'failed' ? '（最近一次生成失败，详情在生活页时间轴上）' : ''}
+        </p>
+      )}
       {outline.note ? <p className="dash-card__muted">{outline.note}</p> : null}
     </>
   );
@@ -568,37 +663,279 @@ export function IntentTeaserBody({ data }: { data: Record<string, unknown> }): R
 }
 
 /**
- * 总览上的两块生活摘要。
+ * 12 列网格的正文（4 个区块 / 12 张卡）。
  *
- * 抽成独立组件只为一个测试目的：`DashboardPage` 在 SSR 下永远停在"加载中"，
- * 没法直接断言卡片内容；而"一块坏不影响另一块"与"relation 文案"正是这次
- * 必须钉住的行为。两块各自拿 `DashboardSection`（各带自己的 `status`），
- * 所以隔离性由结构保证，不靠调用方小心。
+ * 从 `DashboardPage` 里拆出来是为了能在 SSR 下断言区块顺序、每块独立降级和
+ * 首屏密度——`DashboardPage` 自己第一次渲染永远停在"加载中"。它只拿一个
+ * 已经解析好的 `DashboardResponse`，不负责取数、轮询或整页错误。
  */
-export function LifeOverviewCards({
-  today,
-  intent,
-  onOpenLife,
+export function DashboardBody({
+  data,
+  onOpenNow,
+  onOpenChat,
+  onOpenSettings,
+  onRetry,
 }: {
-  today: DashboardSection;
-  intent: DashboardSection;
-  onOpenLife: () => void;
+  data: DashboardResponse;
+  onOpenNow: () => void;
+  onOpenChat: () => void;
+  onOpenSettings: () => void;
+  onRetry: () => void;
 }) {
+  const s = data.sections;
+  const outline: DashboardSection = s.today_outline ?? MISSING_SECTION;
+  const intent: DashboardSection = s.intent_teaser ?? MISSING_SECTION;
+  const horizonUnplanned = (intent.data as Partial<IntentTeaserOut> | null | undefined)
+    ?.horizon_unplanned;
   return (
-    <>
+    <div className="dash__grid">
+      {/* ---------------------------------------------------------- A 现在 */}
+      <DashboardZone id="now" title="现在" hint="她此刻在做什么、能不能聊" />
+      <Card
+        title="此刻"
+        span={6}
+        section={s.activity}
+        onRetry={onRetry}
+        action={{ label: '查看生活', onClick: onOpenNow }}
+      >
+        {(d) => (
+          <>
+            <p className="dash-now__line">
+              <strong>
+                {STATE_LABEL[String(d.state)] ?? String(d.state ?? '')}
+              </strong>
+              {d.kind ? <span className="dash-now__kind">{String(d.kind)}</span> : null}
+            </p>
+            {d.place_id ? <p className="dash-card__muted">地点：{String(d.place_id)}</p> : null}
+            <p className="dash-now__origin">
+              来源：{ORIGIN_LABEL[String(d.origin)] ?? String(d.origin ?? '未知')}
+            </p>
+          </>
+        )}
+      </Card>
+
+      <Card
+        title="可用性"
+        span={3}
+        section={s.presence}
+        onRetry={onRetry}
+        action={{ label: '去聊天', onClick: onOpenChat }}
+      >
+        {(d) => (
+          <>
+            <p className="dash-now__line">
+              <strong>{AVAILABILITY_LABEL[String(d.availability)] ?? String(d.availability ?? '')}</strong>
+              <span className="dash-now__kind">
+                精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
+              </span>
+            </p>
+            <p className="dash-card__muted">{String(d.describe ?? '')}</p>
+          </>
+        )}
+      </Card>
+
+      <Card title="情绪" span={3} section={s.affect} onRetry={onRetry}>
+        {(d) => (
+          <>
+            <p className="dash-now__line">
+              <strong>{emotionLabel(d.emotion)}</strong>
+              <span className="dash-now__kind">
+                强度 {Math.round(Number(d.intensity ?? 0) * 100)}%
+              </span>
+            </p>
+            {d.cause ? <p className="dash-card__muted">因为：{String(d.cause)}</p> : null}
+          </>
+        )}
+      </Card>
+
+      {/*
+        「手机」单独一块：她低头看手机那段时间不回消息，不是装死。
+        真人一天解锁几十上百次，这段"在忙别的"里她照样在，只是没在看对话。
+        把这层画出来，「没秒回」才不会被读成「不理人」。
+      */}
+      <Card title="手机" span={6} section={s.phone} onRetry={onRetry}>
+        {(d) => <PhoneBody data={d} />}
+      </Card>
+
+      {/*
+        没有候选时也照常渲染：`empty` 分支的载荷里带着门控（能不能发、为什么
+        不能发），用一句"没有待处理的候选"盖掉它，就等于把「渠道不支持主动
+        联系」这件事藏起来了。
+      */}
+      <Card title="主动联系" span={6} section={s.proactive} renderWhenEmpty onRetry={onRetry}>
+        {(d) => {
+          const pending = Number(d.pending_count ?? 0);
+          return (
+            <>
+              <p className="dash-now__line">
+                <strong>{pending}</strong>
+                <span className="dash-now__kind">条候选</span>
+              </p>
+              <p className="dash-card__muted">{proactiveDeliveryLine(d)}</p>
+              {pending === 0 ? (
+                <p className="dash-card__muted">当前没有待处理的候选。</p>
+              ) : null}
+              {d.top ? (
+                <p className="dash-quote">
+                  “{String((d.top as Record<string, unknown>).draft_text ?? '（还没写开场白）')}”
+                </p>
+              ) : null}
+            </>
+          );
+        }}
+      </Card>
+
+      {/* ------------------------------------------------------ B 接下来 */}
+      <DashboardZone
+        id="next"
+        title="接下来"
+        hint="她可能做什么 / 已约定什么 —— 计划与承诺，不是已经发生的事"
+      />
+
       <Card
         title="今天的节奏"
-        span="half"
-        section={today}
+        span={6}
+        section={outline}
         renderWhenEmpty
-        action={{ label: '查看生活', onClick: onOpenLife }}
+        onRetry={onRetry}
+        action={{ label: '查看生活', onClick: onOpenNow }}
       >
         {(d) => <TodayOutlineBody data={d} />}
       </Card>
-      <Card title="未来意向" span="half" section={intent} renderWhenEmpty>
+
+      <Card
+        title="今天的安排"
+        span={6}
+        section={s.agenda}
+        renderWhenEmpty
+        onRetry={onRetry}
+        action={{ label: '查看生活', onClick: onOpenNow }}
+      >
+        {(d) => <AgendaBody data={d} />}
+      </Card>
+
+      <Card
+        title="未来意向"
+        span={12}
+        section={intent}
+        renderWhenEmpty
+        onRetry={onRetry}
+        // 「未安排」常驻可见：意向不等于日程，这条不能只在有内容时才说。
+        badge={horizonUnplanned === false ? undefined : '未安排'}
+        action={{ label: '查看生活', onClick: onOpenNow }}
+      >
         {(d) => <IntentTeaserBody data={d} />}
       </Card>
-    </>
+
+      {/* ------------------------------------------- C 已留下的记录 */}
+      <DashboardZone
+        id="records"
+        title="已留下的记录"
+        hint="已经发生的经历、已经记住的事 —— 与「接下来」里的计划分开读"
+      />
+
+      <Card title="近期生活" span={6} section={s.timeline} onRetry={onRetry}>
+        {(d) => {
+          const items = (d.items as Array<Record<string, unknown>>) ?? [];
+          return (
+            <ul className="dash-list">
+              {items.slice(0, CARD_LIST_PREVIEW).map((e) => (
+                <li key={String(e.experience_id)} className="dash-list__row">
+                  <span className="dash-list__kind">{String(e.occurred_at ?? '').slice(5, 16).replace('T', ' ')}</span>
+                  <span className="dash-list__text">{String(e.summary ?? '')}</span>
+                  <span className="dash-list__meta">
+                    {ORIGIN_LABEL[String(e.origin)] ?? String(e.origin ?? '')}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </Card>
+
+      <Card title="最近记住的事" span={6} section={s.memories} onRetry={onRetry}>
+        {(d) => {
+          const items = (d.items as Array<Record<string, unknown>>) ?? [];
+          return (
+            <ul className="dash-list">
+              {items.slice(0, CARD_LIST_PREVIEW).map((m) => (
+                <li key={String(m.memory_id)} className="dash-list__row">
+                  <span className="dash-list__kind">{String(m.kind ?? '')}</span>
+                  <span className="dash-list__text">{String(m.text ?? '')}</span>
+                  <span className="dash-list__meta">
+                    {ORIGIN_LABEL[String(m.origin)] ?? String(m.origin ?? '')}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          );
+        }}
+      </Card>
+
+      <Card
+        title="关系"
+        span={12}
+        section={s.relationship}
+        onRetry={onRetry}
+        action={{ label: '设置', onClick: onOpenSettings }}
+      >
+        {(d) => (
+          <>
+            <p className="dash-now__line">
+              <strong>熟悉度 {Number(d.familiarity ?? 0).toFixed(2)}</strong>
+              <span className="dash-now__kind">信任 {Number(d.trust ?? 0).toFixed(2)}</span>
+            </p>
+            <p className="dash-card__muted">
+              最近互动：{d.last_interaction_at ? String(d.last_interaction_at).slice(0, 16).replace('T', ' ') : '还没有'}
+            </p>
+          </>
+        )}
+      </Card>
+
+      <DashboardZone
+        id="connectivity"
+        title="连接状态"
+        hint="渠道与模型能不能用 —— 她说不出话时，问题通常在这里"
+      />
+
+      <Card
+        title="渠道与模型"
+        span={12}
+        id="dash-connectivity"
+        section={s.connectivity}
+        onRetry={onRetry}
+        action={{ label: '去设置', onClick: onOpenSettings }}
+      >
+        {(d) => {
+          const channels = (d.channels as Array<Record<string, unknown>>) ?? [];
+          const bound = (d.bound_model_roles as string[]) ?? [];
+          return (
+            <>
+              <ul className="dash-list">
+                {channels.map((ch) => (
+                  <li key={String(ch.channel)} className="dash-list__row">
+                    <span className="dash-list__kind">{String(ch.channel)}</span>
+                    <span className="dash-list__text">
+                      {ch.configured ? '已配置' : `未配置${ch.reason ? `（${String(ch.reason)}）` : ''}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="dash-card__muted">
+                {bound.length > 0
+                  ? `已绑定模型职责：${bound.join('、')}`
+                  : '还没有绑定任何模型职责——她现在说不出话。'}
+              </p>
+              {bound.length === 0 ? (
+                <button type="button" className="button" onClick={onOpenSettings}>
+                  去配置模型
+                </button>
+              ) : null}
+            </>
+          );
+        }}
+      </Card>
+    </div>
   );
 }
 
@@ -606,13 +943,26 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ExplainedError | null>(null);
+  /**
+   * 后台刷新失败的时刻。
+   *
+   * `error` 只留给"第一次就没拿到"的整页失败；定时刷新/手动刷新失败时页面
+   * 上已经有旧卡片，**不能**把它们换成错误面板——那样人正在读的状态会突然
+   * 消失。但也不能把旧数据当实时：页头写明哪次刷新没成功，卡片上的
+   * 「更新于」保持旧时刻不变。
+   */
+  const [refreshFailedAt, setRefreshFailedAt] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setError(null);
     try {
-      setData(await api.dashboard());
+      const next = await api.dashboard();
+      setData(next);
+      setError(null);
+      setRefreshFailedAt(null);
     } catch (cause) {
-      setError(explainError(cause));
+      const explained = explainError(cause);
+      setError((current) => current ?? explained);
+      setRefreshFailedAt((current) => current ?? new Date().toISOString());
     } finally {
       setLoading(false);
     }
@@ -637,14 +987,15 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
     );
   }
 
-  if (error || !data) {
+  // 只有**一次都没成功**时才是整页失败：没数据可降级，只能整体重试。
+  if (!data) {
     return (
       <div className="page">
         <div className="dash-error" role="alert">
           <AlertIcon />
           <div>
             <strong>{error?.reason ?? '读取失败'}</strong>
-            {error?.hint ? <p>{error.hint}</p> : null}
+            <p>{error?.hint ?? '这是网络或服务端的问题；稍后再试一次。'}</p>
           </div>
           <button type="button" className="button" onClick={() => void load()}>
             <RefreshIcon /> 重试
@@ -655,210 +1006,49 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
   }
 
   const s = data.sections;
+  const reload = () => void load();
+  const outline: DashboardSection = s.today_outline ?? MISSING_SECTION;
+  const outlineData = (outline.data ?? {}) as Partial<TodayOutlineOut>;
+  // 页头的一句话摘要：只说已经拿到的事实，读不到的块不在这里下结论。
+  const displayDate = String(outlineData.display_date ?? '');
 
   return (
     <div className="page dash">
       <header className="dash__head">
-        <h1 className="dash__title">总览</h1>
+        <div className="dash__heading">
+          <h1 className="dash__title">总览</h1>
+          <p className="dash__subtitle">
+            {displayDate ? `今天是 ${displayDate} · ` : ''}
+            先看她此刻怎样，再看接下来要做什么
+          </p>
+        </div>
         <div className="dash__meta">
           <span>更新于 {formatClock(data.generated_at)}</span>
-          <button type="button" className="dash__refresh" onClick={() => void load()}>
+          {refreshFailedAt ? (
+            <span className="dash__stale" role="status" data-testid="dash-refresh-failed">
+              刚刚这次没有更新成功（{formatClock(refreshFailedAt)}），下面是之前读到的时间
+            </span>
+          ) : null}
+          <button type="button" className="dash__refresh" onClick={reload}>
             <RefreshIcon /> 刷新
           </button>
         </div>
       </header>
 
-      <div className="dash__grid">
-        <Card
-          title="此刻"
-          span="wide"
-          section={s.activity}
-          action={{ label: '详细', onClick: onOpenNow }}
-        >
-          {(d) => (
-            <>
-              <p className="dash-now__line">
-                <strong>
-                  {STATE_LABEL[String(d.state)] ?? String(d.state ?? '')}
-                </strong>
-                {d.kind ? <span className="dash-now__kind">{String(d.kind)}</span> : null}
-              </p>
-              {d.place_id ? <p className="dash-card__muted">地点：{String(d.place_id)}</p> : null}
-              <p className="dash-now__origin">
-                来源：{ORIGIN_LABEL[String(d.origin)] ?? String(d.origin ?? '未知')}
-              </p>
-            </>
-          )}
-        </Card>
+      {data.sections.connectivity?.status === 'unavailable' ? (
+        // 页尾那块坏了，人在首屏根本滚不下去，而它正是"她没反应"最可能的原因。
+        <a className="dash-jump" href="#dash-connectivity" data-testid="dash-connectivity-alert">
+          渠道与模型这块暂时读不到，点这里看
+        </a>
+      ) : null}
 
-        <Card title="情绪" span="half" section={s.affect}>
-          {(d) => (
-            <>
-              <p className="dash-now__line">
-                <strong>{emotionLabel(d.emotion)}</strong>
-                <span className="dash-now__kind">
-                  强度 {Math.round(Number(d.intensity ?? 0) * 100)}%
-                </span>
-              </p>
-              {d.cause ? <p className="dash-card__muted">因为：{String(d.cause)}</p> : null}
-            </>
-          )}
-        </Card>
-
-        <Card title="可用性" span="half" section={s.presence}>
-          {(d) => (
-            <>
-              <p className="dash-now__line">
-                <strong>{AVAILABILITY_LABEL[String(d.availability)] ?? String(d.availability ?? '')}</strong>
-                <span className="dash-now__kind">
-                  精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
-                </span>
-              </p>
-              <p className="dash-card__muted">{String(d.describe ?? '')}</p>
-            </>
-          )}
-        </Card>
-
-        {/*
-          「手机」单独一块：她低头看手机那段时间不回消息，不是装死。
-          真人一天解锁几十上百次，这段"在忙别的"里她照样在，只是没在看对话。
-          把这层画出来，「没秒回」才不会被读成「不理人」。
-        */}
-        <Card title="手机" span="half" section={s.phone}>
-          {(d) => <PhoneBody data={d} />}
-        </Card>
-
-        {/*
-          没有候选时也照常渲染：`empty` 分支的载荷里带着门控（能不能发、为什么
-          不能发），用一句"没有待处理的候选"盖掉它，就等于把「渠道不支持主动
-          联系」这件事藏起来了。
-        */}
-        <Card title="主动联系" span="half" section={s.proactive} renderWhenEmpty>
-          {(d) => {
-            const pending = Number(d.pending_count ?? 0);
-            return (
-              <>
-                <p className="dash-now__line">
-                  <strong>{pending}</strong>
-                  <span className="dash-now__kind">条候选</span>
-                </p>
-                <p className="dash-card__muted">{proactiveDeliveryLine(d)}</p>
-                {pending === 0 ? (
-                  <p className="dash-card__muted">当前没有待处理的候选。</p>
-                ) : null}
-                {d.top ? (
-                  <p className="dash-quote">
-                    “{String((d.top as Record<string, unknown>).draft_text ?? '（还没写开场白）')}”
-                  </p>
-                ) : null}
-              </>
-            );
-          }}
-        </Card>
-
-        <Card title="今天的安排" span="half" section={s.agenda} renderWhenEmpty>
-          {(d) => <AgendaBody data={d} />}
-        </Card>
-
-        {/*
-          「今天她可能做什么」+「未来意向」：与旧 `agenda` **并列**，不改旧卡片
-          的语义。两块各有自己的 `status`（后端 `_guard` 逐块兜底），一块坏
-          不影响整页——所以它们是两张独立的卡，不塞进旧卡片里。
-        */}
-        <LifeOverviewCards
-          today={s.today_outline ?? MISSING_SECTION}
-          intent={s.intent_teaser ?? MISSING_SECTION}
-          onOpenLife={onOpenNow}
-        />
-
-        <Card title="最近记住的事" span="wide" section={s.memories}>
-          {(d) => {
-            const items = (d.items as Array<Record<string, unknown>>) ?? [];
-            return (
-              <ul className="dash-list">
-                {items.map((m) => (
-                  <li key={String(m.memory_id)} className="dash-list__row">
-                    <span className="dash-list__kind">{String(m.kind ?? '')}</span>
-                    <span className="dash-list__text">{String(m.text ?? '')}</span>
-                    <span className="dash-list__meta">
-                      {ORIGIN_LABEL[String(m.origin)] ?? String(m.origin ?? '')}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            );
-          }}
-        </Card>
-
-        <Card title="近期生活" span="wide" section={s.timeline}>
-          {(d) => {
-            const items = (d.items as Array<Record<string, unknown>>) ?? [];
-            return (
-              <ul className="dash-list">
-                {items.map((e) => (
-                  <li key={String(e.experience_id)} className="dash-list__row">
-                    <span className="dash-list__kind">{String(e.occurred_at ?? '').slice(5, 16).replace('T', ' ')}</span>
-                    <span className="dash-list__text">{String(e.summary ?? '')}</span>
-                    <span className="dash-list__meta">
-                      {ORIGIN_LABEL[String(e.origin)] ?? String(e.origin ?? '')}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            );
-          }}
-        </Card>
-
-        <Card
-          title="关系"
-          span="half"
-          section={s.relationship}
-          action={{ label: '设置', onClick: onOpenSettings }}
-        >
-          {(d) => (
-            <>
-              <p className="dash-now__line">
-                <strong>熟悉度 {Number(d.familiarity ?? 0).toFixed(2)}</strong>
-                <span className="dash-now__kind">信任 {Number(d.trust ?? 0).toFixed(2)}</span>
-              </p>
-              <p className="dash-card__muted">
-                最近互动：{d.last_interaction_at ? String(d.last_interaction_at).slice(0, 16).replace('T', ' ') : '还没有'}
-              </p>
-            </>
-          )}
-        </Card>
-
-        <Card title="渠道与模型" span="half" section={s.connectivity}>
-          {(d) => {
-            const channels = (d.channels as Array<Record<string, unknown>>) ?? [];
-            const bound = (d.bound_model_roles as string[]) ?? [];
-            return (
-              <>
-                <ul className="dash-list">
-                  {channels.map((ch) => (
-                    <li key={String(ch.channel)} className="dash-list__row">
-                      <span className="dash-list__kind">{String(ch.channel)}</span>
-                      <span className="dash-list__text">
-                        {ch.configured ? '已配置' : `未配置${ch.reason ? `（${String(ch.reason)}）` : ''}`}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                <p className="dash-card__muted">
-                  {bound.length > 0
-                    ? `已绑定模型职责：${bound.join('、')}`
-                    : '还没有绑定任何模型职责——她现在说不出话。'}
-                </p>
-                {bound.length === 0 ? (
-                  <button type="button" className="button" onClick={onOpenSettings}>
-                    去配置模型
-                  </button>
-                ) : null}
-              </>
-            );
-          }}
-        </Card>
-      </div>
+      <DashboardBody
+        data={data}
+        onOpenNow={onOpenNow}
+        onOpenChat={onOpenChat}
+        onOpenSettings={onOpenSettings}
+        onRetry={reload}
+      />
 
       <p className="dash__foot">
         <button type="button" className="dash__refresh" onClick={onOpenChat}>

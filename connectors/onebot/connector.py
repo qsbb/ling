@@ -33,6 +33,10 @@ from ling.contracts.v1 import (
     InputPart,
     InteractionEnvelope,
     Modality,
+    OutboundRecallState,
+    RecallEvent,
+    RecallKind,
+    RecallReceipt,
     new_id,
 )
 from ling.ports.channel import (
@@ -40,6 +44,7 @@ from ling.ports.channel import (
     ChannelError,
     ChannelErrorKind,
     OutboundMessage,
+    RecallRequest,
     ReceiptQuery,
     delivery_text_digest,
 )
@@ -85,6 +90,28 @@ EXPLICIT_MISSING_GRACE_SECONDS = 180.0
 
 # 平台明确说"消息不存在"的字样（NapCat 的 GetMsg 抛 `Error('消息不存在')`）。
 _MISSING_HINTS = ("消息不存在", "not found", "消息不存在或已撤回")
+
+
+# 已知、且**按设计**不进入任何链路的 notice 类型（静默丢弃，不记日志）。
+#
+# 判据只有一条：它不改变"我们手里的知识是否还成立"。撤回会改（所以它单独走
+# `_recall_from_notice`），入群/戳一戳/改名片都不会。
+#
+# 不在这里的类型一律记一条「暂不处理」——静默掉未知类型会让"平台加了新的
+# 撤回类事件"这类情况永远看不见。
+_IGNORED_NOTICE_TYPES: frozenset[str] = frozenset(
+    {
+        "notify",  # 戳一戳 / 群签到 / 运气王，sub_type 区分
+        "group_increase",
+        "group_decrease",
+        "group_admin",
+        "group_card",
+        "group_ban",
+        "group_upload",
+        "friend_add",
+        "group_msg_emoji_like",  # NapCat 扩展：表情回应
+    }
+)
 
 
 class OneBotV11Connector(ChannelConnector):
@@ -269,6 +296,88 @@ class OneBotV11Connector(ChannelConnector):
             message.window_ref,
             message.text,
             _now(),
+        )
+
+    async def recall(self, request: RecallRequest) -> RecallReceipt:
+        """**主动撤回**我们发出去的那条（OneBot ``delete_msg``）。
+
+        ## 只有 ``message_id`` 一条判据
+
+        撤回是不可逆的破坏性动作：撤错了等于把别人的话从群里抹掉。所以这里
+        只认 ``request.platform_message_id``——那是我们发送时拿到的**真实回执
+        id**，不是正文、不是时间、不是本地 id。上层（
+        `domains/conversation/recall.py`）已经在发 action 之前核对过
+        "这条确实是她自己发的、还在时间窗内"，连接器只负责把平台的回答翻译成
+        五个状态之一。
+
+        ## 平台错误 → 状态映射（**不许猜成成功**）
+
+        | 平台表现 | 我们的状态 | 理由 |
+        | --- | --- | --- |
+        | ``retcode=0`` | ``recalled`` | 平台明确接受 |
+        | 404（实现没有这个 API） | ``unsupported`` | 这个 OneBot 实现不支持 |
+        | 业务失败且文案是"消息不存在/已撤回" | ``not_found`` | 目标已经不在平台上 |
+        | 业务失败且文案是"超过时间/权限" | ``expired`` | 平台明确拒绝（时间窗） |
+        | 其它业务失败 | ``uncertain`` | 可能已经撤了，不能谎报 |
+        | 超时/断连/非 JSON | ``uncertain`` | 结果未知，**可重试但不重复撤** |
+
+        **注意**：`expired` 与 `not_found` 都来自平台自己的说法。我们**不**
+        用本地时间猜——平台的时间窗会变，而我们的时钟不可信。
+        """
+        message_id = str(request.platform_message_id or "").strip()
+        if not message_id:
+            # 走到这里说明上层没做校验（不该发生）。不猜、不发 action。
+            return RecallReceipt(
+                receipt_id=new_id("rcpt"),
+                channel=self.connector_id,
+                state=OutboundRecallState.uncertain,
+                observed_at=_now(),
+                detail="没有可用的平台消息 id，未发起撤回",
+            )
+        try:
+            await self._call("delete_msg", {"message_id": message_id})
+        except ChannelError as exc:
+            return self._recall_from_error(message_id, exc)
+        return RecallReceipt(
+            receipt_id=new_id("rcpt"),
+            channel=self.connector_id,
+            state=OutboundRecallState.recalled,
+            platform_message_id=message_id,
+            observed_at=_now(),
+        )
+
+    def _recall_from_error(self, message_id: str, exc: ChannelError) -> RecallReceipt:
+        """把 ``delete_msg`` 的失败翻译成对外状态（见 :meth:`recall` 的映射表）。"""
+        kind = exc.kind
+        text = exc.message or ""
+        lowered = text.lower()
+        if kind is ChannelErrorKind.unsupported:
+            state = OutboundRecallState.unsupported
+            detail = "这个 OneBot 实现没有 delete_msg（不支持撤回）"
+        elif kind in (ChannelErrorKind.unreachable, ChannelErrorKind.uncertain):
+            # **先按错误类别判，再按文案判**：断连/超时/非 JSON 是"我们没拿到
+            # 回答"，绝不能因为文案里恰好有 "timeout" 就被读成"平台说超时"——
+            # 那会把一次网络抖动说成"过了撤回时间窗"，用户就再也不会重试了。
+            state = OutboundRecallState.uncertain
+            detail = f"撤回结果未知（{text[:120]}）"
+        elif _looks_recall_expired(lowered):
+            state = OutboundRecallState.expired
+            detail = "平台拒绝了撤回：超过允许的撤回时间或没有权限"
+        elif _looks_missing(lowered):
+            state = OutboundRecallState.not_found
+            detail = "平台上已经找不到这条消息"
+        else:
+            # 其余一律"结果未知"：可能已经撤掉了，说失败会让用户重试，
+            # 而重试一次撤回只会得到一个"找不到"——那反而像故障。
+            state = OutboundRecallState.uncertain
+            detail = f"撤回结果未知（{text[:120]}）"
+        return RecallReceipt(
+            receipt_id=new_id("rcpt"),
+            channel=self.connector_id,
+            state=state,
+            platform_message_id=message_id,
+            observed_at=_now(),
+            detail=detail,
         )
 
     async def query_receipt(self, query: ReceiptQuery) -> DeliveryReceipt:
@@ -486,6 +595,84 @@ class OneBotV11Connector(ChannelConnector):
         """
         return self._event_message_ids.get(str(external_event_id or ""))
 
+    def _recall_from_notice(self, payload: dict) -> RecallEvent | None:
+        """``notice.group_recall`` / ``notice.friend_recall`` → `RecallEvent`。
+
+        ## 只认这两种，其余返回 None
+
+        OneBot V11 的 notice 有十几种（poke / group_increase /
+        group_card / group_admin / friend_add…）。**只有撤回**会改变"我们手里
+        的知识是否还成立"，其余一律不接。不接不等于报错：调用方会把它们归到
+        ``ignored``，不刷日志。
+
+        ## 字段映射（按 OneBot V11 规范）
+
+        - ``group_recall``：``group_id`` / ``user_id``（原发言人）/
+          ``operator_id``（谁点的撤回）/ ``message_id``
+        - ``friend_recall``：``user_id``（对方）/ ``message_id``
+          （规范里没有 ``operator_id``，撤回人就是对方本人）
+
+        ## 为什么 ``self_recall`` 要单独标
+
+        机器人自己撤回自己的消息时也会来一条 ``*_recall``（``user_id`` 等于
+        ``self_id``）。它不是"对方收回了"，而是"我们自己收回了"。混在一起会
+        让行为日志说成"对方撤回了一条消息"——那是错误归属。本轮对它的处置
+        只是记录（原文照样不再进上下文，这一点对两边都成立）。
+        """
+        notice_type = str(payload.get("notice_type") or "")
+        if notice_type not in {"group_recall", "friend_recall"}:
+            return None
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            # 没有 message_id 就无从对应任何本地消息：**不猜**。
+            logger.debug(
+                "撤回通知缺少 message_id，按未匹配丢弃：notice=%s", notice_type
+            )
+            return None
+        is_group = notice_type == "group_recall"
+        self_id = str(payload.get("self_id") or self._config.self_id or "")
+        user_id = str(payload.get("user_id") or "") or None
+        operator_id = str(payload.get("operator_id") or "") or None
+        group_id = str(payload.get("group_id") or "") if is_group else None
+        target_id = group_id or user_id
+        if is_group and not group_id:
+            logger.debug("群撤回通知缺少 group_id，按未匹配丢弃：message_id=%s", message_id)
+            return None
+
+        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+        sender_name = _clean_name((sender or {}).get("card")) or _clean_name(
+            (sender or {}).get("nickname")
+        )
+        return RecallEvent(
+            connector_instance=self.instance_id,
+            # 去重键：同一个 message_id 只会被撤回一次；平台重投时 id 相同。
+            external_event_id=f"{self.instance_id}:recall:{message_id}",
+            recall_kind=RecallKind.group if is_group else RecallKind.friend,
+            platform_message_id=message_id,
+            operator_ref=operator_id or user_id,
+            target_ref=target_id,
+            window_ref=(
+                window_ref_for(
+                    is_group=True,
+                    target_id=str(group_id),
+                    instance_id=self.instance_id,
+                )
+                if is_group and group_id
+                else (
+                    window_ref_for(
+                        is_group=False,
+                        target_id=str(user_id),
+                        instance_id=self.instance_id,
+                    )
+                    if user_id
+                    else None
+                )
+            ),
+            occurred_at=_from_ts(payload.get("time")),
+            sender_name=sender_name,
+            self_recall=bool(self_id) and (user_id == self_id or operator_id == self_id),
+        )
+
     def _remember_message_id(self, message_id: str, external_event_id: str) -> None:
         """记下一条见过的入站 message_id（引用白名单 + 上下文 id）。"""
         if message_id not in self._known_message_set:
@@ -678,8 +865,8 @@ class OneBotV11Connector(ChannelConnector):
         ).hexdigest()
         return hmac.compare_digest(signature[len("sha1=") :], expected)
 
-    def normalize_inbound(self, payload: dict) -> InteractionEnvelope:
-        """把 OneBot 事件翻译成交互信封。
+    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent:
+        """把 OneBot 事件翻译成交互信封；**撤回**除外（返回 `RecallEvent`）。
 
         只翻译，不改写语义：文本原样进 ``parts``，
         @ 与引用作为结构化字段保留，供决策层判断"是不是在跟我说话"。
@@ -730,10 +917,32 @@ class OneBotV11Connector(ChannelConnector):
             raise ChannelError(
                 ChannelErrorKind.ignored, f"message_sent:{message_id or ''}"
             )
+        if post_type == "notice":
+            # **撤回**是唯一需要内核处理的 notice：对方把他的那条收回了，
+            # 我们不能再把原文喂给模型。其余 notice（戳一戳、入群、群名片
+            # 更新…）仍然不进入任何链路——它们没有需要撤回的知识。
+            recall = self._recall_from_notice(payload)
+            if recall is not None:
+                return recall  # 类型故意与信封不同：它不是一条消息
+
+            notice_type = str(payload.get("notice_type") or "")
+            if notice_type in _IGNORED_NOTICE_TYPES:
+                # 已知且**按设计**不进任何链路：戳一戳、入群、群名片…
+                # 它们在活跃群里很频繁，逐条记日志会把真正要看的东西挤出去。
+                raise ChannelError(
+                    ChannelErrorKind.ignored,
+                    f"notice:{notice_type}:{payload.get('sub_type') or ''}",
+                )
+            # 不认识的 notice 类型仍然记一条：那是"出现了新东西"，
+            # 与"已知的不重要"不是一回事（把两者都静默掉，将来平台加了
+            # 新的撤回类事件我们会毫无察觉）。
+            raise ChannelError(
+                ChannelErrorKind.unsupported,
+                f"暂不处理 OneBot notice 类型: {notice_type or '（空）'}",
+            )
         if post_type != "message":
-            # notice/request 目前不进入对话链路。
-            # 它们仍有价值（入群、撤回、戳一戳、加好友请求），但要先有对应
-            # 处理策略，不能当普通消息塞给模型。
+            # request（加好友/入群邀请）不进入对话链路，也不该被当成
+            # "不支持"打日志——那是设计如此，不是缺口。
             raise ChannelError(
                 ChannelErrorKind.unsupported, f"暂不处理 OneBot 事件类型: {post_type}"
             )
@@ -906,6 +1115,10 @@ class OneBotV11Connector(ChannelConnector):
             supports_group=self._config.supports_group,
             supports_proactive=self._config.supports_proactive,
             supports_media=self._config.supports_media,
+            # OneBot V11 有 ``delete_msg``（NapCat/Lagrange/go-cqhttp 都实现）。
+            # 具体能不能撤、撤多久以内，由平台在调用时回答——这里只声明
+            # "我们会去试"，不声明"一定能成功"。
+            supports_recall=True,
             max_text_length=self._config.max_text_length,
             receipt_reliability="best_effort",
             enabled=bool(self._config.api_base),
@@ -1018,6 +1231,30 @@ def _aware(value):  # noqa: ANN001, ANN202
     if not isinstance(value, datetime):
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _looks_recall_expired(message: str) -> bool:
+    """平台是否在说"超时/没权限撤回"。
+
+    关键词取自 NapCat / go-cqhttp 的常见文案（"timeout" / "超过" /
+    "权限" / "not allowed" / "expired"）。**只在撤回路径上用**：这里宁可
+    把一次失败归成 ``expired``（用户看到"超时了撤不回"），也不要归成
+    ``uncertain`` 让用户反复重试——重试一次撤回不可能成功。
+    """
+    lowered = (message or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "timeout",
+            "time out",
+            "超时",
+            "超过",
+            "过期",
+            "expired",
+            "not allowed",
+            "权限",
+        )
+    )
 
 
 def _looks_missing(message: str) -> bool:

@@ -2609,6 +2609,70 @@ button {
   margin-top: 10px;
 }
 
+/*
+ * 正在合并的那一张卡片。
+ *
+ * 关系页默认每张卡片都是只读摘要，只有点开「合并到…」的那**一张**才展开候选
+ * 下拉（旧实现给每张卡片都渲染全量候选，n 条就是 n² 个 <option>，2000 条
+ * 直接 400 万个节点把浏览器卡死）。所以这里的视觉重点是"当前是哪一张在编辑"：
+ * 加一圈强调色边框，避免用户点开之后分不清选的是谁。
+ */
+.account-card--editing {
+  border-color: var(--accent, #6a7258);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #6a7258) 18%, transparent);
+}
+
+/*
+ * 关系页的搜索框与「加载更多」。
+ *
+ * `min-width: 0` 是关键：flex 容器里 input 的默认固有宽度会撑破 375px 视口
+ * （`min-width: auto` 的经典坑），这里让它可收缩。
+ */
+.identity-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 14px;
+}
+
+.identity-search input {
+  flex: 1 1 180px;
+  min-width: 0;
+  border: 1px solid var(--line-strong, #d8cdb8);
+  border-radius: 9px;
+  background: #fffdf8;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.identity-search input:focus {
+  outline: none;
+  border-color: #b9af99;
+  box-shadow: 0 0 0 3px rgba(106, 114, 88, 0.1);
+}
+
+.identity-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 16px 0 8px;
+}
+
+/*
+ * 「合并到谁」的下拉。只在展开的那一张卡片里出现，最长可能装着已加载的全部
+ * 候选（首屏 50 个，加上"加载更多"后的若干页）。限宽 + 省略，避免长昵称
+ * 把卡片撑出横向滚动。
+ */
+.account-card__actions select {
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line-strong, #d8cdb8);
+  border-radius: 9px;
+  background: #fffdf8;
+}
+
 .badge--muted {
   opacity: 0.65;
 }
@@ -2628,17 +2692,36 @@ button {
 
 /* ------------------------------------------------------------ 总览（仪表盘） */
 
+/*
+ * 总览用满主区宽度（不再限 1200 居中）。
+ *
+ * 实测：1440 视口下主区只有 1148px，而 1200 的上限让它"看起来居中、实际贴左"，
+ * 右边留一条空带；窄一点的桌面（1100–1200）反而被这层限宽挤到只剩 860–960，
+ * 4 个区块要竖着堆。全宽之后每个断点的列宽都实打实给到内容。
+ *
+ * 行宽由卡片自己把关：一列卡最多 3 行、一行一个字条，不会出现"一行字横跨
+ * 整个屏幕"的读不下去。
+ */
 .dash {
-  max-width: 1200px;
-  margin: 0 auto;
+  width: 100%;
 }
 
+/*
+ * 页头：左「总览 + 一句说明」，右「更新时间 + 刷新」。
+ *
+ * 窄屏改成纵向堆叠（见 dashboard.css 的 560px 断点）：两段挤在一行时，
+ * 更新时间与刷新按钮会把标题挤到换行。
+ */
 .dash__head {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 16px;
+}
+
+.dash__heading {
+  min-width: 0;
 }
 
 .dash__title {
@@ -2647,12 +2730,32 @@ button {
   font-weight: 600;
 }
 
+/* 页头副标题：告诉人这页从上往下该按什么顺序读，而不是再复述一遍状态。 */
+.dash__subtitle {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted, #6b7280);
+}
+
 .dash__meta {
   display: flex;
   align-items: center;
   gap: 12px;
   font-size: 12px;
   color: var(--muted, #6b7280);
+  flex: none;
+}
+
+/*
+ * 后台刷新失败：旧卡片留着，但必须明说"这不是刚读到的"。
+ * 用警示色而不是错误红——数据还在，只是没更新上。
+ */
+.dash__stale {
+  color: var(--warn);
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-width: 260px;
 }
 
 .dash__refresh {
@@ -2672,11 +2775,21 @@ button {
   background: rgba(127, 127, 127, 0.12);
 }
 
-/* 12 列网格：宽卡占 7，半卡占 5/6，窄屏塌成单列且顺序不变 */
+/*
+ * 12 列网格：卡片按「3 / 6 / 12」占列（`CardSpan`），区块标题占整行。
+ *
+ * `container-type: inline-size`：卡片多宽由视口决定（左导航在 ≤900 会收起、
+ * `.page` 的内边距也随断点变），固定列数在 941–1200 这段会把两张 6 列卡挤成
+ * 340px。改成按网格自身宽度查询后，规则与"这行还能不能放下两张卡"直接对应
+ * （见 dashboard.css 的两条 `@container`）。
+ */
 .dash__grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 14px;
+  align-items: start;
+  container-type: inline-size;
+  container-name: dashgrid;
 }
 
 .dash-card {
@@ -2687,16 +2800,54 @@ button {
   min-height: 96px;
   display: flex;
   flex-direction: column;
+  /*
+   * 网格项默认 `min-width: auto`：卡片里的 `.dash-list__meta` 是 `white-space:
+   * nowrap`，会把卡片的最小宽度顶到内容宽度，3/6 列的卡就被撑成几十像素宽
+   * （实测 1440 下每列 8px、文字竖排）。这里必须显式归零，让省略号生效。
+   */
+  min-width: 0;
 }
 
-.dash-card--wide { grid-column: span 7; }
-.dash-card--half { grid-column: span 5; }
-.dash-card--third { grid-column: span 4; }
+.dash-card--span3 { grid-column: span 3; }
+.dash-card--span6 { grid-column: span 6; }
+.dash-card--span12 { grid-column: span 12; }
 
-@media (max-width: 900px) {
-  .dash-card--wide,
-  .dash-card--half,
-  .dash-card--third { grid-column: span 12; }
+/*
+ * 区块标题（现在 / 接下来 / 已留下的记录 / 连接状态）。
+ * 整行 + 上边距：四个区块在版面上有明确的分界，避免 12 张卡平铺成一堵墙。
+ */
+.dash-zone {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 10px 0 -4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+/* 第一区块不需要顶部分隔线（头顶就是页头）。 */
+.dash-zone:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.dash-zone__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+}
+
+.dash-zone__hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-faint);
 }
 
 .dash-card__head {
@@ -2705,6 +2856,8 @@ button {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .dash-card__title {
@@ -2721,6 +2874,8 @@ button {
   gap: 8px;
   font-size: 11px;
   color: var(--muted, #6b7280);
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .dash-card__action {
@@ -2735,6 +2890,7 @@ button {
 
 .dash-card__body {
   flex: 1;
+  min-width: 0;
   font-size: 13px;
 }
 
@@ -2783,6 +2939,8 @@ button {
   align-items: baseline;
   padding: 4px 0;
   border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.06));
+  /* 与 `.dash-card` 同一个理由：不让 nowrap 的元信息顶宽整行。 */
+  min-width: 0;
 }
 
 .dash-list__row:last-child {
@@ -2798,6 +2956,7 @@ button {
 
 .dash-list__text {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

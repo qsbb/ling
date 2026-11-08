@@ -1,0 +1,37 @@
+{
+  "$id": "https://ling.local/contracts/v1/ConnectorChangeRequest.schema.json",
+  "additionalProperties": false,
+  "description": "`PUT /v1/settings/connectors/{scope}` 的请求体。\n\n``set`` 里没出现的键 = 不改；密钥空串 = 不改；``clear`` = 删除覆盖回退\nenv（不是写空串）。同一个键同时出现在两边 → 422。",
+  "properties": {
+    "clear": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Clear",
+      "type": "array"
+    },
+    "set": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
+      "title": "Set",
+      "type": "object"
+    }
+  },
+  "title": "ConnectorChangeRequest",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

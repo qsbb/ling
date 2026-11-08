@@ -313,6 +313,23 @@ HISTORY_MESSAGE_ID_LIMIT = 12
 # 由入站桥在落库时写（`InboundBridge._remember_platform_message_id`）。
 PLATFORM_MESSAGE_ID_SCOPE = "platform_msgid"
 
+# 撤回但**她当时已经看过**的消息，在上下文里的旁白注记。
+#
+# 为什么不是"把这行删掉"：她见过这条、也已经据此回过话。删掉等于抹掉
+# "她见过"这件事，而且下一轮她会完全不理解自己上一条回复在说什么。
+#
+# 为什么不是命令（"不要提这件事"）：该不该提由她决定。代码只把事实摆出来，
+# 措辞留给人设——这是本项目一贯的分工（状态影响表达，不改变许可）。
+RETRACTED_NOTE = "（这条消息后来被撤回了）"
+
+#: **她自己**把这条收回去了，在上下文里的旁白注记。
+#:
+#: 为什么和入站的 `RETRACTED_NOTE` 分开写：措辞不同，而且必须不同——
+#: "被撤回"读起来像对方撤的，"我后来撤回了这条"才说得清是谁动的手。
+#: 她自己撤回的发言**一定**保留在上下文里（她说过、也据此发生过后续），
+#: 只是要让她知道自己后来收回了，否则下一轮她会当那条还挂在平台上继续引用。
+SELF_RECALLED_NOTE = "（我后来撤回了这条）"
+
 
 def message_id_token(raw: str) -> str:
     """把平台 id 缩成上下文里好读的 token。
@@ -427,22 +444,44 @@ class ContextCompiler:
         contributions: list[ContextContribution] = []
         compiled_meta: dict[str, object] = {}
 
-        contributions.append(
-            ContextContribution(
-                lane="persona",
-                # system_prompt + traits。**traits 原本完全没进提示词**——
-                # 人设页有专门的 JSON 编辑器编辑它，而模型从来没看见过。
-                # 想让她在群里话多、语气更冷，写在那儿就该生效。
-                text="\n\n".join(
-                    part
-                    for part in (persona.system_prompt, format_traits(persona.traits))
-                    if part
-                ),
-                origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
-                visibility=Visibility.subject_private,
-                token_budget=DEFAULT_BUDGETS["persona"],
-            )
+        # system_prompt + traits。**traits 原本完全没进提示词**——
+        # 人设页有专门的 JSON 编辑器编辑它，而模型从来没看见过。
+        # 想让她在群里话多、语气更冷，写在那儿就该生效。
+        persona_text = "\n\n".join(
+            part for part in (persona.system_prompt, format_traits(persona.traits)) if part
         )
+        # **人设是空的时候，一条消息都不发。**
+        #
+        # 原来无条件追加，于是 `system_prompt=""` 且 `traits={}` 时这里塞进去
+        # 一条 `content=""` 的 system 消息。三个后果都真实发生过：
+        # 1. 「查看本次提示词」里出现一个**内容为空的「人设」块**——用户看到的
+        #    就是"人设没有被注入"，而真正的原因是库里那一行本来就是空的
+        #    （实测：空人设 → `messages[0]` 长度 0）；
+        # 2. 空 system 段对某些供应商是"给了一段空指令"，措辞全丢；
+        # 3. 它仍然占一条消息位，排查时反而要多看一层。
+        #
+        # 空人设**不自动补默认值**：清空是用户的明确动作，替他塞回默认等于
+        # 把他的删除操作悄悄撤销。改为记进 meta + 日志，让"人设为空"这件事
+        # 可被看见、可被查（`persona_empty`）。
+        if persona_text:
+            contributions.append(
+                ContextContribution(
+                    lane="persona",
+                    text=persona_text,
+                    origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["persona"],
+                )
+            )
+        compiled_meta["persona_chars"] = len(persona_text)
+        compiled_meta["persona_empty"] = not persona_text
+        if not persona_text:
+            logger.warning(
+                "人设为空：本轮提示词里没有人设（persona_id=%s）。"
+                "这不是注入链路故障——库里那一行的 system_prompt 与 traits 都是空的，"
+                "去「人设」页填上即生效",
+                self._persona_id,
+            )
         contributions.append(
             ContextContribution(
                 lane="constraints",
@@ -1006,6 +1045,11 @@ class ContextCompiler:
                     .where(
                         _Message.window_id == window_id,
                         _Message.role == "actor",
+                        # 这里**不按 `retracted_at` 过滤**：数的是"她自己说了
+                        # 几遍同一句话"。她自己撤回过一句，那句话仍然是她说过的
+                        # （重复提醒是给她的自省，不是对外引用）。
+                        # 撤回真正要拦的是**对方**那一条进上下文，见
+                        # `messages_for_prompt`。
                     )
                     .order_by(_Message.sequence.desc())
                     .limit(5)
@@ -1079,6 +1123,11 @@ class ContextCompiler:
         #
         # `ContextContribution` 是 **frozen** 的契约模型，不能原地赋值
         # （`c.text = ...` 抛 `ValidationError`，不是"截断"）。所以造新对象。
+        # **空文本的车道整条不发**：一条 `content=""` 的 system 消息既没有任何
+        # 信息，又会在快照里变成一个"看起来注入了、其实是空的"块。任何车道
+        # （不只是人设）渲染出空串时都不该占消息位。
+        contributions = [c for c in contributions if c.text.strip()]
+
         capped: list[ContextContribution] = []
         for c in contributions:
             budget_chars = max(80, c.token_budget * 2)  # 保守：按 2 字符/token 估算
@@ -1278,6 +1327,26 @@ class ContextCompiler:
             name = speaker_names.get(msg.sender_subject_id or "")
             if name and role == "user":
                 content = f"{name}：{content}"
+            # **撤回的两种落点在这里分开**（见 `messages_for_prompt`）：
+            #
+            # 走到这个循环里的消息，要么没被撤回，要么"她撤回前已经看过"
+            # （没看过的在取数时就被剔除了）。对后者补一句注记：
+            #
+            # - 不抹掉原文：她已经据此回过话了，抹掉等于篡改她见过的事实；
+            # - 但也不能装作没撤回过：对方明确收回了，她不该在下一轮继续
+            #   把它当"对方说过的话"引用（"你刚才说……"会让人莫名其妙）。
+            #
+            # 注记写成**括号里的旁白**而不是给她下指令：她该不该提这件事
+            # 由她自己决定（人设自由度），代码只负责把事实摆出来。
+            if getattr(msg, "retracted_at", None) is not None:
+                content = f"{content}{RETRACTED_NOTE}"
+            # 她自己撤回的那条：措辞换成第一人称（谁撤回的不能混）。
+            #
+            # 为什么**不**剔除：撤回发生在她说出口之后，平台的对话里已经没有
+            # 这条，但"她说过这句话"是既成事实——删掉会让下一轮的她完全不理解
+            # 自己上一条回复在说什么（和入站"已看过"那条同理）。
+            if getattr(msg, "recalled_at", None) is not None:
+                content = f"{content}{SELF_RECALLED_NOTE}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
             mark = history_marks.get(msg.message_id) if role == "user" else None
@@ -1533,7 +1602,11 @@ def render_rollup(dropped: list, *, prev_summary: str | None = None) -> str:
         text = (msg.text or "").strip().replace("\n", " ")
         if not text:
             continue
-        lines.append(f"{who}「{text[:120]}」")
+        # 摘要里也要留下"这条后来被撤回了"：原文一旦压进摘要，
+        # 下一轮她看到的就是这段回顾——旁白不能只加在原文那一侧，
+        # 否则撤回的痕迹会随着消息被挤出窗口而消失。
+        note = "（后来被撤回了）" if getattr(msg, "retracted_at", None) else ""
+        lines.append(f"{who}「{text[:120]}」{note}")
     return "\n".join(lines)
 
 

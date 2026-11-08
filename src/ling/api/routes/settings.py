@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
 from ling.api.errors import LingError
 from ling.audit import audit_event
-from ling.contracts.v1 import ErrorCode
+from ling.contracts.v1 import (
+    ConnectorAccessGroupOut,
+    ConnectorActivationOut,
+    ConnectorFieldOut,
+    ConnectorsOut,
+    ConnectorView,
+    ErrorCode,
+)
 from ling.infra.models import utcnow
 from ling.ports.config import (
     BindingMode,
@@ -584,11 +591,87 @@ async def put_preferences(
     )
 
 
-@router.get("/settings/connectors")
+async def _connector_field_views(
+    session: AsyncSession,
+    *,
+    settings: object,
+    app_state: object,
+    include_sensitive: bool,
+) -> dict[str, list[dict[str, object]]]:
+    """三个 scope 的字段视图（``source`` / ``configured`` / ``preview`` / ``value``）。
+
+    **GET 全程不解密**：这里只读 ``preview`` 与指纹，密钥原文一次都没进内存。
+    设计 §5 的硬要求是"普通 GET、审计、状态机与日志不解密"，只有构造连接器
+    的那条受控路径才解密。
+
+    密钥**永远**只有 ``preview`` 与 ``configured``，``value`` 恒 ``None``；
+    非 owner 连 ``preview`` 都不给（设计 §6：敏感预览只给 owner）。
+    """
+    from ling.settings import connector_fields as cf
+    from ling.settings import connector_overrides as ov
+
+    # env 基线（不含任何 DB 覆盖）：构造 dataclass 只为让解析器拿到
+    # OneBotConfig / QQBotConfig 那一层的 env 值。
+    env_only_onebot = await ov.resolve_field_values(
+        session,
+        scope=cf.SCOPE_ONEBOT,
+        settings=settings,
+        include_secrets=False,
+        use_overrides=False,
+    )
+    env_only_qqbot = await ov.resolve_field_values(
+        session,
+        scope=cf.SCOPE_QQBOT,
+        settings=settings,
+        include_secrets=False,
+        use_overrides=False,
+    )
+    onebot_cfg = ov.build_onebot_config_from(env_only_onebot.fields_by_key())
+    qqbot_cfg = ov.build_qqbot_config_from(env_only_qqbot.fields_by_key())
+
+    out: dict[str, list[dict[str, object]]] = {}
+    for scope in cf.SCOPES:
+        resolved = await ov.resolve_field_values(
+            session,
+            scope=scope,
+            settings=settings,
+            onebot=onebot_cfg,
+            qqbot=qqbot_cfg,
+            include_secrets=False,
+        )
+        out[scope] = [
+            state.public(include_sensitive=include_sensitive)
+            for state in resolved.fields.values()
+        ]
+    return out
+
+
+async def _activation_views(session: AsyncSession) -> dict[str, dict[str, object]]:
+    from ling.infra.models import ConnectorConfigHead
+    from ling.settings import connector_fields as cf
+    from ling.settings.connector_service import activation_payload, latest_revision
+
+    out: dict[str, dict[str, object]] = {}
+    for scope in cf.SCOPES:
+        head = await session.get(ConnectorConfigHead, scope)
+        out[scope] = activation_payload(
+            scope=scope,
+            generation=int(getattr(head, "generation", 0) or 0),
+            active_revision_id=getattr(head, "active_revision_id", None),
+            candidate_revision_id=getattr(head, "candidate_revision_id", None),
+            last=await latest_revision(session, scope),
+        )
+    return out
+
+
+@router.get("/settings/connectors", response_model=ConnectorsOut)
 async def get_connectors(
-    request: Request, auth: CurrentAuth, settings: SettingsDep
-) -> dict[str, object]:
-    """接入器（渠道连接器）的**只读**诊断：凭据齐不齐、连没连上、改哪里。
+    request: Request,
+    auth: CurrentAuth,
+    settings: SettingsDep,
+    session: DbSession,
+) -> ConnectorsOut:
+    """接入器的诊断 **+ 可配置字段**（v2）：凭据齐不齐、连没连上、有效值来自哪。
 
     **必须鉴权**：这条端点把部署的接入方式摊开（有哪些入站端口、开了哪个
     渠道、凭据设了没有）。它不含任何密钥明文（见
@@ -602,13 +685,414 @@ async def get_connectors(
     状态只读进程里**已经存在**的对象，不发网络探测：设置页会被反复打开，
     把它做成探活会让每次打开都对外打一次 QQ 开放平台。
     """
+    from ling.settings import connector_fields as cf
+    from ling.settings.connector_service import operation_view  # noqa: F401 - 供文档引用
     from ling.settings.connectors import connector_views
 
+    is_owner = str(getattr(auth.user, "role", "")) == "owner"
+    views = connector_views(settings, request.app.state)
+    field_views = await _connector_field_views(
+        session,
+        settings=settings,
+        app_state=request.app.state,
+        include_sensitive=is_owner,
+    )
+    activations = await _activation_views(session)
+
+    # 渠道视图：字段与生效状态按 id 挂上去；白名单（access）没有"渠道"概念，
+    # 单独一段（设计 §6）。
+    merged: list[dict[str, object]] = [
+        {**view, "editable": is_owner, "storage": "db"} for view in views
+    ]
+
+    access = activations[cf.SCOPE_ACCESS]
+    # 用契约模型而不是裸 dict 返回：字段名/类型由同一个地方定义，
+    # 前端按 schema 读、后端按 schema 序列化，中间少一层手抄。
+    from ling.contracts.v1 import (
+        ConnectorActivationOut,
+        ConnectorFieldOut,
+        ConnectorsOut,
+    )
+
+    def _activation(payload: dict[str, object]) -> ConnectorActivationOut:
+        return ConnectorActivationOut.model_validate(payload)
+
+    def _fields(items: list[dict[str, object]]) -> list[ConnectorFieldOut]:
+        return [ConnectorFieldOut.model_validate(item) for item in items]
+
+    connector_views_out: list[ConnectorView] = []
+    for view in merged:
+        channel_id = str(view["id"])
+        connector_views_out.append(
+            ConnectorView(
+                id=channel_id,
+                label=str(view["label"]),
+                configured=bool(view["configured"]),
+                enabled=bool(view["enabled"]),
+                status=str(view["status"]),
+                status_reason=str(view["status_reason"]),
+                status_message=str(view["status_message"]),
+                guidance=str(view["guidance"]),
+                editable=is_owner,
+                storage="db",
+                generation=int(activations[channel_id]["generation"]),  # type: ignore[call-overload]
+                activation=_activation(activations[channel_id]),
+                fields=_fields(field_views.get(channel_id, [])),
+                runtime=_runtime_of(view),
+            )
+        )
+
+    return ConnectorsOut(
+        as_of=utcnow(),
+        can_edit=is_owner,
+        connectors=connector_views_out,
+        access=ConnectorAccessGroupOut(
+            generation=int(access["generation"]),  # type: ignore[call-overload]
+            activation=_activation(access),
+            editable=is_owner,
+            fields=_fields(field_views.get(cf.SCOPE_ACCESS, [])),
+        ),
+    )
+
+
+def _cleared_keys(results: list[dict[str, object]]) -> list[str]:
+    """reset 结果里所有被清掉的键（审计用）。"""
+    out: list[str] = []
+    for result in results:
+        raw = result.get("cleared")
+        if isinstance(raw, list):
+            out.extend(str(item) for item in raw)
+    return out
+
+
+def _runtime_of(item: dict[str, object]) -> dict[str, int | None]:
+    """把渠道视图的 ``runtime`` 规整成契约要求的 ``dict[str, int | None]``。"""
+    raw = item.get("runtime")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): (value if isinstance(value, int) else None) for key, value in raw.items()}
+
+
+class ConnectorChangeBody(BaseModel):
+    """``PUT /v1/settings/connectors/{scope}`` 的请求体（设计 §6）。
+
+    ``set`` 里没出现的键 = 不改；密钥给空串 = **不改**（密码框总是空的，
+    不能因此变成一次删除）；``clear`` = 删掉该键的覆盖、回退到 env。
+    同一个键同时出现在两边 → 422。
+    """
+
+    set: dict[str, object] = Field(default_factory=dict)
+    clear: list[str] = Field(default_factory=list)
+
+
+def _require_connector_write_guards(request: Request, auth: object) -> None:
+    """owner + 同源（复用更新通道那套门禁，不自创弱校验）。
+
+    为什么不能只判 ``role == owner``：cookie 会话被 CSRF 借用时，"当前用户是
+    owner"这条依然成立，所以还要校验 **Origin 同源**。
+    """
+    from ling.api.routes.version import (  # noqa: PLC2701 - 同一进程内的门禁复用
+        _origin_problem,
+        _require_json_content_type,
+    )
+
+    if str(getattr(getattr(auth, "user", None), "role", "")) != "owner":
+        raise LingError(
+            ErrorCode.forbidden,
+            "只有所有者可以修改接入器配置",
+            status_code=403,
+            detail="not_owner",
+        )
+    _require_json_content_type(request)
+    problem = _origin_problem(request, request.app.state.settings)
+    if problem is not None:
+        # 跨站 / 缺失 Origin 一律拒绝（设计 §6：``bad_origin``）。
+        raise LingError(
+            ErrorCode.forbidden,
+            "这个请求的来源不可信",
+            status_code=403,
+            detail="bad_origin",
+        )
+
+
+async def _connector_write_guard(
+    request: Request, auth: object, session: AsyncSession
+) -> None:
+    """再加一条"最近 15 分钟内重新登录过"（被窃取的旧会话改不了入站凭据）。"""
+    from ling.api.routes.version import _require_recent_login
+
+    _require_connector_write_guards(request, auth)
+    try:
+        await _require_recent_login(auth, session)  # type: ignore[arg-type]
+    except LingError as exc:
+        raise LingError(
+            ErrorCode.forbidden,
+            "修改接入器配置需要最近 15 分钟内重新登录过",
+            status_code=403,
+            detail="recent_login_required",
+        ) from exc
+
+
+def _connector_service(request: Request, auth: object, session: AsyncSession):  # noqa: ANN202
+    from ling.settings.connector_service import ConnectorConfigService
+
+    app_state = request.app.state
+    return ConnectorConfigService(
+        settings=app_state.settings,
+        box=getattr(app_state, "secret_box", None),
+        runtime=getattr(app_state, "connector_runtime", None),
+    )
+
+
+@router.put("/settings/connectors/{scope}")
+async def put_connector_config(
+    scope: str,
+    body: ConnectorChangeBody,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """保存某个接入器的配置并**立刻尝试生效**（owner only）。
+
+    语义：受理 ≠ 生效。``202`` 表示切换已完成（单副本部署里它同时也是终态）；
+    ``409`` 是代际冲突/另一处正在生效；``422`` 是字段校验失败——**此时一个连接
+    都没停过**；``503`` 是切换器不可用。真正的失败（新配置起不来）会以
+    ``rolled_back`` 返回，并保证旧配置与旧连接已经恢复。
+    """
+    from ling.settings import connector_fields as cf
+    from ling.settings.connector_service import (
+        OP_ACTIVE,
+        OP_DEGRADED,
+        OP_ROLLED_BACK,
+        OP_UNCHANGED,
+        ChangeRequest,
+        ConnectorServiceError,
+    )
+
+    await _connector_write_guard(request, auth, session)
+    if not cf.is_known_scope(scope):
+        raise LingError(ErrorCode.not_found, "没有这个接入器", status_code=404)
+
+    # If-Match：设计 §6 要求并发保存只有一个赢家。
+    raw_generation = request.headers.get("if-match") or request.headers.get("If-Match")
+    expected: int | None = None
+    if raw_generation is not None:
+        try:
+            expected = int(str(raw_generation).strip().strip('"'))
+        except ValueError as exc:
+            raise LingError(
+                ErrorCode.invalid_request,
+                "If-Match 必须是代际号（整数）",
+                status_code=422,
+                detail="invalid_field",
+            ) from exc
+
+    try:
+        change = ChangeRequest.build(scope, body.model_dump())
+    except ConnectorServiceError as exc:
+        raise LingError(
+            ErrorCode.invalid_request,
+            exc.message,
+            status_code=exc.status_code,
+            detail=exc.code,
+            field=exc.field_name,
+        ) from exc
+
+    service = _connector_service(request, auth, session)
+    try:
+        result = await service.apply(
+            session,
+            scope=scope,
+            change=change,
+            expected_generation=expected,
+            actor_id=str(getattr(getattr(auth, "user", None), "subject_id", "") or ""),
+        )
+    except ConnectorServiceError as exc:
+        # `ErrorCode` 是**受控枚举**：409 的两种具体原因（代际冲突 / 另一处
+        # 正在生效）不能当成新的错误码塞进去——那会让契约多出两个没人映射的
+        # 取值。所以 code 用 `conflict`，具体原因放 `detail`（稳定字符串）。
+        raise LingError(
+            ErrorCode.conflict if exc.status_code == 409 else ErrorCode.invalid_request,
+            exc.message,
+            status_code=exc.status_code,
+            detail=exc.code,
+            field=exc.field_name,
+        ) from exc
+
+    # 审计：只记字段名 + 指纹 + 结果，**绝不写值或预览**（设计 §6）。
+    if result.changed or result.state not in {OP_UNCHANGED}:
+
+        audit_event(
+            "connector_config_changed",
+            outcome="ok" if result.state == OP_ACTIVE else "degraded",
+            actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+            target_type="connector",
+            target_id=scope,
+            attributes={
+                "scope": scope,
+                "fields": sorted(set(body.set) | set(body.clear)),
+                "action": {
+                    key: ("set" if key in body.set else "clear")
+                    for key in sorted(set(body.set) | set(body.clear))
+                },
+                "revision_id": result.revision_id,
+                "generation": result.generation,
+                "state": result.state,
+                "error_code": result.error_code,
+                # 指纹由 service 在**写入前**算好（旧值>新值）；
+                # 这里再读库只会读到已经覆盖后的值，两边一样。
+                "fingerprints": result.fingerprints,
+            },
+        )
+    if result.state == OP_ACTIVE:
+        audit_event(
+            "connector_activated",
+            actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+            target_type="connector",
+            target_id=scope,
+            attributes={"generation": result.generation, "revision_id": result.revision_id},
+        )
+    elif result.state in {OP_ROLLED_BACK, OP_DEGRADED}:
+        audit_event(
+            "connector_rolled_back",
+            outcome="degraded",
+            target_type="connector",
+            target_id=scope,
+            reason_code=str(result.error_code or ""),
+            attributes={"generation": result.generation, "revision_id": result.revision_id},
+        )
+
+    # 202 = 受理并**尝试过**（成功或已回滚都算做过事）；200 = 什么都没变。
+    # 注意 202 不等于"已生效"：终态看 `state`（active/rolled_back/degraded）。
+    response.status_code = 200 if result.state == OP_UNCHANGED else 202
+    response.headers["Cache-Control"] = "no-store"
     return {
-        "schema_version": "v1",
-        "as_of": utcnow().isoformat(),
-        "connectors": connector_views(settings, request.app.state),
+        "schema_version": "v2",
+        "operation_id": result.operation_id,
+        "scope": scope,
+        "generation": result.generation,
+        "status": result.state,
+        "state": result.state,
+        "changed": result.changed,
+        "revision_id": result.revision_id,
+        "active_revision_id": result.active_revision_id,
+        "ack_count": result.ack_count,
+        "expected_count": result.expected_count,
+        "started_at": result.started_at.isoformat(),
+        "finished_at": result.finished_at.isoformat(),
+        "error_code": result.error_code,
+        "error_safe": result.error_safe,
+        # 量化中断窗口：不承诺零丢消息，只如实给出几个时刻（设计 §4）
+        "timings": result.timings,
     }
+
+
+@router.get("/settings/connectors/operations/{operation_id}")
+async def get_connector_operation(
+    operation_id: str, auth: CurrentAuth, session: DbSession
+) -> dict[str, object]:
+    """按 operation_id 查一次生效操作的状态（owner only，设计 §6）。
+
+    202 不等于已生效：客户端拿这里返回的 ``active / rolled_back / degraded``
+    才是终态。
+    """
+    from ling.settings.connector_service import operation_view
+
+    if str(getattr(auth.user, "role", "")) != "owner":
+        raise LingError(
+            ErrorCode.forbidden, "只有所有者可以查看", status_code=403, detail="not_owner"
+        )
+    view = await operation_view(session, operation_id)
+    if view is None:
+        raise LingError(ErrorCode.not_found, "没有这个操作", status_code=404)
+    return view
+
+
+@router.post("/settings/connectors/reset")
+async def reset_connector_config(
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """把三个 scope 的覆盖全部清空（回退到 env / 默认）。
+
+    一个操作跟踪三个 scope：**全部成功**才算 reset 成功；任一 scope 重建失败
+    就保留原 active，绝不让"部分恢复默认"被报成成功（设计 §6）。
+    """
+    from ling.settings import connector_fields as cf
+    from ling.settings.connector_service import (
+        OP_DEGRADED,
+        OP_ROLLED_BACK,
+        OP_UNCHANGED,
+        ChangeRequest,
+        ConnectorServiceError,
+    )
+
+    await _connector_write_guard(request, auth, session)
+    service = _connector_service(request, auth, session)
+    results: list[dict[str, object]] = []
+    failed = False
+    for scope in cf.SCOPES:
+        specs = cf.fields_for(scope)
+        current = await service.resolved(session, scope=scope, include_secrets=False)
+        to_clear = [
+            spec.key
+            for spec in specs
+            if current.fields.get(spec.key) is not None
+            and current.fields[spec.key].source == cf.SOURCE_DB
+        ]
+        if not to_clear:
+            results.append({"scope": scope, "state": OP_UNCHANGED, "cleared": []})
+            continue
+        change = ChangeRequest(set_values={}, clear_keys=tuple(to_clear))
+        try:
+            result = await service.apply(
+                session,
+                scope=scope,
+                change=change,
+                expected_generation=None,
+                actor_id=str(getattr(auth.user, "subject_id", "") or ""),
+            )
+        except ConnectorServiceError as exc:
+            failed = True
+            results.append(
+                {
+                    "scope": scope,
+                    "state": "failed",
+                    "cleared": [],
+                    "error_code": exc.code,
+                    "error_safe": exc.message,
+                }
+            )
+            continue
+        if result.state in {OP_ROLLED_BACK, OP_DEGRADED}:
+            failed = True
+        results.append(
+            {
+                "scope": scope,
+                "state": result.state,
+                "cleared": to_clear,
+                "operation_id": result.operation_id,
+                "generation": result.generation,
+            }
+        )
+    audit_event(
+        "connector_config_changed",
+        outcome="degraded" if failed else "ok",
+        actor=str(getattr(auth.user, "subject_id", "") or "owner"),
+        target_type="connector",
+        target_id="all",
+        attributes={
+            "scope": "all",
+            "action": "reset",
+            "fields": _cleared_keys(results),
+            "state": "failed" if failed else "reset",
+        },
+    )
+    response.status_code = 200
+    return {"schema_version": "v2", "ok": not failed, "results": results}
 
 
 @router.put("/settings/draft")

@@ -357,6 +357,118 @@ class InteractionEnvelope(StrictModel):
         return v
 
 
+# ---------------------------------------------------------------- 撤回
+
+
+class RecallKind(StrEnum):
+    """撤回事件来自哪一侧。**只用于日志与话术，不参与判定。**"""
+
+    group = "group"
+    friend = "friend"
+
+
+class RecallEvent(StrictModel):
+    """**一条撤回通知**——不是一条消息，也不该变成一条消息。
+
+    为什么单独一个类型、而不是复用 :class:`InteractionEnvelope`：
+
+    信封的语义是"有人对我说了什么"，它必然带 `parts`（正文）并走决策→生成→
+    投递；撤回通知没有正文、也不该触发回复。硬塞进信封只有两种写法，
+    两种都是伪造：造一个空的用户发言（她会以为对方发了个空消息），或者加一个
+    "这条其实不是消息"的开关（信封从此有两种含义）。
+
+    所以撤回有自己的类型，`inbound_intake` 用 `isinstance` 分流，
+    **不**进对话链路、**不**产生 `messages` 行。
+
+    ``self_recall`` 是"她自己撤回了自己的消息"（OneBot 的
+    `notice.group_recall`/`friend_recall` 也会因为机器人自己撤回而触发）。
+    这一类**不进**给模型看的上下文标记是反过来的：她的消息照样算她的话，
+    只是那条原文不再可用。本轮只记录、不额外处理。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    connector_instance: IdStr
+    # 去重键（`<instance>:recall:<message_id>`）。重复上报同一撤回必须只生效一次。
+    external_event_id: IdStr
+    recall_kind: RecallKind = RecallKind.friend
+    # 平台侧被撤回的那条消息 id。**这是唯一能把撤回与知识对应起来的东西。**
+    platform_message_id: IdStr
+    # 发起撤回的人（群里有管理撤回别人的消息，所以它不一定等于原发言人）
+    operator_ref: IdStr | None = None
+    # 原消息所属的会话（群号 / 对方账号）；撤回事件里通常带得到
+    target_ref: IdStr | None = None
+    window_ref: IdStr | None = None
+    occurred_at: datetime | None = None
+    sender_name: str | None = None
+    # 是不是她自己发的消息被撤回
+    self_recall: bool = False
+    trace_id: IdStr | None = None
+
+
+# ---------------------------------------------------------------- 主动撤回（出站）
+
+class OutboundRecallState(StrEnum):
+    """**她自己**发出去的消息，被主动撤回的结果。
+
+    与入站的 :class:`RecallEvent` 是两件事：那个是"对方收回了什么"，
+    这个是"我们把已经发出去的那条收回来"。混用会让"谁撤回的"永远说不清。
+
+    五个取值都必须能区分，因为它们对用户的含义完全不同：
+
+    - ``recalled``：平台确认已撤回（**唯一**可以说"撤回了"的状态）；
+    - ``not_found``：平台上已经没有这条（可能早被删、id 过期）；
+    - ``expired``：超过平台允许的撤回时间窗，**根本没发 action**；
+    - ``unsupported``：这个接入方式不支持撤回（QQ 官方机器人）；
+    - ``uncertain``：没拿到回执，**不确定**是否撤回成功——不许说成功。
+    """
+
+    recalled = "recalled"
+    not_found = "not_found"
+    expired = "expired"
+    unsupported = "unsupported"
+    uncertain = "uncertain"
+
+
+class RecallReceipt(StrictModel):
+    """一次撤回尝试的**平台回执**（"没有回执不声称已撤回"）。
+
+    ``detail`` 是给人看的一句话（不含消息正文）；``attempts`` 让调用方能说清
+    "我们试过几次"——重试不重复撤回，但"试过"本身是事实。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    receipt_id: IdStr
+    channel: IdStr
+    state: OutboundRecallState
+    # 被撤回的那条平台消息 id（撤回动作的对象）
+    platform_message_id: IdStr | None = None
+    observed_at: datetime
+    detail: str | None = None
+
+
+class RecallMessageOut(StrictModel):
+    """`POST /v1/conversations/{conversation_id}/messages/{message_id}/recall` 的响应。
+
+    ``state`` 与 :class:`OutboundRecallState` 同源；``message_id`` 是**本地**
+    消息 id（不是平台 id，平台 id 不进前端——它是对账凭据，不是展示标识）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    message_id: IdStr
+    state: OutboundRecallState
+    # 人话说明（"撤回了"/"超过平台允许的撤回时间了"…）。前端直接显示这句。
+    note: str
+    # 本地标记的撤回时刻（`recalled` 与 `uncertain` 都可能非空：
+    # 后者是"我们发起了、但没拿到确认"，不能当成成功）
+    recalled_at: datetime | None = None
+    # 平台回执 id（可用来对账/追查，不含正文）
+    receipt_id: IdStr | None = None
+    attempts: int = Field(default=1, ge=0)
+    reason_code: str | None = Field(
+        default=None, description="稳定错误码，只给日志与测试；界面显示 note"
+    )
+
+
 # ---------------------------------------------------------------- 会话与轮次
 
 
@@ -471,6 +583,20 @@ class ChatMessage(StrictModel):
     # 发言人的平台标识（QQ 号；解析不到时退回 subject id）。
     # 前端用它把人分组，所以它必须对同一个人**始终是同一个值**。
     sender_id: str | None = None
+    # 这条消息在平台上被**对方**撤回了（入站撤回，迁移 0055）。
+    # 非空 = 撤回时刻。界面据此标"已撤回"；上下文按
+    # `retracted_after_seen` 分两种处理（看过 → 保留并加注记）。
+    retracted_at: datetime | None = None
+    # **她自己**把这条收回来了（出站撤回，迁移 0057）。
+    #
+    # 与 `retracted_at` 分开：那个是"对方撤回的"，这个是"她撤回的"。
+    # 前端据此画"已撤回"徽标 + 决定是否还显示"撤回"按钮；两者都非空时
+    # 以 `recalled_at` 为准（她自己撤的优先级更高，说明这条是她的发言）。
+    recalled_at: datetime | None = None
+    # 最后一次撤回尝试的结果（`recalled`/`uncertain`/`expired`/`not_found`/
+    # `unsupported`）。**只有 `recalled` 等于"撤回了"**——`uncertain` 是
+    # "没拿到回执，不确定"，不能显示成成功。
+    recall_state: str | None = None
 
 
 # ---------------------------------------------------------------- 能力与回执
@@ -486,6 +612,12 @@ class CapabilityDescriptor(StrictModel):
     supports_proactive: bool = False
     supports_edit: bool = False
     supports_media: bool = False
+    # 能不能**主动撤回自己发出去的消息**（OneBot 的 `delete_msg`）。
+    #
+    # 为什么单独一位而不是让调用方 try/except：`recall()` 是可选能力，
+    # 而"这个渠道不支持撤回"与"这次撤回失败了"是两种完全不同的结论——
+    # 前者根本不该发 action（也不该在审计里记一次失败尝试）。
+    supports_recall: bool = False
     max_text_length: int = Field(default=4096, ge=1)
     receipt_reliability: Literal["none", "best_effort", "confirmed"] = "best_effort"
     enabled: bool = False
@@ -750,6 +882,57 @@ class IntentTeaserOut(StrictModel):
     note: str | None = None
 
 
+# ---------------------------------------------------------------- 上游回退标记
+
+
+class FallbackState(StrEnum):
+    """回退标记里"上游当时是什么状态"。
+
+    与 :class:`TimelineState` 刻意分开、取值不完全相同：这里还多一个
+    ``unknown``（状态不明），并且**只有** `ready` 算"能用上游的值"。
+    把两者合成一个枚举会让"我们不知道"被迫冒充成某一个具体状态。
+    """
+
+    ready = "ready"
+    degraded = "degraded"
+    empty = "empty"
+    pending = "pending"
+    failed = "failed"
+    unavailable = "unavailable"
+    unknown = "unknown"
+
+
+class FallbackSource(StrEnum):
+    """这个值是上游给的，还是本领域自己的默认参数。**只有这两种**。"""
+
+    upstream = "upstream"
+    domain_default = "domain_default"
+
+
+class FallbackNotice(StrictModel):
+    """一个消费点上"这次的值从哪来"的紧凑标记。
+
+    **它不是事实**，也不能被读成事实：
+
+    - ``used=true`` 只说明"上游这次没给出可用的值，我们用了自己的默认参数"，
+      不代表上游坏了、更不代表她做了什么；
+    - ``reason`` 是给人看的一句人话（界面直接显示），不是错误码表；
+    - 值本身（默认值）**绝不**写进 activities / experiences / 位置等事实表。
+
+    没有回退时也要给这个标记（``used=false``、``source=upstream``）：
+    "这次没用默认值"本身就是要回答的问题，缺字段会让前端分不清
+    "没用回退"和"后端没实现"。
+    """
+
+    upstream: str = Field(description="上游是谁，如 schedule / scene")
+    used: bool = Field(description="这次是否用了领域默认参数")
+    state: FallbackState = Field(description="上游当时的状态")
+    source: FallbackSource = Field(description="值的来源")
+    reason: str | None = Field(
+        default=None, description="用默认值的人话原因；没回退时为 null"
+    )
+
+
 # ---------------------------------------------------------------- 提示词快照（只读）
 
 
@@ -862,6 +1045,58 @@ class PromptSnapshotOut(StrictModel):
     sections: list[PromptSnapshotSection] = Field(default_factory=list)
     # 给人看的一句状态说明（expired / unavailable 时解释原因，纯文本）
     note: str | None = None
+
+
+# ---------------------------------------------------------------- 关系（分页，2026-11）
+
+
+class SubjectAccountOut(StrictModel):
+    """`GET /v1/accounts/subjects` 的 `subjects[].accounts[]`：一个渠道账号绑定。
+
+    ``revoked`` 是**派生字段**（``revoked_at`` 非空），只读接口不回吐时间戳：
+    页面要说的是"这个号还能不能用"，不是"哪一刻解绑的"。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    account_id: IdStr
+    connector_instance: str
+    external_account_id: str
+    proof: str
+    revoked: bool = False
+
+
+class SubjectRow(StrictModel):
+    """一个人：昵称、亲疏等级、被合并到谁，以及他/她绑定的账号。
+
+    ``merged_into`` 非空表示"已被当作另一个人"。合并**只写这一个指针**，
+    账号与记忆都留在原处（所以拆开只是清指针）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    subject_id: IdStr
+    display_name: str
+    trust_level: str
+    merged_into: IdStr | None = None
+    accounts: list[SubjectAccountOut] = Field(default_factory=list)
+
+
+class SubjectsPage(StrictModel):
+    """`GET /v1/accounts/subjects` 的响应（**分页**，docs/API-WEB-V1.md §13）。
+
+    分页是契约的一部分，不是可选优化：``subjects`` 默认只有 50 条，
+    调用方必须看 ``has_more`` / ``total``，不能假设"一次就是全部"。
+    ``total`` 是**筛选后**的总行数（``q`` 生效时它不是全表行数）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    subjects: list[SubjectRow] = Field(default_factory=list)
+    # 服务端实际生效的分页参数（回显）：客户端不必猜默认值。
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0)
+    has_more: bool = False
+    # 服务端实际生效的筛选词（已 strip）；没筛选时为 null。
+    q: str | None = None
 
 
 # ---------------------------------------------------------------- 镜像更新（四态）
@@ -1125,6 +1360,182 @@ class ImageUpdateCheckAccepted(StrictModel):
     accepted: bool
 
 
+# ---------------------------------------------------------------- 接入器可配置（v2）
+#
+# 设计 `docs/CONNECTOR-CONFIG-DESIGN.md` §6。字段形状刻意只覆盖"能提交/能判断
+# 的东西"：**密钥的 `value` 恒为 null**，只有 `preview` 与 `configured`。
+# 契约里没有"解密后的值"这个字段，也不会有——前端拿不到它。
+
+
+class ConnectorFieldSource(StrEnum):
+    """一项配置的有效值来自哪一层。"""
+
+    DB = "db"
+    ENV = "env"
+    DEFAULT = "default"
+
+
+class ConnectorFieldKind(StrEnum):
+    """字段在表单上的种类。``secret`` 的 ``value`` 恒为 null。"""
+
+    SECRET = "secret"
+    TEXT = "text"
+    SWITCH = "switch"
+    LIST = "list"
+
+
+class ConnectorFieldOut(StrictModel):
+    """一个字段的有效值 + 来源 + 脱敏预览。
+
+    ``key`` 是注册表里的固定名（同时是 GET/PUT 的键）；``source`` 回答
+    "现在生效的是 DB 覆盖、env 还是默认值"；``configured`` 只表示**有效值
+    非空**，不等于"DB 有覆盖"。``preview`` 只对敏感字段出现（前 7 个字符 +
+    固定遮罩），非 owner 拿到的是 null。
+    """
+
+    key: str
+    name: str = Field(description="与 key 相同的兼容别名（旧前端读 name）")
+    scope: str
+    kind: ConnectorFieldKind
+    label: str
+    control: str = Field(default="text", description="text / password / switch / list / select")
+    editable: bool = True
+    source: ConnectorFieldSource
+    configured: bool
+    set: bool = Field(description="configured 的兼容别名")
+    value: str | bool | list[str] | None = Field(
+        default=None, description="非密钥的规范化值；密钥恒 null"
+    )
+    preview: str | None = Field(
+        default=None, description="敏感字段的前缀预览（前 7 字符 + ••••）；未配置为 null"
+    )
+
+
+class ConnectorActivationOut(StrictModel):
+    """一个 scope 的生效状态（只含无敏感值的运行信息）。
+
+    ``state=activating`` 表示候选已落库、正在切换；只有到 ``active`` 才是
+    "已生效"。``rolled_back`` 表示失败并已恢复上一份配置；``degraded`` 是
+    本地生效但远端没连上（或回退本身也失败）——都**不是**成功。
+    """
+
+    scope: str
+    state: str
+    generation: int
+    active_generation: int
+    candidate_generation: int | None = None
+    active_revision_id: str | None = None
+    candidate_revision_id: str | None = None
+    last_revision_id: str | None = None
+    last_state: str | None = None
+    started_at: str | None = None
+    activated_at: str | None = None
+    error_code: str | None = None
+    error_safe: str | None = Field(
+        default=None, description="可以展示给人看的一句话，不含异常原文"
+    )
+    ack_count: int = 0
+    expected_count: int = 1
+
+
+class ConnectorView(StrictModel):
+    """一个接入器的诊断 + 可编辑字段（``GET /v1/settings/connectors``）。"""
+
+    id: str
+    label: str
+    configured: bool
+    enabled: bool
+    status: str
+    status_reason: str
+    status_message: str
+    guidance: str
+    editable: bool = Field(description="owner 为 true；非 owner 只读")
+    storage: str = Field(default="db", description="值落库；容器根目录只读，写不了 .env")
+    generation: int = 0
+    activation: ConnectorActivationOut
+    fields: list[ConnectorFieldOut] = Field(default_factory=list)
+    runtime: dict[str, int | None] = Field(default_factory=dict)
+
+
+class ConnectorAccessGroupOut(StrictModel):
+    """出入许可（白名单）组：参与同一套 generation，但不重建长连接。"""
+
+    id: str = "access"
+    generation: int = 0
+    activation: ConnectorActivationOut
+    editable: bool = True
+    fields: list[ConnectorFieldOut] = Field(default_factory=list)
+
+
+class ConnectorsOut(StrictModel):
+    """`GET /v1/settings/connectors` 的 v2 形状。"""
+
+    schema_version: Literal["v2"] = "v2"
+    as_of: datetime
+    can_edit: bool = Field(description="当前登录者是否是 owner")
+    connectors: list[ConnectorView] = Field(default_factory=list)
+    access: ConnectorAccessGroupOut
+
+
+class ConnectorChangeRequest(StrictModel):
+    """`PUT /v1/settings/connectors/{scope}` 的请求体。
+
+    ``set`` 里没出现的键 = 不改；密钥空串 = 不改；``clear`` = 删除覆盖回退
+    env（不是写空串）。同一个键同时出现在两边 → 422。
+    """
+
+    set: dict[str, str | bool | list[str]] = Field(default_factory=dict)
+    clear: list[str] = Field(default_factory=list)
+
+
+class ConnectorChangeAccepted(StrictModel):
+    """保存的结果。``status`` 是**终态**（单副本部署里 PUT 内联完成切换）。"""
+
+    schema_version: Literal["v2"] = "v2"
+    operation_id: str
+    scope: str
+    generation: int
+    status: str = Field(description="active / unchanged / rolled_back / degraded")
+    state: str
+    changed: bool
+    revision_id: str | None = None
+    active_revision_id: str | None = None
+    ack_count: int = 0
+    expected_count: int = 1
+    started_at: str
+    finished_at: str
+    error_code: str | None = None
+    error_safe: str | None = None
+    timings: dict[str, float] = Field(default_factory=dict)
+
+
+class ConnectorOperationOut(StrictModel):
+    """`GET /v1/settings/connectors/operations/{id}`：一次生效操作的状态。"""
+
+    schema_version: Literal["v2"] = "v2"
+    operation_id: str
+    scope: str
+    state: str
+    generation: int
+    active_generation: int
+    started_at: str | None = None
+    activated_at: str | None = None
+    error_code: str | None = None
+    error_safe: str | None = None
+
+
+class ConnectorResetResult(StrictModel):
+    """`POST /v1/settings/connectors/reset` 的逐 scope 结果。
+
+    ``ok=false`` 表示至少一个 scope 没清成功——那三个 scope 的 active 都保留，
+    不出现"部分恢复默认却报成功"。
+    """
+
+    schema_version: Literal["v2"] = "v2"
+    ok: bool
+    results: list[dict[str, object]] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 错误
 
 
@@ -1136,6 +1547,9 @@ class ErrorBody(StrictModel):
     retriable: bool = False
     detail: str | None = None
     trace_id: IdStr | None = None
+    # 出错的具体字段（接入器配置校验用）。设计 §6 要求错误里带 ``field``：
+    # 只给一句"有一项不合法"，用户得自己猜是哪一项。
+    field: str | None = None
 
 
 class ErrorResponse(StrictModel):
@@ -1144,6 +1558,9 @@ class ErrorResponse(StrictModel):
 
 
 __all__ = [
+    "RecallReceipt",
+    "RecallMessageOut",
+    "OutboundRecallState",
     "SCHEMA_VERSION",
     "ActionIntent",
     "AudienceRule",
@@ -1157,6 +1574,9 @@ __all__ = [
     "ErrorBody",
     "ErrorCode",
     "ErrorResponse",
+    "FallbackNotice",
+    "FallbackSource",
+    "FallbackState",
     "CompatModel",
     "HandoffCapsule",
     "ImageNewerRelease",
@@ -1194,8 +1614,13 @@ __all__ = [
     "PromptSnapshotOut",
     "PromptSnapshotSection",
     "PromptSnapshotState",
+    "RecallEvent",
+    "RecallKind",
     "RuntimeScope",
     "SessionRecord",
+    "SubjectAccountOut",
+    "SubjectRow",
+    "SubjectsPage",
     "TimelineState",
     "TodayOutlineItem",
     "TodayOutlineOut",

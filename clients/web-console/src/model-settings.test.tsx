@@ -25,13 +25,18 @@ import {
 import { ProvidersPanel } from './components/model-settings/ProvidersPanel';
 import {
   effectiveNote,
+  groupSlotOptions,
   kindLabel,
+  parseSlotSelectValue,
   profileEquals,
   providerEquals,
   providerShapeIssues,
   providersForChatSlot,
   providersForProfile,
   rowStateOf,
+  slotDraftDirty,
+  slotOptions,
+  slotSelectValue,
   visibleRoleKeys,
 } from './components/model-settings/shared';
 import type {
@@ -269,20 +274,23 @@ function render(overrides: {
   quickConfig?: QuickConfigPreview | null;
   config?: SettingsConfig;
   providers?: ProviderDraftInput[];
+  slots?: SlotDraftInput[];
+  slotViews?: SlotView[];
+  saving?: boolean;
 } = {}): string {
   return renderToStaticMarkup(
     <RolesPanel
       config={overrides.config ?? CONFIG}
       providers={overrides.providers ?? PROVIDERS}
       profiles={overrides.profiles ?? []}
-      slots={SLOT_DRAFTS}
+      slots={overrides.slots ?? SLOT_DRAFTS}
       resolutions={overrides.resolutions ?? []}
-      slotViews={SLOTS}
+      slotViews={overrides.slotViews ?? SLOTS}
       quickConfig={overrides.quickConfig ?? null}
       quickConfigBusy={false}
       health={null}
       dirtyCount={0}
-      saving={false}
+      saving={overrides.saving ?? false}
       onPatchProfile={NOOP}
       onPatchSlot={NOOP}
       onDiscard={NOOP}
@@ -530,7 +538,7 @@ describe('默认槽位卡片', () => {
     expect(html).toContain('m-fast');
     expect(html).toContain('日常对话 跟着它');
     // 没配的槽位不能显示成一个假模型
-    expect(html).toContain('还没有配模型');
+    expect(html).toContain('还没配：跟随它的职责会显示不可用');
   });
 
   it('「视频」是独立槽位：卡片自己写着"谁跟着它"，不和识图混用', () => {
@@ -540,6 +548,257 @@ describe('默认槽位卡片', () => {
     // 职责行「看视频」由 PRIMARY_ROLES ∩ known_profiles 决定
     expect(html).toContain('看视频');
     expect(html).toContain('perception.video');
+  });
+});
+
+/* ------------------------------------------------ §1 点开就能换模型（默认槽位） */
+
+const TWO_PROVIDERS: ProviderDraftInput[] = [
+  {
+    provider_id: 'first',
+    kind: 'openai_compatible',
+    capabilities: ['chat'],
+    base_url: 'https://192.0.2.11/v1',
+    enabled: true,
+    models: [{ model_id: 'shared-model', note: '', enabled: true }],
+    timeout_seconds: 60,
+    max_output_tokens: null,
+    daily_token_limit: null,
+  },
+  {
+    provider_id: 'second',
+    kind: 'openai_compatible',
+    capabilities: ['chat'],
+    base_url: 'https://192.0.2.12/v1',
+    enabled: true,
+    models: [{ model_id: 'shared-model', note: '', enabled: true }],
+    timeout_seconds: 60,
+    max_output_tokens: null,
+    daily_token_limit: null,
+  },
+];
+
+function slotDraft(slot: string, providerId: string, modelId: string): SlotDraftInput {
+  return { slot, provider_id: providerId, model_id: modelId };
+}
+
+function slotView(slot: string, providerId = '', modelId = ''): SlotView {
+  const base = SLOTS.find((item) => item.slot === slot)!;
+  return {
+    ...base,
+    provider_id: providerId,
+    model_id: modelId,
+    configured: Boolean(providerId && modelId),
+    usable: Boolean(providerId && modelId),
+  };
+}
+
+describe('默认槽位：点开就能换模型（没有编辑门）', () => {
+  it('页面上不存在「更换默认 / 完成更换」按钮', () => {
+    const html = render();
+    expect(html).not.toContain('更换默认');
+    expect(html).not.toContain('完成更换');
+  });
+
+  it('五个槽位各有一个「槽位用哪个模型」下拉，首次渲染即可操作', () => {
+    const html = render();
+    for (const label of ['快速', '创作', '识图', '视频', '日常']) {
+      const select = selectMarkup(html, `${label} 槽位用哪个模型`);
+      expect(select === '', `${label} 槽位没有选择器`).toBe(false);
+      // 没点任何按钮，选择器就已经是启用状态
+      expect(select).not.toContain('disabled');
+    }
+    // 不许再有"先选供应商"的第二段式下拉
+    expect(html).not.toContain('槽位的供应商');
+  });
+
+  it('一个下拉：分组头是「供应商 · 协议」，当前项打勾 + aria-selected', () => {
+    const html = render();
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    expect(select).toContain('<optgroup label="main · OpenAI 兼容">');
+    expect(select).toContain('value="main::m-fast"');
+    expect(select).toContain('✓ m-fast');
+    expect(select).toContain('aria-selected="true"');
+    // 未选中的不带勾
+    expect(select).not.toContain('✓ m-big');
+    // 模型项在分组下面，不是另起一个"模型"下拉
+    expect(html.match(/槽位用哪个模型/g)).toHaveLength(5);
+  });
+
+  it('同名模型分属两家：选中的是结构化 (provider_id, model_id) 对', () => {
+    const slots = SLOT_DRAFTS.map((item) =>
+      item.slot === 'fast' ? slotDraft('fast', 'second', 'shared-model') : item,
+    );
+    const html = render({
+      providers: TWO_PROVIDERS,
+      slots,
+      slotViews: SLOTS.map((item) =>
+        item.slot === 'fast' ? slotView('fast', 'second', 'shared-model') : item,
+      ),
+    });
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    // 两家分组都在，但只有 second 的那一项被选中
+    expect(select).toContain('<optgroup label="first · OpenAI 兼容">');
+    expect(select).toContain('<optgroup label="second · OpenAI 兼容">');
+    expect(select).toContain('value="second::shared-model"');
+    expect(select).toContain('✓ shared-model');
+    // 服务端生效值也是 second（按模型名反查会选错另一家）
+    expect(html).toContain('second · OpenAI 兼容');
+    expect(parseSlotSelectValue('second::shared-model')).toEqual({
+      providerId: 'second',
+      modelId: 'shared-model',
+    });
+  });
+
+  it('没有供应商：选择器禁用、写「先添加模型」，页面照常可进入', () => {
+    const html = render({ providers: [] });
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    expect(select).toContain('disabled');
+    expect(select).toContain('先添加模型');
+    expect(html).toContain('先添加供应商和模型');
+    // 页面主体仍在（不是白板）
+    expect(html).toContain('每个职责，各指一个模型');
+  });
+
+  it('有供应商但没有启用的模型：同样禁用并提示先加模型', () => {
+    const disabledModels: ProviderDraftInput[] = [
+      {
+        ...PROVIDERS[0]!,
+        models: [{ model_id: 'm-fast', note: '', enabled: false }],
+      },
+    ];
+    const html = render({ providers: disabledModels });
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    expect(select).toContain('disabled');
+    expect(html).toContain('先给供应商添加一个启用的对话模型');
+  });
+
+  it('保存中：槽位下拉与保存按钮都禁用（不重复提交）', () => {
+    const html = render({ saving: true });
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    expect(select).toContain('disabled');
+    expect(html).toContain('保存中…');
+  });
+
+  it('草稿与已保存不同：标「未保存」，生效值只说等待服务端确认', () => {
+    // 草稿改成 m-big，但服务端 resolve 还没回来（slotViews 仍是 m-fast）
+    const html = render({
+      slots: SLOT_DRAFTS.map((item) =>
+        item.slot === 'fast' ? slotDraft('fast', 'main', 'm-big') : item,
+      ),
+    });
+    expect(html).toContain('未保存');
+    expect(html).toContain('等待服务端确认');
+    // 不许把浏览器推算的 m-big 冒充「实际生效」
+    const slotCard = html.slice(html.indexOf('快速'), html.indexOf('创作'));
+    expect(slotCard).not.toContain('实际生效</span><span class="ms-slot__effective-model">');
+  });
+
+  it('已停用的历史模型：保留显示但不可新选，并说明怎么换', () => {
+    const providers: ProviderDraftInput[] = [
+      {
+        ...PROVIDERS[0]!,
+        models: [
+          { model_id: 'm-fast', note: '', enabled: true },
+          { model_id: 'm-old', note: '', enabled: false },
+        ],
+      },
+    ];
+    const html = render({
+      providers,
+      slots: SLOT_DRAFTS.map((item) =>
+        item.slot === 'fast' ? slotDraft('fast', 'main', 'm-old') : item,
+      ),
+      slotViews: SLOTS.map((item) =>
+        item.slot === 'fast' ? slotView('fast', 'main', 'm-old') : item,
+      ),
+    });
+    const select = selectMarkup(html, '快速 槽位用哪个模型');
+    expect(select).toContain('value="main::m-old"');
+    expect(select).toContain('（已停用）');
+    expect(select).toContain('disabled');
+    expect(html).toContain('已停用：保留显示是为了让你看清现状，换个启用的模型');
+  });
+});
+
+describe('槽位可选项：结构化、按能力过滤、历史项可见不可选', () => {
+  it('同名模型分属两家：值是 provider::model，分组头各自带供应商', () => {
+    const { options, selectableCount, emptyHint } = slotOptions(
+      TWO_PROVIDERS,
+      'second',
+      'shared-model',
+    );
+    expect(emptyHint).toBe('');
+    expect(selectableCount).toBe(2);
+    expect(options.map((item) => item.value)).toEqual([
+      'first::shared-model',
+      'second::shared-model',
+    ]);
+    // 分组头是「供应商 · 协议」，两家必须能分清（不能只显示模型名）
+    expect(options.map((item) => item.provider_label)).toEqual([
+      'first · OpenAI 兼容',
+      'second · OpenAI 兼容',
+    ]);
+    const groups = groupSlotOptions(options);
+    expect(groups.map((group) => group.providerId)).toEqual(['first', 'second']);
+  });
+
+  it('停用的模型仍出现（历史可见），但不可新选', () => {
+    const providers: ProviderDraftInput[] = [
+      {
+        ...PROVIDERS[0]!,
+        models: [
+          { model_id: 'm-fast', note: '', enabled: true },
+          { model_id: 'm-old', note: '', enabled: false },
+        ],
+      },
+    ];
+    const { options } = slotOptions(providers, 'main', 'm-old');
+    expect(options.map((item) => [item.model_id, item.selectable])).toEqual([
+      ['m-fast', true],
+      ['m-old', false],
+    ]);
+  });
+
+  it('没有对话供应商（只有嵌入）：空列表 + 先添加模型的提示', () => {
+    const embed = MEMORY_PROVIDERS.find((item) => item.provider_id === 'cf')!;
+    const { options, selectableCount, emptyHint } = slotOptions([embed], '', '');
+    expect(options).toEqual([]);
+    expect(selectableCount).toBe(0);
+    expect(emptyHint).toBe('先添加供应商和模型');
+  });
+
+  it('历史绑定指向不具备 chat 能力的供应商：保留可见、不可新选', () => {
+    // cf 是嵌入供应商，但历史槽位指向它 → 仍显示，selectable=false
+    const { options } = slotOptions(MEMORY_PROVIDERS, 'cf', '@cf/baai/bge-m3');
+    const kept = options.find((item) => item.value === 'cf::@cf/baai/bge-m3');
+    expect(kept).toBeDefined();
+    expect(kept?.selectable).toBe(false);
+  });
+
+  it('未保存判据只看 (provider, model) 是否与已保存一致', () => {
+    const saved = slotView('fast', 'main', 'm-fast');
+    expect(slotDraftDirty(slotDraft('fast', 'main', 'm-fast'), saved)).toBe(false);
+    expect(slotDraftDirty(slotDraft('fast', 'main', 'm-big'), saved)).toBe(true);
+    expect(slotDraftDirty(slotDraft('fast', '', ''), saved)).toBe(true);
+    expect(slotDraftDirty(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('槽位选中值的结构化转换', () => {
+  it('provider::model → 结构化对；空值 → null（清空槽位）', () => {
+    expect(slotSelectValue('main', 'm-fast')).toBe('main::m-fast');
+    expect(slotSelectValue('', 'm-fast')).toBe('');
+    expect(slotSelectValue('main', '')).toBe('');
+    expect(parseSlotSelectValue('')).toBeNull();
+    expect(parseSlotSelectValue('')).toBeNull();
+  });
+
+  it('模型 ID 里带 `::` 也能切开：只按第一个分隔符', () => {
+    expect(parseSlotSelectValue('vendor::model::v2')).toEqual({
+      providerId: 'vendor',
+      modelId: 'model::v2',
+    });
   });
 });
 

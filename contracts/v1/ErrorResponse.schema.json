@@ -19,6 +19,18 @@
           "default": null,
           "title": "Detail"
         },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Field"
+        },
         "message": {
           "title": "Message",
           "type": "string"

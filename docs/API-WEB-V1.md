@@ -33,6 +33,7 @@
 | DELETE | `/v1/sessions/{id}` | 归档（软删除） |
 | GET | `/v1/sessions/{id}/messages?limit=50&before_sequence=N` | `{messages: ChatMessage[], active_turn: TurnView \| null}` |
 | GET | `/v1/messages/{message_id}/prompt` | 「查看本次提示词」：这条回复当时真正发给模型的上下文（只读、owner 限定，见 §12） |
+| POST | `/v1/sessions/{conversation_id}/messages/{message_id}/recall` | **撤回她自己发出去的那条**（owner only，见 §3A） |
 
 `ChatMessage` 来自 `contracts/v1`。`TurnView`：
 
@@ -82,6 +83,52 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 且必须仍属于调用者窗口；成功轮次重试返回 409。若协调器仍在收尾，服务端会有界等待
 （最多约 3 秒）后继续，而不是立即拒绝。
 
+## 3A. 撤回她自己发出去的消息（2026-11 新增）
+
+`POST /v1/sessions/{conversation_id}/messages/{message_id}/recall`
+
+用户拍板「说错了想收回」可以用。**只允许撤回她自己发出去的消息**，边界由
+服务端事实决定，客户端不能指定平台 id、不能跳过时间窗。
+
+| 状态码 | 什么时候 | 平台有没有收到 action |
+| --- | --- | --- |
+| 200 `state=recalled` | 平台确认撤回 | 收到 1 次 `delete_msg` |
+| 200 `state=uncertain` | 没拿到回执（超时/断连） | 收到（结果未知） |
+| 200 `state=not_found` | 平台说这条已经不在 | 收到 |
+| 200 `state=expired` | **平台**说超时/没权限 | 收到 |
+| 200 `state=unsupported` | 这个接入方式不支持（QQ 官方机器人） | **没收到** |
+| 403 `not_owner` / `not_actor_message` | 不是主人 / 不是她的发言 | **没收到** |
+| 404 `not_found` | 这条不在这个会话里 | **没收到** |
+| 409 `no_receipt` / `not_delivered` / `already_recalled` | 没有平台回执 / 当时没确认送达 / 已经撤过 | **没收到** |
+| 422 `expired` | 超过本地预检的 2 分钟窗 | **没收到** |
+| 429 `rate_limited` | 同一会话一分钟内超过 3 次 | **没收到** |
+
+响应体：
+
+```json
+{ "schema_version": "v1", "message_id": "msg_...", "state": "recalled",
+  "note": "撤回了", "recalled_at": "2026-11-09T07:40:00Z",
+  "receipt_id": "rcpt_...", "attempts": 1, "reason_code": null }
+```
+
+**界面只显示 `note`，不显示 `reason_code`**（`reason_code` 是稳定码，只给日志
+与测试；拒绝时它在错误体的 `detail` 里）。
+
+**`uncertain` 不是成功**：文案是「没拿到回执，不确定是否撤回成功」，前端不能
+显示成"已撤回"，也不能自动重试——重试由用户再点一次。
+
+**ChatMessage 新增三个字段**：`retracted_at`（**对方**撤回，2026-11 已有）、
+`recalled_at`（**她**撤回，本次新增）、`recall_state`（最后一次尝试的结果）。
+前端画"已撤回"徽标用这两个时间戳；两者都非空时以 `recalled_at` 为准。
+
+**为什么"她自己决定撤回"不开放给模型**：撤回是对已发生交互的补救，让模型
+判断"这句说错了"意味着它要评估自己的输出，而它对自己的错误没有可靠判据——
+错判一次就是替用户删掉一条正常回复。本轮只有用户手动入口；下一阶段若开放，
+需单独授权（模型只能提议、owner 确认）。
+
+完整口径（五道闸、回执五态、上下文注记、审计字段）见
+`docs/BEHAVIOR-LOG-CONTRACT.md` §4A。
+
 ## 4. 模型设置
 
 | 方法 | 路径 | 说明 |
@@ -95,7 +142,10 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | DELETE | `/v1/settings/providers/{provider_id}/secret` | 删除凭据 |
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
-| GET | `/v1/settings/connectors` | `{schema_version, as_of, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, fields[], runtime}]}`；**只读**接入器诊断，`fields[].kind=secret` 只回 `set` 不回值（必鉴权） |
+| GET | `/v1/settings/connectors` | `{schema_version: "v2", as_of, can_edit, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, generation, activation, fields[], runtime}], access: {id, generation, activation, editable, fields[]}}`；接入器诊断 **+ 可配置字段**；`fields[].kind=secret` 只回 `configured`/`preview`，`value` 恒 null（必鉴权） |
+| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。owner + 同源 Origin + 15 分钟内重新登录（必鉴权） |
+| GET | `/v1/settings/connectors/operations/{operation_id}` | `{operation_id, scope, state, generation, active_generation, started_at, activated_at, error_code, error_safe}`；202 之后用它确认**真的**生效了（必鉴权，owner） |
+| POST | `/v1/settings/connectors/reset` | 清空三个 scope 的覆盖（回退 env/默认）→ `{ok, results: [{scope, state, cleared[], operation_id?, error_code?}]}`；任一 scope 失败则 `ok=false` 并保留原 active（**不出现"部分恢复默认却报成功"**）（必鉴权，owner） |
 | POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
 | POST | `/v1/settings/quick-config/preview` | 同上的 body → `{rows[], profiles[], summary}`；快速配置的二次确认（全量覆盖，`profiles` 就是确认后要写入的那份） |
 | GET | `/v1/settings/preferences` | `{schema_version, timezone, source, stored, env, default, common[], video_mode, video_modes[], video_mode_default}`；`source` 为 `preference` / `env` / `default`（必鉴权） |
@@ -165,23 +215,96 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 `change_kind` 取 `override / same / repair / unavailable`——弹窗必须把
 "将要覆盖哪几条"摆在明面上，确认后仍需保存才生效。
 
-### 4.2 接入器（渠道）
+### 4.2 接入器（渠道，可配置）
 
-`GET /v1/settings/connectors` 是**只读**诊断：渠道配置全在宿主部署目录的 `.env`
-（`LING_ONEBOT_*` / `LING_QQBOT_*`），密钥只在宿主上。这条端点回答三件事——
-凭据齐不齐（`configured`）、现在通不通（`status`）、缺的那项该改哪个变量
-（`fields[]` + `guidance`）。
+> 设计文档：`docs/CONNECTOR-CONFIG-DESIGN.md`。契约：
+> `contracts/v1/ConnectorsOut.schema.json`、`ConnectorChangeRequest.schema.json`、
+> `ConnectorChangeAccepted.schema.json`。
 
-`status` 四值：`not_configured`（还没填齐）/ `disabled`（凭据齐了但渠道开关关着，
-只在 QQ 官方机器人上出现）/ `configured_disconnected`（配齐了但当前没连上）/
-`connected`。**不要把它压成"可用/不可用"**：这四者的下一步完全不同。
+接入器配置**不再只从 `.env` 来**：生产容器非 root、根文件系统只读，写不了 `.env`
+也重启不了自己，所以值落**数据库覆盖层**，由进程读出来构造连接器。优先级：
 
-`status_reason` 是稳定的码，`status_message` 是它对应的中文（码表见
-`ling/settings/connectors.py::CONNECTOR_REASON_TEXT`，前端只显示文案）。
-`fields[]` 每项 `{name, label, kind, set, value, source}`，`name` 是真实环境变量名，
-`kind=secret` 的项 `value` **恒为 null**、只有 `set`；`kind=switch` 的 `value` 是"开"/"关"。
+```text
+DB 已生效覆盖  >  进程启动时的 env 快照  >  代码默认值
+```
+
+**诊断仍然只读**：`GET` 回答凭据齐不齐（`configured`）、现在通不通（`status`）、
+有效值来自哪一层（`fields[].source`）。`status` 四值：`not_configured`（还没填齐）/
+`disabled`（凭据齐了但渠道开关关着，只在 QQ 官方机器人上出现）/
+`configured_disconnected`（配齐了但当前没连上）/ `connected`。**不要把它压成
+"可用/不可用"**：这四者的下一步完全不同。`status_reason` 是稳定的码，
+`status_message` 是它对应的中文（码表见 `ling/settings/connectors.py::CONNECTOR_REASON_TEXT`）。
+
+#### 字段
+
+`fields[]` 每项：
+
+| 字段 | 含义 |
+| --- | --- |
+| `key` | 注册表里的固定键（= 环境变量名）。`name` 是它的兼容别名 |
+| `kind` | `secret` / `text` / `switch` / `list` |
+| `source` | `db`（本 scope active 修订里有覆盖）/ `env`（启动时 env 有值）/ `default` |
+| `configured` | **有效值非空**（不等于"DB 有覆盖"）。`set` 是兼容别名 |
+| `value` | 非密钥的规范化值：文本、布尔（switch）、字符串数组（list，**前导零保留**）；`secret` 恒 `null` |
+| `preview` | 仅 `secret`：前 `min(7, len-1)` 个 Unicode 字符 + 固定 `••••`；空值为 `null`。**非 owner 一律 `null`** |
+| `editable` | owner 为 true；非 owner 只读 |
+
+字段清单是**服务端白名单**（`ling/settings/connector_fields.py`，onebot 12 项 /
+qqbot 12 项 / access 2 项）。请求里出现白名单之外的键（`LING_ROOT_KEY`、
+`DATABASE_URL`…）一律 `422 invalid_field`——不能把"任意环境变量写入"开成口子。
+
+#### 保存
+
+`PUT /v1/settings/connectors/{scope}`：
+
+- `set` 里没出现的键 = 不改；**密钥给空串 = 不改**（密码框总是空的，不能因此变成删除）；
+- `clear` = 删除该键在本修订的覆盖，**回退到 env**（不是写空串）；
+- 同一个键同时出现在 `set` 与 `clear` → `422 invalid_field`；
+- 校验分两层：字段级（URL scheme / 禁 userinfo / 禁敏感 query / 控制字符 / 端口范围）
+  与**合并后的整体**（配了 WS 端口没令牌、白名单模式但名单空…）。**任何一层失败都
+  在停连接之前**，所以用户填错一个端口号不会让她的 QQ 掉线；
+- 有效值没变 → `200` + `state=unchanged`，**不建修订、不重连**；
+- 真实切换失败 → `202` + `state=rolled_back`：旧配置与旧连接已恢复，`generation`
+  **不推进**；回退本身也失败才是 `degraded`（如实上报，绝不报成功）。
+
+#### 生效
+
+`generation` 是每个 scope 的单调代际号。`PUT` 用 `If-Match: <generation>` 做并发
+控制：两个保存同时到达只有一个赢家，输家拿 `409 conflict` + `detail=generation_conflict`
+或 `detail=activation_in_progress`（候选已落库、正在切换）。
+
+一次 `PUT` 的顺序是**先校验、再落候选修订、最后在事务外切换**：长连接
+`stop()`/`start()` 绝不在事务里，否则拿着行锁等网络。切换失败时用**旧配置重新
+构造**一份（旧对象 stop 之后不保证能再 start，见设计 §4），并让
+`app.state` 继续指向可用的那份。
+
+**白名单不需要重连**：它换掉进程里的 `Settings` 快照（一次赋值，asyncio 单线程里
+原子可见），入站判断下一条消息就按新名单走。这样不会出现"验签读旧 token、授权读
+新名单"——同一个请求读到的永远是一份完整快照。
+
+#### 中断窗口（`timings`）
+
+回包带 `timings`：`disconnect_started_at`（开始停旧实例）、`listener_ready_at`
+（新实例 `start()` 返回）、`remote_connected_at`（远端在等待窗口内报告已连上）。
+**"任务已创建"不等于"已连上"**，所以远端那一步有独立的有界等待（3 秒）：
+超时只影响 `health/state`（`degraded`），不影响"本地已切换"。量化目标是本地
+代际切换 500ms 内完成（`listener_ready_at - disconnect_started_at`）。
+
+#### 审计
+
+一次保存记两条：`connector_config_changed`（改了哪些**字段名**、每个字段的
+`旧指纹>新指纹`、结果）与 `connector_activated` / `connector_rolled_back`。
+指纹是**带域分离的 HMAC-SHA256 截断**（低熵字段如端口 `5700` 用无盐 SHA 能被
+穷举反推）。审计里**没有值、也没有预览**；请求体本身不进访问日志。
+
+#### `runtime` 与 `activation`
+
 `runtime` 报进程里能直接看到的连接数与已收帧数（没有可观察的连接对象时为 null）；
 **这条端点不发网络探测**，设置页会被反复打开，不能拿它当探活。
+`activation` 是 `{state, generation, active_generation, candidate_generation,
+active_revision_id, candidate_revision_id, last_revision_id, last_state, started_at,
+activated_at, error_code, error_safe, ack_count, expected_count}`：
+`activating` 表示候选已落库、正在切换；`rolled_back` / `degraded` 都**不是**成功。
 
 `log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
 **只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过
@@ -846,3 +969,87 @@ messages** + 每一段属于哪个语义块。用来回答"她为什么这么说
 2. 墓碑再放 7 天 → 真删（之后才退化成 `unavailable`）。
 
 所以"过期"和"从没存过"在保留期后的一段时间里仍然可分。清理不删任何对话数据。
+
+
+## 13. 上游不可用时回退到领域默认（2026-11 新增）
+
+设计依据：`docs/UX-FIXES-2026-11-09.md` §4；实现：`src/ling/domains/fallback.py`。
+
+### 13.1 一句话规则
+
+有些**行为参数**不归本域所有，而是"看上游现在怎样"决定的（例如「多久看一次
+手机」要看日程：在忙拉长、睡着不排）。上游可能还没生成（`pending`）、生成失败
+（`failed`）、本来就没有（`empty`）或读不到（`unavailable` / 超时）。这三种情况下：
+
+- **不硬崩**：本域照常返回可用结果；
+- **不拿旧值顶**：上一次的日程、过期场景都不能当作现在还成立；
+- **用本域默认参数**跑这一次，并**说清这是默认值**。
+
+### 13.2 `fallback` 标记（`FallbackNotice`）
+
+凡是会回退的区块，`data.fallback` 都给同一个形状（契约
+`contracts/v1/FallbackNotice.schema.json`）：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `upstream` | string | 上游是谁：`schedule` / `scene` |
+| `used` | boolean | 这次是否用了**领域默认参数** |
+| `state` | enum | 上游当时的状态：`ready`/`degraded`/`empty`/`pending`/`failed`/`unavailable`/`unknown` |
+| `source` | enum | `upstream`（用上游值）或 `domain_default`（回退） |
+| `reason` | string \| null | 给人看的一句话；没回退时为 `null` |
+
+**没有回退时这个字段也在**（`used=false`、`reason=null`）。缺字段会让前端
+分不清"没用回退"和"后端没实现"。
+
+**它不是事实**，也不能被读成事实：
+
+- `used=true` 只说"上游这次没给出可用的值"，不代表上游坏了，更不代表她做了什么；
+- 默认值**绝不**写进 `activities` / `self_experiences` / 位置 / `day_plans` /
+  `scene_commits`——回退只影响**本次**的参数，写入仍归各自的状态机；
+- 上游恢复后，下一次调用直接读新鲜值；回退结果不会被缓存成事实。
+
+### 13.3 当前两处落点
+
+**`sections.phone.data`**（看手机）
+
+| 字段 | 含义 |
+| --- | --- |
+| `next_look_interval_minutes` | 下次隔多久看她一眼。上游（日程当日段）可用时按段的活动类别给（`focus/work` 45、`meal` 30、`leisure` 15、`sleep` 0 = 醒来再排）；否则用 `DEFAULT_IDLE_MINUTES`（10） |
+| `fallback` | 见 §13.2；`upstream=schedule` |
+
+空态（从没看过手机）也会给 `next_look_interval_minutes` 与 `fallback`——
+**参数**不跟着**事实**一起消失；但空态里不会出现 `state` / `last_looked_at`
+这类"她拿过手机"的字段（那是在编事实）。
+
+**`sections.presence.data`**（当前场景）
+
+| 字段 | 含义 |
+| --- | --- |
+| `scene.state` | `chat`/`focus`/`rest`/`errand`/`unknown`；`valid_until` 过期即 `unknown` |
+| `scene.expired` | 这次读到的是不是已过期（过期不沿用旧场景） |
+| `fallback` | 见 §13.2；`upstream=scene` |
+
+只给状态、不给 `scene.activity_id` / `place_id`：首屏不需要，也不该在这里被读成
+"她正在做 X"。
+
+### 13.4 判定表（与 §11.3 的 `TimelineState` 对齐）
+
+| 上游状态 | 能否当当前输入 | 消费点行为 |
+| --- | --- | --- |
+| `ready` | 能 | 用上游值，`source=upstream` |
+| `degraded` | **只能作计划参考** | 行为参数可以用（`used=false`、`state=degraded`，标记里如实写"规则兜底"）；**任何断言"她正在做 X"的地方都不能用**，那种地方回退到领域默认 |
+| `empty` / `pending` / `failed` / `unavailable` / `unknown` | 不能 | 用领域默认，`used=true`，理由说清是哪种 |
+| 读超过 300 ms 预算 | 不能 | 按 `unavailable` 回退，`reason` 写出预算 |
+
+### 13.5 还没接上的调用点（下一批）
+
+下面这些也读上游，但本批**没有**改（各有各的理由，按风险排）：
+
+| 调用点 | 读什么 | 当前行为 | 下一批怎么做 |
+| --- | --- | --- | --- |
+| `api/routes/dashboard.py::today_outline()` | `load_actor_day` | 读取失败 → 整块 `unavailable`；状态原样透出，本就不伪造 | 加 `fallback`（仅"无值可展示"时），不改状态语义 |
+| `api/routes/life_timeline.py::_load_facts()` | `SceneCommitRow.valid_until` | 过期 → `scene_valid_until=null`（已按 §11.5 处理） | 加 `input_sources.scene` 标记 |
+| `kernel/self_view.py::_add_scene()` | `PresenceService.scene()` | 过期/读失败 → 丢弃（不注入提示词） | 复用 `resolve_scene()`，在 `SelfView.dropped` 里带原因 |
+| `kernel/autonomy.py` 的处境读取 | presence / 负担 / 情绪 | 读失败 → 用默认值继续（已有 try/except） | 统一走 `read_within_budget`，标记进决策事件 |
+| `worker.py` 的 `life.tick` 场景提交 | 日程段 | 无段就不提交；过期靠 TTL 自然转 unknown | **写路径**，需单独设计（本批只做只读） |
+| `domains/phone` 的"真的采用这个节奏" | 调用 `schedule_next_from_upstream` | 目前只有读侧投影；谁调 `stop_watching` 由调度决定 | 调度接线时直接调它（已带日志与回退标记） |

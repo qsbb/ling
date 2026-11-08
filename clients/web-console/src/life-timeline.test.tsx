@@ -19,12 +19,25 @@ import { describe, expect, it } from 'vitest';
 import {
   buildSegmentTree,
   commitmentTag,
+  createOutlineScheduler,
   DreamCardView,
   dreamView,
   evidenceLabel,
   formatInZone,
+  GenerateScheduleButton,
   hiddenSummary,
   LifeTimeline,
+  LifeTimelinePanel,
+  outlineButtonLabel,
+  outlineIdleHint,
+  OUTLINE_FORCE_PROMPT,
+  outlineViewFromError,
+  outlineViewFromJob,
+  type OutlineJobApi,
+  type OutlineJobView,
+  type TimelinePanelApi,
+  scheduleActionFor,
+  submitFailureCopy,
   segmentEmptyText,
   segmentHeightPx,
   segmentPhase,
@@ -32,12 +45,14 @@ import {
   timezoneGapNote,
   TimelineTrack,
 } from './components/LifeTimeline';
+import { ApiError } from './api';
 import type {
   DayIntentSummary,
   DreamCard,
   LifeTimelineFact,
   LifeTimelineOut,
   LifeTimelineSegment,
+  OutlineJobOut,
   TimelineState,
 } from './types';
 
@@ -676,5 +691,434 @@ describe('TimelineTrack 单独渲染', () => {
       }),
     );
     expect(html).toContain('data-testid="tl-seg-seg-orphan"');
+  });
+});
+
+/* ------------------------------------------------------ 手动生成日程 */
+
+function job(overrides: Partial<OutlineJobOut> = {}): OutlineJobOut {
+  return {
+    schema_version: 'v1',
+    job_id: 'job-1',
+    plan_day: '2026-11-07',
+    state: 'queued',
+    note: '已经排上队了，她正在准备，稍等一下再看',
+    revision: 1,
+    plan_state: 'pending',
+    reason_code: null,
+    enqueued: true,
+    ...overrides,
+  };
+}
+
+/** 假时钟：`sleep` 只推进时间，不真的等。 */
+function fakeClock() {
+  let t = 0;
+  return {
+    now: () => t,
+    sleep: async (ms: number) => {
+      t += ms;
+    },
+    elapsed: () => t,
+  };
+}
+
+describe('生成日程：按钮该出现什么、点下去会怎样', () => {
+  it('空态/无计划行 → 「生成今天的日程」；ready/degraded → 「重新生成」（要 force）', () => {
+    expect(scheduleActionFor(null, 'empty')).toBe('generate');
+    expect(scheduleActionFor('pending', 'pending')).toBe('generate');
+    expect(scheduleActionFor('failed', 'failed')).toBe('generate');
+    expect(scheduleActionFor('ready', 'ready')).toBe('regenerate');
+    expect(scheduleActionFor('degraded', 'degraded')).toBe('regenerate');
+    // 读不到 ≠ 没生成：不给按钮，免得白花一次生成额度。
+    expect(scheduleActionFor('ready', 'unavailable')).toBe('none');
+    expect(scheduleActionFor('whatever', 'ready')).toBe('none');
+  });
+
+  it('按钮文案：生成中说「已提交，正在生成…」，空闲时按状态给「生成/重新生成」', () => {
+    expect(outlineButtonLabel('generate', false)).toBe('生成今天的日程');
+    expect(outlineButtonLabel('regenerate', false)).toBe('重新生成');
+    expect(outlineButtonLabel('generate', true)).toBe('已提交，正在生成…');
+  });
+
+  it('作业状态 → 界面状态：queued/running 只能是"正在生成"，unknown 不猜成功', () => {
+    expect(outlineViewFromJob(job({ state: 'queued' })).phase).toBe('polling');
+    expect(outlineViewFromJob(job({ state: 'running', note: '她正在排这一天的日程' })).note).toBe(
+      '她正在排这一天的日程',
+    );
+    expect(outlineViewFromJob(job({ state: 'ready', note: '这一天的日程已经排好了' })).phase).toBe(
+      'ready',
+    );
+    expect(outlineViewFromJob(job({ state: 'degraded', note: '已按规则铺了一版' })).phase).toBe(
+      'degraded',
+    );
+    expect(outlineViewFromJob(job({ state: 'unchanged', note: '今天已经生成过，没有重新生成' })).phase).toBe(
+      'unchanged',
+    );
+    expect(outlineViewFromJob(job({ state: 'failed', note: '没排出来' })).phase).toBe('failed');
+    expect(outlineViewFromJob(job({ state: 'blocked', note: '预算用完了' })).phase).toBe('failed');
+    expect(outlineViewFromJob(job({ state: '猜不到的状态', note: '' })).phase).toBe('failed');
+  });
+
+  it('reason_code 不进界面文案（只给日志与测试）', () => {
+    const view = outlineViewFromJob(
+      job({ state: 'failed', note: '这一天的日程没排出来，可以再试一次', reason_code: 'budget_exhausted' }),
+    );
+    expect(view.note).not.toContain('budget_exhausted');
+    expect(JSON.stringify(view)).not.toContain('budget_exhausted');
+  });
+
+  it('409 用后端的人话；429 固定文案；网络/5xx 可重试，409 不可', () => {
+    expect(
+      submitFailureCopy(new ApiError(409, 'conflict', '今天用来生成日程的调用次数用完了，可以在设置里调整预算上限')),
+    ).toBe('今天用来生成日程的调用次数用完了，可以在设置里调整预算上限');
+    expect(submitFailureCopy(new ApiError(429, 'rate_limited', '点得太快了，稍等一下再试'))).toBe(
+      '点太快了，等几秒再试',
+    );
+    expect(submitFailureCopy(new ApiError(422, 'invalid_request', '只能生成 2026-11-08 或 2026-11-09 的日程'))).toBe(
+      '只能生成今天或明天的日程，刷新页面后再试',
+    );
+    expect(submitFailureCopy(new ApiError(403, 'forbidden', '只有主人可以触发日程生成'))).toContain('只有主人');
+
+    expect(outlineViewFromError(new ApiError(0, 'network_error', '无法连接服务端')).retryable).toBe(true);
+    expect(outlineViewFromError(new ApiError(500, 'internal', '服务端内部错误')).retryable).toBe(true);
+    expect(outlineViewFromError(new ApiError(409, 'conflict', '预算用完了')).retryable).toBe(false);
+  });
+
+  it('提交 202 → 轮询 running → ready：只发一次、按钮/状态跟着变、终态后刷新时间轴', async () => {
+    const creates: { plan_day: string; force: boolean; request_id: string }[] = [];
+    const polls: string[] = [];
+    const changes: OutlineJobView[] = [];
+    let settled = 0;
+    const states = ['running', 'ready'];
+    const api: OutlineJobApi = {
+      async createOutlineJob(body) {
+        creates.push(body);
+        return job({ state: 'queued', note: '已经排上队了，她正在准备，稍等一下再看' });
+      },
+      async outlineJob(jobId) {
+        polls.push(jobId);
+        const state = states.shift() ?? 'ready';
+        return job({
+          state,
+          note: state === 'ready' ? '这一天的日程已经排好了' : '她正在排这一天的日程',
+        });
+      },
+    };
+    const clock = fakeClock();
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: (next) => changes.push(next),
+      onSettled: () => {
+        settled += 1;
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      makeRequestId: () => 'rid-fixed',
+    });
+
+    const view = await scheduler.submit('2026-11-07', false);
+
+    expect(creates).toEqual([{ plan_day: '2026-11-07', force: false, request_id: 'rid-fixed' }]);
+    expect(polls).toEqual(['job-1', 'job-1']);
+    expect(changes.map((item) => item.phase)).toEqual(['polling', 'polling', 'ready']);
+    expect(changes[0]?.note).toBe('已经排上队了，她正在准备，稍等一下再看');
+    expect(view.phase).toBe('ready');
+    expect(settled).toBe(1);
+  });
+
+  it('双重点击只提交一次，两次用同一个 request_id', async () => {
+    const creates: { plan_day: string; force: boolean; request_id: string }[] = [];
+    let ids = 0;
+    const api: OutlineJobApi = {
+      async createOutlineJob(body) {
+        creates.push(body);
+        return job({ state: 'unchanged', note: '今天已经生成过，没有重新生成' });
+      },
+      async outlineJob() {
+        return job({ state: 'ready' });
+      },
+    };
+    const clock = fakeClock();
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: () => undefined,
+      sleep: clock.sleep,
+      now: clock.now,
+      makeRequestId: () => `rid-${++ids}`,
+    });
+
+    const [first, second] = await Promise.all([
+      scheduler.submit('2026-11-07', false),
+      scheduler.submit('2026-11-07', false),
+    ]);
+
+    expect(creates).toHaveLength(1);
+    expect(creates[0]?.request_id).toBe('rid-1');
+    expect(ids).toBe(1);
+    expect(first).toBe(second);
+    expect(first.phase).toBe('unchanged');
+  });
+
+  it('网络失败后重试复用同一个 request_id（后端据此幂等）', async () => {
+    const creates: string[] = [];
+    let attempt = 0;
+    const api: OutlineJobApi = {
+      async createOutlineJob(body) {
+        creates.push(body.request_id);
+        attempt += 1;
+        if (attempt === 1) throw new ApiError(0, 'network_error', '无法连接服务端');
+        return job({ state: 'unchanged', note: '今天已经生成过，没有重新生成' });
+      },
+      async outlineJob() {
+        return job({ state: 'ready' });
+      },
+    };
+    let ids = 0;
+    const clock = fakeClock();
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: () => undefined,
+      sleep: clock.sleep,
+      now: clock.now,
+      makeRequestId: () => `rid-${++ids}`,
+    });
+
+    const failed = await scheduler.submit('2026-11-07', false);
+    expect(failed.phase).toBe('error');
+    expect(failed.retryable).toBe(true);
+    expect(scheduler.pendingRequestId).toBe('rid-1');
+
+    const view = await scheduler.retry();
+    expect(creates).toEqual(['rid-1', 'rid-1']);
+    expect(view?.phase).toBe('unchanged');
+    expect(ids).toBe(1);
+  });
+
+  it('60 秒还没到终态 → 只能说"还在生成"，绝不说成功', async () => {
+    const api: OutlineJobApi = {
+      async createOutlineJob() {
+        return job({ state: 'queued' });
+      },
+      async outlineJob() {
+        return job({ state: 'running', note: '她正在排这一天的日程' });
+      },
+    };
+    const clock = fakeClock();
+    let settled = 0;
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: () => undefined,
+      onSettled: () => {
+        settled += 1;
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      pollMs: 1500,
+      maxMs: 60_000,
+      makeRequestId: () => 'rid-timeout',
+    });
+
+    const view = await scheduler.submit('2026-11-07', false);
+
+    expect(view.phase).toBe('timeout');
+    expect(view.note).toBe('还在生成，可以稍后刷新看看');
+    expect(view.note).not.toContain('成功');
+    expect(clock.elapsed()).toBeGreaterThanOrEqual(60_000);
+    expect(settled).toBe(1);
+  });
+
+  it('force=true 真的进请求体（重排）；unchanged 不轮询也不说重新生成', async () => {
+    const creates: { plan_day: string; force: boolean; request_id: string }[] = [];
+    let polls = 0;
+    const api: OutlineJobApi = {
+      async createOutlineJob(body) {
+        creates.push(body);
+        return job({ state: 'unchanged', note: '今天已经生成过，没有重新生成' });
+      },
+      async outlineJob() {
+        polls += 1;
+        return job({ state: 'ready' });
+      },
+    };
+    const clock = fakeClock();
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: () => undefined,
+      sleep: clock.sleep,
+      now: clock.now,
+      makeRequestId: () => 'rid-force',
+    });
+
+    const view = await scheduler.submit('2026-11-07', true);
+
+    expect(creates[0]?.force).toBe(true);
+    expect(polls).toBe(0);
+    expect(view.phase).toBe('unchanged');
+    expect(view.note).toBe('今天已经生成过，没有重新生成');
+  });
+
+  it('409 直接显示后端 note，不轮询作业', async () => {
+    let polls = 0;
+    const api: OutlineJobApi = {
+      async createOutlineJob() {
+        throw new ApiError(
+          409,
+          'conflict',
+          '今天用来生成日程的调用次数用完了，可以在设置里调整预算上限',
+          false,
+          '计划日 2026-11-07 的手动生成没有开始。',
+        );
+      },
+      async outlineJob() {
+        polls += 1;
+        return job({ state: 'ready' });
+      },
+    };
+    const clock = fakeClock();
+    const changes: OutlineJobView[] = [];
+    const scheduler = createOutlineScheduler({
+      api,
+      onChange: (next) => changes.push(next),
+      sleep: clock.sleep,
+      now: clock.now,
+    });
+
+    const view = await scheduler.submit('2026-11-07', false);
+
+    expect(view.phase).toBe('error');
+    expect(view.note).toBe('今天用来生成日程的调用次数用完了，可以在设置里调整预算上限');
+    expect(view.retryable).toBe(false);
+    expect(polls).toBe(0);
+    expect(JSON.stringify(changes)).not.toContain('budget_exhausted');
+  });
+});
+
+describe('生成日程：无障碍与禁用态（SSR）', () => {
+  it('生成中：按钮禁用、aria-busy、文案与状态都更新，状态区 aria-live=polite', () => {
+    const html = renderToStaticMarkup(
+      h(GenerateScheduleButton, {
+        planDay: '2026-11-07',
+        action: 'generate',
+        busy: true,
+        status: '已经排上队了，她正在准备，稍等一下再看',
+        statusTone: 'info',
+        onGenerate: () => undefined,
+        forcePrompt: OUTLINE_FORCE_PROMPT,
+      }),
+    );
+    expect(html).toContain('已提交，正在生成…');
+    expect(html).toMatch(/data-testid="tl-generate-button"[^>]*disabled/);
+    expect(html).toContain('aria-busy="true"');
+    expect(html).toContain('aria-live="polite"');
+    expect(html).toContain('已经排上队了，她正在准备');
+    expect(html).toContain('2026-11-07');
+  });
+
+  it('ready 后按钮变「重新生成」且不再禁用；确认文案说明会推倒未开始的段', () => {
+    const html = renderToStaticMarkup(
+      h(GenerateScheduleButton, {
+        planDay: '2026-11-07',
+        action: 'regenerate',
+        busy: false,
+        status: '这一天的日程已经排好了',
+        statusTone: 'info',
+        onGenerate: () => undefined,
+        forcePrompt: OUTLINE_FORCE_PROMPT,
+      }),
+    );
+    expect(html).toContain('重新生成');
+    expect(html).not.toContain('disabled');
+    expect(OUTLINE_FORCE_PROMPT).toContain('推倒还没开始的计划段');
+  });
+
+  it('409 的 note 显示在状态区，且整段 HTML 不含 reason_code', () => {
+    const view = outlineViewFromError(
+      new ApiError(409, 'conflict', '今天用来生成日程的调用次数用完了，可以在设置里调整预算上限'),
+    );
+    const html = renderToStaticMarkup(
+      h(GenerateScheduleButton, {
+        planDay: '2026-11-07',
+        action: 'generate',
+        busy: false,
+        status: view.note,
+        statusTone: 'error',
+        onGenerate: () => undefined,
+        forcePrompt: OUTLINE_FORCE_PROMPT,
+      }),
+    );
+    expect(html).toContain('今天用来生成日程的调用次数用完了');
+    expect(html).not.toContain('budget_exhausted');
+    expect(html).toContain('data-tone="error"');
+  });
+});
+
+/* ------------------------------------------- 面板：目标日只听时间轴的 */
+
+/**
+ * 面板在 SSR 下停在加载态（effect 里的取数还没跑），所以这里测的是**按钮的
+ * 取值规则**本身：目标日永远来自时间轴的 `plan_day`。点下去的完整流程
+ * （提交→轮询→ready→重新生成）由 `life-timeline.browser.test.tsx` 在真浏览器里测。
+ */
+describe('生成按钮的目标日只取时间轴的 plan_day（不按浏览器时区算）', () => {
+  it('display_date 与 plan_day 不同时，按钮带的是 plan_day', () => {
+    const html = renderToStaticMarkup(
+      h(GenerateScheduleButton, {
+        // 夹具里 display_date=11-08（你的今天），plan_day=11-07（她的计划日）
+        planDay: '2026-11-07',
+        action: 'generate',
+        busy: false,
+        status: outlineIdleHint('generate'),
+        statusTone: 'info',
+        onGenerate: () => undefined,
+        forcePrompt: OUTLINE_FORCE_PROMPT,
+      }),
+    );
+    expect(html).toContain('data-target-day="2026-11-07"');
+    expect(html).not.toContain('2026-11-08');
+  });
+
+  it('面板没有注入 client 时用真实 api（类型契约仍在）', () => {
+    // 只要类型成立即可：面板默认 client = api，注入后走假实现。
+    const client: TimelinePanelApi = {
+      async lifeTimeline() {
+        return timeline();
+      },
+      async createOutlineJob() {
+        return job();
+      },
+      async outlineJob() {
+        return job();
+      },
+    };
+    expect(typeof client.lifeTimeline).toBe('function');
+    // 组件存在且可被渲染成元素（SSR 下是加载态，不取数）。
+    const html = renderToStaticMarkup(h(LifeTimelinePanel, {}));
+    expect(html).toContain('data-testid="life-timeline-panel"');
+  });
+});
+
+describe('轮询失败 vs 超时', () => {
+  it('轮询中途报错：显示错误，不许被"还在生成"覆盖', async () => {
+    const api: OutlineJobApi = {
+      async createOutlineJob() {
+        return job({ state: 'queued', note: '已提交' });
+      },
+      async outlineJob() {
+        throw new ApiError(503, 'internal', '服务端内部错误');
+      },
+    };
+    const views: OutlineJobView[] = [];
+    const view = await createOutlineScheduler({
+      api,
+      pollMs: 1,
+      maxMs: 50,
+      sleep: async () => {},
+      onChange: (v) => views.push(v),
+    }).submit('2026-11-07', false);
+
+    expect(view.phase).toBe('error');
+    expect(view.retryable).toBe(true);
+    expect(views.map((v) => v.phase)).not.toContain('timeout');
   });
 });

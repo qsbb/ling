@@ -1,0 +1,362 @@
+{
+  "$defs": {
+    "ConnectorActivationOut": {
+      "additionalProperties": false,
+      "description": "一个 scope 的生效状态（只含无敏感值的运行信息）。\n\n``state=activating`` 表示候选已落库、正在切换；只有到 ``active`` 才是\n\"已生效\"。``rolled_back`` 表示失败并已恢复上一份配置；``degraded`` 是\n本地生效但远端没连上（或回退本身也失败）——都**不是**成功。",
+      "properties": {
+        "ack_count": {
+          "default": 0,
+          "title": "Ack Count",
+          "type": "integer"
+        },
+        "activated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Activated At"
+        },
+        "active_generation": {
+          "title": "Active Generation",
+          "type": "integer"
+        },
+        "active_revision_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active Revision Id"
+        },
+        "candidate_generation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Generation"
+        },
+        "candidate_revision_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Revision Id"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error Code"
+        },
+        "error_safe": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "可以展示给人看的一句话，不含异常原文",
+          "title": "Error Safe"
+        },
+        "expected_count": {
+          "default": 1,
+          "title": "Expected Count",
+          "type": "integer"
+        },
+        "generation": {
+          "title": "Generation",
+          "type": "integer"
+        },
+        "last_revision_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Revision Id"
+        },
+        "last_state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last State"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "state",
+        "generation",
+        "active_generation"
+      ],
+      "title": "ConnectorActivationOut",
+      "type": "object"
+    },
+    "ConnectorFieldKind": {
+      "description": "字段在表单上的种类。``secret`` 的 ``value`` 恒为 null。",
+      "enum": [
+        "secret",
+        "text",
+        "switch",
+        "list"
+      ],
+      "title": "ConnectorFieldKind",
+      "type": "string"
+    },
+    "ConnectorFieldOut": {
+      "additionalProperties": false,
+      "description": "一个字段的有效值 + 来源 + 脱敏预览。\n\n``key`` 是注册表里的固定名（同时是 GET/PUT 的键）；``source`` 回答\n\"现在生效的是 DB 覆盖、env 还是默认值\"；``configured`` 只表示**有效值\n非空**，不等于\"DB 有覆盖\"。``preview`` 只对敏感字段出现（前 7 个字符 +\n固定遮罩），非 owner 拿到的是 null。",
+      "properties": {
+        "configured": {
+          "title": "Configured",
+          "type": "boolean"
+        },
+        "control": {
+          "default": "text",
+          "description": "text / password / switch / list / select",
+          "title": "Control",
+          "type": "string"
+        },
+        "editable": {
+          "default": true,
+          "title": "Editable",
+          "type": "boolean"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectorFieldKind"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "name": {
+          "description": "与 key 相同的兼容别名（旧前端读 name）",
+          "title": "Name",
+          "type": "string"
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "敏感字段的前缀预览（前 7 字符 + ••••）；未配置为 null",
+          "title": "Preview"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "set": {
+          "description": "configured 的兼容别名",
+          "title": "Set",
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/ConnectorFieldSource"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "非密钥的规范化值；密钥恒 null",
+          "title": "Value"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "scope",
+        "kind",
+        "label",
+        "source",
+        "configured",
+        "set"
+      ],
+      "title": "ConnectorFieldOut",
+      "type": "object"
+    },
+    "ConnectorFieldSource": {
+      "description": "一项配置的有效值来自哪一层。",
+      "enum": [
+        "db",
+        "env",
+        "default"
+      ],
+      "title": "ConnectorFieldSource",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/ConnectorView.schema.json",
+  "additionalProperties": false,
+  "description": "一个接入器的诊断 + 可编辑字段（``GET /v1/settings/connectors``）。",
+  "properties": {
+    "activation": {
+      "$ref": "#/$defs/ConnectorActivationOut"
+    },
+    "configured": {
+      "title": "Configured",
+      "type": "boolean"
+    },
+    "editable": {
+      "description": "owner 为 true；非 owner 只读",
+      "title": "Editable",
+      "type": "boolean"
+    },
+    "enabled": {
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "fields": {
+      "items": {
+        "$ref": "#/$defs/ConnectorFieldOut"
+      },
+      "title": "Fields",
+      "type": "array"
+    },
+    "generation": {
+      "default": 0,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "guidance": {
+      "title": "Guidance",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "label": {
+      "title": "Label",
+      "type": "string"
+    },
+    "runtime": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Runtime",
+      "type": "object"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "status_message": {
+      "title": "Status Message",
+      "type": "string"
+    },
+    "status_reason": {
+      "title": "Status Reason",
+      "type": "string"
+    },
+    "storage": {
+      "default": "db",
+      "description": "值落库；容器根目录只读，写不了 .env",
+      "title": "Storage",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "label",
+    "configured",
+    "enabled",
+    "status",
+    "status_reason",
+    "status_message",
+    "guidance",
+    "editable",
+    "activation"
+  ],
+  "title": "ConnectorView",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

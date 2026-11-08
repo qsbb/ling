@@ -210,8 +210,6 @@ async def test_timeline_is_empty_not_fake(logged_in) -> None:
     body = (await logged_in.client.get("/v1/dashboard")).json()
     section = body["sections"]["timeline"]
     assert section["status"] in {"ok", "empty", "unavailable"}
-    if section["status"] == "empty":
-        assert not section["data"]
     if section["status"] == "ok":
         for item in section["data"]["items"]:
             # 每条都要带来源，否则无法判断它是观察到的还是推断的
@@ -229,7 +227,14 @@ async def test_phone_is_empty_not_fake(logged_in) -> None:
     section = body["sections"]["phone"]
     assert section["status"] in {"empty", "unavailable", "ok"}
     if section["status"] == "empty":
-        assert not section["data"]
+        data = section["data"] or {}
+        # 空态里**不许**出现"她拿过手机"的字段（那是编事实）。
+        for forbidden in ("state", "last_looked_at", "next_look_at", "watching_app"):
+            assert forbidden not in data, data
+        # 但"下次该隔多久"是**参数**不是事实：它照样有值，并带来源标记，
+        # 否则最常出现的空态里反而看不到"这次用了默认值，因为……"。
+        assert data.get("next_look_interval_minutes") is not None, data
+        assert "used" in (data.get("fallback") or {}), data
     # 无论哪种状态，都不许把 last_context 那段自由文本透出来
     assert "last_context" not in (section.get("data") or {})
 
