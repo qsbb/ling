@@ -26,18 +26,49 @@
 }
 
 /*
- * 多列 → 单列的切换点从 900px 提到 940px。
+ * 卡片的窄屏塌陷（§5 的分档）：
+ * - ≤940px（平板竖屏）：3 列的小卡变 6 列，6/12 仍占满一行；
+ *   900–940 这段 12 列每列只有 58.6–61.9px，再切 3 列必然挤到两三个字一行。
+ * - ≤768px（手机）：一律单列，**区块顺序不变**（DOM 顺序就是阅读顺序）。
  *
- * 900–940 这段：内容宽 856–896px，12 列每列 58.6–61.9px，卡在 60px 下限上，
- * 与其让它擦边，不如提前塌成单列（这一档本来就是平板竖屏）。
- * 选择器用 `.dash__grid .dash-card--*`（0,2,0）而不是裸 `.dash-card--*`，
- * 这样不受 `styles.css` 与本文件的加载顺序影响。
+ * 选择器带 `.dash__grid`（0,2,0）：dashboard.css 先于 styles.css 加载，
+ * 裸类名会被基本规则压掉。
  */
 @media (max-width: 940px) {
-  .dash__grid .dash-card--wide,
-  .dash__grid .dash-card--half,
-  .dash__grid .dash-card--third {
+  /* 0,3,0：`styles.css` 里 `.dash-card--span3` 是 0,1,0，`.dash__grid …` 只有 0,2,0
+   * ——单列规则必须再高一档，否则 375 下 3 列的卡只剩 76px，竖排成一列字。 */
+  .dash .dash__grid .dash-card--span3 {
+    grid-column: span 6;
+  }
+}
+
+@media (max-width: 768px) {
+  .dash .dash__grid .dash-card--span3,
+  .dash .dash__grid .dash-card--span6,
+  .dash .dash__grid .dash-card--span12 {
     grid-column: span 12;
+  }
+}
+
+/*
+ * 375px：页头纵向堆叠（标题一行、更新时间与刷新一行），
+ * 否则"更新于 …"和"刷新"会把标题挤到换行。
+ */
+@media (max-width: 560px) {
+  .dash__head {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .dash__meta {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
+
+  .dash__stale {
+    flex-basis: 100%;
+    max-width: none;
   }
 }
 
@@ -114,7 +145,8 @@
  */
 .dash-card__unavailable {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 4px 0 0;
   padding: 6px 8px;
@@ -127,6 +159,12 @@
 .dash-card__unavailable > svg {
   flex: none;
   margin-top: 1px;
+}
+
+/* 文字允许换行（375px 下"暂时读不到这块数据 + 重试"不能撑破卡片）。 */
+.dash-card__unavailable-text {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* ------------------------------------------------------------ 日程/承诺标记 */
@@ -210,3 +248,98 @@
   }
 }
 
+
+/* ------------------------------------------------ 卡片首层的视觉收敛（§5） */
+
+/*
+ * 卡片标题降到 h3 之后字号也跟着收敛：标题只做"这块是什么"的定位，
+ * 主值（`.dash-now__line strong`）才是人扫一眼要看到的东西。
+ */
+.dash .dash-card__title {
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+}
+
+/* 卡片主体的主值统一一档：区块多了以后，卡片内部不能再各说各的字号。 */
+.dash .dash-card__body {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+/*
+ * 右上角的语义标记（如「未安排」）。
+ * 只表达结论，不表达状态码；虚线边框与「接下来」的虚线关系标签同一种语言。
+ */
+.dash .dash-card__badge {
+  padding: 0 6px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 4px;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* 「未来意向」是意向不是日程：整块用更低的对比度，别和「今天的节奏」抢注意力。 */
+.dash .dash-card[data-testid='dash-未来意向'] {
+  background: color-mix(in srgb, var(--paper-sunken) 45%, var(--surface, #fff));
+}
+
+/* 失败态里的重试按钮：和告警条同一行，命中区在窄屏 ≥44px（见下方媒体查询）。 */
+.dash .dash-card__retry {
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.dash .dash-card__retry:hover {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+
+@media (max-width: 900px) {
+  .dash .dash-card__retry {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 10px 12px;
+    margin: -10px -6px -10px 0;
+  }
+}
+
+/* ------------------------------------------------ 连接状态：页顶可跳转告警 */
+
+/*
+ * 「渠道与模型」在页尾。它读不到时人不会滚下去看，而这正是"她没反应"
+ * 最常见的原因——页顶给一条能跳过去的告警条。
+ */
+.dash .dash-jump {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  text-decoration: none;
+}
+
+.dash .dash-jump:hover {
+  text-decoration: underline;
+}
+
+/* 锚点跳转时给目标卡片一个短暂的视觉落点，别让人自己找。 */
+.dash .dash-card[data-testid='dash-渠道与模型'] {
+  scroll-margin-top: 12px;
+}

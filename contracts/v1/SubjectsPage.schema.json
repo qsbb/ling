@@ -1,0 +1,158 @@
+{
+  "$defs": {
+    "SubjectAccountOut": {
+      "additionalProperties": false,
+      "description": "`GET /v1/accounts/subjects` 的 `subjects[].accounts[]`：一个渠道账号绑定。\n\n``revoked`` 是**派生字段**（``revoked_at`` 非空），只读接口不回吐时间戳：\n页面要说的是\"这个号还能不能用\"，不是\"哪一刻解绑的\"。",
+      "properties": {
+        "account_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Account Id",
+          "type": "string"
+        },
+        "connector_instance": {
+          "title": "Connector Instance",
+          "type": "string"
+        },
+        "external_account_id": {
+          "title": "External Account Id",
+          "type": "string"
+        },
+        "proof": {
+          "title": "Proof",
+          "type": "string"
+        },
+        "revoked": {
+          "default": false,
+          "title": "Revoked",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id",
+        "connector_instance",
+        "external_account_id",
+        "proof"
+      ],
+      "title": "SubjectAccountOut",
+      "type": "object"
+    },
+    "SubjectRow": {
+      "additionalProperties": false,
+      "description": "一个人：昵称、亲疏等级、被合并到谁，以及他/她绑定的账号。\n\n``merged_into`` 非空表示\"已被当作另一个人\"。合并**只写这一个指针**，\n账号与记忆都留在原处（所以拆开只是清指针）。",
+      "properties": {
+        "accounts": {
+          "items": {
+            "$ref": "#/$defs/SubjectAccountOut"
+          },
+          "title": "Accounts",
+          "type": "array"
+        },
+        "display_name": {
+          "title": "Display Name",
+          "type": "string"
+        },
+        "merged_into": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Merged Into"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        },
+        "trust_level": {
+          "title": "Trust Level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id",
+        "display_name",
+        "trust_level"
+      ],
+      "title": "SubjectRow",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/SubjectsPage.schema.json",
+  "additionalProperties": false,
+  "description": "`GET /v1/accounts/subjects` 的响应（**分页**，docs/API-WEB-V1.md §13）。\n\n分页是契约的一部分，不是可选优化：``subjects`` 默认只有 50 条，\n调用方必须看 ``has_more`` / ``total``，不能假设\"一次就是全部\"。\n``total`` 是**筛选后**的总行数（``q`` 生效时它不是全表行数）。",
+  "properties": {
+    "has_more": {
+      "default": false,
+      "title": "Has More",
+      "type": "boolean"
+    },
+    "limit": {
+      "default": 50,
+      "maximum": 200,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "offset": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Offset",
+      "type": "integer"
+    },
+    "q": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Q"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "subjects": {
+      "items": {
+        "$ref": "#/$defs/SubjectRow"
+      },
+      "title": "Subjects",
+      "type": "array"
+    },
+    "total": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Total",
+      "type": "integer"
+    }
+  },
+  "title": "SubjectsPage",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

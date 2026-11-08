@@ -16,14 +16,14 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import {
+  DashboardBody,
   intentTeaserSourceLabel,
   intentTeaserStateLabel,
-  LifeOverviewCards,
   outlineStateLabel,
   relationLabel,
   RELATION_LABEL,
 } from './components/DashboardPage';
-import type { DashboardSection, IntentTeaserOut, TodayOutlineOut } from './types';
+import type { DashboardResponse, DashboardSection, IntentTeaserOut, TodayOutlineOut } from './types';
 
 /* ------------------------------------------------------------------ 夹具 */
 
@@ -100,15 +100,51 @@ function section(
   };
 }
 
+/**
+ * 12 个分段都给同一份"有内容"的载荷，只把两块生活摘要换成测试指定的状态。
+ *
+ * 用整个网格渲染而不是只渲染两张卡：区块顺序与"一块坏不影响别块"都是
+ * **整页**的性质，只渲染局部就测不到它们（§5 的验收要求是整页口径）。
+ */
+const FILLER = {
+  status: 'ok' as const,
+  as_of: '2026-11-08T00:10:00Z',
+  data: {},
+};
+
+function dashboardFixture(today: DashboardSection, intent: DashboardSection): DashboardResponse {
+  return {
+    schema_version: 'v1',
+    generated_at: '2026-11-08T00:12:00Z',
+    timezone: 'Asia/Shanghai',
+    sections: {
+      activity: { status: 'ok', as_of: FILLER.as_of, data: { state: 'running', kind: 'reading', origin: 'simulated' } },
+      affect: { status: 'ok', as_of: FILLER.as_of, data: { emotion: 'calm', intensity: 0.4 } },
+      presence: { status: 'ok', as_of: FILLER.as_of, data: { availability: 'available', energy: 80, social_load: 10 } },
+      proactive: { status: 'ok', as_of: FILLER.as_of, data: { pending_count: 0, delivery_enabled: true } },
+      agenda: { status: 'empty', as_of: FILLER.as_of, data: { plans: [], commitments: [], goals: [] } },
+      memories: { status: 'ok', as_of: FILLER.as_of, data: { items: [] } },
+      timeline: { status: 'ok', as_of: FILLER.as_of, data: { items: [] } },
+      relationship: { status: 'ok', as_of: FILLER.as_of, data: { familiarity: 0.5, trust: 0.5 } },
+      connectivity: { status: 'ok', as_of: FILLER.as_of, data: { channels: [], bound_model_roles: ['dialogue.fast'] } },
+      phone: FILLER,
+      today_outline: today,
+      intent_teaser: intent,
+    },
+  };
+}
+
 function renderCards(
   today: DashboardSection,
   intent: DashboardSection,
 ): string {
   return renderToStaticMarkup(
-    h(LifeOverviewCards, {
-      today,
-      intent,
-      onOpenLife: () => undefined,
+    h(DashboardBody, {
+      data: dashboardFixture(today, intent),
+      onOpenNow: () => undefined,
+      onOpenChat: () => undefined,
+      onOpenSettings: () => undefined,
+      onRetry: () => undefined,
     }),
   );
 }

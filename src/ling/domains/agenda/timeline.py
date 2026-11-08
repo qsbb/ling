@@ -4066,6 +4066,7 @@ async def outline_work(
     timezone: str | None = None,
     timezone_source: str | None = None,
     lease_owner: str | None = None,
+    force: bool = False,
 ) -> OutlineOutcome:
     """按**目标日 + 相位**跑一次大纲作业（调度唯一该调的入口）。
 
@@ -4123,6 +4124,10 @@ async def outline_work(
         )
         return replace(tagged, phase=effective)
 
+    # ``force`` 只来自**调用方显式要求**（手动"重新生成"）：表示"就算已经
+    # 生成过，也按当前快照重排一版"。它仍然要过预算、lease 与段的替代规则。
+    # 自动链路与醒前 catch-up 走下面那条路径，语义不变。
+    forced_by_caller = bool(force)
     force = False
     if effective == PHASE_CATCHUP:
         row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
@@ -4144,7 +4149,7 @@ async def outline_work(
         timezone=timezone,
         timezone_source=timezone_source,
         lease_owner=lease_owner,
-        force=force,
+        force=force or forced_by_caller,
     )
     return replace(outcome, phase=effective)
 

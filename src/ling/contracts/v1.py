@@ -750,6 +750,57 @@ class IntentTeaserOut(StrictModel):
     note: str | None = None
 
 
+# ---------------------------------------------------------------- 上游回退标记
+
+
+class FallbackState(StrEnum):
+    """回退标记里"上游当时是什么状态"。
+
+    与 :class:`TimelineState` 刻意分开、取值不完全相同：这里还多一个
+    ``unknown``（状态不明），并且**只有** `ready` 算"能用上游的值"。
+    把两者合成一个枚举会让"我们不知道"被迫冒充成某一个具体状态。
+    """
+
+    ready = "ready"
+    degraded = "degraded"
+    empty = "empty"
+    pending = "pending"
+    failed = "failed"
+    unavailable = "unavailable"
+    unknown = "unknown"
+
+
+class FallbackSource(StrEnum):
+    """这个值是上游给的，还是本领域自己的默认参数。**只有这两种**。"""
+
+    upstream = "upstream"
+    domain_default = "domain_default"
+
+
+class FallbackNotice(StrictModel):
+    """一个消费点上"这次的值从哪来"的紧凑标记。
+
+    **它不是事实**，也不能被读成事实：
+
+    - ``used=true`` 只说明"上游这次没给出可用的值，我们用了自己的默认参数"，
+      不代表上游坏了、更不代表她做了什么；
+    - ``reason`` 是给人看的一句人话（界面直接显示），不是错误码表；
+    - 值本身（默认值）**绝不**写进 activities / experiences / 位置等事实表。
+
+    没有回退时也要给这个标记（``used=false``、``source=upstream``）：
+    "这次没用默认值"本身就是要回答的问题，缺字段会让前端分不清
+    "没用回退"和"后端没实现"。
+    """
+
+    upstream: str = Field(description="上游是谁，如 schedule / scene")
+    used: bool = Field(description="这次是否用了领域默认参数")
+    state: FallbackState = Field(description="上游当时的状态")
+    source: FallbackSource = Field(description="值的来源")
+    reason: str | None = Field(
+        default=None, description="用默认值的人话原因；没回退时为 null"
+    )
+
+
 # ---------------------------------------------------------------- 提示词快照（只读）
 
 
@@ -862,6 +913,58 @@ class PromptSnapshotOut(StrictModel):
     sections: list[PromptSnapshotSection] = Field(default_factory=list)
     # 给人看的一句状态说明（expired / unavailable 时解释原因，纯文本）
     note: str | None = None
+
+
+# ---------------------------------------------------------------- 关系（分页，2026-11）
+
+
+class SubjectAccountOut(StrictModel):
+    """`GET /v1/accounts/subjects` 的 `subjects[].accounts[]`：一个渠道账号绑定。
+
+    ``revoked`` 是**派生字段**（``revoked_at`` 非空），只读接口不回吐时间戳：
+    页面要说的是"这个号还能不能用"，不是"哪一刻解绑的"。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    account_id: IdStr
+    connector_instance: str
+    external_account_id: str
+    proof: str
+    revoked: bool = False
+
+
+class SubjectRow(StrictModel):
+    """一个人：昵称、亲疏等级、被合并到谁，以及他/她绑定的账号。
+
+    ``merged_into`` 非空表示"已被当作另一个人"。合并**只写这一个指针**，
+    账号与记忆都留在原处（所以拆开只是清指针）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    subject_id: IdStr
+    display_name: str
+    trust_level: str
+    merged_into: IdStr | None = None
+    accounts: list[SubjectAccountOut] = Field(default_factory=list)
+
+
+class SubjectsPage(StrictModel):
+    """`GET /v1/accounts/subjects` 的响应（**分页**，docs/API-WEB-V1.md §13）。
+
+    分页是契约的一部分，不是可选优化：``subjects`` 默认只有 50 条，
+    调用方必须看 ``has_more`` / ``total``，不能假设"一次就是全部"。
+    ``total`` 是**筛选后**的总行数（``q`` 生效时它不是全表行数）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    subjects: list[SubjectRow] = Field(default_factory=list)
+    # 服务端实际生效的分页参数（回显）：客户端不必猜默认值。
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0)
+    has_more: bool = False
+    # 服务端实际生效的筛选词（已 strip）；没筛选时为 null。
+    q: str | None = None
 
 
 # ---------------------------------------------------------------- 镜像更新（四态）
@@ -1157,6 +1260,9 @@ __all__ = [
     "ErrorBody",
     "ErrorCode",
     "ErrorResponse",
+    "FallbackNotice",
+    "FallbackSource",
+    "FallbackState",
     "CompatModel",
     "HandoffCapsule",
     "ImageNewerRelease",
@@ -1196,6 +1302,9 @@ __all__ = [
     "PromptSnapshotState",
     "RuntimeScope",
     "SessionRecord",
+    "SubjectAccountOut",
+    "SubjectRow",
+    "SubjectsPage",
     "TimelineState",
     "TodayOutlineItem",
     "TodayOutlineOut",

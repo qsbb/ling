@@ -1,0 +1,45 @@
+{
+  "$id": "https://ling.local/contracts/v1/SubjectAccountOut.schema.json",
+  "additionalProperties": false,
+  "description": "`GET /v1/accounts/subjects` 的 `subjects[].accounts[]`：一个渠道账号绑定。\n\n``revoked`` 是**派生字段**（``revoked_at`` 非空），只读接口不回吐时间戳：\n页面要说的是\"这个号还能不能用\"，不是\"哪一刻解绑的\"。",
+  "properties": {
+    "account_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Account Id",
+      "type": "string"
+    },
+    "connector_instance": {
+      "title": "Connector Instance",
+      "type": "string"
+    },
+    "external_account_id": {
+      "title": "External Account Id",
+      "type": "string"
+    },
+    "proof": {
+      "title": "Proof",
+      "type": "string"
+    },
+    "revoked": {
+      "default": false,
+      "title": "Revoked",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_id",
+    "connector_instance",
+    "external_account_id",
+    "proof"
+  ],
+  "title": "SubjectAccountOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

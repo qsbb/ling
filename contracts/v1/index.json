@@ -9,6 +9,7 @@
     "DeliveryReceipt": "DeliveryReceipt.schema.json",
     "DreamCard": "DreamCard.schema.json",
     "ErrorResponse": "ErrorResponse.schema.json",
+    "FallbackNotice": "FallbackNotice.schema.json",
     "HandoffCapsule": "HandoffCapsule.schema.json",
     "ImageNewerRelease": "ImageNewerRelease.schema.json",
     "ImageReleaseCheckCurrent": "ImageReleaseCheckCurrent.schema.json",
@@ -38,6 +39,9 @@
     "PromptSnapshotSection": "PromptSnapshotSection.schema.json",
     "RuntimeScope": "RuntimeScope.schema.json",
     "SessionRecord": "SessionRecord.schema.json",
+    "SubjectAccountOut": "SubjectAccountOut.schema.json",
+    "SubjectRow": "SubjectRow.schema.json",
+    "SubjectsPage": "SubjectsPage.schema.json",
     "TodayOutlineItem": "TodayOutlineItem.schema.json",
     "TodayOutlineOut": "TodayOutlineOut.schema.json"
   },

@@ -247,14 +247,23 @@ function dashboardPayload() {
   };
 }
 
+/*
+ * 总览的 12 张卡，按 §5 的区块顺序（现在 → 接下来 → 已留下的记录 → 连接状态）。
+ *
+ * 「今天的节奏」「未来意向」与「手机」是后加的，此前这里只列了 9 个；
+ * 数量写死 9 的那条断言在任何一次新增卡片时都会假反，改成"全都在"。
+ */
 const EXPECTED_SECTIONS = [
   '此刻',
-  '情绪',
   '可用性',
+  '情绪',
+  '手机',
   '主动联系',
+  '今天的节奏',
   '今天的安排',
-  '最近记住的事',
+  '未来意向',
   '近期生活',
+  '最近记住的事',
   '关系',
   '渠道与模型',
 ];
@@ -435,15 +444,24 @@ async function runViewport(browser, viewport, label) {
   /* ---- 内容 ---- */
   record(`${label}：标题是「总览」`, m.title === '总览', m.title || '(空)');
   const missing = EXPECTED_SECTIONS.filter((title) => !m.cardTitles.includes(title));
-  record(`${label}：9 个分段都在`, m.cardTitles.length === 9 && missing.length === 0, `卡片=${m.cardTitles.length} 缺失=${missing.join('、') || '无'}`);
-  record(`${label}：9 张卡片都可见`, m.visibleCards === 9, `可见=${m.visibleCards}`);
+  record(`${label}：12 张卡都在`, m.cardTitles.length === EXPECTED_SECTIONS.length && missing.length === 0, `卡片=${m.cardTitles.length} 缺失=${missing.join('、') || '无'}`);
+  record(`${label}：12 张卡都可见`, m.visibleCards === EXPECTED_SECTIONS.length, `可见=${m.visibleCards}`);
   const personaHits = PERSONA_TEXT.filter((marker) => text.includes(marker));
   record(`${label}：没有角色页文本`, personaHits.length === 0, personaHits.join('、'));
   record(
     `${label}：总览内容真的渲染了`,
     text.includes('给无人机小兔子做保养') && text.includes('喜欢喝常温的美式') && text.includes('条候选'),
   );
-  record(`${label}：每张卡片都标了「更新于」`, m.asOfCount === 9, `带时间的卡片=${m.asOfCount}`);
+  /*
+   * 只有「查到了」的卡片才有可信时刻：mock 里 `phone` 分段没有载荷，
+   * 列表页那两张在后端也可能返回 unavailable——所以这里要求"大多数卡带时间"
+   * 而不是"12 张全带"。`unavailable` 一律不标时间由单测钉住。
+   */
+  record(
+    `${label}：卡片都标了「更新于」`,
+    m.asOfCount >= EXPECTED_SECTIONS.length - 3,
+    `带时间的卡片=${m.asOfCount}/${EXPECTED_SECTIONS.length}`,
+  );
 
   /* ---- F5：情绪是中文，不是原始英文枚举 ---- */
   record(
@@ -542,10 +560,15 @@ async function runViewport(browser, viewport, label) {
       m.grid !== null && m.grid.width >= (m.page?.width ?? 0) - 60,
       `grid=${Math.round(m.grid?.width ?? 0)} page=${Math.round(m.page?.width ?? 0)}`,
     );
+    /*
+     * 3 列小卡（情绪/可用性）在设计上就是 279px 左右：里面只有"一个主值 +
+     * 一句解释"，279px 足够正常断行。900px 档曾要求 ≥300px，那是单一大网格
+     * 时代的阈值，现在会把设计好的小卡误判成"太窄"。
+     */
     const narrowest = m.cardWidths.length ? Math.min(...m.cardWidths) : 0;
     record(
       `${label}：卡片足够宽（不会 2–3 字换行）`,
-      narrowest >= 300,
+      narrowest >= 260,
       `最窄卡片=${Math.round(narrowest * 100) / 100}px（修复前 96.25px）`,
     );
   } else {
@@ -669,11 +692,17 @@ async function runUnknownRoute(browser, viewport, label) {
 
 async function runSectionUnavailable(browser) {
   const payload = dashboardPayload();
+  /*
+   * 分段的 `data` 必须显式给 null：`_section()` 在没有载荷时字段缺省，
+   * 而 demo 服务若把它序列化成 `{}`，前端就会把 `{}` 当成"有内容"照常渲染，
+   * 这块失败态在真浏览器里就看不见了（mock 自己要说得准）。
+   */
   payload.sections.affect = {
     status: 'unavailable',
     as_of: '2026-10-30T05:48:02Z',
+    data: null,
   };
-  payload.sections.memories = { status: 'empty', as_of: '2026-10-30T05:48:02Z' };
+  payload.sections.memories = { status: 'empty', as_of: '2026-10-30T05:48:02Z', data: null };
   const state = { dashboard: payload, dashboardRequests: 0 };
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
@@ -695,7 +724,8 @@ async function runSectionUnavailable(browser) {
       };
     };
     return {
-      unavailable: read('p.dash-card__unavailable'),
+      // 告警条是 `<div role="status">`，不是 `<p>`；按 `p.` 选会永远 null。
+      unavailable: read('.dash-card__unavailable'),
       empty: read('[data-testid="dash-最近记住的事"] p.dash-card__muted'),
       wholePageError: document.querySelectorAll('.page > .dash-error').length,
     };

@@ -22,7 +22,7 @@
  * 是不够的——他要的是"到底是谁"。
  */
 
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import type {
   MemorySource,
   ModelHealthResponse,
@@ -43,12 +43,16 @@ import {
   bindingCapabilityMismatch,
   capabilityLabel,
   effectiveNote,
+  groupSlotOptions,
   kindLabel,
-  providersForChatSlot,
+  parseSlotSelectValue,
   providersForProfile,
   roleBadgeState,
   roleLabel,
+  slotDraftDirty,
   slotLabel,
+  slotOptions,
+  slotSelectValue,
   visibleRoleKeys,
   type RoleBadgeState,
   type RoleMeta,
@@ -118,96 +122,149 @@ const STATE_LABEL: Record<string, string> = {
 
 /* ------------------------------------------------------------------ 槽位 */
 
+/**
+ * 一个默认槽位：**点开就能换模型**（没有"更换默认"编辑门）。
+ *
+ * 选中值是**结构化的 `(provider_id, model_id)` 对**（`provider::model`，
+ * 只按第一个 `::` 切）。为什么不只存模型名：同一个模型名可以由两家供应商
+ * 提供，按名字反查供应商在"同名"时会静默选错另一家。
+ *
+ * 形态照职责行：一个下拉，`供应商 · 协议` 是不可选的分组头，组下是模型名。
+ * 当前项前面打勾并带 `aria-selected`。选中只改这一个槽位的草稿，
+ * 保存/放弃仍走全页底部那一对按钮。
+ *
+ * 边界：
+ * - 没有供应商、或没有任何**启用**的对话模型 → 选择器禁用并写「先添加模型」，
+ *   页面照常可用（不是白屏，也不是假装能选）；
+ * - 历史绑了已停用的模型/不提供 chat 的供应商 → 选项保留显示、但 `disabled`
+ *   不可新选，并在卡片里说明怎么换；
+ * - 服务端 `resolve` 还没回来时只说「等待服务端确认」，**不**把前端推算值
+ *   冒充「实际生效」。
+ */
 function SlotCard({
   view,
-  editing,
+  saved,
   providers,
   slotDraft,
+  saving,
   onPatch,
 }: {
   view: SlotView;
-  editing: boolean;
+  /** 服务端**已保存**的这一行（`/settings/config` 的 slots）。用来标"未保存"。 */
+  saved: SlotView | undefined;
   providers: ProviderDraftInput[];
   slotDraft: SlotDraftInput | undefined;
+  saving: boolean;
   onPatch: (patch: Partial<SlotDraftInput>) => void;
 }) {
   const providerId = slotDraft?.provider_id ?? view.provider_id;
   const modelId = slotDraft?.model_id ?? view.model_id;
-  // 默认槽位只收**对话**供应商：嵌入/重排填进来，发布能成功、调用必失败。
-  // 能力来自服务端（`capabilities`）；当前已绑的那家即使不匹配也留着，
-  // 由下面的警告说明，不在下拉里悄悄消失。
-  const chatProviders = providersForChatSlot(providers, providerId);
   const provider = providers.find((item) => item.provider_id === providerId);
-  const models = (provider?.models ?? []).filter(
-    (model) => model.enabled || model.model_id === modelId,
+  const selected = slotSelectValue(providerId, modelId);
+
+  // 选项与"能不能选"的判断全在 `shared.slotOptions`（纯函数、有单测）：
+  // 默认槽位只收**对话**供应商，历史不匹配/已停用的项保留显示但不可新选。
+  const { options, selectableCount, emptyHint } = slotOptions(
+    providers,
+    providerId,
+    modelId,
   );
-  const roles = view.roles.map(roleLabel);
-  // 历史槽位可能存着嵌入/重排供应商：后端发布校验目前只管绑定，不管槽位，
-  // 所以界面必须自己说出来。
+  const groups = groupSlotOptions(options);
+  const canPick = selectableCount > 0;
   const providerMismatch = bindingCapabilityMismatch(provider, 'chat');
+
+  // 草稿 vs 已保存的槽位：只用来显示"未保存"，不用来推算生效模型。
+  const dirty = slotDraftDirty(slotDraft, saved);
+  // 服务端对**当前草稿**的结论（resolve 会重算 slots）。草稿刚改、
+  // 服务端还没回来时两边不一致 → 只提示等待，不显示任何前端推算值。
+  const awaitingServer = providerId !== view.provider_id || modelId !== view.model_id;
+  const roles = view.roles.map(roleLabel);
 
   return (
     <div className={`ms-slot${providerId ? ' ms-slot--set' : ''}`}>
       <div className="ms-slot__top">
-        <span className="ms-slot__name">{view.label}</span>
+        <span className="ms-slot__name">
+          {view.label}
+          {dirty ? <span className="ms-slot__dirty">未保存</span> : null}
+        </span>
         <span className="ms-slot__hint">{view.hint}</span>
       </div>
-      {editing ? (
-        <div className="ms-slot__fields">
-          <select
-            className="ms-input"
-            aria-label={`${view.label} 槽位的供应商`}
-            value={providerId}
-            onChange={(event) => {
-              const next = providers.find((item) => item.provider_id === event.target.value);
-              const first = (next?.models ?? []).find((model) => model.enabled)?.model_id ?? '';
-              onPatch({ provider_id: event.target.value, model_id: first });
-            }}
-          >
-            <option value="">— 选择供应商 —</option>
-            {chatProviders.map((item) => (
-              <option key={item.provider_id} value={item.provider_id}>
-                {item.provider_id}
-                {item.enabled ? '' : '（已停用）'}
+
+      <select
+        className="ms-input ms-select ms-slot__select"
+        aria-label={`${view.label} 槽位用哪个模型`}
+        value={selected}
+        disabled={!canPick || saving}
+        onChange={(event) => {
+          const picked = parseSlotSelectValue(event.target.value);
+          // 空值 = 不指定（把槽位清回"没配"）。选中只改这一个槽位的草稿。
+          onPatch(
+            picked
+              ? { provider_id: picked.providerId, model_id: picked.modelId }
+              : { provider_id: '', model_id: '' },
+          );
+        }}
+      >
+        <option value="">{canPick ? '— 选择模型 —' : '先添加模型'}</option>
+        {groups.map((group) => (
+          <optgroup key={group.providerId} label={group.label}>
+            {group.items.map((item) => (
+              <option
+                key={item.value}
+                value={item.value}
+                disabled={!item.selectable}
+                aria-selected={item.value === selected}
+              >
+                {item.value === selected ? '✓ ' : ''}
+                {item.model_id}
+                {item.model_enabled ? '' : '（已停用）'}
               </option>
             ))}
-          </select>
-          <select
-            className="ms-input"
-            aria-label={`${view.label} 槽位的模型`}
-            value={modelId}
-            disabled={!provider}
-            onChange={(event) => onPatch({ model_id: event.target.value })}
-          >
-            <option value="">— 选择模型 —</option>
-            {models.map((model) => (
-              <option key={model.model_id} value={model.model_id}>
-                {model.model_id}
-                {model.enabled ? '' : '（已停用）'}
-              </option>
-            ))}
-          </select>
-        </div>
-      ) : (
-        <div className="ms-slot__model">
-          {modelId ? (
-            <>
-              <strong>{modelId}</strong>
-              <span className="ms-slot__via">
-                {provider?.provider_id ?? providerId} · {kindLabel(provider?.kind ?? '')}
-              </span>
-            </>
-          ) : (
-            <span className="ms-slot__unset">还没有配模型</span>
-          )}
-        </div>
-      )}
+          </optgroup>
+        ))}
+      </select>
+
+      {emptyHint ? <span className="ms-slot__empty-hint">{emptyHint}</span> : null}
+
+      <div className="ms-slot__effective">
+        <span className="ms-slot__effective-head">实际生效</span>
+        {awaitingServer ? (
+          <span className="ms-slot__effective-note">等待服务端确认…</span>
+        ) : view.usable ? (
+          <>
+            <span className="ms-slot__effective-model">
+              <CheckIcon size={12} />
+              {view.model_id}
+            </span>
+            <span className="ms-slot__effective-note">
+              {view.provider_id} · {kindLabel(provider?.kind ?? '')}
+            </span>
+          </>
+        ) : view.configured ? (
+          <span className="ms-slot__effective-model ms-slot__effective-model--bad">
+            <AlertIcon size={12} />
+            已配置但不可用（供应商或模型被停用）
+          </span>
+        ) : (
+          <span className="ms-slot__effective-model ms-slot__effective-model--bad">
+            还没配：跟随它的职责会显示不可用
+          </span>
+        )}
+      </div>
+
       {providerMismatch ? (
         <span className="ms-slot__warn" role="status">
           <AlertIcon size={12} />
           这家不提供对话能力，填进默认槽位会发布成功、调用必失败；换一家对话供应商。
         </span>
       ) : null}
+      {!providerMismatch && modelId && provider && !modelEnabled(provider, modelId) ? (
+        <span className="ms-slot__warn" role="status">
+          <AlertIcon size={12} />
+          现在这个模型「{modelId}」已停用：保留显示是为了让你看清现状，换个启用的模型。
+        </span>
+      ) : null}
+
       <div className="ms-slot__foot">
         {roles.length > 0 ? (
           <span>{roles.join(' / ')} 跟着它</span>
@@ -217,6 +274,11 @@ function SlotCard({
       </div>
     </div>
   );
+}
+
+function modelEnabled(provider: ProviderDraftInput, modelId: string): boolean {
+  const model = (provider.models ?? []).find((item) => item.model_id === modelId);
+  return Boolean(model?.enabled);
 }
 
 /* ---------------------------------------------------------------- 职责行 */
@@ -448,6 +510,22 @@ function RoleRow({
   );
 }
 
+/* ------------------------------------------------------ 槽位与职责的取值转换 */
+
+// 这两个是**槽位**专用（不存在"跟随默认"这一档），与上面的职责行转换分开写：
+// 合用一个函数会让"槽位选了空值"和"职责选了跟随"看起来是同一种状态。
+
+/**
+ * 槽位选中值的对外导出（实现与单测都在 `shared.slotSelectValue`）。
+ *
+ * 保留这里的再导出是为了让页面与其他调用方只 import 一个模块；
+ * 转换本身是纯函数，重算不会与界面漂开。
+ */
+export { parseSlotSelectValue, slotSelectValue };
+
+/** 一个槽位下拉的可选项与"能不能选"，同样是纯函数（见 `shared.slotOptions`）。 */
+export { groupSlotOptions, slotOptions };
+
 /** 供应商已知能力 → 人话；未知时直接说"能力未确认"。 */
 function knownCapabilityText(provider: ProviderDraftInput | undefined): string {
   const capabilities = provider?.capabilities;
@@ -587,8 +665,6 @@ export function RolesPanel({
   onCloseQuickConfig,
   onApplyQuickConfig,
 }: Props) {
-  const [editingSlots, setEditingSlots] = useState(false);
-
   const byProfile = useMemo(() => new Map(profiles.map((item) => [item.profile, item])), [profiles]);
   const byResolution = useMemo(
     () => new Map(resolutions.map((item) => [item.profile, item])),
@@ -597,6 +673,12 @@ export function RolesPanel({
   const slotDrafts = useMemo(
     () => new Map(slots.map((item) => [item.slot, item])),
     [slots],
+  );
+  // `config.slots` 是**已保存**的那一份；`slotViews` 是服务端对当前草稿的
+  // resolve 结果（改草稿后 250ms 才回来）。两者分开，"未保存"才有依据。
+  const savedSlots = useMemo(
+    () => new Map((config.slots ?? []).map((item) => [item.slot, item])),
+    [config.slots],
   );
   const metaByKey = useMemo(
     () => new Map<string, RoleMeta>([...PRIMARY_ROLES, ...EXTRA_ROLES].map((meta) => [meta.key, meta])),
@@ -649,7 +731,8 @@ export function RolesPanel({
         <div>
           <h2>每个职责，各指一个模型</h2>
           <p className="ms-muted">
-            先给五件常做的事各挑一个模型，再决定每条职责要不要单独指定。行尾永远是
+            先给五件常做的事各挑一个模型——点开下拉就能换，不需要先按任何按钮；
+            再决定每条职责要不要单独指定。下面那行永远是
             <strong>这一行实际会跑的模型</strong>。
           </p>
           <p className="ms-roles__counts">
@@ -689,16 +772,9 @@ export function RolesPanel({
         <div className="ms-roles__actions">
           <button
             type="button"
-            className="ms-btn ms-btn--sm"
-            aria-pressed={editingSlots}
-            onClick={() => setEditingSlots((current) => !current)}
-          >
-            {editingSlots ? '完成更换' : '更换默认'}
-          </button>
-          <button
-            type="button"
             className="ms-btn ms-btn--sm ms-btn--primary"
-            disabled={quickConfigBusy}
+            // 保存中不接第二次点击：否则同一份草稿会连开两个发布请求。
+            disabled={quickConfigBusy || saving}
             onClick={onRequestQuickConfig}
           >
             快速配置
@@ -711,9 +787,10 @@ export function RolesPanel({
           <SlotCard
             key={view.slot}
             view={view}
-            editing={editingSlots}
+            saved={savedSlots.get(view.slot)}
             providers={providers}
             slotDraft={slotDrafts.get(view.slot)}
+            saving={saving}
             onPatch={(patch) => onPatchSlot(view.slot, patch)}
           />
         ))}

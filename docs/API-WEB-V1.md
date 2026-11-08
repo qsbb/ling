@@ -846,3 +846,87 @@ messages** + 每一段属于哪个语义块。用来回答"她为什么这么说
 2. 墓碑再放 7 天 → 真删（之后才退化成 `unavailable`）。
 
 所以"过期"和"从没存过"在保留期后的一段时间里仍然可分。清理不删任何对话数据。
+
+
+## 13. 上游不可用时回退到领域默认（2026-11 新增）
+
+设计依据：`docs/UX-FIXES-2026-11-09.md` §4；实现：`src/ling/domains/fallback.py`。
+
+### 13.1 一句话规则
+
+有些**行为参数**不归本域所有，而是"看上游现在怎样"决定的（例如「多久看一次
+手机」要看日程：在忙拉长、睡着不排）。上游可能还没生成（`pending`）、生成失败
+（`failed`）、本来就没有（`empty`）或读不到（`unavailable` / 超时）。这三种情况下：
+
+- **不硬崩**：本域照常返回可用结果；
+- **不拿旧值顶**：上一次的日程、过期场景都不能当作现在还成立；
+- **用本域默认参数**跑这一次，并**说清这是默认值**。
+
+### 13.2 `fallback` 标记（`FallbackNotice`）
+
+凡是会回退的区块，`data.fallback` 都给同一个形状（契约
+`contracts/v1/FallbackNotice.schema.json`）：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `upstream` | string | 上游是谁：`schedule` / `scene` |
+| `used` | boolean | 这次是否用了**领域默认参数** |
+| `state` | enum | 上游当时的状态：`ready`/`degraded`/`empty`/`pending`/`failed`/`unavailable`/`unknown` |
+| `source` | enum | `upstream`（用上游值）或 `domain_default`（回退） |
+| `reason` | string \| null | 给人看的一句话；没回退时为 `null` |
+
+**没有回退时这个字段也在**（`used=false`、`reason=null`）。缺字段会让前端
+分不清"没用回退"和"后端没实现"。
+
+**它不是事实**，也不能被读成事实：
+
+- `used=true` 只说"上游这次没给出可用的值"，不代表上游坏了，更不代表她做了什么；
+- 默认值**绝不**写进 `activities` / `self_experiences` / 位置 / `day_plans` /
+  `scene_commits`——回退只影响**本次**的参数，写入仍归各自的状态机；
+- 上游恢复后，下一次调用直接读新鲜值；回退结果不会被缓存成事实。
+
+### 13.3 当前两处落点
+
+**`sections.phone.data`**（看手机）
+
+| 字段 | 含义 |
+| --- | --- |
+| `next_look_interval_minutes` | 下次隔多久看她一眼。上游（日程当日段）可用时按段的活动类别给（`focus/work` 45、`meal` 30、`leisure` 15、`sleep` 0 = 醒来再排）；否则用 `DEFAULT_IDLE_MINUTES`（10） |
+| `fallback` | 见 §13.2；`upstream=schedule` |
+
+空态（从没看过手机）也会给 `next_look_interval_minutes` 与 `fallback`——
+**参数**不跟着**事实**一起消失；但空态里不会出现 `state` / `last_looked_at`
+这类"她拿过手机"的字段（那是在编事实）。
+
+**`sections.presence.data`**（当前场景）
+
+| 字段 | 含义 |
+| --- | --- |
+| `scene.state` | `chat`/`focus`/`rest`/`errand`/`unknown`；`valid_until` 过期即 `unknown` |
+| `scene.expired` | 这次读到的是不是已过期（过期不沿用旧场景） |
+| `fallback` | 见 §13.2；`upstream=scene` |
+
+只给状态、不给 `scene.activity_id` / `place_id`：首屏不需要，也不该在这里被读成
+"她正在做 X"。
+
+### 13.4 判定表（与 §11.3 的 `TimelineState` 对齐）
+
+| 上游状态 | 能否当当前输入 | 消费点行为 |
+| --- | --- | --- |
+| `ready` | 能 | 用上游值，`source=upstream` |
+| `degraded` | **只能作计划参考** | 行为参数可以用（`used=false`、`state=degraded`，标记里如实写"规则兜底"）；**任何断言"她正在做 X"的地方都不能用**，那种地方回退到领域默认 |
+| `empty` / `pending` / `failed` / `unavailable` / `unknown` | 不能 | 用领域默认，`used=true`，理由说清是哪种 |
+| 读超过 300 ms 预算 | 不能 | 按 `unavailable` 回退，`reason` 写出预算 |
+
+### 13.5 还没接上的调用点（下一批）
+
+下面这些也读上游，但本批**没有**改（各有各的理由，按风险排）：
+
+| 调用点 | 读什么 | 当前行为 | 下一批怎么做 |
+| --- | --- | --- | --- |
+| `api/routes/dashboard.py::today_outline()` | `load_actor_day` | 读取失败 → 整块 `unavailable`；状态原样透出，本就不伪造 | 加 `fallback`（仅"无值可展示"时），不改状态语义 |
+| `api/routes/life_timeline.py::_load_facts()` | `SceneCommitRow.valid_until` | 过期 → `scene_valid_until=null`（已按 §11.5 处理） | 加 `input_sources.scene` 标记 |
+| `kernel/self_view.py::_add_scene()` | `PresenceService.scene()` | 过期/读失败 → 丢弃（不注入提示词） | 复用 `resolve_scene()`，在 `SelfView.dropped` 里带原因 |
+| `kernel/autonomy.py` 的处境读取 | presence / 负担 / 情绪 | 读失败 → 用默认值继续（已有 try/except） | 统一走 `read_within_budget`，标记进决策事件 |
+| `worker.py` 的 `life.tick` 场景提交 | 日程段 | 无段就不提交；过期靠 TTL 自然转 unknown | **写路径**，需单独设计（本批只做只读） |
+| `domains/phone` 的"真的采用这个节奏" | 调用 `schedule_next_from_upstream` | 目前只有读侧投影；谁调 `stop_watching` 由调度决定 | 调度接线时直接调它（已带日志与回退标记） |

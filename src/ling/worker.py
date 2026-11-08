@@ -2855,11 +2855,14 @@ async def _stale_outline_call_days(
 def _like_prefix(value: str) -> str:
     """把字面量变成 LIKE 前缀模式（转义 ``%`` / ``_`` / ``\\``）。
 
-    actor id 里带下划线（``actor_ling``）时，不转义的 LIKE 会把 ``_`` 当成
-    "任意一个字符"，于是 ``actorXling`` 的事件也会被算进同一个作业。
+    实现搬到了 :func:`ling.kernel.outbox.like_prefix`：手动生成日程
+    （`domains/agenda/outline_jobs.py`）也要按"同一天的 outbox 事件"判断在途，
+    而跨模块 import 一个下划线私有名，改它的形状时不会有任何调用点报错。
+    这里保留同名薄封装，本文件内的既有调用点不用改。
     """
-    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"{escaped}%"
+    from ling.kernel.outbox import like_prefix
+
+    return like_prefix(value)
 
 
 async def _schedule_outline(
@@ -3242,6 +3245,17 @@ async def handle_life_schedule(payload: dict) -> None:
         logger.info("生活调度投递 %d 条: %s", len(enqueued), ", ".join(enqueued))
 
 
+def _schedule_now() -> datetime:
+    """大纲作业的"现在"。
+
+    单独一个函数只为一件事：**测试要能把时钟钉住**。相位（due/catchup/late）
+    由"现在"与计划日窗口的相对位置决定，直接调 `utcnow()` 的话，
+    "手动生成今天"这类用例在一天里的不同时刻会落进不同相位（夜里跑是
+    ``late``，零模型），测试就成了"看运气"。生产里它就是 `utcnow()`。
+    """
+    return utcnow()
+
+
 def _parse_payload_date(payload: dict, key: str) -> date | None:
     """从载荷里取 ISO 日期；缺失/非法一律返回 None（调用方记日志并返回）。"""
     raw = str(payload.get(key) or "").strip()
@@ -3262,6 +3276,7 @@ async def handle_schedule_outline(payload: dict) -> None:
     过期的 `due` 去调模型——到了醒点就自动降成零模型的 `late`。
     """
     from ling.audit import behavior_event
+    from ling.domains.agenda.outline_jobs import FORCE_KEY
     from ling.domains.agenda.timeline import PHASE_CATCHUP, PHASE_DUE, PHASE_LATE, outline_work
 
     settings = get_settings()
@@ -3274,7 +3289,7 @@ async def handle_schedule_outline(payload: dict) -> None:
     if phase not in (PHASE_DUE, PHASE_CATCHUP, PHASE_LATE):
         logger.warning("schedule.outline 收到未知相位 %r，按 due 处理", phase)
         phase = PHASE_DUE
-    now = utcnow()
+    now = _schedule_now()
     async with session_scope() as session:
         outcome = await outline_work(
             session,
@@ -3287,6 +3302,9 @@ async def handle_schedule_outline(payload: dict) -> None:
             config_reader=_config_reader(session),
             now=now,
             lease_owner=f"{WORKER_ID}/{plan_day.isoformat()}",
+            # 手动"重新生成"带着 force：它只放宽"已生成就短路"这一条，
+            # 预算 / lease / 段的替代规则一并照旧。
+            force=bool(payload.get(FORCE_KEY)),
         )
     logger.info(
         "大纲作业完成 day=%s phase=%s state=%s revision=%s segments=%s calls=%s reason=%s",

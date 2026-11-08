@@ -1076,7 +1076,8 @@ export type DashboardStatus = 'ok' | 'empty' | 'unavailable';
 export interface DashboardSection {
   status: DashboardStatus;
   as_of: string;
-  data?: Record<string, unknown> | null;
+  /** 只读，不做原地修改：`sections` 里的分段可能是可选的（见 `today_outline`）。 */
+  data?: Readonly<Record<string, unknown>> | null;
 }
 
 export interface DashboardResponse {

@@ -1,0 +1,72 @@
+{
+  "$defs": {
+    "FallbackSource": {
+      "description": "这个值是上游给的，还是本领域自己的默认参数。**只有这两种**。",
+      "enum": [
+        "upstream",
+        "domain_default"
+      ],
+      "title": "FallbackSource",
+      "type": "string"
+    },
+    "FallbackState": {
+      "description": "回退标记里\"上游当时是什么状态\"。\n\n与 :class:`TimelineState` 刻意分开、取值不完全相同：这里还多一个\n``unknown``（状态不明），并且**只有** `ready` 算\"能用上游的值\"。\n把两者合成一个枚举会让\"我们不知道\"被迫冒充成某一个具体状态。",
+      "enum": [
+        "ready",
+        "degraded",
+        "empty",
+        "pending",
+        "failed",
+        "unavailable",
+        "unknown"
+      ],
+      "title": "FallbackState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/FallbackNotice.schema.json",
+  "additionalProperties": false,
+  "description": "一个消费点上\"这次的值从哪来\"的紧凑标记。\n\n**它不是事实**，也不能被读成事实：\n\n- ``used=true`` 只说明\"上游这次没给出可用的值，我们用了自己的默认参数\"，\n  不代表上游坏了、更不代表她做了什么；\n- ``reason`` 是给人看的一句人话（界面直接显示），不是错误码表；\n- 值本身（默认值）**绝不**写进 activities / experiences / 位置等事实表。\n\n没有回退时也要给这个标记（``used=false``、``source=upstream``）：\n\"这次没用默认值\"本身就是要回答的问题，缺字段会让前端分不清\n\"没用回退\"和\"后端没实现\"。",
+  "properties": {
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "用默认值的人话原因；没回退时为 null",
+      "title": "Reason"
+    },
+    "source": {
+      "$ref": "#/$defs/FallbackSource",
+      "description": "值的来源"
+    },
+    "state": {
+      "$ref": "#/$defs/FallbackState",
+      "description": "上游当时的状态"
+    },
+    "upstream": {
+      "description": "上游是谁，如 schedule / scene",
+      "title": "Upstream",
+      "type": "string"
+    },
+    "used": {
+      "description": "这次是否用了领域默认参数",
+      "title": "Used",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "upstream",
+    "used",
+    "state",
+    "source"
+  ],
+  "title": "FallbackNotice",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}
