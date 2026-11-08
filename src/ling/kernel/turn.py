@@ -1580,6 +1580,26 @@ class TurnCoordinator:
                     },
                 )
             )
+            # 聊天里的**临时提议**（设计 §4）：同样只登记一条 outbox 事件。
+            #
+            # 这里只做"值不值得继续判"的候选判定（关键词/结构化信号），
+            # **不改计划、不调模型**：硬门（睡眠窗、confirmed 承诺、作息、
+            # 体力、预算/频率）与"去不去"的判断都在 worker 的
+            # `schedule.replan` handler 里。于是"聊天里提一句"最多多一条事件。
+            #
+            # 为什么在轮次收尾而不是消息落库处：候选判定要看**整轮**的用户输入
+            # （一句话可能被拆成几条消息），而且放在这里天然保证"这一轮已经有
+            # 一次决定"的幂等键是 `turn_id`。没有原文外泄：事件 payload 只带
+            # turn/window id，worker 按 turn_id 回读那一条消息。
+            from ling.domains.agenda.replan import note_schedule_proposal
+
+            await note_schedule_proposal(
+                conversation.session,
+                actor_id=self._actor_id,
+                window_id=window_id,
+                turn_id=turn_id,
+                text=user_text,
+            )
             await conversation.session.flush()
 
         sequencer = ActorSequencer(

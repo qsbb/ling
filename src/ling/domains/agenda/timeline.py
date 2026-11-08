@@ -77,12 +77,13 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import Visibility
 from ling.domains.agenda.intents import (
+    MAX_SEGMENT_TREE_NODES,
     IntentError,
     IntentService,
     IntentValidationError,
@@ -2465,6 +2466,9 @@ async def _reserve_call(
     reserved_output_tokens: int = OUTLINE_RESERVED_OUTPUT_TOKENS,
     lease_seconds: float = OUTLINE_LEASE_SECONDS,
     attempt: int | None = None,
+    # 重排要按"同一聊天窗口每小时 ≤1 次"计额（设计 §4），所以得把窗口记下来。
+    # 大纲/细化不传（空串），行为与以前完全一致。
+    window_id: str = "",
 ) -> _Reservation | None:
     """预约一次行为模型调用（预算闸 + lease），拿不到返回 ``None``。
 
@@ -2494,7 +2498,7 @@ async def _reserve_call(
                     actor_id=actor_id,
                     plan_day=plan_day,
                     kind=kind,
-                    window_id="",
+                    window_id=window_id,
                     idempotency_key=idempotency_key,
                     attempt=attempt,
                     state="reserved",
@@ -2593,6 +2597,52 @@ async def _outline_model_ready(
     except Exception:  # noqa: BLE001 - 配置读不出来等于"现在不能调"
         return False
     return bool(resolved.usable and resolved.provider_id and resolved.model_id)
+
+
+# 阶段 3 的局部重排与大纲/细化**共用**同一个职责（``memory.extract``）、同一次
+# 超时、同一套"有没有可用模型"的预检。下面三个是给
+# :mod:`ling.domains.agenda.replan` 的**公开入口**：让它不必 import 私有函数，
+# 否则"能不能调模型"的判据会分叉成两份，哪天改了一边就会出现
+# "预检说能调、真调的时候抛不可用"。
+async def behavior_model_ready(
+    router: object | None, config_reader: object | None
+) -> bool:
+    """这个进程现在能不能调行为模型（口径与大纲完全一致）。"""
+    return await _outline_model_ready(router, config_reader)
+
+
+async def call_behavior_model(
+    *, router: object, config_reader: object, prompt: str
+) -> str:
+    """调一次 ``memory.extract``（严格一次，不换模型偷偷重试）。"""
+    return await _call_outline_model(
+        router=router, config_reader=config_reader, prompt=prompt
+    )
+
+
+async def day_behavior_call_totals(
+    session: AsyncSession, *, actor_id: str, plan_day: date, kind: str
+) -> tuple[int, int]:
+    """某 ``kind`` 当日的 (调用次数, 已用/已预留 token 上界)。"""
+    return await _day_call_totals(
+        session, actor_id=actor_id, plan_day=plan_day, kind=kind
+    )
+
+
+async def reserve_behavior_call(
+    session: AsyncSession, **kwargs: object
+) -> object | None:
+    """预约一次行为模型调用（预算闸 + 租约）；拿不到返回 ``None``。
+
+    公开别名：阶段 3 的重排与大纲/细化共用同一张 ``behavior_model_calls``，
+    只是 ``kind`` 不同、额度不同（设计 §0 的三行额度）。
+    """
+    return await _reserve_call(session, **kwargs)  # type: ignore[arg-type]
+
+
+async def finish_behavior_call(session: AsyncSession, **kwargs: object) -> None:
+    """结清一次预留（``committed`` / ``failed`` + 实际 token / 原因码）。"""
+    await _finish_call(session, **kwargs)  # type: ignore[arg-type]
 
 
 class OutlineModelUnavailable(RuntimeError):
@@ -2997,6 +3047,432 @@ async def _commit_revision(
 
 class StaleRevisionError(RuntimeError):
     """提交时 ``revision`` 已被别人推进（CAS 失败）。"""
+
+
+# ---------------------------------------------------------------- 作用域修订（阶段 3）
+#
+# 阶段 1.5 的 :func:`_commit_revision` 是**整版重排**：它把所有"未开始的
+# current 段"一起 ``superseded``，再插一整套新段。那正是"夜里生成一份新大纲"
+# 该有的语义，但**不是**"用户临时提议、只改下一个锚点之前那一小段"该有的语义：
+# 拿它做局部重排会把区间外的段也换成新 ID，等于偷偷重排了整天，还让
+# ``GET /v1/life/timeline`` 之外的一切（活动、准备段关联、审计）都指到旧段上。
+#
+# 所以这里补的是**作用域修订**：只替换 ``[scope_start, scope_end)`` 内、某棵
+# 子树的段；区间外的段逐字段保持原样（同 ID、同 ``revision_created``、同
+# ``source_event_ids``、同 ``updated_at``）。设计 §4 的"局部重排"就是它。
+
+REASON_REPLAN_APPLIED = "replan_applied"
+REASON_REPLAN_SCOPE_EMPTY = "scope_empty"
+REASON_REPLAN_OUT_OF_SCOPE = "segment_out_of_scope"
+REASON_REPLAN_SEGMENT_CONFLICT = "segment_conflict"
+
+
+class ScopeError(RuntimeError):
+    """作用域修订被**代码**拒绝（越界 / 与保留段冲突 / 区间退化）。
+
+    只带**原因码**与一句不带原文的说明：拒绝理由要能进日志与审计，
+    但不能顺手把用户的话抄进时间轴。
+    """
+
+    def __init__(self, reason_code: str, detail: str = "") -> None:
+        super().__init__(detail or reason_code)
+        self.reason_code = reason_code
+        self.detail = detail
+
+
+def valid_at_revision(revision: int):
+    """「某版本有效段」的读谓词：**R 版时间轴上有哪些段**。
+
+    语义（左闭右开，一律 UTC）::
+
+        revision_created <= R  AND  (revision_ended IS NULL OR revision_ended > R)
+                               AND  status <> 'cancelled'
+
+    - ``revision_created`` 是段进入时间轴的那一版；
+    - ``revision_ended`` 是段被后继版本**结束**的那一版（``superseded`` 时写入），
+      ``NULL`` 表示"还是最新版"；
+    - 于是一条在第 R+1 版被替换的段：``created <= R`` 且 ``ended = R+1 > R``
+      → **在 R 版有效、在 R+1 版失效**。这正是"旧段可查"与"新版本不重叠"
+      同时成立的原因。
+    - ``cancelled`` 是终态（不信版本），任何版本里都不算有效段。当前没有写入方
+      把段置成 ``cancelled``（撤回走 ``superseded``，见
+      ``intents._cancel_future_segments``），这条是给未来写入方的明确语义。
+
+    当 ``R = day_plans.revision``（最新版）时，谓词退化成"``status='current'``
+    且未结束"——也就是既有的 :func:`load_segments` 看到的那批行。**两者是有意
+    一致**：历史版本读法不能与最新版读法分叉。
+    """
+    value = int(revision)
+    return and_(
+        ScheduleSegmentRow.revision_created <= value,
+        or_(
+            ScheduleSegmentRow.revision_ended.is_(None),
+            ScheduleSegmentRow.revision_ended > value,
+        ),
+        ScheduleSegmentRow.status != "cancelled",
+    )
+
+
+async def load_segments_at(
+    session: AsyncSession, *, plan_id: str, revision: int
+) -> list[ScheduleSegmentRow]:
+    """只读：某计划在**第 ``revision`` 版**上的有效段（按开始时间排序）。"""
+    stmt = (
+        select(ScheduleSegmentRow)
+        .where(ScheduleSegmentRow.plan_id == plan_id, valid_at_revision(revision))
+        .order_by(ScheduleSegmentRow.start_at, ScheduleSegmentRow.id)
+    )
+    return list((await session.execute(stmt)).scalars())
+
+
+@dataclass(frozen=True)
+class ScopedDraft:
+    """作用域修订里的一条新段草稿。
+
+    ``parent_index`` 指向**同一批草稿**里的父段下标（``None`` = 根段）。用下标而
+    不是 ID：这批行还没入库、没有 ID。父子同批插入才能让"子段重排时对应父段/
+    ``is_leaf`` 一并原子更新"成立（设计 §4）。
+    """
+
+    draft: SegmentDraft
+    parent_index: int | None = None
+
+
+@dataclass(frozen=True)
+class ScopeEdit:
+    """一次作用域修订：某份计划的某个 UTC 区间 + 要写进去的新草稿。"""
+
+    row: DayPlanRow
+    scope_start: datetime
+    scope_end: datetime
+    drafts: tuple[ScopedDraft, ...] = ()
+    # ``None`` = 用 ``row.revision``。调用方在拿到锁之后读到什么就用什么，
+    # 不要把"模型调用之前看到的版本号"当期望值（那是两张快照）。
+    expected_revision: int | None = None
+    reason_code: str = REASON_REPLAN_APPLIED
+    source_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScopeReplacement:
+    """作用域修订的结果（给审计/测试用，不含任何正文）。"""
+
+    plan_id: str
+    plan_day: date
+    revision_before: int
+    revision_after: int
+    scope_start: datetime
+    scope_end: datetime
+    superseded_ids: tuple[str, ...]
+    created_ids: tuple[str, ...]
+    # 区间内**但没被动**的段：已开始（历史/进行中）或不可移动（睡眠/承诺）。
+    frozen_ids: tuple[str, ...]
+    reason_code: str = REASON_REPLAN_APPLIED
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "plan_id": self.plan_id,
+            "plan_day": self.plan_day.isoformat(),
+            "revision_before": self.revision_before,
+            "revision_after": self.revision_after,
+            "scope_start": self.scope_start.isoformat(),
+            "scope_end": self.scope_end.isoformat(),
+            "superseded": list(self.superseded_ids),
+            "created": list(self.created_ids),
+            "frozen": list(self.frozen_ids),
+            "reason_code": self.reason_code,
+        }
+
+
+def scope_movable(segment: ScheduleSegmentRow) -> bool:
+    """作用域修订能不能替换这一段。
+
+    比 :func:`_replan_candidate` **更严**：预计睡眠在这里也算不可移动。
+    理由：``_replan_candidate`` 允许睡眠段"被新确认承诺裁剪"，那是接缝校验
+    /新锚点落地的确定性修补；临时提议**不能**拿"我想看电影"去压缩她的睡眠
+    （设计 §4："可选活动不能再压缩现有预计睡眠"）。
+    """
+    if str(segment.anchor_kind or ""):
+        return False
+    return str(segment.commitment_level) != "confirmed"
+
+
+async def _scope_subtree(
+    session: AsyncSession, *, plan_id: str, roots: Sequence[str]
+) -> dict[str, ScheduleSegmentRow]:
+    """把 ``roots`` 以及它们的**全部后代**（current）取出来。
+
+    父段被替换时必须整棵子树一起处理：留下一个 current 子段指向 superseded 的
+    父段，时间轴上就会出现"孤儿子段"，而父子关系是"若无新事可能怎样做"的唯一
+    来源。段树最多 block→hour→minute 三层，这里仍用广度优先 + 节点上限防御
+    脏数据（父子成环）。
+    """
+    if not roots:
+        return {}
+    rows = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow).where(
+                    ScheduleSegmentRow.plan_id == plan_id,
+                    ScheduleSegmentRow.status == "current",
+                )
+            )
+        ).scalars()
+    )
+    by_id = {str(item.id): item for item in rows}
+    children: dict[str, list[str]] = {}
+    for item in rows:
+        parent = str(item.parent_id or "")
+        if parent:
+            children.setdefault(parent, []).append(str(item.id))
+    found: dict[str, ScheduleSegmentRow] = {}
+    frontier = [str(item) for item in roots if str(item) in by_id]
+    guard = 0
+    while frontier and guard < MAX_SEGMENT_TREE_NODES:
+        guard += len(frontier)
+        next_frontier: list[str] = []
+        for key in frontier:
+            if key in found:
+                continue
+            found[key] = by_id[key]
+            next_frontier.extend(children.get(key, ()))
+        frontier = next_frontier
+    return found
+
+
+def _validate_scope_drafts(
+    drafts: Sequence[ScopedDraft],
+    *,
+    scope_start: datetime,
+    scope_end: datetime,
+    kept: Sequence[ScheduleSegmentRow],
+) -> None:
+    """新草稿的**代码**校验：越界/重叠一律拒收，不裁剪。
+
+    为什么不裁剪：把一段 21:00–23:30 的电影裁成 21:00–22:00 是替模型编内容
+    （它没说只要一小时）。宁可整份输出拒收、保留旧计划并如实告诉用户
+    "今天安排没有改成"（设计 §4），也不写一个谁都没同意的段。
+
+    叶子段之间、叶子段与**保留段**之间都不许重叠；父段与自己的子段重叠是
+    合法的（大块 / 小时的父子关系本来就有意重叠）。
+    """
+    for index, scoped in enumerate(drafts):
+        draft = scoped.draft
+        start, end = _aware(draft.start_at), _aware(draft.end_at)
+        if start >= end:
+            raise ScopeError(REASON_REPLAN_OUT_OF_SCOPE, f"第 {index} 段起止倒置")
+        if start < scope_start or end > scope_end:
+            raise ScopeError(
+                REASON_REPLAN_OUT_OF_SCOPE,
+                f"第 {index} 段越过作用域 [{scope_start.isoformat()}, {scope_end.isoformat()})",
+            )
+        if draft.anchor_kind or draft.commitment_level == "confirmed":
+            raise ScopeError(
+                REASON_REPLAN_OUT_OF_SCOPE,
+                f"第 {index} 段想当锚点/已确认约定；临时提议不能写这类段",
+            )
+        parent_index = scoped.parent_index
+        if parent_index is None:
+            continue
+        if not 0 <= parent_index < index:
+            raise ScopeError(
+                REASON_REPLAN_OUT_OF_SCOPE,
+                f"第 {index} 段的父段下标 {parent_index} 非法（必须小于自己）",
+            )
+        parent = drafts[parent_index].draft
+        if not (
+            _aware(parent.start_at) <= start and end <= _aware(parent.end_at)
+        ):
+            raise ScopeError(
+                REASON_REPLAN_OUT_OF_SCOPE, f"第 {index} 段不在父段区间内"
+            )
+
+    leaves = [
+        (index, _aware(item.draft.start_at), _aware(item.draft.end_at))
+        for index, item in enumerate(drafts)
+        if not any(other.parent_index == index for other in drafts)
+    ]
+    leaves.sort(key=lambda item: (item[1], item[2]))
+    for left, right in zip(leaves, leaves[1:], strict=False):
+        if right[1] < left[2]:
+            raise ScopeError(
+                REASON_REPLAN_SEGMENT_CONFLICT,
+                f"第 {left[0]} 段与第 {right[0]} 段重叠",
+            )
+    for index, start, end in leaves:
+        for row in kept:
+            if overlaps(start, end, _aware(row.start_at), _aware(row.end_at)):
+                raise ScopeError(
+                    REASON_REPLAN_SEGMENT_CONFLICT,
+                    f"第 {index} 段压到保留段 {row.id}",
+                )
+
+
+async def _replace_scope_in_txn(
+    session: AsyncSession, edit: ScopeEdit, *, now: datetime
+) -> ScopeReplacement:
+    """:func:`replace_scope_multi` 的单格实现：**不自己开事务**，调用方管边界。"""
+    row = edit.row
+    plan_id = str(row.id)
+    scope_start = _aware(edit.scope_start)
+    scope_end = _aware(edit.scope_end)
+    if scope_end <= scope_start:
+        raise ScopeError(REASON_REPLAN_SCOPE_EMPTY, "作用域为空")
+    expected = int(row.revision if edit.expected_revision is None else edit.expected_revision)
+    new_revision = expected + 1
+    floor = max(_aware(now), _aware(row.window_start_at))
+
+    current = list(
+        (
+            await session.execute(
+                select(ScheduleSegmentRow)
+                .where(
+                    ScheduleSegmentRow.plan_id == plan_id,
+                    ScheduleSegmentRow.status == "current",
+                )
+                .order_by(ScheduleSegmentRow.start_at, ScheduleSegmentRow.id)
+            )
+        ).scalars()
+    )
+    hit = [
+        item
+        for item in current
+        if scope_movable(item)
+        and _aware(item.start_at) >= floor
+        and overlaps(
+            _aware(item.start_at), _aware(item.end_at), scope_start, scope_end
+        )
+    ]
+    # 父段被替换 → 整棵子树一并替换。子段必落在父段区间内，所以"父段在作用域内
+    # 且未开始"时子段也一定未开始；反过来，只有子段相交（父段更早开始）时父段
+    # 保留，子段单独换掉——大块剩余部分仍然算数。
+    supersede = await _scope_subtree(
+        session, plan_id=plan_id, roots=[str(item.id) for item in hit]
+    )
+    superseded_ids = sorted(supersede)
+    superseded_set = set(superseded_ids)
+    # 区间内**没被动**的段：已开始的历史/进行中，或不可移动（睡眠/承诺）。
+    frozen_ids = tuple(
+        sorted(
+            str(item.id)
+            for item in current
+            if str(item.id) not in superseded_set
+            and overlaps(
+                _aware(item.start_at), _aware(item.end_at), scope_start, scope_end
+            )
+        )
+    )
+    kept = [item for item in current if str(item.id) not in superseded_set]
+    _validate_scope_drafts(
+        edit.drafts, scope_start=scope_start, scope_end=scope_end, kept=kept
+    )
+
+    result = await session.execute(
+        update(DayPlanRow)
+        .where(DayPlanRow.id == plan_id, DayPlanRow.revision == expected)
+        .values(revision=new_revision, updated_at=now)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        raise StaleRevisionError(expected)
+
+    tag = f"{REASON_TAG_PREFIX}{edit.reason_code}"
+    for key in superseded_ids:
+        segment = supersede[key]
+        segment.status = "superseded"
+        segment.revision_ended = new_revision
+        segment.source_event_ids = _append_unique(
+            segment.source_event_ids, tag, *edit.source_ids
+        )
+        segment.updated_at = now
+
+    created_ids: list[str] = []
+    new_ids = [new_id("seg") for _ in edit.drafts]
+    for index, scoped in enumerate(edit.drafts):
+        draft = scoped.draft
+        parent_id = (
+            new_ids[scoped.parent_index] if scoped.parent_index is not None else None
+        )
+        session.add(
+            ScheduleSegmentRow(
+                id=new_ids[index],
+                plan_id=plan_id,
+                actor_id=str(row.actor_id),
+                parent_id=parent_id,
+                parent_key=parent_id or "",
+                layer=draft.layer,
+                kind=draft.kind,
+                title=draft.title,
+                start_at=_aware(draft.start_at),
+                end_at=_aware(draft.end_at),
+                place_id=draft.place_id,
+                commitment_level=draft.commitment_level,
+                status="current",
+                is_leaf=draft.is_leaf,
+                anchor_kind=draft.anchor_kind,
+                source=draft.source,
+                revision_created=new_revision,
+                revision_ended=None,
+                source_event_ids=list(
+                    dict.fromkeys(
+                        [
+                            *draft.source_event_ids,
+                            tag,
+                            *edit.source_ids,
+                        ]
+                    )
+                ),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        created_ids.append(new_ids[index])
+    await session.flush()
+    return ScopeReplacement(
+        plan_id=plan_id,
+        plan_day=row.plan_day,
+        revision_before=expected,
+        revision_after=new_revision,
+        scope_start=scope_start,
+        scope_end=scope_end,
+        superseded_ids=tuple(superseded_ids),
+        created_ids=tuple(created_ids),
+        frozen_ids=frozen_ids,
+        reason_code=edit.reason_code,
+    )
+
+
+async def replace_scope_multi(
+    session: AsyncSession, edits: Sequence[ScopeEdit], *, now: datetime
+) -> list[ScopeReplacement]:
+    """**一个事务、多个作用域**的修订（跨午夜邀约必须这样改）。
+
+    设计 §4："跨午夜邀约分成相邻两日的原子修订，不能在 D−1 行写入 D 的叶段"。
+    所以两格各自只改**自己那一份** ``day_plans``，但要么都成功、要么都不生效：
+    这里把所有格放进**同一个 savepoint**，任何一格抛
+    :class:`ScopeError` / :class:`StaleRevisionError` 都整单回滚（调用方随后可以
+    在干净的外层事务里写下 defer 决定）。
+
+    写入顺序按 ``plan_day`` 升序：调用方在拿锁时就用同一顺序
+    (``SELECT … ORDER BY plan_day FOR UPDATE``)，两边一致才不会出现
+    "A 锁 D、B 锁 D+1，然后互相等对方"的死锁。
+    """
+    ordered = sorted(edits, key=lambda item: (item.row.plan_day, str(item.row.id)))
+    if not ordered:
+        raise ScopeError(REASON_REPLAN_SCOPE_EMPTY, "没有要改的作用域")
+    results: list[ScopeReplacement] = []
+    async with session.begin_nested():
+        for edit in ordered:
+            results.append(await _replace_scope_in_txn(session, edit, now=now))
+    for row in {id(item.row): item.row for item in ordered}.values():
+        await session.refresh(row)
+    return results
+
+
+async def replace_scope(
+    session: AsyncSession, edit: ScopeEdit, *, now: datetime
+) -> ScopeReplacement:
+    """单份计划的作用域修订（:func:`replace_scope_multi` 的单格用法）。"""
+    return (await replace_scope_multi(session, [edit], now=now))[0]
 
 
 # ---------------------------------------------------------------- 准备段落库
@@ -5399,6 +5875,10 @@ __all__ = [
     "REASON_NEEDS_REVIEW",
     "REASON_PREPARATION_UNPLACED",
     "REASON_REFINE_ATTEMPTED",
+    "REASON_REPLAN_APPLIED",
+    "REASON_REPLAN_OUT_OF_SCOPE",
+    "REASON_REPLAN_SCOPE_EMPTY",
+    "REASON_REPLAN_SEGMENT_CONFLICT",
     "REASON_REFINE_INVALID",
     "REASON_REFINE_ROLLING",
     "REASON_REFINE_STALE",
@@ -5440,6 +5920,10 @@ __all__ = [
     "PlannedBlock",
     "PreparationLink",
     "RefineChild",
+    "ScopeEdit",
+    "ScopeError",
+    "ScopeReplacement",
+    "ScopedDraft",
     "RefineOutcome",
     "RefineTarget",
     "RefineValidationError",
@@ -5471,6 +5955,7 @@ __all__ = [
     "load_future_intents",
     "load_refine_target",
     "load_segments",
+    "load_segments_at",
     "local_hhmm",
     "local_minute_instant",
     "on_new_confirmed_anchor",
@@ -5498,5 +5983,14 @@ __all__ = [
     "sleep_anchors_for_day",
     "validate_intention_proposals",
     "validate_outline",
+    "behavior_model_ready",
+    "call_behavior_model",
+    "day_behavior_call_totals",
+    "finish_behavior_call",
+    "replace_scope",
+    "reserve_behavior_call",
+    "scope_movable",
+    "replace_scope_multi",
+    "valid_at_revision",
     "validate_refine_children",
 ]
