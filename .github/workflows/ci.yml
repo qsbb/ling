@@ -65,6 +65,38 @@ jobs:
           for script in deploy/install.sh deploy/entrypoint.sh deploy/backup/*.sh; do
             bash -n "$script"
           done
+      - name: 补建 `ling` 数据库（安装器/更新器的就绪探针固定连它）
+        # CI 的 postgres 服务只建了 `ling_test`（测试库）。但安装器与更新器在**生产**
+        # 里连的是 `ling`：`deploy/cli/ling.py` 的就绪探针是
+        # `psql -U ling -d ling -tAc 'select 1'`，库不存在就会被判成"还没就绪"，
+        # 一直重试到超时 → 安装器相关用例整片红（main 上已经连续红了几轮，
+        # 连 tag 发版也因此在 ci 这一步被卡住、镜像根本没构建）。
+        # 这里按生产的形状把库补出来，让那些用例跑在"库存在"的真实前提上。
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          import asyncpg
+
+          async def main() -> None:
+              conn = await asyncpg.connect(
+                  host="127.0.0.1",
+                  port=55432,
+                  user="ling",
+                  password="ling",
+                  database="ling_test",
+              )
+              try:
+                  await conn.execute("CREATE DATABASE ling")
+                  print("已补建数据库 ling")
+              except asyncpg.DuplicateDatabaseError:
+                  print("数据库 ling 已存在")
+              finally:
+                  await conn.close()
+
+          asyncio.run(main())
+          PY
+
       - name: 校验可信发布目录（catalog.py validate）
         # 独立具名 step，不埋进 `静态检查` 的多行 run 里：发布目录是"网页更新
         # 按钮能指向哪个目标"的唯一信任锚（deploy/releases.json），它坏掉时
