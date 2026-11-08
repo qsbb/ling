@@ -508,14 +508,24 @@ class OneBotV11Connector(ChannelConnector):
         message_id = payload.get("message_id")
         if message_id is None:
             return
-        target = str(
-            payload.get("target_id")
-            or payload.get("group_id")
-            or payload.get("user_id")
-            or ""
-        )
-        parsed = parse_message(payload.get("message"), self_id=self._config.self_id)
-        self._echoes.append((_now(), target, str(message_id), parsed.text))
+        # 记账失败**不能**让这条回显变成错误：`_record_echo` 在
+        # `normalize_inbound` 里、被抛 ``ignored`` 之前调用，异常一穿出去，
+        # ``process_inbound_payload`` 只会把 ChannelError/ValueError 收成
+        # ``accepted=False``，其它异常会一路冒到上报路由 → 平台按"投递失败"
+        # 重投同一条回显。可以吞的理由：这只是一个对账用的**加速证据**
+        # （`reportSelfMessage` 默认关闭），丢了它并不影响送达判定——送达仍由
+        # `send()` 回执与 `get_msg` 决定。
+        try:
+            target = str(
+                payload.get("target_id")
+                or payload.get("group_id")
+                or payload.get("user_id")
+                or ""
+            )
+            parsed = parse_message(payload.get("message"), self_id=self._config.self_id)
+            self._echoes.append((_now(), target, str(message_id), parsed.text))
+        except Exception as exc:  # noqa: BLE001 - 辅助记账失败不改变事件语义
+            logger.debug("回显记账失败（不影响对账，只少一条加速证据）：%s", type(exc).__name__)
 
 
     async def _call(self, action: str, params: dict) -> object:

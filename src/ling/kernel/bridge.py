@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.audit import hash_account_ref
+from ling.audit import behavior_event, hash_account_ref
 from ling.contracts.v1 import InteractionEnvelope
 from ling.domains.conversation.service import ConversationService
 from ling.domains.identity.service import IdentityService
@@ -931,33 +931,72 @@ class InboundBridge:
 
         写进现成的 `idempotency_keys` 表（不建新表、不动迁移）。写失败只影响
         "她能不能引用这条消息"，**绝不能**因此让这条消息处理失败。
+
+        ## 为什么是「SAVEPOINT + 吞」
+
+        这个函数在 `handle()` 主流程里、`commit()` **之前**被 await。原来没有
+        任何保护，一次异常就穿透到 `inbound_intake.process_inbound_payload`
+        的 `except Exception`（"事件处理失败，撤回认领以便重投"）——用户看到的
+        正是**这条消息没收到回复**，而且每次重投都在同一处再炸一遍。
+
+        两条具体的失败路径：
+
+        1. **唯一键冲突**：同一个 `message_id` 被并发写（两个 worker 抢同一条
+           重投事件），或在同一事务里写两次。所以这里用
+           ``ON CONFLICT DO UPDATE`` 而不是"先查再插"：查与插之间没有锁，
+           天生会撞；撞上就当成功，映射值以最后一次为准（重投拿到的平台 id
+           才是最新的那个）。
+        2. **任何 DB 错误**（连接抖动、NOT NULL 违约）。一次失败的 flush 会把
+           整个 session 标成待回滚，调用方随后的 `commit()` 会拿到
+           ``PendingRollbackError``——消息照样被拒收，只是换了个地方炸。
+           包在 SAVEPOINT 里之后，失败只回滚这一段，主流程照常提交。
         """
         platform_id = self._platform_message_id(envelope)
         if not platform_id:
             return
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         from ling.infra.models import IdempotencyKey
         from ling.infra.security import new_id
 
-        existing = (
-            await self._session.execute(
-                select(IdempotencyKey).where(
-                    IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
-                    IdempotencyKey.key == message_id,
+        try:
+            async with self._session.begin_nested():
+                await self._session.execute(
+                    pg_insert(IdempotencyKey)
+                    .values(
+                        id=new_id("idem"),
+                        scope=PLATFORM_MESSAGE_ID_SCOPE,
+                        key=message_id,
+                        result_ref=platform_id,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[IdempotencyKey.scope, IdempotencyKey.key],
+                        set_={"result_ref": platform_id},
+                    )
                 )
+        except Exception as exc:  # noqa: BLE001 - 旁路失败绝不能拒收消息
+            # 为什么可以吞：这条映射只决定"上下文里能不能给模型看
+            # `[msg_id:…]`"（同时是出站引用白名单的依据）。没有它，她仍然会
+            # 回复、仍然落库、仍然投递，只是说不出"我引用的那条"；下一条消息
+            # 会再试。而抛出去等于拿"引用元数据"换"整条消息"，代价完全不对等。
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="platform_message_id_record_failed",
+                message="没记下这条消息的平台 id（不影响回复，只是她没法引用它）",
+                attributes={
+                    "reason_code": "platform_message_id_record_failed",
+                    "error_type": type(exc).__name__,
+                },
             )
-        ).scalar_one_or_none()
-        if existing is not None:
-            existing.result_ref = platform_id
-            return
-        self._session.add(
-            IdempotencyKey(
-                id=new_id("idem"),
-                scope=PLATFORM_MESSAGE_ID_SCOPE,
-                key=message_id,
-                result_ref=platform_id,
+            # 行为日志：这是"她这一侧"的残缺能力（无法引用那条消息），
+            # 与消息收没收到是两件事，用 outcome=degraded 标出来。
+            behavior_event(
+                "platform_message_id_record_failed",
+                "这条消息的平台 id 没记下来（她没法用它引用这条消息，但回复照常）",
+                outcome="degraded",
+                attributes={"error_type": type(exc).__name__},
             )
-        )
-        await self._session.flush()
 
     # ------------------------------------------------------------ 重投续发
 
@@ -1110,20 +1149,42 @@ class InboundBridge:
         """她说"稍后再提"时落一条意图。
 
         来源固定为这条消息——说不出为什么会有这个念头的，不允许产生。
+
+        **写不进去也不能拒收消息**：这条意图只是"过一会儿主动提一句"的备忘，
+        而调用点就在 `handle()` 的主流程里（落完消息、`commit()` 之前）。
+        `record_followup` 内部会 `flush()`，并发/重投撞同一个 dedupe_key 时
+        抛 `IntegrityError`；不包 SAVEPOINT 的话，这个异常会穿透成
+        "事件处理失败，撤回认领以便重投"——为了丢一句提醒，把整条消息的处置
+        也丢了（见 `_remember_platform_message_id` 的同类说明）。
         """
         followup = getattr(decision, "followup", None)
         if followup is None:
             return
         from ling.domains.intent.service import record_followup
 
-        await record_followup(
-            self._session,
-            actor_id=self._actor_id,
-            followup=followup,
-            subject_id=subject_id,
-            window_id=window_id,
-            source_ref=f"msg:{message_id}",
-        )
+        try:
+            async with self._session.begin_nested():
+                await record_followup(
+                    self._session,
+                    actor_id=self._actor_id,
+                    followup=followup,
+                    subject_id=subject_id,
+                    window_id=window_id,
+                    source_ref=f"msg:{message_id}",
+                )
+        except Exception as exc:  # noqa: BLE001 - 旁路失败绝不能拒收消息
+            # 可以吞：她"晚点再提"的念头丢了，这条消息本身仍然会照常回/照常沉默，
+            # 而且下一条消息里她还能重新产生同样的念头。
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="followup_record_failed",
+                message="没记下「稍后再提」的意图（不影响这条消息的处理）",
+                attributes={
+                    "reason_code": "followup_record_failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
 
     async def _ingest_media(
         self,
@@ -1165,16 +1226,43 @@ class InboundBridge:
         failures: list[str] = []
         for ref in refs:
             try:
-                view = await service.record(
-                    subject_id=subject_id,
-                    window_id=window_id,
-                    media_ref=ref,
-                    kind=kinds.get(ref, "image"),
-                    source_event_id=f"{envelope.external_event_id}:{ref}",
-                    consent_subjects=(owner_subject_id,) if owner_subject_id else (),
-                )
+                # 每个媒体一个 SAVEPOINT：登记是**旁路**（本函数的文档就在说
+                # "媒体登记失败不阻断文本轮次"），而 `record()` 内部会
+                # `flush()`——并发/重投撞 `uq_media_evidence_dedupe`（或任何
+                # DB 错误）时抛的是 `IntegrityError`，不在下面那个
+                # `MediaEvidenceError` 分支里。不包 SAVEPOINT 的话，一次撞键
+                # 就会穿透到 `handle()` 外面变成"事件处理失败、撤回认领"
+                # （用户看到的是"发了图，她完全没反应"），而且失败的 flush
+                # 会把 session 标成待回滚，后面 `commit()` 还会再炸一次。
+                async with self._session.begin_nested():
+                    view = await service.record(
+                        subject_id=subject_id,
+                        window_id=window_id,
+                        media_ref=ref,
+                        kind=kinds.get(ref, "image"),
+                        source_event_id=f"{envelope.external_event_id}:{ref}",
+                        consent_subjects=(owner_subject_id,) if owner_subject_id else (),
+                    )
             except MediaEvidenceError as exc:
                 failures.append(str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001 - 旁路失败不能拒收消息
+                # 为什么可以吞：这条证据没登记上，最坏结果只是这一张图没被描述；
+                # 同一张图往往已被并发的另一次处理登记过（撞键就是这么来的），
+                # 正文轮次更不该因此中断。原因带回去给调用方，不静默。
+                # 但它不属于"预期内的拒绝"（那是 MediaEvidenceError），
+                # 所以单独记一条 WARNING，别和授权拒绝混在同一行 INFO 里。
+                emit_event(
+                    logger,
+                    logging.WARNING,
+                    event_name="media_evidence_record_failed",
+                    message="媒体证据没登记上（不影响这条消息的正文轮次）",
+                    attributes={
+                        "reason_code": "media_evidence_record_failed",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                failures.append(f"媒体登记失败（{type(exc).__name__}）")
                 continue
             recorded.append(view.evidence_id)
         if failures:
