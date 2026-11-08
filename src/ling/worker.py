@@ -3434,6 +3434,295 @@ async def handle_schedule_refine(payload: dict) -> None:
     )
 
 
+# ---------------------------------------------------------------- 重排回话
+#
+# 缺口：`schedule.replan` 拒绝/推迟一次临时提议时，原来只往
+# `schedule_change_requests` 与行为日志里记一笔，**用户收不到任何回话**——
+# 提议像掉进了黑洞（设计文档把这条列为"最大的产品级缺口"）。下面补的就是
+# "她回一句"。
+#
+# 三条硬规则：
+# 1. **先说在本地**：话先落成会话里她的一条消息（Web 端立刻能看到），再谈
+#    发到哪个平台；连落库都失败就什么都不声称。
+# 2. **没有回执不声称已发送**：只有 `DeliveryOutcome.delivered` 才记 `sent`；
+#    结果未知记 `uncertain` 并**不重发**；明确没发出去记 `failed`。
+# 3. **回话失败不影响主线**：走到这里时计划已经改完、或已经决定不改了。这一整
+#    段自己吞掉异常，绝不往外抛——一句发不出去的"今天先不折腾"不该让整条
+#    `schedule.replan` 事件重试到 dead。
+REPLAN_NOTICE_SCOPE = "replan_notice"
+REPLAN_NOTICE_OPERATION_PREFIX = "replan_notice:"
+
+
+def _record_replan_notice(
+    *,
+    actor_id: str,
+    turn_id: str,
+    reason_code: str,
+    delivery: str,
+    stage: str,
+    window_id: str = "",
+    message_id: str = "",
+    operation_id: str = "",
+    text: str = "",
+) -> None:
+    """记一条 ``replan_notice`` 行为事件：她有没有回话、回话到了哪。
+
+    ``delivery`` 是**送达结论**，四种取值与投递状态机同名：
+
+    - ``sent``：拿到送达回执；
+    - ``uncertain``：可能到了，等对账，**不重发**；
+    - ``failed``：明确没发出去；
+    - ``web_only``：只落库——没有可主动推送的渠道（例如只有 Web）。
+
+    ``stage`` 说明停在哪一步：``persist``（话都没落下来）/ ``deliver``
+    （落库了，但没送到平台）/ ``done``（该做的都做完了）。分开写是因为
+    "她根本没说话"和"她说了但没送到平台"对用户是两件事，事后不该长得一样。
+    """
+    from ling.audit import behavior_event
+
+    behavior_event(
+        "replan_notice",
+        # 说明是人话：她说了什么、有没有送出去。
+        f"提议没有改动安排，她{'说了一句「' + text + '」' if text else '没回成话'}"
+        f"（{delivery}）",
+        outcome="ok" if delivery in {"sent", "web_only"} else "skip",
+        attributes={
+            "actor_id": actor_id,
+            "turn_id": turn_id,
+            "reason_code": reason_code,
+            "delivery": delivery,
+            "stage": stage,
+            "window_id": window_id,
+            "message_id": message_id,
+            "operation_id": operation_id,
+        },
+    )
+
+
+async def _replan_notice_target(
+    session: object, *, window_id: str, connector: object
+) -> tuple[str, str, bool] | None:
+    """回话该发到哪：`Window.id` → ``(window_ref, subject_id, is_group)``。
+
+    两跳是必须的：``payload["window_id"]`` 是本地会话主键，连接器要的是平台
+    窗口标识（``Window.title``，如 ``onebot-x:private:9001``）。把 id 当 ref
+    传下去，就是"把 ``win_xxx`` 当成 QQ 号发出去"。
+
+    只发**这条提议所在的那个窗口**（提议从群里来就回群里）。另有两条硬约束：
+
+    - 窗口必须属于同一渠道（``Window.channel == connector_id``）：别的渠道
+      解析不出这个 ref；
+    - ``title`` 必须真是平台标识（``split_window_ref`` 认得）：Web 窗口的
+      title 是用户随手起的名字，长得像 ref 也不能拿来当收件人。
+
+    任何一条不满足都返回 ``None``：调用方**只落库**，不声称发送。
+    """
+    from ling.domains.conversation.service import split_window_ref
+    from ling.infra.models import Window
+
+    channel = str(getattr(connector, "connector_id", "") or "")
+    row = (
+        (
+            await session.execute(  # type: ignore[attr-defined]
+                select(Window).where(
+                    Window.id == window_id, Window.archived.is_(False)
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None or not row.title:
+        return None
+    if channel and str(row.channel or "") != channel:
+        return None
+    parsed = split_window_ref(str(row.title))
+    if parsed is None:
+        return None
+    _instance, kind, _target = parsed
+    return str(row.title), str(row.subject_id or ""), kind == "group"
+
+
+async def _send_replan_notice(
+    *,
+    actor_id: str,
+    persona_id: str,
+    turn_id: str,
+    window_id: str | None,
+    text: str,
+    reason_code: str,
+) -> None:
+    """把她那句"这次没改"送出去：先落库，再（有渠道时）真实投递。
+
+    **本函数从不抛异常**：调用点在计划已经改完（或已经决定不改）之后，
+    回话是附加品，不是主线。
+
+    ## 幂等：同一 ``turn_id`` 最多一条回话，三层保证
+
+    1. **决定层**（主闸）：`notice_for` 对 ``duplicate`` 返回 ``None``——同一轮
+       被重复消费时连文案都不会产生（和"同一轮只改一次计划"是同一把锁）；
+    2. **回话层**：落库前先 ``claim_event(scope="replan_notice", key=turn_id)``
+       认领这一轮。重复/并发消费直接短路：即使决定记录被清理掉再跑一次，
+       也不会多出第二条消息；
+    3. **投递层**：``deliver(plan_id="replan_notice:<turn_id>", part_ordinal=0)``
+       走段级幂等——已送达的段**跳过**，``uncertain`` **不重发**（等对账）。
+       ``OutboundMessage.operation_id`` 只是这条回话的逻辑身份：``deliver``
+       会把它换成它新建的本地 ``operations.id``，平台看不到它。
+
+    ## 顺序
+
+    落库（一个事务）→ 投递（另一个事务）。**必须先落库并且先提交**：投递
+    抛异常时，Web 端那句话不能跟着回滚——"她说了但没送到平台"是可解释的，
+    "她什么都没说"不是。
+    """
+    from ling.capabilities.delivery import DeliveryService
+    from ling.contracts.v1 import OperationState, Origin
+    from ling.domains.conversation.service import ConversationService
+    from ling.ports.channel import ChannelError, ChannelErrorKind, OutboundMessage
+
+    if not window_id:
+        # 定位不到会话就只有事件可记：不能猜一个窗口把这句塞进去。
+        logger.warning("重排回话拿不到 window_id，只记事件 turn=%s", turn_id)
+        _record_replan_notice(
+            actor_id=actor_id,
+            turn_id=turn_id,
+            reason_code=reason_code,
+            delivery="failed",
+            stage="persist",
+            text=text,
+        )
+        return
+
+    # ① 落库：Web 端立刻能看到。同时认领这一轮，重复消费在这里短路。
+    message_id = ""
+    try:
+        async with session_scope() as session:
+            conversation = ConversationService(
+                session, actor_id=actor_id, persona_id=persona_id
+            )
+            claimed = await conversation.claim_event(
+                scope=REPLAN_NOTICE_SCOPE, key=turn_id
+            )
+            if claimed is not None:
+                logger.info("重排回话这一轮已经回过，跳过 turn=%s", turn_id)
+                return
+            view = await conversation.add_message(
+                window_id,
+                role="actor",
+                text=text,
+                # 用最贴近的**既有**取值：这是她说的一句话（不是用户陈述、
+                # 不是外部观测），与 proactive 主动消息落库时同一种来源，
+                # 见 `domains/proactive/dispatch.py::_append_web_message`。
+                # `Origin` 里没有"系统固定文案"这一档，不为这一句新增枚举值。
+                origin=Origin.simulated,
+            )
+            message_id = view.message_id
+    except Exception:  # noqa: BLE001 - 回话失败绝不影响主线
+        logger.warning("重排回话落库失败 turn=%s", turn_id, exc_info=True)
+        _record_replan_notice(
+            actor_id=actor_id,
+            turn_id=turn_id,
+            reason_code=reason_code,
+            delivery="failed",
+            stage="persist",
+            window_id=window_id,
+            text=text,
+        )
+        return
+
+    # ② 有可主动推送的渠道才谈"发出去"；没有就只落库（Web 端已经能看到）。
+    try:
+        from ling.capabilities.channels import proactive_connector
+
+        connector = proactive_connector()
+    except Exception:  # noqa: BLE001 - 渠道探测失败按"没有渠道"处理
+        logger.warning("重排回话：渠道探测失败 turn=%s", turn_id, exc_info=True)
+        connector = None
+
+    if connector is None:
+        logger.info("重排回话只落库（没有可主动推送的渠道）turn=%s", turn_id)
+        _record_replan_notice(
+            actor_id=actor_id,
+            turn_id=turn_id,
+            reason_code=reason_code,
+            delivery="web_only",
+            stage="done",
+            window_id=window_id,
+            message_id=message_id,
+            text=text,
+        )
+        return
+
+    operation_id = ""
+    delivery = "failed"
+    try:
+        async with session_scope() as session:
+            target = await _replan_notice_target(
+                session, window_id=window_id, connector=connector
+            )
+            if target is None:
+                # 有连接器但**定位不到平台窗口**（例如 Web 会话）：同样只落库。
+                logger.info(
+                    "重排回话没有可投递的会话定位（window_id 不是平台窗口）turn=%s",
+                    turn_id,
+                )
+                _record_replan_notice(
+                    actor_id=actor_id,
+                    turn_id=turn_id,
+                    reason_code=reason_code,
+                    delivery="web_only",
+                    stage="done",
+                    window_id=window_id,
+                    message_id=message_id,
+                    text=text,
+                )
+                return
+            window_ref, subject_id, is_group = target
+            outcome = await DeliveryService(session).deliver(
+                connector=connector,
+                message=OutboundMessage(
+                    operation_id=f"{REPLAN_NOTICE_OPERATION_PREFIX}{turn_id}",
+                    window_ref=window_ref,
+                    text=text,
+                    is_group=is_group,
+                ),
+                actor_id=actor_id,
+                subject_id=subject_id,
+                require_proactive=True,
+                payload_extra={"turn_id": turn_id, "source": "schedule.replan"},
+                plan_id=f"{REPLAN_NOTICE_OPERATION_PREFIX}{turn_id}",
+                part_ordinal=0,
+            )
+        operation_id = outcome.operation_id
+        if outcome.delivered:
+            delivery = "sent"
+        elif outcome.state is OperationState.uncertain:
+            # 不确定 ≠ 失败：可能已经到了，等对账，**不重发**。
+            delivery = "uncertain"
+        else:
+            delivery = "failed"
+    except ChannelError as exc:
+        delivery = "uncertain" if exc.kind is ChannelErrorKind.uncertain else "failed"
+        logger.warning(
+            "重排回话投递异常 turn=%s kind=%s delivery=%s", turn_id, exc.kind, delivery
+        )
+    except Exception:  # noqa: BLE001 - 回话失败绝不影响主线
+        logger.warning("重排回话投递异常 turn=%s", turn_id, exc_info=True)
+        delivery = "failed"
+
+    _record_replan_notice(
+        actor_id=actor_id,
+        turn_id=turn_id,
+        reason_code=reason_code,
+        delivery=delivery,
+        stage="done" if delivery == "sent" else "deliver",
+        window_id=window_id,
+        message_id=message_id,
+        operation_id=operation_id,
+        text=text,
+    )
+
+
 @handler("schedule.replan")
 async def handle_schedule_replan(payload: dict) -> None:
     """聊天里的临时提议 → 硬门 → 意愿模型 → 局部修订（设计 §4）。
@@ -3451,9 +3740,13 @@ async def handle_schedule_replan(payload: dict) -> None:
     没有候选提议 → 什么都不做；已决定过 → 返回原决定；硬门不过/预算满/
     模型不可用/输出非法/越界/CAS 失败 → ``defer``/``decline`` 并**已经落库**；
     接受 → 局部修订提交 ``revision+1``（旧段 superseded，不物理删）。
+
+    最后一件事是**回一句话**（见 `_send_replan_notice`）：只有真的提过建议、
+    而且**没改成**（``declined``/``deferred``）才回。这一步失败只记日志与
+    行为事件，绝不让本作业失败——它走到这里时计划已经定下来了。
     """
     from ling.audit import behavior_event
-    from ling.domains.agenda.replan import replan_work, turn_user_text
+    from ling.domains.agenda.replan import notice_for, replan_work, turn_user_text
 
     settings = get_settings()
     actor_id = str(payload.get("actor_id") or settings.actor_id)
@@ -3528,6 +3821,31 @@ async def handle_schedule_replan(payload: dict) -> None:
             "notice": outcome.notice,
         },
     )
+
+    # 回一句话：真的提过建议、而且**没改成**时，她要应一声。
+    #
+    # 只有 `declined` / `deferred` 才有回话：闲聊（`no_proposal`）一个字都不
+    # 多说、`accepted` 的回复本来就在谈这件事、`duplicate` 是同一轮的重复消费。
+    # 文案是代码固定的（`notice_for`），**不为回一句话调模型**。
+    #
+    # 幂等键是 `turn_id`：同一轮最多一条回话，重复消费不会刷第二遍。
+    #
+    # 这里再包一层 try：`_send_replan_notice` 自己已经逐段吞异常了，这层是
+    # "将来有人往里加一行没护栏的代码"时的兜底——回话**永远**不许让本作业
+    # 失败，它走到这里时计划已经定下来了。
+    try:
+        notice_text = notice_for(outcome)
+        if notice_text:
+            await _send_replan_notice(
+                actor_id=actor_id,
+                persona_id=str(settings.persona_id),
+                turn_id=turn_id,
+                window_id=window_id,
+                text=notice_text,
+                reason_code=str(outcome.reason_code or ""),
+            )
+    except Exception:  # noqa: BLE001 - 回话是附加品，绝不影响主线
+        logger.warning("重排回话失败（不影响本次决定）turn=%s", turn_id, exc_info=True)
 
 
 @handler("dream.generate")
