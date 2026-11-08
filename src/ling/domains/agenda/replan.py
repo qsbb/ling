@@ -1271,12 +1271,96 @@ def _notice(decision: str | None, reason_code: str | None) -> str:
     """给用户看的一句话（不含原文、不含内部 id）。
 
     设计 §4："超预算后用确定性答复'现在不重新安排/晚些再决定'，不得假称同意"。
+
+    **这句话是审计用的**：它把原因码原样带出来（``这次不去了（sleep_window）``），
+    便于在行为日志里回答"为什么没改"。真正说给用户听的那一句在
+    :func:`notice_for`（原因码不进聊天）。
     """
     if decision == "accept":
         return "好，那就去；时间轴已经改过来了。"
     if decision == "decline":
         return f"这次不去了（{reason_code or '不想去'}），安排不变。"
     return f"现在不重新安排（{reason_code or '时机不合适'}），今天的时间轴没有改动。"
+
+
+# ---------------------------------------------------------------- 回一句话
+#
+# 缺口（设计 §4 把这条列为**最大的产品级缺口**）：一次临时提议被拒绝或被推迟
+# 时，原来只往 `schedule_change_requests` 与行为日志里记一笔，用户那边**一点
+# 回话都没有**——提议像掉进了黑洞，看起来和"她没听见"一模一样。
+#
+# 下面这段文案**全部是代码固定的**，三条理由：
+#
+# 1. **回一句"这次没改"不需要调模型**：为一句固定短话花一次调用、一份预算，
+#    还会让同一句话每次都不同；
+# 2. **也不能让模型自由发挥**：它很容易顺势承诺"明天一定去"——**计划不是
+#    事实**，没排进时间轴的事不能先说出来；
+# 3. **不提预算/额度/token**：用户关心的是"安排动了没有"，不是我们的账本；
+#    说出账本也解释不了为什么"这次"不行。
+REPLAN_NOTICE_MAX_CHARS = 30
+
+# 每个原因码一句。**同一族的门用同一句话**：频率/预算那三个闸、模型那几个
+# 故障，对用户来说是同一件事（"今天不重排"/"这次没改成"），分开说只会把
+# 内部机制漏进聊天。
+REPLAN_NOTICE_TEXTS: dict[str, str] = {
+    # —— 硬门：她自己此刻不可用（不是不想理你）——
+    REASON_SLEEP_WINDOW: "这个点我该睡了，今天先不折腾",
+    REASON_REST_WINDOW: "那个点我该睡了，先不动了",
+    REASON_COMMITMENT_CONFLICT: "那个时间我答应过别的事，不挪了",
+    REASON_ACTIVITY_RUNNING: "手上这件事还没完，先不改安排",
+    REASON_LOW_ENERGY: "今天有点累，不想再挪了",
+    # —— 硬门：这句话还不算"要改计划"（问句/否定/假设）——
+    REASON_AMBIGUOUS_QUESTION: "这句我先当聊天，安排不动",
+    REASON_AMBIGUOUS_NEGATION: "这句我先当聊天，安排不动",
+    REASON_AMBIGUOUS_HYPOTHETICAL: "这句我先当聊天，安排不动",
+    # —— 改不动：没有可改的时间轴、空档太小、跨日超出局部范围 ——
+    REASON_PLAN_MISSING: "今天的安排还没排好，先不改了",
+    REASON_CROSS_MIDNIGHT_MISSING: "另一天的安排还没排好，先不改了",
+    REASON_SCOPE_TOO_SMALL: "这会儿腾不出空档，先不改了",
+    # —— 频率与预算：对用户是同一件事 ——
+    REASON_WINDOW_HOURLY_LIMIT: "今天安排就不动了",
+    REASON_DAILY_LIMIT: "今天安排就不动了",
+    REASON_BUDGET_EXHAUSTED: "今天安排就不动了",
+    # —— 模型侧故障 / 版本冲突：对用户也是同一件事 ——
+    REASON_MODEL_UNAVAILABLE: "这次没改成，回头再说",
+    REASON_MODEL_INVALID: "这次没改成，回头再说",
+    REASON_MODEL_ERROR: "这次没改成，回头再说",
+    REASON_STALE_REVISION: "这次没改成，回头再说",
+}
+
+# 原因码落在上表之外时怎么办。两种结局**必须分开**：
+# - ``declined`` 是"她不想去"（例如模型自己 decline 并给了自己的原因码），
+#   说"没改成"会把她的选择说成技术故障；
+# - ``deferred`` 是"现在动不了"，说"不去了"等于替她拒绝。
+# 模型给的 ``reason_code`` 是任意短标识，我们**不猜它什么意思**，走兜底。
+_NOTICE_DECLINED_FALLBACK = "这次就不去了，安排照旧"
+_NOTICE_DEFERRED_FALLBACK = "这次没改成，回头再说"
+
+
+def notice_for(outcome: ReplanOutcome) -> str | None:
+    """这次要不要**回一句话**；要的话是哪一句（纯函数，零 IO）。
+
+    ## 什么时候不说
+
+    只对真的**提过建议**、而且**没改成**的轮次回话：
+
+    - ``no_proposal``：绝大多数闲聊走这里。她本来就在聊天，再补一句
+      "没改计划"只是噪声，一句话都不能多；
+    - ``accepted``：她这一轮的回复本来就在谈这件事，时间轴也已经改好；
+    - ``duplicate``：同一 ``turn_id`` 已经回过一次。幂等键就是 ``turn_id``，
+      重复消费**不许再回一条**（否则重投会把同一句话刷两遍）。
+
+    其余（``declined`` / ``deferred``）各回一句——"拒绝/推迟"必须让用户听见，
+    而"记账"只有我们自己看得见。
+    """
+    if outcome.state not in ("declined", "deferred"):
+        return None
+    text = REPLAN_NOTICE_TEXTS.get(str(outcome.reason_code or ""))
+    if text is not None:
+        return text
+    if outcome.state == "declined":
+        return _NOTICE_DECLINED_FALLBACK
+    return _NOTICE_DEFERRED_FALLBACK
 
 
 async def _claim_decision(
@@ -1962,6 +2046,8 @@ __all__ = [
     "REPLAN_MAX_SEGMENTS",
     "REPLAN_MIN_ENERGY",
     "REPLAN_MIN_SCOPE_MINUTES",
+    "REPLAN_NOTICE_MAX_CHARS",
+    "REPLAN_NOTICE_TEXTS",
     "REPLAN_PROFILE",
     "REPLAN_RESERVED_INPUT_TOKENS",
     "REPLAN_RESERVED_OUTPUT_TOKENS",
@@ -1975,6 +2061,7 @@ __all__ = [
     "check_limits",
     "detect_proposal",
     "evaluate_gates",
+    "notice_for",
     "note_schedule_proposal",
     "parse_replan_output",
     "parse_requested_window",

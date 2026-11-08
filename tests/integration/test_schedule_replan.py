@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timedelta
+import logging
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
-from ling.domains.agenda.replan import replan_work
+from ling.domains.agenda.replan import REPLAN_NOTICE_TEXTS, replan_work
 from ling.domains.agenda.timeline import (
     ScopedDraft,
     ScopeEdit,
@@ -44,15 +45,19 @@ from ling.infra.models import (
     BehaviorModelCallRow,
     CommitmentRow,
     DayPlanRow,
+    Message,
+    Operation,
     OutboxEvent,
     PresenceState,
     ScheduleChangeRequestRow,
     ScheduleIntentionRow,
     ScheduleSegmentRow,
     SelfExperienceRow,
+    Window,
 )
 from ling.infra.security import new_id
 from ling.models.router import StreamOutcome
+from ling.ports.channel import ChannelError, ChannelErrorKind
 from ling.ports.config import (
     EffectiveConfig,
     ProfileBinding,
@@ -1488,3 +1493,528 @@ async def test_timeline_endpoint_shows_the_plan_was_changed(logged_in: TestEnv) 
     assert "看电影" in titles
     assert "赶稿" not in titles, "被替代的段不该还画在当前时间轴上"
     assert str(body["segments"][0]["plan_id"]) == ids["plan"]
+
+
+# ---------------------------------------------------------------- 回一句话
+#
+# 缺口：拒绝/推迟一次临时提议时，原来只往 `schedule_change_requests` 与行为
+# 日志里记一笔，**用户收不到任何回话**——提议像掉进了黑洞。下面这组用例钉住
+# 补上的那一层：
+#
+# - 说不说：只有 `declined`/`deferred` 才回；闲聊与"已经改了"一个字都不多说；
+# - 说什么：按原因码给固定短句（`REPLAN_NOTICE_TEXTS`）；
+# - 怎么送达：先落库（Web 能看到），有可主动推送的渠道再真发；
+#   没有渠道就只落库并记 `web_only`，**不声称发送**；
+# - 幂等与失败隔离：同一 `turn_id` 只回一条；投递炸了主线不受影响。
+#
+# 一律走**真正的 handler**（`handle_schedule_replan`）而不是直接调
+# `replan_work`——回话就在 handler 里，绕过去等于没测。
+
+
+class _NoticeConnector:
+    """最小渠道连接器：记录出站消息，可选地"发的时候炸"。
+
+    `supports_proactive=True` 是必需的：回话走主动投递口径
+    （`require_proactive=True`），和承诺到期提醒同一条路。
+    """
+
+    connector_id = "onebot"
+    instance_id = "onebot-notice-test"
+
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.sent: list[object] = []
+        self.attempts = 0
+        self._error = error
+
+    def capabilities(self):  # noqa: ANN201
+        from ling.contracts.v1 import CapabilityDescriptor
+
+        return CapabilityDescriptor(
+            capability_id="fake-notice",
+            version="1",
+            supports_private=True,
+            supports_group=True,
+            supports_proactive=True,
+            max_text_length=4000,
+            enabled=True,
+        )
+
+    async def send(self, message):  # noqa: ANN001, ANN201
+        from ling.contracts.v1 import DeliveryReceipt, DeliveryState
+
+        self.attempts += 1
+        if self._error is not None:
+            raise self._error
+        self.sent.append(message)
+        return DeliveryReceipt(
+            receipt_id=new_id("rcpt"),
+            operation_id=message.operation_id,
+            channel=self.connector_id,
+            state=DeliveryState.delivered,
+            platform_message_id="mid_notice_test",
+            observed_at=datetime.now(UTC),
+        )
+
+
+def _install_channel(
+    monkeypatch: pytest.MonkeyPatch, connector: _NoticeConnector | None
+) -> _NoticeConnector | None:
+    """装/卸"可主动推送的渠道"。
+
+    必须显式替换 `proactive_connector`：开发机 shell 里可能真的配了 OneBot
+    变量，不替换就会对着真实平台发消息（用例也会变成偶发）。
+    """
+    import ling.capabilities.channels as channels_mod
+
+    monkeypatch.setattr(channels_mod, "proactive_connector", lambda: connector)
+    return connector
+
+
+async def _window(
+    *,
+    window_id: str,
+    title: str = "新的对话",
+    channel: str = "web",
+    visibility: str = "subject_private",
+) -> str:
+    async with session_scope() as session:
+        session.add(
+            Window(
+                id=window_id,
+                actor_id=ACTOR,
+                persona_id="persona_ling",
+                subject_id="subject_1",
+                title=title,
+                channel=channel,
+                visibility=visibility,
+                archived=False,
+            )
+        )
+    return window_id
+
+
+async def _seed_user_turn(*, turn_id: str, window_id: str, text: str) -> str:
+    """一条用户消息：handler 按 `turn_id` 回读用户原话（outbox 里不存正文）。"""
+    message_id = new_id("msg")
+    async with session_scope() as session:
+        session.add(
+            Message(
+                id=message_id,
+                window_id=window_id,
+                turn_id=turn_id,
+                role="user",
+                text=text,
+                state="completed",
+                sequence=1,
+                origin="user_statement",
+            )
+        )
+    return message_id
+
+
+async def _seed_replan_call(
+    *, window_id: str, at: datetime, reserved_input: int = 0
+) -> None:
+    """伪造"这个窗口/这一计划日已经重排过"——频率与预算两道闸的输入。"""
+    async with session_scope() as session:
+        session.add(
+            BehaviorModelCallRow(
+                id=new_id("bcal"),
+                actor_id=ACTOR,
+                plan_day=DAY,
+                kind="replan",
+                window_id=window_id,
+                idempotency_key=f"seed-{new_id('k')}",
+                attempt=1,
+                state="reserved",
+                reserved_input_tokens=reserved_input,
+                reserved_output_tokens=0,
+                lease_owner="seed",
+                lease_until=None,
+                created_at=at,
+                updated_at=at,
+            )
+        )
+
+
+async def _handle_replan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: datetime,
+    turn_id: str,
+    window_id: str,
+    responses: list[str] | None = None,
+):  # noqa: ANN202
+    """走生产 handler：冻结"现在"，可选装模型。
+
+    不传 `responses` 就不装模型路由——"拒绝/超限分支一次模型都不该调"因此
+    可以靠"没有可调的东西"来验证，而不是只靠调用计数。
+    """
+    from ling import worker
+
+    monkeypatch.setattr(worker, "utcnow", lambda: now)
+    # 时区解析的唯一入口是 DB 偏好 > env > 默认；这里钉住 env 那一层。
+    monkeypatch.setenv("LING_USER_TIMEZONE", TZ)
+    stub = None
+    if responses is not None:
+        stub = _StubRouter(responses)
+        monkeypatch.setattr(worker, "_MEMORY_ROUTER", stub)
+        monkeypatch.setattr(
+            worker, "_config_reader", lambda session: _StubConfig(_config())
+        )
+    await worker.handle_schedule_replan(
+        {"actor_id": ACTOR, "turn_id": turn_id, "window_id": window_id}
+    )
+    return stub
+
+
+async def _actor_messages(window_id: str) -> list[Message]:
+    async with session_scope() as session:
+        return list(
+            (
+                await session.execute(
+                    select(Message)
+                    .where(Message.window_id == window_id, Message.role == "actor")
+                    .order_by(Message.sequence)
+                )
+            ).scalars()
+        )
+
+
+def _notice_events(caplog: pytest.LogCaptureFixture) -> list[dict]:
+    """这一轮 `replan_notice` 行为事件的 attributes（按出现顺序）。
+
+    `emit_event` 把整份 payload 塞在 record.attributes 里，业务字段在它的
+    嵌套 ``attributes`` 下——和读面板日志时看到的形状一致。
+    """
+    events: list[dict] = []
+    for record in caplog.records:
+        if record.name != "ling.behavior":
+            continue
+        if getattr(record, "event_name", "") != "replan_notice":
+            continue
+        payload = getattr(record, "attributes", {}) or {}
+        events.append(dict(payload.get("attributes") or payload))
+    return events
+
+
+async def test_declined_turn_gets_one_reply_on_web(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """被拒绝的一次提议：她**回一句**、落库到同一个窗口；没有渠道时只说 web_only。"""
+    await _seed_routine(rest=22 * 60)
+    await _seed_plan()
+    window_id = await _window(window_id="win-notice-web")
+    await _seed_user_turn(
+        turn_id="turn-notice-web", window_id=window_id, text="我们去看电影吧"
+    )
+    _install_channel(monkeypatch, None)
+
+    with caplog.at_level(logging.INFO):
+        await _handle_replan(
+            monkeypatch,
+            now=_at(23 * 60 + 30),  # 睡眠窗内 → decline，且不该调模型
+            turn_id="turn-notice-web",
+            window_id=window_id,
+        )
+
+    messages = await _actor_messages(window_id)
+    assert len(messages) == 1, "拒绝了一次提议，却没有一句回话"
+    assert messages[0].text == REPLAN_NOTICE_TEXTS["sleep_window"]
+    assert messages[0].origin == "simulated", "这是她说的一句话"
+    assert messages[0].turn_id is None, (
+        "不能挂在同一个 turn_id 上：那一轮她的正文已经在库里，"
+        "多一条会让「续发/对账取这一轮正文」取到这句回话"
+    )
+
+    # 决定照旧记在账上：回话不是决定本身，也不能替代它
+    requests = await _change_requests()
+    assert [(row.decision, row.reason_code) for row in requests] == [
+        ("decline", "sleep_window")
+    ]
+
+    events = _notice_events(caplog)
+    assert len(events) == 1, events
+    assert events[0]["delivery"] == "web_only"
+    assert events[0]["reason_code"] == "sleep_window"
+    assert events[0]["stage"] == "done"
+    assert events[0]["message_id"] == messages[0].id, "事件要指回那条消息"
+
+
+async def test_declined_turn_is_really_delivered_when_a_channel_exists(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """有可主动推送的渠道：这句话真的发到**这个窗口**的平台 ref，并记 sent。"""
+    await _seed_routine(rest=22 * 60)
+    await _seed_plan()
+    ref = "onebot-x:private:10001"
+    window_id = await _window(
+        window_id="win-notice-qq", title=ref, channel="onebot"
+    )
+    await _seed_user_turn(
+        turn_id="turn-notice-qq", window_id=window_id, text="我们去看电影吧"
+    )
+    connector = _NoticeConnector()
+    _install_channel(monkeypatch, connector)
+
+    with caplog.at_level(logging.INFO):
+        await _handle_replan(
+            monkeypatch,
+            now=_at(23 * 60 + 30),
+            turn_id="turn-notice-qq",
+            window_id=window_id,
+        )
+
+    assert connector.attempts == 1
+    assert len(connector.sent) == 1
+    sent = connector.sent[0]
+    assert sent.text == REPLAN_NOTICE_TEXTS["sleep_window"]
+    assert sent.window_ref == ref, "收件人必须是窗口的平台标识，不是本地 Window.id"
+    assert sent.is_group is False
+
+    # 本地同样有一条：Web 端不该因为"发到 QQ 了"就看不到这句话
+    assert [item.text for item in await _actor_messages(window_id)] == [
+        REPLAN_NOTICE_TEXTS["sleep_window"]
+    ]
+    events = _notice_events(caplog)
+    assert [(item["delivery"], item["stage"]) for item in events] == [
+        ("sent", "done")
+    ], events
+
+    # 回执与段的幂等身份都留在 operations 里（平台看不到那个 id，本地要查得到）
+    async with session_scope() as session:
+        operations = list((await session.execute(select(Operation))).scalars())
+    assert len(operations) == 1
+    assert operations[0].state == "succeeded"
+    assert operations[0].payload["reply_plan"] == "replan_notice:turn-notice-qq"
+
+
+async def _deferred_reply_case(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    window_id: str,
+    turn_id: str,
+    now: datetime,
+    seeded_window_id: str,
+    reserved_input: int,
+) -> list[Message]:
+    """跑一次"被频率/预算闸推迟"的提议，返回落库的消息（断言由调用方做）。"""
+    await _seed_routine()
+    await _seed_day()
+    await _seed_user_turn(
+        turn_id=turn_id, window_id=window_id, text="我们七点去看电影吧"
+    )
+    # 频率闸看"同一个窗口"，预算闸看"同一计划日"——一条"已经重排过"的记录
+    # 分别命中它们。
+    await _seed_replan_call(
+        window_id=seeded_window_id, at=now - timedelta(minutes=20),
+        reserved_input=reserved_input,
+    )
+    _install_channel(monkeypatch, None)
+    with caplog.at_level(logging.INFO):
+        await _handle_replan(
+            monkeypatch, now=now, turn_id=turn_id, window_id=window_id
+        )
+    return await _actor_messages(window_id)
+
+
+async def test_deferred_reply_for_window_hourly_limit(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """被"这个窗口一小时只一次"推迟：她照样回一句，只说"今天安排就不动了"。"""
+    window_id = await _window(window_id="win-notice-hourly")
+    messages = await _deferred_reply_case(
+        monkeypatch,
+        caplog,
+        window_id=window_id,
+        turn_id="turn-notice-hourly",
+        now=_at(18 * 60 + 30),
+        # 同一个窗口一小时内的重排记录 = 撞上频率闸
+        seeded_window_id=window_id,
+        reserved_input=0,
+    )
+    assert [item.text for item in messages] == ["今天安排就不动了"]
+    requests = await _change_requests()
+    assert [(row.decision, row.reason_code) for row in requests] == [
+        ("defer", "window_hourly_limit")
+    ]
+    events = _notice_events(caplog)
+    assert [(item["reason_code"], item["delivery"], item["stage"]) for item in events] == [
+        ("window_hourly_limit", "web_only", "done")
+    ], events
+
+
+async def test_deferred_reply_for_budget_exhausted(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """被"今天重排的额度用完了"推迟：说的还是**同一句**（账本不进聊天）。"""
+    window_id = await _window(window_id="win-notice-budget")
+    messages = await _deferred_reply_case(
+        monkeypatch,
+        caplog,
+        window_id=window_id,
+        turn_id="turn-notice-budget",
+        now=_at(18 * 60 + 30),
+        # 别的窗口 + 两小时前：避开频率闸与"每小时"口径，只撞预算
+        seeded_window_id="win-elsewhere",
+        reserved_input=2400,
+    )
+    assert [item.text for item in messages] == ["今天安排就不动了"]
+    assert REPLAN_NOTICE_TEXTS["budget_exhausted"] == REPLAN_NOTICE_TEXTS[
+        "window_hourly_limit"
+    ], "频率闸与预算闸对用户是同一件事，分开说就把内部账本漏进聊天了"
+    requests = await _change_requests()
+    assert [(row.decision, row.reason_code) for row in requests] == [
+        ("defer", "budget_exhausted")
+    ]
+    events = _notice_events(caplog)
+    assert [(item["reason_code"], item["delivery"], item["stage"]) for item in events] == [
+        ("budget_exhausted", "web_only", "done")
+    ], events
+
+
+async def test_plain_chat_and_accepted_turns_get_no_reply(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """闲聊与"已经改了"：**一条回话都不产生**（多一句就是噪声）。"""
+    # ① 闲聊：连候选都不是
+    await _seed_routine()
+    ids = await _seed_day()
+    chat_window = await _window(window_id="win-notice-chat")
+    await _seed_user_turn(
+        turn_id="turn-notice-chat", window_id=chat_window, text="今天天气不错"
+    )
+    connector = _NoticeConnector()
+    _install_channel(monkeypatch, connector)
+    await _handle_replan(
+        monkeypatch,
+        now=_at(18 * 60 + 30),
+        turn_id="turn-notice-chat",
+        window_id=chat_window,
+    )
+    assert await _actor_messages(chat_window) == []
+    assert connector.attempts == 0
+    assert await _change_requests() == []
+
+    # ② 接受：计划真的改了，但她这一轮的回复本来就在谈这件事
+    accept_window = await _window(
+        window_id="win-notice-accept",
+        title="onebot-x:private:10002",
+        channel="onebot",
+    )
+    await _seed_user_turn(
+        turn_id="turn-notice-accept",
+        window_id=accept_window,
+        text="我们七点去看电影吧",
+    )
+    await _handle_replan(
+        monkeypatch,
+        now=_at(18 * 60 + 40),
+        turn_id="turn-notice-accept",
+        window_id=accept_window,
+        responses=[_reply(spans=[(19 * 60, 21 * 60)])],
+    )
+    plan = await _plan_row(ids["plan"])
+    assert plan.revision == 2, "接受没有生效，这条用例就没测到点上"
+    assert await _actor_messages(accept_window) == [], "已经改好了还要回一句是噪声"
+    assert connector.attempts == 0
+
+
+async def test_same_turn_replies_exactly_once(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 `turn_id` 重复消费：消息 1 条、连接器只被调 1 次。
+
+    两层都要挡住：第二次消费时 `replan_work` 返回 `duplicate`（决定层），
+    即使把决定记录清掉重跑，回话层自己的认领也不许再发第二条。
+    """
+    await _seed_routine(rest=22 * 60)
+    await _seed_plan()
+    window_id = await _window(
+        window_id="win-notice-once", title="onebot-x:private:10003", channel="onebot"
+    )
+    await _seed_user_turn(
+        turn_id="turn-notice-once", window_id=window_id, text="我们去看电影吧"
+    )
+    connector = _NoticeConnector()
+    _install_channel(monkeypatch, connector)
+
+    kwargs = {
+        "now": _at(23 * 60 + 30),
+        "turn_id": "turn-notice-once",
+        "window_id": window_id,
+    }
+    await _handle_replan(monkeypatch, **kwargs)
+    await _handle_replan(monkeypatch, **kwargs)  # 重复消费 → duplicate → 不回
+
+    assert len(await _actor_messages(window_id)) == 1
+    assert connector.attempts == 1
+    assert len(await _change_requests()) == 1, "重复消费不该再记一次决定"
+
+    # 把决定记录清掉再跑：这次连 duplicate 都没有，只靠回话层的认领挡
+    async with session_scope() as session:
+        await session.execute(delete(ScheduleChangeRequestRow))
+    await _handle_replan(monkeypatch, **kwargs)
+
+    assert len(await _actor_messages(window_id)) == 1, "同一轮说出了第二句回话"
+    assert connector.attempts == 1, "重复消费把同一句话又发了一遍"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ChannelError(ChannelErrorKind.uncertain, "网关超时"), "uncertain"),
+        (ChannelError(ChannelErrorKind.rejected, "平台拒收"), "failed"),
+        (RuntimeError("连接器崩了"), "failed"),
+    ],
+)
+async def test_delivery_failure_never_fails_the_job(
+    web_env: TestEnv,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: BaseException,
+    expected: str,
+) -> None:
+    """投递炸了：作业不失败、决定照旧、本地照样有这句话，**不重发**。"""
+    await _seed_routine(rest=22 * 60)
+    await _seed_plan()
+    window_id = await _window(
+        window_id="win-notice-boom", title="onebot-x:private:10004", channel="onebot"
+    )
+    await _seed_user_turn(
+        turn_id="turn-notice-boom", window_id=window_id, text="我们去看电影吧"
+    )
+    connector = _NoticeConnector(error=error)
+    _install_channel(monkeypatch, connector)
+
+    with caplog.at_level(logging.INFO):
+        # 不抛就是第一层验收：回话失败不许让整个 replan 作业失败
+        await _handle_replan(
+            monkeypatch,
+            now=_at(23 * 60 + 30),
+            turn_id="turn-notice-boom",
+            window_id=window_id,
+        )
+
+    assert connector.attempts == 1, "不确定/失败都不许重发"
+    assert await _actor_messages(window_id), "投递失败不该把本地那句话一起丢掉"
+    requests = await _change_requests()
+    assert [(row.decision, row.reason_code) for row in requests] == [
+        ("decline", "sleep_window")
+    ], "投递失败影响了 replan 的决定记录"
+    events = _notice_events(caplog)
+    assert [(item["delivery"], item["stage"]) for item in events] == [
+        (expected, "deliver")
+    ], events
+

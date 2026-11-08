@@ -13,11 +13,15 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ling.domains.agenda.replan import (
+    REPLAN_NOTICE_MAX_CHARS,
+    REPLAN_NOTICE_TEXTS,
     GateVerdict,
     ProposalSignal,
+    ReplanOutcome,
     ReplanValidationError,
     build_replan_prompt,
     detect_proposal,
+    notice_for,
     parse_replan_output,
     parse_requested_window,
     validate_replan_segments,
@@ -348,3 +352,127 @@ def test_prompt_tells_the_model_what_it_may_not_touch() -> None:
     )
     assert "赶稿" in prompt, "可换的段要列出来（她得知道现在排了什么）"
     assert "吃饭" in prompt and "不能碰" in prompt
+
+
+# ---------------------------------------------------------------- 回话文案
+#
+# 缺口：拒绝/推迟一次提议时用户收不到任何回话。`notice_for` 就是那句回话，
+# 它必须是**固定、诚实、短**的：为一句固定短话调模型是浪费，说内部机制是
+# 泄漏，承诺新安排是撒谎（计划不是事实）。
+
+# 走到 `declined` / `deferred` 的全部原因码。**一个都不能漏**：新增一道硬门
+# 却忘了写文案时，下面那条"覆盖恰好相等"的用例会红。
+REACHABLE_REASONS = (
+    # 硬门：她自己不可用
+    "sleep_window",
+    "rest_window",
+    "commitment_conflict",
+    "activity_running",
+    "low_energy",
+    # 硬门：这话还不算"要改计划"
+    "ambiguous_question",
+    "ambiguous_negation",
+    "ambiguous_hypothetical",
+    # 改不动
+    "plan_missing",
+    "cross_midnight_plan_missing",
+    "scope_too_small",
+    # 频率与预算
+    "window_hourly_limit",
+    "daily_limit",
+    "budget_exhausted",
+    # 模型侧 / 版本冲突
+    "model_unavailable",
+    "model_invalid",
+    "model_error",
+    "stale_revision",
+)
+
+# 不能出现在**给用户**的话里的词：那是我们的账本和内部机制。
+FORBIDDEN_IN_NOTICE = (
+    "预算",
+    "额度",
+    "token",
+    "Token",
+    "模型",
+    "频率",
+    "限流",
+    "预算耗尽",
+    "重排",
+)
+
+# 承诺式措辞：计划不是事实，没排进时间轴的事不能先说出去。
+PROMISE_WORDS = ("一定", "肯定", "保证", "明天", "改天", "下次", "maybe", "probably")
+
+
+def _notice(state: str, reason: str | None) -> str | None:
+    return notice_for(ReplanOutcome(state=state, turn_id="turn-1", reason_code=reason))
+
+
+def test_no_notice_for_plain_chat_accepted_or_replayed() -> None:
+    """闲聊、已经改了、以及同一轮的重复消费，都**一个字都不回**。"""
+    for state in ("no_proposal", "accepted", "duplicate"):
+        for reason in (None, *REACHABLE_REASONS):
+            assert _notice(state, reason) is None, (state, reason)
+
+
+def test_every_reachable_reason_has_a_notice() -> None:
+    """每个能走到"拒绝/推迟"的原因码都有固定文案，且表里没有多余/错拼的键。"""
+    assert set(REPLAN_NOTICE_TEXTS) == set(REACHABLE_REASONS)
+
+
+@pytest.mark.parametrize("reason", REACHABLE_REASONS)
+def test_notice_is_short_and_free_of_internal_words_and_promises(reason: str) -> None:
+    """一句话、≤30 字；不含内部词；不承诺任何新安排；不漏原因码。"""
+    text = _notice("deferred", reason)
+    assert text, reason
+    assert text == _notice("declined", reason), "同一个门不管拒绝还是推迟都说同一句"
+    assert len(text) <= REPLAN_NOTICE_MAX_CHARS, text
+    assert len(text) >= 4, "短到读不懂也不算好文案"
+    # 内部词：预算/额度/token/模型/频率……
+    for word in FORBIDDEN_IN_NOTICE:
+        assert word not in text, (reason, word, text)
+    # 承诺：不能替她答应任何以后的事
+    for word in PROMISE_WORDS:
+        assert word not in text, (reason, word, text)
+    # 原因码本身漏进聊天（例如 "sleep_window"）就是机制泄漏
+    assert reason.replace("_", "") not in text.replace("_", "")
+    assert not any(char.isascii() and char.isalpha() for char in text), text
+
+
+def test_same_family_reasons_share_one_sentence() -> None:
+    """对用户是同一件事的门就说同一句：频率/预算三个闸、模型四种故障。"""
+    rate = {_notice("deferred", reason) for reason in (
+        "window_hourly_limit",
+        "daily_limit",
+        "budget_exhausted",
+    )}
+    assert len(rate) == 1, rate
+    model = {_notice("deferred", reason) for reason in (
+        "model_unavailable",
+        "model_invalid",
+        "model_error",
+        "stale_revision",
+    )}
+    assert len(model) == 1, model
+    # 而不同族的说法必须**不同**（否则用户分不清"该睡了"和"没改成"）
+    assert rate != model
+    assert len({_notice("deferred", reason) for reason in REACHABLE_REASONS}) >= 6
+
+
+def test_unknown_reason_falls_back_by_decision_not_by_guess() -> None:
+    """模型自己给的原因码不在表里：按**决定**兜底，不猜它什么意思。
+
+    `declined` 是"她不想去"，`deferred` 是"现在动不了"——把两者说成同一句，
+    等于要么把她的选择说成技术故障，要么替她拒绝。
+    """
+    declined = _notice("declined", "feels_wrong")
+    deferred = _notice("deferred", "weird_code")
+    assert declined and deferred and declined != deferred
+    # 她的选择不能被说成技术故障；"现在动不了"也不能被说成"她不去"
+    assert "没改成" not in declined, declined
+    assert "不去" not in deferred, deferred
+    # 没有原因码也一样（`ReplanOutcome.reason_code` 允许 None）
+    assert _notice("declined", None) == declined
+    assert _notice("deferred", None) == deferred
+
