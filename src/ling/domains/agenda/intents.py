@@ -488,7 +488,8 @@ def _clean_code(value: str | None, *, label: str = "reason_code") -> str:
     return _clean_text(value, label=label, limit=MAX_CODE_CHARS)
 
 
-def _append_unique(existing: object, *values: str) -> list[str]:
+def _append_unique(existing: Sequence[object] | None, *values: str) -> list[str]:
+    """往段的 ``source_event_ids``（``JSON`` 列，读出来是列表）里追加去重后的值。"""
     items = [str(item) for item in (existing or [])]
     for value in values:
         text = str(value or "").strip()

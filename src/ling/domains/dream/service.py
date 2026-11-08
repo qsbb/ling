@@ -309,7 +309,7 @@ def parse_dream_payload(
     cue_sources: Mapping[str, str],
     planned_transforms: Sequence[str],
     threat: ThreatPlan,
-    source_texts: Sequence[str] = (),
+    source_texts: list[str] | tuple[str, ...] = (),
 ) -> DreamDraft:
     """严格解析模型输出：只接受设计 §5 的六字段 JSON。
 
@@ -974,18 +974,18 @@ class DreamService:
                 )
             ).scalars()
         )
-        for row in commitments:
+        for commitment in commitments:
             # 承诺原文不进程 prompt：只留"有一件没做到的事"这个碎片。
             out.append(
                 Candidate(
-                    cue_id=f"cue:commitment:{row.id}",
+                    cue_id=f"cue:commitment:{commitment.id}",
                     kind="unfinished",
                     provenance="commitment",
-                    source_ref=f"commitment:{row.id}",
-                    occurred_at=_aware(row.due_at),
+                    source_ref=f"commitment:{commitment.id}",
+                    occurred_at=_aware(commitment.due_at),
                     as_tuple=CueTuple(person="一个约好的人", action="没做到的事"),
                     unfinished=1.0,
-                    text_hint=str(row.text or ""),
+                    text_hint=str(commitment.text or ""),
                 )
             )
         return out

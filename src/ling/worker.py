@@ -3407,6 +3407,10 @@ async def handle_schedule_refine(payload: dict) -> None:
         outcome.calls,
         outcome.reason_code or "",
     )
+    # 目标日是"本次实际细化的那天"，取不到才退回请求里带的那天。
+    # 提成一个变量只是为了让下面能先判空再取值：写成
+    # `(outcome.plan_day or plan_day).isoformat()` 时类型仍是 `date | None`。
+    target_plan_day = outcome.plan_day or plan_day
     behavior_event(
         "schedule_refined" if outcome.state == "refined" else "schedule_refine_skipped",
         (
@@ -3418,9 +3422,7 @@ async def handle_schedule_refine(payload: dict) -> None:
         outcome="ok" if outcome.state in ("refined", "unchanged", "no_target") else "skip",
         attributes={
             "actor_id": actor_id,
-            "target_plan_day": (outcome.plan_day or plan_day).isoformat()
-            if (outcome.plan_day or plan_day)
-            else "",
+            "target_plan_day": target_plan_day.isoformat() if target_plan_day else "",
             "state": outcome.state,
             "parent_id": outcome.parent_id or "",
             "window_start": outcome.window_start.isoformat()

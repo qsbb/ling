@@ -32,6 +32,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
@@ -39,6 +40,11 @@ from ling.capabilities.delivery import DeliveryService, reconcile_due
 from ling.contracts.v1 import OperationState
 from ling.infra.db import session_scope
 from ling.infra.models import Message, Operation
+
+if TYPE_CHECKING:
+    # 只在注解里用：`ling.ports.channel` 是这个模块的下游依赖，
+    # 运行时导入没有意义（本模块的函数体里按需导入它）。
+    from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.domains.goals.delivery_reconcile")
 
@@ -185,7 +191,10 @@ async def _settle_pending(
 
 async def reconcile_deliveries(
     *,
-    connector_for: Callable[[str], Awaitable[object] | object | None],
+    # 值的真实契约：一个渠道连接器（`DeliveryService.reconcile/deliver` 要的
+    # 就是 `ChannelConnector`），同步返回或协程返回都可以，拿不到给 None。
+    # 原来写成 `object`，等于把"它到底是什么"丢给了调用处。
+    connector_for: Callable[[str], Awaitable[ChannelConnector] | ChannelConnector | None],
     limit: int = RECONCILE_BATCH,
     pause: Callable[[float], Awaitable[None]] | None = None,
     now: datetime | None = None,
@@ -282,7 +291,7 @@ async def reconcile_deliveries(
             try:
                 async with session_scope() as session:
                     outcome = await DeliveryService(session).deliver(
-                        connector=connector,  # type: ignore[arg-type]
+                        connector=connector,
                         message=OutboundMessage(
                             operation_id=f"op_resume_{index}",
                             window_ref=window_ref,
@@ -349,9 +358,9 @@ async def _pending_age_seconds(operation_id: str, *, moment: datetime) -> float:
 
 
 async def _resolve(
-    connector_for: Callable[[str], Awaitable[object] | object | None],
+    connector_for: Callable[[str], Awaitable[ChannelConnector] | ChannelConnector | None],
     channel: str,
-) -> object | None:
+) -> ChannelConnector | None:
     if not channel:
         return None
     with contextlib.suppress(Exception):

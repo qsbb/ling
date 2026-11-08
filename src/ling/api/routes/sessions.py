@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
@@ -45,7 +46,9 @@ class MessagesOut(BaseModel):
     active_turn: dict | None = None
 
 
-async def _group_display_names(request: Request, windows: list) -> dict[str, str | None]:
+async def _group_display_names(
+    request: Request, windows: Sequence[Window]
+) -> dict[str, str | None]:
     """给群窗口补上**群名**（采集不到就是 ``None``）。
 
     ## 为什么在接口层做，不在入站路径做
@@ -62,7 +65,10 @@ async def _group_display_names(request: Request, windows: list) -> dict[str, str
     找不到、或这个连接器没有采集能力（web 窗口 / 测试桩），返回 ``{}``：
     前端按 ``channel`` + ``peer_id`` 自己回退，功能不受影响。
     """
-    plan: dict[str, tuple[object, str]] = {}
+    # 值里存的是**绑定方法本身**（不是它返回的结果）：先攒齐再一次性
+    # `gather`，所以这里必须写成可调用的类型。写成 `object` 会让下面
+    # `fetch(peer)` 变成"对着 object 调用"。
+    plan: dict[str, tuple[Callable[[str], Awaitable[str | None]], str]] = {}
     for window in windows:
         channel, kind, peer_id = window_target(window)
         if kind != "group" or not peer_id:
@@ -87,7 +93,7 @@ async def _group_display_names(request: Request, windows: list) -> dict[str, str
 
 
 async def _display_names(
-    request: Request, conversation: ConversationService, windows: list
+    request: Request, conversation: ConversationService, windows: Sequence[Window]
 ) -> dict[str, str | None]:
     """会话的**人话名字**：群窗口靠采集，私聊窗口靠库里已有的昵称。
 
@@ -106,11 +112,11 @@ async def _display_names(
 
 
 async def _session_record(
-    request: Request, conversation: ConversationService, window: object
+    request: Request, conversation: ConversationService, window: Window
 ) -> SessionRecord:
     names = await _display_names(request, conversation, [window])
     return conversation.to_session_record(
-        window, display_name=names.get(getattr(window, "id", ""))
+        window, display_name=names.get(window.id)
     )
 
 
