@@ -1444,6 +1444,51 @@ async def _group_reply_delivery_enabled(config) -> bool:  # noqa: ANN001
     return bool(effective.dialogue.group_reply_delivery_enabled)
 
 
+@handler("delivery.reconcile")
+async def handle_delivery_reconcile(payload: dict) -> None:  # noqa: ARG001
+    """把"结果未知"和"该发未发"两种投递推进到确定的结局。
+
+    `DeliveryService.reconcile()` 早就写好，但**一直没有生产调用方**
+    （只有测试调它），所以线上 `uncertain` 等于永久悬空——既不会变成已送达，
+    也不会有人再查一次。这条周期任务就是它的调用方
+    （`docs/OUTBOUND-DELIVERY-RESEARCH.md` §5 P0-2）。
+
+    两件事：
+    1. `state='uncertain'` 的投递 → 问平台（`get_msg` / 回显 / 历史内容比对）；
+    2. `kind='delivery.pending'`（生成超时留下的）→ 正文落库之后续发。
+
+    **绝不因为对账失败就重发**：查不到 ≠ 没发出去。
+    """
+    from ling.domains.goals.delivery_reconcile import reconcile_deliveries
+
+    def _connector_for(channel: str):  # noqa: ANN202
+        try:
+            return _group_reply_connector(channel)
+        except Exception as exc:  # noqa: BLE001 - 构造失败只影响这一条
+            logger.warning("对账连接器构造失败（%s）：%s", channel, type(exc).__name__)
+            return None
+
+    report = await reconcile_deliveries(connector_for=_connector_for)
+    if not report.touched:
+        return
+    emit_event(
+        logger,
+        logging.INFO,
+        event_name="delivery_reconciled",
+        message=(
+            f"投递对账：{report.scanned} 条不确定 / {report.pending_scanned} 条待续发"
+        ),
+        attributes={
+            "scanned": report.scanned,
+            "delivered": report.delivered,
+            "still_uncertain": report.still_uncertain,
+            "failed": report.failed,
+            "pending_scanned": report.pending_scanned,
+            "resumed": report.resumed,
+        },
+    )
+
+
 @handler("attention.tick")
 async def handle_attention_tick(payload: dict) -> None:
     """群聊轮询：刷到才看，**一次轮询最多一次决策调用**。
@@ -2643,6 +2688,15 @@ PROACTIVE_DRAFT_SECONDS = 300.0
 # 主动投递：看配置项 proactive_delivery_enabled（默认关）。
 PROACTIVE_DISPATCH_SECONDS = 300.0
 
+# 出站投递对账：把 `operations.state='uncertain'` 与
+# `kind='delivery.pending'`（生成超时留下的"该发未发"）推向收敛。
+#
+# 工程初值 60 秒：uncertain 的投递最晚一分钟内会被查一次；令牌桶式的
+# 每轮上限与条间间隔在 `domains/goals/delivery_reconcile.py` 里
+# （`RECONCILE_BATCH` / `RECONCILE_PAUSE_SECONDS`），这里只管节奏。
+# **独立 topic，不动 `life.schedule` 的主体**：它们互不依赖。
+DELIVERY_RECONCILE_SECONDS = 60.0
+
 
 def _should_run_maintenance(last: float, now: float, *, interval: float | None = None) -> bool:
     return (now - last) >= (interval or MAINTENANCE_INTERVAL_SECONDS)
@@ -3812,6 +3866,14 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
     # `{"shadow": False}`——两次都是硬编码，用户没有开关可选。
     PeriodicJob("attention.tick", handle_attention_tick, {}, ATTENTION_TICK_SECONDS),
     PeriodicJob("embedding.backfill", handle_embedding_backfill, {}, EMBEDDING_BACKFILL_SECONDS),
+    # 出站投递对账 + 续发。**独立 topic**：它只查 operations 表，
+    # 与生活时间轴（life.schedule）互不依赖，不能塞进那边的循环。
+    PeriodicJob(
+        "delivery.reconcile",
+        handle_delivery_reconcile,
+        {},
+        DELIVERY_RECONCILE_SECONDS,
+    ),
     PeriodicJob("intent.tick", handle_intent_tick, {}, PROACTIVE_COLLECT_SECONDS),
     # 生活调度：只查 DB 到期边界（21:00 目标日、00:00 接缝、梦窗口、结算），
     # 到期才把真正干活的作业投进 outbox。**这里不调模型**。

@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import DeliveryState, ErrorCode, OperationState
-from ling.infra.models import DeliveryReceiptRow, Operation, utcnow
+from ling.infra.models import DeliveryReceiptRow, IdempotencyKey, Operation, utcnow
 from ling.infra.security import new_id
 from ling.ports.channel import (
     ChannelConnector,
@@ -23,7 +24,25 @@ from ling.ports.channel import (
     ChannelErrorKind,
     OutboundMessage,
     ReceiptQuery,
+    delivery_text_digest,
 )
+
+# ---------------------------------------------------------------- 段级幂等
+#
+# 幂等键作用域：一条逻辑回复的**第几段**。
+#   IdempotencyKey(scope=PART_SCOPE, key=f"{plan_id}:{ordinal}")
+#   result_ref = 这一段的 operation_id
+#
+# `plan_id` **必须由本轮 turn 派生**（`bridge._deliver` 用 `plan_{turn_id}`），
+# 否则重投会拿到一个新的 plan_id，幂等直接失效——那正是"重投必然重发第 1 段"
+# 的根因（原实现的 plan_id 是 `plan_{uuid4()}`）。
+PART_SCOPE = "delivery_part"
+
+# 对账状态机的工程初值（依据 docs/OUTBOUND-DELIVERY-RESEARCH.md §5 P0-2）。
+# **都没有经过真实 NapCat 长跑验证**，需要按线上观察调整。
+RECONCILE_MAX_ATTEMPTS = 6
+RECONCILE_BACKOFF_SECONDS = (60, 120, 300, 600, 1200, 1800)
+RECONCILE_MAX_AGE_SECONDS = 24 * 3600
 
 
 @dataclass(frozen=True)
@@ -33,6 +52,9 @@ class DeliveryOutcome:
     state: OperationState
     receipt: DeliveryReceiptRow | None
     detail: str
+    # 这一段**没有真的再发一次**：它上一次已经送达（succeeded），
+    # 或还停在 uncertain（等对账）。重投时靠它区分"跳过"与"刚发出去"。
+    skipped: bool = False
 
     @property
     def delivered(self) -> bool:
@@ -94,6 +116,11 @@ class DeliveryService:
         subject_id: str | None,
         require_proactive: bool = False,
         payload_extra: dict | None = None,
+        # 段级幂等：`(plan_id, part_ordinal)` 唯一确定"这一条逻辑回复的第几段"。
+        # 两个都给了才启用；只给一个（或都不给）等于"这一次没有计划身份"，
+        # 退化成老行为（每次都发）——调用方必须自己保证这是有意的。
+        plan_id: str | None = None,
+        part_ordinal: int | None = None,
     ) -> DeliveryOutcome:
         caps = connector.capabilities()
         if not caps.enabled:
@@ -141,6 +168,27 @@ class DeliveryService:
                 message, actor_id, subject_id, detail, error_code=ErrorCode.internal
             )
 
+        # **段级幂等的闸门放在能力校验之后、建 operation 之前。**
+        #
+        # 为什么必须在建 operation 之前：重投（OneBot 超时重发 / 事件认领被
+        # 释放）会重新规划一遍分段。`plan_id` 由 turn 派生、段序号稳定，所以
+        # 同一个 `(plan_id, ordinal)` 就是同一段内容。查这个键就能知道：
+        #   - succeeded → 已经真的发出去过 → **跳过**（重投不许重发第 1 段）
+        #   - uncertain → 可能发出去了 → **不重发**，交给对账（`reconcile`）
+        #   - failed    → 明确没发出去 → 可以再发
+        #   - 其它（running/proposed）= 正在发/上次发到一半 → 当 uncertain
+        #
+        # 为什么必须在能力校验**之后**：渠道不支持 / 文本超限这类"根本没打算
+        # 发"的情况，不该在幂等表里留下一个"这一段可能发过了"的记录——
+        # 那会让以后每一次重投都跳过它（而且是静默的）。
+        claim: IdempotencyKey | None = None
+        if plan_id is not None and part_ordinal is not None:
+            claim, claimed = await self._claim_part(plan_id, part_ordinal)
+            if not claimed:
+                existing = await self._replay_outcome(claim)
+                if existing is not None:
+                    return existing
+
         operation = await self.create_operation(
             kind="delivery",
             actor_id=actor_id,
@@ -157,11 +205,22 @@ class DeliveryService:
                 "media_refs": list(message.media_refs),
                 # 分段信息：一条逻辑回复可能拆成多段，每段一个 operation。
                 # 事后能回答"这条回复发全了吗"。
+                "reply_plan": plan_id,
+                "part_ordinal": part_ordinal,
+                # 对账用：**内容摘要而不是正文**。没有平台 id 的投递只能靠
+                # "平台历史里有没有同文消息"作证据，但把正文抄进 operations
+                # 等于给内容开第二份副本；摘要能比对、不能还原。
+                "text_digest": delivery_text_digest(message.text),
                 **dict(payload_extra or {}),
             },
         )
         operation.state = OperationState.running.value
         await self._session.flush()
+        if claim is not None:
+            # 抢占行要**立刻**记下它对应哪条 operation：重投/对账都要靠
+            # `result_ref` 找回上一段的状态。行本身在 `_claim_part` 里已 flush。
+            claim.result_ref = operation.id
+            await self._session.flush()
 
         # 把本地 operation ID 替进 message，保证 connector 拿到的
         # ``operation_id`` 与刚建的 operation 行是同一个 ID——回执里的
@@ -226,12 +285,90 @@ class DeliveryService:
             detail=receipt.detail or "",
         )
 
-    async def reconcile(self, connector: ChannelConnector, operation_id: str) -> DeliveryOutcome:
-        """对账不确定投递：查平台真实状态，不重发。"""
-        operation = await self._session.get(Operation, operation_id)
+    # ------------------------------------------------------------ 段级幂等
+
+    async def _claim_part(
+        self, plan_id: str, ordinal: int
+    ) -> tuple[IdempotencyKey | None, bool]:
+        """抢占"这一条回复的第 N 段"。返回 `(抢占行, 是否本次抢到)`。
+
+        用现成的 `idempotency_keys` 表（`(scope, key)` 唯一），**不建新表**；
+        它是 MaiBot `OutboundTracker.begin_tracking` 的持久化版本
+        （那是内存态、TTL 30 分钟、重启即失，见调研 §3.3）。
+        """
+        key = f"{plan_id}:{ordinal}"
+        existing = (
+            await self._session.execute(
+                select(IdempotencyKey).where(
+                    IdempotencyKey.scope == PART_SCOPE, IdempotencyKey.key == key
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing, False
+        row = IdempotencyKey(id=new_id("idem"), scope=PART_SCOPE, key=key)
+        self._session.add(row)
+        try:
+            # SAVEPOINT：并发下另一个 worker 可能刚好抢先插入了同一个键。
+            # 唯一约束一炸就把这一次插入单独回滚，不能把外层事务整体标脏。
+            async with self._session.begin_nested():
+                await self._session.flush()
+        except IntegrityError:
+            existing = (
+                await self._session.execute(
+                    select(IdempotencyKey).where(
+                        IdempotencyKey.scope == PART_SCOPE, IdempotencyKey.key == key
+                    )
+                )
+            ).scalar_one_or_none()
+            return existing, False
+        return row, True
+
+    async def _replay_outcome(self, claim: IdempotencyKey | None) -> DeliveryOutcome | None:
+        """重投时看**上一段**发生了什么。返回 None 表示"可以再发"。"""
+        operation: Operation | None = None
+        if claim is not None and claim.result_ref:
+            operation = await self._session.get(Operation, claim.result_ref)
         if operation is None:
-            raise KeyError(f"operation 不存在: {operation_id}")
-        last = (
+            # 抢占行存在、但找不到它对应的 operation：上一次在
+            # "抢占成功、建 operation 之前"中断了。发没发出去无法确认，
+            # 只能按 uncertain 处理——**绝不重发**（重发就是重复消息）。
+            return DeliveryOutcome(
+                operation_id=(claim.result_ref or "") if claim else "",
+                state=OperationState.uncertain,
+                receipt=None,
+                detail="上一次投递在记录 operation 之前中断，结果未知（不重发，等对账）",
+                skipped=True,
+            )
+        try:
+            state = OperationState(operation.state)
+        except ValueError:  # pragma: no cover - 库里出现了未知状态
+            state = OperationState.uncertain
+        if state is OperationState.failed:
+            # 明确失败 = 那一段确实没发出去（连接器只在"确定没发出"时给 failed）。
+            # 允许再发；抢占行会改成指向新的 operation。
+            return None
+        last = await self._latest_receipt(operation.id)
+        if state is OperationState.succeeded:
+            return DeliveryOutcome(
+                operation_id=operation.id,
+                state=state,
+                receipt=last,
+                detail="这一段上一次已送达，跳过（重投不重发已发段）",
+                skipped=True,
+            )
+        # proposed / running / uncertain：都不能重发。running 尤其危险——
+        # 那可能是另一个 worker 正在发，重发就是两条。
+        return DeliveryOutcome(
+            operation_id=operation.id,
+            state=OperationState.uncertain,
+            receipt=last,
+            detail="这一段上一次结果未知（运行中/不确定），不重发，交给对账",
+            skipped=True,
+        )
+
+    async def _latest_receipt(self, operation_id: str) -> DeliveryReceiptRow | None:
+        return (
             await self._session.execute(
                 select(DeliveryReceiptRow)
                 .where(DeliveryReceiptRow.operation_id == operation_id)
@@ -239,18 +376,65 @@ class DeliveryService:
                 .limit(1)
             )
         ).scalar_one_or_none()
+
+    # ------------------------------------------------------------ 对账
+
+    async def reconcile(self, connector: ChannelConnector, operation_id: str) -> DeliveryOutcome:
+        """对账不确定投递：查平台真实状态，**不重发**。
+
+        收敛规则（`docs/OUTBOUND-DELIVERY-RESEARCH.md` §5 P0-2）：
+
+        - 查到 → ``succeeded``（delivered）
+        - 仍不确定 → **保持** ``uncertain``，累加 `reconcile_attempts`、
+          写下一次可重试时间（指数退避）；**绝不因为"查不到"就判失败或重发**
+        - 超过 `RECONCILE_MAX_AGE_SECONDS`（或次数上限）仍未收敛 →
+          标 ``reconcile_expired``（**状态仍是 uncertain**）。这是"我们永远
+          不知道了"，不是"没发出去"：改成 failed 会让上游误判成可重发。
+        - 平台给出**两个独立否证**（连接器只在那种情况下给 ``failed``）→
+          ``failed``。此时仍然**不重发**（重发由调用方明确决定）。
+        """
+        operation = await self._session.get(Operation, operation_id)
+        if operation is None:
+            raise KeyError(f"operation 不存在: {operation_id}")
+        payload = dict(operation.payload or {})
+        last = await self._latest_receipt(operation_id)
         receipt = await connector.query_receipt(
             ReceiptQuery(
                 operation_id=operation_id,
                 platform_message_id=last.platform_message_id if last else None,
+                # 没有平台 id 时的兜底证据：会话 + 内容摘要 + 发出时间。
+                window_ref=payload.get("window_ref"),
+                text_digest=payload.get("text_digest"),
+                sent_at=operation.created_at,
             )
         )
+        attempts = int(payload.get("reconcile_attempts") or 0) + 1
+        now = datetime.now(UTC)
+        expired = _reconcile_expired(operation.created_at, attempts=attempts)
         if receipt.state in {DeliveryState.sent, DeliveryState.delivered}:
             operation.state = OperationState.succeeded.value
+            payload.pop("reconcile_next_at", None)
+            payload["reconciled"] = True
         elif receipt.state is DeliveryState.uncertain:
+            # **保持 uncertain**：既不能算成功，也不能改成可重发的失败态。
             operation.state = OperationState.uncertain.value
+            if expired:
+                payload["reconcile_expired"] = True
+                payload.pop("reconcile_next_at", None)
+            else:
+                delay = RECONCILE_BACKOFF_SECONDS[
+                    min(attempts - 1, len(RECONCILE_BACKOFF_SECONDS) - 1)
+                ]
+                payload["reconcile_next_at"] = (now + timedelta(seconds=delay)).isoformat()
         else:
             operation.state = OperationState.failed.value
+            payload.pop("reconcile_next_at", None)
+            payload["reconciled"] = True
+        payload["reconcile_attempts"] = attempts
+        payload["reconcile_at"] = now.isoformat()
+        # JSON 列必须整体赋值才会被 SQLAlchemy 认为"变了"。原地改 dict 会被
+        # 静默丢弃（这也是 attempts 计数一开始不生效的那类坑）。
+        operation.payload = payload
         row = DeliveryReceiptRow(
             id=new_id("rcpt"),
             operation_id=operation_id,
@@ -258,7 +442,7 @@ class DeliveryService:
             state=receipt.state.value,
             platform_message_id=receipt.platform_message_id,
             detail=f"对账: {receipt.detail or ''}".strip(),
-            observed_at=datetime.now(UTC),
+            observed_at=now,
         )
         self._session.add(row)
         await self._session.flush()
@@ -268,6 +452,41 @@ class DeliveryService:
             receipt=row,
             detail=receipt.detail or "",
         )
+
+    async def record_pending(
+        self,
+        *,
+        connector_id: str | None,
+        actor_id: str,
+        subject_id: str | None,
+        window_ref: str,
+        is_group: bool,
+        plan_id: str,
+        turn_id: str,
+        reason: str,
+        detail: str,
+    ) -> Operation:
+        """记一条"**该发但还没发**"的投递（例如生成超时）。
+
+        为什么必须落库而不是只记日志：进程一重启，内存里"还有话没发出去"
+        这件事就没了。DB 里有一条 `kind='delivery.pending'` 的行，周期对账
+        任务就能把它捡起来续发（续发靠段级幂等，天然不会重复）。
+        """
+        return await self.create_operation(
+            kind="delivery.pending",
+            actor_id=actor_id,
+            subject_id=subject_id,
+            payload={
+                "channel": connector_id,
+                "window_ref": window_ref,
+                "is_group": is_group,
+                "reply_plan": plan_id,
+                "turn_id": turn_id,
+                "reason": reason,
+                "detail": detail[:500],
+            },
+        )
+
 
     async def _unsupported(
         self,
@@ -304,5 +523,35 @@ class DeliveryService:
             detail=detail,
         )
 
+def reconcile_due(payload: dict, *, now: datetime | None = None) -> bool:
+    """这条 uncertain operation 现在该不该再对一次账。
 
-__all__ = ["DeliveryOutcome", "DeliveryService"]
+    依据 `payload` 里由 :meth:`DeliveryService.reconcile` 写下的
+    `reconcile_next_at` / `reconcile_expired`，**不另存状态**：
+    operations 表没有专门的列，而加列要迁移（迁移不在本次改动范围）。
+    """
+    moment = now or datetime.now(UTC)
+    if payload.get("reconcile_expired"):
+        return False
+    next_at = payload.get("reconcile_next_at")
+    if not next_at:
+        return True
+    try:
+        due = datetime.fromisoformat(str(next_at))
+    except ValueError:
+        return True
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    return moment >= due
+
+
+def _reconcile_expired(created_at: datetime | None, *, attempts: int) -> bool:
+    if attempts >= RECONCILE_MAX_ATTEMPTS:
+        return True
+    if created_at is None:
+        return False
+    moment = created_at if created_at.tzinfo is not None else created_at.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - moment).total_seconds()
+    return age >= RECONCILE_MAX_AGE_SECONDS
+
+__all__ = ["PART_SCOPE", "DeliveryOutcome", "DeliveryService", "reconcile_due"]

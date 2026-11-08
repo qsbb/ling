@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -292,6 +294,40 @@ KEY_ORDER: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------- 消息 id 标注
+#
+# 依据 docs/OUTBOUND-DELIVERY-RESEARCH.md §0.1/§5 P0-4：引用必须是**真实 id**，
+# 而 ling 原来的提示词写的是 `[quote:消息序号]`、上下文里却从来没有给过任何 id
+# ——模型只能瞎编（线上见到的是 `[quote:3]`），平台就把引用段静默丢掉。
+#
+# 照 MaiBot 的做法：每条入站消息前面标 `[msg_id:<id>]`。短 id（NapCat 的数字
+# 短 id）原样显示；长 id（qqbot 的 ``ROBOT1.0_…``）缩成 ``m`` + 6 位 base32，
+# 发送前再按 `reply_ids` 映射回原始 id。
+MESSAGE_ID_MARKER = "[msg_id:{token}]"
+MAX_INLINE_MESSAGE_ID_CHARS = 20
+# 只给**最近**这么多条入站消息标 id。NapCat 的短 id 表是 5000 条 FIFO
+# （§4.2），上下文里放太旧的 id 只会在发送时已经被淘汰——那时引用仍会
+# 静默消失，所以不如少放几条、让模型优先引最近的。
+HISTORY_MESSAGE_ID_LIMIT = 12
+# `idempotency_keys` 里存"本地消息 id → 平台 message id"的作用域名。
+# 由入站桥在落库时写（`InboundBridge._remember_platform_message_id`）。
+PLATFORM_MESSAGE_ID_SCOPE = "platform_msgid"
+
+
+def message_id_token(raw: str) -> str:
+    """把平台 id 缩成上下文里好读的 token。
+
+    短 id 原样（NapCat 的数字短 id 就是这样）；长 id 用 ``m`` + 6 位 base32
+    哈希（照 MaiBot 的 `message_id_alias`）。**token 不参与发送**：
+    发送前按 `CompiledContext.reply_ids` 映射回原始 id。
+    """
+    value = str(raw or "")
+    if len(value) <= MAX_INLINE_MESSAGE_ID_CHARS:
+        return value
+    digest = hashlib.sha1(value.encode("utf-8")).digest()[:4]
+    return "m" + base64.b32encode(digest).decode("ascii").lower()[:6]
+
+
 @dataclass
 class CompiledContext:
     messages: list[ChatMessageIn]
@@ -299,6 +335,12 @@ class CompiledContext:
     memory_ids: list[str] = field(default_factory=list)
     filtered_memories: int = 0
     meta: dict[str, object] = field(default_factory=dict)
+    # 这条提示里**真的渲染出来**的消息 id：`{模型看到的 token: 原始平台 id}`。
+    # 收尾时用它校验她写的 `[quote:…]`：只接受能对上的真 id，对不上就降级为
+    # 普通消息（不发引用段），而不是让平台去静默丢掉那一段。
+    # 空 dict 与 None 不同：空 dict = "这轮一条 id 都没有"（于是就都不许引用），
+    # None 见 `CompiledContext` 的默认值（= 没有做过 id 注入，无从校验）。
+    reply_ids: dict[str, str] | None = None
     # 本轮冻结的受众快照对象。供内核复用（PolicyGate 裁决等），
     # 不放进 meta 是因为 meta 会被序列化进事件。
     snapshot: object | None = None
@@ -376,6 +418,10 @@ class ContextCompiler:
         # 历史里每条都带署名了，当前这条要单独追加，所以也得带——
         # 否则"刚开口那个人"反而是唯一没署名的一句。
         user_sender_name: str | None = None,
+        # 当前这条入站消息的**平台 message id**（拿不到就是 None）。
+        # 由入站桥从连接器取（只有连接器知道 OneBot 的
+        # `f"{self_id}:{message_id}"` 这类拼法）。
+        current_message_platform_id: str | None = None,
     ) -> CompiledContext:
         persona = await self._persona.get(self._persona_id)
         contributions: list[ContextContribution] = []
@@ -988,6 +1034,9 @@ class ContextCompiler:
         # 它们的社交含义，用不用、用哪个，她自己判断。
         from ling.capabilities.expression_choice import render_expression_help
 
+        # 引用要用**真实消息 id**（见本文件顶部"消息 id 标注"）。提示词里
+        # 必须说清"id 在哪、只能是哪些"——否则她只能瞎编（`[quote:3]`），
+        # 而 NapCat 对无效 reply 是静默丢段（调研 §4.4），本地看不出任何异常。
         contributions.append(
             ContextContribution(
                 lane="capabilities",
@@ -996,6 +1045,21 @@ class ContextCompiler:
                     # 拍一拍要连接器支持；没能力就**不要列出来**——
                     # 列了做不到的，她会选一个做不出来的动作。
                     supports_poke=bool(getattr(self, "_supports_poke", True)),
+                ),
+                origin=Origin.verified_source,
+                visibility=Visibility.subject_private,
+                token_budget=DEFAULT_BUDGETS["capabilities"],
+            )
+        )
+        contributions.append(
+            ContextContribution(
+                lane="capabilities",
+                text=(
+                    "每条入站消息前面可能带一个 `[msg_id:…]`，那就是它的消息 id。"
+                    "要引用某条消息时写 `[quote:那个 id]`，**只能用上面出现过、"
+                    "标着 [msg_id:…] 的 id**。用了没出现过的 id，这一句会当作"
+                    "普通消息发出去（不带引用，也不会失败）。没有 [msg_id:…] 的"
+                    "消息就别引用它。"
                 ),
                 origin=Origin.verified_source,
                 visibility=Visibility.subject_private,
@@ -1190,6 +1254,19 @@ class ContextCompiler:
                     if (normalized := normalize_display_name(r.display_name))
                 }
 
+        # ---------------------------------------------------------- 真实消息 id
+        #
+        # 每条入站消息前面标 `[msg_id:…]`（MaiBot 的做法）。id 来自
+        # `idempotency_keys(scope='platform_msgid', key=<本地消息 id>,
+        # result_ref=<平台 id>)`——入站桥落库时写，这里批量取回。
+        # 平台 id 只有连接器知道（OneBot 是 `f"{self_id}:{message_id}"` 里的
+        # 后半段），所以内核不拆字符串，只读这张映射表。
+        (
+            history_marks,
+            reply_ids,
+            current_mark,
+        ) = await self._message_id_marks(usable, current_message_platform_id)
+
         for msg in usable:
             role = "user" if msg.role == "user" else "assistant"
             content = msg.text
@@ -1198,6 +1275,9 @@ class ContextCompiler:
                 content = f"{name}：{content}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
+            mark = history_marks.get(msg.message_id) if role == "user" else None
+            if mark:
+                content = f"{MESSAGE_ID_MARKER.format(token=mark)} {content}"
             annotated.append(
                 CompiledMessage(
                     role=role,
@@ -1257,6 +1337,8 @@ class ContextCompiler:
             # 群里有人在说话，而不是用户在跟她说话。
             user_sender_name = None
         current = f"{user_sender_name}：{user_text}" if user_sender_name else user_text
+        if current_mark:
+            current = f"{MESSAGE_ID_MARKER.format(token=current_mark)} {current}"
         annotated.append(
             CompiledMessage(
                 role="user",
@@ -1266,6 +1348,9 @@ class ContextCompiler:
                 sender=user_sender_name,
             )
         )
+        # 收尾校验用的映射：token → 原始平台 id。**当前这句也在里面**——
+        # 她最常引用的就是"正在回的这条"。只放在 `reply_ids` 一处：
+        # 同一事实写两份（meta 再抄一份）迟早会不一致。
         return CompiledContext(
             messages=[ChatMessageIn(role=m.role, content=m.content) for m in annotated],
             contributions=contributions,
@@ -1274,7 +1359,54 @@ class ContextCompiler:
             meta=compiled_meta,
             snapshot=snapshot,
             annotated=annotated,
+            reply_ids=dict(reply_ids),
         )
+
+    async def _message_id_marks(
+        self,
+        usable: list,
+        current_platform_id: str | None,
+    ) -> tuple[dict[str, str], dict[str, str], str | None]:
+        """算出这一轮要渲染的 `[msg_id:…]`。
+
+        返回 ``(本地消息 id → token, token → 原始平台 id, 当前这句的 token)``。
+
+        取不到平台 id 的消息**不标**（宁可不给 id，也不给一个假的）：
+        她拿不到 id 时就不该引用，而不是拿一个本地 id 去引用。
+        """
+        raw_by_local: dict[str, str] = {}
+        wanted = [m.message_id for m in usable if m.role == "user"]
+        if wanted:
+            from ling.infra.models import IdempotencyKey
+
+            rows = (
+                await self._session.execute(
+                    select(IdempotencyKey.key, IdempotencyKey.result_ref).where(
+                        IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                        IdempotencyKey.key.in_(wanted),
+                        IdempotencyKey.result_ref.is_not(None),
+                    )
+                )
+            ).all()
+            raw_by_local = {str(key): str(value) for key, value in rows}
+
+        history_marks: dict[str, str] = {}
+        reply_ids: dict[str, str] = {}
+        # 只给**最近**若干条标 id：更旧的平台 id 可能已经不在 NapCat 的
+        # 5000 条 FIFO 短 id 表里，标出来只会让她引用到一个已失效的 id。
+        for msg in [m for m in usable if m.role == "user"][-HISTORY_MESSAGE_ID_LIMIT:]:
+            raw = raw_by_local.get(msg.message_id)
+            if not raw:
+                continue
+            token = message_id_token(raw)
+            history_marks[msg.message_id] = token
+            reply_ids[token] = raw
+
+        current_mark = None
+        if current_platform_id:
+            current_mark = message_id_token(current_platform_id)
+            reply_ids[current_mark] = str(current_platform_id)
+        return history_marks, reply_ids, current_mark
 
     async def _rollup_summary(
         self,

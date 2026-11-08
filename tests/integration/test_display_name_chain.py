@@ -275,7 +275,9 @@ async def test_this_turn_context_uses_the_live_card(
     last = compiled[-1].messages[-1]
     # 本次名片在前（当轮就该这么叫），括号里是库里的人级昵称——
     # 历史消息的署名读的是那一列，不写出来同一个人就有两个名字（串人）。
-    assert last.content == "新名片（阿岚）：你好", last.content
+    # 前面可能带 `[msg_id:…]`（引用要用**真实** id，见 docs/OUTBOUND-DELIVERY-RESEARCH.md
+    # P0-4）；署名规则本身不变。
+    assert last.content.endswith("新名片（阿岚）：你好"), last.content
     # 落库的仍是**人级**昵称——当轮显示与人级列是两件事
     assert await _display_name(subject_id) == "阿岚"
 

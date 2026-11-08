@@ -9,7 +9,10 @@ query_receipt / capabilities / health``。
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
@@ -19,6 +22,26 @@ from ling.contracts.v1 import (
     InteractionEnvelope,
     Modality,
 )
+
+
+def normalize_delivery_text(text: str) -> str:
+    """投递内容比对用的归一化：折叠所有空白。
+
+    只用于"平台侧那条消息是不是我们发的这一段"的判断（内容比对），
+    不参与任何发送。折叠空白是因为正文经过平台往返后换行/空格可能变。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
+def delivery_text_digest(text: str) -> str:
+    """投递内容摘要（**不落正文**，只落这个摘要）。
+
+    对账时要用"平台历史里有没有同文消息"作证据，但把回复正文抄进
+    `operations.payload` 等于给内容开第二份副本。所以只存摘要：
+    摘要能比对、不能还原。
+    """
+    normalized = normalize_delivery_text(text).encode("utf-8")
+    return "sha256:" + hashlib.sha256(normalized).hexdigest()[:32]
 
 
 class ChannelErrorKind(StrEnum):
@@ -86,8 +109,24 @@ class OutboundMessage:
 
 @dataclass(frozen=True)
 class ReceiptQuery:
+    """一次对账查询。
+
+    ``platform_message_id`` 是**最直接**的证据，但很多平台并不保证给
+    （OneBot 的 ``send_*_msg`` 在 ``status=ok`` + 空 data 时就没有 id）。
+    没有 id 时，连接器只能用"会话 + 正文 + 大致时间"去平台历史里做内容比对
+    （见 docs/OUTBOUND-DELIVERY-RESEARCH.md §5 P0-2），所以这里额外带上三项。
+    三项都是**可选**的：拿不到就退回"不确定"，绝不当成"没发出去"。
+    """
+
     operation_id: str
     platform_message_id: str | None = None
+    # 目标会话（形如 "<instance>:private:<uid>" / "<instance>:group:<gid>"）。
+    window_ref: str | None = None
+    # 这一段发出去的正文摘要（`delivery_text_digest`），用于内容比对。
+    # **不是正文**：库里存的是摘要，见 `operations.payload["text_digest"]`。
+    text_digest: str | None = None
+    # 发出时间（对账时算时间窗与宽限期用）。
+    sent_at: datetime | None = None
 
 
 @runtime_checkable
@@ -132,4 +171,6 @@ __all__ = [
     "ChannelErrorKind",
     "OutboundMessage",
     "ReceiptQuery",
+    "delivery_text_digest",
+    "normalize_delivery_text",
 ]

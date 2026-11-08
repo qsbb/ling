@@ -16,7 +16,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -579,6 +579,24 @@ class TurnCoordinator:
         self._speak_lease = speak_lease
         self._secret_reader = secret_reader
 
+    def partial_text(self, turn_id: str) -> str:
+        """已经流出来的**部分**正文（内存态）。
+
+        生成超时时用它判断"到底有没有生成过东西"。它可能含半截标记，
+        所以**不能直接外发**——落库由收尾路径（`_finalize`）负责。
+        """
+        return self._cancels.partial(turn_id)
+
+    def request_stop(self, turn_id: str) -> bool:
+        """请求这一轮**优雅停止**（保留已生成的部分并落库）。
+
+        生成超时后没有人再来收事件了，让模型继续跑只是白烧额度；而停下来的
+        收尾路径（`_finalize(stopped=True, delivered=<已生成部分>)`）会把正文
+        写进 `messages`——这正是"180 秒超时不丢正文"的落库点。
+        返回 False 表示这一轮已经结束（没有可停的东西）。
+        """
+        return self._cancels.stop(turn_id)
+
     async def run_turn(
         self,
         *,
@@ -596,6 +614,10 @@ class TurnCoordinator:
         # 只用于给当轮上下文里**最后那句**署名，不落库：库里的
         # `subjects.display_name` 是人级旁路（见 identity.observe_display_name）。
         sender_name: str | None = None,
+        # 当前这条入站消息的**平台 message id**（拿不到就是 None）。
+        # 只有连接器知道它（OneBot 的 `f"{self_id}:{message_id}"`），
+        # 上下文用它给"正在回的这条"也标上 `[msg_id:…]`。
+        current_message_platform_id: str | None = None,
     ) -> asyncio.Queue[TurnStreamEvent | None]:
         queue: asyncio.Queue[TurnStreamEvent | None] = asyncio.Queue()
         token = StopToken()
@@ -612,6 +634,7 @@ class TurnCoordinator:
                 attempt=attempt,
                 source_account=source_account,
                 sender_name=sender_name,
+                current_message_platform_id=current_message_platform_id,
             ),
             name=f"turn:{turn_id}",
         )
@@ -650,12 +673,17 @@ class TurnCoordinator:
         attempt: int = 1,
         source_account: str | None = None,
         sender_name: str | None = None,
+        current_message_platform_id: str | None = None,
     ) -> None:
         delivered = ""
         target_label: str | None = None
         stopped = False
         error: ModelError | None = None
         held_by_me = False
+        # 本轮上下文里渲染给她的 `[msg_id:…]` → 原始平台 id。
+        # 初始为 None（= "还没编译，无从校验"）：编译前就失败的路径不该
+        # 因为"引用校验不可用"而误删她本来合法的引用。
+        replyable_ids: dict[str, str] | None = None
         # 仲裁只尝试一次：未取得就本轮不再等，避免每个 delta 都白等 8 秒
         floor_settled = False
         # 曾经持有过、后来续约失败（租约被别人拿走/过期接管）。
@@ -716,6 +744,7 @@ class TurnCoordinator:
                         user_text=user_text,
                         floor_held=held_by_me,
                         source_account=source_account,
+                        replyable_ids=replyable_ids,
                     )
                     return
 
@@ -762,8 +791,15 @@ class TurnCoordinator:
                     user_sender_name=(
                         sender_name if window.visibility == "group_scope" else None
                     ),
+                    # 「正在回的这条」也要能被她引用：它的平台 id 只有调用方
+                    # 知道（连接器给的），所以从上面一路透传下来。
+                    current_message_platform_id=current_message_platform_id,
                 )
                 messages = list(compiled.messages)
+                # 上下文里每条入站消息都带了 `[msg_id:…]`（见
+                # `ContextCompiler`）。这里取出"她这轮真的看见过哪些 id"，
+                # 收尾时用它校验她写的 `[quote:…]`：对不上就不发引用段。
+                replyable_ids = dict(compiled.reply_ids or {})
 
                 # 权限硬门（设计文档 §1 第 7 条）：
                 # 产出"回复"这个动作本身也要过裁决。正常对话一定通过，
@@ -797,6 +833,7 @@ class TurnCoordinator:
                         user_text=user_text,
                         floor_held=held_by_me,
                         source_account=source_account,
+                        replyable_ids=replyable_ids,
                     )
                     return
 
@@ -816,6 +853,7 @@ class TurnCoordinator:
                         user_text=user_text,
                         floor_held=held_by_me,
                         source_account=source_account,
+                        replyable_ids=replyable_ids,
                     )
                     return
 
@@ -992,6 +1030,7 @@ class TurnCoordinator:
                     floor_held=held_by_me,
                     floor_lost=lease_lost,
                     source_account=source_account,
+                    replyable_ids=replyable_ids,
                     raw_chars=raw_chars,
                 )
         except asyncio.CancelledError:
@@ -1016,6 +1055,7 @@ class TurnCoordinator:
                         floor_held=held_by_me,
                         floor_lost=lease_lost,
                         source_account=source_account,
+                        replyable_ids=replyable_ids,
                     )
             except Exception:  # noqa: BLE001 - 关闭路径不掩盖原始取消
                 pass
@@ -1328,6 +1368,11 @@ class TurnCoordinator:
         # 「说了但被洗空（全是标记/半截标记）」——两者处置完全不同，
         # 只报"没有可交付文本"等于把它们混成一种。
         raw_chars: int = 0,
+        # 本轮上下文里**真正出现过**的消息 id（渲染给她的那些 `[msg_id:…]`）。
+        # 她写 `[quote:…]` 时只有能在这张表里对上的才发引用段；
+        # 对不上就降级成普通消息（绝不整条失败）。None = 这批信息不可用
+        # （例如编译之前就失败的路径），此时不做校验，保持老行为。
+        replyable_ids: dict[str, str] | None = None,
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -1352,6 +1397,7 @@ class TurnCoordinator:
         # 之后就不好判断它是尾句了。
         segments: list[str] = [delivered] if delivered else []
         expression = None
+        dropped_quote: str | None = None
         if delivered:
             from ling.capabilities.chunking import plan_parts
             from ling.capabilities.followup import strip_service_tail
@@ -1375,6 +1421,24 @@ class TurnCoordinator:
             from ling.capabilities.expression_choice import parse_expression
 
             delivered, expression = parse_expression(delivered)
+            # **引用必须指向真实存在、且她这轮真的看到过的消息 id。**
+            #
+            # 原来提示词写的是 `[quote:消息序号]`，而上下文里从来没有给过任何
+            # id（只有名字），所以她只能瞎编（线上见到的是 `[quote:3]`）。
+            # 现在上下文给每条入站消息标了 `[msg_id:…]`，这里只接受能对上的：
+            # - 对得上 → 换成**原始平台 id**（长 id 走短别名，见 context）
+            # - 对不上 → 去掉引用段，正文照发（降级，不整条失败）
+            if expression is not None and expression.quote is not None:
+                allowed = replyable_ids or {}
+                raw_id = allowed.get(str(expression.quote))
+                if raw_id is None:
+                    dropped_quote = str(expression.quote)
+                    expression = replace(expression, quote=None)
+                    logger.info(
+                        "引用目标不在本轮可见的消息 id 里，按普通消息发送：%s", dropped_quote
+                    )
+                else:
+                    expression = replace(expression, quote=raw_id)
             # 用与渠道投递**同一套**分段规则：模型的换行就是她决定"分几条发"，
             # 不该被"短句合并"抹掉。以前这里用 split_semantic 算出一个
             # planned_chunks 只塞进事件里当装饰，消息仍然存成一条——
@@ -1590,6 +1654,9 @@ class TurnCoordinator:
                         if expression is not None
                         else None
                     ),
+                    # 她想引用但 id 对不上（不是真消息）——留痕，别让它静默消失。
+                    # 引用是**装饰**：去掉它正文照发，不能让整条消息失败。
+                    "quote_dropped": dropped_quote,
                     "suppressed_reason": (
                         (
                             "本轮中途失去发言权（租约被另一个窗口接管），"
