@@ -114,32 +114,25 @@ def test_repository_catalog_is_valid_and_lists_real_releases() -> None:
     assert stat.S_IMODE(REPO_CATALOG.stat().st_mode) & 0o022 == 0
 
 
-def test_repository_catalog_is_not_behind_the_app_version() -> None:
-    """发布目录**不能落后于应用版本**（这次真踩到的坑）。
+def test_repository_catalog_is_frozen_for_old_updaters() -> None:
+    """发布目录**不再需要跟着应用版本走**（0.0.5 起更新器直接查 GHCR）。
 
-    现场：应用已经到 0.0.4，目录里最新还只有 0.0.3 → 部署机点「检查更新」得到
-    「暂无可用的更新目标」，更新器整条链路完全用不了，而代码本身没有任何问题。
+    这条原来是"目录最高版本不得落后于应用版本"——那个不变量在目录还是更新事实源时
+    是对的（落后就会让部署机永远显示"暂无可用的更新目标"）。0.0.5 把发现层换成
+    registry tags 之后，目录只剩一个用途：**还在跑 0.0.3 的旧更新器**从它读目标。
+    所以现在唯一该守的是"如果它还在，就必须仍然可校验、且不指向更老的版本"，
+    而**不是**逼着每次发版都往里加一行（那会把简化又绕回去）。
 
-    不变量（只在"发布之后忘了填目录"时红，正常发布期间不会误报）：
-    - 目录里的最高版本必须 **>=** 当前应用版本；
-    - 若最高版本高于当前版本，它的 `min_from` **必须包含**当前版本，
-      否则它对新装机的人来说永远不会成为可用目标。
+    目录文件与 `catalog.py` 的删除时机见 docs/UPDATE-SIMPLIFICATION-DESIGN.md §8：
+    等旧机都完成一次性宿主引导之后再删。
     """
-    from ling import __version__ as app_version
-
     parsed = catalog.load_catalog(REPO_CATALOG)
     versions = [release["version"] for release in parsed["releases"]]
-    newest = max(versions, key=catalog.version_key)
-    assert catalog.version_key(newest) >= catalog.version_key(app_version), (
-        f"发布目录最高版本 {newest} 落后于应用版本 {app_version}："
-        "部署机将永远显示『暂无可用的更新目标』。发版后记得 catalog.py add。"
+    assert versions, "旧更新器仍要读它，别在桥接期清空"
+    # 允许目录版本 <= 应用版本；只禁止它比"曾经发布过的最高版本"倒退。
+    assert max(versions, key=catalog.version_key) >= "0.0.4", (
+        "桥接期目录至少要留到 0.0.4（旧更新器升级路径）"
     )
-    if newest != app_version:
-        entry = next(r for r in parsed["releases"] if r["version"] == newest)
-        assert app_version in entry["min_from"], (
-            f"{newest} 的 min_from 不含当前版本 {app_version}："
-            "从当前版本升级会被判成 not_in_min_from"
-        )
 
 
 def test_repository_catalog_is_only_group_or_world_non_writable() -> None:
