@@ -2167,14 +2167,16 @@ async def _advance_timeline_boundaries(
                 now=now,
             )
             actions.append(f"scene:{target_scene}")
-        elif started.activity.state == "running":
-            # 真实边界事件（段仍覆盖此刻）+ 活动仍在 running：允许续 TTL。
-            if await presence.refresh_scene_ttl(
-                reason=SCENE_REFRESH_REASON_SEGMENT,
-                activity_running=True,
-                now=now,
-            ):
-                actions.append("scene:ttl")
+        # 真实边界事件（段仍覆盖此刻）+ 活动仍在 running：允许续 TTL。
+        # 写成单个 `if … and …` 而不是 `elif …:` 里再套 `if`：`and` 短路，
+        # `refresh_scene_ttl` 仍只在活动还在 running 时才被调用；`elif` 与上面
+        # `commit_scene` 分支的互斥关系也不变，合并只是去掉一层缩进。
+        elif started.activity.state == "running" and await presence.refresh_scene_ttl(
+            reason=SCENE_REFRESH_REASON_SEGMENT,
+            activity_running=True,
+            now=now,
+        ):
+            actions.append("scene:ttl")
         return actions
 
     # ④ 此刻没有任何覆盖段：场景回 unknown，别拿旧场景自述。
