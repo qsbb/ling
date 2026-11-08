@@ -95,7 +95,10 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 | DELETE | `/v1/settings/providers/{provider_id}/secret` | 删除凭据 |
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
-| GET | `/v1/settings/connectors` | `{schema_version, as_of, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, fields[], runtime}]}`；**只读**接入器诊断，`fields[].kind=secret` 只回 `set` 不回值（必鉴权） |
+| GET | `/v1/settings/connectors` | `{schema_version: "v2", as_of, can_edit, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, generation, activation, fields[], runtime}], access: {id, generation, activation, editable, fields[]}}`；接入器诊断 **+ 可配置字段**；`fields[].kind=secret` 只回 `configured`/`preview`，`value` 恒 null（必鉴权） |
+| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。owner + 同源 Origin + 15 分钟内重新登录（必鉴权） |
+| GET | `/v1/settings/connectors/operations/{operation_id}` | `{operation_id, scope, state, generation, active_generation, started_at, activated_at, error_code, error_safe}`；202 之后用它确认**真的**生效了（必鉴权，owner） |
+| POST | `/v1/settings/connectors/reset` | 清空三个 scope 的覆盖（回退 env/默认）→ `{ok, results: [{scope, state, cleared[], operation_id?, error_code?}]}`；任一 scope 失败则 `ok=false` 并保留原 active（**不出现"部分恢复默认却报成功"**）（必鉴权，owner） |
 | POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
 | POST | `/v1/settings/quick-config/preview` | 同上的 body → `{rows[], profiles[], summary}`；快速配置的二次确认（全量覆盖，`profiles` 就是确认后要写入的那份） |
 | GET | `/v1/settings/preferences` | `{schema_version, timezone, source, stored, env, default, common[], video_mode, video_modes[], video_mode_default}`；`source` 为 `preference` / `env` / `default`（必鉴权） |
@@ -165,23 +168,96 @@ enabled, reason}`，随 `GET /settings/config` 一起返回；`effective` 为
 `change_kind` 取 `override / same / repair / unavailable`——弹窗必须把
 "将要覆盖哪几条"摆在明面上，确认后仍需保存才生效。
 
-### 4.2 接入器（渠道）
+### 4.2 接入器（渠道，可配置）
 
-`GET /v1/settings/connectors` 是**只读**诊断：渠道配置全在宿主部署目录的 `.env`
-（`LING_ONEBOT_*` / `LING_QQBOT_*`），密钥只在宿主上。这条端点回答三件事——
-凭据齐不齐（`configured`）、现在通不通（`status`）、缺的那项该改哪个变量
-（`fields[]` + `guidance`）。
+> 设计文档：`docs/CONNECTOR-CONFIG-DESIGN.md`。契约：
+> `contracts/v1/ConnectorsOut.schema.json`、`ConnectorChangeRequest.schema.json`、
+> `ConnectorChangeAccepted.schema.json`。
 
-`status` 四值：`not_configured`（还没填齐）/ `disabled`（凭据齐了但渠道开关关着，
-只在 QQ 官方机器人上出现）/ `configured_disconnected`（配齐了但当前没连上）/
-`connected`。**不要把它压成"可用/不可用"**：这四者的下一步完全不同。
+接入器配置**不再只从 `.env` 来**：生产容器非 root、根文件系统只读，写不了 `.env`
+也重启不了自己，所以值落**数据库覆盖层**，由进程读出来构造连接器。优先级：
 
-`status_reason` 是稳定的码，`status_message` 是它对应的中文（码表见
-`ling/settings/connectors.py::CONNECTOR_REASON_TEXT`，前端只显示文案）。
-`fields[]` 每项 `{name, label, kind, set, value, source}`，`name` 是真实环境变量名，
-`kind=secret` 的项 `value` **恒为 null**、只有 `set`；`kind=switch` 的 `value` 是"开"/"关"。
+```text
+DB 已生效覆盖  >  进程启动时的 env 快照  >  代码默认值
+```
+
+**诊断仍然只读**：`GET` 回答凭据齐不齐（`configured`）、现在通不通（`status`）、
+有效值来自哪一层（`fields[].source`）。`status` 四值：`not_configured`（还没填齐）/
+`disabled`（凭据齐了但渠道开关关着，只在 QQ 官方机器人上出现）/
+`configured_disconnected`（配齐了但当前没连上）/ `connected`。**不要把它压成
+"可用/不可用"**：这四者的下一步完全不同。`status_reason` 是稳定的码，
+`status_message` 是它对应的中文（码表见 `ling/settings/connectors.py::CONNECTOR_REASON_TEXT`）。
+
+#### 字段
+
+`fields[]` 每项：
+
+| 字段 | 含义 |
+| --- | --- |
+| `key` | 注册表里的固定键（= 环境变量名）。`name` 是它的兼容别名 |
+| `kind` | `secret` / `text` / `switch` / `list` |
+| `source` | `db`（本 scope active 修订里有覆盖）/ `env`（启动时 env 有值）/ `default` |
+| `configured` | **有效值非空**（不等于"DB 有覆盖"）。`set` 是兼容别名 |
+| `value` | 非密钥的规范化值：文本、布尔（switch）、字符串数组（list，**前导零保留**）；`secret` 恒 `null` |
+| `preview` | 仅 `secret`：前 `min(7, len-1)` 个 Unicode 字符 + 固定 `••••`；空值为 `null`。**非 owner 一律 `null`** |
+| `editable` | owner 为 true；非 owner 只读 |
+
+字段清单是**服务端白名单**（`ling/settings/connector_fields.py`，onebot 12 项 /
+qqbot 12 项 / access 2 项）。请求里出现白名单之外的键（`LING_ROOT_KEY`、
+`DATABASE_URL`…）一律 `422 invalid_field`——不能把"任意环境变量写入"开成口子。
+
+#### 保存
+
+`PUT /v1/settings/connectors/{scope}`：
+
+- `set` 里没出现的键 = 不改；**密钥给空串 = 不改**（密码框总是空的，不能因此变成删除）；
+- `clear` = 删除该键在本修订的覆盖，**回退到 env**（不是写空串）；
+- 同一个键同时出现在 `set` 与 `clear` → `422 invalid_field`；
+- 校验分两层：字段级（URL scheme / 禁 userinfo / 禁敏感 query / 控制字符 / 端口范围）
+  与**合并后的整体**（配了 WS 端口没令牌、白名单模式但名单空…）。**任何一层失败都
+  在停连接之前**，所以用户填错一个端口号不会让她的 QQ 掉线；
+- 有效值没变 → `200` + `state=unchanged`，**不建修订、不重连**；
+- 真实切换失败 → `202` + `state=rolled_back`：旧配置与旧连接已恢复，`generation`
+  **不推进**；回退本身也失败才是 `degraded`（如实上报，绝不报成功）。
+
+#### 生效
+
+`generation` 是每个 scope 的单调代际号。`PUT` 用 `If-Match: <generation>` 做并发
+控制：两个保存同时到达只有一个赢家，输家拿 `409 conflict` + `detail=generation_conflict`
+或 `detail=activation_in_progress`（候选已落库、正在切换）。
+
+一次 `PUT` 的顺序是**先校验、再落候选修订、最后在事务外切换**：长连接
+`stop()`/`start()` 绝不在事务里，否则拿着行锁等网络。切换失败时用**旧配置重新
+构造**一份（旧对象 stop 之后不保证能再 start，见设计 §4），并让
+`app.state` 继续指向可用的那份。
+
+**白名单不需要重连**：它换掉进程里的 `Settings` 快照（一次赋值，asyncio 单线程里
+原子可见），入站判断下一条消息就按新名单走。这样不会出现"验签读旧 token、授权读
+新名单"——同一个请求读到的永远是一份完整快照。
+
+#### 中断窗口（`timings`）
+
+回包带 `timings`：`disconnect_started_at`（开始停旧实例）、`listener_ready_at`
+（新实例 `start()` 返回）、`remote_connected_at`（远端在等待窗口内报告已连上）。
+**"任务已创建"不等于"已连上"**，所以远端那一步有独立的有界等待（3 秒）：
+超时只影响 `health/state`（`degraded`），不影响"本地已切换"。量化目标是本地
+代际切换 500ms 内完成（`listener_ready_at - disconnect_started_at`）。
+
+#### 审计
+
+一次保存记两条：`connector_config_changed`（改了哪些**字段名**、每个字段的
+`旧指纹>新指纹`、结果）与 `connector_activated` / `connector_rolled_back`。
+指纹是**带域分离的 HMAC-SHA256 截断**（低熵字段如端口 `5700` 用无盐 SHA 能被
+穷举反推）。审计里**没有值、也没有预览**；请求体本身不进访问日志。
+
+#### `runtime` 与 `activation`
+
 `runtime` 报进程里能直接看到的连接数与已收帧数（没有可观察的连接对象时为 null）；
 **这条端点不发网络探测**，设置页会被反复打开，不能拿它当探活。
+`activation` 是 `{state, generation, active_generation, candidate_generation,
+active_revision_id, candidate_revision_id, last_revision_id, last_state, started_at,
+activated_at, error_code, error_safe, ack_count, expected_count}`：
+`activating` 表示候选已落库、正在切换；`rolled_back` / `degraded` 都**不是**成功。
 
 `log_access_denials`（实例级，与 `test_mode` 同层）：是否逐条记录入站白名单拒绝。
 **只影响日志量**——拒绝本身与 `denied_total` 计数不受影响；默认 `true`，未发布过

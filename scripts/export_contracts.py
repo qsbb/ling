@@ -61,6 +61,17 @@ EXPORTED = [
     "SubjectAccountOut",
     "SubjectRow",
     "SubjectsPage",
+    # 接入器可配置（docs/CONNECTOR-CONFIG-DESIGN.md §6）：字段只带 source /
+    # configured / preview，**没有**解密后的值；保存结果带 generation 与终态。
+    "ConnectorsOut",
+    "ConnectorView",
+    "ConnectorFieldOut",
+    "ConnectorActivationOut",
+    "ConnectorAccessGroupOut",
+    "ConnectorChangeRequest",
+    "ConnectorChangeAccepted",
+    "ConnectorOperationOut",
+    "ConnectorResetResult",
     # 「检查更新」四态卡片（docs/UPDATE-UX-DESIGN.md）。嵌套片段对象（current /
     # newer / target / task / details.*）也各自导出：它们是 API 契约的一部分，
     # 单独写 schema 才能让前端按字段名/类型对齐，而不是对着文档抄。

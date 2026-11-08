@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import not_found
@@ -38,6 +38,57 @@ MAX_TITLE_LEN = 60
 # kind 只可能是这两种。其它形态一律当作"不是平台标识"——
 # web 窗口的 title 是用户随手起的名字，长得像 ref 也不能当群号用。
 WINDOW_REF_KINDS = frozenset({"group", "private"})
+
+
+# 她"已经看过"这条消息的**既有事实**（不要新造字段）。
+#
+# 两档，缺一不可：
+#
+# - ``attention_state == "seen"``：消息进过她的决策上下文（`mark_seen` 在决策
+#   成功之后才写，见 `AttentionService.poll_window`）；
+# - ``handled_as is not None``：已经有了处置结论（回了 / 选择不回 / 决定回但没
+#   发出去）。`missed` **不算**看到——那是"一直没机会看"的终态，语义正好相反。
+#
+# 为什么不用"消息行存在"：存在只说明**收下了**。用户要分的恰恰是
+# "收下了但还没看"和"看过了"——用"存在"会把两种混成一种。
+# 为什么不用时间差猜：`seen_at` 就是官方记录的那一刻，没有任何理由去推。
+SEEN_ATTENTION_STATES: frozenset[str] = frozenset({"seen"})
+# `missed` 明确排除：它表示"一直没机会看，已过时效"。
+NOT_SEEN_HANDLED_AS: frozenset[str] = frozenset({"missed"})
+
+
+def visible_to_model():
+    """**能进模型上下文的消息**的 SQL 条件（唯一判据，三处共用）。
+
+    两种撤回的落点全在这里：
+
+    - 没被撤回 → 可见；
+    - 撤回但**她当时已看过**（`retracted_after_seen = true`）→ 仍可见
+      （渲染层加「（这条消息后来被撤回了）」）；
+    - 撤回且她没看过（`false`，以及迁移 0056 之前的 NULL 旧数据）→ 不可见。
+
+    为什么收成一个函数：这条判据同时被"历史取数""未读队列""摘要素材"用到，
+    三处各写一遍必然漂——而漂的后果是某一条路径把撤回的消息又捞回去，
+    而且**只在特定入口**出现，最难查。
+    """
+    return or_(
+        Message.retracted_at.is_(None),
+        Message.retracted_after_seen.is_(True),
+    )
+
+
+def saw_it_before_recall(row: Message) -> bool:
+    """撤回发生时，她**已经看过**这条消息吗（第二层语义的唯一判定点）。
+
+    这是纯函数：只读那一行上已有的字段，不查库、不看时间差。判定发生在
+    撤回那一刻，结果由调用方写进 ``retracted_after_seen`` 冻结下来。
+    """
+    if row.seen_at is not None:
+        return True
+    if str(row.attention_state or "") in SEEN_ATTENTION_STATES:
+        return True
+    handled = str(row.handled_as or "")
+    return bool(handled) and handled not in NOT_SEEN_HANDLED_AS
 
 
 def split_window_ref(ref: str) -> tuple[str, str, str] | None:
@@ -73,6 +124,29 @@ def window_target(window: Window) -> tuple[str, str, str | None]:
 
 
 @dataclass(frozen=True)
+class RetractOutcome:
+    """一次撤回落库的结果。
+
+    四种取值各有各的下一步，**不能合并成布尔值**：
+
+    - ``retracted``：这次真的标上了（第一次收到）；
+    - ``already_retracted``：之前就标过了（重复上报）——不是错误，
+      但要能和"第一次"分开，否则幂等测试没法断言"第二次没生效"；
+    - ``unmatched``：库里没有这条平台消息（很久以前/别的窗口/不是给我们的）；
+    - ``self_recall``：被撤的是她自己发的消息（本轮只记录，不改上下文语义）。
+    """
+
+    status: str
+    message_ids: tuple[str, ...] = ()
+    affected: int = 0
+    reason: str | None = None
+    # 撤回时她**是否已经看过**那条消息（第二层语义的判定结果）。
+    # 一次撤回可能命中多条（同一平台 id 在库里只有一条，但保留字段以便扩展）。
+    after_seen: bool = False
+    seen_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class MessageView:
     message_id: str
     turn_id: str | None
@@ -95,6 +169,13 @@ class MessageView:
     sender_name: str | None = None
     # 发言人的平台账号（QQ 号）；解析不到时由调用方退回 subject id。
     sender_id: str | None = None
+    # 这条消息在平台上被撤回了（非空 = 撤回时刻）。
+    #
+    # 界面上据此标"已撤回"；模型上下文里分两种（见 `messages_for_prompt`）：
+    # 她看过的保留并附注，没看过的整条不出现。
+    retracted_at: datetime | None = None
+    # 撤回发生时她是否已经看过（迁移 0056 冻结下来的判定）。
+    retracted_after_seen: bool | None = None
 
     def to_contract(self) -> ChatMessage:
         return ChatMessage(
@@ -484,6 +565,10 @@ class ConversationService:
         只取 ``role='user'``：她自己说的话不存在"没看见"。
         历史记录 ``attention_state`` 为 NULL 的**不算未读**——
         那时还没有这个字段，无法判断，武断当成未读会让她突然"补看"一批老消息。
+
+        **被撤回且她没看过的要排除**：这个列表是"她刷到时会看到什么"，
+        而撤回的语义是"等同没看见"。留在队列里会让她在下一轮刷到时
+        把一条已经不存在的消息读进决策——那正是"撤回没生效"。
         """
         rows = (
             (
@@ -493,6 +578,7 @@ class ConversationService:
                         Message.window_id == window_id,
                         Message.role == "user",
                         Message.attention_state == "unseen",
+                        visible_to_model(),
                     )
                     .order_by(Message.sequence)
                     .limit(limit)
@@ -636,6 +722,12 @@ class ConversationService:
     async def list_messages(
         self, window_id: str, *, limit: int = 100, before_sequence: int | None = None
     ) -> list[MessageView]:
+        """界面用的历史消息：**包含**被撤回的那些。
+
+        与 `messages_for_prompt` 刻意不同：给模型看的内容里不能有撤回的原文，
+        但给人看的对话页要能显示"这条被撤回了"——否则用户翻记录时会以为
+        那句话从来没存在过，而这正是"撤回"和"删除"的区别。
+        """
         stmt = select(Message).where(Message.window_id == window_id)
         if before_sequence is not None:
             stmt = stmt.where(Message.sequence < before_sequence)
@@ -653,6 +745,143 @@ class ConversationService:
             )
             for r in rows
         ]
+
+    # ---------------------------------------------------------- 撤回
+
+    async def retract_message(
+        self, *, window_ref: str, platform_message_id: str, now: datetime | None = None
+    ) -> RetractOutcome:
+        """把"平台上被撤回的那条消息"标记为不再可用（**不删行**）。
+
+        ## 为什么入参是 `window_ref` 而不是 `window_id`
+
+        撤回通知来自**渠道**，它只知道平台窗口标识（``onebot-x:group:100…``），
+        不知道我们本地那行 `windows.id`。而"撤回只影响它所属的那个会话"是
+        一条安全边界，必须真的按窗口过滤——所以这里按 ``windows.title``
+        （渠道窗口的 title **就是** window_ref，见 ``bridge._ensure_window``）
+        解析出本地窗口。
+
+        ## 三件事，顺序不能反
+
+        1. 按 window_ref 找本地窗口 → 再按「窗口 + 平台 message id」找到本地消息；
+        2. 条件更新 `retracted_at`（`WHERE retracted_at IS NULL`）——
+           幂等靠数据库，不靠内存：重复上报的撤回第二次影响 0 行；
+        3. 返回结果让调用方决定怎么写日志（本函数**不写任何事实表**）。
+
+        ## 为什么找不到就只是"未匹配"
+
+        撤回可能指向：很久以前已被清理的消息、别的窗口的消息、或者根本不是
+        发给她的消息（群里的每条撤回都会上报，不只是被 @ 的那些）。
+        这三种都是**正常情况**，不是错误——所以不抛异常、不建行，只让调用方
+        记一条"撤回未匹配"，等真有人问"她怎么还引用那条"时能对上号。
+        """
+
+        from ling.infra.models import IdempotencyKey, Window
+        from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
+
+        moment = now or datetime.now(UTC)
+        mid = str(platform_message_id or "").strip()
+        ref = str(window_ref or "").strip()
+        if not mid or not ref:
+            return RetractOutcome(status="unmatched", reason="缺少窗口标识或平台消息 id")
+        window_id = (
+            await self._session.execute(
+                select(Window.id).where(
+                    Window.actor_id == self._actor_id, Window.title == ref
+                )
+            )
+        ).scalars().first()
+        if not window_id:
+            return RetractOutcome(
+                status="unmatched", reason="这个窗口还没有任何消息"
+            )
+        # 本地 message_id ↔ 平台 message_id 的映射在 `idempotency_keys`
+        # （`bridge._remember_platform_message_id` 写的那条），不新增表。
+        local_ids = (
+            (
+                await self._session.execute(
+                    select(IdempotencyKey.key).where(
+                        IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                        IdempotencyKey.result_ref == mid,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not local_ids:
+            return RetractOutcome(
+                status="unmatched", reason="库里没有这条平台消息的映射"
+            )
+        # **先读一次"她当时看没看见"**，再写。判定必须在这一刻做完并存下来
+        # （见 `Message.retracted_after_seen` 的注释）：`attention_state` 之后
+        # 还会变，读取时再推就是用今天的状态解释撤回那一刻的事实。
+        rows = list(
+            (
+                await self._session.execute(
+                    select(Message).where(
+                        Message.id.in_(list(local_ids)),
+                        Message.window_id == window_id,
+                        Message.retracted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if rows:
+            for row in rows:
+                row.retracted_at = moment
+                row.retracted_after_seen = saw_it_before_recall(row)
+            await self._session.flush()
+            seen_ids = [r.id for r in rows if r.retracted_after_seen]
+            return RetractOutcome(
+                status="retracted",
+                message_ids=tuple(str(r.id) for r in rows),
+                affected=len(rows),
+                after_seen=bool(seen_ids),
+                seen_message_ids=tuple(str(i) for i in seen_ids),
+            )
+        # 有映射、但那一行已经被撤回过（或不属于这个窗口）：幂等命中。
+        already = (
+            (
+                await self._session.execute(
+                    select(Message.id).where(
+                        Message.id.in_(list(local_ids)),
+                        Message.window_id == window_id,
+                        Message.retracted_at.isnot(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if already:
+            existing = (
+                (
+                    await self._session.execute(
+                        select(Message).where(
+                            Message.id.in_(list(local_ids)),
+                            Message.window_id == window_id,
+                            Message.retracted_at.isnot(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return RetractOutcome(
+                status="already_retracted",
+                after_seen=any(bool(r.retracted_after_seen) for r in existing),
+                seen_message_ids=tuple(
+                    str(r.id) for r in existing if r.retracted_after_seen
+                ),
+                message_ids=tuple(str(i) for i in already),
+                affected=0,
+            )
+        return RetractOutcome(
+            status="unmatched", reason="映射指向的消息不在这个窗口里"
+        )
 
     async def _sender_labels(
         self, window_id: str, rows: list[Message]
@@ -757,6 +986,18 @@ class ConversationService:
             Message.window_id == window_id,
             Message.state == TurnState.completed.value,
             Message.role.in_(["user", "actor"]),
+            # **撤回分两种，判定用撤回那一刻冻结下来的
+            # `retracted_after_seen`**（迁移 0056）：
+            #
+            # - 她**已经看过**（`retracted_after_seen=true`）：这条留在上下文里，
+            #   由渲染层加一句「（这条消息后来被撤回了）」。抹掉它等于抹掉
+            #   "她见过"这个事实——她已经据此回过话了；
+            # - 她**还没看到**（`false` / NULL 的旧数据）：等同没看见，这里就
+            #   剔除（连 `dropped` 都不进，不会被摘要"捞"回来）。
+            #
+            # 放在 SQL 条件里而不是取回来再过滤：Python 里过滤等于
+            # "读出来了但没发出去"，调用方拿到的 `dropped` 会把它算进摘要。
+            visible_to_model(),
         ]
         if after_sequence > 0:
             conditions.append(Message.sequence > after_sequence)
@@ -814,6 +1055,8 @@ class ConversationService:
             sender_subject_id=row.sender_subject_id,
             sender_name=sender_name,
             sender_id=sender_id,
+            retracted_at=row.retracted_at,
+            retracted_after_seen=row.retracted_after_seen,
         )
 
     # ---------------------------------------------------------- 窗口短记忆

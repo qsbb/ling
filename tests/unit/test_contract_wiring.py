@@ -50,6 +50,10 @@ def _is_assigned(name: str, blob: str) -> bool:
     return bool(
         re.search(rf"\b{re.escape(name)}\s*=", blob)
         or re.search(rf'"{re.escape(name)}"\s*:', blob)
+        # 请求体字段是通过 ``body.<name>`` 读的（pydantic 模型在路由签名里
+        # 直接声明，循环里不会给它赋值）。属性读取同样证明"有人真的用它"；
+        # 只认赋值会让纯输入契约永远过不了这一条，逼人去写无意义的赋值。
+        or re.search(rf"\.{re.escape(name)}\b", blob)
     )
 
 

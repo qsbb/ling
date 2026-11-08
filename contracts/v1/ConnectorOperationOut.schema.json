@@ -1,0 +1,91 @@
+{
+  "$id": "https://ling.local/contracts/v1/ConnectorOperationOut.schema.json",
+  "additionalProperties": false,
+  "description": "`GET /v1/settings/connectors/operations/{id}`：一次生效操作的状态。",
+  "properties": {
+    "activated_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Activated At"
+    },
+    "active_generation": {
+      "title": "Active Generation",
+      "type": "integer"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Code"
+    },
+    "error_safe": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Safe"
+    },
+    "generation": {
+      "title": "Generation",
+      "type": "integer"
+    },
+    "operation_id": {
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Started At"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation_id",
+    "scope",
+    "state",
+    "generation",
+    "active_generation"
+  ],
+  "title": "ConnectorOperationOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

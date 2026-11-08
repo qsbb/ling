@@ -152,6 +152,14 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
         logger.warning("入站事件未通过契约校验（已丢弃）: %s", detail)
         return {"accepted": False, "reason": "事件格式不合法"}
 
+    # **撤回通知不是一条消息**：它有自己的类型，走自己的处理路径。
+    # 放在白名单/去重/决策之前一点点，但仍然走完整的去重与日志——
+    # 早退会把"重复撤回只记一条日志"这件事交给调用方，那是错的。
+    from ling.contracts.v1 import RecallEvent
+
+    if isinstance(envelope, RecallEvent):
+        return await _process_recall(app, envelope)
+
     state = app.state  # type: ignore[attr-defined]
     settings = state.settings
     # 群 id 从窗口引用里取（`window:group:<id>`），没有就是私聊。
@@ -299,6 +307,115 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
         "handled_as": result.handled_as,
         "parts_total": result.parts_total,
         "parts_sent": result.parts_sent,
+    }
+
+
+async def _process_recall(app: object, event: object) -> dict:
+    """处理一条撤回通知：**不产生消息、不触发回复、不调用模型**。
+
+    ## 为什么独立于消息链路
+
+    消息链路会创建 `Message` 行、跑决策、调模型、投递回复。撤回通知三样都不该
+    做——它要做的只有两件事：
+
+    1. 把库里那条消息标成 `retracted_at`（条件更新，天然幂等）；
+    2. 记一条人话行为日志（含"没匹配上"这种正常情况）。
+
+    ## 为什么**不**再过访问白名单
+
+    白名单管的是"能不能跟她说话"。撤回管的是"她已经知道的东西还成不成立"。
+    某人不在白名单里，也不代表我们可以继续引用他撤回的那句话；而且白名单
+    随时会改（今天放行、明天关掉），撤回的正确性不该跟着它漂。
+    真正的边界是窗口：`retract_message` 只在消息所属窗口里生效。
+    """
+    from ling.audit import behavior_event
+    from ling.contracts.v1 import RecallEvent
+    from ling.domains.conversation.service import ConversationService
+
+    assert isinstance(event, RecallEvent)
+    connector_instance = event.connector_instance
+    async with session_scope() as session:
+        conversation = ConversationService(session)
+        # 事件级幂等：同一撤回被平台重投时，第二次直接返回 duplicate。
+        # 这与 `retract_message` 里的条件更新是**两层**保护——条件更新保证
+        # "数据只变一次"，这里保证"日志也只记一次"。
+        claimed = await conversation.claim_event(
+            scope=f"connector:{connector_instance}:recall",
+            key=event.external_event_id,
+        )
+        if claimed is not None:
+            return {"accepted": True, "duplicate": True, "reason": "重复的撤回通知"}
+        await session.commit()
+
+        try:
+            outcome = await conversation.retract_message(
+                window_ref=str(event.window_ref or ""),
+                platform_message_id=str(event.platform_message_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - 失败要能被平台重投
+            logger.exception("撤回处理失败，撤回认领以便重投")
+            await conversation.release_event(
+                scope=f"connector:{connector_instance}:recall",
+                key=event.external_event_id,
+            )
+            await session.commit()
+            return {
+                "accepted": False,
+                "reason": f"撤回处理失败，可重投: {type(exc).__name__}",
+            }
+        await session.commit()
+
+    who = event.sender_name or "对方"
+    where = "群里" if ":group:" in str(event.window_ref or "") else "私聊里"
+    matched = outcome.status in {"retracted", "already_retracted"}
+    if event.self_recall:
+        # 自己撤回自己的：不是"对方收回了"，不要错误归属。
+        message = f"我把{where}的一条消息收回了，之后不再引用它的原文"
+        action = "recall_self"
+    elif not matched:
+        # 未匹配是**正常情况**：撤回的可能是很久以前的消息、别的会话的消息，
+        # 或者压根不是发给她的。所以是 INFO 的一行，不是告警。
+        message = f"{who} 撤回了一条消息，但我这里没有对应的原文（可能是不久前没保存的）"
+        action = "recall_unmatched"
+    elif outcome.after_seen:
+        # **她看手机之后才撤回**：她见过这条、可能已经回过话。所以不抹掉，
+        # 只在上下文里补一句旁白。日志也要说清是这一种——两种撤回的处置
+        # 完全不同，合成一句会让排障时分不清"她为什么还提那条"。
+        message = (
+            f"{who} 在{where}撤回了一条消息，我已经看过了；"
+            "之后引用它时会注明「已被撤回」，之前说过的话不作废"
+        )
+        action = "message_retracted_after_seen"
+    else:
+        # **她还没看到就被撤回**：等同没看见，之后不会再进上下文。
+        message = f"{who} 在{where}撤回了一条消息，我还没看到，就当没发生过"
+        action = "message_retracted_unseen"
+
+    behavior_event(
+        action,
+        message,
+        attributes={
+            "connector": connector_instance,
+            "recall_kind": str(event.recall_kind),
+            "status": outcome.status,
+            "matched": matched,
+            # 判定结果本身要可查：这是"两种撤回"唯一的机器可读依据。
+            "after_seen": bool(outcome.after_seen),
+            # **不放正文**：撤回事件里本来就没有原文；放 id 便于对日志与库。
+            "platform_message_id": str(event.platform_message_id),
+        },
+    )
+    logger.info(
+        "撤回通知 processed: status=%s message_id=%s window=%s",
+        outcome.status,
+        event.platform_message_id,
+        event.window_ref,
+    )
+    return {
+        "accepted": True,
+        "recalled": outcome.status == "retracted",
+        "after_seen": bool(outcome.after_seen),
+        "reason": outcome.status,
     }
 
 

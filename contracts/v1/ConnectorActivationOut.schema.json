@@ -1,0 +1,151 @@
+{
+  "$id": "https://ling.local/contracts/v1/ConnectorActivationOut.schema.json",
+  "additionalProperties": false,
+  "description": "一个 scope 的生效状态（只含无敏感值的运行信息）。\n\n``state=activating`` 表示候选已落库、正在切换；只有到 ``active`` 才是\n\"已生效\"。``rolled_back`` 表示失败并已恢复上一份配置；``degraded`` 是\n本地生效但远端没连上（或回退本身也失败）——都**不是**成功。",
+  "properties": {
+    "ack_count": {
+      "default": 0,
+      "title": "Ack Count",
+      "type": "integer"
+    },
+    "activated_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Activated At"
+    },
+    "active_generation": {
+      "title": "Active Generation",
+      "type": "integer"
+    },
+    "active_revision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Active Revision Id"
+    },
+    "candidate_generation": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Candidate Generation"
+    },
+    "candidate_revision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Candidate Revision Id"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Code"
+    },
+    "error_safe": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "可以展示给人看的一句话，不含异常原文",
+      "title": "Error Safe"
+    },
+    "expected_count": {
+      "default": 1,
+      "title": "Expected Count",
+      "type": "integer"
+    },
+    "generation": {
+      "title": "Generation",
+      "type": "integer"
+    },
+    "last_revision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Revision Id"
+    },
+    "last_state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last State"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Started At"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scope",
+    "state",
+    "generation",
+    "active_generation"
+  ],
+  "title": "ConnectorActivationOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

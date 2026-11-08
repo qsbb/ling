@@ -1,0 +1,124 @@
+{
+  "$id": "https://ling.local/contracts/v1/ConnectorChangeAccepted.schema.json",
+  "additionalProperties": false,
+  "description": "保存的结果。``status`` 是**终态**（单副本部署里 PUT 内联完成切换）。",
+  "properties": {
+    "ack_count": {
+      "default": 0,
+      "title": "Ack Count",
+      "type": "integer"
+    },
+    "active_revision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Active Revision Id"
+    },
+    "changed": {
+      "title": "Changed",
+      "type": "boolean"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Code"
+    },
+    "error_safe": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Safe"
+    },
+    "expected_count": {
+      "default": 1,
+      "title": "Expected Count",
+      "type": "integer"
+    },
+    "finished_at": {
+      "title": "Finished At",
+      "type": "string"
+    },
+    "generation": {
+      "title": "Generation",
+      "type": "integer"
+    },
+    "operation_id": {
+      "title": "Operation Id",
+      "type": "string"
+    },
+    "revision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Revision Id"
+    },
+    "schema_version": {
+      "const": "v2",
+      "default": "v2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "started_at": {
+      "title": "Started At",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "status": {
+      "description": "active / unchanged / rolled_back / degraded",
+      "title": "Status",
+      "type": "string"
+    },
+    "timings": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Timings",
+      "type": "object"
+    }
+  },
+  "required": [
+    "operation_id",
+    "scope",
+    "generation",
+    "status",
+    "state",
+    "changed",
+    "started_at",
+    "finished_at"
+  ],
+  "title": "ConnectorChangeAccepted",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

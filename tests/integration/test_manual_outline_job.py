@@ -181,12 +181,17 @@ class _StubConfigReader:
 
 
 def _install_interfaces(
-    env: TestEnv, *, with_outline_model: bool = True
+    env: TestEnv, *, with_outline_model: bool = True, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[_StubStream, _StubConfigReader]:
     """把 app.state 上的 router / 配置换成桩，让预算预检与 worker 都走它。
 
     真实装配下 `ConfigDep` 读的是 secret_box 解密出的已发布修订；测试里没有
     已发布修订，所以这里把同一个 reader 同时给路由（依赖覆盖）与 worker。
+
+    **必须用 ``monkeypatch``**：``worker._MEMORY_ROUTER`` / ``_config_reader``
+    是**进程级全局**，直接赋值会漏到后面的用例里。曾经正是这里漏了——
+    下一个模块的记忆提取读到本模块的桩 router，断言"应提取名字"直接变空，
+    而那条用例单独跑永远是通过的（这类跨模块污染最难查）。
     """
     router = _StubStream(*(_seed_today_pair()))
     reader = _StubConfigReader(_config(with_outline_model=with_outline_model))
@@ -194,8 +199,8 @@ def _install_interfaces(
     env.app.dependency_overrides[_router_dep()] = lambda: router
     import ling.worker as worker_module
 
-    worker_module._MEMORY_ROUTER = router  # 与生产一致：worker 用进程内 router
-    worker_module._config_reader = lambda session: reader  # type: ignore[assignment]
+    monkeypatch.setattr(worker_module, "_MEMORY_ROUTER", router)
+    monkeypatch.setattr(worker_module, "_config_reader", lambda session: reader)
     return router, reader
 
 
@@ -324,10 +329,12 @@ def _patch_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_first_manual_outline_creates_plan_and_one_revision(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_routine()
-    router, _reader = _install_interfaces(web_env)
+    router, _reader = _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, timezone = await _today()
 
     response = await _post(web_env, plan_day=today)
@@ -370,10 +377,12 @@ async def test_first_manual_outline_creates_plan_and_one_revision(
 
 
 async def test_second_click_is_idempotent(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_routine()
-    router, _reader = _install_interfaces(web_env)
+    router, _reader = _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
 
     first = await _post(web_env, plan_day=today)
@@ -406,7 +415,9 @@ async def test_second_click_is_idempotent(
 
 
 async def test_manual_click_reuses_an_inflight_automatic_job(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """21:00 自动生成正在跑时点按钮：复用**那一条**，不另投。
 
@@ -416,7 +427,7 @@ async def test_manual_click_reuses_an_inflight_automatic_job(
     from ling.infra.security import new_id
 
     await _seed_routine()
-    _install_interfaces(web_env)
+    _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
 
     # 模拟自动扫描已经投过一条（与 `_schedule_outline` 同形的事件 id）
@@ -450,7 +461,9 @@ async def test_manual_click_reuses_an_inflight_automatic_job(
 
 
 async def test_same_request_id_is_deduplicated_even_after_completion(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """同一次点击超时重发（带同一个 request_id）：不许重排第二版。
 
@@ -458,7 +471,7 @@ async def test_same_request_id_is_deduplicated_even_after_completion(
     把日程重排一版——用户只点了一下。所以 request_id 的判据跨状态。
     """
     await _seed_routine()
-    router, _reader = _install_interfaces(web_env)
+    router, _reader = _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
 
     first = await web_env.client.post(
@@ -487,10 +500,12 @@ async def test_same_request_id_is_deduplicated_even_after_completion(
 
 
 async def test_force_regenerates_and_supersedes_only_future_segments(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_routine()
-    router, _reader = _install_interfaces(web_env)
+    router, _reader = _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, timezone = await _today()
 
     job_id = (await _post(web_env, plan_day=today)).json()["job_id"]
@@ -550,10 +565,12 @@ async def test_force_regenerates_and_supersedes_only_future_segments(
 
 
 async def test_budget_exhausted_returns_409_and_makes_no_model_call(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_routine()
-    router, _reader = _install_interfaces(web_env)
+    router, _reader = _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
 
     # 先把当日大纲额度用满（真实写行为模型调用行）。
@@ -592,11 +609,13 @@ async def test_budget_exhausted_returns_409_and_makes_no_model_call(
 
 
 async def test_no_outline_model_returns_409(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """没有可用模型时不投递、不生成规则日程——手动生成要的是模型版。"""
     await _seed_routine()
-    _install_interfaces(web_env, with_outline_model=False)
+    _install_interfaces(web_env, with_outline_model=False, monkeypatch=monkeypatch)
     today, _tz = await _today()
 
     response = await _post(web_env, plan_day=today)
@@ -609,9 +628,11 @@ async def test_no_outline_model_returns_409(
 
 
 async def test_out_of_range_day_is_422(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_interfaces(web_env)
+    _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
     # 允许范围是 [角色今天, 角色今天+1]；固定时钟下"今天"是 TARGET_DAY-1。
     for bad in (today - timedelta(days=2), today + timedelta(days=1)):
@@ -620,13 +641,15 @@ async def test_out_of_range_day_is_422(
 
 
 async def test_member_cannot_trigger_generation(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from httpx import ASGITransport, AsyncClient
 
     from ling.infra.security import hash_password
 
-    _install_interfaces(web_env)
+    _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
     async with session_scope() as session:
         from ling.infra.models import User
@@ -659,9 +682,11 @@ async def test_member_cannot_trigger_generation(
 
 
 async def test_rate_limit_returns_429(
-    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+    web_env: TestEnv,
+    logged_in: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_interfaces(web_env)
+    _install_interfaces(web_env, monkeypatch=monkeypatch)
     today, _tz = await _today()
     jobs.MANUAL_OUTLINE_LIMITER.limit = 2
 

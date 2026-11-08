@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import (
@@ -267,6 +268,35 @@ class Message(Base):
     )
     handled_as: Mapped[str | None] = mapped_column(String(24), nullable=True)
     handled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 对方在平台上**撤回了**这条消息（迁移 0055）。
+    #
+    # 非空之后：原文不再进任何模型上下文（历史 / 摘要素材 / 提示词），
+    # 但**行不删**——她当时为什么没接那句话、记忆为什么缺一块，都要能追溯。
+    # 幂等靠条件更新 `WHERE retracted_at IS NULL`，不靠进程内去重。
+    #
+    # 为什么不用 `state='retracted'`：`state` 描述的是**这一轮的处理状态**
+    # （completed/failed/stopped…），撤回是**消息在平台上被收回**，两件事
+    # 可以同时成立（她已回复完，对方随后撤回）。挤进同一列会让"这轮失败了"
+    # 和"对方撤回了"互相覆盖。
+    retracted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 撤回**发生时**她是否已经看过这条（迁移 0056）。
+    #
+    # 只有 `retracted_at` 不够：用户要求分两种情况——
+    #
+    # - 已经看过（`attention_state='seen'` / `handled_as` 已定）：撤回不能把
+    #   她见过的事实抹掉，上下文里保留原文并附注「（这条消息后来被撤回了）」，
+    #   已经发出的回复也不回滚；
+    # - 还没看过：`retracted_at` 打上，且**不进任何模型上下文**（等同没看见）。
+    #
+    # 为什么要**落一列**而不是读取时再推：`attention_state` 会变（`missed`
+    # 就是"一直没机会看"），读取时推等于用**今天**的状态去解释**撤回那一刻**
+    # 的事实。判定必须在撤回那一刻做完并存下来——这也是排障时唯一能回答
+    # "当时到底看没看见"的东西。
+    #
+    # NULL 只出现在"没有撤回"的行上；撤回过的行一定是 true/false。
+    retracted_after_seen: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -396,6 +426,138 @@ class ProviderCredential(Base):
     ciphertext: Mapped[str] = mapped_column(Text)
     last4: Mapped[str] = mapped_column(String(8), default="")
     fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ConnectorConfigRevision(Base):
+    """接入器配置的**候选/已生效修订**（OneBot / QQBot / 白名单）。
+
+    为什么不复用 ``config_revisions``：那张表的 ``payload`` 是可读 JSON，装的是
+    "模型怎么跑"这类与发布/回滚绑定的配置；接入器修订里含**渠道密钥**，
+    必须逐字段密文存储，而且它的生效方式完全不同（重建长连接实例，不是发布
+    新配置给下一次请求）。混进同一张表会让"回滚模型配置"顺手改掉入站凭据。
+
+    状态机：``pending``（已校验、等激活）→ ``activating``（正在切换实例）
+    → ``active``（全部副本确认）；失败落 ``rolled_back``（已回到上一版）；
+    回退本身也失败才是 ``degraded``（**必须可观测**，不能报成功）。
+    """
+
+    __tablename__ = "connector_config_revisions"
+    __table_args__ = (
+        Index("ix_connector_config_revisions_scope_state", "scope", "state"),
+        Index("ix_connector_config_revisions_created", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # onebot | qqbot | access
+    scope: Mapped[str] = mapped_column(String(16), index=True)
+    # 上一版（用于回退时读"旧的有效覆盖集合"）。为空表示这是该 scope 的第一版。
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 稳定错误码（不携带原始异常字符串：它可能带 URL / Authorization）。
+    error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # 可以安全展示给 owner 的一句话（不含值、不含异常原文）。
+    error_safe: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ConnectorOverrideValue(Base):
+    """某个修订里的一项覆盖值（每个 scope 的完整覆盖集合快照里的一个成员）。
+
+    **不出现的 key = 回退到 env**，不写空串哨兵：空串在密钥上是"没设过"、
+    在文本上是"显式空值"，用哨兵表达"没有覆盖"会把这两件事混成一件。
+
+    CHECK 约束保证"密钥只存密文、非密钥只存规范化值"：
+    ``kind='secret'`` 时 ``ciphertext`` 非空且 ``plain_value`` 为空；
+    其余 ``plain_value`` 非空且 ``ciphertext`` 为空。这条约束的价值在于
+    它防的是**未来某次改动的疏忽**（比如有人图省事把密钥写进可读列），
+    而且是被数据库拒绝，不依赖代码评审。
+    """
+
+    __tablename__ = "connector_override_values"
+    __table_args__ = (
+        UniqueConstraint("revision_id", "field_key", name="uq_connector_override_key"),
+        CheckConstraint(
+            "value_kind IN ('secret', 'text', 'switch', 'list')",
+            name="ck_connector_override_kind",
+        ),
+        CheckConstraint(
+            "(value_kind = 'secret' AND ciphertext IS NOT NULL AND plain_value IS NULL)"
+            " OR (value_kind <> 'secret' AND plain_value IS NOT NULL AND ciphertext IS NULL)",
+            name="ck_connector_override_secret_shape",
+        ),
+        Index("ix_connector_override_revision", "revision_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision_id: Mapped[str] = mapped_column(String(64), index=True)
+    # 注册表里的固定 key（迁移不从请求动态生成 schema，见 settings/connector_fields.py）
+    field_key: Mapped[str] = mapped_column(String(64))
+    value_kind: Mapped[str] = mapped_column(String(16))
+    # 非密钥的规范化值：JSON 标量或数组
+    # （文本 → str，开关 → "1"/"0"，名单 → list[str] 且**保留前导零**）。
+    # 不做成 `dict`：这里的值从来不是对象，标注成 dict 会逼调用方到处
+    # `type: ignore`，也会让人以为里面能放结构化内容。
+    plain_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    # 密钥：SecretBox（AES-GCM）密文，逐字段加密
+    ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # UI 元数据（前 N 字符 + 固定遮罩）。不是解密依据，也不参与认证。
+    preview: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 审计指纹（带域分离的 HMAC 截断），不参与认证与连接
+    audit_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConnectorConfigHead(Base):
+    """每个 scope 一行的**指针**：现在生效的是哪一版、正在激活的是哪一版。
+
+    独立成行（而不是"查 state=active 的最新一条"）的原因：回退时需要在
+    同一事务里原子地把指针从候选拨回旧版；用查询表达"最新 active"会让
+    并发下的指针漂移变成一次静默的重排。
+    """
+
+    __tablename__ = "connector_config_heads"
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    active_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 单调递增的代际号：客户端的 If-Match 与副本 ACK 都以它为准
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ConnectorRuntimeAck(Base):
+    """副本对某代际的确认（``(generation, replica_id)`` 唯一）。
+
+    单副本部署里它就是"本地切换完成"的证据；多副本时只有**全部**存活副本
+    ACK 才把 head 指向新修订，失联副本不能无限阻塞（有界超时后回退）。
+    """
+
+    __tablename__ = "connector_runtime_acks"
+    __table_args__ = (
+        # 唯一键必须带 scope：onebot 与 qqbot 可以同时停在"第 1 代"，
+        # 少了 scope 这一列，第二个 scope 生效时会被唯一约束挡住。
+        UniqueConstraint("scope", "generation", "replica_id", name="uq_connector_ack_generation"),
+        Index("ix_connector_ack_generation", "generation"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(16), index=True)
+    generation: Mapped[int] = mapped_column(Integer)
+    replica_id: Mapped[str] = mapped_column(String(64))
+    # prepared | activated | failed
+    phase: Mapped[str] = mapped_column(String(16), default="prepared")
+    # ok | degraded | unknown —— 与 phase 分开：切过去了但远端没连上是 degraded
+    health: Mapped[str] = mapped_column(String(16), default="unknown")
+    error_safe: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )

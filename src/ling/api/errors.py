@@ -20,6 +20,7 @@ class LingError(Exception):
         status_code: int = 400,
         retriable: bool = False,
         detail: str | None = None,
+        field: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -27,6 +28,7 @@ class LingError(Exception):
         self.status_code = status_code
         self.retriable = retriable
         self.detail = detail
+        self.field = field
 
 
 def error_response(
@@ -37,10 +39,16 @@ def error_response(
     retriable: bool = False,
     detail: str | None = None,
     trace_id: str | None = None,
+    field: str | None = None,
 ) -> JSONResponse:
     body = ErrorResponse(
         error=ErrorBody(
-            code=code, message=message, retriable=retriable, detail=detail, trace_id=trace_id
+            code=code,
+            message=message,
+            retriable=retriable,
+            detail=detail,
+            trace_id=trace_id,
+            field=field,
         )
     )
     return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
@@ -62,6 +70,7 @@ async def ling_error_handler(request: Request, exc: LingError) -> JSONResponse:
         retriable=exc.retriable,
         detail=exc.detail,
         trace_id=trace_id,
+        field=getattr(exc, "field", None),
     )
     if trace_id:
         response.headers[TRACE_HEADER] = trace_id

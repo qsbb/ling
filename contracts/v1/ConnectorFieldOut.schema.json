@@ -1,0 +1,121 @@
+{
+  "$defs": {
+    "ConnectorFieldKind": {
+      "description": "字段在表单上的种类。``secret`` 的 ``value`` 恒为 null。",
+      "enum": [
+        "secret",
+        "text",
+        "switch",
+        "list"
+      ],
+      "title": "ConnectorFieldKind",
+      "type": "string"
+    },
+    "ConnectorFieldSource": {
+      "description": "一项配置的有效值来自哪一层。",
+      "enum": [
+        "db",
+        "env",
+        "default"
+      ],
+      "title": "ConnectorFieldSource",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/ConnectorFieldOut.schema.json",
+  "additionalProperties": false,
+  "description": "一个字段的有效值 + 来源 + 脱敏预览。\n\n``key`` 是注册表里的固定名（同时是 GET/PUT 的键）；``source`` 回答\n\"现在生效的是 DB 覆盖、env 还是默认值\"；``configured`` 只表示**有效值\n非空**，不等于\"DB 有覆盖\"。``preview`` 只对敏感字段出现（前 7 个字符 +\n固定遮罩），非 owner 拿到的是 null。",
+  "properties": {
+    "configured": {
+      "title": "Configured",
+      "type": "boolean"
+    },
+    "control": {
+      "default": "text",
+      "description": "text / password / switch / list / select",
+      "title": "Control",
+      "type": "string"
+    },
+    "editable": {
+      "default": true,
+      "title": "Editable",
+      "type": "boolean"
+    },
+    "key": {
+      "title": "Key",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/ConnectorFieldKind"
+    },
+    "label": {
+      "title": "Label",
+      "type": "string"
+    },
+    "name": {
+      "description": "与 key 相同的兼容别名（旧前端读 name）",
+      "title": "Name",
+      "type": "string"
+    },
+    "preview": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "敏感字段的前缀预览（前 7 字符 + ••••）；未配置为 null",
+      "title": "Preview"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "set": {
+      "description": "configured 的兼容别名",
+      "title": "Set",
+      "type": "boolean"
+    },
+    "source": {
+      "$ref": "#/$defs/ConnectorFieldSource"
+    },
+    "value": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "非密钥的规范化值；密钥恒 null",
+      "title": "Value"
+    }
+  },
+  "required": [
+    "key",
+    "name",
+    "scope",
+    "kind",
+    "label",
+    "source",
+    "configured",
+    "set"
+  ],
+  "title": "ConnectorFieldOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

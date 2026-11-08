@@ -248,114 +248,277 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         else:
             logger.warning("%s", _msg)
 
-    # OneBot WS **服务端**（推荐）：NapCat 连进来。见 connectors/onebot/ws_server.py
+    # ---------------------------------------------------------- 接入器构造
     #
-    # host 由 `LING_ONEBOT_WS_HOST` 决定，**默认 127.0.0.1**。原来这里硬编码
-    # 0.0.0.0，等于"配了端口就自动对外"，而 token 为空时还放行——两者叠加
-    # 就是任何能访问该端口的人都能往对话链路里推事件。现在没有 token 时
-    # `start()` 直接抛错（fail-closed），对外也必须显式配置。
-    ws_server = None
-    if settings.onebot_ws_port:
-        from connectors.onebot.connector import OneBotV11Connector
-        from connectors.onebot.ws_server import OneBotWsAuthError, OneBotWsServer
+    # 以前的写法是在这里**直接读 env 构造**（`onebot_config()` / `settings.qqbot_*`），
+    # 并且每个分支各自 `if` 一遍"配了才起"。现在统一走**有效配置**：
+    #
+    #     DB 已生效覆盖 > 进程启动时的 env 快照 > 代码默认
+    #
+    # 这样设置页保存后，同一个构造函数被复用一次就能把新配置真正用起来，
+    # 而且不会出现"页面写进去了、进程还读 env"的裂缝（设计 §8）。
+    #
+    # 两个东西要分开：
+    # * `_connector_effective`：本次**实际生效**的解密后配置（只在本进程内存）；
+    # * `ConnectorRuntime`：负责 stop(旧) → construct(新) → start(新) 的切换器，
+    #   设置页保存时由 `settings/connector_service.py` 调它。
+    from ling.capabilities.channels import onebot_config as _env_onebot_config
+    from ling.capabilities.channels import qqbot_config as _env_qqbot_config
+    from ling.kernel.connector_runtime import ConnectorRuntime, SwapPlan
+    from ling.settings import connector_fields as _cf
+    from ling.settings import connector_overrides as _ov
 
-        from ling.capabilities.channels import onebot_config
-
-        server_config = onebot_config()
-        server_connector = OneBotV11Connector(server_config)
-        app.state.onebot_connector = server_connector
-        ws_server = OneBotWsServer(
-            # 单一来源：`OneBotConfig.ws_host`（`onebot_config()` 从
-            # `LING_ONEBOT_WS_HOST` 读，默认 127.0.0.1）。不在 Settings 里
-            # 再定义一份——同一个开关两个默认值迟早漂。
-            host=server_config.ws_host,
-            port=settings.onebot_ws_port,
-            app=app,
-            connector=server_connector,
-            token=settings.onebot_ws_token,
+    async with session_scope() as session:
+        _onebot_effective = await _ov.resolve_field_values(
+            session,
+            scope=_cf.SCOPE_ONEBOT,
+            settings=settings,
+            onebot=_env_onebot_config(),
+            qqbot=_env_qqbot_config(settings),
+            box=box,
+            include_secrets=True,
         )
-        try:
-            await ws_server.start()
-        except OneBotWsAuthError as exc:
-            # **不让进程带着一个"谁都能连"的端口起来**。配置错就启动失败，
-            # 让它在部署时就暴露出来，而不是安静地跑到被冒充之后才发现。
-            logger.error("%s", exc)
-            raise
-        app.state.onebot_ws_server = ws_server
+        _qqbot_effective = await _ov.resolve_field_values(
+            session,
+            scope=_cf.SCOPE_QQBOT,
+            settings=settings,
+            onebot=_env_onebot_config(),
+            qqbot=_env_qqbot_config(settings),
+            box=box,
+            include_secrets=True,
+        )
+        _access_effective = await _ov.current_access_snapshot(session, settings=settings)
 
-    # QQ 官方机器人：**WebSocket 网关**（ling 主动连出去）。
-    #
-    # 为什么默认走网关而不是 Webhook：Webhook 要求腾讯能访问到公网 HTTPS
-    # 回调地址，而 ling 常跑在内网；官方文档还明确写了"发送消息接口要求
-    # 机器人连接到 WebSocket 保持在线"。所以网关是主路径，Webhook 只是备用。
-    #
-    # 只在**凭据齐备**时启动：没凭据还去连只会不断失败并刷日志。
-    qqbot_gateway = None
-    if settings.qqbot_enabled:
-        from ling.capabilities.channels import qqbot_config
+    app.state.connector_effective = {
+        _cf.SCOPE_ONEBOT: dict(_onebot_effective.fields_by_key()),
+        _cf.SCOPE_QQBOT: dict(_qqbot_effective.fields_by_key()),
+    }
+    app.state.access_snapshot = _access_effective
+    connector_runtime = ConnectorRuntime(app)
+    app.state.connector_runtime = connector_runtime
+    # 一次性快照：运行期参数（WS 端口/令牌/地址、渠道开关）。它们不属于
+    # `OneBotConfig` / `QQBotConfig`，但同样是"有效配置"的一部分。
+    app.state.connector_runtime_settings = _ov.ConnectorRuntimeSettings(
+        onebot_ws_port=settings.onebot_ws_port,
+        onebot_ws_token=settings.onebot_ws_token,
+        onebot_ws_url=settings.onebot_ws_url,
+        onebot_secret=_onebot_effective.text("LING_ONEBOT_SECRET"),
+        qqbot_enabled=_qqbot_effective.flag("LING_QQBOT_ENABLED"),
+    )
 
-        try:
-            bot_config = qqbot_config(settings)
-        except Exception:  # noqa: BLE001 - 配置读不到就不启动
-            bot_config = None
-        if bot_config is not None and bot_config.configured:
-            from connectors.qqbot.connector import QQBotConnector
-            from connectors.qqbot.ws_gateway import QQBotGateway
+    async def _start_onebot(values: dict) -> dict:
+        """按一份有效配置起 OneBot 的组件，返回实例映射。
 
-            bot_connector = QQBotConnector(bot_config)
-            app.state.qqbot_connector = bot_connector
-            qqbot_gateway = QQBotGateway(connector=bot_connector, app=app)
-            app.state.qqbot_gateway = qqbot_gateway
-            qqbot_gateway.start()
-            logger.info(
-                "QQ 官方机器人网关已启动（app_id=%s，%s）",
-                bot_config.app_id,
-                "沙箱" if bot_config.sandbox else "正式",
+        WS 服务端 / 出站 WS 客户端 / HTTP 懒构造连接器三者互不排斥，所以
+        一次构造里可能起两个组件。**失败时由调用方回滚**，这里只管起。
+        """
+        import dataclasses
+
+        from connectors.onebot.connector import OneBotV11Connector
+
+        runtime_settings = dataclasses.replace(
+            app.state.connector_runtime_settings,  # type: ignore[arg-type]
+        ).with_values(_cf.SCOPE_ONEBOT, values)
+        app.state.connector_runtime_settings = runtime_settings
+        config = _ov.build_onebot_config_from(values)
+        instances: dict[str, object] = {}
+
+        port = runtime_settings.onebot_ws_port
+        if port:
+            from connectors.onebot.ws_server import OneBotWsAuthError, OneBotWsServer
+
+            server_connector = OneBotV11Connector(config)
+            ws_server = OneBotWsServer(
+                host=config.ws_host,
+                port=port,
+                app=app,
+                connector=server_connector,
+                token=runtime_settings.onebot_ws_token,
             )
+            try:
+                await ws_server.start()
+            except OneBotWsAuthError as exc:
+                # **不让进程带着一个"谁都能连"的端口起来**（fail-closed）。
+                raise RuntimeError("OneBot WS 服务端拒绝启动：缺少令牌") from exc
+            instances["onebot_ws_server"] = ws_server
+            instances["onebot_connector"] = server_connector
+            app.state.onebot_ws_server = ws_server
+            app.state.onebot_connector = server_connector
+            logger.info("OneBot WS 服务端已启动 %s:%s", config.ws_host, port)
         else:
+            app.state.onebot_ws_server = None
+
+        if runtime_settings.onebot_ws_url:
+            from connectors.onebot.ws_client import OneBotWsClient
+
+            connector = OneBotV11Connector(config)
+            ws_client = OneBotWsClient(
+                url=runtime_settings.onebot_ws_url, app=app, connector=connector
+            )
+            app.state.onebot_connector = connector
+            app.state.onebot_ws = ws_client
+            ws_client.start()
+            instances["onebot_ws"] = ws_client
+            instances["onebot_connector"] = connector
+            logger.info("OneBot WS 入站已启动: %s", runtime_settings.onebot_ws_url)
+        else:
+            app.state.onebot_ws = None
+
+        if not instances:
+            # 只走 HTTP 上报：仍然要有可用的连接器对象（发消息要用）。
+            connector = OneBotV11Connector(config)
+            app.state.onebot_connector = connector
+            instances["onebot_connector"] = connector
+        return instances
+
+    async def _start_qqbot(values: dict) -> dict:
+        from connectors.qqbot.connector import QQBotConnector
+        from connectors.qqbot.ws_gateway import QQBotGateway
+
+        runtime_settings = app.state.connector_runtime_settings
+        runtime_settings = runtime_settings.with_values(_cf.SCOPE_QQBOT, values)
+        app.state.connector_runtime_settings = runtime_settings
+        bot_config = _ov.build_qqbot_config_from(values)
+        if not runtime_settings.qqbot_enabled or not bot_config.configured:
+            # 关着或凭据不全：不启动网关。**如实记下原因**，不假装在连。
             app.state.qqbot_gateway = None
             logger.info(
-                "QQ 官方机器人已启用但缺少凭据（LING_QQBOT_APP_ID/CLIENT_SECRET），网关不启动"
+                "QQ 官方机器人不启动（enabled=%s configured=%s）",
+                runtime_settings.qqbot_enabled,
+                bot_config.configured,
             )
-
-    # OneBot 反向 WS 入站：配了地址才启动。
-    # 放在 API 进程而不是 worker，因为入站要用的 coordinator/router 都在这里。
-    ws_client = None
-    if settings.onebot_ws_url:
-        from connectors.onebot.connector import OneBotV11Connector
-        from connectors.onebot.ws_client import OneBotWsClient
-
-        from ling.capabilities.channels import onebot_config
-
-        connector = OneBotV11Connector(onebot_config())
-        app.state.onebot_connector = connector
-        ws_client = OneBotWsClient(
-            url=settings.onebot_ws_url, app=app, connector=connector
+            return {}
+        bot_connector = QQBotConnector(bot_config)
+        gateway = QQBotGateway(connector=bot_connector, app=app)
+        app.state.qqbot_connector = bot_connector
+        app.state.qqbot_gateway = gateway
+        gateway.start()
+        logger.info(
+            "QQ 官方机器人网关已启动（app_id 指纹=%s，%s）",
+            _fingerprint(bot_config.app_id),
+            "沙箱" if bot_config.sandbox else "正式",
         )
-        app.state.onebot_ws = ws_client
-        ws_client.start()
-        logger.info("OneBot WS 入站已启动: %s", settings.onebot_ws_url)
-    else:
-        app.state.onebot_ws = None
+        return {"qqbot_gateway": gateway, "qqbot_connector": bot_connector}
 
+    async def _start_access(values: dict) -> dict:
+        """白名单生效：**换掉进程里的 Settings 快照**，不重建任何连接。
+
+        `kernel/inbound_intake` 的授权判断读的是 ``app.state.settings``；
+        这里用 ``dataclasses.replace`` 造一份新的 frozen Settings，只改
+        ``access_mode`` / ``access_list``，然后**一次赋值**换上去。
+
+        为什么用替换而不是"让入站自己去查 DB"：
+        - 入站路径在每条消息上，加一次 DB 查询是白给；
+        - 一次属性读取就是一次快照，请求处理期间不会读到一半新一半旧
+          （设计 §4："请求处理时捕获一次代际快照"）。
+
+        赋值是同步的（中间没有 await），所以在 asyncio 单线程里对其他协程
+        原子可见——不会出现"验签读旧 token、授权读新名单"。
+        """
+        import dataclasses
+
+        from ling.settings import connector_fields as _cf2
+
+        old_settings = app.state.settings
+        new_settings = dataclasses.replace(
+            old_settings,
+            access_mode=str(values.get("LING_ACCESS_MODE") or "off"),
+            access_list=frozenset(_cf2.normalize_list(values.get("LING_ACCESS_LIST"))),
+        )
+        app.state.settings = new_settings
+        async with session_scope() as session:
+            app.state.access_snapshot = await _ov.current_access_snapshot(
+                session, settings=new_settings
+            )
+        logger.info(
+            "出入许可已生效 mode=%s 名单=%d 人",
+            new_settings.access_mode,
+            len(new_settings.access_list),
+        )
+        return {}
+
+    async def _plan_access(values: dict) -> SwapPlan:
+        return SwapPlan(stops=(), start=lambda: _start_access(values))
+
+    async def _plan_onebot(values: dict) -> SwapPlan:
+        return SwapPlan(stops=("onebot_ws_server", "onebot_ws"), start=lambda: _start_onebot(values))
+
+    async def _plan_qqbot(values: dict) -> SwapPlan:
+        return SwapPlan(stops=("qqbot_gateway",), start=lambda: _start_qqbot(values))
+
+    connector_runtime.register(
+        _cf.SCOPE_ONEBOT,
+        _plan_onebot,
+        values=app.state.connector_effective[_cf.SCOPE_ONEBOT],
+    )
+    connector_runtime.register(
+        _cf.SCOPE_QQBOT,
+        _plan_qqbot,
+        values=app.state.connector_effective[_cf.SCOPE_QQBOT],
+    )
+    connector_runtime.register(
+        _cf.SCOPE_ACCESS,
+        _plan_access,
+        values={
+            "LING_ACCESS_MODE": _access_effective.mode,
+            "LING_ACCESS_LIST": sorted(_access_effective.allow_list),
+        },
+    )
+
+    # 启动时按有效配置起组件（与升级前行为一致：env 就是"有效配置"）。
+    if settings.onebot_ws_port or settings.onebot_ws_url:
+        _onebot_instances = await _start_onebot(
+            app.state.connector_effective[_cf.SCOPE_ONEBOT]
+        )
+        connector_runtime.register(
+            _cf.SCOPE_ONEBOT,
+            _plan_onebot,
+            instances=_onebot_instances,
+            values=app.state.connector_effective[_cf.SCOPE_ONEBOT],
+        )
+    else:
+        # 只走 HTTP：仍需一个连接器对象（懒构造也会覆盖它）。
+        from connectors.onebot.connector import OneBotV11Connector as _LazyOneBot
+
+        app.state.onebot_connector = _LazyOneBot(
+            _ov.build_onebot_config_from(app.state.connector_effective[_cf.SCOPE_ONEBOT])
+        )
+    _qqbot_instances = await _start_qqbot(app.state.connector_effective[_cf.SCOPE_QQBOT])
+    connector_runtime.register(
+        _cf.SCOPE_QQBOT,
+        _plan_qqbot,
+        instances=_qqbot_instances,
+        values=app.state.connector_effective[_cf.SCOPE_QQBOT],
+    )
     await _recover_dangling_turns()
     await _bootstrap(settings)
     logger.info("ling api 就绪 env=%s db=%s", settings.env, _safe_db(settings.database_url))
     try:
         yield
     finally:
-        if ws_client is not None:
-            await ws_client.stop()
-        if ws_server is not None:
-            await ws_server.stop()
-        if qqbot_gateway is not None:
-            await qqbot_gateway.stop()
+        for _scope in (_cf.SCOPE_ONEBOT, _cf.SCOPE_QQBOT):
+            for _name, _instance in (connector_runtime._instances.get(_scope) or {}).items():
+                _stopper = getattr(_instance, "stop", None)
+                if _stopper is not None:
+                    try:
+                        _result = _stopper()
+                        if hasattr(_result, "__await__"):
+                            await _result
+                    except Exception:  # noqa: BLE001 - 关闭路径不掩盖原始错误
+                        logger.warning("关闭接入器组件失败：%s", _name)
         # 额度记账的后台落库任务要在引擎关闭前收尾：否则最后几轮的用量
         # 只留在内存里，下次启动就没了。
         quota = getattr(app.state, "quota", None)
         if quota is not None:
             await quota.aclose()
         await dispose_engine()
+
+
+def _fingerprint(value: str) -> str:
+    """身份类字段（AppID）的短指纹：日志里只用它，不出现原值。"""
+    import hashlib
+
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:8] if value else ""
 
 
 def _safe_db(url: str) -> str:

@@ -38,9 +38,17 @@ CHANNEL_EVENTS = frozenset({EVENT_AT_MESSAGE_CREATE, EVENT_DIRECT_MESSAGE_CREATE
 # 官方在群聊 @ 机器人的消息里会带这个前缀，且它们不是用户说的话。
 _MENTION_RE = re.compile(r"<@!?[^>\s]+>")
 
+# 附件 content_type 主类型 → 正文占位标记里的段名。
+#
+# `record` 与 OneBot 侧同一个教训：QQ 家族的语音在协议层叫 `record`，
+# `voice` 只是别名。两者都映射到 `voice`，与 OneBot 侧的占位形态一致——
+# `bridge._MEDIA_MARKERS` 只认 `image|voice|video|file`，标记写成别的名字
+# 就剥不掉，纯附件消息会被当成"有可读文本"去回复。
 _ATTACHMENT_KINDS = {
     "image": "image",
     "voice": "voice",
+    "record": "voice",
+    "audio": "voice",
     "video": "video",
     "file": "file",
 }

@@ -357,6 +357,54 @@ class InteractionEnvelope(StrictModel):
         return v
 
 
+# ---------------------------------------------------------------- 撤回
+
+
+class RecallKind(StrEnum):
+    """撤回事件来自哪一侧。**只用于日志与话术，不参与判定。**"""
+
+    group = "group"
+    friend = "friend"
+
+
+class RecallEvent(StrictModel):
+    """**一条撤回通知**——不是一条消息，也不该变成一条消息。
+
+    为什么单独一个类型、而不是复用 :class:`InteractionEnvelope`：
+
+    信封的语义是"有人对我说了什么"，它必然带 `parts`（正文）并走决策→生成→
+    投递；撤回通知没有正文、也不该触发回复。硬塞进信封只有两种写法，
+    两种都是伪造：造一个空的用户发言（她会以为对方发了个空消息），或者加一个
+    "这条其实不是消息"的开关（信封从此有两种含义）。
+
+    所以撤回有自己的类型，`inbound_intake` 用 `isinstance` 分流，
+    **不**进对话链路、**不**产生 `messages` 行。
+
+    ``self_recall`` 是"她自己撤回了自己的消息"（OneBot 的
+    `notice.group_recall`/`friend_recall` 也会因为机器人自己撤回而触发）。
+    这一类**不进**给模型看的上下文标记是反过来的：她的消息照样算她的话，
+    只是那条原文不再可用。本轮只记录、不额外处理。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    connector_instance: IdStr
+    # 去重键（`<instance>:recall:<message_id>`）。重复上报同一撤回必须只生效一次。
+    external_event_id: IdStr
+    recall_kind: RecallKind = RecallKind.friend
+    # 平台侧被撤回的那条消息 id。**这是唯一能把撤回与知识对应起来的东西。**
+    platform_message_id: IdStr
+    # 发起撤回的人（群里有管理撤回别人的消息，所以它不一定等于原发言人）
+    operator_ref: IdStr | None = None
+    # 原消息所属的会话（群号 / 对方账号）；撤回事件里通常带得到
+    target_ref: IdStr | None = None
+    window_ref: IdStr | None = None
+    occurred_at: datetime | None = None
+    sender_name: str | None = None
+    # 是不是她自己发的消息被撤回
+    self_recall: bool = False
+    trace_id: IdStr | None = None
+
+
 # ---------------------------------------------------------------- 会话与轮次
 
 
@@ -1228,6 +1276,182 @@ class ImageUpdateCheckAccepted(StrictModel):
     accepted: bool
 
 
+# ---------------------------------------------------------------- 接入器可配置（v2）
+#
+# 设计 `docs/CONNECTOR-CONFIG-DESIGN.md` §6。字段形状刻意只覆盖"能提交/能判断
+# 的东西"：**密钥的 `value` 恒为 null**，只有 `preview` 与 `configured`。
+# 契约里没有"解密后的值"这个字段，也不会有——前端拿不到它。
+
+
+class ConnectorFieldSource(StrEnum):
+    """一项配置的有效值来自哪一层。"""
+
+    DB = "db"
+    ENV = "env"
+    DEFAULT = "default"
+
+
+class ConnectorFieldKind(StrEnum):
+    """字段在表单上的种类。``secret`` 的 ``value`` 恒为 null。"""
+
+    SECRET = "secret"
+    TEXT = "text"
+    SWITCH = "switch"
+    LIST = "list"
+
+
+class ConnectorFieldOut(StrictModel):
+    """一个字段的有效值 + 来源 + 脱敏预览。
+
+    ``key`` 是注册表里的固定名（同时是 GET/PUT 的键）；``source`` 回答
+    "现在生效的是 DB 覆盖、env 还是默认值"；``configured`` 只表示**有效值
+    非空**，不等于"DB 有覆盖"。``preview`` 只对敏感字段出现（前 7 个字符 +
+    固定遮罩），非 owner 拿到的是 null。
+    """
+
+    key: str
+    name: str = Field(description="与 key 相同的兼容别名（旧前端读 name）")
+    scope: str
+    kind: ConnectorFieldKind
+    label: str
+    control: str = Field(default="text", description="text / password / switch / list / select")
+    editable: bool = True
+    source: ConnectorFieldSource
+    configured: bool
+    set: bool = Field(description="configured 的兼容别名")
+    value: str | bool | list[str] | None = Field(
+        default=None, description="非密钥的规范化值；密钥恒 null"
+    )
+    preview: str | None = Field(
+        default=None, description="敏感字段的前缀预览（前 7 字符 + ••••）；未配置为 null"
+    )
+
+
+class ConnectorActivationOut(StrictModel):
+    """一个 scope 的生效状态（只含无敏感值的运行信息）。
+
+    ``state=activating`` 表示候选已落库、正在切换；只有到 ``active`` 才是
+    "已生效"。``rolled_back`` 表示失败并已恢复上一份配置；``degraded`` 是
+    本地生效但远端没连上（或回退本身也失败）——都**不是**成功。
+    """
+
+    scope: str
+    state: str
+    generation: int
+    active_generation: int
+    candidate_generation: int | None = None
+    active_revision_id: str | None = None
+    candidate_revision_id: str | None = None
+    last_revision_id: str | None = None
+    last_state: str | None = None
+    started_at: str | None = None
+    activated_at: str | None = None
+    error_code: str | None = None
+    error_safe: str | None = Field(
+        default=None, description="可以展示给人看的一句话，不含异常原文"
+    )
+    ack_count: int = 0
+    expected_count: int = 1
+
+
+class ConnectorView(StrictModel):
+    """一个接入器的诊断 + 可编辑字段（``GET /v1/settings/connectors``）。"""
+
+    id: str
+    label: str
+    configured: bool
+    enabled: bool
+    status: str
+    status_reason: str
+    status_message: str
+    guidance: str
+    editable: bool = Field(description="owner 为 true；非 owner 只读")
+    storage: str = Field(default="db", description="值落库；容器根目录只读，写不了 .env")
+    generation: int = 0
+    activation: ConnectorActivationOut
+    fields: list[ConnectorFieldOut] = Field(default_factory=list)
+    runtime: dict[str, int | None] = Field(default_factory=dict)
+
+
+class ConnectorAccessGroupOut(StrictModel):
+    """出入许可（白名单）组：参与同一套 generation，但不重建长连接。"""
+
+    id: str = "access"
+    generation: int = 0
+    activation: ConnectorActivationOut
+    editable: bool = True
+    fields: list[ConnectorFieldOut] = Field(default_factory=list)
+
+
+class ConnectorsOut(StrictModel):
+    """`GET /v1/settings/connectors` 的 v2 形状。"""
+
+    schema_version: Literal["v2"] = "v2"
+    as_of: datetime
+    can_edit: bool = Field(description="当前登录者是否是 owner")
+    connectors: list[ConnectorView] = Field(default_factory=list)
+    access: ConnectorAccessGroupOut
+
+
+class ConnectorChangeRequest(StrictModel):
+    """`PUT /v1/settings/connectors/{scope}` 的请求体。
+
+    ``set`` 里没出现的键 = 不改；密钥空串 = 不改；``clear`` = 删除覆盖回退
+    env（不是写空串）。同一个键同时出现在两边 → 422。
+    """
+
+    set: dict[str, str | bool | list[str]] = Field(default_factory=dict)
+    clear: list[str] = Field(default_factory=list)
+
+
+class ConnectorChangeAccepted(StrictModel):
+    """保存的结果。``status`` 是**终态**（单副本部署里 PUT 内联完成切换）。"""
+
+    schema_version: Literal["v2"] = "v2"
+    operation_id: str
+    scope: str
+    generation: int
+    status: str = Field(description="active / unchanged / rolled_back / degraded")
+    state: str
+    changed: bool
+    revision_id: str | None = None
+    active_revision_id: str | None = None
+    ack_count: int = 0
+    expected_count: int = 1
+    started_at: str
+    finished_at: str
+    error_code: str | None = None
+    error_safe: str | None = None
+    timings: dict[str, float] = Field(default_factory=dict)
+
+
+class ConnectorOperationOut(StrictModel):
+    """`GET /v1/settings/connectors/operations/{id}`：一次生效操作的状态。"""
+
+    schema_version: Literal["v2"] = "v2"
+    operation_id: str
+    scope: str
+    state: str
+    generation: int
+    active_generation: int
+    started_at: str | None = None
+    activated_at: str | None = None
+    error_code: str | None = None
+    error_safe: str | None = None
+
+
+class ConnectorResetResult(StrictModel):
+    """`POST /v1/settings/connectors/reset` 的逐 scope 结果。
+
+    ``ok=false`` 表示至少一个 scope 没清成功——那三个 scope 的 active 都保留，
+    不出现"部分恢复默认却报成功"。
+    """
+
+    schema_version: Literal["v2"] = "v2"
+    ok: bool
+    results: list[dict[str, object]] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 错误
 
 
@@ -1239,6 +1463,9 @@ class ErrorBody(StrictModel):
     retriable: bool = False
     detail: str | None = None
     trace_id: IdStr | None = None
+    # 出错的具体字段（接入器配置校验用）。设计 §6 要求错误里带 ``field``：
+    # 只给一句"有一项不合法"，用户得自己猜是哪一项。
+    field: str | None = None
 
 
 class ErrorResponse(StrictModel):
@@ -1300,6 +1527,8 @@ __all__ = [
     "PromptSnapshotOut",
     "PromptSnapshotSection",
     "PromptSnapshotState",
+    "RecallEvent",
+    "RecallKind",
     "RuntimeScope",
     "SessionRecord",
     "SubjectAccountOut",

@@ -33,6 +33,8 @@ from ling.contracts.v1 import (
     InputPart,
     InteractionEnvelope,
     Modality,
+    RecallEvent,
+    RecallKind,
     new_id,
 )
 from ling.ports.channel import (
@@ -85,6 +87,28 @@ EXPLICIT_MISSING_GRACE_SECONDS = 180.0
 
 # 平台明确说"消息不存在"的字样（NapCat 的 GetMsg 抛 `Error('消息不存在')`）。
 _MISSING_HINTS = ("消息不存在", "not found", "消息不存在或已撤回")
+
+
+# 已知、且**按设计**不进入任何链路的 notice 类型（静默丢弃，不记日志）。
+#
+# 判据只有一条：它不改变"我们手里的知识是否还成立"。撤回会改（所以它单独走
+# `_recall_from_notice`），入群/戳一戳/改名片都不会。
+#
+# 不在这里的类型一律记一条「暂不处理」——静默掉未知类型会让"平台加了新的
+# 撤回类事件"这类情况永远看不见。
+_IGNORED_NOTICE_TYPES: frozenset[str] = frozenset(
+    {
+        "notify",  # 戳一戳 / 群签到 / 运气王，sub_type 区分
+        "group_increase",
+        "group_decrease",
+        "group_admin",
+        "group_card",
+        "group_ban",
+        "group_upload",
+        "friend_add",
+        "group_msg_emoji_like",  # NapCat 扩展：表情回应
+    }
+)
 
 
 class OneBotV11Connector(ChannelConnector):
@@ -486,6 +510,84 @@ class OneBotV11Connector(ChannelConnector):
         """
         return self._event_message_ids.get(str(external_event_id or ""))
 
+    def _recall_from_notice(self, payload: dict) -> RecallEvent | None:
+        """``notice.group_recall`` / ``notice.friend_recall`` → `RecallEvent`。
+
+        ## 只认这两种，其余返回 None
+
+        OneBot V11 的 notice 有十几种（poke / group_increase /
+        group_card / group_admin / friend_add…）。**只有撤回**会改变"我们手里
+        的知识是否还成立"，其余一律不接。不接不等于报错：调用方会把它们归到
+        ``ignored``，不刷日志。
+
+        ## 字段映射（按 OneBot V11 规范）
+
+        - ``group_recall``：``group_id`` / ``user_id``（原发言人）/
+          ``operator_id``（谁点的撤回）/ ``message_id``
+        - ``friend_recall``：``user_id``（对方）/ ``message_id``
+          （规范里没有 ``operator_id``，撤回人就是对方本人）
+
+        ## 为什么 ``self_recall`` 要单独标
+
+        机器人自己撤回自己的消息时也会来一条 ``*_recall``（``user_id`` 等于
+        ``self_id``）。它不是"对方收回了"，而是"我们自己收回了"。混在一起会
+        让行为日志说成"对方撤回了一条消息"——那是错误归属。本轮对它的处置
+        只是记录（原文照样不再进上下文，这一点对两边都成立）。
+        """
+        notice_type = str(payload.get("notice_type") or "")
+        if notice_type not in {"group_recall", "friend_recall"}:
+            return None
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            # 没有 message_id 就无从对应任何本地消息：**不猜**。
+            logger.debug(
+                "撤回通知缺少 message_id，按未匹配丢弃：notice=%s", notice_type
+            )
+            return None
+        is_group = notice_type == "group_recall"
+        self_id = str(payload.get("self_id") or self._config.self_id or "")
+        user_id = str(payload.get("user_id") or "") or None
+        operator_id = str(payload.get("operator_id") or "") or None
+        group_id = str(payload.get("group_id") or "") if is_group else None
+        target_id = group_id or user_id
+        if is_group and not group_id:
+            logger.debug("群撤回通知缺少 group_id，按未匹配丢弃：message_id=%s", message_id)
+            return None
+
+        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+        sender_name = _clean_name((sender or {}).get("card")) or _clean_name(
+            (sender or {}).get("nickname")
+        )
+        return RecallEvent(
+            connector_instance=self.instance_id,
+            # 去重键：同一个 message_id 只会被撤回一次；平台重投时 id 相同。
+            external_event_id=f"{self.instance_id}:recall:{message_id}",
+            recall_kind=RecallKind.group if is_group else RecallKind.friend,
+            platform_message_id=message_id,
+            operator_ref=operator_id or user_id,
+            target_ref=target_id,
+            window_ref=(
+                window_ref_for(
+                    is_group=True,
+                    target_id=str(group_id),
+                    instance_id=self.instance_id,
+                )
+                if is_group and group_id
+                else (
+                    window_ref_for(
+                        is_group=False,
+                        target_id=str(user_id),
+                        instance_id=self.instance_id,
+                    )
+                    if user_id
+                    else None
+                )
+            ),
+            occurred_at=_from_ts(payload.get("time")),
+            sender_name=sender_name,
+            self_recall=bool(self_id) and (user_id == self_id or operator_id == self_id),
+        )
+
     def _remember_message_id(self, message_id: str, external_event_id: str) -> None:
         """记下一条见过的入站 message_id（引用白名单 + 上下文 id）。"""
         if message_id not in self._known_message_set:
@@ -678,8 +780,8 @@ class OneBotV11Connector(ChannelConnector):
         ).hexdigest()
         return hmac.compare_digest(signature[len("sha1=") :], expected)
 
-    def normalize_inbound(self, payload: dict) -> InteractionEnvelope:
-        """把 OneBot 事件翻译成交互信封。
+    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent:
+        """把 OneBot 事件翻译成交互信封；**撤回**除外（返回 `RecallEvent`）。
 
         只翻译，不改写语义：文本原样进 ``parts``，
         @ 与引用作为结构化字段保留，供决策层判断"是不是在跟我说话"。
@@ -730,10 +832,32 @@ class OneBotV11Connector(ChannelConnector):
             raise ChannelError(
                 ChannelErrorKind.ignored, f"message_sent:{message_id or ''}"
             )
+        if post_type == "notice":
+            # **撤回**是唯一需要内核处理的 notice：对方把他的那条收回了，
+            # 我们不能再把原文喂给模型。其余 notice（戳一戳、入群、群名片
+            # 更新…）仍然不进入任何链路——它们没有需要撤回的知识。
+            recall = self._recall_from_notice(payload)
+            if recall is not None:
+                return recall  # 类型故意与信封不同：它不是一条消息
+
+            notice_type = str(payload.get("notice_type") or "")
+            if notice_type in _IGNORED_NOTICE_TYPES:
+                # 已知且**按设计**不进任何链路：戳一戳、入群、群名片…
+                # 它们在活跃群里很频繁，逐条记日志会把真正要看的东西挤出去。
+                raise ChannelError(
+                    ChannelErrorKind.ignored,
+                    f"notice:{notice_type}:{payload.get('sub_type') or ''}",
+                )
+            # 不认识的 notice 类型仍然记一条：那是"出现了新东西"，
+            # 与"已知的不重要"不是一回事（把两者都静默掉，将来平台加了
+            # 新的撤回类事件我们会毫无察觉）。
+            raise ChannelError(
+                ChannelErrorKind.unsupported,
+                f"暂不处理 OneBot notice 类型: {notice_type or '（空）'}",
+            )
         if post_type != "message":
-            # notice/request 目前不进入对话链路。
-            # 它们仍有价值（入群、撤回、戳一戳、加好友请求），但要先有对应
-            # 处理策略，不能当普通消息塞给模型。
+            # request（加好友/入群邀请）不进入对话链路，也不该被当成
+            # "不支持"打日志——那是设计如此，不是缺口。
             raise ChannelError(
                 ChannelErrorKind.unsupported, f"暂不处理 OneBot 事件类型: {post_type}"
             )
