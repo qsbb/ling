@@ -292,3 +292,76 @@ async def test_multiple_media_are_all_recorded_when_owner_granted(
 
     assert len(recorded) == 2, recorded
     assert note is None
+
+
+async def test_a_failed_media_write_does_not_kill_the_turn(
+    logged_in: TestEnv,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """媒体登记撞 DB 错误（并发重投撞 `uq_media_evidence_dedupe` 就是这么来的）：
+    这一条跳过、调用方的事务照常提交。
+
+    修好之前：`MediaEvidenceService.record()` 里的 `flush()` 抛
+    ``IntegrityError``，它不在 `_ingest_media` 里那个 ``MediaEvidenceError``
+    分支上，于是一路穿透到 `InboundBridge.handle()` 外面 → "事件处理失败，
+    撤回认领以便重投"——用户看到的是"发了图，她完全没反应"；而且失败的
+    flush 把 session 标成待回滚，后面 ``commit()`` 还会再炸一次。
+    """
+    from sqlalchemy import event
+    from sqlalchemy.exc import IntegrityError
+
+    from ling.infra import db as db_module
+
+    await _grant(OWNER)
+    window_id = await _window(logged_in)
+
+    fired: list[str] = []
+
+    def _fail_media_insert(  # noqa: ANN001, ARG001
+        conn, cursor, statement, parameters, context, executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("INSERT") and "media_evidence" in statement:
+            fired.append(statement)
+            raise IntegrityError(statement, parameters, Exception("boom"))
+
+    engine = db_module._engine
+    assert engine is not None, "夹具没初始化引擎"
+    event.listen(engine.sync_engine, "before_cursor_execute", _fail_media_insert)
+    try:
+        async with session_scope() as session:
+            with caplog.at_level(logging.WARNING, logger="ling.kernel.bridge"):
+                recorded, note = await _bridge(session)._ingest_media(
+                    _envelope_with_two_media(),
+                    subject_id=SPEAKER,
+                    window_id=window_id,
+                    owner_subject_id=OWNER,
+                )
+            # SAVEPOINT 回滚之后这个事务仍然干净：这一步抛错就说明没兜住
+            await session.commit()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _fail_media_insert)
+
+    assert fired, "用例没打到媒体登记那一步"
+    assert recorded == []
+    assert note and "媒体登记失败" in note, note
+    warnings = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", "") == "media_evidence_record_failed"
+    ]
+    assert warnings and warnings[-1].attributes["reason_code"] == "media_evidence_record_failed"
+
+    # 失败的写没有留下半条证据
+    from sqlalchemy import func
+    from sqlalchemy import select as _select
+
+    async with session_scope() as session:
+        count = (
+            await session.execute(
+                _select(func.count())
+                .select_from(MediaEvidenceRow)
+                .where(MediaEvidenceRow.actor_id == ACTOR)
+            )
+        ).scalar_one()
+    assert count == 0
+

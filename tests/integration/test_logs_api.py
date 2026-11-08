@@ -298,7 +298,7 @@ async def test_successful_log_poll_does_not_log_itself(logged_in: TestEnv) -> No
         assert response.status_code == 200, response.text
 
     paths = [
-        entry.attributes.get("http.request.path")
+        entry.attributes.get("http.route")
         for entry in await _access_entries()
     ]
     assert "/v1/logs" not in paths, paths
@@ -316,7 +316,7 @@ async def test_failing_log_poll_is_still_logged(logged_in: TestEnv) -> None:
     assert response.status_code == 422, response.text
 
     paths = [
-        entry.attributes.get("http.request.path")
+        entry.attributes.get("http.route")
         for entry in await _access_entries()
     ]
     assert "/v1/logs" in paths, paths
@@ -328,7 +328,7 @@ async def test_other_endpoints_still_log_access(logged_in: TestEnv) -> None:
     assert (await logged_in.client.get("/v1/sessions")).status_code == 200
 
     paths = [
-        entry.attributes.get("http.request.path")
+        entry.attributes.get("http.route")
         for entry in await _access_entries()
     ]
     assert "/v1/sessions" in paths, paths
