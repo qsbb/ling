@@ -26,6 +26,7 @@ import type {
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
 import { LifePage } from './LifePage';
+import { LifeTimelinePanel } from './LifeTimeline';
 import { PageTabPanel, PageTabs, type PageTabSpec } from './PageTabs';
 
 interface LifeNowPageProps {
@@ -128,6 +129,13 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
 
   return (
     <div className="domain-body">
+      {/*
+        时间轴是**独立**取数的一块：它读的是 `/v1/life/timeline`（计划投影），
+        和下面三块（presence / goal / proactive）不是同一份数据，也不共用
+        请求。任何一边失败，另一边照常显示。
+      */}
+      <LifeTimelinePanel />
+
       {loading ? <p className="page__hint">加载中…</p> : null}
 
       {error ? (

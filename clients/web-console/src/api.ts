@@ -36,6 +36,7 @@ import type {
   GoalsResponse,
   ProactiveResponse,
   TimelineResponse,
+  LifeTimelineOut,
   SubjectsResponse,
   MergeResult,
   UnmergeResult,
@@ -388,6 +389,17 @@ export const api = {
   },
   proactive(): Promise<ProactiveResponse> {
     return request<ProactiveResponse>('/v1/proactive');
+  },
+  /**
+   * 一天的**只读**生活时间轴（`GET /v1/life/timeline`）。
+   *
+   * 不传 `date` = 服务端按**登录者时区**的今天。前端不自己算"今天"：
+   * 同一个请求在两台机器上会落到两个日期（见 docs/API-WEB-V1.md §11.1）。
+   * 这个端点不生成、不重排、不调模型，读到的就是库里的投影。
+   */
+  lifeTimeline(date?: string): Promise<LifeTimelineOut> {
+    const query = date ? `?date=${encodeURIComponent(date)}` : '';
+    return request<LifeTimelineOut>(`/v1/life/timeline${query}`);
   },
 
   /* ------------------------------------------------ 设置分类法与授权 */

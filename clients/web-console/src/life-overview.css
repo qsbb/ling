@@ -1,0 +1,68 @@
+/**
+ * 总览页新增的两块生活摘要（「今天的节奏」/「未来意向」）的样式。
+ *
+ * 单独成文件而不是塞进 `dashboard.css` 或 `styles.css`：那两份文件由并行
+ * 任务在改，这里只新增 `dash-` 前缀的补充规则，加载顺序不影响既有样式
+ * （选择器都带 `.dash`，与 dashboard.css 同前缀、同特异度）。
+ *
+ * 375px 的约束：`now` / `next` / `anchor` 的中文标签（"此刻可能在做"）不能
+ * 单行省略——那会只剩一个"此…"，用户看不出关系。
+ */
+
+.dash .dash-relation {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+
+/* 「已约定」才加实线描边：它是确认过的锚点，与"接下来（可能）"不同。 */
+.dash .dash-relation--anchor {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 「接下来」是可能，不描边（虚线留给"计划"这个更大的语义）。 */
+.dash .dash-relation--next {
+  border-style: dashed;
+}
+
+/* 375px：卡片行里的状态文字不再单行省略，允许换行。 */
+@media (max-width: 560px) {
+  .dash .dash-list__state,
+  .dash .dash-relation {
+    white-space: normal;
+  }
+}
+
+/*
+ * 375px：这两块的列表可能带三段文字（关系/日期 + 标题 + 状态/来源）。
+ * `styles.css` 里 `.dash-list__text` 是单行省略、`.dash-list__meta` 是
+ * `flex: none`——对旧卡片够用，但"已确认想在这个日期段做（时段仍待定）"
+ * 这种长状态会把整行撑到 448px（实测）。这里只对**新块的行**放开换行，
+ * 旧卡片的省略行为一点不改。
+ */
+.dash .dash-list__row--life {
+  flex-wrap: wrap;
+}
+
+.dash .dash-list__row--life .dash-list__text {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.dash .dash-list__row--life .dash-list__meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
