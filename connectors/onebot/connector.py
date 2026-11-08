@@ -21,7 +21,8 @@ import hashlib
 import hmac
 import logging
 import time
-from datetime import UTC, datetime
+from collections import deque
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -40,6 +41,7 @@ from ling.ports.channel import (
     ChannelErrorKind,
     OutboundMessage,
     ReceiptQuery,
+    delivery_text_digest,
 )
 
 from .message import (
@@ -51,6 +53,39 @@ from .message import (
 from .settings import OneBotConfig
 
 logger = logging.getLogger("ling.connectors.onebot")
+
+# ---------------------------------------------------------------- 对账常量
+#
+# **全部是工程初值，未经真实 NapCat 长跑验证。** 依据见
+# `docs/OUTBOUND-DELIVERY-RESEARCH.md` §4.2/§4.3/§4.5。
+
+# 回显环形缓冲：`message_sent`（我们自己发出的消息的回显）只用来给
+# "没有拿到 message_id 的那一段"补 id。**不是必需依赖**——NapCat 的
+# `reportSelfMessage` 默认是 false，大多数部署里这条事件根本不会来。
+ECHO_MAX_ENTRIES = 64
+
+# 见过的入站 message_id 上限。用于出站引用段的**本地白名单**：
+# 引用一个从没见过的 id，在 NapCat 上是"静默丢掉引用段、正文照发"（§4.4），
+# 本地能先挡住就没必要让平台去丢。
+KNOWN_MESSAGE_ID_LIMIT = 512
+
+# `get_group_msg_history` / `get_friend_msg_history` 一次取多少条。
+# 取太多会把 NapCat 打满（这是外呼），20 条覆盖几十秒的窗口足够。
+HISTORY_LOOKBACK = 20
+
+# 内容比对的时间窗：`[sent_at - 30s, sent_at + 180s]`。
+# 下限留 30 秒是给"本地时间比平台快"的时钟偏差留余量。
+HISTORY_MATCH_BEFORE_SECONDS = 30.0
+HISTORY_MATCH_AFTER_SECONDS = 180.0
+
+# "查不到 ≠ 没发出"（§4.2）的例外门槛：只有消息**足够旧**时，
+# "平台查无此 id + 历史里也没有同文消息"这两个否证才足以判 failed。
+# 太新的消息还可能在投递队列里，早判就会误记失败。
+EXPLICIT_MISSING_GRACE_SECONDS = 180.0
+
+# 平台明确说"消息不存在"的字样（NapCat 的 GetMsg 抛 `Error('消息不存在')`）。
+_MISSING_HINTS = ("消息不存在", "not found", "消息不存在或已撤回")
+
 
 class OneBotV11Connector(ChannelConnector):
     """一个 OneBot V11 实现（NapCat / Lagrange / go-cqhttp 等）的连接器。"""
@@ -87,10 +122,46 @@ class OneBotV11Connector(ChannelConnector):
         self.group_name_timeout = 2.0
         self.group_name_cache_max = 512
 
+        # ---- 对账/引用用到的进程内证据（都不落库） ----
+        #
+        # 1) 出站回显：`message_sent` 带上我们自己发出的消息的 `message_id`，
+        #    与 `send_*_msg` 回执同一个 id 空间（NapCat 的
+        #    `MessageUnique.createUniqueMsgId`），所以可以给"没拿到回执 id"
+        #    的那一段补 id。
+        self._echoes: deque[tuple[datetime, str, str, str]] = deque(
+            maxlen=ECHO_MAX_ENTRIES
+        )
+        # 2) 发出但平台没回 message_id 的那几条：`operation_id -> (window_ref,
+        #    正文, 发出时间)`。只在**同一进程**里能把回显对回 operation；
+        #    worker 是另一个进程，所以对账不能只依赖它（见 `query_receipt`）。
+        self._unidentified: dict[str, tuple[str, str, datetime]] = {}
+        # 3) 见过的入站 message_id（引用白名单）。有界：只留最近的，
+        #    因为 NapCat 的短 id 表本身也是 5000 条 FIFO（§4.2）。
+        self._known_message_ids: deque[str] = deque(maxlen=KNOWN_MESSAGE_ID_LIMIT)
+        self._known_message_set: set[str] = set()
+        # 4) 外部事件 id → 平台 message_id。上下文要给模型**真实 id**（§5 P0-4），
+        #    而 id 只有连接器知道（`f"{self_id}:{message_id}"` 是 OneBot 的拼法）。
+        self._event_message_ids: dict[str, str] = {}
+
     # ------------------------------------------------------------ 出站
 
     async def send(self, message: OutboundMessage) -> DeliveryReceipt:
-        """发送消息（群聊/私聊按 ``message.is_group`` 选 API）。"""
+        """发送消息（群聊/私聊按 ``message.is_group`` 选 API）。
+
+        ## 三件必须分开的事
+
+        1. **引用白名单**：`reply_to` 必须是**我们真的见过**的入站 message_id，
+           否则本地就去掉引用段（降级为普通消息），不让平台去静默丢它
+           （NapCat 对无效 reply 是"丢弃该段、正文照发"，§4.4）。
+        2. **装饰段兜底**：平台明确拒收（``rejected``）时去掉引用/@ 重发一次，
+           正文不能跟着丢。**注意**：调研（§4.5）里 NapCat 全仓没有
+           ``retcode=100``，无效引用走的是"静默丢段"，所以这条路基本不会触发；
+           真正治本的是给模型真实 id（上下文里的 `[msg_id:…]`）。
+        3. **回执语义**：`retcode=0` 但 `data` 为空 / 没有 ``message_id`` 时，
+           平台只是"没说失败"，**不是**"确认送达"。这种情况记
+           ``uncertain``（进对账），绝不记 ``sent``——`sent` 在上层被算成
+           "已送达"，于是"平台没给 id"被当成"发完了"。
+        """
         if message.is_group:
             action = "send_group_msg"
             params: dict = {"group_id": self._target_id(message.window_ref)}
@@ -101,31 +172,33 @@ class OneBotV11Connector(ChannelConnector):
         # ``message.operation_id`` 是本地 operation 行 ID，只用来回填下面
         # 回执里的 ``operation_id``（本地关联）；平台侧收不到这个字段，也不能
         # 按它去重或对账——平台侧凭据是响应里的 ``data.message_id``。
+        mentions = list(getattr(message, "mentions", None) or [])
+        reply_to = getattr(message, "reply_to", None)
+        dropped_reply: str | None = None
+        if reply_to and self._known_message_set and str(reply_to) not in self._known_message_set:
+            # 只丢**引用段**，不丢正文、也不丢 @：引用是装饰，正文才是话本身。
+            dropped_reply = str(reply_to)
+            logger.info(
+                "引用目标不在见过的入站消息里，按普通消息发送（不发送引用段）：%s",
+                dropped_reply,
+            )
+            reply_to = None
         params["message"] = build_outbound_segments(
             message.text,
             list(message.media_refs),
-            list(getattr(message, "mentions", None) or []),
-            getattr(message, "reply_to", None),
+            mentions,
+            reply_to,
         )
 
-        # 装饰段（引用 / @）被平台拒收时，**不能连正文一起丢掉**。
+        # 装饰段（引用 / @）被平台明确拒收时，**不能连正文一起丢掉**。
         #
-        # 为什么会发生：她可以自己选表达方式（`capabilities/expression_choice`），
-        # 而提示里写的是 ``[quote:消息序号]`` / ``[at:QQ号]``——上下文里
-        # **从来没有给过她真实的消息 id 或 QQ 号**（`kernel/context.py` 只给
-        # 名字）。于是她写出来的引用 id 常常对不上任何平台消息，NapCat 的
-        # `send_*_msg` 会整条拒收（``retcode=100``）。
+        # 只在 ``rejected`` 上重试：``uncertain``（异步提交/响应不是 JSON/
+        # NapCat 的 1200、200）可能**已经发出去了**，重发就是重复消息；
+        # ``unreachable`` / ``unauthorized`` 重发也不会有不同结果。
         #
-        # 结果是"她决定了回、正文也生成了，对方一个字都没收到"，而本地只知道
-        # "这段没送达"。引用是**装饰**，正文才是话本身：平台明确拒收
-        # （``rejected``）说明这一条根本没发出去，此时去掉装饰重发一次，
-        # 宁可少一个 @ 也不能让她的话消失。
-        #
-        # 只在 ``rejected`` 上重试：``uncertain``（异步提交/响应不是 JSON）
-        # 可能**已经发出去了**，重发就是重复消息；``unreachable`` /
-        # ``unauthorized`` 重发也不会有不同结果。
-        mentions = list(getattr(message, "mentions", None) or [])
-        reply_to = getattr(message, "reply_to", None)
+        # 按调研（§4.4/§4.5）：NapCat 对**无效 reply 是静默丢弃该段、正文照发**，
+        # 只有"所有段都被丢掉"才会变成错误。所以这条分支在 NapCat 上几乎不会
+        # 触发——**别把它当成引用失效的主要修法**，治本是把真实 id 放进上下文。
         degraded: str | None = None
         try:
             data = await self._call(action, params)
@@ -159,6 +232,16 @@ class OneBotV11Connector(ChannelConnector):
             mid = data.get("message_id")
             if mid is not None:
                 platform_message_id = str(mid)
+        notes = []
+        if degraded:
+            # 降级重发过就如实写进回执：事后对账时能看出"这条为什么少了引用"。
+            notes.append(f"已去掉引用/@ 重发（平台拒收装饰段：{degraded}）")
+        if dropped_reply:
+            notes.append(f"引用目标不在可见范围（{dropped_reply}），已降级为普通消息")
+        if platform_message_id is None:
+            # 平台回了成功但没有 id：**不能算已送达**，只能算"提交了、未确认"。
+            self._remember_unidentified(message)
+            notes.append("平台未返回 message_id（提交结果无法确认，进对账而不是记已送达）")
         return DeliveryReceipt(
             receipt_id=new_id("rcpt"),
             operation_id=message.operation_id,
@@ -166,46 +249,274 @@ class OneBotV11Connector(ChannelConnector):
             state=(
                 DeliveryState.delivered
                 if platform_message_id
-                else DeliveryState.sent
+                else DeliveryState.uncertain
             ),
             platform_message_id=platform_message_id,
             observed_at=_now(),
-            # 降级重发过就如实写进回执：事后对账时能看出"这条为什么少了引用"。
-            detail=(
-                f"已去掉引用/@ 重发（平台拒收装饰段：{degraded}）"
-                if degraded
-                else None
-            ),
+            detail="；".join(notes) if notes else None,
+        )
+
+    def _remember_unidentified(self, message: OutboundMessage) -> None:
+        """记住"发出去了但平台没给 id"的那一条，供同进程的对账补 id 用。
+
+        有界：只留最近 128 条（一次长回复最多 5 段，够覆盖正常会话）。
+        """
+        if len(self._unidentified) >= 128:
+            oldest = sorted(self._unidentified.items(), key=lambda kv: kv[1][2])[:32]
+            for key, _ in oldest:
+                self._unidentified.pop(key, None)
+        self._unidentified[str(message.operation_id)] = (
+            message.window_ref,
+            message.text,
+            _now(),
         )
 
     async def query_receipt(self, query: ReceiptQuery) -> DeliveryReceipt:
         """对账：OneBot 没有独立的"查送达"API。
 
-        只能用 ``get_msg`` 确认消息存在（存在 ≠ 已读，但能区分
-        "发出去了" 与 "根本没到平台"）。查不到就是不确定——
-        **不能**当成失败，否则会重发造成重复。
+        三级证据，**只能单向确认**（§4.2）：
+
+        1. 有 ``platform_message_id`` → ``get_msg``。查到 → ``delivered``；
+           平台明确说"消息不存在" → **一个否证**，还要第二个才敢判 failed。
+        2. 没有 id → 先看同进程的 ``message_sent`` 回显（回显带真实
+           ``message_id``，与发送回执同一 id 空间）；再看
+           ``get_group_msg_history`` / ``get_friend_msg_history`` 的**内容比对**
+           （自己发的 + 同文 + 时间窗内，且必须**唯一命中**）。
+        3. 两个否证（平台查无此 id + 近期历史里没有同文消息）**且**消息已过
+           宽限期 → ``failed``；否则一律 ``uncertain``。
+
+        **查不到 ≠ 没发出去**（§4.2）：NapCat 的短 id 表是 5000 条 FIFO，
+        进程重启/超量/撤回都会"消息不存在"。所以不允许因为一次查不到就记失败。
+        这里的 ``failed`` 只表示"两个独立证据都说没到平台"，而且仍然**不重发**。
         """
-        try:
-            data = await self._call("get_msg", {"message_id": query.platform_message_id})
-        except ChannelError:
-            return DeliveryReceipt(
-                receipt_id=new_id("rcpt"),
-                operation_id=query.operation_id,
-                channel=self.connector_id,
-                state=DeliveryState.uncertain,
-                observed_at=_now(),
-                detail="查询失败，结果未知",
+        if query.platform_message_id:
+            try:
+                data = await self._call(
+                    "get_msg", {"message_id": query.platform_message_id}
+                )
+            except ChannelError as exc:
+                if _looks_missing(exc.message):
+                    return await self._negative_evidence(
+                        query, reason=f"get_msg: {exc.message}"
+                    )
+                return self._receipt(
+                    query,
+                    DeliveryState.uncertain,
+                    detail=f"查询失败，结果未知（{exc.message}）",
+                )
+            found = isinstance(data, dict) and data.get("message_id") is not None
+            if found:
+                return self._receipt(
+                    query,
+                    DeliveryState.delivered,
+                    platform_message_id=query.platform_message_id,
+                )
+            return await self._negative_evidence(query, reason="get_msg: 空 data")
+
+        # 没有平台 id：先看回显（同进程内最快、最准的证据）
+        echo_id = self._match_echo(query)
+        if echo_id:
+            return self._receipt(
+                query,
+                DeliveryState.delivered,
+                platform_message_id=echo_id,
+                detail="按 message_sent 回显确认（回显里的 message_id 与发送回执同 id 空间）",
             )
-        found = isinstance(data, dict) and data.get("message_id") is not None
+        return await self._negative_evidence(query, reason="无平台 id")
+
+    async def _negative_evidence(
+        self, query: ReceiptQuery, *, reason: str
+    ) -> DeliveryReceipt:
+        """一个否证之后：能再拿到第二个否证、且消息已过宽限期，才判 failed。"""
+        scanned = await self._scan_history(query)
+        if scanned.matched_id:
+            return self._receipt(
+                query,
+                DeliveryState.delivered,
+                platform_message_id=scanned.matched_id,
+                detail=f"按历史内容比对确认（{reason}）",
+            )
+        if scanned.ambiguous:
+            return self._receipt(
+                query,
+                DeliveryState.uncertain,
+                detail=f"{reason}；历史里有不止一条同文消息，无法唯一命中",
+            )
+        if not scanned.ok:
+            return self._receipt(
+                query,
+                DeliveryState.uncertain,
+                detail=f"{reason}；历史查询不可用，无法取得第二个否证",
+            )
+        if not scanned.saw_self:
+            # **历史里一条自己的消息都没有** = 还不能证明"这份历史会包含我发的
+            # 消息"。调研 §7.6 正是未证实项（`get_group_msg_history` 是否含
+            # 机器人自己发的消息，没有实机验证）。在这种情况下"没找到同文消息"
+            # 不构成否证——否则整个 NapCat 的行为差异会被我们误判成"没送达"。
+            return self._receipt(
+                query,
+                DeliveryState.uncertain,
+                detail=(
+                    f"{reason}；历史里看不到任何自己发出的消息，"
+                    "无法据此判定（平台历史可能不含自身消息）"
+                ),
+            )
+        # 两个否证都拿到了：还要过了宽限期才敢说"没到平台"
+        sent_at = _aware(query.sent_at)
+        if sent_at is not None and (
+            _now() - sent_at
+        ).total_seconds() < EXPLICIT_MISSING_GRACE_SECONDS:
+            return self._receipt(
+                query,
+                DeliveryState.uncertain,
+                detail=f"{reason}；历史里也没有同文消息，但消息太新（可能仍在投递）",
+            )
+        return self._receipt(
+            query,
+            DeliveryState.failed,
+            detail=(
+                f"{reason}；近期历史里也没有同文消息（两个独立否证）——"
+                "按未到达平台记录。注意：平台已发出但被撤回/超出保留窗口也会长这样"
+            ),
+        )
+
+    async def _scan_history(self, query: ReceiptQuery) -> _HistoryScan:
+        """在窗口历史里找"自己发的、同文的、时间窗内"的消息。"""
+        window_ref = query.window_ref or ""
+        digest = query.text_digest or ""
+        if not window_ref or not digest:
+            # 拿不到会话/正文就没法比对：当作"没有证据"，不当作否证。
+            return _HistoryScan(ok=False)
+        sent_at = _aware(query.sent_at) or _now()
+        since = sent_at - timedelta(seconds=HISTORY_MATCH_BEFORE_SECONDS)
+        until = sent_at + timedelta(seconds=HISTORY_MATCH_AFTER_SECONDS)
+        is_group = ":group:" in window_ref
+        action = "get_group_msg_history" if is_group else "get_friend_msg_history"
+        target_key = "group_id" if is_group else "user_id"
+        try:
+            data = await self._call(
+                action,
+                {target_key: self._target_id(window_ref), "count": HISTORY_LOOKBACK},
+            )
+        except ChannelError as exc:
+            logger.debug("历史查询失败（对账保持 uncertain）：%s", exc.message)
+            return _HistoryScan(ok=False)
+        if isinstance(data, dict):
+            rows = data.get("messages") or data.get("message") or []
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        if not isinstance(rows, list):
+            return _HistoryScan(ok=False)
+        self_id = str(self._config.self_id or "")
+        hits: list[str] = []
+        saw_self = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sender = row.get("sender") or {}
+            sender_id = str((sender or {}).get("user_id") or "")
+            if not self_id or sender_id != self_id:
+                continue
+            saw_self = True
+            parsed = parse_message(row.get("message"), self_id=self_id)
+            if delivery_text_digest(parsed.text) != digest:
+                continue
+            at = _from_ts(row.get("time"))
+            if at is not None and not (since <= at <= until):
+                continue
+            mid = row.get("message_id")
+            if mid is not None:
+                hits.append(str(mid))
+        if len(hits) == 1:
+            return _HistoryScan(ok=True, matched_id=hits[0], saw_self=True)
+        if len(hits) > 1:
+            return _HistoryScan(ok=True, ambiguous=True, saw_self=True)
+        return _HistoryScan(ok=True, saw_self=saw_self)
+
+    def _match_echo(self, query: ReceiptQuery) -> str | None:
+        """用同进程收到的 ``message_sent`` 回显给这一段补 id。
+
+        只在这个连接器实例**自己发过**那一段时才用（`_unidentified`），
+        所以不会把别人发的消息当成自己的。
+        """
+        seen = self._unidentified.get(str(query.operation_id))
+        if seen is None:
+            return None
+        window_ref, text, at = seen
+        wanted = delivery_text_digest(text)
+        since = at - timedelta(seconds=HISTORY_MATCH_BEFORE_SECONDS)
+        until = at + timedelta(seconds=HISTORY_MATCH_AFTER_SECONDS)
+        target = self._target_id(window_ref)
+        hits = [
+            message_id
+            for observed, echo_target, message_id, echo_text in self._echoes
+            if echo_target == target
+            and delivery_text_digest(echo_text) == wanted
+            and since <= observed <= until
+        ]
+        # 唯一命中才算证据（§5 P0-2 风险：同一句话连发两遍会误命中）
+        return hits[0] if len(hits) == 1 else None
+
+    def _receipt(
+        self,
+        query: ReceiptQuery,
+        state: DeliveryState,
+        *,
+        platform_message_id: str | None = None,
+        detail: str | None = None,
+    ) -> DeliveryReceipt:
         return DeliveryReceipt(
             receipt_id=new_id("rcpt"),
             operation_id=query.operation_id,
             channel=self.connector_id,
-            state=DeliveryState.delivered if found else DeliveryState.uncertain,
-            platform_message_id=query.platform_message_id,
+            state=state,
+            platform_message_id=platform_message_id or query.platform_message_id,
             observed_at=_now(),
-            detail=None if found else "平台无此消息",
+            detail=detail,
         )
+
+    def platform_message_id_for_event(self, external_event_id: str) -> str | None:
+        """外部事件 id → 平台 message_id（给上下文注入 `[msg_id:…]` 用）。
+
+        只有连接器知道这个映射：OneBot 的 `external_event_id` 是
+        ``f"{self_id}:{message_id}"``，别的渠道不是这个拼法。所以内核不该自己
+        拆字符串，而是问连接器——不支持就返回 ``None``，上下文里就不带 id。
+        """
+        return self._event_message_ids.get(str(external_event_id or ""))
+
+    def _remember_message_id(self, message_id: str, external_event_id: str) -> None:
+        """记下一条见过的入站 message_id（引用白名单 + 上下文 id）。"""
+        if message_id not in self._known_message_set:
+            self._known_message_ids.append(message_id)
+            # 白名单直接由环形缓冲重建：`deque(maxlen=…)` 自动淘汰最旧的，
+            # 重建一次 512 个元素的集合比维护"谁被淘汰了"的账更不容易错。
+            self._known_message_set = set(self._known_message_ids)
+        if len(self._event_message_ids) >= KNOWN_MESSAGE_ID_LIMIT * 4:
+            # 事件 id 表只服务"当前这一轮"的上下文注入，可以有界地丢最旧的。
+            for key in list(self._event_message_ids)[: KNOWN_MESSAGE_ID_LIMIT]:
+                self._event_message_ids.pop(key, None)
+        self._event_message_ids[str(external_event_id)] = message_id
+
+    def _record_echo(self, payload: dict) -> None:
+        """把一条 ``message_sent`` 回显记进有界环形缓冲。
+
+        只记**目标 + 正文 + message_id + 观察时间**：对账靠这四项做
+        "自己发的、同文的、时间窗内的唯一命中"。
+        """
+        message_id = payload.get("message_id")
+        if message_id is None:
+            return
+        target = str(
+            payload.get("target_id")
+            or payload.get("group_id")
+            or payload.get("user_id")
+            or ""
+        )
+        parsed = parse_message(payload.get("message"), self_id=self._config.self_id)
+        self._echoes.append((_now(), target, str(message_id), parsed.text))
+
 
     async def _call(self, action: str, params: dict) -> object:
         """调用 OneBot HTTP API。"""
@@ -270,6 +581,35 @@ class OneBotV11Connector(ChannelConnector):
             # 异步提交：结果未知，不能算成功也不能算失败
             raise ChannelError(
                 ChannelErrorKind.uncertain, detail_or("异步处理，结果未知", body)
+            )
+        # ---- NapCat 的实际错误码（`OneBotAction.ts`，见调研 §4.5）----
+        #
+        # | retcode | 含义                          | 分类      |
+        # |---------|-------------------------------|-----------|
+        # | 400/1400| 参数 schema 校验失败（没发）    | rejected  |
+        # | 1404    | 不支持的 API                   | unsupported |
+        # | 1200/200| **动作内部抛异常**（可能是发送超时、也可能"消息体无法解析"）| uncertain |
+        #
+        # 关键：**1200/200 把"发送前失败"和"发送中超时"混成同一个码**，
+        # 只能保守按"可能已发出"处理——记 uncertain 进对账，**绝不重发**
+        # （重发就是重复消息）。原实现把它们都归成 ``rejected``，
+        # 而 ``rejected`` 会触发"去掉装饰重发"，等于把超时当"肯定没发出"。
+        #
+        # 另：全仓检索 NapCat 的 ``OB11Response.error(...)`` 只出
+        # 200/400/1200/1400/1404，**没有 100**。所以线上若真见到
+        # ``retcode=100``，那一定来自别的实现（如 Lagrange），按兜底的
+        # ``rejected`` 处理是安全的；但别拿它当"引用失效"的证据——NapCat 对
+        # 无效 reply 是**静默丢掉该段、正文照发**（§4.4），根本不会报错。
+        if retcode in {1200, 200}:
+            raise ChannelError(
+                ChannelErrorKind.uncertain,
+                detail_or(f"OneBot 动作内部异常 retcode={retcode}（可能已发送）", body),
+            )
+        if retcode == 1404:
+            raise ChannelError(
+                ChannelErrorKind.unsupported,
+                detail_or("OneBot 实现不支持该 API retcode=1404", body),
+                retriable=False,
             )
         raise ChannelError(
             ChannelErrorKind.rejected, detail_or(f"OneBot 调用失败 retcode={retcode}", body)
@@ -364,6 +704,13 @@ class OneBotV11Connector(ChannelConnector):
             # 这里**不补写回执**：``DeliveryReceiptRow`` 必须挂在
             # ``operation_id`` 上，而回显事件里没有这个值；拿它凑一条
             # "已送达"只能证明平台存在这条消息，属于伪造送达证据。
+            #
+            # 但**要把 id 记下来**（调研 §4.3 / §5 P0-2）：回显里的
+            # ``message_id`` 与 ``send_*_msg`` 回执的 ``message_id`` 是
+            # 同一个 id 空间，所以它能给"发出去了但平台没给 id"的那一段补 id。
+            # 只在同进程有效（worker 是另一个进程），所以它只是对账的
+            # **加速证据**，不是必需依赖——`reportSelfMessage` 默认是关的。
+            self._record_echo(payload)
             message_id = payload.get("message_id")
             logger.debug(
                 "出站回显（自己发出的消息，按设计忽略）：message_id=%s target=%s",
@@ -403,6 +750,11 @@ class OneBotV11Connector(ChannelConnector):
         # 去重键必须包含 self_id 与 message_id：同一 QQ 号下 message_id 唯一，
         # 但多实例共库时只靠 message_id 会互相覆盖。
         external_event_id = f"{self_id}:{message_id}" if message_id else new_id("obe")
+        # 这条入站消息的**真实平台 id**有两个用处：
+        # 1. 出站引用白名单（引用一个没见过的 id，NapCat 只会静默丢段，§4.4）；
+        # 2. 上下文里给模型看 `[msg_id:…]`（§5 P0-4）。
+        if message_id:
+            self._remember_message_id(message_id, external_event_id)
 
         occurred = payload.get("time")
         # 本次称呼（card 优先）与昵称（人级）分开带走：显示用前者，
@@ -647,6 +999,49 @@ def _now():  # noqa: ANN202
     from datetime import UTC, datetime
 
     return datetime.now(UTC)
+
+
+def _aware(value):  # noqa: ANN001, ANN202
+    """把可能 naive 的时间统一成带时区的 UTC。拿不到就返回 None。"""
+    from datetime import UTC, datetime
+
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _looks_missing(message: str) -> bool:
+    """平台的话里有没有"这条消息不存在"。"""
+    lowered = (message or "").lower()
+    return any(hint in lowered for hint in _MISSING_HINTS)
+
+
+class _HistoryScan:
+    """一次历史内容比对的结果。
+
+    ``ok`` 只是"查询成功"，**不等于**"没有命中"：
+    - ``matched_id`` 唯一命中 → 可以补 id、记 delivered
+    - ``ambiguous`` 命中多条 → 只能保持 uncertain（同一句话连发两遍）
+    - ``ok=False`` → 查询不可用，**不能**当成否证
+    - ``saw_self=False`` → 这份历史里**一条自己的消息都没有**。调研 §7.6 没
+      证实"平台历史是否包含机器人自己发的消息"，所以"没找到同文消息"在这种
+      情况下不构成否证（否则平台行为差异会被误判成"没送达"）。
+    """
+
+    __slots__ = ("ambiguous", "matched_id", "ok", "saw_self")
+
+    def __init__(
+        self,
+        *,
+        ok: bool,
+        matched_id: str | None = None,
+        ambiguous: bool = False,
+        saw_self: bool = False,
+    ) -> None:
+        self.ok = ok
+        self.matched_id = matched_id
+        self.ambiguous = ambiguous
+        self.saw_self = saw_self
 
 
 def _sender_fields(payload: dict) -> tuple[str | None, str | None]:

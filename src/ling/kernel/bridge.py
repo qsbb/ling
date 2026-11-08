@@ -16,9 +16,13 @@ Request/SSE。渠道入站没有 Request，所以把那段流水线抽到这里�
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import random
 import re
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -38,6 +42,7 @@ from ling.kernel.autonomy import (
     make_situation_reader,
     scenario_key_for,
 )
+from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
 from ling.kernel.decision import DecisionContext, classify_text
 from ling.kernel.turn import describe_turn_failure
 from ling.logging_setup import emit_event
@@ -46,6 +51,130 @@ if TYPE_CHECKING:
     from ling.infra.models import Turn
 
 logger = logging.getLogger("ling.kernel.bridge")
+
+# ---------------------------------------------------------------- 出站节奏/限速
+#
+# 依据 docs/OUTBOUND-DELIVERY-RESEARCH.md §5 P1-2：
+# - AstrBot 的 1.5–3.5 秒随机停顿是**拟人节奏**，不是限速；
+# - MaiBot 用"打字时长"（中文 0.3 s/字）拟人，也不是限速；
+# - 两家都没有真正的令牌桶，NapCat 侧也没有频控（§4.5）。
+#
+# 所以这里补三件真需要的事，全部是**工程初值、未经真实会话验证**：
+# 1. 段间**最小间隔 + 抖动**：避免机械节奏被识别成机器人；
+# 2. 每窗口**令牌桶**：同一个人连收 5 条会烦，群里更是刷屏；
+# 3. 同窗口**串行发送**：两个并发轮次不能把两段话交错着发出去。
+#
+# 基础间隔**复用** `chunking.PART_DELAY_SECONDS`（1.2 s）：它本来就是这个
+# 用途，而且测试把它改成 0 时整套节奏（含令牌桶）一起关掉，不必另加开关。
+PART_INTERVAL_JITTER = (0.85, 1.25)
+SEND_BUCKET_CAPACITY = 3.0  # 每窗口突发 3 段
+SEND_BUCKET_REFILL_SECONDS = 3.0  # 之后每 3 秒补 1 段
+WINDOW_GATE_LIMIT = 256  # 进程内最多保留多少个窗口的闸门
+
+# 一轮生成最多等多久（秒）。**这是工程初值**：180 秒是原来写死的值，
+# 保留它，但抽成常量便于测试注入（测试不可能真等三分钟）。
+TURN_WAIT_TIMEOUT_SECONDS = 180.0
+
+
+async def _sleep(seconds: float) -> None:
+    """段间停顿。单独抽出来是为了测试能把它换掉（不必真等）。"""
+    if seconds > 0:
+        await asyncio.sleep(seconds)
+
+
+def _part_interval_base() -> float:
+    """段间基础间隔（秒）。0 = 关掉节奏与令牌桶（测试用）。"""
+    from ling.capabilities.chunking import PART_DELAY_SECONDS
+
+    return float(PART_DELAY_SECONDS or 0.0)
+
+
+class WindowSendGate:
+    """一个窗口的出站闸门：**串行** + 最小间隔 + 令牌桶。
+
+    进程内实现。跨进程的"谁在说话"由发言租约（`kernel/speak_lease.py`）管，
+    但那条租约在生成结束时就释放了，而投递发生在那之后——所以发送这一层
+    仍然需要自己的串行闸：两个并发轮次各自分段发送时，绝不能让同一窗口的
+    两段话交错（用户看到的是 A1 B1 A2 B2）。
+
+    跨进程的重复发送由**段级幂等**（`IdempotencyKey("delivery_part", …)`）
+    挡住；这里只管节奏与顺序。
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._tokens = SEND_BUCKET_CAPACITY
+        self._stamp = time.monotonic()
+
+    async def pace(self, *, first: bool) -> float:
+        """在**已经持有锁**时调用：等够最小间隔并取走一个令牌。
+
+        返回实际等待秒数（只用于日志/测试断言）。
+        """
+        waited = 0.0
+        base = _part_interval_base()
+        if base <= 0:
+            return waited
+        if not first:
+            low, high = PART_INTERVAL_JITTER
+            delay = base * random.uniform(low, high)
+            await _sleep(delay)
+            waited += delay
+        self._refill()
+        if self._tokens < 1.0:
+            wait = (1.0 - self._tokens) * SEND_BUCKET_REFILL_SECONDS
+            await _sleep(wait)
+            waited += wait
+            self._refill()
+        self._tokens = max(0.0, self._tokens - 1.0)
+        return waited
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._stamp)
+        self._stamp = now
+        self._tokens = min(
+            SEND_BUCKET_CAPACITY,
+            self._tokens + elapsed / SEND_BUCKET_REFILL_SECONDS,
+        )
+
+
+_SEND_GATES: dict[str, WindowSendGate] = {}
+
+
+def _gate_for(window_ref: str) -> WindowSendGate:
+    gate = _SEND_GATES.get(window_ref)
+    if gate is None:
+        if len(_SEND_GATES) >= WINDOW_GATE_LIMIT:
+            _SEND_GATES.pop(next(iter(_SEND_GATES)), None)
+        gate = WindowSendGate()
+        _SEND_GATES[window_ref] = gate
+    return gate
+
+
+def reset_send_gates() -> None:
+    """清空进程内闸门（测试用；生产不需要）。"""
+    _SEND_GATES.clear()
+
+
+def _event_message_id_hint(external_event_id: str) -> str | None:
+    """从外部事件 id 里猜出平台 message_id。
+
+    兜底用：连接器提供了 `platform_message_id_for_event` 时优先问它。
+    OneBot 与 qqbot 的拼法都是 ``"<账号>:<平台 message_id>"``，
+    所以取第一个冒号后面的部分。
+    """
+    value = str(external_event_id or "")
+    if not value:
+        return None
+    if ":" in value:
+        tail = value.split(":", 1)[1]
+        return tail or None
+    return value
 
 
 @dataclass
@@ -100,6 +229,13 @@ class TurnResult:
     suppressed_reason: str | None = None
     # 出口清洗**之前**的原始字数：区分「模型没说话」与「说了被洗空」
     raw_chars: int = 0
+    # 这一轮**生成超时**了（没有等到 turn.completed/failed）。
+    # 正文可能还在路上，也可能已经落库；总之**不能记成"回了"**。
+    timed_out: bool = False
+    # 超时时已经流出来的字数（0 = 一个字都还没生成）。
+    partial_chars: int = 0
+    # 她想引用但 id 对不上（被降级为普通消息）。留痕，别让它静默消失。
+    quote_dropped: str | None = None
 
     @property
     def suppressed(self) -> bool:
@@ -153,6 +289,26 @@ def describe_delivery(delivered: bool, *, parts_sent: int, parts_total: int) -> 
     if parts_sent <= 0:
         return f"投递失败（0/{parts_total} 段发出，对方没有收到）"
     return f"部分送达（{parts_sent}/{parts_total} 段发出，后面的段没到）"
+
+
+def describe_timeout(result: TurnResult) -> str:
+    """生成超时时**必须说清**"有没有东西、在哪儿"。
+
+    三种结局完全不同，而它们以前共用同一句「轮次结束但没有可交付文本」：
+    - 已经生成了一部分（且已落库）→ 正文没丢，只是还没投递；
+    - 一个字都没生成 → 这一轮真的没有内容；
+    - 请求了停止但收尾还没跑完 → 正文会在收尾时落库。
+    """
+    seconds = int(TURN_WAIT_TIMEOUT_SECONDS)
+    if result.partial_chars <= 0:
+        return (
+            f"生成超时（{seconds} 秒）：还没有生成任何内容，已请求停止；"
+            "这一轮没有投递（不会记成已回复）"
+        )
+    return (
+        f"生成超时（{seconds} 秒）：已生成 {result.partial_chars} 字，"
+        "正文已落库、尚未投递（交给对账任务续发，不会重复发送已发段）"
+    )
 
 
 class InboundBridge:
@@ -520,6 +676,23 @@ class InboundBridge:
                 "config_revision": effective.revision,
             },
         )
+        # 重投（事件认领被释放后 OneBot 重发）时，这一轮可能**已经生成过正文、
+        # 也已经发出去几段**。那种情况只续发剩下的段：**不再调一次模型**
+        # （二次生成会让同一轮出现两版不同的话，而段级幂等键是按第一版记的），
+        # 也不重复落一条用户消息。
+        resumed_text = await self._resumable_reply(turn.id)
+        if resumed_text:
+            return await self._resume_delivery(
+                envelope=envelope,
+                turn=turn,
+                window=window,
+                subject_id=subject_id,
+                text=resumed_text,
+                is_group=is_group,
+                media_ids=media_ids,
+                media_note=media_note,
+            )
+
         user_row = await conversation.add_message(
             window.id,
             role="user",
@@ -530,6 +703,10 @@ class InboundBridge:
             attention_state="seen",
             sender_subject_id=subject_id,
         )
+        # 记下"这条入站消息的真实平台 id"：上下文要给模型看 `[msg_id:…]`，
+        # 而 `messages` 表只有本地 id。映射写进 `idempotency_keys`
+        # （scope=platform_msgid，key=本地消息 id）——不新增表、不改迁移。
+        await self._remember_platform_message_id(user_row.message_id, envelope)
         await self._record_followup(
             decision,
             subject_id=subject_id,
@@ -552,8 +729,56 @@ class InboundBridge:
             # `compile(user_sender_name=...)`：库里那一列是旁路，改名后
             # 当轮就该用新名片，而不是等落库再下一轮才生效。
             sender_name=envelope.sender_name,
+            current_message_platform_id=self._platform_message_id(envelope),
         )
         reply_text = turn_result.text
+        if turn_result.timed_out:
+            # **生成超时**：不许当作"没有可交付文本"草草收场。
+            #
+            # 两条事实必须同时成立：① 正文不能丢；② 不能记成"已回复"。
+            # 做法是让这一轮**优雅停止**（收尾路径把已生成的部分写进
+            # `messages`），再落一条 `delivery.pending`——周期对账任务看到
+            # 它就把正文发出去。续发走段级幂等，所以即使 bridge 已经发过
+            # 某几段也不会重复。
+            reason = describe_timeout(turn_result)
+            await self._request_turn_stop(turn.id)
+            await self._record_pending_delivery(
+                envelope=envelope,
+                turn_id=turn.id,
+                subject_id=subject_id,
+                text_len_readable=len(reply_text),
+            )
+            await conversation.correct_handled_for_turn(
+                turn.id, outcome="failed", reason=reason
+            )
+            await self._session.commit()
+            emit_event(
+                logger,
+                logging.WARNING,
+                event_name="turn_completed",
+                message="轮次超时：正文未丢，等待续发",
+                attributes={
+                    "turn_id": turn.id,
+                    "outcome": "timeout",
+                    "is_group": is_group,
+                    "partial_chars": turn_result.partial_chars,
+                    "raw_chars": turn_result.raw_chars,
+                    "reason": reason,
+                },
+            )
+            return BridgeResult(
+                accepted=True,
+                reason=reason,
+                subject_id=subject_id,
+                window_id=window.id,
+                turn_id=turn.id,
+                decision="reply",
+                media_evidence_ids=media_ids,
+                media_note=media_note,
+                # **不许记 replied**：这一轮还没有一个字发出去。
+                handled_as="failed",
+                delivered=False,
+            )
         if not reply_text:
             # 轮次跑完了却没产出文本：这是"她说不出话"，与"决定不说"不同。
             #
@@ -621,7 +846,20 @@ class InboundBridge:
             text=reply_text,
             subject_id=subject_id,
             expression=turn_result.expression or {},
+            # 段级幂等键由本轮 turn 派生（重投复用同一个 turn）
+            turn_id=turn.id,
         )
+        if turn_result.quote_dropped:
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="quote_degraded",
+                message="引用目标不是真消息 id，已降级为普通消息",
+                attributes={
+                    "turn_id": turn.id,
+                    "quote_dropped": turn_result.quote_dropped,
+                },
+            )
         emit_event(
             logger,
             logging.INFO if delivered else logging.WARNING,
@@ -668,6 +906,198 @@ class InboundBridge:
         )
 
     # ------------------------------------------------------------ 内部
+
+    # ------------------------------------------------------------ 消息 id
+
+    def _platform_message_id(self, envelope: InteractionEnvelope) -> str | None:
+        """这条入站消息的平台 message id。
+
+        只有连接器知道这件事（OneBot 是 ``f"{self_id}:{message_id}"``）。
+        连接器提供了 `platform_message_id_for_event` 就问它；没有就退回
+        "取第一个冒号后面的部分"——OneBot / qqbot 都是这个拼法。
+        """
+        probe = getattr(self._connector, "platform_message_id_for_event", None)
+        if callable(probe):
+            with contextlib.suppress(Exception):
+                found = probe(envelope.external_event_id)
+                if found:
+                    return str(found)
+        return _event_message_id_hint(envelope.external_event_id)
+
+    async def _remember_platform_message_id(
+        self, message_id: str, envelope: InteractionEnvelope
+    ) -> None:
+        """记下"本地消息 id → 平台 message id"，供上下文渲染 `[msg_id:…]`。
+
+        写进现成的 `idempotency_keys` 表（不建新表、不动迁移）。写失败只影响
+        "她能不能引用这条消息"，**绝不能**因此让这条消息处理失败。
+        """
+        platform_id = self._platform_message_id(envelope)
+        if not platform_id:
+            return
+        from ling.infra.models import IdempotencyKey
+        from ling.infra.security import new_id
+
+        existing = (
+            await self._session.execute(
+                select(IdempotencyKey).where(
+                    IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                    IdempotencyKey.key == message_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.result_ref = platform_id
+            return
+        self._session.add(
+            IdempotencyKey(
+                id=new_id("idem"),
+                scope=PLATFORM_MESSAGE_ID_SCOPE,
+                key=message_id,
+                result_ref=platform_id,
+            )
+        )
+        await self._session.flush()
+
+    # ------------------------------------------------------------ 重投续发
+
+    async def _resumable_reply(self, turn_id: str) -> str | None:
+        """这一轮**已经生成过正文、而且已经发过至少一段**时，返回那段正文。
+
+        为什么要续发而不是重新生成：① 二次生成会让同一轮出现两版不一样的话；
+        ② 段级幂等键是按第一版的段序号记的，换一版文字等于"已发段被跳过、
+        剩下的段发成另一句话"——那样用户会看到两段互不衔接的内容。
+        """
+        from ling.capabilities.delivery import PART_SCOPE
+        from ling.infra.models import IdempotencyKey, Message
+
+        text = (
+            await self._session.execute(
+                select(Message.text)
+                .where(Message.turn_id == turn_id, Message.role == "actor")
+                .order_by(Message.sequence.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not text:
+            return None
+        claimed = (
+            await self._session.execute(
+                select(IdempotencyKey.key)
+                .where(
+                    IdempotencyKey.scope == PART_SCOPE,
+                    IdempotencyKey.key.like(f"plan_{turn_id}:%"),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return str(text) if claimed else None
+
+    async def _resume_delivery(
+        self,
+        *,
+        envelope: InteractionEnvelope,
+        turn: Turn,
+        window: Window,
+        subject_id: str,
+        text: str,
+        is_group: bool,
+        media_ids: list[str],
+        media_note: str | None,
+    ) -> BridgeResult:
+        """重投时只**续发剩下的段**（已发段由段级幂等跳过）。"""
+        from ling.domains.conversation.service import ConversationService
+
+        delivered, parts_sent, parts_total = await self._deliver(
+            envelope=envelope,
+            text=text,
+            subject_id=subject_id,
+            expression={},
+            turn_id=turn.id,
+        )
+        reason = describe_delivery(delivered, parts_sent=parts_sent, parts_total=parts_total)
+        emit_event(
+            logger,
+            logging.INFO if delivered else logging.WARNING,
+            event_name="turn_completed",
+            message="续发剩余段",
+            attributes={
+                "turn_id": turn.id,
+                "outcome": "resumed" if delivered else "partial_delivery",
+                "resumed": True,
+                "parts_total": parts_total,
+                "parts_sent": parts_sent,
+                "is_group": is_group,
+            },
+        )
+        if not delivered:
+            conversation = ConversationService(
+                self._session, actor_id=self._actor_id, persona_id=self._persona_id
+            )
+            await conversation.correct_handled_for_turn(
+                turn.id, outcome="failed", reason=reason
+            )
+        await self._session.commit()
+        return BridgeResult(
+            accepted=True,
+            reason=reason,
+            subject_id=subject_id,
+            window_id=window.id,
+            turn_id=turn.id,
+            decision="reply",
+            reply_text=text,
+            delivered=delivered,
+            media_evidence_ids=media_ids,
+            media_note=media_note,
+            handled_as="replied" if delivered else "failed",
+            parts_total=parts_total,
+            parts_sent=parts_sent,
+        )
+
+    # ------------------------------------------------------------ 超时收尾
+
+    def _coordinator_call(self, name: str, *args: object) -> object | None:
+        """调用协调器上的可选方法（测试会塞一个假协调器进来）。"""
+        fn = getattr(self._coordinator, name, None)
+        if not callable(fn):
+            return None
+        with contextlib.suppress(Exception):
+            return fn(*args)
+        return None
+
+    async def _request_turn_stop(self, turn_id: str) -> None:
+        """让超时的这一轮优雅停下（把已生成的部分落库）。"""
+        self._coordinator_call("request_stop", turn_id)
+
+    async def _record_pending_delivery(
+        self,
+        *,
+        envelope: InteractionEnvelope,
+        turn_id: str,
+        subject_id: str,
+        text_len_readable: int,
+    ) -> None:
+        """落一条"该发但还没发"的投递记录。
+
+        为什么必须落库：进程一重启，"还有话没发"这件事在内存里就没了。
+        `delivery.pending` 行由周期对账任务捡起来续发（段级幂等保证不重复）。
+        """
+        from ling.capabilities.delivery import DeliveryService
+
+        await DeliveryService(self._session).record_pending(
+            connector_id=getattr(self._connector, "connector_id", None),
+            actor_id=self._actor_id,
+            subject_id=subject_id,
+            window_ref=envelope.window_ref,
+            is_group=":group:" in envelope.window_ref,
+            plan_id=f"plan_{turn_id}",
+            turn_id=turn_id,
+            reason="generation_timeout",
+            detail=(
+                f"生成超过 {int(TURN_WAIT_TIMEOUT_SECONDS)} 秒未结束；"
+                f"返回时可见正文 {text_len_readable} 字"
+            ),
+        )
 
     async def _record_followup(
         self,
@@ -965,6 +1395,9 @@ class InboundBridge:
         text: str,
         effective: object,
         source_account: str | None = None,
+        # 当前这条入站消息的平台 message id（连接器给的）。上下文靠它渲染
+        # `[msg_id:…]`——她最常引用的就是"正在回的这条"。
+        current_message_platform_id: str | None = None,
         # 这条消息里的称呼（群里 = 群名片优先）。与 `source_account` 一样，
         # 它属于"这一条消息"，不是"这个人"，所以只能沿调用链透传，
         # 不能从库里读——库里那一列是旁路同步的结果，可能还没写进去。
@@ -995,23 +1428,42 @@ class InboundBridge:
             source_account=source_account,
             # 「当前这句是谁说的」——群里用它给最后一行署名（群名片优先）
             sender_name=sender_name,
+            current_message_platform_id=current_message_platform_id,
         )
         reply_text = ""
+        partial_text = ""
         state = "unknown"
         expression: dict | None = None
         error: dict | None = None
         suppressed_reason: str | None = None
         raw_chars = 0
+        quote_dropped: str | None = None
+        timed_out = False
         while True:
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=180.0)
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=TURN_WAIT_TIMEOUT_SECONDS
+                )
             except TimeoutError:
-                logger.warning("轮次 %s 超时未结束", turn_id)
+                # **超时不等于没内容**：已经流出来的部分还在（`CancelRegistry`
+                # 逐 delta 记着），而且生成任务仍在跑、最终会把正文写进
+                # `messages`。所以这里**不能**当作"没有可交付文本"收场。
+                timed_out = True
+                logger.warning(
+                    "轮次 %s 超过 %.0f 秒未结束（已生成 %d 字），转交收尾/续发",
+                    turn_id,
+                    TURN_WAIT_TIMEOUT_SECONDS,
+                    len(partial_text),
+                )
                 break
             if event is None:
                 break
             name = getattr(event, "event", "")
             data = getattr(event, "data", {}) or {}
+            if name == "delta":
+                # 记下已流出的部分：超时收场时要用它判断"是不是真的什么都没说"。
+                partial_text += str(data.get("text") or "")
+                continue
             if name in {"turn.completed", "turn.stopped", "turn.failed"}:
                 state = str(data.get("state") or name)
                 message = data.get("message") or {}
@@ -1019,6 +1471,7 @@ class InboundBridge:
                 expression = data.get("expression") or expression
                 # 事件里已经有这两个事实，就必须接住（见 docstring）。
                 suppressed_reason = str(data.get("suppressed_reason") or "") or None
+                quote_dropped = str(data.get("quote_dropped") or "") or quote_dropped
                 with contextlib.suppress(TypeError, ValueError):
                     raw_chars = int(data.get("raw_chars") or 0)
                 if name == "turn.failed":
@@ -1047,11 +1500,15 @@ class InboundBridge:
             raw_chars = max(raw_chars, len(reply_text))
         return TurnResult(
             text=cleaned,
-            state=state,
+            state="timeout" if timed_out else state,
             expression=expression,
             error=error,
             suppressed_reason=suppressed_reason,
             raw_chars=raw_chars,
+            timed_out=timed_out,
+            # 只报字数、不报正文：日志/返回值里不需要把她的话再抄一份。
+            partial_chars=len(partial_text),
+            quote_dropped=quote_dropped,
         )
 
     async def _deliver(
@@ -1061,30 +1518,38 @@ class InboundBridge:
         text: str,
         subject_id: str,
         expression: dict | None = None,
+        # 段级幂等键的来源：()`plan_{turn_id}`, 序号)`。**必须由 turn 派生**——
+        # 原实现用的是 `plan_{uuid4()}`，重投必然拿到新 plan_id，幂等直接失效，
+        # 那正是"重投必然重发第 1 段"的根因（调研 §5 P0-1）。
+        turn_id: str | None = None,
     ) -> tuple[bool, int, int]:
         """把一条回复按语义分段顺序投递。返回 (是否全部送达, 已发段数, 总段数)。
 
         **每段只在上一段拿到真实回执之后才发**——这就是"不是一次全倒出去"。
 
-        四条硬约束：
+        六条硬约束：
         1. 群聊恒为 1 段：拆成多条会绕过防刷屏上限（`group_turn_budget`
            数的是消息条数）
         2. **分段必须按渠道硬上限切**：`plan_parts` 收
            `max_part_chars=capabilities().max_text_length`。这是物理约束，
            与 `MAX_SEGMENT_CHARS`（220，只管"切不切"）不是一回事。
            拿不到能力时 `plan_parts` 用保守兜底值，也绝不产出"肯定发不出去"的段
-        3. 回执缺失/不明/失败 → **停止后续段**，不盲目重发
-        4. 段间停顿是**模拟节奏**，绝不写进 delivery 回执
+        3. **段级幂等**：`(plan_id, ordinal)` 已送达 → **跳过**；
+           结果未知（uncertain / 运行中）→ **不重发**，交给对账。
+           这一条让"事件认领被释放后的重投"变成"续发剩下的段"。
+        4. 回执缺失/不明/失败 → **停止后续段**，不盲目重发
+        5. 段间节奏与限速：最小间隔 + 抖动 + 每窗口令牌桶（见文件顶部常量），
+           并把**同一窗口**的发送串行起来（两个轮次不能交错说话）
+        6. 段间停顿是**模拟节奏**，绝不写进 delivery 回执
 
         为什么超限不再导致"部分送达 + 尾段丢失"：切分在这里就按渠道上限做完
         （见约束 2），所以 `DeliveryService.deliver` 里的超限拦截只是防御性的，
         正常情况下不可达。原先的 `break` 也因此只对**真发不出去**的失败生效
         （渠道不可达/平台拒收），而不是"这一段太长"。
         """
-        import asyncio
-
-        from ling.capabilities.chunking import PART_DELAY_SECONDS, plan_parts
+        from ling.capabilities.chunking import plan_parts
         from ling.capabilities.delivery import DeliveryService
+        from ling.contracts.v1 import OperationState
         from ling.ports.channel import OutboundMessage
 
         is_group = ":group:" in envelope.window_ref
@@ -1099,36 +1564,89 @@ class InboundBridge:
         if not parts:
             return (False, 0, 0)
 
-        plan_id = f"plan_{__import__('uuid').uuid4().hex[:16]}"
+        # **确定性** plan_id：同一轮重投必须落回同一组段键。
+        plan_id = f"plan_{turn_id}" if turn_id else f"plan_{uuid.uuid4().hex[:16]}"
+        use_plan = turn_id is not None
         service = DeliveryService(self._session)
+
+        # 引用段已经是**核对过的真 id**：`turn._finalize` 用上下文里真的渲染
+        # 出来的 `[msg_id:…]` 白名单核过一遍，连接器发之前还会再核一遍
+        # "这个 id 我到底见过没有"（NapCat 对无效 reply 只会静默丢该段）。
+        # 这里只负责把它塞进出站消息。
+        reply_to = (expression or {}).get("quote")
+
+        gate = _gate_for(envelope.window_ref)
         sent = 0
+        skipped = 0
+        attempted = 0
         for index, part in enumerate(parts, 1):
-            if index > 1:
-                # 上一段已经拿到回执才走到这里。停顿只是节奏，不是回执。
-                await asyncio.sleep(PART_DELAY_SECONDS)
-            outcome = await service.deliver(
-                connector=self._connector,  # type: ignore[arg-type]
-                message=OutboundMessage(
-                    operation_id=f"op_{__import__('uuid').uuid4().hex[:16]}",
-                    window_ref=envelope.window_ref,
-                    text=part,
-                    is_group=is_group,
-                    # **她自己选的**表达方式。代码不再替她决定"群里就该 @"——
-                    # 那是把人设的判断写死在代码里。这里只负责"选了就做到"。
-                    mentions=list((expression or {}).get("at") or []),
-                    reply_to=(expression or {}).get("quote"),
-                    poke_targets=list((expression or {}).get("poke") or []),
-                ),
-                actor_id=self._actor_id,
-                subject_id=subject_id,
-                payload_extra={
-                    "reply_plan": plan_id,
-                    "part_ordinal": index,
-                    "parts_total": len(parts),
-                },
-            )
+            payload_extra = {
+                "reply_plan": plan_id,
+                "part_ordinal": index,
+                "parts_total": len(parts),
+            }
+            async with gate.lock:
+                # 节奏与令牌桶都在锁内：同一窗口的两个轮次不会交错发送。
+                await gate.pace(first=attempted == 0)
+                outcome = await service.deliver(
+                    connector=self._connector,  # type: ignore[arg-type]
+                    message=OutboundMessage(
+                        operation_id=f"op_{uuid.uuid4().hex[:16]}",
+                        window_ref=envelope.window_ref,
+                        text=part,
+                        is_group=is_group,
+                        # **她自己选的**表达方式。代码不再替她决定"群里就该 @"——
+                        # 那是把人设的判断写死在代码里。这里只负责"选了就做到"。
+                        mentions=list((expression or {}).get("at") or []),
+                        reply_to=reply_to,
+                        poke_targets=list((expression or {}).get("poke") or []),
+                    ),
+                    actor_id=self._actor_id,
+                    subject_id=subject_id,
+                    payload_extra=payload_extra,
+                    plan_id=plan_id if use_plan else None,
+                    part_ordinal=index if use_plan else None,
+                )
+                # 每段结束就提交：已发的段与段键必须**先落库**，否则重投时
+                # 看不到它们，等于幂等键不存在。
+                await self._session.commit()
+
+            if outcome.skipped:
+                if outcome.state is OperationState.succeeded:
+                    # 这一段上一次真的发出去过 → 跳过，但算进"已送达段数"：
+                    # 平台上确实有这一段，报 0/N 会误导运维。
+                    sent += 1
+                    skipped += 1
+                    continue
+                # uncertain / 运行中：**绝不重发**（重发就是重复消息）。
+                # 后面的段也不能抢跑：顺序错乱比少一段更难解释。
+                emit_event(
+                    logger,
+                    logging.WARNING,
+                    event_name="delivery_uncertain_skipped",
+                    message="这一段上一次结果未知，不重发；本轮停在这里等对账",
+                    attributes={
+                        "channel": getattr(self._connector, "connector_id", ""),
+                        "operation_id": outcome.operation_id,
+                        "part_ordinal": index,
+                        "parts_total": len(parts),
+                        "reason": outcome.detail[:200],
+                    },
+                )
+                break
+            attempted += 1
             # `delivered` 是**唯一**判据，不再在这里另写一种拼法
             if not outcome.delivered:
+                if outcome.state is OperationState.uncertain and outcome.operation_id:
+                    # 不确定 → **立刻对一次账**（有 id 走 get_msg，没 id 走历史比对）。
+                    # 查到就继续；查不到就保持 uncertain 交给周期对账，**不重发**。
+                    reconciled = await service.reconcile(
+                        self._connector, outcome.operation_id  # type: ignore[arg-type]
+                    )
+                    await self._session.commit()
+                    if reconciled.state is OperationState.succeeded:
+                        sent += 1
+                        continue
                 # 「为什么没送达」的唯一权威记录：状态、错误码、第几段。
                 # 不记正文——投递失败不代表可以把内容抄进日志。
                 emit_event(
@@ -1171,12 +1689,12 @@ class InboundBridge:
                     "parts_sent": sent,
                     "parts_total": len(parts),
                     "parts_not_attempted": len(parts) - sent,
+                    "parts_skipped_already_sent": skipped,
                     "is_group": is_group,
                 },
             )
 
         return (sent == len(parts), sent, len(parts))
-
 
 __all__ = ["BridgeResult", "InboundBridge"]
 

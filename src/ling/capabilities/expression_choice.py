@@ -100,8 +100,9 @@ def render_expression_help(*, is_group: bool, supports_poke: bool = True) -> str
             "用它能明确你是在回谁——不是为了礼貌，是为了让人看得懂。"
         )
         lines.append(
-            "- `[quote:消息序号]`：引用某条消息。适合回一条较早的、"
-            "或者话题已经翻过去了的消息。"
+            "- `[quote:消息 id]`：引用某条消息。id 就是上下文里每条消息前面的"
+            " `[msg_id:…]`——只能用上面真的出现过的 id，编一个会被忽略。"
+            "适合回一条较早的、或者话题已经翻过去了的消息。"
         )
     if supports_poke:
         lines.append(

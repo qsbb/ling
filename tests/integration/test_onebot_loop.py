@@ -876,19 +876,42 @@ async def test_part_two_not_sent_when_part_one_fails(
 async def test_delay_sits_between_real_receipts(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """段间停顿发生在**上一段拿到回执之后**，且它只是节奏、不是回执。"""
+    """段间停顿发生在**上一段拿到回执之后**，且它只是节奏、不是回执。
+
+    2026-11-08 起段间隔是"基础 1.2 秒 × 抖动"，不再是固定 1.2：
+    固定节奏容易被识别成机器人（AstrBot 用 1.5–3.5 秒随机、MaiBot 用打字
+    时长）。所以这里断言的是**顺序**（发送 → 停顿 → 发送）与**区间**，
+    不是某个固定数字。
+    """
     import ling.capabilities.chunking as chunking
+    import ling.kernel.bridge as bridge_module
 
-    slept: list[float] = []
+    timeline: list[tuple[str, float]] = []
 
-    async def fake_sleep(seconds: float) -> None:
-        slept.append(seconds)
+    # **精确**只换掉桥的节奏 sleep（`bridge._sleep`），不去 patch 全局
+    # `asyncio.sleep`：应用里别的 sleep（假模型逐字吐字、记忆检索）不该混进来，
+    # 否则断言会因为无关的 1.2 秒级等待而误报。
+    async def fake_paced_sleep(seconds: float) -> None:
+        timeline.append(("sleep", seconds))
 
+    monkeypatch.setattr(bridge_module, "_sleep", fake_paced_sleep)
     monkeypatch.setattr(chunking, "PART_DELAY_SECONDS", 1.2)
-    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    # 令牌桶是**进程内、按窗口**的：前面的用例可能刚把这个窗口的桶打空，
+    # 那样"第 1 段之前"就会先等补令牌。这里要测的是"段间停顿"，先清空。
+    bridge_module.reset_send_gates()
 
     fake = FakeOneBot()
     _install(logged_in, fake)
+    # 发送时刻也记进同一条时间线：用它验证"停顿在上一段回执之后"。
+    original_send = fake.handler
+
+    async def handler(request):  # noqa: ANN001, ANN202
+        timeline.append(("send", 0.0))
+        return await original_send(request)
+
+    logged_in.app.state.onebot_connector._http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
     await _bind(logged_in)
 
     stub = _LongReplyRouter(logged_in.app.state.router, long_text=_LONG_REPLY)
@@ -899,8 +922,24 @@ async def test_delay_sits_between_real_receipts(
         logged_in.app.state.router = stub._inner
 
     assert body["parts_sent"] == body["parts_total"] >= 2
-    assert slept.count(1.2) == body["parts_total"] - 1, (
-        f"段间停顿次数不对：slept={slept}"
+    low, high = bridge_module.PART_INTERVAL_JITTER
+    paced = [i for i, (kind, _) in enumerate(timeline) if kind == "sleep"]
+    sends = [i for i, (kind, _) in enumerate(timeline) if kind == "send"]
+    # 第 1 段之前不许有节奏停顿（首条不该凭空晚一两秒）
+    assert timeline[0][0] == "send", timeline
+    # 每次停顿都必须夹在两次发送之间 = **在上一段拿到回执之后**才停顿
+    for i in paced:
+        assert any(j < i for j in sends) and any(j > i for j in sends), timeline
+    # 抖动区间：每段间隔都要落在 [base*low, base*high] 内（桶空后的补令牌
+    # 等待是额外睡眠，单独看它不参与这个区间）
+    jittered = [
+        seconds
+        for kind, seconds in timeline
+        if kind == "sleep" and low * 1.2 - 1e-6 <= seconds <= high * 1.2 + 1e-6
+    ]
+    assert len(jittered) >= body["parts_total"] - 1, (
+        f"段间停顿次数不对（应有至少 {body['parts_total'] - 1} 次落在 "
+        f"[{low * 1.2:.2f}, {high * 1.2:.2f}] 秒）：{timeline}"
     )
 
 
