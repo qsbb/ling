@@ -1189,10 +1189,10 @@ def build_replan_prompt(
     lines.append("## 不可移动（绝对不能压上去，也不能改）")
     anchors = list(verdict.anchors)[:REPLAN_MAX_INPUT_ANCHORS]
     if anchors:
-        for item in anchors:
+        for anchor in anchors:
             lines.append(
-                f"- {_aware(item.start_at).isoformat()} → {_aware(item.end_at).isoformat()}"
-                f" {item.title}"
+                f"- {_aware(anchor.start_at).isoformat()} → "
+                f"{_aware(anchor.end_at).isoformat()} {anchor.title}"
             )
     for item in list(verdict.blocked)[:REPLAN_MAX_INPUT_SEGMENTS]:
         lines.append(

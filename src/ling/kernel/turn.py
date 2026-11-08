@@ -15,12 +15,12 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,7 +39,7 @@ from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.stream_log import StreamLog
 from ling.models.router import ModelRouter
 from ling.ports.config import EffectiveConfig
-from ling.ports.model import ModelError, ModelErrorKind
+from ling.ports.model import ChatMessageIn, ModelError, ModelErrorKind
 
 if TYPE_CHECKING:
     from ling.kernel.context import CompiledContext, CompiledMessage
@@ -91,7 +91,27 @@ def _snapshot_size(value: object) -> int:
     return len(_snapshot_json(value).encode("utf-8"))
 
 
-def _snapshot_entry(item: CompiledMessage, index: int) -> dict[str, object]:
+class _SnapshotEntry(TypedDict):
+    """快照里**一条消息**的固定字段。
+
+    ``payload`` 整体是松的（``dict[str, object]``，读侧可以多几个字段），
+    但每条消息的字段是固定的。用 TypedDict 而不是 ``dict[str, object]``
+    只是为了让人看得懂"这些键里有 int、有 str"——写成松的会让
+    ``int(entry["tokens"])`` 这类取值变成对 ``object`` 操作。
+    """
+
+    index: int
+    role: str
+    key: str
+    lane: str
+    tokens: int
+    content: str
+    sender: str | None
+    at: str | None
+    truncated: bool
+
+
+def _snapshot_entry(item: CompiledMessage, index: int) -> _SnapshotEntry:
     """一条消息 → 快照里的一项（含语义块标签与 token 估算）。"""
     return {
         "index": index,
@@ -110,7 +130,7 @@ def build_prompt_snapshot_payload(
     annotated: list[CompiledMessage],
     *,
     model: dict[str, object] | None = None,
-    captured_at: object | None = None,
+    captured_at: datetime | None = None,
 ) -> tuple[dict[str, object], bool]:
     """把**真正要发出去的那份 messages** 装成快照 payload。
 
@@ -148,7 +168,7 @@ def build_prompt_snapshot_payload(
     locked = [e for e in entries if e["key"] != "history"]
     history = [e for e in entries if e["key"] == "history"]
 
-    def _probe(keep_history: int) -> tuple[list[dict[str, object]], int]:
+    def _probe(keep_history: int) -> tuple[list[_SnapshotEntry], int]:
         keep = {id(e) for e in locked}
         if keep_history:
             keep |= {id(e) for e in history[len(history) - keep_history :]}
@@ -156,7 +176,7 @@ def build_prompt_snapshot_payload(
         candidate = {**payload, "truncated": True, "messages": kept}
         return kept, _snapshot_size(candidate)
 
-    best_kept: list[dict[str, object]] = locked
+    best_kept: list[_SnapshotEntry] = locked
     lo, hi = 0, len(history)
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -343,7 +363,7 @@ async def purge_expired_prompt_snapshots(
     scrubbed = 0
 
     result = await session.execute(
-        PromptSnapshot.__table__.delete().where(
+        delete(PromptSnapshot).where(
             PromptSnapshot.expires_at <= now - timedelta(days=tombstone_days)
         )
     )
@@ -1142,7 +1162,10 @@ class TurnCoordinator:
         window_id: str,
         turn_id: str,
         compiled: CompiledContext,
-        messages: list[object],
+        # 收 `Sequence` 而不是 `list[object]`：调用方手里的就是
+        # `list[ChatMessageIn]`（列表不变，`list[object]` 收不了它），
+        # 而这里只读不写，协变的 `Sequence` 正好表达"只读"。
+        messages: Sequence[ChatMessageIn],
         config: EffectiveConfig,
         profile: str,
     ) -> None:
@@ -1285,7 +1308,9 @@ class TurnCoordinator:
     async def _follow_up_after_watch(
         self,
         *,
-        messages: list[object],
+        # 同 `_capture_prompt_snapshot`：调用方传的是 `list[ChatMessageIn]`，
+        # 这里只读（再拼上一条观察）后交给路由器，所以收 `Sequence`。
+        messages: Sequence[ChatMessageIn],
         observation: str,
         config: EffectiveConfig,
         profile: str,
@@ -1305,8 +1330,6 @@ class TurnCoordinator:
         读失败/超预算时**根本不会走到这里**（调用方只有在 ``observation``
         非空时才调）：不能让她说"我看了"，也不能凭空编一句。
         """
-        from ling.ports.model import ChatMessageIn
-
         observation_line = ChatMessageIn(
             role="user",
             content=(
@@ -1321,7 +1344,7 @@ class TurnCoordinator:
             async for chunk, _outcome in self._router.stream(
                 config,
                 profile=profile,
-                messages=[*messages, observation_line],  # type: ignore[list-item]
+                messages=[*messages, observation_line],
             ):
                 if getattr(token, "stopped", False):
                     break

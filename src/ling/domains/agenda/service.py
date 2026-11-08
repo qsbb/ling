@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -26,6 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.infra.models import ActorRoutineRow, AgendaPlanRow, utcnow
 from ling.infra.security import new_id
 from ling.ports.config import LifePolicy
+
+if TYPE_CHECKING:
+    # 只为注解：service 与 timeline 运行时互相引用，真导入都写在函数体内。
+    from ling.domains.agenda.timeline import Anchor
 
 PLAN_STATES = ("planned", "active", "done", "cancelled", "skipped")
 COMMITMENT_LEVELS = ("tentative", "confirmed")
@@ -387,7 +392,7 @@ class AgendaService:
         )
 
     async def on_new_confirmed_anchor(
-        self, plan_day: date, anchor: object, *, now: datetime | None = None
+        self, plan_day: date, anchor: Anchor, *, now: datetime | None = None
     ):  # noqa: ANN201 - 返回 timeline.ReplanTodo | None
         """新确认锚点落地后即时复核同一计划日（**零模型**，只登记待办）。
 
@@ -400,7 +405,7 @@ class AgendaService:
         return await on_new_confirmed_anchor(
             self._session,
             plan_day,
-            anchor,  # type: ignore[arg-type] - 运行时是 timeline.Anchor
+            anchor,
             actor_id=self._actor_id,
             now=now,
         )

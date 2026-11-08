@@ -722,7 +722,9 @@ class ContextCompiler:
             videos = []
             compiled_meta["video_error"] = f"{type(exc).__name__}: {exc}"[:200]
         if videos:
-            names: dict[str, str] = {}
+            # 变量名带 `video_` 前缀：图片那块上面已经用过 `names`/`rows`
+            # （同一函数作用域），重名会让后面这几行的类型取决于先绑的那次。
+            video_names: dict[str, str] = {}
             wanted = {v.subject_id for v in videos if v.subject_id}
             if wanted:
                 rows = (
@@ -732,10 +734,10 @@ class ContextCompiler:
                         )
                     )
                 ).all()
-                names = {sid: str(name or "").strip() for sid, name in rows}
+                video_names = {sid: str(name or "").strip() for sid, name in rows}
             lines = []
             for video in videos:
-                sender = names.get(video.subject_id or "") or "有人"
+                sender = video_names.get(video.subject_id or "") or "有人"
                 when = ""
                 if video.created_at is not None:
                     when = _as_local_hint(video.created_at)
@@ -1238,7 +1240,10 @@ class ContextCompiler:
             if wanted:
                 from ling.infra.models import Subject as _Subject
 
-                rows = (
+                # 单独一个变量名：上面的 `rows` 是 `(id, display_name)` 的
+                # 行元组，这里查的是整行 Subject——同一个名字先后绑两种
+                # 查询结果，读的人会以为还是同一份东西。
+                subject_rows = (
                     await self._session.execute(
                         select(_Subject).where(_Subject.id.in_(list(wanted)))
                     )
@@ -1250,7 +1255,7 @@ class ContextCompiler:
 
                 speaker_names = {
                     r.id: normalized
-                    for r in rows
+                    for r in subject_rows
                     if (normalized := normalize_display_name(r.display_name))
                 }
 

@@ -75,6 +75,7 @@ import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
+from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import and_, func, or_, select, update
@@ -112,6 +113,11 @@ from ling.infra.models import (
 )
 from ling.infra.security import new_id
 from ling.ports.model import ChatMessageIn, ModelError
+
+if TYPE_CHECKING:
+    # 只为注解：``router`` / ``config_reader`` 在公开入口处是宽松的 ``object``
+    # （domain 不 import 设置域），收窄时才需要这个端口协议。
+    from ling.ports.config import ConfigReader
 
 logger = logging.getLogger("ling.domains.agenda.timeline")
 
@@ -1034,14 +1040,14 @@ async def load_commitment_anchors(
             )
         )
     ).scalars()
-    for row in plans:
+    for plan_row in plans:
         anchors.append(
             Anchor(
                 kind=COMMITMENT_ANCHOR,
-                start_at=_aware(row.start_at),
-                end_at=_aware(row.end_at),
-                title=f"约定：{_short(str(row.title), 40)}",
-                source_id=f"agenda_plan:{row.id}",
+                start_at=_aware(plan_row.start_at),
+                end_at=_aware(plan_row.end_at),
+                title=f"约定：{_short(str(plan_row.title), 40)}",
+                source_id=f"agenda_plan:{plan_row.id}",
             )
         )
     anchors.sort(key=lambda item: item.start_at)
@@ -1166,7 +1172,7 @@ def parse_outline_payload(raw: str) -> list[dict[str, object]]:
 
 
 def validate_outline(
-    segments: list[object],
+    segments: Sequence[object],
     *,
     window_start: datetime,
     window_end: datetime,
@@ -1332,7 +1338,7 @@ _STATE_WORD: dict[str, str] = {
 
 
 def validate_intention_proposals(
-    proposals: list[object],
+    proposals: Sequence[object],
     *,
     future_intents: FutureIntentZone | None,
     memory: MemoryZone | None,
@@ -3573,13 +3579,13 @@ async def _attach_preparations(
         parent_id = str(segment.parent_id or "")
         if key in attached or draft.intention_id is not None or not parent_id:
             continue
-        intention_id = attached.get(parent_id)
-        if intention_id is None:
+        parent_intention_id = attached.get(parent_id)
+        if parent_intention_id is None:
             continue
         try:
             await attach_preparation(
                 session,
-                intention_id=intention_id,
+                intention_id=parent_intention_id,
                 segment_id=key,
                 actor_id=actor_id,
                 source_visibilities=_prep_source_visibilities(),
@@ -3596,7 +3602,7 @@ async def _attach_preparations(
                 session, segment, now=now, reason_code=exc.reason_code
             )
             continue
-        attached[key] = intention_id
+        attached[key] = parent_intention_id
     return len(attached)
 
 
@@ -3866,15 +3872,21 @@ async def ensure_day_plan(
             )
             break
         else:
+            # ``_outline_model_ready`` 已返回 True ⇒ ``config_reader`` 必非 ``None``；
+            # 公开入口把它标成 ``object``（本模块不 import 设置域），这里在"已确认
+            # 可用"的位置把它收窄回端口协议，只是给类型看的，运行期是同一个对象。
+            # ``ConfigReader`` 只在 ``TYPE_CHECKING`` 里导入，所以必须用**字符串**
+            # 形式传给 ``cast``：``cast`` 的第一个参数运行期会求值，裸名字会 NameError。
+            reader = cast("ConfigReader", config_reader)
             await _finish_call(
                 session,
                 call_id=reservation.call_id,
                 state="committed",
                 actual_tokens=_estimate_tokens(prompt, raw),
-                provider_id=_resolved_provider_id(await config_reader.effective(), OUTLINE_PROFILE),
+                provider_id=_resolved_provider_id(await reader.effective(), OUTLINE_PROFILE),
             )
             model_provider = _resolved_provider_id(
-                await config_reader.effective(), OUTLINE_PROFILE
+                await reader.effective(), OUTLINE_PROFILE
             )
             prep_links, unplaced_reason = plan_preparations(
                 blocks,
@@ -5053,9 +5065,12 @@ async def refine_work(
             base, state="busy", calls=1, reason_code=REASON_REFINE_STALE
         )
 
-    provider_id = _resolved_provider_id(
-        await config_reader.effective(), REFINE_PROFILE  # type: ignore[attr-defined]
-    )
+    # 同 ``outline_work``：走到这里说明 ``_outline_model_ready`` 已放行、
+    # ``config_reader`` 必非 ``None``，收窄只为类型，运行期对象不变。
+    # 必须用字符串形式：``ConfigReader`` 在 ``TYPE_CHECKING`` 里，而 ``cast`` 的
+    # 第一个参数运行期会被求值，写裸名字会 NameError。
+    reader = cast("ConfigReader", config_reader)
+    provider_id = _resolved_provider_id(await reader.effective(), REFINE_PROFILE)
     await _finish_call(
         session,
         call_id=reservation.call_id,

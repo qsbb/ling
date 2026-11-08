@@ -21,11 +21,12 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.audit import behavior_event
-from ling.domains.media.describe import MediaDescriber, MediaReadError
+from ling.domains.media.describe import MediaDescriber, MediaFetcher, MediaReadError
 from ling.domains.media.service import (
     EvidenceView,
     MediaEvidenceError,
@@ -39,6 +40,9 @@ from ling.domains.media.video import (
     resolve_watch_refs,
     short_ref_for,
 )
+
+if TYPE_CHECKING:
+    from ling.config import Settings
 
 logger = logging.getLogger("ling.domains.media.watch")
 
@@ -97,12 +101,14 @@ class VideoWatchService:
         outcome = WatchOutcome(refs=list(refs))
         videos = await self.videos_in_window(window_id)
         # 先看撞车：**撞车不读**（可能读错人），也不能"取第一条凑合"。
-        collisions = ambiguous_refs(refs, videos)
+        # video.py's list[object] signatures preserve these EvidenceView instances.
+        video_refs = cast(list[object], videos)
+        collisions = ambiguous_refs(refs, video_refs)
         if collisions:
             outcome.skipped = f"短号撞车（{collisions[0]}），无法确定是哪一条"
             _log_skipped(collisions[0], "短号撞车，无法确定是哪一条视频")
             return outcome
-        resolved = resolve_watch_refs(refs, videos)
+        resolved = cast(list[EvidenceView], resolve_watch_refs(refs, video_refs))
         if not resolved:
             # 短号对不上：可能是幻觉、也可能是别的窗口的视频、或者已过期。
             # **静默退化**（不报错、不追问），只留一行日志便于排查。
@@ -217,7 +223,7 @@ def make_watch_callback(
             service = VideoWatchService(
                 session,
                 actor_id=actor_id,
-                describer=MediaDescriber(  # type: ignore[arg-type]
+                describer=MediaDescriber(
                     service=MediaEvidenceService(session, actor_id=actor_id),
                     fetch_media=fetch_media,
                     router=router,
@@ -232,6 +238,11 @@ def make_watch_callback(
     return watch
 
 
+class _WatchCache(TypedDict, total=False):
+    settings: Settings
+    fetcher: MediaFetcher
+
+
 def default_watch_callback(*, router: object, actor_id: str) -> WatchCallback:
     """兜底装配：自己去找设置、连接器、媒体取用函数与偏好。
 
@@ -239,7 +250,7 @@ def default_watch_callback(*, router: object, actor_id: str) -> WatchCallback:
     都能拿到这些对象；但为了**不动那两个文件**（作用域限制），这里在真的
     要看视频时才惰性装配。装不起来就返回"没看成"，绝不影响正常对话。
     """
-    cache: dict[str, object] = {}
+    cache: _WatchCache = {}
 
     async def watch(window_id: str, refs: list[str]) -> str | None:
         try:
