@@ -33,8 +33,10 @@ from ling.contracts.v1 import (
     InputPart,
     InteractionEnvelope,
     Modality,
+    OutboundRecallState,
     RecallEvent,
     RecallKind,
+    RecallReceipt,
     new_id,
 )
 from ling.ports.channel import (
@@ -42,6 +44,7 @@ from ling.ports.channel import (
     ChannelError,
     ChannelErrorKind,
     OutboundMessage,
+    RecallRequest,
     ReceiptQuery,
     delivery_text_digest,
 )
@@ -293,6 +296,88 @@ class OneBotV11Connector(ChannelConnector):
             message.window_ref,
             message.text,
             _now(),
+        )
+
+    async def recall(self, request: RecallRequest) -> RecallReceipt:
+        """**主动撤回**我们发出去的那条（OneBot ``delete_msg``）。
+
+        ## 只有 ``message_id`` 一条判据
+
+        撤回是不可逆的破坏性动作：撤错了等于把别人的话从群里抹掉。所以这里
+        只认 ``request.platform_message_id``——那是我们发送时拿到的**真实回执
+        id**，不是正文、不是时间、不是本地 id。上层（
+        `domains/conversation/recall.py`）已经在发 action 之前核对过
+        "这条确实是她自己发的、还在时间窗内"，连接器只负责把平台的回答翻译成
+        五个状态之一。
+
+        ## 平台错误 → 状态映射（**不许猜成成功**）
+
+        | 平台表现 | 我们的状态 | 理由 |
+        | --- | --- | --- |
+        | ``retcode=0`` | ``recalled`` | 平台明确接受 |
+        | 404（实现没有这个 API） | ``unsupported`` | 这个 OneBot 实现不支持 |
+        | 业务失败且文案是"消息不存在/已撤回" | ``not_found`` | 目标已经不在平台上 |
+        | 业务失败且文案是"超过时间/权限" | ``expired`` | 平台明确拒绝（时间窗） |
+        | 其它业务失败 | ``uncertain`` | 可能已经撤了，不能谎报 |
+        | 超时/断连/非 JSON | ``uncertain`` | 结果未知，**可重试但不重复撤** |
+
+        **注意**：`expired` 与 `not_found` 都来自平台自己的说法。我们**不**
+        用本地时间猜——平台的时间窗会变，而我们的时钟不可信。
+        """
+        message_id = str(request.platform_message_id or "").strip()
+        if not message_id:
+            # 走到这里说明上层没做校验（不该发生）。不猜、不发 action。
+            return RecallReceipt(
+                receipt_id=new_id("rcpt"),
+                channel=self.connector_id,
+                state=OutboundRecallState.uncertain,
+                observed_at=_now(),
+                detail="没有可用的平台消息 id，未发起撤回",
+            )
+        try:
+            await self._call("delete_msg", {"message_id": message_id})
+        except ChannelError as exc:
+            return self._recall_from_error(message_id, exc)
+        return RecallReceipt(
+            receipt_id=new_id("rcpt"),
+            channel=self.connector_id,
+            state=OutboundRecallState.recalled,
+            platform_message_id=message_id,
+            observed_at=_now(),
+        )
+
+    def _recall_from_error(self, message_id: str, exc: ChannelError) -> RecallReceipt:
+        """把 ``delete_msg`` 的失败翻译成对外状态（见 :meth:`recall` 的映射表）。"""
+        kind = exc.kind
+        text = exc.message or ""
+        lowered = text.lower()
+        if kind is ChannelErrorKind.unsupported:
+            state = OutboundRecallState.unsupported
+            detail = "这个 OneBot 实现没有 delete_msg（不支持撤回）"
+        elif kind in (ChannelErrorKind.unreachable, ChannelErrorKind.uncertain):
+            # **先按错误类别判，再按文案判**：断连/超时/非 JSON 是"我们没拿到
+            # 回答"，绝不能因为文案里恰好有 "timeout" 就被读成"平台说超时"——
+            # 那会把一次网络抖动说成"过了撤回时间窗"，用户就再也不会重试了。
+            state = OutboundRecallState.uncertain
+            detail = f"撤回结果未知（{text[:120]}）"
+        elif _looks_recall_expired(lowered):
+            state = OutboundRecallState.expired
+            detail = "平台拒绝了撤回：超过允许的撤回时间或没有权限"
+        elif _looks_missing(lowered):
+            state = OutboundRecallState.not_found
+            detail = "平台上已经找不到这条消息"
+        else:
+            # 其余一律"结果未知"：可能已经撤掉了，说失败会让用户重试，
+            # 而重试一次撤回只会得到一个"找不到"——那反而像故障。
+            state = OutboundRecallState.uncertain
+            detail = f"撤回结果未知（{text[:120]}）"
+        return RecallReceipt(
+            receipt_id=new_id("rcpt"),
+            channel=self.connector_id,
+            state=state,
+            platform_message_id=message_id,
+            observed_at=_now(),
+            detail=detail,
         )
 
     async def query_receipt(self, query: ReceiptQuery) -> DeliveryReceipt:
@@ -1030,6 +1115,10 @@ class OneBotV11Connector(ChannelConnector):
             supports_group=self._config.supports_group,
             supports_proactive=self._config.supports_proactive,
             supports_media=self._config.supports_media,
+            # OneBot V11 有 ``delete_msg``（NapCat/Lagrange/go-cqhttp 都实现）。
+            # 具体能不能撤、撤多久以内，由平台在调用时回答——这里只声明
+            # "我们会去试"，不声明"一定能成功"。
+            supports_recall=True,
             max_text_length=self._config.max_text_length,
             receipt_reliability="best_effort",
             enabled=bool(self._config.api_base),
@@ -1142,6 +1231,30 @@ def _aware(value):  # noqa: ANN001, ANN202
     if not isinstance(value, datetime):
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _looks_recall_expired(message: str) -> bool:
+    """平台是否在说"超时/没权限撤回"。
+
+    关键词取自 NapCat / go-cqhttp 的常见文案（"timeout" / "超过" /
+    "权限" / "not allowed" / "expired"）。**只在撤回路径上用**：这里宁可
+    把一次失败归成 ``expired``（用户看到"超时了撤不回"），也不要归成
+    ``uncertain`` 让用户反复重试——重试一次撤回不可能成功。
+    """
+    lowered = (message or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "timeout",
+            "time out",
+            "超时",
+            "超过",
+            "过期",
+            "expired",
+            "not allowed",
+            "权限",
+        )
+    )
 
 
 def _looks_missing(message: str) -> bool:

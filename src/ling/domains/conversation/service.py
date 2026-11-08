@@ -176,6 +176,10 @@ class MessageView:
     retracted_at: datetime | None = None
     # 撤回发生时她是否已经看过（迁移 0056 冻结下来的判定）。
     retracted_after_seen: bool | None = None
+    # **她自己**把这条收回来了（出站撤回，迁移 0057）。与 `retracted_at`
+    # 分开：那个是"对方撤回的"，这个是"她撤回的"——撤回方不同，含义不同。
+    recalled_at: datetime | None = None
+    recall_state: str | None = None
 
     def to_contract(self) -> ChatMessage:
         return ChatMessage(
@@ -194,6 +198,9 @@ class MessageView:
             handled_reason=self.handled_reason,
             sender_name=self.sender_name,
             sender_id=self.sender_id,
+            retracted_at=self.retracted_at,
+            recalled_at=self.recalled_at,
+            recall_state=self.recall_state,
         )
 
 
@@ -1057,6 +1064,8 @@ class ConversationService:
             sender_id=sender_id,
             retracted_at=row.retracted_at,
             retracted_after_seen=row.retracted_after_seen,
+            recalled_at=getattr(row, "recalled_at", None),
+            recall_state=getattr(row, "recall_state", None),
         )
 
     # ---------------------------------------------------------- 窗口短记忆

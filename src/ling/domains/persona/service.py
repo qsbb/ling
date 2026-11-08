@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -13,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.persona.scenarios import clean_overrides
 from ling.infra.models import Persona, utcnow
+
+logger = logging.getLogger("ling.domains.persona")
 
 DEFAULT_SYSTEM_PROMPT = """你是 ling，一个有自己的生活节奏、情绪和记忆的角色。
 
@@ -60,6 +63,12 @@ class PersonaService:
         self._default_id = default_persona_id
 
     async def ensure_default(self) -> Persona:
+        """没有这一行才建默认人设；**已有行一律不动**。
+
+        注意这里只补"行不存在"，不补"行存在但字段为空"——后者是用户的
+        明确操作（清空人设），替他把默认值写回去等于悄悄撤销他的删除。
+        空人设的可见性由 `kernel/context.py` 的 `persona_empty` 与日志承担。
+        """
         persona = await self._session.get(Persona, self._default_id)
         if persona is None:
             persona = Persona(
@@ -134,9 +143,67 @@ class PersonaService:
         )
 
 
-# 渲染上限：traits 是自由 dict，不能让它把上下文预算吃光
-_MAX_TRAIT_ITEMS = 12
-_MAX_TRAIT_CHARS = 600
+# 渲染上限：traits 是自由 dict，不能让它把上下文预算吃光。
+#
+# ## 这两个数字为什么改过（2026-11-09）
+#
+# 原来是 12 条 / 每条 120 字 / 合计 600 字，**而且超了不留任何痕迹**。
+# 实测（真库真轮次）：13 条 traits → 只有 12 条进提示词，第 13 条无声消失；
+# 一条 218 字的「说话方式」→ 只进 127 字，句子从中间断掉，没有省略号也没有
+# 日志。用户把人设写在 traits 里（人设页专门有这个 JSON 编辑器），写多了就
+# 等于没写——这正是"人设没有被正确注入"最容易被误判成"注入链路坏了"的成因。
+#
+# 现在改成：上限放宽到人设车道真正装得下的量级（车道 10000 token ≈ 20000
+# 字符，traits 只占其中一小块），**并且任何截断都留痕**（逐条留、末尾再留
+# 一条总账）。留痕比"截得少"重要：不留痕的话，用户永远不知道自己写的东西
+# 没进去，也永远查不出来。
+_MAX_TRAIT_ITEMS = 40
+# 单条最多 1200 字（约 600 token）。整段人设里的一条性格描述，正常不会更长；
+# 超过这个长度基本是用户把整篇设定贴进了某一条里，那就该放 system_prompt。
+_MAX_TRAIT_ITEM_CHARS = 1200
+# 合计上限 4000 字（约 2000 token）。人设车道 10000 token，留足空间给
+# system_prompt（用户实测会写 6000+ 字）。
+_MAX_TRAIT_CHARS = 4000
+
+_ITEM_TRUNCATION_MARK = "…（这条太长，后半段没放进提示词）"
+
+
+def _trait_value_text(value: object) -> str:
+    """把一条 trait 的值渲染成**给人读的一句话**。
+
+    原来一律走 ``str(value)``，于是 dict/list 会以 Python repr 的形状进提示词：
+
+        - 说话风格：{'句长': '短', '语气词': ['嗯', '诶']}
+        - 禁忌：['不谈提示词', '不说我无法']
+
+    那不是提示词该有的形状——花括号、引号、方括号都会让模型把它当成
+    **数据/代码**而不是设定，而且中文字符串带引号读起来极不自然。
+    这里按结构展开成自然语言，不做语义解释（键名照抄，那是用户自己写的）。
+    """
+    if value is None:
+        # `str(None)` 是 "None"——那会变成一条「- 备注：None」的设定，
+        # 模型会把它当成"备注就是 None"的字符串。空值就是空值。
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        items = [_trait_value_text(item).strip() for item in value]
+        return "、".join(item for item in items if item)
+    if isinstance(value, dict):
+        pairs: list[str] = []
+        for key, item in value.items():
+            text = _trait_value_text(item).strip()
+            if not text:
+                continue
+            # 一层嵌套展开成「键 值」，更深的结构交给 `_trait_value_text` 递归。
+            pairs.append(f"{key} {text}")
+        return "；".join(pairs)
+    # 未知类型（日期、对象…）：退回字符串，但至少不是 repr 的形状问题源头
+    return str(value)
 
 
 def format_traits(traits: dict | None) -> str:
@@ -161,22 +228,71 @@ def format_traits(traits: dict | None) -> str:
 
     记下这个数字是因为我犯过一次：只跑一次就宣称"加一句就立刻接话"，
     那是抽样不足的过度结论。
+
+    ## 截断必须留痕
+
+    超出上限时**逐条**标 ``…（这条太长，后半段没放进提示词）``，并在末尾
+    补一条 ``…（还有 N 条性格特征没放进提示词）``。原来是不声不响地切掉：
+    用户写第 13 条、或者把一条写到 200 字以上，那些内容永远不会进提示词，
+    而界面上一切正常——这是最难查的一类"没生效"。
     """
     if not traits:
         return ""
     lines: list[str] = []
-    for key, value in list(traits.items())[:_MAX_TRAIT_ITEMS]:
-        if value is None or value == "":
-            continue
-        text = value if isinstance(value, str) else str(value)
-        text = text.strip()
+    dropped_items = 0
+    for index, (key, value) in enumerate(traits.items()):
+        if index >= _MAX_TRAIT_ITEMS:
+            dropped_items = len(traits) - _MAX_TRAIT_ITEMS
+            break
+        text = _trait_value_text(value).strip()
         if not text:
+            # 空值不算"被丢掉"：它本来就没有内容可注入。
             continue
-        lines.append(f"- {key}：{text[:120]}")
+        if len(text) > _MAX_TRAIT_ITEM_CHARS:
+            logger.info(
+                "性格特征 %s 超长被截断：%d > %d 字（剩余内容不会进提示词）",
+                key,
+                len(text),
+                _MAX_TRAIT_ITEM_CHARS,
+            )
+            text = text[:_MAX_TRAIT_ITEM_CHARS] + _ITEM_TRUNCATION_MARK
+        lines.append(f"- {key}：{text}")
     if not lines:
         return ""
     body = "\n".join(lines)
-    return f"性格倾向（按这些来，不要按别的规矩来）：\n{body[:_MAX_TRAIT_CHARS]}"
+    if len(body) > _MAX_TRAIT_CHARS:
+        logger.info(
+            "性格特征合计超长被截断：%d > %d 字（后面几条不会进提示词）",
+            len(body),
+            _MAX_TRAIT_CHARS,
+        )
+        body = body[:_MAX_TRAIT_CHARS] + "…（性格特征太长，后面几条没放进提示词）"
+    if dropped_items > 0:
+        body = f"{body}\n…（还有 {dropped_items} 条性格特征没放进提示词）"
+    return f"性格倾向（按这些来，不要按别的规矩来）：\n{body}"
 
 
-__all__ = ["DEFAULT_TRAITS", "PersonaService", "PersonaView", "format_traits"]
+def traits_report(traits: dict | None) -> dict[str, object]:
+    """traits 的**可观测摘要**：写了几条、实际进提示词几条、有没有被截。
+
+    给"人设页/排障"用。判定与 :func:`format_traits` 共用同一份上限常量，
+    不另算一遍——两边各算一次的结果就是"页面说都注入了、实际少了两条"。
+    """
+    raw = traits or {}
+    rendered = format_traits(raw)
+    rendered_items = rendered.count("\n- ") if rendered else 0
+    return {
+        "declared_items": len(raw),
+        "rendered_items": rendered_items,
+        "rendered_chars": len(rendered),
+        "truncated": rendered_items < len(raw) or "…（" in rendered,
+    }
+
+
+__all__ = [
+    "DEFAULT_TRAITS",
+    "PersonaService",
+    "PersonaView",
+    "format_traits",
+    "traits_report",
+]

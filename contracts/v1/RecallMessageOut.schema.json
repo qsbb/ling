@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "OutboundRecallState": {
+      "description": "**她自己**发出去的消息，被主动撤回的结果。\n\n与入站的 :class:`RecallEvent` 是两件事：那个是\"对方收回了什么\"，\n这个是\"我们把已经发出去的那条收回来\"。混用会让\"谁撤回的\"永远说不清。\n\n五个取值都必须能区分，因为它们对用户的含义完全不同：\n\n- ``recalled``：平台确认已撤回（**唯一**可以说\"撤回了\"的状态）；\n- ``not_found``：平台上已经没有这条（可能早被删、id 过期）；\n- ``expired``：超过平台允许的撤回时间窗，**根本没发 action**；\n- ``unsupported``：这个接入方式不支持撤回（QQ 官方机器人）；\n- ``uncertain``：没拿到回执，**不确定**是否撤回成功——不许说成功。",
+      "enum": [
+        "recalled",
+        "not_found",
+        "expired",
+        "unsupported",
+        "uncertain"
+      ],
+      "title": "OutboundRecallState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/RecallMessageOut.schema.json",
+  "additionalProperties": false,
+  "description": "`POST /v1/conversations/{conversation_id}/messages/{message_id}/recall` 的响应。\n\n``state`` 与 :class:`OutboundRecallState` 同源；``message_id`` 是**本地**\n消息 id（不是平台 id，平台 id 不进前端——它是对账凭据，不是展示标识）。",
+  "properties": {
+    "attempts": {
+      "default": 1,
+      "minimum": 0,
+      "title": "Attempts",
+      "type": "integer"
+    },
+    "message_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Message Id",
+      "type": "string"
+    },
+    "note": {
+      "title": "Note",
+      "type": "string"
+    },
+    "reason_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "稳定错误码，只给日志与测试；界面显示 note",
+      "title": "Reason Code"
+    },
+    "recalled_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Recalled At"
+    },
+    "receipt_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Receipt Id"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/OutboundRecallState"
+    }
+  },
+  "required": [
+    "message_id",
+    "state",
+    "note"
+  ],
+  "title": "RecallMessageOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

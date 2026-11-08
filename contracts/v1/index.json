@@ -46,6 +46,8 @@
     "PromptSnapshotModel": "PromptSnapshotModel.schema.json",
     "PromptSnapshotOut": "PromptSnapshotOut.schema.json",
     "PromptSnapshotSection": "PromptSnapshotSection.schema.json",
+    "RecallMessageOut": "RecallMessageOut.schema.json",
+    "RecallReceipt": "RecallReceipt.schema.json",
     "RuntimeScope": "RuntimeScope.schema.json",
     "SessionRecord": "SessionRecord.schema.json",
     "SubjectAccountOut": "SubjectAccountOut.schema.json",

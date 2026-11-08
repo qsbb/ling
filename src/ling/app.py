@@ -607,6 +607,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
     from ling.api.routes import logs as logs_routes
+    from ling.api.routes import recall as recall_routes
     from ling.api.routes import settings as settings_routes
     from ling.api.routes import version as version_routes
 
@@ -638,6 +639,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix="/v1")
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
+    # 主动撤回自己发的消息（破坏性动作，独立路由与独立授权边界）
+    app.include_router(recall_routes.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
     app.include_router(version_routes.router, prefix="/v1")

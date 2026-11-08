@@ -322,6 +322,14 @@ PLATFORM_MESSAGE_ID_SCOPE = "platform_msgid"
 # 措辞留给人设——这是本项目一贯的分工（状态影响表达，不改变许可）。
 RETRACTED_NOTE = "（这条消息后来被撤回了）"
 
+#: **她自己**把这条收回去了，在上下文里的旁白注记。
+#:
+#: 为什么和入站的 `RETRACTED_NOTE` 分开写：措辞不同，而且必须不同——
+#: "被撤回"读起来像对方撤的，"我后来撤回了这条"才说得清是谁动的手。
+#: 她自己撤回的发言**一定**保留在上下文里（她说过、也据此发生过后续），
+#: 只是要让她知道自己后来收回了，否则下一轮她会当那条还挂在平台上继续引用。
+SELF_RECALLED_NOTE = "（我后来撤回了这条）"
+
 
 def message_id_token(raw: str) -> str:
     """把平台 id 缩成上下文里好读的 token。
@@ -436,22 +444,44 @@ class ContextCompiler:
         contributions: list[ContextContribution] = []
         compiled_meta: dict[str, object] = {}
 
-        contributions.append(
-            ContextContribution(
-                lane="persona",
-                # system_prompt + traits。**traits 原本完全没进提示词**——
-                # 人设页有专门的 JSON 编辑器编辑它，而模型从来没看见过。
-                # 想让她在群里话多、语气更冷，写在那儿就该生效。
-                text="\n\n".join(
-                    part
-                    for part in (persona.system_prompt, format_traits(persona.traits))
-                    if part
-                ),
-                origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
-                visibility=Visibility.subject_private,
-                token_budget=DEFAULT_BUDGETS["persona"],
-            )
+        # system_prompt + traits。**traits 原本完全没进提示词**——
+        # 人设页有专门的 JSON 编辑器编辑它，而模型从来没看见过。
+        # 想让她在群里话多、语气更冷，写在那儿就该生效。
+        persona_text = "\n\n".join(
+            part for part in (persona.system_prompt, format_traits(persona.traits)) if part
         )
+        # **人设是空的时候，一条消息都不发。**
+        #
+        # 原来无条件追加，于是 `system_prompt=""` 且 `traits={}` 时这里塞进去
+        # 一条 `content=""` 的 system 消息。三个后果都真实发生过：
+        # 1. 「查看本次提示词」里出现一个**内容为空的「人设」块**——用户看到的
+        #    就是"人设没有被注入"，而真正的原因是库里那一行本来就是空的
+        #    （实测：空人设 → `messages[0]` 长度 0）；
+        # 2. 空 system 段对某些供应商是"给了一段空指令"，措辞全丢；
+        # 3. 它仍然占一条消息位，排查时反而要多看一层。
+        #
+        # 空人设**不自动补默认值**：清空是用户的明确动作，替他塞回默认等于
+        # 把他的删除操作悄悄撤销。改为记进 meta + 日志，让"人设为空"这件事
+        # 可被看见、可被查（`persona_empty`）。
+        if persona_text:
+            contributions.append(
+                ContextContribution(
+                    lane="persona",
+                    text=persona_text,
+                    origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["persona"],
+                )
+            )
+        compiled_meta["persona_chars"] = len(persona_text)
+        compiled_meta["persona_empty"] = not persona_text
+        if not persona_text:
+            logger.warning(
+                "人设为空：本轮提示词里没有人设（persona_id=%s）。"
+                "这不是注入链路故障——库里那一行的 system_prompt 与 traits 都是空的，"
+                "去「人设」页填上即生效",
+                self._persona_id,
+            )
         contributions.append(
             ContextContribution(
                 lane="constraints",
@@ -1093,6 +1123,11 @@ class ContextCompiler:
         #
         # `ContextContribution` 是 **frozen** 的契约模型，不能原地赋值
         # （`c.text = ...` 抛 `ValidationError`，不是"截断"）。所以造新对象。
+        # **空文本的车道整条不发**：一条 `content=""` 的 system 消息既没有任何
+        # 信息，又会在快照里变成一个"看起来注入了、其实是空的"块。任何车道
+        # （不只是人设）渲染出空串时都不该占消息位。
+        contributions = [c for c in contributions if c.text.strip()]
+
         capped: list[ContextContribution] = []
         for c in contributions:
             budget_chars = max(80, c.token_budget * 2)  # 保守：按 2 字符/token 估算
@@ -1305,6 +1340,13 @@ class ContextCompiler:
             # 由她自己决定（人设自由度），代码只负责把事实摆出来。
             if getattr(msg, "retracted_at", None) is not None:
                 content = f"{content}{RETRACTED_NOTE}"
+            # 她自己撤回的那条：措辞换成第一人称（谁撤回的不能混）。
+            #
+            # 为什么**不**剔除：撤回发生在她说出口之后，平台的对话里已经没有
+            # 这条，但"她说过这句话"是既成事实——删掉会让下一轮的她完全不理解
+            # 自己上一条回复在说什么（和入站"已看过"那条同理）。
+            if getattr(msg, "recalled_at", None) is not None:
+                content = f"{content}{SELF_RECALLED_NOTE}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
             mark = history_marks.get(msg.message_id) if role == "user" else None

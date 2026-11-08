@@ -297,6 +297,22 @@ class Message(Base):
     #
     # NULL 只出现在"没有撤回"的行上；撤回过的行一定是 true/false。
     retracted_after_seen: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # --- 出站撤回：**她自己**把自己说过的话收回来（迁移 0057）---
+    #
+    # 与上面的 `retracted_at` 是**两件事**：那个是"对方收回了"，这个是
+    # "她收回自己的话"。撤回方不同，窗口/频次/回执也都不同，所以列必须分开
+    # （见 `migrations/versions/0057_outbound_recall.py` 的说明）。
+    #
+    # `recalled_at` 只有平台回执 == recalled 时才写；`uncertain` 只写
+    # `recall_attempted_at`——把"试过"当成"成了"会让一次超时被永久记成功。
+    recalled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recall_state: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    recall_receipt_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recall_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

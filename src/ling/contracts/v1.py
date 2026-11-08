@@ -405,6 +405,70 @@ class RecallEvent(StrictModel):
     trace_id: IdStr | None = None
 
 
+# ---------------------------------------------------------------- 主动撤回（出站）
+
+class OutboundRecallState(StrEnum):
+    """**她自己**发出去的消息，被主动撤回的结果。
+
+    与入站的 :class:`RecallEvent` 是两件事：那个是"对方收回了什么"，
+    这个是"我们把已经发出去的那条收回来"。混用会让"谁撤回的"永远说不清。
+
+    五个取值都必须能区分，因为它们对用户的含义完全不同：
+
+    - ``recalled``：平台确认已撤回（**唯一**可以说"撤回了"的状态）；
+    - ``not_found``：平台上已经没有这条（可能早被删、id 过期）；
+    - ``expired``：超过平台允许的撤回时间窗，**根本没发 action**；
+    - ``unsupported``：这个接入方式不支持撤回（QQ 官方机器人）；
+    - ``uncertain``：没拿到回执，**不确定**是否撤回成功——不许说成功。
+    """
+
+    recalled = "recalled"
+    not_found = "not_found"
+    expired = "expired"
+    unsupported = "unsupported"
+    uncertain = "uncertain"
+
+
+class RecallReceipt(StrictModel):
+    """一次撤回尝试的**平台回执**（"没有回执不声称已撤回"）。
+
+    ``detail`` 是给人看的一句话（不含消息正文）；``attempts`` 让调用方能说清
+    "我们试过几次"——重试不重复撤回，但"试过"本身是事实。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    receipt_id: IdStr
+    channel: IdStr
+    state: OutboundRecallState
+    # 被撤回的那条平台消息 id（撤回动作的对象）
+    platform_message_id: IdStr | None = None
+    observed_at: datetime
+    detail: str | None = None
+
+
+class RecallMessageOut(StrictModel):
+    """`POST /v1/conversations/{conversation_id}/messages/{message_id}/recall` 的响应。
+
+    ``state`` 与 :class:`OutboundRecallState` 同源；``message_id`` 是**本地**
+    消息 id（不是平台 id，平台 id 不进前端——它是对账凭据，不是展示标识）。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    message_id: IdStr
+    state: OutboundRecallState
+    # 人话说明（"撤回了"/"超过平台允许的撤回时间了"…）。前端直接显示这句。
+    note: str
+    # 本地标记的撤回时刻（`recalled` 与 `uncertain` 都可能非空：
+    # 后者是"我们发起了、但没拿到确认"，不能当成成功）
+    recalled_at: datetime | None = None
+    # 平台回执 id（可用来对账/追查，不含正文）
+    receipt_id: IdStr | None = None
+    attempts: int = Field(default=1, ge=0)
+    reason_code: str | None = Field(
+        default=None, description="稳定错误码，只给日志与测试；界面显示 note"
+    )
+
+
 # ---------------------------------------------------------------- 会话与轮次
 
 
@@ -519,6 +583,20 @@ class ChatMessage(StrictModel):
     # 发言人的平台标识（QQ 号；解析不到时退回 subject id）。
     # 前端用它把人分组，所以它必须对同一个人**始终是同一个值**。
     sender_id: str | None = None
+    # 这条消息在平台上被**对方**撤回了（入站撤回，迁移 0055）。
+    # 非空 = 撤回时刻。界面据此标"已撤回"；上下文按
+    # `retracted_after_seen` 分两种处理（看过 → 保留并加注记）。
+    retracted_at: datetime | None = None
+    # **她自己**把这条收回来了（出站撤回，迁移 0057）。
+    #
+    # 与 `retracted_at` 分开：那个是"对方撤回的"，这个是"她撤回的"。
+    # 前端据此画"已撤回"徽标 + 决定是否还显示"撤回"按钮；两者都非空时
+    # 以 `recalled_at` 为准（她自己撤的优先级更高，说明这条是她的发言）。
+    recalled_at: datetime | None = None
+    # 最后一次撤回尝试的结果（`recalled`/`uncertain`/`expired`/`not_found`/
+    # `unsupported`）。**只有 `recalled` 等于"撤回了"**——`uncertain` 是
+    # "没拿到回执，不确定"，不能显示成成功。
+    recall_state: str | None = None
 
 
 # ---------------------------------------------------------------- 能力与回执
@@ -534,6 +612,12 @@ class CapabilityDescriptor(StrictModel):
     supports_proactive: bool = False
     supports_edit: bool = False
     supports_media: bool = False
+    # 能不能**主动撤回自己发出去的消息**（OneBot 的 `delete_msg`）。
+    #
+    # 为什么单独一位而不是让调用方 try/except：`recall()` 是可选能力，
+    # 而"这个渠道不支持撤回"与"这次撤回失败了"是两种完全不同的结论——
+    # 前者根本不该发 action（也不该在审计里记一次失败尝试）。
+    supports_recall: bool = False
     max_text_length: int = Field(default=4096, ge=1)
     receipt_reliability: Literal["none", "best_effort", "confirmed"] = "best_effort"
     enabled: bool = False
@@ -1474,6 +1558,9 @@ class ErrorResponse(StrictModel):
 
 
 __all__ = [
+    "RecallReceipt",
+    "RecallMessageOut",
+    "OutboundRecallState",
     "SCHEMA_VERSION",
     "ActionIntent",
     "AudienceRule",

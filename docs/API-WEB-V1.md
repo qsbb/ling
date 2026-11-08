@@ -33,6 +33,7 @@
 | DELETE | `/v1/sessions/{id}` | 归档（软删除） |
 | GET | `/v1/sessions/{id}/messages?limit=50&before_sequence=N` | `{messages: ChatMessage[], active_turn: TurnView \| null}` |
 | GET | `/v1/messages/{message_id}/prompt` | 「查看本次提示词」：这条回复当时真正发给模型的上下文（只读、owner 限定，见 §12） |
+| POST | `/v1/sessions/{conversation_id}/messages/{message_id}/recall` | **撤回她自己发出去的那条**（owner only，见 §3A） |
 
 `ChatMessage` 来自 `contracts/v1`。`TurnView`：
 
@@ -81,6 +82,52 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 `POST /v1/turns/{turn_id}/retry` → 与发送相同的 SSE。只允许重试 `failed`/`stopped` 的轮次，
 且必须仍属于调用者窗口；成功轮次重试返回 409。若协调器仍在收尾，服务端会有界等待
 （最多约 3 秒）后继续，而不是立即拒绝。
+
+## 3A. 撤回她自己发出去的消息（2026-11 新增）
+
+`POST /v1/sessions/{conversation_id}/messages/{message_id}/recall`
+
+用户拍板「说错了想收回」可以用。**只允许撤回她自己发出去的消息**，边界由
+服务端事实决定，客户端不能指定平台 id、不能跳过时间窗。
+
+| 状态码 | 什么时候 | 平台有没有收到 action |
+| --- | --- | --- |
+| 200 `state=recalled` | 平台确认撤回 | 收到 1 次 `delete_msg` |
+| 200 `state=uncertain` | 没拿到回执（超时/断连） | 收到（结果未知） |
+| 200 `state=not_found` | 平台说这条已经不在 | 收到 |
+| 200 `state=expired` | **平台**说超时/没权限 | 收到 |
+| 200 `state=unsupported` | 这个接入方式不支持（QQ 官方机器人） | **没收到** |
+| 403 `not_owner` / `not_actor_message` | 不是主人 / 不是她的发言 | **没收到** |
+| 404 `not_found` | 这条不在这个会话里 | **没收到** |
+| 409 `no_receipt` / `not_delivered` / `already_recalled` | 没有平台回执 / 当时没确认送达 / 已经撤过 | **没收到** |
+| 422 `expired` | 超过本地预检的 2 分钟窗 | **没收到** |
+| 429 `rate_limited` | 同一会话一分钟内超过 3 次 | **没收到** |
+
+响应体：
+
+```json
+{ "schema_version": "v1", "message_id": "msg_...", "state": "recalled",
+  "note": "撤回了", "recalled_at": "2026-11-09T07:40:00Z",
+  "receipt_id": "rcpt_...", "attempts": 1, "reason_code": null }
+```
+
+**界面只显示 `note`，不显示 `reason_code`**（`reason_code` 是稳定码，只给日志
+与测试；拒绝时它在错误体的 `detail` 里）。
+
+**`uncertain` 不是成功**：文案是「没拿到回执，不确定是否撤回成功」，前端不能
+显示成"已撤回"，也不能自动重试——重试由用户再点一次。
+
+**ChatMessage 新增三个字段**：`retracted_at`（**对方**撤回，2026-11 已有）、
+`recalled_at`（**她**撤回，本次新增）、`recall_state`（最后一次尝试的结果）。
+前端画"已撤回"徽标用这两个时间戳；两者都非空时以 `recalled_at` 为准。
+
+**为什么"她自己决定撤回"不开放给模型**：撤回是对已发生交互的补救，让模型
+判断"这句说错了"意味着它要评估自己的输出，而它对自己的错误没有可靠判据——
+错判一次就是替用户删掉一条正常回复。本轮只有用户手动入口；下一阶段若开放，
+需单独授权（模型只能提议、owner 确认）。
+
+完整口径（五道闸、回执五态、上下文注记、审计字段）见
+`docs/BEHAVIOR-LOG-CONTRACT.md` §4A。
 
 ## 4. 模型设置
 

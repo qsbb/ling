@@ -72,6 +72,10 @@ EXPORTED = [
     "ConnectorChangeAccepted",
     "ConnectorOperationOut",
     "ConnectorResetResult",
+    # 主动撤回（出站）：五态回执 + 接口响应。入站的 `RecallEvent` 是另一件事
+    # （对方撤回了什么），不在这里。
+    "RecallReceipt",
+    "RecallMessageOut",
     # 「检查更新」四态卡片（docs/UPDATE-UX-DESIGN.md）。嵌套片段对象（current /
     # newer / target / task / details.*）也各自导出：它们是 API 契约的一部分，
     # 单独写 schema 才能让前端按字段名/类型对齐，而不是对着文档抄。
