@@ -984,6 +984,31 @@ export interface LifeTimelineOut {
   note: string | null;
 }
 
+/**
+ * `POST /v1/life/outline-jobs` 与 `GET /v1/life/outline-jobs/{job_id}` 的响应。
+ *
+ * `state` 是**作业**状态：`queued` / `running` / `ready` / `degraded` /
+ * `failed` / `unchanged`（这次点击什么都没做）/ `blocked`（入队被预算拦下）。
+ * 202 只表示**已提交**，不表示生成成功——还要按 `job_id` 轮询到终态。
+ *
+ * `note` 是**人话**，直接进界面；`reason_code` 只给日志与测试，
+ * 界面上一个字符都不许出现（设计 §0：界面不出现原因码）。
+ */
+export interface OutlineJobOut {
+  schema_version: string;
+  /** `unchanged` 且没有对应的作业事件时可以是 null。 */
+  job_id: string | null;
+  /** 目标日 = **角色计划日**（不是浏览器时区的今天）。 */
+  plan_day: string;
+  state: string;
+  note: string;
+  revision: number;
+  plan_state: string | null;
+  reason_code: string | null;
+  /** 这次调用是否真的新入队（false = 复用了已有作业，或什么都没做）。 */
+  enqueued: boolean;
+}
+
 /** `GET /v1/dashboard` 的 `sections.today_outline.data` 里的一条。 */
 export interface TodayOutlineItem {
   schema_version: string;

@@ -37,6 +37,7 @@ import type {
   ProactiveResponse,
   TimelineResponse,
   LifeTimelineOut,
+  OutlineJobOut,
   SubjectsResponse,
   SubjectsQuery,
   MergeResult,
@@ -405,6 +406,26 @@ export const api = {
   lifeTimeline(date?: string): Promise<LifeTimelineOut> {
     const query = date ? `?date=${encodeURIComponent(date)}` : '';
     return request<LifeTimelineOut>(`/v1/life/timeline${query}`);
+  },
+  /**
+   * 手动生成某一天的日程（owner only，`POST /v1/life/outline-jobs`）。
+   *
+   * **`plan_day` 必须来自时间轴的 `plan_day`**：那是角色计划日。按浏览器
+   * 时区算"今天"在跨日附近会落到另一个日期，后端只会回 422。
+   *
+   * 202 = 已入队（不是已生成）：拿 `job_id` 去轮询；200 = 已经生成过、
+   * 这次什么都没做（`state=unchanged`）。失败码由调用方翻译成人话。
+   */
+  createOutlineJob(body: {
+    plan_day: string;
+    force: boolean;
+    request_id: string;
+  }): Promise<OutlineJobOut> {
+    return request<OutlineJobOut>('/v1/life/outline-jobs', jsonInit('POST', body));
+  },
+  /** 按作业 id 读生成进度（终态后调用方重读时间轴）。 */
+  outlineJob(jobId: string): Promise<OutlineJobOut> {
+    return request<OutlineJobOut>(`/v1/life/outline-jobs/${encodeURIComponent(jobId)}`);
   },
 
   /* ------------------------------------------------ 设置分类法与授权 */
