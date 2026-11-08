@@ -3434,6 +3434,102 @@ async def handle_schedule_refine(payload: dict) -> None:
     )
 
 
+@handler("schedule.replan")
+async def handle_schedule_replan(payload: dict) -> None:
+    """聊天里的临时提议 → 硬门 → 意愿模型 → 局部修订（设计 §4）。
+
+    这条事件由**会话层**在用户消息落库时投递（
+    `domains/conversation/service.add_message` 的接入点），幂等键是
+    ``replan:<turn_id>``。它和 ``schedule.outline`` / ``schedule.refine``
+    一样把模型调用放在 handler 里、不放在 outbox 的认领事务里。
+
+    Payload 里**没有**聊天正文（只带 ``turn_id`` / ``window_id``）：
+    用户的话按 ``turn_id`` 从 ``messages`` 回读，outbox 里少存一份原文就少一处
+    泄漏面。缺 payload 就跳过并记日志——绝不猜。
+
+    分支（全部由 `replan_work` 决定，这里只负责取参数与记账）：
+    没有候选提议 → 什么都不做；已决定过 → 返回原决定；硬门不过/预算满/
+    模型不可用/输出非法/越界/CAS 失败 → ``defer``/``decline`` 并**已经落库**；
+    接受 → 局部修订提交 ``revision+1``（旧段 superseded，不物理删）。
+    """
+    from ling.audit import behavior_event
+    from ling.domains.agenda.replan import replan_work, turn_user_text
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    turn_id = str(payload.get("turn_id") or "").strip()
+    if not turn_id:
+        logger.warning("schedule.replan 缺少 turn_id，跳过: %s", payload)
+        return
+    window_id = str(payload.get("window_id") or "").strip() or None
+    now = utcnow()
+    async with session_scope() as session:
+        user_text = await turn_user_text(session, turn_id=turn_id)
+        outcome = await replan_work(
+            session,
+            actor_id=actor_id,
+            turn_id=turn_id,
+            user_text=user_text,
+            window_id=window_id,
+            now=now,
+            router=_MEMORY_ROUTER,
+            config_reader=_config_reader(session),
+            lease_owner=f"{WORKER_ID}/replan",
+        )
+    if outcome.state == "no_proposal":
+        # 绝大多数消息走这里：没有提议，**不写任何行**（连审计事件都不发，
+        # 否则每一句闲聊都会在行为日志里刷一行"没有动计划"）。
+        logger.debug("schedule.replan.no_proposal turn=%s", turn_id)
+        return
+    logger.info(
+        "重排作业 turn=%s state=%s decision=%s reason=%s plan_day=%s "
+        "revision=%s→%s superseded=%s created=%s calls=%s",
+        turn_id,
+        outcome.state,
+        outcome.decision or "",
+        outcome.reason_code or "",
+        outcome.plan_day.isoformat() if outcome.plan_day else "",
+        outcome.revision_before,
+        outcome.revision_after,
+        outcome.superseded,
+        outcome.created,
+        outcome.calls,
+    )
+    behavior_event(
+        "schedule_replanned"
+        if outcome.state == "accepted"
+        else "schedule_replan_declined"
+        if outcome.state == "declined"
+        else "schedule_replan_deferred",
+        # 说明里只说"改没改"，不复述用户的话。
+        (
+            f"把接下来一段时间改成了新安排（{outcome.created} 段，"
+            f"版本 {outcome.revision_before}→{outcome.revision_after}）"
+            if outcome.state == "accepted"
+            else "这次提议没有改动时间轴"
+        ),
+        outcome="ok" if outcome.state == "accepted" else "skip",
+        attributes={
+            "actor_id": actor_id,
+            "turn_id": turn_id,
+            "state": outcome.state,
+            "decision": outcome.decision or "",
+            "reason_code": outcome.reason_code or "",
+            "target_plan_day": (
+                outcome.plan_day.isoformat() if outcome.plan_day else ""
+            ),
+            "plan_id": outcome.plan_id or "",
+            "revision_before": outcome.revision_before,
+            "revision_after": outcome.revision_after,
+            "superseded": outcome.superseded,
+            "created": outcome.created,
+            "calls": outcome.calls,
+            # 给用户的那句话（"暂未改动"就在里面）：调用方可以直接说给用户听。
+            "notice": outcome.notice,
+        },
+    )
+
+
 @handler("dream.generate")
 async def handle_dream_generate(payload: dict) -> None:
     """生成某一晚的梦（一晚一份；模型调用在 outbox 事务外）。
@@ -3903,6 +3999,10 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     "relationship.update",
     "schedule.outline",
     "schedule.refine",
+    # 聊天里的临时提议：会话层在消息落库时投递（见
+    # `domains/conversation/service.add_message` 的接入点），handler 在这里跑
+    # 硬门 + 意愿模型 + 局部修订。**不是**周期任务：没有提议就没有事件。
+    "schedule.replan",
     "schedule.seam",
     "sleep.settle",
     "window.summary",

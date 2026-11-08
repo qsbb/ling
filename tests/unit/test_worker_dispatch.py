@@ -131,10 +131,41 @@ def test_life_schedule_scan_is_minute_grained() -> None:
 
 
 def test_new_schedule_topics_are_registered() -> None:
-    """时间轴/梦/结算的四个 outbox topic 必须都在。"""
-    expected = {"schedule.outline", "schedule.seam", "dream.generate", "sleep.settle"}
+    """时间轴/梦/结算/重排的 outbox topic 必须都在。
+
+    `schedule.replan` 是阶段 3 的：**由会话层投递**（用户消息落库时命中提议
+    候选），不是周期任务——没有提议就没有事件，所以它只能在
+    `OUTBOX_TOPICS` 里、不在 `PERIODIC_JOBS` 里。
+    """
+    expected = {
+        "schedule.outline",
+        "schedule.seam",
+        "schedule.refine",
+        "schedule.replan",
+        "dream.generate",
+        "sleep.settle",
+    }
     assert expected <= set(HANDLERS)
     assert expected <= OUTBOX_TOPICS
+
+
+def test_replan_topic_is_enqueued_from_the_turn_side() -> None:
+    """`schedule.replan` 必须由**轮次收尾**投递，而且不带聊天正文。
+
+    两个都重要：
+
+    - 入队方只能有一处（轮次收尾），否则两条链路各自投一次，同一轮会被判
+      两次——`turn_id` 的幂等键就白设了；
+    - payload 里不能出现用户原文（`text`），否则每一句可能成提议的聊天都会被
+      抄进 `outbox_events.payload`，凭空多一处隐私副本。worker 按 `turn_id`
+      回读那一条消息即可。
+    """
+    turn = (SRC / "kernel" / "turn.py").read_text(encoding="utf-8")
+    assert "note_schedule_proposal" in turn, "轮次收尾没有接提议提取的入口"
+    replan = (SRC / "domains" / "agenda" / "replan.py").read_text(encoding="utf-8")
+    assert '"schedule.replan"' in replan
+    payload_block = replan.split('topic="schedule.replan"', 1)[1].split(")", 1)[0]
+    assert '"text"' not in payload_block, "outbox payload 里不该出现聊天原文"
 
 
 def test_job_intervals_are_sane() -> None:
