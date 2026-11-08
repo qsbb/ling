@@ -1,0 +1,614 @@
+/**
+ * 生活时间轴的样式（`/life?tab=now`）。
+ *
+ * 单独成文件：`styles.css` 由并行任务在改，这里只在**必须**的时候覆写，类名一律
+ * `tl-` 前缀，不碰其它页面。
+ *
+ * 三条视觉约定，各自对应一条产品约束：
+ *
+ * 1. **计划 = 虚线 + 浅色**，事实 = 实心小块（`.tl-fact--solid`）。两种层不能
+ *    看起来一样——缝隙里全是"这只是打算"还是"这已经发生"。
+ * 2. **已过去 / 此刻 / 未到** 三态靠透明度与左侧竖线（`data-phase`）区分，
+ *    刻意**不**用颜色代码表示"成功/失败"（那会让人以为计划有对错）。
+ * 3. **375px 不横向溢出**：所有会长的东西（标题、时间、原因码）都允许换行
+ *    （`overflow-wrap: anywhere`），时间列在窄屏折成段内的一行，而不是继续
+ *    挤在左栏。宽度只用 `min(…, 100%)` 与 `flex-basis`，不写死像素宽度。
+ */
+
+.tl {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------ 顶部 */
+
+.tl-head {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+
+/* 两个日期并排；窄屏自动折成一列（`minmax(min(100%, 190px), 1fr)`）。 */
+.tl-days {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  gap: 8px 14px;
+}
+
+.tl-day {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.tl-day__label {
+  flex: none;
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.tl-day__value {
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.tl-day__tz {
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-day__src {
+  color: var(--ink-faint);
+}
+
+.tl-days__note {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--warn-soft);
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 状态行：标签 + 说明 + 原因码 + （不可用时的）重试。 */
+.tl-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.tl-state strong {
+  font-size: 14px;
+}
+
+.tl-state__hint {
+  color: var(--ink-soft);
+  font-size: 12px;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* 原因码是**机器码**，用等宽字体 + 中性色：它不是故障文案，不当成错误读。 */
+.tl-state__code {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.tl-note {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.tl-times__row {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tl-times dt {
+  color: var(--ink-faint);
+}
+
+.tl-times dd {
+  margin: 0;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.tl-private {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ 主体 */
+
+.tl-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+
+/* 宽屏：时间轴在左、事实层在右。窄屏（≤860px）保持单列。 */
+@media (min-width: 861px) {
+  .tl-body {
+    grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+    align-items: start;
+  }
+}
+
+.tl-plans,
+.tl-facts {
+  min-width: 0;
+  padding: 12px 14px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+
+.tl-plans__title,
+.tl-facts__title,
+.tl-intents__title,
+.tl-dream__title {
+  margin: 0 0 10px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.tl-plans__empty,
+.tl-facts__empty,
+.tl-intents__empty,
+.tl-dream__none {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* -------------------------------------------------------------- 时间轴本体 */
+
+.tl-track {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 0 2px;
+  list-style: none;
+  min-width: 0;
+}
+
+/* 左侧那条竖线：整个轨道的"一天"。 */
+.tl-track::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.tl-item {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+/* 写得下就并排；写不下（375px）时间折到段内，不让时间列吃掉正文。 */
+@media (max-width: 460px) {
+  .tl-item {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+}
+
+.tl-item__time {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 6px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.tl-item__time-end::before {
+  content: '↓ ';
+  color: var(--line-strong);
+}
+
+@media (max-width: 460px) {
+  /* 窄屏时间列被折掉：段内已经有一份起止（`.tl-seg__range`），不重复。 */
+  .tl-item__time {
+    display: none;
+  }
+}
+
+/* 计划段：**虚线边框 + 浅色底**，这是"打算/可能"的唯一视觉签名。 */
+.tl-seg {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--paper-sunken) 55%, transparent);
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* 层级：大块 → 小时 → 分钟，靠缩进与字号区分（颜色不再重复一次）。 */
+.tl-seg--layer-block {
+  font-size: 14px;
+  padding-left: 12px;
+}
+
+.tl-seg--layer-hour {
+  margin-left: 10px;
+  font-size: 13px;
+  padding-left: 12px;
+  background: color-mix(in srgb, var(--paper-sunken) 40%, transparent);
+}
+
+.tl-seg--layer-minute {
+  margin-left: 20px;
+  font-size: 12px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--paper-sunken) 28%, transparent);
+}
+
+.tl-seg__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.tl-seg__toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 0;
+  border: none;
+  background: none;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.tl-seg__toggle[aria-expanded='true'] > svg {
+  transform: rotate(90deg);
+}
+
+.tl-seg__toggle > svg {
+  transition: transform 120ms ease;
+}
+
+.tl-seg__title {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.tl-seg__tag {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.tl-seg__now {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.tl-seg__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.tl-seg__range {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 跨午夜的两个标记：段首/段尾各一个，位置本身就是语义。 */
+.tl-seg__edge {
+  display: inline-block;
+  color: var(--warn);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.tl-seg__edge--from {
+  align-self: flex-start;
+}
+
+.tl-seg__edge--next {
+  align-self: flex-end;
+}
+
+/* 三态：已过去压暗，此刻给左侧实线强调，未到保持原样。 */
+.tl-item--past .tl-seg {
+  opacity: 0.55;
+}
+
+.tl-item--now .tl-seg {
+  border-style: dashed;
+  border-left: 3px solid var(--accent);
+  box-shadow: var(--shadow-card);
+}
+
+/* ------------------------------------------------------------------ 事实 */
+
+.tl-seg__facts,
+.tl-facts__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+/*
+ * 事实 = **实心**小块。与计划段的虚线正好相反：这条有证据。
+ * 用 `min-height: 0` + 自动高度（不参与时间比例），避免被读成"又一段计划"。
+ */
+.tl-fact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--ink-soft);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.tl-fact--solid {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.tl-fact__label {
+  flex: none;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.tl-fact__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-fact__kind,
+.tl-fact__scene {
+  color: var(--ink-faint);
+}
+
+/* -------------------------------------------------------------- 子段容器 */
+
+.tl-children {
+  /* 父段是两列 grid（时间列 + 段卡片）；子段列表必须跨满两列，
+     否则会被自动放进 56px 的时间列里、挤成竖排单字（实测过一次）。 */
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 5px 0 0;
+  padding: 0 0 0 2px;
+  list-style: none;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------ 意向 */
+
+.tl-intents,
+.tl-dream {
+  min-width: 0;
+  padding: 12px 14px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+
+.tl-intents__horizon {
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  border-left: 3px solid var(--line-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-intents__list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tl-intent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-intent__days {
+  flex: none;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* confirmed 也不说"约好"：文案本身带"时段仍待定"，这里只弱化样式。 */
+.tl-intent__state {
+  min-width: 0;
+  color: var(--ink-soft);
+}
+
+.tl-intent__source {
+  color: var(--ink-faint);
+}
+
+/* -------------------------------------------------------------------- 梦 */
+
+.tl-dream__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-bottom: 6px;
+}
+
+/* `origin=simulated` 必须露出来：梦是模拟叙事，不是事实。 */
+.tl-dream__badge {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--warn);
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.tl-dream__heading {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.tl-dream__text {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tl-dream__restricted {
+  margin: 0 0 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.tl-dream__meta {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 外壳/触控 */
+
+.tl-panel__title {
+  margin-top: 0;
+}
+
+/*
+ * 触控目标：折叠按钮在手机上原本只有一行文字的高度（≈18px）。
+ * 用 padding + 等量负 margin 把命中区撑到 44px，视觉密度不变
+ * （与 dashboard.css 里 `dash__refresh` 同一手法）。
+ */
+@media (max-width: 900px) {
+  .tl-seg__toggle {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 12px 8px;
+    margin: -12px -8px -12px 0;
+    justify-content: flex-start;
+  }
+}
+
+/*
+ * 读不到（`state=unavailable`）时的那一条。
+ * 刻意**不**长得像空态：左边警示条 + 明确写着"这不代表今天没有安排"。
+ * 空态（`empty`）用的是 `.tl-plans__empty` 的灰字，两者不会混。
+ */
+.tl-unavailable {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

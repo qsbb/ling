@@ -833,6 +833,198 @@ export interface ProactiveResponse {
   note?: string;
 }
 
+/* ------------------------------------------------------ 生活时间轴（只读） */
+
+/**
+ * 只读生活时间轴的对外状态（后端 `TimelineState`，六个值**必须互相区分**）。
+ *
+ * - `empty`：这一天没有计划行——真的没有，不是故障；
+ * - `pending`：行已建、大纲还没生成；
+ * - `ready`：模型或规则大纲已提交；
+ * - `degraded`：有行，但内容是规则兜底（模型不可用/输出被拒收）；
+ * - `failed`：最近一次生成失败，原因在 `last_error_code`；
+ * - `unavailable`：这一次读取出错，投影拿不到（**不是**"没安排"）。
+ */
+export type TimelineState =
+  | 'ready'
+  | 'degraded'
+  | 'failed'
+  | 'pending'
+  | 'empty'
+  | 'unavailable';
+
+/** 仪表盘一条今日摘要与"此刻"的关系（后端 `OutlineRelation`）。 */
+export type OutlineRelation = 'now' | 'next' | 'anchor';
+
+/** 时间轴上的一个计划段（`layer` 的闭集；未知值原样显示，不猜）。 */
+export type TimelineLayer = 'block' | 'hour' | 'minute';
+
+/**
+ * `GET /v1/life/timeline` 的 `segments[]`：**计划层**。
+ *
+ * `start_at` / `end_at` 是原始区间；`display_*` 是裁剪到展示日窗口后的区间。
+ * 跨午夜的段在两天各自被裁剪，靠 `continues_*` 说明还有另一半——**不要**把
+ * 裁剪后的值当成段的真实起止，也不要用 `start_at` 反推归属日（用 `plan_day`）。
+ */
+export interface LifeTimelineSegment {
+  schema_version: string;
+  segment_id: string;
+  plan_id: string;
+  /** 这个段属于哪一天的**角色计划日**（可能不等于顶层 `plan_day`）。 */
+  plan_day: string;
+  parent_id: string | null;
+  layer: string;
+  is_leaf: boolean;
+  /** current / superseded / cancelled（已替代段不会出现在响应里）。 */
+  status: string;
+  revision: number;
+  /** model / rule / baseline / user。 */
+  source: string;
+  /** '' 可变段；sleep / commitment 是不可移动锚点。 */
+  anchor_kind: string;
+  /** tentative / confirmed。 */
+  commitment_level: string;
+  place_id: string | null;
+  title: string;
+  start_at: string;
+  end_at: string;
+  display_start_at: string;
+  display_end_at: string;
+  continues_from_previous_day: boolean;
+  continues_next_day: boolean;
+}
+
+/**
+ * `facts[]`：**事实层**（已发生的活动进程），与计划段分开。
+ *
+ * `evidence_kind=clock_only` 只证明"时间到了"，不能当成"她做过"；
+ * `observed` / `user_confirmed` 才是事实。`scene_valid_until=null` 表示
+ * 此刻情景状态 unknown（过期或未提交），不要读成"她还在做"。
+ */
+export interface LifeTimelineFact {
+  schema_version: string;
+  activity_id: string;
+  /** running / paused / completed / failed。 */
+  state: string;
+  origin: string;
+  evidence_kind: string;
+  scene_valid_until: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  place_id: string | null;
+}
+
+/** 未来 7 天展望里的一条长程意向（**不是**那一天的日计划）。 */
+export interface DayIntentSummary {
+  schema_version: string;
+  intention_id: string;
+  target_start_day: string;
+  target_end_day: string;
+  /** proposed / planned / confirmed（confirmed 也不等于"某个时段约好"）。 */
+  state: string;
+  /** model / user / actor / recurrence。 */
+  source_kind: string;
+  visibility: string;
+  priority: number;
+}
+
+/**
+ * 一晚的梦（模拟叙事）。**不是事实**，且受众受限。
+ *
+ * `dream=null` = 没有记录；`restricted=true` = 有记录但你看不到正文。
+ * 两者不能合并。
+ */
+export interface DreamCard {
+  schema_version: string;
+  /** ready / failed / missed / no_dream。 */
+  status: string;
+  origin: string;
+  visibility: string;
+  title: string | null;
+  narrative: string | null;
+  restricted: boolean;
+}
+
+/** `GET /v1/life/timeline` 的完整响应（字段名严格对齐后端契约）。 */
+export interface LifeTimelineOut {
+  schema_version: string;
+  state: TimelineState;
+  /** 库里 `day_plans.state` 原值：pending / ready / degraded；无行为 null。 */
+  plan_state: string | null;
+  revision: number;
+  /** 最近一次失败/降级/待复核的**原因码**（如 `degraded_late`），不是文案。 */
+  last_error_code: string | null;
+  display_date: string;
+  display_timezone: string;
+  display_timezone_source: TimezoneSource;
+  display_window_start_at: string;
+  display_window_end_at: string;
+  actor_timezone: string;
+  actor_timezone_source: TimezoneSource;
+  plan_day: string;
+  plan_window_start_at: string;
+  plan_window_end_at: string;
+  /** 生成到期时刻（D−1 角色本地 21:00），与 `generated_at` 不是一回事。 */
+  outline_due_at: string;
+  timezone_source: string;
+  /** 当前版本**实际提交**时刻；无计划行时为 null。 */
+  generated_at: string | null;
+  segments: LifeTimelineSegment[];
+  facts: LifeTimelineFact[];
+  intents: DayIntentSummary[];
+  /** 未来日尚未生成大纲：`intents` 是展望，不是 D+1…D+7 的日计划。 */
+  horizon_unplanned: boolean;
+  dream: DreamCard | null;
+  superseded_segment_count: number;
+  hidden_segment_count: number;
+  hidden_fact_count: number;
+  hidden_intent_count: number;
+  /** 有内容因受众裁决被隐藏（空数组 ≠ 没有内容）。 */
+  has_private_content: boolean;
+  note: string | null;
+}
+
+/** `GET /v1/dashboard` 的 `sections.today_outline.data` 里的一条。 */
+export interface TodayOutlineItem {
+  schema_version: string;
+  segment_id: string | null;
+  relation: OutlineRelation;
+  title: string;
+  start_at: string;
+  end_at: string;
+}
+
+/** `GET /v1/dashboard` 的 `sections.today_outline.data`。 */
+export interface TodayOutlineOut {
+  schema_version: string;
+  state: TimelineState;
+  display_date: string;
+  display_timezone: string;
+  plan_day: string;
+  actor_timezone: string;
+  items: TodayOutlineItem[];
+  note: string | null;
+}
+
+/** `GET /v1/dashboard` 的 `sections.intent_teaser.data` 里的一条。 */
+export interface IntentTeaserItem {
+  schema_version: string;
+  intention_id: string;
+  title: string;
+  target_start_day: string;
+  target_end_day: string;
+  state: string;
+  source_kind: string;
+}
+
+/** `GET /v1/dashboard` 的 `sections.intent_teaser.data`。 */
+export interface IntentTeaserOut {
+  schema_version: string;
+  /** 恒为 true：未来日**尚未生成大纲**，条目是意向而不是安排。 */
+  horizon_unplanned: boolean;
+  items: IntentTeaserItem[];
+  note: string | null;
+}
 
 export interface MediaUploadResponse {
   evidence_id: string;
@@ -908,6 +1100,19 @@ export interface DashboardResponse {
      * 看屏幕"——后者是更短、更频繁的状态切换，两者时间尺度不一样。
      */
     phone: DashboardSection;
+    /**
+     * 「今天她可能做什么」：时间轴上的 2–3 条摘要（当前段 / 接下来 / 已约定）。
+     *
+     * 与旧的 `agenda` **并列、互不改义**：`agenda` 是"最多几件小事"，这块回答
+     * 的是"她这一天的时间轴现在到哪儿了"。运行期按可选处理——旧后端不返回它，
+     * 那时整块退化成 `unavailable`，而不是让整页炸掉。
+     */
+    today_outline?: DashboardSection;
+    /**
+     * 未来意向预告（1–2 条）。`horizon_unplanned=true` 是契约的一部分：
+     * 未来日**没有**生成大纲，这些是意向而不是那一天的安排。
+     */
+    intent_teaser?: DashboardSection;
   };
 }
 

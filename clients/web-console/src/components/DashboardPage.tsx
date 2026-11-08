@@ -16,10 +16,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
-import type { DashboardResponse, DashboardSection } from '../types';
+import type {
+  DashboardResponse,
+  DashboardSection,
+  IntentTeaserOut,
+  OutlineRelation,
+  TimelineState,
+  TodayOutlineOut,
+} from '../types';
 import { AlertIcon, RefreshIcon } from './Icons';
+import '../life-overview.css';
 
 interface DashboardPageProps {
+  /** 「详细」入口：生活页（`/life`）。 */
   onOpenNow: () => void;
   onOpenChat: () => void;
   onOpenSettings: () => void;
@@ -360,6 +369,239 @@ export function AgendaBody({ data }: { data: Record<string, unknown> }): React.R
   );
 }
 
+/**
+ * `today_outline.items[].relation` 的中文（契约 §11.9 / 后端 `OutlineRelation`）。
+ *
+ * 三个值**不能合并**：`now` 是"此刻可能在做"，`next` 是"接下来（可能）"，
+ * `anchor` 才是"已约定"。把 next 写成"在做"、把 anchor 写成"打算"，
+ * 都会让人把计划当承诺 / 把承诺当计划。
+ */
+export const RELATION_LABEL: Record<OutlineRelation, string> = {
+  now: '此刻可能在做',
+  next: '接下来',
+  anchor: '已约定',
+};
+
+export function relationLabel(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return RELATION_LABEL[raw as OutlineRelation] ?? raw;
+}
+
+/**
+ * `state` 的短文案（总览用；完整解释在生活页时间轴顶部）。
+ *
+ * 六种都要有：把 `empty` 和 `unavailable` 说成同一句，就是"查不到"与
+ * "确实没有"最典型的混淆。
+ */
+export const OUTLINE_STATE_LABEL: Record<TimelineState, string> = {
+  ready: '已生成',
+  degraded: '规则兜底',
+  failed: '生成失败',
+  pending: '还没生成',
+  empty: '这一天还没有安排',
+  unavailable: '读不到',
+};
+
+export function outlineStateLabel(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return OUTLINE_STATE_LABEL[raw as TimelineState] ?? raw;
+}
+
+/** 契约 §11.9 的 `intent_teaser.items[].state`（与时间轴的 `intents[]` 同一套）。 */
+export function intentTeaserStateLabel(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  switch (raw) {
+    case 'proposed':
+      return '候选';
+    case 'planned':
+      return '想/考虑';
+    case 'confirmed':
+      // 确认的是目标/日期，不是某个时段已经约好。
+      return '已确认想在这个日期段做（时段仍待定）';
+    default:
+      return raw;
+  }
+}
+
+const INTENT_SOURCE_LABEL: Record<string, string> = {
+  model: '模型提的',
+  user: '你提的',
+  actor: '她提的',
+  recurrence: '按周期',
+};
+
+export function intentTeaserSourceLabel(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return INTENT_SOURCE_LABEL[raw] ?? raw;
+}
+
+/** 卡片拿不到区块时按"读不到"处理，不按"没有"处理。 */
+const MISSING_SECTION: DashboardSection = { status: 'unavailable', as_of: '' };
+
+/**
+ * 「今天她可能做什么」的正文。
+ *
+ * 与旧 `agenda` 卡片并列、互不改义：这块只画时间轴上的 2–3 条摘要。
+ * 条数是后端选的，**没有就不补**——"下午还没定"不该显示成"安排满了"。
+ * 时间用区块自带的 `display_timezone` 格式化（不读浏览器时区）。
+ */
+export function TodayOutlineBody({ data }: { data: Record<string, unknown> }): React.ReactElement {
+  const outline = data as unknown as Partial<TodayOutlineOut>;
+  const state = String(outline.state ?? '');
+  const items = outline.items ?? [];
+  const timeZone = String(outline.display_timezone ?? 'UTC');
+  const displayDate = String(outline.display_date ?? '');
+  const planDay = String(outline.plan_day ?? '');
+  // 两个日期本来就是背靠背的：不抹成同一个"今天"（契约 §11.2）。
+  const zonesDiffer = Boolean(displayDate && planDay && displayDate !== planDay);
+  const fmt = (iso: string | null | undefined) => {
+    if (!iso) return '';
+    const at = new Date(iso);
+    if (Number.isNaN(at.getTime())) return '';
+    try {
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+      }).format(at);
+    } catch {
+      return String(iso).slice(11, 16);
+    }
+  };
+  return (
+    <>
+      <p className="dash-card__muted">
+        你的今天 {displayDate || '未知'}（{outline.display_timezone ?? '未知'}）
+        {planDay ? ` · 她的计划日 ${planDay}（${outline.actor_timezone ?? '未知'}）` : ''}
+      </p>
+      {zonesDiffer ? (
+        <p className="dash-card__muted" data-testid="dash-outline-tz-note">
+          两边日期不同：这里是你的今天，括号里是她的计划日——时间轴按各自的时区裁剪。
+        </p>
+      ) : null}
+      {items.length === 0 ? (
+        <p className="dash-card__muted" data-testid="dash-outline-empty">
+          {/* 空态也分状态：没安排 / 还没生成 / 读不到，三件事。 */}
+          {outlineStateLabel(state) || '今天暂时没有可展示的摘要。'}
+        </p>
+      ) : (
+        <ul className="dash-list" data-testid="dash-outline-list">
+          {items.map((item, index) => (
+            <li
+              key={`${item.segment_id ?? item.title}-${index}`}
+              className="dash-list__row dash-list__row--life"
+              data-relation={item.relation}
+            >
+              <span className={`dash-list__kind dash-relation dash-relation--${item.relation}`}>
+                {relationLabel(item.relation)}
+              </span>
+              <span className="dash-list__text">{item.title}</span>
+              <span className="dash-list__meta">
+                {fmt(item.start_at)}–{fmt(item.end_at)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="dash-card__muted" data-testid="dash-outline-state">
+        状态：{outlineStateLabel(state) || '未知'}
+        {state === 'degraded' ? '（内容是规则兜底，不是模型排的）' : ''}
+        {state === 'failed' ? '（最近一次生成失败；原因码在生活页时间轴上）' : ''}
+      </p>
+      {outline.note ? <p className="dash-card__muted">{outline.note}</p> : null}
+    </>
+  );
+}
+
+/**
+ * 「未来意向」的正文。
+ *
+ * `horizon_unplanned=true` 是**契约的一部分**：未来日没有生成大纲，这些条目
+ * 只是意向。所以这句话必须和列表一起出现——单独一张"未来 7 天"列表，
+ * 会被读成日程表。`proposed` 候选不会因为上了首屏就升级。
+ */
+export function IntentTeaserBody({ data }: { data: Record<string, unknown> }): React.ReactElement {
+  const teaser = data as unknown as Partial<IntentTeaserOut>;
+  const items = teaser.items ?? [];
+  const horizon =
+    typeof teaser.horizon_unplanned === 'boolean' ? teaser.horizon_unplanned : true;
+  return (
+    <>
+      {horizon ? (
+        <p className="dash-card__muted" data-testid="dash-intent-horizon">
+          未来日还未生成大纲——下面这些只是意向，不是那一天的安排。
+        </p>
+      ) : null}
+      {items.length === 0 ? (
+        <p className="dash-card__muted" data-testid="dash-intent-empty">
+          未来 7 天还没有有来源的意向。
+        </p>
+      ) : (
+        <ul className="dash-list" data-testid="dash-intent-list">
+          {items.map((item) => (
+            <li key={item.intention_id} className="dash-list__row dash-list__row--life">
+              <span className="dash-list__kind">
+                {item.target_start_day === item.target_end_day
+                  ? item.target_start_day
+                  : `${item.target_start_day} → ${item.target_end_day}`}
+              </span>
+              <span className="dash-list__text">{item.title}</span>
+              <span className="dash-list__meta">
+                <span className="dash-list__state">{intentTeaserStateLabel(item.state)}</span>
+                {intentTeaserSourceLabel(item.source_kind) ? (
+                  <span className="dash-list__kind">
+                    {intentTeaserSourceLabel(item.source_kind)}
+                  </span>
+                ) : null}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {teaser.note ? <p className="dash-card__muted">{teaser.note}</p> : null}
+    </>
+  );
+}
+
+/**
+ * 总览上的两块生活摘要。
+ *
+ * 抽成独立组件只为一个测试目的：`DashboardPage` 在 SSR 下永远停在"加载中"，
+ * 没法直接断言卡片内容；而"一块坏不影响另一块"与"relation 文案"正是这次
+ * 必须钉住的行为。两块各自拿 `DashboardSection`（各带自己的 `status`），
+ * 所以隔离性由结构保证，不靠调用方小心。
+ */
+export function LifeOverviewCards({
+  today,
+  intent,
+  onOpenLife,
+}: {
+  today: DashboardSection;
+  intent: DashboardSection;
+  onOpenLife: () => void;
+}) {
+  return (
+    <>
+      <Card
+        title="今天的节奏"
+        span="half"
+        section={today}
+        renderWhenEmpty
+        action={{ label: '查看生活', onClick: onOpenLife }}
+      >
+        {(d) => <TodayOutlineBody data={d} />}
+      </Card>
+      <Card title="未来意向" span="half" section={intent} renderWhenEmpty>
+        {(d) => <IntentTeaserBody data={d} />}
+      </Card>
+    </>
+  );
+}
+
 export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: DashboardPageProps) {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -517,6 +759,17 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
         <Card title="今天的安排" span="half" section={s.agenda} renderWhenEmpty>
           {(d) => <AgendaBody data={d} />}
         </Card>
+
+        {/*
+          「今天她可能做什么」+「未来意向」：与旧 `agenda` **并列**，不改旧卡片
+          的语义。两块各有自己的 `status`（后端 `_guard` 逐块兜底），一块坏
+          不影响整页——所以它们是两张独立的卡，不塞进旧卡片里。
+        */}
+        <LifeOverviewCards
+          today={s.today_outline ?? MISSING_SECTION}
+          intent={s.intent_teaser ?? MISSING_SECTION}
+          onOpenLife={onOpenNow}
+        />
 
         <Card title="最近记住的事" span="wide" section={s.memories}>
           {(d) => {
