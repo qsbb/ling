@@ -339,3 +339,63 @@ def test_stats_report_buffered_and_capacity() -> None:
     stats = log_buffer_stats()
     assert stats.buffered >= 1
     assert stats.capacity == DEFAULT_LOG_BUFFER_SIZE
+
+
+def test_setup_logging_heals_after_handlers_were_cleared() -> None:
+    """root handler 被清空之后，`setup_logging()` 必须把日志链路**装回来**。
+
+    ## 为什么这条必须存在
+
+    它对应一个真实排查了很久的故障：`setup_logging` 只在 `ling.app` 模块导入
+    时跑一次（`uvicorn ling.app:app` 的启动方式不走 `__main__`）。一旦有任何
+    代码把 root handler 清掉（测试、宿主框架重配日志、`dictConfig`），之后：
+
+    - `/v1/logs` **永远是空的**（环形缓冲 handler 没了）；
+    - 每条日志的 `trace_id` 都是 null（`ContextFilter` 只挂在那个 handler 上）。
+
+    而且进程一切看起来正常——这正是它隐瞒了这么久的原因。表现只在
+    "用户拿 trace_id 回来查日志，查不到"时才暴露。
+
+    所以这里断言的是**自愈**：清空 → 再调一次 → 缓冲与 filter 都回来了。
+    """
+    import logging as _logging
+
+    from ling.logging_setup import ContextFilter
+
+    root = _logging.getLogger()
+    original = list(root.handlers)
+    original_filters = list(root.filters)
+    try:
+        for handler in original:
+            root.removeHandler(handler)
+        for flt in original_filters:
+            root.removeFilter(flt)
+        assert not root.handlers
+
+        # 模拟宿主先装了一个**没有** ContextFilter 的 handler
+        foreign = _logging.StreamHandler()
+        root.addHandler(foreign)
+
+        setup_logging(role="test")
+
+        # 1) 环形缓冲回来了（否则 /v1/logs 永远空）
+        assert any(isinstance(h, RingBufferHandler) for h in root.handlers)
+        # 2) 外来的那个 handler 也被补上了 filter：子 logger 冒泡上来的记录
+        #    靠的是 handler 上的 filter（logger 的 filter 只在发出处跑）
+        assert any(isinstance(f, ContextFilter) for f in foreign.filters), (
+            "外来 handler 没被补上 ContextFilter：子 logger 的记录里不会有 trace_id"
+        )
+        # 3) 重复调用不会把 filter 塞多次
+        before = len([f for f in foreign.filters if isinstance(f, ContextFilter)])
+        setup_logging(role="test")
+        after = len([f for f in foreign.filters if isinstance(f, ContextFilter)])
+        assert before == after == 1
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in original:
+            root.addHandler(handler)
+        for flt in list(root.filters):
+            root.removeFilter(flt)
+        for flt in original_filters:
+            root.addFilter(flt)

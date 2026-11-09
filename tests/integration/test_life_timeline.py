@@ -492,6 +492,14 @@ async def test_dashboard_adds_today_outline_and_intent_teaser(logged_in: TestEnv
     now = datetime.now(UTC)
     plan_day = plan_day_for(now, TZ)
     plan_id = await _insert_plan(plan_day)
+    # 段的时间**不能**直接取 `now + 1 小时`：跑测试的时刻如果接近角色当地
+    # 午夜（例如 23:29），+1 小时就落到"明天"，而 `load_actor_day` 只取
+    # **角色当天**的段（窗口是当地零点到零点，见 `plan_day_window`），锚点会
+    # 被窗口过滤掉 —— 用例白天绿、深夜红，而产品行为完全正确。
+    #
+    # 所以锚点必须落在**角色当地**的当天窗口内，而不是按 UTC 零点算。
+    from ling.domains.agenda.timeline import plan_day_window
+
     current_start = now.replace(second=0, microsecond=0)
     await _insert_segment(
         plan_id,
@@ -499,11 +507,21 @@ async def test_dashboard_adds_today_outline_and_intent_teaser(logged_in: TestEnv
         end_at=current_start + timedelta(minutes=30),
         title="写代码",
     )
-    anchor_start = current_start + timedelta(hours=1)
+    window_start, window_end = plan_day_window(plan_day, TZ)
+    # 锚点要在"此刻之后、当地日结束之前"。优先放当地日的 3/4 处；深夜跑
+    # 测试时那个点已经过去了，就贴着"此刻 +2 分钟"放，并把它压短到能塞进
+    # 剩余窗口。只有当地日真的只剩不到 3 分钟时才跳过——那时不存在"未来且
+    # 仍在今天"的锚点，是**数据上不可能**，不是功能缺失。
+    anchor_start = window_start + (window_end - window_start) * 3 / 4
+    anchor_start = max(anchor_start, current_start + timedelta(minutes=2))
+    remaining = window_end - anchor_start
+    if remaining <= timedelta(minutes=1):
+        pytest.skip("此刻距当地午夜不足 3 分钟，无法构造同一天内的未来锚点")
+    anchor_span = min(timedelta(minutes=30), remaining - timedelta(seconds=30))
     await _insert_segment(
         plan_id,
         start_at=anchor_start,
-        end_at=anchor_start + timedelta(minutes=30),
+        end_at=anchor_start + anchor_span,
         title="和人约好",
         anchor_kind="commitment",
         commitment_level="confirmed",

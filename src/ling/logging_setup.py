@@ -640,7 +640,6 @@ def setup_logging(role: str | None = None) -> None:
     root = logging.getLogger()
     if not root.handlers:
         handler = logging.StreamHandler(sys.stdout)
-        handler.addFilter(ContextFilter())
         service, version = _service_meta()
         if fmt == "json":
             handler.setFormatter(
@@ -654,6 +653,26 @@ def setup_logging(role: str | None = None) -> None:
                 )
             )
         root.addHandler(handler)
+
+    # `ContextFilter` 原来只加在"本函数自己新建的那个 stdout handler"上，
+    # 于是有一个隐蔽缺口：root 已经有别的 handler 时（uvicorn 先配过、pytest
+    # 的捕获器、宿主程序调过 basicConfig），这一支根本不执行，**filter 就没
+    # 装上**——contextvars 里的 trace_id / turn_id / session_id 一个都不会进
+    # LogRecord。表现是"日志看起来正常，但关联字段全是 null"，而排查恰恰靠
+    # 这几个字段。
+    #
+    # 注意 logging 的语义：`Logger.filter()` 只在**记录被发出的那个 logger**
+    # 上执行；记录向上冒泡时，祖先 logger 的 filters **不会**再跑。所以只把
+    # filter 挂到 root logger 上是不够的——它只对"直接打在 root 上的记录"生效。
+    #
+    # 因此两处都要：root logger 一份（覆盖直接打 root 的调用），以及给 root 上
+    # **已经存在的每个 handler** 补一份（覆盖子 logger 冒泡上来的记录，不管那个
+    # handler 是谁装的）。两者都幂等，重复调用不会把字段塞多次。
+    if not any(isinstance(f, ContextFilter) for f in root.filters):
+        root.addFilter(ContextFilter())
+    for existing_handler in list(root.handlers):
+        if not any(isinstance(f, ContextFilter) for f in existing_handler.filters):
+            existing_handler.addFilter(ContextFilter())
 
     # 内存缓冲独立于 stdout handler 判断：已经有了 stdout handler（比如
     # uvicorn 先配过、或测试自己装过）时，仍要确保缓冲存在，否则

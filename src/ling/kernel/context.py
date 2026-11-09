@@ -1005,9 +1005,16 @@ class ContextCompiler:
         try:
 
             from ling.domains.awareness.service import AwarenessService as _AS
+            from ling.domains.memory.purge import has_open_purge
 
             awareness_service = _AS(self._session)
-            if not snapshot.allows_awareness():
+            # **清理进行中一律不注入**：意识条目同样是派生记忆（"她在写小说"），
+            # 请求到物理删除之间它还在库里，照常注入等于删了又念一遍。
+            # 判断放在组合根而不是 `awareness/service.py`：awareness 域不该
+            # import memory 域（域边界闸门，ADR-0001 §2），而"要不要用某个域
+            # 的数据"本来就是这里该决定的事。
+            purge_in_progress = await has_open_purge(self._session, subject_id=subject_id)
+            if not snapshot.allows_awareness() or purge_in_progress:
                 awareness_items = []
             else:
                 awareness_items = await awareness_service.visible_for_window(
@@ -1022,6 +1029,7 @@ class ContextCompiler:
             # 隐私是这类系统里最不该妥协的一条。
             if (
                 not is_group
+                and not purge_in_progress
                 and snapshot.allows_awareness()
                 and await self._trust_level(subject_id) == "owner"
             ):

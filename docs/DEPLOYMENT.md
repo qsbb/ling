@@ -570,7 +570,7 @@ docker logs ling-worker-1 2>&1 | grep proactive_dispatch_skipped
 
 | 命名空间 | 回答什么问题 | 典型事件 |
 |---|---|---|
-| `ling.audit` | **谁**在什么时候**改了什么** | `audit_config_published`、`audit_config_rolled_back`、`audit_provider_secret_set`、`audit_memory_retracted`、`audit_memory_forgotten`、`audit_memory_superseded`、`audit_consent_changed`、`audit_password_changed` |
+| `ling.audit` | **谁**在什么时候**改了什么** | `audit_config_published`、`audit_config_rolled_back`、`audit_provider_secret_set`、`audit_memory_retracted`、`audit_memory_forgotten`、`audit_memory_purged`、`audit_memory_purge_failed`、`audit_memory_superseded`、`audit_consent_changed`、`audit_password_changed` |
 | `ling.security` | **谁**被拒绝了、为什么 | `security_auth_failed`、`security_inbound_denied`、`security_signature_invalid`、`security_must_change_password_blocked` |
 
 ```bash

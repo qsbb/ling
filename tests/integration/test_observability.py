@@ -111,21 +111,55 @@ async def test_polling_route_stays_quiet_when_it_succeeds(logged_in, caplog) -> 
     ]
 
 
-async def test_access_log_entry_carries_the_trace_id(logged_in) -> None:
+async def test_access_log_entry_carries_the_trace_id(logged_in, caplog) -> None:
     """访问日志那条自己也要带 trace_id——日志页里它才是"对得上用户那次请求"的锚点。
 
     `reset_context` 原来在记访问日志**之前**执行，于是这条日志是唯一一条
     没有 trace_id 的：用户在错误页上拿到 id，回来却查不到对应的那次请求。
-    """
-    from ling.logging_setup import recent_logs
 
+    ## 为什么这里断言"日志页真的看得到"，而不是只翻 `caplog`
+
+    这条用例在完整套件里反复偶发失败，根因不是产品行为，而是**取证据的方式**：
+
+    - 早先它读进程级环形缓冲（`recent_logs`），前面上千条用例会把缓冲刷满；
+    - 改用 `caplog` 之后仍偶发——`caplog` 的记录是 root 上某个 handler 写进去
+      的，而 `ContextFilter` 挂在哪一层、哪个 handler 先装，取决于**前面用例
+      执行顺序**。换句话说，断言拿到的是"当时那套 handler 配置"的产物，
+      而不是用户实际会看到的东西。
+
+    用户实际依赖的路径是唯一的：`GET /v1/logs` 返回的条目里有没有
+    `trace_id`（前端的日志页就是照这个字段筛选的）。所以这里直接断言那条
+    路径——它不依赖 handler 装配顺序，也不会被别的用例影响。
+
+    顺带把「`LogEntry.to_dict` 会输出 trace_id」这件事钉住：一旦有人删掉
+    那个字段，日志页就再也对不上请求，而单纯翻日志对象的用例发现不了。
+    """
+    # 环形缓冲是**进程级单例**，前面的用例会把它刷满、也有用例会主动清空它
+    # （`test_message_recall` / `test_recall_tool` 都会）。这里先清空，
+    # 让"本次请求那条日志"一定在窗口里——清空**不改变**被测行为，只是把
+    # "最后 N 条里有没有我这条"变成确定的。
+    from ling.logging_setup import clear_log_buffer
+
+    clear_log_buffer()
     response = await logged_in.client.get("/v1/sessions")
     trace = response.headers["X-Trace-Id"]
+    assert trace
 
-    entries = [
-        entry
-        for entry in recent_logs(limit=200)
-        if entry.event_name == "http_request_completed" and entry.trace_id == trace
+    # 走用户真实路径：日志页读的就是这个接口。
+    logs = await logged_in.client.get("/v1/logs", params={"limit": 200})
+    assert logs.status_code == 200, logs.text
+    items = logs.json()["items"]
+
+    matched = [
+        item
+        for item in items
+        if item.get("event_name") == "http_request_completed"
+        and item.get("trace_id") == trace
     ]
-    assert entries, "访问日志没带上这次请求的 trace_id"
-
+    assert matched, (
+        "日志页里查不到这次请求的 trace_id；"
+        f"本次 trace={trace}，接口返回里出现过的 trace_id："
+        f"{sorted({i.get('trace_id') for i in items if i.get('trace_id')})[:5]}"
+    )
+    # 那一行还要能自解释（用户原话：一长串「请求完成」看不出完成了什么）。
+    assert "读取会话列表" in str(matched[-1].get("message") or "")

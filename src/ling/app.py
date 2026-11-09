@@ -586,6 +586,12 @@ async def memory_request_validation_handler(
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    # 每次建 app 都**确保**日志链路在：`setup_logging` 是幂等的，代价只有几次
+    # isinstance 检查。为什么不够"只在模块导入时配一次"——测试或嵌入方可能把
+    # root handler 清空（`logging.getLogger().handlers.clear()`、宿主框架重配
+    # 日志），那一刻起环形缓冲与 `ContextFilter` 就都不在了，表现是
+    # `/v1/logs` 永远为空、日志里的 trace_id 全是 null，而进程看起来一切正常。
+    setup_logging(role="api")
     settings = settings or get_settings()
     app = FastAPI(
         title="ling",
