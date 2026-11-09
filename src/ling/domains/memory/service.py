@@ -964,6 +964,7 @@ class MemoryService:
         min_age_days: int = 60,
         importance_floor: float = 0.25,
         min_group: int = 3,
+        subject_id: str | None = None,
     ) -> dict[str, int]:
         """压缩级联：把同槽位的多条低价值记忆并成一条高层摘要。
 
@@ -976,6 +977,10 @@ class MemoryService:
         - 同 slot 达到 ``min_group`` 条才合并（少于这个数并了反而丢信息）
         - 合并后原行**归档**并指向摘要（保留 superseded 链，不物理删除）
 
+        ``subject_id`` 给定时只整理该主体（睡眠期整理按人做，见
+        `domains/memory/consolidate.py`）；``None`` = 全部（每日归档的既有
+        行为，保持不变）。
+
         返回 {"groups": 合并组数, "archived": 归档行数}。
         """
         now = now or datetime.now(UTC)
@@ -984,6 +989,15 @@ class MemoryService:
             (
                 await self._session.execute(
                     select(MemoryRow).where(
+                        # 睡眠期整理是**按人**的：一次只动一个主体的记忆。
+                        # 分组键里本来就有 subject_id（不会跨主体合并），
+                        # 但那是"不混在一组"，不是"只处理这一个"——
+                        # 不加这个条件，给 A 整理的一晚会把 B 的记忆也归档。
+                        *(
+                            [MemoryRow.subject_id == subject_id]
+                            if subject_id is not None
+                            else []
+                        ),
                         MemoryRow.archived_at.is_(None),
                         MemoryRow.retracted.is_(False),
                         MemoryRow.value.is_not(None),

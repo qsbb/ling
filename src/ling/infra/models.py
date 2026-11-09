@@ -2818,3 +2818,41 @@ class MediaSlotRow(Base):
         DateTime(timezone=True), nullable=True, index=True
     )
     generation: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class MemoryConsolidationRow(Base):
+    """睡眠期记忆整理的记录：一晚一行。
+
+    设计见 `docs/SLEEP-MEMORY-CONSOLIDATION.md`。这张表不存记忆内容，
+    只记"这一晚做了什么"——整理会归档记忆，用户有权知道发生过什么。
+
+    `state='skipped'` 不是失败：最常见的情况是"到了预计入睡时间，但这晚
+    没有可整理的东西"。把它记成 ok 会让"整理了几条"这个数字失去意义。
+
+    `sleep_date` 唯一：同时起两个作业整理同一晚，会把同一批记忆并两遍，
+    而且两条摘要会互相覆盖来源链。
+    """
+
+    __tablename__ = "memory_consolidations"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id", "subject_id", "sleep_date",
+            name="uq_memory_consolidations_night",
+        ),
+        Index("ix_memory_consolidations_actor_day", "actor_id", "sleep_date"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    subject_id: Mapped[str] = mapped_column(String(64))
+    sleep_date: Mapped[date] = mapped_column(Date)
+    #: ok = 真的做了事；skipped = 判断过但没有可整理的；failed = 出错
+    state: Mapped[str] = mapped_column(String(16), default="skipped")
+    #: 为什么是这个状态（人话，给记忆页展示）
+    reason: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    groups_merged: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    rows_archived: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

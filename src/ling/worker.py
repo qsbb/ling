@@ -3182,6 +3182,14 @@ OUTLINE_SCHEDULE_MAX_ATTEMPTS = 3
 # 不为几天前没生成的梦翻旧账。
 DREAM_MISSED_MARK_HOURS = 6
 
+#: 预计入睡后多久开始整理记忆。给"睡前那几句话"留出落库时间：
+#: 她可能在 bed_at 前刚说完什么，太早整理会漏掉。
+CONSOLIDATION_DELAY_MINUTES = 30
+
+#: 窗口过去多久之后不再补整理。停机一整天后恢复时，对同一批记忆做一次
+#: "补课式"归档没有收益，用户看起来还莫名其妙。
+CONSOLIDATION_CATCHUP_HOURS = 3
+
 
 def _config_reader(session):  # noqa: ANN001, ANN202
     """构造"已发布配置"读取器（worker 侧唯一来源）。
@@ -3517,6 +3525,61 @@ async def _schedule_dream(
     )
 
 
+async def _schedule_consolidation(
+    session, *, actor_id: str, subject_id: str, window, now: datetime  # noqa: ANN001
+) -> bool:
+    """预计入睡后 30 分钟投一次睡眠期记忆整理（一晚一条，幂等键 = sleep_date）。
+
+    ## 为什么是"预计入睡后 30 分钟"
+
+    `life.schedule` 算出的 `night_window` 是**预计**睡眠窗口，不是"她真的
+    睡着了"（设计 §3 第 13 条）。留 30 分钟是给"睡前那几句话"落库——她
+    可能在 bed_at 前刚说完什么，太早整理会漏掉；太晚则拖到早上，跟醒来
+    后的第一轮抢写。
+
+    ## 为什么不在窗口结束后才投
+
+    整理要在**夜里**做（用户对"睡眠时压缩"的理解就是这样），而且它与
+    跨夜结算（`sleep.settle`）是两件事：结算算的是饥饿/精力这类数值，
+    整理动的是记忆行。分开投递，一个失败不影响另一个。
+    """
+    from ling.infra.models import MemoryConsolidationRow
+
+    due = window.bed_at + timedelta(minutes=CONSOLIDATION_DELAY_MINUTES)
+    if now < due:
+        return False
+    # 窗口早已过去很久（比如停机了一整天）：不再补投。补整理的收益很小，
+    # 却会在恢复时对同一批记忆做一次"补课式"归档，用户看起来莫名其妙。
+    if now > window.wake_at + timedelta(hours=CONSOLIDATION_CATCHUP_HOURS):
+        return False
+    existing = (
+        await session.execute(
+            select(MemoryConsolidationRow.id)
+            .where(
+                MemoryConsolidationRow.actor_id == actor_id,
+                MemoryConsolidationRow.subject_id == subject_id,
+                MemoryConsolidationRow.sleep_date == window.sleep_date,
+            )
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        return False  # 这一晚已经整理过（含 skipped/failed）——一晚一次
+    return await _enqueue_once(
+        session,
+        event_id=f"memory_consolidate:{actor_id}:{window.sleep_date.isoformat()}",
+        topic="memory.consolidate",
+        payload={
+            "actor_id": actor_id,
+            "subject_id": subject_id,
+            "sleep_date": window.sleep_date.isoformat(),
+            "bed_at": window.bed_at.isoformat(),
+            "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+
+
 async def _schedule_settlement(
     session, *, actor_id: str, window, now: datetime  # noqa: ANN001
 ) -> bool:
@@ -3586,6 +3649,7 @@ async def handle_life_schedule(payload: dict) -> None:
     )
     from ling.domains.dream.service import night_window
     from ling.infra.models import ActorRoutineRow
+    from ling.settings.user_preferences import owner_subject_id
 
     actor_id = str(payload.get("actor_id") or get_settings().actor_id)
     now = utcnow()
@@ -3660,6 +3724,17 @@ async def handle_life_schedule(payload: dict) -> None:
                 session, actor_id=actor_id, window=window, now=now
             ):
                 enqueued.append(f"sleep.settle:{sleep_date.isoformat()}")
+            # 记忆是**按主体**存的，整理也必须按主体做。主人还没确定时
+            # （全新安装、还没登录过）没有主体可整理——那就跳过，不编一个。
+            owner = await owner_subject_id(session)
+            if owner and await _schedule_consolidation(
+                session,
+                actor_id=actor_id,
+                subject_id=owner,
+                window=window,
+                now=now,
+            ):
+                enqueued.append(f"memory.consolidate:{sleep_date.isoformat()}")
 
         # ⑤ 近窗细化（阶段 2）：距最早未细化段开始 ≤ 60 分钟、且未来 3 小时里
         # 确有粗段才投一次；幂等键含版本与窗口起点，重复扫描不会重复投。
@@ -4352,6 +4427,52 @@ async def handle_dream_generate(payload: dict) -> None:
     )
 
 
+@handler("memory.consolidate")
+async def handle_memory_consolidate(payload: dict) -> None:
+    """睡眠期记忆整理：一晚一次，**确定性、零模型**。
+
+    用户原话：「睡眠的时候应该要对记忆进行压缩或者什么样的」。
+
+    ## 为什么零模型
+
+    整理会**归档**记忆并让摘要行取代它们参与召回。用模型写摘要，等于让
+    模型编的一句话变成她记得的事——而记忆是这个项目里最不能编的东西。
+    第一版只做确定性整理（同槽位、同受众边界、够老、够低价值的归档），
+    每一件都可解释。真需要"这一天浓缩成一句话"时，必须新增一个明确标注
+    "非事实"的存储，不能复用记忆行。
+
+    ## 为什么"预计"而不是"真的睡着"
+
+    调度点是 `life.schedule` 算出的 `night_window`（设计 §3 第 13 条），
+    只是**预计**睡眠窗口。所以落库的 `reason` 写"预计入睡"，不宣称角色
+    真的在睡梦中思考。
+    """
+    from ling.domains.memory.consolidate import consolidate_night
+
+    settings = get_settings()
+    actor_id = str(payload.get("actor_id") or settings.actor_id)
+    subject_id = str(payload.get("subject_id") or "")
+    sleep_date = _parse_payload_date(payload, "sleep_date")
+    if not subject_id or sleep_date is None:
+        logger.warning("memory.consolidate 缺少必要字段，跳过: %s", payload)
+        return
+    async with session_scope() as session:
+        outcome = await consolidate_night(
+            session,
+            actor_id=actor_id,
+            subject_id=subject_id,
+            sleep_date=sleep_date,
+        )
+    logger.info(
+        "睡眠期记忆整理 sleep_date=%s state=%s 合并=%d 归档=%d already=%s",
+        sleep_date.isoformat(),
+        outcome.state,
+        outcome.groups_merged,
+        outcome.rows_archived,
+        outcome.already_done,
+    )
+
+
 @handler("sleep.settle")
 async def handle_sleep_settle(payload: dict) -> None:
     """跨夜结算（零模型，唯一键幂等）：与梦是否成功**无关**。
@@ -4906,6 +5027,9 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     "schedule.replan",
     "schedule.seam",
     "sleep.settle",
+    # 睡眠期记忆整理：由 `life.schedule` 在**预计入睡后 30 分钟**投递，
+    # 一晚一条（幂等键 = sleep_date）。确定性、零模型。
+    "memory.consolidate",
     "window.summary",
     # 视频后台取证（裁决 §3.3）。由入口端点同事务投递，**由专用媒体 worker
     # 消费**：普通 worker 在 `run_forever` 里用 `exclude_topics` 排除它，
