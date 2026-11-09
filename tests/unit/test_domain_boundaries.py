@@ -102,6 +102,15 @@ ALLOWED: dict[tuple[str, str], str] = {
         "mark_missed，不碰 conversation 的表和模型——消息状态的唯一写入方"
         "仍是 conversation 域。"
     ),
+    ("media/sediment.py", "ling.domains.memory.service"): (
+        "媒体沉降要把「她真的看过、但描述即将过期」的证据写成长期记忆"
+        "（用户原话：看过的视频过期后经筛选走记忆入库流程）。写记忆的唯一"
+        "入口是 MemoryService.propose，判重问询是 MemoryService."
+        "already_proposed——本文件不 import MemoryRow、不自己查 memories 表、"
+        "不拼 SQL，记忆的所有权仍完整留在 memory 域。"
+        "（最初版本确实 import 了 MemoryRow 自己查重，被本闸门拦下后改成"
+        "经公开方法问询——这条注释记录的就是那次修正。）"
+    ),
     ("media/service.py", "ling.domains.consent.service"): (
         "入站媒体能不能被描述，由 media.inbound 授权决定（默认拒绝）。"
         "授权记录是 consent 域的权威状态，媒体只读 .granted/.revision，"

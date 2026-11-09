@@ -2732,6 +2732,7 @@ async def handle_memory_archive(payload: dict) -> None:
     from ling.domains.memory.service import MemoryService
     from ling.settings.service import published_memory_policy
 
+    settings = get_settings()
     episode_days = int(payload.get("episode_days") or 180)
     async with session_scope() as session:
         # 归档判定要跟着已发布策略走：`max_retention_days` 是硬上限，
@@ -2743,6 +2744,29 @@ async def handle_memory_archive(payload: dict) -> None:
         # 参照实现把它放在"睡眠维护"里——不压缩的话，用几个月后
         # 证据车道会被一堆"用户喜欢过 X"的碎片占满。
         compacted = await service.compact_low_value()
+        # **媒体沉降**：把"她真的看过、但描述即将过期"的媒体，经筛选后
+        # 写进长期记忆。用户原话：「看过的视频完整的解析留存一小段时间，
+        # 过了一段时间之后……经过筛选，走记忆入库流程」。
+        #
+        # 不沉降的话，媒体描述只有最近 3 条能进上下文（`context.py:749`），
+        # 三轮之后她就彻底忘了自己看过什么——用户问"上次那个视频"
+        # 只能答不知道。
+        sediment = None
+        try:
+            from ling.domains.media.sediment import sediment_expired_evidence
+
+            sediment = await sediment_expired_evidence(
+                session, actor_id=settings.actor_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 沉降失败不能拖垮归档
+            logger.info("媒体沉降失败：%s", type(exc).__name__)
+    if sediment is not None and sediment.written:
+        logger.info(
+            "memory.archive 媒体沉降：扫描 %d 条、写入 %d 条记忆、跳过 %d 条",
+            sediment.scanned,
+            sediment.written,
+            sediment.skipped,
+        )
     if compacted["groups"]:
         logger.info(
             "memory.archive 压缩级联：合并 %d 组、归档 %d 条",

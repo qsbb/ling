@@ -482,6 +482,24 @@ class MemoryService:
         await self._session.flush()
         return row.id
 
+    async def already_proposed(self, *, turn_id: str, slot: str) -> bool:
+        """这一槽位是否已有同 (turn_id, slot) 的记忆。
+
+        给**邻居域**用的公开问询接口：媒体沉降要知道"这条证据沉降过没有"，
+        但它不该自己查 `memories` 表（ADR-0001：跨域读投影可以，改别人的表
+        不行）。让记忆域自己回答，所有权才留在本域。
+
+        与 `propose()` 里的幂等判定是同一条键，所以两处不会各说各话。
+        """
+        found = (
+            await self._session.execute(
+                select(MemoryRow.id)
+                .where(MemoryRow.turn_id == turn_id, MemoryRow.slot == slot)
+                .limit(1)
+            )
+        ).first()
+        return found is not None
+
     async def record_episode(
         self,
         *,
