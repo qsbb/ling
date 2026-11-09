@@ -21,7 +21,11 @@ from ling.contracts.v1 import (
     PromptSnapshotState,
     SessionRecord,
 )
-from ling.domains.conversation.service import ConversationService, window_target
+from ling.domains.conversation.service import (
+    ConversationService,
+    sort_windows_for_display,
+    window_target,
+)
 from ling.infra.models import Message, PromptSnapshot, Window
 from ling.kernel.context import KEY_LABELS, KEY_ORDER, estimate_tokens
 
@@ -92,31 +96,118 @@ async def _group_display_names(
     }
 
 
+async def _friend_names_by_channel(
+    request: Request, windows: Sequence[Window]
+) -> dict[str, dict[str, tuple[str | None, str | None]]]:
+    """每个涉及到的渠道 → ``{user_id: (remark, nickname)}``。
+
+    ## 为什么按渠道去重、**每个渠道只调一次**
+
+    ``fetch_friend_names`` 是**整表**接口（OneBot 没有"查单个好友备注"的
+    动作）。三个私聊窗口共用同一个连接器时，逐个窗口调就是三次全量响应——
+    连接器内部虽然缓存了，但缓存是"10 分钟后失效"的，失效那一刻就会连打
+    三次。所以这里按 channel 分组，一个渠道一次。
+
+    ## 为什么吞异常
+
+    备注只是标题的优先级最高项，不是主功能。任何采集失败都退化成"这个渠道
+    没有好友名"，调用方继续用 ``subjects.display_name`` 或前端回退。
+    """
+    names: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+    for window in windows:
+        channel, kind, peer_id = window_target(window)
+        if kind != "private" or not peer_id or channel in names:
+            continue
+        connector = getattr(request.app.state, f"{channel}_connector", None)
+        fetch = getattr(connector, "fetch_friend_names", None)
+        if fetch is None:
+            # 这个渠道没有采集能力（web 窗口 / 测试桩 / QQ 官方未实现）。
+            # 记一个空表，后面的窗口不再重复找连接器。
+            names[channel] = {}
+            continue
+        try:
+            fetched = await fetch()
+        except Exception:  # noqa: BLE001 - 采集是尽力而为，标题退回 null
+            fetched = {}
+        names[channel] = fetched if isinstance(fetched, dict) else {}
+    return names
+
+
+async def _friend_remark_names(
+    request: Request,
+    windows: Sequence[Window],
+    friends: dict[str, dict[str, tuple[str | None, str | None]]] | None = None,
+) -> dict[str, str | None]:
+    """私聊窗口 id → **好友备注优先**的显示名。
+
+    ## 优先级（用户要的就是这个）
+
+        remark（好友备注）> nickname（昵称）> subjects.display_name > None
+
+    「备注」是**用户自己**给这个人起的叫法，比对方自己填的昵称更贴近用户
+    心里那个人。昵称是对方自称，库里的人级名字是入站时记下的快照——三者
+    不同的时候，用户最认的是自己写的备注。
+
+    ## 拿不到就是 None
+
+    不在好友列表（群里认识的、临时会话）、连接器不支持、超时时，这一项
+    没有值，**回退给** ``subjects.display_name``（由调用方合并）。
+    都拿不到才返回 ``None``，前端回退成「私聊 {id}」。
+    """
+    table = (
+        friends
+        if friends is not None
+        else await _friend_names_by_channel(request, windows)
+    )
+    out: dict[str, str | None] = {}
+    for window in windows:
+        channel, kind, peer_id = window_target(window)
+        if kind != "private" or not peer_id:
+            continue
+        remark, nickname = table.get(channel, {}).get(peer_id, (None, None))
+        chosen = (remark or nickname or "").strip()
+        if chosen:
+            out[window.id] = chosen[:128]
+    return out
+
+
 async def _display_names(
     request: Request, conversation: ConversationService, windows: Sequence[Window]
 ) -> dict[str, str | None]:
-    """会话的**人话名字**：群窗口靠采集，私聊窗口靠库里已有的昵称。
+    """会话的**人话名字**：群窗口靠采集，私聊窗口按 备注 > 昵称 > 库里的名字。
 
-    两种来源差别很大，所以分两段：
+    三段来源，优先级从高到低：
 
-    - **私聊**：对端昵称入站时就写进了 ``subjects.display_name``，一次查询
-      就够（见 ``ConversationService.peer_display_names``），不需要外呼；
-    - **群**：群名只有平台知道，读侧外呼采集，失败静默 ``None``。
+    - **群**：群名只有平台知道（``get_group_info``），读侧外呼采集，失败 ``None``；
+    - **私聊·好友备注**：``get_friend_list`` 的 ``remark``（整表一次，带缓存）；
+    - **私聊·昵称**：同一个接口的 ``nickname``，再退到 ``subjects.display_name``
+      （入站时身份域写进去的人级昵称）。
 
     都不编名字：采集不到/查不到就是 ``None``，由前端按 ``channel`` +
     ``peer_id`` 回退成「群 100…」「私聊 100200301」。
     """
     names = await conversation.peer_display_names(windows)
+    # 好友备注/昵称覆盖库里的名字（更贴近用户自己的叫法）。
+    friends = await _friend_names_by_channel(request, windows)
+    names.update(await _friend_remark_names(request, windows, friends))
     names.update(await _group_display_names(request, windows))
     return names
 
 
 async def _session_record(
-    request: Request, conversation: ConversationService, window: Window
+    request: Request,
+    conversation: ConversationService,
+    window: Window,
+    *,
+    familiarity: dict[str, float] | None = None,
 ) -> SessionRecord:
     names = await _display_names(request, conversation, [window])
+    if familiarity is None:
+        familiarity = await conversation.familiarities([window])
     return conversation.to_session_record(
-        window, display_name=names.get(window.id)
+        window,
+        display_name=names.get(window.id),
+        familiarity=familiarity.get(str(window.subject_id)),
     )
 
 
@@ -124,15 +215,82 @@ async def _session_record(
 async def list_sessions(
     request: Request, auth: CurrentAuth, conversation: ConversationDep
 ) -> SessionListOut:
+    """会话列表：**置顶 → 好感度 → 最近活跃**（用户原话：「可置顶，其他按好感度」）。
+
+    顺序由 `sort_windows_for_display` 定，接口层不自己写排序规则——三个入口
+    （这里、默认会话兜底、将来的移动端）必须共享同一份顺序。
+
+    好感度**一次 IN 查询**批量取回（`familiarities`），不是逐窗口查：
+    关系页那次卡死就是 n²，这里不能再犯。
+    """
+    # **先取行，再查好感度，最后排序**——顺序不能反。
+    #
+    # `list_windows` 的排序键是"置顶 → 好感度 → 最近活跃"，而好感度要按
+    # 窗口的 subject_id 集合去查，于是存在一个**循环依赖**：
+    #
+    #     排序需要 familiarity → familiarity 需要窗口列表 → 列表已排好序
+    #
+    # 此前的写法是先 `list_windows()`（此时没传 familiarity，中间那个键
+    # 全体相等，退化成按 updated_at 排）**再**查 `familiarities()` ——
+    # 好感度只进了返回值用于展示，**从未参与排序**。用户以为"按好感度排"，
+    # 实际一直是按最近活跃排；而代码两件事都做了，只是顺序错了，看不出异常。
+    #
+    # 所以拆两步：先取未排的行 → 查 familiarity → 用同一个纯函数排一次。
     windows = await conversation.list_windows(auth.user.subject_id)
     if not windows:
         window = await conversation.ensure_default_window(auth.user.subject_id)
         windows = [window]
+    familiarity = await conversation.familiarities(windows)
+    windows = sort_windows_for_display(windows, familiarity)
     names = await _display_names(request, conversation, windows)
     return SessionListOut(
         sessions=[
-            conversation.to_session_record(w, display_name=names.get(w.id)) for w in windows
+            conversation.to_session_record(
+                w,
+                display_name=names.get(w.id),
+                familiarity=familiarity.get(str(w.subject_id)),
+            )
+            for w in windows
         ]
+    )
+
+
+class PinSessionBody(BaseModel):
+    pinned: bool
+
+
+@router.post("/sessions/{session_id}/pin", response_model=SessionRecord)
+async def pin_session(
+    session_id: str,
+    body: PinSessionBody,
+    request: Request,
+    auth: CurrentAuth,
+    conversation: ConversationDep,
+) -> SessionRecord:
+    """置顶 / 取消置顶。
+
+    ## 幂等
+
+    重复置顶不报错，只是把 ``pinned_at`` 刷新成现在——于是"我刚置顶的那个"
+    排到置顶组的第一位，这正是用户点它时想要的。取消一个没置顶的会话同理：
+    把已经是 ``NULL`` 的值再写成 ``NULL``。
+
+    ## 归属校验
+
+    ``get_window`` 对跨用户一律 404（不是 403）：403 等于告诉调用方
+    "这个 id 存在但你没权限"，那本身就是信息泄露。
+
+    ## 返回整条 `SessionRecord`
+
+    前端拿它直接替换列表里的那一行，不必再发一次列表请求——置顶会改变
+    顺序，但顺序由前端按同一条规则重排即可（`pinned` 字段在记录里）。
+    """
+    window = await conversation.set_window_pinned(
+        session_id, subject_id=auth.user.subject_id, pinned=body.pinned
+    )
+    familiarity = await conversation.familiarities([window])
+    return await _session_record(
+        request, conversation, window, familiarity=familiarity
     )
 
 

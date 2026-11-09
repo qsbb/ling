@@ -149,6 +149,20 @@ class OneBotV11Connector(ChannelConnector):
         self.group_name_timeout = 2.0
         self.group_name_cache_max = 512
 
+        # 好友名/备注缓存：**一次 `get_friend_list` 拿全量**，不是逐个查。
+        #
+        # 为什么整表缓存而不是按需查：OneBot 没有"给我这个人的备注"这种动作
+        # （`get_stranger_info` 只给昵称，不给备注——备注是**好友关系**的属性，
+        # 只有 `get_friend_list` 才有）。所以要么整表拿一次，要么拿不到。
+        #
+        # 为什么要缓存：会话列表每开一次页面就会问一遍，而好友列表在几百人的
+        # 号上是几十 KB 的响应。10 分钟一次足够——改备注不会有人指望立刻生效，
+        # 而"每开一次页面打一次 NapCat"是实打实的负担。
+        self._friend_names_cache: tuple[float, dict[str, tuple[str | None, str | None]]] | None = None
+        self.friend_names_ttl = 600.0  # 成功后的复用时长（10 分钟）
+        self.friend_names_miss_ttl = 60.0  # 失败后的静默时长（别一直打）
+        self.friend_names_timeout = 3.0  # 比群名宽一点：它是整表响应
+
         # ---- 对账/引用用到的进程内证据（都不落库） ----
         #
         # 1) 出站回显：`message_sent` 带上我们自己发出的消息的 `message_id`，
@@ -1197,6 +1211,70 @@ class OneBotV11Connector(ChannelConnector):
         self._group_name_cache[gid] = (now, name)
         self._trim_group_name_cache()
         return name
+
+    async def fetch_friend_names(
+        self,
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """好友列表 → ``{user_id: (remark, nickname)}``。**拿不到返回空字典，绝不抛**。
+
+        ## 为什么必须调 `get_friend_list`
+
+        会话标题要显示"好友备注"。但 OneBot V11 里**备注不是消息事件的一部分**：
+        `sender` 只带 `nickname` / `card`；`get_stranger_info` 也只给昵称。
+        `remark`（备注）是**好友关系**上的字段，只有 `get_friend_list` 返回它。
+
+        所以这一项只能整表拉一次——没有"查单个好友备注"的接口。
+
+        ## 缓存
+
+        会话列表是**读侧**、每开一次页面都会问。不缓存就是每次开页面都让
+        NapCat 吐一遍全量好友列表。成功的 10 分钟内复用，失败 1 分钟内静默
+        （NapCat 刚重启时别让它挨一轮风暴）。
+
+        ## 失败为什么不抛
+
+        标题是次要信息。`get_friend_list` 在某些 OneBot 实现里没实现
+        （404 → ``unsupported``），也可能超时。为了一个标题让会话列表 500，
+        是拿主功能换次要信息。调用方拿到空字典就按"没有备注/昵称"处理，
+        前端回退成「私聊 {id}」。
+        """
+        now = time.monotonic()
+        cached = self._friend_names_cache
+        if cached is not None:
+            stamped, cached_names = cached
+            ttl = (
+                self.friend_names_ttl
+                if cached_names
+                else self.friend_names_miss_ttl
+            )
+            if now - stamped < ttl:
+                return cached_names
+
+        names: dict[str, tuple[str | None, str | None]] = {}
+        try:
+            data = await asyncio.wait_for(
+                self._call("get_friend_list", {}), timeout=self.friend_names_timeout
+            )
+            rows = data if isinstance(data, list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user_id = row.get("user_id")
+                if user_id is None:
+                    continue
+                remark = _clean_name(row.get("remark"))
+                nickname = _clean_name(row.get("nickname"))
+                if remark or nickname:
+                    names[str(user_id)] = (remark, nickname)
+        except (ChannelError, TimeoutError) as exc:
+            logger.debug(
+                "采集好友列表失败（标题回退为无名）：%s", type(exc).__name__
+            )
+        except Exception as exc:  # noqa: BLE001 - 采集是尽力而为，不能影响读侧
+            logger.debug("采集好友列表异常（回退为无名）：%s", type(exc).__name__)
+
+        self._friend_names_cache = (now, names)
+        return names
 
     def _trim_group_name_cache(self) -> None:
         """缓存只保留最近的若干群，防止长跑进程里字典无限长。"""

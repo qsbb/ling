@@ -36,6 +36,18 @@
       "default": null,
       "title": "Display Name"
     },
+    "familiarity": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Familiarity"
+    },
     "message_count": {
       "default": 0,
       "minimum": 0,
@@ -53,6 +65,11 @@
       ],
       "default": null,
       "title": "Peer Id"
+    },
+    "pinned": {
+      "default": false,
+      "title": "Pinned",
+      "type": "boolean"
     },
     "schema_version": {
       "const": "v1",

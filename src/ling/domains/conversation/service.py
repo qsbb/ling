@@ -102,6 +102,56 @@ def split_window_ref(ref: str) -> tuple[str, str, str] | None:
     return instance, kind, target
 
 
+def sort_windows_for_display(
+    windows: Sequence[Window], familiarity: dict[str, float]
+) -> list[Window]:
+    """会话展示顺序：**置顶 → 好感度 → 最近活跃**（都是倒序）。
+
+    ## 三个键各自的"缺失值"排哪里
+
+    - ``pinned_at is None``（未置顶）→ 排在所有置顶之后；
+    - ``familiarity`` 不在字典里 → 视为 ``-inf``（排在所有已知好感度之后）；
+    - ``updated_at`` 缺失 → 视为最旧。
+
+    为什么"未知好感度"排最后而不是按 0 算：0 是"认识但还不熟"，
+    未知是"我们根本没有这个人的关系记录"。把未知当 0，会让一个刚被拉进群、
+    从没单独说过话的人**排在聊过几次的人前面**（因为后者可能是 0.1）。
+    用户要的是"按好感度排"，不是"按有没有记录排"。
+
+    ## 为什么要有 `id` 兜底
+
+    `list.sort` 是稳定的，但"稳定"依赖输入顺序（PG 不保证无 ORDER BY 的
+    返回顺序）。同一时刻置顶的两个会话，如果不给最后一级键，顺序会在两次
+    请求之间跳动——前端做局部更新时看起来像在乱抖。所以最后按 ``id`` 定序。
+    """
+    import math
+
+    def key(window: Window) -> tuple[int, float, float, float, str]:
+        pinned = getattr(window, "pinned_at", None)
+        fam = familiarity.get(str(window.subject_id or ""))
+        return (
+            # 置顶的排 0（更靠前）；未置顶 1。
+            0 if pinned is not None else 1,
+            # 置顶时刻越晚越靠前；未置顶时这一位全等，交给好感度决定。
+            -_timestamp(pinned) if pinned is not None else 0.0,
+            # 好感度越大越靠前；未知给 -inf。
+            -(fam if fam is not None and not math.isnan(fam) else float("-inf")),
+            # 最后一级：最近活跃倒序。用负时间戳让"越新越靠前"。
+            -_timestamp(getattr(window, "updated_at", None)),
+            str(window.id),
+        )
+
+    return sorted(windows, key=key)
+
+
+def _timestamp(value: object) -> float:
+    """datetime → 秒（无时区按 UTC）。缺失返回 0.0（= 最旧）。"""
+    if not isinstance(value, datetime):
+        return 0.0
+    moment = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return moment.timestamp()
+
+
 def window_target(window: Window) -> tuple[str, str, str | None]:
     """(渠道, 会话类型, 平台对端 id)。
 
@@ -269,12 +319,64 @@ class ConversationService:
         await self._session.flush()
         return window
 
-    async def list_windows(self, subject_id: str, *, include_archived: bool = False) -> list[Window]:
+    async def list_windows(
+        self,
+        subject_id: str,
+        *,
+        include_archived: bool = False,
+        familiarity: dict[str, float] | None = None,
+    ) -> list[Window]:
+        """这个用户的会话列表，**已按展示顺序排好**。
+
+        ## 排序（用户原话：「置顶 + 其他按照好感度」）
+
+        1. **置顶优先**，置顶内部按 ``pinned_at`` 倒序（最近置顶的更靠上）；
+        2. **好感度倒序**（``familiarity``，查不到 = ``null`` 排最后）；
+        3. ``updated_at`` 倒序（最近有动静的更靠上）。
+
+        ## 为什么排序放在这里，而不是接口层
+
+        三个调用方（``/v1/sessions``、默认会话兜底、将来的移动端）都要同一份
+        顺序。放在接口层就等于"谁忘了排谁就不对"，而且这种不一致不会报错。
+
+        ## `familiarity` 为什么由调用方传进来
+
+        好感度在**关系域**（``relationship_states``）。本域为了排个序去读另一
+        个域的表，会让"会话域"悄悄依赖"关系域"的表结构。所以接口层批量查一次
+        传进来（**一次 IN 查询，不是 N+1**）；没传就按"都不知道"排（第 2 条
+        关键字全体相等，退化成按 ``updated_at``）。
+
+        ## 为什么用 Python 排而不是 SQL 的 ORDER BY
+
+        置顶/好感度/活跃三个键里，中间那个是**调用方传进来的字典**（不在
+        `windows` 表里）。要在 SQL 里排就得 join `relationship_states`——那是
+        跨域 join，还会让"没有关系行"的窗口因为 INNER JOIN 消失（或要写
+        LEFT JOIN + COALESCE 的 NULL 语义）。单个用户几十个窗口，内存排序
+        既便宜又不容易写错 NULL 的位置。
+        """
         stmt = select(Window).where(Window.subject_id == subject_id)
         if not include_archived:
             stmt = stmt.where(Window.archived.is_(False))
-        stmt = stmt.order_by(Window.updated_at.desc(), Window.created_at.desc())
-        return list((await self._session.execute(stmt)).scalars())
+        rows = list((await self._session.execute(stmt)).scalars())
+        return sort_windows_for_display(rows, familiarity or {})
+
+    async def set_window_pinned(
+        self, window_id: str, *, subject_id: str, pinned: bool
+    ) -> Window:
+        """置顶 / 取消置顶（**幂等**：重复置顶只是刷新时刻，不报错）。
+
+        归属校验走 ``get_window``：跨用户一律 404，不泄露"这个 id 存在"。
+
+        ## 置顶**不动** `updated_at`
+
+        置顶不是"有新消息"。改 `updated_at` 会让这个会话跳到"最近活跃"的
+        位置，而它其实安静了一星期——列表看起来像自己乱动了。同理取消置顶
+        也不改：会话应该回到它按好感度/活跃度本该在的位置，而不是"刚刚活跃过"。
+        """
+        window = await self.get_window(window_id, subject_id=subject_id)
+        window.pinned_at = utcnow() if pinned else None
+        await self._session.flush()
+        return window
 
     async def get_window(self, window_id: str, *, subject_id: str) -> Window:
         """读取窗口并校验归属；跨用户一律 404（不泄露存在性）。"""
@@ -333,9 +435,53 @@ class ConversationService:
             return windows[0]
         return await self.create_window(subject_id=subject_id)
 
+    async def familiarities(
+        self, windows: Sequence[Window]
+    ) -> dict[str, float]:
+        """这些窗口的**对端好感度**：``subject_id -> familiarity``。
+
+        ## 一次查询，不是 N+1
+
+        关系页那次卡死就是 n²（每个 subject 一次查询 + 每个 subject 一次渲染）。
+        这里按 subject_id 集合做**一次 IN 查询**，返回字典给排序用。
+
+        ## 用哪个 subject
+
+        - **私聊**：窗口的 ``subject_id`` 就是**对端**（见 ``_ensure_window``）；
+        - **群聊**：窗口的 ``subject_id`` 是**主人**，不是群里的某个人。所以群
+          窗口的"好感度"取主人自己的关系值——它是"这个群属于谁"的好感度，
+          而不是某个群成员的。用群成员的会随机挑一个人，且同一个人在不同群
+          会互相覆盖。
+
+        没有关系行 = 不在返回的字典里（调用方按"未知"处理，不编 0）。
+        """
+        wanted = {str(w.subject_id) for w in windows if w.subject_id}
+        if not wanted:
+            return {}
+        from ling.infra.models import RelationshipState
+
+        rows = (
+            await self._session.execute(
+                select(RelationshipState.subject_id, RelationshipState.familiarity)
+                .where(
+                    RelationshipState.actor_id == self._actor_id,
+                    RelationshipState.subject_id.in_(list(wanted)),
+                )
+            )
+        ).all()
+        out: dict[str, float] = {}
+        for subject_id, familiarity in rows:
+            value = float(familiarity) if familiarity is not None else None
+            if value is not None:
+                out[str(subject_id)] = value
+        return out
+
     @staticmethod
     def to_session_record(
-        window: Window, *, display_name: str | None = None
+        window: Window,
+        *,
+        display_name: str | None = None,
+        familiarity: float | None = None,
     ) -> SessionRecord:
         """窗口 → 契约记录。
 
@@ -358,6 +504,8 @@ class ConversationService:
             display_name=display_name,
             channel=channel,
             peer_id=peer_id,
+            pinned=getattr(window, "pinned_at", None) is not None,
+            familiarity=familiarity,
         )
 
     async def peer_display_names(
