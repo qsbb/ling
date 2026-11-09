@@ -387,6 +387,51 @@ export function fallbackNoticeOf(data: unknown): FallbackNotice | null {
  * 从没看过手机（`empty`）的载荷里同样带着这个标记，所以这里不能只在
  * 「看得懂的那三种状态」里渲染它。
  */
+/** 媒体活动的 kind → 人话。没列到的 kind 就原样显示，不猜。 */
+const MEDIA_KIND_LABELS: Record<string, string> = {
+  video_watch: '看视频',
+  bilibili_feed: '刷视频',
+  livestream: '看直播',
+};
+
+/**
+ * 「正在忙什么」：她此刻是不是在看/刷媒体。
+ *
+ * ## 为什么不并进「手机」那张卡
+ *
+ * 用户原话：「他在忙，可以给他变成他的真实活动状态，放到"正在看手机"那里，
+ * 显示当前的状态」。
+ *
+ * 「正在看手机」讲的是**手机**（解锁、刷 app、放下）；「正在看视频」讲的是
+ * **媒体注意力**。两者可以同时成立，也常常不同时成立——她可能在看 B 站而
+ * 根本没在「看手机」。并成一句会把具体事实换成更含糊的说法。
+ *
+ * ## 别人的会话只能知道"忙"
+ *
+ * 后端按受众过滤过：`in_my_session === false` 时只说明"她正忙着媒体动作"，
+ * 说不出她在看什么、给谁看。这里**如实照做**，不假装知道更多。
+ */
+export function MediaBody({ data }: { data: Record<string, unknown> }) {
+  const kind = String(data.kind ?? '');
+  const label = MEDIA_KIND_LABELS[kind] ?? kind;
+  const mine = data.in_my_session === true;
+  const since = data.started_at ? formatClock(String(data.started_at)) : '';
+  return (
+    <>
+      <p className="dash-now__line">
+        <strong>{mine ? `正在${label || '忙媒体'}` : '正忙着看东西'}</strong>
+        {mine && kind ? <span className="dash-now__kind">{label}</span> : null}
+      </p>
+      {since ? <p className="dash-card__muted">从 {since} 起</p> : null}
+      {mine ? null : (
+        <p className="dash-card__muted">
+          发生在别的会话里，这里只知道她正忙着——细节不在这一侧。
+        </p>
+      )}
+    </>
+  );
+}
+
 export function PhoneBody({ data }: { data: Record<string, unknown> }) {
   const watching = String(data.state ?? '') === 'watching';
   const app = data.watching_app ? String(data.watching_app) : '';
@@ -891,6 +936,17 @@ export function DashboardBody({
       <Card title="手机" span={6} section={s.phone} renderWhenEmpty onRetry={onRetry}>
         {(d) => <PhoneBody data={d} />}
       </Card>
+
+      {/*
+        「正在忙什么」：与「手机」并列而不是合并。看视频≠看手机，
+        合起来说会把"她在看手机"这个具体事实换成更含糊的一句。
+        `empty`（此刻没有媒体活动）就不渲染——没这件事，不用摆个空壳。
+      */}
+      {s.media && s.media.status === 'ok' ? (
+        <Card title="正在忙什么" span={6} section={s.media} onRetry={onRetry}>
+          {(d) => <MediaBody data={d} />}
+        </Card>
+      ) : null}
 
       {/*
         没有候选时也照常渲染：`empty` 分支的载荷里带着门控（能不能发、为什么

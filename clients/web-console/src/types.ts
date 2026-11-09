@@ -1411,6 +1411,17 @@ export interface DashboardResponse {
      * 未来日**没有**生成大纲，这些是意向而不是那一天的安排。
      */
     intent_teaser?: DashboardSection;
+    /**
+     * 她此刻是不是正在看/刷媒体（全局唯一槽位）。
+     *
+     * 与 `phone` **分开**：看视频 ≠ 看手机，合成一句会把具体事实说糊。
+     * 没有有效占用时是 `empty`，界面不渲染这一块。
+     *
+     * 受众：`in_my_session === false` 表示观看发生在别人的会话里——那时
+     * 后端只给 `kind` 与 `started_at`，不给 `activity_id`，界面也只能说
+     * "她正忙着"。
+     */
+    media?: DashboardSection;
   };
 }
 

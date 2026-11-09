@@ -29,7 +29,7 @@
 | R15 全局媒体槽 | **已实现**（2026-11-10）：`media_slots` 单行表 + 迁移 0061 + `domains/media/slot.py`（`FOR UPDATE NOWAIT` 抢占、240 秒租约、代次栅栏、fail-closed）；已接入 `VideoWatchService.watch()` 的耗时区间，生产装配 `enforce_slot=True` 有测试钉住。真 PG 20 并发抢占**恰好 1 个成功**。 | `bilibili_feed`/`livestream` 只留了 kind 常量，尚未接入执行器（设计如此：它们将来争同一行）。 |
 | R16 可等待、自由决定回复时机 | **未实现**：`docs/MEDIA-WILLINGNESS-DESIGN.md:1-13` 明说是方案；当前 `turn.py:1044-1073` 在本轮同步等观看，缺用户可见“稍后回复”状态机。 | 需求复杂且与 R15 方案“忙即拒绝、不排槽队列”存在产品语义冲突，先裁决再实现。 |
 | R17 她有权不看 | **机制部分成立**：`context.py:807-860` 明示“想看才写标记，没写当没看见”；`turn.py:1044-1049` 仅见标记才读。 | 这只证明模型可选择不写；未有真实模型对话样本证明她会按人设拒绝，而非总被诱导看。 |
-| R18 忙态展示 | **未实现且旧手机态未接线**：生产源码中 `start_watching/stop_watching` 只有定义 `phone/service.py:210,231`，调用仅在测试；UI 依赖 `state=watching`，`DashboardPage.tsx:305-312`。 | 开发库 `phone_states` 0 行，故此库当前显示空态“她还没拿起过手机” `dashboard.py:584-599`、`DashboardPage.tsx:343-344`，不能武断说“一直是手机放下了”。 |
+| R18 忙态展示 | **已实现**（2026-11-10）：新增 `GET /v1/dashboard` 的 `media` 段（`dashboard.py::media()`），从全局槽位读 `current_holder()` 投影**真实**媒体活动；前端新增「正在忙什么」卡片。三个关键取舍：**不塞进「正在看手机」**——看视频≠看手机，合并会把具体事实说糊；只报 `active`（`held` 是还在准备）；**别人的会话只给 `kind`/`started_at`，不给 `activity_id`/`window_id`**（受众边界）。真浏览器 1440/375 各一条，无横向溢出。 | `phone` 那套 `start_watching/stop_watching` 仍是生产零调用——它管的是手机这一层，与媒体活动是两件事，不强行接线。 |
 | R19 视频留存后总结入记忆 | **未实现**：现有 `media_evidence.description` 在 `media/service.py:215-243`，上下文读取 `context.py:750-805`；无视频摘要定时入库路径。 | 近期描述可复用，但不是“过期后筛选成长期记忆”；当前上下文只取最近 3 条，见 B。 |
 | R20 睡眠记忆压缩 | **部分已有，不是需求完成**：`compact_low_value` `memory/service.py:951-1021`，`memory.archive` 调用 `worker.py:2673-2694`。 | 仅满足“60 天以上、带 slot/value、同组至少 3 条、重要性低”的确定性合并；没有睡眠事件触发或睡眠回顾。 |
 | R21 后台真删 | **未交付，正在开发**：现有 HTTP 仍调用软清除 `manage.py:272-283`，`forget_subject` 保留原文 `memory/service.py:1431-1486`。 | 新 `purge.py:145-220,223-362` 和迁移 0060、worker handler 已出现，但路由仍未调用 `request_purge`；未验证代次与历史事件脱敏。 |
@@ -234,7 +234,7 @@
 | 项 | 现状 | 缺什么 |
 |---|---|---|
 | **R16 可等待/自主决定回复时机** | **未实现**。`docs/MEDIA-WILLINGNESS-DESIGN.md` 有完整设计（`DeferredReply` + 到期新轮次 + 新输入取消旧投递） | 持久化的延后回复载体与调度；且与 R15"忙即拒绝、不排队"需要产品裁决先后 |
-| **R18 忙态真实活动** | **未实现**。槽位已能回答"她此刻是否在看媒体"（`slot.current_holder()`），但前端「正在看手机」没有接它 | 把 `current_holder()` 投影到活状态；`PhoneService.start_watching/stop_watching` 仍是生产零调用 |
+| **R18 忙态真实活动** | **已补完**（见上表） | — |
 | **R19 视频摘要长期沉淀** | **未实现**。上下文只取最近 3 条媒体描述（`context.py:749`），更早的看过的视频彻底消失 | 过期后经筛选走记忆入库流程的定时任务 |
 | **R20 睡眠期记忆压缩** | **部分**。`compact_low_value()` 已存在且每日跑，但只处理"≥60 天、低重要性、同组≥3 条" | 按睡眠事件触发的整合（`docs/SLEEP-MEMORY-CONSOLIDATION.md` 已设计） |
 | **R17 她有权不看** | **机制成立、未验证**。上下文已给她"想看才写标记"的选择 | 真实模型对话样本，证明她确实会拒绝而不是总被诱导 |

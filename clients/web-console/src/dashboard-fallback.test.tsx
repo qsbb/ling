@@ -367,3 +367,68 @@ describe('fallbackNoticeOf：形状不认识就不猜', () => {
     expect(html).toContain('mystery');
   });
 });
+
+/* --------------------------------------------------- 「正在忙什么」（媒体） */
+
+/**
+ * 用户原话：「他在忙，可以给他变成他的真实活动状态，放到"正在看手机"那里，
+ * 显示当前的状态」。
+ *
+ * 这些用例钉住两件事：
+ *
+ * 1. **看视频 ≠ 看手机**，所以它是一张独立的卡，不是塞进手机卡里的一句话；
+ * 2. **别人的会话只该知道"忙"**——后端按主体过滤过，前端不能假装知道更多。
+ */
+describe('正在忙什么：媒体活动是真实状态，不是含糊的「在忙」', () => {
+  it('自己的会话：说出在看什么、从什么时候起', () => {
+    const html = renderDashboard({
+      phone: section({ state: 'idle' }),
+      media: section({
+        kind: 'video_watch',
+        started_at: '2026-11-08T02:12:00Z',
+        in_my_session: true,
+        activity_id: 'act_1',
+      }),
+    });
+    expect(html).toContain('正在忙什么');
+    expect(html).toContain('正在看视频');
+    expect(html).toContain('看视频');
+    // 起算时间要给出来，否则"正在看"没有时间感
+    expect(html).toMatch(/从 \d{2}:\d{2} 起/);
+    // 自己这边不该出现"细节不在这一侧"那句
+    expect(html).not.toContain('细节不在这一侧');
+  });
+
+  it('别人的会话：只说"正忙着看东西"，不说在看什么、也不说细节在哪', () => {
+    const html = renderDashboard({
+      phone: section({ state: 'idle' }),
+      media: section({
+        kind: 'bilibili_feed',
+        started_at: '2026-11-08T02:12:00Z',
+        in_my_session: false,
+      }),
+    });
+    expect(html).toContain('正忙着看东西');
+    // 「刷视频」是别人的会话内容，不该出现在这一侧
+    expect(html).not.toContain('正在刷视频');
+    // 也不该反过来泄露"是别人的会话"这种元信息措辞之外的东西，
+    // 但必须诚实地说明这一侧知道得有限
+    expect(html).toContain('细节不在这一侧');
+  });
+
+  it('没有媒体活动时整张卡不渲染（不摆空壳）', () => {
+    const html = renderDashboard({
+      phone: section({ state: 'idle' }),
+      media: { status: 'empty', data: {} },
+    });
+    expect(html).not.toContain('正在忙什么');
+  });
+
+  it('未知 kind 原样显示，不猜一个更好听的名字', () => {
+    const html = renderDashboard({
+      phone: section({ state: 'idle' }),
+      media: section({ kind: 'livestream', started_at: null, in_my_session: true }),
+    });
+    expect(html).toContain('正在看直播');
+  });
+});

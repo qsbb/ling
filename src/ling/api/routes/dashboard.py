@@ -622,6 +622,64 @@ async def get_dashboard(
             },
         )
 
+    def _iso_or_none(value: object) -> str | None:
+        """把可选的时间戳转成 ISO 串；不是 datetime 就返回 None。
+
+        槽位那一层返回的是 `dict[str, object]`（它不该依赖本文件的类型），
+        所以这里必须自己收窄——直接 `.isoformat()` 会在 mypy 上炸，
+        也会在"槽位返回了别的形状"时抛 AttributeError 把整页拖垮。
+        """
+        from datetime import datetime as _dt
+
+        return value.isoformat() if isinstance(value, _dt) else None
+
+    async def media() -> dict:
+        """她此刻是不是正在看/刷媒体（全局唯一槽位）。
+
+        ## 为什么单独一块，不塞进 `phone`
+
+        用户原话：「他在忙，可以给他变成他的真实活动状态，放到"正在看手机"
+        那里，显示当前的状态」。
+
+        「正在看手机」讲的是**手机**这件事（解锁、刷 app、放下）；
+        「正在看视频/刷流」讲的是**媒体注意力**。两者可以同时成立，也常常
+        不同时成立——她完全可能在看 B 站而根本没在"看手机"。把后者塞进前者，
+        就会把"她在看手机"这个具体事实，变成"她可能在做任何耗时的媒体动作"
+        这样一句更弱、更含糊的话。
+
+        所以并列成一块：`phone` 说手机，`media` 说媒体。界面上可以连着渲染，
+        但语义不混。
+
+        ## 受众：别的会话只能知道"忙"，不能知道"在看什么"
+
+        槽位是全局的，但**细节不能跨会话泄漏**。当前观看若发生在别人窗口，
+        本窗口只该知道"她此刻正忙着媒体动作"——不该知道她在看哪个视频、
+        谁的窗口、哪个 subject。这与记忆的受众边界是同一条原则。
+
+        自己的窗口则可以看到完整信息（在做什么、从什么时候开始）。
+        """
+        from ling.domains.media import slot as slot_mod
+
+        holder = await slot_mod.current_holder(session)
+        if holder is None:
+            # 没有有效占用就是**没有这件事**，不编一个 idle 状态出来。
+            return _section(SECTION_EMPTY, {})
+        # 首屏是**全局**视图，不属于任何单个窗口，所以判据只能是主体：
+        # 观看发生在"我这个人"的某个窗口里 → 可以说细节；发生在别人那里 →
+        # 只能说"她正忙着"。**不投影 `window_id`**：窗口 id 本身就是别人的
+        # 会话标识，透出去等于告诉用户"她在跟谁说话"。
+        same_subject = str(holder.get("subject_id") or "") == str(subject_id)
+        data: dict[str, object] = {
+            "kind": holder.get("kind"),
+            "started_at": _iso_or_none(holder.get("started_at")),
+            # 是否发生在"我这个人"的会话里：前端据此决定能不能说
+            # "她正在看那个视频"。false 时只能说"她正忙着"。
+            "in_my_session": same_subject,
+        }
+        if same_subject:
+            data["activity_id"] = holder.get("activity_id")
+        return _section(SECTION_OK, data)
+
     sections = {
         "activity": await _guard("activity", activity(), session),
         "affect": await _guard("affect", affect(), session),
@@ -636,6 +694,7 @@ async def get_dashboard(
         "intent_teaser": await _guard("intent_teaser", intent_teaser(), session),
         "timeline": await _guard("timeline", timeline(), session),
         "phone": await _guard("phone", phone(), session),
+        "media": await _guard("media", media(), session),
     }
 
     return {

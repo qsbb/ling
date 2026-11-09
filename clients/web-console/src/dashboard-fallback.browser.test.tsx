@@ -102,7 +102,11 @@ const FALLBACK_NOT_USED = {
 
 const EMPTY_SECTION = { status: 'ok', as_of: NOW, data: {} };
 
-function dashboard(phone: Record<string, unknown>, presence: Record<string, unknown> = {}): unknown {
+function dashboard(
+  phone: Record<string, unknown>,
+  presence: Record<string, unknown> = {},
+  media: Record<string, unknown> | null = null,
+): unknown {
   return {
     schema_version: 'v1',
     generated_at: NOW,
@@ -130,6 +134,7 @@ function dashboard(phone: Record<string, unknown>, presence: Record<string, unkn
       relationship: EMPTY_SECTION,
       connectivity: { status: 'ok', as_of: NOW, data: { channels: [], bound_model_roles: [] } },
       phone: { status: 'ok', as_of: NOW, data: phone },
+      ...(media ? { media: { status: 'ok', as_of: NOW, data: media } } : {}),
     },
   };
 }
@@ -341,4 +346,65 @@ describe('总览回退提示：场景回退（可用性卡片）@ 375', () => {
     expect(report.cards).toEqual(['dash-可用性']);
     await page.close();
   }, TIMEOUT);
+});
+
+/**
+ * 「正在忙什么」在真浏览器里：1440 与 375 都要真的出现在页面上，
+ * 且不把页面撑出横向滚动。
+ *
+ * 为什么不只做 SSR 断言：这块是新增卡片，宽度与换行只有真排版才知道。
+ * 「她正在看视频」这类短句在 375 下换行后如果卡片没有弹性约束，最容易撑破。
+ */
+describe('正在忙什么：真浏览器渲染', () => {
+  it('1440：自己的会话 → 说出在看什么，且无横向溢出', async () => {
+    if (!browser || launchError) {
+      console.warn(`[dashboard-media.browser] 跳过：${launchError}`);
+      return;
+    }
+    const page = await openDashboard(
+      { width: 1440, height: 900 },
+      dashboard({ state: 'idle' }, {}, {
+        kind: 'video_watch',
+        started_at: '2026-11-08T02:12:00Z',
+        in_my_session: true,
+      }),
+    );
+    const title = page.getByText('正在忙什么').first();
+    await title.waitFor({ timeout: 10_000 });
+    expect(await title.isVisible()).toBe(true);
+    const body = page.getByText('正在看视频').first();
+    expect(await body.isVisible()).toBe(true);
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+    await page.close();
+  }, 60_000);
+
+  it('375：别人的会话只说"正忙着"，且无横向溢出', async () => {
+    if (!browser || launchError) {
+      console.warn(`[dashboard-media.browser] 跳过：${launchError}`);
+      return;
+    }
+    const page = await openDashboard(
+      { width: 375, height: 812 },
+      dashboard({ state: 'idle' }, {}, {
+        kind: 'bilibili_feed',
+        started_at: '2026-11-08T02:12:00Z',
+        in_my_session: false,
+      }),
+    );
+    const text = page.getByText('正忙着看东西').first();
+    await text.waitFor({ timeout: 10_000 });
+    expect(await text.isVisible()).toBe(true);
+    // 「刷视频」是别人会话里的细节，这一侧不该出现
+    expect(await page.getByText('正在刷视频').count()).toBe(0);
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+    await page.close();
+  }, 60_000);
 });
