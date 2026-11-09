@@ -241,9 +241,16 @@ async def test_cross_audience_data_does_not_enable_tools(logged_in: TestEnv) -> 
     from ling.capabilities.tools import build_default_registry
 
     registry = build_default_registry()
-    # 工具集合是静态白名单，与上下文无关——这是设计意图
+    # 工具集合是静态白名单，与上下文无关——这是设计意图。
+    # `message.recall` 也在里面：它同样是**静态**注册的（不是"上下文里提到
+    # 撤回就多出一个工具"），而且 `requires_confirmation=True`，模型无法直接执行。
     tool_ids = {spec.tool_id for spec in registry.list_specs()}
-    assert tool_ids == {"clock.now", "diagnostics.echo", "shell.readonly"}
+    assert tool_ids == {
+        "clock.now",
+        "diagnostics.echo",
+        "message.recall",
+        "shell.readonly",
+    }
 
     group = await _window(logged_in, visibility="group_scope", title="群")
     await _seed_memory(
@@ -253,7 +260,7 @@ async def test_cross_audience_data_does_not_enable_tools(logged_in: TestEnv) -> 
         visibility=Visibility.group_scope,
         source_visibility="group_scope",
     )
-    # 无论上下文写了什么，不可逆工具都不因文本出现而可注册
+    # 无论上下文写了什么，工具集合都不变（静态白名单推导不出新工具）
     after_ids = {spec.tool_id for spec in build_default_registry().list_specs()}
     assert after_ids == tool_ids
 

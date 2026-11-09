@@ -39,17 +39,24 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ling.kernel.marker_stream import (
+    PENDING_MARKER_RE as _SHARED_PENDING_MARKER_RE,
+)
+
 logger = logging.getLogger("ling.domains.media.video")
 
 # 唯一被支持的标记语法。``[A-Za-z0-9_-]`` 覆盖 m3 / m3f2a1 这类短号。
 MARKER_RE = re.compile(r"<<\s*看视频\s+([A-Za-z0-9_-]{1,16})\s*>>")
 
-# 流式过滤用：以 ``<<`` 开头、还没等到 ``>>`` 的尾巴。也可能是普通的
-# ``a < b`` 文本，所以只在**确实以 ``<<`` 开头**时才压住。
+# 流式过滤用：以 ``<<`` 开头、还没等到 ``>>`` 的尾巴（可能是半个标记）。
 #
-# 尾部的单个 ``>`` 也算"可能是标记"：流式可能在两个 ``>`` 之间切开
-# （``<<看视频 m3>`` | ``>``），不认这一条就会把前半截推给浏览器。
-_PENDING_MARKER_RE = re.compile(r"<<[^<>]*>?$")
+# **唯一的定义在 `kernel/marker_stream.py`**：撤回标记（`domains/conversation
+# /recall.py`）必须用同一个形状。两个域各写一份的结果是必有一处先被改松，而
+# "哪一处松了"极难发现（历史上两份都是 ``r"<<[^<>]*>?$"``，把
+# ``1<<2 就是 4`` 洗成了 ``1``）。域之间不许互相 import，所以它住在 kernel。
+PENDING_MARKER_RE = _SHARED_PENDING_MARKER_RE
+# 旧名字（本模块内部引用）保留，避免外部导入点全部改一遍。
+_PENDING_MARKER_RE = PENDING_MARKER_RE
 
 # 每窗口每小时的读取次数上限 / 每天（全局）上限。
 WINDOW_HOURLY_LIMIT = 2

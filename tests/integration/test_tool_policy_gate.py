@@ -76,8 +76,10 @@ async def test_irreversible_tool_blocked_without_device_consent(
 ) -> None:
     """未授权 device → 不可逆工具必须 403，且**不能被执行**。"""
     await _install_irreversible_tool(logged_in)
+    # 请求体里**不能**带 `confirmed`（带了就 422，见
+    # `test_wire_cannot_self_confirm_irreversible_tool`）。这条验的是权限门。
     response = await logged_in.client.post(
-        "/v1/tools/test.irreversible/call", json={"args": {}, "confirmed": True}
+        "/v1/tools/test.irreversible/call", json={"args": {}}
     )
     assert response.status_code == 403, response.text
     assert "device" in response.text or "未授权" in response.text
@@ -91,17 +93,25 @@ async def test_irreversible_tool_requires_confirmation(logged_in: TestEnv) -> No
         "/v1/consents", json={"scope": "device", "granted": True}
     )
     response = await logged_in.client.post(
-        "/v1/tools/test.irreversible/call", json={"args": {}, "confirmed": False}
+        "/v1/tools/test.irreversible/call", json={"args": {}}
     )
     assert response.status_code == 200, response.text
     assert response.json()["outcome"] == "needs_confirmation"
     assert logged_in.app.state.tool_executed == [], "未确认就执行了不可逆工具"
 
 
-async def test_irreversible_tool_runs_after_consent_and_confirmation(
+async def test_wire_cannot_self_confirm_irreversible_tool(
     logged_in: TestEnv,
 ) -> None:
-    """授权 + 确认 → 正常执行（不能为了安全把功能锁死）。"""
+    """**HTTP 请求体不能自证确认**——这是"确认"这条硬门的唯一正确语义。
+
+    原来 `ToolCallBody.confirmed` 直接透传给 `registry.call(confirmed=...)`，
+    于是任何拿到 token 的调用方在 body 里写 ``"confirmed": true`` 就等于自己
+    批准了不可逆动作（这条路径连 owner/窗口归属都不校验）。
+
+    现在：字段不存在 → 422，handler 一次都没进。**即使 device 已授权**也一样，
+    因为"有没有确认"不该由调用方说了算。
+    """
     await _install_irreversible_tool(logged_in)
     await logged_in.client.put(
         "/v1/consents", json={"scope": "device", "granted": True}
@@ -110,8 +120,28 @@ async def test_irreversible_tool_runs_after_consent_and_confirmation(
         "/v1/tools/test.irreversible/call",
         json={"args": {"k": "v"}, "confirmed": True},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded"
+    assert response.status_code == 422, response.text
+    assert "确认" in response.text, "拒绝文案要指向『确认走提议端点』"
+    assert logged_in.app.state.tool_executed == [], "请求体自证确认竟然执行了"
+
+
+async def test_irreversible_tool_runs_only_via_server_side_confirmation(
+    logged_in: TestEnv,
+) -> None:
+    """授权 + **服务端**确认 → 正常执行（不能为了安全把功能锁死）。
+
+    确认的唯一来源是服务端自己（例如用户在网页点了"确认"，`recall.py` 的
+    confirm 端点随后调 `registry.call(confirmed=True)`）。这条断言证明
+    "锁死了 wire"没有连功能一起锁死。
+    """
+    await _install_irreversible_tool(logged_in)
+    await logged_in.client.put(
+        "/v1/consents", json={"scope": "device", "granted": True}
+    )
+    registry = logged_in.app.state.tools
+    result = await registry.call("test.irreversible", {"k": "v"}, confirmed=True)
+
+    assert result.outcome.value == "succeeded", result
     assert logged_in.app.state.tool_executed == [{"k": "v"}]
 
 
@@ -125,7 +155,7 @@ async def test_revoking_device_consent_blocks_again(logged_in: TestEnv) -> None:
         "/v1/consents", json={"scope": "device", "granted": False}
     )
     response = await logged_in.client.post(
-        "/v1/tools/test.irreversible/call", json={"args": {}, "confirmed": True}
+        "/v1/tools/test.irreversible/call", json={"args": {}}
     )
     assert response.status_code == 403
 

@@ -116,9 +116,41 @@ def render_expression_help(*, is_group: bool, supports_poke: bool = True) -> str
     return "\n".join(lines)
 
 
+def render_recall_help(refs: list[str]) -> str:
+    """把"你能撤回哪几条"告诉她（只列**真的**撤得动的）。
+
+    ## 为什么这是独立一段而不是并进 `render_expression_help`
+
+    表达方式（@/引用/拍一拍）是**发消息时**的选择；撤回是**事后**对已经发出去
+    的东西的补救，而且不可逆、要用户确认。混在一段里会让她以为撤回和 @ 一样
+    随手可用。
+
+    ## 为什么必须列出短号
+
+    不列她就只能写 `<<撤回>>`（撤最近一条），而她常常想撤的是上一条里的某一句。
+    但**只列真撤得动的**（`recallable_refs` 查过）：列了做不到的，她就会选一个
+    做不出来的动作，然后"选了却没发生"。
+
+    ``refs`` 为空时**整段不出现**：没有可撤回的东西时提这件事，只会让她
+    想着去撤一条撤不了的。
+    """
+    if not refs:
+        return ""
+    listed = "、".join(f"`{ref}`" for ref in refs)
+    return (
+        "如果你觉得自己刚才说错了、想收回，可以写标记：\n"
+        f"- `<<撤回 {refs[-1]}>>`：撤回对应的那一条（上面标着 `[recall:…]` 的发言）；\n"
+        "- `<<撤回>>`：撤回你最近发的那一条。\n"
+        f"现在能撤回的是：{listed}。\n"
+        "撤回**不可逆**，而且需要用户点确认才会真的执行——所以只在确实说错了"
+        "的时候提，不要拿它当「再说一遍」的手段。标记会从正文里去掉，用户看不到。"
+    )
+
+
 __all__ = [
     "MAX_TARGETS",
     "Directive",
     "parse_expression",
     "render_expression_help",
+    "render_recall_help",
 ]

@@ -1,10 +1,12 @@
 import { formatClock, formatModelLabel } from '../format';
 import { retryLabel } from '../errors';
 import { usePersonaName } from '../personaName';
+import type { RecallProposalView } from '../recall';
 import type { LiveTurn, UiMessage } from '../useChat';
 import type { TurnView } from '../types';
 import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
 import { PROMPT_DRAWER_ID, PROMPT_ENTRY_LABEL } from './PromptDrawer';
+import { RecallCard, RecallUnavailableCard } from './RecallCard';
 
 /**
  * 会话类型决定「谁在说话」怎么读。
@@ -54,6 +56,35 @@ interface MessageListProps {
   promptOpenKey?: string | null;
   /** 点击入口。第二个参数是入口元素本身，关闭抽屉后要把焦点还给它。 */
   onOpenPrompt?: (message: UiMessage, trigger: HTMLElement) => void;
+  /**
+   * 她提议撤回、还没处理完的（按 `message_id` 挂到对应消息下面）。
+   *
+   * 默认空数组：其它调用方（测试、别的页面）不受影响。
+   */
+  recallProposals?: RecallProposalView[];
+  /** 撤回提议列表读不到：只在卡片区降级，聊天照常。 */
+  recallUnavailable?: boolean;
+  onReloadRecall?: () => void;
+  onConfirmRecall?: (proposal: RecallProposalView) => void;
+  onDeclineRecall?: (proposal: RecallProposalView) => void;
+  /** 注入时钟（单测用固定时间；运行时是 `Date.now`）。 */
+  recallClock?: () => number;
+}
+
+/**
+ * 被撤那条的摘要：卡片上要让人确认"撤的是哪一句"。
+ *
+ * 取不到正文时返回 `null`（卡片会换成"不在这一屏里"的说明）——**绝不**用
+ * "（无内容）"之类的占位符冒充正文，那会让人以为要撤的是一条空消息。
+ */
+export function recallExcerpt(messages: UiMessage[], messageId: string): string | null {
+  const target = messages.find((message) => message.messageId === messageId);
+  const text = (target?.text ?? '').trim();
+  if (!text) return null;
+  // 摘要只取首段前 80 字：卡片是"确认一下"的提示，不是全文阅读器。
+  const firstLine = text.split('\n')[0] ?? text;
+  const compact = firstLine.replace(/\s+/g, ' ');
+  return compact.length > 80 ? `${compact.slice(0, 80)}…` : compact;
 }
 
 const SETTINGS_CODES = new Set([
@@ -331,10 +362,53 @@ export function MessageList({
   promptEnabled = false,
   promptOpenKey = null,
   onOpenPrompt,
+  recallProposals = [],
+  recallUnavailable = false,
+  onReloadRecall,
+  onConfirmRecall,
+  onDeclineRecall,
+  recallClock,
 }: MessageListProps) {
   const liveTurnId = live?.turnId ?? null;
   const actorName = usePersonaName();
   const rows = buildDialogueRows(messages, variant);
+  /*
+   * 提议按 `message_id` 分桶：卡片挂在"她想撤的那条"下面。
+   * 找不到对应消息的提议**不能丢**——那条消息可能已经滚出这一页（后端只给
+   * 最近 200 条），而提议仍然有效。它们统一挂到列表末尾一个"另外的提议"块里。
+   */
+  const byMessage = new Map<string, RecallProposalView[]>();
+  const orphans: RecallProposalView[] = [];
+  const knownIds = new Set(
+    messages.map((message) => message.messageId).filter((id): id is string => Boolean(id)),
+  );
+  for (const proposal of recallProposals) {
+    if (!knownIds.has(proposal.messageId)) {
+      orphans.push(proposal);
+      continue;
+    }
+    const list = byMessage.get(proposal.messageId) ?? [];
+    list.push(proposal);
+    byMessage.set(proposal.messageId, list);
+  }
+  const renderProposals = (messageId: string | null) => {
+    const list = messageId ? byMessage.get(messageId) : undefined;
+    if (!list || list.length === 0) return null;
+    return (
+      <div className="message__recall">
+        {list.map((proposal) => (
+          <RecallCard
+            key={proposal.proposalId}
+            proposal={proposal}
+            excerpt={recallExcerpt(messages, proposal.messageId)}
+            onConfirm={onConfirmRecall ?? (() => undefined)}
+            onDecline={onDeclineRecall ?? (() => undefined)}
+            {...(recallClock ? { clock: recallClock } : {})}
+          />
+        ))}
+      </div>
+    );
+  };
   const showGeneratingRow =
     activeTurn !== null &&
     (live === null || live.turnId !== activeTurn.turn_id) &&
@@ -418,7 +492,21 @@ export function MessageList({
                   ) : null}
                 </div>
               ) : null}
-              <div className={`message__bubble ${streaming ? 'message__bubble--streaming' : ''}`}>
+              <div
+                className={`message__bubble ${streaming ? 'message__bubble--streaming' : ''}${
+                  message.recalledAt ? ' message__bubble--recalled' : ''
+                }`}
+              >
+                {/*
+                  撤回后的气泡：正文仍然显示（用户可能正需要确认撤掉的是哪一句），
+                  但整体降权 + 一个「已撤回」徽标。**不能**把正文换成"已撤回"三个字
+                  ——那就等于替用户决定了"内容不重要"，而撤回恰恰是因为内容重要。
+                */}
+                {message.recalledAt ? (
+                  <span className="message__recalled" data-testid="message-recalled">
+                    {message.recalledByActor ? '她撤回了这条' : '对方撤回了一条消息'}
+                  </span>
+                ) : null}
                 {message.text ? (
                   <span className="message__text">{message.text}</span>
                 ) : streaming ? (
@@ -442,6 +530,8 @@ export function MessageList({
                   onOpenSettings={onOpenSettings}
                 />
               ) : null}
+              {/* 她想撤回这条：卡片紧贴在这条消息下面，不另找地方。 */}
+              {renderProposals(message.messageId)}
               {row.own ? (
                 <div className="message__meta message__meta--user">
                   {message.state === 'pending' ? (
@@ -496,6 +586,28 @@ export function MessageList({
           </li>
         );
       })}
+
+      {orphans.length > 0 ? (
+        <li className="messages__recall-orphans" data-testid="recall-orphans">
+          <p className="messages__recall-orphans-title">其它还没处理的撤回提议</p>
+          {orphans.map((proposal) => (
+            <RecallCard
+              key={proposal.proposalId}
+              proposal={proposal}
+              excerpt={null}
+              onConfirm={onConfirmRecall ?? (() => undefined)}
+              onDecline={onDeclineRecall ?? (() => undefined)}
+              {...(recallClock ? { clock: recallClock } : {})}
+            />
+          ))}
+        </li>
+      ) : null}
+
+      {recallUnavailable ? (
+        <li className="messages__recall-unavailable">
+          <RecallUnavailableCard {...(onReloadRecall ? { onRetry: onReloadRecall } : {})} />
+        </li>
+      ) : null}
 
       {showGeneratingRow && activeTurn ? (
         <li className="message message--actor message--generating" data-role="actor">

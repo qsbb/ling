@@ -83,19 +83,53 @@ def estimate_tokens(text: str) -> int:
     return cjk + max(1, other // 4)
 
 
-# 各条车道的 token 预算。**合计 50k**（按用户指定）。
+# 各条车道的 token 预算。
 #
 # 原来合计只有约 8.3k——紧到人格剩 3.6k、最近对话只留 400。
 # 对陪伴型角色这是错的取舍：她"像不像那个人"主要靠人设 + 最近聊了什么，
 # 而这两条被压得最狠。同类产品的上下文预算普遍比这更宽。
 #
-# **合计约 50000 token。** 如果你的模型窗口装不下，用
-# `LING_CONTEXT_BUDGET_SCALE` 整体缩放（如 0.5 = 25k），不必改代码。
+# ## 现在合计约 149k token（2026-11-09 用户拍板「人设上限 10 万 token」）
+#
+# 人设从 10k 提到 **100k**，其余车道**一个都没动**（仍是 28600）。
+# 车道和 = 128600 token，另有最近原文层 `HISTORY_TOKEN_BUDGET = 20000`
+# 不在这个 dict 里，所以一轮的上下文上界约 **148.6k token**。
+#
+# ### 这个改动有一个必须说清的副作用：总预算跟着变大了
+#
+# 总预算（`_total_soft_hard()`）是 `sum(DEFAULT_BUDGETS.values()) * 2` 推出来的
+# ——它不是一个独立数字，而是"各车道之和 × 2 字符/token"。所以人设涨 10 倍，
+# **总预算也涨**：
+#
+#   - 改前：车道和 38600 token → 软上限 77200 字符 / 硬上限 92640 字符；
+#   - 改后：车道和 128600 token → 软上限 257200 字符 / 硬上限 308640 字符。
+#
+# 这意味着**历史与摘要现在能装得更多**（原来会被"总预算超了"按
+# `SACRIFICE_ORDER` 整条丢弃的记忆/证据/知识，现在可能留得下）。这是预期的
+# 连带效果，不是 bug——但它是一个**可观察的行为变化**：同一个窗口、同样的
+# 消息，改后进提示词的内容更多（以及"某块被丢掉了"的日志会更少出现）。
+#
+# ### 模型窗口装不下怎么办
+#
+# 约 149k token 的提示词只有大窗口模型接得住。装不下就调
+# `LING_CONTEXT_BUDGET_SCALE`（整体等比缩，如 0.5 ≈ 74k），**不要**去改单个
+# 车道的数字——那会让"谁该让位"变成一堆手工调参。默认 1.0 = 不缩。
+# 缩放会同时作用于车道和 `HISTORY_TOKEN_BUDGET`（见文件末尾的 `_SCALE` 段）。
+#
+# 硬上限还有一个更硬的后果：真撞上 `_total_soft_hard()` 的硬上限时，
+# `PROTECTED_LANES`（人设/约束/短记忆）**永不整条丢弃**，只会截断非受保护车道。
+# 所以"人设 10 万"在最坏情况下会把它人挤到只剩骨架——这是用户明确要的取舍：
+# 宁可少记得点，也要角色完整。
 DEFAULT_BUDGETS: dict[str, int] = {
     # 人格是全篇最不能截断的一条：截掉一半的人设比提示长更糟——
     # 模型会只看到开头（世界观），看不到「说话方式」「禁区」，
-    # 于是角色变成"设定对、说话不像"。12k ≈ 24000 字符。
-    "persona": 10000,
+    # 于是角色变成"设定对、说话不像"。
+    #
+    # **用户指定 10 万 token**（2026-11-09）。按本文件的换算口径
+    # （`budget_chars = token_budget * 2`）≈ 20 万字符，够放一整本角色设定书。
+    # 实测用户真实人设 6222 字符，远在限内；这条上限的意义是"写多少都不会
+    # 被悄悄砍掉"，而不是"鼓励写到 20 万字"。
+    "persona": 100000,
     # 最近对话：这是"接得上话"的命脉。原值 400 只够三四条。
     "short_memory": 4000,
     # 核心记忆：每轮常驻，不依赖检索命中（Letta core memory / 插件 Label 常驻）
@@ -304,6 +338,13 @@ KEY_ORDER: tuple[str, ...] = (
 # 短 id）原样显示；长 id（qqbot 的 ``ROBOT1.0_…``）缩成 ``m`` + 6 位 base32，
 # 发送前再按 `reply_ids` 映射回原始 id。
 MESSAGE_ID_MARKER = "[msg_id:{token}]"
+#: **她自己的**发言前面的撤回短号标记。
+#:
+#: 为什么用自己的标记而不是复用 `[msg_id:…]`：那个是**平台消息 id**（用来
+#: `[quote:…]` 引用别人的话），而撤回要的是**本地消息 id**——两套 id 语义不同，
+#: 混用会让模型把平台 id 写进 `<<撤回 …>>`，然后必然对不上、静默失效。
+#: 前缀 `r` 也把两条标记在正则层面分开（`<<看视频 m…>>` vs `<<撤回 r…>>`）。
+RECALL_REF_MARKER = "[recall:{ref}]"
 MAX_INLINE_MESSAGE_ID_CHARS = 20
 # 只给**最近**这么多条入站消息标 id。NapCat 的短 id 表是 5000 条 FIFO
 # （§4.2），上下文里放太旧的 id 只会在发送时已经被淘汰——那时引用仍会
@@ -443,6 +484,26 @@ class ContextCompiler:
         persona = await self._persona.get(self._persona_id)
         contributions: list[ContextContribution] = []
         compiled_meta: dict[str, object] = {}
+
+        # 她**现在还真撤得动**的那几条：本地消息 id → 撤回短号。
+        #
+        # 为什么在**装配最前面**算一次：这一份要供两处用——历史里给她自己的
+        # 发言打 `[recall:…]` 标记，以及 `capabilities` 车道里那句"你能撤回
+        # 哪几条"。两处各查一次就是两次 IO，而且可能给出不一致的答案
+        # （中间有别的轮次撤了一条）。
+        #
+        # 查不到（纯 Web 会话没有连接器/没有回执）就是空表，不标——宁可不提，
+        # 也不要给她一个写了也撤不成的短号。
+        recall_refs: dict[str, str] = {}
+        try:
+            from ling.domains.conversation.recall import recallable_refs
+
+            for local_id, ref in await recallable_refs(
+                self._session, window_id=window_id
+            ):
+                recall_refs[local_id] = ref
+        except Exception:  # noqa: BLE001 - 标注失败不该影响整轮
+            logger.info("撤回短号标注失败（本轮不提供撤回选项）")
 
         # system_prompt + traits。**traits 原本完全没进提示词**——
         # 人设页有专门的 JSON 编辑器编辑它，而模型从来没看见过。
@@ -1097,6 +1158,21 @@ class ContextCompiler:
                 token_budget=DEFAULT_BUDGETS["capabilities"],
             )
         )
+        # 「你能撤回哪几条」：**只在她真的有可撤回的消息时出现**。
+        # 没有可撤回的东西还提这件事，只会让她想着去撤一条撤不了的。
+        from ling.capabilities.expression_choice import render_recall_help
+
+        recall_help = render_recall_help(sorted(recall_refs.values()))
+        if recall_help:
+            contributions.append(
+                ContextContribution(
+                    lane="capabilities",
+                    text=recall_help,
+                    origin=Origin.verified_source,
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["capabilities"],
+                )
+            )
         contributions.append(
             ContextContribution(
                 lane="capabilities",
@@ -1352,6 +1428,13 @@ class ContextCompiler:
             mark = history_marks.get(msg.message_id) if role == "user" else None
             if mark:
                 content = f"{MESSAGE_ID_MARKER.format(token=mark)} {content}"
+            # 她自己说的、**现在还真撤得动**的那几条：前面标注撤回短号。
+            #
+            # 只标"查过确实能撤"的（见 `recallable_refs`），否则她照着写
+            # `<<撤回 rXXXX>>` 会被五道闸拒——那正是"列了做不到的动作"。
+            recall_ref = recall_refs.get(msg.message_id) if role != "user" else None
+            if recall_ref:
+                content = f"{RECALL_REF_MARKER.format(ref=recall_ref)} {content}"
             annotated.append(
                 CompiledMessage(
                     role=role,

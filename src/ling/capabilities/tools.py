@@ -73,12 +73,30 @@ class ToolRegistry:
         self._handlers: dict[str, ToolHandler] = {}
         self._allow_irreversible = allow_irreversible
 
-    def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
+    def register(
+        self,
+        spec: ToolSpec,
+        handler: ToolHandler,
+        *,
+        allow_irreversible: bool | None = None,
+    ) -> None:
+        """注册一个工具。
+
+        ``allow_irreversible`` 是**逐次**的显式授权，默认 ``None`` = 用注册表
+        级的开关（``ToolRegistry(allow_irreversible=...)``）。
+
+        为什么需要它：注册表级的开关一开，**之后任何**不可逆工具都能注册进来；
+        而真正要表达的是"这一个工具已经过评审、允许存在"。逐次的写法让授权
+        落在注册那一行上——审计时一眼能看出"是谁批准了哪个不可逆工具"，
+        而不是"某个地方开过总开关"。
+
+        它**不是**绕过确认：下面那条"必须 requires_confirmation"仍然生效，
+        权限硬门（`manage.call_tool` 的 PolicyGate）也照旧。
+        """
         if spec.tool_id in self._specs:
             raise ValueError(f"工具已注册: {spec.tool_id}")
-        if spec.risk in {ToolRisk.irreversible, ToolRisk.external_publish} and not (
-            self._allow_irreversible
-        ):
+        authorized = self._allow_irreversible if allow_irreversible is None else allow_irreversible
+        if spec.risk in {ToolRisk.irreversible, ToolRisk.external_publish} and not authorized:
             raise PermissionError(
                 f"{spec.risk.value} 工具默认不允许注册（需要显式授权与审计）"
             )
@@ -185,8 +203,103 @@ def _safe_command_tool(allowed: set[str]) -> ToolHandler:
     return handler
 
 
-def build_default_registry(*, allow_irreversible: bool = False) -> ToolRegistry:
-    """默认工具集：只有只读/诊断能力。不可逆与公开发布默认不注册。"""
+# ------------------------------------------------------------------ 撤回（不可逆）
+
+
+class RecallToolError(RuntimeError):
+    """撤回工具拿不到执行条件（没会话、没连接器）。
+
+    **不是**撤回失败：这类错误发生在发 action 之前，语义是"这次撤不了"。
+    单独一个类型，是为了让 handler 能把它翻译成人话而不是抛栈。
+    """
+
+
+async def _recall_tool(args: dict[str, Any]) -> str:
+    """``message.recall`` 的处理器：撤回**她自己**的一条消息。
+
+    ## 这个 handler 只有一条执行路径
+
+    它**不自己判**归属/已送达/时间窗/频次/对象，而是直接调
+    :func:`ling.domains.conversation.recall.resolve_recall_target` +
+    :func:`perform_recall` —— 也就是 ``POST /v1/sessions/{id}/messages/{mid}/recall``
+    背后那套五道闸。判据只有一份，手端点与模型提议点走同一条。抄一份过来
+    迟早会走散（而"模型那条路判松了"正是最难发现的那种错）。
+
+    ## 为什么它默认根本不会被调用
+
+    ``ToolSpec.requires_confirmation=True``：``ToolRegistry.call(confirmed=False)``
+    在**进这个函数之前**就返回 ``needs_confirmation`` 了。模型只能提议，
+    执行要用户确认。这条防线在注册表里，不靠 handler 自觉。
+
+    ## 参数
+
+    ``message_id``（必需）：本地消息 id，由调用方把标记短号解析好再传进来。
+    ``window_id``（必需）：会话 id —— 撤回必须限定在某个窗口内，
+    不接受"随便哪条她说的"（那会跨会话撤）。
+    ``connector``（必需，非 JSON）：连接器实例。由调用方注入，**不从参数里读**：
+    参数来自模型/请求体，让它们指定连接器等于让调用方决定"发到哪个平台"。
+    """
+    from ling.domains.conversation.recall import (
+        RecallRejected,
+        perform_recall,
+        resolve_recall_target,
+    )
+
+    window_id = str(args.get("window_id") or "").strip()
+    message_id = str(args.get("message_id") or "").strip()
+    connector = args.get("connector")
+    if not window_id:
+        raise RecallToolError("不知道在哪个会话里撤回")
+    if not message_id:
+        raise RecallToolError("没有说要撤回哪一条")
+    if connector is None:
+        # 纯 Web 会话没有连接器：平台上没有可撤的东西。
+        # 这条**不算失败**——如实说"这个接入方式不支持撤回"。
+        return "这个接入方式不支持撤回（平台上没有这条消息）"
+
+    session = args.get("session")
+    if session is None:
+        raise RecallToolError("撤回需要数据库会话")
+
+    try:
+        target = await resolve_recall_target(
+            session, window_id=window_id, message_id=message_id
+        )
+    except RecallRejected as rejected:
+        # 五道闸拒了：**平台一次 action 都没收到**。人话直出，不带原因码。
+        raise RecallToolError(rejected.note) from rejected
+
+    outcome = await perform_recall(session, connector=connector, target=target)
+    # ``outcome.note`` 已经是人话（`RECALL_RESULT_NOTES`），
+    # 且 ``uncertain`` 说的是"没拿到回执，不确定是否撤回成功"——**不是成功**。
+    return outcome.note
+
+
+#: 撤回工具的 id。常量而不是字面量：解析标记那一侧（`kernel/turn.py`）与
+#: 注册这一侧必须写同一个字符串，两处各打一遍字迟早会有一个打错，而"打错了"
+#: 的表现是"模型提议了但什么都没发生"——最难查的那种。
+RECALL_TOOL_ID = "message.recall"
+
+
+def build_default_registry(
+    *, allow_irreversible: bool = False, include_recall: bool = True
+) -> ToolRegistry:
+    """默认工具集：只读/诊断 + 撤回（不可逆，需确认）。
+
+    ## 撤回为什么要进默认集
+
+    用户拍板「撤回消息只做注册工具开放给 llm」。它**必须**进默认集，否则
+    ``/v1/tools`` 里看不到它、模型侧也就没有可提议的动作。
+
+    但它和只读工具不是一类东西，所以：
+    - ``risk=irreversible``：撤回在平台上不可撤销（撤了就是撤了）；
+    - ``requires_confirmation=True``：**这是模型不能直接执行的唯一原因**，
+      见 `ToolRegistry.call` —— ``confirmed=False`` 时它连 handler 都不进；
+    - ``reversible=False`` / ``idempotent=True``：重复撤同一条是幂等的
+      （第二次会因为 ``recalled_at`` 非空被拒），但撤了不能反悔。
+
+    ``include_recall=False`` 是给"明确不要这个能力"的部署留的开关；默认开。
+    """
     registry = ToolRegistry(allow_irreversible=allow_irreversible)
     registry.register(
         ToolSpec(
@@ -222,10 +335,50 @@ def build_default_registry(*, allow_irreversible: bool = False) -> ToolRegistry:
         ),
         _safe_command_tool({"date", "uptime", "whoami"}),
     )
+    if include_recall:
+        # 撤回是**不可逆**工具，注册表默认拒绝它（见 `ToolRegistry.register`）。
+        # 这里把 allow_irreversible 显式打开一次——不是绕过闸门，而是"这个具体
+        # 工具已经过评审、确认可以存在"：它仍然要求确认、仍然过权限硬门
+        # （`manage.call_tool` 的 PolicyGate）、仍然走完整五道闸。
+        registry.register(
+            ToolSpec(
+                tool_id=RECALL_TOOL_ID,
+                version="1.0.0",
+                description=(
+                    "撤回她自己发出去的一条消息。不可逆，必须由用户确认后才执行；"
+                    "只在她自己的发言、有真实送达回执、且在平台撤回时间窗内时可用"
+                ),
+                risk=ToolRisk.irreversible,
+                requires_confirmation=True,
+                reversible=False,
+                # 撤回是"发一条平台 action"，比只读命令慢，但远快于 15 秒。
+                timeout_seconds=20.0,
+                idempotent=True,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": "要撤回的那条消息的 id（上下文里 [recall:…] 标记给的那个）",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "可选：为什么要撤回（只用于审计，不发给平台）",
+                            "maxLength": 200,
+                        },
+                    },
+                    "required": ["message_id"],
+                },
+            ),
+            _recall_tool,
+            allow_irreversible=True,
+        )
     return registry
 
 
 __all__ = [
+    "RECALL_TOOL_ID",
+    "RecallToolError",
     "ToolHandler",
     "ToolOutcome",
     "ToolRegistry",

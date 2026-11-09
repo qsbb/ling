@@ -11,7 +11,7 @@ from datetime import UTC, datetime, time
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
@@ -1398,9 +1398,52 @@ async def unbind_account(account_id: str, auth: CurrentAuth, session: DbSession)
 
 
 class ToolCallBody(BaseModel):
+    """`POST /v1/tools/{id}/call` 的请求体。
+
+    ## 为什么这里**没有** `confirmed` 字段
+
+    原来有一个 ``confirmed: bool = False``，直接透传给
+    ``ToolRegistry.call(confirmed=...)``——也就是**请求体自己给自己发确认**。
+    那等于把"不可逆动作需要二次确认"这条硬门做成摆设：任何拿到 token 的调用方
+    在 body 里写 ``"confirmed": true`` 就能执行撤回这类不可逆工具。今天打不穿
+    纯属巧合（``message.recall`` 的 handler 需要 `session` / `connector` 两个
+    非 JSON 对象，wire 上给不出来），而"靠 handler 恰好要不到参数"不是防线。
+
+    改成**结构性拒绝**而不是"读到了但忽略"：忽略意味着字段仍在、仍出现在
+    ``/openapi.json`` 里，下一个人接一条"顺手用 body.confirmed"的代码时不会有
+    任何提示。``extra="forbid"`` 让带这个字段的请求直接 422，且**连 handler 都
+    不进**。
+
+    真正的确认入口只有一个：``POST /v1/sessions/{id}/recall-proposals/{pid}/confirm``
+    ——那里由**服务端**在用户点击后传 ``confirmed=True``，事实来源是"一条待确认
+    的提议行 + owner 本人"，不是请求体里的一个 bool。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     args: dict = Field(default_factory=dict)
-    confirmed: bool = False
     window_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_self_confirmation(cls, data: object) -> object:
+        """带 ``confirmed`` 的请求给一句**能指路**的拒绝。
+
+        结构性拒绝已经在 ``extra="forbid"`` 里了（422、连 handler 都不进），
+        但 pydantic 的原话是 "Extra inputs are not permitted"——调用方看到的是
+        "你多传了一个字段"，而不是"确认不能在这种请求里给"。这两句的差别决定
+        下一个人是去改请求体还是去改确认流程。
+
+        拒绝仍然**必须是拒绝**：这里绝不"读到就忽略"，也不会替调用方改成
+        ``False`` 然后继续——那样请求会 200，调用方会以为自己的确认生效了。
+        """
+        if isinstance(data, dict) and "confirmed" in data:
+            raise ValueError(
+                "这个端点不能自证确认（confirmed 不是请求体字段）："
+                "不可逆动作的确认必须走提议端点，"
+                "即 POST /v1/sessions/{id}/recall-proposals/{proposal_id}/confirm"
+            )
+        return data
 
 
 @router.get("/tools")
@@ -1437,9 +1480,19 @@ async def call_tool(
     auth: CurrentAuth,
     session: DbSession,
 ) -> dict:
-    """执行工具。
+    """执行工具（**永远以"未确认"身份执行**）。
 
     工具结果是**不可信数据**（untrusted=True），调用方必须包裹后再进提示。
+
+    ## 只能"提议"，不能"确认"
+
+    这个端点的身份是**模型侧/诊断侧的执行入口**，所以它永远传
+    ``confirmed=False``。``requires_confirmation`` 的工具在这里最多走到
+    ``needs_confirmation``，绝不真的执行——不可逆动作的确认只能由用户在
+    ``/v1/sessions/{id}/recall-proposals/{pid}/confirm`` 点出来。
+
+    请求体里带 ``confirmed`` 会直接 422（``ToolCallBody`` 的
+    ``extra="forbid"``），所以"在 wire 上自证确认"这条路口是**关着的**。
     """
     registry = getattr(request.app.state, "tools", None)
     if registry is None:
@@ -1478,19 +1531,32 @@ async def call_tool(
             "该工具需要额外授权：" + "；".join(verdict.reasons),
             status_code=403,
         )
-    if verdict.requires_confirmation and not body.confirmed:
+    # **这个端点永远传 confirmed=False**，不给任何例外。
+    #
+    # 为什么写死而不是"读一个请求体字段"：见 `ToolCallBody` 的注释。确认这件事
+    # 只能由**服务端在用户点击之后**给出，来源是"有一条待确认的提议行 + owner
+    # 本人"，而不是调用方在 body 里写的一个 bool。请求体里就算带了
+    # ``confirmed``，模型层（``extra="forbid"``）也已经 422 掉了，走不到这里。
+    #
+    # 需要"用户已确认"的工具必须在 `verdict.requires_confirmation` 这一步就
+    # 返回 `needs_confirmation`，并指向 `/v1/sessions/{id}/recall-proposals/{pid}/confirm`。
+    if verdict.requires_confirmation:
         # 需要二次确认时**不能**直接执行，把决定权交回用户
         return {
             "tool_id": tool_id,
             "call_id": "",
             "outcome": "needs_confirmation",
             "output": None,
-            "detail": "该操作不可逆或会公开发布，需要二次确认（confirmed=true）",
+            "detail": (
+                "该操作不可逆或会公开发布，需要二次确认；"
+                "确认要走提议端点（如 /v1/sessions/{id}/recall-proposals/{pid}/confirm），"
+                "不能在这里自证"
+            ),
             "untrusted": True,
             "observed_at": datetime.now(UTC).isoformat(),
         }
 
-    result = await registry.call(tool_id, body.args, confirmed=body.confirmed)
+    result = await registry.call(tool_id, body.args, confirmed=False)
     return {
         "tool_id": result.tool_id,
         "call_id": result.call_id,

@@ -13,13 +13,37 @@ pytestmark = pytest.mark.w0_web
 
 
 async def test_tools_are_registered(logged_in: TestEnv) -> None:
-    """默认只注册只读/诊断工具，不可逆与公开发布不注册。"""
+    """默认集：只读/诊断 + **撤回**（不可逆但必须确认）。
+
+    撤回是 2026-11-09 用户拍板「只做注册工具开放给 llm」之后加进来的，所以它
+    是唯一一个不在 `read_only` 里的默认工具。它的安全边界不在"不许注册"
+    （那条防的是**没评审过**的不可逆工具），而在 `requires_confirmation=True`：
+    `ToolRegistry.call(confirmed=False)` 连 handler 都不进。
+    """
     response = await logged_in.client.get("/v1/tools")
     assert response.status_code == 200
     tools = response.json()["tools"]
     ids = {t["tool_id"] for t in tools}
-    assert ids == {"clock.now", "diagnostics.echo", "shell.readonly"}
-    assert all(t["risk"] == "read_only" for t in tools)
+    assert ids == {
+        "clock.now",
+        "diagnostics.echo",
+        "message.recall",
+        "shell.readonly",
+    }
+
+    readonly = [t for t in tools if t["risk"] == "read_only"]
+    assert {t["tool_id"] for t in readonly} == {
+        "clock.now",
+        "diagnostics.echo",
+        "shell.readonly",
+    }
+    assert all(t["requires_confirmation"] is False for t in readonly)
+
+    # 唯一一个不可逆的：必须要求确认，且不可逆
+    irreversible = [t for t in tools if t["risk"] == "irreversible"]
+    assert [t["tool_id"] for t in irreversible] == ["message.recall"]
+    assert irreversible[0]["requires_confirmation"] is True
+    assert irreversible[0]["reversible"] is False
 
 
 async def test_call_readonly_tool(logged_in: TestEnv) -> None:

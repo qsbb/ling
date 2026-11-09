@@ -48,9 +48,21 @@ class PersonaOut(BaseModel):
     scenarios: list[ScenarioOut]
 
 
+# 人设正文的**接口侧**上限（字符）。原来 8000。
+#
+# 为什么必须跟着预算一起改：`DEFAULT_BUDGETS["persona"]` 已提到 10 万 token
+# （≈20 万字符，见 `kernel/context.py`）。如果这里还卡 8000 字符，用户看到的是
+# "预算有 10 万 token"，实际却连 8000 字都存不进去——上限成了摆设，而且
+# 报错是 422 `string_too_long`，跟"预算"这个词毫无关系，没人会想到是这里。
+#
+# 取 200000 = 人设车道的字符上限（token × 2），让**接口与预算同一个数**。
+# 再大就没意义了：超出的部分反正进不了提示词（车道会截断并留痕）。
+PERSONA_PROMPT_MAX_CHARS = 200_000
+
+
 class PersonaUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=64)
-    system_prompt: str | None = Field(default=None, max_length=8000)
+    system_prompt: str | None = Field(default=None, max_length=PERSONA_PROMPT_MAX_CHARS)
     traits: dict | None = None
     boundaries: list[str] | None = None
     # 只放覆盖；某个键给空串 = 恢复默认。未知键直接报错，不静默丢弃——

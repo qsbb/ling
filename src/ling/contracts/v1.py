@@ -469,6 +469,26 @@ class RecallMessageOut(StrictModel):
     )
 
 
+class RecallProposalOut(StrictModel):
+    """她提议撤回、等用户确认的一条（`operations.kind='message_recall_proposal'`）。
+
+    ## 为什么单独一个契约而不是复用 `RecallMessageOut`
+
+    那个描述的是"撤回**已经执行**的结果"（有 state/recall receipt/attempts）；
+    这个描述的是"她想撤，但还没执行"。把两者塞进一个模型，前端就得靠
+    `state` 猜"这条到底撤没撤"——而"猜错一次就是把待确认当成已撤回"。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    proposal_id: IdStr
+    #: 她想撤的那条（本地消息 id）
+    message_id: IdStr
+    window_id: IdStr
+    #: 人话："她要撤回这条，确认吗？"
+    note: str
+    created_at: datetime
+
+
 # ---------------------------------------------------------------- 会话与轮次
 
 
@@ -1560,6 +1580,7 @@ class ErrorResponse(StrictModel):
 __all__ = [
     "RecallReceipt",
     "RecallMessageOut",
+    "RecallProposalOut",
     "OutboundRecallState",
     "SCHEMA_VERSION",
     "ActionIntent",

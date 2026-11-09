@@ -25,17 +25,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, TurnState, new_id
+from ling.domains.conversation.recall import (
+    finalize_recall_text,
+    parse_recall_markers,
+    recallable_refs,
+    resolve_recall_ref,
+)
 from ling.domains.conversation.service import ConversationService, MessageView
 from ling.domains.media.video import (
     finalize_reply_text,
     parse_watch_markers,
-    stream_safe,
-    strip_watch_markers,
 )
 from ling.infra.db import session_scope
 from ling.infra.models import ActorEvent, ActorState, OutboxEvent, PromptSnapshot, utcnow
 from ling.kernel.arbiter import SpeakerArbiter
 from ling.kernel.context import ContextCompiler, estimate_tokens
+from ling.kernel.marker_stream import stream_safe_all, strip_all_markers
 from ling.kernel.stream_log import StreamLog
 from ling.models.router import ModelRouter
 from ling.ports.config import EffectiveConfig
@@ -897,10 +902,22 @@ class TurnCoordinator:
                 )
 
                 def _visible(delta: str) -> str:
+                    """流式 delta → 用户真的看得见的那部分。
+
+                    **两种标记都要挡**（`<<看视频 …>>` 与 `<<撤回 …>>`）。原来
+                    这里只调了 `strip_watch_markers`，于是 ``<<撤回 r3f2a1>>``
+                    原样出现在气泡里，等落库时才洗掉——用户先看到说明书，再看它
+                    消失。流式是唯一"用户看得见中间态"的出口，漏一种就等于漏给
+                    用户。
+
+                    半截暂扣与完整标记剥离都收在 `marker_stream` 里：两条标记的
+                    待扣尾巴必须由**同一个**函数判定，否则串起来会互相吞
+                    （见 `kernel/marker_stream.py` 的模块注释）。
+                    """
                     nonlocal stream_hold
                     stream_hold += delta
-                    ready, stream_hold = stream_safe(stream_hold)
-                    return strip_watch_markers(ready)
+                    ready, stream_hold = stream_safe_all(stream_hold)
+                    return strip_all_markers(ready)
 
                 try:
                     async for chunk, outcome in self._router.stream(
@@ -938,7 +955,9 @@ class TurnCoordinator:
                                         data={
                                             "turn_id": turn_id,
                                             "state": TurnState.streaming.value,
-                                            "caught_up": strip_watch_markers(delivered),
+                                            # 补齐时也要剥**两种**标记：这段是
+                                            # 排队期间累积的原文。
+                                            "caught_up": strip_all_markers(delivered),
                                             "note": "排到发言权，补齐排队期间产生的文字",
                                         },
                                     )
@@ -1352,8 +1371,9 @@ class TurnCoordinator:
                     continue
                 text += chunk.delta
                 hold += chunk.delta
-                ready, hold = stream_safe(hold)
-                visible = strip_watch_markers(ready)
+                # 同一个过滤器：这条补生成的正文里也可能出现撤回标记。
+                ready, hold = stream_safe_all(hold)
+                visible = strip_all_markers(ready)
                 if visible and held_by_me:
                     await queue.put(
                         TurnStreamEvent(
@@ -1367,6 +1387,68 @@ class TurnCoordinator:
             return ""
         cleaned, _refs = parse_watch_markers(text)
         return cleaned
+
+    async def _collect_recall_proposals(
+        self,
+        *,
+        conversation: ConversationService,
+        window_id: str,
+        turn_id: str,
+        text: str,
+    ) -> list[dict]:
+        """把她写的 ``<<撤回 rXXXX>>`` 变成**待确认项**，返回给事件的载荷。
+
+        ## 为什么是"待确认"而不是直接撤
+
+        撤回不可逆。让模型自己判断"这句说错了"意味着它要评估自己刚才的输出，
+        而它对自己的错误没有可靠判据——错判一次就是替用户删掉一条正常回复。
+        所以这里只**记录提议**，等用户在网页上点确认。
+
+        这与 ``ToolSpec.requires_confirmation=True`` 是同一件事的两面：
+        工具注册表那一侧保证 ``confirmed=False`` 时 handler 根本不进；这一侧
+        保证提议被记下来、能被展示、能被拒绝。
+
+        ## 一次回复里写多个标记
+
+        只认**第一个**。撤回是有频次上限的破坏性动作，一句回复里连撤三条
+        更像是模型跑偏了，而不是用户真的一次想撤三条。多出来的标记仍然会被
+        剥掉（不发给用户），但不落提议——并且记一条日志。
+        """
+        cleaned, refs = parse_recall_markers(text)
+        if not refs:
+            return []
+        if len(refs) > 1:
+            logger.info(
+                "一轮里有 %d 个撤回标记，只处理第一个：window=%s", len(refs), window_id
+            )
+        proposals: list[dict] = []
+        try:
+            async with session_scope() as session:
+                candidates = await recallable_refs(session, window_id=window_id)
+                message_id = resolve_recall_ref(refs[0], candidates)
+                if message_id is None:
+                    # 短号对不上（模型编的 / 那条已经出窗了）：**什么都不撤**，
+                    # 也不报错给用户——她已经把"想收回"这件事说出口了，
+                    # 但平台上什么都没发生，那就不该让用户看到一条失败提示。
+                    logger.info(
+                        "撤回标记对不上任何可撤回的消息：window=%s ref=%s",
+                        window_id,
+                        refs[0] or "(最近一条)",
+                    )
+                    return []
+                proposal = await _record_recall_proposal(
+                    session,
+                    window_id=window_id,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                    actor_id=self._actor_id,
+                )
+                if proposal is not None:
+                    proposals.append(proposal)
+        except Exception:  # noqa: BLE001 - 记录提议失败不该毁掉这一轮回复
+            logger.exception("记录撤回提议失败：window=%s", window_id)
+            return []
+        return proposals
 
     async def _finalize(
         self,
@@ -1413,6 +1495,19 @@ class TurnCoordinator:
         # 它是说明书的碎片，落库后历史渲染里会露出来，外发更糟。这里用的
         # `finalize_reply_text` = 剥完整标记 + 去半截尾巴，幂等，重复调用无害。
         delivered = finalize_reply_text(delivered)
+
+        # 「撤回」标记：**先落提议，再剥正文**。
+        #
+        # 顺序不能反。剥掉标记之后正文里就没有"她想撤哪一条"的信息了，
+        # 那之后再想落提议只能靠猜。所以先解析、先把待确认项写下来，
+        # 再把标记从要发出去的正文里去掉（用户不该看到这行说明书）。
+        recall_proposals = await self._collect_recall_proposals(
+            conversation=conversation,
+            window_id=window_id,
+            turn_id=turn_id,
+            text=delivered,
+        )
+        delivered = finalize_recall_text(delivered)
 
         actor_message: MessageView | None = None
         # 表达层：先去掉客服式追问，再按语义分段。
@@ -1700,6 +1795,12 @@ class TurnCoordinator:
                     # 她想引用但 id 对不上（不是真消息）——留痕，别让它静默消失。
                     # 引用是**装饰**：去掉它正文照发，不能让整条消息失败。
                     "quote_dropped": dropped_quote,
+                    # 她提议撤回的**待确认项**（见 `_collect_recall_proposals`）。
+                    # 每项 `{proposal_id, message_id, note}`：前端据此画
+                    # 「她要撤回这条，确认吗？」。**不在这里执行**——
+                    # 不可逆动作要用户点确认（工具注册表那边同样要求
+                    # `requires_confirmation=True`）。
+                    "recall_proposals": recall_proposals,
                     "suppressed_reason": (
                         (
                             "本轮中途失去发言权（租约被另一个窗口接管），"
@@ -1722,6 +1823,82 @@ class TurnCoordinator:
                 },
             )
         )
+
+
+#: ``operations.kind``：她提议撤回、等用户确认。与 ``delivery`` 分开：
+#: 那是"我们发出去的动作"，这是"她想做但还没被批准的動作"。
+RECALL_PROPOSAL_KIND = "message_recall_proposal"
+
+#: 提议状态。``proposed`` = 等确认；``confirmed`` / ``declined`` / ``expired``
+#: 是三种终态。**只有 ``confirmed`` 之后才允许真去撤**——那一步在
+#: ``POST /v1/sessions/{id}/recall-proposals/{pid}/confirm``。
+RECALL_PROPOSAL_STATES = ("proposed", "confirmed", "declined", "expired")
+
+
+async def _record_recall_proposal(
+    session: AsyncSession,
+    *,
+    window_id: str,
+    message_id: str,
+    turn_id: str,
+    actor_id: str,
+) -> dict | None:
+    """把她提议撤回这件事落成一条 ``operations`` 行（待确认）。
+
+    为什么复用 ``operations`` 而不是新开一张表：
+    - 它本来就是"受控外部动作"的表，撤回正是这一类；
+    - 已经带 ``state`` 状态机与 ``payload``（可以放 window/message/turn）；
+    - 建新表要迁移，而这件事的数据形状与现有行完全一致。
+
+    ``payload`` 里只放 id，**不放正文**：撤回往往正是因为那条内容不该再被
+    引用，把正文抄进提议行等于给它开了第二份长期副本。
+    """
+    from ling.infra.models import Operation
+
+    existing = (
+        await session.execute(
+            select(Operation).where(
+                Operation.kind == RECALL_PROPOSAL_KIND,
+                Operation.state == "proposed",
+                Operation.actor_id == actor_id,
+            )
+        )
+    ).scalars().all()
+    for row in existing:
+        payload = dict(row.payload or {})
+        # 同一条消息已经有一条待确认提议：不重复落（她连说两次"撤回这条"
+        # 不该在界面上出现两个确认框）。幂等键 = (窗口, 目标消息)。
+        if payload.get("window_id") == window_id and payload.get("message_id") == message_id:
+            return {
+                "proposal_id": str(row.id),
+                "message_id": message_id,
+                "note": "她要撤回这条，确认吗？",
+            }
+
+    proposal = Operation(
+        id=new_id("recall"),
+        kind=RECALL_PROPOSAL_KIND,
+        actor_id=actor_id,
+        state="proposed",
+        payload={
+            "window_id": window_id,
+            "message_id": message_id,
+            "turn_id": turn_id,
+        },
+    )
+    session.add(proposal)
+    await session.flush()
+    logger.info(
+        "她提议撤回一条消息（等确认）：window=%s message=%s proposal=%s",
+        window_id,
+        message_id,
+        proposal.id,
+    )
+    return {
+        "proposal_id": str(proposal.id),
+        "message_id": message_id,
+        "note": "她要撤回这条，确认吗？",
+    }
 
 
 def describe_turn_failure(data: dict[str, Any] | None) -> str:

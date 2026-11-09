@@ -75,6 +75,8 @@ function messageFixture(patch: Partial<UiMessage> & { key: string }): UiMessage 
     silenceReason: null,
     senderName: null,
     senderId: null,
+    recalledAt: null,
+    recalledByActor: false,
     ...rest,
   };
 }
