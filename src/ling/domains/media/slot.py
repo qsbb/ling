@@ -238,20 +238,35 @@ async def acquire(
             {"key": RESOURCE_KEY},
         )
         await session.flush()
-        row = (
-            await session.execute(
-                text(
-                    """
-                    SELECT holder_id, lease_until, generation, phase, window_id,
-                           clock_timestamp() AS now
-                      FROM media_slots
-                     WHERE resource_key = :key
-                     FOR UPDATE NOWAIT
-                    """
-                ),
-                {"key": RESOURCE_KEY},
+        try:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT holder_id, lease_until, generation, phase, window_id,
+                               clock_timestamp() AS now
+                          FROM media_slots
+                         WHERE resource_key = :key
+                         FOR UPDATE NOWAIT
+                        """
+                    ),
+                    {"key": RESOURCE_KEY},
+                )
+            ).first()
+        except Exception as exc:  # noqa: BLE001 - 与首次读取同一套分类
+            # **补行后的重试同样会撞上行锁**：20 个并发补行时，第一个持锁
+            # 提交前，其余的 NOWAIT 必然失败。漏掉这里会让并发抢占直接抛
+            # 异常出去（表现为"看视频炸了"），而不是干净地返回 busy。
+            if _is_lock_conflict(exc):
+                return SlotOutcome(
+                    outcome=OUTCOME_BUSY,
+                    detail="另一个请求正在抢占媒体槽位",
+                )
+            logger.warning("媒体槽位补行后不可用：%s", type(exc).__name__)
+            return SlotOutcome(
+                outcome=OUTCOME_UNAVAILABLE,
+                detail=f"无法确认媒体槽位（{type(exc).__name__}）",
             )
-        ).first()
         if row is None:  # pragma: no cover - 表结构不对才会到这
             logger.error("media_slots 补建预置行后仍读不到，媒体动作拒绝执行")
             return SlotOutcome(
