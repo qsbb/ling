@@ -290,6 +290,11 @@ export function ChatPage({
               promptEnabled={promptEnabled}
               promptOpenKey={promptOpenKey}
               onOpenPrompt={togglePrompt}
+              recallProposals={chat.recallProposals}
+              recallUnavailable={chat.recallProposalsUnavailable}
+              onReloadRecall={chat.reloadRecallProposals}
+              onConfirmRecall={chat.confirmRecall}
+              onDeclineRecall={chat.declineRecall}
             />
           )}
         </div>

@@ -59,6 +59,8 @@ import type {
   MemoryListResponse,
   LogQuery,
   LogsResponse,
+  RecallProposal,
+  RecallResult,
 } from './types';
 
 export class ApiError extends Error {
@@ -129,7 +131,7 @@ export async function parseErrorResponse(response: Response): Promise<ApiError> 
   );
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function requestResponse(path: string, init: RequestInit = {}): Promise<Response> {
   let response: Response;
   try {
     response = await fetch(path, { credentials: 'same-origin', ...init });
@@ -152,10 +154,32 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     throw await parseErrorResponse(response);
   }
+  return response;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await requestResponse(path, init);
   if (response.status === 204) {
     return undefined as T;
   }
   return (await response.json()) as T;
+}
+
+/**
+ * 响应里的服务端时刻（HTTP `Date` 头，毫秒时间戳）。
+ *
+ * 为什么需要它：撤回窗口是 120 秒，而**浏览器时钟不可信**（时区设错、机器
+ * 休眠后漂移、手动改过时间）。拿 `Date.now()` 减服务端给的 `created_at`，
+ * 时钟一歪就会把"还来得及"判成"来不及"，或者反过来让用户点一个注定失败的
+ * 按钮。`Date` 头是服务端自己盖的时间，与 `created_at` 同源，差值才是真的。
+ *
+ * 拿不到（代理剥掉、CORS 未暴露）时返回 null，调用方退回保守策略。
+ */
+export function serverNowMsFromResponse(response: Response): number | null {
+  const header = response.headers.get('date');
+  if (!header) return null;
+  const parsed = Date.parse(header);
+  return Number.isNaN(parsed) ? null : parsed;
 }
 
 function jsonInit(method: string, body: unknown): RequestInit {
@@ -253,6 +277,47 @@ export const api = {
   messagePrompt(messageId: string): Promise<PromptSnapshotOut> {
     return request<PromptSnapshotOut>(
       `/v1/messages/${encodeURIComponent(messageId)}/prompt`,
+    );
+  },
+
+  /* ------------------------------------------------------- 她提议的撤回 */
+  /**
+   * 她提议撤回、还没被处理的那些（后端只回 `state='proposed'`）。
+   *
+   * 用途是"刷新页面后把没处理完的提议找回来"：流式事件只在一轮结束时给一次，
+   * 关掉标签页就再也看不到了，而提议本身还挂在库里等着人确认。
+   *
+   * 失败**不该影响聊天**：调用方自己 catch 成"这块暂时读不到"。
+   */
+  async recallProposals(sessionId: string): Promise<{
+    items: RecallProposal[];
+    /** 服务端"现在"（HTTP Date 头）；null = 拿不到，调用方自己决定保守程度。 */
+    serverNowMs: number | null;
+  }> {
+    const response = await requestResponse(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/recall-proposals`,
+    );
+    const items = (await response.json()) as RecallProposal[];
+    return { items, serverNowMs: serverNowMsFromResponse(response) };
+  },
+  /**
+   * 用户点「撤回」→ 这时才真的执行（后端用 `confirmed=True` 调同一个工具）。
+   *
+   * 返回的是**执行结果**而不是"提议状态"：`state` 可能是 `expired`
+   * （超过平台窗口）、`unsupported`（这个渠道不支持）、`uncertain`
+   * （没拿到回执）——三者的界面文案不同，不能一律说"已撤回"。
+   */
+  confirmRecall(sessionId: string, proposalId: string): Promise<RecallResult> {
+    return request<RecallResult>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/recall-proposals/${encodeURIComponent(proposalId)}/confirm`,
+      { method: 'POST' },
+    );
+  },
+  /** 用户点「算了」：只把提议标成 declined，不发任何平台动作（204）。 */
+  declineRecall(sessionId: string, proposalId: string): Promise<void> {
+    return request<void>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/recall-proposals/${encodeURIComponent(proposalId)}/decline`,
+      { method: 'POST' },
     );
   },
 

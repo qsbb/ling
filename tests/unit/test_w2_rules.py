@@ -836,15 +836,30 @@ def test_format_traits_is_bounded() -> None:
 
 
 def test_format_traits_marks_every_truncation() -> None:
-    """三种截断（单条过长 / 合计过长 / 条目过多）都要能看出来。"""
-    from ling.domains.persona.service import format_traits
+    """三种截断（单条过长 / 合计过长 / 条目过多）都要能看出来。
+
+    上限随人设预算一起放宽过（40 条/1200 字/4000 字 → 400 条/4000 字/120000 字），
+    所以这里用**常量本身**造超限数据，而不是写死一个数字——否则上限一改这条
+    测试就会假绿（造的数据根本没超限）。
+    """
+    from ling.domains.persona.service import (
+        _MAX_TRAIT_CHARS,
+        _MAX_TRAIT_ITEM_CHARS,
+        _MAX_TRAIT_ITEMS,
+        format_traits,
+    )
 
     # 单条过长：逐条留痕
-    single = format_traits({"说话方式": "设定" * 2000})
-    assert "这条太长" in single
+    single = format_traits({"说话方式": "设定" * (_MAX_TRAIT_ITEM_CHARS // 2 + 100)})
+    assert "这条太长" in single, "单条超限没留痕"
+
+    # 合计过长：末尾留痕
+    huge = {f"k{i}": "设" * (_MAX_TRAIT_ITEM_CHARS - 10) for i in range(40)}
+    assert len(format_traits(huge)) > _MAX_TRAIT_CHARS
+    assert "没放进提示词" in format_traits(huge), "合计超限没留痕"
 
     # 条目过多：末尾给总账，且明确还有几条没进来
-    many = {f"k{i}": f"第{i}条" for i in range(60)}
+    many = {f"k{i}": f"第{i}条" for i in range(_MAX_TRAIT_ITEMS + 20)}
     out = format_traits(many)
     assert "条性格特征没放进提示词" in out
 
@@ -869,17 +884,23 @@ def test_format_traits_does_not_assume_known_keys() -> None:
 # ---------------------------------------------------------------- 上下文预算
 
 
-def test_total_budget_is_fifty_k() -> None:
-    """总预算按 5w token 配。
+def test_total_budget_follows_the_persona_budget() -> None:
+    """总预算 = 车道和 + 最近原文层；人设提到 10 万后合计约 149k。
 
-    原来合计只有约 8.3k——紧到人格剩 3.6k、最近对话只留 400。
-    对陪伴型角色这是错的取舍："像不像那个人"主要靠人设 + 最近聊了什么，
-    而这两条被压得最狠。
+    原来合计只有约 8.3k——紧到人格剩 3.6k、最近对话只留 400。后来是 50k，
+    2026-11-09 用户拍板「人设上限 10 万 token」，于是人设 10k → 100k，
+    **其余车道一个都没动**（仍是 28600）。
+
+    这条测试钉的是**结构关系**（总预算由车道和推出），不是某个具体数字：
+    数字变了要改的是 `DEFAULT_BUDGETS`，不是这里。
     """
     from ling.kernel.context import DEFAULT_BUDGETS, HISTORY_TOKEN_BUDGET
 
-    total = sum(DEFAULT_BUDGETS.values()) + HISTORY_TOKEN_BUDGET
-    assert 45000 <= total <= 65000, f"预算合计 {total}，偏离 5w 太多"
+    lanes = sum(DEFAULT_BUDGETS.values())
+    total = lanes + HISTORY_TOKEN_BUDGET
+    assert DEFAULT_BUDGETS["persona"] == 100_000
+    assert lanes - DEFAULT_BUDGETS["persona"] == 28_600, "其余车道被动过了"
+    assert total == lanes + 20_000
 
 
 def test_persona_budget_fits_a_full_character_sheet() -> None:
@@ -917,8 +938,11 @@ def test_budget_scale_env_is_honored(monkeypatch) -> None:  # noqa: ANN001
     reloaded = importlib.reload(ctx)
     try:
         total = sum(reloaded.DEFAULT_BUDGETS.values()) + reloaded.HISTORY_TOKEN_BUDGET
-        # 0.5 倍：约 29k
-        assert 20000 <= total <= 35000, f"缩放后 {total}，没按 0.5 生效"
+        # 0.5 倍：车道和 128600 → 64300，历史 20000 → 10000，合计 74300。
+        # 用**比例**断言而不是写死数字：上限一改这里就会假红。
+        assert reloaded.DEFAULT_BUDGETS["persona"] == 50_000
+        assert reloaded.HISTORY_TOKEN_BUDGET == 10_000
+        assert total == 74_300, f"缩放后 {total}，没按 0.5 生效"
     finally:
         monkeypatch.delenv("LING_CONTEXT_BUDGET_SCALE", raising=False)
         importlib.reload(ctx)
@@ -1833,6 +1857,140 @@ def test_traits_report_counts_what_really_went_in() -> None:
     assert ok["rendered_items"] == 2
     assert ok["truncated"] is False
 
-    cut = traits_report({f"k{i}": "y" * 3000 for i in range(3)})
+    # 超过**条目**上限也算截断（上限随人设预算放宽到 400 条）
+    from ling.domains.persona.service import _MAX_TRAIT_ITEMS
+
+    cut = traits_report({f"k{i}": f"第{i}条" for i in range(_MAX_TRAIT_ITEMS + 5)})
     assert cut["truncated"] is True
     assert int(cut["rendered_chars"]) > 0
+
+
+# ------------------------------------------------- 撤回：标记解析与工具注册（纯函数）
+
+
+def test_recall_marker_parse_and_strip() -> None:
+    """`<<撤回 rXXXX>>` 解析、剥离、幂等；无参形式 = 撤最近一条。"""
+    from ling.domains.conversation.recall import (
+        finalize_recall_text,
+        parse_recall_markers,
+        strip_recall_markers,
+    )
+
+    cleaned, refs = parse_recall_markers("说错了<<撤回 r3f2a1>>，当没听见")
+    assert refs == ["r3f2a1"]
+    assert "<<撤回" not in cleaned
+    assert "说错了" in cleaned and "当没听见" in cleaned
+
+    # 幂等
+    assert strip_recall_markers(cleaned) == cleaned
+    assert parse_recall_markers(cleaned)[1] == []
+
+    # 无参
+    assert parse_recall_markers("<<撤回>>好")[1] == [""]
+
+    # 宽容排版：多余空格也认
+    assert parse_recall_markers("<<  撤回   r3f2a1  >>")[1] == ["r3f2a1"]
+
+    # 半截标记也要清掉（模型被打断的残片不能落库/外发）
+    assert "<<" not in finalize_recall_text("说错了<<撤回 r3")
+    assert finalize_recall_text("正常的句子") == "正常的句子"
+
+
+def test_recall_marker_does_not_collide_with_watch_marker() -> None:
+    """撤回标记与看视频标记**互不吞**（两套正则各认各的）。"""
+    from ling.domains.conversation.recall import parse_recall_markers
+    from ling.domains.media.video import parse_watch_markers
+
+    both = "<<看视频 m3f2a1>>我看了<<撤回 r9b2c3>>"
+    watch_cleaned, watch_refs = parse_watch_markers(both)
+    assert watch_refs == ["m3f2a1"]
+    # 撤回标记仍在（看视频那条不该顺手把它吃掉）
+    assert "<<撤回 r9b2c3>>" in watch_cleaned
+
+    recall_cleaned, recall_refs = parse_recall_markers(both)
+    assert recall_refs == ["r9b2c3"]
+    assert "<<看视频 m3f2a1>>" in recall_cleaned
+
+
+def test_recall_ref_is_derived_from_message_id() -> None:
+    """短号由 id 唯一决定（同一句话在相邻两轮里拿到同一个短号）。"""
+    from ling.domains.conversation.recall import recall_ref_for
+
+    assert recall_ref_for("m3f2a1") == "r3f2a1"
+    assert recall_ref_for("abc123") == "rabc123"
+    assert recall_ref_for("") == ""
+    # 同一个输入永远同一个输出
+    assert recall_ref_for("mdeadbe") == recall_ref_for("mdeadbe")
+
+
+@pytest.mark.asyncio
+async def test_recall_tool_is_registered_irreversible_and_needs_confirmation() -> None:
+    """`message.recall` 在默认注册表里，且不可逆 + 必须确认。"""
+    from ling.capabilities.tools import (
+        RECALL_TOOL_ID,
+        ToolOutcome,
+        ToolRisk,
+        build_default_registry,
+    )
+
+    registry = build_default_registry()
+    spec = next(s for s in registry.list_specs() if s.tool_id == RECALL_TOOL_ID)
+    assert spec.risk is ToolRisk.irreversible
+    assert spec.requires_confirmation is True
+    assert spec.reversible is False
+    assert spec.idempotent is True
+    assert "message_id" in spec.input_schema.get("required", [])
+
+    # 不确认 → needs_confirmation，**handler 根本不进**
+    result = await registry.call(
+        RECALL_TOOL_ID, {"message_id": "msg_x", "window_id": "win_x"}
+    )
+    assert result.outcome is ToolOutcome.needs_confirmation
+    assert result.output == ""
+    assert result.call_id, "没有 call_id，审计对不上"
+
+
+def test_per_registration_authorization_does_not_open_the_gate() -> None:
+    """逐次授权只对那一次生效：默认注册表仍然拒绝别的不可逆工具。"""
+    from ling.capabilities.tools import ToolRegistry, ToolRisk, ToolSpec
+
+    async def handler(args):  # noqa: ANN001
+        return "x"
+
+    spec = ToolSpec(
+        tool_id="other.danger",
+        version="1",
+        description="别的不可逆工具",
+        risk=ToolRisk.irreversible,
+        requires_confirmation=True,
+        reversible=False,
+    )
+    # 不传 allow_irreversible → 拒绝
+    with pytest.raises(PermissionError):
+        ToolRegistry().register(spec, handler)
+    # 显式传 True → 允许（这就是撤回那一行的写法）
+    registry = ToolRegistry()
+    registry.register(spec, handler, allow_irreversible=True)
+    assert [s.tool_id for s in registry.list_specs()] == ["other.danger"]
+
+
+def test_irreversible_tool_without_confirmation_is_rejected() -> None:
+    """不可逆 + 不要确认 = 直接拒。确认这一条是硬要求，不能被授权开关绕过。"""
+    from ling.capabilities.tools import ToolRegistry, ToolRisk, ToolSpec
+
+    async def handler(args):  # noqa: ANN001
+        return "x"
+
+    with pytest.raises(ValueError, match="必须要求确认"):
+        ToolRegistry().register(
+            ToolSpec(
+                tool_id="sneaky",
+                version="1",
+                description="不可逆但不要确认",
+                risk=ToolRisk.irreversible,
+                requires_confirmation=False,
+                reversible=False,
+            ),
+            handler,
+            allow_irreversible=True,
+        )

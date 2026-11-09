@@ -52,6 +52,22 @@ export interface ChatMessage {
   sender_name?: string | null;
   /** 发言人的平台号码（QQ 号）或 subject id；和名字分两行显示，不要挤一起。 */
   sender_id?: string | null;
+  /**
+   * 这条被**对方**撤回了（入站撤回，迁移 0055）。非空 = 撤回时刻。
+   * 与下面的 `recalled_at` 分开：那个是"她自己收回了"。
+   */
+  retracted_at?: string | null;
+  /**
+   * **她自己**把这条收回来了（出站撤回，迁移 0057）。非空 = 撤回时刻。
+   * 两者都非空时以它为准（她自己撤的优先级更高，说明这条是她的发言）。
+   */
+  recalled_at?: string | null;
+  /**
+   * 最后一次撤回尝试的结果：`recalled` / `uncertain` / `expired` /
+   * `not_found` / `unsupported`。**只有 `recalled` 等于"撤回了"**——
+   * `uncertain` 是"没拿到回执"，界面不能说成功。
+   */
+  recall_state?: string | null;
 }
 
 export interface TurnView {
@@ -679,6 +695,62 @@ export interface TurnFinalData {
   decision_hard?: boolean;
   model_status?: string;
   silent_ack?: boolean;
+  /**
+   * 她这一轮**提议撤回**的待确认项（后端 `kernel/turn.py` 的
+   * `_collect_recall_proposals`）。
+   *
+   * 只带 id 与人话说明，**不带被撤那条的正文**——撤回往往正是因为那段内容
+   * 不该再被复制一份（见 `_record_recall_proposal` 的 payload 注释）。
+   * 字段可选：旧服务端不会下发，前端按"这一轮没有提议"处理。
+   */
+  recall_proposals?: RecallProposalRef[];
+}
+
+/* ---------------------------------------------------------------- 撤回提议 */
+
+/** 提议状态。`expired` 后端目前没有人写入，但契约里有，前端照实渲染。 */
+export type RecallProposalState = 'proposed' | 'confirmed' | 'declined' | 'expired';
+
+/**
+ * 流里下发的一条撤回提议（`turn.completed` 的 `recall_proposals[]`）。
+ *
+ * 与 `RecallProposalOut`（列表接口）的区别：流里没有 `created_at`/`window_id`
+ * ——那是落库之后才有的。所以前端合并时以列表接口的记录为准，流里这条只用来
+ * "立刻把卡片挂上去"，不参与过期判断。
+ */
+export interface RecallProposalRef {
+  proposal_id: string;
+  message_id: string;
+  note?: string;
+}
+
+/** `GET /v1/sessions/{cid}/recall-proposals` 的一项（`RecallProposalOut`）。 */
+export interface RecallProposal {
+  schema_version: string;
+  proposal_id: string;
+  /** 她想撤的那条本地消息 id。 */
+  message_id: string;
+  window_id: string;
+  /** 人话："她要撤回这条，确认吗？"。 */
+  note: string;
+  created_at: string;
+}
+
+/**
+ * 撤回**执行结果**（`RecallMessageOut`）。
+ *
+ * `state` 是平台的结论，`note` 是给人看的那句话；`reason_code` 只给日志与
+ * 测试，**界面不许显示它**（本项目的通例：人话给用户，原因码给排查）。
+ */
+export interface RecallResult {
+  schema_version: string;
+  message_id: string;
+  state: 'recalled' | 'not_found' | 'expired' | 'unsupported' | 'uncertain';
+  note: string;
+  recalled_at?: string | null;
+  receipt_id?: string | null;
+  attempts?: number;
+  reason_code?: string | null;
 }
 
 /* ---------------------------------------------------------------- 设置分类法 */

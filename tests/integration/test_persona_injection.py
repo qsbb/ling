@@ -341,3 +341,130 @@ async def test_persona_api_matches_database(logged_in: TestEnv) -> None:
     first = _first_system(await _run_turn(logged_in))
     assert "你是心夏。" in first
     assert "tone：松弛" in first
+
+
+# ---------------------------------------------------------------- 8. 10 万 token 人设预算
+
+
+def test_persona_budget_is_100k_tokens() -> None:
+    """人设车道 10 万 token，其余车道不动（用户 2026-11-09 拍板）。"""
+    from ling.kernel.context import DEFAULT_BUDGETS
+
+    assert DEFAULT_BUDGETS["persona"] == 100_000
+    # 其余车道**一个都没动**：这条断言是为了防止"顺手把别的也调大"。
+    others = {k: v for k, v in DEFAULT_BUDGETS.items() if k != "persona"}
+    assert sum(others.values()) == 28_600, others
+
+
+def test_total_budget_grows_with_persona() -> None:
+    """总预算由车道和推出，所以它**跟着变大**——这是必须可预期的副作用。"""
+    from ling.kernel.context import DEFAULT_BUDGETS, _total_soft_hard
+
+    lanes = sum(DEFAULT_BUDGETS.values())
+    soft, hard = _total_soft_hard()
+    assert soft == lanes * 2
+    assert hard == int(lanes * 2 * 1.2)
+    # 改前是 38600 → 77200/92640；现在必须明显更大，否则说明没生效
+    assert soft > 200_000, soft
+
+
+def test_traits_limits_scale_with_persona_budget() -> None:
+    """traits 上限跟着人设预算放宽（否则"预算 10 万、traits 只准 4000 字"错配）。"""
+    from ling.domains.persona.service import (
+        _MAX_TRAIT_CHARS,
+        _MAX_TRAIT_ITEM_CHARS,
+        _MAX_TRAIT_ITEMS,
+    )
+
+    assert _MAX_TRAIT_ITEMS == 400
+    assert _MAX_TRAIT_ITEM_CHARS == 4000
+    assert _MAX_TRAIT_CHARS == 120_000
+    # 与车道换算口径一致：token × 2 = 字符，traits 不超过人设车道的 60%
+    from ling.kernel.context import DEFAULT_BUDGETS
+
+    persona_chars = DEFAULT_BUDGETS["persona"] * 2
+    assert persona_chars * 0.6 >= _MAX_TRAIT_CHARS
+
+
+async def test_200k_char_persona_is_injected_whole(logged_in: TestEnv) -> None:
+    """20 万字符（≈10 万 token）人设必须**完整**进提示词，不被截断。"""
+    head = "【设定开头】你是心夏。\n"
+    tail = "\n【设定结尾】始终是心夏。"
+    prompt = head + ("这是一段角色设定。" * 20000) + tail  # 180025 字符
+    assert 150_000 < len(prompt) < 200_000
+
+    response = await logged_in.client.put(
+        "/v1/persona", json={"system_prompt": prompt, "traits": {}}
+    )
+    assert response.status_code == 200, response.text[:400]
+
+    provider = await _run_turn(logged_in)
+    first = _first_system(provider)
+    assert head.strip() in first, "设定开头没进提示词"
+    assert tail.strip() in first, "设定结尾没进提示词——说明被截断了"
+    assert len(first) >= len(prompt), f"人设块只有 {len(first)} 字，少于原文 {len(prompt)}"
+    assert "已截断" not in first
+    assert "…（" not in first
+
+
+async def test_persona_over_budget_is_truncated_with_a_mark(logged_in: TestEnv) -> None:
+    """超 10 万 token：**显式截断并留痕**，不是静默砍掉。
+
+    接口上限是 200000 字符（= 车道字符上限），所以超预算只能直接写库——
+    这正好模拟"老数据/手工改库"的情形，也是车道截断真正的入口。
+    """
+    from ling.infra.models import Persona
+
+    head = "【开头】心夏。\n"
+    tail = "\n【结尾】始终是心夏。"
+    prompt = head + ("设定内容。" * 50000) + tail  # 250019 字符 > 200000
+    async with session_scope() as session:
+        row = await session.get(Persona, PERSONA)
+        assert row is not None
+        row.system_prompt = prompt
+        row.traits = {}
+        session.add(row)
+
+    provider = await _run_turn(logged_in)
+    first = _first_system(provider)
+    assert head.strip() in first, "截断不该把开头也砍掉"
+    assert tail.strip() not in first, "超预算却没截断"
+    assert "已截断" in first, "截断了但没留痕——这正是最难查的那种「没生效」"
+    # 截到车道字符上限附近（不是砍成空）
+    assert len(first) >= 200_000 - 100, len(first)
+
+
+async def test_empty_persona_still_sends_no_empty_message(logged_in: TestEnv) -> None:
+    """预算改动不能退化掉"空人设不发空 system 消息"。"""
+    from ling.infra.models import Persona
+
+    async with session_scope() as session:
+        row = await session.get(Persona, PERSONA)
+        assert row is not None
+        row.system_prompt = ""
+        row.traits = {}
+        session.add(row)
+
+    provider = await _run_turn(logged_in)
+    assert all(
+        str(getattr(m, "content", "")).strip() for m in provider.requests[0]
+    ), "提示词里有空消息"
+    assert "性格倾向" not in _system_text(provider)
+
+
+async def test_traits_report_matches_what_went_in(logged_in: TestEnv) -> None:
+    """`traits_report()` 与实际渲染一致（同一份上限，不另算一遍）。"""
+    from ling.domains.persona.service import traits_report
+
+    traits = {f"特征{i}": f"第{i}条性格设定" for i in range(1, 31)}
+    response = await logged_in.client.put("/v1/persona", json={"traits": traits})
+    assert response.status_code == 200, response.text
+
+    report = traits_report(traits)
+    assert report["declared_items"] == 30
+    assert report["rendered_items"] == 30
+    assert report["truncated"] is False
+
+    first = _first_system(await _run_turn(logged_in))
+    for index in range(1, 31):
+        assert f"第{index}条性格设定" in first, f"第 {index} 条没进提示词"

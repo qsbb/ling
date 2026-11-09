@@ -1,0 +1,50 @@
+{
+  "$id": "https://ling.local/contracts/v1/RecallProposalOut.schema.json",
+  "additionalProperties": false,
+  "description": "她提议撤回、等用户确认的一条（`operations.kind='message_recall_proposal'`）。\n\n## 为什么单独一个契约而不是复用 `RecallMessageOut`\n\n那个描述的是\"撤回**已经执行**的结果\"（有 state/recall receipt/attempts）；\n这个描述的是\"她想撤，但还没执行\"。把两者塞进一个模型，前端就得靠\n`state` 猜\"这条到底撤没撤\"——而\"猜错一次就是把待确认当成已撤回\"。",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "message_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Message Id",
+      "type": "string"
+    },
+    "note": {
+      "title": "Note",
+      "type": "string"
+    },
+    "proposal_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Proposal Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "window_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Window Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "proposal_id",
+    "message_id",
+    "window_id",
+    "note",
+    "created_at"
+  ],
+  "title": "RecallProposalOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

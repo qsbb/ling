@@ -3313,3 +3313,207 @@ button {
     display: none;
   }
 }
+
+/* -------------------------------------------------------------------------
+   「她想撤回这条」确认卡片 + 已撤回气泡。
+
+   为什么追加在文件末尾：这些都是新增选择器（`recall-` / `message__recalled`），
+   不改既有规则；`.message__bubble--recalled` 也只是叠加在气泡上的一层。
+
+   两条约束写在样式里：
+   - 卡片不能把消息列撑宽（375px 下必须不横向溢出）；
+   - 过期的卡片**视觉上明显不可操作**（按钮直接不渲染，整体降权），
+     不能只是"看起来还能点、点了报错"。
+   ---------------------------------------------------------------------- */
+
+.message__recall {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 0 2px;
+  min-width: 0;
+}
+
+.recall-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(520px, 100%);
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--warn);
+  border-radius: 10px;
+  background: var(--paper-raised);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+/* 已撤回 / 已放弃：不再是"待你操作"，把警示色条换成中性色。 */
+.recall-card[data-status='confirmed'],
+.recall-card[data-status='declined'],
+.recall-card[data-status='gone'] {
+  border-left-color: var(--line-strong);
+  background: var(--paper-sunken);
+  opacity: 0.85;
+}
+
+/* 过期：按钮不渲染，整卡再降一档——它只是"曾经有过这么个提议"的记录。 */
+.recall-card[data-status='expired'] {
+  border-left-color: var(--line-strong);
+  opacity: 0.72;
+}
+
+/* 失败：用警示色，但**不用错误红**——撤回失败通常不是故障（渠道不支持 / 超时）。 */
+.recall-card[data-status='failed'] {
+  border-left-color: var(--danger);
+}
+
+.recall-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.recall-card__title {
+  font-family: var(--font-serif);
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recall-card__state {
+  flex: none;
+  font-size: 10.5px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-faint);
+  background: rgba(255, 255, 255, 0.6);
+  white-space: nowrap;
+}
+
+/*
+ * 被撤那条的摘要：两行截断。
+ *
+ * 用 `-webkit-line-clamp` 而不是 JS 截断：中文正文按字数截会把词切断，
+ * 而按行截由浏览器排版决定，长短都好看。
+ */
+.recall-card__excerpt {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.035);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.recall-card__excerpt--missing {
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.recall-card__status {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.recall-card__hint {
+  margin-left: 4px;
+  opacity: 0.85;
+}
+
+.recall-card__note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.recall-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* 窄屏：按钮至少 44px 高（可点范围），且不并排挤成两行小字。 */
+@media (max-width: 560px) {
+  .recall-card {
+    max-width: 100%;
+  }
+
+  .recall-card__actions .button {
+    min-height: 44px;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+
+/* 降级卡：只在卡片区，不抢聊天的视觉重心。 */
+.recall-card--unavailable {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-left-color: var(--line-strong);
+  color: var(--ink-faint);
+}
+
+.messages__recall-orphans,
+.messages__recall-unavailable {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 4px 0 0;
+}
+
+.messages__recall-orphans-title {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------ 已撤回的气泡 */
+
+/*
+ * 撤回不是"没生成"：正文照常显示（用户要能确认撤的是哪一句），
+ * 只把整体降权 + 顶部一个徽标。
+ */
+.message__bubble--recalled {
+  border-style: dashed;
+  background: var(--paper-sunken);
+}
+
+.message__bubble--recalled .message__text {
+  color: var(--ink-faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong);
+}
+
+.message__recalled {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0 6px;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  background: rgba(255, 255, 255, 0.6);
+}

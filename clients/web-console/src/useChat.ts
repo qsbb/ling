@@ -7,11 +7,18 @@
  * - 停止后不再追加文本（即使还有迟到的 delta）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, ApiError } from './api';
+import { api, ApiError, serverNowMsFromResponse } from './api';
 import { explainError, type ExplainedError } from './errors';
 import { newClientTurnId } from './format';
 import { navigate, routePath } from './route';
 import { consumeSse, StreamAbortError, StreamTimeoutError } from './sse';
+import {
+  mergeRecallProposals,
+  proposalFromServer,
+  proposalsFromFinal,
+  recallExpired,
+  type RecallProposalView,
+} from './recall';
 import type {
   ChatMessage,
   DeltaData,
@@ -52,6 +59,16 @@ export interface UiMessage {
   senderName: string | null;
   /** 发言人的平台号码（QQ 号）。界面上和名字分两行，不挤成 `@号码 名字`。 */
   senderId: string | null;
+  /**
+   * 这条消息已被撤回的时刻（`null` = 没撤）。
+   *
+   * 两个来源合并成一个字段：她自己收回了（`recalled_at`）优先，其次是对方
+   * 撤回（`retracted_at`）。界面只需要"这条已经不在平台上了"这一个事实；
+   * 谁撤的在措辞上区分（她撤的才可能出现在「她想撤回」的上下文里）。
+   */
+  recalledAt: string | null;
+  /** 是她自己撤回的（区别于"对方撤回"）。 */
+  recalledByActor: boolean;
 }
 
 export interface LiveTurn {
@@ -108,6 +125,10 @@ function buildServerMessage(message: ChatMessage): UiMessage {
         : null,
     senderName: optionalText(message.sender_name),
     senderId: optionalText(message.sender_id),
+    // 她自己撤回优先：`recalled_at` 非空说明这条是她的发言被收回，
+    // 此时 `retracted_at` 不该覆盖它（那是"对方撤回"，语义不同）。
+    recalledAt: optionalText(message.recalled_at) ?? optionalText(message.retracted_at),
+    recalledByActor: Boolean(optionalText(message.recalled_at)),
   };
 }
 
@@ -137,6 +158,8 @@ function emptyActor(key: string, turnId: string | null): UiMessage {
     silenceReason: null,
     senderName: null,
     senderId: null,
+    recalledAt: null,
+    recalledByActor: false,
   };
 }
 
@@ -170,6 +193,16 @@ export interface ChatState {
   renameSession: (sessionId: string, title: string) => Promise<void>;
   selectSession: (sessionId: string) => void;
   dismissNotice: () => void;
+  /** 她提议撤回、还没处理完的（挂在对应消息下面）。 */
+  recallProposals: RecallProposalView[];
+  /** 撤回提议列表读不到（只影响卡片区，聊天照常）。 */
+  recallProposalsUnavailable: boolean;
+  /** 手动重拉撤回提议列表。 */
+  reloadRecallProposals: () => void;
+  /** 点「撤回」：真的执行，成功/失败都收敛到卡片状态上。 */
+  confirmRecall: (proposal: RecallProposalView) => void;
+  /** 点「算了」：只把提议标成 declined。 */
+  declineRecall: (proposal: RecallProposalView) => void;
 }
 
 export function useChat(
@@ -185,12 +218,15 @@ export function useChat(
   const [bootstrapping, setBootstrapping] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadError, setLoadError] = useState<ExplainedError | null>(null);
+  const [recallProposals, setRecallProposals] = useState<RecallProposalView[]>([]);
+  const [recallProposalsUnavailable, setRecallProposalsUnavailable] = useState(false);
 
   const currentIdRef = useRef<string | null>(null);
   const liveRef = useRef<LiveTurn | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<UiMessage[]>([]);
   const activeTurnRef = useRef<TurnView | null>(null);
+  const recallProposalsRef = useRef<RecallProposalView[]>([]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -199,6 +235,41 @@ export function useChat(
   useEffect(() => {
     activeTurnRef.current = activeTurn;
   }, [activeTurn]);
+
+  useEffect(() => {
+    recallProposalsRef.current = recallProposals;
+  }, [recallProposals]);
+
+  /**
+   * 合并一批撤回提议（**按 `proposal_id` 去重**）。
+   *
+   * 为什么要走 ref 再写 state：同一轮 final 可能重复到达（幂等重放、断线
+   * 重连、SSE 重放），而 `setState` 的 updater 里读 `prev` 是安全的——但
+   * `applyFinal` 是普通函数、同一 tick 里可能连调两次，用 ref 保证第二次
+   * 看到的是第一次的结果。终态（已撤回/已放弃/过期）不会被翻回待确认。
+   */
+  const addRecallProposals = useCallback((incoming: RecallProposalView[]) => {
+    if (incoming.length === 0) return;
+    setRecallProposals((prev) => {
+      const next = mergeRecallProposals(prev, incoming);
+      recallProposalsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  /** 把某条提议推进到新状态（不可变更新，保持顺序）。 */
+  const patchRecallProposal = useCallback(
+    (proposalId: string, patch: Partial<RecallProposalView>) => {
+      setRecallProposals((prev) => {
+        const next = prev.map((item) =>
+          item.proposalId === proposalId ? { ...item, ...patch } : item,
+        );
+        recallProposalsRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
 
   const commitLive = useCallback((next: LiveTurn | null) => {
     liveRef.current = next;
@@ -235,6 +306,32 @@ export function useChat(
     if (sessionId) void loadMessages(sessionId);
   }, [loadMessages]);
 
+  /**
+   * 拉一次「她想撤回」的待确认列表。
+   *
+   * 为什么要有这条：流式事件只在一轮结束时给一次，关掉标签页就再也看不到了，
+   * 而提议本身还挂在库里等人确认。所以**切换会话时与刷新消息时都要拉一次**。
+   *
+   * 失败**只影响卡片区**：`recallProposalsUnavailable` 单独一个标志，
+   * 聊天主流程（收发消息）一点都不该被它拖住——撤回提议读不到和"她不能说话"
+   * 是两件事。
+   */
+  const loadRecallProposals = useCallback(async (sessionId: string) => {
+    if (!sessionId) return;
+    try {
+      const { items, serverNowMs } = await api.recallProposals(sessionId);
+      if (currentIdRef.current !== sessionId) return;
+      const nowMs = Date.now();
+      addRecallProposals(items.map((item) => proposalFromServer(item, serverNowMs, nowMs)));
+      setRecallProposalsUnavailable(false);
+    } catch (error) {
+      if (currentIdRef.current !== sessionId) return;
+      const explained = explainError(error);
+      if (explained.code === 'unauthorized') return;
+      setRecallProposalsUnavailable(true);
+    }
+  }, [addRecallProposals]);
+
   /* ------------------------------------------------------------ 首次/切换会话 */
   useEffect(() => {
     let cancelled = false;
@@ -245,6 +342,11 @@ export function useChat(
     setMessages([]);
     setCurrentId(null);
     currentIdRef.current = null;
+    // 撤回提议是**按会话**的：切会话必须先清空，否则上一个会话的卡片会挂到
+    // 新会话的消息下面（挂错消息比不显示更糟——用户会以为她要撤的是新那条）。
+    setRecallProposals([]);
+    recallProposalsRef.current = [];
+    setRecallProposalsUnavailable(false);
     setBootstrapping(true);
 
     (async () => {
@@ -271,7 +373,7 @@ export function useChat(
         currentIdRef.current = target;
         setCurrentId(target);
         setBootstrapping(false);
-        await loadMessages(target);
+        await Promise.all([loadMessages(target), loadRecallProposals(target)]);
       } catch (error) {
         if (cancelled) return;
         const explained = explainError(error);
@@ -283,7 +385,7 @@ export function useChat(
     return () => {
       cancelled = true;
     };
-  }, [routeSessionId, loadMessages, commitLive]);
+  }, [routeSessionId, loadMessages, loadRecallProposals, commitLive]);
 
   useEffect(
     () => () => {
@@ -328,6 +430,14 @@ export function useChat(
       let turnId = options.turnId;
       let accumulated = '';
       let terminal = false;
+      /**
+       * 这条 SSE 响应的服务端时刻（HTTP `Date` 头）。
+       *
+       * 流里下发的 `recall_proposals` **没有 `created_at`**（那是落库字段），
+       * 而"还能撤几秒"必须用服务端时钟算。拿这一轮响应的 `Date` 当头锚，
+       * 误差只有请求往返的一瞬；拿不到时退回本机时钟并在卡片上注明。
+       */
+      let streamServerNowMs: number | null = null;
 
       commitLive({
         kind,
@@ -437,6 +547,32 @@ export function useChat(
             local: false,
           });
         }
+        /*
+         * 她这一轮提议撤回的待确认项：**立刻挂卡片**，然后补一次列表。
+         *
+         * 流里只给 `{proposal_id, message_id, note}`，没有 `created_at`，
+         * 也不含状态（别处可能已经处理过）。所以这里的职责只有两条：
+         * 1. 让卡片**当场出现**（不必等一次额外请求——等一次就等于让用户
+         *    在一两秒里看不到她刚提的撤回）；
+         * 2. 紧接着拉一次列表，用权威的 `created_at` 覆盖掉用回复时刻顶上的
+         *    那个代理值，顺便把别处已处理的状态收进来。
+         */
+        if (owned()) {
+          const nowMs = Date.now();
+          // 代理时刻：她这条回复的落库时间（提议正是在这一轮写下来的）。
+          const fallbackCreatedAt = serverMessage?.created_at ?? new Date(nowMs).toISOString();
+          const incoming = proposalsFromFinal(
+            data.recall_proposals,
+            fallbackCreatedAt,
+            streamServerNowMs,
+            nowMs,
+          );
+          if (incoming.length > 0) {
+            addRecallProposals(incoming);
+            void loadRecallProposals(sessionId);
+          }
+        }
+
         setActiveTurn(null);
         if (userKey) updateUser({ state: 'completed', local: false });
       };
@@ -500,6 +636,7 @@ export function useChat(
           kind === 'send'
             ? await api.sendTurn(sessionId, options.clientTurnId ?? '', options.text ?? '', controller.signal)
             : await api.retryTurn(turnId ?? '', controller.signal);
+        streamServerNowMs = serverNowMsFromResponse(response);
         await consumeSse(response, handleEvent, {
           signal: controller.signal,
           idleMs: STREAM_IDLE_MS,
@@ -572,7 +709,7 @@ export function useChat(
           .catch(() => undefined);
       }
     },
-    [commitLive, loadMessages, onTestMode],
+    [addRecallProposals, commitLive, loadMessages, loadRecallProposals, onTestMode],
   );
 
   /* ------------------------------------------------------------ 用户动作 */
@@ -607,6 +744,8 @@ export function useChat(
           silenceReason: null,
           senderName: null,
           senderId: null,
+          recalledAt: null,
+          recalledByActor: false,
         },
       ]);
       void pump({
@@ -786,6 +925,119 @@ export function useChat(
     navigate(routePath({ name: 'chat', sessionId }));
   }, []);
 
+  const reloadRecallProposals = useCallback(() => {
+    const sessionId = currentIdRef.current;
+    if (sessionId) void loadRecallProposals(sessionId);
+  }, [loadRecallProposals]);
+
+  /**
+   * 点「撤回」：先看时间窗，再真的执行。
+   *
+   * 为什么**前端也要判一次**（后端本来就会判）：让用户点一个注定失败的按钮，
+   * 比一开始就写"来不及"更糟。这里的判据与卡片显示用的是同一个纯函数
+   * （`recallExpired`），不会出现"按钮能点但点了必失败"的错位。
+   *
+   * 请求在飞时状态是 `pending`：按钮禁用，防止双击变成两次不可逆请求。
+   */
+  const confirmRecall = useCallback(
+    (proposal: RecallProposalView) => {
+      const sessionId = currentIdRef.current;
+      if (!sessionId) return;
+      if (proposal.status === 'pending') return;
+      // 窗口外直接收敛到 expired，**不发请求**。
+      if (recallExpired(proposal, Date.now())) {
+        patchRecallProposal(proposal.proposalId, { status: 'expired' });
+        return;
+      }
+      patchRecallProposal(proposal.proposalId, { status: 'pending', failureNote: null });
+      void api
+        .confirmRecall(sessionId, proposal.proposalId)
+        .then((result) => {
+          if (currentIdRef.current !== sessionId) return;
+          if (result.state === 'recalled') {
+            patchRecallProposal(proposal.proposalId, { status: 'confirmed', failureNote: null });
+            /*
+             * 被撤那条在气泡上要能看出来。
+             *
+             * **不改 `state`**：撤回不是"生成失败/被停止"，把它改成 stopped
+             * 会让界面显示「已停止，未生成内容」——而那条内容是真实生成过的，
+             * 只是现在平台上看不到了。单独一个 `recalledAt` 才不会篡改事实。
+             */
+            const targetId = result.message_id || proposal.messageId;
+            const recalledAt = result.recalled_at ?? new Date().toISOString();
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.messageId === targetId
+                  ? { ...message, recalledAt, recalledByActor: true }
+                  : message,
+              ),
+            );
+            return;
+          }
+          // 其余四种状态各说各的：expired 是"来不及"，unsupported 是"这个渠道
+          // 不支持"，uncertain 是"没拿到回执，不敢说成功"。
+          if (result.state === 'expired') {
+            patchRecallProposal(proposal.proposalId, {
+              status: 'expired',
+              failureNote: result.note || null,
+            });
+            return;
+          }
+          patchRecallProposal(proposal.proposalId, {
+            status: 'failed',
+            failureNote: result.note || null,
+          });
+        })
+        .catch((error: unknown) => {
+          if (currentIdRef.current !== sessionId) return;
+          const explained = explainError(error);
+          if (explained.code === 'not_found') {
+            // 提议已经不在了（别处处理过 / 被清理）：卡片留着但不可点。
+            patchRecallProposal(proposal.proposalId, { status: 'gone' });
+            return;
+          }
+          if (explained.code === 'conflict') {
+            // 409 = 已经处理过（并发双击、另一个标签页先点了）。
+            patchRecallProposal(proposal.proposalId, {
+              status: 'gone',
+              failureNote: '这条已经处理过了',
+            });
+            return;
+          }
+          patchRecallProposal(proposal.proposalId, {
+            status: 'failed',
+            failureNote: explained.reason,
+          });
+        });
+    },
+    [patchRecallProposal],
+  );
+
+  const declineRecall = useCallback(
+    (proposal: RecallProposalView) => {
+      const sessionId = currentIdRef.current;
+      if (!sessionId) return;
+      if (proposal.status === 'pending') return;
+      patchRecallProposal(proposal.proposalId, { status: 'pending', failureNote: null });
+      void api
+        .declineRecall(sessionId, proposal.proposalId)
+        .then(() => {
+          if (currentIdRef.current !== sessionId) return;
+          patchRecallProposal(proposal.proposalId, { status: 'declined', failureNote: null });
+        })
+        .catch((error: unknown) => {
+          if (currentIdRef.current !== sessionId) return;
+          const explained = explainError(error);
+          // 拒绝失败时退回"待确认"：不能因为一次网络抖动就把她的提议吞掉。
+          patchRecallProposal(proposal.proposalId, {
+            status: explained.code === 'not_found' ? 'gone' : 'proposed',
+            failureNote: explained.code === 'not_found' ? '这条已经处理过了' : null,
+          });
+        });
+    },
+    [patchRecallProposal],
+  );
+
   const dismissNotice = useCallback(() => setNotice(null), []);
 
   return {
@@ -808,5 +1060,10 @@ export function useChat(
     renameSession,
     selectSession,
     dismissNotice,
+    recallProposals,
+    recallProposalsUnavailable,
+    reloadRecallProposals,
+    confirmRecall,
+    declineRecall,
   };
 }

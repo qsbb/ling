@@ -34,6 +34,9 @@
 | GET | `/v1/sessions/{id}/messages?limit=50&before_sequence=N` | `{messages: ChatMessage[], active_turn: TurnView \| null}` |
 | GET | `/v1/messages/{message_id}/prompt` | 「查看本次提示词」：这条回复当时真正发给模型的上下文（只读、owner 限定，见 §12） |
 | POST | `/v1/sessions/{conversation_id}/messages/{message_id}/recall` | **撤回她自己发出去的那条**（owner only，见 §3A） |
+| GET | `/v1/sessions/{id}/recall-proposals` | 她提议撤回、**等用户确认**的那些（见 §3B） |
+| POST | `/v1/sessions/{id}/recall-proposals/{pid}/confirm` | 确认 → 真的撤回（走同一条工具 handler） |
+| POST | `/v1/sessions/{id}/recall-proposals/{pid}/decline` | 不要撤 → `204`，**平台零调用** |
 
 `ChatMessage` 来自 `contracts/v1`。`TurnView`：
 
@@ -121,13 +124,49 @@ data: {"turn_id":"turn_...","error":{"code":"provider_timeout","message":"...","
 `recalled_at`（**她**撤回，本次新增）、`recall_state`（最后一次尝试的结果）。
 前端画"已撤回"徽标用这两个时间戳；两者都非空时以 `recalled_at` 为准。
 
-**为什么"她自己决定撤回"不开放给模型**：撤回是对已发生交互的补救，让模型
-判断"这句说错了"意味着它要评估自己的输出，而它对自己的错误没有可靠判据——
-错判一次就是替用户删掉一条正常回复。本轮只有用户手动入口；下一阶段若开放，
-需单独授权（模型只能提议、owner 确认）。
+**模型侧只能提议，不能执行**：撤回是对已发生交互的补救，让模型判断"这句说错了"
+意味着它要评估自己的输出，而它对自己的错误没有可靠判据——错判一次就是替用户
+删掉一条正常回复。所以 `message.recall` 虽然**注册成了工具**（见 §3B），但
+`requires_confirmation=True`：`ToolRegistry.call(confirmed=False)` 在进 handler
+**之前**就返回 `needs_confirmation`，模型连执行的机会都没有。
 
 完整口径（五道闸、回执五态、上下文注记、审计字段）见
-`docs/BEHAVIOR-LOG-CONTRACT.md` §4A。
+`docs/BEHAVIOR-LOG-CONTRACT.md` §4A；标记语法与确认流程见 `docs/RECALL-TOOL.md`。
+
+### 3B. 撤回工具与待确认提议
+
+`GET /v1/tools` 里能看到 `message.recall`：
+
+```json
+{ "tool_id": "message.recall", "version": "1.0.0",
+  "risk": "irreversible", "requires_confirmation": true, "reversible": false,
+  "description": "撤回她自己发出去的一条消息。不可逆，必须由用户确认后才执行；…" }
+```
+
+她在回复里写 `<<撤回 rXXXX>>`（或 `<<撤回>>` = 最近一条）→ 代码把标记**从正文里
+剥掉**，并落一条待确认项。网页据此画「她要撤回这条，确认吗？」：
+
+```
+GET /v1/sessions/{id}/recall-proposals
+→ [{ "schema_version": "v1", "proposal_id": "recall_...",
+     "message_id": "msg_...", "window_id": "win_...",
+     "note": "她要撤回这条，确认吗？", "created_at": "..." }]
+```
+
+| 方法 | 路径 | 结果 |
+| --- | --- | --- |
+| POST | `.../recall-proposals/{pid}/confirm` | 200 `RecallMessageOut`（与手端点同形）；`409` 已处理过；`403` 非 owner；`404` 不在这窗口 |
+| POST | `.../recall-proposals/{pid}/decline` | `204`；提议标 `declined`，**平台零调用** |
+
+**确认后跑的是同一个工具 handler**（`confirmed=True`），也就是与
+`POST .../messages/{mid}/recall` **同一套五道闸**——不是第二个执行入口。
+
+**为什么确认不走 `POST /v1/tools/message.recall/call`**：那条通用端点是给
+运维/调试用的，它需要调用方自己带 `args` 与 `window_id`；而这里要的是
+"从一条具体提议出发、只撤那一条"。两者共用 handler，但入口不同。
+
+`recall_proposals` 也会出现在 SSE 的 `turn.completed` 事件里（`{proposal_id,
+message_id, note}`），网页可以在回复到达的同一条事件里直接画确认框。
 
 ## 4. 模型设置
 

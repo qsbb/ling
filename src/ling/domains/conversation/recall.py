@@ -18,12 +18,24 @@
 5. **不可撤回的对象**：系统/占位消息（`origin` 是外部观测或正文为空）、
    别人的消息、已经撤过一次的（幂等，不重复发 action）。
 
-## 为什么"她自己决定撤回"这一轮不开
+## 模型侧怎么参与：**只能提议，不能执行**
 
-撤回是对**已发生交互**的补救。让模型自己判断"这句说错了"意味着它要评估
-自己刚才的输出，而它对自己的错误没有可靠判据——错判一次就是替用户删掉一条
-正常回复。所以本轮只开放**用户手动**入口（owner only），模型侧留到下一阶段
-单独授权（见 `docs/BEHAVIOR-LOG-CONTRACT.md`）。
+用户拍板「撤回消息只做注册工具开放给 llm」。但"开放给模型"不等于"模型能直接
+撤"——撤回不可逆，而模型对自己刚才的输出没有可靠判据，错判一次就是替用户
+删掉一条正常回复。所以这里的分工是：
+
+1. 模型在回复里写标记 ``<<撤回 r3f2a1>>``（或 ``<<撤回>>`` = 上一条）；
+2. 代码把标记**从正文里剥掉**（用户永远看不到这行说明书），并落一条
+   ``operations(kind="message_recall", state="proposed")`` = **待确认项**；
+3. 网页把它显示成「她要撤回这条，确认吗？」；
+4. **用户点确认**才走下面那五道闸并真的发 ``delete_msg``。
+
+也就是说 ``ToolSpec.requires_confirmation=True`` 不是装饰：``ToolRegistry.call``
+在 ``confirmed=False`` 时**根本不会执行 handler**，只回 ``needs_confirmation``。
+模型能做的只有"提议"，执行权始终在用户手上。
+
+标记语法、确认流程、以及"为什么不用 function-calling"见
+``docs/RECALL-TOOL.md``。
 
 ## 本地只标记、不删行
 
@@ -36,6 +48,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -50,6 +63,7 @@ from ling.contracts.v1 import (
     OutboundRecallState,
     RecallReceipt,
 )
+from ling.kernel.marker_stream import PENDING_MARKER_RE
 from ling.ports.channel import ChannelConnector, ChannelError, RecallRequest
 
 logger = logging.getLogger("ling.domains.conversation.recall")
@@ -345,6 +359,15 @@ def check_recallable_message(row: object) -> None:
     只认 ``role="actor"``：她自己的话。用户消息一律拒——那是"撤回别人的话"，
     不在授权范围内（对方要撤回自己走平台，不经过我们）。
     """
+    # **已撤回的直接拒**（防御性，不依赖上游先判）。
+    #
+    # 上游 `resolve_recall_target` 也判这一条，但那是"调用顺序"上的保证：
+    # 任何新入口（工具 handler、将来的批量接口）只要漏掉那一步，就会对着一条
+    # 已经撤过的消息再发一次 `delete_msg`。放在这个纯函数里，任何走到这里的
+    # 路径都过不去——判据只有一份，且它必然被执行。
+    if getattr(row, "recalled_at", None) is not None:
+        raise RecallRejected("already_recalled", refusal_note("already_recalled"))
+
     role = str(getattr(row, "role", ""))
     if role != "actor":
         raise RecallRejected("not_actor_message", refusal_note("not_actor_message"), status_code=403, http_code=ErrorCode.forbidden)
@@ -401,6 +424,26 @@ async def perform_recall(
     3. **落标记**：只有 ``recalled`` 才写 ``recalled_at``。``uncertain`` 写
        ``recall_attempted_at``（新列）——"我们试过但没确认"与"撤回了"必须
        在库里也能分开，否则下次重试会看到"已撤回"而跳过。
+
+    ## ``uncertain`` 的重试语义（**不幂等，别当成幂等**）
+
+    ``uncertain`` 是"我们发了 delete_msg 但没拿到回答"（超时/断连/非 JSON）。
+    这时允许用户再点一次——**但那会真的再发一次 delete_msg**，对着一条
+    平台上可能已经不存在的消息。我们**没有**可靠的核对办法：
+
+    - OneBot 没有"这条被撤回过吗"的查询 API（``get_msg`` 查已删除的消息会
+      直接"消息不存在"，而"没被撤过但 id 过期"的返回**一模一样**——两个
+      签名分不开，拿它当判据等于猜）；
+    - ``get_group_msg_history`` 只能比对"历史里还在不在"，同样分不开
+      "撤掉了"与"id 过期/被刷出 FIFO"。
+
+    所以如实写清楚：**重试可能对一条已删除的消息再撤一次**，NapCat 会回
+    "消息不存在" → 我们据此写 ``not_found``（这时**不**写 ``recalled_at``）。
+    这是可接受的：最坏结果是用户看到"这条已经不在平台上了"，而平台侧没有
+    任何副作用（重复 delete 一条已删消息是空操作）。
+
+    **绝不能**把它做成"写了 recalled_at 就算成功"来假装幂等——那会把一次
+    超时永久记成"撤回了"，而它可能根本没撤掉。
     """
     from ling.infra.models import Message
 
@@ -491,6 +534,109 @@ async def perform_recall(
     )
 
 
+# ---------------------------------------------------------------- 标记解析
+#
+# 模型侧唯一的入口：在回复正文里写标记。**为什么是标记而不是 function-calling**：
+# `ModelRequest`（`ports/model.py`）没有 tools 字段，各 provider 适配器也没有
+# 实现工具调用；而仓库里"她决定做某事"的既有范式就是标记（`<<看视频 mXXXX>>`，
+# 见 `domains/media/video.py`）。沿用同一种形状，解析、剥离、流式暂扣那套
+# 代码路径都能复用，不需要为撤回单独造一条通道。
+#
+# 语法（刻意与看视频那条**互不重叠**）：
+#
+#     <<撤回 r3f2a1>>     撤上面标着 [msg_id:r3f2a1] 的那条
+#     <<撤回>>            撤她自己**最近一条**发出去的消息
+#
+# 短号用 `r` 前缀（`r` = recall），和看视频的 `m` 前缀分开：两条标记如果长得
+# 像，模型会写错、正则也会互相吞。短号本身由 `msg_id` token 决定（同一 token
+# 永远同一个短号），不需要额外存表。
+
+#: 撤回标记。``[A-Za-z0-9_-]{1,16}`` 覆盖 `r3f2a1` 与模型可能写的数字 id。
+RECALL_MARKER_RE = re.compile(r"<<\s*撤回(?:\s+([A-Za-z0-9_-]{1,32}))?\s*>>")
+
+#: 流式过滤：以 ``<<`` 开头、还没等到 ``>>`` 的尾巴（可能是半个撤回标记）。
+#:
+#: **与看视频那条共用同一个定义**（`kernel/marker_stream.py`），不在这里再写
+#: 一份。原来这里写的是 ``r"<<[^<>]*>?$"``——和 video 那边同形的宽松版本，会把
+#: ``1<<2 就是 4`` 这种正常正文当半截标记吞掉。之所以放在 kernel 而不是从
+#: `domains/media/video.py` 取：域之间不许互相 import（
+#: `tests/unit/test_domain_boundaries.py` 会拦），而 kernel 谁都能 import。
+_PENDING_RECALL_RE = PENDING_MARKER_RE
+
+#: 标记里的短号前缀。`msg_id` token 本身就是 `m`+6 位（见 `context.py`），
+#: 所以这里把 `m` 换成 `r`，两条标记不会互相匹配。
+RECALL_REF_PREFIX = "r"
+
+
+def recall_ref_for(message_token: str) -> str:
+    """上下文里的 `[msg_id:…]` token → 撤回标记里的短号。
+
+    纯函数：``m3f2a1`` → ``r3f2a1``。不是 `m` 开头（例如模型自己编的 id）就
+    原样加前缀，让"编的 id"在解析时自然对不上——**对不上就是没这条**，
+    静默退化，不猜。
+    """
+    token = (message_token or "").strip()
+    if not token:
+        return ""
+    if token.startswith("m") and len(token) > 1:
+        return RECALL_REF_PREFIX + token[1:]
+    return RECALL_REF_PREFIX + token
+
+
+def parse_recall_markers(text: str) -> tuple[str, list[str]]:
+    """取出所有 ``<<撤回 …>>`` 标记，返回 (剥掉标记后的文本, 短号列表)。
+
+    ``None`` 短号（``<<撤回>>``）用空串表示"撤最近一条"。
+    幂等：对已经剥过的文本再调一次，得到同样的文本与空列表。
+    """
+    if not text:
+        return "", []
+    refs: list[str] = []
+    for match in RECALL_MARKER_RE.finditer(text):
+        refs.append((match.group(1) or "").strip())
+    cleaned = RECALL_MARKER_RE.sub("", text)
+    # 标记剥掉后常在原处留一串空格；收成单个空格。换行不动。
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned, refs
+
+
+def strip_recall_markers(text: str) -> str:
+    """只剥标记（出口用）。幂等。"""
+    return parse_recall_markers(text)[0]
+
+
+def stream_safe_recall(text: str) -> tuple[str, str]:
+    """流式过滤：返回 (可以立刻发出去的部分, 需要暂扣的尾巴)。
+
+    与 `domains/media/video.py::stream_safe` 同一套判据，只是正则换成撤回那条。
+    两处各写一份而不是抽公共函数，是因为它们的"半个标记"判定要跟着各自的
+    语法走（`<<看视频 m` vs `<<撤回 r`）——抽出来反而要多传一个正则参数。
+    """
+    if not text:
+        return "", ""
+    head, sep, tail = text.rpartition("<<")
+    if not sep:
+        if text.endswith("<"):
+            return text[:-1], "<"
+        return text, ""
+    if ">>" in tail or not _PENDING_RECALL_RE.match(sep + tail):
+        return text, ""
+    return head, sep + tail
+
+
+def drop_partial_recall_marker(text: str) -> str:
+    """去掉**没写完的**撤回标记尾巴（``<<撤回 r3`` 这种半截）。"""
+    if not text:
+        return ""
+    match = _PENDING_RECALL_RE.search(text)
+    return text[: match.start()] if match else text
+
+
+def finalize_recall_text(text: str) -> str:
+    """出口的最终清洗：剥完整撤回标记 + 去半截标记 + 去行尾空白。幂等。"""
+    return drop_partial_recall_marker(strip_recall_markers(text)).rstrip(" \t")
+
+
 # ---------------------------------------------------------------- 审计
 
 
@@ -551,6 +697,112 @@ def audit_recall_refused(
     )
 
 
+async def recallable_refs(
+    session: AsyncSession, *, window_id: str, limit: int = 3
+) -> list[tuple[str, str]]:
+    """这个窗口里**她最近说得出来、还撤得动**的几条：``[(本地消息 id, 短号)]``。
+
+    给上下文用：只有这些才在她的历史里带 ``[recall:rXXXX]`` 标记。**先查真能
+    撤的、再标**，而不是"标了再说"——后者正是"列了做不到的动作"那种坑：
+    她照着标记写 ``<<撤回 rXXXX>>``，结果五道闸拒掉，用户看到的是"她要撤，
+    但撤不了"。
+
+    与 :func:`recallable_message_ids` 的区别：那个给前端画按钮（整个窗口），
+    这个给提示词（只取最近 ``limit`` 条，且**带短号**）。两处判据共用
+    `_plan_id_for_message` / `_receipts_for_plan`，不各写一套。
+
+    故意**不判时间窗与频次**（同 `recallable_message_ids`）：那两项每秒都在变，
+    算进来会让"标记了但点不动"。真正执行时由 `resolve_recall_target` 判。
+    """
+    from ling.infra.models import DeliveryReceiptRow, Message, Operation
+
+    rows = list(
+        (
+            await session.execute(
+                select(Message)
+                .where(
+                    Message.window_id == window_id,
+                    Message.role == "actor",
+                    Message.recalled_at.is_(None),
+                )
+                .order_by(Message.sequence.desc())
+                .limit(max(limit * 4, 8))
+            )
+        ).scalars()
+    )
+    candidates = [
+        row
+        for row in rows
+        if str(row.origin or "") not in NON_RECALLABLE_ORIGINS
+        and str(row.text or "").strip()
+        and row.turn_id
+    ]
+    if not candidates:
+        return []
+
+    # **一条 SQL 拿到"哪些 reply_plan 真有回执"**，而不是每条消息查两遍。
+    # 这个函数每轮都会跑（上下文要给她标记），N+1 会把它变成每轮十几次查询。
+    plans = {f"plan_{row.turn_id}" for row in candidates}
+    delivered = set(
+        (
+            await session.execute(
+                select(cast(Operation.payload["reply_plan"], SAString))
+                .join(DeliveryReceiptRow, DeliveryReceiptRow.operation_id == Operation.id)
+                .where(
+                    Operation.kind == "delivery",
+                    cast(Operation.payload["reply_plan"], SAString).in_(
+                        [f'"{plan}"' for plan in plans]
+                    ),
+                    DeliveryReceiptRow.state.in_(tuple(DELIVERABLE_STATES)),
+                    DeliveryReceiptRow.platform_message_id.is_not(None),
+                )
+            )
+        ).scalars()
+    )
+    delivered_plans = {str(value).strip('"') for value in delivered if value}
+
+    out: list[tuple[str, str]] = []
+    for row in reversed(candidates):
+        if f"plan_{row.turn_id}" not in delivered_plans:
+            continue
+        out.append((str(row.id), "r" + _ref_tail(str(row.id))))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _ref_tail(message_id: str) -> str:
+    """本地消息 id → 短号尾巴（纯函数）。
+
+    **必须由 id 唯一决定**，不能用一个每轮递增的序号：同一句话在相邻两轮
+    里要拿到同一个短号，否则她上一轮记住的 `r3f2a1` 下一轮就对不上了。
+    取 id 末尾 6 位字母数字——与 `domains/media/video.py::short_ref_for`
+    同一套做法（那里是证据 id，这里是消息 id），理由也相同：短、够散、
+    不用额外存映射表。
+    """
+    tail = "".join(ch for ch in message_id if ch.isalnum())[-6:]
+    return (tail or "0").lower()
+
+
+def resolve_recall_ref(
+    ref: str, refs: list[tuple[str, str]]
+) -> str | None:
+    """标记里的短号 → 本地消息 id。
+
+    空串（``<<撤回>>``）表示"最近一条"：``refs`` 按时间升序，取最后一个。
+    **对不上就返回 None**，由调用方按"没这条"处理——不猜、不模糊匹配。
+    """
+    if not refs:
+        return None
+    wanted = (ref or "").strip().lower()
+    if not wanted:
+        return refs[-1][0]
+    for message_id, token in refs:
+        if token.lower() == wanted:
+            return message_id
+    return None
+
+
 def recall_window_ends_at(sent_at: datetime) -> datetime:
     """这条消息的撤回窗口何时关闭（给前端显示"还剩多久"用）。"""
     return sent_at + timedelta(seconds=RECALL_WINDOW_SECONDS)
@@ -603,6 +855,7 @@ __all__ = [
     "DELIVERABLE_STATES",
     "NON_RECALLABLE_ORIGINS",
     "RECALL_LIMITER",
+    "RECALL_MARKER_RE",
     "RECALL_RATE_LIMIT_PER_MINUTE",
     "RECALL_REFUSAL_NOTES",
     "RECALL_RESULT_NOTES",
@@ -618,7 +871,15 @@ __all__ = [
     "perform_recall",
     "recall_window_ends_at",
     "recallable_message_ids",
+    "recallable_refs",
+    "resolve_recall_ref",
+    "drop_partial_recall_marker",
+    "finalize_recall_text",
+    "parse_recall_markers",
+    "recall_ref_for",
     "refusal_note",
     "resolve_recall_target",
     "result_note",
+    "stream_safe_recall",
+    "strip_recall_markers",
 ]
