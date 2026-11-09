@@ -612,3 +612,33 @@ def test_partial_marker_in_native_mime_guard() -> None:
     from ling.domains.media.video import guess_video_suffix
 
     assert guess_video_suffix("application/octet-stream") == ".mp4"
+
+
+def test_default_watch_callback_enforces_the_slot() -> None:
+    """生产装配必须**打开**全局媒体槽位。
+
+    ## 为什么这条必须有
+
+    `VideoWatchService(enforce_slot=...)` 默认是 False——那是为了单元测试能
+    传 mock session（见构造函数的注释）。但生产路径如果忘了传 True，
+    后果是**静默的**：
+
+    - 两个窗口可以同时下载/抽帧/调视觉模型；
+    - 她的"我正在看点东西"同时出现在两处，两边读到互相矛盾的状态；
+    - 没有任何报错、没有任何日志——一切看起来正常。
+
+    这正是本项目反复踩过的坑（`settle_dead_jobs` 写好没接线、
+    `run_media_worker_forever` 写好没启动）。所以这里不测行为，测**接线**：
+    源码里 `default_watch_callback` 构造服务时必须显式传 `enforce_slot=True`。
+    """
+    import inspect
+
+    from ling.domains import media
+
+    # 注意查的是**整个模块**：`default_watch_callback` 返回的是一个内层闭包，
+    # `getsource` 只给出外层函数体，装配代码在闭包里。
+    module_source = inspect.getsource(media.watch)
+    assert "enforce_slot=True" in module_source, (
+        "生产装配没打开媒体槽位：跨会话并发观看不会被拦住，"
+        "而且不会报错——这正是最危险的一种失效"
+    )

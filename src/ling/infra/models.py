@@ -21,6 +21,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
@@ -2777,3 +2778,43 @@ __all__ = [
 
 # 避免未使用告警（保留类型导入供后续批次）
 _ = (Float,)
+
+
+class MediaSlotRow(Base):
+    """媒体注意力唯一槽位：全系统同时只允许**一个**耗时媒体动作。
+
+    设计见 `docs/MEDIA-EXCLUSIVE-SLOT.md` §3。要点：
+
+    - **单行表**（`resource_key='media.attention'` 是主键），预置一行，永不新增
+      第二行。看视频、将来的刷流/看直播都争这一行——`kind` 只说明持有者做什么，
+      不划分并发额度。
+    - 为什么不是进程内锁/事务级 advisory lock：Web 请求、多个 worker、专用媒体
+      worker 可能在不同进程（见设计 §2 第 7–10 条）。会话级 advisory lock 绑
+      物理连接，连接池复用会串味。
+    - `holder_id` 为 NULL 表示空槽；`generation` 每次占用 +1，用来让**旧持有者
+      的晚到写入**失败（栅栏）。没有代次，一个卡了 4 分钟的旧执行者会在租约被
+      别人接手后照样把结果写进库。
+    - 时间一律用**数据库时间**（`clock_timestamp()`），不用本机时钟：多机部署
+      的时钟偏差会让"谁还没过期"判断错乱。
+    """
+
+    __tablename__ = "media_slots"
+
+    resource_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    holder_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # held：已拿到执行权；active：执行者已就绪、耗时动作真的开始了。
+    # 只有 active 才能对外说"她正在看东西"——held 只能说"正在处理媒体请求"。
+    phase: Mapped[str] = mapped_column(String(16), default="held")
+    kind: Mapped[str] = mapped_column(String(24), default="")
+    actor_id: Mapped[str] = mapped_column(String(64), default="")
+    window_id: Mapped[str] = mapped_column(String(64), default="")
+    subject_id: Mapped[str] = mapped_column(String(64), default="")
+    call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    activity_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    generation: Mapped[int] = mapped_column(BigInteger, default=0)

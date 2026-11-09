@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -77,9 +78,13 @@ MAX_READS_PER_REPLY = 2
 #:   这不是故障，是她今天真的没有余力——说成"打不开"就是谎报技术故障。
 #: - ``missing``：短号不存在/已过期/撞车 → 说"看不了/找不到"。
 #: - ``error``：读取失败（下载失败、模型超时、抽帧失败…） → 说"打不开"。
+#: - ``busy``：**她自己正在看/刷别的媒体**（全局唯一槽位被同一次执行之外的
+#:   占用）。这不是故障，也不是没余力——是"我正忙着看点东西"。说成"打不开"
+#:   是谎报技术故障，说成"今天不想看"是冒充她的意愿。
 DENIED_QUOTA = "quota"
 DENIED_MISSING = "missing"
 DENIED_ERROR = "error"
+DENIED_BUSY = "busy"
 
 #: 额度拒绝的**人话**里必须带这几个数（已用/上限），否则用户与运维都看不出
 #: "为什么今天不能看了"。文案在 `video_quota_denial` 里统一生成。
@@ -197,6 +202,7 @@ class VideoWatchService:
         actor_id: str,
         describer: MediaDescriber,
         quota_denial: Callable[[], Awaitable[str | None]] | None = None,
+        enforce_slot: bool = False,
     ) -> None:
         self._session = session
         self._actor_id = actor_id
@@ -208,6 +214,84 @@ class VideoWatchService:
         #: 与 `router` 在 `quota is None` 时放行是同一个口径。
         self._quota_denial = quota_denial
         self._service = MediaEvidenceService(session, actor_id=actor_id)
+        #: 当前持有的媒体槽位（一次 `watch()` 最多持有一个）。
+        #:
+        #: 放在实例上而不是局部变量：释放发生在 `finally` 里，而此时
+        #: ``handle`` 还在 `try` 之前的作用域。这个类每次 `watch()` 都是
+        #: 新实例（见 `default_watch_callback`），所以不担心跨调用串味。
+        self._slot_handle: object | None = None
+        #: 是否启用**全局媒体槽位**（跨进程单飞）。
+        #:
+        #: 默认 False 是为了让单元测试能直接构造本服务——它们传的是 mock
+        #: session，跑不了 SQL。**生产路径必须打开**：由
+        #: `default_watch_callback` 显式传 True，并有测试钉住这一点
+        #: （`test_default_watch_callback_enforces_the_slot`）。
+        #:
+        #: 为什么用开关而不是"检测 session 是不是真的"：后者会让"忘了装配"
+        #: 变成静默失效——媒体单飞没了，但一切看起来正常。
+        self._enforce_slot = enforce_slot
+
+    async def _enter_slot(self, window_id: str) -> str | None:
+        """抢全局媒体槽位。返回 ``None`` 表示拿到了；返回字符串表示没拿到的人话原因。
+
+        ## 为什么抢不到要如实说"我正忙着"
+
+        用户原话：「当这个会话在看视频的时候，另一个会话可以说在忙」。
+        所以 `busy` 既不是"打不开"（谎报故障）也不是"今天不想看"
+        （冒充她的意愿），而是第三种事实：她此刻确实在看别的东西。
+
+        ## 数据库不可用时不假装"忙"
+
+        `unavailable` 意味着**确认不了**有没有人在用。这时按 fail closed
+        处理——不开始媒体动作——但措辞不能是"我正忙着"（那是在编造她的活动）。
+        所以两种情况给两句话。
+        """
+        # `getattr` 兜底：本类有几个测试用 `__new__` 手工装配属性绕过
+        # `__init__`（它们只想测"读一次/用缓存"的分支，不需要会话）。
+        # 直接访问会 AttributeError，把"没装配"变成"看视频整体损坏"——
+        # 一个可选特性不该有这种耦合。
+        if not getattr(self, "_enforce_slot", False):
+            return None
+        from ling.domains.media import slot as slot_mod
+
+        try:
+            outcome = await slot_mod.acquire(
+                self._session,
+                kind=slot_mod.KIND_VIDEO_WATCH,
+                window_id=window_id,
+                actor_id=self._actor_id,
+            )
+            await self._session.commit()
+        except Exception as exc:  # noqa: BLE001 - 槽位故障不能打断对话
+            logger.info("媒体槽位抢占异常：%s", type(exc).__name__)
+            return "现在没法确认能不能看这个视频（稍后再试）"
+
+        if outcome.acquired:
+            self._slot_handle = outcome.handle
+            # 拿到执行权 ≠ 已经在看：还要走下载/抽帧。先标 active 再往下，
+            # 因为接下来那一步就是真正的耗时动作。
+            if outcome.handle is not None:
+                with contextlib.suppress(Exception):
+                    await slot_mod.mark_active(self._session, outcome.handle)
+                    await self._session.commit()
+            return None
+
+        if outcome.busy:
+            return "她这会儿正在看别的视频"
+        return "现在没法确认能不能看这个视频（稍后再试）"
+
+    async def _leave_slot(self) -> None:
+        """放掉媒体槽位。**幂等**，失败只记日志（不能让释放拖垮对话）。"""
+        from ling.domains.media import slot as slot_mod
+
+        # 同 `_enter_slot`：`__new__` 装配的测试实例可能没有这个属性。
+        handle = getattr(self, "_slot_handle", None)
+        self._slot_handle = None
+        if handle is None:
+            return
+        with contextlib.suppress(Exception):
+            await slot_mod.release(self._session, handle)  # type: ignore[arg-type]
+            await self._session.commit()
 
     async def videos_in_window(self, window_id: str, *, limit: int = 20) -> list[EvidenceView]:
         """窗口内所有视频（看过与没看过的都要）——短号解析要用全集。"""
@@ -265,6 +349,19 @@ class VideoWatchService:
                 _log_skipped(ref, denied)
                 break
 
+            # 真正耗时的动作（下载/抽帧/调视觉模型）——**这一段要在全局槽位
+            # 里跑**。用户原话：「看视频的线程只允许存在一个全局，当这个会话
+            # 在看视频的时候，另一个会话可以说在忙」。
+            #
+            # 只保护这里、不保护整轮，是因为解析短号、看缓存描述都不耗时；
+            # 把整轮都塞进槽位会让"她正在说话"也占住媒体执行权。
+            slot_denial = await self._enter_slot(window_id)
+            if slot_denial is not None:
+                outcome.skipped = slot_denial
+                outcome.denied_kind = DENIED_BUSY
+                _log_skipped(ref, slot_denial)
+                break
+
             started = time.perf_counter()
             try:
                 read = await self._describer.describe_video(evidence, mode=mode)
@@ -279,6 +376,11 @@ class VideoWatchService:
                 logger.info("看视频失败 ref=%s: %s", ref, type(exc).__name__)
                 _log_skipped(ref, outcome.skipped)
                 break
+
+            finally:
+                # 无论成功、失败、超时都要放掉槽位，否则一次异常就让媒体链路
+                # 永久"忙"——这是这类单飞设计最常见的死法。
+                await self._leave_slot()
 
             elapsed = time.perf_counter() - started
             outcome.reads += 1
@@ -389,6 +491,10 @@ def make_watch_callback(
                     profile=profile,
                 ),
                 quota_denial=_quota_gate(config_reader, quota, profile),
+                # **生产路径必须打开全局媒体槽位**。用户原话：「看视频的线程
+                # 只允许存在一个全局，当这个会话在看视频的时候，另一个会话
+                # 可以说在忙」。这里不打开就等于没有单飞，而且不会有任何报错。
+                enforce_slot=True,
             )
             outcome = await service.watch(window_id=window_id, refs=refs, mode=mode)
             await session.commit()
