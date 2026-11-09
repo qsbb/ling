@@ -226,7 +226,7 @@
 | 项 | 证据 |
 |---|---|
 | **R6 接入器可编辑** | 表单接 `PUT /v1/settings/connectors/{scope}`；`rolled_back`（HTTP 202）单独文案且不含"已生效"；密钥恒空、清空走 `clear`；`src/connectors.browser.test.tsx` 11 项真 Chromium |
-| **R15 全局媒体槽** | `media_slots` + `0061_media_slot` + `domains/media/slot.py`；20 并发抢占恰好 1 个成功；代次栅栏让旧持有者写入落空；`test_default_watch_callback_enforces_the_slot` 钉住生产装配 |
+| **R15 全局媒体槽** | `media_slots` + `0061_media_slot` + `domains/media/slot.py`；20 并发抢占恰好 1 个成功；代次栅栏让旧持有者写入落空；`test_default_watch_callback_enforces_the_slot` 钉住生产装配。**容器内验证**：NAS 上 `postgres:16-alpine` 容器（PG 16.15）跑完整迁移链到 `0061_media_slot`、预置行正确、`downgrade -1`→`upgrade head` 往返成功，10 条槽位用例跨网络全部通过 |
 | **R4 回退来源可见** | `FallbackHint` 按 `fallback.used/source/reason` 明说"这是默认参数，不是她的真实状态"；`src/dashboard-fallback.browser.test.tsx` 5 项（1440/375 无溢出） |
 
 ### 仍未完成（不掩饰）
