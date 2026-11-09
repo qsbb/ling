@@ -35,8 +35,7 @@ import logging
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 from ling.kernel.marker_stream import (
@@ -58,9 +57,21 @@ PENDING_MARKER_RE = _SHARED_PENDING_MARKER_RE
 # 旧名字（本模块内部引用）保留，避免外部导入点全部改一遍。
 _PENDING_MARKER_RE = PENDING_MARKER_RE
 
-# 每窗口每小时的读取次数上限 / 每天（全局）上限。
-WINDOW_HOURLY_LIMIT = 2
-DAILY_LIMIT = 20
+# 读视频的额度**不再按次数算**（2026-11-09 用户拍板「次数限制去掉」）。
+#
+# 原来这里是"每窗口每小时 ≤2、每天 ≤20"，两份进程内计数器。删掉的理由：
+#
+# 1. 次数与成本脱钩。一段 5 秒的视频和一段 3 分钟的视频都记"1 次"，而后者
+#    抽帧更多、token 多出一个量级。按次数限，等于把成本管错了对象。
+# 2. 进程内计数重启即清零，注释里自己写着"可以接受"——那不是额度，是限流。
+# 3. 真正该管的是 token，而那份账**已经存在**：`models/quota.py` 的
+#    `TokenQuotaStore` 按 (供应商, 本地日) 记真实用量，`router` 每次调用前
+#    都会查。看视频走的是同一个 router、同一家供应商，所以额度天然共用——
+#    不需要、也不该再维护第二套计数器（两套必然对不上，而对不上的时候
+#    用户看到的是"额度显示还有、视频却看不了"）。
+#
+# 现在的口径见 `watch.py::video_quota_denial`：查 `perception.video` 槽位
+# 绑定那家供应商的当日已用 token 与上限。
 
 # 抽帧参数（依据用户要求：0.5 fps、最多 16 帧、长边 ≤512、单帧 JPEG）。
 TARGET_FPS = 0.5
@@ -185,59 +196,6 @@ def ambiguous_refs(refs: list[str], videos: list[object]) -> list[str]:
 
 
 # ---------------------------------------------------------------- 预算闸
-
-
-@dataclass
-class WatchBudget:
-    """读取预算：同一条只读一次（调用方用描述缓存保证）、每窗每小时 ≤2、
-    每天 ≤20。
-
-    **进程内**计数：这是成本闸，不是审计账。进程重启后清零可以接受——
-    重启本身就是罕见事件，而为了它单建一张表/一次迁移不值得。真正的
-    审计由行为日志负责（每次读取/拒绝都会留一行）。
-    """
-
-    window_hourly: int = WINDOW_HOURLY_LIMIT
-    daily: int = DAILY_LIMIT
-    _window_hits: dict[str, list[float]] = field(default_factory=dict)
-    _day_hits: list[float] = field(default_factory=list)
-    _clock: object = None
-
-    def _now(self) -> float:
-        clock = self._clock
-        if callable(clock):
-            return float(clock())  # type: ignore[operator]
-        import time
-
-        return time.monotonic()
-
-    def deny_reason(self, window_id: str) -> str | None:
-        """能不能读？能读返回 ``None``，否则返回**人话**原因（写进行为日志）。"""
-        now = self._now()
-        hour_ago = now - 3600.0
-        hits = [stamp for stamp in self._window_hits.get(window_id, []) if stamp > hour_ago]
-        self._window_hits[window_id] = hits
-        if len(hits) >= self.window_hourly:
-            return f"超出这个窗口每小时 {self.window_hourly} 次的预算"
-        day_ago = now - 86400.0
-        self._day_hits = [stamp for stamp in self._day_hits if stamp > day_ago]
-        if len(self._day_hits) >= self.daily:
-            return f"超出每天 {self.daily} 次的预算"
-        return None
-
-    def record(self, window_id: str) -> None:
-        now = self._now()
-        self._window_hits.setdefault(window_id, []).append(now)
-        self._day_hits.append(now)
-
-    def reset(self) -> None:
-        """测试用：清空所有计数。"""
-        self._window_hits.clear()
-        self._day_hits.clear()
-
-
-# 进程级单例：worker 与 API 共用同一份预算（同一进程里它们本来就在一起）。
-WATCH_BUDGET = WatchBudget()
 
 
 # ---------------------------------------------------------------- 抽帧
@@ -386,13 +344,7 @@ def video_url_for(data: bytes, mime: str | None) -> str:
     return f"data:{mime or 'video/mp4'};base64,{encoded}"
 
 
-def today_key(now: datetime | None = None) -> str:
-    """预算日志里用的日期（UTC）。只为可读性，不参与判定。"""
-    return (now or datetime.now(UTC)).strftime("%Y-%m-%d")
-
-
 __all__ = [
-    "DAILY_LIMIT",
     "FFMPEG_TIMEOUT",
     "LONG_SIDE",
     "LONG_VIDEO_SECONDS",
@@ -400,11 +352,8 @@ __all__ = [
     "MAX_FRAMES",
     "MAX_VIDEO_BYTES",
     "TARGET_FPS",
-    "WATCH_BUDGET",
-    "WINDOW_HOURLY_LIMIT",
     "FrameSample",
     "VideoReadError",
-    "WatchBudget",
     "drop_partial_marker",
     "ambiguous_refs",
     "extract_frames",
@@ -419,6 +368,5 @@ __all__ = [
     "short_ref_for",
     "stream_safe",
     "strip_watch_markers",
-    "today_key",
     "video_url_for",
 ]

@@ -38,6 +38,7 @@ from sqlalchemy import select, update
 
 from ling.config import get_settings
 from ling.domains.media.errors import MediaRefError
+from ling.domains.media.jobs import MEDIA_READ_TOPIC
 from ling.infra.db import dispose_engine, init_engine, session_scope
 from ling.infra.models import OutboxEvent, Turn, utcnow
 
@@ -432,10 +433,49 @@ async def handle_memory_extract(payload: dict) -> None:
         # 策略**现读**已发布修订：每个 outbox 事件一次事务，没有轮次快照可继承。
         # 不传的话写入的留期一律落回列默认 365，设置页的 max_retention_days
         # 永远不生效（本任务修的就是这条断链）。
+        # **写库前的遗忘栅栏**：这条事件入队之后，用户可能已经从后台点了
+        # "删除我的记忆"。代次不一致就静默作废——不是失败，是预期行为，
+        # 所以只记一条 debug 日志、正常确认事件，不重试。
+        from ling.domains.memory.purge import claim_still_valid
         from ling.settings.service import published_memory_policy
+
+        if not await claim_still_valid(session):
+            logger.info(
+                "memory.extract 作废：入队后发生过遗忘请求 turn=%s", turn_id
+            )
+            return
 
         service = MemoryService(session, policy=await published_memory_policy(session))
         source_ids = [f"turn:{turn_id}"]
+
+        # 断言记忆：**模型提炼 + 代码闸门**。
+        # 旧实现只匹配「我叫/我喜欢/我住在」三个正则，参照稿明确记录过这条路线的
+        # 失败：「我一累就咬后槽牙」「我妈忌日是十一月三号」这类细节全部落空，
+        # 且落空后没有兜底。现在交给模型提炼，正则只作为模型不可用时的降级路径。
+        #
+        # **提炼必须排在所有写入之前**（原实现先写情节、再提炼）：情节一旦先落库，
+        # 慢提炼期间的遗忘请求就只能在第二次栅栏处 return——而那时情节已经在
+        # 事务里了，它会被一起提交。表现是"删完记忆之后库里又多了一条情节"。
+        # 顺序调过来之后，两道栅栏之间**没有任何写入**，作废才是真的作废。
+        from ling.contracts.v1 import MemoryProposal
+        from ling.domains.memory.extract import (
+            gate,
+        )
+
+        candidates = await _extract_candidates(
+            user_text=user_text,
+            actor_text=actor_text,
+            is_group=is_group,
+        )
+        # **第二次栅栏**：模型提炼是慢操作（可能几十秒）。前面那次检查之后
+        # 用户完全可能已经点了删除——不在这里再确认一次，提炼结果就会在
+        # 删除之后写回去，等于删除失败。这是"边删边写"最真实的窗口。
+        if not await claim_still_valid(session):
+            logger.info(
+                "memory.extract 作废：模型提炼期间发生过遗忘请求 turn=%s", turn_id
+            )
+            return
+
         # 情节记忆：这一轮发生了什么（长期可检索，承接"上次那个事"）
         summary_parts = []
         if user_text.strip():
@@ -458,20 +498,6 @@ async def handle_memory_extract(payload: dict) -> None:
                 turn_id=turn_id,
             )
 
-        # 断言记忆：**模型提炼 + 代码闸门**。
-        # 旧实现只匹配「我叫/我喜欢/我住在」三个正则，参照稿明确记录过这条路线的
-        # 失败：「我一累就咬后槽牙」「我妈忌日是十一月三号」这类细节全部落空，
-        # 且落空后没有兜底。现在交给模型提炼，正则只作为模型不可用时的降级路径。
-        from ling.contracts.v1 import MemoryProposal
-        from ling.domains.memory.extract import (
-            gate,
-        )
-
-        candidates = await _extract_candidates(
-            user_text=user_text,
-            actor_text=actor_text,
-            is_group=is_group,
-        )
         gated = gate(candidates, user_text=user_text, is_group=is_group)
         if gated.rejected:
             # 拒绝原因要可查：不然"为什么这条没记住"无从排查
@@ -501,7 +527,7 @@ async def handle_memory_extract(payload: dict) -> None:
                 # 记录产生这条记忆的渠道账号：同一人多个号合并后要能无损拆回
                 source_account=payload.get("source_account"),
             )
-            # 实体关联：把"养了豆豆""家人是妈""在做 X 项目"这类
+            # 实体关联：把"养了一只宠物""家人是妈""在做 X 项目"这类
             # 可被反复提到的对象建成实体，供"沿关系定位"用。
             # 槽位→实体类型是确定性映射，不依赖模型输出格式。
             await _link_entity_for(
@@ -782,6 +808,139 @@ async def handle_commitment_dispatch(payload: dict) -> None:
             logger.info("承诺投递成功 %d 条", dispatched)
 
 
+@handler("memory.purge")
+async def handle_memory_purge(payload: dict) -> None:
+    """记忆真删的**清理阶段**：把墓碑对应的记忆与派生数据物理删除。
+
+    ## 为什么要分成两段
+
+    用户点"删除我的记忆"时，请求阶段已经同步做完了最要紧的三件事：
+    代次 +1（此后旧写入全部作废）、写墓碑、取消并脱敏在途事件。那一步
+    在 HTTP 请求里跑完，用户刷新就已经看不到记忆。
+
+    但**物理删除**不能放在请求里：数据量可能几十万行（记忆 + 情节 + 向量 +
+    实体关联 + 检索日志），卡在请求里会让前端转圈几十秒甚至超时。而且删除
+    必须能重试——删到一半崩了要能续。
+
+    ## 幂等
+
+    重复跑同一个墓碑只会删到 0 行。状态已是 `done` 的直接返回既有计数，
+    不重复删。
+
+    ## 为什么失败要留 `failed` 而不是吞掉
+
+    删除失败意味着"用户以为删了但还在"。这必须可查、可重试，
+    不能被当成"没事发生"——所以墓碑置 `failed` 并由下一轮扫描重试。
+    """
+    from ling.audit import audit_event
+    from ling.domains.memory.purge import MemoryPurgeError, purge_subject
+    from ling.infra.models import MemoryPurgeTombstone
+
+    tombstone_id = str(payload.get("tombstone_id") or "")
+    if not tombstone_id:
+        logger.warning("memory.purge 缺少 tombstone_id，跳过: %s", payload)
+        return
+    async with session_scope() as session:
+        # 先取 subject_id：审计要记"删了谁"，而墓碑在 `purge_subject` 之后
+        # 状态会变，不如在这里一次性读出来。
+        subject_id = str(
+            await session.scalar(
+                select(MemoryPurgeTombstone.subject_id).where(
+                    MemoryPurgeTombstone.id == tombstone_id
+                )
+            )
+            or ""
+        )
+        try:
+            result = await purge_subject(session, tombstone_id=tombstone_id)
+        except MemoryPurgeError as exc:
+            # 不抛：抛出去会让 outbox 反复重试同一条注定失败的删除。
+            # 墓碑已置 failed，由 `memory.purge.sweep` 周期任务按墓碑重试。
+            logger.warning(
+                "memory.purge 失败 tombstone=%s code=%s", tombstone_id, exc.code
+            )
+            audit_event(
+                "memory_purge_failed",
+                outcome="failed",
+                actor="worker",
+                target_type="subject",
+                target_id=subject_id,
+                reason_code=exc.code,
+                attributes={"tombstone_id": tombstone_id},
+            )
+            return
+    # 清理完成要留**一条可追责的事实**：什么时候、删了多少行。
+    # 只放计数与 id——审计管道不能承载被删内容，否则等于给"不存在"开副本。
+    audit_event(
+        "memory_purged",
+        actor="worker",
+        target_type="subject",
+        target_id=subject_id,
+        attributes={
+            "tombstone_id": tombstone_id,
+            "memories_deleted": result.memories_deleted,
+            "episodes_deleted": result.episodes_deleted,
+            "core_deleted": result.core_deleted,
+            "awareness_deleted": result.awareness_deleted,
+            "embeddings_deleted": result.embeddings_deleted,
+            "entities_deleted": result.entities_deleted,
+            "retrieval_logs_deleted": result.retrieval_logs_deleted,
+            "events_scrubbed": result.events_scrubbed,
+            # 本次补齐的表（媒体描述 / 私有知识 / 提示词快照 / 关系事件 note）。
+            # 审计里必须有它们：否则"这次到底清了什么"只答得出一半，漏掉的表
+            # 永远看不出有没有清。值全是计数，不含正文。
+            **dict(result.details),
+        },
+    )
+    logger.info(
+        "memory.purge 完成 tombstone=%s 记忆=%d 情节=%d 核心=%d 意识=%d "
+        "向量=%d 实体=%d 检索日志=%d 事件脱敏=%d",
+        tombstone_id,
+        result.memories_deleted,
+        result.episodes_deleted,
+        result.core_deleted,
+        result.awareness_deleted,
+        result.embeddings_deleted,
+        result.entities_deleted,
+        result.retrieval_logs_deleted,
+        result.events_scrubbed,
+    )
+
+
+@handler("memory.purge.sweep")
+async def handle_memory_purge_sweep(payload: dict) -> None:
+    """扫描还没清理完的墓碑并逐个清理（零模型的兜底）。
+
+    ## 为什么需要这个扫描
+
+    请求阶段写墓碑、投一次 `memory.purge` 事件。但那次投递可能失败
+    （进程在两者之间崩了），或者清理本身失败（`failed`）。没有扫描的话
+    这些墓碑会永远停在 `pending`/`failed`——**用户以为删了，数据还在**。
+
+    这是"删除"这条链上唯一能保证最终一致的东西，所以它必须存在。
+    """
+    from ling.domains.memory.purge import MemoryPurgeError, pending_tombstones, purge_subject
+
+    async with session_scope() as session:
+        ids = await pending_tombstones(session, limit=int(payload.get("limit") or 20))
+    if not ids:
+        return
+    done = failed = 0
+    for tombstone_id in ids:
+        async with session_scope() as session:
+            try:
+                await purge_subject(session, tombstone_id=tombstone_id)
+                done += 1
+            except MemoryPurgeError as exc:
+                failed += 1
+                logger.warning(
+                    "memory.purge.sweep 失败 tombstone=%s code=%s",
+                    tombstone_id,
+                    exc.code,
+                )
+    logger.info("memory.purge.sweep 完成 %d 条，失败 %d 条", done, failed)
+
+
 @handler("session.purge")
 async def handle_session_purge(payload: dict) -> None:
     """删除已过期的登录会话（`auth_sessions`）。
@@ -929,6 +1088,266 @@ def make_media_fetcher(
         return await connector.fetch_media(media_ref)  # type: ignore[attr-defined]
 
     return _fetch
+
+
+# ------------------------------------------------------------------ 视频后台取证作业
+#
+# 裁决 `docs/ASYNC-TOOL-DECISION.md` §3.3。两条入口：
+#
+# - `media.video.read`（**outbox**）：一次真正的后台读取，由入口端点入队；
+# - `media.read.cleanup`（**周期**）：零模型的过期/失联清理。
+#
+# ## 为什么媒体要一个**专用 worker**
+#
+# 现有周期循环与 outbox 循环都是串行 `await`：一条 60 秒的视频会把撤回、摘要、
+# 日程全部堵住。所以：
+#
+# 1. 普通 worker 用 `exclude_topics` **排除**这个 topic（不认领，也就不会被它堵）；
+# 2. `run_media_worker_forever` 只认这一个 topic，**并发固定为 1**（裁决）。
+#
+# 并发 1 的理由不是保守，是正确性成本：视觉模型按次计费，而第 4 步之前还没有
+# 持久预算账本。多个并发媒体作业会在"额度检查"落地前把调用数放大。
+
+
+@handler(MEDIA_READ_TOPIC)
+async def handle_media_video_read(payload: dict) -> None:
+    """跑一次后台视频读取。**业务终态由 jobs 自己落库**，这里只负责翻译。
+
+    ## 这个 handler 的返回/抛出规则（裁决 §3.3 的重试裁定）
+
+    - **正常返回** → outbox 标 `done`。业务上成功、失败、超时、unknown、
+      取消、过期**全都**走这条：`ToolRegistry` 那套"failed/timeout 返回值不触发
+      重试"的结论在这里同样成立——`outbox` 只对**异常**退避。所以业务终态必须
+      在 `run_read_job` 里落库，不能指望"失败就抛"来重试。
+    - **抛异常** → outbox 退避重排（最多 5 次，上限 300 秒），到 dead 时
+      `settle_dead_jobs` 同步终结业务作业。这里**只**为"取件类故障"抛
+      （`ReadJobError`）：那时还没花模型调用，重排是安全的。
+
+    `needs_confirmation`：这个作业没有"确认"这一步（它就是用户点出来的），
+    所以没有任何分支会走到它——如果哪天有人加进来，必须在这里显式拒绝执行。
+    """
+    from ling.domains.media.jobs import ReadJobError, run_read_job
+
+    call_id = str(payload.get("call_id") or "")
+    if not call_id:
+        # payload 坏掉：**不抛**。抛出去会重排一条永远修不好的事件，
+        # 5 次之后变 dead，而没有任何业务作业对应它。
+        logger.warning("media.video.read: payload 缺 call_id，忽略")
+        return
+
+    describer, close = await _build_video_describer()
+    try:
+        outcome = await run_read_job(
+            call_id=call_id,
+            lease_owner=WORKER_ID,
+            describer=describer,
+        )
+    except ReadJobError as exc:
+        # 取件类：还没花钱，让 outbox 重排。
+        logger.info("media.video.read %s 取件失败（将重排）: %s", call_id, exc)
+        raise
+    finally:
+        await close()
+
+    logger.info(
+        "media.video.read %s → %s%s",
+        call_id,
+        outcome.state.value,
+        f" ({outcome.error_code})" if outcome.error_code else "",
+    )
+
+
+async def _build_video_describer() -> tuple[object | None, Callable[[], Awaitable[None]]]:
+    """造一个 `MediaDescriber` + 一个 close 函数。
+
+    ## 为什么单独抽出来、还要回一个 close
+
+    `MediaDescriber` 需要一个 `MediaEvidenceService`，而 service 绑在**一个
+    数据库会话**上。执行跨多个事务（认领 / 写 model_started_at / 提交终态），
+    所以这里开一个**执行期专用会话**，跑完就关——不复用请求会话，也不把它
+    留在 `app.state`（那会让所有并发执行共用一个 session）。
+
+    模型路由没就绪时返回 `(None, close)`：`run_read_job` 会把它翻成
+    `ReadJobError`（取件类，还没花钱 → 重排）。**不能**在路由就绪前假装成功。
+    """
+    from ling.capabilities.channels import build_onebot_connector
+    from ling.domains.media.describe import MediaDescriber
+    from ling.domains.media.service import MediaEvidenceService
+    from ling.infra.db import get_session_factory
+    from ling.infra.security import SecretBox
+    from ling.settings.service import ConfigService
+
+    router = _MEMORY_ROUTER
+    if router is None:
+        logger.info("media.video.read 跳过：模型路由未就绪（事件保持可重排）")
+        return None, _noop_close
+
+    settings = get_settings()
+    try:
+        connector = build_onebot_connector()
+    except Exception as exc:  # noqa: BLE001 - 没有渠道时只能读本地文件
+        connector = None
+        logger.info(
+            "media.video.read：没有可用渠道（%s），只处理本地上传的文件",
+            type(exc).__name__,
+        )
+
+    fetch_media = make_media_fetcher(
+        connector,
+        media_root=settings.data_dir / "media",
+        max_bytes=settings.max_body_bytes,
+    )
+
+    session = get_session_factory()()
+    try:
+        service = MediaEvidenceService(session, actor_id=settings.actor_id)
+        describer = MediaDescriber(
+            service=service,
+            fetch_media=fetch_media,
+            router=router,
+            config_reader=ConfigService(
+                session,
+                SecretBox(settings),
+                test_mode_default=settings.test_mode,
+                persona_id=settings.persona_id,
+            ),
+        )
+    except Exception:
+        await session.close()
+        raise
+
+    async def _close() -> None:
+        await session.close()
+
+    return describer, _close
+
+
+async def _noop_close() -> None:
+    return None
+
+
+@handler("media.read.cleanup")
+async def handle_media_read_cleanup(payload: dict) -> None:
+    """零模型的过期/失联清理（裁决 §3.3 的 `PERIODIC_JOBS` 唯一新增项）。
+
+    两件事：
+    1. `pending` 且超过 `deadline`（**可空**，用 `requested_at + 15min` 兜底）
+       → `expired`；
+    2. `running` 且租约过期：
+       - `model_started_at IS NULL` → 回 `pending`（**重新执行**，还没花钱）；
+       - `model_started_at` 非空 → `unknown`（模型可能收过费，不自动再烧）。
+
+    **一次模型调用都没有**。这条是"没有新作业的定时扫描必须零模型"的落地：
+    清理只读作业表，不碰证据、不碰模型。
+    """
+    from ling.domains.media.jobs import expire_overdue_jobs
+
+    counts = await expire_overdue_jobs()
+    if any(counts.values()):
+        logger.info(
+            "媒体读取清理：过期 %d，退回排队 %d，不确定 %d",
+            counts["expired"],
+            counts["requeued"],
+            counts["unknown"],
+        )
+
+
+async def _media_worker_loop(stop: asyncio.Event, *, poll_seconds: float = 2.0) -> None:
+    """媒体 worker 的**循环本体**：只认 `media.video.read`，并发固定为 1。
+
+    ## 为什么把循环与"进程入口"拆开
+
+    同一个进程里要跑两条线（主循环 + 媒体），共用一个 `stop` 事件。如果这里
+    也自己 `init_engine` / `init_memory_router` / `wait_for_schema` / 装信号
+    处理器，同进程跑两遍会：重复初始化连接池（两套 engine）、重复注册信号
+    （后者覆盖前者）、以及两次 schema 等待。这些都只在"独立进程"语义下才对。
+
+    所以：初始化与信号归 :func:`run_media_worker_forever`（独立进程入口），
+    本函数只做循环，由调用方决定它跟谁一起停。
+
+    ## 并发为什么是 1
+
+    裁决明确"媒体并发先固定为 1"。第 4 步的预算账本落地之前，并发数直接等于
+    "同时最多烧几次视觉模型"——在还没有持久账本时把它调大，就是绕过额度。
+
+    ## 崩溃语义
+
+    进程被杀时不留任何内存状态：作业停在 `running` 且带租约，由
+    `media.read.cleanup` 按 `model_started_at` 分两路收敛（见
+    `expire_overdue_jobs`）。所以这个循环**不需要**自己的恢复逻辑。
+    """
+    from ling.domains.media.jobs import MEDIA_READ_TOPIC as _TOPIC
+
+    while not stop.is_set():
+        try:
+            # 回收过期 outbox 租约：上一次崩溃留下的 in_flight 事件要能被放回。
+            # 主循环也会回收，但媒体 worker 不能依赖它——两边的轮询节奏不同，
+            # 而这条事件只由媒体 worker 消费。
+            await reclaim_expired_outbox_leases()
+            count = await drain_outbox(limit=1, only_topic=_TOPIC)
+            if count:
+                logger.info("媒体 outbox 处理 %d 条", count)
+        except asyncio.CancelledError:
+            # 关停时 `wait_for` 会取消这里。**向上抛**，让取消语义完整。
+            raise
+        except Exception as exc:  # noqa: BLE001 - 不能因一次失败退出
+            logger.exception("媒体 outbox 轮询异常: %s", exc)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+        except TimeoutError:
+            continue
+
+
+async def run_media_worker_forever(poll_seconds: float = 2.0) -> None:
+    """**独立进程**入口：自己初始化、自己装信号，然后跑 :func:`_media_worker_loop`。
+
+    ## 什么时候用它
+
+    只有"把媒体单独跑成一个进程"时（例如将来给它单独一个容器/更多 CPU）。
+    当前部署是**同进程双循环**（见 `run_forever` 里的 `create_task`），因为
+    多一个容器还要同步改 compose、install 与健康检查，收益不足以支撑。
+
+    保留这个入口的原因是**它必须能跑**：如果哪天有人把媒体拆出去，改的应该是
+    compose，而不是重新写一遍初始化逻辑。
+
+    ## 同进程时**不要**调用它
+
+    它会重复 `init_engine` / `init_memory_router` / `wait_for_schema` 并抢信号
+    处理器——同进程里那等于两套连接池、两次 schema 等待、后者覆盖前者的信号。
+    同进程请用 `_media_worker_loop(stop)`。
+    """
+    from ling.domains.media.jobs import MEDIA_READ_TOPIC as _TOPIC
+
+    settings = get_settings()
+    init_engine(settings)
+    await init_memory_router()
+    if not await wait_for_schema():
+        logger.error("媒体 worker 等不到 schema，退出")
+        await dispose_engine()
+        raise SystemExit(1)
+
+    stop = asyncio.Event()
+
+    def _stop(*_: object) -> None:
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):  # pragma: no cover - 某些平台
+            loop.add_signal_handler(sig, _stop)
+
+    logger.info(
+        "媒体 worker 启动 env=%s topic=%s 并发=1 handler=%s",
+        settings.env,
+        _TOPIC,
+        _TOPIC in HANDLERS,
+    )
+    try:
+        await _media_worker_loop(stop, poll_seconds=poll_seconds)
+    finally:
+        with contextlib.suppress(Exception):
+            await release_outbox_leases()
+        await dispose_engine()
 
 
 @handler("media.describe")
@@ -2675,6 +3094,10 @@ EMBEDDING_BACKFILL_SECONDS = 300.0
 
 # 媒体描述：给待描述的媒体证据跑视觉模型。拿不到就留空、下次再试。
 MEDIA_DESCRIBE_SECONDS = 60.0
+# 媒体读取作业的清理周期。裁决要求"清理周期固定 ≤60 秒"，所以它不能跟着
+# 其它小时级的周期走。60 秒也是"非终态作业最迟在 deadline + 一个清理周期后
+# 终结"这条验收的量化依据。
+MEDIA_READ_CLEANUP_SECONDS = 60.0
 
 # 自我时间线：把已完成且有证据的活动派生为"我做过这件事"。
 SELF_TIMELINE_SECONDS = 300.0
@@ -2682,6 +3105,13 @@ SELF_TIMELINE_SECONDS = 300.0
 # 过期登录会话清理。小时级足够：过期会话多留一小时没有任何风险，
 # 而清理本身没有业务价值，不该占更密的节奏。
 SESSION_PURGE_SECONDS = 3600.0
+
+# 记忆真删的清理阶段。用户点了"删除"之后，请求阶段已同步完成（代次 +1、
+# 墓碑、取消在途事件），这一步只是把库里剩下的行物理删掉。
+#
+# 30 秒：删除是用户主动发起、正在等待结果的动作，"过一会儿才真正消失"
+# 会让用户怀疑没生效；但也不能放到请求里同步跑（数据量可能几十万行）。
+MEMORY_PURGE_SECONDS = 30.0
 
 # 主动草稿：给候选生成开场白（只生成不发送）。
 # 跟收集器同节奏即可——刚收集到的候选下一轮就有草稿。
@@ -4017,6 +4447,14 @@ class OutboxClaim:
     topic: str
     payload: dict
     attempts: int
+    # 入队时该主体的遗忘代次。handler 写库前比对，不一致就作废。
+    #
+    # 为什么放在 claim 上而不是 payload 里：payload 会原样传给 handler，
+    # 而 handler 是**按 topic 签名**的（`dict -> None`）。代次是调度层的
+    # 元信息，不该混进业务参数；而且放 payload 里会被 `{"purged": True}`
+    # 脱敏时一起抹掉——那正好抹掉了作废的依据。
+    forget_generation: int = 0
+    subject_id: str | None = None
 
 
 async def _reclaim_expired_outbox_leases(session, *, now: datetime) -> int:  # noqa: ANN001
@@ -4046,8 +4484,20 @@ async def reclaim_expired_outbox_leases() -> int:
         return await _reclaim_expired_outbox_leases(session, now=now)
 
 
-async def claim_next_outbox_event() -> OutboxClaim | None:
+async def claim_next_outbox_event(
+    *, exclude_topics: frozenset[str] = frozenset(), only_topic: str | None = None
+) -> OutboxClaim | None:
     """短事务认领**一条**可跑的事件并立即提交。
+
+    ## 为什么需要 topic 过滤
+
+    裁决 §3.3 点名：现有周期与 outbox 循环都是**串行 await**，一条慢视频会
+    堵住整个队列——这期间撤回、摘要、日程全都停摆。所以媒体作业必须由**专用
+    worker** 跑，而普通 worker 要能把它**排除掉**（`exclude_topics`），否则
+    它仍然会抓到那条事件、然后被它堵住。
+
+    `only_topic` 是另一侧：媒体 worker 只认 `media.video.read`，绝不去抢普通
+    事件——那样它就变成了"第二个普通 worker"，慢视频一样会占住它去干别的。
 
     为什么一次只认领一条，而不是一批：
     - 一批认领会把"还没开始跑"的行也标成 in_flight，等于用租约挡住别的
@@ -4057,14 +4507,16 @@ async def claim_next_outbox_event() -> OutboxClaim | None:
     代价是每条事件多两个短事务，在这个量级上无关紧要。
     """
     now = utcnow()
+    conditions = [OutboxEvent.state == "pending", OutboxEvent.available_at <= now]
+    if only_topic is not None:
+        conditions.append(OutboxEvent.topic == only_topic)
+    if exclude_topics:
+        conditions.append(OutboxEvent.topic.not_in(tuple(exclude_topics)))
     async with session_scope() as session:
         row = (
             await session.execute(
                 select(OutboxEvent)
-                .where(
-                    OutboxEvent.state == "pending",
-                    OutboxEvent.available_at <= now,
-                )
+                .where(*conditions)
                 .order_by(OutboxEvent.created_at, OutboxEvent.id)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -4080,6 +4532,8 @@ async def claim_next_outbox_event() -> OutboxClaim | None:
             topic=str(row.topic),
             payload=dict(row.payload or {}),
             attempts=int(row.attempts or 0),
+            forget_generation=int(getattr(row, "forget_generation", 0) or 0),
+            subject_id=getattr(row, "subject_id", None),
         )
         # 出 `async with` 即提交：handler 在**没有行锁**的事务外跑。
     return claim
@@ -4088,8 +4542,12 @@ async def claim_next_outbox_event() -> OutboxClaim | None:
 async def settle_outbox_event(
     claim: OutboxClaim, *, ok: bool, error: str | None = None
 ) -> None:
-    """短事务确认：成功→done；失败→按退避重排；到上限→dead。"""
+    """短事务确认：成功→done；失败→按退避重排；到上限→dead。
+
+    到 dead 时，若这是媒体读取事件，**同步终结对应的业务作业**（见下面注释）。
+    """
     now = utcnow()
+    went_dead = False
     async with session_scope() as session:
         row = await session.get(OutboxEvent, claim.event_id, with_for_update=True)
         if row is None:  # pragma: no cover - 事件被人工删掉
@@ -4121,9 +4579,33 @@ async def settle_outbox_event(
             # 不静默放弃：转 "dead" 状态等待人工/运维重放，
             # 原始事件仍在库里，派生数据只是暂缺（不是物理丢失）。
             row.state = "dead"
+            went_dead = True
         logger.warning(
             "outbox %s 处理失败（第 %d 次）: %s", claim.event_id, row.attempts, error
         )
+
+    # **到 dead 要同步终结业务作业**（裁决 §3.3）。
+    #
+    # 不终结的话媒体读取作业会永远停在 `pending`：用户看到"已安排，尚未读到
+    # 结果"，而队列里什么都没有了——比报错更糟，因为它看起来像还在排队。
+    #
+    # 放在事务**外**：业务作业是另一张表，和这条事件的确认没有原子性要求
+    # （事件已经 dead，重放由人来做；业务终态只是让用户看到确定的结论）。
+    # 失败也不回滚事件确认——那会让一条已经放弃的事件又回到 pending。
+    if went_dead and claim.topic == MEDIA_READ_TOPIC:
+        call_id = str(dict(claim.payload or {}).get("call_id") or "")
+        if call_id:
+            try:
+                from ling.domains.media.jobs import settle_dead_jobs
+
+                await settle_dead_jobs(call_id=call_id)
+            except Exception as exc:  # noqa: BLE001 - 收尾失败不影响事件确认
+                logger.warning(
+                    "outbox %s 到 dead，但终结业务作业失败（%s）: %s",
+                    claim.event_id,
+                    call_id,
+                    exc,
+                )
 
 
 async def mark_outbox_unhandled(claim: OutboxClaim) -> None:
@@ -4161,11 +4643,21 @@ async def release_outbox_leases() -> int:
         return int(getattr(result, "rowcount", 0) or 0)
 
 
-async def drain_outbox(limit: int = 50) -> int:
+async def drain_outbox(
+    limit: int = 50,
+    *,
+    exclude_topics: frozenset[str] = frozenset(),
+    only_topic: str | None = None,
+) -> int:
     """至少一次处理；消费方按事件 id 幂等。
 
     每次认领 = 一个短事务，handler 在事务外跑（见本节顶部"改之前/现在"）。
     `limit` 是"这一轮最多跑几条"，不是"一次锁几条"。
+
+    `exclude_topics` / `only_topic` 见 `claim_next_outbox_event`：普通 worker
+    排除慢媒体 topic，媒体 worker 只认它。**两个参数都要一路透传到认领查询**
+    ——只在这里过滤是不够的：认领已经把行标成 in_flight 了，再"跳过"等于
+    占着租约不干活，那条事件会白等一个租约周期。
     """
     await refresh_memory_router_if_stale()
     reclaimed = await reclaim_expired_outbox_leases()
@@ -4173,15 +4665,32 @@ async def drain_outbox(limit: int = 50) -> int:
         logger.info("回收过期 outbox 租约 %d 条", reclaimed)
     processed = 0
     for _ in range(max(0, limit)):
-        claim = await claim_next_outbox_event()
+        claim = await claim_next_outbox_event(
+            exclude_topics=exclude_topics, only_topic=only_topic
+        )
         if claim is None:
             break
         fn = HANDLERS.get(claim.topic)
         if fn is None:
             await mark_outbox_unhandled(claim)
             continue
+        # 把这条事件的**遗忘代次**绑进当前任务的上下文，handler 写库前用
+        # `purge.claim_still_valid()` 比对：期间发生过"删掉这个人的记忆"就
+        # 静默作废。用 ContextVar 而不是改 handler 签名——payload 是业务
+        # 参数，代次是调度元信息，而且清理阶段会把 payload 脱敏成
+        # `{"purged": True}`，放里面会连作废依据一起被抹掉。
+        from ling.domains.memory.purge import bind_claim_fence, release_claim_fence
+
+        fence_token = bind_claim_fence(
+            topic=claim.topic,
+            subject_id=claim.subject_id,
+            generation=claim.forget_generation,
+        )
         # 单条失败不影响这一轮的其它事件；异常只用来决定这条事件的状态。
-        error = await _guarded(claim.topic, fn, claim.payload)
+        try:
+            error = await _guarded(claim.topic, fn, claim.payload)
+        finally:
+            release_claim_fence(fence_token)
         await settle_outbox_event(
             claim,
             ok=error is None,
@@ -4223,6 +4732,20 @@ async def run_forever(poll_seconds: float = 2.0) -> None:
     except Exception as exc:  # noqa: BLE001 - 维护投递失败不阻塞主循环
         logger.warning("维护任务投递失败: %s", exc)
 
+    # **媒体 worker 是同进程的第二条循环**（不是第二个进程）。
+    #
+    # 为什么必须在这里 create_task：主循环用 `exclude_topics` 把
+    # `media.video.read` 排除掉了，如果没有人消费它，那条事件会**永远**停在
+    # pending——入口返回 202「已安排，尚未读到结果」，而永远不会有结果。这比
+    # 报错更糟：它看起来像还在排队。
+    #
+    # 传给它的是**主循环的 stop 事件**：一次 SIGTERM 同时停两条线，不用装
+    # 第二套信号处理器，也不用重复 init（见 `_media_worker_loop` 的说明）。
+    media_task = asyncio.create_task(
+        _media_worker_loop(stop, poll_seconds=poll_seconds), name="media-worker"
+    )
+    logger.info("媒体 worker 已随主循环启动（topic=media.video.read 并发=1）")
+
     try:
         # 周期任务统一走注册表：加了一个 handler 就必须在 PERIODIC_JOBS
         # 里登记，否则 test_worker_dispatch 会红。这样"注册了但没人派发"
@@ -4253,7 +4776,10 @@ async def run_forever(poll_seconds: float = 2.0) -> None:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("告警检查异常: %s", exc)
             try:
-                count = await drain_outbox()
+                # **排除媒体 topic**：慢视频会把这条串行循环堵住，而撤回/摘要/
+                # 日程都排在同一条队列上。媒体由 `_media_worker_loop` 这条
+                # 独立循环消费（并发 1，见上面 create_task），两条线互不影响。
+                count = await drain_outbox(exclude_topics=MEDIA_EXCLUDED_FROM_MAIN_WORKER)
                 if count:
                     logger.info("outbox 处理 %d 条", count)
             except Exception as exc:  # noqa: BLE001 - worker 不能因一次失败退出
@@ -4263,6 +4789,14 @@ async def run_forever(poll_seconds: float = 2.0) -> None:
             except TimeoutError:
                 continue
     finally:
+        # 先停媒体线：它可能正卡在 `wait_for(stop.wait())` 或一次 drain 里。
+        # `cancel()` 之后**必须 await**——不 await 的话任务可能还在跑，而
+        # 下面已经 `dispose_engine()` 了，那条连接池被拆时会报一堆
+        # "Event loop is closed"。`suppress(CancelledError)` 是因为这里正是
+        # 我们自己取消的，那个异常是预期结果而不是错误。
+        media_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await media_task
         # 正常退出时主动放掉自己持有的 outbox 租约：否则重启后的 worker 要
         # 白等一个租约周期（10 分钟）才补投。崩溃走不到这里，那种情况由
         # 租约到期兜底——两条路都要有，不能只依赖优雅退出。
@@ -4319,14 +4853,36 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
     # 触发；旧 `agenda_plans` 仍可读，手工小事仍走 AgendaService。
     PeriodicJob("life.tick", handle_life_tick, {}, LIFE_TICK_SECONDS),
     PeriodicJob("media.describe", handle_media_describe, {}, MEDIA_DESCRIBE_SECONDS),
+    # 视频后台取证作业的**零模型**清理：排队超时→expired、租约过期→
+    # 退回排队或记 unknown（按 `model_started_at` 分岔，见 jobs.py）。
+    # 它只读作业表，不碰证据、不碰模型——"没有新作业的定时扫描必须零模型"。
+    PeriodicJob(
+        "media.read.cleanup",
+        handle_media_read_cleanup,
+        {},
+        MEDIA_READ_CLEANUP_SECONDS,
+    ),
     # 收集阶段没有开关：它只登记候选，发不发由 proactive.dispatch 与
     # `proactive_delivery_enabled` 决定（见 handle_proactive_collect）。
     PeriodicJob("proactive.collect", handle_proactive_collect, {}, PROACTIVE_COLLECT_SECONDS),
     PeriodicJob("proactive.draft", handle_proactive_draft, {}, PROACTIVE_DRAFT_SECONDS),
     PeriodicJob("proactive.dispatch", handle_proactive_dispatch, {}, PROACTIVE_DISPATCH_SECONDS),
     PeriodicJob("session.purge", handle_session_purge, {}, SESSION_PURGE_SECONDS),
+    # 记忆真删的清理阶段兜底：请求阶段会投一次 memory.purge，但那次投递
+    # 可能失败、清理本身也可能失败。没有这个扫描，墓碑会永远停在 pending，
+    # 而用户以为已经删干净了——这是"删除"链上唯一保证最终一致的东西。
+    PeriodicJob(
+        "memory.purge.sweep",
+        handle_memory_purge_sweep,
+        {},
+        MEMORY_PURGE_SECONDS,
+    ),
     PeriodicJob("self.timeline", handle_self_timeline, {}, SELF_TIMELINE_SECONDS),
 )
+
+#: 普通 worker **不认领**的 topic：它们慢（分钟级），放进串行循环会把整条
+#: 队列堵死。每一个都必须有专用 worker 消费，否则事件会永远 pending。
+MEDIA_EXCLUDED_FROM_MAIN_WORKER: frozenset[str] = frozenset({"media.video.read"})
 
 # 由 outbox 投递的 topic（不是周期任务，是事件驱动）。
 # `schedule.*` / `dream.*` / `sleep.*` 由 `life.schedule` 在到期边界投递，
@@ -4336,6 +4892,11 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     "dream.generate",
     "memory.archive",
     "memory.extract",
+    # 真删的清理阶段：由 `POST /v1/memory/forget` 在**同一事务**里投递。
+    # 不能做成周期任务——墓碑 id 在 payload 里，清理要跟着那次请求走。
+    # 它与 `memory.purge.sweep` 互补：一条保证"请求必然触发立即清理"，
+    # 一条保证"投递失败/清理失败也迟早会被捡起来"。
+    "memory.purge",
     "relationship.update",
     "schedule.outline",
     "schedule.refine",
@@ -4346,6 +4907,10 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     "schedule.seam",
     "sleep.settle",
     "window.summary",
+    # 视频后台取证（裁决 §3.3）。由入口端点同事务投递，**由专用媒体 worker
+    # 消费**：普通 worker 在 `run_forever` 里用 `exclude_topics` 排除它，
+    # 否则一条慢视频会把撤回/摘要/日程全堵在后面。
+    "media.video.read",
 })
 
 # **只保留手工触发**的 handler。注册它们不是为了自动跑，而是为了：

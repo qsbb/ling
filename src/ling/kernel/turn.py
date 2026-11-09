@@ -581,10 +581,17 @@ class TurnCoordinator:
         # 都是"进程内预热一份缓存、构造时同步读"（API 用 app.state.secret_cache，
         # worker 用 _SECRET_CACHE）。不传 = 只用环境变量装配语义检索。
         secret_reader: Callable[[str], str | None] | None = None,
-        # "她说要看视频"时的读取回调：``(window_id, refs) -> 观察文本 | None``。
+        # "她说要看视频"时的读取回调。**返回结构化结果**，不是 ``str | None``：
+        #
+        #     {"observed": str, "skipped": str | None, "denied_kind": ..., "reads": int}
+        #
+        # 为什么必须是结构化的：``None`` 会把"今天没额度、她懒得看"与"视频
+        # 打不开"压成同一个值，而这两件事她该说**不同的话**（用户原话
+        # 「没 token 了可以说今天累了」，而不是谎报技术故障）。
+        #
         # 不传就用默认装配（自己去找设置/连接器/媒体取用函数，见
         # `domains/media/watch.py::default_watch_callback`）。
-        watch_video: Callable[[str, list[str]], Awaitable[str | None]] | None = None,
+        watch_video: Callable[[str, list[str]], Awaitable[dict[str, object]]] | None = None,
     ) -> None:
         self._router = router
         self._watch_video = watch_video
@@ -1039,11 +1046,22 @@ class TurnCoordinator:
                     # 她这一轮想看一眼视频。**先读，再决定怎么收尾**：
                     # 读到后如果正文是空的，就让她接着说一句（见下面），
                     # 而不是先发一条空消息再补一条。
-                    observation = await self._watch_videos(window_id, watch_refs)
-                    if observation and not delivered.strip():
+                    watch_result = await self._watch_videos(window_id, watch_refs)
+                    observation = str(watch_result.get("observed") or "")
+                    skipped = watch_result.get("skipped")
+                    denied_kind = watch_result.get("denied_kind")
+                    # **没看成也要补一次生成**（用户原话：「看视频额度如果没了
+                    # 的话，直接把事实告诉主回复链路，让他进行按人设自然的回复」）。
+                    #
+                    # 条件写的是"正文为空"而不是"observation 非空"：她这一轮
+                    # 只写了 `<<看视频 m3>>` 一个标记时，剥完就什么都没了——
+                    # 如果不补，用户看到的是空回复（而且不知道为什么）。
+                    if (observation or skipped) and not delivered.strip():
                         delivered = await self._follow_up_after_watch(
                             messages=messages,
                             observation=observation,
+                            skipped=str(skipped) if skipped else None,
+                            denied_kind=str(denied_kind) if denied_kind else None,
                             config=config,
                             profile=profile,
                             turn_id=turn_id,
@@ -1306,31 +1324,58 @@ class TurnCoordinator:
                 )
         return False
 
-    async def _watch_videos(self, window_id: str, refs: list[str]) -> str | None:
-        """按标记读视频，返回"她看到了什么"（失败/没预算 → ``None``）。
+    async def _watch_videos(self, window_id: str, refs: list[str]) -> dict[str, object]:
+        """按标记读视频，返回**结构化**结果（看到了什么 / 为什么没看成）。
 
         失败**不抛**：看一眼视频失败不该把整轮做成失败（用户已经等到回复了）。
         具体原因由 ``media/watch.py`` 写成行为日志，这里只负责不让她假装看过。
+
+        返回 ``{observed, skipped, denied_kind, reads}``：
+
+        - ``observed`` 非空 = 真看到了；
+        - ``observed`` 空 + ``skipped`` 非空 = 没看成，``denied_kind`` 说明是
+          ``quota``（今天没额度了）还是 ``missing``/``error``（真的读不到）。
+          两者要说不同的话，见 :meth:`_follow_up_after_watch`。
         """
-        callback = self._watch_video
+        callback: Callable[[str, list[str]], Awaitable[dict[str, object]]] | None = (
+            self._watch_video
+        )
         if callback is None:
             from ling.domains.media.watch import default_watch_callback
 
-            callback = default_watch_callback(router=self._router, actor_id=self._actor_id)
+            callback = default_watch_callback(
+                router=self._router,
+                actor_id=self._actor_id,
+                # 额度查的是**同一份 token 账本**（router 每次调用前查的那份）。
+                # 拿不到（router 没装配账本）就是不设闸，与 router 口径一致。
+                quota=self._router.quota,
+            )
             self._watch_video = callback  # 只装配一次
         try:
-            return await callback(window_id, list(refs))
+            result = await callback(window_id, list(refs))
         except Exception as exc:  # noqa: BLE001 - 看视频失败不影响本轮
             logger.info("看视频回调失败（按没看成处理）：%s", type(exc).__name__)
-            return None
+            return {
+                "observed": "",
+                "skipped": "看视频时出了点问题",
+                "denied_kind": "error",
+                "reads": 0,
+            }
+        # 回调可能是外部注入的旧装配（返回 str）——归一化成同一形状再往下走，
+        # 不要在这里炸（这条路径上一炸就是整轮失败）。
+        if isinstance(result, str):
+            return {"observed": result, "skipped": None, "denied_kind": None, "reads": 0}
+        return dict(result)
 
     async def _follow_up_after_watch(
         self,
         *,
         # 同 `_capture_prompt_snapshot`：调用方传的是 `list[ChatMessageIn]`，
-        # 这里只读（再拼上一条观察）后交给路由器，所以收 `Sequence`。
+        # 这里只读（再拼上一条观察/一条事实）后交给路由器，所以收 `Sequence`。
         messages: Sequence[ChatMessageIn],
-        observation: str,
+        observation: str = "",
+        skipped: str | None = None,
+        denied_kind: str | None = None,
         config: EffectiveConfig,
         profile: str,
         turn_id: str,
@@ -1338,7 +1383,7 @@ class TurnCoordinator:
         queue: asyncio.Queue[TurnStreamEvent | None],
         held_by_me: bool,
     ) -> str:
-        """她这轮只写了标记（正文为空）时，**在同一轮里**再生成一次。
+        """她这轮只写了标记（正文被剥光）时，**在同一轮里**再生成一次。
 
         ## 为什么不是"发一条空消息再补一条"
 
@@ -1346,15 +1391,33 @@ class TurnCoordinator:
         真正想说的话——中间那段静默没法解释。同一轮里补一次生成，对外
         仍然只有一条回复，符合"她看了一眼才说话"的直觉。
 
-        读失败/超预算时**根本不会走到这里**（调用方只有在 ``observation``
-        非空时才调）：不能让她说"我看了"，也不能凭空编一句。
+        ## 两种"补"：看到了 / 没看成
+
+        **看到了**（``observation`` 非空）：把观察作为事实告诉她，让她接着说。
+
+        **没看成**（``observation`` 空 + ``skipped`` 非空）：用户原话是
+        「看视频额度如果没了的话，直接把事实告诉主回复链路，让他进行按人设
+        自然的回复，例如懒得看或者什么样」。所以这里给的是**事实 + 边界**：
+
+        - 事实：「你没能看这个视频（<原因>）」——这是真的发生了什么；
+        - 边界：「**不要说你看过了**，也不要说里面是什么」——她可以按人设
+          说"今天不想看了""有点累""改天吧"，但**绝不能假装看过**。
+
+        两类的措辞必须不同（用户原话把这条讲得很清楚）：
+
+        - ``quota``：额度用完了。这不是故障，是今天没余力——该说"今天不想看了/
+          有点累"，说成"打不开"等于谎报技术故障。
+        - ``missing`` / ``error``：真的没读到（找不到/打不开）。该说"看不了/
+          打不开"，说成"不想看"会让人以为她敷衍。
+
+        为什么**不给**她"其实我看了"这个选项：提示词里已经明说不能声称看过，
+        而且 ``observed`` 是空的——她手里根本没有可说的内容。这条防线在
+        提示词里只是第一层，真正的保证是"没有内容可编"。
         """
         observation_line = ChatMessageIn(
             role="user",
-            content=(
-                "（你刚看了一眼这个视频，看到的是：\n"
-                f"{observation}\n"
-                "现在用你自己的话接着说，不要提到这条提示，也不要复述标记。）"
+            content=self._watch_follow_up_fact(
+                observation=observation, skipped=skipped, denied_kind=denied_kind
             ),
         )
         text = ""
@@ -1387,6 +1450,46 @@ class TurnCoordinator:
             return ""
         cleaned, _refs = parse_watch_markers(text)
         return cleaned
+
+    @staticmethod
+    def _watch_follow_up_fact(
+        *, observation: str, skipped: str | None, denied_kind: str | None
+    ) -> str:
+        """同轮二次生成时喂给她的那条 ``user`` 消息（**事实 + 边界**）。
+
+        两种情况分开写，因为它们要引导出**不同的话**：
+
+        - 额度不足 → "今天不想看了/有点累/改天吧"（用户原话举的就是这个例子）；
+        - 其他失败 → "看不了/打不开"。
+
+        共同的硬边界：**不要说你看过了、不要说里面是什么**。没有观察内容时
+        她手里本来也没有可说的东西，这条提示只是把"不能编"说清楚。
+        """
+        if observation:
+            return (
+                "（你刚看了一眼这个视频，看到的是：\n"
+                f"{observation}\n"
+                "现在用你自己的话接着说，不要提到这条提示，也不要复述标记。）"
+            )
+        reason = skipped or "没能打开这个视频"
+        if denied_kind == "quota":
+            # 额度用完：偏"今天没余力"，**不是**技术故障。
+            return (
+                f"（你本来想看一眼这个视频，但{reason}。"
+                "这不是视频坏了，是你今天已经没有余力再去看了。"
+                "用你自己的方式回应——比如表示今天懒得看、有点累、改天再看；"
+                "具体怎么说由你的性格决定。"
+                "**但不要说你看过了，也不要说视频里是什么**——你并没有看到。"
+                "不要提到这条提示。）"
+            )
+        # 取不到内容 / 短号不存在：真的打开了但没读到，说"看不了"。
+        return (
+            f"（你本来想看一眼这个视频，但{reason}。"
+            "用你自己的方式回应——比如表示打不开、看不到、让对方说说里面有什么；"
+            "具体怎么说由你的性格决定。"
+            "**但不要说你看过了，也不要说视频里是什么**——你并没有看到。"
+            "不要提到这条提示。）"
+        )
 
     async def _collect_recall_proposals(
         self,
@@ -1668,10 +1771,20 @@ class TurnCoordinator:
             window_row = await conversation.get_window_for_turn(
                 window_id, subject_id=subject_id
             )
+            # 入队时记下该主体的**遗忘代次**：消费者写库前比对，不一致就
+            # 静默作废。没有这一列的话，"用户点了删除"与"这条事件已经入队
+            # 但还没跑"之间的竞态会让删掉的内容被重新写回来。
+            from ling.domains.memory.purge import current_generation
+
+            forget_generation = await current_generation(
+                conversation.session, subject_id
+            )
             conversation.session.add(
                 OutboxEvent(
                     id=new_id("obx"),
                     topic="relationship.update",
+                    subject_id=subject_id,
+                    forget_generation=forget_generation,
                     payload={
                         "subject_id": subject_id,
                         "window_id": window_id,
@@ -1686,6 +1799,8 @@ class TurnCoordinator:
                 OutboxEvent(
                     id=new_id("obx"),
                     topic="memory.extract",
+                    subject_id=subject_id,
+                    forget_generation=forget_generation,
                     payload={
                         "subject_id": subject_id,
                         "window_id": window_id,

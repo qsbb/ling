@@ -633,6 +633,18 @@ class SessionRecord(StrictModel):
     channel: str = "web"
     # 平台侧对端 id：群聊是群号、私聊是对方 QQ 号；web 窗口为 ``null``。
     peer_id: str | None = None
+    # 是否已置顶。**列表排序的第一关键字**：置顶的永远在最前。
+    #
+    # 为什么不是 ``pinned_at``：前端只需要"要不要显示图钉"，时间戳是服务端
+    # 排序用的实现细节；把它放进契约，前端迟早会有人拿它做展示（"置顶于
+    # 3 天前"这种没人要的信息）。
+    pinned: bool = False
+    # 这个会话对端的好感度（``relationship_states.familiarity``，0~1）。
+    #
+    # 排序的第二关键字（降序）。**查不到就是 ``null``，不是 0**：
+    # 0 是"关系还没建立"，``null`` 是"我们根本不知道这个人"——把未知写成 0
+    # 会让一个从没聊过的人排到"聊过但还生疏"的人后面，而这两者本不该比较。
+    familiarity: float | None = None
 
 
 class ChatMessage(StrictModel):

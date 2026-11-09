@@ -20,10 +20,7 @@ import pytest
 from ling.domains.media.describe import MediaDescriber
 from ling.domains.media.service import EvidenceView
 from ling.domains.media.video import (
-    DAILY_LIMIT,
     MAX_FRAMES,
-    WINDOW_HOURLY_LIMIT,
-    WatchBudget,
     extract_frames,
     ffmpeg_available,
     parse_watch_markers,
@@ -119,41 +116,131 @@ def test_extract_frames_from_a_real_clip(tmp_path) -> None:  # noqa: ANN001
     assert sample.long_video is False
 
 
-# ------------------------------------------------------------------ 预算闸
+# ------------------------------------------------------------------ 额度闸（token 账本）
 
 
-def test_budget_hourly_limit() -> None:
-    budget = WatchBudget()
-    clock = [1000.0]
-    budget._clock = lambda: clock[0]
-    for _ in range(WINDOW_HOURLY_LIMIT):
-        assert budget.deny_reason("w") is None
-        budget.record("w")
-    assert "每小时" in (budget.deny_reason("w") or "")
-    # 另一个窗口不受影响（预算是按窗口算的）
-    assert budget.deny_reason("other") is None
+@pytest.mark.asyncio
+async def test_quota_allows_when_no_limit() -> None:
+    """没设日限额 = 放行（与 router 的 `daily_limit_effective()` 同一个口径）。"""
+    from ling.domains.media.watch import video_quota_denial
+
+    assert await video_quota_denial(
+        config_reader=_QuotaConfigReader(daily_limit=None),
+        quota=_Quota(used=10_000_000),
+        profile="perception.video",
+    ) is None
 
 
-def test_budget_daily_limit() -> None:
-    budget = WatchBudget()
-    clock = [1000.0]
-    budget._clock = lambda: clock[0]
-    for index in range(DAILY_LIMIT):
-        # 每次换一个窗口，避开"每小时"那条
-        clock[0] += 10
-        assert budget.deny_reason(f"w{index}") is None
-        budget.record(f"w{index}")
-    assert "每天" in (budget.deny_reason("fresh") or "")
+@pytest.mark.asyncio
+async def test_quota_denies_when_used_reaches_limit() -> None:
+    """用完了就拒绝，且**人话里带已用/上限**（排障与用户都看这两个数）。"""
+    from ling.domains.media.watch import video_quota_denial
+
+    note = await video_quota_denial(
+        config_reader=_QuotaConfigReader(daily_limit=1000),
+        quota=_Quota(used=1000),
+        profile="perception.video",
+    )
+    assert note is not None
+    assert "额度" in note
+    assert "1000" in note, f"没给出已用/上限的数字：{note}"
+    assert "tokens" in note
 
 
-def test_budget_window_expires() -> None:
-    budget = WatchBudget()
-    clock = [1000.0]
-    budget._clock = lambda: clock[0]
-    for _ in range(WINDOW_HOURLY_LIMIT):
-        budget.record("w")
-    clock[0] += 3601
-    assert budget.deny_reason("w") is None
+@pytest.mark.asyncio
+async def test_quota_allows_when_below_limit() -> None:
+    from ling.domains.media.watch import video_quota_denial
+
+    assert await video_quota_denial(
+        config_reader=_QuotaConfigReader(daily_limit=1000),
+        quota=_Quota(used=999),
+        profile="perception.video",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_quota_without_store_allows() -> None:
+    """没装配账本 = 不设闸（与 router 在 `quota is None` 时放行一致）。"""
+    from ling.domains.media.watch import video_quota_denial
+
+    assert await video_quota_denial(
+        config_reader=_QuotaConfigReader(daily_limit=1),
+        quota=None,
+        profile="perception.video",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_quota_reads_the_video_provider_not_another() -> None:
+    """查的是 `perception.video` 槽位绑的那家，不是别的职责的家。"""
+    from ling.domains.media.watch import video_quota_denial
+
+    quota = _Quota(used=500)
+    await video_quota_denial(
+        config_reader=_QuotaConfigReader(daily_limit=1000, provider_id="video-provider"),
+        quota=quota,
+        profile="perception.video",
+    )
+    assert quota.asked == ["video-provider"]
+
+
+class _Quota:
+    """假账本：只实现 `used()`。"""
+
+    def __init__(self, *, used: int) -> None:
+        self._used = used
+        self.asked: list[str] = []
+
+    async def used(self, provider_id: str) -> int:
+        self.asked.append(provider_id)
+        return self._used
+
+
+class _QuotaConfigReader:
+    """假配置读取器：一个职责绑一家供应商，带或不带日限额。
+
+    名字带 `_Quota` 前缀是因为本文件后面还有另一个 `_ConfigReader`
+    （原生/抽帧那条路径用的最小桩）。同名会让**后定义的那个**静默生效，
+    而报错信息只会说"参数不对"，查起来要绕一圈。
+    """
+
+    def __init__(self, *, daily_limit: int | None, provider_id: str = "p1") -> None:
+        self._limit = daily_limit
+        self._provider_id = provider_id
+
+    async def effective(self):  # noqa: ANN201
+        """一份最小的已发布配置：只有一个职责绑一家供应商。
+
+        **不 monkey-patch `resolve_profile`**：`EffectiveConfig` 是 frozen
+        dataclass，赋值直接 `FrozenInstanceError`；而且额度判据要走的本来就是
+        真实解析（"这个职责最终跑在哪家"是它的唯一裁决）。用真解析也就多
+        拼几个对象，换来的是"测试测的就是生产那条路"。
+        """
+        from ling.ports.config import (
+            EffectiveConfig,
+            ProfileBinding,
+            ProviderConfig,
+            ProviderModel,
+        )
+
+        provider = ProviderConfig(
+            provider_id=self._provider_id,
+            kind="fake",
+            models=(ProviderModel(model_id="deterministic"),),
+            daily_token_limit=self._limit,
+        )
+        return EffectiveConfig(
+            revision=1,
+            providers={self._provider_id: provider},
+            profiles={
+                "perception.video": ProfileBinding(
+                    profile="perception.video",
+                    provider_id=self._provider_id,
+                    model_id="deterministic",
+                )
+            },
+            test_mode=True,
+        )
 
 
 # ------------------------------------------------------------------ 读视频
@@ -203,13 +290,13 @@ class _FakeService:
         return [v for v in self._videos if v.description is not None]
 
 
-async def _watch(videos: list[EvidenceView], refs: list[str], *, mode: str = "frames", budget=None):  # noqa: ANN001, ANN202
+async def _watch(videos: list[EvidenceView], refs: list[str], *, mode: str = "frames", quota_denial=None):  # noqa: ANN001, ANN202
     from ling.infra.db import session_scope  # noqa: F401 - 只为保持导入形态与生产一致
 
     service = VideoWatchService.__new__(VideoWatchService)
     service._actor_id = "actor_ling"  # noqa: SLF001
     service._describer = _FakeDescriber()  # noqa: SLF001
-    service._budget = budget or WatchBudget()  # noqa: SLF001
+    service._quota_denial = quota_denial  # noqa: SLF001
     service._service = _FakeService(videos)  # noqa: SLF001
     service._session = None  # noqa: SLF001
     return await service.watch(window_id="w1", refs=refs, mode=mode)
@@ -238,17 +325,58 @@ async def test_watch_reads_once_then_uses_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_budget_blocks_and_produces_no_observation() -> None:
-    budget = WatchBudget()
-    budget.window_hourly = 1
-    budget.record("w1")
-    outcome = await _watch(
-        [_video("media_bbbb2222")],
-        [short_ref_for("media_bbbb2222")],
-        budget=budget,
+async def test_quota_denied_produces_no_observation_and_marks_kind() -> None:
+    """额度不足：`observed` 必须为空（不能让她以为自己看了），
+    且 `denied_kind == "quota"`（调用方据此说"今天不想看了"而不是"打不开"）。"""
+
+    async def _denied() -> str:
+        return "今天的看视频额度用完了（已用 1000 / 上限 1000 tokens）"
+
+    describer = _FakeDescriber()
+    service = VideoWatchService.__new__(VideoWatchService)
+    service._actor_id = "actor_ling"  # noqa: SLF001
+    service._describer = describer  # noqa: SLF001
+    service._quota_denial = _denied  # noqa: SLF001
+    service._service = _FakeService([_video("media_bbbb2222")])  # noqa: SLF001
+    service._session = None  # noqa: SLF001
+    outcome = await service.watch(
+        window_id="w1", refs=[short_ref_for("media_bbbb2222")], mode="frames"
     )
-    assert outcome.observed == "", "超预算不能让她以为自己看了"
-    assert "预算" in (outcome.skipped or "")
+
+    assert outcome.observed == "", "额度不足不能让她以为自己看了"
+    assert outcome.skipped
+    assert outcome.denied_kind == "quota"
+    assert describer.calls == [], "额度不足时**不该**调视觉模型"
+
+
+@pytest.mark.asyncio
+async def test_no_observation_when_reading_fails() -> None:
+    """读失败：`observed` 空 + `denied_kind == "error"`（区别于额度不足）。"""
+
+    class _Boom:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def describe_video(self, evidence, *, mode: str = "frames"):  # noqa: ANN001, ANN201
+            from ling.domains.media.describe import MediaReadError
+
+            self.calls += 1
+            raise MediaReadError("视频下载失败: ConnectError")
+
+    describer = _Boom()
+    service = VideoWatchService.__new__(VideoWatchService)
+    service._actor_id = "actor_ling"  # noqa: SLF001
+    service._describer = describer  # noqa: SLF001
+    service._quota_denial = None  # noqa: SLF001
+    service._service = _FakeService([_video("media_cccc3333")])  # noqa: SLF001
+    service._session = None  # noqa: SLF001
+    outcome = await service.watch(
+        window_id="w1", refs=[short_ref_for("media_cccc3333")], mode="frames"
+    )
+
+    assert outcome.observed == ""
+    assert outcome.denied_kind == "error"
+    assert describer.calls == 1
 
 
 # ------------------------------------------------------------------ 原生退回

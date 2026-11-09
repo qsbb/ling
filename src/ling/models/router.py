@@ -149,6 +149,18 @@ class ModelRouter:
 
     # ---------------------------------------------------------- 额度
 
+    @property
+    def quota(self) -> TokenQuotaStore | None:
+        """这份 token 账本（没装配时为 ``None``）。
+
+        为什么开放一个**只读**属性：看视频要查"今天这家还有额度吗"，而那份账
+        就挂在这里（`_quota_block` 每次调用前查的就是它）。让调用方去摸
+        `_quota` 私有字段，等于把"账本放在哪"变成实现细节——换个存法就会有
+        一处悄悄失效。这里只暴露对象本身，**不给** reset/clear 之类的方法：
+        账本只能被 `record()` 写。
+        """
+        return self._quota
+
     async def _quota_block(self, pcfg: ProviderConfig | None) -> ModelError | None:
         """今天的额度用完了就返回一个错误，否则 None。
 
