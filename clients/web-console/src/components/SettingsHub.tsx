@@ -247,12 +247,12 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   {
     key: 'connectors',
     title: '接入与连接',
-    note: '她从哪条线收发消息：OneBot（NapCat 等）与 QQ 官方机器人。配置来自宿主的 .env，本轮只读。',
+    note: '她从哪条线收发消息：OneBot（NapCat 等）与 QQ 官方机器人。可以在这里直接改，保存后立刻尝试生效。',
     entries: [
       {
         key: 'connectors',
         label: '接入器',
-        verb: '看每个渠道的凭据齐不齐、现在连没连上、缺的那一项该在 .env 里改哪个变量。',
+        verb: '改每条线的凭据与开关；保存会立刻切换，起不来会自动恢复旧配置。',
         path: '/settings/connectors',
         testid: 'open-connectors',
       },

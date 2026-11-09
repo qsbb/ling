@@ -27,6 +27,9 @@ import type {
   ModelHealthResponse,
   ConsentsResponse,
   ConsentUpdate,
+  ConnectorChangeRequest,
+  ConnectorChangeResult,
+  ConnectorResetResponse,
   ConnectorsResponse,
   StopResponse,
   TaxonomyResponse,
@@ -231,6 +234,50 @@ function jsonInit(method: string, body: unknown): RequestInit {
   };
 }
 
+/**
+ * 读响应体里**未被 schema 声明**的 `error.field`（哪个键错了）。
+ *
+ * `parseErrorResponse` 只抬 `code/message/detail/trace_id`，会丢掉 `field`；
+ * 而"逐字段指出哪个错了"必须靠它。这里读的是**另一份** body 文本，所以由
+ * `connectorWriteError` 统一读一次再同时交给两边，不重复消费流。
+ */
+function fieldFromPayload(payload: unknown): string | null {
+  const field = (payload as { error?: { field?: unknown } } | null)?.error?.field;
+  return typeof field === 'string' && field !== '' ? field : null;
+}
+
+/**
+ * 保存接入器失败时的错误：与原 `ApiError` **同一个对象**，只补一个 `field`。
+ *
+ * 为什么不是包一层新类：`explainError` 按 `instanceof ApiError` 分支、
+ * 测试按 message/code 判等，包一层会让"同一个 422"在两处的身份不同。
+ * 直接挂在原实例上，`connectorErrorField()` 读得到，其余行为一字不变。
+ */
+async function connectorWriteError(response: Response): Promise<ApiError> {
+  const raw = await response.clone().text();
+  let payload: unknown = null;
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = null;
+    }
+  }
+  const error = await parseErrorResponse(response);
+  const field = fieldFromPayload(payload);
+  if (field !== null) {
+    Object.defineProperty(error, 'field', { value: field, enumerable: false });
+  }
+  return error;
+}
+
+/** 保存结果里被抬出来的字段名（只有 `api.saveConnectorConfig` 会带）。 */
+export function connectorErrorField(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const field = (error as { field?: unknown }).field;
+  return typeof field === 'string' && field !== '' ? field : null;
+}
+
 /** 发送/重试返回原始 SSE 响应，由 sse.ts 解析。 */
 async function postStream(path: string, body: unknown | null, signal: AbortSignal): Promise<Response> {
   let response: Response;
@@ -384,13 +431,68 @@ export const api = {
     return request<SettingsConfig>('/v1/settings/config');
   },
   /**
-   * 接入器（渠道）的只读诊断。
+   * 接入器（渠道）的配置 + 诊断（`GET /v1/settings/connectors`，v2）。
    *
-   * 不带任何参数：值在宿主 `.env` 里，这条端点只报告"设了没有、通没通"，
-   * 密钥值连后端视图对象都不进（见 `ling/settings/connectors.py`）。
+   * 值落在 DB 覆盖层（容器根目录只读，写不了 `.env`）。这条读端点里**没有**
+   * 密钥值：`kind==='secret'` 的字段连值都不进视图对象，只有 `configured`
+   * 与（owner 才有的）`preview`。
    */
   connectors(): Promise<ConnectorsResponse> {
     return request<ConnectorsResponse>('/v1/settings/connectors');
+  },
+  /**
+   * 保存某个接入器的配置并**立刻尝试生效**（owner + 同源 + 最近 15 分钟
+   * 重新登录过，见 `settings.py:788-833`）。
+   *
+   * `ifMatch` 是卡片上的 `generation`：并发保存只有一个赢家，输了拿 409。
+   * **202 不等于"已生效"**——终态看返回的 `state`，`rolled_back` 是失败。
+   *
+   * 422/409 的响应体里带 `error.field`（哪个键错了），用
+   * `connectorErrorField()` 取；非写路径的错误永远返回 null。
+   */
+  async saveConnectorConfig(
+    scope: string,
+    change: ConnectorChangeRequest,
+    ifMatch: number,
+  ): Promise<ConnectorChangeResult> {
+    let response: Response;
+    try {
+      response = await fetch(`/v1/settings/connectors/${encodeURIComponent(scope)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          // 后端接受不带引号的整数，也会 strip 掉引号（settings.py:878-889）。
+          'If-Match': String(ifMatch),
+        },
+        body: JSON.stringify(change),
+      });
+    } catch (cause) {
+      throw new ApiError(
+        0,
+        'network_error',
+        '无法连接服务端，请确认后端已启动或网络可用',
+        true,
+        cause instanceof Error ? cause.message : null,
+      );
+    }
+    if (response.status === 401) {
+      unauthorizedHandler?.();
+      throw await parseErrorResponse(response);
+    }
+    if (!response.ok) throw await connectorWriteError(response);
+    return (await response.json()) as ConnectorChangeResult;
+  },
+  /**
+   * 把三个 scope 的覆盖**全部清空**（回退到 env / 默认）。
+   *
+   * 一个操作跟踪三个 scope，全部成功才算成功；任一 scope 重建失败会保留原
+   * active——所以 `ok:false` 必须如实展示，不能说成"已恢复默认"。
+   */
+  resetConnectorConfig(): Promise<ConnectorResetResponse> {
+    return request<ConnectorResetResponse>('/v1/settings/connectors/reset', {
+      method: 'POST',
+    });
   },
   saveDraft(payload: {
     providers?: ProviderDraftInput[];

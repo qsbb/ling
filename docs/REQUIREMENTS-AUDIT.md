@@ -15,9 +15,9 @@
 | R1 模型即点即换 | **代码已接通**：槽位直接 `<select>` 并按 provider `optgroup` 分组，`clients/web-console/src/components/model-settings/RolesPanel.tsx:193-225`；SSR 用例 `model-settings.test.tsx:603-642`。 | 未做本次真浏览器点击与保存回读；不把 SSR 当交互验收。 |
 | R2 关系页卡死 | **主要病因已修**：首屏 50 条，只有展开卡才建候选，`IdentityPage.tsx:135-170,230-237`；API 有 `LIMIT/OFFSET`，`manage.py:1182-1209,1212-1287`。 | `identity.browser.test.tsx:307-330` 用 2000 条**模拟接口**但只加载 50；真实 2000 人逐页加载到底的延迟、内存未测。 |
 | R3 手动生成日程 | **可见入口与后端有链路**：按钮及轮询 `LifeTimeline.tsx:1070-1151,1227-1288,1399-1438`；API `api.ts:476`。 | 本次未以真实模型验证“点后生成成功”；需端到端验收失败和重试。 |
-| R4 上游失效时回退 | **后端部分完成**：统一解析 `domains/fallback.py:174-195`；手机节奏使用 `phone/service.py:338-342`，总览返回来源 `dashboard.py:574-607`。 | 前端 `DashboardPage.tsx:305-333` 只画状态/下次时间，未显示 `fallback`；声称有可见 `FallbackNotice` 缺证据。 |
+| R4 上游失效时回退 | **已补全**（2026-11-10）：前端新增 `FallbackHint`，按 `sections.phone.data.fallback`（`used/source/reason`）在回退时明说“这是按默认参数算的，不是她此刻的真实状态”；正常态零噪音。可用性卡也补上 scene 回退提示。真 Chromium 5 项（1440/375 无溢出）。 | 后端 `describe` 一词两义（见下），属语义改进，不影响本需求。 |
 | R5 总览布局 | **实现有依据**：12 列自适应与 gutter `dashboard.css:1-68`，卡片跨列 `DashboardPage.tsx:690-749`。 | CSS 注释的尺寸不是本次实测；须在 375/1440 和中间宽度浏览器验收。 |
-| R6 接入器配置 | **半成品**：后端 GET/PUT/reset `settings.py:667-748,847-1034`，迁移 0054；前端仅 `api.connectors()`，`api.ts:346-352`。 | `ConnectorsPage.tsx:223-260` 明写“本页只读”，设置入口 `SettingsHub.tsx:248-257` 也引导去 `.env`；用户无法配置。 |
+| R6 接入器配置 | **已完成**（2026-11-10）：前端从只读改为可编辑表单，接 `PUT /v1/settings/connectors/{scope}`，覆盖 202/409/422/503/rolled_back 全部分支；密钥恒空、清空只能走 `clear`；真 Chromium 11 项通过。`SettingsHub` 的“本轮只读”文案已同步改正。 | 无。 |
 | R7 设置布局 | **已有实现**：三组结构 `SettingsHub.tsx:118-150`，双列/窄屏单列 `settings.css:163-166,355-360`；浏览器用例 `settings-layout.browser.test.tsx:167,214`。 | 浏览器用例本次未执行，且文件未跟踪；正式交付需跑并确认未 skip。 |
 | R8 置顶及好感度排序 | **声称完成但实际断链**：置顶 API `sessions.py:244-275`、字段迁移 0059；`sort_windows_for_display` 有排序键 `conversation/service.py:105-144`。 | `sessions.py:222-233` **先** `list_windows()`，**后**查 `familiarities()`，没有把字典传给前者；`list_windows` 空字典排序 `service.py:357-361`。前端无 pin 调用/按钮（`api.ts`、组件检索）；用户不能置顶，也不会按好感度排。 |
 | R9 会话标题 | **后端真接线**：OneBot `get_friend_list` `connector.py:1215-1267`；路由实际调用 `sessions.py:95-129,185-190,222-233`，备注优先 `:163-166`；群名独立采集 `:56-90`。 | 真实 OneBot 返回备注、群名和超时表现未本次在线验收；现有 `test_session_display_fields.py:137-242` 重点测群名/昵称。 |
@@ -26,7 +26,7 @@
 | R12 撤回仅作 LLM 工具 | **核心链路存在**：工具注册 `capabilities/tools.py:281,330-366`、确认路由 `api/routes/recall.py:216-292`；集成 `test_recall_tool.py:214,716-726`，浏览器卡片 `recall.browser.test.tsx:300-308`。 | 本次未接真实 OneBot/QQ 回执测试；“只有工具”应再核对所有入口权限，不能仅看注册。 |
 | R13 人设 10 万 token | **配置上限已提高**：`context.py:123-132` 给 persona 100000；traits 上限 `persona/service.py:157-176`。 | 这里按 2 字符/token **估算** `context.py:1209`；不等于供应商必能接受 10 万输入，需按目标模型上下文验收。 |
 | R14 视频模型/额度 | **同步观看路径接通**：`watch.py:373-395` 明确视频职责；次数常量已删 `video.py:60-74`；token 闸 `watch.py:124-185,256-265`；`turn.py:1044-1073,1474-1483` 传失败事实。 | 后台视频读取第 4 步持久预算尚缺，不能把同步 token 余额闸当成全部视频成本保障；见 R24。 |
-| R15 全局媒体槽 | **未实现**：仅 `docs/MEDIA-EXCLUSIVE-SLOT.md:10-16,88-100`；同步观看走 `turn.py:1327-1355`，媒体 worker 仅自家单并发 `worker.py:1205-1238`。 | 无跨进程共享持有者；跨会话并发同步观看仍可发生。 |
+| R15 全局媒体槽 | **已实现**（2026-11-10）：`media_slots` 单行表 + 迁移 0061 + `domains/media/slot.py`（`FOR UPDATE NOWAIT` 抢占、240 秒租约、代次栅栏、fail-closed）；已接入 `VideoWatchService.watch()` 的耗时区间，生产装配 `enforce_slot=True` 有测试钉住。真 PG 20 并发抢占**恰好 1 个成功**。 | `bilibili_feed`/`livestream` 只留了 kind 常量，尚未接入执行器（设计如此：它们将来争同一行）。 |
 | R16 可等待、自由决定回复时机 | **未实现**：`docs/MEDIA-WILLINGNESS-DESIGN.md:1-13` 明说是方案；当前 `turn.py:1044-1073` 在本轮同步等观看，缺用户可见“稍后回复”状态机。 | 需求复杂且与 R15 方案“忙即拒绝、不排槽队列”存在产品语义冲突，先裁决再实现。 |
 | R17 她有权不看 | **机制部分成立**：`context.py:807-860` 明示“想看才写标记，没写当没看见”；`turn.py:1044-1049` 仅见标记才读。 | 这只证明模型可选择不写；未有真实模型对话样本证明她会按人设拒绝，而非总被诱导看。 |
 | R18 忙态展示 | **未实现且旧手机态未接线**：生产源码中 `start_watching/stop_watching` 只有定义 `phone/service.py:210,231`，调用仅在测试；UI 依赖 `state=watching`，`DashboardPage.tsx:305-312`。 | 开发库 `phone_states` 0 行，故此库当前显示空态“她还没拿起过手机” `dashboard.py:584-599`、`DashboardPage.tsx:343-344`，不能武断说“一直是手机放下了”。 |
@@ -34,7 +34,7 @@
 | R20 睡眠记忆压缩 | **部分已有，不是需求完成**：`compact_low_value` `memory/service.py:951-1021`，`memory.archive` 调用 `worker.py:2673-2694`。 | 仅满足“60 天以上、带 slot/value、同组至少 3 条、重要性低”的确定性合并；没有睡眠事件触发或睡眠回顾。 |
 | R21 后台真删 | **未交付，正在开发**：现有 HTTP 仍调用软清除 `manage.py:272-283`，`forget_subject` 保留原文 `memory/service.py:1431-1486`。 | 新 `purge.py:145-220,223-362` 和迁移 0060、worker handler 已出现，但路由仍未调用 `request_purge`；未验证代次与历史事件脱敏。 |
 | R22 开源记忆设计调研 | **文档产出存在**：`docs/MEMORY-OSS-RESEARCH.md:1-20` 覆盖拟人化写入、召回、睡眠、遗忘（本次工作树未跟踪）。 | 调研产物不是记忆行为改善；随提交确认来源与可追溯性。 |
-| R23 注入正确性 | **诊断存在，根因未修**：候选 500 先截 `memory/service.py:559-574`；相对下限及保底 `:825-835`；情节检索 `:738-769`。 | 当前开发库没有 live assertion，无法从该库证明真实对话正在误注入；风险机制和缺失的反例测试见 B。 |
+| R23 注入正确性 | **边界已复现，不是"随机乱注入"**：候选 500 先截 `memory/service.py:559-574`；相对下限 + 保底 `kept or scored[:1]` 见 `:825-835`。实测（`_bm25_scores` 直接调用）：字面零命中的记忆**不会**进候选池（无 embedder 时只留 BM25>0）；但**弱相关的一定会**——只要它是唯一候选，`kept or scored[:1]` 就保底注入，不看绝对分。 | "无关记忆被注入"不是 bug 而是**相对阈值的固有天花板**：需要绝对分下限才能挡弱相关，而那会把"同义改写"也误杀。若要做，应先补 embedder 再谈阈值；当前无 embedder 的部署下这是已知取舍。 |
 | R24 异步工具 | **仅 C 的执行侧部分接通**：入口 `chat.py:530-565`，媒体 handler/独立循环 `worker.py:1062-1102,4687-4696`，dead 作业收尾 `:4550-4565`。 | `jobs.py:599-655` 无预算预留，`chat.py:536-540` 明言延至第 4 步；不能宣称“成本闸门已完成”。 |
 
 ## B. 对抗性审查：需求、真实 bug 与误报
@@ -216,3 +216,31 @@
 68. 从纯 0047 schema 逐步升级 0054–0060，确保每个对象恰好创建一次。依据：`alembic current=0047`、`heads=0060`、各迁移 `down_revision`。
 69. 对 0054/0058/0059 做有数据的降级演练，只能宣称 schema 可回退，不能宣称内容恢复。依据：`0054_connector_config.py:136-149`、`0058_media_read_jobs.py:167-185`、`0059_window_pinned_at.py:55-58`。
 70. 检查 24+24 件 pending 是否在 worker 恢复后开始认领；若仍 attempts=0，先查调度/连接/版本，再查提取器。依据：开发库 outbox 分组、`worker.py:4653-4731`。
+
+## D. 2026-11-10 补做与当前未完成项
+
+第一轮审查后补掉的三项，以及仍然明确未做的项。**没做完的写没做完**，不用"已有设计"冒充交付。
+
+### 已补完
+
+| 项 | 证据 |
+|---|---|
+| **R6 接入器可编辑** | 表单接 `PUT /v1/settings/connectors/{scope}`；`rolled_back`（HTTP 202）单独文案且不含"已生效"；密钥恒空、清空走 `clear`；`src/connectors.browser.test.tsx` 11 项真 Chromium |
+| **R15 全局媒体槽** | `media_slots` + `0061_media_slot` + `domains/media/slot.py`；20 并发抢占恰好 1 个成功；代次栅栏让旧持有者写入落空；`test_default_watch_callback_enforces_the_slot` 钉住生产装配 |
+| **R4 回退来源可见** | `FallbackHint` 按 `fallback.used/source/reason` 明说"这是默认参数，不是她的真实状态"；`src/dashboard-fallback.browser.test.tsx` 5 项（1440/375 无溢出） |
+
+### 仍未完成（不掩饰）
+
+| 项 | 现状 | 缺什么 |
+|---|---|---|
+| **R16 可等待/自主决定回复时机** | **未实现**。`docs/MEDIA-WILLINGNESS-DESIGN.md` 有完整设计（`DeferredReply` + 到期新轮次 + 新输入取消旧投递） | 持久化的延后回复载体与调度；且与 R15"忙即拒绝、不排队"需要产品裁决先后 |
+| **R18 忙态真实活动** | **未实现**。槽位已能回答"她此刻是否在看媒体"（`slot.current_holder()`），但前端「正在看手机」没有接它 | 把 `current_holder()` 投影到活状态；`PhoneService.start_watching/stop_watching` 仍是生产零调用 |
+| **R19 视频摘要长期沉淀** | **未实现**。上下文只取最近 3 条媒体描述（`context.py:749`），更早的看过的视频彻底消失 | 过期后经筛选走记忆入库流程的定时任务 |
+| **R20 睡眠期记忆压缩** | **部分**。`compact_low_value()` 已存在且每日跑，但只处理"≥60 天、低重要性、同组≥3 条" | 按睡眠事件触发的整合（`docs/SLEEP-MEMORY-CONSOLIDATION.md` 已设计） |
+| **R17 她有权不看** | **机制成立、未验证**。上下文已给她"想看才写标记"的选择 | 真实模型对话样本，证明她确实会拒绝而不是总被诱导 |
+| **R24 异步工具预算** | 执行侧已通，`jobs.py` 无预算预留 | 第 4 步：`behavior_model_calls` + `kind=video_watch` 的持久预留 |
+
+### 本轮新发现、未修的后端小问题（如实记录）
+
+1. `dashboard.py:324` 的 `describe` **一词两义**：它本意是"可用性说明"，却在场景 unknown/过期时补一句"状态正常，可以随时说话"，读起来像在说她的场景正常。前端只能把两块分开讲，语义应由后端用独立字段表达。
+2. `presence.resolve_scene()` 在"从没提交过场景"（最常见的默认状态）时也会 `log_fallback(consumer="presence.scene")`，把正常空状态记成 `upstream_fallback` 行为日志。与 `fallback.py` 里"上游为空是正常状态"的取向不一致，日志容易被刷满。

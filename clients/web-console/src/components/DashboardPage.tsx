@@ -19,6 +19,7 @@ import { explainError, type ExplainedError } from '../errors';
 import type {
   DashboardResponse,
   DashboardSection,
+  FallbackNotice,
   IntentTeaserOut,
   OutlineRelation,
   TimelineState,
@@ -296,38 +297,147 @@ export function DashboardZone({ id, title, hint }: { id: string; title: string; 
 }
 
 /**
+ * 上游是谁 → 界面上怎么称呼它。
+ *
+ * 后端 `domains/fallback.py::ResolvedInput.upstream` 给的是机器名
+ * （`schedule` / `scene`），直接印出来就是"schedule 不可用"这种黑话。
+ * **认不出来的一律不猜**：退回原样显示，而不是硬说成"日程"。
+ */
+const UPSTREAM_LABEL: Record<string, string> = {
+  schedule: '日程',
+  scene: '她此刻的场景',
+};
+
+/**
+ * 「这个值是兜底值」的提示条。
+ *
+ * 为什么必须有它：同一句话（「下次大约 14:20」）在两种情况下长得一模一样——
+ *
+ * 1. 日程按她的时间轴真的算出来的；
+ * 2. 日程读不到 / 还没生成，后端回退到本域默认参数算出来的。
+ *
+ * 不标来源，等于**把兜底值伪装成她的真实状态**（「不编造」是本项目的底线）。
+ * 所以这里只回答两件事：这次的值从哪来、为什么，以及**它不是她的状态**。
+ *
+ * 三条克制：
+ * - 正常（`used=false`）时**什么都不渲染**——不是每块都挂一个"正常"标签；
+ * - 不摆错误码：人话优先用后端给的 `reason`（`phone`/`presence` 那边本来就是
+ *   中文人话），拿不到才按上游名说一句；
+ * - 语气是"说明"不是"告警"：中性底 + 一条虚线左边框，不用警示色——上游为空
+ *   （今天没排日程）是正常状态，不是故障。
+ */
+export function FallbackHint({
+  notice,
+  scope,
+}: {
+  /** `sections.*.data.fallback`，即后端 `FallbackNotice`。 */
+  notice: FallbackNotice | null | undefined;
+  /** 回退影响的是**哪件事**，如「看手机的节奏」；只在没有 reason 时用得上。 */
+  scope: string;
+}) {
+  if (!notice?.used) return null;
+  const upstream = UPSTREAM_LABEL[String(notice.upstream)] ?? String(notice.upstream ?? '');
+  const reason = typeof notice.reason === 'string' ? notice.reason.trim() : '';
+  return (
+    <div className="dash-fallback" data-testid="dash-fallback" data-upstream={String(notice.upstream)}>
+      <p className="dash-fallback__line">
+        <span className="dash-fallback__tag">默认值</span>
+        {reason || `${upstream || '上游'}暂时用不上，${scope}先按默认参数显示`}
+      </p>
+      {/*
+        这句是这条提示存在的全部理由：让"她真的这么想"和"我们兜底算的"
+        在界面上分开。没有它，上面那句原因只是技术说明，读者仍会把数字当成
+        她的状态。
+      */}
+      <p className="dash-fallback__note">这是按默认参数算的，不是她此刻的真实状态。</p>
+    </div>
+  );
+}
+
+/**
+ * 从 `sections.*.data` 里取出回退标记。
+ *
+ * 形状不认识（不是对象 / 没有布尔 `used`）时返回 `null`——那种情况下
+ * **不能**当成"正常"去渲染，也编不出一句说明，所以由调用方决定怎么交代。
+ */
+export function fallbackNoticeOf(data: unknown): FallbackNotice | null {
+  if (!data || typeof data !== 'object') return null;
+  const raw = (data as Record<string, unknown>).fallback;
+  if (!raw || typeof raw !== 'object') return null;
+  const notice = raw as Record<string, unknown>;
+  if (typeof notice.used !== 'boolean') return null;
+  return {
+    upstream: String(notice.upstream ?? ''),
+    used: notice.used,
+    state: (notice.state ?? 'unknown') as FallbackNotice['state'],
+    source: (notice.source ?? 'upstream') as FallbackNotice['source'],
+    reason: typeof notice.reason === 'string' ? notice.reason : null,
+  };
+}
+
+/**
  * 「手机」卡片的正文。
  *
  * 抽成独立组件只为一个原因：它有三种可区分的样子（正在看 / 放下但有下次 /
  * 还没安排），而这三种的区别正是用户要看的东西——不抽出来就没法在单测里
  * 逐种钉住，只能靠整页渲染碰运气。
+ *
+ * 「下次什么时候看」是**参数**不是事实：它由上游日程决定，日程不可用时后端
+ * 回退到本域默认节奏。这条来源不标出来，用户会把兜底值读成她的真实状态。
+ * 从没看过手机（`empty`）的载荷里同样带着这个标记，所以这里不能只在
+ * 「看得懂的那三种状态」里渲染它。
  */
 export function PhoneBody({ data }: { data: Record<string, unknown> }) {
   const watching = String(data.state ?? '') === 'watching';
   const app = data.watching_app ? String(data.watching_app) : '';
+  const fallback = fallbackNoticeOf(data);
+  /*
+   * `empty` = 从没看过手机。载荷里没有事实字段（后端刻意不给 state /
+   * last_looked_at，那是编事实），**只有**「下次该隔多久」这个参数和它的来源；
+   * 所以这里不能写"手机放下了"——她没拿起过，谈不上放下。
+   */
+  const neverLooked = !('state' in data) && !watching;
+  const intervalMinutes = Number(data.next_look_interval_minutes ?? NaN);
   return (
     <>
-      <p className="dash-now__line">
-        <strong>{watching ? '正在看手机' : '手机放下了'}</strong>
-        {watching && app ? <span className="dash-now__kind">{app}</span> : null}
-      </p>
+      {neverLooked ? (
+        <p className="dash-card__muted">她还没拿起过手机。</p>
+      ) : (
+        <p className="dash-now__line">
+          <strong>{watching ? '正在看手机' : '手机放下了'}</strong>
+          {watching && app ? <span className="dash-now__kind">{app}</span> : null}
+        </p>
+      )}
       {watching && data.watching_since ? (
         <p className="dash-card__muted">从 {formatClock(String(data.watching_since))} 起</p>
       ) : null}
       {!watching && data.last_looked_at ? (
         <p className="dash-card__muted">上次看是 {formatClock(String(data.last_looked_at))}</p>
       ) : null}
+      {neverLooked ? (
+        Number.isFinite(intervalMinutes) ? (
+          <p className="dash-card__muted">按现在的节奏，大约每 {intervalMinutes} 分钟看一次</p>
+        ) : null
+      ) : (
+        /*
+          正在看的时候后端不排下一次（状态机规则 2），所以这里写「等她收起手机」，
+          而不是显示一个会跳的数字——那个数字在"正在看"期间根本不存在。
+        */
+        <p className="dash-card__muted">
+          {watching
+            ? '等她收起手机'
+            : data.next_look_at
+              ? `下次大约 ${formatClock(String(data.next_look_at))}`
+              : '还没安排下一次'}
+        </p>
+      )}
       {/*
-        正在看的时候后端不排下一次（状态机规则 2），所以这里写「等她收起手机」，
-        而不是显示一个会跳的数字——那个数字在"正在看"期间根本不存在。
+        **正在看时不显示**：这段时间卡上唯一的"下次"是「等她收起手机」，
+        它是状态机规则、不是回退参数。此刻挂一句「不是她此刻的真实状态」，
+        读者会以为我们在说"她正在看手机"这件事也是猜的——那是新的误导。
+        等她放下手机、真的排了 `next_look_at`，提示才跟着那个值一起出现。
       */}
-      <p className="dash-card__muted">
-        {watching
-          ? '等她收起手机'
-          : data.next_look_at
-            ? `下次大约 ${formatClock(String(data.next_look_at))}`
-            : '还没安排下一次'}
-      </p>
+      <FallbackHint notice={watching ? null : fallback} scope="看手机的节奏" />
     </>
   );
 }
@@ -721,17 +831,36 @@ export function DashboardBody({
         onRetry={onRetry}
         action={{ label: '去聊天', onClick: onOpenChat }}
       >
-        {(d) => (
-          <>
-            <p className="dash-now__line">
-              <strong>{AVAILABILITY_LABEL[String(d.availability)] ?? String(d.availability ?? '')}</strong>
-              <span className="dash-now__kind">
-                精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
-              </span>
-            </p>
-            <p className="dash-card__muted">{String(d.describe ?? '')}</p>
-          </>
-        )}
+        {(d) => {
+          /*
+           * 这一块**有两个**上游，别把它们的回退混成一件：
+           *
+           * - `availability` / `energy` / `social_load` / `describe`：presence
+           *   自己的状态，与回退无关，照常显示；
+           * - `fallback`：讲的是**场景**（`presence/service.py::resolve_scene`，
+           *   场景过期 / 从没提交过 → 领域默认 `unknown`）。后端把
+           *   `scene.state` 也给了，而这里不显示它——所以它不是"兜底值冒充
+           *   真实状态"，只是这条标记**在这张卡上没有对应的可见值**。
+           *
+           * 那为什么还渲染 `FallbackHint`？因为它说的是"她此刻在做什么"：
+           * 这句话用户会从这张卡里猜出来（旁边就是"可以随时说话"），而猜错
+           * 的方向恰好是"她现在闲着"。让默认值有个名字，比留白更诚实。
+           */
+          const fallback = fallbackNoticeOf(d);
+          const describe = String(d.describe ?? '');
+          return (
+            <>
+              <p className="dash-now__line">
+                <strong>{AVAILABILITY_LABEL[String(d.availability)] ?? String(d.availability ?? '')}</strong>
+                <span className="dash-now__kind">
+                  精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
+                </span>
+              </p>
+              <p className="dash-card__muted">{describe}</p>
+              <FallbackHint notice={fallback} scope="她此刻在做什么" />
+            </>
+          );
+        }}
       </Card>
 
       <Card title="情绪" span={3} section={s.affect} onRetry={onRetry}>
@@ -752,8 +881,14 @@ export function DashboardBody({
         「手机」单独一块：她低头看手机那段时间不回消息，不是装死。
         真人一天解锁几十上百次，这段"在忙别的"里她照样在，只是没在看对话。
         把这层画出来，「没秒回」才不会被读成「不理人」。
+
+        `renderWhenEmpty`：`empty`（从没看过手机）的载荷里**没有**事实字段，
+        但有「下次该隔多久」这个**参数**和它的来源标记（见后端
+        `dashboard.py::phone()` 里那段注释）。用一句"她还没拿起过手机"盖掉它，
+        等于在最常见的空态里把回退说明藏起来——而这正是提醒用户"这是默认值"
+        最该出现的时候。
       */}
-      <Card title="手机" span={6} section={s.phone} onRetry={onRetry}>
+      <Card title="手机" span={6} section={s.phone} renderWhenEmpty onRetry={onRetry}>
         {(d) => <PhoneBody data={d} />}
       </Card>
 

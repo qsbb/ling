@@ -29,7 +29,7 @@
    新 handler 必须持久化业务终态；failed/timeout 正常确认 outbox done，但绝不标作业 succeeded。仅模型调用前、已分类可重试的取件故障抛异常；沿用最多 5 次失败、指数退避上限 300 秒（`src/ling/worker.py:49-51,4112-4123`），到 dead 同步终结业务作业。
    已持久成功的重放只读已有结果；模型开始后崩溃而无结果则记 unknown、不自动再烧一次模型。只承诺结果持久化去重，不承诺外部执行 exactly-once。
 4. **最后接预算和读侧再开放入口。** 在 `jobs.py` 以数据库锁串行化预算检查与预留，复用 `behavior_model_calls`、新增 `kind=video_watch`；调用模型前先提交预留和 `model_started_at`。每个作业最多一次视觉请求，首期固定 frames、关闭供应商回退；缓存命中为零模型。
-   把 `video.py`/`watch.py` 的同步与后台视频额度统一到持久账本：每窗口滚动 1 小时最多 2 次、全局滚动 24 小时最多 20 次视觉请求；失败和 unknown 占额不退款。每次预留包含视觉输入的可核验 token 上界及输出上限；无法取得上界则拒绝后台调用。记录 actual_tokens，缺 usage 保留预留，不虚填为零；不挪用日程额度。
+   把 `video.py`/`watch.py` 的同步与后台视频额度统一到持久账本：**按 token 额度**（复用 `TokenQuotaStore`，与 router 的 `_quota_block` 同一判据），**不设次数上限**——用户 2026-11-09 明确要求「次数限制去掉，看视频这个模型直接使用设定的看视频模型」。失败和 unknown 占额不退款。每次预留包含视觉输入的可核验 token 上界及输出上限；无法取得上界则拒绝后台调用。记录 actual_tokens，缺 usage 保留预留，不虚填为零；不挪用日程额度。
    不用模型轮询任务，不生成“已完成”对话；没有新作业的定时扫描必须零模型。现有日程上限由领域调用方执行，媒体预算也由上述领域闸强制，不把表名或原则注释当成自动保障。
    修改 `src/ling/domains/media/service.py` 的读侧及 `src/ling/kernel/context.py:739-803`：仅当前受众仍获授权、未过期的成功证据可读；保留最近 3 条上限，不保证每个结果必进下一轮；用 `wrap_untrusted` 包裹内容，带 call/evidence ID、观察时间和推断标记，修正文案中把视频称为图片/语音的问题。
 

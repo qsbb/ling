@@ -470,10 +470,13 @@ export interface DraftResponse {
 }
 
 /**
- * 接入器（`GET /v1/settings/connectors`）的只读视图。
+ * 接入器（`GET /v1/settings/connectors`）的视图。
  *
  * 四态而不是三态：`disabled` 只出现在 QQ 官方机器人上——凭据配好了但渠道开关
  * 是关的。把它说成"未连接"是错的（连接从没被尝试过），去查连接只会白费时间。
+ *
+ * 契约见 `src/ling/contracts/v1.py` 的 `ConnectorsOut`；字段注册表见
+ * `src/ling/settings/connector_fields.py`。
  */
 export type ConnectorStatus =
   | 'not_configured'
@@ -481,22 +484,47 @@ export type ConnectorStatus =
   | 'configured_disconnected'
   | 'connected';
 
-export type ConnectorFieldKind = 'secret' | 'text' | 'switch';
+/**
+ * 字段四档（`ling/settings/connector_fields.py:23-29`）。
+ *
+ * `list` 是名单：GET 回字符串数组，PUT 接受数组或逗号拼接的字符串，
+ * 后端 `normalize_list` 会 trim/去空/去重，**但绝不转成数字**
+ * （QQ 号可能有前导零）。
+ */
+export type ConnectorFieldKind = 'secret' | 'text' | 'switch' | 'list';
+
+/** 有效值从哪来：DB 覆盖 > 进程启动时的 env 快照 > 代码默认值。 */
+export type ConnectorFieldSource = 'db' | 'env' | 'default';
 
 /**
- * 一项配置。**密钥只有 `set`**（`kind==='secret'` 时 `value` 恒为 null）：
- * 后端连值都不放进视图对象，页面不存在"显示/隐藏密钥"这条路径。
+ * 一项配置。
+ *
+ * **密钥只有 `configured` / `set` / `preview`**（`kind==='secret'` 时 `value`
+ * 恒为 null）：后端连值都不放进视图对象，页面不存在"显示/隐藏密钥"这条路径。
+ * `preview` 是 owner 才拿到的前 7 字符 + `••••`，**只在要点开编辑时才显示**，
+ * 不作为输入框的回显值（那等于把一个可用的凭据明文画在屏幕上）。
  */
 export interface ConnectorField {
-  /** 环境变量名（真实变量名由后端从代码推导，前端不得自造） */
+  /** 注册表里的固定键名，同时也是 PUT 的 `set` / `clear` 里的键 */
+  key: string;
+  /** 与 `key` 相同的兼容别名（旧后端/旧前端读它） */
   name: string;
-  label: string;
+  scope: string;
   kind: ConnectorFieldKind;
-  /** 这一项有没有生效值（switch 恒为 true，值看 value） */
+  label: string;
+  /** 控件提示：text / password / switch / list / select（纯展示，不是校验依据） */
+  control: string;
+  /** 这一项是否允许在网页上改（注册表里的 `editable`） */
+  editable: boolean;
+  source: ConnectorFieldSource | string;
+  /** 有效值非空（**不等于"DB 里有覆盖"**） */
+  configured: boolean;
+  /** `configured` 的兼容别名 */
   set: boolean;
-  value: string | null;
-  /** 值来自哪里。目前只有 env：改它要去宿主部署目录的 `.env`。 */
-  source: string;
+  /** 非密钥的规范化值；密钥恒 null。switch 给布尔，list 给数组 */
+  value: string | boolean | string[] | null;
+  /** 密钥预览（前 7 字符 + ••••）；非密钥或非 owner 为 null */
+  preview: string | null;
 }
 
 export interface ConnectorRuntime {
@@ -506,28 +534,137 @@ export interface ConnectorRuntime {
   received: number | null;
 }
 
+/**
+ * 一个 scope 的**生效**状态（`ConnectorActivationOut`）。
+ *
+ * `activating` 只是"候选落库、正在切换"，只有 `active` 才算生效；
+ * `rolled_back` 是失败且已恢复旧配置；`degraded` 要么本地生效但远端没连上，
+ * 要么回退本身也失败——两者都**不是成功**。
+ */
+export interface ConnectorActivation {
+  scope: string;
+  state: string;
+  generation: number;
+  active_generation: number;
+  candidate_generation: number | null;
+  active_revision_id: string | null;
+  candidate_revision_id: string | null;
+  last_revision_id: string | null;
+  last_state: string | null;
+  started_at: string | null;
+  activated_at: string | null;
+  error_code: string | null;
+  /** 可以展示给人看的一句话（不含异常原文） */
+  error_safe: string | null;
+  ack_count: number;
+  expected_count: number;
+}
+
 export interface ConnectorView {
   id: string;
   label: string;
   /** 凭据齐不齐（与总览 connectivity 同源，不另判一套） */
   configured: boolean;
   enabled: boolean;
-  status: ConnectorStatus;
+  status: ConnectorStatus | string;
   status_reason: string;
   status_message: string;
   /** 一句"怎么改"，点名真实环境变量 */
   guidance: string;
-  /** 本轮恒为 false：值在宿主 `.env`，页面不给编辑入口 */
+  /** owner 为 true；非 owner 只读（PUT 会 403） */
   editable: boolean;
+  /** 值落在 DB 覆盖层（容器根目录只读，写不了 .env） */
   storage: string;
+  /** 并发代际：PUT 的 `If-Match` 用它 */
+  generation: number;
+  activation: ConnectorActivation;
   fields: ConnectorField[];
   runtime: ConnectorRuntime;
+}
+
+/**
+ * 出入许可（白名单）组：参与同一套 generation，但不重建长连接。
+ * 它**不是**一个"渠道"，所以单独一段而不是混进 `connectors`。
+ */
+export interface ConnectorAccessGroup {
+  id: string;
+  generation: number;
+  activation: ConnectorActivation;
+  editable: boolean;
+  fields: ConnectorField[];
 }
 
 export interface ConnectorsResponse {
   schema_version: string;
   as_of: string;
+  /** 当前登录者是不是 owner（非 owner 页面不给编辑入口） */
+  can_edit: boolean;
   connectors: ConnectorView[];
+  access: ConnectorAccessGroup;
+}
+
+/**
+ * `PUT /v1/settings/connectors/{scope}` 的请求体（`ConnectorChangeBody`）。
+ *
+ * - `set` 里**没出现的键 = 不改**；
+ * - 密钥给空串 = **不改**（密码框总是空的，不能因此变成一次删除，
+ *   见 `ling/settings/connector_service.py:198-205`）；
+ * - `clear` = 删掉该键的覆盖、回退到 env/默认（**不是写空串**）；
+ * - 同一个键同时出现在两边 → 422。
+ */
+export interface ConnectorChangeRequest {
+  set: Record<string, string | boolean | string[]>;
+  clear: string[];
+}
+
+/**
+ * `PUT` 的返回。
+ *
+ * **202 不等于"已生效"**：终态看 `state`（`active` / `unchanged` /
+ * `rolled_back` / `degraded`）。成功生效时 `generation +1`；回滚时
+ * generation **不增**（旧配置仍在）。
+ */
+export interface ConnectorChangeResult {
+  schema_version: string;
+  operation_id: string;
+  scope: string;
+  generation: number;
+  status: string;
+  state: string;
+  changed: boolean;
+  revision_id: string | null;
+  active_revision_id: string | null;
+  ack_count: number;
+  expected_count: number;
+  started_at: string;
+  finished_at: string;
+  error_code: string | null;
+  error_safe: string | null;
+  timings: Record<string, number>;
+}
+
+/** `POST /v1/settings/connectors/reset` 里一个 scope 的结果。 */
+export interface ConnectorResetResult {
+  scope: string;
+  /** unchanged / active / rolled_back / degraded / failed */
+  state: string;
+  /** 被清掉的键（回退到 env / 默认） */
+  cleared: string[];
+  operation_id?: string;
+  generation?: number;
+  error_code?: string;
+  error_safe?: string;
+}
+
+/**
+ * `POST /v1/settings/connectors/reset` 的返回：三个 scope 一个操作，
+ * **全部成功才算成功**（`ok`）。任一 scope 重建失败会保留原 active，
+ * 绝不把"部分恢复默认"报成成功。
+ */
+export interface ConnectorResetResponse {
+  schema_version: string;
+  ok: boolean;
+  results: ConnectorResetResult[];
 }
 
 export interface SecretStatus {
@@ -1192,6 +1329,46 @@ export interface UnmergeResult {
 }
 
 export type DashboardStatus = 'ok' | 'empty' | 'unavailable';
+
+/**
+ * 回退标记里「上游当时是什么状态」。取值与后端
+ * `contracts/v1.py::FallbackState` 完全一致——**不是** `TimelineState`
+ * （这里多一个 `unknown`），也不是 `DashboardStatus`（三态 vs 七态）。
+ */
+export type FallbackState =
+  | 'ready'
+  | 'degraded'
+  | 'empty'
+  | 'pending'
+  | 'failed'
+  | 'unavailable'
+  | 'unknown';
+
+/** 这个值是上游给的，还是本领域自己的默认参数。**只有这两种**。 */
+export type FallbackSource = 'upstream' | 'domain_default';
+
+/**
+ * 一个消费点上"这次的值从哪来"的紧凑标记（后端 `contracts/v1.py::FallbackNotice`）。
+ *
+ * **它不是事实**：`used=true` 只说明"上游没给出可用的值，我们用了自己的
+ * 默认参数"，不代表上游坏了、更不代表她做了什么。界面上必须把这件事说出来，
+ * 否则兜底值会被读成她的真实状态（本项目明令禁止的那类伪造）。
+ *
+ * 没有回退时后端也会给这个标记（`used=false` / `source=upstream`），所以
+ * 「没有字段」与「没用回退」是两件事，不能混成一种。
+ */
+export interface FallbackNotice {
+  /** 上游是谁，如 `schedule`（日程）/ `scene`（场景）。 */
+  upstream: string;
+  /** 这次是否用了领域默认参数。 */
+  used: boolean;
+  /** 上游当时的状态。 */
+  state: FallbackState;
+  /** 值的来源。 */
+  source: FallbackSource;
+  /** 用默认值的人话原因（后端直接写成中文，界面原样显示）；没回退时为 null。 */
+  reason: string | null;
+}
 
 export interface DashboardSection {
   status: DashboardStatus;

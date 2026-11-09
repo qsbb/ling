@@ -363,3 +363,63 @@
 .dash .dash-card[data-testid='dash-渠道与模型'] {
   scroll-margin-top: 12px;
 }
+
+/* ------------------------------------------------------ 上游回退（默认参数）提示 */
+
+/*
+ * 「这个数字是兜底值」的提示条（`FallbackHint`）。
+ *
+ * 为什么它必须存在：同一句「下次大约 14:20」在"日程真的算出来的"和"日程读不到、
+ * 回退到默认节奏"两种情况下长得一模一样。不标来源 = 把兜底值伪装成她的真实
+ * 状态，而这正是本项目「不编造」要挡的事。
+ *
+ * 为什么**不**用 `--warn`（告警黄）：上游为空（今天没排日程）是正常状态，
+ * 不是故障。用告警色会把"今天没安排"读成"出错了"，与 `dash-card__unavailable`
+ * （真的读不到）就分不开了。这里用中性底 + 左侧虚线，只表示"这句有附加说明"。
+ *
+ * 选择器带 `.dash`（0,2,0）：dashboard.css 先于 styles.css 加载，
+ * 裸类名会被同等特异度的规则压掉（`.dash-list__meta` 那次踩过）。
+ */
+.dash .dash-fallback {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-left: 2px dashed var(--line-strong);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--paper-sunken) 45%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* 长句必须能断行：375px 下"默认参数 + 原因"这一行是卡里最长的文本。 */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dash .dash-fallback__line {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* 标签本身不换行，但**不**强撑宽度：`max-width: 100%` + 行内流式排布，
+ * 所以它后面那半句在窄屏上照样能折行。 */
+.dash .dash-fallback__tag {
+  display: inline-block;
+  max-width: 100%;
+  margin-right: 5px;
+  padding: 0 5px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 4px;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* 第二行是"这不是她的状态"那句：比原因低一档，但仍是正文色阶，不是灰到看不见。 */
+.dash .dash-fallback__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}

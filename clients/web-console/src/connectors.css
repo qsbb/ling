@@ -11,7 +11,11 @@
  * 2. 375px 单列、无横向溢出：字段行在窄屏堆成三段，长变量名 `overflow-wrap: anywhere`
  *    （`LING_QQBOT_WEBHOOK_PUBLIC_KEY` 这种名字在 375 下必然超宽）。
  * 3. 触控目标 ≥44×44（仅窄屏；桌面保留紧凑密度）。
- * 4. 字段值是**等宽**的：这些是变量名、端口、地址，混排字体里 0/O、1/l 分不清。
+  * 4. 字段值是**等宽**的：这些是变量名、端口、地址，混排字体里 0/O、1/l 分不清。
+ * 5. 表单与控制项要能**真的用**：每个字段两行（第一行名字/说明/来源，第二行控件），
+ *    375px 下不横向溢出，输入框与按钮都 ≥44px（触控下限）。
+ * 6. 结论条（`.connector-notice`）按**结论**着色，不按 HTTP 状态码着色：
+ *    `rolled_back` 是失败，哪怕它返回的是 202。
  */
 
 .page.connectors-page {
@@ -176,16 +180,28 @@
 
 .connector-field {
   display: grid;
-  grid-template-columns: minmax(0, 17rem) minmax(0, 1fr) auto;
+  /* 第一行：变量名 / 说明 / 来源+状态；第二行：控件（跨全宽）。 */
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) auto;
   align-items: baseline;
-  gap: 4px 12px;
-  padding: 6px 8px;
+  gap: 5px 12px;
+  padding: 8px;
   border-radius: var(--radius-sm);
   min-width: 0;
 }
 
+/* 校验没通过的那一行：左侧色条与底色一起变，不只靠文字。 */
+.connector-field--invalid {
+  background: var(--danger-soft);
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
 .connector-field:nth-child(odd) {
   background: rgba(239, 233, 222, 0.45);
+}
+
+/* 斑马纹不能盖掉"这一项错了"的底色（同特异度，靠顺序覆盖）。 */
+.connector-field--invalid:nth-child(odd) {
+  background: var(--danger-soft);
 }
 
 .connector-field__name {
@@ -204,23 +220,250 @@
   overflow-wrap: anywhere;
 }
 
-.connector-field__state {
-  font-size: 12px;
-  color: var(--ink-soft);
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
+/* 来源 + "已设置/未设置"两个小徽标：一个回答"值从哪来"，一个回答"有没有值"。 */
+.connector-field__meta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   justify-self: end;
-  text-align: right;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.connector-field__source,
+.connector-field__state {
+  font-size: 11px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+}
+
+/* 来源是**信息**不是状态：db 有底色（网页上改过），env/default 保持素净。 */
+.connector-field[data-source='db'] .connector-field__source {
+  background: var(--paper-sunken);
+  color: var(--ink);
 }
 
 /* 未设置是**待办**，不是故障：用它自己的样式，别用红色。 */
 .connector-field__state--unset {
   color: var(--warn);
+  border-color: #ecd9b4;
   font-weight: 600;
 }
 
 .connector-field__state--set {
   color: var(--ok);
+  border-color: #cfdcc6;
+}
+
+/* 密钥的现有值预览（前 7 字符 + ••••）：**只读文本**，不是输入框。 */
+.connector-field__preview {
+  display: block;
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 输入控件 */
+
+.connector-field__control {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.connector-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-size: 13px;
+  /* 地址/端口/公钥 hex：等宽，否则 0/O、1/l 分不清。 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.connector-input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.connector-input:disabled {
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  cursor: not-allowed;
+}
+
+.connector-input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.connector-input--list {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.connector-field__clear {
+  flex: 0 0 auto;
+}
+
+.connector-edit__cleared {
+  margin: 0;
+  padding: 7px 10px;
+  flex: 1 1 auto;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* 开关：原生 checkbox 放大到能点（44px 热区），旁边补一句开/关。 */
+.connector-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.connector-switch__box {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--ink);
+}
+
+.connector-switch__text {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.connector-field__error {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 表单与动作 */
+
+.connector-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.connector-form__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+}
+
+.connector-form__note {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 结论条 */
+
+/*
+ * 按**结论**着色：ok（真的生效了）/ warn（写进去了但没连上、还没到终态）/
+ * error（没生效，含 rolled_back）。`rolled_back` 走 error，不因为它返回 202
+ * 就变绿。
+ */
+.connector-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  font-size: 12.5px;
+}
+
+.connector-notice--ok {
+  border-left-color: var(--ok);
+  background: var(--ok-soft);
+  color: var(--ink);
+}
+
+.connector-notice--warn {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--ink);
+}
+
+.connector-notice--error {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--ink);
+}
+
+.connector-notice__body {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.connector-notice__detail {
+  margin-top: 3px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 二次确认 */
+
+.connector-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-left: 4px solid var(--danger);
+  border-radius: var(--radius-lg);
+  background: var(--paper-raised);
+  font-size: 13px;
+}
+
+.connector-confirm p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.connector-confirm__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+}
+
+/* 「确认恢复默认」是破坏性动作：红底，与普通按钮区分开。 */
+.connectors-page .button--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fdf6f3;
+}
+
+.connectors-page .button--danger:hover:not(:disabled) {
+  background: #87392f;
 }
 
 /* ---------------------------------------------------------------- 窄屏 */
@@ -234,21 +477,47 @@
     padding: 14px 14px;
   }
 
-  /* 三段堆叠：名字 → 说明 → 状态，单列不横向溢出。 */
+  /* 三段堆叠：名字 → 说明 → 来源，控件占满下一行，单列不横向溢出。 */
   .connector-field {
     grid-template-columns: minmax(0, 1fr);
-    gap: 2px;
+    gap: 4px;
   }
 
-  .connector-field__state {
+  .connector-field__meta {
     justify-self: start;
-    text-align: left;
   }
 
-  /* 触控目标 ≥44×44（桌面保留紧凑密度）。 */
+  /* 密钥的清除按钮在窄屏单独一行，不与输入框挤在一起。 */
+  .connector-field__control {
+    flex-wrap: wrap;
+  }
+
+  .connector-field__clear {
+    width: 100%;
+  }
+
+  /* 触控目标 ≥44×44（桌面保留紧凑密度）：按钮、输入框、下拉、文本框都一样。 */
   .connectors-page .back-link,
   .connectors-page .button {
     min-height: 44px;
     min-width: 44px;
+  }
+
+  .connectors-page .connector-input {
+    min-height: 44px;
+    /* 16px 是 iOS Safari 的分界：小于它聚焦时会自动放大页面，用户会迷路。 */
+    font-size: 16px;
+  }
+
+  .connectors-page .connector-input--list {
+    min-height: 88px;
+  }
+
+  .connector-form__actions .button {
+    flex: 1 1 auto;
+  }
+
+  .connector-form__note {
+    flex: 1 1 100%;
   }
 }
