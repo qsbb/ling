@@ -145,7 +145,7 @@ function snapshotFixture(patch: Partial<PromptSnapshotOut> = {}): PromptSnapshot
 
 const OWNER: UserInfo = {
   id: 'user-1',
-  username: 'lingxi',
+  username: 'demo-user',
   role: 'owner',
   subject_id: 'subject-owner',
   display_name: '主人',
@@ -570,10 +570,12 @@ describe('样式契约：宽度三段、内部滚动、保留换行', () => {
     expect(css).not.toMatch(/(^|\n)\s*body\s*\{[^}]*overflow:\s*hidden/);
   });
 
-  it('遮罩与 wrapper 不接指针，只有面板接：背景仍可滚动/可读', () => {
+  it('遮罩与 wrapper 不接指针，只有面板**内容**接：背景仍可滚动/可读', () => {
     expect(css).toMatch(/\.prompt-drawer\s*\{[^}]*pointer-events: none/);
     expect(css).toMatch(/\.prompt-drawer__scrim\s*\{[^}]*pointer-events: none/);
-    expect(css).toMatch(/\.prompt-drawer__panel\s*\{[^}]*pointer-events: auto/);
+    // 面板本身不接（空白处放行给背后被让位推到左边的入口），内容接。
+    expect(css).toMatch(/\.prompt-drawer__panel\s*\{[^}]*pointer-events: none/);
+    expect(css).toMatch(/\.prompt-drawer__panel\s+\*\s*\{[^}]*pointer-events: auto/);
   });
 
   it('内容保留换行，长串不撑破', () => {

@@ -795,15 +795,29 @@
   padding-top: 8px;
 }
 
+/* 清理中：spinner 与文字同一行居中；长计数不许撑出横向滚动。 */
 .mem-danger__count {
   margin: 0;
   font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .mem-danger__count strong {
   font-size: 18px;
   color: var(--danger);
   padding: 0 4px;
+}
+
+/* 失败原因码可能与计数行混排，用等宽字体以便维护者抄给日志检索。 */
+.mem-danger__result code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .mem-danger__confirm-button {

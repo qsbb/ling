@@ -2507,7 +2507,7 @@
  * 每个选项独占一行、radio 与文字顶对齐；可点区域 ≥44 高（radio 本体可以
  * 保持 13×13，手指点的是 label），这与「窄屏触控 ≥44」是同一条要求。
  */
-.settings-group__body label {
+.settings-tile__body label {
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -2522,13 +2522,13 @@
   text-wrap: balance;
 }
 
-.settings-group__body label input[type='radio'] {
+.settings-tile__body label input[type='radio'] {
   flex: 0 0 auto;
   /* 与首行文字的中线对齐；radio 比行高小，不顶对齐会悬在半空。 */
   margin-top: 4px;
 }
 
-.settings-group__body legend {
+.settings-tile__body legend {
   font-size: 12px;
   color: var(--ink-faint);
   padding: 0 0 4px;

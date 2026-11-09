@@ -114,6 +114,19 @@ function renderSidebar(sessions: SessionRecord[]): string {
   );
 }
 
+/**
+ * 按 `<li>` 切开渲染结果，一条消息一片。
+ *
+ * 断言"这一行是左还是右"必须落在**行自身**的 class 上：直接 `indexOf` 再
+ * 前后截 200 字，会截到相邻行的 class 里去（改左右后第一次就是这么误判的）。
+ */
+function liChunks(html: string): string[] {
+  return html
+    .split(/<li class="/)
+    .slice(1)
+    .map((chunk) => chunk);
+}
+
 function renderMessages(messages: UiMessage[], variant: 'web' | 'group' | 'private'): string {
   return renderToStaticMarkup(
     <MessageList
@@ -346,14 +359,30 @@ describe('发言人分层', () => {
     expect(rows.map((row) => row.showSpeaker)).toEqual([true, true]);
   });
 
-  it('网页会话里 role=user 是靠右的"我"，不参与署名', () => {
+  it('左右只按"谁说的"分：她自己（actor）在右，别人（user）在左——网页会话', () => {
     const rows = buildDialogueRows(
       [messageFixture({ key: 'u1', text: '在吗' }), messageFixture({ key: 'a1', role: 'actor' })],
       'web',
     );
-    expect(rows[0]?.own).toBe(true);
+    // 用户原话：左边是其他人，右边是 bot 自己。这一条以前是反的。
+    expect(rows[0]?.own).toBe(false);
+    expect(rows[0]?.inbound).toBe(false);
+    expect(rows[1]?.own).toBe(true);
     expect(rows[0]?.speaker).toBeNull();
-    expect(rows[1]?.own).toBe(false);
+  });
+
+  it('渠道会话同一套规则：她的回复在右，群成员的发言在左', () => {
+    const rows = buildDialogueRows(
+      [
+        messageFixture({ key: 'm1', senderName: '阿懒', senderId: '100200300' }),
+        messageFixture({ key: 'a1', role: 'actor', text: '嗯' }),
+      ],
+      'group',
+    );
+    // 以前群会话里 user 与 actor 全都靠左（row.own 恒 false），分不出谁是谁
+    expect(rows.map((row) => row.own)).toEqual([false, true]);
+    expect(rows[0]?.inbound).toBe(true);
+    expect(rows[1]?.speaker).toBeNull();
   });
 });
 
@@ -477,7 +506,7 @@ describe('消息列表渲染', () => {
     expect(html).not.toContain('已送达');
   });
 
-  it('网页会话保持"我问她答"：不出现群成员署名，我的消息仍标已送达', () => {
+  it('网页会话：她的回复在右（message--own / row-reverse），我的话在左', () => {
     const html = renderMessages(
       [
         messageFixture({ key: 'u1', text: '在吗', senderName: '主人', senderId: 'web' }),
@@ -486,8 +515,42 @@ describe('消息列表渲染', () => {
       'web',
     );
     expect(html).not.toContain('message__sender');
-    expect(html).toContain('已送达');
-    expect(html).toContain('message--user');
+    // 她的行：靠右那一套；我的行：靠左那一套
+    const rows = liChunks(html);
+    const actorRow = rows.find((row) => row.includes('data-role="actor"')) ?? '';
+    const userRow = rows.find((row) => row.includes('data-role="user"')) ?? '';
+    expect(actorRow).toContain('message--own');
+    expect(userRow).toContain('message--inbound');
+    expect(userRow).not.toContain('message--own');
+    // `data-role` 不变（选择器契约）
+    expect(html).toContain('data-role="actor"');
+    expect(html).toContain('data-role="user"');
+  });
+
+  it('她的消息在右时头像仍在行内（与气泡同侧）且 aria-label 是她', () => {
+    const html = renderMessages(
+      [messageFixture({ key: 'a1', role: 'actor', text: '在', state: 'completed' })],
+      'web',
+    );
+    expect(html).toContain('aria-label="灵"');
+  });
+
+  it('群会话左右：她的话在右，群成员在左（同一份 DOM 两种方向）', () => {
+    const html = renderMessages(
+      [
+        messageFixture({ key: 'm1', text: '在吗', senderName: '阿懒', senderId: '100200300' }),
+        messageFixture({ key: 'a1', role: 'actor', text: '在', state: 'completed' }),
+      ],
+      'group',
+    );
+    const rows = liChunks(html);
+    const member = rows.find((row) => row.includes('data-role="user"')) ?? '';
+    const actor = rows.find((row) => row.includes('data-role="actor"')) ?? '';
+    expect(member).toContain('message--inbound');
+    expect(actor).toContain('message--own');
+    // 群成员的在左、她的在右：DOM 里没有左右信息（顺序是稳定的阅读顺序），
+    // 左右只由 CSS 决定——这里钉住两类行拿到了相反的 class。
+    expect(member).not.toContain('message--own');
   });
 
   it('没有群名片时签名只用号码兜底，不出现空名字行', () => {

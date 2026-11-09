@@ -70,32 +70,79 @@
 
 /* ------------------------------------------------------------- 设置分组 */
 
-.settings-groups {
+/*
+ * 设置页的骨架：页头 → 若干「组」→ 每组一张等宽卡片网格。
+ *
+ * 三条约束（这一轮的用户诉求就落在这三条上）：
+ * 1. **层级**：组标题 + 一句说明，把"这条通道/这个偏好"和"那张卡"分开；
+ *    原来六段平铺、卡片标题和组标题同一级，眼睛得逐行找。
+ * 2. **留白**：组间距 30px / 组内卡片间距 12px，两级间距明确；
+ *    原来 26px 与 10px 混用，读起来像随机留白。
+ * 3. **可扫描**：卡片统一 `min-height`、内容顶对齐、最多两行说明；
+ *    卡片宽度由网格决定，不随文案长短变。
+ */
+
+/*
+ * 宽度：上限定 1200px，**并且要把 `.page` 的横向 padding 换成常数**。
+ *
+ * `.page` 的横向 padding 是 `max(14px, (100% - 980px) / 2)`，百分比相对的是
+ * 父元素而不是自己；只写 `max-width` 的话，1440 下 1200 宽的盒子会被那套老公式
+ * 各削掉 230px，网格只剩 940（第一版就是这样，实测列宽 464 而非 570）。
+ * 与 `dashboard.css` 里 `.page.dash` 是同一个坑、同一个解法。
+ */
+.page.settings-page {
+  padding-left: 24px;
+  padding-right: 24px;
+  max-width: 1200px;
+  width: 100%;
+  margin-inline: auto;
+}
+
+@media (max-width: 900px) {
+  /* 窄屏沿用 styles.css 的小 gutter：手机上不再多加 10px 空白。 */
+  .page.settings-page {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+}
+
+.settings-page__head {
   display: flex;
   flex-direction: column;
-  gap: 26px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.settings-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
 }
 
 .settings-group {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 }
 
+/* 组头两行：标题一行、说明一行。横排时说明会被推到屏幕另一头，
+   读起来不像标题的注解，而像另一段文字。 */
 .settings-group__head {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
 }
 
 .settings-group__title {
   margin: 0;
   font-family: var(--font-serif);
-  font-size: 16px;
+  font-size: 15.5px;
   font-weight: 500;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
+  color: var(--ink);
 }
 
 .settings-group__note {
@@ -103,10 +150,227 @@
   color: var(--ink-faint);
   font-size: 12px;
   line-height: 1.7;
-  max-width: 720px;
+  max-width: 68ch;
+}
+
+/* ---------------------------------------------------------------- 设置卡片 */
+
+/*
+ * 等宽 2 列。**列数只在这里声明一次**（不在窄屏断点里重写成别的值）：
+ * 上一轮总览网格的 bug 就是 12 列模板写进了手机断点，窄屏反而退化成 12 列
+ * 细条。这里只做「2 → 1」的降级，别的一概不碰。
+ */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.settings-card {
+  /* 按钮与 section 共用一副骨架：卡片是"一格"，不随文案长成竖条。 */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* 内容顶对齐：文案短的卡片不会把文字垂直居中、跟隔壁错位。 */
+  justify-content: flex-start;
+  min-height: 92px;
+  min-width: 0;
+  padding: 14px 16px;
+  text-align: left;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+@media (min-width: 761px) {
+  /*
+   * 组内奇数张卡片时，最后一张独占一行。
+   *
+   * 「连接与运行」有 3 张：两列网格会把它塞进左下角、右下角空一格，
+   * 那个洞看起来像"还差一张没加载出来"。独占一行后它读起来是一条横向摘要，
+   * 而不是散落的第三块。
+   */
+  .settings-grid > .settings-card:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 14px;
+    min-height: 0;
+  }
+
+  .settings-grid > .settings-card:last-child:nth-child(odd) .settings-card__verb {
+    -webkit-line-clamp: 1;
+  }
+}
+
+.settings-card:hover {
+  border-color: var(--line-strong);
+  background: var(--paper);
+}
+
+.settings-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 就地可改的块（时区/视频）：不是按钮，别给指针与 hover。 */
+.settings-card--tile {
+  cursor: default;
+  min-height: 0;
+}
+
+.settings-card--tile:hover {
+  border-color: var(--line);
+  background: var(--paper-raised);
+}
+
+.settings-card__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-card__label {
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* 箭头钉在右上角：整行高度不因为它多一行而变。 */
+.settings-card__arrow {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.settings-card:hover .settings-card__arrow {
+  color: var(--accent);
+}
+
+.settings-card__badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft, #eff6ff);
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/*
+ * 说明最多两行。**这里不靠截断文案**：文案是写死的短句，两行只是兜住
+ * 窄屏（375 下 2 列变 1 列之前的一档）。真到了两行，`min-height` 仍然
+ * 让隔壁卡片对齐——因为网格 `align-items: stretch`，同一行的卡片等高。
+ */
+.settings-card__verb {
+  color: var(--ink-faint);
+  font-size: 12.5px;
+  line-height: 1.65;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/*
+ * tile 撑满卡片剩余高度：网格 `stretch` 会把同一行的两张卡拉等高，右卡（视频）
+ * 内容多、左卡（时区）就多出一块空白。让 tile 自己吃掉这块高度、把按钮行贴到
+ * 卡片底部，两块内容的首尾就都对齐了。
+ */
+.settings-card__tile {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.settings-card__tile > * {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-tile--timezone form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-tile--timezone .inline-form {
+  margin-top: auto;
+}
+
+/* 卡片内的偏好块：不要再长出一层分组标题。 */
+.settings-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-tile__head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-tile__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-tile__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+/* 单选项的排版（独占一行 / radio 顶对齐 / 触控高度）在 `model-settings.css`
+   的 `.settings-tile__body` 一节里，只保留那一份。 */
+.settings-tile__body {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 
 /* --------------------------------------------------------------- 窄屏 */
+
+/*
+ * ≤760px：卡片单列。
+ *
+ * 只覆盖列数，**不重写 `grid-template-columns` 以外的任何网格属性**，
+ * 尤其不要把桌面端的列数塞进这里（那会让窄屏变成 12 列细条）。
+ */
+@media (max-width: 760px) {
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-card {
+    min-height: 0;
+    padding: 13px 14px;
+  }
+
+  /* 触摸目标 ≥44px：整张卡都是按钮，卡片本身远高于 44，只需保证
+     卡内的小按钮不缩水。 */
+  .settings-card .button {
+    min-height: 44px;
+  }
+}
 
 @media (max-width: 640px) {
   .domain-tabs {
@@ -139,5 +403,145 @@
 @media (max-width: 360px) {
   .domain-tab {
     font-size: 13px;
+  }
+}
+
+/* ------------------------------------------------- 权限与隐私（/settings/privacy） */
+
+/*
+ * 八条权限压成"一行一条"：名称 + 状态徽标 + 一句话 + 按钮。
+ *
+ * 原来每条三行（名称 / 说明 / `scope=… 修订…`），八条二十四行；而且状态只有
+ * 一枚灰底徽标，扫一列看不出哪几条已经放开了。现在：
+ * - 名称与徽标同排（徽标用颜色区分已授权/未授权，并带文字，不只靠颜色）；
+ * - 说明一行，`scope` 与修订号退到 `title` 悬停提示；
+ * - 右侧只有一个按钮，与它所在的那一行绑定。
+ */
+
+.consent-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.consent-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  justify-content: space-between;
+  min-width: 0;
+  /* 列表可能很长（8 条起）：整行不换行，长说明被裁成两行而不是把按钮挤窄。 */
+  flex-wrap: nowrap;
+  /* 一行的高度：上下一共 20px 内边距 + 标题行 ~21px + 说明一行 ~19px = 62–66。
+     三行式（名称/说明/scope 各一行）实测 104px，这里刻意压到"两行字"以内。 */
+  padding: 10px 14px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 10px;
+}
+
+/* 已授权：左侧色条 + 徽标都是强调色；未授权用中性灰（默认关闭是常态）。 */
+.consent-row[data-state='granted'] {
+  border-left-color: var(--ok);
+}
+
+.consent-row__main {
+  /* `flex: 1` 而不是默认的 `0 1 auto`：不给它 grow，长说明会把右侧按钮挤成
+     一列竖着的字（实测 1440 下「授予」被压成两行单字）。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 按钮不许被压缩：它必须始终是一个可点的方块。 */
+/* 按钮包一层：`.button` 自己在 flex 里是 `0 1 auto`，会被长说明压成竖排单字
+   （实测「授予」被挤成两行）。容器不许收缩、按钮也不许换行。 */
+.consent-row__action {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+}
+
+.consent-row__action .button {
+  white-space: nowrap;
+}
+
+/* scope 是排查用的机器键：等宽小字，压在标题行末尾，别占正文宽度。 */
+.consent-row__code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.consent-row__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.consent-row__name {
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.consent-row__badge {
+  flex: none;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.7;
+  border: 1px solid transparent;
+}
+
+.consent-row__badge--granted {
+  background: var(--ok-soft);
+  border-color: #cfdcc6;
+  color: var(--ok);
+}
+
+.consent-row__badge--denied {
+  background: var(--paper-sunken);
+  border-color: var(--line);
+  color: var(--ink-faint);
+}
+
+.consent-row__hint {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 1.6;
+  display: -webkit-box;
+  /* 只留一行：一条权限一眼看完。两行说明会把行高从 65 顶到 84，八条多半屏。
+     完整说明挂在行的 `title` 上（悬停/读屏都能拿到）。 */
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 窄屏：按钮独占一行（仍在卡片内），触控 ≥44。 */
+@media (max-width: 760px) {
+  .consent-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .consent-row__action .button {
+    min-height: 44px;
+    align-self: flex-start;
   }
 }

@@ -77,7 +77,7 @@ function skip(ctx: { skip: () => void }): boolean {
 
 const USER = (role: 'owner' | 'member') => ({
   id: 'user-1',
-  username: 'lingxi',
+  username: 'demo-user',
   role,
   subject_id: 'subject-owner',
   display_name: '主人',
@@ -256,6 +256,61 @@ async function activeTestId(page: Page): Promise<string | null> {
   return page.evaluate(() => document.activeElement?.getAttribute('data-testid') ?? null);
 }
 
+/**
+ * 抽屉打开时，入口中心点上**命中的真实元素**是什么。
+ *
+ * 只断言"Playwright 点得到"是不够的：入口被她的话挤到右侧之后，曾经正好被
+ * 从右边滑出的面板整个压住（1440 下入口占 1244–1338，面板从 950.4 起）——
+ * 点得"到"是靠 Playwright 自己滚/重试碰运气，而 `document.elementFromPoint`
+ * 会老老实实返回面板。这条断言让遮挡在下一次布局改动时立刻红。
+ */
+interface HitReport {
+  entryCenter: { x: number; y: number };
+  hit: string | null;
+  isEntry: boolean;
+  panelLeft: number;
+}
+
+async function entryHitPoint(page: Page, index = 0): Promise<HitReport> {
+  return page.evaluate((i) => {
+    const entry = document.querySelectorAll<HTMLElement>('[data-testid="prompt-entry"]')[i];
+    if (!entry) throw new Error(`没有第 ${i} 个 prompt-entry`);
+    const rect = entry.getBoundingClientRect();
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    const panel = document.querySelector('[data-testid="prompt-drawer"]');
+    return {
+      entryCenter: { x, y },
+      hit: hit ? `${hit.tagName.toLowerCase()}.${String(hit.className)}`.trim() : null,
+      isEntry: hit !== null && hit.closest('[data-testid="prompt-entry"]') === entry,
+      panelLeft: panel ? panel.getBoundingClientRect().left : Number.NaN,
+    };
+  }, index);
+}
+
+/**
+ * 断言"抽屉打开时入口仍然真的露在外面、点得到"：
+ * - 中心点命中入口本身（或它的子节点），不是任何 `prompt-drawer__*`；
+ * - 入口整块不越过面板左边缘（视觉上不压在面板上）。
+ */
+async function expectEntryReachable(page: Page, index = 0): Promise<HitReport> {
+  const report = await entryHitPoint(page, index);
+  const entry = await page
+    .getByTestId('prompt-entry')
+    .nth(index)
+    .evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      return { left: rect.left, right: rect.right };
+    });
+  expect(report.isEntry).toBe(true);
+  expect(entry.right).toBeLessThanOrEqual(report.panelLeft + 0.5);
+  // 明确再挡一次"是抽屉的某一层吃了指针"
+  expect(report.hit ?? '').not.toContain('prompt-drawer__');
+  return report;
+}
+
+
 /* ------------------------------------------------------------ 测试 */
 
 describe('真实浏览器：入口、请求、抽屉', () => {
@@ -332,8 +387,27 @@ describe('真实浏览器：入口、请求、抽屉', () => {
 
       // 4) 再点入口 = 收起。遮罩不接指针，所以入口是真的点得到。
       await openDrawer(page);
+      /*
+       * 防回归：点之前先证明入口真的露在面板外面。
+       * 她的话贴右（own = role === 'actor'），入口也跟着贴右；曾经抽屉打开时
+       * 面板正好把入口整个盖住，这一条会直接指出"命中 prompt-drawer__body"。
+       */
+      const reachable = await expectEntryReachable(page);
+      console.info(
+        `[prompt.browser] 抽屉打开时入口中心 (${reachable.entryCenter.x.toFixed(1)}, ` +
+          `${reachable.entryCenter.y.toFixed(1)}) 命中 ${reachable.hit}，` +
+          `面板 left=${reachable.panelLeft.toFixed(1)}`,
+      );
       await page.getByTestId('prompt-entry').first().click();
       await page.getByTestId('prompt-drawer').waitFor({ state: 'detached' });
+      // 收起后让位内边距也要撤掉，对话区回到满宽
+      expect(
+        await page.evaluate(
+          () =>
+            getComputedStyle(document.querySelector('[data-testid="message-scroll"]') as HTMLElement)
+              .paddingRight,
+        ),
+      ).toBe('40px');
     },
     TIMEOUT,
   );
@@ -352,7 +426,14 @@ describe('真实浏览器：入口、请求、抽屉', () => {
       const member = await openChat('member', { width: 1440, height: 900 }, { expectEntry: false });
       expect(await member.page.getByTestId('prompt-entry').count()).toBe(0);
     },
-    TIMEOUT,
+    /*
+     * 这一条开两个浏览器上下文，而**每个上下文的首屏都要在 Vite 冷启动 +
+     * 全量并行（十几个浏览器测试同时在跑）下实例化一份新的依赖图**——
+     * 单独跑约 4.5s，全量跑到这一条时实测要 15s 上下，最坏一次卡在等
+     * 依赖图就吃掉了 20s。非 owner 用例本身值得留，所以抬高这一条的上限，
+     * 而不是删掉它或悄悄放宽全局超时。
+     */
+    45_000,
   );
 
   it(
@@ -390,6 +471,9 @@ describe('真实浏览器：入口、请求、抽屉', () => {
             scrim: getComputedStyle(
               document.querySelector('[data-testid="prompt-scrim"]') as HTMLElement,
             ).backgroundColor,
+            scrollerPaddingRight: getComputedStyle(
+              document.querySelector('[data-testid="message-scroll"]') as HTMLElement,
+            ).paddingRight,
           };
         });
 
@@ -401,6 +485,14 @@ describe('真实浏览器：入口、请求、抽屉', () => {
       expect(desktop.panelLeft).toBeCloseTo(1440 - desktop.panelWidth, 1);
       expect(desktop.panelRight).toBeCloseTo(1440, 1);
       expect(desktop.docScrollWidth).toBeLessThanOrEqual(desktop.docClientWidth);
+
+      /*
+       * 抽屉打开时对话区让位：消息滚动容器的右内边距 == 面板宽度，
+       * 且入口真的露在面板左边（命中入口，不是 prompt-drawer__*）。
+       */
+      expect(parseFloat(desktop.scrollerPaddingRight)).toBeCloseTo(desktop.panelWidth, 1);
+      await expectEntryReachable(page);
+
       // 背景没有被锁死：body/html 都没有 overflow:hidden，对话列表仍可滚
       expect(desktop.bodyOverflowY).not.toBe('hidden');
       expect(desktop.htmlOverflowY).not.toBe('hidden');

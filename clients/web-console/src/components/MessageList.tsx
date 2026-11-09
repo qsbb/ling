@@ -26,9 +26,15 @@ export interface SpeakerLabel {
 
 export interface DialogueRow {
   message: UiMessage;
-  /** 网页会话里浏览器自己发出的：靠右、不署名。 */
+  /**
+   * **她自己说的话**（`role=actor`）：靠右、用她那一侧的泡泡。
+   *
+   * 这里是"谁在说话"，不是"谁发起的这次请求"——原来按
+   * `variant === 'web' && role === 'user'` 算，于是渠道会话里她和群成员
+   * 全挤在左边，群里根本看不出哪句是她的。
+   */
   own: boolean;
-  /** 渠道会话里群里/对面某个人发来的：需要署名。 */
+  /** 别人说的话（`role=user`）：靠左；渠道会话里还要署名。 */
   inbound: boolean;
   speaker: SpeakerLabel | null;
   /** 同一个人连续多条只署一次；换人必须重新署名。 */
@@ -155,7 +161,14 @@ export function buildDialogueRows(
       previousSpeaker = null;
       continue;
     }
-    const own = variant === 'web' && message.role === 'user';
+    /*
+     * 左右统一成「她 → 右，别人 → 左」，两种会话都一视同仁。
+     *
+     * 判据只看 `role`：`actor` 永远是她；`user` 在网页会话里是浏览器前面
+     * 这位、在渠道会话里是群里/对面的某个人——**都不会是"她自己"**。
+     * 所以不再需要 `variant`，但保留参数签名（调用方与测试都在用）。
+     */
+    const own = message.role === 'actor';
     const speaker = speakerLabel(message, variant);
     const speakerKey = speaker ? `${speaker.name}|${speaker.id ?? ''}` : null;
     const showSpeaker = speaker !== null && speakerKey !== previousSpeaker;
@@ -288,15 +301,21 @@ function ActorMeta({
   liveTurnId,
   onRetry,
   variant,
+  align = 'start',
 }: {
   message: UiMessage;
   liveTurnId: string | null;
   onRetry: (turnId: string) => void;
   variant: DialogueVariant;
+  /** 她的话在右：状态与时间也贴右。 */
+  align?: 'start' | 'end';
 }) {
-  const stateText = statusText(message, liveTurnId, variant);
+  const stateText =
+    message.role === 'actor' ? statusText(message, liveTurnId, variant) : '';
   return (
-    <div className="message__meta">
+    <div
+      className={`message__meta${align === 'end' ? ' message__meta--own' : ''}`}
+    >
       {stateText ? (
         <span className={`state state--${message.state}`}>
           {message.state === 'completed' ? <CheckIcon size={12} /> : null}
@@ -449,10 +468,18 @@ export function MessageList({
         const streaming = message.state === 'streaming' || message.state === 'pending';
         const clock = formatClock(message.createdAt);
         const inboundState = row.inbound ? statusText(message, liveTurnId, variant) : '';
+        /*
+         * 行的左右只由"是谁说的"决定（与 `role` 一一对应）：
+         * - 她：`message--actor`（右对齐）+ `message--own`（她的气泡色）；
+         * - 别人：`message--user`（左对齐）+ `message--inbound`（对方的泡泡）。
+         *
+         * `message--actor` / `message--user` 这两个类以前就存在（选择器和测试
+         * 都在用），只是含义从"谁发起的请求"变成"谁说的话"——`data-role`
+         * 仍是权威且不变。
+         */
         const rowClass = [
           'message',
-          // 只有网页会话里"我发的"才靠右；渠道会话里 role=user 是别人，靠左。
-          row.own ? 'message--user' : row.inbound ? 'message--inbound' : 'message--actor',
+          row.own ? 'message--actor message--own' : 'message--user message--inbound',
           row.speaker && !row.showSpeaker ? 'message--continued' : '',
         ]
           .filter(Boolean)
@@ -464,7 +491,17 @@ export function MessageList({
             data-state={message.state}
             data-role={message.role}
           >
-            {row.own ? null : row.inbound ? (
+            {/*
+              头像与气泡**同侧**：她的话语在右，头像也在右（CSS 的
+              `row-reverse` 把它甩到气泡右边）；别人的头像在左。
+              DOM 顺序始终"头像 → 正文"，视觉左右只由 CSS 决定——
+              这样键盘/读屏的阅读顺序不因左右对调而颠倒。
+            */}
+            {row.own ? (
+              <div className="message__avatar" role="img" aria-label={actorName} title={actorName}>
+                <span />
+              </div>
+            ) : row.inbound ? (
               // 群成员头像用名字首字 + 稳定色号：不同人一眼能分开，
               // 但不用颜色表示身份（同名不同人靠下面的号码区分）。
               <span
@@ -475,9 +512,10 @@ export function MessageList({
                 {avatarInitial(row.speaker?.name)}
               </span>
             ) : (
-              <div className="message__avatar" role="img" aria-label={actorName} title={actorName}>
-                <span />
-              </div>
+              // 渠道私聊里对方没有群名片：给一个中性头像，别让整行只剩气泡。
+              <span className="message__avatar message__avatar--member" data-tone={avatarTone(message.key)} aria-hidden="true">
+                ·
+              </span>
             )}
             <div className="message__body">
               {row.speaker && row.showSpeaker ? (
@@ -532,19 +570,20 @@ export function MessageList({
               ) : null}
               {/* 她想撤回这条：卡片紧贴在这条消息下面，不另找地方。 */}
               {renderProposals(message.messageId)}
+              {/*
+                meta 行按"谁说的话"分，不再按"谁发起的请求"：
+                - 她：完整状态（模型、第几次尝试、停止后继续）——左右对调之后
+                  她自己出现在右边，这套原来只属于"我发的"渲染要跟着搬过来；
+                - 别人（`role=user`）：只留状态与时间，渠道会话里不逐条刷「已送达」。
+              */}
               {row.own ? (
-                <div className="message__meta message__meta--user">
-                  {message.state === 'pending' ? (
-                    <span className="state__pulse" aria-hidden="true" />
-                  ) : null}
-                  <span className={`state state--${message.state}`}>
-                    {statusText(message, liveTurnId, variant)}
-                  </span>
-                  {message.state === 'stopped' ? (
-                    <span className="message__attempt">可重新发送</span>
-                  ) : null}
-                  <span className="message__time">{clock}</span>
-                </div>
+                <ActorMeta
+                  message={message}
+                  liveTurnId={liveTurnId}
+                  onRetry={onRetry}
+                  variant={variant}
+                  align="end"
+                />
               ) : message.role === 'user' ? (
                 // 渠道会话的入站消息：只留时间，状态只在失败/待发时出现。
                 inboundState || clock ? (

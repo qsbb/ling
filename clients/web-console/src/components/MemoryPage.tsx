@@ -8,8 +8,10 @@
  * 2. **记忆列表**（`GET /v1/memory`）：按 kind 分段、时间倒序；默认**不显示**
  *    已撤回/已归档，墓碑要显式 `include=retracted|archived|all` 才取回。
  * 3. **单条操作**：撤回（必填理由）、纠正（supersede，旧条目变「已被纠正」）。
- * 4. **危险区**：遗忘全部（`POST /v1/memory/forget`）——二次确认 + 服务端返回的
- *    影响行数 + 明说不可撤销。
+ * 4. **危险区**：遗忘全部（`POST /v1/memory/forget`）——二次确认 + 明说不可撤销 +
+ *    **真删**（记忆 / 情节 / 核心记忆 / 意识条目 / 向量 / 实体关联 / 检索记录全部从库里
+ *    物理删除）。清理在后台完成，所以提交后还要轮询 `GET /v1/memory/purge/status`
+ *    拿到真实计数；轮询有上限（`PURGE_POLL_MAX_ATTEMPTS`），超时就说"仍在进行"。
  * 5. **「记忆与学习」调参 tab**（`?tab=settings`）：原 `/settings/memory` 的 4 个参数。
  *
  * 边界（读契约冻结时验收方点名的缺口，**不假装支持**）：
@@ -22,10 +24,20 @@
  * 另一条硬要求：**任何一块读失败都不许盖住整页**。核心记忆 403 时列表照常显示，
  * 反之亦然——分段级错误条与整页错误面板是两种不同的东西。
  */
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
-import { api } from '../api';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import {
+  api,
+  type ForgetAcceptedResponse,
+  type ForgetResponse,
+  type PurgeStatusItem,
+  type PurgeStatusResponse,
+} from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import { navigate, useLocationHref } from '../route';
+/* eslint-disable @typescript-eslint/no-unused-vars -- re-export 的类型给测试与调用方用 */
+export type { ForgetAcceptedResponse, ForgetResponse, PurgeStatusItem, PurgeStatusResponse };
+/* eslint-enable @typescript-eslint/no-unused-vars */
+
 import type {
   CoreMemoryInput,
   CoreMemoryItem,
@@ -462,18 +474,132 @@ export function memoryFooterNote(
   };
 }
 
+/* ==================================================================== 删除进度 */
+
+/**
+ * 轮询上限。**必须有限**：清理卡住时无限轮询既不会让删除变快，又会一直打着后端、
+ * 让用户以为"还在转"就等于"还在干活"。2 秒 × 20 次 = 40 秒，超时后如实说
+ * 「仍在进行，稍后刷新查看」——清理本身由后端扫描任务兜底，不依赖这个页面开着。
+ */
+export const PURGE_POLL_INTERVAL_MS = 2_000;
+export const PURGE_POLL_MAX_ATTEMPTS = 20;
+
+/** 一次轮询的判定结果。`continue` 是**动作**不是字面量，避免和状态名混。 */
+export type PurgePollDecision = 'continue' | 'done' | 'failed' | 'gone';
+
+/**
+ * 按墓碑查清那条记录该落到哪个状态。
+ *
+ * - 找不到这条墓碑（`gone`）：不说"已完成"——拿不到计数就不许编计数，
+ *   也不许无限重试；
+ * - `failed` 优先于其它：墓碑一旦失败就是失败，不能被后面别的记录盖过去；
+ * - `state` 认不出来（后端加了新状态）：按"还在进行"处理，不谎称完成。
+ */
+export function decidePurgePoll(
+  response: PurgeStatusResponse,
+  tombstoneId: string,
+): { decision: PurgePollDecision; item: PurgeStatusItem | null } {
+  const items = Array.isArray(response?.items) ? response.items : [];
+  const item = items.find((row) => row.tombstone_id === tombstoneId) ?? null;
+  if (!item) return { decision: 'gone', item: null };
+  if (item.state === 'done') return { decision: 'done', item };
+  if (item.state === 'failed') return { decision: 'failed', item };
+  return { decision: 'continue', item };
+}
+
+/** 一条墓碑的计数（后端字段直接映射；缺字段按 0，不猜）。 */
+export interface PurgeCounts {
+  memories: number;
+  episodes: number;
+  core: number;
+  awareness: number;
+  embeddings: number;
+  entities: number;
+  retrievalLogs: number;
+  eventsScrubbed: number;
+}
+
+export function purgeCountsOf(item: PurgeStatusItem | null): PurgeCounts {
+  return {
+    memories: item?.memories_deleted ?? 0,
+    episodes: item?.episodes_deleted ?? 0,
+    core: item?.core_deleted ?? 0,
+    awareness: item?.awareness_deleted ?? 0,
+    embeddings: item?.embeddings_deleted ?? 0,
+    entities: item?.entities_deleted ?? 0,
+    retrievalLogs: item?.retrieval_logs_deleted ?? 0,
+    eventsScrubbed: item?.events_scrubbed ?? 0,
+  };
+}
+
+/**
+ * 完成后的计数文案。
+ *
+ * 只说**真实删掉的条数**；计数为 0 的项不列（列一排 `0` 会把真数字淹掉）。
+ * 但**合计为 0** 时必须说清楚：不能让人把"删了 0 条"读成"删除失败"，也不能
+ * 把它读成"删成功了"——只能说这次没有行被删。
+ */
+export function describePurgeCounts(counts: PurgeCounts): string {
+  const parts: string[] = [];
+  if (counts.memories > 0) parts.push(`${counts.memories} 条记忆`);
+  if (counts.episodes > 0) parts.push(`${counts.episodes} 条情节`);
+  if (counts.core > 0) parts.push(`${counts.core} 条核心记忆`);
+  if (counts.awareness > 0) parts.push(`${counts.awareness} 条${AWARENESS_TERM}`);
+  if (counts.embeddings > 0) parts.push(`${counts.embeddings} 条向量`);
+  if (counts.entities > 0) parts.push(`${counts.entities} 条实体关联`);
+  if (counts.retrievalLogs > 0) parts.push(`${counts.retrievalLogs} 条检索记录`);
+  if (counts.eventsScrubbed > 0) parts.push(`${counts.eventsScrubbed} 条待处理事件`);
+  if (parts.length === 0) {
+    return '清理已完成：这次没有删到任何行（库里本来就没有可删的，或者这条记录不带计数）。';
+  }
+  return `已删除 ${parts.join('、')}。`;
+}
+
+/** 这个返回是两段式的受理结果，还是旧版软清除的计数？ */
+export function isForgetAccepted(response: ForgetResponse): response is ForgetAcceptedResponse {
+  return typeof (response as ForgetAcceptedResponse)?.tombstone_id === 'string';
+}
+
 /* ==================================================================== 遗忘状态机 */
 
-export type ForgetStep = 'idle' | 'confirm' | 'done';
+/**
+ * - `idle`：首屏；
+ * - `confirm`：二次确认，勾选后才能提交；
+ * - `purging`：请求已受理，**正在后台清理**（轮询中，还没有真实计数）；
+ * - `failed`：清理失败（只能来自 purge 墓碑的 `failed`）；
+ * - `done`：清理完成且有计数；
+ * - `timeout`：轮询到上限还没结束——不等了，但也不谎称完成；
+ * - `unsupported`：后端还是旧版（只软清除，没有墓碑可查）。
+ */
+export type ForgetStep =
+  | 'idle'
+  | 'confirm'
+  | 'purging'
+  | 'failed'
+  | 'done'
+  | 'timeout'
+  | 'unsupported';
 
 export interface ForgetState {
   step: ForgetStep;
   /** 二次确认必须显式勾选，按钮才可用——不是点一下就执行。 */
   ack: boolean;
+  /** 请求阶段进行中（POST 还没返回），或用户在失败页点了「重试删除」。 */
   pending: boolean;
-  /** 服务端返回的影响行数；只有 done 时有值。 */
-  count: number | null;
+  /** 已受理的墓碑 id；轮询只认这一条。 */
+  tombstoneId: string | null;
+  /** 请求阶段被取消并脱敏的在途事件数（**不是**删除条数）。 */
+  eventsCancelled: number | null;
+  /** 后台清理的计数；只有 done 时才有值。 */
+  counts: PurgeCounts | null;
+  /** 失败原因码（后端墓碑里的 `error_code`，不含正文）。 */
+  errorCode: string | null;
+  /** 旧后端软清除返回的影响行数：只用于如实说明"这个是软清除"，不当成删除计数。 */
+  legacyRetracted: number | null;
+  /** 请求阶段（POST 本身）失败：留在二次确认里就地显示。 */
   error: ExplainedError | null;
+  /** 已发起的轮询次数，超时判定用。 */
+  polls: number;
 }
 
 export type ForgetAction =
@@ -481,23 +607,76 @@ export type ForgetAction =
   | { type: 'cancel' }
   | { type: 'ack'; value: boolean }
   | { type: 'submit' }
-  | { type: 'succeeded'; count: number }
+  /** POST 受理成功：进入后台清理（**不是**完成）。 */
+  | { type: 'accepted'; accepted: ForgetAcceptedResponse }
+  /** 旧后端：只做了软清除。 */
+  | { type: 'legacy'; retracted: number }
+  /** 一次轮询的结果。 */
+  | { type: 'poll'; decision: PurgePollDecision; item: PurgeStatusItem | null }
+  /** 轮询到达上限：停止，但不是完成。 */
+  | { type: 'timeout' }
+  /** 请求阶段失败：回到二次确认，就地显示原因。 */
   | { type: 'failed'; error: ExplainedError }
+  /** 清理失败后用户再点一次（会重新提交删除请求，拿到新墓碑）。 */
+  | { type: 'retry' }
   | { type: 'reset' };
 
 export const INITIAL_FORGET: ForgetState = {
   step: 'idle',
   ack: false,
   pending: false,
-  count: null,
+  tombstoneId: null,
+  eventsCancelled: null,
+  counts: null,
+  errorCode: null,
+  legacyRetracted: null,
   error: null,
+  polls: 0,
 };
 
+const CONFIRMED = { ...INITIAL_FORGET, step: 'confirm' as const, ack: true, pending: true };
+
+function withPollResult(state: ForgetState, action: Extract<ForgetAction, { type: 'poll' }>): ForgetState {
+  if (state.step !== 'purging') return state;
+  const polls = state.polls + 1;
+  switch (action.decision) {
+    case 'done':
+      return {
+        ...state,
+        step: 'done',
+        pending: false,
+        polls,
+        counts: purgeCountsOf(action.item),
+        errorCode: null,
+        error: null,
+      };
+    case 'failed':
+      return {
+        ...state,
+        step: 'failed',
+        pending: false,
+        polls,
+        counts: null,
+        errorCode: action.item?.error_code ?? 'purge_failed',
+        error: null,
+      };
+    case 'gone':
+      // 查不到这条墓碑：不说"完成"，也不再继续问（再问也不会出现）。
+      // 后端有扫描任务兜底，这里只能说"没查到状态"。
+      return { ...state, step: 'timeout', pending: false, polls };
+    case 'continue':
+    default:
+      return { ...state, polls };
+  }
+}
+
 /**
- * 二次确认的状态机（纯函数，便于单测）。
+ * 二次确认 + 后台清理的状态机（纯函数，便于单测）。
  *
- * 只有 `confirm + ack + !pending` 才允许提交；`submit` 只把 pending 置真，
- * 行数一律以服务端返回为准，不在前端猜。
+ * 两条硬规则：
+ * 1. **请求受理 ≠ 删除完成**。`accepted` 只能进 `purging`，绝不能直接进 `done`；
+ *    `done` 只由 `poll(decision: 'done')` 产生，计数只从 status 里取。
+ * 2. 只有 `confirm + ack + !pending` 才允许提交；`purging` 里的重复提交无效。
  */
 export function forgetReducer(state: ForgetState, action: ForgetAction): ForgetState {
   switch (action.type) {
@@ -508,11 +687,42 @@ export function forgetReducer(state: ForgetState, action: ForgetAction): ForgetS
     case 'ack':
       return state.step === 'confirm' ? { ...state, ack: action.value } : state;
     case 'submit':
-      if (state.step !== 'confirm' || !state.ack || state.pending) return state;
-      return { ...state, pending: true, error: null };
-    case 'succeeded':
-      return { step: 'done', ack: true, pending: false, count: action.count, error: null };
+      if (!canSubmitForget(state)) return state;
+      return CONFIRMED;
+    case 'retry':
+      // 只允许从失败态重来一次：重新走两段式（新墓碑、新代次）。
+      if (state.step !== 'failed' || state.pending) return state;
+      return CONFIRMED;
+    case 'accepted':
+      if (!state.pending) return state;
+      return {
+        ...state,
+        step: 'purging',
+        pending: false,
+        ack: true,
+        tombstoneId: action.accepted.tombstone_id,
+        eventsCancelled: action.accepted.events_cancelled ?? 0,
+        counts: null,
+        errorCode: null,
+        legacyRetracted: null,
+        error: null,
+        polls: 0,
+      };
+    case 'legacy':
+      if (!state.pending) return state;
+      return {
+        ...INITIAL_FORGET,
+        step: 'unsupported',
+        ack: true,
+        legacyRetracted: action.retracted,
+      };
+    case 'poll':
+      return withPollResult(state, action);
+    case 'timeout':
+      return state.step === 'purging' ? { ...state, step: 'timeout', pending: false } : state;
     case 'failed':
+      // 轮询请求本身失败 ≠ 删除失败：只说明"这次没问到"，让下一次轮询或超时收场。
+      if (state.step === 'purging') return state;
       return { ...state, pending: false, error: action.error };
     case 'reset':
       return { ...INITIAL_FORGET };
@@ -523,6 +733,16 @@ export function forgetReducer(state: ForgetState, action: ForgetAction): ForgetS
 
 export function canSubmitForget(state: ForgetState): boolean {
   return state.step === 'confirm' && state.ack && !state.pending;
+}
+
+/** 还在等后台清理（要起轮询）。 */
+export function isForgetPolling(state: ForgetState): boolean {
+  return state.step === 'purging';
+}
+
+/** 失败提示里能不能给「重试删除」按钮。 */
+export function canRetryForget(state: ForgetState): boolean {
+  return state.step === 'failed' && !state.pending;
 }
 
 /* ==================================================================== 操作句柄 */
@@ -537,8 +757,13 @@ export interface MemoryHandlers {
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
   deleteCore(item: CoreMemoryItem): Promise<void>;
-  /** 返回服务端给出的影响行数。 */
-  forget(): Promise<number>;
+  /**
+   * 提交删除（两段式的请求阶段）。返回受理结果或旧后端的软清除计数；
+   * **不返回**"删掉了多少"——那个数只能从 `purgeStatus()` 里拿。
+   */
+  forget(): Promise<ForgetResponse>;
+  /** 查后台清理进度。`tombstone_id` 由调用方按受理结果匹配。 */
+  purgeStatus(signal?: AbortSignal): Promise<PurgeStatusResponse>;
   reloadCore(): void;
   reloadList(): void;
 }
@@ -1404,7 +1629,69 @@ export function MemoryListSection({
 export interface MemoryDangerZoneProps {
   state: ForgetState;
   dispatch: (action: ForgetAction) => void;
-  handlers: MemoryHandlers;
+  handlers: Pick<MemoryHandlers, 'forget' | 'purgeStatus'>;
+}
+
+/**
+ * 轮询后台清理进度，**有上限、可中止**。
+ *
+ * 为什么不能只靠"提交成功"就结束：两段式里 POST 只做同步的那一小步（代次 +1、
+ * 写墓碑、取消在途事件），物理删除在后台。此时界面上说"已遗忘 N 条"就是假话。
+ *
+ * 三条硬约束（测试逐条钉住）：
+ * - 最多 `attempts` 次；到上限就 `timeout` 停下，**不无限轮询**；
+ * - 组件卸载（或换了墓碑）时清掉定时器，并用 `AbortController` 掐断在途请求——
+ *   否则测试里会报 act 警告、真实页面里会对着已卸载组件 setState；
+ * - 单次查询失败不立刻断定"删除失败"：那只是"这次没问到"，下一次再问，
+ *   直到上限。删除是否失败只看墓碑的 `state === 'failed'`。
+ */
+export async function pollForgetProgress(options: {
+  tombstoneId: string;
+  handler: (signal?: AbortSignal) => Promise<PurgeStatusResponse>;
+  intervalMs: number;
+  attempts: number;
+  isCancelled: () => boolean;
+  onUpdate: (result: { decision: PurgePollDecision; item: PurgeStatusItem | null }) => void;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const {
+    tombstoneId,
+    handler,
+    intervalMs,
+    attempts,
+    isCancelled,
+    onUpdate,
+    sleep = defaultSleep,
+  } = options;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0) {
+      await sleep(intervalMs);
+      if (isCancelled()) return;
+    }
+    const controller = new AbortController();
+    try {
+      const response = await handler(controller.signal);
+      if (isCancelled()) return;
+      const result = decidePurgePoll(response, tombstoneId);
+      onUpdate(result);
+      if (result.decision !== 'continue') return;
+    } catch {
+      // 卸载导致的取消：直接退出，不回调。
+      if (isCancelled()) return;
+      // 其它失败（500 / 网络断）当"这次没问到"，继续下一次。
+    }
+  }
+  if (!isCancelled()) onUpdate({ decision: 'gone', item: null });
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 主按钮文案（轮询中不清回"确认遗忘全部"，否则会让人以为没提交上）。 */
+export function forgetButtonLabel(state: ForgetState): string {
+  if (state.pending) return '正在提交…';
+  return '确认遗忘全部';
 }
 
 export function MemoryDangerZone({
@@ -1416,8 +1703,28 @@ export function MemoryDangerZone({
     if (!canSubmitForget(state)) return;
     dispatch({ type: 'submit' });
     try {
-      const count = await handlers.forget();
-      dispatch({ type: 'succeeded', count });
+      const response = await handlers.forget();
+      if (isForgetAccepted(response)) {
+        // 受理 ≠ 完成：进入后台清理后由轮询去拿真实计数。
+        dispatch({ type: 'accepted', accepted: response });
+      } else {
+        dispatch({ type: 'legacy', retracted: Number(response?.retracted ?? 0) });
+      }
+    } catch (cause) {
+      dispatch({ type: 'failed', error: explainError(cause) });
+    }
+  };
+
+  const retry = async () => {
+    if (!canRetryForget(state)) return;
+    dispatch({ type: 'retry' });
+    try {
+      const response = await handlers.forget();
+      if (isForgetAccepted(response)) {
+        dispatch({ type: 'accepted', accepted: response });
+      } else {
+        dispatch({ type: 'legacy', retracted: Number(response?.retracted ?? 0) });
+      }
     } catch (cause) {
       dispatch({ type: 'failed', error: explainError(cause) });
     }
@@ -1431,14 +1738,21 @@ export function MemoryDangerZone({
 
       {state.step === 'idle' ? (
         <>
-          <p className="mem-danger__body">
-            「遗忘全部」会清空当前账号<strong>可见</strong>的记忆：所有记忆行（情节 / 断言 /
-            程序三类 kind 都算）标记为已撤回、情节片段归档、核心记忆停用、{AWARENESS_TERM}失效。
-            它不会删除数据库里的行（软清除，保留证据链）。
+          <p className="mem-danger__body" data-testid="mem-danger-scope">
+            「遗忘全部」会<strong>从数据库里真正删除</strong>当前账号的记忆与派生数据：
+            记忆、情节、核心记忆、{AWARENESS_TERM}、向量、实体关联、检索记录，
+            连同 payload 里带原文的在途任务一起清掉。
+          </p>
+          <p className="mem-danger__body" data-testid="mem-danger-background">
+            删除在后台完成，可能需要几秒到几分钟；提交后这个页面会显示清理进度和真实计数。
+          </p>
+          <p className="mem-danger__body" data-testid="mem-danger-tombstone">
+            清完之后只留下来一条<strong>不含任何内容</strong>的删除记录（什么时候删的、删了几行），
+            用来防止备份恢复后内容复活——它不存原文，也不存被删的条目。
           </p>
           <p className="mem-danger__irreversible">
-            ⚠ 无法撤销：接口没有恢复端点，页面也没有撤销入口。清掉之后只能在墓碑里看到
-            「已撤回」，无法让它们重新参与召回。
+            ⚠ 无法撤销：没有恢复接口，页面也没有撤销入口。删掉的内容不会再出现在列表里，
+            也不会重新参与召回。
           </p>
           <button
             type="button"
@@ -1455,12 +1769,18 @@ export function MemoryDangerZone({
           <h3 id="mem-danger-confirm-title" className="mem-confirm__title">
             二次确认：遗忘全部记忆
           </h3>
-          <ul className="mem-danger__list">
-            <li>记忆行（情节 / 断言 / 程序三类都有，不按 kind 过滤）→ 标记已撤回，理由记为「用户请求清除」</li>
-            <li>情节片段（另一张表 MemoryEpisode）→ 归档，退出检索</li>
-            <li>核心记忆 → 停用（不再每轮注入）</li>
-            <li>{AWARENESS_TERM} → 失效</li>
+          <ul className="mem-danger__list" data-testid="mem-danger-confirm-list">
+            <li>记忆行（情节 / 断言 / 程序三类都有，不按 kind 过滤）→ <strong>从库里删除</strong></li>
+            <li>情节片段（另一张表 MemoryEpisode）→ <strong>从库里删除</strong></li>
+            <li>核心记忆 → <strong>从库里删除</strong>（不再每轮注入）</li>
+            <li>{AWARENESS_TERM} → <strong>从库里删除</strong></li>
+            <li>向量、实体关联、检索记录 → <strong>从库里删除</strong>（检索记录里有你说的原话）</li>
+            <li>在途的记忆提炼任务 → 取消，并擦掉 payload 里的原文</li>
+            <li>只留下一条不含任何内容的删除记录，用于防止备份恢复后内容复活</li>
           </ul>
+          <p className="mem-danger__body">
+            删除在后台完成，可能需要几秒到几分钟。提交后页面会显示清理进度与真实计数。
+          </p>
           <p className="mem-danger__irreversible">
             ⚠ 该操作不可撤销。请先确认这些记忆确实不再需要。
           </p>
@@ -1469,8 +1789,9 @@ export function MemoryDangerZone({
               type="checkbox"
               checked={state.ack}
               onChange={(event) => dispatch({ type: 'ack', value: event.target.checked })}
+              disabled={state.pending}
             />
-            <span>我明白这会清空当前账号可见的记忆，且无法撤销</span>
+            <span>我明白这会从数据库里永久删除当前账号的记忆，且无法撤销</span>
           </label>
 
           <InlineError error={state.error} resource="list" />
@@ -1482,7 +1803,7 @@ export function MemoryDangerZone({
               disabled={!canSubmitForget(state)}
               onClick={() => void run()}
             >
-              {state.pending ? '正在遗忘…' : '确认遗忘全部'}
+              {forgetButtonLabel(state)}
             </button>
             <button
               type="button"
@@ -1496,19 +1817,85 @@ export function MemoryDangerZone({
         </div>
       ) : null}
 
-      {state.step === 'done' ? (
-        <div className="mem-danger__result" role="status" data-testid="mem-forget-result">
+      {state.step === 'purging' ? (
+        <div className="mem-danger__result" role="status" data-testid="mem-forget-purging">
           <p className="mem-danger__count">
-            已遗忘：服务端返回影响行数 <strong data-testid="mem-forget-count">{state.count ?? 0}</strong>
+            <span className="spinner" aria-hidden="true" /> 已提交删除，正在后台清理…
           </p>
           <p className="mem-danger__body">
-            口径：服务端返回的是四类受影响行数之和——记忆行（情节 / 断言 / 程序三类 kind）+
-            情节片段（MemoryEpisode）+ 核心记忆 + {AWARENESS_TERM}。四类都只做软清除（撤回 / 归档 /
-            停用 / 失效），不物理删除。
+            记录已受理{state.eventsCancelled !== null ? `，已取消并脱敏 ${state.eventsCancelled} 条在途任务` : ''}。
+            清理在后台逐表执行，完成后这里会换成真实删除条数。可以先去别的页面，清理本身不受这个页面影响。
+          </p>
+          <p className="mem-danger__body">
+            进度查询：第 {state.polls} / {PURGE_POLL_MAX_ATTEMPTS} 次
+            （最多等 {(PURGE_POLL_INTERVAL_MS * PURGE_POLL_MAX_ATTEMPTS) / 1000} 秒，不会一直轮询）。
+          </p>
+        </div>
+      ) : null}
+
+      {state.step === 'done' ? (
+        <div className="mem-danger__result" role="status" data-testid="mem-forget-result">
+          <p className="mem-danger__count" data-testid="mem-forget-count-line">
+            {describePurgeCounts(state.counts ?? purgeCountsOf(null))}
+          </p>
+          <p className="mem-danger__body">
+            口径：后台清理返回的真实删除行数，按后端墓碑记录原样显示；不把 0 的项列出来，
+            也不加总成"影响行数"糊弄过去。
           </p>
           <p className="mem-danger__irreversible">
-            ⚠ 无法撤销（没有恢复接口）。默认列表与核心记忆现在应为空；
-            墓碑可以用上面的「显示已撤回 / 显示已归档」查看。
+            ⚠ 无法撤销（没有恢复接口）。列表与核心记忆现在应为空；
+            只留下那条不含内容的删除记录。
+          </p>
+          <button type="button" className="button mem-action" onClick={() => dispatch({ type: 'reset' })}>
+            知道了
+          </button>
+        </div>
+      ) : null}
+
+      {state.step === 'failed' ? (
+        <div className="mem-danger__result" role="alert" data-testid="mem-forget-failed">
+          <p className="mem-danger__count">清理失败：后台删除没有跑完。</p>
+          <p className="mem-danger__body">
+            原因码 <code data-testid="mem-forget-error-code">{state.errorCode ?? 'purge_failed'}</code>
+            （不含任何被删内容）。请求阶段已经生效——列表里已经看不到这些记忆；但库里的行可能还在，
+            后台扫描也会按这条记录重试。
+          </p>
+          <div className="mem-confirm__actions">
+            <button
+              type="button"
+              className="button mem-action mem-action--danger"
+              onClick={() => void retry()}
+              disabled={state.pending}
+            >
+              {state.pending ? '正在重新提交…' : '重试删除'}
+            </button>
+            <button type="button" className="button mem-action" onClick={() => dispatch({ type: 'reset' })}>
+              关闭
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {state.step === 'timeout' ? (
+        <div className="mem-danger__result" role="status" data-testid="mem-forget-pending">
+          <p className="mem-danger__count">清理仍在进行，稍后刷新查看。</p>
+          <p className="mem-danger__body">
+            页面已经停止轮询（最多查 {PURGE_POLL_MAX_ATTEMPTS} 次）——这只说明"还没拿到最终结果"，
+            既不代表删除失败，也不代表已完成。后台清理会继续，下次打开本页会重新查询；
+            如果一直是这个状态，请让维护者看服务端的清理任务。
+          </p>
+          <button type="button" className="button mem-action" onClick={() => dispatch({ type: 'reset' })}>
+            知道了
+          </button>
+        </div>
+      ) : null}
+
+      {state.step === 'unsupported' ? (
+        <div className="mem-danger__result" role="alert" data-testid="mem-forget-unsupported">
+          <p className="mem-danger__count">服务端还是旧版：这次只做了软清除。</p>
+          <p className="mem-danger__body">
+            后端返回的是旧接口的 <code>retracted</code> 计数（本次 {state.legacyRetracted ?? 0} 行），
+            没有墓碑、也查不到清理进度——说明原文还留在库里。升级后端之后再执行一次「遗忘全部」才是真删。
           </p>
           <button type="button" className="button mem-action" onClick={() => dispatch({ type: 'reset' })}>
             知道了
@@ -1644,6 +2031,7 @@ export function MemoryContent(): React.ReactElement {
     void loadList();
   }, [loadList]);
 
+
   const handlers: MemoryHandlers = useMemo(
     () => ({
       async retract(memoryId, reason) {
@@ -1681,13 +2069,21 @@ export function MemoryContent(): React.ReactElement {
         await loadCore();
       },
       async forget() {
+        // 请求阶段：只把"删除请求"发出去。**不在这里说"已遗忘 N 条"**——
+        // 原文这时还在库里，真实计数要等后台清理（见下面的轮询 effect）。
         const result = await api.forgetAllMemories();
         setNotice({
           tone: 'warn',
-          text: `已遗忘全部记忆：服务端返回影响 ${result.retracted} 行（记忆行 + 情节片段 + 核心记忆 + ${AWARENESS_TERM}四类合计），且无法撤销。`,
+          text: isForgetAccepted(result)
+            ? '删除请求已受理：正在后台清理，完成后这里会显示真实的删除条数。清理期间就已经不会再召回这些记忆。'
+            : '删除请求已被受理，但服务端返回的是旧版软清除计数：原文可能还在库里，见危险区的说明。',
         });
+        // 读侧按代次/墓碑过滤，刷新一次就能看到"已经没了"。
         await Promise.all([loadCore(), loadList()]);
-        return result.retracted;
+        return result;
+      },
+      purgeStatus(signal) {
+        return api.purgeStatus(signal);
       },
       reloadCore() {
         void loadCore();
@@ -1698,6 +2094,46 @@ export function MemoryContent(): React.ReactElement {
     }),
     [loadCore, loadList],
   );
+
+  /**
+   * 后台清理的轮询。
+   *
+   * 只跟着"已受理的墓碑"走：`purging` 里 `tombstoneId` 一变（新一次删除）就重开一轮。
+   * 卸载时把 `cancelled` 置真并清掉定时器——定时器不清，测试里会报 act 警告，
+   * 真实页面里会对着已卸载组件 setState。
+   *
+   * handler 走 ref 而不是放进依赖：`handlers` 每次 `loadList` 变化都会重建，
+   * 放进依赖会让轮询每刷一次列表就重启一轮，轮询计数永远到不了上限。
+   */
+  const tombstoneId = forget.step === 'purging' ? forget.tombstoneId : null;
+  const purgePollHandlerRef = useRef(handlers.purgeStatus);
+  purgePollHandlerRef.current = handlers.purgeStatus;
+  useEffect(() => {
+    if (!tombstoneId) return undefined;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void pollForgetProgress({
+        tombstoneId,
+        handler: purgePollHandlerRef.current,
+        intervalMs: PURGE_POLL_INTERVAL_MS,
+        attempts: PURGE_POLL_MAX_ATTEMPTS,
+        isCancelled: () => cancelled,
+        onUpdate: (result) => {
+          if (cancelled) return;
+          if (result.decision === 'gone') {
+            // 走到上限仍没拿到这条墓碑的结果：停，但不说"完成"。
+            dispatchForget({ type: 'timeout' });
+            return;
+          }
+          dispatchForget({ type: 'poll', decision: result.decision, item: result.item });
+        },
+      });
+    }, PURGE_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [tombstoneId]);
 
   return (
     <MemoryContentBody

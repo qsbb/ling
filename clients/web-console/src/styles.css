@@ -767,6 +767,44 @@ button {
   padding: 22px clamp(14px, 4vw, 40px) 10px;
 }
 
+/*
+ * 「她这次看到了什么」抽屉打开时，给对话区让出抽屉的宽度。
+ *
+ * 为什么必须让：她的消息现在贴右（MessageList 里 own = role === 'actor'），
+ * 她那条下面的入口按钮（data-testid="prompt-entry"）也跟着贴右；抽屉从右侧
+ * 滑出，不让位就会把入口整个压在 .prompt-drawer__panel 底下——入口看起来
+ * 还在，实际点不到，"再点入口 = 收起"永远触发不了。
+ *
+ * 不选"z-index / pointer-events 把入口抬到面板之上"：那会让入口浮在抽屉
+ * 内容上，视觉更糟。这里只改滚动容器的内边距，层级不变：
+ * - 抽屉本身不吃指针（pointer-events: none，见 prompt-drawer.css），
+ *   背景的滚轮/触控滚动照旧，只是可读区域变窄；
+ * - 让位宽度与 .prompt-drawer__panel 的三段宽度一一对应
+ *   （宽屏 clamp(420px, 34vw, 560px)，≤1170 用 min(88vw, 520px)）；
+ * - 全局 box-sizing: border-box，加内边距不会撑出横向溢出。
+ */
+.messages[data-prompt-open='true'] {
+  padding-right: clamp(420px, 34vw, 560px);
+  transition: padding-right 0.22s ease-out;
+}
+
+@media (max-width: 1170px) {
+  .messages[data-prompt-open='true'] {
+    padding-right: min(88vw, 520px);
+  }
+}
+
+/*
+ * ≤560（含 375）：抽屉占满视口，对话区本来就整体被盖住，让位没有意义，
+ * 反而可能把窄屏挤成横向滚动条。这里明确跳过让位。
+ */
+@media (max-width: 560px) {
+  .messages[data-prompt-open='true'] {
+    padding-right: 0;
+    transition: none;
+  }
+}
+
 .messages__list {
   list-style: none;
   margin: 0 auto;
@@ -824,8 +862,24 @@ button {
   }
 }
 
-.message--user {
-  justify-content: flex-end;
+/*
+ * 左右只表示"谁说的话"，两种会话一致：
+ *
+ * - `role=actor`（她自己）→ `.message--own`：贴右，头像排到气泡右侧；
+ * - `role=user`（别人）→ `.message--inbound`：贴左，头像在左。
+ *
+ * 之前是"网页会话里我发的靠右、群里全靠左"，于是群里她和群成员挤在同一边，
+ * 看不出哪句是她的（用户原话：左右区分没做好，左边应该是其他人）。
+ * 行方向用 `row-reverse` 而不是把头像挪到 DOM 后面：键盘/读屏顺序仍是
+ * "头像 → 正文"，只有视觉左右翻转。
+ */
+.message--own {
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+}
+
+.message--inbound {
+  justify-content: flex-start;
 }
 
 .message__avatar {
@@ -862,11 +916,18 @@ button {
   max-width: min(680px, 84%);
 }
 
-.message--user .message__body {
+.message--own .message__body {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   max-width: min(560px, 86%);
+}
+
+/* 别人的正文占满剩余宽度（头像已在左侧），气泡本身仍按内容收缩。 */
+.message--inbound .message__body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .message__author {
@@ -891,10 +952,18 @@ button {
   border-color: #d8d2c2;
 }
 
-.message--user .message__bubble {
+/* 她的气泡：暖色、右上角收窄（尖角朝她的头像）。 */
+.message--own .message__bubble {
   background: var(--user-bubble);
   border-color: #ddd1ba;
   border-radius: 15px 4px 15px 15px;
+}
+
+/* 别人的气泡：素纸色，左上角收窄（尖角朝对方的头像）。 */
+.message--inbound .message__bubble {
+  background: var(--paper-sunken);
+  border-color: var(--line);
+  border-radius: 4px 15px 15px 15px;
 }
 
 .message__text {
@@ -904,7 +973,7 @@ button {
   letter-spacing: 0.01em;
 }
 
-.message--user .message__text {
+.message--own .message__text {
   font-size: 14.5px;
   line-height: 1.7;
 }
@@ -977,7 +1046,8 @@ button {
   color: var(--ink-faint);
 }
 
-.message__meta--user {
+/* 她的话在右，状态/时间也贴右；别人的贴左（默认）。 */
+.message__meta--own {
   justify-content: flex-end;
 }
 
@@ -1042,7 +1112,7 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
-.message__meta--user .message__time {
+.message__meta--own .message__time {
   margin-left: 0;
 }
 
@@ -1890,7 +1960,7 @@ button {
     max-width: 88%;
   }
 
-  .message--user .message__body {
+  .message--own .message__body {
     max-width: 88%;
   }
 
@@ -3253,10 +3323,11 @@ button {
   background: #b3a08c;
 }
 
-/* 群成员的泡泡比她的暗一档：同屏时一眼看出哪句是她说的 */
-.message--inbound .message__bubble {
-  background: var(--paper-sunken);
-}
+/*
+ * 群成员 / 对方的泡泡比她的暗一档（与 `.message--inbound .message__bubble`
+ * 同一条规则，见上面的左右映射段）。这里不再重复声明：一份判据写在两处，
+ * 迟早会有人只改一边。
+ */
 
 /* 同一个人连着说：气泡贴近一点，读起来是一段 */
 .message--continued {

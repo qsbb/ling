@@ -10,6 +10,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type { ConsentRecord } from '../types';
+// 授权页与设置枢纽共用同一套页面骨架样式（settings.css 里的 .settings-page 等）。
+// 之前这个页面一份 CSS 都没引，`consent-row*` 规则自然不生效，列表退化成
+// 带圆点的裸 `<ul>`；显式引入后规则才落地。
+import '../settings.css';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
 
 interface ConsentPageProps {
@@ -120,35 +124,56 @@ export function ConsentPage({ onBack }: ConsentPageProps) {
       {message ? <div className="banner banner--ok">{message}</div> : null}
 
       {!loading ? (
-        <ul className="consent-list">
+        <ul className="consent-rows">
           {scopes.map((scope) => {
             const record = recordOf(scope);
             const granted = record?.granted ?? false;
             const meta = SCOPE_LABELS[scope];
             return (
-              <li key={scope} className="consent-list__item">
-                <div className="consent-list__body">
-                  <div className="consent-list__title">
-                    {meta?.label ?? scope}
-                    <span className={`badge ${granted ? 'badge--published' : 'badge--draft'}`}>
+              /*
+               * 一条权限 = 一行：名称 + 状态徽标 + 一句话 + 按钮。
+               *
+               * 原来每条占三行（名称 / 说明 / scope=… 修订…），八条就是二十四行，
+               * 眼睛要来回跳着配对"这一行的按钮管的是哪一条"。现在名称与徽标
+               * 同排、说明与按钮同行（窄屏堆叠），`scope` 与修订号降为 title
+               * 悬停提示——它们是排查用的，不该占正文宽度。
+               */
+              <li
+                key={scope}
+                className="consent-row"
+                data-state={granted ? 'granted' : 'denied'}
+              >
+                {/* 一行 = 主信息 + 按钮。`title` 那句（scope / 修订）挂在主信息上
+                    而不是整行：整行带 title 会让悬停提示盖住按钮的可点区域。 */}
+                <div className="consent-row__main">
+                  <div className="consent-row__title">
+                    <span className="consent-row__name">{meta?.label ?? scope}</span>
+                    <span
+                      className={`consent-row__badge consent-row__badge--${granted ? 'granted' : 'denied'}`}
+                    >
                       {granted ? '已授权' : '未授权'}
                     </span>
+                    <span
+                      className="consent-row__code"
+                      title={`scope=${scope}${record ? ` · 修订 ${record.revision}` : ' · 未设置过'}${
+                        record?.valid_until ? ` · 有效至 ${record.valid_until}` : ''
+                      }`}
+                    >
+                      {scope}
+                    </span>
                   </div>
-                  <div className="consent-list__hint">{meta?.hint ?? '后端登记但界面未说明的授权范围'}</div>
-                  <div className="consent-list__meta">
-                    scope = <code>{scope}</code>
-                    {record?.valid_until ? ` · 有效至 ${record.valid_until}` : ''}
-                    {record ? ` · 修订 ${record.revision}` : ' · 未设置过'}
-                  </div>
+                  <p className="consent-row__hint">{meta?.hint ?? '后端登记但界面未说明的授权范围'}</p>
                 </div>
+                <div className="consent-row__action">
                 <button
                   type="button"
-                  className={`button ${granted ? '' : 'button--primary'}`}
+                  className={`button button--small ${granted ? '' : 'button--primary'}`}
                   disabled={busy === scope}
                   onClick={() => void toggle(scope, !granted)}
                 >
-                  {busy === scope ? '处理中…' : granted ? '撤销' : '授予'}
+                  {busy === scope ? '处理中…' : granted ? '撤回' : '授予'}
                 </button>
+                </div>
               </li>
             );
           })}

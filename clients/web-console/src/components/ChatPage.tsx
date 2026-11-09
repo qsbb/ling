@@ -261,8 +261,19 @@ export function ChatPage({
           </div>
         ) : null}
 
+        {/*
+          抽屉打开时给对话区让出抽屉的宽度（`data-prompt-open` → CSS 里
+          `padding-right: clamp(420px, 34vw, 560px)`）。她的消息贴右，入口按钮
+          也跟着贴右；不让位的话入口会被从右侧滑出的面板整个压住——
+          "再点入口 = 收起"就永远没有机会触发。这里不用 z-index /
+          pointer-events 把入口抬到面板之上（那会浮在面板内容上）。≤560px
+          时抽屉占满视口，让位没有意义，由媒体查询跳过。
+          数据属性放在滚动容器上而不是 `.chat-main`：只让消息区让位，
+          标题栏与输入框仍占满整宽。
+        */}
         <div
           className="messages"
+          data-prompt-open={promptOpenKey !== null ? 'true' : undefined}
           ref={listRef}
           data-testid="message-scroll"
           onScroll={(event) => {

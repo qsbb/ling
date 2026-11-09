@@ -88,6 +88,47 @@ export class ApiError extends Error {
   }
 }
 
+/** `POST /v1/memory/forget` 的两段式返回（请求阶段）。 */
+export interface ForgetAcceptedResponse {
+  tombstone_id: string;
+  generation: number;
+  events_cancelled: number;
+  state: string;
+}
+
+/**
+ * 旧后端（两段式之前）的返回：只做了软清除，`retracted` 是四类受影响行数之和。
+ * 保留这个分支不是为了兼容，而是为了让页面能**如实指出**"这个后端还没真删"。
+ */
+export interface ForgetLegacyResponse {
+  retracted: number;
+}
+
+export type ForgetResponse = ForgetAcceptedResponse | ForgetLegacyResponse;
+
+/** `GET /v1/memory/purge/status` 的返回：最近的清理记录。 */
+export interface PurgeStatusItem {
+  tombstone_id: string;
+  state: string;
+  requested_at: string | null;
+  completed_at: string | null;
+  memories_deleted: number;
+  episodes_deleted: number;
+  core_deleted: number;
+  awareness_deleted: number;
+  embeddings_deleted: number;
+  entities_deleted: number;
+  /** 后端墓碑表里有这一列；老后端不返回时按 0 处理。 */
+  retrieval_logs_deleted?: number | null;
+  events_cancelled: number;
+  events_scrubbed?: number | null;
+  error_code: string | null;
+}
+
+export interface PurgeStatusResponse {
+  items: PurgeStatusItem[];
+}
+
 let unauthorizedHandler: (() => void) | null = null;
 
 /** 应用层注册：任何请求 401 时回到登录表单（保留当前路由）。 */
@@ -656,9 +697,26 @@ export const api = {
     );
   },
 
-  /** 遗忘全部：软清除当前 subject，返回四类受影响行数之和。没有恢复接口。 */
-  forgetAllMemories(): Promise<{ retracted: number }> {
+  /**
+   * 遗忘全部（两段式的**请求阶段**）：真删当前 subject 的记忆与派生数据。
+   *
+   * 这个调用返回时物理删除**还没有做**——后台清理需要几秒到几分钟，进度走
+   * `purgeStatus()`。返回里唯一能显示的是 `events_cancelled`（在途事件数），
+   * 它**不是**"删掉了多少条记忆"，页面不许把它当计数用。
+   *
+   * 旧后端（两段式之前）只回 `{retracted}`（软清除的受影响行数）：这里如实
+   * 透传，由页面识别并说明"这个后端还在软清除"，不假装已经真删。
+   */
+  forgetAllMemories(): Promise<ForgetResponse> {
     return request('/v1/memory/forget', { method: 'POST' });
+  },
+
+  /** 最近的清理记录：`{items: [...]}`，按时间倒序；没配信号 = 不取消。 */
+  purgeStatus(signal?: AbortSignal): Promise<PurgeStatusResponse> {
+    return request('/v1/memory/purge/status', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
   },
 
   listCoreMemory(): Promise<CoreMemoryListResponse> {

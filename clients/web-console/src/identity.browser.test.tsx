@@ -82,7 +82,7 @@ function skip(ctx: { skip: () => void }): boolean {
 
 const USER = {
   id: 'user-1',
-  username: 'lingxi',
+  username: 'demo-user',
   role: 'owner',
   subject_id: 'subj_0000',
   display_name: '主人',

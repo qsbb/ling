@@ -9,6 +9,11 @@
    - 宽屏：420–560px（clamp 保证两端都不越界，1440 下约 490）；
    - ≤1170px：min(88vw, 520px)；
    - ≤560px（含 375）：100%，占满视口。
+
+   与对话区的配合：抽屉打开时消息滚动容器往左让出同样的宽度
+   （styles.css 里 `.messages[data-prompt-open='true']` 的 padding-right）。
+   她的消息贴右，入口按钮也在右侧；不让位的话入口正好压在面板底下，
+   "再点入口 = 收起"就没有机会触发。≤560 的让位被同一个媒体查询跳过。
    ---------------------------------------------------------------------- */
 
 .prompt-drawer {
@@ -18,7 +23,7 @@
   display: flex;
   justify-content: flex-end;
   /*
-   * 整层都不接指针：只有面板接（下面单独 pointer-events: auto）。
+   * 整层都不接指针：只有面板的内容接（下面 __panel / __panel * 单独接）。
    * 否则这个全屏 wrapper 会把背景的滚轮/触控/点击全部吃掉，滚不动对话页。
    */
   pointer-events: none;
@@ -41,11 +46,20 @@
 .prompt-drawer__panel {
   position: relative;
   z-index: 81;
-  pointer-events: auto;
+  /*
+   * 面板接指针，但"只接落在它自己内容上的"：
+   *
+   * 打开抽屉时对话区会往左让出面板的宽度（styles.css 里
+   * `.messages[data-prompt-open='true']` 的 padding-right）。入口按钮因此
+   * 落在面板左边的空白区域里，可点。动画的 0.22s 内（或窗口刚变窄的那一帧）
+   * 入口可能短暂落在面板已占据但还没铺满内容的区域上；这里用
+   * `pointer-events: none` + 子孙元素 `auto`，让那层空白把点击/滚轮放行给
+   * 背后的入口，而不是被一个空面板吃掉。
+   */
+  pointer-events: none;
   display: flex;
   flex-direction: column;
   width: clamp(420px, 34vw, 560px);
-  max-width: 100vw;
   height: 100%;
   min-height: 0;
   background: var(--paper-raised);
@@ -61,6 +75,14 @@
   to {
     transform: none;
   }
+}
+
+/*
+ * 面板自己的内容一律恢复接指针（见 .prompt-drawer__panel 的说明）。
+ * `pointer-events` 会继承，所以用 `*` 一次性还给所有后代。
+ */
+.prompt-drawer__panel * {
+  pointer-events: auto;
 }
 
 .prompt-drawer__head {
@@ -345,6 +367,24 @@
   color: var(--accent);
 }
 
+/*
+ * 抽屉开着时入口一定是可点的（不只是"看起来还在"）：
+ *
+ * 对话区在抽屉打开时会让位（见 styles.css 的
+ * `.messages[data-prompt-open='true']`），入口被推到面板左边。这里再叠一层
+ * 保险——抽屉打开期间把入口放进自己的层叠上下文，让它稳稳落在遮罩之上。
+ * **不**把它抬到面板之上：入口的位置本来就不和面板重叠，这一层只是防止
+ * 遮罩（`rgba(38,34,29,0.14)`，同样 z-index: 80 的 fixed 层）在个别浏览器
+ * 把 fixed 层画在静态内容之上时把入口压灰、压得点不到。
+ *
+ * 挡不住也没关系：`.prompt-drawer__panel` 已经 `pointer-events: none`
+ * （只让内容接），空白处会把点击放行给背后的入口。
+ */
+.message__prompt[aria-expanded='true'] {
+  position: relative;
+  z-index: 79;
+}
+
 /* ------------------------------------------------------------ 响应式 */
 
 @media (max-width: 1170px) {
@@ -357,7 +397,6 @@
   .prompt-drawer__panel {
     /* 375 上占满宽度：用 100% 而不是 100vw，避免滚动条把页面撑出横向溢出 */
     width: 100%;
-    max-width: 100%;
     border-left: 0;
   }
 

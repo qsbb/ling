@@ -70,18 +70,137 @@ interface SettingsEntry {
   testid?: string;
 }
 
-interface SettingsGroup {
+/**
+ * 设置中心的一组入口。
+ *
+ * 分组不只为好看：整页原来是一条长长的单列，六段之间没有任何层级，
+ * 人只能一路往下读到底才知道"维护与关于"在哪。分组标题就是路上那几个
+ * 路标——而且**顺序本身是信息**（常用的在上，低频的在最下）。
+ */
+export interface SettingsGroup {
   key: string;
   title: string;
-  /** 这一组为什么算"程序/运维"。 */
+  /** 一句话说清这一组装的是什么（≤ 30 字，别写成段落）。 */
   note: string;
   entries: readonly SettingsEntry[];
 }
 
 /**
- * 四组 / 五个页面（DESIGN §2 的表，后加「接入与连接」）。顺序即渲染顺序：
- * 安全与隐私（一跳可达的权利与凭据）→ 模型与密钥（实例能力）→ 接入与连接
- * （她从哪条线收发消息）→ 维护与关于（运维动作）。
+ * 「关于她」这一组的两格**不是跳转入口**，而是就地可改的偏好。
+ *
+ * 把它们和跳转卡片放进同一个网格、长得也一样，是因为对用户来说它们是同一类
+ * 东西——"设置里的一个开关/一项值"。但交互完全不同（就地改 vs 点进去），
+ * 所以卡片上明确写「就地生效」，并且不给箭头。
+ */
+export type SettingsTile = 'timezone' | 'video';
+
+export interface SettingsCardSpec {
+  key: string;
+  label: string;
+  /** 卡片上那句话：说清"点进去能改什么"，不写长段落。 */
+  verb: string;
+  path: string;
+  testid: string;
+  /** 对应 taxonomy 的类 key（有值时用后端 label/verb 覆盖）。 */
+  taxonomyKey?: string;
+  /** 有值表示这张卡是就地可改的偏好块（不跳转）。 */
+  tile?: SettingsTile;
+  /** 右上角小标记，例：当前值 / 状态。 */
+  badge?: string;
+}
+
+export interface SettingsSection {
+  key: string;
+  title: string;
+  note: string;
+  /** 组内卡片：全部等宽，2 列（≤760px 单列）。 */
+  cards: readonly SettingsCardSpec[];
+}
+
+/**
+ * 三组入口 + 一组就地偏好。顺序即首屏优先级：
+ *
+ * 1. **关于她**：时区与"怎么看视频"——改完不用发布，一天要用好几次；
+ * 2. **安全**：权限与隐私、登录名与密码——偶尔要改，但改了立刻生效；
+ * 3. **连接与运行**：模型与生成、接入器、维护与关于——装好之后很少动，
+ *    出问题时才来，所以压在最下面。
+ */
+function SETTINGS_GROUPS_CARDS(): readonly SettingsSection[] {
+  const group = (key: string) => SETTINGS_GROUPS.find((item) => item.key === key);
+  const cardsOf = (key: string): SettingsCardSpec[] =>
+    (group(key)?.entries ?? []).map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      verb: entry.verb,
+      path: entry.path,
+      testid: entry.testid ?? `open-${entry.key}`,
+      ...(entry.taxonomyKey ? { taxonomyKey: entry.taxonomyKey } : {}),
+    }));
+
+  const runCards = [
+    ...cardsOf('model'),
+    ...cardsOf('connectors'),
+    ...cardsOf('maintenance'),
+  ];
+
+  return [
+    {
+      key: 'about-her',
+      title: '关于她',
+      note: '决定她怎么过日子、怎么看你发来的东西。改完就生效，不用发布。',
+      cards: [
+        {
+          key: 'timezone',
+          label: '你在哪个时区',
+          verb: '「今天」的边界、免打扰时段、每日限额都按它算。',
+          path: '',
+          testid: 'settings-card-timezone',
+          tile: 'timezone',
+        },
+        {
+          key: 'video',
+          label: '她怎么看视频',
+          verb: '抽帧还是原生输入；只有她主动标记要看时才读。',
+          path: '',
+          testid: 'settings-card-video',
+          tile: 'video',
+        },
+      ],
+    },
+    {
+      key: 'security',
+      title: '安全',
+      note: '谁能看到什么，以及你自己的登录凭据。',
+      cards: cardsOf('security'),
+    },
+    {
+      key: 'runtime',
+      title: '连接与运行',
+      note: '实例能力与运维：模型、从哪条线收发消息、版本与更新。',
+      cards: runCards,
+    },
+  ];
+}
+
+let cache: readonly SettingsSection[] | null = null;
+
+/**
+ * 渲染时用的分组。
+ *
+ * 惰性求值不是洁癖：`SETTINGS_GROUPS` 在本文件**下面**才声明，模块顶层直接
+ * 调 `SETTINGS_GROUPS_CARDS()` 会撞上 TDZ（`Cannot access before
+ * initialization`），整页白板。缓存也只算一次——分组是常量，不随渲染变。
+ */
+export function settingsSections(): readonly SettingsSection[] {
+  if (cache === null) cache = SETTINGS_GROUPS_CARDS();
+  return cache;
+}
+
+/**
+ * 四组 / 五个页面（DESIGN §2 的表，后加「接入与连接」）。
+ *
+ * 这里是**数据的唯一来源**，`settingsSections()` 只重排它、不改写它：
+ * 两份入口表迟早走散，而"设置页少了一个入口"是那种没人报但会让人点不开的错。
  *
  * 条目数比原先少一个：「多用户与账号」已搬成一级导航「关系」（`/relationships`），
  * 设置里不再留入口。留一条就是"迁出"没做干净——旧路径会经由
@@ -216,13 +335,12 @@ export function TimezoneForm({
         : `没有设置过，用默认值 ${effective}。填一次就以你为准。`;
 
   return (
-    <section className="settings-group" data-settings-group="local-time">
-      <div className="settings-group__head">
-        <h2 className="settings-group__title">你的本地时间</h2>
-        <p className="settings-group__note">
-          你在哪个时区。「今天」的边界、免打扰时段、每日主动联系的限额都按它算。
-        </p>
-      </div>
+    <section className="settings-tile settings-tile--timezone" data-settings-group="local-time">
+      {/*
+        这里**不再重复**卡片标题与那句说明：外层卡片的标题就是「你在哪个时区」，
+        说明也已经在卡片上。块内只留"当前生效的是哪个值、从哪来"——
+        一格里写两遍同一件事，正是这一轮要收掉的噪音。
+      */}
 
       <form
         onSubmit={(event) => {
@@ -274,7 +392,7 @@ export function TimezoneForm({
           >
             清空（回退默认）
           </button>
-          <span className="settings-group__note">
+          <span className="settings-tile__note">
             {dirty ? '有未保存的改动' : '保存即生效，不走草稿/发布'}
           </span>
         </div>
@@ -357,7 +475,7 @@ export function TimezoneSection() {
 
   if (loading) {
     return (
-      <div className="settings-group" data-settings-group="local-time">
+      <div className="settings-tile settings-tile--timezone" data-settings-group="local-time">
         <div className="page__loading">
           <span className="spinner" aria-hidden="true" /> 正在读取时区…
         </div>
@@ -367,7 +485,7 @@ export function TimezoneSection() {
 
   if (error || !prefs) {
     return (
-      <section className="settings-group" data-settings-group="local-time">
+      <section className="settings-tile settings-tile--timezone" data-settings-group="local-time">
         <div className="banner banner--error" role="status">
           <AlertIcon />
           <div>
@@ -456,7 +574,7 @@ export function VideoModeSection() {
 
   if (error && !prefs) {
     return (
-      <section className="settings-group" data-settings-group="video-mode">
+      <section className="settings-tile settings-tile--video" data-settings-group="video-mode">
         <div className="banner banner--error" role="status">
           <AlertIcon />
           <div>
@@ -473,21 +591,14 @@ export function VideoModeSection() {
 
   const current = prefs?.video_mode ?? 'frames';
   return (
-    <section className="settings-group" data-settings-group="video-mode">
-      <div className="settings-group__head">
-        <h2 className="settings-group__title">媒体与视频</h2>
-        <p className="settings-group__note">
-          不是每个视频都会去读：只有她在回复里写标记时才去看。不写标记就不读，
-          群里的视频也不会被自动看一遍。
-        </p>
-        <p className="settings-group__note">
-          {/* 标记单独一段：塞进上一句的括号里会在 375 下把行拆成
-              「如」/「&lt;&lt;看视频…&gt;&gt;」两行（一个字的孤行）。 */}
-          标记形如 <code>&lt;&lt;看视频 m…&gt;&gt;</code>。
-        </p>
-      </div>
-      <fieldset className="settings-group__body" disabled={saving}>
-        <legend>她怎么看视频</legend>
+    <section className="settings-tile settings-tile--video" data-settings-group="video-mode">
+      {/*
+        块内**不再重复**卡片标题（「她怎么看视频」就是卡片标题）：原来这里还有
+        一个 `<legend>` 写着同一句话，一格之内说两遍。说明也只留一句——
+        "不写标记就不读"由卡片那句"只有她主动标记要看时才读"承担。
+      */}
+      <fieldset className="settings-tile__body" disabled={saving}>
+        <legend className="settings-tile__legend">交给模型的方式</legend>
         <label>
           <input
             type="radio"
@@ -511,10 +622,79 @@ export function VideoModeSection() {
           原生视频输入：直接把视频交给模型；只有部分供应商支持
           （Gemini / Qwen-VL / 豆包 / 智谱 / Kimi），不支持时会自动退回抽帧并记录原因。
         </label>
-        <p className="settings-group__note">不论哪种方式，都只有她主动想看时才读。</p>
-        {message ? <p className="settings-group__note" role="status">{message}</p> : null}
+        <p className="settings-tile__note">
+          标记形如 <code>&lt;&lt;看视频 m…&gt;&gt;</code>；不写标记就不读。
+        </p>
+        {message ? <p className="settings-tile__note" role="status">{message}</p> : null}
       </fieldset>
     </section>
+  );
+}
+
+/**
+ * 一张设置卡片。
+ *
+ * 三件东西，一个不多：**标题 + 一句话 + （跳转卡片）箭头**。
+ * 原来每张卡是一个符号 + 标题 + 两行长说明，五张卡高度不一、还互相错位；
+ * 现在说明只留一句，长解释留给点进去之后的页面。
+ */
+export function SettingsCard({
+  spec,
+  onOpen,
+  decorate,
+  tile,
+}: {
+  spec: SettingsCardSpec;
+  onOpen: (path: string) => void;
+  decorate: (spec: SettingsCardSpec) => SettingsCardSpec;
+  /** 就地可改的偏好块（时区/视频）：整块嵌进卡片，不再单开一节。 */
+  tile?: React.ReactNode;
+}) {
+  const card = decorate(spec);
+  const isTile = Boolean(spec.tile);
+  const inner = (
+    <>
+      <span className="settings-card__head">
+        <span className="settings-card__label">{card.label}</span>
+        {card.badge ? <span className="settings-card__badge">{card.badge}</span> : null}
+        {isTile ? null : (
+          // 箭头是"这张卡会跳走"的唯一提示；就地可改的块没有它。
+          <span className="settings-card__arrow" aria-hidden="true">
+            →
+          </span>
+        )}
+      </span>
+      <span className="settings-card__verb">{card.verb}</span>
+      {tile ? <span className="settings-card__tile">{tile}</span> : null}
+    </>
+  );
+
+  if (isTile) {
+    // 就地可改的块不能做成 `<button>`：里面还有输入框与提交按钮，
+    // 按钮套按钮既不是合法 HTML，也会让键盘焦点打架。
+    return (
+      <section
+        className="settings-card settings-card--tile"
+        data-testid={card.testid}
+        data-settings-card={card.key}
+        aria-label={card.label}
+      >
+        {inner}
+      </section>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="settings-card"
+      data-testid={card.testid}
+      data-settings-card={card.key}
+      data-taxonomy-key={card.taxonomyKey ?? undefined}
+      onClick={() => onOpen(card.path)}
+    >
+      {inner}
+    </button>
   );
 }
 
@@ -537,35 +717,28 @@ export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
   }, [load]);
 
   /** 有 taxonomy 就用它的 label/verb；没有就用本文件的。 */
-  const decorate = (entry: SettingsEntry): SettingsEntry => {
-    if (!entry.taxonomyKey) return entry;
-    const category = taxonomy?.categories.find((item) => item.key === entry.taxonomyKey);
-    if (!category) return entry;
-    return { ...entry, label: category.label, verb: category.verb };
+  const decorate = (spec: SettingsCardSpec): SettingsCardSpec => {
+    if (!spec.taxonomyKey) return spec;
+    const category = taxonomy?.categories.find((item) => item.key === spec.taxonomyKey);
+    if (!category) return spec;
+    return { ...spec, label: category.label, verb: category.verb };
   };
 
+  const sections = settingsSections();
+
   return (
-    <section className="page">
+    <section className="page settings-page">
       <button type="button" className="back-link settings-hub__back" onClick={onBack}>
         <ArrowLeftIcon /> 返回聊天
       </button>
 
-      <h1 className="page__title">设置</h1>
-      <p className="page__hint">
-        这里只有程序与运维：凭据、密钥、版本。改她的行为（记什么、说不说话、
-        怎么过日子）跟着各自的页面走，不在这里。例外是最上面那条
-        「你的本地时间」——那是<strong>你</strong>在哪，不是她的行为。
-      </p>
-
-      {/* 用户自己的时区：不进草稿/发布，保存即生效（详见文件头注释）。
-          `ms-timezone` 只用于窄屏触控尺寸规则（model-settings.css 那份），
-          这里不引入模型页的任何颜色/排版变量。 */}
-      <div className="ms-timezone">
-        <TimezoneSection />
-      </div>
-
-      {/* 媒体与视频：同样是用户偏好，保存即生效。 */}
-      <VideoModeSection />
+      <header className="settings-page__head">
+        <h1 className="page__title">设置</h1>
+        <p className="page__hint">
+          这里分三组：<strong>你</strong>的时区与偏好、你的权限与凭据、以及实例的模型与版本。
+          改她的行为（记什么、说不说话、怎么过日子）跟着各自的页面走，不在这里。
+        </p>
+      </header>
 
       {error ? (
         <div className="banner banner--error" role="status">
@@ -583,33 +756,38 @@ export function SettingsHub({ onBack, onOpen }: SettingsHubProps) {
         </div>
       ) : null}
 
-      <div className="settings-groups">
-        {SETTINGS_GROUPS.map((group) => (
-          <section key={group.key} className="settings-group" data-settings-group={group.key}>
+      <div className="settings-sections">
+        {sections.map((section) => (
+          <section key={section.key} className="settings-group" data-settings-group={section.key}>
             <div className="settings-group__head">
-              <h2 className="settings-group__title">{group.title}</h2>
-              <p className="settings-group__note">{group.note}</p>
+              <h2 className="settings-group__title">{section.title}</h2>
+              <p className="settings-group__note">{section.note}</p>
             </div>
-            <div className="settings-hub">
-              {group.entries.map((raw) => {
-                const entry = decorate(raw);
-                return (
-                  <button
-                    key={entry.key}
-                    type="button"
-                    className="settings-hub__card"
-                    data-taxonomy-key={entry.taxonomyKey ?? undefined}
-                    data-testid={entry.testid}
-                    onClick={() => onOpen(entry.path)}
-                  >
-                    <span className="settings-hub__index">{entry.key === 'about' ? 'i' : '≡'}</span>
-                    <span className="settings-hub__body">
-                      <span className="settings-hub__label">{entry.label}</span>
-                      <span className="settings-hub__verb">{entry.verb}</span>
-                    </span>
-                  </button>
-                );
-              })}
+            {/*
+              等宽 2 列网格：卡片高度由 `min-height` 对齐、内容顶对齐，
+              一张卡文案长一点不会把它那一行整体撑高（原来单列时没有这个问题，
+              但一改成多列就会出现"参差"）。≤760px 单列，见 settings.css。
+            */}
+            <div className="settings-grid">
+              {section.cards.map((spec) => (
+                <SettingsCard
+                  key={spec.key}
+                  spec={spec}
+                  onOpen={onOpen}
+                  decorate={decorate}
+                  tile={
+                    spec.tile === 'timezone' ? (
+                      // `ms-timezone` 只用于窄屏触控尺寸（model-settings.css），
+                      // 不引入模型页的颜色/排版变量。
+                      <span className="ms-timezone">
+                        <TimezoneSection />
+                      </span>
+                    ) : spec.tile === 'video' ? (
+                      <VideoModeSection />
+                    ) : undefined
+                  }
+                />
+              ))}
             </div>
           </section>
         ))}

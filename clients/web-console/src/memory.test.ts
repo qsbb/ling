@@ -15,7 +15,7 @@
  */
 import { createElement as h, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AWARENESS_TERM,
   DEFAULT_FILTERS,
@@ -27,8 +27,14 @@ import {
   MemoryListSection,
   MemoryPage,
   MemorySettingsTab,
+  PURGE_POLL_INTERVAL_MS,
+  PURGE_POLL_MAX_ATTEMPTS,
+  canRetryForget,
   canSubmitForget,
   confidenceLabel,
+  decidePurgePoll,
+  describePurgeCounts,
+  forgetButtonLabel,
   coreOriginLabel,
   filterMemories,
   forgetReducer,
@@ -37,16 +43,22 @@ import {
   groupByKind,
   includeMode,
   includeSummary,
+  isForgetAccepted,
+  isForgetPolling,
   kindLabel,
   limitNotice,
+  pollForgetProgress,
+  purgeCountsOf,
   memoryErrorCopy,
   memoryFooterNote,
   memoryTabFromHref,
   memoryTabHref,
   originLabel,
   sortByCreatedDesc,
+  type ForgetAcceptedResponse,
   type ForgetState,
   type MemoryHandlers,
+  type PurgeStatusItem,
   type SectionState,
   type TombstoneFlags,
 } from './components/MemoryPage';
@@ -114,12 +126,66 @@ function ok<T>(data: T): SectionState<T> {
   return { status: 'ok', data, error: null };
 }
 
+const ACCEPTED: ForgetAcceptedResponse = {
+  tombstone_id: 'purge_1',
+  generation: 2,
+  events_cancelled: 3,
+  state: 'pending',
+};
+
+function purgeItem(patch: Partial<PurgeStatusItem> = {}): PurgeStatusItem {
+  return {
+    tombstone_id: 'purge_1',
+    state: 'pending',
+    requested_at: '2026-11-09T05:00:00+00:00',
+    completed_at: null,
+    memories_deleted: 0,
+    episodes_deleted: 0,
+    core_deleted: 0,
+    awareness_deleted: 0,
+    embeddings_deleted: 0,
+    entities_deleted: 0,
+    retrieval_logs_deleted: 0,
+    events_cancelled: 3,
+    events_scrubbed: 0,
+    error_code: null,
+    ...patch,
+  };
+}
+
+const DONE_ITEM = purgeItem({
+  state: 'done',
+  completed_at: '2026-11-09T05:00:07+00:00',
+  memories_deleted: 43,
+  episodes_deleted: 7,
+  core_deleted: 2,
+  awareness_deleted: 1,
+  embeddings_deleted: 43,
+  entities_deleted: 12,
+  retrieval_logs_deleted: 5,
+});
+
+const FAILED_ITEM = purgeItem({ state: 'failed', error_code: 'OperationalError' });
+
+/** 把状态机推进到指定步骤，避免每个用例重写一长串 reducer 调用。 */
+function toStep(target: 'purging' | 'done' | 'failed' | 'timeout'): ForgetState {
+  let state = forgetReducer(INITIAL_FORGET, { type: 'begin' });
+  state = forgetReducer(state, { type: 'ack', value: true });
+  state = forgetReducer(state, { type: 'submit' });
+  state = forgetReducer(state, { type: 'accepted', accepted: ACCEPTED });
+  if (target === 'purging') return state;
+  if (target === 'done') return forgetReducer(state, { type: 'poll', decision: 'done', item: DONE_ITEM });
+  if (target === 'failed') return forgetReducer(state, { type: 'poll', decision: 'failed', item: FAILED_ITEM });
+  return forgetReducer(state, { type: 'timeout' });
+}
+
 const HANDLERS: MemoryHandlers = {
   retract: async () => undefined,
   supersede: async () => undefined,
   saveCore: async () => undefined,
   deleteCore: async () => undefined,
-  forget: async () => 0,
+  forget: async () => ACCEPTED,
+  purgeStatus: async () => ({ items: [] }),
   reloadCore: () => undefined,
   reloadList: () => undefined,
 };
@@ -1021,9 +1087,10 @@ describe('危险操作：遗忘全部的二次确认流', () => {
     expect(html).toContain('危险操作');
     expect(html).toContain('无法撤销');
     expect(html).toContain('遗忘全部记忆…');
-    // 首屏影响面也要按实际写（三类 MemoryRow 都会被撤回）
-    expect(html).toContain('所有记忆行');
+    // 首屏明说是真删，且四类记忆 + 派生数据都点到
+    expect(html).toContain('从数据库里真正删除');
     expect(html).not.toContain('长期记忆标记为已撤回');
+    // 首屏只能有一个入口，不能直接露出确认按钮
     expect(html).not.toContain('确认遗忘全部');
   });
 
@@ -1035,12 +1102,12 @@ describe('危险操作：遗忘全部的二次确认流', () => {
 
     const html = renderDanger(stepOne);
     expect(html).toContain('二次确认：遗忘全部记忆');
-    expect(html).toContain('我明白这会清空当前账号可见的记忆');
-    // 影响面按实际后端（forget_subject）写：所有 kind 的 MemoryRow 都撤回，
-    // 不是只有「长期记忆（断言）」。
+    expect(html).toContain('从数据库里永久删除当前账号的记忆');
+    // 影响面按真删写：所有 kind 的 MemoryRow 都删除，不是只有「长期记忆（断言）」。
     expect(html).toContain('记忆行（情节 / 断言 / 程序三类都有');
     expect(html).toContain('情节片段');
-    expect(html).toContain('用户请求清除');
+    expect(html).not.toContain('用户请求清除');
+    expect(html).not.toContain('标记已撤回');
     expect(html).not.toContain('长期记忆（断言）');
     expect(html).toMatch(/<button[^>]*disabled[^>]*>确认遗忘全部<\/button>/);
 
@@ -1050,27 +1117,39 @@ describe('危险操作：遗忘全部的二次确认流', () => {
     expect(acked.step).toBe('confirm');
   });
 
-  it('提交只进入 pending；行数一律以服务端返回为准', () => {
+  it('受理只进入「正在清理」，计数只从 purge/status 拿', () => {
     const acked = forgetReducer(forgetReducer(INITIAL_FORGET, { type: 'begin' }), {
       type: 'ack',
       value: true,
     });
     const pending = forgetReducer(acked, { type: 'submit' });
     expect(pending.pending).toBe(true);
-    expect(pending.count).toBeNull();
-    // pending 中重复提交不产生副作用
+    expect(pending.counts).toBeNull();
+    // 请求阶段进行中重复提交不产生副作用
     expect(forgetReducer(pending, { type: 'submit' })).toEqual(pending);
 
-    const done = forgetReducer(pending, { type: 'succeeded', count: 7 });
+    // 受理 ≠ 完成
+    const accepted = forgetReducer(pending, { type: 'accepted', accepted: ACCEPTED });
+    expect(accepted.step).toBe('purging');
+    expect(isForgetPolling(accepted)).toBe(true);
+    expect(accepted.counts).toBeNull();
+    expect(accepted.eventsCancelled).toBe(3);
+    expect(accepted.tombstoneId).toBe('purge_1');
+
+    const purgingHtml = renderDanger(accepted);
+    expect(purgingHtml).toContain('data-testid="mem-forget-purging"');
+    expect(purgingHtml).toContain('已提交删除，正在后台清理');
+    expect(purgingHtml).not.toContain('data-testid="mem-forget-count-line"');
+
+    // 轮询到 done 才有真实计数
+    const done = forgetReducer(accepted, { type: 'poll', decision: 'done', item: DONE_ITEM });
     expect(done.step).toBe('done');
-    expect(done.count).toBe(7);
     const html = renderDanger(done);
-    expect(html).toContain('data-testid="mem-forget-count"');
-    expect(html).toContain('7');
-    expect(html).toContain('四类受影响行数之和');
-    expect(html).toContain('记忆行（情节 / 断言 / 程序三类 kind）');
-    expect(html).toContain('软清除');
+    expect(html).toContain('data-testid="mem-forget-result"');
+    expect(html).toContain('已删除 43 条记忆');
+    expect(html).toContain('7 条情节');
     expect(html).toContain('无法撤销');
+    expect(html).not.toContain('软清除');
   });
 
   it('取消回到初始态；失败保留二次确认并显示原因', () => {
@@ -1110,13 +1189,19 @@ describe('术语统一：意识条目', () => {
   const renders: Array<[string, string]> = [
     ['首屏', renderDanger(INITIAL_FORGET)],
     ['二次确认', renderDanger(stepConfirm)],
-    ['结果态', renderDanger(forgetReducer(stepConfirm, { type: 'succeeded', count: 3 }))],
+    ['清理中', renderDanger(forgetReducer(forgetReducer(forgetReducer(stepConfirm, { type: 'ack', value: true }), { type: 'submit' }), { type: 'accepted', accepted: ACCEPTED }))],
+    ['结果态', renderDanger(forgetReducer(forgetReducer(forgetReducer(forgetReducer(stepConfirm, { type: 'ack', value: true }), { type: 'submit' }), { type: 'accepted', accepted: ACCEPTED }), { type: 'poll', decision: 'done', item: DONE_ITEM }))],
     ['整页', renderToStaticMarkup(h(MemoryPage, {}))],
   ];
 
   it('只说「意识条目」，不混「觉察记录」/「awareness」', () => {
     expect(AWARENESS_TERM).toBe('意识条目');
     for (const [where, markup] of renders) {
+      if (where === '清理中') {
+        // 清理中/失败态不提各表的明细（只讲状态与计数），所以只禁止旧词。
+        expect(markup, where).not.toContain('觉察');
+        continue;
+      }
       expect(markup, where).toContain(AWARENESS_TERM);
       expect(markup, where).not.toContain('觉察');
       expect(markup, where).not.toContain('awareness');
@@ -1248,5 +1333,263 @@ describe('展示工具', () => {
 
   it('withNode 帮助函数防止空渲染的假绿', () => {
     expect(withNode('x')).toContain('x');
+  });
+});
+
+/* ------------------------------------------------------------- 真删文案 */
+
+describe('危险区文案：如实写「真删」，不出现软清除的说法', () => {
+  const states: Array<[string, ForgetState]> = [
+    ['首屏', INITIAL_FORGET],
+    ['二次确认', forgetReducer(INITIAL_FORGET, { type: 'begin' })],
+    ['清理中', toStep('purging')],
+    ['完成', toStep('done')],
+    ['失败', toStep('failed')],
+    ['超时', toStep('timeout')],
+    ['整页', INITIAL_FORGET],
+  ];
+
+  it('任何状态下都不出现「不会删除数据库里的行」「软清除」', () => {
+    for (const [where, state] of states) {
+      const markup =
+        where === '整页' ? renderToStaticMarkup(h(MemoryPage, {})) : renderDanger(state);
+      expect(markup, where).not.toContain('不会删除数据库里的行');
+      expect(markup, where).not.toContain('软清除');
+      expect(markup, where).not.toContain('标记为已撤回');
+    }
+  });
+
+  it('首屏写明真删哪些数据、后台完成、只留一条不含内容的删除记录', () => {
+    const html = renderDanger(INITIAL_FORGET);
+    expect(html).toContain('从数据库里真正删除');
+    for (const term of ['记忆', '情节', '核心记忆', '向量', '实体关联', '检索记录']) {
+      expect(html, term).toContain(term);
+    }
+    expect(html).toContain(AWARENESS_TERM);
+    // 删除在后台完成，可能几秒到几分钟
+    expect(html).toContain('删除在后台完成');
+    expect(html).toContain('几秒到几分钟');
+    // 只留下一条不含内容的删除记录，用途是防备份恢复后复活
+    expect(html).toContain('不含任何内容');
+    expect(html).toContain('防止备份恢复后内容复活');
+  });
+
+  it('二次确认条目写「删除」，不写「标记已撤回」', () => {
+    const html = renderDanger(forgetReducer(INITIAL_FORGET, { type: 'begin' }));
+    expect(html).toContain('data-testid="mem-danger-confirm-list"');
+    expect(html).toContain('从库里删除');
+    expect((html.match(/从库里删除/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    expect(html).not.toContain('标记已撤回');
+    // 旧版的软删除清单项不能再出现
+    expect(html).not.toContain('→ 归档，退出检索');
+    expect(html).not.toContain('→ 失效');
+    expect(html).not.toContain('→ 停用（不再每轮注入）');
+  });
+});
+
+/* ------------------------------------------------------------- 删除进度 */
+
+describe('删除进度：轮询 purge/status，有上限、可卸载', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('轮询上限是有限的正整数（不无限轮询）', () => {
+    expect(PURGE_POLL_MAX_ATTEMPTS).toBeGreaterThan(0);
+    expect(PURGE_POLL_MAX_ATTEMPTS).toBeLessThanOrEqual(60);
+    expect(PURGE_POLL_INTERVAL_MS).toBeGreaterThan(0);
+  });
+
+  it('decidePurgePoll 按墓碑匹配，认不出的状态按「还在进行」', () => {
+    expect(decidePurgePoll({ items: [purgeItem()] }, 'purge_1').decision).toBe('continue');
+    expect(decidePurgePoll({ items: [DONE_ITEM] }, 'purge_1').decision).toBe('done');
+    expect(decidePurgePoll({ items: [FAILED_ITEM] }, 'purge_1').decision).toBe('failed');
+    // 别的墓碑不算
+    expect(decidePurgePoll({ items: [DONE_ITEM] }, 'purge_other').decision).toBe('gone');
+    expect(decidePurgePoll({ items: [] }, 'purge_1').decision).toBe('gone');
+    expect(decidePurgePoll({ items: [purgeItem({ state: 'future_state' })] }, 'purge_1').decision).toBe(
+      'continue',
+    );
+  });
+
+  it('pollForgetProgress 在 done 时停下；连续 running 时只查这么多次', async () => {
+    vi.useFakeTimers();
+    const handler = vi.fn(async () => ({ items: [purgeItem({ state: 'running' })] }));
+    const updates: string[] = [];
+    const promise = pollForgetProgress({
+      tombstoneId: 'purge_1',
+      handler,
+      intervalMs: 100,
+      attempts: 4,
+      isCancelled: () => false,
+      onUpdate: (result) => updates.push(result.decision),
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await promise;
+    expect(handler).toHaveBeenCalledTimes(4);
+    expect(updates.at(-1)).toBe('gone');
+    // 之后不再有调用（不是无限轮询）
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(handler).toHaveBeenCalledTimes(4);
+  });
+
+  it('完成态显示真实计数，失败态给出可重试按钮', () => {
+    const done = renderDanger(toStep('done'));
+    expect(done).toContain('已删除 43 条记忆');
+    expect(done).toContain('7 条情节');
+    expect(done).not.toContain('清理失败');
+
+    const failed = renderDanger(toStep('failed'));
+    expect(failed).toContain('data-testid="mem-forget-failed"');
+    expect(failed).toContain('data-testid="mem-forget-error-code"');
+    expect(failed).toContain('OperationalError');
+    expect(failed).toContain('重试删除');
+    expect(canRetryForget(toStep('failed'))).toBe(true);
+    // 只读的被删内容：失败提示里没有计数
+    expect(failed).not.toContain('已删除');
+  });
+
+  it('失败后重试会重新走两段式（新墓碑），而不是直接说完成', () => {
+    const failed = toStep('failed');
+    const retried = forgetReducer(failed, { type: 'retry' });
+    expect(retried.step).toBe('confirm');
+    expect(retried.pending).toBe(true);
+    expect(retried.tombstoneId).toBeNull();
+    const acceptedAgain = forgetReducer(retried, {
+      type: 'accepted',
+      accepted: { ...ACCEPTED, tombstone_id: 'purge_2' },
+    });
+    expect(acceptedAgain.step).toBe('purging');
+    expect(acceptedAgain.tombstoneId).toBe('purge_2');
+  });
+
+  it('超时说明「仍在进行」：既不说失败，也不说完成', () => {
+    const html = renderDanger(toStep('timeout'));
+    expect(html).toContain('data-testid="mem-forget-pending"');
+    expect(html).toContain('清理仍在进行，稍后刷新查看');
+    expect(html).toContain(`${PURGE_POLL_MAX_ATTEMPTS}`);
+    expect(html).not.toContain('已删除');
+    expect(html).not.toContain('清理失败');
+  });
+
+  it('旧后端（只回 retracted）如实说「只做了软清除」，不假装已真删', () => {
+    const state = forgetReducer(
+      forgetReducer(
+        forgetReducer(forgetReducer(INITIAL_FORGET, { type: 'begin' }), { type: 'ack', value: true }),
+        { type: 'submit' },
+      ),
+      { type: 'legacy', retracted: 5 },
+    );
+    expect(state.step).toBe('unsupported');
+    const html = renderDanger(state);
+    expect(html).toContain('data-testid="mem-forget-unsupported"');
+    expect(html).toContain('这次只做了软清除');
+    expect(html).toContain('原文还留在库里');
+    expect(isForgetAccepted({ retracted: 5 })).toBe(false);
+    expect(isForgetAccepted(ACCEPTED)).toBe(true);
+  });
+
+  it('计数文案只列真实非零项；全零时不说「删成功了」', () => {
+    expect(describePurgeCounts(purgeCountsOf(DONE_ITEM))).toBe(
+      '已删除 43 条记忆、7 条情节、2 条核心记忆、1 条意识条目、43 条向量、12 条实体关联、5 条检索记录。',
+    );
+    const zero = describePurgeCounts(purgeCountsOf(null));
+    expect(zero).toContain('没有删到任何行');
+    expect(zero).not.toContain('已删除');
+  });
+
+  it('提交阶段按钮文案是「正在提交…」（不让人以为又要点一次）', () => {
+    const submitting = forgetReducer(
+      forgetReducer(
+        forgetReducer(INITIAL_FORGET, { type: 'begin' }),
+        { type: 'ack', value: true },
+      ),
+      { type: 'submit' },
+    );
+    expect(forgetButtonLabel(submitting)).toBe('正在提交…');
+    expect(forgetButtonLabel(INITIAL_FORGET)).toBe('确认遗忘全部');
+  });
+
+  it('卸载后不再继续轮询（fake timers 断言调用次数不再增长）', async () => {
+    vi.useFakeTimers();
+    const handler = vi.fn(async () => ({ items: [purgeItem({ state: 'running' })] }));
+    let cancelled = false;
+    const updates: string[] = [];
+    const promise = pollForgetProgress({
+      tombstoneId: 'purge_1',
+      handler,
+      intervalMs: 100,
+      attempts: PURGE_POLL_MAX_ATTEMPTS,
+      isCancelled: () => cancelled,
+      onUpdate: (result) => updates.push(result.decision),
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    const before = handler.mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+
+    // 模拟卸载：容器 effect 的 cleanup 会把 cancelled 置真并清掉定时器
+    cancelled = true;
+    await vi.advanceTimersByTimeAsync(100 * PURGE_POLL_MAX_ATTEMPTS * 3);
+    await promise;
+    expect(handler.mock.calls.length).toBe(before);
+    // 取消之后一次回调都不许发生（卸载后 setState 就是 act 警告的来源）
+    expect(updates.length).toBe(before);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  /**
+   * 组件级验证：仓库没有 jsdom（见 `dashboard.test.ts` 的取舍），所以这里
+   * 只有在真有 DOM 时才挂载；没有就直接跳过并说明原因，不假装测过。
+   */
+  const hasDom = typeof document !== 'undefined';
+  it.skipIf(!hasDom)('组件卸载后，容器的轮询 effect 被清掉', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    const React = await import('react');
+    const { createRoot } = await import('react-dom/client');
+    const actual = await vi.importActual<typeof import('./api')>('./api');
+    const purgeStatus = vi.fn(async () => ({ items: [purgeItem({ state: 'running' })] }));
+    vi.doMock('./api', () => ({
+      ...actual,
+      api: {
+        ...actual.api,
+        forgetAllMemories: async () => ACCEPTED,
+        purgeStatus,
+        listMemories: async () => listResponse([]),
+        listCoreMemory: async () => coreResponse([]),
+      },
+    }));
+    try {
+      const { MemoryContent } = await import('./components/MemoryPage');
+      const container = document.createElement('div');
+      const root = createRoot(container);
+      await React.act(async () => {
+        root.render(React.createElement(MemoryContent));
+      });
+      await React.act(async () => {
+        container.querySelector<HTMLButtonElement>('[data-testid="mem-danger"] button.mem-danger__start')?.click();
+      });
+      await React.act(async () => {
+        container.querySelector<HTMLInputElement>('[data-testid="mem-danger"] input[type="checkbox"]')?.click();
+      });
+      await React.act(async () => {
+        container.querySelector<HTMLButtonElement>('[data-testid="mem-danger"] .mem-danger__confirm-button')?.click();
+      });
+      await React.act(async () => {
+        await vi.advanceTimersByTimeAsync(PURGE_POLL_INTERVAL_MS * 3);
+      });
+      const before = purgeStatus.mock.calls.length;
+      await React.act(async () => {
+        root.unmount();
+      });
+      await vi.advanceTimersByTimeAsync(PURGE_POLL_INTERVAL_MS * PURGE_POLL_MAX_ATTEMPTS * 2);
+      expect(purgeStatus.mock.calls.length).toBe(before);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.doUnmock('./api');
+      vi.resetModules();
+      vi.useRealTimers();
+    }
   });
 });
