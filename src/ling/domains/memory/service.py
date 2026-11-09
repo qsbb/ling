@@ -552,6 +552,15 @@ class MemoryService:
 
         subjects = await IdentityService(self._session).subject_group(subject_id)
 
+        # **读侧硬门**：请求已接受但物理删除还没跑完的这段时间里，行还在库里。
+        # 不加这道门，用户刚点完"删除"，下一轮对话她就会把那些事再说一遍——
+        # 代次栅栏只拦写，拦不住读。判据是"有未完成的墓碑"，不是"行还在不在"。
+        from ling.domains.memory.purge import open_purge_subjects
+
+        if await open_purge_subjects(self._session, subject_ids=list(subjects)):
+            result.strategy = "purge_pending"
+            return result
+
         # **必须有上界**。原实现按 subject 全量取回再在 Python 里算相关度：
         # 记忆只有 3 条时看不出问题，涨到几千条就是每轮对话扫全表 + 全量 BM25。
         # 这里按最近更新取一个候选池——真正的排序仍在下面做，
@@ -1519,6 +1528,13 @@ class MemoryService:
         # limit 截断会漏行/重复。memory_id 只是**稳定排序键，不表示新旧**
         # （new_id 是随机 token_hex，id 的大小与创建时间无关）；它保证排序
         # 确定且可复现。
+        #
+        # 清理进行中一律返回空：请求已接受但物理删除还没跑完时，行还在库里。
+        # 这时照常列出，用户刚点完"删除"刷新还看得见——那正是"没生效"的样子。
+        from ling.domains.memory.purge import has_open_purge
+
+        if await has_open_purge(self._session, subject_id=subject_id):
+            return []
         return list(
             (
                 await self._session.execute(
@@ -1531,7 +1547,15 @@ class MemoryService:
         )
 
     async def count_memories(self, subject_id: str, *, include: str = "all") -> int:
-        """与 ``list_memories`` 同一过滤口径的总数（供 total/has_more）。"""
+        """与 ``list_memories`` 同一过滤口径的总数（供 total/has_more）。
+
+        清理进行中返回 0，必须与 ``list_memories`` 一致：列表空而 `total` 非零，
+        前端会显示"还有 N 条，往后翻"——而它们马上就要被删掉。
+        """
+        from ling.domains.memory.purge import has_open_purge
+
+        if await has_open_purge(self._session, subject_id=subject_id):
+            return 0
         total = await self._session.execute(
             select(func.count())
             .select_from(MemoryRow)

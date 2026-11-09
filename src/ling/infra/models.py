@@ -102,6 +102,18 @@ class Subject(Base, TimestampMixin):
     # 跨窗事实（Awareness）对非 owner 一律不注入。
     trust_level: Mapped[str] = mapped_column(String(32), default="known")
     merged_into: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 遗忘代次：每接受一次"删除这个人的记忆"请求就 +1。
+    #
+    # 为什么需要它：删除请求会与"已认领、正在跑"的记忆提取任务竞态。只把
+    # outbox 事件置为 cancelled 抓不住在途任务（它们已经不在 pending 里）。
+    # 入队时记下代次、写库前比对代次，旧任务才会**静默作废**。
+    #
+    # 默认 0 = 从未遗忘过。放 `subjects` 而不是单开一张表：代次与主体一一
+    # 对应，查询点又全在写入热路径上（每条记忆写入前都要读一次），放这里能
+    # 跟已有的 subject 查询合并，不必多一次 JOIN。
+    forget_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
 
 
 class ActorAccount(Base, TimestampMixin):
@@ -182,6 +194,18 @@ class Window(Base, TimestampMixin):
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 置顶时刻（迁移 0059）。``NULL`` = 没置顶。
+    #
+    # 为什么存"时刻"而不是 ``pinned: bool``：多个置顶之间也有先后——先置顶的
+    # 应该更靠上。只存布尔值，三个置顶会话之间就只能退化成按 ``updated_at``
+    # 排，于是"我刚置顶的那个"会因为它刚好也很活跃而排到第二，用户会觉得
+    # 置顶没生效。时刻把"是否置顶"和"置顶先后"两件事一起表达了。
+    #
+    # 为什么不复用 ``updated_at``：那是"这条会话有没有新消息"的时间轴。改它
+    # 会让"最近活跃"失真（置顶一下，会话就跳到最近活跃第一条）。
+    pinned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -679,6 +703,70 @@ class OutboxEvent(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 哪个实例/进程处理的（多副本时诊断"谁做了这件事"）
     processed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 这条事件属于哪个主体（可空：与主体无关的维护任务没有主体）。
+    #
+    # 为什么冗余到列上而不是从 payload 里取：取消时要按主体过滤，而 payload
+    # 是 JSON，各 topic 的键名不同（`memory.extract` 用 `subject_id`，其它
+    # topic 未必有）。在 JSON 上过滤既慢又不可靠。
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 入队时该主体的遗忘代次。消费者写库前比对：代次不一致 = 期间发生过
+    # 遗忘请求，这次写入必须**静默作废**（不是报错——那是预期行为）。
+    #
+    # 只把 outbox 置成 cancelled 抓不住"已认领、正在跑"的任务：它们已经
+    # 不在 pending 里了。代次是唯一能堵住"边删边写"的办法。
+    forget_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+
+
+class MemoryPurgeTombstone(Base):
+    """一次记忆真删请求的墓碑。**不含任何正文**。
+
+    用户要求「真删：原文和派生数据都从库里清掉」。清完之后必须留下痕迹，
+    否则两件事做不到：
+
+    1. **备份恢复后的防复活**：从旧备份恢复会把已删内容带回来。
+       墓碑记录"这个主体在 T 时刻删过到第 N 代"，恢复后重放墓碑即可再删一次。
+    2. **异步删除的进度**：删除要处理多张表与在途任务，不可能在一个请求里
+       做完。前端要能答"删到哪一步了、删掉了多少"，而不是只说"已提交"。
+
+    只存数字计数，不存被删的文本、不存来源 id：墓碑本身不能变成新的泄漏点。
+    """
+
+    __tablename__ = "memory_purge_tombstones"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 发起人（后台管理页的操作者）。审计用，可空：系统触发的清理没有操作者。
+    requested_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 请求时的代次。完成后与 `subjects.forget_generation` 相等；
+    # 不等说明期间又有新请求，本行是"旧代次"的收尾记录。
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    # pending → running → done | failed
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    memories_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    episodes_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    core_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    awareness_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    events_cancelled: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    embeddings_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    entities_deleted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 检索日志的删除数**必须单独记**：`memory_retrieval_logs.query` 存的是用户
+    # 原话，是整条链上最容易漏、也最需要"能证明删过"的一张表。混进别的计数里，
+    # 就答不出"那句原话到底清了没有"。
+    retrieval_logs_deleted: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    # 历史事件 payload 的脱敏数（done/dead/cancelled 里残留的原文）。
+    events_scrubbed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 失败原因码（不存异常正文：异常里常常带着被删数据的片段）
+    error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
 
 
 class ActorState(Base):

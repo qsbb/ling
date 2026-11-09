@@ -108,7 +108,15 @@ class CoreMemoryService:
 
         ``limit`` 供 API 端点传 ``MAX_PER_SUBJECT``，让响应回显的硬上限与
         实际查询一致；不传时保持旧行为（内部容量检查/渲染需要看全量）。
+
+        清理进行中返回空：核心记忆是**每轮常驻**的注入块，比检索更容易泄漏。
+        用户在后台点了"删除"之后，下一轮回复里还会照常出现"她怕黑"——
+        那比检索命中更难解释。
         """
+        from ling.domains.memory.purge import has_open_purge
+
+        if await has_open_purge(self._session, subject_id=subject_id):
+            return []
         stmt = (
             select(CoreMemoryRow)
             .where(

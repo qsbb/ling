@@ -251,12 +251,53 @@ message_id, note}`），网页可以在回复到达的同一条事件里直接�
 
 `cancel_requested_at` 非空**不等于**已取消。
 
-### 3B.6 本轮未实现（第 3、4 步另派）
+### 3B.6 执行与恢复（第 3 步已落地）
 
-不注册 worker、不调模型、不检查额度、不写描述。所以 outbox 事件会一直停在
-`pending`——这是**刻意**的：提前接上执行却没有租约/预算/恢复，等于开了一条
-静默烧钱的路径。`budget_denied` / `expired` 等状态目前只由迁移与状态机定义，
-还没有代码会写入它们。
+作业由**专用媒体 worker**执行（topic `media.video.read`，并发固定 1）。普通
+worker 用 `exclude_topics` 把它排除——现有 outbox 是串行 `await`，一条慢视频
+会把撤回/摘要/日程全堵在后面。
+
+**状态会真的推进了**：`pending → running → succeeded/failed/timeout/unknown/
+cancelled/expired`。所以前端可以放心轮询 GET。
+
+#### 崩溃后各自收敛到哪
+
+| 死在哪 | 库里的样子 | 谁收 | 结果 |
+| --- | --- | --- | --- |
+| 入队后、认领前 | `pending`，事件租约到期 | outbox 租约回收 | 重新排队 |
+| 认领后、模型前 | `running`，`model_started_at` 为空，租约过期 | 清理任务 | **退回 `pending` 重跑**（还没花钱） |
+| 模型开始后 | `running`，`model_started_at` 非空，租约过期 | 清理任务 | `unknown`，**不自动再烧一次** |
+| 结果提交后 | 终态 + `result_ref` | 事件重放 | 只读已有结果，**零模型调用** |
+
+第三行与第二行的唯一判据是 `model_started_at`——它在调模型**之前**单独提交。
+把它和结果放同一个事务，崩溃时一起回滚，"模型可能收过费"就查不到，重排后
+第二次收费。
+
+#### 重试语义（裁决 §3.3 的硬结论）
+
+`outbox` 只对**异常**退避重排，`ToolRegistry` 的 `failed`/`timeout` 返回值
+不会触发重试。所以：
+
+- **业务终态由 handler 自己落库**；`failed`/`timeout` 正常确认 outbox `done`；
+- **只有"模型调用前的取件类故障"抛异常**（下载抖动、路由未就绪）——那时还没
+  花钱，重排安全。最多 5 次，退避上限 300 秒，到 dead 时业务作业同步终结为
+  `failed`（`error_code=outbox_dead`），不留悬空行。
+
+#### 取消
+
+执行前与提交结果前各重检一次 `cancel_requested_at`。若取消发生在模型之后，
+**晚到的内容不会成为可消费证据**（描述被 `mark_describe_failed` 逐出可读集合）。
+
+#### 清理（零模型）
+
+`media.read.cleanup` 每 60 秒跑一次，只读作业表、不调模型：排队超时→`expired`，
+租约过期按上表分岔。`deadline` 可空，用 `requested_at + 15 分钟` 兜底。
+
+### 3B.7 尚未实现（第 4 步）
+
+**预算**：不检查、不预留 `behavior_model_calls`，也不记录 `actual_tokens`。
+所以 `budget_denied` 目前只有定义、没有写入方；媒体并发固定为 1 就是在没有
+持久账本时唯一可靠的额度上限。读侧再开放（哪条结果能进上下文）也在第 4 步。
 
 ## 4. 模型设置
 
@@ -774,10 +815,117 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 | POST | `/v1/memory` | `{memory_id}` | `source_event_ids` 为空 / `kind` 非 `episode\|assertion\|procedure` / `origin=model_inference` / 非法 `origin` 或 `visibility` → `422 invalid_request`（**不再 500**，且为统一 `ErrorResponse`） |
 | POST | `/v1/memory/{memory_id}/retract` | `{memory_id, retracted:true}` | 不存在或非本人 `404`；`reason` 缺失/空串/超过 500 字符 → `422 invalid_request`（统一形状）；重复撤回幂等返回 `200` |
 | POST | `/v1/memory/{memory_id}/supersede` | `{memory_id: 新id, supersedes: 旧id}` | 不存在或非本人 `404`；旧行被置 `retracted=true` 且 `superseded_by=新id`，新行 `supersedes=旧id` |
-| POST | `/v1/memory/forget` | `{retracted: 影响行数}` | 无 body；只清当前 subject；返回的是 MemoryRow + Episode + CoreMemory + Awareness 四类受影响行数之和（**四类都清**，不是只清 MemoryRow） |
+| POST | `/v1/memory/forget` | `{tombstone_id, generation, events_cancelled, state}` | 无 body；只清当前 subject；主体不存在 `404`。**这是真删的请求阶段**（见 10.2.1） |
 
-`forget` 仍是软清除（撤回/归档/停用/失效），不物理删除；清除后默认
-`GET /v1/memory` 为空，`?include=all` 仍能看到墓碑。
+#### 10.2.1 `POST /v1/memory/forget`：真删（两段式）
+
+2026-11 起 `forget` 不再软清除。原软清除（撤回/归档/停用/失效、原文仍在
+`memories.text` 里、`?include=all` 还能读回来）与用户原话「真删：原文和派生
+数据都从库里清掉」直接冲突，已按后者改写。
+
+响应字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `tombstone_id` | 本次清理的墓碑 id（`purge_…`）；查进度用它 |
+| `generation` | 该 subject 递增后的遗忘代次（从 1 开始，单调递增） |
+| `events_cancelled` | 本次取消并脱敏的在途事件数 |
+| `state` | **恒为 `pending`**：描述墓碑此刻的状态，不是"已经删完了" |
+
+`state=pending` 不是失败也不是"没删"。请求阶段（同步）已经封住了读写：
+
+- 代次 +1 ⇒ 此前入队、此后才跑的记忆提取一律作废（含已经被认领的
+  `in_flight` 事件——改状态抓不住它们，只有代次能）；
+- 在途事件置 `cancelled` 且 payload 换成 `{"purged": true}`；
+- 读侧硬门：`GET /v1/memory`、`GET /v1/core-memory`、`GET /v1/awareness`
+  全部返回空，召回（`MemoryService.recall`）返回空结果——**这一步之后，
+  下一轮对话就不会再提到那些事了**，即使物理删除还没跑；
+- 墓碑与清理任务在同一事务里落库（`outbox_events.topic=memory.purge`），
+  所以"墓碑存在 ⇒ 清理任务必然存在"。
+
+清理阶段（后台 worker）**物理删除**这些表里该 subject 的行：
+
+| 表 | 为什么算"记忆" |
+| --- | --- |
+| `memories` | 提炼后的断言正文，就是"你记住的关于我的事"本身 |
+| `memory_episodes` | 叙事化摘要，含用户原话的转述 |
+| `core_memories` | 称呼/边界/禁忌正文（每轮常驻） |
+| `awareness_items` | 跨会话事实投影（第三人称转述） |
+| `memory_embeddings` | 向量能从语义反推内容，是派生数据 |
+| `memory_entities` | 关联行暴露"这条记忆关于谁" |
+| `entities` | `name`/`aliases` 是从原话抠出来的对象名（"我妈""家里那条狗"） |
+| `memory_retrieval_logs` | `query` 列**就是用户原话** |
+| `media_evidence`（`subject_id` 非空时） | `description` 是对用户图片/视频的文字化 |
+| `knowledge_items`（`owner_subject_id` 非空时） | `source_kind=user_statement` 的 `claim` 是用户自述 |
+| `prompt_snapshots` | `payload` 是**整份实际发给模型的 messages**，即用户原话的完整副本 |
+
+另外两处**脱敏但不删行**：
+
+- `outbox_events.payload` → `{"purged": true}`（含 `subject_id` 为 NULL 的历史行，
+  按 payload 里的 `subject_id` 匹配）；
+- `relationship_events.note` → `NULL`（它等于 `user_text[:200]`；行本身是
+  熟悉度/信任度投影的可重算来源，删了就再也算不回来）。
+
+**明确不删**：`messages`（对话记录不等于记忆，删它会把"忘了我"变成"清空聊天"）、
+`window_contexts` / `handoff_capsules`（对保留中 messages 的摘要）、
+`speech_segments`（她自己的语音）、`owner_subject_id IS NULL` 的公共知识。
+
+完成后墓碑置 `done` 并记下各项计数。
+
+前端应该：
+
+1. 点完删除立刻按"已清空"渲染列表（服务端读侧已经这么做），**不要**因为
+   `state=pending` 就显示"失败/还在删除中"；
+2. 需要给用户一个"彻底完成"的确认时，轮询 `GET /v1/memory/purge/status`，
+   等 `state=done`；
+3. `state=failed` 才算异常：此时数据没删干净，读侧**仍然**返回空（失败不放行），
+   后台会自动重试。
+
+#### 10.2.2 `GET /v1/memory/purge/status`
+
+返回当前 subject 最近 5 条清理记录（新→旧）：
+
+```json
+{
+  "items": [
+    {
+      "tombstone_id": "purge_ab12…",
+      "state": "done",
+      "requested_at": "2026-11-09T05:12:00+00:00",
+      "completed_at": "2026-11-09T05:12:03+00:00",
+      "memories_deleted": 128,
+      "episodes_deleted": 41,
+      "core_deleted": 3,
+      "awareness_deleted": 6,
+      "embeddings_deleted": 128,
+      "entities_deleted": 17,
+      "retrieval_logs_deleted": 240,
+      "events_cancelled": 2,
+      "events_scrubbed": 96,
+      "error_code": null
+    }
+  ],
+  "note": "…"
+}
+```
+
+`state` 取值：`pending` / `running` / `done` / `failed`。**只有 `done` 代表
+物理删除真的完成了。** `error_code` 是失败原因码（不是异常正文——异常里常常
+带着被删数据的片段）。
+
+响应里**不含任何被删内容**：墓碑表本身不存正文，这里也不额外拼文本。
+`retrieval_logs_deleted` 单列一项，因为 `memory_retrieval_logs.query` 存的是
+**用户原话**，是"原文真的清掉了吗"的直接证据。
+
+媒体描述 / 私有知识 / 提示词快照 / 关系事件 `note` 这四类的计数**不在这个
+响应里**（墓碑只有上面这几列），它们进的是 `memory_purged` 审计事件的
+`attributes`（`media_evidence_deleted` / `knowledge_items_deleted` /
+`prompt_snapshots_deleted` / `relationship_notes_scrubbed`）与 worker 日志。
+要查"那几类清了多少"请看审计，不要指望状态端点——它只报墓碑上有的列。
+
+`GET /v1/memory` 与 `GET /v1/core-memory` 在清理进行中（`pending`/`running`/
+`failed`）返回空列表、`total=0`，与"物理删除完成后"看到的样子一致；
+`GET /v1/awareness` 同样返回空 `items`（`scope="purge_pending"`）。
 
 ### 10.3 `GET /v1/core-memory`
 

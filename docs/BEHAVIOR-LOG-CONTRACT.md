@@ -79,11 +79,76 @@
 | 撤回（出站） | `message_recalled` | **她**把发出去的那条收回来了（含五态回执、不含正文） |
 | 撤回（出站） | `message_recall_refused` | 想撤但被拒（归属/时间窗/频次/回执），**零平台 action** |
 | 媒体 | `video_watched` / `video_watch_skipped` | 看了 / 没看成那个视频，为什么 |
+| 媒体 | `video_quota_exhausted` | 看视频的 **token 额度**用完了（含 used/limit 与供应商，便于排障） |
 | 上游回退 | `upstream_fallback` | 这次用了领域默认参数（上游不可用），附原因 |
 
 > 模型侧失败**不是**行为日志：它走运行日志（`ling.models.router` 的
 > 「模型调用失败 provider=… code=…」）。行为日志只说"她这一侧发生了什么"，
 > 供应商 5xx 不是她的经历。
+
+---
+
+## 3A. 看视频的额度口径（2026-11-09 改）
+
+### 从"次数"改成"token 账本"
+
+原来是"每窗口每小时 ≤2、每天 ≤20"，两份**进程内**计数器（注释自己写着
+"重启清零可以接受"）。已删除。理由三条：
+
+1. **次数与成本脱钩**：5 秒的短片和 3 分钟的长片都记"1 次"，而后者抽帧更多、
+   token 多一个量级。按次数限等于把成本管错了对象。
+2. **进程内计数不是额度**，是限流——重启即清零，多副本各算各的。
+3. **真正该管的那份账已经存在**：`models/quota.py::TokenQuotaStore` 按
+   (供应商, 本地日) 累计真实 token 到 `provider_token_usage` 表，`router`
+   每次调用前都会查。看视频走同一个 router、同一家供应商，所以额度**天然共用**
+   ——再维护第二套计数器必然对不上，而对不上的时候用户看到的是
+   "额度页说还有、视频却看不了"。
+
+### 判据（与 router 完全一致，不另立一套）
+
+```
+limit = providers[perception.video 绑定的供应商].daily_limit_effective()
+limit is None        → 放行（没设限额）
+used >= limit        → 拒绝
+```
+
+`used` 来自 `TokenQuotaStore.used(provider_id)`。**不自己维护任何计数器**。
+
+### 没看成之后：把事实交给主回复链路
+
+用户原话：「看视频额度如果没了的话，直接把事实告诉主回复链路，让他进行按人设
+自然的回复，例如懒得看或者什么样」。
+
+`WatchOutcome` 除了 `observed`（看到了什么）还有结构化的：
+
+| 字段 | 含义 |
+| --- | --- |
+| `observed` | 她看到了什么。**失败时必为空**——走了二次生成不等于"看到了" |
+| `skipped` | 没看成的**人话**原因 |
+| `denied_kind` | `quota` / `missing` / `error`（`None` = 没失败） |
+
+`kernel/turn.py` 在 `observed` 为空但 `skipped` 非空时，**同轮再生成一次**，
+把下面这条作为 `user` 角色的**事实**喂进去：
+
+- **`quota`**：「你本来想看一眼这个视频，但今天的看视频额度用完了（已用 X /
+  上限 Y tokens）。这不是视频坏了，是你今天已经没有余力再去看了。用你自己的
+  方式回应——比如表示今天懒得看、有点累、改天再看。」
+- **`missing` / `error`**：「你本来想看一眼这个视频，但取不到视频内容。用你
+  自己的方式回应——比如表示打不开、看不到、让对方说说里面有什么。」
+
+两类的共同硬边界：**不要说你看过了，也不要说视频里是什么**。
+
+### 为什么两类必须说不同的话
+
+- 额度用完**不是故障**，是她今天真的没有余力。说成"打不开"就是谎报技术故障，
+  用户会去查网络和视频文件。
+- 取不到内容**是真的没读到**。说成"不想看"会让用户以为她敷衍。
+
+### 为什么断言要看提示词
+
+用户看到的是她最终说的那句话。"她有没有假装看过"必须从**喂进去的提示词**与
+**生成的内容**两头看——只看 `WatchOutcome` 的字段会漏掉"字段正确、提示词里
+却写着观察内容"的情况（那样她照样会说"我看到一只猫"）。
 
 ---
 
@@ -108,7 +173,55 @@
 2. **不物理删除**：`retracted_at` 非空、行还在——"她当时为什么没接那句话"
    要能追溯；
 3. **已沉淀的记忆不主动回改**：撤回是"以后别再引用"，不是"过去没发生"。
-   用户要清除记忆走 `retract` / `forget`，那是另一件事。
+   用户要清除记忆走 `retract` / `forget`，那是另一件事（`forget` 现在是
+   真删，见 §4B）。
+
+---
+
+## 4B. `POST /v1/memory/forget`：真删与审计（2026-11 变更）
+
+`forget` 从"软清除"（打撤回/归档标记，原文仍在库里）改成了**真删**：
+请求阶段同步封住读写，清理阶段由后台 worker 物理删除原文与全部派生数据。
+完整契约见 `docs/API-WEB-V1.md` §10.2.1/§10.2.2，这里只记**审计口径**。
+
+### 4B.1 为什么审计要分三段
+
+「用户点了删除」和「数据真的没了」在审计里必须长得不一样。混成一条时，
+出事查不出它停在哪个阶段——是请求没落库、还是清理一直失败。
+
+| 动作 | 何时写 | `attributes` |
+| --- | --- | --- |
+| `memory_forgotten` | 请求阶段（`POST /v1/memory/forget` 提交时） | `{tombstone_id, generation, events_cancelled, mode:"purge"}` |
+| `memory_purged` | 清理阶段完成（`state=done`） | `{tombstone_id, memories_deleted, episodes_deleted, core_deleted, awareness_deleted, embeddings_deleted, entities_deleted, retrieval_logs_deleted, events_scrubbed, media_evidence_deleted, knowledge_items_deleted, prompt_snapshots_deleted, relationship_notes_scrubbed}` |
+| `memory_purge_failed` | 清理失败（`state=failed`） | `{tombstone_id}`；原因码放 `reason_code` |
+
+**字段口径变更**：`memory_forgotten` 原来带 `retracted_count`（软清除的影响
+行数）。真删的请求阶段**还不知道**真实删除数（物理删除在后台），返回它只能
+是假的——所以换成 `tombstone_id` + `generation` + `events_cancelled`。真实行数
+在 `memory_purged` 里，那时才知道。
+
+`memory_purged` 的后四个计数（媒体描述 / 私有知识 / 提示词快照 / 关系事件
+`note`）**只出现在审计与 worker 日志里**，墓碑表没有对应的列，所以
+`GET /v1/memory/purge/status` 不报它们。这不是遗漏：墓碑只存"能撑起状态
+机的那几个数"，其余属观测细节。
+
+### 4B.2 审计里**不能**出现被删内容
+
+三条都只带 id、计数、状态码。`attributes` 里出现正文（哪怕一句摘要）就把
+审计管道变成了"不存在"的副本——而审计是长期保留的。
+
+同理，墓碑表（`memory_purge_tombstones`）不存正文：备份恢复后能凭
+`subject_id + generation` 阻止旧数据复活，却读不出她被删了什么。
+
+### 4B.3 相关不变式
+
+- **对话里不能删**：工具注册表里没有任何遗忘/删除类工具
+  （`tests/unit/test_memory_purge_no_chat_path.py` 用封闭集合钉住）；唯一入口
+  是后台管理页的这个端点。
+- **投递失败也必须收敛**：`memory.purge` 事件与墓碑同一事务落库；另有
+  `memory.purge.sweep` 周期任务扫描 `pending|running|failed` 墓碑兜底。
+- **失败不放行读**：`state=failed` 期间读侧仍然返回空——用一次清理失败换一次
+  泄漏是不可接受的。
 
 ---
 

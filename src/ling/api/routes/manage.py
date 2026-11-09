@@ -271,16 +271,125 @@ async def supersede_memory(
 
 @router.post("/memory/forget")
 async def forget_all(auth: CurrentAuth, session: DbSession) -> dict:
-    count = await MemoryService(session).forget_subject(auth.user.subject_id)
-    # 一次清空整份记忆：只记数量，不记清掉了什么
+    """**真删**这个账号的记忆：请求阶段（同步）+ 清理阶段（后台）。
+
+    用户原话三句合起来只有一个意思：这些东西不该继续存在。所以这个端点
+    不再走 ``MemoryService.forget_subject()`` 的软清除（只打 retracted /
+    archived 标记、原文仍在库里），而是走 ``purge.request_purge()``。
+
+    ## 为什么请求阶段与"投递清理任务"必须在同一个事务里
+
+    墓碑与清理任务分开提交，就会出现一个**两个方向都坏**的中间态：
+
+    - 墓碑写了、事件没写 → 读侧按墓碑封住一切，但永远没有人去物理删除，
+      数据留在库里直到下一次请求（而用户可能再也不来）；
+    - 事件写了、墓碑没写 → 清理任务找不到墓碑，直接 no-op。
+
+    同一事务提交保证「**墓碑存在 ⇒ 清理任务必然存在**」。这是整条链能收敛
+    的唯一前提，不能靠"先写一个再写另一个、失败了重试"。
+
+    ## 为什么清理不在这里同步跑
+
+    数据量可能几十万行（记忆 + 情节 + 向量 + 实体 + 检索日志），卡在请求里
+    会让前端转圈几十秒。而且删除必须**幂等可重试**：删到一半崩了要能续，
+    这在 HTTP 请求的生命周期里做不到。
+
+    返回值里 ``state`` 恒为 ``pending``：它描述的是**墓碑**此刻的状态，不是
+    "已经删完了"。进度看 ``GET /v1/memory/purge/status``。
+    """
+    from ling.domains.memory.purge import MemoryPurgeError, request_purge
+    from ling.infra.models import OutboxEvent
+    from ling.infra.security import new_id
+
+    try:
+        request = await request_purge(
+            session, subject_id=auth.user.subject_id, requested_by=auth.user.id
+        )
+    except MemoryPurgeError as exc:
+        # 主体不存在 = 没有记忆可删。这不是错误，如实告诉调用方"无事可做"，
+        # 而不是编一个 200 出来让前端以为删过了。
+        raise LingError(ErrorCode.not_found, exc.message, status_code=404) from exc
+
+    session.add(
+        OutboxEvent(
+            id=new_id("obx"),
+            topic="memory.purge",
+            # subject_id / forget_generation 一起写上：前者让清理阶段能按主体
+            # 兜底脱敏，后者让代次栅栏在调度层有一份可读的快照。
+            subject_id=auth.user.subject_id,
+            forget_generation=request.generation,
+            payload={"tombstone_id": request.tombstone_id},
+        )
+    )
+    # 一次清空整份记忆：只记数量与代次，不记清掉了什么。
+    #
+    # 字段口径变更（相对软清除时代）：`retracted_count` 换成了
+    # `events_cancelled` + `generation` + `tombstone_id`。软清除的"影响行数"
+    # 在真删里没有意义——真实删除数在清理阶段才知道，那时另记一条
+    # `memory_purged`（见 worker.handle_memory_purge）。
     audit_event(
         "memory_forgotten",
         actor=auth.user.id,
         target_type="subject",
         target_id=auth.user.subject_id,
-        attributes={"retracted_count": count},
+        attributes={
+            "tombstone_id": request.tombstone_id,
+            "generation": request.generation,
+            "events_cancelled": request.events_cancelled,
+            "mode": "purge",
+        },
     )
-    return {"retracted": count}
+    return {
+        "tombstone_id": request.tombstone_id,
+        "generation": request.generation,
+        "events_cancelled": request.events_cancelled,
+        "state": "pending",
+    }
+
+
+@router.get("/memory/purge/status")
+async def memory_purge_status(auth: CurrentAuth, session: DbSession) -> dict:
+    """最近的记忆清理进度（**不含任何被删内容**）。
+
+    为什么要有这个端点：真删是两段式的，请求返回 `state=pending` 之后，
+    用户需要能回答"到底删完了没有"。只说"已提交"等于把不确定性丢给用户。
+
+    返回的每一项都只有计数与状态码：墓碑表本身就不存正文（见
+    `MemoryPurgeTombstone` 的注释），这里也不额外拼任何文本。
+    """
+    from ling.domains.memory.purge import list_tombstones
+
+    rows = await list_tombstones(session, subject_id=auth.user.subject_id, limit=5)
+    return {
+        "items": [
+            {
+                "tombstone_id": row.id,
+                "state": row.state,
+                "requested_at": row.requested_at.isoformat()
+                if row.requested_at
+                else None,
+                "completed_at": row.completed_at.isoformat()
+                if row.completed_at
+                else None,
+                "memories_deleted": int(row.memories_deleted or 0),
+                "episodes_deleted": int(row.episodes_deleted or 0),
+                "core_deleted": int(row.core_deleted or 0),
+                "awareness_deleted": int(row.awareness_deleted or 0),
+                "embeddings_deleted": int(row.embeddings_deleted or 0),
+                "entities_deleted": int(row.entities_deleted or 0),
+                # 检索日志存的是用户原话，单独报——这是"原文真的清掉了吗"的证据。
+                "retrieval_logs_deleted": int(row.retrieval_logs_deleted or 0),
+                "events_cancelled": int(row.events_cancelled or 0),
+                "events_scrubbed": int(row.events_scrubbed or 0),
+                "error_code": row.error_code,
+            }
+            for row in rows
+        ],
+        "note": (
+            "真删是两段式的：请求阶段（同步）已封住读写，清理阶段（后台）物理删除。"
+            "state=done 才是真的删完了。"
+        ),
+    }
 
 
 # ------------------------------------------------------------------ 关系与情绪
@@ -824,10 +933,17 @@ async def list_awareness(
     群聊窗口查不到 subject_fact，私聊窗口查不到别的群的内容。
     """
     from ling.domains.awareness.service import AwarenessService
+    from ling.domains.memory.purge import has_open_purge
 
     service = AwarenessService(session)
     policy = await service.policy(auth.user.subject_id)
-    if window_id:
+    # 清理进行中不返回任何条目：它同样是派生记忆，请求到物理删除之间还在库里。
+    # 判断放在路由层（而不是 awareness 域里）是因为域边界闸门不允许
+    # awareness import memory（ADR-0001 §2）。
+    if await has_open_purge(session, subject_id=auth.user.subject_id):
+        items = []
+        scope = "purge_pending"
+    elif window_id:
         window = await ConversationService(session).get_window(
             window_id, subject_id=auth.user.subject_id
         )

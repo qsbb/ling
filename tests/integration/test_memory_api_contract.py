@@ -787,13 +787,23 @@ async def test_supersede_invalid_text_uses_error_shape(logged_in: TestEnv, paylo
 # ------------------------------------------------------------------ forget
 
 
-async def test_forget_only_clears_own_and_returns_affected_count(
+async def test_forget_returns_two_phase_receipt_and_only_touches_own(
     logged_in: TestEnv,
 ) -> None:
-    """forget 此前端点层零测试：只清本人、返回影响行数、清完默认查询为空。"""
+    """`POST /v1/memory/forget` 现在是**真删**的两段式回执，不再返回影响行数。
+
+    契约变更（2026-11）：用户原话「真删：原文和派生数据都从库里清掉」。
+    软清除时代的 `{retracted: N}` 被换成
+    `{tombstone_id, generation, events_cancelled, state}`——影响行数在
+    请求阶段根本还不知道（物理删除是后台的），返回它只能是假的。
+
+    这条用例同时钉住"只清本人"：别人的记忆一行不动。
+    """
+    from ling.worker import handle_memory_purge
+
     first = await _create_memory(logged_in, "自己的记忆一")
     second = await _create_memory(logged_in, "自己的记忆二")
-    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他阿澄"})
+    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他小明"})
     assert put.status_code == 200, put.text
 
     other = await _other_subject()
@@ -805,21 +815,33 @@ async def test_forget_only_clears_own_and_returns_affected_count(
 
     response = await logged_in.client.post("/v1/memory/forget")
     assert response.status_code == 200, response.text
-    # 2 条 MemoryRow + 1 条 CoreMemoryRow；没有 episode/awareness。
-    assert response.json() == {"retracted": 3}
+    body = response.json()
+    assert set(body) == {"tombstone_id", "generation", "events_cancelled", "state"}
+    assert body["state"] == "pending"
+    assert body["generation"] == 1
+    assert body["tombstone_id"].startswith("purge")
+
+    # 请求阶段：行还在库里（物理删除是后台的），但**读侧已经封住**。
+    async with session_scope() as session:
+        assert await session.get(MemoryRow, first) is not None
+        assert await session.get(MemoryRow, second) is not None
+    default_body = (await logged_in.client.get("/v1/memory")).json()
+    assert default_body["memories"] == []
+    assert default_body["total"] == 0
+    # `?include=all` 也一样：清理进行中没有"墓碑可见"这回事。
+    all_body = (await logged_in.client.get("/v1/memory?include=all")).json()
+    assert all_body["memories"] == []
+    core_body = (await logged_in.client.get("/v1/core-memory")).json()
+    assert core_body["items"] == []
+
+    # 清理阶段：物理删除之后，行真的没了。
+    await handle_memory_purge({"tombstone_id": body["tombstone_id"]})
 
     async with session_scope() as session:
         rows = {
             memory_id: await session.get(MemoryRow, memory_id)
             for memory_id in (first, second, theirs)
         }
-        own_core = list(
-            (
-                await session.execute(
-                    select(CoreMemoryRow).where(CoreMemoryRow.subject_id == logged_in.subject_id)
-                )
-            ).scalars()
-        )
         other_core = list(
             (
                 await session.execute(
@@ -827,29 +849,19 @@ async def test_forget_only_clears_own_and_returns_affected_count(
                 )
             ).scalars()
         )
-    assert rows[first] is not None and rows[first].retracted is True
-    assert rows[second] is not None and rows[second].retracted is True
+    assert rows[first] is None and rows[second] is None, "真删：本人的记忆必须物理消失"
+    # 只清本人：另一 subject 的记忆与核心记忆都不动。
     assert rows[theirs] is not None and rows[theirs].retracted is False
-    assert own_core and all(row.active is False for row in own_core)
     assert other_core and all(row.active is True for row in other_core)
-
-    # 默认列表为空；include=all 仍能看到墓碑（不物理删除）
-    default_body = (await logged_in.client.get("/v1/memory")).json()
-    assert default_body["memories"] == []
-    assert default_body["total"] == 0
-    all_body = (await logged_in.client.get("/v1/memory?include=all")).json()
-    assert {i["memory_id"] for i in all_body["memories"]} == {first, second}
-    assert all(i["retracted"] for i in all_body["memories"])
-
-    core_body = (await logged_in.client.get("/v1/core-memory")).json()
-    assert core_body["items"] == []
 
 
 async def test_forget_covers_four_object_kinds_and_only_own(logged_in: TestEnv) -> None:
-    """forget 返回的影响行数必须覆盖 Memory/Episode/Core/Awareness 四类之和。"""
+    """真删必须覆盖 Memory/Episode/Core/Awareness 四类，且只删本人的。"""
+    from ling.worker import handle_memory_purge
+
     memory_id = await _create_memory(logged_in, "自己的记忆")
     episode_id = await _seed_episode(logged_in.subject_id, "自己的情节")
-    core = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他阿澄"})
+    core = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他小明"})
     assert core.status_code == 200, core.text
     core_id = core.json()["core_id"]
     awareness_id = await _seed_awareness(logged_in.subject_id, "自己的意识")
@@ -865,8 +877,7 @@ async def test_forget_covers_four_object_kinds_and_only_own(logged_in: TestEnv) 
 
     response = await logged_in.client.post("/v1/memory/forget")
     assert response.status_code == 200, response.text
-    # 1 MemoryRow + 1 Episode + 1 CoreMemoryRow + 1 AwarenessItemRow
-    assert response.json() == {"retracted": 4}
+    await handle_memory_purge({"tombstone_id": response.json()["tombstone_id"]})
 
     async with session_scope() as session:
         own_memory = await session.get(MemoryRow, memory_id)
@@ -884,10 +895,11 @@ async def test_forget_covers_four_object_kinds_and_only_own(logged_in: TestEnv) 
             ).scalars()
         )
 
-    assert own_memory is not None and own_memory.retracted is True
-    assert own_episode is not None and own_episode.archived_at is not None
-    assert own_core is not None and own_core.active is False
-    assert own_awareness is not None and own_awareness.invalidated_at is not None
+    # 本人四类：物理消失（不是打标记）。
+    assert own_memory is None
+    assert own_episode is None
+    assert own_core is None
+    assert own_awareness is None
 
     # 只清本人：另一 subject 的四类对象都不动。
     assert other_memory is not None and other_memory.retracted is False
@@ -900,7 +912,7 @@ async def test_forget_covers_four_object_kinds_and_only_own(logged_in: TestEnv) 
 
 
 async def test_core_memory_list_has_timestamps(logged_in: TestEnv) -> None:
-    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他阿澄"})
+    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他小明"})
     assert put.status_code == 200, put.text
     body = (await logged_in.client.get("/v1/core-memory")).json()
     item = next(i for i in body["items"] if i["label"] == "称呼")
@@ -912,7 +924,7 @@ async def test_core_memory_list_has_timestamps(logged_in: TestEnv) -> None:
 
 async def test_core_memory_timestamps_match_database(logged_in: TestEnv) -> None:
     """时间戳必须与 `core_memories` 表逐字相等，不能是"当前时间"占位。"""
-    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他阿澄"})
+    put = await logged_in.client.put("/v1/core-memory", json={"label": "称呼", "text": "叫他小明"})
     assert put.status_code == 200, put.text
     core_id = put.json()["core_id"]
 
@@ -976,7 +988,7 @@ async def test_core_memory_put_returns_full_record(logged_in: TestEnv) -> None:
     """PUT 响应直接带 priority/scope/时间戳：写完不必再 GET 一次。"""
     response = await logged_in.client.put(
         "/v1/core-memory",
-        json={"label": "称呼", "text": "叫他阿澄", "priority": 7, "scope": "group"},
+        json={"label": "称呼", "text": "叫他小明", "priority": 7, "scope": "group"},
     )
     assert response.status_code == 200, response.text
     body = response.json()

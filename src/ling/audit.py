@@ -141,6 +141,14 @@ _AUDIT_MESSAGES: dict[str, str] = {
     "provider_secret_set": "供应商密钥已更新",
     "memory_retracted": "记忆已撤回",
     "memory_forgotten": "记忆已清除",
+    # 真删是两段式的，所以审计必须分三段记：
+    # `memory_forgotten` = 请求已接受（同步、只封住读写），
+    # `memory_purged` = 物理删除完成（带各项计数），
+    # `memory_purge_failed` = 清理失败（带原因码，由后台重试）。
+    # 混成一条时"用户点了删除"与"数据真的没了"在审计里长得一模一样，
+    # 出事时查不出停在哪个阶段。
+    "memory_purged": "记忆已物理删除",
+    "memory_purge_failed": "记忆清理失败",
     "memory_superseded": "记忆已更正",
     "consent_changed": "授权已变更",
     "subjects_merged": "账号身份已合并",
