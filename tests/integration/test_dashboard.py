@@ -21,6 +21,9 @@ SECTION_KEYS = {
     "relationship",
     "connectivity",
     "phone",
+    # 媒体活动与「手机」**并列**：看视频 ≠ 看手机，合并会把具体事实说糊
+    # （用户原话：「他在忙，可以给他变成他的真实活动状态」）。
+    "media",
 }
 
 

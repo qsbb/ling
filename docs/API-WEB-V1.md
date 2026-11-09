@@ -1298,6 +1298,25 @@ messages** + 每一段属于哪个语义块。用来回答"她为什么这么说
 **参数**不跟着**事实**一起消失；但空态里不会出现 `state` / `last_looked_at`
 这类"她拿过手机"的字段（那是在编事实）。
 
+**`sections.media.data`**（正在忙什么：媒体活动）
+
+与 `phone` **并列**，不是它的一部分：看视频 ≠ 看手机。她可能在看 B 站而
+根本没在"看手机"，合并会把具体事实说成一句更含糊的话。
+
+| 字段 | 含义 |
+| --- | --- |
+| `kind` | `video_watch` / `bilibili_feed` / `livestream`；三者争同一个全局槽位 |
+| `started_at` | 这次媒体动作真正开始的时刻（`phase=active` 时才有） |
+| `in_my_session` | 是否发生在本用户主体的会话里 |
+| `activity_id` | **仅当 `in_my_session=true`** 才给 |
+
+- 只报 `phase=active`：`held` 是"已拿到执行权、还在准备"（解析短号、看缓存、
+  准备下载），把它报成"正在看"是编造状态。
+- 没有有效占用时整段是 `empty`（不编一个 idle）——"她这会儿没在看媒体"和
+  "她此刻闲置"是两件事。
+- **受众**：`in_my_session=false` 时不给 `activity_id`，也从不给 `window_id`。
+  窗口 id 是别人的会话标识，透出去等于告诉用户"她在跟谁说话"。
+
 **`sections.presence.data`**（当前场景）
 
 | 字段 | 含义 |
