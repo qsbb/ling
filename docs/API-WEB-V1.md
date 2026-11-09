@@ -168,6 +168,96 @@ GET /v1/sessions/{id}/recall-proposals
 `recall_proposals` 也会出现在 SSE 的 `turn.completed` 事件里（`{proposal_id,
 message_id, note}`），网页可以在回复到达的同一条事件里直接画确认框。
 
+## 3B. 视频后台取证作业（2026-11 新增，裁决 §3 第 1、2 步）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/v1/sessions/{id}/media/{evidence_id}/read-jobs` | 安排一次**后台**视频读取 → `202` + `MediaReadJobOut` |
+| GET | `/v1/sessions/{id}/media/read-jobs/{call_id}` | 查当前状态 |
+| POST | `/v1/sessions/{id}/media/read-jobs/{call_id}/cancel` | 取消 |
+
+### 3B.1 请求体（只有两个字段，都必填）
+
+```json
+{ "feedback_mode": "evidence_only", "request_key": "前端生成的唯一键" }
+```
+
+- `feedback_mode` **必填**且首期只接受 `evidence_only`。缺字段的报错会明说
+  "必填"，因为真正的坑是"以为不写就等于 evidence_only"——将来放开主动补话时，
+  那批老客户端会**静默**变成"会说话"。别的值 → 422，不静默降级。
+- `request_key` 必填：后台作业要扛住"双击了两次 / 前端重试"。服务端不生成
+  （每次新 id 就永远不幂等）。
+- **多余字段 → 422**（`extra="forbid"`）。例如按旧文档传 `wait=true` 会被拒，
+  而不是被无视。
+
+### 3B.2 响应
+
+```json
+{ "schema_version": "v1", "call_id": "mread_...", "window_id": "win_...",
+  "evidence_id": "ev_...", "state": "pending",
+  "note": "已安排，尚未读到结果", "error_code": null, "result_ref": null,
+  "requested_at": "...", "started_at": null, "completed_at": null,
+  "deadline": "...", "cancel_requested_at": null, "feedback_mode": "evidence_only" }
+```
+
+**`note` 由服务端固定映射，前端直接显示，不要自己拼**：
+
+| state | note |
+| --- | --- |
+| `pending` | 已安排，尚未读到结果 |
+| `running` | 正在读这个视频，还没读到结果 |
+| `succeeded` | 读完了，结果已存为这条视频的内容 |
+| `failed` | 这次没读成（可以再试一次） |
+| `timeout` | 读取超时，没读完（可以再试一次） |
+| `unknown` | 不确定读到没有：读取过程被中断，结果没存下来 |
+| `cancelled` | 已取消，没有读 |
+| `expired` | 排太久了，已失效（可以再试一次） |
+| `budget_denied` | 这次额度不够，没有读 |
+
+三条纪律：**入队 ≠ 读到结果**（`pending` 不许出现"看到了"）；**`unknown` ≠
+失败**（模型可能已经调用并收费，说成失败会诱导重复收费的重试）；文案只有一个
+来源（服务端），前端拼文案会让两条路各说各话。
+
+### 3B.3 拒绝
+
+| 状态码 | 什么时候 |
+| --- | --- |
+| 403 | 没有 `media.inbound` 授权（报文给出"去哪儿授权"） |
+| 404 | 会话不存在 / 证据不在这个会话 / 证据已过期 / 作业不属于这个窗口 |
+| 422 | 证据不是视频（图片、语音走既有的自动描述）/ 缺字段 / 多余字段 / `feedback_mode` 不是 `evidence_only` |
+| 409 | 同 `request_key` 但**参数不同**（`detail=request_key_conflict`）/ 同一证据已有在途作业（`detail=evidence_read_in_flight`） |
+
+**每一条拒绝都是零副作用**：不建作业、不投 outbox。一条"排上了但永远排不上"
+的 pending 行比报错更糟。
+
+跨窗口一律按 404 处理（403 会变成"这个 id 存在吗"的探测口）。
+
+### 3B.4 幂等与互斥
+
+- `UNIQUE(actor_id, window_id, request_key)`：同一人同一窗口的同一键 → **同一个**
+  `call_id`（重放 202）。别人/别的窗口拿到同一个键互不影响。
+- 同键**不同参数** → 409，不悄悄返回旧作业（否则调用方以为新请求生效了）。
+- 部分唯一索引 `(evidence_id, tool_version) WHERE state IN ('pending','running')`：
+  同一视频同一工具版本**最多一个在途作业**；**终态之后允许再排**（想再读一遍 /
+  上次失败重试）。不做成普通唯一约束，否则"重试"永远做不了。
+
+### 3B.5 取消的两种语义
+
+- `pending`（还没开始）→ 直接 `cancelled`。什么都没发生，不用等。
+- `running` → **状态不变**，只置 `cancel_requested_at`。执行方看到标记后尽力停，
+  真停下来才落 `cancelled`。直接写 `cancelled` 会让"还在跑、可能正在花钱"和
+  "库里说取消了"同时成立，而晚到的结果还会被写进证据。
+- 已是终态 → 200 + 当前状态，**不改任何东西**（终态不可再变，点两次不该报错）。
+
+`cancel_requested_at` 非空**不等于**已取消。
+
+### 3B.6 本轮未实现（第 3、4 步另派）
+
+不注册 worker、不调模型、不检查额度、不写描述。所以 outbox 事件会一直停在
+`pending`——这是**刻意**的：提前接上执行却没有租约/预算/恢复，等于开了一条
+静默烧钱的路径。`budget_denied` / `expired` 等状态目前只由迁移与状态机定义，
+还没有代码会写入它们。
+
 ## 4. 模型设置
 
 | 方法 | 路径 | 说明 |

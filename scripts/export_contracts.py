@@ -79,6 +79,9 @@ EXPORTED = [
     # 她提议撤回、等用户确认的那一条（`docs/RECALL-TOOL.md`）。与
     # `RecallMessageOut` 分开：那个是"已经执行的结果"，这个是"还没执行"。
     "RecallProposalOut",
+    # 视频后台取证作业（docs/ASYNC-TOOL-DECISION.md §3）：202 登记与状态查询
+    # 共用一个形状；`state` 与域内 `JobState` 逐字对应（有测试钉住）。
+    "MediaReadJobOut",
     # 「检查更新」四态卡片（docs/UPDATE-UX-DESIGN.md）。嵌套片段对象（current /
     # newer / target / task / details.*）也各自导出：它们是 API 契约的一部分，
     # 单独写 schema 才能让前端按字段名/类型对齐，而不是对着文档抄。

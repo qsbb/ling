@@ -18,10 +18,14 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import (
     ConfigDep,
@@ -32,7 +36,8 @@ from ling.api.deps import (
     SettingsDep,
 )
 from ling.api.errors import LingError, not_found
-from ling.contracts.v1 import ErrorCode, TurnState
+from ling.contracts.v1 import ErrorCode, MediaReadJobOut, TurnState
+from ling.infra.models import Window
 from ling.kernel.autonomy import TurnChoice
 from ling.kernel.decision import TurnDecision
 from ling.kernel.turn import TurnCoordinator, TurnStreamEvent
@@ -339,6 +344,443 @@ async def upload_media(
         # 下一轮自动进她的上下文（同一窗口，最多 3 张）。
         "note": "图片会在被识别后自动进入该会话的下一轮对话，无需额外传参",
     }
+
+
+# ------------------------------------------------------------------ 视频后台取证作业
+#
+# 裁决 `docs/ASYNC-TOOL-DECISION.md` §3 第 1 步：**显式**的后台入口。
+#
+# 三条纪律，写在这里是因为它们决定了下面每一行的形状：
+#
+# 1. **不从自然语言猜"用户愿不愿意等"**。只有这个端点被真的调用才算授权了
+#    一次后台读取。正文非空也不构成理由——"她说了一句话"和"她这句话跟视频
+#    有关"是两件事。
+# 2. **不改**现有 `<<看视频>>` 同步路径。那条路是"她在这一轮里等"，这个端点
+#    是"安排到后台读"，两条互不影响。
+# 3. **入队不等于读到结果**。202 的 `note` 只能是"已安排，尚未读到结果"，
+#    绝不承诺"稍后告诉你"（裁决 §4 明确不做结果通知）。
+
+
+class CreateReadJobBody(BaseModel):
+    """`POST .../media/{evidence_id}/read-jobs` 的请求体。
+
+    ## 为什么 `feedback_mode` 必须显式给 `evidence_only`
+
+    它是"这个作业允不允许主动补话"的开关，而首期裁决**只允许**产出证据。
+    做成默认值（`= "evidence_only"`）会让"少写一个字段"和"明确表示只写证据"
+    变成同一件事，将来放开主动补话时，一批老客户端会**静默**升级成"会说话"。
+    所以它是必填且只接受一个值：多一个值就是 422，逼迫调用方在升级时显式选择。
+
+    ## 为什么 `request_key` 必填
+
+    后台作业要能承受"用户双击了两次""前端重试了"。幂等键不能由服务端凭空
+    生成（每次生成一个新 id 就永远不会幂等），必须调用方给。必填也避免了
+    "有的请求带、有的不带"那种半幂等的状态。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: 首期唯一合法值。放开时**必须**同时改 `domains/media/jobs.py` 与读侧。
+    feedback_mode: Literal["evidence_only"]
+    #: 调用方的幂等键。同一个人同一窗口同一个键 → 同一个作业。
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explain_missing_fields(cls, data: object) -> object:
+        """缺字段时给一句能指路的话。
+
+        pydantic 的原话是 "Field required"，而这条链路上真正的坑是"以为不写
+        feedback_mode 就等于 evidence_only"。所以要明说它是**必填**。
+
+        多余字段在 ``extra="forbid"`` 里已经 422 掉了（例如客户端按旧文档传
+        ``wait=true``），这里只补缺字段的解释。
+        """
+        if isinstance(data, dict) and "feedback_mode" not in data:
+            raise ValueError(
+                "feedback_mode 必填，首期只接受 evidence_only"
+                "（这个入口只写证据，不主动补话；不写不等于默认）"
+            )
+        return data
+
+
+#: 状态 → 人话。**唯一**的措辞来源：接口、测试、日志都从这里取。
+#:
+#: 三条硬纪律（裁决 §5 第 7 条）：
+#: - 非终态只能说"已安排/正在读"，**不许**说"看到了"；
+#: - `unknown` 必须说"不确定"，因为模型可能已经调用过、只是结果没落库——
+#:   说成失败会让人以为可以安全重试，而重试可能第二次收费；
+#: - 失败类要给出**下一步**（"可以再试一次"），不要只丢一个状态词。
+READ_JOB_NOTES: dict[str, str] = {
+    "pending": "已安排，尚未读到结果",
+    "running": "正在读这个视频，还没读到结果",
+    "succeeded": "读完了，结果已存为这条视频的内容",
+    "failed": "这次没读成（可以再试一次）",
+    "timeout": "读取超时，没读完（可以再试一次）",
+    "unknown": "不确定读到没有：读取过程被中断，结果没存下来",
+    "cancelled": "已取消，没有读",
+    "expired": "排太久了，已失效（可以再试一次）",
+    "budget_denied": "这次额度不够，没有读",
+}
+
+
+def _read_job_note(state: str) -> str:
+    """状态 → 人话。未知状态给"不知道"，**不猜**成功。"""
+    return READ_JOB_NOTES.get(state, "状态未知")
+
+
+def _read_job_view(row: object) -> dict:
+    """`MediaReadJob` → 响应体（`MediaReadJobOut` 的字段集）。
+
+    ## 为什么 `note` 由服务端映射
+
+    文案是**判定的一部分**：`pending` 说成"已安排"、`unknown` 说成"不确定"，
+    这些区分如果交给前端拼，各家会拼出不同的意思，而 `unknown` 被拼成"失败"
+    就会诱导用户在不该重试的时候重试（重复收费）。所以文案只有一个来源。
+    """
+    state = str(getattr(row, "state", ""))
+    return {
+        "call_id": str(getattr(row, "call_id", "")),
+        "window_id": str(getattr(row, "window_id", "")),
+        "evidence_id": str(getattr(row, "evidence_id", "")),
+        "state": state,
+        "note": _read_job_note(state),
+        "error_code": getattr(row, "error_code", None),
+        "result_ref": getattr(row, "result_ref", None),
+        "requested_at": getattr(row, "requested_at", None),
+        "started_at": getattr(row, "started_at", None),
+        "completed_at": getattr(row, "completed_at", None),
+        "deadline": getattr(row, "deadline", None),
+        "cancel_requested_at": getattr(row, "cancel_requested_at", None),
+        "feedback_mode": str(getattr(row, "feedback_mode", "") or "evidence_only"),
+    }
+
+
+async def _media_authorization_ref(
+    session: AsyncSession,
+    *,
+    subject_id: str | None,
+    window_id: str,
+) -> str | None:
+    """登记时生效的那条 `media.inbound` 授权修订，形如 ``subject:revision``。
+
+    ## 为什么复用 `MediaEvidenceService` 的判据而不另写
+
+    媒体授权有**两个**可能的主体：上传者本人，**或**这个窗口的主人
+    （群聊里主人授权一次，别人发的图也能被描述）。这套规则写在
+    `MediaEvidenceService._granted_consent` 里，顺序即优先级。这里再写一遍
+    必然走散——而"哪一条判松了"是最难发现的错。
+
+    所以直接调它（同一套 `ConsentService.get(subject, "media.inbound")` 循环），
+    拿到的整条 `ConsentView` 既回答"能不能读"，又给出**应该记哪一条**的
+    `revision`（撤权审计时要指回具体的人）。
+    """
+    from ling.domains.consent.service import ConsentService
+    from ling.domains.media.service import INBOUND_SCOPE
+
+    window = await session.get(Window, window_id)
+    owner = getattr(window, "subject_id", None)
+    seen: set[str] = set()
+    for candidate in (subject_id, owner):
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        consent = await ConsentService(session).get(candidate, INBOUND_SCOPE)
+        if consent.granted:
+            return f"{candidate}:{consent.revision}"
+    return None
+
+
+async def _require_read_job_scope(
+    row: object, *, window_id: str
+) -> None:
+    """作业必须在**这个窗口**里。跨窗口一律按"不存在"处理。
+
+    「不存在」而不是 403：403 等于告诉调用方"这个 id 存在但你无权看"，
+    那是一个探测口（可以拿它枚举别人有哪些作业）。
+    """
+    if str(getattr(row, "window_id", "")) != window_id:
+        raise LingError(ErrorCode.not_found, "没有这个读取作业", status_code=404)
+
+
+@router.post(
+    "/sessions/{session_id}/media/{evidence_id}/read-jobs",
+    response_model=MediaReadJobOut,
+    status_code=202,
+)
+async def create_media_read_job(
+    session_id: str,
+    evidence_id: str,
+    body: CreateReadJobBody,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+) -> dict:
+    """安排一次**后台**视频读取；202 表示"已安排"，不表示"读到了"。
+
+    ## 顺序（每一步都必须在前一步之后）
+
+    1. **窗口归属**：会话必须是当前登录者的。否则 404（不泄露存在性）。
+    2. **证据必须是本窗口的已存在视频**：不是视频 → 422（"这个入口只读视频"，
+       图片/音频走既有的自动描述）；不存在/跨窗口/已过期 → 404。
+    3. **媒体授权**：复用 `MediaEvidenceService` 的判据（上传者本人或窗口主人
+       的 `media.inbound`）。没有 → 403，并给出可执行的下一步（去哪儿授权）。
+    4. **建作业 + 同事务投 outbox**：提交之后才返回 202。**先提交再返回**是
+       硬要求——不然"202 说已安排"和"其实事务回滚了"会同时成立，用户等一个
+       永远不会开始的读取。
+    5. **幂等**：同一 `(actor, window, request_key)` 命中已有作业 → 返回**同一个**
+       call_id（200 语义的 202 重放）；同键但参数不同 → 409。
+    6. **在途互斥**：同一证据同一 `tool_version` 已有在途作业 → 409（那会两次
+       视觉调用、两次收费，而结果写的是同一行证据）。
+
+    ## 为什么不在这里做预算/额度检查
+
+    裁决把它放在第 4 步（`budget_denied` 是**执行前**的闸）。入口这里做预算
+    检查会有两个问题：检查与预留不是原子的（中间会被别的作业抢走额度），而且
+    用户会看到"提交成功然后又失败"。所以入口只负责"排上队"，额度在执行前判。
+    """
+    from ling.domains.conversation.service import ConversationService
+    from ling.domains.media.jobs import (
+        MEDIA_READ_QUEUE_DEADLINE,
+        MEDIA_READ_TOOL_VERSION,
+        JobState,
+        enqueue_read_job,
+    )
+    from ling.domains.media.service import MediaEvidenceService
+    from ling.infra.models import MediaReadJob
+    from ling.infra.security import new_id
+
+    # 1) 窗口归属
+    conversation = ConversationService(session, actor_id=settings.actor_id)
+    window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
+    if window is None:
+        raise LingError(ErrorCode.not_found, "会话不存在", status_code=404)
+
+    # 2) 证据：必须是本窗口的、已存在的、**视频**
+    service = MediaEvidenceService(session, actor_id=settings.actor_id)
+    evidence = await service.get(evidence_id, window_id=session_id)
+    if evidence is None:
+        raise LingError(ErrorCode.not_found, "这个会话里没有这条媒体", status_code=404)
+    if evidence.kind != "video":
+        raise LingError(
+            ErrorCode.invalid_request,
+            f"这个入口只读视频，收到的是 {evidence.kind}；"
+            "图片和语音会自动进入对话，不需要后台读取",
+            status_code=422,
+        )
+
+    # 3) 媒体授权（复用既有判据，不另写）
+    authorization_ref = await _media_authorization_ref(
+        session, subject_id=auth.user.subject_id, window_id=session_id
+    )
+    if authorization_ref is None:
+        raise LingError(
+            ErrorCode.forbidden,
+            "未授权读取入站媒体（scope=media.inbound）。"
+            "请先在「授权」页允许「接收媒体」",
+            status_code=403,
+        )
+
+    now = datetime.now(UTC)
+    job = MediaReadJob(
+        call_id=new_id("mread"),
+        actor_id=settings.actor_id,
+        subject_id=auth.user.subject_id,
+        window_id=session_id,
+        evidence_id=evidence.evidence_id,
+        # 来源留空：这个入口是用户**显式**点的，没有"哪一轮的模型想读它"。
+        # 裁决明确不从自然语言猜，所以也不该伪造一个 turn 出来。
+        source_message_id=None,
+        source_turn_id=None,
+        source_attempt=None,
+        request_key=body.request_key,
+        tool_version=MEDIA_READ_TOOL_VERSION,
+        mode="video",
+        feedback_mode=body.feedback_mode,
+        authorization_ref=authorization_ref,
+        state=JobState.pending.value,
+        requested_at=now,
+        deadline=now + MEDIA_READ_QUEUE_DEADLINE,
+    )
+
+    try:
+        await enqueue_read_job(session, job=job, now=now)
+        await session.commit()
+    except IntegrityError as exc:
+        # 两类唯一冲突，含义完全不同，必须分开说：
+        await session.rollback()
+        return await _resolve_read_job_conflict(
+            session,
+            exc,
+            session_id=session_id,
+            request_key=body.request_key,
+            evidence_id=evidence.evidence_id,
+            actor_id=settings.actor_id,
+        )
+
+    return _read_job_view(job)
+
+
+async def _resolve_read_job_conflict(
+    session: AsyncSession,
+    exc: IntegrityError,
+    *,
+    session_id: str,
+    request_key: str,
+    evidence_id: str,
+    actor_id: str,
+) -> dict:
+    """唯一冲突 → 幂等重放（同一个作业）或 409（在途互斥 / 同键不同参数）。
+
+    ## 为什么分成两支
+
+    - **`request_key` 唯一约束**：说明"同一个幂等键已经有一个作业了"。这时
+      要判断"是不是同一次请求"：参数一致就返回**同一个** call_id（幂等的 202），
+      参数不同就 409——悄悄返回旧作业会让调用方以为自己的新请求生效了。
+    - **在途部分唯一索引**：同一个证据同一个工具版本已经有一个在跑的作业。
+      这时**没有**可以重放的东西（是不同的 request_key 要求的），只能 409
+      并告诉用户"这个视频正在读"。
+
+    用约束名区分而不是"看哪条 SQL 报错"：约束名是我们自己起的，稳定；
+    而 psycopg 的错误文本会随版本变。
+    """
+    from sqlalchemy import select
+
+    from ling.domains.media.jobs import MEDIA_READ_TOOL_VERSION
+    from ling.infra.models import MediaReadJob
+
+    # psycopg 把约束名放在 `diag.constraint_name`；asyncpg 放在 `constraint_name`。
+    # 两个都试，拿不到就退回整段文本——约束名是我们自己起的，比错误文本稳定。
+    orig = exc.orig
+    detail = str(
+        getattr(orig, "constraint_name", None)
+        or getattr(getattr(orig, "diag", None), "constraint_name", None)
+        or exc
+    )
+    if "uq_media_read_job_request" in detail:
+        existing = (
+            await session.execute(
+                select(MediaReadJob).where(
+                    MediaReadJob.actor_id == actor_id,
+                    MediaReadJob.window_id == session_id,
+                    MediaReadJob.request_key == request_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:  # pragma: no cover - 刚撞过唯一键，行必然在
+            raise LingError(ErrorCode.conflict, "重复的请求", status_code=409) from exc
+        if existing.evidence_id != evidence_id:
+            # 同键不同参数：必须分开说，否则调用方以为自己的新请求生效了。
+            raise LingError(
+                ErrorCode.conflict,
+                "同一个 request_key 已经用另一条视频提交过；"
+                "换一条视频请换一个 request_key",
+                status_code=409,
+                detail="request_key_conflict",
+            ) from exc
+        return _read_job_view(existing)
+
+    if "uq_media_read_job_active_evidence" in detail:
+        raise LingError(
+            ErrorCode.conflict,
+            "这个视频已经有一个正在排队的读取；等它结束再用新的 request_key 提交",
+            status_code=409,
+            detail="evidence_read_in_flight",
+        ) from exc
+
+    # 其它完整性错误（外键、CHECK 等）：是 bug，不是用户输入问题。
+    logger.warning(
+        "读取作业插入失败（未识别的约束）: %s | tool_version=%s",
+        detail[:200],
+        MEDIA_READ_TOOL_VERSION,
+    )
+    raise LingError(ErrorCode.internal, "没能安排这次读取", status_code=500) from exc
+
+
+@router.get(
+    "/sessions/{session_id}/media/read-jobs/{call_id}",
+    response_model=MediaReadJobOut,
+)
+async def get_media_read_job(
+    session_id: str,
+    call_id: str,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+) -> dict:
+    """查一次后台读取的**当前状态**（同窗口作用域）。
+
+    `note` 由服务端映射：`pending`/`running` 只说"已安排/正在读"，
+    `unknown` 说"不确定"，**没有**任何状态会说"我看到了"直到 `succeeded`
+    ——而入队本身永远不是成功。
+    """
+    from ling.domains.conversation.service import ConversationService
+    from ling.infra.models import MediaReadJob
+
+    conversation = ConversationService(session, actor_id=settings.actor_id)
+    if await conversation.get_window(session_id, subject_id=auth.user.subject_id) is None:
+        raise LingError(ErrorCode.not_found, "会话不存在", status_code=404)
+
+    row = await session.get(MediaReadJob, call_id)
+    if row is None or row.actor_id != settings.actor_id:
+        raise LingError(ErrorCode.not_found, "没有这个读取作业", status_code=404)
+    await _require_read_job_scope(row, window_id=session_id)
+    return _read_job_view(row)
+
+
+@router.post(
+    "/sessions/{session_id}/media/read-jobs/{call_id}/cancel",
+    response_model=MediaReadJobOut,
+)
+async def cancel_media_read_job(
+    session_id: str,
+    call_id: str,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+) -> dict:
+    """取消一次后台读取。
+
+    ## 两种取消，语义不同（裁决 §3 第 2 步）
+
+    - **还没开始**（`pending`）：直接 `cancelled`。什么都没发生，不用等。
+    - **已经在跑**（`running`）：**不动 state**，只置 `cancel_requested_at`。
+      执行方看到标记后尽力停；真的停下来才落 `cancelled`。这里不能直接写
+      `cancelled`——那会让"作业还在跑、可能正在花视觉模型的钱"和"库里说它
+      取消了"同时成立，而晚到的结果还会被写进证据。
+
+    ## 已经是终态
+
+    幂等返回当前状态（200），**不报错**：用户点第二次取消不该看到一个错误。
+    但也不会改任何东西——终态不可再变（`transition()` 的唯一铁律）。
+    """
+    from ling.domains.conversation.service import ConversationService
+    from ling.domains.media.jobs import JobState, is_terminal
+    from ling.infra.models import MediaReadJob
+
+    conversation = ConversationService(session, actor_id=settings.actor_id)
+    if await conversation.get_window(session_id, subject_id=auth.user.subject_id) is None:
+        raise LingError(ErrorCode.not_found, "会话不存在", status_code=404)
+
+    row = await session.get(MediaReadJob, call_id)
+    if row is None or row.actor_id != settings.actor_id:
+        raise LingError(ErrorCode.not_found, "没有这个读取作业", status_code=404)
+    await _require_read_job_scope(row, window_id=session_id)
+
+    state = JobState(row.state)
+    if is_terminal(state):
+        return _read_job_view(row)
+
+    now = datetime.now(UTC)
+    if state is JobState.pending:
+        row.state = JobState.cancelled.value
+        row.completed_at = now
+    else:
+        # running：只置标记，状态不变（见 docstring）
+        if row.cancel_requested_at is None:
+            row.cancel_requested_at = now
+    await session.commit()
+    return _read_job_view(row)
 
 
 @router.post("/sessions/{session_id}/turns")

@@ -33,6 +33,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -1641,6 +1642,128 @@ class MediaEvidenceRow(Base, TimestampMixin):
     )
 
 
+class MediaReadJob(Base):
+    """一次**视频后台取证**作业（`media.video.read`，迁移 0058）。
+
+    裁决见 `docs/ASYNC-TOOL-DECISION.md` §3：后台读取必须是一个**有主键、能被
+    查询、能取消、能在崩溃后对账**的领域作业，而不是进程内的一个 task。
+
+    ## 为什么不是 `operations` 表加个 type
+
+    `operations` 记的是**投递**（一个 part 发到平台、拿到回执），它的状态词表
+    围绕"发没发出去"；而这个作业的状态围绕"读没读到、能不能再花钱"。硬塞进
+    去会让两边共享一套 `state` 字符串，而它们的合法转移完全不同——合成一张表
+    之后，两边的状态机只能有一个活下来。
+
+    ## 字段分四组
+
+    1. **身份**：`call_id` 主键 + `actor/subject/window/evidence`。窗口用于
+       "同窗口鉴权"，evidence 决定读谁。
+    2. **因果**：`source_message_id/source_turn_id/source_attempt` 记"是谁在
+       哪一轮要求的"。裁决明确**不从自然语言猜**用户想不想等，所以这个来源只
+       用于审计与事后解释，**不作为**准入判据。
+    3. **协议**：`request_key`（幂等键）+ `tool_version` + `mode` +
+       `feedback_mode` + `authorization_ref`（登记时生效的那条授权修订）。
+    4. **状态**：`state` + `error_code` + `result_ref` + 时间戳 + 租约。
+
+    ## 约束
+
+    - `UNIQUE(actor_id, window_id, request_key)`：同一个人在同一窗口里重发
+      同一个 `request_key` 必须命中**同一个**作业，而不是排第二个。跨窗口不
+      合并——两个窗口的授权与可见性不同，合并等于让 A 窗口的读取结果进 B 窗口。
+    - **部分唯一索引** `(evidence_id, tool_version) WHERE state IN
+      ('pending','running')`：同一证据同一版本最多一个在途作业。为什么是部分
+      索引而不是普通唯一约束：终态之后**允许**再排一次（用户可能想再读一遍，
+      或上次失败想重试），只是不允许"同一个证据同时有两个在途读取"——那会
+      两次视觉调用、两次收费，而结果写的是同一行证据。
+    """
+
+    __tablename__ = "media_read_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id", "window_id", "request_key", name="uq_media_read_job_request"
+        ),
+        # 在途互斥（部分唯一索引）。`postgresql_where` 让 SQLite 之类的方言
+        # 仍能建表（本项目生产用 PG，测试库也是 PG，但迁移可回滚性依赖方言
+        # 不报错）。
+        Index(
+            "uq_media_read_job_active_evidence",
+            "evidence_id",
+            "tool_version",
+            unique=True,
+            postgresql_where=text("state IN ('pending', 'running')"),
+            sqlite_where=text("state IN ('pending', 'running')"),
+        ),
+        Index("ix_media_read_jobs_actor_window", "actor_id", "window_id"),
+        # 清理任务（第 3 步）按 state + deadline 扫过期/失联作业。
+        Index("ix_media_read_jobs_state_deadline", "state", "deadline"),
+        Index("ix_media_read_jobs_lease", "lease_owner", "lease_until"),
+    )
+
+    call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    window_id: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_id: Mapped[str] = mapped_column(String(64), index=True)
+
+    # --- 因果：谁在什么时候要求的（**只用于审计，不作准入判据**）---
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 同一轮的第几次尝试。重试不删除已交付文本（与 messages.attempt 同语义）。
+    source_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- 协议 ---
+    request_key: Mapped[str] = mapped_column(String(128))
+    # 工具版本：改行为就要改它。部分唯一索引按它分组。
+    tool_version: Mapped[str] = mapped_column(String(64))
+    # 首期只有 `video`（这个作业只读视频）。留字段是为了将来扩展时不用迁移。
+    mode: Mapped[str] = mapped_column(String(24), default="video")
+    # **首期固定 `evidence_only`**：只把结果写成证据，不主动补话。
+    feedback_mode: Mapped[str] = mapped_column(String(32), default="evidence_only")
+    # 登记时生效的授权修订（`consent_revisions`）。撤权后据此判"这条还该不该读"。
+    # 存的是**哪一条授权**，不是布尔：撤权审计时要指回具体的人。
+    authorization_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # --- 状态机 ---
+    # 取值见 `domains/media/jobs.py::JobState`。迁移里有 CHECK 约束兜底。
+    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    # 稳定错误码（`model_unavailable` / `download_failed` / ...），人话在接口里映射。
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 结果引用：成功时指向 **evidence_id**（描述写进那条证据，不另存一份副本）。
+    # 为什么不是复制描述正文：证据是唯一的事实载体，复制一份就有两个"最新描述"。
+    result_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 排队截止：登记 + 15 分钟。超过还没开始 → 清理任务终结为 expired。
+    deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 模型**可能已经调用**的时间。`unknown` 的判据：有它、但没有终态。
+    model_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # --- 租约（第 3 步的执行栅栏）---
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 每次抢占 +1。结果提交时带 `WHERE lease_generation = :gen`，旧代次的提交
+    # 更新行数为 0——这是"被接管的作业不会写出两份结果"的唯一保证。
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class IntentRow(Base, TimestampMixin):
     """她自己产生的「想做什么」——一个跨轮的待办念头。
 
@@ -2558,6 +2681,7 @@ __all__ = [
     "Subject",
     "Turn",
     "User",
+    "MediaReadJob",
     "Window",
     "WindowContext",
     "utcnow",

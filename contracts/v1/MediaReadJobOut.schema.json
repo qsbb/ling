@@ -1,0 +1,155 @@
+{
+  "$defs": {
+    "MediaReadJobState": {
+      "description": "`media_read_jobs.state` 的契约镜像（与 `domains/media/jobs.JobState` 同值）。\n\n## 为什么契约里再写一份\n\n契约是**对外**的词表，域内的枚举是**实现**。两边直接共用一个类型会让\n\"改实现\"变成\"改 API\"——而这两个变化的影响面完全不同（前者可能要迁移\n历史行，后者前端会炸）。所以契约这里显式列一遍，并有测试断言两边**逐字\n相同**：多一个少一个都会红。",
+      "enum": [
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "unknown",
+        "timeout",
+        "cancelled",
+        "expired",
+        "budget_denied"
+      ],
+      "title": "MediaReadJobState",
+      "type": "string"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/MediaReadJobOut.schema.json",
+  "additionalProperties": false,
+  "description": "一次视频后台取证作业的**当前状态**（登记返回 202，查询返回同形状）。\n\n## 三条文案纪律（裁决 §3）\n\n1. **入队不等于读到结果**：`state=pending` 的 `note` 只能是\"已安排，尚未\n   读到结果\"，不许出现\"看完了/我看到了\"这类已完成语。文案由**服务端**\n   固定映射，前端直接显示 `note`，不要自己拼。\n2. `unknown` **不等于失败**：它的文案必须说\"不确定\"，因为模型可能已经\n   调用过、只是结果没落库。把它说成失败会让人以为可以安全重试，而重试\n   可能第二次收费。\n3. `error_code` 是稳定码（给日志与测试），人话在 `note` 里。",
+  "properties": {
+    "call_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Call Id",
+      "type": "string"
+    },
+    "cancel_requested_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cancel Requested At"
+    },
+    "completed_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completed At"
+    },
+    "deadline": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Deadline"
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Code"
+    },
+    "evidence_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Evidence Id",
+      "type": "string"
+    },
+    "feedback_mode": {
+      "title": "Feedback Mode",
+      "type": "string"
+    },
+    "note": {
+      "title": "Note",
+      "type": "string"
+    },
+    "requested_at": {
+      "format": "date-time",
+      "title": "Requested At",
+      "type": "string"
+    },
+    "result_ref": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Result Ref"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Started At"
+    },
+    "state": {
+      "$ref": "#/$defs/MediaReadJobState"
+    },
+    "window_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Window Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "call_id",
+    "window_id",
+    "evidence_id",
+    "state",
+    "note",
+    "requested_at",
+    "feedback_mode"
+  ],
+  "title": "MediaReadJobOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

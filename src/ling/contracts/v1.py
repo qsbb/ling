@@ -489,6 +489,68 @@ class RecallProposalOut(StrictModel):
     created_at: datetime
 
 
+# ---------------------------------------------------------------- 视频后台取证作业
+
+class MediaReadJobState(StrEnum):
+    """`media_read_jobs.state` 的契约镜像（与 `domains/media/jobs.JobState` 同值）。
+
+    ## 为什么契约里再写一份
+
+    契约是**对外**的词表，域内的枚举是**实现**。两边直接共用一个类型会让
+    "改实现"变成"改 API"——而这两个变化的影响面完全不同（前者可能要迁移
+    历史行，后者前端会炸）。所以契约这里显式列一遍，并有测试断言两边**逐字
+    相同**：多一个少一个都会红。
+    """
+
+    pending = "pending"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    unknown = "unknown"
+    timeout = "timeout"
+    cancelled = "cancelled"
+    expired = "expired"
+    budget_denied = "budget_denied"
+
+
+class MediaReadJobOut(StrictModel):
+    """一次视频后台取证作业的**当前状态**（登记返回 202，查询返回同形状）。
+
+    ## 三条文案纪律（裁决 §3）
+
+    1. **入队不等于读到结果**：`state=pending` 的 `note` 只能是"已安排，尚未
+       读到结果"，不许出现"看完了/我看到了"这类已完成语。文案由**服务端**
+       固定映射，前端直接显示 `note`，不要自己拼。
+    2. `unknown` **不等于失败**：它的文案必须说"不确定"，因为模型可能已经
+       调用过、只是结果没落库。把它说成失败会让人以为可以安全重试，而重试
+       可能第二次收费。
+    3. `error_code` 是稳定码（给日志与测试），人话在 `note` 里。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    call_id: IdStr
+    window_id: IdStr
+    evidence_id: IdStr
+    state: MediaReadJobState
+    #: 服务端固定映射的人话。前端直接显示。
+    note: str
+    #: 稳定错误码（只在非成功终态出现）。不是给人看的。
+    error_code: str | None = None
+    #: 成功时指向 `evidence_id`（描述写在那条证据上，不复制一份）
+    result_ref: IdStr | None = None
+    requested_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    #: 排队截止时间。过了它还没开始就等于"排不上了"（`expired`）。
+    deadline: datetime | None = None
+    #: 用户请求过取消的时间。**非空不等于已取消**：`running` 时它表示
+    #: "已请求，正在尽力停"，状态仍是 `running`。
+    cancel_requested_at: datetime | None = None
+    #: 这个入口首期**只产出证据**，不主动补话。回给前端是为了让它别承诺
+    #: "她稍后会说"。
+    feedback_mode: str
+
+
 # ---------------------------------------------------------------- 会话与轮次
 
 
@@ -1578,6 +1640,8 @@ class ErrorResponse(StrictModel):
 
 
 __all__ = [
+    "MediaReadJobState",
+    "MediaReadJobOut",
     "RecallReceipt",
     "RecallMessageOut",
     "RecallProposalOut",
