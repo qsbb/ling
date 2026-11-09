@@ -143,6 +143,19 @@ class _TextRouter:
         self._text = text
         self.generation_calls = 0
 
+    @property
+    def quota(self):  # noqa: ANN201
+        """转发给被包裹的真 router。
+
+        不是为了让桩"不报错"才加的：`kernel/turn.py` 会读 `router.quota` 去查
+        今天的看视频额度（那是**真实**的调用路径，每轮都会走）。桩少了这个
+        属性，这条路就只能测到 AttributeError，测不到它本来的行为。
+
+        转发而不是伪造一个空账本：额度判断的语义（有账本 = 可查）必须和
+        生产一致，否则"额度用完了"这条分支在集成测试里永远测不到。
+        """
+        return self._inner.quota
+
     async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
         from ling.models.router import StreamOutcome
         from ling.ports.model import ModelChunk
@@ -201,7 +214,20 @@ async def test_washed_empty_body_is_reported_not_delivered(logged_in: TestEnv) -
     _install(logged_in, fake)
     await _bind(logged_in)
 
-    body = await _post_with_text(logged_in, "<<看视频 m3>>", "那个视频呢")
+    # 用网页没开视频的标记形式：这一轮她只写了一个标记，剥完正文就成了空串，
+    # 正是"被出口清洗洗空"的场景。
+    #
+    # 注意标记本身会触发**第二次**生成（`turn.py` 的
+    # `_follow_up_after_watch`：看不到视频时也要按人设自然回一句），所以这里
+    # 不能用 `_post_with_text` 的"生成恰好一次"断言——那是媒体链路出现之前
+    # 的旧前提。改为直接投递、只断言**出口**的行为。
+    stub = _TextRouter(logged_in.app.state.router, "<<看视频 m3>>")
+    logged_in.app.state.router = stub
+    try:
+        body = await _post(logged_in, _event_body("那个视频呢", message_id=801))
+    finally:
+        logged_in.app.state.router = stub._inner
+    assert stub.generation_calls >= 1, "生成没被调用，测到的不是出站链路"
 
     assert body["decision"] == "reply"
     assert body["delivered"] is False
