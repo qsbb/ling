@@ -63,3 +63,10 @@ tests/e2e/node_modules
 
 # 个人交接笔记属于工作文档，不是产品文档：只留本地 .data/handoffs/，不进公开仓库
 docs/HANDOFF-*.md
+
+# 设计阶段的方案/勘察/评审文档：只在本地参考，不推送。
+#
+# 这些是"想清楚怎么做"的中间产物，不是产品文档——口径会随讨论变，
+# 推上去等于给一份随时过期的承诺。定下来的口径写进 docs/ 顶层的
+# 正式文档（如 MODEL-PROVIDER-EXPANSION.md）。
+docs/design/
