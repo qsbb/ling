@@ -250,7 +250,17 @@ async def test_plan_window_end_completes_activity(logged_in: TestEnv) -> None:
     now = datetime.now(UTC)
     async with session_scope() as session:
         agenda = AgendaService(session, actor_id=ACTOR)
-        await agenda.set_routine(timezone="Asia/Shanghai", wake_minute=0, rest_minute=1439)
+        # **窗口要真的全程醒着**：`is_awake` 按 `[wake, rest)` 判，而 `rest` 与
+        # `wake` 相等时"默认醒着"——那是唯一能保证测试不受运行时刻影响的口径。
+        #
+        # 这里原来写的是 `wake_minute=0, rest_minute=1439`（即 23:59 睡），
+        # 于是**每天 23:59 那一分钟**跑 CI 会假失败：`handle_life_tick` 的
+        # "该歇了"分支先 `return`，根本走不到下面的收尾逻辑，断言 `completed`
+        # 拿到空列表。2026-11-10 的 CI（UTC 15:50 = 上海 23:50 起跑，跑到
+        # 23:59 边界）就是这样红的——产品逻辑没错，是测试假设"永远醒着"
+        # 不成立。改成 wake == rest 之后，按 `is_awake` 的既定语义永远是醒着，
+        # 这个用例就与运行时刻无关了。
+        await agenda.set_routine(timezone="Asia/Shanghai", wake_minute=0, rest_minute=0)
         await agenda.propose_plan(
             kind="reading",
             title="读会儿书",
