@@ -28,7 +28,16 @@
    `*.models` / `*.table` 之类会 FAIL——"跨域读投影可以，改别人的表不行"
    （ADR-0001 §2）。
 
-## 7 处为什么不修掉
+## 这些为什么不修掉
+
+### 人格多实例新增的 3 处（agenda / conversation / dream → persona.service）
+
+原来这三处读的是环境变量 `LING_PERSONA_ID`（或是写死的 id）。人格变成
+「多套并存 + 可切换」之后，「现在用哪一套」只能问 persona 域——别处各读一遍
+配置就是第二份判据，症状是「在设置里切了人格，日程/梦/新窗口还在用旧的」。
+三处都只调公开的 `active_persona_id()` / `active_persona_view()`，
+不 import 实现模块 `persona.current`、不读不写 personas 表，符合
+ADR-0001「跨域读投影可以，改别人的表不行」。
 
 逐处评估过（每处都在 `ALLOWED` 里写了理由）。共同点是：**都通过邻居域
 的公开 service 方法访问，没有任何一处 import 别人的 models/表，也没有
@@ -160,6 +169,27 @@ ALLOWED: dict[tuple[str, str], str] = {
         "「她自己说过过会儿要处理的事」到点了——这是主动候选的一类来源，"
         "IntentService.due(now=) 是它的唯一入口。主动域的工作本来就是"
         "巡视别的域的到期项，这不是实现细节泄漏，而是数据源。"
+    ),
+    ("agenda/timeline.py", "ling.domains.persona.service"): (
+        "日程投影要带「她是谁」（人格名 / 性格 / 场景偏好的结构化短项）。"
+        "多套人格之后这个答案不再是环境变量，而是已发布配置里的当前人格"
+        "（`configured_persona_id()`），读它必须问 persona 域——"
+        "别处各读一遍配置就是第二份判据。只调公开的 "
+        "`PersonaService.active_persona_id` / `active_persona_view`，"
+        "不 import `persona.current`（实现模块）、不碰 personas 表、不拼 SQL；"
+        "人格的所有权仍在 persona 域。函数内 import 是为了避开导入期循环。"
+    ),
+    ("conversation/service.py", "ling.domains.persona.service"): (
+        "新建窗口时要把「创建那一刻生效的是哪一套人格」写进 "
+        "`windows.persona_id`（窗口归属是人格切换「整套换」的落点：旧窗口不该"
+        "被后续切换重新解释）。不传 persona_id 时才问 persona 域的公开入口 "
+        "`active_persona_id()`；不 import `persona.current`、不读 personas 表。"
+        "函数内 import，且只在「没有显式指定」时发生。"
+    ),
+    ("dream/service.py", "ling.domains.persona.service"): (
+        "梦里的性格线索取自**当前生效**的那一套人格（traits）。切换人格之后"
+        "仍读环境变量会让梦一直梦到旧人设。只调公开的 `active_persona_id()`，"
+        "然后按 id 读自己的投影；不 import `persona.current`、不写 personas 表。"
     ),
     ("proactive/sources.py", "ling.domains.goals.service"): (
         "「承诺将到期」是用户明确要求过的主动联系，GoalsService."
@@ -310,7 +340,7 @@ def test_domains_root_exists_and_scans_real_files() -> None:
 
 
 def test_no_cross_domain_imports() -> None:
-    """真实代码里不允许跨域直接 import（已知 7 处见 ALLOWED）。"""
+    """真实代码里不允许跨域直接 import（已知条目见 ALLOWED，每处都有理由）。"""
     # 先确认扫描不是空的——否则下面的断言会因为"什么都没扫到"而假绿。
     assert _python_files(), f"没有扫描到任何文件：{DOMAINS_ROOT} 指错了"
 

@@ -349,11 +349,22 @@ def _slot_issues(payload: dict, providers: dict[str, dict]) -> list[ValidationIs
 class ConfigService:
     def __init__(
         self, session: AsyncSession, secret_box: SecretBox, *, test_mode_default: bool = True,
-        persona_id: str = "persona_ling", log_denials_default: bool = True
+        # ``None`` = 读 `Settings.persona_id`（即 ``LING_PERSONA_ID``）。
+        # 默认值不再写字面量 ``"persona_ling"``：那会让"环境变量里换了人格"
+        # 在没发布过修订的部署上静默失效。
+        persona_id: str | None = None, log_denials_default: bool = True
     ) -> None:
         self._session = session
         self._box = secret_box
         self._test_mode_default = test_mode_default
+        # 没显式给就取环境变量（`Settings.persona_id` ← `LING_PERSONA_ID`）。
+        # **只在"没有已发布修订"时用得到**：发布过修订之后，人格以修订里的
+        # `persona_id` 为准（见 `effective()` 传给 `effective_from_payload`
+        # 的 `persona_default`）。这正是"环境变量只作初始默认"的那条线。
+        if persona_id is None:
+            from ling.config import get_settings
+
+            persona_id = get_settings().persona_id
         self._persona_id = persona_id
         # `LING_LOG_ACCESS_DENIALS`。只在"没有已发布修订"或"修订里没有这个键"
         # （旧修订）时兜底；发布过带该键的修订之后以修订为准。
@@ -764,6 +775,55 @@ class ConfigService:
     async def rollback(self, to_revision: int) -> int:
         """回滚 = 把历史修订重新发布为当前生效（不复制 payload 内容）。"""
         return await self.publish(to_revision)
+
+    async def set_active_persona(self, persona_id: str, *, changed_by: str | None = None) -> int:
+        """切换当前激活的人格 = 改 ``persona_id`` 并**发布一条新修订**。
+
+        ## 为什么走"保存草稿 + 立即发布"，而不是直接改已发布那行
+
+        1. **原子**：两条 SQL 在同一个事务里，中间没有"草稿已存、还没发布"的
+           半成状态；任一步失败整笔回滚，人格不会停在"改了一半"。
+        2. **可回滚**：人格跟着修订走，``POST /settings/rollback`` 回到上一版
+           修订时，人格也一起回去。这是"当前人格即配置"这个设计真正的好处。
+        3. **跨进程可见**：别的副本与 worker 靠修订号变化感知，不需要新机制。
+
+        只改 ``persona_id`` 一个键：其余键从当前生效快照原样带过来
+        （``payload_from_effective``），供应商、职责、记忆策略一个字都不动。
+
+        不在这里校验"这一行存在"：那是人格域的判据
+        （``PersonaService.get`` / 路由层），重复一份会分叉。
+        """
+        persona_id = str(persona_id or "").strip()
+        if not persona_id:
+            raise LingError(
+                ErrorCode.invalid_request, "persona_id 不能为空", status_code=422
+            )
+        base = await self.effective()
+        payload = payload_from_effective(base)
+        payload["persona_id"] = persona_id
+        issues = await self.validate_payload(payload)
+        blocking = [i for i in issues if i.blocking]
+        if blocking:
+            # 与手动「保存草稿」同一条路：切换人格不能绕过发布前校验，
+            # 否则会出现"点一下切换就把配置发布成非法状态"。
+            raise LingError(
+                ErrorCode.config_invalid,
+                "当前配置校验未通过，不能切换人格",
+                status_code=422,
+                detail="; ".join(f"{i.field}: {i.message}" for i in blocking),
+            )
+        row = ConfigRevision(
+            id=new_id("cfg"),
+            revision=await self._next_revision_number(),
+            state="draft",
+            payload=payload,
+            validation_errors=[i.to_dict() for i in issues],
+            created_by=changed_by,
+            note=f"切换人格 → {persona_id}",
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return await self.publish(row.revision, published_by=changed_by)
 
     async def _next_revision_number(self) -> int:
         latest = (

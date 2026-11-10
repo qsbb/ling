@@ -43,7 +43,8 @@ class QQIngress:
         connector: QQConnector,
         *,
         actor_id: str = "actor_ling",
-        persona_id: str = "persona_ling",
+        # ``None`` = 用当前激活的人格（`ling.domains.persona.current`）。
+        persona_id: str | None = None,
     ) -> None:
         self._session = session
         self._connector = connector

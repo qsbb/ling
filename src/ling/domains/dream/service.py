@@ -1060,12 +1060,18 @@ class DreamService:
     # ---------------------------------------------------------- 小工具
 
     async def _resolve_persona_id(self) -> str:
-        from ling.config import get_settings
+        # 读**已发布配置**里的当前激活人格（与提示词注入同一个来源），
+        # 而不是环境变量：环境变量只在"还没有任何已发布修订"时才有意义，
+        # 在设置里切换人格之后它就是个过期值。
+        from ling.domains.persona.service import active_persona_id
 
         try:
-            return get_settings().persona_id
-        except Exception:  # noqa: BLE001 - 配置不可读时用默认 id
-            return "persona_ling"
+            return await active_persona_id(self._session)
+        except Exception:  # noqa: BLE001 - 配置不可读时返回空串 = 没人格
+            # 不再回落到字面量 ``"persona_ling"``：那个 id 在新装库里根本
+            # 不存在，回落等于"编一个人格 id 出来"，查不到行又会被当成
+            # "人设被清空了"。空串的语义是明确的"没有"。
+            return ""
 
     async def _display_name(self) -> str:
         persona = await self._session.get(Persona, await self._resolve_persona_id())

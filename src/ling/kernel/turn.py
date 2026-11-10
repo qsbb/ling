@@ -585,7 +585,12 @@ class TurnCoordinator:
         *,
         router: ModelRouter,
         actor_id: str,
-        persona_id: str,
+        # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`）。
+        # 协调器是长生命周期对象（worker 的延后回复、API 的 SSE 流各建一个），
+        # 在构造时把 ``settings.persona_id`` 记下来，等于"服务启动之后切换
+        # 的人格对这个协调器永远无效"。传 ``None`` 之后，每一轮在自己的
+        # 会话里解析（见 `_resolve_persona_id`）。
+        persona_id: str | None,
         cancels: CancelRegistry,
         # 她的显示名。用于剥掉"她：…"这种照抄示例格式的前缀。
         display_name: str = "",
@@ -638,6 +643,26 @@ class TurnCoordinator:
         self._speak_lease = speak_lease
         self._secret_reader = secret_reader
         self._deliver_gate = deliver_gate
+
+    async def _resolve_persona_id(self, session: object) -> str:
+        """这一轮用哪套人格：显式传入的优先，否则读**当前激活**的那一套。
+
+        只在**显式没有给**时才解析。解析放在方法里而不是构造时：一个
+        ``TurnCoordinator`` 可以被多轮复用（SSE 流与延后回复都是），
+        用户在中间切换了人格，下一轮就该用新的那一套。
+
+        解析失败（配置读不出来）时返回空串 = "没有人格"：不能让一个
+        读配置的错误把整轮对话打挂，也不能真的编一个 id 出来。
+        """
+        if self._persona_id:
+            return str(self._persona_id)
+        try:
+            from ling.domains.persona.current import effective_persona_id
+
+            return await effective_persona_id(session)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - 配置不可读时按"没有人格"处理
+            logger.info("解析当前人格失败（本轮按无人格处理）")
+            return ""
 
     def partial_text(self, turn_id: str) -> str:
         """已经流出来的**部分**正文（内存态）。
@@ -778,8 +803,12 @@ class TurnCoordinator:
                     )
 
             async with session_scope() as session:
+                # 这一轮用哪套人格：**在本轮自己的会话里解析一次**，之后整轮
+                # 一致（窗口归属、提示词、角色事件都同一个 id）。解析在这里
+                # 而不是构造时——协调器可能跨多轮复用，中间切换人格要能生效。
+                persona_id = await self._resolve_persona_id(session)
                 conversation = ConversationService(
-                    session, actor_id=self._actor_id, persona_id=self._persona_id
+                    session, actor_id=self._actor_id, persona_id=persona_id
                 )
                 # 先把状态推进到 streaming（= 服务端已受理）。
                 # 上下文编译含记忆检索/关系/情绪等多条查询，真实模型场景可能耗时
@@ -821,7 +850,7 @@ class TurnCoordinator:
                 compiled = await ContextCompiler(
                     session,
                     actor_id=self._actor_id,
-                    persona_id=self._persona_id,
+                    persona_id=persona_id,
                     memory_policy=config.memory,
                     # 嵌入/重排的绑定也随这一轮快照走：同一轮内的检索不该
                     # 因为别人在设置页换了模型而中途换掉向量空间。
@@ -1299,8 +1328,12 @@ class TurnCoordinator:
             # 进程关闭或超时强制取消：尽力落库
             try:
                 async with session_scope() as session:
+                    # 被取消时也要落库：这里重新解析一次人格（与主路径同一口径），
+                    # 否则 `persona_id=None` 的协调器会把空 id 写进角色事件。
                     conversation = ConversationService(
-                        session, actor_id=self._actor_id, persona_id=self._persona_id
+                        session,
+                        actor_id=self._actor_id,
+                        persona_id=await self._resolve_persona_id(session),
                     )
                     await self._finalize(
                         conversation=conversation,
@@ -1982,7 +2015,10 @@ class TurnCoordinator:
             # 「她：」前缀。这是格式残留，不是她的表达——剥掉。
             from ling.capabilities.naming import display_name_for, strip_self_prefix
 
-            _name = self._display_name or await display_name_for(self._persona_id)
+            # `self._persona_id` 可能为 None（= 每一轮现解析）；这种协调器
+            # 没有"本轮人格"的记忆，剥前缀就用空 id（`display_name_for("")`
+            # 返回空串 → 不剥任何前缀），而不是拿 None 去查缓存。
+            _name = self._display_name or await display_name_for(self._persona_id or "")
             _cleaned, _stripped = strip_self_prefix(delivered, _name)
             if _stripped:
                 delivered = _cleaned
@@ -2207,8 +2243,13 @@ class TurnCoordinator:
             )
             await conversation.session.flush()
 
+        # 角色事件的 `persona_id` 必须是**本轮真正用的那一套**。协调器可能
+        # 拿到 None（= 每轮现解析），所以这里退回"这一轮对话服务手上那个 id"
+        # ——它就是 `run_turn` 开头解析出来、本轮回话所归属的人格。
         sequencer = ActorSequencer(
-            conversation_session(conversation), actor_id=self._actor_id, persona_id=self._persona_id
+            conversation_session(conversation),
+            actor_id=self._actor_id,
+            persona_id=getattr(conversation, "persona_id", None) or self._persona_id or "",
         )
         await sequencer.commit_event(
             type=f"turn.{state.value}",

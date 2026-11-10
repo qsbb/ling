@@ -514,7 +514,9 @@ def scenario_key_for(ctx: DecisionContext) -> str:
     return "group_unaddressed"
 
 
-def make_persona_reader(session: object, *, persona_id: str, scenario: str | None = None):
+def make_persona_reader(
+    session: object, *, persona_id: str | None, scenario: str | None = None
+):
     """构造人设读取器。把人设带进"要不要开口"的决策里。
 
     之前决策只知道场景和处境，**不知道她是谁**——于是四个群聊场景
@@ -529,7 +531,15 @@ def make_persona_reader(session: object, *, persona_id: str, scenario: str | Non
         from ling.domains.persona.scenarios import render
         from ling.domains.persona.service import PersonaService
 
-        view = await PersonaService(session, persona_id).get(persona_id)  # type: ignore[arg-type]
+        # ``persona_id=None`` 时由服务解析**当前激活**的人格（`persona_id` 参数
+        # 只是"这一轮已经解析过就复用"的快捷通道，不引入第二个真相来源）。
+        # ``get_or_none``：没人格时返回空视图，下面的分支会拼出空串——
+        # 也就是"决策里没有人设可参考"，而不是异常或伪造的人设。
+        view = await PersonaService(session, persona_id).get_or_none(persona_id)  # type: ignore[arg-type]
+        if view is None:
+            from ling.domains.persona.service import empty_persona_view
+
+            view = empty_persona_view(str(persona_id or ""))
         from ling.domains.persona.service import format_traits
 
         parts: list[str] = []

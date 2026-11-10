@@ -146,7 +146,14 @@ async def test_lane_budget_is_enforced(logged_in: TestEnv) -> None:
         from ling.kernel.context import DEFAULT_BUDGETS
 
         need_chars = DEFAULT_BUDGETS["persona"] * 2 + 500
-        await persona.update(system_prompt="设定" * (need_chars // 2 + 10))
+        # 新装不再自动建行（2026-11-11）：先按当前激活 id 建行，再写入超长正文。
+        from ling.domains.persona import current as persona_current
+
+        active_id = await persona_current.effective_persona_id(session)
+        await persona.create(
+            persona_id=active_id,
+            system_prompt="设定" * (need_chars // 2 + 10),
+        )
 
     session_id, subject_id = await _window(logged_in)
     async with session_scope() as session:
@@ -473,10 +480,14 @@ async def test_private_turn_injects_private_scenario_only(logged_in: TestEnv) ->
     await logged_in.client.put(
         "/v1/persona",
         json={
+            # 场景覆盖不是"人设是否为空"的判据：空人设时场景段会整段跳过
+            # （连角色名都没有的一句"此刻的场景"是没有主语的），所以这里
+            # 必须先有一句正文。见 `domains/persona/service.persona_is_empty`。
+            "system_prompt": "你是心夏。",
             "scenario_prompts": {
                 "private": "私聊里可以顺着对方的话多聊两句",
                 "group": "群里只接一句就走",
-            }
+            },
         },
     )
     session_id, subject_id = await _window(logged_in)
@@ -498,10 +509,14 @@ async def test_group_turn_injects_group_scenario_without_private_override(
     await logged_in.client.put(
         "/v1/persona",
         json={
+            # 场景覆盖不是"人设是否为空"的判据：空人设时场景段会整段跳过
+            # （连角色名都没有的一句"此刻的场景"是没有主语的），所以这里
+            # 必须先有一句正文。见 `domains/persona/service.persona_is_empty`。
+            "system_prompt": "你是心夏。",
             "scenario_prompts": {
                 "private": "私聊里可以顺着对方的话多聊两句",
                 "group": "群里只接一句就走",
-            }
+            },
         },
     )
     session_id, subject_id = await _window(logged_in, visibility="group_scope")
@@ -517,10 +532,21 @@ async def test_group_turn_injects_group_scenario_without_private_override(
     assert "顺着对方的话多聊两句" not in scenario
 
 
-async def test_scenario_lane_uses_default_when_not_overridden(logged_in: TestEnv) -> None:
-    """没写覆盖时也要有提示——默认值不是文档，是要进提示词的。"""
+async def test_scenario_lane_is_skipped_when_not_overridden(logged_in: TestEnv) -> None:
+    """没写覆盖时**不注入**场景内置默认。
+
+    语义变更（2026-11-11，用户要求"空人设什么都不注入（最彻底）"）：内置默认
+    是"场景行为规则"，属于人设的一部分；用户没写过就不该替用户发出去，
+    否则它就是一个写不到、也删不掉的隐藏人设。
+
+    这条断言与它原来的写法**方向相反**，所以名字也改了——原来叫
+    `..._uses_default_when_not_overridden`，断言的是"默认值必须进提示词"。
+    """
     from ling.domains.persona.scenarios import SCENARIO_BY_KEY
 
+    await logged_in.client.put(
+        "/v1/persona", json={"system_prompt": "你是心夏。"}
+    )
     session_id, subject_id = await _window(logged_in)
     async with session_scope() as session:
         compiled = await ContextCompiler(session).compile(
@@ -529,5 +555,6 @@ async def test_scenario_lane_uses_default_when_not_overridden(logged_in: TestEnv
             user_text="嗨",
             is_group=False,
         )
-    assert "此刻的场景" in _lane_text(compiled, "scenario")
-    assert SCENARIO_BY_KEY["private"].default in _lane_text(compiled, "scenario")
+    scenario = _lane_text(compiled, "scenario")
+    assert scenario == "", f"没写过覆盖却注入了场景提示：{scenario!r}"
+    assert SCENARIO_BY_KEY["private"].default not in scenario

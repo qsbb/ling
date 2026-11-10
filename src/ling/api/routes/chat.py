@@ -67,7 +67,10 @@ def _coordinator(request: Request, settings: SettingsDep, router_: RouterDep) ->
     return TurnCoordinator(
         router=router_,
         actor_id=settings.actor_id,
-        persona_id=settings.persona_id,
+        # ``None`` = 本轮用**当前激活**的人格（`domains/persona/current.py`）。
+        # 原来是 `settings.persona_id`（环境变量），在设置里切了人格之后
+        # Web 对话仍然按旧人设跑——而且不会报错。
+        persona_id=None,
         cancels=request.app.state.cancels,
         arbiter=getattr(request.app.state, "arbiter", None),
         stream_log=getattr(request.app.state, "stream_log", None),
@@ -144,7 +147,7 @@ async def _choose_by_autonomy(
         ),
         persona_reader=make_persona_reader(
             config_session,
-            persona_id=__import__("ling.config", fromlist=["get_settings"]).get_settings().persona_id,
+            persona_id=None,  # None = 当前激活的人格
             scenario=scenario_key_for(ctx),  # type: ignore[arg-type]
         ),
     ).choose(ctx, text=text)  # type: ignore[arg-type]
@@ -233,7 +236,9 @@ async def _refresh_config_if_stale(request: Request) -> None:
                 session,
                 cache=request.app.state.secret_cache,
                 box=request.app.state.secret_box,
-                persona_id=settings.persona_id,
+                # 不走环境变量：没传就让 `ConfigService` 从 `Settings` 取
+                # （唯一来源），避免"这里抄一份、那里抄一份"。
+                persona_id=None,
                 test_mode_default=settings.test_mode,
                 diagnosis=getattr(request.app.state, "secret_diagnosis", None),
             )

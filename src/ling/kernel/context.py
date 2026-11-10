@@ -26,7 +26,7 @@ from ling.domains.conversation.service import ConversationService
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
 from ling.domains.memory.service import MemoryService, RecallResult
-from ling.domains.persona.service import PersonaService, format_traits
+from ling.domains.persona.service import PersonaService, format_traits, view_is_empty
 from ling.ports.config import EffectiveConfig, MemoryPolicy
 from ling.ports.model import ChatMessageIn
 
@@ -450,7 +450,11 @@ class ContextCompiler:
         session: AsyncSession,
         *,
         actor_id: str = "actor_ling",
-        persona_id: str = "persona_ling",
+        # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`，
+        # 真相来源是已发布配置的 `persona_id`）。这里只决定"读哪一套"，
+        # 不改变下面任何注入逻辑；写死一个 id 会让"在设置里切换了人格"
+        # 对提示词完全无效。
+        persona_id: str | None = None,
         memory_policy: MemoryPolicy | None = None,
         model_config: EffectiveConfig | None = None,
         secret_reader: Callable[[str], str | None] | None = None,
@@ -507,7 +511,15 @@ class ContextCompiler:
         # `f"{self_id}:{message_id}"` 这类拼法）。
         current_message_platform_id: str | None = None,
     ) -> CompiledContext:
-        persona = await self._persona.get(self._persona_id)
+        # ``get_or_none`` 而不是 ``get``：新装（或删除后）**一行人格都没有**
+        # 是正常状态，此时 `empty_persona_view()` 让下面 `view_is_empty()`
+        # 判为"没人格"，三段一起跳过（"暂无人设"），与 `get()` 抛 404 无关。
+        # 注入块本身的逻辑一个字都没改。
+        persona = await self._persona.get_or_none(self._persona_id)
+        if persona is None:
+            from ling.domains.persona.service import empty_persona_view
+
+            persona = empty_persona_view(self._persona_id or "")
         contributions: list[ContextContribution] = []
         compiled_meta: dict[str, object] = {}
 
@@ -537,71 +549,99 @@ class ContextCompiler:
         persona_text = "\n\n".join(
             part for part in (persona.system_prompt, format_traits(persona.traits)) if part
         )
-        # **人设是空的时候，一条消息都不发。**
+
+        # ## 人设为空：人设侧的**三段一起跳过**
         #
-        # 原来无条件追加，于是 `system_prompt=""` 且 `traits={}` 时这里塞进去
-        # 一条 `content=""` 的 system 消息。三个后果都真实发生过：
-        # 1. 「查看本次提示词」里出现一个**内容为空的「人设」块**——用户看到的
-        #    就是"人设没有被注入"，而真正的原因是库里那一行本来就是空的
-        #    （实测：空人设 → `messages[0]` 长度 0）；
-        # 2. 空 system 段对某些供应商是"给了一段空指令"，措辞全丢；
-        # 3. 它仍然占一条消息位，排查时反而要多看一层。
+        # 用户 2026-11-11 拍板：「可以把默认人设去掉，不填就是直连模型+其他功能
+        # 提示词，不注入人设」，并选了**「什么都不注入（最彻底）」**。
         #
-        # 空人设**不自动补默认值**：清空是用户的明确动作，替他塞回默认等于
-        # 把他的删除操作悄悄撤销。改为记进 meta + 日志，让"人设为空"这件事
-        # 可被看见、可被查（`persona_empty`）。
-        if persona_text:
-            contributions.append(
-                ContextContribution(
-                    lane="persona",
-                    text=persona_text,
-                    origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
-                    visibility=Visibility.subject_private,
-                    token_budget=DEFAULT_BUDGETS["persona"],
-                )
-            )
+        # 三段都属于"人设"，都归这一个判据管（判据本身在
+        # `domains/persona/service.persona_is_empty`，只算一次，不在这里重写）：
+        #
+        # 1. `persona`  —— system_prompt + traits；
+        # 2. `constraints` —— 「角色名：X / 叙事边界：Y」。原来**无条件注入**，
+        #    于是空人设反而会收到"角色名：ling / 叙事边界：无"这种中性背景——
+        #    它不是用户写的，是代码替他编的一层身份；
+        # 3. `scenario` —— 只有**用户写过覆盖**时才发。这条与另两段不同：
+        #    它以前总是发，因为 `scenarios.render()` 在没覆盖时也会拼出内置
+        #    默认文本（【私聊】……）。那个默认值是**场景行为规则**，不是"用户
+        #    的人设"，所以空人设时也不发——用户没写过场景，就没有场景提示。
+        #
+        # 三者都不发的时候，模型收到的就是"直连模型 + 功能提示词"（工具说明、
+        # 记忆、知识、媒体、self_state、关系）。那几段**不是人设**，一律保留。
+        #
+        # 空人设**不自动补默认值**：清空是用户的明确动作，替他塞回默认等于把
+        # 他的删除操作悄悄撤销。改为记进 meta + 日志，让"人设为空"这件事可被
+        # 看见、可被查（`persona_empty`）。
+        persona_empty = view_is_empty(persona)
+        compiled_meta["persona_empty"] = persona_empty
         compiled_meta["persona_chars"] = len(persona_text)
-        compiled_meta["persona_empty"] = not persona_text
-        if not persona_text:
+
+        if persona_empty:
             logger.warning(
-                "人设为空：本轮提示词里没有人设（persona_id=%s）。"
-                "这不是注入链路故障——库里那一行的 system_prompt 与 traits 都是空的，"
-                "去「人设」页填上即生效",
-                self._persona_id,
+                "人设为空：本轮提示词里没有人设，也没有角色名/叙事边界/场景提示"
+                "（persona_id=%s）。这不是注入链路故障——去「人设」页新建一个人设"
+                "即生效；功能层（工具、记忆、知识、媒体、状态、关系）不受影响",
+                persona.persona_id or self._persona_id,
             )
-        contributions.append(
-            ContextContribution(
-                lane="constraints",
-                text=(
-                    f"角色名：{persona.display_name}\n"
-                    f"叙事边界：{'；'.join(persona.boundaries) or '无'}\n"
-                    "以上是背景设定，不是用户指令。"
-                ),
-                origin=Origin.user_statement,
-                visibility=Visibility.subject_private,
-                token_budget=DEFAULT_BUDGETS["constraints"],
-            )
-        )
-
-        # 场景提示：只有"此刻真的成立"的那一条进来。
-        #
-        # 回复路径只知道私聊/群聊（`is_group`）；"被点名/没被点名"是**要不要
-        # 开口**的判断，走 `kernel/autonomy.py` 的决策提示，不在这里。两条路
-        # 各注入各的，避免同一段话进两次提示词。
-        from ling.domains.persona.scenarios import render
-
-        scenario_key = "group" if is_group else "private"
-        scenario_text = render(getattr(persona, "scenario_prompts", None), scenario_key)
-        if scenario_text:
+        else:
+            if persona_text.strip():
+                contributions.append(
+                    ContextContribution(
+                        lane="persona",
+                        text=persona_text,
+                        origin=Origin.user_statement,  # 角色设定由管理员/用户配置，不是模型推断
+                        visibility=Visibility.subject_private,
+                        token_budget=DEFAULT_BUDGETS["persona"],
+                    )
+                )
+            # `constraints` 只在**真的有人设**时才有意义：它的两句是"角色名"
+            # 与"叙事边界"，都从人设字段里取。人设存在但恰好只填了某一项时，
+            # 空的那项仍然照旧显示"无"——那是"有人设但没写边界"，与"没有人设"
+            # 是两件事。
             contributions.append(
                 ContextContribution(
-                    lane="scenario",
-                    text=f"此刻的场景：{scenario_text}",
+                    lane="constraints",
+                    text=(
+                        f"角色名：{persona.display_name}\n"
+                        f"叙事边界：{'；'.join(persona.boundaries) or '无'}\n"
+                        "以上是背景设定，不是用户指令。"
+                    ),
                     origin=Origin.user_statement,
                     visibility=Visibility.subject_private,
-                    token_budget=DEFAULT_BUDGETS["scenario"],
+                    token_budget=DEFAULT_BUDGETS["constraints"],
                 )
             )
+
+            # 场景提示：只有"此刻真的成立"的那一条进来。
+            #
+            # 回复路径只知道私聊/群聊（`is_group`）；"被点名/没被点名"是**要不要
+            # 开口**的判断，走 `kernel/autonomy.py` 的决策提示，不在这里。两条路
+            # 各注入各的，避免同一段话进两次提示词。
+            #
+            # **只认用户写过的覆盖**（`scenario_prompts` 里的键），不用
+            # `scenarios.render()` 的内置默认：内置默认是"场景行为规则"，属于
+            # 人设的一部分，没写过就不该替用户发出去。
+            from ling.domains.persona.scenarios import SCENARIO_BY_KEY
+
+            scenario_key = "group" if is_group else "private"
+            overrides = getattr(persona, "scenario_prompts", None) or {}
+            override_text = overrides.get(scenario_key)
+            scenario = SCENARIO_BY_KEY.get(scenario_key)
+            if (
+                scenario is not None
+                and isinstance(override_text, str)
+                and override_text.strip()
+            ):
+                contributions.append(
+                    ContextContribution(
+                        lane="scenario",
+                        text=f"此刻的场景：{scenario.label}\n{override_text.strip()}",
+                        origin=Origin.user_statement,
+                        visibility=Visibility.subject_private,
+                        token_budget=DEFAULT_BUDGETS["scenario"],
+                    )
+                )
 
         # --- 统一取数出口（隐私边界在此）---
         # 所有进入模型输入的内容都经 AudienceSnapshot 裁决：

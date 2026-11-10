@@ -16,6 +16,16 @@
 
 所以这里断言的都不是"函数被调用了"，而是**provider 收到的第一条 system
 消息里有什么**——这是唯一能证明"她真的看见了"的位置。
+
+## 2026-11-11：没有默认人设了
+
+用户拍板「可以把默认人设去掉，不填就是直连模型+其他功能提示词，不注入人设」，
+空人设时**什么都不注入**。所以本文件里凡是要断言"人设进了提示词"的用例，
+都**自己先写一份人设**（`_write_persona`），不再依赖库里有一份默认人设——
+依赖默认值会让"默认被删掉"这件事反过来让这些用例红，而它们本来要测的是
+**注入链路**，不是默认值。
+
+"空人设 → 人设/角色名/叙事边界/场景三段一条都不发"的用例见 §5。
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ import uuid
 import pytest
 
 from ling.domains.conversation.service import ConversationService
-from ling.domains.persona.service import DEFAULT_SYSTEM_PROMPT, PersonaService
+from ling.domains.persona.service import PersonaService
 from ling.infra.db import session_scope
 from ling.infra.models import Persona
 from ling.kernel.turn import TurnCoordinator
@@ -124,6 +134,13 @@ async def _run_turn(env: TestEnv, *, visibility: str = "subject_private") -> _Ca
     return registry.provider
 
 
+async def _private_window(env: TestEnv) -> tuple[str, str]:
+    """建一个私聊窗口，返回 `(window_id, subject_id)`，供 compile 层直接断言。"""
+    response = await env.client.post("/v1/sessions", json={"title": "人设编译"})
+    assert response.status_code == 201, response.text
+    return response.json()["session_id"], env.subject_id
+
+
 def _system_text(provider: _CapturingProvider) -> str:
     """provider 收到的全部 system 内容（按发送顺序拼接）。"""
     return "\n".join(
@@ -140,20 +157,60 @@ def _first_system(provider: _CapturingProvider) -> str:
     return ""
 
 
-# ---------------------------------------------------------------- 1. 默认人设
+async def _write_persona(
+    env: TestEnv,
+    *,
+    display_name: str = "心夏",
+    system_prompt: str = "你是心夏，一个在旧书店打工的姑娘。",
+    traits: dict | None = None,
+    boundaries: list[str] | None = None,
+    scenario_prompts: dict | None = None,
+) -> dict:
+    """写一份**用户自己的人设**并返回 API 返回体。
+
+    每个要断言"人设进了提示词"的用例都从这里开始：库里再没有默认人设可依赖，
+    而"写进去 → 下一轮真的发出去"才是这些用例真正要证明的事。
+    """
+    payload: dict[str, object] = {
+        "display_name": display_name,
+        "system_prompt": system_prompt,
+        "traits": {"tone": "自然、略带温度"} if traits is None else traits,
+        "boundaries": ["不编造现实履历"] if boundaries is None else boundaries,
+    }
+    if scenario_prompts is not None:
+        payload["scenario_prompts"] = scenario_prompts
+    response = await env.client.put("/v1/persona", json=payload)
+    assert response.status_code == 200, response.text
+    body: dict = response.json()
+    return body
 
 
-async def test_default_persona_reaches_the_model(logged_in: TestEnv) -> None:
-    """全新库的默认人设：首句 + 至少一个 trait 都在提示词里。"""
+# ---------------------------------------------------------------- 1. 写进去的人设
+
+
+async def test_written_persona_reaches_the_model(logged_in: TestEnv) -> None:
+    """用户写的人设：正文 + trait + 叙事边界都在提示词里。
+
+    这条原本断言的是"全新库的默认人设"，**默认人设已经去掉**（2026-11-11，
+    空人设什么都不注入），所以改为自己写一份再断言。它证明的东西没变：
+    人设车道真的把这三样送到了 provider。
+    """
+    await _write_persona(
+        logged_in,
+        system_prompt="你是心夏，一个在旧书店打工的姑娘。",
+        traits={"tone": "自然、略带温度"},
+        boundaries=["不编造现实履历"],
+    )
     provider = await _run_turn(logged_in)
     first = _first_system(provider)
 
     assert first, "第一条 system 消息是空的——人设根本没有发出去"
-    # 首句（前 30 字，足够定位是同一段设定）
-    assert DEFAULT_SYSTEM_PROMPT[:30] in first
+    assert "你是心夏，一个在旧书店打工的姑娘。" in first
     # 至少一个 trait（traits 是"写了就生效"的自由字段，必须真的进去）
     assert "tone：" in first
     assert "自然、略带温度" in first
+    # 叙事边界属于 constraints 段，是**另一条** system 消息，所以扫全部而不是只看第一条
+    assert "叙事边界：不编造现实履历" in _system_text(provider)
 
 
 # ---------------------------------------------------------------- 2. 改 traits 后下一轮生效
@@ -161,6 +218,7 @@ async def test_default_persona_reaches_the_model(logged_in: TestEnv) -> None:
 
 async def test_updated_traits_take_effect_next_turn(logged_in: TestEnv) -> None:
     """人设页改 traits → 下一轮提示词里就是新的（不需要重启）。"""
+    await _write_persona(logged_in)
     before = _first_system(await _run_turn(logged_in))
     assert "毒舌" not in before
 
@@ -255,47 +313,174 @@ async def test_structured_trait_is_rendered_as_language(logged_in: TestEnv) -> N
 # ---------------------------------------------------------------- 5. 空人设
 
 
-async def test_empty_persona_sends_no_empty_system_message(logged_in: TestEnv) -> None:
-    """人设为空时**不发**空 system 消息，并且这件事在日志里说得清。
+async def _ensure_no_persona_row() -> None:
+    """保证**库里一行人格都没有**（= 新装状态 = 空人设）。
 
-    空人设 ≠ 注入故障。原来会发一条 `content=""` 的 system 消息，于是
-    「查看本次提示词」里那块「人设」是空的——用户看到的就是"人设没注入"。
+    2026-11-11 起系统**不再自动建行**：新装就是"配置里那个 id 指向不存在的
+    行"，`GET /v1/persona` 返回一版全空视图 + `exists=false`，注入侧
+    `get_or_none()` 拿不到行 → 用 `empty_persona_view()` → 人设三段全跳过。
+
+    所以"制造空人设"不再需要清字段，只需要**删掉这一行**。之前那条
+    `_clear_persona_row`（把固定行的三列清空）已经不可能成功：夹具不再
+    预备 `persona_ling` 那一行，`session.get()` 拿到的就是 `None`。
     """
+    from sqlalchemy import delete
+
     async with session_scope() as session:
-        row = await session.get(Persona, PERSONA)
-        assert row is not None
-        row.system_prompt = ""
-        row.traits = {}
-        session.add(row)
+        await session.execute(delete(Persona))
+        # 窗口引用的是字符串列（无外键），删人格不会级联删窗口；
+        # 这里只清人格行，窗口留着也不影响判据。
+        await session.flush()
+
+
+async def test_empty_persona_injects_absolutely_nothing(logged_in: TestEnv) -> None:
+    """空人设 = **人设侧三段一条都不发**（用户拍板「什么都不注入（最彻底）」）。
+
+    这是 2026-11-11 的核心语义，三段都要断：
+
+    1. `persona`      —— 不再有默认正文与默认 traits；
+    2. `constraints`  —— 原来**无条件**注入「角色名：ling / 叙事边界：无」，
+       空人设反而收到一层代码替用户编的身份；
+    3. `scenario`     —— 原来私聊/群聊都会带上内置的场景默认文本（【私聊】…）。
+
+    同时断言"不是把人设删成空消息"：provider 收到的消息里没有任何一条是空的。
+    """
+    await _ensure_no_persona_row()
 
     provider = await _run_turn(logged_in)
     messages = provider.requests[0]
     assert all(str(getattr(m, "content", "")).strip() for m in messages), (
         "提示词里有空消息——空车道不该占消息位"
     )
-    # 约束车道仍在（角色名/边界），人设车道整条不发
+
     joined = _system_text(provider)
-    assert "角色名：" in joined
+    # 1. 没有人设正文，也没有默认 traits
     assert "性格倾向" not in joined
+    # 2. 没有角色名 / 叙事边界这一段
+    assert "角色名：" not in joined
+    assert "叙事边界：" not in joined
+    # 3. 没有场景提示（包括内置默认）
+    assert "此刻的场景" not in joined
+    assert "【私聊】" not in joined
+    # 默认人设的正文一个字都不许回流
+    assert "你是 ling" not in joined
+    assert "说话方式：" not in joined
 
 
-async def test_persona_restored_after_being_cleared(logged_in: TestEnv) -> None:
-    """清空后再填回去，下一轮立刻恢复（证明链路一直是通的）。"""
+async def test_empty_persona_keeps_functional_lanes(logged_in: TestEnv) -> None:
+    """空人设**只**跳过人设侧三段；功能层（工具说明等）必须还在。
+
+    "什么都不注入"指的是不注入*人设*，不是让提示词变空：`capabilities` 之类的
+    功能提示词不属于人设，删了它们她就没法调用工具。
+    """
+    await _ensure_no_persona_row()
+
+    from ling.kernel.context import ContextCompiler
+
+    session_id, subject_id = await _private_window(logged_in)
     async with session_scope() as session:
-        row = await session.get(Persona, PERSONA)
-        row.system_prompt = ""
-        row.traits = {}
-        session.add(row)
-    assert "性格倾向" not in _system_text(await _run_turn(logged_in))
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id,
+            window_id=session_id,
+            user_text="在吗",
+        )
+    compiled_lanes = [c.lane for c in compiled.contributions]
 
-    response = await logged_in.client.put(
-        "/v1/persona",
-        json={"system_prompt": "你是阿岚。", "traits": {"tone": "安静"}},
+    assert "capabilities" in compiled_lanes, "工具说明被一起删掉了——那不是人设"
+    for persona_lane in ("persona", "constraints", "scenario"):
+        assert persona_lane not in compiled_lanes, f"{persona_lane} 段没有被跳过"
+    # 可观测性保留：元数据里必须能看到"这一轮是空人设"
+    assert compiled.meta["persona_empty"] is True
+
+
+async def test_empty_persona_meta_is_visible_in_turn(logged_in: TestEnv) -> None:
+    """空人设的**可观测性**必须在真实轮次后仍然成立（不是只有 compile 层）。
+
+    `persona_empty` 与日志是用户"为什么她没按人设说话"唯一的线索，删掉它们
+    等于把排查入口也一起删了。
+    """
+    await _ensure_no_persona_row()
+    # 先跑一轮真实轮次：确认它不会因为"人设为空"而报错或发空消息
+    provider = await _run_turn(logged_in)
+    assert provider.requests
+
+    from ling.kernel.context import ContextCompiler
+
+    session_id, subject_id = await _private_window(logged_in)
+    async with session_scope() as session:
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id,
+            window_id=session_id,
+            user_text="在吗",
+        )
+    assert compiled.meta["persona_empty"] is True
+    assert compiled.meta["persona_chars"] == 0
+
+
+async def test_non_empty_persona_keeps_all_three_sections(logged_in: TestEnv) -> None:
+    """只要**任一**字段有内容，三段就照常发——"空"是严格的三列全空。"""
+    await _write_persona(
+        logged_in,
+        system_prompt="你是心夏。",
+        traits={"tone": "安静"},
+        boundaries=["不编造现实履历"],
     )
-    assert response.status_code == 200, response.text
-    restored = _system_text(await _run_turn(logged_in))
-    assert "你是阿岚。" in restored
-    assert "tone：安静" in restored
+    joined = _system_text(await _run_turn(logged_in))
+    assert "你是心夏。" in joined
+    assert "角色名：心夏" in joined
+    assert "叙事边界：不编造现实履历" in joined
+
+
+async def test_boundaries_alone_count_as_a_persona(logged_in: TestEnv) -> None:
+    """只写了叙事边界也算"有人设"：它是用户写的内容，必须被注入。
+
+    这条防的是判据写错（例如只检查 `system_prompt`）：那时候用户写的一整页
+    边界会被静默丢掉，而页面上看着"已经填了"。
+    """
+    await _write_persona(
+        logged_in,
+        system_prompt="",
+        traits={},
+        boundaries=["不跨受众复述他人私聊"],
+    )
+    joined = _system_text(await _run_turn(logged_in))
+    assert "叙事边界：不跨受众复述他人私聊" in joined
+    assert "性格倾向" not in joined, "traits 是空的，不该凭空出现"
+
+
+async def test_scenario_override_alone_counts_as_a_persona(logged_in: TestEnv) -> None:
+    """写了场景覆盖的人设：那条覆盖必须进场景段。
+
+    注意场景覆盖**不是**"人设是否为空"的判据（判据只看 system_prompt /
+    traits / boundaries）。空人设时场景段也一起跳过——连角色名都没有的一句
+    "此刻的场景：…"是没有主语的。所以这里要先有一句正文。
+    """
+    await _write_persona(
+        logged_in,
+        display_name="ling",
+        system_prompt="你是心夏。",
+        traits={},
+        boundaries=[],
+        scenario_prompts={"private": "私聊里可以顺着对方的话多聊两句"},
+    )
+    joined = _system_text(await _run_turn(logged_in))
+    assert "此刻的场景" in joined
+    assert "私聊里可以顺着对方的话多聊两句" in joined
+
+
+async def test_unwritten_scenario_is_not_injected(logged_in: TestEnv) -> None:
+    """人设存在但**没写**私聊场景时，不注入场景内置默认文本。
+
+    内置默认（`scenarios.SCENARIOS[].default`）是"场景行为规则"，属于人设的
+    一部分；用户没写过就不该替用户发出去，否则它就成了一个写不到、删不掉的
+    隐藏人设。
+    """
+    from ling.domains.persona.scenarios import SCENARIO_BY_KEY
+
+    await _write_persona(logged_in, scenario_prompts={"group": "群里只接一句"})
+    joined = _system_text(await _run_turn(logged_in))
+    assert "此刻的场景" not in joined
+    assert SCENARIO_BY_KEY["private"].default not in joined
 
 
 # ---------------------------------------------------------------- 6. 群聊路径
@@ -303,13 +488,22 @@ async def test_persona_restored_after_being_cleared(logged_in: TestEnv) -> None:
 
 async def test_group_turn_also_carries_persona(logged_in: TestEnv) -> None:
     """群聊走的是同一个 `compile`（全仓只有一处），人设照样要在。"""
+    await _write_persona(
+        logged_in,
+        system_prompt="你在群里只接技术问题。",
+        traits={"tone": "干脆"},
+        scenario_prompts={"group": "群里只接一句就走"},
+    )
     provider = await _run_turn(logged_in, visibility="group_scope")
     first = _first_system(provider)
-    assert DEFAULT_SYSTEM_PROMPT[:30] in first
+    assert "你在群里只接技术问题。" in first
     assert "tone：" in first
     joined = _system_text(provider)
-    # 场景提示是群聊那条，说明走的确实是群聊分支
-    assert "【群聊】" in joined
+    # 场景提示是**自己写的**群聊那条，说明走的确实是群聊分支
+    assert "此刻的场景：群聊" in joined
+    assert "群里只接一句就走" in joined
+    # 私聊那条覆盖不该带进来
+    assert "此刻的场景：私聊" not in joined
 
 
 # ---------------------------------------------------------------- 7. API 与库一致
@@ -412,15 +606,19 @@ async def test_persona_over_budget_is_truncated_with_a_mark(logged_in: TestEnv) 
 
     接口上限是 200000 字符（= 车道字符上限），所以超预算只能直接写库——
     这正好模拟"老数据/手工改库"的情形，也是车道截断真正的入口。
+
+    新装不再自动建行，所以先用一次 `PUT /v1/persona` 把这一行建出来，再直接
+    改库把正文换成超预算的版本。
     """
     from ling.infra.models import Persona
 
+    await _write_persona(logged_in)
     head = "【开头】心夏。\n"
     tail = "\n【结尾】始终是心夏。"
     prompt = head + ("设定内容。" * 50000) + tail  # 250019 字符 > 200000
     async with session_scope() as session:
         row = await session.get(Persona, PERSONA)
-        assert row is not None
+        assert row is not None, "PUT 之后应该建出了这一行"
         row.system_prompt = prompt
         row.traits = {}
         session.add(row)
@@ -434,22 +632,24 @@ async def test_persona_over_budget_is_truncated_with_a_mark(logged_in: TestEnv) 
     assert len(first) >= 200_000 - 100, len(first)
 
 
-async def test_empty_persona_still_sends_no_empty_message(logged_in: TestEnv) -> None:
-    """预算改动不能退化掉"空人设不发空 system 消息"。"""
-    from ling.infra.models import Persona
+async def test_cleared_persona_still_sends_no_empty_message(logged_in: TestEnv) -> None:
+    """预算改动不能退回"提示词里出现空消息"。
 
-    async with session_scope() as session:
-        row = await session.get(Persona, PERSONA)
-        assert row is not None
-        row.system_prompt = ""
-        row.traits = {}
-        session.add(row)
+    与 :func:`test_empty_persona_injects_absolutely_nothing` 同一前提（空人设
+    三列全空），这里**额外**断言"空"不等于"发一条空消息"：人设车道不是变成
+    `content=""`，而是整条不存在。
+    """
+    await _ensure_no_persona_row()
 
     provider = await _run_turn(logged_in)
-    assert all(
-        str(getattr(m, "content", "")).strip() for m in provider.requests[0]
-    ), "提示词里有空消息"
+    messages = provider.requests[0]
+    assert all(str(getattr(m, "content", "")).strip() for m in messages), (
+        "提示词里有空消息"
+    )
+    assert messages, "一条消息都没发——功能层不该被一起关掉"
+    # 空人设下人也设车道的标志性内容一个都不许有
     assert "性格倾向" not in _system_text(provider)
+    assert "角色名：" not in _system_text(provider)
 
 
 async def test_traits_report_matches_what_went_in(logged_in: TestEnv) -> None:

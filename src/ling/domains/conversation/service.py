@@ -290,10 +290,14 @@ def _as_utc(value: datetime) -> datetime:
 
 class ConversationService:
     def __init__(
-        self, session: AsyncSession, *, actor_id: str = "actor_ling", persona_id: str = "persona_ling"
+        self, session: AsyncSession, *, actor_id: str = "actor_ling", persona_id: str | None = None
     ) -> None:
         self._session = session
         self._actor_id = actor_id
+        # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`）。
+        # 不再写死 ``"persona_ling"``：那会让"在设置里切换了人格"之后新建的
+        # 窗口仍然挂到旧人格名下，于是人格切换对会话归属完全失效——而且
+        # 界面上一切正常（窗口照常能聊），只有跨人格的数据对不上时才会发现。
         self._persona_id = persona_id
 
     @property
@@ -301,15 +305,34 @@ class ConversationService:
         """本域使用的数据库会话（供内核在同事务内提交角色事件）。"""
         return self._session
 
+    @property
+    def persona_id(self) -> str:
+        """本实例归属的人格 id。**可能为空串**（实例没有显式指定时）。
+
+        暴露它是为了让"角色事件挂到哪一套人格"与"窗口归属哪一套人格"
+        用同一个值：`TurnCoordinator` 两处都要这个 id，自己再解析一次
+        就有"事件挂 A、窗口挂 B"的可能。
+        """
+        return str(self._persona_id or "")
+
     # ---------------------------------------------------------- 窗口
 
     async def create_window(
         self, *, subject_id: str, title: str | None = None, channel: str = "web"
     ) -> Window:
+        # 窗口上的 ``persona_id`` 是**创建那一刻**的人格快照（那一整套设定，
+        # 包括当时的名字与提示词）。之后再切换人格，旧窗口仍然属于旧人格：
+        # 这样"换成另一套人格"真的是"整套换"，而不是把历史对话也重新解释
+        # 成新人格说的。
+        persona_id = self._persona_id
+        if not persona_id:
+            from ling.domains.persona.service import active_persona_id
+
+            persona_id = await active_persona_id(self._session)
         window = Window(
             id=new_id("win"),
             actor_id=self._actor_id,
-            persona_id=self._persona_id,
+            persona_id=persona_id,
             subject_id=subject_id,
             title=(title or DEFAULT_WINDOW_TITLE)[:MAX_TITLE_LEN],
             channel=channel,

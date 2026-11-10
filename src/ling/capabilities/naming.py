@@ -56,8 +56,11 @@ async def display_name_for(persona_id: str) -> str:
         from ling.infra.db import session_scope
 
         async with session_scope() as session:
-            persona = await PersonaService(session, persona_id).get()
-            _NAME_CACHE[persona_id] = persona.display_name or ""
+            # ``get_or_none``：删掉人格（或新装一行都没有）之后这里会拿到
+            # None，缓存成空串 = 不剥任何前缀。用 ``get()`` 会抛 404，
+            # 被下面的 except 吞掉——结果一样，但每次都白跑一次查库。
+            persona = await PersonaService(session, persona_id).get_or_none()
+            _NAME_CACHE[persona_id] = (persona.display_name if persona else "") or ""
     except Exception:  # noqa: BLE001 - 取不到名字不影响出话
         return ""
     return _NAME_CACHE[persona_id]

@@ -86,7 +86,16 @@ async def _bootstrap(settings: Settings) -> None:
 
     async with session_scope() as session:
         identity = IdentityService(session)
-        await PersonaService(session, settings.persona_id).ensure_default()
+        # **不再建人格行**：新装就是"暂无人设"（用户 2026-11-11 的要求）。
+        # 这里调用它只是取一次当前人格并让它出现在日志里——
+        # `ensure_default()` 现在读不到就返回 None，不写库。
+        persona = await PersonaService(session, settings.persona_id).ensure_default()
+        if persona is None:
+            logger.info(
+                "启动引导：还没有人格（persona_id=%s 指向不存在的行）。"
+                "人设页会显示「暂无人设」，新建并设为当前之后立即生效",
+                settings.persona_id,
+            )
         if await identity.count_users() > 0:
             return
         # 首次安装：没有配置口令就生成一个随机口令，并**打印到日志**。
@@ -613,6 +622,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
     from ling.api.routes import logs as logs_routes
+    from ling.api.routes import persona as persona_routes
     from ling.api.routes import recall as recall_routes
     from ling.api.routes import settings as settings_routes
     from ling.api.routes import version as version_routes
@@ -649,6 +659,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(recall_routes.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
+    # 多套人格（`/v1/personas`）：列表/新建/详情/编辑/删除/切换。
+    # 与 `actor.py` 里的单例 `/v1/persona`（= 当前激活人格的快捷方式）并存。
+    app.include_router(persona_routes.router, prefix="/v1")
     app.include_router(version_routes.router, prefix="/v1")
     # 运行日志（本进程的环形缓冲）。观察代价极低，且日志页是运维的常驻入口，
     # 所以**无条件注册**——不像 qq/qqbot 那样按开关注册。

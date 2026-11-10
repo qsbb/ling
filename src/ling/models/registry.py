@@ -131,10 +131,29 @@ class ProviderRegistry:
         self._signatures.pop(provider_id, None)
 
 
+def _initial_persona_id() -> str:
+    """还没有任何已发布修订"时的初始人格（``LING_PERSONA_ID``）。
+
+    读的是 `Settings`，不是直接读环境变量：这样"没配环境变量时是什么"
+    只有 `config.py` 一处定义。读不到配置（例如在极早期导入阶段）时返回空串
+    = "没有配置任何人格"，调用方拿到的是"暂无人设"，而不是一个编出来的 id。
+    """
+    try:
+        from ling.config import get_settings
+
+        return str(get_settings().persona_id or "")
+    except Exception:  # noqa: BLE001 - 早期导入 / 配置损坏时按"没配"处理
+        return ""
+
+
 def bootstrap_config(
     *,
     test_mode: bool = True,
-    persona_id: str = "persona_ling",
+    # ``None`` = "调用方没指定，用环境变量里的初始人格"（`LING_PERSONA_ID`）。
+    # 原来这里写死 ``"persona_ling"``，于是"没发布过修订"的部署永远忽略
+    # 环境变量里配的人格——`ConfigService` 每次都显式传值所以看不出来，
+    # 但直接调 `bootstrap_config()` 的地方（测试、脚本）会拿到错的 id。
+    persona_id: str | None = None,
     log_access_denials: bool = True,
 ) -> EffectiveConfig:
     """没有任何已发布修订时的引导配置。
@@ -145,10 +164,21 @@ def bootstrap_config(
     ``log_access_denials`` 来自环境变量（``LING_LOG_ACCESS_DENIALS``），
     作为"还没发布过配置修订"时的默认值；一旦设置页保存并发布了修订，
     以修订里的值为准（与 ``test_mode`` 同一个模式）。
+
+    没传 ``persona_id`` 时才现读 `Settings.persona_id`（``LING_PERSONA_ID``，
+    默认在 `config.py` 里，**全仓唯一的那个字面量**）。刻意不在签名里写死：
+    签名默认值在导入时求值，环境变量改了也拿不到。
     """
+    if persona_id is None:
+        persona_id = _initial_persona_id()
+    # 显式收窄成非空 str：`_initial_persona_id()` 的返回类型是 `str`，但 mypy
+    # 看不到"None 分支已经处理完"这件事会传导到下面两个构造点（参数本身仍
+    # 声明为 `str | None`，因为调用方确实可以传 None 表示"用环境变量"）。
+    # 不写成 `assert` 是因为它在 `-O` 下会被优化掉，而这里不需要断言语义。
+    resolved_persona_id: str = persona_id
     if not test_mode:
         return EffectiveConfig(revision=0, providers={}, profiles={}, test_mode=False,
-                               persona_id=persona_id,
+                               persona_id=resolved_persona_id,
                                log_access_denials=log_access_denials)
     providers = {
         "fake": ProviderConfig(
@@ -176,7 +206,7 @@ def bootstrap_config(
             model_id="deterministic",
         )
     return EffectiveConfig(revision=0, providers=providers, profiles=profiles, test_mode=True,
-                           persona_id=persona_id,
+                           persona_id=resolved_persona_id,
                            log_access_denials=log_access_denials)
 
 

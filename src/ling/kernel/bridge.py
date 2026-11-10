@@ -332,7 +332,10 @@ class InboundBridge:
         # 与 `_defer_group_attention` 的区别：那个是**配置**说"群消息先放着"，
         # 这个是**这条消息**没有回复资格——哪怕配置允许立即回，也不该开口。
         observe_only: bool = False,
-        persona_id: str = "persona_ling",
+        # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`，
+        # 真相来源是已发布配置的 `persona_id`）。写死一个 id 等于"在设置里
+        # 切换人格之后，入站消息仍然按旧人格处理"。
+        persona_id: str | None = None,
         actor_id: str = "actor_ling",
     ) -> None:
         self._session = session

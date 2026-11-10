@@ -264,11 +264,18 @@ async def test_persona_traits_reach_the_context(logged_in: TestEnv) -> None:
     from ling.infra.models import Persona
 
     async with session_scope() as session:
-        await PersonaService(session).ensure_default()
-        persona = await session.get(Persona, logged_in.settings.persona_id)
+        # 新装**没有人格行**（2026-11-11 去掉默认人设，`ensure_default()` 现在
+        # 只读不建）。这里按当前激活 id 建一行夹具，再写 traits。
+        from ling.domains.persona import current as persona_current
+
+        active_id = await persona_current.effective_persona_id(session)
+        await PersonaService(session).create(
+            persona_id=active_id,
+            display_name="ling",
+            traits={"group_chat": "群里看到感兴趣的就接一句", "tone": "偏冷"},
+        )
+        persona = await session.get(Persona, active_id)
         assert persona is not None
-        persona.traits = {"group_chat": "群里看到感兴趣的就接一句", "tone": "偏冷"}
-        session.add(persona)
 
     text = await _compile(logged_in, await _window(logged_in))
     assert "group_chat" in text, f"上下文里没有 traits：{text[:300]}"

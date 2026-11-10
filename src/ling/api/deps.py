@@ -85,8 +85,14 @@ def conversation_service(request: Request, session: DbSession) -> ConversationSe
 
 
 def persona_service(request: Request, session: DbSession) -> PersonaService:
-    settings: Settings = request.app.state.settings
-    return PersonaService(session, settings.persona_id)
+    """**不传 persona_id**：让服务在真正读的时候解析当前激活的人格。
+
+    以前这里传的是 `settings.persona_id`（环境变量）。多套人格之后那是
+    "初始默认"，不是"当前"——传进来会让"在设置里切到 B"对 API 侧完全无效，
+    因为每个请求都拿环境变量里的 A 去读。传 ``None`` 之后解析只发生在
+    `domains/persona/current.py` 一处（按会话缓存，一轮一次查询）。
+    """
+    return PersonaService(session)
 
 
 def config_service(request: Request, session: DbSession) -> ConfigService:
@@ -95,7 +101,9 @@ def config_service(request: Request, session: DbSession) -> ConfigService:
         session,
         request.app.state.secret_box,
         test_mode_default=settings.test_mode,
-        persona_id=settings.persona_id,
+        # 不传 persona_id：`ConfigService` 只在"没有已发布修订"时用得到它，
+        # 而那个默认值现在由它自己从 `Settings` 取（唯一来源），这里再抄
+        # 一份只会让两处走散。
         log_denials_default=settings.log_access_denials,
     )
 

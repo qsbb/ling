@@ -313,7 +313,7 @@ cancelled/expired`。所以前端可以放心轮询 GET。
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
 | GET | `/v1/settings/connectors` | `{schema_version: "v2", as_of, can_edit, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, generation, activation, fields[], runtime}], access: {id, generation, activation, editable, fields[]}}`；接入器诊断 **+ 可配置字段**；`fields[].kind=secret` 只回 `configured`/`preview`，`value` 恒 null（必鉴权） |
-| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。owner + 同源 Origin + 15 分钟内重新登录（必鉴权） |
+| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。owner + 同源 Origin（必鉴权） |
 | GET | `/v1/settings/connectors/operations/{operation_id}` | `{operation_id, scope, state, generation, active_generation, started_at, activated_at, error_code, error_safe}`；202 之后用它确认**真的**生效了（必鉴权，owner） |
 | POST | `/v1/settings/connectors/reset` | 清空三个 scope 的覆盖（回退 env/默认）→ `{ok, results: [{scope, state, cleared[], operation_id?, error_code?}]}`；任一 scope 失败则 `ok=false` 并保留原 active（**不出现"部分恢复默认却报成功"**）（必鉴权，owner） |
 | POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
@@ -521,16 +521,99 @@ activated_at, error_code, error_safe, ack_count, expected_count}`：
 
 ## 5. 角色与时间线
 
+**多套人格并存，同一时间只有一套生效**（切换时整套换：`system_prompt` /
+`traits` / `boundaries` / 场景覆盖一起换）。「当前激活的是哪一套」的唯一来源是
+**已发布配置修订里的 `persona_id`**（所以切换能跨副本/worker 生效，也能随
+`/v1/settings/rollback` 回滚）。
+
+### 5.1 人格列表与增删改
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/v1/personas` | 登录 | `{items: PersonaListItem[], active_persona_id, total}` |
+| POST | `/v1/personas` | **owner** | 新建 → `201` + `PersonaOut`；**不自动设为当前** |
+| GET | `/v1/personas/{id}` | 登录 | `PersonaOut`；不存在 → `404 not_found` / `persona_not_found` |
+| PUT | `/v1/personas/{id}` | **owner** | 部分字段 → `PersonaOut`；**行不存在 → 404，不会建行** |
+| DELETE | `/v1/personas/{id}` | **owner** | `204`；见下面三种冲突 |
+| POST | `/v1/personas/{id}/activate` | **owner** | `{persona_id, config_revision}`：切换当前激活人格 |
+
+`PersonaOut`（详情/更新/创建的返回体）：
+
+```json
+{
+  "persona_id": "persona_温柔-a1b2c3",
+  "revision": 3,
+  "name": "persona_温柔-a1b2c3",
+  "display_name": "温柔",
+  "system_prompt": "……",
+  "traits": {"tone": "偏冷"},
+  "boundaries": ["不编造现实履历"],
+  "scenario_prompts": {"group": "群里基本不接话"},
+  "scenarios": [{"key": "private", "label": "…", "when": "…",
+                 "text": "…", "default_text": "…", "custom": false}]
+}
+```
+
+`PersonaListItem`（列表页一张卡）：`{persona_id, revision, name, display_name,
+is_active, has_content, system_prompt_chars, trait_count, boundary_count,
+scenario_count, published}`。
+
+- `is_active`：就是当前激活的那一套（判据只能有一份，所以由服务端算）；
+- `has_content`：用的和注入侧**同一条判据**（`persona_is_empty`：三列全空才算没人设），
+  直接决定卡片显示"暂未填写"还是"已写 N 字"；
+- 列表**不带**正文（`system_prompt` 上限 20 万字符，带上会让列表变成几百 KB），
+  要正文点开详情。
+
+`POST /v1/personas` 请求体（全部可选）：`{display_name?, system_prompt?, traits?,
+boundaries?, scenario_prompts?}`。`persona_id` **由服务端生成**：
+`persona_<display_name 转出的 slug>-<6 位随机 hex>`（中文名转不出 slug 时用
+`persona_<8 位随机 hex>`）。用可读前缀 + 随机后缀的理由：id 会出现在 URL、日志、
+`actor_events.persona_id` 与窗口里，纯 uuid 排查时认不出是谁；纯 slug 则会
+"删除重建后 id 复用"，让历史事件被误认成新人格。
+
+删除的三种拒绝：
+
+| 情况 | 状态码 | `code` | `detail` |
+| --- | --- | --- | --- |
+| 删的是**当前激活**的人格 | 409 | `conflict` | `persona_active`（先 `activate` 别的） |
+| 名下还有**有内容的会话** | 409 | `conflict` | `persona_in_use:<窗口数>` |
+| id 不存在 | 404 | `not_found` | `persona_not_found` |
+
+窗口与 `actor_events` 的 `persona_id` 是**纯字符串列**（不是外键），删除人格**不会**
+连带删除，也不改写历史事件（事件记的是"当时是哪一套人设在说"）。
+
+### 5.2 当前激活人格（单例快捷方式，保留）
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/persona` | `{persona_id, revision, display_name, system_prompt, traits, boundaries, scenario_prompts, scenarios[]}` |
-| PUT | `/v1/persona` | 同形状（部分字段）→ 新修订；立即影响后续轮次 |
-| GET | `/v1/actor/timeline?limit=50` | `{events: [{id, type, origin, visibility, occurred_at, summary}]}` |
-| GET | `/v1/life/timeline?date=YYYY-MM-DD` | 只读生活时间轴（双时区 / 段 / 事实 / 未来意向 / 梦卡片），字段见 §11 |
+| GET | `/v1/persona` | 当前激活人格，返回 `PersonaOut` + `{active: true, exists}` |
+| PUT | `/v1/persona` | 改当前激活人格（同形状，部分字段） |
+
+保留这两个路由是因为既有前端与脚本已经在调，语义在多实例下依然成立（"现在是哪一套"）。
+
+- `exists: false` = **库里还没有这一行**（新装）。此时仍返回完整形状的全空视图，
+  前端据此显示"暂无人设 / 创建人格"；旧版这里会顺手建一行 `persona_ling`，
+  现在**不建**。
+- `PUT /v1/persona` 在行不存在时会**按当前激活的 id 建一行再写入**
+  （这是"当前人格的编辑器"的语义，与 `PUT /v1/personas/{id}` 的"必须已存在"不同）；
+  若配置里连激活 id 都没有，则 `409 invalid_request` / `no_active_persona`。
+- 注入行为与"有没有这一行"无关：三列全空 = 什么都不注入，所以新装（无行）与老库
+  （有 `persona_ling` 一行但为空）表现一致。
 
 `scenarios[]` 每项：`{key, label, when, text, default_text, custom}`。`scenario_prompts`
 只存**覆盖**（键：`private` / `group` / `group_mentioned` / `group_unaddressed`）；
 某个键给空串或整组不带该键 = 使用内置默认。未知键返回 400，不会静默丢弃。
+
+### 5.3 时间线
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/v1/actor/timeline?limit=50` | `{events: [{id, type, origin, visibility, occurred_at, summary}]}` |
+| GET | `/v1/life/timeline?date=YYYY-MM-DD` | 只读生活时间轴（双时区 / 段 / 事实 / 未来意向 / 梦卡片），字段见 §11 |
+
+`actor/timeline` 按**角色**（`actor_id`）取事件、**不按人格过滤**：人格是多套
+轮换的，时间线要能追溯"上一套人设说过什么"。每条事件自带 `persona_id`（记在
+**实际被操作的那一套**上），所以切换前后的事件都能在同一个时间轴里追到。
 
 ## 6. 健康
 
@@ -553,7 +636,7 @@ activated_at, error_code, error_safe, ack_count, expected_count}`：
 | GET | `/v1/version/update` | 更新通道视图（只读固定 JSON，不发起网络请求） |
 | POST | `/v1/version/update-requests` | owner 提交一次更新请求，`201` + job |
 | GET | `/v1/version/image-update` | **镜像模式**的「检查更新」卡片（四态 + 诊断，见 §7.1） |
-| POST | `/v1/version/image-update-requests` | owner 提交一次固定 digest 的镜像更新，`201`；要求最近 15 分钟内登录 |
+| POST | `/v1/version/image-update-requests` | owner 提交一次固定 digest 的镜像更新，`201` |
 | POST | `/v1/version/image-update-checks` | owner 发起一次**按需检查**（只写刷新请求），`202` 已排队 / `200` 幂等去重 |
 
 `GET /v1/version/update`：

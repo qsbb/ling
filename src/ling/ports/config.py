@@ -364,6 +364,16 @@ class EffectiveConfig:
     # `LING_LOG_ACCESS_DENIALS` 提供的是"还没有任何已发布修订时"的默认值
     # （见 `Settings.log_access_denials`），与 `test_mode` 同一个模式。
     log_access_denials: bool = True
+    # **当前激活的人格**（`personas.id`）。这是"同一时间只有一套人格生效"的
+    # 唯一真相来源：所有取值点都经由
+    # `domains/persona/current.py::effective_persona_id` 读它，
+    # 不要在各模块里再写一个写死的 id（原来 13 处硬编码 ``"persona_ling"``
+    # 就是"设置改了、运行没改"的来源）。
+    #
+    # 默认值保持 ``"persona_ling"`` 只为兼容：没有已发布修订时（新装），
+    # `ConfigService.effective()` 用 `LING_PERSONA_ID` 覆盖它；而新装又没有
+    # `persona_ling` 这一行，于是"指向一个不存在的 id" = 暂无人设，
+    # 该行为与老库里有这一行的情况一致（有行就有人格）。
     persona_id: str = "persona_ling"
     memory: MemoryPolicy = field(default_factory=MemoryPolicy)
     life: LifePolicy = field(default_factory=LifePolicy)

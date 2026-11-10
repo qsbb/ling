@@ -614,7 +614,10 @@ def make_group_chooser(
     window_id: str,
     router: object,
     config_reader: object,
-    persona_id: str = "persona_ling",
+    # ``None`` = 用当前激活的人格（`domains/persona/current.py`），由
+    # `make_persona_reader` 在真正读人设时解析。"回不回"的判断必须用
+    # **这一轮生效的那套人格**，写死一个 id 等于让群聊决策永远看着旧人设。
+    persona_id: str | None = None,
 ):
     """构造轮询用的决策回调。
 

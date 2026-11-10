@@ -471,21 +471,14 @@ async def test_real_persona_reader_includes_traits(logged_in: TestEnv) -> None: 
     pid = new_id("persona")
     async with session_scope() as session:
         svc = PersonaService(session)
-        created = await svc.ensure_default()
-        # 复制一份默认人设，改 traits，避免污染测试环境的默认行
-        from ling.infra.models import Persona
-
-        session.add(
-            Persona(
-                id=pid,
-                revision=1,
-                name="probe",
-                display_name="probe",
-                system_prompt=created.system_prompt,
-                traits={"group_chat": "群里很爱搭话"},
-                boundaries=list(created.boundaries),
-                published=True,
-            )
+        # 不再 `ensure_default()`：新装没有默认行（2026-11-11 去掉默认人设），
+        # 它现在返回 `None`。自己建一行夹具人格即可。
+        await svc.create(
+            persona_id=pid,
+            display_name="probe",
+            system_prompt="你是一个角色。",
+            traits={"group_chat": "群里很爱搭话"},
+            boundaries=["不编造现实履历"],
         )
 
     async with session_scope() as session:

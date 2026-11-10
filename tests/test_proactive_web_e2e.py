@@ -106,6 +106,11 @@ class _FixedRouter:
 class _TestConfig:
     async def effective(self):  # noqa: ANN201
         return SimpleNamespace(
+            # `domains/persona/current.py::effective_persona_id` 会读这个字段
+            # 决定"这一轮用哪套人格"。真实的 `EffectiveConfig` 有它（默认
+            # `"persona_ling"`），替身漏掉会让 draft 阶段直接 AttributeError——
+            # 配置替身必须与真类在**被读到**的字段上保持一致。
+            persona_id="persona_ling",
             dialogue=SimpleNamespace(
                 proactive_delivery_enabled=True,
                 proactive_daily_limit=2,

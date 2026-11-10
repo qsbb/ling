@@ -2034,15 +2034,18 @@ async def handle_proactive_draft(payload: dict) -> None:
             session,
             SecretBox(settings),
             test_mode_default=settings.test_mode,
-            persona_id=settings.persona_id,
         )
-        view = await PersonaService(session, settings.persona_id).get(settings.persona_id)
+        # 当前激活的人格 = 已发布配置里的 `persona_id`（`domains/persona/current.py`）。
+        # 这里原来取 `settings.persona_id`（环境变量），切人格之后主动草稿
+        # 会继续按旧人设写。`get_or_none`：新装没人格时草稿用空人设。
+        active = await PersonaService(session).get_or_none()
+        view_prompt = str(active.system_prompt or "") if active else ""
         stats = await draft_pending(
             session,
             actor_id=settings.actor_id,
             router=router,
             config_reader=config,
-            persona=str(view.system_prompt or ""),
+            persona=view_prompt,
             limit=int(payload.get("limit") or 5),
         )
     if stats["drafted"] or stats["failed"]:
@@ -2824,12 +2827,15 @@ async def handle_life_plan(payload: dict) -> None:
             _LAST_PLAN_DATE = today
             return
 
-        persona = await PersonaService(session, settings.persona_id).get()
+        # 排日程时"她是谁"用当前激活的人格；没人格时用一个空视图
+        # （下面的代码只读 `display_name` / `traits`，空就是"没有设定"）。
+        from ling.domains.persona.service import empty_persona_view
+
+        persona = await PersonaService(session).get_or_none() or empty_persona_view()
         config = ConfigService(
             session,
             SecretBox(settings),
             test_mode_default=settings.test_mode,
-            persona_id=settings.persona_id,
         )
         effective = await config.effective()
         # 排日程**没有自己的职责**（`planning` 至今没有实现，见
@@ -4896,8 +4902,11 @@ async def handle_dream_generate(payload: dict) -> None:
         logger.warning("dream.generate 缺少可解析的 sleep_date，跳过: %s", payload)
         return
     async with session_scope() as session:
+        # 不传 persona_id = 用当前激活的人格（`domains/persona/current.py`）。
+        # 传 `settings.persona_id` 会让"在设置里切了人格"之后，梦里的性格
+        # 线索仍然取自旧人设。
         outcome = await DreamService(
-            session, actor_id=actor_id, persona_id=settings.persona_id
+            session, actor_id=actor_id
         ).generate(
             sleep_date,
             now=utcnow(),

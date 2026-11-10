@@ -803,6 +803,145 @@ def test_format_traits_renders_key_values() -> None:
     assert "curiosity：0.2" in out
 
 
+def test_persona_is_empty_judge() -> None:
+    """「人设是否为空」只有一个判据，三列**全空**才算空。
+
+    引子：没有默认人设了（2026-11-11），空人设什么都不注入。所以"空"的判断
+    必须精确——判宽了会把用户写的东西丢掉，判窄了会让新装用户被当成"有人设"，
+    「暂无人设 + 新建人设」的空状态就永远出不来。
+
+    **display_name 不参与判据**：它只是名字（时间线/日程/剥自我前缀用它），
+    新装行里本来就是 `"ling"`；算进来会让每个新装用户都被判成"有人设"。
+    """
+    from ling.domains.persona.service import PersonaView, persona_is_empty, view_is_empty
+
+    # 三列全空 → 空
+    assert persona_is_empty(system_prompt="", traits={}, boundaries=[]) is True
+    assert persona_is_empty() is True
+    # 全空白也算空（空白不是设定，注入它只会让模型收到一段空指令）
+    assert persona_is_empty(system_prompt="   \n\t") is True
+    # 有键但值全空：format_traits 渲染就是空串，所以也算空（两边判断必须一致）
+    assert persona_is_empty(traits={"a": "", "b": None}) is True
+    # boundaries 里全是空白串 → 空
+    assert persona_is_empty(boundaries=["", "   "]) is True
+
+    # 任一列有真内容 → 非空
+    assert persona_is_empty(system_prompt="你是小满。") is False
+    assert persona_is_empty(traits={"tone": "冷淡"}) is False
+    assert persona_is_empty(boundaries=["不编造现实履历"]) is False
+
+    # 历史脏数据：类型不对 / NULL 一律按空处理，不抛异常
+    assert persona_is_empty(system_prompt=None, traits=None, boundaries=None) is True
+    assert persona_is_empty(traits=[], boundaries="不是列表") is True  # type: ignore[arg-type]
+
+    def _view(**kwargs: object) -> PersonaView:
+        base: dict = {
+            "persona_id": "p",
+            "revision": 1,
+            "name": "ling",
+            "display_name": "ling",
+            "system_prompt": "",
+            "traits": {},
+            "boundaries": [],
+        }
+        base.update(kwargs)
+        return PersonaView(**base)
+
+    # view 版本与裸字段版本同一个判据
+    assert view_is_empty(_view()) is True
+    assert view_is_empty(_view(system_prompt="你是小满。")) is False
+    # display_name 不影响结论：名字是"ling"、其余全空，仍然是空人设
+    assert view_is_empty(_view(display_name="ling")) is True
+
+
+def test_persona_view_is_returned_as_stored() -> None:
+    """`_to_view` **原样**返回：空就是空，绝不回落成任何默认值。
+
+    这条防的是上一版踩过的坑：读取时回落 → 前端输入框显示默认值 → 用户一点
+    保存 → 默认值被写进库、从此冻结，于是"空 = 跟随默认"这个设计根本存不下来。
+    """
+    from ling.domains.persona.service import PersonaService
+    from ling.infra.models import Persona
+
+    row = Persona(
+        id="p",
+        revision=1,
+        name="ling",
+        display_name="ling",
+        system_prompt="",
+        traits={},
+        boundaries=[],
+        scenario_prompts={},
+        published=True,
+    )
+    view = PersonaService._to_view(row)
+    assert view.system_prompt == ""
+    assert view.traits == {}
+    assert view.boundaries == []
+    # 形状兜底（NULL / 脏数据）不得把"空"变成"有内容"
+    row.system_prompt = None  # type: ignore[assignment]
+    row.traits = None  # type: ignore[assignment]
+    row.boundaries = None  # type: ignore[assignment]
+    view = PersonaService._to_view(row)
+    assert view.system_prompt == ""
+    assert view.traits == {}
+    assert view.boundaries == []
+
+
+def test_no_default_persona_constants_exist() -> None:
+    """**没有默认人设**：这三个常量必须彻底不存在。
+
+    为什么不是"改成空值"：`DEFAULT_*` 这个名字本身就在说"这里有一份默认人设"。
+    留空壳常量，下一个人会往里填内容，而且每个引用点都得写
+    `if DEFAULT_SYSTEM_PROMPT:` 这种恒假判断。所以这里断言的是"名字不存在"：
+    有人想把默认人设加回来，必须先改掉这条用例并解释原因。
+    """
+    import ling.domains.persona as pkg
+    import ling.domains.persona.service as svc
+
+    for name in ("DEFAULT_SYSTEM_PROMPT", "DEFAULT_TRAITS", "DEFAULT_BOUNDARIES"):
+        assert not hasattr(svc, name), f"{name} 又回来了——默认人设不该存在"
+    # 上一版的读取时回落函数同样必须不存在
+    for name in ("effective_prompt", "effective_traits", "effective_boundaries"):
+        assert not hasattr(svc, name), f"{name} 又回来了——回落会让空人设存不下来"
+    assert not hasattr(pkg, "DEFAULT_SYSTEM_PROMPT")
+
+
+def test_empty_persona_renders_nothing_to_send() -> None:
+    """三列都为空时，人设车道**渲染不出可发送的内容**——不能出现 `content=""`。
+
+    这是从 `tests/integration/test_persona_injection.py` 搬过来的保护：
+    那条集成用例原来靠"库里清空两列"制造空人设，但回落语义落地后，库里空
+    读出来就是默认人设了——**"空"只能由渲染结果为空**来构造。
+
+    两点分工写清楚，免得以后有人以为下面那条白名单是有意保留的行为：
+
+    1. `format_traits` 渲染为空（键存在但值全空）→ 拼出来的文本本来就是 `""`；
+    2. `system_prompt` 只有空白（`"  \n"`）→ 拼出来的文本是空白串，**不是** `""`。
+       这一点由 `ContextCompiler` 的末道过滤兜住：所有贡献统一
+       ``[c for c in contributions if c.text.strip()]``（见 `kernel/context.py`
+       里"空文本的车道整条不发"那段注释），所以空白串同样不发。
+       这里断言的是**不发**这个结果，而不是"拼接结果为 `""`"。
+
+    真正会触发它的情形仍在：老数据/手工改库把 `system_prompt` 写成空白、
+    且 `traits` 里全是空值。
+    """
+    from ling.domains.persona.service import format_traits
+
+    for prompt, traits in (
+        ("", {}),
+        ("", None),
+        ("", {"a": "", "b": None}),  # 有键但渲染为空
+        ("   \n", {"a": "   "}),  # 只有空白：靠 `kernel/context.py` 的 strip 过滤兜住
+    ):
+        # 与 `kernel/context.py` 里人设车道的拼装表达式一致
+        persona_text = "\n\n".join(
+            part for part in (prompt, format_traits(traits)) if part
+        )
+        # 与 `ContextCompiler` 的末道过滤一致：空白也不占消息位
+        assert not persona_text.strip(), f"人设车道会发出一条空消息：{persona_text!r}"
+
+
 def test_format_traits_empty_returns_nothing() -> None:
     """空 traits 不能产出半句空话——那只是白占预算。"""
     from ling.domains.persona.service import format_traits

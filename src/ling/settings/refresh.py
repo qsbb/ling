@@ -52,7 +52,8 @@ async def current_revision(session: AsyncSession) -> int:
 
 
 async def refresh_secrets(
-    session: AsyncSession, *, cache: dict[str, str], box: object, persona_id: str,
+    session: AsyncSession, *, cache: dict[str, str], box: object,
+    persona_id: str | None = None,
     test_mode_default: bool, diagnosis: dict[str, str] | None = None,
 ) -> int:
     """把已发布的密钥重新解密进 ``cache``（原地更新）。

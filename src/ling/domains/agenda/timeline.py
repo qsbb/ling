@@ -5759,12 +5759,20 @@ async def _count_current_segments(session: AsyncSession, plan_id: str) -> int:
 
 
 async def _resolve_persona_id(session: AsyncSession) -> str:
-    from ling.config import get_settings
+    """当前激活的人格 id（读**已发布配置**，与提示词注入同一个来源）。
+
+    原实现读的是 ``get_settings().persona_id``（环境变量），于是在设置里
+    切换人格之后，日程投影里的人格名/性格仍然是旧的那一套。配置不可读时
+    返回空串 = "没有"，而不是回落成一个写死的 id（那个 id 在新装库里不存在）。
+    """
+    # 经 persona 域的公开 `service` 模块读（ADR-0001 跨域闸门：别的域只能
+    # import 邻居域的 `*.service`，不能 import 它的实现模块）。
+    from ling.domains.persona.service import active_persona_id
 
     try:
-        return get_settings().persona_id
-    except Exception:  # noqa: BLE001 - 配置不可读时用默认 id
-        return "persona_ling"
+        return await active_persona_id(session)
+    except Exception:  # noqa: BLE001 - 配置不可读时 = 没有人格
+        return ""
 
 
 def _settings_actor_id() -> str:

@@ -97,7 +97,11 @@ async def _log_denials_enabled(state: object) -> bool:
                 session,
                 SecretBox(settings),
                 test_mode_default=bool(getattr(settings, "test_mode", True)),
-                persona_id=str(getattr(settings, "persona_id", "persona_ling")),
+                # 这里只读"拒绝日志开关"，人格参数在这里不会产生任何效果；
+                # 但仍走同一个默认来源（``Settings.persona_id`` ←
+                # ``LING_PERSONA_ID``），不再留一个写死的 ``"persona_ling"``
+                # ——那会在 grep 里看起来像"还有一处没改成读配置"。
+                persona_id=str(getattr(settings, "persona_id", "") or ""),
                 log_denials_default=default,
             )
             enabled = (await svc.effective()).log_access_denials
