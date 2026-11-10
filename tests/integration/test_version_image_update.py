@@ -389,34 +389,6 @@ async def test_post_cookie_requires_same_origin_and_update_header(
     assert _request_files(base) == []
 
 
-async def test_post_requires_recent_login(logged_in: TestEnv, tmp_path: Path) -> None:
-    """会话本身仍有效，但建立时间超过 15 分钟 → 拒绝（服务端按会话表判定）。"""
-    base = _configure(logged_in, tmp_path)
-    _write_status(base)
-    token = logged_in.client.cookies.get(logged_in.settings.cookie_name)
-    assert token
-    async with session_scope() as session:
-        row = (
-            await session.execute(
-                select(AuthSession).where(AuthSession.token_hash == hash_token(token))
-            )
-        ).scalar_one()
-        row.created_at = datetime.now(UTC) - timedelta(minutes=45)
-    response = await _post(logged_in)
-    assert response.status_code == 403
-    assert response.json()["error"]["detail"] == "recent_login_required"
-    assert "15 分钟" in response.json()["error"]["message"]
-    assert _request_files(base) == []
-
-    # 重新登录（新会话）后即可提交。
-    assert (
-        await logged_in.client.post(
-            "/v1/auth/login", json={"username": "tester", "password": "tester-password"}
-        )
-    ).status_code == 200
-    assert (await _post(logged_in)).status_code == 201, "重新登录后应恢复"
-
-
 async def test_post_rate_limited(logged_in: TestEnv, tmp_path: Path) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base)
@@ -2610,11 +2582,13 @@ async def test_check_requires_same_origin(logged_in: TestEnv, tmp_path: Path) ->
     assert _visible_files(base / "requests") == []
 
 
-async def test_check_works_without_recent_login(logged_in: TestEnv, tmp_path: Path) -> None:
-    """检查是**只读**动作：登录 45 分钟后仍可发起（旧版这里给了个看不懂的 403）。
+async def test_session_age_does_not_gate_check_or_install(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    """登录已 45 分钟的老会话照样能**检查**、也能**提交安装**。
 
-    安装请求 ``POST /v1/version/image-update-requests`` 仍然要求最近登录
-    （见 ``test_post_requires_recent_login``）——两件事的授权边界不同。
+    授权只看 role + Origin + 限流：单人部署里唯一的所有者不该为了点一次更新
+    重新登录，而"会话年龄"也挡不住会话被窃的攻击者（他随时能自己登录一次）。
     """
     base = _configure(logged_in, tmp_path)
     _write_status(base)
@@ -2633,11 +2607,10 @@ async def test_check_works_without_recent_login(logged_in: TestEnv, tmp_path: Pa
     assert response.json()["request_id"] == request_id
     assert _visible_files(base / "requests") == [f"refresh-{request_id}.json"]
 
-    # 同一个过期会话提交**安装**请求仍然被拒（权限边界没变）。
+    # 同一个老会话提交**安装**请求也放行（会话年龄不再是门禁）。
     install = await _post(logged_in)
-    assert install.status_code == 403
-    assert install.json()["error"]["detail"] == "recent_login_required"
-    assert _request_files(base) == []
+    assert install.status_code == 201, install.text
+    assert len(_request_files(base)) == 1
 
 
 async def test_check_writes_one_atomic_refresh_file(

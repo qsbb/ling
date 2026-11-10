@@ -822,8 +822,7 @@ fail-closed 判据）；必须先人工迁移。
 ### 10.2 请求协议（`POST /v1/version/image-update-requests`）
 
 - `owner` 专属；必须 `Content-Type: application/json` + `X-Ling-Update: 1`，
-  同源（Cookie 认证必须带匹配 `Origin`，Bearer 可省）；另外要求**最近 15 分钟内
-  登录**（服务端按会话 `created_at` 判定），并按用户限流（60 秒 5 次）。
+  同源（Cookie 认证必须带匹配 `Origin`，Bearer 可省），并按用户限流（60 秒 5 次）。
 - 请求体**恰好五个键**，多一个少一个都 422：
 
 ```json

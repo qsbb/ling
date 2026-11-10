@@ -28,7 +28,6 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Literal
@@ -36,8 +35,6 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Request, Response
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
@@ -57,8 +54,6 @@ from ling.contracts.v1 import (
     ImageUpdateUpdaterDetails,
     ImageUpdateView,
 )
-from ling.infra.models import AuthSession
-from ling.infra.security import hash_token
 from ling.updates import protocol as update_protocol
 from ling.updates.service import (
     REASON_IN_PROGRESS,
@@ -900,7 +895,7 @@ async def create_update_request(
 #
 # 状态码口径（本文件对镜像通道的约定）：
 #
-# - 权限与来源（非所有者、Origin、最近登录）→ 403
+# - 权限与来源（非所有者、Origin）→ 403
 # - 通道/拓扑状态（未启用、离线、协议不兼容、备份门禁、进行中、重复…）→ 409
 # - 请求体格式 → 422；限流 → 429
 
@@ -968,10 +963,6 @@ IMAGE_UPDATER_ONLINE_SECONDS = 120.0
 IMAGE_UPDATE_RATE_LIMIT = 5
 IMAGE_UPDATE_RATE_WINDOW_SECONDS = 60.0
 IMAGE_UPDATE_RATE_MAX_KEYS = 1024
-
-# 「最近登录」窗口：更新是能改宿主状态的不可逆动作，要求当前会话在 15 分钟内
-# 建立（服务端按 ``auth_sessions.created_at`` 判定，不看 cookie 的 max_age）。
-RECENT_LOGIN_MAX_AGE_SECONDS = 15 * 60
 
 IMAGE_UPDATER_STATES = ("idle", "busy", "needs_manual")
 IMAGE_TASK_STATE_MESSAGES: dict[str, str] = {
@@ -1194,7 +1185,6 @@ IMAGE_REASON_MESSAGES: dict[str, str] = {
     "installed_version_changed": "当前运行提交已变化，请重新检查后再提交",
     "already_on_target": "目标摘要与当前运行摘要相同，不需要更新",
     "duplicate_request_id": "该任务 ID 已使用过，不重复执行",
-    "recent_login_required": "该操作要求最近 15 分钟内重新登录",
     "rate_limited": "提交过于频繁，请稍后再试",
     "image_mode_requires_image_channel": (
         "源码模式的更新通道不适用于镜像模式，请用 /v1/version/image-update-requests"
@@ -1227,7 +1217,6 @@ IMAGE_REASON_STATUS: dict[str, int] = {
     "installed_version_changed": 409,
     "already_on_target": 409,
     "duplicate_request_id": 409,
-    "recent_login_required": 403,
     "rate_limited": 429,
     "image_mode_requires_image_channel": 409,
     "invalid_request_body": 422,
@@ -1272,7 +1261,6 @@ IMAGE_REASON_NEXT_ACTIONS: dict[str, tuple[str, ...]] = {
     "installed_version_changed": ("重新打开检查更新，按最新的当前提交重新提交",),
     "already_on_target": ("当前已是该摘要，无需操作",),
     "duplicate_request_id": ("换一个新的 request_id 重新提交（不要重放旧任务）",),
-    "recent_login_required": ("退出后重新登录（15 分钟内）再发起更新",),
     "rate_limited": ("等待一分钟后重试",),
     "image_mode_requires_image_channel": (
         "改用 POST /v1/version/image-update-requests（固定 digest 请求）",
@@ -1293,7 +1281,6 @@ IMAGE_REASON_NEXT_ACTIONS.update(
     }
 )
 
-_IMAGE_FORBIDDEN_REASONS = frozenset({"not_owner", "recent_login_required"})
 _IMAGE_INVALID_REASONS = frozenset(
     {
         "invalid_request_body",
@@ -1315,7 +1302,7 @@ _IMAGE_STATUS_OK = "ok"
 def _image_error(reason: str) -> LingError:
     """把固定 reason 翻成契约错误（码表文案 + 固定 detail + 稳定状态码）。"""
     message = IMAGE_REASON_MESSAGES.get(reason, "镜像更新暂不可用")
-    if reason in _IMAGE_FORBIDDEN_REASONS:
+    if reason == "not_owner":
         code = ErrorCode.forbidden
     elif reason in _IMAGE_INVALID_REASONS:
         code = ErrorCode.invalid_request
@@ -2029,25 +2016,6 @@ def _image_limiter(request: Request) -> ImageUpdateRateLimiter:
         limiter = ImageUpdateRateLimiter()
         request.app.state.image_update_limiter = limiter
     return limiter
-
-
-async def _require_recent_login(auth: CurrentAuth, session: AsyncSession) -> None:
-    """要求当前会话是**最近 15 分钟内**建立的（服务端按会话表判定）。
-
-    只看 cookie 的 ``max_age`` 是不够的：会话被窃后 token 仍能用到自然过期。
-    ``created_at`` 在服务端，改不了；取不到会话行时同样 fail closed。
-    """
-    row = (
-        await session.execute(
-            select(AuthSession).where(AuthSession.token_hash == hash_token(auth.token))
-        )
-    ).scalar_one_or_none()
-    created = None if row is None else row.created_at
-    if created is not None and created.tzinfo is None:
-        created = created.replace(tzinfo=UTC)
-    age = None if created is None else (datetime.now(UTC) - created).total_seconds()
-    if age is None or age > RECENT_LOGIN_MAX_AGE_SECONDS:
-        raise _image_error("recent_login_required")
 
 
 @dataclass(frozen=True)
@@ -2968,13 +2936,12 @@ async def create_image_update_request(
     settings: SettingsDep,
     request: Request,
     response: Response,
-    session: DbSession,
 ) -> dict[str, object]:
     """owner 提交一次**镜像**更新请求；只原子写请求文件，不执行任何部署。
 
     顺序（每一步失败都 fail closed，且不写任何文件）：
 
-    1. 所有者权限 → 来源/CSRF → 限流 → 最近登录；
+    1. 所有者权限 → 来源/CSRF → 限流；
     2. 请求体上限 + 固定格式（多余字段/非 digest/未确认一律 422）；
     3. 通道门禁（开关、更新器在线、协议、恢复点、当前镜像…）→ 409/403；
     4. 期望当前值与实测的 ``LING_COMMIT`` / ``LING_APP_IMAGE`` 逐项比对；
@@ -2994,7 +2961,6 @@ async def create_image_update_request(
         )
     if not _image_limiter(request).allow(auth.user.id):
         raise _image_error("rate_limited")
-    await _require_recent_login(auth, session)
     raw = await _read_update_body(request)
     try:
         submission = _parse_image_submission(raw)
@@ -3088,11 +3054,8 @@ async def create_image_update_check(
 
     - **不要求** ``X-Ling-Update`` 头（那是写接口的防误触标记；本接口只写一条
       只读刷新请求），但同源校验照样生效；
-    - **不要求最近登录**：检查是只读动作（不改宿主、不装东西），只写一条排队
-      请求。旧版这里要最近 15 分钟内登录，用户点「检查更新」拿到 403 却看不懂
-      为什么（docs/UPDATE-SIMPLIFICATION-DESIGN.md §6：给出可执行的一步，不要
-      莫名其妙地拒绝）。安装请求 ``POST /v1/version/image-update-requests`` 的
-      最近登录校验**保持不变**。
+    - **不改宿主**：检查是只读动作（不改宿主、不装东西），只写一条排队请求。
+      安装请求 ``POST /v1/version/image-update-requests`` 才写安装任务。
     """
     response.headers["Cache-Control"] = "no-store"
     if auth.user.role != "owner":
