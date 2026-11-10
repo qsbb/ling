@@ -24,7 +24,7 @@
  *    提交期间按钮禁用、表单只读，避免连点产生第二次并发写。
  * 3. **状态码各说各的话**：`409` 是别处改过（要刷新后重试）、`422` 是字段不合法
  *    （逐个指出哪个键，并说明**此时一个连接都没停过**）、`503` 是切换器不可用
- *    （改不了，不是改错了）、`403` 要区分"不是 owner / 来源不可信 / 要重新登录"。
+ *    （改不了，不是改错了）、`403` 要区分"不是 owner / 来源不可信"。
  * 4. **只发真正改过的键**。后端把"`set` 里没出现的键"定义成"不改"；把没动过的
  *    项一起发过去虽然也会被判成 `unchanged`，但会让审计里多出一堆"改了"的字段。
  *
@@ -505,13 +505,6 @@ export function describeSaveError(error: unknown): SaveNotice {
   }
   if (status === 403) {
     const detail = explained.detail;
-    if (detail === 'recent_login_required') {
-      return {
-        tone: 'error',
-        text: '为了安全，改接入器需要最近 15 分钟内重新登录过。',
-        detail: '请退出后重新登录，再回到这一页保存。这次的改动没有提交。',
-      };
-    }
     if (detail === 'bad_origin') {
       return {
         tone: 'error',
@@ -1363,8 +1356,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
       {state.status === 'ready' && !canEdit ? (
         <p className="panel__note" data-testid="connectors-readonly">
-          当前账号不是所有者：可以看，但不能改。修改接入器需要所有者，且最近 15
-          分钟内重新登录过。
+          当前账号不是所有者：可以看，但不能改。修改接入器需要所有者账号。
         </p>
       ) : null}
 

@@ -10,6 +10,8 @@ import type {
   DraftResponse,
   MessagesResponse,
   Persona,
+  PersonaCreate,
+  PersonaSummary,
   PersonaUpdate,
   ProbeResult,
   PromptSnapshotOut,
@@ -311,6 +313,59 @@ async function postStream(path: string, body: unknown | null, signal: AbortSigna
   return response;
 }
 
+/**
+ * 人格的 id（新契约 `id`，旧实现 `persona_id`）。
+ *
+ * 只在这里读这两个键：两个都有时以 `id` 为准，只有一个时用那个，都没有时
+ * 给空串——空串的 id 任何写操作都会 404，比拿 `undefined` 拼出
+ * `/v1/personas/undefined` 更容易在日志里看出来。
+ */
+export function personaId(persona: { id?: string; persona_id?: string }): string {
+  const id = persona.id ?? persona.persona_id ?? '';
+  return typeof id === 'string' ? id : '';
+}
+
+/**
+ * 收下一个"人格列表"响应体。
+ *
+ * 后端实际回的是 `PersonaListOut`：`{items, active_persona_id, total}`
+ * （`routes/persona.py`）。契约文档原本写"直接回 `Persona[]`"，所以裸数组
+ * 与 `{personas: [...]}` 也一并接受。**其余形状一律抛错**，不默默返回空数组：
+ * 返回空数组会让页面显示「暂无人设」，而那是一个会误导用户去重建人设的结论。
+ */
+export function personaListFrom(payload: unknown): {
+  items: PersonaSummary[];
+  activePersonaId: string | null;
+  /** 后端 `total`；没给时取 `items.length`（裸数组形状只能这样）。 */
+  total: number;
+} {
+  let value: unknown = payload;
+  let activePersonaId: string | null = null;
+  let reportedTotal: number | null = null;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    const active = obj.active_persona_id ?? obj.active_id;
+    if (typeof active === 'string' && active !== '') activePersonaId = active;
+    if (typeof obj.total === 'number' && Number.isFinite(obj.total)) reportedTotal = obj.total;
+    value = obj.items ?? obj.personas ?? obj.data;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nested = value as Record<string, unknown>;
+      value = nested.items ?? nested.personas;
+    }
+  }
+  if (!Array.isArray(value)) {
+    throw new ApiError(
+      200,
+      'invalid_request',
+      '服务端返回的人格列表格式无法识别（期望 {items: [...]} 或数组）',
+    );
+  }
+  const items = value.filter(
+    (item): item is PersonaSummary => !!item && typeof item === 'object',
+  );
+  return { items, activePersonaId, total: reportedTotal ?? items.length };
+}
+
 export const api = {
   /* ------------------------------------------------------------ 认证 */
   me(): Promise<AuthResponse> {
@@ -452,8 +507,7 @@ export const api = {
     return request<ConnectorsResponse>('/v1/settings/connectors');
   },
   /**
-   * 保存某个接入器的配置并**立刻尝试生效**（owner + 同源 + 最近 15 分钟
-   * 重新登录过，见 `settings.py:788-833`）。
+   * 保存某个接入器的配置并**立刻尝试生效**（owner + 同源，见 `settings.py:788-815`）。
    *
    * `ifMatch` 是卡片上的 `generation`：并发保存只有一个赢家，输了拿 409。
    * **202 不等于"已生效"**——终态看返回的 `state`，`rolled_back` 是失败。
@@ -846,12 +900,78 @@ export const api = {
     return request(`/v1/core-memory/${encodeURIComponent(coreId)}`, { method: 'DELETE' });
   },
 
-  /* ------------------------------------------------------------ 角色 */
+  /* ------------------------------------------------------------ 角色
+   *
+   * 两套端点并存，**不是二选一**：
+   *
+   * - 旧：`GET|PUT /v1/persona` = 当前生效的那一套（单一人设时代留下的）。
+   *   聊天页的称呼（`personaName.ts`）仍然只读它，所以这里保留不动。
+   * - 新：`/v1/personas` 集合 + `/v1/personas/{id}/activate`。切换时是**整套**
+   *   换掉（不是合并字段），所以"改哪套"必须由 id 指明，不能靠"当前那套"。
+   *
+   * 所有路径都带 `/v1`：本文件其余端点一律如此，漏掉前缀会得到 index.html
+   * 和一条看不懂的 JSON 解析错误。
+   */
   persona(): Promise<Persona> {
     return request<Persona>('/v1/persona');
   },
+  /**
+   * 旧端点：更新**当前生效**的那一套。人设页改版后不再用它写（改哪一套由
+   * 卡片决定），保留是为了别的调用方与旧后端仍能用。
+   */
   updatePersona(patch: PersonaUpdate): Promise<Persona> {
     return request<Persona>('/v1/persona', jsonInit('PUT', patch));
+  },
+  /**
+   * 全部人格（`GET /v1/personas`）。
+   *
+   * 后端回 `{items, active_persona_id, total}`；裸数组与 `{personas}` 也接受
+   * （见 `personaListFrom`）。`active_persona_id` 一起交出去：它是"哪套生效"
+   * 的第二判据，页面在列表项没带 `is_active` 时用它。
+   *
+   * **列表项没有正文**（后端刻意不带，`PersonaListItem`）：卡片要摘要时页面
+   * 自己按 id 调 `getPersona`。
+   */
+  async listPersonas(signal?: AbortSignal): Promise<{
+    items: PersonaSummary[];
+    activePersonaId: string | null;
+    total: number;
+  }> {
+    const data = await request<unknown>('/v1/personas', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+    return personaListFrom(data);
+  },
+  createPersona(body: PersonaCreate): Promise<PersonaSummary> {
+    return request<PersonaSummary>('/v1/personas', jsonInit('POST', body));
+  },
+  getPersona(personaId: string): Promise<PersonaSummary> {
+    return request<PersonaSummary>(`/v1/personas/${encodeURIComponent(personaId)}`);
+  },
+  updatePersonaById(personaId: string, patch: PersonaUpdate): Promise<PersonaSummary> {
+    return request<PersonaSummary>(
+      `/v1/personas/${encodeURIComponent(personaId)}`,
+      jsonInit('PUT', patch),
+    );
+  },
+  /** 删除一套人格。**当前生效的那套后端可能拒绝**（409/422），由调用方翻译。 */
+  deletePersona(personaId: string): Promise<void> {
+    return request<void>(`/v1/personas/${encodeURIComponent(personaId)}`, {
+      method: 'DELETE',
+    });
+  },
+  /**
+   * 把某一套设为生效（整套替换，不合并）。
+   *
+   * 返回 `{persona_id}` 是后端回执，不是完整对象——切换后列表要重读一次，
+   * 别拿回执拼一个"已激活"的本地状态。
+   */
+  activatePersona(personaId: string): Promise<{ persona_id: string }> {
+    return request<{ persona_id: string }>(
+      `/v1/personas/${encodeURIComponent(personaId)}/activate`,
+      jsonInit('POST', {}),
+    );
   },
   timeline(limit = 50): Promise<TimelineResponse> {
     return request<TimelineResponse>(`/v1/actor/timeline?limit=${limit}`);

@@ -776,12 +776,91 @@ export interface Persona {
 }
 
 export interface PersonaUpdate {
+  name?: string;
   display_name?: string;
   system_prompt?: string;
   traits?: Record<string, unknown>;
   boundaries?: string[];
   /** 整组替换：空串 = 恢复默认，缺键 = 没有覆盖。 */
   scenario_prompts?: Record<string, string>;
+}
+
+/**
+ * 多人设列表里的一项（`GET /v1/personas`，契约见 `PersonaInput` / `PersonaOut`）。
+ *
+ * 与 `Persona`（当前激活的那一套，`GET /v1/persona`）是**同一份数据**，这里
+ * 只是给列表端点一个明确的形状，并把两个"能缺就缺"的字段标成可选：
+ *
+ * - `id` 可能不单独给（旧实现只有 `persona_id`），读取一律走
+ *   {@link personaId}，组件里不直接碰这两个键名；
+ * - `created_at` 可能在旧后端里没有——卡片上的创建时间就会整行不出现，
+ *   而不是画一个 `1970/01/01`。
+ *
+ * `is_active` 是"这一套正在生效"。后端若不在每个对象上带它，前端就退回
+ * `GET /v1/persona` 的 `persona_id` 来判——两条路都给，界面上"当前使用"
+ * 就不会因为后端少一个字段而消失。
+ */
+export type PersonaSummary = Persona & {
+  /** 新契约的 id。缺失时回退 `persona_id`。 */
+  id?: string;
+  /** 列表端点上的激活标记；缺失时按 `active_persona_id` / `GET /v1/persona` 判。 */
+  is_active?: boolean;
+  /** ISO8601；**后端目前不给**（`PersonaListItem` 没有这一列）→ 卡片不显示时间行。 */
+  created_at?: string | null;
+  updated_at?: string | null;
+  /**
+   * `system_prompt` 的字数（`PersonaListItem.system_prompt_chars`）。
+   *
+   * 列表接口**刻意不带正文**（上限 20 万字符，带上会变成几百 KB），所以卡片上
+   * 没有摘要时靠它说明"写了 N 字，点开看"。为 0 = 真的没写。
+   */
+  system_prompt_chars?: number;
+  /** `PersonaListItem.has_content`：与注入侧 `persona_is_empty()` 同一个判据。 */
+  has_content?: boolean;
+  trait_count?: number;
+  boundary_count?: number;
+  scenario_count?: number;
+  /** "4 个技能"徽章。缺失时不出徽章，不编数字。 */
+  skill_count?: number | null;
+  /** "使用 N 个工具"徽章。 */
+  tool_count?: number | null;
+  /** 发布态；缺失时按"未发布"处理。 */
+  published?: boolean;
+};
+
+/**
+ * 新建人格的请求体（`POST /v1/personas`，后端 `routes/persona.py::PersonaCreate`）。
+ *
+ * **没有 `name`**：库里那一列由服务端从 `display_name` 生成（`persona_<slug>-<6 位随机>`），
+ * id 也由服务端生成。所以表单里只需要"她叫什么"。
+ *
+ * **空值不发送**：`system_prompt: ''` 和"没有这个键"在后端是两种意思
+ * （前者可能被当成显式清空）。新建时两件事本来就等价，所以统一不发，
+ * 让"空就是空"只由后端一处定义。
+ */
+export interface PersonaCreate {
+  display_name?: string;
+  system_prompt?: string;
+  traits?: Record<string, unknown>;
+  boundaries?: string[];
+  scenario_prompts?: Record<string, string>;
+}
+
+/**
+ * 人格列表的一次响应（`GET /v1/personas`）。
+ *
+ * 契约写的是"直接回 `Persona[]`"，但 REST 列表端点回包一层 `{personas: [...]}`
+ * 也很常见。**两种形状都接受**（见 `api.listPersonas`）：读错形状的代价是
+ * 整页"暂无人设"——一个非常容易被误当成"用户真的还没建人设"的失败。
+ */
+export interface PersonaListResponse {
+  /** 后端实际字段名是 `items`（`PersonaListOut`）；`personas` 是接受别的写法。 */
+  items?: PersonaSummary[];
+  personas?: PersonaSummary[];
+  /** 当前激活的人格 id（`PersonaListOut.active_persona_id`）。 */
+  active_persona_id?: string | null;
+  active_id?: string | null;
+  total?: number;
 }
 
 export interface TimelineEvent {

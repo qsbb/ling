@@ -527,11 +527,7 @@ describe('保存失败：状态码各说各的话', () => {
     expect(notice.detail).toContain('不是你填错了');
   });
 
-  it('403 三种原因分开说（重新登录 / 来源 / 非 owner）', () => {
-    const relogin = describeSaveError(
-      apiError(403, 'forbidden', '修改接入器配置需要最近 15 分钟内重新登录过', 'recent_login_required'),
-    );
-    expect(relogin.text).toContain('最近 15 分钟');
+  it('403 两种原因分开说（来源 / 非 owner）', () => {
     const origin = describeSaveError(
       apiError(403, 'forbidden', '这个请求的来源不可信', 'bad_origin'),
     );
