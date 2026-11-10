@@ -39,6 +39,9 @@ from ling.domains.deferred.markers import (
     strip_defer_markers,
 )
 from ling.domains.media.video import (
+    MARKER_RE as WATCH_MARKER_RE,
+)
+from ling.domains.media.video import (
     finalize_reply_text,
     parse_watch_markers,
 )
@@ -933,6 +936,55 @@ class TurnCoordinator:
                     profile=profile,
                 )
 
+                # 一旦本流的**已生成原文**里出现过观看标记（完整的或半截的），
+                # 其后的正文就先不外发——它可能依赖"到底看到了什么"，而视频
+                # 要到这次生成**结束之后**才读。详见 `_watch_claim_held`。
+                def _watch_claim_held(raw: str) -> bool:
+                    """本轮正文是否必须暂扣到"观看结果确定"之后。
+
+                    ## 为什么必须暂扣（真实缺陷，不是预防性设计）
+
+                    R17 真实模型取证（`docs/evidence/r17-watch-willingness.md`）
+                    的 D2 轮：视频文件被删掉、读不到，她的**同一次输出**是
+                    ``<<看视频 m26defe>>\n看了，你这视频想让我看啥呀？``。
+
+                    读取发生在这次生成**结束之后**，所以写"看了"时她手里一个
+                    字都没有。更要命的是流式 delta **实时**推给前端
+                    （下面的 `queue.put(delta)`），用户眼睁睁看到她说"看了"——
+                    实测 6 轮里 1 轮、8 轮探针里 2 轮命中，是**用户可见的谎话**。
+
+                    原来的补救（`_follow_up_after_watch` 里那句"不要说你看过了"）
+                    只在**正文为空**时才送达，正文非空就完全没机会说出口。
+
+                    ## 判据为什么是"出现过标记"而不是"分析正文语义"
+
+                    分析语义（正则抓"看了/看过了"）既抓不全也误伤。而"出现过
+                    观看标记"是一个确定的事实：**只要她要去看，本轮正文的内容
+                    就可能依赖观看结果**。扣住它，等结果回来再决定，是唯一
+                    不会漏的做法。
+
+                    代价：写了标记的那一轮，正文不再逐字流式。这是**诚实的
+                    代价**——比起让用户先看到一句可能为假的"看了"，晚几百毫秒
+                    看到真话更对。**不含标记的普通轮次完全不受影响**（这里
+                    直接返回 False，一个字节都不扣）。
+                    """
+                    # **只认完整标记**，不认半截。
+                    #
+                    # 为什么不能把半截也算进来：`PENDING_MARKER_RE` 对
+                    # ``1<<`` 这种普通正文里的双尖括号也返回真（它此时确实
+                    # 无法区分"普通文本"与"标记开头"）。拿它当"她要看视频"
+                    # 的判据，`1<<2 就是 4` 这种正文就会被误扣——而且因为
+                    # 这条 `continue` 跳过了 `_visible`，`stream_hold` 里
+                    # 暂扣的 `<` 再也放不出来，正文被吃掉一个字符。
+                    # `test_recall_defects.py::test_normal_double_angle_survives_the_stream`
+                    # 抓到的就是这个（`1<<2 就是 4` → `1<2 就是 4`）。
+                    #
+                    # 半截标记的安全本来就不靠这里：`stream_safe_all` 会把它
+                    # 扣在 `stream_hold` 里不放出去，等闭合再决定。所以
+                    # "半截"由既有过滤器负责，"完整标记出现过"由这里负责，
+                    # 两者不重叠，也就不会互相打架。
+                    return WATCH_MARKER_RE.search(raw) is not None
+
                 def _visible(delta: str) -> str:
                     """流式 delta → 用户真的看得见的那部分。
 
@@ -1016,6 +1068,19 @@ class TurnCoordinator:
 
                         if not held_by_me:
                             # 仍在排队：本轮不产生任何对外片段
+                            continue
+
+                        # **依赖观看结果的正文先不外发。**
+                        #
+                        # 判据看的是**已累积的原文**（`delivered`），不是这一段
+                        # delta：标记可能跨 chunk，也可能出现在正文之前。
+                        # 一旦出现过观看标记，本轮后面的正文全部扣住，等
+                        # 视频读完再统一收尾（`_follow_up_after_watch`）。
+                        #
+                        # 代价与理由见 `_watch_claim_held` 的 docstring：
+                        # 写了标记的那一轮不再逐字流式，但不含标记的普通轮次
+                        # 一个字节都不扣。
+                        if _watch_claim_held(delivered):
                             continue
 
                         visible = _visible(chunk.delta)
@@ -1179,10 +1244,24 @@ class TurnCoordinator:
                     # **没看成也要补一次生成**（用户原话：「看视频额度如果没了
                     # 的话，直接把事实告诉主回复链路，让他进行按人设自然的回复」）。
                     #
-                    # 条件写的是"正文为空"而不是"observation 非空"：她这一轮
-                    # 只写了 `<<看视频 m3>>` 一个标记时，剥完就什么都没了——
-                    # 如果不补，用户看到的是空回复（而且不知道为什么）。
-                    if (observation or skipped) and not delivered.strip():
+                    # ## 什么时候必须补一次
+                    #
+                    # 两个条件**任一**成立就补：
+                    #
+                    # 1. 正文为空：她这一轮只写了 `<<看视频 m3>>` 一个标记，
+                    #    剥完就什么都没了。不补的话用户看到空回复，而且不
+                    #    知道为什么。
+                    # 2. **没看成**（`skipped` 非空）：即使已有正文也必须补。
+                    #    这是 R17 取证抓到的真实缺陷（D2）：正文与标记是
+                    #    **同一次生成**，写"看了"时视频还没读。原来这里要求
+                    #    "正文为空"才补，于是 D2 那句"不要说你看过了"根本
+                    #    没机会送达，用户看到的是谎话。
+                    #
+                    # 第 2 条的正文由 `_follow_up_after_watch` 丢弃并重写
+                    # （它不回传原正文），所以不会出现"旧谎话 + 新真话"
+                    # 拼接的情况。
+                    must_rewrite = bool(skipped) and bool(delivered.strip())
+                    if (observation or skipped) and (not delivered.strip() or must_rewrite):
                         delivered = await self._follow_up_after_watch(
                             messages=messages,
                             observation=observation,
