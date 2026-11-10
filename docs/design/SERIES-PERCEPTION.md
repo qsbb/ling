@@ -75,13 +75,15 @@
 
 这是临最反直觉、也最值得写清的部分。它经历了**一次明确的回退**。
 
-- **作者明确，历史**：`1.3.0` 时期确实跑过「快速动作模型」——一个独立、低延迟的 Provider，在正文生成的同时并行决定动作，CHANGELOG 记录过「允许快速动作通道与 AstrBot EventBus 动作工具在同一轮进行受控竞选；有明确情绪或互动语境时可自主选择一个轻微动作」，也记录过「修正快速动作启用时 EventBus 工具被提前禁用，导致主模型无法发起自主动作的问题」。（临/`CHANGELOG.md:423`、临/`CHANGELOG.md:427`）
-- **作者明确，回退**：`1.9.0` 全部撤掉——「普通对话不再启动快速动作 Provider，也不向主 LLM 暴露动作工具或动作反馈。明确动作继续由本地严格解析器处理；直连/降级适配器返回遗留动作字段时，编排层会收敛为 `talk/idle`」。（临/`CHANGELOG.md:275-278`）
+- **作者明确，历史**（⚠️ 以下版本号已按 `CHANGELOG.md` 原文更正，2026-11-11）：该能力 **`1.0.4`（`CHANGELOG.md:461`）上线**——「增加默认开启、可独立选模的异步快速动作通道；动作专用模型与 AstrBot EventBus 主回复并行，只输出严格白名单 `avatar.intent`」；**`1.0.7`（`:423`/`:427`）为巅峰**——CHANGELOG 记录「允许快速动作通道与 AstrBot EventBus 动作工具在同一轮进行受控竞选；有明确情绪或互动语境时可自主选择一个轻微动作」，并专门修了一个 bug「修正快速动作启用时 EventBus 工具被提前禁用，导致主模型无法发起自主动作的问题」。
+- **作者明确，回退**：**`1.1.4`（`CHANGELOG.md:256`，正文 `:275-278`）全部撤掉**——「普通对话不再启动快速动作 Provider，也不向主 LLM 暴露动作工具或动作反馈。明确动作继续由本地严格解析器处理；直连/降级适配器返回遗留动作字段时，编排层会收敛为 `talk/idle`」。
+  因此**该能力只存活约 9 天**（`1.0.4` 08-16 → `1.1.4` 08-24），不是跨多个大版本的长期演进。**注意 `## 1.9.0`（`:3`）只有一条 UI 优化，与动作回退无关**——此前版本曾误标为 1.3.0/1.9.0，已更正。
 - **作者明确，代码注释里的理由**（原文英文）：
 
   > Autonomous action selection is deliberately outside the main dialogue path. Ordinary turns must not spend provider time analysing whether the avatar should move. Explicit commands are handled by the deterministic branch above; touch/gesture events arrive through the interaction path separately.
 
-  （临/`core/turn_orchestrator.py:826-831`）
+  （临/`core/turn_orchestrator.py:827-831`）
+- **重要边界**：「模型选的动作不合时宜／不可控」这一层理由**文档完全没有记录**，属推断；唯一写下的理由是「不花 Provider 时间」。但 `1.1.4` 撤的不只是那个快 Provider，连**主 LLM 的动作工具与动作反馈一起撤了**，说明撤掉的是整条「模型决定动作」的路径。详见 `SERIES-EMBODIMENT-COMPROMISE.md` §3-C1。
 - **作者明确**：README 三处重申——「本插件…**也不让主对话 LLM 自主选择动作**」（临/`README.md:164`）；「普通对话由主 LLM 只生成自然语言回复，动作工具、动作反馈和遗留动作字段都不会暴露给它」（临/`README.md:160`）；「绝不把动作枚举交给主 LLM」（临/`README.md:208`）。
 - **实现核对，现在的动作来源有三条**：
   1. **显式指令**：`parse_explicit_action()` 做严格词法匹配，`MAX_COMMAND_CHARS=96`，主语/请求包装有界，否定、引用、假设、讨论、多动作表达一律 `rejected/ambiguous`。（临/`core/explicit_action_parser.py:1-60`、临/`README.md:160`）
