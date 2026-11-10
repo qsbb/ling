@@ -102,9 +102,19 @@ SENSITIVE_KEYS: frozenset[str] = frozenset(
 REDACTED = "[REDACTED]"
 
 # 值层面的已知模式：字符串里夹带的凭据也要拦
+#
+# **这里不猜厂商的密钥前缀。** 曾经有一条 `sk|pk|ghp|...` 的正则，只认
+# 下划线不认连字符，于是 `sk-...` 原样进日志；补上连字符之后又漏了
+# `sk-proj-...`。根因不是正则写得不全，而是"靠前缀猜密钥"这个方法本身
+# 就漏——密钥的格式由厂商和用户决定，下一个服务商换个前缀就绕过去了，
+# 自建/中转的 token 更是可以任意命名。
+#
+# 真正的防线是**按字段名**拦（`SENSITIVE_KEYS` 里的 `api_key` / `token` /
+# `authorization` / `secret` …）：它不依赖值长什么样。这里的模式只保留
+# 那些**有固定写法、不是某个厂商自定义**的形态——HTTP 鉴权头、URL 里的
+# 口令、长 hex 令牌。
 _VALUE_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._\-]{12,}"),
-    re.compile(r"\b(?:sk|pk|ghp|gho|ghs)_[A-Za-z0-9]{12,}"),
     re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),  # postgres://user:pass@host
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),  # 长 hex（openid/token 常见形态）
 )

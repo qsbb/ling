@@ -87,10 +87,6 @@ def test_nested_sensitive_keys_are_redacted() -> None:
     [
         "Authorization: Bearer abcdefghijklmnop123456",
         "postgresql+asyncpg://ling:s3cret@db:5432/ling",
-        # 拼接构造，避免源码里出现**令牌形状的字符串**：
-        # GitHub secret scanning 会对 ghp_ 开头的字面量报警，
-        # 这里是纯假的测试输入，不该污染告警。
-        "ghp_" + "a" * 24,
         "token " + "84b3453ef8654af2f7f782e1c8f99bff",
     ],
 )
@@ -100,6 +96,33 @@ def test_credential_patterns_in_values_are_redacted(raw: str) -> None:
     assert REDACTED in cleaned
     assert "s3cret" not in cleaned
     assert "abcdefghijklmnop" not in cleaned
+
+
+def test_vendor_key_prefixes_are_not_guessed() -> None:
+    """**不靠猜厂商前缀**脱敏——这是刻意的设计，不是遗漏。
+
+    曾经这里有一条 `sk|pk|ghp|...` 的正则。问题是密钥格式由厂商和用户决定：
+    补了 `sk-` 就连字符，还会漏 `sk-proj-`；自建服务 / 中转站的 token 更是
+    可以任意命名。靠前缀猜永远漏，而且每补一次都在加深"猜得够全"的错觉。
+
+    真正的防线是**按字段名**拦（`SENSITIVE_KEYS` 含 `api_key`/`token`/
+    `authorization`/`secret`…），它不依赖值长什么样。见下面那个用例。
+    """
+    # 厂商密钥形状的值**不会**被值模式命中——它们该走字段名那条路。
+    assert redact_value("sk-" + "a" * 24) == "sk-" + "a" * 24
+    assert redact_value("任意自定义格式的令牌XYZ123") == "任意自定义格式的令牌XYZ123"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["api_key", "apikey", "token", "access_token", "authorization", "secret", "password"],
+)
+def test_any_value_under_a_sensitive_key_is_redacted(key: str) -> None:
+    """字段名命中就整值替换——**不管值长什么样**，这才是兜得住的那道闸。"""
+    for value in ("sk-" + "a" * 24, "自定义格式令牌", "x"):
+        clean, hit = redact_mapping({key: value})
+        assert clean[key] == REDACTED, f"{key}={value!r} 没被拦住"
+        assert key in hit
 
 
 def test_long_values_are_truncated() -> None:
