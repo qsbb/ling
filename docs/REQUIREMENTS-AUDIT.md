@@ -35,7 +35,7 @@
 | **容器内验证（2026-11-10，0.0.7）** | ✅ **已验证**：GitHub Actions 的 CI 在 `postgres:16-alpine` **服务容器**里跑完整套，提交 `9bb12bb` 全绿——`web`（36s）、`test (py3.12)`（28m35s）、`test (py3.13)`（25m35s）三个 job 全部通过。容器日志实证：`docker create … postgres:16-alpine --health-cmd pg_isready -U ling -e POSTGRES_DB=ling_test`；依赖装好后 `ruff` All checks passed、`pytest tests -q -n auto` 全量通过（含 `test_migrations.py` 迁移用例）。前端 `vitest` 27 文件 766 passed / 45 skipped（browser 用例在无 Chromium 的 runner 上跳过，**那部分由本机真 Chromium 补**：7 个文件 46 项全部实跑未跳过）。 | 这不等于「打包镜像后起栈」的验证：容器里跑的是 `postgres:16-alpine` + 源码，**没有**构建 `deploy/Dockerfile.api`、也**没有**起 `deploy/compose.yaml` 全栈。镜像构建、入口脚本、卷权限、compose 网络仍未被自动化覆盖——那些只有真机 `docker build` + `docker compose up` 能验，而本机没有容器运行时。风险判断：迁移与 PG 行为是本项最可能漏的地方，已在容器内的 PG 16-alpine 上跑过；剩下的是部署层，与业务代码无关。 |
 | R21 后台真删 | **已接通**（2026-11-10 复核）：HTTP 入口已改走真删——`manage.py:300` `from ling.domains.memory.purge import MemoryPurgeError, request_purge`，`:305` 实际调用 `request_purge(...)`，不再是软清除。**失败留墓碑也已实现**：`purge.py:594` `_record_purge_failure()` 用**独立事务**写 `state='failed'`（`:618` `await fresh.commit()`），`purge.py:563` 是它的调用点。有测试钉住：`tests/unit/test_memory_purge_gaps.py:211` `test_failed_state_survives_the_rollback`、`tests/integration/test_memory_purge_flow.py:723`（「清理失败时墓碑必须真的变成 failed」）。 | 仍未验证的只有：代次栅栏对**旧事件**（`subject_id` 为空的那批）的行为、以及 `media_evidence.description`/知识项/提示词快照是否都纳入删除边界。这两项需要构造含旧事件的库来验收，普通测试覆盖不到。 |
 | R22 开源记忆设计调研 | **文档产出存在**：`docs/MEMORY-OSS-RESEARCH.md:1-20` 覆盖拟人化写入、召回、睡眠、遗忘（本次工作树未跟踪）。 | 调研产物不是记忆行为改善；随提交确认来源与可追溯性。 |
-| R23 注入正确性 | **边界已复现，不是"随机乱注入"**：候选 500 先截 `memory/service.py:559-574`；相对下限 + 保底 `kept or scored[:1]` 见 `:825-835`。实测（`_bm25_scores` 直接调用）：字面零命中的记忆**不会**进候选池（无 embedder 时只留 BM25>0）；但**弱相关的一定会**——只要它是唯一候选，`kept or scored[:1]` 就保底注入，不看绝对分。 | "无关记忆被注入"不是 bug 而是**相对阈值的固有天花板**：需要绝对分下限才能挡弱相关，而那会把"同义改写"也误杀。若要做，应先补 embedder 再谈阈值；当前无 embedder 的部署下这是已知取舍。 |
+| R23 注入正确性 | **边界已复现，不是"随机乱注入"**（2026-11-10 追加记忆召回实测，见「记忆召回与保留」第 49/56 条：确认候选池按时间截断会漏掉旧的高相关工作记忆，已用 xfail 钉住；账号合并后情节读不到已修）：候选 500 先截 `memory/service.py:559-574`；相对下限 + 保底 `kept or scored[:1]` 见 `:825-835`。实测（`_bm25_scores` 直接调用）：字面零命中的记忆**不会**进候选池（无 embedder 时只留 BM25>0）；但**弱相关的一定会**——只要它是唯一候选，`kept or scored[:1]` 就保底注入，不看绝对分。 | "无关记忆被注入"不是 bug 而是**相对阈值的固有天花板**：需要绝对分下限才能挡弱相关，而那会把"同义改写"也误杀。若要做，应先补 embedder 再谈阈值；当前无 embedder 的部署下这是已知取舍。 |
 | R24 异步工具 | **预算闸已接通并修掉两个真 bug**（2026-11-10）：新增 `domains/media/budget.py`，在 `run_read_job` 调模型前做**持久**预留（复用 `behavior_model_calls`，`kind=video_watch`），五条退出路径（认领失败/租约丢失/取消/异常/成功）都结清，失败与 unknown 占额不退款。**次数限制彻底去掉**（`VIDEO_MAX_CALLS_PER_DAY is None`，`reserve_behavior_call` 支持 `max_calls=None`），只守 token 额度。独立 QA 复验抓出两处真回归并已修：(a) 预算闸原在 `claim_read_job` 之后，额度用尽时 `transition(running,budget_denied)` 必抛 `InvalidJobTransition` → outbox 重试 5 次 → 用户看到 `failed` 而非 `budget_denied`；闸已前移到认领之前走 `pending→budget_denied` 合法边；(b) `describer is None`（模型路由未就绪，正常路径）在 `_settle_budget` 定义之前早退，每次重排漏一条永久占额的 `reserved`，已把检查前移。证据：`tests/integration/test_media_read_execution.py::test_budget_denied_settles_without_raising`、`::test_missing_describer_leaks_no_reservation`，两者均已变异测试确认会红。 | 真实用量 `actual_tokens` 仍记 `None`（缺 usage 不虚填 0），要拿到 provider usage 才能填实数。 |
 
 ## B. 对抗性审查：需求、真实 bug 与误报
@@ -195,14 +195,33 @@
 
 ### 记忆召回与保留
 
-49. 造 501 条授权断言，最旧一条高度相关，验证是否被 `updated_at` 候选池排除。依据：`memory/service.py:559-574`。
+49. 🔴 **【已实测：确认是缺陷，未修，已用 xfail 钉住】** 造 501 条授权断言，最旧一条高度相关，验证是否被 `updated_at` 候选池排除。
+    - **结论：会被排除，而且更糟**。候选池 `ORDER BY updated_at DESC LIMIT 500`（`memory/service.py:594-599`），
+      **按时间而非相关度**选候选。
+    - **对照实验**（唯一变量 = 条数）：500 条（含 needle）→ `mem_needle` 召回；
+      **501 条 → `hits=[]`，一条都不返回**。
+    - 用户视角：一年前告诉她的重要事情被忘掉，而一堆无关琐事还记得。
+      这与「重要的事该记得更牢」正好相反。
+    - **为什么本轮没修**：改召回路径要同时动 BM25/向量/重排三路与并集上限，
+      风险远大于收益，且当前无 embedder 的部署下没有可靠的"相关度"可用。
+      修法方向已写进用例（有界并集：`最近 N 条 ∪ 全文/向量命中的 M 条`）。
+    - 可复现形式：`tests/integration/test_memory_recall_scope.py::test_old_but_relevant_memory_survives_the_candidate_pool`
+      （标 `xfail`，修好后会 XPASS，那时去掉标记）。
 50. 强化旧记忆后复读 `updated_at`、`access_count`，先确定 onupdate 的真实行为。依据：`memory/service.py:1391-1413`。
 51. 只给一个弱语义候选，提问无关主题，检查是否仍注入首名。依据：`memory/service.py:650-676,825-835`。
 52. 无 embedder 且无 BM25/实体命中时应返回空，不要误报“一定注入”。依据：`memory/service.py:650-660`。
 53. reranker 对所有候选给零分时应允许空结果；现状保底首名。依据：`memory/service.py:1346-1377,825-835`。
 54. 断言和情节内容完全相同的窗口，检查是否各注入一次。依据：`memory/service.py:708-718,736-814`。
 55. 单主体 1 万条 episode 复测查询量/延迟；当前 SQL 无 LIMIT。依据：`memory/service.py:738-746`。
-56. 合并 A→B 后在 A 窗口问 B 的 episode，应读到；现状仅查 A。依据：`memory/service.py:553-565,741-743`。
+56. ✅ **【已实测：确认是缺陷，已修】** 合并 A→B 后在 A 窗口问 B 的 episode，应读到；原实现仅查 A。
+    - **实测**：修复前从 A 提问 `kinds={'fact': 1}`——断言读得到 B，**情节一条没有**；
+      修复后 `kinds={'episode': 1, 'fact': 1}`。
+    - **根因**：断言记忆用合并展开后的 `subjects` 集合查，情节用单个 `subject_id`
+      （`memory/service.py:765-775`）。同一个人两段记忆有一半是瞎的，
+      而且表现为"她记性不好"，看不出来是 bug。
+    - **已修**：情节查询改为 `MemoryEpisode.subject_id.in_(list(subjects))`，与断言同源。
+    - 回归：`test_memory_recall_scope.py::test_merged_subject_episodes_are_recalled_too`；
+      变异测试（退回单一 `subject_id`）→ `assert 'episode' in {'fact'}` 变红。
 57. 对同一偏好不同轮次提取，防止“总括+四单项”多次写入。依据：`memory/service.py:439-456`、开发库五条偏好文本。
 58. 验证 7 组重复 episode 的来源 turn 是否同一重放，避免误归因给提取模型。依据：开发库 live episode 重复组查询；本次未比对 `turn_id`。
 59. `core_memories` 与 `knowledge_items` 目前均 0，不能用空表断言检索质量。依据：开发库两表 `COUNT(*)=0`。

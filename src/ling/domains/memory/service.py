@@ -762,11 +762,18 @@ class MemoryService:
             )
         # 情节记忆（Episode）：同样是"先过滤受众，再排序"。
         # 长期承接"上次那个事"依赖它，而不是靠窗口短记忆（那个 2 小时就过期）。
+        # **合并过的账号要一起召回**，和上面断言记忆用同一份 `subjects`。
+        #
+        # 这里原来写的是 `MemoryEpisode.subject_id == subject_id`（单个），
+        # 而断言记忆那边用的是展开后的 `subjects` 集合。后果：A 合并进 B 之后，
+        # 从 A 的窗口问起，**断言读得到 B、情节读不到 B**——同一个人的两段记忆
+        # 有一半是瞎的，而且看不出是 bug（更像"她记性不好"）。
+        # 实测：同一关键词下 `kinds={'fact': 1}`，情节一条没来。
         episode_rows = list(
             (
                 await self._session.execute(
                     select(MemoryEpisode).where(
-                        MemoryEpisode.subject_id == subject_id,
+                        MemoryEpisode.subject_id.in_(list(subjects)),
                         MemoryEpisode.archived_at.is_(None),
                     )
                 )
