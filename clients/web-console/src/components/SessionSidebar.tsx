@@ -6,6 +6,7 @@ import {
   LogoutIcon,
   PencilIcon,
   PersonaIcon,
+  PinIcon,
   PlusIcon,
   SettingsIcon,
 } from './Icons';
@@ -135,6 +136,14 @@ interface SessionSidebarProps {
   onSelect: (sessionId: string) => void;
   onCreate: () => void;
   onRename: (sessionId: string, title: string) => Promise<void>;
+  /**
+   * 置顶 / 取消置顶。
+   *
+   * 为什么是 `Promise<void>` 而不是返回新记录：列表由上层持有，置顶会改变
+   * **顺序**，由上层按同一条规则重排才一致（`pinned` 字段就在记录里）。
+   * 这里只负责发起意图。
+   */
+  onPin: (sessionId: string, pinned: boolean) => Promise<void>;
   onNavigateSettings: () => void;
   onNavigatePersona: () => void;
   onLogout: () => void;
@@ -149,6 +158,7 @@ export function SessionSidebar({
   onSelect,
   onCreate,
   onRename,
+  onPin,
   onNavigateSettings,
   onNavigatePersona,
   onLogout,
@@ -180,6 +190,17 @@ export function SessionSidebar({
     (session) => session.message_count > 0 || session.session_id === currentId,
   );
 
+  // **置顶的排到前面**，组内保持后端给的顺序（= 最近活跃倒序）。
+  //
+  // 为什么不在这里再按 `updated_at` 排一次：后端 `sessions.py` 已经按
+  // `pinned_at DESC, 最近活跃 DESC` 给过顺序了。前端重排一遍就有了两套
+  // 排序规则，哪天两边不一致就是"列表看着乱但说不清哪不对"。
+  // 这里只做**分组**（置顶 / 非置顶），组内顺序原样保留。
+  const ordered = [
+    ...visible.filter((session) => session.pinned),
+    ...visible.filter((session) => !session.pinned),
+  ];
+
   return (
     <div className={`sidebar ${open ? 'sidebar--open' : ''}`} aria-label="会话列表">
       <button type="button" className="sidebar__scrim" aria-label="关闭会话列表" onClick={onClose} />
@@ -202,7 +223,7 @@ export function SessionSidebar({
           {visible.length === 0 ? (
             <p className="sidebar__empty">还没有会话</p>
           ) : (
-            visible.map((session) => {
+            ordered.map((session) => {
               const active = session.session_id === currentId;
               const editing = editingId === session.session_id;
               const heading = describeSession(session);
@@ -280,6 +301,30 @@ export function SessionSidebar({
                           onClick={() => startEdit(session)}
                         >
                           <PencilIcon />
+                        </button>
+                      ) : null}
+                      {/*
+                        置顶按钮。**只对能改名的会话显示**（`renamable`）：
+                        网页会话是我们自己的，渠道窗口（QQ 群/私聊）不归这里管，
+                        给它一个"置顶"按钮等于承诺一个管不住的东西。
+
+                        已置顶时图标实心 + `aria-pressed`，读屏能听出状态；
+                        取消置顶不弹确认——它是一个可逆的轻动作，
+                        弹确认只会让"点错了"比"撤销"更麻烦。
+                      */}
+                      {renamable ? (
+                        <button
+                          type="button"
+                          className={`session__pin-button icon-button ${session.pinned ? 'is-pinned' : ''}`}
+                          aria-label={
+                            session.pinned ? `取消置顶：${heading.title}` : `置顶：${heading.title}`
+                          }
+                          aria-pressed={Boolean(session.pinned)}
+                          title={session.pinned ? '取消置顶' : '置顶'}
+                          data-testid="session-pin"
+                          onClick={() => void onPin(session.session_id, !session.pinned)}
+                        >
+                          <PinIcon filled={Boolean(session.pinned)} />
                         </button>
                       ) : null}
                     </>

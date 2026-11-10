@@ -246,3 +246,62 @@ async def test_subject_and_window_exist_for_the_fixture(  # noqa: F811
     response = await logged_in.client.get("/v1/sessions")
     assert response.status_code == 200
     assert response.json()["sessions"], "会话列表为空，上面的排序用例没有意义"
+
+
+async def test_pin_endpoint_round_trips_and_exposes_the_field(logged_in: TestEnv) -> None:  # noqa: F811
+    """`POST /sessions/{id}/pin` 往返，且 `SessionRecord.pinned` 真的出现。
+
+    ## 为什么单独测这一个端点
+
+    排序本身有 `test_pinned_windows_come_first` 覆盖，但那条是**直接写库**
+    （`_make_window(pinned_at=…)`）。用户实际走的路径是 **API**：
+    `POST /pin` → 返回整条记录 → 前端拿 `pinned` 决定图钉状态与分组。
+
+    这两段之间断过一次：后端一直返回 `SessionRecord.pinned`、也一直支持
+    `/pin`，但前端从没消费（`clients/web-console/src/` 搜 `pinned` 零命中），
+    于是"能按好感度排"却"不能置顶"。所以这里断言的是**字段出现在响应里**，
+    不只是"库里那个时间是新的"——那正是当初漏掉的一环。
+
+    同时钉住幂等：重复置顶不报错（只刷新 `pinned_at`，于是"刚置顶的"
+    排到置顶组第一位），取消一个没置顶的也不报错。
+    """
+    import uuid
+
+    window_id = await _make_window(
+        logged_in, title=f"pin-{uuid.uuid4().hex[:8]}", updated_at=datetime.now(UTC)
+    )
+
+    # 1) 置顶：返回整条记录，`pinned` 为真
+    response = await logged_in.client.post(
+        f"/v1/sessions/{window_id}/pin", json={"pinned": True}
+    )
+    assert response.status_code == 200, response.text
+    record = response.json()
+    assert record["pinned"] is True, record
+    assert record["session_id"] == window_id
+
+    # 2) 列表里也带这个字段，且它排在前面
+    listed = (await logged_in.client.get("/v1/sessions")).json()["sessions"]
+    mine = [item for item in listed if item["session_id"] == window_id]
+    assert len(mine) == 1, listed
+    assert mine[0]["pinned"] is True
+    assert listed[0]["session_id"] == window_id, "置顶后没排到最前"
+
+    # 3) 幂等：重复置顶不报错
+    again = await logged_in.client.post(
+        f"/v1/sessions/{window_id}/pin", json={"pinned": True}
+    )
+    assert again.status_code == 200, again.text
+
+    # 4) 取消置顶：`pinned` 变回假
+    unpinned = await logged_in.client.post(
+        f"/v1/sessions/{window_id}/pin", json={"pinned": False}
+    )
+    assert unpinned.status_code == 200, unpinned.text
+    assert unpinned.json()["pinned"] is False
+
+    # 5) 幂等：取消一个没置顶的也不报错
+    noop = await logged_in.client.post(
+        f"/v1/sessions/{window_id}/pin", json={"pinned": False}
+    )
+    assert noop.status_code == 200, noop.text

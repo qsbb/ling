@@ -192,6 +192,14 @@ export interface ChatState {
   reloadSessions: () => void;
   createSession: () => void;
   renameSession: (sessionId: string, title: string) => Promise<void>;
+  /**
+   * 置顶 / 取消置顶。
+   *
+   * 成功后**替换整条记录**（后端返回的 `SessionRecord` 带新的 `pinned`），
+   * 顺序由 `SessionSidebar` 按 `pinned` 分组——两处共用同一个字段，
+   * 不在前端另存一份"置顶 id 集合"（两份状态必然有一天不一致）。
+   */
+  pinSession: (sessionId: string, pinned: boolean) => Promise<void>;
   selectSession: (sessionId: string) => void;
   dismissNotice: () => void;
   /** 她提议撤回、还没处理完的（挂在对应消息下面）。 */
@@ -999,6 +1007,20 @@ export function useChat(
     }
   }, []);
 
+  const pinSession = useCallback(async (sessionId: string, pinned: boolean) => {
+    try {
+      const updated = await api.pinSession(sessionId, pinned);
+      setSessions((prev) =>
+        prev.map((session) => (session.session_id === sessionId ? updated : session)),
+      );
+    } catch (error) {
+      const explained = explainError(error);
+      // 失败要说清"没置顶成功"，不能静默——用户会以为点上了，
+      // 下次刷新发现顺序没变，只会以为界面在乱跳。
+      setNotice({ kind: 'error', text: `${pinned ? '置顶' : '取消置顶'}失败：${explained.reason}` });
+    }
+  }, []);
+
   const selectSession = useCallback((sessionId: string) => {
     if (sessionId === currentIdRef.current) return;
     navigate(routePath({ name: 'chat', sessionId }));
@@ -1137,6 +1159,7 @@ export function useChat(
     reloadSessions,
     createSession,
     renameSession,
+    pinSession,
     selectSession,
     dismissNotice,
     recallProposals,

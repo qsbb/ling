@@ -36,9 +36,11 @@ LAN 机器上真实可用的 `:3002`，模型仍是 ling 配置里指定的 `hy3
 
 ```
 TurnCoordinator.run_turn
-  → context.compile（含 context.py:807-860 的「想看就写 <<看视频 mX>>」提示行）
+  → context.compile（含「想看就写 <<看视频 mX>>」提示行；取证当时在 `context.py:807-860`，
+    后续修复后移到 `:916`。引用前请 `grep -n "想看就写" src/ling/kernel/context.py` 重定位）
   → ModelRouter.stream（真实 HTTP 调用 hy3）
-  → parse_watch_markers（turn.py:1044）
+  → parse_watch_markers（取证当时在 `turn.py:1044`，R16 合入后移到 `:1235`。
+    引用前请 `grep -n "delivered, watch_refs = parse_watch_markers" src/ling/kernel/turn.py` 重定位）
   → _watch_videos → VideoWatchService → MediaDescriber → 抽帧 + 视觉模型
   → 写回 media_evidence.description
 ```
@@ -619,7 +621,7 @@ delta **分片实时**推送（`['\n看了', '，咋了', '？']`），不是流
 - 主人 03:57 发了个视频，你还没看。想看就写 <<看视频 m273eb2>>（这条标记不会发出去）。
 ```
 
-三处结构性缺陷（`context.py:788`、`796`、`846`）：
+三处结构性缺陷（取证当时在 `context.py:788`、`796`、`846`；**这三个位置在后来的修复中已全部改写**，见本节顶部状态标注。不要再引用这些行号：指到任何新位置都是错的）：
 
 1. **已描述条目不带短号**。`lines.append(f"- {who}{when}发的{label}：{description}{tag}")`
    里没有 `short_ref_for(evidence_id)`，而"待看"那条**有** `<<看视频 mXXXXXX>>`。

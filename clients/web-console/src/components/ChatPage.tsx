@@ -160,6 +160,7 @@ export function ChatPage({
           chat.createSession();
         }}
         onRename={chat.renameSession}
+        onPin={chat.pinSession}
         onNavigateSettings={onOpenSettings}
         onNavigatePersona={onOpenPersona}
         onLogout={onLogout}

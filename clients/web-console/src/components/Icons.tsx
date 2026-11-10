@@ -102,6 +102,21 @@ export function PencilIcon({ size = 15, className }: IconProps) {
   );
 }
 
+/**
+ * 图钉。置顶用。
+ *
+ * 两种状态画同一个形状、只换填充：`filled` 时实心（已置顶），否则空心。
+ * 用同一个 path 而不是两套图标，是为了让"置顶/取消置顶"的视觉差异只有
+ * 填充这一处——用户点它时知道自己点的还是同一个东西。
+ */
+export function PinIcon({ size = 15, className, filled = false }: IconProps & { filled?: boolean }) {
+  return (
+    <svg {...base(size, className)} fill={filled ? 'currentColor' : 'none'} strokeWidth={filled ? 1 : 1.7}>
+      <path d="M9 3h6l-1 6 3 3v2h-4v7l-1 1-1-1v-7H7v-2l3-3-1-6Z" />
+    </svg>
+  );
+}
+
 export function CloseIcon({ size = 18, className }: IconProps) {
   return (
     <svg {...base(size, className)}>

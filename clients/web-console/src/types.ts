@@ -27,6 +27,13 @@ export interface SessionRecord {
   channel?: string;
   /** 群号 / QQ 号。没有具体对端（网页会话）时为 null。 */
   peer_id?: string | null;
+  /**
+   * 是否置顶。后端早在 `contracts/v1.py` 返回这个字段，前端一直没消费——
+   * 于是"能按好感度排"（后端已修）但"不能置顶"。这里补上。
+   *
+   * 旧服务端没有这个字段，所以可选：缺失按"未置顶"处理，不报错。
+   */
+  pinned?: boolean;
 }
 
 export interface ChatMessage {

@@ -344,6 +344,17 @@ export const api = {
   createSession(title?: string): Promise<SessionRecord> {
     return request<SessionRecord>('/v1/sessions', jsonInit('POST', title ? { title } : {}));
   },
+  /**
+   * 置顶 / 取消置顶。后端**幂等**：重复置顶只刷新 `pinned_at`（于是"刚置顶
+   * 的那个"排到置顶组第一位），重复取消写回 NULL 也不报错。
+   *
+   * 返回整条 `SessionRecord`——前端直接替换列表里那一行，不必再拉一次列表。
+   */
+  pinSession(sessionId: string, pinned: boolean): Promise<SessionRecord> {
+    return request<SessionRecord>(`/v1/sessions/${encodeURIComponent(sessionId)}/pin`, {
+      ...jsonInit('POST', { pinned }),
+    });
+  },
   renameSession(sessionId: string, title: string): Promise<SessionRecord> {
     return request<SessionRecord>(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
       ...jsonInit('PATCH', { title }),

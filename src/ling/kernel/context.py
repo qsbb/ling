@@ -846,10 +846,12 @@ class ContextCompiler:
                 who = names.get(item.subject_id or "") or "有人"
                 when = _as_local_hint_seconds(item.created_at) if item.created_at else ""
                 if str(item.kind) == "video":
-                    mark = f"（短号 {short_ref_for(item.evidence_id)}）"
+                    media_mark = f"（短号 {short_ref_for(item.evidence_id)}）"
                 else:
-                    mark = f"（第 {index} 条）"
-                lines.append(f"- {who}{when}发的{label}{mark}：{item.description}{tag}")
+                    media_mark = f"（第 {index} 条）"
+                lines.append(
+                    f"- {who}{when}发的{label}{media_mark}：{item.description}{tag}"
+                )
             contributions.append(
                 ContextContribution(
                     lane="media",
@@ -1540,15 +1542,17 @@ class ContextCompiler:
                 content = f"{content}{SELF_RECALLED_NOTE}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
-            # 变量名带 `history_` 前缀：同一个 `compile()` 里媒体块还用了
-            # 一个 `mark`（`（短号 …）` / `（第 N 条）`，类型 `str`）。两个
-            # 不同含义的局部变量共用一个名字，`mypy` 会按**先出现的那个**定
-            # 类型（`str`），于是这里的 `dict.get()` 返回值 `str | None` 就报
-            # "Incompatible types in assignment"。改名是唯一诚实的修法——
-            # `# type: ignore` 会把这条真实存在的语义混淆藏起来。
-            history_mark = history_marks.get(msg.message_id) if role == "user" else None
-            if history_mark:
-                content = f"{MESSAGE_ID_MARKER.format(token=history_mark)} {content}"
+            # 媒体块那边的变量叫 `media_mark`（不是 `mark`），就是为了让这里
+            # 能用最自然的名字。同一个 `compile()` 里两个不同含义的局部变量
+            # 共用一个名字时，`mypy` 会按**先出现的那个**定类型，另一处就报
+            # "Incompatible types in assignment"——而报错行在后者、根因在前者，
+            # 很容易归错因（这件事真实发生过一次）。
+            #
+            # 约定：**新引入的变量让路**。媒体块的 `media_mark` 是后加的，所以
+            # 由它带前缀；历史块这个先存在，保持 `mark`。
+            mark = history_marks.get(msg.message_id) if role == "user" else None
+            if mark:
+                content = f"{MESSAGE_ID_MARKER.format(token=mark)} {content}"
             # 她自己说的、**现在还真撤得动**的那几条：前面标注撤回短号。
             #
             # 只标"查过确实能撤"的（见 `recallable_refs`），否则她照着写

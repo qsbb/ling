@@ -107,6 +107,7 @@ function renderSidebar(sessions: SessionRecord[]): string {
       onSelect={() => undefined}
       onCreate={() => undefined}
       onRename={async () => undefined}
+      onPin={async () => undefined}
       onNavigateSettings={() => undefined}
       onNavigatePersona={() => undefined}
       onLogout={() => undefined}
@@ -561,5 +562,66 @@ describe('消息列表渲染', () => {
     expect(html).toContain('成员 100200300');
     expect(countOf(html, 'class="message__sender-name"')).toBe(1);
     expect(countOf(html, 'class="message__sender-id"')).toBe(0);
+  });
+});
+
+/**
+ * 置顶：R8 的**前端**缺口。
+ *
+ * 后端一直在返回 `SessionRecord.pinned`、也一直支持
+ * `POST /sessions/{id}/pin`，但前端从没消费过——于是用户"能按好感度排"
+ * （后端已修）却"不能置顶"。这组用例钉住三件事：
+ *
+ * 1. 能置顶的会话上有按钮，且按钮带可读的状态（`aria-pressed`）；
+ * 2. 已置顶的排到前面，**组内顺序不变**（不另造一套排序规则）；
+ * 3. 渠道窗口（QQ 群/私聊）**不给**置顶按钮——那是管不住的东西。
+ */
+describe('置顶：按钮与排序（R8 前端）', () => {
+  it('已置顶的排在前面，组内保持后端给的顺序', () => {
+    const html = renderSidebar([
+      sessionFixture({ session_id: 'web-a', title: '我自己的会话 A', pinned: false }),
+      sessionFixture({ session_id: 'web-b', title: '我自己的会话 B', pinned: true }),
+      sessionFixture({ session_id: 'web-c', title: '我自己的会话 C', pinned: false }),
+    ]);
+    const a = html.indexOf('web-a');
+    const b = html.indexOf('web-b');
+    const c = html.indexOf('web-c');
+    expect(b).toBeGreaterThanOrEqual(0);
+    // 置顶的 B 必须在未置顶的 A、C 之前；A 与 C 之间保持原序。
+    expect(b).toBeLessThan(a);
+    expect(a).toBeLessThan(c);
+  });
+
+  it('按钮带 aria-pressed，读屏能听出"已置顶/未置顶"', () => {
+    const pinnedHtml = renderSidebar([
+      sessionFixture({ session_id: 'web-b', title: '已置顶', pinned: true }),
+    ]);
+    const plainHtml = renderSidebar([
+      sessionFixture({ session_id: 'web-a', title: '没置顶', pinned: false }),
+    ]);
+    expect(pinnedHtml).toContain('aria-pressed="true"');
+    expect(pinnedHtml).toContain('取消置顶');
+    expect(plainHtml).toContain('aria-pressed="false"');
+    expect(plainHtml).toContain('title="置顶"');
+  });
+
+  it('旧服务端没有 pinned 字段时按"未置顶"处理，不报错', () => {
+    const html = renderSidebar([
+      sessionFixture({ session_id: 'web-a', title: '旧服务端' }),
+    ]);
+    expect(html).toContain('aria-pressed="false"');
+  });
+
+  it('渠道窗口没有置顶按钮——那是这里管不住的东西', () => {
+    const html = renderSidebar([
+      sessionFixture({
+        session_id: 'onebot-default:group:100200300',
+        title: 'onebot-default:group:100200300',
+        channel: 'onebot-default',
+        peer_id: '100200300',
+      }),
+    ]);
+    expect(html).toContain('群 100200300');
+    expect(html).not.toContain('data-testid="session-pin"');
   });
 });
