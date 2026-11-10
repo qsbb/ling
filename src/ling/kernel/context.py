@@ -23,6 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.contracts.v1 import ContextContribution, Origin, Visibility
 from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
+from ling.domains.deferred.markers import defer_marker_prefix
+from ling.domains.deferred.state import MAX_DELAY_SECONDS
 from ling.domains.memory.service import MemoryService, RecallResult
 from ling.domains.persona.service import PersonaService, format_traits
 from ling.ports.config import EffectiveConfig, MemoryPolicy
@@ -156,12 +158,36 @@ def _as_local_hint(value: object) -> str:
 
     不做时区换算：上下文里只需要"大概什么时候"，而按服务器本地时区换算
     在跨时区部署时会整体偏——差 8 小时比只显示钟点更容易误导。
+
+    **精度只到分钟，不要用它区分同一分钟内的多条记录**：那会把两行写成
+    完全一样。媒体车道用 :func:`_as_local_hint_seconds`。
     """
     hour = getattr(value, "hour", None)
     minute = getattr(value, "minute", None)
     if hour is None or minute is None:  # pragma: no cover - 防御
         return " "
     return f" {hour:02d}:{minute:02d} "
+
+
+def _as_local_hint_seconds(value: object) -> str:
+    """`` 12:21:07 ``：媒体车道专用，精确到秒。
+
+    为什么媒体需要秒：同一个人连着发几条图片/视频时，它们的 ``created_at``
+    经常落在同一分钟里。分钟精度下，两块描述会渲染成**逐字相同的前缀**
+    （「主人 12:21 发的视频：」），她只能看到两段描述却分不出哪段对哪条，
+    实际表现就是把上一条的内容说成这一条的（见 R17 取证 A2/A4/B3）。
+    秒是顺手取的最近一级精度，不需要额外字段。
+
+    仍然不做时区换算，理由同 :func:`_as_local_hint`。
+    """
+    hour = getattr(value, "hour", None)
+    minute = getattr(value, "minute", None)
+    second = getattr(value, "second", None)
+    if hour is None or minute is None:  # pragma: no cover - 防御
+        return " "
+    if second is None:  # pragma: no cover - date/datetime 都有 second
+        return f" {hour:02d}:{minute:02d} "
+    return f" {hour:02d}:{minute:02d}:{second:02d} "
 
 
 def _fit_message_text(text: str, budget_tokens: int) -> str:
@@ -774,26 +800,66 @@ class ContextCompiler:
                     )
                 ).all()
                 names = {sid: str(name or "").strip() for sid, name in rows}
+            # **每条都要能被单独指认**，否则她只能挑最近的一条来用。
+            #
+            # 原来的行为（R17 取证 A2/A4/B3 复现过）：三行描述长得一模一样
+            # （「主人 12:21 发的视频：…」），她无法把某段描述对应到某个具体
+            # 视频，于是把**上一轮**的内容当成本轮的。三轮首次生成全部指向
+            # 上一轮，而读到观察后的第二次生成都正确——说明内容来自旧描述。
+            #
+            # 标识分两种，**因为能不能"再去看"不一样**：
+            # - 视频：用 `short_ref_for(evidence_id)`，与「待看」那条
+            #   `<<看视频 mXXXXXX>>` **同一个短号**。两套短号必然分叉，
+            #   分叉的表现是"她写的短号对不上任何视频"，比原缺陷更难查。
+            # - 图片/语音/表情：**不给短号**，只给序号。它们没有 `<<看视频>>`
+            #   这种可执行标记；给了短号她会以为也能"看"，写出一个对不上
+            #   任何视频的标记，白瞎一轮。
+            from ling.domains.media.video import short_ref_for
+
+            # 文案按**实际存在的种类**生成。写死"图片/语音"而列表里全是视频，
+            # 是在告诉她一件假事（`_MEDIA_KIND_LABELS` 早就有 video: "视频"，
+            # 是模板没跟上 kind）。
+            kinds_present: list[str] = []
+            for item in media_items:
+                kind_label = _MEDIA_KIND_LABELS.get(str(item.kind), str(item.kind))
+                if kind_label not in kinds_present:
+                    kinds_present.append(kind_label)
+            kinds_phrase = "/".join(kinds_present) or "媒体"
+
             lines = []
             any_inference = False
-            for item in media_items:
+            for index, item in enumerate(media_items, start=1):
                 inferred = item.description_origin == ORIGIN_MODEL
                 any_inference = any_inference or inferred
-                tag = "（你自己看图推断的，不确定）" if inferred else "（对方说的）"
-                who = names.get(item.subject_id or "") or "有人"
-                when = _as_local_hint(item.created_at) if item.created_at else ""
+                # `label` 必须在 `tag` **之前**取：tag 里要用它区分
+                # "看图片/看视频/看语音推断的"。
                 label = _MEDIA_KIND_LABELS.get(str(item.kind), str(item.kind))
-                lines.append(f"- {who}{when}发的{label}：{item.description}{tag}")
+                # 「推断」两个字**不能丢**：这条标注的全部意义是区分
+                # "她自己推断的"与"对方说的"。曾经有一版把它改成
+                # 「（你自己看到的，不确定）」——"看到的"读起来像**观察事实**，
+                # 而这批描述恰恰是模型的推断。改丢"推断"，标注就退化成
+                # 一句无信息量的免责声明，她可能把自己的猜测当成对方说的。
+                #
+                # 同时去掉「看图」：这一块现在混排图片/视频/语音，"看图"
+                # 对视频和语音都不成立。用"看{label}"保持逐类准确。
+                tag = f"（你自己看{label}推断的，不确定）" if inferred else "（对方说的）"
+                who = names.get(item.subject_id or "") or "有人"
+                when = _as_local_hint_seconds(item.created_at) if item.created_at else ""
+                if str(item.kind) == "video":
+                    mark = f"（短号 {short_ref_for(item.evidence_id)}）"
+                else:
+                    mark = f"（第 {index} 条）"
+                lines.append(f"- {who}{when}发的{label}{mark}：{item.description}{tag}")
             contributions.append(
                 ContextContribution(
                     lane="media",
                     # 混合时取**较弱**的保证：只要有一张是推断的，
                     # 整块就按推断标注，不能因为其余是人说的就放宽。
                     text=(
-                        f"这个窗口里最近的 {len(media_items)} 条图片/语音，你看到的是"
-                        "（对应历史里那些「发来一张图片」的消息）：\n"
+                        f"这个窗口里最近的 {len(media_items)} 条{kinds_phrase}——"
+                        "这些是你**之前**收发过的、已经知道内容的，**不是**这一轮新发的：\n"
                         + "\n".join(lines)
-                        + "\n更早的图/语音没有描述，你看不到，别假装看过。"
+                        + f"\n更早的{kinds_phrase}没有描述，你看不到，别假装看过。"
                         "\n标注为推断的内容只是你的猜测，不要当成对方告诉过你的事实。"
                     ),
                     origin=Origin.model_inference if any_inference else Origin.user_statement,
@@ -840,7 +906,9 @@ class ContextCompiler:
                 sender = video_names.get(video.subject_id or "") or "有人"
                 when = ""
                 if video.created_at is not None:
-                    when = _as_local_hint(video.created_at)
+                    # 与「已看过」那块用**同一级精度**：两块里的时间长得不一样
+                    # 时，她会以为说的是两件事。
+                    when = _as_local_hint_seconds(video.created_at)
                 ref = short_ref_for(video.evidence_id)
                 lines.append(
                     f"- {sender}{when}发了个视频，你还没看。想看就写 <<看视频 {ref}>>"
@@ -850,9 +918,12 @@ class ContextCompiler:
                 ContextContribution(
                     lane="media",
                     text=(
-                        "这个窗口里有你还没看过的视频：\n"
+                        "这个窗口里有你**还没看过**的视频——这些是新的，"
+                        "不是上面那些已经知道内容的：\n"
                         + "\n".join(lines)
                         + "\n只有你写了标记，才会去看；没写就当没看见，别假装看过。"
+                        "\n上面那条「之前收发过、已经知道内容的」列表里如果有视频，"
+                        "那是你看过的旧视频，不要拿它的内容当成这一条。"
                     ),
                     # 这是**我们自己**的状态提示，不是对方说的话
                     origin=Origin.model_inference,
@@ -1197,6 +1268,42 @@ class ContextCompiler:
             )
         )
 
+        # --- 「你可以晚点回」：只在**私聊**里给，且写明上限与"只写标记" ---
+        #
+        # 用户裁决（2026-11-10）：「只在她主动选择时才延后，且延后多久让她自由
+        # 发挥，上限 5 分钟」。所以这里做三件事，一件都不能少：
+        #
+        # 1. **说清是她自己决定**（"想晚点回就写"，不是"系统会安排"）；
+        # 2. **说清上限**（300 秒）——不写上限她会写 999，然后被代码钳到 300，
+        #    而用户看到的是"她等了 5 分钟"而不是"她想等 16 分钟"。上限写进
+        #    提示词能减少这种落差，但**不能代替**钳制与如实上报；
+        # 3. **说清"只写标记、不要写正文"**——标记旁边有正文时按坏格式处理
+        #    （不延后、正文照发），那是刻意的：她既然写了回复就是回了。
+        #    不写清这一条，她会一边说"等会儿"一边说正文，然后延后不生效，
+        #    而 `reason=body_present` 会堆成噪声。
+        #
+        # **群聊不给这个选项**：群里的"等会儿"是对着一群人说的，而群聊当前
+        # 不在 `deferred.service.SUPPORTED_CHANNELS` 里（外发闸管不到群渠道的
+        # 投递）。给了选项却做不到，比不给更糟。
+        if not is_group:
+            contributions.append(
+                ContextContribution(
+                    lane="capabilities",
+                    text=(
+                        "如果这一轮你现在不想马上回，可以只写一行 "
+                        f"`{defer_marker_prefix()}`（把 90 换成你想等的秒数，"
+                        f"最长 {MAX_DELAY_SECONDS} 秒），然后**不要再写别的正文**。"
+                        "写了这行，这一轮就不会立刻发出去，到点你会重新看到这个"
+                        "对话再回。\n"
+                        "不想等就别写它——绝大多数时候直接回就好。"
+                        "这行标记不会发给对方。"
+                    ),
+                    origin=Origin.verified_source,
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["capabilities"],
+                )
+            )
+
         # 车道预算执行：按字符近似 token（中文 1 字≈1 token，英文≈4 字符/token）。
         # 超预算的车道截断并保留省略标记，而不是让提示无限增长。
         #
@@ -1433,9 +1540,15 @@ class ContextCompiler:
                 content = f"{content}{SELF_RECALLED_NOTE}"
             if msg.origin in {Origin.external_observation, Origin.verified_source}:
                 content = f"{UNTRUSTED_WRAPPER}\n{content}"
-            mark = history_marks.get(msg.message_id) if role == "user" else None
-            if mark:
-                content = f"{MESSAGE_ID_MARKER.format(token=mark)} {content}"
+            # 变量名带 `history_` 前缀：同一个 `compile()` 里媒体块还用了
+            # 一个 `mark`（`（短号 …）` / `（第 N 条）`，类型 `str`）。两个
+            # 不同含义的局部变量共用一个名字，`mypy` 会按**先出现的那个**定
+            # 类型（`str`），于是这里的 `dict.get()` 返回值 `str | None` 就报
+            # "Incompatible types in assignment"。改名是唯一诚实的修法——
+            # `# type: ignore` 会把这条真实存在的语义混淆藏起来。
+            history_mark = history_marks.get(msg.message_id) if role == "user" else None
+            if history_mark:
+                content = f"{MESSAGE_ID_MARKER.format(token=history_mark)} {content}"
             # 她自己说的、**现在还真撤得动**的那几条：前面标注撤回短号。
             #
             # 只标"查过确实能撤"的（见 `recallable_refs`），否则她照着写

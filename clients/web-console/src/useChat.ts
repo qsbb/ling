@@ -24,6 +24,7 @@ import type {
   DeltaData,
   SessionRecord,
   SseEvent,
+  TurnDeferredData,
   TurnFinalData,
   TurnStartedData,
   TurnState,
@@ -203,6 +204,36 @@ export interface ChatState {
   confirmRecall: (proposal: RecallProposalView) => void;
   /** 点「算了」：只把提议标成 declined。 */
   declineRecall: (proposal: RecallProposalView) => void;
+}
+
+/**
+ * 把 `turn.deferred` 载荷变成一句给用户看的话。
+ *
+ * **钳过必须说出来**：她要求 999 秒、代码钳到 300 秒时，只说"等 5 分钟"
+ * 等于把系统的上限伪装成她的选择。这是本项目反复强调的一条底线（与"不许把
+ * 槽位忙包装成人格动作"同源），所以这里的文案分两种。
+ *
+ * 导出它是为了让单测直接断言文案，而不是去点 DOM 猜。
+ */
+export function describeDeferral(info: TurnDeferredData): string {
+  const applied = Math.round(Number(info.applied_seconds ?? 0));
+  const requested = Math.round(Number(info.requested_seconds ?? applied));
+  const human = formatDuration(applied);
+  if (info.clamped && requested > applied) {
+    return `她说等会儿再回（本来想等 ${formatDuration(requested)}，最长只能等 ${human}）`;
+  }
+  return `她说等会儿再回（大约 ${human} 后）`;
+}
+
+/** 秒 → 人话时长。60 秒以上说"X 分钟"，否则说"X 秒"。 */
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '一会儿';
+  if (seconds >= 60) {
+    const minutes = seconds / 60;
+    const rounded = Math.round(minutes * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)} 分钟`;
+  }
+  return `${Math.round(seconds)} 秒`;
 }
 
 export function useChat(
@@ -480,6 +511,17 @@ export function useChat(
         setMessages((prev) => prev.filter((message) => message.key !== actorKey));
       };
 
+      /*
+       * 这一轮收到的 `turn.deferred` 载荷（如果有）。
+       *
+       * 为什么放在 `applyFinal` 外面：`turn.deferred` 与 `turn.completed` 是
+       * **两个**事件，而"她延后了"这个事实要影响终态的处理（不画空气泡、
+       * 把说明挂到用户消息上）。用一个闭包变量把两件事连起来，比在
+       * `TurnFinalData` 上加一个"这一轮延后过"的布尔更诚实——后者会让
+       * `turn.completed` 看起来自带延后语义，而它其实没有。
+       */
+      let deferredInfo: TurnDeferredData | null = null;
+
       const applyFinal = (eventName: string, data: TurnFinalData) => {
         terminal = true;
         const serverMessage = (data.message ?? null) as ChatMessage | null;
@@ -507,6 +549,28 @@ export function useChat(
             retriable: explained.retriable || finalState === 'failed',
             local: false,
           });
+        } else if (deferredInfo && !serverMessage && !accumulated) {
+          /*
+           * 她**选择**过一会儿再回：这一轮确实没有正文，但**不是**空回复。
+           *
+           * 处置与 `silence` 相同（不留空气泡、把说明挂到用户那条消息上），
+           * 区别只在文案：延后是"她说了会回"，沉默是"她这次不打算说"。
+           * 混成同一句会让用户以为她不想理人。
+           *
+           * 钳过时必须让用户看得出来（`clamped` + `requested_seconds`）：
+           * 只显示实际等 5 分钟，等于把系统的上限说成她的选择——用户会以为
+           * 她只想等 5 分钟，而她想等 16 分钟。
+           */
+          removeActor();
+          if (userKey) {
+            updateUser({
+              state: 'completed',
+              local: false,
+              silenceReason: describeDeferral(deferredInfo),
+            });
+          }
+          setActiveTurn(null);
+          return;
         } else if (data.decision === 'silence' && !serverMessage && !accumulated) {
           // 她选择不说话。**不能**留一个空气泡——那会渲染成「（无内容）」，
           // 看起来像生成失败，和"她这次不想说"完全是两回事。
@@ -613,6 +677,21 @@ export function useChat(
             accumulated += chunk;
             ensureActor();
             updateActor({ text: accumulated, state: 'streaming' });
+            break;
+          }
+          case 'turn.deferred': {
+            /*
+             * 她**选择**过一会儿再回。服务端在原轮 `_finalize` 之前发这个事件，
+             * 所以它一定先于 `turn.completed`（有服务端用例钉这个顺序）。
+             *
+             * 这里的职责只有两条：
+             * 1. 把"她在等"挂到用户那条消息上（和"她没回"同一个位置，
+             *    因为对用户来说都是"暂时没有回复"）；
+             * 2. **不画空气泡**——延后不是"她回了一条空的"。
+             */
+            const data = event.data as unknown as TurnDeferredData;
+            if (typeof data.turn_id === 'string') turnId = data.turn_id;
+            deferredInfo = data;
             break;
           }
           case 'turn.completed':

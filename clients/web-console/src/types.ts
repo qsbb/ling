@@ -814,6 +814,30 @@ export interface DeltaData {
   turn_id?: string;
 }
 
+/**
+ * `turn.deferred`：她**选择**过一会儿再回（不是失败、也不是沉默）。
+ *
+ * 服务端在原轮 `_finalize` **之前**发这个事件，所以它一定先于 `turn.completed`。
+ * 前端靠这个顺序决定"显示她说等会儿"还是"显示一条空回复"——后者是 bug 的样子。
+ *
+ * ## 三个时长字段必须一起看
+ *
+ * `requested_seconds` 是她**真正要求**的，`applied_seconds` 是代码实际用的
+ * （≤300），`clamped` 说明两者不等。只显示 `applied_seconds` 等于把系统的
+ * 上限说成她的选择——用户会以为她只想等 5 分钟，而她想等 16 分钟。
+ * 钳过时必须让用户看得出来。
+ */
+export interface TurnDeferredData {
+  turn_id: string;
+  delay_id?: string;
+  requested_seconds?: number;
+  applied_seconds?: number;
+  clamped?: boolean;
+  due_at?: string;
+  hard_deadline_at?: string;
+  note?: string;
+}
+
 export interface TurnFinalData {
   turn_id: string;
   state: TurnState;

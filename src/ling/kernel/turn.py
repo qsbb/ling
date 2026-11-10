@@ -32,16 +32,30 @@ from ling.domains.conversation.recall import (
     resolve_recall_ref,
 )
 from ling.domains.conversation.service import ConversationService, MessageView
+from ling.domains.deferred.markers import (
+    DeferIntent,
+    parse_defer_marker,
+    stream_safe_deferred,
+    strip_defer_markers,
+)
 from ling.domains.media.video import (
     finalize_reply_text,
     parse_watch_markers,
 )
 from ling.infra.db import session_scope
-from ling.infra.models import ActorEvent, ActorState, OutboxEvent, PromptSnapshot, utcnow
+from ling.infra.models import (
+    ActorEvent,
+    ActorState,
+    Message,
+    OutboxEvent,
+    PromptSnapshot,
+    utcnow,
+)
 from ling.kernel.arbiter import SpeakerArbiter
 from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.marker_stream import stream_safe_all, strip_all_markers
 from ling.kernel.stream_log import StreamLog
+from ling.logging_setup import emit_event
 from ling.models.router import ModelRouter
 from ling.ports.config import EffectiveConfig
 from ling.ports.model import ChatMessageIn, ModelError, ModelErrorKind
@@ -592,6 +606,16 @@ class TurnCoordinator:
         # 不传就用默认装配（自己去找设置/连接器/媒体取用函数，见
         # `domains/media/watch.py::default_watch_callback`）。
         watch_video: Callable[[str, list[str]], Awaitable[dict[str, object]]] | None = None,
+        # 外发前的最后一道闸（可选）。返回 False = **不许外发**，正文仍落库。
+        #
+        # 为什么需要它：延后回复在生成期间用户完全可能又说话了。那一轮生成出来的
+        # 内容不该插进新话题（"迟到补话"，`docs/ASYNC-TOOL-DECISION.md` 明令
+        # 禁止）。而"生成完再判"在 `_finalize` 里已经太晚——那时消息已经落库、
+        # `turn.completed` 已经带上它了。所以判据要能在**落库之前**被问到。
+        #
+        # 只有延后回复那条路径会传它（见 `worker.py` 的 `_run_deferred_turn`）；
+        # 普通对话不传 = 不设闸，行为完全不变。
+        deliver_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._router = router
         self._watch_video = watch_video
@@ -610,6 +634,7 @@ class TurnCoordinator:
         # 进程内 arbiter 只覆盖单进程。
         self._speak_lease = speak_lease
         self._secret_reader = secret_reader
+        self._deliver_gate = deliver_gate
 
     def partial_text(self, turn_id: str) -> str:
         """已经流出来的**部分**正文（内存态）。
@@ -911,20 +936,39 @@ class TurnCoordinator:
                 def _visible(delta: str) -> str:
                     """流式 delta → 用户真的看得见的那部分。
 
-                    **两种标记都要挡**（`<<看视频 …>>` 与 `<<撤回 …>>`）。原来
-                    这里只调了 `strip_watch_markers`，于是 ``<<撤回 r3f2a1>>``
-                    原样出现在气泡里，等落库时才洗掉——用户先看到说明书，再看它
-                    消失。流式是唯一"用户看得见中间态"的出口，漏一种就等于漏给
-                    用户。
+                    **三种标记都要挡**（`<<看视频 …>>` / `<<撤回 …>>` /
+                    `<<等会回 …>>`）。它们都是"说明书"：落库时会洗掉，但流式
+                    是**唯一让用户看见中间态的出口**——在这里漏一种，用户就会
+                    先看到 ``<<撤回 r3f2a1>>`` 再看到它消失。
 
-                    半截暂扣与完整标记剥离都收在 `marker_stream` 里：两条标记的
-                    待扣尾巴必须由**同一个**函数判定，否则串起来会互相吞
-                    （见 `kernel/marker_stream.py` 的模块注释）。
+                    ## 组合规则：各跑一遍**同一份**原始文本，取更保守的暂扣
+
+                    **不能**把一条过滤器的输出当成另一条的输入串起来跑：
+
+                        ready, hold = stream_safe_all(text)
+                        ready2, _ = stream_safe_deferred(ready + hold)   # ← 错
+
+                    看起来只是"多过一道"，实际会把 `stream_safe_all` 刚扣下的
+                    `<<撤` 原样放出去——因为 `<<撤` 对延后过滤器而言只是普通
+                    正文。这个错误真实发生过，`test_recall_defects.py` 里 6 条
+                    `never_reaches_the_client` 当场变红。
+
+                    正确做法：两条各跑**同一份** `text`，谁扣得多用谁。
+                    扣得多 = 更保守 = 交集，不重不漏。
+
+                    **加第四条标记时**：照这个形状再接一条独立过滤器，不要串进
+                    中间。`tests/unit/test_deferred_stream_filters.py` 是这条
+                    不变式的护栏（含一条 `by_design` 反例，断言错误写法确实会
+                    出错）。
                     """
                     nonlocal stream_hold
                     stream_hold += delta
-                    ready, stream_hold = stream_safe_all(stream_hold)
-                    return strip_all_markers(ready)
+                    ready, hold = stream_safe_all(stream_hold)
+                    ready_defer, hold_defer = stream_safe_deferred(stream_hold)
+                    if len(hold_defer) > len(hold):
+                        ready, hold = ready_defer, hold_defer
+                    stream_hold = hold
+                    return strip_all_markers(strip_defer_markers(ready))
 
                 try:
                     async for chunk, outcome in self._router.stream(
@@ -1041,6 +1085,88 @@ class TurnCoordinator:
                 # 不同的故障（前者查模型/上下文，后者查标记与出口清洗）。
                 # 只报"没有可交付文本"会把两者混成一种，运维无从下手。
                 raw_chars = len(delivered)
+
+                # ---- 延后意图：与 `parse_watch_markers` **同一层** ----
+                #
+                # 为什么放在这一层：两者都是"说明书标记"（她对自己这一轮怎么
+                # 收尾的选择），都在模型输出结束之后、`_finalize` 之前被解析。
+                # **不插进**下面那几对"顺序不能反"的中间：
+                #
+                #   - `parse_watch_markers` 之后（先读视频，再决定收尾）；
+                #   - `_collect_recall_proposals` 之前（撤回要先落提议再剥正文）。
+                #
+                # 延后判定只关心"标记之外还有没有正文"，与视频、引用、撤回互不
+                # 影响，所以放在"视频已处理完、正文即将定稿"这个位置是安全的。
+                #
+                # ## 三种结果，对应两类日志
+                #
+                # - **合法**（只有标记，或标记 + 纯空白）：登记延后，本轮不发。
+                #   日志 `reply_deferred`，`cause=volition`——**她**选的。
+                # - **坏格式**（标记 + 正文、负数、非数字、缺秒数、多个标记）：
+                #   剥掉标记、正文照发、立即回复。日志 `reply_defer_rejected`。
+                #   **不**记 `reply_deferred`：那是"她真的延后了"的统计，混进
+                #   坏格式会让这个数字失去意义（lead 明确要求）。
+                # - **没标记**：什么都不做，更不记日志。
+                #
+                # 注意 `parse_defer_marker` **不做钳制**：钳制是策略、解析是
+                # 事实。混在一起会让"她要求过 16 分钟"这个事实在解析阶段就
+                # 消失，而它恰恰是要如实上报给用户的东西。
+                delivered, defer_intent, defer_bad = parse_defer_marker(delivered)
+                if defer_bad:
+                    emit_event(
+                        logger,
+                        logging.INFO,
+                        event_name="reply_defer_rejected",
+                        message="她那轮写了延后标记，但格式不可用；按立即回复处理",
+                        attributes={
+                            "turn_id": turn_id,
+                            "window_id": window_id,
+                            "reason": defer_bad,
+                            # 坏格式是**她的表达问题**，不是系统故障。
+                            # `cause=volition` 让统计能把两类分开。
+                            "cause": "volition",
+                        },
+                    )
+                if defer_intent is not None and not delivered.strip():
+                    # 合法延后：到点再说。**本轮不产生任何外发**。
+                    defer_plan = await self._schedule_deferred(
+                        conversation=conversation,
+                        window_id=window_id,
+                        subject_id=subject_id,
+                        turn_id=turn_id,
+                        intent=defer_intent,
+                        user_text=user_text,
+                    )
+                    if defer_plan is not None:
+                        # `turn.deferred` 必须**先于** `turn.completed` 发出：
+                        # 前端靠这个顺序决定显示"她说等一会儿"还是"她回了
+                        # 一条空的"（后者是 bug 的样子）。
+                        await queue.put(
+                            TurnStreamEvent(event="turn.deferred", data=defer_plan)
+                        )
+                        await self._finalize(
+                            conversation=conversation,
+                            window_id=window_id,
+                            subject_id=subject_id,
+                            turn_id=turn_id,
+                            # 正文为空：**标记不进库、不外发**。
+                            delivered="",
+                            target_label=target_label,
+                            stopped=False,
+                            error=None,
+                            queue=queue,
+                            attempt=attempt,
+                            user_text=user_text,
+                            floor_held=held_by_me,
+                            floor_lost=lease_lost,
+                            source_account=source_account,
+                            replyable_ids=replyable_ids,
+                            raw_chars=raw_chars,
+                            handled_as="deferred",
+                        )
+                        # 提前退出：`_finalize` 已经落库并发了终态事件。
+                        # `finally` 仍会回收发言权、清停止标记、关闭队列。
+                        return
                 delivered, watch_refs = parse_watch_markers(delivered)
                 if watch_refs:
                     # 她这一轮想看一眼视频。**先读，再决定怎么收尾**：
@@ -1324,6 +1450,106 @@ class TurnCoordinator:
                 )
         return False
 
+    async def _schedule_deferred(
+        self,
+        *,
+        conversation: ConversationService,
+        window_id: str,
+        subject_id: str,
+        turn_id: str,
+        intent: DeferIntent,
+        user_text: str,
+    ) -> dict[str, object] | None:
+        """把她的延后意图登记成一条持久记录，返回 `turn.deferred` 的载荷。
+
+        返回 ``None`` = 登记失败（重复登记 / 库出错），调用方应当**按正常回复
+        继续走**而不是"延后了但没人知道"。宁可立刻回，也不要许诺一个没人跟踪的
+        未来。
+
+        ## 载荷里必须同时带三个数
+
+        `requested_seconds`（她要的）、`applied_seconds`（实际用的）、
+        `clamped`（两者不等）。只带钳后值等于把"系统上限"说成"她的选择"——
+        那是本项目明令禁止的一类事实伪造（与"把槽位忙包装成人格选择"同一条
+        底线）。前端要能说"她本来想等更久"。
+
+        ## `input_sequence` 从哪来
+
+        当前窗口里**最大的用户消息序号**（就是她这一轮在回的那条）。
+        到点时任何比它更大的用户消息都意味着"用户又说话了"→ 作废这条延后。
+        派生栅栏，没有写入点，也就没有漏写的可能。
+        """
+        from sqlalchemy import func, select
+
+        from ling.domains.deferred import service as deferred
+        from ling.infra.models import Message
+
+        sequence = await conversation.session.scalar(
+            select(func.max(Message.sequence)).where(
+                Message.window_id == window_id, Message.role == "user"
+            )
+        )
+        from ling.infra.models import Window
+
+        window = await conversation.session.get(Window, window_id)
+        channel = str(getattr(window, "channel", "") or "")
+        if channel not in deferred.SUPPORTED_CHANNELS:
+            # 不支持的渠道：**不登记**，让她正常回。
+            # 登记了却到点发不出去，用户会白等一轮——比不支持更糟。
+            logger.info(
+                "延后回复在渠道 %r 上不支持，按立即回复处理 turn=%s", channel, turn_id
+            )
+            return None
+
+        row = await deferred.schedule(
+            conversation.session,
+            actor_id=self._actor_id,
+            window_id=window_id,
+            subject_id=subject_id,
+            source_turn_id=turn_id,
+            source_message_id=None,
+            input_sequence=int(sequence or 0),
+            applied_delay_ms=int(intent.applied_seconds) * 1000,
+            requested_delay_ms=int(intent.requested_seconds) * 1000,
+            clamped=bool(intent.clamped),
+        )
+        if row is None:
+            # 同一轮已经有一条了（重试 / 两个入口都解析到标记）。
+            # 不重复登记，也不谎报"已延后"。
+            logger.info("延后回复重复登记，按立即回复处理 turn=%s", turn_id)
+            return None
+
+        # 行为日志：`cause=volition` —— **她**选的延后，不是系统限制。
+        # 与"模型慢导致的沉默/迟到"严格分开（后者只记运行日志，从不记
+        # `reply_deferred`），否则这个统计会变成噪声。
+        emit_event(
+            logger,
+            logging.INFO,
+            event_name="reply_deferred",
+            message="她选择过一会儿再回",
+            attributes={
+                "turn_id": turn_id,
+                "window_id": window_id,
+                "delay_id": row.id,
+                "requested_seconds": int(intent.requested_seconds),
+                "applied_seconds": int(intent.applied_seconds),
+                "clamped": bool(intent.clamped),
+                "cause": "volition",
+            },
+        )
+        return {
+            "turn_id": turn_id,
+            "delay_id": row.id,
+            # 前端要能说"她本来想等更久"，所以三个数都要带。
+            "requested_seconds": int(intent.requested_seconds),
+            "applied_seconds": int(intent.applied_seconds),
+            "clamped": bool(intent.clamped),
+            "due_at": row.chosen_due_at.isoformat(),
+            "hard_deadline_at": row.hard_deadline_at.isoformat(),
+            # 这条必须在前端说明"她现在不会立刻回"。
+            "note": "她选择过一会儿再回这条消息",
+        }
+
     async def _watch_videos(self, window_id: str, refs: list[str]) -> dict[str, object]:
         """按标记读视频，返回**结构化**结果（看到了什么 / 为什么没看成）。
 
@@ -1593,6 +1819,13 @@ class TurnCoordinator:
         # 对不上就降级成普通消息（绝不整条失败）。None = 这批信息不可用
         # （例如编译之前就失败的路径），此时不做校验，保持老行为。
         replyable_ids: dict[str, str] | None = None,
+        # 这一轮的处置方式。默认按状态推断；延后回复显式传 ``"deferred"``。
+        #
+        # 为什么需要显式传：默认识别的三条分支都在看"有没有正文"（回复了 /
+        # 没交付 / 洗空了），而延后**既不是回复也不是失败**——她确实做了决定
+        # （选择晚点回），只是这一轮没有话要说。塞进任何一条现有分支都会让
+        # 库里写着 `failed`，而用户看到的是一条"她说等会儿"的正常轮次。
+        handled_as: str | None = None,
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -1603,6 +1836,33 @@ class TurnCoordinator:
         else:
             state = TurnState.completed
             code = None
+
+        # 外发前的最后一道闸：**在消息落库与事件发出之前**问一次。
+        #
+        # 目前只有延后回复那条路径会装它（`worker._run_deferred_turn`）：生成
+        # 要几十秒，这期间用户完全可能又说话了，那一轮的内容不该插进新话题。
+        #
+        # 闸不通过时的处置：正文**不落库、不外发**，但轮次状态照常终结为
+        # `completed`——她确实说完了这一轮，只是这句话作废了。把状态改成
+        # failed 会谎报"生成失败"，而生成其实成功了。
+        #
+        # 放在这里而不是更早，是因为"早"意味着在流式阶段就判；那时正文还没
+        # 生成完，判了也只能停掉一半。放在落库前是**唯一**能同时保证
+        # "不落库 + 不外发 + 状态如实"的位置。
+        if self._deliver_gate is not None and state is TurnState.completed:
+            try:
+                may_deliver = await self._deliver_gate()
+            except Exception as exc:  # noqa: BLE001 - 闸自己坏了按不许外发处理
+                logger.warning("外发闸判定失败，按不外发处理：%s", type(exc).__name__)
+                may_deliver = False
+            if not may_deliver:
+                logger.info(
+                    "外发闸拦下本轮 turn=%s window=%s（正文 %d 字不落库、不外发）",
+                    turn_id,
+                    window_id,
+                    len(delivered),
+                )
+                delivered = ""
 
         # 最后一道闸：**完整标记与半截标记**都不许进库/外发。
         #
@@ -1734,7 +1994,28 @@ class TurnCoordinator:
         # 「完成」也有两种：真的把她的话交出去了，以及**生成了却没交出去**
         # （发言权被另一个窗口占着 / 正文被标记洗空）。后者以前会落进第一个
         # 分支，于是库里写着 `replied`、对方一个字都没收到——最难查的组合。
-        if state is TurnState.completed and delivered and floor_held:
+        if handled_as == "deferred":
+            # **先判延后**：它的正文必然是空的，会被下面"洗空了"那条分支
+            # 误判成失败。
+            #
+            # 为什么不走 `correct_handled_for_turn`：那个方法的 outcome 白名单
+            # 只有 replied/stopped/failed/ignored，而 `deferred` 属于 conversation
+            # 域的词表——加它要改那个域（不在本任务范围，且会牵动它的调用方）。
+            #
+            # 这里直接按 turn_id 改这一轮的用户消息：`kernel/turn.py` 本来就在
+            # 直接读写 models（OutboxEvent / PromptSnapshot / ActorEvent 都是），
+            # 所以这不算越界，影响面也最小。
+            #
+            # `handled_as` 是自由字符串列（`String(24)`），库里没有 CHECK 约束，
+            # 所以**不需要迁移**。取值 `deferred` 的语义是"她收到了这条，并决定
+            # 晚点再回"——与 `ignored`（决定不回）和 `replied`（已经回了）都不同。
+            await conversation.session.execute(
+                update(Message)
+                .where(Message.turn_id == turn_id, Message.role == "user")
+                .values(handled_as="deferred", handled_reason="她选择过一会儿再回")
+            )
+            await conversation.session.flush()
+        elif state is TurnState.completed and delivered and floor_held:
             await conversation.correct_handled_for_turn(turn_id, outcome="replied")
         elif state is TurnState.completed and delivered:
             await conversation.correct_handled_for_turn(

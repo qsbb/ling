@@ -139,6 +139,17 @@ def _fallback_payload(notice: dict[str, object]) -> dict[str, object]:
     return FallbackNotice.model_validate(notice).model_dump(mode="json")
 
 
+def _scene_unknown_note(expired: bool) -> str:
+    """场景不可用时给首屏的一句人话。
+
+    过期与"从没有"要分开说：前者是"之前有过、现在不作数了"，后者是
+    "还没有过"。混成一句"场景未知"会让人以为读取失败。
+    """
+    if expired:
+        return "她此刻在做什么：上一次的场景已经过期，按不知道处理"
+    return "她此刻在做什么：还不知道（还没有可用的场景）"
+
+
 async def _guard(name: str, coro: Any, session: Any) -> dict:
     """跑一个片段的查询；失败只标记这一块，不影响整页。
 
@@ -316,12 +327,23 @@ async def get_dashboard(
                     "expired": scene.expired,
                     # 只给状态，不给自由文本：scene 的 activity/place 属于事实层，
                     # 首屏不需要，也不该在这里被读成"她正在做 X"。
+                    #
+                    # `note` 是**场景**这一块的人话。加这个字段是因为
+                    # `describe` 曾经一词两义：它本意是**可用性**说明
+                    # （"可以随时说话"），却被前端渲染成这张卡唯一的一句描述、
+                    # 紧挨着讲场景的 `FallbackHint`——于是"状态正常，可以随时
+                    # 说话"会被读成"她的场景正常"，而场景其实是 unknown。
+                    # 两件事必须各有各的话。
+                    "note": scene.describe() or _scene_unknown_note(scene.expired),
                 },
                 "fallback": _fallback_payload(scene_input.notice()),
-                # `describe()` 是给表达层的一句话：正常时它**故意返回空串**
-                # （正常不需要额外约束）。首屏上留白会让人以为没读到，
-                # 所以这里补一句人话，但实质仍是那个唯一结论。
-                "describe": view.describe() or "状态正常，可以随时说话",
+                # `describe()` 是给**表达层**的一句话：正常时它**故意返回空串**
+                # （正常不需要额外约束）。这里原样给出（空就是空），不再拿它
+                # 冒充"场景正常"；首屏那句人话另给 `describe_note`。
+                "describe": view.describe(),
+                # 首屏给**可用性**补的人话。它说的是能不能说话，与场景无关；
+                # 单独一个字段，前端就不会把它摆到场景那一行去。
+                "describe_note": "状态正常，可以随时说话",
             },
         )
 

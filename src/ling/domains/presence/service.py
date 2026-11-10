@@ -44,6 +44,16 @@ SCENE_UPSTREAM = "scene"
 SCENE_DEFAULT_STATE = "unknown"
 SCENE_DEFAULT_REASON = "场景不明（没有有效场景 / 已过期），按未知处理，不冒充她在做什么"
 
+#: 哪些上游状态值得记一条 `upstream_fallback` 行为日志。
+#:
+#: **故意不含 `empty` 与 `unknown`**：前者是"从没提交过场景/已过期"（最常见
+#: 的正常状态），后者是"本来就不明"。把这两个记成回退，会让 500 条环形日志
+#: 被正常状态刷满，真正的故障反而看不见——这是 `domains/fallback.py` 开头
+#: 明写的取向（"上游为空是正常状态，不是故障"）。
+_SCENE_FALLBACK_WORTH_LOGGING: frozenset[DependencyState] = frozenset(
+    {DependencyState.failed, DependencyState.unavailable}
+)
+
 # 场景默认有效期。太短会让"刚才在干什么"反复变成 unknown；
 # 太长会让旧场景残留。15 分钟是一个普通"手头这件事"的量级。
 DEFAULT_SCENE_TTL = timedelta(minutes=15)
@@ -505,7 +515,21 @@ class PresenceService:
         resolved = resolve_input(
             dependency, default=default, default_reason=SCENE_DEFAULT_REASON
         )
-        log_fallback(resolved, consumer="presence.scene")
+        # **只在上游"该有却没有"时记回退日志，不把"从没提交过场景"记成故障。**
+        #
+        # 这一条是修真实噪声：`scene()` 在库里没有 `scene_commits` 行时返回
+        # `state=unknown, expired=False`（这是**最常见**的默认状态——新装、
+        # 长期没跑过场景投影、或者刚清理过）。原来这里无条件调
+        # `log_fallback`，于是每一次首屏读仪表盘、每一次看手机，都往行为
+        # 日志里塞一条 `upstream_fallback`。日志是 500 条环形缓冲，很快就被
+        # "一切正常"刷满，真正的回退反而看不见了。
+        #
+        # 这与 `fallback.py` 开头的取向本来是一致的：「上游为空（今天没安排）
+        # 是**正常状态**，不是故障」。过期也一样——过期即未知是设计，不是故障。
+        # 所以只有 `dependency.state` 是**故障类**（failed/unavailable）才记；
+        # `empty`（从没有/已过期）与 `unknown`（本来就不明）都不记。
+        if dependency.state in _SCENE_FALLBACK_WORTH_LOGGING:
+            log_fallback(resolved, consumer="presence.scene")
         return resolved.value, resolved
 
 

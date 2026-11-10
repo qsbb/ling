@@ -2856,3 +2856,106 @@ class MemoryConsolidationRow(Base):
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class DeferredReply(Base):
+    """她主动选择"过一会儿再回"（`deferred_replies`，迁移 0063）。
+
+    用户裁决（2026-11-10）：「做，但是只在她主动选择时才延后，且延后多久让她
+    自由发挥，上限 5 分钟」。设计见 `docs/MEDIA-WILLINGNESS-DESIGN.md` §4 与
+    `src/ling/domains/deferred/`。
+
+    ## 为什么是持久表而不是进程里的 sleep
+
+    三件事都要求它落库：进程重启后"她答应了 45 秒后回"不能凭空消失；两个
+    worker 同时到点只能有一个真去生成；期间来了新输入，旧的那句"等会儿"必须
+    能被**确定地**撤销资格。
+
+    ## 为什么不是 `operations` 或 `media_read_jobs` 加个 type
+
+    那两张表的状态词表分别围绕"发没发出去"与"读没读到、能不能再花钱"，而这里
+    围绕"她答应的那句话还算不算数"。三条状态机的合法转移完全不同，挤进一张表
+    只能有一个活下来。
+
+    ## 时长为什么存三个数
+
+    `requested_delay_ms` 是她真正要求的（可能是 999000），`applied_delay_ms` 是
+    代码实际用的（≤300000），`clamped` 说明两者不等。只存钳后值等于把"系统上限"
+    说成"她选择等这么久"——那与"把槽位忙包装成人格选择"是同一条底线上的伪造。
+    界面要能说"她本来想等更久"。
+    """
+
+    __tablename__ = "deferred_replies"
+    __table_args__ = (
+        # 同一轮最多一条延后记录。这是"重复扫描只产生一个轮次"的**库级**保证，
+        # 不靠进程内去重（多副本时那种去重等于没有）。
+        Index("uq_deferred_replies_source_turn", "source_turn_id", unique=True),
+        # 认领扫描的唯一查询形状：到期 + 未终结。
+        Index("ix_deferred_replies_state_due", "state", "chosen_due_at"),
+        Index("ix_deferred_replies_state_hard_deadline", "state", "hard_deadline_at"),
+        Index("ix_deferred_replies_lease", "lease_owner", "lease_until"),
+        Index("ix_deferred_replies_window_state", "window_id", "state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    window_id: Mapped[str] = mapped_column(String(64))
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # --- 因果 ---
+    source_turn_id: Mapped[str] = mapped_column(String(64))
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 被延后那条用户消息的 `messages.sequence`。抢占判据是
+    #: "这个窗口里出现了比它更大的 user 消息序号"，见 `service.input_preempted`。
+    #:
+    #: 为什么是**派生**栅栏而不是"取消代次"计数器：新输入入口分散在 web 路由、
+    #: 入站桥、注意力轮询三处，任何"顺手 +1"的钩子都必然漏一处，而漏掉的表现是
+    #: "她插进新话题补了一句"——极难复现。派生没有写入点，也就没有漏写的可能。
+    input_sequence: Mapped[int] = mapped_column(BigInteger, default=0)
+
+    # --- 时长（三个数，见类注释）---
+    requested_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    applied_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    clamped: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # --- 截止 ---
+    #: 到点被 worker 认领。
+    chosen_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: 到点之后允许生成多久；到这一刻还没有可交付正文就发兜底短句。
+    #: 没有它，"她选了 300 秒"会变成无上界的等待。
+    hard_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    # --- 状态机 ---
+    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 这次交付用的是兜底短句（"刚才想晚点回你，但没能及时整理好"）。
+    #: 单独一列是因为"她回了"与"她回的是那句兜底"必须能分开——把兜底记成正常
+    #: 交付，就等于声称她当时真的想清楚了。
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # --- 交付结果 ---
+    delivered_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivered_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # --- 认领栅栏（与 media_read_jobs 同一套写法）---
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    claim_generation: Mapped[int] = mapped_column(Integer, default=0)
+    #: 模型**可能已经调用**的时间。`claimed -> pending` 的重排只允许它为空时：
+    #: 非空意味着可能已经收了费、用户也可能已经看到内容，自动重跑会二次收费。
+    model_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

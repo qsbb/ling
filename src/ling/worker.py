@@ -1252,6 +1252,477 @@ async def handle_media_read_cleanup(payload: dict) -> None:
         )
 
 
+#: 硬截止兜底短句。**模块级常量**，不在函数里拼字符串：
+#: 它会被测试断言、也可能被前端引用，拼出来的字符串一旦改动就没人知道
+#: 是哪一处变的。
+#:
+#: 这句话必须只陈述**可核实的事实**：「想晚点回」是真的（她登记过），
+#: 「没能及时整理好」是真的（生成超时或失败），「你刚才的问题我还没有回答」
+#: 也是真的（确实没答）。它**不**说"我马上回""刚才在忙"这类无从核实的话，
+#: 更不能暗示已送达。
+DEFERRED_FALLBACK_TEXT = "刚才想晚点回你，但没能及时整理好；你刚才的问题我还没有回答。"
+
+
+async def _deferred_sweep_once(*, now: datetime | None = None) -> dict[str, int]:
+    """跑一轮延后回复扫描。**零模型、短事务**，返回统计。
+
+    ## 三件事，顺序不能反
+
+    1. **回收过期租约**（二分：`model_started_at` 空 → 回 pending；非空 → failed）。
+       放在最前面，否则一条崩溃留下的 `claimed` 会永远占着，而它的租约过期后
+       本可以被重新执行。
+    2. **硬截止兜底**：到 `hard_deadline_at` 还没终结的 → `failed`。放在认领
+       之前，否则一条已经过期的记录会被认领走、再白跑一次生成。
+    3. **认领到期的**，交给调用方去生成。
+
+    第 3 步不在这里做，因为生成要调模型（几十秒），不能待在扫描的短事务里。
+    """
+    from ling.domains.deferred import service as deferred
+
+    counts = {"requeued": 0, "failed": 0, "expired": 0}
+    async with session_scope() as session:
+        reclaimed = await deferred.reclaim_expired_leases(session, now=now)
+        counts["requeued"] = reclaimed["requeued"]
+        counts["failed"] = reclaimed["failed"]
+    async with session_scope() as session:
+        counts["expired"] = await deferred.expire_past_hard_deadline(session, now=now)
+    return counts
+
+
+async def _claim_one_deferred(*, now: datetime | None = None):
+    """短事务认领一条到期的延后回复。抢不到返回 ``None``。
+
+    认领即提交（出 `session_scope` 就提交），生成在**没有行锁**的事务外跑。
+    """
+    from ling.domains.deferred import service as deferred
+
+    async with session_scope() as session:
+        return await deferred.claim_due(session, lease_owner=WORKER_ID, now=now)
+
+
+async def _deferred_input_preempted(window_id: str, input_sequence: int) -> bool:
+    """抢占栅栏（认领后、生成前、外发前各调一次）。"""
+    from ling.domains.deferred import service as deferred
+
+    async with session_scope() as session:
+        return await deferred.input_preempted(
+            session, window_id=window_id, input_sequence=input_sequence
+        )
+
+
+async def _deferred_window_deliverable(window_id: str, subject_id: str | None) -> str:
+    """到点后**重新取**受众与授权：返回空串表示可以投，否则返回原因码。
+
+    ## 为什么必须重新取，不能复用原轮的缓存
+
+    60 秒里场景可能已经变了：窗口被归档、会话主人变了、记忆被真删、授权被撤。
+    原轮编译时成立的条件，到点不一定还成立。复用缓存等于"用 60 秒前的授权去
+    说 60 秒后的话"——那正是本项目反复要防的那类越权。
+
+    只查自己需要的三张表（窗口 / 授权不在这里判，由 `TurnCoordinator` 重新
+    编译上下文时判），所以本函数不构成跨域依赖。
+    """
+    from sqlalchemy import select
+
+    from ling.domains.deferred import service as deferred
+    from ling.infra.models import Window
+
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(Window).where(Window.id == window_id, Window.archived.is_(False))
+        )
+    if row is None:
+        return "window_gone"
+    if str(row.channel or "") not in deferred.SUPPORTED_CHANNELS:
+        # 外部渠道**当前不支持延后**，见 `service.SUPPORTED_CHANNELS` 的论证：
+        # 外发闸拦的是"落库"，而 QQ 的投递发生在 `bridge._deliver`，绕开它。
+        # 宁可在这里诚实拒绝（用户与日志都能看到 `channel_unsupported`），
+        # 也不要静默走一条没被闸保护的投递路径。
+        return "channel_unsupported"
+    if subject_id is not None and str(row.subject_id or "") != subject_id:
+        # 窗口换了主人：那句"等会儿"是对原来那个人说的，不能发给新的人。
+        return "subject_changed"
+    return ""
+
+
+async def _run_deferred_turn(
+    *,
+    reply_id: str,
+    window_id: str,
+    subject_id: str,
+    input_sequence: int,
+    claim_generation: int,
+) -> tuple[str, str, str]:
+    """到点后跑一个**新的逻辑轮次**并投递。返回 ``(结果, 原因, 消息 id)``。
+
+    ``结果`` 是 ``delivered`` / ``cancelled`` / ``failed`` 之一。
+
+    ## 本函数**不写终态**（只判定、只返回）
+
+    终结只有一个写入点：:func:`_settle_deferred`。这不是风格问题——第一版把
+    终态写在栅栏里，结果是"抢占"那条路径被写了两次（栅栏写 cancelled、结算又
+    写 cancelled），而状态机的同态转移是**非法**的，于是真跑起来直接抛
+    `InvalidDeferredTransition`，整条链断掉。测试当场抓到了它。
+
+    一条记录从 `claimed` 到终态只经过一个写入点，才谈得上"终态吸收"。
+
+    ## 为什么必须是新轮次
+
+    原轮早已 `_finalize` 终结（`turn.completed` 已发、SSE 已关、停止标记已清）。
+    往那条队列里塞消息等于向已关闭的流推 delta——前端收不到，而库里却有一条
+    "她回了"。所以这里用 `ConversationService.create_turn` 建一条**新** turn，
+    `client_turn_id = deferred:{reply_id}` 让它天然幂等（`turns.uq_turn_client`
+    第二道闸），再交给 `TurnCoordinator` 重新编译上下文、重新取发言权。
+
+    ## 三个时点各判一次（断言 10）
+
+    - **生成前**：窗口还在吗、主人没变吗、渠道支持吗、没被新输入抢占吗
+      （栅栏 1 + 2）；
+    - **生成中**：`TurnCoordinator` 自己取发言权（拿不到就不外发，既有机制）；
+    - **落库前**：`deliver_gate`（见下面 `_still_allowed`）——**这一道是关键**。
+
+    为什么"落库前"这道不能用"生成后再判"代替：`_finalize` 里消息一旦落库，
+    Web 路径上就等于送达了。生成完再判时消息已经在库里、`turn.completed` 也
+    已经带着它发给前端了，判什么都拦不住。阶段 3 的变异测试抓到的就是这个：
+    删掉外发闸后 9 个用例全绿，说明原来的用例只覆盖了"抢占发生之后"，没覆盖
+    "抢占发生在生成期间"。
+
+    任一次失败 → `cancelled`，**外发次数为 0**。
+    """
+    from ling.domains.conversation.service import ConversationService
+    from ling.domains.deferred import service as deferred
+    from ling.domains.deferred.state import HARD_DEADLINE_SECONDS
+    from ling.infra.security import SecretBox
+    from ling.kernel.turn import CancelRegistry, TurnCoordinator
+    from ling.settings.service import ConfigService
+
+    settings = get_settings()
+    router = _MEMORY_ROUTER
+    if router is None:
+        return "failed", "model_router_unavailable", ""
+
+    # --- 栅栏 1：受众与窗口 ---
+    blocked = await _deferred_window_deliverable(window_id, subject_id)
+    if blocked:
+        return "cancelled", blocked, ""
+
+    # --- 栅栏 2：新输入抢占（生成前）---
+    if await _deferred_input_preempted(window_id, input_sequence):
+        return "cancelled", deferred.PREEMPT_REASON_NEW_INPUT, ""
+
+    # --- 建新轮次并提交（协调器跑在自己的会话里，看不到未提交的行）---
+    async with session_scope() as session:
+        config = ConfigService(
+            session,
+            SecretBox(settings),
+            test_mode_default=settings.test_mode,
+            persona_id=settings.persona_id,
+        )
+        effective = await config.effective()
+        conversation = ConversationService(
+            session, actor_id=settings.actor_id, persona_id=settings.persona_id
+        )
+        turn = await conversation.create_turn(
+            window_id,
+            client_turn_id=f"deferred:{reply_id}",
+            config_revision=effective.revision,
+        )
+        turn_id = turn.id
+
+    # 模型调用**之前**单独提交 `model_started_at`：崩溃后靠它区分"还能重排"与
+    # "可能已经收过费"。与 `media/jobs.py::mark_model_started` 同一语义。
+    async with session_scope() as session:
+        await deferred.mark_model_started(
+            session,
+            reply_id=reply_id,
+            lease_owner=WORKER_ID,
+            claim_generation=claim_generation,
+        )
+
+    async def _still_allowed() -> bool:
+        """外发闸：**落库之前**再问一次"这条回复还算数吗"。
+
+        单独一道闸而不复用下面栅栏 3 的检查，是因为它必须在 `_finalize`
+        **内部**、消息落库之前被问到——生成已经跑完，但用户可能在这几十秒里
+        又说话了。栅栏 3 在轮次结束后才判，那时消息早已落库、`turn.completed`
+        已经带着它发给前端了，拦不住任何东西（阶段 3 的变异测试抓到了这一点）。
+        """
+        return not await _deferred_input_preempted(window_id, input_sequence)
+
+    coordinator = TurnCoordinator(
+        router=router,  # type: ignore[arg-type]
+        actor_id=settings.actor_id,
+        persona_id=settings.persona_id,
+        cancels=CancelRegistry(),
+        secret_reader=_SECRET_CACHE.get,
+        deliver_gate=_still_allowed,
+    )
+    queue = await coordinator.run_turn(
+        window_id=window_id,
+        subject_id=subject_id,
+        turn_id=turn_id,
+        # 空串：这一轮**没有**新的用户输入，她回的是"之前那条还没答的话"。
+        # 传原文会把旧输入再喂一遍，变成"她又说了一遍"。
+        user_text="",
+        config=effective,
+    )
+
+    reply_text = ""
+    state = "unknown"
+    while True:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=float(HARD_DEADLINE_SECONDS))
+        except TimeoutError:
+            return "failed", "generation_timeout", ""
+        if event is None:
+            break
+        name = getattr(event, "event", "")
+        data = getattr(event, "data", {}) or {}
+        if name in {"turn.completed", "turn.stopped", "turn.failed"}:
+            state = str(data.get("state") or name)
+            message = data.get("message") or {}
+            reply_text = str(message.get("text") or "")
+    # --- 抢占判定必须在"没有正文"判定**之前** ---
+    #
+    # 顺序反了会出一个很难看的 bug：外发闸拦下正文之后，下面把"没有正文"
+    # 理解成生成失败，于是走兜底路径**又发了一句**进去——闸白装了。变异测试
+    # 抓到的就是这个（阶段 3 的第二轮）。
+    #
+    # 语义上也该如此：被抢占的那一轮根本没有"失败"，它是**作废**了。作废
+    # 不需要道歉，也不需要兜底。
+    if await _deferred_input_preempted(window_id, input_sequence):
+        return "cancelled", deferred.PREEMPT_REASON_NEW_INPUT, ""
+
+    if not reply_text.strip():
+        return "failed", f"no_text:{state}", ""
+
+    return "delivered", "", turn_id
+
+
+@handler("deferred.reply.sweep")
+async def handle_deferred_reply_sweep(payload: dict) -> None:  # noqa: ARG001
+    """到点就把她答应过的回复真的回出去。
+
+    ## 这个 handler 的三段，以及为什么是这个顺序
+
+    1. **零模型扫描**（`:func:`_deferred_sweep_once`）：回收过期租约、硬截止兜底。
+       这一步永远跑，即使下面没抢到东西。
+    2. **认领一条**（短事务、条件更新、立即提交）。
+    3. **在事务外生成并投递**（几十秒，绝不占行锁）。
+
+    ## 为什么一次只处理一条
+
+    与媒体 worker 同一理由：批量认领会把"还没开始跑"的行也标成 in_flight，
+    等于用租约挡住别的 worker——锁是没了，吞吐却没恢复。一条一认领后，慢的那条
+    只拖住它自己。
+
+    ## 零模型的证明
+
+    空扫描（没有任何到期行）时这个 handler **一次模型都不调**：`claim_due` 返回
+    `None` 就直接返回。测试用 `behavior_model_calls` 行数为 0 断言这一点——它每
+    5 秒跑一次，一旦因为某个 bug 每次调一次模型，账单会以 17280 次/天 烧。
+    """
+
+    counts = await _deferred_sweep_once()
+    if counts["expired"]:
+        logger.info("延后回复：%d 条到硬截止仍未交付，已终结", counts["expired"])
+    if counts["requeued"] or counts["failed"]:
+        logger.info(
+            "延后回复租约回收：退回排队 %d，终结 %d",
+            counts["requeued"],
+            counts["failed"],
+        )
+
+    claimed = await _claim_one_deferred()
+    if claimed is None:
+        return
+
+    outcome, reason, delivered_turn_id = await _run_deferred_turn(
+        reply_id=claimed.id,
+        window_id=claimed.window_id,
+        subject_id=str(claimed.subject_id or ""),
+        input_sequence=int(claimed.input_sequence),
+        claim_generation=int(claimed.claim_generation),
+    )
+    await _settle_deferred(
+        claimed, outcome=outcome, reason=reason, delivered_turn_id=delivered_turn_id
+    )
+
+
+async def _settle_deferred(  # noqa: ANN001
+    claimed, *, outcome: str, reason: str, delivered_turn_id: str = ""
+) -> None:
+    """把生成结果落成终态；需要时补一句兜底短句。**绝不谎报送达**。
+
+    ## 这是唯一写终态的地方
+
+    `_run_deferred_turn` 只判定、只返回（见那里的注释）。一条记录从 `claimed`
+    到终态只经过这里——否则"抢占"那条路径会被写两次，而同态转移在状态机里是
+    非法的，真跑起来直接抛异常。
+    """
+    from ling.domains.deferred import service as deferred
+    from ling.domains.deferred.state import DeferredReplyState
+
+    if outcome == "delivered":
+        async with session_scope() as session:
+            await deferred.finish(
+                session,
+                reply_id=claimed.id,
+                target=DeferredReplyState.delivered,
+                lease_owner=WORKER_ID,
+                claim_generation=int(claimed.claim_generation),
+                # 交付结果要指回**真正说出那句话的新轮次**，否则"她回过没有"
+                # 只能靠猜。
+                delivered_turn_id=delivered_turn_id or None,
+            )
+        return
+    if outcome == "cancelled":
+        # 抢占/授权失效：**不发任何东西**。新轮已经把旧输入一起处理了，
+        # 再补一句"刚才没能及时回你"就是插进新话题的迟到补话。
+        async with session_scope() as session:
+            await deferred.finish(
+                session,
+                reply_id=claimed.id,
+                target=DeferredReplyState.cancelled,
+                reason=reason,
+                lease_owner=WORKER_ID,
+                claim_generation=int(claimed.claim_generation),
+            )
+        return
+
+    # outcome == failed：到硬截止仍无可交付正文 → 发确定性短句。
+    #
+    # 这一句是**她确实说过"等会儿"之后**的交代，不是主动补话：内容只陈述
+    # 可核实的事实，不承诺、不假装送达。
+    delivered = await _deliver_deferred_fallback(
+        window_id=claimed.window_id, subject_id=str(claimed.subject_id or "")
+    )
+    async with session_scope() as session:
+        if delivered:
+            await deferred.finish(
+                session,
+                reply_id=claimed.id,
+                target=DeferredReplyState.delivered,
+                reason=reason,
+                lease_owner=WORKER_ID,
+                claim_generation=int(claimed.claim_generation),
+                fallback_used=True,
+            )
+        else:
+            # 兜底也发不出去：**写 failed**，并且**不写** delivered_turn_id。
+            # 状态 failed + 有轮次 id 是自相矛盾的记录，会让对账无从判断。
+            await deferred.finish(
+                session,
+                reply_id=claimed.id,
+                target=DeferredReplyState.failed,
+                reason=f"{reason}+fallback_undeliverable",
+                lease_owner=WORKER_ID,
+                claim_generation=int(claimed.claim_generation),
+            )
+    emit_event(
+        logger,
+        logging.INFO if delivered else logging.WARNING,
+        event_name="deferred_fallback_used" if delivered else "deferred_fallback_failed",
+        message="延后回复没生成出正文，发了兜底短句" if delivered else "延后回复兜底也没发出去",
+        attributes={
+            "reply_id": claimed.id,
+            "window_id": claimed.window_id,
+            "reason": reason,
+            "delivered": delivered,
+            "cause": "system",
+        },
+    )
+
+
+async def _deliver_deferred_fallback(*, window_id: str, subject_id: str) -> bool:
+    """把兜底短句落成一条消息并（有渠道时）真的发出去。返回**是否确认送达**。
+
+    没有渠道（纯 Web 会话）时：落库即算送达——Web 面板本身就是投递面，用户
+    打开就能看到。有渠道时以平台回执为准，`uncertain` 一律按**没送达**处理
+    （宁可下次不再发，也不要重复发一条）。
+    """
+    from sqlalchemy import select
+
+    from ling.capabilities.chunking import plan_parts
+    from ling.contracts.v1 import Origin
+    from ling.domains.conversation.service import ConversationService
+    from ling.infra.models import Window
+    from ling.infra.security import new_id
+
+    settings = get_settings()
+    async with session_scope() as session:
+        window = await session.scalar(select(Window).where(Window.id == window_id))
+        if window is None:
+            return False
+        conversation = ConversationService(
+            session, actor_id=settings.actor_id, persona_id=settings.persona_id
+        )
+        await conversation.add_message(
+            window_id,
+            role="actor",
+            text=DEFERRED_FALLBACK_TEXT,
+            # `model_inference`：这句话是**代码**生成的确定性文本，不是模型
+            # 推出来的。用 `simulated` 会把它说成"模拟生成的内容"，而它其实
+            # 是一条关于系统自身状态的事实陈述。
+            origin=Origin.model_inference,
+            handled_as="deferred",
+            handled_reason="hard_deadline_fallback",
+        )
+        channel = str(window.channel or "")
+        window_ref = str(window.title or "")
+        is_group = str(window.visibility or "") == "group_scope"
+
+    if channel in {"", "web"} or not window_ref:
+        # 没有外部渠道：落库即送达（Web 面板就是投递面）。
+        return channel in {"", "web"}
+
+    connector = _group_reply_connector(channel)
+    if connector is None:
+        return False
+    caps = getattr(connector, "capabilities", None)
+    limit = None
+    if callable(caps):
+        with contextlib.suppress(Exception):
+            limit = int(caps().max_text_length) or None
+    parts = plan_parts(DEFERRED_FALLBACK_TEXT, is_group=is_group, max_part_chars=limit)
+    if not parts:
+        return False
+
+    from ling.capabilities.delivery import DeliveryService
+    from ling.ports.channel import OutboundMessage
+
+    async with session_scope() as session:
+        service = DeliveryService(session)
+        plan_id = f"plan_deferred_{new_id('dfr')}"
+        for index, part in enumerate(parts, 1):
+            try:
+                outcome = await service.deliver(
+                    connector=connector,  # type: ignore[arg-type]
+                    message=OutboundMessage(
+                        operation_id=new_id("op"),
+                        window_ref=window_ref,
+                        text=part,
+                        is_group=is_group,
+                    ),
+                    actor_id=settings.actor_id,
+                    subject_id=subject_id,
+                    payload_extra={
+                        "reply_plan": plan_id,
+                        "part_ordinal": index,
+                        "parts_total": len(parts),
+                        "source": "deferred.reply.sweep",
+                        "fallback": True,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - 异常按"没送达"处理
+                logger.warning("延后回复兜底投递异常：%s", type(exc).__name__)
+                return False
+            # `delivered` 是唯一判据。`uncertain` 绝不当作已送达。
+            if not outcome.delivered:
+                return False
+    return True
+
+
 async def _media_worker_loop(stop: asyncio.Event, *, poll_seconds: float = 2.0) -> None:
     """媒体 worker 的**循环本体**：只认 `media.video.read`，并发固定为 1。
 
@@ -3125,6 +3596,14 @@ MEDIA_READ_CLEANUP_SECONDS = 60.0
 
 # 自我时间线：把已完成且有证据的活动派生为"我做过这件事"。
 SELF_TIMELINE_SECONDS = 300.0
+
+# 延后回复的到期扫描。**必须明显小于她可能选择的最短延后时长**，否则"她选了
+# 5 秒"会变成"实际 20 秒后才动"。
+#
+# 为什么是 5 秒而不是 1 秒：扫描本身零模型、只查一次索引的短事务，但每秒醒一次
+# 在空转上纯属浪费（同一进程还有别的循环）。5 秒的最坏误差对"她自己说等 90 秒"
+# 这种量级完全可接受，对她可能选择的最小值也不至于明显违约。
+DEFERRED_REPLY_SWEEP_SECONDS = 5.0
 
 # 过期登录会话清理。小时级足够：过期会话多留一小时没有任何风险，
 # 而清理本身没有业务价值，不该占更密的节奏。
@@ -5006,6 +5485,24 @@ PERIODIC_JOBS: tuple[PeriodicJob, ...] = (
         handle_media_read_cleanup,
         {},
         MEDIA_READ_CLEANUP_SECONDS,
+    ),
+    # 延后回复的到期扫描：**她主动选择"过一会儿再回"之后**，到点由这里
+    # 认领并另开一个新逻辑轮次去回。
+    #
+    # 为什么是周期任务而不是 outbox topic：到期是**时间驱动**的，没有"某件事
+    # 发生了"可以投递。幂等不靠事件重投，靠两道库级闸——
+    # `uq_deferred_replies_source_turn`（同一轮只一条记录）+
+    # `turns.uq_turn_client`（同一记录只建一个新轮次）。
+    #
+    # 扫描本身**零模型**（只查索引、回收租约、终结过期）；模型调用发生在认领
+    # 之后的短事务外，一次扫描最多一条。这个区分有断言（空扫描时
+    # `behavior_model_calls` 行数为 0）——它每 5 秒跑一次，一旦退化成"每次
+    # 调一次模型"，账单会以 17280 次/天 的速度烧。
+    PeriodicJob(
+        "deferred.reply.sweep",
+        handle_deferred_reply_sweep,
+        {},
+        DEFERRED_REPLY_SWEEP_SECONDS,
     ),
     # 收集阶段没有开关：它只登记候选，发不发由 proactive.dispatch 与
     # `proactive_delivery_enabled` 决定（见 handle_proactive_collect）。

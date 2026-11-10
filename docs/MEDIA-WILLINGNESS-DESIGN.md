@@ -59,13 +59,37 @@
 
 28. 日志字段使用稳定 snake_case；`message` 写人话，`attributes` 放枚举/时长/ID；行为日志仅 500 条环形缓冲，不作持久事实或精确计数（`docs/BEHAVIOR-LOG-CONTRACT.md` §1–§3；`src/ling/audit.py:174-213`）。
     若系统超时导致回复未送达，投递/轮次状态与运行日志负责可追责记录；不能为凑“三类行为事件”把供应商 5xx 写成她的经历。
-29. 意愿延后要由她在生成正文**之前**提出结构化 `reply_later(delay_seconds)`，可选立即、15、45、90 秒；代码只接受 `0–120` 秒，且绝对截止为本次输入接收后 120 秒，不能由模型延长或自定无穷时刻。
-30. 这一步是延迟意图，不是 A3 的“再判一次看不看”：只在需要决定是否晚回复时运行；模型缺席、解析失败或预算不足则立即回复，不静默挂起。具体档位与 120 秒上限待测试体验后调整。
-31. 代码写持久 `DeferredReply{window_id,source_turn_id,input_sequence,chosen_due_at,hard_deadline_at,state,reason}`，以 `source_turn_id` 唯一去重；不把它写成 `MediaReadJob` 或 `activities.running`，因为等待不是观看活动。
+29. **（2026-11-10 用户裁决推翻原文，此处为修订版）** 意愿延后由她在生成正文**之前**提出结构化标记 `<<等会回 90>>`（秒数由她自己给，**不设固定档位**）。
+    原文的「可选立即、15、45、90 秒；代码只接受 `0–120` 秒」**已作废**。用户原话：「做，但是只在她主动选择时才延后，且延后多久让她自由发挥，上限 5 分钟」。
+    现行规则：**任意秒数**（含 `2分` / `1分30秒` 写法），代码强制 `0 < applied_delay_ms ≤ 300000`；超限**钳到 300 秒**，并**如实记录被钳过**（见第 29a 条）。模型不能延长上限，也不能自定无穷时刻。
+29a. **被钳过必须对用户可见**。`DeferredReply` 同时存 `requested_delay_ms`（她要的，可能是 999000）、`applied_delay_ms`（实际用的，≤300000）、`clamped`（两者不等）。
+    只存钳后值等于把**系统的上限说成她的选择**——用户会以为她只想等 5 分钟，而她想等 16 分钟。这是与「不许把槽位忙包装成人格动作」（第 27 条）同一条底线。
+    因此 SSE `turn.deferred` 必须同时下发 `requested_seconds` / `applied_seconds` / `clamped`，前端要能说「她本来想等更久」。实现见 `src/ling/domains/deferred/markers.py`、`src/ling/kernel/turn.py`、`clients/web-console/src/useChat.ts::describeDeferral`。
+29b. **生成宽限有硬上界，且短于「再等一轮」的直觉**。`hard_deadline_at = chosen_due_at + 60 秒`。
+    没有这个上界，「她选了 300 秒」会变成「等 300 秒 + 生成超时（不知多久）+ 再等」——用户面对的是**无上界**的等待，而这正是延后回复最容易变成「消息石沉大海」的地方。到 `hard_deadline_at` 无论生成到哪一步都发兜底短句（第 33 条）。
+30. 这一步是延迟意图，不是 A3 的“再判一次看不看”：只在需要决定是否晚回复时运行；模型缺席、解析失败或预算不足则立即回复，**不静默挂起**。
+    **坏格式的处置**：`<<等会回>>`（缺秒数）、`<<等会回 abc>>`（非数字）、`<<等会回 -5>>`（负数）、多个标记并存 → 全部剥掉标记、正文照发、立即回复，并记 `reply_defer_rejected`（`reason` 分别落 `duration_empty` / `duration_unparsable` / `multiple_markers`）。
+    **标记 + 正文同时出现**也按坏格式处理（`reason=body_present`，不延后、正文照发）：她既然写了回复，那就是回了；反过来（保留延后、丢掉正文）会让她生成的内容凭空消失，用户看到的是一轮空回复——那是**可观察的损坏**，比语气不完美严重得多。
+    `reply_defer_rejected` **绝不**记成 `reply_deferred`：后者是「她真的延后了」的统计，混进坏格式会让这个数字失去意义。
+31. 代码写持久 `DeferredReply`（表 `deferred_replies`，迁移 `0063`），字段分组见 `src/ling/infra/models.py`：身份与因果（`window_id`/`source_turn_id`/`input_sequence`）、时长三个数（第 29a 条）、截止两个时刻（第 29b 条）、状态与栅栏（`state`/`reason`/`lease_owner`/`lease_until`/`claim_generation`/`model_started_at`）。
+    以 `UNIQUE(source_turn_id)` 唯一去重（库级，不靠进程内变量——多副本时那种去重等于没有）；新轮次再用 `turns.uq_turn_client`（`client_turn_id = deferred:{reply_id}`）挡第二道。
+    不把它写成 `MediaReadJob` 或 `activities.running`，因为等待不是观看活动。
+31a. **抢占栅栏是派生的，没有写入点**。判据是「这个窗口里出现了比 `input_sequence` 更大的 **`role='user'`** 消息」，不是某个「取消代次」计数器。
+    理由：新输入入口分散在 web 路由、连接器入站桥、注意力轮询三处，任何「新输入时顺手 +1」的钩子都必然漏掉一处——而漏掉的表现是「她插进新话题补了一句」，极难复现、极难归因。派生没有写入点，也就没有漏写的可能。
+    只数 `role='user'`：她自己的回复不算新输入，否则一条延后回复会把自己抢占掉。判据实现在 `domains/deferred/service.py::input_preempted`。
 32. 到 `chosen_due_at` 新建**逻辑轮次**，重新编译当前上下文和授权，取得该窗口发言权才生成及投递；原轮先明确终结，不能重开 completed 轮或向关闭的 SSE 推 delta（`docs/ASYNC-TOOL-EXECUTION.md:92-104`）。
-33. 到 `hard_deadline_at` 仍无可交付正文，代码终结延后状态并发确定性短句，例如「刚才想晚点回你，但没能及时整理好；你刚才的问题我还没有回答。」；若投递回执不明，记录 `uncertain`，不能声称已送达或盲重发。
+33. 到 `hard_deadline_at` 仍无可交付正文，代码终结延后状态并发确定性短句。现行文案是**模块级常量** `src/ling/worker.py::DEFERRED_FALLBACK_TEXT`（不在函数里拼字符串：它会被测试断言、也可能被前端引用）：
+    「刚才想晚点回你，但没能及时整理好；你刚才的问题我还没有回答。」
+    这句话只陈述可核实的事实：她想晚回是真的（登记过）、没能及时整理好是真的（超时/失败）、问题还没答也是真的。它**不**说「我马上回」「刚才在忙」这类无从核实的话。
+    若投递回执不明，落 `failed`（`reason=..._fallback_undeliverable`）而**不写** `delivered_turn_id`——「状态 failed 但带着轮次 id」是自相矛盾的记录，会让对账无从判断。绝不声称已送达或盲重发。
 34. 新输入到达同窗口时默认取消旧延后回复的**主动投递资格**，新轮把仍有效的旧输入纳入上下文一起处理；旧事实/已完成媒体观察可保存，但旧迟到回复不插进新话题（`docs/ASYNC-TOOL-EXECUTION.md:114-118`）。
-35. 用窗口输入序号与取消代次，在认领延后轮、生成前、外发前均比较；新输入与截止同时发生时只允许一方取得发言权。用户显式要求“哪怕我又说话也提醒”才另审持续通知，本期没有该授权。
+35. 用第 31a 条的派生栅栏在**三个时点**各比一次：认领时、生成前、外发前；新输入与截止同时发生时只允许一方取得发言权。用户显式要求“哪怕我又说话也提醒”才另审持续通知，本期没有该授权。
+35a. **外发前那次比较必须在「消息落库之前」**，不能在流式阶段、也不能在轮次结束之后。
+    为什么：`_finalize` 里消息一旦落库，Web 路径上就等于已经送达了（Web 面板本身就是投递面）。在流式阶段判只能停掉一半正文；在轮次结束后判则什么都拦不住——那时 `turn.completed` 已经带着正文发给前端了。
+    实现：`TurnCoordinator(deliver_gate=...)`，在 `_finalize` 内、消息落库与事件发出**之前**问一次；不通过则正文不落库不外发，但轮次仍终结为 `completed`（她确实说完了这一轮，只是这句话作废了——改成 `failed` 会谎报「生成失败」）。
+35b. **被抢占的那一轮是「作废」，不是「失败」**：作废不发兜底短句（新轮已经把旧输入一起处理了，补一句「刚才没能及时回你」就是插进新话题的迟到补话）。因此抢占判定必须在「没有可交付正文」判定**之前**——顺序反了会把作废误判成失败，于是走兜底路径**又发一句**，闸白装了。
+35c. **外部渠道当前不支持延后**：`deferred.service.SUPPORTED_CHANNELS = {"web", ""}`，非白名单渠道到点直接 `cancelled(reason=channel_unsupported)`，不发任何东西。
+    理由：外发闸（第 35a 条）拦的是「消息落库」，而 QQ/OneBot 的投递发生在 `kernel/bridge.py::_deliver`，那道闸**管不到它**。宁可诚实拒绝（用户与日志都能看到 `channel_unsupported`），也不要静默走一条没被闸保护的投递路径。将来要支持群聊时，做的是「加渠道 + 补 `_deliver` 前的抢占检查 + 一组群聊用例」，而不是删掉一个碍事的断言。
 36. 资源竞争不参与 `reply_later` 倒计时：`try_acquire` 仍立即 `busy/contended/unavailable`，不保持数据库事务/连接或自动等槽；模型也不得把“槽忙”重新标成自愿晚回（`docs/MEDIA-EXCLUSIVE-SLOT.md` §3–§4）。
 37. 当前 `_visible` 先推正文、后解析视频标记；已推「我看到了」无法再靠晚些补一句修正。凡可能依赖观看结果的正文须在首次外发前暂扣，直到观察或拒绝结果确定；普通与媒体无关的正文可继续流式（`src/ling/kernel/turn.py:911-927,1036-1075`）。
 38. 延后回复不采用“当前 SSE 卡住两分钟再续写”；它是原轮终结后的新轮次。若同步观看仍在未终结轮内等待真实结果，可在硬超时内暂扣媒体依赖正文，但不能先发不成立的因果声明。
@@ -74,6 +98,8 @@
 `DeferredReply` 的截止以数据库时间判定，worker 只在短事务认领到期项，生成阶段不占行锁；每次外发仍经过会话授权与发言权栅栏。
 若延后期间已有视频后台作业完成，新轮只能读**已持久成功且当前受众仍有权**的证据；`pending/running/unknown` 不能写成她看到了（`docs/ASYNC-TOOL-DECISION.md` §3）。
 原轮若选择静默延后，接口必须给客户端可区分的 `deferred` 状态与截止，不能把“没有 SSE delta”伪装成连接卡死；渠道端可按授权表达一句不含完成承诺的等待提示。
+**已实现（2026-11-10）**：SSE 事件 `turn.deferred`，**先于** `turn.completed` 发出（前端靠这个顺序决定显示「她说等会儿」还是「她回了一条空的」），载荷含 `delay_id` / `requested_seconds` / `applied_seconds` / `clamped` / `due_at` / `hard_deadline_at`。
+轮次状态**不新增枚举成员**：`TurnState` 是「这一轮执行到哪了」，而「她延后了」是**她的意愿**，不是轮次没跑完。硬塞进枚举会让「turn 是 completed 但用户还没收到东西」变成不可表达的矛盾。对外用 `messages.handled_as='deferred'` + SSE `turn.deferred` 表达。
 
 ## §5 忙态载体与展示
 
@@ -128,11 +154,18 @@ phone 的 `watching_since` 用实际 `active` 时刻，不用标记生成、作�
 66. 断言 5：`held` 未开工、额度不足、缓存命中均不产生新的 running 媒体活动或 phone watching；active 后 activity/phone/slot 持同一执行键。
 67. 断言 6：20 秒心跳续租，240 秒过期后旧代次更新、释放、证据提交均影响 0 行；读侧立即不显示“正在看”，清理后无残留 running 活动。
 68. 断言 7：活动 `current()` 被另一条较新活动覆盖时，卡片仍按有效槽位 `activity_id` 得到媒体活动；另一会话只见粗粒度忙态，不见标题/链接/来源身份。
-69. 阶段三：增加显式有界延后回复的持久调度、新轮次、取消代次与投递回执；先在普通不依赖媒体结果的回复路径试运行，再评估视频结果依赖路径。
+69. 阶段三：增加显式有界延后回复的持久调度、新轮次、抢占栅栏与投递回执；先在普通不依赖媒体结果的回复路径试运行，再评估视频结果依赖路径。
+    **落地状态（2026-11-10）**：`domains/deferred/`（状态机 + 标记解析 + service）、迁移 `0063`、`worker.py` 周期扫描 `deferred.reply.sweep`、`kernel/turn.py` 产生意图与 `turn.deferred`、前端 `useChat.describeDeferral` 均已实现。
 70. 断言 8：选择 45 秒延后时 44 秒前无回复，45 秒后恰好一个新轮；重启后仍按原截止，重复任务只产生一个轮次和一个投递计划。
-71. 断言 9：模型给出 999 秒或坏格式时不挂起；合法延后绝不超过输入后 120 秒，超时给确定性“未能及时回答”事实，不假装送达。
+    **验证**：`tests/integration/test_deferred_reply_flow.py::test_no_reply_before_due_then_exactly_one_new_turn`（注入固定 `now`，不 sleep 真实 45 秒）与 `::test_duplicate_sweeps_produce_only_one_new_turn`（连扫三次仍只一个新轮、只调一次模型）。
+71. 断言 9（**原文的上限 120 秒已按第 29 条作废，此处为修订版**）：模型给出 999 秒时**钳到 300 秒且如实标注 `clamped`**（不挂起、不静默改写她的要求）；坏格式（缺秒数/非数字/负数/多标记/标记+正文）**一律不挂起**，剥掉标记、正文照发、立即回复；到 `hard_deadline_at`（上限 + 60 秒）无条件给确定性「未能及时回答」事实，不假装送达。
+    **验证**：`test_deferred_reply_intent.py::test_clamped_values_reach_the_client`（999 → `requested=999, applied=300, clamped=true`）与 `test_bad_format_replies_immediately`（5 个参数化坏格式）。
 72. 断言 10：延后期间同窗口新输入递增序号并取消旧投递资格；新输入与到点同时发生时旧回复外发次数为 0 或先已合法送达 1 次，绝无乱序迟到补话。
+    **验证**：`test_deferred_reply_flow.py::test_new_input_preempts_before_generation`（生成前）、`::test_new_input_during_generation_still_blocks_delivery`（**生成期间**——这条是变异测试逼出来的：删掉外发闸后原有用例全绿，说明当时只覆盖了"抢占发生之后"，没覆盖"抢占发生在生成中"）。
+    实现位置见第 35a/35b 条。
 73. 断言 11：日志区分 `cause=volition/resource/system`；资源 busy 不生成 `DeferredReply`，系统慢不生成 `reply_deferred`，环形日志删除后业务行为不变。
+    **验证**：`test_deferred_reply_intent.py::test_valid_defer_logs_reply_deferred`（`cause=volition`）与 `::test_bad_format_logs_rejected_not_deferred`（坏格式记 `reply_defer_rejected`，**不许**记 `reply_deferred`）。
+    **注意**：日志缓冲是进程全局的 500 条环形缓冲，用例必须用"前后差集"断言，不能查全量快照——否则会被别的用例挤出的旧事件污染。
 74. 断言 12：前端五类展示与 API 受众投影一致；过期槽位、未知 scene、仅有旧 phone watching 时均不显示“正在看视频”。
 
 验收时用固定时钟和跨 worker 集成测试验证截止、租约与代次；仅用模型文案快照不能证明状态真实或投递成功。

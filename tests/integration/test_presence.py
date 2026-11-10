@@ -254,3 +254,46 @@ async def test_energy_never_sticks_at_the_floor(logged_in: TestEnv) -> None:
         # 每 6 小时看一次，模拟"她过日子"式的时间推进，共 3 天
         views = [await svc.view(now=now + timedelta(hours=6 * i)) for i in range(1, 13)]
     assert any(v.availability != "resting" for v in views), "三天里一次都没恢复到可以说话"
+
+
+async def test_never_committed_scene_is_not_logged_as_upstream_fallback(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: F811
+    """「从没提交过场景」是**正常默认状态**，不许记成 `upstream_fallback`。
+
+    这是一条真实的日志噪声修复。`scene()` 在库里没有 `scene_commits` 行时返回
+    `state=unknown, expired=False`——这是新装、长期没跑场景投影、刚清理过的
+    **最常见**状态。原来 `resolve_scene` 无条件调 `log_fallback`，于是每一次
+    首屏读仪表盘、每一次看手机都往行为日志里塞一条 `upstream_fallback`。
+    行为日志是 500 条环形缓冲，很快被"一切正常"刷满，真正的回退反而看不见。
+
+    与 `domains/fallback.py` 开头的取向一致：**上游为空是正常状态，不是故障**。
+    只有故障类（failed/unavailable）才值得记一条。
+    """
+    from ling.domains import fallback as fallback_module
+
+    calls: list[str] = []
+    real = fallback_module.log_fallback
+
+    def spy(resolved, *, consumer: str):  # noqa: ANN001, ANN202
+        calls.append(consumer)
+        return real(resolved, consumer=consumer)
+
+    monkeypatch.setattr(fallback_module, "log_fallback", spy)
+
+    async with session_scope() as session:
+        svc = _svc(session)
+        view = await svc.scene()
+        # 前提：库里确实没有场景行（否则本用例测的不是这条路径）
+        assert view.state == "unknown"
+        assert view.expired is False
+        _value, resolved = svc.resolve_scene(view)
+
+    # 结论 1：确实回退了（值是领域默认，不是编造的场景）
+    assert resolved.used_default is True
+    assert resolved.value.state == "unknown"
+    # 结论 2：但**没有**记一条行为日志
+    assert calls == [], (
+        f"「从没提交过场景」被记成了 upstream_fallback（{calls}）——"
+        "500 条环形日志会被这种正常状态刷满"
+    )

@@ -19,20 +19,20 @@
 | R5 总览布局 | **实现有依据**：12 列自适应与 gutter `dashboard.css:1-68`，卡片跨列 `DashboardPage.tsx:690-749`。 | CSS 注释的尺寸不是本次实测；须在 375/1440 和中间宽度浏览器验收。 |
 | R6 接入器配置 | **已完成**（2026-11-10）：前端从只读改为可编辑表单，接 `PUT /v1/settings/connectors/{scope}`，覆盖 202/409/422/503/rolled_back 全部分支；密钥恒空、清空只能走 `clear`；真 Chromium 11 项通过。`SettingsHub` 的“本轮只读”文案已同步改正。 | 无。 |
 | R7 设置布局 | **已有实现**：三组结构 `SettingsHub.tsx:118-150`，双列/窄屏单列 `settings.css:163-166,355-360`；浏览器用例 `settings-layout.browser.test.tsx:167,214`。 | 浏览器用例本次未执行，且文件未跟踪；正式交付需跑并确认未 skip。 |
-| R8 置顶及好感度排序 | **声称完成但实际断链**：置顶 API `sessions.py:244-275`、字段迁移 0059；`sort_windows_for_display` 有排序键 `conversation/service.py:105-144`。 | `sessions.py:222-233` **先** `list_windows()`，**后**查 `familiarities()`，没有把字典传给前者；`list_windows` 空字典排序 `service.py:357-361`。前端无 pin 调用/按钮（`api.ts`、组件检索）；用户不能置顶，也不会按好感度排。 |
+| R8 置顶及好感度排序 | **后端已修，前端未接**（2026-11-10 复核）：`sessions.py:239-243` 现在是 `list_windows()` → `familiarities(windows)` → `sort_windows_for_display(windows, familiarity)`，顺序正确，好感度**真的参与排序了**；`:226-238` 的注释专门记录了这个循环依赖（排序要 familiarity，familiarity 要窗口列表）以及为什么必须拆两步。置顶 API `POST /sessions/{id}/pin` 在 `sessions.py:262-293`，`set_window_pinned` 由 `:288` 调用。 | **前端完全没接**：`clients/web-console/src/` 下 `pinned` 零命中（`types.ts` 无此字段，无置顶按钮，`api.ts` 无 pin 调用）。用户**能**按好感度排序了，但**不能**置顶——契约里的 `SessionRecord.pinned`（`contracts/v1.py:641`）后端已经在返回，前端没消费。 |
 | R9 会话标题 | **后端真接线**：OneBot `get_friend_list` `connector.py:1215-1267`；路由实际调用 `sessions.py:95-129,185-190,222-233`，备注优先 `:163-166`；群名独立采集 `:56-90`。 | 真实 OneBot 返回备注、群名和超时表现未本次在线验收；现有 `test_session_display_fields.py:137-242` 重点测群名/昵称。 |
 | R10 消息左右 | **改动生效但有回归**：actor 右、其他人左 `MessageList.tsx:171,473-483`、`styles.css:830-889`；SSR `dialogue.test.tsx:509-553`。 | 抽屉打开后右侧 actor 下的 `prompt-entry` 被面板遮挡，见 C；需产品修复，且私聊方向需用户体验裁决。 |
 | R11 撤回时点 | **实现与测试可见**：判定 `conversation/service.py:972-1032`，读侧保留看过的消息 `:1135-1165`，迁移 0056；`test_message_recall.py:323-331,447`。 | 当前开发库的 `retracted_after_seen` 列存在，但迁移版本戳仍 0047，不能由此证明升级流程正确。 |
 | R12 撤回仅作 LLM 工具 | **核心链路存在**：工具注册 `capabilities/tools.py:281,330-366`、确认路由 `api/routes/recall.py:216-292`；集成 `test_recall_tool.py:214,716-726`，浏览器卡片 `recall.browser.test.tsx:300-308`。 | 本次未接真实 OneBot/QQ 回执测试；“只有工具”应再核对所有入口权限，不能仅看注册。 |
 | R13 人设 10 万 token | **配置上限已提高**：`context.py:123-132` 给 persona 100000；traits 上限 `persona/service.py:157-176`。 | 这里按 2 字符/token **估算** `context.py:1209`；不等于供应商必能接受 10 万输入，需按目标模型上下文验收。 |
 | R14 视频模型/额度 | **同步观看路径接通**：`watch.py:373-395` 明确视频职责；次数常量已删 `video.py:60-74`；token 闸 `watch.py:124-185,256-265`；`turn.py:1044-1073,1474-1483` 传失败事实。 | 后台视频读取第 4 步持久预算尚缺，不能把同步 token 余额闸当成全部视频成本保障；见 R24。 |
-| R15 全局媒体槽 | **已实现**（2026-11-10）：`media_slots` 单行表 + 迁移 0061 + `domains/media/slot.py`（`FOR UPDATE NOWAIT` 抢占、240 秒租约、代次栅栏、fail-closed）；已接入 `VideoWatchService.watch()` 的耗时区间，生产装配 `enforce_slot=True` 有测试钉住。真 PG 20 并发抢占**恰好 1 个成功**。 | `bilibili_feed`/`livestream` 只留了 kind 常量，尚未接入执行器（设计如此：它们将来争同一行）。 |
-| R16 可等待、自由决定回复时机 | **已裁决，实施中**（2026-11-10）：用户原话「做，但是只在她主动选择时才延后，且延后多久让她自由发挥，上限 5 分钟」。设计文档 §4 原有的「0/15/45/90 档位 + 120 秒上限」**已被推翻**，改为「时长由她自己给 + 300 秒硬上限」。与 R15 的冲突已裁定：槽位等待（`cause=resource`）**不是**她的意愿延后（`cause=volition`），两者分开记日志、互不冒充。 | 实现由独立子智能体在 `domains/deferred/` + 新迁移 0063 上做，本表在其交回证据后再更新为「已实现」。 |
-| R17 她有权不看 | **机制部分成立**：`context.py:807-860` 明示“想看才写标记，没写当没看见”；`turn.py:1044-1049` 仅见标记才读。 | 这只证明模型可选择不写；未有真实模型对话样本证明她会按人设拒绝，而非总被诱导看。 |
+| R15 全局媒体槽 | **已实现**（2026-11-10）：`media_slots` 单行表 + 迁移 0061 + `domains/media/slot.py`（`FOR UPDATE NOWAIT` 抢占、240 秒租约、代次栅栏、fail-closed）；已接入 `VideoWatchService.watch()` 的耗时区间，生产装配 `enforce_slot=True` 有测试钉住。真 PG 20 并发抢占**恰好 1 个成功**。 | ① `bilibili_feed`/`livestream` 只留了 kind 常量，尚未接入执行器（设计如此：它们将来争同一行）。② **`enforce_slot=True` 的生产装配点只有 `watch.py:497` 一处**（`default_watch_callback` 内）；`VideoWatchService` 的 `enforce_slot` 默认 `False`（`watch.py:205`，**故意的**——测试与同步观看路径需要不占槽），`watch.py:253` 对 `False` 直接 `return None` 静默放行。所以若将来有新的生产调用点自己构造 `VideoWatchService` 却不传 `enforce_slot=True`，**不会有任何报错，只是单飞悄悄失效**。已核实的装配点只有这一处，但这条约束没有测试钉住。 |
+| R16 可等待、自由决定回复时机 | **已实现**（2026-11-10）：用户裁决原话「做，但是只在她主动选择时才延后，且延后多久让她自由发挥，上限 5 分钟」。新增 `domains/deferred/`（`state.py` 状态机 / `markers.py` 标记解析 / `service.py` 认领与栅栏）+ 迁移 `0063_deferred_replies` + worker 周期任务 `deferred.reply.sweep`（5 秒，零模型）。她写 `<<等会回 N>>` 才延后，N 由她自己给、钳到 300 秒且**钳过要在 SSE 里如实上报**（`requested_seconds`/`applied_seconds`/`clamped` 三个数都带）。新输入抢占用**派生栅栏**（`max(messages.sequence)`）而不是取消代次列——入口分散在三处，任何写入点都会漏。**槽位等待（`cause=resource`）与意愿延后（`cause=volition`）严格分开记**，互不冒充。证据：`tests/integration/test_deferred_reply_{store,flow,intent,wiring}.py` + `tests/unit/test_deferred_{markers,stream_filters}.py`，20 组变异测试全部验证会红。 | 当前只支持 Web 会话（`SUPPORTED_CHANNELS`）；群聊延后需要额外在 `_deliver` 前补抢占检查，已在代码注释说明。延后到点后的回复由 worker 建新轮次落库，前端下次拉消息可见，**未做倒计时/到点自动刷新**。 |
+| R17 她有权不看 | **机制成立 + 有真实样本**（2026-11-10，23 轮真实模型对话，`hy3`，见 `docs/evidence/r17-watch-willingness.md`）：`context.py:807-860` 明示“想看才写标记，没写当没看见”；`turn.py:1044-1049` 仅见标记才读。样本里 **23 轮有 1 轮（E4）真的没写标记、没读**——用户只说「我刚才发了个视频你看到没」，她的原始输出是「还没看呢，没点开。」，无 `<<看视频>>` 标记、无 `video_watch*` 事件、`description` 保持空。**「不写标记 = 不看」在真实模型下被实际用到。** | ① 未观察到**基于意愿**的拒绝（E 场景 5 轮里 4 轮仍主动去看），那 1 次是"未主动去看"的事实陈述，不是"我不想看"。这是人格倾向不是代码缺陷，未改提示词去凑结论。② **发现一处硬事实违例（用户可见）**：D2 视频读不到时正文写了「看了，你这视频想让我看啥呀？」。**已实测确认这不只是落库问题——SSE delta 在生成过程中实时推送，用户当场看到了这句话**（6 轮真实 HTTP SSE 里第 3 轮实时收到 `看了下。`；8 轮探针命中 2 轮）。根因：正文与标记**同一次生成**，读视频在生成之后。**已开 task-25（`blocked_by: task-23`）**，见下方「未修问题」第 3 条。③ 附带发现：历史媒体描述不带轮次标识，3/10 轮首次生成说出了**上一轮**视频的内容（见「未修问题」第 4 条，未修待裁）。⚠️ **适用范围**：样本跑在 `:3002` + `NASFREE_API_KEY`，**非生产端点**（`hy3gw2 → :8080` 当天不可用），详见证据文档开头的醒目限制。 |
 | R18 忙态展示 | **已实现**（2026-11-10）：新增 `GET /v1/dashboard` 的 `media` 段（`dashboard.py::media()`），从全局槽位读 `current_holder()` 投影**真实**媒体活动；前端新增「正在忙什么」卡片。三个关键取舍：**不塞进「正在看手机」**——看视频≠看手机，合并会把具体事实说糊；只报 `active`（`held` 是还在准备）；**别人的会话只给 `kind`/`started_at`，不给 `activity_id`/`window_id`**（受众边界）。真浏览器 1440/375 各一条，无横向溢出。 | `phone` 那套 `start_watching/stop_watching` 仍是生产零调用——它管的是手机这一层，与媒体活动是两件事，不强行接线。 |
 | R19 视频留存后总结入记忆 | **已实现**（2026-11-10）：新增 `domains/media/sediment.py`，在每日 `memory.archive` 里把**将要过期/已过期**且"她真的看过"的媒体描述沉降成记忆（走 `MemoryService.propose`，带来源、幂等）。五个筛选条件：真看过（排除 `model_inference`）、有真实 `source_event_id`、有归属主体、已过期、未沉降过。 | 不做"立刻再总结一次"（伪需求：观看结果本来就会复用描述）。模型生成的浓缩摘要未做——那要独立"非事实"存储。 |
 | R20 睡眠记忆压缩 | **已实现**（2026-11-10）：新增 `memory.consolidate` 作业，由 `life.schedule` 在**预计入睡后 30 分钟**投递（一晚一条，幂等键 = sleep_date）；`memory_consolidations` 表（迁移 0062）记录每晚做了什么。第一版**确定性、零模型**：复用 `compact_low_value` 按人整理。`skipped` 与 `ok` 分开——空跑不记成功，否则"整理过 N 晚"就只是个心跳。 | 模型生成的"这一天浓缩成一句话"仍未做：那必须新增明确标注"非事实"的存储，不能复用记忆行（否则模型编的话会取代原始记忆参与召回）。 |
-| R21 后台真删 | **未交付，正在开发**：现有 HTTP 仍调用软清除 `manage.py:272-283`，`forget_subject` 保留原文 `memory/service.py:1431-1486`。 | 新 `purge.py:145-220,223-362` 和迁移 0060、worker handler 已出现，但路由仍未调用 `request_purge`；未验证代次与历史事件脱敏。 |
+| R21 后台真删 | **已接通**（2026-11-10 复核）：HTTP 入口已改走真删——`manage.py:300` `from ling.domains.memory.purge import MemoryPurgeError, request_purge`，`:305` 实际调用 `request_purge(...)`，不再是软清除。**失败留墓碑也已实现**：`purge.py:594` `_record_purge_failure()` 用**独立事务**写 `state='failed'`（`:618` `await fresh.commit()`），`purge.py:563` 是它的调用点。有测试钉住：`tests/unit/test_memory_purge_gaps.py:211` `test_failed_state_survives_the_rollback`、`tests/integration/test_memory_purge_flow.py:723`（「清理失败时墓碑必须真的变成 failed」）。 | 仍未验证的只有：代次栅栏对**旧事件**（`subject_id` 为空的那批）的行为、以及 `media_evidence.description`/知识项/提示词快照是否都纳入删除边界。这两项需要构造含旧事件的库来验收，普通测试覆盖不到。 |
 | R22 开源记忆设计调研 | **文档产出存在**：`docs/MEMORY-OSS-RESEARCH.md:1-20` 覆盖拟人化写入、召回、睡眠、遗忘（本次工作树未跟踪）。 | 调研产物不是记忆行为改善；随提交确认来源与可追溯性。 |
 | R23 注入正确性 | **边界已复现，不是"随机乱注入"**：候选 500 先截 `memory/service.py:559-574`；相对下限 + 保底 `kept or scored[:1]` 见 `:825-835`。实测（`_bm25_scores` 直接调用）：字面零命中的记忆**不会**进候选池（无 embedder 时只留 BM25>0）；但**弱相关的一定会**——只要它是唯一候选，`kept or scored[:1]` 就保底注入，不看绝对分。 | "无关记忆被注入"不是 bug 而是**相对阈值的固有天花板**：需要绝对分下限才能挡弱相关，而那会把"同义改写"也误杀。若要做，应先补 embedder 再谈阈值；当前无 embedder 的部署下这是已知取舍。 |
 | R24 异步工具 | **预算闸已接通并修掉两个真 bug**（2026-11-10）：新增 `domains/media/budget.py`，在 `run_read_job` 调模型前做**持久**预留（复用 `behavior_model_calls`，`kind=video_watch`），五条退出路径（认领失败/租约丢失/取消/异常/成功）都结清，失败与 unknown 占额不退款。**次数限制彻底去掉**（`VIDEO_MAX_CALLS_PER_DAY is None`，`reserve_behavior_call` 支持 `max_calls=None`），只守 token 额度。独立 QA 复验抓出两处真回归并已修：(a) 预算闸原在 `claim_read_job` 之后，额度用尽时 `transition(running,budget_denied)` 必抛 `InvalidJobTransition` → outbox 重试 5 次 → 用户看到 `failed` 而非 `budget_denied`；闸已前移到认领之前走 `pending→budget_denied` 合法边；(b) `describer is None`（模型路由未就绪，正常路径）在 `_settle_budget` 定义之前早退，每次重排漏一条永久占额的 `reserved`，已把检查前移。证据：`tests/integration/test_media_read_execution.py::test_budget_denied_settles_without_raising`、`::test_missing_describer_leaks_no_reservation`，两者均已变异测试确认会红。 | 真实用量 `actual_tokens` 仍记 `None`（缺 usage 不虚填 0），要拿到 provider usage 才能填实数。 |
@@ -86,32 +86,35 @@
 - 这 24 条 `memory.extract` 的 `payload` 均含 `user_text`、`actor_text`，但新冗余 `outbox_events.subject_id` 均为 NULL（只读查询）；新 `request_purge` 只按该列取消，`purge.py:178-184`，所以**历史 pending 事件无法被请求阶段选中**。这是 R21 新方案的确定性缺口。
 - 新 `purge_subject` 也按 `outbox_events.subject_id` 擦历史 done/dead/cancelled 的 payload，`purge.py:314-327`；旧事件该列为空，仍有原文。不能用“已写真删模块”覆盖这个事实；需要历史回填或安全地按 payload 归属筛选。
 - 对旧事件的代次防护也失效：worker 将 `claim.subject_id` 绑定进栅栏 `worker.py:4626-4642`，而 `claim_still_valid` 遇空主体直接放行 `purge.py:430-442`；开发库这 24 条旧提取事件 `subject_id` 全空。
-- **失败状态会随异常回滚**：`purge.py:357-362` 写 `tombstone.state='failed'` 后抛 `MemoryPurgeError`；调用它的 `session_scope` 在异常时 rollback，`infra/db.py:100-110`。因此“失败留墓碑”当前未实现，须独立事务落状态或改变异常边界。
+- ~~**失败状态会随异常回滚**~~ **已修**（2026-11-10 复核）：现在走 `purge.py:594` `_record_purge_failure()`，它用**独立事务**提交 `state='failed'`（`:618` `await fresh.commit()`），因此调用方 `session_scope` 回滚也不会吃掉这条状态。`purge.py:543-557` 的注释专门解释了「为什么不能在当前 session 里写再抛」。测试钉住：`tests/unit/test_memory_purge_gaps.py:211` `test_failed_state_survives_the_rollback`、`tests/integration/test_memory_purge_flow.py:723`。原文描述的 `purge.py:357-362` 行号已漂移，不再是失败路径。
 - 真删时的并发新记忆也需定界：`purge_subject` 对该主体的 `memories`/`episodes` 整表删除 `purge.py:282-291`，而新轮次入队记的是新代次 `turn.py:1774-1803`；若清理与新写入并行，新内容是否应保留及锁边界尚未证明。
 - 新清理逻辑 `purge.py:259-327` 只列部分派生表；`media_evidence.description`、知识项、提示词快照是否属于“用户要求的派生数据”须逐表定边界，并验证删除后无可检索原文；当前未见验收测试。
 - **前端抽屉超时是产品回归，不是单纯测试问题**：`prompt.browser.test.tsx:308-339` 明测再点入口；按用户给的 1440px 命中实测，入口 x=1244..1338，抽屉 x=950..1440，`elementFromPoint` 命中 `prompt-drawer__body`。本次未重跑浏览器，几何证据与 CSS/事件逻辑一致。
 - **标题采集不是死路径**：`sessions.py:187-190,222-233` 确实调到 `fetch_friend_names`；但按 channel 调一次整表 `:95-129`，需真实渠道测试备注变化、缓存到期及故障回退，不能用静态接线代替交付。
 - **群窗口按好感度排序没有区分力**：`conversation/service.py:450-454` 明写群窗口 `subject_id` 是主人；多个群窗口同取主人的 familiarity，即使修复 R8 的传参，也会退化按活跃时间排。群排序需另定群级信号。
-- **新 R8 还有 schema 运行风险**：代码模型已读取 `Window.pinned_at` `service.py:129-138`，但迁移 0059/0060 均未跟踪且开发库版本戳 0047；部署若只换代码不做真实迁移，会在列不存在的目标库上失败。
+- **新 R8 的 schema 风险（2026-11-10 实测复核，原描述已不成立，但风险本身仍成立）**：
+  - ✅ **已不成立**：`0059_window_pinned_at.py` 与 `0060_memory_purge.py` **均已 git 跟踪**（`git ls-files --error-unmatch` 已验证）；开发库版本戳**不是 0047**，实测 `alembic current` = `0062_memory_consolidate`。原文「均未跟踪且版本戳 0047」两项都已过时。
+  - ⚠️ **仍成立**：代码读 `Window.pinned_at`（`service.py:129-138`）而**任何**目标库必须先跑迁移再换代码，这个部署顺序约束没有变，也没有机制强制它——只换代码不迁移，仍会在缺列的库上失败。证据：`git ls-files migrations/versions/ | tail` 显示 0059/0060 在列；`alembic current` 实测 0062。
 - **R13 的巨大人设预算可能挤压其他车道**：`context.py:120-145` 明定受保护车道、persona 100000；应验收真实模型上下文上限、费用及截断提示，而非仅看页面输入成功。
 - **R24 并非完全死路径**：媒体 outbox handler 已注册且 `_media_worker_loop` 被 `run_forever` 启动，`worker.py:1062-1102,4687-4696`；`settle_dead_jobs` 也在 dead 分支接线 `:4550-4565`。旧“零调用方”说法在当前工作树已过时。
-- **R24 仍有成本竞态**：`jobs.py:599-655` 只有认领、开始标记、执行；无 `behavior_model_calls` 的原子预算预留。同步视频仅查余额 `watch.py:124-185`；并发可以同时看到“还有额度”，需第 4 步验证。
+- ~~**R24 仍有成本竞态**~~ **已修**（2026-11-10 复核）：`domains/media/budget.py:94` `reserve_video_call()` 已在模型调用前做**持久**预留（复用 `behavior_model_calls`，`kind=video_watch`，`:122-123` 落 `reserved_input_tokens`/`reserved_output_tokens`），闸门在 `jobs.py` 认领**之前**判定，拿不到就落 `pending→budget_denied`。测试：`tests/integration/test_media_read_execution.py:1314` `test_budget_denied_settles_without_raising`、`:1388` `test_missing_describer_leaks_no_reservation`。**注意**：同步观看路径（`watch.py:124-185`）与后台作业走的是两份不同的账（前者查 `TokenQuotaStore` 实时余额、后者写 `behavior_model_calls`），两者共享供应商总额度但**不是同一把锁**——同一秒内同步看一个、后台再排一个，仍可能双双放行。这才是本条剩余的真实缺口，与“无预留”是两回事。
 - **设计文档与 R14 冲突**：`ASYNC-TOOL-DECISION.md:31-32` 的第 4 步仍要求“每窗口每小时 2 次、全局每天 20 次”，但 R14 已删次数限制 `video.py:60-74`；实现预算前先裁决究竟只管 token，还是重新引入次数闸。
 
 ## D. 交付前动作（按优先级）
 
 | 优先级 | 必做动作与完成判据 | 为什么必须做 |
 |---|---|
-| P0 阻断交付 | 修 R8：先批量取好感度再排序，前端提供置顶/取消置顶；对私聊及群聊分别验收。证据：`sessions.py:222-233`、`service.py:357-361,450-454`。 | 现在 API 回了 familiarity，但顺序不按它排，用户可感知承诺失效。 |
-| P0 阻断交付 | 完成 R21 后台真删入口、历史 outbox 清理及失败状态持久化；构造含旧事件的库验收“请求后不可见、后台后不存在”。证据：`manage.py:272-283`、`purge.py:178-184,314-327,357-362`、开发库 24 条 subject_id=NULL。 | 当前软删留原文，新模块漏旧队列，且失败状态会被事务回滚。 |
-| P0 阻断交付 | 以干净 0047 快照升级到当前 head，并以迁移后读写烟测 R6/R8/R11/R12/R24；核实最终 head 与提交文件一致。证据：当前 `alembic current=0047`、`heads=0060`，但当前库已有后续表列。 | 开发库版本戳与 schema 分叉，现有测试无法证明升级过程可部署。 |
+| P1 应当修（原 P0，已降级） | **R8 只剩前端**：给会话列表加置顶/取消置顶 UI，消费后端已返回的 `SessionRecord.pinned`（`contracts/v1.py:641`）并调 `POST /sessions/{id}/pin`（`sessions.py:262-293`）。排序部分**已完成**，不需要再动（`sessions.py:239-243`）。对私聊及群聊分别验收。 | 用户现在能按好感度排（已修），但仍**不能置顶**——`clients/web-console/src/` 搜 `pinned` 零命中。后端能力已就绪，纯前端缺口。 |
+| ~~P0 阻断交付~~ **已降级** | **R21 主体已完成**，只剩一项验收：构造含**旧事件**（`subject_id` 为空的那批）的库，验证“请求后不可见、后台后不存在”。证据：入口 `manage.py:300,305` 已调 `request_purge`；失败留墓碑 `purge.py:594-618` 独立事务；测试 `tests/unit/test_memory_purge_gaps.py:211`、`tests/integration/test_memory_purge_flow.py:723`。 | 不再是“未交付”：软删入口已替换、失败状态不再被回滚。**剩余风险只有旧事件代次栅栏与派生表边界**（见 R21 条目缺口栏），不再阻断交付。 |
+| ~~P0~~ **拆分：升级路径已验证，剩 head 一致性未验** | ✅ **已验证（2026-11-10 实测）**：造一个 **0047 + 真实数据**的独立库（`ling_r17_mig`：subjects/windows/messages/memories/media_evidence/outbox_events 各 1 行），`alembic upgrade 0062` **全程无错**（0047→0062 共 15 个 revision），升级后**数据完整保留**（计数与原文均逐一核对），且新增的列/表**可读可写**：`windows.pinned_at`（0059）UPDATE 成功、`memory_purge_tombstones`（0060）/`media_slots`（0061）/`memory_consolidations`（0062）插入成功。反向 `downgrade 0047` 也成功且数据保留。再 `upgrade 0063`（含 R16 未跟踪迁移）同样通过。
+  ⚠️ **仍未验证**：① 开发库 `ling` 版本戳实测 `0062`，而代码 `heads` = `0063_deferred_replies` —— **差一版**，因为 `0063_deferred_replies.py` 目前**未跟踪**（`git status` 显示 `?? `）；提交前必须确认它被纳入且 `heads` 与提交文件一致。② 本次只做迁移烟测，**没有**在升级后的库上跑 R6/R8/R11/R12/R24 的业务读写。 |升级路径本身已证明可部署；剩余风险集中在「未跟踪迁移是否随提交」与「业务层烟测」两项。 |
 | P0 阻断交付 | 修 `prompt-entry` 被右抽屉遮挡，并在 1440/375 真 Chromium 跑 `prompt.browser.test.tsx:308-339`，确认测试未 skip。 | 用户可见“再点入口收起”失效，已有命中测试与 CSS 路径相互印证。 |
 | P1 应当修 | 把 R6 的后端可编辑字段、保存/回滚/失败状态做成前端表单；证据 `settings.py:847-1034` 对比 `ConnectorsPage.tsx:223-260`。 | 原始诉求就是“点进去能配置”，目前界面还告诉用户去改 `.env`。 |
 | P1 应当修 | 给 R4 前端展示回退来源；验证未生成日程、读取超时、睡眠态三个用户场景。证据 `dashboard.py:574-607` 对比 `DashboardPage.tsx:305-333`。 | 静默回退虽能运行，却让用户误以为日程驱动正在生效。 |
 | P1 应当修 | 查 worker 是否实际运行、为什么 10-31 后 24+24 件均零次认领；观察消费日志和只读队列状态，恢复后确认 backlog 消退。证据：开发库 outbox 分组查询、`worker.py:388-511,4687-4696`。 | 记忆与关系均不再更新；不能把“提取代码存在”当服务正常。 |
 | P1 应当修 | 给 R23 做可重复的无关查询、500 池外旧事实、重复情节、合并主体测试，并对绝对相关性设可为空门槛；证据 `memory/service.py:559-574,708-835`。 | 注入错误会直接改变她的回答，现有测试反而保护“至少一条”的行为。 |
-| P1 应当修 | 修已看视频被写成“图片/语音”的媒体车道，区分来源；证据 `context.py:778-805`、`media/service.py:343-351`。 | 角色可能把视频内容说成看图所得，破坏事实来源。 |
-| P1 应当修 | 对 R14/R24 后台视频接数据库预算预留，做同步+异步并发超额验收；证据 `chat.py:536-540`、`jobs.py:599-655`。 | 第 4 步未做时无法保证并发成本上限。 |
+| ~~P1 应当修~~ **已完成（task-26）** | 媒体车道文案已按实际 `kind` 生成：`context.py` 里 `条图片/语音` **零命中**（改成 `kinds_phrase`，只列真实存在的种类）。同时给每条已描述媒体加了可指认标识（视频用 `short_ref_for`，图片/语音用序号），并明确区分"之前收发过的"与"还没看的"。测试 `tests/integration/test_context_media_identity.py`（6 用例，两组变异测试确认会红），改动记录见 `docs/evidence/context-media-identity.md`。 | 无。原缺口「角色可能把视频内容说成看图所得」已消除。 |
+| P1 应当修 | **后台预留已完成**（`domains/media/budget.py:94`，测试 `test_media_read_execution.py:1314,1388`）。**只剩一项**：同步观看与后台作业**不是同一把锁**——同步查 `TokenQuotaStore` 实时余额（`watch.py:124-185`），后台写 `behavior_model_calls`，同一秒并发仍可能双双放行。需要一条"同步+异步并发超额"验收来定界。 | 后台单独看已有上限；两侧叠加时的真实上限未被验证。 |
 | P2 可以后置 | R15 先收集并发冲突频率，再决定跨进程全局槽；R16 先定“等待/稍后回复”产品语义。证据 `turn.py:1044-1073`、`docs/MEDIA-EXCLUSIVE-SLOT.md:112-113`。 | 真实可触发但高复杂度，当前缺频率与等待体验证据。 |
 | P2 可以后置 | R17、R10 找真实私聊样本做选择权与左右方向体验验收；证据 `context.py:807-860`、`dialogue.test.tsx:509-553`。 | 单靠标记和 CSS 测试无法裁决拟人化意愿与用户方向感。 |
 | P2 可以后置 | R18 接真实活动态，不复用死的手机 API 冒充视频；R19 只做筛选后的长期沉淀；R20 按睡眠事件触发新增工作。证据 `phone/service.py:210-255`、`context.py:750-805`、`worker.py:2673-2694`。 | 这些是体验增强；当前已有状态/描述/弱压缩，应先避免重复实现。 |
@@ -233,14 +236,25 @@
 
 | 项 | 现状 | 缺什么 |
 |---|---|---|
-| **R16 可等待/自主决定回复时机** | **未实现**。`docs/MEDIA-WILLINGNESS-DESIGN.md` 有完整设计（`DeferredReply` + 到期新轮次 + 新输入取消旧投递） | 持久化的延后回复载体与调度；且与 R15"忙即拒绝、不排队"需要产品裁决先后 |
+| **R16 可等待/自主决定回复时机** | **已实现**：`domains/deferred/` + 迁移 0063 + worker 周期扫描；她自己给时长、300 秒硬上限且钳制对用户可见；新输入抢占走派生栅栏；硬截止兜底短句不谎报送达 | 群聊渠道未接；未做前端倒计时 |
 | **R18 忙态真实活动** | **已补完**（见上表） | — |
 | **R19 视频摘要长期沉淀** | **已补完**（见上表）：`sediment.py` 在每日归档里把将过期的"真看过"证据沉降成记忆，五个筛选条件、幂等、带来源 | 模型浓缩摘要（须独立"非事实"存储） |
 | **R20 睡眠期记忆压缩** | **已补完**（见上表）：`life.schedule` 按预计入睡 +30 分钟投 `memory.consolidate`，一晚一次、按人、零模型；`memory_consolidations` 留痕 | 模型摘要（须独立"非事实"存储） |
-| **R17 她有权不看** | **机制成立、未验证**。上下文已给她"想看才写标记"的选择 | 真实模型对话样本，证明她确实会拒绝而不是总被诱导 |
+| **R17 她有权不看** | **已验证有真实样本**（见上表）：23 轮真实模型对话，1 轮（E4）真的没写标记也没读，措辞与事实一致 | 未观察到"因为不想看而拒绝"，属人格倾向；D2「读不到却称看了」已确认**用户可见**并开 task-25；历史描述缺轮次标识（上一轮内容被当成本轮）未修待裁。样本在 `:3002` 非生产端点 |
 | **R24 异步工具预算** | **已补完并修掉 QA 发现的两个真回归**（见上表）：预算闸前移到认领之前（`pending→budget_denied` 合法边）、`describer is None` 检查前移消除 `reserved` 泄漏、五条退出路径全结清、次数限制彻底去掉 | `actual_tokens` 待接 provider usage |
 
 ### 本轮新发现、未修的后端小问题（如实记录）
 
 1. `dashboard.py:324` 的 `describe` **一词两义**：它本意是"可用性说明"，却在场景 unknown/过期时补一句"状态正常，可以随时说话"，读起来像在说她的场景正常。前端只能把两块分开讲，语义应由后端用独立字段表达。
 2. `presence.resolve_scene()` 在"从没提交过场景"（最常见的默认状态）时也会 `log_fallback(consumer="presence.scene")`，把正常空状态记成 `upstream_fallback` 行为日志。与 `fallback.py` 里"上游为空是正常状态"的取向不一致，日志容易被刷满。
+3. 🔴 **`[用户可见]` 读视频失败时正文仍可能声称"看了" —— 已开 task-25 修复**（证据：`docs/evidence/r17-watch-willingness.md`「补充取证·一」）。**这不是日志准确性的小瑕疵，是用户当场看得见的谎话。**
+   - **实测**（真实 HTTP + 真实 SSE）：6 轮里第 3 轮用户实时收到 `看了下。`，该轮 `description` 为空、行为日志 `video_watch_skipped`；另一次 8 轮探针命中 2 轮（`刚看了。`、`看了，咋了？`），且是 3 个 delta 分片**实时**推出去的。
+   - **为什么用户看得见**：`turn.py` 的 `queue.put(TurnStreamEvent(event="delta", …))` 在生成过程中就实时推；`chat.py:204-211` 的 `_forward()` 把 `item.data` 原样转成 SSE，**没有任何过滤**；`_visible()`/`stream_safe()` 只暂扣**不完整标记**，不拦正文里的观看声称。
+   - **根因**：正文与 `<<看视频>>` 标记是**同一次生成**，读视频发生在生成之后；`_follow_up_after_watch` 的"你没看成，不要说你看过了"只在**正文为空**时才送达——D2 正文非空，约束根本没机会说出口。
+   - **修法方向**：不是把提示词写得更严，而是**"依赖观看结果的正文必须在结果确定前暂扣"**。
+   - **状态**：已登记 **task-25**，**`blocked_by: task-23`**（R16 也在改 `turn.py`，必须串行）。验收线：**正文已含观看声称 + 观看失败 + 用户收到那句话 = 不通过**。
+4. 🟠 **`[可修]` 历史媒体描述没有轮次标识，她会把上一轮的描述当成这一轮的**（证据：`docs/evidence/r17-watch-willingness.md`「补充取证·二」）。实测导出的真实上下文里，已描述条目形如 `- 主人 03:57 发的视频：<描述>（对方说的）`，**不带短号**；而"待看"那条**带** `<<看视频 mXXXXXX>>`。同窗口多条视频时，模型无法把任一条描述对应到某个具体视频。三处缺陷（`context.py:788`、`796`、`846`）：
+   - 已描述条目**不带 `short_ref_for(evidence_id)`**（"待看"那条带）；
+   - 时间只到**分钟**（`_as_local_hint` → ` HH:MM `），同分钟多条视频三行完全同形；
+   - 块标题写「最近的 3 条**图片/语音**」「对应历史里那些「发来**一张图片**」的消息」，列表里装的却是**视频**，措辞错配。
+   **实证**：A/B 共 10 轮里 3 轮（A2/A4/B3）的**首次生成**（读视频之前）说出了**上一轮**视频的具体内容（A2 说"红底 A1"、A4 说"绿底 A3"、B3 说"青底 B2"），而这三轮在读到观察后的第二次生成都正确。与"把最近一条已描述条目当成当前视频"完全吻合，不是随机口误。比第 3 条轻（用户听到的是另一个**真实**视频的描述，不是凭空声称看过），但同族——都是"正文在结果确定前生成"的后果。修法：给已描述条目加短号，或明确标注「以下是你**之前**看过的，不是现在这条」。**未修，待裁**（不在 task-25 范围内）。

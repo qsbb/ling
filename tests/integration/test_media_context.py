@@ -127,7 +127,10 @@ async def test_inferred_description_enters_context_labeled(logged_in: TestEnv) -
     # 断言**紧跟在描述后面**的那条标注，而不是全文里出现过"推断"二字——
     # 末尾的说明句本身就含"推断"，只查包含关系的话，
     # 把每条的具体标注删掉测试依然是绿的（实测过）。
-    assert f"{INFERRED}（你自己看图推断的，不确定）" in media.text, (
+    # 标注必须**按实际 kind** 说清"她是从什么东西推断的"（图片/视频/语音），
+    # 且必须保留「推断」二字——丢了它，这条标注就退化成一句免责声明，
+    # 她可能把自己的猜测当成对方说过的话。
+    assert f"{INFERRED}（你自己看图片推断的，不确定）" in media.text, (
         f"推断没有被逐条标注：{media.text}"
     )
     assert "不要当成对方告诉过你的事实" in media.text

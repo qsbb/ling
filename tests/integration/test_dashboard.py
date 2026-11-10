@@ -205,7 +205,25 @@ async def test_presence_exposes_single_availability_conclusion(logged_in) -> Non
     if section["status"] == "ok":
         data = section["data"]
         assert data["availability"] in {"available", "low", "resting"}, data
-        assert data["describe"], "没有给表达层用的那句话"
+
+        # `describe` 是**给表达层**的一句话：她状态正常时它**故意是空串**
+        # （正常不需要额外约束）。这里原来断言它非空，等于要求后端编一句话，
+        # 而那正是"`describe` 一词两义"的来源：那句补出来的人话
+        # （"状态正常，可以随时说话"）是**可用性**说明，却被前端渲染在讲
+        # 场景的那一行上，于是"状态正常"被读成"她的场景正常"。
+        #
+        # 现在拆成三个字段，各自语义唯一：
+        #   - `describe`      → 给表达层，正常时为空（**允许为空**）
+        #   - `describe_note` → 首屏给**可用性**的人话
+        #   - `scene.note`    → 首屏给**场景**（她在做什么）的人话
+        assert isinstance(data.get("describe"), str), data.get("describe")
+        assert data["describe_note"], "首屏没有可用性说明"
+        scene = data.get("scene") or {}
+        assert scene.get("note"), "首屏没有场景说明（她说不出自己在做什么）"
+        # 两句话必须是**两件事**，不能又合并成一句
+        assert data["describe_note"] != scene["note"], (
+            "可用性与场景用了同一句话——这正是要修的一词两义"
+        )
 
 
 async def test_timeline_is_empty_not_fake(logged_in) -> None:

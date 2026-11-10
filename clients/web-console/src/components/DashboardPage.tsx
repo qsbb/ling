@@ -880,19 +880,32 @@ export function DashboardBody({
           /*
            * 这一块**有两个**上游，别把它们的回退混成一件：
            *
-           * - `availability` / `energy` / `social_load` / `describe`：presence
-           *   自己的状态，与回退无关，照常显示；
+           * - `availability` / `energy` / `social_load`：presence 自己的状态，
+           *   与回退无关，照常显示；
            * - `fallback`：讲的是**场景**（`presence/service.py::resolve_scene`，
-           *   场景过期 / 从没提交过 → 领域默认 `unknown`）。后端把
-           *   `scene.state` 也给了，而这里不显示它——所以它不是"兜底值冒充
-           *   真实状态"，只是这条标记**在这张卡上没有对应的可见值**。
+           *   场景过期 / 从没提交过 → 领域默认 `unknown`）。
            *
-           * 那为什么还渲染 `FallbackHint`？因为它说的是"她此刻在做什么"：
-           * 这句话用户会从这张卡里猜出来（旁边就是"可以随时说话"），而猜错
-           * 的方向恰好是"她现在闲着"。让默认值有个名字，比留白更诚实。
+           * ## 为什么现在分成两行说话
+           *
+           * 这里原来只渲染后端的一个 `describe`，而它本意是**可用性**说明
+           * （"状态正常，可以随时说话"）。它被摆在这张卡唯一的描述行上、
+           * 紧挨着讲场景的 `FallbackHint`——于是「状态正常，可以随时说话」
+           * 会被读成「她的场景正常」，而场景其实是 `unknown`。
+           *
+           * 后端现在把两件事拆开给了：`scene.note` 说**她在做什么**，
+           * `describe_note` 说**能不能说话**。两句话各有各的位置，谁也不
+           * 冒充谁。`describe` 仍是给表达层的那一句（正常时是空串），
+           * 首屏**不用**它——用它就又会把空串补成一句像结论的话。
            */
           const fallback = fallbackNoticeOf(d);
-          const describe = String(d.describe ?? '');
+          const scene = (d.scene ?? {}) as Record<string, unknown>;
+          const sceneNote = String(scene.note ?? '');
+          // 兼容两种后端形状：新后端分开给 `describe_note`（可用性）与
+          // `scene.note`（她在做什么）；旧后端只有 `describe`。
+          // 回退到 `describe` 是**为了不让旧响应渲染成空白**，不是为了
+          // 复活那个一词两义——新后端下 `describe` 正常时是空串，
+          // 这条回退自然不生效。
+          const describeNote = String(d.describe_note ?? d.describe ?? '');
           return (
             <>
               <p className="dash-now__line">
@@ -901,7 +914,8 @@ export function DashboardBody({
                   精力 {String(d.energy ?? '?')} · 社交负担 {String(d.social_load ?? '?')}
                 </span>
               </p>
-              <p className="dash-card__muted">{describe}</p>
+              {describeNote ? <p className="dash-card__muted">{describeNote}</p> : null}
+              {sceneNote ? <p className="dash-card__muted dash-now__scene">{sceneNote}</p> : null}
               <FallbackHint notice={fallback} scope="她此刻在做什么" />
             </>
           );
