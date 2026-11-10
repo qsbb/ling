@@ -638,3 +638,559 @@ def test_0053_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
     assert "payload" in _columns(migrated_db.url, "prompt_snapshots")
 
 
+
+
+# --------------------------------------------------------------------------- #
+# e) 0064_persona_clear_defaults
+#     清掉"与旧默认逐字相同"的人设行，用户改过的一律不动。
+# --------------------------------------------------------------------------- #
+
+#: 旧 `DEFAULT_SYSTEM_PROMPT` 的逐字副本（commit 5818d2f
+#: `src/ling/domains/persona/service.py:20-32`）。**刻意在这里独立再抄一份**：
+#: 测试要断言"迁移里硬编码的值 == 源码当时的真实值"，两边都从同一个历史
+#: commit 取，才能在有人改错迁移时立刻发现。264 字符，ASCII 双引号，无结尾换行。
+_OLD_PROMPT_5818D2F = """你是 ling，一个有自己的生活节奏、情绪和记忆的角色。
+
+说话方式：
+- 用自然的中文口语，像一个熟悉的人在聊天，不用客服腔、不用列表式汇报。
+- 回复通常简短（一到四句），除非对方明确要你展开。
+- 可以有自己的判断、偏好和小情绪，但不假装自己是人类，也不编造现实履历。
+- 不确定的事就说不知道，不编证据；不把猜测说成事实。
+
+边界：
+- 不泄露其他人的私聊内容，不把群聊内容当成本人授权。
+- 不声称自己做过没做过的事；没收到真实回执就说还没做到。
+- 被问到"你是不是 AI"时如实说明自己是 ling 这个角色程序。"""
+
+_OLD_TRAITS_5818D2F = {
+    "tone": "自然、略带温度、不谄媚",
+    "pace": "跟随对方节奏，允许短回复",
+    "curiosity": 0.6,
+}
+
+_OLD_BOUNDARIES_5818D2F = [
+    "不把模拟生活说成真实生物经历",
+    "不跨受众复述他人私聊",
+    "没有回执不声称已发送/已执行",
+]
+
+_REV_0064 = "0064_persona_clear_defaults"
+_REV_0063 = "0063_deferred_replies"
+
+
+@contextmanager
+def _fresh_db_at(revision: str) -> Iterator[str]:
+    """建一个临时库并 upgrade 到 ``revision``；用完 drop。
+
+    为什么不用 session 级的 ``migrated_db``：0064 是**数据迁移**，测试必须在
+    插入样本行之后才执行 upgrade，而 session fixture 在 yield 前就已经跑到
+    head 了。每个用例一个干净库，互不干扰（尤其是空表 no-op 用例）。
+    """
+    database = f"ling_mig_0064_{uuid.uuid4().hex[:10]}"
+    asyncio.run(_execute(TEST_DB_URL, f'CREATE DATABASE "{database}"'))
+    url = _database_url(TEST_DB_URL, database)
+    try:
+        _run_alembic("upgrade", url, revision)
+        yield url
+    finally:
+        try:
+            asyncio.run(
+                _execute(TEST_DB_URL, f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"临时数据库 {database} 清理失败，请手工删除: {exc}", stacklevel=1)
+
+
+def _insert_persona(
+    url: str,
+    *,
+    persona_id: str,
+    system_prompt: str,
+    traits: object,
+    boundaries: object,
+    revision: int = 1,
+) -> None:
+    """插一行人设。JSON 列用参数绑定，避免手拼引号。"""
+    import json as _json
+
+    statement = (
+        "INSERT INTO personas "
+        "(id, revision, name, display_name, system_prompt, traits, boundaries, "
+        " scenario_prompts, published, created_at, updated_at) "
+        "VALUES (:id, :revision, 'ling', 'ling', :prompt, "
+        "        CAST(:traits AS json), CAST(:boundaries AS json), "
+        "        CAST('{}' AS json), true, now(), now())"
+    )
+
+    async def _run() -> None:
+        engine = create_async_engine(url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(statement),
+                    {
+                        "id": persona_id,
+                        "revision": revision,
+                        "prompt": system_prompt,
+                        "traits": _json.dumps(traits, ensure_ascii=False),
+                        "boundaries": _json.dumps(boundaries, ensure_ascii=False),
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def _read_persona(url: str, persona_id: str) -> tuple[str, str, str]:
+    """读回三列，返回 (system_prompt, traits_json_text, boundaries_json_text)。"""
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT system_prompt, traits::text, boundaries::text "
+            f"FROM personas WHERE id = '{persona_id}'",
+        )
+    )
+    assert len(rows) == 1, f"persona {persona_id} 应有且仅有一行，实际 {rows}"
+    return str(rows[0][0]), str(rows[0][1]), str(rows[0][2])
+
+
+def test_0064_hardcoded_values_match_historical_source() -> None:
+    """迁移里硬编码的旧值必须与 commit 5818d2f 的常量逐字一致。
+
+    这条不连数据库：它守的是"迁移硬编码值本身没抄错"。历史 commit 取不到时
+    skip（浅克隆/导出包场景），而不是让整条链的测试挂掉。
+    """
+    import subprocess
+
+    try:
+        source = subprocess.run(
+            ["git", "show", "5818d2f:src/ling/domains/persona/service.py"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip("取不到 commit 5818d2f（浅克隆或无 git），跳过历史值比对")
+
+    namespace: dict[str, object] = {}
+    start = source.index("DEFAULT_SYSTEM_PROMPT")
+    end = source.index("@dataclass")
+    exec(source[start:end], namespace)  # noqa: S102 - 只执行常量赋值段
+
+    assert namespace["DEFAULT_SYSTEM_PROMPT"] == _OLD_PROMPT_5818D2F
+    assert namespace["DEFAULT_TRAITS"] == _OLD_TRAITS_5818D2F
+    assert namespace["DEFAULT_BOUNDARIES"] == _OLD_BOUNDARIES_5818D2F
+    # 两句身份立场必须在旧文案里（这是本次要清掉的核心原因）
+    assert "不假装自己是人类" in _OLD_PROMPT_5818D2F
+    assert "你是不是 AI" in _OLD_PROMPT_5818D2F
+
+
+def test_0064_clears_row_with_revision_1() -> None:
+    """三字段旧默认 + revision=1（从没保存过）→ 清空。
+
+    这是唯一会被清的组合。`revision=1` 是 `ensure_default()` 建行时的初值
+    （`5818d2f:service.py:76`），任何一次 `update()` 都会把它加到 2。
+    """
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+            revision=1,
+        )
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        prompt, traits, boundaries = _read_persona(url, "persona_ling")
+        assert prompt == ""
+        assert traits == "{}"
+        assert boundaries == "[]"
+
+
+def test_0064_keeps_row_with_revision_2_untouched_body() -> None:
+    """三字段旧默认 + revision=2（只改过显示名/场景）→ **整行不动**。
+
+    这类用户主动保存过这一行（`update()` 结尾无条件 bump revision，
+    `display_name` / `scenario_prompts` 都是可选参数），说明他知道这行存在。
+    替他清掉等于擅自撤销他的操作。
+    """
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+            revision=2,
+        )
+        before = _read_persona(url, "persona_ling")
+        assert before[0] == _OLD_PROMPT_5818D2F
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        after = _read_persona(url, "persona_ling")
+        assert after == before, (
+            "revision > 1 的行即使正文与旧默认相同也不得被清"
+            f"（前 {before}，后 {after}）"
+        )
+        assert after[0] == _OLD_PROMPT_5818D2F
+        # 两句身份立场仍在——这是刻意的：这行是用户自己保存过的
+        assert "不假装自己是人类" in after[0]
+
+
+def test_0064_revision_2_various_values_all_kept() -> None:
+    """revision 为 2/3/99 → 一律不动；只有 revision=1 会被清。
+
+    同一次迁移里混放三行，验证判据是"逐行"而非"整表一刀切"。
+    """
+    with _fresh_db_at(_REV_0063) as url:
+        for revision_value in (2, 3, 99):
+            _insert_persona(
+                url,
+                persona_id=f"p_rev_{revision_value}",
+                system_prompt=_OLD_PROMPT_5818D2F,
+                traits=_OLD_TRAITS_5818D2F,
+                boundaries=_OLD_BOUNDARIES_5818D2F,
+                revision=revision_value,
+            )
+        _insert_persona(
+            url,
+            persona_id="p_rev_1",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+            revision=1,
+        )
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        for revision_value in (2, 3, 99):
+            prompt, _, _ = _read_persona(url, f"p_rev_{revision_value}")
+            assert prompt == _OLD_PROMPT_5818D2F, (
+                f"revision={revision_value} 不应被清"
+            )
+        prompt, traits, boundaries = _read_persona(url, "p_rev_1")
+        assert (prompt, traits, boundaries) == ("", "{}", "[]")
+
+
+def test_0064_clears_untouched_default_persona() -> None:
+    """三列与旧默认逐字相同的行 → 迁移后三列变空，行还在。"""
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+        assert _read_persona(url, "persona_ling")[0] == _OLD_PROMPT_5818D2F
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        prompt, traits, boundaries = _read_persona(url, "persona_ling")
+        assert prompt == "", f"system_prompt 应被清空，实际 {prompt!r}"
+        assert traits == "{}", f"traits 应为 {{}}，实际 {traits}"
+        assert boundaries == "[]", f"boundaries 应为 []，实际 {boundaries}"
+        # 行**没有**被删：id 仍可查（display_name 等仍承载在这行上）
+        assert _current_version(url) == _REV_0064
+
+
+def test_0064_keeps_user_edited_persona() -> None:
+    """改过一个字 → 整行原样保留（即使其余部分与旧默认相同）。"""
+    edited = _OLD_PROMPT_5818D2F.replace("不假装自己是人类", "不假装自己是真人")
+    assert edited != _OLD_PROMPT_5818D2F
+
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=edited,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        prompt, traits, boundaries = _read_persona(url, "persona_ling")
+        assert prompt == edited, "用户改过的 system_prompt 不得被改动"
+        # 三列必须**同时**匹配才算未编辑，所以其余两列也不能被单独清掉
+        assert "自然、略带温度、不谄媚" in traits, (
+            f"traits 未整体匹配时不应被清空，实际 {traits}"
+        )
+        assert "不把模拟生活说成真实生物经历" in boundaries, (
+            f"boundaries 未整体匹配时不应被清空，实际 {boundaries}"
+        )
+
+
+def test_0064_keeps_partially_edited() -> None:
+    """三个字段里只有一个不同 → 整行保留，另外两个**也**不清。"""
+    with _fresh_db_at(_REV_0063) as url:
+        # prompt 完全相同，只让 traits / boundaries 之一不同
+        _insert_persona(
+            url,
+            persona_id="p_traits_diff",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits={"tone": "改过的语气", "pace": "跟随对方节奏，允许短回复", "curiosity": 0.6},
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+        _insert_persona(
+            url,
+            persona_id="p_bounds_diff",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=["只留一条"],
+        )
+        _insert_persona(
+            url,
+            persona_id="p_curl_diff",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits={"tone": "自然、略带温度、不谄媚", "pace": "跟随对方节奏，允许短回复", "curiosity": 0.7},
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+        _run_alembic("upgrade", url, _REV_0064)
+
+        for persona_id in ("p_traits_diff", "p_bounds_diff", "p_curl_diff"):
+            prompt, _traits, _boundaries = _read_persona(url, persona_id)
+            assert prompt == _OLD_PROMPT_5818D2F, (
+                f"{persona_id}: 只要有一项不同，system_prompt 也不能被清"
+            )
+
+        # 精确断言没被清空的那两列
+        _, traits_1, bounds_1 = _read_persona(url, "p_traits_diff")
+        assert "改过的语气" in traits_1
+        assert "不把模拟生活说成真实生物经历" in bounds_1
+
+        _, traits_2, bounds_2 = _read_persona(url, "p_bounds_diff")
+        assert "自然、略带温度、不谄媚" in traits_2
+        assert "只留一条" in bounds_2
+
+        _, traits_3, _ = _read_persona(url, "p_curl_diff")
+        assert "curiosity" in traits_3 and "0.7" in traits_3
+
+
+def test_0064_noop_on_empty_table() -> None:
+    """空表（新装/老部署没有 persona 行）→ 迁移正常通过，零影响。"""
+    with _fresh_db_at(_REV_0063) as url:
+        rows = asyncio.run(_fetch(url, "SELECT count(*) FROM personas"))
+        assert int(rows[0][0]) == 0
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        assert _current_version(url) == _REV_0064
+        rows = asyncio.run(_fetch(url, "SELECT count(*) FROM personas"))
+        assert int(rows[0][0]) == 0
+
+
+def test_0064_noop_on_empty_persona_created_by_new_code() -> None:
+    """新版 `ensure_default()` 建的空人设（'' / {} / []）→ 不得被改动。"""
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt="",
+            traits={},
+            boundaries=[],
+        )
+
+        _run_alembic("upgrade", url, _REV_0064)
+
+        prompt, traits, boundaries = _read_persona(url, "persona_ling")
+        assert prompt == ""
+        assert traits == "{}"
+        assert boundaries == "[]"
+
+
+def test_0064_is_idempotent() -> None:
+    """同一批数据再跑一次 upgrade 语句，结果不变（幂等）。
+
+    用 alembic 自己在**同步**引擎上跑 §0064 的 upgrade 语句，避免在 async
+    连接上手工伪造 `op`；做法是 downgrade 到 0063 再 upgrade 回 0064 —— 但
+    0064 的 downgrade 会 raise，所以这里改为直接对已清空的数据重放同一条 SQL。
+    """
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+        _run_alembic("upgrade", url, _REV_0064)
+        first = _read_persona(url, "persona_ling")
+        assert first[0] == ""
+
+        # 重放同一条 UPDATE：已清空的行不再等于旧默认，命中 0 行。
+        import json as _json
+
+        async def _replay() -> int:
+            engine = create_async_engine(url)
+            try:
+                async with engine.begin() as connection:
+                    result = await connection.execute(
+                        text(
+                            """
+                            UPDATE personas
+                            SET system_prompt = '',
+                                traits = CAST('{}' AS json),
+                                boundaries = CAST('[]' AS json)
+                            WHERE system_prompt = :prompt
+                              AND traits::jsonb = CAST(:traits AS jsonb)
+                              AND boundaries::jsonb = CAST(:boundaries AS jsonb)
+                            """
+                        ),
+                        {
+                            "prompt": _OLD_PROMPT_5818D2F,
+                            "traits": _json.dumps(_OLD_TRAITS_5818D2F, ensure_ascii=False),
+                            "boundaries": _json.dumps(
+                                _OLD_BOUNDARIES_5818D2F, ensure_ascii=False
+                            ),
+                        },
+                    )
+                    return result.rowcount or 0
+            finally:
+                await engine.dispose()
+
+        assert asyncio.run(_replay()) == 0, "重放不应再命中任何行"
+        assert _read_persona(url, "persona_ling") == first
+
+
+def test_0064_downgrade_does_not_restore_data() -> None:
+    """降级**不还原数据**：不报错、不写入，只记 warning。
+
+    为什么不是 raise：仓库里没有任何其他迁移在 downgrade 里 raise，且
+    `alembic downgrade` 必须能沿链回退（`test_recent_two_migrations_*`、
+    `test_0052_*`、`test_0053_*` 都依赖这点）。
+    """
+    with _fresh_db_at(_REV_0064) as url:
+        import importlib.util as _ilu
+
+        module_path = VERSIONS_DIR / "0064_persona_clear_defaults.py"
+        spec = _ilu.spec_from_file_location("_m0064_down", module_path)
+        assert spec is not None and spec.loader is not None
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # 造两条行：一条"被清空过的"（revision=1 三列为空），一条用户自己的。
+        _insert_persona(
+            url, persona_id="cleared_row", system_prompt="", traits={}, boundaries=[]
+        )
+        _insert_persona(
+            url,
+            persona_id="user_row",
+            system_prompt="我自己写的人设",
+            traits={"tone": "自定义"},
+            boundaries=["自定义边界"],
+        )
+        before = (
+            _read_persona(url, "cleared_row"),
+            _read_persona(url, "user_row"),
+        )
+
+        # no-op：不应抛异常，也不应改任何数据
+        module.downgrade()
+
+        after = (
+            _read_persona(url, "cleared_row"),
+            _read_persona(url, "user_row"),
+        )
+        assert after == before, "downgrade 不得写入任何数据（尤其不能把空值填回旧默认）"
+        assert _current_version(url) == _REV_0064
+
+
+def test_0064_alembic_downgrade_chain_still_works() -> None:
+    """0064 的 no-op downgrade 必须让 ``alembic downgrade`` 真的能沿链回退。
+
+    这是"为什么不是 raise"的直接证据：如果 0064 在 downgrade 里 raise，
+    整条链的回退路径就断了。
+    """
+    with _fresh_db_at(_REV_0063) as url:
+        _insert_persona(
+            url,
+            persona_id="persona_ling",
+            system_prompt=_OLD_PROMPT_5818D2F,
+            traits=_OLD_TRAITS_5818D2F,
+            boundaries=_OLD_BOUNDARIES_5818D2F,
+        )
+        _run_alembic("upgrade", url, _REV_0064)
+        cleared = _read_persona(url, "persona_ling")
+        assert cleared[0] == "", "升级后应已清空"
+
+        # 真跑 alembic 回退到 0063：不应报错
+        _run_alembic("downgrade", url, _REV_0063)
+        assert _current_version(url) == _REV_0063
+        # 数据保持清空（不还原）
+        assert _read_persona(url, "persona_ling") == cleared
+
+        # 再升回来仍然幂等（已空的行不匹配旧默认）
+        _run_alembic("upgrade", url, _REV_0064)
+        assert _current_version(url) == _REV_0064
+        assert _read_persona(url, "persona_ling") == cleared
+
+
+def test_0064_raises_when_personas_table_missing() -> None:
+    """缺表不静默早退：静默返回会让 alembic 标记本版本已执行，旧文案永久保留。
+
+    这里不跑整条 alembic 链（0001 之后的迁移会因缺表先失败，测不到 0064），
+    而是建一个**空库**，直接执行 0064 的 ``upgrade()``。
+    """
+    database = f"ling_mig_0064b_{uuid.uuid4().hex[:10]}"
+    asyncio.run(_execute(TEST_DB_URL, f'CREATE DATABASE "{database}"'))
+    url = _database_url(TEST_DB_URL, database)
+    try:
+        tables = asyncio.run(
+            _fetch(
+                url,
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'",
+            )
+        )
+        assert tables == [], f"新建库应为空，实际 {tables}"
+
+        # 在 async 引擎上用 run_sync 拿到同步连接，再跑真实的 upgrade()。
+        # 只注入一个实现 get_bind() 的 op 桩，其余走真实代码路径。
+        import importlib.util as _ilu
+
+        module_path = VERSIONS_DIR / "0064_persona_clear_defaults.py"
+        spec = _ilu.spec_from_file_location("_m0064_nomissing", module_path)
+        assert spec is not None and spec.loader is not None
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def _run_on_sync_connection(sync_conn):  # type: ignore[no-untyped-def]
+            class _Op:
+                @staticmethod
+                def get_bind():  # type: ignore[no-untyped-def]
+                    return sync_conn
+
+            original = module.op
+            module.op = _Op  # type: ignore[assignment]
+            try:
+                module.upgrade()
+            finally:
+                module.op = original  # type: ignore[assignment]
+
+        async def _call_upgrade() -> None:
+            engine = create_async_engine(url)
+            try:
+                async with engine.connect() as connection:
+                    await connection.run_sync(_run_on_sync_connection)
+            finally:
+                await engine.dispose()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            asyncio.run(_call_upgrade())
+        message = str(excinfo.value)
+        assert "personas" in message
+        assert "不存在" in message
+    finally:
+        try:
+            asyncio.run(
+                _execute(TEST_DB_URL, f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"临时数据库 {database} 清理失败: {exc}", stacklevel=1)
