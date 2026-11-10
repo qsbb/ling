@@ -2466,7 +2466,7 @@ async def _reserve_call(
     now: datetime,
     lease_owner: str,
     kind: str = OUTLINE_KIND,
-    max_calls: int = OUTLINE_MAX_CALLS,
+    max_calls: int | None = OUTLINE_MAX_CALLS,
     daily_token_budget: int = OUTLINE_DAILY_TOKEN_BUDGET,
     reserved_input_tokens: int = OUTLINE_RESERVED_INPUT_TOKENS,
     reserved_output_tokens: int = OUTLINE_RESERVED_OUTPUT_TOKENS,
@@ -2488,7 +2488,9 @@ async def _reserve_call(
     calls, budget = await _day_call_totals(
         session, actor_id=actor_id, plan_day=plan_day, kind=kind
     )
-    if calls >= max_calls:
+    # ``max_calls=None`` = 不按次数限制（只守 token 额度）。媒体域明确要求
+    # 去掉次数上限；日程仍传具体数字，行为不变。
+    if max_calls is not None and calls >= max_calls:
         return None
     reserved = reserved_input_tokens + reserved_output_tokens
     if budget + reserved > daily_token_budget:

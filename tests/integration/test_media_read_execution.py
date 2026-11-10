@@ -793,8 +793,26 @@ async def test_job_completion_creates_no_conversation_side_effects(logged_in: Te
     assert after["turns"] == before["turns"], "后台作业新增了轮次"
     assert after["operations"] == before["operations"], "后台作业新增了投递 operation"
     assert after["deliveries"] == before["deliveries"]
-    # 第 4 步才接预算账本；本轮**不写** behavior_model_calls（所以也不该新增）
-    assert after["model_calls"] == before["model_calls"]
+    # 预算账本（设计第 4 步，2026-11-10 已接）：模型调用前**必须**预留一次，
+    # 所以这里从"不新增"改成"恰好新增 1 条、且是 video_watch 的预留"。
+    #
+    # 这比原来的断言更强：它同时钉住"确实预留了"（否则多副本会重复烧钱）
+    # 与"只预留一次"（多预留同样是错）。
+    assert after["model_calls"] == before["model_calls"] + 1, (
+        "后台作业应当恰好预留一次视频预算"
+    )
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(BehaviorModelCallRow)
+                .where(BehaviorModelCallRow.kind == "video_watch")
+                .order_by(BehaviorModelCallRow.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    assert row is not None, "预算预留没有落库"
+    # 成功的作业必须结清成 committed：留着 reserved 会让额度永远被占着
+    assert row.state == "committed", f"预留没有结清：{row.state}"
 
 
 @pytest.mark.parametrize("state", ["pending", "running", "failed", "timeout", "unknown"])
@@ -1288,3 +1306,125 @@ async def test_graceful_shutdown_mid_model_records_unknown_and_reraises(logged_i
     assert row.error_code == "worker_shutdown"
     assert row.model_started_at is not None
     assert row.result_ref is None
+
+
+# ================================================================ 预算闸位置（P0 回归钉）
+
+
+async def test_budget_denied_settles_without_raising(logged_in: TestEnv) -> None:  # noqa: F811
+    """额度用尽时必须**落 `budget_denied` 并正常返回**，不能抛、不能白烧模型。
+
+    ## 这条用例为什么必须存在
+
+    这条路径原来整条都是坏的，而且没有任何测试覆盖到它——全仓搜
+    `budget_denied` 当时只有状态机单测。真实的失败是：
+
+    预算闸写在 `claim_read_job`（`pending -> running`）**之后**，而
+    `commit_read_outcome` 第一行就是 `transition(running, outcome.state)`；
+    `ALLOWED_TRANSITIONS[running]` 里**故意没有** `budget_denied`（裁决：没额度
+    就永远不该进 running）。于是只要额度真的用尽：
+
+    1. `InvalidJobTransition` 被抛出——它不是 `ReadJobError`，worker 抓不到；
+    2. 一路抛给 outbox → 退避重试 5 次（每次同一结果）→ `dead`；
+    3. 对账把它落成 `failed/outbox_dead`。
+
+    用户看到的是「失败」，而 `chat.py` 里那句「这次额度不够，没有读」永远
+    不会出现，还白烧 5 次重试。
+
+    现在闸前移到认领之前，走 `pending -> budget_denied`（合法边）。
+    """
+    from ling.config import get_settings
+    from ling.domains.media.budget import (
+        VIDEO_DAILY_TOKEN_BUDGET,
+        VIDEO_RESERVED_INPUT_TOKENS,
+        VIDEO_RESERVED_OUTPUT_TOKENS,
+        reserve_video_call,
+    )
+
+    window_id, evidence_id, store = await _session_and_evidence(logged_in)
+    call_id = await _make_job(window_id, evidence_id)
+
+    # 把今天的额度先占满（用别的 key 预留，不结清）。
+    actor_id = str(get_settings().actor_id)
+    per_call = VIDEO_RESERVED_INPUT_TOKENS + VIDEO_RESERVED_OUTPUT_TOKENS
+    for i in range(VIDEO_DAILY_TOKEN_BUDGET // per_call + 1):
+        async with session_scope() as session:
+            await reserve_video_call(
+                session,
+                actor_id=actor_id,
+                idempotency_key=f"video:filler_{call_id}_{i}",
+            )
+
+    describer = _CountingDescriber()
+    outcome = await _run(call_id, describer=describer, store=store)
+
+    # 1) 不抛（能返回本身就是断言：抛了这行就到不了）
+    # 2) 终态是 budget_denied，不是 failed
+    assert outcome.state is JobState.budget_denied, (
+        f"额度用尽应当落 budget_denied，实际 {outcome.state}"
+    )
+    # 3) 一行都没花
+    assert describer.calls == 0, "额度不足仍然调了模型"
+
+    # 4) 库里确实是 budget_denied，且作业**从未进入 running**
+    row = await _job(call_id)
+    assert row is not None
+    assert row.state == JobState.budget_denied.value
+    assert row.started_at is None, "预算闸在认领之前，不该有开始时间"
+
+    # 5) 这次被拒的作业**没有**留下第二份预留（那份额度被 filler 占满了，
+    #    闸没放行就不该有 call_id）
+    async with session_scope() as session:
+        ours = (
+            await session.execute(
+                select(BehaviorModelCallRow).where(
+                    BehaviorModelCallRow.idempotency_key == f"video:{call_id}"
+                )
+            )
+        ).all()
+    assert ours == [], "闸没放行却留下了预留行"
+
+
+async def test_missing_describer_leaks_no_reservation(logged_in: TestEnv) -> None:  # noqa: F811
+    """`describer is None`（模型路由未就绪）**每次都不许留下 reserved 行**。
+
+    这条检查原来在预算预留之后，于是「路由还没就绪」这段**正常**时间里，
+    每次重排都漏一条 `reserved`：`_day_call_totals` 把 reserved 计入当日额度，
+    而 `_reserve_call` 不看租约是否过期，所以这些行**当天永久占额**。
+    路由没就绪几个小时就足以把 120k 额度吃光，之后所有视频读取一起被拒。
+
+    连跑 3 次（模拟 outbox 重排），断言预留行数为 0。
+    """
+    from ling.config import get_settings
+
+    actor_id = str(get_settings().actor_id)
+    window_id, evidence_id, store = await _session_and_evidence(logged_in)
+    call_id = await _make_job(window_id, evidence_id)
+
+    for _ in range(3):
+        # 注意：直接用 `run_read_job`，**不走** `_run` —— `_run` 把
+        # `describer=None` 换成了 `_CountingDescriber()`，那正好绕开了本用例。
+        with pytest.raises(ReadJobError):
+            await run_read_job(
+                call_id=call_id,
+                lease_owner="media-worker-1",
+                describer=None,
+                service_factory=_factory(store),
+            )
+
+    async with session_scope() as session:
+        leaked = (
+            await session.execute(
+                select(BehaviorModelCallRow).where(
+                    BehaviorModelCallRow.actor_id == actor_id,
+                    BehaviorModelCallRow.kind == "video_watch",
+                    BehaviorModelCallRow.idempotency_key == f"video:{call_id}",
+                )
+            )
+        ).all()
+    assert leaked == [], f"没有描述器却留下 {len(leaked)} 条预留（当天永久占额）"
+
+    # 作业仍是 pending（取件类错误允许重排），没有被改成终态
+    row = await _job(call_id)
+    assert row is not None
+    assert row.state == JobState.pending.value

@@ -27,7 +27,7 @@
 | R13 人设 10 万 token | **配置上限已提高**：`context.py:123-132` 给 persona 100000；traits 上限 `persona/service.py:157-176`。 | 这里按 2 字符/token **估算** `context.py:1209`；不等于供应商必能接受 10 万输入，需按目标模型上下文验收。 |
 | R14 视频模型/额度 | **同步观看路径接通**：`watch.py:373-395` 明确视频职责；次数常量已删 `video.py:60-74`；token 闸 `watch.py:124-185,256-265`；`turn.py:1044-1073,1474-1483` 传失败事实。 | 后台视频读取第 4 步持久预算尚缺，不能把同步 token 余额闸当成全部视频成本保障；见 R24。 |
 | R15 全局媒体槽 | **已实现**（2026-11-10）：`media_slots` 单行表 + 迁移 0061 + `domains/media/slot.py`（`FOR UPDATE NOWAIT` 抢占、240 秒租约、代次栅栏、fail-closed）；已接入 `VideoWatchService.watch()` 的耗时区间，生产装配 `enforce_slot=True` 有测试钉住。真 PG 20 并发抢占**恰好 1 个成功**。 | `bilibili_feed`/`livestream` 只留了 kind 常量，尚未接入执行器（设计如此：它们将来争同一行）。 |
-| R16 可等待、自由决定回复时机 | **未实现**：`docs/MEDIA-WILLINGNESS-DESIGN.md:1-13` 明说是方案；当前 `turn.py:1044-1073` 在本轮同步等观看，缺用户可见“稍后回复”状态机。 | 需求复杂且与 R15 方案“忙即拒绝、不排槽队列”存在产品语义冲突，先裁决再实现。 |
+| R16 可等待、自由决定回复时机 | **已裁决，实施中**（2026-11-10）：用户原话「做，但是只在她主动选择时才延后，且延后多久让她自由发挥，上限 5 分钟」。设计文档 §4 原有的「0/15/45/90 档位 + 120 秒上限」**已被推翻**，改为「时长由她自己给 + 300 秒硬上限」。与 R15 的冲突已裁定：槽位等待（`cause=resource`）**不是**她的意愿延后（`cause=volition`），两者分开记日志、互不冒充。 | 实现由独立子智能体在 `domains/deferred/` + 新迁移 0063 上做，本表在其交回证据后再更新为「已实现」。 |
 | R17 她有权不看 | **机制部分成立**：`context.py:807-860` 明示“想看才写标记，没写当没看见”；`turn.py:1044-1049` 仅见标记才读。 | 这只证明模型可选择不写；未有真实模型对话样本证明她会按人设拒绝，而非总被诱导看。 |
 | R18 忙态展示 | **已实现**（2026-11-10）：新增 `GET /v1/dashboard` 的 `media` 段（`dashboard.py::media()`），从全局槽位读 `current_holder()` 投影**真实**媒体活动；前端新增「正在忙什么」卡片。三个关键取舍：**不塞进「正在看手机」**——看视频≠看手机，合并会把具体事实说糊；只报 `active`（`held` 是还在准备）；**别人的会话只给 `kind`/`started_at`，不给 `activity_id`/`window_id`**（受众边界）。真浏览器 1440/375 各一条，无横向溢出。 | `phone` 那套 `start_watching/stop_watching` 仍是生产零调用——它管的是手机这一层，与媒体活动是两件事，不强行接线。 |
 | R19 视频留存后总结入记忆 | **已实现**（2026-11-10）：新增 `domains/media/sediment.py`，在每日 `memory.archive` 里把**将要过期/已过期**且"她真的看过"的媒体描述沉降成记忆（走 `MemoryService.propose`，带来源、幂等）。五个筛选条件：真看过（排除 `model_inference`）、有真实 `source_event_id`、有归属主体、已过期、未沉降过。 | 不做"立刻再总结一次"（伪需求：观看结果本来就会复用描述）。模型生成的浓缩摘要未做——那要独立"非事实"存储。 |
@@ -35,7 +35,7 @@
 | R21 后台真删 | **未交付，正在开发**：现有 HTTP 仍调用软清除 `manage.py:272-283`，`forget_subject` 保留原文 `memory/service.py:1431-1486`。 | 新 `purge.py:145-220,223-362` 和迁移 0060、worker handler 已出现，但路由仍未调用 `request_purge`；未验证代次与历史事件脱敏。 |
 | R22 开源记忆设计调研 | **文档产出存在**：`docs/MEMORY-OSS-RESEARCH.md:1-20` 覆盖拟人化写入、召回、睡眠、遗忘（本次工作树未跟踪）。 | 调研产物不是记忆行为改善；随提交确认来源与可追溯性。 |
 | R23 注入正确性 | **边界已复现，不是"随机乱注入"**：候选 500 先截 `memory/service.py:559-574`；相对下限 + 保底 `kept or scored[:1]` 见 `:825-835`。实测（`_bm25_scores` 直接调用）：字面零命中的记忆**不会**进候选池（无 embedder 时只留 BM25>0）；但**弱相关的一定会**——只要它是唯一候选，`kept or scored[:1]` 就保底注入，不看绝对分。 | "无关记忆被注入"不是 bug 而是**相对阈值的固有天花板**：需要绝对分下限才能挡弱相关，而那会把"同义改写"也误杀。若要做，应先补 embedder 再谈阈值；当前无 embedder 的部署下这是已知取舍。 |
-| R24 异步工具 | **仅 C 的执行侧部分接通**：入口 `chat.py:530-565`，媒体 handler/独立循环 `worker.py:1062-1102,4687-4696`，dead 作业收尾 `:4550-4565`。 | `jobs.py:599-655` 无预算预留，`chat.py:536-540` 明言延至第 4 步；不能宣称“成本闸门已完成”。 |
+| R24 异步工具 | **预算闸已接通并修掉两个真 bug**（2026-11-10）：新增 `domains/media/budget.py`，在 `run_read_job` 调模型前做**持久**预留（复用 `behavior_model_calls`，`kind=video_watch`），五条退出路径（认领失败/租约丢失/取消/异常/成功）都结清，失败与 unknown 占额不退款。**次数限制彻底去掉**（`VIDEO_MAX_CALLS_PER_DAY is None`，`reserve_behavior_call` 支持 `max_calls=None`），只守 token 额度。独立 QA 复验抓出两处真回归并已修：(a) 预算闸原在 `claim_read_job` 之后，额度用尽时 `transition(running,budget_denied)` 必抛 `InvalidJobTransition` → outbox 重试 5 次 → 用户看到 `failed` 而非 `budget_denied`；闸已前移到认领之前走 `pending→budget_denied` 合法边；(b) `describer is None`（模型路由未就绪，正常路径）在 `_settle_budget` 定义之前早退，每次重排漏一条永久占额的 `reserved`，已把检查前移。证据：`tests/integration/test_media_read_execution.py::test_budget_denied_settles_without_raising`、`::test_missing_describer_leaks_no_reservation`，两者均已变异测试确认会红。 | 真实用量 `actual_tokens` 仍记 `None`（缺 usage 不虚填 0），要拿到 provider usage 才能填实数。 |
 
 ## B. 对抗性审查：需求、真实 bug 与误报
 
@@ -238,7 +238,7 @@
 | **R19 视频摘要长期沉淀** | **已补完**（见上表）：`sediment.py` 在每日归档里把将过期的"真看过"证据沉降成记忆，五个筛选条件、幂等、带来源 | 模型浓缩摘要（须独立"非事实"存储） |
 | **R20 睡眠期记忆压缩** | **已补完**（见上表）：`life.schedule` 按预计入睡 +30 分钟投 `memory.consolidate`，一晚一次、按人、零模型；`memory_consolidations` 留痕 | 模型摘要（须独立"非事实"存储） |
 | **R17 她有权不看** | **机制成立、未验证**。上下文已给她"想看才写标记"的选择 | 真实模型对话样本，证明她确实会拒绝而不是总被诱导 |
-| **R24 异步工具预算** | 执行侧已通，`jobs.py` 无预算预留 | 第 4 步：`behavior_model_calls` + `kind=video_watch` 的持久预留 |
+| **R24 异步工具预算** | **已补完并修掉 QA 发现的两个真回归**（见上表）：预算闸前移到认领之前（`pending→budget_denied` 合法边）、`describer is None` 检查前移消除 `reserved` 泄漏、五条退出路径全结清、次数限制彻底去掉 | `actual_tokens` 待接 provider usage |
 
 ### 本轮新发现、未修的后端小问题（如实记录）
 

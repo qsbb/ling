@@ -49,6 +49,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.media.budget import ReservationResult
 from ling.infra.models import MediaReadJob
 
 __all__ = [
@@ -630,6 +631,52 @@ async def run_read_job(
 
     moment = now or _utcnow()
 
+    # 描述器必须在**花钱和改状态之前**就确认存在。
+    #
+    # 这条检查原来在预算预留之后（第 3 步），于是 `describer is None` 这条
+    # 正常路径（worker 的模型路由还没就绪，`_build_video_describer` 返回 None）
+    # 每重排一次就漏一条 `reserved` 预留行：`_day_call_totals` 把 reserved
+    # 计入当日额度，而 `_reserve_call` 不看租约是否过期，于是这些行**当天
+    # 永久占额**。路由没就绪的那几个小时足以把 120k 额度吃光，之后所有视频
+    # 读取一起变成 budget_denied。检查挪到最前面，泄漏的源头就没有了。
+    if describer is None:
+        raise ReadJobError("没有可用的描述器（worker 未注入 MediaDescriber）")
+
+    # ---------------------------------------------------------- 0. 预算闸
+    #
+    # 模型调用前先**持久**预留额度（设计 §0 第 4 步）。为什么必须落库：
+    # 后台视频作业在 worker 里跑，而 worker 可以多副本。进程内计数器让
+    # 每个副本各算一份"今天还能看几个"——N 个副本烧 N 倍的钱，且看不出来。
+    #
+    # 用户明确要求「次数限制去掉」，所以这里**只有 token 额度**，没有次数上限。
+    #
+    # ## 为什么闸必须在认领之前
+    #
+    # 状态机的裁决是「没额度就永远不该进 `running`」，所以
+    # `ALLOWED_TRANSITIONS` 里**故意没有** `running -> budget_denied` 这条边，
+    # 只有 `pending -> budget_denied`。而认领会把行改成 running，于是
+    # "认领之后才发现没额度"这条路根本没有地方落终态。
+    #
+    # 曾经写成"先认领、再判预算、拿不到就落 budget_denied"，结果只要额度
+    # 真的用尽，`commit_read_outcome` 的第一行 `transition(running,
+    # budget_denied)` 就必抛 `InvalidJobTransition`。那不是 `ReadJobError`，
+    # worker 抓不到，一路抛到 outbox → 退避重试 5 次（每次同一结果）→ dead →
+    # 被对账落成 `failed/outbox_dead`。用户永远看不到 `budget_denied`，
+    # `chat.py` 里那句「这次额度不够，没有读」也永远不会出现，还白烧 5 次重试。
+    #
+    # 所以闸放在认领之前：在 `pending` 上判，`pending -> budget_denied` 是合法边。
+    reservation = await _reserve_budget(call_id=call_id, lease_owner=lease_owner)
+    if not reservation.ok:
+        # 拿不到预留：落 `budget_denied` 终态并正常确认事件——**不重排**。
+        # 预算不会因为重试而变多，重试只会让同一天的额度被反复探测。
+        denied = ReadOutcome(state=JobState.budget_denied, error_code="budget_denied")
+        if not await _deny_before_claim(call_id=call_id, outcome=denied):
+            # 认领前状态已经变了（别人抢先/已被取消）：如实读现状返回。
+            async with session_scope() as session:
+                return await _already_settled_outcome(session, call_id)
+        return denied
+    budget_call_id = reservation.call_id
+
     # ---------------------------------------------------------- 1. 认领
     async with session_scope() as session:
         claimed = await claim_read_job(
@@ -638,6 +685,10 @@ async def run_read_job(
         if not claimed:
             # 抢不到：作业已经是终态、或者被别的 worker 拿走了。两种都不是
             # 错误——outbox 至少一次投递，重复事件是常态。
+            #
+            # 但预算**已经预留了**，必须结清：认领失败说明这次根本不该执行，
+            # `reserved` 留在当天账上就是永久占额（`_reserve_call` 不看租约）。
+            await _settle_budget(call_id=call_id, budget_call_id=budget_call_id, ran=False)
             return await _already_settled_outcome(session, call_id)
         generation = await _lease_generation_of(session, call_id)
         located = await _job_window(session, call_id)
@@ -683,11 +734,11 @@ async def run_read_job(
     if not await mark_model_started(
         call_id, lease_owner=lease_owner, lease_generation=generation
     ):
+        # 租约已被抢走，这次不执行了。预留**必须**结清——否则那条 `reserved`
+        # 会留在当天账上永久占额（`_reserve_call` 不看租约是否过期）。
+        await _settle_budget(call_id=call_id, budget_call_id=budget_call_id, ran=False)
         async with session_scope() as session:
             return await _already_settled_outcome(session, call_id)
-
-    if describer is None:
-        raise ReadJobError("没有可用的描述器（worker 未注入 MediaDescriber）")
 
     # ---------------------------------------------------------- 4. 调模型 + 写证据
     #
@@ -713,10 +764,14 @@ async def run_read_job(
             generation=generation,
             outcome=ReadOutcome(state=JobState.unknown, error_code="worker_shutdown"),
         )
+        # 关停时模型可能已经调用过 → 占额，不退款。
+        await _settle_budget(call_id=call_id, budget_call_id=budget_call_id, ran=False)
         raise
     except BaseException as exc:  # noqa: BLE001 - 模型之后的一切都必须落终态
         outcome = classify_describe_error(exc)
         await _settle(call_id=call_id, generation=generation, outcome=outcome)
+        # 失败也占额：无法证明模型没被调用过。
+        await _settle_budget(call_id=call_id, budget_call_id=budget_call_id, ran=False)
         return outcome
 
     # ---------------------------------------------------------- 5. 提交结果前再查取消
@@ -740,7 +795,109 @@ async def run_read_job(
             observed=(getattr(read, "text", "") or "")[:200],
         )
     await _settle(call_id=call_id, generation=generation, outcome=outcome)
+    # 走到了这里说明模型真的产出过内容（无论结果最终是被采用还是被丢弃）。
+    await _settle_budget(call_id=call_id, budget_call_id=budget_call_id, ran=True)
     return outcome
+
+
+async def _reserve_budget(*, call_id: str, lease_owner: str) -> ReservationResult:
+    """在**认领之前**为这次后台读取预留预算。
+
+    独立成函数是因为它必须早于认领调用，而认领在 `run_read_job` 的开头；
+    内联会让"先花钱还是先改状态"这个顺序在读代码时看不出来。
+    """
+    from ling.config import get_settings
+    from ling.domains.media.budget import reserve_video_call
+    from ling.infra.db import session_scope
+
+    async with session_scope() as budget_session:
+        return await reserve_video_call(
+            budget_session,
+            # actor 是**全局唯一**的角色身份（不随请求变），从设置取即可；
+            # `run_read_job` 的入参里没有它，加一个只为传它会把调用点全改一遍。
+            actor_id=str(get_settings().actor_id),
+            idempotency_key=f"video:{call_id}",
+            lease_owner=lease_owner,
+        )
+
+
+async def _deny_before_claim(*, call_id: str, outcome: ReadOutcome) -> bool:
+    """在 `pending` 上直接落 `budget_denied`（**不经过** `commit_read_outcome`）。
+
+    为什么不能用 `commit_read_outcome`：那个函数把 `WHERE ... AND
+    state='running'` 和 `transition(running, ...)` 都写死了——那是"执行完
+    才提交"的栅栏。预算拒绝发生在**认领之前**，行还是 `pending`，走那条路
+    只会抛 `InvalidJobTransition`（这正是之前的 P0）。
+
+    这里用条件更新把闸做在同一处：`WHERE state='pending'`，并清掉租约字段
+    （此时本来也没有租约，但保持与其它终态一致）。返回 False 表示行已经不是
+    `pending` 了——别人抢先执行、或已被取消/清理，此时**不改任何行**，
+    让调用方读现状返回。
+    """
+    from ling.infra.db import session_scope
+    from ling.infra.models import MediaReadJob
+    from ling.infra.models import utcnow as _utcnow
+
+    transition(JobState.pending, outcome.state)
+    moment = _utcnow()
+    async with session_scope() as session:
+        result = await session.execute(
+            update(MediaReadJob)
+            .where(
+                MediaReadJob.call_id == call_id,
+                MediaReadJob.state == JobState.pending.value,
+            )
+            .values(
+                state=outcome.state.value,
+                error_code=outcome.error_code,
+                result_ref=None,
+                completed_at=moment,
+                lease_owner=None,
+                lease_until=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        denied = int(getattr(result, "rowcount", 0) or 0) == 1
+    if denied:
+        emit_job_log(
+            "media_read_budget_denied",
+            "额度不足，这次没有读（作业未开工即终结）",
+            call_id=call_id,
+        )
+    return denied
+
+
+async def _settle_budget(*, call_id: str, budget_call_id: str | None, ran: bool) -> None:
+    """结清这次预留。**失败与 unknown 都占额**。
+
+    `ran` 只表示"模型真的产出过内容"，不表示成功：被取消、结果被丢弃
+    都属于"模型已经调用过"，一样花钱。缺 usage 时 `actual_tokens=None`
+    而不虚填 0（设计：缺 usage 保留预留）。
+
+    模块级而不是 `run_read_job` 内嵌：所有早退路径（认领失败、
+    `mark_model_started` 失败、取消、异常、成功）都必须走到这里，内嵌时
+    定义在预算闸之后，前面两条早退就够不着它——那正是 `reserved` 泄漏的成因。
+    """
+    if not budget_call_id:
+        return
+    from ling.domains.media.budget import finish_video_call
+    from ling.infra.db import session_scope
+
+    try:
+        async with session_scope() as budget_session:
+            await finish_video_call(
+                budget_session,
+                call_id=budget_call_id,
+                state="committed" if ran else "failed",
+                actual_tokens=None,
+            )
+    except Exception as exc:  # noqa: BLE001 - 结账失败不能吞掉业务结果
+        emit_job_log(
+            "media_budget_settle_failed",
+            "后台视频预算结清失败",
+            call_id=call_id,
+            error=type(exc).__name__,
+        )
 
 
 async def _settle(*, call_id: str, generation: int, outcome: ReadOutcome) -> bool:

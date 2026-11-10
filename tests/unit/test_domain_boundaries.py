@@ -102,6 +102,16 @@ ALLOWED: dict[tuple[str, str], str] = {
         "mark_missed，不碰 conversation 的表和模型——消息状态的唯一写入方"
         "仍是 conversation 域。"
     ),
+    ("media/budget.py", "ling.domains.agenda.service"): (
+        "后台视频作业在 worker 里跑，而 worker 可多副本——进程内计数器会让每个"
+        "副本各算一份预算，N 个副本烧 N 倍的钱。所以必须用共享的 "
+        "behavior_model_calls 账本，而它的并发语义（唯一约束/attempt/失败不退款）"
+        "由 agenda 维护：media 只调 AgendaService.reserve_model_call / "
+        "finish_model_call 这两个公开入口，不 import agenda.timeline（内部实现"
+        "模块）、不碰那张表、不拼 SQL。"
+        "（最初版本直接 import 了 agenda.timeline，被本闸门拦下后改成经"
+        "service 转一手——这条注释记录的就是那次修正。）"
+    ),
     ("media/sediment.py", "ling.domains.memory.service"): (
         "媒体沉降要把「她真的看过、但描述即将过期」的证据写成长期记忆"
         "（用户原话：看过的视频过期后经筛选走记忆入库流程）。写记忆的唯一"

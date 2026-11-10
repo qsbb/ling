@@ -150,6 +150,75 @@ class AgendaService:
         self._actor_id = actor_id
         self._policy = policy or LifePolicy()
 
+    # ------------------------------------------------------ 行为模型预算账本
+
+    async def reserve_model_call(
+        self,
+        *,
+        kind: str,
+        plan_day: date,
+        idempotency_key: str,
+        now: datetime,
+        lease_owner: str,
+        max_calls: int | None,
+        daily_token_budget: int,
+        reserved_input_tokens: int,
+        reserved_output_tokens: int,
+        lease_seconds: float,
+        window_id: str = "",
+    ) -> str | None:
+        """在共享的 `behavior_model_calls` 账本里预留一次模型调用。
+
+        **为什么由 agenda 转一手**：那张表与"调用前预留 + 租约"的并发语义是
+        本域引入并维护的（唯一约束、attempt、不退款）。别的域（如媒体）要复用它
+        时，必须经本域的公开入口，而不是直接 import `agenda.timeline`——后者
+        是内部实现模块，跨域依赖它等于把内部细节变成对外契约（ADR-0001）。
+
+        返回 ``call_id``；拿不到（超预算/超次数/并发抢占失败）返回 ``None``。
+
+        ``max_calls=None`` 表示**不按次数限制**，只守 token 额度。媒体域要这个
+        是因为用户明确要求去掉次数限制；日程那边照旧传具体数字。
+        """
+        from ling.domains.agenda.timeline import reserve_behavior_call
+
+        reserved = await reserve_behavior_call(
+            self._session,
+            actor_id=self._actor_id,
+            plan_day=plan_day,
+            idempotency_key=idempotency_key,
+            now=now,
+            lease_owner=lease_owner,
+            kind=kind,
+            max_calls=max_calls,
+            daily_token_budget=daily_token_budget,
+            reserved_input_tokens=reserved_input_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            lease_seconds=lease_seconds,
+            window_id=window_id,
+        )
+        if reserved is None:
+            return None
+        return str(getattr(reserved, "call_id", "") or "") or None
+
+    async def finish_model_call(
+        self,
+        *,
+        call_id: str,
+        state: str,
+        actual_tokens: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """结清一次预留（`committed` / `failed`）。失败同样占额，不退款。"""
+        from ling.domains.agenda.timeline import finish_behavior_call
+
+        await finish_behavior_call(
+            self._session,
+            call_id=call_id,
+            state=state,
+            actual_tokens=actual_tokens,
+            error_code=error_code,
+        )
+
     # ---------------------------------------------------------- 作息
 
     async def routine(self) -> RoutineView:
