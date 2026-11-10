@@ -139,12 +139,12 @@ active(N) --PUT/校验--> pending(N+1) --> activating(N+1)
 - 操作查询只返回无敏感值的状态；operation 属于 owner 会话可见范围，历史记录按保留期清理，但 active 修订和回退所需密文不能随便删。
 - `POST /v1/settings/connectors/reset` 以同样门禁和候选修订机制清空三个 scope 的全部覆盖；操作需能显示预计会回退到哪些 env/default 来源，密钥仍不回显。
 - 全局 reset 使用一个 operation 跟踪三个 scope：全部通过才清空全部 active head；任一 scope 重建失败则三个 scope 都保留原 active，避免“部分恢复默认”却报成功。
-- 权限照更新通道：owner（`src/ling/api/routes/version.py:778-783`）+ 严格同源（`:652-686`）+ 登录不超过 15 分钟（`:2034-2050`）；Bearer/API 自动化若无浏览器 Origin，需明确独立策略，默认 fail-closed。
-- 错误：401 未登录；403 `not_owner|bad_origin|recent_login_required`；409 `generation_conflict|activation_in_progress`；422 `invalid_field|invalid_config`；503 `activation_unavailable`；异步启动失败落 operation 的 `rolled_back`，不伪装为 PUT 422。
+- 权限照更新通道：owner（`src/ling/api/routes/version.py:773`）+ 严格同源（`:647`）；Bearer/API 自动化若无浏览器 Origin，需明确独立策略，默认 fail-closed。
+- 错误：401 未登录；403 `not_owner|bad_origin`；409 `generation_conflict|activation_in_progress`；422 `invalid_field|invalid_config`；503 `activation_unavailable`；异步启动失败落 operation 的 `rolled_back`，不伪装为 PUT 422。
 - 每个错误包含稳定 `code`、中文 `message`、可选字段 `field` 与 `operation_id`；不把 Pydantic 原始输入值或上游异常字符串直接传给浏览器。
 - 每次通过校验的改动记一条审计 `connector_config_changed`：操作者 ID、scope、字段名、动作、旧/新 HMAC 指纹、候选修订和结果；重连成功/回退另记 `connector_activated|connector_rolled_back`，绝不写原文或 preview。
 - 并发由 DB 锁 + generation CAS 控制；同代际两次保存只有一个进入 activating，另一方 409 并拿新 generation；操作幂等键允许网络重试但不重复生成修订。
-- **§6 验收**：非 owner、异源、超过 15 分钟会话分别得到 403；并发 PUT 一成功一 409；审计只含字段名/指纹，抓包无完整密钥回显。
+- **§6 验收**：非 owner、异源分别得到 403；并发 PUT 一成功一 409；审计只含字段名/指纹，抓包无完整密钥回显。
 
 ## §7 前端交互
 
@@ -158,7 +158,7 @@ active(N) --PUT/校验--> pending(N+1) --> activating(N+1)
 - 非密钥显示有效值及来源徽标；“恢复默认”指删除 DB 覆盖、显示回退来源，不能误导为清空 env；“放弃”仅丢弃未提交草稿。
 - “恢复默认”分单字段与全局两个入口；全局入口先列出将回退的字段名与来源变化，再调用 reset API，确认行为而非密钥内容。
 - 保存按钮仅在有变更时可用；按字段提示校验错误；提交后状态依次“正在验证…→正在生效…→已生效”，失败显示“失败，已恢复上一配置”及可操作原因。
-- 对端口未发布提示“需在部署文件映射端口”；对 WS 未连提示“检查对端地址/令牌，连接仍在重试”；对最近登录失效引导重新登录，不展示 Python/socket 异常原文。
+- 对端口未发布提示“需在部署文件映射端口”；对 WS 未连提示“检查对端地址/令牌，连接仍在重试”；不展示 Python/socket 异常原文。
 - 页面显示 active generation、最后生效时间、各副本确认数；刷新或离开再回来仍能看到未完成操作；非 owner 只见诊断与不可编辑状态。
 - 无障碍标签不能把 preview 写进密码框的 `value`/`aria-label`；屏幕阅读器朗读“已设置，来源 DB，前缀 …”，不朗读遮罩以外内容。
 - **§7 验收**：每类字段控件类型与清单一致；短密钥/未设置视觉可区分；保存、放弃、恢复默认三条路径均有交互测试；失败提示不含异常栈或密钥。

@@ -815,24 +815,6 @@ def _require_connector_write_guards(request: Request, auth: object) -> None:
         )
 
 
-async def _connector_write_guard(
-    request: Request, auth: object, session: AsyncSession
-) -> None:
-    """再加一条"最近 15 分钟内重新登录过"（被窃取的旧会话改不了入站凭据）。"""
-    from ling.api.routes.version import _require_recent_login
-
-    _require_connector_write_guards(request, auth)
-    try:
-        await _require_recent_login(auth, session)  # type: ignore[arg-type]
-    except LingError as exc:
-        raise LingError(
-            ErrorCode.forbidden,
-            "修改接入器配置需要最近 15 分钟内重新登录过",
-            status_code=403,
-            detail="recent_login_required",
-        ) from exc
-
-
 def _connector_service(request: Request, auth: object, session: AsyncSession):  # noqa: ANN202
     from ling.settings.connector_service import ConnectorConfigService
 
@@ -870,7 +852,7 @@ async def put_connector_config(
         ConnectorServiceError,
     )
 
-    await _connector_write_guard(request, auth, session)
+    _require_connector_write_guards(request, auth)
     if not cf.is_known_scope(scope):
         raise LingError(ErrorCode.not_found, "没有这个接入器", status_code=404)
 
@@ -1030,7 +1012,7 @@ async def reset_connector_config(
         ConnectorServiceError,
     )
 
-    await _connector_write_guard(request, auth, session)
+    _require_connector_write_guards(request, auth)
     service = _connector_service(request, auth, session)
     results: list[dict[str, object]] = []
     failed = False

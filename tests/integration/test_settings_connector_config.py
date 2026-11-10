@@ -9,7 +9,7 @@
 4. 密钥预览：7 字符最多露 6 个 + 固定遮罩；全量 JSON / 审计搜不到完整值；
 5. 校验失败（任意 env 名、非法端口、URL 夹 token）→ 422 且 **stop() 零次**；
 6. 切换失败 → ``rolled_back``、旧配置与旧连接恢复、generation 不变；
-7. 门禁：非 owner / 跨站 Origin / 15 分钟前的会话 → 403；代际冲突 → 409；
+7. 门禁：非 owner / 跨站 Origin → 403（会话年龄不作门禁）；代际冲突 → 409；
 8. 白名单保留前导零。
 """
 
@@ -520,10 +520,10 @@ async def test_missing_origin_is_rejected(
     assert fake_runtime.applies == []
 
 
-async def test_stale_session_requires_recent_login(
+async def test_old_session_can_still_write(
     web_env: TestEnv, logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
 ) -> None:
-    """会话超过 15 分钟 → 403 recent_login_required（服务端按会话表判定）。"""
+    """登录 2 小时的老会话照样能改接入器：会话年龄不再是写入门禁。"""
     from datetime import UTC, datetime, timedelta
 
     from ling.infra.security import hash_token
@@ -536,15 +536,14 @@ async def test_stale_session_requires_recent_login(
                 select(AuthSession).where(AuthSession.token_hash == hash_token(token))
             )
         ).scalar_one()
-        session_row.created_at = datetime.now(UTC) - timedelta(minutes=16)
+        session_row.created_at = datetime.now(UTC) - timedelta(hours=2)
         await session.commit()
 
     response = await _put(
-        web_env, "onebot", {"set": {"LING_ONEBOT_ACCESS_TOKEN": "x"}}
+        web_env, "onebot", {"set": {"LING_ONEBOT_ACCESS_TOKEN": TOKEN_A}}
     )
-    assert response.status_code == 403, response.text
-    assert response.json()["error"]["detail"] == "recent_login_required"
-    assert fake_runtime.applies == []
+    assert response.status_code == 202, response.text
+    assert response.json()["state"] == "active"
 
 
 async def test_generation_conflict_is_409(

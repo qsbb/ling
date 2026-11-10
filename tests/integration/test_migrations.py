@@ -636,3 +636,5 @@ def test_0053_downgrade_one_then_upgrade(migrated_db: MigratedDatabase) -> None:
 
     assert _current_version(migrated_db.url) == migrated_db.head
     assert "payload" in _columns(migrated_db.url, "prompt_snapshots")
+
+
