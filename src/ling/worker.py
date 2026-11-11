@@ -49,7 +49,10 @@ from ling.kernel.visibility import (
 )
 
 if TYPE_CHECKING:
+    from ling.domains.media.assets import GeneratedMediaService
+    from ling.domains.speech.orchestration import SpeechOrchestrator
     from ling.ports.config import EffectiveConfig
+    from ling.ports.speech import ExpressionIntent, TtsVoice
 
 # 单条 outbox 事件的最多尝试次数。达到后转 "dead" 等人工重放，
 # 不静默丢弃（注意：五次失败不等于记忆应该永久缺席）。
@@ -2325,6 +2328,7 @@ async def _reply_in_group_window(  # noqa: ANN001
 
     from ling.capabilities.chunking import PART_DELAY_SECONDS, plan_parts
     from ling.capabilities.delivery import DeliveryService
+    from ling.capabilities.expression_choice import parse_speak_choice
     from ling.ports.channel import OutboundMessage
 
     caps = getattr(connector, "capabilities", None)
@@ -2333,7 +2337,38 @@ async def _reply_in_group_window(  # noqa: ANN001
         with contextlib.suppress(Exception):
             limit = int(caps().max_text_length) or None
     is_group = is_group_visibility(window.visibility)
-    parts = plan_parts(reply_text, is_group=True, max_part_chars=limit)
+    # ---- 语音出站：`[speak]` 决策的**唯一**消费点 -----------------------------
+    #
+    # 接线之前这条链上每一节都写好了，却**没有一节调用下一节**（REQ-10）：
+    # `parse_speak_choice` 零调用点、`SpeechOrchestrator.synthesize` 零生产调用点、
+    # `SpeechDelivery.deliver_speech` 零生产调用点。这里把四节接起来。
+    #
+    # ## 判断只做一次
+    #
+    # "发文字还是发语音"由 `deliver_speech` 裁决（它自己的注释写了这条纪律）。
+    # 本处只负责**把事实交给它**：意图来自 `parse_speak_choice`，合成结果来自
+    # 编排层。任何一处再判一遍 `speak`/"合成了吗"，迟早会与它分叉。
+    #
+    # ## 没写 `[speak]` 时连装配都不碰
+    #
+    # 不读 TTS 绑定、不建媒体服务、不碰合成幂等表——纯文字路径与接线前相同，
+    # 不会留下任何"语音降级"的痕迹。
+    #
+    # ## 必须在 `plan_parts` **之前**剥掉标签
+    #
+    # 分段规则里写着"各段按序拼接必须等于原文本"，所以带 `[speak]` 的原文切出来
+    # 的段也会带标签。先剥、再分段，否则：① 第一段之后的段会把 `[speak]` 念出来；
+    # ② 超长回复被切开时，标签留在中间某一段而不是开头。`SpeakChoice.text`
+    # 正是为此提供的字段——"调用方必须用这个，不能用原始文本"。
+    speak_choice = parse_speak_choice(reply_text)
+    speech = None
+    if speak_choice.speak:
+        speech = await _prepare_speech_reply(effective=effective, session=session)
+    # 只在她**真的选了语音**时才用剥过的正文：没写 `[speak]` 时 `text` 与原文
+    # 逐字节相同（`parse_speak_choice` 只在匹配到起始控制区时才改它），所以
+    # 纯文字路径的分段结果与接线前完全一致。
+    body = speak_choice.text if speak_choice.speak else reply_text
+    parts = plan_parts(body, is_group=is_group, max_part_chars=limit)
     if not parts:
         return False, "回复文本为空"
 
@@ -2344,6 +2379,29 @@ async def _reply_in_group_window(  # noqa: ANN001
         if index > 1:
             # 上一段已经拿到回执才走到这里。停顿只是节奏，不是回执。
             await asyncio.sleep(PART_DELAY_SECONDS)
+        mentions = list((expression or {}).get("at") or [])
+        reply_to = (expression or {}).get("quote")
+        if speech is not None and index == 1:
+            # **只有首段**走语音裁决：一条语音对应一条消息。第二段起走下面的纯文字段
+            # （降级时同理——`deliver_speech` 也只发一段）。
+            ok = await _deliver_speech_reply(
+                speech=speech,
+                session=session,
+                service=service,
+                connector=connector,
+                turn_id=turn.client_turn_id,
+                actor_id=settings.actor_id,
+                subject_id=subject_id,
+                window_ref=window_ref,
+                is_group=is_group,
+                mentions=mentions,
+                reply_to=reply_to,
+                part=part,
+            )
+            if not ok:
+                return False, "语音投递失败（降级文字也没发出去）"
+            sent += 1
+            continue
         try:
             outcome = await service.deliver(
                 connector=connector,  # type: ignore[arg-type]
@@ -2353,8 +2411,8 @@ async def _reply_in_group_window(  # noqa: ANN001
                     text=part,
                     is_group=is_group,
                     # 她自己在生成时选的表达方式（@/引用/拍一拍）
-                    mentions=list((expression or {}).get("at") or []),
-                    reply_to=(expression or {}).get("quote"),
+                    mentions=mentions,
+                    reply_to=reply_to,
                     poke_targets=list((expression or {}).get("poke") or []),
                 ),
                 actor_id=settings.actor_id,
@@ -2376,6 +2434,247 @@ async def _reply_in_group_window(  # noqa: ANN001
             return False, f"投递失败：{outcome.detail or str(outcome.state)}"
         sent += 1
     return (sent == len(parts)), ""
+
+
+@dataclass(frozen=True)
+class _SpeechReply:
+    """`[speak]` 这一轮装配出来的东西。**构造本对象就等于"这次要发语音"。**
+
+    ## 为什么不放进一个 `bool` + 一堆 `object | None`
+
+    三态字段（"有/没有/不知道"）是最容易写错的一类：`getattr(..., None)` 与
+    "真的没有"长得一样。这里一共只有两种状态，且**只有一种**能构造成功——
+    装配失败的结论由调用方 `_prepare_speech_reply` 返回 `None` 表达，并顺手
+    记一条日志。于是下面四个字段全部非空，没有"猜哪个 None 是什么意思"。
+    """
+
+    intent: ExpressionIntent
+    orchestrator: SpeechOrchestrator
+    media: GeneratedMediaService
+    tts_provider_id: str
+    tts_kind: str
+    voice: TtsVoice
+    model_id: str
+
+
+async def _prepare_speech_reply(*, effective: EffectiveConfig, session) -> _SpeechReply | None:  # noqa: ANN001
+    """只在她写了 `[speak]` 时调用：装配 TTS / 媒体 / 编排三件。
+
+    **任何一步失败都返回 `None`，不抛。** 抛出去会被调用方的 `try` 记成
+    "生成/投递异常"，而"没绑 TTS"不是投递故障——它必须**降级发文字**。
+
+    失败原因一律进日志（`logger.info`，不 `warning`）：她写了 `[speak]` 却
+    没有可用的 TTS，是配置状态而不是运行故障，用户侧的正文照常送达。
+    """
+    try:
+        return await _build_speech_reply(effective=effective, session=session)
+    except Exception as exc:  # noqa: BLE001 - 装配失败 = 降级，不是回复失败
+        logger.info("语音本轮降级为文字：装配失败（%s）", type(exc).__name__)
+        return None
+
+
+async def _build_speech_reply(*, effective: EffectiveConfig, session) -> _SpeechReply | None:  # noqa: ANN001
+    """装配语音出站运行时。返回 `None` = 这一轮发不了语音（**不是故障**）。
+
+    ## 音色是**唯一**还没接上的一环，这里不猜
+
+    `SpeechOrchestrator._run_synthesis` 在 `request.voice is None` 时直接抛
+    `not_configured`；而三家音色是**三家各自的值对象**（§17.2 撤销了跨厂商
+    映射表）。当前 `EffectiveConfig` 里没有任何音色字段，`src/` 里也没有一处
+    构造 `MiniMaxVoice` / `FishAudioVoice` / `MimoReferenceVoice`。
+
+    所以这里**不给一个"听起来还行"的默认嗓音**：那等于替她选了声音，而日志里
+    看不出任何异常——正是 `ports/speech.py` 反复要防的那类自我欺骗。缺音色时
+    明确返回 `None`，正文照发，并说清缺的是哪一环。
+    """
+    from ling.domains.media.assets import GeneratedMediaService
+    from ling.domains.speech.orchestration import SpeechOrchestrator
+    from ling.domains.speech.providers import build_tts_provider
+    from ling.infra.security import load_signing_root_key
+    from ling.ports.speech import ExpressionIntent
+
+    settings = get_settings()
+    tts = await build_tts_provider(effective, secret_reader=_published_secret_reader())
+    if not tts.ok:
+        # 没绑 / 没密钥 / kind 不对：降级。`reason` 是给用户看的中文。
+        logger.info("语音本轮降级为文字：TTS 未就绪（%s）", tts.reason)
+        return None
+
+    voice = await _voice_for_tts(tts.kind, effective=effective)
+    if voice is None:
+        logger.info(
+            "语音本轮降级为文字：没有可用的音色配置（kind=%s，"
+            "配置里没有任何 voice 字段，代码也不替她选嗓音）",
+            tts.kind,
+        )
+        return None
+
+    # `data_dir` 取 `settings.data_dir`（**不是** `_media_root_default()`）：
+    # 存储层自己会在它下面拼 `generated_media/`，传错一层会让产物落进
+    # `data/media/generated_media/`，而导出接口按另一处根目录读——表现成
+    # "合成成功、投递说找不到"。与会话一起用的还有 `window_id`（见下）。
+    media = GeneratedMediaService(
+        session,
+        data_dir=settings.data_dir,
+        root_key=load_signing_root_key(settings),
+        actor_id=settings.actor_id,
+    )
+    intent = ExpressionIntent(
+        output_modality="voice",
+        source="model",
+        config_revision=int(getattr(effective, "revision", 0) or 0),
+    )
+    return _SpeechReply(
+        intent=intent,
+        # `MediaSink` 把 `save_bytes` 声明成带裸 `**kwargs` 的 `async def`，而
+        # `GeneratedMediaService` 用的是**显式关键字参数**——mypy 判两者不兼容，
+        # 运行期却是对的（编排层只用关键字调它）。端口与实现由
+        # `tests/unit/test_speech_media_contracts.py` 守着，这里只压掉静态检查。
+        # 要根治得改 `MediaSink` 的签名，那是端口契约变更，不在本次接线范围内。
+        orchestrator=SpeechOrchestrator(
+            session,
+            tts=tts.provider,
+            media=media,  # type: ignore[arg-type]
+        ),
+        media=media,
+        tts_provider_id=tts.provider_id,
+        tts_kind=tts.kind,
+        voice=voice,
+        model_id=tts.model_id,
+    )
+
+
+async def _voice_for_tts(kind: str, *, effective: EffectiveConfig) -> TtsVoice | None:  # noqa: ANN001,ARG001
+    """这一轮用什么音色。
+
+    **当前恒为 `None`**：音色还没有配置落点。本函数存在的意义是把"缺什么"
+    写在一个能被测试打到的位置上，而不是让它散落成注释——这样等配置层补上
+    `voice` 字段时，只有这一个函数要改，调用链一行不动。
+    """
+    return None
+
+
+def _published_secret_reader() -> Callable[[str], Awaitable[str | None]]:
+    """密钥**现读库**的读取器（与 `GET /v1/speech` 同一条理由）。
+
+    进程内 `_SECRET_CACHE` 里可能还是轮换前的旧值；拿一把废密钥去碰供应商，
+    比一次明确的降级更糟。这里开**旁路会话**读，不占用调用方那条事务。
+    """
+
+    async def reader(provider_id: str) -> str | None:
+        from ling.infra.security import SecretBox
+        from ling.settings.service import ConfigService
+
+        settings = get_settings()
+        async with session_scope() as sidecar:
+            return await ConfigService(
+                sidecar,
+                SecretBox(settings),
+                test_mode_default=settings.test_mode,
+                persona_id=settings.persona_id,
+            ).read_secret(provider_id)
+
+    return reader
+
+
+def _speech_transport() -> str:
+    """音频交给渠道的形态。与 `connectors/onebot/voice.py` 的三种 transport 对应。
+
+    默认 `signed_url`：NapCat 与本进程不共享文件系统时唯一可行的形态。
+    `LING_SPEECH_TRANSPORT` 可覆盖（`asset` / `base64` / `shared_file`）。
+    **没有"自动选择"分支**——猜错会静默发不出去。
+    """
+    return str(os.environ.get("LING_SPEECH_TRANSPORT") or "signed_url")
+
+
+async def _deliver_speech_reply(
+    *,
+    speech: _SpeechReply,
+    session,  # noqa: ANN001 - `AsyncSession`；本文件统一不在这里标注
+    service: object,
+    connector: object,
+    turn_id: str,
+    actor_id: str,
+    subject_id: str | None,
+    window_ref: str,
+    is_group: bool,
+    mentions: list[str],
+    reply_to: str | None,
+    part: str,
+) -> bool:
+    """首段的语音裁决。返回"这一段是否算送达"。
+
+    ## 这里**不判** `speak`，也不判"合成了吗"
+
+    判断归 `deliver_speech`：它拿意图与合成结果自己决定发语音还是降级。
+    这里只把事实摆过去——这正是"重复判断迟早会分叉"那条纪律要求的形状。
+
+    ## 合成为什么走 `deliver_speech` 而不是自己发文字
+
+    降级（没合成出来）时由它发文字，且**不复用**语音那条的幂等键；自己再发一遍
+    会变成两条正文相同的消息。
+    """
+    from ling.capabilities.speech_delivery import (
+        SpeechDelivery,
+        SpeechDeliveryRequest,
+        SpeechDeliveryState,
+        resolve_fallback,
+    )
+    from ling.domains.speech.orchestration import SynthesisRequest
+
+    # 幂等键 `(turn_id, message_id)`：同一段回复重跑不会重复合成（不重复花钱）。
+    # `message_id` 必须是**稳定**的派生值，不能是 `new_id()`——那每次重跑都
+    # 是一次新的合成，等于"幂等键每次都不同"。
+    message_id = f"attn:{window_ref}:1"
+    outcome = await speech.orchestrator.synthesize(
+        SynthesisRequest(
+            turn_id=turn_id,
+            message_id=message_id,
+            text=part,
+            window_id=window_ref,
+            actor_id=actor_id,
+            subject_id=subject_id,
+            intent=speech.intent,
+            voice=speech.voice,
+            model_id=speech.model_id,
+            producer="tts",
+        )
+    )
+    delivery = SpeechDelivery(
+        session,
+        delivery=service,
+        media=speech.media,
+        connector=connector,
+    )
+    result = await delivery.deliver_speech(
+        request=SpeechDeliveryRequest(
+            turn_id=turn_id,
+            message_id=message_id,
+            window_ref=window_ref,
+            text=part,
+            is_group=is_group,
+            reply_to=reply_to,
+            mentions=tuple(mentions),
+        ),
+        outcome=outcome,
+        intent=speech.intent,
+        actor_id=actor_id,
+        subject_id=subject_id,
+        # 非法/缺失一律按 `text`：配置写错时用户**至少还能收到话**。
+        fallback=resolve_fallback(None),
+        transport=_speech_transport(),
+    )
+    logger.info(
+        "语音投递：provider=%s state=%s digest=%s detail=%s",
+        speech.tts_provider_id,
+        result.state,
+        (result.digest or "")[:12],
+        result.detail,
+    )
+    # 只有"确定没发出去"才算这一段没送。语音没成、文字已经降级发出去了
+    # （`text_only`）是**成功送达**——用户收到了回复。`partial`（可能发出去了）
+    # 也不算没送：重发比漏发更难收拾，对账在 `handle_delivery_reconcile`。
+    return result.state not in {SpeechDeliveryState.failed, SpeechDeliveryState.unsupported}
 
 
 async def _group_reply_delivery_enabled(config) -> bool:  # noqa: ANN001
