@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, File, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1874,7 +1875,233 @@ async def secret_status(
     return {"provider_id": provider_id, **status}
 
 
-__all__ = ["router"]
+# ------------------------------------------------------------------ 音色参考音频
+#
+# REQ-10 的后半句："mimo 上传参考音频 + 另两家手填 ID"。
+#
+# 配置侧早就做完了（`DialoguePolicy.voice.reference_asset_id`，
+# `worker._voice_for_tts` 会把它换成交给 MiMo 的 `MimoReferenceVoice`），但
+# **没有任何入口能把那段音频传上去**——用户得自己算出 media digest 才能填，
+# 实际使用里等于不可用。
+#
+# ## 为什么挂在 `/settings/` 而不是会话下面
+#
+# 音色是**配置**，不属于任何一个会话。现有的
+# `POST /sessions/{id}/media`（`chat.py`）绑会话、只收图片、还会把文件登记成
+# "对话证据"（进上下文、有 7 天保留期）——参考素材三样都不该有。
+#
+# ## 为什么 `window_id` 用一个哨兵值
+#
+# `media_assets.window_id` 是 `NOT NULL`，但**没有外键约束**（见
+# `infra/media_assets.py`），所以可以写一个约定的字符串。读取端
+# `worker._load_reference_audio` 用的是 `session.get()` + `row.is_live()`
+# （ready / 未删除 / 未过期），**不按 window 判可见性**，所以这个值不参与任何
+# 授权判定——它只用来让"这不是真实窗口"在库里可见。
+VOICE_REFERENCE_WINDOW_ID = "__voice_reference__"
+"""参考素材的 ``window_id`` 哨兵。**不是真实窗口。**
+
+为什么不复用 `settings.actor_id` 当 window：那会让 `list_window_assets`
+按窗口列产物时把它们当成"某个会话里的音频"，而它们不属于任何会话。
+"""
+
+#: 参考素材是**长效**配置，不是 7 天就清掉的产物。
+#:
+#: `0` 在 `domains/media/assets.resolve_retention_days` 里的含义就是"不自动过期"
+#: （`_expiry_for` 返回 `None`，`purge_expired` 的 `expires_at IS NOT NULL`
+#: 条件不会命中它）。**不能省略这个参数**：省略会落到默认的 7 天，
+#: 一周后 `is_live()` 变假，`_voice_for_tts` 静默降级发文字——用户只会觉得
+#: "声音用了一个星期就自己没了"。
+VOICE_REFERENCE_RETENTION_DAYS = 0
+
+
+def _require_voice_reference_guards(request: Request, auth: object) -> None:
+    """owner + **同源**。与 `_require_connector_write_guards` 同一套门禁。
+
+    只有那一处不同：**不调 `_require_json_content_type`**——这是 multipart，
+    要求 ``application/json`` 会把唯一的合法请求形态拒掉。少的那一层不会削弱
+    CSRF 防护：真正的跨站防护是同源校验（Origin），`_origin_problem` 对
+    "cookie 会话 + 缺 Origin" 是**拒绝**的，所以第三方页面发起的 multipart
+    表单（浏览器一定会带它自己的 Origin）照样被挡在 403。
+
+    为什么"当前用户是 owner"单独不够：cookie 会话被 CSRF 借用时它依然成立。
+    """
+    from ling.api.routes.version import _origin_problem  # noqa: PLC2701 - 同一进程内的门禁复用
+
+    if str(getattr(getattr(auth, "user", None), "role", "")) != "owner":
+        raise LingError(
+            ErrorCode.forbidden,
+            "只有所有者可以上传音色参考音频",
+            status_code=403,
+            detail="not_owner",
+        )
+    problem = _origin_problem(request, request.app.state.settings)
+    if problem is not None:
+        raise LingError(
+            ErrorCode.forbidden,
+            "这个请求的来源不可信",
+            status_code=403,
+            detail="bad_origin",
+        )
+
+
+@router.post("/settings/speech/voice-reference")
+async def upload_voice_reference(
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    upload: UploadFile = File(...),
+) -> dict[str, object]:
+    """上传一段参考音频，返回可以填进 ``dialogue.voice.reference_asset_id`` 的 id。
+
+    返回的 ``asset_id`` 就是 `media_assets.digest`（内容的 sha256），与设置页
+    校验要求的"64 位十六进制"一致（见 `settings/service._voice_issues`）。
+
+    ## 判据一律来自**内容**，不来自请求头
+
+    ``content_type`` 与文件名都是客户端可以随便写的。这里：
+
+    - 容器由 `models/tts_common.sniff_container` 按字节头判定（也就是 MiMo 适配器
+      自己用的那一个），判定结果再查白名单；
+    - 落盘用的 ``fmt`` / ``mime_type`` 取自**嗅探结果**，不取自 ``content_type``；
+    - 文件名完全不用（这条路径不拼任何用户给的字符串进路径）。
+
+    ## 六类拒绝，各有确定的下一步
+
+    | 情况 | 状态码 | 为什么不是 500 |
+    |---|---|---|
+    | 超过大小上限 | 413 | 与 `body_limit` 中间件同码，文案里给 MB |
+    | 不是白名单容器 | 422 | 说清支持哪几种 |
+    | 内容不是合法音频 | 422 | 头几个字节认不出，内容说了算 |
+    | 空文件 | 422 | 空文件不是音频 |
+    | 非 owner | 403 | 改配置的人才该传素材 |
+    | 跨站 | 403 | 同源校验 |
+    """
+    from ling.api.routes.chat import MAX_VOICE_BYTES, VOICE_MIME_BY_CONTAINER
+    from ling.domains.media.assets import GeneratedMediaService
+    from ling.infra.security import load_signing_root_key
+    from ling.models.tts_common import sniff_container
+
+    _require_voice_reference_guards(request, auth)
+
+    # `upload.filename` **一次都不用**：它只可能是 `../../etc/passwd` 这类东西，
+    # 而 `save_bytes` 按内容 digest 命名，这条路径根本不拼用户给的字符串。
+
+    # 只读到"上限 + 1"字节：多读一个就足以判定超限，不会为一个伪造的
+    # Content-Length 把整个请求体读进内存。
+    data = await upload.read(MAX_VOICE_BYTES + 1)
+    limit_mb = MAX_VOICE_BYTES // (1024 * 1024)
+    if len(data) > MAX_VOICE_BYTES:
+        raise LingError(
+            ErrorCode.invalid_request,
+            f"参考音频超过 {limit_mb}MB 上限",
+            status_code=413,
+            detail="voice_reference_too_large",
+        )
+    if not data:
+        raise LingError(
+            ErrorCode.invalid_request,
+            "上传内容为空：参考音频不能是 0 字节",
+            status_code=422,
+            detail="voice_reference_empty",
+        )
+
+    container = sniff_container(data)
+    mime_type = VOICE_MIME_BY_CONTAINER.get(container or "")
+    if container is None or mime_type is None:
+        declared = (upload.content_type or "").split(";")[0].strip().lower()
+        raise LingError(
+            ErrorCode.invalid_request,
+            "这段内容不是可识别的音频（按字节头判断，不看文件扩展名或"
+            f"Content-Type）。支持的格式：{', '.join(sorted(VOICE_MIME_BY_CONTAINER))}"
+            + (f"；你声明的是 {declared}" if declared else ""),
+            status_code=422,
+            detail="voice_reference_invalid_audio",
+        )
+
+    # `save_bytes` 的两个构造参数与 `worker._build_speech_reply` 保持字面一致：
+    # `data_dir` 必须是 `settings.data_dir`（存储层自己拼 `generated_media/`），
+    # `root_key` 走 `load_signing_root_key`（根密钥的唯一公开入口）。
+    media = GeneratedMediaService(
+        session,
+        data_dir=settings.data_dir,
+        root_key=load_signing_root_key(settings),
+        actor_id=settings.actor_id,
+    )
+    saved = await media.save_bytes(
+        data,
+        actor_id=settings.actor_id,
+        window_id=VOICE_REFERENCE_WINDOW_ID,
+        kind="audio",
+        fmt=container,
+        mime_type=mime_type,
+        # 时长**不估**：这里没有解码器，不知道多久就是不知道
+        # （`ports/speech.AudioSpec` 对"谎报一个看起来合理的值"的态度同理）。
+        duration_ms=None,
+        producer="settings.voice_reference",
+        retention_days=VOICE_REFERENCE_RETENTION_DAYS,
+        expected_digest=hashlib.sha256(data).hexdigest(),
+    )
+    await _keep_voice_reference_from_expiring(session, saved.digest)
+    await session.commit()
+
+    audit_event(
+        "voice_reference_uploaded",
+        outcome="ok",
+        actor=str(getattr(auth.user, "subject_id", "") or "owner"),
+        target_type="media_asset",
+        target_id=saved.digest,
+        attributes={
+            "format": container,
+            "mime_type": mime_type,
+            "size_bytes": saved.size_bytes,
+            "created": saved.created,
+        },
+    )
+    return {
+        "schema_version": "v1",
+        "asset_id": saved.digest,
+        "format": container,
+        "mime_type": mime_type,
+        # 大小取**落盘的那份字节**（`SavedAsset.size_bytes`），不是上传时的
+        # 声明——两者一致是常态，不一致说明中间出了别的事，报实的那个。
+        "size_bytes": saved.size_bytes,
+        "duration_ms": None,
+        # 给设置页用的可读提示：填在哪、会不会过期。
+        "retention_days": VOICE_REFERENCE_RETENTION_DAYS,
+    }
+
+
+async def _keep_voice_reference_from_expiring(session: AsyncSession, digest: str) -> None:
+    """把这一行的 ``expires_at`` 清成 ``None``（= 不自动过期）。
+
+    ## 为什么传了 `retention_days=0` 还要再补一刀
+
+    `save_bytes` 有**两**条路径：
+
+    1. 新内容 → 按 ``retention_days`` 建行。传 0 → `expires_at=None`。正确。
+    2. 字节与**已有一条有效记录**完全相同 → 直接复用旧行，``created=False``，
+       **既不更新 `expires_at` 也不更新 `window_id`**（见 `assets.py` 去重分支，
+       那里刻意不动归属与保留期）。
+
+    路径 2 是真实的坑：用户上传的参考音频如果恰好与某条已存在的 TTS 产物
+    同字节（重复试同一段话、或从别处拿回同一段音频），复用的那一行仍带着
+    旧的 7 天保留期，一周后 `purge_expired` 把它标死 → `_voice_for_tts`
+    静默降级发文字。`purge_expired` 的 `_still_referenced` 只认
+    `media_evidence`，**不认配置里的 `reference_asset_id`**。
+
+    改 `assets.py` 的去重分支会影响所有调用方（合成产物恰恰**不该**被这样
+    延长），所以这一刀放在这一层：只有"音色参考素材"这个语义知道它必须长效。
+    """
+    from ling.infra.media_assets import MediaAssetRow
+
+    row = await session.get(MediaAssetRow, digest)
+    if row is not None and row.expires_at is not None:
+        row.expires_at = None
+        await session.flush()
+
+
+__all__ = ["VOICE_REFERENCE_WINDOW_ID", "router"]
 
 
 def _unused() -> None:  # pragma: no cover

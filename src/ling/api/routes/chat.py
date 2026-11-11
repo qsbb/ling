@@ -259,6 +259,39 @@ async def _refresh_config_if_stale(request: Request) -> None:
 # 只收图片、只落本地、只登记证据。**不在这里生成描述**：描述要视觉模型，
 # 由 worker 的 media.describe 异步做，且拿不到就留空、下次再试。
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
+#: 音色参考音频的**唯一**字节上限。
+#:
+#: 两个端点共用一个常量，因为**四处**必须同时成立，否则表现成"上传说成功、
+#: 真到合成时静默降级发文字"：
+#:
+#: 1. 上传端点 `POST /settings/speech/voice-reference`（`settings.py`）；
+#: 2. `worker._load_reference_audio`（读端，超限直接降级）；
+#: 3. `models/mimo_tts.MAX_VOICE_BYTES`（适配器，data URL 会膨胀 4/3）；
+#: 4. 客户端（设置页的提示文案）。
+#:
+#: 读端那一份仍在 `worker.py` 模块顶部：那里不能 import 本模块——`api` 是上层，
+#: `worker` 拉它会把 HTTP 栈带进 worker 进程。所以两处相等这件事由
+#: `tests/unit/test_speech_voice_config.py::test_upload_voice_size_limit_matches_read_side`
+#: 盯着。
+MAX_VOICE_BYTES = 10 * 1024 * 1024
+
+#: 参考音频允许的容器 → MIME。**取内容嗅探的结果，不看客户端 ``content_type``**。
+#:
+#: 条目来自 `models/mimo_tts._MIME_BY_CONTAINER`（那家 voiceclone 接口真能吃的
+#: 容器），而不是 `domains/media/assets._FORMAT_MIME`——后者是 TTS **产物**的格式
+#: 表，含 silk/amr 这类入站参考素材用不上的项。
+#:
+#: 不收裸 PCM：`sniff_container` 对 PCM 只有启发式判断，一份 10MB 无头字节与
+#: "上传了别的东西"无法可靠区分——宁可在入口拒绝，也不要在合成时表现为噪音。
+VOICE_MIME_BY_CONTAINER: dict[str, str] = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "flac": "audio/flac",
+    "ogg": "audio/ogg",
+    "m4a": "audio/mp4",
+}
+
 _IMAGE_MIME = {
     "image/png": ".png",
     "image/jpeg": ".jpg",

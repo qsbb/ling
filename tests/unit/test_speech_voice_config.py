@@ -451,3 +451,22 @@ def test_worker_voice_size_limit_matches_mimo_adapter() -> None:
     from ling.worker import MAX_VOICE_BYTES as WORKER_LIMIT
 
     assert WORKER_LIMIT == ADAPTER_LIMIT
+
+
+def test_upload_voice_size_limit_matches_read_side() -> None:
+    """上传端（API）的上限 == 读端（worker）的上限。
+
+    必须失败于「上传端点自己写一个数」：两个数不一致时，症状是**最坏的那一种**
+    ——比读端松，用户能传上去、上传还返回 200，但 `_load_reference_audio`
+    一直降级发文字，界面上没有任何错误；比读端紧，则是一段读端明明能用的音频
+    在入口被拒。
+
+    这条守的是**等式**本身，而不是"两个常量都存在"：删掉上传端那个常量时
+    import 就会炸，红得很难看但红得对；把它改成另一个数时，这条是唯一会红的
+    地方——两个端点各自都能正常跑，只有"能不能读回自己上传的东西"这件事坏了。
+    """
+    from ling.api.routes.chat import MAX_VOICE_BYTES as UPLOAD_LIMIT
+    from ling.worker import MAX_VOICE_BYTES as WORKER_LIMIT
+
+    assert UPLOAD_LIMIT == WORKER_LIMIT
+
