@@ -645,6 +645,63 @@ class ContextCompiler:
         window_row = await self._conversation.get_window_for_turn(
             window_id, subject_id=subject_id
         )
+        # --- 环境事实（平台 / 会话 / 时间）---
+        #
+        # ## 为什么夹在这里
+        #
+        # `window_row` 刚取到，而这段代码**在所有 persona 分支之外**——上面那段
+        # 「有没有人设」的 if/else 只管 `persona` / `constraints` / `scenario`
+        # 三条车道。环境事实属于**功能侧**，空人设时也必须注入（用户明确要求：
+        # 「其他功能侧正常该注入就注入，人设就空着不注入」）。放进那个 else 分支
+        # 里，空人设的部署就永远不知道自己在哪个渠道——而那恰恰是全新安装的默认状态。
+        #
+        # ## 为什么复用 `window_row` 而不重新查
+        #
+        # `get_window_for_turn` 已经处理了"群窗口对所有成员开放"的归属规则
+        # （见该函数 docstring 里 2026-10-29 的实测复现）。再查一次等于把同一条
+        # 规则维护两遍，而 `worker.py:414-426` 记过这种双份维护的真实后果：
+        # 一处永远不写入，群聊闸门全线失效。
+        #
+        # 取数失败**不阻断对话**：环境事实是旁白，不是这一轮的前提条件。
+        try:
+            from ling.kernel.env_facts import collect as _collect_env_facts
+            from ling.kernel.env_facts import render as _render_env_facts
+
+            env_facts = await _collect_env_facts(
+                self._session, window=window_row, subject_id=subject_id
+            )
+            env_text = _render_env_facts(env_facts).strip()
+            if env_text:
+                contributions.append(
+                    ContextContribution(
+                        lane="world",
+                        text=env_text,
+                        # `external_observation`：这些事实是系统**观测**到的
+                        # 渠道状态（窗口的 channel/visibility/title、用户设的
+                        # 时区），不是用户说的、更不是模型推断的。
+                        # 六种 origin 里只有它是"我们这边查到的客观情况"，
+                        # 用 `model_inference` 会让下游把它当成不可靠猜测。
+                        origin=Origin.external_observation,
+                        # 群窗口的渠道/群号对群里所有人都可见（他们本来就在那个群里）；
+                        # 私聊窗口只有当事人自己。
+                        visibility=(
+                            Visibility.group_scope if env_facts.is_group
+                            else Visibility.subject_private
+                        ),
+                        token_budget=DEFAULT_BUDGETS["world"],
+                    )
+                )
+            compiled_meta["env_facts"] = {
+                "channel": env_facts.channel,
+                "is_group": env_facts.is_group,
+                "has_window_ref": bool(env_facts.window_ref),
+                "timezone": env_facts.timezone,
+            }
+        except Exception as exc:  # noqa: BLE001 - 环境事实失败不阻断对话
+            # 记进 meta 而不是静默吞掉：`compiled_meta` 会进日志，
+            # 否则"这轮为什么没有环境事实"永远查不出来。
+            compiled_meta["env_facts_error"] = type(exc).__name__
+
         snapshot = await AudienceSnapshot.freeze(
             self._session,
             subject_id=subject_id,

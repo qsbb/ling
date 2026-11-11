@@ -1067,39 +1067,109 @@ def test_history_budget_is_not_the_bottleneck() -> None:
     )
 
 
-def test_budget_scale_env_is_honored(monkeypatch) -> None:  # noqa: ANN001
-    """`LING_CONTEXT_BUDGET_SCALE` 要能整体缩放——模型窗口小的时候用得上。"""
-    import importlib
+def _src_root() -> str:
+    """给子进程用的 ``PYTHONPATH``：``ling`` 包所在目录的父目录（即 ``src/``）。
 
+    从**已导入的包**反推，而不是拼 ``cwd/src``：用例可能在仓库根、
+    也可能在 ``tests/`` 下被调用，写死相对路径会在其中一种下静默失败
+    （子进程 import 不到 ling，报的错还和缩放无关）。
+    """
+    import os.path
+
+    import ling
+
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = [os.path.dirname(os.path.dirname(os.path.abspath(ling.__file__)))]
+    if existing:
+        parts.append(existing)
+    return os.pathsep.join(parts)
+
+
+def test_budget_scale_env_is_honored(monkeypatch) -> None:  # noqa: ANN001
+    """`LING_CONTEXT_BUDGET_SCALE` 要能整体缩放——模型窗口小的时候用得上。
+
+    **不要用 ``importlib.reload`` 来测这个**（曾经是这么写的，已改）：
+    reload 会造出**第二个** ``ContextCompiler`` 类，而 ``turn.py:58`` 的
+    ``from ... import ContextCompiler`` 在首次导入时已把旧类钉死，
+    reload 修不回来。结果是 ``monkeypatch.setattr(context.ContextCompiler, ...)``
+    patch 到新类、生产代码走旧类，spy 静默地永不触发——表现为
+    ``test_display_name_chain.py`` 单独跑全绿、跟在本文之后跑必挂。
+    见 ``docs/evidence/test-pollution-reload.md``。
+
+    改成两层测（都不 reload）：系数取值在本进程直接调 ``_budget_scale()``
+    （它调用期读 ``os.environ``）；"系数真的作用到预算表上"那一步发生在
+    导入期，放到 :func:`test_budget_scale_actually_resizes_the_tables`
+    用子进程验。
+    """
     import ling.kernel.context as ctx
+
+    assert ctx._budget_scale() == 1.0, "没设环境变量时应当是 1.0"
 
     monkeypatch.setenv("LING_CONTEXT_BUDGET_SCALE", "0.5")
-    reloaded = importlib.reload(ctx)
-    try:
-        total = sum(reloaded.DEFAULT_BUDGETS.values()) + reloaded.HISTORY_TOKEN_BUDGET
-        # 0.5 倍：车道和 128600 → 64300，历史 20000 → 10000，合计 74300。
-        # 用**比例**断言而不是写死数字：上限一改这里就会假红。
-        assert reloaded.DEFAULT_BUDGETS["persona"] == 50_000
-        assert reloaded.HISTORY_TOKEN_BUDGET == 10_000
-        assert total == 74_300, f"缩放后 {total}，没按 0.5 生效"
-    finally:
-        monkeypatch.delenv("LING_CONTEXT_BUDGET_SCALE", raising=False)
-        importlib.reload(ctx)
+    assert ctx._budget_scale() == 0.5
+
+    # 超范围要夹紧，而不是让预算炸掉或归零
+    monkeypatch.setenv("LING_CONTEXT_BUDGET_SCALE", "99")
+    assert ctx._budget_scale() == 5.0
+    monkeypatch.setenv("LING_CONTEXT_BUDGET_SCALE", "0")
+    assert ctx._budget_scale() == 0.1
 
 
-def test_budget_scale_rejects_garbage(monkeypatch) -> None:  # noqa: ANN001
+def _import_context_in_subprocess(scale: str) -> dict:
+    """在**干净解释器**里按给定 ``LING_CONTEXT_BUDGET_SCALE`` 导入 context，取结果。
+
+    为什么必须开子进程：缩放发生在 ``context.py`` 的**导入期**（``_SCALE =
+    _budget_scale()`` 之后重算两张预算表）。本进程早已导入完，除了
+    ``importlib.reload`` 没有别的办法再看一次"换环境变量重新导入会怎样"——
+    而 reload 正是本文要根除的东西（它分裂类身份，污染别的测试文件）。
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "import json;"
+        "import ling.kernel.context as c;"
+        "print(json.dumps({"
+        "'scale': c._SCALE,"
+        "'persona': c.DEFAULT_BUDGETS['persona'],"
+        "'history': c.HISTORY_TOKEN_BUDGET,"
+        "'total': sum(c.DEFAULT_BUDGETS.values()) + c.HISTORY_TOKEN_BUDGET}))"
+    )
+    completed = subprocess.run(  # noqa: S603 - 固定脚本，无外部输入
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env={**os.environ, "LING_CONTEXT_BUDGET_SCALE": scale, "PYTHONPATH": _src_root()},
+    )
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def test_budget_scale_actually_resizes_the_tables() -> None:
+    """系数必须真的作用到两张预算表上，而不只是被读出来。
+
+    断言子进程里**真实导入结果**，不复算缩放公式——公式抄到测试里就成了
+    "两处各说一套"，改了一边另一边还绿。
+    """
+    data = _import_context_in_subprocess("0.5")
+
+    assert data["scale"] == 0.5, data
+    # 0.5 倍：人设 100k → 50k，历史 20k → 10k，车道和 128600 → 64300
+    assert data["persona"] == 50_000, data
+    assert data["history"] == 10_000, data
+    assert data["total"] == 74_300, data
+
+
+def test_budget_scale_garbage_does_not_zero_the_budgets() -> None:
     """环境变量写错不能把预算变成 0 —— 那会让所有车道都截成 80 字符。"""
-    import importlib
+    data = _import_context_in_subprocess("不是数字")
 
-    import ling.kernel.context as ctx
-
-    monkeypatch.setenv("LING_CONTEXT_BUDGET_SCALE", "不是数字")
-    reloaded = importlib.reload(ctx)
-    try:
-        assert sum(reloaded.DEFAULT_BUDGETS.values()) > 30000, "垃圾值把预算压没了"
-    finally:
-        monkeypatch.delenv("LING_CONTEXT_BUDGET_SCALE", raising=False)
-        importlib.reload(ctx)
+    assert data["scale"] == 1.0, f"垃圾值应当退回 1.0，实际 {data['scale']}"
+    assert data["total"] > 30_000, f"垃圾值把预算压没了：{data['total']}"
 
 
 # ---------------------------------------------------------------- 出入许可
