@@ -264,6 +264,8 @@ class WeChatConnector:
             supports_group=profile.supports_group,
             supports_proactive=profile.supports_proactive,
             supports_edit=False,  # 微信不支持编辑已发消息
+            # 微信没有"拍一拍"。显式写 False 而不是靠默认值。
+            supports_poke=False,
             supports_media=True,
             max_text_length=profile.max_text_length,
             receipt_reliability=profile.receipt_reliability,  # type: ignore[arg-type]

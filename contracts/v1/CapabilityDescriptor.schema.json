@@ -85,6 +85,11 @@
       "title": "Supports Media",
       "type": "boolean"
     },
+    "supports_poke": {
+      "default": false,
+      "title": "Supports Poke",
+      "type": "boolean"
+    },
     "supports_private": {
       "default": true,
       "title": "Supports Private",

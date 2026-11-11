@@ -24,7 +24,14 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, TurnState, new_id
+from ling.contracts.v1 import (
+    CapabilityDescriptor,
+    ChatMessage,
+    ErrorCode,
+    Origin,
+    TurnState,
+    new_id,
+)
 from ling.domains.conversation.recall import (
     finalize_recall_text,
     parse_recall_markers,
@@ -696,6 +703,26 @@ class TurnCoordinator:
         # 产生这一轮的渠道账号（"instance:external_id"）。记忆要记下它，
         # 否则同一人多个号合并后无法无损拆分。
         source_account: str | None = None,
+        # 这一轮所在渠道的**能力声明**（`connector.capabilities()`）。
+        #
+        # ## 为什么必须由调用方传
+        #
+        # `TurnService` 不持有连接器（它只管生成），而"这个渠道能不能拍一拍"
+        # 只有连接器自己知道。之前没这个参数，于是 `context.py` 用
+        # `getattr(self, "_supports_poke", True)` 兜底——**默认 True**，
+        # 导致提示词对 QQ/微信/Web 都宣告"可以拍一拍"，而她真写了
+        # `[poke:…]` 之后投递层静默丢弃，用户看到"她说要拍你但没拍"。
+        #
+        # ## ``None`` 的语义是"**没有外部渠道**"，不是"没传"
+        #
+        # Web 面板与内部直发没有连接器（`worker.py` 的
+        # `channel in {"", "web"}` 分支：落库即送达）。这对提示词的含义是
+        # "没有外部表达能力"，因此按**不列任何渠道动作**处理。
+        #
+        # 所以 ``None`` 与"某个 `supports_poke=False` 的连接器"在行为上一致，
+        # 但语义不同：前者根本没有渠道，后者有渠道但没这个能力。将来加别的
+        # 表达能力（@/引用）时这条区分会变得重要，别把它们混成一个分支。
+        channel_capabilities: CapabilityDescriptor | None = None,
         # 「这条消息是谁说的」——本次称呼（群里 = 群名片优先）。
         # 只用于给当轮上下文里**最后那句**署名，不落库：库里的
         # `subjects.display_name` 是人级旁路（见 identity.observe_display_name）。
@@ -719,6 +746,7 @@ class TurnCoordinator:
                 token=token,
                 attempt=attempt,
                 source_account=source_account,
+                channel_capabilities=channel_capabilities,
                 sender_name=sender_name,
                 current_message_platform_id=current_message_platform_id,
             ),
@@ -758,6 +786,8 @@ class TurnCoordinator:
         token: StopToken,
         attempt: int = 1,
         source_account: str | None = None,
+        # 渠道能力声明，透传给 `ContextCompiler`（见 `run_turn` 的说明）。
+        channel_capabilities: CapabilityDescriptor | None = None,
         sender_name: str | None = None,
         current_message_platform_id: str | None = None,
     ) -> None:
@@ -865,6 +895,8 @@ class TurnCoordinator:
                     # 因为别人在设置页换了模型而中途换掉向量空间。
                     model_config=config,
                     secret_reader=self._secret_reader,
+                    # 渠道能力决定提示词能列哪些动作（见 `run_turn` 的说明）。
+                    channel_capabilities=channel_capabilities,
                 ).compile(
                     subject_id=subject_id,
                     window_id=window_id,

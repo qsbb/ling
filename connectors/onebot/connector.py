@@ -1413,6 +1413,10 @@ class OneBotV11Connector(ChannelConnector):
             # 具体能不能撤、撤多久以内，由平台在调用时回答——这里只声明
             # "我们会去试"，不声明"一定能成功"。
             supports_recall=True,
+            # OneBot V11 的 ``send_poke``（NapCat / Lagrange 都实现）。
+            # 见下面 ``send`` 里对 ``poke_targets`` 的处理——**真的会发**，
+            # 所以这里如实声明 True，提示词才会把 ``[poke:…]`` 列给她。
+            supports_poke=True,
             max_text_length=self._config.max_text_length,
             receipt_reliability="best_effort",
             enabled=bool(self._config.api_base),

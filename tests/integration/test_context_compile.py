@@ -376,10 +376,36 @@ async def test_context_offers_expression_choices(logged_in: TestEnv) -> None:
     """
 
     from ling.capabilities.expression_choice import render_expression_help
+    from ling.contracts.v1 import CapabilityDescriptor, Modality
+
+    # 必须显式给定渠道能力，不能靠 `ContextCompiler(session)` 的默认值。
+    #
+    # ## 这一行以前没有，而它缺席时测试在锁一个 bug
+    #
+    # 原写法是 `ContextCompiler(session)`，什么都不传，然后断言群聊里必须有
+    # `[poke:`。它能通过，是因为当时 `context.py` 用
+    # `getattr(self, "_supports_poke", True)` 兜底——**恒为 True**，对所有渠道
+    # 都宣告"可以拍一拍"，包括根本没有 `send_poke` 的 QQ 官方和微信。
+    # 也就是说，这条断言当时锁住的不是需求，而是那个 bug。
+    #
+    # 修掉之后同样的代码就红了，正确的做法是**把能力说清楚**而不是放宽断言：
+    # 这个能力声明想表达的是"渠道支持拍一拍时，提示词要把它列出来"——那正是
+    # 下面 `for marker in (...)` 要验证的事。
+    #
+    # 对照同一测试文件里 `render_expression_help(is_group=False, supports_poke=False)`
+    # 那一行：那里一直是显式传的。写的时候就知道要传，只是群聊这条漏了。
+    caps = CapabilityDescriptor(
+        capability_id="test.group",
+        version="1.0.0",
+        modalities=[Modality.text],
+        supports_private=True,
+        supports_group=True,
+        supports_poke=True,
+    )
 
     session_id, subject_id = await _window(logged_in)
     async with session_scope() as session:
-        compiled = await ContextCompiler(session).compile(
+        compiled = await ContextCompiler(session, channel_capabilities=caps).compile(
             subject_id=subject_id, window_id=session_id, user_text="你好", is_group=True
         )
     blob = "\n".join(m.content for m in compiled.messages)

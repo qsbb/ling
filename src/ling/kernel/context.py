@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.contracts.v1 import ContextContribution, Origin, Visibility
+from ling.contracts.v1 import CapabilityDescriptor, ContextContribution, Origin, Visibility
 from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.deferred.markers import defer_marker_prefix
@@ -450,8 +450,19 @@ class ContextCompiler:
         memory_policy: MemoryPolicy | None = None,
         model_config: EffectiveConfig | None = None,
         secret_reader: Callable[[str], str | None] | None = None,
+        # 这一轮所在渠道的能力声明（`connector.capabilities()`）。
+        #
+        # ``None`` 表示**没有外部渠道**（Web 面板 / 内部直发），不是"没传"。
+        # 两者对提示词的含义相同（没有外部表达能力 → 不列渠道动作），但语义
+        # 不同，所以不要把它们合并成一个"默认值"。
+        #
+        # 为什么必须由调用方传：编译器不持有连接器，而"这个渠道能不能拍一拍"
+        # 只有连接器自己知道。之前没这个参数，`_supports_poke` 从来没人赋值，
+        # 于是 `getattr(self, "_supports_poke", True)` 恒为 True。
+        channel_capabilities: CapabilityDescriptor | None = None,
     ) -> None:
         self._session = session
+        self._channel_capabilities = channel_capabilities
         self._actor_id = actor_id
         self._persona_id = persona_id
         self._persona = PersonaService(session, persona_id)
@@ -474,6 +485,20 @@ class ContextCompiler:
             secret_reader=secret_reader,
         )
         self._consent = ConsentService(session)
+
+    @property
+    def supports_poke(self) -> bool:
+        """这个渠道能不能"拍一拍"。
+
+        **没有渠道（``None``）时为 False**：Web 面板与内部直发没有外部连接器，
+        拍一拍无处可发。以前这里恒为 True，于是提示词对 Web 用户也列
+        ``[poke:…]``，而她写了之后投递层静默丢弃。
+
+        `CapabilityDescriptor.supports_poke` 默认也是 False，理由相同：
+        能力必须由知道实情的连接器**显式声明**，不能靠默认值宣称。
+        """
+        caps = self._channel_capabilities
+        return bool(getattr(caps, "supports_poke", False)) if caps is not None else False
 
     async def _trust_level(self, subject_id: str) -> str:
         """亲疏等级。读不到按最不信任处理（fail closed）。"""
@@ -1321,7 +1346,18 @@ class ContextCompiler:
                     is_group=is_group,
                     # 拍一拍要连接器支持；没能力就**不要列出来**——
                     # 列了做不到的，她会选一个做不出来的动作。
-                    supports_poke=bool(getattr(self, "_supports_poke", True)),
+                    #
+                    # 这里原来写的是 `getattr(self, "_supports_poke", True)`：
+                    # 全仓**没有任何地方给 `_supports_poke` 赋值**，所以它恒为
+                    # True，等于对 QQ / 微信 / Web 都宣告"可以拍一拍"，而她真写
+                    # 了 `[poke:…]` 之后投递层静默丢弃，用户看到的是"她说要拍你
+                    # 但没拍"。上面这句注释写着"没能力就不要列出来"——代码却在
+                    # 做相反的事，因为当时没有数据源，兜底值又选错了方向。
+                    #
+                    # 现在读连接器**自己声明**的事实（`CapabilityDescriptor.
+                    # supports_poke`）。没有渠道（Web 面板）时为 None，按
+                    # False 处理：没有外部渠道就等于没有渠道动作。
+                    supports_poke=self.supports_poke,
                 ),
                 origin=Origin.verified_source,
                 visibility=Visibility.subject_private,

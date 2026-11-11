@@ -627,6 +627,9 @@ class QQBotConnector(ChannelConnector):
             supports_edit=False,
             # 也没有撤回已发消息的接口（见 recall()）
             supports_recall=False,
+            # QQ 官方接口没有拍一拍。显式写 False 而不是靠字段默认值：默认值将来若被
+            # 改动，这里不会跟着变——**能力声明要写在知道实情的地方**。
+            supports_poke=False,
             supports_media=self._config.supports_media,
             max_text_length=self._config.max_text_length,
             receipt_reliability="best_effort",

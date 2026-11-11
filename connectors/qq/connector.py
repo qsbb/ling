@@ -414,6 +414,9 @@ class QQConnector:
             supports_group=True,
             supports_proactive=bool(self._config.proactive_enabled),
             supports_edit=False,  # QQ 官方接口不支持编辑已发消息
+            # QQ 官方接口没有"拍一拍"。显式写 False 而不是靠默认值：
+            # 默认值将来若被改动，这里不会跟着变——能力声明要写在知道实情的地方。
+            supports_poke=False,
             supports_media=True,
             max_text_length=2000,
             receipt_reliability="best_effort",

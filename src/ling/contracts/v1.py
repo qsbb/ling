@@ -816,6 +816,19 @@ class CapabilityDescriptor(StrictModel):
     # 而"这个渠道不支持撤回"与"这次撤回失败了"是两种完全不同的结论——
     # 前者根本不该发 action（也不该在审计里记一次失败尝试）。
     supports_recall: bool = False
+    # 能不能**拍一拍**（OneBot 的 `send_poke`）。
+    #
+    # ## 默认 False 是**有意**的，不要改成 True
+    #
+    # 下一个人看到 `bool` 字段的第一反应往往是"默认 True 更安全"——这里恰好
+    # 相反。这个字段存在的**唯一原因**就是修一个 `getattr(self, "_supports_poke",
+    # True)` 造成的活 bug：提示词对所有渠道都宣告"可以拍一拍"，而 QQ 官方和
+    # 微信根本没有这个能力，于是她写 `[poke:…]`、投递层静默丢弃、用户看到的是
+    # "她说要拍你但没拍"。**默认 True = 没探测就宣称能做**，那正是要修的毛病。
+    #
+    # 能力声明必须由**知道实情的连接器**显式给出：只有真正实现了 poke 的渠道
+    # 才有资格写 `True`。同一条原则见上面的 `supports_recall`（默认也是 False）。
+    supports_poke: bool = False
     max_text_length: int = Field(default=4096, ge=1)
     receipt_reliability: Literal["none", "best_effort", "confirmed"] = "best_effort"
     enabled: bool = False

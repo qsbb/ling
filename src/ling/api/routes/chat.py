@@ -993,6 +993,10 @@ async def send_turn(
         turn_id=turn.id,
         user_text=text,
         config=effective,
+        # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
+        # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此
+        # 不列 `[poke:…]` 这类渠道动作，因为它们在 Web 上无处执行。
+        channel_capabilities=None,
     )
     started = _sse(
         "turn.started",
@@ -1241,6 +1245,10 @@ async def retry_turn(
         user_text=user_text,
         config=effective,
         attempt=new_attempt,
+        # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
+        # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此
+        # 不列 `[poke:…]` 这类渠道动作，因为它们在 Web 上无处执行。
+        channel_capabilities=None,
     )
     started = _sse(
         "turn.started",

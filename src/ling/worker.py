@@ -1474,6 +1474,11 @@ async def _run_deferred_turn(
         # 传原文会把旧输入再喂一遍，变成"她又说了一遍"。
         user_text="",
         config=effective,
+        # 延后回复落在**原窗口**所在的渠道上，能力也取自那里。
+        # 这个渠道一定是 web/空（`_deferred_window_deliverable` 已把外部渠道
+        # 拒成 `channel_unsupported`），所以通常是 None；仍按 window 查，
+        # 是为了将来放开外部渠道延后时不用再改这里。
+        channel_capabilities=await _window_channel_capabilities(window_id),
     )
 
     reply_text = ""
@@ -2143,6 +2148,44 @@ async def handle_embedding_backfill(payload: dict) -> None:
         logger.info("向量补算：写入 %d 条", done)
 
 
+def _channel_capabilities(channel: str) -> object | None:
+    """这一轮所在渠道的能力声明（喂给 `ContextCompiler` 决定提示词能列哪些动作）。
+
+    ``None`` 表示**没有外部渠道**（Web 面板 / 内部直发，见 `channel in {"", "web"}`
+    那条分支：落库即送达，没有平台可调）。它不是"忘了传"——提示词据此不列任何
+    渠道动作，因为那些动作在 Web 上无处执行。
+
+    能力取自**连接器自己的声明**（`connector.capabilities()`），不是别处查表：
+    查表就等于又维护一份"哪个渠道支持什么"，而那份表迟早和连接器漂移。
+    """
+    connector = _group_reply_connector(channel)
+    if connector is None:
+        return None
+    caps = getattr(connector, "capabilities", None)
+    return caps() if callable(caps) else None
+
+
+async def _window_channel_capabilities(window_id: str) -> object | None:
+    """按 `window_id` 查出窗口渠道，再取该渠道的能力声明。
+
+    只被"手里只有 window_id、没有 window 对象"的路径用（延后回复）。
+    查不到窗口时返回 ``None``（按无渠道处理）——不能因此让整轮失败：
+    能力只影响提示词**列什么**，不该影响这一轮能不能跑。
+    """
+    from sqlalchemy import select
+
+    from ling.infra.models import Window
+
+    try:
+        async with session_scope() as session:
+            channel = await session.scalar(
+                select(Window.channel).where(Window.id == window_id)
+            )
+    except Exception:  # noqa: BLE001 - 取不到能力就按无渠道处理，不阻断本轮
+        return None
+    return _channel_capabilities(str(channel or ""))
+
+
 def _group_reply_connector(channel: str) -> object | None:
     """按**窗口所属渠道**取连接器。
 
@@ -2223,6 +2266,8 @@ async def _reply_in_group_window(  # noqa: ANN001
         # 这里把批次文本作为"她正在回什么"的输入。
         user_text=result.batch_text,
         config=effective,
+        # 群回复发生在窗口所属渠道上，能力取自该渠道的连接器声明。
+        channel_capabilities=_channel_capabilities(str(window.channel or "")),
     )
 
     reply_text = ""

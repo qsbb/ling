@@ -1489,6 +1489,41 @@ class InboundBridge:
         ).scalars()
         return len(list(rows))
 
+    def _current_capabilities(self):
+        """这条入站消息**所属渠道**的能力声明，喂给提示词决定能列哪些动作。
+
+        返回 `CapabilityDescriptor`，取不到时返回 ``None``（按"没有外部渠道"
+        处理，提示词不列渠道动作）。
+
+        ## 为什么可以放心用 `self._connector`
+
+        `InboundBridge` 是**每条入站事件构造一次**的（见
+        `inbound_intake`：`InboundBridge(session, connector=connector, ...)`），
+        而那个 `connector` 就是**这条消息来的那个实例**。所以这里取到的必然是
+        对的号，不是"随便哪个连接器"。
+
+        ## 但这个前提将来会变
+
+        多实例运行时改造（`b323ed6` 那轮只做了数据层，运行时还没做）之后，
+        如果 `InboundBridge` 被改成复用、或改成持有"渠道 → 连接器"的表，
+        那么 `self._connector` 就不再天然等于"这条消息的来源实例"了。
+        **到那时这里必须改成按 `envelope.instance_id` 取对应的那个**，
+        否则能力会从一个实例串到另一个实例上——而这不会报错，只会让她
+        在 A 号上看到 B 号才能做的动作。
+
+        写下这段是因为"取错号"的失败是**静默**的：提示词里多一个 `[poke:…]`
+        没有任何日志。
+        """
+        caps = getattr(self._connector, "capabilities", None)
+        if not callable(caps):
+            return None
+        try:
+            return caps()
+        except Exception:  # noqa: BLE001 - 取不到能力不该让整轮失败
+            # 能力只影响提示词**列什么**，不影响这一轮能不能跑。
+            # 取不到就按无渠道处理（fail-closed：不列做不到的动作）。
+            return None
+
     async def _run_turn(
         self,
         *,
@@ -1527,6 +1562,9 @@ class InboundBridge:
             turn_id=turn_id,
             user_text=text,
             config=effective,
+            # 这一轮所在渠道的能力声明，决定提示词能列哪些动作
+            # （`[poke:…]` 只有真的能拍的渠道才该出现）。
+            channel_capabilities=self._current_capabilities(),
             # 记忆要记下"是哪个号说的"，合并后才能无损拆分
             source_account=source_account,
             # 「当前这句是谁说的」——群里用它给最后一行署名（群名片优先）
