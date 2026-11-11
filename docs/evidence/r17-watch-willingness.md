@@ -2,7 +2,7 @@
 
 **取证日期**：2026-11-10
 **代码版本**：`d5fe3f4`（fix(media): 看视频额度用尽时会崩、路由未就绪时漏额度）
-**模型**：`hy3`（`openai_compatible`，`base_url = http://192.168.5.88:3002/v1`）
+**模型**：`hy3`（`openai_compatible`，`base_url = http://192.0.2.88:3002/v1`）
 **样本数**：23 轮真实对话（真实模型，无 mock）
 **环境**：独立 scratch 库 `ling_r17_evidence`（跑完已 drop），生产库与 `ling_test` 一行未动
 
@@ -23,7 +23,7 @@
 
 ## 为什么用这个通道
 
-ling 自己配置的供应商 `hy3gw2` 指向 `http://192.168.5.88:8080/v1`，取证当天该端点
+ling 自己配置的供应商 `hy3gw2` 指向 `http://192.0.2.88:8080/v1`，取证当天该端点
 connection refused（同主机 `:3002`/`:3000`/`:8000` 都正常，排除网络问题），且
 `hy3gw`/`hy3gw2` 的密钥在库里都是 `undecryptable`（密文由旧 root key 加密）。
 详见给 Lead 的阻塞报告。因此本次取证在 **scratch 库**里把 provider 指向同一台
