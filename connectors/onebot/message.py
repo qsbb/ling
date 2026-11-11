@@ -204,6 +204,13 @@ def build_media_segments(text: str, media_refs: list[str] | None = None) -> list
     没有真实结果却留下成功记录。
 
     文本为空时只发媒体段，不塞空 text 段（部分实现会因此报错）。
+
+    .. warning::
+
+       **这里只发 ``image`` 段**。语音条不能走这里——它会被当成一张
+       （打不开的）图片发出去，而本地回执仍然是 ``delivered``。语音走
+       ``connectors/onebot/voice.py`` 的 ``voice_segment()``，由
+       ``build_outbound_segments(voice_segments=...)`` 拼进同一条消息。
     """
     segments: list[dict] = []
     if text:
@@ -243,8 +250,9 @@ def build_outbound_segments(
     media_refs: list[str] | None = None,
     mention_ids: list[str] | None = None,
     reply_to: str | None = None,
+    voice_segments: list[dict] | None = None,
 ) -> list[dict]:
-    """构造外发消息段：@ + 文本 + 媒体。
+    """构造外发消息段：@ + 文本 + 图片 + 语音。
 
     ## 为什么要 @ 段
 
@@ -260,6 +268,16 @@ def build_outbound_segments(
     ## 顺序
 
     @ 在前、文本在中、媒体在后。人也是这样发的：先点名，再说事。
+    语音排在图片**之后**：QQ 客户端把语音条渲染成一条独立的播放控件，
+    放最后才不会把正文挤到控件下面。
+
+    ## ``media_refs`` 里为什么不能放语音
+
+    ``media_refs`` 是 ``list[str]``，**没有类型信息**。从这里构造的每一段
+    都是 ``image``——把语音的 file 值塞进来，用户收到的是一张打不开的图，
+    而本地回执仍然是 ``delivered``。语音必须由调用方用
+    ``voice.build_voice_segments()`` 显式构造成 ``record`` 段后经
+    ``voice_segments`` 传进来（见 ``connectors/onebot/voice.py`` 的说明）。
     """
     segments: list[dict] = []
     # 引用段必须在最前：平台的 reply 语义是"这条消息引用了 X"
@@ -274,4 +292,10 @@ def build_outbound_segments(
         # @ 之后垫一个空格，否则在客户端里会跟正文黏在一起
         segments.append({"type": "text", "data": {"text": " "}})
     segments.extend(build_media_segments(text, media_refs))
+    for segment in voice_segments or []:
+        # 只接受已经构造成 record 的段：任何别的类型到这里都是上游搞错了，
+        # 静默放过就会变成"图片版的语音"。
+        if str(segment.get("type") or "") != "record":
+            raise ValueError(f"voice_segments 只接受 record 段，收到 {segment.get('type')!r}")
+        segments.append(segment)
     return segments

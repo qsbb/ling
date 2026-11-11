@@ -8,6 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from connectors.onebot.voice import (
+    DEFAULT_BASE64_MAX_BYTES,
+    DEFAULT_VOICE_MAX_BYTES,
+    VoiceSendOptions,
+    VoiceTransport,
+)
+
 # OneBot 媒体（图片/语音）的默认域名白名单：QQ 图床。
 #
 # 匹配规则是 ``host == h or host.endswith("." + h)``（见
@@ -91,8 +98,49 @@ class OneBotConfig:
     # 单次媒体下载上限（字节）。超过就中断下载，**不把整个响应读进内存**。
     media_max_bytes: int = 32 * 1024 * 1024
 
+    # ---- 语音条**发送**（`connectors/onebot/voice.py`）----
+    #
+    # 为什么和 `media_max_bytes`（下载）分开：方向不同，信任也不同。
+    # 下载是"外部内容进来"，要有域名白名单；发送是"我们自己的音频出去"，
+    # 只要它别太大。
+    #
+    # **默认值选 base64**：它是唯一"不需要提前知道两边文件系统关系"的
+    # transport，跨机/跨容器部署开箱即用。代价是体积 +33%（有上限，见下）。
+    # 同机部署的大文件应显式改 `shared_file`。
+    voice_transport: VoiceTransport = VoiceTransport.base64
+    # ling 侧路径前缀 → NapCat 侧路径前缀。**只有 shared_file 用**。
+    #
+    # 留空是有意的：`file:///` 里的路径是 NapCat 所在容器/主机的路径，
+    # 不是 ling 的。同机同文件系统时看起来"一样"，跨容器时通常不同。
+    # 未配置时 shared_file 会明确报错，而不是发出一条打不开的消息。
+    voice_shared_path_from: str = ""
+    voice_shared_path_to: str = ""
+    # `base64://` 内联体积上限（字节）。见 `DEFAULT_BASE64_MAX_BYTES` 的说明。
+    voice_base64_max_bytes: int = DEFAULT_BASE64_MAX_BYTES
+    # 单个语音条大小上限（字节），三种 transport 共用。
+    voice_max_bytes: int = DEFAULT_VOICE_MAX_BYTES
+    # 短时签名 URL 的有效期（秒）。签名由外部回调提供，本层只透传。
+    voice_signed_url_ttl_seconds: int = 300
+
+    def voice_options(self) -> VoiceSendOptions:
+        """把语音发送相关的字段收成 `VoiceSendOptions`。"""
+        return VoiceSendOptions(
+            transport=self.voice_transport,
+            shared_path_from=self.voice_shared_path_from,
+            shared_path_to=self.voice_shared_path_to,
+            base64_max_bytes=self.voice_base64_max_bytes,
+            max_bytes=self.voice_max_bytes,
+            signed_url_ttl_seconds=self.voice_signed_url_ttl_seconds,
+        )
+
 
 DEFAULT_CONFIG = OneBotConfig()
 
-__all__ = ["DEFAULT_CONFIG", "DEFAULT_MEDIA_HOSTS", "OneBotConfig"]
+__all__ = [
+    "DEFAULT_CONFIG",
+    "DEFAULT_MEDIA_HOSTS",
+    "OneBotConfig",
+    "VoiceSendOptions",
+    "VoiceTransport",
+]
 

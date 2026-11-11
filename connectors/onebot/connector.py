@@ -23,6 +23,7 @@ import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 
@@ -47,6 +48,7 @@ from ling.ports.channel import (
     RecallRequest,
     ReceiptQuery,
     delivery_text_digest,
+    iter_outbound_attachments,
 )
 
 from .message import (
@@ -56,6 +58,18 @@ from .message import (
     window_ref_for,
 )
 from .settings import OneBotConfig
+from .silk import default_codec
+from .voice import (
+    SignUrl,
+    VoiceAsset,
+    VoiceSendError,
+    build_voice_file_async,
+    ensure_silk,
+    silk_tmp_root,
+    suggest_alternative,
+    voice_segment,
+    voice_summary,
+)
 
 logger = logging.getLogger("ling.connectors.onebot")
 
@@ -132,6 +146,22 @@ class OneBotV11Connector(ChannelConnector):
         # 之前端点没有鉴权也没缓存：任何能访问 6520 的人都能用它当放大器，
         # 一秒几十次地打 NapCat。缓存只是限流，不是能力——鉴权在路由层。
         self._health_cache: tuple[float, tuple[bool, str]] | None = None
+        # 语音能力（SILK 链路）的探测缓存。
+        #
+        # 为什么缓存：``capabilities()`` 会被投递层在**每条消息**上调用，
+        # 而 readiness 要查 ffmpeg 二进制 + import pysilk（一次磁盘 stat +
+        # 一次 C 扩展导入）。不缓存就是每条消息两次 syscall，30 秒一轮的
+        # worker 循环叠上来更明显。
+        #
+        # 为什么必须能失效：依赖是运维**后装**的（``apt-get install ffmpeg``、
+        # ``pip install 'ling[speech-codecs]'``）。进程启动时探一次、然后永远
+        # 记着"没有语音"，运维装完还得重启才有语音——而"为什么装了还是不能发"
+        # 是最难排查的一类问题。所以给 ``refresh_voice_readiness()`` 手动失效，
+        # 并在缓存条目里带时间戳让自动过期也能生效。
+        self._voice_ready_cache: tuple[float, tuple[bool, str]] | None = None
+        # 语音 readiness 的缓存时长：比 health 长得多。装依赖是低频操作，
+        # 而探测本身不像外呼 NapCat 那样有成本。
+        self.voice_readiness_cache_seconds = 60.0
         # 缓存有效期（秒）。探活是运维动作，10 秒的陈旧度完全够用。
         self.health_cache_seconds = 10.0
         self._health_clock = time.monotonic
@@ -215,6 +245,10 @@ class OneBotV11Connector(ChannelConnector):
         # 按它去重或对账——平台侧凭据是响应里的 ``data.message_id``。
         mentions = list(getattr(message, "mentions", None) or [])
         reply_to = getattr(message, "reply_to", None)
+        # 语音段在**构造阶段**就确定（可能是 base64 内联，几 MB），之后
+        # 两条发送路径（首次 / 去装饰重发）都用同一份：重算会读两次文件，
+        # 也可能因为签名 URL 的 TTL 在两份里不同而对不上。
+        voice_segments = await self._voice_segments_for(message)
         dropped_reply: str | None = None
         if reply_to and self._known_message_set and str(reply_to) not in self._known_message_set:
             # 只丢**引用段**，不丢正文、也不丢 @：引用是装饰，正文才是话本身。
@@ -229,6 +263,7 @@ class OneBotV11Connector(ChannelConnector):
             list(message.media_refs),
             mentions,
             reply_to,
+            voice_segments=voice_segments,
         )
 
         # 装饰段（引用 / @）被平台明确拒收时，**不能连正文一起丢掉**。
@@ -250,8 +285,14 @@ class OneBotV11Connector(ChannelConnector):
             logger.warning(
                 "装饰段被平台拒收，去掉引用/@ 重发一次（正文不丢）：%s", exc.message
             )
+            # **语音段必须跟着走**：这条路径是"去掉装饰再发一次同一条消息"，
+            # 不是"发一条更简的"。把 record 丢掉等于让一次拒收变成一次静默的
+            # 语音丢失，而回执仍记 delivered——用户什么也没收到，日志里只有
+            # 一条"已去掉引用重发"。
             params["message"] = build_outbound_segments(
-                message.text, list(message.media_refs)
+                message.text,
+                list(message.media_refs),
+                voice_segments=voice_segments,
             )
             data = await self._call(action, params)
 
@@ -296,6 +337,203 @@ class OneBotV11Connector(ChannelConnector):
             observed_at=_now(),
             detail="；".join(notes) if notes else None,
         )
+
+    async def send_voice(
+        self,
+        *,
+        window_ref: str,
+        asset: VoiceAsset,
+        is_group: bool = False,
+        sign_url: SignUrl | None = None,
+        operation_id: str | None = None,
+    ) -> DeliveryReceipt:
+        """发一条**纯语音条**（payload 里只有一个 ``record`` 段）。
+
+        .. deprecated:: 语音返工
+           **正式路径是 ``send()`` + ``OutboundMessage.attachments``** 里放一个
+           ``OutboundAttachment(kind=AttachmentKind.audio, ref=<本地路径>)``。
+           ``send()`` 会做同样的 SILK 转换、同样的单条 payload 保证，而且
+           走投递层（有计划幂等、节奏、能力检查、operation 落库）。
+
+           保留这个方法是为了**过渡期**：SP07 编排层还没接 ``send()`` 的
+           类型化附件路径，现在删掉会让语音完全发不出去。等那边接上之后再删。
+
+          两者不冲突的原因：``send()`` 保证「一个消息最多一个 audio 附件」，
+          所以两条路产出的 payload 是**同一个形状**（一个 record 段）。
+          区别只在 ``send()`` 会额外带一个空 text 占位段（既有
+          ``build_media_segments`` 行为），而这里不带。
+
+        ## 为什么当初是独立方法而不是 ``send(media_refs=[...])``
+
+        ``OutboundMessage.media_refs`` 是 ``list[str]``，构造出来的每一段都是
+        ``image``。语音塞进去 = 用户收到一张打不开的图 + 本地回执
+        ``delivered``。类型信息必须**显式**传，不能靠扩展名猜。
+        （后来 SP00 用 ``attachments`` 解决了这个问题，所以现在能用
+        ``media_refs`` 之外的类型化路径。）
+
+        而且语音条通常**不带正文**：``{"type":"text","data":{"text":""}}``
+        这种空 text 段一部分实现会报错。这里直接不塞 text 段。
+
+        ## 回执语义与 ``send`` 一致
+
+        ``retcode=0`` 且拿到 ``message_id`` 才是 ``delivered``；平台回了成功
+        但没给 id 记 ``uncertain``（进对账）。**绝不**因为"请求没抛异常"
+        就记已送达。
+
+        ## 失败一律抛 ``VoiceSendError`` / ``ChannelError``
+
+        不回退成图片、不回退成文本、不截断。caller 要么展示"语音没发出去 + 原因"，
+        要么自己决定降级成文字——那是**它**的决定，不是连接器偷偷做的。
+        """
+        options = self._config.voice_options()
+        # 构造 `file` 值（可能要读文件、可能要 await 签名）。失败发生在
+        # **任何网络动作之前**：没拿到可用 file 就一个字都不发。
+        #
+        # ## 为什么这里要先 ensure_silk 再调 build
+        #
+        # `build_voice_file_async` 内部**也会**调 `ensure_silk`（保证每个
+        # transport 都拿到 SILK），但它不返回临时目录——清理得由调用方做。
+        # 所以这里先转一次拿到句柄，把转好的 asset 交给 build，最后无论成功
+        # 还是失败都删临时文件。
+        #
+        # 不这么做的后果很实在：每发一条语音就在 /tmp 留一个目录，长期跑下来
+        # 会把容器磁盘填满，而且是**静默**的（日志里没有任何错误）。
+        silk_handle = ensure_silk(asset, tmp_root=silk_tmp_root(options))
+        try:
+            file_value = await build_voice_file_async(
+                silk_handle.asset, options, sign_url=sign_url
+            )
+            asset = silk_handle.asset
+            size = asset.size_bytes()
+            if size > options.max_bytes:
+                # 路径/URL 形态不占 JSON 体积，但超大音频在 QQ 侧仍会被拒或
+                # 转码失败。早点拒绝，别让它走到平台再变成一句含糊的错误。
+                raise VoiceSendError(
+                    "too_large",
+                    f"{asset.display_name()} 大小 {size} 字节，超过语音上限 "
+                    f"{options.max_bytes} 字节。{suggest_alternative(options)}",
+                    transport=options.transport.value,
+                )
+            if is_group:
+                action = "send_group_msg"
+                params: dict = {"group_id": self._target_id(window_ref)}
+            else:
+                action = "send_private_msg"
+                params = {"user_id": self._target_id(window_ref)}
+            segment = voice_segment(file_value)
+            # **一个语音条 = 一个 part**：message 里只有这一个 record。
+            params["message"] = [segment]
+            logger.info("发送语音：%s", voice_summary(asset, options))
+            data = await self._call(action, params)
+
+            platform_message_id = None
+            if isinstance(data, dict):
+                mid = data.get("message_id")
+                if mid is not None:
+                    platform_message_id = str(mid)
+            notes = [voice_summary(asset, options)]
+            if platform_message_id is None:
+                notes.append("平台未返回 message_id（语音提交结果无法确认，进对账）")
+            return DeliveryReceipt(
+                receipt_id=new_id("rcpt"),
+                operation_id=operation_id or new_id("op"),
+                channel=self.connector_id,
+                state=(
+                    DeliveryState.delivered
+                    if platform_message_id
+                    else DeliveryState.uncertain
+                ),
+                platform_message_id=platform_message_id,
+                observed_at=_now(),
+                detail="；".join(notes),
+            )
+        finally:
+            # **无论成功失败都清临时文件。** 不清理的后果是每发一条语音就在
+            # /tmp 留一个目录，长期跑把容器磁盘填满——而且是静默的，日志里
+            # 没有任何错误。放在 finally 而不是成功分支，因为失败路径留下的
+            # 临时文件更没价值。
+            silk_handle.cleanup()
+
+    async def _voice_segments_for(self, message: OutboundMessage) -> list[dict]:
+        """从**类型化附件**里取出语音，转成 ``record`` 段。
+
+        ## 为什么不再用 ``getattr(message, "voice_segments")``
+
+        那是 SP00 定稿前的临时契约（``OutboundMessage`` 那时还没有类型化附件）。
+        现在 ``OutboundMessage.attachments`` 是正式字段，再留一条
+        ``getattr`` 通道就是**第二条不设防的路**：它绕过附件类型检查，
+        任何能往对象上挂属性的地方都能偷偷塞一个语音段进来。
+
+        ## 一个消息最多一个语音条
+
+        「一个语音条 = 一个 payload」在这里是**结构性**保证的，不靠运行时
+        侥幸：多于一个 audio 附件直接报错。
+
+        为什么不是"循环发 N 次"：``send()`` 的契约是**一次调用 = 一次
+        ``_call`` = 一个 ``platform_message_id``**。循环发 N 次却只有一个
+        回执 id，意味着另外 N-1 条的回执只能塞进人类可读的 ``detail``
+        字符串里——以后对账要再解析它，那是技术债。多段语音由上游拆成
+        多条消息（各自有独立 ``part_ordinal``），与 ``kernel/bridge.py``
+        已经按 part 循环投递的设计一致（§17.5：一条语音、零附带正文）。
+        """
+        audios = [
+            attachment
+            for attachment in iter_outbound_attachments(message)
+            if attachment.modality is Modality.audio
+        ]
+        if not audios:
+            return []
+        if len(audios) > 1:
+            # 错误信息要说**怎么做**，不是只说"参数错误"。
+            raise ChannelError(
+                ChannelErrorKind.rejected,
+                f"一个 OutboundMessage 只能带一个语音附件，收到 {len(audios)} 个。"
+                "多条语音请拆成多条消息（各自有独立的 part_ordinal）："
+                "OneBot 的每条语音必须是独立的一次 send，"
+                "否则 N 条语音只会有 1 个 message_id，其余无法对账",
+            )
+        return await self._build_voice_segment(audios[0], message)
+
+    async def _build_voice_segment(
+        self, attachment: object, message: OutboundMessage
+    ) -> list[dict]:
+        """把一个 audio 附件变成 ``[record 段]``。
+
+        ``ref`` 的三种形态都走同一套 transport（见 ``voice.py``）：
+        本地路径、``base64://``、``http(s)://``。其中只有本地路径能被我们
+        转成 SILK——远程 URL 若已是 SILK，平台能直接用；不是 SILK 则明确失败
+        （见 ``ensure_silk``），绝不把 mp3 的 URL 发出去让它去转码。
+        """
+        ref = str(getattr(attachment, "ref", "") or "").strip()
+        if not ref:
+            raise ChannelError(
+                ChannelErrorKind.rejected,
+                "语音附件的 ref 为空（需要本地路径、base64:// 或 http(s):// URL）",
+            )
+        options = self._config.voice_options()
+        if ref.startswith("base64://"):
+            # 调用方已经把字节编好了（少见：通常是本地路径）。
+            # 这里不重新编码——无法确认那串字节是不是 SILK，而"看起来能发"
+            # 正是最危险的状态。要求调用方给本地文件，语义才明确。
+            raise ChannelError(
+                ChannelErrorKind.rejected,
+                "语音附件的 ref 不支持 base64:// 形态：连接器需要本地文件才能"
+                "校验/转成 SILK。请给本地路径，或用 send_voice(asset=...)",
+            )
+        asset = VoiceAsset(path=Path(ref), mime_type="audio/silk", name=Path(ref).name)
+        return [voice_segment(await build_voice_file_async(asset, options))]
+
+    def build_voice_segments(
+        self, asset: VoiceAsset, *, sign_url: SignUrl | None = None
+    ) -> list[dict]:
+        """给 ``OutboundMessage.voice_segments`` 用的同步版构造。
+
+        ``signed_url`` transport 需要 ``await``，这种情况调用方应该直接用
+        ``send_voice`` 或 ``voice.build_voice_segments_async``。
+        """
+        from .voice import build_voice_segments as _build
+
+        return _build(asset, self._config.voice_options(), sign_url=sign_url)
 
     def _remember_unidentified(self, message: OutboundMessage) -> None:
         """记住"发出去了但平台没给 id"的那一条，供同进程的对账补 id 用。
@@ -1121,6 +1359,27 @@ class OneBotV11Connector(ChannelConnector):
         return [text[i : i + limit] for i in range(0, len(text), limit)]
 
     def capabilities(self) -> CapabilityDescriptor:
+        """渠道能力声明。
+
+        ## 语音能力必须**实测**过才声明
+
+        ``supports_media`` 是一个笼统的 bit，而 ``media_supported()`` 在
+        ``supported_media is None`` 时**只把 audio 判成不支持**（见
+        ``contracts/v1.py:808``）。所以想让语音通过投递层的检查，必须显式
+        在 ``supported_media`` 里列出 ``Modality.audio``。
+
+        但**不能无条件列**：发语音需要 ffmpeg（解码/重采样）+ pysilk
+        （编码），缺一样就发不出去。无条件声明等于让投递层放行、然后连接器
+        报错——用户看到的是"她试着说话但失败了"，而不是"这个渠道不支持语音"。
+        这正是 §17.6 点名的"用总 supports_media 宣称已支持语音"。
+
+        所以：**readiness 通过才声明 audio**，并把原因记在
+        :meth:`voice_readiness` 里供运维查"为什么没有语音"。
+        """
+        ready, _reason = self.voice_readiness()
+        supported_media = [Modality.image]
+        if ready:
+            supported_media.append(Modality.audio)
         return CapabilityDescriptor(
             capability_id=self.connector_id,
             version="11",
@@ -1128,6 +1387,9 @@ class OneBotV11Connector(ChannelConnector):
             supports_private=True,
             supports_group=self._config.supports_group,
             supports_proactive=self._config.supports_proactive,
+            # 细分的媒体能力：让"能发图"与"能发语音"分开。audio 只在
+            # SILK 链路实测就绪时出现，见上面的 docstring。
+            supported_media=supported_media,
             supports_media=self._config.supports_media,
             # OneBot V11 有 ``delete_msg``（NapCat/Lagrange/go-cqhttp 都实现）。
             # 具体能不能撤、撤多久以内，由平台在调用时回答——这里只声明
@@ -1137,6 +1399,60 @@ class OneBotV11Connector(ChannelConnector):
             receipt_reliability="best_effort",
             enabled=bool(self._config.api_base),
         )
+
+    def voice_readiness(self) -> tuple[bool, str]:
+        """能不能**真的**发一条语音条；返回 (可用, 不可用原因)。
+
+        ## 这里查什么
+
+        语音链路要三样东西同时就位：``ffmpeg``（解码+重采样）、``pysilk``
+        （编码）、以及一个可用的 transport 配置。少任何一样，发出去就会
+        在连接器这一层失败——所以能力声明必须以它为准。
+
+        ## 为什么是"查依赖"而不是"编一个试试"
+
+        真正的自检（编一个 100ms 正弦）在 ``silk.SilkCodec.selftest()`` 里，
+        它要跑一次完整的解码+编码，代价是几十毫秒。``capabilities()`` 会被
+        投递层**每条消息**调用一次，不能在那里跑真实编码。
+
+        所以分工是：``capabilities()`` 用这里（廉价、缓存）；部署自检/运维
+        命令用 ``selftest()``（真实、贵）。§17.3 要求"真实编码一个 fixture，
+        不能仅 which ffmpeg"——那条要求对应的是自检入口，不是每次能力查询。
+
+        ## 返回的原因要能指导操作
+
+        运维要能回答"为什么这个渠道没有语音"。所以原因里要指出缺什么、
+        怎么装，而不是一句"语音不可用"。
+        """
+        now = self._health_clock()
+        cached = self._voice_ready_cache
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        result = self._probe_voice_readiness()
+        self._voice_ready_cache = (now + self.voice_readiness_cache_seconds, result)
+        if not result[0]:
+            logger.info("语音能力未就绪（不声明 audio）：%s", result[1])
+        return result
+
+    def refresh_voice_readiness(self) -> tuple[bool, str]:
+        """丢掉缓存重新探测。
+
+        **给运维用**：依赖是后装的（``apt-get install ffmpeg``、
+        ``pip install 'ling[speech-codecs]'``）。不提供这个入口，运维装完之后
+        只能重启进程才能拿到语音能力，而"装好了还是不能发"是最难查的一类问题。
+        """
+        self._voice_ready_cache = None
+        return self.voice_readiness()
+
+    def _probe_voice_readiness(self) -> tuple[bool, str]:
+        """实际探测（不含缓存）。"""
+        if not self._config.supports_media:
+            return False, "配置里 supports_media=False（这个渠道没有开通媒体发送）"
+        codec = default_codec()
+        ok, reason = codec.readiness()
+        if not ok:
+            return False, reason
+        return True, ""
 
     async def health(self) -> tuple[bool, str]:
         """探活：``get_login_info`` 是最轻的可用性探测。

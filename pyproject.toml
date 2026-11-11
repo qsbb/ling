@@ -33,6 +33,9 @@ dependencies = [
   # 动图拆帧（domains/media/describe.py）。视觉接口对 GIF 通常只取第一帧，
   # 而第一帧经常是片头/黑场——不拆帧就会出现"她看了动图说这是黑色图片"。
   "pillow>=10,<14",
+  # FishAudio TTS 的请求体是 msgpack（`Content-Type: application/msgpack`），
+  # 不是 JSON——见 `models/fish_audio.py`。纯 Python，无编译依赖。
+  "msgpack>=1.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +47,36 @@ dev = [
   "ruff>=0.6,<1",
   "mypy>=1.11,<2",
 ]
+# SILK 编解码：**只有 OneBot/NapCat 语音条发送需要**，所以做成可选 extra。
+#
+# ## 为什么不是主依赖
+#
+# 不装它项目照常跑（只是没有 OneBot 语音条发送能力）；装上才有。C 扩展塞进
+# 主依赖会让所有部署都被迫下载它，而 Web、qqbot、微信这些渠道根本用不到
+# SILK（§17.3："绝不把所有渠道都喂 SILK"）。
+#
+# ## 为什么是 pysilk-mod 而不是 pysilk
+#
+# `pysilk`（PyPI 上 0.0.1）是个**空壳包**：646 字节的 sdist，`setup.py` 里
+# `packages=[]`，没有任何源码，装了也 import 不出来（2026-11-11 下载核实）。
+# `pysilk-mod` 才是真正打包了编解码器的那个：预编译 wheel 覆盖
+# cp38–cp313 / manylinux x86_64+aarch64 / macOS / Windows，零运行时依赖，
+# 不需要用户机器有编译器。
+#
+# ## 许可提示
+#
+# `pysilk-mod` 内部打包的是**腾讯 SILK SDK 的二进制**，PyPI metadata 只写
+# "see LICENSE"。本项目是 AGPL-3.0-or-later；把它做成**可选 extra + 可替换
+# 实现**（`connectors/onebot/silk.py` 的 `SilkEncoder` 协议）就是为了让部署方
+# 自行决定是否接受该依赖，换实现不需要改上层任何代码。
+#
+# ## 光有它还不够
+#
+# 解码与**真重采样**到 24 kHz 走 `ffmpeg`（镜像需 `apt-get install ffmpeg`，
+# 见 deploy/Dockerfile.api）。缺任何一半都会明确报错并给安装指引，绝不降级
+# 发原始 wav/mp3——NapCat 收到非 SILK 会去调宿主机上不存在的
+# `ntsilk_s16le` muxer，用户一条语音都收不到。
+speech-codecs = ["pysilk-mod>=1.6.4,<2"]
 # 本地开发/CI 使用的便携 PostgreSQL（无 Docker 时的真实数据库测试）
 # 便携 PostgreSQL 由 scripts/dev_pg.sh 在 Python 3.11 侧 venv 安装（pgserver 无 cp313 wheel）
 
