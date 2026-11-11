@@ -25,6 +25,29 @@ is_group=":group:" in str(window.title or "")
 
 `kernel/visibility.py::is_group_visibility` 是**唯一判据**：
 接受枚举或裸字符串（库里是 `String(32)`），`None`/未知值 fail-closed 到 `False`。
+
+## ⚠️ 这四条挂了，先看是不是前置闸
+
+`resolve_recall_target` 里除了群聊判定，还有**前四道闸**（归属 / 已送达 /
+时间窗 / 频次，见它的 docstring）。其中"已送达"要求 `operations` 里有一行
+`kind="delivery"` 且 `payload.reply_plan` 对得上，还要有一条
+`delivery_receipts`。本文件的 `_seed` 把这几张表都造齐了。
+
+**之所以用真表而不是 mock**：归属核对查的就是这两张表，mock 掉等于把要验的
+前置条件替换掉了——那会让这四条变成"测我自己的 mock"。
+
+**但代价是**：将来任何人改动那几道闸，这四条会**一起红**，而报错是
+`no_receipt` / `not_delivered` / `expired`，**不是**"群聊判定错了"。
+所以看到这四条同时失败时，**先按报错的 `code` 判断是前置闸还是判据**：
+
+| 报错 code | 含义 | 该看哪 |
+|---|---|---|
+| `no_receipt` / `not_delivered` / `expired` / `rate_limited` / `not_found` | 前置闸没过 | `_seed` 是否还满足新前置条件 |
+| 断言 `is False` / `is True` 失败 | **判据本身错了** | `recall.py` 的 `is_group=` 那行 |
+
+判据本身只有 `test_private_visibility_wins_over_group_like_title`（第 2 条）
+有能力抓到——把 `is_group=` 改回 `":group:" in title` 时，只有它会红
+（实测：1 failed, 3 passed）。
 """
 
 from __future__ import annotations
