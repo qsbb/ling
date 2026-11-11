@@ -39,6 +39,7 @@ from sqlalchemy import select
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.infra.models import DEFAULT_INSTANCE_ID
 from ling.infra.security import new_id
 from ling.settings import connector_fields as cf
 from ling.settings import connector_overrides as ov
@@ -273,6 +274,7 @@ async def _current_effective(
     session: AsyncSession,
     *,
     scope: str,
+    instance_id: str = DEFAULT_INSTANCE_ID,
     settings: object | None,
     onebot: object | None,
     qqbot: object | None,
@@ -282,6 +284,7 @@ async def _current_effective(
     resolved = await ov.resolve_field_values(
         session,
         scope=scope,
+        instance_id=instance_id,
         settings=settings,
         onebot=onebot,
         qqbot=qqbot,
@@ -350,25 +353,39 @@ class ConnectorConfigService:
         change: ChangeRequest,
         expected_generation: int | None,
         actor_id: str | None,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> ActivationResult:
         """执行一次保存。返回终态（active / unchanged / rolled_back / degraded）。
 
         ``expected_generation`` 是 ``If-Match``；``None`` 表示调用方没带
         （只在内部重试路径里允许，HTTP 入口一律要求带）。
+
+        ``instance_id`` 是**实例身份**（``connector_instances`` 的主键列），
+        不是 actor 命名空间。它决定这次保存写进哪个实例的修订链、动哪个实例
+        的 HEAD 指针与 generation。默认值 ``'default'``——存量单实例部署与
+        升级前行为完全一致。
+
+        实例是否**存在且未软删**由调用方先 ``require_live`` 保证：服务层不
+        依赖目录表的具体实现。这里只保证"传进来的 id 被原样用于全部读写"，
+        **不会**在查不到时退回默认实例——静默退回会造成"保存到实例 B，结果
+        覆盖了默认实例"，而写入方看不到任何错误。
         """
         started_at = self._clock()
         # operation_id 就是候选修订 id：一次保存一个 id，客户端拿它轮询，
         # 不必再建一张 operation 表（v1 不做独立操作历史）。
         operation_id = new_id("crev")
 
-        # ② 串行化：同一 scope 一次只允许一个写入者。锁随事务释放。
+        # ② 串行化：同一**实例**一次只允许一个写入者。锁随事务释放。
+        #
+        # 锁键必须带实例：`generation` 是每实例递增的，两个实例的保存互不
+        # 相干。只按 scope 锁会让它们互相排队，且掩盖"其实不需要互斥"这件事。
         await session.execute(
             sql_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-            {"k": f"connector:{scope}"},
+            {"k": f"connector:{scope}:{instance_id}"},
         )
-        from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead
+        from ling.infra.models import ConnectorConfigHead
 
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         generation = int(getattr(head, "generation", 0) or 0)
         candidate_id = getattr(head, "candidate_revision_id", None)
         if candidate_id:
@@ -388,6 +405,7 @@ class ConnectorConfigService:
         current_values, _gen, active_revision_id = await _current_effective(
             session,
             scope=scope,
+            instance_id=instance_id,
             settings=self._settings,
             onebot=self._onebot,
             qqbot=self._qqbot,
@@ -398,7 +416,11 @@ class ConnectorConfigService:
         #    以 env 为底会把"上一版 DB 覆盖"一起丢掉，表现是"只改了一项，
         #    别的项悄悄回到 env"。
         overrides = await ov.read_override_values(
-            session, scope=scope, box=self._box, include_secrets=True
+            session,
+            scope=scope,
+            instance_id=instance_id,
+            box=self._box,
+            include_secrets=True,
         )
         merged = dict(overrides)
         for key in change.clear_keys:
@@ -458,6 +480,7 @@ class ConnectorConfigService:
         revision_id = await self._write_candidate(
             session,
             scope=scope,
+            instance_id=instance_id,
             revision_id=operation_id,
             parent_id=active_revision_id,
             merged=merged,
@@ -485,6 +508,7 @@ class ConnectorConfigService:
             await self._mark_failed(
                 session,
                 scope=scope,
+                instance_id=instance_id,
                 revision_id=revision_id,
                 outcome=outcome,
                 state=STATE_ROLLED_BACK if outcome.error_code != "rollback_failed" else STATE_DEGRADED,
@@ -514,6 +538,7 @@ class ConnectorConfigService:
         await self._mark_active(
             session,
             scope=scope,
+            instance_id=instance_id,
             revision_id=revision_id,
             generation=generation + 1,
             operation_id=operation_id,
@@ -605,9 +630,9 @@ class ConnectorConfigService:
         parent_id: str | None,
         merged: dict[str, Any],
         actor_id: str | None,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> str:
         from ling.infra.models import (
-            DEFAULT_INSTANCE_ID,
             ConnectorConfigHead,
             ConnectorConfigRevision,
             ConnectorOverrideValue,
@@ -618,13 +643,10 @@ class ConnectorConfigService:
             ConnectorConfigRevision(
                 id=revision_id,
                 scope=scope,
-                # 本轮（数据层）**刻意不传 instance_id**，靠模型的
-                # `default=DEFAULT_INSTANCE_ID` 落到默认实例——等价于升级前
-                # "每 scope 一份配置"的行为。
-                #
-                # 下一阶段（服务层接多实例）必须在这里接收实例参数并传进来，
-                # 否则**所有实例的配置都会写进默认实例**，而写入方不会报错，
-                # 只会在读取时表现为"另一个实例的配置被覆盖了"。
+                # 实例维度**必须显式传**：模型的 `default=DEFAULT_INSTANCE_ID`
+                # 只在"单实例时代"是对的。漏传的后果不是报错，而是**所有实例
+                # 的配置都写进默认实例**，表现为"另一个实例的配置被覆盖了"。
+                instance_id=instance_id,
                 parent_id=parent_id,
                 state=STATE_PENDING,
                 created_by=actor_id,
@@ -662,13 +684,13 @@ class ConnectorConfigService:
             )
             session.add(row)
 
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         if head is None:
             # 显式写 instance_id 而不是靠模型默认值：这行代码的语义就是
-            # "给默认实例建指针"，写出来读的人不用翻模型定义才知道建的是哪个实例。
+            # "给这个实例建指针"，写出来读的人不用翻模型定义才知道建的是哪个实例。
             head = ConnectorConfigHead(
                 scope=scope,
-                instance_id=DEFAULT_INSTANCE_ID,
+                instance_id=instance_id,
                 generation=0,
                 updated_at=now,
             )
@@ -687,9 +709,9 @@ class ConnectorConfigService:
         generation: int,
         operation_id: str,
         health: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> None:
         from ling.infra.models import (
-            DEFAULT_INSTANCE_ID,
             ConnectorConfigHead,
             ConnectorConfigRevision,
             ConnectorRuntimeAck,
@@ -703,7 +725,7 @@ class ConnectorConfigService:
         revision.activated_at = now
         revision.error_code = None
         revision.error_safe = None
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         if head is not None:
             head.active_revision_id = revision_id
             head.candidate_revision_id = None
@@ -713,17 +735,14 @@ class ConnectorConfigService:
             await session.execute(
                 select(ConnectorRuntimeAck).where(
                     ConnectorRuntimeAck.scope == scope,
+                    # 实例维度必须带上：唯一键已经不会让两个实例的第 N 代
+                    # 互相冲突，但**不带它的 select 仍会跨实例命中**——表现是
+                    # 实例 B 的 ACK 更新了实例 A 那一行（health 被改写），
+                    # 且不报错。这与报告 R6 是同一个故障，只是位置从约束挪到
+                    # 了查询。
+                    ConnectorRuntimeAck.instance_id == instance_id,
                     ConnectorRuntimeAck.generation == generation,
                     ConnectorRuntimeAck.replica_id == self._replica_id,
-                    # 本轮（数据层）加了 `instance_id` 列与唯一键，但**这条查询
-                    # 还没带实例维度**——等价于"整条 scope 只有一个实例"，
-                    # 与升级前行为一致。
-                    #
-                    # 下一阶段必须补上 `ConnectorRuntimeAck.instance_id == ...`：
-                    # 唯一键已经不会让两个实例的第 N 代互相冲突了，但这条
-                    # `select` 仍会**跨实例命中**，表现为实例 B 的 ACK 更新了
-                    # 实例 A 那一行（health 被改写），且不报错。
-                    # 这与报告 R6 是同一个故障，只是位置从约束挪到了查询。
                 )
             )
         ).scalar_one_or_none()
@@ -732,6 +751,7 @@ class ConnectorConfigService:
                 ConnectorRuntimeAck(
                     id=new_id("cack"),
                     scope=scope,
+                    instance_id=instance_id,
                     generation=generation,
                     replica_id=self._replica_id,
                     phase="activated",
@@ -760,9 +780,9 @@ class ConnectorConfigService:
         revision_id: str,
         outcome: SwapOutcome,
         state: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> None:
         from ling.infra.models import (
-            DEFAULT_INSTANCE_ID,
             ConnectorConfigHead,
             ConnectorConfigRevision,
         )
@@ -776,7 +796,7 @@ class ConnectorConfigService:
                 outcome.error_safe
                 or SAFE_ERRORS.get(str(outcome.error_code), SAFE_ERRORS["connector_start_failed"])
             )
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         if head is not None:
             # head 仍指向旧 active 修订；只清掉候选指针。
             head.candidate_revision_id = None

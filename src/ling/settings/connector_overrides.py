@@ -40,6 +40,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# 顶层导入：`instance_id` 现在是函数签名的默认值，不能再等到函数体内
+# 才 import。`infra.models` 不 import 本模块，所以这里不会形成环。
+from ling.infra.models import DEFAULT_INSTANCE_ID
 from ling.settings import connector_fields as cf
 
 logger = logging.getLogger("ling.settings.connector_overrides")
@@ -132,14 +135,18 @@ class ResolvedConnectorConfig:
 # ---------------------------------------------------------------- 读覆盖
 
 
-async def _head_row(session: AsyncSession, scope: str) -> Any:
-    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead
+async def _head_row(
+    session: AsyncSession, scope: str, instance_id: str = DEFAULT_INSTANCE_ID
+) -> Any:
+    from ling.infra.models import ConnectorConfigHead
 
-    return await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+    return await session.get(ConnectorConfigHead, (scope, instance_id))
 
 
-async def active_generation(session: AsyncSession, scope: str) -> int:
-    row = await _head_row(session, scope)
+async def active_generation(
+    session: AsyncSession, scope: str, instance_id: str = DEFAULT_INSTANCE_ID
+) -> int:
+    row = await _head_row(session, scope, instance_id)
     return int(getattr(row, "generation", 0) or 0)
 
 
@@ -147,6 +154,7 @@ async def read_override_values(
     session: AsyncSession,
     *,
     scope: str,
+    instance_id: str = DEFAULT_INSTANCE_ID,
     box: object | None = None,
     include_secrets: bool = False,
     revision_id: str | None = None,
@@ -155,15 +163,17 @@ async def read_override_values(
 
     ``include_secrets=False`` 时**不解密**：返回的密钥项只有 ``preview`` 与
     指纹，``plain_value`` 为 ``None``。这是给 GET / 审计用的形状。
+
+    ``revision_id`` 为空时按 ``(scope, instance_id)`` 找当前 active 修订。
+    实例参数默认 ``'default'``：单实例部署与升级前行为一致。
     """
     from ling.infra.models import (
-        DEFAULT_INSTANCE_ID,
         ConnectorConfigHead,
         ConnectorOverrideValue,
     )
 
     if revision_id is None:
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         revision_id = getattr(head, "active_revision_id", None)
     if not revision_id:
         return {}
@@ -328,6 +338,7 @@ async def resolve_field_values(
     session: AsyncSession,
     *,
     scope: str,
+    instance_id: str = DEFAULT_INSTANCE_ID,
     settings: object | None = None,
     onebot: object | None = None,
     qqbot: object | None = None,
@@ -343,12 +354,16 @@ async def resolve_field_values(
     specs = cf.fields_for(scope)
     overrides = (
         await read_override_values(
-            session, scope=scope, box=box, include_secrets=include_secrets
+            session,
+            scope=scope,
+            instance_id=instance_id,
+            box=box,
+            include_secrets=include_secrets,
         )
         if use_overrides
         else {}
     )
-    head = await _head_row(session, scope)
+    head = await _head_row(session, scope, instance_id)
     resolved = ResolvedConnectorConfig(
         generation=int(getattr(head, "generation", 0) or 0),
         active_revision_id=getattr(head, "active_revision_id", None),

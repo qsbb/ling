@@ -19,7 +19,7 @@ from ling.contracts.v1 import (
     ConnectorView,
     ErrorCode,
 )
-from ling.infra.models import utcnow
+from ling.infra.models import DEFAULT_INSTANCE_ID, utcnow
 from ling.ports.config import (
     BindingMode,
     EffectiveConfig,
@@ -826,6 +826,254 @@ def _connector_service(request: Request, auth: object, session: AsyncSession):  
     )
 
 
+# ------------------------------------------------------------------ 实例目录
+#
+# 路径挂在 `/settings/connectors/{scope}/instances` 下，而不是另起一个
+# `/settings/connector-instances`：实例**只在 scope 内存在**（主键是
+# (scope, instance_id)），把 scope 放进前缀后，路径本身就是那个命名空间，
+# 不会出现"列表里某行的 scope 和路径里的 scope 不一致"这种形状。
+#
+# 用 POST/非 PUT 的语义：创建是原语（不幂等），改名走 PUT 在子资源上。
+
+
+class ConnectorInstanceCreateBody(BaseModel):
+    display_name: str = Field(min_length=1, max_length=64)
+    #: 不给就按显示名派生（中文名派生不出时用随机后缀）。**建后不可变**。
+    instance_id: str | None = Field(default=None, min_length=1, max_length=16)
+    enabled: bool = True
+
+
+class ConnectorInstanceRenameBody(BaseModel):
+    display_name: str = Field(min_length=1, max_length=64)
+
+
+class ConnectorInstanceEnabledBody(BaseModel):
+    enabled: bool
+
+
+def _instance_error(exc: object) -> LingError:
+    """实例目录错误 → ``LingError``。
+
+    ``ErrorCode`` 是受控枚举，不加新值：404 映射 ``not_found``，其余冲突
+    （重名 / 已删 / 默认实例受保护）映射 ``conflict``，具体原因放 ``detail``。
+    """
+    status_code = int(getattr(exc, "status_code", 422))
+    code = {
+        404: ErrorCode.not_found,
+        409: ErrorCode.conflict,
+    }.get(status_code, ErrorCode.invalid_request)
+    return LingError(
+        code,
+        str(getattr(exc, "message", str(exc))),
+        status_code=status_code,
+        detail=str(getattr(exc, "code", "")),
+        field=getattr(exc, "name", None),
+    )
+
+
+def _require_instance_scope(scope: str) -> None:
+    from ling.settings import connector_fields as cf
+
+    if not cf.is_known_scope(scope):
+        raise LingError(ErrorCode.not_found, "没有这个接入器", status_code=404)
+
+
+@router.get("/settings/connectors/{scope}/instances")
+async def list_connector_instances(
+    scope: str,
+    auth: CurrentAuth,
+    session: DbSession,
+    include_deleted: bool = False,
+) -> dict[str, object]:
+    """列出某个接入器下的实例。
+
+    默认**不含已软删的**：实例选择器不该出现已经删掉的名字。
+    ``?include_deleted=true`` 用于"历史配置还能查"的那条路径。
+
+    必须鉴权：实例名本身是部署指纹（"她挂了哪几个号"）。
+    """
+    from ling.settings.connector_instances import ConnectorInstanceService, instance_view
+
+    _require_instance_scope(scope)
+    rows = await ConnectorInstanceService(session).list_instances(
+        scope=scope, include_deleted=include_deleted
+    )
+    return {
+        "schema_version": "v1",
+        "scope": scope,
+        "items": [instance_view(row) for row in rows],
+        "include_deleted": include_deleted,
+    }
+
+
+@router.post("/settings/connectors/{scope}/instances", status_code=201)
+async def create_connector_instance(
+    scope: str,
+    body: ConnectorInstanceCreateBody,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """建一个实例（owner only）。
+
+    **真的建行**：``connector_instances`` 里会出现 ``(scope, instance_id)``。
+    建完之后就可以拿这个 ``instance_id`` 去 ``PUT /settings/connectors/{scope}
+    ?instance_id=...`` 保存配置——配置保存路径认的就是它。
+
+    同 scope 下显示名重复 → 409 ``duplicate_display_name``（**不是 500**）。
+    """
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+        instance_view,
+    )
+
+    _require_connector_write_guards(request, auth)
+    _require_instance_scope(scope)
+    service = ConnectorInstanceService(session)
+    try:
+        row = await service.create(
+            scope=scope,
+            display_name=body.display_name,
+            instance_id=body.instance_id,
+            enabled=body.enabled,
+            created_by=str(getattr(getattr(auth, "user", None), "subject_id", "") or None),
+        )
+    except ConnectorInstanceError as exc:
+        raise _instance_error(exc) from exc
+    await session.commit()
+    audit_event(
+        "connector_instance_created",
+        actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+        target_type="connector_instance",
+        target_id=f"{scope}/{row.instance_id}",
+        attributes={"scope": scope, "instance_id": row.instance_id},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"schema_version": "v1", "item": instance_view(row)}
+
+
+@router.put("/settings/connectors/{scope}/instances/{instance_id}")
+async def rename_connector_instance(
+    scope: str,
+    instance_id: str,
+    body: ConnectorInstanceRenameBody,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """改显示名。**实例身份不变**——改的是 ``display_name``，不是 ``instance_id``。"""
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+        instance_view,
+    )
+
+    _require_connector_write_guards(request, auth)
+    _require_instance_scope(scope)
+    service = ConnectorInstanceService(session)
+    try:
+        row = await service.rename(
+            scope=scope, instance_id=instance_id, display_name=body.display_name
+        )
+    except ConnectorInstanceError as exc:
+        raise _instance_error(exc) from exc
+    await session.commit()
+    audit_event(
+        "connector_instance_renamed",
+        actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+        target_type="connector_instance",
+        target_id=f"{scope}/{instance_id}",
+        attributes={"scope": scope, "instance_id": instance_id},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"schema_version": "v1", "item": instance_view(row)}
+
+
+@router.put("/settings/connectors/{scope}/instances/{instance_id}/enabled")
+async def set_connector_instance_enabled(
+    scope: str,
+    instance_id: str,
+    body: ConnectorInstanceEnabledBody,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """启用/停用。软删过的实例**不能**再启用（409 ``instance_deleted``）。
+
+    停用**不动**已保存的配置与修订链：它表达的是"这个实例现在不参与运行"，
+    而不是"忘掉它的配置"。
+    """
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+        instance_view,
+    )
+
+    _require_connector_write_guards(request, auth)
+    _require_instance_scope(scope)
+    service = ConnectorInstanceService(session)
+    try:
+        row = await service.set_enabled(
+            scope=scope, instance_id=instance_id, enabled=body.enabled
+        )
+    except ConnectorInstanceError as exc:
+        raise _instance_error(exc) from exc
+    await session.commit()
+    audit_event(
+        "connector_instance_toggled",
+        actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+        target_type="connector_instance",
+        target_id=f"{scope}/{instance_id}",
+        attributes={"scope": scope, "instance_id": instance_id, "enabled": bool(body.enabled)},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"schema_version": "v1", "item": instance_view(row)}
+
+
+@router.delete("/settings/connectors/{scope}/instances/{instance_id}")
+async def delete_connector_instance(
+    scope: str,
+    instance_id: str,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    response: Response,
+) -> dict[str, object]:
+    """**软删**（置 ``deleted_at``）。修订链与审计留着可查。
+
+    默认实例 ``'default'`` **不能删**：存量数据全部折叠在它上面，删了之后
+    读取路径（``connector_service.py`` 里按 ``(scope, 'default')`` 取 HEAD）
+    会在"实例已删除"的状态下继续工作，没有任何一处会报错。
+    """
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+        instance_view,
+    )
+
+    _require_connector_write_guards(request, auth)
+    _require_instance_scope(scope)
+    service = ConnectorInstanceService(session)
+    try:
+        row = await service.soft_delete(scope=scope, instance_id=instance_id)
+    except ConnectorInstanceError as exc:
+        raise _instance_error(exc) from exc
+    await session.commit()
+    audit_event(
+        "connector_instance_deleted",
+        actor=str(getattr(getattr(auth, "user", None), "subject_id", "") or "owner"),
+        target_type="connector_instance",
+        target_id=f"{scope}/{instance_id}",
+        attributes={"scope": scope, "instance_id": instance_id},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"schema_version": "v1", "item": instance_view(row)}
+
+
 @router.put("/settings/connectors/{scope}")
 async def put_connector_config(
     scope: str,
@@ -834,15 +1082,24 @@ async def put_connector_config(
     auth: CurrentAuth,
     session: DbSession,
     response: Response,
+    instance_id: str | None = None,
 ) -> dict[str, object]:
-    """保存某个接入器的配置并**立刻尝试生效**（owner only）。
+    """保存某个接入器**某个实例**的配置并**立刻尝试生效**（owner only）。
 
     语义：受理 ≠ 生效。``202`` 表示切换已完成（单副本部署里它同时也是终态）；
-    ``409`` 是代际冲突/另一处正在生效；``422`` 是字段校验失败——**此时一个连接
-    都没停过**；``503`` 是切换器不可用。真正的失败（新配置起不来）会以
+    ``409`` 是代际冲突/另一处正在生效/实例已删；``422`` 是字段校验失败——**此时
+    一个连接都没停过**；``503`` 是切换器不可用。真正的失败（新配置起不来）会以
     ``rolled_back`` 返回，并保证旧配置与旧连接已经恢复。
+
+    ``instance_id`` 默认 ``'default'``：老前端不带这个参数时行为与升级前完全
+    一致（存量配置全部折叠在默认实例上）。实例必须**存在且未软删**——否则
+    "保存到一个已删除的实例"会静默写进一张没人看得到的修订链。
     """
     from ling.settings import connector_fields as cf
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+    )
     from ling.settings.connector_service import (
         OP_ACTIVE,
         OP_DEGRADED,
@@ -855,6 +1112,32 @@ async def put_connector_config(
     _require_connector_write_guards(request, auth)
     if not cf.is_known_scope(scope):
         raise LingError(ErrorCode.not_found, "没有这个接入器", status_code=404)
+
+    # 实例必须活着。
+    #
+    # 分两种情况，**故意不对称**：
+    #
+    # - 调用方**没带** ``instance_id``：落到默认实例，且默认实例不存在时补建
+    #   一行。理由是升级前保存配置从不要求实例行（``_write_candidate`` 自己
+    #   建 HEAD），迁移也只给"有过数据"的 scope 回填——全新部署表是空的，
+    #   硬性 404 会把"第一次保存"弄坏。
+    # - 调用方**显式指定**了 ``instance_id``：必须真的存在且未软删，查不到就
+    #   404。**不**静默退回默认实例——那会让"保存到实例 B"变成"覆盖了默认
+    #   实例"，而写入方拿到的是一份正常的 202。
+    instances = ConnectorInstanceService(session)
+    target_instance = instance_id or DEFAULT_INSTANCE_ID
+    try:
+        if instance_id is None:
+            await instances.ensure_default(scope=scope)
+        await instances.require_live(scope=scope, instance_id=target_instance)
+    except ConnectorInstanceError as exc:
+        raise LingError(
+            ErrorCode.not_found if exc.status_code == 404 else ErrorCode.conflict,
+            exc.message,
+            status_code=exc.status_code,
+            detail=exc.code,
+            field=exc.name,
+        ) from exc
 
     # If-Match：设计 §6 要求并发保存只有一个赢家。
     raw_generation = request.headers.get("if-match") or request.headers.get("If-Match")
@@ -886,6 +1169,7 @@ async def put_connector_config(
         result = await service.apply(
             session,
             scope=scope,
+            instance_id=target_instance,
             change=change,
             expected_generation=expected,
             actor_id=str(getattr(getattr(auth, "user", None), "subject_id", "") or ""),
@@ -913,6 +1197,10 @@ async def put_connector_config(
             target_id=scope,
             attributes={
                 "scope": scope,
+                # 多实例下**必须记实例**：否则审计只能答"onebot 被改过"，
+                # 答不了"是哪个机器人被改过"——而这正是出事后要查的那一句。
+                # 记解析后的实例（缺省时是补建出来的 default），不是未解析的入参。
+                "instance_id": target_instance,
                 "fields": sorted(set(body.set) | set(body.clear)),
                 "action": {
                     key: ("set" if key in body.set else "clear")
@@ -953,6 +1241,7 @@ async def put_connector_config(
         "schema_version": "v2",
         "operation_id": result.operation_id,
         "scope": scope,
+        "instance_id": target_instance,
         "generation": result.generation,
         "status": result.state,
         "state": result.state,
