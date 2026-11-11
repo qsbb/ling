@@ -82,6 +82,16 @@ PREEMPT_REASON_NEW_INPUT = "new_input"
 #: 日志都能看到的事实**（`reason=channel_unsupported`），而不是一个隐含假设。
 #: 将来真要支持群聊时，做的是"把渠道加进来 + 补一条 `_deliver` 前的抢占检查 +
 #: 一组群聊用例"，而不是删掉一个碍事的断言。
+#:
+#: ## 提示词侧读**这一个**常量，不再自己判 `not is_group`
+#:
+#: 以前提示词只问"是不是私聊"就给延后说明，于是**任意外部私聊**（QQ /
+#: OneBot / 微信）都会收到它，而她选了之后被这里拒登记、按立即回复处理——
+#: 用户看到"她说要晚点回，结果立刻回了"。
+#:
+#: 现在两处读同一个判据：`capabilities/tag_specs.defer_available()`
+#: 直接 import 本常量（只读，不复制一份）。本集合仍是**唯一**的渠道白名单，
+#: 要加渠道只改这里。
 SUPPORTED_CHANNELS: frozenset[str] = frozenset({"web", ""})
 
 

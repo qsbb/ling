@@ -13,7 +13,8 @@ import pytest
 from ling.domains.conversation.service import ConversationService
 from ling.domains.persona.service import PersonaService
 from ling.infra.db import session_scope
-from ling.kernel.context import ContextCompiler
+from ling.infra.models import IdempotencyKey
+from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE, ContextCompiler
 from ling.kernel.handoff import HandoffService
 from tests.integration.conftest import TestEnv
 
@@ -410,9 +411,32 @@ async def test_context_offers_expression_choices(logged_in: TestEnv) -> None:
         )
     blob = "\n".join(m.content for m in compiled.messages)
     assert "你可以选择怎么表达" in blob, f"没把选项告诉她：{blob[:300]}"
-    # 群聊里三种都该出现
-    for marker in ("[at:", "[quote:", "[poke:"):
+    # 群聊里 @ 与拍一拍都该出现（引用另有一段断言，见下）
+    for marker in ("[at:", "[poke:"):
         assert marker in blob, f"选项里缺 {marker}"
+
+    # ## 引用：**有 id 才宣告**（这里必须断言"不出现"）
+    #
+    # 这条断言以前是 `("[at:", "[quote:", "[poke:")` 三个都要出现。改它的
+    # 依据不是"实现现在是这样"，而是需求本身：
+    #
+    # 这个窗口是**新建的**，一条历史都没有，所以上下文里不会有任何
+    # `[msg_id:…]`。此时告诉她"要引用就写 `[quote:那个 id]`"——她**一个 id
+    # 都看不到**，只能瞎编。线上见到的 `[quote:3]` 正是这么来的；而它随后会
+    # 被 `reply_ids` 校验丢掉，正文照发，用户看不出任何异常。
+    #
+    # 设计文档 5.4 把 `[quote:3]`（本轮无 id 3）列为反例：不执行、记
+    # `invalid_target`。既然执行阶段必拒，**宣告阶段就不该给**——
+    # "选了却没发生"是本项目反复点名要消灭的那一类失败。
+    #
+    # 配对正向断言在 `tests/unit/test_tag_specs.py::
+    # test_quote_is_not_advertised_without_any_message_id`（同一条渲染逻辑 +
+    # 一条真实 id → 必须出现）。只留这里的"不出现"，一个永远不宣告引用的
+    # 实现也能让本文件全绿。
+    assert "[quote:" not in blob, (
+        "这个窗口没有任何 `[msg_id:…]`，却仍然教她写 `[quote:…]`——"
+        "她只能编一个，然后被静默丢弃"
+    )
 
     # 私聊不该出现 @ ——列了做不到的，她会选了却不发生
     private_only = render_expression_help(is_group=False, supports_poke=False)
@@ -584,3 +608,57 @@ async def test_scenario_lane_is_skipped_when_not_overridden(logged_in: TestEnv) 
     scenario = _lane_text(compiled, "scenario")
     assert scenario == "", f"没写过覆盖却注入了场景提示：{scenario!r}"
     assert SCENARIO_BY_KEY["private"].default not in scenario
+
+async def test_quote_is_advertised_when_a_real_message_id_exists(
+    logged_in: TestEnv,  # noqa: F811
+) -> None:
+    """**配对正向**：真有一条带平台 id 的消息时，`[quote:` 必须出现。
+
+    ## 这条是被一次"假绿"逼出来的
+
+    `_has_replyable_ids()` 的 join 第一版写错了列
+    （`Message.message_id`，而 `Message` 没有这一列）。它的 `except Exception`
+    把这个 `AttributeError` 吞成了 `False`，于是探测永远返回"没有 id"。
+    **当时所有测试都是绿的**——因为相关断言全是 `"[quote:" not in blob`，
+    而探测失败恰好也满足它。
+
+    也就是说：**只测"没有 id 时不出现"的话，一个永远返回 False 的实现全绿。**
+    这正是 AGENTS.md 说的"负向断言的信息量 = 配对正向断言的信息量"。
+
+    ## 它必须失败于哪个缺陷
+
+    失败于「探测实现写错/接线没做」——不论是把列名写错、还是干脆
+    `return False`。它**不**失败于"渲染逻辑把引用隐藏了"（那是上一条测试的事）。
+    """
+    session_id, subject_id = await _window(logged_in, visibility="group")
+
+    # 造一条入站消息 + 它的平台 id 映射（约定见 `_message_id_marks`：
+    # key = 本地消息 id，result_ref = 平台 id）。
+    async with session_scope() as session:
+        conv = ConversationService(session)
+        msg = await conv.add_message(session_id, role="user", text="上一句")
+        # `add_message` 返回的是 `MessageView`，它的 **`message_id`** 就是本地
+        # 消息 id（`MessageView` 没有 `.id`）。这与 `IdempotencyKey.key` 的约定
+        # 一致——见 `_message_id_marks` 的注释。
+        session.add(
+            IdempotencyKey(
+                id="idem_test_quote_1",
+                scope=PLATFORM_MESSAGE_ID_SCOPE,
+                key=msg.message_id,
+                result_ref="srv:771",
+            )
+        )
+        await session.commit()
+
+    async with session_scope() as session:
+        compiled = await ContextCompiler(session).compile(
+            subject_id=subject_id, window_id=session_id, user_text="你好", is_group=True
+        )
+    blob = "\n".join(m.content for m in compiled.messages)
+    assert "[quote:" in blob, (
+        "这个窗口**有**带平台 id 的入站消息，却没有教她引用——"
+        "要么探测写错了，要么接线没做。两种情况都会让引用能力永久失效，"
+        "而且不报错"
+    )
+    # 同时确认 id 真的渲染出来了：没有它，上面的 `[quote:` 是一句空话
+    assert "[msg_id:" in blob, "宣告了引用，却没把任何 `[msg_id:…]` 放进上下文"

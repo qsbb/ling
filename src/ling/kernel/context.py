@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import CapabilityDescriptor, ContextContribution, Origin, Visibility
@@ -1353,36 +1354,102 @@ class ContextCompiler:
         #
         # 不是"群里就替她 @"——那是代码替人设做决定。这里只列可用动作和
         # 它们的社交含义，用不用、用哪个，她自己判断。
+        #
+        # ## 为什么这里要问渠道与 id 表（而不是只问 is_group）
+        #
+        # 旧实现在这一处只有 `is_group` 一个判据，于是：
+        #
+        # 1. 引用说明在私聊不列，**另有一段又无条件教她写 `[quote:…]`**——
+        #    两段自相矛盾（设计文档第 3 节）。现在引用只由目录渲染一次，
+        #    私聊根本不可用，矛盾从结构上消失。
+        # 2. 延后说明给**任何私聊**，而 `deferred.service.SUPPORTED_CHANNELS`
+        #    只放行 web/空渠道 → 外部私聊选了延后会被拒登记。现在两处读
+        #    **同一个** `defer_available()`。
+        #
+        # ## 渠道从哪来
+        #
+        # `env_facts.channel` 就是 `Window.channel`（上面那段环境事实已经查过
+        # 一次）；取不到时退回空串 = "没有外部渠道"，与 `SUPPORTED_CHANNELS`
+        # 的语义一致（落库即送达）。
         from ling.capabilities.expression_choice import render_expression_help
+        from ling.capabilities.tag_specs import TurnEnvironment, defer_available
 
-        # 引用要用**真实消息 id**（见本文件顶部"消息 id 标注"）。提示词里
-        # 必须说清"id 在哪、只能是哪些"——否则她只能瞎编（`[quote:3]`），
-        # 而 NapCat 对无效 reply 是静默丢段（调研 §4.4），本地看不出任何异常。
-        contributions.append(
-            ContextContribution(
-                lane="capabilities",
-                text=render_expression_help(
-                    is_group=is_group,
-                    # 拍一拍要连接器支持；没能力就**不要列出来**——
-                    # 列了做不到的，她会选一个做不出来的动作。
-                    #
-                    # 这里原来写的是 `getattr(self, "_supports_poke", True)`：
-                    # 全仓**没有任何地方给 `_supports_poke` 赋值**，所以它恒为
-                    # True，等于对 QQ / 微信 / Web 都宣告"可以拍一拍"，而她真写
-                    # 了 `[poke:…]` 之后投递层静默丢弃，用户看到的是"她说要拍你
-                    # 但没拍"。上面这句注释写着"没能力就不要列出来"——代码却在
-                    # 做相反的事，因为当时没有数据源，兜底值又选错了方向。
-                    #
-                    # 现在读连接器**自己声明**的事实（`CapabilityDescriptor.
-                    # supports_poke`）。没有渠道（Web 面板）时为 None，按
-                    # False 处理：没有外部渠道就等于没有渠道动作。
-                    supports_poke=self.supports_poke,
-                ),
-                origin=Origin.verified_source,
-                visibility=Visibility.subject_private,
-                token_budget=DEFAULT_BUDGETS["capabilities"],
-            )
+        _env_meta = compiled_meta.get("env_facts")
+        channel = str(_env_meta.get("channel") or "") if isinstance(_env_meta, dict) else ""
+        # 引用要有**真实消息 id**（见本文件顶部"消息 id 标注"）。没有 id 时
+        # 告诉她"可以引用"只会让她瞎编（线上见到过 `[quote:3]`），然后被
+        # `reply_ids` 校验丢掉——正文照发，看起来"什么都没发生"。
+        #
+        # 这里必须**真的查**，不能假设"有历史就有 id"：平台 id 由入站桥写进
+        # `idempotency_keys`，纯 Web 会话、旧数据、连接器没拿到 id 时都是空。
+        quote_ids_available = await self._has_replyable_ids(window_id)
+
+        turn_env = TurnEnvironment(
+            channel=channel,
+            is_group=is_group,
+            channel_features=frozenset(),
+            excluded_features=(
+                frozenset() if self.supports_poke else frozenset({"poke"})
+            ),
+            # `None` = 不宣告引用（猜不出 id）；`{}` 在这里同义，但用 `None`
+            # 是为了让 `TurnEnvironment` 的三态语义保持"没采集 id 表"。
+            visible_message_ids={"pending": "pending"} if quote_ids_available else None,
         )
+        expression_help = render_expression_help(
+            is_group=is_group,
+            channel=channel,
+            # ## @ 与引用：**显式传**，不交给按渠道名的推导
+            #
+            # 推导表（`ENV_CHANNEL_FEATURES`）是过渡手段：它只知道"哪个渠道的
+            # **连接器**实现了这两个动作"，不知道这一轮的事实。而这里有它拿不到
+            # 的两件事：
+            #
+            # - **会话类型**：Web 面板的群窗口是 `channel == "web"` 且
+            #   `is_group=True`。推导表里 `web` 是空集，于是 @ 被判成不可用
+            #   ——而这条路径以前是列出来的（`test_context_offers_expression_choices`
+            #   当场变红）。
+            # - **这一轮真的有 id**：由 `_has_replyable_ids` 现查。
+            #
+            # 所以判据在这里说清楚：**群聊就给 @，有 id 就给引用**。
+            #
+            # ## 为什么不在这上面再叠一层"渠道做不到就别给"
+            #
+            # 第一版写的是 `is_group and _channel_can("mention", channel)`，
+            # 结果是两个判据打架：`_channel_can` 按推导表说"web 什么都不支持"，
+            # 把上面这条 `is_group` 又否决掉了，`[at:` 照样消失。
+            #
+            # 两个判据叠加时，**否决权更大的那个悄悄赢了**，而它的信息量更低
+            # （它只知道渠道名）。保留信息量更高的那个。
+            #
+            # "渠道真做不到"由投递层兜底——它能直接拒绝整条消息
+            # （`delivery.py` 的 `supports_poke` 闸）。在这里多说一句的代价是
+            # 她偶尔选了一个被拒的动作；在这里少说一句的代价是她**永远**
+            # 用不了这个动作，而且没有任何日志说明为什么。
+            supports_mention=is_group,
+            supports_quote=quote_ids_available,
+            # 拍一拍要连接器支持；没能力就**不要列出来**——列了做不到的，
+            # 她会选一个做不出来的动作。
+            #
+            # 这里原来写的是 `getattr(self, "_supports_poke", True)`：
+            # 全仓**没有任何地方给 `_supports_poke` 赋值**，所以它恒为 True，
+            # 等于对 QQ / 微信 / Web 都宣告"可以拍一拍"，而她真写了
+            # `[poke:…]` 之后投递层静默丢弃，用户看到的是"她说要拍你但没拍"。
+            #
+            # 现在读连接器**自己声明**的事实（`CapabilityDescriptor.supports_poke`）。
+            # 没有渠道（Web 面板）时为 None，按 False 处理。
+            supports_poke=self.supports_poke,
+            has_message_ids=quote_ids_available,
+        )
+        if expression_help:
+            contributions.append(
+                ContextContribution(
+                    lane="capabilities",
+                    text=expression_help,
+                    origin=Origin.verified_source,
+                    visibility=Visibility.subject_private,
+                    token_budget=DEFAULT_BUDGETS["capabilities"],
+                )
+            )
         # 「你能撤回哪几条」：**只在她真的有可撤回的消息时出现**。
         # 没有可撤回的东西还提这件事，只会让她想着去撤一条撤不了的。
         from ling.capabilities.expression_choice import render_recall_help
@@ -1398,40 +1465,30 @@ class ContextCompiler:
                     token_budget=DEFAULT_BUDGETS["capabilities"],
                 )
             )
-        contributions.append(
-            ContextContribution(
-                lane="capabilities",
-                text=(
-                    "每条入站消息前面可能带一个 `[msg_id:…]`，那就是它的消息 id。"
-                    "要引用某条消息时写 `[quote:那个 id]`，**只能用上面出现过、"
-                    "标着 [msg_id:…] 的 id**。用了没出现过的 id，这一句会当作"
-                    "普通消息发出去（不带引用，也不会失败）。没有 [msg_id:…] 的"
-                    "消息就别引用它。"
-                ),
-                origin=Origin.verified_source,
-                visibility=Visibility.subject_private,
-                token_budget=DEFAULT_BUDGETS["capabilities"],
-            )
-        )
+        # 旧的"第二段 `[quote:…]` 说明"已**删除**：引用怎么写、id 从哪来，
+        # 现在只由 `tag_specs` 里 `message.quote` 的 `model_help` 说一次。
+        # 保留它就是在两处各说一套，而两处的条件（群/私聊、有没有 id）
+        # 不可能长期保持一致。
 
-        # --- 「你可以晚点回」：只在**私聊**里给，且写明上限与"只写标记" ---
+        # --- 「你可以晚点回」：给出条件与**本渠道真的可执行**一致 ---
         #
         # 用户裁决（2026-11-10）：「只在她主动选择时才延后，且延后多久让她自由
         # 发挥，上限 5 分钟」。所以这里做三件事，一件都不能少：
         #
         # 1. **说清是她自己决定**（"想晚点回就写"，不是"系统会安排"）；
         # 2. **说清上限**（300 秒）——不写上限她会写 999，然后被代码钳到 300，
-        #    而用户看到的是"她等了 5 分钟"而不是"她想等 16 分钟"。上限写进
-        #    提示词能减少这种落差，但**不能代替**钳制与如实上报；
-        # 3. **说清"只写标记、不要写正文"**——标记旁边有正文时按坏格式处理
-        #    （不延后、正文照发），那是刻意的：她既然写了回复就是回了。
-        #    不写清这一条，她会一边说"等会儿"一边说正文，然后延后不生效，
-        #    而 `reason=body_present` 会堆成噪声。
+        #    而用户看到的是"她等了 5 分钟"而不是"她想等 16 分钟"；
+        # 3. **说清"只写标记、不要写正文"**——标记旁边有正文时按坏格式处理。
         #
-        # **群聊不给这个选项**：群里的"等会儿"是对着一群人说的，而群聊当前
-        # 不在 `deferred.service.SUPPORTED_CHANNELS` 里（外发闸管不到群渠道的
-        # 投递）。给了选项却做不到，比不给更糟。
-        if not is_group:
+        # ## 判据从 `not is_group` 改成 `defer_available()`
+        #
+        # 原来这里只写 `if not is_group`，而真正登记的地方（`turn.py` 与
+        # `worker.py`）要求 `channel in deferred.SUPPORTED_CHANNELS`（只有
+        # web / 空渠道）。于是**任意外部私聊都会收到延后说明**，她选了之后
+        # 被拒登记、按立即回复处理——用户看到"她说要晚点回，结果立刻回了"。
+        #
+        # 现在两处读同一个判据：给她的选项就是真的能执行的选项。
+        if defer_available(turn_env):
             contributions.append(
                 ContextContribution(
                     lane="capabilities",
@@ -1787,6 +1844,76 @@ class ContextCompiler:
             annotated=annotated,
             reply_ids=dict(reply_ids),
         )
+
+    async def _has_replyable_ids(self, window_id: str) -> bool:
+        """这一轮**大概**有没有可引用的消息 id（决定要不要跟她提引用）。
+
+        ## 为什么是一次单独的轻查询，而不是复用 `reply_ids`
+
+        `_message_id_marks()` 需要 `usable`（历史消息列表），而历史在
+        `capabilities` 车道**之后**才组装。把整个历史取数前移会改变
+        "历史在车道预算之前还是之后"的装配顺序，风险远大于收益。
+
+        所以这里只问一个问题：**这个窗口最近有没有带平台 id 的入站消息**。
+        有 → 上下文里会渲染出 `[msg_id:…]`，提引用是对的；没有 → 一句都不提。
+
+        ## 为什么用 `LIMIT 1` + 存在性判断
+
+        判据只需要存在性。查具体 id 会重复 `_message_id_marks` 的工作（而且
+        那时还不知道哪些消息真的进了预算），而两份"哪些 id 可见"的实现
+        必然会漂移——那正是本次要修的那类问题。
+
+        ## 查不到时返回 False（fail closed）
+
+        "不确定有没有 id"时跟她提引用，她会写一个必然被丢掉的引用段，
+        而**正文照发**——用户看不出任何异常。宁可不提。
+        """
+        from ling.infra.models import IdempotencyKey, Message
+
+        try:
+            found = await self._session.scalar(
+                # ## join 的那一列是 `Message.id`，不是 `message_id`
+                #
+                # 第一版写的是 `Message.message_id == IdempotencyKey.key`，
+                # 而 `infra/models.Message` **没有** `message_id` 这一列
+                # （`mypy` 报 `"type[Message]" has no attribute "message_id"`）。
+                #
+                # 真正的约定见 `_message_id_marks` 的注释：
+                # `idempotency_keys(scope='platform_msgid', key=<本地消息 id>,
+                # result_ref=<平台 id>)`。所以 `key` 对的是本地 `Message.id`。
+                #
+                # 这条如果不 join 而直接查 `IdempotencyKey`，会把**其他窗口**
+                # 的 id 也算进来——于是"这个窗口有可引用消息"变成一个与窗口
+                # 无关的判断，提示词就会在空窗口里教她引用。
+                select(IdempotencyKey.key)
+                .join(Message, Message.id == IdempotencyKey.key)
+                .where(
+                    Message.window_id == window_id,
+                    Message.role == "user",
+                    IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                    IdempotencyKey.result_ref.is_not(None),
+                )
+                .limit(1)
+            )
+        except SQLAlchemyError:
+            # ## 只吞**数据库层**的失败
+            #
+            # 第一版是 `except Exception`。它没错过测试，而是**让测试永远绿**：
+            # 我最初把 join 写成了 `Message.message_id`（该列不存在），
+            # 于是这条查询每次都抛 `AttributeError` → 被这里吞成 `False`
+            # → 提示词不提引用 → 而 `test_context_offers_expression_choices`
+            # 当时断言的是"[at: 要出现"，根本没有引用那条断言，于是全绿。
+            #
+            # 抓住它的是 `mypy`（`"type[Message]" has no attribute
+            # "message_id"`），不是任何一条测试。这是本项目反复记下的那个形状：
+            # **捕获范围太宽的 except 会把缺陷变成"安静降级"**。
+            #
+            # 现在只捕获 `SQLAlchemyError`：那才是这里真正预期的失败（库暂时
+            # 不可用、连接被回收）。`AttributeError` / `TypeError` 这类**编码
+            # 错误**必须冒出来——它们不会自己好，只会一直悄悄让引用不可用。
+            logger.info("可引用消息 id 探测失败（库不可用，本轮不提引用）")
+            return False
+        return found is not None
 
     async def _message_id_marks(
         self,
