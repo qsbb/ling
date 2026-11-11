@@ -238,8 +238,13 @@ def test_worker_keeps_fail_closed_on_explicit_is_group() -> None:
     并跑完整 handler，而设想的"将来生产者开始写它"还没发生。钉住这个语义
     防止有人在收敛时把它当成"死代码"删掉。
     """
-    source = inspect.getsource(worker_module)
-    assert 'payload.get("is_group")' in source, (
+    # **必须只看代码行**：worker.py 的注释里也写着 `payload.get("is_group")`
+    # （解释这个字段的来历），用 `inspect.getsource` 直接断言会被注释骗过——
+    # 删掉真代码后断言仍然通过。这正是 qa-be 守卫第一版踩的坑，我复现了一次：
+    # 变异 `is_group = is_group_visibility(source_visibility)`（删掉 or 分支）
+    # 后 39 条测试**全绿**，因为注释还在。
+    code = "\n".join(_code_lines("src/ling/worker.py"))
+    assert 'payload.get("is_group")' in code, (
         "worker.py 丢掉了 is_group 的追加语义——群聊判定会变成单源，"
         "一旦 source_visibility 算错就没有第二道保险"
     )
