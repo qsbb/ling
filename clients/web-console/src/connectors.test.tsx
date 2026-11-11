@@ -26,6 +26,7 @@ import {
   describeSaveError,
   describeVerifyState,
   draftFromFields,
+  ensureInstanceForm,
   formatAsOf,
   formsOf,
 } from './components/ConnectorsPage';
@@ -675,23 +676,60 @@ describe('运行时那一行：没有可观察的连接就不编数字', () => {
   });
 });
 
-describe('页面状态：草稿从 GET 来，三个 scope 各一份', () => {
-  it('formsOf 为两个渠道 + access 各建一份草案；密钥初值为空', () => {
+describe('页面状态：草稿从 GET 来，按 (scope, instance_id) 分区', () => {
+  it('formsOf 为两个渠道 + access 各建一份**默认实例**的草案；密钥初值为空', () => {
     const forms = formsOf(makeResponse());
-    expect(Object.keys(forms).sort()).toEqual(['access', 'onebot', 'qqbot']);
-    expect(forms['onebot']?.draft['LING_ONEBOT_API_BASE']).toEqual({
+    // 键是 `instanceFormKey(scope, 'default')`，不是裸 scope：草案必须按实例分区，
+    // 否则在 A 里改了不保存、切到 B，B 的输入框会画 A 的草稿，保存还成功。
+    expect(Object.keys(forms).sort()).toEqual([
+      'access::default',
+      'onebot::default',
+      'qqbot::default',
+    ]);
+    expect(forms['onebot::default']?.draft['LING_ONEBOT_API_BASE']).toEqual({
       kind: 'text',
       value: 'http://127.0.0.1:5700',
     });
-    expect(forms['onebot']?.draft['LING_ONEBOT_WS_TOKEN']).toEqual({ kind: 'secret', value: '' });
-    expect(forms['access']?.draft['LING_ACCESS_MODE']).toEqual({ kind: 'select', value: 'off' });
-    expect(forms['onebot']?.clearKeys).toEqual([]);
+    expect(forms['onebot::default']?.draft['LING_ONEBOT_WS_TOKEN']).toEqual({
+      kind: 'secret',
+      value: '',
+    });
+    expect(forms['access::default']?.draft['LING_ACCESS_MODE']).toEqual({
+      kind: 'select',
+      value: 'off',
+    });
+    expect(forms['onebot::default']?.clearKeys).toEqual([]);
+    // 非默认实例**不给**初始草案：它只能按自己那份视图在切换时建，
+    // 拿默认实例的值预填就是冒充。
+    expect(forms['onebot::alpha']).toBeUndefined();
   });
 
   it('GET 里缺 access 段也不崩（老后端），只是没有白名单卡', () => {
     const body = { ...makeResponse(), access: undefined as never };
     const forms = formsOf(body);
-    expect(forms['access']).toEqual({ draft: {}, clearKeys: [] });
+    expect(forms['access::default']).toEqual({ draft: {}, clearKeys: [] });
+  });
+
+  it('ensureInstanceForm：已建好的原样返回，没建好的按**自己的**字段建', () => {
+    const fields = onebotFields();
+    const edited = { draft: draftFromFields(fields), clearKeys: [] };
+    edited.draft['LING_ONEBOT_API_BASE'] = { kind: 'text', value: 'aaa' };
+    const forms = { 'onebot::alpha': edited };
+
+    // 已存在 → 同引用（切回 A 时它的未保存内容还在）。
+    expect(ensureInstanceForm(forms, 'onebot', 'alpha', fields)['onebot::alpha']).toBe(edited);
+
+    // 不存在 → 按传进来的字段建，且**不是** alpha 那一份。
+    const withBeta = ensureInstanceForm(forms, 'onebot', 'beta', fields);
+    expect(withBeta['onebot::alpha']).toBe(edited);
+    expect(withBeta['onebot::beta']?.draft['LING_ONEBOT_API_BASE']).toEqual({
+      kind: 'text',
+      value: 'http://127.0.0.1:5700',
+    });
+
+    // 拿不到某实例的视图（null → 传空数组）时，建出来的是空表单，不是别人的值。
+    const blank = ensureInstanceForm(forms, 'onebot', 'gamma', []);
+    expect(blank['onebot::gamma']).toEqual({ draft: {}, clearKeys: [] });
   });
 });
 

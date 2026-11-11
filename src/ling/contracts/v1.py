@@ -1684,6 +1684,25 @@ class ConnectorsOut(StrictModel):
     schema_version: Literal["v2"] = "v2"
     as_of: datetime
     can_edit: bool = Field(description="当前登录者是否是 owner")
+    #: 这份视图**实际读的是哪个实例**（``?instance_id=`` 解析后的值）。
+    #:
+    #: 回显它，而不是让前端"记着自己传了什么"：请求里写的是 ``instance_id``，
+    #: 真正读了哪个实例由后端决定（缺省 → ``'default'``）。有了这个字段，
+    #: 前端可以断言"我看到的这份数据属于我在看的那台"，而不是靠约定去猜。
+    #: 缺省 ``'default'``：老响应在反序列化侧也有确定取值。
+    instance_id: str = Field(
+        default="default", description="这份视图实际读取的实例（默认实例为 default）"
+    )
+    #: 逐个 scope 实际读取的实例（``{scope: instance_id}``）。
+    #:
+    #: 必要之举：实例**只在 scope 内存在**。调用方通常只在一个 scope 上建了
+    #: 那个实例（例如只给 onebot 配了第二台号），另外两个 scope 上并没有同名
+    #: 实例——那时它们退回默认实例。只回显一个 ``instance_id`` 会让这件事
+    #: 看不见，前端就会以为"整个页面都切到了实例 B"。这里如实给出每个 scope
+    #: 真正读了哪个实例，前端可以据此标出"这个 scope 没有那个实例，显示的是默认实例"。
+    instances: dict[str, str] = Field(
+        default_factory=dict, description="逐个 scope 实际读取的实例"
+    )
     connectors: list[ConnectorView] = Field(default_factory=list)
     access: ConnectorAccessGroupOut
 

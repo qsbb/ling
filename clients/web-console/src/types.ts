@@ -652,6 +652,59 @@ export interface ConnectorsResponse {
   can_edit: boolean;
   connectors: ConnectorView[];
   access: ConnectorAccessGroup;
+  /**
+   * 这次读的是哪个实例——**只在带 `?instance_id=` 读取时才有**。
+   *
+   * 有它，客户端才能自证"这份字段视图属于这个实例"；页面级读（不带实例）
+   * 没有它，那份视图只代表默认实例。可选而非必有，正是因为老服务端/默认读
+   * 不会给：客户端必须按**实际收到的响应**判断，不能假设它一定在。
+   */
+  instance_id?: string;
+}
+
+/**
+ * 一个接入器实例（同属一个 scope 的"一条线"）。
+ *
+ * 契约：`src/ling/settings/connector_instances.py` 的 `instance_view()`，
+ * 端点在 `/v1/settings/connectors/{scope}/instances`。
+ *
+ * 身份是 `(scope, instance_id)`：`instance_id` **建后不可变**，改名只改
+ * `display_name`。配置保存（`PUT /v1/settings/connectors/{scope}?instance_id=`）
+ * 认的是 `instance_id`，不是显示名——两者在列表里看起来很像，别混用。
+ */
+export interface ConnectorInstance {
+  scope: string;
+  /** 身份。派生自显示名，派生不出时是 `i-<8 位 hex>`。最长 16 字符。 */
+  instance_id: string;
+  display_name: string;
+  /** 停用**不动**已保存的配置与修订链，只表示"这个实例现在不参与运行"。 */
+  enabled: boolean;
+  /**
+   * 默认实例（`instance_id === 'default'`）为 false。
+   *
+   * **后端算好给的**，不是前端按字面量猜的：默认实例是存量配置的属主，
+   * 删掉它会让读取路径静默读到"已删除"的状态。前端据此把删除按钮置灰，
+   * 而不是让用户点了才收 409 `default_instance_protected`。
+   */
+  deletable: boolean;
+  created_at: string | null;
+  created_by: string | null;
+  deleted_at: string | null;
+}
+
+/** `GET /v1/settings/connectors/{scope}/instances` 的返回。 */
+export interface ConnectorInstancesResponse {
+  schema_version: string;
+  scope: string;
+  /** 后端已按「默认实例最前、其余按创建时间」排好序，前端不再重排。 */
+  items: ConnectorInstance[];
+  include_deleted: boolean;
+}
+
+/** `POST` / `PUT` / `DELETE .../instances/...` 的返回：单个实例的最新状态。 */
+export interface ConnectorInstanceResponse {
+  schema_version: string;
+  item: ConnectorInstance;
 }
 
 /**

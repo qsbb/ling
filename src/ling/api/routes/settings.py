@@ -597,6 +597,7 @@ async def _connector_field_views(
     settings: object,
     app_state: object,
     include_sensitive: bool,
+    instances: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     """三个 scope 的字段视图（``source`` / ``configured`` / ``preview`` / ``value``）。
 
@@ -606,6 +607,10 @@ async def _connector_field_views(
 
     密钥**永远**只有 ``preview`` 与 ``configured``，``value`` 恒 ``None``；
     非 owner 连 ``preview`` 都不给（设计 §6：敏感预览只给 owner）。
+
+    ``instances`` 是 ``{scope: instance_id}``：**逐个 scope** 决定读哪个实例的
+    覆盖与 HEAD 指针。缺省（``None``）时三个 scope 都读 ``'default'``——不带
+    实例的调用方（老前端、reset、任何内部读取）行为与升级前完全一致。
     """
     from ling.settings import connector_fields as cf
     from ling.settings import connector_overrides as ov
@@ -634,6 +639,7 @@ async def _connector_field_views(
         resolved = await ov.resolve_field_values(
             session,
             scope=scope,
+            instance_id=(instances or {}).get(scope, DEFAULT_INSTANCE_ID),
             settings=settings,
             onebot=onebot_cfg,
             qqbot=qqbot_cfg,
@@ -646,21 +652,85 @@ async def _connector_field_views(
     return out
 
 
-async def _activation_views(session: AsyncSession) -> dict[str, dict[str, object]]:
-    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead
+async def _activation_views(
+    session: AsyncSession, *, instances: dict[str, str] | None = None
+) -> dict[str, dict[str, object]]:
+    """三个 scope 的 ``activation`` 段，**按各自实例**取。
+
+    HEAD 指针与"最近一条修订"必须落在同一个实例上：只按 scope 查修订会让
+    实例 B 的 ``last_revision_id`` / ``last_state`` 显示成实例 A 的，而那段
+    形状完全正常——读串了看不出来。
+
+    ``instances`` 缺省时三个 scope 都读 ``'default'``（升级前行为）。
+    """
+    from ling.infra.models import ConnectorConfigHead
     from ling.settings import connector_fields as cf
     from ling.settings.connector_service import activation_payload, latest_revision
 
     out: dict[str, dict[str, object]] = {}
     for scope in cf.SCOPES:
-        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
+        instance_id = (instances or {}).get(scope, DEFAULT_INSTANCE_ID)
+        head = await session.get(ConnectorConfigHead, (scope, instance_id))
         out[scope] = activation_payload(
             scope=scope,
             generation=int(getattr(head, "generation", 0) or 0),
             active_revision_id=getattr(head, "active_revision_id", None),
             candidate_revision_id=getattr(head, "candidate_revision_id", None),
-            last=await latest_revision(session, scope),
+            last=await latest_revision(session, scope, instance_id=instance_id),
         )
+    return out
+
+
+async def _live_instances(
+    session: AsyncSession, *, instance_id: str | None
+) -> dict[str, str]:
+    """逐个 scope 解析这次要读的实例，返回 ``{scope: instance_id}``。
+
+    实例是**按 scope 独立**的（主键 ``(scope, instance_id)``），而这条端点一次
+    返回三个 scope，所以"读哪个实例"必须逐 scope 回答，不能拿一个 id 套三处：
+
+    - ``instance_id is None``（老前端、任何不带参数的调用方）→ 三个 scope 都读
+      ``'default'``。**不查目录、不补建行**：GET 是读路径，不该有副作用；而且
+      升级前的存量配置全在默认实例上，目录表里可能根本没有那一行（迁移只给
+      "有过数据"的 scope 回填，全新部署表是空的）。硬性要求它会 404 掉老部署。
+    - 显式给了 ``instance_id`` → 该 scope 上必须**存在且未软删**，否则
+      404 ``instance_not_found`` / 409 ``instance_deleted``。**不**静默回退默认
+      实例：那会让"我在看实例 B"变成"我在看实例 A，而界面照常显示"——正是这个
+      缺口本来的形状，只是把串读挪到了前端。
+
+    "逐 scope"是刻意的：用户通常只在**一个** scope 上建实例（例如只配了
+    onebot 的第二台号），另外两个 scope 上根本没有同名实例。要求三个 scope
+    都有会让"切到实例 B"直接 404，把本该能看的部分也挡掉。
+    """
+    from ling.settings import connector_fields as cf
+
+    if instance_id is None:
+        return dict.fromkeys(cf.SCOPES, DEFAULT_INSTANCE_ID)
+
+    from ling.settings.connector_instances import (
+        ConnectorInstanceError,
+        ConnectorInstanceService,
+    )
+
+    service = ConnectorInstanceService(session)
+    out: dict[str, str] = {}
+    for scope in cf.SCOPES:
+        try:
+            await service.require_live(scope=scope, instance_id=instance_id)
+            out[scope] = instance_id
+        except ConnectorInstanceError as exc:
+            if exc.status_code != 404:
+                raise LingError(
+                    ErrorCode.conflict,
+                    exc.message,
+                    status_code=exc.status_code,
+                    detail=exc.code,
+                    field=exc.name,
+                ) from exc
+            # 这个 scope 上没有该实例：它是一个单 scope 的实例，不是"坏请求"。
+            # 该 scope 退回默认实例——**但必须让调用方看得见**（见下方
+            # `instance_scope_fallbacks` 回显），不能安静地混在一起。
+            out[scope] = DEFAULT_INSTANCE_ID
     return out
 
 
@@ -670,6 +740,7 @@ async def get_connectors(
     auth: CurrentAuth,
     settings: SettingsDep,
     session: DbSession,
+    instance_id: str | None = None,
 ) -> ConnectorsOut:
     """接入器的诊断 **+ 可配置字段**（v2）：凭据齐不齐、连没连上、有效值来自哪。
 
@@ -677,6 +748,21 @@ async def get_connectors(
     渠道、凭据设了没有）。它不含任何密钥明文（见
     ``ling.settings.connectors``：``kind="secret"`` 的字段连值都不进视图对象），
     但"哪个变量设了、监听在哪个端口"本身就是部署指纹，不该匿名可读。
+
+    **多实例**：``?instance_id=`` 决定读**哪个实例**的字段与 ``activation``。
+    实例**只在 scope 内存在**，所以它是**逐 scope** 解析的：
+
+    - 不传：三个 scope 都读默认实例。**行为与升级前一致**（存量配置全在默认
+      实例上），且**不**在这里补建实例行——GET 是读路径，不该有副作用。
+    - 显式传：该 scope 上有这个实例就读它；没有就退回默认实例。已软删 →
+      ``409 instance_deleted``（不是"没有"，两者的提示不该混成一句）。
+    - 为什么"逐 scope 回退"而不是"整条 404"：用户通常只在**一个** scope 上建
+      实例（只给 onebot 配了第二台号），另外两个 scope 上并没有同名实例。
+      整条 404 会把本该看得见的部分一起挡掉。
+    - 为什么回退必须**可见**：响应同时回显 ``instance_id``（全局）与
+      ``instances``（逐 scope 实际读的那个）。退回了默认实例的 scope 在
+      ``instances`` 里就是 ``'default'``——**安静回退才是这个缺口本来的形状**，
+      回显让"我看的是哪一份"变成可断言的事实，而不是约定。
 
     ``configured`` 不在这里另判一遍：QQ 官方机器人复用
     ``QQBotConfig.configured``，与总览的 ``connectivity`` 段同源；否则会出现
@@ -690,14 +776,19 @@ async def get_connectors(
     from ling.settings.connectors import connector_views
 
     is_owner = str(getattr(auth.user, "role", "")) == "owner"
+
+    # 逐 scope 解析"这次读哪个实例"（实例按 scope 独立，见 _live_instances）。
+    live = await _live_instances(session, instance_id=instance_id)
+
     views = connector_views(settings, request.app.state)
     field_views = await _connector_field_views(
         session,
         settings=settings,
         app_state=request.app.state,
         include_sensitive=is_owner,
+        instances=live,
     )
-    activations = await _activation_views(session)
+    activations = await _activation_views(session, instances=live)
 
     # 渠道视图：字段与生效状态按 id 挂上去；白名单（access）没有"渠道"概念，
     # 单独一段（设计 §6）。
@@ -745,6 +836,11 @@ async def get_connectors(
     return ConnectorsOut(
         as_of=utcnow(),
         can_edit=is_owner,
+        # 回显**逐 scope 实际读取**的实例（不是入参）：`live` 是解析后的映射，
+        # 某个 scope 上没有请求的那个实例时会退回默认实例，这里如实呈现。
+        # 前端据此断言"我看到的这份数据属于我在看的那台"。
+        instance_id=live[cf.SCOPE_ONEBOT],
+        instances=dict(live),
         connectors=connector_views_out,
         access=ConnectorAccessGroupOut(
             generation=int(access["generation"]),  # type: ignore[call-overload]

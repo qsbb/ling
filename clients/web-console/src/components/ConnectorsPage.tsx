@@ -58,6 +58,11 @@ import type {
   ConnectorView,
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, CheckIcon, RefreshIcon } from './Icons';
+import {
+  ConnectorInstancePanel,
+  DEFAULT_INSTANCE_ID,
+  instanceFormKey,
+} from './ConnectorInstances';
 import '../connectors.css';
 
 interface ConnectorsPageProps {
@@ -595,7 +600,25 @@ export function FieldControl({
     'data-testid': `connector-input-${key}`,
   } as const;
 
-  if (!draft) return null;
+  // `draft === undefined` 表示**这个实例的草案还没建好**（例如刚切到非默认实例、
+  // 它的字段视图还没回来）。从前这里 `return null`，控件就**静默消失**：字段行、
+  // 说明、「已设置」全在，只有一个空白的 `.connector-field__control`。
+  //
+  // 那正是本仓库反复要消灭的「名字比实现强」——一行长得跟正常字段一样的东西，
+  // 里面什么都没有，而且不报错。改成**显式降级**：保住 `data-testid`（测试能
+  // 看见它），写成 disabled，并说明为什么不能改。
+  if (draft === undefined) {
+    return (
+      <input
+        {...common}
+        type="text"
+        value=""
+        placeholder="这个实例的配置还没读回来，暂时不能编辑"
+        disabled
+        data-draft-missing="true"
+      />
+    );
+  }
   if (cleared) {
     return (
       <p className="connector-edit__cleared" data-testid={`connector-cleared-${key}`}>
@@ -817,7 +840,46 @@ export interface ConnectorFormProps {
 }
 
 interface ConnectorCardProps extends ConnectorFormProps {
+  /**
+   * 这张卡片**表单**用的视图：选中的是默认实例时就是页面级视图；切到非默认
+   * 实例时它的 `fields` 换成那个实例自己的（拿不到就是空数组——输入框空着，
+   * 不画别人的值）。`key` 只用于重建表单子树。
+   */
   connector: ConnectorView;
+  /**
+   * 给实例面板用的**默认实例**视图，应当始终是页面级那一次 GET 的结果。
+   *
+   * 为什么不直接用 `connector`：非默认实例的 `connector` 可能是一份空字段的
+   * 视图，而面板会拿它 `draftFromFields()` 现造草案——空字段会让面板抛
+   * `fields is not iterable` 并整块崩掉。面板的四态诊断描述的是"这条渠道"，
+   * 也不该跟着实例走。不传时退回 `connector`（老调用点/测试）。
+   */
+  panelConnector?: ConnectorView;
+  /**
+   * 这张卡片的表单此刻属于哪个实例（`instanceFormKey` 的右半边）。
+   *
+   * **只用于表单子树的 `key`**，不画出来：`ConnectorView` 本身不带
+   * `instance_id`（它是页面级/按实例读回来的同一张视图），实例身份只有页面
+   * 知道，所以要显式给。
+   */
+  instanceId?: string;
+  /**
+   * 字段列表为空时，**为什么**空（非空字符串 = 原因）。
+   *
+   * 默认实例的字段列表不存在"空得可疑"这种情况（页面级 GET 一定给），所以
+   * 只有切到非默认实例、视图还没到/读不到时才传。没有这一段，"空表单"与
+   * "这个实例真的没配"在界面上不可区分。
+   */
+  emptyFieldsReason?: string | null;
+  /**
+   * 实例面板的上报，**原样透传**给 `ConnectorInstancePanel`。
+   *
+   * 卡片自己不消费这两条：它只负责把面板和页面的草案状态连起来。面板**不**
+   * 在卡片里再渲染一张卡片（那会递归），所以这条链是单向的
+   * 面板 → 卡片 → 页面。
+   */
+  onSelectInstance?: (instanceId: string) => void;
+  onInstanceView?: (instanceId: string, fields: ConnectorField[] | null) => void;
 }
 
 /**
@@ -826,7 +888,15 @@ interface ConnectorCardProps extends ConnectorFormProps {
  * 表单**始终展开**：用户点进来就是为了改，"点进去居然没有配置界面"正是这一轮
  * 要修的问题；再套一层"先点编辑"只会让人以为又是只读的。
  */
-export function ConnectorCard({ connector, ...form }: ConnectorCardProps) {
+export function ConnectorCard({
+  connector,
+  panelConnector,
+  instanceId,
+  emptyFieldsReason = null,
+  onSelectInstance,
+  onInstanceView,
+  ...form
+}: ConnectorCardProps) {
   const presentation = describeConnectorStatus(connector.status);
   const runtime = connectorRuntimeLine(connector.runtime);
   const editable = connector.editable;
@@ -834,6 +904,23 @@ export function ConnectorCard({ connector, ...form }: ConnectorCardProps) {
     () => buildConnectorChange(connector.fields, form.draft, form.clearKeys),
     [connector.fields, form.draft, form.clearKeys],
   );
+  /**
+   * 列表上要给哪些实例画脏标。
+   *
+   * 卡片是**每个 scope 一张**，而它的表单此刻属于 `instanceId` 那个实例——
+   * 所以这里能确定"当前这个实例有没有未保存改动"（`change.dirty` /
+   * `form.clearKeys`）。别的实例的草案也存在页面里，但卡片看不到，因此这里
+   * 只报自己这一份；面板会把外部给的与自算的取并集。
+   *
+   * 为什么必须从这里给：从前面板拿**自己**的 `forms` 算脏标，而字段输入框读写
+   * 的是页面的 `forms`——于是"卡片写着有未保存改动、列表上却没有脏标"。
+   */
+  const dirtyInstanceIds = useMemo(() => {
+    const out = new Set<string>();
+    const id = instanceId ?? DEFAULT_INSTANCE_ID;
+    if (change.dirty || form.clearKeys.length > 0) out.add(id);
+    return out;
+  }, [change.dirty, form.clearKeys, instanceId]);
   const verifyState = connector.activation?.state ?? null;
   const submit = () => {
     if (!form.saving) form.onSave();
@@ -874,6 +961,21 @@ export function ConnectorCard({ connector, ...form }: ConnectorCardProps) {
         </p>
       ) : null}
 
+      {/*
+        实例面板放在「配置项」**之前**：实例是账号级的，字段是账号内的配置。
+        顺序反过来会让人以为"先改字段、再选账号"——实际保存是写进当前选中的
+        那个实例的，选错了会把 A 的值存到 B 上。
+      */}
+      <ConnectorInstancePanel
+        scope={connector.id}
+        connector={panelConnector ?? connector}
+        canEdit={editable}
+        pageBusy={form.saving}
+        onSelectInstance={onSelectInstance}
+        onInstanceView={onInstanceView}
+        dirtyInstanceIds={dirtyInstanceIds}
+      />
+
       <h3 className="connector-card__subtitle">配置项</h3>
       <p className="connector-card__note">
         存在服务端的数据库覆盖层里，保存后立刻按新配置重建连接。密钥只报"设了没有"，
@@ -882,11 +984,28 @@ export function ConnectorCard({ connector, ...form }: ConnectorCardProps) {
 
       <form
         className="connector-form"
+        // `key` 带上当前实例：切实例时 React **重建**这个表单子树，任何内部
+        // 残留（将来有人加一个不受控输入/useState 缓冲）都带不过来。这是防串
+        // 草稿的第二道闸，第一道是 `(scope, instanceId)` 分区键。
+        //
+        // **只加在这里，不能加在卡片或面板上**：那会连面板一起重建，面板的
+        // 选中态与列表会被打回初始值（选中态变 null、列表退回 loading），
+        // 切实例时看起来像"点一下就全清空了"。
+        key={`${connector.id}::${instanceId ?? ''}`}
         onSubmit={(event) => {
           event.preventDefault();
           submit();
         }}
       >
+        {emptyFieldsReason ? (
+          <p
+            className="connector-form__note connector-form__note--warn"
+            role="status"
+            data-testid={`connector-${connector.id}-fields-unverified`}
+          >
+            {emptyFieldsReason}
+          </p>
+        ) : null}
         <ul className="connector-fields">
           {connector.fields.map((field) => {
             const key = field.key || field.name;
@@ -937,7 +1056,17 @@ export function ConnectorCard({ connector, ...form }: ConnectorCardProps) {
               (editable
                 ? change.dirty
                   ? '有未保存的改动'
-                  : `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`
+                  : /*
+                     * 保存被**挡下**时（"没有要保存的改动"这类 `warn`）必须说一句，
+                     * 否则用户点了保存却什么反应都没有。
+                     *
+                     * 但**只有 `warn` 走这里**：`ok`（"已生效…"）已经由上面那块
+                     * 通知区显示，挤进这一行会把版本号顶掉——而版本号是"这次生效的
+                     * 是哪一版"的唯一可见证据，既有浏览器测试正是拿它断言的
+                     * （`connectors.browser.test.tsx`：保存后 note 含"当前版本 4"）。
+                     */
+                    (form.notice?.tone === 'warn' ? form.notice.text : null) ??
+                    `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`
                 : '只有所有者可以修改')}
           </span>
         </div>
@@ -1091,26 +1220,110 @@ interface PendingState {
 
 const IDLE: PendingState = { saving: false, notice: null, fieldError: null };
 
-/** 页面上的表单状态（草案 + 待清除的键），按 scope 分开存。 */
+/**
+ * 页面上的表单状态（草案 + 待清除的键），按 **`instanceFormKey(scope, instanceId)`**
+ * 分开存——不是按 scope。
+ *
+ * 为什么必须带上实例：保存走的是 `PUT .../{scope}?instance_id=`，写的是**当前选中
+ * 那个实例**。只按 scope 分区的话，在实例 A 里改了不保存、切到 B，B 的输入框画的
+ * 就是 A 的草案，点保存就把 A 的改动存进了 B，而且服务端返回成功——这是一条
+ * 会静默写错账号的路径。分区键用面板里那个 `instanceFormKey`，两处必须是
+ * **同一个函数**，否则页面与面板各说一套。
+ */
 interface FormState {
   draft: Record<string, FieldDraft>;
   clearKeys: string[];
 }
 
-/** 从一次 GET 构造各 scope 的初始草案。 */
+/**
+ * 从一次 GET 构造各 scope **默认实例**的初始草案。
+ *
+ * 页面级 GET（不带 `?instance_id=`）读到的是默认实例的视图，所以这里只建
+ * `default` 那一份键。非默认实例的草案由 `ensureInstanceForm` 在**切换时**
+ * 按那个实例自己的字段视图按需建立——不从别处借。
+ */
 export function formsOf(body: ConnectorsResponse): Record<string, FormState> {
   const forms: Record<string, FormState> = {
-    access: { draft: draftFromFields(body.access?.fields ?? []), clearKeys: [] },
+    [instanceFormKey('access', DEFAULT_INSTANCE_ID)]: {
+      draft: draftFromFields(body.access?.fields ?? []),
+      clearKeys: [],
+    },
   };
   for (const connector of body.connectors) {
-    forms[connector.id] = { draft: draftFromFields(connector.fields), clearKeys: [] };
+    forms[instanceFormKey(connector.id, DEFAULT_INSTANCE_ID)] = {
+      draft: draftFromFields(connector.fields),
+      clearKeys: [],
+    };
   }
   return forms;
+}
+
+/**
+ * 按需给一个 `(scope, instanceId)` 建草案，**只用那个实例自己的字段视图**。
+ *
+ * - 已经建好 → 原样返回（切回 A 时 A 的未保存内容还在）。
+ * - 没建好 → 用 `fields` 建一份。`fields` 必须是**这个实例**的已保存值；
+ *   拿不到就传空数组，让输入框空着，**不要**借默认实例的值冒充它。
+ */
+export function ensureInstanceForm(
+  forms: Record<string, FormState>,
+  scope: string,
+  instanceId: string,
+  fields: ConnectorField[],
+): Record<string, FormState> {
+  const key = instanceFormKey(scope, instanceId);
+  const existing = forms[key];
+  if (existing !== undefined) {
+    /*
+     * 已有键时**不能无条件早退**。
+     *
+     * 这个键可能在"字段视图还没回来"时就用**空字段列表**建过了
+     * （`handleInstanceView(..., null)` → `ensureInstanceForm(..., [])`）。
+     * 之后视图真的到了，若这里直接 return，草案就永远停在空的那份：字段行
+     * 照画（`connector.fields` 来自视图），输入框却全是空——
+     * 用户看到 14 个空框，以为这个实例什么都没配，而保存会把空值写上去。
+     *
+     * 所以只在"现有草案是空的、而新字段不为空"时重建。用户已经改过的草案
+     * （`draft` 非空或 `clearKeys` 非空）一律保留——那是他的未保存输入。
+     */
+    const untouched =
+      existing.clearKeys.length === 0 && Object.keys(existing.draft).length === 0;
+    if (!untouched || fields.length === 0) return forms;
+    return { ...forms, [key]: { draft: draftFromFields(fields), clearKeys: [] } };
+  }
+  return {
+    ...forms,
+    [key]: { draft: draftFromFields(fields), clearKeys: [] },
+  };
 }
 
 export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [forms, setForms] = useState<Record<string, FormState>>({});
+  /**
+   * 每个 scope 当前选中的实例。面板上报、页面存——保存要用它拼 `?instance_id=`，
+   * 草案分区也要用它。
+   *
+   * 默认 `default`：面板第一帧选中后端排序第一个（默认实例排最前），在它上报
+   * 之前保存只会落到默认实例上，与升级前（`PUT` 不带 `instance_id`）等价。
+   */
+  const [selectedInstance, setSelectedInstance] = useState<Record<string, string>>({});
+  /**
+   * 面板按选中实例重读到的字段视图：`scope → 该实例的字段`。
+   *
+   * 页面级 GET 只带默认实例的视图；非默认实例的"已保存的值"只有面板按
+   * `?instance_id=` 读得到，所以由面板回灌到页面，页面再拿它给卡片当字段来源，
+   * 并在切换（或视图迟到）时用**这个实例自己的值**建草案。
+   */
+  const [instanceFields, setInstanceFields] = useState<Record<string, ConnectorField[]>>({});
+  /**
+   * `scope → 选中实例的字段视图**不可得**`（读取失败，或响应没回显实例）。
+   *
+   * 与"这个实例确实什么都没配"是两件事，界面上也不能一样：前者要把输入框
+   * 空着**并说明为什么空**，否则空表单会被读成"它真的是空的"。所以不能只靠
+   * `instanceFields[scope] === undefined` 一个信号表达两种含义。
+   */
+  const [instanceUnverified, setInstanceUnverified] = useState<Record<string, boolean>>({});
   const [pending, setPending] = useState<Record<string, PendingState>>({});
   const [resetting, setResetting] = useState(false);
   const [resetNotice, setResetNotice] = useState<SaveNotice | null>(null);
@@ -1119,12 +1332,21 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
   const body = state.status === 'ready' ? state.body : null;
   const canEdit = body?.can_edit === true;
 
+  /** 某个 scope 当前选中的实例 id（没有选中时按默认实例）。 */
+  const instanceOf = useCallback(
+    (scope: string) => selectedInstance[scope] ?? DEFAULT_INSTANCE_ID,
+    [selectedInstance],
+  );
+
   /**
    * 重新读一次 GET。
    *
-   * `resetDrafts` 为真时丢弃草案（刷新 = 按服务端现状重填）；为假时保留用户
-   * 正在改的内容（保存失败后他还要接着改）。**notice 不动**：那条描述的是
-   * "上一次保存怎么了"，刷新不会让它过期，反而正是 409 之后要留下的信息。
+   * `resetDrafts` 为真时丢弃默认实例的草案（刷新 = 按服务端现状重填）；为假时
+   * 保留用户正在改的内容（保存失败后他还要接着改）。**notice 不动**：那条描述
+   * 的是"上一次保存怎么了"，刷新不会让它过期，反而正是 409 之后要留下的信息。
+   *
+   * 非默认实例的草案**一律保留**：页面级 GET 不带实例，这里拿不到它们的现状，
+   * 丢弃就等于悄悄替用户撤销了输入。
    */
   const reload = useCallback(async (resetDrafts: boolean) => {
     try {
@@ -1132,9 +1354,15 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       setState({ status: 'ready', body: next });
       setForms((previous) => {
         const fresh = formsOf(next);
-        if (resetDrafts) return fresh;
+        if (resetDrafts) {
+          const kept: Record<string, FormState> = {};
+          for (const [key, form] of Object.entries(previous)) {
+            if (!Object.prototype.hasOwnProperty.call(fresh, key)) kept[key] = form;
+          }
+          return { ...kept, ...fresh };
+        }
         const merged: Record<string, FormState> = {};
-        for (const [scope, form] of Object.entries(fresh)) merged[scope] = previous[scope] ?? form;
+        for (const [key, form] of Object.entries(fresh)) merged[key] = previous[key] ?? form;
         return merged;
       });
     } catch (err) {
@@ -1151,34 +1379,105 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
     void load();
   }, [load]);
 
-  const editField = useCallback((scope: string, key: string, value: FieldDraft) => {
-    setForms((previous) => {
-      const form = previous[scope];
-      if (!form) return previous;
-      // 一旦手工编辑这一项，就不再是"待清除"。
-      return {
-        ...previous,
-        [scope]: {
-          draft: { ...form.draft, [key]: value },
-          clearKeys: form.clearKeys.filter((item) => item !== key),
-        },
-      };
-    });
-    setPending((previous) => ({
-      ...previous,
-      [scope]: { ...(previous[scope] ?? IDLE), notice: null, fieldError: null },
-    }));
+  /**
+   * 面板上报：它按实例读到了什么。
+   *
+   * 只报选中、不报视图的话，切换后卡片没有这个实例的字段可分。收到视图后
+   * 立刻按它建草案；拿不到视图就走"不可得"那条路：输入框空着、并说明为什么
+   * 空。**空着是诚实的，画出默认实例的值不是。**
+   *
+   * `instanceFields`（画什么）与 `instanceUnverified`（能不能当真）必须成对
+   * 更新：只改一份就会出现"空表单看起来像这个实例真的没配"。
+   */
+  const handleInstanceView = useCallback(
+    (scope: string, instanceId: string, fields: ConnectorField[] | null) => {
+      if (instanceId === DEFAULT_INSTANCE_ID) return;
+      /*
+       * 键**必须带 instanceId**。
+       *
+       * 从前这里是 `instanceFields[scope]`、`instanceUnverified[scope]`——一个
+       * scope 只能记住"最后一次读到的那个实例"的字段。于是：
+       *
+       *   alpha（已保存 …21）→ 切 beta（读到 …22，写进 instanceFields['onebot']）
+       *   → 切回 alpha
+       *
+       * 切回时页面拿到的 `fields` 还是 **beta 的 …22**，而 `form.draft` 是
+       * alpha 的。用户看到的是 B 的值，点保存就把 B 的配置写进了 A——
+       * 交接书点名的那个雷的**镜像形态**（显示 B、存进 A）。
+       *
+       * `instanceFormKey` 早就是 `(scope, instanceId)` 分区的，只有这两份没跟上。
+       */
+      const viewKey = instanceFormKey(scope, instanceId);
+      setInstanceFields((previous) => {
+        if (fields === null) {
+          if (!Object.prototype.hasOwnProperty.call(previous, viewKey)) return previous;
+          const next = { ...previous };
+          delete next[viewKey];
+          return next;
+        }
+        if (previous[viewKey] === fields) return previous;
+        return { ...previous, [viewKey]: fields };
+      });
+      setInstanceUnverified((previous) => {
+        const was = previous[viewKey] === true;
+        if (fields === null) {
+          return was ? previous : { ...previous, [viewKey]: true };
+        }
+        if (!was) return previous;
+        const next = { ...previous };
+        delete next[viewKey];
+        return next;
+      });
+      setForms((previous) => ensureInstanceForm(previous, scope, instanceId, fields ?? []));
+    },
+    [],
+  );
+
+  const selectInstance = useCallback((scope: string, instanceId: string) => {
+    setSelectedInstance((previous) =>
+      previous[scope] === instanceId ? previous : { ...previous, [scope]: instanceId },
+    );
   }, []);
 
-  const toggleClear = useCallback((scope: string, key: string) => {
+  /**
+   * 编辑某个 `(scope, instanceId)` 的一项。
+   *
+   * `instanceId` **由调用方显式传入**（取自渲染这一帧所用的实例），不在回调里
+   * 现读 `selectedInstance`：回调可能晚于一次切换执行，现读会把 A 的输入写进
+   * 刚刚选中的 B——这正是要防的那个串稿。
+   */
+  const editField = useCallback(
+    (scope: string, instanceId: string, key: string, value: FieldDraft) => {
+      setForms((previous) => {
+        const form = previous[instanceFormKey(scope, instanceId)];
+        if (!form) return previous;
+        // 一旦手工编辑这一项，就不再是"待清除"。
+        return {
+          ...previous,
+          [instanceFormKey(scope, instanceId)]: {
+            draft: { ...form.draft, [key]: value },
+            clearKeys: form.clearKeys.filter((item) => item !== key),
+          },
+        };
+      });
+      setPending((previous) => ({
+        ...previous,
+        [scope]: { ...(previous[scope] ?? IDLE), notice: null, fieldError: null },
+      }));
+    },
+    [],
+  );
+
+  const toggleClear = useCallback((scope: string, instanceId: string, key: string) => {
+    const formKey = instanceFormKey(scope, instanceId);
     setForms((previous) => {
-      const form = previous[scope];
+      const form = previous[formKey];
       if (!form) return previous;
       const on = form.clearKeys.includes(key);
       const draft = form.draft[key];
       return {
         ...previous,
-        [scope]: {
+        [formKey]: {
           // 清除密钥时把输入框里没保存的内容一起清掉：留着它会让"清除"
           // 与"我要设置新值"这两种意图混在同一个表单里。
           draft:
@@ -1195,29 +1494,43 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
     }));
   }, []);
 
+  /**
+   * 撤销某个 `(scope, instanceId)` 的改动。
+   *
+   * 非默认实例的"已保存的值"页面级 GET 拿不到，只有面板按实例读回的那份
+   * （`instanceFields[scope]`）。两处都没有就退化成空表单（"撤销"不是"回填
+   * 别人的值"）。
+   */
   const revertDraft = useCallback(
-    (scope: string) => {
-      if (!body) return;
-      const fields =
-        scope === 'access'
-          ? (body.access?.fields ?? [])
-          : (body.connectors.find((item) => item.id === scope)?.fields ?? []);
+    (scope: string, instanceId: string, fields: ConnectorField[]) => {
       setForms((previous) => ({
         ...previous,
-        [scope]: { draft: draftFromFields(fields), clearKeys: [] },
+        [instanceFormKey(scope, instanceId)]: { draft: draftFromFields(fields), clearKeys: [] },
       }));
       setPending((previous) => ({ ...previous, [scope]: { ...IDLE } }));
     },
-    [body],
+    [],
   );
 
   /**
-   * 保存一个 scope。**不乐观更新**：只有 `state==='active'` 才算生效，
-   * 且生效后一定要重新读 GET（卡片状态来自服务端，不能本地拼）。
+   * 保存一个 `(scope, instanceId)`。
+   *
+   * **不乐观更新**：只有 `state==='active'` 才算生效，且生效后一定要重新读 GET
+   * （卡片状态来自服务端，不能本地拼）。
+   *
+   * `instanceId` 显式传入并原样作为 `PUT` 的 query 参数：草案分区键、请求参数、
+   * 生效后重建草案用的字段，三者必须是**同一个**实例——少一处就会出现
+   * "改了 A、存到 B、界面还画着 A 的草稿"。
    */
   const save = useCallback(
-    async (scope: string, fields: ConnectorField[], generation: number) => {
-      const form = forms[scope];
+    async (
+      scope: string,
+      instanceId: string,
+      fields: ConnectorField[],
+      generation: number,
+    ) => {
+      const formKey = instanceFormKey(scope, instanceId);
+      const form = forms[formKey];
       if (!form) return;
       const { change } = buildConnectorChange(fields, form.draft, form.clearKeys);
       if (Object.keys(change.set).length === 0 && change.clear.length === 0) {
@@ -1240,7 +1553,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         [scope]: { saving: true, notice: null, fieldError: null },
       }));
       try {
-        const result = await api.saveConnectorConfig(scope, change, generation);
+        const result = await api.saveConnectorConfig(scope, change, generation, instanceId);
         setPending((previous) => ({
           ...previous,
           [scope]: { saving: false, notice: describeChangeResult(result), fieldError: null },
@@ -1251,7 +1564,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         if (settled) {
           setForms((previous) => ({
             ...previous,
-            [scope]: { draft: draftFromFields(fields), clearKeys: [] },
+            [formKey]: { draft: draftFromFields(fields), clearKeys: [] },
           }));
         }
         await reload(settled);
@@ -1292,20 +1605,28 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
   const anySaving = resetting || Object.values(pending).some((item) => item.saving);
 
-  const formProps = (
+  /**
+   * 渲染一张卡片需要的表单状态。
+   *
+   * `instanceId` 与 `fields` 由调用方给出**同一个实例的**两样东西：
+   * 草案按 `(scope, instanceId)` 取，字段视图是同一实例的已保存值。
+   * 两者错配就是"在 B 的界面上画 A 的值"，所以放在一个参数位上一起传。
+   */
+  const formPropsFor = (
     scope: string,
+    instanceId: string,
     fields: ConnectorField[],
     generation: number,
   ): ConnectorFormProps => {
     const now = pending[scope] ?? IDLE;
-    const form = forms[scope];
+    const form = forms[instanceFormKey(scope, instanceId)];
     return {
       draft: form?.draft ?? {},
       clearKeys: form?.clearKeys ?? [],
-      onEdit: (key, value) => editField(scope, key, value),
-      onToggleClear: (key) => toggleClear(scope, key),
-      onResetDraft: () => revertDraft(scope),
-      onSave: () => void save(scope, fields, generation),
+      onEdit: (key, value) => editField(scope, instanceId, key, value),
+      onToggleClear: (key) => toggleClear(scope, instanceId, key),
+      onResetDraft: () => revertDraft(scope, instanceId, fields),
+      onSave: () => void save(scope, instanceId, fields, generation),
       saving: now.saving,
       formNote: now.saving ? '正在保存：要等服务端切换完成才算生效…' : null,
       notice: now.notice,
@@ -1419,19 +1740,62 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       ) : null}
 
       {state.status === 'ready'
-        ? state.body.connectors.map((connector) => (
-            <ConnectorCard
-              key={connector.id}
-              connector={connector}
-              {...formProps(connector.id, connector.fields, connector.generation)}
-            />
-          ))
+        ? state.body.connectors.map((connector) => {
+            const instanceId = instanceOf(connector.id);
+            /*
+             * 卡片画哪个实例的字段：选中的是默认实例 → 页面级视图（本来就是它的）；
+             * 其余 → 面板按 `?instance_id=` 读回、且**能证明**属于它的那份。
+             * 还没有那份视图时用**空字段列表**，让输入框空着——画默认实例的值
+             * 会让人以为 B 已经配好了，那正是"名字比实现强"。
+             */
+            const fields =
+              instanceId === DEFAULT_INSTANCE_ID
+                ? connector.fields
+                : (instanceFields[instanceFormKey(connector.id, instanceId)] ?? []);
+            const view: ConnectorView =
+              instanceId === DEFAULT_INSTANCE_ID ? connector : { ...connector, fields };
+            return (
+              <ConnectorCard
+                /*
+                 * 卡片本身**不**带 `key={instanceId}`：那会连面板一起重建，
+                 * 面板的选中态和列表会被打回初始值。切实例的"物理隔离"由表单
+                 * 子树自己的 `key` 负责（见卡片里 `<form>` 上那条注释）。
+                 */
+                key={connector.id}
+                connector={view}
+                /*
+                 * 面板自己那份**默认实例**视图：它不随选中变化，所以卡片上
+                 * 「四态诊断」讲的始终是"这条渠道现在怎么样"，而不是去读一个
+                 * 被换成**空字段数组**的视图（那会让面板 `draftFromFields([])`
+                 * 拿不到字段、直接抛错整块崩掉）。
+                 */
+                panelConnector={connector}
+                instanceId={instanceId}
+                onSelectInstance={(next) => selectInstance(connector.id, next)}
+                onInstanceView={(nextId, nextFields) =>
+                  handleInstanceView(connector.id, nextId, nextFields)
+                }
+                /*
+                 * 非默认实例、且它的字段视图还没读回（或读失败）：说明**为什么
+                 * 空着**，而不是让一个空表单被读成"这个实例真的什么都没配"。
+                 */
+                emptyFieldsReason={
+                  instanceId !== DEFAULT_INSTANCE_ID && fields.length === 0
+                    ? instanceUnverified[instanceFormKey(connector.id, instanceId)] === true
+                      ? '没读到这个实例的字段视图（读取失败，或响应没说明它读的是哪个实例）。下面的输入框因此是空的——它不代表这个实例的配置为空，保存前请先确认。'
+                      : '正在读取这个实例的字段视图…读到之前下面的输入框是空的，它们不代表这个实例的配置为空。'
+                    : null
+                }
+                {...formPropsFor(connector.id, instanceId, fields, connector.generation)}
+              />
+            );
+          })
         : null}
 
       {state.status === 'ready' && state.body.access ? (
         <AccessCard
           group={state.body.access}
-          {...formProps('access', state.body.access.fields, state.body.access.generation)}
+          {...formPropsFor('access', DEFAULT_INSTANCE_ID, state.body.access.fields, state.body.access.generation)}
         />
       ) : null}
 

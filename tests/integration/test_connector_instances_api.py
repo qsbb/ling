@@ -736,3 +736,237 @@ async def test_bootstrap_default_does_not_create_on_new_scope_rows_twice(
             ).scalars()
         )
         assert len(rows) == 1
+
+
+# ---------------------------------------------------------------- 10. 读路径也认实例
+#
+# 上面第 8 节证明了"**写**路径认实例"。但读路径曾经硬绑默认实例：
+# `GET /v1/settings/connectors` 不传 `?instance_id=` 时永远读 `default`，
+# 于是切到实例 B，页面右侧显示的仍是默认实例的值——**形状完全正常**，
+# 看不出来串了。下面这一组守的就是读路径。
+#
+# 变异验证：删掉 `_connector_field_views` / `_activation_views` 里新加的
+# `instance_id=` 过滤，或把 `get_connectors` 的 `target_instance` 写死成
+# `DEFAULT_INSTANCE_ID`，第 1 条（下头 `..._reads_each_instances_own_...`）必须红。
+
+
+async def _read(env: TestEnv, *, instance_id: str | None = None):
+    """读接入器视图。``instance_id`` 走 query 参数（缺省 = 默认实例）。"""
+    params = {"instance_id": instance_id} if instance_id is not None else None
+    return await env.client.get(BASE, params=params)
+
+
+def _onebot_field(body: dict[str, Any], key: str) -> dict[str, Any]:
+    """从响应里取出 ``onebot`` 渠道的某个字段视图。"""
+    for connector in body["connectors"]:
+        if connector["id"] == "onebot":
+            for field in connector["fields"]:
+                if field["key"] == key:
+                    return field
+    raise AssertionError(f"onebot 里没有字段 {key}")
+
+
+def _onebot_connector(body: dict[str, Any]) -> dict[str, Any]:
+    for connector in body["connectors"]:
+        if connector["id"] == "onebot":
+            return connector
+    raise AssertionError("响应里没有 onebot 渠道")
+
+
+async def test_read_path_returns_each_instances_own_config(
+    logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    """**核心**：A / B 各存一份不同配置，分别读回各自的。
+
+    这是"写对了但读串了"的照妖镜。如果 ``GET /settings/connectors?instance_id=``
+    被忽略（仍然硬绑默认实例），两次读都会拿到默认实例的 ``100200400``，
+    第二条断言红。
+
+    两条断言**必须都查**：只查"读 B 得到 B 的值"时，如果两份配置恰好相同，
+    错误实现也会绿；所以这里刻意让两份值不同，且两侧各断言一次。
+    """
+    assert (
+        await _create(logged_in, display_name="默认实例", instance_id=DEFAULT_INSTANCE_ID)
+    ).status_code == 201
+    assert (
+        await _create(logged_in, display_name="第二台", instance_id="second")
+    ).status_code == 201
+    assert (
+        await _save(logged_in, instance_id=DEFAULT_INSTANCE_ID,
+                    set_values={"LING_ONEBOT_SELF_ID": "100200400"})
+    ).status_code == 202
+    assert (
+        await _save(logged_in, instance_id="second",
+                    set_values={"LING_ONEBOT_SELF_ID": "100200401"})
+    ).status_code == 202
+
+    default_body = (await _read(logged_in, instance_id=DEFAULT_INSTANCE_ID)).json()
+    second_body = (await _read(logged_in, instance_id="second")).json()
+
+    # 回显：告诉前端"你拿到的是哪一份"
+    assert default_body["instance_id"] == DEFAULT_INSTANCE_ID
+    assert second_body["instance_id"] == "second"
+
+    # 字段值分别属于各自的实例
+    assert _onebot_field(default_body, "LING_ONEBOT_SELF_ID")["value"] == "100200400"
+    assert _onebot_field(second_body, "LING_ONEBOT_SELF_ID")["value"] == "100200401"
+
+    # activation 段也必须按实例取：两个实例各一代、各自的 active 修订。
+    # 只按 scope 查 `latest_revision` 时，谁最后写谁就被两个实例同时看到。
+    default_conn = _onebot_connector(default_body)
+    second_conn = _onebot_connector(second_body)
+    assert default_conn["generation"] == 1
+    assert second_conn["generation"] == 1
+    assert (
+        default_conn["activation"]["active_revision_id"]
+        != second_conn["activation"]["active_revision_id"]
+    )
+    # last_revision_id 是"该实例最近一条修订"；串了就会两边相同
+    assert (
+        default_conn["activation"]["last_revision_id"]
+        != second_conn["activation"]["last_revision_id"]
+    )
+
+
+async def test_read_without_instance_id_reads_default(
+    logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    """**向后兼容**：不传 ``instance_id`` → 默认实例（与上一条配对）。
+
+    这条与上一条必须同时存在：只断言"传了能读到 B"，证明不了"不传仍然是
+    默认实例"——一个把缺省当成"返回 B"的实现也会让上一条绿。
+    """
+    assert (
+        await _create(logged_in, display_name="默认实例", instance_id=DEFAULT_INSTANCE_ID)
+    ).status_code == 201
+    assert (
+        await _create(logged_in, display_name="第二台", instance_id="second")
+    ).status_code == 201
+    assert (
+        await _save(logged_in, instance_id=DEFAULT_INSTANCE_ID,
+                    set_values={"LING_ONEBOT_SELF_ID": "100200402"})
+    ).status_code == 202
+    assert (
+        await _save(logged_in, instance_id="second",
+                    set_values={"LING_ONEBOT_SELF_ID": "100200403"})
+    ).status_code == 202
+
+    body = (await _read(logged_in)).json()
+    assert body["instance_id"] == DEFAULT_INSTANCE_ID
+    assert _onebot_field(body, "LING_ONEBOT_SELF_ID")["value"] == "100200402"
+
+
+async def test_read_missing_instance_id_falls_back_per_scope_visibly(
+    logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    """读一个在某 scope 上**不存在**的实例 → 该 scope 退回默认实例，且**回显可见**。
+
+    ## 为什么不是整条 404
+
+    实例**只在 scope 内存在**。用户通常只在一个 scope 上建实例（只给 onebot
+    配了第二台号），另外两个 scope 上根本没有同名实例。整条 404 会让"切到
+    实例 B"看到的是一个错误页——连 onebot 上那份本来能看的配置也没了。
+
+    ## 为什么回退必须可见
+
+    **安静退回默认实例正是这个缺口本来的形状**：用户以为在看 B，实际是 A，
+    而界面照常显示。所以回退必须体现在响应里——``instances`` 逐 scope 给出
+    真正读了哪一份。
+
+    区分力：
+    - 读路径仍硬绑默认实例 → 第一条值与第二条 ``instances`` 断言都红
+      （读到默认实例的 ``100200405``，且 onebot 被标成 ``default``）
+    - 按实例读但不回显 → ``instances`` 断言红（前端无从知道退回了）
+    """
+    assert (
+        await _create(logged_in, display_name="第二台", instance_id="second")
+    ).status_code == 201
+    # 默认实例也建一份、存一份**不同**的值：若 onebot 被退回默认实例，读到的会是它
+    assert (
+        await _create(logged_in, display_name="默认实例", instance_id=DEFAULT_INSTANCE_ID)
+    ).status_code == 201
+    assert (
+        await _save(logged_in, instance_id=DEFAULT_INSTANCE_ID,
+                    set_values={"LING_ONEBOT_SELF_ID": "100200405"})
+    ).status_code == 202
+    assert (
+        await _save(logged_in, instance_id="second",
+                    set_values={"LING_ONEBOT_SELF_ID": "100200406"})
+    ).status_code == 202
+
+    response = await _read(logged_in, instance_id="second")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # 逐 scope 实际读取的实例：onebot 有 second，其余两个 scope 退回默认实例
+    assert body["instances"]["onebot"] == "second"
+    assert body["instances"]["qqbot"] == DEFAULT_INSTANCE_ID
+    assert body["instances"]["access"] == DEFAULT_INSTANCE_ID
+
+    # 值必须来自 second（不是默认实例那一份）
+    assert _onebot_field(body, "LING_ONEBOT_SELF_ID")["value"] == "100200406"
+
+
+async def test_read_soft_deleted_instance_is_409(
+    logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    """读一个**已软删**的实例 → 409 ``instance_deleted``（不是静默回退、不是 200）。
+
+    与"不存在"配对：不存在在该 scope 上**可见地**退回默认实例，而已软删直接
+    409——因为"这台被删了"和"这台从来没有"对用户是两件事，提示不该混成一句。
+    把软删也做成静默回退，会让用户对着一个已删除实例的配置面板继续编辑。
+    """
+    assert (
+        await _create(logged_in, display_name="待删", instance_id="gone")
+    ).status_code == 201
+    deleted = await logged_in.client.request(
+        "DELETE",
+        _instances_url("onebot", instance_id="gone"),
+        headers={**ORIGIN, "Content-Type": "application/json"},
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    response = await _read(logged_in, instance_id="gone")
+    assert response.status_code == 409, response.text
+    assert _detail(response) == "instance_deleted"
+
+
+async def test_read_default_instance_without_directory_row_still_works(
+    logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    """**GET 不要求目录行存在**，也不补建它。
+
+    升级前的存量配置全在默认实例上，而目录表可能根本没有那一行（迁移只给
+    "有过数据"的 scope 回填；全新部署表是空的）。若读路径像写路径那样
+    ``require_live``，老部署打开设置页就会 404。**GET 是读路径，不该有副作用**：
+    这条同时断言"读到 200"与"库里没有多出一行"。
+    """
+    async with session_scope() as session:
+        before = list(
+            (
+                await session.execute(
+                    select(ConnectorInstance).where(
+                        ConnectorInstance.scope == "onebot",
+                        ConnectorInstance.instance_id == DEFAULT_INSTANCE_ID,
+                    )
+                )
+            ).scalars()
+        )
+    assert before == [], "前提：目录里一开始没有默认实例行"
+
+    response = await _read(logged_in)
+    assert response.status_code == 200, response.text
+    assert response.json()["instance_id"] == DEFAULT_INSTANCE_ID
+
+    async with session_scope() as session:
+        after = list(
+            (
+                await session.execute(
+                    select(ConnectorInstance).where(
+                        ConnectorInstance.scope == "onebot",
+                        ConnectorInstance.instance_id == DEFAULT_INSTANCE_ID,
+                    )
+                )
+            ).scalars()
+        )
+    assert after == [], "GET 不应该补建实例行（读路径无副作用）"

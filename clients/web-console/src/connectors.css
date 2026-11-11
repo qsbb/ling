@@ -521,3 +521,284 @@
     flex: 1 1 100%;
   }
 }
+
+/* ---------------------------------------------------------------- 实例 */
+
+/*
+ * 实例面板：左列表、右详情。
+ *
+ * 几条不靠颜色表达的事：
+ * - 选中态：`aria-current` + 左边一条实色条 + 加粗，不只靠底色深浅
+ *   （黑白打印与色弱下仍分得清）；
+ * - 「默认」与「已停用」是**两个独立的标签**，不是一种状态：默认实例也可以
+ *   被停用，把两者并成一个徽标会让"默认实例被停用了"看不出来。
+ */
+
+.connector-instances-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.connector-instances-section__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.connector-instances-section__hint {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.connector-instances__layout {
+  display: grid;
+  /* 236px 与 `model-settings.css` 左栏同宽：同一页里两块列表宽度不一致很像 bug。 */
+  grid-template-columns: 236px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.connector-instances__rail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.connector-instances__rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 2px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+.connector-instances__count {
+  font-variant-numeric: tabular-nums;
+}
+
+.connector-instance-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.connector-instance-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--paper-raised);
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.connector-instance-item:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+
+/* 选中态：实色左条 + 加粗，不只靠背景深浅。 */
+.connector-instance-item--active {
+  border-left-color: var(--accent, #6b5a3e);
+  background: var(--paper);
+  box-shadow: 0 1px 2px rgba(58, 48, 34, 0.06);
+}
+
+.connector-instance-item--active .connector-instance-item__name {
+  font-weight: 600;
+}
+
+.connector-instance-item__main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.connector-instance-item__name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 身份是 id，不是给人读的 prose：等宽，且与显示名分开一行。 */
+.connector-instance-item__id {
+  font-size: 10.5px;
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-instance-item__tags {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.connector-instance-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.connector-instance-tag--default {
+  border-color: var(--line-strong);
+  font-weight: 600;
+}
+
+.connector-instance-tag--on {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.connector-instance-tag--off {
+  color: var(--ink-soft);
+}
+
+.connector-instance-tag--dirty {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.connector-instances__empty,
+.connector-instances__error {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.connector-instances__error {
+  border-style: solid;
+  border-left: 4px solid var(--danger);
+}
+
+.connector-instances__error strong {
+  color: var(--danger);
+}
+
+.connector-instance-create {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.connector-instance-create__label {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.connector-instance-create__error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.connector-instances__detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.connector-instances__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.connector-instances__rename {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/*
+ * 「已保存值不是这个实例的」：左边一条 warn 色条 —— 这条会改变用户对屏幕上
+ * 数字的解读，不能做得比普通提示更轻。
+ */
+.connector-instances__view-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  font-size: 12.5px;
+}
+
+@media (max-width: 900px) {
+  .connector-instances__layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 窄屏列表横排可滑，选中的那一项不会被挤到看不见的地方。 */
+  .connector-instance-list {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 3px;
+    scrollbar-width: thin;
+  }
+
+  .connector-instance-list > li {
+    min-width: 200px;
+  }
+}
+
+@media (max-width: 560px) {
+  .connector-instance-list {
+    flex-direction: column;
+    overflow-x: visible;
+    padding-bottom: 0;
+  }
+
+  .connector-instance-list > li {
+    min-width: 0;
+  }
+
+  /* 触控目标 ≥44px，与页面其它控件一致。 */
+  .connector-instances .connector-instance-item,
+  .connector-instances .button,
+  .connector-instance-create .button,
+  .connector-instance-create .connector-input {
+    min-height: 44px;
+  }
+
+  .connector-instances__toolbar .button {
+    flex: 1 1 auto;
+  }
+}

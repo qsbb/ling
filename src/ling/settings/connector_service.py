@@ -331,11 +331,17 @@ class ConnectorConfigService:
         session: AsyncSession,
         *,
         scope: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
         include_secrets: bool = False,
     ) -> ov.ResolvedConnectorConfig:
+        """解析某个 scope 在**某个实例**上的有效配置。
+
+        ``instance_id`` 缺省 ``'default'``：单实例部署与升级前行为一致。
+        """
         return await ov.resolve_field_values(
             session,
             scope=scope,
+            instance_id=instance_id,
             settings=self._settings,
             onebot=self._onebot,
             qqbot=self._qqbot,
@@ -859,23 +865,15 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-async def latest_revision(session: AsyncSession, scope: str) -> Any:
-    """该 scope 最近一条修订（用于 activation 段回显上次结果）。"""
-    from sqlalchemy import select
+async def latest_revision(
+    session: AsyncSession, scope: str, *, instance_id: str = DEFAULT_INSTANCE_ID
+) -> Any:
+    """该 **scope + 实例** 最近一条修订（用于 activation 段回显上次结果）。
 
-    from ling.infra.models import ConnectorConfigRevision
-
-    return (
-        await session.execute(
-            select(ConnectorConfigRevision)
-            .where(ConnectorConfigRevision.scope == scope)
-            .order_by(ConnectorConfigRevision.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
-
-async def pending_revision(session: AsyncSession, scope: str) -> Any:
+    实例维度不是可选装饰：修订表里同一 scope 下有两个实例的修订链，
+    只按 scope 过滤会让实例 B 的 ``activation`` 段回显出实例 A 的
+    ``last_revision_id`` / ``last_state``——而形状完全正常，看不出串了。
+    """
     from sqlalchemy import select
 
     from ling.infra.models import ConnectorConfigRevision
@@ -885,6 +883,32 @@ async def pending_revision(session: AsyncSession, scope: str) -> Any:
             select(ConnectorConfigRevision)
             .where(
                 ConnectorConfigRevision.scope == scope,
+                ConnectorConfigRevision.instance_id == instance_id,
+            )
+            .order_by(ConnectorConfigRevision.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def pending_revision(
+    session: AsyncSession, scope: str, *, instance_id: str = DEFAULT_INSTANCE_ID
+) -> Any:
+    """该 **scope + 实例** 上正在 pending/activating 的修订（没有则 ``None``）。
+
+    与 :func:`latest_revision` 同罪同罚：只按 scope 过滤会把实例 A 的"正在
+    切换"算到实例 B 头上，而"另一处正在生效"正是 409 的依据。
+    """
+    from sqlalchemy import select
+
+    from ling.infra.models import ConnectorConfigRevision
+
+    return (
+        await session.execute(
+            select(ConnectorConfigRevision)
+            .where(
+                ConnectorConfigRevision.scope == scope,
+                ConnectorConfigRevision.instance_id == instance_id,
                 ConnectorConfigRevision.state.in_((STATE_PENDING, STATE_ACTIVATING)),
             )
             .order_by(ConnectorConfigRevision.created_at.desc())

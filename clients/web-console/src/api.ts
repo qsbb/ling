@@ -33,6 +33,8 @@ import type {
   ConnectorChangeResult,
   ConnectorResetResponse,
   ConnectorsResponse,
+  ConnectorInstanceResponse,
+  ConnectorInstancesResponse,
   StopResponse,
   TaxonomyResponse,
   UserPreferencesResponse,
@@ -280,6 +282,16 @@ export function connectorErrorField(error: unknown): string | null {
   return typeof field === 'string' && field !== '' ? field : null;
 }
 
+/**
+ * 实例子资源的路径。`instance_id` 直接进路径段，所以**必须编码**：
+ * 它由后端派生（`i-<hex>` 或 slug），但客户端不该假设其中没有 `/` 或空格。
+ */
+function connectorInstancePath(scope: string, instanceId: string): string {
+  return `/v1/settings/connectors/${encodeURIComponent(scope)}/instances/${encodeURIComponent(
+    instanceId,
+  )}`;
+}
+
 /** 发送/重试返回原始 SSE 响应，由 sse.ts 解析。 */
 async function postStream(path: string, body: unknown | null, signal: AbortSignal): Promise<Response> {
   let response: Response;
@@ -502,15 +514,102 @@ export const api = {
    * 值落在 DB 覆盖层（容器根目录只读，写不了 `.env`）。这条读端点里**没有**
    * 密钥值：`kind==='secret'` 的字段连值都不进视图对象，只有 `configured`
    * 与（owner 才有的）`preview`。
+   *
+   * `instanceId` 走 **query 参数**：不给就是默认实例（升级前的行为）。给了
+   * 就必须存在且未软删，否则 404 / 409——**不静默回退默认实例**。
+   *
+   * 注意这条端点的响应契约里目前**没有**回显实际读取的实例，所以调用方拿到
+   * 一份 body 后**无法自证**它属于 `instanceId`。需要这个保证的地方必须自己
+   * 标出来（见 `ConnectorInstances.tsx` 的 `viewMatches`），不要把"我传了参数"
+   * 当成"我拿到了那一份"。
    */
-  connectors(): Promise<ConnectorsResponse> {
-    return request<ConnectorsResponse>('/v1/settings/connectors');
+  connectors(instanceId?: string | null): Promise<ConnectorsResponse> {
+    const query =
+      instanceId === undefined || instanceId === null || instanceId === ''
+        ? ''
+        : `?instance_id=${encodeURIComponent(instanceId)}`;
+    return request<ConnectorsResponse>(`/v1/settings/connectors${query}`);
   },
   /**
-   * 保存某个接入器的配置并**立刻尝试生效**（owner + 同源，见 `settings.py:788-815`）。
+   * 某个接入器下的实例（`GET /v1/settings/connectors/{scope}/instances`）。
+   *
+   * 默认**不含已软删的**（`include_deleted` 只给"查历史配置"那条路径用）。
+   * **全新部署返回的是空列表**，而且默认实例也还不存在——后端只在
+   * 保存配置（不带 `instance_id`）时才 `ensure_default` 补建它。
+   * 所以空列表必须在页面上有一个"新建第一个实例"的入口，不能当作错误。
+   */
+  connectorInstances(scope: string): Promise<ConnectorInstancesResponse> {
+    return request<ConnectorInstancesResponse>(
+      `/v1/settings/connectors/${encodeURIComponent(scope)}/instances`,
+    );
+  },
+  /**
+   * 新建实例（`POST .../instances`，201）。**真的建行**：返回的 `instance_id`
+   * 随后就能拿去 `saveConnectorConfig`。
+   *
+   * 不传 `instance_id` 时由后端按显示名派生（中文名派生不出时用 `i-<hex>`），
+   * **不在这里猜**：派生规则只有一份，猜错就会建出两个"同名"实例。
+   * 同 scope 下显示名重复 → 409 `duplicate_display_name`。
+   */
+  createConnectorInstance(
+    scope: string,
+    body: { display_name: string; enabled?: boolean },
+  ): Promise<ConnectorInstanceResponse> {
+    return request<ConnectorInstanceResponse>(
+      `/v1/settings/connectors/${encodeURIComponent(scope)}/instances`,
+      jsonInit('POST', body),
+    );
+  },
+  /** 改显示名（身份不变，`instance_id` 一个字都不动）。 */
+  renameConnectorInstance(
+    scope: string,
+    instanceId: string,
+    displayName: string,
+  ): Promise<ConnectorInstanceResponse> {
+    return request<ConnectorInstanceResponse>(
+      `${connectorInstancePath(scope, instanceId)}`,
+      jsonInit('PUT', { display_name: displayName }),
+    );
+  },
+  /** 启用/停用。停用**不动**已保存的配置与修订链。 */
+  setConnectorInstanceEnabled(
+    scope: string,
+    instanceId: string,
+    enabled: boolean,
+  ): Promise<ConnectorInstanceResponse> {
+    return request<ConnectorInstanceResponse>(
+      `${connectorInstancePath(scope, instanceId)}/enabled`,
+      jsonInit('PUT', { enabled }),
+    );
+  },
+  /**
+   * **软删**（置 `deleted_at`）：修订链与审计留着可查，名字从选择器里消失。
+   *
+   * 默认实例删不得（后端 409 `default_instance_protected`）——前端用列表里的
+   * `deletable` 先把按钮置灰，别让用户点了才看到错误。
+   */
+  deleteConnectorInstance(
+    scope: string,
+    instanceId: string,
+  ): Promise<ConnectorInstanceResponse> {
+    return request<ConnectorInstanceResponse>(connectorInstancePath(scope, instanceId), {
+      method: 'DELETE',
+    });
+  },
+  /**
+   * 保存某个接入器**某个实例**的配置并**立刻尝试生效**（`settings.py:830-1080`）。
    *
    * `ifMatch` 是卡片上的 `generation`：并发保存只有一个赢家，输了拿 409。
    * **202 不等于"已生效"**——终态看返回的 `state`，`rolled_back` 是失败。
+   *
+   * `instanceId` 是 **query 参数**（后端签名里 `instance_id: str | None = None`），
+   * 不是 body 里的键：body 是 `ConnectorChangeBody`，多塞一个 `instance_id`
+   * 只有被 pydantic 丢掉和被当成字段两种结局，两种都不是"指定了实例"。
+   *
+   * 不给 `instanceId` 时**必须**保持升级前那条路径（落到默认实例、默认实例
+   * 不存在时后端补建）。给了就必须真的存在且未软删：后端**不会**静默退回默认
+   * 实例——否则"保存到实例 B"会变成"覆盖了默认实例"，而写入方拿到的是一份
+   * 正常的 202。404 `instance_not_found` / 409 `instance_deleted` 如实上抛。
    *
    * 422/409 的响应体里带 `error.field`（哪个键错了），用
    * `connectorErrorField()` 取；非写路径的错误永远返回 null。
@@ -519,10 +618,16 @@ export const api = {
     scope: string,
     change: ConnectorChangeRequest,
     ifMatch: number,
+    instanceId?: string | null,
   ): Promise<ConnectorChangeResult> {
+    const path = `/v1/settings/connectors/${encodeURIComponent(scope)}`;
+    const query =
+      instanceId === undefined || instanceId === null || instanceId === ''
+        ? ''
+        : `?instance_id=${encodeURIComponent(instanceId)}`;
     let response: Response;
     try {
-      response = await fetch(`/v1/settings/connectors/${encodeURIComponent(scope)}`, {
+      response = await fetch(`${path}${query}`, {
         method: 'PUT',
         credentials: 'same-origin',
         headers: {
