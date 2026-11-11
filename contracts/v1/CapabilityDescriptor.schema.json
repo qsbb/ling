@@ -55,6 +55,21 @@
       "title": "Schema Version",
       "type": "string"
     },
+    "supported_media": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/Modality"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Supported Media"
+    },
     "supports_edit": {
       "default": false,
       "title": "Supports Edit",

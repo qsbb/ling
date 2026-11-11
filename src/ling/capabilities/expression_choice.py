@@ -23,7 +23,12 @@
 [at:770140]        群里点明在回谁
 [quote:123456]     引用某条消息回复
 [poke:770140]      拍一拍（不打断地提醒/亲昵）
+[speak]            这条用语音说（无参数）
 ```
+
+`[speak]` 与上面三个的区别：那三个是**投递给谁**的问题，`[speak]` 是
+**用什么形态**的问题。所以它单独解析（`parse_speak_choice`），也不进
+`Directive`——混在一起会让"没选语音"和"没选 @ 谁"变成同一个字段的两种空值。
 
 用方括号而不是自然语言（"@小明"），因为要**可逆地剥掉**：
 发出去的正文里不能残留这些标记，否则她的话就变成了说明书。
@@ -40,7 +45,22 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from ling.ports.speech import SPEAK_TAG
+
 _MARKER = re.compile(r"\[(at|quote|poke)\s*:\s*([^\]\s]{1,40})\]")
+
+#: `[speak]` 只允许出现在**起始控制区**：前导空白之后、正文第一个字之前。
+#:
+#: ## 为什么必须锚在开头
+#:
+#: 端口 §17.4 的原话：「不从用户内容、引用、工具结果、代码块或正文中间提取」。
+#: 不锚定的后果很具体：她写「他说『[speak] 是什么意思』」时，正文里的字面量
+#: 会被当成她的选择，于是**一条解释语法的文字回复变成了一条语音**。
+#: 更糟的是用户发来的内容里带这四个字，也能让她的回复变成语音。
+#:
+#: 允许多个前导空白与换行（模型常在标记前留空行），但**只认一个**标签，
+#: 且剥掉后必须还有正文。
+_SPEAK_PREFIX = re.compile(r"^\s*" + re.escape(SPEAK_TAG) + r"\s*")
 
 MAX_TARGETS = 3
 
@@ -85,6 +105,73 @@ def parse_expression(text: str) -> tuple[str, Directive]:
         return (text or ""), Directive()
 
     return cleaned, Directive(at=at, quote=quote, poke=poke)
+
+
+@dataclass(frozen=True)
+class SpeakChoice:
+    """她对「这条用文字还是语音」的选择。**是意图，不是结果。**
+
+    `explicit` 区分"她写了 `[speak]`"与"她什么都没写"：两者都是文字，
+    但原因完全不同——一个是主动选文字，一个是没表达。事后统计"她多久选一次
+    语音"必须能分开这两者，否则"选了文字"会被"没说话"稀释掉。
+    """
+
+    speak: bool
+    explicit: bool
+    #: 剥掉标签之后的正文。**调用方必须用这个**，不能用原始文本——
+    #: 否则 `[speak]` 会念出来。
+    text: str
+    #: 解析被拒时的原因（供日志与审计）。正常路径为空。
+    rejected: str = ""
+
+
+def parse_speak_choice(text: str) -> SpeakChoice:
+    """从她的最终回复里解析 `[speak]`。
+
+    ## 只认开头，且剥完必须还有正文
+
+    端口 §17.4 的四条规则这里逐条落地：
+
+    1. 只认**起始控制区**（`_SPEAK_PREFIX` 锚 `^`）；
+    2. 只允许一个**无参数**的 `[speak]`（正则里没留参数位）；
+    3. 不从正文中间/代码块/引用里提取（锚定天然排除）；
+    4. 剥完为空 → **明确无有效外发**，不沿用旧"剥离为空就恢复标签"的兜底。
+
+    第 4 条与 `parse_expression` 的取向**故意相反**：那里剥空要还原原文
+    （否则用户收到空消息），这里剥空意味着"她只写了个 `[speak]` 没有正文"——
+    发一条没有内容的语音毫无意义，而还原成 `[speak]` 会把说明书念给用户听。
+    两个兜底方向不同，是因为它们的失败后果不同。
+    """
+    raw = text or ""
+    match = _SPEAK_PREFIX.match(raw)
+    if match is None:
+        # 正文中间出现 `[speak]`：**不认**，但要如实报告，便于发现模型用错。
+        if SPEAK_TAG in raw:
+            return SpeakChoice(
+                speak=False,
+                explicit=False,
+                text=raw,
+                rejected=f"{SPEAK_TAG} 不在起始控制区，已忽略（不从正文中间提取）",
+            )
+        return SpeakChoice(speak=False, explicit=False, text=raw)
+
+    stripped = raw[match.end() :].strip()
+    if not stripped:
+        return SpeakChoice(
+            speak=False,
+            explicit=True,
+            text="",
+            rejected=f"去掉 {SPEAK_TAG} 后没有正文，无有效外发",
+        )
+    if _SPEAK_PREFIX.match(stripped):
+        # 写了两个：不猜哪个才算，按非法处理。
+        return SpeakChoice(
+            speak=False,
+            explicit=True,
+            text=stripped,
+            rejected=f"重复的 {SPEAK_TAG}，按非法控制处理",
+        )
+    return SpeakChoice(speak=True, explicit=True, text=stripped)
 
 
 def render_expression_help(*, is_group: bool, supports_poke: bool = True) -> str:
@@ -150,7 +237,9 @@ def render_recall_help(refs: list[str]) -> str:
 __all__ = [
     "MAX_TARGETS",
     "Directive",
+    "SpeakChoice",
     "parse_expression",
+    "parse_speak_choice",
     "render_expression_help",
     "render_recall_help",
 ]

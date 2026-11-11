@@ -25,6 +25,7 @@ from ling.ports.channel import (
     OutboundMessage,
     ReceiptQuery,
     delivery_text_digest,
+    iter_outbound_attachments,
 )
 
 # ---------------------------------------------------------------- 段级幂等
@@ -138,12 +139,27 @@ class DeliveryService:
         # 媒体能力必须单独挡。不挡的话会出现最糟的一种"成功"：
         # 文字发出去、图被静默丢弃、回执照样拿到——本地记成已送达，
         # 用户却什么都没看到。宁可在发送前就拒绝。
-        if message.media_refs and not caps.supports_media:
+        #
+        # **按类型逐个判断**，不再只看一个 `supports_media` 位。一个渠道能发
+        # 图片不代表能发语音：过去用一个 bit 时，发语音的请求在只支持图片的
+        # 渠道上会被放行，然后静默变成"只发了文字"或"发了一张图"。
+        #
+        # 兼容性：`media_refs`（legacy）经 `iter_outbound_attachments()` 一律
+        # 被当作 image，而 `media_supported(image)` 在旧声明
+        # `supports_media=True` 下返回 True——所以旧行为**完全等价**
+        # （旧渠道 + 旧 refs → 一律放行，与改动前一致）。
+        unsupported = [
+            attachment.kind.value
+            for attachment in iter_outbound_attachments(message)
+            if not caps.media_supported(attachment.modality)
+        ]
+        if unsupported:
             return await self._unsupported(
                 message,
                 actor_id,
                 subject_id,
-                f"渠道不支持发送媒体（{len(message.media_refs)} 个媒体引用未发送）",
+                "渠道不支持发送媒体"
+                f"（{len(unsupported)} 个未发送：{'、'.join(sorted(set(unsupported)))}）",
             )
         # 文本超限：**这里只做防御性拦截，不做切分**。
         #

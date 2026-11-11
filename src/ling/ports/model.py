@@ -34,6 +34,44 @@ class ProviderKind(StrEnum):
     # 由绑定按能力过滤（见 `PROVIDER_CAPABILITIES`）。
     cloudflare_embedding = "cloudflare_embedding"
     siliconflow_rerank = "siliconflow_rerank"
+    # ---------------------------------------------------- 语音合成（TTS）
+    #
+    # 三家**真实厂商**，各自一套 wire 协议，不能靠换 base_url 顶替：
+    #
+    # - ``minimax_tts``：MiniMax 专用 TTS 端点，JSON 进、hex 音频出。
+    #   用户口语里叫「mimotts」，那只是叫法，不是另一个供应商。
+    # - ``fish_audio``：FishAudio 专用端点，JSON 进、二进制音频出，
+    #   音色用 reference_id，模型名走 header。
+    # - ``mimo_chat`` / ``mimo_tts``：小米 MiMo，**同一个厂商、同一个
+    #   base_url（``https://api.xiaomimimo.com/v1``），但拆成两个 kind**。
+    #   理由见下方长注释——这是本模块最容易被误解的一处。
+    minimax_tts = "minimax_tts"
+    fishaudio_tts = "fishaudio_tts"
+    """FishAudio。**对外稳定值用 `fishaudio_tts`**（§17.2 定名）。
+
+    曾经写成 `fish_audio`，与**文件名** `models/fish_audio.py` 同形，但
+    "文件名不必为此改名"，对外配置值统一成 `fishaudio_tts`。旧的
+    `fish_audio` 保留在 `LEGACY_PROVIDER_KIND_ALIASES` 里做读取兼容——
+    **不能同时发布两个同义 kind**，那会让设置页出现两个都能选、
+    配出来行为一样的条目。
+    """
+    # MiMo 走的是 ``chat/completions``，不是专用 TTS 端点。所以它天然能
+    # 同时承担「对话」和「合成」两种角色——但**绝不允许一个 kind 同时声明
+    # 两种能力**。
+    #
+    # 为什么必须拆：`PROVIDER_CAPABILITIES` 是绑定校验的**唯一**能力闸
+    # （`kind_supports_profile` 只看它）。若 `mimo` 同时持 `{chat, tts}`，
+    # 那么 `speech.tts` 绑到它就会通过校验、`dialogue.fast` 绑到它也会通过，
+    # 「把 TTS 供应商塞进聊天槽位」这类错配就再也拦不住——fail-closed 原则
+    # 直接作废。能力表能表达的是"这个 kind 能服务哪些角色"，而"同一个人
+    # 既能聊天又能合成"是**配置层面**的事实，应该用两个 provider 条目表达，
+    # 不是一个 kind 带两个能力。
+    #
+    # 所以：用户在设置里加两条 provider，`base_url` 相同、`kind` 不同。
+    # 好处是两类流量的密钥、健康状态、计费计量天然分开，也不会有人在聊天时
+    # 误触发合成或反之。代价只是用户要多配一条——比"错绑拦不住"便宜得多。
+    mimo_chat = "mimo_chat"
+    mimo_tts = "mimo_tts"
 
 
 class ModelCapability(StrEnum):
@@ -46,9 +84,10 @@ class ModelCapability(StrEnum):
     为什么要这层而不是"按 kind 手写 if"：kind 与角色的对应关系一旦散落
     在界面、校验、装配三处，加一个供应商就要改三处，漏一处就是静默错配。
 
-    ``tts`` / ``asr`` 本期**只定义不启用**：语音 provider 还没实现，
-    先落枚举是因为它是公开契约——等 provider 写出来再改成员，
-    已经存下来的 kind → capability 表要跟着改一遍。
+    ``tts`` 现在**已有三家真实供应商**提供（见 `ProviderKind.minimax_tts` /
+    `fish_audio` / `mimo_tts`）。``asr`` 仍然**只定义不启用**：识别 provider
+    还没实现，任何 `speech.asr` 绑定都会被能力闸拦下——这是刻意的，
+    在那之前任何"绑定成功"都是假的。
     """
 
     chat = "chat"
@@ -69,7 +108,48 @@ PROVIDER_CAPABILITIES: dict[ProviderKind, frozenset[ModelCapability]] = {
     ProviderKind.local: frozenset({ModelCapability.chat}),
     ProviderKind.cloudflare_embedding: frozenset({ModelCapability.embed}),
     ProviderKind.siliconflow_rerank: frozenset({ModelCapability.rerank}),
+    # 三家 TTS：能力都**只有** tts。一个 kind 声明两种能力会破坏绑定闸门
+    # （见 `ProviderKind.mimo_chat` 的长注释）。
+    ProviderKind.minimax_tts: frozenset({ModelCapability.tts}),
+    ProviderKind.fishaudio_tts: frozenset({ModelCapability.tts}),
+    ProviderKind.mimo_chat: frozenset({ModelCapability.chat}),
+    ProviderKind.mimo_tts: frozenset({ModelCapability.tts}),
 }
+
+# 加 kind 时最容易犯的错是**忘了在上一张表里登记**。忘了的后果不是报错，
+# 而是那个 kind 在设置页里静默不可选、绑上去只说"不支持"——很难查。
+# 所以在导入时就断言穷举，让漏登记变成启动即崩的硬错误。
+_missing_kinds = set(ProviderKind) - set(PROVIDER_CAPABILITIES)
+if _missing_kinds:  # pragma: no cover - 只有在改漏时才触发
+    raise RuntimeError(
+        "PROVIDER_CAPABILITIES 漏登记了这些 ProviderKind："
+        f"{sorted(k.value for k in _missing_kinds)}"
+    )
+del _missing_kinds
+
+
+# 已经发出去过、后来改了名的 kind 值 → 现在的规范值。
+#
+# 为什么需要：`ProviderKind` 的取值是**公开契约**，会存进用户已有的配置
+# revision 里。直接改名会让老配置在读取时变成"未知供应商类型"——
+# 而那些配置本来是能用的。所以改名必须走别名，不能硬切。
+#
+# 为什么不能同时**发布**两个同义 kind：设置页会出现两个都能选、配出来行为
+# 完全一样的条目，用户无法判断该选哪个。别名只用于**读取**，写入一律规范值。
+LEGACY_PROVIDER_KIND_ALIASES: dict[str, str] = {
+    # FishAudio 定名前用过 `fish_audio`（与文件名同形）。§17.2 统一成
+    # `fishaudio_tts`，旧值保留为读取别名。
+    "fish_audio": ProviderKind.fishaudio_tts.value,
+}
+
+
+def normalize_provider_kind(kind: str) -> str:
+    """把可能的历史 kind 值规范成当前值。未知值原样返回（由调用方判失败）。
+
+    **写入路径必须先过这个函数**，否则用户改一下老供应商就会把别名值
+    又存回配置里，别名永远收不干净。
+    """
+    return LEGACY_PROVIDER_KIND_ALIASES.get(kind, kind)
 
 
 # 角色 → 它需要的能力。键必须与 `contracts/v1.ModelRole` 的取值一致
@@ -105,9 +185,13 @@ PROFILE_CAPABILITIES: dict[str, ModelCapability] = {
 
 
 def provider_capabilities(kind: str) -> frozenset[ModelCapability]:
-    """某个 kind 提供的能力。未知 kind → **空集**（失败关闭）。"""
+    """某个 kind 提供的能力。未知 kind → **空集**（失败关闭）。
+
+    先过 `normalize_provider_kind`：老配置里可能还存着历史 kind 值，
+    它们绑定时仍应正常匹配，否则用户升级后原本能用的绑定会突然"不支持"。
+    """
     try:
-        return PROVIDER_CAPABILITIES[ProviderKind(kind)]
+        return PROVIDER_CAPABILITIES[ProviderKind(normalize_provider_kind(kind))]
     except ValueError:
         return frozenset()
 
@@ -380,6 +464,7 @@ class ModelTarget:
 
 
 __all__ = [
+    "LEGACY_PROVIDER_KIND_ALIASES",
     "PROFILE_CAPABILITIES",
     "PROVIDER_CAPABILITIES",
     "ChatMessageIn",
@@ -396,6 +481,7 @@ __all__ = [
     "ProviderKind",
     "Usage",
     "kind_supports_profile",
+    "normalize_provider_kind",
     "provider_capabilities",
     "required_capability",
 ]

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from ling.ports.model import SLOT_LABELS, ModelTarget, slot_for_profile
 
@@ -157,6 +157,44 @@ class LifePolicy:
     max_live_plans: int = 4
 
 
+VoiceWillingness = Literal["reserved", "natural", "expressive"]
+"""她愿不愿意开口说话的三个**语义档**（§17.4）。
+
+用 `Literal` 而不是 `StrEnum`：这个值要原样进配置 JSON、进 API 校验、
+进前端联合类型，用字符串字面量能让 pydantic 的 `Literal` 直接做"非法值拒绝"
+（§17.4 要求「`DialoguePolicyIn` 同值校验」）。枚举成员在序列化时要多一层
+转换，而这个字段恰恰是"必须贯穿全链路"的那个——少一层转换少一处出错点。
+"""
+
+
+# 三档各自注入提示词的**确定文本**（§17.4 原文，逐字）。
+#
+# 为什么是"整句话"而不是枚举值：档位要影响她的表达，唯一可靠的落地方式就是
+# 把倾向说进提示词。放成一张表而不是散在拼提示词的各处，是为了让
+# "这几档到底告诉了模型什么"能一次看全、能被逐字测试。
+#
+# 三条共同的底线（都写在文本里，不靠代码强制）：
+# 1. 任何档位都允许她选择任一种表达——reserved 不是"禁止语音"，
+#    expressive 也不是"必须语音"。
+# 2. 对方的明确语境（"请文字" / "不方便听" / "读给我听"）优先于默认倾向，
+#    由她理解，不靠关键词强制器替她决定。
+# 3. 不为了用语音而改变要说的话。
+VOICE_WILLINGNESS_PROMPTS: dict[VoiceWillingness, str] = {
+    "reserved": (
+        "你通常偏向文字。对方希望听你说、安慰或情绪表达用声音更合适时，"
+        "可以自然选择语音；无需为用语音凑理由。"
+    ),
+    "natural": (
+        "你根据当下交流自然选择文字或语音。短句、亲近交流或声音更能传达情绪时可用语音；"
+        "需要复制、列信息或不方便收听时偏向文字。"
+    ),
+    "expressive": (
+        "在适合听语音的情境下，你更愿意开口说话。仍需顾及对方是否方便、内容是否适合阅读；"
+        "不要每条都发语音，也不必为了使用语音改变要说的话。"
+    ),
+}
+
+
 @dataclass(frozen=True)
 class DialoguePolicy:
     """对话节奏与主动联系的门槛。
@@ -232,6 +270,27 @@ class DialoguePolicy:
     紧急内容（求助、出事）永远不受此影响。
     """
 
+    voice_willingness: VoiceWillingness = "natural"
+    """她**愿不愿意开口说话**的倾向档位。设置页「⑤ 对话与主动性」。
+    设计文档 §17.4。
+
+    **这是"倾向"，不是概率。** 用户的原话是「倾向，提供几个档位选择」——
+    要档位，不要数字滑块。所以：
+
+    - 三档之间**没有** 0.3 / 0.7 这样的映射；
+    - **不抽随机数**，不设"每 N 条必须语音"，也不统计命中比例来判定成败；
+    - 每档都只转成一段**提示词倾向**（见 `VOICE_WILLINGNESS_PROMPTS`），
+      由她自己结合情境决定这一条说还是打。
+
+    谁决定：**她自己**，在每次最终回复里用开头的 `[speak]` 表达。
+    确定性代码只负责能力、授权、预算、投递可行性——不替她抛硬币。
+    她选了语音之后，执行层可以因为不可用/超预算/没权限而拒绝
+    （记 `voice_rejected`），但**不能**强制改成发声或改成文字。
+
+    默认 ``natural``：不配置时行为与"她现在这样"最接近，
+    也不会把她突然变成"每句都发语音"。
+    """
+
     @property
     def quiet_start(self) -> tuple[int, int]:
         return divmod(self.quiet_start_minute, 60)
@@ -239,6 +298,17 @@ class DialoguePolicy:
     @property
     def quiet_end(self) -> tuple[int, int]:
         return divmod(self.quiet_end_minute, 60)
+
+    def voice_prompt(self) -> str:
+        """本档位要注入提示词的那段确定文本（§17.4）。
+
+        这是 `voice_willingness` 的**唯一消费入口**：档位不是概率，落地的
+        方式就是一段话告诉她"你倾向于怎么说话"。其余全部交给她判断。
+
+        返回的是**固定文本**，可按档位逐字断言——这样"改了文案"和
+        "改了行为"能被区分开。
+        """
+        return VOICE_WILLINGNESS_PROMPTS[self.voice_willingness]
 
 
 @dataclass(frozen=True)

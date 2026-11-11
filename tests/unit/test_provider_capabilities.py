@@ -31,8 +31,19 @@ from ling.ports.model import (
     required_capability,
 )
 
-# 对话能力的老成员：这五个是"能当 chat 用"的全部 kind。
-CHAT_KINDS = {"fake", "openai_compatible", "anthropic", "chat_responses", "local"}
+# 对话能力的**原始**成员：这五个从一开始就能当 chat 用。
+LEGACY_CHAT_KINDS = {"fake", "openai_compatible", "anthropic", "chat_responses", "local"}
+
+# 对话能力的全部成员 = 老五个 + 小米 MiMo 的对话面。
+#
+# MiMo 走 `chat/completions`，所以它**确实能**当对话供应商用。但它与语音面
+# 被拆成两个 kind（`mimo_chat` / `mimo_tts`），理由见 `ports/model.py` 里
+# `ProviderKind.mimo_chat` 的长注释：一个 kind 同时持有 {chat, tts} 会让
+# "把 TTS 供应商绑到聊天槽位"这种错配通过能力闸。
+CHAT_KINDS = LEGACY_CHAT_KINDS | {"mimo_chat"}
+
+# 本期新增的三家 TTS 供应商（MiMo 拆两面，语音面单独算一个）。
+TTS_KINDS = {"minimax_tts", "fishaudio_tts", "mimo_tts"}
 
 
 def test_every_provider_kind_declares_capabilities() -> None:
@@ -146,3 +157,85 @@ def test_roles_without_declared_capability_are_unconstrained() -> None:
 def test_capability_values_are_plain_words() -> None:
     """能力值是前端直接比较的字符串，必须与枚举名一致且稳定。"""
     assert {c.value for c in ModelCapability} == {"chat", "embed", "rerank", "tts", "asr"}
+
+
+# --------------------------------------------------------------------------- #
+# 三家 TTS 供应商与 MiMo 的「一厂两面」
+# --------------------------------------------------------------------------- #
+
+
+def test_tts_kinds_are_exactly_the_three_vendors() -> None:
+    """提供 tts 能力的 kind 就是这三家，不多不少。
+
+    多一个：某家只做对话的供应商被误标成能合成，用户绑上去每次调用都失败。
+    少一个：用户配好了却在下拉里选不中。
+    """
+    tts = {k.value for k, caps in PROVIDER_CAPABILITIES.items() if ModelCapability.tts in caps}
+    assert tts == TTS_KINDS
+
+
+def test_no_kind_declares_both_chat_and_tts() -> None:
+    """**核心约束**：没有任何 kind 同时提供 chat 和 tts。
+
+    MiMo 走 `chat/completions`，天然能同时承担两种角色——但它必须在**配置**
+    里表达成两条 provider，而不是一个 kind 带两个能力。
+
+    为什么这条断言比"功能测试"更重要：`PROVIDER_CAPABILITIES` 是绑定校验的
+    唯一能力闸（`kind_supports_profile` 只看它）。一旦某个 kind 同时持有
+    {chat, tts}，`speech.tts` 绑到聊天供应商就会**通过**校验，fail-closed
+    直接作废。这是契约层面的不变量，所以单独守一条。
+    """
+    both = {
+        k.value
+        for k, caps in PROVIDER_CAPABILITIES.items()
+        if ModelCapability.chat in caps and ModelCapability.tts in caps
+    }
+    assert not both, f"这些 kind 同时声明了 chat 与 tts，会废掉绑定闸: {sorted(both)}"
+
+
+def test_mimo_split_into_two_single_capability_kinds() -> None:
+    """MiMo 的对话面与语音面是两个 kind，能力各自单一。"""
+    assert ProviderKind.mimo_chat.value == "mimo_chat"
+    assert ProviderKind.mimo_tts.value == "mimo_tts"
+    assert PROVIDER_CAPABILITIES[ProviderKind.mimo_chat] == {ModelCapability.chat}
+    assert PROVIDER_CAPABILITIES[ProviderKind.mimo_tts] == {ModelCapability.tts}
+
+
+def test_mimo_faces_cannot_cross_bind() -> None:
+    """错绑必须被拒：TTS 绑不到对话面，对话绑不到语音面。"""
+    # 语音角色 → mimo_chat：拒绝（对话面没有 tts 能力）
+    assert not kind_supports_profile("mimo_chat", "speech.tts")
+    # 对话角色 → mimo_tts：拒绝（语音面没有 chat 能力）
+    assert not kind_supports_profile("mimo_tts", "dialogue.fast")
+    assert not kind_supports_profile("mimo_tts", "dialogue.deep")
+    # 正确方向必须通过
+    assert kind_supports_profile("mimo_tts", "speech.tts")
+    assert kind_supports_profile("mimo_chat", "dialogue.fast")
+
+
+@pytest.mark.parametrize("kind", sorted(TTS_KINDS))
+def test_tts_kinds_serve_speech_tts_only(kind: str) -> None:
+    """三家 TTS 能服务 speech.tts，但不能服务任何对话/记忆角色。"""
+    assert kind_supports_profile(kind, "speech.tts")
+    assert not kind_supports_profile(kind, "dialogue.fast")
+    assert not kind_supports_profile(kind, "memory.extract")
+    assert not kind_supports_profile(kind, "memory.embed")
+    assert not kind_supports_profile(kind, "memory.rerank")
+    assert not kind_supports_profile(kind, "perception.vision")
+
+
+@pytest.mark.parametrize("kind", sorted(CHAT_KINDS))
+def test_chat_kinds_cannot_serve_tts(kind: str) -> None:
+    """任何对话 kind 都不能承担语音合成。"""
+    assert not kind_supports_profile(kind, "speech.tts")
+
+
+def test_asr_still_has_no_provider() -> None:
+    """`speech.asr` 仍然没有供应商——识别适配器还没实现。
+
+    这条是**故意**保留的失败关闭：在实现之前，任何"绑定成功"都是假的。
+    """
+    asr = {k.value for k, caps in PROVIDER_CAPABILITIES.items() if ModelCapability.asr in caps}
+    assert asr == set(), f"还没有实现 ASR，却有 kind 声称支持: {sorted(asr)}"
+    assert not kind_supports_profile("minimax_tts", "speech.asr")
+    assert not kind_supports_profile("mimo_tts", "speech.asr")

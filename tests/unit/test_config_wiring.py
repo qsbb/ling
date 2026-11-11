@@ -44,34 +44,62 @@ POLICIES = [DialoguePolicy, MemoryPolicy, LifePolicy]
 
 
 def _derived_names(cls: type, field: str) -> list[str]:
-    """字段名 + 由它派生的 property 名。
+    """字段名 + 由它派生的**属性或方法**名。
 
-    注意：**必须包含派生属性**。`quiet_start_minute` 自己没被任何人读，
+    注意：**必须包含派生成员**。`quiet_start_minute` 自己没被任何人读，
     但它的 property `quiet_start` 被 ProactiveService 读了——
     只 grep 字段名会把正常的接线误判成孤儿（我自己就误判过一次）。
+
+    **普通方法也要算**，不只是 `property`。这不是过度设计：`value_willingness`
+    的唯一消费入口是 `voice_prompt()`——一个**方法**而不是 property（它要返回
+    一段文案，用方法语义更准确）。只看 `property` 会把已接好的字段当成孤儿，
+    从而逼着人把接口改成"测试认得的形状"，那是本末倒置。
+
+    判定方式统一成"读源码看它有没有提到这个字段"，对方法和 property 都适用。
     """
     names = [field]
     for name, member in inspect.getmembers(cls):
-        if isinstance(member, property) and member.fget is not None:
-            try:
-                body = inspect.getsource(member.fget)
-            except OSError:  # pragma: no cover - 交互式定义时取不到源码
-                continue
-            if re.search(rf"\b{re.escape(field)}\b", body):
-                names.append(name)
+        fn = member.fget if isinstance(member, property) else member
+        if not inspect.isfunction(fn):
+            continue
+        try:
+            body = inspect.getsource(fn)
+        except OSError:  # pragma: no cover - 交互式定义时取不到源码
+            continue
+        if re.search(rf"\b{re.escape(field)}\b", body):
+            names.append(name)
     return names
 
 
-def _references(names: list[str]) -> list[str]:
-    """在存储层之外找引用。返回命中的位置，便于失败时定位。"""
+def _references(names: list[str], field: str) -> list[str]:
+    """在存储层之外找引用。返回命中的位置，便于失败时定位。
+
+    ``ports/config.py`` 在 ``STORAGE_ONLY`` 里（它是**定义处**，字段名当然
+    出现在那），但那里也可能有**真正的消费者**：策略类自己提供的派生方法
+    （如 ``DialoguePolicy.voice_prompt()`）就是字段的唯一使用入口。所以：
+
+    - 存储层里，**只认派生名**（`voice_prompt`），不认字段名本身
+      （`voice_willingness` 在 `ports/config.py` 里出现是定义，不是使用）；
+    - 其他文件里，派生名和字段名都认。
+    """
+    derived = [n for n in names if n != field]
     pattern = re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")\b")
+    derived_only = (
+        re.compile(r"\b(" + "|".join(map(re.escape, derived)) + r")\b")
+        if derived
+        else None
+    )
     hits: list[str] = []
     for path in SRC.rglob("*.py"):
         rel = path.relative_to(SRC).as_posix()
-        if rel in STORAGE_ONLY:
-            continue
         text = path.read_text(encoding="utf-8")
-        for match in pattern.finditer(text):
+        if rel in STORAGE_ONLY:
+            if derived_only is None:
+                continue
+            matcher = derived_only
+        else:
+            matcher = pattern
+        for match in matcher.finditer(text):
             line_no = text[: match.start()].count("\n") + 1
             hits.append(f"{rel}:{line_no}")
     return hits
@@ -84,7 +112,7 @@ def _references(names: list[str]) -> list[str]:
 def test_policy_field_is_actually_read(policy: type, field: str) -> None:
     """每个策略字段都要有人读——否则界面上设了也没有任何效果。"""
     names = _derived_names(policy, field)
-    hits = _references(names)
+    hits = _references(names, field)
     assert hits, (
         f"{policy.__name__}.{field} 没有任何地方读取。"
         f"界面上设了它不会有任何效果——这正是本项目反复出现的那类 bug。\n"

@@ -693,6 +693,71 @@ class ChatMessage(StrictModel):
     recall_state: str | None = None
 
 
+# ---------------------------------------------------------------- 出站附件
+
+
+class AttachmentKind(StrEnum):
+    """出站附件的类型。**必须显式给出**，不由引用内容猜。
+
+    为什么不猜：`OutboundMessage.media_refs` 是裸字符串，一个 ``asset:abc``
+    既可能是图片也可能是语音。靠扩展名猜会在 ``asset:abc``（无扩展名）上
+    失效，靠探测内容要下载字节——投递层不该为了判断类型去拉一遍文件。
+    猜错的后果是"发语音被当成图片发出去"，而用户看到的是纯图片，不会报错。
+    """
+
+    image = "image"
+    audio = "audio"
+    video = "video"
+    file = "file"
+
+
+class OutboundAttachment(StrictModel):
+    """一个**类型化**的出站附件。
+
+    替代裸字符串的 ``media_refs``。第一版只带投递层真正需要的东西：
+    类型、引用、以及"如果平台要显示一段说明"的那点文本。
+
+    刻意**不**放在这里的东西：
+
+    - 音频的采样率/声道/时长——那些属于语音领域的 ``AudioSpec``。附件是
+      **投递**概念，渠道只关心"这是什么、发到哪去"，不关心 codec。把
+      AudioSpec 塞进来会让每个渠道都被迫理解音频格式。
+    - 正文——文字内容在消息自己的 ``text`` 里。语音消息的原理是
+      "``text`` 用于后台展示 + ``attachments`` 里放一条 audio"，**不是**把
+      正文复制进附件。
+    """
+
+    kind: AttachmentKind
+    ref: str = Field(min_length=1, max_length=2048)
+    """平台侧的引用：URL、不透明 id、或 ``asset:<id>``。
+
+    **不套 ``MediaRef``**：入站那个类型只允许 http/https 或不透明 id，是为了
+    防 SSRF；而出站要交给平台自己解析——OneBot 的 ``file`` 还接受本地路径与
+    base64。方向不同，信任也不同：这里的值由我们自己产生，不是外部输入。
+    """
+    mime_type: str | None = Field(default=None, max_length=128)
+    caption: str | None = Field(default=None, max_length=1024)
+    """给附件配的一句话说明。语音附件**不建议**填——说了什么已经在正文里了。"""
+
+    @property
+    def modality(self) -> Modality:
+        """映射到渠道能力用的 ``Modality``。
+
+        ``file`` 没有对应的 ``Modality``（它既不是图片也不是音视频），
+        归到 ``structured``——渠道要么支持发文件、要么不支持，与"能发图片"
+        是两件事，这里不假装它们相同。
+        """
+        return _ATTACHMENT_MODALITY[self.kind]
+
+
+_ATTACHMENT_MODALITY: dict[AttachmentKind, Modality] = {
+    AttachmentKind.image: Modality.image,
+    AttachmentKind.audio: Modality.audio,
+    AttachmentKind.video: Modality.video,
+    AttachmentKind.file: Modality.structured,
+}
+
+
 # ---------------------------------------------------------------- 能力与回执
 
 
@@ -706,6 +771,45 @@ class CapabilityDescriptor(StrictModel):
     supports_proactive: bool = False
     supports_edit: bool = False
     supports_media: bool = False
+    """**旧字段，保留成普通字段而不是 property。**
+
+    它只表达"能不能发媒体"这一个 bit，无法区分图片/语音/视频。而这三者的
+    实现难度和平台支持度差得很远：QQ 能发图不代表能发语音条，OneBot 能发
+    语音不代表能发视频。继续用一个 bit 会让"发语音被静默降级成发图片"。
+
+    为什么不改成 `bool(self.supported_media)` 的派生属性：这个类有 **14 处**
+    使用点，其中 13 处是按关键字构造 / 读取 bool。改成 property 会让
+    `CapabilityDescriptor(supports_media=True)` 这种构造直接报错。所以两个
+    都留成字段，兼容策略见 `supported_media`。
+    """
+    supported_media: list[Modality] | None = None
+    """**细分**的媒体发送能力，各自独立。
+
+    三态语义（§17.6 明确要求区分"未提供"与"显式空集合"）：
+
+    - **`None`（未提供）** + `supports_media=True` → 视作只声明了图片。
+      这是对既有渠道的兼容：`connectors/wechat/connector.py:267` 与
+      `connectors/qq/connector.py:417` 只写了这个 bit，它们过去的实际行为
+      就是发图片。保守按图片解读，行为完全等价。
+    - **`[]`（显式空集合）** → **什么都不支持**，即使 `supports_media=True`
+      也不放大。这条是 §17.6 点名的缺口：旧实现用"空 list"同时表示
+      "没给"和"给了空的"，结果 qq/wechat 那些虚假的 `supports_media=True`
+      永远被当成"能发图片"，真实能力无从表达。
+    - **非空列表** → 以它为准，`supports_media` 只作摘要。
+
+    **规则写在 `media_supported()` 里，不要在调用处各写一遍判断。**
+    """
+
+    def media_supported(self, modality: Modality) -> bool:
+        """这个渠道能不能发某一类媒体。**唯一判据**，调用方别自己推断。"""
+        if self.supported_media is not None:
+            # 显式集合（含空集合）优先，不被 legacy 的 supports_media 放大。
+            return modality in self.supported_media
+        if self.supports_media:
+            # 旧声明：过去只发图片，所以只当作图片能力。
+            return modality is Modality.image
+        return False
+
     # 能不能**主动撤回自己发出去的消息**（OneBot 的 `delete_msg`）。
     #
     # 为什么单独一位而不是让调用方 try/except：`recall()` 是可选能力，

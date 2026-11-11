@@ -17,10 +17,12 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from ling.contracts.v1 import (
+    AttachmentKind,
     CapabilityDescriptor,
     DeliveryReceipt,
     InteractionEnvelope,
     Modality,
+    OutboundAttachment,
     RecallEvent,
     RecallReceipt,
 )
@@ -100,13 +102,46 @@ class OutboundMessage:
     # http/https 或不透明 id（防 SSRF），而出站要交给平台自己解析——OneBot 的
     # `file` 还接受本地路径与 base64，收紧只会把能发的东西变少。方向不同，
     # 信任也不同：这里的值由我们自己产生，不是外部输入。
+    #
+    # **legacy**：不带类型，无法区分图片/语音/视频。保留只为兼容既有调用方
+    # 与已落库数据；新代码请用 `attachments`。判定能力时这里一律当作**图片**
+    # （见 `CapabilityDescriptor.media_supported`）。
+    #
+    # 刻意**不做**"从引用内容猜类型"的隐式转换：一个 `asset:abc` 猜错了，
+    # 结果就是"语音被当图片发出去"——用户只会看到一张图，不会有任何报错。
     media_refs: list[str] = field(default_factory=list)
+    # **类型化**的出站附件。新代码用这个。
+    #
+    # 与 `media_refs` 并存而不是替换：替换会让所有既有构造点（三个渠道、
+    # 投递层、大量测试）一次性全改，而这个契约是后面 12 个任务的依赖面。
+    # 并存 + 唯一的判定规则（`iter_outbound_attachments()`）代价更小，
+    # 语义也不含糊。
+    attachments: list[OutboundAttachment] = field(default_factory=list)
     is_group: bool = False
     # 要 @ 的平台账号（QQ 号）。群里多人说话时用它消歧——
     # "回你"没人知道是对谁说的，@ 一下才说得清。
     mentions: list[str] = field(default_factory=list)
     # 要拍一拍谁（QQ 号）。**不打断的提醒/亲近**，比"在吗"轻。
     poke_targets: list[str] = field(default_factory=list)
+
+
+def iter_outbound_attachments(message: OutboundMessage) -> list[OutboundAttachment]:
+    """把一条消息的**全部**媒体统一成类型化附件列表。
+
+    `media_refs`（legacy）在这里被当作 **image**，与它过去的行为等价——
+    这正是兼容的关键：旧渠道声明 `supports_media=True` 且实际只发图片，
+    转换后仍然是"图片 + 能发图片 → 放行"，行为一分不变。
+
+    **顺序**：先 `media_refs` 后 `attachments`。调用方若要挑"第一条语音发
+    哪个"，应按 `kind` 过滤而不是依赖位置。
+
+    永远返回新 list，不改动入参（`OutboundMessage` 是 frozen 的）。
+    """
+    legacy = [
+        OutboundAttachment(kind=AttachmentKind.image, ref=ref)
+        for ref in message.media_refs
+    ]
+    return [*legacy, *message.attachments]
 
 
 @dataclass(frozen=True)
@@ -216,5 +251,6 @@ __all__ = [
     "RecallRequest",
     "ReceiptQuery",
     "delivery_text_digest",
+    "iter_outbound_attachments",
     "normalize_delivery_text",
 ]

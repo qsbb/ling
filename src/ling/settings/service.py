@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from typing import cast
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +32,7 @@ from ling.ports.config import (
     ProfileBinding,
     ProviderConfig,
     ProviderModel,
+    VoiceWillingness,
 )
 from ling.ports.model import (
     SLOT_LABELS,
@@ -1116,7 +1118,9 @@ def _apply_patch(
         payload["life"] = _merge_fields(payload["life"], life, _LIFE_BOUNDS)
 
     if dialogue is not None:
-        payload["dialogue"] = _merge_fields(payload["dialogue"], dialogue, _DIALOGUE_BOUNDS)
+        payload["dialogue"] = _merge_fields(
+            payload["dialogue"], dialogue, _DIALOGUE_BOUNDS, _DIALOGUE_ENUM_KEYS
+        )
 
     if providers is not None:
         merged: dict[str, dict] = {p["provider_id"]: p for p in payload["providers"]}
@@ -1343,6 +1347,13 @@ _DIALOGUE_BOUNDS: dict[str, tuple[float, float]] = {
     "group_reply_delivery_enabled": (0, 1),
 }
 
+# 对话策略里的**非数值**键：枚举/字符串，没有 `(low, high)` 可钳制，
+# 所以进不了 `_DIALOGUE_BOUNDS`，但必须能被补丁覆盖。
+#
+# 单独列一张表而不是把它们混进 `_DIALOGUE_BOUNDS`：那个表的所有成员都会被
+# `float()` + `min/max` 处理，混进一个枚举值会在钳制时炸掉。
+_DIALOGUE_ENUM_KEYS: frozenset[str] = frozenset({"voice_willingness"})
+
 # 生活节奏的取值范围。与记忆策略分开一张表，避免两类的键名撞车。
 _LIFE_BOUNDS: dict[str, tuple[float, float]] = {
     "scene_ttl_minutes": (1, 1440),
@@ -1522,11 +1533,25 @@ def _life_to_dict(policy: LifePolicy) -> dict[str, float | int]:
     }
 
 
-def _merge_fields(current: object, patch: dict, bounds: dict[str, tuple[float, float]]) -> dict:
-    """只覆盖显式给出的字段。不传的字段保持原值——不是重置成默认。"""
+def _merge_fields(
+    current: object,
+    patch: dict,
+    bounds: dict[str, tuple[float, float]],
+    extra_keys: frozenset[str] = frozenset(),
+) -> dict:
+    """只覆盖显式给出的字段。不传的字段保持原值——不是重置成默认。
+
+    ``extra_keys`` 是**不属于数值区间表但可被补丁覆盖**的键（例如枚举/字符串
+    字段，它们没有 `(low, high)` 可钳制，所以进不了 `bounds`）。
+
+    为什么必须有这个参数：原来只遍历 ``bounds`` 的键，而 `_DIALOGUE_BOUNDS`
+    里**只有数值字段**。于是字符串/枚举字段即使出现在补丁里也会被静默丢掉——
+    症状是"改了下拉框、保存成功、刷新之后还是旧值"，而权重一类数值字段
+    却生效了，看起来像"只有一部分设置不生效"。
+    """
     base = current if isinstance(current, dict) else {}
     merged = dict(base)
-    for key in bounds:
+    for key in (*bounds, *extra_keys):
         if key in patch and patch[key] is not None:
             merged[key] = patch[key]
     return merged
@@ -1632,10 +1657,40 @@ def _dialogue_policy(raw: object) -> DialoguePolicy:
                 )
             )
         ),
+        voice_willingness=_voice_willingness(data.get("voice_willingness"), d.voice_willingness),
     )
 
 
-def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, int | bool]:
+_VOICE_WILLINGNESS_VALUES: frozenset[str] = frozenset({"reserved", "natural", "expressive"})
+
+
+def _voice_willingness(raw: object, default: VoiceWillingness) -> VoiceWillingness:
+    """读语音意愿档位。**非法值退回默认，不抛异常。**
+
+    非法/缺失时退回 ``natural``（§17.4：「三档配置缺省读为 natural」）。
+    与 `_clamp_in` 同一取舍：配置里的脏值不该让整个设置页保存失败
+    （那样用户会卡在"怎么都存不上"，还看不出是哪一项坏了）。
+
+    §17.4 还要求旧 numeric/off/always 草稿**不继续作为行为源**：那些值不在
+    这里的合法集合里，会自然落到 ``natural``——正是裁决要的结果，不需要
+    额外写一个"识别旧值再转换"的分支。
+    """
+    if isinstance(raw, str) and raw in _VOICE_WILLINGNESS_VALUES:
+        return cast("VoiceWillingness", raw)
+    return default
+
+
+_DialogueValue = int | bool | float | str
+
+
+def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, _DialogueValue]:
+    """`DialoguePolicy` → 可入库的 dict。
+
+    **每个字段都要在这里列一次。** 新增字段忘了补，会在"存得住但读不回"
+    之间静默丢失——契约加了、UI 也显示了、用户选了却没生效。
+    `tests/unit/test_speech_media_contracts.py` 有一条断言盯着这张键集合
+    等于 `dataclasses.fields(DialoguePolicy)`，漏字段会立刻红。
+    """
     return {
         "group_turn_budget": policy.group_turn_budget,
         "proactive_daily_limit": policy.proactive_daily_limit,
@@ -1647,4 +1702,5 @@ def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, int | bool]:
         "group_attention_deferred": policy.group_attention_deferred,
         "proactive_delivery_enabled": policy.proactive_delivery_enabled,
         "group_reply_delivery_enabled": policy.group_reply_delivery_enabled,
+        "voice_willingness": policy.voice_willingness,
     }
