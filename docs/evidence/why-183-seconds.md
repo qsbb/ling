@@ -165,18 +165,89 @@ return queue
 | 是测试 bug 吗 | **是**。测试抢走了 bridge 的终止标记 |
 | `assert recorder.compiled` 是假的吗 | **不是**。它确实拿到了编译结果，只是代价是让 bridge 空等 180 秒 |
 
-## 修法：从「抢着消费」改成「旁观」
+## 修法（第二版：第一版是错的）
 
-**最简方案其实不需要额外机制**：测试只要**不消费 queue**，`_post` 返回时一切就绪——
-因为 `bridge.handle()` 会消费 queue 到底才返回，那时 `_execute` 已跑完、`compile` 已被调用。
+方向始终是「从『抢着消费』改成『旁观』」。**但第一版给的具体做法是错的**，
+而且错法本身值得记录，所以两版都留着。
+
+### 第一版（错）
+
+**当时写的**：
+
+> **最简方案其实不需要额外机制**：测试只要**不消费 queue**，`_post` 返回时一切就绪——
+> 因为 `bridge.handle()` 会消费 queue 到底才返回，那时 `_execute` 已跑完、`compile` 已被调用。
 
 ```python
 recorder = RecordingCoordinator(inner)
-await _post(env, body)        # bridge 消费完 queue 才返回（约 1.25 秒）
-assert recorder.compiled      # 此时 compile 已经跑过了
+await _post(env, body)        # ← 第一版以为这样就够了
+assert recorder.compiled
 ```
 
-**如果确实需要在测试侧观察 queue 内容**，用 tee（记录但不 pop），让 bridge 正常消费：
+**漏了什么：patch 的作用域。**
+
+`RecordingCoordinator.run_turn` 里包着 `with patch.object(...)`：
+
+```python
+with patch.object(turn_module.ContextCompiler, "compile", _spy):
+    queue = await self._inner.run_turn(**kwargs)
+    while True:                 # ← 当前版本用这个循环把执行拖在窗口内
+        event = await queue.get()
+        if event is None:
+            break
+    return queue                # ← with 在这里退出，spy 卸载
+```
+
+而 `_execute` 是 `run_turn` 内部 `create_task` 出来的后台任务（`turn.py:737`）：
+
+```python
+queue: asyncio.Queue[TurnStreamEvent | None] = asyncio.Queue()
+token = StopToken()
+task = asyncio.create_task(self._execute(...))
+```
+
+**`run_turn` 返回时 `_execute` 还没跑。** 所以「不消费、直接 return」会让 `with`
+在 `_execute` 调用 `compile` **之前**就退出，spy 已经卸载，`compiled` 永远是 `[]`。
+
+**这正是修复前那个版本红掉的原因**（变异实验实测：`2 failed in 8.80s`，
+`assert [] = RecordingCoordinator.compiled`）。
+
+**第一版错在哪，一句话**：
+
+> 我证明了「`bridge.handle()` 会消费完 queue 才返回」（这句话是对的），
+> 但没有检查「patch 什么时候退出」。
+> **两件事都成立才够，我只验了一件。**
+
+### 第二版（对）
+
+**patch 必须提到测试层，覆盖这一轮 turn 的完整生命周期**，而不是包住 `run_turn` 的调用：
+
+```python
+with patch.object(turn_module.ContextCompiler, "compile", _spy):
+    await _post(env, body)      # bridge 消费完 queue 才返回，_execute 已跑完
+assert _spy.calls               # 此时 compile 已被调用
+```
+
+**`RecordingCoordinator` 于是只负责记录 `run_turn` 的入参，不再负责 patch。**
+职责变清楚：**一个组件记录入参，一个作用域覆盖生命周期。**
+
+**为什么第二版是对的，而第一版不是**：区别不在「谁消费 queue」，在
+**「`with` 块的退出时机是否晚于 `compile` 被调用」**。第一版让 `with` 绑在一个
+提前返回的函数上，第二版让它绑在整个 HTTP 请求上。**后者必然晚于 `_execute` 跑完。**
+
+### 这也是「当前测试能通过」的真正原因
+
+当前版本（消费 queue 到 `None`）能通过，**是因为它用「消费」这个动作把执行
+拖在了 patch 窗口内**——`_execute` 跑完、推完 `None`、循环才退出、`with` 才结束。
+
+**那是巧合，不是设计。** 测试的 patch 作用域和它想观测的东西本来就不匹配，
+只是被一个恰好阻塞到位的循环救了。
+
+**代价**就是这篇文档开头那 183 秒：为了让 `_execute` 跑完，测试必须消费同一个
+queue，于是抢走了 bridge 的终止标记。
+
+### 附带说明：TeeQueue 不是必需的
+
+考虑过用 tee（继承 `asyncio.Queue`，记录但不 pop）让两边都能看到事件：
 
 ```python
 class TeeQueue(asyncio.Queue):
@@ -189,7 +260,46 @@ class TeeQueue(asyncio.Queue):
         return item
 ```
 
-**两种方案都从「两个消费者抢一个标记」变成「一个消费者 + 一个观察者」。**
+**它解决「终止标记只有一份」这个问题，但解决不了 patch 作用域**——因为
+`run_turn` 仍然要提前 return，`with` 仍然会提前退出。
+
+**第二版方案不需要 tee**：测试不需要看 queue 里的每个事件，它看的是 `compile` 的结果。
+**只在确实需要观测流事件时才引入 tee。**
+
+### 改动的前置条件
+
+这个改动会**改变测试的形态**，所以：
+
+- **必须重跑变异实验**（删掉 drain 循环 → 必须红）确认覆盖没被削弱
+- **必须先接受基于当前版本的验收结论**——A 阶段那五种变异都是在旧版测试上做的，
+  改了测试，那些结果就不再直接适用于新版本
+
+**所以这是一个独立任务，不该夹在验收中间做。**
+
+## 为什么第一版的错误值得留档
+
+**因为它不是「不知道事实」，是「用一个成立的事实推出了一个不成立的结论」。**
+
+这是最难自查的错误类型：**每一步都有依据，但依据不全。**
+
+对比一下这次排查里另外两种错误：
+
+| 类型 | 例子 | 自查难度 |
+|---|---|---|
+| 不知道事实 | 「没查过 `TURN_WAIT_TIMEOUT_SECONDS` 是多少」 | **容易**——查一下就有了 |
+| 事实查错了 | 「行号开窗落在错误位置，读到 0 命中」 | 中——再查一遍能发现 |
+| **事实对、推理不全** | **本文第一版修法** | **难——每一步都能复述出依据** |
+
+**第三种的可怕之处在于：它经得起「你为什么这么写」的追问。**
+
+问「为什么认为不消费 queue 就够了？」，答案是：
+「因为 `bridge.handle()` 会消费完 queue 才返回，那时 `_execute` 已跑完」——
+**这句话是真的**。追问到此为止，因为提问者也认可这句话。
+
+**漏掉的那一半（patch 何时退出）不在任何人的视野里**，包括写的人和审的人。
+
+**所以这类错误的防线不是「更仔细地检查已知事实」，是「把结论依赖的全部前提列出来，
+逐个问『这条我验过了吗』」**——第一版只验了 1 条前提，结论需要 2 条。
 
 ## 方法论
 
