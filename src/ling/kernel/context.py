@@ -496,6 +496,25 @@ class ContextCompiler:
 
         `CapabilityDescriptor.supports_poke` 默认也是 False，理由相同：
         能力必须由知道实情的连接器**显式声明**，不能靠默认值宣称。
+
+        这里有两个「看着像防线、其实不是」的地方，写清楚免得下次误判：
+
+        1. ``getattr`` 的第三个参数 ``False`` **永远不会被返回**。
+           ``CapabilityDescriptor`` 是 pydantic 模型，``supports_poke`` 有类级
+           默认值 ``False``，实例必然有这个属性。保留 ``getattr`` 只是为了将来
+           有人把 ``_channel_capabilities`` 换成不保证该字段的对象时不炸。
+           ——「兜底看着像在保护我们，实际永远不执行」，和假通过是同一类问题。
+
+        2. ``is not None`` **不是**同样的情况：它真的会分叉。它区分的是
+           「没有外部渠道」（Web 面板 / 内部直发）与「有渠道但不会拍」。
+           两者语义不同，但**当前对提示词的含义相同**——都不列 ``[poke:…]``。
+           注意准确说法是「当前行为相同，但没有人验证过它们确实相同」，
+           而不是「没有测试能区分它们」。加 ``@`` / ``quote`` 能力时会分叉，
+           那时要补一条区分二者的测试。
+
+        真正的防线不在这一行，在两条测试：
+        ``test_capability_descriptor_defaults_poke_to_false``（默认值是 False）
+        与 ``test_real_connectors_declare_poke_explicitly``（四个连接器显式声明）。
         """
         caps = self._channel_capabilities
         return bool(getattr(caps, "supports_poke", False)) if caps is not None else False
