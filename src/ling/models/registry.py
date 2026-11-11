@@ -78,6 +78,10 @@ class ProviderRegistry:
                 base_url=cfg.base_url or "https://api.openai.com/v1",
                 api_key=secret,
                 kind=ProviderKind(kind),
+                # 这个适配器实现了 `tools` / 流式 `tool_calls` 的编解码。
+                # 声明在这里而不是按 kind 猜：**适配器自己知道自己实现了什么**，
+                # 而 `ProviderKind.openai_compatible` 只说明它说 /chat/completions。
+                native_tools=True,
                 timeout_seconds=cfg.timeout_seconds,
                 secret_hint=self._secret_hint,
             )

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from ling.models.quota import TokenQuotaStore, estimate_tokens_for
@@ -27,6 +27,8 @@ from ling.ports.model import (
     ModelTarget,
     ProbeResult,
     ProviderKind,
+    ToolDefinition,
+    provider_native_tools_support,
 )
 
 logger = logging.getLogger("ling.models.router")
@@ -53,6 +55,14 @@ class StreamOutcome:
     error: ModelError | None = None
     fallback_used: bool = False
     delivered_any: bool = False
+    # 供应商是否在**这次响应里提出过工具调用**（不论参数是否完整）。
+    #
+    # 为什么必须与 ``delivered_any`` 分开：回退的判据是"有没有产生外部
+    # 副作用"，而"提出了一个工具调用"就是副作用的**前一步**。原来只看
+    # `delivered_any`，于是"模型提出 clock.now、参数还没收全就断流"这种
+    # 情况会被当成"什么都没发生"，透明回退到备用模型重放同一轮——
+    # 备用模型会重新提出调用，而编排层已经可能执行过前一轮的工具了。
+    tool_call_proposed: bool = False
 
 
 class ModelRouter:
@@ -107,6 +117,33 @@ class ModelRouter:
             fallback_model_id=stored.fallback_model_id if stored else None,
         )
         return binding, resolved.reason
+
+    def native_tools_support(self, config: EffectiveConfig, profile: str) -> bool:
+        """这一轮**这个具体适配器**声明支持工具吗？
+
+        编排层用它做能力闸的最后一步（前一步是 kind 的协议能力）。
+
+        为什么必须问到**实例**：`openai_compatible` 是"说 /chat/completions
+        的端点"的集合，里面有真支持工具的，也有把 ``tools`` 字段丢掉、仍返回
+        200 的。只按 kind 判，失败方式是"模型从来不调工具"——不报错、不降级、
+        只是永远不用，而日志里一句相关的都没有。
+
+        解析不到（没有可用模型 / provider 配置缺失）时返回 ``False``：
+        这一轮本来就会在 ``stream()`` 上以明确的 ``ModelError`` 失败，
+        这里没必要再造一个不同的错误。
+        """
+        try:
+            binding, _reason = self._resolved_binding(config, profile)
+        except ModelError:
+            return False
+        pcfg = config.providers.get(binding.provider_id)
+        if pcfg is None:
+            return False
+        try:
+            provider = self._provider(config, binding)
+        except (UnknownProviderError, ModelError):
+            return False
+        return provider_native_tools_support(provider)
 
     def resolve(self, config: EffectiveConfig, profile: str) -> tuple[ModelTarget, ProfileBinding]:
         binding, _reason = self._resolved_binding(config, profile)
@@ -224,10 +261,21 @@ class ModelRouter:
         messages: list[ChatMessageIn],
         trace_id: str | None = None,
         allow_fallback: bool = True,
+        tools: Sequence[ToolDefinition] = (),
+        tool_choice: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> AsyncIterator[tuple[ModelChunk, StreamOutcome]]:
         """产出 ``(chunk, outcome)``；outcome 在最后一帧包含完整文本与目标。
 
-        回退只发生在**尚未产出任何文本**时。
+        回退只发生在**尚未产出任何文本、也未提出工具调用**时。
+
+        ## 工具参数是"整轮固定"的
+
+        ``tools`` / ``tool_choice`` 由调用方（编排层）决定，路由器只**转发**，
+        不自己从注册表推断"这一轮能调用什么"。理由是能力闸属于编排层：
+        它同时要知道本轮的 profile、kind、以及"这次是不是收尾步骤"。
+        路由器若自己填一遍，两处判据迟早走散——而走散的表现是"路由器以为
+        能用、编排层以为不能用"，或者反过来。
         """
         binding, _reason = self._resolved_binding(config, profile)
 
@@ -290,6 +338,9 @@ class ModelRouter:
                 config_revision=config.revision,
                 trace_id=trace_id,
                 timeout_seconds=pcfg.timeout_seconds if pcfg is not None else 60.0,
+                tools=tuple(tools),
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
             )
             outcome = StreamOutcome(target=target, fallback_used=index > 0)
             started = time.monotonic()
@@ -298,6 +349,8 @@ class ModelRouter:
                     if chunk.delta:
                         outcome.text += chunk.delta
                         outcome.delivered_any = True
+                    if chunk.tool_call is not None or chunk.tool_call_complete:
+                        outcome.tool_call_proposed = True
                     if chunk.done:
                         outcome.finish_reason = chunk.finish_reason
                     yield chunk, outcome
@@ -341,8 +394,14 @@ class ModelRouter:
                 )
                 outcome.error = exc
                 last_error = exc
-                if outcome.delivered_any:
-                    # 已经交付过文本：不换模型重放，直接把错误交给上层
+                if outcome.delivered_any or outcome.tool_call_proposed:
+                    # 已经交付过文本、或已经提出过工具调用：不换模型重放。
+                    #
+                    # 第二种是新加的（原来只看 `delivered_any`）。"提出了调用"
+                    # 意味着这一轮**可能已经执行过** —— 编排层是边收参数边
+                    # 决定要不要执行的，路由器没有那个视野。此时换一家重放，
+                    # 等于让两个供应商各提一批调用，而用户只会看到其中一批的
+                    # 结果。宁可失败，也不重放。
                     raise
                 continue
             except Exception as exc:  # noqa: BLE001 - provider 边界统一归类
@@ -366,7 +425,8 @@ class ModelRouter:
                 )
                 last_error = wrapped
                 outcome.error = wrapped
-                if outcome.delivered_any:
+                if outcome.delivered_any or outcome.tool_call_proposed:
+                    # 同上面那处 ModelError 分支：提出过调用就不再回退。
                     raise wrapped from exc
                 continue
 

@@ -8,10 +8,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 class ProviderKind(StrEnum):
@@ -102,7 +103,21 @@ class ModelCapability(StrEnum):
 # 任何角色绑上去都会被校验拦下），是失败关闭的方向，不是静默放行。
 PROVIDER_CAPABILITIES: dict[ProviderKind, frozenset[ModelCapability]] = {
     ProviderKind.fake: frozenset({ModelCapability.chat}),
+    # 原生工具调用**不是**这张表里的一项能力，**故意的**。
+    #
+    # `ModelCapability` 是"角色 ↔ 供应商 kind"的绑定闸，它的成员会出现在
+    # 设置页文案里（`settings/service.py` 那句"同时启用了 N 家 X 能力的
+    # 供应商"），加一项就是给用户界面加一个概念。而"这家支不支持工具"是
+    # **同一个 kind 内部逐端点不同**的事实：有的兼容端点认 `tools`，有的把
+    # 字段丢掉还返回 200。用它做绑定闸，结果是"绑不上"，而真实需求是
+    # "绑得上、只是这一轮没有工具"。
+    #
+    # 所以工具能力走两条更窄的通道：
+    # - `ADAPTER_NATIVE_TOOLS_KINDS`：**本仓库适配器**实现了编解码的 kind；
+    # - `provider_native_tools_support()`：具体实例的显式声明。
     ProviderKind.openai_compatible: frozenset({ModelCapability.chat}),
+    # Responses / Anthropic：协议有工具，但本仓库适配器**未实现**——
+    # 不发 `tools`、不解析工具事件（见 `ADAPTER_NATIVE_TOOLS_KINDS` 的说明）。
     ProviderKind.anthropic: frozenset({ModelCapability.chat}),
     ProviderKind.chat_responses: frozenset({ModelCapability.chat}),
     ProviderKind.local: frozenset({ModelCapability.chat}),
@@ -207,6 +222,77 @@ def kind_supports_profile(kind: str, profile: str) -> bool:
     if need is None:
         return True
     return need in provider_capabilities(kind)
+
+
+# 哪些**角色**在本仓库的编排里能接到原生工具框架（`kernel/turn.py` 的同轮
+# 工具回路只挂在主对话链路上）。
+#
+# 这是一张**白名单**，不是"所有对话角色都行"：看视频、记忆提炼这些角色有自己的
+# 生成循环（`_follow_up_after_watch` / `worker` 的异步任务），本期没有接工具回路；
+# 给它们声明 `native_tools` 会让"这一轮工具标为可用"变成一句空话。
+NATIVE_TOOLS_PROFILES: frozenset[str] = frozenset(
+    {
+        "dialogue.fast",
+        "dialogue.deep",
+        "dialogue.group",
+    }
+)
+
+
+def profile_supports_native_tools(profile: str) -> bool:
+    """这个角色有没有接同轮工具回路（本仓库事实，不是供应商能力）。"""
+    return profile in NATIVE_TOOLS_PROFILES
+
+
+#: **本仓库适配器**实现了原生工具编解码的 kind。
+#:
+#: 只有 ``openai_compatible``：它按官方形状发 ``tools`` / ``tool_choice``，
+#: 并解析流式 ``delta.tool_calls`` 的 index/id/name/arguments 分片。
+#:
+#: **Responses（``chat_responses``）与 Anthropic（``anthropic``）未实现。**
+#: 它们的回灌形状不是 ``role:"tool"``，不能复用这个适配器的编解码；本期
+#: 明确不做。对它们的正确处理是"这一轮工具标为不可用"，**不是**退化成
+#: "让模型把查询写成文本标签"——那种退化没有执行、没有回灌，模型只能编。
+ADAPTER_NATIVE_TOOLS_KINDS: frozenset[str] = frozenset(
+    {ProviderKind.openai_compatible.value}
+)
+
+
+def kind_may_have_native_tools(kind: str) -> bool:
+    """这个 kind 的**协议 + 本仓库适配器**有没有工具编解码能力。
+
+    它是**必要条件，不是充分条件**：
+
+    - ``openai_compatible``：适配器实现了 ``tools`` / 流式 ``tool_calls``；
+      但兼容层里有的端点直接丢掉 ``tools`` 字段还返回 200，所以真实判据是
+      适配器**实例**的声明（:func:`provider_native_tools_support`）；
+    - ``anthropic`` / ``chat_responses``：协议本身有工具，但本仓库适配器
+      **未实现**，所以这里为 ``False``——"未实现"的结果是这一轮工具标为
+      不可用，**不**退化成"让模型把查询写成文本标签"；
+    - ``fake`` / TTS 等：为 ``False``。
+
+    未知 kind → ``False``（失败关闭）。
+    """
+    try:
+        normalized = normalize_provider_kind(kind)
+    except (TypeError, ValueError):
+        return False
+    return normalized in ADAPTER_NATIVE_TOOLS_KINDS
+
+
+def provider_native_tools_support(provider: object) -> bool:
+    """这个**具体实例**声明了支持工具吗？
+
+    读的是普通属性，缺省 ``False``（适配器没表态 = 不支持，方向是失败关闭）。
+    属性与方法两种声明形状都接受。
+    """
+    if not kind_may_have_native_tools(str(getattr(provider, "kind", "") or "")):
+        return False
+    declared = getattr(provider, "supports_native_tools", False)
+    if callable(declared):
+        return bool(declared())
+    return bool(declared)
+
 
 
 # ---------------------------------------------------------------- 默认槽位
@@ -339,7 +425,7 @@ class VideoPart:
 
 @dataclass(frozen=True)
 class ChatMessageIn:
-    role: str  # system | user | assistant
+    role: str  # system | user | assistant | tool
     content: str
     # 图像随消息一起送。空表示纯文本。
     # **不放进 content 里**：把 base64 塞进正文字符串会让日志、截断、
@@ -348,6 +434,22 @@ class ChatMessageIn:
     # 视频同理，且**只有原生视频模式**才填。抽帧模式下视频被拆成
     # ``images`` 里的若干 JPEG，走的是原来那条路。
     videos: tuple[VideoPart, ...] = ()
+    # ---------------------------------------------------- 原生工具回路
+    #
+    # ``role="assistant"`` 且模型提出了调用时：这里放**原样**的调用列表。
+    # 回灌必须先回放这条消息，否则下一轮多出来的 ``role="tool"`` 消息找不到
+    # 它在回应哪一条 assistant 消息（OpenAI 会 400）。
+    #
+    # ``role="tool"`` 时：``provider_call_id`` 必填、``content`` 是结果正文。
+    # **只有 provider 的 ID 能出现在这里**——内部执行 ID 放进去是错的，
+    # 见 `ToolCall` 的说明。
+    tool_calls: tuple[ToolCall, ...] = ()
+    provider_call_id: str | None = None
+
+    def is_tool_result(self) -> bool:
+        """这条消息是不是一条工具结果（而不是普通对话）。"""
+        return self.role == "tool"
+
 
 
 def has_videos(messages: list[ChatMessageIn]) -> bool:
@@ -372,6 +474,20 @@ class ModelRequest:
     config_revision: int = 0
     trace_id: str | None = None
     timeout_seconds: float = 60.0
+    # ---------------------------------------------------- 原生工具回路
+    #
+    # 空元组 = **不发** ``tools`` 字段（而不是发一个空数组）。有些兼容端点
+    # 把 ``tools: []`` 当成"已启用工具模式"，于是开始要求 ``tool_choice``，
+    # 或者干脆返回 400。默认不带工具，与改动前逐字节一致。
+    tools: tuple[ToolDefinition, ...] = ()
+    # ``auto`` / ``none`` / ``required``。``None`` = 不发这个字段。
+    #
+    # ``none`` 是**收尾步骤**用的：已经有过工具调用、但批次/时间预算用完时，
+    # 必须让模型在不调用工具的情况下把已拿到的结果说清楚，而不是继续提新调用。
+    tool_choice: str | None = None
+    # 只认 ``False``（= 本次至多一个调用）。``None`` = 不发，由供应商默认。
+    # 最小闭环先限单调用；``True`` 不是"允许并行"的保证，各家支持度不同。
+    parallel_tool_calls: bool | None = None
 
 
 def has_images(messages: list[ChatMessageIn]) -> bool:
@@ -407,13 +523,127 @@ class ModelError(Exception):
         self.retriable = retriable
 
 
+@dataclass(frozen=True)
+class ToolDefinition:
+    """一个可以被模型调用的工具（**与供应商无关**的定义）。
+
+    ``parameters`` 是 JSON Schema 的 ``properties``+``required`` 那一层，
+    不是完整 schema：适配器自己补 ``{"type": "object", ...}``。这样
+    ``ToolSpec.input_schema`` 既能原样传给供应商，也不会因为这里多包一层
+    ``type`` 出现 ``{"type":"object","type":"object"}``。
+
+    ``strict`` 只有支持约束解码的供应商才认。**不能靠它证明参数安全**：
+    它约束的是"形状对不对"，不是"这个 URL 该不该读 / 这个动作有没有被授权"。
+    """
+
+    name: str
+    description: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+    strict: bool = False
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """模型提出的**一次**工具调用（供应商 wire 里的 ``tool_calls[i]``）。
+
+    两套 ID 不是同一件事，**不能互相冒充**：
+
+    - ``provider_call_id``（``id``）：供应商给的配对键。回灌时 ``role:"tool"``
+      的 ``tool_call_id`` 必须用它，否则供应商看到的是"一个没有出处的工具结果"。
+    - 内部执行 ID 由 ``ToolRegistry`` 自己生成（它是执行审计的键）。
+
+    编排层保存两者的映射。用内部 ID 冒充 provider ID 的后果是**静默的**：
+    OpenAI 会 400，而宽松的兼容端点会把这条结果当成"无主"丢弃——于是模型
+    看不到任何结果，接着凭印象回答问题。这比报错危险得多。
+
+    ``arguments`` 是供应商给的**原始 JSON 字符串**，不在这里解析：解析与
+    校验属于编排层（它要知道某一次调用是因为参数坏掉而失败的，并且要为此
+    生成一条明确的失败回执）。``raw_index`` 是流式分片里的 ``index``，
+    只用于"同一批里乱序到达时按提出顺序排列"。
+    """
+
+    provider_call_id: str
+    name: str
+    arguments: str = ""
+    raw_index: int = 0
+
+    def parsed_arguments(self) -> dict[str, Any]:
+        """解析参数。解析失败抛 ``ValueError``（带可读原因），不要静默成 ``{}``。
+
+        ``{}`` 的语义是"这个工具确实不需要参数"，与"参数坏了"是两件相反的事：
+        前者可以执行，后者必须生成失败回执。
+        """
+        raw = (self.arguments or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"工具参数不是合法 JSON: {exc.msg}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("工具参数必须是 JSON 对象")
+        return parsed
+
+
+class ModelChunkKind(StrEnum):
+    """``ModelChunk`` 的可选单调类型。
+
+    **默认 ``content``**：这是为了让所有既有生产点/消费点（fake provider、
+    三个适配器、路由、turn 主循环、补生成）一行都不用改，也为了让
+    "不认识 ``kind`` 的旧消费者"看到的行为与改动前完全一致。
+
+    真正的区分不能只看 ``kind``：一个只带 ``done=True`` 的收尾帧也是
+    ``content``。判断"这一帧是不是工具事件"要用 ``ModelChunk.is_tool_event()``。
+    """
+
+    content = "content"
+    tool_call = "tool_call"
+
+
 @dataclass
 class ModelChunk:
-    """流式增量。文本增量与结束原因是两个语义。"""
+    """流式增量。
+
+    三种语义**不能混**（混了会静默丢数据）：
+
+    1. ``delta``：可见文本。
+    2. ``done``：这一步结束（``finish_reason`` 在收尾帧上）。
+    3. 工具事件：``tool_call``（一次调用开始，带 id/name）与
+       ``tool_arguments_delta``（参数分片，按 provider_call_id 累积）。
+
+    为什么要把工具事件做成**独立的类型化字段**而不是往 ``delta`` 里塞一段
+    文本：``delta`` 会原样累积进 ``delivered`` 并被流式外发。把一个
+    ``{"id": "call_A", ...}`` 塞进去，用户会先看到 JSON 再看到它消失。
+
+    ``tool_call_complete=True`` 表示这个 provider_call_id 的参数已经收齐，
+    后面不会再有它的 ``tool_arguments_delta``。
+    """
 
     delta: str = ""
     done: bool = False
     finish_reason: str | None = None
+    # ---- 工具事件（与供应商无关）
+    #
+    # ``provider_call_id`` 只在该帧属于某一次具体调用时非空。
+    # 只带 ``kind=tool_call`` 而没有 ID 的帧不是合法事件（解析器会跳过）。
+    tool_call: ToolCall | None = None
+    tool_arguments_delta: str | None = None
+    provider_call_id: str | None = None
+    tool_call_complete: bool = False
+    kind: ModelChunkKind = ModelChunkKind.content
+
+    def is_tool_event(self) -> bool:
+        """这一帧是不是工具事件（不是内容帧）。
+
+        判据是"带了工具 payload"，不是"``kind`` 等于什么"：默认 ``kind``
+        为 ``content`` 时也可能携带工具 payload（旧生产者不写 ``kind``）。
+        """
+        return (
+            self.tool_call is not None
+            or self.tool_arguments_delta is not None
+            or self.tool_call_complete
+        )
+
 
 
 @dataclass
@@ -465,9 +695,13 @@ class ModelTarget:
 
 __all__ = [
     "LEGACY_PROVIDER_KIND_ALIASES",
+    "NATIVE_TOOLS_PROFILES",
     "PROFILE_CAPABILITIES",
     "PROVIDER_CAPABILITIES",
     "ChatMessageIn",
+    "ModelChunkKind",
+    "ToolCall",
+    "ToolDefinition",
     "VideoPart",
     "has_videos",
     "ModelCapability",
@@ -480,8 +714,12 @@ __all__ = [
     "ProbeResult",
     "ProviderKind",
     "Usage",
+    "ADAPTER_NATIVE_TOOLS_KINDS",
+    "kind_may_have_native_tools",
+    "provider_native_tools_support",
     "kind_supports_profile",
     "normalize_provider_kind",
+    "profile_supports_native_tools",
     "provider_capabilities",
     "required_capability",
 ]
