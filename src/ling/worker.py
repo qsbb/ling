@@ -41,6 +41,11 @@ from ling.domains.media.errors import MediaRefError
 from ling.domains.media.jobs import MEDIA_READ_TOPIC
 from ling.infra.db import dispose_engine, init_engine, session_scope
 from ling.infra.models import OutboxEvent, Turn, utcnow
+from ling.kernel.visibility import (
+    GROUP_VISIBILITY,
+    is_group_visibility,
+    is_group_window_ref,
+)
 
 if TYPE_CHECKING:
     from ling.ports.config import EffectiveConfig
@@ -422,9 +427,13 @@ async def handle_memory_extract(payload: dict) -> None:
     # 而"群聊"的定义就是 group_scope，两者不可能互相矛盾，也不需要第二处
     # 生产者同步维护。显式的 is_group 若将来出现，只允许它**追加**群聊语义
     # （fail-closed）：任何一方说"这是群聊"，就按群聊处理。
-    is_group = source_visibility == Visibility.group_scope.value or bool(
-        payload.get("is_group")
-    )
+    # 判据收敛到 `kernel/visibility.py` 的**唯一实现**。
+    #
+    # 保留 `payload.get("is_group")` 的**追加**语义（fail-closed）：生产者目前
+    # 不写这个字段，但「任何一方说这是群聊，就按群聊处理」是安全的一侧——
+    # 群聊语义会收紧行为（闸门拒绝某些提炼、记忆限本群），多收紧不会泄漏。
+    # 反过来漏判才是那次事故的形态。
+    is_group = is_group_visibility(source_visibility) or bool(payload.get("is_group"))
     if not (subject_id and window_id and turn_id):
         logger.warning("memory.extract 缺少必要字段，跳过: %s", payload)
         return
@@ -663,7 +672,7 @@ async def _commitment_window_ref(
             stmt = stmt.where(Window.channel == channel)
         row = (await session.execute(stmt)).scalars().first()  # type: ignore[attr-defined]
         # 群窗口的 title 也是 window_ref，这里必须挡住：承诺提醒不发到群里
-        if row is not None and row.visibility != "group_scope" and row.title:
+        if row is not None and not is_group_visibility(row.visibility) and row.title:
             return str(row.title)
 
     if not (subject_id and channel):
@@ -770,7 +779,7 @@ async def handle_commitment_dispatch(payload: dict) -> None:
                         operation_id=f"commit:{commitment.commitment_id}",
                         window_ref=window_ref,
                         text=commitment.text,
-                        is_group=":group:" in window_ref,
+                        is_group=is_group_window_ref(window_ref),
                     ),
                     actor_id=get_settings().actor_id,
                     subject_id=commitment.subject_id,
@@ -1670,7 +1679,7 @@ async def _deliver_deferred_fallback(*, window_id: str, subject_id: str) -> bool
         )
         channel = str(window.channel or "")
         window_ref = str(window.title or "")
-        is_group = str(window.visibility or "") == "group_scope"
+        is_group = is_group_visibility(window.visibility)
 
     if channel in {"", "web"} or not window_ref:
         # 没有外部渠道：落库即送达（Web 面板就是投递面）。
@@ -2277,7 +2286,7 @@ async def _reply_in_group_window(  # noqa: ANN001
     if callable(caps):
         with contextlib.suppress(Exception):
             limit = int(caps().max_text_length) or None
-    is_group = str(window.visibility or "") == "group_scope"
+    is_group = is_group_visibility(window.visibility)
     parts = plan_parts(reply_text, is_group=True, max_part_chars=limit)
     if not parts:
         return False, "回复文本为空"
@@ -2434,7 +2443,10 @@ async def handle_attention_tick(payload: dict) -> None:
                 select(Message.window_id, func.count(Message.id))
                 .join(Window, Window.id == Message.window_id)
                 .where(
-                    Window.visibility == "group_scope",
+                    # SQL 端判据：与该列存的值同源（`group_scope`）。
+                    # 这里不能调 Python 函数，但字面量取自唯一权威枚举，
+                    # 不是第二份判断——改取值只改 `GROUP_VISIBILITY`。
+                    Window.visibility == GROUP_VISIBILITY,
                     Message.role == "user",
                     Message.attention_state == "unseen",
                 )

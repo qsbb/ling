@@ -45,6 +45,7 @@ from ling.kernel.autonomy import (
 from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
 from ling.kernel.decision import DecisionContext, classify_text
 from ling.kernel.turn import describe_turn_failure
+from ling.kernel.visibility import is_group_window_ref
 from ling.logging_setup import emit_event
 
 if TYPE_CHECKING:
@@ -360,7 +361,12 @@ class InboundBridge:
         # 原来群里没走过绑定流程的人整条被拒——她只能听见已绑定的人说话，
         # 等于在有别人的群里是聋的。现在群里自动建 known 级 subject：
         # 能听见，但记忆只限本群、跨窗召回不开放（见 IDENTITY-MULTIUSER-DESIGN）。
-        is_group = ":group:" in envelope.window_ref
+        # 群聊判定走**唯一实现**（`kernel/visibility.py`）。原来是
+        # `":group:" in window_ref` 的**子串**匹配，会把
+        # `onebot:private:group:123` 这类私聊标识误判成群聊——而这个值下面
+        # 还要决定往 `Window.visibility` 写什么，所以错误会落进数据库，
+        # 之后 turn.py / worker.py 全都跟着错。
+        is_group = is_group_window_ref(envelope.window_ref)
         identity = IdentityService(self._session)
         subject_id = await identity.resolve_account(
             envelope.connector_instance, envelope.account_ref or ""
@@ -1137,7 +1143,7 @@ class InboundBridge:
             actor_id=self._actor_id,
             subject_id=subject_id,
             window_ref=envelope.window_ref,
-            is_group=":group:" in envelope.window_ref,
+            is_group=is_group_window_ref(envelope.window_ref),
             plan_id=f"plan_{turn_id}",
             turn_id=turn_id,
             reason="generation_timeout",
@@ -1649,7 +1655,7 @@ class InboundBridge:
         from ling.contracts.v1 import OperationState
         from ling.ports.channel import OutboundMessage
 
-        is_group = ":group:" in envelope.window_ref
+        is_group = is_group_window_ref(envelope.window_ref)
         # 渠道硬上限：能拿到就用，拿不到让 `plan_parts` 用保守兜底。
         # 不传这个值就等于"假设渠道没有上限"——正是尾段被整条拒收的成因。
         caps = getattr(self._connector, "capabilities", None)

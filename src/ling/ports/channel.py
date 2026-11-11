@@ -164,6 +164,37 @@ class ReceiptQuery:
     text_digest: str | None = None
     # 发出时间（对账时算时间窗与宽限期用）。
     sent_at: datetime | None = None
+    # 这条消息当时发往群聊还是私聊。**三态**：
+    #
+    # - ``None``（默认）= 调用方不知道。连接器应退回自己的推断（OneBot 是
+    #   按 ``window_ref`` 反推），而不是当成私聊。
+    # - ``True`` / ``False`` = 调用方明确知道，连接器直接采用。
+    #
+    # ## 为什么需要这个字段
+    #
+    # 对账时平台常常没给 ``platform_message_id``（OneBot 的 ``send_*_msg``
+    # 在 ``status=ok`` + 空 data 时就没有），连接器只能去平台历史里做内容
+    # 比对。**而查历史要选对接口**：群聊是 ``get_group_msg_history``、私聊是
+    # ``get_friend_msg_history``，选错就查不到，于是那条消息永远停在
+    # ``uncertain``。
+    #
+    # 在那之前，连接器只能从 ``window_ref`` 字符串反推（``":group:" in ref``）。
+    # 字符串是拼接出来的约定而不是受约束的类型，这会误判——而"什么算群聊"
+    # 本来就是业务语义，不该由传输层推断。
+    #
+    # ## 为什么不是 ``bool = False``
+    #
+    # ``False`` 会被读成"调用方确认这是私聊"，与"调用方不知道"是两件事。
+    # 用 ``False`` 当默认值等于**替调用方做了一个它没做的判断**，而且这个
+    # 判断还是错的（真实是群聊时会去查私聊历史）。同一个道理见
+    # ``CapabilityDescriptor.supported_media`` 的三态设计。
+    #
+    # ## 为什么 `OutboundMessage` 和 `RecallRequest` 都已经有它
+    #
+    # 那两处早就有 ``is_group``，唯独这里缺——**能力具备而字段缺失就是遗漏**：
+    # 发起对账的调用方本来就知道这条 operation 发往哪里
+    # （``operations.payload["window_ref"]`` 与它同在一条记录上）。
+    is_group: bool | None = None
 
 
 @dataclass(frozen=True)

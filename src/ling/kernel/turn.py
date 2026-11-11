@@ -58,6 +58,7 @@ from ling.kernel.arbiter import SpeakerArbiter
 from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.marker_stream import stream_safe_all, strip_all_markers
 from ling.kernel.stream_log import StreamLog
+from ling.kernel.visibility import is_group_visibility
 from ling.logging_setup import emit_event
 from ling.models.router import ModelRouter
 from ling.ports.config import EffectiveConfig
@@ -847,6 +848,14 @@ class TurnCoordinator:
                 # **记忆策略随本轮配置快照一起进来**：`config` 是这一轮开始时
                 # 取到的已发布配置，所以"发布后下一轮生效"是天然成立的——
                 # 进行中的轮次继续用旧快照，不会被热改半路换掉。
+                # 群聊判定走**唯一实现**（`kernel/visibility.py`），且**只算一次**。
+                #
+                # 原来这里有两处各自写 `window.visibility == "group_scope"`：
+                # 一处在 `is_group=`，一处在 `user_sender_name=`。同一轮里
+                # 两个判断必须同源——分开写就有"上下文按群聊组装、署名按私聊
+                # 省略"（或反过来）的可能，而那种不一致不会报错，只会让输出
+                # 看起来莫名其妙。
+                is_group_window = is_group_visibility(window.visibility)
                 compiled = await ContextCompiler(
                     session,
                     actor_id=self._actor_id,
@@ -860,7 +869,7 @@ class TurnCoordinator:
                     subject_id=subject_id,
                     window_id=window_id,
                     user_text=user_text,
-                    is_group=window.visibility == "group_scope",
+                    is_group=is_group_window,
                     # **不要在这里给条数上限。** 这里原来是 `history_limit=20`：
                     # 那个值不是"上下文里放 20 条"，而是"一次性只从库里取 20 条"，
                     # 于是第 21 条往回的消息既不在原文里、也不在编译器的
@@ -877,9 +886,7 @@ class TurnCoordinator:
                     # 私聊不署名：那里只有一个说话人，前缀只是噪音；而且
                     # `compile` 的接口文档写明这个参数"群聊才有意义"
                     # （`is_group=False` 时它也不去库里补名字）。
-                    user_sender_name=(
-                        sender_name if window.visibility == "group_scope" else None
-                    ),
+                    user_sender_name=(sender_name if is_group_window else None),
                     # 「正在回的这条」也要能被她引用：它的平台 id 只有调用方
                     # 知道（连接器给的），所以从上面一路透传下来。
                     current_message_platform_id=current_message_platform_id,

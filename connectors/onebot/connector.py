@@ -751,7 +751,25 @@ class OneBotV11Connector(ChannelConnector):
         sent_at = _aware(query.sent_at) or _now()
         since = sent_at - timedelta(seconds=HISTORY_MATCH_BEFORE_SECONDS)
         until = sent_at + timedelta(seconds=HISTORY_MATCH_AFTER_SECONDS)
-        is_group = ":group:" in window_ref
+        # 群聊判定：**调用方给了就用，没给才反推**。
+        #
+        # `ReceiptQuery.is_group` 是三态的（`None` = 调用方不知道）。这里必须
+        # 用 `is not None` 而不是 `or`——后者会把明确的 `False`（"确认是私聊"）
+        # 当成"没给"，于是去反推，等于丢掉调用方给的确切事实。
+        #
+        # 反推用 `is_group_window_ref()`（`kernel/visibility.py`），不是
+        # `":group:" in window_ref` 的子串匹配：后者会把
+        # `onebot:private:group:123` 这类私聊标识误判成群聊，然后对私聊窗口
+        # 调 `get_group_msg_history`——查不到，那条消息永远停在 uncertain。
+        #
+        # 注意分层：这里**不 import kernel 模块**（方向是 kernel → connectors）。
+        # 反推逻辑放在本连接器内联，但语义与 `is_group_window_ref` 一致：
+        # 按 `:` 切段、只看第 2 段是否为 `group`、且第 3 段非空。
+        if query.is_group is not None:
+            is_group = query.is_group
+        else:
+            _parts = str(window_ref or "").split(":")
+            is_group = len(_parts) >= 3 and _parts[1] == "group" and bool(_parts[2])
         action = "get_group_msg_history" if is_group else "get_friend_msg_history"
         target_key = "group_id" if is_group else "user_id"
         try:

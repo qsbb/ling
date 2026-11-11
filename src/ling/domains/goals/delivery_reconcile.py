@@ -40,6 +40,7 @@ from ling.capabilities.delivery import DeliveryService, reconcile_due
 from ling.contracts.v1 import OperationState
 from ling.infra.db import session_scope
 from ling.infra.models import Message, Operation
+from ling.kernel.visibility import is_group_window_ref
 
 if TYPE_CHECKING:
     # 只在注解里用：`ling.ports.channel` 是这个模块的下游依赖，
@@ -277,7 +278,18 @@ async def reconcile_deliveries(
         connector = await _resolve(connector_for, channel)
         if connector is None:
             continue
-        is_group = ":group:" in window_ref
+        # 群聊判定走**唯一实现**（`kernel/visibility.py`）。
+        #
+        # 这里是**降级路径**：`window_ref` 来自 operation 的 payload（:138），
+        # 手上没有 Window 行，读不到权威的 `visibility` 列。所以用
+        # `is_group_window_ref()` 从标识反推——它与原来的
+        # `":group:" in window_ref` **子串**匹配的区别是：不会把
+        # `onebot:private:group:123` 这类私聊标识误判成群聊。
+        #
+        # 误判的后果在这里是分条策略错：`plan_parts` 会按群聊的上限切分，
+        # 而实际是私聊——切出来的条数不对，可能多切（多发几条消息）或少切
+        # （被平台整条拒收）。
+        is_group = is_group_window_ref(window_ref)
         caps = getattr(connector, "capabilities", None)
         part_limit = None
         if callable(caps):

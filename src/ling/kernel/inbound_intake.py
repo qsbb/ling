@@ -29,6 +29,7 @@ import logging
 import time
 
 from ling.infra.db import session_scope
+from ling.kernel.visibility import group_id_from_window_ref, is_group_window_ref
 
 logger = logging.getLogger("ling.kernel.inbound")
 
@@ -168,7 +169,10 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
     settings = state.settings
     # 群 id 从窗口引用里取（`window:group:<id>`），没有就是私聊。
     scene = str(getattr(envelope, "window_ref", "") or "")
-    group_id = scene.split(":group:", 1)[1].split(":", 1)[0] if ":group:" in scene else None
+    # 群号提取走**唯一实现**（`kernel/visibility.py` 的 `group_id_from_window_ref`）。
+    # 原来的内联切分是同一逻辑的第二份拷贝：两处只要有一处改了判据
+    # （第几段、要不要 `:group:` 字样），就会出现"一个说有群号、一个说没有"。
+    group_id = group_id_from_window_ref(scene)
     decision = check_access(
         envelope.account_ref,
         mode=settings.access_mode,
@@ -298,7 +302,9 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
         # 行为日志：**她这一侧**发生了什么。放在这里而不是 bridge 内部，
         # 是因为 inbound_intake 是所有渠道的唯一汇合点——放 bridge 里，
         # QQ 官方机器人那条路会漏。
-        _log_inbound_behavior(envelope, result, is_group=":group:" in envelope.window_ref)
+        _log_inbound_behavior(
+            envelope, result, is_group=is_group_window_ref(envelope.window_ref)
+        )
 
     return {
         "accepted": result.accepted,
@@ -370,7 +376,7 @@ async def _process_recall(app: object, event: object) -> dict:
         await session.commit()
 
     who = event.sender_name or "对方"
-    where = "群里" if ":group:" in str(event.window_ref or "") else "私聊里"
+    where = "群里" if is_group_window_ref(event.window_ref) else "私聊里"
     matched = outcome.status in {"retracted", "already_retracted"}
     if event.self_recall:
         # 自己撤回自己的：不是"对方收回了"，不要错误归属。

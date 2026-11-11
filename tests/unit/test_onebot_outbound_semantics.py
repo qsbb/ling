@@ -447,3 +447,108 @@ async def test_query_receipt_channel_error_stays_uncertain() -> None:
         ReceiptQuery(operation_id="op1", platform_message_id="555")
     )
     assert receipt.state is DeliveryState.uncertain
+
+
+# ------------------------------------------------------ 对账：群聊判定的事实来源
+#
+# `ReceiptQuery.is_group` 是三态的（`None` = 调用方不知道）。连接器选历史接口时
+# 必须**先看调用方给的事实，没有才反推**。这三条钉住三态的三个分支。
+
+
+@pytest.mark.asyncio
+async def test_receipt_uses_caller_supplied_is_group_true() -> None:
+    """调用方给 `is_group=True` → 用**群聊**历史接口。
+
+    关键在窗口标识是**私聊形态**（`:private:`）：如果连接器偷偷自己反推，
+    就会走私聊分支。断言它走了群聊分支，才证明"调用方的事实优先"。
+    """
+    actions: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        actions.append(str(request.url).rsplit("/", 1)[-1])
+        return _ok({"messages": []})
+
+    await _connector(handler).query_receipt(
+        ReceiptQuery(
+            operation_id="op_caller_group",
+            window_ref="onebot-semantics:private:100200300",
+            text_digest=delivery_text_digest("随便"),
+            sent_at=datetime.now(UTC) - timedelta(seconds=20),
+            is_group=True,
+        )
+    )
+    assert actions == ["get_group_msg_history"], (
+        f"调用方说群聊，却走了 {actions}——连接器没有采用调用方给的事实"
+    )
+
+
+@pytest.mark.asyncio
+async def test_receipt_uses_caller_supplied_is_group_false() -> None:
+    """调用方给 `is_group=False` → 用**私聊**历史接口。
+
+    ## 这条防的是 `or` 的坑
+
+    如果实现写成 ``is_group = query.is_group or _infer(...)``，那么明确的
+    ``False`` 会被当成"没给"，于是去反推——而窗口标识是群聊形态，反推结果是
+    ``True``，走了群聊接口。这条会红。
+
+    必须用 ``is not None`` 判断。
+    """
+    actions: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        actions.append(str(request.url).rsplit("/", 1)[-1])
+        return _ok({"messages": []})
+
+    await _connector(handler).query_receipt(
+        ReceiptQuery(
+            operation_id="op_caller_private",
+            window_ref="onebot-semantics:group:123456",
+            text_digest=delivery_text_digest("随便"),
+            sent_at=datetime.now(UTC) - timedelta(seconds=20),
+            is_group=False,
+        )
+    )
+    assert actions == ["get_friend_msg_history"], (
+        f"调用方说私聊，却走了 {actions}——明确的 False 被当成'没给'了"
+    )
+
+
+@pytest.mark.asyncio
+async def test_receipt_falls_back_to_inference_when_is_group_absent() -> None:
+    """调用方没给（`None`）→ 退回反推，且**不误判**含 ``group`` 字样的私聊。
+
+    这是渐进收窄的关键：在调用方补上 `is_group` 之前，行为必须与改动前一致。
+    """
+    actions: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        actions.append(str(request.url).rsplit("/", 1)[-1])
+        return _ok({"messages": []})
+
+    connector = _connector(handler)
+    sent_at = datetime.now(UTC) - timedelta(seconds=20)
+
+    # 真群聊：反推为群聊
+    await connector.query_receipt(
+        ReceiptQuery(
+            operation_id="op_infer_group",
+            window_ref="onebot-semantics:group:123456",
+            text_digest=delivery_text_digest("随便"),
+            sent_at=sent_at,
+        )
+    )
+    assert actions[-1] == "get_group_msg_history"
+
+    # **带 group 字样的私聊**：不能误判成群聊
+    await connector.query_receipt(
+        ReceiptQuery(
+            operation_id="op_infer_private",
+            window_ref="onebot-semantics:private:group:123",
+            text_digest=delivery_text_digest("随便"),
+            sent_at=sent_at,
+        )
+    )
+    assert actions[-1] == "get_friend_msg_history", (
+        "私聊标识被误判成群聊——子串匹配的老问题又回来了"
+    )
