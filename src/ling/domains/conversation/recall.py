@@ -64,6 +64,7 @@ from ling.contracts.v1 import (
     RecallReceipt,
 )
 from ling.kernel.marker_stream import PENDING_MARKER_RE
+from ling.kernel.visibility import is_group_visibility
 from ling.ports.channel import ChannelConnector, ChannelError, RecallRequest
 
 logger = logging.getLogger("ling.domains.conversation.recall")
@@ -345,7 +346,26 @@ async def resolve_recall_target(
         message_id=str(row.id),
         window_id=str(window_id),
         window_ref=str(window.title or ""),
-        is_group=":group:" in str(window.title or ""),
+        # 群聊判定读**权威列** `Window.visibility`，不再拿 `title` 做字符串匹配。
+        #
+        # 这里原来写的是 `":group:" in str(window.title or "")`——而 `window` 是
+        # `session.get(Window, ...)` 取回的**完整 ORM 对象**（见上面 :304），
+        # `visibility` 就在手边。**明明有权威数据却用了间接的**，这是全仓唯一
+        # 一处"有得选却选错"的（另外几处字符串匹配是因为手上确实只有
+        # `window_ref` 字符串，没得选）。
+        #
+        # ## 为什么这一处比别处更要紧
+        #
+        # 撤回是**不可撤销的破坏性动作**。判错群/私聊会走到错的平台接口，
+        # 而 `RecallRequest` 的文档明确写着：「猜错就是撤掉别人的消息，那是
+        # 不可撤销的破坏」。所以这里的判据准确性要求比任何别处都高，却偏偏
+        # 用的是最脆弱的判据（子串匹配）。
+        #
+        # 具体误判：`window.title` 存的就是 `window_ref`
+        # （`kernel/bridge.py::_ensure_window` 的 `title=envelope.window_ref`），
+        # 所以 `"onebot:private:group:123"` 这类**私聊**标识会因为含有
+        # `:group:` 子串而被判成群聊。
+        is_group=is_group_visibility(window.visibility),
         platform_message_id=platform_id,
         sent_at=observed_at,
         operation_id=operation_id,

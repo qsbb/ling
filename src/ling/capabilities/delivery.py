@@ -422,6 +422,25 @@ class DeliveryService:
                 window_ref=payload.get("window_ref"),
                 text_digest=payload.get("text_digest"),
                 sent_at=operation.created_at,
+                # 发往群聊还是私聊：**这里手上有权威数据，不要让它去推断**。
+                # 这个值是发送时写进 payload 的（`:217` 正常投递、`:498`
+                # 超时续发的 `delivery.pending` 也会写），来自
+                # `OutboundMessage.is_group`——是显式的业务语义。
+                #
+                # 为什么必须传：不传的话连接器只能从 `window_ref` 里找
+                # `":group:"` 反推。字符串是拼接出来的约定，不是受约束的
+                # 类型，会误判（见 `ports/channel.py:167` 起的契约说明）。
+                # 而查历史接口选错就直接查不到 → 那条消息永远停在
+                # `uncertain`，用户看到的是"发出去了但一直不确定"。
+                #
+                # **绝不写成 `bool(payload.get("is_group"))`**：
+                # `bool(None)` 是 `False`，会把这个字段上线前发出的旧
+                # operation（payload 里没这个 key）全部当成"确认私聊"，
+                # 反而把误判方向固定死。`None` 的语义是"调用方不知道，
+                # 请连接器退回自己的推断"——这正是旧数据该走的路。
+                # 见 `ports/channel.py` 里 `is_group` 的三态说明，以及
+                # 该字段下方「为什么不是 `bool = False`」一节。
+                is_group=payload.get("is_group"),
             )
         )
         attempts = int(payload.get("reconcile_attempts") or 0) + 1
