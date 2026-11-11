@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select, update
 
 from ling.config import get_settings
+from ling.contracts.v1 import CapabilityDescriptor
 from ling.domains.media.errors import MediaRefError
 from ling.domains.media.jobs import MEDIA_READ_TOPIC
 from ling.infra.db import dispose_engine, init_engine, session_scope
@@ -2148,7 +2149,7 @@ async def handle_embedding_backfill(payload: dict) -> None:
         logger.info("向量补算：写入 %d 条", done)
 
 
-def _channel_capabilities(channel: str) -> object | None:
+def _channel_capabilities(channel: str) -> CapabilityDescriptor | None:
     """这一轮所在渠道的能力声明（喂给 `ContextCompiler` 决定提示词能列哪些动作）。
 
     ``None`` 表示**没有外部渠道**（Web 面板 / 内部直发，见 `channel in {"", "web"}`
@@ -2165,7 +2166,7 @@ def _channel_capabilities(channel: str) -> object | None:
     return caps() if callable(caps) else None
 
 
-async def _window_channel_capabilities(window_id: str) -> object | None:
+async def _window_channel_capabilities(window_id: str) -> CapabilityDescriptor | None:
     """按 `window_id` 查出窗口渠道，再取该渠道的能力声明。
 
     只被"手里只有 window_id、没有 window 对象"的路径用（延后回复）。
