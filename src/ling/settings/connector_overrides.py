@@ -133,9 +133,9 @@ class ResolvedConnectorConfig:
 
 
 async def _head_row(session: AsyncSession, scope: str) -> Any:
-    from ling.infra.models import ConnectorConfigHead
+    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead
 
-    return await session.get(ConnectorConfigHead, scope)
+    return await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
 
 
 async def active_generation(session: AsyncSession, scope: str) -> int:
@@ -156,10 +156,14 @@ async def read_override_values(
     ``include_secrets=False`` 时**不解密**：返回的密钥项只有 ``preview`` 与
     指纹，``plain_value`` 为 ``None``。这是给 GET / 审计用的形状。
     """
-    from ling.infra.models import ConnectorConfigHead, ConnectorOverrideValue
+    from ling.infra.models import (
+        DEFAULT_INSTANCE_ID,
+        ConnectorConfigHead,
+        ConnectorOverrideValue,
+    )
 
     if revision_id is None:
-        head = await session.get(ConnectorConfigHead, scope)
+        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
         revision_id = getattr(head, "active_revision_id", None)
     if not revision_id:
         return {}

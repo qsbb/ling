@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from ling.infra.db import session_scope
 from ling.infra.models import (
+    DEFAULT_INSTANCE_ID,
     AuthSession,
     ConnectorConfigHead,
     ConnectorConfigRevision,
@@ -243,7 +244,7 @@ async def test_clear_falls_back_to_env_without_copying_it(
         )
     # 新修订里**没有**这个 key（clear 的语义是"这一版没有覆盖"，不是写空串）
     async with session_scope() as session:
-        head = await session.get(ConnectorConfigHead, "onebot")
+        head = await session.get(ConnectorConfigHead, ("onebot", DEFAULT_INSTANCE_ID))
         assert head is not None
         active_rows = [
             r for r in rows if r.revision_id == head.active_revision_id
@@ -405,7 +406,7 @@ async def test_start_failure_rolls_back_and_keeps_old_generation(
     # 有效值仍是 A（回退了），不是 B
     assert _field(after, "onebot", "LING_ONEBOT_ACCESS_TOKEN")["preview"] == "onebot-••••"
     async with session_scope() as session:
-        head = await session.get(ConnectorConfigHead, "onebot")
+        head = await session.get(ConnectorConfigHead, ("onebot", DEFAULT_INSTANCE_ID))
         assert head is not None and head.candidate_revision_id is None
         assert head.active_revision_id is not None
         failed = await session.get(ConnectorConfigRevision, body["revision_id"])
@@ -565,7 +566,9 @@ async def test_activation_in_progress_is_409(
 ) -> None:
     """候选已落库、还没确认时，第二个写入者拿到 409（不并发切换）。"""
     async with session_scope() as session:
-        head = ConnectorConfigHead(scope="onebot", generation=0)
+        head = ConnectorConfigHead(
+            scope="onebot", instance_id=DEFAULT_INSTANCE_ID, generation=0
+        )
         session.add(head)
         revision = ConnectorConfigRevision(
             id="crev_inflight", scope="onebot", state="activating"

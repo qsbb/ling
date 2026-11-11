@@ -647,13 +647,13 @@ async def _connector_field_views(
 
 
 async def _activation_views(session: AsyncSession) -> dict[str, dict[str, object]]:
-    from ling.infra.models import ConnectorConfigHead
+    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead
     from ling.settings import connector_fields as cf
     from ling.settings.connector_service import activation_payload, latest_revision
 
     out: dict[str, dict[str, object]] = {}
     for scope in cf.SCOPES:
-        head = await session.get(ConnectorConfigHead, scope)
+        head = await session.get(ConnectorConfigHead, (scope, DEFAULT_INSTANCE_ID))
         out[scope] = activation_payload(
             scope=scope,
             generation=int(getattr(head, "generation", 0) or 0),

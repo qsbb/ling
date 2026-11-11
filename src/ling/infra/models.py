@@ -473,6 +473,59 @@ class ProviderCredential(Base):
     )
 
 
+#: 每个 scope 的那个"存量折叠出来的"实例的 id。
+#:
+#: 升级前每个 scope 只有一份配置，迁移把它折成 `(scope, 'default')`。
+#: 读取方在**还没引入实例参数**的位置一律用它——那些位置对应"这个 scope
+#: 现在生效的配置"，而在单实例部署里那就是默认实例。
+#:
+#: 注意这是**回落值**，不是"所有实例都叫 default"：存量部署若已把
+#: `LING_*_INSTANCE_ID` 改成别的值，迁移会把它作为实例 id（见 0067 的推导逻辑），
+#: 此时 `default` 只是"没有实例上下文"时的兜底。
+DEFAULT_INSTANCE_ID = "default"
+
+
+class ConnectorInstance(Base):
+    """一个连接器实例的**身份**（同一 scope 可以有多个）。
+
+    这是本次多实例改造引入的新概念：以前"实例"只以配置字段
+    ``LING_ONEBOT_INSTANCE_ID`` 的形式存在，没有生命周期、不能枚举、
+    也无法表达"已删除"；而 ``connector_config_heads`` 只在首次保存时才建行，
+    所以"建了实例但还没保存过配置"在库里根本不存在。
+
+    **身份与命名空间是两件事**（这是最容易混的一处）：
+
+    - 本表的 ``(scope, instance_id)`` 是实例的**稳定身份**，建后不可变；
+    - ``LING_ONEBOT_INSTANCE_ID`` 那个字段现在叫 **actor 命名空间**，决定
+      "两个机器人下同一个 QQ 号算不算同一个人"，它是实例的**配置内容**，
+      改它不会变成另一个实例。
+
+    软删（``deleted_at``）而不是真删：修订链与审计要留着可查。
+    """
+
+    __tablename__ = "connector_instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope", "display_name", name="uq_connector_instance_display_name"
+        ),
+        CheckConstraint(
+            "scope IN ('onebot', 'qqbot', 'access')", name="ck_connector_instance_scope"
+        ),
+        Index("ix_connector_instance_scope_deleted", "scope", "deleted_at"),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    #: 实例身份。与 scope 组成主键——两个 scope 可以各有一个 ``default``。
+    instance_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ConnectorConfigRevision(Base):
     """接入器配置的**候选/已生效修订**（OneBot / QQBot / 白名单）。
 
@@ -489,12 +542,22 @@ class ConnectorConfigRevision(Base):
     __tablename__ = "connector_config_revisions"
     __table_args__ = (
         Index("ix_connector_config_revisions_scope_state", "scope", "state"),
+        Index(
+            "ix_connector_config_revisions_scope_instance_state",
+            "scope",
+            "instance_id",
+            "state",
+        ),
         Index("ix_connector_config_revisions_created", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # onebot | qqbot | access
     scope: Mapped[str] = mapped_column(String(16), index=True)
+    #: 这条修订属于哪个实例。实例身份见 ``ConnectorInstance``。
+    instance_id: Mapped[str] = mapped_column(
+        String(16), default="default", server_default="default"
+    )
     # 上一版（用于回退时读"旧的有效覆盖集合"）。为空表示这是该 scope 的第一版。
     parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
@@ -557,16 +620,32 @@ class ConnectorOverrideValue(Base):
 
 
 class ConnectorConfigHead(Base):
-    """每个 scope 一行的**指针**：现在生效的是哪一版、正在激活的是哪一版。
+    """**每个实例**一行的**指针**：现在生效的是哪一版、正在激活的是哪一版。
 
     独立成行（而不是"查 state=active 的最新一条"）的原因：回退时需要在
     同一事务里原子地把指针从候选拨回旧版；用查询表达"最新 active"会让
     并发下的指针漂移变成一次静默的重排。
+
+    主键是 ``(scope, instance_id)`` 而不是 ``scope``：``generation`` 本来就是
+    **每实例**递增的（它同时是客户端的 ``If-Match`` 与 ACK 的依据），
+    单列主键装不下同一 scope 的两个实例各停在自己那一代。
     """
 
     __tablename__ = "connector_config_heads"
 
     scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    #: 实例身份。与 scope 组成主键。
+    #:
+    #: 两层默认值都必要：``default`` 让 ORM 构造 ``ConnectorConfigHead(scope=...)``
+    #: 时不传也有值；``server_default`` 让绕过 ORM 的裸 SQL 插入也拿到值。
+    #: 少了前者，`connector_service.py` 里"首次保存时建行"那条路径会写进 NULL
+    #: 并撞 NOT NULL 约束（实测过）。
+    instance_id: Mapped[str] = mapped_column(
+        String(16),
+        primary_key=True,
+        default=DEFAULT_INSTANCE_ID,
+        server_default=DEFAULT_INSTANCE_ID,
+    )
     active_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     candidate_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 单调递增的代际号：客户端的 If-Match 与副本 ACK 都以它为准
@@ -577,7 +656,7 @@ class ConnectorConfigHead(Base):
 
 
 class ConnectorRuntimeAck(Base):
-    """副本对某代际的确认（``(generation, replica_id)`` 唯一）。
+    """副本对某代际的确认（``(scope, instance_id, generation, replica_id)`` 唯一）。
 
     单副本部署里它就是"本地切换完成"的证据；多副本时只有**全部**存活副本
     ACK 才把 head 指向新修订，失联副本不能无限阻塞（有界超时后回退）。
@@ -587,12 +666,26 @@ class ConnectorRuntimeAck(Base):
     __table_args__ = (
         # 唯一键必须带 scope：onebot 与 qqbot 可以同时停在"第 1 代"，
         # 少了 scope 这一列，第二个 scope 生效时会被唯一约束挡住。
-        UniqueConstraint("scope", "generation", "replica_id", name="uq_connector_ack_generation"),
+        #
+        # 同理必须带 instance_id：两个 onebot 实例都从 0 开始计代，
+        # 少了它，实例 A 的第 3 代会挡住实例 B 的第 3 代——表现为
+        # "切换成功但没 ACK"，而不是报错，属于最难查的那类。
+        UniqueConstraint(
+            "scope",
+            "instance_id",
+            "generation",
+            "replica_id",
+            name="uq_connector_ack_generation",
+        ),
         Index("ix_connector_ack_generation", "generation"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scope: Mapped[str] = mapped_column(String(16), index=True)
+    #: 这条 ACK 是哪个实例的。
+    instance_id: Mapped[str] = mapped_column(
+        String(16), default="default", server_default="default"
+    )
     generation: Mapped[int] = mapped_column(Integer)
     replica_id: Mapped[str] = mapped_column(String(64))
     # prepared | activated | failed
