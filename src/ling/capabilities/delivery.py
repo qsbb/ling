@@ -136,6 +136,32 @@ class DeliveryService:
             return await self._unsupported(
                 message, actor_id, subject_id, "该渠道当前不支持主动推送（需以账号权限探测为准）"
             )
+        # 拍一拍是**渠道动作**，不是"正文的一个属性"。渠道做不到时必须整条拒绝，
+        # 不能"把正文发出去、拍一拍静默丢掉"——那会留下最糟的一种记录：
+        # 回执说已送达，用户却没被拍到，而本地没有任何一行说它没发生。
+        #
+        # 判据用连接器**显式声明**的 `supports_poke`（默认 False，"未知即不可用"）。
+        # 详见 `contracts/v1.py` 该字段的注释：它的默认值刻意不是 True。
+        #
+        # ## @ 与引用的能力位**尚不存在**——这里是"不知道"，不是"不需要"
+        #
+        # `CapabilityDescriptor` 目前只有 `supports_poke` / `supports_recall`，
+        # **没有** `supports_mention` / `supports_quote`。所以 `mentions` 与
+        # `reply_to` 这两项**无法在此闸校验**：写了闸也是 `getattr` 一个不存在的
+        # 属性、拿一个自己编的默认值去判——那正是本文件上方记录的
+        # `_supports_poke` 恒为 True 那类假防线。
+        #
+        # 因此这里**故意不加** @/引用的闸，并把缺口写在这里，而不是假装它们被
+        # 覆盖了。要补需要先做独立的契约变更任务：在 `contracts/v1.py` 加
+        # `supports_mention` / `supports_quote`，由四个连接器显式声明，
+        # 并重导 `scripts/export_contracts.py` 的 schema（有守卫测试
+        # `test_exported_schemas_match_source` 会卡住）。
+        #
+        # 在此之前，@/引用的"渠道不支持"只会表现为平台侧静默无效或丢段。
+        if message.poke_targets and not caps.supports_poke:
+            return await self._unsupported(
+                message, actor_id, subject_id, "该渠道不支持拍一拍"
+            )
         # 媒体能力必须单独挡。不挡的话会出现最糟的一种"成功"：
         # 文字发出去、图被静默丢弃、回执照样拿到——本地记成已送达，
         # 用户却什么都没看到。宁可在发送前就拒绝。
