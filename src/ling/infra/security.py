@@ -107,6 +107,20 @@ def _load_root_key(settings: Settings) -> bytes:
     return key
 
 
+def load_signing_root_key(settings: Settings) -> bytes:
+    """根密钥的**公开**读取入口，供签名 URL 等派生用途使用。
+
+    为什么需要这个薄包装：`_load_root_key` 是私有名，被签名侧直接 import
+    会让"根密钥从哪来"出现第二处实现。这里把它包成一个语义明确的公开函数：
+    根密钥的**唯一来源**依然只有 `_load_root_key`，签名侧只是换个入口调用它。
+
+    返回的是根密钥本身（不是派生后的子密钥）：派生在
+    `domains/media/exports.derive_signing_key` 里做，那样"用什么标签派生"
+    这件事只在一处，换标签时不会漏掉某个调用方。
+    """
+    return _load_root_key(settings)
+
+
 class SecretBox:
     """对称加密容器。同一进程内复用根密钥。"""
 

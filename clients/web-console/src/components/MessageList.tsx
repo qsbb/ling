@@ -7,6 +7,7 @@ import type { TurnView } from '../types';
 import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
 import { PROMPT_DRAWER_ID, PROMPT_ENTRY_LABEL } from './PromptDrawer';
 import { RecallCard, RecallUnavailableCard } from './RecallCard';
+import { VoicePlayer, type VoiceMessageView } from './VoicePlayer';
 
 /**
  * 会话类型决定「谁在说话」怎么读。
@@ -75,6 +76,18 @@ interface MessageListProps {
   onDeclineRecall?: (proposal: RecallProposalView) => void;
   /** 注入时钟（单测用固定时间；运行时是 `Date.now`）。 */
   recallClock?: () => number;
+  /**
+   * 语音消息（SP03）：`message_id → 可播放的语音`。
+   *
+   * 默认空 Map：没有语音的会话、以及既有测试，行为完全不变。语音信息来自
+   * 独立端点 `GET /v1/sessions/{id}/voice-messages`——**不塞进消息契约**，
+   * 那样 `types.ts`（SP00 独占）就必须为"有没有音频"改一次。
+   */
+  voices?: Map<string, VoiceMessageView>;
+  /** 上报一次播放（后端按 `(message_id, subject)` 累加）。 */
+  onVoicePlayed?: (messageId: string, info: { positionMs?: number; completed?: boolean }) => void;
+  /** 签名 URL 过期后重取地址。不传则过期时直接报错。 */
+  onRefreshVoiceUrl?: (messageId: string) => Promise<string | null>;
 }
 
 /**
@@ -387,6 +400,9 @@ export function MessageList({
   onConfirmRecall,
   onDeclineRecall,
   recallClock,
+  voices,
+  onVoicePlayed,
+  onRefreshVoiceUrl,
 }: MessageListProps) {
   const liveTurnId = live?.turnId ?? null;
   const actorName = usePersonaName();
@@ -410,6 +426,10 @@ export function MessageList({
     list.push(proposal);
     byMessage.set(proposal.messageId, list);
   }
+  // 语音按 message_id 取：`voices` 缺省时返回 undefined，既有路径零影响。
+  const voiceFor = (messageId: string | null | undefined) =>
+    messageId && voices ? voices.get(messageId) : undefined;
+
   const renderProposals = (messageId: string | null) => {
     const list = messageId ? byMessage.get(messageId) : undefined;
     if (!list || list.length === 0) return null;
@@ -560,6 +580,20 @@ export function MessageList({
                 )}
                 {streaming && message.text ? <span className="caret" aria-hidden="true" /> : null}
               </div>
+              {/*
+                语音消息（SP03）：`<audio>` 放不进气泡文本里——它是块级控件，
+                塞进 `message__text` 会让正文与播放器互相挤。所以挂在气泡**下面**，
+                与撤回卡片同一位置约定（"紧贴这条消息"）。
+
+                只画她自己说的（`row.own`）：用户的语音属于入站媒体，另一套授权。
+              */}
+              {row.own && voiceFor(message.messageId) ? (
+                <VoicePlayer
+                  voice={voiceFor(message.messageId)!}
+                  onPlayed={onVoicePlayed}
+                  refreshUrl={onRefreshVoiceUrl}
+                />
+              ) : null}
               {message.state === 'failed' ? (
                 <ErrorCard
                   message={message}

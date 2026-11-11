@@ -9,6 +9,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, serverNowMsFromResponse } from './api';
 import { explainError, type ExplainedError } from './errors';
+import {
+  fetchVoiceMessages,
+  refetchVoiceUrl,
+  reportPlayback,
+} from './voiceMessages';
+import type { VoiceMessageView } from './components/VoicePlayer';
 import { newClientTurnId } from './format';
 import { navigate, routePath } from './route';
 import { consumeSse, StreamAbortError, StreamTimeoutError } from './sse';
@@ -206,6 +212,17 @@ export interface ChatState {
   recallProposals: RecallProposalView[];
   /** 撤回提议列表读不到（只影响卡片区，聊天照常）。 */
   recallProposalsUnavailable: boolean;
+  /** 语音消息（SP03）：`message_id → 可播放的语音`；缺省空 Map 表示没有语音。 */
+  voices: Map<string, VoiceMessageView>;
+  /** 语音列表**没取到**（与"没有语音"是两件事，界面要提示）。 */
+  voicesUnavailable: boolean;
+  /** 上报一次播放（本地立刻推进状态 + 后台累加）。 */
+  noteVoicePlayed: (
+    messageId: string,
+    info: { positionMs?: number; completed?: boolean },
+  ) => void;
+  /** 签名地址过期时重取。 */
+  refreshVoiceUrl: (messageId: string) => Promise<string | null>;
   /** 手动重拉撤回提议列表。 */
   reloadRecallProposals: () => void;
   /** 点「撤回」：真的执行，成功/失败都收敛到卡片状态上。 */
@@ -259,6 +276,16 @@ export function useChat(
   const [loadError, setLoadError] = useState<ExplainedError | null>(null);
   const [recallProposals, setRecallProposals] = useState<RecallProposalView[]>([]);
   const [recallProposalsUnavailable, setRecallProposalsUnavailable] = useState(false);
+  /*
+   * 语音消息（SP03）：`message_id → 语音`。
+   *
+   * 与撤回提议同一套"按会话加载、切换时清空"的模式——语音也是**按会话**的，
+   * 留着上一个会话的映射会让播放器挂到新会话的消息下面。
+   * `voicesUnavailable` 与"这个会话没有语音"必须分开：后者是正常事实，
+   * 前者是"列表没取到"，界面要提示，否则用户会以为她根本没发语音。
+   */
+  const [voices, setVoices] = useState<Map<string, VoiceMessageView>>(new Map());
+  const [voicesUnavailable, setVoicesUnavailable] = useState(false);
 
   const currentIdRef = useRef<string | null>(null);
   const liveRef = useRef<LiveTurn | null>(null);
@@ -371,6 +398,66 @@ export function useChat(
     }
   }, [addRecallProposals]);
 
+  /**
+   * 拉这个会话的语音消息。
+   *
+   * 失败时**不清空**已有映射、只置 `voicesUnavailable`：一次网络抖动不该让
+   * 已经显示出来的播放器整片消失（那看起来像"她的语音被删了"）。
+   */
+  const loadVoices = useCallback(async (sessionId: string) => {
+    if (!sessionId) return;
+    const { voices: list, failed } = await fetchVoiceMessages(sessionId);
+    if (currentIdRef.current !== sessionId) return;
+    if (failed) {
+      setVoicesUnavailable(true);
+      return;
+    }
+    setVoicesUnavailable(false);
+    // 换成一个新 Map（而不是原地改）：MessageList 按引用比较，
+    // 原地改会让 React 认为"没变"。
+    setVoices(new Map(list.map((voice) => [voice.message_id, voice])));
+  }, []);
+
+  /**
+   * 上报一次播放，并**本地立刻**把播放状态推进。
+   *
+   * 为什么要本地推进：后端已经把 `play_count` 加上去了，如果等下一次
+   * 全量拉取才更新，"你听过"这三个字会在用户点击后仍然显示"还没听"——
+   * 那种延迟会让人以为播放没被记录。
+   */
+  const noteVoicePlayed = useCallback(
+    (messageId: string, info: { positionMs?: number; completed?: boolean }) => {
+      setVoices((prev) => {
+        const current = prev.get(messageId);
+        if (!current) return prev;
+        const next = new Map(prev);
+        next.set(messageId, {
+          ...current,
+          played: true,
+          play_count: current.play_count + 1,
+          last_played_at: new Date().toISOString(),
+        });
+        return next;
+      });
+      void reportPlayback(messageId, info);
+    },
+    [],
+  );
+
+  /** 签名地址过期时重取一次（并把它写回映射，避免每次播放都失败）。 */
+  const refreshVoiceUrl = useCallback(async (messageId: string) => {
+    const url = await refetchVoiceUrl(messageId);
+    if (!url) return null;
+    setVoices((prev) => {
+      const current = prev.get(messageId);
+      if (!current) return prev;
+      const next = new Map(prev);
+      next.set(messageId, { ...current, url });
+      return next;
+    });
+    return url;
+  }, []);
+
   /* ------------------------------------------------------------ 首次/切换会话 */
   useEffect(() => {
     let cancelled = false;
@@ -386,6 +473,9 @@ export function useChat(
     setRecallProposals([]);
     recallProposalsRef.current = [];
     setRecallProposalsUnavailable(false);
+    // 语音同样按会话：切会话必须清空，否则播放器会挂到新会话的消息下面。
+    setVoices(new Map());
+    setVoicesUnavailable(false);
     setBootstrapping(true);
 
     (async () => {
@@ -412,7 +502,11 @@ export function useChat(
         currentIdRef.current = target;
         setCurrentId(target);
         setBootstrapping(false);
-        await Promise.all([loadMessages(target), loadRecallProposals(target)]);
+        await Promise.all([
+          loadMessages(target),
+          loadRecallProposals(target),
+          loadVoices(target),
+        ]);
       } catch (error) {
         if (cancelled) return;
         const explained = explainError(error);
@@ -1165,6 +1259,10 @@ export function useChat(
     recallProposals,
     recallProposalsUnavailable,
     reloadRecallProposals,
+    voices,
+    voicesUnavailable,
+    noteVoicePlayed,
+    refreshVoiceUrl,
     confirmRecall,
     declineRecall,
   };

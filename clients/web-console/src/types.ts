@@ -422,6 +422,50 @@ export interface DialoguePolicy {
   group_mention_requires_reply: number | boolean;
   rest_may_skip: number | boolean;
   group_reply_delivery_enabled: number | boolean;
+  /**
+   * 她**愿不愿意开口说话**的倾向档位。设置页「⑤ 对话与主动性」。
+   * 对应后端 `ports/config.py::VoiceWillingness`（§17.4）。
+   *
+   * **这是倾向，不是概率**：三档之间没有 0.3/0.7 的映射，不抽随机数。
+   * 每档只转成一段提示词倾向，由她自己决定这一条说还是打。
+   * 服务端默认 `natural`；非法值也退回 `natural`。
+   */
+  voice_willingness?: VoiceWillingness;
+}
+
+/**
+ * 语音意愿档位。与后端 `ports/config.py::VoiceWillingness` 一一对应（§17.4）。
+ *
+ * - `reserved` 少用语音
+ * - `natural` 自然选择（默认）
+ * - `expressive` 多用语音
+ *
+ * 任何档位都允许她选择任一种表达；对方明确的「请文字／不方便听」优先。
+ */
+export type VoiceWillingness = 'reserved' | 'natural' | 'expressive';
+
+/**
+ * 出站附件的类型。**必须显式给出**，不由引用内容猜。
+ *
+ * 为什么重要：一个 `asset:abc` 既可能是图片也可能是语音。猜错的后果是
+ * "语音被当图片发出去"——用户只会看到一张图，不会有任何报错。
+ */
+export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+/**
+ * 一个**类型化**的出站附件。与后端 `contracts/v1.py::OutboundAttachment` 对应。
+ *
+ * 语音消息的**平台侧**形态是：`text=""` + 一条 `kind: 'audio'` 附件，
+ * **无 caption、无正文**（§17.5）。后台能看到的「语音标签 + 文字」是
+ * 另一个**投影**，由后台接口从 Message.text 取，不是从附件或 wire 消息取。
+ * 正文绝不复制进附件——复制一份必然出现"两份不一致该信哪个"。
+ */
+export interface OutboundAttachment {
+  kind: AttachmentKind;
+  /** 平台侧引用：URL、不透明 id，或 `asset:<id>`。 */
+  ref: string;
+  mime_type?: string | null;
+  caption?: string | null;
 }
 
 export interface SettingsConfig {

@@ -87,6 +87,12 @@ _ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/v1/sessions/{session_id}/messages"): "读取会话消息",
     ("POST", "/v1/sessions/{session_id}/turns"): "发送消息",
     ("POST", "/v1/sessions/{session_id}/media"): "上传媒体",
+    # SP03 媒体读取：签名 URL 是渠道/`<audio>` 的取流路径（无登录态），
+    # 另外三条是会话页的语音列表、单条语音与播放上报。
+    ("GET", "/v1/media/generated/{file_id}"): "读取生成媒体",
+    ("GET", "/v1/sessions/{session_id}/voice-messages"): "读取会话语音",
+    ("GET", "/v1/messages/{message_id}/voice"): "读取消息语音",
+    ("POST", "/v1/messages/{message_id}/playback"): "记录语音播放",
     # 入站入口：所有渠道消息都从这里进来，出问题时最需要一眼看见
     ("POST", "/v1/onebot/events"): "接收 OneBot 事件",
     ("GET", "/v1/onebot/health"): "读取 OneBot 健康状态",

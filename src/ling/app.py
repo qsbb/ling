@@ -620,7 +620,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from ling.api.body_limit import BodySizeLimitMiddleware
     from ling.api.observability import observability_middleware
-    from ling.api.routes import actor, auth, chat, health, manage, onebot, ops, sessions
+    from ling.api.routes import actor, auth, chat, health, manage, media, onebot, ops, sessions
     from ling.api.routes import logs as logs_routes
     from ling.api.routes import persona as persona_routes
     from ling.api.routes import recall as recall_routes
@@ -657,6 +657,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat.router, prefix="/v1")
     # 主动撤回自己发的消息（破坏性动作，独立路由与独立授权边界）
     app.include_router(recall_routes.router, prefix="/v1")
+    # 生成媒体的读取（SP03）：一条签名 URL（无登录态，`<audio>` 用）+ 三条
+    # 登录态端点（会话里的语音列表、单条语音、播放上报）。**无条件注册**：
+    # 它只读本项目自己的表与本地媒体目录，没有外部依赖。
+    app.include_router(media.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
     # 多套人格（`/v1/personas`）：列表/新建/详情/编辑/删除/切换。

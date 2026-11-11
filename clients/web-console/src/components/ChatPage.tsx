@@ -307,6 +307,9 @@ export function ChatPage({
               onReloadRecall={chat.reloadRecallProposals}
               onConfirmRecall={chat.confirmRecall}
               onDeclineRecall={chat.declineRecall}
+              voices={chat.voices}
+              onVoicePlayed={chat.noteVoicePlayed}
+              onRefreshVoiceUrl={chat.refreshVoiceUrl}
             />
           )}
         </div>
