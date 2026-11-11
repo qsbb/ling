@@ -199,6 +199,29 @@ def test_guard_would_catch_a_reintroduction():
 - 变异**没红**时，第一反应不能是「这个变异不适用」，而应该是**「我的测试可能是假的」**
 - 按上面那条判据选输入：如果变异和原实现在该输入上结果相同，换输入，别换结论
 
+### `getattr(obj, name, default)` 不是「安全取值」
+
+对实现了 `__getattr__` 的对象，第三个参数**可能不生效**：
+
+| 对象 | `getattr(obj, "x", default)` 的行为 |
+|---|---|
+| 普通对象 | 属性不存在 → 返回 `default` |
+| starlette `State` | `__getattr__` 里直接 `raise` → **默认值参数被绕过** |
+
+同一个内置函数，两种失效方式：
+
+- **静默返回默认值**：`getattr(self, "_supports_poke", True)` 恒为 `True`，
+  而这个属性**全仓零赋值点**——代码在问一个从来没被回答过的问题，然后自己编答案
+- **直接抛异常**：starlette `State` 的 key 不存在时，`getattr(state, "x", None)`
+  不会返回 `None`，而是 `AttributeError`
+
+**取值前先确认对象是不是"缺属性会返回默认值"的那一类。** 不确定就用
+`try/except AttributeError` 或 `vars(obj)` / `state._state`。
+
+代价来源（2026-11-11）：同一天，同一个 `getattr` 在三处制造了三种问题——
+能力字段恒 True（产品 bug）、守卫测试查不到属性（假绿）、测试基础设施报
+`AttributeError`（两次调试）。
+
 ### 别用 `bool()` 包装三态字段
 
 ```python
