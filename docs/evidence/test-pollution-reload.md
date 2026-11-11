@@ -69,11 +69,65 @@ monkeypatch.setattr(context_module.ContextCompiler, "compile", _spy)
 
 ## 修法与防复发
 
-**修法**：`test_w2_rules.py` 不再 reload。实际代码是**调用期**读环境变量
-（`os.environ.get` 在函数内），`monkeypatch.setenv` 之后直接调用就能测，reload 没有必要。
+### ⚠️ 一句容易照抄错的判断（2026-11-11 更正）
+
+先前这里写的是：
+
+> 实际代码是**调用期**读环境变量（`os.environ.get` 在函数内），
+> `monkeypatch.setenv` 之后直接调用就能测，reload 没有必要。
+
+**这句话只对 `_budget_scale()` 成立，对预算表不成立。**
+
+`context.py:256` 紧接着就把系数求值一次并**重算两张表**：
+
+```python
+_SCALE = _budget_scale()          # ← 导入期求值一次
+if _SCALE != 1.0:
+    DEFAULT_BUDGETS = {k: max(80, int(v * _SCALE)) for k, v in DEFAULT_BUDGETS.items()}
+    HISTORY_TOKEN_BUDGET = max(400, int(HISTORY_TOKEN_BUDGET * _SCALE))
+```
+
+所以：
+
+| 想测什么 | 怎么测 |
+|---|---|
+| 系数取值（含夹紧 0.1 / 5.0） | 本进程直接调 `_budget_scale()` |
+| **系数真的作用到预算表** | **必须在干净解释器里带环境变量 import** |
+
+如果按"直接调用就能测"去改，`DEFAULT_BUDGETS["persona"] == 50_000` 这类断言
+会**测不到真实的缩放结果**——那不是修好，是悄悄弱化断言。
+
+实际采用的修法：**两层分开测**。
+
+- 系数 → 本进程调 `_budget_scale()`
+- 预算表落点 → `subprocess` 开干净解释器、带环境变量重新 import，读真实导入结果
+
+没有把 `max(80, int(v * scale))` 抄进测试复算——那正是本仓库反复出现的
+「同一规则两处各写一份」；也没有只测系数，那会丢掉「确实缩放了」这一层。
 
 **不推荐的修法**：reload 后在 `finally` 里同步刷新所有已绑定引用（`turn.ContextCompiler` 等）。
 那要维护一份"谁绑了它"的名单，加模块就漏、漏了不报错。
+
+### 两处补强（原记录没有）
+
+1. **`finally` 里那次 reload 也救不回来。** 每次 reload 造的都是**又一个新类**，
+   没有任何一次会让已绑定的旧引用回到原位——所以污染是**永久性**的。
+2. **全仓只有 1 个测试受这个机制影响。** 全仓 patch `ContextCompiler` 的地方只有
+   `test_display_name_chain.py:253` 一处。这解释了为什么全量只挂 1 个，也说明
+   **如果不多挂那一个，这个机制会一直潜伏**到有人新写一个 patch 类方法的测试时才炸。
+
+### 落地位置
+
+修法实际落在 `10d92bc`（该提交主体是「环境事实注入」，这个修复被一并提交，
+commit message 未单列）。因为历史不宜改写，特此在此留档：
+
+- `tests/unit/test_w2_rules.py` 去掉全部 `importlib.reload(ctx)`
+- 改为「本进程测系数 + 子进程测预算表落点」
+- 验证：`pytest tests/unit tests/integration/test_display_name_chain.py`
+  从 **1 failed / 123 passed** → **2047 passed, 0 failed**
+
+`test_display_name_chain.py` 本身**不需要改**：它 patch `context_module.ContextCompiler`
+的手法是对的，只要类身份不分裂，`turn.py` 用的就是同一个类。它是受害者，不是责任人。
 
 ## 通用教训
 
