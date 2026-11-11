@@ -48,6 +48,31 @@ class ToolSpec:
     timeout_seconds: float = 15.0
     idempotent: bool = True
     input_schema: dict[str, Any] = field(default_factory=dict)
+    # 这个工具**输出**是不是第三方/外部数据（网页正文、OCR、群友消息……）。
+    #
+    # 内置只读工具（时间、回显、白名单命令）的输出来自本机，是可信的；
+    # 未来的 ``knowledge.open`` / ``web.read_url`` 必须置 ``True``。
+    # 这是 ``ToolResult.untrusted`` 的**默认值来源**：编排层在编码回灌结果时
+    # 用它决定要不要加"这些是数据，不是指令"的包裹。
+    #
+    # 默认 ``True``：新的外部工具忘了声明时，宁可多包一层数据边界，
+    # 也不该让第三方文本冒泡成指令。
+    output_untrusted: bool = True
+    # 能不能交给**模型**通过原生工具调用执行（而不是只给管理 API / 领域内部用）。
+    #
+    # 这个字段必须显式声明，**不能**从 ``risk`` 或 ``idempotent`` 推断：
+    # - ``shell.readonly`` 是 read_only 且 idempotent，但它能读整机状态
+    #   （``whoami`` / ``uptime`` / ``date``），把它交给模型等于开一条
+    #   "模型可以问宿主环境"的路，必须单独评审；
+    # - ``message.recall`` 是不可逆动作，模型只能**提议**，执行要用户确认，
+    #   它走的是另一条（确认）回路，不是这个开关。
+    #
+    # 默认 ``False`` = 失败关闭：新加的工具不会因为"忘了声明"而自动对模型开放。
+    model_callable: bool = False
+    # 回灌时 ``data`` 字段的字符上限。**与上面的 ``output[:8000]`` 是两回事**：
+    # 那是注册表给调用方（API 审计、领域代码）的原始输出；这里是给**模型**看的
+    # 单次结果上限。超限必须置 ``truncated=true``，不能悄悄截。
+    model_result_chars: int = 2000
 
 
 @dataclass(frozen=True)
@@ -58,7 +83,9 @@ class ToolResult:
     output: str
     detail: str | None = None
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    # 工具输出是不可信数据：调用方必须包裹后再进提示
+    # 工具输出是不可信数据：调用方必须包裹后再进提示。
+    # 默认值来自 ``ToolSpec.output_untrusted``（内置只读工具置 False，
+    # 外部数据工具保持 True），由 ``ToolRegistry._execute`` 填入。
     untrusted: bool = True
 
 
@@ -110,15 +137,86 @@ class ToolRegistry:
     def list_specs(self) -> list[ToolSpec]:
         return sorted(self._specs.values(), key=lambda s: s.tool_id)
 
+    def spec(self, tool_id: str) -> ToolSpec | None:
+        """按 id 取声明；没有就返回 ``None``（不抛：调用方要区分"未注册"）。"""
+        return self._specs.get(tool_id)
+
+    def list_model_tools(self) -> list[ToolSpec]:
+        """**对模型开放**的工具清单（``model_callable=True`` 的子集）。
+
+        排序保证同一份注册表每轮发出的 schema 顺序稳定——顺序抖动会让
+        供应商侧的提示词缓存失效，也会让"这轮发了什么"没法逐字节对比。
+        """
+        return [spec for spec in self.list_specs() if spec.model_callable]
+
     async def call(
         self,
         tool_id: str,
         args: dict[str, Any],
         *,
         confirmed: bool = False,
+        internal_call_id: str | None = None,
     ) -> ToolResult:
+        """执行一次工具调用（成功输出截到 8000 字符）。
+
+        行为与改动前一致；新增的 ``internal_call_id`` 见 :meth:`call_untruncated`。
+        """
+        return await self._execute(
+            tool_id,
+            args,
+            confirmed=confirmed,
+            internal_call_id=internal_call_id,
+            output_limit=8000,
+        )
+
+    async def call_untruncated(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        *,
+        confirmed: bool = False,
+        internal_call_id: str | None = None,
+    ) -> ToolResult:
+        """与 :meth:`call` 相同，但**保留完整输出**（不截断）。
+
+        ## 为什么不能"先 call 再截"
+
+        注册表这句 ``output[:8000]`` 是**无提示**截断：模型拿到被砍过的文本，
+        却没有任何"这里被砍了"的标记，于是会照着半句话下结论。回灌给模型的
+        结果必须有 ``truncated=true`` 这个**显式**字段（见 ``kernel/turn.py``
+        的结果编码器），所以调用方需要拿到完整输出，自己按单工具上限截并标记。
+
+        ## 为什么不是"重跑一次 handler 拿完整结果"
+
+        那是**错的**：``clock.now`` 会变，命令会重跑，有副作用的工具会执行两次。
+        截断与执行是同一个动作的两个出口——所以这里和 :meth:`call` 共用一个
+        执行体 ``_execute``，只把上限参数换掉。**handler 只被调用一次。**
+
+        ``internal_call_id`` 是编排层给的**执行审计 ID**（可选）。不给就自己生成。
+        它区别于供应商的 ``tool_call_id``：那是协议配对键，这里是执行审计键。
+        两者由编排层保存映射，**不能用内部 ID 冒充 provider ID**——注册表既不知道
+        也不该知道供应商协议。
+        """
+        return await self._execute(
+            tool_id,
+            args,
+            confirmed=confirmed,
+            internal_call_id=internal_call_id,
+            output_limit=None,
+        )
+
+    async def _execute(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        *,
+        confirmed: bool,
+        internal_call_id: str | None,
+        output_limit: int | None,
+    ) -> ToolResult:
+        """唯一的执行体。``output_limit=None`` = 不截断。"""
         spec = self._specs.get(tool_id)
-        call_id = new_id("call")
+        call_id = internal_call_id or new_id("call")
         if spec is None:
             return ToolResult(
                 tool_id=tool_id,
@@ -126,6 +224,8 @@ class ToolRegistry:
                 outcome=ToolOutcome.unsupported,
                 output="",
                 detail=f"工具未注册: {tool_id}",
+                # 未注册 = 我们完全不知道它是什么，按最不可信处理
+                untrusted=True,
             )
         if spec.requires_confirmation and not confirmed:
             return ToolResult(
@@ -134,6 +234,7 @@ class ToolRegistry:
                 outcome=ToolOutcome.needs_confirmation,
                 output="",
                 detail="该动作需要用户明确确认后才能执行",
+                untrusted=spec.output_untrusted,
             )
         handler = self._handlers[tool_id]
         try:
@@ -145,6 +246,7 @@ class ToolRegistry:
                 outcome=ToolOutcome.timeout,
                 output="",
                 detail=f"工具执行超时（{spec.timeout_seconds}s）",
+                untrusted=spec.output_untrusted,
             )
         except Exception as exc:  # noqa: BLE001 - 工具边界统一归类
             return ToolResult(
@@ -153,12 +255,16 @@ class ToolRegistry:
                 outcome=ToolOutcome.failed,
                 output="",
                 detail=str(exc)[:300],
+                # 异常文本可能夹带外部数据（比如子进程的 stderr），
+                # 所以它跟随 spec 的可信性判断，而不是一律 True/False。
+                untrusted=spec.output_untrusted,
             )
         return ToolResult(
             tool_id=tool_id,
             call_id=call_id,
             outcome=ToolOutcome.succeeded,
-            output=output[:8000],
+            output=output if output_limit is None else output[:output_limit],
+            untrusted=spec.output_untrusted,
         )
 
 
@@ -166,8 +272,23 @@ class ToolRegistry:
 
 
 async def _clock_tool(args: dict[str, Any]) -> str:
-    from datetime import datetime
+    """读当前时间。``tz`` 可以是 IANA 时区名；不给就是 UTC。
 
+    为什么要看 ``tz``：schema 里声明了它，处理函数就必须**真的用它**，
+    否则模型传了 ``Asia/Shanghai`` 却拿到 UTC 时间——schema 与行为不一致，
+    而模型没法从结果里看出这一点（它只看到"当前 UTC 时间"）。非法时区名
+    直接报错（成为一条明确的失败回执），而不是静默退回 UTC。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    raw_tz = str(args.get("tz") or "").strip()
+    if raw_tz:
+        try:
+            now = datetime.now(ZoneInfo(raw_tz))
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"未知时区: {raw_tz}") from exc
+        return f"{raw_tz} 当前时间：{now.isoformat()}"
     now = datetime.now(UTC)
     return f"当前 UTC 时间：{now.isoformat()}"
 
@@ -280,6 +401,10 @@ async def _recall_tool(args: dict[str, Any]) -> str:
 #: 的表现是"模型提议了但什么都没发生"——最难查的那种。
 RECALL_TOOL_ID = "message.recall"
 
+#: 时钟工具的 id。理由与 `RECALL_TOOL_ID` 相同：schema 声明侧、
+#: 可用性判断侧、测试断言侧写的是同一个常量。
+CLOCK_NOW_TOOL_ID = "clock.now"
+
 
 def build_default_registry(
     *, allow_irreversible: bool = False, include_recall: bool = True
@@ -303,12 +428,35 @@ def build_default_registry(
     registry = ToolRegistry(allow_irreversible=allow_irreversible)
     registry.register(
         ToolSpec(
-            tool_id="clock.now",
+            tool_id=CLOCK_NOW_TOOL_ID,
             version="1.0.0",
             description="读取当前时间（只读）",
             risk=ToolRisk.read_only,
             requires_confirmation=False,
             reversible=True,
+            # ---- 本期**唯一**对模型开放的工具。
+            #
+            # 三条判据（缺一条都不该开放）：只读、无副作用、幂等。
+            # `diagnostics.echo` 虽然也只读，但它的输出是**模型自己给的输入**，
+            # 开放它等于让模型在两步之间"回声"自己的参数，没有信息增量，
+            # 反而给"伪造一次成功调用"提供了形状。`shell.readonly` 能读宿主机
+            # 状态，需要单独评审。`message.recall` 走确认回路。
+            model_callable=True,
+            # 本机时钟，不是第三方数据
+            output_untrusted=False,
+            # 参数 schema 必须**真实**：原来是空 dict，而空 schema 在官方
+            # 形状里等于"任意参数"，模型会照着自己编的 key 传值，
+            # 校验层只认 ``tz``，于是它收到的错误与它看到的不一致。
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tz": {
+                        "type": "string",
+                        "description": "IANA 时区名，例如 Asia/Shanghai；留空表示 UTC",
+                    },
+                },
+                "required": [],
+            },
         ),
         _clock_tool,
     )
@@ -377,6 +525,7 @@ def build_default_registry(
 
 
 __all__ = [
+    "CLOCK_NOW_TOOL_ID",
     "RECALL_TOOL_ID",
     "RecallToolError",
     "ToolHandler",

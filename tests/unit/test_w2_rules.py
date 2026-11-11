@@ -1576,7 +1576,25 @@ def test_expression_markers_are_parsed_and_stripped() -> None:
     assert d.quote == "123456"
 
     text, d = parse_expression("[poke:770140]")
-    # 只有标记 → 保留原文，否则会发出一条空消息
+    # 只有标记 → 保留原文，否则会发出一条空消息。
+    #
+    # ## 这条锁的是**当前折衷行为**，不是设计目标
+    #
+    # `docs/design/CAPABILITY-TAG-SYSTEM.md` 5.2 的原话是：「删除若导致正文为空，
+    # **不要回退发送原始标记**：`poke` 可作为纯动作请求执行而不发送空消息；单独的
+    # `at/quote` 无可附着的文字时不执行、不发空消息，记 `empty_body`。」
+    #
+    # 也就是说**设计目标是空正文时不发原文、也不发空消息**——`poke` 走纯动作
+    # 路径，`at/quote` 直接记 `empty_body` 不执行。而本断言锁的是"保留原文"，
+    # 与那个目标**相反**。
+    #
+    # 之所以暂时保留旧行为：纯动作路径要改投递层（`bridge._deliver` 只在有正文时
+    # 才逐段发送，没有"只发动作、不发正文"的分支），不在当前改动范围内。
+    # 同一件事的说明见 `expression_choice.parse_expression` 里
+    # 「这里为什么仍然还原原文」那段注释——两处必须一起改，否则又是一处漂移。
+    #
+    # **将来做纯动作路径时**：这条断言会变红，那是**预期的**——届时应改成
+    # 正文为空且 `poke` 保留在 `Directive` 里，而不是把新行为改回旧行为。
     assert text == "[poke:770140]"
     assert d.empty is True
 

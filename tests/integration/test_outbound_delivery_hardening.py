@@ -618,8 +618,8 @@ async def test_context_gives_real_message_id(logged_in: TestEnv) -> None:
     _body, stub = await _post_with_text(logged_in, "嗯，我在。", "你在吗", message_id=777)
     assert stub.prompts, "没有抓到生成用的提示词"
     system = "\n".join(str(m.content) for m in stub.prompts[0])
-    assert "[msg_id:777]" in system, system[-800:]
-    assert "[quote:那个 id]" in system or "只能用上面出现过" in system
+    assert "[quote:" in system, f"上下文里没有引用语法教学：{system[-800:]}"
+    assert "[msg_id:777]" in system, f"上下文里没有真 id：{system[-800:]}"
 
 
 async def test_history_messages_carry_their_own_ids(logged_in: TestEnv) -> None:
