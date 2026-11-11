@@ -26,6 +26,7 @@ from ling.ports.config import (
     EffectiveConfig,
     ResolutionSource,
     ResolvedProfile,
+    VoiceWillingness,
 )
 from ling.ports.model import (
     SLOT_HINTS,
@@ -178,6 +179,16 @@ class DialoguePolicyIn(BaseModel):
     proactive_delivery_enabled: bool | None = None
     # 群聊里「决定回了」之后是否真的生成并发送（默认关）
     group_reply_delivery_enabled: bool | None = None
+    # 她愿不愿意开口说话的倾向档位（§17.4）。**和 voice 一样必须有这一行**：
+    # 读接口（`GET /settings/config`）一直在回这个字段，服务层也认
+    # （`service.py::_DIALOGUE_ENUM_KEYS`），但写入入口没声明过它——而
+    # `save_draft` 用 `model_dump(exclude_none=True)`，于是前端传上来的值被
+    # pydantic **静默丢弃**：选了档位、保存成功、刷新回到原值。
+    #
+    # 三个档位之间没有数值映射，也不抽随机数（见 `ports/config.py` 的
+    # `voice_willingness` docstring）。这里只负责收下来、交给
+    # `_voice_willingness()` 校验归一。
+    voice_willingness: VoiceWillingness | None = None
     # 音色。**必须有这一行**：pydantic 默认丢掉未声明的字段，于是前端把
     # `dialogue.voice` 传上来会静默消失，表现成"填了音色、保存成功、还是降级"。
     voice: VoiceIn | None = None

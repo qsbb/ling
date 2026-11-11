@@ -41,6 +41,20 @@ DEFAULTS = {
     "proactive_delivery_enabled": False,
     # 群聊「决定回了」默认只记录、不真的发出去（安全默认）
     "group_reply_delivery_enabled": False,
+    # 说话倾向默认 natural（§17.4）：不配置时行为与"她现在这样"最接近，
+    # 也不会把她突然变成"每句都发语音"。
+    "voice_willingness": "natural",
+    # 音色默认**全空**：没有 kind 就没有音色，`_voice_for_tts` 据此降级发文字。
+    # 这几个 None 不是"忘了填"，是"没配语音"的唯一表达方式。
+    "voice": {
+        "kind": None,
+        "voice_id": None,
+        "reference_asset_id": None,
+        "speed": 1.0,
+        "vol": 1.0,
+        "pitch": 0,
+        "emotion": None,
+    },
 }
 
 
@@ -84,6 +98,16 @@ async def test_dialogue_roundtrip(logged_in: TestEnv) -> None:
         "group_attention_deferred": True,
         "proactive_delivery_enabled": False,
         "group_reply_delivery_enabled": False,
+        "voice_willingness": "natural",
+        "voice": {
+            "kind": None,
+            "voice_id": None,
+            "reference_asset_id": None,
+            "speed": 1.0,
+            "vol": 1.0,
+            "pitch": 0,
+            "emotion": None,
+        },
     }
 
 
@@ -479,3 +503,36 @@ async def test_ignored_is_not_overwritten_by_replied(logged_in: TestEnv) -> None
         ).scalars().first()
     assert row is not None
     assert row.handled_as == "ignored", "沉默被改成了回过"
+
+
+async def test_voice_willingness_roundtrip(logged_in: TestEnv) -> None:
+    """说话倾向三档**真的存得进去、读得回来**。
+
+    这一条存在的理由不是"再测一遍读写"，而是一个具体的失败：
+    `GET /settings/config` 一直在回 `voice_willingness`，服务层
+    （`service.py::_DIALOGUE_ENUM_KEYS`）也认它，但写入入口
+    `DialoguePolicyIn` **从没声明过这个字段**。而 `save_draft` 用
+    `model_dump(exclude_none=True)` —— pydantic 把未声明的键静默丢掉，
+    于是「选了档位 → 保存成功 → 刷新回到 natural」，界面上一切正常。
+
+    ## 为什么三档都要试，不能只试一档
+
+    只测 `expressive` 的话，一个"恒写 natural"的实现也能过（默认值恰好对）。
+    必须有一个**远离默认值**的取值：`reserved` 与 `expressive` 在数值上
+    分居两端，把默认值夹在中间。任何一个实现若把字段写成常量，都会被其中
+    至少一档抓到。
+    """
+    for level in ("reserved", "expressive", "natural"):
+        body = await _publish(logged_in, {"dialogue": {"voice_willingness": level}})
+        assert body["dialogue"]["voice_willingness"] == level, (
+            f"存 {level} 读回来是 {body['dialogue']['voice_willingness']}——"
+            f"说明写入链路把这个字段丢了"
+        )
+
+
+async def test_unknown_voice_willingness_is_rejected(logged_in: TestEnv) -> None:
+    """未知档位不能静默落回默认值——那会让"配错了"表现为"配了没用"。"""
+    response = await logged_in.client.put(
+        "/v1/settings/draft", json={"dialogue": {"voice_willingness": "loud"}}
+    )
+    assert response.status_code == 422, response.text
