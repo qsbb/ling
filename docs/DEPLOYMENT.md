@@ -28,6 +28,29 @@ python -m ling
 开发默认 `LING_TEST_MODE=1`，对话由确定性 fake provider 生成，界面显著标注
 “测试模式：回复由确定性 fake provider 生成，非真实模型能力”。
 
+### 1.1 语音条（可选）
+
+本地要试语音条，同样需要 `ffmpeg` + `pysilk-mod`（原因见 §11.6）：
+
+```bash
+# ffmpeg：macOS 用 brew，Debian/Ubuntu 用 apt
+brew install ffmpeg
+# 或： sudo apt-get install -y --no-install-recommends ffmpeg
+
+# pysilk-mod：在同一个虚拟环境里装（包名带 -mod，import 名是 pysilk）
+uv pip install -e ".[dev,speech-codecs]"
+```
+
+不装也能跑，只是**发不出语音条**——能力声明不会包含 `audio`，日志会说明
+缺什么（见 §11.6「不装会怎样」）。
+
+自检（真编一段 100 ms 正弦，比只 `which ffmpeg` 可靠）：
+
+```bash
+python -c "from connectors.onebot.silk import default_codec; print(default_codec().selftest())"
+# 期望： (True, 'ok（... 字节，0.100s）')
+```
+
 ## 2. Docker Compose（Linux）
 
 > 本节及 §2 各小节描述的是**源码模式**（`install.sh` 在宿主构建当前 checkout）。
@@ -2064,6 +2087,151 @@ python3 deploy/release/publish.py \
 > `messages=0`/`memories=0`）、arm64 运行、真实浏览器端到端点一遍。
 > GHCR package 可见性、宿主架构、真实部署路径与端口仍要现场确认，
 > 不要照抄 `/opt/ling`、`/vol1/ling-backups` 这类示例。
+
+### 11.6 语音条依赖（ffmpeg + pysilk-mod）
+
+镜像**已经自带**这两样，`ling` / `publish.py` 照常用即可，不需要额外操作。
+这一节写给两类人：想知道"为什么镜像这么大"的人，和**自己在源码模式跑、
+或从不带语音依赖的旧镜像升级上来**的人。
+
+#### 发语音条到底需要什么
+
+OneBot（NapCat）的语音条必须是 **Tencent SILK**。`ling` 自己产出 SILK，
+因为它收到非 SILK 音频时会去调宿主机上 `/usr/bin/ffmpeg -f ntsilk_s16le`
+——**那个 muxer 不存在**（见下面「查证结果」），结果是用户一条语音都收不到。
+
+自己产出 SILK 需要两样东西，缺一不可：
+
+| 依赖 | 作用 | 镜像里的来源 |
+| --- | --- | --- |
+| `ffmpeg`（系统二进制） | 解码任意厂商音频 + **真重采样**到 24 kHz 单声道 s16le | `apt-get install --no-install-recommends ffmpeg`（Debian bookworm，5.1.9） |
+| `pysilk-mod`（Python 包） | 把 24 kHz PCM 编成 SILK | `pyproject.toml` 的可选 extra `speech-codecs`，随镜像 wheel 离线安装 |
+
+#### 不装会怎样（**不是崩溃，是诚实降级**）
+
+这是刻意设计的行为，不是 bug：
+
+1. 连接器的 `capabilities()` **不声明** `audio` 能力；
+2. 日志里有一条 **info** 级说明，指出缺什么、怎么装：
+
+   ```text
+   语音能力未就绪（不声明 audio）：运行环境缺少 ffmpeg：无法解码/重采样到 24000 Hz。
+   Debian/Ubuntu 装法：apt-get install -y ffmpeg
+   ```
+
+   （缺 `pysilk-mod` 时同一位置报 `运行环境没有安装 pysilk-mod（ModuleNotFoundError）。
+   装法：pip install 'ling[speech-codecs]'`。）
+
+3. 文字、图片等其它能力**完全不受影响**——只是发不出语音条。
+
+换句话说：**能力声明如实反映实际能力**，不会假装能发然后在发送时炸。
+要恢复语音，装齐两样后调 `refresh_voice_readiness()`（或重启进程），
+不用改任何配置。
+
+#### 源码模式 / 旧镜像怎么补
+
+源码模式（`bash deploy/install.sh`）与直接 `pip install` 的部署**不会**
+自动装这两样：
+
+```bash
+# 1) ffmpeg（Debian/Ubuntu；其它发行版换成对应包管理器）
+sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+# 2) pysilk-mod（注意：包名是 pysilk-mod，import 名是 pysilk）
+#    在 ling 所在的同一个 Python 环境里装
+pip install 'ling[speech-codecs]'
+```
+
+> **`pysilk` 是空壳包，别装错**：PyPI 上的 `pysilk`（0.0.1）只有 646 字节，
+> `setup.py` 里 `packages=[]`，装了也 `import` 不出来。必须是 `pysilk-mod`。
+
+装完自检（**推荐**，它真编一段 100 ms 正弦，不是只看 `which ffmpeg`）：
+
+```bash
+docker compose exec api python -c \
+  "from connectors.onebot.silk import default_codec; print(default_codec().selftest())"
+# 期望： (True, 'ok（338 字节，0.100s）')   —— 字节数会随环境略有差异
+```
+
+#### 镜像体积代价
+
+`apt-get install --no-install-recommends ffmpeg` 在 Debian bookworm 上
+**新增 234 个包、压缩后约 +138 MB 镜像层**（解压后约 493 MB）。这不是可以
+轻易砍掉的：`ffmpeg` 这个 CLI 包硬依赖 `libavdevice59 → libgl1 → mesa →
+libllvm15`（LLVM 一个就 22 MB），而语音只用得到解码与重采样，用不到任何
+OpenGL/采集设备。**实测**过只装 `libavcodec59/libavformat59/libavutil57/
+libswresample4` 可以压到约 67 MB，但那条路要把 `/usr/bin/ffmpeg` 换成
+别的二进制，而 `connectors/onebot/silk.py` 是按 `/usr/bin/ffmpeg` 调用的——
+为省 70 MB 改代码路径，不值得。`pysilk-mod` 的 wheel 本身只有约 240 KB，
+可以忽略。
+
+`--no-install-recommends` 不是可选项：加上 `Recommends` 会多带 87 个包、
+再多约 67 MB（实测）。
+
+#### 查证结果：ffmpeg 的 silk muxer **不存在**（2026-11-11 核实）
+
+任务里要求确认"目标发行版的 ffmpeg 有没有 silk 相关依赖"。结论是**不需要，
+也找不到**：
+
+- 上游 FFmpeg 的 `libavformat/allformats.c`（master）里**没有** silk muxer；
+- 本机 ffmpeg 7.1 实测 `ffmpeg -muxers | grep -i silk`、`-demuxers`、
+  `-encoders` **全部为空**；
+- 所以 `ntsilk_s16le` 不是 FFmpeg 的功能，而是 **NapCat 自己打的补丁二进制**。
+  Debian bookworm 的 5.1.9 同样没有。
+
+我们只依赖 ffmpeg 的**解码 + `libswresample` 重采样**，这两项是核心能力。
+Debian 的构建（`debian/rules`）实测启用了 `libmp3lame` / `libopus` /
+`libvorbis`，而 s16le 与 swresample 是内置的；三家 TTS 的产出
+（mp3 / wav）与常见的 ogg/flac/m4a 输入都能解。
+
+> 裸 PCM（无容器头）**不在**这条链上：`speech/orchestration.py::_format_for`
+> 会在更上游就以 `invalid_audio` 拒绝它，不会走到 ffmpeg。
+
+#### 构建后自检清单（运维照着做）
+
+镜像构建本身已经做了**构建期**断言——`ffmpeg -version` 与"真编一段 100 ms
+正弦并校验 SILK 魔数"都写在 `deploy/Dockerfile.api` 里，任何一项失败构建就红。
+所以正常情况下**镜像能构建出来就意味着语音依赖是好的**。
+
+下面这几条是**部署后**在真实环境再确认一次，尤其是要跨架构（arm64）或
+跨宿主时。全部只读，不改任何配置。
+
+```bash
+# 0) 前置：用你实际的项目名/服务名，下面按 ling 写
+cd /opt/ling     # 镜像模式的安装目录；源码模式是你的 checkout
+
+# 1) 两个依赖都在（最直接的证据）
+docker compose exec api sh -c 'ffmpeg -version | head -1; python -c "import pysilk; print(\"pysilk ok\")"'
+# 期望类似：
+#   ffmpeg version 5.1.9-0+deb12u1 ...
+#   pysilk ok
+
+# 2) 走完整条 silk 链的真实自检（**这一条最有价值**，它真编码，不是只看二进制）
+docker compose exec api python -c \
+  "from connectors.onebot.silk import default_codec; print(default_codec().selftest())"
+# 期望： (True, 'ok（338 字节，0.100s）')   —— 字节数随环境略有差异
+# 若返回 (False, '...') 说明缺依赖或编码器不可用，原因字符串会指出缺什么
+
+# 3) 看日志有没有那条降级说明（**有 == 没就绪**；没有 == 已就绪）
+#    这条信息由 connectors/onebot/connector.py 的 voice_readiness() 在每次
+#    探测失败时打一次（info 级，logger 名 ling.connectors.onebot）
+docker compose logs api | grep '语音能力未就绪' || echo '没有降级日志 = 语音能力已就绪'
+
+# 4) 确认镜像里确实没有残留的 /wheels（构建收尾应当已删）
+docker compose exec api sh -c 'test ! -e /wheels && echo "wheels 已清理" || echo "警告：/wheels 残留"'
+```
+
+真发一条语音（端到端，**这条只能人工做**，因为它要一个真实的 QQ/NapCat 会话）：
+
+5. 在网页控制台触发一次会产出语音的对话，或对机器人发一条会带语音回复的消息；
+6. 确认 QQ 侧**能点开播放**、语速正常。若声音变成噪音或时长明显不对
+   （例如 1 秒变 1.84 秒），说明**重采样没生效**——那是 `-ar 24000` 路径的
+   问题，不是 ffmpeg 缺失，查 `silk.py::decode_to_pcm24`。
+
+> **arm64 注意**：`pysilk-mod` 的 aarch64 wheel 需要 `GLIBC_2.17`，
+> `python:3.13-slim`（bookworm，glibc 2.36）满足；实测该 wheel 是
+> `ELF 64-bit ARM aarch64`，只依赖 `libc/libm/libpthread`。
+> 但**本任务没有在真实 arm64 硬件上跑过**（见 §6 的演练边界）。
 
 ## 12. 从源码模式迁移到镜像模式
 

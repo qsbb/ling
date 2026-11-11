@@ -84,11 +84,29 @@ COPY connectors ./connectors
 # 导致整次部署失败）。这里加两个东西：
 #   1. `--retries/--timeout`：给慢网络留余地，而不是一次超时就放弃
 #   2. `PIP_INDEX_URL`：允许换镜像源（国内可用清华源），默认仍是官方 PyPI
+#
+# `.[speech-codecs]` 这里的方括号是**必须的**，不是笔误（2026-11-11 实测）：
+#
+#   `pip wheel .` 只解析 pyproject 的**核心** dependencies，**不会**下载任何
+#   optional-dependencies 里的包。于是 `pysilk-mod` 根本不进 /wheels，
+#   runtime 阶段那个离线 `pip install /wheels/*.whl` 也就装不上它——
+#   镜像里 `import pysilk` 必然失败，语音发不出去（能力声明会诚实地说
+#   "没有 audio"，但用户要的是能发）。
+#
+#   写成 `.[speech-codecs]` 之后实测 /wheels 里多出
+#   `pysilk_mod-1.6.4-cp313-cp313-manylinux_2_17_{x86_64,aarch64}...whl`。
+#
+# **为什么这里能拿到正确架构的 wheel**：builder 与 runtime 用同一个
+# `${LING_PYTHON_BASE}` 且都**没有** `--platform=$BUILDPLATFORM` 覆盖，
+# 所以 buildx 多平台构建时 builder 跟着目标架构走（arm64 阶段由 QEMU 执行），
+# pip 解出的就是该架构的 manylinux wheel。builder 与 runtime 的平台/解释器
+# 因此天然一致，不需要额外传 `--platform` 给 pip。
 ARG PIP_INDEX_URL=""
 RUN pip install --no-cache-dir --retries 5 --timeout 60 \
       ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} build \
  && pip wheel --no-cache-dir --retries 5 --timeout 60 \
-      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} --wheel-dir /wheels . \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} --wheel-dir /wheels \
+      ".[speech-codecs]" \
  && ls /wheels
 
 
@@ -126,9 +144,98 @@ RUN groupadd --system --gid 10001 ling \
  && mkdir -p /app /data /app/web \
  && chown -R ling:ling /app /data
 
+# --- ffmpeg：OneBot/NapCat 语音条的**解码与重采样** ---
+#
+# 为什么需要它：语音条必须是 Tencent SILK，我们自己做这个编码。编码前要把
+# 任意厂商音频解码并**真正重采样**到 24 kHz 单声道 s16le——这一步由 ffmpeg
+# 完成（`connectors/onebot/silk.py::decode_to_pcm24`）。缺它则
+# `voice_readiness()` 报 "运行环境缺少 ffmpeg"，`capabilities()` 不声明
+# audio，一条语音都发不出去。
+#
+# **为什么不靠 NapCat 自带的 ffmpeg**：NapCat 收到非 SILK 音频时会去调
+# `/usr/bin/ffmpeg -f ntsilk_s16le`，但那个 muxer **不存在**——
+# 2026-11-11 核实：上游 FFmpeg（master 与 7.1）的 libavformat 里根本没有
+# silk muxer，它是 NapCat 自己打的补丁二进制。所以指望它转码必然失败，
+# 必须由我们自己产出带 `\x02#!SILK_V3` 头的 SILK。
+#
+# **这个 ffmpeg 不需要 silk 支持**：它只负责解 mp3/wav/flac/ogg/m4a 并重采样。
+# Debian bookworm 的是 5.1.9，实测其构建启用了 libmp3lame / libopus /
+# libvorbis（见 debian/rules），而 s16le 与 swresample 是 FFmpeg 核心能力，
+# 三家 TTS 的产出（mp3/wav）全都能解。
+#
+# `--no-install-recommends` 是必要的：不加会带进 X11、jack、SDL 等一整串
+# 与无头容器无关的推荐包。`rm -rf /var/lib/apt/lists/*` 必须留在**同一层**，
+# 否则那几十 MB 的索引会固化进镜像。
+#
+# 放在 pip install 之前：apt 层只依赖基础镜像，几乎不会失效，可以长期命中
+# 缓存；而 pip 安装层依赖 /wheels（每次源码变更都会变）。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+# `--no-index --find-links /wheels`：**纯离线**安装，不访问 PyPI。wheel 已经
+# 在 builder 阶段全部下载好了（含 speech-codecs extra 的 pysilk-mod）。
+#
+# ## 为什么要写 `ling[speech-codecs]` 而不是 `/wheels/*.whl`
+#
+# 真正的失败点在 **builder**：`pip wheel .` 只解析核心 dependencies，
+# `pysilk-mod` 根本不会进 /wheels（已在 builder 阶段改成 `.[speech-codecs]`）。
+# 这一层再写 `/wheels/*.whl` 的话，装的 wheel 集合里没有 pysilk-mod——
+# 实测 `import pysilk` → ModuleNotFoundError，语音发不出去。
+#
+# 反过来，**只要 pysilk 的 wheel 在 /wheels 里**，`/wheels/*.whl` 其实也能装上它
+# （逐个点名 wheel 时 pip 会满足 `extra == 'speech-codecs'` 标记，实测如此）。
+# 但那种写法把正确性押在"glob 恰好吃到全部 wheel"上：将来 /wheels 里多一个
+# 无关 wheel、或换 pip 版本改变该行为，就会静默退化成"少装一个包"。
+# 按**包名 + extra** 安装是显式声明依赖关系，pip 自己从 /wheels 解析传递闭包，
+# 不依赖 glob 的巧合。实测装全 39 个包且 `import pysilk` 成功。
+#
+# 也不能写成 `/wheels/*.whl[speech-codecs]`（2026-11-11 实测）：shell 会把
+# `[speech-codecs]` 当成字符类，glob 匹配不到任何文件，pip 报
+# `Invalid wheel filename (wrong number of parts): '*'`。
+#
+# `--no-index` 顺带保证"离线安装"不是靠运气：PyPI 上有同名包时也不会去下载，
+# 装的一定是 builder 刚打出来的那一份。
+#
+# ## 自检为什么不能只 `import pysilk`
+#
+# 预编译 wheel 里的 C 扩展有两个"装上了但用不了"的失败模式：
+#   1. manylinux ABI 与基础镜像的 glibc 不搭（import 时报 undefined symbol）；
+#   2. wheel 装上了、符号也在，但编解码二进制本身有问题。
+# 第 2 种 `import` 完全查不出来。所以这里**真编一段 100 ms 正弦**并校验 SILK
+# 魔数——与 `connectors/onebot/silk.py::SilkCodec.selftest()` 同一个判据，
+# 只是提前到构建期，让"装了个坏 wheel"在构建时红，而不是部署后用户发现
+# 一条语音都收不到。
+RUN cat > /tmp/silk_smoke.py <<'PY'
+import math
+import struct
+import sys
+
+import pysilk
+
+frames = int(24000 * 0.1)  # 100 ms @ 24 kHz
+pcm = b"".join(
+    struct.pack("<h", int(12000 * math.sin(2 * math.pi * 1000 * i / 24000)))
+    for i in range(frames)
+)
+data = pysilk.encode(pcm, 24000)
+if b"#!SILK" not in data[:10]:
+    sys.exit(f"SILK 自检失败：输出缺少 SILK 魔数（前10字节={data[:10]!r}）")
+back = pysilk.decode(data, 24000)
+if not back:
+    sys.exit("SILK 自检失败：解码回来是空 PCM")
+print(f"语音依赖自检通过：pysilk 编码 {len(data)} 字节、解码 {len(back)} 字节；ffmpeg 可用")
+PY
+
+# 自检**先跑**、`rm -rf /wheels` 放最后：清理是收尾动作，不能夹在
+# "装完"和"验完"之间——万一将来有人在这条链中间插步骤，顺序不该靠运气。
+RUN pip install --no-cache-dir --no-index --find-links /wheels "ling[speech-codecs]" \
+ && ffmpeg -version >/dev/null \
+ && python /tmp/silk_smoke.py \
+ && rm -rf /wheels \
+ && rm -f /tmp/silk_smoke.py
 
 COPY --chown=ling:ling src ./src
 # 同上：入口脚本与部分运行期代码会 `import connectors.*`，镜像里必须有。
