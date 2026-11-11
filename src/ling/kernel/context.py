@@ -27,6 +27,25 @@ from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
 from ling.domains.memory.service import MemoryService, RecallResult
 from ling.domains.persona.service import PersonaService, format_traits, view_is_empty
+
+# 提示词分区注册表：车道清单、预算、牺牲次序、保护集合、展示分组的**唯一**来源。
+# 本文件不再手写任何一份车道表——下面那些模块级别名全是注册表的派生值。
+from ling.kernel.prompt_zones import (
+    DEFAULT_BUDGETS as _DEFAULT_BUDGETS,
+)
+from ling.kernel.prompt_zones import (
+    LANE_TO_KEY as _LANE_TO_KEY,
+)
+from ling.kernel.prompt_zones import (
+    PROTECTED_LANES as _PROTECTED_LANES,
+)
+from ling.kernel.prompt_zones import (
+    SACRIFICE_ORDER as _SACRIFICE_ORDER,
+)
+from ling.kernel.prompt_zones import (
+    budget_overruns,
+    lane_zone,
+)
 from ling.ports.config import EffectiveConfig, MemoryPolicy
 from ling.ports.model import ChatMessageIn
 
@@ -122,35 +141,15 @@ def estimate_tokens(text: str) -> int:
 # `PROTECTED_LANES`（人设/约束/短记忆）**永不整条丢弃**，只会截断非受保护车道。
 # 所以"人设 10 万"在最坏情况下会把它人挤到只剩骨架——这是用户明确要的取舍：
 # 宁可少记得点，也要角色完整。
-DEFAULT_BUDGETS: dict[str, int] = {
-    # 人格是全篇最不能截断的一条：截掉一半的人设比提示长更糟——
-    # 模型会只看到开头（世界观），看不到「说话方式」「禁区」，
-    # 于是角色变成"设定对、说话不像"。
-    #
-    # **用户指定 10 万 token**（2026-11-09）。按本文件的换算口径
-    # （`budget_chars = token_budget * 2`）≈ 20 万字符，够放一整本角色设定书。
-    # 实测用户真实人设 6222 字符，远在限内；这条上限的意义是"写多少都不会
-    # 被悄悄砍掉"，而不是"鼓励写到 20 万字"。
-    "persona": 100000,
-    # 最近对话：这是"接得上话"的命脉。原值 400 只够三四条。
-    "short_memory": 4000,
-    # 核心记忆：每轮常驻，不依赖检索命中（Letta core memory / 插件 Label 常驻）
-    "core_memory": 6000,
-    "evidence": 6000,
-    # 知识库：外部可核验事实。与 evidence（本人记忆）分开两条车道，
-    # 因为二者的可信等级不同——知识是"外部来源说的"，记忆是"我对你的了解"。
-    "knowledge": 3000,
-    "world": 2000,
-    "self_state": 2000,
-    "relationship": 1200,
-    "media": 1500,
-    "goals": 800,
-    "capabilities": 300,
-    "constraints": 1200,
-    # 场景提示是**补丁**：一段话说明"此刻这种场合怎么处理"。给多了它就会
-    # 和人格车道抢预算，而它本来就该是短句。
-    "scenario": 600,
-}
+# 车道预算与车道清单现在**只有一份来源**：`ling.kernel.prompt_zones`。
+# 那里按区域登记每条车道（谁产出的、多少 token、超限先丢谁、是否受保护），
+# 下面这些名字全是它的派生结果，不是第二份手写表。
+#
+# 保留这些模块级别名而不是让调用方直接 import prompt_zones，是因为
+# `SACRIFICE_ORDER` / `PROTECTED_LANES` / `LANE_TO_KEY` 在测试与 API 里
+# 已被大量按 `ling.kernel.context.X` 引用；改导入点会让这次"纯重构"
+# 的 diff 淹没在无关改名里，反而看不清真正变了什么。
+DEFAULT_BUDGETS: dict[str, int] = _DEFAULT_BUDGETS
 
 
 def _as_local_hint(value: object) -> str:
@@ -309,20 +308,13 @@ def lane_key(lane: str) -> str:
 # - 「plan」：与"打算做什么"有关的目标（目前车道 `goals`，将来议程也归这里）；
 # - 「media」单独一组：图/语音/视频的描述是最容易被误读的一块
 #   （"她是不是假装看过"），必须能一眼看见它到底注入了什么。
+#
+# 这份映射来自 `prompt_zones` 的 `ZoneSpec.legacy_ui_key`，本文件不再手写。
+# 只取 system 类车道：`summary` / `history` / `input` 是结构车道，从不经过
+# `lane_key()`（它只对 `ContextContribution` 调用），留在映射里只会让人以为
+# 它们也能落进某个展示分组。
 LANE_TO_KEY: dict[str, str] = {
-    "persona": "system",
-    "constraints": "system",
-    "scenario": "system",
-    "capabilities": "system",
-    "evidence": "memory",
-    "core_memory": "memory",
-    "knowledge": "memory",
-    "short_memory": "memory",
-    "relationship": "memory",
-    "self_state": "memory",
-    "world": "memory",
-    "goals": "plan",
-    "media": "media",
+    lane: key for lane, key in _LANE_TO_KEY.items() if lane not in {"summary", "history", "input"}
 }
 
 # key → 给人看的标签。前端**直接用这个 label**，不要在前端再翻译一遍：
@@ -1799,24 +1791,18 @@ __all__ = [
 
 # ---------------------------------------------------------------- 总预算
 
-# 超软上限时**整条牺牲**的顺序（先扔最不重要的）。
-# persona / constraints 刻意不在此列：它们是"她是谁"，截了就不是她了。
-SACRIFICE_ORDER: tuple[str, ...] = (
-    "capabilities",
-    "goals",
-    "media",
-    "world",
-    # 车道名是 `scenario`，不是 `scene`。写错名字的后果不是报错，而是
-    # 场景提示在"超软上限"这一层**永远不会被整条牺牲**——它会一直占着预算，
-    # 直到撞到硬上限被从中间截一半（正好是这段注释反对的那种丢法）。
-    "scenario",
-    "knowledge",
-    "evidence",
-    "relationship",
-    "self_state",
-    "core_memory",
-)
-PROTECTED_LANES: frozenset[str] = frozenset({"persona", "constraints", "short_memory"})
+# 超软上限时**整条牺牲**的顺序，以及谁永不整条丢弃。
+#
+# 两者都从 `prompt_zones` 注册表派生，本文件不再手写。原先这里有一份手写
+# 元组，配着一段注释警告"车道名写错不会报错，只会让那条车道永远不被牺牲"——
+# 现在车道名由 `validate_registry()` 在**导入期**核对：既检查牺牲表覆盖了
+# 所有可牺牲车道，也检查每个名字都真实存在。写错就启动即崩，不再靠注释提醒。
+#
+# 注意 `SACRIFICE_ORDER` 当前仍是**重构前的那一份次序**（注册表里的
+# `SACRIFICE_ORDER_CURRENT`）。设计文档 §2 的目标次序与它不同，切换是 PR 3 的
+# 事，届时把那里改成 `SACRIFICE_ORDER_TARGET` 即可，对照表已在注册表 docstring。
+SACRIFICE_ORDER: tuple[str, ...] = _SACRIFICE_ORDER
+PROTECTED_LANES: frozenset[str] = _PROTECTED_LANES
 
 
 def _total_soft_hard() -> tuple[int, int]:
@@ -1858,6 +1844,122 @@ def render_rollup(dropped: list, *, prev_summary: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def _describe_overruns(contributions: list[ContextContribution]) -> str:
+    """把"哪些车道超了自己的预算"写成一句人话。**日志用，不是给模型看的。**
+
+    为什么要单独算这个：总预算超了只说明"整包太大"，但用户真正想知道的
+    是**哪个区域**把她的话挤掉了。单车道的预算在这里才有意义——`capabilities`
+    只有 300 token 却塞了 800 个字时，它是被自己撑爆的，不是被总预算牵连的。
+
+    返回形如 `可执行能力/capabilities 超 400 字符`（按超出量降序，最多 4 条）。
+    没有车道超预算时返回空串。
+    """
+    lane_chars: dict[str, int] = {}
+    for c in contributions:
+        lane_chars[c.lane] = lane_chars.get(c.lane, 0) + len(c.text)
+    overruns = budget_overruns(lane_chars)
+    if not overruns:
+        return ""
+    parts: list[str] = []
+    for zone_id, lane_name, chars, budget_chars in overruns[:4]:
+        zone = lane_zone(lane_name)
+        label = zone.label if zone else zone_id
+        parts.append(
+            f"{label}/{lane_name} 超 {chars - budget_chars} 字符"
+            f"（{chars}/{budget_chars}）"
+        )
+    if len(overruns) > 4:
+        parts.append(f"等共 {len(overruns)} 条")
+    return "；".join(parts)
+
+
+def _log_budget_pressure(
+    meta: dict,
+    *,
+    original: list[ContextContribution],
+    dropped: list[tuple[str, int]],
+    truncated: list[tuple[str, int]],
+) -> None:
+    """把这次超预算的**结论**写进日志。用户能在 Web 日志页看到的就是这条。
+
+    ## 为什么是 `warning` 而不是 `info`
+
+    实测过：只调用 `install_log_buffer()` 而没走 `setup_logging()` 时，
+    root logger 停在 `WARNING`，于是 `logger.info(...)` **在源头就被丢弃**，
+    环形缓冲里一条都没有。任何绕过 `setup_logging()` 的路径（测试脚本、
+    独立 worker、未来的 CLI）都会静默丢光 info 级日志。
+
+    超预算本来就是"出问题了"，用 `warning` 既符合语义，也让它不依赖
+    root 级别的配置——**用户要求"在日志显示出来"，那就不该有配置能让它消失**。
+
+    ## 为什么要说清"丢了哪个区域"
+
+    用户看日志要回答的是「为什么这次回复少了一些东西」。所以这条日志按
+    **区域**组织而不是按内部车道名：区域才是他划分提示词时用的概念。
+    同时保留车道名，方便直接去 `prompt_zones.py` 里改预算。
+    """
+    state = meta.get("budget_state", "within")
+    if state == "within":
+        return
+
+    total = meta.get("budget_total_chars", 0)
+    soft = meta.get("budget_soft", 0)
+    hard = meta.get("budget_hard", 0)
+
+    # 按区域归并牺牲量：用户问的是"哪个区域没了"，不是"哪十一条车道没了"。
+    per_zone: dict[str, list[tuple[str, int]]] = {}
+    for lane_name, chars in dropped:
+        zone = lane_zone(lane_name)
+        key = zone.label if zone else "未知区域"
+        per_zone.setdefault(key, []).append((lane_name, chars))
+    zone_parts = []
+    for zone_label, items in per_zone.items():
+        subtotal = sum(chars for _, chars in items)
+        lanes = "、".join(name for name, _ in items)
+        zone_parts.append(f"{zone_label} {subtotal} 字符（{lanes}）")
+
+    overrun_text = _describe_overruns(original)
+    header = "上下文超硬上限" if state == "over_hard" else "上下文超软上限"
+
+    if state == "over_hard":
+        # 硬上限意味着内容真的会**变形**（不是整条丢，而是被截一半）。
+        # 这里只说"撞了硬上限 + 丢了什么"，截断结果由调用方在截断后
+        # 用同一函数补一条，避免"说将截断但实际没截"这种前后不一致。
+        logger.warning(
+            "%s：总长 %d 字符（软 %d / 硬 %d），整条丢弃 %d 段后仍超%s%s",
+            header,
+            total,
+            soft,
+            hard,
+            len(dropped),
+            f"；丢失区域：{'；'.join(zone_parts)}" if zone_parts else "",
+            f"；超预算车道：{overrun_text}" if overrun_text else "",
+        )
+    else:
+        logger.warning(
+            "%s：总长 %d 字符（软 %d / 硬 %d），整条丢弃 %d 段%s%s",
+            header,
+            total,
+            soft,
+            hard,
+            len(dropped),
+            f"；丢失区域：{'；'.join(zone_parts)}" if zone_parts else "",
+            f"；超预算车道：{overrun_text}" if overrun_text else "",
+        )
+
+    if truncated:
+        # 截断发生在牺牲之后，只有这里才能说"真的截了"以及截了多少。
+        detail = "、".join(f"{lane} {chars} 字符" for lane, chars in truncated)
+        logger.warning("硬上限仍超，已截断这些车道的尾部：%s", detail)
+    elif state == "over_hard":
+        # 想截却没有可截对象：剩下的全是受保护车道。用户看到"超硬上限"
+        # 却没有截断记录时，这个解释能省掉一次排查。
+        logger.warning(
+            "硬上限仍超，但剩余内容全部是受保护车道（%s），按设计不做截断",
+            "、".join(sorted(PROTECTED_LANES)),
+        )
+
+
 def _apply_total_budget(
     contributions: list[ContextContribution], meta: dict
 ) -> list[ContextContribution]:
@@ -1865,6 +1967,11 @@ def _apply_total_budget(
 
     为什么整条丢而不是截断：半条记忆比没有记忆更糟——模型会基于残缺内容
     下结论。整条丢至少是"这次没想起来"。
+
+    **超限时一定写日志**（用户要求：「如果超预算，记得在日志显示出来」）。
+    日志走 root logger，会进 `logging_setup` 的环形缓冲，因此 Web 日志页
+    查得到。这一条不是设计文档 `PROMPT-ZONE-SPEC.md` 的内容——那份文档
+    只做分区，超预算可观测性是用户单独提的验收要求。
     """
     soft, hard = _total_soft_hard()
     total = sum(len(c.text) for c in contributions)
@@ -1876,6 +1983,7 @@ def _apply_total_budget(
         return contributions
 
     dropped: list[str] = []
+    dropped_detail: list[tuple[str, int]] = []
     kept = list(contributions)
     for lane in SACRIFICE_ORDER:
         if total <= soft:
@@ -1888,17 +1996,12 @@ def _apply_total_budget(
             kept.remove(c)
             total -= len(c.text)
             dropped.append(f"{lane}:{len(c.text)}")
+            dropped_detail.append((lane, len(c.text)))
 
     meta["budget_state"] = "over_hard" if total > hard else "over_soft"
     meta["budget_dropped"] = dropped
-    if dropped:
-        logger.info(
-            "上下文超总预算（%d > %d 字符），整条丢弃 %d 段：%s",
-            sum(len(c.text) for c in contributions),
-            soft,
-            len(dropped),
-            ", ".join(dropped[:6]),
-        )
+
+    truncated: list[tuple[str, int]] = []
     if total > hard:
         # 硬上限仍未满足：**只截断非受保护车道**，且留痕。
         #
@@ -1914,9 +2017,17 @@ def _apply_total_budget(
             cut = min(over, max(0, len(c.text) - 200))
             if cut <= 0:
                 continue
-            logger.warning("硬上限仍超，截断车道 %s %d 字符", c.lane, cut)
             kept[idx] = c.model_copy(
                 update={"text": c.text[: len(c.text) - cut] + "…（已截断）"}
             )
             total -= cut
+            truncated.append((c.lane, cut))
+
+    # 每条截断单独记太吵（一次可能十几条），改为汇总成一条由
+    # `_log_budget_pressure()` 一起输出；这里只记录发生了什么，措辞和
+    # 级别都在那一处决定，避免两个地方对同一件事说法不一致。
+    meta["budget_truncated"] = [f"{lane}:{chars}" for lane, chars in truncated]
+    _log_budget_pressure(
+        meta, original=contributions, dropped=dropped_detail, truncated=truncated
+    )
     return kept
