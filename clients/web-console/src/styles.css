@@ -3588,3 +3588,153 @@ button {
   color: var(--ink-faint);
   background: rgba(255, 255, 255, 0.6);
 }
+
+/* ---------------------------------------------------------------- 语音设置 */
+
+/*
+ * 意愿档位与音色。两个区块都是 `.memory-form__row` 的同款卡片，所以这里只加
+ * "一列选项 + 动态字段"需要的部分，不另起一套视觉语言。
+ */
+.voice-form {
+  display: grid;
+  gap: 14px;
+}
+
+.voice-form__block {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.voice-form__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.voice-form__intro,
+.voice-form__note,
+.voice-form__ok,
+.voice-form__warn {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.voice-form__warn {
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.voice-form__ok {
+  padding: 8px 10px;
+  border: 1px solid #cfdcc6;
+  border-radius: 8px;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.voice-form__choices {
+  display: grid;
+  gap: 8px;
+}
+
+@media (min-width: 760px) {
+  .voice-form__choices {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .voice-form__choices--kinds {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.voice-form__choice {
+  display: flex;
+  gap: 10px;
+  /* 44px 是触摸下限：选项本身就是主要的点击目标。 */
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+  cursor: pointer;
+}
+
+.voice-form__choice--on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.voice-form__choice input {
+  margin-top: 3px;
+  flex: none;
+}
+
+.voice-form__choice-body {
+  display: grid;
+  gap: 4px;
+}
+
+.voice-form__choice-label {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.voice-form__choice-detail {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.voice-form__grid {
+  display: grid;
+  gap: 12px;
+}
+
+@media (min-width: 760px) {
+  .voice-form__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.voice-form__input--wide {
+  width: 220px;
+  max-width: 100%;
+  text-align: left;
+}
+
+.voice-form__file {
+  max-width: 100%;
+  font-size: 13px;
+}
+
+.voice-form__upload-error {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  padding: 10px 12px;
+  border: 1px solid #eccfc8;
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.voice-form__error,
+.memory-form__error {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}

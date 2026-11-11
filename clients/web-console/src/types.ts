@@ -431,6 +431,62 @@ export interface DialoguePolicy {
    * 服务端默认 `natural`；非法值也退回 `natural`。
    */
   voice_willingness?: VoiceWillingness;
+  /**
+   * 她要用的**音色**。对应后端 `ports/config.py::VoiceSetting`。
+   *
+   * 缺省（`undefined`）与 `{kind: null}` 都表示"还没配"——那时运行时降级发文字。
+   * 页面**不得**把它显示成"可用"。
+   */
+  voice?: VoiceSetting;
+}
+
+/**
+ * 可以配音色的三家。取值与后端 `VoiceKind` / `ports/model.ProviderKind` 逐字一致。
+ *
+ * **没有统一的 `voice_key`**（§17.2 撤销了跨厂商映射表）：同一个"温柔"在三家
+ * 是三个完全不同的值。所以 `kind` 只回答"这套参数是给谁的"，不承担翻译。
+ */
+export type VoiceKind = 'minimax_tts' | 'fishaudio_tts' | 'mimo_tts';
+
+/**
+ * 一套音色参数。与后端 `ports/config.py::VoiceSetting` 一一对应。
+ *
+ * ## 字段按家归属，**不是并集都能填**
+ *
+ * - `minimax_tts`：`voice_id` + speed / vol / pitch / emotion
+ * - `fishaudio_tts`：**只有** `voice_id`（那边叫 reference_id）——没有 speed/vol/pitch
+ * - `mimo_tts`：**只有** `reference_asset_id`（走 voiceclone，由上传接口拿到）
+ *
+ * 后端对"多填了别家的"不报错（它只判"缺该有的"），所以**清理残留字段是界面的
+ * 责任**：`speed` 留在 mimo 配置里不会生效，但会让人以为它生效。
+ */
+export interface VoiceSetting {
+  kind: VoiceKind | null;
+  /** MiniMax 的 `voice_id`，**也是** FishAudio 的 `reference_id`（由 kind 决定是哪种）。 */
+  voice_id: string | null;
+  /** MiMo 的参考素材 id（`media_assets.digest`，64 位十六进制）。**不是字节**。 */
+  reference_asset_id: string | null;
+  speed: number;
+  vol: number;
+  pitch: number;
+  /** 默认 `null` = 不发。猜一个 emotion 会让语音听起来莫名其妙。 */
+  emotion: string | null;
+}
+
+/**
+ * 参考音频上传的成功返回（`POST /v1/settings/speech/voice-reference`）。
+ *
+ * `asset_id` 直接填进 `voice.reference_asset_id`；`format` / `size_bytes` 用于
+ * 在页面上说清"传进来的是什么"，免得用户以为扩展名对了就行（后端按字节头判定）。
+ */
+export interface VoiceReferenceUpload {
+  schema_version: string;
+  asset_id: string;
+  format: string;
+  mime_type: string;
+  size_bytes: number;
+  duration_ms: number | null;
+  retention_days: number;
 }
 
 /**

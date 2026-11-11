@@ -68,6 +68,7 @@ import type {
   LogsResponse,
   RecallProposal,
   RecallResult,
+  VoiceReferenceUpload,
 } from './types';
 
 export class ApiError extends Error {
@@ -507,6 +508,34 @@ export const api = {
   /* ------------------------------------------------------------ 设置 */
   settingsConfig(): Promise<SettingsConfig> {
     return request<SettingsConfig>('/v1/settings/config');
+  },
+  /**
+   * 上传一段**参考音频**，返回可以填进 `dialogue.voice.reference_asset_id` 的 id。
+   *
+   * `POST /v1/settings/speech/voice-reference`（`routes/settings.py:1947`）。
+   *
+   * 三件事**不要**改：
+   *
+   * 1. 表单字段名是 **`upload`**（后端签名 `upload: UploadFile = File(...)`）。
+   *    换个名字后端收不到，报的是 422「字段缺失」，看起来像"文件不合法"。
+   * 2. **不设 `Content-Type`**：`multipart/form-data` 的 boundary 必须由浏览器
+   *    生成。手写这个头会让 boundary 对不上，服务端解析出 0 字节 → 422
+   *    `voice_reference_empty`。
+   * 3. 文件名只作提示：后端**一次都不用** `upload.filename`（它只可能是
+   *    `../../etc/passwd` 这类东西），容器按字节头嗅探。
+   *
+   * 失败形状（`error.detail` 是稳定原因码，界面按它给人话）：413
+   * `voice_reference_too_large` / 422 `voice_reference_empty` /
+   * 422 `voice_reference_invalid_audio` / 403 `not_owner` / 403 `bad_origin`。
+   */
+  uploadVoiceReference(file: File | Blob, filename = 'voice-reference'): Promise<VoiceReferenceUpload> {
+    const form = new FormData();
+    // 第三个参数是文件名：只影响后端日志之外的表象，判定全看字节。
+    form.append('upload', file, file instanceof File ? file.name : filename);
+    return request<VoiceReferenceUpload>('/v1/settings/speech/voice-reference', {
+      method: 'POST',
+      body: form,
+    });
   },
   /**
    * 接入器（渠道）的配置 + 诊断（`GET /v1/settings/connectors`，v2）。
