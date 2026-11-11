@@ -650,3 +650,110 @@ async def test_voice_reply_leaves_exactly_one_delivery_operation(
         )
     # 本路径**不落** actor message（那是 `TurnCoordinator` 的事，这里被替换掉了）。
     assert messages == [], f"投递路径自己写了消息行：{messages}"
+
+
+# --------------------------------------------------------------------------- #
+# 五、配置里真的配了音色 → 真的出声（**不 patch `_voice_for_tts`**）
+#
+# 这一节与上面几节的区别只有一处：上面用 `_give_voice` 把音色**注入**进去，
+# 所以它们证明的是"有音色就能出声"；这里从**配置层**配一遍（真实
+# `save_draft` → 真实 `effective()` → 真实 `_voice_for_tts`），证明的是
+# "用户在设置里填的音色，最终能被那一环读出来"。
+#
+# 缺了这一节，"配置读不进运行时"这个缺陷在所有测试里都是不可见的——
+# 因为注入绕过了读取。
+# --------------------------------------------------------------------------- #
+
+
+async def _draft_voice(session, voice: dict) -> None:  # noqa: ANN001
+    """走**真实**的 `save_draft` + `publish` 把音色写进已发布修订。
+
+    为什么要发布：`ConfigService.effective()` 只认**已发布**那一行，草稿
+    对运行时不可见。只写草稿的话 `_voice_for_tts` 读到的是引导配置，这条
+    e2e 就在"什么都没配"的状态下跑——那证明不了任何事（实测过：它的症状
+    正是日志里那句"还没配置音色"）。
+
+    为什么先断言没有音色校验错误：合法配置被拦下时 `publish` 抛 422，
+    失败信息指向"发布失败"，而真正的原因在一个不该报错的字段上。
+    """
+    config = await _config(session)
+    result = await config.save_draft(dialogue={"voice": voice}, note="配一个音色")
+    voice_errors = [
+        i for i in result.validation_errors if i.field.startswith("dialogue.voice")
+    ]
+    assert not voice_errors, f"合法的音色配置被校验拦下了：{voice_errors}"
+    await config.publish(result.revision)
+
+
+async def test_configured_minimax_voice_really_synthesizes(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """设置里配好 MiniMax 音色 + 写 `[speak]` → **真的合成**，不是降级。
+
+    **必须失败于**：
+    - `_voice_for_tts` 恒返回 `None`（补音色之前的状态）→ `tts.calls == 0`；
+    - 配置读不进运行时（serde 漏字段 / 补丁丢掉 voice）→ 同上；
+    - 校验把合法配置拦下 → `save_draft` 里那条断言先红。
+
+    这条**不 patch** `_voice_for_tts`，所以它走的是生产上那条路：
+    `effective.dialogue.voice` → 值对象 → `synthesize(voice=...)`。
+    """
+    tts = FakeTts()
+    _bind_tts(monkeypatch, tts)
+    connector = FakeConnector()
+
+    window = await _make_window(logged_in, channel="onebot")
+    async with session_scope() as session:
+        await _draft_voice(
+            session,
+            {"kind": "minimax_tts", "voice_id": "voice_from_settings", "speed": 1.1},
+        )
+
+    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    _patch_turn_coordinator(monkeypatch, f"{SPEAK} 配了音色就该出声。")
+    async with session_scope() as session:
+        delivered, reason = await worker_module._reply_in_group_window(
+            session=session,
+            config=await _config(session),
+            window=window,
+            result=_Result(),
+        )
+
+    assert delivered is True, reason
+    assert tts.calls == 1, f"provider 被调用 {tts.calls} 次：配好的音色没有走到合成"
+    assert len(connector.sent) == 1
+    message = connector.sent[0]
+    assert _audio(message), f"配了音色却发了纯文字（降级了）：{message.attachments}"
+    assert message.text == "配了音色就该出声。", message.text
+
+
+async def test_configured_voice_of_another_provider_does_not_guess(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """配的是 MiniMax 音色，而这一轮 TTS 是 FishAudio → 降级发文字。
+
+    与上一条**配对**：只测"配好了会出声"，一个"不管配的是哪家都硬塞进去"的
+    实现同样全绿。这条要的是"两边不一致时**不猜**"。
+    """
+    tts = FakeTts()
+    _bind_tts(monkeypatch, tts, kind="fishaudio_tts")
+    connector = FakeConnector()
+
+    window = await _make_window(logged_in, channel="onebot")
+    async with session_scope() as session:
+        await _draft_voice(session, {"kind": "minimax_tts", "voice_id": "voice_1"})
+
+    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    _patch_turn_coordinator(monkeypatch, f"{SPEAK} 别猜我的声音。")
+    async with session_scope() as session:
+        delivered, reason = await worker_module._reply_in_group_window(
+            session=session,
+            config=await _config(session),
+            window=window,
+            result=_Result(),
+        )
+
+    assert delivered is True, reason
+    assert tts.calls == 0, "跨厂商硬塞了音色（§17.2 撤销了映射表，不该猜）"
+    assert not _audio(connector.sent[0])
+    assert connector.sent[0].text == "别猜我的声音。"

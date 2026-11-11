@@ -52,7 +52,33 @@ if TYPE_CHECKING:
     from ling.domains.media.assets import GeneratedMediaService
     from ling.domains.speech.orchestration import SpeechOrchestrator
     from ling.ports.config import EffectiveConfig
-    from ling.ports.speech import ExpressionIntent, TtsVoice
+
+    # `AudioInput` 只出现在 `_load_reference_audio` 的**返回注解**里（本文件
+    # 用了 `from __future__ import annotations`，注解不求值）；构造它的地方在
+    # 函数体内延迟导入，所以这里不需要在模块顶部真导入。
+    from ling.ports.speech import AudioInput, ExpressionIntent, TtsVoice
+
+# 音色参考素材的字节上限。**与 `models/mimo_tts.MAX_VOICE_BYTES` 同值**，
+# 但不在模块顶部 import 它：那个模块只在真的要用 MiMo 时才该被拉进来
+# （`_build` 里是延迟导入的）。这条断言放在 `tests/unit/test_speech_voice_config.py`
+# 里盯着两边一致——两处各写一个数，迟早一边改了另一边没改。
+MAX_VOICE_BYTES = 10 * 1024 * 1024
+
+# 参考素材的容器 → codec。与 `domains/speech/providers.py` 的
+# `_CODEC_BY_CONTAINER` 一致，但那张表是**合成产物**用的（producer 侧），
+# 这里是**输入素材**用的：素材可能是 wav/mp3/flac/ogg/m4a，合成产物只有四种。
+# 认不出的容器写 `unknown`，**不谎报一个看起来合理的编码**。
+_VOICE_CODEC_BY_CONTAINER: dict[str, str] = {
+    "wav": "pcm_s16le",
+    "pcm": "pcm_s16le",
+    "mp3": "mp3",
+    "flac": "flac",
+    "ogg": "opus",
+    "opus": "opus",
+    "m4a": "aac",
+    "silk": "silk",
+    "amr": "amr",
+}
 
 # 单条 outbox 事件的最多尝试次数。达到后转 "dead" 等人工重放，
 # 不静默丢弃（注意：五次失败不等于记忆应该永久缺席）。
@@ -2544,14 +2570,162 @@ async def _build_speech_reply(*, effective: EffectiveConfig, session) -> _Speech
     )
 
 
-async def _voice_for_tts(kind: str, *, effective: EffectiveConfig) -> TtsVoice | None:  # noqa: ANN001,ARG001
-    """这一轮用什么音色。
+async def _voice_for_tts(kind: str, *, effective: EffectiveConfig) -> TtsVoice | None:
+    """这一轮用什么音色。**解析不出来就返回 `None`（降级发文字），不抛。**
 
-    **当前恒为 `None`**：音色还没有配置落点。本函数存在的意义是把"缺什么"
-    写在一个能被测试打到的位置上，而不是让它散落成注释——这样等配置层补上
-    `voice` 字段时，只有这一个函数要改，调用链一行不动。
+    ## 不跨厂商猜
+
+    `kind` 是**这一轮TTS 供应商**的 kind（来自 `build_tts_provider()`），
+    配置里的 `voice.kind` 是**用户为哪家准备的音色**。两者必须一致：
+
+    - 不一致 → `None` + 一条说清两边的日志。绝不拿用户给 MiniMax 的音色
+      去喂 FishAudio，也不"顺手换一家"——§17.2 撤销了跨厂商映射表，同一个
+      "温柔"在三家是三个不同的值，猜出来的声音"听起来完全变了"却不会报错。
+    - 代码里**没有** `voice_key` 这类翻译，也没有任何默认嗓音。
+
+    ## MiMo 要把素材读成字节
+
+    配置里只有 `reference_asset_id`（**不是字节**：把字节存进配置库会让配置
+    体积失控，也会让"授权"变成"字节还在就算有权限"）。这里用媒体服务把它
+    换成 `AudioInput`。读取失败（素材被清理、过期、文件缺失、库不可用）
+    **一律 `None`**：那是一个可预期的降级，不是运行时故障。
+
+    ## 授权
+
+    参考素材是用**她自己的身份**读的（`actor_id`），不是"配置里写了 id 就
+    有权限"。资产层的可见性判定（ready / 未删除 / 未过期）照常生效——见
+    `_load_reference_audio`。
     """
-    return None
+    # 延迟导入（与本文件其它语音路径一致）：不用 `[speak]` 的部署
+    # 不该因为这几个符号被拉进来就付出导入代价。
+    from ling.ports.config import voice_requirement_issue
+    from ling.ports.model import normalize_provider_kind
+    from ling.ports.speech import FishAudioVoice, MimoReferenceVoice, MiniMaxVoice
+
+    voice = effective.dialogue.voice
+    issue = voice_requirement_issue(voice)
+    if issue is not None:
+        logger.info("语音本轮没有可用音色：%s", issue)
+        return None
+    if voice.kind is None:
+        logger.info("语音本轮降级为文字：还没配置音色（dialogue.voice.kind 为空）")
+        return None
+
+    if voice.kind != normalize_provider_kind(kind):
+        # 两边的值都记下来：只说"不匹配"的话，用户看不出是改了 TTS 供应商
+        # 还是改了音色类型。
+        logger.info(
+            "语音本轮降级为文字：音色配的是 %s，而这一轮 TTS 是 %s（不跨厂商猜音色）",
+            voice.kind,
+            kind,
+        )
+        return None
+
+    if voice.kind == "minimax_tts":
+        assert voice.voice_id is not None  # `voice_requirement_issue` 已保证
+        return MiniMaxVoice(
+            voice_id=voice.voice_id,
+            speed=voice.speed,
+            vol=voice.vol,
+            pitch=voice.pitch,
+            emotion=voice.emotion,
+        )
+    if voice.kind == "fishaudio_tts":
+        assert voice.voice_id is not None
+        # FishAudio **没有** speed/vol/pitch 那套参数，值对象里也没有这些字段。
+        # 配置里存着它们不影响：它们不会被发到这一家去。
+        return FishAudioVoice(reference_id=voice.voice_id)
+
+    asset_id = voice.reference_asset_id
+    assert asset_id is not None  # `voice_requirement_issue` 已保证
+    audio = await _load_reference_audio(asset_id)
+    if audio is None:
+        return None
+    return MimoReferenceVoice(audio=audio)
+
+
+async def _load_reference_audio(asset_id: str) -> AudioInput | None:
+    """`reference_asset_id` → **已授权**的 `AudioInput`。读不到返回 `None`。
+
+    ## 为什么不用 `read_for_window`
+
+    那条路是给"窗口里的产物"用的，它按 `window_id` / `actor_id` 判可见性；
+    而音色参考素材是**配置**，不属于任何一个会话窗口。用她自己的身份
+    （`settings.actor_id`）直接读库：
+
+    - `_load_live` 仍然生效——**未 ready / 已删除 / 已过期**的素材读不到，
+      这正是"授权"里"还有没有权"的那一半；
+    - 文件缺失（记录在、文件没了 = 存储损坏）也按"读不到"处理，但**记 error**
+      （`logger.error` 而不是 `info`）：那是故障，不是配置缺失。
+
+    字节上限与 MiMo 适配器一致（`MAX_VOICE_BYTES`）：适配器自己也会拦，但
+    在这里拦能少读几百 MB 进内存——一个误传的整段录音就是这种情况。
+    """
+    from ling.domains.media.storage import GeneratedMediaStorage, MediaStorageError
+    from ling.infra.db import session_scope
+    from ling.infra.media_assets import MediaAssetRow
+    from ling.ports.speech import AudioInput, AudioSpec
+
+    settings = get_settings()
+    try:
+        async with session_scope() as session:
+            row = await session.get(MediaAssetRow, asset_id)
+            if row is None or not row.is_live():
+                logger.info(
+                    "语音本轮降级为文字：参考素材 %s 不存在或已失效（未就绪/已删除/已过期）",
+                    asset_id[:12],
+                )
+                return None
+            if int(row.size_bytes or 0) > MAX_VOICE_BYTES:
+                logger.info(
+                    "语音本轮降级为文字：参考素材 %s 太大（%d 字节，上限 %d）",
+                    asset_id[:12],
+                    row.size_bytes,
+                    MAX_VOICE_BYTES,
+                )
+                return None
+            data_dir = settings.data_dir
+            mime_type = str(row.mime_type or "")
+            format_ = str(row.format or "")
+            sample_rate = row.sample_rate
+    except Exception as exc:  # noqa: BLE001 - 读不到 = 降级，不是投递故障
+        logger.info("语音本轮降级为文字：读取参考素材失败（%s）", type(exc).__name__)
+        return None
+
+    # 字节在会话之外读：读文件是同步 IO，不该占着数据库事务。
+    # `GeneratedMediaStorage` 的 `absolute_path_of` 会做越界检查（库里那串
+    # 相对路径终究是个字符串），所以这里不在 worker 里再拼路径。
+    storage = GeneratedMediaStorage(data_dir)
+    try:
+        content = storage.read(asset_id)
+    except (MediaStorageError, OSError) as exc:
+        logger.error(
+            "生成媒体记录存在但文件缺失：digest=%s err=%s（音色参考素材读不到，本轮降级）",
+            asset_id[:12],
+            exc,
+        )
+        return None
+    if not content:
+        logger.info("语音本轮降级为文字：参考素材 %s 是空文件", asset_id[:12])
+        return None
+
+    # 规格从**库里那一行**来，不从文件名猜：资产写好时就记过 mime / format /
+    # sample_rate。容器与 codec 分开（`ports/speech.AudioSpec` 的要求）。
+    # MiMo 适配器仍会按字节嗅探一次 mime，这里的声明只是兜底。
+    spec = AudioSpec(
+        mime_type=mime_type or "application/octet-stream",
+        container=format_ or "raw",
+        codec=_VOICE_CODEC_BY_CONTAINER.get(format_, "unknown"),
+        sample_rate_hz=sample_rate,
+        channels=1,
+    )
+    # 文件名由服务端生成，带真实容器扩展名——不用用户上传的原始文件名
+    # （可能含路径，见 `AudioInput.filename` 的注释）。
+    return AudioInput(
+        content=content,
+        filename=f"reference.{format_ or 'bin'}",
+        spec=spec,
+    )
 
 
 def _published_secret_reader() -> Callable[[str], Awaitable[str | None]]:

@@ -158,6 +158,16 @@ class LifePolicy:
 
 
 VoiceWillingness = Literal["reserved", "natural", "expressive"]
+
+VoiceKind = Literal["minimax_tts", "fishaudio_tts", "mimo_tts"]
+"""可以配**音色**的三家。取值与 `ports/model.ProviderKind` 逐字一致。
+
+**没有统一的 `voice_key`**（§17.2 撤销了跨厂商映射表）：同一个"温柔"在
+三家是三种完全不同的东西。所以 `voice_kind` 只回答"这套音色参数是给谁的"，
+不承担"把一家的音色翻译成另一家的"那种职责——那件事代码不替用户做。
+"""
+
+VOICE_KINDS: frozenset[str] = frozenset({"minimax_tts", "fishaudio_tts", "mimo_tts"})
 """她愿不愿意开口说话的三个**语义档**（§17.4）。
 
 用 `Literal` 而不是 `StrEnum`：这个值要原样进配置 JSON、进 API 校验、
@@ -193,6 +203,71 @@ VOICE_WILLINGNESS_PROMPTS: dict[VoiceWillingness, str] = {
         "不要每条都发语音，也不必为了使用语音改变要说的话。"
     ),
 }
+
+
+@dataclass(frozen=True)
+class VoiceSetting:
+    """她要用的**音色**。设置页「⑤ 对话与主动性」里的一段。
+
+    ## 为什么是"共用字段 + 一个 kind"，而不是三家的联合对象
+
+    三家的音色形状完全不同（``MiniMaxVoice`` 有 speed/vol/pitch/emotion，
+    ``FishAudioVoice`` 只有一个 ``reference_id``，``MimoReferenceVoice`` 要
+    **参考音频字节**）。运行时当然要变成那三个值对象之一，但**配置里不能**：
+
+    - MiMo 的 ``AudioInput`` 是已授权、已解码的字节。存进配置库会让配置体积
+      失控，还会把"授权"变成"字节还在就算有权限"（`ports/speech.py` 的原话）。
+      所以配置里只存 ``reference_asset_id``，运行时再去媒体服务换字节。
+    - 三家的参数并集很小（就下面这几个），拆成三个嵌套 dict 只会让"缺哪个"
+      更难被单独表达——一个 ``None`` 就能说清"这套里的这一项没填"。
+
+    ## 每个字段各自缺失，各自表达
+
+    ``kind`` 为空 = 还没选音色（不是"用默认嗓音"，运行时会降级发文字）。
+    ``voice_id`` / ``reference_asset_id`` 谁该填由 ``kind`` 决定（见
+    `voice_requirement_issue`）；speed/vol/pitch 只为 MiniMax 存在，
+    填了别的家也不报错——它们对那家没有意义，运行时也不会发出去。
+    """
+
+    kind: VoiceKind | None = None
+    voice_id: str | None = None
+    """MiniMax 的 ``voice_id``，或 FishAudio 的 ``reference_id``。
+
+    一个字段装两种 id 是有意的：它们都是"厂商那边一个已有音色的字符串"，
+    由 ``kind`` 决定它是哪一种。分两个字段会让"填错了格子"变成静默忽略。
+    """
+    reference_asset_id: str | None = None
+    """MiMo 的参考素材 id（`media_assets.digest`）。**不是字节**。"""
+    speed: float = 1.0
+    vol: float = 1.0
+    pitch: int = 0
+    emotion: str | None = None
+    """默认 None = 不发。猜一个 emotion 会让语音听起来莫名其妙。"""
+
+
+def voice_requirement_issue(voice: VoiceSetting) -> str | None:
+    """这套音色还缺什么。返回**给用户直接看的中文**，或 ``None`` 表示可用。
+
+    这是"缺哪个"的**唯一判定**：设置页的校验（`settings/service.py`）与
+    运行时的降级（`worker._voice_for_tts`）都调它，所以不会出现"保存时说过
+    没问题、运行起来降级"这种两套规则。
+
+    ``kind`` 为空时返回 ``None``：那是"还没配"，不是"配错了"——校验不该逼
+    每个用户都先选一个音色，而降级由运行时按"没有音色"处理。
+    """
+    kind = voice.kind
+    if kind is None:
+        return None
+    if kind not in VOICE_KINDS:
+        return f"未知的音色类型：{kind}（支持：{'、'.join(sorted(VOICE_KINDS))}）"
+    if kind == "mimo_tts":
+        if not (voice.reference_asset_id or "").strip():
+            return "音色类型是 mimo_tts，但没填参考音频（reference_asset_id）"
+        return None
+    if not (voice.voice_id or "").strip():
+        label = "voice_id" if kind == "minimax_tts" else "reference_id"
+        return f"音色类型是 {kind}，但没填 {label}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -289,6 +364,14 @@ class DialoguePolicy:
 
     默认 ``natural``：不配置时行为与"她现在这样"最接近，
     也不会把她突然变成"每句都发语音"。
+    """
+
+    voice: VoiceSetting = field(default_factory=VoiceSetting)
+    """她要用的音色。
+
+    默认空 = 还没配。**代码不替她选嗓音**：没有音色时 `[speak]` 降级发文字，
+    日志里说清缺的是哪一环（见 `worker._voice_for_tts`）。给一个"听起来还行"
+    的默认值，会让"配错了"和"没配"在用户那里长得一模一样。
     """
 
     @property

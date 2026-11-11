@@ -141,6 +141,27 @@ class LifePolicyIn(BaseModel):
     max_live_plans: int | None = Field(default=None, ge=1, le=20)
 
 
+class VoiceIn(BaseModel):
+    """音色："mimo 上传参考音频 + 另两家手填 ID"（需求原文）。
+
+    ## 为什么不加 ``model_config = ConfigDict(extra="forbid")``
+
+    这一层是**宽松的翻译层**：合法的形状检查（kind 是否已知、id 与 kind 是否
+    配套）都在 `settings/service._voice_issues` 里，那里的错误会进
+    `validation_errors` 并显示在设置页。在这里再加一套 pydantic 校验，会让
+    同一个错误有两条不同的报错文案，而且 422 与"草稿存下了但带错误"是两种
+    完全不同的界面行为。
+    """
+
+    kind: str | None = None
+    voice_id: str | None = None
+    reference_asset_id: str | None = None
+    speed: float | None = None
+    vol: float | None = None
+    pitch: int | None = None
+    emotion: str | None = None
+
+
 class DialoguePolicyIn(BaseModel):
     """⑤ 对话与主动性 的策略。免打扰用"当天分钟数"，因为跨午夜是常态。"""
 
@@ -156,6 +177,9 @@ class DialoguePolicyIn(BaseModel):
     proactive_delivery_enabled: bool | None = None
     # 群聊里「决定回了」之后是否真的生成并发送（默认关）
     group_reply_delivery_enabled: bool | None = None
+    # 音色。**必须有这一行**：pydantic 默认丢掉未声明的字段，于是前端把
+    # `dialogue.voice` 传上来会静默消失，表现成"填了音色、保存成功、还是降级"。
+    voice: VoiceIn | None = None
 
 
 class DraftBody(BaseModel):
@@ -396,6 +420,19 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             "group_reply_delivery_enabled": (
                 effective.dialogue.group_reply_delivery_enabled
             ),
+            # 这两项原来漏了：数据库里存了、运行时也用了，但**读接口不给**，
+            # 于是设置页"保存成功，刷新后回到默认"。`voice` 是同一个坑的
+            # 第二批——加字段时必须同时补读接口，否则前端拿不到就显示"未配置"。
+            "voice_willingness": effective.dialogue.voice_willingness,
+            "voice": {
+                "kind": effective.dialogue.voice.kind,
+                "voice_id": effective.dialogue.voice.voice_id,
+                "reference_asset_id": effective.dialogue.voice.reference_asset_id,
+                "speed": effective.dialogue.voice.speed,
+                "vol": effective.dialogue.voice.vol,
+                "pitch": effective.dialogue.voice.pitch,
+                "emotion": effective.dialogue.voice.emotion,
+            },
         },
         "profiles": [
             {

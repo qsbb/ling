@@ -23,6 +23,7 @@ from ling.infra.models import ConfigRevision, ProviderCredential, utcnow
 from ling.infra.security import SecretBox, new_id
 from ling.models.registry import bootstrap_config
 from ling.ports.config import (
+    VOICE_KINDS,
     BindingMode,
     DialoguePolicy,
     EffectiveConfig,
@@ -32,7 +33,10 @@ from ling.ports.config import (
     ProfileBinding,
     ProviderConfig,
     ProviderModel,
+    VoiceKind,
+    VoiceSetting,
     VoiceWillingness,
+    voice_requirement_issue,
 )
 from ling.ports.model import (
     SLOT_LABELS,
@@ -268,6 +272,87 @@ def _resolves(payload: dict, profile: str) -> bool:
         # payload 本身有毛病时另有专门的错误，这里不重复报。
         return True
     return config.resolve_profile(profile).usable
+
+
+def _voice_issues(
+    dialogue: object, providers: dict[str, dict]
+) -> list[ValidationIssue]:
+    """音色的校验：**明确的错误，不是静默丢弃**。
+
+    三条规则，各自的理由：
+
+    1. ``kind`` 必须是已知的三家之一。写错了（比如 ``minimax``）如果静默
+       忽略，运行时就只是"没有音色"→ 降级发文字，用户看到的是"语音功能坏了"，
+       而不是"我把音色名打错了"。
+    2. ``voice_id`` / ``reference_asset_id`` 必须与 ``kind`` **配套**——
+       `ports/speech.voice_requirement_issue` 是这条的唯一判定，运行时降级
+       也调它，所以不会出现"保存时说过没问题、跑起来降级"。
+    3. ``reference_asset_id`` 必须是媒体的 sha256（64 位十六进制），且
+       **真的在 media_assets 里**。这一条在这里判不了（要查库，而这函数
+       是纯的），所以只判形态；"素材读不到"由运行时降级处理。
+
+    ## 不跨厂商猜
+
+    ``kind=mimo_tts`` 却只填了 ``voice_id`` **不报错**：那个 id 可能是用户
+    从 MiniMax 那边抄过来的残留。运行时会因为缺 ``reference_asset_id`` 降级，
+    但**不会**拿那个 ``voice_id`` 去喂别家——§17.2 撤销了映射表，代码不替
+    用户做这种翻译。所以这里只在"缺该有的"时报错，不在"多填了别人的"时报错。
+    """
+    data = dialogue if isinstance(dialogue, dict) else {}
+    raw = data.get("voice")
+    if raw is None:
+        # 没配过音色：这是**合法状态**（最多降级发文字），不是校验错误。
+        # 强制每个用户先选音色，会让只想用文字的人连草稿都存不下。
+        return []
+    if not isinstance(raw, dict):
+        return [ValidationIssue("dialogue.voice", "音色配置必须是一个对象")]
+
+    issues: list[ValidationIssue] = []
+    voice = _voice_setting(raw)
+
+    kind_issue = voice_requirement_issue(voice)
+    if kind_issue is not None:
+        field = "dialogue.voice.kind"
+        if voice.kind in VOICE_KINDS:
+            field = (
+                "dialogue.voice.reference_asset_id"
+                if voice.kind == "mimo_tts"
+                else "dialogue.voice.voice_id"
+            )
+        issues.append(ValidationIssue(field, kind_issue))
+        # 已报过"这套音色不能用"，下面的形态检查没有意义。
+        return issues
+
+    if voice.kind is None:
+        # 没选类型却填了参数：多半是清空了一半。说出来，别让用户以为已生效。
+        leftovers = [
+            key
+            for key in ("voice_id", "reference_asset_id")
+            if getattr(voice, key)
+        ]
+        if leftovers:
+            issues.append(
+                ValidationIssue(
+                    "dialogue.voice.kind",
+                    "填了音色参数却没有选音色类型（kind）：选了类型才会被使用",
+                )
+            )
+        return issues
+
+    asset_id = voice.reference_asset_id
+    if voice.kind == "mimo_tts" and asset_id is not None:
+        looks_like_digest = len(asset_id) == _ASSET_ID_HEX_LEN and all(
+            ch in "0123456789abcdef" for ch in asset_id.lower()
+        )
+        if not looks_like_digest:
+            issues.append(
+                ValidationIssue(
+                    "dialogue.voice.reference_asset_id",
+                    "参考素材 id 应该是媒体库里那份音频的 sha256（64 位十六进制）。"
+                    "上传参考音频后取它的 digest 填在这里；不要填文件路径或网址。",
+                )
+            )
+    return issues
 
 
 def _slot_issues(payload: dict, providers: dict[str, dict]) -> list[ValidationIssue]:
@@ -749,6 +834,7 @@ class ConfigService:
                 )
             )
 
+        issues.extend(_voice_issues(payload.get("dialogue"), providers))
         issues.extend(_slot_issues(payload, providers))
         return issues
 
@@ -1128,9 +1214,7 @@ def _apply_patch(
         payload["life"] = _merge_fields(payload["life"], life, _LIFE_BOUNDS)
 
     if dialogue is not None:
-        payload["dialogue"] = _merge_fields(
-            payload["dialogue"], dialogue, _DIALOGUE_BOUNDS, _DIALOGUE_ENUM_KEYS
-        )
+        payload["dialogue"] = _merge_dialogue(payload["dialogue"], dialogue)
 
     if providers is not None:
         merged: dict[str, dict] = {p["provider_id"]: p for p in payload["providers"]}
@@ -1364,6 +1448,32 @@ _DIALOGUE_BOUNDS: dict[str, tuple[float, float]] = {
 # `float()` + `min/max` 处理，混进一个枚举值会在钳制时炸掉。
 _DIALOGUE_ENUM_KEYS: frozenset[str] = frozenset({"voice_willingness"})
 
+# 音色的承载位置：`dialogue.voice`。**不是** `dialogue.voice_kind` 那种平铺。
+#
+# 平铺会让 `_dialogue_to_dict` 的键集合不再是"一个字段一个键"（`voice` 这一个
+# 字段对应八个键），`test_dialogue_serde_covers_every_field` 那条守卫就失效了。
+# 而且"这一整套音色"在语义上是一个整体：`kind` 一换，另外几个参数就属于另一家。
+_DIALOGUE_OBJECT_KEYS: frozenset[str] = frozenset({"voice"})
+
+# 音色里可以钳制的参数。**只有 MiniMax 用得上**，但这不妨碍统一归一化：
+# 别的家读进这些值也不会发出去（运行时按值对象的形状构造）。
+_VOICE_BOUNDS: dict[str, tuple[float, float]] = {
+    "speed": (0.5, 2.0),
+    "vol": (0.0, 10.0),
+    "pitch": (-12, 12),
+}
+
+# 音色里**原样保留的字符串键**：id 与枚举值不做范围钳制（钳不了），
+# 由 `validate_payload` 判合法性与配套关系。
+_VOICE_TEXT_KEYS: frozenset[str] = frozenset(
+    {"kind", "voice_id", "reference_asset_id", "emotion"}
+)
+
+# 参考素材 id 的形态：`media_assets.digest` 是 sha256 十六进制。
+# 在这里写死长度是有意的——把用户填的文件路径/URL 当 asset id 存进去，
+# 运行时才会发现"找不到素材"，而那已经是一次降级了。
+_ASSET_ID_HEX_LEN = 64
+
 # 生活节奏的取值范围。与记忆策略分开一张表，避免两类的键名撞车。
 _LIFE_BOUNDS: dict[str, tuple[float, float]] = {
     "scene_ttl_minutes": (1, 1440),
@@ -1567,6 +1677,20 @@ def _merge_fields(
     return merged
 
 
+def _merge_dialogue(current: object, patch: dict) -> dict:
+    """对话策略的补丁：数值/枚举逐键覆盖，`voice` **交给 `_merge_voice`**。
+
+    `voice` 不能走 `_merge_fields`：它的值是一个 dict，而 `_merge_fields`
+    对 ``None`` 的处理是"当成没改"——那样"取消音色"（显式传 ``None``）
+    永远存不下去。音色要能**真的删掉**，所以它有自己的一份合并。
+    """
+    merged = _merge_fields(current, patch, _DIALOGUE_BOUNDS, _DIALOGUE_ENUM_KEYS)
+    if "voice" in patch:
+        base = current if isinstance(current, dict) else {}
+        merged["voice"] = _merge_voice(base.get("voice"), patch["voice"])
+    return merged
+
+
 # ------------------------------------------------------------------ 对话策略
 
 
@@ -1668,6 +1792,7 @@ def _dialogue_policy(raw: object) -> DialoguePolicy:
             )
         ),
         voice_willingness=_voice_willingness(data.get("voice_willingness"), d.voice_willingness),
+        voice=_voice_setting(data.get("voice")),
     )
 
 
@@ -1693,7 +1818,109 @@ def _voice_willingness(raw: object, default: VoiceWillingness) -> VoiceWillingne
 _DialogueValue = int | bool | float | str
 
 
-def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, _DialogueValue]:
+# ------------------------------------------------------------------ 音色配置
+#
+# 音色是 `dialogue.voice` 里的**一个嵌套 dict**。读/写/补丁三处都要覆盖它：
+#
+# - 读：`_dialogue_policy` → `_voice_setting`
+# - 写：`_dialogue_to_dict` → `_voice_to_dict`
+# - 补丁：`_apply_patch` → `_merge_voice`（整段替换，不按键合并）
+#
+# 为什么补丁是**整段替换**而不是像别的字段那样逐键覆盖：音色参数是一个整体，
+# `kind` 从 minimax 换成 mimo 时，旧的 `voice_id` 就不再属于这一套。逐键合并
+# 会把它们留在 dict 里，运行时虽然按 kind 只取该取的字段，但设置页读回来
+# 会显示"你还填着一个 MiniMax 的 id"，让人以为自己保存错了东西。
+
+
+def _voice_text(raw: object) -> str | None:
+    """把字符串类音色字段归一化：去空白、空串 → ``None``。
+
+    空串与 `None` 必须合成同一个值：否则"清空输入框"会存成 ``""``，而运行时
+    判 `if not value` 与 `if value is None` 的写法各有一套——两套迟早不一致。
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value or None
+
+
+def _voice_setting(raw: object) -> VoiceSetting:
+    """从修订 payload 读出音色。缺键 / 脏值 → 默认值。**不抛异常。**
+
+    与 `_voice_willingness` 同一取舍：配置里的脏值不该让整个设置页读崩。
+    但这里**只做归一化**，合法性（kind 是否已知、id 与 kind 是否配套）交给
+    `validate_payload` 报错——读的时候静默退回默认，会让"存了却读不回来"
+    变成两处不一致的静默行为，而不是一条用户能看到的校验错误。
+    """
+    data = raw if isinstance(raw, dict) else {}
+    defaults = VoiceSetting()
+
+    def _num(key: str, default: float) -> float:
+        value = data.get(key)
+        if value is None:
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        low, high = _VOICE_BOUNDS[key]
+        return min(max(number, low), high)
+
+    pitch_raw = data.get("pitch")
+    try:
+        pitch = int(pitch_raw) if pitch_raw is not None else defaults.pitch
+    except (TypeError, ValueError):
+        pitch = defaults.pitch
+    low, high = _VOICE_BOUNDS["pitch"]
+    pitch = int(min(max(pitch, low), high))
+
+    kind = _voice_text(data.get("kind"))
+    return VoiceSetting(
+        # 未知 kind 原样保留（`cast`）：读进来时"说它是什么"，判定交给校验。
+        # 退回 None 会让"填错了一家名字"看起来像"没填"，用户看不到任何提示。
+        kind=cast("VoiceKind", kind) if kind else None,
+        voice_id=_voice_text(data.get("voice_id")),
+        reference_asset_id=_voice_text(data.get("reference_asset_id")),
+        speed=_num("speed", defaults.speed),
+        vol=_num("vol", defaults.vol),
+        pitch=pitch,
+        emotion=_voice_text(data.get("emotion")),
+    )
+
+
+def _voice_to_dict(voice: VoiceSetting) -> dict[str, object]:
+    """`VoiceSetting` → 可入库的 dict。与 `_dialogue_to_dict` 同一条纪律：
+    每个字段都要在这里列一次，漏了就会"存得住但读不回"。"""
+    return {
+        "kind": voice.kind,
+        "voice_id": voice.voice_id,
+        "reference_asset_id": voice.reference_asset_id,
+        "speed": voice.speed,
+        "vol": voice.vol,
+        "pitch": voice.pitch,
+        "emotion": voice.emotion,
+    }
+
+
+def _merge_voice(current: object, patch: object) -> dict[str, object]:
+    """音色补丁：**整段替换**，但保留未出现在补丁里的键。
+
+    与 `_merge_fields` 的差别只在"没传的键"：这里传了 ``{"kind": None}`` 就是
+    "清空音色"，与"没传 kind"不同。`_merge_fields` 把 ``None`` 当成"没改"，
+    那样"取消音色"就永远存不下去——用户选了"不使用"，刷新后还是旧音色。
+    """
+    base = dict(current) if isinstance(current, dict) else {}
+    if not isinstance(patch, dict):
+        return base
+    merged = dict(base)
+    for key in (*_VOICE_BOUNDS, *_VOICE_TEXT_KEYS):
+        if key in patch:
+            merged[key] = patch[key]
+    # 允许一次补丁里带任意组合；归一化交给 `_voice_setting`（读路径只有一处）。
+    return merged
+
+
+def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, object]:
     """`DialoguePolicy` → 可入库的 dict。
 
     **每个字段都要在这里列一次。** 新增字段忘了补，会在"存得住但读不回"
@@ -1713,4 +1940,5 @@ def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, _DialogueValue]:
         "proactive_delivery_enabled": policy.proactive_delivery_enabled,
         "group_reply_delivery_enabled": policy.group_reply_delivery_enabled,
         "voice_willingness": policy.voice_willingness,
+        "voice": _voice_to_dict(policy.voice),
     }
