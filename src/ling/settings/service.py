@@ -89,7 +89,8 @@ KNOWN_PROFILES = {role.value for role in ModelRole}
 # 只列**有明确降级后果**的职责；没有列的角色缺绑定不会静默降级。
 #
 # 语音三项（speech.asr / speech.tts / realtime.voice）**不在这里**，
-# 也不在可绑清单里：它们的绑定路径压根不存在。见 RESERVED_PROFILES。
+# 也不在可绑清单里：它们绑上之后仍然换不来用户能看见的效果。
+# 见 RESERVED_PROFILES。
 PROFILE_DEGRADATIONS: dict[str, str] = {
     # 记忆提炼**不再借主对话模型代跑**。从前未绑定时它偷偷用 `dialogue.fast`，
     # 而设置页把这条说成"改用主对话模型代跑"——那正是这次要消灭的东西：
@@ -124,15 +125,24 @@ RESERVED_PROFILES: dict[str, str] = {
     # 等真的做出快/慢路由（并且能解释"为什么这次走了 deep"）再挪回可绑清单。
     "dialogue.deep": "尚无实现：目前没有任何代码请求这个角色",
     # 语音三项：**入站链路是真的**（`POST /speech/segments` 落库，
-    # `SpeechService.record_partial/record_final`），但**没有任何代码按
-    # 模型职责去构造 provider**——`AsrProvider` / `TtsProvider` 全仓只有
-    # `UnconfiguredSpeechProvider` 一个实现，`/v1/speech` 直接返回
-    # `configured: False`。也就是说，在这个位置绑一个模型，不会有任何代码
-    # 去读它。展示出来等于承诺"绑上就能听见/说话"，而实际零效果——
+    # `SpeechService.record_partial/record_final`），但绑一个模型仍然换不来
+    # 用户能看见的效果。展示出来等于承诺"绑上就能听见/说话"，而实际零效果——
     # 比没有这个入口更糟：用户会以为自己配错了。
-    # 等真的接上出站 TTS / ASR provider 时，把这三项挪回可绑清单。
     "speech.asr": "尚无实现：入站语音分段已落库，但没有按模型职责构造的 ASR provider",
-    "speech.tts": "尚无实现：没有出站 TTS provider，绑定后不会有任何朗读",
+    # `speech.tts` 与另两项**不再是同一个原因**（2026-11-12 拆开写）：
+    # 出站 provider 已经能按绑定真的构造出来了
+    # （`domains/speech/providers.py::build_tts_provider`，`GET /v1/speech`
+    # 读的就是它），三家的配置、密钥、模型都能通到底。
+    # **缺的是"谁在什么时候调它"**：`[speak]` 能被
+    # `capabilities/expression_choice.py` 解析成 `ExpressionIntent`，但没有任何
+    # 生产代码把结果交给 `SpeechOrchestrator.synthesize()`（那个方法在 `src/`
+    # 里零调用点，只有集成测试手工构造它）。所以绑上也**不会有任何朗读**。
+    # 等出站触发链路接上（`REQUIREMENTS-v0.0.7.md` REQ-10 的"完整回复链"），
+    # 再把这条挪回 `api/routes/settings.py::_OFFERABLE_PROFILES`。
+    "speech.tts": (
+        "尚无实现：TTS provider 已能按绑定构造，但没有出站触发链路"
+        "（[speak] 的解析结果没有任何代码交给合成），绑定后仍不会有任何朗读"
+    ),
     "realtime.voice": "尚无实现：没有实时语音会话实现，绑定后不会有任何效果",
 }
 

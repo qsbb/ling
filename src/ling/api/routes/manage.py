@@ -1058,19 +1058,50 @@ async def revoke_handoff(
 
 
 @router.get("/speech")
-async def speech_status(auth: CurrentAuth) -> dict:
-    from ling.ports.speech import (
-        SPEECH_PROFILE_REQUIREMENTS,
-        UnconfiguredSpeechProvider,
-    )
+async def speech_status(auth: CurrentAuth, config: ConfigDep) -> dict:
+    """语音现状。**TTS 一栏是按当前已发布配置真的装配出来的。**
 
-    provider = UnconfiguredSpeechProvider()
+    从前这里硬编码 `UnconfiguredSpeechProvider()` 并返回写死的
+    `configured: False`——绑了 `speech.tts` 也没有任何代码去读它。
+    现在走 `build_tts_provider`，`tts.available` 反映的是「那家适配器到底
+    造没造出来」，不再是常量。
+
+    **它仍不等于「她会说话」。** 出站触发链路（`[speak]` → 合成 → 投递）
+    还没有生产调用点，`speech.tts` 也仍留在 `RESERVED_PROFILES` 里；
+    `tts.outbound_wired` 把这个事实写进响应，别让 `available: true`
+    被读成"绑上就能听见"。
+    """
+    from ling.domains.speech.providers import build_tts_provider
+    from ling.ports.speech import SPEECH_PROFILE_REQUIREMENTS
+
+    effective = await config.effective()
+    # 密钥**只从库里现读**：`app.state.secret_cache` 是同一个 provider_id 的
+    # 一份进程内副本，用 `.get` 兜底会让「缓存里还是旧密钥」盖住「库里已经换成
+    # 新密钥」——而这里的代价是拿一把废密钥去碰供应商。查询本身就是一次
+    # 主键查找，没有缓存它的理由。
+    async def secret_reader(provider_id: str) -> str | None:
+        return await config.read_secret(provider_id)
+
+    tts = await build_tts_provider(effective, secret_reader=secret_reader)
+
     return {
         "configured": False,
-        "provider_id": provider.provider_id,
+        "provider_id": tts.provider.provider_id,
         "requirements": SPEECH_PROFILE_REQUIREMENTS,
         "status": "已实现未测试：语音流水线与 provider 端口已就绪，未接凭据与设备",
         "blocked_by": "需要语音供应商凭据（ASR/TTS）与手机设备",
+        "tts": {
+            # 装配结论：真的造出了那家的适配器才为 True。
+            "available": tts.ok,
+            "implementation": tts.implementation,
+            "provider_id": tts.provider_id,
+            "model_id": tts.model_id,
+            "kind": tts.kind,
+            "source": tts.source,
+            "reason": tts.reason,
+            # 出站链路（谁把 `[speak]` 交给合成）**仍未接线**。
+            "outbound_wired": False,
+        },
         "rules": [
             "ASR partial 只做字幕，不写记忆、不触发工具",
             "只有 final 进入主链",

@@ -44,6 +44,23 @@ from ling.settings.service import RESERVED_PROFILES
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "ling"
 
+# 「代码**读得到** provider，但用户**看不到**效果」的角色，以及为什么。
+#
+# 这张表是 `test_reserved_profiles_are_not_still_requested` 的唯一豁免来源。
+# 它存在的理由：那条规则把"字符串被按职责请求"当成"功能已交付"，而这两件事
+# 可以分开——`speech.tts` 就是（`domains/speech/providers.py` 真的会按绑定造出
+# 三家适配器，但没有任何代码在回复时调用 `SpeechOrchestrator.synthesize()`）。
+#
+# **只允许往里加"读得到、听不到"的条目**。真正的交付（用户能看到效果）应该
+# 把角色从 `RESERVED_PROFILES` 挪进 `_OFFERABLE_PROFILES`，而不是往这里加一行。
+PROVIDER_READ_BUT_NOT_DELIVERED: dict[str, str] = {
+    "speech.tts": (
+        "domains/speech/providers.py 已能按绑定构造 MiniMax/FishAudio/MiMo 适配器"
+        "（GET /v1/speech 读它），但 [speak] 的解析结果没有任何生产代码交给"
+        " SpeechOrchestrator.synthesize()，所以她仍然不会说话"
+    ),
+}
+
 # 只定义/回显角色、不真正请求它们的地方
 DEFINITION_ONLY = {
     "contracts/v1.py",
@@ -130,15 +147,63 @@ def test_reserved_profiles_are_not_still_requested() -> None:
     """已经接上实现的角色不该还挂在保留名单里。
 
     否则它会被永久排除在设置页之外——功能做了，但用户看不到。
+
+    ## `speech.tts` 为什么可以例外（2026-11-12）
+
+    这条规则的前提是「按职责拿到模型 == 用户能看见效果」。`speech.tts` 打破了
+    这个前提，于是**两种做法会有一边是假的**：
+
+    - 按规则把它移出保留名单 → 设置页出现它 → 承诺"绑上就会说话"，而
+      出站触发链路仍然不存在（`SpeechOrchestrator.synthesize()` 在 `src/`
+      里零调用点，只有集成测试手工构造）。这正是本仓库反复消灭的假承诺。
+    - 把它留在保留名单 → 这条字符串守卫会红，因为它只看"字符串出现过"。
+
+    所以这里改成**显式豁免 + 行为判据**：豁免只对写进
+    `PROVIDER_READ_BUT_NOT_DELIVERED` 的角色开，且另有一条测试
+    （`test_read_but_not_delivered_exemption_is_justified`）要求
+    「读得到 provider」是真的、「用户看不到效果」也是真的。
     """
     blob = _requested_profiles()
     stale = [
         name
         for name in RESERVED_PROFILES
-        if re.search(rf'["\']{re.escape(name)}["\']', blob)
+        if name not in PROVIDER_READ_BUT_NOT_DELIVERED
+        and re.search(rf'["\']{re.escape(name)}["\']', blob)
     ]
-    assert not stale, (
-        f"这些角色已经在代码里被请求，却仍标为保留（用户看不到）：{stale}"
+    assert not stale, f"这些角色已经在代码里被请求，却仍标为保留（用户看不到）：{stale}"
+
+
+def test_read_but_not_delivered_exemption_is_justified() -> None:
+    """豁免的每一条都必须真的"读得到 provider、但用户看不到效果"。
+
+    这条不是文字游戏：它把 `RESERVED_PROFILES` 里那句说明和代码绑在一起。
+    删掉 `domains/speech/providers.py` 的装配实现之后，那段说明（"已能按绑定
+    构造"）就成了假的，这条会红。
+    """
+    from ling.api.routes.settings import _OFFERABLE_PROFILES
+    from ling.domains.speech.providers import TTS_KINDS, TTS_PROFILE
+    from ling.ports.model import kind_supports_profile
+
+    assert set(PROVIDER_READ_BUT_NOT_DELIVERED) <= set(RESERVED_PROFILES), (
+        "豁免表里出现了不在保留名单里的角色"
+    )
+    for name, why in PROVIDER_READ_BUT_NOT_DELIVERED.items():
+        assert why.strip(), f"{name} 的豁免没写理由"
+
+    # `speech.tts` 的豁免靠这三条事实撑住，缺一条它就是假的。
+    assert TTS_PROFILE == "speech.tts"
+    unsupported = [k for k in TTS_KINDS if not kind_supports_profile(k, TTS_PROFILE)]
+    assert not unsupported, f"TTS_KINDS 里有 kind 其实不能服务 speech.tts：{unsupported}"
+    assert len(TTS_KINDS) == 3, (
+        "三家适配器（MiniMax / FishAudio / MiMo）应当都能按绑定构造；"
+        f"实际登记的是 {sorted(TTS_KINDS)}"
+    )
+
+    # 「用户看不到效果」这一半：它不在可绑清单里。哪天进了可绑清单，就不再是
+    # "读得到但听不到"，豁免必须先删掉——这条会先炸。
+    assert "speech.tts" not in _OFFERABLE_PROFILES, (
+        "speech.tts 已经进了可绑清单，`PROVIDER_READ_BUT_NOT_DELIVERED` 里的豁免"
+        "必须删掉；在此之前先确认出站触发链路真的接上了"
     )
 
 

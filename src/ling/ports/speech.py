@@ -569,12 +569,28 @@ class UnconfiguredSpeechProvider:
     def __init__(self, reason: str = "尚未配置语音供应商") -> None:
         self._reason = reason
 
+    def capabilities(self, model_id: str) -> TtsCapabilities:
+        """**什么都不支持**。
+
+        没有这个方法时，一个声明为 `TtsProvider` 的占位实现至少缺一个成员，
+        调用方还能在静态检查里看出来。补上它是为了让"占位"完整地满足端口——
+        也让 `isinstance(x, TtsProvider)` 不再是"能用"的判据
+        （那只是结构符合，见 `domains/speech/providers.TtsBindingView.ok`）。
+        """
+        return TtsCapabilities(formats=frozenset(), streaming="none", cancellable_transport=False)
+
+    async def cancel(self, *, attempt_id: str) -> None:
+        """没有在途请求，取消是空操作。"""
+        return None
+
+    async def aclose(self) -> None:
+        """没有共享 client。"""
+        return None
+
     async def transcribe(self, request: AsrRequest, *, call: SpeechCall) -> AsrResult:
         raise SpeechError(SpeechErrorKind.not_configured, self._reason, retriable=False)
 
-    async def synthesize(
-        self, request: TtsRequest, *, call: SpeechCall
-    ) -> AsyncIterator[TtsEvent]:
+    async def synthesize(self, request: TtsRequest, *, call: SpeechCall) -> AsyncIterator[TtsEvent]:
         """明确失败。**不 yield 伪造音频**——那等于告诉她"我已经说给你听了"。
 
         声明成异步生成器是为了满足 `TtsProvider` 协议的签名；函数体第一句
