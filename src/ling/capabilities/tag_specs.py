@@ -363,7 +363,7 @@ def _feature(env: TurnEnvironment, name: str) -> bool:
 
     ``supports_mention`` / ``supports_quote`` 字段目前**不存在**
     （见 `ENV_CHANNEL_FEATURES` 的说明），所以现在 `getattr` 的默认值
-    确实会被走��——这与 `ContextCompiler.supports_poke` 里那个"永不执行的
+    确实会被走到——这与 `ContextCompiler.supports_poke` 里那个"永不执行的
     getattr 默认值"不同，**这里是真兜底**。加字段之后它才会变成同一类问题，
     届时这条注释和 `ENV_CHANNEL_FEATURES` 要一起删掉。
     """
