@@ -3,7 +3,7 @@
 ## 这个模块只做三件事
 
 1. 把 `SpeechArtifact` 换成渠道能吃的形态（URL / 路径 / base64，由 transport 定）；
-2. 组一条**同时带正文与音频附件**的 `OutboundMessage`；
+2. 组一条**只带音频附件、`text=""`** 的 `OutboundMessage`；
 3. 交给 `DeliveryService.deliver()`，沿用已有的段级幂等与回执语义。
 
 **它不合成。** 合成在 `domains/speech/orchestration.py`。分开是刻意的，理由写在
@@ -13,22 +13,34 @@
 
 ## 「渠道上只发语音，后台显示语音标签 + 文字」
 
-用户原话落地方式：**一条消息，两个面**。
+**一条逻辑消息，两个面，但它们落在两个持久层，不是同一条 wire 消息。**
 
 ```
-   OutboundMessage
-     ├── text        = 正文        ← 后台渲染成文字气泡（带语音标签）
-     └── attachments = [audio]     ← 渠道上真的发出去的那个语音条
+   OutboundMessage              ← wire：真的发给平台的只有这个
+     ├── text        = ""        ← 空串，带音频时 OneBot 仍走
+     └── attachments = [audio]      build_media_segments 的媒体分支
+                                   （`if text:` 不进 text 段；
+                                    `if not segments` 才补空 text 段，
+                                    而这里已经有 record 段了）
+
+   Message.text                 ← 后台：canonical_text（§17.5 已存在那一半）
+   operations.payload           ← 对账：只放 text_digest，不落正文
 ```
 
-**不是文字发两遍。** 这里的关键是 OneBot 的 `voice.py` 已经规定了「一个语音条
-= 一个 part，payload 里只有一个 `record`，不掺 `text`」（见那个模块的规则 1）。
-所以 `text` 只进 `operations.payload` 的摘要与本地记录，不进 `record` 段。
+**外发不带正文**，设计文档 `docs/design/SPEECH-IO-ARCHITECTURE.md`
+§17.5「默认只发语音，后台显示语音标签与文字」原文：
 
-反过来说，**不能**因为"渠道只发语音"就把 `message.text` 置空：
-- 后台拿不到正文，用户看到一条空消息 + 一个播放器，不知道她说了什么；
-- `DeliveryService` 的 `delivery_text_digest` 是对账用的证据，正文为空时
-  无法与平台历史比对，`uncertain` 就永远收敛不了。
+> | 对方的平台消息 | `OutboundMessage(text="", attachments=[audio asset], mentions=[], ...)`；
+> 一个语音 part，无 caption、无正文、**无补空格**／额外 @ 文本。平台确实需要
+> 装饰时也不能泄漏正文 |
+
+> **`OutboundMessage.text` 是 wire text，不能兼做后台转写。**「后台语音标签＋文字」
+> 不等于发送器收到文字副本。
+
+所以：`text` 必须是 `""`，**不是 `" "`**——补空格就是文档点名禁止的"补空格"，
+而且 `text=" "` 外发出去是一条正文只有空白的消息。后台与对账各走各的路：
+后台读 `Message.text`，对账读 `text_digest`（见 `ports/channel.py` 里
+`delivery_text_digest` 的说明：抄正文进 `operations.payload` 等于开第二份副本）。
 
 ## 幂等分两层，各自管各自的账
 
@@ -45,12 +57,23 @@
 
 ## 降级：合成失败时发什么
 
-`speech_fallback` 有三种，对应三种不同的用户预期：
+`SpeechFallback` 有三种，对应三种不同的用户预期：
 
-- ``text``（默认）：**静默退回纯文字**。用户本来要的是一条回复，语音是形态；
-  形态拿不到时内容仍然送到，这是最不打扰的降级。
-- ``notice``：文字 + 一句"语音没合成出来"。适合调试期或用户明确在意语音时。
-- ``silent``：**什么都不发**。只给"语音是我的唯一表达方式"这种极端配置用。
+- ``text``：**静默退回纯文字**。形态拿不到时内容仍然送到。
+- ``notice``：文字 + 一句"语音没合成出来"。
+- ``silent``（默认）：**什么都不发**。
+
+默认是 `silent`，依据同一节：
+
+> 合成／转码／投递失败默认**不把原话改发文字**；只记录准确状态，后台可重试。
+> 对方需要文字时由其明确请求后形成新的文字选择，或以后另设显式降级策略
+> （**不在本期偷偷默认开启**）。
+
+"不偷偷"不等于"永远不许"——`text` / `notice` 两个选项本身保留，由调用方显式
+传 `fallback=` 就能选到（`tests/integration/test_speech_orchestration.py` 各有一条
+守着）。**但当前没有任何配置读点能选到它们**：`resolve_fallback()` 的唯一生产
+调用点是 `worker.py:2838` 的 `resolve_fallback(None)`，全仓也没有
+`speech_fallback` 配置字段。把它接到 `settings/` 是另一步的工作，**本轮未接线**。
 
 **绝不**降级成"假装发了语音"——那是本仓库反复防的那类事实伪造。
 """
@@ -77,24 +100,36 @@ logger = logging.getLogger("ling.capabilities.speech_delivery")
 
 
 class SpeechFallback(StrEnum):
-    """合成失败时的降级方式。由配置给（`speech_fallback`）。"""
+    """合成失败时的降级方式。
+
+    **当前没有配置读点能选到它**：`resolve_fallback()` 的唯一生产调用点是
+    `worker.py:2838` 的 `resolve_fallback(None)`，全仓也没有 `speech_fallback`
+    配置字段。三个值都可以由调用方显式传 `fallback=` 用起来；接到 `settings/`
+    是另一步的工作。
+    """
 
     text = "text"
-    """静默退回纯文字（默认）。"""
+    """静默退回纯文字（**需要显式选择**，不是默认）。"""
 
     notice = "notice"
     """文字 + 一句语音没合成出来的说明。"""
 
     silent = "silent"
-    """什么都不发。"""
+    """什么都不发（**默认**）。"""
 
 
-#: 非法/缺失的配置值一律按 `text` 处理。
+#: 非法/缺失的配置值一律按 `silent` 处理。
 #:
-#: 为什么不退到 `silent`：配置写错时**用户会完全收不到回复**，而错因是
-#: 一个我们自己的字符串拼写问题——惩罚完全落在用户身上。退到 `text`
-#: 至少话还是送到了。
-DEFAULT_FALLBACK = SpeechFallback.text
+#: 依据设计文档 §17.5（`docs/design/SPEECH-IO-ARCHITECTURE.md`）：
+#:
+#: > 合成／转码／投递失败默认**不把原话改发文字**；只记录准确状态，后台可重试。
+#: > ……不在本期偷偷默认开启。
+#:
+#: 原先这里取 `text`，理由是"配置写错时用户至少还能收到话"。那条理由**方向反了**：
+#: 它把"替用户决定降级成文字"当成了安全默认，而文档明确禁止偷偷补文字。语音
+#: 失败时要记的是**准确状态**（`SpeechDeliveryState.text_only` + detail），由后台
+#: 重试或由对方明确请求文字；"话送到了"不能靠偷换表达形态来换。
+DEFAULT_FALLBACK = SpeechFallback.silent
 
 
 def resolve_fallback(value: str | None) -> SpeechFallback:
@@ -203,10 +238,37 @@ class SpeechDelivery:
         audio_ref: str,
         mime_type: str,
     ) -> OutboundMessage:
-        """组一条**同时带正文与音频附件**的出站消息。
+        """组一条**只带音频附件**的出站消息（`text=""`）。
 
-        正文与附件是**同一份内容**的两个面，不是两条消息：
-        正文给后台展示（"语音标签 + 文字"），附件给渠道发出去。
+        ## 外发 `text=""`
+
+        设计文档 §17.5（`docs/design/SPEECH-IO-ARCHITECTURE.md`）规定的 wire 形态：
+
+        > `OutboundMessage(text="", attachments=[audio asset], mentions=[], ...)`；
+        > 一个语音 part，无 caption、无正文、**无补空格**／额外 @ 文本。
+
+        空串不是"随便挑一个空值"：`connectors/onebot/message.py::build_media_segments`
+        里 `if text:` 才加 text 段，`text=""` 不进任何 text 段；只有"完全没有任何段"
+        时才补一个空 text 段，而这里已经有语音段了，所以整条消息照发。
+        **不能写成 `" "`**——那是文档点名禁止的"补空格"，会外发一条只有空白的正文。
+
+        ## 后台投影由 `Message.text` 承担（不是这个参数）
+
+        同一节：**`OutboundMessage.text` 是 wire text，不能兼做后台转写**。
+        后台 owner/admin 要看的 `[语音] 完整文字` + 播放器 + 状态，其文字那一半
+        已经在 `infra/models.py::Message.text`（`canonical_text`）里了——那是
+        `TurnCoordinator` 落的行，**本类不写**。所以这里不需要、也不应该把正文
+        塞进 `payload_extra`：`operations.payload` 按 `ports/channel.py` 里
+        `delivery_text_digest` 的约定"只存摘要，不存正文"，而且
+        `domains/media/playback.py` 已经在读 `Operation.payload`——那是一条
+        参与者可达的路径。
+
+        ## §17.5 要求的显式 operator view／普通参与者 403：本轮未做
+
+        那需要 `Message.output_modality` / `audio_asset_id` / `speech_state`
+        三个字段（当前 `grep -c output_modality src/ling/infra/models.py` = 0），
+        要新迁移。本轮只修正外发形态与降级默认值，**后台投影的权限边界仍未落地**：
+        现在没有任何 operator-only 入口，也没有"普通参与者请求 operator 返回 403"。
 
         `audio_ref` 是渠道能解析的引用（`asset:<digest>` / 签名 URL /
         `file:///…`），由 `resolve_audio_ref()` 按 transport 算出。
@@ -214,7 +276,8 @@ class SpeechDelivery:
         return OutboundMessage(
             operation_id="",  # 由 DeliveryService.deliver 填入真实的 operation id
             window_ref=request.window_ref,
-            text=request.text,
+            # 空串，不是 `request.text`，也不是 `" "`：见上面 §17.5 的原文。
+            text="",
             reply_to=request.reply_to,
             # **用类型化附件**，不碰 legacy `media_refs`：后者一律被当作图片，
             # 语音走那条路会被当成一张图发出去（见 onebot/voice.py 开头的说明）。
@@ -223,8 +286,8 @@ class SpeechDelivery:
                     kind=AttachmentKind.audio,
                     ref=audio_ref,
                     mime_type=mime_type,
-                    # 刻意**不填 caption**：说了什么已经在正文里了，
-                    # 再加一句说明会变成"语音 + 重复的文字"。
+                    # 刻意**不填 caption**：文档要求"无 caption"。正文不在 wire 上，
+                    # 加一句说明就变成"语音 + 文字副本"。
                     caption=None,
                 )
             ],
@@ -309,7 +372,10 @@ class SpeechDelivery:
     ) -> SpeechDeliveryOutcome:
         """完整投递：有音频就发语音，没有就按 `fallback` 降级。
 
-        这是本模块唯一的入口。它自己决定"发语音"还是"只发文字"，
+        默认的 `fallback` 是 `silent`——**不把原话改发文字**（§17.5）。降级发字
+        必须由调用方显式传 `text` / `notice` 才发生。
+
+        这是本模块唯一的入口。它自己决定"发语音"还是"降级"，
         调用方不需要（也不应该）在两处各判一次——那种重复判断迟早会分叉。
         """
         if intent.output_modality != "voice":
@@ -387,7 +453,14 @@ class SpeechDelivery:
         fallback: SpeechFallback,
         fallback_notice: str,
     ) -> SpeechDeliveryOutcome:
-        """语音拿不到时的降级。**文字仍然要送到。**"""
+        """语音拿不到时的降级。
+
+        `silent`（默认）：**什么都不发**，只把失败事实（`detail` 里带原因）如实
+        记成 `text_only`。依据 §17.5「合成／转码／投递失败默认不把原话改发文字；
+        只记录准确状态，后台可重试」。
+
+        `text` / `notice`：调用方**显式**选了才发文字。那时文字仍然要送到。
+        """
         reason = outcome.detail or "语音合成未完成"
 
         if fallback is SpeechFallback.silent:

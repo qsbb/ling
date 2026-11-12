@@ -579,7 +579,10 @@ async def _run_delivery(
     *,
     intent=None,  # noqa: ANN001
     text: str = "我今天有点累，但看到你消息还是挺高兴的。",
-    fallback: SpeechFallback = SpeechFallback.text,
+    # 默认跟 `DEFAULT_FALLBACK` 一致（`silent`）：各用例要"补文字"就**显式**
+    # 传 `text` / `notice`。这里原来写死 `text`，于是每个用例都在不知不觉中
+    # 依赖"失败会补文字"这个错误默认。
+    fallback: SpeechFallback = SpeechFallback.silent,
     connector: FakeConnector | None = None,
 ):  # noqa: ANN202
     """跑一次投递，返回 (结果, 假渠道, 假投递服务)。"""
@@ -607,11 +610,16 @@ async def _run_delivery(
     return result, connector, delivery
 
 
-async def test_语音投递只发一条且同时带正文与音频(web_env, tmp_path) -> None:
-    """用户原话的核心：「只发语音（渠道），后台显示语音标签 + 文字」。
+async def test_语音投递只发一条_外发无正文(web_env, tmp_path) -> None:
+    """「只发语音（渠道），后台显示语音标签 + 文字」。
 
-    一条消息，两个面：`text` 给后台渲染，`attachments=[audio]` 是渠道上
-    真的发出去的东西。**不是文字发两遍。**
+    **这条的判据当初写反了。** 它原名 `..._且同时带正文与音频`，断言
+    `sent.text.strip()` 非空，把「正文与语音同时外发」当成了正确行为——而需求
+    一直要求「外发不带正文」（§17.5：`OutboundMessage(text="", ...)`，无 caption、
+    无正文、**无补空格**）。改它不是实现变了，是因为判据一直错。
+
+    后台那一面（`[语音] 完整文字`）不在 wire 上，它由 `Message.text` 承担；
+    摘要与正文都不进 `operations.payload`。
     """
     tts = FakeTts()
     outcome, _ = await _orchestrate(tmp_path, tts, make_request())
@@ -622,7 +630,9 @@ async def test_语音投递只发一条且同时带正文与音频(web_env, tmp_
     assert connector.send_calls == 1, f"发了 {connector.send_calls} 条，应该只有 1 条"
 
     sent = connector.sent[0]
-    assert sent.text.strip(), "正文不能为空：后台要靠它显示「语音标签 + 文字」"
+    # 精确等于空串：`" "`（补空格）也会让它通过 `not sent.text.strip()`，
+    # 而 §17.5 明确禁止补空格。
+    assert sent.text == "", f"外发消息里带了正文（应为空串）：{sent.text!r}"
     assert len(sent.attachments) == 1
     attachment = sent.attachments[0]
     assert attachment.kind is AttachmentKind.audio, "语音必须用类型化 audio 附件"
@@ -649,21 +659,30 @@ async def test_语音投递只发一条且同时带正文与音频(web_env, tmp_
     assert delivery.calls[0]["part_ordinal"] == 0
 
 
-async def test_合成失败默认静默降级为纯文字(web_env, tmp_path) -> None:
-    """语音没合成出来时，**内容仍然要送到**——语音是形态，不是内容。"""
+async def test_合成失败默认什么都不发(web_env, tmp_path) -> None:
+    """合成失败、**没有**显式降级配置 → 什么都不发，只如实记状态。
+
+    **判据当初写反了。** 原名 `..._默认静默降级为纯文字`，断言"正文必须原样
+    送到"。§17.5 明写：「合成／转码／投递失败默认**不把原话改发文字**；只记录
+    准确状态，后台可重试」。改它不是因为实现变了。
+
+    `text_only` 这个状态名保留（"这一轮不是语音"），但它现在也涵盖"静默"——
+    真正的区分在 `detail` 与"有没有发出东西"。
+
+    **必须失败于**「`DEFAULT_FALLBACK` 退回 `text`」：那时 `send_calls == 1`
+    且正文被补发出去。
+    """
     tts = FakeTts(
         fail_with=SpeechError(SpeechErrorKind.unsupported, "文本过长", retriable=False)
     )
     outcome, _ = await _orchestrate(tmp_path, tts, make_request())
-    result, connector, delivery = await _run_delivery(tmp_path, outcome)
+    result, connector, _delivery = await _run_delivery(tmp_path, outcome)
 
-    assert result.state is SpeechDeliveryState.text_only
-    assert connector.send_calls == 1
-    sent = connector.sent[0]
-    assert sent.attachments == [], "降级时不该带任何音频附件"
-    assert "我今天有点累" in sent.text, "正文必须原样送到"
-    assert "没合成出来" not in sent.text, "默认 text 降级不该加说明"
-    assert delivery.calls[0]["payload_extra"]["speech_fallback"] == "text"
+    assert result.state is SpeechDeliveryState.text_only, "静默不是失败，要如实记成降级"
+    assert connector.send_calls == 0, (
+        f"默认降级偷偷发了 {connector.send_calls} 条：{[m.text for m in connector.sent]}"
+    )
+    assert "静默" in result.detail, f"状态里要说清是静默不发：{result.detail!r}"
 
 
 async def test_notice降级会加一句说明(web_env, tmp_path) -> None:
@@ -788,11 +807,21 @@ async def test_状态编码往返可逆且陌生值按不确定处理() -> None:
     assert decode_state("")[0] is SynthesisState.uncertain
 
 
-async def test_降级配置非法值退回文字而不是静默() -> None:
-    """配置写错时用户不该**完全收不到回复**——退回 text，并记 warning。"""
-    assert resolve_fallback(None) is SpeechFallback.text
+async def test_降级配置缺失或非法一律落到不补文字() -> None:
+    """缺失 / 非法值 → 默认（`silent`），并记 warning；合法值原样解析。
+
+    **判据当初写反了。** 原来断言"退回 text，因为用户不该完全收不到回复"——
+    那正是 §17.5 禁止的"偷偷默认开启"。缺省与写错都落到"不补文字"，是文档
+    要求的保守方向：宁可只记状态、后台重试，也不替用户改表达形态。
+
+    注意：`text` / `notice` **仍然可以解析到**（它们只是不再是默认）。
+    """
+    assert resolve_fallback(None) is SpeechFallback.silent
     assert resolve_fallback("silent") is SpeechFallback.silent
-    assert resolve_fallback("不存在的值") is SpeechFallback.text
+    assert resolve_fallback("不存在的值") is SpeechFallback.silent
+    # 显式配置仍可用：默认改了，不等于把这两个选项删掉了。
+    assert resolve_fallback("text") is SpeechFallback.text
+    assert resolve_fallback("notice") is SpeechFallback.notice
 
 
 # --------------------------------------------------------------------------- #

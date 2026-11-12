@@ -16,10 +16,15 @@
 
 ## 四条边界，各打一条
 
-1. `[speak]` + 已绑 TTS → 真的合成 + 语音投递（正文与音频**同一条**消息）；
+1. `[speak]` + 已绑 TTS → 真的合成 + 语音投递（外发**只有音频**，`text=""`）；
 2. 没用 `[speak]` → 纯文字，**没有**任何语音降级痕迹（TTS 一次都不碰）；
-3. `[speak]` + **未绑** TTS → 降级发文字，**不是**静默失败；
-4. `[speak]` + 合成失败 → 同样降级发文字。
+3. `[speak]` + **未绑** TTS → 这一轮没语音，但仍在装配阶段，**正文照发**；
+4. `[speak]` + 合成失败 → **默认什么都不发**（不偷偷补文字），状态如实记录。
+
+**3 与 4 不是同一件事，判据也不同。** 3 发生在 `_prepare_speech_reply` 返回
+`None`（装配没成），那一轮压根没有表达形态可选，正文照发；4 发生在她**已经选了
+语音**、意图已经在途之后才失败——§17.5 要求这种失败"不把原话改发文字"。
+把 3 也改成不发，会让"没配音色"这种运维状态吞掉她的整条回复。
 
 ## 它**不能**证明什么
 
@@ -39,6 +44,7 @@ import pytest
 from sqlalchemy import select
 
 import ling.worker as worker_module
+from ling.capabilities.speech_delivery import SpeechDeliveryRequest, SpeechDeliveryState
 from ling.contracts.v1 import (
     CapabilityDescriptor,
     DeliveryReceipt,
@@ -72,6 +78,10 @@ AUDIO = b"ID3\x04\x00\x00\x00\x00\x00\x00" + bytes(range(256)) * 4
 
 #: 语音标签。字面量**不从被测模块取**：取的话模块里改坏了标签，测试跟着坏。
 SPEAK = "[speak]"
+
+#: 空串（以及纯空白）的 `delivery_text_digest`。语音消息的 `text=""` 让它成为
+#: 每条语音 operation 的 `text_digest`——见 `test_正文在Message里_...` 的说明。
+EMPTY_TEXT_DIGEST = "sha256:e3b0c44298fc1c149afbf4c8996fb924"
 
 
 # --------------------------------------------------------------------------- #
@@ -373,10 +383,11 @@ async def test_speak_with_tts_really_synthesizes_and_sends_voice(
     audio = _audio(message)
     assert len(audio) == 1, f"外发的消息里没有语音附件：{message.attachments}"
     assert audio[0].ref, "语音附件没有可解析的引用"
-    # 「渠道上只发语音，后台显示语音标签 + 文字」：**一条消息两个面**。
-    assert message.text == "今天有点累，但看到你消息还是挺高兴的。", (
-        f"正文丢了或带了标签：{message.text!r}"
-    )
+    # **外发不带正文**（§17.5：「无 caption、无正文、无补空格」）。
+    #
+    # 这条断言原来写的是 `message.text == "今天有点累…"` —— 那一条把
+    # 「正文与语音同时外发」断言成了正确行为。判据一直错，不是实现变了。
+    assert message.text == "", f"外发消息里带了正文（应为空串）：{message.text!r}"
 
 
 async def test_library_shows_speech_tag_and_text(
@@ -386,6 +397,11 @@ async def test_library_shows_speech_tag_and_text(
 
     operation 的 `speech.digest` 是后台显示"语音"标签的依据，`text_digest` 是
     正文的摘要（对账用）。少了任何一个，后台就只能显示一条空消息或一个播放器。
+
+    **这条的判据当初写反了一半。** 它原来还断言「正文在 operation 的摘要里」，
+    暗示正文该跟着语音一起走；但 §17.5 说的是**摘要**（不能还原），而完整正文
+    在 `Message.text` 里。所以现在：operation 侧只守摘要（能比对、不能还原），
+    正文那一半改由 `test_后台仍能看到正文_而外发正文为空` 守。
     """
     _bind_tts(monkeypatch, FakeTts())
     _give_voice(monkeypatch)
@@ -527,13 +543,20 @@ async def test_no_voice_configured_degrades_instead_of_guessing(
 # --------------------------------------------------------------------------- #
 
 
-async def test_synthesis_failure_degrades_to_text(
+async def test_synthesis_failure_sends_nothing_by_default(
     logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
 ) -> None:
-    """合成抛错 → **降级发文字**，不是静默失败。
+    """合成抛错 → **默认什么都不发**，也不是把这一轮判成失败。
 
-    **必须失败于**「合成失败就当这一轮失败」：那种实现下 `delivered` 是 False
-    且 `connector.sent` 为空——用户什么也收不到。
+    **判据当初写反了。** 这条原来叫 `..._degrades_to_text`，断言「正文必须
+    发出去」；§17.5 明写「合成／转码／投递失败默认**不把原话改发文字**；只记录
+    准确状态，后台可重试」。所以现在守着的是三件事同时成立：
+
+    - 合成**真的被尝试过**（`failing.calls == 1`）——否则证明的不是降级，是没接线；
+    - 外发**零条**（没有偷偷补文字，也没有补一条空消息）；
+    - 这一轮**没有被判成失败**（`delivered is True`）——"没发"不等于"投递故障"。
+
+    降级发文字仍然可选，由 `test_显式text降级才补文字` 守着。
     """
     failing = FakeTts(fail_with=SpeechError(SpeechErrorKind.unavailable, "上游 503"))
     _bind_tts(monkeypatch, failing)
@@ -547,10 +570,10 @@ async def test_synthesis_failure_degrades_to_text(
 
     assert delivered is True, f"合成失败不该把整轮回复判成失败：{reason}"
     assert failing.calls == 1, "合成没有被尝试（那证明的不是降级，是没接线）"
-    assert len(connector.sent) == 1, "合成失败后正文没有发出去"
-    message = connector.sent[0]
-    assert not _audio(message), "合成失败却发了音频附件？"
-    assert message.text == "合成会失败，但话得送到。", message.text
+    assert not connector.sent, (
+        f"合成失败后偷偷补发了 {len(connector.sent)} 条："
+        f"{[getattr(m, 'text', None) for m in connector.sent]}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -724,7 +747,11 @@ async def test_configured_minimax_voice_really_synthesizes(
     assert len(connector.sent) == 1
     message = connector.sent[0]
     assert _audio(message), f"配了音色却发了纯文字（降级了）：{message.attachments}"
-    assert message.text == "配了音色就该出声。", message.text
+    # 2026-11-12 修正：原来的 `message.text == "配了音色就该出声。"` 把
+    # 「语音 + 正文同时外发」当成了正确形态。§17.5 的 wire 形态是
+    # `OutboundMessage(text="", attachments=[audio], ...)`——外发**没有**正文。
+    # 判据一直错，不是因为实现变了。
+    assert message.text == "", f"外发消息里带了正文（应为空串）：{message.text!r}"
 
 
 async def test_configured_voice_of_another_provider_does_not_guess(
@@ -757,3 +784,369 @@ async def test_configured_voice_of_another_provider_does_not_guess(
     assert tts.calls == 0, "跨厂商硬塞了音色（§17.2 撤销了映射表，不该猜）"
     assert not _audio(connector.sent[0])
     assert connector.sent[0].text == "别猜我的声音。"
+
+
+# --------------------------------------------------------------------------- #
+# 六、外发形态与后台投影：§17.5 的 wire 契约（REQ-12）
+#
+# 这一节守的是设计文档 `docs/design/SPEECH-IO-ARCHITECTURE.md` §17.5 的两句话：
+#
+#   > `OutboundMessage(text="", attachments=[audio asset], mentions=[], ...)`；
+#   > 一个语音 part，无 caption、无正文、**无补空格**／额外 @ 文本。
+#
+#   > 合成／转码／投递失败默认**不把原话改发文字**；只记录准确状态，后台可重试。
+#
+# 在此之前，实现与测试**两边都反着**：外发带正文、失败默认补文字。所以这里的
+# 每条都同时是「新行为」与「旧判据写反了」的证据。
+# --------------------------------------------------------------------------- #
+
+
+async def test_外发的语音消息正文是空串(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """§17.5：外发 `OutboundMessage.text` **精确等于空串**。
+
+    **必须失败于**「外发带正文」（`text=request.text`）：那时它是"听到了吗"。
+    **必须也失败于**「补空格」（`text=" "`）：所以断言是 `== ""`，不是
+    `not text.strip()`——后者会让 `" "` 通过，而设计文档点名禁止"补空格"。
+    """
+    _bind_tts(monkeypatch, FakeTts())
+    _give_voice(monkeypatch)
+    connector = FakeConnector()
+
+    delivered, reason = await _run_reply(
+        logged_in, monkeypatch, reply_text=f"{SPEAK} 听到了吗", connector=connector
+    )
+    assert delivered is True, reason
+    assert len(connector.sent) == 1, f"期望一条消息，实际 {len(connector.sent)}"
+
+    message = connector.sent[0]
+    # 先钉住"这确实是语音消息"：没有音频时下面断言正文为空也成立，
+    # 那样它证明不了任何与语音有关的事。
+    assert len(_audio(message)) == 1, f"没有发出语音：{message.attachments}"
+    assert message.text == "", (
+        f"外发消息的 text 应为空串，实际 {message.text!r}（带正文 = 泄漏；"
+        f"' ' = 补空格，两者都被 §17.5 禁止）"
+    )
+
+
+async def test_外发段里语音前面没有正文段(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """§17.5：平台上那条消息**没有正文段**（也不靠一个空 text 段占位）。
+
+    这条走 OneBot **真实**的 `build_outbound_segments`，而不是看我们自己的
+    `OutboundMessage` 长什么样——两者不是一回事：构造出 `text=""` 之后，
+    如果渠道适配器自己补了东西，用户的平台上仍然会出现文字。
+
+    **必须失败于**「外发带正文」：`text="听到了吗"` 会多出一个
+    `{'type': 'text', 'data': {'text': '听到了吗'}}` 段。
+    **必须失败于**「补空格」：`text=" "` 会多出一个 `text == " "` 的段。
+    """
+    from connectors.onebot.message import build_outbound_segments
+
+    from ling.ports.channel import iter_outbound_attachments
+
+    _bind_tts(monkeypatch, FakeTts())
+    _give_voice(monkeypatch)
+    connector = FakeConnector()
+
+    delivered, reason = await _run_reply(
+        logged_in, monkeypatch, reply_text=f"{SPEAK} 听到了吗", connector=connector
+    )
+    assert delivered is True, reason
+
+    message = connector.sent[0]
+    voice_segments = [
+        {"type": "record", "data": {"file": a.ref}} for a in iter_outbound_attachments(message)
+    ]
+    assert len(voice_segments) == 1, f"语音段没构造出来：{voice_segments}"
+
+    segments = build_outbound_segments(
+        message.text,
+        media_refs=list(message.media_refs),
+        # §17.5 的 wire 形态里 `mentions=[]`：带 @ 时 `build_outbound_segments`
+        # 会为了排版垫一个空格 text 段（那是它处理 @ 的既有行为，与正文无关），
+        # 所以另有一条 `..._带艾特时也只多一个空格段` 把 @ 的情形钉在"只有空格"上。
+        mention_ids=[],
+        reply_to=None,
+        voice_segments=voice_segments,
+    )
+    # **实测**：`text=""` 时 `build_media_segments` 虽然不进 text 段，但它的
+    # `if not segments` 兜底会补一个 `{'type': 'text', 'data': {'text': ''}}`。
+    # 那是**空段**（平台上不可见），不是正文——所以这里断言"所有 text 段都为空"，
+    # 而不是"没有 text 段"。
+    text_segments = [s for s in segments if s["type"] == "text"]
+    assert [s["data"]["text"] for s in text_segments] == [""], (
+        f"语音消息的 wire 上出现了非空 text 段（正文泄漏）：{segments}"
+    )
+    # 正向配对：语音段**确实**在，且排在最后。否则"没有正文"在"什么都没发"
+    # 的实现下也成立。
+    assert segments[-1] == voice_segments[0], segments
+    assert [s["type"] for s in segments if s["type"] != "text"] == ["record"], segments
+
+
+def test_语音消息带艾特时也只多一个空格段() -> None:
+    """带 @ 时 `build_outbound_segments` 会垫一个空格段——但**只有空格**。
+
+    这是"补空格"唯一允许出现的位置（为了 @ 与正文不黏连的排版），而且此时
+    **没有正文**。断言整条消息里所有 text 段都是空白（`" "` 与 `""`），
+    并且**没有一段含正文**——`data.text` 为空串/空格不等于"没泄漏"，要另配
+    一条正向对照证明"真带正文时它会出现在某一段里"。
+
+    **必须失败于**「外发 `text` 带正文」：那样会多出一个 `text == "听到我了吗"`
+    的段，下面的正向对照正是同一个形态。
+    """
+    from connectors.onebot.message import build_outbound_segments
+
+    body = "听到我了吗"
+    voice = [{"type": "record", "data": {"file": "asset:abc"}}]
+
+    # 空串（= 实现现在的 `text=""`）：@ 只带来"@ 段 + 空格段 + 空段"，没有正文。
+    segments = build_outbound_segments(
+        "", mention_ids=["100200300"], voice_segments=voice
+    )
+    assert [s["type"] for s in segments] == ["at", "text", "text", "record"], segments
+    assert all(s["data"]["text"].strip() == "" for s in segments if s["type"] == "text"), (
+        segments
+    )
+    assert body not in str(segments)
+    assert segments[-1] == voice[0], "语音段必须在最后"
+
+    # 反向配对：真的带正文时，正文**会**作为独立 text 段出现——证明上面
+    # "没有正文"不是一句同义反复。
+    leaked = build_outbound_segments(
+        body, mention_ids=["100200300"], voice_segments=voice
+    )
+    assert {"type": "text", "data": {"text": body}} in leaked, leaked
+
+
+async def test_正文在Message里_外发正文为空_不落payload(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """正文落在 `Message.text`（后台那一面），**不进** `operations.payload`。
+
+    判据的两侧各管一件事，缺一半就没有区分力：
+
+    - `Message.text` 有完整正文 → "外发不带正文"**不是**把内容弄丢了；
+      §17.5 的 Message 行写的是 `text=canonical_text`。
+    - `operations.payload` **没有**那个非空 text 段（没有 `text` 键、没有
+      `text_digest`）→ 不落第二份正文，也不落它的摘要。依据
+      `ports/channel.py::delivery_text_digest`：「把回复正文抄进
+      `operations.payload` 等于给内容开第二份副本」。
+
+    `Message` 那一行由 `TurnCoordinator` 落，而本文件把 `TurnCoordinator`
+    替换成了假件（它不写库），所以这里**直接构造**那条 actor 消息作为前置
+    条件——这条测试守的是"投递 operation 不落正文"，不是"谁写了 Message"。
+
+    **必须失败于**「把正文塞进 payload_extra」（例如为了"后台能显示"而补一份）：
+    那时 `payload` 里会出现 `text` 或非空 `text_digest`。
+    """
+    from ling.infra.security import new_id
+
+    _bind_tts(monkeypatch, FakeTts())
+    _give_voice(monkeypatch)
+    connector = FakeConnector()
+
+    window = await _make_window(logged_in, channel="onebot")
+    # 前置条件：后台那一面已经有完整正文（`canonical_text`，剥掉 `[speak]`）。
+    async with session_scope() as session:
+        session.add(
+            Message(
+                id=new_id("msg"),
+                window_id=window.id,
+                role="actor",
+                text="听到了吗",
+                state="completed",
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    _patch_turn_coordinator(monkeypatch, f"{SPEAK} 听到了吗")
+    async with session_scope() as session:
+        delivered, reason = await worker_module._reply_in_group_window(
+            session=session, config=await _config(session), window=window, result=_Result()
+        )
+    assert delivered is True, reason
+    assert len(_audio(connector.sent[0])) == 1, "没有发出语音：下面的断言证明不了接线"
+
+    async with session_scope() as session:
+        actors = list(
+            (await session.execute(select(Message).where(Message.role == "actor"))).scalars()
+        )
+    assert len(actors) == 1, f"期望一条 actor 消息，实际 {len(actors)}"
+    assert actors[0].text == "听到了吗", (
+        f"后台拿不到她说的完整正文：Message.text={actors[0].text!r}"
+    )
+
+    rows = await _deliveries()
+    assert len(rows) == 1, f"期望一条投递 operation，实际 {len(rows)}"
+    payload = dict(rows[0].payload or {})
+    assert "text" not in payload, f"正文被写进了 operations.payload：{payload['text']!r}"
+    # 摘要只允许是**空正文**的摘要。`DeliveryService` 对每条消息都算
+    # `delivery_text_digest(message.text)`，而 `text=""` 时它恒等于常量
+    # `sha256:e3b0c44298…`——所以这里能断言的只有"没有落**非空**摘要"。
+    #
+    # 已知缺陷（本轮**未修**，见报告）：那个常量摘要违反 §17.5「禁止空
+    # text_digest 匹配所有语音」——任何两条省略正文的消息摘要相同，对账时
+    # 无法用摘要区分它们。修它要改 `delivery.py` 里的摘要写入条件，超出本轮
+    # 只修两处方向的范围。
+    assert payload.get("text_digest") in (None, EMPTY_TEXT_DIGEST), (
+        f"正文摘要落了 operations.payload：{payload.get('text_digest')}"
+    )
+    # 正向配对：这条 operation 确实是那条语音的。否则"没落正文"在"根本没建
+    # operation"时也成立。
+    assert payload["speech"]["digest"], payload
+
+
+async def test_显式text降级才补文字(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """合成失败 + **显式** `fallback=SpeechFallback.text` → 才补发正文。
+
+    §17.5 说的是"不**偷偷**默认开启"，不是"永远不许"。所以默认改为不发之后，
+    这个选项必须仍然可用、仍然真的会发——否则修 bug 修成了删功能。
+
+    **必须失败于**「把 `text` 选项一起删掉/无视」：那时 `connector.sent` 为空。
+    与 `test_synthesis_failure_sends_nothing_by_default` **配对**：同一份缺陷
+    （降级分支恒不发）会让那一条绿、这一条红；反之（恒发）则相反。
+
+    形态走的是 `deliver_speech` 的**真实入口**（真实 `DeliveryService`、真实
+    数据库、真实 `Message` 落库），在这里显式传 `fallback=`：`resolve_fallback`
+    目前没有任何配置读点，所以"能不能选到"只能在这一层验。
+    """
+    from ling.capabilities.delivery import DeliveryService
+    from ling.capabilities.speech_delivery import SpeechDelivery, SpeechFallback
+    from ling.config import get_settings
+    from ling.domains.media.assets import GeneratedMediaService
+    from ling.domains.speech.orchestration import SynthesisOutcome
+    from ling.infra.security import load_signing_root_key
+    from ling.ports.speech import ExpressionIntent
+
+    settings = get_settings()
+
+    async def _deliver_with(fallback):  # noqa: ANN001,ANN202
+        connector = FakeConnector()
+        window = await _make_window(logged_in, channel="onebot")
+        async with session_scope() as session:
+            media = GeneratedMediaService(
+                session,
+                data_dir=settings.data_dir,
+                root_key=load_signing_root_key(settings),
+                actor_id=ACTOR,
+            )
+            service = SpeechDelivery(
+                session,
+                delivery=DeliveryService(session),
+                media=media,
+                connector=connector,
+            )
+            # 两个场景各用一个**新窗口**：`silent` 那次不建 operation，但
+            # `text` 那次会；共用一个窗口容易踩 `plan_id`/幂等键的边。
+            intent = ExpressionIntent(
+                output_modality="voice", source="model", config_revision=0
+            )
+            result = await service.deliver_speech(
+                request=SpeechDeliveryRequest(
+                    turn_id=f"turn_fallback_{fallback.value}",
+                    message_id=f"attn:fallback:{fallback.value}",
+                    window_ref=str(window.id),
+                    text="合成会失败，但话得送到。",
+                    is_group=True,
+                ),
+                outcome=SynthesisOutcome(
+                    artifact=None,
+                    intent=intent,
+                    failed=True,
+                    detail="上游 503",
+                ),
+                intent=intent,
+                actor_id=ACTOR,
+                subject_id=logged_in.subject_id,
+                fallback=fallback,
+                transport="asset",
+            )
+            await session.commit()
+        return result, connector
+
+    text_result, text_connector = await _deliver_with(SpeechFallback.text)
+    assert text_result.state is SpeechDeliveryState.text_only
+    assert len(text_connector.sent) == 1, f"显式选了 text 却没发：{text_connector.sent}"
+    assert text_connector.sent[0].text == "合成会失败，但话得送到。", (
+        text_connector.sent[0].text
+    )
+    assert not _audio(text_connector.sent[0]), "降级时不该带音频"
+
+    silent_result, silent_connector = await _deliver_with(SpeechFallback.silent)
+    assert silent_result.state is SpeechDeliveryState.text_only, "静默要如实记成降级，不是失败"
+    assert not silent_connector.sent, f"显式选了 silent 却发了：{[m.text for m in silent_connector.sent]}"
+
+
+# --------------------------------------------------------------------------- #
+# 七、默认降级的**接线**：`DEFAULT_FALLBACK` 必须真的到达 `deliver_speech`
+#
+# 上面那条 `test_显式text降级才补文字` 证明的是"显式传参有效"；它**证明不了**
+# 默认值是什么——它自己就把 `fallback=` 传了进去。于是"`DEFAULT_FALLBACK` 退回
+# `text`"这个缺陷在它那里是不可见的（实测：M2 变异下它仍然绿）。
+#
+# 这一节补的就是那个缺口，两半必须同时成立：
+#   1. 常量本身是 `silent`（§17.5）；
+#   2. `worker._deliver_speech_reply` 交给 `deliver_speech` 的**就是**它。
+# 只有 1 没有 2：常量写对了但没人用；只有 2 没有 1：接线对、默认错。
+# --------------------------------------------------------------------------- #
+
+
+def test_默认降级是不补文字() -> None:
+    """`DEFAULT_FALLBACK` 是 `silent`——§17.5「失败默认不把原话改发文字」。
+
+    **必须失败于**「默认退回 `text`」（M2 变异）：那是老实现的方向。
+    `text` / `notice` 仍然**可以解析**到，只是不再是默认——同一条断言的正反两面。
+    """
+    from ling.capabilities.speech_delivery import DEFAULT_FALLBACK, SpeechFallback
+
+    assert DEFAULT_FALLBACK is SpeechFallback.silent
+    # 反方向配对：不是"把三个都变成 silent"，`text` 仍然可选。
+    assert SpeechFallback("text") is SpeechFallback.text
+    assert SpeechFallback("notice") is SpeechFallback.notice
+
+
+async def test_生产路径传给投递的降级就是默认值(
+    logged_in, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+) -> None:
+    """`_deliver_speech_reply` 传给 `deliver_speech` 的 `fallback` == `DEFAULT_FALLBACK`。
+
+    看的是**生产调用点**真的交出去的那个值，而不是常量自己长什么样——两者可以
+    分别正确、组合错误（例如接线处写死 `SpeechFallback.text`）。
+
+    **必须失败于**「接线处写死 `text`」或「常量退回 `text`」：两者都会让实际
+    传出去的值不是 `silent`。
+    """
+    from ling.capabilities.speech_delivery import DEFAULT_FALLBACK, SpeechDelivery
+
+    _bind_tts(monkeypatch, FakeTts())
+    _give_voice(monkeypatch)
+    connector = FakeConnector()
+    seen: list[object] = []
+    real = SpeechDelivery.deliver_speech
+
+    async def spy(self, **kwargs):  # noqa: ANN001,ANN003,ANN202
+        seen.append(kwargs.get("fallback"))
+        return await real(self, **kwargs)
+
+    monkeypatch.setattr(SpeechDelivery, "deliver_speech", spy)
+    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    _patch_turn_coordinator(monkeypatch, f"{SPEAK} 默认该是什么")
+
+    window = await _make_window(logged_in, channel="onebot")
+    async with session_scope() as session:
+        delivered, reason = await worker_module._reply_in_group_window(
+            session=session, config=await _config(session), window=window, result=_Result()
+        )
+
+    assert delivered is True, reason
+    assert len(seen) == 1, f"deliver_speech 被调用 {len(seen)} 次（期望 1）"
+    assert seen[0] is DEFAULT_FALLBACK, (
+        f"生产路径交给投递的 fallback 是 {seen[0]!r}，不是 DEFAULT_FALLBACK"
+        f"（{DEFAULT_FALLBACK!r}）——接线处自己写死了值？"
+    )

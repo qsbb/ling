@@ -2834,7 +2834,10 @@ async def _deliver_speech_reply(
         intent=speech.intent,
         actor_id=actor_id,
         subject_id=subject_id,
-        # 非法/缺失一律按 `text`：配置写错时用户**至少还能收到话**。
+        # 缺失一律取 `DEFAULT_FALLBACK`（= `silent`，§17.5「合成／转码／投递失败
+        # 默认不把原话改发文字」）。`resolve_fallback` 目前**没有配置读点**：
+        # 全仓没有 `speech_fallback` 字段，这里恒传 `None`。把 `text` / `notice`
+        # 接到 `settings/` 是另一步的工作。
         fallback=resolve_fallback(None),
         transport=_speech_transport(),
     )
