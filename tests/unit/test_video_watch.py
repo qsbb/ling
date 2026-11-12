@@ -283,6 +283,9 @@ class _FakeService:
     def __init__(self, videos: list[EvidenceView]) -> None:
         self._videos = videos
 
+    async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> None:
+        return None
+
     async def undescribed_videos(self, *, window_id: str, limit: int = 5):  # noqa: ANN001, ANN201
         return [v for v in self._videos if v.description is None]
 
@@ -411,6 +414,9 @@ class _ConfigReader:
 class _Svc:
     def __init__(self) -> None:
         self.written: dict[str, str] = {}
+
+    async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> None:
+        return None
 
     async def describe(self, evidence_id, *, window_id, description, description_origin):  # noqa: ANN001, ANN003, ANN201
         self.written[evidence_id] = description

@@ -55,6 +55,7 @@ class ConsentService:
                 select(ConsentRule).where(
                     ConsentRule.subject_id == subject_id, ConsentRule.scope == scope
                 )
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if row is None:

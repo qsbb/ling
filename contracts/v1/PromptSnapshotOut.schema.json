@@ -227,6 +227,54 @@
       ],
       "title": "PromptSnapshotState",
       "type": "string"
+    },
+    "PromptToolResult": {
+      "additionalProperties": false,
+      "description": "首次回灌到模型步骤的工具结果。",
+      "properties": {
+        "content": {
+          "title": "Content",
+          "type": "string"
+        },
+        "outcome": {
+          "title": "Outcome",
+          "type": "string"
+        },
+        "provider_call_id": {
+          "title": "Provider Call Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "v1",
+          "default": "v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "step": {
+          "minimum": 2,
+          "title": "Step",
+          "type": "integer"
+        },
+        "tokens": {
+          "minimum": 0,
+          "title": "Tokens",
+          "type": "integer"
+        },
+        "tool_id": {
+          "title": "Tool Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step",
+        "provider_call_id",
+        "tool_id",
+        "outcome",
+        "content",
+        "tokens"
+      ],
+      "title": "PromptToolResult",
+      "type": "object"
     }
   },
   "$id": "https://ling.local/contracts/v1/PromptSnapshotOut.schema.json",
@@ -316,6 +364,18 @@
       "minimum": 0,
       "title": "Token Total",
       "type": "integer"
+    },
+    "tool_transcript": {
+      "items": {
+        "$ref": "#/$defs/PromptToolResult"
+      },
+      "title": "Tool Transcript",
+      "type": "array"
+    },
+    "tool_transcript_truncated": {
+      "default": false,
+      "title": "Tool Transcript Truncated",
+      "type": "boolean"
     },
     "truncated": {
       "default": false,

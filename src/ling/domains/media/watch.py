@@ -333,6 +333,15 @@ class VideoWatchService:
             ref = short_ref_for(evidence.evidence_id)
             if evidence.description:
                 # 同一条证据只读一次：有描述就直接用，不再调模型。
+                try:
+                    await self._service.ensure_description_authorized(
+                        evidence.evidence_id, window_id=window_id
+                    )
+                except MediaEvidenceError as exc:
+                    outcome.skipped = str(exc)
+                    outcome.denied_kind = DENIED_ERROR
+                    _log_skipped(ref, str(exc))
+                    break
                 lines.append(f"- {ref}（之前看过的）：{evidence.description}")
                 _log_viewed(ref, "上次已经看过，用已有描述", cached=True)
                 continue
@@ -574,6 +583,7 @@ def default_watch_callback(
                     actor_id=actor_id,
                     describer=describer,
                     quota_denial=_quota_gate(config_reader, quota, profile),
+                    enforce_slot=True,
                 ).watch(window_id=window_id, refs=refs, mode=mode)
                 await session.commit()
             return outcome.as_dict()

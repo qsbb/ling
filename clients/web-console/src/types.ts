@@ -143,6 +143,15 @@ export interface PromptSnapshotOut {
   token_total: number | null;
   truncated: boolean;
   sections: PromptSection[];
+  tool_transcript?: Array<{
+    step: number;
+    provider_call_id: string;
+    tool_id: string;
+    outcome: string;
+    content: string;
+    tokens: number;
+  }>;
+  tool_transcript_truncated?: boolean;
 }
 
 export interface UserInfo {

@@ -95,6 +95,7 @@ class ToolResult:
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
+WatchVideo = Callable[[str, list[str]], Awaitable[dict[str, object]]]
 
 
 class ToolRegistry:
@@ -410,9 +411,11 @@ RECALL_TOOL_ID = "message.recall"
 #: 可用性判断侧、测试断言侧写的是同一个常量。
 CLOCK_NOW_TOOL_ID = "clock.now"
 KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
+MEDIA_WATCH_VIDEO_TOOL_ID = "media.watch_video"
 _KNOWLEDGE_RESULT_CHARS = 3000
 _KNOWLEDGE_CLAIM_CHARS = 600
 _KNOWLEDGE_QUERY_CHARS = 200
+_MEDIA_REF_CHARS = 16
 
 
 async def _search_knowledge(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
@@ -452,11 +455,30 @@ async def _search_knowledge(args: dict[str, Any], *, audience: AudienceSnapshot)
     return json.dumps({"items": items, "truncated": truncated}, ensure_ascii=False)
 
 
+async def _watch_video(
+    args: dict[str, Any], *, window_id: str, watch_video: WatchVideo
+) -> str:
+    ref = args["ref"].strip()
+    if not ref or len(ref) > _MEDIA_REF_CHARS:
+        raise ValueError(f"视频引用长度应为 1 到 {_MEDIA_REF_CHARS} 字符")
+    result = await watch_video(window_id, [ref])
+    observation = str(result.get("observed") or "").strip()
+    if not observation:
+        reason = str(result.get("skipped") or "视频没有成功读取").strip()
+        raise RuntimeError(reason[:300])
+    return json.dumps(
+        {"ref": ref, "observation": observation, "reads": int(result.get("reads") or 0)},
+        ensure_ascii=False,
+    )
+
+
 def build_default_registry(
     *,
     allow_irreversible: bool = False,
     include_recall: bool = True,
     knowledge_audience: AudienceSnapshot | None = None,
+    media_window_id: str | None = None,
+    watch_video: WatchVideo | None = None,
 ) -> ToolRegistry:
     """默认工具集：只读/诊断 + 撤回（不可逆，需确认）。
 
@@ -533,6 +555,37 @@ def build_default_registry(
             ),
             partial(_search_knowledge, audience=knowledge_audience),
         )
+    if media_window_id and watch_video is not None:
+        registry.register(
+            ToolSpec(
+                tool_id=MEDIA_WATCH_VIDEO_TOOL_ID,
+                version="1.0.0",
+                description=(
+                    "读取当前会话中提示已列出的一个视频短引用。只使用提示中出现的引用。"
+                    "结果是视觉模型对视频内容的推断，不是已核实的外部事实。"
+                ),
+                risk=ToolRisk.read_only,
+                requires_confirmation=False,
+                reversible=True,
+                model_callable=True,
+                output_untrusted=True,
+                timeout_seconds=190.0,
+                model_result_chars=3000,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "ref": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": _MEDIA_REF_CHARS,
+                            "description": "提示中当前会话视频行显示的短引用",
+                        },
+                    },
+                    "required": ["ref"],
+                },
+            ),
+            partial(_watch_video, window_id=media_window_id, watch_video=watch_video),
+        )
     registry.register(
         ToolSpec(
             tool_id="diagnostics.echo",
@@ -599,6 +652,8 @@ def build_default_registry(
 
 __all__ = [
     "CLOCK_NOW_TOOL_ID",
+    "KNOWLEDGE_SEARCH_TOOL_ID",
+    "MEDIA_WATCH_VIDEO_TOOL_ID",
     "RECALL_TOOL_ID",
     "RecallToolError",
     "ToolHandler",

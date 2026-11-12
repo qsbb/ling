@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
 from ling.api.deps import ConversationDep, CurrentAuth, DbSession
@@ -19,6 +19,7 @@ from ling.contracts.v1 import (
     PromptSnapshotOut,
     PromptSnapshotSection,
     PromptSnapshotState,
+    PromptToolResult,
     SessionRecord,
 )
 from ling.domains.conversation.service import (
@@ -454,6 +455,19 @@ def _snapshot_sections(payload: dict) -> list[PromptSnapshotSection]:
     return sections
 
 
+def _snapshot_tool_results(payload: dict) -> list[PromptToolResult]:
+    raw_results = payload.get("tool_transcript")
+    if not isinstance(raw_results, list):
+        return []
+    results = []
+    for raw in raw_results:
+        try:
+            results.append(PromptToolResult.model_validate(raw))
+        except ValidationError:
+            continue
+    return results
+
+
 @router.get("/messages/{message_id}/prompt", response_model=PromptSnapshotOut)
 async def get_message_prompt(
     message_id: str,
@@ -494,6 +508,12 @@ async def get_message_prompt(
                 select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
             )
         ).scalar_one_or_none()
+    if row is not None:
+        captured_attempt = row.payload.get("attempt") if isinstance(row.payload, dict) else None
+        if row.message_id not in {None, message_id} or (
+            isinstance(captured_attempt, int) and captured_attempt != message.attempt
+        ):
+            row = None
 
     if row is None:
         # 从没存下来：捕获失败，或这条消息早于本功能。
@@ -562,5 +582,7 @@ async def get_message_prompt(
         truncated=bool(row.truncated or payload.get("truncated")),
         dropped_items=int(payload.get("dropped_items") or 0),
         sections=_snapshot_sections(payload),
+        tool_transcript=_snapshot_tool_results(payload),
+        tool_transcript_truncated=bool(payload.get("tool_transcript_truncated")),
     )
 

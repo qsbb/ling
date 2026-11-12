@@ -1047,17 +1047,17 @@ class ContextCompiler:
                     when = _as_local_hint_seconds(video.created_at)
                 ref = short_ref_for(video.evidence_id)
                 lines.append(
-                    f"- {sender}{when}发了个视频，你还没看。想看就写 <<看视频 {ref}>>"
-                    "（这条标记不会发出去）。"
+                    f"- {sender}{when}发了个视频，你还没看。想看时优先使用本轮可用的"
+                    f"媒体读取工具（引用 {ref}）；若没有原生工具，再写 <<看视频 {ref}>>。"
                 )
             contributions.append(
                 ContextContribution(
                     lane="media",
                     text=(
                         "这个窗口里有你**还没看过**的视频——这些是新的，"
-                        "不是上面那些已经知道内容的：\n"
+                        "不是上面那些已经知道内容的。旧式视频标记不会发出去：\n"
                         + "\n".join(lines)
-                        + "\n只有你写了标记，才会去看；没写就当没看见，别假装看过。"
+                        + "\n只有实际调用读取能力或发出旧式标记后才会去看；没读取就当没看见，别假装看过。"
                         "\n上面那条「之前收发过、已经知道内容的」列表里如果有视频，"
                         "那是你看过的旧视频，不要拿它的内容当成这一条。"
                     ),

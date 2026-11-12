@@ -226,14 +226,7 @@ class MediaEvidenceService:
         主人授权过的群图仍然会在描述这一步被拒——等于没修。
         """
         row = await self._require(evidence_id, window_id)
-        if row.subject_id is None:
-            raise MediaEvidenceError("证据没有上传者，无法校验授权")
-
-        consent = await self._granted_consent([row.subject_id, await self._window_owner(window_id)])
-        if consent is None:
-            raise MediaEvidenceError(
-                f"授权已撤销，不能再描述（scope={INBOUND_SCOPE}）"
-            )
+        consent = await self._description_consent(row, window_id)
 
         text = description.strip()
         if not text:
@@ -249,6 +242,28 @@ class MediaEvidenceService:
         row.updated_at = utcnow()
         await self._session.flush()
         return _view(row)
+
+    async def ensure_description_authorized(
+        self, evidence_id: str, *, window_id: str
+    ) -> None:
+        """确认当前证据仍有入站媒体授权，不修改证据。"""
+        row = await self._require(evidence_id, window_id)
+        await self._description_consent(row, window_id)
+
+    async def _description_consent(
+        self, row: MediaEvidenceRow, window_id: str
+    ) -> ConsentView:
+        if row.subject_id is None:
+            raise MediaEvidenceError("证据没有上传者，无法校验授权")
+
+        consent = await self._granted_consent(
+            [row.subject_id, await self._window_owner(window_id)]
+        )
+        if consent is None:
+            raise MediaEvidenceError(
+                f"授权已撤销，不能再描述（scope={INBOUND_SCOPE}）"
+            )
+        return consent
 
     async def mark_describe_failed(
         self, evidence_id: str, *, window_id: str, reason: str

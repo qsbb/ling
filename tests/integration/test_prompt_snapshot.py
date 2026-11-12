@@ -529,9 +529,9 @@ async def test_retry_overwrites_instead_of_appending(logged_in: TestEnv) -> None
         )
         turn_id = turn.id
 
-    first = {"messages": [{"index": 0, "role": "user", "key": "input",
+    first = {"attempt": 1, "messages": [{"index": 0, "role": "user", "key": "input",
                            "content": "第一次尝试", "tokens": 4}]}
-    second = {"messages": [{"index": 0, "role": "user", "key": "input",
+    second = {"attempt": 2, "messages": [{"index": 0, "role": "user", "key": "input",
                             "content": "第二次尝试", "tokens": 4}]}
     await save_prompt_snapshot(
         actor_id="actor_ling", turn_id=turn_id, window_id=window_id,
@@ -540,6 +540,10 @@ async def test_retry_overwrites_instead_of_appending(logged_in: TestEnv) -> None
     await save_prompt_snapshot(
         actor_id="actor_ling", turn_id=turn_id, window_id=window_id,
         payload=second, truncated=False,
+    )
+    assert not await save_prompt_snapshot(
+        actor_id="actor_ling", turn_id=turn_id, window_id=window_id,
+        payload=first, truncated=False,
     )
 
     async with session_scope() as session:

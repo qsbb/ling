@@ -403,6 +403,27 @@ export function PromptSnapshotBody({
           );
         })
       )}
+      {snapshot.tool_transcript?.length || snapshot.tool_transcript_truncated ? (
+        <section className="prompt-drawer__section" aria-label="工具回灌">
+          <header className="prompt-drawer__section-head">
+            <h3 className="prompt-drawer__section-title">工具回灌</h3>
+          </header>
+          {snapshot.tool_transcript?.map((result) => (
+            <details
+              className="prompt-drawer__item"
+              key={`${result.step}-${result.provider_call_id}`}
+            >
+              <summary>
+                第 {result.step} 步 · {result.tool_id} · {result.outcome}
+              </summary>
+              <div className="prompt-drawer__item-content">{result.content}</div>
+            </details>
+          ))}
+          {snapshot.tool_transcript_truncated ? (
+            <p className="prompt-drawer__truncated">部分工具结果超过快照容量，未保留。</p>
+          ) : null}
+        </section>
+      ) : null}
     </div>
   );
 }

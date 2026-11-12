@@ -1231,6 +1231,18 @@ class PromptSnapshotSection(StrictModel):
     items: list[PromptSnapshotItem] = Field(default_factory=list)
 
 
+class PromptToolResult(StrictModel):
+    """首次回灌到模型步骤的工具结果。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    step: int = Field(ge=2)
+    provider_call_id: str
+    tool_id: str
+    outcome: str
+    content: str
+    tokens: int = Field(ge=0)
+
+
 class PromptSnapshotOut(StrictModel):
     """`GET /v1/messages/{message_id}/prompt` 的响应。
 
@@ -1254,6 +1266,8 @@ class PromptSnapshotOut(StrictModel):
     truncated: bool = False
     dropped_items: int = Field(default=0, ge=0)
     sections: list[PromptSnapshotSection] = Field(default_factory=list)
+    tool_transcript: list[PromptToolResult] = Field(default_factory=list)
+    tool_transcript_truncated: bool = False
     # 给人看的一句状态说明（expired / unavailable 时解释原因，纯文本）
     note: str | None = None
 
@@ -1847,6 +1861,7 @@ __all__ = [
     "PromptSnapshotOut",
     "PromptSnapshotSection",
     "PromptSnapshotState",
+    "PromptToolResult",
     "RecallEvent",
     "RecallKind",
     "RuntimeScope",

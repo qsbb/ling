@@ -281,9 +281,16 @@ class MediaDescriber:
         **同一条证据只读一次**：已经有描述就直接用缓存，不再调模型。
         """
         if evidence.description:
+            await self._service.ensure_description_authorized(
+                evidence.evidence_id, window_id=evidence.window_id
+            )
             return VideoRead(
                 text=evidence.description, mode="cached", cached=True
             )
+
+        await self._service.ensure_description_authorized(
+            evidence.evidence_id, window_id=evidence.window_id
+        )
 
         try:
             data, mime = await self._fetch(evidence.media_ref)
@@ -308,6 +315,9 @@ class MediaDescriber:
             fallback_reason = f"媒体类型不是视频（{mime or '未知'}），改走抽帧"
         if mode == "native" and fallback_reason is None:
             try:
+                await self._service.ensure_description_authorized(
+                    evidence.evidence_id, window_id=evidence.window_id
+                )
                 text = await self._ask(
                     prompt=VIDEO_DESCRIBE_PROMPT,
                     videos=(VideoPart.from_bytes(data, mime),),
@@ -333,6 +343,9 @@ class MediaDescriber:
                     f"（这段视频较长，你只看到全片等间隔取样的 {sample.count} 帧，"
                     "请在描述里说明这只是其中一部分。）"
                 )
+            await self._service.ensure_description_authorized(
+                evidence.evidence_id, window_id=evidence.window_id
+            )
             text = await self._ask(
                 prompt=prompt,
                 images=tuple(

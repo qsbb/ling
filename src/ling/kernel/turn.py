@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
+    MEDIA_WATCH_VIDEO_TOOL_ID,
     build_default_registry,
 )
 from ling.contracts.v1 import (
@@ -36,6 +37,7 @@ from ling.contracts.v1 import (
     ChatMessage,
     ErrorCode,
     Origin,
+    PromptToolResult,
     TurnState,
     new_id,
 )
@@ -52,6 +54,7 @@ from ling.domains.deferred.markers import (
     stream_safe_deferred,
     strip_defer_markers,
 )
+from ling.domains.media.describe import VIDEO_PROFILE
 from ling.domains.media.video import (
     MARKER_RE as WATCH_MARKER_RE,
 )
@@ -185,6 +188,7 @@ def build_prompt_snapshot_payload(
     *,
     model: dict[str, object] | None = None,
     captured_at: datetime | None = None,
+    attempt: int | None = None,
 ) -> tuple[dict[str, object], bool]:
     """把**真正要发出去的那份 messages** 装成快照 payload。
 
@@ -215,6 +219,10 @@ def build_prompt_snapshot_payload(
         "dropped_items": 0,
         "messages": entries,
     }
+    if attempt is not None:
+        payload["attempt"] = attempt
+        payload["tool_transcript"] = []
+        payload["tool_transcript_truncated"] = False
     if _snapshot_size(payload) <= PROMPT_SNAPSHOT_MAX_BYTES:
         return payload, False
 
@@ -334,24 +342,28 @@ async def save_prompt_snapshot(
                 )
             )
 
-    async def _overwrite() -> None:
+    async def _overwrite() -> bool:
         async with session_scope() as session:
-            await session.execute(
-                update(PromptSnapshot)
+            row = await session.scalar(
+                select(PromptSnapshot)
                 .where(PromptSnapshot.turn_id == turn_id)
-                .values(
-                    window_id=window_id,
-                    # 这一轮新的回复还没落库：旧的 message_id 指向上一 attempt
-                    # 的消息（可能已被 retry 删掉），必须先清空。
-                    message_id=None,
-                    created_at=now,
-                    expires_at=expires_at,
-                    schema_version=PROMPT_SNAPSHOT_SCHEMA_VERSION,
-                    size_bytes=size_bytes,
-                    truncated=truncated,
-                    payload=payload,
-                )
+                .with_for_update()
             )
+            if row is None:
+                return False
+            previous = row.payload.get("attempt") if isinstance(row.payload, dict) else None
+            attempt = payload.get("attempt")
+            if isinstance(previous, int) and isinstance(attempt, int) and previous > attempt:
+                return False
+            row.window_id = window_id
+            row.message_id = None
+            row.created_at = now
+            row.expires_at = expires_at
+            row.schema_version = PROMPT_SNAPSHOT_SCHEMA_VERSION
+            row.size_bytes = size_bytes
+            row.truncated = truncated
+            row.payload = payload
+            return True
 
     try:
         existing = None
@@ -365,16 +377,13 @@ async def save_prompt_snapshot(
             ).scalar_one_or_none()
         if existing is None:
             await _insert()
-        else:
-            await _overwrite()
-        return True
+            return True
+        return await _overwrite()
     except IntegrityError:
         # 同一轮的两个 attempt 同时写（「停止 → 立即重试」时真的会同时跑）：
-        # 唯一约束挡住了后到的那份。改成覆盖——后写的那份才是这一轮真正
-        # 要发给模型的内容。
+        # 唯一约束挡住后到的写入，转为按 attempt 比较后覆盖。
         try:
-            await _overwrite()
-            return True
+            return await _overwrite()
         except Exception as exc:  # noqa: BLE001 - 快照失败不影响本轮
             logger.warning(
                 "提示词快照写入失败（不影响本轮回复） turn=%s reason_code=%s detail=%s",
@@ -660,7 +669,9 @@ class TurnCoordinator:
         tool_calls_enabled: bool | None = None,
         tool_registry: ToolRegistry | None = None,
         # 知识查询还需按本轮受众注册。撤回走用户确认回路。
-        tool_allowlist: frozenset[str] = frozenset({CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID}),
+        tool_allowlist: frozenset[str] = frozenset(
+            {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID}
+        ),
     ) -> None:
         self._router = router
         self._tool_calls_enabled = tool_calls_enabled
@@ -1077,6 +1088,7 @@ class TurnCoordinator:
                     messages=messages,
                     config=config,
                     profile=profile,
+                    attempt=attempt,
                 )
 
                 # ---- 本轮的工具状态（原生工具调用）----
@@ -1091,6 +1103,7 @@ class TurnCoordinator:
                 tool_ledger = self._tool_ledger_for_turn(
                     config=config,
                     profile=profile,
+                    window_id=window_id,
                     audience=(
                         compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
                     ),
@@ -1417,6 +1430,11 @@ class TurnCoordinator:
                     stopped = stopped or stream_state.stopped
                 except ModelError as exc:
                     error = exc
+                finally:
+                    if tool_ledger.forwarded:
+                        await self._attach_tool_transcript(
+                            turn_id=turn_id, attempt=attempt, results=tool_ledger.forwarded
+                        )
 
                 # 出口清洗：剥掉 <<看视频 mX>>（幂等，再剥一次也不出错）。
                 # 顺带丢掉"半个标记"的尾巴——模型被打断时会出现这种残片。
@@ -1746,6 +1764,7 @@ class TurnCoordinator:
         messages: Sequence[ChatMessageIn],
         config: EffectiveConfig,
         profile: str,
+        attempt: int,
     ) -> None:
         """存一份"这次回复看到的上下文"（best-effort，**绝不阻塞出话**）。
 
@@ -1779,7 +1798,7 @@ class TurnCoordinator:
                     for m in messages
                 ]
             payload, truncated = build_prompt_snapshot_payload(
-                annotated, model=_snapshot_model_info(config, profile)
+                annotated, model=_snapshot_model_info(config, profile), attempt=attempt
             )
             await save_prompt_snapshot(
                 actor_id=self._actor_id,
@@ -1796,8 +1815,42 @@ class TurnCoordinator:
                 f"{type(exc).__name__}: {exc}"[:200],
             )
 
+    async def _attach_tool_transcript(
+        self, *, turn_id: str, attempt: int, results: Sequence[PromptToolResult]
+    ) -> None:
+        """保留模型收到的结果，复用该次提示词快照的授权、期限与容量。"""
+        try:
+            async with session_scope() as session:
+                row = await session.scalar(
+                    select(PromptSnapshot)
+                    .where(PromptSnapshot.turn_id == turn_id)
+                    .with_for_update()
+                )
+                if row is None or not isinstance(row.payload, dict):
+                    return
+                payload = dict(row.payload)
+                if payload.get("scrubbed") or payload.get("attempt") != attempt:
+                    return
+                entries: list[dict[str, object]] = []
+                payload["tool_transcript"] = entries
+                payload["tool_transcript_truncated"] = False
+                for result in results:
+                    entries.append(result.model_dump(mode="json"))
+                    if _snapshot_size(payload) > PROMPT_SNAPSHOT_MAX_BYTES:
+                        entries.pop()
+                        payload["tool_transcript_truncated"] = True
+                        break
+                size = _snapshot_size(payload)
+                if size <= PROMPT_SNAPSHOT_MAX_BYTES:
+                    row.payload = payload
+                    row.size_bytes = size
+                else:
+                    row.truncated = True
+        except Exception as exc:  # noqa: BLE001 - 快照旁路失败不影响回复
+            logger.warning("工具回灌快照保存失败 turn=%s error=%s", turn_id, type(exc).__name__)
+
     async def _bind_snapshot_message(
-        self, conversation: ConversationService, *, turn_id: str, message_id: str
+        self, conversation: ConversationService, *, turn_id: str, message_id: str, attempt: int
     ) -> None:
         """回复落库后把快照指到这条消息（同一事务，best-effort）。
 
@@ -1808,11 +1861,17 @@ class TurnCoordinator:
         """
         try:
             async with conversation.session.begin_nested():
-                await conversation.session.execute(
-                    update(PromptSnapshot)
+                row = await conversation.session.scalar(
+                    select(PromptSnapshot)
                     .where(PromptSnapshot.turn_id == turn_id)
-                    .values(message_id=message_id)
+                    .with_for_update()
                 )
+                if (
+                    row is not None
+                    and isinstance(row.payload, dict)
+                    and row.payload.get("attempt", attempt) == attempt
+                ):
+                    row.message_id = message_id
         except Exception as exc:  # noqa: BLE001 - 回填失败只少一个入口
             logger.info(
                 "提示词快照回填 message_id 失败（不影响回复） turn=%s "
@@ -2432,7 +2491,7 @@ class TurnCoordinator:
         # 恰恰只有快照能解释（被注入的内容里可能就有原因）。
         if actor_message is not None:
             await self._bind_snapshot_message(
-                conversation, turn_id=turn_id, message_id=actor_message.message_id
+                conversation, turn_id=turn_id, message_id=actor_message.message_id, attempt=attempt
             )
         # **按实际结果校正**用户消息的处置结果。
         # 它是在消息创建时按"她的决定"写的（决定回 → replied），但决定回
@@ -2688,7 +2747,12 @@ class TurnCoordinator:
     # ------------------------------------------------------ 原生工具回路
 
     def _tool_ledger_for_turn(
-        self, *, config: EffectiveConfig, profile: str, audience: AudienceSnapshot | None = None
+        self,
+        *,
+        config: EffectiveConfig,
+        profile: str,
+        audience: AudienceSnapshot | None = None,
+        window_id: str | None = None,
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -2728,7 +2792,16 @@ class TurnCoordinator:
                         enabled=False, reason="no_registry", provider_kind=kind, model_id=model_id
                     )
                 )
-            registry = build_default_registry(knowledge_audience=audience)
+            media_callback = self._watch_video
+            if media_callback is None and window_id:
+                video_binding = config.resolve_profile(VIDEO_PROFILE)
+                if video_binding.usable and video_binding.enabled:
+                    media_callback = self._watch_videos
+            registry = build_default_registry(
+                knowledge_audience=audience,
+                media_window_id=window_id,
+                watch_video=media_callback,
+            )
         if not profile_supports_native_tools(profile):
             return _ToolLedger(
                 availability=ToolAvailability(
@@ -2948,6 +3021,7 @@ class TurnCoordinator:
         # ---- 工具轮次 ----
         definitions = tuple(ledger.availability.tools if ledger.availability else ())
         request_messages: list[ChatMessageIn] = list(messages)
+        pending_results: list[ChatMessageIn] = []
         try:
             while True:
                 calls = _ToolCallStream()
@@ -2965,6 +3039,9 @@ class TurnCoordinator:
                     # 回灌"已经能容纳乱序完成。留给供应商默认。
                     parallel_tool_calls=None,
                 ):
+                    if pending_results:
+                        ledger.record_forwarded(step=rounds.batches + 1, messages=pending_results)
+                        pending_results = []
                     if outcome.target is not None and target_label is None:
                         target_label = outcome.target.label
                     if getattr(token, "stopped", False):
@@ -3029,6 +3106,7 @@ class TurnCoordinator:
                         ModelErrorKind.error, "模型未提供可配对的工具调用 ID", retriable=False
                     )
                 request_messages = [*request_messages, *tail]
+                pending_results = tail[1:]
         except ModelError as exc:
             state.delivered = delivered
             state.target_label = target_label
@@ -3533,7 +3611,7 @@ class _ToolRounds:
 
 @dataclass
 class _ToolLedger:
-    """这一轮工具事实的**留痕**（供日志与测试断言，不落库）。
+    """这一轮工具执行与回灌的留痕。
 
     为什么要有它：验收判据里有一条"Registry 真的执行了"。模型说"现在是
     22:05"本身**证明不了**它查过——它完全可能编一个。所以执行事实必须由
@@ -3545,6 +3623,7 @@ class _ToolLedger:
     registry: ToolRegistry | None = None
     executed: list[dict[str, str]] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
+    forwarded: list[PromptToolResult] = field(default_factory=list)
     batches: int = 0
     # 第一次真正执行发生在第几批（1 起）
     first_execution_step: int | None = None
@@ -3561,6 +3640,20 @@ class _ToolLedger:
                 "outcome": outcome,
             }
         )
+
+    def record_forwarded(self, *, step: int, messages: Sequence[ChatMessageIn]) -> None:
+        for message in messages:
+            payload = json.loads(message.content)
+            self.forwarded.append(
+                PromptToolResult(
+                    step=step,
+                    provider_call_id=payload["provider_call_id"],
+                    tool_id=payload["tool_id"],
+                    outcome=payload["outcome"],
+                    content=message.content,
+                    tokens=estimate_tokens(message.content),
+                )
+            )
 
     def reject(self, *, provider_call_id: str, tool_id: str, code: str) -> None:
         self.rejected.append(

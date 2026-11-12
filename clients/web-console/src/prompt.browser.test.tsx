@@ -193,7 +193,7 @@ interface Harness {
 async function openChat(
   role: 'owner' | 'member',
   viewport: { width: number; height: number },
-  options: { expectEntry?: boolean } = {},
+  options: { expectEntry?: boolean; prompt?: Record<string, unknown> } = {},
 ): Promise<Harness> {
   if (!browser || launchError) throw new Error(launchError ?? '浏览器未启动');
   // 关掉动画：滑入动画会让 getBoundingClientRect 读到动画中途的位置，
@@ -230,7 +230,7 @@ async function openChat(
       if (path === '/v1/messages/msg-archived/prompt') {
         return route.fulfill(json({ error: { code: 'not_found', message: '目标不存在', retriable: false } }, 404));
       }
-      return route.fulfill(json(PROMPT));
+      return route.fulfill(json(options.prompt ?? PROMPT));
     }
     if (path.startsWith('/v1/')) {
       return route.fulfill(json({ error: { code: 'not_found', message: path, retriable: false } }, 404));
@@ -356,9 +356,36 @@ describe('真实浏览器：入口、请求、抽屉', () => {
       expect(await page.getByText('记忆管家：').count()).toBe(1);
       // 换行保留在文本节点里（white-space: pre-wrap）
       expect(await page.getByText('你是灵。').innerText()).toContain('\n');
+      expect(await dialog.getByRole('region', { name: '工具回灌' }).count()).toBe(0);
     },
     TIMEOUT,
   );
+
+  it('显示实际回灌步骤、失败结果和截断提示', async (ctx) => {
+    if (skip(ctx)) return;
+    const content = '{"outcome":"failed","error":"<b>资料未找到</b>"}';
+    const { page } = await openChat('owner', { width: 1440, height: 900 }, {
+      prompt: {
+        ...PROMPT,
+        tool_transcript: [{
+          step: 2,
+          provider_call_id: 'call-fixture',
+          tool_id: 'knowledge.search',
+          outcome: 'failed',
+          content,
+          tokens: 12,
+        }],
+        tool_transcript_truncated: true,
+      },
+    });
+    await openDrawer(page);
+
+    const tool = page.getByRole('region', { name: '工具回灌' });
+    await tool.getByText('第 2 步 · knowledge.search · failed').click();
+    expect(await tool.getByText(content).isVisible()).toBe(true);
+    expect(await tool.locator('b').count()).toBe(0);
+    expect(await tool.getByText('部分工具结果超过快照容量，未保留。').isVisible()).toBe(true);
+  }, TIMEOUT);
 
   it(
     '四种收起方式：Esc / X / 遮罩 / 再点入口；焦点进抽屉、关闭后回入口',

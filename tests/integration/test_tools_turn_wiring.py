@@ -10,16 +10,29 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from ling import worker
-from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, ToolRegistry
+from ling.capabilities.tools import (
+    CLOCK_NOW_TOOL_ID,
+    KNOWLEDGE_SEARCH_TOOL_ID,
+    MEDIA_WATCH_VIDEO_TOOL_ID,
+    ToolRegistry,
+    build_default_registry,
+)
+from ling.domains.consent.service import ConsentService
 from ling.domains.knowledge.service import KnowledgeService
-from ling.infra.db import session_scope
-from ling.infra.models import KnowledgeItem
+from ling.domains.media.describe import MediaDescriber
+from ling.domains.media.service import INBOUND_SCOPE, MediaEvidenceService
+from ling.domains.media.video import short_ref_for
+from ling.domains.media.watch import VideoWatchService, make_watch_callback
+from ling.infra.db import get_session_factory, session_scope
+from ling.infra.models import KnowledgeItem, PromptSnapshot, ProviderTokenUsage
 from ling.kernel import turn as turn_module
 from ling.kernel.turn import MAX_TOOL_CALLS_PER_BATCH, MAX_TOOL_CALLS_PER_TURN
 from ling.models import openai_compatible
+from ling.models.quota import TokenQuotaStore
 from ling.models.registry import ProviderRegistry
 from ling.models.router import ModelRouter, StreamOutcome
 from ling.ports.model import ModelChunk
@@ -56,10 +69,16 @@ class _ToolEndpoint:
         self.reply = ""
         self.tool_name = "clock_now"
         self.script: list[tuple[dict | list[dict], str]] = []
+        self.fail_request: int | None = None
+        self.pause_continuation: asyncio.Event | None = None
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.requests.append(body)
+        if len(self.requests) == self.fail_request:
+            return httpx.Response(503, text="fixture unavailable")
+        if len(self.requests) == 2 and self.pause_continuation is not None:
+            return httpx.Response(200, stream=_PausedModelStream(self.pause_continuation))
         if len(self.requests) <= len(self.script):
             return _model_response(*self.script[len(self.requests) - 1])
         if "tools" not in body:
@@ -72,6 +91,8 @@ class _ToolEndpoint:
             if self.tool_name == "knowledge_search" and payload.get("data"):
                 items = json.loads(content)["items"]
                 content = items[0]["claim"].splitlines()[0] if items else "未找到资料"
+            if self.tool_name == "media_watch_video" and payload.get("data"):
+                content = json.loads(content)["observation"]
             self.reply = f"{RESULT_PREFIX}{content}"
             return _model_response({"content": self.reply}, "stop")
 
@@ -81,6 +102,16 @@ class _ToolEndpoint:
         }
         call = {"index": 0, "id": CALL_ID, "type": "function", "function": function}
         return _model_response({"tool_calls": [call]}, "tool_calls")
+
+
+class _PausedModelStream(httpx.AsyncByteStream):
+    def __init__(self, paused: asyncio.Event) -> None:
+        self.paused = paused
+
+    async def __aiter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"candidate"}}]}\n\n'
+        self.paused.set()
+        await asyncio.Event().wait()
 
 
 @pytest.fixture
@@ -113,6 +144,7 @@ async def _bind_model(
     enabled: bool | None = None,
     native_tools: bool | None = True,
     kind: str = "openai_compatible",
+    video_profile: bool = False,
 ) -> None:
     body: dict = {
         "providers": [
@@ -133,6 +165,14 @@ async def _bind_model(
             }
         ],
     }
+    if video_profile:
+        body["profiles"].append(
+            {
+                "profile": "perception.video",
+                "provider_id": "fixture",
+                "model_id": "fixture-chat",
+            }
+        )
     body["dialogue"] = {"private_may_stay_silent": False}
     if enabled is not None:
         body["dialogue"]["tools_enabled"] = enabled
@@ -168,7 +208,9 @@ async def _web_reply(env: TestEnv, *, text: str = "现在几点了？") -> str:
 
 
 def _tool_payload(
-    endpoint: _ToolEndpoint, *, available: tuple[str, ...] = ("clock_now", "knowledge_search")
+    endpoint: _ToolEndpoint,
+    *,
+    available: tuple[str, ...] = ("clock_now", "knowledge_search"),
 ) -> dict:
     assert len(endpoint.requests) == 2, endpoint.requests
     first, second = endpoint.requests
@@ -179,6 +221,10 @@ def _tool_payload(
         schema = tools["knowledge_search"]["parameters"]
         assert schema["required"] == ["query"]
         assert schema["properties"]["query"]["type"] == "string"
+    if "media_watch_video" in tools:
+        schema = tools["media_watch_video"]["parameters"]
+        assert schema["required"] == ["ref"]
+        assert schema["properties"]["ref"]["type"] == "string"
     proposals = [call for message in second["messages"] for call in message.get("tool_calls", [])]
     assert len(proposals) == 1
     assert proposals[0]["id"] == CALL_ID
@@ -190,6 +236,7 @@ def _tool_payload(
     assert payload["tool_id"] == {
         "clock_now": CLOCK_NOW_TOOL_ID,
         "knowledge_search": KNOWLEDGE_SEARCH_TOOL_ID,
+        "media_watch_video": MEDIA_WATCH_VIDEO_TOOL_ID,
     }[endpoint.tool_name]
     assert payload["provider_call_id"] == CALL_ID
     return payload
@@ -377,6 +424,436 @@ async def test_web_knowledge_search_returns_current_scoped_results(
         for message in endpoint.requests[1]["messages"]
         if message["role"] != "tool"
     )
+
+
+async def test_video_tool_uses_the_current_turn_watch_callback(
+    logged_in: TestEnv,
+    endpoint: _ToolEndpoint,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _bind_model(logged_in, enabled=True, video_profile=True)
+    endpoint.tool_name = "media_watch_video"
+    endpoint.arguments = {"ref": "m3f2a1"}
+    calls: list[tuple[str, list[str]]] = []
+
+    async def watch_video(self, window_id: str, refs: list[str]) -> dict[str, object]:
+        calls.append((window_id, refs))
+        return {
+            "observed": "一辆红色汽车从路口驶过。",
+            "skipped": None,
+            "denied_kind": None,
+            "reads": 1,
+        }
+
+    monkeypatch.setattr(turn_module.TurnCoordinator, "_watch_videos", watch_video)
+    events = await _web_turn(logged_in, text="请看一下刚才的视频。")
+
+    payload = _tool_payload(
+        endpoint,
+        available=("clock_now", "knowledge_search", "media_watch_video"),
+    )
+    assert payload["outcome"] == "succeeded", payload
+    assert payload["untrusted"] is True
+    assert json.loads(payload["data"]) == {
+        "ref": "m3f2a1",
+        "observation": "一辆红色汽车从路口驶过。",
+        "reads": 1,
+    }
+    assert endpoint.reply.endswith("一辆红色汽车从路口驶过。")
+    assert len(calls) == 1
+    assert calls[0][1] == ["m3f2a1"]
+    assert calls[0][0]
+    assert _reply_text(events).endswith("一辆红色汽车从路口驶过。")
+
+
+async def test_video_tool_failure_is_not_encoded_as_empty_success(
+    logged_in: TestEnv,
+    endpoint: _ToolEndpoint,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _bind_model(logged_in, enabled=True, video_profile=True)
+    endpoint.tool_name = "media_watch_video"
+    endpoint.arguments = {"ref": "m3f2a1"}
+
+    async def denied(_self, _window_id: str, _refs: list[str]) -> dict[str, object]:
+        return {
+            "observed": "",
+            "skipped": "今天的看视频额度用完了（已用 120000 / 上限 120000 tokens）",
+            "denied_kind": "quota",
+            "reads": 0,
+        }
+
+    monkeypatch.setattr(turn_module.TurnCoordinator, "_watch_videos", denied)
+    await _web_turn(logged_in, text="请看一下这个视频。")
+
+    payload = _tool_payload(
+        endpoint,
+        available=("clock_now", "knowledge_search", "media_watch_video"),
+    )
+    assert payload["outcome"] == "failed", payload
+    assert "data" not in payload
+    assert "额度用完" in payload["error"]["message"]
+
+
+async def test_video_tool_is_not_advertised_without_video_profile(
+    logged_in: TestEnv,
+    endpoint: _ToolEndpoint,
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+
+    await _web_reply(logged_in)
+
+    first_request = endpoint.requests[0]
+    advertised = {tool["function"]["name"] for tool in first_request["tools"]}
+    assert advertised == {"clock_now", "knowledge_search"}
+
+
+async def test_video_tool_reuses_window_scoped_media_authorization(
+    logged_in: TestEnv,
+) -> None:
+    async def create_window(title: str) -> str:
+        response = await logged_in.client.post("/v1/sessions", json={"title": title})
+        assert response.status_code == 201, response.text
+        return response.json()["session_id"]
+
+    current_window = await create_window("当前媒体工具会话")
+    other_window = await create_window("其他媒体工具会话")
+    async with session_scope() as session:
+        await ConsentService(session).grant(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+        media = MediaEvidenceService(session, actor_id="actor_ling")
+        current = await media.record(
+            subject_id=logged_in.subject_id,
+            window_id=current_window,
+            media_ref="object/current.mp4",
+            kind="video",
+            source_event_id="tool-current-video",
+        )
+        foreign = await media.record(
+            subject_id=logged_in.subject_id,
+            window_id=other_window,
+            media_ref="object/foreign.mp4",
+            kind="video",
+            source_event_id="tool-foreign-video",
+        )
+        await media.describe(
+            current.evidence_id,
+            window_id=current_window,
+            description="当前会话的红色汽车视频。",
+        )
+        await media.describe(
+            foreign.evidence_id,
+            window_id=other_window,
+            description="另一会话的蓝色船只视频。",
+        )
+
+    async def watch_video(window_id: str, refs: list[str]) -> dict[str, object]:
+        async with session_scope() as session:
+            service = VideoWatchService(
+                session,
+                actor_id="actor_ling",
+                describer=object(),  # 已描述的证据走缓存，不调用视觉模型
+            )
+            result = await service.watch(window_id=window_id, refs=refs)
+            await session.commit()
+            return result.as_dict()
+
+    registry = build_default_registry(
+        media_window_id=current_window,
+        watch_video=watch_video,
+    )
+    current_result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(current.evidence_id)},
+        internal_call_id="current-media-call",
+    )
+    foreign_result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(foreign.evidence_id)},
+        internal_call_id="foreign-media-call",
+    )
+
+    assert current_result.outcome.value == "succeeded"
+    assert "当前会话的红色汽车视频" in current_result.output
+    assert foreign_result.outcome.value == "failed"
+    assert foreign_result.output == ""
+    assert "不存在或已过期" in (foreign_result.detail or "")
+
+
+@pytest.mark.parametrize("cached", [False, True])
+async def test_video_tool_does_not_read_or_return_media_after_consent_revocation(
+    logged_in: TestEnv,
+    cached: bool,
+) -> None:
+    response = await logged_in.client.post(
+        "/v1/sessions", json={"title": "撤权后的媒体工具"}
+    )
+    assert response.status_code == 201, response.text
+    window_id = response.json()["session_id"]
+
+    async with session_scope() as session:
+        await ConsentService(session).grant(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+        media = MediaEvidenceService(session, actor_id="actor_ling")
+        evidence = await media.record(
+            subject_id=logged_in.subject_id,
+            window_id=window_id,
+            media_ref="object/revoked.mp4",
+            kind="video",
+            source_event_id=f"revoked-video-{cached}",
+        )
+        if cached:
+            await media.describe(
+                evidence.evidence_id,
+                window_id=window_id,
+                description="撤权后不得返回的缓存描述。",
+            )
+        await ConsentService(session).revoke(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+
+    fetches: list[str] = []
+
+    async def fetch_media(media_ref: str) -> tuple[bytes, str]:
+        fetches.append(media_ref)
+        return b"video bytes", "video/mp4"
+
+    callback = make_watch_callback(
+        fetch_media=fetch_media,
+        router=object(),
+        config_reader=object(),
+        actor_id="actor_ling",
+    )
+    registry = build_default_registry(
+        media_window_id=window_id,
+        watch_video=callback,
+    )
+    result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(evidence.evidence_id)},
+        internal_call_id=f"revoked-media-{cached}",
+    )
+
+    assert result.outcome.value == "failed"
+    assert result.output == ""
+    assert "授权已撤销" in (result.detail or "")
+    assert "撤权后不得返回" not in (result.detail or "")
+    assert fetches == []
+
+
+async def test_video_tool_rechecks_consent_after_fetch_before_model_call(
+    logged_in: TestEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = await logged_in.client.post(
+        "/v1/sessions", json={"title": "读取中撤权的媒体工具"}
+    )
+    assert response.status_code == 201, response.text
+    window_id = response.json()["session_id"]
+
+    async with session_scope() as session:
+        await ConsentService(session).grant(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+        evidence = await MediaEvidenceService(session, actor_id="actor_ling").record(
+            subject_id=logged_in.subject_id,
+            window_id=window_id,
+            media_ref="object/revoke-during-fetch.mp4",
+            kind="video",
+            source_event_id="tool-revoke-during-fetch-video",
+        )
+
+    fetches: list[str] = []
+    model_calls: list[str] = []
+
+    async def fetch_media(media_ref: str) -> tuple[bytes, str]:
+        fetches.append(media_ref)
+        async with session_scope() as session:
+            await ConsentService(session).revoke(
+                subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+            )
+            await session.commit()
+        return b"video bytes", "video/mp4"
+
+    async def ask_video(self, **_kwargs: object) -> str:
+        model_calls.append("called")
+        return "模型不应看到这段视频。"
+
+    monkeypatch.setattr(MediaDescriber, "_ask", ask_video)
+
+    async def native_mode() -> str:
+        return "native"
+
+    callback = make_watch_callback(
+        fetch_media=fetch_media,
+        router=object(),
+        config_reader=object(),
+        actor_id="actor_ling",
+        mode_reader=native_mode,
+    )
+    registry = build_default_registry(
+        media_window_id=window_id,
+        watch_video=callback,
+    )
+    result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(evidence.evidence_id)},
+        internal_call_id="revoke-during-fetch-call",
+    )
+
+    assert fetches == ["object/revoke-during-fetch.mp4"]
+    assert model_calls == []
+    assert result.outcome.value == "failed"
+    assert "授权已撤销" in (result.detail or "")
+
+
+async def test_video_tool_does_not_persist_description_if_consent_is_revoked_during_model_call(
+    logged_in: TestEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = await logged_in.client.post(
+        "/v1/sessions", json={"title": "模型执行中撤权的视频工具"}
+    )
+    assert response.status_code == 201, response.text
+    window_id = response.json()["session_id"]
+
+    async with session_scope() as session:
+        await ConsentService(session).grant(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+        evidence = await MediaEvidenceService(session, actor_id="actor_ling").record(
+            subject_id=logged_in.subject_id,
+            window_id=window_id,
+            media_ref="object/revoke-during-model.mp4",
+            kind="video",
+            source_event_id="tool-revoke-during-model-video",
+        )
+
+    fetches: list[str] = []
+    model_calls: list[str] = []
+
+    async def fetch_media(media_ref: str) -> tuple[bytes, str]:
+        fetches.append(media_ref)
+        return b"video bytes", "video/mp4"
+
+    async def describe_during_model_call(self, **_kwargs: object) -> str:
+        model_calls.append("started")
+        async with session_scope() as session:
+            await ConsentService(session).revoke(
+                subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+            )
+            await session.commit()
+        return "模型看到一辆红色汽车。"
+
+    monkeypatch.setattr(MediaDescriber, "_ask", describe_during_model_call)
+
+    async def native_mode() -> str:
+        return "native"
+
+    callback = make_watch_callback(
+        fetch_media=fetch_media,
+        router=object(),
+        config_reader=object(),
+        actor_id="actor_ling",
+        mode_reader=native_mode,
+    )
+    registry = build_default_registry(
+        media_window_id=window_id,
+        watch_video=callback,
+    )
+    result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(evidence.evidence_id)},
+        internal_call_id="revoke-during-model-call",
+    )
+
+    assert fetches == ["object/revoke-during-model.mp4"]
+    assert model_calls == ["started"]
+    assert result.outcome.value == "failed"
+    assert result.output == ""
+    assert "取不到视频内容" in (result.detail or "")
+    async with session_scope() as session:
+        stored = await MediaEvidenceService(
+            session, actor_id="actor_ling"
+        ).get(evidence.evidence_id, window_id=window_id)
+        assert stored is not None
+        assert stored.description is None
+
+
+async def test_video_tool_checks_the_shared_token_budget_before_fetching(
+    logged_in: TestEnv,
+) -> None:
+    response = await logged_in.client.post(
+        "/v1/sessions", json={"title": "媒体工具额度闸"}
+    )
+    assert response.status_code == 201, response.text
+    window_id = response.json()["session_id"]
+
+    async with session_scope() as session:
+        await ConsentService(session).grant(
+            subject_id=logged_in.subject_id, scope=INBOUND_SCOPE
+        )
+        evidence = await MediaEvidenceService(session, actor_id="actor_ling").record(
+            subject_id=logged_in.subject_id,
+            window_id=window_id,
+            media_ref="object/quota.mp4",
+            kind="video",
+            source_event_id="tool-budget-video",
+        )
+
+    class ConfigReader:
+        async def effective(self):  # noqa: ANN201
+            return SimpleNamespace(
+                resolve_profile=lambda _profile: SimpleNamespace(
+                    provider_id="video-provider"
+                ),
+                providers={
+                    "video-provider": SimpleNamespace(
+                        daily_limit_effective=lambda: 100
+                    )
+                },
+            )
+
+    quota = TokenQuotaStore(get_session_factory(), timezone="UTC")
+    async with session_scope() as session:
+        session.add(
+            ProviderTokenUsage(
+                id="video-budget-used-today",
+                provider_id="video-provider",
+                day=quota.today(),
+                tokens=100,
+                estimated=False,
+            )
+        )
+
+    fetches: list[str] = []
+
+    async def fetch_media(media_ref: str) -> tuple[bytes, str]:
+        fetches.append(media_ref)
+        return b"video bytes", "video/mp4"
+
+    callback = make_watch_callback(
+        fetch_media=fetch_media,
+        router=object(),
+        config_reader=ConfigReader(),
+        actor_id="actor_ling",
+        quota=quota,
+    )
+    registry = build_default_registry(
+        media_window_id=window_id,
+        watch_video=callback,
+    )
+    result = await registry.call(
+        MEDIA_WATCH_VIDEO_TOOL_ID,
+        {"ref": short_ref_for(evidence.evidence_id)},
+        internal_call_id="budgeted-media-call",
+    )
+
+    assert result.outcome.value == "failed"
+    assert "额度用完" in (result.detail or "")
+    assert fetches == []
 
 
 @pytest.mark.parametrize(
@@ -637,3 +1114,121 @@ async def test_tool_finish_without_proposals_does_not_release_candidate(
     assert [name for name, _ in events if name in {"delta", "turn.failed"}] == ["turn.failed"]
     assert clock_executions == []
     assert len(endpoint.requests) == 1
+
+
+async def test_prompt_snapshot_matches_forwarded_tool_results(
+    logged_in: TestEnv, endpoint: _ToolEndpoint
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [
+        (_clock_proposals("first"), "tool_calls"),
+        (_clock_proposals("second"), "tool_calls"),
+        ({"content": "两次查询均已完成。"}, "stop"),
+    ]
+    events = await _web_turn(logged_in, text="请核对两次。")
+    completed = next(payload for name, payload in events if name == "turn.completed")
+    message_id = completed["message"]["message_id"]
+    response = await logged_in.client.get(f"/v1/messages/{message_id}/prompt")
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    assert snapshot["state"] == "available"
+    forwarded = snapshot["tool_transcript"]
+    assert [(row["step"], row["provider_call_id"]) for row in forwarded] == [
+        (2, "first"),
+        (3, "second"),
+    ]
+    for row in forwarded:
+        sent = endpoint.requests[row["step"] - 1]
+        matches = [
+            message["content"]
+            for message in sent["messages"]
+            if message.get("tool_call_id") == row["provider_call_id"]
+        ]
+        assert matches == [row["content"]]
+        assert row["outcome"] == "succeeded"
+        assert row["tokens"] > 0
+    assert snapshot["tool_transcript_truncated"] is False
+
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(PromptSnapshot).where(PromptSnapshot.turn_id == snapshot["turn_id"])
+        )
+        assert row is not None
+        row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    expired = (await logged_in.client.get(f"/v1/messages/{message_id}/prompt")).json()
+    assert expired["state"] == "expired"
+    assert expired["tool_transcript"] == []
+
+
+async def test_snapshot_omits_tool_result_when_continuation_was_not_accepted(
+    logged_in: TestEnv, endpoint: _ToolEndpoint
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.fail_request = 2
+
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    assert any(name == "turn.failed" for name, _ in events)
+    _, results = _wire_tool_history(endpoint.requests[1])
+    assert results[CALL_ID]["outcome"] == "succeeded"
+    turn_id = next(payload["turn_id"] for name, payload in events if name == "turn.started")
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
+        )
+        assert row is not None
+        assert not row.payload.get("tool_transcript")
+
+
+async def test_cancel_after_first_continuation_frame_keeps_tool_snapshot(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.pause_continuation = asyncio.Event()
+    monkeypatch.setattr(turn_module, "FORCE_CANCEL_AFTER_SECONDS", 0.01)
+    task = asyncio.create_task(_web_turn(logged_in, text="现在几点了？"))
+    try:
+        await asyncio.wait_for(endpoint.pause_continuation.wait(), timeout=5)
+        cancels = logged_in.app.state.cancels
+        [turn_id] = cancels.running_turns()
+        assert cancels.stop(turn_id)
+        events = await asyncio.wait_for(task, timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+    assert any(name == "turn.stopped" for name, _ in events)
+    assert not any(name == "delta" for name, _ in events)
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
+        )
+        assert row is not None
+        [result] = row.payload["tool_transcript"]
+        assert (result["step"], result["provider_call_id"]) == (2, CALL_ID)
+
+
+async def test_tool_snapshot_marks_truncation_even_when_only_base_fits(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    attach = turn_module.TurnCoordinator._attach_tool_transcript
+
+    async def limit_to_base(self, *, turn_id, **kwargs):
+        async with session_scope() as session:
+            row = await session.scalar(
+                select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
+            )
+            assert row is not None
+            monkeypatch.setattr(turn_module, "PROMPT_SNAPSHOT_MAX_BYTES", row.size_bytes)
+        await attach(self, turn_id=turn_id, **kwargs)
+
+    monkeypatch.setattr(turn_module.TurnCoordinator, "_attach_tool_transcript", limit_to_base)
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    _assert_clock_result(endpoint)
+    completed = next(payload for name, payload in events if name == "turn.completed")
+    message_id = completed["message"]["message_id"]
+    snapshot = (await logged_in.client.get(f"/v1/messages/{message_id}/prompt")).json()
+    assert snapshot["tool_transcript_truncated"] is True
+    assert snapshot["tool_transcript"] == []
