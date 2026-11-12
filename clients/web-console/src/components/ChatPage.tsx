@@ -3,6 +3,7 @@ import { formatDuration } from '../format';
 import type { UserInfo } from '../types';
 import { useChat, type UiMessage } from '../useChat';
 import { Composer } from './Composer';
+import { AudioInputComposer } from './AudioInputComposer';
 import { AlertIcon, PencilIcon } from './Icons';
 import { MessageList } from './MessageList';
 import {
@@ -314,6 +315,8 @@ export function ChatPage({
           )}
         </div>
 
+        {chat.currentId && <AudioInputComposer key={chat.currentId} sessionId={chat.currentId}
+          disabled={busy || chat.bootstrapping} onUpdated={() => { chat.reloadMessages(); chat.reloadSessions(); }} />}
         <Composer
           busy={busy}
           stopping={stopping}

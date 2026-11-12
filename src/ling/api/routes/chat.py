@@ -832,6 +832,21 @@ async def send_turn(
     config: ConfigDep,
     settings: SettingsDep,
 ) -> StreamingResponse:
+    return await send_transcribed_turn(session_id, body, request, auth, conversation,
+                                       router_, config, settings)
+
+
+async def send_transcribed_turn(
+    session_id: str,
+    body: SendTurnBody,
+    request: Request,
+    auth: CurrentAuth,
+    conversation: ConversationDep,
+    router_: RouterDep,
+    config: ConfigDep,
+    settings: SettingsDep,
+    *, source_message_id: str | None = None,
+) -> StreamingResponse:
     # 配置可能刚被另一个副本改过：按修订号懒刷新密钥，
     # 否则本进程会继续用旧密钥，表现为"有时能聊有时不能"。
     await _refresh_config_if_stale(request)
@@ -915,8 +930,8 @@ async def send_turn(
     turn = await conversation.create_turn(
         window.id, client_turn_id=body.client_turn_id, config_revision=effective.revision
     )
-    user_msg = await conversation.add_message(
-        window.id,
+    user_msg = await conversation.adopt_input(
+        source_message_id, window.id,
         role="user",
         text=text,
         turn_id=turn.id,

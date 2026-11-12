@@ -1967,8 +1967,7 @@ async def upload_voice_reference(
 ) -> dict[str, object]:
     """上传一段参考音频，返回可以填进 ``dialogue.voice.reference_asset_id`` 的 id。
 
-    返回的 ``asset_id`` 就是 `media_assets.digest`（内容的 sha256），与设置页
-    校验要求的"64 位十六进制"一致（见 `settings/service._voice_issues`）。
+    返回的 ``asset_id`` 是窗口隔离的逻辑资产引用，内容摘要另存在 blob 表。
 
     ## 判据一律来自**内容**，不来自请求头
 
@@ -2053,9 +2052,10 @@ async def upload_voice_reference(
         duration_ms=None,
         producer="settings.voice_reference",
         retention_days=VOICE_REFERENCE_RETENTION_DAYS,
+        purpose="tts_reference",
         expected_digest=hashlib.sha256(data).hexdigest(),
     )
-    await _keep_voice_reference_from_expiring(session, saved.digest)
+    await _keep_voice_reference_from_expiring(session, saved.asset_id)
     await session.commit()
 
     audit_event(
@@ -2063,7 +2063,7 @@ async def upload_voice_reference(
         outcome="ok",
         actor=str(getattr(auth.user, "subject_id", "") or "owner"),
         target_type="media_asset",
-        target_id=saved.digest,
+        target_id=saved.asset_id,
         attributes={
             "format": container,
             "mime_type": mime_type,
@@ -2073,7 +2073,7 @@ async def upload_voice_reference(
     )
     return {
         "schema_version": "v1",
-        "asset_id": saved.digest,
+        "asset_id": saved.asset_id,
         "format": container,
         "mime_type": mime_type,
         # 大小取**落盘的那份字节**（`SavedAsset.size_bytes`），不是上传时的
@@ -2085,33 +2085,18 @@ async def upload_voice_reference(
     }
 
 
-async def _keep_voice_reference_from_expiring(session: AsyncSession, digest: str) -> None:
-    """把这一行的 ``expires_at`` 清成 ``None``（= 不自动过期）。
+async def _keep_voice_reference_from_expiring(session: AsyncSession, reference: str) -> None:
+    """参考素材的逻辑资产长期保留，旧 digest 继续兼容。"""
+    from ling.infra.media_assets import MediaAssetGrantRow, MediaAssetRow
 
-    ## 为什么传了 `retention_days=0` 还要再补一刀
-
-    `save_bytes` 有**两**条路径：
-
-    1. 新内容 → 按 ``retention_days`` 建行。传 0 → `expires_at=None`。正确。
-    2. 字节与**已有一条有效记录**完全相同 → 直接复用旧行，``created=False``，
-       **既不更新 `expires_at` 也不更新 `window_id`**（见 `assets.py` 去重分支，
-       那里刻意不动归属与保留期）。
-
-    路径 2 是真实的坑：用户上传的参考音频如果恰好与某条已存在的 TTS 产物
-    同字节（重复试同一段话、或从别处拿回同一段音频），复用的那一行仍带着
-    旧的 7 天保留期，一周后 `purge_expired` 把它标死 → `_voice_for_tts`
-    静默降级发文字。`purge_expired` 的 `_still_referenced` 只认
-    `media_evidence`，**不认配置里的 `reference_asset_id`**。
-
-    改 `assets.py` 的去重分支会影响所有调用方（合成产物恰恰**不该**被这样
-    延长），所以这一刀放在这一层：只有"音色参考素材"这个语义知道它必须长效。
-    """
-    from ling.infra.media_assets import MediaAssetRow
-
-    row = await session.get(MediaAssetRow, digest)
-    if row is not None and row.expires_at is not None:
-        row.expires_at = None
-        await session.flush()
+    grant = await session.get(MediaAssetGrantRow, reference)
+    if grant is not None:
+        grant.expires_at = None
+    else:
+        legacy = await session.get(MediaAssetRow, reference)
+        if legacy is not None:
+            legacy.expires_at = None
+    await session.flush()
 
 
 __all__ = ["VOICE_REFERENCE_WINDOW_ID", "router"]

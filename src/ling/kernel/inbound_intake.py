@@ -115,7 +115,8 @@ async def _log_denials_enabled(state: object) -> bool:
     return enabled
 
 
-async def process_inbound_payload(app: object, connector: object, payload: dict) -> dict:
+async def process_inbound_payload(app: object, connector: object, payload: dict,
+                                  *, _asr_resume: tuple | None = None) -> dict:
     """处理一条已经解析好的平台事件（字典）。
 
     返回要回给上报方的 JSON。**业务失败也返回 accepted=False 而不是抛错**——
@@ -129,7 +130,7 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
     from ling.ports.channel import ChannelError
 
     try:
-        envelope = connector.normalize_inbound(payload)  # type: ignore[attr-defined]
+        envelope = _asr_resume[0] if _asr_resume else connector.normalize_inbound(payload)  # type: ignore[attr-defined]
     except ChannelError as exc:
         from ling.ports.channel import ChannelErrorKind
 
@@ -219,13 +220,15 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
     connector_instance = connector.instance_id  # type: ignore[attr-defined]
     async with session_scope() as session:
         conversation = ConversationService(session)
-        claimed = await conversation.claim_event(
+        claimed = None if _asr_resume else await conversation.claim_event(
             scope=f"connector:{connector_instance}",
             key=envelope.external_event_id,
         )
         if claimed is not None:
             return {"accepted": True, "duplicate": True}
-        await session.commit()
+        has_audio = any(part.modality.value == "audio" for part in envelope.parts)
+        if not has_audio or _asr_resume:
+            await session.commit()
 
         # 协调器默认**每条消息新建一个**。这没有问题，因为 `TurnCoordinator`
         # 不带任何每轮状态：它的全部实例属性都在 `__init__` 里赋值，而且
@@ -279,7 +282,7 @@ async def process_inbound_payload(app: object, connector: object, payload: dict)
             persona_id=settings.persona_id,
         )
         try:
-            result = await bridge.handle(envelope)
+            result = await bridge.handle(envelope, resume_message_id=_asr_resume[1]) if _asr_resume else await bridge.handle(envelope)
         except Exception as exc:  # noqa: BLE001 - 任何失败都要能重投
             logger.exception("事件处理失败，撤回认领以便重投")
             await conversation.release_event(

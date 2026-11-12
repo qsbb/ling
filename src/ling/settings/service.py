@@ -295,7 +295,7 @@ def _voice_issues(
     2. ``voice_id`` / ``reference_asset_id`` 必须与 ``kind`` **配套**——
        `ports/speech.voice_requirement_issue` 是这条的唯一判定，运行时降级
        也调它，所以不会出现"保存时说过没问题、跑起来降级"。
-    3. ``reference_asset_id`` 必须是媒体的 sha256（64 位十六进制），且
+    3. ``reference_asset_id`` 必须是媒体逻辑资产 ID 或存量 sha256，且
        **真的在 media_assets 里**。这一条在这里判不了（要查库，而这函数
        是纯的），所以只判形态；"素材读不到"由运行时降级处理。
 
@@ -352,12 +352,16 @@ def _voice_issues(
         looks_like_digest = len(asset_id) == _ASSET_ID_HEX_LEN and all(
             ch in "0123456789abcdef" for ch in asset_id.lower()
         )
-        if not looks_like_digest:
+        looks_like_asset_id = asset_id.startswith("asset_") and (
+            6 < len(asset_id) <= 64
+            and all(ch.isascii() and (ch.isalnum() or ch in "_-") for ch in asset_id)
+        )
+        if not (looks_like_digest or looks_like_asset_id):
             issues.append(
                 ValidationIssue(
                     "dialogue.voice.reference_asset_id",
-                    "参考素材 id 应该是媒体库里那份音频的 sha256（64 位十六进制）。"
-                    "上传参考音频后取它的 digest 填在这里；不要填文件路径或网址。",
+                    "参考素材 id 应由参考音频上传接口返回。"
+                    "请上传音频并使用返回的 asset_id。",
                 )
             )
     return issues

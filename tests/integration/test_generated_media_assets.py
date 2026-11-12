@@ -46,7 +46,7 @@ from ling.domains.media.exports import (
 )
 from ling.domains.media.storage import GeneratedMediaStorage, MediaStorageError
 from ling.infra.db import session_scope
-from ling.infra.media_assets import MediaAssetRow
+from ling.infra.media_assets import MediaAssetGrantRow, MediaAssetRow
 
 pytestmark = pytest.mark.w0_web
 
@@ -532,6 +532,9 @@ async def test_过期后不可见且被清理(web_env, tmp_path) -> None:
         row = await session.get(MediaAssetRow, saved.digest)
         assert row is not None
         row.expires_at = utcnow() - timedelta(hours=1)
+        grant = await session.get(MediaAssetGrantRow, saved.asset_id)
+        assert grant is not None
+        grant.expires_at = row.expires_at
         await session.commit()
 
     storage = GeneratedMediaStorage(tmp_path)

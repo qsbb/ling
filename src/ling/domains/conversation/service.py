@@ -735,6 +735,24 @@ class ConversationService:
         await self._session.flush()
         return self._to_view(row)
 
+    async def adopt_input(self, message_id: str | None, window_id: str, **kwargs) -> MessageView:
+        """Advance an already accepted input without duplicating its message."""
+        if message_id is None:
+            return await self.add_message(window_id, **kwargs)
+        row = await self._session.scalar(
+            select(Message).where(Message.id == message_id, Message.window_id == window_id)
+            .with_for_update()
+        )
+        if row is None or row.retracted_at is not None or row.role != "user":
+            raise not_found("原消息已删除或撤回")
+        for key in ("text", "turn_id", "handled_as", "handled_reason", "attention_state", "sender_subject_id"):
+            if key in kwargs:
+                setattr(row, key, kwargs[key])
+        if kwargs.get("attention_state") == "seen":
+            row.seen_at = utcnow()
+        await self._session.flush()
+        return self._to_view(row)
+
     async def unseen_messages(
         self, window_id: str, *, limit: int = 20
     ) -> list[MessageView]:

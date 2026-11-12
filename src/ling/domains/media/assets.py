@@ -1,117 +1,8 @@
-"""生成媒体资产的**唯一写入方**：保存、读取、导出、过期清理。
+"""受管媒体的保存、窗口授权、租约与清理。
 
-## 一份产物的一生
-
-```
-   TTS 产出 bytes
-        │
-        │  save_bytes()  ── 1. 落盘（原子，storage.put）
-        │                    2. 插记录（ready_at 已设）
-        ▼
-   media_assets 一行  ── digest = sha256 = 文件名
-        │
-        ├── read_for_window()   授权后读字节（Web 播放）
-        ├── export_for_window() 授权后按 transport 导出（渠道发送）
-        ├── sign_url_for_window() 授权后签发短时效 URL
-        └── purge_expired()     过期清理（先标记、后删文件）
-```
-
-## 原子性：为什么先落盘后写库
-
-反过来（先插记录、再落盘）会出现**一段所有读者都能看到、但文件还不存在**
-的窗口。那段窗口里的每一次读取都是一次错误路径，而错误路径才是真正会被
-"偶发 500"暴露出来的东西。
-
-先落盘则相反：文件先完整存在，然后才有一行指向它。中间的失败（进程被杀）
-只留下一个**孤儿文件**（没有记录指向它），它不影响任何读取，且能被
-`collect_orphans()` 收拾掉。**孤儿文件是无害的，悬空记录是有害的**——所以
-永远选前者。
-
-## 去重与"两次请求同一份内容"
-
-`digest` 唯一。第二次保存同样的字节时：
-
-- 文件已存在 → 不重写；
-- 记录已存在、且**已失效**（软删/过期）→ 复活它并**改为新归属**，不新增行；
-- 记录已存在、且**仍有效** → 只当"内容已存在"返回：**不新增行，也不动原有
-  归属**（见下一段）。
-
-但这里有个真实的坑：**同一份音频可能被两个窗口用到**。一行只能记一个
-`window_id`，更新归属会让先前的窗口突然失去访问权（它的消息里引用的音频
-播不出来）。所以仍有效的记录**不更新归属**——代价转移到后来者身上。
-
-⚠️ 命中"仍有效"这一支还有一个副作用：**`expires_at` 不会被刷新**。同一窗口
-反复命中时（例如同一个 `(turn_id, message_id)` 的产物被重新保存），那一行的
-过期时刻仍是最早那一次算出来的，不会因为"刚刚又用了一次"而后移。
-
-处理方式：归属列为空/不同时**不动原有归属**，只把这一行当作"内容已存在"
-返回。**去重不动归属**——`actor_id` / `window_id` 永远是**第一个**写入者的，
-后来者拿到的 `SavedAsset.created` 是 `False`，而那一行并不属于它。
-
-**授权是严格的，没有例外。** 唯一的判定实现在
-`exports.check_window_access`：`actor_id` **且** `window_id` 都相同才放行，
-**同一个人的两个窗口也拒绝**（REQ-14「A 不能读 B」——同一个人的两个群是
-两个语境）。`read_for_window` / `export_for_window` / 签名 URL 走的都是这
-一份判定。
-
-所以：**跨窗口命中时，调用方拿到的 `created=False` + 他人窗口的 digest
-不能直接用**——拿它去引用音频，播放/导出时会被 `check_window_access`
-拒绝，用户的音频播不出来。调用方必须自己处理这件事（自己判断"这一行是
-不是我的"）：要么为自己的窗口重新生成，要么接受这一轮没有音频。
-
-注意 `digest` 兼作主键、也兼作磁盘文件名，一条记录只能有一个归属，所以
-**存储层无法为第二个窗口再建一行**——"内容共享、归属分开"需要改表结构
-（新迁移），当前形态下做不到。这也是为什么这条限制必须写在文档里，而不是
-指望调用层。
-
-### 跨窗口撞内容有多可能（当前唯一生产调用方：TTS）
-
-结论：**结构上可能，概率上极低**。两条依据都是查代码得来的，不是推断：
-
-1. **幂等键实际上是按窗口隔离的。** 合成幂等键是
-   `f"{request.turn_id}:{request.message_id}"`（`speech/orchestration.py`），
-   不含 `window_id`；而 `turns.id` 是主键、一行只有一个 `window_id`，所以
-   `turn_id` 本身就把窗口钉死了。生产唯一调用点
-   （`worker._deliver_speech_reply`）更进一步把窗口写进了键：
-   `message_id = f"attn:{window_ref}:1"`。⇒ **跨窗口的第二份请求不会命中
-   幂等键**，它会真的再合成一次，于是可能走到 `save_bytes` 的跨窗口去重。
-2. **跨窗口字节完全相同需要一个巧合。** 上游 `TtsRequest` 只带
-   `text` / `voice` / `model_id` / `response_format`，**不带窗口上下文**；
-   默认格式是 `mp3`。所以两个不同窗口只要说了同一句话、用同一音色同一模型，
-   就有机会产出逐字节相同的字节流——这要求上游合成是确定性的（未验证，
-   取决于供应商）。碰撞概率低，但不是零，且**随使用量单调增大**。
-
-所以不能断言"不可能"。但也不需要在这一层加字段去处理它：
-
-- 撞上时投递侧**已经**是安全的：`SpeechDelivery.deliver_speech` 把
-  `resolve_audio_ref` 的异常整体接住（`ExportDenied` 在里面），按降级配置
-  走，不会抛出、也不会把文字扣下——用户看到的是"这条本来想用语音说"的
-  降级，而不是一条静默无声的语音；
-- 而 `save_bytes` 即便加了 `owned` 之类的信号，生产调用方
-  （`_run_synthesis`）**也没有"照样重存一次"的出路**：主键是 `digest`、
-  磁盘文件名也是 `digest`，同一份字节写第二次必然还是命中同一行同一归属，
-  重存只会得到同一个 `created=False`。唯一可行的反应是"这一轮不发语音"，
-  而投递层在撞上的那一刻已经这么做了。
-
-⇒ 当前形态下 **(B) 没有能让调用方变好的动作**，只会在 `SavedAsset` 上多
-一个永远无法被合法满足的字段。真正让"跨窗口共享内容"可行的是
-"内容表 + 归属表"两表拆分（`digest` 不再是唯一的归属载体），那需要新迁移。
-
-## 删除为什么不影响在途任务
-
-删除分两步：**先软删（`deleted_at`）、后删文件**。
-
-- 软删之后所有读取路径都当它不存在（`is_live()` 为假），所以不会有人再
-  拿到一个即将消失的路径去下载；
-- 文件的实际删除被推迟到清理任务，且在删之前会**重新确认**没有活跃引用；
-- 在途任务（已经拿到内容、正在编码/发送）手里是**字节或已签名的 URL**，
-  不依赖文件继续存在——签名 URL 才需要文件，所以清理有一个宽限期
-  （见 `purge_expired` 的 `grace_seconds`）。
-
-## 保留期
-
-`retention_days` 可配置，默认 7 天。`LING_MEDIA_ASSET_RETENTION_DAYS`
-覆盖；设为 `0` 或负数表示**不自动过期**（用户明确要留着）。
+内容按 digest 存一份，逻辑资产按 asset_id 隔离窗口、用途和期限。
+存量 digest 引用继续对应原始归属；新调用使用不透明 asset_id。
+保存与清理持有同一内容锁，GC 只删除已无引用或租约的内容。
 """
 
 from __future__ import annotations
@@ -124,7 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import cast, delete, exists, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.media.exports import (
@@ -136,8 +28,9 @@ from ling.domains.media.exports import (
     export_as,
 )
 from ling.domains.media.storage import GeneratedMediaStorage, MediaStorageError
-from ling.infra.media_assets import MediaAssetRow, utcnow
+from ling.infra.media_assets import MediaAssetGrantRow, MediaAssetLeaseRow, MediaAssetRow, utcnow
 from ling.infra.models import MediaEvidenceRow
+from ling.infra.security import new_id
 
 logger = logging.getLogger("ling.domains.media.assets")
 
@@ -159,6 +52,8 @@ _FORMAT_MIME = {
     "silk": "audio/silk",
     "amr": "audio/amr",
     "m4a": "audio/mp4",
+    "webm": "audio/webm",
+    "flac": "audio/flac",
 }
 
 
@@ -176,22 +71,16 @@ class AssetNotFound(AssetError):
 
 @dataclass(frozen=True)
 class SavedAsset:
-    """一次保存的结果。"""
-
     digest: str
     size_bytes: int
-    #: 是否新建了数据库行（False = 同一份内容已存在，复用）。
-    #:
-    #: **`False` 不保证那一行属于这次请求的 `(actor_id, window_id)`**：
-    #: 去重命中时归属仍是第一个写入者的。跨窗口命中时拿这个 digest 去引用，
-    #: 会在 `check_window_access` 上被拒——调用方必须自己判断。
     created: bool
     relative_path: str
+    asset_id: str = ""
 
 
 @dataclass(frozen=True)
 class AssetView:
-    """对外可见的资产描述。**不含磁盘绝对路径**。"""
+    """授权后的逻辑资产元数据，包含真实内容摘要。"""
 
     digest: str
     kind: str
@@ -202,6 +91,35 @@ class AssetView:
     duration_ms: int | None
     created_at: datetime
     expires_at: datetime | None
+    asset_id: str = ""
+    actor_id: str = ""
+    window_id: str = ""
+    subject_id: str | None = None
+    purpose: str = "tts_output"
+    message_id: str | None = None
+    relative_path: str = ""
+
+
+async def load_asset(
+    session: AsyncSession, reference: str, *, now: datetime | None = None
+) -> AssetView:
+    """解析逻辑 ID 或旧 digest。归属授权由调用方执行。"""
+    grant = await session.get(MediaAssetGrantRow, reference, populate_existing=True)
+    digest = grant.blob_digest if grant is not None else reference
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:asset_key, 0))"),
+        {"asset_key": f"media_blob:{digest}"},
+    )
+    if grant is not None:
+        await session.refresh(grant)
+        blob = await session.get(MediaAssetRow, grant.blob_digest, populate_existing=True)
+        if blob is None or blob.ready_at is None or not grant.is_live(now=now):
+            raise AssetNotFound("媒体不存在或已失效")
+        return _to_view(blob, grant)
+    blob = await session.get(MediaAssetRow, reference, populate_existing=True)
+    if blob is None or not blob.is_live(now=now):
+        raise AssetNotFound("媒体不存在或已失效")
+    return _to_view(blob)
 
 
 def resolve_retention_days(value: int | None = None) -> int:
@@ -269,6 +187,8 @@ class GeneratedMediaService:
         producer: str | None = None,
         retention_days: int | None = None,
         expected_digest: str | None = None,
+        purpose: str = "tts_output",
+        retention_seconds: int | None = None,
     ) -> SavedAsset:
         """把一段字节存成可引用的资产。
 
@@ -285,70 +205,81 @@ class GeneratedMediaService:
             if mime_type is None:
                 raise AssetError(f"不支持的音频格式：{fmt!r}（允许：{sorted(_FORMAT_MIME)}）")
 
-        # 1. 落盘（原子）。这里抛错时库里什么都没有 —— 正是我们要的。
+        digest = hashlib.sha256(data).hexdigest()
+        await self._lock_blob(digest)
         stored = self._storage.put(data, expected_digest=expected_digest)
-
-        # 2. 插/改记录。
-        existing = await self._session.get(MediaAssetRow, stored.digest)
-        if existing is not None:
-            if not existing.is_live():
-                # 记录存在但不可用（已删除/过期）：**复活它**而不是新建。
-                # 主键是 digest，新建会撞主键；而内容确实还在盘上。
-                existing.deleted_at = None
-                existing.ready_at = utcnow()
-                existing.actor_id = actor_id
-                existing.window_id = window_id
-                if retention_days is not None or resolve_retention_days() > 0:
-                    existing.expires_at = _expiry_for(retention_days)
-                await self._session.flush()
-                return SavedAsset(
-                    digest=stored.digest,
-                    size_bytes=stored.size_bytes,
-                    created=False,
-                    relative_path=stored.relative_path,
-                )
-            # 内容完全一样且仍有效：复用，**不动归属**（见模块文档）。
-            # 注意 `existing` 可能是**别的窗口**的行：这时返回的 digest 仍
-            # 属于它，请求方拿去引用会被 `check_window_access` 拒绝。
-            logger.debug(
-                "生成媒体去重命中：digest=%s 归属=(%s,%s)",
-                stored.digest[:12],
-                existing.actor_id,
-                existing.window_id,
-            )
-            return SavedAsset(
-                digest=stored.digest,
-                size_bytes=stored.size_bytes,
-                created=False,
-                relative_path=stored.relative_path,
-            )
-
-        row = MediaAssetRow(
-            digest=stored.digest,
-            actor_id=actor_id,
-            window_id=window_id,
-            subject_id=subject_id,
-            kind=kind,
-            format=fmt.lower(),
-            mime_type=mime_type,
-            relative_path=stored.relative_path,
-            size_bytes=stored.size_bytes or len(data),
-            sample_rate=sample_rate,
-            duration_ms=duration_ms,
-            turn_id=turn_id,
-            message_id=message_id,
-            producer=producer,
-            # 落盘已经完成，所以这一行出生即 ready。
-            ready_at=utcnow(),
-            expires_at=_expiry_for(retention_days),
+        blob = await self._session.get(MediaAssetRow, stored.digest, populate_existing=True)
+        created = blob is None
+        expiry = (
+            utcnow() + timedelta(seconds=retention_seconds)
+            if retention_seconds is not None
+            else _expiry_for(retention_days)
         )
-        self._session.add(row)
+        if blob is None:
+            blob = MediaAssetRow(
+                digest=stored.digest,
+                actor_id=actor_id,
+                window_id=window_id,
+                subject_id=subject_id,
+                kind=kind,
+                format=fmt.lower(),
+                mime_type=mime_type,
+                relative_path=stored.relative_path,
+                size_bytes=stored.size_bytes,
+                sample_rate=sample_rate,
+                duration_ms=duration_ms,
+                turn_id=turn_id,
+                message_id=message_id,
+                producer=producer,
+                ready_at=utcnow(),
+                expires_at=expiry,
+            )
+            self._session.add(blob)
+            await self._session.flush()
+
+
+        grant = await self._session.scalar(
+            select(MediaAssetGrantRow)
+            .where(
+                MediaAssetGrantRow.blob_digest == stored.digest,
+                MediaAssetGrantRow.actor_id == actor_id,
+                MediaAssetGrantRow.window_id == window_id,
+                MediaAssetGrantRow.purpose == purpose,
+                MediaAssetGrantRow.message_id == message_id,
+                MediaAssetGrantRow.deleted_at.is_(None),
+            )
+            .order_by(MediaAssetGrantRow.created_at.desc())
+            .limit(1)
+        )
+        if grant is None or not grant.is_live():
+            grant = MediaAssetGrantRow(
+                asset_id=new_id("asset"),
+                blob_digest=stored.digest,
+                actor_id=actor_id,
+                window_id=window_id,
+                subject_id=subject_id,
+                purpose=purpose,
+                turn_id=turn_id,
+                message_id=message_id,
+                producer=producer,
+                expires_at=expiry,
+            )
+            self._session.add(grant)
+        else:
+            grant.expires_at = expiry
         await self._session.flush()
         return SavedAsset(
             digest=stored.digest,
-            size_bytes=row.size_bytes,
-            created=True,
+            size_bytes=stored.size_bytes,
+            created=created,
             relative_path=stored.relative_path,
+            asset_id=grant.asset_id,
+        )
+
+    async def _lock_blob(self, digest: str) -> None:
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:asset_key, 0))"),
+            {"asset_key": f"media_blob:{digest}"},
         )
 
     async def save_stream(
@@ -387,21 +318,74 @@ class GeneratedMediaService:
 
     # -------------------------------------------------------------- 读取
 
-    async def _load_live(self, digest: str, *, now: datetime | None = None) -> MediaAssetRow:
-        """取一行**可对外提供**的记录；否则抛 `AssetNotFound`。"""
-        row = await self._session.get(MediaAssetRow, digest)
-        if row is None or not row.is_live(now=now):
-            raise AssetNotFound("媒体不存在或已失效")
-        return row
+    async def _load_live(self, reference: str, *, now: datetime | None = None) -> AssetView:
+        return await load_asset(self._session, reference, now=now)
 
-    def _abs_path(self, row: MediaAssetRow) -> Path:
-        """记录 → 绝对路径（含越界检查）。"""
+    def _abs_path(self, row: AssetView) -> Path:
         return self._storage.absolute_path_of(row.relative_path)
 
-    async def view(self, digest: str) -> AssetView:
-        """不含授权的元数据（调用方负责先确认可见性）。"""
-        row = await self._load_live(digest)
-        return _to_view(row)
+    async def view(self, reference: str) -> AssetView:
+        return await self._load_live(reference)
+
+    async def view_for_window(
+        self, reference: str, *, requester_actor: str | None, requester_window: str | None
+    ) -> AssetView:
+        row = await self._load_live(reference)
+        check_window_access(
+            requester_window=requester_window,
+            requester_actor=requester_actor,
+            file_window=row.window_id,
+            file_actor=row.actor_id,
+        )
+        return row
+
+    async def acquire_lease(
+        self,
+        reference: str,
+        *,
+        requester_actor: str | None,
+        requester_window: str | None,
+        ttl_seconds: int = 180,
+    ) -> str:
+        if ttl_seconds <= 0:
+            raise AssetError("租约期限必须为正")
+        row = await self.view_for_window(
+            reference, requester_actor=requester_actor, requester_window=requester_window
+        )
+        await self._lock_blob(row.digest)
+        row = await self.view_for_window(
+            reference, requester_actor=requester_actor, requester_window=requester_window
+        )
+        asset_id = row.asset_id
+        if not asset_id:
+            # 存量 digest 的授权主体确定，按原归属补建可租赁逻辑引用。
+            grant = MediaAssetGrantRow(
+                asset_id=new_id("asset"),
+                blob_digest=row.digest,
+                actor_id=row.actor_id,
+                window_id=row.window_id,
+                subject_id=row.subject_id,
+                purpose=row.purpose,
+                expires_at=row.expires_at,
+            )
+            self._session.add(grant)
+            await self._session.flush()
+            asset_id = grant.asset_id
+        lease_id = new_id("lease")
+        self._session.add(
+            MediaAssetLeaseRow(
+                lease_id=lease_id,
+                asset_id=asset_id,
+                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+            )
+        )
+        await self._session.flush()
+        return lease_id
+
+    async def release_lease(self, lease_id: str) -> None:
+        await self._session.execute(
+            delete(MediaAssetLeaseRow).where(MediaAssetLeaseRow.lease_id == lease_id)
+        )
 
     async def read_for_window(
         self,
@@ -415,12 +399,12 @@ class GeneratedMediaService:
         授权规则的唯一实现在 `exports.check_window_access`：这条路与三种
         transport 用的是同一份判定，不会出现"播放能取、渠道不能取"的分叉。
         """
-        row = await self._load_live(digest)
-        check_window_access(
-            requester_window=requester_window,
-            requester_actor=requester_actor,
-            file_window=row.window_id,
-            file_actor=row.actor_id,
+        row = await self.view_for_window(
+            digest, requester_actor=requester_actor, requester_window=requester_window
+        )
+        await self._lock_blob(row.digest)
+        row = await self.view_for_window(
+            digest, requester_actor=requester_actor, requester_window=requester_window
         )
         try:
             data = self._storage.read(row.digest)
@@ -432,8 +416,9 @@ class GeneratedMediaService:
 
     async def verify_integrity(self, digest: str) -> bool:
         """重算 hash 与记录比对（运维自检用）。"""
-        row = await self._session.get(MediaAssetRow, digest)
-        if row is None:
+        try:
+            row = await self._load_live(digest)
+        except AssetNotFound:
             return False
         if not self._storage.exists(row.digest):
             return False
@@ -459,9 +444,16 @@ class GeneratedMediaService:
             digest, requester_actor=requester_actor, requester_window=requester_window
         )
         row = await self._load_live(digest)
+        if transport in (ExportTransport.local_path, ExportTransport.signed_url):
+            await self.acquire_lease(
+                digest,
+                requester_actor=requester_actor,
+                requester_window=requester_window,
+                ttl_seconds=ttl_seconds,
+            )
         return export_as(
             transport=transport,
-            digest=row.digest,
+            digest=digest,
             data=data,
             abs_path=str(self._abs_path(row)),
             mime_type=row.mime_type,
@@ -517,13 +509,38 @@ class GeneratedMediaService:
 
     # -------------------------------------------------------------- 删除与过期
 
-    async def soft_delete(self, digest: str, *, reason: str = "") -> bool:
-        """标记删除。**立即对所有读取路径不可见**，文件由清理任务稍后删。"""
-        row = await self._session.get(MediaAssetRow, digest)
-        if row is None or row.deleted_at is not None:
+    async def soft_delete(self, reference: str, *, reason: str = "") -> bool:
+        grant = await self._session.get(MediaAssetGrantRow, reference, populate_existing=True)
+        if grant is not None:
+            if grant.deleted_at is not None:
+                return False
+            grant.deleted_at = utcnow()
+            grant.note = reason or grant.note
+            blob = await self._session.get(MediaAssetRow, grant.blob_digest)
+            if blob is not None and (blob.actor_id, blob.window_id) == (
+                grant.actor_id,
+                grant.window_id,
+            ):
+                blob.deleted_at = utcnow()
+            await self._session.flush()
+            return True
+        blob = await self._session.get(MediaAssetRow, reference, populate_existing=True)
+        if blob is None or blob.deleted_at is not None:
             return False
-        row.deleted_at = utcnow()
-        row.note = reason or row.note
+        blob.deleted_at = utcnow()
+        blob.note = reason or blob.note
+        # 存量 digest 删除只撤销原归属的引用，其他窗口引用独立存活。
+        grants = (
+            await self._session.scalars(
+                select(MediaAssetGrantRow).where(
+                    MediaAssetGrantRow.blob_digest == blob.digest,
+                    MediaAssetGrantRow.actor_id == blob.actor_id,
+                    MediaAssetGrantRow.window_id == blob.window_id,
+                )
+            )
+        ).all()
+        for item in grants:
+            item.deleted_at = utcnow()
         await self._session.flush()
         return True
 
@@ -534,79 +551,121 @@ class GeneratedMediaService:
         grace_seconds: int = DEFAULT_DELETE_GRACE_SECONDS,
         limit: int = 200,
     ) -> int:
-        """清理过期资产，返回真正删掉的文件数。
-
-        两趟：
-
-        1. 把 `expires_at <= now` 的**未删除**记录标成软删（此刻起不可见）；
-        2. 把软删已经超过 `grace_seconds` 的记录连文件一起删。
-
-        两趟分开是为了让"不可见"立刻生效、"删文件"延后——在途任务与已签发
-        的 URL 因此不会被半路抽走文件。
-        """
         current = now or utcnow()
-        purged = 0
-
-        expired = (
-            await self._session.execute(
-                select(MediaAssetRow)
-                .where(
-                    MediaAssetRow.deleted_at.is_(None),
-                    MediaAssetRow.expires_at.is_not(None),
-                    MediaAssetRow.expires_at <= current,
-                )
-                .limit(limit)
-            )
-        ).scalars()
-        marked = 0
-        for row in expired:
-            row.deleted_at = current
-            marked += 1
-        if marked:
-            await self._session.flush()
-
         cutoff = current - timedelta(seconds=grace_seconds)
-        candidates = (
-            await self._session.execute(
+        await self._session.execute(
+            delete(MediaAssetLeaseRow).where(MediaAssetLeaseRow.expires_at <= current)
+        )
+        grant_expired = exists(
+            select(MediaAssetGrantRow.asset_id).where(
+                MediaAssetGrantRow.blob_digest == MediaAssetRow.digest,
+                or_(
+                    MediaAssetGrantRow.deleted_at.is_not(None),
+                    MediaAssetGrantRow.expires_at <= current,
+                ),
+            )
+        )
+        blobs = (
+            await self._session.scalars(
                 select(MediaAssetRow)
                 .where(
-                    MediaAssetRow.deleted_at.is_not(None),
-                    MediaAssetRow.deleted_at <= cutoff,
+                    or_(
+                        MediaAssetRow.deleted_at.is_not(None),
+                        MediaAssetRow.expires_at <= current,
+                        grant_expired,
+                    )
                 )
+                .order_by(MediaAssetRow.created_at)
                 .limit(limit)
             )
-        ).scalars()
-        for row in candidates:
-            if await self._still_referenced(row.digest):
-                # 还有在途任务/证据引用它：只保留记录，不删文件，下一轮再看。
-                continue
-            if self._storage.delete(row.digest):
-                purged += 1
-            await self._session.delete(row)
-        if purged:
+        ).all()
+        purged = 0
+        for blob in blobs:
+            await self._lock_blob(blob.digest)
+            await self._session.refresh(blob)
+            grants = (
+                await self._session.scalars(
+                    select(MediaAssetGrantRow)
+                    .where(MediaAssetGrantRow.blob_digest == blob.digest)
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+            for grant in grants:
+                if (
+                    grant.deleted_at is None
+                    and grant.expires_at is not None
+                    and grant.expires_at <= current
+                ):
+                    grant.deleted_at = current
+            if (
+                blob.deleted_at is None
+                and blob.expires_at is not None
+                and blob.expires_at <= current
+            ):
+                blob.deleted_at = current
             await self._session.flush()
-
-        if marked or purged:
-            logger.info("生成媒体清理：标记 %d 条过期，删除 %d 个文件", marked, purged)
+            if blob.deleted_at is None or blob.deleted_at > cutoff:
+                continue
+            if any(g.deleted_at is None or g.deleted_at > cutoff for g in grants):
+                continue
+            leased = await self._session.scalar(
+                select(MediaAssetLeaseRow.lease_id)
+                .join(
+                    MediaAssetGrantRow, MediaAssetLeaseRow.asset_id == MediaAssetGrantRow.asset_id
+                )
+                .where(
+                    MediaAssetGrantRow.blob_digest == blob.digest,
+                    MediaAssetLeaseRow.expires_at > current,
+                )
+                .limit(1)
+            )
+            if leased is not None or await self._still_referenced(blob.digest, grants):
+                continue
+            for grant in grants:
+                await self._session.delete(grant)
+            await self._session.flush()
+            if self._storage.delete(blob.digest):
+                purged += 1
+            await self._session.delete(blob)
+        await self._session.flush()
         return purged
 
-    async def _still_referenced(self, digest: str) -> bool:
-        """文件是否还被别处引用（目前只有 `media_evidence.media_ref`）。"""
-        referenced = (
-            await self._session.execute(
-                select(MediaEvidenceRow.id).where(MediaEvidenceRow.media_ref == digest).limit(1)
+    async def _still_referenced(
+        self, digest: str, grants: Sequence[MediaAssetGrantRow] = ()
+    ) -> bool:
+        refs = [digest, f"asset:{digest}"]
+        for grant in grants:
+            refs.extend((grant.asset_id, f"asset:{grant.asset_id}"))
+        if (
+            await self._session.scalar(
+                select(MediaEvidenceRow.id).where(MediaEvidenceRow.media_ref.in_(refs)).limit(1)
             )
-        ).scalar_one_or_none()
-        return referenced is not None
+            is not None
+        ):
+            return True
+        if not grants:
+            return False
+        from ling.infra.asr_jobs import AsrJob
+
+        payload_matches = [
+            cast(AsrJob.payload, JSONB).contains({"audio": [{"asset_id": grant.asset_id}]})
+            for grant in grants
+        ]
+        return (
+            await self._session.scalar(
+                select(AsrJob.id)
+                .where(
+                    AsrJob.state.in_(("queued", "running", "succeeded", "unknown")),
+                    AsrJob.submission == "pending",
+                    or_(*payload_matches),
+                )
+                .limit(1)
+            )
+            is not None
+        )
 
     async def collect_orphans(self, *, limit: int = 500) -> int:
-        """删掉**没有任何记录指向**的磁盘文件，返回删除个数。
-
-        孤儿是"先落盘后写库"的正常副产物（两步之间进程被杀）。它们无害但占
-        空间。只清理超过宽限期的文件，避免删掉别的进程正在保存的临时产物。
-        """
-        rows = (await self._session.execute(select(MediaAssetRow.digest))).scalars().all()
-        known = set(rows)
+        """持内容锁复查数据库，避免清理并发保存中的内容。"""
         removed = 0
         root = self._storage.root
         if not root.is_dir():
@@ -617,7 +676,11 @@ class GeneratedMediaService:
             for candidate in shard.iterdir():
                 if candidate.name.startswith("."):
                     continue
-                if candidate.stem not in known:
+                await self._lock_blob(candidate.name)
+                exists = await self._session.get(
+                    MediaAssetRow, candidate.name, populate_existing=True
+                )
+                if exists is None:
                     try:
                         candidate.unlink()
                         removed += 1
@@ -635,17 +698,25 @@ def _expiry_for(retention_days: int | None) -> datetime | None:
     return utcnow() + timedelta(days=days)
 
 
-def _to_view(row: MediaAssetRow) -> AssetView:
+def _to_view(blob: MediaAssetRow, grant: MediaAssetGrantRow | None = None) -> AssetView:
+    owner = grant or blob
     return AssetView(
-        digest=row.digest,
-        kind=row.kind,
-        format=row.format,
-        mime_type=row.mime_type,
-        size_bytes=row.size_bytes,
-        sample_rate=row.sample_rate,
-        duration_ms=row.duration_ms,
-        created_at=row.created_at,
-        expires_at=row.expires_at,
+        digest=blob.digest,
+        kind=blob.kind,
+        format=blob.format,
+        mime_type=blob.mime_type,
+        size_bytes=blob.size_bytes,
+        sample_rate=blob.sample_rate,
+        duration_ms=blob.duration_ms,
+        created_at=owner.created_at,
+        expires_at=owner.expires_at,
+        asset_id=grant.asset_id if grant else "",
+        actor_id=owner.actor_id,
+        window_id=owner.window_id,
+        subject_id=owner.subject_id,
+        purpose=grant.purpose if grant else "tts_output",
+        message_id=owner.message_id,
+        relative_path=blob.relative_path,
     )
 
 
@@ -657,26 +728,40 @@ async def list_window_assets(
     limit: int = 50,
     now: datetime | None = None,
 ) -> list[AssetView]:
-    """列出某窗口里可播放的产物（**只返回仍有效的**）。"""
     current = now or utcnow()
-    rows: Sequence[MediaAssetRow] = (
-        (
-            await session.execute(
-                select(MediaAssetRow)
-                .where(
-                    MediaAssetRow.actor_id == actor_id,
-                    MediaAssetRow.window_id == window_id,
-                    MediaAssetRow.deleted_at.is_(None),
-                    MediaAssetRow.ready_at.is_not(None),
-                )
-                .order_by(MediaAssetRow.created_at.desc())
-                .limit(limit)
+    rows = (
+        await session.execute(
+            select(MediaAssetRow, MediaAssetGrantRow)
+            .join(MediaAssetGrantRow, MediaAssetGrantRow.blob_digest == MediaAssetRow.digest)
+            .where(
+                MediaAssetGrantRow.actor_id == actor_id,
+                MediaAssetGrantRow.window_id == window_id,
+                MediaAssetGrantRow.deleted_at.is_(None),
+                MediaAssetRow.ready_at.is_not(None),
             )
+            .order_by(MediaAssetGrantRow.created_at.desc())
+            .limit(limit)
         )
-        .scalars()
-        .all()
+    ).all()
+    views = [_to_view(blob, grant) for blob, grant in rows if grant.is_live(now=current)]
+    known = {view.digest for view in views}
+    legacy = (
+        await session.scalars(
+            select(MediaAssetRow)
+            .where(
+                MediaAssetRow.actor_id == actor_id,
+                MediaAssetRow.window_id == window_id,
+                MediaAssetRow.deleted_at.is_(None),
+                MediaAssetRow.ready_at.is_not(None),
+            )
+            .order_by(MediaAssetRow.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    views.extend(
+        _to_view(row) for row in legacy if row.digest not in known and row.is_live(now=current)
     )
-    return [_to_view(row) for row in rows if row.is_live(now=current)]
+    return views[:limit]
 
 
 __all__ = [
@@ -688,5 +773,6 @@ __all__ = [
     "GeneratedMediaService",
     "SavedAsset",
     "list_window_assets",
+    "load_asset",
     "resolve_retention_days",
 ]

@@ -315,12 +315,13 @@ class SpeechDelivery:
         """
         from ling.domains.media.exports import ExportTransport
 
+        reference = artifact.asset_id or artifact.digest
         if transport == "asset":
             # 不导出也不读文件：渠道拿 digest 自己去问存储（同进程部署）。
-            return f"asset:{artifact.digest}"
+            return f"asset:{reference}"
         if transport == "base64":
             target = await self._media.export_for_window(
-                artifact.digest,
+                reference,
                 transport=ExportTransport.base64,
                 requester_actor=actor_id,
                 requester_window=window_id,
@@ -331,7 +332,7 @@ class SpeechDelivery:
         if transport == "shared_file":
             # 路径由 media 服务自己算（它知道 `data_dir`），**不让调用方猜**。
             target = await self._media.export_for_window(
-                artifact.digest,
+                reference,
                 transport=ExportTransport.local_path,
                 requester_actor=actor_id,
                 requester_window=window_id,
@@ -340,7 +341,7 @@ class SpeechDelivery:
                 raise RuntimeError("local_path 导出没有返回路径")
             return target.path
         target = await self._media.export_for_window(
-            artifact.digest,
+            reference,
             transport=ExportTransport.signed_url,
             requester_actor=actor_id,
             requester_window=window_id,

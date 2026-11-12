@@ -312,7 +312,7 @@ def test_downgrade_then_upgrade_round_trip() -> None:
     """降到底再升回来，结构完全恢复。这是"3 个链式回滚测试"依赖的能力。"""
     with _fresh_db_at(REV) as url:
         _run_alembic("downgrade", url, PARENT)
-        _run_alembic("upgrade", url, "head")
+        _run_alembic("upgrade", url, REV)
 
         assert _current_version(url) == REV
         assert "connector_instances" in _tables(url)

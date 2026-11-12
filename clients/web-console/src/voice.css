@@ -131,3 +131,24 @@
     line-height: 20px;
   }
 }
+
+.composer__audio {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+}
+.composer__audio button {
+  font: inherit;
+  border: 1px solid var(--border, #d7d9df);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: inherit;
+  padding: 0.35rem 0.65rem;
+  cursor: pointer;
+}
+.composer__audio button:disabled { opacity: 0.5; cursor: default; }
+.composer__audio audio { max-width: 100%; height: 2.5rem; }
+.composer__audio textarea { flex-basis: 100%; min-height: 5rem; font: inherit; }
+.composer__audio [role='alert'] { color: var(--danger, #b42318); flex-basis: 100%; }

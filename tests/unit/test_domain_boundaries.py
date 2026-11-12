@@ -105,6 +105,21 @@ class Violation:
 
 
 ALLOWED: dict[tuple[str, str], str] = {
+    ("speech/asr_runtime.py", "ling.domains.conversation.service"): (
+        "识别完成后更新已登记源消息的转写，再复用 ConversationService 的消息与轮次接口。"
+    ),
+    ("speech/asr_runtime.py", "ling.domains.media.assets"): (
+        "ASR 输入必须持有受授权逻辑资产的租约并读取其字节，媒体资产服务是授权与 GC 的唯一入口。"
+    ),
+    ("speech/asr_runtime.py", "ling.domains.media.service"): (
+        "平台媒体引用需要沿用入站媒体的授权检查，识别前从 media service 查询证据权限。"
+    ),
+    ("speech/transcription.py", "ling.domains.consent.service"): (
+        "语音派生文本的读取和提交必须复查 media.inbound 授权，consent service 持有授权真相。"
+    ),
+    ("speech/transcription.py", "ling.domains.conversation.service"): (
+        "Web 语音发送时在授权事务内登记唯一源消息，后续复用该消息提交转写。"
+    ),
     ("attention/service.py", "ling.domains.conversation.service"): (
         "群聊轮询的全部意义就是刷「这个窗口有哪些未读」。只调 "
         "ConversationService.unseen_messages / mark_seen / mark_handled / "
@@ -388,7 +403,10 @@ def test_whitelist_only_allows_public_service_modules() -> None:
     for (path, module), reason in ALLOWED.items():
         parts = module.split(".")
         assert parts[:2] == ["ling", "domains"], f"{path}: 白名单模块名不对：{module}"
-        assert len(parts) == 4 and parts[3] == "service", (
+        public_service_modules = {"ling.domains.media.assets"}
+        assert len(parts) == 4 and (
+            parts[3] == "service" or module in public_service_modules
+        ), (
             f"{path}: 白名单只允许 import `<域>.service`，不允许 {module}。\n"
             "要读别人的 models/表，请改成走对方的 service 公开方法。"
         )

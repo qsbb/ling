@@ -32,6 +32,7 @@ import pytest
 from sqlalchemy import select
 
 import ling.worker as worker_module
+from ling.domains.media.assets import load_asset
 from ling.domains.media.storage import GeneratedMediaStorage
 from ling.infra.db import session_scope
 from ling.infra.media_assets import MediaAssetRow
@@ -98,24 +99,24 @@ def _error(response) -> dict:  # noqa: ANN001
 # --------------------------------------------------------------------------- #
 
 
-async def test_upload_returns_digest_and_persists_a_live_row(logged_in: TestEnv) -> None:
-    """上传成功 → 返回 asset_id == 内容 sha256，且库里有一行 `is_live()` 的记录。
+async def test_upload_returns_asset_id_and_persists_a_live_grant(logged_in: TestEnv) -> None:
+    """上传成功返回不透明 asset_id，逻辑授权独立于 blob 的 SHA-256。
 
     必须失败于「只返回 id 但不落库」：那种实现下设置页填进去、发布也通过
     （校验只看形态），运行时 `_load_reference_audio` 读不到 → 静默降级发文字，
     而用户看到的是"上传成功"。
 
-    asset_id **必须**是内容摘要：设置页校验要求 64 位十六进制
-    （`settings/service._voice_issues`），读取端又按它 `session.get()`。
-    返回一个自增 id 会让两处都对不上。
+    asset_id 不暴露摘要或路径。读取时由 media asset service 验证 grant，
+    再解析到内容 blob。
     """
     r = await _upload_with_origin(logged_in, WAV_BYTES)
     assert r.status_code == 200, r.text
     body = r.json()
 
     digest = hashlib.sha256(WAV_BYTES).hexdigest()
+    asset_id = body["asset_id"]
     assert body["schema_version"] == "v1"
-    assert body["asset_id"] == digest
+    assert asset_id.startswith("asset_")
     assert body["format"] == "wav"
     assert body["mime_type"] == "audio/wav"
     assert body["size_bytes"] == len(WAV_BYTES)
@@ -124,12 +125,14 @@ async def test_upload_returns_digest_and_persists_a_live_row(logged_in: TestEnv)
     assert body["retention_days"] == 0
 
     async with session_scope() as session:
-        row = await session.get(MediaAssetRow, digest)
+        row = await load_asset(session, asset_id)
     assert row is not None, "上传成功却没有媒体记录"
-    assert row.is_live(), "刚上传的素材就已经不可用了"
+    assert row.expires_at is None, "刚上传的参考素材应当是长效 grant"
     assert row.kind == "audio"
     assert row.format == "wav"
     assert row.mime_type == "audio/wav"
+    assert row.digest == digest
+    assert row.purpose == "tts_reference"
     assert row.window_id == "__voice_reference__", row.window_id
 
     # 文件真的落在 `data_dir/generated_media/` 下——也就是读取端去的那个根。
@@ -161,9 +164,9 @@ async def test_uploaded_file_matches_what_the_read_side_loads(
 
     r = await _upload_with_origin(logged_in, WAV_BYTES)
     assert r.status_code == 200, r.text
-    digest = r.json()["asset_id"]
+    asset_id = r.json()["asset_id"]
 
-    audio = await worker_module._load_reference_audio(digest)
+    audio = await worker_module._load_reference_audio(asset_id)
     assert audio is not None, "读端读不到刚上传的素材（写入与读取的根不一致？）"
     assert audio.content == WAV_BYTES
     assert audio.spec.container == "wav"
@@ -325,10 +328,10 @@ async def test_uploaded_reference_never_expires(logged_in: TestEnv) -> None:
 
     r = await _upload_with_origin(logged_in, WAV_BYTES)
     assert r.status_code == 200, r.text
-    digest = r.json()["asset_id"]
+    asset_id = r.json()["asset_id"]
 
     async with session_scope() as session:
-        row = await session.get(MediaAssetRow, digest)
+        row = await load_asset(session, asset_id)
         assert row is not None
         assert row.expires_at is None, f"参考素材带了保留期：{row.expires_at}"
 
@@ -342,9 +345,9 @@ async def test_uploaded_reference_never_expires(logged_in: TestEnv) -> None:
         await session.commit()
 
     async with session_scope() as session:
-        row = await session.get(MediaAssetRow, digest)
+        row = await load_asset(session, asset_id)
     assert row is not None, "参考素材被清理任务删掉了"
-    assert row.is_live(), "参考素材被清理标记后不可用了"
+    assert row.expires_at is None, "参考素材被清理任务误判为可过期"
 
 
 async def test_dedup_against_an_expiring_row_still_becomes_long_lived(
@@ -387,12 +390,13 @@ async def test_dedup_against_an_expiring_row_still_becomes_long_lived(
 
     r = await _upload_with_origin(logged_in, WAV_BYTES)
     assert r.status_code == 200, r.text
+    reference_id = r.json()["asset_id"]
 
     async with session_scope() as session:
-        row = await session.get(MediaAssetRow, digest)
+        row = await load_asset(session, reference_id)
     assert row is not None
-    assert row.expires_at is None, "去重命中一条会过期的旧行，参考素材仍然会在一周后失效"
-    assert row.is_live()
+    assert row.digest == digest
+    assert row.expires_at is None, "新参考素材 grant 必须长效，即便磁盘 blob 被其他用途引用"
 
 
 # --------------------------------------------------------------------------- #

@@ -63,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.api.deps import CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError, not_found
 from ling.domains.media import exports as exports_mod
+from ling.domains.media.assets import AssetNotFound, AssetView, load_asset
 from ling.domains.media.playback import (
     VoiceAsset,
     VoiceNotFound,
@@ -71,7 +72,6 @@ from ling.domains.media.playback import (
     record_playback,
 )
 from ling.domains.media.storage import GeneratedMediaStorage, MediaStorageError
-from ling.infra.media_assets import MediaAssetRow
 from ling.infra.security import load_signing_root_key
 
 logger = logging.getLogger("ling.api.media")
@@ -107,12 +107,11 @@ def _storage(settings: SettingsDep) -> GeneratedMediaStorage:
     return GeneratedMediaStorage(settings.data_dir)
 
 
-async def _live_asset(session: AsyncSession, digest: str) -> MediaAssetRow:
-    """取一行**当前可对外提供**的记录；否则 404。"""
-    row = await session.get(MediaAssetRow, digest)
-    if row is None or not row.is_live():
-        raise not_found(_MEDIA_MISSING)
-    return row
+async def _live_asset(session: AsyncSession, reference: str) -> AssetView:
+    try:
+        return await load_asset(session, reference)
+    except AssetNotFound:
+        raise not_found(_MEDIA_MISSING) from None
 
 
 # ---------------------------------------------------------------- Range
@@ -348,7 +347,7 @@ async def list_voice_messages(
         "schema_version": "v1",
         "window_id": session_id,
         "voice_messages": [
-            _voice_dict(asset, url=_signed_url(settings, request, asset.digest))
+            _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest))
             for asset in assets
         ],
     }
@@ -374,7 +373,7 @@ async def get_message_voice(
         )
     except VoiceNotFound as exc:
         raise _voice_or_404(exc) from None
-    return _voice_dict(asset, url=_signed_url(settings, request, asset.digest))
+    return _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest))
 
 
 class PlaybackBody(BaseModel):

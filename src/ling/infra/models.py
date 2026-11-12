@@ -3052,3 +3052,6 @@ class DeferredReply(Base):
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+# Durable transcription tasks share the application's metadata.
+from ling.infra import asr_jobs as _asr_jobs  # noqa: E402,F401

@@ -51,7 +51,8 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.media_assets import MediaAssetRow, utcnow
+from ling.domains.media.assets import AssetView, _to_view
+from ling.infra.media_assets import MediaAssetGrantRow, MediaAssetRow, utcnow
 from ling.infra.media_playback import MediaPlayEventRow, play_state_for
 from ling.infra.models import Message, Window
 
@@ -92,6 +93,7 @@ class VoiceAsset:
     played: bool
     play_count: int
     last_played_at: datetime | None
+    asset_id: str = ""
 
 
 def _owner_only(window: Window | None, subject_id: str) -> bool:
@@ -109,34 +111,26 @@ async def _window_of(session: AsyncSession, window_id: str) -> Window | None:
 
 async def _assets_for_messages(
     session: AsyncSession, message_ids: list[str]
-) -> dict[str, MediaAssetRow]:
-    """批量取"这些消息各自对应的、仍然可用的音频资产"。
-
-    一个 message 理论上可以有多段语音（一轮拆成几段发）。首版按**最早可播的
-    那一份**返回：前端只放一个播放器，给多个地址会让用户不知道点哪个。
-
-    用 `IN` 一次查完，不做 N+1：会话里可能有几十条语音消息，逐条查会把
-    "打开会话"变成几十次往返。
-    """
+) -> dict[str, AssetView]:
     if not message_ids:
         return {}
-    rows = (
-        await session.execute(
-            select(MediaAssetRow)
-            .where(
-                MediaAssetRow.message_id.in_(message_ids),
-                MediaAssetRow.kind == "audio",
-            )
-            .order_by(MediaAssetRow.created_at)
-        )
-    ).scalars()
     current = utcnow()
-    picked: dict[str, MediaAssetRow] = {}
-    for row in rows:
-        if row.message_id is None or not row.is_live(now=current):
-            continue
-        # 先到先得：按 created_at 升序，第一条可播的就是"最早那一份"。
-        picked.setdefault(row.message_id, row)
+    rows = (await session.execute(select(MediaAssetRow, MediaAssetGrantRow).join(
+        MediaAssetGrantRow, MediaAssetGrantRow.blob_digest == MediaAssetRow.digest
+    ).where(
+        MediaAssetGrantRow.message_id.in_(message_ids),
+        MediaAssetGrantRow.purpose == "tts_output", MediaAssetRow.kind == "audio",
+    ).order_by(MediaAssetGrantRow.created_at))).all()
+    picked: dict[str, AssetView] = {}
+    for blob, grant in rows:
+        if grant.message_id is not None and grant.is_live(now=current) and blob.ready_at is not None:
+            picked.setdefault(grant.message_id, _to_view(blob, grant))
+    legacy = (await session.scalars(select(MediaAssetRow).where(
+        MediaAssetRow.message_id.in_(message_ids), MediaAssetRow.kind == "audio",
+    ).order_by(MediaAssetRow.created_at))).all()
+    for blob in legacy:
+        if blob.message_id is not None and blob.is_live(now=current):
+            picked.setdefault(blob.message_id, _to_view(blob))
     return picked
 
 
@@ -223,6 +217,7 @@ async def load_voice_assets(
                 message_id=message.id,
                 window_id=message.window_id,
                 digest=asset.digest,
+                asset_id=asset.asset_id,
                 mime_type=asset.mime_type,
                 format=asset.format,
                 size_bytes=asset.size_bytes,

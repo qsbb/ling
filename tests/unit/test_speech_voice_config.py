@@ -233,6 +233,8 @@ def test_unknown_kind_is_an_error() -> None:
         {"voice": {"kind": "minimax_tts", "voice_id": "v1"}},
         {"voice": {"kind": "fishaudio_tts", "voice_id": "ref-9"}},
         {"voice": {"kind": "mimo_tts", "reference_asset_id": ASSET_ID}},
+        {"voice": {"kind": "mimo_tts", "reference_asset_id": "asset_" + "a" * 24}},
+        {"voice": {"kind": "mimo_tts", "reference_asset_id": "asset_" + "b" * 32}},
         {"voice": None},
         {},
     ],
@@ -421,6 +423,19 @@ async def test_mimo_voice_reads_the_asset_into_audio_input(
         def read(self, digest: str) -> bytes:
             return content if digest == ASSET_ID else b""
 
+    from datetime import UTC, datetime
+
+    from ling.domains.media.assets import AssetView
+
+    async def _load_asset(session: object, reference: str):
+        return AssetView(
+            digest=ASSET_ID, kind="audio", format="wav", mime_type="audio/wav",
+            size_bytes=len(content), sample_rate=24000, duration_ms=100,
+            created_at=datetime.now(UTC), expires_at=None, asset_id=ASSET_ID,
+            actor_id="actor_ling", purpose="tts_reference",
+        )
+
+    monkeypatch.setattr("ling.domains.media.assets.load_asset", _load_asset)
     monkeypatch.setattr(db_module, "session_scope", _fake_scope)
     monkeypatch.setattr(storage_module, "GeneratedMediaStorage", _Storage)
 

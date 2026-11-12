@@ -379,7 +379,46 @@ export function personaListFrom(payload: unknown): {
   return { items, activePersonaId, total: reportedTotal ?? items.length };
 }
 
+export interface TranscriptionJob {
+  job_id: string;
+  state: string;
+  submission: string;
+  mode: 'send' | 'draft';
+  revision: number;
+  text: string;
+  message_id: string | null;
+  error: {code: string; message: string} | null;
+}
+
 export const api = {
+  uploadAudio(sessionId: string, file: File): Promise<{asset_id: string; duration_seconds: number}> {
+    const form = new FormData();
+    form.append('file', file);
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/audio-inputs`, {method: 'POST', body: form});
+  },
+  createTranscription(sessionId: string, assetId: string, key: string, mode: 'send' | 'draft') {
+    return request<TranscriptionJob>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcriptions`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({asset_id: assetId, client_request_id: key, mode}),
+    });
+  },
+  transcription(sessionId: string, jobId: string, signal?: AbortSignal) {
+    return request<TranscriptionJob>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/transcriptions/${encodeURIComponent(jobId)}`,
+      { signal },
+    );
+  },
+  commitTranscription(sessionId: string, job: TranscriptionJob, text: string) {
+    return request<TranscriptionJob>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcriptions/${encodeURIComponent(job.job_id)}/commit`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({result_revision: job.revision, text}),
+    });
+  },
+  cancelTranscription(sessionId: string, jobId: string) {
+    return request<TranscriptionJob>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcriptions/${encodeURIComponent(jobId)}`, {method: 'DELETE'});
+  },
+  retryTranscription(sessionId: string, jobId: string) {
+    return request<TranscriptionJob>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcriptions/${encodeURIComponent(jobId)}/retry`, {method: 'POST'});
+  },
+
   /* ------------------------------------------------------------ 认证 */
   me(): Promise<AuthResponse> {
     return request<AuthResponse>('/v1/auth/me');

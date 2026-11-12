@@ -355,7 +355,7 @@ class InboundBridge:
         self._persona_id = persona_id
         self._actor_id = actor_id
 
-    async def handle(self, envelope: InteractionEnvelope) -> BridgeResult:
+    async def handle(self, envelope: InteractionEnvelope, *, resume_message_id: str | None = None) -> BridgeResult:
         # 1) 身份：私聊只接受**已证明**的绑定（不猜）；群聊允许"只认识账号"。
         #
         # 原来群里没走过绑定流程的人整条被拒——她只能听见已绑定的人说话，
@@ -483,6 +483,36 @@ class InboundBridge:
             replied_to_actor=bool(envelope.reply_to),
         )
 
+        audio_ids = []
+        if resume_message_id is None and any(p.modality.value == "audio" for p in envelope.parts):
+            from ling.domains.media.service import MediaEvidenceService
+            from ling.domains.speech.transcription import TranscriptionError, create_job
+            svc = MediaEvidenceService(self._session, actor_id=self._actor_id)
+            for eid in media_ids:
+                evidence = await svc.get(eid, window_id=window.id)
+                if evidence is not None and evidence.kind == "audio":
+                    audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
+            if audio_ids and (not is_group or addressed):
+                effective = await self._config_service().effective()
+                try:
+                    job = await create_job(
+                        self._session, window_id=window.id, subject_id=subject_id,
+                        actor_id=self._actor_id,
+                        request_key=f"{envelope.connector_instance}:{envelope.external_event_id}",
+                        mode="send", config=effective,
+                        payload={"audio": audio_ids, "text": _MEDIA_MARKERS.sub("", text).strip(),
+                                 "envelope": envelope.model_dump(mode="json"),
+                                 "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0]},
+                    )
+                    if job.source_message_id:
+                        await self._remember_platform_message_id(job.source_message_id, envelope)
+                    await self._session.commit()
+                    return BridgeResult(accepted=True, reason="语音识别已排队", decision="deferred_attention",
+                                        subject_id=subject_id, window_id=window.id, media_evidence_ids=media_ids)
+                except TranscriptionError as exc:
+                    return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
+                                        window_id=window.id, media_evidence_ids=media_ids)
+
         # 群里被 @ 但**没有正文**：等对方补一句。
         # QQ 里「先 @ 再发正文」很常见，立刻决策只能看到孤零零一个 @。
         if is_group and addressed and not text.strip() and not media_ids:
@@ -491,8 +521,8 @@ class InboundBridge:
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )
-            pending_row = await conversation.add_message(
-                window.id,
+            pending_row = await conversation.adopt_input(
+                resume_message_id, window.id,
                 role="user",
                 text=text,
                 attention_state="unseen",
@@ -560,8 +590,8 @@ class InboundBridge:
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )
-            observed_row = await conversation.add_message(
-                window.id,
+            observed_row = await conversation.adopt_input(
+                resume_message_id, window.id,
                 role="user",
                 text=text,
                 attention_state="unseen",
@@ -605,8 +635,8 @@ class InboundBridge:
             conversation = ConversationService(
                 self._session, actor_id=self._actor_id, persona_id=self._persona_id
             )
-            msg = await conversation.add_message(
-                window.id,
+            msg = await conversation.adopt_input(
+                resume_message_id, window.id,
                 role="user",
                 text=text,
                 handled_as="ignored",
@@ -708,8 +738,8 @@ class InboundBridge:
                 media_note=media_note,
             )
 
-        user_row = await conversation.add_message(
-            window.id,
+        user_row = await conversation.adopt_input(
+            resume_message_id, window.id,
             role="user",
             text=text,
             turn_id=turn.id,

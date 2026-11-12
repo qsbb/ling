@@ -396,6 +396,7 @@ class SpeechArtifact:
     #: 上游给的请求 id（排障用）。命中幂等时为 None——那一次不是这次合成的。
     provider_request_id: str | None = None
     usage: SpeechUsage | None = None
+    asset_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -491,7 +492,7 @@ class SpeechOrchestrator:
         except Exception as exc:  # noqa: BLE001 - 未识别异常也要落状态，否则键永远卡住
             return await self._settle_error(key_row, to_speech_error(exc), request.intent)
 
-        key_row.result_ref = encode_state(SynthesisState.succeeded, detail=artifact.digest)
+        key_row.result_ref = encode_state(SynthesisState.succeeded, detail=artifact.asset_id or artifact.digest)
         await self._session.flush()
         return SynthesisOutcome(artifact=artifact, intent=request.intent)
 
@@ -567,6 +568,7 @@ class SpeechOrchestrator:
                     replay=SynthesisOutcome(
                         artifact=SpeechArtifact(
                             digest=artifact.digest,
+                            asset_id=getattr(artifact, "asset_id", ""),
                             mime_type=artifact.mime_type,
                             format=artifact.format,
                             size_bytes=artifact.size_bytes,
@@ -671,6 +673,7 @@ class SpeechOrchestrator:
         )
         return SpeechArtifact(
             digest=saved.digest,
+            asset_id=getattr(saved, "asset_id", ""),
             mime_type=_mime_for(fmt),
             format=fmt,
             size_bytes=saved.size_bytes,

@@ -407,7 +407,8 @@ async def test_合成成功后产物真的落在磁盘上(web_env, tmp_path) -> 
     assert digest == hashlib.sha256(AUDIO).hexdigest(), "digest 必须就是内容的 sha256"
     assert storage.exists(digest)
     assert storage.read(digest) == AUDIO, "存进去的字节必须原样"
-    assert ref is not None and digest in ref
+    assert ref is not None and outcome.artifact.asset_id in ref
+    assert outcome.artifact.asset_id != digest
 
 
 # --------------------------------------------------------------------------- #
@@ -638,7 +639,8 @@ async def test_语音投递只发一条_外发无正文(web_env, tmp_path) -> No
     assert attachment.kind is AttachmentKind.audio, "语音必须用类型化 audio 附件"
     assert attachment.ref.startswith("asset:"), attachment.ref
     assert result.digest is not None
-    assert attachment.ref == f"asset:{result.digest}", "附件引用必须指向这次合成的产物"
+    assert outcome.artifact is not None
+    assert attachment.ref == f"asset:{outcome.artifact.asset_id}", "附件引用必须指向本窗口的逻辑资产"
     # legacy 字段必须为空：走那条路语音会被当成图片发出去
     assert sent.media_refs == [], "不能同时塞 legacy media_refs（会被当图片）"
 

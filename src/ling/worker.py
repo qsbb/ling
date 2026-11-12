@@ -2661,16 +2661,17 @@ async def _load_reference_audio(asset_id: str) -> AudioInput | None:
     字节上限与 MiMo 适配器一致（`MAX_VOICE_BYTES`）：适配器自己也会拦，但
     在这里拦能少读几百 MB 进内存——一个误传的整段录音就是这种情况。
     """
+    from ling.domains.media.assets import load_asset
     from ling.domains.media.storage import GeneratedMediaStorage, MediaStorageError
     from ling.infra.db import session_scope
-    from ling.infra.media_assets import MediaAssetRow
     from ling.ports.speech import AudioInput, AudioSpec
 
     settings = get_settings()
     try:
         async with session_scope() as session:
-            row = await session.get(MediaAssetRow, asset_id)
-            if row is None or not row.is_live():
+            row = await load_asset(session, asset_id)
+            if (row is None or row.actor_id != settings.actor_id
+                    or (asset_id.startswith("asset_") and row.purpose != "tts_reference")):
                 logger.info(
                     "语音本轮降级为文字：参考素材 %s 不存在或已失效（未就绪/已删除/已过期）",
                     asset_id[:12],
@@ -2684,6 +2685,7 @@ async def _load_reference_audio(asset_id: str) -> AudioInput | None:
                     MAX_VOICE_BYTES,
                 )
                 return None
+            blob_digest = row.digest
             data_dir = settings.data_dir
             mime_type = str(row.mime_type or "")
             format_ = str(row.format or "")
@@ -2697,7 +2699,7 @@ async def _load_reference_audio(asset_id: str) -> AudioInput | None:
     # 相对路径终究是个字符串），所以这里不在 worker 里再拼路径。
     storage = GeneratedMediaStorage(data_dir)
     try:
-        content = storage.read(asset_id)
+        content = storage.read(blob_digest)
     except (MediaStorageError, OSError) as exc:
         logger.error(
             "生成媒体记录存在但文件缺失：digest=%s err=%s（音色参考素材读不到，本轮降级）",

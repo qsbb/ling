@@ -1,47 +1,15 @@
-"""生成媒体资产的表定义：``media_assets``。
+"""媒体内容、逻辑资产授权与租约。
 
-## 为什么表定义不在 `infra/models.py`
-
-`models.py` 是全库 schema 的权威清单，但它此刻正被另一个任务改动
-（避免同文件冲突）。这份表定义因此分出来单独放，**行为完全一样**：
-用的还是同一个 `Base`（`ling.infra.db.Base`），所以 `metadata.create_all`
-与 Alembic autogenerate 都认得它。
-
-导入顺序要求：任何要用这张表的地方（迁移检查、测试建表、资产服务）都必须
-`import ling.infra.media_assets` 一次，让模块级 `class` 定义把自己注册进
-`Base.metadata`。`assets.py` 已经在顶部做了这件事。
-
-## 这张表记什么
-
-一行 = **一个已落盘的生成媒体文件**。核心不变量：
-
-1. **`digest` 唯一**。文件名就是内容的 sha256，同一份内容只存一份、只有
-   一行记录。两个不同的 TTS 请求产出同样的字节（同样的文本、同样的音色、
-   同样的参数）时，第二行不该出现——否则清理任务删掉其中一行就会误删
-   另一行还在用的文件。
-2. **`relative_path` 而不是绝对路径**。绝对路径在换机器/换挂载点后失效，
-   而生产端的 `data_dir` 与开发机不同（见项目约定：生产在 NAS 的
-   `/vol1/@appdata/ling`）。
-3. **`ready_at` 是"这个文件真的能读了"的唯一判据**。保存分两步：先落盘
-   （原子），再插记录。插进来的记录默认就是 ready——因为落盘在前，记录
-   出现时文件一定完整。保留这个列是为了给"两步之间失败"留下可观测状态，
-   以及让未来的"先占位后流式写"仍能表达"还没好"。
-4. **`expires_at` 可空**：空 = 不自动过期（用户明确要留着的产物）。
-5. **不记录是否已发送**。发送状态属于投递域（`operations` /
-   `delivery_receipts`）；在这里也记一份会出现两份真相。
-
-## 权限列（与入站证据无关）
-
-`actor_id` + `window_id` 是这套媒体的授权凭据，语义见 `exports.py`。
-这里**故意没有** `consent_revision`：媒体是我们自己生成的，不存在"用户
-撤回了他给我看的东西"这回事，撤权只会让它过期或被删。
+media_assets 保留内容摘要及旧引用的原始归属。
+media_asset_grants 为新调用提供独立 asset_id、窗口授权和保留期。
+同一份磁盘内容可被多个独立逻辑资产引用。
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ling.infra.db import Base
@@ -110,4 +78,47 @@ class MediaAssetRow(Base, TimestampMixin):
         return not (self.expires_at is not None and self.expires_at <= current)
 
 
-__all__ = ["MediaAssetRow", "utcnow"]
+class MediaAssetGrantRow(Base, TimestampMixin):
+    """一个窗口对内容的逻辑资产引用。"""
+
+    __tablename__ = "media_asset_grants"
+    __table_args__ = (
+        Index("ix_media_asset_grants_owner", "actor_id", "window_id"),
+        Index("ix_media_asset_grants_expires", "expires_at"),
+        Index("ix_media_asset_grants_message", "message_id"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    blob_digest: Mapped[str] = mapped_column(
+        String(64), ForeignKey("media_assets.digest"), index=True
+    )
+    actor_id: Mapped[str] = mapped_column(String(64))
+    window_id: Mapped[str] = mapped_column(String(64))
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    purpose: Mapped[str] = mapped_column(String(32), default="tts_output")
+    turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    producer: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def is_live(self, *, now: datetime | None = None) -> bool:
+        current = now or utcnow()
+        return self.deleted_at is None and (self.expires_at is None or self.expires_at > current)
+
+
+class MediaAssetLeaseRow(Base):
+    """在途使用者持有的有期限租约。"""
+
+    __tablename__ = "media_asset_leases"
+    __table_args__ = (Index("ix_media_asset_leases_expires", "expires_at"),)
+
+    lease_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("media_asset_grants.asset_id", ondelete="CASCADE"), index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+__all__ = ["MediaAssetRow", "MediaAssetGrantRow", "MediaAssetLeaseRow", "utcnow"]

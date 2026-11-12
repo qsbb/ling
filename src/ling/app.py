@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -502,9 +503,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _recover_dangling_turns()
     await _bootstrap(settings)
     logger.info("ling api 就绪 env=%s db=%s", settings.env, _safe_db(settings.database_url))
+    from ling.domains.speech.asr_runtime import stop_worker, worker_loop
+    asr_worker = asyncio.create_task(worker_loop(app), name="asr-worker")
     try:
         yield
     finally:
+        await stop_worker(asr_worker)
         for _scope in (_cf.SCOPE_ONEBOT, _cf.SCOPE_QQBOT):
             for _name, _instance in (connector_runtime._instances.get(_scope) or {}).items():
                 _stopper = getattr(_instance, "stop", None)
@@ -655,6 +659,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix="/v1")
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
+    from ling.api.routes import transcriptions
+    app.include_router(transcriptions.router, prefix="/v1")
     # 主动撤回自己发的消息（破坏性动作，独立路由与独立授权边界）
     app.include_router(recall_routes.router, prefix="/v1")
     # 生成媒体的读取（SP03）：一条签名 URL（无登录态，`<audio>` 用）+ 三条
