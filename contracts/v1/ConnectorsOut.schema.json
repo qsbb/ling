@@ -419,6 +419,20 @@
       "title": "Connectors",
       "type": "array"
     },
+    "instance_id": {
+      "default": "default",
+      "description": "这份视图实际读取的实例（默认实例为 default）",
+      "title": "Instance Id",
+      "type": "string"
+    },
+    "instances": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "逐个 scope 实际读取的实例",
+      "title": "Instances",
+      "type": "object"
+    },
     "schema_version": {
       "const": "v2",
       "default": "v2",
