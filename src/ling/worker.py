@@ -49,6 +49,7 @@ from ling.kernel.visibility import (
 )
 
 if TYPE_CHECKING:
+    from ling.capabilities.tools import ToolRegistry
     from ling.domains.media.assets import GeneratedMediaService
     from ling.domains.speech.orchestration import SpeechOrchestrator
     from ling.ports.config import EffectiveConfig
@@ -1495,6 +1496,13 @@ async def _run_deferred_turn(
         cancels=CancelRegistry(),
         secret_reader=_SECRET_CACHE.get,
         deliver_gate=_still_allowed,
+        # 原生工具回路：开关默认关（见 `DialoguePolicy.tools_enabled`）。
+        # 两样一起给才是"打开"——只给开关 → `no_registry`，只给注册表 → `switch_off`。
+        # 这一轮跑的是默认角色 `dialogue.fast`（`run_turn` 没传 profile），
+        # 在白名单里；若将来这里换成别的角色，`turn.py` 会如实报
+        # `profile_not_wired` 而不是"静默没有工具"。
+        tool_calls_enabled=_tool_calls_switch(effective),
+        tool_registry=tool_registry_for_turn(effective),
     )
     queue = await coordinator.run_turn(
         window_id=window_id,
@@ -2287,6 +2295,10 @@ async def _reply_in_group_window(  # noqa: ANN001
         cancels=CancelRegistry(),
         # 群聊自动回复同样走记忆检索：没有这个读取器就只能用环境变量那套。
         secret_reader=_SECRET_CACHE.get,
+        # 原生工具回路：与延后回复同一份开关、同一套注册表构造。
+        # 这一轮同样落在默认角色 `dialogue.fast`（`run_turn` 没传 profile）。
+        tool_calls_enabled=_tool_calls_switch(effective),
+        tool_registry=tool_registry_for_turn(effective),
     )
     queue = await coordinator.run_turn(
         window_id=window.id,
@@ -2866,6 +2878,50 @@ async def _group_reply_delivery_enabled(config) -> bool:  # noqa: ANN001
         logger.warning("群聊回复跳过：配置不可用（%s）", type(exc).__name__)
         return False
     return bool(effective.dialogue.group_reply_delivery_enabled)
+
+
+def _tool_calls_switch(effective: EffectiveConfig) -> bool:
+    """这一轮的配置打开了原生工具调用吗？读不到就是关闭。
+
+    它是 ``kernel/turn.py`` 的第一道闸（`switch_off`）。**默认关**的理由写在
+    `ports/config.py::DialoguePolicy.tools_enabled` 上：打开它等于把所有普通
+    对话塞进一条新路径。所以这里不做任何"从别的设置推断"——用户没有显式打开
+    就是关，与 `turn.py` 的构造默认值（``False``）保持同一个语义。
+
+    为什么接收 ``EffectiveConfig`` 而不是自己去 ``config.effective()``：
+    两处调用点都已经在光标处持有 ``effective``，而这个决定必须和**同一轮**
+    使用的是同一份配置快照。再读一次可能读到下一版修订——那种"开关按新版、
+    模型按旧版"的错位在日志里完全看不出来。
+    """
+    return bool(effective.dialogue.tools_enabled)
+
+
+def tool_registry_for_turn(
+    effective: EffectiveConfig,
+) -> ToolRegistry | None:
+    """给这一轮构造工具注册表；**开关没开时返回 ``None``**。
+
+    返回 ``None`` 而不是一个空注册表是有意的：`turn.py` 用两种不同的 ``reason``
+    区分它们——``switch_off``（没开开关）与 ``no_registry``（开了却忘了给注册表）。
+    把空注册表当默认值，会把"配置没开"伪装成"配置开了但清单为空"
+    （``no_model_tools``），运维会去查清单而不是查开关。
+
+    ## 注册什么
+
+    ``build_default_registry()``，与 `/v1/tools`（`app.py`）**同一份默认集**。
+    但模型侧能看到的只是 ``list_model_tools()`` 里 ``model_callable=True`` 的
+    那一个（``clock.now``）——``turn.py`` 的 ``tool_allowlist`` 默认也只放它。
+    ``diagnostics.echo`` / ``shell.readonly`` 没开 ``model_callable``；
+    ``message.recall`` 是可逆=false 的不可逆动作，走**用户确认**回路。
+
+    ``allow_irreversible`` 保持默认 ``False``：不可逆动作仍需服务端确认，
+    模型**不能**在生成过程中直接执行。
+    """
+    if not _tool_calls_switch(effective):
+        return None
+    from ling.capabilities.tools import build_default_registry
+
+    return build_default_registry()
 
 
 @handler("delivery.reconcile")

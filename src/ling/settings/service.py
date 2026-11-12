@@ -1439,6 +1439,8 @@ _DIALOGUE_BOUNDS: dict[str, tuple[float, float]] = {
     "proactive_delivery_enabled": (0, 1),
     # 群聊「决定回了」是否真的发出去。同样是 0/1 的布尔。
     "group_reply_delivery_enabled": (0, 1),
+    # 同轮原生工具调用的总开关（默认关，见 DialoguePolicy 的 docstring）。
+    "tools_enabled": (0, 1),
 }
 
 # 对话策略里的**非数值**键：枚举/字符串，没有 `(low, high)` 可钳制，
@@ -1791,6 +1793,16 @@ def _dialogue_policy(raw: object) -> DialoguePolicy:
                 )
             )
         ),
+        tools_enabled=bool(
+            int(
+                _clamp_in(
+                    _DIALOGUE_BOUNDS,
+                    "tools_enabled",
+                    data.get("tools_enabled"),
+                    int(d.tools_enabled),
+                )
+            )
+        ),
         voice_willingness=_voice_willingness(data.get("voice_willingness"), d.voice_willingness),
         voice=_voice_setting(data.get("voice")),
     )
@@ -1939,6 +1951,7 @@ def _dialogue_to_dict(policy: DialoguePolicy) -> dict[str, object]:
         "group_attention_deferred": policy.group_attention_deferred,
         "proactive_delivery_enabled": policy.proactive_delivery_enabled,
         "group_reply_delivery_enabled": policy.group_reply_delivery_enabled,
+        "tools_enabled": policy.tools_enabled,
         "voice_willingness": policy.voice_willingness,
         "voice": _voice_to_dict(policy.voice),
     }
