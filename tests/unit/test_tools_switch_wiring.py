@@ -387,3 +387,22 @@ async def test_router_does_not_send_native_tools_to_incapable_fallback(has_tool_
         assert requests[0].tools == ()
         assert requests[0].tool_choice is None
         assert requests[0].parallel_tool_calls is None
+
+
+def test_tool_budget_excludes_time_between_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from ling.kernel import turn as turn_module
+
+    ticks = iter([100.0, 103.0, 150.0, 152.0, 153.0])
+    monkeypatch.setattr(turn_module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    rounds = turn_module._ToolRounds()
+    budget = turn_module.TOOL_WALL_CLOCK_SECONDS
+
+    rounds.start_batch()
+    rounds.finish_batch()
+    assert rounds.remaining() == budget - 3
+    rounds.start_batch()
+    assert rounds.remaining() == budget - 5
+    rounds.finish_batch()
+    assert rounds.remaining() == budget - 6

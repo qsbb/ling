@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -1095,8 +1096,6 @@ class TurnCoordinator:
                     ),
                 )
                 tool_ledger.turn_id = turn_id
-                # 跨两个模型步骤的调用装配器（分片按 index 累积）
-                call_stream = _CallStreamSlot()
 
                 # 一旦本流的**已生成原文**里出现过观看标记（完整的或半截的），
                 # 其后的正文就先不外发——它可能依赖"到底看到了什么"，而视频
@@ -1404,7 +1403,6 @@ class TurnCoordinator:
                         floor=floor,
                         ledger=tool_ledger,
                         rounds=tool_rounds,
-                        call_stream=call_stream,
                         on_visible=_push_visible,
                         state=stream_state,
                     )
@@ -2829,7 +2827,6 @@ class TurnCoordinator:
         floor: _FloorState,
         ledger: _ToolLedger,
         rounds: _ToolRounds,
-        call_stream: _CallStreamSlot,
         on_visible: Callable[[str], Awaitable[str]],
         state: _StreamState,
     ) -> None:
@@ -2954,8 +2951,8 @@ class TurnCoordinator:
         try:
             while True:
                 calls = _ToolCallStream()
-                call_stream.current = calls
-                withheld: list[str] = []
+                candidate_text: list[str] = []
+                tool_finish = False
                 async for chunk, outcome in self._router.stream(
                     config,
                     profile=profile,
@@ -2976,70 +2973,61 @@ class TurnCoordinator:
                         calls.complete(chunk)
                     elif chunk.tool_call is not None or chunk.tool_arguments_delta is not None:
                         calls.feed(chunk)
-                    if chunk.delta and calls.calls:
-                        # 本步骤已经提过调用：之后的正文一律扣住。进历史
-                        # （下一步模型会看到自己说了什么），但**不外发**。
-                        withheld.append(chunk.delta)
-                    elif chunk.delta:
-                        # 与普通轮次同一条判据：先累积原文，再看外发。
-                        # **不能**按 `on_visible` 的返回值累积——它返回空串
-                        # 既可能是"没话音权"，也可能是"扣住但原文仍在"
-                        # （观看标记），后者按返回值判就是整轮正文消失。
-                        delivered += chunk.delta
-                        await on_visible(chunk.delta)
+                    tool_finish |= chunk.finish_reason == "tool_calls"
+                    if chunk.delta:
+                        # 工具提议可能晚于正文分片。整个步骤结束后才能决定这段话可否外发。
+                        candidate_text.append(chunk.delta)
                 if getattr(token, "stopped", False):
-                    # 停止：扣住的正文**不外发**（它可能依赖没执行的结果），
-                    # 但它仍是模型说过的话，落库时保留。
-                    for piece in withheld:
-                        delivered += piece
-                    # 与普通轮次同一条纪律：停止必须能让收尾看见，
-                    # 否则工具轮次的停止同样落成 `completed`。
                     state.stopped = True
                     state.delivered = delivered
                     state.target_label = target_label
                     return
                 proposals = calls.proposed()
                 if not proposals:
-                    # 这一步就是答案：把扣住的正文补**发**出去。
-                    #
-                    # 这里**不**累积 `delivered`：本步骤的每一个增量在上面
-                    # 外发那一支里已经进过 `delivered` 了（累积的是模型原文，
-                    # 不随"发不发"变）。再在这里补记一次就是重复。
-                    #
-                    # 为什么逐段补发：外发闭包把每次文本都送进它自己的标记
-                    # 过滤器——过滤器要按原文顺序见到每一段，不能拼成一段。
-                    for piece in withheld:
+                    if tool_finish:
+                        raise ModelError(
+                            ModelErrorKind.error,
+                            "模型结束了工具步骤，但没有提供可解析的调用",
+                            retriable=False,
+                        )
+                    for piece in candidate_text:
+                        if getattr(token, "stopped", False):
+                            state.stopped = True
+                            break
+                        delivered += piece
                         await on_visible(piece)
                     state.delivered = delivered
                     state.target_label = target_label
                     return
-                # 本步提了调用：扣住的正文进历史，**不外发**。
-                delivered += "".join(withheld)
                 if rounds.batches >= MAX_TOOL_BATCHES:
-                    logger.warning(
-                        "工具批次已用满但模型仍提出调用 turn=%s，按现有正文收尾",
-                        ledger.turn_id,
+                    raise ModelError(
+                        ModelErrorKind.error,
+                        "工具调用已达批次上限，模型没有给出最终回答",
+                        retriable=False,
                     )
-                    state.delivered = delivered
-                    state.target_label = target_label
-                    return
                 rounds.batches += 1
                 ledger.batches = rounds.batches
-                rounds.start_clock()
-                rounds.calls += len(proposals)
-                tail = await self._execute_tool_batch(
-                    ledger=ledger,
-                    rounds=rounds,
-                    step=rounds.batches,
-                    proposals=proposals,
-                    token=token,
-                    queue=queue,
-                    held_by_me=floor.held,
-                )
-                if not tail:
+                rounds.start_batch()
+                try:
+                    tail = await self._execute_tool_batch(
+                        ledger=ledger,
+                        rounds=rounds,
+                        step=rounds.batches,
+                        proposals=proposals,
+                        token=token,
+                        queue=queue,
+                    )
+                finally:
+                    rounds.finish_batch()
+                if getattr(token, "stopped", False):
+                    state.stopped = True
                     state.delivered = delivered
                     state.target_label = target_label
                     return
+                if not tail:
+                    raise ModelError(
+                        ModelErrorKind.error, "模型未提供可配对的工具调用 ID", retriable=False
+                    )
                 request_messages = [*request_messages, *tail]
         except ModelError as exc:
             state.delivered = delivered
@@ -3055,50 +3043,28 @@ class TurnCoordinator:
         proposals: Sequence[ToolCall],
         token: object,
         queue: asyncio.Queue[TurnStreamEvent | None],
-        held_by_me: bool,
     ) -> list[ChatMessageIn]:
-        """执行一批提议的调用，产出**回灌用**的消息尾巴。
-
-        返回值与请求消息拼起来就是下一个模型步骤的完整输入：
-
-            [... 请求消息, assistant(tool_calls=[…]), tool, tool, …]
-
-        ``assistant`` 那条是**协议要求**：``role:"tool"`` 的结果靠
-        ``tool_call_id`` 找它回应的那次调用，而那批调用声明在 assistant 消息上。
-        缺了它，OpenAI 直接 400；宽松的兼容端点会把结果当成"无主数据"丢掉，
-        而模型接着凭印象回答——**不报错的那种错**。
-
-        ## 配对完整性：每个提议的 ID 恰好一条结果
-
-        下面每一条出口都对应一条"这个 ID 有结果"：
-
-        - 缺 ID → ``missing_provider_call_id``（**不可回灌**，见下）
-        - 重复 ID → ``duplicate_provider_call_id``
-        - 超一批上限 → ``rejected / batch_limit``
-        - 整轮墙钟用完 → ``rejected / turn_budget``
-        - 工具不在本轮清单 → ``rejected / tool_not_available``
-        - 参数坏 / schema 不符 → ``failed / invalid_arguments``
-        - 被停止 → ``rejected / stopped``
-        - 执行过 → Registry 的 ``succeeded`` / ``failed`` / ``timeout`` / ``unsupported``
-
-        任何一条出口都不能只是 ``continue``：少了结果，供应商那边看到的就是
-        "它提出了一批调用，其中几个永远没有回应"。
-
-        ## 缺 provider ID 的那条：回执留给审计，**不进回灌**
-
-        没有 ID 的消息在适配器那一层会被拒绝序列化（``_encode_message`` 抛错）。
-        与其造一个假的 ID 去配对（那会让供应商把结果关联到一次**不存在的**
-        调用），不如把它记为一次失败、写进 ``ledger.rejected``，并在模型回复
-        里通过"没有工具结果"这个事实体现出来。这一批如果**全部**缺 ID，
-        函数返回空列表，调用方据此结束工具回路（不再调模型）。
-        """
-        tail: list[ChatMessageIn] = [
-            ChatMessageIn(role="assistant", content="", tool_calls=tuple(proposals))
-        ]
+        """只把有唯一协议 ID 的提议和对应结果加入续步 transcript。"""
+        id_counts = Counter(call.provider_call_id for call in proposals)
+        accepted_calls: list[ToolCall] = []
         results: list[ChatMessageIn] = []
         seen_ids: set[str] = set()
-        for position, call in enumerate(proposals):
+        for call in proposals:
             provider_call_id = call.provider_call_id or ""
+            if not provider_call_id.strip():
+                ledger.reject(
+                    provider_call_id="", tool_id=call.name, code="missing_provider_call_id"
+                )
+                continue
+            if provider_call_id in rounds.replied_ids or provider_call_id in seen_ids:
+                ledger.reject(
+                    provider_call_id=provider_call_id,
+                    tool_id=call.name,
+                    code="duplicate_provider_call_id",
+                )
+                continue
+            seen_ids.add(provider_call_id)
+            accepted_calls.append(call)
             internal_call_id = new_id("call")
 
             def _reject(
@@ -3124,23 +3090,23 @@ class TurnCoordinator:
                     )
                 )
 
-            if not provider_call_id:
-                ledger.reject(
-                    provider_call_id="", tool_id=call.name, code="missing_provider_call_id"
-                )
-                continue
-            if provider_call_id in seen_ids:
+            if id_counts[provider_call_id] > 1:
                 _reject(
                     "duplicate_provider_call_id",
-                    "同一次步骤里出现了重复的调用 ID，后一次未执行",
+                    "同一步骤重复使用调用 ID，该调用未执行",
                     outcome="failed",
                 )
                 continue
-            seen_ids.add(provider_call_id)
-            if position >= MAX_TOOL_CALLS_PER_BATCH:
+            if len(accepted_calls) > MAX_TOOL_CALLS_PER_BATCH:
                 _reject(
                     "batch_limit",
                     f"一批最多执行 {MAX_TOOL_CALLS_PER_BATCH} 项，这一项未执行",
+                )
+                continue
+            if rounds.executed >= MAX_TOOL_CALLS_PER_TURN:
+                _reject(
+                    "turn_limit",
+                    f"一轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 项，这一项未执行",
                 )
                 continue
             if rounds.remaining() <= 0:
@@ -3167,10 +3133,15 @@ class TurnCoordinator:
                 _reject("stopped", "这一轮被停止了，未执行")
                 continue
             assert registry is not None
-            result = await registry.call_untruncated(
-                call.name, args, internal_call_id=internal_call_id
-            )
             rounds.executed += 1
+            try:
+                result = await asyncio.wait_for(
+                    registry.call_untruncated(call.name, args, internal_call_id=internal_call_id),
+                    timeout=rounds.remaining(),
+                )
+            except TimeoutError:
+                _reject("turn_budget", "工具执行超过本轮剩余时间", outcome="timeout")
+                continue
             if ledger.first_execution_step is None:
                 ledger.first_execution_step = step
             ledger.note(
@@ -3184,20 +3155,30 @@ class TurnCoordinator:
                     content=_tool_result_payload(call.name, spec, call, result),
                 )
             )
-            rounds.executed_ids.add(provider_call_id)
-        if results and held_by_me:
+        if not results:
+            return []
+        rounds.replied_ids.update(seen_ids)
+        if not getattr(token, "stopped", False):
             await queue.put(
                 TurnStreamEvent(
                     event="turn.tool_call",
                     data={
                         "turn_id": ledger.turn_id,
                         "step": step,
-                        # 只发**本批**的事实（ledger 是整轮累积的）
-                        "calls": [json.loads(m.content) for m in results],
+                        "calls": [
+                            {
+                                key: payload[key]
+                                for key in ("provider_call_id", "tool_id", "outcome")
+                            }
+                            for payload in (json.loads(message.content) for message in results)
+                        ],
                     },
                 )
             )
-        return [*tail, *results]
+        return [
+            ChatMessageIn(role="assistant", content="", tool_calls=tuple(accepted_calls)),
+            *results,
+        ]
 
 #: ``operations.kind``：她提议撤回、等用户确认。与 ``delivery`` 分开：
 #: 那是"我们发出去的动作"，这是"她想做但还没被批准的動作"。
@@ -3225,6 +3206,7 @@ RECALL_PROPOSAL_STATES = ("proposed", "confirmed", "declined", "expired")
 # 角色上下文压测过再谈可调（调大之前先问"大了之后坏在哪"）。
 MAX_TOOL_BATCHES = 3
 MAX_TOOL_CALLS_PER_BATCH = 3
+MAX_TOOL_CALLS_PER_TURN = 6
 # 整轮工具**墙钟**上限。它覆盖所有批次的执行，不含模型生成时间——
 # 模型时间由路由器的 `timeout_seconds` 管，两者不能互相顶替。
 TOOL_WALL_CLOCK_SECONDS = 45.0
@@ -3523,41 +3505,30 @@ class _StreamState:
     stopped: bool = False
 
 
-class _CallStreamSlot:
-    """``_execute`` 与编排辅助函数之间传递装配器的可变槽。
-
-    为什么需要它：主循环每次模型步骤都要**新建**一个装配器（上一次的调用
-    已执行完、结果已回灌），但编排辅助函数按"不在别人正在编辑的那段循环里
-    塞参数"的原则只拿到既有对象。用一个槽比改主循环签名安全：另一个 agent
-    正在改同一段循环。
-    """
-
-    def __init__(self) -> None:
-        self.current: _ToolCallStream | None = None
-
-
 @dataclass
 class _ToolRounds:
     """整轮的批次计数与墙钟起点。**跨模型步骤存活**。"""
 
-    # ``time.monotonic`` 起点。惰性初始化：**没提过工具就不算时间**，
-    # 否则一次很慢的模型生成（几十秒）会把一次很快的工具调用挤进
-    # "整轮 45 秒已经用完"。
-    wall_started: float | None = None
+    elapsed_seconds: float = 0.0
+    batch_started: float | None = None
     batches: int = 0
-    calls: int = 0
     executed: int = 0
     # 已经回过灌的 provider_call_id（同一轮里不许重复执行同一个 ID）
-    executed_ids: set[str] = field(default_factory=set)
+    replied_ids: set[str] = field(default_factory=set)
 
-    def start_clock(self) -> None:
-        if self.wall_started is None:
-            self.wall_started = time.monotonic()
+    def start_batch(self) -> None:
+        self.batch_started = time.monotonic()
+
+    def finish_batch(self) -> None:
+        if self.batch_started is not None:
+            self.elapsed_seconds += time.monotonic() - self.batch_started
+            self.batch_started = None
 
     def remaining(self) -> float:
-        if self.wall_started is None:
-            return TOOL_WALL_CLOCK_SECONDS
-        return TOOL_WALL_CLOCK_SECONDS - (time.monotonic() - self.wall_started)
+        elapsed = self.elapsed_seconds
+        if self.batch_started is not None:
+            elapsed += time.monotonic() - self.batch_started
+        return TOOL_WALL_CLOCK_SECONDS - elapsed
 
 
 @dataclass

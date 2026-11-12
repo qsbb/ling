@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -12,10 +13,12 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from ling import worker
-from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID
+from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, ToolRegistry
 from ling.domains.knowledge.service import KnowledgeService
 from ling.infra.db import session_scope
 from ling.infra.models import KnowledgeItem
+from ling.kernel import turn as turn_module
+from ling.kernel.turn import MAX_TOOL_CALLS_PER_BATCH, MAX_TOOL_CALLS_PER_TURN
 from ling.models import openai_compatible
 from ling.models.registry import ProviderRegistry
 from ling.models.router import ModelRouter, StreamOutcome
@@ -32,11 +35,16 @@ PLAIN_REPLY = "这轮使用普通对话。"
 RESULT_PREFIX = "查询结果是："
 
 
-def _model_response(delta: dict, finish_reason: str) -> httpx.Response:
-    chunk = {"choices": [{"delta": delta, "finish_reason": finish_reason}]}
+def _model_response(delta: dict | list[dict], finish_reason: str) -> httpx.Response:
+    parts = delta if isinstance(delta, list) else [delta]
+    chunks = []
+    for index, part in enumerate(parts):
+        finish = finish_reason if index == len(parts) - 1 else None
+        chunk = {"choices": [{"delta": part, "finish_reason": finish}]}
+        chunks.append(f"data: {json.dumps(chunk)}\n\n")
     return httpx.Response(
         200,
-        text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        text="".join(chunks) + "data: [DONE]\n\n",
         headers={"Content-Type": "text/event-stream"},
     )
 
@@ -47,10 +55,13 @@ class _ToolEndpoint:
         self.arguments = {"tz": "Asia/Shanghai"}
         self.reply = ""
         self.tool_name = "clock_now"
+        self.script: list[tuple[dict | list[dict], str]] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.requests.append(body)
+        if len(self.requests) <= len(self.script):
+            return _model_response(*self.script[len(self.requests) - 1])
         if "tools" not in body:
             return _model_response({"content": PLAIN_REPLY}, "stop")
 
@@ -134,7 +145,7 @@ async def _enabled(env: TestEnv) -> bool:
     return response.json()["dialogue"]["tools_enabled"]
 
 
-async def _web_reply(env: TestEnv, *, text: str = "现在几点了？") -> str:
+async def _web_turn(env: TestEnv, *, text: str) -> list[tuple[str, dict]]:
     window = await env.client.post("/v1/sessions", json={"title": "工具回路"})
     assert window.status_code == 201, window.text
     session_id = window.json()["session_id"]
@@ -143,10 +154,17 @@ async def _web_reply(env: TestEnv, *, text: str = "现在几点了？") -> str:
         json={"client_turn_id": "fixture-turn", "text": text},
     )
     assert response.status_code == 200, response.text
-    events = await read_sse(response)
+    return await read_sse(response)
+
+
+def _reply_text(events: list[tuple[str, dict]]) -> str:
     completed = [data for name, data in events if name == "turn.completed"]
     assert completed and completed[-1].get("message"), events
     return completed[-1]["message"]["text"]
+
+
+async def _web_reply(env: TestEnv, *, text: str = "现在几点了？") -> str:
+    return _reply_text(await _web_turn(env, text=text))
 
 
 def _tool_payload(
@@ -417,3 +435,205 @@ async def test_knowledge_database_failure_is_returned_without_internal_details(
     assert payload["outcome"] == "failed"
     assert payload["error"] == {"code": "failed", "message": "本地知识库查询失败"}
     assert "data" not in payload
+
+
+def _clock_proposals(*ids: str) -> dict:
+    return {
+        "tool_calls": [
+            {
+                "index": index,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "clock_now", "arguments": '{"tz": "Asia/Shanghai"}'},
+            }
+            for index, call_id in enumerate(ids)
+        ]
+    }
+
+
+def _wire_tool_history(request: dict) -> tuple[list[str], dict[str, dict]]:
+    calls = []
+    replies = {}
+    for message in request["messages"]:
+        calls.extend(call["id"] for call in message.get("tool_calls", []))
+        if message["role"] == "tool":
+            call_id = message["tool_call_id"]
+            assert call_id not in replies
+            replies[call_id] = json.loads(message["content"])
+    assert calls == list(replies)
+    return calls, replies
+
+
+async def test_tool_step_does_not_publish_candidate_text(
+    logged_in: TestEnv, endpoint: _ToolEndpoint
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [
+        (
+            [{"content": "我已经核实了候选值 Q-81。"}, _clock_proposals(CALL_ID),
+             {"content": "还是先用这个候选值。"}],
+            "tool_calls",
+        ),
+    ]
+
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    _assert_clock_result(endpoint)
+    assert _reply_text(events) == endpoint.reply
+    assert "".join(payload["text"] for name, payload in events if name == "delta") == endpoint.reply
+    assert "Q-81" not in json.dumps(events, ensure_ascii=False)
+    tool_status = [payload for name, payload in events if name == "turn.tool_call"]
+    assert tool_status[0]["calls"] == [
+        {"provider_call_id": CALL_ID, "tool_id": CLOCK_NOW_TOOL_ID, "outcome": "succeeded"}
+    ]
+
+
+async def test_enabled_plain_text_step_keeps_all_deltas(
+    logged_in: TestEnv, endpoint: _ToolEndpoint
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [([{"content": "第一句。"}, {"content": "第二句。"}], "stop")]
+
+    events = await _web_turn(logged_in, text="请直接回复两句。")
+
+    assert _reply_text(events) == "第一句。第二句。"
+    assert [payload["text"] for name, payload in events if name == "delta"] == [
+        "第一句。",
+        "第二句。",
+    ]
+    assert len(endpoint.requests) == 1
+    assert "tools" in endpoint.requests[0]
+
+
+@pytest.fixture
+def clock_executions(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    executions = []
+    execute = ToolRegistry.call_untruncated
+
+    async def record(self, tool_id, args, **kwargs):
+        executions.append(tool_id)
+        return await execute(self, tool_id, args, **kwargs)
+
+    monkeypatch.setattr(ToolRegistry, "call_untruncated", record)
+    return executions
+
+
+async def test_tool_transcript_pairs_only_unique_protocol_ids(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, clock_executions: list[str]
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [
+        (_clock_proposals("", "duplicate", "duplicate", "first"), "tool_calls"),
+        (_clock_proposals("first", "second"), "tool_calls"),
+        ({"content": "两次有效查询均已完成。"}, "stop"),
+    ]
+
+    assert await _web_reply(logged_in) == "两次有效查询均已完成。"
+
+    first_calls, first_results = _wire_tool_history(endpoint.requests[1])
+    assert first_calls == ["duplicate", "first"]
+    assert first_results["duplicate"]["error"]["code"] == "duplicate_provider_call_id"
+    assert first_results["first"]["outcome"] == "succeeded"
+    calls, results = _wire_tool_history(endpoint.requests[2])
+    assert calls == ["duplicate", "first", "second"]
+    assert results["second"]["outcome"] == "succeeded"
+    assert clock_executions == [CLOCK_NOW_TOOL_ID, CLOCK_NOW_TOOL_ID]
+
+
+async def test_tools_require_a_pairable_id(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, clock_executions: list[str]
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [
+        ([{"content": "未经验证的候选值。"}, _clock_proposals("")], "tool_calls")
+    ]
+
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    assert [name for name, _ in events if name in {"delta", "turn.failed"}] == ["turn.failed"]
+    assert len(endpoint.requests) == 1
+    assert clock_executions == []
+
+
+async def test_tool_batch_and_turn_limits_do_not_execute_excess_calls(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, clock_executions: list[str]
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    first = [f"first-{index}" for index in range(MAX_TOOL_CALLS_PER_BATCH + 1)]
+    second = [f"second-{index}" for index in range(MAX_TOOL_CALLS_PER_BATCH)]
+    endpoint.script = [
+        (_clock_proposals(*first), "tool_calls"),
+        (_clock_proposals(*second), "tool_calls"),
+        (_clock_proposals("over-turn-limit"), "tool_calls"),
+        ({"content": "本轮只使用预算内的查询结果。"}, "stop"),
+    ]
+
+    assert await _web_reply(logged_in) == "本轮只使用预算内的查询结果。"
+
+    request = endpoint.requests[3]
+    assert request["tool_choice"] == "none"
+    _, results = _wire_tool_history(request)
+    assert results[first[-1]]["error"]["code"] == "batch_limit"
+    assert results["over-turn-limit"]["error"]["code"] == "turn_limit"
+    assert len(clock_executions) == MAX_TOOL_CALLS_PER_TURN
+
+
+async def test_stop_during_tool_discards_candidate_and_skips_continuation(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [
+        ([{"content": "未核实的候选。"}, _clock_proposals(CALL_ID)], "tool_calls")
+    ]
+    cancels = logged_in.app.state.cancels
+    execute = ToolRegistry.call_untruncated
+    partials = []
+
+    async def stop_while_executing(self, tool_id, args, **kwargs):
+        [turn_id] = cancels.running_turns()
+        partials.append(cancels.partial(turn_id))
+        assert cancels.stop(turn_id)
+        return await execute(self, tool_id, args, **kwargs)
+
+    monkeypatch.setattr(ToolRegistry, "call_untruncated", stop_while_executing)
+
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    assert partials == [""]
+    assert [name for name, _ in events if name in {"delta", "turn.stopped"}] == ["turn.stopped"]
+    assert len(endpoint.requests) == 1
+
+
+async def test_tool_wait_is_bounded_by_remaining_turn_budget(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    cancelled = asyncio.Event()
+
+    async def wait_forever(self, tool_id, args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(ToolRegistry, "call_untruncated", wait_forever)
+    monkeypatch.setattr(turn_module, "TOOL_WALL_CLOCK_SECONDS", 0.2)
+
+    assert await _web_reply(logged_in) == f"{RESULT_PREFIX}turn_budget"
+    assert cancelled.is_set()
+    payload = _tool_payload(endpoint)
+    assert payload["outcome"] == "timeout"
+    assert "data" not in payload
+
+
+async def test_tool_finish_without_proposals_does_not_release_candidate(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, clock_executions: list[str]
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.script = [({"content": "未经核实的候选。"}, "tool_calls")]
+
+    events = await _web_turn(logged_in, text="现在几点了？")
+
+    assert [name for name, _ in events if name in {"delta", "turn.failed"}] == ["turn.failed"]
+    assert clock_executions == []
+    assert len(endpoint.requests) == 1
