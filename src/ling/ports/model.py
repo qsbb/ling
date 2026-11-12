@@ -35,6 +35,8 @@ class ProviderKind(StrEnum):
     # 由绑定按能力过滤（见 `PROVIDER_CAPABILITIES`）。
     cloudflare_embedding = "cloudflare_embedding"
     siliconflow_rerank = "siliconflow_rerank"
+    siliconflow_asr = "siliconflow_asr"
+    dashscope_asr = "dashscope_asr"
     # ---------------------------------------------------- 语音合成（TTS）
     #
     # 三家**真实厂商**，各自一套 wire 协议，不能靠换 base_url 顶替：
@@ -85,10 +87,7 @@ class ModelCapability(StrEnum):
     为什么要这层而不是"按 kind 手写 if"：kind 与角色的对应关系一旦散落
     在界面、校验、装配三处，加一个供应商就要改三处，漏一处就是静默错配。
 
-    ``tts`` 现在**已有三家真实供应商**提供（见 `ProviderKind.minimax_tts` /
-    `fish_audio` / `mimo_tts`）。``asr`` 仍然**只定义不启用**：识别 provider
-    还没实现，任何 `speech.asr` 绑定都会被能力闸拦下——这是刻意的，
-    在那之前任何"绑定成功"都是假的。
+    语音合成与文件识别通过各自适配器声明能力，由对应的语音工厂装配。
     """
 
     chat = "chat"
@@ -123,6 +122,8 @@ PROVIDER_CAPABILITIES: dict[ProviderKind, frozenset[ModelCapability]] = {
     ProviderKind.local: frozenset({ModelCapability.chat}),
     ProviderKind.cloudflare_embedding: frozenset({ModelCapability.embed}),
     ProviderKind.siliconflow_rerank: frozenset({ModelCapability.rerank}),
+    ProviderKind.siliconflow_asr: frozenset({ModelCapability.asr}),
+    ProviderKind.dashscope_asr: frozenset({ModelCapability.asr}),
     # 三家 TTS：能力都**只有** tts。一个 kind 声明两种能力会破坏绑定闸门
     # （见 `ProviderKind.mimo_chat` 的长注释）。
     ProviderKind.minimax_tts: frozenset({ModelCapability.tts}),
@@ -191,9 +192,7 @@ PROFILE_CAPABILITIES: dict[str, ModelCapability] = {
     "memory.extract": ModelCapability.chat,
     "memory.embed": ModelCapability.embed,
     "memory.rerank": ModelCapability.rerank,
-    # 语音两项：能力已定义，但**没有任何 kind 提供**（provider 尚未实现）。
-    # 于是把 speech.* 绑到任何现有供应商都会被校验拦下——这正是我们要的：
-    # 在那之前，任何"绑定成功"都是假的。
+    # 语音职责分别由合成和识别适配器提供。
     "speech.tts": ModelCapability.tts,
     "speech.asr": ModelCapability.asr,
 }

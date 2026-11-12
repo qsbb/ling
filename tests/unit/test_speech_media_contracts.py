@@ -155,8 +155,8 @@ def test_speech_tts_accepts_buffered_provider() -> None:
     assert validate_speech_profile(buffered, {"produces_audio": True}) == []
 
 
-def test_asr_and_realtime_stay_reserved() -> None:
-    """ASR/实时语音保持保留状态，不能随 TTS 一起被解锁（§17.2 明令）。"""
+def test_file_asr_is_distinct_from_realtime_voice_requirements() -> None:
+    """文件识别具备独立适配器，实时会话仍须满足插话和重连要求。"""
     realtime = SPEECH_PROFILE_REQUIREMENTS["realtime.voice"]
     assert realtime["streaming"] is True
     assert realtime["barge_in"] is True
@@ -164,7 +164,7 @@ def test_asr_and_realtime_stay_reserved() -> None:
     asr_kinds = {
         k.value for k, caps in PROVIDER_CAPABILITIES.items() if ModelCapability.asr in caps
     }
-    assert asr_kinds == set(), f"还没有 ASR adapter，却有 kind 声称支持: {sorted(asr_kinds)}"
+    assert asr_kinds == {"siliconflow_asr", "dashscope_asr"}
 
 
 # --------------------------------------------------------------------------- #

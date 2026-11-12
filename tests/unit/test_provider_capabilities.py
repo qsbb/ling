@@ -230,12 +230,11 @@ def test_chat_kinds_cannot_serve_tts(kind: str) -> None:
     assert not kind_supports_profile(kind, "speech.tts")
 
 
-def test_asr_still_has_no_provider() -> None:
-    """`speech.asr` 仍然没有供应商——识别适配器还没实现。
-
-    这条是**故意**保留的失败关闭：在实现之前，任何"绑定成功"都是假的。
-    """
+def test_asr_is_served_by_file_recognition_adapters() -> None:
+    """文件识别只能绑定对应协议适配器，合成供应商仍被能力闸拦住。"""
     asr = {k.value for k, caps in PROVIDER_CAPABILITIES.items() if ModelCapability.asr in caps}
-    assert asr == set(), f"还没有实现 ASR，却有 kind 声称支持: {sorted(asr)}"
+    assert asr == {"siliconflow_asr", "dashscope_asr"}
+    assert kind_supports_profile("siliconflow_asr", "speech.asr")
+    assert kind_supports_profile("dashscope_asr", "speech.asr")
     assert not kind_supports_profile("minimax_tts", "speech.asr")
     assert not kind_supports_profile("mimo_tts", "speech.asr")

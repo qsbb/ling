@@ -125,6 +125,8 @@ function baseUrlPlaceholder(kind: string): string {
     return '可留空（用账号 ID 拼官方端点），或填完整地址';
   }
   if (kind === 'siliconflow_rerank') return 'https://api.siliconflow.cn/v1';
+  if (kind === 'siliconflow_asr') return '可留空，默认 https://api.siliconflow.cn/v1';
+  if (kind === 'dashscope_asr') return '可填百炼工作空间地址，留空使用北京默认端点';
   return 'https://…/v1';
 }
 
@@ -132,6 +134,9 @@ function baseUrlPlaceholder(kind: string): string {
 function modelIdPlaceholder(kind: string): string {
   if (kind === 'cloudflare_embedding') return '模型 ID，例如 @cf/baai/bge-m3';
   if (kind === 'siliconflow_rerank') return '模型 ID，例如 BAAI/bge-reranker-v2-m3';
+  if (kind === 'siliconflow_asr' || kind === 'dashscope_asr') {
+    return '填写当前账号可用的文件语音识别模型 ID';
+  }
   return '模型 ID，例如 gpt-4o-mini';
 }
 

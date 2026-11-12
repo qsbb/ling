@@ -1184,3 +1184,52 @@ describe('模块装载', () => {
     expect(typeof mod.api.quickConfigPreview).toBe('function');
   });
 });
+
+describe('文件语音识别配置', () => {
+  const asr: ProviderDraftInput = {
+    provider_id: 'recognition',
+    kind: 'siliconflow_asr',
+    base_url: null,
+    enabled: true,
+    capabilities: ['asr'],
+    models: [{ model_id: 'account-recognition-model', enabled: true, note: '' }],
+    timeout_seconds: 90,
+    max_output_tokens: null,
+    daily_token_limit: null,
+  };
+
+  it('按服务端职责清单展示语音识别，并仅提供有 asr 能力的模型', () => {
+    const config: SettingsConfig = {
+      ...CONFIG,
+      known_profiles: ['speech.asr'],
+      profile_capabilities: { 'speech.asr': 'asr' },
+    };
+    expect(visibleRoleKeys(config.known_profiles)).toEqual(['speech.asr']);
+    expect(providersForProfile([...PROVIDERS, asr], 'asr', undefined).map((p) => p.provider_id)).toEqual([
+      'recognition',
+    ]);
+    const html = render({ config, providers: [...PROVIDERS, asr] });
+    expect(html).toContain('语音识别');
+    expect(html).toContain('account-recognition-model');
+    expect(visibleRoleKeys([])).not.toContain('speech.asr');
+  });
+
+  it('两种识别协议都有可选类型与专属地址提示', () => {
+    expect(kindLabel('siliconflow_asr')).toBe('语音识别（SiliconFlow）');
+    expect(kindLabel('dashscope_asr')).toBe('语音识别（百炼 Qwen）');
+    const kinds = ['siliconflow_asr', 'dashscope_asr'];
+    const sf = renderProvider(asr, kinds);
+    const dashscope = renderProvider({ ...asr, kind: 'dashscope_asr' }, kinds);
+    expect(sf).toContain('默认 https://api.siliconflow.cn/v1');
+    expect(dashscope).toContain('百炼工作空间地址');
+  });
+
+  it('默认端点可留空，填写的 ASR 地址仍需 HTTP 协议', () => {
+    for (const kind of ['siliconflow_asr', 'dashscope_asr']) {
+      expect(providerShapeIssues({ kind })).toEqual([]);
+      expect(providerShapeIssues({ kind, base_url: 'file:///tmp/audio' })).toEqual([
+        expect.objectContaining({ field: 'providers.new.base_url' }),
+      ]);
+    }
+  });
+});

@@ -1083,13 +1083,17 @@ async def speech_status(auth: CurrentAuth, config: ConfigDep) -> dict:
         return await config.read_secret(provider_id)
 
     tts = await build_tts_provider(effective, secret_reader=secret_reader)
+    from ling.domains.speech.asr_providers import build_asr_provider
+    asr = await build_asr_provider(effective, secret_reader=secret_reader)
 
     return {
-        "configured": False,
+        "configured": tts.ok or asr.ok,
         "provider_id": tts.provider.provider_id,
         "requirements": SPEECH_PROFILE_REQUIREMENTS,
-        "status": "已实现未测试：语音流水线与 provider 端口已就绪，未接凭据与设备",
-        "blocked_by": "需要语音供应商凭据（ASR/TTS）与手机设备",
+        "status": "语音识别与合成按已发布配置独立装配",
+        "asr": {"available": asr.ok, "provider_id": asr.provider_id,
+                "model_id": asr.model_id, "kind": asr.kind, "reason": asr.reason,
+                "file_input": asr.ok, "realtime_input": False},
         "tts": {
             # 装配结论：真的造出了那家的适配器才为 True。
             "available": tts.ok,
@@ -1099,8 +1103,8 @@ async def speech_status(auth: CurrentAuth, config: ConfigDep) -> dict:
             "kind": tts.kind,
             "source": tts.source,
             "reason": tts.reason,
-            # 出站链路（谁把 `[speak]` 交给合成）**仍未接线**。
-            "outbound_wired": False,
+            # 表示 `[speak]` 到合成与渠道投递的生产调用已接通。
+            "outbound_wired": True,
         },
         "rules": [
             "ASR partial 只做字幕，不写记忆、不触发工具",

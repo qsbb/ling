@@ -81,6 +81,8 @@ class SpeechErrorKind(StrEnum):
     """超出配置的大小或时长上限。重试无用，且**不许静默截断**。"""
     no_speech = "no_speech"
     """识别成功但没有人声。**不是错误**，但也不该启动一次空对话。"""
+    unintelligible = "unintelligible"
+    """识别没有返回可用文字，尚无证据判断为静音。"""
     cancelled = "cancelled"
     """本地取消。**不保证上游免计费**——不要对用户声称没花钱。"""
 
@@ -375,6 +377,22 @@ class TtsProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class AsrCapabilities:
+    """当前适配器的文件识别能力与输入约束。"""
+
+    formats: frozenset[str]
+    file_transcription: bool = True
+    file_result_stream: bool = False
+    realtime_input: bool = False
+    language_hints: bool = False
+    vocabulary: bool = False
+    timestamps: bool = False
+    speaker_diarization: bool = False
+    max_file_bytes: int | None = None
+    max_audio_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class AsrRequest:
     model_id: str
     audio: AudioInput
@@ -437,7 +455,10 @@ class StreamingAsrOptions:
 
 @runtime_checkable
 class AsrProvider(Protocol):
-    """整段/文件识别。成功只返回终态；空白结果用 ``no_speech``。"""
+    """整段文件识别。成功返回终态，空白结果用 ``unintelligible``。
+
+    有独立静音证据时才使用 ``no_speech``。
+    """
 
     provider_id: str
 
@@ -601,6 +622,7 @@ class UnconfiguredSpeechProvider:
 
 
 __all__ = [
+    "AsrCapabilities",
     "SPEAK_TAG",
     "SPEECH_PROFILE_REQUIREMENTS",
     "AsrEvent",

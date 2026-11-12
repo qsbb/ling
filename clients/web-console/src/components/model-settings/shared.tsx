@@ -69,6 +69,12 @@ export const PRIMARY_ROLES: RoleMeta[] = [
     short: '记忆',
     hint: '从对话里抽长期记忆，决定她记不记得住',
   },
+  {
+    key: 'speech.asr',
+    label: '语音识别',
+    short: '识别',
+    hint: '把收到的语音转成文字，交给对话模型理解',
+  },
 ];
 
 /**
@@ -117,6 +123,8 @@ export const PROVIDER_KIND_OPTIONS = [
   // 不混进「OpenAI 兼容」里让用户换个地址就以为能用。
   { value: 'cloudflare_embedding', label: '嵌入（Cloudflare）' },
   { value: 'siliconflow_rerank', label: '重排（SiliconFlow）' },
+  { value: 'siliconflow_asr', label: '语音识别（SiliconFlow）' },
+  { value: 'dashscope_asr', label: '语音识别（百炼 Qwen）' },
 ] as const;
 
 export function kindLabel(kind: string): string {
@@ -408,6 +416,7 @@ export function providerShapeIssues(input: {
     kind === 'local';
   const isRerank = kind === 'siliconflow_rerank';
   const isEmbed = kind === 'cloudflare_embedding';
+  const isAsr = kind === 'siliconflow_asr' || kind === 'dashscope_asr';
   const validUrl = /^https?:\/\//.test(baseUrl);
 
   if (isChat || isRerank) {
@@ -441,6 +450,13 @@ export function providerShapeIssues(input: {
         message: 'API 地址必须以 http:// 或 https:// 开头',
       });
     }
+  }
+
+  if (isAsr && baseUrl && !validUrl) {
+    issues.push({
+      field: `providers.${providerId}.base_url`,
+      message: 'API 地址必须以 http:// 或 https:// 开头',
+    });
   }
 
   return issues;
@@ -556,6 +572,7 @@ export const ROLE_GROUPS: readonly RoleGroup[] = [
     note: '3 个 · 提炼与检索',
     keys: ['memory.extract', 'memory.embed', 'memory.rerank'],
   },
+  { title: '语音', note: '收到语音时识别', keys: ['speech.asr'] },
 ];
 
 /**

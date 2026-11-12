@@ -19,10 +19,8 @@
 
 ## 它**不能**证明什么
 
-`tts.available: true` 只说明「那家适配器被造出来了」。它**不**说明她会说话：
-出站触发链路（`[speak]` → 合成 → 投递）仍然没有生产调用点，`speech.tts`
-也仍留在 `RESERVED_PROFILES` 里。响应里的 `outbound_wired: false` 就是这条的
-显式声明，本文件也断言它——防止有人把 `available` 读成"绑上就能听见"。
+`tts.available: true` 表示供应商适配器已按当前配置装配。`outbound_wired` 另行
+反映 `[speak]` 到渠道投递链是否接通。顶层 `configured` 汇总 ASR 或 TTS 是否已装配。
 """
 
 from __future__ import annotations
@@ -130,22 +128,13 @@ async def test_bound_tts_provider_is_the_real_adapter(
     assert tts["model_id"] == model_id
     assert tts["kind"] == provider["kind"]
     assert tts["reason"] == ""
-    # 出站链路仍然是断的。这一条**故意**和上面的 available 同时断言：
-    # 让"造出来了"与"她会说话"在同一个响应里被分开报告。
-    assert tts["outbound_wired"] is False, (
-        "出站链路被标成已接线了？先确认 [speak] → 合成 → 投递真的有生产调用点，"
-        "再动这条断言"
-    )
+    assert tts["outbound_wired"] is True
 
 
-async def test_response_still_does_not_claim_speech_is_configured(
+async def test_response_reports_configured_tts(
     logged_in: TestEnv,
 ) -> None:
-    """顶层 `configured` 仍是 false——装配成功 ≠ 语音功能可用。
-
-    这条防止有人"顺手"把 `configured` 改成 `tts.available`：那会让后台显示
-    "语音已配置"，而她并不会说话。
-    """
+    """顶层 configured 汇总当前可装配的语音方向。"""
     await _publish(
         logged_in,
         {
@@ -159,7 +148,7 @@ async def test_response_still_does_not_claim_speech_is_configured(
     )
     body = (await logged_in.client.get("/v1/speech")).json()
     assert body["tts"]["available"] is True
-    assert body["configured"] is False
+    assert body["configured"] is True
 
 
 # --------------------------------------------------------------- 负向：仍是占位

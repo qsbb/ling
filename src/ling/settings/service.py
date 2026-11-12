@@ -132,7 +132,6 @@ RESERVED_PROFILES: dict[str, str] = {
     # `SpeechService.record_partial/record_final`），但绑一个模型仍然换不来
     # 用户能看见的效果。展示出来等于承诺"绑上就能听见/说话"，而实际零效果——
     # 比没有这个入口更糟：用户会以为自己配错了。
-    "speech.asr": "尚无实现：入站语音分段已落库，但没有按模型职责构造的 ASR provider",
     # `speech.tts` 与另两项**不再是同一个原因**（2026-11-12 拆开写）：
     # 出站 provider 已经能按绑定真的构造出来了
     # （`domains/speech/providers.py::build_tts_provider`，`GET /v1/speech`
@@ -244,6 +243,15 @@ def _provider_shape_issues(pid: str, cfg: dict) -> list[ValidationIssue]:
                     f"providers.{pid}.base_url", "base_url 必须以 http:// 或 https:// 开头"
                 )
             )
+
+    if ModelCapability.asr in capabilities and base_url and not (
+        base_url.startswith("http://") or base_url.startswith("https://")
+    ):
+        issues.append(
+            ValidationIssue(
+                f"providers.{pid}.base_url", "base_url 必须以 http:// 或 https:// 开头"
+            )
+        )
 
     if capabilities and not cfg.get("has_secret"):
         issues.append(
