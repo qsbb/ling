@@ -745,8 +745,20 @@ class OneBotV11Connector(ChannelConnector):
         """在窗口历史里找"自己发的、同文的、时间窗内"的消息。"""
         window_ref = query.window_ref or ""
         digest = query.text_digest or ""
-        if not window_ref or not digest:
+        if not window_ref or not digest or digest == delivery_text_digest(""):
             # 拿不到会话/正文就没法比对：当作"没有证据"，不当作否证。
+            #
+            # ## 为什么"空正文的摘要"也算没有证据
+            #
+            # `delivery_text_digest("")` 是**常量**（所有空正文同值）——修复
+            # `8e5b84b` 之后新写的语音 operation 不再带这个键，但**存量行**
+            # （修复前写下的）里仍然躺着它。而它一旦非空就绕过上面这个开关，
+            # 下去逐条比对历史：任何一条正文为空的消息都会 `== digest`，
+            # `hits` 于是装进**别人的** message_id，把别人的消息认成自己这条。
+            #
+            # 这一层放在对账侧而不是只靠数据迁移，是因为判断本身幂等、无副作用、
+            # 随代码走：别处的库、备份恢复、导出导入都可能把旧行再带回来。
+            # 与迁移不冲突——迁移负责"清干净"，这里负责"即使没清干净也不误认"。
             return _HistoryScan(ok=False)
         sent_at = _aware(query.sent_at) or _now()
         since = sent_at - timedelta(seconds=HISTORY_MATCH_BEFORE_SECONDS)

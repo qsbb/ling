@@ -52,7 +52,11 @@ from ling.contracts.v1 import (
 )
 from ling.infra.db import session_scope
 from ling.infra.models import Operation
-from ling.ports.channel import OutboundMessage, ReceiptQuery
+from ling.ports.channel import (
+    OutboundMessage,
+    ReceiptQuery,
+    delivery_text_digest,
+)
 
 #: 空串／纯空白的 ``delivery_text_digest`` 值。**字面量不从被测代码取**：
 #: 被测代码里改坏了它，测试要跟着报警，而不是跟着坏。
@@ -509,22 +513,30 @@ async def test_empty_digest_string_also_reports_no_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_empty_digest_would_have_matched_strangers_message() -> None:
-    """**反方向的正向配对**：同一个连接器、同一份历史，摘要换成空摘要常量时**确实会**
-    命中别人的消息。
+async def test_stored_empty_digest_constants_are_ignored_like_missing() -> None:
+    """**存量行**：摘要键存在但值是空摘要**常量** → 同样"没有证据"。
 
-    这条是前两条的对照实验，缺了它，"没有查历史"就无法区分于"这份历史本来就
-    什么都匹配不上"：
+    只修写侧（`8e5b84b`）挡不住这个形状：修复前写下的语音 operation 里仍然躺着
+    ``EMPTY_TEXT_DIGEST``。它非空，所以绕过"摘要是空值"那个开关，下去逐条比对
+    历史——任何一条正文为空的消息都会 ``== digest``，`hits` 于是装进**别人的**
+    message_id。所以读侧（`_scan_history`）必须把它与"没有摘要"同等处理。
 
-    - 传 ``EMPTY_TEXT_DIGEST`` → 那几条空正文消息被认成自己 → ``delivered``，
-      而且 ``platform_message_id`` 是**历史里别人的 id**；
-    - 传 ``None`` → 不查、``uncertain``。
+    这条替换掉了本文件原来的
+    ``test_the_empty_digest_would_have_matched_strangers_message``。那条断言
+    "空摘要常量**确实会**命中外人的消息"，并预言"如果哪天连接器改成空摘要也不
+    匹配，这条会红"——**它红了，而且它描述的那个行为正是设计文档禁止的**，
+    所以按它自己的指示改写成现在这条，而不是放宽它。
 
-    两个结果不同，才证明"摘要缺失"这条路真的改变了结论。**如果哪天连接器改成了
-    "空摘要也不匹配"，这条会红**——那时应该删掉它，而不是放宽它：它描述的正是
-    设计文档禁止的那种匹配。
+    同时验证**不查历史**：可以查却查了、只是恰好没命中，在实现上是另一个状态
+    （``ok=True`` + ``saw_self``），会把后续推向 ``failed``。
+
+    **必须失败于**"去掉空摘要常量判断"：那时下面这份历史里三条空正文消息都会被
+    认成自己 → ``delivered``（唯一命中）或 ``ambiguous``，且会真的发出历史请求。
     """
+    seen: list[str] = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url).rsplit("/", 1)[-1])
         return _ok_history(_EMPTY_BODY_HISTORY)
 
     receipt = await _onebot_connector(handler).query_receipt(
@@ -536,12 +548,71 @@ async def test_the_empty_digest_would_have_matched_strangers_message() -> None:
             is_group=True,
         )
     )
-    # 三条空正文消息都命中 → 不止一条 → 连接器只能报"无法唯一命中"。
-    # 无论它报 delivered 还是 ambiguous，"摘要被当成了证据"这一点都成立。
-    assert receipt.state is not DeliveryState.failed, receipt
-    assert "历史内容比对" in (receipt.detail or "") or "无法唯一命中" in (
-        receipt.detail or ""
-    ), f"空摘要没有被拿去比对历史：{receipt.detail!r}"
+    assert seen == [], f"摘要是空正文常量，却仍然去查了历史：{seen}"
+    assert receipt.state is DeliveryState.uncertain, receipt
+    assert "第二个否证" in (receipt.detail or ""), receipt.detail
+    assert receipt.platform_message_id is None, (
+        f"把历史里别人的空消息认成了自己：{receipt.platform_message_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_digest_still_matches_through_the_same_scan() -> None:
+    """**配对正向断言**：正常非空摘要 + 正常匹配 → 仍然**唯一命中**那条历史消息。
+
+    没有这一条，"空摘要常量一律返回 ``ok=False``"也能让上面那条通过——那时
+    历史比对这条证据链等于被整条关掉，语音/纯文本一旦没有平台 id 就永远
+    ``uncertain``。所以这条不是陪衬，是那一刀没跑偏的唯一保证。
+
+    ## 构造方式：同一份历史里**既有**空正文消息**也有**目标消息
+
+    单单"历史里只有一条同文消息"是不够的：那种历史在"错误地忽略所有摘要"的
+    实现下会报"没命中"，在这条实现下报"命中"——能区分；但它区分不了"命中"来自
+    内容比对还是来自"附近只有一条自己的消息"。真正需要的是：把空正文消息
+    **放在一起**，让错误的实现先去把它们数进 ``hits``。
+
+    - 若实现把空正文也算命中 → ``hits`` 有 4 条（3 条空正文 + 1 条正文）→
+      ``ambiguous`` 或认错 id，这条红；
+    - 若实现完全不按摘要匹配 → 0 条 → ``ok=True, saw_self=True``，回执是
+      ``uncertain``/``failed``，不会带 message_id，这条也红。
+
+    只有"只认那个正文的摘要、跳过空正文"才得到唯一的那个 id。
+
+    **必须失败于**"凡是摘要就 return ``ok=False``" 与 "把空正文也算命中"。
+    """
+    target_text = "我到家了"
+    history = [
+        # 三条别人的空正文消息（sender 仍是我们自己，否则它们连比对都进不去）。
+        *_EMPTY_BODY_HISTORY,
+        # 目标：正文与 query 的摘要一致。
+        {
+            "message_id": 7301,
+            "sender": {"user_id": 10001},
+            "message": [{"type": "text", "data": {"text": target_text}}],
+        },
+    ]
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url).rsplit("/", 1)[-1])
+        return _ok_history(history)
+
+    receipt = await _onebot_connector(handler).query_receipt(
+        ReceiptQuery(
+            operation_id="op_plain_positive",
+            window_ref="onebot-digest-evidence:group:100200300",
+            text_digest=delivery_text_digest(target_text),
+            sent_at=datetime.now(UTC) - timedelta(minutes=30),
+            is_group=True,
+        )
+    )
+    # 正向：真的走了历史查询这条路（不是靠什么捷径拿到 id）。
+    assert seen, "非空摘要却没有查历史，下面的命中不可能是内容比对得来的"
+    assert receipt.state is DeliveryState.delivered, receipt
+    assert receipt.platform_message_id == "7301", (
+        f"内容比对没有唯一命中目标消息：{receipt.platform_message_id!r}"
+    )
+    assert "历史内容比对" in (receipt.detail or ""), receipt.detail
 
 
 @pytest.mark.asyncio
