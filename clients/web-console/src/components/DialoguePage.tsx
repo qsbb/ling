@@ -103,7 +103,7 @@ const FIELDS: PolicyField[] = [
   {
     key: 'tools_enabled',
     label: '允许对话调用工具',
-    hint: '开启后，已在模型设置中声明支持工具调用的对话模型可以在回复前查询当前时间。',
+    hint: '开启后，已声明支持工具调用的对话模型可以查询当前时间和本轮可读的本地资料。',
     kind: 'bool',
   },
   {

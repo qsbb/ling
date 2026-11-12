@@ -25,7 +25,11 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, build_default_registry
+from ling.capabilities.tools import (
+    CLOCK_NOW_TOOL_ID,
+    KNOWLEDGE_SEARCH_TOOL_ID,
+    build_default_registry,
+)
 from ling.contracts.v1 import (
     CapabilityDescriptor,
     ChatMessage,
@@ -64,6 +68,7 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.kernel.arbiter import SpeakerArbiter
+from ling.kernel.audience import AudienceSnapshot
 from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.marker_stream import (
     stream_safe_all,
@@ -653,11 +658,8 @@ class TurnCoordinator:
         # 默认读取本轮生效配置。显式传值的调用方仍需提供自己的注册表。
         tool_calls_enabled: bool | None = None,
         tool_registry: ToolRegistry | None = None,
-        # 这一轮允许模型调用的工具 id。**默认只有 `clock.now`**：
-        # 只读、无副作用、幂等。`diagnostics.echo` 故意不在里面（它的输出
-        # 是模型自己的输入，没有信息增量）；`shell.readonly` 能读宿主机状态；
-        # `message.recall` 走用户确认回路。
-        tool_allowlist: frozenset[str] = frozenset({CLOCK_NOW_TOOL_ID}),
+        # 知识查询还需按本轮受众注册。撤回走用户确认回路。
+        tool_allowlist: frozenset[str] = frozenset({CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID}),
     ) -> None:
         self._router = router
         self._tool_calls_enabled = tool_calls_enabled
@@ -1085,7 +1087,13 @@ class TurnCoordinator:
                 # 三条判据（开关 / 能力闸 / 开放清单）为什么都在这里而不是
                 # 路由器里，见 `_tool_ledger_for_turn`。
                 tool_rounds = _ToolRounds()
-                tool_ledger = self._tool_ledger_for_turn(config=config, profile=profile)
+                tool_ledger = self._tool_ledger_for_turn(
+                    config=config,
+                    profile=profile,
+                    audience=(
+                        compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
+                    ),
+                )
                 tool_ledger.turn_id = turn_id
                 # 跨两个模型步骤的调用装配器（分片按 index 累积）
                 call_stream = _CallStreamSlot()
@@ -2682,7 +2690,7 @@ class TurnCoordinator:
     # ------------------------------------------------------ 原生工具回路
 
     def _tool_ledger_for_turn(
-        self, *, config: EffectiveConfig, profile: str
+        self, *, config: EffectiveConfig, profile: str, audience: AudienceSnapshot | None = None
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -2722,7 +2730,7 @@ class TurnCoordinator:
                         enabled=False, reason="no_registry", provider_kind=kind, model_id=model_id
                     )
                 )
-            registry = build_default_registry()
+            registry = build_default_registry(knowledge_audience=audience)
         if not profile_supports_native_tools(profile):
             return _ToolLedger(
                 availability=ToolAvailability(
@@ -3143,7 +3151,7 @@ class TurnCoordinator:
                 continue
             registry = ledger.registry
             spec = registry.spec(call.name) if registry else None
-            if spec is None or call.name not in self._tool_allowlist:
+            if spec is None or not spec.model_callable or call.name not in self._tool_allowlist:
                 _reject("tool_not_available", "这一轮没有开放这个工具，未执行")
                 continue
             try:
@@ -3306,13 +3314,7 @@ def _tool_error(code: str, message: str) -> dict[str, str]:
 
 
 def _definition_from_spec(spec: ToolSpec) -> ToolDefinition:
-    """``ToolSpec`` → 端口里的 ``ToolDefinition``。
-
-    名字直接用 ``tool_id``（``clock.now`` 这种带点的形式两家协议都接受，
-    OpenAI 要求 ``^[a-zA-Z0-9_-]{1,64}$``——点号不在白名单里，但实际端点
-    普遍接受，且这是既有 id 体系不能改）。**如果需要严格白名单**，
-    将来在适配器一侧换成映射表，而不是在这里改 id。
-    """
+    """端口保留领域工具 ID，由适配器转换为协议函数名。"""
     return ToolDefinition(
         name=spec.tool_id,
         description=spec.description,

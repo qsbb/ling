@@ -10,12 +10,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import KnowledgeItem
 from ling.infra.security import new_id
+
+if TYPE_CHECKING:
+    from ling.kernel.audience import AudienceSnapshot
 
 DEFAULT_TTL_HOURS = 24
 
@@ -129,16 +133,19 @@ class KnowledgeService:
         if not terms:
             return []
         now = datetime.now(UTC)
-        from sqlalchemy import or_
 
         conditions = [
             or_(
-                KnowledgeItem.topic.ilike(f"%{t}%"),
-                KnowledgeItem.claim.ilike(f"%{t}%"),
+                KnowledgeItem.topic.icontains(t, autoescape=True),
+                KnowledgeItem.claim.icontains(t, autoescape=True),
             )
             for t in terms[:8]
         ]
-        stmt = select(KnowledgeItem).where(or_(*conditions))
+        stmt = select(KnowledgeItem).where(
+            or_(*conditions),
+            or_(KnowledgeItem.valid_until.is_(None), KnowledgeItem.valid_until > now),
+            KnowledgeItem.visibility.in_(("public", "subject_private")),
+        )
         # 归属过滤：公共条目（owner 为 NULL）人人可读；
         # 私有条目只能被它的 owner 读到。缺这一层的话，
         # source_kind=user_statement 的条目会跨用户泄漏。
@@ -158,9 +165,19 @@ class KnowledgeService:
                 )
             ).scalars()
         )
-        out = [self._view(r, now) for r in rows if not self._expired(r, now)]
+        out = [self._view(r, now) for r in rows]
         out.sort(key=lambda v: (-v.confidence, v.observed_at))
         return out[:limit]
+
+    async def search_for_audience(
+        self, query: str, *, audience: AudienceSnapshot, limit: int = 3
+    ) -> list[KnowledgeView]:
+        """用同一份受众范围检索首轮资料和同轮补查结果。"""
+        if not audience.allows_long_term_memory():
+            return []
+        return await self.search(
+            query, limit=limit, subject_id=None if audience.is_group else audience.subject_id
+        )
 
     async def list_all(self, limit: int = 50) -> list[KnowledgeView]:
         now = datetime.now(UTC)

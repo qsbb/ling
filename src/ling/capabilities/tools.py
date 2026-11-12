@@ -10,14 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any
 
 from ling.contracts.v1 import new_id
+
+if TYPE_CHECKING:
+    from ling.kernel.audience import AudienceSnapshot
 
 
 class ToolRisk(StrEnum):
@@ -404,10 +409,54 @@ RECALL_TOOL_ID = "message.recall"
 #: 时钟工具的 id。理由与 `RECALL_TOOL_ID` 相同：schema 声明侧、
 #: 可用性判断侧、测试断言侧写的是同一个常量。
 CLOCK_NOW_TOOL_ID = "clock.now"
+KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
+_KNOWLEDGE_RESULT_CHARS = 3000
+_KNOWLEDGE_CLAIM_CHARS = 600
+_KNOWLEDGE_QUERY_CHARS = 200
+
+
+async def _search_knowledge(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from ling.domains.knowledge.service import KnowledgeService
+    from ling.infra.db import session_scope
+
+    query = args["query"].strip()
+    if not query or len(query) > _KNOWLEDGE_QUERY_CHARS:
+        raise ValueError(f"查询词长度应为 1 到 {_KNOWLEDGE_QUERY_CHARS} 字符")
+    try:
+        async with session_scope() as session:
+            matches = await KnowledgeService(session).search_for_audience(query, audience=audience)
+    except SQLAlchemyError as exc:
+        raise RuntimeError("本地知识库查询失败") from exc
+
+    items: list[dict[str, str | None]] = []
+    truncated = False
+    for match in matches:
+        item = {
+            "item_id": match.item_id,
+            "topic": match.topic,
+            "claim": match.claim[:_KNOWLEDGE_CLAIM_CHARS],
+            "source_url": match.source_url,
+            "source_kind": match.source_kind,
+            "observed_at": match.observed_at.isoformat(),
+            "valid_until": match.valid_until.isoformat() if match.valid_until else None,
+        }
+        # 用较长的 false 预留标志位，保证截断后仍返回完整 JSON。
+        candidate = json.dumps({"items": [*items, item], "truncated": False}, ensure_ascii=False)
+        if len(candidate) > _KNOWLEDGE_RESULT_CHARS:
+            truncated = True
+            break
+        items.append(item)
+        truncated |= len(match.claim) > _KNOWLEDGE_CLAIM_CHARS
+    return json.dumps({"items": items, "truncated": truncated}, ensure_ascii=False)
 
 
 def build_default_registry(
-    *, allow_irreversible: bool = False, include_recall: bool = True
+    *,
+    allow_irreversible: bool = False,
+    include_recall: bool = True,
+    knowledge_audience: AudienceSnapshot | None = None,
 ) -> ToolRegistry:
     """默认工具集：只读/诊断 + 撤回（不可逆，需确认）。
 
@@ -434,8 +483,6 @@ def build_default_registry(
             risk=ToolRisk.read_only,
             requires_confirmation=False,
             reversible=True,
-            # ---- 本期**唯一**对模型开放的工具。
-            #
             # 三条判据（缺一条都不该开放）：只读、无副作用、幂等。
             # `diagnostics.echo` 虽然也只读，但它的输出是**模型自己给的输入**，
             # 开放它等于让模型在两步之间"回声"自己的参数，没有信息增量，
@@ -460,6 +507,32 @@ def build_default_registry(
         ),
         _clock_tool,
     )
+    if knowledge_audience is not None and knowledge_audience.allows_long_term_memory():
+        registry.register(
+            ToolSpec(
+                tool_id=KNOWLEDGE_SEARCH_TOOL_ID,
+                version="1.0.0",
+                description="按关键词补查本地知识库，最多返回三条当前可读的资料及来源。",
+                risk=ToolRisk.read_only,
+                requires_confirmation=False,
+                reversible=True,
+                model_callable=True,
+                model_result_chars=_KNOWLEDGE_RESULT_CHARS,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": _KNOWLEDGE_QUERY_CHARS,
+                            "description": "要补查的主题或关键词",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            partial(_search_knowledge, audience=knowledge_audience),
+        )
     registry.register(
         ToolSpec(
             tool_id="diagnostics.echo",

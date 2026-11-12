@@ -865,8 +865,8 @@ class ContextCompiler:
             try:
                 from ling.domains.knowledge.service import KnowledgeService
 
-                knowledge_items = await KnowledgeService(self._session).search(
-                    user_text, limit=3, subject_id=subject_id
+                knowledge_items = await KnowledgeService(self._session).search_for_audience(
+                    user_text, audience=snapshot
                 )
             except Exception as exc:  # noqa: BLE001 - 知识库失败不影响本轮
                 knowledge_items = []

@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from ling.capabilities.tools import CLOCK_NOW_TOOL_ID
+from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID
 from ling.ports.model import (
     ModelChunk,
     ModelChunkKind,
@@ -49,7 +49,10 @@ from ling.ports.model import (
 )
 
 # Chat Completions 的函数名不接受点号。领域工具 ID 仍用于权限与审计。
-_TOOL_WIRE_NAMES = {CLOCK_NOW_TOOL_ID: "clock_now"}
+_TOOL_WIRE_NAMES = {
+    CLOCK_NOW_TOOL_ID: "clock_now",
+    KNOWLEDGE_SEARCH_TOOL_ID: "knowledge_search",
+}
 _TOOL_IDS_BY_WIRE_NAME = {name: tool_id for tool_id, name in _TOOL_WIRE_NAMES.items()}
 
 
