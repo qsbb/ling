@@ -302,6 +302,21 @@ async function checkedWillingness(page: Page): Promise<string | null> {
 
 /* ------------------------------------------------------------ 用例 */
 
+describe('对话工具设置', () => {
+  it('旧配置默认关闭，开启后随对话策略保存', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, drafts } = await openDialogue();
+    const tools = page.getByRole('checkbox', { name: /允许对话调用工具/ });
+    expect(await tools.isChecked()).toBe(false);
+
+    await tools.check();
+    await save(page);
+    await expect.poll(() => drafts.length).toBe(1);
+    const dialogue = drafts[0]?.body.dialogue as Record<string, unknown>;
+    expect(dialogue.tools_enabled).toBe(1);
+  }, TIMEOUT);
+});
+
 describe('语音设置：意愿档位', () => {
   it('三档都在，默认 natural，且每档下面有一句说明', async (ctx) => {
     if (skip(ctx)) return;

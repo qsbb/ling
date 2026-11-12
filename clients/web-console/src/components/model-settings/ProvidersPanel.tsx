@@ -658,6 +658,23 @@ export function ProvidersPanel({
                   }
                 />
               </label>
+              {selected.kind === 'openai_compatible' || selected.kind === 'local' ? (
+                <div className="ms-field ms-field--wide">
+                  <span className="ms-field__label">端点支持原生工具调用</span>
+                  <MsSwitch
+                    checked={selected.extra?.native_tools === true}
+                    label="端点支持原生工具调用"
+                    onChange={(value) =>
+                      onPatch(selected.provider_id, {
+                        extra: { ...selected.extra, native_tools: value },
+                      })
+                    }
+                  />
+                  <span className="ms-hint">
+                    确认该端点及对话模型支持流式工具调用后开启。
+                  </span>
+                </div>
+              ) : null}
               {selected.kind === 'cloudflare_embedding' ? (
                 <label className="ms-field ms-field--wide">
                   <span className="ms-field__label">账号 ID（Account ID）</span>

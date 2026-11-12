@@ -422,6 +422,7 @@ export interface DialoguePolicy {
   group_mention_requires_reply: number | boolean;
   rest_may_skip: number | boolean;
   group_reply_delivery_enabled: number | boolean;
+  tools_enabled?: boolean;
   /**
    * 她**愿不愿意开口说话**的倾向档位。设置页「⑤ 对话与主动性」。
    * 对应后端 `ports/config.py::VoiceWillingness`（§17.4）。

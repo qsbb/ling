@@ -1,27 +1,4 @@
-"""原生工具回路的**生产接线**：开关、注册表、以及五种"不可用"必须各自可区分。
-
-## 这个文件钉的是什么
-
-`kernel/turn.py` 从落地起就有一套完整的同轮工具回路（`_ToolRounds` 普通轮与
-工具轮共用同一个循环、两道能力闸、角色白名单），但 ``tool_calls_enabled``
-**全仓零调用点**——线上她永远不会调用任何工具。这个文件守的是"接上线之后
-它仍然可以是关的，而且关得有理由"：
-
-1. 不配置 → ``switch_off``（**默认关**，不是接线时顺手打开）；
-2. 开了但没给注册表 → ``no_registry``（"只给开关"是一个独立的成因）；
-3. 开了、给了注册表，角色不在白名单 → ``profile_not_wired``；
-4. 开了、给了注册表、角色在白名单，供应商 kind 没有编解码 →
-   ``kind_has_no_native_tools``；
-5. 配置项本身能存能读（``voice_willingness`` 那个坑：`DialoguePolicyIn` 不声明
-   → pydantic 静默丢弃 → "打开了、保存成功、刷新回到关"）。
-
-## 为什么第 1-4 条要分别单测而不是一条端到端
-
-四种成因的**修法不同**（改配置 / 注入注册表 / 换角色 / 换供应商），压成一个
-布尔之后，线上表现统一是"她从来不用工具"，谁都查不出是哪一环。所以每条都
-断言 ``reason`` 的**字面值**，而不只是 ``enabled is False``——后者在四种成因
-下都是 ``False``，它证明不了任何事。
-"""
+"""同轮工具调用的配置往返与能力门。"""
 
 from __future__ import annotations
 
@@ -36,7 +13,6 @@ from ling.ports.config import (
     ProfileBinding,
     ProviderConfig,
 )
-from ling.worker import tool_registry_for_turn
 
 #: 一个在角色白名单里（`ports/model.py::NATIVE_TOOLS_PROFILES`）的角色。
 WIRED_PROFILE = "dialogue.fast"
@@ -84,7 +60,7 @@ def _config(*, kind: str = "openai_compatible", tools_enabled: bool = False) -> 
     )
 
 
-def _ledger(*, enabled: bool, registry: object, declared: bool = True, config=None):  # noqa: ANN001, ANN202
+def _ledger(*, enabled: bool | None, registry: object, declared: bool = True, config=None):  # noqa: ANN001, ANN202
     coordinator = TurnCoordinator(
         router=_NoopRouter(declared=declared),  # type: ignore[arg-type]
         actor_id="actor_ling",
@@ -273,131 +249,41 @@ def test_tools_enabled_defaults_to_false_when_absent_from_payload() -> None:
     assert _dialogue_policy({"group_turn_budget": 5}).tools_enabled is False
 
 
-# ------------------------------------------ 7. worker 真的把参数传下去了
+# ------------------------------------------ 7. 按轮读取已发布配置
 
 
-def _code_only(path) -> str:  # noqa: ANN001
-    """只保留**代码**行：剥掉注释与 docstring。
-
-    **这不是技巧，是必要条件。** 解释一条禁令必须引用被禁的词——`worker.py`
-    的注释里写着 `tool_calls_enabled=...`，朴素字符串搜索会被注释骗过。
-    """
-    import ast
-
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    lines = path.read_text(encoding="utf-8").splitlines()
-    keep: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.stmt) and node.end_lineno is not None:
-            for lineno in range(node.lineno, node.end_lineno + 1):
-                keep.add(lineno)
-    return "\n".join(line for i, line in enumerate(lines, 1) if i in keep)
-
-
-def _coordinator_constructions(node, found):  # noqa: ANN001, ANN202
-    import ast
-
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            func = child.func
-            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-            if name == "TurnCoordinator":
-                found.append({kw.arg for kw in child.keywords})
-    return found
-
-
-def test_every_turn_coordinator_in_worker_wires_the_tool_switch() -> None:
-    """`worker.py` 里**每一处** `TurnCoordinator(...)` 都必须传这两个参数。
-
-    这是唯一能抓住"接线未做"的守卫，而且必须是**结构级**的：端到端测试自己
-    写一份 `TurnCoordinator(...)` 传参时，删掉 worker 里的接线它照样绿——
-    已实测（变异 1 未红）。绕过全部调用点的 e2e 证明不了调用点被接上了。
-
-    为什么不用字符串搜索：`worker.py` 的注释里就写着这两个参数名。
-    `_code_only` 用 AST 只留代码行，删掉真代码后注释不会让它变绿。
-
-    ## `allow_irreversible` 不在断言里
-
-    它由 `tool_registry_for_turn` → `build_default_registry()` 的默认值决定，
-    另有一条测试盯它（`test_default_registry_never_allows_irreversible_by_default`），
-    这里只管"参数传没传"。
-    """
-    from pathlib import Path
-
-    src = _code_only(Path(__file__).resolve().parents[2] / "src/ling/worker.py")
-    assert "TurnCoordinator" in src, "守卫没抓到任何构造点——AST 或路径坏了"
-
-    import ast
-
-    found = _coordinator_constructions(ast.parse(src), [])
-    assert len(found) == 2, f"期望 worker 里有 2 处 TurnCoordinator 构造，实际 {len(found)}"
-    for index, names in enumerate(found):
-        assert "tool_calls_enabled" in names, f"第 {index + 1} 处没传 tool_calls_enabled"
-        assert "tool_registry" in names, f"第 {index + 1} 处没传 tool_registry"
-
-
-def test_guard_would_catch_a_reintroduction() -> None:
-    """守卫本身要有测试：造一个**没接线**的源码，确认它真能被判成缺参数。
-
-    一个永远为真的守卫比没有守卫更糟——它给人虚假的安全感。
-    """
-    import ast
-
-    broken = """
-def build():
-    return TurnCoordinator(router=None, actor_id="a", persona_id=None, cancels=None)
-
-
-def build_ok():
-    return TurnCoordinator(
-        router=None,
-        tool_calls_enabled=True,
-        tool_registry=None,
+def test_published_setting_selects_registry_for_each_turn() -> None:
+    coordinator = TurnCoordinator(
+        router=_NoopRouter(declared=True),  # type: ignore[arg-type]
+        actor_id="actor_ling",
+        persona_id=None,
+        cancels=object(),  # type: ignore[arg-type]
     )
-"""
-    found = _coordinator_constructions(ast.parse(broken), [])
-    assert len(found) == 2
-    assert "tool_calls_enabled" not in found[0], "守卫读不出缺参数的情况"
-    assert "tool_calls_enabled" in found[1], "守卫会把接好的也判成缺"
+    for enabled in (False, True, False):
+        ledger = coordinator._tool_ledger_for_turn(
+            config=_config(tools_enabled=enabled), profile=WIRED_PROFILE
+        )
+        assert ledger.enabled is enabled
+        assert (ledger.registry is not None) is enabled
+        assert {tool.name for tool in ledger.availability.tools} == (
+            {CLOCK_NOW_TOOL_ID} if enabled else set()
+        )
 
 
-def test_guard_ignores_comments_that_mention_the_parameters() -> None:
-    """注释里写参数名**不能**让守卫通过。
-
-    这是"被注释骗过"那个坑的直接对照：`_code_only` 必须真的剥掉注释。
-    变异方式：把 `_code_only` 换成直接返回原文，这条会红。
-    """
-    import ast
-    from pathlib import Path
-
-    src = _code_only(Path(__file__).resolve().parents[2] / "src/ling/worker.py")
-    assert "MUTATION" not in src
-
-    total = Path(__file__).resolve().parents[2] / "src/ling/worker.py"
-    raw = total.read_text(encoding="utf-8")
-    # 前提：原文里这两个词**确实**在注释中出现过（否则这条对照没有意义）
-    assert raw.count("tool_calls_enabled=") > 0
-    # 而只留代码行时，出现的次数只能是真正传参的那几处（2 处 × 1 次）
-    assert src.count("tool_calls_enabled=") == 2, src.count("tool_calls_enabled=")
-    assert "TurnCoordinator" in src
-    assert ast.parse(src) is not None
+def test_enabled_setting_with_unsupported_instance_sends_no_tools() -> None:
+    ledger = _ledger(
+        enabled=None, registry=None, declared=False, config=_config(tools_enabled=True)
+    )
+    assert ledger.availability.reason == "instance_has_no_native_tools"
+    assert ledger.availability.tools == ()
 
 
 def test_default_registry_never_allows_irreversible_by_default() -> None:
-    """`tool_registry_for_turn` 用的默认集**不允许**不可逆工具被直接执行。
+    from ling.capabilities.tools import RECALL_TOOL_ID, ToolRegistry, ToolRisk, ToolSpec
 
-    需求原文：「不可逆动作仍需服务端确认」。所以：
-    - 构造参数 `allow_irreversible` 保持默认 False；
-    - `message.recall` **可以**在默认集里注册（它经过逐次授权），但它必须
-      `requires_confirmation=True`，且**不是** ``model_callable``——
-      模型看不到它，就不可能在同一轮里直接执行。
-    """
-    from ling.capabilities.tools import RECALL_TOOL_ID, ToolRisk, build_default_registry
-    from ling.ports.config import DialoguePolicy
-
-    registry = tool_registry_for_turn(
-        EffectiveConfig(revision=1, dialogue=DialoguePolicy(tools_enabled=True))
-    )
+    registry = _ledger(
+        enabled=None, registry=None, config=_config(tools_enabled=True)
+    ).registry
     assert registry is not None
 
     # 模型侧清单里没有任何不可逆工具
@@ -411,8 +297,6 @@ def test_default_registry_never_allows_irreversible_by_default() -> None:
     assert recall.requires_confirmation is True
 
     # 注册表级的总开关保持关：新建一个注册表时，不可逆工具默认注册不进来。
-    from ling.capabilities.tools import ToolRegistry, ToolSpec
-
     strict = ToolRegistry()
     with pytest.raises(PermissionError):
         strict.register(
@@ -426,4 +310,80 @@ def test_default_registry_never_allows_irreversible_by_default() -> None:
             ),
             lambda _args: None,  # noqa: ARG005
         )
-    assert build_default_registry is not None
+
+
+@pytest.mark.parametrize("has_tool_history", [False, True])
+async def test_router_does_not_send_native_tools_to_incapable_fallback(has_tool_history: bool) -> None:
+    from ling.models.registry import ProviderRegistry
+    from ling.models.router import ModelRouter
+    from ling.ports.model import (
+        ChatMessageIn,
+        ModelChunk,
+        ModelChunkKind,
+        ModelError,
+        ModelErrorKind,
+        ToolDefinition,
+    )
+
+    requests = []
+
+    class Main:
+        kind = "openai_compatible"
+        supports_native_tools = True
+
+        async def stream(self, request):
+            if not request.tools:
+                yield ModelChunk(delta="unexpected")
+                return
+            raise ModelError(ModelErrorKind.unavailable, "fixture primary failed", retriable=True)
+
+    class Fallback:
+        kind = "openai_compatible"
+        supports_native_tools = False
+
+        async def stream(self, request):
+            requests.append(request)
+            yield ModelChunk(kind=ModelChunkKind.tool_call, provider_call_id="unadvertised")
+            yield ModelChunk(delta="fallback")
+
+    class Registry(ProviderRegistry):
+        def get(self, cfg):
+            return Main() if cfg.provider_id == "main" else Fallback()
+
+    config = EffectiveConfig(
+        revision=1,
+        providers={
+            provider_id: ProviderConfig(provider_id=provider_id, kind="openai_compatible", enabled=True)
+            for provider_id in ("main", "fallback")
+        },
+        profiles={
+            WIRED_PROFILE: ProfileBinding(
+                profile=WIRED_PROFILE,
+                provider_id="main",
+                model_id="m1",
+                fallback_provider_id="fallback",
+                fallback_model_id="m2",
+            ),
+        },
+    )
+    messages = [ChatMessageIn(role="user", content="clock")]
+    if has_tool_history:
+        messages.append(ChatMessageIn(role="tool", content="result", provider_call_id="fixture-id"))
+    router = ModelRouter(Registry(lambda _: None))
+    stream = router.stream(
+        config, profile=WIRED_PROFILE, messages=messages,
+        tools=(ToolDefinition(name=CLOCK_NOW_TOOL_ID, description="Clock"),),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+    if has_tool_history:
+        with pytest.raises(ModelError, match="fixture primary failed"):
+            async for _ in stream:
+                pass
+        assert not requests
+    else:
+        assert [chunk.delta async for chunk, _ in stream] == ["fallback"]
+        assert len(requests) == 1
+        assert requests[0].tools == ()
+        assert requests[0].tool_choice is None
+        assert requests[0].parallel_tool_calls is None

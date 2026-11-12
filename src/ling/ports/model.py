@@ -246,15 +246,15 @@ def profile_supports_native_tools(profile: str) -> bool:
 
 #: **本仓库适配器**实现了原生工具编解码的 kind。
 #:
-#: 只有 ``openai_compatible``：它按官方形状发 ``tools`` / ``tool_choice``，
-#: 并解析流式 ``delta.tool_calls`` 的 index/id/name/arguments 分片。
+#: ``openai_compatible`` 与 ``local`` 共用 Chat Completions 编解码，
+#: 发送 ``tools`` / ``tool_choice`` 并解析流式 ``delta.tool_calls``。
 #:
 #: **Responses（``chat_responses``）与 Anthropic（``anthropic``）未实现。**
 #: 它们的回灌形状不是 ``role:"tool"``，不能复用这个适配器的编解码；本期
 #: 明确不做。对它们的正确处理是"这一轮工具标为不可用"，**不是**退化成
 #: "让模型把查询写成文本标签"——那种退化没有执行、没有回灌，模型只能编。
 ADAPTER_NATIVE_TOOLS_KINDS: frozenset[str] = frozenset(
-    {ProviderKind.openai_compatible.value}
+    {ProviderKind.openai_compatible.value, ProviderKind.local.value}
 )
 
 
@@ -263,7 +263,7 @@ def kind_may_have_native_tools(kind: str) -> bool:
 
     它是**必要条件，不是充分条件**：
 
-    - ``openai_compatible``：适配器实现了 ``tools`` / 流式 ``tool_calls``；
+    - ``openai_compatible`` / ``local``：适配器实现了 ``tools`` / 流式 ``tool_calls``；
       但兼容层里有的端点直接丢掉 ``tools`` 字段还返回 200，所以真实判据是
       适配器**实例**的声明（:func:`provider_native_tools_support`）；
     - ``anthropic`` / ``chat_responses``：协议本身有工具，但本仓库适配器

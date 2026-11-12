@@ -41,6 +41,7 @@ DEFAULTS = {
     "proactive_delivery_enabled": False,
     # 群聊「决定回了」默认只记录、不真的发出去（安全默认）
     "group_reply_delivery_enabled": False,
+    "tools_enabled": False,
     # 说话倾向默认 natural（§17.4）：不配置时行为与"她现在这样"最接近，
     # 也不会把她突然变成"每句都发语音"。
     "voice_willingness": "natural",
@@ -84,6 +85,7 @@ async def test_dialogue_roundtrip(logged_in: TestEnv) -> None:
                 "proactive_daily_limit": 1,
                 "quiet_start_minute": 1320,  # 22:00
                 "quiet_end_minute": 420,  # 07:00
+                "tools_enabled": True,
             }
         },
     )
@@ -98,6 +100,7 @@ async def test_dialogue_roundtrip(logged_in: TestEnv) -> None:
         "group_attention_deferred": True,
         "proactive_delivery_enabled": False,
         "group_reply_delivery_enabled": False,
+        "tools_enabled": True,
         "voice_willingness": "natural",
         "voice": {
             "kind": None,

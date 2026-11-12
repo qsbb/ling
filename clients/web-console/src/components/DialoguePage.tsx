@@ -101,6 +101,12 @@ const FIELDS: PolicyField[] = [
     kind: 'bool',
   },
   {
+    key: 'tools_enabled',
+    label: '允许对话调用工具',
+    hint: '开启后，已在模型设置中声明支持工具调用的对话模型可以在回复前查询当前时间。',
+    kind: 'bool',
+  },
+  {
     key: 'rest_may_skip',
     label: '在休息时可以先不回',
     hint: '关掉之后，即使她在休息也会正常进入判断（由她自己决定回不回）。紧急求助永远不受影响。',

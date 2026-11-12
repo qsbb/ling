@@ -20,6 +20,7 @@ from ling.ports.config import EffectiveConfig, ProfileBinding, ProviderConfig
 from ling.ports.model import (
     ChatMessageIn,
     ModelChunk,
+    ModelChunkKind,
     ModelError,
     ModelErrorKind,
     ModelProvider,
@@ -328,6 +329,10 @@ class ModelRouter:
                 # 用户以为"她今天不想说话"。
                 last_error = quota_block
                 continue
+            # 回退供应商也要过能力门。已有工具回灌时，普通文本端点无法消费它。
+            candidate_supports_tools = not tools or provider_native_tools_support(provider)
+            if not candidate_supports_tools and any(message.is_tool_result() for message in messages):
+                continue
             request = ModelRequest(
                 model_id=candidate.model_id,
                 messages=messages,
@@ -338,14 +343,16 @@ class ModelRouter:
                 config_revision=config.revision,
                 trace_id=trace_id,
                 timeout_seconds=pcfg.timeout_seconds if pcfg is not None else 60.0,
-                tools=tuple(tools),
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
+                tools=tuple(tools) if candidate_supports_tools else (),
+                tool_choice=tool_choice if candidate_supports_tools else None,
+                parallel_tool_calls=parallel_tool_calls if candidate_supports_tools else None,
             )
             outcome = StreamOutcome(target=target, fallback_used=index > 0)
             started = time.monotonic()
             try:
                 async for chunk in self._timed_stream(provider, request):
+                    if not candidate_supports_tools and chunk.kind is ModelChunkKind.tool_call:
+                        continue
                     if chunk.delta:
                         outcome.text += chunk.delta
                         outcome.delivered_any = True

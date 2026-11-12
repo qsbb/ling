@@ -346,23 +346,7 @@ class DialoguePolicy:
     """
 
     tools_enabled: bool = False
-    """她能不能在**回复的当场**调用工具（同轮回灌）。
-
-    **默认 False**，与 ``proactive_delivery_enabled`` 同一条理由：打开它就
-    等于把所有普通对话塞进一条新路径——每次请求多一个 ``tools`` 字段、多一种
-    可能的 400。`kernel/turn.py` 从落地起就是默认关（见那里的注释），本字段
-    是给它补的**显式设置项**，不是改默认。
-
-    打开之后仍然**不一定**有工具：`kernel/turn.py::_tool_ledger_for_turn`
-    还要过角色白名单、适配器 kind、实例声明、清单四道闸，每一道失败都带着
-    自己的 ``reason``（``no_registry`` / ``profile_not_wired`` /
-    ``kind_has_no_native_tools`` / ``instance_has_no_native_tools`` /
-    ``no_model_tools``）。所以"开了却没反应"在日志里查得到是哪一环。
-
-    这一项只影响**同一轮**里的工具调用。不在任何工具白名单里的工具
-    （``shell.readonly`` / ``message.recall``）即使打开也不会被模型看到——
-    见 ``worker.py`` 的注册表构造与 `kernel/turn.py` 的 ``tool_allowlist``。
-    """
+    """允许在同一轮回复中调用模型支持的只读工具，默认关闭。"""
 
     voice_willingness: VoiceWillingness = "natural"
     """她**愿不愿意开口说话**的倾向档位。设置页「⑤ 对话与主动性」。

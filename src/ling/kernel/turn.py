@@ -25,7 +25,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.capabilities.tools import CLOCK_NOW_TOOL_ID
+from ling.capabilities.tools import CLOCK_NOW_TOOL_ID, build_default_registry
 from ling.contracts.v1 import (
     CapabilityDescriptor,
     ChatMessage,
@@ -650,16 +650,8 @@ class TurnCoordinator:
         # 只有延后回复那条路径会传它（见 `worker.py` 的 `_run_deferred_turn`）；
         # 普通对话不传 = 不设闸，行为完全不变。
         deliver_gate: Callable[[], Awaitable[bool]] | None = None,
-        # ---- 原生工具调用（同轮回灌）
-        #
-        # **默认关闭**，而且没有对应的环境变量/设置项：本期只做"端口 + 一个
-        # 适配器 + 编排 + 测试闭环"，生产上还没有任何供应商被探测证明支持
-        # 稳定的工具调用。默认打开它，等于把所有普通对话都塞进一条未经
-        # 压测的新路径（每次请求多一个 `tools` 字段、多一种可能的 400）。
-        #
-        # 打开它需要**两样一起给**：`tool_calls_enabled=True` 与一个注册表。
-        # 只给开关不给注册表 = `no_registry`（日志里说得清），不是静默关掉。
-        tool_calls_enabled: bool = False,
+        # 默认读取本轮生效配置。显式传值的调用方仍需提供自己的注册表。
+        tool_calls_enabled: bool | None = None,
         tool_registry: ToolRegistry | None = None,
         # 这一轮允许模型调用的工具 id。**默认只有 `clock.now`**：
         # 只读、无副作用、幂等。`diagnostics.echo` 故意不在里面（它的输出
@@ -2694,11 +2686,7 @@ class TurnCoordinator:
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
-        ## 开关默认关闭
-
-        生产路径必须显式打开（``tool_calls_enabled=True`` + 注入注册表）。
-        这样"没配好"的表现是**普通对话**，而不是"模型偶尔调一个工具"——
-        后者在生产里是最难解释的形状。本期只有测试与注入的 fake provider 打开它。
+        开关与模型绑定使用同一份配置快照。生产入口默认采用只读工具清单。
 
         ## 能力闸是**两道**，缺一不可
 
@@ -2715,20 +2703,26 @@ class TurnCoordinator:
         **不允许**退化成"让模型把查询写成文本标签"：那种退化没有回灌，
         模型会编结果，而且用户看不出区别——比"这一轮没有工具"糟得多。
 
-        ## 四种"不可用"必须可区分
-
-        ``switch_off`` / ``no_registry`` / ``profile_not_wired`` /
-        ``kind_has_no_native_tools`` / ``no_model_tools`` 各自是不同人的不同修法：
-        改配置、注入注册表、换角色、换供应商、改清单。压成一个布尔就谁都查不出来。
         """
         model_id, kind = self._resolved_tool_target(config, profile)
-        if not self._tool_calls_enabled or self._tool_registry is None:
-            reason = "no_registry" if self._tool_calls_enabled else "switch_off"
+        enabled = self._tool_calls_enabled
+        registry = self._tool_registry
+        if enabled is None:
+            enabled = config.dialogue.tools_enabled
+        if not enabled:
             return _ToolLedger(
                 availability=ToolAvailability(
-                    enabled=False, reason=reason, provider_kind=kind, model_id=model_id
+                    enabled=False, reason="switch_off", provider_kind=kind, model_id=model_id
                 )
             )
+        if registry is None:
+            if self._tool_calls_enabled is not None:
+                return _ToolLedger(
+                    availability=ToolAvailability(
+                        enabled=False, reason="no_registry", provider_kind=kind, model_id=model_id
+                    )
+                )
+            registry = build_default_registry()
         if not profile_supports_native_tools(profile):
             return _ToolLedger(
                 availability=ToolAvailability(
@@ -2758,7 +2752,7 @@ class TurnCoordinator:
             )
         definitions = tuple(
             _definition_from_spec(spec)
-            for spec in self._tool_registry.list_model_tools()
+            for spec in registry.list_model_tools()
             if spec.tool_id in self._tool_allowlist
         )
         if not definitions:
@@ -2771,6 +2765,7 @@ class TurnCoordinator:
                 )
             )
         return _ToolLedger(
+            registry=registry,
             availability=ToolAvailability(
                 enabled=True,
                 tools=definitions,
@@ -3146,7 +3141,8 @@ class TurnCoordinator:
                     f"本轮工具已用满 {TOOL_WALL_CLOCK_SECONDS:.0f} 秒，这一项未执行",
                 )
                 continue
-            spec = self._tool_registry.spec(call.name) if self._tool_registry else None
+            registry = ledger.registry
+            spec = registry.spec(call.name) if registry else None
             if spec is None or call.name not in self._tool_allowlist:
                 _reject("tool_not_available", "这一轮没有开放这个工具，未执行")
                 continue
@@ -3162,8 +3158,8 @@ class TurnCoordinator:
             if getattr(token, "stopped", False):
                 _reject("stopped", "这一轮被停止了，未执行")
                 continue
-            assert self._tool_registry is not None  # 上面已判过
-            result = await self._tool_registry.call_untruncated(
+            assert registry is not None
+            result = await registry.call_untruncated(
                 call.name, args, internal_call_id=internal_call_id
             )
             rounds.executed += 1
@@ -3573,6 +3569,7 @@ class _ToolLedger:
 
     turn_id: str = ""
     availability: ToolAvailability | None = None
+    registry: ToolRegistry | None = None
     executed: list[dict[str, str]] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
     batches: int = 0

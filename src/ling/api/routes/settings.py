@@ -179,15 +179,6 @@ class DialoguePolicyIn(BaseModel):
     proactive_delivery_enabled: bool | None = None
     # 群聊里「决定回了」之后是否真的生成并发送（默认关）
     group_reply_delivery_enabled: bool | None = None
-    # 同轮原生工具调用的总开关（默认关）。
-    #
-    # **必须有这一行**，理由和下面的 `voice_willingness` / `voice` 完全一样：
-    # `save_draft` 用 `model_dump(exclude_none=True)` 组装补丁，未声明的字段会被
-    # pydantic 直接丢掉——症状是"打开了开关、保存成功、刷新回到关"，服务端
-    # 则一直走 `switch_off`，看起来像工具回路根本没接线。
-    #
-    # 打开它只过了**第一道闸**：角色白名单、适配器 kind、实例声明、清单
-    # 还有各自的闸，失败原因在 `kernel/turn.py::_tool_ledger_for_turn` 里分开写。
     tools_enabled: bool | None = None
     # 她愿不愿意开口说话的倾向档位（§17.4）。**和 voice 一样必须有这一行**：
     # 读接口（`GET /settings/config`）一直在回这个字段，服务层也认
@@ -442,6 +433,7 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             "group_reply_delivery_enabled": (
                 effective.dialogue.group_reply_delivery_enabled
             ),
+            "tools_enabled": effective.dialogue.tools_enabled,
             # 这两项原来漏了：数据库里存了、运行时也用了，但**读接口不给**，
             # 于是设置页"保存成功，刷新后回到默认"。`voice` 是同一个坑的
             # 第二批——加字段时必须同时补读接口，否则前端拿不到就显示"未配置"。
