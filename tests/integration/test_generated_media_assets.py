@@ -171,6 +171,48 @@ async def test_同内容去重只占一份(web_env, tmp_path) -> None:
         assert len(rows) == 1
 
 
+async def test_跨窗口同内容时digest仍归第一个窗口(web_env, tmp_path) -> None:
+    """**模块文档里那句"跨窗口额外放行"描述的是一条不存在的行为。**
+
+    这里钉住真实行为：第二个窗口存同一份字节，拿到 `created=False` 和同一个
+    digest，但那一行的归属**仍然是第一个窗口的**——它不能拿去引用音频。
+    授权侧（`exports.check_window_access`）不会为它开例外，下一条用例证明。
+    """
+    first = await _save(tmp_path)
+    second = await _save(tmp_path, window_id=OTHER_WINDOW)
+    assert second.created is False
+    assert second.digest == first.digest
+
+    async with session_scope() as session:
+        row = await session.get(MediaAssetRow, second.digest)
+        assert row is not None
+        assert (row.actor_id, row.window_id) == (ACTOR, WINDOW), (
+            "去重不该把归属改成第二个窗口（那会让第一个窗口播不出来）"
+        )
+
+
+async def test_跨窗口同内容第二个窗口读不出(web_env, tmp_path) -> None:
+    """第二个窗口拿到别人的 digest 之后，读取必须被拒——这就是那句文档的
+    `created=False` 为什么**不能直接用**。"""
+    await _save(tmp_path)
+    second = await _save(tmp_path, window_id=OTHER_WINDOW)
+
+    async with session_scope() as session:
+        service = make_service(tmp_path, session, base_url=BASE_URL)
+        # 同一个 actor（同一个人），只是换了窗口：也必须拒绝。
+        with pytest.raises(ExportDenied):
+            await service.read_for_window(
+                second.digest, requester_actor=ACTOR, requester_window=OTHER_WINDOW
+            )
+        # 而第一个窗口照常能读——去重没有破坏它的访问权。
+        assert (
+            await service.read_for_window(
+                second.digest, requester_actor=ACTOR, requester_window=WINDOW
+            )
+            == AUDIO
+        )
+
+
 # ------------------------------------------------------------------ 2. 授权读取
 
 
