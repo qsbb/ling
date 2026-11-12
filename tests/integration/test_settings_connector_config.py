@@ -60,7 +60,8 @@ class FakeRuntime:
         self.fail_next = False
         self.health = "ok"
 
-    async def apply(self, scope: str, *, values: dict[str, Any], operation_id: str) -> Any:
+    async def apply(self, scope: str, *, values: dict[str, Any], operation_id: str,
+                    instance_id: str = "default") -> Any:
         from ling.settings.connector_service import SwapOutcome
 
         self.applies.append((scope, values))

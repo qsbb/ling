@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -282,7 +283,7 @@ async def _run_reply(
     channel: str = "onebot",
 ) -> tuple[bool, str]:
     """走 `_reply_in_group_window`：真实函数、真实投递服务、真实数据库。"""
-    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    monkeypatch.setattr("ling.worker._group_reply_connector", AsyncMock(return_value=connector))
     _patch_turn_coordinator(monkeypatch, reply_text)
 
     window = await _make_window(env, channel=channel)
@@ -747,7 +748,7 @@ async def test_configured_minimax_voice_really_synthesizes(
             {"kind": "minimax_tts", "voice_id": "voice_from_settings", "speed": 1.1},
         )
 
-    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    monkeypatch.setattr("ling.worker._group_reply_connector", AsyncMock(return_value=connector))
     _patch_turn_coordinator(monkeypatch, f"{SPEAK} 配了音色就该出声。")
     async with session_scope() as session:
         delivered, reason = await worker_module._reply_in_group_window(
@@ -785,7 +786,7 @@ async def test_configured_voice_of_another_provider_does_not_guess(
     async with session_scope() as session:
         await _draft_voice(session, {"kind": "minimax_tts", "voice_id": "voice_1"})
 
-    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    monkeypatch.setattr("ling.worker._group_reply_connector", AsyncMock(return_value=connector))
     _patch_turn_coordinator(monkeypatch, f"{SPEAK} 别猜我的声音。")
     async with session_scope() as session:
         delivered, reason = await worker_module._reply_in_group_window(
@@ -977,7 +978,7 @@ async def test_正文在Message里_外发正文为空_不落payload(
         )
         await session.commit()
 
-    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    monkeypatch.setattr("ling.worker._group_reply_connector", AsyncMock(return_value=connector))
     _patch_turn_coordinator(monkeypatch, f"{SPEAK} 听到了吗")
     async with session_scope() as session:
         delivered, reason = await worker_module._reply_in_group_window(
@@ -1154,7 +1155,7 @@ async def test_生产路径传给投递的降级就是默认值(
         return await real(self, **kwargs)
 
     monkeypatch.setattr(SpeechDelivery, "deliver_speech", spy)
-    monkeypatch.setattr("ling.worker._group_reply_connector", lambda ch: connector)
+    monkeypatch.setattr("ling.worker._group_reply_connector", AsyncMock(return_value=connector))
     _patch_turn_coordinator(monkeypatch, f"{SPEAK} 默认该是什么")
 
     window = await _make_window(logged_in, channel="onebot")

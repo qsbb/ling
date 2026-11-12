@@ -90,7 +90,7 @@ def build_qqbot_connector(settings: object | None = None) -> ChannelConnector:
 
 
 def qqbot_enabled(settings: object | None = None) -> bool:
-    """渠道开关。未启用时不注册 Webhook 路由：**入口不存在**比"存在但拒绝"更难误配。"""
+    """默认实例的渠道开关，供兼容调用方读取。"""
     if settings is None:
         from ling.config import get_settings
 
@@ -119,7 +119,7 @@ def proactive_connector() -> ChannelConnector | None:
     return None
 
 
-def proactive_connector_status() -> tuple[ChannelConnector | None, str | None]:
+def proactive_connector_status(app: object | None = None) -> tuple[ChannelConnector | None, str | None]:
     """返回 (连接器, 不可用的**精确原因**)。
 
     ## 为什么需要原因
@@ -132,6 +132,14 @@ def proactive_connector_status() -> tuple[ChannelConnector | None, str | None]:
     - 连接器压根没配好 → 去配 OneBot
     - 配好了但没声明支持主动推送 → 去打开那个开关
     """
+    if app is not None:
+        runtime = getattr(app.state, "connector_runtime", None)
+        for connector in runtime.connectors() if runtime is not None else ():
+            caps = connector.capabilities()
+            if caps.enabled and caps.supports_proactive:
+                return connector, None
+        return None, "当前没有可主动推送的启用实例"
+
     # **两个渠道都要如实报**。
     #
     # 原来只查 OneBot：部署实例上 qqbot 明明配好了（只是平台没给主动权限），
@@ -201,3 +209,116 @@ __all__ = [
     "qqbot_connector_status",
     "qqbot_enabled",
 ]
+
+
+def connector_for_instance(app: object, scope: str, instance_id: str = "default") -> object | None:
+    """按目录中的稳定身份选择本进程的连接器。"""
+    state = app.state
+    if instance_id == "default":
+        legacy = getattr(state, f"{scope}_connector", None)
+        if legacy is not None and getattr(legacy, "_ling_runtime_active", True) is not False:
+            return legacy
+    runtime = getattr(state, "connector_runtime", None)
+    if runtime is not None:
+        return runtime.connector(scope, instance_id)
+    return None
+
+
+def connector_for_namespace(app: object, scope: str, namespace: str) -> object | None:
+    """账号、回执及音频来源使用账号命名空间选择同一实例。"""
+    legacy = getattr(app.state, f"{scope}_connector", None)
+    if (legacy is not None and getattr(legacy, "instance_id", None) == namespace
+            and getattr(legacy, "_ling_runtime_active", True) is not False):
+        return legacy
+    runtime = getattr(app.state, "connector_runtime", None)
+    return runtime.for_namespace(namespace, scope) if runtime is not None else None
+
+
+async def load_window_connector(channel: str, window_ref: str) -> object | None:
+    """worker 从当前已发布配置构造窗口所属实例，停用或删除后拒绝投递。"""
+    if channel not in {"", "onebot", "qqbot"}:
+        return None
+    from sqlalchemy import select
+
+    from ling.config import get_settings
+    from ling.infra.db import session_scope
+    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorInstance
+    from ling.infra.security import SecretBox
+    from ling.settings import connector_overrides as ov
+
+    namespace = window_ref.split(":", 1)[0]
+    settings = get_settings()
+    async with session_scope() as session:
+        protocols = (channel,) if channel else ("onebot", "qqbot")
+        rows = list((await session.execute(select(ConnectorInstance).where(
+            ConnectorInstance.scope.in_(protocols),
+        ))).scalars())
+        ids = [(row.scope, row.instance_id) for row in rows
+               if row.enabled and row.deleted_at is None]
+        for protocol in protocols:
+            if not any(row.scope == protocol and row.instance_id == DEFAULT_INSTANCE_ID
+                       for row in rows):
+                ids.append((protocol, DEFAULT_INSTANCE_ID))
+        for channel, instance_id in ids:
+            config = await ov.resolve_field_values(
+                session, scope=channel, instance_id=instance_id, settings=settings,
+                box=SecretBox(settings), include_secrets=True,
+            )
+            values = config.fields_by_key()
+            if str(values.get(f"LING_{channel.upper()}_INSTANCE_ID") or "") != namespace:
+                continue
+            if channel == "onebot":
+                from connectors.onebot.connector import OneBotV11Connector
+                connector = OneBotV11Connector(ov.build_onebot_config_from(values))
+            else:
+                if not config.flag("LING_QQBOT_ENABLED"):
+                    return None
+                from connectors.qqbot.connector import QQBotConnector
+                connector = QQBotConnector(ov.build_qqbot_config_from(values))
+            connector._ling_instance_key = (channel, instance_id)
+            connector._ling_config_generation = config.generation
+            return connector
+    return None
+
+
+async def channel_connectivity(session, *, settings: object, app: object) -> list[dict]:
+    """汇总非删除实例的已发布配置与当前运行能力，供总览展示。"""
+    from sqlalchemy import select
+
+    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorInstance
+    from ling.settings import connector_overrides as ov
+
+    rows = list((await session.execute(select(ConnectorInstance).where(
+        ConnectorInstance.scope.in_(("onebot", "qqbot")),
+    ))).scalars())
+    runtime = getattr(app.state, "connector_runtime", None)
+    result = []
+    for scope in ("qqbot", "onebot"):
+        ids = [row.instance_id for row in rows if row.scope == scope and row.deleted_at is None]
+        if not any(row.scope == scope and row.instance_id == DEFAULT_INSTANCE_ID for row in rows):
+            ids.append(DEFAULT_INSTANCE_ID)
+        configured = False
+        for instance_id in ids:
+            resolved = await ov.resolve_field_values(
+                session, scope=scope, instance_id=instance_id, settings=settings,
+            )
+            fields = resolved.fields
+            if scope == "qqbot":
+                configured |= (fields["LING_QQBOT_APP_ID"].configured
+                               and fields["LING_QQBOT_CLIENT_SECRET"].configured)
+            else:
+                configured |= bool(resolved.text("LING_ONEBOT_WS_URL")
+                                   or fields["LING_ONEBOT_SECRET"].configured
+                                   or (resolved.text("LING_ONEBOT_WS_PORT")
+                                       and fields["LING_ONEBOT_WS_TOKEN"].configured))
+        connectors = runtime.connectors(scope) if runtime is not None else ()
+        proactive_ready = any(c.capabilities().enabled and c.capabilities().supports_proactive
+                              for c in connectors)
+        result.append({
+            "channel": scope,
+            "configured": configured,
+            "reason": "" if configured else "尚未配置接入凭据",
+            "proactive_ready": proactive_ready,
+            "proactive_reason": "" if proactive_ready else "当前没有可主动推送的启用实例",
+        })
+    return result

@@ -33,25 +33,18 @@ logger = logging.getLogger("ling.api.qqbot")
 router = APIRouter(prefix="/v1/qqbot", tags=["qqbot"])
 
 
-def _connector(request: Request):  # noqa: ANN202
-    """按需构造连接器（缓存在 app.state，避免每次请求重建）。
+def _connector(request: Request, instance_id: str = "default"):  # noqa: ANN202
+    from ling.capabilities.channels import connector_for_instance
 
-    **必须缓存**：被动回复窗口（哪条消息还能回、回了几次）在连接器实例上，
-    每次请求新建一个实例等于把窗口全部忘掉，所有回复都会退化成主动推送
-    而被拒绝。
-    """
-    existing = getattr(request.app.state, "qqbot_connector", None)
-    if existing is not None:
-        return existing
-    from ling.capabilities.channels import build_qqbot_connector
-
-    connector = build_qqbot_connector(getattr(request.app.state, "settings", None))
-    request.app.state.qqbot_connector = connector
+    connector = connector_for_instance(request.app, "qqbot", instance_id)
+    if connector is None:
+        raise LingError(ErrorCode.not_found, "这个连接器实例当前不可用", status_code=404)
     return connector
 
 
+@router.post("/instances/{instance_id}/events")
 @router.post("/events")
-async def qqbot_events(request: Request) -> JSONResponse:
+async def qqbot_events(request: Request, instance_id: str = "default") -> JSONResponse:
     """接收 QQ 官方机器人事件回调。
 
     - 验签失败 → 403（来源不可信，不该被当成正常事件吞掉）
@@ -59,7 +52,7 @@ async def qqbot_events(request: Request) -> JSONResponse:
     - 其余 → 统一受理入口
     """
     body = await request.body()
-    connector = _connector(request)
+    connector = _connector(request, instance_id)
     headers = {k: v for k, v in request.headers.items()}
 
     try:
@@ -118,8 +111,9 @@ async def qqbot_events(request: Request) -> JSONResponse:
     return JSONResponse(await process_inbound_payload(request.app, connector, payload))
 
 
+@router.get("/instances/{instance_id}/health")
 @router.get("/health")
-async def qqbot_health(request: Request, auth: CurrentAuth) -> dict:
+async def qqbot_health(request: Request, auth: CurrentAuth, instance_id: str = "default") -> dict:
     """探测凭据是否可用（换取 access_token）。
 
     只说**鉴权**通过：消息能否真的发出去取决于被动回复窗口与主动推送权限，
@@ -129,7 +123,7 @@ async def qqbot_health(request: Request, auth: CurrentAuth) -> dict:
     （历史上含 ``app_id`` 明文）。没鉴权时等于把机器人身份与"一个能替
     任何人反复换 token 的免费入口"一起送出去。
     """
-    connector = _connector(request)
+    connector = _connector(request, instance_id)
     ok, detail = await connector.health()
     from connectors.qqbot.connector import describe_config
 

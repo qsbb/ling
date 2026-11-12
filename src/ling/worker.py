@@ -705,7 +705,7 @@ async def _commitment_window_ref(
         if row is not None and not is_group_visibility(row.visibility) and row.title:
             return str(row.title)
 
-    if not (subject_id and channel):
+    if not subject_id:
         return ""
     # 与 `domains/proactive/dispatch.py::_target_window_ref` 同一条选窗规则：
     # 最近活跃的同渠道私聊窗口。这里复制查询而不是 import 那个私有函数——
@@ -714,7 +714,7 @@ async def _commitment_window_ref(
         select(Window)
         .where(
             Window.subject_id == subject_id,
-            Window.channel == channel,
+            Window.channel.in_((channel,) if channel else ("onebot", "qqbot")),
             Window.visibility == "subject_private",
             Window.archived.is_(False),
         )
@@ -752,23 +752,8 @@ async def handle_commitment_dispatch(payload: dict) -> None:
         # 原实现有渠道时直接 `delivery_state="sent"` 却没有发任何消息——
         # 这违反项目自己的硬规则"没有回执不声称已发送"，
         # 用户会以为提醒到了，实际什么都没发生（而且是静默的）。
-        from ling.capabilities.channels import proactive_connector
         from ling.capabilities.delivery import DeliveryService
         from ling.ports.channel import ChannelError, OutboundMessage
-
-        connector = proactive_connector()
-        if connector is None:
-            for commitment in due:
-                await goals.mark_delivery(
-                    commitment.commitment_id,
-                    operation_id=None,
-                    delivery_state="unsupported",
-                )
-                logger.info(
-                    "承诺 %s 到期但无可主动推送的渠道（能力自检未通过），标记 unsupported",
-                    commitment.commitment_id,
-                )
-            return
 
         delivery = DeliveryService(session)
         dispatched = 0
@@ -788,9 +773,10 @@ async def handle_commitment_dispatch(payload: dict) -> None:
             window_ref = str(payload.get("proactive_window_ref") or "")
             if not window_ref:
                 window_ref = await _commitment_window_ref(
-                    session, commitment=commitment, connector=connector
+                    session, commitment=commitment, connector=None
                 )
-            if not window_ref:
+            connector = await _group_reply_connector("", window_ref) if window_ref else None
+            if connector is None:
                 await goals.mark_delivery(
                     commitment.commitment_id,
                     operation_id=None,
@@ -1059,6 +1045,7 @@ def make_media_fetcher(
     *,
     media_root: Path | None = None,
     max_bytes: int | None = None,
+    connector_loader: Callable[[], Awaitable[object | None]] | None = None,
 ):
     """构造取媒体内容的函数。
 
@@ -1122,9 +1109,10 @@ def make_media_fetcher(
             return data, _MEDIA_SUFFIX_MIME.get(
                 resolved.suffix.lower(), _UNKNOWN_MEDIA_MIME
             )
-        if connector is None:
+        selected = await connector_loader() if connector_loader is not None else connector
+        if selected is None:
             raise RuntimeError("没有可用渠道下载远程媒体")
-        return await connector.fetch_media(media_ref)  # type: ignore[attr-defined]
+        return await selected.fetch_media(media_ref)  # type: ignore[attr-defined]
 
     return _fetch
 
@@ -1174,7 +1162,7 @@ async def handle_media_video_read(payload: dict) -> None:
         logger.warning("media.video.read: payload 缺 call_id，忽略")
         return
 
-    describer, close = await _build_video_describer()
+    describer, close = await _build_video_describer(call_id)
     try:
         outcome = await run_read_job(
             call_id=call_id,
@@ -1196,7 +1184,7 @@ async def handle_media_video_read(payload: dict) -> None:
     )
 
 
-async def _build_video_describer() -> tuple[object | None, Callable[[], Awaitable[None]]]:
+async def _build_video_describer(call_id: str) -> tuple[object | None, Callable[[], Awaitable[None]]]:
     """造一个 `MediaDescriber` + 一个 close 函数。
 
     ## 为什么单独抽出来、还要回一个 close
@@ -1209,7 +1197,6 @@ async def _build_video_describer() -> tuple[object | None, Callable[[], Awaitabl
     模型路由没就绪时返回 `(None, close)`：`run_read_job` 会把它翻成
     `ReadJobError`（取件类，还没花钱 → 重排）。**不能**在路由就绪前假装成功。
     """
-    from ling.capabilities.channels import build_onebot_connector
     from ling.domains.media.describe import MediaDescriber
     from ling.domains.media.service import MediaEvidenceService
     from ling.infra.db import get_session_factory
@@ -1222,19 +1209,20 @@ async def _build_video_describer() -> tuple[object | None, Callable[[], Awaitabl
         return None, _noop_close
 
     settings = get_settings()
-    try:
-        connector = build_onebot_connector()
-    except Exception as exc:  # noqa: BLE001 - 没有渠道时只能读本地文件
-        connector = None
-        logger.info(
-            "media.video.read：没有可用渠道（%s），只处理本地上传的文件",
-            type(exc).__name__,
-        )
+    async def source_connector() -> object | None:
+        from ling.infra.models import MediaReadJob, Window
+
+        async with session_scope() as source_session:
+            window = await source_session.scalar(select(Window).join(
+                MediaReadJob, MediaReadJob.window_id == Window.id,
+            ).where(MediaReadJob.call_id == call_id))
+        if window is None:
+            return None
+        return await _group_reply_connector(str(window.channel or ""), str(window.title or ""))
 
     fetch_media = make_media_fetcher(
-        connector,
-        media_root=settings.data_dir / "media",
-        max_bytes=settings.max_body_bytes,
+        None, connector_loader=source_connector,
+        media_root=settings.data_dir / "media", max_bytes=settings.max_body_bytes,
     )
 
     session = get_session_factory()()
@@ -1720,7 +1708,7 @@ async def _deliver_deferred_fallback(*, window_id: str, subject_id: str) -> bool
         # 没有外部渠道：落库即送达（Web 面板就是投递面）。
         return channel in {"", "web"}
 
-    connector = _group_reply_connector(channel)
+    connector = await _group_reply_connector(channel, window_ref)
     if connector is None:
         return False
     caps = getattr(connector, "capabilities", None)
@@ -1873,7 +1861,6 @@ async def handle_media_describe(payload: dict) -> None:
     让它留在队列里下次再试。写一句占位符会把"没看到"伪装成
     "看到了但没内容"，既不诚实，又让重试永远发生不了。
     """
-    from ling.capabilities.channels import build_onebot_connector
     from ling.domains.media.describe import MediaDescriber
     from ling.domains.media.service import MediaEvidenceService
     from ling.infra.security import SecretBox
@@ -1885,38 +1872,11 @@ async def handle_media_describe(payload: dict) -> None:
         return
 
     settings = get_settings()
-    try:
-        connector = build_onebot_connector()
-    except Exception as exc:  # noqa: BLE001 - 没有渠道时只能读本地文件
-        connector = None
-        logger.info("媒体描述：没有可用渠道（%s），只处理本地上传的文件", type(exc).__name__)
-
-    # **显式把媒体目录与上限传进去**：`file:` 分支的越界判定以它为根。
-    # 不传的话会回落到 `get_settings().data_dir`——那在测试/多实例下
-    # 与真实落盘位置（`ling/api/routes/chat.py` 用的同一份 settings）不一致，
-    # 表现为"上传的图明明在，却报越界"。
-    _fetch_media = make_media_fetcher(
-        connector,
-        media_root=settings.data_dir / "media",
-        max_bytes=settings.max_body_bytes,
-    )
-
     limit = int(payload.get("limit") or 5)
     described = failed = permanent = blocked = 0
     aborted = False
     async with session_scope() as session:
         service = MediaEvidenceService(session, actor_id=settings.actor_id)
-        describer = MediaDescriber(
-            service=service,
-            fetch_media=_fetch_media,
-            router=router,
-            config_reader=ConfigService(
-                session,
-                SecretBox(settings),
-                test_mode_default=settings.test_mode,
-                persona_id=settings.persona_id,
-            ),
-        )
         # **视频不在这里读**：视频只在她主动写 ``<<看视频 mX>>`` 时才读
         # （见 domains/media/video.py 与 domains/media/watch.py）。自动队列
         # 里留着它，等于每 60 秒把群里每一段视频都送进视频模型——那是白烧
@@ -1924,6 +1884,28 @@ async def handle_media_describe(payload: dict) -> None:
         for window_id in await service.windows_with_pending(
             limit=10, exclude_kinds=("video",)
         ):
+            async def source_connector(window_id: str = window_id) -> object | None:
+                from ling.infra.models import Window
+
+                window = await session.get(Window, window_id)
+                if window is None:
+                    return None
+                return await _group_reply_connector(
+                    str(window.channel or ""), str(window.title or ""),
+                )
+
+            describer = MediaDescriber(
+                service=service,
+                fetch_media=make_media_fetcher(
+                    None, connector_loader=source_connector,
+                    media_root=settings.data_dir / "media", max_bytes=settings.max_body_bytes,
+                ),
+                router=router,
+                config_reader=ConfigService(
+                    session, SecretBox(settings), test_mode_default=settings.test_mode,
+                    persona_id=settings.persona_id,
+                ),
+            )
             outcome = await describer.describe_pending(window_id=window_id, limit=limit)
             described += outcome.described
             failed += outcome.failed
@@ -1970,26 +1952,11 @@ async def handle_proactive_dispatch(payload: dict) -> None:
     默认关的理由：前面几步能在影子模式下验证，但投递一旦发生就是
     "她突然找你"。用户先看几天草稿、确认语气合适，再自己打开。
     """
-    from ling.capabilities.channels import proactive_connector
     from ling.domains.proactive.dispatch import dispatch_pending
     from ling.infra.security import SecretBox
     from ling.settings.service import ConfigService
 
     settings = get_settings()
-    connector = proactive_connector()
-    if connector is None:
-        # 没有外部渠道时**不放弃**：Web 面板也算一个投递面。
-        # 否则在 qqbot 拿不到主动权限、OneBot 没启用的实例上，"主动联系"
-        # 永远只是代码里的空转——她永远不会先开口。
-        # 落库同样受门控（勿扰时段/日限额）与 `proactive_delivery_enabled` 约束。
-        emit_event(
-            logger,
-            logging.INFO,
-            event_name="proactive_dispatch_skipped",
-            message="没有外部主动推送渠道，改投 Web 会话",
-            attributes={"reason_code": "no_proactive_channel"},
-        )
-
     async with session_scope() as session:
         config = ConfigService(
             session,
@@ -2014,7 +1981,8 @@ async def handle_proactive_dispatch(payload: dict) -> None:
         stats = await dispatch_pending(
             session,
             actor_id=settings.actor_id,
-            connector=connector,
+            connector=None,
+            connector_for_window=_group_reply_connector,
             deliver_to_web=True,
             config_reader=config,
             subject_timezone=instance_timezone,
@@ -2178,7 +2146,7 @@ async def handle_embedding_backfill(payload: dict) -> None:
         logger.info("向量补算：写入 %d 条", done)
 
 
-def _channel_capabilities(channel: str) -> CapabilityDescriptor | None:
+async def _channel_capabilities(channel: str, window_ref: str) -> CapabilityDescriptor | None:
     """这一轮所在渠道的能力声明（喂给 `ContextCompiler` 决定提示词能列哪些动作）。
 
     ``None`` 表示**没有外部渠道**（Web 面板 / 内部直发，见 `channel in {"", "web"}`
@@ -2188,7 +2156,7 @@ def _channel_capabilities(channel: str) -> CapabilityDescriptor | None:
     能力取自**连接器自己的声明**（`connector.capabilities()`），不是别处查表：
     查表就等于又维护一份"哪个渠道支持什么"，而那份表迟早和连接器漂移。
     """
-    connector = _group_reply_connector(channel)
+    connector = await _group_reply_connector(channel, window_ref)
     if connector is None:
         return None
     caps = getattr(connector, "capabilities", None)
@@ -2202,36 +2170,27 @@ async def _window_channel_capabilities(window_id: str) -> CapabilityDescriptor |
     查不到窗口时返回 ``None``（按无渠道处理）——不能因此让整轮失败：
     能力只影响提示词**列什么**，不该影响这一轮能不能跑。
     """
-    from sqlalchemy import select
-
     from ling.infra.models import Window
 
     try:
         async with session_scope() as session:
-            channel = await session.scalar(
-                select(Window.channel).where(Window.id == window_id)
-            )
+            window = await session.get(Window, window_id)
     except Exception:  # noqa: BLE001 - 取不到能力就按无渠道处理，不阻断本轮
         return None
-    return _channel_capabilities(str(channel or ""))
+    if window is None:
+        return None
+    return await _channel_capabilities(str(window.channel or ""), str(window.title or ""))
 
 
-def _group_reply_connector(channel: str) -> object | None:
-    """按**窗口所属渠道**取连接器。
+async def _group_reply_connector(channel: str, window_ref: str) -> object | None:
+    """按窗口的账号命名空间解析当前已发布且启用的连接器。"""
+    from ling.capabilities.channels import load_window_connector
 
-    **不能**拿 `proactive_connector()` 顶替：那只挑"声明支持主动推送"的
-    渠道，可能和这个群所在的平台/账号不是同一个。群回复必须发回它来自的
-    那个渠道，否则消息会从另一个号冒出来，或者根本发不出去。
-    """
-    if channel == "onebot":
-        from ling.capabilities.channels import build_onebot_connector
-
-        return build_onebot_connector()
-    if channel == "qqbot":
-        from ling.capabilities.channels import build_qqbot_connector
-
-        return build_qqbot_connector()
-    return None
+    try:
+        return await load_window_connector(channel, window_ref)
+    except Exception:  # noqa: BLE001 - 单个实例不可用时保留任务，后续重试
+        logger.warning("窗口连接器暂不可用 channel=%s", channel, exc_info=False)
+        return None
 
 
 async def _reply_in_group_window(  # noqa: ANN001
@@ -2297,7 +2256,9 @@ async def _reply_in_group_window(  # noqa: ANN001
         user_text=result.batch_text,
         config=effective,
         # 群回复发生在窗口所属渠道上，能力取自该渠道的连接器声明。
-        channel_capabilities=_channel_capabilities(str(window.channel or "")),
+        channel_capabilities=await _channel_capabilities(
+            str(window.channel or ""), str(window.title or ""),
+        ),
     )
 
     reply_text = ""
@@ -2341,8 +2302,9 @@ async def _reply_in_group_window(  # noqa: ANN001
         # 用户下次打开就能看到。没有外部渠道可发，也不算失败。
         return True, ""
 
+    window_ref = str(window.title or "")
     try:
-        connector = _group_reply_connector(channel)
+        connector = await _group_reply_connector(channel, window_ref)
     except Exception as exc:  # noqa: BLE001 - 构造失败按"没发出去"处理
         return False, f"渠道 {channel} 连接器构造失败：{type(exc).__name__}"
     if connector is None:
@@ -2887,14 +2849,16 @@ async def handle_delivery_reconcile(payload: dict) -> None:  # noqa: ARG001
     """
     from ling.domains.goals.delivery_reconcile import reconcile_deliveries
 
-    def _connector_for(channel: str):  # noqa: ANN202
+    async def _connector_for(channel: str, window_ref: str):  # noqa: ANN202
         try:
-            return _group_reply_connector(channel)
+            return await _group_reply_connector(channel, window_ref)
         except Exception as exc:  # noqa: BLE001 - 构造失败只影响这一条
             logger.warning("对账连接器构造失败（%s）：%s", channel, type(exc).__name__)
             return None
 
-    report = await reconcile_deliveries(connector_for=_connector_for)
+    report = await reconcile_deliveries(
+        connector_for=lambda _channel: None, connector_for_window=_connector_for,
+    )
     if not report.touched:
         return
     emit_event(
@@ -5202,13 +5166,16 @@ async def _send_replan_notice(
         )
         return
 
-    # ② 有可主动推送的渠道才谈"发出去"；没有就只落库（Web 端已经能看到）。
     try:
-        from ling.capabilities.channels import proactive_connector
+        from ling.infra.models import Window
 
-        connector = proactive_connector()
-    except Exception:  # noqa: BLE001 - 渠道探测失败按"没有渠道"处理
-        logger.warning("重排回话：渠道探测失败 turn=%s", turn_id, exc_info=True)
+        async with session_scope() as session:
+            window = await session.get(Window, window_id)
+        connector = (await _group_reply_connector(
+            str(window.channel or ""), str(window.title or ""),
+        )) if window is not None else None
+    except Exception:  # noqa: BLE001 - 无法定位渠道时保留本地消息
+        logger.warning("重排回话：渠道解析失败 turn=%s", turn_id, exc_info=True)
         connector = None
 
     if connector is None:

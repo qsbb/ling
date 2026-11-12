@@ -583,10 +583,12 @@ async def test_dispatch_sends_through_connector(logged_in: TestEnv) -> None:
         http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
-    import ling.capabilities.channels as channels_mod
+    from unittest.mock import AsyncMock
 
-    original = channels_mod.proactive_connector
-    channels_mod.proactive_connector = lambda: connector  # type: ignore[assignment]
+    import ling.worker as worker_mod
+
+    original = worker_mod._group_reply_connector
+    worker_mod._group_reply_connector = AsyncMock(return_value=connector)
     try:
         window_id = await _private_window(logged_in, ref="commit-test:private:12345")
         commitment = await _create(
@@ -596,7 +598,7 @@ async def test_dispatch_sends_through_connector(logged_in: TestEnv) -> None:
         # 只有小时桶，**没有任何会话定位**。
         await handle_commitment_dispatch({"bucket": "2026-11-03T01"})
     finally:
-        channels_mod.proactive_connector = original  # type: ignore[assignment]
+        worker_mod._group_reply_connector = original
 
     assert sent, "承诺到期却没有任何实际发送"
     assert sent[0]["message"], "发送内容为空"
@@ -645,17 +647,19 @@ async def test_due_commitment_without_window_falls_back_to_private_window(
         http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
-    import ling.capabilities.channels as channels_mod
+    from unittest.mock import AsyncMock
 
-    original = channels_mod.proactive_connector
-    channels_mod.proactive_connector = lambda: connector  # type: ignore[assignment]
+    import ling.worker as worker_mod
+
+    original = worker_mod._group_reply_connector
+    worker_mod._group_reply_connector = AsyncMock(return_value=connector)
     try:
         # 窗口存在，但承诺**没有**指向它（window_id 为 NULL）
         await _private_window(logged_in, ref="commit-test:private:88888")
         commitment = await _create(logged_in, due_in=timedelta(minutes=-1))
         await handle_commitment_dispatch({"bucket": "2026-11-03T01"})
     finally:
-        channels_mod.proactive_connector = original  # type: ignore[assignment]
+        worker_mod._group_reply_connector = original
 
     assert sent, "承诺行没有 window_id 时投递彻底失败（回落没生效）"
     assert sent[0]["user_id"] == "88888"
@@ -725,14 +729,16 @@ async def test_dispatch_never_targets_group_window(logged_in: TestEnv) -> None:
         )
         await session.commit()
 
-    import ling.capabilities.channels as channels_mod
+    from unittest.mock import AsyncMock
 
-    original = channels_mod.proactive_connector
-    channels_mod.proactive_connector = lambda: connector  # type: ignore[assignment]
+    import ling.worker as worker_mod
+
+    original = worker_mod._group_reply_connector
+    worker_mod._group_reply_connector = AsyncMock(return_value=connector)
     try:
         await handle_commitment_dispatch({"bucket": "2026-11-03T01"})
     finally:
-        channels_mod.proactive_connector = original  # type: ignore[assignment]
+        worker_mod._group_reply_connector = original
 
     assert not sent, f"承诺提醒被发进了群: {sent}"
     async with session_scope() as session:

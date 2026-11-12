@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import secrets
@@ -268,10 +269,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 这样设置页保存后，同一个构造函数被复用一次就能把新配置真正用起来，
     # 而且不会出现"页面写进去了、进程还读 env"的裂缝（设计 §8）。
     #
-    # 两个东西要分开：
-    # * `_connector_effective`：本次**实际生效**的解密后配置（只在本进程内存）；
-    # * `ConnectorRuntime`：负责 stop(旧) → construct(新) → start(新) 的切换器，
-    #   设置页保存时由 `settings/connector_service.py` 调它。
+    # 切换器按实例保存已发布构造参数，设置保存与路由均从它取运行对象。
     from ling.capabilities.channels import onebot_config as _env_onebot_config
     from ling.capabilities.channels import qqbot_config as _env_qqbot_config
     from ling.kernel.connector_runtime import ConnectorRuntime, SwapPlan
@@ -279,136 +277,60 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from ling.settings import connector_overrides as _ov
 
     async with session_scope() as session:
-        _onebot_effective = await _ov.resolve_field_values(
-            session,
-            scope=_cf.SCOPE_ONEBOT,
-            settings=settings,
-            onebot=_env_onebot_config(),
-            qqbot=_env_qqbot_config(settings),
-            box=box,
-            include_secrets=True,
-        )
-        _qqbot_effective = await _ov.resolve_field_values(
-            session,
-            scope=_cf.SCOPE_QQBOT,
-            settings=settings,
-            onebot=_env_onebot_config(),
-            qqbot=_env_qqbot_config(settings),
-            box=box,
-            include_secrets=True,
-        )
         _access_effective = await _ov.current_access_snapshot(session, settings=settings)
 
-    app.state.connector_effective = {
-        _cf.SCOPE_ONEBOT: dict(_onebot_effective.fields_by_key()),
-        _cf.SCOPE_QQBOT: dict(_qqbot_effective.fields_by_key()),
-    }
     app.state.access_snapshot = _access_effective
     connector_runtime = ConnectorRuntime(app)
     app.state.connector_runtime = connector_runtime
-    # 一次性快照：运行期参数（WS 端口/令牌/地址、渠道开关）。它们不属于
-    # `OneBotConfig` / `QQBotConfig`，但同样是"有效配置"的一部分。
-    app.state.connector_runtime_settings = _ov.ConnectorRuntimeSettings(
-        onebot_ws_port=settings.onebot_ws_port,
-        onebot_ws_token=settings.onebot_ws_token,
-        onebot_ws_url=settings.onebot_ws_url,
-        onebot_secret=_onebot_effective.text("LING_ONEBOT_SECRET"),
-        qqbot_enabled=_qqbot_effective.flag("LING_QQBOT_ENABLED"),
-    )
-
     async def _start_onebot(values: dict) -> dict:
-        """按一份有效配置起 OneBot 的组件，返回实例映射。
-
-        WS 服务端 / 出站 WS 客户端 / HTTP 懒构造连接器三者互不排斥，所以
-        一次构造里可能起两个组件。**失败时由调用方回滚**，这里只管起。
-        """
-        import dataclasses
-
         from connectors.onebot.connector import OneBotV11Connector
+        from connectors.onebot.ws_client import OneBotWsClient
+        from connectors.onebot.ws_server import OneBotWsServer
 
-        runtime_settings = dataclasses.replace(
-            app.state.connector_runtime_settings,  # type: ignore[arg-type]
-        ).with_values(_cf.SCOPE_ONEBOT, values)
-        app.state.connector_runtime_settings = runtime_settings
+        runtime_settings = _ov.ConnectorRuntimeSettings().with_values(_cf.SCOPE_ONEBOT, values)
         config = _ov.build_onebot_config_from(values)
-        instances: dict[str, object] = {}
-
-        port = runtime_settings.onebot_ws_port
-        if port:
-            from connectors.onebot.ws_server import OneBotWsAuthError, OneBotWsServer
-
-            server_connector = OneBotV11Connector(config)
-            ws_server = OneBotWsServer(
-                host=config.ws_host,
-                port=port,
-                app=app,
-                connector=server_connector,
-                token=runtime_settings.onebot_ws_token,
-            )
-            try:
-                await ws_server.start()
-            except OneBotWsAuthError as exc:
-                # **不让进程带着一个"谁都能连"的端口起来**（fail-closed）。
-                raise RuntimeError("OneBot WS 服务端拒绝启动：缺少令牌") from exc
-            instances["onebot_ws_server"] = ws_server
-            instances["onebot_connector"] = server_connector
-            app.state.onebot_ws_server = ws_server
-            app.state.onebot_connector = server_connector
-            logger.info("OneBot WS 服务端已启动 %s:%s", config.ws_host, port)
-        else:
-            app.state.onebot_ws_server = None
-
-        if runtime_settings.onebot_ws_url:
-            from connectors.onebot.ws_client import OneBotWsClient
-
-            connector = OneBotV11Connector(config)
-            ws_client = OneBotWsClient(
-                url=runtime_settings.onebot_ws_url, app=app, connector=connector
-            )
-            app.state.onebot_connector = connector
-            app.state.onebot_ws = ws_client
-            ws_client.start()
-            instances["onebot_ws"] = ws_client
-            instances["onebot_connector"] = connector
-            logger.info("OneBot WS 入站已启动: %s", runtime_settings.onebot_ws_url)
-        else:
-            app.state.onebot_ws = None
-
-        if not instances:
-            # 只走 HTTP 上报：仍然要有可用的连接器对象（发消息要用）。
-            connector = OneBotV11Connector(config)
-            app.state.onebot_connector = connector
-            instances["onebot_connector"] = connector
-        return instances
+        connector = OneBotV11Connector(config)
+        components: dict[str, object] = {"onebot_connector": connector}
+        try:
+            if runtime_settings.onebot_ws_port:
+                server = OneBotWsServer(
+                    host=config.ws_host, port=runtime_settings.onebot_ws_port,
+                    app=app, connector=connector, token=runtime_settings.onebot_ws_token,
+                )
+                components["onebot_ws_server"] = server
+                await server.start()
+            if runtime_settings.onebot_ws_url:
+                client = OneBotWsClient(
+                    url=runtime_settings.onebot_ws_url, app=app, connector=connector
+                )
+                components["onebot_ws"] = client
+                client.start()
+        except BaseException:
+            for component in components.values():
+                stop = getattr(component, "stop", None)
+                if stop is not None:
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await stop()
+            raise
+        return components
 
     async def _start_qqbot(values: dict) -> dict:
         from connectors.qqbot.connector import QQBotConnector
         from connectors.qqbot.ws_gateway import QQBotGateway
 
-        runtime_settings = app.state.connector_runtime_settings
-        runtime_settings = runtime_settings.with_values(_cf.SCOPE_QQBOT, values)
-        app.state.connector_runtime_settings = runtime_settings
-        bot_config = _ov.build_qqbot_config_from(values)
-        if not runtime_settings.qqbot_enabled or not bot_config.configured:
-            # 关着或凭据不全：不启动网关。**如实记下原因**，不假装在连。
-            app.state.qqbot_gateway = None
-            logger.info(
-                "QQ 官方机器人不启动（enabled=%s configured=%s）",
-                runtime_settings.qqbot_enabled,
-                bot_config.configured,
-            )
+        runtime_settings = _ov.ConnectorRuntimeSettings().with_values(_cf.SCOPE_QQBOT, values)
+        config = _ov.build_qqbot_config_from(values)
+        if not runtime_settings.qqbot_enabled or not config.configured:
             return {}
-        bot_connector = QQBotConnector(bot_config)
-        gateway = QQBotGateway(connector=bot_connector, app=app)
-        app.state.qqbot_connector = bot_connector
-        app.state.qqbot_gateway = gateway
-        gateway.start()
-        logger.info(
-            "QQ 官方机器人网关已启动（app_id 指纹=%s，%s）",
-            _fingerprint(bot_config.app_id),
-            "沙箱" if bot_config.sandbox else "正式",
-        )
-        return {"qqbot_gateway": gateway, "qqbot_connector": bot_connector}
+        connector = QQBotConnector(config)
+        gateway = QQBotGateway(connector=connector, app=app)
+        try:
+            gateway.start()
+        except BaseException:
+            await gateway.stop()
+            await connector.close()
+            raise
+        return {"qqbot_gateway": gateway, "qqbot_connector": connector}
 
     async def _start_access(values: dict) -> dict:
         """白名单生效：**换掉进程里的 Settings 快照**，不重建任何连接。
@@ -450,56 +372,69 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async def _plan_access(values: dict) -> SwapPlan:
         return SwapPlan(stops=(), start=lambda: _start_access(values))
 
-    async def _plan_onebot(values: dict) -> SwapPlan:
-        return SwapPlan(stops=("onebot_ws_server", "onebot_ws"), start=lambda: _start_onebot(values))
+    async def _plan_onebot(instance_id: str, values: dict) -> SwapPlan:
+        return SwapPlan(stops=("onebot_ws_server", "onebot_ws"),
+                        start=lambda: _start_onebot(values))
 
-    async def _plan_qqbot(values: dict) -> SwapPlan:
+    async def _plan_qqbot(instance_id: str, values: dict) -> SwapPlan:
         return SwapPlan(stops=("qqbot_gateway",), start=lambda: _start_qqbot(values))
 
+    connector_runtime.register_factory(_cf.SCOPE_ONEBOT, _plan_onebot)
+    connector_runtime.register_factory(_cf.SCOPE_QQBOT, _plan_qqbot)
     connector_runtime.register(
-        _cf.SCOPE_ONEBOT,
-        _plan_onebot,
-        values=app.state.connector_effective[_cf.SCOPE_ONEBOT],
-    )
-    connector_runtime.register(
-        _cf.SCOPE_QQBOT,
-        _plan_qqbot,
-        values=app.state.connector_effective[_cf.SCOPE_QQBOT],
-    )
-    connector_runtime.register(
-        _cf.SCOPE_ACCESS,
-        _plan_access,
-        values={
-            "LING_ACCESS_MODE": _access_effective.mode,
-            "LING_ACCESS_LIST": sorted(_access_effective.allow_list),
-        },
+        _cf.SCOPE_ACCESS, _plan_access,
+        values={"LING_ACCESS_MODE": _access_effective.mode,
+                "LING_ACCESS_LIST": sorted(_access_effective.allow_list)},
     )
 
-    # 启动时按有效配置起组件（与升级前行为一致：env 就是"有效配置"）。
-    if settings.onebot_ws_port or settings.onebot_ws_url:
-        _onebot_instances = await _start_onebot(
-            app.state.connector_effective[_cf.SCOPE_ONEBOT]
-        )
-        connector_runtime.register(
-            _cf.SCOPE_ONEBOT,
-            _plan_onebot,
-            instances=_onebot_instances,
-            values=app.state.connector_effective[_cf.SCOPE_ONEBOT],
-        )
-    else:
-        # 只走 HTTP：仍需一个连接器对象（懒构造也会覆盖它）。
-        from connectors.onebot.connector import OneBotV11Connector as _LazyOneBot
-
-        app.state.onebot_connector = _LazyOneBot(
-            _ov.build_onebot_config_from(app.state.connector_effective[_cf.SCOPE_ONEBOT])
-        )
-    _qqbot_instances = await _start_qqbot(app.state.connector_effective[_cf.SCOPE_QQBOT])
-    connector_runtime.register(
-        _cf.SCOPE_QQBOT,
-        _plan_qqbot,
-        instances=_qqbot_instances,
-        values=app.state.connector_effective[_cf.SCOPE_QQBOT],
+    from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead, ConnectorInstance
+    from ling.settings.connector_service import (
+        STATE_ROLLED_BACK,
+        ConnectorConfigService,
+        SwapOutcome,
     )
+
+    async with session_scope() as session:
+        interrupted = list((await session.execute(select(ConnectorConfigHead).where(
+            ConnectorConfigHead.candidate_revision_id.is_not(None),
+        ))).scalars())
+        recovery = ConnectorConfigService(settings=settings, box=box, runtime=connector_runtime)
+        for head in interrupted:
+            await recovery._mark_failed(
+                session, scope=head.scope, instance_id=head.instance_id,
+                revision_id=head.candidate_revision_id,
+                outcome=SwapOutcome(ok=False, error_code="activation_interrupted",
+                                    error_safe="上次配置切换被中断，已恢复已发布配置"),
+                state=STATE_ROLLED_BACK,
+            )
+        rows = list((await session.execute(select(ConnectorInstance))).scalars())
+        enabled_instances = {(row.scope, row.instance_id) for row in rows
+                             if row.enabled and row.deleted_at is None}
+        present = {(row.scope, row.instance_id) for row in rows}
+        for scope in (_cf.SCOPE_ONEBOT, _cf.SCOPE_QQBOT):
+            if (scope, DEFAULT_INSTANCE_ID) not in present:
+                enabled_instances.add((scope, DEFAULT_INSTANCE_ID))
+        startup_values = []
+        for scope, instance_id in sorted(enabled_instances):
+            if scope == _cf.SCOPE_ACCESS:
+                continue
+            resolved = await _ov.resolve_field_values(
+                session, scope=scope, instance_id=instance_id, settings=settings,
+                onebot=_env_onebot_config(), qqbot=_env_qqbot_config(settings),
+                box=box, include_secrets=True,
+            )
+            startup_values.append((scope, instance_id, resolved.fields_by_key()))
+    try:
+        for scope, instance_id, values in startup_values:
+            outcome = await connector_runtime.apply(
+                scope, instance_id=instance_id, values=values, operation_id="startup"
+            )
+            if not outcome.ok:
+                logger.error("接入器启动失败 scope=%s instance=%s code=%s",
+                             scope, instance_id, outcome.error_code)
+    except BaseException:
+        await connector_runtime.shutdown()
+        raise
     await _recover_dangling_turns()
     await _bootstrap(settings)
     logger.info("ling api 就绪 env=%s db=%s", settings.env, _safe_db(settings.database_url))
@@ -509,16 +444,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await stop_worker(asr_worker)
-        for _scope in (_cf.SCOPE_ONEBOT, _cf.SCOPE_QQBOT):
-            for _name, _instance in (connector_runtime._instances.get(_scope) or {}).items():
-                _stopper = getattr(_instance, "stop", None)
-                if _stopper is not None:
-                    try:
-                        _result = _stopper()
-                        if hasattr(_result, "__await__"):
-                            await _result
-                    except Exception:  # noqa: BLE001 - 关闭路径不掩盖原始错误
-                        logger.warning("关闭接入器组件失败：%s", _name)
+        await connector_runtime.shutdown()
         # 额度记账的后台落库任务要在引擎关闭前收尾：否则最后几轮的用量
         # 只留在内存里，下次启动就没了。
         quota = getattr(app.state, "quota", None)
@@ -691,10 +617,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(qq.router)
     # QQ 官方机器人 Webhook。默认关闭：没配 app_id/secret 时这个入口只会
     # 对着无效签名返回 403，注册它反而让人以为"已经接上了"。
-    if settings.qqbot_enabled:
-        from ling.api.routes import qqbot
+    from ling.api.routes import qqbot
 
-        app.include_router(qqbot.router)
+    app.include_router(qqbot.router)
 
     _mount_web(app, settings)
     return app

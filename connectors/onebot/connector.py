@@ -1283,7 +1283,7 @@ class OneBotV11Connector(ChannelConnector):
             # （QQ 里先 @ 再发正文很常见）。原来这里是 `if parsed.text else []`，
             # 于是空正文的 @ 直接被契约校验拒掉，连 bridge 都到不了——
             # 用户看到的是"@ 了她却毫无反应"。
-            parts=[InputPart(modality=Modality.text, text=parsed.text)],
+            parts=[InputPart(modality=Modality.text, text=parsed.text), *parsed.parts],
             reply_to=parsed.reply_to_message_id,
             media_refs=parsed.media_refs,
             mentions_actor=parsed.mentions_self,

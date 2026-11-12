@@ -58,6 +58,7 @@ class _GroupNameConnector:
     """只会回答群名的连接器桩：证明"能采集"与"采集失败"两条路。"""
 
     connector_id = "onebot"
+    instance_id = GROUP_REF.split(":", 1)[0]
 
     def __init__(self, name: str | None = "测试群", *, boom: bool = False) -> None:
         self._name = name

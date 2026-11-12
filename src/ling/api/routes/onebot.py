@@ -31,20 +31,18 @@ def _config():  # noqa: ANN202
     return onebot_config()
 
 
-def _connector(request: Request):  # noqa: ANN202
-    """按需构造连接器（实例缓存在 app.state，避免每次请求重建）。"""
-    existing = getattr(request.app.state, "onebot_connector", None)
-    if existing is not None:
-        return existing
-    from connectors.onebot.connector import OneBotV11Connector
+def _connector(request: Request, instance_id: str = "default"):  # noqa: ANN202
+    from ling.capabilities.channels import connector_for_instance
 
-    connector = OneBotV11Connector(_config())
-    request.app.state.onebot_connector = connector
+    connector = connector_for_instance(request.app, "onebot", instance_id)
+    if connector is None:
+        raise LingError(ErrorCode.not_found, "这个连接器实例当前不可用", status_code=404)
     return connector
 
 
+@router.post("/instances/{instance_id}/events")
 @router.post("/events")
-async def onebot_events(request: Request) -> JSONResponse:
+async def onebot_events(request: Request, instance_id: str = "default") -> JSONResponse:
     """接收 OneBot 事件上报。
 
     返回 200 即表示"已受理"。OneBot 规范允许在响应体里放「快速操作」
@@ -55,7 +53,7 @@ async def onebot_events(request: Request) -> JSONResponse:
     否则 OneBot 会反复重投同一条事件。
     """
     body = await request.body()
-    connector = _connector(request)
+    connector = _connector(request, instance_id)
     headers = {k: v for k, v in request.headers.items()}
 
     if not await connector.verify_inbound(headers, body):
@@ -82,8 +80,9 @@ async def onebot_events(request: Request) -> JSONResponse:
     return JSONResponse(await process_inbound_payload(request.app, connector, payload))
 
 
+@router.get("/instances/{instance_id}/health")
 @router.get("/health")
-async def onebot_health(request: Request, auth: CurrentAuth) -> dict:
+async def onebot_health(request: Request, auth: CurrentAuth, instance_id: str = "default") -> dict:
     """探测 OneBot 实现是否可用（get_login_info）。
 
     **必须鉴权**：这条会**外呼** NapCat，返回里还带 ``self_id``（机器人 QQ 号）。
@@ -98,7 +97,7 @@ async def onebot_health(request: Request, auth: CurrentAuth) -> dict:
     """
     from ling.kernel.inbound_intake import denied_total
 
-    connector = _connector(request)
+    connector = _connector(request, instance_id)
     ok, detail = await connector.health()
     return {
         "ok": ok,

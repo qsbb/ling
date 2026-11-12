@@ -1561,12 +1561,13 @@ def _install_channel(
 ) -> _NoticeConnector | None:
     """装/卸"可主动推送的渠道"。
 
-    必须显式替换 `proactive_connector`：开发机 shell 里可能真的配了 OneBot
-    变量，不替换就会对着真实平台发消息（用例也会变成偶发）。
+    显式替换窗口连接器加载器，让用例的外发只经过内存传输。
     """
-    import ling.capabilities.channels as channels_mod
+    from unittest.mock import AsyncMock
 
-    monkeypatch.setattr(channels_mod, "proactive_connector", lambda: connector)
+    import ling.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_group_reply_connector", AsyncMock(return_value=connector))
     return connector
 
 

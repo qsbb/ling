@@ -366,7 +366,7 @@ async def test_proactive_route_consults_real_capability(
     # 打真正的路由接缝：路由直接 import 并调用 proactive_connector_status，
     # 只替换 proactive_connector 对它无效。
     monkeypatch.setattr(
-        channels, "proactive_connector_status", lambda: (_Conn(), None)
+        channels, "proactive_connector_status", lambda app=None: (_Conn(), None)
     )
     r = await logged_in.client.get("/v1/proactive")
     assert r.status_code == 200, r.text
@@ -399,7 +399,7 @@ async def test_proactive_route_reports_missing_channel(
     monkeypatch.setattr(
         channels,
         "proactive_connector_status",
-        lambda: (None, "连接器不可用（测试模拟无主动渠道）"),
+        lambda app=None: (None, "连接器不可用（测试模拟无主动渠道）"),
     )
     r = await logged_in.client.get("/v1/proactive")
     assert r.status_code == 200, r.text

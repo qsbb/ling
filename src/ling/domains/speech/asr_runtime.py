@@ -134,8 +134,9 @@ async def _process_audio(
     if raw is None:
         from ling.worker import make_media_fetcher
         channel = payload.get("channel", "onebot")
-        connector = getattr(app.state, f"{channel}_connector", None)
+        from ling.capabilities.channels import connector_for_namespace
         envelope = payload.get("envelope") or {}
+        connector = connector_for_namespace(app, channel, envelope.get("connector_instance", ""))
         if connector is None or connector.instance_id != envelope.get("connector_instance"):
             raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
         fetch = make_media_fetcher(
@@ -327,7 +328,10 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
         from ling.kernel.inbound_intake import process_inbound_payload
         original = InteractionEnvelope.model_validate(payload["envelope"])
         env = original.model_copy(update={"parts": [InputPart(modality=Modality.text, text=text)]})
-        connector = getattr(app.state, f"{payload.get("channel", "onebot")}_connector", None)
+        from ling.capabilities.channels import connector_for_namespace
+        connector = connector_for_namespace(
+            app, payload.get("channel", "onebot"), original.connector_instance
+        )
         if connector is None or connector.instance_id != original.connector_instance:
             raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
         await process_inbound_payload(app, connector, {}, _asr_resume=(env, source_id))

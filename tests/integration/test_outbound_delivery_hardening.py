@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -437,7 +438,7 @@ async def test_reconcile_job_is_scheduled_and_converges(
     op_id = await _uncertain_operation(logged_in, connector)
     monkeypatch.setattr(
         "ling.worker._group_reply_connector",
-        lambda channel: connector if channel == "onebot" else None,
+        AsyncMock(side_effect=lambda channel, window_ref: connector if channel == "onebot" else None),
     )
     import ling.domains.goals.delivery_reconcile as reconcile_module
 
@@ -546,7 +547,7 @@ async def test_pending_delivery_is_resumed_once(
     await _bind(logged_in)
     monkeypatch.setattr(
         "ling.worker._group_reply_connector",
-        lambda channel: connector if channel == "onebot" else None,
+        AsyncMock(side_effect=lambda channel, window_ref: connector if channel == "onebot" else None),
     )
     import ling.domains.goals.delivery_reconcile as reconcile_module
 

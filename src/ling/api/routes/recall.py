@@ -57,22 +57,14 @@ class RecallContext(BaseModel):
 
 
 def _connector_for_window(request: Request, window_title: str) -> object | None:
-    """按窗口标识找到这个渠道的连接器实例。
+    """用平台窗口的账号命名空间选择原实例。"""
+    from ling.capabilities.channels import connector_for_namespace
 
-    窗口 title 就是平台窗口标识（``onebot-x:group:100…``，见
-    ``bridge._ensure_window``），前缀第一段是 ``instance_id``；
-    连接器按渠道挂在 ``app.state`` 上（``onebot_connector`` / ``qqbot_connector``）。
-
-    拿不到就返回 ``None``——调用方会按 ``unsupported`` 处理（**不发 action**），
-    而不是去猜一个连接器。
-    """
-    channel = window_title.split(":", 1)[0] if ":" in window_title else ""
-    # 实例名前缀是 `<connector>-<name>`（onebot-default / qqbot-test…）。
-    for candidate in ("onebot", "qqbot", "qq"):
-        if channel.startswith(candidate):
-            connector = getattr(request.app.state, f"{candidate}_connector", None)
-            if connector is not None:
-                return connector
+    namespace = window_title.split(":", 1)[0]
+    for scope in ("onebot", "qqbot", "qq"):
+        connector = connector_for_namespace(request.app, scope, namespace)
+        if connector is not None:
+            return connector
     return None
 
 

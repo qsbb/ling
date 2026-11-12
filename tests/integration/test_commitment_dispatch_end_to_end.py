@@ -114,12 +114,14 @@ async def _run_production_dispatch(
     维护任务用小时桶做幂等键，所以先清掉本桶已有的事件——否则
     `enqueue_maintenance` 会认为"已投递"而直接跳过（那会让测试假绿）。
     """
-    import ling.capabilities.channels as channels_mod
+    from unittest.mock import AsyncMock
+
+    import ling.worker as worker_mod
     from ling.worker import drain_outbox, enqueue_maintenance
 
     sent: list[dict] = []
     monkeypatch.setattr(
-        channels_mod, "proactive_connector", lambda: _connector(sent)
+        worker_mod, "_group_reply_connector", AsyncMock(return_value=_connector(sent))
     )
 
     hour_bucket = datetime.now(UTC).strftime("%Y-%m-%dT%H")

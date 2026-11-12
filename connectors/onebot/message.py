@@ -149,6 +149,10 @@ def _handle_segment(
             # 打不开的图片一起消失。过滤规则与 `MediaRef` 同一份。
             if media_ref_is_valid(ref):
                 result.media_refs.append(ref)
+                modality = {"record": Modality.audio, "voice": Modality.audio,
+                            "image": Modality.image, "video": Modality.video}.get(seg_type)
+                if modality is not None:
+                    result.parts.append(InputPart(modality=modality, media_ref=ref))
             else:
                 logger.warning(
                     "丢弃不合格的媒体引用（类型 %s，长度 %d）：只影响该附件",

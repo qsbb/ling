@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -108,6 +108,41 @@ class DeliveryService:
         await self._session.flush()
         return row
 
+    async def _instance_available(self, connector: ChannelConnector) -> bool:
+        """把实例停用提交与在途投递按同一个事务锁排序。"""
+        if getattr(connector, "_ling_runtime_active", True) is False:
+            return False
+        key = getattr(connector, "_ling_instance_key", None)
+        if key is None:
+            return True
+        from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead, ConnectorInstance
+
+        scope, instance_id = key
+        if self._session.bind.dialect.name == "postgresql":
+            acquired = await self._session.scalar(
+                text("SELECT pg_try_advisory_xact_lock_shared(hashtext(:k))"),
+                {"k": f"connector:{scope}:{instance_id}"},
+            )
+            if not acquired:
+                return False
+        row = await self._session.get(
+            ConnectorInstance, (scope, instance_id), populate_existing=True,
+        )
+        if row is None:
+            if instance_id != DEFAULT_INSTANCE_ID:
+                return False
+        elif not row.enabled or row.deleted_at is not None:
+            return False
+        head = await self._session.get(
+            ConnectorConfigHead, (scope, instance_id), populate_existing=True,
+        )
+        if head is not None and head.candidate_revision_id:
+            return False
+        expected = getattr(connector, "_ling_config_generation", None)
+        if expected is not None and expected != (head.generation if head is not None else 0):
+            return False
+        return getattr(connector, "_ling_runtime_active", True) is not False
+
     async def deliver(
         self,
         *,
@@ -123,6 +158,8 @@ class DeliveryService:
         plan_id: str | None = None,
         part_ordinal: int | None = None,
     ) -> DeliveryOutcome:
+        if not await self._instance_available(connector):
+            return await self._unsupported(message, actor_id, subject_id, "这个连接器实例已停止或配置已更新")
         caps = connector.capabilities()
         if not caps.enabled:
             return await self._unsupported(

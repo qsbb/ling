@@ -515,6 +515,16 @@ class QQBotConnector(ChannelConnector):
             # 同时 bridge 会剥掉标记判断"有没有真话"。
             markers = "".join(media_marker(_guess_content_type(ref)) for ref in media_refs)
             parts[0] = InputPart(modality=Modality.text, text=f"{parsed.text}{markers}")
+            attachments = (payload.get("d") or {}).get("attachments") or []
+            for attachment in attachments:
+                if not isinstance(attachment, dict) or attachment.get("url") not in media_refs:
+                    continue
+                ref = attachment["url"]
+                mime = str(attachment.get("content_type") or _guess_content_type(ref))
+                modality = {"audio": Modality.audio, "image": Modality.image,
+                            "video": Modality.video}.get(mime.split("/", 1)[0].lower())
+                if modality is not None:
+                    parts.append(InputPart(modality=modality, media_ref=ref, mime_type=mime))
 
         return InteractionEnvelope(
             connector_instance=self.instance_id,

@@ -106,13 +106,16 @@ class ConnectorServiceError(Exception):
 class RuntimeSwap(Protocol):
     """切换器协议：把某个 scope 的新配置应用到本副本。
 
-    ``values`` 是**解密后**的完整有效配置，只在切换期间存在；
-    实现方**不得**把它存进任何日志/状态对象。
+    ``values`` 是解密后的完整有效配置，切换器在进程内保留以支持重建。
+    禁止写入日志或序列化到对外状态。
     """
 
     async def apply(
-        self, scope: str, *, values: dict[str, Any], operation_id: str
+        self, scope: str, *, values: dict[str, Any], operation_id: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> SwapOutcome: ...
+
+    async def stop(self, scope: str, instance_id: str = DEFAULT_INSTANCE_ID) -> None: ...
 
 
 @dataclass
@@ -236,7 +239,7 @@ def validate_full(scope: str, values: dict[str, Any]) -> None:
     """
     for spec in cf.fields_for(scope):
         raw = values.get(spec.key)
-        if raw is None:
+        if raw is None or raw == "":
             continue
         try:
             if spec.kind == cf.KIND_LIST:
@@ -265,6 +268,94 @@ def validate_full(scope: str, values: dict[str, Any]) -> None:
                 "白名单模式但名单是空的：这样谁都不能跟她说话",
                 field_name="LING_ACCESS_LIST",
             )
+
+
+async def lock_instance_resources(session: AsyncSession, scope: str, instance_id: str) -> None:
+    for key in (f"connector:{scope}:{instance_id}", "connector-resources"):
+        await session.execute(
+            sql_text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": key},
+        )
+
+
+async def validate_instance_config(
+    session: AsyncSession, *, scope: str, instance_id: str, values: dict[str, Any],
+    settings: object, box: object | None,
+) -> None:
+    """更新连接前校验账号命名空间及监听端口的独占资源。"""
+    from ling.infra.models import ConnectorConfigHead, ConnectorInstance
+
+    if scope == cf.SCOPE_ACCESS:
+        return
+    target = await session.get(ConnectorInstance, (scope, instance_id))
+    namespace_key = f"LING_{scope.upper()}_INSTANCE_ID"
+    namespace = str(values.get(namespace_key) or "")
+    if not namespace or ":" in namespace or len(namespace) > 64:
+        raise ConnectorServiceError(
+            "invalid_config", "账号命名空间必须为 1 到 64 个字符且不能含冒号",
+            field_name=namespace_key,
+        )
+    current = await ov.resolve_field_values(
+        session, scope=scope, instance_id=instance_id, settings=settings,
+        box=box, include_secrets=True,
+    )
+    old_namespace = current.text(namespace_key)
+    if old_namespace and old_namespace != namespace:
+        from ling.infra.models import ActorAccount, Window
+
+        used_account = await session.scalar(select(ActorAccount.id).where(
+            ActorAccount.connector_instance == old_namespace,
+        ).limit(1))
+        used_window = await session.scalar(select(Window.id).where(
+            Window.title.startswith(old_namespace + ":", autoescape=True),
+        ).limit(1))
+        if used_account or used_window:
+            raise ConnectorServiceError(
+                "invalid_config", "这个账号命名空间已有会话记录，请创建新实例接入另一个账号",
+                field_name=namespace_key,
+            )
+    rows = list((await session.execute(select(ConnectorInstance).where(
+        ConnectorInstance.scope != cf.SCOPE_ACCESS,
+    ))).scalars())
+    keys = {(row.scope, row.instance_id) for row in rows}
+    running = {(row.scope, row.instance_id) for row in rows
+               if row.enabled and row.deleted_at is None}
+    # 环境变量默认实例在第一次保存配置前也会参与运行。
+    for protocol in (cf.SCOPE_ONEBOT, cf.SCOPE_QQBOT):
+        default = await session.get(ConnectorInstance, (protocol, DEFAULT_INSTANCE_ID))
+        if default is None:
+            keys.add((protocol, DEFAULT_INSTANCE_ID))
+            running.add((protocol, DEFAULT_INSTANCE_ID))
+    for protocol, other_id in keys - {(scope, instance_id)}:
+        resolved = await ov.resolve_field_values(
+            session, scope=protocol, instance_id=other_id, settings=settings,
+            box=box, include_secrets=True,
+        )
+        candidates = [resolved.fields_by_key()]
+        head = await session.get(ConnectorConfigHead, (protocol, other_id))
+        if head is not None and head.candidate_revision_id:
+            pending = await ov.read_override_values(
+                session, scope=protocol, instance_id=other_id,
+                revision_id=head.candidate_revision_id, box=box, include_secrets=True,
+            )
+            baseline = await ov.resolve_field_values(
+                session, scope=protocol, instance_id=other_id, settings=settings,
+                box=box, include_secrets=True, use_overrides=False,
+            )
+            candidates.append({**baseline.fields_by_key(), **pending})
+        for candidate in candidates:
+            if namespace == str(candidate.get(f"LING_{protocol.upper()}_INSTANCE_ID") or ""):
+                raise ConnectorServiceError(
+                    "invalid_config", "账号命名空间已由另一个实例使用", field_name=namespace_key
+                )
+            port = str(values.get("LING_ONEBOT_WS_PORT") or "")
+            if (target is None or target.enabled) and (protocol, other_id) in running and (
+                scope == protocol == cf.SCOPE_ONEBOT and port and port == str(
+                candidate.get("LING_ONEBOT_WS_PORT") or ""
+            )):
+                raise ConnectorServiceError(
+                    "invalid_config", "监听端口已由另一个实例使用",
+                    field_name="LING_ONEBOT_WS_PORT",
+                )
 
 
 # ---------------------------------------------------------------- 合并
@@ -349,6 +440,56 @@ class ConnectorConfigService:
             include_secrets=include_secrets,
         )
 
+    async def set_running(
+        self, session: AsyncSession, *, scope: str, instance_id: str,
+        enabled: bool, delete: bool = False,
+    ) -> Any:
+        """串行执行目录启停与运行切换，失败时由事务保留原目录状态。"""
+        from ling.infra.models import ConnectorConfigHead
+        from ling.settings.connector_instances import ConnectorInstanceService
+
+        await lock_instance_resources(session, scope, instance_id)
+        instances = ConnectorInstanceService(session)
+        row = await instances.require_live(scope=scope, instance_id=instance_id)
+        await session.refresh(row)
+        await instances.require_live(scope=scope, instance_id=instance_id)
+        head = await session.get(ConnectorConfigHead, (scope, instance_id), populate_existing=True)
+        if head is not None and head.candidate_revision_id:
+            raise ConnectorServiceError(
+                "activation_in_progress", "配置正在生效，请稍后再启停实例", status_code=409,
+            )
+        if self._runtime is None:
+            raise ConnectorServiceError(
+                "activation_unavailable", SAFE_ERRORS["activation_unavailable"], status_code=503,
+            )
+        if delete:
+            # 先校验默认实例保护，再释放连接。
+            row = await instances.soft_delete(scope=scope, instance_id=instance_id)
+        elif enabled:
+            row = await instances.set_enabled(scope=scope, instance_id=instance_id, enabled=True)
+            resolved = await self.resolved(
+                session, scope=scope, instance_id=instance_id, include_secrets=True,
+            )
+            values = resolved.fields_by_key()
+            validate_full(scope, values)
+            await validate_instance_config(
+                session, scope=scope, instance_id=instance_id, values=values,
+                settings=self._settings, box=self._box,
+            )
+            outcome = await self._runtime.apply(
+                scope, instance_id=instance_id, values=values, operation_id=new_id("enable"),
+            )
+            if not outcome.ok:
+                raise ConnectorServiceError(
+                    outcome.error_code or "connector_start_failed",
+                    outcome.error_safe or SAFE_ERRORS["connector_start_failed"], status_code=503,
+                )
+            return row
+        else:
+            row = await instances.set_enabled(scope=scope, instance_id=instance_id, enabled=False)
+        await self._runtime.stop(scope, instance_id=instance_id)
+        return row
+
     # ------------------------------------------------------------ 写
 
     async def apply(
@@ -371,8 +512,8 @@ class ConnectorConfigService:
         的 HEAD 指针与 generation。默认值 ``'default'``——存量单实例部署与
         升级前行为完全一致。
 
-        实例是否**存在且未软删**由调用方先 ``require_live`` 保证：服务层不
-        依赖目录表的具体实现。这里只保证"传进来的 id 被原样用于全部读写"，
+        实例是否存在由调用方先 ``require_live`` 保证，取得锁后复查删除状态。
+        传入的 id 原样用于全部读写，
         **不会**在查不到时退回默认实例——静默退回会造成"保存到实例 B，结果
         覆盖了默认实例"，而写入方看不到任何错误。
         """
@@ -385,13 +526,14 @@ class ConnectorConfigService:
         #
         # 锁键必须带实例：`generation` 是每实例递增的，两个实例的保存互不
         # 相干。只按 scope 锁会让它们互相排队，且掩盖"其实不需要互斥"这件事。
-        await session.execute(
-            sql_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-            {"k": f"connector:{scope}:{instance_id}"},
-        )
-        from ling.infra.models import ConnectorConfigHead
+        await lock_instance_resources(session, scope, instance_id)
+        from ling.infra.models import ConnectorConfigHead, ConnectorInstance
+        from ling.settings.connector_instances import ConnectorInstanceError
 
-        head = await session.get(ConnectorConfigHead, (scope, instance_id))
+        directory = await session.get(ConnectorInstance, (scope, instance_id), populate_existing=True)
+        if directory is not None and directory.deleted_at is not None:
+            raise ConnectorInstanceError("instance_deleted", "这个实例已被删除", status_code=409)
+        head = await session.get(ConnectorConfigHead, (scope, instance_id), populate_existing=True)
         generation = int(getattr(head, "generation", 0) or 0)
         candidate_id = getattr(head, "candidate_revision_id", None)
         if candidate_id:
@@ -441,6 +583,7 @@ class ConnectorConfigService:
         baseline = await ov.resolve_field_values(
             session,
             scope=scope,
+            instance_id=instance_id,
             settings=self._settings,
             onebot=self._onebot,
             qqbot=self._qqbot,
@@ -455,6 +598,10 @@ class ConnectorConfigService:
             else:
                 effective[spec.key] = baseline.get(spec.key)
         validate_full(scope, effective)
+        await validate_instance_config(
+            session, scope=scope, instance_id=instance_id, values=effective,
+            settings=self._settings, box=self._box,
+        )
 
         # ④ 有效值没变 → unchanged（不建修订、不重连、不写审计）
         fingerprints = await self._fingerprints(
@@ -497,9 +644,15 @@ class ConnectorConfigService:
         # ⑥ 事务外切换
         outcome: SwapOutcome
         try:
-            outcome = await self._runtime.apply(
-                scope, values=effective, operation_id=operation_id
-            )
+            from ling.infra.models import ConnectorInstance
+
+            instance = await session.get(ConnectorInstance, (scope, instance_id))
+            if instance is not None and not instance.enabled:
+                outcome = SwapOutcome(ok=True)
+            else:
+                outcome = await self._runtime.apply(
+                    scope, instance_id=instance_id, values=effective, operation_id=operation_id
+                )
         except Exception as exc:  # noqa: BLE001 - 切换器不该抛，抛了也必须回滚
             logger.exception("接入器切换抛错（已按失败处理）：scope=%s", scope)
             outcome = SwapOutcome(
@@ -690,7 +843,7 @@ class ConnectorConfigService:
             )
             session.add(row)
 
-        head = await session.get(ConnectorConfigHead, (scope, instance_id))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id), populate_existing=True)
         if head is None:
             # 显式写 instance_id 而不是靠模型默认值：这行代码的语义就是
             # "给这个实例建指针"，写出来读的人不用翻模型定义才知道建的是哪个实例。
@@ -731,7 +884,7 @@ class ConnectorConfigService:
         revision.activated_at = now
         revision.error_code = None
         revision.error_safe = None
-        head = await session.get(ConnectorConfigHead, (scope, instance_id))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id), populate_existing=True)
         if head is not None:
             head.active_revision_id = revision_id
             head.candidate_revision_id = None
@@ -802,7 +955,7 @@ class ConnectorConfigService:
                 outcome.error_safe
                 or SAFE_ERRORS.get(str(outcome.error_code), SAFE_ERRORS["connector_start_failed"])
             )
-        head = await session.get(ConnectorConfigHead, (scope, instance_id))
+        head = await session.get(ConnectorConfigHead, (scope, instance_id), populate_existing=True)
         if head is not None:
             # head 仍指向旧 active 修订；只清掉候选指针。
             head.candidate_revision_id = None

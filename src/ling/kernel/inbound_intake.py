@@ -129,6 +129,8 @@ async def process_inbound_payload(app: object, connector: object, payload: dict,
     from ling.kernel.access import check_access
     from ling.ports.channel import ChannelError
 
+    if getattr(connector, "_ling_runtime_active", True) is False:
+        return {"accepted": False, "reason": "instance_unavailable"}
     try:
         envelope = _asr_resume[0] if _asr_resume else connector.normalize_inbound(payload)  # type: ignore[attr-defined]
     except ChannelError as exc:

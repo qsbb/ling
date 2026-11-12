@@ -70,13 +70,14 @@ operation_id，平台也无从按它去重或对账。
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import ProactiveOpportunity, Window, utcnow
+from ling.logging_setup import emit_event
 
 logger = logging.getLogger("ling.domains.proactive.dispatch")
 
@@ -197,6 +198,7 @@ async def dispatch_pending(
     now: datetime | None = None,
     limit: int = MAX_PER_ROUND,
     deliver_to_web: bool = False,
+    connector_for_window: Callable[[str, str], Awaitable[object | None]] | None = None,
 ) -> dict[str, int | str]:
     """把有草稿的候选真的发出去。
 
@@ -279,7 +281,22 @@ async def dispatch_pending(
             # 门控没过就留着，不标 rejected——它只是"现在还不是时候"
             continue
 
-        if connector is None:
+        selected = connector
+        window_ref = None
+        if connector_for_window is not None:
+            target = await session.scalar(select(Window).where(
+                Window.subject_id == row.subject_id,
+                Window.channel.in_(("onebot", "qqbot")),
+                Window.visibility == "subject_private", Window.archived.is_(False),
+            ).order_by(Window.last_message_at.desc().nulls_last()).limit(1))
+            if target is not None:
+                window_ref = str(target.title or "")
+                selected = await connector_for_window(str(target.channel), window_ref)
+                if selected is not None:
+                    capabilities = selected.capabilities()
+                    if not capabilities.enabled or not capabilities.supports_proactive:
+                        selected = None
+        if selected is None:
             # Web 投递：没有外部渠道时的唯一路径。
             if not deliver_to_web:
                 continue
@@ -292,6 +309,13 @@ async def dispatch_pending(
                 )
                 rejected += 1
                 continue
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="proactive_dispatch_skipped",
+                message="没有可用的外部主动推送实例，改投 Web 会话",
+                attributes={"reason_code": "no_proactive_channel", "opportunity_id": row.id},
+            )
             await _append_web_message(
                 session,
                 window_id=window.id,
@@ -302,7 +326,8 @@ async def dispatch_pending(
             sent += 1
             continue
 
-        window_ref = await _target_window_ref(session, subject_id=row.subject_id)
+        if window_ref is None:
+            window_ref = await _target_window_ref(session, subject_id=row.subject_id)
         if window_ref is None:
             await service.mark(
                 row.id, state="rejected", reason="没有可投递的私聊会话"
@@ -311,7 +336,7 @@ async def dispatch_pending(
             continue
 
         delivery = DeliveryService(session)
-        probe = _SendProbe(connector)
+        probe = _SendProbe(selected)
         try:
             # 每次投递各自一个 SAVEPOINT。
             #

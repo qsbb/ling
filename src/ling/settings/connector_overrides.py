@@ -334,6 +334,15 @@ def _env_baseline(
 # ---------------------------------------------------------------- 解析
 
 
+def _baseline_for_instance(spec: cf.FieldSpec, scope: str, instance_id: str) -> Any:
+    """独立实例以协议默认值起步，账号命名空间从稳定身份派生。"""
+    if spec.key == f"LING_{scope.upper()}_INSTANCE_ID":
+        return f"{scope}-{instance_id}"
+    if spec.key == "LING_ONEBOT_API_BASE":
+        return ""
+    return spec.default
+
+
 async def resolve_field_values(
     session: AsyncSession,
     *,
@@ -369,7 +378,11 @@ async def resolve_field_values(
         active_revision_id=getattr(head, "active_revision_id", None),
     )
     for spec in specs:
-        baseline = _env_baseline(spec, settings=settings, onebot=onebot, qqbot=qqbot)
+        baseline = (
+            _baseline_for_instance(spec, scope, instance_id)
+            if instance_id != DEFAULT_INSTANCE_ID
+            else _env_baseline(spec, settings=settings, onebot=onebot, qqbot=qqbot)
+        )
         baseline_text = cf.env_stringify(spec, baseline)
         if spec.key in overrides:
             override = overrides[spec.key]
@@ -406,11 +419,11 @@ async def resolve_field_values(
         if baseline_text not in (None, "", "[]") and not (
             spec.kind == cf.KIND_LIST and baseline_text == ""
         ):
-            source = cf.SOURCE_ENV
+            source = cf.SOURCE_ENV if instance_id == DEFAULT_INSTANCE_ID else cf.SOURCE_DEFAULT
             value = baseline if spec.kind == cf.KIND_LIST else baseline_text
         else:
             source = cf.SOURCE_DEFAULT
-            value = spec.default
+            value = baseline if instance_id != DEFAULT_INSTANCE_ID else spec.default
         preview = (
             cf.secret_preview(str(value)) if spec.kind == cf.KIND_SECRET and value else None
         )
@@ -517,7 +530,8 @@ def build_onebot_config_from(values: dict[str, Any]):  # noqa: ANN201
 
     hosts = cf.normalize_list(values.get("LING_ONEBOT_MEDIA_HOSTS"))
     return OneBotConfig(
-        api_base=text("LING_ONEBOT_API_BASE") or "http://127.0.0.1:5700",
+        api_base=(text("LING_ONEBOT_API_BASE") or "")
+        if "LING_ONEBOT_API_BASE" in values else "http://127.0.0.1:5700",
         access_token=text("LING_ONEBOT_ACCESS_TOKEN"),
         secret=text("LING_ONEBOT_SECRET"),
         self_id=text("LING_ONEBOT_SELF_ID"),

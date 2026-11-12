@@ -48,7 +48,6 @@ from ling.audit import behavior_event
 from ling.domains.media.describe import (
     VIDEO_PROFILE,
     MediaDescriber,
-    MediaFetcher,
     MediaReadError,
 )
 from ling.domains.media.service import (
@@ -514,7 +513,6 @@ def make_watch_callback(
 
 class _WatchCache(TypedDict, total=False):
     settings: Settings
-    fetcher: MediaFetcher
 
 
 def default_watch_callback(
@@ -526,9 +524,8 @@ def default_watch_callback(
 ) -> WatchCallback:
     """兜底装配：自己去找设置、连接器、媒体取用函数与偏好。
 
-    `TurnCoordinator` 有两个构造点（Web 聊天路由与渠道入站），它们的上下文里
-    都能拿到这些对象；但为了**不动那两个文件**（作用域限制），这里在真的
-    要看视频时才惰性装配。装不起来就返回"没看成"，绝不影响正常对话。
+    在读取视频时按窗口的账号命名空间解析当前连接器，下载时复查实例可用性。
+    装配失败时返回"没看成"，让主回复链路解释读取结果。
 
     ``quota``：`TokenQuotaStore`。给了就按 token 账本判额度；``None`` = 不设闸
     （与 router 在没装配账本时放行是同一个口径）。
@@ -537,7 +534,7 @@ def default_watch_callback(
 
     async def watch(window_id: str, refs: list[str]) -> WatchResult:
         try:
-            from ling.capabilities.channels import build_onebot_connector
+            from ling.capabilities.channels import load_window_connector
             from ling.config import get_settings
             from ling.infra.db import session_scope
             from ling.infra.models import Window
@@ -553,18 +550,18 @@ def default_watch_callback(
                 mode = await load_video_mode(
                     session, subject_id=getattr(window, "subject_id", None)
                 )
-                fetcher = cache.get("fetcher")
-                if fetcher is None:
-                    try:
-                        connector = build_onebot_connector()
-                    except Exception:  # noqa: BLE001 - 没有渠道时只能读本地文件
-                        connector = None
-                    fetcher = make_media_fetcher(
-                        connector,
-                        media_root=settings.data_dir / "media",
-                        max_bytes=settings.max_body_bytes,
+                async def source_connector() -> object | None:
+                    if window is None:
+                        return None
+                    return await load_window_connector(
+                        str(window.channel or ""), str(window.title or ""),
                     )
-                    cache["fetcher"] = fetcher
+
+                fetcher = make_media_fetcher(
+                    None, connector_loader=source_connector,
+                    media_root=settings.data_dir / "media",
+                    max_bytes=settings.max_body_bytes,
+                )
                 config_reader = ConfigService(
                     session,
                     SecretBox(settings),

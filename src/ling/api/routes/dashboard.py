@@ -40,7 +40,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.routes.life_timeline import (
@@ -173,6 +173,7 @@ async def _guard(name: str, coro: Any, session: Any) -> dict:
 
 @router.get("/dashboard")
 async def get_dashboard(
+    request: Request,
     auth: CurrentAuth,
     session: DbSession,
     settings: SettingsDep,
@@ -237,7 +238,7 @@ async def get_dashboard(
         try:
             from ling.capabilities.channels import proactive_connector_status
 
-            connector, reason = proactive_connector_status()
+            connector, reason = proactive_connector_status(request.app)
             delivery_enabled = connector is not None
             gate_reason = reason or ""
         except Exception as exc:  # noqa: BLE001 - 探测失败按不可投递
@@ -513,52 +514,9 @@ async def get_dashboard(
         )
 
     async def connectivity() -> dict:
-        from ling.capabilities.channels import (
-            qqbot_config,
-            qqbot_connector_status,
-        )
+        from ling.capabilities.channels import channel_connectivity
 
-        # **"配置齐备"与"能主动推送"是两件事**。
-        # `qqbot_connector_status()` 在"凭据齐全但没申请主动推送"时会返回
-        # (None, 原因)——用它判断 configured 会把配好的渠道误报成未配置
-        # （实测在部署实例上就报错了）。configured 只看凭据，主动能力单独说。
-        channels: list[dict] = []
-        try:
-            qq_config = qqbot_config()
-            _connector, status_reason = qqbot_connector_status()
-            channels.append(
-                {
-                    "channel": "qqbot",
-                    "configured": qq_config.configured,
-                    "reason": ""
-                    if qq_config.configured
-                    else "凭据不全（APP_ID / CLIENT_SECRET）",
-                    # 主动推送能力是平台权限，不是配置
-                    "proactive_ready": _connector is not None,
-                    "proactive_reason": status_reason or "",
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            channels.append(
-                {
-                    "channel": "qqbot",
-                    "configured": False,
-                    "reason": f"探测失败（{type(exc).__name__}）",
-                }
-            )
-
-        # OneBot 的配置是纯环境变量，没有"连接器对象"可探测——这里只报
-        # 配置是否齐备，**不冒充连通性**（真正能不能收消息只有日志知道）。
-        onebot_configured = bool(
-            settings.onebot_ws_port or settings.onebot_ws_url or settings.onebot_ws_token
-        )
-        channels.append(
-            {
-                "channel": "onebot",
-                "configured": onebot_configured,
-                "reason": "" if onebot_configured else "未配置 LING_ONEBOT_*",
-            }
-        )
+        channels = await channel_connectivity(session, settings=settings, app=request.app)
 
         # 模型职责有没有绑定：没绑 = 她说不出话，这是首屏必须能看出来的
         bound: list[str] = []

@@ -196,6 +196,7 @@ async def reconcile_deliveries(
     # 就是 `ChannelConnector`），同步返回或协程返回都可以，拿不到给 None。
     # 原来写成 `object`，等于把"它到底是什么"丢给了调用处。
     connector_for: Callable[[str], Awaitable[ChannelConnector] | ChannelConnector | None],
+    connector_for_window: Callable[[str, str], Awaitable[ChannelConnector | None]] | None = None,
     limit: int = RECONCILE_BATCH,
     pause: Callable[[float], Awaitable[None]] | None = None,
     now: datetime | None = None,
@@ -214,7 +215,9 @@ async def reconcile_deliveries(
 
     # ---------------------------------------------------------------- 1) 对账
     for operation_id, channel, _instance in await _due_uncertain():
-        connector = await _resolve(connector_for, channel)
+        connector = await _resolve(
+            connector_for, channel, connector_for_window, str(_instance or "")
+        )
         if connector is None:
             continue
         report.scanned += 1
@@ -275,7 +278,9 @@ async def reconcile_deliveries(
                     detail="生成超时后一直没有等到正文落库，放弃续发（未投递）",
                 )
             continue
-        connector = await _resolve(connector_for, channel)
+        connector = await _resolve(
+            connector_for, channel, connector_for_window, window_ref
+        )
         if connector is None:
             continue
         # 群聊判定走**唯一实现**（`kernel/visibility.py`）。
@@ -372,11 +377,14 @@ async def _pending_age_seconds(operation_id: str, *, moment: datetime) -> float:
 async def _resolve(
     connector_for: Callable[[str], Awaitable[ChannelConnector] | ChannelConnector | None],
     channel: str,
+    connector_for_window: Callable[[str, str], Awaitable[ChannelConnector | None]] | None = None,
+    window_ref: str = "",
 ) -> ChannelConnector | None:
     if not channel:
         return None
     with contextlib.suppress(Exception):
-        found = connector_for(channel)
+        found = (connector_for_window(channel, window_ref)
+                 if connector_for_window is not None else connector_for(channel))
         if hasattr(found, "__await__"):
             found = await found  # type: ignore[misc]
         return found

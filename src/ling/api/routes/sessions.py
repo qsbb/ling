@@ -64,11 +64,8 @@ async def _group_display_names(
     连接器内部还有缓存（成功 6 小时 / 失败 5 分钟），所以这里不会每次
     开页面都去打 NapCat。
 
-    ## 为什么按 ``{channel}_connector`` 找连接器
-
-    ``app.py`` 就是这么挂的（``state.onebot_connector`` / ``state.qqbot_connector``）。
-    找不到、或这个连接器没有采集能力（web 窗口 / 测试桩），返回 ``{}``：
-    前端按 ``channel`` + ``peer_id`` 自己回退，功能不受影响。
+    用窗口的账号命名空间选择所属实例。找不到、或该实例没有采集能力时，
+    前端按渠道与 peer_id 回退显示。
     """
     # 值里存的是**绑定方法本身**（不是它返回的结果）：先攒齐再一次性
     # `gather`，所以这里必须写成可调用的类型。写成 `object` 会让下面
@@ -78,7 +75,10 @@ async def _group_display_names(
         channel, kind, peer_id = window_target(window)
         if kind != "group" or not peer_id:
             continue
-        connector = getattr(request.app.state, f"{channel}_connector", None)
+        from ling.capabilities.channels import connector_for_namespace
+
+        namespace = str(window.title or "").split(":", 1)[0]
+        connector = connector_for_namespace(request.app, channel, namespace)
         fetch = getattr(connector, "fetch_group_name", None)
         if fetch is None:
             continue
@@ -97,17 +97,17 @@ async def _group_display_names(
     }
 
 
-async def _friend_names_by_channel(
+async def _friend_names_by_instance(
     request: Request, windows: Sequence[Window]
 ) -> dict[str, dict[str, tuple[str | None, str | None]]]:
-    """每个涉及到的渠道 → ``{user_id: (remark, nickname)}``。
+    """每个涉及到的账号命名空间 → ``{user_id: (remark, nickname)}``。
 
-    ## 为什么按渠道去重、**每个渠道只调一次**
+    ## 为什么每个实例只调一次
 
     ``fetch_friend_names`` 是**整表**接口（OneBot 没有"查单个好友备注"的
     动作）。三个私聊窗口共用同一个连接器时，逐个窗口调就是三次全量响应——
     连接器内部虽然缓存了，但缓存是"10 分钟后失效"的，失效那一刻就会连打
-    三次。所以这里按 channel 分组，一个渠道一次。
+    三次。所以这里按账号命名空间分组，每个实例一次。
 
     ## 为什么吞异常
 
@@ -117,20 +117,23 @@ async def _friend_names_by_channel(
     names: dict[str, dict[str, tuple[str | None, str | None]]] = {}
     for window in windows:
         channel, kind, peer_id = window_target(window)
-        if kind != "private" or not peer_id or channel in names:
+        namespace = str(window.title or "").split(":", 1)[0]
+        if kind != "private" or not peer_id or namespace in names:
             continue
-        connector = getattr(request.app.state, f"{channel}_connector", None)
+        from ling.capabilities.channels import connector_for_namespace
+
+        connector = connector_for_namespace(request.app, channel, namespace)
         fetch = getattr(connector, "fetch_friend_names", None)
         if fetch is None:
             # 这个渠道没有采集能力（web 窗口 / 测试桩 / QQ 官方未实现）。
             # 记一个空表，后面的窗口不再重复找连接器。
-            names[channel] = {}
+            names[namespace] = {}
             continue
         try:
             fetched = await fetch()
         except Exception:  # noqa: BLE001 - 采集是尽力而为，标题退回 null
             fetched = {}
-        names[channel] = fetched if isinstance(fetched, dict) else {}
+        names[namespace] = fetched if isinstance(fetched, dict) else {}
     return names
 
 
@@ -158,14 +161,15 @@ async def _friend_remark_names(
     table = (
         friends
         if friends is not None
-        else await _friend_names_by_channel(request, windows)
+        else await _friend_names_by_instance(request, windows)
     )
     out: dict[str, str | None] = {}
     for window in windows:
         channel, kind, peer_id = window_target(window)
         if kind != "private" or not peer_id:
             continue
-        remark, nickname = table.get(channel, {}).get(peer_id, (None, None))
+        namespace = str(window.title or "").split(":", 1)[0]
+        remark, nickname = table.get(namespace, {}).get(peer_id, (None, None))
         chosen = (remark or nickname or "").strip()
         if chosen:
             out[window.id] = chosen[:128]
@@ -189,7 +193,7 @@ async def _display_names(
     """
     names = await conversation.peer_display_names(windows)
     # 好友备注/昵称覆盖库里的名字（更贴近用户自己的叫法）。
-    friends = await _friend_names_by_channel(request, windows)
+    friends = await _friend_names_by_instance(request, windows)
     names.update(await _friend_remark_names(request, windows, friends))
     names.update(await _group_display_names(request, windows))
     return names

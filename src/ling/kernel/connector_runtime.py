@@ -29,13 +29,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ling.settings.connector_service import SwapOutcome
+from ling.infra.models import DEFAULT_INSTANCE_ID
+from ling.settings.connector_service import ConnectorServiceError, SwapOutcome
 
 logger = logging.getLogger("ling.kernel.connector_runtime")
 
@@ -59,17 +61,19 @@ class SwapPlan:
 
 
 class ConnectorRuntime:
-    """按 scope 切换连接器实例，并把结果写回 ``app.state``。"""
+    """按 (scope, instance_id) 切换连接器实例，并把结果写回 ``app.state``。"""
 
-    def __init__(self, app: object) -> None:
+    def __init__(self, app: Any) -> None:
         self._app = app
-        #: scope → 生成 SwapPlan 的工厂（``None`` 表示这个 scope 不重连，
+        #: 实例身份 → 生成 SwapPlan 的工厂（``None`` 表示这个 scope 不重连，
         #: 例如白名单：它只在下一个请求生效，不需要动连接）。
-        self._plans: dict[str, Callable[[dict[str, Any]], Awaitable[SwapPlan]]] = {}
-        #: scope → 当前实例名 → 对象（供停止与回滚使用）
-        self._instances: dict[str, dict[str, Any]] = {}
-        #: scope → 构造参数快照（回滚时重建用）
-        self._effective: dict[str, dict[str, Any]] = {}
+        self._plans: dict[tuple[str, str], Callable[[dict[str, Any]], Awaitable[SwapPlan]]] = {}
+        #: 实例身份 → 组件名 → 对象（供停止与回滚使用）
+        self._instances: dict[tuple[str, str], dict[str, Any]] = {}
+        #: 实例身份 → 构造参数快照（回滚时重建用）
+        self._effective: dict[tuple[str, str], dict[str, Any]] = {}
+        self._factories: dict[str, Callable[[str, dict[str, Any]], Awaitable[SwapPlan]]] = {}
+        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------ 注册
 
@@ -78,23 +82,130 @@ class ConnectorRuntime:
         scope: str,
         factory: Callable[[dict[str, Any]], Awaitable[SwapPlan]],
         *,
+        instance_id: str = DEFAULT_INSTANCE_ID,
         instances: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
     ) -> None:
-        self._plans[scope] = factory
+        key = (scope, instance_id)
+        self._plans[key] = factory
         if instances is not None:
-            self._instances[scope] = instances
+            self._instances[key] = instances
+            self._publish(scope, instance_id, instances)
         if values is not None:
-            self._effective[scope] = values
+            self._effective[key] = values
 
-    def snapshot(self, scope: str) -> dict[str, Any]:
-        """当前已生效的构造参数（GET 视图与诊断用；**不含解密后的密钥副本**）。"""
-        return dict(self._effective.get(scope) or {})
+    def snapshot(self, scope: str, instance_id: str = DEFAULT_INSTANCE_ID) -> dict[str, Any]:
+        """当前构造参数的进程内副本，仅供重建与状态解析，禁止输出或序列化。"""
+        return dict(self._effective.get((scope, instance_id)) or {})
 
-    # ------------------------------------------------------------ 切换
+    def register_factory(
+        self, scope: str, factory: Callable[[str, dict[str, Any]], Awaitable[SwapPlan]]
+    ) -> None:
+        self._factories[scope] = factory
+
+    def components(self, scope: str, instance_id: str = DEFAULT_INSTANCE_ID) -> dict[str, Any]:
+        return dict(self._instances.get((scope, instance_id)) or {})
+
+    def connector(self, scope: str, instance_id: str = DEFAULT_INSTANCE_ID) -> Any:
+        return self.components(scope, instance_id).get(f"{scope}_connector")
+
+    def connectors(self, scope: str | None = None) -> list[Any]:
+        return [
+            connector
+            for (protocol, _instance_id), components in self._instances.items()
+            if scope is None or protocol == scope
+            if (connector := components.get(f"{protocol}_connector")) is not None
+            and getattr(connector, "_ling_runtime_active", True) is not False
+        ]
+
+    def for_namespace(self, namespace: str, scope: str | None = None) -> Any:
+        for (protocol, _instance_id), components in self._instances.items():
+            if scope is not None and protocol != scope:
+                continue
+            connector = components.get(f"{protocol}_connector")
+            if (connector is not None and connector.instance_id == namespace
+                    and getattr(connector, "_ling_runtime_active", True) is not False):
+                return connector
+        return None
+
+    def _publish(self, scope: str, instance_id: str, components: dict[str, Any]) -> None:
+        connector = components.get(f"{scope}_connector")
+        if connector is not None:
+            connector._ling_runtime_active = True
+            connector._ling_instance_key = (scope, instance_id)
+        # 旧调用方通过这些属性访问默认实例。
+        if instance_id == DEFAULT_INSTANCE_ID:
+            names = {
+                "onebot": ("onebot_connector", "onebot_ws", "onebot_ws_server"),
+                "qqbot": ("qqbot_connector", "qqbot_gateway"),
+            }.get(scope, ())
+            for name in names:
+                setattr(self._app.state, name, components.get(name))
+
+    async def stop(self, scope: str, instance_id: str = DEFAULT_INSTANCE_ID) -> None:
+        async with self._lock:
+            key = (scope, instance_id)
+            components = self.components(scope, instance_id)
+            values = self.snapshot(scope, instance_id)
+            try:
+                await _stop_components(components, scope)
+            except (Exception, asyncio.CancelledError) as exc:
+                restored, instances = await self._rollback(scope, values, instance_id=instance_id)
+                self._instances[key] = instances
+                self._publish(scope, instance_id, instances)
+                if not restored:
+                    self._effective.pop(key, None)
+                raise ConnectorServiceError(
+                    "connector_stop_failed" if restored else "rollback_failed",
+                    "实例未能停用，已恢复原连接" if restored else "实例停止与恢复失败，请检查运行日志",
+                    status_code=503,
+                ) from exc
+            self._instances.pop(key, None)
+            self._effective.pop(key, None)
+            self._publish(scope, instance_id, {})
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            for (scope, instance_id), components in list(self._instances.items()):
+                try:
+                    await _stop_components(components, scope)
+                except (Exception, asyncio.CancelledError) as exc:
+                    logger.error("接入器关闭失败 scope=%s instance=%s type=%s",
+                                 scope, instance_id, type(exc).__name__)
+                self._publish(scope, instance_id, {})
+            self._instances.clear()
+            self._effective.clear()
+
+    def validate(self, scope: str, instance_id: str, values: dict[str, Any]) -> None:
+        namespace_key = f"LING_{scope.upper()}_INSTANCE_ID"
+        for (other_scope, other_id), other in self._effective.items():
+            if (other_scope, other_id) == (scope, instance_id):
+                continue
+            other_namespace = other.get(f"LING_{other_scope.upper()}_INSTANCE_ID")
+            if values.get(namespace_key) and values[namespace_key] == other_namespace:
+                raise ConnectorServiceError(
+                    "invalid_config", "账号命名空间已由另一个实例使用", field_name=namespace_key
+                )
+            if scope == other_scope == "onebot":
+                port = values.get("LING_ONEBOT_WS_PORT")
+                if port and str(port) == str(other.get("LING_ONEBOT_WS_PORT") or ""):
+                    raise ConnectorServiceError(
+                        "invalid_config", "监听端口已由另一个实例使用",
+                        field_name="LING_ONEBOT_WS_PORT",
+                    )
 
     async def apply(
-        self, scope: str, *, values: dict[str, Any], operation_id: str
+        self, scope: str, *, values: dict[str, Any], operation_id: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
+    ) -> SwapOutcome:
+        async with self._lock:
+            self.validate(scope, instance_id, values)
+            return await self._apply(scope, values=values, operation_id=operation_id,
+                                     instance_id=instance_id)
+
+    async def _apply(
+        self, scope: str, *, values: dict[str, Any], operation_id: str,
+        instance_id: str = DEFAULT_INSTANCE_ID,
     ) -> SwapOutcome:
         """把新配置应用到这个副本。**不抛异常**：失败以 ``ok=False`` 返回。"""
         started = time.monotonic()
@@ -102,38 +213,46 @@ class ConnectorRuntime:
 
         # 白名单等"下一个请求生效"的 scope 没有需要重建的连接。
         # 但**仍然要记录新快照**：入站判断读的是它。
-        factory = self._plans.get(scope)
-        old_values = dict(self._effective.get(scope) or {})
-        old_instances = dict(self._instances.get(scope) or {})
+        key = (scope, instance_id)
+        factory = self._plans.get(key)
+        if factory is None and scope in self._factories:
+            async def factory(candidate: dict[str, Any]) -> SwapPlan:
+                return await self._factories[scope](instance_id, candidate)
+            self._plans[key] = factory
+        old_values = dict(self._effective.get((scope, instance_id)) or {})
+        old_instances = dict(self._instances.get((scope, instance_id)) or {})
 
         if factory is None:
-            self._effective[scope] = dict(values)
+            self._effective[key] = dict(values)
             timings["listener_ready_at"] = round(time.monotonic() - started, 4)
             return SwapOutcome(ok=True, health="ok", timings=timings, stop_calls=0)
 
         stop_calls = 0
         timings["disconnect_started_at"] = round(time.monotonic() - started, 4)
         try:
-            # 1) 停旧的：端口/连接必须释放。
-            for name in old_instances:
-                instance = old_instances.get(name)
-                stopper = getattr(instance, "stop", None)
-                if stopper is None:
-                    continue
-                stop_calls += 1
-                result = stopper()
-                if hasattr(result, "__await__"):
-                    await result
+            stop_calls = sum(
+                callable(getattr(component, "stop", None) or getattr(component, "close", None))
+                for component in old_instances.values()
+            )
+            await _stop_components(old_instances, scope)
             # 2) 构造并启动新的
             plan = await factory(dict(values))
             new_instances = await plan.start()
-        except Exception as exc:  # noqa: BLE001 - 切换失败必须回滚，不能让异常穿出去
+        except (Exception, asyncio.CancelledError) as exc:  # 切换取消也必须恢复并结清修订
             logger.warning(
                 "接入器切换失败 scope=%s type=%s（开始回滚）", scope, type(exc).__name__
             )
-            rollback_ok, rollback_instances = await self._rollback(scope, old_values)
+            if old_values:
+                rollback_ok, rollback_instances = await self._rollback(
+                    scope, old_values, instance_id=instance_id
+                )
+            else:
+                rollback_ok, rollback_instances = True, {}
             timings["listener_ready_at"] = round(time.monotonic() - started, 4)
             if not rollback_ok:
+                self._instances.pop(key, None)
+                self._effective.pop(key, None)
+                self._publish(scope, instance_id, {})
                 # 回退也失败：**不能报成功**，如实标 degraded
                 return SwapOutcome(
                     ok=False,
@@ -143,8 +262,9 @@ class ConnectorRuntime:
                     timings=timings,
                     stop_calls=stop_calls,
                 )
-            self._instances[scope] = rollback_instances
-            self._effective[scope] = old_values
+            self._instances[key] = rollback_instances
+            self._effective[key] = old_values
+            self._publish(scope, instance_id, rollback_instances)
             return SwapOutcome(
                 ok=False,
                 health="degraded",
@@ -155,16 +275,20 @@ class ConnectorRuntime:
             )
 
         # 3) 成功：替换引用（**在 start 之后**，失败时引用仍指向可用实例）
-        self._instances[scope] = new_instances
-        self._effective[scope] = dict(values)
+        self._instances[key] = new_instances
+        self._publish(scope, instance_id, new_instances)
+        self._effective[key] = dict(values)
         timings["listener_ready_at"] = round(time.monotonic() - started, 4)
 
         # 4) 远端握手：有界等待，超时只影响 health
         health = "ok"
         if plan.connected is not None:
-            connected = await _wait_connected(
-                plan.connected, new_instances, timeout=REMOTE_CONNECT_WAIT_SECONDS
-            )
+            try:
+                connected = await _wait_connected(
+                    plan.connected, new_instances, timeout=REMOTE_CONNECT_WAIT_SECONDS
+                )
+            except asyncio.CancelledError:
+                connected = False
             if connected:
                 timings["remote_connected_at"] = round(time.monotonic() - started, 4)
             else:
@@ -174,21 +298,46 @@ class ConnectorRuntime:
         )
 
     async def _rollback(
-        self, scope: str, old_values: dict[str, Any]
+        self, scope: str, old_values: dict[str, Any], *, instance_id: str
     ) -> tuple[bool, dict[str, Any]]:
         """用**旧配置**重建实例（旧对象已经 stop，不保证能再 start）。"""
-        factory = self._plans.get(scope)
+        key = (scope, instance_id)
+        factory = self._plans.get(key)
+        if factory is None and scope in self._factories:
+            async def factory(candidate: dict[str, Any]) -> SwapPlan:
+                return await self._factories[scope](instance_id, candidate)
+            self._plans[key] = factory
         if factory is None:
             return True, {}
         try:
             plan = await factory(dict(old_values))
             instances = await plan.start()
-        except Exception as exc:  # noqa: BLE001 - 回退失败要如实上报
+        except (Exception, asyncio.CancelledError) as exc:  # 回退失败要如实上报
             logger.error(
                 "接入器回退失败 scope=%s type=%s —— 需要人工检查", scope, type(exc).__name__
             )
             return False, {}
         return True, instances
+
+
+async def _stop_components(components: dict[str, Any], scope: str) -> None:
+    """先拒绝新的收发，再逐个关闭组件，任一失败仍继续释放其它资源。"""
+    connector = components.get(f"{scope}_connector")
+    if connector is not None:
+        connector._ling_runtime_active = False
+    error: BaseException | None = None
+    for component in components.values():
+        stopper = getattr(component, "stop", None) or getattr(component, "close", None)
+        if stopper is None:
+            continue
+        try:
+            result = stopper()
+            if hasattr(result, "__await__"):
+                await result
+        except (Exception, asyncio.CancelledError) as exc:
+            error = error or exc
+    if error is not None:
+        raise error
 
 
 def _error_code_for(exc: BaseException) -> str:

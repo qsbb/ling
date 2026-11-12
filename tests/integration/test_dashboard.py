@@ -91,16 +91,8 @@ async def test_connectivity_separates_configured_from_proactive(
     "未配置"——用户会去翻凭据，而真正的问题是平台权限。
     """
 
-    class _Cfg:
-        configured = True
-
-    monkeypatch.setattr(
-        "ling.capabilities.channels.qqbot_config", lambda: _Cfg()
-    )
-    monkeypatch.setattr(
-        "ling.capabilities.channels.qqbot_connector_status",
-        lambda: (None, "主动推送需在开放平台单独申请"),
-    )
+    monkeypatch.setenv("LING_QQBOT_APP_ID", "fake-dashboard-app")
+    monkeypatch.setenv("LING_QQBOT_CLIENT_SECRET", "fake-dashboard-secret")
 
     body = (await logged_in.client.get("/v1/dashboard")).json()
     data = body["sections"]["connectivity"]["data"]

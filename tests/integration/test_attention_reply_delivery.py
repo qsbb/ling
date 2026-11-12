@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -159,7 +160,7 @@ def _install(
     monkeypatch.setattr(
         worker,
         "_group_reply_connector",
-        lambda channel: connector if channel == "onebot" else None,
+        AsyncMock(side_effect=lambda channel, window_ref: connector if channel == "onebot" else None),
     )
     return router, connector
 

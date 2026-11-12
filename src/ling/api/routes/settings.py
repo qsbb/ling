@@ -824,14 +824,52 @@ async def get_connectors(
     """
     from ling.settings import connector_fields as cf
     from ling.settings.connector_service import operation_view  # noqa: F401 - 供文档引用
-    from ling.settings.connectors import connector_views
 
     is_owner = str(getattr(auth.user, "role", "")) == "owner"
 
     # 逐 scope 解析"这次读哪个实例"（实例按 scope 独立，见 _live_instances）。
     live = await _live_instances(session, instance_id=instance_id)
 
-    views = connector_views(settings, request.app.state)
+    from types import SimpleNamespace
+
+    from ling.infra.models import ConnectorInstance
+    from ling.settings import connector_overrides as ov
+    from ling.settings.connectors import _onebot_view, _qqbot_view
+
+    views = []
+    for scope, make_view, build_config in (
+        (cf.SCOPE_ONEBOT, _onebot_view, ov.build_onebot_config_from),
+        (cf.SCOPE_QQBOT, _qqbot_view, ov.build_qqbot_config_from),
+    ):
+        selected = live[scope]
+        resolved = await ov.resolve_field_values(
+            session, scope=scope, instance_id=selected, settings=settings,
+            box=getattr(request.app.state, "secret_box", None), include_secrets=True,
+        )
+        values = resolved.fields_by_key()
+        runtime = getattr(request.app.state, "connector_runtime", None)
+        components = runtime.components(scope, selected) if hasattr(runtime, "components") else {}
+        if selected == DEFAULT_INSTANCE_ID:
+            components = {name: getattr(request.app.state, name, None) for name in (
+                "onebot_ws_server", "onebot_ws", "qqbot_gateway",
+            )}
+        runtime_settings = ov.ConnectorRuntimeSettings().with_values(scope, values)
+        view_settings = SimpleNamespace(**vars(settings))
+        for spec in cf.fields_for(scope):
+            attr = ov._SETTINGS_ATTRS.get(spec.key)
+            if attr is not None and spec.key in values:
+                value = values[spec.key]
+                if spec.kind == cf.KIND_SWITCH:
+                    value = value is True or str(value) == "1"
+                setattr(view_settings, attr, value)
+        for key, value in vars(runtime_settings).items():
+            setattr(view_settings, key, value)
+        view = make_view(view_settings, build_config(values), SimpleNamespace(**components))
+        row = await session.get(ConnectorInstance, (scope, selected))
+        if row is not None and not row.enabled:
+            view.update(enabled=False, status="disabled", status_reason="instance_disabled",
+                        status_message="这个实例已停用", guidance="启用实例后恢复连接")
+        views.append(view)
     field_views = await _connector_field_views(
         session,
         settings=settings,
@@ -970,6 +1008,13 @@ def _connector_service(request: Request, auth: object, session: AsyncSession):  
         settings=app_state.settings,
         box=getattr(app_state, "secret_box", None),
         runtime=getattr(app_state, "connector_runtime", None),
+    )
+
+
+def _runtime_instance_error(exc: object) -> LingError:
+    return LingError(
+        ErrorCode.conflict if exc.status_code == 409 else ErrorCode.invalid_request,
+        exc.message, status_code=exc.status_code, detail=exc.code, field=exc.field_name,
     )
 
 
@@ -1156,19 +1201,21 @@ async def set_connector_instance_enabled(
     """
     from ling.settings.connector_instances import (
         ConnectorInstanceError,
-        ConnectorInstanceService,
         instance_view,
     )
 
     _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
-    service = ConnectorInstanceService(session)
+    from ling.settings.connector_service import ConnectorServiceError
+
     try:
-        row = await service.set_enabled(
-            scope=scope, instance_id=instance_id, enabled=body.enabled
+        row = await _connector_service(request, auth, session).set_running(
+            session, scope=scope, instance_id=instance_id, enabled=body.enabled,
         )
     except ConnectorInstanceError as exc:
         raise _instance_error(exc) from exc
+    except ConnectorServiceError as exc:
+        raise _runtime_instance_error(exc) from exc
     await session.commit()
     audit_event(
         "connector_instance_toggled",
@@ -1198,17 +1245,21 @@ async def delete_connector_instance(
     """
     from ling.settings.connector_instances import (
         ConnectorInstanceError,
-        ConnectorInstanceService,
         instance_view,
     )
 
     _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
-    service = ConnectorInstanceService(session)
+    from ling.settings.connector_service import ConnectorServiceError
+
     try:
-        row = await service.soft_delete(scope=scope, instance_id=instance_id)
+        row = await _connector_service(request, auth, session).set_running(
+            session, scope=scope, instance_id=instance_id, enabled=False, delete=True,
+        )
     except ConnectorInstanceError as exc:
         raise _instance_error(exc) from exc
+    except ConnectorServiceError as exc:
+        raise _runtime_instance_error(exc) from exc
     await session.commit()
     audit_event(
         "connector_instance_deleted",
@@ -1321,6 +1372,8 @@ async def put_connector_config(
             expected_generation=expected,
             actor_id=str(getattr(getattr(auth, "user", None), "subject_id", "") or ""),
         )
+    except ConnectorInstanceError as exc:
+        raise _instance_error(exc) from exc
     except ConnectorServiceError as exc:
         # `ErrorCode` 是**受控枚举**：409 的两种具体原因（代际冲突 / 另一处
         # 正在生效）不能当成新的错误码塞进去——那会让契约多出两个没人映射的

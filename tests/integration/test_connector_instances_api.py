@@ -80,11 +80,15 @@ class FakeRuntime:
         self.applies: list[tuple[str, dict[str, Any]]] = []
         self.stop_calls = 0
 
-    async def apply(self, scope: str, *, values: dict[str, Any], operation_id: str) -> Any:
+    async def apply(self, scope: str, *, values: dict[str, Any], operation_id: str,
+                    instance_id: str = "default") -> Any:
         from ling.settings.connector_service import SwapOutcome
 
         self.applies.append((scope, values))
         return SwapOutcome(ok=True, health="ok", stop_calls=0)
+
+    async def stop(self, scope: str, instance_id: str = "default") -> None:
+        self.stop_calls += 1
 
 
 @pytest.fixture

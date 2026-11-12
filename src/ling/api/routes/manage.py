@@ -677,6 +677,7 @@ async def cancel_commitment(
 
 @router.get("/proactive")
 async def list_proactive(
+    request: Request,
     auth: CurrentAuth, session: DbSession, settings: SettingsDep, config: ConfigDep
 ) -> dict:
     service = ProactivityService(session, actor_id=_actor_id(settings))
@@ -692,7 +693,7 @@ async def list_proactive(
     # 同样返回 None（那种情况下如实标记不可达，不能假装能发）。
     from ling.capabilities.channels import proactive_connector_status
 
-    _connector, _why_not = proactive_connector_status()
+    _connector, _why_not = proactive_connector_status(request.app)
     # 免打扰窗必须来自**已发布配置**，不能留给服务里的默认值：
     # 面板上改了 0-0（关闭）却仍然报「处于勿扰时段（23:00-08:00）」，
     # 用户会以为设置没保存。这里把生效值显式传下去。

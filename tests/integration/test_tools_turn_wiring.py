@@ -7,6 +7,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -347,7 +348,7 @@ async def test_group_worker_uses_published_switch(
 
     monkeypatch.setattr(router, "stream", stream)
     monkeypatch.setattr(
-        worker, "_group_reply_connector", lambda channel: connector if channel == "onebot" else None
+        worker, "_group_reply_connector", AsyncMock(side_effect=lambda channel, window_ref: connector if channel == "onebot" else None)
     )
     window_id = await attention._group_window(logged_in)
     text = "现在几点了？"
