@@ -231,30 +231,66 @@ class DeliveryService:
                 if existing is not None:
                     return existing
 
+        # 对账用：**内容摘要而不是正文**。没有平台 id 的投递只能靠"平台历史
+        # 里有没有同文消息"作证据，但把正文抄进 operations 等于给内容开第二份
+        # 副本；摘要能比对、不能还原。
+        #
+        # ## 正文为空时**不写这个键**（§17.5「禁止空 text_digest 匹配所有语音」）
+        #
+        # `delivery_text_digest` 对空串/纯空白恒定返回同一个常量
+        # （`sha256:e3b0c442…`，空输入的 sha256）。语音消息的 `text=""` 会让每条
+        # 语音 operation 都带上它，于是"摘要"不再是区分两个正文的证据，而是一张
+        # 万能通行证：`connectors/onebot/connector.py::_scan_history` 用
+        # `delivery_text_digest(parsed.text) != digest` 逐条比对，任何一条正文为空
+        # （或归一化后为空）的历史消息都会命中，`hits` 里就装进了别人的 message_id
+        # ——对账把"某条别人的空消息"认成"我这条语音送到了"。
+        #
+        # 这是**唯一**会静默错的方向：失败有声音，认错没有。所以正文为空时宁可不写。
+        # 缺键后 `reconcile()` 里 `payload.get("text_digest")` 是 `None`，
+        # `_scan_history` 走 `if not window_ref or not digest: return
+        # _HistoryScan(ok=False)`——"没有证据"，不是"否证"，那条 operation 保持
+        # `uncertain` 等更好的证据（平台 message_id / 回显 / 真实媒体证据）。
+        #
+        # ## 为什么是"缺键"而不是写 `None`
+        #
+        # 两种写法在**消费者**眼里等价（`.get()` 都得到 `None`，都走 `ok=False`），
+        # 但对**存量数据**不等价：修复前写下的语音 operation 里躺着那个常量，
+        # 写成 `None` 会让"空摘要"这个缺陷在库里有两种表示（常量 / `None`），
+        # 以后任何按 `"text_digest" in payload` 分流的代码都要同时认两种。缺键
+        # 则是存量旧行（本就没有这个键）与新语音行**同一种表示**，读侧不用分叉。
+        # 它也保住了"键存在 ⇒ 摘要确实是某一非空正文的摘要"这条不变式。
+        #
+        # 纯文本（正文非空）**逐字节不变**：仍是 `delivery_text_digest(text)`。
+        payload: dict = {
+            "channel": connector.connector_id,
+            "instance": connector.instance_id,
+            "window_ref": message.window_ref,
+            "chars": len(message.text),
+            "is_group": message.is_group,
+            # 记录**意图**：这条 operation 本应带几个媒体。
+            # 事后对账时才能区分"压根没想发媒体"和"想发但失败了"。
+            #
+            # `media_count` 必须按**类型化附件也算进去**来数：语音走的是
+            # `attachments`（`speech_delivery.build_message`），不进 legacy
+            # `media_refs`。只数 `media_refs` 的话，一条语音 operation 会记成
+            # `media_count=0`——"压根没想发媒体"——正好把语音那段丢掉的意图
+            # 反过来写在记录里。
+            "media_count": len(iter_outbound_attachments(message)),
+            "media_refs": list(message.media_refs),
+            # 分段信息：一条逻辑回复可能拆成多段，每段一个 operation。
+            # 事后能回答"这条回复发全了吗"。
+            "reply_plan": plan_id,
+            "part_ordinal": part_ordinal,
+        }
+        digest = delivery_text_digest(message.text)
+        if digest != delivery_text_digest(""):
+            payload["text_digest"] = digest
+        payload.update(dict(payload_extra or {}))
         operation = await self.create_operation(
             kind="delivery",
             actor_id=actor_id,
             subject_id=subject_id,
-            payload={
-                "channel": connector.connector_id,
-                "instance": connector.instance_id,
-                "window_ref": message.window_ref,
-                "chars": len(message.text),
-                "is_group": message.is_group,
-                # 记录**意图**：这条 operation 本应带几个媒体。
-                # 事后对账时才能区分"压根没想发媒体"和"想发但失败了"。
-                "media_count": len(message.media_refs),
-                "media_refs": list(message.media_refs),
-                # 分段信息：一条逻辑回复可能拆成多段，每段一个 operation。
-                # 事后能回答"这条回复发全了吗"。
-                "reply_plan": plan_id,
-                "part_ordinal": part_ordinal,
-                # 对账用：**内容摘要而不是正文**。没有平台 id 的投递只能靠
-                # "平台历史里有没有同文消息"作证据，但把正文抄进 operations
-                # 等于给内容开第二份副本；摘要能比对、不能还原。
-                "text_digest": delivery_text_digest(message.text),
-                **dict(payload_extra or {}),
-            },
+            payload=payload,
         )
         operation.state = OperationState.running.value
         await self._session.flush()

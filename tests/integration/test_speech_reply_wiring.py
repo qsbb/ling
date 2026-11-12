@@ -395,13 +395,21 @@ async def test_library_shows_speech_tag_and_text(
 ) -> None:
     """「默认只发语音但后台显示语音标签 + 文字」——库里两个面都落了账。
 
-    operation 的 `speech.digest` 是后台显示"语音"标签的依据，`text_digest` 是
-    正文的摘要（对账用）。少了任何一个，后台就只能显示一条空消息或一个播放器。
+    operation 的 `speech.digest` 是后台显示"语音"标签的依据。语音 operation
+    **刻意没有** `text_digest`（正文为空，见
+    `test_正文在Message里_外发正文为空_不落payload` —— 空的摘要是用来匹配
+    所有语音的万能通行证，§17.5 明令禁止），正文那一半由 `Message.text` 守。
 
-    **这条的判据当初写反了一半。** 它原来还断言「正文在 operation 的摘要里」，
-    暗示正文该跟着语音一起走；但 §17.5 说的是**摘要**（不能还原），而完整正文
-    在 `Message.text` 里。所以现在：operation 侧只守摘要（能比对、不能还原），
-    正文那一半改由 `test_后台仍能看到正文_而外发正文为空` 守。
+    **这条的判据改过两次，两次都是判据错、不是实现变。**
+
+    1. 它原来断言「正文在 operation 的摘要里」，暗示正文该跟着语音一起走；
+       但 §17.5 说的是**摘要**（不能还原），完整正文在 `Message.text` 里。
+    2. 于是改成"摘要必须是**非空**的"——而 `text=""` 时
+       `delivery_text_digest` 恒为 `sha256:e3b0c442…`（空输入的 sha256），
+       这个"非空"只是字符串非空，它**不区分任何两条消息**。那条断言等于
+       把「空摘要匹配所有语音」这个缺陷断言成了正确行为。
+
+    现在 operation 侧只守语音标签，并在**负向**断言里钉住空摘要不出现。
     """
     _bind_tts(monkeypatch, FakeTts())
     _give_voice(monkeypatch)
@@ -421,7 +429,14 @@ async def test_library_shows_speech_tag_and_text(
     payload = dict(rows[0].payload or {})
     assert "speech" in payload, f"operation 里没有语音信息（后台无法显示语音标签）：{payload}"
     assert payload["speech"]["digest"], payload
-    assert payload.get("text_digest"), "正文摘要缺失：后台/对账拿不到她说了什么"
+    # 正向配对：这条 operation 确实是那条语音的（否则"没有摘要"在"根本没建
+    # operation"时也成立）。
+    assert payload["media_count"] == 1, f"语音没被记成媒体意图：{payload}"
+    # 空正文不落摘要：那个常量对任何两条语音都相同，会把别人的消息认成自己的。
+    assert payload.get("text_digest") is None, (
+        f"语音 operation 落了正文摘要（空正文摘要会匹配所有语音）："
+        f"{payload.get('text_digest')!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -984,16 +999,20 @@ async def test_正文在Message里_外发正文为空_不落payload(
     assert len(rows) == 1, f"期望一条投递 operation，实际 {len(rows)}"
     payload = dict(rows[0].payload or {})
     assert "text" not in payload, f"正文被写进了 operations.payload：{payload['text']!r}"
-    # 摘要只允许是**空正文**的摘要。`DeliveryService` 对每条消息都算
-    # `delivery_text_digest(message.text)`，而 `text=""` 时它恒等于常量
-    # `sha256:e3b0c44298…`——所以这里能断言的只有"没有落**非空**摘要"。
+    # 空正文**不落摘要**（§17.5：「语音对账使用平台 message_id 或真实媒体证据，
+    # 禁止空 text_digest 匹配所有语音」）。
     #
-    # 已知缺陷（本轮**未修**，见报告）：那个常量摘要违反 §17.5「禁止空
-    # text_digest 匹配所有语音」——任何两条省略正文的消息摘要相同，对账时
-    # 无法用摘要区分它们。修它要改 `delivery.py` 里的摘要写入条件，超出本轮
-    # 只修两处方向的范围。
-    assert payload.get("text_digest") in (None, EMPTY_TEXT_DIGEST), (
-        f"正文摘要落了 operations.payload：{payload.get('text_digest')}"
+    # 这条断言原来写的是 `in (None, EMPTY_TEXT_DIGEST)`，并把空摘要标成"本轮未修的
+    # 已知缺陷"——也就是说，它当时**把缺陷同时当成了允许值和豁免理由**。而
+    # `connectors/onebot/connector.py::_scan_history` 用摘要逐条比对历史，空摘要
+    # 会命中任何一条正文为空的消息，把别人的 message_id 认成自己的。
+    #
+    # 现在 `EMPTY_TEXT_DIGEST` 只作为**反例常量**留着：它出现在 payload 里就是缺陷。
+    assert payload.get("text_digest") is None, (
+        f"空正文落了摘要（它匹配所有语音）：{payload.get('text_digest')!r}"
+    )
+    assert "text_digest" not in payload, (
+        f"空正文时连键都不该出现（存量旧行与新语音行同一种表示）：{payload.get('text_digest')!r}"
     )
     # 正向配对：这条 operation 确实是那条语音的。否则"没落正文"在"根本没建
     # operation"时也成立。
