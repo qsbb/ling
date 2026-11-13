@@ -34,7 +34,7 @@
  * instance_id 存配置"时才被补建）。这时画的是"新建第一个实例"的引导，
  * 不是"加载失败"，也不是一片空白。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
@@ -394,6 +394,8 @@ export interface ConnectorInstancePanelProps {
    * 不传时退回面板自算（保留单独使用面板的场合）。
    */
   dirtyInstanceIds?: ReadonlySet<string>;
+  /** 当前实例的字段与保存动作，放在详情栏中。 */
+  children?: ReactNode;
 }
 
 /**
@@ -435,6 +437,7 @@ export function ConnectorInstancePanel({
   onSelectInstance,
   onInstanceView,
   dirtyInstanceIds,
+  children,
 }: ConnectorInstancePanelProps) {
   const [list, setList] = useState<ListState>({ status: 'loading' });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -775,8 +778,7 @@ export function ConnectorInstancePanel({
             <div className="connector-instances__empty" data-testid={`connector-instance-panel-${scope}-empty`}>
               <strong>还没有任何实例</strong>
               <span>
-                这是全新部署时的正常状态（默认实例只在第一次保存配置时才由服务端补建）。
-                在下面建第一个——建好之后，右边的配置就属于它。
+                新建一个实例，填写这个账号的连接配置。
               </span>
             </div>
           ) : null}
@@ -824,10 +826,21 @@ export function ConnectorInstancePanel({
             <p className="panel__note" data-testid={`connector-instance-panel-${scope}-nothing-selected`}>
               {hasLoadedList && items.length === 0
                 ? '左侧建好第一个实例后，这里会显示它的配置。'
-                : '在左侧选一个实例，这里显示它的配置。'}
+                : selectedId === null
+                  ? '当前显示默认实例配置。实例列表读取成功后可切换其他账号。'
+                  : '正在读取所选实例的配置…'}
             </p>
           ) : (
             <>
+              <div className="connector-instances__identity">
+                <span className="connector-instances__avatar" aria-hidden="true">
+                  {selected?.display_name.slice(0, 1).toUpperCase()}
+                </span>
+                <div>
+                  <h3>{selected?.display_name}</h3>
+                  <p>{connector.label} · {selected ? instanceStatusLabel(selected) : ''}</p>
+                </div>
+              </div>
               {/*
                * **绝不在这里再放一个 `ConnectorCard`。**
                *
@@ -837,8 +850,8 @@ export function ConnectorInstancePanel({
                * 列表与表单成倍增长。这个 bug 不会报错、`tsc` 也看不见（参数
                * 类型完全合法），只有真的在浏览器里数元素才会发现。
                *
-               * 所以右侧详情**只放实例级的动作**（改名/启停/删除/通知），
-               * 字段表单留在卡片自己的位置上。
+               * 右侧详情放实例级动作，字段表单由调用方作为 children 传入。
+               * 实例面板本身不递归创建卡片。
                */}
               <div
                 className="connector-instances__toolbar"
@@ -995,6 +1008,7 @@ export function ConnectorInstancePanel({
 
             </>
           )}
+          {list.status === 'ready' && items.length === 0 ? null : children}
         </div>
       </div>
     </div>

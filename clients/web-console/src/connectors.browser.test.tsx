@@ -494,6 +494,29 @@ describe('接入器：恢复默认要二次确认', () => {
   }, TIMEOUT);
 });
 
+describe('接入器：实例与配置同屏', () => {
+  it('字段和保存按钮位于右侧详情栏，窄屏详情排在实例列表之后', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page } = await openConnectors({ width: 1440, height: 1000 });
+    const panel = page.getByTestId('connector-instance-panel-onebot');
+    const detail = page.getByTestId('connector-instance-panel-onebot-detail');
+    expect(await detail.getByTestId('connector-input-LING_ONEBOT_API_BASE').count()).toBe(1);
+    expect(await detail.getByTestId('connector-onebot-save').count()).toBe(1);
+    const rail = panel.locator('.connector-instances__rail');
+    const railBox = await rail.boundingBox();
+    const detailBox = await detail.boundingBox();
+    expect(railBox).not.toBeNull();
+    expect(detailBox).not.toBeNull();
+    expect(detailBox!.x).toBeGreaterThanOrEqual(railBox!.x + railBox!.width);
+    await page.screenshot({ path: '/tmp/ling-connectors-redesign-wide.png', fullPage: true });
+    await page.setViewportSize({ width: 375, height: 900 });
+    const mobileRail = await rail.boundingBox();
+    const mobileDetail = await detail.boundingBox();
+    expect(mobileDetail!.y).toBeGreaterThanOrEqual(mobileRail!.y + mobileRail!.height);
+    await page.screenshot({ path: '/tmp/ling-connectors-redesign-mobile.png', fullPage: true });
+  }, TIMEOUT);
+});
+
 describe('接入器：窄屏表单可用', () => {
   it('375：不横向溢出，输入框与保存按钮都 ≥44px', async (ctx) => {
     if (skip(ctx)) return;

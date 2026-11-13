@@ -728,10 +728,10 @@ export function FieldRow({
       data-invalid={invalid ? 'true' : undefined}
     >
       <label className="connector-field__name" htmlFor={cleared ? undefined : id} title={key}>
-        {key}
+        {field.label}
       </label>
       <span className="connector-field__label">
-        <span>{field.label}</span>
+        <span className="connector-field__key">{key}</span>
         {field.kind === 'secret' && field.preview ? (
           <span className="connector-field__preview" data-testid={`connector-preview-${key}`}>
             当前值 {field.preview}
@@ -974,12 +974,10 @@ export function ConnectorCard({
         onSelectInstance={onSelectInstance}
         onInstanceView={onInstanceView}
         dirtyInstanceIds={dirtyInstanceIds}
-      />
-
-      <h3 className="connector-card__subtitle">配置项</h3>
+      >
+      <h3 className="connector-card__subtitle">接入设置</h3>
       <p className="connector-card__note">
-        存在服务端的数据库覆盖层里，保存后立刻按新配置重建连接。密钥只报"设了没有"，
-        网页上不存在回显——密码框留空表示不修改。
+        保存后立即尝试连接。密码框留空表示保留已保存的密钥。
       </p>
 
       <form
@@ -1084,6 +1082,7 @@ export function ConnectorCard({
         <strong>怎么改：</strong>
         {renderInlineCode(connector.guidance)}
       </p>
+      </ConnectorInstancePanel>
     </section>
   );
 }
@@ -1643,8 +1642,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
       <h1 className="page__title">接入器</h1>
       <p className="page__hint">
-        她从哪条线收发消息：OneBot（NapCat 等）与 QQ 官方机器人。配置存在服务端的数据库
-        覆盖层里，<strong>保存后立刻尝试生效</strong>；密钥永远不回显，密码框留空表示不修改。
+        管理各平台账号与连接方式。选中实例后修改配置，<strong>保存后立刻尝试生效</strong>。
       </p>
 
       <div className="connectors-page__actions">
