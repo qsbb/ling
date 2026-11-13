@@ -36,6 +36,7 @@ jobs:
           --health-retries 10
     env:
       LING_TEST_DATABASE_URL: postgresql+asyncpg://ling:ling@127.0.0.1:55432/ling_test
+      LING_DATABASE_URL: postgresql+asyncpg://ling:ling@127.0.0.1:55432/ling_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,8 +46,12 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: 安装
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
           python -m pip install -U pip build
-          pip install -e ".[dev]"
+          pip install -e ".[dev,speech-codecs]"
+          ffmpeg -version
+          python -c "import pysilk"
       - name: 静态检查
         run: |
           # 用 `ruff check .` 而不是列目录：原来列的是 `src tests connectors deploy/update`，
@@ -115,6 +120,11 @@ jobs:
           print("postgres 55432 可连")
           PY
           pytest tests/integration/test_migrations.py -q
+      - name: 登录与事件循环测试
+        # 计时断言单独运行，避免并行进程争用 CPU 干扰事件循环测量。
+        run: pytest tests/integration/test_login_hardening.py -q
+        env:
+          LING_TEST_MODE: "1"
       - name: 测试
         # `-n auto` 用满 runner 的核：3126 个用例串行要 35 分钟，4 核并行约
         # 5 分钟。集成用例每个模块用自己的 schema（`t_<uuid>`），本来就互不
@@ -122,7 +132,7 @@ jobs:
         #
         # 不用 `-n logical`：那个按超线程数开，对 I/O 密集的用例收益不大，
         # 反而更容易把 PostgreSQL 连接数顶上去。
-        run: pytest tests -q -n auto
+        run: pytest tests -q -n auto --ignore=tests/integration/test_login_hardening.py
         env:
           LING_TEST_MODE: "1"
 
