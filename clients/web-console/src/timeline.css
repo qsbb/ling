@@ -126,6 +126,39 @@
   overflow-wrap: anywhere;
 }
 
+.tl-reason,
+.tl-last-model {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-unplanned {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tl-unplanned h4,
+.tl-unplanned p,
+.tl-unplanned ul {
+  margin: 0 0 6px;
+}
+
+.tl-unplanned h4 {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.tl-unplanned ul {
+  padding-left: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
 .tl-times {
   display: flex;
   flex-wrap: wrap;

@@ -20,6 +20,7 @@ from ling.api.routes.life_timeline import (
     intent_teaser_items,
     is_confirmed_anchor,
     project_segments,
+    reason_explanation,
     resolve_dual_window,
     select_today_outline,
     state_note,
@@ -114,6 +115,96 @@ def _plan(
         last_error_code=error,
         updated_at=updated_at or datetime(2026, 11, 7, 13, 5, tzinfo=UTC),
     )
+
+
+def test_reason_explanations_use_actual_state_and_known_codes() -> None:
+    assert reason_explanation(TimelineState.failed, "model_timeout") == "生成日程时模型请求超时。"
+    assert reason_explanation(TimelineState.degraded, "outline_invalid") == "模型生成的日程未通过校验。"
+    assert reason_explanation(TimelineState.degraded, "unknown_code") == "具体原因暂不明确。"
+    assert reason_explanation(TimelineState.failed, None) == "具体原因暂不明确。"
+    assert reason_explanation(TimelineState.ready, "needs_review") == "部分安排存在冲突，需要检查。"
+    assert reason_explanation(TimelineState.ready, "model_timeout") is None
+    assert state_note(TimelineState.degraded) == "这一天的安排来自规则兜底"
+    assert reason_explanation(TimelineState.degraded, "budget_exhausted") == "该计划日的日程生成预算已用完。"
+
+
+def test_unplanned_periods_merge_parent_child_and_hide_private_times() -> None:
+    parent = _segment("parent", _shanghai(DAY, 8), _shanghai(DAY, 12), is_leaf=False)
+    child = _segment("child", _shanghai(DAY, 9), _shanghai(DAY, 10), parent_id="parent")
+    private = _segment(
+        "private", _shanghai(DAY, 14), _shanghai(DAY, 15), visibility="actor_private"
+    )
+    old = _segment("old", _shanghai(DAY, 17), _shanghai(DAY, 18), status="superseded")
+
+    def build(is_owner: bool):  # noqa: ANN202
+        return build_timeline(TimelineInputs(
+            display_day=DAY,
+            display_timezone=TZ,
+            display_timezone_source="preference",
+            actor_timezone=TZ,
+            actor_timezone_source="preference",
+            is_owner=is_owner,
+            plan=_plan(),
+            segment_rows=tuple((row, DAY) for row in (parent, child, private, old)),
+        ))
+
+    owner = build(True)
+    assert owner.unplanned is not None
+    assert [(period.start_at, period.end_at) for period in owner.unplanned.periods] == [
+        (_shanghai(DAY, 0), _shanghai(DAY, 8)),
+        (_shanghai(DAY, 12), _shanghai(DAY, 14)),
+        (_shanghai(DAY, 15), _shanghai(DAY + timedelta(days=1), 0)),
+    ]
+    assert build(False).unplanned is None
+
+
+def test_unplanned_is_unknown_without_a_committed_plan() -> None:
+    def build(plan: DayPlanRow | None):  # noqa: ANN202
+        return build_timeline(TimelineInputs(
+            display_day=DAY,
+            display_timezone=TZ,
+            display_timezone_source="preference",
+            actor_timezone=TZ,
+            actor_timezone_source="preference",
+            is_owner=True,
+            plan=plan,
+        ))
+
+    assert build(None).unplanned is None
+    assert build(_plan(state="pending", revision=0, error="model_timeout")).unplanned is None
+    assert build(_plan(state="pending", revision=0)).unplanned is None
+    assert build(_plan(state="ready", revision=0)).unplanned is None
+    assert build(_plan(state="degraded", revision=1)).unplanned is not None
+
+
+def test_unplanned_uses_real_instants_across_daylight_saving_fallback() -> None:
+    day = date(2026, 11, 1)
+    zone = "America/New_York"
+    window = resolve_dual_window(day, zone, zone)
+    assert window.display_end_at - window.display_start_at == timedelta(hours=25)
+    plan = _plan(plan_day=day, timezone=zone)
+    plan.window_start_at = window.plan_start_at
+    plan.window_end_at = window.plan_end_at
+    gap_start = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+    gap_end = datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    rows = (
+        (_segment("first", window.display_start_at, gap_start), day),
+        (_segment("second", gap_end, window.display_end_at), day),
+    )
+    result = build_timeline(TimelineInputs(
+        display_day=day,
+        display_timezone=zone,
+        display_timezone_source="preference",
+        actor_timezone=zone,
+        actor_timezone_source="preference",
+        is_owner=True,
+        plan=plan,
+        segment_rows=rows,
+    ))
+    assert result.unplanned is not None
+    assert [(period.start_at, period.end_at) for period in result.unplanned.periods] == [
+        (gap_start, gap_end)
+    ]
 
 
 # ---------------------------------------------------------------- 裁剪

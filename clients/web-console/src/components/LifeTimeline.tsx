@@ -91,6 +91,49 @@ export function formatDayTimeInZone(
     .replace(/\//g, '-');
 }
 
+/** 带年份的时间，用于可能跨年的历史生成记录。 */
+export function formatFullDayTimeInZone(
+  value: string | null | undefined,
+  timeZone: string,
+): string {
+  const date = toDate(value);
+  if (!date) return '';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: safeTimeZone(timeZone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  })
+    .format(date)
+    .replace(/\//g, '-');
+}
+
+/** 跨夏令时变化时补充两端的 UTC 偏移，避免相同时钟读数造成歧义。 */
+function formatUnplannedRange(start: string, end: string, timeZone: string): string {
+  const from = formatDayTimeInZone(start, timeZone);
+  const to = formatDayTimeInZone(end, timeZone);
+  const startDate = toDate(start);
+  const endDate = toDate(end);
+  if (!startDate || !endDate) return `${from || '—'}–${to || '—'}`;
+
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: safeTimeZone(timeZone),
+    hour: '2-digit',
+    timeZoneName: 'shortOffset',
+  });
+  const offsetAt = (date: Date) =>
+    formatter.formatToParts(date).find((part) => part.type === 'timeZoneName')?.value;
+  const startOffset = offsetAt(startDate);
+  const endOffset = offsetAt(endDate);
+  if (startOffset && endOffset && startOffset !== endOffset) {
+    return `${from} (${startOffset})–${to} (${endOffset})`;
+  }
+  return `${from}–${to}`;
+}
+
 export function formatRangeInZone(
   start: string | null | undefined,
   end: string | null | undefined,
@@ -595,6 +638,13 @@ export function TimelineHeader({
   const code = reasonCode(timeline);
   const gap = timezoneGapNote(timeline);
   const hidden = hiddenSummary(timeline);
+  const explanation = timeline.reason_explanation ?? (
+    timeline.state === 'degraded' || timeline.state === 'failed' ? '具体原因暂不明确。' : null
+  );
+  const lastModelOutline = formatFullDayTimeInZone(
+    timeline.last_model_outline_at,
+    timeline.display_timezone,
+  );
   return (
     <header className="tl-head">
       <div className="tl-heading">
@@ -621,6 +671,12 @@ export function TimelineHeader({
             <RefreshIcon /> 重试
           </button>
         ) : null}
+      </p>
+      {explanation ? (
+        <p className="tl-reason" data-testid="tl-reason">{explanation}</p>
+      ) : null}
+      <p className="tl-last-model" data-testid="tl-last-model">
+        最近一次模型生成成功：{lastModelOutline || '未知'}
       </p>
       <details className="tl-diagnostics" data-testid="tl-diagnostics">
         <summary>生成详情与时区</summary>
@@ -655,16 +711,15 @@ export function TimelineHeader({
           <dl className="tl-times">
             <div className="tl-times__row">
               <dt>生成到期</dt>
-              {/* 到期时刻与实际提交时刻**分开**：一个说"该什么时候生成"，
-                  一个说"什么时候真的生成了"。合成一句"更新于"就会两头都不准。 */}
+              {/* 到期时间与计划最后修改时间分别展示。 */}
               <dd data-testid="tl-due-at">{formatDayTimeInZone(timeline.outline_due_at, timeline.display_timezone)}</dd>
             </div>
             <div className="tl-times__row">
-              <dt>实际提交</dt>
+              <dt>计划最近变更</dt>
               <dd data-testid="tl-generated-at">
                 {timeline.generated_at
                   ? formatDayTimeInZone(timeline.generated_at, timeline.display_timezone)
-                  : '还没有提交过'}
+                  : '未知'}
               </dd>
             </div>
             <div className="tl-times__row">
@@ -687,6 +742,38 @@ export function TimelineHeader({
         </p>
       ) : null}
     </header>
+  );
+}
+
+function UnplannedPeriods({ timeline }: { timeline: LifeTimelineOut }) {
+  const unplanned = timeline.unplanned;
+  if (!unplanned) {
+    return (
+      <section className="tl-unplanned" data-testid="tl-unplanned">
+        <h4>未安排的时段</h4>
+        <p>未知，当前信息不足以判断。</p>
+      </section>
+    );
+  }
+  const timeZone = timeline.display_timezone;
+  return (
+    <section className="tl-unplanned" data-testid="tl-unplanned">
+      <h4>未安排的时段</h4>
+      <p>
+        计划范围 {formatUnplannedRange(unplanned.scope_start_at, unplanned.scope_end_at, timeZone)}
+      </p>
+      {unplanned.periods.length ? (
+        <ul>
+          {unplanned.periods.map((period) => (
+            <li key={`${period.start_at}-${period.end_at}`}>
+              {formatUnplannedRange(period.start_at, period.end_at, timeZone)}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p>这个范围内已有计划覆盖全部时段。</p>
+      )}
+    </section>
   );
 }
 
@@ -878,6 +965,7 @@ export function LifeTimeline({ timeline, now, defaultCollapsed, onRetry }: LifeT
                   defaultCollapsed={defaultCollapsed ?? []}
                 />
               )}
+              <UnplannedPeriods timeline={timeline} />
             </div>
             <TimelineFactsLane
               facts={timeline.facts}

@@ -3002,22 +3002,27 @@ async def _commit_revision(
                 for item in kept
             )
         ]
+        values = {
+            "revision": new_revision,
+            "state": state,
+            "generation_source": source,
+            "last_error_code": error_code,
+            "timezone": timezone,
+            "timezone_source": timezone_source,
+            "timezone_revision": timezone_revision,
+            "routine_revision": routine.revision,
+            "window_start_at": row.window_start_at,
+            "window_end_at": row.window_end_at,
+            "updated_at": now,
+        }
+        if state == "ready" and source == "model":
+            # 随版本 CAS 一起写入，降级、并发失败和事务回滚都不能冒充成功。
+            # `now` 是排程快照时间，模型调用可能耗时，提交时间需重新读取时钟。
+            values["last_model_outline_at"] = utcnow()
         result = await session.execute(
             update(DayPlanRow)
             .where(DayPlanRow.id == row.id, DayPlanRow.revision == expected)
-            .values(
-                revision=new_revision,
-                state=state,
-                generation_source=source,
-                last_error_code=error_code,
-                timezone=timezone,
-                timezone_source=timezone_source,
-                timezone_revision=timezone_revision,
-                routine_revision=routine.revision,
-                window_start_at=row.window_start_at,
-                window_end_at=row.window_end_at,
-                updated_at=now,
-            )
+            .values(**values)
         )
         if int(getattr(result, "rowcount", 0) or 0) != 1:
             raise StaleRevisionError(expected)

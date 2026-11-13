@@ -996,12 +996,27 @@ class DreamCard(StrictModel):
     restricted: bool = False
 
 
+class LifeTimelineUnplannedPeriod(StrictModel):
+    """计划窗口中没有当前计划段覆盖的半开区间。"""
+
+    start_at: datetime
+    end_at: datetime
+
+
+class LifeTimelineUnplanned(StrictModel):
+    """仅描述当前受众可可靠判断的计划窗口。"""
+
+    scope_start_at: datetime
+    scope_end_at: datetime
+    periods: list[LifeTimelineUnplannedPeriod] = Field(default_factory=list)
+
+
 class LifeTimelineOut(StrictModel):
     """`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。
 
-    ``generated_at`` 是**当前版本提交时刻**（`day_plans.updated_at`）；
-    ``outline_due_at`` 是生成到期时刻（D−1 角色本地 21:00）。两者分开：
-    "应当什么时候生成"和"实际上什么时候生成"不是同一件事。
+    ``generated_at`` 沿用旧字段，实际是计划行最后修改时间；失败标记等操作也会
+    修改它。``last_model_outline_at`` 是真实提交过的最近模型大纲时间，旧记录
+    无从确认时为 null。``outline_due_at`` 是生成到期时刻。
     """
 
     schema_version: Literal["v1"] = SCHEMA_VERSION
@@ -1012,6 +1027,9 @@ class LifeTimelineOut(StrictModel):
     revision: int = Field(default=0, ge=0, description="计划版本号；0 = 没有计划行")
     last_error_code: str | None = Field(
         default=None, description="最近一次失败/降级/待复核的原因码（不含正文）"
+    )
+    reason_explanation: str | None = Field(
+        default=None, description="当前失败、降级或待复核原因的自然语言说明"
     )
     display_date: date
     display_timezone: str
@@ -1026,7 +1044,13 @@ class LifeTimelineOut(StrictModel):
     outline_due_at: datetime
     timezone_source: str = Field(description="计划行记录的时区来源；无行时取角色侧解析结果")
     generated_at: datetime | None = None
+    last_model_outline_at: datetime | None = Field(
+        default=None, description="本角色最近一次成功提交模型大纲的时间；无法确认时为 null"
+    )
     segments: list[LifeTimelineSegment] = Field(default_factory=list)
+    unplanned: LifeTimelineUnplanned | None = Field(
+        default=None, description="可判断的未安排时段；计划不可用或受众无法核实时为 null"
+    )
     facts: list[LifeTimelineFact] = Field(default_factory=list)
     intents: list[DayIntentSummary] = Field(default_factory=list)
     horizon_unplanned: bool = Field(
@@ -1854,6 +1878,8 @@ __all__ = [
     "LifeTimelineFact",
     "LifeTimelineOut",
     "LifeTimelineSegment",
+    "LifeTimelineUnplanned",
+    "LifeTimelineUnplannedPeriod",
     "MemoryProposal",
     "Modality",
     "ModelRole",

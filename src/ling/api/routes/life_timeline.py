@@ -55,7 +55,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
@@ -68,6 +68,8 @@ from ling.contracts.v1 import (
     LifeTimelineFact,
     LifeTimelineOut,
     LifeTimelineSegment,
+    LifeTimelineUnplanned,
+    LifeTimelineUnplannedPeriod,
     OutlineRelation,
     TimelineState,
     TodayOutlineItem,
@@ -117,10 +119,24 @@ PRIVATE_VISIBILITY = "actor_private"
 # 给人看的状态说明（纯文本，前端直接进 JSX）。
 NOTE_EMPTY = "这一天还没有安排"
 NOTE_PENDING = "这一天的安排还没生成"
-NOTE_DEGRADED = "这一天的安排来自规则兜底（模型不可用或输出被拒收）"
+NOTE_DEGRADED = "这一天的安排来自规则兜底"
 NOTE_FAILED = "这一天的安排生成失败"
 NOTE_UNAVAILABLE = "暂时无法读取时间轴"
 NOTE_DREAM_RESTRICTED = "梦是角色私有内容，你看不到正文"
+
+REASON_EXPLANATIONS = {
+    "model_unavailable": "生成时没有可用的模型。",
+    "model_timeout": "生成日程时模型请求超时。",
+    "model_error": "生成日程时模型调用发生错误。",
+    "outline_invalid": "模型生成的日程未通过校验。",
+    "budget_exhausted": "该计划日的日程生成预算已用完。",
+    "degraded_late": "计划日已经开始，系统只补排了确定的安排。",
+    "needs_review": "部分安排存在冲突，需要检查。",
+    "sleep_boundary_conflict": "跨日睡眠时段存在冲突，需要检查。",
+    "stale_revision": "另一次修改先完成了，这次生成未提交。",
+    "lease_busy": "已有日程生成任务正在进行。",
+}
+REVIEW_REASONS = frozenset({"needs_review", "sleep_boundary_conflict"})
 
 
 # ---------------------------------------------------------------- 纯函数
@@ -502,6 +518,19 @@ async def _load_plan(
     ).scalar_one_or_none()
 
 
+async def _load_last_model_outline_at(
+    session: AsyncSession, *, actor_id: str
+) -> datetime | None:
+    """取本角色有事务提交证据的最新模型大纲时间。"""
+    return (
+        await session.execute(
+            select(func.max(DayPlanRow.last_model_outline_at)).where(
+                DayPlanRow.actor_id == actor_id
+            )
+        )
+    ).scalar_one_or_none()
+
+
 async def _load_segment_rows(
     session: AsyncSession, *, actor_id: str, window_start: datetime, window_end: datetime
 ) -> list[tuple[ScheduleSegmentRow, date]]:
@@ -676,6 +705,7 @@ class TimelineInputs:
     actor_timezone_source: str
     is_owner: bool = False
     plan: DayPlanRow | None = None
+    last_model_outline_at: datetime | None = None
     segment_rows: tuple[tuple[ScheduleSegmentRow, date], ...] = ()
     facts: tuple[LifeTimelineFact, ...] = ()
     hidden_fact_count: int = 0
@@ -700,6 +730,59 @@ def state_note(state: TimelineState, *, dream: DreamCard | None = None) -> str |
     if dream is not None and dream.restricted:
         return NOTE_DREAM_RESTRICTED
     return None
+
+
+def reason_explanation(state: TimelineState, code: str | None) -> str | None:
+    """将计划行记录的原因翻译为可展示的说明。"""
+    reason = str(code or "").strip()
+    if state not in (TimelineState.degraded, TimelineState.failed) and not (
+        state is TimelineState.ready and reason in REVIEW_REASONS
+    ):
+        return None
+    return REASON_EXPLANATIONS.get(reason, "具体原因暂不明确。")
+
+
+def unplanned_periods(
+    inputs: TimelineInputs, *, window: DualWindow, state: TimelineState
+) -> LifeTimelineUnplanned | None:
+    """求实际计划窗口内未被当前计划段覆盖的区间。
+
+    未生成、读取失败或受众看不到私密段时返回未知。父段本身也是计划，不能只
+    依赖叶段；相邻和重叠段先合并，旧版 superseded 段不计入。
+    """
+    plan = inputs.plan
+    if (
+        plan is None
+        or state not in (TimelineState.ready, TimelineState.degraded)
+        or int(plan.revision or 0) <= 0
+    ):
+        return None
+    scope = clip_to_window(
+        plan.window_start_at, plan.window_end_at, window.display_start_at, window.display_end_at
+    )
+    if scope is None:
+        return None
+
+    occupied: list[tuple[datetime, datetime]] = []
+    for row, _plan_day in inputs.segment_rows:
+        if str(row.status) != "current":
+            continue
+        clipped = clip_to_window(row.start_at, row.end_at, *scope)
+        if clipped is None:
+            continue
+        if not visible_to(row.visibility, is_owner=inputs.is_owner):
+            return None
+        occupied.append(clipped)
+
+    periods: list[LifeTimelineUnplannedPeriod] = []
+    cursor = scope[0]
+    for start, end in sorted(occupied):
+        if start > cursor:
+            periods.append(LifeTimelineUnplannedPeriod(start_at=cursor, end_at=start))
+        cursor = max(cursor, end)
+    if cursor < scope[1]:
+        periods.append(LifeTimelineUnplannedPeriod(start_at=cursor, end_at=scope[1]))
+    return LifeTimelineUnplanned(scope_start_at=scope[0], scope_end_at=scope[1], periods=periods)
 
 
 def build_timeline(
@@ -731,7 +814,8 @@ def build_timeline(
         state=state,
         plan_state=str(plan.state) if plan is not None else None,
         revision=int(plan.revision or 0) if plan is not None else 0,
-        last_error_code=str(plan.last_error_code) if plan is not None else None,
+        last_error_code=str(plan.last_error_code) if plan is not None and plan.last_error_code else None,
+        reason_explanation=reason_explanation(state, plan.last_error_code if plan is not None else None),
         display_date=window.display_date,
         display_timezone=inputs.display_timezone,
         display_timezone_source=inputs.display_timezone_source,
@@ -747,7 +831,11 @@ def build_timeline(
         if plan is not None
         else inputs.actor_timezone_source,
         generated_at=_aware(plan.updated_at) if plan is not None and plan.updated_at else None,
+        last_model_outline_at=_aware(inputs.last_model_outline_at)
+        if inputs.last_model_outline_at is not None
+        else None,
         segments=list(projection.segments),
+        unplanned=unplanned_periods(inputs, window=window, state=state),
         facts=list(inputs.facts),
         intents=list(inputs.intents),
         horizon_unplanned=True,
@@ -848,6 +936,7 @@ async def get_life_timeline(
 
     try:
         plan = await _load_plan(session, actor_id=actor_id, plan_day=window.plan_day)
+        last_model_outline_at = await _load_last_model_outline_at(session, actor_id=actor_id)
         segment_rows = await _load_segment_rows(
             session,
             actor_id=actor_id,
@@ -899,6 +988,7 @@ async def get_life_timeline(
             actor_timezone_source=pair.actor_timezone_source,
             is_owner=is_owner,
             plan=plan,
+            last_model_outline_at=last_model_outline_at,
             segment_rows=tuple(segment_rows),
             facts=facts,
             hidden_fact_count=hidden_facts,

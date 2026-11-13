@@ -1439,6 +1439,8 @@ export interface LifeTimelineOut {
   revision: number;
   /** 最近一次失败/降级/待复核的**原因码**（如 `degraded_late`），不是文案。 */
   last_error_code: string | null;
+  /** 由服务端根据实际原因码生成；旧版本服务端可能未提供。 */
+  reason_explanation?: string | null;
   display_date: string;
   display_timezone: string;
   display_timezone_source: TimezoneSource;
@@ -1452,9 +1454,17 @@ export interface LifeTimelineOut {
   /** 生成到期时刻（D−1 角色本地 21:00），与 `generated_at` 不是一回事。 */
   outline_due_at: string;
   timezone_source: string;
-  /** 当前版本**实际提交**时刻；无计划行时为 null。 */
+  /** 计划行最后修改时间，失败标记等操作也可能修改它。 */
   generated_at: string | null;
+  /** 最近成功提交模型大纲的时间，缺失时未知。 */
+  last_model_outline_at?: string | null;
   segments: LifeTimelineSegment[];
+  /** 计划窗口内未被当前计划覆盖的区间；null 表示无法判断。 */
+  unplanned?: {
+    scope_start_at: string;
+    scope_end_at: string;
+    periods: Array<{ start_at: string; end_at: string }>;
+  } | null;
   facts: LifeTimelineFact[];
   intents: DayIntentSummary[];
   /** 未来日尚未生成大纲：`intents` 是展望，不是 D+1…D+7 的日计划。 */

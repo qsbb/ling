@@ -2278,6 +2278,10 @@ class DayPlanRow(Base, TimestampMixin):
     generation_source: Mapped[str] = mapped_column(String(16), default="rule")
     # 最近一次失败/降级的确定性原因码（不含正文、不含路径）
     last_error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # 最近一次模型大纲成功提交的时间；旧数据与只有规则兜底时为未知。
+    last_model_outline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class ScheduleIntentionRow(Base, TimestampMixin):
