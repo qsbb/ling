@@ -61,10 +61,12 @@ async def _recover_dangling_turns() -> None:
 
     from sqlalchemy import update
 
+    from ling.capabilities.voice_reply import recover_synthesis_jobs
     from ling.infra.models import Turn, utcnow
 
     cutoff = utcnow() - timedelta(minutes=DANGLING_TURN_MINUTES)
     async with session_scope() as session:
+        recovered_speech = await recover_synthesis_jobs(session, cutoff=cutoff)
         result = await session.execute(
             update(Turn)
             .where(
@@ -80,6 +82,8 @@ async def _recover_dangling_turns() -> None:
         affected = int(getattr(result, "rowcount", 0) or 0)
         if affected:
             logger.warning("重启恢复：%d 个中断轮次已标记为 failed", affected)
+        if recovered_speech:
+            logger.warning("重启恢复：%d 个中断语音作业已标记为 uncertain", recovered_speech)
 
 
 async def _bootstrap(settings: Settings) -> None:

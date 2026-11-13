@@ -80,6 +80,8 @@ async def test_config_advertises_capabilities_and_profile_requirements(
     assert capabilities["perception.vision"] == "chat"
     assert capabilities["memory.embed"] == "embed"
     assert capabilities["memory.rerank"] == "rerank"
+    assert capabilities["speech.tts"] == "tts"
+    assert capabilities["speech.asr"] == "asr"
 
     kinds = set(body["known_kinds"])
     assert {"cloudflare_embedding", "siliconflow_rerank"} <= kinds, kinds
@@ -103,6 +105,78 @@ async def test_memory_roles_are_offerable_and_dialogue_deep_is_not(
     )
     assert "dialogue.deep" in reserved
     assert "尚无实现" in reserved["dialogue.deep"]
+
+
+async def test_speech_roles_offer_only_matching_provider_candidates(
+    logged_in: TestEnv,
+) -> None:
+    """文件识别与合成均可绑定，各自的候选只包含对应协议的供应商。"""
+    kinds = {
+        "minimax_tts": "tts",
+        "fishaudio_tts": "tts",
+        "mimo_tts": "tts",
+        "siliconflow_asr": "asr",
+        "dashscope_asr": "asr",
+        "mimo_chat": "chat",
+    }
+    draft = await _draft(
+        logged_in,
+        {
+            "providers": [
+                {
+                    "provider_id": kind,
+                    "kind": kind,
+                    "base_url": "https://speech.example.test/v1",
+                    "enabled": True,
+                    "models": [{"model_id": "fixture-model"}],
+                }
+                for kind in kinds
+            ],
+            "profiles": [
+                {
+                    "profile": "speech.tts",
+                    "provider_id": "minimax_tts",
+                    "model_id": "fixture-model",
+                },
+                {
+                    "profile": "speech.asr",
+                    "provider_id": "siliconflow_asr",
+                    "model_id": "fixture-model",
+                },
+            ],
+        },
+    )
+    assert not _errors(draft), draft
+    await _publish(logged_in, draft["revision"])
+    response = await logged_in.client.get("/v1/settings/config")
+    assert response.status_code == 200, response.text
+    config = response.json()
+
+    assert {"speech.tts", "speech.asr"} <= set(config["known_profiles"])
+    assert not {"speech.tts", "speech.asr"}.intersection(config["reserved_profiles"])
+    assert "realtime.voice" in config["reserved_profiles"]
+    assert "realtime.voice" not in config["known_profiles"]
+    providers = {provider["provider_id"]: provider for provider in config["providers"]}
+    for kind, capability in kinds.items():
+        assert providers[kind]["capabilities"] == [capability]
+    assert providers["fake"]["capabilities"] == ["chat"]
+
+    requirements = {
+        "speech.tts": ("tts", {"minimax_tts", "fishaudio_tts", "mimo_tts"}),
+        "speech.asr": ("asr", {"siliconflow_asr", "dashscope_asr"}),
+    }
+    for profile, (capability, expected_kinds) in requirements.items():
+        assert config["profile_capabilities"][profile] == capability
+        candidates = {
+            provider["kind"]
+            for provider in config["providers"]
+            if capability in provider["capabilities"]
+        }
+        assert candidates == expected_kinds
+        assert expected_kinds <= set(config["known_kinds"])
+    bindings = {binding["profile"]: binding for binding in config["profiles"]}
+    assert bindings["speech.tts"]["provider_id"] == "minimax_tts"
+    assert bindings["speech.asr"]["provider_id"] == "siliconflow_asr"
 
 
 # ------------------------------------------------------------ 必填字段差异

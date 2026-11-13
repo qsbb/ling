@@ -596,21 +596,15 @@ async def test_decoration_retry_keeps_voice_segment_and_never_becomes_image(
 
 
 @pytest.mark.asyncio
-async def test_voice_only_message_is_sent_once_with_a_placeholder_text_segment(
+async def test_voice_only_message_is_sent_once_without_a_placeholder_text_segment(
     silk_file: Path,
 ) -> None:
     """没有装饰段时不该进入重试分支：只发一次。
 
-    ## 为什么纯语音经 ``send()`` 会带一个 ``{"text": ""}``
+    ## 纯语音不需要空文本占位
 
-    ``build_media_segments`` 在没有任何段时**必须**塞一个空 text 段：
-    一些实现收到空数组会直接报错，而空数组在参数校验上的表现各家不同。
-    这是既有行为（文本消息也走同一条路），本任务**不改**它。
-
-    要发出"payload 里只有 record"的纯语音条，用 ``send_voice()``——
-    它自己对参数负责、不塞空 text（见上面
-    `test_send_voice_posts_single_record_segment`）。
-    这里钉住的是：走 ``send()`` 时语音段被正确带上了，且只发一次。
+    普通空消息仍由 ``build_media_segments`` 补一个 text 占位，
+    但带 record 的纯语音消息必须只发 record 段。
     """
     recorder = _Recorder(_ok({"message_id": 1}))
     connector = _connector(recorder)
@@ -627,9 +621,7 @@ async def test_voice_only_message_is_sent_once_with_a_placeholder_text_segment(
 
     assert len(recorder.payloads) == 1
     types = [seg["type"] for seg in recorder.payloads[0]["message"]]
-    assert types == ["text", "record"]
-    # 那个 text 必须是**空**的：不许替她编一句话
-    assert recorder.payloads[0]["message"][0]["data"]["text"] == ""
+    assert types == ["record"]
 
 
 # ------------------------------------------------------------------ 日志/摘要不许泄漏 payload

@@ -266,6 +266,10 @@ class Message(Base):
         String(64), nullable=True, index=True
     )
     text: Mapped[str] = mapped_column(Text, default="")
+    output_modality: Mapped[str] = mapped_column(String(16), default="text", server_default="text")
+    audio_asset_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    speech_state: Mapped[str] = mapped_column(String(24), default="none", server_default="none")
+    speech_delivery_state: Mapped[str | None] = mapped_column(String(24), nullable=True)
     # 同一 turn 的第几次尝试：重试不删除旧文本，靠 attempt 区分"上一段未完成"
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     state: Mapped[str] = mapped_column(String(32), default="completed")
@@ -339,7 +343,9 @@ class Message(Base):
     recall_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class WindowContext(Base):
@@ -407,9 +413,7 @@ class PromptSnapshot(Base):
     turn_id: Mapped[str] = mapped_column(String(64))
     window_id: Mapped[str] = mapped_column(String(64))
     message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # payload 的**结构**版本（不是契约 v1）。结构变了就升它，老行照原样读，
     # 读侧按版本决定怎么渲染——不要把老快照读崩。
@@ -1630,6 +1634,23 @@ class CommitmentRow(Base, TimestampMixin):
     cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class SpeechSynthesisJob(Base):
+    """一次消息合成的持久意图与本地字符预算，不冒充厂商计费单位。"""
+
+    __tablename__ = "speech_synthesis_jobs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    message_id: Mapped[str] = mapped_column(String(64), unique=True)
+    provider_id: Mapped[str] = mapped_column(String(64), index=True)
+    model_id: Mapped[str] = mapped_column(String(200))
+    config_revision: Mapped[int] = mapped_column(Integer)
+    voice_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    text_hash: Mapped[str] = mapped_column(String(64))
+    input_characters: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(24))
+    usage_source: Mapped[str] = mapped_column(String(24), default="unknown")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ProactiveOpportunity(Base):
     """主动机会：有时效、需过勿扰/限额/可达性硬门。"""
 
@@ -1665,6 +1686,7 @@ class ProactiveOpportunity(Base):
     # `reason` 不能直接当消息发：那是内部推理（"问对方手机上聊天指什么项目"），
     # 发出去很怪。必须过一次生成，并把结果留在这里让人能先看到。
     draft_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_modality: Mapped[str] = mapped_column(String(16), default="text", server_default="text")
 
     # --- 阶段 4：因果来源与结构化原因 ---
     # 没有来源的机会不是"关心"，是随机打扰。

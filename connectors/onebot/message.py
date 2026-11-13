@@ -295,7 +295,10 @@ def build_outbound_segments(
     if segments:
         # @ 之后垫一个空格，否则在客户端里会跟正文黏在一起
         segments.append({"type": "text", "data": {"text": " "}})
-    segments.extend(build_media_segments(text, media_refs))
+    # Voice-only messages must stay a single record segment. The media helper
+    # intentionally inserts an empty text segment for an otherwise empty message.
+    if text or media_refs or not voice_segments:
+        segments.extend(build_media_segments(text, media_refs))
     for segment in voice_segments or []:
         # 只接受已经构造成 record 的段：任何别的类型到这里都是上游搞错了，
         # 静默放过就会变成"图片版的语音"。

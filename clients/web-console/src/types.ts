@@ -42,6 +42,9 @@ export interface ChatMessage {
   turn_id: string | null;
   role: 'user' | 'actor' | 'system';
   text: string;
+  output_modality?: 'text' | 'voice';
+  speech_state?: 'none' | 'pending' | 'synthesizing' | 'ready' | 'failed' | 'cancelled' | 'expired';
+  speech_delivery_state?: string | null;
   state: TurnState;
   created_at: string;
   sequence: number;

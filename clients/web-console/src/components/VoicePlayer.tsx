@@ -1,13 +1,7 @@
 /**
- * 语音消息的**播放控件 + 语音标签 + 文字**。
+ * 语音消息的播放控件。参与者默认看不到原始文字。
  *
- * ## 用户明确要求的一条
- *
- * > 「默认只发语音，后台显示**语音标签 + 文字**」
- *
- * 所以这个组件不是"一个播放器"：它必须让人一眼看出**这是一条语音**、并且
- * **看到这条语音说了什么**。只给播放器等于把内容藏起来；只给文字则失去了
- * "她其实是用说的"这个事实。
+ * 后台正文通过独立的 operator 视图显式读取，不依赖音频资产是否存在。
  *
  * ## 为什么单独一个端点，而不是给消息加字段
  *
@@ -52,7 +46,7 @@ export interface VoiceMessageView {
   size_bytes: number;
   duration_ms: number | null;
   sample_rate: number | null;
-  /** 正文原文。「语音标签 + 文字」里的文字就是它。 */
+  /** 普通参与者视图必须为空；后台正文单独读取。 */
   text: string;
   created_at: string;
   expires_at: string | null;
@@ -94,9 +88,9 @@ export type VoiceErrorKind = 'expired' | 'unsupported' | 'error';
 export function voiceErrorText(kind: VoiceErrorKind): string {
   switch (kind) {
     case 'expired':
-      return '这条语音已经过期了（音频保留 7 天）。文字还在上面。';
+      return '这条语音已经过期了（音频保留 7 天）。';
     case 'unsupported':
-      return '这个浏览器播不了这种音频格式。文字还在上面。';
+      return '这个浏览器暂不支持这种语音格式。';
     default:
       return '没播出来，点一下重试。';
   }
@@ -196,11 +190,6 @@ export function VoicePlayer({
         </span>
         <span className="voice-message__duration">{formatDuration(voice.duration_ms)}</span>
       </div>
-
-      {/* 「+ 文字」：正文原文。语音不是不可读的附件。 */}
-      <p className="voice-message__text" data-testid="voice-text">
-        {voice.text}
-      </p>
 
       <div className="voice-message__actions">
         <audio

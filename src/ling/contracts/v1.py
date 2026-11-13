@@ -653,6 +653,12 @@ class ChatMessage(StrictModel):
     turn_id: IdStr | None = None
     role: Literal["user", "actor", "system"]
     text: str
+    output_modality: Literal["text", "voice"] = "text"
+    audio_asset_id: str | None = None
+    speech_state: Literal[
+        "none", "pending", "synthesizing", "ready", "failed", "cancelled", "expired",
+    ] = "none"
+    speech_delivery_state: str | None = None
     state: TurnState = TurnState.completed
     created_at: datetime
     sequence: int = Field(default=0, ge=0)

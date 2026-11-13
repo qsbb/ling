@@ -60,7 +60,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.deps import CurrentAuth, DbSession, SettingsDep
+from ling.api.deps import CurrentAuth, DbSession, SettingsDep, authorize_message_view
 from ling.api.errors import LingError, not_found
 from ling.domains.media import exports as exports_mod
 from ling.domains.media.assets import AssetNotFound, AssetView, load_asset
@@ -268,7 +268,7 @@ async def get_generated_media(
 # ---------------------------------------------------------------- 会话视图
 
 
-def _voice_dict(asset: VoiceAsset, *, url: str | None) -> dict[str, Any]:
+def _voice_dict(asset: VoiceAsset, *, url: str | None, operator: bool = False) -> dict[str, Any]:
     """一条语音消息的对外形态。
 
     字段分三组，**不要合并**：
@@ -291,7 +291,7 @@ def _voice_dict(asset: VoiceAsset, *, url: str | None) -> dict[str, Any]:
         "sample_rate": asset.sample_rate,
         # 「语音标签 + 文字」：她说的原话。后台显示标签时同时给文字，
         # 不是只丢一个播放器。
-        "text": asset.text,
+        "text": asset.text if operator else "",
         "created_at": asset.created_at.isoformat(),
         "expires_at": asset.expires_at.isoformat() if asset.expires_at else None,
         # --- 两个独立的事实 ---
@@ -329,6 +329,7 @@ async def list_voice_messages(
     auth: CurrentAuth,
     session: DbSession,
     settings: SettingsDep,
+    view: str = "participant",
 ) -> dict[str, Any]:
     """`GET /v1/sessions/{id}/voice-messages` —— 这个会话里可播放的语音消息。
 
@@ -340,6 +341,7 @@ async def list_voice_messages(
     非 owner 窗口返回**空列表**而不是 404：接口语义是"你在这里有几条语音"，
     没有权限时答案是零条，返回 404 反而暴露了窗口是否存在。
     """
+    operator = authorize_message_view(auth, view)
     assets = await load_voice_assets(
         session, window_id=session_id, subject_id=auth.user.subject_id
     )
@@ -347,7 +349,8 @@ async def list_voice_messages(
         "schema_version": "v1",
         "window_id": session_id,
         "voice_messages": [
-            _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest))
+            _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest),
+                        operator=operator)
             for asset in assets
         ],
     }
@@ -365,15 +368,54 @@ async def get_message_voice(
     auth: CurrentAuth,
     session: DbSession,
     settings: SettingsDep,
+    view: str = "participant",
 ) -> dict[str, Any]:
     """`GET /v1/messages/{id}/voice` —— 单条消息的播放地址与两种记录状态。"""
+    operator = authorize_message_view(auth, view)
     try:
         asset = await load_voice_for_message(
             session, message_id=message_id, subject_id=auth.user.subject_id
         )
     except VoiceNotFound as exc:
         raise _voice_or_404(exc) from None
-    return _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest))
+    return _voice_dict(asset, url=_signed_url(settings, request, asset.asset_id or asset.digest),
+                       operator=operator)
+
+
+@router.get("/speech/messages/{message_id}")
+async def get_operator_speech_message(
+    message_id: str,
+    request: Request,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    view: str = "operator",
+) -> dict[str, Any]:
+    """授权后台显式读取语音正文、合成状态与真实投递状态。"""
+    from ling.contracts.v1 import ErrorCode
+    from ling.domains.conversation.service import ConversationService
+    from ling.infra.models import Message, Window
+
+    authorize_message_view(auth, view)
+    if view != "operator":
+        raise LingError(ErrorCode.invalid_request, "请选择 operator 后台视图", status_code=422)
+    row = await session.get(Message, message_id)
+    window = await session.get(Window, row.window_id) if row is not None else None
+    if row is None or window is None or window.actor_id != settings.actor_id:
+        raise not_found(_MEDIA_MISSING)
+    message = ConversationService._to_view(row).to_contract(operator=True)
+    voice = None
+    try:
+        asset = await load_voice_for_message(
+            session, message_id=message_id, subject_id=str(window.subject_id or ""),
+        )
+        voice = _voice_dict(
+            asset, url=_signed_url(settings, request, asset.asset_id or asset.digest), operator=True,
+        )
+    except VoiceNotFound:
+        pass
+    return {"schema_version": "v1", "view": "operator", "message": message.model_dump(mode="json"),
+            "voice": voice}
 
 
 class PlaybackBody(BaseModel):

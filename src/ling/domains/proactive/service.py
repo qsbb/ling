@@ -35,6 +35,7 @@ class OpportunityView:
     expires_at: datetime
     # 生成好的开场白。None = 还没生成（不是"生成了空的"）。
     draft_text: str | None = None
+    output_modality: str = "text"
 
 
 @dataclass
@@ -266,7 +267,13 @@ class ProactivityService:
             row.delivery_state = delivery_state[:32]
         await self._session.flush()
 
-    async def set_draft(self, opportunity_id: str, *, text: str) -> None:
+    async def set_draft(
+        self,
+        opportunity_id: str,
+        *,
+        text: str,
+        output_modality: str = "text",
+    ) -> None:
         """写入生成好的开场白。
 
         单独一个方法而不是塞进 `mark`：草稿和状态是两件事，
@@ -275,7 +282,10 @@ class ProactivityService:
         row = await self._session.get(ProactiveOpportunity, opportunity_id)
         if row is None:
             raise KeyError(opportunity_id)
+        if output_modality not in {"text", "voice"}:
+            raise ValueError("主动草稿表达形态无效")
         row.draft_text = text[:2000]
+        row.output_modality = output_modality
         await self._session.flush()
 
     async def collect_candidates(self, *, now: datetime | None = None) -> dict:
@@ -368,6 +378,7 @@ class ProactivityService:
             state=row.state,
             expires_at=expires,
             draft_text=row.draft_text,
+            output_modality=row.output_modality,
         )
 
 

@@ -1,8 +1,8 @@
 /*
- * 语音消息（SP03）：播放控件 + 「语音标签 + 文字」。
+ * 语音消息（SP03）：参与者播放控件 + 管理员显式正文入口。
  *
- * 三段结构：标签行 / 正文 / 操作行。正文**永远完整显示**——它不依赖播放
- * 成功与否，所以"播不了"时内容也不会丢（见 VoicePlayer 的 unsupported 文案）。
+ * 播放与正文权限分开：普通参与者只看标签、时长与播放状态；后台正文由
+ * operator endpoint 按需读取，失败音频也保留这条入口。
  *
  * 触控：按钮在窄屏 ≥44×44（与仓库其它页同一把尺子）。`<audio>` 本体不显示
  * 原生控件，因为它在小宽度下会被压成一条 30px 的缝，且各浏览器长得都不一样。
@@ -61,6 +61,37 @@
   overflow-wrap: anywhere;
   text-wrap: pretty;
   min-width: 0;
+}
+
+.voice-message__operator {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.voice-message__transcript {
+  min-height: 36px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.voice-message__transcript:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.voice-message__transcript:focus-visible {
+  outline: 2px solid var(--ink-soft);
+  outline-offset: 2px;
 }
 
 .voice-message__actions {
@@ -129,6 +160,10 @@
   .voice-message__tag {
     font-size: 12px;
     line-height: 20px;
+  }
+
+  .voice-message__transcript {
+    min-height: 44px;
   }
 }
 

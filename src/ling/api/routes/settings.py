@@ -51,9 +51,7 @@ router = APIRouter(tags=["settings"])
 # `dialogue.deep` 已移进 RESERVED_PROFILES：审计确认全仓没有任何代码按它
 # 发起请求（见 docs/MODEL-ROLES-AUDIT.md），列着它等于承诺"绑上会更聪明"。
 #
-# 语音三项（speech.asr / speech.tts / realtime.voice）也在 RESERVED_PROFILES：
-# 入站分段是真的，但**没有按模型职责构造的 provider**，绑上去不会改变任何
-# 行为。用户看到"已绑定"却听不见任何声音，比看不到这个入口更糟。
+# 文件语音识别与语音回复均按职责绑定装配；实时双工语音仍在保留名单中。
 #
 # `memory.embed` / `memory.rerank` 从保留名单挪到这里：它们现在**真的**读
 # 绑定（`domains/memory/providers.py`：先读绑定，没绑定才退回环境变量）。
@@ -70,6 +68,8 @@ _OFFERABLE_PROFILES: tuple[str, ...] = (
     "memory.extract",
     "memory.embed",
     "memory.rerank",
+    "speech.asr",
+    "speech.tts",
 )
 
 

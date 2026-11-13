@@ -51,7 +51,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.domains.media.assets import AssetView, _to_view
+from ling.domains.media.assets import AssetNotFound, AssetView, _to_view, load_asset
 from ling.infra.media_assets import MediaAssetGrantRow, MediaAssetRow, utcnow
 from ling.infra.media_playback import MediaPlayEventRow, play_state_for
 from ling.infra.models import Message, Window
@@ -209,6 +209,18 @@ async def load_voice_assets(
     out: list[VoiceAsset] = []
     for message in messages:
         asset = assets.get(message.id)
+        if message.audio_asset_id:
+            try:
+                asset = await load_asset(session, message.audio_asset_id)
+            except AssetNotFound:
+                continue
+            if (
+                asset.window_id != message.window_id
+                or asset.actor_id != window.actor_id
+                or asset.message_id != message.id
+                or asset.purpose != "tts_output"
+            ):
+                continue
         if asset is None:
             continue
         is_played, count, last_at = played.get(message.id, (False, 0, None))
@@ -226,7 +238,7 @@ async def load_voice_assets(
                 text=message.text or "",
                 created_at=message.created_at,
                 expires_at=asset.expires_at,
-                delivered=message.id in delivered,
+                delivered=(message.id in delivered or message.speech_delivery_state == "delivered"),
                 played=is_played,
                 play_count=count,
                 last_played_at=last_at,

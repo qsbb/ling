@@ -82,6 +82,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass, field
@@ -487,6 +488,15 @@ class SpeechOrchestrator:
 
         try:
             artifact = await self._run_synthesis(request, text)
+        except asyncio.CancelledError:
+            # The provider may have accepted and billed the request before the
+            # local task was cancelled. Keep the idempotency record fail-closed.
+            key_row.result_ref = encode_state(
+                SynthesisState.uncertain,
+                detail=SpeechErrorKind.cancelled.value,
+            )
+            await self._session.flush()
+            raise
         except SpeechError as exc:
             return await self._settle_error(key_row, exc, request.intent)
         except Exception as exc:  # noqa: BLE001 - 未识别异常也要落状态，否则键永远卡住

@@ -359,6 +359,7 @@ async def _probe_provider_reachability() -> None:
         logger.info("供应商可达性探测跳过: %s", type(exc).__name__)
         return
 
+
     for base_url in sorted(t for t in targets if t):
         parsed = urlparse(base_url)
         host = parsed.hostname
@@ -384,7 +385,6 @@ async def _probe_provider_reachability() -> None:
             )
             continue
         logger.info("供应商可达：%s:%d", host, port)
-
 
 
 Handler = Callable[[dict], Awaitable[None]]
@@ -1186,7 +1186,6 @@ async def handle_media_video_read(payload: dict) -> None:
 
 async def _build_video_describer(call_id: str) -> tuple[object | None, Callable[[], Awaitable[None]]]:
     """造一个 `MediaDescriber` + 一个 close 函数。
-
     ## 为什么单独抽出来、还要回一个 close
 
     `MediaDescriber` 需要一个 `MediaEvidenceService`，而 service 绑在**一个
@@ -1209,6 +1208,7 @@ async def _build_video_describer(call_id: str) -> tuple[object | None, Callable[
         return None, _noop_close
 
     settings = get_settings()
+
     async def source_connector() -> object | None:
         from ling.infra.models import MediaReadJob, Window
 
@@ -1419,6 +1419,7 @@ async def _run_deferred_turn(
     from ling.domains.conversation.service import ConversationService
     from ling.domains.deferred import service as deferred
     from ling.domains.deferred.state import HARD_DEADLINE_SECONDS
+    from ling.infra.coordination import SpeakLeaseStore
     from ling.infra.security import SecretBox
     from ling.kernel.turn import CancelRegistry, TurnCoordinator
     from ling.settings.service import ConfigService
@@ -1477,11 +1478,13 @@ async def _run_deferred_turn(
         return not await _deferred_input_preempted(window_id, input_sequence)
 
     coordinator = TurnCoordinator(
+        settings=settings,
         router=router,  # type: ignore[arg-type]
         actor_id=settings.actor_id,
         persona_id=settings.persona_id,
         cancels=CancelRegistry(),
         secret_reader=_SECRET_CACHE.get,
+        speak_lease=SpeakLeaseStore(),
         deliver_gate=_still_allowed,
     )
     queue = await coordinator.run_turn(
@@ -1514,6 +1517,18 @@ async def _run_deferred_turn(
             state = str(data.get("state") or name)
             message = data.get("message") or {}
             reply_text = str(message.get("text") or "")
+            logger.info(
+                "延后回复轮次终态 state=%s modality=%s speech_state=%s has_text=%s",
+                state,
+                str(message.get("output_modality") or "text"),
+                str(message.get("speech_state") or "none"),
+                bool(reply_text.strip()),
+            )
+            if message.get("output_modality") == "voice":
+                if message.get("speech_state") == "ready":
+                    reply_text = "[语音]"
+                else:
+                    return "failed", "voice_not_delivered", ""
     # --- 抢占判定必须在"没有正文"判定**之前** ---
     #
     # 顺序反了会出一个很难看的 bug：外发闸拦下正文之后，下面把"没有正文"
@@ -1616,6 +1631,18 @@ async def _settle_deferred(  # noqa: ANN001
                 session,
                 reply_id=claimed.id,
                 target=DeferredReplyState.cancelled,
+                reason=reason,
+                lease_owner=WORKER_ID,
+                claim_generation=int(claimed.claim_generation),
+            )
+        return
+
+    if reason == "voice_not_delivered":
+        async with session_scope() as session:
+            await deferred.finish(
+                session,
+                reply_id=claimed.id,
+                target=DeferredReplyState.failed,
                 reason=reason,
                 lease_owner=WORKER_ID,
                 claim_generation=int(claimed.claim_generation),
@@ -1978,6 +2005,82 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             subject_id=await owner_subject_id(session),
             env=settings.user_timezone,
         )
+
+        async def deliver_voice(opportunity, window, connector) -> str:
+            from ling.capabilities.voice_reply import VoiceReplyService, record_voice_reply
+            from ling.contracts.v1 import Origin
+            from ling.domains.conversation.service import ConversationService
+            from ling.infra.models import Message
+
+            effective = await config.effective()
+            voice = VoiceReplyService(session, settings=settings)
+            conversation = ConversationService(session, actor_id=settings.actor_id)
+            view = await conversation.add_message(
+                window.id,
+                role="actor",
+                text=str(opportunity.draft_text or ""),
+                turn_id=f"proactive_{opportunity.id}",
+                origin=Origin.simulated,
+            )
+            message = await session.get(Message, view.message_id)
+            message.output_modality = "voice"
+            message.speech_state = "pending"
+            prepared = await voice.prepare(effective, secret_reader=config.read_secret)
+            if prepared is None:
+                message.speech_state = "failed"
+                await record_voice_reply(session, message)
+                await session.commit()
+                return "failed"
+
+            async def allowed() -> bool:
+                return await _proactive_voice_allowed(
+                    session,
+                    opportunity_id=opportunity.id,
+                    window_id=window.id,
+                    subject_id=opportunity.subject_id,
+                )
+
+            try:
+                if not await voice.synthesize(
+                    message,
+                    prepared=prepared,
+                    subject_id=opportunity.subject_id,
+                    allowed=allowed,
+                ):
+                    await record_voice_reply(session, message)
+                    await session.commit()
+                    return "failed"
+                if connector is None:
+                    message.speech_delivery_state = "delivered"
+                    await record_voice_reply(session, message)
+                    await session.commit()
+                    return "delivered"
+                delivered = await voice.deliver(
+                    message,
+                    connector=connector,
+                    window_ref=str(window.title or ""),
+                    subject_id=opportunity.subject_id,
+                    is_group=False,
+                )
+                await session.commit()
+                return "delivered" if delivered else str(message.speech_delivery_state or "failed")
+            except asyncio.CancelledError:
+                await record_voice_reply(session, message)
+                await session.commit()
+                raise
+            except Exception as exc:  # noqa: BLE001 - external send may have taken effect
+                if message.speech_state != "ready":
+                    message.speech_state = "failed"
+                message.speech_delivery_state = (
+                    "uncertain" if connector is not None else "failed"
+                )
+                await record_voice_reply(session, message)
+                await session.commit()
+                logger.warning(
+                    "主动语音失败 opportunity=%s type=%s", opportunity.id, type(exc).__name__
+                )
+                return str(message.speech_delivery_state)
+
         stats = await dispatch_pending(
             session,
             actor_id=settings.actor_id,
@@ -1987,6 +2090,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             config_reader=config,
             subject_timezone=instance_timezone,
             subject_timezones=await timezone_by_subject(session),
+            voice_dispatch=deliver_voice,
         )
     if stats.get("skipped"):
         # 门控跳过要写清**为什么**：勿扰时段、日限额、没有会话…
@@ -2052,6 +2156,61 @@ async def handle_proactive_draft(payload: dict) -> None:
         # 会继续按旧人设写。`get_or_none`：新装没人格时草稿用空人设。
         active = await PersonaService(session).get_or_none()
         view_prompt = str(active.system_prompt or "") if active else ""
+
+        async def proactive_voice_help(opportunity, effective) -> str:
+            from ling.capabilities.voice_reply import VoiceReplyService, voice_help
+            from ling.contracts.v1 import Modality
+            from ling.infra.models import Window
+
+            target = await session.scalar(
+                select(Window)
+                .where(
+                    Window.subject_id == opportunity.subject_id,
+                    Window.visibility == "subject_private",
+                    Window.archived.is_(False),
+                    Window.channel.in_(("onebot", "qqbot")),
+                )
+                .order_by(Window.last_message_at.desc().nulls_last())
+                .limit(1)
+            )
+            channel_audio = False
+            if target is not None:
+                connector = await _group_reply_connector(target.channel, str(target.title or ""))
+                if connector is not None:
+                    caps = connector.capabilities()
+                    channel_audio = caps.enabled and caps.media_supported(Modality.audio)
+            if not channel_audio:
+                web = await session.scalar(
+                    select(Window.id)
+                    .where(
+                        Window.subject_id == opportunity.subject_id,
+                        Window.channel == "web",
+                        Window.visibility == "subject_private",
+                        Window.archived.is_(False),
+                    )
+                    .limit(1)
+                )
+                channel_audio = web is not None
+            if not channel_audio:
+                return "当前没有语音投递渠道。只生成文字草稿，不得输出 [speak]。"
+            prepared = await VoiceReplyService(session, settings=settings).prepare(
+                effective,
+                secret_reader=config.read_secret,
+            )
+            if prepared is None:
+                return "语音合成未配置可用音色。只生成文字草稿，不得输出 [speak]。"
+            return voice_help(effective.dialogue.voice_willingness)
+
+        def interpret_proactive_draft(text: str) -> tuple[str, str, bool]:
+            from ling.capabilities.expression_choice import parse_speak_choice
+
+            choice = parse_speak_choice(text)
+            return (
+                choice.text,
+                "voice" if choice.speak else "text",
+                bool(choice.explicit and choice.rejected),
+            )
+
         stats = await draft_pending(
             session,
             actor_id=settings.actor_id,
@@ -2059,6 +2218,8 @@ async def handle_proactive_draft(payload: dict) -> None:
             config_reader=config,
             persona=view_prompt,
             limit=int(payload.get("limit") or 5),
+            voice_help_for=proactive_voice_help,
+            interpret_draft=interpret_proactive_draft,
         )
     if stats["drafted"] or stats["failed"]:
         logger.info(
@@ -2193,6 +2354,26 @@ async def _group_reply_connector(channel: str, window_ref: str) -> object | None
         return None
 
 
+async def _proactive_voice_allowed(
+    session,
+    *,
+    opportunity_id: str,
+    window_id: str,
+    subject_id: str,
+) -> bool:
+    from ling.infra.models import ProactiveOpportunity, Window
+
+    opportunity = await session.get(ProactiveOpportunity, opportunity_id, populate_existing=True)
+    window = await session.get(Window, window_id, populate_existing=True)
+    return bool(
+        opportunity is not None
+        and opportunity.state == "dispatching"
+        and window is not None
+        and not window.archived
+        and str(window.subject_id) == subject_id
+    )
+
+
 async def _reply_in_group_window(  # noqa: ANN001
     *,
     session,
@@ -2239,6 +2420,7 @@ async def _reply_in_group_window(  # noqa: ANN001
     await session.commit()
 
     coordinator = TurnCoordinator(
+        settings=settings,
         # `_MEMORY_ROUTER` 只声明成 object（预热失败时为 None，上面已挡住）
         router=router,  # type: ignore[arg-type]
         actor_id=settings.actor_id,
@@ -2289,6 +2471,33 @@ async def _reply_in_group_window(  # noqa: ANN001
                 logger.warning(
                     "群聊回应轮次 %s 失败（%s）：%s", turn.id, state, failure
                 )
+    from ling.capabilities.voice_reply import VoiceReplyService
+    from ling.infra.models import Message
+
+    voice_message = await session.scalar(
+        select(Message)
+        .where(
+            Message.turn_id == turn.id,
+            Message.output_modality == "voice",
+        )
+        .order_by(Message.sequence.desc())
+        .limit(1)
+    )
+    if voice_message is not None:
+        channel = str(window.channel or "")
+        if channel in {"", "web"}:
+            return voice_message.speech_state == "ready", ""
+        connector = await _group_reply_connector(channel, str(window.title or ""))
+        if connector is None:
+            return False, "语音来源实例当前不可用"
+        delivered = await VoiceReplyService(session, settings=settings).deliver(
+            voice_message,
+            connector=connector,
+            window_ref=str(window.title or ""),
+            subject_id=subject_id,
+            is_group=is_group_visibility(window.visibility),
+        )
+        return delivered, "" if delivered else "语音投递未确认"
     reply_text = reply_text.strip()
     if not reply_text:
         # 失败原因要回到调用方：它会被写成"她没开口"的理由，
@@ -2849,6 +3058,8 @@ async def handle_delivery_reconcile(payload: dict) -> None:  # noqa: ARG001
     """
     from ling.domains.goals.delivery_reconcile import reconcile_deliveries
 
+    await recover_dangling_turns()
+
     async def _connector_for(channel: str, window_ref: str):  # noqa: ANN202
         try:
             return await _group_reply_connector(channel, window_ref)
@@ -3129,6 +3340,7 @@ async def handle_proactive_collect(payload: dict) -> None:
         )
 
 
+
 # 活动类别的中文说法。给用户看的文案里不该出现 `reading` 这种槽位名——
 # 那是内部标识，漏到回复里会立刻显得机械。
 _ACTIVITY_LABELS = {
@@ -3151,7 +3363,6 @@ async def _plan_window_ended(session, plan_id: str, *, now):  # noqa: ANN001, AN
 
     plan_row = await session.get(AgendaPlanRow, plan_id)
     return plan_row is not None and _as_aware(plan_row.end_at) <= now
-
 
 
 # 旧路径的周期（600 秒）**已不再使用**：`life.plan` 移出 `PERIODIC_JOBS`，
@@ -3425,6 +3636,7 @@ async def handle_life_plan(payload: dict) -> None:
                 "reason_code": "" if created else "model_returned_no_usable_plan",
             },
         )
+
 
 # ---------------------------------------------------------------- 新时间轴的段边界（阶段 2）
 #
@@ -3886,8 +4098,11 @@ async def recover_dangling_turns() -> int:
     """
     from datetime import timedelta
 
+    from ling.capabilities.voice_reply import recover_synthesis_jobs
+
     cutoff = utcnow() - timedelta(minutes=DANGLING_TURN_MINUTES)
     async with session_scope() as session:
+        recovered_speech = await recover_synthesis_jobs(session, cutoff=cutoff)
         result = await session.execute(
             update(Turn)
             .where(
@@ -3903,6 +4118,8 @@ async def recover_dangling_turns() -> int:
         count = int(getattr(result, "rowcount", 0) or 0)
     if count:
         logger.warning("恢复 %d 个长时间无更新的轮次为 failed", count)
+    if recovered_speech:
+        logger.warning("恢复 %d 个中断语音作业为 uncertain", recovered_speech)
     return count
 
 

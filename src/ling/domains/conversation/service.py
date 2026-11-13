@@ -230,13 +230,21 @@ class MessageView:
     # 分开：那个是"对方撤回的"，这个是"她撤回的"——撤回方不同，含义不同。
     recalled_at: datetime | None = None
     recall_state: str | None = None
+    output_modality: str = "text"
+    audio_asset_id: str | None = None
+    speech_state: str = "none"
+    speech_delivery_state: str | None = None
 
-    def to_contract(self) -> ChatMessage:
+    def to_contract(self, *, operator: bool = False) -> ChatMessage:
         return ChatMessage(
             message_id=self.message_id,
             turn_id=self.turn_id,
             role=self.role,  # type: ignore[arg-type]
-            text=self.text,
+            text=self.text if operator or self.output_modality != "voice" else "",
+            output_modality=self.output_modality,
+            audio_asset_id=self.audio_asset_id,
+            speech_state=self.speech_state,
+            speech_delivery_state=self.speech_delivery_state,
             state=self.state,
             created_at=self.created_at,
             sequence=self.sequence,
@@ -1239,6 +1247,10 @@ class ConversationService:
             turn_id=row.turn_id,
             role=row.role,
             text=row.text,
+            output_modality=row.output_modality,
+            audio_asset_id=row.audio_asset_id,
+            speech_state=row.speech_state,
+            speech_delivery_state=row.speech_delivery_state,
             state=TurnState(row.state),
             created_at=_as_utc(row.created_at),
             sequence=int(row.sequence or 0),

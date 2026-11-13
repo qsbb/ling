@@ -360,8 +360,7 @@ class OneBotV11Connector(ChannelConnector):
 
           两者不冲突的原因：``send()`` 保证「一个消息最多一个 audio 附件」，
           所以两条路产出的 payload 是**同一个形状**（一个 record 段）。
-          区别只在 ``send()`` 会额外带一个空 text 占位段（既有
-          ``build_media_segments`` 行为），而这里不带。
+           两条路径都会只带一个 record 段，不加空 text 占位。
 
         ## 为什么当初是独立方法而不是 ``send(media_refs=[...])``
 
@@ -521,7 +520,25 @@ class OneBotV11Connector(ChannelConnector):
                 "校验/转成 SILK。请给本地路径，或用 send_voice(asset=...)",
             )
         asset = VoiceAsset(path=Path(ref), mime_type="audio/silk", name=Path(ref).name)
-        return [voice_segment(await build_voice_file_async(asset, options))]
+        silk_handle = None
+        try:
+            silk_handle = ensure_silk(asset, tmp_root=silk_tmp_root(options))
+            silk_asset = silk_handle.asset
+            size = silk_asset.size_bytes()
+            if size > options.max_bytes:
+                raise VoiceSendError(
+                    "too_large",
+                    f"{silk_asset.display_name()} 大小 {size} 字节，超过语音上限 "
+                    f"{options.max_bytes} 字节。{suggest_alternative(options)}",
+                    transport=options.transport.value,
+                )
+            file_value = await build_voice_file_async(silk_asset, options)
+            return [voice_segment(file_value)]
+        except VoiceSendError as exc:
+            raise ChannelError(ChannelErrorKind.rejected, exc.detail) from exc
+        finally:
+            if silk_handle is not None:
+                silk_handle.cleanup()
 
     def build_voice_segments(
         self, asset: VoiceAsset, *, sign_url: SignUrl | None = None

@@ -461,9 +461,11 @@ class ContextCompiler:
         # 只有连接器自己知道。之前没这个参数，`_supports_poke` 从来没人赋值，
         # 于是 `getattr(self, "_supports_poke", True)` 恒为 True。
         channel_capabilities: CapabilityDescriptor | None = None,
+        voice_help: str = "",
     ) -> None:
         self._session = session
         self._channel_capabilities = channel_capabilities
+        self._voice_help = voice_help
         self._actor_id = actor_id
         self._persona_id = persona_id
         self._persona = PersonaService(session, persona_id)
@@ -1440,6 +1442,7 @@ class ContextCompiler:
             supports_poke=self.supports_poke,
             has_message_ids=quote_ids_available,
         )
+        expression_help = "\n".join(filter(None, (expression_help, self._voice_help)))
         if expression_help:
             contributions.append(
                 ContextContribution(

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { formatClock, formatModelLabel } from '../format';
 import { retryLabel } from '../errors';
 import { usePersonaName } from '../personaName';
@@ -8,6 +9,43 @@ import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
 import { PROMPT_DRAWER_ID, PROMPT_ENTRY_LABEL } from './PromptDrawer';
 import { RecallCard, RecallUnavailableCard } from './RecallCard';
 import { VoicePlayer, type VoiceMessageView } from './VoicePlayer';
+import { fetchOperatorSpeechText } from '../voiceMessages';
+
+export function OperatorSpeechText({ messageId }: { messageId: string }) {
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  return (
+    <div className="voice-message__operator">
+      <button
+        type="button"
+        className="voice-message__transcript"
+        disabled={loading}
+        aria-expanded={text !== null}
+        onClick={async () => {
+          if (text !== null) {
+            setText(null);
+            return;
+          }
+          setLoading(true);
+          setFailed(false);
+          const transcript = await fetchOperatorSpeechText(messageId);
+          setText(transcript);
+          setFailed(transcript === null);
+          setLoading(false);
+        }}
+      >
+        {text !== null ? '隐藏正文' : loading ? '读取中…' : '后台查看正文'}
+      </button>
+      {text !== null ? (
+        <p className="voice-message__text" data-testid="voice-operator-text">{text}</p>
+      ) : failed ? (
+        <p className="voice-message__error" role="alert">正文读取失败。</p>
+      ) : null}
+    </div>
+  );
+}
 
 /**
  * 会话类型决定「谁在说话」怎么读。
@@ -59,6 +97,7 @@ interface MessageListProps {
    * 默认关，既有页面与测试不受影响。
    */
   promptEnabled?: boolean;
+  canViewVoiceTranscript?: boolean;
   /** 当前抽屉打开的那条消息（按 `key` 比，再点同一条 = 收起）。 */
   promptOpenKey?: string | null;
   /** 点击入口。第二个参数是入口元素本身，关闭抽屉后要把焦点还给它。 */
@@ -392,6 +431,7 @@ export function MessageList({
   onOpenSettings,
   variant = 'web',
   promptEnabled = false,
+  canViewVoiceTranscript = false,
   promptOpenKey = null,
   onOpenPrompt,
   recallProposals = [],
@@ -573,6 +613,12 @@ export function MessageList({
                     <i />
                     <i />
                   </span>
+                ) : message.outputModality === 'voice' ? (
+                  <span className="message__empty">
+                    语音 · {message.speechState === 'ready' ? '已生成' :
+                      message.speechState === 'failed' ? '生成失败' :
+                      message.speechState === 'cancelled' ? '已取消' : '处理中'}
+                  </span>
                 ) : message.state === 'stopped' ? (
                   <span className="message__empty">已停止，未生成内容</span>
                 ) : (
@@ -593,6 +639,9 @@ export function MessageList({
                   onPlayed={onVoicePlayed}
                   refreshUrl={onRefreshVoiceUrl}
                 />
+              ) : null}
+              {row.own && canViewVoiceTranscript && message.outputModality === 'voice' ? (
+                <OperatorSpeechText messageId={message.messageId ?? message.key} />
               ) : null}
               {message.state === 'failed' ? (
                 <ErrorCard

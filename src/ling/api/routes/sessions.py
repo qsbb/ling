@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
-from ling.api.deps import ConversationDep, CurrentAuth, DbSession
+from ling.api.deps import ConversationDep, CurrentAuth, DbSession, authorize_message_view
 from ling.api.errors import not_found
 from ling.contracts.v1 import (
     PromptBlock,
@@ -361,7 +361,9 @@ async def list_messages(
     conversation: ConversationDep,
     limit: int = 100,
     before_sequence: int | None = None,
+    view: str = "participant",
 ) -> MessagesOut:
+    operator = authorize_message_view(auth, view)
     await conversation.get_window(session_id, subject_id=auth.user.subject_id)
     views = await conversation.list_messages(
         session_id, limit=limit, before_sequence=before_sequence
@@ -370,9 +372,15 @@ async def list_messages(
     active_view = None
     if active is not None:
         partial = request.app.state.cancels.partial(active.id)
+        if not operator:
+            voice_message = await conversation.session.scalar(select(Message.id).where(
+                Message.turn_id == active.id, Message.output_modality == "voice",
+            ).limit(1))
+            if voice_message is not None:
+                partial = ""
         active_view = (await conversation.turn_view(active, partial_text=partial)).to_dict()
     return MessagesOut(
-        messages=[v.to_contract().model_dump(mode="json") for v in views],
+        messages=[v.to_contract(operator=operator).model_dump(mode="json") for v in views],
         active_turn=active_view,
     )
 

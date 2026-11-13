@@ -301,6 +301,7 @@ export function ChatPage({
               onStop={() => void chat.stop()}
               onOpenSettings={onOpenSettings}
               promptEnabled={promptEnabled}
+              canViewVoiceTranscript={user.role === 'owner' || user.role === 'admin'}
               promptOpenKey={promptOpenKey}
               onOpenPrompt={togglePrompt}
               recallProposals={chat.recallProposals}

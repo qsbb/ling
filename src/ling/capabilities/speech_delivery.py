@@ -209,6 +209,7 @@ class SpeechDeliveryRequest:
     #: 这一层按调用方自己的判断挡（例如上一条消息已经发过同一段语音）。
     reply_to: str | None = None
     mentions: tuple[str, ...] = ()
+    window_id: str | None = None
 
 
 class SpeechDelivery:
@@ -311,7 +312,8 @@ class SpeechDelivery:
 
         - ``signed_url``：短时签名 URL。跨机部署默认候选。
         - ``asset``：裸 ``asset:<digest>``，由渠道自己认（同一进程内的渠道）。
-        - ``shared_file``：本地绝对路径，NapCat 与 ling 共享目录时用。
+        - ``shared_file``：映射成本地绝对路径，NapCat 与 ling 共享目录时用。
+        - ``local_file``：把受控的本地文件交给 OneBot connector，由它编码为最终 wire transport。
         """
         from ling.domains.media.exports import ExportTransport
 
@@ -329,7 +331,7 @@ class SpeechDelivery:
             if not target.data_uri:
                 raise RuntimeError("base64 导出没有返回 data_uri")
             return target.data_uri
-        if transport == "shared_file":
+        if transport in {"shared_file", "local_file"}:
             # 路径由 media 服务自己算（它知道 `data_dir`），**不让调用方猜**。
             target = await self._media.export_for_window(
                 reference,
@@ -404,7 +406,7 @@ class SpeechDelivery:
             audio_ref = await self.resolve_audio_ref(
                 artifact,
                 actor_id=actor_id,
-                window_id=request.window_ref,
+                window_id=request.window_id or request.window_ref,
                 transport=transport,
             )
         except Exception as exc:  # noqa: BLE001 - 导出失败不该让整轮回复消失
@@ -428,6 +430,7 @@ class SpeechDelivery:
             plan_id=f"plan_{request.turn_id}",
             ordinal=0,
             payload_extra={
+                "message_id": request.message_id,
                 "speech": {
                     "digest": artifact.digest,
                     "reused": artifact.reused,

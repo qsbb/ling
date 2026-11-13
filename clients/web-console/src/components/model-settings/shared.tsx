@@ -75,6 +75,12 @@ export const PRIMARY_ROLES: RoleMeta[] = [
     short: '识别',
     hint: '把收到的语音转成文字，交给对话模型理解',
   },
+  {
+    key: 'speech.tts',
+    label: '语音合成',
+    short: '合成',
+    hint: '她选择语音回复时，把正文合成为声音',
+  },
 ];
 
 /**
@@ -125,6 +131,9 @@ export const PROVIDER_KIND_OPTIONS = [
   { value: 'siliconflow_rerank', label: '重排（SiliconFlow）' },
   { value: 'siliconflow_asr', label: '语音识别（SiliconFlow）' },
   { value: 'dashscope_asr', label: '语音识别（百炼 Qwen）' },
+  { value: 'minimax_tts', label: '语音合成（MiniMax）' },
+  { value: 'fishaudio_tts', label: '语音合成（FishAudio）' },
+  { value: 'mimo_tts', label: '语音合成（MiMo）' },
 ] as const;
 
 export function kindLabel(kind: string): string {
@@ -572,7 +581,7 @@ export const ROLE_GROUPS: readonly RoleGroup[] = [
     note: '3 个 · 提炼与检索',
     keys: ['memory.extract', 'memory.embed', 'memory.rerank'],
   },
-  { title: '语音', note: '收到语音时识别', keys: ['speech.asr'] },
+  { title: '语音', note: '语音输入与回复', keys: ['speech.asr', 'speech.tts'] },
 ];
 
 /**

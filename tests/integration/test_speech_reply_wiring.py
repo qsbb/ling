@@ -888,14 +888,9 @@ async def test_外发段里语音前面没有正文段(
         reply_to=None,
         voice_segments=voice_segments,
     )
-    # **实测**：`text=""` 时 `build_media_segments` 虽然不进 text 段，但它的
-    # `if not segments` 兜底会补一个 `{'type': 'text', 'data': {'text': ''}}`。
-    # 那是**空段**（平台上不可见），不是正文——所以这里断言"所有 text 段都为空"，
-    # 而不是"没有 text 段"。
+    # 纯语音的 wire 只保留 record，不附带空 text 占位。
     text_segments = [s for s in segments if s["type"] == "text"]
-    assert [s["data"]["text"] for s in text_segments] == [""], (
-        f"语音消息的 wire 上出现了非空 text 段（正文泄漏）：{segments}"
-    )
+    assert text_segments == [], f"语音消息不应带 text 段：{segments}"
     # 正向配对：语音段**确实**在，且排在最后。否则"没有正文"在"什么都没发"
     # 的实现下也成立。
     assert segments[-1] == voice_segments[0], segments
@@ -918,11 +913,11 @@ def test_语音消息带艾特时也只多一个空格段() -> None:
     body = "听到我了吗"
     voice = [{"type": "record", "data": {"file": "asset:abc"}}]
 
-    # 空串（= 实现现在的 `text=""`）：@ 只带来"@ 段 + 空格段 + 空段"，没有正文。
+    # 空串（= 实现现在的 `text=""`）：@ 只带来"@ 段 + 空格段"，没有正文。
     segments = build_outbound_segments(
         "", mention_ids=["100200300"], voice_segments=voice
     )
-    assert [s["type"] for s in segments] == ["at", "text", "text", "record"], segments
+    assert [s["type"] for s in segments] == ["at", "text", "record"], segments
     assert all(s["data"]["text"].strip() == "" for s in segments if s["type"] == "text"), (
         segments
     )

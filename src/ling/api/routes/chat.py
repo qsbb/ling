@@ -66,6 +66,7 @@ def _sse(event: str, data: dict) -> bytes:
 def _coordinator(request: Request, settings: SettingsDep, router_: RouterDep) -> TurnCoordinator:
     return TurnCoordinator(
         router=router_,
+        settings=settings,
         actor_id=settings.actor_id,
         # ``None`` = 本轮用**当前激活**的人格（`domains/persona/current.py`）。
         # 原来是 `settings.persona_id`（环境变量），在设置里切了人格之后
@@ -904,7 +905,7 @@ async def send_transcribed_turn(
                     {
                         "turn_id": existing.id,
                         "state": view.state.value,
-                        "text": actor_msg.text if actor_msg else "",
+                        "text": actor_msg.to_contract().text if actor_msg else "",
                         "error": {
                             "code": (view.error_code or ErrorCode.cancelled).value,
                             "message": "该轮次此前未完成，可点击重试",
@@ -1062,6 +1063,7 @@ async def send_transcribed_turn(
             "model_status": decision.model_status.value,
         },
     )
+
     async def _guarded() -> AsyncIterator[bytes]:
         produced = False
         started_at = time.perf_counter()
@@ -1090,7 +1092,6 @@ async def send_transcribed_turn(
         _guarded(), media_type="text/event-stream", headers=SSE_HEADERS
     )
 
-
 @router.get("/turns/{turn_id}/resume")
 async def resume_turn(
     turn_id: str,
@@ -1112,24 +1113,36 @@ async def resume_turn(
     await conversation.get_window(turn.window_id, subject_id=auth.user.subject_id)
     effective_attempt = attempt if attempt is not None else int(turn.attempt or 1)
 
+    from sqlalchemy import select
+
+    from ling.infra.models import Message
+
+    actor_message = await conversation.session.scalar(
+        select(Message)
+        .where(
+            Message.turn_id == turn_id,
+            Message.role == "actor",
+            Message.attempt == effective_attempt,
+        )
+        .order_by(Message.sequence.desc())
+        .limit(1)
+    )
+    voice_reply = actor_message is not None and actor_message.output_modality == "voice"
+
     stream_log = getattr(request.app.state, "stream_log", None)
     chunks: list = []
     complete = False
-    if stream_log is not None:
+    if stream_log is not None and not voice_reply:
         chunks, complete = stream_log.since(
             turn_id=turn_id, attempt=effective_attempt, last_sequence=max(0, since)
         )
 
     # 兜底文本：进程内存里的半成品（单实例）或已落库的 actor 消息（多实例）
     snapshot = ""
-    if not complete:
+    if not complete and not voice_reply:
         snapshot = request.app.state.cancels.partial(turn_id)
-        if not snapshot:
-            msgs = await conversation.list_messages(turn.window_id, limit=200)
-            for msg in reversed(msgs):
-                if msg.turn_id == turn_id and msg.role == "actor":
-                    snapshot = msg.text
-                    break
+        if not snapshot and actor_message is not None:
+            snapshot = conversation._to_view(actor_message).to_contract().text
 
     async def replay() -> AsyncIterator[bytes]:
         yield _sse(
@@ -1307,6 +1320,7 @@ async def retry_turn(
             "attempt": new_attempt,
         },
     )
+
     async def _guarded() -> AsyncIterator[bytes]:
         produced = False
         async for chunk in _forward(queue, started=started):

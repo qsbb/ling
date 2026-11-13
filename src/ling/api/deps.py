@@ -45,6 +45,17 @@ class AuthContext:
     token: str
 
 
+def authorize_message_view(auth: AuthContext, view: str) -> bool:
+    """只允许显式请求后台视图的管理员读取语音正文。"""
+    if view not in {"participant", "operator"}:
+        raise LingError(ErrorCode.invalid_request, "消息视图参数不合法", status_code=422)
+    if view == "participant":
+        return False
+    if auth.user.role not in {"owner", "admin"}:
+        raise LingError(ErrorCode.forbidden, "后台语音视图需要管理员权限", status_code=403)
+    return True
+
+
 async def current_auth(request: Request, session: DbSession) -> AuthContext:
     settings: Settings = request.app.state.settings
     token = request.cookies.get(settings.cookie_name) or ""

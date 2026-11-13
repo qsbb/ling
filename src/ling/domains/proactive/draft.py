@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,6 +96,7 @@ async def draft_for(
     config_reader: object,
     persona: str = "",
     now: object | None = None,
+    voice_help_for: Callable[[ProactiveOpportunity, object], Awaitable[str]] | None = None,
 ) -> str | None:
     """为一条机会生成开场白。失败返回 None，不写占位符。"""
     from ling.models.router import StreamOutcome  # noqa: F401
@@ -116,6 +118,8 @@ async def draft_for(
         return None
 
     system = DRAFT_PROMPT if not persona else f"{DRAFT_PROMPT}\n\n你是谁：\n{persona}"
+    if voice_help_for is not None:
+        system += "\n\n" + await voice_help_for(opportunity, effective)
     chunks: list[str] = []
     try:
         async for chunk, outcome in router.stream(  # type: ignore[attr-defined]
@@ -154,6 +158,8 @@ async def draft_pending(
     subject_id: str | None = None,
     limit: int = 5,
     now: object | None = None,
+    voice_help_for: Callable[[ProactiveOpportunity, object], Awaitable[str]] | None = None,
+    interpret_draft: Callable[[str], tuple[str, str, bool]] | None = None,
 ) -> dict[str, int]:
     """给还没有草稿的候选生成开场白。**不发送。**
 
@@ -182,11 +188,19 @@ async def draft_pending(
             config_reader=config_reader,
             persona=persona,
             now=moment,
+            voice_help_for=voice_help_for,
         )
         if text is None:
             failed += 1
             continue
-        await service.set_draft(row.id, text=text)
+        content, modality, rejected = (
+            interpret_draft(text) if interpret_draft else (text, "text", False)
+        )
+        if rejected:
+            await service.mark(row.id, state="failed", reason="草稿表达控制无效")
+            failed += 1
+            continue
+        await service.set_draft(row.id, text=content, output_modality=modality)
         drafted += 1
     return {"drafted": drafted, "failed": failed, "considered": len(rows)}
 

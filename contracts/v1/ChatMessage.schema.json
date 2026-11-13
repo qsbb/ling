@@ -57,6 +57,18 @@
       "title": "Attempt",
       "type": "integer"
     },
+    "audio_asset_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Audio Asset Id"
+    },
     "created_at": {
       "format": "date-time",
       "title": "Created At",
@@ -118,6 +130,15 @@
     "origin": {
       "$ref": "#/$defs/Origin",
       "default": "user_statement"
+    },
+    "output_modality": {
+      "default": "text",
+      "enum": [
+        "text",
+        "voice"
+      ],
+      "title": "Output Modality",
+      "type": "string"
     },
     "recall_state": {
       "anyOf": [
@@ -201,6 +222,32 @@
       "minimum": 0,
       "title": "Sequence",
       "type": "integer"
+    },
+    "speech_delivery_state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Speech Delivery State"
+    },
+    "speech_state": {
+      "default": "none",
+      "enum": [
+        "none",
+        "pending",
+        "synthesizing",
+        "ready",
+        "failed",
+        "cancelled",
+        "expired"
+      ],
+      "title": "Speech State",
+      "type": "string"
     },
     "state": {
       "$ref": "#/$defs/TurnState",

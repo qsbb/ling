@@ -19,16 +19,25 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
 
-from ling.domains.proactive.dispatch import dispatch_pending
+from ling.domains.proactive.dispatch import (
+    PROACTIVE_DISPATCH_SCOPE,
+    STALE_CLAIM_SECONDS,
+    dispatch_pending,
+)
 from ling.infra.db import session_scope
 from ling.infra.models import (
     DeliveryReceiptRow,
+    IdempotencyKey,
     Operation,
     ProactiveOpportunity,
     Window,
@@ -85,6 +94,18 @@ class _Connector:
 
     async def verify_inbound(self, headers, body):  # noqa: ANN001, ANN202
         return True
+
+
+class _VoiceCaps(_Caps):
+    supports_media = True
+
+    def media_supported(self, modality):  # noqa: ANN001, ANN202
+        return True
+
+
+class _VoiceConnector(_Connector):
+    def capabilities(self):  # noqa: ANN202
+        return _VoiceCaps()
 
 
 class _Config:
@@ -470,6 +491,218 @@ async def _dispatch(connector, *, enabled: bool = True) -> dict:  # noqa: ANN001
             subject_timezone=TZ,
             now=SAFE_NOW,
         )
+
+
+class _BarrierConfig(_Config):
+    def __init__(self, barrier: asyncio.Barrier) -> None:
+        super().__init__(enabled=True)
+        self._barrier = barrier
+
+    async def effective(self):  # noqa: ANN202
+        await self._barrier.wait()
+        return await super().effective()
+
+
+class _PausedSend(_Connector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, message):  # noqa: ANN001, ANN202
+        from ling.contracts.v1 import DeliveryReceipt
+
+        self.sent.append(message)
+        self.entered.set()
+        await self.release.wait()
+        return DeliveryReceipt(
+            receipt_id=f"rcpt_{len(self.sent)}",
+            operation_id=message.operation_id,
+            channel=self.connector_id,
+            state=self._state,
+            platform_message_id=f"pm_{len(self.sent)}",
+            observed_at=datetime.now(UTC),
+            detail=None,
+        )
+
+
+async def _dispatch_with_config(
+    connector: object,
+    config_reader: object,
+    *,
+    voice_dispatch: Callable[
+        [ProactiveOpportunity, Window, object | None], Awaitable[str]
+    ]
+    | None = None,
+) -> dict[str, int | str]:
+    async with session_scope() as session:
+        return await dispatch_pending(
+            session,
+            actor_id=ACTOR,
+            connector=connector,
+            config_reader=config_reader,
+            subject_timezone=TZ,
+            now=SAFE_NOW,
+            voice_dispatch=voice_dispatch,
+        )
+
+
+async def test_concurrent_dispatchers_send_one_opportunity_at_most_once(
+    logged_in: TestEnv,  # noqa: ARG001
+) -> None:
+    """独立 session 同时竞争时，同一机会最多一次进入发送边界。"""
+    await _window()
+    oid = await _candidate(oid=f"opp_dispatch_concurrent_{uuid4().hex}")
+    connector = _PausedSend()
+    config = _BarrierConfig(asyncio.Barrier(2))
+
+    first = asyncio.create_task(_dispatch_with_config(connector, config))
+    second = asyncio.create_task(_dispatch_with_config(connector, config))
+    try:
+        await asyncio.wait_for(connector.entered.wait(), timeout=5)
+        # 第二个 dispatch 已穿过配置屏障。让它在第一个发送仍暂停时竞争机会。
+        await asyncio.sleep(0.25)
+    finally:
+        connector.release.set()
+        await asyncio.wait_for(
+            asyncio.gather(first, second, return_exceptions=True), timeout=10
+        )
+
+    first_stats, second_stats = first.result(), second.result()
+    assert len(connector.sent) == 1, (
+        f"同一机会从两个独立 session 发送了 {len(connector.sent)} 次: "
+        f"{first_stats}, {second_stats}"
+    )
+    state, _ = await _state(oid)
+    assert state == "sent", "并发保护不能以两边都不发送作为通过结果"
+
+
+async def test_stale_dispatch_claim_recovers_as_uncertain_without_resend(
+    logged_in: TestEnv,  # noqa: ARG001
+) -> None:
+    """超过声明阈值的旧 claim 从新 session 回收为 uncertain，且两轮都不重发。"""
+    await _window()
+    oid = await _candidate(oid=f"opp_dispatch_stale_{uuid4().hex}")
+    claim_id = f"idem_dispatch_stale_{uuid4().hex}"
+    async with session_scope() as session:
+        opportunity = await session.get(ProactiveOpportunity, oid)
+        assert opportunity is not None
+        opportunity.state = "dispatching"
+        session.add(
+            IdempotencyKey(
+                id=claim_id,
+                scope=PROACTIVE_DISPATCH_SCOPE,
+                key=oid,
+                result_ref="v1:in_progress",
+                created_at=SAFE_NOW - timedelta(seconds=STALE_CLAIM_SECONDS + 1),
+            )
+        )
+
+    current_sweep = _Connector()
+    current_stats = await _dispatch(current_sweep)
+    assert current_sweep.sent == [], "陈旧 claim 回收时不能重发"
+    assert current_stats["uncertain"] == 1, current_stats
+    state, sent_at, _operation_id, delivery_state = await _settlement(oid)
+    assert state == "uncertain"
+    assert delivery_state == "uncertain"
+    assert sent_at is None
+
+    later_sweep = _Connector()
+    await _dispatch(later_sweep)
+    assert later_sweep.sent == [], "后续新 session 不能重试已回收的 uncertain 机会"
+    assert (await _settlement(oid))[0] == "uncertain"
+
+
+async def test_concurrent_voice_dispatchers_call_voice_handler_once(
+    logged_in: TestEnv,  # noqa: ARG001
+) -> None:
+    """voice 模式也必须经过同一机会 claim，并实际进入一次语音回调。"""
+    await _window()
+    oid = await _candidate(oid=f"opp_dispatch_voice_claim_{uuid4().hex}")
+    async with session_scope() as session:
+        opportunity = await session.get(ProactiveOpportunity, oid)
+        assert opportunity is not None
+        opportunity.output_modality = "voice"
+
+    connector = _VoiceConnector()
+    config = _BarrierConfig(asyncio.Barrier(2))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    callback_opportunities: list[str] = []
+
+    async def voice_dispatch(
+        opportunity: ProactiveOpportunity, window: Window, selected: object | None
+    ) -> str:
+        callback_opportunities.append(opportunity.id)
+        assert window.subject_id == SUBJ
+        assert selected is connector
+        entered.set()
+        await release.wait()
+        return "delivered"
+
+    first = asyncio.create_task(
+        _dispatch_with_config(connector, config, voice_dispatch=voice_dispatch)
+    )
+    second = asyncio.create_task(
+        _dispatch_with_config(connector, config, voice_dispatch=voice_dispatch)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0.25)
+    finally:
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(first, second, return_exceptions=True), timeout=10
+        )
+
+    first_stats, second_stats = first.result(), second.result()
+    assert callback_opportunities == [oid], (
+        f"voice callback 次数或机会不正确: {callback_opportunities}"
+    )
+    assert first_stats["sent"] + second_stats["sent"] == 1, (
+        f"voice 正向投递没有恰好一次完成: {first_stats}, {second_stats}"
+    )
+    assert connector.sent == [], "voice 分支应调用注入的回调而非文本发送器"
+    assert (await _state(oid))[0] == "sent"
+
+
+class _AcceptedThenBlocked(_Connector):
+    """在可能已被平台接受的发送入口等待，供取消尝试使用。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def send(self, message):  # noqa: ANN001, ANN202
+        self.sent.append(message)
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+async def test_cancelled_possibly_sent_attempt_is_durable_and_not_retried(
+    logged_in: TestEnv,  # noqa: ARG001
+) -> None:
+    """发送入口后的取消必须跨新 session 持久结算 uncertain，且不可重发。"""
+    await _window()
+    oid = await _candidate(oid=f"opp_dispatch_cancelled_{uuid4().hex}")
+    connector = _AcceptedThenBlocked()
+
+    task = asyncio.create_task(_dispatch(connector))
+    await asyncio.wait_for(connector.entered.wait(), timeout=5)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+    state, sent_at, _operation_id, delivery_state = await _settlement(oid)
+    assert len(connector.sent) == 1, "取消前必须确实越过过发送边界"
+    assert state == "uncertain", f"可能已送达的取消结果被记为 {state}"
+    assert delivery_state == "uncertain"
+    assert sent_at is None
+
+    retry = _Connector()
+    await _dispatch(retry)
+    assert retry.sent == [], "新 session 对 uncertain 机会又发起了外部调用"
+    assert (await _settlement(oid))[0] == "uncertain"
 
 
 async def test_exception_after_send_is_never_resent(logged_in: TestEnv) -> None:  # noqa: ARG001

@@ -50,6 +50,9 @@ export interface UiMessage {
   role: 'user' | 'actor';
   system: boolean;
   text: string;
+  outputModality?: 'text' | 'voice';
+  speechState?: string;
+  speechDeliveryState?: string | null;
   state: TurnState;
   createdAt: string;
   modelLabel: string | null;
@@ -116,6 +119,9 @@ function buildServerMessage(message: ChatMessage): UiMessage {
     role: message.role === 'user' ? 'user' : 'actor',
     system: message.role === 'system',
     text: message.text,
+    outputModality: message.output_modality ?? 'text',
+    speechState: message.speech_state ?? 'none',
+    speechDeliveryState: message.speech_delivery_state ?? null,
     state: message.state,
     createdAt: message.created_at,
     modelLabel: message.model_label,
@@ -152,6 +158,9 @@ function emptyActor(key: string, turnId: string | null): UiMessage {
     role: 'actor',
     system: false,
     text: '',
+    outputModality: 'text',
+    speechState: 'none',
+    speechDeliveryState: null,
     state: 'pending',
     createdAt: new Date().toISOString(),
     modelLabel: null,
@@ -692,6 +701,9 @@ export function useChat(
             messageId: serverMessage.message_id,
             turnId: serverMessage.turn_id,
             text: serverMessage.text,
+            outputModality: serverMessage.output_modality ?? 'text',
+            speechState: serverMessage.speech_state ?? 'none',
+            speechDeliveryState: serverMessage.speech_delivery_state ?? null,
             state: serverMessage.state,
             createdAt: serverMessage.created_at,
             modelLabel: serverMessage.model_label,
@@ -740,6 +752,7 @@ export function useChat(
         }
 
         setActiveTurn(null);
+        void loadVoices(sessionId);
         if (userKey) updateUser({ state: 'completed', local: false });
       };
 

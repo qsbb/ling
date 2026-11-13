@@ -3,11 +3,8 @@
  *
  * ## 这个文件在守什么
  *
- * 用户明确要求：**「默认只发语音，后台显示语音标签 + 文字」**。所以这里的
- * 第一批断言全部围绕这两件事——不是"有没有播放器"，而是：
- *
- * 1. 一眼能看出**这是语音**（`语音` 标签 + 时长）；
- * 2. **正文文字必须完整出现**（语音不是不可读附件）。
+ * 参与者看到语音标签、时长和播放器，不看到 canonical transcript。
+ * 管理员正文入口由独立的 operator view 显式触发。
  *
  * 第二重要的是**播放与送达分开**。后端给了两个独立字段，界面上也必须是
  * **两句不同的话**：「已发出 / 没发到渠道」与「你听过 / 还没听」。把它们合并成
@@ -29,8 +26,10 @@ import {
   voiceErrorText,
   type VoiceMessageView,
 } from './components/VoicePlayer';
+import { OperatorSpeechText } from './components/MessageList';
 import {
   fetchVoiceMessages,
+  fetchOperatorSpeechText,
   indexVoicesByMessage,
   refetchVoiceUrl,
   reportPlayback,
@@ -59,26 +58,24 @@ function voice(patch: Partial<VoiceMessageView> = {}): VoiceMessageView {
   };
 }
 
-describe('语音标签 + 文字（用户明确要求）', () => {
-  it('渲染「语音」标签、时长与正文原文', () => {
+describe('参与者语音投影', () => {
+  it('渲染语音标签、时长与播放器，不渲染正文', () => {
     const html = renderToStaticMarkup(<VoicePlayer voice={voice()} />);
 
     expect(html).toContain('data-testid="voice-label"');
     expect(html).toContain('语音');
     // 时长 2400ms → 0:02
     expect(html).toContain('0:02');
-    // **正文必须在**：这是「+ 文字」那一半
-    expect(html).toContain('data-testid="voice-text"');
-    expect(html).toContain('晚安，早点睡。');
-    // 播放器本体存在但仍需要文字：只给 audio 不算完成需求
+    expect(html).not.toContain('voice-text');
+    expect(html).not.toContain('晚安，早点睡。');
     expect(html).toContain('data-testid="voice-audio"');
     expect(html).toContain('data-testid="voice-toggle"');
   });
 
-  it('正文很长时也完整输出（不截断）', () => {
-    const long = '这是一段很长的语音转写文字，'.repeat(12);
-    const html = renderToStaticMarkup(<VoicePlayer voice={voice({ text: long })} />);
-    expect(html).toContain(long);
+  it('管理员需要显式触发后台正文读取', () => {
+    const html = renderToStaticMarkup(<OperatorSpeechText messageId="msg_voice_1" />);
+    expect(html).toContain('后台查看正文');
+    expect(html).not.toContain('晚安，早点睡。');
   });
 
   it('空正文时标签仍在：这条依然是语音', () => {
@@ -137,9 +134,8 @@ describe('播放失败必须说清楚（三种文案不合并）', () => {
 
     expect(new Set([expired, unsupported, other]).size).toBe(3);
     expect(expired).toContain('过期');
-    expect(unsupported).toContain('播不了');
-    // 播不了时内容不能丢——文字还在
-    expect(unsupported).toContain('文字');
+    expect(unsupported).toContain('不支持');
+    expect(unsupported).not.toContain('正文');
     expect(other).toContain('重试');
   });
 
@@ -152,6 +148,16 @@ describe('播放失败必须说清楚（三种文案不合并）', () => {
 });
 
 describe('取数封装：失败必须与"没有语音"区分', () => {
+  it('后台正文只从显式 operator 视图读取', async () => {
+    const calls: string[] = [];
+    const fake = (async (url: string) => {
+      calls.push(url);
+      return new Response(JSON.stringify({ message: { text: '后台正文' } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await fetchOperatorSpeechText('msg/1', fake)).toBe('后台正文');
+    expect(calls).toEqual(['/v1/speech/messages/msg%2F1?view=operator']);
+  });
+
   it('200 且空列表 → 没有语音（不算失败）', async () => {
     const fake = (async () =>
       new Response(JSON.stringify({ voice_messages: [] }), { status: 200 })) as typeof fetch;

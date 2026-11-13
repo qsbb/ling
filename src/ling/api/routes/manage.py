@@ -678,8 +678,15 @@ async def cancel_commitment(
 @router.get("/proactive")
 async def list_proactive(
     request: Request,
-    auth: CurrentAuth, session: DbSession, settings: SettingsDep, config: ConfigDep
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    config: ConfigDep,
+    view: str = "participant",
 ) -> dict:
+    from ling.api.deps import authorize_message_view
+
+    operator = authorize_message_view(auth, view)
     service = ProactivityService(session, actor_id=_actor_id(settings))
     try:
         effective_dialogue = (await config.effective()).dialogue
@@ -734,7 +741,8 @@ async def list_proactive(
                 "kind": o.kind,
                 "reason": o.reason,
                 # 生成好的开场白；None 表示还没生成（不是"生成了空的"）
-                "draft_text": o.draft_text,
+                "draft_text": o.draft_text if operator or o.output_modality != "voice" else "",
+                "output_modality": o.output_modality,
                 "expires_at": o.expires_at.isoformat(),
             }
             for o in pending
@@ -1076,6 +1084,7 @@ async def speech_status(auth: CurrentAuth, config: ConfigDep) -> dict:
     from ling.ports.speech import SPEECH_PROFILE_REQUIREMENTS
 
     effective = await config.effective()
+
     # 密钥**只从库里现读**：`app.state.secret_cache` 是同一个 provider_id 的
     # 一份进程内副本，用 `.get` 兜底会让「缓存里还是旧密钥」盖住「库里已经换成
     # 新密钥」——而这里的代价是拿一把废密钥去碰供应商。查询本身就是一次
@@ -1085,6 +1094,7 @@ async def speech_status(auth: CurrentAuth, config: ConfigDep) -> dict:
 
     tts = await build_tts_provider(effective, secret_reader=secret_reader)
     from ling.domains.speech.asr_providers import build_asr_provider
+
     asr = await build_asr_provider(effective, secret_reader=secret_reader)
 
     return {

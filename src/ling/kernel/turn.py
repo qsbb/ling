@@ -36,6 +36,7 @@ from ling.contracts.v1 import (
     CapabilityDescriptor,
     ChatMessage,
     ErrorCode,
+    Modality,
     Origin,
     PromptToolResult,
     TurnState,
@@ -99,6 +100,7 @@ from ling.ports.model import (
 if TYPE_CHECKING:
     from ling.capabilities.tag_specs import TurnEnvironment
     from ling.capabilities.tools import ToolRegistry, ToolResult, ToolSpec
+    from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
     from ling.kernel.context import CompiledContext, CompiledMessage
 
 # 排队等待参数：等不到就放弃对外流式（内容仍落库，前端能看到最终消息）
@@ -463,8 +465,6 @@ async def purge_expired_prompt_snapshots(
         )
     return {"scrubbed": scrubbed, "deleted": deleted}
 
-
-
 @dataclass
 class TurnStreamEvent:
     """SSE 事件的服务端表示。"""
@@ -570,6 +570,7 @@ class CancelRegistry:
     def __init__(self) -> None:
         self._tokens: dict[str, StopToken] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._force_cancel_tasks: dict[str, asyncio.Task] = {}
         # 流式中的半成品文本（内存态）：刷新后前端可继续显示
         self._partial: dict[str, str] = {}
 
@@ -583,10 +584,15 @@ class CancelRegistry:
         self._tokens[turn_id] = token
         self._tasks[turn_id] = task
 
-    def discard(self, turn_id: str) -> None:
+    def discard(self, turn_id: str, *, task: asyncio.Task | None = None) -> None:
+        if task is not None and self._tasks.get(turn_id) is not task:
+            return
         self._tokens.pop(turn_id, None)
         self._tasks.pop(turn_id, None)
         self._partial.pop(turn_id, None)
+        watchdog = self._force_cancel_tasks.pop(turn_id, None)
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
 
     def stop(self, turn_id: str) -> bool:
         """请求停止。
@@ -601,13 +607,27 @@ class CancelRegistry:
         token.stop()
         task = self._tasks.get(turn_id)
         if task is not None and not task.done():
+            existing = self._force_cancel_tasks.get(turn_id)
+            if existing is not None and not existing.done():
+                return True
+
             async def _force_cancel() -> None:
                 await asyncio.sleep(FORCE_CANCEL_AFTER_SECONDS)
                 if not task.done():
                     task.cancel()
 
             with contextlib.suppress(RuntimeError):  # 无事件循环时忽略
-                asyncio.get_running_loop().create_task(_force_cancel())
+                loop = asyncio.get_running_loop()
+                watchdog = loop.create_task(
+                    _force_cancel(), name=f"force-cancel:{turn_id}"
+                )
+                self._force_cancel_tasks[turn_id] = watchdog
+
+                def _forget_watchdog(done: asyncio.Task) -> None:
+                    if self._force_cancel_tasks.get(turn_id) is done:
+                        self._force_cancel_tasks.pop(turn_id, None)
+
+                watchdog.add_done_callback(_forget_watchdog)
         return True
 
     def is_running(self, turn_id: str) -> bool:
@@ -616,6 +636,13 @@ class CancelRegistry:
 
     def running_turns(self) -> list[str]:
         return [tid for tid, t in self._tasks.items() if not t.done()]
+
+
+@dataclass
+class _VoiceTurn:
+    service: VoiceReplyService
+    prepared: PreparedVoice
+    token: StopToken
 
 
 class TurnCoordinator:
@@ -672,8 +699,10 @@ class TurnCoordinator:
         tool_allowlist: frozenset[str] = frozenset(
             {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID}
         ),
+        settings: object | None = None,
     ) -> None:
         self._router = router
+        self._settings = settings
         self._tool_calls_enabled = tool_calls_enabled
         self._tool_registry = tool_registry
         self._tool_allowlist = frozenset(tool_allowlist)
@@ -808,8 +837,9 @@ class TurnCoordinator:
                 control.watch(turn_id, token, attempt),  # type: ignore[attr-defined]
                 name=f"stopwatch:{turn_id}",
             )
-        def _cleanup(_: asyncio.Task) -> None:
-            self._cancels.discard(turn_id)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._cancels.discard(turn_id, task=done)
             if watcher is not None:
                 watcher.cancel()
 
@@ -843,6 +873,10 @@ class TurnCoordinator:
         # 共用。`held_by_me` 仍保留（收尾、落库、`_finalize` 用它），但凡是
         # 需要"闭包改了、外面看得见"的地方都读 `floor.held`。
         floor = _FloorState()
+        voice_state = None
+        voice_probe_text = ""
+        voice_probe_done = False
+        voice_probe_selected = False
         # 本轮上下文里渲染给她的 `[msg_id:…]` → 原始平台 id。
         # 初始为 None（= "还没编译，无从校验"）：编译前就失败的路径不该
         # 因为"引用校验不可用"而误删她本来合法的引用。
@@ -900,6 +934,7 @@ class TurnCoordinator:
                     # 编译前就被要求停止：直接收敛，不浪费模型调用
                     await self._finalize(
                         conversation=conversation,
+                        voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
                         turn_id=turn_id,
@@ -934,6 +969,35 @@ class TurnCoordinator:
                 # 省略"（或反过来）的可能，而那种不一致不会报错，只会让输出
                 # 看起来莫名其妙。
                 is_group_window = is_group_visibility(window.visibility)
+                from ling.capabilities.voice_reply import VoiceReplyService, voice_help
+                from ling.config import get_settings
+                from ling.infra.security import SecretBox
+                from ling.settings.service import ConfigService
+
+                settings = self._settings or get_settings()
+                voice_service = None
+                prepared = None
+                channel_audio = str(window.channel or "") in {"", "web"} or (
+                    channel_capabilities is not None
+                    and channel_capabilities.enabled
+                    and channel_capabilities.media_supported(Modality.audio)
+                )
+                if channel_audio and config.dialogue.voice.kind is not None:
+                    try:
+                        voice_service = VoiceReplyService(session, settings=settings)
+                        prepared = await voice_service.prepare(
+                            config,
+                            secret_reader=ConfigService(
+                                session,
+                                SecretBox(settings),
+                                test_mode_default=settings.test_mode,
+                                persona_id=settings.persona_id,
+                            ).read_secret,
+                        )
+                    except Exception as exc:
+                        logger.info("语音能力本轮不可用 type=%s", type(exc).__name__)
+                if prepared is not None:
+                    voice_state = _VoiceTurn(voice_service, prepared, token)
                 compiled = await ContextCompiler(
                     session,
                     actor_id=self._actor_id,
@@ -945,6 +1009,7 @@ class TurnCoordinator:
                     secret_reader=self._secret_reader,
                     # 渠道能力决定提示词能列哪些动作（见 `run_turn` 的说明）。
                     channel_capabilities=channel_capabilities,
+                    voice_help=voice_help(config.dialogue.voice_willingness) if prepared else "",
                 ).compile(
                     subject_id=subject_id,
                     window_id=window_id,
@@ -1026,6 +1091,7 @@ class TurnCoordinator:
                     )
                     await self._finalize(
                         conversation=conversation,
+                        voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
                         turn_id=turn_id,
@@ -1051,6 +1117,7 @@ class TurnCoordinator:
                     # 编译期间被要求停止
                     await self._finalize(
                         conversation=conversation,
+                        voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
                         turn_id=turn_id,
@@ -1274,11 +1341,33 @@ class TurnCoordinator:
                     与原来那句 ``if not visible: continue`` 等价。
                     """
                     nonlocal held_by_me, withheld, floor_settled, lease_lost
+                    nonlocal voice_probe_text, voice_probe_done, voice_probe_selected
                     if not delta:
                         return ""
+                    if voice_probe_selected:
+                        return ""
+                    if voice_state is None and not voice_probe_done:
+                        voice_probe_text += delta
+                        candidate = voice_probe_text.lstrip()
+                        speak_tag = "[speak]"
+                        if speak_tag.startswith(candidate):
+                            return ""
+                        if candidate.startswith(speak_tag):
+                            voice_probe_selected = True
+                            voice_probe_done = True
+                            voice_probe_text = ""
+                            return ""
+                        delta = voice_probe_text
+                        voice_probe_text = ""
+                        voice_probe_done = True
                     # 这里**不**累积 `delivered`：累积点是 `_visible`（它无条件
                     # 收原文）。原来这两处都记一次，正文会被重复叠加一倍。
-                    self._cancels.set_partial(turn_id, delivered)
+                    self._cancels.set_partial(
+                        turn_id,
+                        ""
+                        if voice_state or voice_probe_selected or voice_probe_text
+                        else delivered,
+                    )
 
                     # 没有发言权就不对外输出（注意：原先照样推 delta，
                     # 等于"排队"是假的）。文字仍累积在缓冲，取得占用后
@@ -1306,7 +1395,9 @@ class TurnCoordinator:
                                         "state": TurnState.streaming.value,
                                         # 补齐时也要剥**两种**标记：这段是
                                         # 排队期间累积的原文。
-                                        "caught_up": strip_all_markers(delivered),
+                                        "caught_up": ""
+                                        if voice_state or voice_probe_selected
+                                        else strip_bracket_tags(strip_all_markers(delivered)),
                                         "note": "排到发言权，补齐排队期间产生的文字",
                                     },
                                 )
@@ -1334,6 +1425,8 @@ class TurnCoordinator:
                         return ""
 
                     visible = _visible(delta)
+                    if voice_state or voice_probe_selected:
+                        visible = ""
                     if self._stream_log is not None:
                         self._stream_log.append(
                             turn_id=turn_id, attempt=attempt, text=visible
@@ -1516,6 +1609,7 @@ class TurnCoordinator:
                         )
                         await self._finalize(
                             conversation=conversation,
+                            voice_state=voice_state,
                             window_id=window_id,
                             subject_id=subject_id,
                             turn_id=turn_id,
@@ -1607,7 +1701,7 @@ class TurnCoordinator:
                             turn_id=turn_id,
                             token=token,
                             queue=queue,
-                            held_by_me=held_by_me,
+                            held_by_me=held_by_me and voice_state is None,
                         )
                     elif skipped and (not delivered.strip() or withheld or must_rewrite):
                         delivered = await self._follow_up_after_watch(
@@ -1620,13 +1714,14 @@ class TurnCoordinator:
                             turn_id=turn_id,
                             token=token,
                             queue=queue,
-                            held_by_me=held_by_me,
+                            held_by_me=held_by_me and voice_state is None,
                         )
                     # 正文非空时：观察已经写进证据，下一轮上下文会自动带上
                     # （context.py 的描述块），**不再额外发一条消息**。
 
                 await self._finalize(
                     conversation=conversation,
+                    voice_state=voice_state,
                     window_id=window_id,
                     subject_id=subject_id,
                     turn_id=turn_id,
@@ -1657,6 +1752,7 @@ class TurnCoordinator:
                     )
                     await self._finalize(
                         conversation=conversation,
+                        voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
                         turn_id=turn_id,
@@ -1677,18 +1773,29 @@ class TurnCoordinator:
                 pass
             raise
         except Exception as exc:  # noqa: BLE001 - 兜底：任何异常都必须让前端看到
+            error_code = getattr(getattr(exc, "code", None), "value", None)
+            import traceback
+
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            logger.error(
+                "轮次执行异常 type=%s code=%s at=%s:%d",
+                type(exc).__name__,
+                error_code or "-",
+                frame.filename.rsplit("/", 1)[-1],
+                frame.lineno,
+            )
             await queue.put(
                 TurnStreamEvent(
                     event="turn.failed",
                     data={
                         "turn_id": turn_id,
                         "state": TurnState.failed.value,
-                        "text": delivered,
+                        "text": "" if voice_state or voice_probe_selected else delivered,
                         "error": {
                             "code": ErrorCode.internal.value,
                             "message": "服务端内部错误，请重试",
                             "retriable": True,
-                            "detail": str(exc)[:300],
+                            "detail": type(exc).__name__,
                         },
                     },
                 )
@@ -2312,6 +2419,7 @@ class TurnCoordinator:
         # （选择晚点回），只是这一轮没有话要说。塞进任何一条现有分支都会让
         # 库里写着 `failed`，而用户看到的是一条"她说等会儿"的正常轮次。
         handled_as: str | None = None,
+        voice_state: _VoiceTurn | None = None,
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -2371,6 +2479,12 @@ class TurnCoordinator:
         delivered = finalize_recall_text(delivered)
 
         actor_message: MessageView | None = None
+        from ling.capabilities.expression_choice import parse_speak_choice
+
+        choice = parse_speak_choice(delivered)
+        chose_voice = choice.explicit and choice.speak
+        if choice.explicit:
+            delivered = "" if choice.rejected else choice.text
         # 表达层：先去掉客服式追问，再按语义分段。
         # 顺序不能反——先分段会把"还有什么可以帮你吗"单独切成一段，
         # 之后就不好判断它是尾句了。
@@ -2479,6 +2593,81 @@ class TurnCoordinator:
                 model_label=target_label,
                 attempt=attempt,
             )
+        if actor_message is not None and chose_voice:
+            row = await conversation.session.get(Message, actor_message.message_id)
+            row.output_modality = "voice"
+            if stopped:
+                row.speech_state = "cancelled"
+            elif state is not TurnState.completed:
+                row.speech_state = "failed"
+            elif not floor_held:
+                row.speech_state = "cancelled"
+            else:
+                row.speech_state = "pending"
+            if state is TurnState.completed and choice.speak:
+                if voice_state is None:
+                    row.speech_state = "failed"
+                elif not floor_held:
+                    row.speech_state = "cancelled"
+                else:
+                    async def still_allowed() -> bool:
+                        if voice_state.token.stopped:
+                            return False
+                        from ling.infra.models import Window
+
+                        current = await conversation.session.get(
+                            Window, window_id, populate_existing=True
+                        )
+                        if current is None or current.archived:
+                            return False
+                        if (
+                            not is_group_visibility(current.visibility)
+                            and str(current.subject_id) != subject_id
+                        ):
+                            return False
+                        if self._deliver_gate is not None and not await self._deliver_gate():
+                            return False
+                        if self._speak_lease is not None:
+                            return await self._speak_lease.extend(
+                                actor_id=self._actor_id,
+                                window_id=window_id,
+                                turn_id=turn_id,
+                            )
+                        return True
+
+                    try:
+                        from ling.capabilities.voice_reply import VoiceReplyService
+
+                        service = VoiceReplyService(
+                            conversation.session,
+                            settings=voice_state.service.settings,
+                        )
+                        ready = await service.synthesize(
+                            row,
+                            prepared=voice_state.prepared,
+                            subject_id=subject_id,
+                            allowed=still_allowed,
+                        )
+                        window = await conversation.get_window_for_turn(
+                            window_id, subject_id=subject_id
+                        )
+                        if ready and str(window.channel or "") in {"web", ""}:
+                            row.speech_delivery_state = "delivered"
+                    except asyncio.CancelledError:
+                        row.speech_state = "cancelled"
+                        row.state = TurnState.stopped.value
+                        state = TurnState.stopped
+                    except Exception as exc:
+                        row.speech_state = "failed"
+                        logger.warning("语音回复失败 turn=%s type=%s", turn_id, type(exc).__name__)
+            from ling.capabilities.voice_reply import record_voice_reply
+
+            voice_window = await conversation.get_window_for_turn(
+                window_id, subject_id=subject_id
+            )
+            if str(voice_window.channel or "") in {"web", ""} or row.speech_state != "ready":
+                await record_voice_reply(conversation.session, row)
+            actor_message = conversation._to_view(row)
         await conversation.set_turn_state(
             turn_id,
             state,
@@ -2522,6 +2711,12 @@ class TurnCoordinator:
                 .values(handled_as="deferred", handled_reason="她选择过一会儿再回")
             )
             await conversation.session.flush()
+        elif chose_voice and actor_message is not None and actor_message.speech_state != "ready":
+            await conversation.correct_handled_for_turn(
+                turn_id,
+                outcome="failed",
+                reason="语音未生成，没有对外交付",
+            )
         elif state is TurnState.completed and delivered and floor_held:
             await conversation.correct_handled_for_turn(turn_id, outcome="replied")
         elif state is TurnState.completed and delivered:
@@ -2665,7 +2860,9 @@ class TurnCoordinator:
                     data={
                         "turn_id": turn_id,
                         "state": state.value,
-                        "text": delivered,
+                        "text": ""
+                        if actor_message and actor_message.output_modality == "voice"
+                        else delivered,
                         "model_label": target_label,
                         "error": {
                             "code": code.value if code else ErrorCode.internal.value,
@@ -2850,14 +3047,13 @@ class TurnCoordinator:
                 tools=definitions,
                 provider_kind=kind,
                 model_id=model_id,
-            )
+            ),
         )
 
     def _resolved_tool_target(
         self, config: EffectiveConfig, profile: str
     ) -> tuple[str, str]:
         """本轮会落到哪个 model / 哪个 provider kind。
-
         解析失败时返回 ``("", "")``：那意味着这一轮根本没有可用模型，工具自然
         也不可用，而且很快会在 ``router.stream`` 上以明确的 ``ModelError``
         报出来——这里不该抢先造一个不同的错误。
@@ -3257,6 +3453,7 @@ class TurnCoordinator:
             ChatMessageIn(role="assistant", content="", tool_calls=tuple(accepted_calls)),
             *results,
         ]
+
 
 #: ``operations.kind``：她提议撤回、等用户确认。与 ``delivery`` 分开：
 #: 那是"我们发出去的动作"，这是"她想做但还没被批准的動作"。
@@ -3752,6 +3949,7 @@ def _channel_id_of(compiled: object) -> str:
     if not isinstance(env_meta, dict):
         return ""
     return str(env_meta.get("channel") or "")
+
 
 def describe_turn_failure(data: dict[str, Any] | None) -> str:
     """把 ``turn.failed`` 事件的 ``error`` 说成一句**能据以行动**的话。

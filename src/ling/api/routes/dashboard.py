@@ -261,7 +261,8 @@ async def get_dashboard(
                     "reason": top.reason,
                     "state": top.state,
                     # None = 还没生成（不是"生成了空的"），前端要能区分
-                    "draft_text": top.draft_text,
+                    "draft_text": top.draft_text if top.output_modality != "voice" else "",
+                    "output_modality": top.output_modality,
                     "expires_at": top.expires_at.isoformat(),
                 },
             },

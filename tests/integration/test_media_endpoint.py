@@ -15,8 +15,8 @@
    播放（`media_play_events`）。合并之后"发出去的没人听"和"没发出去但主人
    自己听了"都无法表达。这里断言两边的行**互不影响**：播放若干次不会新增
    任何 `delivery_receipts`，也不会改 `operations.state`。
-4. **「语音标签 + 文字」**：后台必须同时拿到"这是一条语音"（`kind=audio`）与
-   **文字原文**。只给播放器等于把内容藏起来。
+4. **语音的双投影**：参与者默认只拿到语音播放器，正文为空；owner/admin
+   显式请求后台投影时，同时拿到语音标签（`kind=audio`）与**文字原文**。
 
 ## 为什么每个断言都对着真实 HTTP
 
@@ -337,7 +337,7 @@ async def test_soft_deleted_asset_is_404(web_env: TestEnv) -> None:
 async def test_voice_messages_lists_label_and_text(
     logged_in: TestEnv,
 ) -> None:
-    """用户要求：后台看得见「语音标签 + 文字」，不是只有一个播放器。"""
+    """参与者正文隐藏，owner 显式后台视图可读「语音标签 + 文字」。"""
     env = logged_in
     window_id = await _make_window(env, env.subject_id)
     message_id, digest = await _make_voice_message(
@@ -358,13 +358,23 @@ async def test_voice_messages_lists_label_and_text(
     assert item["mime_type"].startswith("audio/")
     assert "/v1/media/generated/" in item["url"]
     assert "sig=" in item["url"]
-    # 「文字是什么」：正文原文必须在，且与消息表一致
-    assert item["text"] == "我到楼下了，你下来吧。"
+    assert item["text"] == ""
+    assert "我到楼下了，你下来吧。" not in response.text
     assert item["duration_ms"] == 2400
     # 两种记录各自独立（此刻都没发生）
     assert item["delivered"] is False
     assert item["played"] is False
     assert item["play_count"] == 0
+
+    operator = await env.client.get(
+        f"/v1/sessions/{window_id}/voice-messages", params={"view": "operator"}
+    )
+    assert operator.status_code == 200
+    operator_items = operator.json()["voice_messages"]
+    assert len(operator_items) == 1
+    assert operator_items[0]["message_id"] == message_id
+    assert operator_items[0]["kind"] == "audio"
+    assert operator_items[0]["text"] == "我到楼下了，你下来吧。"
 
 
 async def test_voice_messages_excludes_non_voice_and_foreign_windows(
@@ -373,7 +383,7 @@ async def test_voice_messages_excludes_non_voice_and_foreign_windows(
     """没有音频的消息不出现；**别人的窗口**返回空列表（不泄漏窗口是否存在）。"""
     env = logged_in
     mine = await _make_window(env, env.subject_id)
-    await _make_voice_message(env, mine, text="这条有音频")
+    message_id, _ = await _make_voice_message(env, mine, text="这条有音频")
     # 一条纯文字消息（无音频）
     async with session_scope() as session:
         session.add(
@@ -390,13 +400,28 @@ async def test_voice_messages_excludes_non_voice_and_foreign_windows(
         await session.commit()
 
     response = await env.client.get(f"/v1/sessions/{mine}/voice-messages")
-    texts = [item["text"] for item in response.json()["voice_messages"]]
-    assert texts == ["这条有音频"]
+    assert response.status_code == 200
+    items = response.json()["voice_messages"]
+    assert [item["message_id"] for item in items] == [message_id]
+    assert [item["text"] for item in items] == [""]
+    assert "这条有音频" not in response.text
+    operator = await env.client.get(
+        f"/v1/sessions/{mine}/voice-messages", params={"view": "operator"}
+    )
+    assert operator.status_code == 200
+    operator_items = operator.json()["voice_messages"]
+    assert [item["message_id"] for item in operator_items] == [message_id]
+    assert [item["text"] for item in operator_items] == ["这条有音频"]
 
     foreign = await _make_window(env, "subj_someone_else", title="别人的")
     foreign_body = await env.client.get(f"/v1/sessions/{foreign}/voice-messages")
     assert foreign_body.status_code == 200
     assert foreign_body.json()["voice_messages"] == []
+    foreign_operator = await env.client.get(
+        f"/v1/sessions/{foreign}/voice-messages", params={"view": "operator"}
+    )
+    assert foreign_operator.status_code == 200
+    assert foreign_operator.json()["voice_messages"] == []
 
 
 async def test_user_voice_messages_are_not_in_this_list(
@@ -408,11 +433,31 @@ async def test_user_voice_messages_are_not_in_this_list(
     """
     env = logged_in
     window_id = await _make_window(env, env.subject_id)
-    await _make_voice_message(env, window_id, text="她说的", role="actor")
-    await _make_voice_message(env, window_id, text="用户说的", role="user")
+    actor_message_id, _ = await _make_voice_message(
+        env, window_id, text="她说的", role="actor"
+    )
+    user_message_id, _ = await _make_voice_message(
+        env, window_id, text="用户说的", role="user"
+    )
 
     response = await env.client.get(f"/v1/sessions/{window_id}/voice-messages")
-    assert [i["text"] for i in response.json()["voice_messages"]] == ["她说的"]
+    assert response.status_code == 200
+    items = response.json()["voice_messages"]
+    assert [item["message_id"] for item in items] == [actor_message_id]
+    assert user_message_id not in response.text
+    assert [item["text"] for item in items] == [""]
+    assert "她说的" not in response.text
+    assert "用户说的" not in response.text
+
+    operator = await env.client.get(
+        f"/v1/sessions/{window_id}/voice-messages", params={"view": "operator"}
+    )
+    assert operator.status_code == 200
+    operator_items = operator.json()["voice_messages"]
+    assert [item["message_id"] for item in operator_items] == [actor_message_id]
+    assert [item["text"] for item in operator_items] == ["她说的"]
+    assert user_message_id not in operator.text
+    assert "用户说的" not in operator.text
 
 
 def test_signed_url_ttl_is_short_for_web() -> None:

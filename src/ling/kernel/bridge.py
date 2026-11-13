@@ -34,7 +34,7 @@ from ling.contracts.v1 import InteractionEnvelope
 from ling.domains.conversation.service import ConversationService
 from ling.domains.identity.service import IdentityService
 from ling.domains.media.service import MediaEvidenceError, MediaEvidenceService
-from ling.infra.models import Window
+from ling.infra.models import Message, Turn, Window
 from ling.kernel.autonomy import (
     AutonomyTurnService,
     _looks_urgent,
@@ -52,6 +52,26 @@ if TYPE_CHECKING:
     from ling.infra.models import Turn
 
 logger = logging.getLogger("ling.kernel.bridge")
+
+
+async def _voice_delivery_still_allowed(session: AsyncSession, message: Message) -> bool:
+    """Recheck the completed turn immediately before an external voice send."""
+    if not message.turn_id:
+        return False
+    turn = await session.get(Turn, message.turn_id, populate_existing=True)
+    window = await session.get(Window, message.window_id, populate_existing=True)
+    if turn is None or turn.state != "completed" or window is None or window.archived:
+        return False
+    newer_user_message = await session.scalar(
+        select(Message.id)
+        .where(
+            Message.window_id == message.window_id,
+            Message.role == "user",
+            Message.sequence > message.sequence,
+        )
+        .limit(1)
+    )
+    return newer_user_message is None
 
 # ---------------------------------------------------------------- 出站节奏/限速
 #
@@ -338,7 +358,9 @@ class InboundBridge:
         # 切换人格之后，入站消息仍然按旧人格处理"。
         persona_id: str | None = None,
         actor_id: str = "actor_ling",
+        settings: object | None = None,
     ) -> None:
+        self._settings = settings
         self._session = session
         self._coordinator = coordinator
         self._connector = connector
@@ -356,8 +378,7 @@ class InboundBridge:
         self._actor_id = actor_id
 
     async def handle(self, envelope: InteractionEnvelope, *, resume_message_id: str | None = None) -> BridgeResult:
-        # 1) 身份：私聊只接受**已证明**的绑定（不猜）；群聊允许"只认识账号"。
-        #
+        # 1) 身份：私聊只接受**已证明**的绑定（不猜）；群聊允许"只认识账号"。        #
         # 原来群里没走过绑定流程的人整条被拒——她只能听见已绑定的人说话，
         # 等于在有别人的群里是聋的。现在群里自动建 known 级 subject：
         # 能听见，但记忆只限本群、跨窗召回不开放（见 IDENTITY-MULTIUSER-DESIGN）。
@@ -487,6 +508,7 @@ class InboundBridge:
         if resume_message_id is None and any(p.modality.value == "audio" for p in envelope.parts):
             from ling.domains.media.service import MediaEvidenceService
             from ling.domains.speech.transcription import TranscriptionError, create_job
+
             svc = MediaEvidenceService(self._session, actor_id=self._actor_id)
             for eid in media_ids:
                 evidence = await svc.get(eid, window_id=window.id)
@@ -1639,6 +1661,16 @@ class InboundBridge:
                 state = str(data.get("state") or name)
                 message = data.get("message") or {}
                 reply_text = str(message.get("text") or "")
+                if message.get("output_modality") == "voice":
+                    from ling.infra.models import Message
+
+                    voice_message = await self._session.get(
+                        Message,
+                        message.get("message_id"),
+                        populate_existing=True,
+                    )
+                    if voice_message is not None:
+                        reply_text = voice_message.text
                 expression = data.get("expression") or expression
                 # 事件里已经有这两个事实，就必须接住（见 docstring）。
                 suppressed_reason = str(data.get("suppressed_reason") or "") or None
@@ -1724,6 +1756,41 @@ class InboundBridge:
         from ling.ports.channel import OutboundMessage
 
         is_group = is_group_window_ref(envelope.window_ref)
+        if turn_id:
+            from ling.capabilities.voice_reply import VoiceReplyService
+            from ling.config import get_settings
+            from ling.infra.models import Message
+
+            voice_message = await self._session.scalar(
+                select(Message)
+                .where(
+                    Message.turn_id == turn_id,
+                    Message.role == "actor",
+                    Message.output_modality == "voice",
+                )
+                .order_by(Message.sequence.desc())
+                .limit(1)
+            )
+            if voice_message is not None:
+                if not await _voice_delivery_still_allowed(self._session, voice_message):
+                    voice_message.speech_delivery_state = "cancelled"
+                    from ling.capabilities.voice_reply import record_voice_reply
+
+                    await record_voice_reply(self._session, voice_message)
+                    await self._session.commit()
+                    return False, 0, 1
+                delivered = await VoiceReplyService(
+                    self._session,
+                    settings=self._settings or get_settings(),
+                ).deliver(
+                    voice_message,
+                    connector=self._connector,
+                    window_ref=envelope.window_ref,
+                    subject_id=subject_id,
+                    is_group=is_group,
+                )
+                await self._session.commit()
+                return delivered, int(delivered), 1
         # 渠道硬上限：能拿到就用，拿不到让 `plan_parts` 用保守兜底。
         # 不传这个值就等于"假设渠道没有上限"——正是尾段被整条拒收的成因。
         caps = getattr(self._connector, "capabilities", None)
@@ -1866,6 +1933,7 @@ class InboundBridge:
             )
 
         return (sent == len(parts), sent, len(parts))
+
 
 __all__ = ["BridgeResult", "InboundBridge"]
 

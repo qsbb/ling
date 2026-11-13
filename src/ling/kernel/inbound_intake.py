@@ -259,6 +259,7 @@ async def process_inbound_payload(app: object, connector: object, payload: dict,
         coordinator = getattr(state, "bridge_coordinator", None)
         if coordinator is None:
             coordinator = TurnCoordinator(
+                settings=settings,
                 router=state.router,
                 actor_id=settings.actor_id,
                 persona_id=settings.persona_id,
@@ -273,6 +274,7 @@ async def process_inbound_payload(app: object, connector: object, payload: dict,
             )
         bridge = InboundBridge(
             session,
+            settings=settings,
             coordinator=coordinator,
             connector=connector,
             secret_box=state.secret_box,

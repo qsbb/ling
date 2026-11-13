@@ -41,16 +41,13 @@
 onebot/qqbot/qq 的 `connector.send` 只负责把消息发出去，不向平台透传
 operation_id，平台也无从按它去重或对账。
 
-## 已知限制（本轮只记录，留给 task-13 验收）
+## 认领、崩溃与异常边界
 
-- **不是 crash-safe 的**：结算与整轮投递共用一个事务。消息已经发出、进程在
-  提交前崩掉时，机会仍是 `candidate`——下一轮会重发。要真正防重复，得在发送
-  **之前**原子认领机会（`UPDATE … WHERE state='candidate' RETURNING`）并单独
-  提交，而不是发完再改状态。
-- **不是多实例幂等的**：候选查询没有行锁，也没有"先认领再发"的原子动作。两个
-  worker、两个重叠的 tick、或同一条调度消息被重投时，同一批候选会被各发一条。
-  单副本部署通常串行，所以现在没暴露——但那靠调度顺序，不是靠约束。
-- **未捕获异常的路径上，本地 operation/receipt 行不存在**。`deliver` 自己捕获
+发送前会用 `idempotency_keys` 的唯一键认领机会，并单独提交认领状态。并发 worker
+只有一个能越过该闸。认领超过 `STALE_CLAIM_SECONDS` 仍未结算时，按
+`uncertain` 收敛，**不自动重发**：平台可能已经收下，但本地无法证明。
+
+**未捕获异常的路径上，本地 operation/receipt 行仍不存在**。`deliver` 自己捕获
   `ChannelError` 并写好 `operation` + `delivery_receipts` 后正常返回，这类失败
   （含 `uncertain`）的本地行留得下；只有**逃出 `deliver` 的异常**——connector
   抛出的异常不是 `ChannelError`（没被那层 except 接住），或 `deliver` 建
@@ -69,19 +66,148 @@ operation_id，平台也无从按它去重或对账。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import ProactiveOpportunity, Window, utcnow
+from ling.infra.models import IdempotencyKey, ProactiveOpportunity, Window, utcnow
+from ling.infra.security import new_id
 from ling.logging_setup import emit_event
 
 logger = logging.getLogger("ling.domains.proactive.dispatch")
 
 MAX_PER_ROUND = 3
+STALE_CLAIM_SECONDS = 300
+PROACTIVE_DISPATCH_SCOPE = "proactive_dispatch"
+_DISPATCH_IN_PROGRESS = "v1:in_progress"
+_DISPATCH_FINAL_STATES = frozenset({"sent", "rejected", "failed", "uncertain"})
+
+
+def _claim_is_stale(created_at: datetime | None, now: datetime) -> bool:
+    if created_at is None:
+        return True
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return now - created_at >= timedelta(seconds=STALE_CLAIM_SECONDS)
+
+
+def _claim_state(result_ref: str | None) -> str:
+    parts = str(result_ref or "").split(":", 2)
+    if len(parts) >= 2 and parts[0] == "v1" and parts[1] in _DISPATCH_FINAL_STATES:
+        return parts[1]
+    return "uncertain"
+
+
+async def _recover_abandoned_claims(
+    session: AsyncSession, *, actor_id: str, now: datetime
+) -> int:
+    """Settle old in-flight sends as uncertain; never return them to the send queue."""
+    claimed = (
+        await session.execute(
+            select(ProactiveOpportunity, IdempotencyKey)
+            .join(
+                IdempotencyKey,
+                and_(
+                    IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
+                    IdempotencyKey.key == ProactiveOpportunity.id,
+                ),
+            )
+            .where(
+                ProactiveOpportunity.actor_id == actor_id,
+                ProactiveOpportunity.state == "dispatching",
+                IdempotencyKey.result_ref == _DISPATCH_IN_PROGRESS,
+            )
+        )
+    ).all()
+    recovered = 0
+    for opportunity, claim in claimed:
+        if not _claim_is_stale(claim.created_at, now):
+            continue
+        opportunity.state = "uncertain"
+        opportunity.delivery_state = "uncertain"
+        opportunity.rejected_reason = "投递认领已超时，平台可能已收到"
+        claim.result_ref = "v1:uncertain:abandoned"
+        recovered += 1
+    if recovered:
+        await session.commit()
+        logger.warning("主动投递回收 %d 条超时认领，均记为 uncertain", recovered)
+    return recovered
+
+
+async def _claim_opportunity(
+    session: AsyncSession, opportunity: ProactiveOpportunity, *, now: datetime
+) -> str:
+    """Atomically reserve one opportunity before any external send begins."""
+    key = str(opportunity.id)
+    claim = await session.scalar(
+        select(IdempotencyKey).where(
+            IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
+            IdempotencyKey.key == key,
+        )
+    )
+    if claim is not None:
+        if claim.result_ref == _DISPATCH_IN_PROGRESS:
+            if not _claim_is_stale(claim.created_at, now):
+                return "busy"
+            final_state = "uncertain"
+            claim.result_ref = "v1:uncertain:abandoned"
+        else:
+            final_state = _claim_state(claim.result_ref)
+            claim.result_ref = f"v1:{final_state}"
+        opportunity.state = final_state
+        opportunity.delivery_state = final_state
+        if final_state == "sent" and opportunity.sent_at is None:
+            opportunity.sent_at = now
+        if final_state == "uncertain":
+            opportunity.rejected_reason = "投递结果不确定，禁止自动重发"
+        await session.commit()
+        return final_state
+
+    claim = IdempotencyKey(
+        id=new_id("idem"),
+        scope=PROACTIVE_DISPATCH_SCOPE,
+        key=key,
+        result_ref=_DISPATCH_IN_PROGRESS,
+        created_at=now,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(claim)
+            await session.flush()
+    except IntegrityError:
+        # Another dispatcher committed the same key while this one was inserting.
+        existing = await session.scalar(
+            select(IdempotencyKey).where(
+                IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
+                IdempotencyKey.key == key,
+            )
+        )
+        if existing is None:
+            raise
+        return await _claim_opportunity(session, opportunity, now=now)
+
+    opportunity.state = "dispatching"
+    await session.commit()
+    return "claimed"
+
+
+async def _set_claim_result(
+    session: AsyncSession, *, opportunity_id: str, state: str
+) -> None:
+    claim = await session.scalar(
+        select(IdempotencyKey).where(
+            IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
+            IdempotencyKey.key == opportunity_id,
+        )
+    )
+    if claim is not None:
+        claim.result_ref = f"v1:{state}"
+        await session.flush()
 
 
 async def _target_window(
@@ -199,6 +325,8 @@ async def dispatch_pending(
     limit: int = MAX_PER_ROUND,
     deliver_to_web: bool = False,
     connector_for_window: Callable[[str, str], Awaitable[object | None]] | None = None,
+    voice_dispatch: Callable[[ProactiveOpportunity, Window, object | None], Awaitable[str]]
+    | None = None,
 ) -> dict[str, int | str]:
     """把有草稿的候选真的发出去。
 
@@ -222,15 +350,26 @@ async def dispatch_pending(
     from ling.ports.channel import OutboundMessage
 
     moment = now or utcnow()
+    recovered_uncertain = await _recover_abandoned_claims(
+        session, actor_id=actor_id, now=moment
+    )
     try:
         effective = await config_reader.effective()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001 - 读不到配置就不发
         logger.info("主动投递跳过：配置不可用（%s）", type(exc).__name__)
-        return {"skipped": "config_unavailable"}
+        return {
+            "skipped": "config_unavailable",
+            "failed": recovered_uncertain,
+            "uncertain": recovered_uncertain,
+        }
 
     if not bool(effective.dialogue.proactive_delivery_enabled):
         # 默认路径：只生成不发送。要让用户能看见"没发"，而不是以为发了。
-        return {"skipped": "disabled"}
+        return {
+            "skipped": "disabled",
+            "failed": recovered_uncertain,
+            "uncertain": recovered_uncertain,
+        }
 
     # **必须把已发布的 dialogue 策略传下去**。不传时 `ProactivityService`
     # 会退回 `DialoguePolicy()` 的默认值（日限额 2、勿扰 0-0 → 恒不生效），
@@ -240,6 +379,25 @@ async def dispatch_pending(
     service = ProactivityService(
         session, actor_id=actor_id, policy=effective.dialogue
     )
+
+    async def settle(
+        row: ProactiveOpportunity,
+        *,
+        state: str,
+        reason: str | None = None,
+        operation_id: str | None = None,
+        delivery_state: str | None = None,
+    ) -> None:
+        await service.mark(
+            row.id,
+            state=state,
+            reason=reason,
+            operation_id=operation_id,
+            delivery_state=delivery_state,
+        )
+        await _set_claim_result(session, opportunity_id=row.id, state=state)
+        await session.commit()
+
     rows = (
         (
             await session.execute(
@@ -258,8 +416,18 @@ async def dispatch_pending(
         .all()
     )
 
-    sent = failed = rejected = uncertain = 0
+    sent = rejected = 0
+    failed = uncertain = recovered_uncertain
     gate_cache: dict[str, object] = {}
+
+    async def reserve(row: ProactiveOpportunity) -> bool:
+        nonlocal failed, uncertain
+        claim_state = await _claim_opportunity(session, row, now=moment)
+        if claim_state == "uncertain":
+            failed += 1
+            uncertain += 1
+        return claim_state == "claimed"
+
     for row in rows:
         gate = gate_cache.get(row.subject_id)
         if gate is None:
@@ -283,6 +451,7 @@ async def dispatch_pending(
 
         selected = connector
         window_ref = None
+        selected_window: Window | None = None
         if connector_for_window is not None:
             target = await session.scalar(select(Window).where(
                 Window.subject_id == row.subject_id,
@@ -294,8 +463,19 @@ async def dispatch_pending(
                 selected = await connector_for_window(str(target.channel), window_ref)
                 if selected is not None:
                     capabilities = selected.capabilities()
-                    if not capabilities.enabled or not capabilities.supports_proactive:
+                    supports_voice = True
+                    if row.output_modality == "voice":
+                        from ling.contracts.v1 import Modality
+
+                        supports_voice = capabilities.media_supported(Modality.audio)
+                    if (
+                        not capabilities.enabled
+                        or not capabilities.supports_proactive
+                        or not supports_voice
+                    ):
                         selected = None
+                    else:
+                        selected_window = target
         if selected is None:
             # Web 投递：没有外部渠道时的唯一路径。
             if not deliver_to_web:
@@ -304,10 +484,11 @@ async def dispatch_pending(
                 session, subject_id=row.subject_id, channel="web"
             )
             if window is None:
-                await service.mark(
-                    row.id, state="rejected", reason="没有可投递的 Web 会话"
-                )
-                rejected += 1
+                if await reserve(row):
+                    await settle(
+                        row, state="rejected", reason="没有可投递的 Web 会话"
+                    )
+                    rejected += 1
                 continue
             emit_event(
                 logger,
@@ -316,25 +497,97 @@ async def dispatch_pending(
                 message="没有可用的外部主动推送实例，改投 Web 会话",
                 attributes={"reason_code": "no_proactive_channel", "opportunity_id": row.id},
             )
+            if row.output_modality == "voice":
+                if not await reserve(row):
+                    continue
+                try:
+                    result = (
+                        await voice_dispatch(row, window, None)
+                        if voice_dispatch
+                        else "failed"
+                    )
+                except asyncio.CancelledError:
+                    await settle(
+                        row,
+                        state="uncertain",
+                        reason="语音投递期间任务取消，结果无法确认",
+                        delivery_state="uncertain",
+                    )
+                    raise
+                await settle(
+                    row,
+                    state="sent" if result == "delivered" else result,
+                    delivery_state=result,
+                )
+                sent += result == "delivered"
+                failed += result != "delivered"
+                uncertain += result == "uncertain"
+                continue
+            if not await reserve(row):
+                continue
             await _append_web_message(
                 session,
                 window_id=window.id,
                 text=str(row.draft_text),
                 opportunity_id=row.id,
             )
-            await service.mark(row.id, state="sent", reason="web")
+            await settle(row, state="sent", reason="web")
             sent += 1
             continue
 
         if window_ref is None:
             window_ref = await _target_window_ref(session, subject_id=row.subject_id)
         if window_ref is None:
-            await service.mark(
-                row.id, state="rejected", reason="没有可投递的私聊会话"
-            )
-            rejected += 1
+            if await reserve(row):
+                await settle(
+                    row, state="rejected", reason="没有可投递的私聊会话"
+                )
+                rejected += 1
             continue
 
+        if row.output_modality == "voice":
+            if not await reserve(row):
+                continue
+            window = selected_window
+            if window is None:
+                window = await session.scalar(
+                    select(Window)
+                    .where(
+                        Window.subject_id == row.subject_id,
+                        Window.title == window_ref,
+                        Window.channel.in_(("onebot", "qqbot")),
+                        Window.visibility == "subject_private",
+                        Window.archived.is_(False),
+                    )
+                    .order_by(Window.last_message_at.desc().nulls_last())
+                    .limit(1)
+                )
+            try:
+                result = (
+                    await voice_dispatch(row, window, selected)
+                    if voice_dispatch and window
+                    else "failed"
+                )
+            except asyncio.CancelledError:
+                await settle(
+                    row,
+                    state="uncertain",
+                    reason="语音投递期间任务取消，结果无法确认",
+                    delivery_state="uncertain",
+                )
+                raise
+            await settle(
+                row,
+                state="sent" if result == "delivered" else result,
+                delivery_state=result,
+            )
+            sent += result == "delivered"
+            failed += result != "delivered"
+            uncertain += result == "uncertain"
+            continue
+
+        if not await reserve(row):
+            continue
         delivery = DeliveryService(session)
         probe = _SendProbe(selected)
         try:
@@ -360,6 +613,15 @@ async def dispatch_pending(
                     # 不会把 operation 交回来，事后只能靠 payload 反查。
                     payload_extra={"opportunity_id": row.id, "source": "proactive"},
                 )
+        except asyncio.CancelledError:
+            await settle(
+                row,
+                state="uncertain",
+                reason="投递期间任务取消，平台可能已收到",
+                operation_id=probe.operation_id,
+                delivery_state="uncertain",
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - 一次失败不该中断整轮
             state, delivery_state, note = _settle_exception(probe, exc)
             logger.warning(
@@ -378,8 +640,8 @@ async def dispatch_pending(
             # 也一起被撤掉——机会上留下的 `delivery_operation_id` 只是本地
             # operation ID 的残留，本地查不到对应行，只能和上面那条 warning
             # 日志对上（见模块文档「已知限制」）。
-            await service.mark(
-                row.id,
+            await settle(
+                row,
                 state=state,
                 reason=note,
                 operation_id=probe.operation_id,
@@ -401,8 +663,8 @@ async def dispatch_pending(
         )
 
         if outcome.delivered:
-            await service.mark(
-                row.id,
+            await settle(
+                row,
                 state="sent",
                 operation_id=outcome.operation_id,
                 delivery_state=receipt_state,
@@ -412,8 +674,8 @@ async def dispatch_pending(
             # 不确定 ≠ 失败：结果未知只能等对账，**不能盲目重发**。
             # 重复发一条"在吗"比没发更糟。
             unknown = outcome.state is OperationState.uncertain
-            await service.mark(
-                row.id,
+            await settle(
+                row,
                 state="uncertain" if unknown else "failed",
                 reason=outcome.detail or "投递未成功",
                 operation_id=outcome.operation_id,

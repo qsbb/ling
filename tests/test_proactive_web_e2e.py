@@ -104,6 +104,9 @@ class _FixedRouter:
 
 
 class _TestConfig:
+    async def read_secret(self, *_args, **_kwargs):  # noqa: ANN201
+        return None
+
     async def effective(self):  # noqa: ANN201
         return SimpleNamespace(
             # `domains/persona/current.py::effective_persona_id` 会读这个字段
@@ -116,6 +119,8 @@ class _TestConfig:
                 proactive_daily_limit=2,
                 quiet_start=(23, 0),
                 quiet_end=(8, 0),
+                voice=SimpleNamespace(kind=None),
+                voice_willingness="natural",
             )
         )
 

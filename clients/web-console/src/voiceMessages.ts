@@ -29,6 +29,23 @@ export interface VoiceMessagesResult {
   reason: string | null;
 }
 
+export async function fetchOperatorSpeechText(
+  messageId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  try {
+    const response = await fetchImpl(
+      `/v1/speech/messages/${encodeURIComponent(messageId)}?view=operator`,
+      { credentials: 'include' },
+    );
+    if (!response.ok) return null;
+    const payload = await response.json() as { message?: { text?: unknown } };
+    return typeof payload.message?.text === 'string' ? payload.message.text : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 会话里可播放的语音消息。 */
 export async function fetchVoiceMessages(
   sessionId: string,
