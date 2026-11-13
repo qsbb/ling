@@ -14,6 +14,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import cast
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -406,7 +407,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for head in interrupted:
             await recovery._mark_failed(
                 session, scope=head.scope, instance_id=head.instance_id,
-                revision_id=head.candidate_revision_id,
+                revision_id=cast(str, head.candidate_revision_id),
                 outcome=SwapOutcome(ok=False, error_code="activation_interrupted",
                                     error_safe="上次配置切换被中断，已恢复已发布配置"),
                 state=STATE_ROLLED_BACK,

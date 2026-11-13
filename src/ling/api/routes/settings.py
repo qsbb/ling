@@ -36,6 +36,7 @@ from ling.ports.model import (
     required_capability,
     slot_for_profile,
 )
+from ling.settings.connector_service import ConnectorServiceError
 from ling.settings.service import (
     KNOWN_PROVIDER_KINDS,
     PROFILE_DEGRADATIONS,
@@ -848,7 +849,7 @@ async def get_connectors(
         )
         values = resolved.fields_by_key()
         runtime = getattr(request.app.state, "connector_runtime", None)
-        components = runtime.components(scope, selected) if hasattr(runtime, "components") else {}
+        components = runtime.components(scope, selected) if runtime is not None and hasattr(runtime, "components") else {}
         if selected == DEFAULT_INSTANCE_ID:
             components = {name: getattr(request.app.state, name, None) for name in (
                 "onebot_ws_server", "onebot_ws", "qqbot_gateway",
@@ -1011,7 +1012,7 @@ def _connector_service(request: Request, auth: object, session: AsyncSession):  
     )
 
 
-def _runtime_instance_error(exc: object) -> LingError:
+def _runtime_instance_error(exc: ConnectorServiceError) -> LingError:
     return LingError(
         ErrorCode.conflict if exc.status_code == 409 else ErrorCode.invalid_request,
         exc.message, status_code=exc.status_code, detail=exc.code, field=exc.field_name,

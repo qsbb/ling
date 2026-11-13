@@ -188,7 +188,7 @@ async def load_voice_assets(
     非 owner 窗口直接返回空列表——调用方会把"空"和"不存在"渲染成同一句话。
     """
     window = await _window_of(session, window_id)
-    if not _owner_only(window, subject_id):
+    if window is None or not _owner_only(window, subject_id):
         return []
 
     query = select(Message).where(

@@ -30,6 +30,7 @@ import time
 
 from ling.infra.db import session_scope
 from ling.kernel.visibility import group_id_from_window_ref, is_group_window_ref
+from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.kernel.inbound")
 
@@ -115,7 +116,7 @@ async def _log_denials_enabled(state: object) -> bool:
     return enabled
 
 
-async def process_inbound_payload(app: object, connector: object, payload: dict,
+async def process_inbound_payload(app: object, connector: ChannelConnector, payload: dict,
                                   *, _asr_resume: tuple | None = None) -> dict:
     """处理一条已经解析好的平台事件（字典）。
 

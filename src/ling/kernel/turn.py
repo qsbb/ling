@@ -20,7 +20,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
@@ -72,7 +72,7 @@ from ling.infra.models import (
     PromptSnapshot,
     utcnow,
 )
-from ling.kernel.arbiter import SpeakerArbiter
+from ling.kernel.arbiter import AcquireResult, SpeakerArbiter
 from ling.kernel.audience import AudienceSnapshot
 from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.kernel.marker_stream import (
@@ -101,6 +101,8 @@ if TYPE_CHECKING:
     from ling.capabilities.tag_specs import TurnEnvironment
     from ling.capabilities.tools import ToolRegistry, ToolResult, ToolSpec
     from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
+    from ling.config import Settings
+    from ling.infra.coordination import LeaseResult, SpeakLeaseStore
     from ling.kernel.context import CompiledContext, CompiledMessage
 
 # 排队等待参数：等不到就放弃对外流式（内容仍落库，前端能看到最终消息）
@@ -665,7 +667,7 @@ class TurnCoordinator:
         arbiter: SpeakerArbiter | None = None,
         stream_log: StreamLog | None = None,
         turn_control: object | None = None,
-        speak_lease: object | None = None,
+        speak_lease: SpeakLeaseStore | None = None,
         # 已解密供应商密钥的同步读取器（provider_id → secret）。嵌入/重排
         # 的 provider 要在构造时同步拿密钥，而数据库是异步的，所以两条路径
         # 都是"进程内预热一份缓存、构造时同步读"（API 用 app.state.secret_cache，
@@ -699,7 +701,7 @@ class TurnCoordinator:
         tool_allowlist: frozenset[str] = frozenset(
             {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID}
         ),
-        settings: object | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._router = router
         self._settings = settings
@@ -892,7 +894,7 @@ class TurnCoordinator:
             # 被别的窗口占着时不阻塞——继续生成候选，只是不对外"说"。
             if self._speak_lease is not None or self._arbiter is not None:
                 if self._speak_lease is not None:
-                    acquired = await self._speak_lease.acquire(  # type: ignore[attr-defined]
+                    acquired: LeaseResult | AcquireResult = await self._speak_lease.acquire(  # type: ignore[attr-defined]
                         actor_id=self._actor_id, window_id=window_id, turn_id=turn_id
                     )
                 else:
@@ -997,7 +999,7 @@ class TurnCoordinator:
                     except Exception as exc:
                         logger.info("语音能力本轮不可用 type=%s", type(exc).__name__)
                 if prepared is not None:
-                    voice_state = _VoiceTurn(voice_service, prepared, token)
+                    voice_state = _VoiceTurn(cast(VoiceReplyService, voice_service), prepared, token)
                 compiled = await ContextCompiler(
                     session,
                     actor_id=self._actor_id,
@@ -2594,7 +2596,7 @@ class TurnCoordinator:
                 attempt=attempt,
             )
         if actor_message is not None and chose_voice:
-            row = await conversation.session.get(Message, actor_message.message_id)
+            row = cast(Message, await conversation.session.get(Message, actor_message.message_id))
             row.output_modality = "voice"
             if stopped:
                 row.speech_state = "cancelled"

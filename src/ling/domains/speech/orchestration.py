@@ -130,7 +130,14 @@ if TYPE_CHECKING:  # pragma: no cover - 只为类型
         真实实现（`GeneratedMediaService`）天然满足这个协议，不需要继承。
         """
 
-        async def save_bytes(self, data: bytes, **kwargs: Any) -> Any: ...
+        async def save_bytes(
+            self, data: bytes, *, actor_id: str, window_id: str,
+            kind: str = "audio", fmt: str = "wav", mime_type: str | None = None,
+            sample_rate: int | None = None, duration_ms: int | None = None,
+            subject_id: str | None = None, turn_id: str | None = None,
+            message_id: str | None = None, producer: str | None = None,
+            expected_digest: str | None = None,
+        ) -> Any: ...
 
         async def view(self, digest: str) -> Any: ...
 

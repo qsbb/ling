@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ling.contracts.v1 import new_id
 
@@ -467,7 +467,7 @@ async def _watch_video(
         reason = str(result.get("skipped") or "视频没有成功读取").strip()
         raise RuntimeError(reason[:300])
     return json.dumps(
-        {"ref": ref, "observation": observation, "reads": int(result.get("reads") or 0)},
+        {"ref": ref, "observation": observation, "reads": int(cast(int, result.get("reads") or 0))},
         ensure_ascii=False,
     )
 

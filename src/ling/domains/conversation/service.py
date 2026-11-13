@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -241,9 +242,12 @@ class MessageView:
             turn_id=self.turn_id,
             role=self.role,  # type: ignore[arg-type]
             text=self.text if operator or self.output_modality != "voice" else "",
-            output_modality=self.output_modality,
+            output_modality=cast(Literal["text", "voice"], self.output_modality),
             audio_asset_id=self.audio_asset_id,
-            speech_state=self.speech_state,
+            speech_state=cast(
+                Literal["none", "pending", "synthesizing", "ready", "failed", "cancelled", "expired"],
+                self.speech_state,
+            ),
             speech_delivery_state=self.speech_delivery_state,
             state=self.state,
             created_at=self.created_at,

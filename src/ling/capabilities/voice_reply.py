@@ -10,6 +10,7 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +32,8 @@ from ling.domains.speech.providers import build_tts_provider
 from ling.infra.models import IdempotencyKey, Message, SpeechSynthesisJob
 from ling.infra.security import load_signing_root_key, new_id
 from ling.logging_setup import emit_event
-from ling.ports.config import EffectiveConfig, voice_requirement_issue
+from ling.ports.channel import ChannelConnector
+from ling.ports.config import EffectiveConfig, VoiceWillingness, voice_requirement_issue
 from ling.ports.model import normalize_provider_kind
 from ling.ports.speech import (
     AudioInput,
@@ -105,7 +107,7 @@ async def record_voice_reply(session: AsyncSession, message: Message) -> None:
     )
 
 
-def voice_help(willingness: str) -> str:
+def voice_help(willingness: VoiceWillingness) -> str:
     from ling.ports.config import VOICE_WILLINGNESS_PROMPTS
 
     preference = VOICE_WILLINGNESS_PROMPTS.get(willingness, VOICE_WILLINGNESS_PROMPTS["natural"])
@@ -127,15 +129,15 @@ async def voice_for_kind(
         return None
     if voice.kind == "minimax_tts":
         return MiniMaxVoice(
-            voice_id=voice.voice_id,
+            voice_id=cast(str, voice.voice_id),
             speed=voice.speed,
             vol=voice.vol,
             pitch=voice.pitch,
             emotion=voice.emotion,
         )
     if voice.kind == "fishaudio_tts":
-        return FishAudioVoice(reference_id=voice.voice_id)
-    audio = await read_reference(voice.reference_asset_id)
+        return FishAudioVoice(reference_id=cast(str, voice.voice_id))
+    audio = await read_reference(cast(str, voice.reference_asset_id))
     return MimoReferenceVoice(audio=audio) if audio is not None else None
 
 
@@ -286,7 +288,7 @@ class VoiceReplyService:
         )
         if (
             prepared.daily_characters > 0
-            and int(used) + len(message.text) > prepared.daily_characters
+            and int(used or 0) + len(message.text) > prepared.daily_characters
         ):
             message.speech_state = "failed"
             return False
@@ -338,7 +340,7 @@ class VoiceReplyService:
             job.state = "uncertain" if outcome.billed_uncertain else "failed"
             message.speech_state = "failed"
             return False
-        artifact = outcome.artifact
+        artifact = cast(SpeechArtifact, outcome.artifact)
         from ling.domains.speech.audio_input import prepare_audio
 
         raw = await self.media.read_for_window(
@@ -372,7 +374,7 @@ class VoiceReplyService:
         self,
         message: Message,
         *,
-        connector: object,
+        connector: ChannelConnector,
         window_ref: str,
         subject_id: str | None,
         is_group: bool,
@@ -380,7 +382,7 @@ class VoiceReplyService:
         if message.output_modality != "voice" or message.speech_state != "ready":
             return False
         asset = await self.media.view_for_window(
-            message.audio_asset_id,
+            cast(str, message.audio_asset_id),
             requester_actor=self.settings.actor_id,
             requester_window=message.window_id,
         )
@@ -412,7 +414,7 @@ class VoiceReplyService:
             connector=connector,
         ).deliver_speech(
             request=SpeechDeliveryRequest(
-                turn_id=message.turn_id,
+                turn_id=cast(str, message.turn_id),
                 message_id=message.id,
                 window_ref=window_ref,
                 window_id=message.window_id,

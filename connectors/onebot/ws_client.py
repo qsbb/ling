@@ -36,6 +36,8 @@ import contextlib
 import json
 import logging
 
+from ling.ports.channel import ChannelConnector
+
 logger = logging.getLogger("ling.connectors.onebot.ws")
 
 # 断线重连的退避：从 2 秒起翻倍，封顶 60 秒。
@@ -53,7 +55,7 @@ class OneBotWsClient:
         *,
         url: str,
         app: object,
-        connector: object,
+        connector: ChannelConnector,
         reconnect_min: float = RECONNECT_MIN,
         reconnect_max: float = RECONNECT_MAX,
     ) -> None:

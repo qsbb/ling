@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover
     from ling.ports.channel import ChannelConnector
@@ -119,7 +119,7 @@ def proactive_connector() -> ChannelConnector | None:
     return None
 
 
-def proactive_connector_status(app: object | None = None) -> tuple[ChannelConnector | None, str | None]:
+def proactive_connector_status(app: Any | None = None) -> tuple[ChannelConnector | None, str | None]:
     """返回 (连接器, 不可用的**精确原因**)。
 
     ## 为什么需要原因
@@ -211,7 +211,7 @@ __all__ = [
 ]
 
 
-def connector_for_instance(app: object, scope: str, instance_id: str = "default") -> object | None:
+def connector_for_instance(app: Any, scope: str, instance_id: str = "default") -> ChannelConnector | None:
     """按目录中的稳定身份选择本进程的连接器。"""
     state = app.state
     if instance_id == "default":
@@ -224,7 +224,7 @@ def connector_for_instance(app: object, scope: str, instance_id: str = "default"
     return None
 
 
-def connector_for_namespace(app: object, scope: str, namespace: str) -> object | None:
+def connector_for_namespace(app: Any, scope: str, namespace: str) -> ChannelConnector | None:
     """账号、回执及音频来源使用账号命名空间选择同一实例。"""
     legacy = getattr(app.state, f"{scope}_connector", None)
     if (legacy is not None and getattr(legacy, "instance_id", None) == namespace
@@ -234,7 +234,7 @@ def connector_for_namespace(app: object, scope: str, namespace: str) -> object |
     return runtime.for_namespace(namespace, scope) if runtime is not None else None
 
 
-async def load_window_connector(channel: str, window_ref: str) -> object | None:
+async def load_window_connector(channel: str, window_ref: str) -> ChannelConnector | None:
     """worker 从当前已发布配置构造窗口所属实例，停用或删除后拒绝投递。"""
     if channel not in {"", "onebot", "qqbot"}:
         return None
@@ -259,6 +259,7 @@ async def load_window_connector(channel: str, window_ref: str) -> object | None:
             if not any(row.scope == protocol and row.instance_id == DEFAULT_INSTANCE_ID
                        for row in rows):
                 ids.append((protocol, DEFAULT_INSTANCE_ID))
+        connector: ChannelConnector
         for channel, instance_id in ids:
             config = await ov.resolve_field_values(
                 session, scope=channel, instance_id=instance_id, settings=settings,
@@ -275,13 +276,13 @@ async def load_window_connector(channel: str, window_ref: str) -> object | None:
                     return None
                 from connectors.qqbot.connector import QQBotConnector
                 connector = QQBotConnector(ov.build_qqbot_config_from(values))
-            connector._ling_instance_key = (channel, instance_id)
-            connector._ling_config_generation = config.generation
+            setattr(connector, "_ling_instance_key", (channel, instance_id))  # noqa: B010 - runtime metadata
+            setattr(connector, "_ling_config_generation", config.generation)  # noqa: B010 - runtime metadata
             return connector
     return None
 
 
-async def channel_connectivity(session, *, settings: object, app: object) -> list[dict]:
+async def channel_connectivity(session, *, settings: object, app: Any) -> list[dict]:
     """汇总非删除实例的已发布配置与当前运行能力，供总览展示。"""
     from sqlalchemy import select
 

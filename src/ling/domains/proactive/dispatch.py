@@ -78,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.infra.models import IdempotencyKey, ProactiveOpportunity, Window, utcnow
 from ling.infra.security import new_id
 from ling.logging_setup import emit_event
+from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.domains.proactive.dispatch")
 
@@ -317,14 +318,14 @@ async def dispatch_pending(
     session: AsyncSession,
     *,
     actor_id: str,
-    connector: object,
+    connector: ChannelConnector | None,
     config_reader: object,
     subject_timezone: str | None = None,
     subject_timezones: Mapping[str, str] | None = None,
     now: datetime | None = None,
     limit: int = MAX_PER_ROUND,
     deliver_to_web: bool = False,
-    connector_for_window: Callable[[str, str], Awaitable[object | None]] | None = None,
+    connector_for_window: Callable[[str, str], Awaitable[ChannelConnector | None]] | None = None,
     voice_dispatch: Callable[[ProactiveOpportunity, Window, object | None], Awaitable[str]]
     | None = None,
 ) -> dict[str, int | str]:

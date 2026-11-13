@@ -32,7 +32,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import select, update
 
@@ -47,6 +47,7 @@ from ling.kernel.visibility import (
     is_group_visibility,
     is_group_window_ref,
 )
+from ling.ports.channel import ChannelConnector
 
 if TYPE_CHECKING:
     from ling.domains.media.assets import GeneratedMediaService
@@ -2022,7 +2023,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
                 turn_id=f"proactive_{opportunity.id}",
                 origin=Origin.simulated,
             )
-            message = await session.get(Message, view.message_id)
+            message = cast(Message, await session.get(Message, view.message_id))
             message.output_modality = "voice"
             message.speech_state = "pending"
             prepared = await voice.prepare(effective, secret_reader=config.read_secret)
@@ -2343,7 +2344,7 @@ async def _window_channel_capabilities(window_id: str) -> CapabilityDescriptor |
     return await _channel_capabilities(str(window.channel or ""), str(window.title or ""))
 
 
-async def _group_reply_connector(channel: str, window_ref: str) -> object | None:
+async def _group_reply_connector(channel: str, window_ref: str) -> ChannelConnector | None:
     """按窗口的账号命名空间解析当前已发布且启用的连接器。"""
     from ling.capabilities.channels import load_window_connector
 

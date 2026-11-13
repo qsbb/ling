@@ -49,7 +49,9 @@ from ling.kernel.visibility import is_group_window_ref
 from ling.logging_setup import emit_event
 
 if TYPE_CHECKING:
+    from ling.config import Settings
     from ling.infra.models import Turn
+    from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.kernel.bridge")
 
@@ -340,7 +342,7 @@ class InboundBridge:
         session: AsyncSession,
         *,
         coordinator: object,
-        connector: object,
+        connector: ChannelConnector,
         secret_box: object,
         router: object | None = None,
         test_mode_default: bool = True,
@@ -358,7 +360,7 @@ class InboundBridge:
         # 切换人格之后，入站消息仍然按旧人格处理"。
         persona_id: str | None = None,
         actor_id: str = "actor_ling",
-        settings: object | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._settings = settings
         self._session = session

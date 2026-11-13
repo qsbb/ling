@@ -38,6 +38,8 @@ import json
 import logging
 from typing import Any
 
+from ling.ports.channel import ChannelConnector
+
 logger = logging.getLogger("ling.connectors.onebot.ws_server")
 
 
@@ -59,7 +61,7 @@ class OneBotWsServer:
         host: str,
         port: int,
         app: object,
-        connector: object,
+        connector: ChannelConnector,
         token: str | None = None,
     ) -> None:
         self.host = host
