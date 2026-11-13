@@ -391,7 +391,40 @@ export interface TranscriptionJob {
   error: {code: string; message: string} | null;
 }
 
+export interface WindowDialoguePolicy {
+  field: 'private_may_stay_silent';
+  global_value: boolean;
+  override: boolean | null;
+  effective: boolean;
+  source: 'global' | 'session';
+  global_revision: number;
+  session_revision: number;
+}
+
+export interface WindowPolicyChange {
+  set: { private_may_stay_silent?: boolean };
+  clear: 'private_may_stay_silent'[];
+}
+
+export interface WindowPolicyPreview {
+  current: WindowDialoguePolicy;
+  proposed: { override: boolean | null; effective: boolean; source: 'global' | 'session' };
+  preview_token: string;
+  expires_at: number;
+}
+
 export const api = {
+  windowDialoguePolicy(sessionId: string): Promise<WindowDialoguePolicy> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`);
+  },
+  previewWindowPolicy(sessionId: string, change: WindowPolicyChange): Promise<WindowPolicyPreview> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy/preview`, jsonInit('POST', change));
+  },
+  saveWindowPolicy(sessionId: string, change: WindowPolicyChange, token: string): Promise<WindowDialoguePolicy> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`,
+      jsonInit('PUT', { ...change, preview_token: token }));
+  },
+
   uploadAudio(sessionId: string, file: File): Promise<{asset_id: string; duration_seconds: number}> {
     const form = new FormData();
     form.append('file', file);

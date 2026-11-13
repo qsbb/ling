@@ -852,7 +852,14 @@ async def send_transcribed_turn(
     # 否则本进程会继续用旧密钥，表现为"有时能聊有时不能"。
     await _refresh_config_if_stale(request)
     window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
-    effective = await config.effective()
+    if window.channel == "web" and window.visibility == "subject_private":
+        from ling.settings.window_policy import FixedConfigReader, runtime_window_config
+
+        effective = await runtime_window_config(config, window.id)
+        decision_config = FixedConfigReader(effective)
+    else:
+        effective = await config.effective()
+        decision_config = config
     text = body.text.strip()
     if not text:
         raise LingError(ErrorCode.invalid_request, "消息不能为空", status_code=422)
@@ -923,7 +930,7 @@ async def send_transcribed_turn(
         window,
         text,
         auth.user.subject_id,
-        config,
+        decision_config,
         config_session=conversation.session,
         actor_id=settings.actor_id,
     )
@@ -1281,7 +1288,12 @@ async def retry_turn(
             turn_id, from_states={TurnState.stopping}, to_state=TurnState.stopped
         )
 
-    effective = await config.effective()
+    if window.channel == "web" and window.visibility == "subject_private":
+        from ling.settings.window_policy import runtime_window_config
+
+        effective = await runtime_window_config(config, window.id)
+    else:
+        effective = await config.effective()
     messages = await conversation.list_messages(window.id, limit=400)
     user_text = ""
     for msg in reversed(messages):

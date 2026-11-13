@@ -211,6 +211,29 @@ class Window(Base, TimestampMixin):
     )
 
 
+class WindowDialogueOverride(Base):
+    """会话级对话设置；空值表示继承全局设置。"""
+
+    __tablename__ = "window_dialogue_overrides"
+
+    window_id: Mapped[str] = mapped_column(
+        ForeignKey("windows.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    private_may_stay_silent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_by: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DialogueConfigGuard(Base):
+    """全局配置与会话覆盖的短事务互斥点。"""
+
+    __tablename__ = "dialogue_config_guard"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
 class Turn(Base):
     """一轮用户输入 → 角色回复。状态由服务端裁决，浏览器不参与。"""
 

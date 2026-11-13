@@ -1,0 +1,41 @@
+.window-policy {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.75rem 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border, #ded6c8);
+  border-radius: 12px;
+  background: var(--surface, #faf8f3);
+}
+
+.window-policy__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.window-policy select {
+  width: min(100%, 24rem);
+  padding: 0.5rem;
+  border: 1px solid var(--border, #ded6c8);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+
+.window-policy p {
+  margin: 0;
+  color: var(--text-muted, #766e61);
+  font-size: 0.875rem;
+}
+
+.window-policy__preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.window-policy__preview p {
+  flex-basis: 100%;
+}

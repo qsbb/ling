@@ -561,6 +561,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from ling.api.routes import recall as recall_routes
     from ling.api.routes import settings as settings_routes
     from ling.api.routes import version as version_routes
+    from ling.api.routes import window_policy as window_policy_routes
 
     # 请求体上限（**先**注册 = 在**内层**）。原来是 nginx 的
     # `client_max_body_size 32m`，删掉反代后由应用自己承担；它只读
@@ -589,6 +590,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ops.router)
     app.include_router(auth.router, prefix="/v1")
     app.include_router(sessions.router, prefix="/v1")
+    app.include_router(window_policy_routes.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
     from ling.api.routes import transcriptions
     app.include_router(transcriptions.router, prefix="/v1")
