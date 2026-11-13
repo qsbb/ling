@@ -46,8 +46,10 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
+import { accountProofLabel } from '../relationshipDetail';
 import type { SubjectRow } from '../types';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
+import { SubjectDetail } from './SubjectDetail';
 import '../identity.css';
 
 interface IdentityPageProps {
@@ -128,6 +130,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
   const [mergeFor, setMergeFor] = useState<string | null>(null);
   /** 展开中的那张卡片选中的目标。切换卡片时清掉，避免"带着上一个人的选择"提交。 */
   const [mergeTarget, setMergeTarget] = useState('');
+  const [detailFor, setDetailFor] = useState<string | null>(null);
 
   /**
    * 取一页并替换列表。`offset=0` 是首屏 / 刷新 / 换筛选词；
@@ -138,6 +141,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
     setError(null);
     setMergeFor(null);
     setMergeTarget('');
+    setDetailFor(null);
     try {
       const data = await api.subjects({ limit: SUBJECTS_PAGE_SIZE, offset: 0, q: query });
       setSubjects(data.subjects);
@@ -234,6 +238,19 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
   const renderSubject = (subject: SubjectRow) => {
     const isMerged = Boolean(subject.merged_into);
     const isEditing = mergeFor === subject.subject_id;
+    const isDetailOpen = detailFor === subject.subject_id;
+    const detailButton = (
+      <button
+        type="button"
+        className="button button--small"
+        aria-expanded={isDetailOpen}
+        aria-label={`${isDetailOpen ? '收起' : '查看'}${subject.display_name || '该用户'}的详情`}
+        onClick={() => setDetailFor(isDetailOpen ? null : subject.subject_id)}
+        data-testid="detail-open"
+      >
+        {isDetailOpen ? '收起详情' : '详情'}
+      </button>
+    );
     // **只在这一张卡片展开时**才算候选：未展开的卡片一个字都不多算。
     const others = isEditing ? mergeCandidates(subjects, subject.subject_id, '') : [];
     return (
@@ -263,7 +280,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
                 <code>
                   {account.connector_instance}:{account.external_account_id}
                 </code>
-                <span className="badge">{account.proof === 'proven' ? '已证明' : '待验证'}</span>
+                <span className="badge">{accountProofLabel(account.proof)}</span>
                 {account.revoked ? <span className="badge badge--muted">已解绑</span> : null}
               </div>
             ))
@@ -282,6 +299,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
             >
               拆开
             </button>
+            {detailButton}
           </div>
         ) : isEditing ? (
           <div className="account-card__actions">
@@ -325,6 +343,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
             >
               取消
             </button>
+            {detailButton}
           </div>
         ) : (
           <div className="account-card__actions">
@@ -337,8 +356,10 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
             >
               合并到…
             </button>
+            {detailButton}
           </div>
         )}
+        {isDetailOpen ? <SubjectDetail key={subject.subject_id} subjectId={subject.subject_id} /> : null}
       </div>
     );
   };

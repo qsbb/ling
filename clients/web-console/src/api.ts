@@ -70,6 +70,7 @@ import type {
   RecallResult,
   VoiceReferenceUpload,
 } from './types';
+import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -935,6 +936,19 @@ export const api = {
     if (q) params.set('q', q);
     const suffix = params.toString();
     return request<SubjectsResponse>(`/v1/accounts/subjects${suffix ? `?${suffix}` : ''}`);
+  },
+  subjectDetails<K extends SubjectDetailSection>(
+    subjectId: string,
+    section: K,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<SubjectDetailPage<SubjectDetailItems[K]>> {
+    const params = new URLSearchParams({ section });
+    if (cursor) params.set('cursor', cursor);
+    return request<SubjectDetailPage<SubjectDetailItems[K]>>(
+      `/v1/accounts/subjects/${encodeURIComponent(subjectId)}/details?${params}`,
+      { signal },
+    );
   },
   mergeSubjects(body: { source_id: string; target_id: string }): Promise<MergeResult> {
     return request<MergeResult>('/v1/accounts/subjects/merge', jsonInit('POST', body));

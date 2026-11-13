@@ -178,6 +178,7 @@ interface ApiCall {
 interface Harness {
   page: Page;
   calls: ApiCall[];
+  allowDetails: () => void;
 }
 
 /**
@@ -188,13 +189,14 @@ interface Harness {
  */
 async function openRelations(
   viewport: { width: number; height: number },
-  options: { expectEmpty?: boolean } = {},
+  options: { expectEmpty?: boolean; failDetail?: boolean; emptyInteractions?: boolean } = {},
 ): Promise<Harness> {
   if (!browser || launchError) throw new Error(launchError ?? '浏览器未启动');
   const context = await browser.newContext({ viewport, reducedMotion: 'reduce' });
   contexts.push(context);
   const page = await context.newPage();
   const calls: ApiCall[] = [];
+  let failDetail = options.failDetail ?? false;
 
   await page.route('**/*', async (route) => {
     const url = new URL(route.request().url());
@@ -220,6 +222,31 @@ async function openRelations(
       calls.push({ path: pathname, query: Object.fromEntries(url.searchParams) });
       const result = pageOf(url.searchParams);
       return route.fulfill(json(result.body, result.status));
+    }
+    if (/^\/v1\/accounts\/subjects\/[^/]+\/details$/.test(pathname) && method === 'GET') {
+      calls.push({ path: pathname, query: Object.fromEntries(url.searchParams) });
+      const subjectId = decodeURIComponent(pathname.split('/')[4] ?? '');
+      const section = url.searchParams.get('section');
+      if (failDetail && section === 'memories') {
+        return route.fulfill(json({ error: { code: 'internal', message: '暂时无法读取记忆' } }, 503));
+      }
+      const isSelf = subjectId === 'subj_0000';
+      const subject = store.find((row) => row.subject_id === subjectId);
+      const cursor = url.searchParams.get('cursor');
+      if (section === 'accounts') {
+        const items = (subject?.accounts ?? []).map((account) => ({ ...account, subject_id: subjectId }));
+        return route.fulfill(json({ section, access: 'full', items, next_cursor: null }));
+      }
+      if (section === 'interactions') {
+        const items = isSelf && !options.emptyInteractions
+          ? [{ event_id: 'event-a', kind: 'warmth', origin: 'user_statement', occurred_at: '2026-01-01T00:00:00Z' }]
+          : [];
+        return route.fulfill(json({ section, access: isSelf ? 'full' : 'restricted', items, next_cursor: null }));
+      }
+      const items = isSelf
+        ? [{ memory_id: cursor ? 'memory-b' : 'memory-a', text: cursor ? '第二条记忆' : '第一条记忆', kind: 'assertion', visibility: 'subject_private', created_at: null, valid_until: null }]
+        : [{ memory_id: 'memory-public', text: '第二个人的公开记忆', kind: 'assertion', visibility: 'public', created_at: null, valid_until: null }];
+      return route.fulfill(json({ section, access: isSelf ? 'full' : 'public', items, next_cursor: isSelf && !cursor ? 'next' : null }));
     }
     if (pathname === '/v1/accounts/subjects/merge' && method === 'POST') {
       const body = JSON.parse(route.request().postData() ?? '{}') as {
@@ -250,7 +277,7 @@ async function openRelations(
     ? page.getByTestId('subjects-empty')
     : page.locator('[data-testid="subject-card"]').first();
   await settled.waitFor();
-  return { page, calls };
+  return { page, calls, allowDetails: () => { failDetail = false; } };
 }
 
 function json(body: unknown, status = 200): { status: number; contentType: string; body: string } {
@@ -304,6 +331,96 @@ async function assertNoHorizontalOverflow(page: Page, label: string): Promise<vo
 const TEST_TIMEOUT = 30_000;
 
 describe('关系页：不再卡死（真浏览器）', () => {
+  it('按需展开详情、独立翻页并切换不同人的内容', async (ctx) => {
+    if (skip(ctx)) return;
+    resetStore();
+    const { page, calls } = await openRelations({ width: 1440, height: 900 });
+    expect(calls.filter((call) => call.path.endsWith('/details'))).toHaveLength(0);
+
+    await page.getByTestId('detail-open').first().click();
+    const detail = page.getByTestId('subject-detail');
+    await expect.poll(async () => detail.innerText()).toContain('第一条记忆');
+    expect(await detail.innerText()).toContain('温暖的互动');
+    expect(new Set(calls.filter((call) => call.path.endsWith('/details')).map((call) => call.query.section)))
+      .toEqual(new Set(['accounts', 'interactions', 'memories']));
+    await detail.getByRole('button', { name: '加载更多记忆' }).click();
+    await expect.poll(async () => detail.innerText()).toContain('第二条记忆');
+    expect(calls.at(-1)?.query.cursor).toBe('next');
+
+    await page.getByTestId('detail-open').nth(1).click();
+    await expect.poll(async () => detail.innerText()).toContain('第二个人的公开记忆');
+    expect(await detail.innerText()).toContain('仅本人可查看关系事件');
+    expect(await detail.innerText()).toContain('仅显示公开记忆');
+    expect(await detail.innerText()).not.toContain('第一条记忆');
+    expect(await page.getByTestId('subject-detail').count()).toBe(1);
+  }, TEST_TIMEOUT);
+
+  it('列表和详情按真实证明状态区分管理员确认、已证明及待验证', async (ctx) => {
+    if (skip(ctx)) return;
+    const subject = SUBJECTS[0];
+    const template = subject?.accounts[0];
+    if (!subject || !template) throw new Error('缺少测试账号');
+    const proofs = ['admin', 'proven', 'pending', 'unknown'];
+    resetStore([{
+      ...subject,
+      accounts: proofs.map((proof) => ({
+        ...template,
+        account_id: `account-${proof}`,
+        external_account_id: `account-${proof}`,
+        proof,
+      })),
+    }]);
+    const { page } = await openRelations({ width: 1440, height: 900 });
+    const card = page.getByTestId('subject-card').first();
+    await card.getByTestId('detail-open').click();
+    const detail = card.getByTestId('subject-detail');
+    await expect.poll(async () => detail.getByLabel('关联账号').locator('.identity-detail__row').count()).toBe(4);
+
+    for (const [proof, label] of [
+      ['admin', '已证明'],
+      ['proven', '已证明'],
+      ['pending', '待验证'],
+      ['unknown', '状态未知'],
+    ]) {
+      expect(await card.locator('.account-row').filter({ hasText: `account-${proof}` }).innerText()).toContain(label);
+      expect(await detail.getByLabel('关联账号').locator('.identity-detail__row').filter({ hasText: `account-${proof}` }).innerText()).toContain(label);
+    }
+  }, TEST_TIMEOUT);
+
+  it('没有关系事件时说明统计范围和空态', async (ctx) => {
+    if (skip(ctx)) return;
+    resetStore();
+    const { page } = await openRelations({ width: 1440, height: 900 }, { emptyInteractions: true });
+    await page.getByTestId('detail-open').first().click();
+    const section = page.getByTestId('subject-detail').getByLabel('近期关系事件');
+    await expect.poll(async () => section.innerText()).toContain('暂无可显示的关系事件');
+    expect(await section.innerText()).toContain('可追溯到本人未撤回私聊的关系事件');
+  }, TEST_TIMEOUT);
+
+  it('详情某一部分失败时保留其他部分并可重试', async (ctx) => {
+    if (skip(ctx)) return;
+    resetStore();
+    const { page, allowDetails } = await openRelations({ width: 1440, height: 900 }, { failDetail: true });
+    await page.getByTestId('detail-open').first().click();
+    const detail = page.getByTestId('subject-detail');
+    await expect.poll(async () => detail.innerText()).toContain('服务端内部错误');
+    expect(await detail.innerText()).toContain('温暖的互动');
+    allowDetails();
+    await detail.getByRole('button', { name: '重试' }).click();
+    await expect.poll(async () => detail.innerText()).toContain('第一条记忆');
+  }, TEST_TIMEOUT);
+
+  for (const width of [375, 1440]) {
+    it(`${width} 宽度下展开详情不会横向溢出`, async (ctx) => {
+      if (skip(ctx)) return;
+      resetStore();
+      const { page } = await openRelations({ width, height: 900 });
+      await page.getByTestId('detail-open').first().click();
+      await expect.poll(async () => page.getByTestId('subject-detail').innerText()).toContain('第一条记忆');
+      await assertNoHorizontalOverflow(page, `${width} 详情`);
+    }, TEST_TIMEOUT);
+  }
+
   it('首屏只渲染一页，且**没有**任何一个未展开卡片带 <option>', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
@@ -334,13 +451,14 @@ describe('关系页：不再卡死（真浏览器）', () => {
     resetStore();
     const { page } = await openRelations({ width: 1440, height: 900 });
 
+    const initialStats = await domStats(page);
     const opens = page.getByTestId('merge-open');
     await opens.nth(0).click();
     let stats = await domStats(page);
     expect(stats.selects).toBe(1);
     // 下拉里最多是"已加载的其他人"：49（首屏 50 条减去自己）+ 1 个占位
     expect(stats.options).toBeLessThanOrEqual(PAGE_SIZE);
-    expect(stats.elements).toBeLessThan(800);
+    expect(stats.elements - initialStats.elements).toBeLessThanOrEqual(PAGE_SIZE + 5);
 
     // 点第二张：第一张必须收起 —— 不是两个 <select 并存
     await opens.nth(1).click();
