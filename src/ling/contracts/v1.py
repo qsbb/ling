@@ -1442,6 +1442,8 @@ class ImageUpdateTaskRow(CompatModel):
     version: str | None = None
     # 失败码（白名单内）；成功/未失败为 null。
     failed_code: str | None = None
+    # 旧任务可能没有记录下载方式。
+    download_source: str | None = None
 
 
 class ImageUpdateCatalogDetails(CompatModel):
@@ -1528,6 +1530,9 @@ class ImageUpdateUpdaterDetails(CompatModel):
     state: str | None = None
     protocol: int | None = None
     version: str | None = None
+    # None 表示旧更新器未报告，True 只表示配置格式有效。
+    mirror_available: bool | None = None
+    download_sources: list[str] | None = None
 
 
 class ImageUpdateBackupGateDetails(CompatModel):

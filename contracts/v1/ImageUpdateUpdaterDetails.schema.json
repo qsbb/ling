@@ -3,6 +3,33 @@
   "additionalProperties": true,
   "description": "更新器诊断：在线、状态、协议、版本。",
   "properties": {
+    "download_sources": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Download Sources"
+    },
+    "mirror_available": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mirror Available"
+    },
     "online": {
       "anyOf": [
         {

@@ -2071,6 +2071,20 @@ python3 deploy/release/publish.py \
 字段级注释（含会被拒绝的写法）都在 [`deploy/env.example`](../deploy/env.example)，
 本节不复制。
 
+镜像更新支持直连 GHCR、GH-Proxy 的主站、hk 和 EdgeOne 线路，以及管理员配置的
+自定义加速仓库。界面显示的线路能力来自在线更新器，配置格式有效不代表已经测试连通。
+旧更新器没有声明内置线路时，页面保留直连；曾声明自定义仓库能力的更新器仍可选择它。
+
+需要自定义仓库时，在更新器专用的 `<安装根>/updater/.env` 配置
+`LING_UPDATER_GHCR_MIRROR=registry.example.invalid/ghcr.io/qsbb/ling-api`，
+并使用包含该配置项和对应功能的更新器 Compose 文件及镜像重建更新器。值应是仓库
+完整路径，不含协议、凭据、tag 或 digest。GH-Proxy 线路的仓库路径按其
+[Docker 镜像配置说明](https://gh-proxy.com/docs/docker-mirror)拼接。
+
+更新器使用官方目标的同一摘要预取，随后仍从 GHCR 获取官方引用并执行原有身份校验。
+版本发现和最终引用仍需要连接 GHCR，预取能否复用镜像层取决于 Docker 守护进程及
+加速仓库的实际表现。进度和最近任务会显示记录的下载方式，旧任务可能没有记录。
+
 > **两条通道不共用同一套开关**：镜像模式主文件的 `LING_UPDATE_ENABLED` 默认取
 > `0`；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
 > `install.sh` **子进程环境**里设 `LING_UPDATE_ENABLED=1`（只影响该子进程，不写

@@ -917,8 +917,8 @@ IMAGE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # 任务视图里的短标记（backup id / 阶段 / 迁移 revision）：只允许安全字符。
 IMAGE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:-]*$")
 
-# HTTP 请求体**只有这五个字段**。``schema``/``created_at`` 由 API 自己写进请求
-# 文件，客户端提交它们也算多余字段（fail closed，不给未来留后门）。
+# HTTP 请求体的五个必填字段。下载方式是唯一的可选字段，且只能使用固定枚举。
+# ``schema``/``created_at`` 由 API 写入请求文件，客户端提交它们会被拒绝。
 IMAGE_UPDATE_BODY_KEYS = frozenset(
     {
         "request_id",
@@ -965,6 +965,7 @@ IMAGE_UPDATE_RATE_WINDOW_SECONDS = 60.0
 IMAGE_UPDATE_RATE_MAX_KEYS = 1024
 
 IMAGE_UPDATER_STATES = ("idle", "busy", "needs_manual")
+IMAGE_DOWNLOAD_SOURCES = ("direct", "gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone", "mirror")
 IMAGE_TASK_STATE_MESSAGES: dict[str, str] = {
     # 与更新器的 TASK_* 一一对应；文案只来自这张码表。
     "running": "更新进行中",
@@ -1184,6 +1185,8 @@ IMAGE_REASON_MESSAGES: dict[str, str] = {
     "installed_image_changed": "当前运行镜像已变化，请重新检查后再提交",
     "installed_version_changed": "当前运行提交已变化，请重新检查后再提交",
     "already_on_target": "目标摘要与当前运行摘要相同，不需要更新",
+    "mirror_unavailable": "自定义镜像仓库未配置或配置无效，请检查更新器配置",
+    "download_source_unavailable": "更新器未声明支持所选下载线路，请刷新后选择可用线路",
     "duplicate_request_id": "该任务 ID 已使用过，不重复执行",
     "rate_limited": "提交过于频繁，请稍后再试",
     "image_mode_requires_image_channel": (
@@ -1216,6 +1219,8 @@ IMAGE_REASON_STATUS: dict[str, int] = {
     "installed_image_changed": 409,
     "installed_version_changed": 409,
     "already_on_target": 409,
+    "mirror_unavailable": 409,
+    "download_source_unavailable": 409,
     "duplicate_request_id": 409,
     "rate_limited": 429,
     "image_mode_requires_image_channel": 409,
@@ -1658,6 +1663,7 @@ def _image_task_view(raw: object) -> dict[str, object] | None:
     still_on_old = raw.get("still_on_old_version")
     return {
         "request_id": _image_request_id(raw.get("request_id")),
+        "download_source": _image_choice(raw.get("download_source"), IMAGE_DOWNLOAD_SOURCES),
         "state": state,
         "state_message": IMAGE_TASK_STATE_MESSAGES[state],
         "stage": stage_value,
@@ -2026,6 +2032,7 @@ class ImageUpdateSubmission:
     target_digest: str
     expected_current_digest: str
     expected_current_commit: str
+    download_source: str = "direct"
 
 
 @dataclass(frozen=True)
@@ -2064,7 +2071,10 @@ def _parse_image_submission(raw: bytes) -> ImageUpdateSubmission:
     if not isinstance(payload, dict):
         raise _SubmissionError("invalid_request_body")
     # 多余字段一律拒绝：拼错字段名/夹带 shell/compose 片段都不给入口。
-    if set(payload) != IMAGE_UPDATE_BODY_KEYS:
+    if set(payload) - {"download_source"} != IMAGE_UPDATE_BODY_KEYS:
+        raise _SubmissionError("invalid_request_body")
+    download_source = payload.get("download_source", "direct")
+    if download_source not in IMAGE_DOWNLOAD_SOURCES:
         raise _SubmissionError("invalid_request_body")
     request_id = payload["request_id"]
     if not isinstance(request_id, str) or IMAGE_REQUEST_ID_RE.fullmatch(request_id) is None:
@@ -2092,6 +2102,7 @@ def _parse_image_submission(raw: bytes) -> ImageUpdateSubmission:
         target_digest=target_digest,
         expected_current_digest=expected_current_digest,
         expected_current_commit=expected_current_commit,
+        download_source=download_source,
     )
 
 
@@ -2228,6 +2239,8 @@ class ImageUpdateChannel:
         version: str | None = None
         updated_at: str | None = None
         protocol: int | None = None
+        mirror_available: bool | None = None
+        download_sources: list[str] | None = None
         if self._status is not None:
             raw_updater = self._status.get("updater")
             if isinstance(raw_updater, dict):
@@ -2235,6 +2248,14 @@ class ImageUpdateChannel:
                 if isinstance(raw_state, str) and raw_state in IMAGE_UPDATER_STATES:
                     state = raw_state
                 version = _image_text(raw_updater.get("version"), max_length=32)
+                raw_mirror = raw_updater.get("mirror_available")
+                if isinstance(raw_mirror, bool):
+                    mirror_available = raw_mirror
+                raw_sources = raw_updater.get("download_sources")
+                if isinstance(raw_sources, list):
+                    download_sources = [
+                        source for source in IMAGE_DOWNLOAD_SOURCES if source in raw_sources
+                    ]
             raw_protocol = self._status.get("protocol")
             if isinstance(raw_protocol, int) and not isinstance(raw_protocol, bool):
                 protocol = raw_protocol
@@ -2252,6 +2273,8 @@ class ImageUpdateChannel:
             "state": state,
             "protocol": protocol,
             "version": version,
+            "mirror_available": mirror_available if online else None,
+            "download_sources": download_sources if online else None,
             "updated_at": updated_at,
             "age_seconds": None if age is None else round(age, 1),
         }
@@ -2615,6 +2638,9 @@ class ImageUpdateChannel:
         request_id = self.pending_ids[0]
         path = self.requests_dir / f"{IMAGE_UPDATE_REQUEST_PREFIX}{request_id}.json"
         payload = update_protocol.read_json_file(path)
+        if payload is None:
+            path = self.requests_dir / f"claimed-{request_id}.json"
+            payload = update_protocol.read_json_file(path)
         readable = (
             payload is not None
             and payload.get("request_id") == request_id
@@ -2625,6 +2651,11 @@ class ImageUpdateChannel:
             "readable": readable,
             "target_digest": _image_digest(payload.get("target_digest")) if payload else None,
             "created_at": _image_timestamp(payload.get("created_at")) if payload else None,
+            "download_source": (
+                _image_choice(payload.get("download_source"), IMAGE_DOWNLOAD_SOURCES)
+                if readable and payload is not None
+                else None
+            ),
         }
 
     def reason(self, *, role: str, request_id: str | None = None) -> str | None:
@@ -2891,10 +2922,10 @@ class ImageUpdateChannel:
 
 
 def _image_request_payload(
-    submission: ImageUpdateSubmission, *, created_at: str
+    submission: ImageUpdateSubmission, *, created_at: str, record_direct_source: bool = False
 ) -> dict[str, object]:
     """API 写进请求文件的**固定结构**（与更新器的 REQUEST_KEYS 对齐）。"""
-    return {
+    payload: dict[str, object] = {
         "schema": IMAGE_UPDATE_REQUEST_SCHEMA,
         "request_id": submission.request_id,
         "target_digest": submission.target_digest,
@@ -2903,6 +2934,9 @@ def _image_request_payload(
         "operator_confirmed": True,
         "created_at": created_at,
     }
+    if submission.download_source != "direct" or record_direct_source:
+        payload["download_source"] = submission.download_source
+    return payload
 
 
 @router.get("/version/image-update")
@@ -2971,6 +3005,16 @@ async def create_image_update_request(
     gate_reason = channel.reason(role=auth.user.role, request_id=submission.request_id)
     if gate_reason is not None:
         raise _image_error(gate_reason)
+    source = submission.download_source
+    if source != "direct":
+        sources = channel.updater["download_sources"]
+        if source == "mirror" and channel.updater["mirror_available"] is not True:
+            raise _image_error("mirror_unavailable")
+        # 旧更新器可能只报告 mirror_available；内置线路必须有明确的能力声明。
+        if sources is None and source != "mirror":
+            raise _image_error("download_source_unavailable")
+        if isinstance(sources, list) and source not in sources:
+            raise _image_error("download_source_unavailable")
 
     current_commit = _image_commit(build_commit())
     if current_commit is None or submission.expected_current_commit != current_commit:
@@ -2988,7 +3032,12 @@ async def create_image_update_request(
         raise _image_error("target_not_available")
 
     created_at = update_protocol.iso_now()
-    payload = _image_request_payload(submission, created_at=created_at)
+    sources = channel.updater["download_sources"]
+    # 旧更新器的请求文件保持原格式，新更新器声明能力后才记录直连。
+    record_direct_source = isinstance(sources, list) and "direct" in sources
+    payload = _image_request_payload(
+        submission, created_at=created_at, record_direct_source=record_direct_source
+    )
     target = channel.requests_dir / (
         f"{IMAGE_UPDATE_REQUEST_PREFIX}{submission.request_id}{IMAGE_UPDATE_REQUEST_SUFFIX}"
     )

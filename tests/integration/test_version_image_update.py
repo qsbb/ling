@@ -451,7 +451,164 @@ async def test_post_writes_atomic_request_file(logged_in: TestEnv, tmp_path: Pat
         "readable": True,
         "target_digest": TARGET_DIGEST,
         "created_at": stored["created_at"],
+        "download_source": None,
     }
+
+
+@pytest.mark.parametrize("source", ["direct", "gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone", "mirror"])
+async def test_pending_request_reports_selected_source_for_capable_updater(
+    logged_in: TestEnv, tmp_path: Path, source: str
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base, legacy={"updater": {
+        "state": "idle", "version": "1.0.0", "mirror_available": True,
+        "download_sources": ["direct", "gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone", "mirror"],
+    }})
+    body = _body()
+    if source != "direct":
+        body["download_source"] = source
+    response = await _post(logged_in, body)
+    assert response.status_code == 201, response.text
+    pending_path = base / "requests" / f"request-{body['request_id']}.json"
+    stored = json.loads(pending_path.read_text(encoding="utf-8"))
+    assert stored["download_source"] == source
+    view = await _view(logged_in)
+    assert view["request"]["download_source"] == source
+    assert view["request"]["readable"] is True
+
+    pending_path.rename(base / "requests" / f"claimed-{body['request_id']}.json")
+    claimed = (await _view(logged_in))["request"]
+    assert claimed["download_source"] == source
+    assert claimed["readable"] is True
+
+
+async def test_pending_request_does_not_expose_invalid_or_untrusted_source(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base)
+    request_id = _write_pending_request(base)
+    path = base / "requests" / f"request-{request_id}.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    stored["download_source"] = "registry.example.invalid/private-value"
+    update_protocol.atomic_write_json(path, stored, mode=0o640)
+    view = await _view(logged_in)
+    assert view["request"]["readable"] is True
+    assert view["request"]["download_source"] is None
+    assert stored["download_source"] not in json.dumps(view)
+
+    stored["request_id"] = uuid.uuid4().hex
+    stored["download_source"] = "gh_proxy"
+    update_protocol.atomic_write_json(path, stored, mode=0o640)
+    request = (await _view(logged_in))["request"]
+    assert request["readable"] is False
+    assert request["download_source"] is None
+
+
+async def test_mirror_selection_uses_only_updater_capability(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base, legacy={"updater": {
+        "state": "idle", "version": "1.0.0", "mirror_available": True,
+        "mirror_url": "registry.example.invalid/private-value",
+    }})
+    view = await _view(logged_in)
+    assert view["details"]["updater"]["mirror_available"] is True
+    assert "registry.example.invalid" not in json.dumps(view)
+    body = {**_body(), "download_source": "mirror"}
+    response = await _post(logged_in, body)
+    assert response.status_code == 201, response.text
+    stored = json.loads((base / "requests" / f"request-{body['request_id']}.json").read_text())
+    assert stored["download_source"] == "mirror"
+    assert "mirror_url" not in stored
+
+
+async def test_mirror_selection_rejected_for_old_or_unconfigured_updater(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base)
+    updater = (await _view(logged_in))["details"]["updater"]
+    assert updater["mirror_available"] is None
+    assert updater["download_sources"] is None
+    response = await _post(logged_in, {**_body(), "download_source": "mirror"})
+    assert response.status_code == 409
+    assert _request_files(base) == []
+
+
+@pytest.mark.parametrize("source", ["gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone"])
+async def test_builtin_source_requires_and_preserves_explicit_capability(
+    logged_in: TestEnv, tmp_path: Path, source: str
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base, legacy={"updater": {
+        "state": "idle", "version": "1.0.0", "mirror_available": False,
+        "download_sources": ["direct", "gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone"],
+    }})
+    updater = (await _view(logged_in))["details"]["updater"]
+    assert updater["mirror_available"] is False
+    assert source in updater["download_sources"]
+    body = {**_body(), "download_source": source}
+    response = await _post(logged_in, body)
+    assert response.status_code == 201, response.text
+    stored = json.loads((base / "requests" / f"request-{body['request_id']}.json").read_text())
+    assert stored["download_source"] == source
+
+
+@pytest.mark.parametrize("source", ["gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone"])
+async def test_builtin_source_rejected_when_old_updater_did_not_declare_it(
+    logged_in: TestEnv, tmp_path: Path, source: str
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base)
+    updater = (await _view(logged_in))["details"]["updater"]
+    assert updater["download_sources"] is None
+    response = await _post(logged_in, {**_body(), "download_source": source})
+    assert response.status_code == 409
+    assert response.json()["error"]["detail"] == "download_source_unavailable"
+    assert _request_files(base) == []
+
+
+async def test_capabilities_and_task_source_are_bounded_to_fixed_codes(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    secret_path = "registry.example.invalid/private-value"
+    _write_status(base, task=_task(download_source=secret_path), legacy={"updater": {
+        "state": "idle", "version": "1.0.0", "mirror_available": True,
+        "download_sources": ["direct", "gh_proxy", secret_path, {"unexpected": "value"}],
+    }})
+    view = await _view(logged_in)
+    assert view["details"]["updater"]["download_sources"] == ["direct", "gh_proxy"]
+    assert view["details"]["updater"]["mirror_available"] is True
+    assert view["task"]["download_source"] is None
+    assert secret_path not in json.dumps(view)
+    response = await _post(logged_in, {**_body(), "download_source": "mirror"})
+    assert response.status_code == 409
+    assert _request_files(base) == []
+
+
+@pytest.mark.parametrize("source", ["direct", "gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone", "mirror"])
+async def test_task_reports_recorded_source_in_running_and_finished_views(
+    logged_in: TestEnv, tmp_path: Path, source: str
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base, task=_task(state="running", download_source=source))
+    assert (await _view(logged_in))["task"]["download_source"] == source
+    _write_status(base, task=_task(state="succeeded", download_source=source))
+    assert (await _view(logged_in))["task"]["download_source"] == source
+
+
+@pytest.mark.parametrize("source", ["https://example.invalid", "", None, True, [], {}])
+async def test_unrecognized_download_source_cannot_be_queued(
+    logged_in: TestEnv, tmp_path: Path, source: object
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base)
+    response = await _post(logged_in, {**_body(), "download_source": source})
+    assert response.status_code == 422
+    assert _request_files(base) == []
 
 
 @pytest.mark.parametrize(

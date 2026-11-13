@@ -143,7 +143,10 @@ services:
       LING_UPDATER_BACKUP_SCRIPT: /srv/ling-code/backup/backup.sh
       LING_UPDATER_PUBLISH_PY: /srv/ling-code/release/publish.py
       LING_UPDATER_POLL_SECONDS: ${LING_UPDATER_POLL_SECONDS:-5}
-      # **没有** registry / 镜像名 / tag 的配置项：版本发现固定问
+      # 可选的自定义 GHCR 镜像仓库，例如 registry.example.invalid/ghcr.io/qsbb/ling-api。
+      # 内置 GH-Proxy 线路无需此配置；预取始终使用官方摘要并保留最终身份校验。
+      LING_UPDATER_GHCR_MIRROR: ${LING_UPDATER_GHCR_MIRROR:-}
+      # 版本发现固定问
       # `ghcr.io/qsbb/ling-api`（`deploy/updater/registry.py` 的常量），请求方与
       # compose 都影响不到它。旧的 `LING_UPDATER_CATALOG_URL`（联网取 releases.json）
       # 已随可信发布目录一起删除——目录不再参与任何判定。

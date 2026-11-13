@@ -22,6 +22,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
+  ImageDownloadSource,
   ImageUpdateCurrentV2,
   ImageUpdateNewerReleaseV2,
   ImageUpdateSubmission,
@@ -2904,10 +2905,44 @@ export function imagePollDelayMs(state: ImageUpdatePanelState): number {
   return imageTaskActivity(state.view) === 'none' ? IMAGE_POLL_IDLE_MS : IMAGE_POLL_ACTIVE_MS;
 }
 
+/* -------------------------------------------------------------- 下载方式 */
+
+const IMAGE_DOWNLOAD_SOURCE_LABELS = {
+  direct: '直连 GHCR',
+  gh_proxy: 'GH-Proxy 主站',
+  gh_proxy_hk: 'GH-Proxy hk 线路',
+  gh_proxy_edgeone: 'GH-Proxy EdgeOne 线路',
+  mirror: '自定义加速仓库',
+} satisfies Record<ImageDownloadSource, string>;
+
+const IMAGE_DOWNLOAD_SOURCES = Object.keys(IMAGE_DOWNLOAD_SOURCE_LABELS) as ImageDownloadSource[];
+
+function imageDownloadSourceSupported(
+  updater: ImageUpdateV2['details']['updater'],
+  source: ImageDownloadSource,
+): boolean {
+  if (source === 'direct') return true;
+  if (updater.online !== true) return false;
+  const mirrorConfigured = updater.mirror_available === true;
+  const sources = updater.download_sources;
+  if (Array.isArray(sources)) {
+    return sources.includes(source) && (source !== 'mirror' || mirrorConfigured);
+  }
+  // 早期更新器只声明自定义仓库能力，无法推断它支持内置线路。
+  return source === 'mirror' && mirrorConfigured;
+}
+
+function imageDownloadSourceLabel(value: unknown): string {
+  if (typeof value !== 'string' || !Object.prototype.hasOwnProperty.call(IMAGE_DOWNLOAD_SOURCE_LABELS, value)) {
+    return '未记录';
+  }
+  return IMAGE_DOWNLOAD_SOURCE_LABELS[value as ImageDownloadSource];
+}
+
 /* -------------------------------------------------------------- 提交请求体 */
 
 /**
- * POST 的**固定 5 键**请求体（多一个键后端就 422）。
+ * 默认请求保持五个字段。加速请求额外携带固定的下载方式枚举。
  *
  * 目标只取 `view.target.digest`（可信目录 + 摘要已解析）；`task`/请求记录都不回填。
  * 拿不到目标/当前摘要、目标格式不对、或目标与当前相同，一律返回 null。
@@ -2916,18 +2951,21 @@ export function buildImageUpdateSubmission(
   view: ImageUpdateV2 | null,
   targetDigest: string | null,
   requestId: string,
+  downloadSource: ImageDownloadSource = 'direct',
 ): ImageUpdateSubmission | null {
   if (view === null || targetDigest === null) return null;
   if (!isValidImageRequestId(requestId)) return null;
   if (!IMAGE_DIGEST_RE.test(targetDigest)) return null;
   if (view.current.digest === null || view.current.commit === null) return null;
   if (view.current.digest === targetDigest) return null;
+  if (!imageDownloadSourceSupported(view.details.updater, downloadSource)) return null;
   return {
     request_id: requestId,
     target_digest: targetDigest,
     expected_current_digest: view.current.digest,
     expected_current_commit: view.current.commit,
     operator_confirmed: true,
+    ...(downloadSource !== 'direct' ? { download_source: downloadSource } : {}),
   };
 }
 
@@ -2957,7 +2995,7 @@ export function explainImageSubmitError(error: unknown): ImageUpdateSubmitError 
     if (error.status === 422) {
       return {
         reason: error.message || '请求格式未被接受',
-        hint: '本页只提交固定 5 键请求；刷新后重试。',
+        hint: '刷新后重试。',
         refresh: true,
       };
     }
@@ -2984,6 +3022,8 @@ export interface ImageUpdatePanelProps {
   riskAcknowledged: boolean;
   submitting: boolean;
   submitError: ImageUpdateSubmitError | null;
+  downloadSource?: ImageDownloadSource;
+  onDownloadSourceChange?: (source: ImageDownloadSource) => void;
   /** 渲染用的“现在”（测试注入，避免依赖真实时钟）。 */
   nowMs?: number;
   /** 测试/嵌入用：详情区默认展开。 */
@@ -3021,6 +3061,8 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   const newer = view?.newer ?? [];
   const catalog = view?.details?.catalog ?? {};
   const updater = view?.details?.updater ?? {};
+  const mirrorStatus = updater.mirror_available ?? null;
+  const reportedSources = updater.download_sources;
   const updaterBusyUnconfirmed = updater.online === false && updater.state === 'busy';
   const updaterOnlineLabel = updater.online === true ? '在线' : updater.online === false ? '离线' : '未知';
   const backupGate = view?.details?.backup_gate ?? null;
@@ -3188,6 +3230,18 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         <div className="update-task" data-testid="image-update-task-detail">
           <h3 className="update-details__title">任务进度</h3>
           <p>更新请求已提交，正在等待更新器开始。</p>
+          <dl className="about-facts">
+            <dt>下载方式</dt>
+            <dd data-testid="image-update-task-source">
+              {imageDownloadSourceLabel(
+                view?.request != null
+                  ? view.request.download_source
+                  : task?.state === 'queued' || task?.state === 'pending'
+                    ? task.download_source
+                    : null,
+              )}
+            </dd>
+          </dl>
         </div>
       ) : null}
 
@@ -3232,6 +3286,10 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
             </dd>
             <dt>阶段</dt>
             <dd>{task.stage_message ?? imageUpdateStageLabel(task.stage)}</dd>
+            <dt>下载方式</dt>
+            <dd data-testid="image-update-task-source">
+              {imageDownloadSourceLabel(task.download_source)}
+            </dd>
             <dt>目标版本</dt>
             <dd>
               {imageVersionLabel(task.version) ?? (
@@ -3412,6 +3470,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
                   {task.state_message ?? imageUpdateTaskStateText(task.state)}
                   {task.state ? <span className="about-facts__muted">（{task.state}）</span> : null}
                   {` · 阶段 ${imageUpdateStageLabel(task.stage)}`}
+                  {` · 下载方式 ${imageDownloadSourceLabel(task.download_source)}`}
                   {task.failed_code === null ? null : (
                     <>
                       {' · '}
@@ -3477,6 +3536,33 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               </code>
             </dd>
           </dl>
+          <fieldset className="update-download-source">
+            <legend>下载方式</legend>
+            {IMAGE_DOWNLOAD_SOURCES.map((source) => (
+              <label key={source}>
+                <input
+                  type="radio"
+                  name="image-download-source"
+                  value={source}
+                  checked={(props.downloadSource ?? 'direct') === source}
+                  onChange={() => props.onDownloadSourceChange?.(source)}
+                  disabled={submitting || !imageDownloadSourceSupported(updater, source)}
+                />
+                {IMAGE_DOWNLOAD_SOURCE_LABELS[source]}
+              </label>
+            ))}
+            <p>线路连通性尚未检测。加速线路先预取镜像层，仍需连接 GHCR 确认版本和镜像身份。</p>
+            {updater.online !== true ? (
+              <p>更新器当前离线，无法确认线路能力。</p>
+            ) : !Array.isArray(reportedSources) ? (
+              <p>当前更新器未声明内置线路能力。</p>
+            ) : null}
+            {updater.online === true && mirrorStatus === false ? (
+              <p>自定义仓库未配置或配置格式有误。</p>
+            ) : updater.online === true && mirrorStatus === null ? (
+              <p>更新器未报告自定义仓库配置状态。</p>
+            ) : null}
+          </fieldset>
           <ul className="update-risk">
             <li>
               更新会短暂停机：维护门禁生效期间控制台、机器人和定时任务都会暂停写入，正在生成的回复会中断。
@@ -3513,7 +3599,10 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               className="button button--small"
               data-testid="image-update-submit"
               onClick={props.onConfirm}
-              disabled={!riskAcknowledged || submitting || !canWrite || target === null}
+              disabled={
+                !riskAcknowledged || submitting || !canWrite || target === null ||
+                !imageDownloadSourceSupported(updater, props.downloadSource ?? 'direct')
+              }
             >
               {submitting ? '提交中…' : '确认更新并重启'}
             </button>
@@ -3551,6 +3640,7 @@ export function ImageUpdatePage({
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<ImageUpdateSubmitError | null>(null);
+  const [downloadSource, setDownloadSource] = useState<ImageDownloadSource>('direct');
   const [checking, setChecking] = useState(false);
   const [checkNotice, setCheckNotice] = useState<string | null>(null);
   const [pollNonce, setPollNonce] = useState(0);
@@ -3713,11 +3803,15 @@ export function ImageUpdatePage({
       });
       return;
     }
-    const body = buildImageUpdateSubmission(snapshot, targetDigest, requestId);
+    const body = buildImageUpdateSubmission(snapshot, targetDigest, requestId, downloadSource);
     if (body === null) {
+      const sourceUnavailable = snapshot !== null &&
+        !imageDownloadSourceSupported(snapshot.details.updater, downloadSource);
       setSubmitError({
-        reason: '还没有可提交的目标',
-        hint: '先检查更新，确认目标摘要与当前摘要后再提交。',
+        reason: sourceUnavailable ? '所选下载线路当前不可用' : '还没有可提交的目标',
+        hint: sourceUnavailable
+          ? '刷新更新状态，然后选择更新器支持的线路。'
+          : '先检查更新，确认目标摘要与当前摘要后再提交。',
         refresh: true,
       });
       setConfirming(false);
@@ -3744,7 +3838,7 @@ export function ImageUpdatePage({
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [canWrite]);
+  }, [canWrite, downloadSource]);
 
   return (
     <section className="page">
@@ -3763,6 +3857,8 @@ export function ImageUpdatePage({
         riskAcknowledged={riskAcknowledged}
         submitting={submitting}
         submitError={submitError}
+        downloadSource={downloadSource}
+        onDownloadSourceChange={setDownloadSource}
         onCheck={() => {
           void runCheck();
         }}

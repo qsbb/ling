@@ -1961,6 +1961,14 @@ export interface ImageUpdateTargetV2 {
   commit: string | null;
 }
 
+/** 更新器支持的镜像下载方式。 */
+export type ImageDownloadSource =
+  | 'direct'
+  | 'gh_proxy'
+  | 'gh_proxy_hk'
+  | 'gh_proxy_edgeone'
+  | 'mirror';
+
 /**
  * 最近一次安装任务（只给卡片与详情用；不参与发现结论的判定）。
  *
@@ -1975,6 +1983,8 @@ export interface ImageUpdateTaskV2 {
   stage: string | null;
   version: string | null;
   failed_code: string | null;
+  /** 旧任务可能没有记录下载方式。 */
+  download_source?: ImageDownloadSource | null;
   /** 当前请求 ID（设计文档详情区要求）。 */
   request_id?: string | null;
   /** 后端码表文案（中文）；缺失时前端按 `state` 翻译。 */
@@ -1998,6 +2008,7 @@ export interface ImageUpdatePendingRequestV2 {
   request_id: string;
   created_at?: string | null;
   target_digest?: string | null;
+  download_source?: ImageDownloadSource | null;
 }
 
 /** 按需检查的终态元数据（更新器写 `catalog_check`，API 白名单投影）。 */
@@ -2033,6 +2044,10 @@ export interface ImageUpdateUpdaterDetailsV2 {
   state?: string | null;
   protocol?: number | null;
   version?: string | null;
+  /** null 表示未报告，true 表示自定义仓库配置格式有效。 */
+  mirror_available?: boolean | null;
+  /** null 表示未报告；列出支持的方式不代表已经测试连通性。 */
+  download_sources?: ImageDownloadSource[] | null;
 }
 
 /** 恢复点诊断。 */
@@ -2086,13 +2101,14 @@ export interface ImageUpdateCheckAck {
   created_at?: string;
 }
 
-/** `POST /v1/version/image-update-requests` 的**固定 5 键**请求体。 */
+/** 直连请求有五个字段，加速请求另带下载方式。 */
 export interface ImageUpdateSubmission {
   request_id: string;
   target_digest: string;
   expected_current_digest: string;
   expected_current_commit: string;
   operator_confirmed: true;
+  download_source?: Exclude<ImageDownloadSource, 'direct'>;
 }
 
 /** 提交回执（201）：请求已写入，等待更新器接手。 */

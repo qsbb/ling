@@ -1456,6 +1456,108 @@ describe('断线重连不清任务', () => {
 });
 
 describe('提交请求体与请求编号', () => {
+  it('只提交更新器明确声明的下载线路，直连保持旧请求格式', () => {
+    const legacyView = availableView();
+    expect(buildImageUpdateSubmission(legacyView, TARGET_DIGEST, REQUEST_ID, 'gh_proxy')).toBeNull();
+    expect(buildImageUpdateSubmission(legacyView, TARGET_DIGEST, REQUEST_ID, 'mirror')).toBeNull();
+    const interimView = {
+      ...legacyView,
+      details: {
+        ...legacyView.details,
+        updater: { ...legacyView.details.updater, mirror_available: true },
+      },
+    };
+    expect(buildImageUpdateSubmission(interimView, TARGET_DIGEST, REQUEST_ID, 'mirror'))
+      .toMatchObject({ download_source: 'mirror', target_digest: TARGET_DIGEST });
+    expect(buildImageUpdateSubmission(interimView, TARGET_DIGEST, REQUEST_ID, 'gh_proxy')).toBeNull();
+    expect(buildImageUpdateSubmission(interimView, TARGET_DIGEST, REQUEST_ID, 'direct'))
+      .not.toHaveProperty('download_source');
+
+    const sources = ['gh_proxy', 'gh_proxy_hk', 'gh_proxy_edgeone', 'mirror'] as const;
+    const currentView: ImageUpdateV2 = {
+      ...legacyView,
+      details: {
+        ...legacyView.details,
+        updater: {
+          ...legacyView.details.updater,
+          mirror_available: true,
+          download_sources: ['direct', ...sources],
+        },
+      },
+    };
+    for (const source of sources) {
+      expect(buildImageUpdateSubmission(currentView, TARGET_DIGEST, REQUEST_ID, source))
+        .toMatchObject({ download_source: source, target_digest: TARGET_DIGEST });
+    }
+    const offline = {
+      ...currentView,
+      details: { ...currentView.details, updater: { ...currentView.details.updater, online: false } },
+    };
+    expect(buildImageUpdateSubmission(offline, TARGET_DIGEST, REQUEST_ID, 'gh_proxy_hk')).toBeNull();
+  });
+
+  it('区分旧更新器、有效自定义配置和当前尚未检测的线路', () => {
+    const view = availableView();
+    const html = renderPanel({
+      state: { ...initialImageUpdateState(), view },
+      confirming: true,
+    });
+    expect(html).toContain('直连 GHCR');
+    expect(html).toContain('GH-Proxy 主站');
+    expect(html).toContain('当前更新器未声明内置线路能力');
+    expect(html).toContain('更新器未报告自定义仓库配置状态');
+    expect(html).toMatch(/<input(?=[^>]*value="gh_proxy")(?=[^>]*disabled)[^>]*>/);
+    expect(html).toMatch(/<input(?=[^>]*value="mirror")(?=[^>]*disabled)[^>]*>/);
+
+    const configured: ImageUpdateV2 = {
+      ...view,
+      details: {
+        ...view.details,
+        updater: {
+          ...view.details.updater,
+          mirror_available: true,
+          download_sources: ['direct', 'gh_proxy', 'gh_proxy_hk', 'gh_proxy_edgeone', 'mirror'],
+        },
+      },
+    };
+    const configuredHtml = renderPanel({
+      state: { ...initialImageUpdateState(), view: configured },
+      confirming: true,
+      downloadSource: 'gh_proxy_hk',
+    });
+    expect(configuredHtml).toContain('线路连通性尚未检测');
+    expect(configuredHtml).toContain('仍需连接 GHCR');
+    expect(configuredHtml).toMatch(/<input(?=[^>]*value="gh_proxy_hk")(?=[^>]*checked)[^>]*>/);
+    expect(configuredHtml).not.toMatch(/<input(?=[^>]*value="mirror")(?=[^>]*disabled)[^>]*>/);
+
+    const unconfigured = {
+      ...configured,
+      details: { ...configured.details, updater: { ...configured.details.updater, mirror_available: false } },
+    };
+    const unconfiguredHtml = renderPanel({
+      state: { ...initialImageUpdateState(), view: unconfigured },
+      confirming: true,
+    });
+    expect(unconfiguredHtml).toContain('自定义仓库未配置或配置格式有误');
+    expect(unconfiguredHtml).toMatch(/<input(?=[^>]*value="mirror")(?=[^>]*disabled)[^>]*>/);
+    expect(unconfiguredHtml).not.toMatch(/<input(?=[^>]*value="gh_proxy")(?=[^>]*disabled)[^>]*>/);
+  });
+
+  it('最近任务展示已记录的下载方式，旧任务显示未记录', () => {
+    const task: ImageUpdateTaskV2 = {
+      ...makeTask({ state: 'succeeded' }),
+      download_source: 'gh_proxy_edgeone',
+    };
+    const view = makeView({ task });
+    const html = renderPanel({ state: { ...initialImageUpdateState(), view }, defaultDetailsOpen: true });
+    expect(html).toContain('下载方式 GH-Proxy EdgeOne 线路');
+    const legacy = makeView({ task: makeTask({ state: 'succeeded' }) });
+    const legacyHtml = renderPanel({
+      state: { ...initialImageUpdateState(), view: legacy }, defaultDetailsOpen: true,
+    });
+    expect(legacyHtml).toContain('下载方式 未记录');
+  });
+
   it('request_id 是 32 位小写 hex', () => {
     const id = newImageUpdateRequestId();
     expect(id).toMatch(/^[0-9a-f]{32}$/);
