@@ -255,7 +255,23 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
         # 原来写的是 `getattr(state, "cancels", CancelRegistry())`——默认值
         # 会被**立即求值**，无论属性在不在都白建一个 `CancelRegistry`。
         # 改成 `None` 兜底再 `or` 一个，语义相同但不白建。
+        from ling.domains.persona.service import PersonaSnapshot
         from ling.kernel.turn import CancelRegistry, TurnCoordinator
+        from ling.settings.service import ConfigService
+
+        # 决策和生成使用不同会话，共享本次人格 ID 与首次读取的内容。
+        try:
+            config = await ConfigService(
+                session,
+                state.secret_box,
+                test_mode_default=settings.test_mode,
+                persona_id=settings.persona_id,
+                log_denials_default=settings.log_access_denials,
+            ).effective()
+            persona_id = PersonaSnapshot(str(config.persona_id or ""))
+        except Exception:  # noqa: BLE001 - 配置不可读时本条消息按无人格处理
+            logger.info("解析当前人格失败（本条消息按无人格处理）")
+            persona_id = PersonaSnapshot("")
 
         coordinator = getattr(state, "bridge_coordinator", None)
         if coordinator is None:
@@ -263,7 +279,7 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
                 settings=settings,
                 router=state.router,
                 actor_id=settings.actor_id,
-                persona_id=settings.persona_id,
+                persona_id=persona_id,
                 cancels=getattr(state, "cancels", None) or CancelRegistry(),
                 arbiter=getattr(state, "arbiter", None),
                 stream_log=getattr(state, "stream_log", None),
@@ -284,7 +300,7 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
             group_mention_on_reply=settings.group_mention_on_reply,
             auto_register_private=settings.auto_register_private,
             observe_only=decision.verdict == OBSERVE_ONLY,
-            persona_id=settings.persona_id,
+            persona_id=persona_id,
         )
         try:
             result = await bridge.handle(envelope, resume_message_id=_asr_resume[1]) if _asr_resume else await bridge.handle(envelope)

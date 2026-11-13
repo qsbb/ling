@@ -1427,10 +1427,15 @@ class InboundBridge:
         if existing is not None:
             return existing
 
+        persona_id = self._persona_id
+        if persona_id is None:
+            from ling.domains.persona.current import effective_persona_id
+
+            persona_id = await effective_persona_id(self._session)
         window = Window(
             id=f"win_{__import__('uuid').uuid4().hex[:24]}",
             actor_id=self._actor_id,
-            persona_id=self._persona_id,
+            persona_id=persona_id,
             subject_id=subject_id,
             title=envelope.window_ref,
             channel=channel,

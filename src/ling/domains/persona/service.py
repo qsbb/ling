@@ -272,6 +272,23 @@ async def active_persona_view(session: object | None = None) -> PersonaView | No
         return None if row is None else PersonaService._to_view(row)
 
 
+class PersonaIdSnapshot(str):
+    """已经解析的人格 ID，包括明确表示无人格的空字符串。"""
+
+
+class PersonaSnapshot(PersonaIdSnapshot):
+    """平台入站共享的人格内容，首次读取时固定到本次处理结束。"""
+
+    view: PersonaView | None
+    view_loaded: bool
+
+    def __new__(cls, persona_id: str) -> PersonaSnapshot:
+        snapshot = super().__new__(cls, persona_id)
+        snapshot.view = None
+        snapshot.view_loaded = False
+        return snapshot
+
+
 class PersonaService:
     """人格（persona）的**唯一写入方**，多套并存、同一时间只有一套生效。
 
@@ -299,11 +316,15 @@ class PersonaService:
         if kwargs:
             raise TypeError(f"PersonaService 不认识的参数：{'、'.join(sorted(kwargs))}")
         self._session = session
-        # 显式指定优先；``default_persona_id`` 只为兼容旧关键字名。
-        self._persona_id: str | None = explicit or default_param  # type: ignore[assignment]
+        # 普通空串沿用动态解析；快照空串表示这一轮确定没有人格。
+        self._persona_id: str | None = (  # type: ignore[assignment]
+            explicit if isinstance(explicit, PersonaIdSnapshot) else explicit or default_param
+        )
 
     async def _resolved_id(self) -> str:
         persona_id = self._persona_id
+        if isinstance(persona_id, PersonaIdSnapshot):
+            return persona_id
         if persona_id:
             return str(persona_id)
         from ling.domains.persona.current import resolve_active_persona_id
@@ -340,7 +361,16 @@ class PersonaService:
         后者会把"切错 id"伪装成"人格被重置了"（新行是空的），而这两件事的
         修法完全不同。
         """
-        pid = persona_id or await self._resolved_id()
+        pid = (
+            persona_id
+            if isinstance(persona_id, PersonaIdSnapshot)
+            else persona_id or await self._resolved_id()
+        )
+        if isinstance(pid, PersonaSnapshot):
+            view = await self.get_or_none(pid)
+            if view is None:
+                raise PersonaNotFoundError(pid)
+            return view
         return self._to_view(await self._row(pid))
 
     async def get_or_none(self, persona_id: str | None = None) -> PersonaView | None:
@@ -349,7 +379,23 @@ class PersonaService:
         给"根本没配人格"的新装用：调用方要把它渲染成"暂无人设"，而不是 404。
         只有**读**允许走这条路——写永远要求行存在。
         """
-        pid = persona_id or await self._resolved_id()
+        pid = (
+            persona_id
+            if isinstance(persona_id, PersonaIdSnapshot)
+            else persona_id or await self._resolved_id()
+        )
+        if isinstance(pid, PersonaSnapshot):
+            if pid.view_loaded:
+                return pid.view
+            try:
+                row = await self._row_or_none(pid)
+                pid.view = None if row is None else self._to_view(row)
+            except Exception:
+                # 决策读失败时，它与回复都沿用无人格结果；下一条消息重试。
+                pid.view_loaded = True
+                raise
+            pid.view_loaded = True
+            return pid.view
         row = await self._row_or_none(pid)
         return None if row is None else self._to_view(row)
 

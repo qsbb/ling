@@ -63,6 +63,7 @@ from ling.domains.media.video import (
     finalize_reply_text,
     parse_watch_markers,
 )
+from ling.domains.persona.service import PersonaIdSnapshot, PersonaSnapshot
 from ling.infra.db import session_scope
 from ling.infra.models import (
     ActorEvent,
@@ -736,15 +737,17 @@ class TurnCoordinator:
         解析失败（配置读不出来）时返回空串 = "没有人格"：不能让一个
         读配置的错误把整轮对话打挂，也不能真的编一个 id 出来。
         """
+        if isinstance(self._persona_id, PersonaIdSnapshot):
+            return self._persona_id
         if self._persona_id:
             return str(self._persona_id)
         try:
             from ling.domains.persona.current import effective_persona_id
 
-            return await effective_persona_id(session)  # type: ignore[arg-type]
+            return PersonaIdSnapshot(await effective_persona_id(session))  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001 - 配置不可读时按"没有人格"处理
             logger.info("解析当前人格失败（本轮按无人格处理）")
-            return ""
+            return PersonaIdSnapshot("")
 
     def partial_text(self, turn_id: str) -> str:
         """已经流出来的**部分**正文（内存态）。
@@ -2505,10 +2508,14 @@ class TurnCoordinator:
             # 「她：」前缀。这是格式残留，不是她的表达——剥掉。
             from ling.capabilities.naming import display_name_for, strip_self_prefix
 
-            # `self._persona_id` 可能为 None（= 每一轮现解析）；这种协调器
-            # 没有"本轮人格"的记忆，剥前缀就用空 id（`display_name_for("")`
-            # 返回空串 → 不剥任何前缀），而不是拿 None 去查缓存。
-            _name = self._display_name or await display_name_for(self._persona_id or "")
+            # 平台入站复用决策与提示词中的名字，避免中途改名影响清理。
+            if isinstance(self._persona_id, PersonaSnapshot):
+                view = self._persona_id.view
+                _name = self._display_name or (view.display_name if view else "")
+            elif isinstance(self._persona_id, PersonaIdSnapshot) and not self._persona_id:
+                _name = self._display_name
+            else:
+                _name = self._display_name or await display_name_for(self._persona_id or "")
             _cleaned, _stripped = strip_self_prefix(delivered, _name)
             if _stripped:
                 delivered = _cleaned
