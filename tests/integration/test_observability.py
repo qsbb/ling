@@ -111,6 +111,27 @@ async def test_polling_route_stays_quiet_when_it_succeeds(logged_in, caplog) -> 
     ]
 
 
+async def test_update_polling_logs_failures_but_not_successes(web_env, caplog) -> None:
+    """真实更新接口的未登录失败应可见，登录后的成功轮询不刷屏。"""
+    with caplog.at_level(logging.INFO, logger="ling.api.access"):
+        denied = await web_env.client.get("/v1/version/image-update")
+        login = await web_env.client.post(
+            "/v1/auth/login", json={"username": "tester", "password": "tester-password"}
+        )
+        status = await web_env.client.get("/v1/version/image-update")
+
+    assert denied.status_code == 401
+    assert login.status_code == 200
+    assert status.status_code == 200
+    update_events = [
+        record for record in _access_events(caplog)
+        if record.attributes["http.route"] == "/v1/version/image-update"
+    ]
+    assert len(update_events) == 1
+    assert update_events[0].attributes["http.response.status_code"] == 401
+    assert update_events[0].getMessage().startswith("读取镜像更新状态 → 401")
+
+
 async def test_access_log_entry_carries_the_trace_id(logged_in, caplog) -> None:
     """访问日志那条自己也要带 trace_id——日志页里它才是"对得上用户那次请求"的锚点。
 
