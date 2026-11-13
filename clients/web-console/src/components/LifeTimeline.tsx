@@ -110,9 +110,9 @@ function minutesBetween(startIso: string, endIso: string): number {
 }
 
 /** 计划段高度：按时间比例，但给下限（可读）与上限（不撑爆一屏）。 */
-export const SEGMENT_MIN_HEIGHT = 36;
-export const SEGMENT_MAX_HEIGHT = 180;
-export const SEGMENT_PX_PER_MINUTE = 0.6;
+export const SEGMENT_MIN_HEIGHT = 56;
+export const SEGMENT_MAX_HEIGHT = 88;
+export const SEGMENT_PX_PER_MINUTE = 0.2;
 
 export function segmentHeightPx(segment: LifeTimelineSegment): number {
   const minutes = minutesBetween(segment.display_start_at, segment.display_end_at);
@@ -276,27 +276,27 @@ export interface StateCopy {
 export const TIMELINE_STATE_COPY: Record<TimelineState, StateCopy> = {
   ready: {
     label: '大纲已生成',
-    hint: '下面是这一天的计划。计划是打算，不是已经发生的事。',
+    hint: '今天的安排已就绪，可以查看各时段的计划。',
   },
   degraded: {
     label: '来自规则兜底',
-    hint: '模型不可用或输出被拒收，下面的段由规则生成——内容和模型版可能不一样。',
+    hint: '模型暂未生成完整日程，当前展示按作息规则保留的安排。',
   },
   failed: {
     label: '生成失败',
-    hint: '最近一次生成失败了。原因看下面的原因码，不能说成「今天没安排」。',
+    hint: '最近一次生成没有完成，详细原因见生成详情。',
   },
   pending: {
     label: '还没生成',
-    hint: '计划行已经建了，大纲还没到生成时间（见「生成到期」）。',
+    hint: '日程正在等待生成，时间见生成详情。',
   },
   empty: {
     label: '这一天还没有安排',
-    hint: '这一天没有计划行——真的没有，不是读取失败。',
+    hint: '这一天尚未生成日程。',
   },
   unavailable: {
     label: '暂时无法读取',
-    hint: '这一次读取出错了。它不等于「今天没安排」，可以重试。',
+    hint: '暂时无法取得日程，请重试。',
   },
 };
 
@@ -597,23 +597,15 @@ export function TimelineHeader({
   const hidden = hiddenSummary(timeline);
   return (
     <header className="tl-head">
-      <div className="tl-days">
-        <div className="tl-day" data-testid="tl-display-day">
-          <span className="tl-day__label">你的今天（展示日）</span>
-          <strong className="tl-day__value">{timeline.display_date}</strong>
-          <span className="tl-day__tz">
-            {timeline.display_timezone}
-            <span className="tl-day__src">· {timezoneSourceLabel(timeline.display_timezone_source)}</span>
-          </span>
+      <div className="tl-heading">
+        <div>
+          <span className="tl-day__label">当日日程</span>
+          <h3 className="tl-heading__date">{timeline.display_date}</h3>
+          <span className="tl-day__tz">{timeline.display_timezone}</span>
         </div>
-        <div className="tl-day" data-testid="tl-plan-day">
-          <span className="tl-day__label">她的计划日</span>
-          <strong className="tl-day__value">{timeline.plan_day}</strong>
-          <span className="tl-day__tz">
-            {timeline.actor_timezone}
-            <span className="tl-day__src">· {timezoneSourceLabel(timeline.actor_timezone_source)}</span>
-          </span>
-        </div>
+        {timeline.state !== 'unavailable' ? (
+          <span className="tl-heading__count">{timeline.segments.length} 个可见时段</span>
+        ) : null}
       </div>
       {gap ? (
         <p className="tl-days__note" data-testid="tl-tz-note">
@@ -624,47 +616,70 @@ export function TimelineHeader({
       <p className="tl-state" data-testid="tl-state" data-state={timeline.state}>
         <strong>{copy.label}</strong>
         <span className="tl-state__hint">{copy.hint}</span>
-        {code ? (
-          <code className="tl-state__code" data-testid="tl-reason-code">
-            原因码：{code}
-          </code>
-        ) : null}
         {onRetry && timeline.state === 'unavailable' ? (
           <button type="button" className="button button--small" onClick={onRetry}>
             <RefreshIcon /> 重试
           </button>
         ) : null}
       </p>
-      {timeline.note && timeline.note !== copy.hint ? (
-        <p className="tl-note">{timeline.note}</p>
-      ) : null}
+      <details className="tl-diagnostics" data-testid="tl-diagnostics">
+        <summary>生成详情与时区</summary>
+        <div className="tl-diagnostics__body">
+          <div className="tl-days">
+            <div className="tl-day" data-testid="tl-display-day">
+              <span className="tl-day__label">你的今天（展示日）</span>
+              <strong className="tl-day__value">{timeline.display_date}</strong>
+              <span className="tl-day__tz">
+                {timeline.display_timezone}
+                <span className="tl-day__src">· {timezoneSourceLabel(timeline.display_timezone_source)}</span>
+              </span>
+            </div>
+            <div className="tl-day" data-testid="tl-plan-day">
+              <span className="tl-day__label">她的计划日</span>
+              <strong className="tl-day__value">{timeline.plan_day}</strong>
+              <span className="tl-day__tz">
+                {timeline.actor_timezone}
+                <span className="tl-day__src">· {timezoneSourceLabel(timeline.actor_timezone_source)}</span>
+              </span>
+            </div>
+          </div>
+          {code ? (
+            <code className="tl-state__code" data-testid="tl-reason-code">
+              原因码：{code}
+            </code>
+          ) : null}
+          {timeline.note && timeline.note !== copy.hint ? (
+            <p className="tl-note">{timeline.note}</p>
+          ) : null}
 
-      <dl className="tl-times">
-        <div className="tl-times__row">
-          <dt>生成到期</dt>
-          {/* 到期时刻与实际提交时刻**分开**：一个说"该什么时候生成"，
-              一个说"什么时候真的生成了"。合成一句"更新于"就会两头都不准。 */}
-          <dd data-testid="tl-due-at">{formatDayTimeInZone(timeline.outline_due_at, timeline.display_timezone)}</dd>
+          <dl className="tl-times">
+            <div className="tl-times__row">
+              <dt>生成到期</dt>
+              {/* 到期时刻与实际提交时刻**分开**：一个说"该什么时候生成"，
+                  一个说"什么时候真的生成了"。合成一句"更新于"就会两头都不准。 */}
+              <dd data-testid="tl-due-at">{formatDayTimeInZone(timeline.outline_due_at, timeline.display_timezone)}</dd>
+            </div>
+            <div className="tl-times__row">
+              <dt>实际提交</dt>
+              <dd data-testid="tl-generated-at">
+                {timeline.generated_at
+                  ? formatDayTimeInZone(timeline.generated_at, timeline.display_timezone)
+                  : '还没有提交过'}
+              </dd>
+            </div>
+            <div className="tl-times__row">
+              <dt>计划版本</dt>
+              <dd>
+                r{timeline.revision}
+                {timeline.plan_state ? ` · 库里状态 ${timeline.plan_state}` : ''}
+                {timeline.superseded_segment_count > 0
+                  ? ` · 有 ${timeline.superseded_segment_count} 段被新版替代`
+                  : ''}
+              </dd>
+            </div>
+          </dl>
         </div>
-        <div className="tl-times__row">
-          <dt>实际提交</dt>
-          <dd data-testid="tl-generated-at">
-            {timeline.generated_at
-              ? formatDayTimeInZone(timeline.generated_at, timeline.display_timezone)
-              : '还没有提交过'}
-          </dd>
-        </div>
-        <div className="tl-times__row">
-          <dt>计划版本</dt>
-          <dd>
-            r{timeline.revision}
-            {timeline.plan_state ? ` · 库里状态 ${timeline.plan_state}` : ''}
-            {timeline.superseded_segment_count > 0
-              ? ` · 有 ${timeline.superseded_segment_count} 段被新版替代`
-              : ''}
-          </dd>
-        </div>
-      </dl>
+      </details>
 
       {hidden ? (
         <p className="tl-private" data-testid="tl-private">
@@ -848,9 +863,10 @@ export function LifeTimeline({ timeline, now, defaultCollapsed, onRetry }: LifeT
         </p>
       ) : (
         <>
-          <div className="tl-body">
+          <div className={`tl-body${timeline.facts.length === 0 ? ' tl-body--no-facts' : ''}`}>
             <div className="tl-plans">
-              <h3 className="tl-plans__title">计划（打算／可能，不是已经发生）</h3>
+              <h3 className="tl-plans__title">今日计划</h3>
+              <p className="tl-plans__hint">时段表示预计安排，活动记录另列。</p>
               {timeline.segments.length === 0 ? (
                 <p className="tl-plans__empty">{segmentEmptyText(timeline)}</p>
               ) : (

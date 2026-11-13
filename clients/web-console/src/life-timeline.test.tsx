@@ -474,15 +474,15 @@ describe('层级折叠（parent_id）', () => {
   });
 
   it('段高按时间比例，且有下限与上限', () => {
-    // 6 小时 = 360 分钟 → 216px，封顶 180px。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-night')!)).toBe(180);
-    // 4 小时 = 240 分钟 → 144px（未封顶）。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-block')!)).toBe(144);
-    // 15 分钟 → 9px，抬到下限 36px。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-minute')!)).toBe(36);
+    // 长时段保留轻微高度差，同时避免休息段占满首屏。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-night')!)).toBe(72);
+    // 4 小时按紧凑比例折算，使用可读高度下限。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-block')!)).toBe(56);
+    // 短时段同样保证可读高度。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-minute')!)).toBe(56);
     const html = renderTimeline();
-    expect(html).toContain('min-height:144px');
-    expect(html).toContain('min-height:36px');
+    expect(html).toContain('min-height:56px');
+    expect(html).toContain('min-height:56px');
   });
 });
 

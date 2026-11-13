@@ -573,6 +573,15 @@ describe('真实浏览器：生活时间轴与总览两块', () => {
       const life = await openRoute('/life', { width: 1440, height: 900 }, 'life-timeline');
       await life.locator('[data-testid="tl-seg-seg-hour"]').waitFor();
       await assertNoHorizontalOverflow(life, 'life 1440', ['page', 'timeline']);
+      const diagnostics = life.locator('[data-testid="tl-diagnostics"]');
+      expect(await diagnostics.getAttribute('open')).toBeNull();
+      expect(await life.locator('[data-testid="tl-generated-at"]').isVisible()).toBe(false);
+      expect(await life.locator('[data-testid="tl-state"]').isVisible()).toBe(true);
+      await diagnostics.locator('summary').click();
+      expect(await life.locator('[data-testid="tl-generated-at"]').isVisible()).toBe(true);
+      await diagnostics.locator('summary').click();
+      await life.screenshot({ path: '/tmp/ling-life-redesign-desktop.png', fullPage: true });
+
       // 折叠按钮真的在（不是只有文字）且默认展开
       const toggle = life.locator('[data-testid="tl-toggle-seg-block"]');
       expect(await toggle.getAttribute('aria-expanded')).toBe('true');
@@ -596,6 +605,10 @@ describe('真实浏览器：生活时间轴与总览两块', () => {
       const life = await openRoute('/life', { width: 375, height: 667 }, 'life-timeline');
       await life.locator('[data-testid="tl-seg-seg-hour"]').waitFor();
       const widths = await assertNoHorizontalOverflow(life, 'life 375', ['page', 'timeline']);
+      await life.locator('[data-testid="tl-diagnostics"] summary').click();
+      await assertNoHorizontalOverflow(life, 'life 375 expanded details', ['page', 'timeline']);
+      await life.screenshot({ path: '/tmp/ling-life-redesign-mobile.png', fullPage: true });
+
       // 375 下时间列折进段内，标题允许换行：段本身没有被裁掉。
       expect(await life.locator('[data-testid="tl-seg-seg-block"]').count()).toBe(1);
       expect((widths.timeline?.client ?? 0)).toBeLessThanOrEqual(375);

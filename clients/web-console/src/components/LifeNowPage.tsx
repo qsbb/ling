@@ -76,7 +76,7 @@ export function LifeNowPage({ onBack }: LifeNowPageProps) {
 
       <h1 className="page__title">生活</h1>
       <p className="page__hint">
-        这里是它自己的生活状态。模拟出来的活动会标「模拟」——不是现实里真发生的事。
+        查看当日日程、活动记录和未来意向。模拟活动会单独标明。
       </p>
 
       <PageTabs label="生活页分区" tabs={LIFE_TABS} current={tab} onSelect={openTab} />
@@ -134,6 +134,28 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
         和下面三块（presence / goal / proactive）不是同一份数据，也不共用
         请求。任何一边失败，另一边照常显示。
       */}
+      {data ? (
+        <div className="life-now life-current" data-testid="life-current">
+          <span className="life-current__label">当前活动</span>
+          {current ? (
+            <>
+              <div className="life-now__title">
+                {STATE_LABEL[current.state] ?? current.state}·{current.kind}
+                {/* 字段缺失时宁可不显示，也不要渲染一个没有文字的空胶囊。 */}
+                {current.origin ? (
+                  <span className="badge">{ORIGIN_LABEL[current.origin] ?? current.origin}</span>
+                ) : null}
+              </div>
+              <div className="life-now__meta">
+                {current.started_at ? `自 ${formatSessionTime(current.started_at)}` : '还没开始'}
+              </div>
+            </>
+          ) : (
+            <div className="life-now__title">暂无进行中的活动</div>
+          )}
+        </div>
+      ) : null}
+
       <LifeTimelinePanel />
 
       {loading ? <p className="page__hint">加载中…</p> : null}
@@ -153,25 +175,6 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
 
       {data ? (
         <>
-          <div className="life-now">
-            {current ? (
-              <>
-                <div className="life-now__title">
-                  {STATE_LABEL[current.state] ?? current.state}·{current.kind}
-                  {/* 字段缺失时宁可不显示，也不要渲染一个没有文字的空胶囊。 */}
-                  {current.origin ? (
-                    <span className="badge">{ORIGIN_LABEL[current.origin] ?? current.origin}</span>
-                  ) : null}
-                </div>
-                <div className="life-now__meta">
-                  {current.started_at ? `自 ${formatSessionTime(current.started_at)}` : '还没开始'}
-                </div>
-              </>
-            ) : (
-              <div className="life-now__title">此刻空闲</div>
-            )}
-          </div>
-
           <h2 className="life-section">主动联系</h2>
           <p className="page__hint">
             {data.proactive.gate

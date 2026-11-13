@@ -703,3 +703,92 @@
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+
+/* 日程先呈现日期与内容，生成细节按需展开。 */
+.tl-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.tl-heading__date {
+  margin: 4px 0;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.tl-heading__count {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.tl-diagnostics {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.tl-diagnostics summary {
+  cursor: pointer;
+  color: var(--ink-soft);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.tl-diagnostics__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.tl-diagnostics__body .tl-state__code {
+  align-self: flex-start;
+}
+
+.tl-plans__hint {
+  color: var(--ink-faint);
+  font-size: 12px;
+  margin: -4px 0 14px;
+}
+
+.tl-body--no-facts {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.tl-body--no-facts .tl-facts {
+  padding: 10px 14px;
+  background: transparent;
+}
+
+.life-current {
+  padding: 18px 20px;
+  border-left: 3px solid var(--accent);
+  background: var(--paper-raised);
+  border-radius: var(--radius-md);
+}
+
+.life-current__label {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.tl-panel__title {
+  margin-bottom: 12px;
+}
+
+@media (max-width: 460px) {
+  .tl-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .tl-diagnostics summary {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+  }
+}
