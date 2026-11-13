@@ -2080,6 +2080,45 @@ export function imageUpdateStageIndex(stage: string | null | undefined): number 
   return IMAGE_UPDATE_STAGES.indexOf(stage as (typeof IMAGE_UPDATE_STAGES)[number]);
 }
 
+export function imageUpdateProgressState(
+  state: string,
+  stage: string | null | undefined,
+  index: number,
+): 'done' | 'current' | 'pending' | 'stopped' {
+  const currentIndex = imageUpdateStageIndex(stage);
+  if (state === 'queued' || state === 'pending') return 'pending';
+  if (state === 'succeeded' || currentIndex > index) return 'done';
+  if (state === 'running' && currentIndex === index) return 'current';
+  if (
+    ['failed_not_started', 'needs_manual', 'resolved'].includes(state) &&
+    currentIndex === index
+  ) return 'stopped';
+  return 'pending';
+}
+
+export function imageTaskElapsedText(
+  startedAt: string | null | undefined,
+  finishedAt: string | null | undefined,
+  state: string,
+  now = Date.now(),
+): string | null {
+  if (!startedAt) return null;
+  const started = Date.parse(startedAt);
+  const running = state === 'running';
+  const ended = running ? now : finishedAt ? Date.parse(finishedAt) : NaN;
+  if (!Number.isFinite(started) || !Number.isFinite(ended) || started > ended) return null;
+  const prefix = running ? '已运行' : '用时';
+  const elapsedSeconds = Math.floor((ended - started) / 1000);
+  if (elapsedSeconds < 60) return `${prefix} ${elapsedSeconds} 秒`;
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${prefix} ${elapsedMinutes} 分钟`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  const remainingMinutes = elapsedMinutes % 60;
+  return remainingMinutes === 0
+    ? `${prefix} ${elapsedHours} 小时`
+    : `${prefix} ${elapsedHours} 小时 ${remainingMinutes} 分钟`;
+}
+
 /** 更新器状态码 → 中文；未知状态不显示英文码值。 */
 export function imageUpdaterStateLabel(state: string | null | undefined): string {
   switch (state) {
@@ -2971,10 +3010,19 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   const nowMs = props.nowMs ?? Date.now();
   const current = view?.current ?? { version: null, commit: null, digest: null };
   const task = view?.task ?? null;
+  const progressKnown = task !== null && (
+    ['succeeded', 'queued', 'pending'].includes(task.state) ||
+    (
+      ['running', 'failed_not_started', 'needs_manual', 'resolved'].includes(task.state) &&
+      imageUpdateStageIndex(task.stage) >= 0
+    )
+  );
   const target = view?.target ?? null;
   const newer = view?.newer ?? [];
   const catalog = view?.details?.catalog ?? {};
   const updater = view?.details?.updater ?? {};
+  const updaterBusyUnconfirmed = updater.online === false && updater.state === 'busy';
+  const updaterOnlineLabel = updater.online === true ? '在线' : updater.online === false ? '离线' : '未知';
   const backupGate = view?.details?.backup_gate ?? null;
 
   const activity = imageTaskActivity(view);
@@ -3064,6 +3112,17 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         >
           {action.label}
         </button>
+        {task !== null && activity === 'none' ? (
+          <button
+            type="button"
+            className="ghost-button"
+            data-testid="image-update-last-progress"
+            aria-expanded={taskOpen}
+            onClick={() => setTaskOpen((open) => !open)}
+          >
+            {taskOpen ? '收起上次进度' : '查看上次进度'}
+          </button>
+        ) : null}
         {canWrite || activity !== 'none' ? (
           <button
             type="button"
@@ -3125,9 +3184,46 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         </section>
       ) : null}
 
-      {taskOpen && task !== null ? (
+      {taskOpen && activity === 'queued' ? (
         <div className="update-task" data-testid="image-update-task-detail">
           <h3 className="update-details__title">任务进度</h3>
+          <p>更新请求已提交，正在等待更新器开始。</p>
+        </div>
+      ) : null}
+
+      {taskOpen && task !== null && activity !== 'queued' ? (
+        <div className="update-task" data-testid="image-update-task-detail">
+          <h3 className="update-details__title">任务进度</h3>
+          <p className="update-progress__elapsed" data-testid="image-update-elapsed">
+            {imageTaskElapsedText(task.started_at, task.finished_at, task.state, nowMs) ?? '耗时未知'}
+          </p>
+          {progressKnown ? (
+            <ol className="update-progress" data-testid="image-update-progress">
+              {IMAGE_UPDATE_STAGES.map((stage, index) => {
+                const progressState = imageUpdateProgressState(task.state, task.stage, index);
+                const progressLabel = {
+                  done: '已完成',
+                  current: '进行中',
+                  stopped: '未完成',
+                  pending: '待开始',
+                }[progressState];
+                return (
+                  <li
+                    className={`update-progress__step update-progress__step--${progressState}`}
+                    data-progress-state={progressState}
+                    key={stage}
+                  >
+                    <span className="update-progress__marker" aria-hidden="true" />
+                    <span>{imageUpdateStageLabel(stage)}</span>
+                    <span className="update-progress__state">{progressLabel}</span>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : (
+            <p className="update-progress__note">阶段信息未知，无法显示具体进度。</p>
+          )}
+          <p className="update-progress__note">进度按任务阶段显示，镜像下载阶段暂不提供百分比。</p>
           <dl className="about-facts about-facts--tight">
             <dt>任务状态</dt>
             <dd>
@@ -3220,8 +3316,8 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
             </dd>
             <dt>更新器</dt>
             <dd data-testid="image-update-detail-updater">
-              {updater.online === true ? '在线' : updater.online === false ? '离线' : '未知'}
-              {`（${imageUpdaterStateLabel(updater.state ?? null)}）`}
+              {updaterBusyUnconfirmed ? '在线状态未确认' : updaterOnlineLabel}
+              {`（${updaterBusyUnconfirmed ? '最后记录：' : ''}${imageUpdaterStateLabel(updater.state ?? null)}）`}
               {updater.protocol === null || updater.protocol === undefined ? null : (
                 <span className="about-facts__muted"> · 协议 v{updater.protocol}</span>
               )}

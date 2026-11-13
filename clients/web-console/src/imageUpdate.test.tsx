@@ -51,6 +51,8 @@ import {
   imageUpdateReasonText,
   imageUpdateVerification,
   imageUpdateStageIndex,
+  imageUpdateProgressState,
+  imageTaskElapsedText,
   imageUpdateStageLabel,
   imageUpdateTaskStateText,
   imageUpdaterStateLabel,
@@ -1016,6 +1018,18 @@ describe('详情/诊断默认折叠：digest 与原因码只在展开后出现',
     expect(catalogSourceTextOf(missingMarkup)).toBe('未知');
   });
 
+  it('更新器心跳过期且最后记录忙碌时不推断进程离线', () => {
+    const base = makeView();
+    const view = makeView({
+      details: { ...base.details, updater: { online: false, state: 'busy', protocol: 1 } },
+    });
+    const markup = renderPanel({
+      state: { ...initialImageUpdateState(), view },
+      defaultDetailsOpen: true,
+    });
+    expect(markup).toContain('在线状态未确认（最后记录：正在执行任务）');
+  });
+
   it('失败码在详情里也配人话；未知码给兜底文案', () => {
     const view = makeView({
       task: makeTask({ state: 'failed_not_started', stage: 'backup', failed_code: 'backup_failed' }),
@@ -1219,6 +1233,27 @@ describe('阶段与状态码只翻译成中文', () => {
     expect(IMAGE_UPDATE_STAGES).toEqual(['prepare', 'backup', 'migrate', 'switch', 'verify']);
     expect(imageUpdateStageIndex('backup')).toBe(1);
     expect(imageUpdateStageIndex('download')).toBe(-1);
+  });
+
+  it('进度按当前阶段区分已完成、进行中和待开始', () => {
+    expect(imageUpdateProgressState('running', 'migrate', 0)).toBe('done');
+    expect(imageUpdateProgressState('running', 'migrate', 2)).toBe('current');
+    expect(imageUpdateProgressState('running', 'migrate', 4)).toBe('pending');
+    expect(imageUpdateProgressState('queued', 'prepare', 0)).toBe('pending');
+    expect(imageUpdateProgressState('queued', 'verify', 0)).toBe('pending');
+    expect(imageUpdateProgressState('succeeded', 'verify', 4)).toBe('done');
+    expect(imageUpdateProgressState('failed_not_started', 'backup', 1)).toBe('stopped');
+    expect(imageUpdateProgressState('needs_manual', 'switch', 3)).toBe('stopped');
+  });
+
+  it('任务时长按服务端开始时间计算，缺失或无效时间不猜', () => {
+    const now = Date.parse('2026-11-14T03:15:00Z');
+    expect(imageTaskElapsedText('2026-11-14T03:00:00Z', null, 'running', now)).toBe('已运行 15 分钟');
+    expect(imageTaskElapsedText('2026-11-14T01:00:00Z', null, 'running', now)).toBe('已运行 2 小时 15 分钟');
+    expect(imageTaskElapsedText('2026-11-14T03:00:00Z', '2026-11-14T03:10:00Z', 'succeeded', now)).toBe('用时 10 分钟');
+    expect(imageTaskElapsedText('2026-11-14T03:00:00Z', null, 'succeeded', now)).toBeNull();
+    expect(imageTaskElapsedText('invalid', null, 'running', now)).toBeNull();
+    expect(imageTaskElapsedText(null, null, 'running', now)).toBeNull();
   });
 
   it('未知阶段有兜底，缺失阶段写「尚未开始」', () => {
