@@ -1302,11 +1302,32 @@ export interface ProactiveOpportunity {
   reason: string;
   /** 生成好的开场白。null = 还没生成。 */
   draft_text: string | null;
+  /** 语音正文被隐藏时仍可区分已生成与尚未生成。 */
+  draft_available?: boolean;
+  output_modality?: string;
   expires_at: string;
+}
+
+export interface ProactiveRecord {
+  opportunity_id: string;
+  kind: string;
+  reason: string;
+  reason_code: string | null;
+  has_source: boolean;
+  state: string;
+  created_at: string;
+  sent_at: string | null;
+  gate: { allowed: boolean | null; reasons: string[]; checked_at: string | null };
+  delivery_state: string | null;
+  web_saved: boolean;
+  terminal_reason: string | null;
+  receipt: { state: string; channel: string; observed_at: string } | null;
 }
 
 export interface ProactiveResponse {
   pending: ProactiveOpportunity[];
+  /** 旧版本服务端可能没有此字段。 */
+  recent?: ProactiveRecord[];
   gate: boolean;
   gate_reasons: string[];
   /** 主动发送是否真的实现了。false 时候选只会过期，不会变成消息。 */

@@ -446,6 +446,11 @@ async def dispatch_pending(
                 channel_can_proactive=True,
             )
             gate_cache[row.subject_id] = gate
+        # 记录调度器当时真正执行的检查，不把页面上的当前快照冒充历史决策。
+        # 关停发送、缺草稿或尚未扫描到的候选不会经过这里，保持未知。
+        row.last_gate_allowed = bool(getattr(gate, "allowed", False))
+        row.last_gate_reasons = list(getattr(gate, "reasons", []))
+        row.last_gate_at = moment
         if not getattr(gate, "allowed", False):
             # 门控没过就留着，不标 rejected——它只是"现在还不是时候"
             continue

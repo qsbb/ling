@@ -36,6 +36,7 @@ class OpportunityView:
     # 生成好的开场白。None = 还没生成（不是"生成了空的"）。
     draft_text: str | None = None
     output_modality: str = "text"
+    visibility: str = "subject_private"
 
 
 @dataclass
@@ -379,6 +380,7 @@ class ProactivityService:
             expires_at=expires,
             draft_text=row.draft_text,
             output_modality=row.output_modality,
+            visibility=row.visibility,
         )
 
 

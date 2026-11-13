@@ -28,6 +28,8 @@ import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
 import { LifePage } from './LifePage';
 import { LifeTimelinePanel } from './LifeTimeline';
 import { PageTabPanel, PageTabs, type PageTabSpec } from './PageTabs';
+import { ProactiveHistory } from './ProactiveHistory';
+import { ProactiveDraft } from './ProactiveDraft';
 
 interface LifeNowPageProps {
   /** 离开本页（回对话）。 */
@@ -178,26 +180,20 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
           <h2 className="life-section">主动联系</h2>
           <p className="page__hint">
             {data.proactive.gate
-              ? '当前允许主动找你。'
-              : '当前不会主动找你，原因：'}
+              ? '当前外部渠道检查通过。'
+              : '当前外部渠道检查未通过：'}
             {data.proactive.gate ? null : (
               <span className="life-gate">{data.proactive.gate_reasons.join('；')}</span>
             )}
           </p>
           {pending.length > 0 ? (
             <p className="page__hint">
-              {/* gate 放行**不等于**会真的发出：主动发送目前没有实现。
-                  原来这里写"条件满足就会发"，那是一句假话。 */}
-              {/* 三种状态要分开说，不能合成一句：
-                  ① 发送功能没开（默认）——只会生成，不会发
-                  ② 开了但门控没过——排队中
-                  ③ 开了且门控过了——真的会发 */}
               {data.proactive.delivery_enabled === false
                 ? data.proactive.note ||
                   '主动发送默认关闭：下面能看到她会说什么，但不会真的发出去。'
                 : data.proactive.gate
-                  ? '下面这些机会正在排队，条件满足就会发。'
-                  : '下面这些机会已经产生，但按上面的原因还没发出去——不是已经联系过你。'}
+                  ? '下面这些机会正在等待调度，发送时会再次检查。'
+                  : '下面这些机会正在等待调度；外部渠道受上述条件限制，Web 会话可能作为备用。'}
             </p>
           ) : null}
           {pending.length > 0 ? (
@@ -206,11 +202,7 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
                 <li key={item.opportunity_id} className="life-list__row">
                   {/* 她会说什么 —— 这是生成好的开场白，不是内部推理 */}
                   <span className="life-list__main">
-                    {item.draft_text ? (
-                      <span data-testid="proactive-draft">「{item.draft_text}」</span>
-                    ) : (
-                      <span className="life-list__note">（开场白还没生成）</span>
-                    )}
+                    <ProactiveDraft item={item} />
                   </span>
                   <span className="life-list__meta">
                     {/* reason 是内部推理，标出来避免被当成台词 */}
@@ -224,6 +216,7 @@ function LifeNowPanel({ onOpenRhythm }: { onOpenRhythm: () => void }) {
           ) : (
             <p className="page__hint">没有待发的主动机会。</p>
           )}
+          <ProactiveHistory records={data.proactive.recent ?? []} />
 
           <h2 className="life-section">最近做过的事</h2>
           {history.length > 0 ? (

@@ -688,6 +688,7 @@ async def list_proactive(
     view: str = "participant",
 ) -> dict:
     from ling.api.deps import authorize_message_view
+    from ling.domains.proactive.history import recent_opportunities
 
     operator = authorize_message_view(auth, view)
     service = ProactivityService(session, actor_id=_actor_id(settings))
@@ -696,6 +697,12 @@ async def list_proactive(
     except Exception:  # noqa: BLE001 - 读不到配置就按"未开启"报，不假装已开
         effective_dialogue = None
     pending = await service.pending(auth.user.subject_id)
+    recent = await recent_opportunities(
+        session,
+        actor_id=_actor_id(settings),
+        subject_id=auth.user.subject_id,
+        operator=operator,
+    )
     # **必须真的探测**渠道能力，不能硬编码 False。
     # 原来这里写死 False，于是 gate 永远说"当前渠道不支持主动投递"——
     # 无论 OneBot 配置得多完整，主动联系都不可能出现。
@@ -745,11 +752,14 @@ async def list_proactive(
                 "reason": o.reason,
                 # 生成好的开场白；None 表示还没生成（不是"生成了空的"）
                 "draft_text": o.draft_text if operator or o.output_modality != "voice" else "",
+                "draft_available": o.draft_text is not None,
                 "output_modality": o.output_modality,
                 "expires_at": o.expires_at.isoformat(),
             }
             for o in pending
+            if operator or o.visibility in {"subject_private", "public"}
         ],
+        "recent": recent,
         "gate": gate.allowed,
         "gate_reasons": gate.reasons,
         # **诚实标记**：候选会被收集，但目前没有任何代码把它变成消息。

@@ -610,6 +610,7 @@ boundaries?, scenario_prompts?}`。`persona_id` **由服务端生成**：
 | --- | --- | --- |
 | GET | `/v1/actor/timeline?limit=50` | `{events: [{id, type, origin, visibility, occurred_at, summary}]}` |
 | GET | `/v1/life/timeline?date=YYYY-MM-DD` | 只读生活时间轴（双时区 / 段 / 事实 / 未来意向 / 梦卡片），字段见 §11 |
+| GET | `/v1/proactive` | 当前主体的主动联系候选、门控和最近记录，字段见 §14 |
 
 `actor/timeline` 按**角色**（`actor_id`）取事件、**不按人格过滤**：人格是多套
 轮换的，时间线要能追溯"上一套人设说过什么"。每条事件自带 `persona_id`（记在
@@ -1432,3 +1433,24 @@ messages** + 每一段属于哪个语义块。用来回答"她为什么这么说
 | `kernel/autonomy.py` 的处境读取 | presence / 负担 / 情绪 | 读失败 → 用默认值继续（已有 try/except） | 统一走 `read_within_budget`，标记进决策事件 |
 | `worker.py` 的 `life.tick` 场景提交 | 日程段 | 无段就不提交；过期靠 TTL 自然转 unknown | **写路径**，需单独设计（本批只做只读） |
 | `domains/phone` 的"真的采用这个节奏" | 调用 `schedule_next_from_upstream` | 目前只有读侧投影；谁调 `stop_watching` 由调度决定 | 调度接线时直接调它（已带日志与回退标记） |
+
+## 14. 主动联系的只读记录
+
+`GET /v1/proactive` 返回当前主体的候选、当前外部渠道门控快照及 `recent`：最多
+50 条按创建时间倒序排列的机会。读取不会创建或投递机会。`recent` 只保留来源
+类型、理由、最近一次调度门控与投递证据；不返回平台错误原文、平台消息 ID 或草稿正文。
+
+- `gate.allowed` 为 `true` / `false` / `null`，分别表示当时检查允许、暂缓、没有检查记录。
+  `gate.reasons` 与 `gate.checked_at` 对应这次实际检查；发送关闭、草稿未生成、旧版数据
+  和尚未扫描的候选可能没有检查记录。它不是当前状态，也不是完整的检查历史。
+- `receipt` 为 `null` 或 `{state, channel, observed_at}`。只有 operation 同属当前角色
+  与主体，且其 payload 标识此机会为来源时才关联回执。回执持久化失败、Web 文本投递或
+  旧记录可能没有独立回执；不能从允许门控推断已经发送。`web_saved` 仅代表 Web 文本
+  已按现有结算路径写入会话。
+- 默认参与者只读本人 `subject_private` / `public` 的机会；机会未记录窗口归属时，
+  窗口私有、群聊、角色私有和管理员专用记录不向参与者返回。owner/admin 显式传
+  `view=operator` 可读取本人其他可见范围；语音草稿只在该视图可见。两个视图均按
+  主体隔离。`recent` 不返回草稿正文；`pending[].draft_available` 表示草稿是否生成，
+  即使语音正文被隐藏也能与未生成区分。
+- 迁移 `0072_proactive_gate_snapshot` 新增的三个列仅保存最近检查。降级会删除这些
+  列和已记录的门控快照，不删除机会和既有投递记录。

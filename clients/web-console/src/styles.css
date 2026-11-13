@@ -2513,6 +2513,47 @@ button {
   font-size: 12px;
 }
 
+.proactive-history {
+  margin-top: 12px;
+}
+
+.proactive-history summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.proactive-history__list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.proactive-history__item {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 9px;
+  background: var(--surface, #fff);
+  font-size: 13px;
+}
+
+.proactive-history__heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+
+.proactive-history__heading time {
+  color: var(--muted, #6b7280);
+}
+
+.proactive-history__item p {
+  margin: 6px 0 0;
+}
+
 .life-foot {
   margin-top: 26px;
   padding-top: 14px;

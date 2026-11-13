@@ -1665,6 +1665,12 @@ class ProactiveOpportunity(Base):
             unique=True,
             postgresql_where=sa.text("dedupe_key IS NOT NULL"),
         ),
+        Index(
+            "ix_proactive_actor_subject_created",
+            "actor_id",
+            "subject_id",
+            "created_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1711,6 +1717,10 @@ class ProactiveOpportunity(Base):
     channel_hint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 最近一次由调度器实际执行的门控，不从当前配置推测旧记录。
+    last_gate_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_gate_reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    last_gate_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # ------------------------------------------------------------------ W2 知识/设备/语音
