@@ -48,6 +48,7 @@ import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type { SubjectRow } from '../types';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon } from './Icons';
+import '../identity.css';
 
 interface IdentityPageProps {
   onBack: () => void;
@@ -243,6 +244,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
         data-editing={isEditing ? 'true' : 'false'}
       >
         <div className="account-card__head">
+          <span className="identity-avatar" aria-hidden="true">{Array.from(subject.display_name || '未')[0]}</span>
           <strong>{subject.display_name || '（无昵称）'}</strong>
           <span className="badge">{TRUST_LABELS[subject.trust_level] ?? subject.trust_level}</span>
           {isMerged ? (
@@ -270,7 +272,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
 
         {isMerged ? (
           <div className="account-card__actions">
-            <span className="page__hint">这个 subject 已被当作另一个人的号。</span>
+            <span className="page__hint">已关联到另一身份，可拆开独立管理。</span>
             <button
               type="button"
               className="button button--small"
@@ -346,21 +348,23 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
   const nothingMatched = noneAtAll && appliedSearch !== '';
 
   return (
-    <section className="page">
+    <section className="page identity-page">
       {/* 一级页：返回键回聊天，不是回设置（它已经不在设置里了）。 */}
       <button type="button" className="back-link" onClick={onBack}>
         <ArrowLeftIcon /> 返回聊天
       </button>
 
-      <h1 className="page__title">关系</h1>
-      <p className="page__hint">
-        同一个人在多个平台、或者一个平台上有多个号时，可以把它们认成同一个人。
-        <strong>合并只写一个指针，不搬任何数据</strong>——合错了点「拆开」就还原，
-        拆开时还会把合并期间写在别人名下的记忆送回原主。
-      </p>
-      <p className="page__hint">
-        判定的依据永远是<strong>账号</strong>，不是昵称：两个都叫「小明」的人不会被当成一个人。
-      </p>
+      <header className="identity-heading">
+        <div>
+          <h1 className="page__title">关系</h1>
+          <p className="page__hint">管理认识的人和他们的账号，跨平台延续同一段关系。</p>
+        </div>
+        <details className="identity-help">
+          <summary>账号合并说明</summary>
+          <p>确认两个账号属于同一个人后，可以合并身份。请核对平台与账号，避免仅凭昵称判断。</p>
+          <p>合并后仍可拆开，相关记忆会按来源归还。</p>
+        </details>
+      </header>
 
       {/* 搜索在**服务端**做（`q`）：只在当前页里过滤会把"人在第 3 页"说成"没这个人"。 */}
       <form className="identity-search" onSubmit={submitSearch} role="search">
@@ -420,20 +424,20 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
 
       {merged.length > 0 ? (
         <>
-          <h2 className="page__subtitle">已合并</h2>
-          {merged.map(renderSubject)}
+          <h2 className="page__subtitle identity-section-title">已合并 <span>{merged.length}</span></h2>
+          <div className="identity-list">{merged.map(renderSubject)}</div>
         </>
       ) : null}
 
       {loadedCount > 0 ? (
         <>
-          <h2 className="page__subtitle">独立的人</h2>
+          <h2 className="page__subtitle identity-section-title">独立的人 <span>{candidates.length}</span></h2>
           {/* 提示"这是第几条到第几条 / 一共多少"：分页之后不说清楚，用户会以为
               "只剩这几个人了"。 */}
           <p className="page__hint" data-testid="subjects-count">
             已显示 {loadedCount} 人{total > 0 ? `，共 ${total} 人` : ''}
           </p>
-          {candidates.map(renderSubject)}
+          <div className="identity-list">{candidates.map(renderSubject)}</div>
         </>
       ) : null}
 

@@ -469,6 +469,26 @@ describe('关系页：375 / 1440 不横向溢出', () => {
       const { page } = await openRelations({ width, height: 900 });
 
       await assertNoHorizontalOverflow(page, `${width} 只读`);
+      // 列表不能被父级 flex 压缩后用 overflow:hidden 裁掉后续行。
+      // scrollIntoView 会滚动 hidden 容器，单独做命中测试检测不到这种裁切。
+      const listSizes = await page.locator('.identity-list').evaluateAll((lists) =>
+        lists.map((list) => ({ visible: list.clientHeight, content: list.scrollHeight })),
+      );
+      expect(listSizes.length).toBeGreaterThan(0);
+      for (const size of listSizes) {
+        expect(size.content, `${width}px 人员列表不能被纵向裁切`).toBeLessThanOrEqual(size.visible + 1);
+      }
+      const lastCard = page.getByTestId('subject-card').last();
+      await lastCard.scrollIntoViewIfNeeded();
+      const reachable = await lastCard.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(centerX, centerY);
+        return hit !== null && element.contains(hit);
+      });
+      expect(reachable).toBe(true);
+
 
       // 展开第一张：下拉里装着 49 个候选（含长昵称），最窄视口下的关键场景
       await page.getByTestId('merge-open').first().click();
