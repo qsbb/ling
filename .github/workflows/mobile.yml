@@ -34,12 +34,11 @@ jobs:
         working-directory: clients/mobile
     steps:
       - uses: actions/checkout@v4
-      # channel: stable 没钉小版本：这里没法在 GitHub 上验证某个具体版本的可用性，
-      # 钉一个查不到版本号会让整条流水线永久红。首次在 Actions 上跑通后，
-      # 建议改成 `flutter-version: "x.y.z"`（与本地验证过的版本一致）。
+      # 固定到已验证的 SDK，让发版检查使用可复现的分析器与依赖解析。
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: "3.47.5"
           # 缓存 SDK 与 pub 缓存，第二次起省掉 SDK 下载的几分钟。
           cache: true
       - name: 安装依赖
