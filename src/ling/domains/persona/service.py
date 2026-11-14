@@ -311,13 +311,13 @@ class PersonaService:
         一样。关键字名也从 ``default_persona_id`` 改成 ``persona_id``：它已经
         不是"默认值"，而是"这一份服务对象是谁"。
         """
-        explicit = persona_id if persona_id is not None else kwargs.pop("persona_id", None)
+        explicit: object = persona_id if persona_id is not None else kwargs.pop("persona_id", None)
         default_param = kwargs.pop("default_persona_id", None)
         if kwargs:
             raise TypeError(f"PersonaService 不认识的参数：{'、'.join(sorted(kwargs))}")
         self._session = session
         # 普通空串沿用动态解析；快照空串表示这一轮确定没有人格。
-        self._persona_id: str | None = (  # type: ignore[assignment]
+        self._persona_id: object = (
             explicit if isinstance(explicit, PersonaIdSnapshot) else explicit or default_param
         )
 

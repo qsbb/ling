@@ -11,7 +11,7 @@ import binascii
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, time
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -1540,6 +1540,8 @@ async def subject_details(
     # 合并只改变账号的归属视图，不向其他主体授予私有内容的权限。
     own_subject = subject_id == auth.user.subject_id
     access = "full"
+    # Each section selects a different ORM model, then projects its own fields.
+    query: Any
     if section == "accounts":
         group = await IdentityService(session).subject_group(subject_id)
         query = select(ActorAccount).where(ActorAccount.subject_id.in_(list(group)))

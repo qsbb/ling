@@ -42,6 +42,7 @@ from ling.kernel.autonomy import TurnChoice
 from ling.kernel.decision import TurnDecision
 from ling.kernel.turn import TurnCoordinator, TurnStreamEvent
 from ling.logging_setup import emit_event
+from ling.ports.config import ConfigReader
 
 logger = logging.getLogger("ling.api.chat")
 
@@ -852,6 +853,7 @@ async def send_transcribed_turn(
     # 否则本进程会继续用旧密钥，表现为"有时能聊有时不能"。
     await _refresh_config_if_stale(request)
     window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
+    decision_config: ConfigReader
     if window.channel == "web" and window.visibility == "subject_private":
         from ling.settings.window_policy import FixedConfigReader, runtime_window_config
 

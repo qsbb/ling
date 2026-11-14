@@ -27,6 +27,7 @@ import re
 import stat
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -1432,7 +1433,7 @@ def _image_timestamp(value: object) -> str | None:
     return value
 
 
-def _image_choice(value: object, allowed: frozenset[str]) -> str | None:
+def _image_choice(value: object, allowed: Collection[str]) -> str | None:
     if isinstance(value, str) and value in allowed:
         return value
     return None

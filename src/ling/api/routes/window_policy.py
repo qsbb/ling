@@ -33,7 +33,7 @@ from ling.settings.window_policy import (
 )
 
 router = APIRouter(tags=["sessions"])
-_FIELD = "private_may_stay_silent"
+_FIELD: Literal["private_may_stay_silent"] = "private_may_stay_silent"
 _PREVIEW_SECONDS = 300
 
 
