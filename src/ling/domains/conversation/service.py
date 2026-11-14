@@ -968,7 +968,12 @@ class ConversationService:
     # ---------------------------------------------------------- 撤回
 
     async def retract_message(
-        self, *, window_ref: str, platform_message_id: str, now: datetime | None = None
+        self,
+        *,
+        window_ref: str,
+        platform_message_id: str,
+        trusted_instance_key: tuple[str, str] | None = None,
+        now: datetime | None = None,
     ) -> RetractOutcome:
         """把"平台上被撤回的那条消息"标记为不再可用（**不删行**）。
 
@@ -995,6 +1000,8 @@ class ConversationService:
         记一条"撤回未匹配"，等真有人问"她怎么还引用那条"时能对上号。
         """
 
+        from sqlalchemy import and_, or_
+
         from ling.infra.models import IdempotencyKey, Window
         from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
 
@@ -1003,13 +1010,43 @@ class ConversationService:
         ref = str(window_ref or "").strip()
         if not mid or not ref:
             return RetractOutcome(status="unmatched", reason="缺少窗口标识或平台消息 id")
-        window_id = (
-            await self._session.execute(
-                select(Window.id).where(
-                    Window.actor_id == self._actor_id, Window.title == ref
-                )
-            )
-        ).scalars().first()
+        reference_match = or_(
+            Window.connector_window_ref == ref,
+            and_(Window.connector_window_ref.is_(None), Window.title == ref),
+        )
+        candidates = select(Window.id).where(
+            Window.actor_id == self._actor_id,
+            Window.channel.in_(("onebot", "qqbot")),
+            reference_match,
+        )
+        window_ids: list[str] = []
+        if trusted_instance_key is not None:
+            scope, instance_id = trusted_instance_key
+            exact = list((await self._session.scalars(
+                candidates.where(
+                    Window.origin_status == "known",
+                    Window.origin_scope == scope,
+                    Window.origin_instance_id == instance_id,
+                ).limit(2)
+            )).all())
+            if len(exact) > 1:
+                return RetractOutcome(status="unmatched", reason="平台实例下存在多个匹配会话")
+            window_ids = exact
+        if not window_ids:
+            unknown = list((await self._session.scalars(
+                candidates.where(Window.origin_status == "unknown").limit(2)
+            )).all())
+            if len(unknown) > 1:
+                return RetractOutcome(status="unmatched", reason="历史会话来源不唯一，无法安全撤回")
+            window_ids = unknown
+        if trusted_instance_key is None:
+            candidates = candidates.where(Window.origin_status == "known")
+            known = list((await self._session.scalars(candidates.limit(2))).all())
+            if len(known) > 1:
+                return RetractOutcome(status="unmatched", reason="平台会话来源不唯一，无法安全撤回")
+            if not window_ids:
+                window_ids = known
+        window_id = window_ids[0] if window_ids else None
         if not window_id:
             return RetractOutcome(
                 status="unmatched", reason="这个窗口还没有任何消息"
@@ -1433,15 +1470,23 @@ class ConversationService:
 
     async def claim_event(self, *, scope: str, key: str) -> str | None:
         """登记入站事件。返回已有 result_ref 表示重复事件（调用方应短路）。"""
-        existing = (
-            await self._session.execute(
-                select(IdempotencyKey).where(
-                    IdempotencyKey.scope == scope, IdempotencyKey.key == key
+        from sqlalchemy.dialects.postgresql import insert
+
+        inserted = await self._session.execute(
+            insert(IdempotencyKey)
+            .values(id=new_id("idem"), scope=scope, key=key)
+            .on_conflict_do_nothing(
+                index_elements=[IdempotencyKey.scope, IdempotencyKey.key]
+            )
+            .returning(IdempotencyKey.id)
+        )
+        if inserted.scalar_one_or_none() is not None:
+            return None
+        return (
+            await self._session.scalar(
+                select(IdempotencyKey.result_ref).where(
+                    IdempotencyKey.scope == scope,
+                    IdempotencyKey.key == key,
                 )
             )
-        ).scalar_one_or_none()
-        if existing is not None:
-            return existing.result_ref or "duplicate"
-        self._session.add(IdempotencyKey(id=new_id("idem"), scope=scope, key=key))
-        await self._session.flush()
-        return None
+        ) or "duplicate"

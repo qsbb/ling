@@ -49,6 +49,8 @@ export function ProactiveHistory({ records }: { records: ProactiveRecord[] }) {
             </div>
             <p>来源：{record.has_source ? (SOURCES[record.reason_code ?? ''] ?? '已关联来源') : '未记录'}</p>
             <p>缘由：{record.reason}</p>
+            {record.draft_origin === 'unknown' ? <p>草稿来源：未记录</p> : null}
+            {record.draft_state === 'uncertain' ? <p>开场白生成结果暂未确认</p> : null}
             <p>
               上次检查：{record.gate.allowed === null ? '没有记录' : record.gate.allowed ? '允许继续' : '暂缓'}
               {record.gate.reasons.length ? ` · ${record.gate.reasons.join('；')}` : ''}

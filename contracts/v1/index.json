@@ -57,6 +57,7 @@
     "SubjectsPage": "SubjectsPage.schema.json",
     "TodayOutlineItem": "TodayOutlineItem.schema.json",
     "TodayOutlineOut": "TodayOutlineOut.schema.json",
+    "WindowDialoguePolicyFields": "WindowDialoguePolicyFields.schema.json",
     "WindowDialoguePolicyPreview": "WindowDialoguePolicyPreview.schema.json",
     "WindowDialoguePolicyProposed": "WindowDialoguePolicyProposed.schema.json",
     "WindowDialoguePolicyView": "WindowDialoguePolicyView.schema.json"

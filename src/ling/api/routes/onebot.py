@@ -77,7 +77,14 @@ async def onebot_events(request: Request, instance_id: str = "default") -> JSONR
     # 决策、投递），分成几份实现迟早有一条忘了某个检查，而且是静默的。
     from ling.kernel.inbound_intake import process_inbound_payload
 
-    return JSONResponse(await process_inbound_payload(request.app, connector, payload))
+    return JSONResponse(
+        await process_inbound_payload(
+            request.app,
+            connector,
+            payload,
+            trusted_instance_key=("onebot", instance_id),
+        )
+    )
 
 
 @router.get("/instances/{instance_id}/health")

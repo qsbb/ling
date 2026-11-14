@@ -50,6 +50,32 @@ async def check_access(app, session, job: AsrJob) -> None:
             raise TranscriptionError("forbidden", "当前账号已失去渠道访问资格", 403)
 
 
+def _source_connector(app, payload: dict) -> tuple[object, tuple[str, str] | None]:
+    """按作业入队时的可信身份选择连接器，旧作业沿用命名空间。"""
+    from ling.capabilities.channels import connector_for_instance, connector_for_namespace
+
+    channel = payload.get("channel", "onebot")
+    envelope = payload.get("envelope") or {}
+    namespace = envelope.get("connector_instance", "")
+    source = payload.get("trusted_instance")
+    trusted_key = None
+    if source is not None:
+        if (
+            not isinstance(source, dict)
+            or source.get("scope") != channel
+            or not isinstance(source.get("instance_id"), str)
+            or not source["instance_id"]
+        ):
+            raise TranscriptionError("unavailable", "语音来源实例记录无效")
+        trusted_key = (source["scope"], source["instance_id"])
+        connector = connector_for_instance(app, *trusted_key)
+    else:
+        connector = connector_for_namespace(app, channel, namespace)
+    if connector is None or connector.instance_id != namespace:
+        raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
+    return connector, trusted_key
+
+
 async def _claim(job_id: str | None = None) -> tuple[str, int] | None:
     async with session_scope() as session:
         await lock_scope(session, "asr:workers")
@@ -133,12 +159,7 @@ async def _process_audio(
 
     if raw is None:
         from ling.worker import make_media_fetcher
-        channel = payload.get("channel", "onebot")
-        from ling.capabilities.channels import connector_for_namespace
-        envelope = payload.get("envelope") or {}
-        connector = connector_for_namespace(app, channel, envelope.get("connector_instance", ""))
-        if connector is None or connector.instance_id != envelope.get("connector_instance"):
-            raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
+        connector, _ = _source_connector(app, payload)
         fetch = make_media_fetcher(
             connector, media_root=settings.data_dir / "media", max_bytes=10 * 1024 * 1024
         )
@@ -300,7 +321,7 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
                 job.window_id, role="user", text="", sender_subject_id=job.subject_id, handled_as="pending_asr")
             job.source_message_id = msg.message_id
         source = await session.get(Message, job.source_message_id)
-        if source is None or source.retracted_at is not None:
+        if source is None or source.window_id != job.window_id or source.retracted_at is not None:
             raise TranscriptionError("cancelled", "原消息已删除或撤回")
         source.text = text
         later = await session.scalar(select(Message.id).where(
@@ -328,19 +349,16 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
         from ling.kernel.inbound_intake import process_inbound_payload
         original = InteractionEnvelope.model_validate(payload["envelope"])
         env = original.model_copy(update={"parts": [InputPart(modality=Modality.text, text=text)]})
-        from ling.capabilities.channels import connector_for_namespace
-        connector = connector_for_namespace(
-            app, payload.get("channel", "onebot"), original.connector_instance
-        )
-        if connector is None or connector.instance_id != original.connector_instance:
-            raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
-        await process_inbound_payload(
+        connector, trusted_key = _source_connector(app, payload)
+        outcome = await process_inbound_payload(
             app,
             connector,
             {},
-            trusted_instance_key=getattr(connector, "_ling_instance_key", None),
-            _asr_resume=(env, source_id),
+            trusted_instance_key=trusted_key,
+            _asr_resume=(env, source_id, window_id),
         )
+        if not outcome.get("accepted"):
+            raise TranscriptionError("dispatch_failed", "转写结果暂时无法进入原会话，请稍后重试", 503)
     else:
         from ling.api.routes.chat import SendTurnBody, send_transcribed_turn
         async with session_scope() as session:

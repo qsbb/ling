@@ -33,7 +33,14 @@ import ling.worker as worker_module
 from ling.domains.deferred import service as deferred
 from ling.domains.deferred.state import DeferredReplyState
 from ling.infra.db import session_scope
-from ling.infra.models import DeferredReply, Message, Turn, Window
+from ling.infra.models import (
+    DeferredReply,
+    Message,
+    Persona,
+    Turn,
+    Window,
+    WindowDialogueOverride,
+)
 from tests.integration.conftest import (
     TestEnv,  # noqa: F401 - 类型注解
     web_env,  # noqa: F401 - fixture
@@ -50,12 +57,14 @@ class _CountingRouter:
     def __init__(self, *, reply: str = "刚才说的那事我想了想，还是现在说。") -> None:
         self.reply = reply
         self.calls = 0
+        self.prompts: list[str] = []
 
     async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003, ARG002
         from ling.models.router import StreamOutcome
         from ling.ports.model import ModelChunk
 
         self.calls += 1
+        self.prompts.append("\n".join(str(message.content) for message in messages))
         yield ModelChunk(delta=self.reply), StreamOutcome()
         yield ModelChunk(done=True), StreamOutcome(text=self.reply)
 
@@ -84,6 +93,31 @@ async def _user_message(window_id: str, *, sequence: int, text: str = "在吗") 
                 role="user",
                 text=text,
                 sequence=sequence,
+            )
+        )
+
+
+async def _set_window_persona(window_id: str, persona_id: str, marker: str) -> None:
+    async with session_scope() as session:
+        session.add(
+            Persona(
+                id=persona_id,
+                revision=1,
+                name=persona_id,
+                display_name=persona_id,
+                system_prompt=marker,
+                traits={},
+                boundaries=[],
+                scenario_prompts={},
+                published=True,
+            )
+        )
+        session.add(
+            WindowDialogueOverride(
+                window_id=window_id,
+                revision=1,
+                overrides={"persona_id": persona_id},
+                updated_by="test",
             )
         )
 
@@ -193,6 +227,30 @@ async def test_no_reply_before_due_then_exactly_one_new_turn(
     assert stored is not None
     assert stored.state == DeferredReplyState.delivered.value
     assert stored.delivered_turn_id is not None
+
+
+async def test_deferred_reply_uses_window_persona_snapshot(
+    web_env: TestEnv,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """到期时读取目标窗口人格，并把它实际送入延后轮次的提示词。"""
+    router = _CountingRouter()
+    monkeypatch.setattr(worker_module, "_MEMORY_ROUTER", router)
+
+    await _web_window()
+    await _user_message("win_def", sequence=1)
+    await _schedule(delay_ms=45_000)
+    await _set_window_persona(
+        "win_def", "persona_deferred_override", "延后窗口专属人格提示"
+    )
+
+    await _sweep_at(NOW + timedelta(seconds=45))
+
+    assert router.calls == 1
+    assert any("延后窗口专属人格提示" in prompt for prompt in router.prompts), (
+        router.prompts
+    )
+    assert len(await _actor_messages("win_def")) == 1
 
 
 async def test_duplicate_sweeps_produce_only_one_new_turn(
@@ -427,6 +485,7 @@ async def test_group_window_is_refused_instead_of_delivering(
                 title="群平台标识",
                 channel="onebot",
                 visibility="group_scope",
+                origin_status="unknown",
             )
         )
     await _user_message("win_group", sequence=1)

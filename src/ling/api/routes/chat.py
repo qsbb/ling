@@ -854,20 +854,7 @@ async def send_transcribed_turn(
 ) -> StreamingResponse:
     # 配置可能刚被另一个副本改过：按修订号懒刷新密钥，
     # 否则本进程会继续用旧密钥，表现为"有时能聊有时不能"。
-    await _refresh_config_if_stale(request)
     window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
-    decision_config: ConfigReader
-    persona_id: str | None = None
-    if window.channel == "web" and window.visibility == "subject_private":
-        from ling.settings.window_policy import FixedConfigReader, runtime_window_snapshot
-
-        snapshot = await runtime_window_snapshot(config, window.id)
-        effective = snapshot.config
-        persona_id = snapshot.persona
-        decision_config = FixedConfigReader(effective)
-    else:
-        effective = await config.effective()
-        decision_config = config
     text = body.text.strip()
     if not text:
         raise LingError(ErrorCode.invalid_request, "消息不能为空", status_code=422)
@@ -875,10 +862,26 @@ async def send_transcribed_turn(
     existing = await conversation.find_turn(window.id, body.client_turn_id)
     if existing is not None:
         view = await conversation.turn_view(existing)
-        msgs = await conversation.list_messages(window.id, limit=200)
-        actor_msg = next(
-            (m for m in msgs if m.turn_id == existing.id and m.role == "actor"), None
+        from sqlalchemy import select
+
+        from ling.infra.models import ConversationAttemptSnapshot, Message
+
+        attempt = int(existing.attempt or 1)
+        snapshot_record = await conversation.session.get(
+            ConversationAttemptSnapshot, (existing.id, attempt)
         )
+        actor_msg = await conversation.session.scalar(
+            select(Message)
+            .where(
+                Message.turn_id == existing.id,
+                Message.attempt == attempt,
+                Message.role == "actor",
+            )
+            .order_by(Message.sequence.desc())
+            .limit(1)
+        )
+        actor_message = conversation._to_view(actor_msg) if actor_msg is not None else None
+        replay_test_mode = None if snapshot_record is None else snapshot_record.test_mode
 
         async def replay() -> AsyncIterator[bytes]:
             yield _sse(
@@ -887,17 +890,20 @@ async def send_transcribed_turn(
                     "turn_id": existing.id,
                     "state": view.state.value,
                     "replayed": True,
-                    "test_mode": effective.test_mode,
+                    "test_mode": replay_test_mode,
                 },
             )
-            if view.state is TurnState.completed and actor_msg is not None:
+            if view.state is TurnState.completed:
                 yield _sse(
                     "turn.completed",
                     {
                         "turn_id": existing.id,
                         "state": view.state.value,
-                        "model_label": actor_msg.model_label,
-                        "message": actor_msg.to_contract().model_dump(mode="json"),
+                        "model_label": actor_message.model_label if actor_message is not None else None,
+                        "message": (
+                            actor_message.to_contract().model_dump(mode="json")
+                            if actor_message is not None else None
+                        ),
                         "replayed": True,
                     },
                 )
@@ -920,7 +926,7 @@ async def send_transcribed_turn(
                     {
                         "turn_id": existing.id,
                         "state": view.state.value,
-                        "text": actor_msg.to_contract().text if actor_msg else "",
+                        "text": actor_message.to_contract().text if actor_message else "",
                         "error": {
                             "code": (view.error_code or ErrorCode.cancelled).value,
                             "message": "该轮次此前未完成，可点击重试",
@@ -930,6 +936,18 @@ async def send_transcribed_turn(
                 )
 
         return StreamingResponse(replay(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    await _refresh_config_if_stale(request)
+    from ling.settings.window_policy import (
+        FixedConfigReader,
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
+
+    snapshot = await runtime_window_snapshot(config, window.id)
+    effective = snapshot.config
+    persona_id = snapshot.persona
+    decision_config: ConfigReader = FixedConfigReader(effective)
 
     # --- 接话决策：确定性硬规则优先，模型只在弹性区间参与 ---
     # 设计文档 §6.1 候选：回答/澄清/沉默/延后；§1 第 7 条：确定性代码最终裁决。
@@ -1049,6 +1067,12 @@ async def send_transcribed_turn(
         return StreamingResponse(
             silent(), media_type="text/event-stream", headers=SSE_HEADERS
         )
+    await record_conversation_attempt_snapshot(
+        conversation.session,
+        turn_id=turn.id,
+        attempt=int(turn.attempt or 1),
+        snapshot=snapshot,
+    )
     # 轮次任务使用自己的数据库会话：必须先提交请求会话，否则后台看不到 turn 行
     await conversation.session.commit()
     coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
@@ -1058,6 +1082,7 @@ async def send_transcribed_turn(
         turn_id=turn.id,
         user_text=text,
         config=effective,
+        persona_id=persona_id,
         # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
         # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此
         # 不列 `[poke:…]` 这类渠道动作，因为它们在 Web 上无处执行。
@@ -1297,15 +1322,14 @@ async def retry_turn(
             turn_id, from_states={TurnState.stopping}, to_state=TurnState.stopped
         )
 
-    persona_id: str | None = None
-    if window.channel == "web" and window.visibility == "subject_private":
-        from ling.settings.window_policy import runtime_window_snapshot
+    from ling.settings.window_policy import (
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
 
-        snapshot = await runtime_window_snapshot(config, window.id)
-        effective = snapshot.config
-        persona_id = snapshot.persona
-    else:
-        effective = await config.effective()
+    snapshot = await runtime_window_snapshot(config, window.id)
+    effective = snapshot.config
+    persona_id = snapshot.persona
     messages = await conversation.list_messages(window.id, limit=400)
     user_text = ""
     for msg in reversed(messages):
@@ -1320,6 +1344,12 @@ async def retry_turn(
     # 用户能看到"上一段未完成"和"重新回答"，而不是旧文本凭空消失。
     bumped = await conversation.bump_attempt(turn_id)
     new_attempt = int(bumped.attempt or 1)
+    await record_conversation_attempt_snapshot(
+        conversation.session,
+        turn_id=turn_id,
+        attempt=new_attempt,
+        snapshot=snapshot,
+    )
     await conversation.session.commit()
 
     coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
@@ -1329,6 +1359,7 @@ async def retry_turn(
         turn_id=turn_id,
         user_text=user_text,
         config=effective,
+        persona_id=persona_id,
         attempt=new_attempt,
         # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
         # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此

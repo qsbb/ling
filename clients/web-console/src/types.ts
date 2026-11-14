@@ -1304,6 +1304,8 @@ export interface ProactiveOpportunity {
   draft_text: string | null;
   /** 语音正文被隐藏时仍可区分已生成与尚未生成。 */
   draft_available?: boolean;
+  draft_state?: string | null;
+  draft_origin?: 'bound' | 'unknown' | null;
   output_modality?: string;
   expires_at: string;
 }
@@ -1315,6 +1317,8 @@ export interface ProactiveRecord {
   reason_code: string | null;
   has_source: boolean;
   state: string;
+  draft_state?: string | null;
+  draft_origin?: 'bound' | 'unknown' | null;
   created_at: string;
   sent_at: string | null;
   gate: { allowed: boolean | null; reasons: string[]; checked_at: string | null };

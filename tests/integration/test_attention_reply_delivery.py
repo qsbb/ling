@@ -34,7 +34,13 @@ import pytest
 from sqlalchemy import select
 
 from ling.infra.db import session_scope
-from ling.infra.models import AttentionPollLogRow, Message, Window
+from ling.infra.models import (
+    AttentionPollLogRow,
+    Message,
+    Persona,
+    Window,
+    WindowDialogueOverride,
+)
 from tests.integration.conftest import TestEnv
 from tests.integration.test_attention_polling import _seed_unseen
 
@@ -73,11 +79,15 @@ class _TwinProfileRouter:
         self.reply = reply
         self.decision_calls = 0
         self.reply_calls = 0
+        self.prompts: list[tuple[str, str]] = []
 
     async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
         from ling.models.router import StreamOutcome
         from ling.ports.model import ModelChunk
 
+        self.prompts.append(
+            (profile, "\n".join(str(message.content) for message in messages))
+        )
         if profile == "dialogue.group":
             self.decision_calls += 1
             payload = '{"respond": true, "reason": "群里这话我能接"}'
@@ -144,6 +154,9 @@ async def _group_window(
         row.channel = channel
         row.title = title
         row.subject_id = env.subject_id
+        row.origin_scope = None
+        row.origin_instance_id = None
+        row.origin_status = "not_applicable" if channel == "web" else "unknown"
     return session_id
 
 
@@ -180,6 +193,37 @@ async def _set_group_reply_delivery(env: TestEnv, *, enabled: bool) -> None:
         "/v1/settings/publish", json={"revision": draft.json()["revision"]}
     )
     assert published.status_code == 200, published.text
+
+
+async def _set_window_persona(
+    window_id: str,
+    persona_id: str,
+    marker: str,
+    *,
+    extra_overrides: dict[str, object] | None = None,
+) -> None:
+    async with session_scope() as session:
+        session.add(
+            Persona(
+                id=persona_id,
+                revision=1,
+                name=persona_id,
+                display_name=persona_id,
+                system_prompt=marker,
+                traits={},
+                boundaries=[],
+                scenario_prompts={},
+                published=True,
+            )
+        )
+        session.add(
+            WindowDialogueOverride(
+                window_id=window_id,
+                revision=1,
+                overrides={"persona_id": persona_id, **(extra_overrides or {})},
+                updated_by="test",
+            )
+        )
 
 
 async def test_replied_decision_really_delivers(
@@ -236,6 +280,71 @@ async def test_replied_decision_really_delivers(
             )
         ).scalar_one()
         assert log.decision == "replied", log.decision
+
+
+async def test_each_group_window_uses_its_persona_for_decision_and_reply(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个 tick 内的多个窗口各自固定人格，并在决策与生成间复用。"""
+    from ling import worker
+
+    router, _connector = _install(monkeypatch)
+    first_window = await _group_window(logged_in, title="onebot:group:11111")
+    second_window = await _group_window(logged_in, title="onebot:group:22222")
+    await _seed_unseen(first_window, ["群甲需要回应"])
+    await _seed_unseen(second_window, ["群乙需要回应"])
+    await _set_window_persona(first_window, "persona_group_a", "群甲人格标记")
+    await _set_window_persona(second_window, "persona_group_b", "群乙人格标记")
+    await _set_group_reply_delivery(logged_in, enabled=True)
+
+    await worker.handle_attention_tick({})
+
+    decision_prompts = [text for profile, text in router.prompts if profile == "dialogue.group"]
+    reply_prompts = [text for profile, text in router.prompts if profile != "dialogue.group"]
+    assert len(decision_prompts) == 2, router.prompts
+    assert len(reply_prompts) == 2, router.prompts
+    for prompts in (decision_prompts, reply_prompts):
+        assert any("群甲人格标记" in prompt and "群甲需要回应" in prompt for prompt in prompts)
+        assert any("群乙人格标记" in prompt and "群乙需要回应" in prompt for prompt in prompts)
+        assert all(
+            not ("群甲需要回应" in prompt and "群乙人格标记" in prompt)
+            and not ("群乙需要回应" in prompt and "群甲人格标记" in prompt)
+            for prompt in prompts
+        )
+
+
+async def test_group_attention_applies_window_turn_budget_before_model(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """该窗口的人格策略覆盖应在决策时生效，避免无谓的模型调用。"""
+    from ling import worker
+
+    router, _connector = _install(monkeypatch)
+    window_id = await _group_window(logged_in)
+    await _seed_unseen(window_id, ["群里又有人说话了"])
+    await _set_window_persona(
+        window_id,
+        "persona_group_budget",
+        "群预算测试人格",
+        extra_overrides={"group_turn_budget": 1},
+    )
+    async with session_scope() as session:
+        session.add(
+            Message(
+                id="msg_group_budget_actor",
+                window_id=window_id,
+                role="actor",
+                text="她刚刚已经说过",
+                sequence=90000,
+            )
+        )
+
+    await worker.handle_attention_tick({})
+
+    assert router.decision_calls == 0, (
+        "窗口预算为 1 且近期已发言 1 次时，应在发起模型调用前停止"
+    )
+    assert router.reply_calls == 0
 
 
 async def test_delivery_failure_is_not_marked_replied(

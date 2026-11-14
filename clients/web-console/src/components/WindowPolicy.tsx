@@ -10,6 +10,9 @@ import {
   type WindowDialoguePolicyOriginStatus,
   type WindowDialoguePolicySource,
   type WindowDialoguePolicyValue,
+  type WindowOriginBindingChange,
+  type WindowOriginBindingOptions,
+  type WindowOriginBindingPreview,
   type WindowPolicyChange,
   type WindowPolicyPreview,
 } from '../api';
@@ -168,6 +171,198 @@ function personaOptions(policy: WindowDialoguePolicy, personas: PersonaSummary[]
   return [...options].map(([id, label]) => ({ value: `persona:${id}`, label }));
 }
 
+function originChoice(scope: string | null, instanceId: string | null): string {
+  return scope && instanceId ? `${scope}:${instanceId}` : '';
+}
+
+function originLabel(
+  policy: WindowDialoguePolicy,
+  options: WindowOriginBindingOptions | null,
+): string {
+  if (policy.origin_status === 'unknown') return '来源未知';
+  if (policy.origin_status === 'not_applicable') return '网页';
+  const candidate = options?.candidates.find((item) =>
+    item.scope === policy.instance_scope && item.instance_id === policy.instance_id,
+  );
+  return candidate?.display_name || `${policy.instance_scope}/${policy.instance_id}`;
+}
+
+function WindowOriginBinding({
+  sessionId,
+  policy,
+  personas,
+  onSaved,
+}: {
+  sessionId: string;
+  policy: WindowDialoguePolicy;
+  personas: PersonaSummary[];
+  onSaved: (policy: WindowDialoguePolicy) => void;
+}) {
+  const [options, setOptions] = useState<WindowOriginBindingOptions | null>(null);
+  const [selection, setSelection] = useState('');
+  const [preview, setPreview] = useState<WindowOriginBindingPreview | null>(null);
+  const [change, setChange] = useState<WindowOriginBindingChange | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [available, setAvailable] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    api.windowOriginBinding(sessionId).then((result) => {
+      if (!active) return;
+      setOptions(result);
+      setSelection(result.manually_bound
+        ? originChoice(policy.instance_scope, policy.instance_id)
+        : '');
+    }).catch((reason: unknown) => {
+      if (!active) return;
+      if (reason instanceof ApiError && reason.status === 409) {
+        setAvailable(false);
+        return;
+      }
+      setError(errorText(reason));
+    });
+    return () => { active = false; };
+  }, [policy.instance_id, policy.instance_scope, policy.origin_status, sessionId]);
+
+  if (!available) return null;
+
+  const currentChoice = options?.manually_bound
+    ? originChoice(policy.instance_scope, policy.instance_id)
+    : '';
+  const selectedCandidate = options?.candidates.find((candidate) =>
+    originChoice(candidate.scope, candidate.instance_id) === selection,
+  );
+  const canBind = Boolean(selectedCandidate && selection !== currentChoice);
+  const canUnbind = Boolean(options?.manually_bound && selection === '');
+
+  async function previewChange(next: WindowOriginBindingChange) {
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api.previewWindowOriginBinding(sessionId, next);
+      setChange(next);
+      setPreview(result);
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveChange() {
+    if (!preview || !change) return;
+    setBusy(true);
+    setError('');
+    try {
+      const saved = await api.saveWindowOriginBinding(
+        sessionId, change, preview.preview_token,
+      );
+      onSaved(saved);
+      const refreshed = await api.windowOriginBinding(sessionId);
+      setOptions(refreshed);
+      setSelection(refreshed.manually_bound
+        ? originChoice(saved.instance_scope, saved.instance_id)
+        : '');
+      setPreview(null);
+      setChange(null);
+    } catch (reason) {
+      setPreview(null);
+      setChange(null);
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="window-policy__origin" aria-label="平台来源">
+      <div className="window-policy__origin-heading">
+        <strong>{originLabel(policy, options)}</strong>
+        {options?.manually_bound ? <span>·</span> : null}
+        {options?.manually_bound ? (
+          <span>{policy.instance_scope}/{policy.instance_id}</span>
+        ) : null}
+      </div>
+      {options?.candidates.length ? (
+        <div className="window-policy__origin-controls">
+          <label htmlFor={`origin-binding-${sessionId}`}>平台实例</label>
+          <select
+            id={`origin-binding-${sessionId}`}
+            aria-label="平台实例来源"
+            value={selection}
+            disabled={busy || Boolean(preview)}
+            onChange={(event) => {
+              setSelection(event.target.value);
+              setPreview(null);
+              setChange(null);
+            }}
+          >
+            <option value="">未绑定</option>
+            {options.candidates.map((candidate) => (
+              <option
+                key={`${candidate.scope}:${candidate.instance_id}`}
+                value={originChoice(candidate.scope, candidate.instance_id)}
+              >
+                {candidate.display_name} · {candidate.instance_id}{candidate.enabled ? '' : ' · 已停用'}
+              </option>
+            ))}
+          </select>
+          {canBind ? (
+            <button type="button" className="button button--small" disabled={busy}
+              onClick={() => void previewChange({
+                scope: selectedCandidate!.scope,
+                instance_id: selectedCandidate!.instance_id,
+              })}>
+              预览绑定
+            </button>
+          ) : null}
+          {canUnbind ? (
+            <button type="button" className="button button--small" disabled={busy}
+              onClick={() => void previewChange({ scope: null, instance_id: null })}>
+              预览解除
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <span className="window-policy__origin-empty">没有匹配的实例</span>
+      )}
+      {preview && change ? (
+        <div className="window-policy__preview" role="status">
+          <p>
+            {originLabel(preview.current, options)}{' → '}
+            {preview.target?.display_name || '来源未知'}
+          </p>
+          {FIELDS.filter((definition) => {
+            const before = preview.current.fields[definition.key];
+            const after = preview.proposed.fields[definition.key];
+            return before.effective !== after.effective || before.source !== after.source;
+          }).map((definition) => {
+            const before = preview.current.fields[definition.key];
+            const after = preview.proposed.fields[definition.key];
+            return (
+              <p key={definition.key}>
+                {definition.label}: {valueLabel(definition, before.effective, personas)} · {sourceLabel(before.source)}
+                {' → '}
+                {valueLabel(definition, after.effective, personas)} · {sourceLabel(after.source)}
+              </p>
+            );
+          })}
+          <button type="button" className="button button--primary button--small" disabled={busy}
+            onClick={() => void saveChange()}>
+            确认
+          </button>
+          <button type="button" className="button button--small" disabled={busy}
+            onClick={() => { setPreview(null); setChange(null); }}>
+            返回
+          </button>
+        </div>
+      ) : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </section>
+  );
+}
+
 export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
   const [policy, setPolicy] = useState<WindowDialoguePolicy | null>(null);
   const [selections, setSelections] = useState(EMPTY_SELECTIONS);
@@ -300,6 +495,14 @@ export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClos
               );
             })}
           </div>
+          {policy.origin_status !== 'not_applicable' ? (
+            <WindowOriginBinding
+              sessionId={sessionId}
+              policy={policy}
+              personas={personas}
+              onSaved={setPolicy}
+            />
+          ) : null}
           {preview ? (
             <div className="window-policy__preview" role="status">
               <ul style={{ flexBasis: '100%', margin: 0, paddingLeft: '1.2rem' }}>

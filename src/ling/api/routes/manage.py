@@ -753,6 +753,8 @@ async def list_proactive(
                 # 生成好的开场白；None 表示还没生成（不是"生成了空的"）
                 "draft_text": o.draft_text if operator or o.output_modality != "voice" else "",
                 "draft_available": o.draft_text is not None,
+                "draft_state": o.draft_state,
+                "draft_origin": o.draft_origin,
                 "output_modality": o.output_modality,
                 "expires_at": o.expires_at.isoformat(),
             }

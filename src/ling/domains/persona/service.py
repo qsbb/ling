@@ -11,11 +11,17 @@ import re
 import secrets
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.persona.scenarios import clean_overrides
-from ling.infra.models import Persona, Window, utcnow
+from ling.infra.models import (
+    InstanceDialogueOverride,
+    Persona,
+    Window,
+    WindowDialogueOverride,
+    utcnow,
+)
 
 logger = logging.getLogger("ling.domains.persona")
 
@@ -226,6 +232,28 @@ class PersonaInUseError(PersonaConflictError):
         )
         self.persona_id = persona_id
         self.in_use_windows = in_use_windows
+
+
+class PersonaSessionOverrideError(PersonaConflictError):
+    """一个或多个会话设置显式引用了该人格。"""
+
+    def __init__(self, persona_id: str, override_windows: int) -> None:
+        super().__init__(
+            f"{persona_id} 被 {override_windows} 个会话设置显式选择，请先清除这些覆盖"
+        )
+        self.persona_id = persona_id
+        self.override_windows = override_windows
+
+
+class PersonaInstanceOverrideError(PersonaConflictError):
+    """一个或多个平台实例设置显式引用了该人格。"""
+
+    def __init__(self, persona_id: str, override_instances: int) -> None:
+        super().__init__(
+            f"{persona_id} 被 {override_instances} 个平台实例设置显式选择，请先清除这些覆盖"
+        )
+        self.persona_id = persona_id
+        self.override_instances = override_instances
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +575,20 @@ class PersonaService:
         in_use = await self._non_empty_window_count(persona_id)
         if in_use:
             raise PersonaInUseError(persona_id, in_use)
+        override_windows = await self._session.scalar(
+            select(func.count())
+            .select_from(WindowDialogueOverride)
+            .where(WindowDialogueOverride.overrides.contains({"persona_id": persona_id}))
+        )
+        if override_windows:
+            raise PersonaSessionOverrideError(persona_id, override_windows)
+        override_instances = await self._session.scalar(
+            select(func.count())
+            .select_from(InstanceDialogueOverride)
+            .where(InstanceDialogueOverride.overrides.contains({"persona_id": persona_id}))
+        )
+        if override_instances:
+            raise PersonaInstanceOverrideError(persona_id, override_instances)
         view = self._to_view(persona)
         await self._session.delete(persona)
         await self._session.flush()
@@ -785,8 +827,10 @@ __all__ = [
     "active_persona_id",
     "active_persona_view",
     "PersonaConflictError",
+    "PersonaInstanceOverrideError",
     "PersonaInUseError",
     "PersonaNotFoundError",
+    "PersonaSessionOverrideError",
     "PersonaService",
     "PersonaView",
     "empty_persona_view",

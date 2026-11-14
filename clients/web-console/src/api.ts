@@ -399,7 +399,7 @@ export interface WindowDialoguePolicy {
   source: WindowDialoguePolicySource;
   fields: WindowDialoguePolicyFields;
   origin_status: WindowDialoguePolicyOriginStatus;
-  instance_scope: 'onebot' | 'qqbot' | null;
+  instance_scope: ConversationPolicyScope | null;
   instance_id: string | null;
   global_revision: number;
   instance_revision: number;
@@ -416,6 +416,7 @@ export type WindowDialoguePolicyField =
 
 export type WindowDialoguePolicySource = 'global' | 'instance' | 'session';
 export type WindowDialoguePolicyOriginStatus = 'known' | 'unknown' | 'not_applicable';
+export type ConversationPolicyScope = 'onebot' | 'qqbot';
 
 export interface WindowDialoguePolicyPersonaField {
   global_value: string | null;
@@ -486,6 +487,59 @@ export interface WindowPolicyPreview {
   expires_at: number;
 }
 
+export interface WindowOriginBindingCandidate {
+  scope: ConversationPolicyScope;
+  instance_id: string;
+  display_name: string;
+  enabled: boolean;
+}
+
+export interface WindowOriginBindingOptions {
+  scope: ConversationPolicyScope;
+  candidates: WindowOriginBindingCandidate[];
+  manually_bound: boolean;
+}
+
+export interface WindowOriginBindingChange {
+  scope: ConversationPolicyScope | null;
+  instance_id: string | null;
+}
+
+export interface WindowOriginBindingPreview {
+  current: WindowDialoguePolicy;
+  proposed: WindowDialoguePolicy;
+  target: WindowOriginBindingCandidate | null;
+  preview_token: string;
+  expires_at: number;
+}
+
+export interface InstanceDialoguePolicy {
+  schema_version: 'v1';
+  scope: ConversationPolicyScope;
+  instance_id: string;
+  fields: WindowDialoguePolicyFields;
+  global_revision: number;
+  instance_revision: number;
+  impact_epoch: number;
+  affected_active_windows: number;
+  affected_archived_windows: number;
+  session_shadowed_windows: number;
+}
+
+export interface InstanceDialoguePolicyProposed {
+  fields: WindowDialoguePolicyFields;
+  affected_active_windows: number;
+  affected_archived_windows: number;
+  session_shadowed_windows: number;
+}
+
+export interface InstanceDialoguePolicyPreview {
+  current: InstanceDialoguePolicy;
+  proposed: InstanceDialoguePolicyProposed;
+  preview_token: string;
+  expires_at: number;
+}
+
 export const api = {
   windowDialoguePolicy(sessionId: string): Promise<WindowDialoguePolicy> {
     return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`);
@@ -496,6 +550,57 @@ export const api = {
   saveWindowPolicy(sessionId: string, change: WindowPolicyChange, token: string): Promise<WindowDialoguePolicy> {
     return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`,
       jsonInit('PUT', { ...change, preview_token: token }));
+  },
+  windowOriginBinding(sessionId: string): Promise<WindowOriginBindingOptions> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding`);
+  },
+  previewWindowOriginBinding(
+    sessionId: string,
+    change: WindowOriginBindingChange,
+  ): Promise<WindowOriginBindingPreview> {
+    return request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding/preview`,
+      jsonInit('POST', change),
+    );
+  },
+  saveWindowOriginBinding(
+    sessionId: string,
+    change: WindowOriginBindingChange,
+    token: string,
+  ): Promise<WindowDialoguePolicy> {
+    return request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding`,
+      jsonInit('PUT', { ...change, preview_token: token }),
+    );
+  },
+  instanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+  ): Promise<InstanceDialoguePolicy> {
+    return request<InstanceDialoguePolicy>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy`,
+    );
+  },
+  previewInstanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+    change: WindowPolicyChange,
+  ): Promise<InstanceDialoguePolicyPreview> {
+    return request<InstanceDialoguePolicyPreview>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy/preview`,
+      jsonInit('POST', change),
+    );
+  },
+  saveInstanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+    change: WindowPolicyChange,
+    token: string,
+  ): Promise<InstanceDialoguePolicy> {
+    return request<InstanceDialoguePolicy>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy`,
+      jsonInit('PUT', { ...change, preview_token: token }),
+    );
   },
 
   uploadAudio(sessionId: string, file: File): Promise<{asset_id: string; duration_seconds: number}> {

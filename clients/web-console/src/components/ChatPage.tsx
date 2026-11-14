@@ -237,7 +237,7 @@ export function ChatPage({
                 生成中
               </span>
             ) : null}
-            {user.role === 'owner' && session?.channel === 'web' && !session.archived ? (
+            {user.role === 'owner' && session && !session.archived ? (
               <button type="button" className="ghost-button" onClick={() => setPolicyOpen((open) => !open)}
                 aria-expanded={policyOpen}>
                 会话设置

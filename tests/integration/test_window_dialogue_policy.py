@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -12,7 +13,12 @@ from sqlalchemy import select
 from ling.domains.conversation.service import ConversationService
 from ling.domains.identity.service import IdentityService
 from ling.infra.db import session_scope
-from ling.infra.models import Message
+from ling.infra.models import (
+    ConversationAttemptSnapshot,
+    Message,
+    Turn,
+    WindowDialogueOverride,
+)
 from ling.kernel.autonomy import Situation
 from ling.models.router import StreamOutcome
 from ling.ports.model import ModelChunk
@@ -45,6 +51,20 @@ async def save(env: TestEnv, window: str, value: bool | None, token: str):  # no
     return await env.client.put(
         f"/v1/sessions/{window}/dialogue-policy",
         json={**change(value), "preview_token": token},
+        headers=ORIGIN,
+    )
+
+
+async def preview_operation(env: TestEnv, window: str, body: dict):
+    return await env.client.post(
+        f"/v1/sessions/{window}/dialogue-policy/preview", json=body, headers=ORIGIN
+    )
+
+
+async def save_operation(env: TestEnv, window: str, body: dict, token: str):
+    return await env.client.put(
+        f"/v1/sessions/{window}/dialogue-policy",
+        json={**body, "preview_token": token},
         headers=ORIGIN,
     )
 
@@ -84,6 +104,241 @@ async def test_override_false_and_clear_survive_reads_and_other_windows(logged_i
     await set_policy(logged_in, first, None)
     await publish(logged_in, True)
     assert (await logged_in.client.get(f"/v1/sessions/{first}/dialogue-policy")).json()["effective"] is True
+
+
+async def test_six_field_partial_updates_and_persona_tristate_persist(
+    logged_in: TestEnv, caplog: pytest.LogCaptureFixture
+) -> None:
+    window = await create_window(logged_in)
+    created = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "会话覆盖", "system_prompt": "独立人格"}
+    )
+    assert created.status_code == 201, created.text
+    persona_id = created.json()["persona_id"]
+
+    initial = (
+        await logged_in.client.get(f"/v1/sessions/{window}/dialogue-policy")
+    ).json()
+    global_fields = initial["fields"]
+    budget = 20 if global_fields["group_turn_budget"]["global_value"] != 20 else 19
+    updates = {
+        "persona_id": persona_id,
+        "private_may_stay_silent": not global_fields["private_may_stay_silent"]["global_value"],
+        "group_mention_requires_reply": not global_fields["group_mention_requires_reply"]["global_value"],
+        "group_attention_deferred": not global_fields["group_attention_deferred"]["global_value"],
+        "group_turn_budget": budget,
+        "rest_may_skip": not global_fields["rest_may_skip"]["global_value"],
+    }
+    body = {"set": updates, "clear": []}
+    proposed_response = await preview_operation(logged_in, window, body)
+    assert proposed_response.status_code == 200, proposed_response.text
+    proposed = proposed_response.json()["proposed"]["fields"]
+    for field, value in updates.items():
+        assert proposed[field] == {
+            "global_value": global_fields[field]["global_value"],
+            "instance_override": None,
+            "has_instance_override": False,
+            "session_override": value,
+            "has_session_override": True,
+            "effective": value,
+            "source": "session",
+        }
+
+    with caplog.at_level(logging.INFO, logger="ling.audit"):
+        saved_response = await save_operation(
+            logged_in, window, body, proposed_response.json()["preview_token"]
+        )
+    assert saved_response.status_code == 200, saved_response.text
+    audit_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", "") == "audit_window_dialogue_policy_changed"
+    ]
+    assert len(audit_records) == 1
+    audit = audit_records[0].attributes
+    assert audit["attributes"]["set_fields"] == sorted(updates)
+    assert audit["attributes"]["revision"] == 1
+    assert persona_id not in str(audit)
+    assert "独立人格" not in str(audit)
+    saved = saved_response.json()
+    assert saved["session_revision"] == 1
+    for field, value in updates.items():
+        assert saved["fields"][field]["session_override"] == value
+        assert saved["fields"][field]["has_session_override"] is True
+        assert saved["fields"][field]["effective"] == value
+        assert saved["fields"][field]["source"] == "session"
+
+    next_budget = 1 if budget != 1 else 2
+    partial_body = {"set": {"group_turn_budget": next_budget}, "clear": []}
+    partial_preview = await preview_operation(logged_in, window, partial_body)
+    assert partial_preview.status_code == 200, partial_preview.text
+    partial_save = await save_operation(
+        logged_in, window, partial_body, partial_preview.json()["preview_token"]
+    )
+    assert partial_save.status_code == 200, partial_save.text
+    partial = partial_save.json()
+    assert partial["session_revision"] == 2
+    for field, value in updates.items():
+        expected = next_budget if field == "group_turn_budget" else value
+        assert partial["fields"][field]["effective"] == expected
+
+    null_body = {"set": {"persona_id": None}, "clear": []}
+    null_preview = await preview_operation(logged_in, window, null_body)
+    assert null_preview.status_code == 200, null_preview.text
+    null_save = await save_operation(
+        logged_in, window, null_body, null_preview.json()["preview_token"]
+    )
+    assert null_save.status_code == 200, null_save.text
+    explicit_null = null_save.json()["fields"]["persona_id"]
+    assert explicit_null == {
+        "global_value": global_fields["persona_id"]["global_value"],
+        "instance_override": None,
+        "has_instance_override": False,
+        "session_override": None,
+        "has_session_override": True,
+        "effective": None,
+        "source": "session",
+    }
+    assert null_save.json()["session_revision"] == 3
+
+    clear_some = {"set": {}, "clear": ["persona_id", "rest_may_skip"]}
+    clear_preview = await preview_operation(logged_in, window, clear_some)
+    assert clear_preview.status_code == 200, clear_preview.text
+    clear_save = await save_operation(
+        logged_in, window, clear_some, clear_preview.json()["preview_token"]
+    )
+    assert clear_save.status_code == 200, clear_save.text
+    cleared = clear_save.json()
+    assert cleared["session_revision"] == 4
+    for field in ("persona_id", "rest_may_skip"):
+        value = cleared["fields"][field]
+        assert value["has_session_override"] is False
+        assert value["session_override"] is None
+        assert value["effective"] == value["global_value"]
+        assert value["source"] == "global"
+    assert cleared["fields"]["private_may_stay_silent"]["source"] == "session"
+    assert cleared["fields"]["group_turn_budget"]["effective"] == next_budget
+
+    clear_rest = {
+        "set": {},
+        "clear": [
+            "private_may_stay_silent",
+            "group_mention_requires_reply",
+            "group_attention_deferred",
+            "group_turn_budget",
+        ],
+    }
+    final_preview = await preview_operation(logged_in, window, clear_rest)
+    assert final_preview.status_code == 200, final_preview.text
+    final_save = await save_operation(
+        logged_in, window, clear_rest, final_preview.json()["preview_token"]
+    )
+    assert final_save.status_code == 200, final_save.text
+    final = final_save.json()
+    assert final["session_revision"] == 5
+    for value in final["fields"].values():
+        assert value["has_session_override"] is False
+        assert value["session_override"] is None
+        assert value["effective"] == value["global_value"]
+        assert value["source"] == "global"
+
+    async with session_scope() as session:
+        persisted = await session.get(WindowDialogueOverride, window)
+        assert persisted is not None
+        assert persisted.overrides == {}
+        assert persisted.revision == 5
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"set": {"unexpected": True}, "clear": []},
+        {"set": {"private_may_stay_silent": 1}, "clear": []},
+        {"set": {"private_may_stay_silent": None}, "clear": []},
+        {"set": {"group_mention_requires_reply": "true"}, "clear": []},
+        {"set": {"group_attention_deferred": 0}, "clear": []},
+        {"set": {"rest_may_skip": None}, "clear": []},
+        {"set": {"group_turn_budget": True}, "clear": []},
+        {"set": {"group_turn_budget": 0}, "clear": []},
+        {"set": {"group_turn_budget": 21}, "clear": []},
+        {"set": {"group_turn_budget": "7"}, "clear": []},
+        {"set": {"persona_id": ""}, "clear": []},
+        {"set": {"persona_id": "missing-persona"}, "clear": []},
+        {"set": {}, "clear": ["unknown-field"]},
+        {"set": {"private_may_stay_silent": False}, "clear": ["private_may_stay_silent"]},
+        {"set": {}, "clear": ["rest_may_skip", "rest_may_skip"]},
+        {"set": {}, "clear": []},
+    ],
+)
+async def test_invalid_six_field_changes_leave_override_untouched(
+    logged_in: TestEnv, body: dict
+) -> None:
+    window = await create_window(logged_in)
+    response = await preview_operation(logged_in, window, body)
+    assert response.status_code == 422, response.text
+    current = (
+        await logged_in.client.get(f"/v1/sessions/{window}/dialogue-policy")
+    ).json()
+    assert current["session_revision"] == 0
+    assert all(not field["has_session_override"] for field in current["fields"].values())
+
+
+async def test_persona_revision_change_invalidates_preview(logged_in: TestEnv) -> None:
+    created = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "预览人格", "system_prompt": "初始"}
+    )
+    assert created.status_code == 201, created.text
+    persona_id = created.json()["persona_id"]
+    window = await create_window(logged_in)
+    body = {"set": {"persona_id": persona_id}, "clear": []}
+    preview_response = await preview_operation(logged_in, window, body)
+    assert preview_response.status_code == 200, preview_response.text
+
+    update = await logged_in.client.put(
+        f"/v1/personas/{persona_id}", json={"system_prompt": "修订后"}
+    )
+    assert update.status_code == 200, update.text
+    saved = await save_operation(
+        logged_in, window, body, preview_response.json()["preview_token"]
+    )
+    assert saved.status_code == 409, saved.text
+    current = (
+        await logged_in.client.get(f"/v1/sessions/{window}/dialogue-policy")
+    ).json()
+    assert current["session_revision"] == 0
+    assert current["fields"]["persona_id"]["has_session_override"] is False
+
+
+async def test_persona_delete_is_blocked_while_session_override_references_it(
+    logged_in: TestEnv,
+) -> None:
+    created = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "被会话引用", "system_prompt": "测试"}
+    )
+    assert created.status_code == 201, created.text
+    persona_id = created.json()["persona_id"]
+    window = await create_window(logged_in)
+    body = {"set": {"persona_id": persona_id}, "clear": []}
+    preview_response = await preview_operation(logged_in, window, body)
+    assert preview_response.status_code == 200, preview_response.text
+    saved = await save_operation(
+        logged_in, window, body, preview_response.json()["preview_token"]
+    )
+    assert saved.status_code == 200, saved.text
+
+    blocked = await logged_in.client.delete(f"/v1/personas/{persona_id}")
+    assert blocked.status_code == 409, blocked.text
+    assert "persona_session_override:1" in blocked.text
+
+    clear = {"set": {}, "clear": ["persona_id"]}
+    clear_preview = await preview_operation(logged_in, window, clear)
+    assert clear_preview.status_code == 200, clear_preview.text
+    clear_saved = await save_operation(
+        logged_in, window, clear, clear_preview.json()["preview_token"]
+    )
+    assert clear_saved.status_code == 200, clear_saved.text
+    deleted = await logged_in.client.delete(f"/v1/personas/{persona_id}")
+    assert deleted.status_code == 204, deleted.text
 
 
 async def test_previews_are_bound_to_operation_window_time_and_both_revisions(
@@ -146,12 +401,17 @@ async def test_scope_and_write_guards(logged_in: TestEnv) -> None:
         service = ConversationService(session, actor_id=logged_in.settings.actor_id)
         foreign = await service.create_window(subject_id=other.subject_id)
         channel = await service.create_window(subject_id=logged_in.subject_id, channel="onebot")
-        group = await service.create_window(subject_id=logged_in.subject_id)
+        group = await service.create_window(subject_id=logged_in.subject_id, channel="onebot")
+        channel.origin_status = "unknown"
+        group.origin_status = "unknown"
         group.visibility = "group_scope"
         foreign_id, channel_id, group_id = foreign.id, channel.id, group.id
-    for inaccessible in (foreign_id, channel_id, group_id, "missing-window"):
+    for inaccessible in (foreign_id, "missing-window"):
         result = await logged_in.client.get(f"/v1/sessions/{inaccessible}/dialogue-policy")
         assert result.status_code == 404, result.text
+    for manageable in (channel_id, group_id):
+        result = await logged_in.client.get(f"/v1/sessions/{manageable}/dialogue-policy")
+        assert result.status_code == 200, result.text
     url = f"/v1/sessions/{window}/dialogue-policy/preview"
     assert (await logged_in.client.post(url, json=change(False))).status_code == 403
     assert (await logged_in.client.post(url, json=change(False), headers={"Origin": "https://elsewhere.test"})).status_code == 403
@@ -160,6 +420,8 @@ async def test_scope_and_write_guards(logged_in: TestEnv) -> None:
         login = await member.post("/v1/auth/login", json={"username": "member", "password": "member-pass"})
         assert login.status_code == 200, login.text
         assert (await member.get(f"/v1/sessions/{window}/dialogue-policy")).status_code == 404
+        assert (await member.get(f"/v1/sessions/{channel_id}/dialogue-policy")).status_code == 404
+        assert (await member.get(f"/v1/sessions/{group_id}/dialogue-policy")).status_code == 404
         assert (await member.get(f"/v1/sessions/{foreign_id}/dialogue-policy")).status_code == 200
         assert (await member.post(f"/v1/sessions/{foreign_id}/dialogue-policy/preview", json=change(False), headers=ORIGIN)).status_code == 403
 
@@ -211,8 +473,23 @@ async def test_http_decision_uses_override_and_restores_global(
     assert len(router.calls) == 1 and router.calls[0].dialogue.private_may_stay_silent is True
     async with session_scope() as session:
         messages = (await session.scalars(select(Message).where(Message.window_id == window))).all()
+        turns = (
+            await session.scalars(select(Turn).where(Turn.window_id == window))
+        ).all()
+        snapshots = (
+            await session.scalars(
+                select(ConversationAttemptSnapshot).where(
+                    ConversationAttemptSnapshot.turn_id.in_([turn.id for turn in turns])
+                )
+            )
+        ).all()
     assert len([msg for msg in messages if msg.role == "user"]) == 2
     assert any(msg.handled_as == "ignored" for msg in messages)
+    turn_ids = {turn.client_turn_id: turn.id for turn in turns}
+    assert {snapshot.turn_id for snapshot in snapshots} == {turn_ids["first"]}
+    assert [(snapshot.turn_id, snapshot.attempt) for snapshot in snapshots] == [
+        (turn_ids["first"], 1)
+    ]
 
 
 async def test_config_is_fixed_between_decision_and_generation(

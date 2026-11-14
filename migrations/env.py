@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from ling.config import require_database_url
 from ling.infra import models as _models  # noqa: F401 - 注册全部表
+from ling.infra import conversation_policy_audit as _policy_audit  # noqa: F401
+from ling.infra import proactive_quota as _proactive_quota  # noqa: F401
 from ling.infra.db import Base
 
 config = context.config

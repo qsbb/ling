@@ -20,6 +20,7 @@ class _Gate:
 
 class _Dialogue:
     proactive_delivery_enabled = True
+    proactive_daily_limit = 2
 
 
 class _Effective:

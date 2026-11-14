@@ -39,3 +39,38 @@
 .window-policy__preview p {
   flex-basis: 100%;
 }
+
+.window-policy__origin {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--border, #ded6c8);
+}
+
+.window-policy__origin-heading,
+.window-policy__origin-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.window-policy__origin-controls label {
+  color: var(--text-muted, #766e61);
+}
+
+.window-policy__origin-controls select {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.window-policy__origin-empty {
+  color: var(--text-muted, #766e61);
+  font-size: 0.875rem;
+}
+
+@media (max-width: 520px) {
+  .window-policy__origin-controls select {
+    flex-basis: 100%;
+  }
+}

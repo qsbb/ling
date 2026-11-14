@@ -14,7 +14,7 @@ from datetime import UTC, datetime, time, timedelta, tzinfo
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import ProactiveOpportunity, utcnow
+from ling.infra.models import ProactiveDraftBinding, ProactiveOpportunity, utcnow
 from ling.infra.security import new_id
 from ling.ports.config import DialoguePolicy
 
@@ -37,6 +37,8 @@ class OpportunityView:
     draft_text: str | None = None
     output_modality: str = "text"
     visibility: str = "subject_private"
+    draft_state: str | None = None
+    draft_origin: str | None = None
 
 
 @dataclass
@@ -344,7 +346,7 @@ class ProactivityService:
             (
                 await self._session.execute(
                     select(ProactiveOpportunity).where(
-                        ProactiveOpportunity.state == "candidate",
+                        ProactiveOpportunity.state.in_(("candidate", "drafting", "bound_candidate")),
                         ProactiveOpportunity.expires_at <= now,
                     )
                 )
@@ -357,17 +359,19 @@ class ProactivityService:
         return len(rows)
 
     async def pending(self, subject_id: str | None = None) -> list[OpportunityView]:
-        stmt = select(ProactiveOpportunity).where(
+        stmt = select(ProactiveOpportunity, ProactiveDraftBinding.state).outerjoin(
+            ProactiveDraftBinding, ProactiveDraftBinding.opportunity_id == ProactiveOpportunity.id
+        ).where(
             ProactiveOpportunity.actor_id == self._actor_id,
-            ProactiveOpportunity.state == "candidate",
+            ProactiveOpportunity.state.in_(("candidate", "drafting", "bound_candidate")),
         )
         if subject_id:
             stmt = stmt.where(ProactiveOpportunity.subject_id == subject_id)
-        rows = list((await self._session.execute(stmt)).scalars())
-        return [self._view(r) for r in rows]
+        rows = (await self._session.execute(stmt)).all()
+        return [self._view(row, draft_state=state) for row, state in rows]
 
     @staticmethod
-    def _view(row: ProactiveOpportunity) -> OpportunityView:
+    def _view(row: ProactiveOpportunity, *, draft_state: str | None = None) -> OpportunityView:
         expires = row.expires_at
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=UTC)
@@ -376,11 +380,14 @@ class ProactivityService:
             subject_id=row.subject_id,
             kind=row.kind,
             reason=row.reason,
-            state=row.state,
+            state="candidate" if row.state in {"drafting", "bound_candidate"} else row.state,
             expires_at=expires,
             draft_text=row.draft_text,
             output_modality=row.output_modality,
             visibility=row.visibility,
+            draft_state=draft_state,
+            draft_origin=("bound" if draft_state == "ready" else "unknown")
+            if row.draft_text is not None else None,
         )
 
 

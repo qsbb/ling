@@ -56,12 +56,14 @@ class OneBotWsClient:
         url: str,
         app: object,
         connector: ChannelConnector,
+        trusted_instance_key: tuple[str, str] | None = None,
         reconnect_min: float = RECONNECT_MIN,
         reconnect_max: float = RECONNECT_MAX,
     ) -> None:
         self.url = url
         self._app = app
         self._connector = connector
+        self._trusted_instance_key = trusted_instance_key
         # 机器人自己的 QQ 号。OneBot 反向 WS 的握手头，缺了它 NapCat 会把这个
         # 连接当成"只调 API、不收事件"的客户端——**消息事件一条都不会推过来**，
         # 只有心跳。实测：不带 X-Client-Role 时只收到 meta_event。
@@ -95,7 +97,12 @@ class OneBotWsClient:
 
         self.received += 1
         try:
-            return await process_inbound_payload(self._app, self._connector, payload)
+            return await process_inbound_payload(
+                self._app,
+                self._connector,
+                payload,
+                trusted_instance_key=self._trusted_instance_key,
+            )
         except Exception as exc:  # noqa: BLE001 - 单条失败不能断连接
             # 一条消息处理失败就断线重连的话，同一条坏消息会把连接打成死循环。
             logger.exception("WS 入站处理失败（连接保持）")

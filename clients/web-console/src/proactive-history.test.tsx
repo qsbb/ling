@@ -69,4 +69,16 @@ describe('主动联系记录', () => {
     expect(missing).toContain('开场白还没生成');
     expect(old).toContain('开场白状态未知');
   });
+
+  it('展示草稿结果未知与旧草稿来源未记录', () => {
+    const item: ProactiveOpportunity = {
+      opportunity_id: 'candidate', kind: 'check_in', reason: '合成来源', expires_at: base.created_at,
+      draft_text: null, draft_available: false, draft_state: 'uncertain',
+    };
+    expect(renderToStaticMarkup(<ProactiveDraft item={item} />)).toContain('开场白生成结果暂未确认');
+    expect(renderToStaticMarkup(<ProactiveDraft item={{ ...item, draft_text: '你好', draft_origin: 'unknown' }} />))
+      .toContain('草稿来源未知');
+    const history = renderToStaticMarkup(<ProactiveHistory records={[{ ...base, draft_origin: 'unknown' }]} />);
+    expect(history).toContain('草稿来源：未记录');
+  });
 });

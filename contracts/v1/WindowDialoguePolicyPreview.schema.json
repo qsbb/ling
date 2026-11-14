@@ -1,5 +1,245 @@
 {
   "$defs": {
+    "WindowDialoguePolicyBooleanField": {
+      "additionalProperties": false,
+      "description": "布尔字段只接受 JSON boolean。",
+      "properties": {
+        "effective": {
+          "title": "Effective",
+          "type": "boolean"
+        },
+        "global_value": {
+          "title": "Global Value",
+          "type": "boolean"
+        },
+        "has_instance_override": {
+          "title": "Has Instance Override",
+          "type": "boolean"
+        },
+        "has_session_override": {
+          "title": "Has Session Override",
+          "type": "boolean"
+        },
+        "instance_override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Override"
+        },
+        "session_override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Override"
+        },
+        "source": {
+          "enum": [
+            "global",
+            "instance",
+            "session"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "global_value",
+        "instance_override",
+        "has_instance_override",
+        "session_override",
+        "has_session_override",
+        "effective",
+        "source"
+      ],
+      "title": "WindowDialoguePolicyBooleanField",
+      "type": "object"
+    },
+    "WindowDialoguePolicyFields": {
+      "additionalProperties": false,
+      "description": "六个会话字段分别使用对应的 JSON 类型。",
+      "properties": {
+        "group_attention_deferred": {
+          "$ref": "#/$defs/WindowDialoguePolicyBooleanField"
+        },
+        "group_mention_requires_reply": {
+          "$ref": "#/$defs/WindowDialoguePolicyBooleanField"
+        },
+        "group_turn_budget": {
+          "$ref": "#/$defs/WindowDialoguePolicyIntegerField"
+        },
+        "persona_id": {
+          "$ref": "#/$defs/WindowDialoguePolicyPersonaField"
+        },
+        "private_may_stay_silent": {
+          "$ref": "#/$defs/WindowDialoguePolicyBooleanField"
+        },
+        "rest_may_skip": {
+          "$ref": "#/$defs/WindowDialoguePolicyBooleanField"
+        }
+      },
+      "required": [
+        "persona_id",
+        "private_may_stay_silent",
+        "group_mention_requires_reply",
+        "group_attention_deferred",
+        "group_turn_budget",
+        "rest_may_skip"
+      ],
+      "title": "WindowDialoguePolicyFields",
+      "type": "object"
+    },
+    "WindowDialoguePolicyIntegerField": {
+      "additionalProperties": false,
+      "description": "预算字段只接受 JSON integer。",
+      "properties": {
+        "effective": {
+          "title": "Effective",
+          "type": "integer"
+        },
+        "global_value": {
+          "title": "Global Value",
+          "type": "integer"
+        },
+        "has_instance_override": {
+          "title": "Has Instance Override",
+          "type": "boolean"
+        },
+        "has_session_override": {
+          "title": "Has Session Override",
+          "type": "boolean"
+        },
+        "instance_override": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Override"
+        },
+        "session_override": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Override"
+        },
+        "source": {
+          "enum": [
+            "global",
+            "instance",
+            "session"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "global_value",
+        "instance_override",
+        "has_instance_override",
+        "session_override",
+        "has_session_override",
+        "effective",
+        "source"
+      ],
+      "title": "WindowDialoguePolicyIntegerField",
+      "type": "object"
+    },
+    "WindowDialoguePolicyPersonaField": {
+      "additionalProperties": false,
+      "description": "人格字段允许显式 null，且保留继承状态。",
+      "properties": {
+        "effective": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective"
+        },
+        "global_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Global Value"
+        },
+        "has_instance_override": {
+          "title": "Has Instance Override",
+          "type": "boolean"
+        },
+        "has_session_override": {
+          "title": "Has Session Override",
+          "type": "boolean"
+        },
+        "instance_override": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Override"
+        },
+        "session_override": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Override"
+        },
+        "source": {
+          "enum": [
+            "global",
+            "instance",
+            "session"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "global_value",
+        "instance_override",
+        "has_instance_override",
+        "session_override",
+        "has_session_override",
+        "effective",
+        "source"
+      ],
+      "title": "WindowDialoguePolicyPersonaField",
+      "type": "object"
+    },
     "WindowDialoguePolicyProposed": {
       "additionalProperties": false,
       "description": "一次会话设置修改预览后的值和来源。",
@@ -7,6 +247,9 @@
         "effective": {
           "title": "Effective",
           "type": "boolean"
+        },
+        "fields": {
+          "$ref": "#/$defs/WindowDialoguePolicyFields"
         },
         "override": {
           "anyOf": [
@@ -22,6 +265,7 @@
         "source": {
           "enum": [
             "global",
+            "instance",
             "session"
           ],
           "title": "Source",
@@ -31,14 +275,15 @@
       "required": [
         "override",
         "effective",
-        "source"
+        "source",
+        "fields"
       ],
       "title": "WindowDialoguePolicyProposed",
       "type": "object"
     },
     "WindowDialoguePolicyView": {
       "additionalProperties": false,
-      "description": "Web 私聊当前回应设置；空覆盖表示继承全局值。",
+      "description": "逐字段给出全局、可信实例、会话覆盖与生效值。",
       "properties": {
         "effective": {
           "title": "Effective",
@@ -49,6 +294,9 @@
           "title": "Field",
           "type": "string"
         },
+        "fields": {
+          "$ref": "#/$defs/WindowDialoguePolicyFields"
+        },
         "global_revision": {
           "minimum": 0,
           "title": "Global Revision",
@@ -57,6 +305,42 @@
         "global_value": {
           "title": "Global Value",
           "type": "boolean"
+        },
+        "instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Id"
+        },
+        "instance_revision": {
+          "minimum": 0,
+          "title": "Instance Revision",
+          "type": "integer"
+        },
+        "instance_scope": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Scope"
+        },
+        "origin_status": {
+          "enum": [
+            "known",
+            "unknown",
+            "not_applicable"
+          ],
+          "title": "Origin Status",
+          "type": "string"
         },
         "override": {
           "anyOf": [
@@ -77,6 +361,7 @@
         "source": {
           "enum": [
             "global",
+            "instance",
             "session"
           ],
           "title": "Source",
@@ -89,7 +374,12 @@
         "override",
         "effective",
         "source",
+        "fields",
+        "origin_status",
+        "instance_scope",
+        "instance_id",
         "global_revision",
+        "instance_revision",
         "session_revision"
       ],
       "title": "WindowDialoguePolicyView",

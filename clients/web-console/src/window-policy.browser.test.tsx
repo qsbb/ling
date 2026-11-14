@@ -145,14 +145,17 @@ function applyChange(
 async function openChat(
   role: 'owner' | 'member',
   width: number,
-  originStatus: 'known' | 'unknown' | 'not_applicable' = 'known',
+  originStatus: 'known' | 'unknown' | 'not_applicable' = 'not_applicable',
+  channel: 'web' | 'onebot' | 'qqbot' = 'web',
 ) {
   if (!browser) throw new Error(error ?? '浏览器未启动');
   const context = await browser.newContext({ viewport: { width, height: 850 } });
   contexts.push(context);
   const page = await context.newPage();
   const requests: Array<{ method: string; body: unknown }> = [];
-  let savedFields = originStatus === 'unknown'
+  let currentOriginStatus = originStatus;
+  let manuallyBound = originStatus === 'known';
+  let savedFields = originStatus !== 'known'
     ? withoutInstanceOverrides(structuredClone(initialFields))
     : structuredClone(initialFields);
   let savedRevision = 0;
@@ -160,19 +163,19 @@ async function openChat(
     const req = route.request();
     const path = new URL(req.url()).pathname;
     if (path === '/v1/auth/me') return route.fulfill(json({ user: { id: 'u', username: 'test', role, subject_id: 's', display_name: '用户' }, test_mode: false }));
-    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: '测试', channel: 'web', peer_id: null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
+    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: '测试', channel, peer_id: null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
     if (path === '/v1/sessions/w/messages') return route.fulfill(json({ messages: [], active_turn: null }));
     if (path === '/v1/personas') return route.fulfill(json({ items: [{ id: 'p-global', persona_id: 'p-global', name: 'default', display_name: '全局人格' }], active_persona_id: 'p-global', total: 1 }));
     if (path === '/v1/sessions/w/dialogue-policy' && req.method() === 'GET') {
       const fields = resolvedFields(savedFields);
-      return route.fulfill(json(policyView(fields, savedRevision, originStatus)));
+      return route.fulfill(json(policyView(fields, savedRevision, currentOriginStatus)));
     }
     if (path === '/v1/sessions/w/dialogue-policy/preview' && req.method() === 'POST') {
       const body = req.postDataJSON() as { set: Partial<Record<TestFieldKey, TestPolicyValue>>; clear: TestFieldKey[] };
       requests.push({ method: 'preview', body });
       const proposedFields = applyChange(body, savedFields);
       return route.fulfill(json({
-        current: policyView(resolvedFields(savedFields), savedRevision, originStatus),
+        current: policyView(resolvedFields(savedFields), savedRevision, currentOriginStatus),
         proposed: {
           override: proposedFields.private_may_stay_silent.session_override,
           effective: proposedFields.private_may_stay_silent.effective,
@@ -188,7 +191,33 @@ async function openChat(
       requests.push({ method: 'save', body });
       savedFields = applyChange(body, savedFields);
       savedRevision += 1;
-      return route.fulfill(json(policyView(savedFields, savedRevision, originStatus)));
+      return route.fulfill(json(policyView(savedFields, savedRevision, currentOriginStatus)));
+    }
+    if (path === '/v1/sessions/w/origin-binding' && req.method() === 'GET') {
+      return route.fulfill(json({
+        scope: channel,
+        candidates: [{ scope: channel, instance_id: 'test-instance', display_name: '测试实例', enabled: true }],
+        manually_bound: manuallyBound,
+      }));
+    }
+    if (path === '/v1/sessions/w/origin-binding/preview' && req.method() === 'POST') {
+      const body = req.postDataJSON() as { scope: 'onebot' | 'qqbot'; instance_id: string };
+      requests.push({ method: 'origin-preview', body });
+      const target = { scope: body.scope, instance_id: body.instance_id, display_name: '测试实例', enabled: true };
+      return route.fulfill(json({
+        current: policyView(resolvedFields(savedFields), savedRevision, currentOriginStatus),
+        proposed: policyView(resolvedFields(savedFields), savedRevision, 'known'),
+        target,
+        preview_token: 'origin-token',
+        expires_at: 9999999999,
+      }));
+    }
+    if (path === '/v1/sessions/w/origin-binding' && req.method() === 'PUT') {
+      const body = req.postDataJSON() as { scope: 'onebot' | 'qqbot' | null; instance_id: string | null; preview_token: string };
+      requests.push({ method: 'origin-save', body });
+      manuallyBound = body.scope !== null && body.instance_id !== null;
+      currentOriginStatus = manuallyBound ? 'known' : 'unknown';
+      return route.fulfill(json(policyView(resolvedFields(savedFields), savedRevision, currentOriginStatus)));
     }
     if (path.startsWith('/v1/')) return route.fulfill(json({ error: { code: 'not_found', message: '目标不存在', retriable: false } }, 404));
     return route.continue();
@@ -202,7 +231,7 @@ describe('Web 会话对话设置', () => {
   for (const width of [375, 1440]) {
     it(`逐字段显示来源并预览保存 set 与 clear，宽度 ${width}`, async (ctx) => {
       if (error) { console.warn(error); ctx.skip(); return; }
-      const { page, requests } = await openChat('owner', width);
+      const { page, requests } = await openChat('owner', width, 'known', 'onebot');
       await page.getByRole('button', { name: '会话设置' }).click();
       const panel = page.getByRole('region', { name: '会话设置' });
       await panel.getByText('全局人格 · 全局').waitFor();
@@ -239,7 +268,7 @@ describe('Web 会话对话设置', () => {
 
   it('编辑预览内容后会重新获取预览令牌', async (ctx) => {
     if (error) { console.warn(error); ctx.skip(); return; }
-    const { page, requests } = await openChat('owner', 375);
+    const { page, requests } = await openChat('owner', 375, 'known', 'onebot');
     await page.getByRole('button', { name: '会话设置' }).click();
     const panel = page.getByRole('region', { name: '会话设置' });
     await panel.getByLabel('群聊发言预算').selectOption('value:8');
@@ -256,12 +285,29 @@ describe('Web 会话对话设置', () => {
 
   it('历史平台窗口来源未知时不套用实例覆盖', async (ctx) => {
     if (error) { console.warn(error); ctx.skip(); return; }
-    const { page } = await openChat('owner', 375, 'unknown');
+    const { page } = await openChat('owner', 375, 'unknown', 'onebot');
     await page.getByRole('button', { name: '会话设置' }).click();
     const panel = page.getByRole('region', { name: '会话设置' });
     await panel.getByText('平台实例来源未知', { exact: false }).waitFor();
     await panel.getByText('先进入队列 · 全局', { exact: true }).waitFor();
     expect(await panel.getByText('即时判断 · 平台实例', { exact: true }).count()).toBe(0);
+  }, 20000);
+
+  it('历史平台会话可预览并确认来源绑定', async (ctx) => {
+    if (error) { console.warn(error); ctx.skip(); return; }
+    const { page, requests } = await openChat('owner', 375, 'unknown', 'onebot');
+    await page.getByRole('button', { name: '会话设置' }).click();
+    const panel = page.getByRole('region', { name: '会话设置' });
+    const origin = panel.getByRole('region', { name: '平台来源' });
+    await origin.getByLabel('平台实例来源').selectOption('onebot:test-instance');
+    await origin.getByRole('button', { name: '预览绑定' }).click();
+    await origin.getByText('来源未知 → 测试实例').waitFor();
+    await origin.getByRole('button', { name: '确认' }).click();
+    await origin.getByText('onebot/test-instance').waitFor();
+    expect(requests).toEqual([
+      { method: 'origin-preview', body: { scope: 'onebot', instance_id: 'test-instance' } },
+      { method: 'origin-save', body: { scope: 'onebot', instance_id: 'test-instance', preview_token: 'origin-token' } },
+    ]);
   }, 20000);
 
   it('成员看不到修改入口', async (ctx) => {

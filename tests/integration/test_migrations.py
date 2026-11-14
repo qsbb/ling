@@ -318,6 +318,25 @@ def test_upgrade_head_creates_key_tables(migrated_db: MigratedDatabase) -> None:
     assert not missing, f"upgrade head 后缺少表: {sorted(missing)}"
 
 
+def test_dialogue_epoch_ignores_unrelated_window_activity(
+    migrated_db: MigratedDatabase,
+) -> None:
+    def read_generation() -> int:
+        rows = asyncio.run(
+            _fetch(migrated_db.url, "SELECT generation FROM dialogue_config_guard")
+        )
+        return int(rows[0][0])
+
+    before = read_generation()
+    asyncio.run(_execute(migrated_db.url, "UPDATE windows SET message_count = message_count"))
+    after_activity = read_generation()
+    assert after_activity == before
+
+    asyncio.run(_execute(migrated_db.url, "UPDATE windows SET archived = archived"))
+    after_policy_update = read_generation()
+    assert after_policy_update == after_activity + 1
+
+
 @pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
 def test_migration_cli_uses_explicit_postgres(migrated_db: MigratedDatabase, driver: str) -> None:
     env = os.environ.copy()

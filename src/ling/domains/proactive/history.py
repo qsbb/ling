@@ -5,7 +5,12 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import DeliveryReceiptRow, Operation, ProactiveOpportunity
+from ling.infra.models import (
+    DeliveryReceiptRow,
+    Operation,
+    ProactiveDraftBinding,
+    ProactiveOpportunity,
+)
 
 _PARTICIPANT_VISIBILITY = ("subject_private", "public")
 _SAFE_TERMINAL_REASONS = frozenset({
@@ -14,6 +19,7 @@ _SAFE_TERMINAL_REASONS = frozenset({
     "机会已过期（时效性）",
     "投递认领已超时，平台可能已收到",
     "投递结果不确定，禁止自动重发",
+    "草稿表达控制无效",
 })
 
 
@@ -37,6 +43,14 @@ async def recent_opportunities(
         stmt.order_by(ProactiveOpportunity.created_at.desc(), ProactiveOpportunity.id.desc())
         .limit(limit)
     )).all())
+
+    draft_states: dict[str, str] = {}
+    if rows:
+        states = (await session.execute(
+            select(ProactiveDraftBinding.opportunity_id, ProactiveDraftBinding.state)
+            .where(ProactiveDraftBinding.opportunity_id.in_([row.id for row in rows]))
+        )).all()
+        draft_states = {opportunity_id: state for opportunity_id, state in states}
 
     ids = [row.delivery_operation_id for row in rows if row.delivery_operation_id]
     receipts: dict[str, DeliveryReceiptRow] = {}
@@ -75,7 +89,11 @@ async def recent_opportunities(
             "reason": row.reason,
             "reason_code": row.reason_code,
             "has_source": row.source_event_id is not None,
-            "state": row.state,
+            "state": "candidate" if row.state in {"drafting", "bound_candidate"} else row.state,
+            "draft_state": draft_states.get(row.id),
+            "draft_origin": (
+                "bound" if draft_states.get(row.id) == "ready" else "unknown"
+            ) if row.draft_text is not None else None,
             "created_at": row.created_at.isoformat(),
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
             "gate": {

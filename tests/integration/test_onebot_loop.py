@@ -134,6 +134,42 @@ async def test_private_message_gets_a_reply(logged_in: TestEnv) -> None:
     assert str(call["body"]["user_id"]) == QQ_USER
 
 
+async def test_runtime_snapshot_releases_config_guard_before_decision(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """快照完成后必须释放配置守卫，不能把它带进接话决策。"""
+    import asyncio
+
+    from ling.infra.db import get_session_factory
+    from ling.kernel.autonomy import TurnChoice
+    from ling.kernel.bridge import InboundBridge
+    from ling.settings.window_policy import lock_dialogue_config
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    competing_reads: list[bool] = []
+
+    async def decide(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        async with get_session_factory()() as session:
+            await asyncio.wait_for(lock_dialogue_config(session), timeout=1)
+            await session.rollback()
+        competing_reads.append(True)
+        return TurnChoice(
+            respond=False,
+            reason="并发读取验证",
+            skip_code="group_not_addressed",
+        )
+
+    monkeypatch.setattr(InboundBridge, "_decide", decide)
+    response = await _post(logged_in, _event_body(message_id=801))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["accepted"] is True, response.text
+    assert response.json()["decision"] == "silence"
+    assert competing_reads == [True]
+
+
 async def test_reply_is_persisted(logged_in: TestEnv) -> None:
     """机器人的回复必须落库（可审计、可重放）。"""
     fake = FakeOneBot()
@@ -2300,15 +2336,13 @@ async def test_inbound_persona_stays_stable_when_switched_during_decision(
         assert "人格设定甲" not in prompt
 
 
-@pytest.mark.parametrize("initial_state", ["empty", "unreadable"])
 async def test_inbound_empty_persona_snapshot_survives_midturn_activation(
-    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, initial_state: str
+    logged_in: TestEnv,
 ) -> None:
-    """空配置或读取失败时，本条保持无人格，下一条读取新配置。"""
+    """空人格覆盖时，本条保持无人格，下一条读取新配置。"""
     from ling.infra.models import ConfigRevision
     from ling.models.router import StreamOutcome
     from ling.ports.model import ModelChunk
-    from ling.settings.service import ConfigService
 
     fake = FakeOneBot()
     _install(logged_in, fake)
@@ -2321,26 +2355,13 @@ async def test_inbound_empty_persona_snapshot_survives_midturn_activation(
     response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
     assert response.status_code == 200, response.text
 
-    if initial_state == "empty":
-        async with session_scope() as session:
-            revision = (
-                await session.execute(
-                    select(ConfigRevision).where(ConfigRevision.state == "published")
-                )
-            ).scalar_one()
-            revision.payload = {**revision.payload, "persona_id": ""}
-    else:
-        original_effective = ConfigService.effective
-        resolve_calls = 0
-
-        async def fail_once(self):  # noqa: ANN001, ANN202
-            nonlocal resolve_calls
-            resolve_calls += 1
-            if resolve_calls == 1:
-                raise RuntimeError("模拟人格配置读取失败")
-            return await original_effective(self)
-
-        monkeypatch.setattr(ConfigService, "effective", fail_once)
+    async with session_scope() as session:
+        revision = (
+            await session.execute(
+                select(ConfigRevision).where(ConfigRevision.state == "published")
+            )
+        ).scalar_one()
+        revision.payload = {**revision.payload, "persona_id": ""}
 
     decision_messages: list[str] = []
     generated_messages: list[str] = []
@@ -2383,6 +2404,60 @@ async def test_inbound_empty_persona_snapshot_survives_midturn_activation(
         windows = list((await session.execute(select(Window).where(Window.channel == "onebot"))).scalars())
         assert len(windows) == 1
         assert windows[0].persona_id == ""
+
+
+async def test_inbound_config_snapshot_failure_releases_event_for_retry(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配置快照不可读时保留事件认领，修复读取后可重投同一事件。"""
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+    from ling.settings.service import ConfigService
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+
+    original_effective = ConfigService.effective
+    attempts = 0
+
+    async def fail_once(self):  # noqa: ANN001, ANN202
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("模拟全局配置快照读取失败")
+        return await original_effective(self)
+
+    monkeypatch.setattr(ConfigService, "effective", fail_once)
+
+    class CapturingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            payload = (
+                '{"respond":true,"reason":"测试","length":"normal"}'
+                if messages and "只输出一个 JSON 对象" in (messages[0].content or "")
+                else "配置恢复后的回复"
+            )
+            yield ModelChunk(delta=payload), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=payload)
+
+    logged_in.app.state.router = CapturingRouter()
+    body = _event_body(message_id=842)
+
+    first = await _post(logged_in, body)
+    assert first.status_code == 200, first.text
+    assert first.json()["accepted"] is False, first.text
+    assert "可重投" in first.json()["reason"], first.text
+    assert not [call for call in fake.sent if call["action"] == "send_private_msg"]
+
+    retried = await _post(logged_in, body)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["delivered"] is True, retried.text
+    assert attempts == 2
+
+    duplicate = await _post(logged_in, body)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True, duplicate.text
+    assert len([call for call in fake.sent if call["action"] == "send_private_msg"]) == 1
 
 
 async def test_persona_service_keeps_ordinary_empty_id_dynamic(logged_in: TestEnv) -> None:

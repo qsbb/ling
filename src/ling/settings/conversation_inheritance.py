@@ -62,7 +62,7 @@ _BOOLEAN_FIELDS = frozenset(
 _FIELDS = _BOOLEAN_FIELDS | {"persona_id", "group_turn_budget"}
 
 
-def _validate_overrides(overrides: Mapping[str, object]) -> None:
+def validate_conversation_overrides(overrides: Mapping[str, object]) -> None:
     """拒绝错误值，避免非法覆盖被静默当作继承。"""
     for key, value in overrides.items():
         if key not in _FIELDS:
@@ -86,8 +86,8 @@ def resolve_conversation_settings(
     """按会话、实例、全局顺序逐字段解析，且不修改输入。"""
     instance = {} if instance_overrides is None else instance_overrides
     session = {} if session_overrides is None else session_overrides
-    _validate_overrides(instance)
-    _validate_overrides(session)
+    validate_conversation_overrides(instance)
+    validate_conversation_overrides(session)
 
     def choose(key: str, global_value: T) -> ResolvedField[T]:
         if key in session:

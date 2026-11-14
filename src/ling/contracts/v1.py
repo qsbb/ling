@@ -24,6 +24,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     field_validator,
 )
 
@@ -627,15 +628,71 @@ class ContextContribution(StrictModel):
     token_budget: int = Field(default=0, ge=0)
 
 
+DialoguePolicySource = Literal["global", "instance", "session"]
+DialoguePolicyOriginStatus = Literal["known", "unknown", "not_applicable"]
+
+
+class WindowDialoguePolicyPersonaField(StrictModel):
+    """人格字段允许显式 null，且保留继承状态。"""
+
+    global_value: StrictStr | None
+    instance_override: StrictStr | None
+    has_instance_override: bool
+    session_override: StrictStr | None
+    has_session_override: bool
+    effective: StrictStr | None
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyBooleanField(StrictModel):
+    """布尔字段只接受 JSON boolean。"""
+
+    global_value: StrictBool
+    instance_override: StrictBool | None
+    has_instance_override: bool
+    session_override: StrictBool | None
+    has_session_override: bool
+    effective: StrictBool
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyIntegerField(StrictModel):
+    """预算字段只接受 JSON integer。"""
+
+    global_value: StrictInt
+    instance_override: StrictInt | None
+    has_instance_override: bool
+    session_override: StrictInt | None
+    has_session_override: bool
+    effective: StrictInt
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyFields(StrictModel):
+    """六个会话字段分别使用对应的 JSON 类型。"""
+
+    persona_id: WindowDialoguePolicyPersonaField
+    private_may_stay_silent: WindowDialoguePolicyBooleanField
+    group_mention_requires_reply: WindowDialoguePolicyBooleanField
+    group_attention_deferred: WindowDialoguePolicyBooleanField
+    group_turn_budget: WindowDialoguePolicyIntegerField
+    rest_may_skip: WindowDialoguePolicyBooleanField
+
+
 class WindowDialoguePolicyView(StrictModel):
-    """Web 私聊当前回应设置；空覆盖表示继承全局值。"""
+    """逐字段给出全局、可信实例、会话覆盖与生效值。"""
 
     field: Literal["private_may_stay_silent"]
     global_value: StrictBool
     override: StrictBool | None
     effective: StrictBool
-    source: Literal["global", "session"]
+    source: DialoguePolicySource
+    fields: WindowDialoguePolicyFields
+    origin_status: DialoguePolicyOriginStatus
+    instance_scope: StrictStr | None
+    instance_id: StrictStr | None
     global_revision: NonnegativeJsonInteger
+    instance_revision: NonnegativeJsonInteger
     session_revision: NonnegativeJsonInteger
 
 
@@ -644,7 +701,8 @@ class WindowDialoguePolicyProposed(StrictModel):
 
     override: StrictBool | None
     effective: StrictBool
-    source: Literal["global", "session"]
+    source: DialoguePolicySource
+    fields: WindowDialoguePolicyFields
 
 
 class WindowDialoguePolicyPreview(StrictModel):
@@ -652,6 +710,56 @@ class WindowDialoguePolicyPreview(StrictModel):
 
     current: WindowDialoguePolicyView
     proposed: WindowDialoguePolicyProposed
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
+
+
+class WindowOriginBindingCandidate(StrictModel):
+    scope: Literal["onebot", "qqbot"]
+    instance_id: StrictStr
+    display_name: StrictStr
+    enabled: StrictBool
+
+
+class WindowOriginBindingOptions(StrictModel):
+    scope: Literal["onebot", "qqbot"]
+    candidates: list[WindowOriginBindingCandidate]
+    manually_bound: StrictBool
+
+
+class WindowOriginBindingPreview(StrictModel):
+    current: WindowDialoguePolicyView
+    proposed: WindowDialoguePolicyView
+    target: WindowOriginBindingCandidate | None
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyView(StrictModel):
+    """平台实例的逐字段覆盖与当前影响范围摘要。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    scope: Literal["onebot", "qqbot"]
+    instance_id: StrictStr
+    fields: WindowDialoguePolicyFields
+    global_revision: NonnegativeJsonInteger
+    instance_revision: NonnegativeJsonInteger
+    impact_epoch: NonnegativeJsonInteger
+    affected_active_windows: NonnegativeJsonInteger
+    affected_archived_windows: NonnegativeJsonInteger
+    session_shadowed_windows: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyProposed(StrictModel):
+    fields: WindowDialoguePolicyFields
+    affected_active_windows: NonnegativeJsonInteger
+    affected_archived_windows: NonnegativeJsonInteger
+    session_shadowed_windows: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyPreview(StrictModel):
+    current: InstanceDialoguePolicyView
+    proposed: InstanceDialoguePolicyProposed
     preview_token: str = Field(min_length=1, max_length=2048)
     expires_at: NonnegativeJsonInteger
 

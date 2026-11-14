@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, or_, select
 
 from ling.api.deps import CurrentAuth, DbSession, PersonaDep
 from ling.api.errors import LingError
@@ -51,11 +52,15 @@ from ling.contracts.v1 import ErrorCode, Origin
 from ling.domains.persona import current as persona_current
 from ling.domains.persona.service import (
     PersonaActiveError,
+    PersonaInstanceOverrideError,
     PersonaInUseError,
     PersonaNotFoundError,
+    PersonaSessionOverrideError,
     PersonaView,
 )
+from ling.infra.models import Window, WindowDialogueOverride
 from ling.kernel.turn import ActorSequencer
+from ling.settings.window_policy import lock_dialogue_config
 
 router = APIRouter(tags=["persona"])
 
@@ -301,6 +306,7 @@ async def delete_persona(
     过什么"的记录不被改写。
     """
     _require_owner(auth)
+    await lock_dialogue_config(session)
     try:
         view = await persona.delete(persona_id)
     except PersonaNotFoundError as exc:
@@ -319,6 +325,43 @@ async def delete_persona(
             "先归档或清空这些会话再删除",
             status_code=409,
             detail=f"persona_in_use:{exc.in_use_windows}",
+        ) from exc
+    except PersonaSessionOverrideError as exc:
+        visible_windows = await session.scalar(
+            select(func.count())
+            .select_from(WindowDialogueOverride)
+            .join(Window, Window.id == WindowDialogueOverride.window_id)
+            .where(
+                WindowDialogueOverride.overrides.contains({"persona_id": persona_id}),
+                or_(
+                    and_(
+                        Window.visibility == "subject_private",
+                        Window.subject_id == auth.user.subject_id,
+                        or_(Window.channel == "web", Window.actor_id == _settings().actor_id),
+                    ),
+                    and_(
+                        Window.visibility == "group_scope",
+                        Window.actor_id == _settings().actor_id,
+                        Window.channel.in_(("onebot", "qqbot")),
+                    ),
+                ),
+            )
+        )
+        visible_windows = int(visible_windows or 0)
+        raise LingError(
+            ErrorCode.conflict,
+            f"「{persona_id}」仍被会话设置选中，你可管理的会话中有 {visible_windows} 个引用，"
+            "请先修改或清除这些会话的人格覆盖",
+            status_code=409,
+            detail=f"persona_session_override:{visible_windows}",
+        ) from exc
+    except PersonaInstanceOverrideError as exc:
+        raise LingError(
+            ErrorCode.conflict,
+            f"「{persona_id}」仍被 {exc.override_instances} 个平台实例设置选中，"
+            "请先修改或清除这些实例的人格覆盖",
+            status_code=409,
+            detail=f"persona_instance_override:{exc.override_instances}",
         ) from exc
     await _record(
         session,

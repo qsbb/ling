@@ -36,6 +36,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ling.infra.db import Base
@@ -43,6 +44,11 @@ from ling.infra.db import Base
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _window_origin_status_default(context: sa.DefaultExecutionContext) -> str:
+    values = context.get_current_parameters()
+    return "not_applicable" if values.get("channel", "web") == "web" else "unknown"
 
 
 class TimestampMixin:
@@ -184,6 +190,39 @@ class Window(Base, TimestampMixin):
     """会话窗口：一个 subject 与角色的一段连续对话。"""
 
     __tablename__ = "windows"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["origin_scope", "origin_instance_id"],
+            ["connector_instances.scope", "connector_instances.instance_id"],
+            name="fk_windows_origin_connector_instance",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(origin_status = 'known' AND origin_scope IS NOT NULL "
+            "AND origin_scope IN ('onebot', 'qqbot') "
+            "AND origin_instance_id IS NOT NULL) OR "
+            "(origin_status IN ('unknown', 'not_applicable') "
+            "AND origin_scope IS NULL AND origin_instance_id IS NULL)",
+            name="ck_window_origin_identity",
+        ),
+        CheckConstraint(
+            "(channel = 'web' AND origin_status = 'not_applicable') OR "
+            "(channel <> 'web' AND origin_status <> 'not_applicable')",
+            name="ck_window_origin_web_only",
+        ),
+        Index(
+            "ix_windows_connector_ref",
+            "actor_id",
+            "channel",
+            "connector_window_ref",
+        ),
+        Index(
+            "ix_windows_origin_instance",
+            "origin_scope",
+            "origin_instance_id",
+            "origin_status",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     actor_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -192,11 +231,21 @@ class Window(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(128), default="新的对话")
     channel: Mapped[str] = mapped_column(String(32), default="web")
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    connector_window_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    origin_scope: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    origin_instance_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    origin_status: Mapped[str] = mapped_column(
+        String(24), default=_window_origin_status_default, server_default="unknown"
+    )
+    origin_manually_bound: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.false()
+    )
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
     # 置顶时刻（迁移 0059）。``NULL`` = 没置顶。
     #
     # 为什么存"时刻"而不是 ``pinned: bool``：多个置顶之间也有先后——先置顶的
@@ -210,17 +259,82 @@ class Window(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    @property
+    def platform_reference(self) -> str:
+        """平台窗口使用独立引用，历史窗口继续使用原来的标题。"""
+        if self.connector_window_ref is not None:
+            return self.connector_window_ref
+        return str(self.title or "")
+
+    @property
+    def trusted_instance_key(self) -> tuple[str, str] | None:
+        """只返回已持久化的可信实例身份。"""
+        if self.origin_status == "known" and self.origin_scope and self.origin_instance_id:
+            return self.origin_scope, self.origin_instance_id
+        return None
+
 
 class WindowDialogueOverride(Base):
-    """会话级对话设置；空值表示继承全局设置。"""
+    """会话级逐字段对话设置；缺少的键继承上级配置。"""
 
     __tablename__ = "window_dialogue_overrides"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_window_dialogue_overrides_revision"),
+        CheckConstraint(
+            "jsonb_typeof(overrides) = 'object' AND "
+            "overrides - ARRAY['persona_id', 'private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip'] = '{}'::jsonb",
+            name="ck_window_dialogue_overrides_supported_keys",
+        ),
+    )
 
     window_id: Mapped[str] = mapped_column(
         ForeignKey("windows.id", ondelete="CASCADE"), primary_key=True
     )
-    revision: Mapped[int] = mapped_column(Integer, default=1)
-    private_may_stay_silent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    overrides: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    updated_by: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InstanceDialogueOverride(Base):
+    """可信平台实例的逐字段对话设置覆盖。"""
+
+    __tablename__ = "instance_dialogue_overrides"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["scope", "instance_id"],
+            ["connector_instances.scope", "connector_instances.instance_id"],
+            name="fk_instance_dialogue_overrides_connector_instance",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("revision > 0", name="ck_instance_dialogue_overrides_revision"),
+        CheckConstraint(
+            "scope IN ('onebot', 'qqbot')",
+            name="ck_instance_dialogue_overrides_scope",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(overrides) = 'object' AND "
+            "overrides - ARRAY['persona_id', 'private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip'] = '{}'::jsonb",
+            name="ck_instance_dialogue_overrides_supported_keys",
+        ),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    overrides: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
     updated_by: Mapped[str] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -255,6 +369,74 @@ class Turn(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class ConversationAttemptSnapshot(Base):
+    """每个生成尝试实际解析出的公开来源元数据，不保存提示词或消息正文。"""
+
+    __tablename__ = "conversation_attempt_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "(origin_status = 'known' AND instance_scope IS NOT NULL "
+            "AND instance_scope IN ('onebot', 'qqbot') AND instance_id IS NOT NULL) OR "
+            "(origin_status IN ('unknown', 'not_applicable') "
+            "AND instance_scope IS NULL AND instance_id IS NULL)",
+            name="ck_conversation_attempt_instance_identity",
+        ),
+        CheckConstraint(
+            "origin_status IN ('known', 'unknown', 'not_applicable')",
+            name="ck_conversation_attempt_origin_status",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(effective_values) = 'object' AND "
+            "effective_values - ARRAY['private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip'] = '{}'::jsonb AND "
+            "effective_values ?& ARRAY['private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip']",
+            name="ck_conversation_attempt_effective_values",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(field_sources) = 'object' AND "
+            "field_sources - ARRAY['persona_id', 'private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip'] = '{}'::jsonb AND "
+            "field_sources ?& ARRAY['persona_id', 'private_may_stay_silent', "
+            "'group_mention_requires_reply', 'group_attention_deferred', "
+            "'group_turn_budget', 'rest_may_skip']",
+            name="ck_conversation_attempt_field_sources",
+        ),
+        CheckConstraint("attempt > 0", name="ck_conversation_attempt_number"),
+        CheckConstraint(
+            "global_revision >= 0 AND instance_revision >= 0 "
+            "AND session_revision >= 0 AND impact_epoch >= 0 "
+            "AND (persona_revision IS NULL OR persona_revision >= 0)",
+            name="ck_conversation_attempt_revisions",
+        ),
+    )
+
+    turn_id: Mapped[str] = mapped_column(
+        ForeignKey("turns.id", ondelete="CASCADE"), primary_key=True
+    )
+    attempt: Mapped[int] = mapped_column(Integer, primary_key=True)
+    global_revision: Mapped[int] = mapped_column(Integer)
+    test_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=sa.false())
+    instance_scope: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    instance_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    instance_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    session_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    impact_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    origin_status: Mapped[str] = mapped_column(String(24))
+    persona_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    persona_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_values: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    field_sources: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Message(Base):
@@ -1744,6 +1926,27 @@ class ProactiveOpportunity(Base):
     last_gate_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     last_gate_reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_gate_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProactiveDraftBinding(Base):
+    """主动草稿的目标与生成认领，不存人格正文或密钥。"""
+
+    __tablename__ = "proactive_draft_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('preparing', 'generating', 'ready', 'uncertain', 'cancelled')",
+            name="ck_proactive_draft_binding_state",
+        ),
+    )
+
+    opportunity_id: Mapped[str] = mapped_column(
+        ForeignKey("proactive_opportunities.id", ondelete="CASCADE"), primary_key=True
+    )
+    claim_token: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(16))
+    target_window_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 # ------------------------------------------------------------------ W2 知识/设备/语音

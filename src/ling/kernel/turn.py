@@ -775,6 +775,7 @@ class TurnCoordinator:
         turn_id: str,
         user_text: str,
         config: EffectiveConfig,
+        persona_id: str | None = None,
         profile: str = "dialogue.fast",
         attempt: int = 1,
         # 产生这一轮的渠道账号（"instance:external_id"）。记忆要记下它，
@@ -818,6 +819,7 @@ class TurnCoordinator:
                 turn_id=turn_id,
                 user_text=user_text,
                 config=config,
+                persona_id=persona_id,
                 profile=profile,
                 queue=queue,
                 token=token,
@@ -859,6 +861,7 @@ class TurnCoordinator:
         turn_id: str,
         user_text: str,
         config: EffectiveConfig,
+        persona_id: str | None = None,
         profile: str,
         queue: asyncio.Queue[TurnStreamEvent | None],
         token: StopToken,
@@ -924,7 +927,11 @@ class TurnCoordinator:
                 # 这一轮用哪套人格：**在本轮自己的会话里解析一次**，之后整轮
                 # 一致（窗口归属、提示词、角色事件都同一个 id）。解析在这里
                 # 而不是构造时——协调器可能跨多轮复用，中间切换人格要能生效。
-                persona_id = await self._resolve_persona_id(session)
+                persona_id = (
+                    persona_id
+                    if persona_id is not None
+                    else await self._resolve_persona_id(session)
+                )
                 conversation = ConversationService(
                     session, actor_id=self._actor_id, persona_id=persona_id
                 )
@@ -939,6 +946,7 @@ class TurnCoordinator:
                     # 编译前就被要求停止：直接收敛，不浪费模型调用
                     await self._finalize(
                         conversation=conversation,
+                        persona_id=persona_id,
                         voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
@@ -1096,6 +1104,7 @@ class TurnCoordinator:
                     )
                     await self._finalize(
                         conversation=conversation,
+                        persona_id=persona_id,
                         voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
@@ -1122,6 +1131,7 @@ class TurnCoordinator:
                     # 编译期间被要求停止
                     await self._finalize(
                         conversation=conversation,
+                        persona_id=persona_id,
                         voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
@@ -1614,6 +1624,7 @@ class TurnCoordinator:
                         )
                         await self._finalize(
                             conversation=conversation,
+                            persona_id=persona_id,
                             voice_state=voice_state,
                             window_id=window_id,
                             subject_id=subject_id,
@@ -1726,6 +1737,7 @@ class TurnCoordinator:
 
                 await self._finalize(
                     conversation=conversation,
+                    persona_id=persona_id,
                     voice_state=voice_state,
                     window_id=window_id,
                     subject_id=subject_id,
@@ -1750,13 +1762,15 @@ class TurnCoordinator:
                 async with session_scope() as session:
                     # 被取消时也要落库：这里重新解析一次人格（与主路径同一口径），
                     # 否则 `persona_id=None` 的协调器会把空 id 写进角色事件。
+                    cancelled_persona_id = await self._resolve_persona_id(session)
                     conversation = ConversationService(
                         session,
                         actor_id=self._actor_id,
-                        persona_id=await self._resolve_persona_id(session),
+                        persona_id=cancelled_persona_id,
                     )
                     await self._finalize(
                         conversation=conversation,
+                        persona_id=cancelled_persona_id,
                         voice_state=voice_state,
                         window_id=window_id,
                         subject_id=subject_id,
@@ -2381,6 +2395,7 @@ class TurnCoordinator:
         self,
         *,
         conversation: ConversationService,
+        persona_id: str | None = None,
         window_id: str,
         subject_id: str,
         turn_id: str,
@@ -2509,13 +2524,14 @@ class TurnCoordinator:
             from ling.capabilities.naming import display_name_for, strip_self_prefix
 
             # 平台入站复用决策与提示词中的名字，避免中途改名影响清理。
-            if isinstance(self._persona_id, PersonaSnapshot):
-                view = self._persona_id.view
+            final_persona_id = persona_id if persona_id is not None else self._persona_id
+            if isinstance(final_persona_id, PersonaSnapshot):
+                view = final_persona_id.view
                 _name = self._display_name or (view.display_name if view else "")
-            elif isinstance(self._persona_id, PersonaIdSnapshot) and not self._persona_id:
+            elif isinstance(final_persona_id, PersonaIdSnapshot) and not final_persona_id:
                 _name = self._display_name
             else:
-                _name = self._display_name or await display_name_for(self._persona_id or "")
+                _name = self._display_name or await display_name_for(final_persona_id or "")
             _cleaned, _stripped = strip_self_prefix(delivered, _name)
             if _stripped:
                 delivered = _cleaned
@@ -2842,10 +2858,15 @@ class TurnCoordinator:
         # 角色事件的 `persona_id` 必须是**本轮真正用的那一套**。协调器可能
         # 拿到 None（= 每轮现解析），所以这里退回"这一轮对话服务手上那个 id"
         # ——它就是 `run_turn` 开头解析出来、本轮回话所归属的人格。
+        event_persona_id = getattr(conversation, "persona_id", None)
+        if event_persona_id is None:
+            event_persona_id = persona_id
+        if event_persona_id is None:
+            event_persona_id = self._persona_id
         sequencer = ActorSequencer(
             conversation_session(conversation),
             actor_id=self._actor_id,
-            persona_id=getattr(conversation, "persona_id", None) or self._persona_id or "",
+            persona_id=str(event_persona_id or ""),
         )
         await sequencer.commit_event(
             type=f"turn.{state.value}",

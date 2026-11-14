@@ -126,6 +126,7 @@ class QQBotGateway:
         *,
         connector: Any,
         app: Any,
+        trusted_instance_key: tuple[str, str] | None = None,
         intents: int = INTENTS_GROUP_AND_C2C,
         shard: tuple[int, int] = (0, 1),
         reconnect_min: float = RECONNECT_MIN,
@@ -133,6 +134,7 @@ class QQBotGateway:
     ) -> None:
         self._connector = connector
         self._app = app
+        self._trusted_instance_key = trusted_instance_key
         self.intents = intents
         self.shard = shard
         self._min = reconnect_min
@@ -203,7 +205,12 @@ class QQBotGateway:
 
             self.received += 1
             try:
-                result = await process_inbound_payload(self._app, self._connector, frame)
+                result = await process_inbound_payload(
+                    self._app,
+                    self._connector,
+                    frame,
+                    trusted_instance_key=self._trusted_instance_key,
+                )
             except Exception as exc:  # noqa: BLE001 - 单条失败不能断连接
                 logger.exception("QQ 网关事件处理失败（连接保持）")
                 self.last_error = f"{type(exc).__name__}: {exc}"[:200]

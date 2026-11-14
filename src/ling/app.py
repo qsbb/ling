@@ -287,7 +287,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.access_snapshot = _access_effective
     connector_runtime = ConnectorRuntime(app)
     app.state.connector_runtime = connector_runtime
-    async def _start_onebot(values: dict) -> dict:
+    async def _start_onebot(values: dict, instance_id: str) -> dict:
         from connectors.onebot.connector import OneBotV11Connector
         from connectors.onebot.ws_client import OneBotWsClient
         from connectors.onebot.ws_server import OneBotWsServer
@@ -301,12 +301,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 server = OneBotWsServer(
                     host=config.ws_host, port=runtime_settings.onebot_ws_port,
                     app=app, connector=connector, token=runtime_settings.onebot_ws_token,
+                    trusted_instance_key=("onebot", instance_id),
                 )
                 components["onebot_ws_server"] = server
                 await server.start()
             if runtime_settings.onebot_ws_url:
                 client = OneBotWsClient(
-                    url=runtime_settings.onebot_ws_url, app=app, connector=connector
+                    url=runtime_settings.onebot_ws_url,
+                    app=app,
+                    connector=connector,
+                    trusted_instance_key=("onebot", instance_id),
                 )
                 components["onebot_ws"] = client
                 client.start()
@@ -319,7 +323,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise
         return components
 
-    async def _start_qqbot(values: dict) -> dict:
+    async def _start_qqbot(values: dict, instance_id: str) -> dict:
         from connectors.qqbot.connector import QQBotConnector
         from connectors.qqbot.ws_gateway import QQBotGateway
 
@@ -328,7 +332,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not runtime_settings.qqbot_enabled or not config.configured:
             return {}
         connector = QQBotConnector(config)
-        gateway = QQBotGateway(connector=connector, app=app)
+        gateway = QQBotGateway(
+            connector=connector,
+            app=app,
+            trusted_instance_key=("qqbot", instance_id),
+        )
         try:
             gateway.start()
         except BaseException:
@@ -379,10 +387,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _plan_onebot(instance_id: str, values: dict) -> SwapPlan:
         return SwapPlan(stops=("onebot_ws_server", "onebot_ws"),
-                        start=lambda: _start_onebot(values))
+                        start=lambda: _start_onebot(values, instance_id))
 
     async def _plan_qqbot(instance_id: str, values: dict) -> SwapPlan:
-        return SwapPlan(stops=("qqbot_gateway",), start=lambda: _start_qqbot(values))
+        return SwapPlan(
+            stops=("qqbot_gateway",),
+            start=lambda: _start_qqbot(values, instance_id),
+        )
 
     connector_runtime.register_factory(_cf.SCOPE_ONEBOT, _plan_onebot)
     connector_runtime.register_factory(_cf.SCOPE_QQBOT, _plan_qqbot)
