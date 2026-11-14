@@ -334,7 +334,13 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
         )
         if connector is None or connector.instance_id != original.connector_instance:
             raise TranscriptionError("unavailable", "收到语音的连接器实例当前不可用")
-        await process_inbound_payload(app, connector, {}, _asr_resume=(env, source_id))
+        await process_inbound_payload(
+            app,
+            connector,
+            {},
+            trusted_instance_key=getattr(connector, "_ling_instance_key", None),
+            _asr_resume=(env, source_id),
+        )
     else:
         from ling.api.routes.chat import SendTurnBody, send_transcribed_turn
         async with session_scope() as session:
