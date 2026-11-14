@@ -151,6 +151,16 @@ async def independent_session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+@asynccontextmanager
+async def short_session_scope() -> AsyncIterator[AsyncSession]:
+    """短事务避开请求池；私有 SQLite 内存库保持原有连接语义。"""
+    if _engine_settings is None:
+        raise RuntimeError("数据库尚未初始化：先调用 init_engine()")
+    scope = session_scope if is_sqlite_memory_database(_engine_settings) else independent_session_scope
+    async with scope() as session:
+        yield session
+
+
 async def create_all_for_dev(engine: AsyncEngine) -> None:
     """开发/测试用建表。生产走 Alembic 迁移（migrations/）。"""
     # 必须先 import 所有模型模块，让 metadata 完整

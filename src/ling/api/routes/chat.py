@@ -229,11 +229,11 @@ async def _refresh_config_if_stale(request: Request) -> None:
     watcher = getattr(request.app.state, "revision_watcher", None)
     if watcher is None:
         return
-    from ling.infra.db import session_scope
+    from ling.infra.db import short_session_scope
     from ling.settings.refresh import current_revision, refresh_secrets
 
     try:
-        async with session_scope() as session:
+        async with short_session_scope() as session:
             if not await watcher.stale(session):
                 return
             settings = request.app.state.settings

@@ -165,9 +165,9 @@ class RuntimeWindowSnapshot:
 
 async def runtime_window_snapshot(config: ConfigService, window_id: str) -> RuntimeWindowSnapshot:
     """在同一短事务中固定配置与人格，不在模型调用期间持有事务。"""
-    from ling.infra.db import session_scope
+    from ling.infra.db import short_session_scope
 
-    async with session_scope() as session:
+    async with short_session_scope() as session:
         dialect = session.get_bind().dialect.name
         if dialect == "postgresql":
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
