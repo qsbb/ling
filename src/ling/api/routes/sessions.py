@@ -244,6 +244,8 @@ async def list_sessions(
     windows = await conversation.list_windows(auth.user.subject_id)
     if not windows:
         window = await conversation.ensure_default_window(auth.user.subject_id)
+        # Release the creation lock before looking up platform display names.
+        await conversation.session.commit()
         windows = [window]
     familiarity = await conversation.familiarities(windows)
     windows = sort_windows_for_display(windows, familiarity)

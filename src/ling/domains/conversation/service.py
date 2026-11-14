@@ -465,6 +465,16 @@ class ConversationService:
         return window
 
     async def ensure_default_window(self, subject_id: str) -> Window:
+        """Serialize first-window creation until the caller commits or rolls back."""
+        if self._session.bind.dialect.name == "sqlite":
+            from sqlalchemy import text
+
+            # Obtain SQLite's writer lock before checking for an existing window.
+            await self._session.execute(text("UPDATE windows SET id = id WHERE 0 = 1"))
+        else:
+            from ling.domains.speech.transcription import lock_scope
+
+            await lock_scope(self._session, f"default-window:{subject_id}")
         windows = await self.list_windows(subject_id)
         if windows:
             return windows[0]
