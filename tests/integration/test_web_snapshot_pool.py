@@ -32,12 +32,15 @@ async def test_web_turns_progress_when_request_connections_are_exhausted(logged_
     refresh_pids: list[int] = []
     before_refresh = asyncio.Event()
     before_snapshot = asyncio.Event()
+    after_refresh = asyncio.Event()
     release_refresh = asyncio.Event()
     release_snapshot = asyncio.Event()
     refresh_count = 0
 
     async def observe_stale(session):  # noqa: ANN001, ANN202
         refresh_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
+        if len(refresh_pids) == 2:
+            after_refresh.set()
         return await original_stale(session)
 
     async def refresh_barrier(request):  # noqa: ANN001, ANN202
@@ -70,14 +73,16 @@ async def test_web_turns_progress_when_request_connections_are_exhausted(logged_
         for index in range(2)
     ]
     try:
+        await asyncio.wait_for(before_snapshot.wait(), 8)
+        assert engine.pool.checkedout() == 2
+        assert len(set(request_pids)) == 2
+        release_snapshot.set()
         await asyncio.wait_for(before_refresh.wait(), 8)
         assert engine.pool.checkedout() == 2
         release_refresh.set()
-        await asyncio.wait_for(before_snapshot.wait(), 8)
-        assert len(set(request_pids)) == 2 and engine.pool.checkedout() == 2
+        await asyncio.wait_for(after_refresh.wait(), 8)
         assert len(refresh_pids) == 2
         assert set(refresh_pids).isdisjoint(request_pids)
-        release_snapshot.set()
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 12)
         assert all(getattr(result, "status_code", None) == 200 for result in results), results
     finally:
