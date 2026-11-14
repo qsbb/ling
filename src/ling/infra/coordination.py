@@ -7,8 +7,8 @@
    用 ``turn_controls`` 表 + 令牌侧定期轮询（间隔 0.5s，可接受）。
 
 2. **发言租约**：同一角色同时只在一个窗口说话。
-   用 ``INSERT ... ON CONFLICT DO UPDATE ... WHERE`` 做原子抢占，
-   不需要分布式锁服务；租约到期自动可被抢占，实例崩溃不会永久锁死。
+   用数据库原子建行和行锁协调获取与排队；租约到期自动可被抢占，
+   实例崩溃不会永久锁死。
 
 明确的能力降级（不假装跨实例等价）：
 - **流式片段续传**：仍限单进程。多实例下 resume 退化为"权威快照"，
@@ -134,6 +134,46 @@ class LeaseResult:
     reason: str | None = None
 
 
+async def _lock_or_create_lease(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    window_id: str,
+    turn_id: str,
+    lease_seconds: int,
+) -> SpeakLeaseRow:
+    """创建新租约，或锁住已存在的行。
+
+    建行和锁行都可能等待其他事务，调用者需要在返回后重新计算到期时间。
+    """
+    while True:
+        stmt = (
+            pg_insert(SpeakLeaseRow)
+            .values(
+                actor_id=actor_id,
+                window_id=window_id,
+                turn_id=turn_id,
+                expires_at=datetime.now(UTC) + timedelta(seconds=lease_seconds),
+                queue=[],
+            )
+            .on_conflict_do_nothing(index_elements=[SpeakLeaseRow.actor_id])
+            .returning(SpeakLeaseRow)
+        )
+        row = (await session.execute(stmt)).scalar_one_or_none()
+        if row is not None:
+            return row
+        row = (
+            await session.execute(
+                select(SpeakLeaseRow)
+                .where(SpeakLeaseRow.actor_id == actor_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            return row
+        # 冲突的租约可能在取得行锁前被释放并删除，需要重新尝试建行。
+
+
 class SpeakLeaseStore:
     """发言租约的持久化实现（跨实例语义）。"""
 
@@ -145,34 +185,21 @@ class SpeakLeaseStore:
 
         用一个事务完成"读当前 → 判断 → 写"，依赖行级锁保证多实例下不双写。
         """
-        now = datetime.now(UTC)
-        expires = now + timedelta(seconds=self._lease_seconds)
         async with session_scope() as session:
-            # 锁住这一行（如果存在），避免两个实例同时判定"空闲"
-            row = (
-                await session.execute(
-                    select(SpeakLeaseRow)
-                    .where(SpeakLeaseRow.actor_id == actor_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-
-            if row is None or _expired(row.expires_at, now):
-                # 空闲或已过期：直接占用
-                new_row = SpeakLeaseRow(
-                    actor_id=actor_id,
-                    window_id=window_id,
-                    turn_id=turn_id,
-                    expires_at=expires,
-                    queue=[],
-                )
-                if row is None:
-                    session.add(new_row)
-                else:
-                    row.window_id = window_id
-                    row.turn_id = turn_id
-                    row.expires_at = expires
-                    row.queue = list(row.queue or [])
+            row = await _lock_or_create_lease(
+                session,
+                actor_id=actor_id,
+                window_id=window_id,
+                turn_id=turn_id,
+                lease_seconds=self._lease_seconds,
+            )
+            now = datetime.now(UTC)
+            expires = now + timedelta(seconds=self._lease_seconds)
+            if _expired(row.expires_at, now):
+                row.window_id = window_id
+                row.turn_id = turn_id
+                row.expires_at = expires
+                row.queue = list(row.queue or [])
                 await session.flush()
                 return LeaseResult(acquired=True, holder_window_id=window_id,
                                    holder_turn_id=turn_id)
@@ -231,29 +258,16 @@ class SpeakLeaseStore:
         已经处理，所以走到队首分支时持有者**一定还有效**——此时只能返回
         False，让本轮继续排队（等对方 ``release()`` 提升，或等它过期）。
         """
-        now = datetime.now(UTC)
-        expires = now + timedelta(seconds=self._lease_seconds)
         async with session_scope() as session:
-            row = (
-                await session.execute(
-                    select(SpeakLeaseRow)
-                    .where(SpeakLeaseRow.actor_id == actor_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                session.add(
-                    SpeakLeaseRow(
-                        actor_id=actor_id,
-                        window_id=window_id,
-                        turn_id=turn_id,
-                        expires_at=expires,
-                        queue=[],
-                    )
-                )
-                await session.flush()
-                return True
-
+            row = await _lock_or_create_lease(
+                session,
+                actor_id=actor_id,
+                window_id=window_id,
+                turn_id=turn_id,
+                lease_seconds=self._lease_seconds,
+            )
+            now = datetime.now(UTC)
+            expires = now + timedelta(seconds=self._lease_seconds)
             key = f"{window_id}#{turn_id}"
             queue = list(row.queue or [])
 
@@ -308,8 +322,6 @@ class SpeakLeaseStore:
 
     async def release(self, *, actor_id: str, window_id: str, turn_id: str) -> bool:
         """释放并提升队首。"""
-        now = datetime.now(UTC)
-        expires = now + timedelta(seconds=self._lease_seconds)
         async with session_scope() as session:
             row = (
                 await session.execute(
@@ -330,7 +342,7 @@ class SpeakLeaseStore:
                 next_window, next_turn = head.split("#", 1) if "#" in head else (head, "")
                 row.window_id = next_window
                 row.turn_id = next_turn
-                row.expires_at = expires
+                row.expires_at = datetime.now(UTC) + timedelta(seconds=self._lease_seconds)
                 row.queue = queue
             else:
                 await session.execute(
@@ -340,8 +352,22 @@ class SpeakLeaseStore:
             return True
 
     async def extend(self, *, actor_id: str, window_id: str, turn_id: str) -> bool:
-        expires = datetime.now(UTC) + timedelta(seconds=self._lease_seconds)
         async with session_scope() as session:
+            # UPDATE 也可能等待行锁，先取得锁再计算新的期限。
+            row = (
+                await session.execute(
+                    select(SpeakLeaseRow)
+                    .where(
+                        SpeakLeaseRow.actor_id == actor_id,
+                        SpeakLeaseRow.window_id == window_id,
+                        SpeakLeaseRow.turn_id == turn_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            expires = datetime.now(UTC) + timedelta(seconds=self._lease_seconds)
             result = await session.execute(
                 update(SpeakLeaseRow)
                 .where(
