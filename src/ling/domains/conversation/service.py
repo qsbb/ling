@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import not_found
@@ -317,6 +317,10 @@ class ConversationService:
         """本域使用的数据库会话（供内核在同事务内提交角色事件）。"""
         return self._session
 
+    def with_session(self, session: AsyncSession) -> ConversationService:
+        """为短事务保留当前服务的角色与人格配置。"""
+        return ConversationService(session, actor_id=self._actor_id, persona_id=self._persona_id)
+
     @property
     def persona_id(self) -> str:
         """本实例归属的人格 id。**可能为空串**（实例没有显式指定时）。
@@ -467,14 +471,13 @@ class ConversationService:
     async def ensure_default_window(self, subject_id: str) -> Window:
         """Serialize first-window creation until the caller commits or rolls back."""
         if self._session.bind.dialect.name == "sqlite":
-            from sqlalchemy import text
-
             # Obtain SQLite's writer lock before checking for an existing window.
             await self._session.execute(text("UPDATE windows SET id = id WHERE 0 = 1"))
-        else:
-            from ling.domains.speech.transcription import lock_scope
-
-            await lock_scope(self._session, f"default-window:{subject_id}")
+        elif self._session.bind.dialect.name == "postgresql":
+            await self._session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"default-window:{subject_id}"},
+            )
         windows = await self.list_windows(subject_id)
         if windows:
             return windows[0]

@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ling.api import deps
 from ling.config import Settings
 from ling.domains.conversation.service import ConversationService
 from ling.infra.db import build_engine, create_all_for_dev
@@ -173,3 +174,43 @@ async def test_first_window_is_committed_before_display_name_lookup(logged_in, m
         await asyncio.wait_for(request, 5)
     assert request.result().status_code == 200
     assert request.result().json()["sessions"][0]["session_id"] == window_id
+
+
+async def test_first_window_does_not_commit_the_callers_transaction(logged_in):
+    """Creating a default window must not commit other work in a shared session."""
+    from ling.infra.db import get_session_factory, session_scope
+
+    async with session_scope() as setup:
+        await setup.execute(text("CREATE TABLE default_window_marker (id INTEGER PRIMARY KEY)"))
+    factory = get_session_factory()
+    async with (
+        factory.kw["bind"].connect() as caller_connection,
+        AsyncSession(bind=caller_connection, expire_on_commit=False) as caller,
+    ):
+        await caller.execute(text("INSERT INTO default_window_marker (id) VALUES (7)"))
+        caller_pid = await caller.scalar(text("SELECT pg_backend_pid()"))
+
+        async def caller_session():
+            yield caller
+
+        logged_in.app.dependency_overrides[deps.get_session] = caller_session
+        try:
+            response = await logged_in.client.get("/v1/sessions")
+            assert response.status_code == 200
+            async with factory() as observer:
+                observer_pid = await observer.scalar(text("SELECT pg_backend_pid()"))
+                marker = await observer.scalar(text("SELECT id FROM default_window_marker"))
+                windows = (await observer.scalars(select(Window.id).where(
+                    Window.subject_id == logged_in.subject_id,
+                    Window.archived.is_(False),
+                ))).all()
+            assert caller_pid != observer_pid
+            assert len(windows) == 1
+            assert response.json()["sessions"][0]["session_id"] == windows[0]
+            assert marker is None
+            await caller.rollback()
+            async with factory() as observer:
+                assert await observer.scalar(text("SELECT id FROM default_window_marker")) is None
+        finally:
+            logged_in.app.dependency_overrides.pop(deps.get_session, None)
+            await caller.rollback()

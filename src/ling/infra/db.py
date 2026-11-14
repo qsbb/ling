@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,9 +27,14 @@ class Base(DeclarativeBase):
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_independent_engine: AsyncEngine | None = None
+_independent_session_factory: async_sessionmaker[AsyncSession] | None = None
+_engine_settings: Settings | None = None
 
 
-def build_engine(settings: Settings) -> AsyncEngine:
+def build_engine(
+    settings: Settings, *, pool_size: int = 5, max_overflow: int = 5
+) -> AsyncEngine:
     url = settings.database_url
     if settings.db_require_postgres and not settings.is_postgres:
         raise RuntimeError("LING_REQUIRE_POSTGRES=1 但 LING_DATABASE_URL 不是 PostgreSQL")
@@ -69,17 +75,18 @@ def build_engine(settings: Settings) -> AsyncEngine:
         url,
         future=True,
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         connect_args=connect_args,
     )
 
 
 def init_engine(settings: Settings) -> AsyncEngine:
-    global _engine, _session_factory
+    global _engine, _session_factory, _engine_settings
     if _engine is None:
         _engine = build_engine(settings)
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+        _engine_settings = settings
     return _engine
 
 
@@ -90,11 +97,17 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def dispose_engine() -> None:
-    global _engine, _session_factory
+    global _engine, _session_factory, _independent_engine, _independent_session_factory
+    global _engine_settings
+    if _independent_engine is not None:
+        await _independent_engine.dispose()
     if _engine is not None:
         await _engine.dispose()
     _engine = None
     _session_factory = None
+    _independent_engine = None
+    _independent_session_factory = None
+    _engine_settings = None
 
 
 @asynccontextmanager
@@ -106,6 +119,34 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             yield session
             await session.commit()
         except Exception:
+            await session.rollback()
+            raise
+
+
+def is_sqlite_memory_database(settings: Settings) -> bool:
+    """SQLite 内存库无法由不同引擎共享，需沿用调用方事务。"""
+    url = make_url(settings.database_url)
+    return url.get_backend_name() == "sqlite" and url.database in {None, "", ":memory:"}
+
+
+@asynccontextmanager
+async def independent_session_scope() -> AsyncIterator[AsyncSession]:
+    """短事务用独立连接池，避免等待自身已占满的请求连接池。"""
+    global _independent_engine, _independent_session_factory
+    if _engine is None or _engine_settings is None:
+        raise RuntimeError("数据库尚未初始化：先调用 init_engine()")
+    if _independent_session_factory is None:
+        if is_sqlite_memory_database(_engine_settings):
+            raise RuntimeError("SQLite 内存数据库无法提供独立事务，请使用文件数据库或 PostgreSQL")
+        _independent_engine = build_engine(_engine_settings, pool_size=1, max_overflow=0)
+        _independent_session_factory = async_sessionmaker(
+            _independent_engine, expire_on_commit=False
+        )
+    async with _independent_session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except BaseException:
             await session.rollback()
             raise
 

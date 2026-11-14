@@ -27,6 +27,7 @@ from ling.domains.conversation.service import (
     sort_windows_for_display,
     window_target,
 )
+from ling.infra.db import independent_session_scope, is_sqlite_memory_database
 from ling.infra.models import Message, PromptSnapshot, Window
 from ling.kernel.context import KEY_LABELS, KEY_ORDER, estimate_tokens
 
@@ -243,9 +244,15 @@ async def list_sessions(
     # 所以拆两步：先取未排的行 → 查 familiarity → 用同一个纯函数排一次。
     windows = await conversation.list_windows(auth.user.subject_id)
     if not windows:
-        window = await conversation.ensure_default_window(auth.user.subject_id)
-        # Release the creation lock before looking up platform display names.
-        await conversation.session.commit()
+        if is_sqlite_memory_database(request.app.state.settings):
+            # A private in-memory SQLite database cannot be opened by another engine.
+            window = await conversation.ensure_default_window(auth.user.subject_id)
+        else:
+            # Do not commit another dependency's work or hold the lock for network I/O.
+            async with independent_session_scope() as session:
+                window = await conversation.with_session(session).ensure_default_window(
+                    auth.user.subject_id
+                )
         windows = [window]
     familiarity = await conversation.familiarities(windows)
     windows = sort_windows_for_display(windows, familiarity)
