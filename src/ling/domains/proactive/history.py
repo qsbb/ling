@@ -59,7 +59,8 @@ async def recent_opportunities(
                 continue
             opportunity_id = payload.get("opportunity_id")
             if (
-                payload.get("source") == "proactive"
+                isinstance(opportunity_id, str)
+                and payload.get("source") == "proactive"
                 and expected.get(opportunity_id) == operation.id
                 and opportunity_id not in receipts
             ):

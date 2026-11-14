@@ -184,3 +184,40 @@ async def test_scope_voice_and_missing_or_unrelated_receipts(logged_in: TestEnv)
     assert "语音来源" not in member.text and "角色私有标记" not in member.text
     denied = await logged_in.client.get("/v1/proactive", params={"view": "operator"})
     assert denied.status_code == 403
+
+
+async def test_malformed_receipt_source_is_skipped_without_hiding_valid_receipt(
+    logged_in: TestEnv,
+) -> None:
+    subject = logged_in.subject_id
+    async with session_scope() as session:
+        valid = _candidate("opp_valid_receipt", subject, reason="有效回执")
+        valid.delivery_operation_id = "op_valid_receipt"
+        malformed = _candidate("opp_bad_receipt", subject, reason="异常回执")
+        malformed.delivery_operation_id = "op_bad_receipt"
+        session.add_all([
+            valid,
+            malformed,
+            Operation(
+                id="op_valid_receipt", kind="delivery", actor_id="actor_ling",
+                subject_id=subject, state="succeeded",
+                payload={"source": "proactive", "opportunity_id": valid.id},
+            ),
+            Operation(
+                id="op_bad_receipt", kind="delivery", actor_id="actor_ling",
+                subject_id=subject, state="succeeded",
+                payload={"source": "proactive", "opportunity_id": [malformed.id]},
+            ),
+            DeliveryReceiptRow(
+                id="receipt_valid", operation_id="op_valid_receipt", channel="fake",
+                state="delivered", observed_at=NOW,
+            ),
+            DeliveryReceiptRow(
+                id="receipt_bad", operation_id="op_bad_receipt", channel="fake",
+                state="delivered", observed_at=NOW,
+            ),
+        ])
+
+    records = await _records(logged_in)
+    assert records["opp_valid_receipt"]["receipt"]["state"] == "delivered"
+    assert records["opp_bad_receipt"]["receipt"] is None
