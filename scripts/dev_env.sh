@@ -5,7 +5,6 @@ export LING_ENV=dev
 # 默认只绑回环；要让 NapCat 反向上报进来，见文末 OneBot 段（会改成 0.0.0.0）
 export LING_HOST=${LING_HOST:-127.0.0.1}
 export LING_PORT=${LING_PORT:-8080}
-export LING_DATABASE_URL=${LING_DATABASE_URL:-postgresql+asyncpg://ling@127.0.0.1:55432/ling}
 export LING_BOOTSTRAP_ADMIN=${LING_BOOTSTRAP_ADMIN:-ling}
 export LING_BOOTSTRAP_ADMIN_PASSWORD=${LING_BOOTSTRAP_ADMIN_PASSWORD:-ling-dev-password}
 export LING_TEST_MODE=${LING_TEST_MODE:-1}
@@ -87,7 +86,6 @@ export LING_QQBOT_SUPPORTS_GROUP=${LING_QQBOT_SUPPORTS_GROUP:-1}
 export LING_QQBOT_ALLOW_UNSIGNED_VALIDATION=${LING_QQBOT_ALLOW_UNSIGNED_VALIDATION:-0}
 # 回调地址填：https://<你的域名>/v1/qqbot/events
 # （QQ 官方要求 HTTPS 且能被公网访问；本机开发需要内网穿透。）
-echo "[dev_env] db=$LING_DATABASE_URL test_mode=$LING_TEST_MODE port=$LING_PORT"
 
 # ---------------------------------------------------------------- 本机私密配置
 # .data/ 已被 gitignore：里面的凭据不会入库。
@@ -95,3 +93,13 @@ echo "[dev_env] db=$LING_DATABASE_URL test_mode=$LING_TEST_MODE port=$LING_PORT"
 if [ -f .data/local_secrets.env ]; then
   . .data/local_secrets.env
 fi
+
+case "${LING_DATABASE_URL:-}" in
+  postgresql://*|postgresql+asyncpg://*) export LING_DATABASE_URL ;;
+  *)
+    echo "[dev_env] 请设置 LING_DATABASE_URL，使用 PostgreSQL 地址，格式为 postgresql:// 或 postgresql+asyncpg://。" >&2
+    echo "[dev_env] 若此前使用 SQLite，请先备份并确认数据迁移方案。" >&2
+    return 2 2>/dev/null || exit 2
+    ;;
+esac
+echo "[dev_env] 数据库地址已配置 test_mode=$LING_TEST_MODE port=$LING_PORT"

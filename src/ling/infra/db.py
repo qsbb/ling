@@ -1,7 +1,7 @@
 """基础设施：数据库引擎、会话工厂与迁移。
 
-PostgreSQL 是生产权威存储；本地开发允许 sqlite 以便零依赖启动，但
-``LING_REQUIRE_POSTGRES=1`` 时拒绝 sqlite，避免把开发库当成生产事实源。
+业务连接必须显式指向 PostgreSQL。历史兼容代码暂时保留，
+以便单独评估旧数据库数据的迁移与回退。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-from ling.config import Settings
+from ling.config import Settings, require_database_url
 
 
 class Base(DeclarativeBase):
@@ -35,9 +35,7 @@ _engine_settings: Settings | None = None
 def build_engine(
     settings: Settings, *, pool_size: int = 5, max_overflow: int = 5
 ) -> AsyncEngine:
-    url = settings.database_url
-    if settings.db_require_postgres and not settings.is_postgres:
-        raise RuntimeError("LING_REQUIRE_POSTGRES=1 但 LING_DATABASE_URL 不是 PostgreSQL")
+    url = require_database_url(settings.database_url)
     if url.startswith("sqlite"):
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         # sqlite 的默认 busy_timeout 是 **0**：第二个写入者立刻收到

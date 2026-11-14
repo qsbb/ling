@@ -12,9 +12,12 @@ import asyncio, os, sys
 
 async def main() -> int:
     import asyncpg
-    url = os.environ.get("LING_DATABASE_URL", "")
-    if not url:
-        print("[entrypoint] 缺少 LING_DATABASE_URL", file=sys.stderr)
+    from ling.config import require_database_url
+
+    try:
+        url = require_database_url(os.environ.get("LING_DATABASE_URL"))
+    except RuntimeError as exc:
+        print(f"[entrypoint] {exc}", file=sys.stderr)
         return 2
     dsn = url.replace("postgresql+asyncpg://", "postgresql://")
     for attempt in range(60):

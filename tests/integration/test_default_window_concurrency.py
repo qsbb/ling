@@ -5,12 +5,11 @@ import asyncio
 from contextlib import suppress
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api import deps
-from ling.config import Settings
 from ling.domains.conversation.service import ConversationService
-from ling.infra.db import build_engine, create_all_for_dev
+from ling.infra.db import get_session_factory
 from ling.infra.models import Window
 
 
@@ -67,21 +66,17 @@ async def test_concurrent_first_session_requests_share_one_window(logged_in, mon
         assert [window.id for window in windows] == [ids[0]]
 
 
-async def test_sqlite_concurrent_creation_and_subject_isolation(tmp_path):
-    """Separate SQLite connections must recheck after a concurrent commit."""
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'sessions.db'}",
-        data_dir=tmp_path, db_require_postgres=False,
-    )
-    engine = build_engine(settings)
-    await create_all_for_dev(engine)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+async def test_postgres_concurrent_creation_and_subject_isolation(logged_in):
+    """不同 PostgreSQL 连接在并发提交后复用会话，并隔离主体。"""
+    factory = get_session_factory()
     first_created = asyncio.Event()
     second_entered = asyncio.Event()
     release_first = asyncio.Event()
+    backend_pids = []
 
     async def create_first():
         async with factory() as session:
+            backend_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
             window = await ConversationService(session, persona_id="persona_test").ensure_default_window("subject_a")
             first_created.set()
             await release_first.wait()
@@ -90,6 +85,7 @@ async def test_sqlite_concurrent_creation_and_subject_isolation(tmp_path):
 
     async def create_second():
         async with factory() as session:
+            backend_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
             service = ConversationService(session, persona_id="persona_test")
             assert await service.list_windows("subject_a") == []
             second_entered.set()
@@ -98,12 +94,15 @@ async def test_sqlite_concurrent_creation_and_subject_isolation(tmp_path):
             return window.id
 
     first = asyncio.create_task(create_first())
+    second = None
     try:
         await asyncio.wait_for(first_created.wait(), 5)
         second = asyncio.create_task(create_second())
         try:
             await asyncio.wait_for(second_entered.wait(), 5)
+            assert len(set(backend_pids)) == 2
             await asyncio.sleep(0.2)
+            assert not second.done()
         finally:
             release_first.set()
         first_id, second_id = await asyncio.wait_for(asyncio.gather(first, second), 10)
@@ -121,10 +120,10 @@ async def test_sqlite_concurrent_creation_and_subject_isolation(tmp_path):
             ]
     finally:
         release_first.set()
-        if not first.done():
-            first.cancel()
-            await asyncio.gather(first, return_exceptions=True)
-        await engine.dispose()
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
 
 
 async def test_postgres_existing_window_and_other_subject(logged_in):

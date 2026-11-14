@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import subprocess
+import sys
 import uuid
 import warnings
 from collections import Counter, deque
@@ -314,6 +316,90 @@ def test_upgrade_head_creates_key_tables(migrated_db: MigratedDatabase) -> None:
     expected = {"turns", "messages", "config_revisions", "turn_controls"}
     missing = expected - tables
     assert not missing, f"upgrade head 后缺少表: {sorted(missing)}"
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+def test_migration_cli_uses_explicit_postgres(migrated_db: MigratedDatabase, driver: str) -> None:
+    env = os.environ.copy()
+    env["LING_DATABASE_URL"] = make_url(migrated_db.url).set(drivername=driver).render_as_string(hide_password=False)
+    env["LING_REQUIRE_POSTGRES"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-m", "ling.migrate", "upgrade"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "alembic upgrade head 完成" in result.stdout
+    assert _current_version(migrated_db.url) == migrated_db.head
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+def test_container_entrypoint_accepts_explicit_postgres(migrated_db: MigratedDatabase, driver: str) -> None:
+    env = os.environ.copy()
+    env["LING_DATABASE_URL"] = make_url(migrated_db.url).set(drivername=driver).render_as_string(hide_password=False)
+    env["LING_RUN_MIGRATIONS"] = "0"
+    env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(
+        ["bash", str(PROJECT_ROOT / "deploy/entrypoint.sh"), "migrate"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "数据库就绪" in result.stdout
+    assert "跳过迁移" in result.stdout
+    assert _current_version(migrated_db.url) == migrated_db.head
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+@pytest.mark.parametrize("mode", ["upgrade", "stamp"])
+def test_migration_cli_accepts_escaped_password_without_leaking_it(
+    migrated_db: MigratedDatabase, driver: str, mode: str
+) -> None:
+    password = "fake@password"
+    url = make_url(migrated_db.url).set(drivername=driver, password=password).render_as_string(
+        hide_password=False
+    )
+    assert "%40" in url
+    env = os.environ.copy()
+    env["LING_DATABASE_URL"] = url
+    env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-m", "ling.migrate", mode],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert password not in result.stdout + result.stderr
+    assert "fake%40password" not in result.stdout + result.stderr
+    assert _current_version(migrated_db.url) == migrated_db.head
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+async def test_engine_connects_with_supported_postgres_url(migrated_db: MigratedDatabase, driver: str) -> None:
+    from ling.config import Settings
+    from ling.infra.db import build_engine
+
+    url = make_url(migrated_db.url).set(drivername=driver).render_as_string(hide_password=False)
+    engine = build_engine(Settings(database_url=url))
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT 1")) == 1
+    finally:
+        await engine.dispose()
 
 
 def test_messages_unseen_partial_index_exists(migrated_db: MigratedDatabase) -> None:

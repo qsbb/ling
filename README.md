@@ -78,6 +78,10 @@ bash deploy/install.sh --down        # 停止（数据保留）
 PostgreSQL——`pgserver` 目前没有 3.13 的 wheel，所以 PostgreSQL 和运行 ling 的
 Python 是两份不同的解释器）。
 
+数据库地址需要显式配置。此前使用本地 SQLite 的用户应先备份旧文件及相关密钥，
+确认数据迁移与回退方案后再切换。下面的 PostgreSQL 示例不会自动导入旧数据。
+回退时保留旧版本、原数据库文件及其密钥，并恢复原有数据库配置。
+
 ```bash
 uv venv --python 3.13 .venv && . .venv/bin/activate
 uv pip install -e ".[dev]"
@@ -85,9 +89,13 @@ uv pip install -e ".[dev]"
 scripts/dev_pg.sh start                      # 便携 PostgreSQL，端口 55432（内部用 3.11）
 cd clients/web-console && pnpm install && pnpm build && cd ../..
 
+# 请先确认连接的是需要使用的数据库。
+export LING_DATABASE_URL='postgresql+asyncpg://ling@127.0.0.1:55432/ling'
 . scripts/dev_env.sh
 python -m ling                               # → http://127.0.0.1:8080
 ```
+
+连接地址支持 `postgresql://` 和 `postgresql+asyncpg://`。运行时使用 asyncpg 驱动，其他驱动格式会在启动前拒绝。
 
 默认 `LING_TEST_MODE=1`：对话由确定性 fake provider 生成，界面会固定显示测试模式提示。
 **测试模式不会调用真实模型**，用于开发与回归。

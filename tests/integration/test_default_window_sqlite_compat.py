@@ -1,6 +1,8 @@
-"""Existing local SQLite modes continue to serve a default session."""
+"""旧 SQLite 配置启动时得到明确提示，现存文件保持原样。"""
 
-import httpx
+import hashlib
+import sqlite3
+
 import pytest
 
 from ling.app import create_app
@@ -9,12 +11,16 @@ from ling.infra.db import dispose_engine
 
 
 @pytest.mark.parametrize("memory", [True, False], ids=["memory", "file"])
-async def test_local_sqlite_default_session_remains_available(tmp_path, memory):
-    database_url = (
-        "sqlite+aiosqlite:///:memory:"
-        if memory
-        else f"sqlite+aiosqlite:///{tmp_path / 'local.db'}"
-    )
+async def test_sqlite_app_startup_is_rejected_without_modifying_old_data(tmp_path, memory):
+    legacy = tmp_path / "local.db"
+    if memory:
+        database_url = "sqlite+aiosqlite:///:memory:"
+    else:
+        with sqlite3.connect(legacy) as connection:
+            connection.execute("CREATE TABLE user_data (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO user_data VALUES ('keep this data')")
+        before = hashlib.sha256(legacy.read_bytes()).digest()
+        database_url = f"sqlite+aiosqlite:///{legacy}"
     settings = Settings(
         env="test",
         database_url=database_url,
@@ -35,20 +41,10 @@ async def test_local_sqlite_default_session_remains_available(tmp_path, memory):
     await dispose_engine()
     app = create_app(settings)
     try:
-        async with (
-            app.router.lifespan_context(app),
-            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
-        ):
-            login = await client.post(
-                "/v1/auth/login", json={"username": "tester", "password": "tester-password"}
-            )
-            assert login.status_code == 200
-            first = await client.get("/v1/sessions")
-            assert first.status_code == 200
-            assert len(first.json()["sessions"]) == 1
-            session_id = first.json()["sessions"][0]["session_id"]
-            second = await client.get("/v1/sessions")
-            assert second.status_code == 200
-            assert [row["session_id"] for row in second.json()["sessions"]] == [session_id]
+        with pytest.raises(RuntimeError, match="LING_DATABASE_URL.*PostgreSQL"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("SQLite 配置不应启动应用")
     finally:
         await dispose_engine()
+    if not memory:
+        assert hashlib.sha256(legacy.read_bytes()).digest() == before
