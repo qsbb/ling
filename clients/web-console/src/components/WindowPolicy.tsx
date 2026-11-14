@@ -1,47 +1,213 @@
 import { useEffect, useState } from 'react';
 import '../window-policy.css';
-import { api, ApiError, type WindowDialoguePolicy, type WindowPolicyChange, type WindowPolicyPreview } from '../api';
+import {
+  api,
+  ApiError,
+  personaId,
+  type WindowDialoguePolicy,
+  type WindowDialoguePolicyField,
+  type WindowDialoguePolicyFields,
+  type WindowDialoguePolicyOriginStatus,
+  type WindowDialoguePolicySource,
+  type WindowDialoguePolicyValue,
+  type WindowPolicyChange,
+  type WindowPolicyPreview,
+} from '../api';
+import type { PersonaSummary } from '../types';
 
-type Selection = 'inherit' | 'allow' | 'require';
+type PolicyFieldState = WindowDialoguePolicyFields[WindowDialoguePolicyField];
 
-function selectionFor(override: boolean | null): Selection {
-  return override === null ? 'inherit' : override ? 'allow' : 'require';
+interface PolicyFieldDefinition {
+  key: WindowDialoguePolicyField;
+  label: string;
+  kind: 'persona' | 'boolean' | 'integer';
+  trueLabel?: string;
+  falseLabel?: string;
 }
 
-function changeFor(selection: Selection): WindowPolicyChange {
-  return selection === 'inherit'
-    ? { set: {}, clear: ['private_may_stay_silent'] }
-    : { set: { private_may_stay_silent: selection === 'allow' }, clear: [] };
-}
+const FIELDS: PolicyFieldDefinition[] = [
+  { key: 'persona_id', label: '人格', kind: 'persona' },
+  {
+    key: 'private_may_stay_silent',
+    label: '私聊可沉默',
+    kind: 'boolean',
+    trueLabel: '允许沉默',
+    falseLabel: '不允许选择沉默',
+  },
+  {
+    key: 'group_mention_requires_reply',
+    label: '群里被点名',
+    kind: 'boolean',
+    trueLabel: '必须回应',
+    falseLabel: '由模型决定',
+  },
+  {
+    key: 'group_attention_deferred',
+    label: '群聊判断',
+    kind: 'boolean',
+    trueLabel: '先进入队列',
+    falseLabel: '即时判断',
+  },
+  { key: 'group_turn_budget', label: '群聊发言预算', kind: 'integer' },
+  {
+    key: 'rest_may_skip',
+    label: '休息时',
+    kind: 'boolean',
+    trueLabel: '允许跳过',
+    falseLabel: '仍会判断',
+  },
+];
+
+const EMPTY_SELECTIONS = Object.fromEntries(FIELDS.map(({ key }) => [key, 'inherit'])) as Record<WindowDialoguePolicyField, string>;
 
 function errorText(error: unknown): string {
   return error instanceof ApiError ? error.message : '无法连接服务端，请稍后重试';
 }
 
+function fieldState(
+  policy: { fields: WindowDialoguePolicyFields },
+  key: WindowDialoguePolicyField,
+): PolicyFieldState {
+  return policy.fields[key];
+}
+
+function originStatus(policy: WindowDialoguePolicy): WindowDialoguePolicyOriginStatus {
+  return policy.origin_status;
+}
+
+function sessionOverride(field: PolicyFieldState): { hasOverride: boolean; value: WindowDialoguePolicyValue } {
+  return { hasOverride: field.has_session_override, value: field.session_override };
+}
+
+function selectionFor(field: PolicyFieldState, definition: PolicyFieldDefinition): string {
+  const current = sessionOverride(field);
+  if (!current.hasOverride) return 'inherit';
+  if (definition.kind === 'persona') {
+    return current.value === null ? 'persona:none' : `persona:${String(current.value)}`;
+  }
+  if (definition.kind === 'boolean') return current.value === true ? 'value:true' : 'value:false';
+  return `value:${String(current.value)}`;
+}
+
+function sourceLabel(source: WindowDialoguePolicySource): string {
+  if (source === 'session') return '本会话';
+  if (source === 'instance') return '平台实例';
+  return '全局';
+}
+
+function personaName(id: string | null, personas: PersonaSummary[]): string {
+  if (id === null) return '不注入人格';
+  const persona = personas.find((item) => personaId(item) === id);
+  return persona?.display_name?.trim() || persona?.name?.trim() || id;
+}
+
+function valueLabel(
+  definition: PolicyFieldDefinition,
+  value: WindowDialoguePolicyValue,
+  personas: PersonaSummary[],
+): string {
+  if (definition.kind === 'persona') return personaName(typeof value === 'string' ? value : null, personas);
+  if (definition.kind === 'integer') return `${String(value)} 次`;
+  return value === true ? definition.trueLabel ?? '开启' : definition.falseLabel ?? '关闭';
+}
+
+function selectionValue(
+  definition: PolicyFieldDefinition,
+  selection: string,
+): { inherited: true } | { inherited: false; value: WindowDialoguePolicyValue } {
+  if (selection === 'inherit') return { inherited: true };
+  if (definition.kind === 'persona') {
+    return selection === 'persona:none'
+      ? { inherited: false, value: null }
+      : { inherited: false, value: selection.slice('persona:'.length) };
+  }
+  if (definition.kind === 'boolean') return { inherited: false, value: selection === 'value:true' };
+  return { inherited: false, value: Number(selection.slice('value:'.length)) };
+}
+
+function changeFor(
+  policy: WindowDialoguePolicy,
+  selections: Record<WindowDialoguePolicyField, string>,
+): WindowPolicyChange {
+  const set: WindowPolicyChange['set'] = {};
+  const clear: WindowDialoguePolicyField[] = [];
+
+  for (const definition of FIELDS) {
+    const current = sessionOverride(fieldState(policy, definition.key));
+    const selected = selectionValue(definition, selections[definition.key]);
+    if (selected.inherited) {
+      if (current.hasOverride) clear.push(definition.key);
+    } else if (!current.hasOverride || selected.value !== current.value) {
+      Object.assign(set, { [definition.key]: selected.value });
+    }
+  }
+
+  return { set, clear };
+}
+
+function changedFields(change: WindowPolicyChange): WindowDialoguePolicyField[] {
+  const setFields = FIELDS
+    .filter(({ key }) => Object.hasOwn(change.set, key))
+    .map(({ key }) => key);
+  return [...setFields, ...change.clear];
+}
+
+function personaOptions(policy: WindowDialoguePolicy, personas: PersonaSummary[]): Array<{ value: string; label: string }> {
+  const options = new Map<string, string>();
+  for (const persona of personas) {
+    const id = personaId(persona);
+    if (id) options.set(id, persona.display_name?.trim() || persona.name?.trim() || id);
+  }
+
+  const field = fieldState(policy, 'persona_id');
+  const knownIds = [field.global_value, field.effective, field.session_override, field.instance_override];
+  for (const value of knownIds) {
+    if (typeof value === 'string' && value && !options.has(value)) options.set(value, value);
+  }
+
+  return [...options].map(([id, label]) => ({ value: `persona:${id}`, label }));
+}
+
 export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
   const [policy, setPolicy] = useState<WindowDialoguePolicy | null>(null);
-  const [selection, setSelection] = useState<Selection>('inherit');
+  const [selections, setSelections] = useState(EMPTY_SELECTIONS);
+  const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   const [preview, setPreview] = useState<WindowPolicyPreview | null>(null);
+  const [previewChange, setPreviewChange] = useState<WindowPolicyChange | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [personaError, setPersonaError] = useState('');
 
   useEffect(() => {
     let active = true;
     api.windowDialoguePolicy(sessionId).then((result) => {
       if (!active) return;
       setPolicy(result);
-      setSelection(selectionFor(result.override));
+      setSelections(Object.fromEntries(
+        FIELDS.map((definition) => [definition.key, selectionFor(fieldState(result, definition.key), definition)]),
+      ) as Record<WindowDialoguePolicyField, string>);
     }).catch((reason: unknown) => {
       if (active) setError(errorText(reason));
+    });
+    api.listPersonas().then((result) => {
+      if (active) setPersonas(result.items);
+    }).catch((reason: unknown) => {
+      if (active) setPersonaError(errorText(reason));
     });
     return () => { active = false; };
   }, [sessionId]);
 
-  async function previewChange() {
+  const change = policy ? changeFor(policy, selections) : null;
+  const canPreview = change !== null && changedFields(change).length > 0;
+
+  async function previewPolicy() {
+    if (!change || !canPreview) return;
     setBusy(true);
     setError('');
     try {
-      setPreview(await api.previewWindowPolicy(sessionId, changeFor(selection)));
+      const result = await api.previewWindowPolicy(sessionId, change);
+      setPreviewChange(change);
+      setPreview(result);
     } catch (reason) {
       setError(errorText(reason));
     } finally {
@@ -50,50 +216,117 @@ export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClos
   }
 
   async function save() {
-    if (!preview) return;
+    if (!preview || !previewChange) return;
     setBusy(true);
     setError('');
     try {
-      const saved = await api.saveWindowPolicy(sessionId, changeFor(selection), preview.preview_token);
+      const saved = await api.saveWindowPolicy(sessionId, previewChange, preview.preview_token);
       setPolicy(saved);
-      setSelection(selectionFor(saved.override));
+      setSelections(Object.fromEntries(
+        FIELDS.map((definition) => [definition.key, selectionFor(fieldState(saved, definition.key), definition)]),
+      ) as Record<WindowDialoguePolicyField, string>);
       setPreview(null);
+      setPreviewChange(null);
     } catch (reason) {
       setPreview(null);
+      setPreviewChange(null);
       setError(errorText(reason));
     } finally {
       setBusy(false);
     }
   }
 
+  function updateSelection(key: WindowDialoguePolicyField, value: string) {
+    setSelections((current) => ({ ...current, [key]: value }));
+    setPreview(null);
+    setPreviewChange(null);
+  }
+
   return (
     <section className="window-policy" aria-label="会话设置">
       <div className="window-policy__heading">
-        <strong>会话设置</strong>
+        <strong>
+          会话设置
+          {policy && originStatus(policy) === 'unknown' ? <span> · 平台实例来源未知</span> : null}
+        </strong>
         <button type="button" className="ghost-button" onClick={onClose}>关闭</button>
       </div>
       {policy ? (
         <>
-          <label htmlFor="window-policy-silence">私聊回应</label>
-          <select id="window-policy-silence" value={selection} disabled={busy}
-            onChange={(event) => { setSelection(event.target.value as Selection); setPreview(null); }}>
-            <option value="inherit">跟随全局设置</option>
-            <option value="allow">允许选择沉默</option>
-            <option value="require">优先回应</option>
-          </select>
-          <p>当前{policy.effective ? '允许选择沉默' : '优先回应'} · {policy.source === 'global' ? '来自全局设置' : '本会话设置'}</p>
+          <div aria-label="对话规则">
+            {FIELDS.map((definition) => {
+              const field = fieldState(policy, definition.key);
+              const id = `window-policy-${definition.key}`;
+              return (
+                <div key={definition.key} style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, 1fr) minmax(0, min(24rem, 45%))',
+                  width: '100%',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  padding: '0.4rem 0',
+                  borderBottom: '1px solid var(--border, #ded6c8)',
+                }}>
+                  <div>
+                    <label htmlFor={id}>{definition.label}</label>
+                    <output style={{ display: 'block', color: 'var(--text-muted, #766e61)', fontSize: '0.85rem' }}>
+                      {valueLabel(definition, field.effective, personas)} · {sourceLabel(field.source)}
+                    </output>
+                  </div>
+                  <select
+                    id={id}
+                    value={selections[definition.key]}
+                    disabled={busy}
+                    onChange={(event) => updateSelection(definition.key, event.target.value)}
+                  >
+                    <option value="inherit">继承上层</option>
+                    {definition.kind === 'persona' ? (
+                      <>
+                        <option value="persona:none">不注入人格</option>
+                        {personaOptions(policy, personas).map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </>
+                    ) : definition.kind === 'boolean' ? (
+                      <>
+                        <option value="value:true">{definition.trueLabel}</option>
+                        <option value="value:false">{definition.falseLabel}</option>
+                      </>
+                    ) : Array.from({ length: 20 }, (_, index) => index + 1).map((value) => (
+                      <option key={value} value={`value:${value}`}>{value} 次</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
           {preview ? (
-            <div className="window-policy__preview">
-              <p>保存后，本会话{preview.proposed.effective ? '允许选择沉默' : '优先回应'}，{preview.proposed.source === 'global' ? '跟随全局设置' : '使用本会话设置'}。</p>
+            <div className="window-policy__preview" role="status">
+              <ul style={{ flexBasis: '100%', margin: 0, paddingLeft: '1.2rem' }}>
+                {changedFields(previewChange ?? { set: {}, clear: [] }).map((key) => {
+                  const definition = FIELDS.find((item) => item.key === key);
+                  if (!definition) return null;
+                  const current = fieldState(preview.current, key);
+                  const proposed = fieldState(preview.proposed, key);
+                  return (
+                    <li key={key}>
+                      <strong>{definition.label}</strong>{' '}
+                      {valueLabel(definition, current.effective, personas)} · {sourceLabel(current.source)}{' → '}
+                      {valueLabel(definition, proposed.effective, personas)} · {sourceLabel(proposed.source)}
+                    </li>
+                  );
+                })}
+              </ul>
               <button type="button" className="button button--primary button--small" disabled={busy} onClick={() => void save()}>确认保存</button>
-              <button type="button" className="button button--small" disabled={busy} onClick={() => setPreview(null)}>返回修改</button>
+              <button type="button" className="button button--small" disabled={busy} onClick={() => { setPreview(null); setPreviewChange(null); }}>返回修改</button>
             </div>
           ) : (
-            <button type="button" className="button button--small" disabled={busy || selection === selectionFor(policy.override)} onClick={() => void previewChange()}>预览影响</button>
+            <button type="button" className="button button--small" disabled={busy || !canPreview} onClick={() => void previewPolicy()}>预览更改</button>
           )}
         </>
       ) : !error ? <p>正在读取会话设置…</p> : null}
       {error ? <p role="alert">{error}</p> : null}
+      {personaError ? <p role="alert">{personaError}</p> : null}
     </section>
   );
 }

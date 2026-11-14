@@ -396,19 +396,92 @@ export interface WindowDialoguePolicy {
   global_value: boolean;
   override: boolean | null;
   effective: boolean;
-  source: 'global' | 'session';
+  source: WindowDialoguePolicySource;
+  fields: WindowDialoguePolicyFields;
+  origin_status: WindowDialoguePolicyOriginStatus;
+  instance_scope: 'onebot' | 'qqbot' | null;
+  instance_id: string | null;
   global_revision: number;
+  instance_revision: number;
   session_revision: number;
 }
 
+export type WindowDialoguePolicyField =
+  | 'persona_id'
+  | 'private_may_stay_silent'
+  | 'group_mention_requires_reply'
+  | 'group_attention_deferred'
+  | 'group_turn_budget'
+  | 'rest_may_skip';
+
+export type WindowDialoguePolicySource = 'global' | 'instance' | 'session';
+export type WindowDialoguePolicyOriginStatus = 'known' | 'unknown' | 'not_applicable';
+
+export interface WindowDialoguePolicyPersonaField {
+  global_value: string | null;
+  instance_override: string | null;
+  has_instance_override: boolean;
+  session_override: string | null;
+  has_session_override: boolean;
+  effective: string | null;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyBooleanField {
+  global_value: boolean;
+  instance_override: boolean | null;
+  has_instance_override: boolean;
+  session_override: boolean | null;
+  has_session_override: boolean;
+  effective: boolean;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyIntegerField {
+  global_value: number;
+  instance_override: number | null;
+  has_instance_override: boolean;
+  session_override: number | null;
+  has_session_override: boolean;
+  effective: number;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyFields {
+  persona_id: WindowDialoguePolicyPersonaField;
+  private_may_stay_silent: WindowDialoguePolicyBooleanField;
+  group_mention_requires_reply: WindowDialoguePolicyBooleanField;
+  group_attention_deferred: WindowDialoguePolicyBooleanField;
+  group_turn_budget: WindowDialoguePolicyIntegerField;
+  rest_may_skip: WindowDialoguePolicyBooleanField;
+}
+
+export type WindowDialoguePolicyValue = boolean | number | string | null;
+
+export interface WindowDialoguePolicySet {
+  persona_id?: string | null;
+  private_may_stay_silent?: boolean;
+  group_mention_requires_reply?: boolean;
+  group_attention_deferred?: boolean;
+  group_turn_budget?: number;
+  rest_may_skip?: boolean;
+}
+
 export interface WindowPolicyChange {
-  set: { private_may_stay_silent?: boolean };
-  clear: 'private_may_stay_silent'[];
+  set: WindowDialoguePolicySet;
+  clear: WindowDialoguePolicyField[];
+}
+
+export interface WindowDialoguePolicyProposed {
+  override: boolean | null;
+  effective: boolean;
+  source: WindowDialoguePolicySource;
+  fields: WindowDialoguePolicyFields;
 }
 
 export interface WindowPolicyPreview {
   current: WindowDialoguePolicy;
-  proposed: { override: boolean | null; effective: boolean; source: 'global' | 'session' };
+  proposed: WindowDialoguePolicyProposed;
   preview_token: string;
   expires_at: number;
 }
