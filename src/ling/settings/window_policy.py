@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import select, text, update
 
 from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import DialogueConfigGuard, Window, WindowDialogueOverride, utcnow
+from ling.settings.conversation_inheritance import (
+    ResolvedConversationSettings,
+    resolve_conversation_settings,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,16 +25,19 @@ if TYPE_CHECKING:
 async def lock_dialogue_config(session: AsyncSession, *, changed: bool = False) -> None:
     """串行化短事务中的全局发布、预览、保存和运行时解析。"""
     dialect = session.get_bind().dialect.name
+    statement: Any
     if dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert
+        from sqlalchemy.dialects.postgresql import insert as postgres_insert
+
+        statement = postgres_insert(DialogueConfigGuard).values(id=1, generation=0)
     elif dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        statement = sqlite_insert(DialogueConfigGuard).values(id=1, generation=0)
     else:
         raise RuntimeError(f"不支持的数据库类型: {dialect}")
     await session.execute(
-        insert(DialogueConfigGuard)
-        .values(id=1, generation=0)
-        .on_conflict_do_nothing(index_elements=[DialogueConfigGuard.id])
+        statement.on_conflict_do_nothing(index_elements=[DialogueConfigGuard.id])
     )
     # SQLite 的 SELECT FOR UPDATE 不提供互斥，UPDATE 在两种数据库中都持锁至提交。
     await session.execute(
@@ -49,11 +56,19 @@ class WindowPolicySnapshot:
     generation: int
 
     @property
-    def value(self) -> bool:
-        return self.global_value if self.override is None else self.override
+    def resolved(self) -> ResolvedConversationSettings:
+        overrides = (
+            {} if self.override is None else {"private_may_stay_silent": self.override}
+        )
+        return resolve_conversation_settings(self.config, session_overrides=overrides)
 
     @property
-    def source(self) -> str:
+    def value(self) -> bool:
+        return self.resolved.private_may_stay_silent.value
+
+    @property
+    def source(self) -> Literal["global", "session"]:
+        # Web has no instance layer.
         return "global" if self.override is None else "session"
 
 
@@ -75,13 +90,7 @@ async def locked_window_policy(
 
 def apply_window_policy(snapshot: WindowPolicySnapshot) -> EffectiveConfig:
     """得到本次处理使用的全局配置副本。"""
-    return replace(
-        snapshot.config,
-        dialogue=replace(
-            snapshot.config.dialogue,
-            private_may_stay_silent=snapshot.value,
-        ),
-    )
+    return snapshot.resolved.apply_dialogue(snapshot.config)
 
 
 async def policy_window(
