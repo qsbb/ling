@@ -618,9 +618,7 @@ class ContextCompiler:
 
         if persona_empty:
             logger.warning(
-                "人设为空：本轮提示词里没有人设，也没有角色名/叙事边界/场景提示"
-                "（persona_id=%s）。这不是注入链路故障——去「人设」页新建一个人设"
-                "即生效；功能层（工具、记忆、知识、媒体、状态、关系）不受影响",
+                "本轮未注入人设（persona_id=%s），可检查人设内容或人设读取失败日志",
                 persona.persona_id or self._persona_id,
             )
         else:

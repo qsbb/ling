@@ -64,15 +64,15 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _coordinator(request: Request, settings: SettingsDep, router_: RouterDep) -> TurnCoordinator:
+def _coordinator(
+    request: Request, settings: SettingsDep, router_: RouterDep, *, persona_id: str | None = None
+) -> TurnCoordinator:
     return TurnCoordinator(
         router=router_,
         settings=settings,
         actor_id=settings.actor_id,
-        # ``None`` = 本轮用**当前激活**的人格（`domains/persona/current.py`）。
-        # 原来是 `settings.persona_id`（环境变量），在设置里切了人格之后
-        # Web 对话仍然按旧人设跑——而且不会报错。
-        persona_id=None,
+        # 未传快照的调用方继续在本轮解析当前激活的人格。
+        persona_id=persona_id,
         cancels=request.app.state.cancels,
         arbiter=getattr(request.app.state, "arbiter", None),
         stream_log=getattr(request.app.state, "stream_log", None),
@@ -125,6 +125,7 @@ async def _choose_by_autonomy(
     actor_id: str,
     window_id: str,
     subject_id: str,
+    persona_id: str | None = None,
 ) -> TurnChoice:
     """Web 路径的「回不回」——与 QQ 用**同一个**选择器。
 
@@ -149,7 +150,7 @@ async def _choose_by_autonomy(
         ),
         persona_reader=make_persona_reader(
             config_session,
-            persona_id=None,  # None = 当前激活的人格
+            persona_id=persona_id,
             scenario=scenario_key_for(ctx),  # type: ignore[arg-type]
         ),
     ).choose(ctx, text=text)  # type: ignore[arg-type]
@@ -164,6 +165,7 @@ async def _evaluate_turn_decision(
     *,
     config_session: object,
     actor_id: str,
+    persona_id: str | None = None,
 ) -> TurnChoice:
     """计算本轮接话决策。
 
@@ -203,6 +205,7 @@ async def _evaluate_turn_decision(
         actor_id=actor_id,
         window_id=window_id,
         subject_id=subject_id,
+        persona_id=persona_id,
     )
 
 
@@ -854,10 +857,13 @@ async def send_transcribed_turn(
     await _refresh_config_if_stale(request)
     window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
     decision_config: ConfigReader
+    persona_id: str | None = None
     if window.channel == "web" and window.visibility == "subject_private":
-        from ling.settings.window_policy import FixedConfigReader, runtime_window_config
+        from ling.settings.window_policy import FixedConfigReader, runtime_window_snapshot
 
-        effective = await runtime_window_config(config, window.id)
+        snapshot = await runtime_window_snapshot(config, window.id)
+        effective = snapshot.config
+        persona_id = snapshot.persona
         decision_config = FixedConfigReader(effective)
     else:
         effective = await config.effective()
@@ -935,6 +941,7 @@ async def send_transcribed_turn(
         decision_config,
         config_session=conversation.session,
         actor_id=settings.actor_id,
+        persona_id=persona_id,
     )
 
     turn = await conversation.create_turn(
@@ -1044,7 +1051,7 @@ async def send_transcribed_turn(
         )
     # 轮次任务使用自己的数据库会话：必须先提交请求会话，否则后台看不到 turn 行
     await conversation.session.commit()
-    coordinator = _coordinator(request, settings, router_)
+    coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
     queue = await coordinator.run_turn(
         window_id=window.id,
         subject_id=auth.user.subject_id,
@@ -1290,10 +1297,13 @@ async def retry_turn(
             turn_id, from_states={TurnState.stopping}, to_state=TurnState.stopped
         )
 
+    persona_id: str | None = None
     if window.channel == "web" and window.visibility == "subject_private":
-        from ling.settings.window_policy import runtime_window_config
+        from ling.settings.window_policy import runtime_window_snapshot
 
-        effective = await runtime_window_config(config, window.id)
+        snapshot = await runtime_window_snapshot(config, window.id)
+        effective = snapshot.config
+        persona_id = snapshot.persona
     else:
         effective = await config.effective()
     messages = await conversation.list_messages(window.id, limit=400)
@@ -1312,7 +1322,7 @@ async def retry_turn(
     new_attempt = int(bumped.attempt or 1)
     await conversation.session.commit()
 
-    coordinator = _coordinator(request, settings, router_)
+    coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
     queue = await coordinator.run_turn(
         window_id=window.id,
         subject_id=auth.user.subject_id,

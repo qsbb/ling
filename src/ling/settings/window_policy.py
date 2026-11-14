@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -9,6 +10,7 @@ from sqlalchemy import select, text, update
 
 from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ErrorCode
+from ling.domains.persona.service import PersonaService, PersonaSnapshot
 from ling.infra.models import DialogueConfigGuard, Window, WindowDialogueOverride, utcnow
 from ling.settings.conversation_inheritance import (
     ResolvedConversationSettings,
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
 
     from ling.ports.config import EffectiveConfig
     from ling.settings.service import ConfigService
+
+logger = logging.getLogger(__name__)
 
 
 async def lock_dialogue_config(session: AsyncSession, *, changed: bool = False) -> None:
@@ -153,8 +157,14 @@ class FixedConfigReader:
         return self.config
 
 
-async def runtime_window_config(config: ConfigService, window_id: str) -> EffectiveConfig:
-    """用独立短事务固定配置，避免模型调用时持有配置锁。"""
+@dataclass(frozen=True)
+class RuntimeWindowSnapshot:
+    config: EffectiveConfig
+    persona: PersonaSnapshot
+
+
+async def runtime_window_snapshot(config: ConfigService, window_id: str) -> RuntimeWindowSnapshot:
+    """在同一短事务中固定配置与人格，不在模型调用期间持有事务。"""
     from ling.infra.db import session_scope
 
     async with session_scope() as session:
@@ -166,4 +176,19 @@ async def runtime_window_config(config: ConfigService, window_id: str) -> Effect
         else:
             raise RuntimeError(f"不支持的数据库类型: {dialect}")
         snapshot = await locked_window_policy(session, config.with_session(session), window_id)
-        return apply_window_policy(snapshot)
+        effective = apply_window_policy(snapshot)
+        persona = PersonaSnapshot(str(effective.persona_id or ""))
+        try:
+            # Persona 读取失败不应破坏配置读取事务，也不应让本轮后续动态换人格。
+            async with session.begin_nested():
+                await PersonaService(session, persona).get_or_none(persona)
+        except Exception:  # noqa: BLE001 - 人格不可读时本轮按无人格处理
+            persona.view = None
+            persona.view_loaded = True
+            logger.info("读取会话人格失败（本轮按无人格处理）")
+        return RuntimeWindowSnapshot(config=effective, persona=persona)
+
+
+async def runtime_window_config(config: ConfigService, window_id: str) -> EffectiveConfig:
+    """兼容只需要会话生效配置的调用方。"""
+    return (await runtime_window_snapshot(config, window_id)).config
