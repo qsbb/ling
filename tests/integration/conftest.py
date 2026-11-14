@@ -17,10 +17,11 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from ling.app import create_app
-from ling.config import Settings
+from ling.config import Settings, require_database_url
 from ling.infra.db import dispose_engine, init_engine
 
 TEST_DB_URL = os.environ.get(
@@ -41,13 +42,26 @@ class TestEnv:
     subject_id: str = ""
 
 
+def _local_test_database_url() -> str:
+    try:
+        database_url = require_database_url(TEST_DB_URL)
+    except RuntimeError:
+        pytest.fail("W0 测试必须使用本机 ling_test PostgreSQL 测试库", pytrace=False)
+    url = make_url(database_url)
+    if (
+        url.host not in {"127.0.0.1", "localhost", "::1"}
+        or url.database != "ling_test"
+    ):
+        pytest.fail("W0 测试必须使用本机 ling_test PostgreSQL 测试库", pytrace=False)
+    return database_url
+
+
 @pytest_asyncio.fixture(scope="function")
 async def web_env(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestEnv]:
-    if not TEST_DB_URL.startswith("postgresql"):
-        pytest.skip("W0 需要真实 PostgreSQL：设置 LING_TEST_DATABASE_URL")
+    database_url = _local_test_database_url()
 
     schema = f"t_{uuid.uuid4().hex[:12]}"
-    admin_url = TEST_DB_URL
+    admin_url = database_url
     admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     async with admin_engine.connect() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
@@ -55,7 +69,7 @@ async def web_env(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestEnv]:
 
     settings = Settings(
         env="test",
-        database_url=TEST_DB_URL,
+        database_url=database_url,
         db_search_path=schema,
         data_dir=__import__("pathlib").Path(f"/tmp/ling-test-{schema}"),
         bootstrap_admin_user="tester",

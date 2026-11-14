@@ -1920,16 +1920,13 @@ class MediaReadJob(Base):
         UniqueConstraint(
             "actor_id", "window_id", "request_key", name="uq_media_read_job_request"
         ),
-        # 在途互斥（部分唯一索引）。`postgresql_where` 让 SQLite 之类的方言
-        # 仍能建表（本项目生产用 PG，测试库也是 PG，但迁移可回滚性依赖方言
-        # 不报错）。
+        # 在途互斥（PostgreSQL 部分唯一索引）。
         Index(
             "uq_media_read_job_active_evidence",
             "evidence_id",
             "tool_version",
             unique=True,
             postgresql_where=text("state IN ('pending', 'running')"),
-            sqlite_where=text("state IN ('pending', 'running')"),
         ),
         Index("ix_media_read_jobs_actor_window", "actor_id", "window_id"),
         # 清理任务（第 3 步）按 state + deadline 扫过期/失联作业。
@@ -2381,8 +2378,7 @@ class ScheduleIntentionRow(Base, TimestampMixin):
             "target_end_day >= target_start_day",
             name="ck_schedule_intentions_window",
         ),
-        # 目标跨度 ≤ 90 天（设计 §6）。写成减法而不是 `date + 90`：Date 加整数
-        # 在 PostgreSQL 是"加天数"，但在 sqlite/其它方言里没有同义语义。
+        # 目标跨度 ≤ 90 天（设计 §6）。
         CheckConstraint(
             "target_end_day - target_start_day <= 90",
             name="ck_schedule_intentions_span",

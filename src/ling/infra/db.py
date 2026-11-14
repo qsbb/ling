@@ -1,15 +1,10 @@
-"""基础设施：数据库引擎、会话工厂与迁移。
-
-业务连接必须显式指向 PostgreSQL。历史兼容代码暂时保留，
-以便单独评估旧数据库数据的迁移与回退。
-"""
+"""PostgreSQL 引擎、会话工厂与迁移入口。"""
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -36,36 +31,6 @@ def build_engine(
     settings: Settings, *, pool_size: int = 5, max_overflow: int = 5
 ) -> AsyncEngine:
     url = require_database_url(settings.database_url)
-    if url.startswith("sqlite"):
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
-        # sqlite 的默认 busy_timeout 是 **0**：第二个写入者立刻收到
-        # `database is locked`，而不是等前者提交。本地开发/单机部署里
-        # 这几乎必然发生——额度记账就正好撞在一轮对话的事务还没提交时，
-        # 于是记账失败、用量永远显示 0。
-        #
-        # 给 5 秒等待窗口即可：写账是几十毫秒的事，等一等就能成功，
-        # 而真出现长时间持锁（例如另一个进程在跑迁移）时仍会失败，
-        # 那时失败是**对的**——不该无限期卡住回复。
-        # WAL 是这里的关键：默认的 rollback journal 下，一个长事务（一轮对话
-        # 从开始到提交）会把**所有**写入者挡在门外，而额度记账恰好发生在
-        # 这轮事务还没提交的时候。开 WAL 后读不再阻塞写，写入者只需等彼此，
-        # 配合上面的 busy_timeout 就能排上队。
-        engine = create_async_engine(
-            url, future=True, pool_pre_ping=True, connect_args={"timeout": 5.0}
-        )
-
-        from sqlalchemy import event
-
-        @event.listens_for(engine.sync_engine, "connect")
-        def _sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            # 记账必须真的落盘：进程崩掉时丢的应该是最后一轮的估算值，
-            # 而不是整天的账。
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.close()
-
-        return engine
     connect_args: dict[str, object] = {}
     if settings.db_search_path:
         connect_args["server_settings"] = {"search_path": settings.db_search_path}
@@ -121,12 +86,6 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
-def is_sqlite_memory_database(settings: Settings) -> bool:
-    """SQLite 内存库无法由不同引擎共享，需沿用调用方事务。"""
-    url = make_url(settings.database_url)
-    return url.get_backend_name() == "sqlite" and url.database in {None, "", ":memory:"}
-
-
 @asynccontextmanager
 async def independent_session_scope() -> AsyncIterator[AsyncSession]:
     """短事务用独立连接池，避免等待自身已占满的请求连接池。"""
@@ -134,8 +93,6 @@ async def independent_session_scope() -> AsyncIterator[AsyncSession]:
     if _engine is None or _engine_settings is None:
         raise RuntimeError("数据库尚未初始化：先调用 init_engine()")
     if _independent_session_factory is None:
-        if is_sqlite_memory_database(_engine_settings):
-            raise RuntimeError("SQLite 内存数据库无法提供独立事务，请使用文件数据库或 PostgreSQL")
         _independent_engine = build_engine(_engine_settings, pool_size=1, max_overflow=0)
         _independent_session_factory = async_sessionmaker(
             _independent_engine, expire_on_commit=False
@@ -151,11 +108,8 @@ async def independent_session_scope() -> AsyncIterator[AsyncSession]:
 
 @asynccontextmanager
 async def short_session_scope() -> AsyncIterator[AsyncSession]:
-    """短事务避开请求池；私有 SQLite 内存库保持原有连接语义。"""
-    if _engine_settings is None:
-        raise RuntimeError("数据库尚未初始化：先调用 init_engine()")
-    scope = session_scope if is_sqlite_memory_database(_engine_settings) else independent_session_scope
-    async with scope() as session:
+    """短事务使用独立连接池，避免等待自身已占满的请求连接池。"""
+    async with independent_session_scope() as session:
         yield session
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select, text, update
 
@@ -29,21 +29,14 @@ logger = logging.getLogger(__name__)
 async def lock_dialogue_config(session: AsyncSession, *, changed: bool = False) -> None:
     """串行化短事务中的全局发布、预览、保存和运行时解析。"""
     dialect = session.get_bind().dialect.name
-    statement: Any
-    if dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as postgres_insert
-
-        statement = postgres_insert(DialogueConfigGuard).values(id=1, generation=0)
-    elif dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-        statement = sqlite_insert(DialogueConfigGuard).values(id=1, generation=0)
-    else:
+    if dialect != "postgresql":
         raise RuntimeError(f"不支持的数据库类型: {dialect}")
+    from sqlalchemy.dialects.postgresql import insert as postgres_insert
+
+    statement = postgres_insert(DialogueConfigGuard).values(id=1, generation=0)
     await session.execute(
         statement.on_conflict_do_nothing(index_elements=[DialogueConfigGuard.id])
     )
-    # SQLite 的 SELECT FOR UPDATE 不提供互斥，UPDATE 在两种数据库中都持锁至提交。
     await session.execute(
         update(DialogueConfigGuard)
         .where(DialogueConfigGuard.id == 1)
@@ -168,13 +161,9 @@ async def runtime_window_snapshot(config: ConfigService, window_id: str) -> Runt
     from ling.infra.db import short_session_scope
 
     async with short_session_scope() as session:
-        dialect = session.get_bind().dialect.name
-        if dialect == "postgresql":
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        elif dialect == "sqlite":
-            await session.execute(text("BEGIN"))
-        else:
-            raise RuntimeError(f"不支持的数据库类型: {dialect}")
+        if session.get_bind().dialect.name != "postgresql":
+            raise RuntimeError("会话配置快照需要 PostgreSQL")
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         snapshot = await locked_window_policy(session, config.with_session(session), window_id)
         effective = apply_window_policy(snapshot)
         persona = PersonaSnapshot(str(effective.persona_id or ""))

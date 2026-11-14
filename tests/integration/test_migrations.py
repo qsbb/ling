@@ -322,7 +322,6 @@ def test_upgrade_head_creates_key_tables(migrated_db: MigratedDatabase) -> None:
 def test_migration_cli_uses_explicit_postgres(migrated_db: MigratedDatabase, driver: str) -> None:
     env = os.environ.copy()
     env["LING_DATABASE_URL"] = make_url(migrated_db.url).set(drivername=driver).render_as_string(hide_password=False)
-    env["LING_REQUIRE_POSTGRES"] = "1"
     env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(

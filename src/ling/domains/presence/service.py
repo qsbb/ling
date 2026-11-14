@@ -32,7 +32,6 @@ from ling.ports.config import LifePolicy
 
 if TYPE_CHECKING:
     from sqlalchemy.dialects.postgresql.dml import Insert as PostgreSQLInsert
-    from sqlalchemy.dialects.sqlite.dml import Insert as SQLiteInsert
 
 # 场景状态。``unknown`` 是**合法且常用**的答案：
 # 没有证据时就说不知道，不硬编一个"我在看书"。
@@ -244,21 +243,11 @@ class PresenceService:
             "settled_at": utcnow(),
             "revision": 0,
         }
-        dialect = self._session.get_bind().dialect.name
-        statement: PostgreSQLInsert | SQLiteInsert
-        if dialect == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+        if self._session.get_bind().dialect.name != "postgresql":
+            raise RuntimeError("状态初始化需要 PostgreSQL")
+        from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
-            statement = postgresql_insert(PresenceState)
-        elif dialect == "sqlite":
-            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-            statement = sqlite_insert(PresenceState)
-        else:
-            row = PresenceState(**values)
-            self._session.add(row)
-            await self._session.flush()
-            return row
+        statement: PostgreSQLInsert = postgresql_insert(PresenceState)
 
         # A concurrent transaction may have inserted this actor after our read.
         # Keep its values and leave the transaction boundary to the caller.

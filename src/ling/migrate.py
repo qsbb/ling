@@ -71,9 +71,6 @@ async def _alembic_available() -> bool:
 
 async def upgrade() -> int:
     settings = get_settings()
-    if settings.db_require_postgres and not settings.is_postgres:
-        print("[migrate] 拒绝在非 PostgreSQL 上执行生产迁移", file=sys.stderr)
-        return 2
     engine = init_engine(settings)
     if await _alembic_available():
         from alembic import command

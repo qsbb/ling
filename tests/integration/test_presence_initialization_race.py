@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.presence.service import PresenceService
 from ling.infra.db import get_session_factory, session_scope
@@ -299,35 +299,31 @@ async def test_simultaneous_real_inbound_initializes_presence_once(
     assert len(protocol_wire.sends()) == 2
 
 
-async def test_sqlite_initialization_preserves_values_and_caller_rollback(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'presence.sqlite'}")
-    try:
-        async with engine.begin() as connection:
-            await connection.run_sync(PresenceState.__table__.create)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as writer, factory() as observer:
-            writer.add(PresenceState(actor_id="sqlite-unrelated", energy=13))
-            await writer.flush()
-            created = await PresenceService(writer, actor_id="sqlite-new")._row()
-            assert _values(created) == (70, 20, 70, 0)
-            assert writer.in_transaction()
-            assert await observer.get(PresenceState, "sqlite-new") is None
-            assert await observer.get(PresenceState, "sqlite-unrelated") is None
-            await observer.rollback()
-            await writer.rollback()
-        async with factory() as session:
-            assert await session.get(PresenceState, "sqlite-new") is None
-            session.add(
-                PresenceState(
-                    actor_id="sqlite-existing", energy=22, social_load=44, satiety=66, revision=8
-                )
+async def test_postgres_initialization_preserves_values_and_caller_rollback(
+    postgres_session_factory,
+):
+    factory = postgres_session_factory
+    async with factory() as writer, factory() as observer:
+        writer.add(PresenceState(actor_id="pg-unrelated", energy=13))
+        await writer.flush()
+        created = await PresenceService(writer, actor_id="pg-new")._row()
+        assert _values(created) == (70, 20, 70, 0)
+        assert writer.in_transaction()
+        assert await observer.get(PresenceState, "pg-new") is None
+        assert await observer.get(PresenceState, "pg-unrelated") is None
+        await observer.rollback()
+        await writer.rollback()
+    async with factory() as session:
+        assert await session.get(PresenceState, "pg-new") is None
+        session.add(
+            PresenceState(
+                actor_id="pg-existing", energy=22, social_load=44, satiety=66, revision=8
             )
-            await session.commit()
-        async with factory() as session:
-            existing = await PresenceService(session, actor_id="sqlite-existing")._row()
-            assert _values(existing) == (22, 44, 66, 8)
-            created = await PresenceService(session, actor_id="sqlite-other")._row()
-            assert _values(created) == (70, 20, 70, 0)
-            await session.commit()
-    finally:
-        await engine.dispose()
+        )
+        await session.commit()
+    async with factory() as session:
+        existing = await PresenceService(session, actor_id="pg-existing")._row()
+        assert _values(existing) == (22, 44, 66, 8)
+        created = await PresenceService(session, actor_id="pg-other")._row()
+        assert _values(created) == (70, 20, 70, 0)
+        await session.commit()

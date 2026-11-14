@@ -470,14 +470,12 @@ class ConversationService:
 
     async def ensure_default_window(self, subject_id: str) -> Window:
         """Serialize first-window creation until the caller commits or rolls back."""
-        if self._session.bind.dialect.name == "sqlite":
-            # Obtain SQLite's writer lock before checking for an existing window.
-            await self._session.execute(text("UPDATE windows SET id = id WHERE 0 = 1"))
-        elif self._session.bind.dialect.name == "postgresql":
-            await self._session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                {"key": f"default-window:{subject_id}"},
-            )
+        if self._session.bind.dialect.name != "postgresql":
+            raise RuntimeError("默认会话初始化需要 PostgreSQL")
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"default-window:{subject_id}"},
+        )
         windows = await self.list_windows(subject_id)
         if windows:
             return windows[0]

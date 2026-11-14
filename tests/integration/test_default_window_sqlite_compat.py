@@ -1,4 +1,4 @@
-"""旧 SQLite 配置启动时得到明确提示，现存文件保持原样。"""
+"""SQLite 配置被拒绝，旧数据文件保持原样。"""
 
 import hashlib
 import sqlite3
@@ -24,7 +24,6 @@ async def test_sqlite_app_startup_is_rejected_without_modifying_old_data(tmp_pat
     settings = Settings(
         env="test",
         database_url=database_url,
-        db_require_postgres=False,
         db_search_path=None,
         data_dir=tmp_path,
         bootstrap_admin_user="tester",

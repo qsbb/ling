@@ -88,7 +88,7 @@ def test_explicit_non_postgres_database_is_rejected_before_engine_creation(tmp_p
     import ling.infra.db as db
 
     monkeypatch.setattr(db, "create_async_engine", lambda *_args, **_kwargs: pytest.fail("连接不应创建"))
-    settings = Settings(database_url=url, db_require_postgres=False, data_dir=tmp_path / "data")
+    settings = Settings(database_url=url, data_dir=tmp_path / "data")
     with pytest.raises(RuntimeError, match="PostgreSQL"):
         build_engine(settings)
     assert not settings.data_dir.exists()
@@ -176,8 +176,7 @@ def test_development_script_loads_local_database_configuration_without_printing_
     assert secret not in result.stderr
 
 
-@pytest.mark.parametrize("require_postgres", [None, "0", "1"])
-def test_alembic_postgres_guard_preserves_old_database_before_first_revision(tmp_path, require_postgres):
+def test_alembic_postgres_guard_preserves_old_database_before_first_revision(tmp_path):
     legacy = tmp_path / "old.db"
     _sqlite_sentinel(legacy)
     with sqlite3.connect(legacy) as connection:
@@ -187,10 +186,6 @@ def test_alembic_postgres_guard_preserves_old_database_before_first_revision(tmp
     before = hashlib.sha256(legacy.read_bytes()).hexdigest()
     env = _environment_without_database()
     env["LING_DATABASE_URL"] = f"sqlite+aiosqlite:///{legacy}"
-    if require_postgres is None:
-        env.pop("LING_REQUIRE_POSTGRES", None)
-    else:
-        env["LING_REQUIRE_POSTGRES"] = require_postgres
 
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
@@ -326,7 +321,6 @@ def test_explicit_old_database_is_rejected_without_touching_it(tmp_path, command
     env = _environment_without_database()
     env["LING_DATA_DIR"] = str(tmp_path / ".data")
     env["LING_DATABASE_URL"] = f"sqlite+aiosqlite:///{legacy}"
-    env["LING_REQUIRE_POSTGRES"] = "0"
 
     result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=20)
 

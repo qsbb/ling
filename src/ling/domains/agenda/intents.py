@@ -1307,12 +1307,11 @@ class IntentService:
 
 
 class _ActorLock:
-    """actor 级的 PostgreSQL 事务级 advisory lock（其它方言下退化为无锁）。
+    """actor 级 PostgreSQL 事务级 advisory lock。
 
     多 worker 下容量判定必须串行：两个请求同时看到 3 条 proposed，各自插入
     就会变成 5 条。锁的 key 只由 actor 决定，不包含目标日——容量是 actor 级
-    事实。非 PostgreSQL（本地 sqlite 开发库）没有 advisory lock，此时并发
-    写由唯一键兜底，容量上限在单进程内仍然成立。
+    事实。数据库不支持该锁时拒绝继续，避免静默突破容量上限。
     """
 
     def __init__(self, session: AsyncSession, actor_id: str) -> None:
@@ -1322,7 +1321,7 @@ class _ActorLock:
     async def __aenter__(self) -> None:
         bind = self._session.get_bind()
         if bind.dialect.name != "postgresql":
-            return
+            raise RuntimeError("日程意向容量锁需要 PostgreSQL")
         key = zlib.crc32(f"schedule_intentions:{self._actor_id}".encode()) % 2_147_483_648
         await self._session.execute(
             sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": key}

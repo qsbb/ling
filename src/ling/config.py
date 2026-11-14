@@ -89,7 +89,6 @@ class Settings:
     database_url: str = field(
         default_factory=lambda: require_database_url(os.environ.get("LING_DATABASE_URL"))
     )
-    db_require_postgres: bool = field(default_factory=lambda: _bool("LING_REQUIRE_POSTGRES", False))
     # 测试隔离：把连接固定到一个 schema（仅 PostgreSQL 生效）
     db_search_path: str | None = field(
         default_factory=lambda: os.environ.get("LING_DB_SEARCH_PATH") or None
@@ -320,10 +319,6 @@ class Settings:
     allow_public_publish: bool = field(
         default_factory=lambda: _bool("LING_ALLOW_PUBLIC_PUBLISH", False)
     )
-
-    @property
-    def is_postgres(self) -> bool:
-        return self.database_url.startswith("postgresql") or self.database_url.startswith("postgres")
 
     @property
     def secret_key_path(self) -> Path:

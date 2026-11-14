@@ -717,7 +717,7 @@ async def ready_check(settings: Settings) -> dict[str, object]:
         effective = await svc.effective()
     return {
         "database": "ok",
-        "backend": "postgresql" if settings.is_postgres else "sqlite",
+        "backend": "postgresql",
         "config_revision": effective.revision,
         "test_mode": effective.test_mode,
         "profiles": sorted(effective.profiles),

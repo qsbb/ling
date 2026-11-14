@@ -4437,7 +4437,7 @@ def _config_reader(session):  # noqa: ANN001, ANN202
 
 
 def _aware_moment(value: datetime | None) -> datetime | None:
-    """DB 读回的时间可能是 naive（sqlite）；统一按 UTC 解释，别拿它直接相减。"""
+    """Normalize naive timestamps as UTC before doing time arithmetic."""
     if value is None:
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

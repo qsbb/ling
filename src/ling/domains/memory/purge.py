@@ -227,8 +227,7 @@ async def request_purge(
     #    必然是 2。不额外用 `SELECT ... FOR UPDATE` 是因为这条语句已经拿到
     #    行锁，再锁一次只是多一次往返。
     #
-    #    `RETURNING` 在 sqlite（3.35+）与 PostgreSQL 上都能用，所以这条语句
-    #    不需要按方言分叉。
+    #    PostgreSQL 支持 `RETURNING`，所以这条语句不需要额外查询。
     generation = await session.scalar(
         update(Subject)
         .where(Subject.id == subject_id)
@@ -570,9 +569,9 @@ async def purge_subject(
 def _independent_session_factory(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
     """给"另起一个事务"用的会话工厂。
 
-    优先跟随**当前 session 绑定的引擎**：那样不管调用方用的是全局引擎还是
-    测试里自建的 sqlite 引擎，另起的会话都落在同一个库上。只有 `bind` 拿不到
-    时才退回全局工厂（`ling.infra.db.get_session_factory`）。
+    优先跟随**当前 session 绑定的引擎**：这样测试 schema 与全局运行库都在
+    同一个 PostgreSQL 数据库上。只有 `bind` 拿不到时才退回全局工厂
+    （`ling.infra.db.get_session_factory`）。
 
     session 被绑到**连接**上时（`sessionmaker(bind=conn)`）不能直接复用那个
     连接——那样"独立事务"其实是同一条连接、同一个事务，等于什么都没做。

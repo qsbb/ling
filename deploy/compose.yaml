@@ -25,7 +25,6 @@ x-logging: &default-logging
 x-app-env: &app-env
   LING_ENV: production
   LING_DATABASE_URL: postgresql+asyncpg://ling:${POSTGRES_PASSWORD:-ling-dev-password}@db:5432/ling
-  LING_REQUIRE_POSTGRES: "1"
   LING_BOOTSTRAP_ADMIN: ${LING_BOOTSTRAP_ADMIN:-ling}
   LING_BOOTSTRAP_ADMIN_PASSWORD: ${LING_BOOTSTRAP_ADMIN_PASSWORD:-}
   LING_TEST_MODE: ${LING_TEST_MODE:-0}

@@ -14,8 +14,8 @@
    `prompt_snapshots.payload` / `relationship_events.note` 里都有用户原文或
    可推断出原文的内容，原实现一条都没删。
 
-跑在 sqlite 内存库上：验证的是"哪些行被删、哪些字段被清"，与方言无关。
-真实 PostgreSQL 上的并发竞态在 `tests/integration/test_memory_purge_races.py`。
+数据库行为运行在隔离 PostgreSQL schema 中。真实 PostgreSQL 上的并发竞态在
+`tests/integration/test_memory_purge_races.py`。
 """
 
 from __future__ import annotations
@@ -24,14 +24,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ling.domains.memory.purge import (
     MemoryPurgeError,
     purge_subject,
     request_purge,
 )
-from ling.infra.db import Base
 from ling.infra.models import (
     KnowledgeItem,
     MediaEvidenceRow,
@@ -49,16 +47,9 @@ CANARY = "我对花生过敏，千万别给我吃"
 
 
 @pytest.fixture()
-async def session_factory():
-    """建好全部表的 sqlite 内存库 + 会话工厂（与主测试文件同构）。"""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        await engine.dispose()
+def session_factory(postgres_session_factory):
+    """Use the shared isolated PostgreSQL schema for purge regression tests."""
+    return postgres_session_factory
 
 
 async def _seed_minimal(factory) -> dict[str, str]:  # noqa: ANN001 - 测试夹具
