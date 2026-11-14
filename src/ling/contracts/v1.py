@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from datetime import date, datetime
@@ -15,11 +16,30 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+)
 
 SCHEMA_VERSION: Literal["v1"] = "v1"
 
 IdStr = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+def _json_integer(value: Any) -> Any:
+    """JSON Schema 的 integer 也接受数值等于整数的浮点表示。"""
+    if type(value) is float and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
+NonnegativeJsonInteger = Annotated[StrictInt, Field(ge=0), BeforeValidator(_json_integer)]
 
 # 媒体引用：与 ``IdStr`` **故意不同**。
 #
@@ -605,6 +625,35 @@ class ContextContribution(StrictModel):
     source_event_ids: list[IdStr] = Field(default_factory=list)
     valid_until: datetime | None = None
     token_budget: int = Field(default=0, ge=0)
+
+
+class WindowDialoguePolicyView(StrictModel):
+    """Web 私聊当前回应设置；空覆盖表示继承全局值。"""
+
+    field: Literal["private_may_stay_silent"]
+    global_value: StrictBool
+    override: StrictBool | None
+    effective: StrictBool
+    source: Literal["global", "session"]
+    global_revision: NonnegativeJsonInteger
+    session_revision: NonnegativeJsonInteger
+
+
+class WindowDialoguePolicyProposed(StrictModel):
+    """一次会话设置修改预览后的值和来源。"""
+
+    override: StrictBool | None
+    effective: StrictBool
+    source: Literal["global", "session"]
+
+
+class WindowDialoguePolicyPreview(StrictModel):
+    """预览包含修改前后的值以及用于确认的短期令牌。"""
+
+    current: WindowDialoguePolicyView
+    proposed: WindowDialoguePolicyProposed
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
 
 
 class SessionRecord(StrictModel):

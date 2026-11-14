@@ -15,7 +15,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession
 from ling.api.errors import LingError
 from ling.api.routes.version import _origin_problem, _require_json_content_type
-from ling.contracts.v1 import ErrorCode
+from ling.contracts.v1 import (
+    ErrorCode,
+    WindowDialoguePolicyPreview,
+    WindowDialoguePolicyProposed,
+    WindowDialoguePolicyView,
+)
 from ling.infra.models import Window
 from ling.infra.security import load_signing_root_key
 from ling.settings.window_policy import (
@@ -63,16 +68,16 @@ def _write_guards(request: Request, auth: CurrentAuth) -> None:
         )
 
 
-def _view(snapshot: WindowPolicySnapshot) -> dict:
-    return {
-        "field": _FIELD,
-        "global_value": snapshot.global_value,
-        "override": snapshot.override,
-        "effective": snapshot.value,
-        "source": snapshot.source,
-        "global_revision": snapshot.config.revision,
-        "session_revision": snapshot.override_revision,
-    }
+def _view(snapshot: WindowPolicySnapshot) -> WindowDialoguePolicyView:
+    return WindowDialoguePolicyView(
+        field=_FIELD,
+        global_value=snapshot.global_value,
+        override=snapshot.override,
+        effective=snapshot.value,
+        source=snapshot.source,
+        global_revision=snapshot.config.revision,
+        session_revision=snapshot.override_revision,
+    )
 
 
 def _state(snapshot: WindowPolicySnapshot, window: Window) -> dict:
@@ -120,17 +125,19 @@ def _read_token(request: Request, token: str) -> dict:
         ) from exc
 
 
-@router.get("/sessions/{session_id}/dialogue-policy")
+@router.get("/sessions/{session_id}/dialogue-policy", response_model=WindowDialoguePolicyView)
 async def get_policy(
     session_id: str, auth: CurrentAuth, session: DbSession, config: ConfigDep
-) -> dict:
+) -> WindowDialoguePolicyView:
     await lock_dialogue_config(session)
     await policy_window(session, window_id=session_id, subject_id=auth.user.subject_id)
     snapshot = await locked_window_policy(session, config, session_id)
     return _view(snapshot)
 
 
-@router.post("/sessions/{session_id}/dialogue-policy/preview")
+@router.post(
+    "/sessions/{session_id}/dialogue-policy/preview", response_model=WindowDialoguePolicyPreview
+)
 async def preview_policy(
     session_id: str,
     body: PolicyChange,
@@ -138,7 +145,7 @@ async def preview_policy(
     auth: CurrentAuth,
     session: DbSession,
     config: ConfigDep,
-) -> dict:
+) -> WindowDialoguePolicyPreview:
     _write_guards(request, auth)
     await lock_dialogue_config(session)
     window = await policy_window(session, window_id=session_id, subject_id=auth.user.subject_id)
@@ -153,19 +160,19 @@ async def preview_policy(
         "state": _state(snapshot, window),
         "expires": expires,
     }
-    return {
-        "current": _view(snapshot),
-        "proposed": {
-            "override": body.value,
-            "effective": snapshot.global_value if body.value is None else body.value,
-            "source": "global" if body.value is None else "session",
-        },
-        "preview_token": _token(request, payload),
-        "expires_at": expires,
-    }
+    return WindowDialoguePolicyPreview(
+        current=_view(snapshot),
+        proposed=WindowDialoguePolicyProposed(
+            override=body.value,
+            effective=snapshot.global_value if body.value is None else body.value,
+            source="global" if body.value is None else "session",
+        ),
+        preview_token=_token(request, payload),
+        expires_at=expires,
+    )
 
 
-@router.put("/sessions/{session_id}/dialogue-policy")
+@router.put("/sessions/{session_id}/dialogue-policy", response_model=WindowDialoguePolicyView)
 async def put_policy(
     session_id: str,
     body: PolicyCommit,
@@ -173,7 +180,7 @@ async def put_policy(
     auth: CurrentAuth,
     session: DbSession,
     config: ConfigDep,
-) -> dict:
+) -> WindowDialoguePolicyView:
     _write_guards(request, auth)
     token = _read_token(request, body.preview_token)
     if (

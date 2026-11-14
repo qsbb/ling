@@ -1,0 +1,38 @@
+{
+  "$id": "https://ling.local/contracts/v1/WindowDialoguePolicyProposed.schema.json",
+  "additionalProperties": false,
+  "description": "一次会话设置修改预览后的值和来源。",
+  "properties": {
+    "effective": {
+      "title": "Effective",
+      "type": "boolean"
+    },
+    "override": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Override"
+    },
+    "source": {
+      "enum": [
+        "global",
+        "session"
+      ],
+      "title": "Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "override",
+    "effective",
+    "source"
+  ],
+  "title": "WindowDialoguePolicyProposed",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

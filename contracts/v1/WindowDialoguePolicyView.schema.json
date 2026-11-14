@@ -1,0 +1,61 @@
+{
+  "$id": "https://ling.local/contracts/v1/WindowDialoguePolicyView.schema.json",
+  "additionalProperties": false,
+  "description": "Web 私聊当前回应设置；空覆盖表示继承全局值。",
+  "properties": {
+    "effective": {
+      "title": "Effective",
+      "type": "boolean"
+    },
+    "field": {
+      "const": "private_may_stay_silent",
+      "title": "Field",
+      "type": "string"
+    },
+    "global_revision": {
+      "minimum": 0,
+      "title": "Global Revision",
+      "type": "integer"
+    },
+    "global_value": {
+      "title": "Global Value",
+      "type": "boolean"
+    },
+    "override": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Override"
+    },
+    "session_revision": {
+      "minimum": 0,
+      "title": "Session Revision",
+      "type": "integer"
+    },
+    "source": {
+      "enum": [
+        "global",
+        "session"
+      ],
+      "title": "Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "field",
+    "global_value",
+    "override",
+    "effective",
+    "source",
+    "global_revision",
+    "session_revision"
+  ],
+  "title": "WindowDialoguePolicyView",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

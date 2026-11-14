@@ -1,0 +1,130 @@
+{
+  "$defs": {
+    "WindowDialoguePolicyProposed": {
+      "additionalProperties": false,
+      "description": "一次会话设置修改预览后的值和来源。",
+      "properties": {
+        "effective": {
+          "title": "Effective",
+          "type": "boolean"
+        },
+        "override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Override"
+        },
+        "source": {
+          "enum": [
+            "global",
+            "session"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "override",
+        "effective",
+        "source"
+      ],
+      "title": "WindowDialoguePolicyProposed",
+      "type": "object"
+    },
+    "WindowDialoguePolicyView": {
+      "additionalProperties": false,
+      "description": "Web 私聊当前回应设置；空覆盖表示继承全局值。",
+      "properties": {
+        "effective": {
+          "title": "Effective",
+          "type": "boolean"
+        },
+        "field": {
+          "const": "private_may_stay_silent",
+          "title": "Field",
+          "type": "string"
+        },
+        "global_revision": {
+          "minimum": 0,
+          "title": "Global Revision",
+          "type": "integer"
+        },
+        "global_value": {
+          "title": "Global Value",
+          "type": "boolean"
+        },
+        "override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Override"
+        },
+        "session_revision": {
+          "minimum": 0,
+          "title": "Session Revision",
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "global",
+            "session"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "global_value",
+        "override",
+        "effective",
+        "source",
+        "global_revision",
+        "session_revision"
+      ],
+      "title": "WindowDialoguePolicyView",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/WindowDialoguePolicyPreview.schema.json",
+  "additionalProperties": false,
+  "description": "预览包含修改前后的值以及用于确认的短期令牌。",
+  "properties": {
+    "current": {
+      "$ref": "#/$defs/WindowDialoguePolicyView"
+    },
+    "expires_at": {
+      "minimum": 0,
+      "title": "Expires At",
+      "type": "integer"
+    },
+    "preview_token": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Preview Token",
+      "type": "string"
+    },
+    "proposed": {
+      "$ref": "#/$defs/WindowDialoguePolicyProposed"
+    }
+  },
+  "required": [
+    "current",
+    "proposed",
+    "preview_token",
+    "expires_at"
+  ],
+  "title": "WindowDialoguePolicyPreview",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}
