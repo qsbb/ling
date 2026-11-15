@@ -41,36 +41,31 @@ QQ、微信、Web 控制台、移动端都只是**连接到她的渠道**，她�
 
 ### Docker（推荐）
 
-```bash
-git clone https://github.com/qsbb/ling.git
-cd ling
-bash deploy/install.sh
-```
-
-脚本会自动生成密钥、构建镜像、起服务，最后打印控制台地址与账号密码。
+需要 Git、Docker Engine 和 Docker Compose v2。整行执行后会在当前目录创建 `ling`，
+生成本机配置、构建镜像并启动服务；没有预装 pnpm 也可以安装。
 
 ```bash
-bash deploy/install.sh --status      # 状态
-bash deploy/install.sh --logs api    # 日志
-bash deploy/install.sh               # 升级（在**当前源码**上重新构建并重启）
-bash deploy/install.sh --down        # 停止（数据保留）
+git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
 ```
 
-> **升级前必读**
-> `deploy/install.sh` 只会**构建并部署当前这份源码**，不会 `git pull`、也不会去
-> GitHub 下载新版本。仓库目前**还没有发布正式 Release**，自动更新默认关闭
-> （`LING_UPDATE_ENABLED=0`）。想升级要先在宿主机上人工接管：取到新源码后重新运行
-> `install.sh`（它会保留 `deploy/.env` 与数据卷）。
-> 更新执行器（`deploy/update/`，默认不启用）只负责在**已经人工纳管**的机器上按
-> tag/commit 执行同一套安装流程；第一次纳管必须人工完成，见
-> [docs/UPDATES.md](docs/UPDATES.md)。
-> 升级前先备份数据库与 `deploy/.env`。API 容器是只读根文件系统、非 root，**没有
-> Docker socket**，也没有挂宿主源码树；真实 Docker 上的升级/回滚演练**尚未完成**，
-> 不要把自动更新当成已验证能力。
+首次启动会生成密钥和管理员账号。安装成功后显示控制台地址与用户名，随机初始密码
+只写入 API 启动日志，可用下面的日志命令查看；首次登录后需要修改密码。
 
-> 首次启动会**生成随机密码并打印在启动日志里**（安装脚本也会把它取出来显示）。
-> 只有 `deploy/install.sh --admin-user <名字>` 能改用户名；默认 `ling`。
-> 登录后会**强制要求修改密码**——随机口令只当一次性登船票。
+```bash
+bash deploy/upgrade.sh                # 拉取当前分支快进更新并部署
+bash deploy/install.sh --status      # 查看状态
+bash deploy/install.sh --logs api    # 查看 API 日志和首次登录密码
+bash deploy/install.sh               # 仅重新部署当前检出，不拉取代码
+bash deploy/install.sh --down        # 停止服务，保留数据
+```
+
+`deploy/upgrade.sh` 适用于源码安装，会获取当前分支远端并只接受快进更新，再调用标准安装
+流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
+镜像模式不使用这个脚本。网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动
+更新仍需按 [docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
+
+需要回滚保障时，升级前另行备份数据库和 `deploy/.env`。默认管理员名为 `ling`，可在首装
+时用 `--admin-user <名字>` 修改。
 
 ### 本地开发
 

@@ -1900,7 +1900,7 @@ compose up -d --force-recreate api
 | 安装入口 | `bash deploy/install.sh`（在源码 checkout 里） | `ling install --digest ...`（宿主不需要源码树） |
 | 主 Compose 文件 | `deploy/compose.yaml`（api/worker 有 `build:`，Web 从宿主 bind 到 `/app/web`） | `deploy/compose.image.yaml`（api/worker 只认必填 `LING_APP_IMAGE`，Web 已烤进镜像） |
 | 版本标识 | `LING_COMMIT` 构建参数 + 本地镜像名 | 固定 OCI **index digest**（`/v1/version` 读容器内 `LING_APP_IMAGE`；commit 取自镜像内烤入的 `LING_COMMIT`，与 OCI 标注 `org.opencontainers.image.revision` 同源，发布/更新器再交叉核对） |
-| 日常升级 | 人工取新源码 → `install.sh`（[UPDATES.md §7](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
+| 日常升级 | `bash deploy/upgrade.sh`（快进获取远端后构建部署，[UPDATES.md](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
 | 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `ling-updater` + `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
 | 可选 WS 端口 override | `deploy/compose.ws.example.yaml` | `deploy/compose.image.ws.example.yaml` |
 
