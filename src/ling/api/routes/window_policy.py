@@ -45,6 +45,7 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.infra.security import load_signing_root_key
+from ling.ports.config import EffectiveConfig
 from ling.settings.conversation_inheritance import (
     resolve_conversation_settings,
     validate_conversation_overrides,
@@ -59,6 +60,7 @@ from ling.settings.window_policy import (
 )
 
 router = APIRouter(tags=["sessions"])
+InstanceScope = Literal["onebot", "qqbot"]
 _FIELD: Literal["private_may_stay_silent"] = "private_may_stay_silent"
 _FIELDS = (
     "persona_id",
@@ -110,7 +112,7 @@ class PolicyCommit(PolicyChange):
 class OriginBindingChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scope: Literal["onebot", "qqbot"] | None
+    scope: InstanceScope | None
     instance_id: StrictStr | None = Field(max_length=16)
 
     @model_validator(mode="after")
@@ -164,12 +166,17 @@ def _record_policy_audit(
     ))
 
 
-def _require_instance_scope(scope: str) -> None:
-    if scope not in {"onebot", "qqbot"}:
-        raise LingError(ErrorCode.not_found, "没有这个平台实例", status_code=404)
+def _require_instance_scope(scope: str) -> InstanceScope:
+    if scope == "onebot":
+        return "onebot"
+    if scope == "qqbot":
+        return "qqbot"
+    raise LingError(ErrorCode.not_found, "没有这个平台实例", status_code=404)
 
 
-def _instance_field_views(config, overrides: dict[str, object]) -> WindowDialoguePolicyFields:
+def _instance_field_views(
+    config: EffectiveConfig, overrides: dict[str, object]
+) -> WindowDialoguePolicyFields:
     global_values = resolve_conversation_settings(config)
     resolved = resolve_conversation_settings(config, instance_overrides=overrides)
     fields: dict[str, dict[str, object]] = {}
@@ -191,7 +198,7 @@ def _instance_field_views(config, overrides: dict[str, object]) -> WindowDialogu
 async def _require_live_connector_instance(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
     create_default: bool,
 ) -> ConnectorInstance | None:
@@ -199,7 +206,9 @@ async def _require_live_connector_instance(
     if instance_id == DEFAULT_INSTANCE_ID and create_default:
         from ling.settings.connector_instances import ConnectorInstanceService
 
-        row = await ConnectorInstanceService(session).ensure_default(scope=scope)
+        row: ConnectorInstance | None = await ConnectorInstanceService(session).ensure_default(
+            scope=scope
+        )
     else:
         row = await session.get(ConnectorInstance, (scope, instance_id))
     if row is None and instance_id == DEFAULT_INSTANCE_ID and not create_default:
@@ -212,11 +221,11 @@ async def _require_live_connector_instance(
 async def _instance_impact(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
     actor_id: str,
     subject_id: str,
-    config,
+    config: EffectiveConfig,
     current: dict[str, object],
     proposed: dict[str, object] | None = None,
 ) -> tuple[int, int, int]:
@@ -293,11 +302,11 @@ async def _instance_impact(
 async def _instance_policy_view(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
     actor_id: str,
     subject_id: str,
-    config,
+    config: EffectiveConfig,
     instance_revision: int,
     overrides: dict[str, object],
     generation: int,
@@ -329,7 +338,7 @@ def _field_views(
     session_overrides: dict[str, object],
     *,
     instance_overrides: dict[str, object] | None = None,
-) -> dict[str, dict[str, object]]:
+) -> WindowDialoguePolicyFields:
     instance = snapshot.instance_overrides if instance_overrides is None else instance_overrides
     global_values = snapshot.global_resolved
     resolved = resolve_conversation_settings(
@@ -350,18 +359,18 @@ def _field_views(
             "effective": resolved_field.value,
             "source": resolved_field.source,
         }
-    return result
+    return WindowDialoguePolicyFields.model_validate(result)
 
 
 def _view(snapshot: WindowPolicySnapshot) -> WindowDialoguePolicyView:
     fields = _field_views(snapshot, snapshot.session_overrides)
-    private_field = fields[_FIELD]
+    private_field = fields.private_may_stay_silent
     return WindowDialoguePolicyView(
         field=_FIELD,
-        global_value=private_field["global_value"],
-        override=private_field["session_override"],
-        effective=private_field["effective"],
-        source=private_field["source"],
+        global_value=private_field.global_value,
+        override=private_field.session_override,
+        effective=private_field.effective,
+        source=private_field.source,
         fields=fields,
         origin_status=snapshot.origin_status,
         instance_scope=snapshot.instance_scope,
@@ -376,11 +385,11 @@ def _proposed(
     snapshot: WindowPolicySnapshot, overrides: dict[str, object]
 ) -> WindowDialoguePolicyProposed:
     fields = _field_views(snapshot, overrides)
-    private_field = fields[_FIELD]
+    private_field = fields.private_may_stay_silent
     return WindowDialoguePolicyProposed(
-        override=private_field["session_override"],
-        effective=private_field["effective"],
-        source=private_field["source"],
+        override=private_field.session_override,
+        effective=private_field.effective,
+        source=private_field.source,
         fields=fields,
     )
 
@@ -474,9 +483,9 @@ async def _persona_revision_map(
 async def _instance_policy_state(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
-    config,
+    config: EffectiveConfig,
     row: InstanceDialogueOverride | None,
     persona_revisions: dict[str, int | None],
 ) -> dict[str, object]:
@@ -495,11 +504,11 @@ async def _instance_policy_state(
 async def _load_instance_policy(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
     config: ConfigDep,
     create_default: bool,
-) -> tuple[ConnectorInstance | None, object, InstanceDialogueOverride | None, int]:
+) -> tuple[ConnectorInstance | None, EffectiveConfig, InstanceDialogueOverride | None, int]:
     connector = await _require_live_connector_instance(
         session,
         scope=scope,
@@ -515,7 +524,7 @@ async def _load_instance_policy(
 async def _save_instance_override(
     session: AsyncSession,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
     expected_revision: int,
     set_values: dict[str, object],
@@ -607,7 +616,7 @@ async def _binding_connector(
     session: AsyncSession,
     request: Request,
     *,
-    scope: str,
+    scope: InstanceScope,
     instance_id: str,
 ) -> tuple[WindowOriginBindingCandidate, str, int]:
     from ling.capabilities.channels import onebot_config, qqbot_config
@@ -738,6 +747,7 @@ async def get_origin_binding_options(
         allow_managed_groups=True,
     )
     _require_binding_window(window)
+    scope = _require_instance_scope(window.channel)
     reference = _binding_reference(window)
     from ling.settings.connector_instances import ConnectorInstanceService
 
@@ -748,12 +758,12 @@ async def get_origin_binding_options(
     candidates = []
     for instance_id in instance_ids:
         candidate, namespace, _ = await _binding_connector(
-            session, request, scope=window.channel, instance_id=instance_id
+            session, request, scope=scope, instance_id=instance_id
         )
         if reference.split(":", 1)[0] == namespace:
             candidates.append(candidate)
     return WindowOriginBindingOptions(
-        scope=window.channel,
+        scope=scope,
         candidates=candidates,
         manually_bound=window.origin_manually_bound,
     )
@@ -1014,7 +1024,7 @@ async def get_instance_policy(
 ) -> InstanceDialoguePolicyView:
     if auth.user.role != "owner":
         raise LingError(ErrorCode.forbidden, "只有所有者可以查看平台实例设置", status_code=403)
-    _require_instance_scope(scope)
+    scope = _require_instance_scope(scope)
     await lock_dialogue_config(session)
     _, effective, row, generation = await _load_instance_policy(
         session,
@@ -1050,7 +1060,7 @@ async def preview_instance_policy(
     config: ConfigDep,
 ) -> InstanceDialoguePolicyPreview:
     _write_guards(request, auth)
-    _require_instance_scope(scope)
+    scope = _require_instance_scope(scope)
     await lock_dialogue_config(session)
     _, effective, row, generation = await _load_instance_policy(
         session,
@@ -1139,7 +1149,7 @@ async def put_instance_policy(
     config: ConfigDep,
 ) -> InstanceDialoguePolicyView:
     _write_guards(request, auth)
-    _require_instance_scope(scope)
+    scope = _require_instance_scope(scope)
     token = _read_token(request, body.preview_token)
     if (
         token.get("purpose") != "instance_dialogue_policy"

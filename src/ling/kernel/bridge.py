@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from ling.config import Settings
     from ling.infra.models import Turn
     from ling.ports.channel import ChannelConnector
+    from ling.settings.window_policy import RuntimeWindowSnapshot
 
 logger = logging.getLogger("ling.kernel.bridge")
 
@@ -385,7 +386,7 @@ class InboundBridge:
         self._trusted_instance_key = trusted_instance_key
         self._persona_id = persona_id
         self._actor_id = actor_id
-        self._runtime_snapshot = None
+        self._runtime_snapshot: RuntimeWindowSnapshot | None = None
 
     async def handle(
         self,
@@ -557,7 +558,7 @@ class InboundBridge:
                 if evidence is not None and evidence.kind == "audio":
                     audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
             if audio_ids and (not is_group or addressed):
-                effective = self._runtime_snapshot.config
+                effective = runtime_snapshot.config
                 try:
                     job = await create_job(
                         self._session, window_id=window.id, subject_id=subject_id,
@@ -772,7 +773,7 @@ class InboundBridge:
         conversation = ConversationService(
             self._session, actor_id=self._actor_id, persona_id=self._persona_id
         )
-        effective = self._runtime_snapshot.config
+        effective = runtime_snapshot.config
         turn = await self._ensure_turn(
             conversation,
             window_id=window.id,
@@ -835,7 +836,7 @@ class InboundBridge:
             self._session,
             turn_id=turn.id,
             attempt=int(turn.attempt or 1),
-            snapshot=self._runtime_snapshot,
+            snapshot=runtime_snapshot,
         )
         # 轮次任务用自己的会话，必须先提交，否则后台看不到 turn 行
         await self._session.commit()
@@ -847,7 +848,7 @@ class InboundBridge:
             turn_id=turn.id,
             text=text,
             effective=effective,
-            persona_id=self._runtime_snapshot.persona,
+            persona_id=runtime_snapshot.persona,
             # "instance:external_id" —— 记忆按它记录来源账号
             source_account=f"{envelope.connector_instance}:{envelope.account_ref or ''}",
             # **这一条消息**里的称呼（群名片优先）。必须透传到

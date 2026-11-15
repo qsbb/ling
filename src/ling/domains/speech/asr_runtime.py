@@ -7,7 +7,7 @@ import logging
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import and_, func, or_, select
 from starlette.requests import Request
@@ -23,6 +23,9 @@ from ling.infra.models import Message
 from ling.infra.security import load_signing_root_key
 from ling.ports.speech import AsrRequest, SpeechCall, SpeechError
 from ling.settings.service import ConfigService, effective_from_payload
+
+if TYPE_CHECKING:
+    from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ async def check_access(app, session, job: AsrJob) -> None:
             raise TranscriptionError("forbidden", "当前账号已失去渠道访问资格", 403)
 
 
-def _source_connector(app, payload: dict) -> tuple[object, tuple[str, str] | None]:
+def _source_connector(app, payload: dict) -> tuple[ChannelConnector, tuple[str, str] | None]:
     """按作业入队时的可信身份选择连接器，旧作业沿用命名空间。"""
     from ling.capabilities.channels import connector_for_instance, connector_for_namespace
 

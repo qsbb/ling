@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from sqlalchemy import select, text, update
 
@@ -116,7 +116,9 @@ async def locked_window_policy(
     instance_scope: str | None = None
     instance_id: str | None = None
     instance_row = None
-    origin_status = window.origin_status
+    origin_status = cast(
+        Literal["known", "unknown", "not_applicable"], window.origin_status
+    )
     if origin_status == "known":
         if (
             window.origin_scope not in {"onebot", "qqbot"}
@@ -173,15 +175,16 @@ async def policy_window(
         .where(Window.id == window_id)
         .with_for_update()
     )
+    if window is None:
+        raise not_found("会话不存在")
+
     own_private = (
-        window is not None
-        and window.visibility == "subject_private"
+        window.visibility == "subject_private"
         and window.subject_id == subject_id
         and (window.channel == "web" or window.actor_id == actor_id)
     )
     managed_group = (
-        window is not None
-        and allow_managed_groups
+        allow_managed_groups
         and window.visibility == "group_scope"
         and window.actor_id == actor_id
         and window.channel in {"onebot", "qqbot"}

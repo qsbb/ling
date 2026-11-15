@@ -37,6 +37,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine.default import DefaultExecutionContext
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ling.infra.db import Base
@@ -46,7 +47,7 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _window_origin_status_default(context: sa.DefaultExecutionContext) -> str:
+def _window_origin_status_default(context: DefaultExecutionContext) -> str:
     values = context.get_current_parameters()
     return "not_applicable" if values.get("channel", "web") == "web" else "unknown"
 
