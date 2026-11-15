@@ -15,10 +15,13 @@
 >   `bash deploy/upgrade.sh`，它检查干净工作区、快进获取当前分支远端后调用安装器。
 >   `deploy/install.sh` 本身只构建并部署当前 checkout，不拉取代码。镜像模式的安装与
 >   升级见 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐) 与本文 §10。
-> - `v0.0.1` **已经发布**（`docs/IMAGE-DEPLOYMENT-DESIGN.md` §1）。所以“检查更新”
->   现在读到的是它，而不是 `no_release`；仓库当前版本也是 `0.0.1`，远端不比当前
->   新，`check-release` 因此给 `is_newer=false`、`update_eligible=false`
->   （原因码 `not_newer`），提交更新会被拒。
+> - 截至 2026-11-16，最新正式 Release 为 `v0.0.8`（2026-11-13 发布），源码版本字段
+>   也是 `0.0.8`。当前候选 `c86c84d` 比该 Release 提交 `0d36dbad` 多 37 个提交；
+>   它不是已发布镜像的源码快照。Release 门禁要求 tag 提交是 `origin/main` 的祖先，
+>   当前候选尚未满足该条件，不能在此状态直接发版。
+> - 镜像更新器现在直接从 GHCR 读取稳定版 tag 与镜像 index digest；
+>   `deploy/releases.json` 不再参与目标版本或摘要判定。发现新版本不等于网页更新链路
+>   已验收：开关仍默认关闭，当前候选尚未完成容器级镜像更新复验。
 > - 自动更新默认关闭（`LING_UPDATE_ENABLED=0`），**关闭时这套改动不影响已经跑着的
 >   服务**：通道目录照常挂载（compose 早就接线了，见 §2），但开关是 0，界面上不会
 >   出现可点的“更新”入口；`GET /v1/version/update` 仍会读 status 里的心跳来回答
@@ -33,10 +36,10 @@
 >   上真机跑通新装、备份恢复与三次连续无人值守升级。生产 `ling` **已于 2026-11-05
 >   从源码模式迁移到镜像模式**（首装失败过、手工补齐后用 `ling adopt --force` 登记，
 >   见 [DEPLOYMENT.md §6](DEPLOYMENT.md#6-验证状态哪些验过哪些没验)），但那是一次
->   人工迁移，不是演练：**两次连续网页升级**（只发布过一个摘要 `42bba216`，缺第二个
->   digest）、head 不一致 / 并发请求 / 旧执行器残留的故障注入、中断中任务的对账
->   （仅单测）、生产库有真实数据时的恢复（生产库 `messages=0`/`memories=0`）、
->   arm64 运行、真实浏览器端到端点一遍**仍未做**（见 §10.8）。
+>   人工迁移，不是演练。2026-11-05 记录的生产状态不是本次现场核查结果；本次未连接
+>   生产环境，不能据此推断当前生产版本或运行状态。网页更新仍有 head 不一致 / 并发请求 /
+>   旧执行器残留的故障注入、中断中任务的真机对账（仅单测）、生产库有真实数据时的恢复、
+>   arm64 运行及当前候选镜像更新浏览器流程等未完成项（见 §10.8）。
 >   本文描述的接线与契约不等于“已验证的无人值守升级”。
 > - API 容器只读、非 root、**没有 Docker socket**；它只能写一条固定 JSON 请求，
 >   真正部署由宿主上的独立执行器完成（两条通道都遵守这条边界）。
@@ -500,16 +503,13 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
   摘要”的版本（先 create 再 edit 的写法有这个窗口）。任一 digest 不是合法
   `sha256:<64 hex>` 就 `::error::` 并退出——宁可 job 红，也不发没有摘要的 Release。
 
-> **正文里的 index digest 是「部署参考」，不是网页更新的唯一来源。**
-> 可信发布目录（`deploy/releases.json`）**不再记录 digest**（见 §10.3 与
-> `deploy/release/catalog.py` 文件头）：网页更新时由**更新器自己**在刷新目录时跑
-> `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>`，取**本机架构**那条
-> 平台 manifest 的 digest 当目标摘要。两者是同一个多架构镜像的不同层引用：
-> index digest 在多架构清单那一层，平台 manifest digest 在本机架构的子清单那一层；
-> `publish.py` 的 `verify_repo_digests` 两者都接受
-> （`{target_hex} ∪ {target_platform_digest}`），拉取后的平台/提交/当前摘要复核
-> 一步不少。人工 `publish.py --digest` 与 `ling install --digest` 仍按正文里的
-> **index digest** 走。
+> **正文里的 index digest 是人工部署参考，不是网页更新的信任源。** 镜像更新器直接
+> 查询 GHCR 的稳定版 tag 列表，选择最高规范化版本，再读取该 tag 的 index digest，
+> 并确认清单包含当前宿主平台；网页目标来自这次 registry 查询，而不是
+> `deploy/releases.json`。Release 正文可编辑，人工 `ling install --digest` 与
+> `publish.py --digest` 应核对同一 release workflow 的 job summary，再使用其中的
+> **index digest**。`deploy/releases.json` 仍由 CI 校验并随代码保留，但不参与更新目标
+> 选择；更新说明使用独立的 `update-notes.json` / 对应 tag 的 GitHub Release。
 - 权限最小化：仓库默认 `contents: read`；`image` / `updater-image` 恰好
   `contents: read` + `packages: write`（没有 `contents: write`，也没有
   `id-token` / `attestations`——本次不用 GitHub 原生构建证明）；只有 `release`
@@ -764,17 +764,18 @@ fail-closed 判据）；必须先人工迁移。
 
 > 本节前半段是**源码模式**通道的未验证项；镜像模式（§10）的未验证项在 §10.8。
 
-- 真实 Docker 上源码模式的完整升级演练（备份 → 构建 → 切换 → 失败恢复）**尚未
-  完成**；本文所有“能跑通”的证据都来自 stub-only 测试（docker/pnpm/curl 都是
-  替身），**不能**当成真实部署通过；
+- 源码模式的一行首装、快进升级、重复升级及 `.env` / PostgreSQL 卷保留已于
+  2026-11-16 在 5.21 隔离 Docker 项目实测，候选截至 `d7e8e676`；源码模式备份恢复与
+  失败恢复仍未验证。详情见
+  [`single-command-install-upgrade.md`](evidence/single-command-install-upgrade.md)。
 - **从 edge 拓扑迁移的整条链路**（`down --remove-orphans` → 改 `.env` →
   `install.sh` → `adopt-current`）同样**没有在真实 Docker 上演练过**（见 §7.1）；
   迁移前先备份，并按 DEPLOYMENT.md §7 的第 5、6 步逐条核对；
 - 升级失败后的数据库自动回滚**没有实现**，也不打算自动做（镜像模式同样：迁移单向）；
 - 宿主执行器需要 root 才能创建 `/run/ling-update/*` 与备份/切换容器；
-- `v0.0.1` 已发布，所以“检查更新”读到的是它而不是 `no_release`；仓库当前版本也是
-  `0.0.1`，远端不比当前新 → `is_newer=false`、`update_eligible=false`
-  （原因码 `not_newer`）。下一个正式版本发布后才会变成“有更新”；
+- 截至 2026-11-16，正式 Release `v0.0.8` 已于 2026-11-13 发布，当前源码版本字段也为
+  `0.0.8`；因此源码模式版本检查不会把同版本 Release 当成更新。候选 `c86c84d` 比
+  Release 提交多 37 个提交，尚未成为该 Release 的内容。镜像模式版本发现走 GHCR，见 §10；
 - 更新通道默认关闭（`LING_UPDATE_ENABLED=0`）；**目录照常挂**，关闭时 API 仍会
   stat 两个目录、读 status 里的心跳来回答 `GET /v1/version/update` 的
   `executor.online`（`reason=disabled`），但它不写 requests，也没有任何 HTTP 入口
@@ -801,21 +802,20 @@ fail-closed 判据）；必须先人工迁移。
 >   升级 A→B→C→D**、维护门禁（容器 healthy 时宿主端口确实关闭）、已迁移失败
 >   不回滚 / 进人工门禁、更新器 idle 重启对账。记录见
 >   `shots/deploy-research/P5-DRILL.md` 与 `DRILL-DIGESTS.md`。
-> - **生产 `ling` 已是镜像模式**（2026-11-05 迁移完成），但那是**一次人工迁移**，
+> - **生产 `ling` 的历史记录**显示其于 2026-11-05 迁到镜像模式，但那是**一次人工迁移**，
 >   不是演练：首装曾失败在 `failed_after_migration`、手工补齐后用 `ling adopt --force`
->   登记（记录里 14 项 `unknown`，`ling doctor` = ok=29 warn=14 fail=0，这些 warn 是
->   设计如此）。整个过程未受隔离项目演练影响。
-> - **仍未完成**：两次连续网页升级（目前只发布过一个镜像摘要 `42bba216`，没有第二个
->   digest）；故障注入**已做**坏摘要、错仓库、不在目录、错提交、缺确认、多字段、非法
+>   登记（记录里 14 项 `unknown`，`ling doctor` = ok=29 warn=14 fail=0）。本次未连接生产，
+>   不将该历史记录当作当前生产实况。
+> - `v0.0.8` 正式 Release 已有 CI 核验过的镜像摘要；旧记录“只发布过一个摘要”已过期。
+>   **仍未完成**：故障注入**已做**坏摘要、错仓库、不在兼容目标、错提交、缺确认、多字段、非法
 >   JSON、重放、断连重连、端口冲突、API 未认证、拉取失败、迁移跳过、备份篡改，**未做**
 >   head 不一致 / 并发请求 / 旧执行器残留（这三项依赖真实升级场景）；中断中任务的真实
 >   对账（只有 3 条单测 + 变异验证）；生产库有真实数据时的恢复（生产库 `messages=0`/
->   `memories=0`）；arm64 运行（镜像双架构已构建，宿主是 x86_64）；浏览器端到端点一遍。
+>   `memories=0`）；arm64 运行（镜像双架构已构建，宿主是 x86_64）；当前候选的镜像更新
+>   容器与浏览器端到端。
 > - **不能宣称“网页一键更新可用”**：`LING_UPDATE_ENABLED` 默认 `0`（插值，
->   可用 `ling install --with-updater --enable-updates` 打开），但**默认关**的真实
->   原因是**缺第二个镜像摘要、双次升级演练未完成**；
->   `deploy/releases.json` 仍是空列表，真实部署会显示
->   `no_available_target` 并禁用按钮（见 §10.8）。
+>   可用 `ling install --with-updater --enable-updates` 打开）。默认关闭是因为上述验收项仍
+>   未完成；`deploy/releases.json` 不参与更新目标选择，目标由 GHCR 稳定版 tag 检查产生。
 
 ### 10.1 为什么不复用 `executor.py`
 
@@ -846,8 +846,8 @@ fail-closed 判据）；必须先人工迁移。
   compose 片段/任意路径。
 - `operator_confirmed` 必须是 JSON 的 `true`——字符串 `"true"`、`1`、缺省都拒绝
   （422 `operator_not_confirmed`）：这是“人点过确认”的唯一凭据。
-- 目标摘要必须出现在更新器写出的**兼容目标**里，否则 409 `target_not_in_catalog`；
-  不能绕过可信发布目录（`deploy/releases.json`）提交任意摘要。
+- 目标摘要必须出现在更新器本次从 GHCR 发现的**兼容目标**里，否则 409
+  `target_not_available`；调用方不能自行指定任意摘要或 tag。
 - 期望值要与实测一致：`expected_current_commit` 对不上给
   `installed_version_changed`，`expected_current_digest` 对不上给
   `installed_image_changed`，都是 409；目标等于当前摘要给 `already_on_target`。
@@ -957,17 +957,15 @@ fail-closed 判据）；必须先人工迁移。
   网页升级 + 更新器重启后对账**，并且更新器在线、`protocol=1` 兼容、备份/恢复门禁
   齐全、任务失败路径演练通过。**隔离项目 `ling-drill` 已完成**：一次新装、
   三次连续升级（A→B→C→D）、更新器 idle 重启对账；**未完成**的是中断中任务的
-  真机对账（仅单测）。**生产侧另有一条独立原因**：目前只发布过一个镜像摘要
-  （`42bba216`），没有第二个 digest，两次连续网页升级在真实发布上走不完。
-  两条原因都在，所以开关**仍然保持 0**。
+  真机对账（仅单测）。`v0.0.8` 已有正式发布的镜像摘要，因此“缺第二个摘要”不再是
+  当前限制；本次仍未在当前候选上复验镜像更新容器与浏览器流程。因剩余设计验收项未完成，
+  开关**仍然保持 0**。
 - 打开还需要更新器镜像来自发布证据（`--updater-digest` / `LING_UPDATER_IMAGE`），
   以及 `LING_UPDATE_SHARED_GID` 对应的目录权限（`requests` 带 setgid、属组是它）。
-- **要真正有可用目标，还必须先做正式发布**：CI 构建并推送镜像后，把条目用
-  `python3 deploy/release/catalog.py add --version ... --commit ... --min-from ...
-  --has-migration` 写进发布目录（`deploy/releases.json` 的 schema 1 列表；**没有
-  `--digest`**，摘要由更新器自己解析），随发行包/挂载交给更新器。仓库里现在有
-  `0.0.3` 一条；只打开开关不会凭空出现目标——目标还必须"比当前版本新"且当前版本在
-  它的 `min_from` 里。
+- **可用目标由 GHCR 稳定版 tag 决定**：发布流程成功推送镜像后，更新器会在下一次
+  registry 检查中发现最高稳定版本并解析 index digest。`deploy/releases.json` 不是
+  更新器的目标源，修改它不会让网页出现新目标；目标还必须比运行中版本新、摘要可解析，
+  且清单包含宿主平台。只打开开关不会绕过这些检查。
 
 ### 10.8 现在真能做什么、还不能宣称什么
 
@@ -975,25 +973,24 @@ fail-closed 判据）；必须先人工迁移。
   [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐) 人工跑
   `publish.py <digest>` 升级。**在隔离项目 `ling-drill` 上**，网页更新通道的
   完整链路（请求 → 更新器 → 备份 → 迁移 → 维护门禁切换 → 三项核验）已真机
-  跑通三次连续升级；但那条演练用的是**宿主上手写的演练发布目录**
-  （`/vol1/@appdata/ling-drill/deploy/releases.json`，3~4 条测试构建摘要），
-  **不是仓库里的 `deploy/releases.json`**。
-- **不能宣称**：网页一键更新在生产/真实部署里可用。原因全是事实层面的：
-  - **缺第二个镜像摘要**：生产只发布过 `42bba216` 这一个 digest，第二次连续网页升级
-    无法演练（生产本身已于 2026-11-05 迁到镜像模式，见 §10 开头）；
-  - 镜像模式里开关还没打开（设计门槛的"中断中任务对账"未真机证明，head 不一致 /
-    并发请求 / 旧执行器残留的故障注入也未做）；
-  - `deploy/releases.json` 目前只有 `0.0.3` 一条（`min_from` 为 `0.0.2`）。部署机
-    当前版本**不在它的 `min_from` 里**（例如还是 0.0.2 之前的构建）时，
-    `GET /v1/version/image-update` 会给 `no_available_target`、网页按钮禁用。
-    这是**诚实可用**（通道代码就绪、没有可用目标），不是 bug；要出现目标，先有
-    正式发布并把条目 `catalog.py add` 进去。
+  跑通三次连续升级。那次历史演练使用宿主侧测试发布数据；当前更新器已改为直接从
+  GHCR 发现稳定版 tag，因此该演练证明了当时的执行链路，不替代当前 registry 发现和
+  当前候选镜像更新验收。
+- **不能宣称**：当前候选的网页一键更新已在真实部署中可用。`v0.0.8` 已有正式 Release
+  和 CI 验证过的 API / updater 镜像摘要，因此旧记录中“只发布过一个摘要”已过期；但本次
+  没有在当前候选上跑完整的容器更新与真实浏览器流程，也没有连接生产核对其版本和状态。
+  隔离项目的既有三次升级演练不替代当前候选验收。
+- 仍未完成的验收项包括：中断中任务的真机对账、head 不一致 / 并发请求 / 旧执行器残留
+  故障注入，以及当前候选的镜像更新容器复验。`LING_UPDATE_ENABLED` 继续默认 `0`。
+- 当前 `v0.0.8` registry digest 已由 GitHub Actions 的 `image` 与 `updater-image` 作业
+  核验；本次未检查真实部署主机的 GHCR 可达性、架构、目录权限或 Docker socket/GID，
+  也未检查生产环境。
 - **这里列的不再包含"`publish.py` 要求开关=0"**：那条断言已删除（§10.7）。
   开关=1 时更新器→`publish.py` 的预检不再抛 `failed_preflight` / `compose_env`；
   `tests/test_updater.py::test_web_update_chain_passes_preflight_with_switch_on`
-  与 `tests/test_release_publish.py` 的开关用例钉住这一点。上表三条仍是"不能宣称
+  与 `tests/test_release_publish.py` 的开关用例钉住这一点。以上未完成项仍表示"不能宣称
   可一键更新"的**真实**原因。
-- **待现场确认**：GHCR package 可见性、宿主架构、真实部署路径与端口、更新器在
+- **待现场确认**：部署主机的 GHCR 可达性、宿主架构、真实部署路径与端口、更新器在
   目标 NAS 上的 Docker socket/gid 对应关系（`ling install` 会 `stat` socket 取 gid，
   但实际取值未在现场核对过）。
 

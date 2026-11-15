@@ -178,9 +178,12 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：仓库目前**没有发布正式 Release**，也没有经过真实 Docker 的升级/回滚
-演练。`install.sh` 只部署当前源码；自助更新默认关闭，第一次升级必须人工纳管，
-见 [docs/UPDATES.md](docs/UPDATES.md)。
+发布与升级：正式 Release `v0.0.8` 于 2026-11-13 发布。当前工作树版本字段仍为
+`0.0.8`，但候选 `c86c84d` 比该 Release 提交多 37 个提交，并非已发布镜像的源码快照。
+源码模式的一行首装、升级、重复升级及配置/PostgreSQL 卷保留已在隔离 Docker 项目验证，
+测试提交截至 `d7e8e676`；当前候选后续的认证时序修复只完成了本地 PostgreSQL 回归，尚未
+在容器中复验。源码模式备份恢复/回滚和当前候选的镜像网页更新验收仍未完成；自助更新默认
+关闭。详细边界见 [docs/UPDATES.md](docs/UPDATES.md)。
 
 ## 安全与隐私
 

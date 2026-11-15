@@ -1908,37 +1908,18 @@ compose up -d --force-recreate api
 
 ### 11.2 完整流程（全新安装）
 
-1. **从可信发布目录挑一个版本，再去 Release 正文取它的 index digest。** 目录文件是
-   `deploy/releases.json`（schema 1，只记录**发布决策**：`version`、源 `commit`、
-   `min_from`、`has_migration`、`released_at`；格式与校验规则见
-   `deploy/release/catalog.py` 文件头）：
+1. **从正式 Release 对应的 release workflow job summary 取得 API 镜像 index digest。**
+   Release 正文中的 digest 仅方便复制、可被编辑；手工安装前与该次运行的 `image` 作业
+   summary 核对。网页更新器则直接从 GHCR 发现稳定版 tag 和 digest，二者不要混为一谈。
 
-   ```bash
-   python3 deploy/release/catalog.py validate    # CI 也跑这一条，坏了就不该用
-   ```
+   > **摘要来源**：API 镜像使用 `ghcr.io/qsbb/ling-api@sha256:<64 hex>` 形式的
+   > index digest。网页更新器从 GHCR 的稳定版 tag 列表读取最新版本和 digest，并确认
+   > index 包含当前宿主平台；它不读取 `deploy/releases.json` 来选择目标。该文件仍由 CI
+   > 校验并保留为仓库发布元数据，但不是部署安装清单或网页更新信任源。
 
-   > 这条校验工具用到了 `datetime.UTC`，需要 **Python 3.11+**（本机 `python3` 是
-   > 3.9/3.10 时会直接 `ImportError`）；CI 用 `setup-python` 安装的版本跑，没问题。
-   > `ling` / `publish.py` 本身不需要第三方依赖，也没有这个版本限制。
-
-   > **目录里没有 digest。** 目标摘要是"构建之后才存在"的值，而目录条目是"构建
-   > 之前就要提交"的发布元数据，两者顺序相反；过去要求先写死 digest，导致每发一版
-   > 都要「构建 → 取 digest → 手改目录 → 再提交」，重新打包同一版本还会被 `add`
-   > 拒绝。现在：
-   >
-   > - **人工装/人工升**：digest 从该次 release workflow 的 job summary 或 Release
-   >   正文里取（**index digest**：`ghcr.io/qsbb/ling-api@sha256:<64 hex>`），交给
-   >   `ling install --digest` / `publish.py --digest`；
-   > - **网页更新**：由更新器在刷新目录时自己解析
-   >   `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>`，取**本机架构**那条
-   >   平台 manifest 的 digest。两者都被 `publish.py` 的 `verify_repo_digests` 接受，
-   >   拉取后照旧核提交/平台/当前摘要。
-   >
-   > 所以"发版"只需要一次提交：把版本/源提交/跨度写进目录（`catalog.py add`），
-   > **不需要**再回来补 digest。
-
-   > **现状**：仓库里的 `deploy/releases.json` 目前有 `0.0.3`（`min_from` 0.0.2，
-   > 含迁移）。发布新版本时按上面的格式追加一条，不要手填一个"看起来像"的摘要。
+   > 截至 2026-11-16，最新正式 Release 为 `v0.0.8`，发布于 2026-11-13；其两个镜像
+   > digest 已由对应 workflow 的 `image` / `updater-image` 作业核验。当前工作树同样报告
+   > 版本 `0.0.8`，但候选 `c86c84d` 比该 Release 提交多 37 个提交，不应当作已发布镜像。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -2044,12 +2025,13 @@ python3 deploy/release/publish.py \
 退出码能区分失败阶段：`0` 成功、`2` 参数/非 digest、`10` 预检、`11` 锁、`12`
 归档、`13` 备份、`14` 拉取/身份、`15` 迁移、`16` 迁移后的切换/验证失败。
 
-**网页更新**：需要独立 `ling-updater` 与新的镜像更新通道。通道代码已就绪，且在
-隔离项目 `ling-drill` 上真机跑通了三次连续升级；生产 `ling` 已于 2026-11-05 迁到
-镜像模式，但**两次连续网页升级没在生产上走完**——目前只发布过一个镜像摘要
-（`42bba216`），没有第二个 digest。镜像模式 compose 里 `LING_UPDATE_ENABLED` 仍
-默认 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改 `.env` 打开）。仓库里的 `deploy/releases.json` 现在有 `0.0.3` 一条（`min_from` 为 `0.0.2`，且**不含 digest**：摘要由更新器刷新目录时从 registry 解析）；部署机当前版本不在那条的 `min_from` 里时，网页仍会显示 `no_available_target`。
-所以现在仍不要对用户宣称"可以在网页里更新"（细节与未验证项见
+**网页更新**：需要独立 `ling-updater` 与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
+三次连续升级；这不等于当前候选已完成容器与浏览器复验。`LING_UPDATE_ENABLED` 仍默认
+`0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
+`.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
+`deploy/releases.json` 决定。`v0.0.8` 已正式发布并有 CI 核验过的 API / updater digest；
+本次没有检查生产环境，且当前候选 `c86c84d` 尚未做镜像更新容器与真实浏览器验收，因此
+仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
 ### 11.4 三条硬边界
@@ -2102,11 +2084,12 @@ python3 deploy/release/publish.py \
 > `ling-drill` 上真机跑通**（不是 stub；记录见 `shots/deploy-research/`）。
 > **生产 `ling` 已于 2026-11-05 迁移到镜像模式**（过程见 §6：首装曾失败、手工补齐、
 > `ling adopt --force` 登记，记录里 14 项 `unknown`），但那是**一次人工迁移**，
-> 不是演练；演练意义上的下面这些**仍未完成**：两次连续网页升级（目前只发布过一个
-> 镜像摘要 `42bba216`，没有第二个 digest 可升）、head 不一致 / 并发请求 / 旧执行器
-> 残留的故障注入、中断中任务的对账（仅单测）、生产库有真实数据时的恢复（生产库
-> `messages=0`/`memories=0`）、arm64 运行、真实浏览器端到端点一遍。
-> GHCR package 可见性、宿主架构、真实部署路径与端口仍要现场确认，
+> 不是演练。`v0.0.8` 已正式发布并有 CI 核验过的 API / updater digest，旧记录“只发布过
+> 一个摘要”已过期；这本身不证明当前候选的连续网页升级已通过。head 不一致 / 并发请求 /
+> 旧执行器残留的故障注入、中断中任务的对账（仅单测）、生产库有真实数据时的恢复
+> （历史记录 `messages=0`/`memories=0`）、arm64 运行，以及当前候选的镜像更新浏览器流程
+> 仍未完成。本次没有连接生产或部署主机；其当前版本、GHCR 可达性、架构、部署路径与端口、
+> 更新器 Docker socket/GID 仍需现场确认。
 > 不要照抄 `/opt/ling`、`/vol1/ling-backups` 这类示例。
 
 ### 11.6 语音条依赖（ffmpeg + pysilk-mod）
