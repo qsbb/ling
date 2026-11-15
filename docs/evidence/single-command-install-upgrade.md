@@ -65,3 +65,13 @@ README.md: 23b2220d863514f6031b35db304bef9f14d68442c412936636c356a0e6f96916
 - 暂时把 heredoc 注释恢复成 `` `ports` `` 后，测试因 stderr 出现 `command not found` 失败；恢复后脚本 SHA-256 与同一基线一致。
 
 两次变异后 `tests/test_deploy_install.py` 的 SHA-256 均为 `895d16edc3c45f1598185c0aa40d8dad846d1969411b08404e6a345f718798d4`，`git status --short` 与变异前列出的文件一致。
+
+## 2026-11-16 5.21 容器与浏览器补测
+
+测试实例使用独立 Compose 项目 `ling-e2e-20261116` 和端口 `20481`。首次安装前删除了临时检出里的 `.env`，从 `85fb0b4` 执行 `deploy/install.sh`，由安装器生成配置并经 Dockerfile 的 web 阶段构建前端；`/readyz` 返回 200。测试额外注入 `LING_TEST_MODE=1` 与临时管理员口令，回复由 fake provider 生成。
+
+随后用相同项目、端口和数据卷从 `85fb0b4` 部署到 `d7e8e676`，并从前一提交建立测试分支执行 `deploy/upgrade.sh`，验证其从本地测试 bundle 快进到 `d7e8e676`。各次安装均完成 `/readyz` 检查。`.env` 权限为 `600`，升级前后 SHA-256 均为 `d491d51f9f07c06a6d0188a8dcf860ee3685cbd15ef708e84839b6c40ddebe52`；PostgreSQL 卷保持为 `ling-e2e-20261116_db-data`。首次浏览器实测后，用户 1、会话 2、对话轮次 4、消息 8；直接升级后这四项计数相同。
+
+用 Playwright 1.63.0 和 Chromium 153 通过 SSH 本地转发运行 `tests/e2e/w0_browser.mjs`。首次安装后与直接升级后各通过 34/34。`deploy/upgrade.sh` 部署后有一次 28/34，其中总览登录与数据断言失败；同一时间段 API 日志观察到 `/v1/auth/login` 返回 200 和 `/v1/dashboard` 返回 401。单独浏览器复现时登录 cookie 存在且总览返回 200，完整复跑通过 34/34。此次 401 的原因未定位，记录为一次未稳定复现的观测，不能当作已修复。
+
+这组浏览器测试覆盖登录、对话流式输出、停止、失败重试、历史恢复、设置、账号、总览和手机视口。测试模式使用 fake provider，不代表真实模型质量，也没有验证 STT/ASR。收尾已移除该 Compose 项目、容器、数据库和应用卷及生成的 `.env`；测试端口已关闭，原有容器仍在运行。
