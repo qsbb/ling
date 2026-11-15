@@ -97,6 +97,9 @@ async def login(
         path="/",
     )
     effective = await config.effective()
+    # Yield-dependency cleanup may run after the response has been sent. Commit
+    # the session row first so a browser's immediate follow-up request can see it.
+    await session.commit()
     return LoginOut(
         user=UserOut(**result.user.__dict__),
         config_revision=effective.revision,
