@@ -4,7 +4,8 @@
 #   clients/web-console/{package.json,pnpm-lock.yaml,index.html,tsconfig.json,
 #                        vite.config.ts,src/**}
 #   pyproject.toml、README.md、alembic.ini
-#   deploy/{Dockerfile.api,entrypoint.sh,web_manifest.py,requirements.runtime.lock}
+#   deploy/{Dockerfile.api,entrypoint.sh,web_manifest.py,requirements.runtime.lock,
+#           configure_apt_mirror.py}
 #   src/**、connectors/**、migrations/**
 # 改这个文件时请对照 Dockerfile 的 COPY 列表一起看。
 .git

@@ -35,6 +35,7 @@ BACKEND_FILES = [
     "README.md",
     "alembic.ini",
     "deploy/Dockerfile.api",
+    "deploy/configure_apt_mirror.py",
     "deploy/entrypoint.sh",
     "deploy/requirements.runtime.lock",
 ]
@@ -150,6 +151,7 @@ _DOCKER = """#!/usr/bin/env python3
 import json
 import os
 import pathlib
+import shutil
 import sys
 
 
@@ -218,9 +220,41 @@ if args[0] == "version":
     print("27.0.0" if "--format" in args else "Docker version 27.0.0")
     sys.exit(0)
 if args[0] == "image":
-    sys.exit(int(os.environ.get("STUB_IMAGE_INSPECT_EXIT", "1")))
+    if len(args) > 1 and args[1] == "inspect":
+        sys.exit(int(os.environ.get("STUB_IMAGE_INSPECT_EXIT", "1")))
+    if len(args) > 1 and args[1] == "rm":
+        sys.exit(int(os.environ.get("STUB_WEB_IMAGE_RM_EXIT", "0")))
+    log("docker-unknown " + " ".join(args))
+    sys.exit(64)
 if args[0] == "pull":
     sys.exit(int(os.environ.get("STUB_PULL_EXIT", "0")))
+if args[0] == "build":
+    if "--target" not in args or args[args.index("--target") + 1] != "web":
+        log("docker-unknown " + " ".join(args))
+        sys.exit(64)
+    sys.exit(int(os.environ.get("STUB_WEB_BUILD_EXIT", "0")))
+if args[0] == "create":
+    sys.stdout.write("stub-web-container\\n")
+    sys.exit(0)
+if args[0] == "cp":
+    code = int(os.environ.get("STUB_WEB_CP_EXIT", "0"))
+    if code:
+        sys.exit(code)
+    destination = pathlib.Path(args[-1])
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "assets").mkdir(exist_ok=True)
+    (destination / "index.html").write_text(
+        "<!doctype html><title>fresh</title>\\n", encoding="utf-8"
+    )
+    (destination / "assets" / "app.js").write_text(
+        'console.log("fresh");\\n', encoding="utf-8"
+    )
+    public = pathlib.Path("clients/web-console/public")
+    if public.is_dir():
+        shutil.copytree(public, destination, dirs_exist_ok=True)
+    sys.exit(0)
+if args[0] == "rm":
+    sys.exit(int(os.environ.get("STUB_WEB_CONTAINER_RM_EXIT", "0")))
 if args[0] != "compose":
     # 严格模式：未知 docker argv 一律非 0，避免“任何命令都成功”的假阳性。
     log("docker-unknown " + " ".join(args))
@@ -311,11 +345,12 @@ if "build" in args:
     )
     sys.exit(int(os.environ.get("STUB_BUILD_EXIT", "0")))
 if "up" in args:
-    if os.environ.get("STUB_UP_REQUIRE_DIST") == "1" and not pathlib.Path(
-        "clients/web-console/dist"
-    ).is_dir():
-        sys.stderr.write("up: clients/web-console/dist is missing")
-        sys.exit(9)
+    if os.environ.get("STUB_UP_REQUIRE_DIST") == "1":
+        dist = pathlib.Path("clients/web-console/dist")
+        if not (dist / "index.html").is_file() or not (dist / "assets").is_dir():
+            sys.stderr.write("up: clients/web-console/dist is missing its static entry")
+            sys.exit(9)
+        log("up-dist-validated")
     chmod_mode = os.environ.get("STUB_UP_CHMOD_DIST")
     if chmod_mode:
         os.chmod("clients/web-console/dist", int(chmod_mode, 8))
@@ -477,6 +512,7 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
     proc, calls = run_install(repo, env, STUB_UP_REQUIRE_DIST="1")
 
     assert proc.returncode == 0, proc.stderr
+    assert "command not found" not in proc.stderr
     assert "pnpm install --frozen-lockfile" in calls
     assert "pnpm build --outDir" in calls
     assert "--emptyOutDir" in calls
@@ -493,6 +529,7 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
     assert calls.index("pnpm build") < calls.index(docker_build)
     assert calls.index("config --format json") < calls.index(docker_build)
     assert calls.index(docker_build) < calls.index("up -d --no-build")
+    assert "在线前端入口缺失，先发布已校验产物再启动 API" in proc.stdout
     assert "compose 实际挂载的 /app/web 与本次校验产物一致" in proc.stdout
 
     data = json.loads(manifest_path(repo).read_text(encoding="utf-8"))
@@ -516,6 +553,8 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
     assert "http://127.0.0.1:18080" in proc.stdout
     assert "用户名      ling" in proc.stdout
     assert "首次安装" in proc.stdout
+    assert "bash deploy/upgrade.sh" in proc.stdout
+    assert "当前检出，不拉取代码" in proc.stdout
     assert "--offline" not in calls
 
     for key in ("POSTGRES_PASSWORD", "LING_ROOT_KEY"):
@@ -525,6 +564,55 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
         assert value not in proc.stderr
 
     assert (dist_dir(repo) / "index.html").read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_default_install_builds_web_with_docker_when_host_pnpm_is_missing(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    repo, env = fake_repo
+    bin_dir = Path(env["PATH"].split(os.pathsep, 1)[0])
+    (bin_dir / "pnpm").unlink()
+    env["PATH"] = f"{bin_dir}{os.pathsep}/usr/bin:/bin"
+
+    proc, calls = run_install(repo, env, STUB_UP_REQUIRE_DIST="1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "宿主未安装 pnpm，使用 Dockerfile 的 web 阶段构建前端" in proc.stdout
+    assert "pnpm install" not in calls
+    assert "pnpm build" not in calls
+    docker_web_build = next(
+        line
+        for line in calls.splitlines()
+        if line.startswith("docker build ") and "--target web" in line
+    )
+    docker_cp = next(line for line in calls.splitlines() if line.startswith("docker cp "))
+    compose_build = docker_build_line(calls)
+    assert calls.index(docker_web_build) < calls.index(docker_cp) < calls.index(compose_build)
+    assert "docker rm stub-web-container" in calls
+    assert any(line.startswith("docker image rm ling-web-export:") for line in calls.splitlines())
+    assert (dist_dir(repo) / "index.html").read_text(encoding="utf-8").startswith(
+        "<!doctype html>"
+    )
+
+
+def test_docker_web_export_failure_cleans_temporary_container_and_image(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    repo, env = fake_repo
+    bin_dir = Path(env["PATH"].split(os.pathsep, 1)[0])
+    (bin_dir / "pnpm").unlink()
+    env["PATH"] = f"{bin_dir}{os.pathsep}/usr/bin:/bin"
+
+    proc, calls = run_install(repo, env, STUB_WEB_CP_EXIT="23")
+
+    assert proc.returncode != 0
+    assert "无法从临时前端构建容器导出静态文件" in proc.stderr
+    assert "docker rm stub-web-container" in calls
+    assert any(line.startswith("docker image rm ling-web-export:") for line in calls.splitlines())
+    assert not any(
+        line.startswith("docker compose") and (" build" in line or " up " in line)
+        for line in calls.splitlines()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1631,7 +1719,7 @@ def test_readyz_failure_keeps_old_frontend(
 
     assert proc.returncode != 0
     assert "等了 120 秒还没就绪" in proc.stderr
-    assert "前端尚未发布" in proc.stdout
+    assert "在线 dist 保持发布前内容" in proc.stdout
     assert "前端已发布" not in proc.stdout
     assert tree_hash(dist_dir(repo)) == before
 

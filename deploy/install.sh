@@ -500,6 +500,8 @@ LIVE_DIST="$ROOT/$WEB_DIR/dist"
 TMP_BASE=""
 PREV_DIST=""
 WEB_STAGING=""
+WEB_EXPORT_IMAGE=""
+WEB_EXPORT_CONTAINER=""
 HAS_PREV=0
 PUBLISHED=0
 KEEP_TMP=0
@@ -518,6 +520,12 @@ need_tmp() {
 
 cleanup() {
   local rc=$?
+  if [ -n "$WEB_EXPORT_CONTAINER" ]; then
+    docker rm "$WEB_EXPORT_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$WEB_EXPORT_IMAGE" ]; then
+    docker image rm "$WEB_EXPORT_IMAGE" >/dev/null 2>&1 || true
+  fi
   if [ -n "$TMP_BASE" ] && [ -d "$TMP_BASE" ]; then
     if [ "$KEEP_TMP" = "1" ]; then
       printf '%s!%s 保留安装临时目录供人工恢复：%s\n' "$YEL" "$RST" "$TMP_BASE" >&2
@@ -1366,49 +1374,73 @@ verify_compose_layout() {
   adopt_compose_api_port
 }
 
+build_web_from_docker() {
+  WEB_EXPORT_IMAGE="ling-web-export:${TMP_BASE##*/}"
+  say "宿主未安装 pnpm，使用 Dockerfile 的 web 阶段构建前端…"
+  if ! docker build --target web --tag "$WEB_EXPORT_IMAGE" -f deploy/Dockerfile.api .; then
+    die "Docker 前端构建失败；请检查 Node 基础镜像与依赖源"
+  fi
+  WEB_EXPORT_CONTAINER=$(docker create "$WEB_EXPORT_IMAGE") || die "无法创建临时前端构建容器"
+  [ -n "$WEB_EXPORT_CONTAINER" ] || die "Docker 未返回临时前端构建容器 ID"
+  if ! docker cp "$WEB_EXPORT_CONTAINER:/web/dist/." "$WEB_STAGING/"; then
+    die "无法从临时前端构建容器导出静态文件"
+  fi
+  docker rm "$WEB_EXPORT_CONTAINER" >/dev/null || die "无法清理临时前端构建容器"
+  WEB_EXPORT_CONTAINER=""
+  if docker image rm "$WEB_EXPORT_IMAGE" >/dev/null; then
+    WEB_EXPORT_IMAGE=""
+  else
+    warn "无法清理临时前端构建镜像：$WEB_EXPORT_IMAGE"
+  fi
+}
+
 build_web() {
-  command -v pnpm >/dev/null || die "缺 pnpm；若目标机离线，请先在构建机运行 --build-web-only，再传递同一源码与 dist 并使用 --prebuilt-web"
   need_tmp
   snapshot_live_dist
-  say "用 pnpm 构建前端到暂存目录（pnpm $(pnpm --version)；锁文件固定安装）…"
-  local -a install_args=(install --frozen-lockfile)
-  if [ "$WEB_OFFLINE" = "1" ]; then
-    install_args+=(--offline)
-    warn "显式离线模式：仅适用于已缓存全部锁文件依赖的构建环境"
-  fi
-  if ! ( cd "$WEB_DIR" && pnpm "${install_args[@]}" ); then
-    if live_unchanged; then
-      if [ "$WEB_OFFLINE" = "0" ]; then
-        die "前端依赖安装/构建失败；网络不可用时请使用匹配发布源码和 dist 的 --build-web-only / --prebuilt-web 流程"
-      fi
-      die "离线前端安装/构建失败；请在依赖缓存完整的环境构建，或用 --prebuilt-web 提供校验通过的产物"
-    fi
-    warn "依赖安装失败且在线 dist 被改动，正在还原"
-    if ! restore_live_dist; then
-      warn "自动还原失败；发布前备份保留在 $PREV_DIST"
-      KEEP_TMP=1
-    fi
-    die "前端依赖安装/构建失败，且在线 dist 被改动；已拒绝继续（请检查 pnpm 输出）"
-  fi
+  rm -rf "$WEB_STAGING" || die "无法清理前端暂存目录"
+  mkdir -p "$WEB_STAGING" || die "无法创建前端暂存目录"
 
-  rm -rf "$WEB_STAGING" || die "无法清理暂存目录"
-  mkdir -p "$WEB_STAGING" || die "无法创建暂存目录"
-  # 关键：把 Vite 的 outDir 指到仓库外的暂存目录。compose 把在线 dist
-  # 以 bind mount 挂进 api，直接 `pnpm build` 会因 emptyOutDir 先删光
-  # 在线 dist——旧容器在构建失败时会立刻失去前端。
-  if ! ( cd "$WEB_DIR" && pnpm build --outDir "$WEB_STAGING" --emptyOutDir ); then
-    if live_unchanged; then
-      if [ "$WEB_OFFLINE" = "0" ]; then
-        die "前端依赖安装/构建失败；网络不可用时请使用匹配发布源码和 dist 的 --build-web-only / --prebuilt-web 流程"
+  if command -v pnpm >/dev/null 2>&1; then
+    say "用 pnpm 构建前端到暂存目录（pnpm $(pnpm --version)；锁文件固定安装）…"
+    local -a install_args=(install --frozen-lockfile)
+    if [ "$WEB_OFFLINE" = "1" ]; then
+      install_args+=(--offline)
+      warn "显式离线模式：仅适用于已缓存全部锁文件依赖的构建环境"
+    fi
+    if ! ( cd "$WEB_DIR" && pnpm "${install_args[@]}" ); then
+      if live_unchanged; then
+        if [ "$WEB_OFFLINE" = "0" ]; then
+          die "前端依赖安装/构建失败；网络不可用时请使用匹配发布源码和 dist 的 --build-web-only / --prebuilt-web 流程"
+        fi
+        die "离线前端安装/构建失败；请在依赖缓存完整的环境构建，或用 --prebuilt-web 提供校验通过的产物"
       fi
-      die "离线前端安装/构建失败；请在依赖缓存完整的环境构建，或用 --prebuilt-web 提供校验通过的产物"
+      warn "依赖安装失败且在线 dist 被改动，正在还原"
+      if ! restore_live_dist; then
+        warn "自动还原失败；发布前备份保留在 $PREV_DIST"
+        KEEP_TMP=1
+      fi
+      die "前端依赖安装/构建失败，且在线 dist 被改动；已拒绝继续（请检查 pnpm 输出）"
     fi
-    warn "构建失败且在线 dist 被改动，正在还原"
-    if ! restore_live_dist; then
-      warn "自动还原失败；发布前备份保留在 $PREV_DIST"
-      KEEP_TMP=1
+    # 把 Vite 的 outDir 指到仓库外的暂存目录。compose 把在线 dist 以 bind
+    # mount 挂进 api，直接 `pnpm build` 会因 emptyOutDir 先删光在线 dist。
+    if ! ( cd "$WEB_DIR" && pnpm build --outDir "$WEB_STAGING" --emptyOutDir ); then
+      if live_unchanged; then
+        if [ "$WEB_OFFLINE" = "0" ]; then
+          die "前端依赖安装/构建失败；网络不可用时请使用匹配发布源码和 dist 的 --build-web-only / --prebuilt-web 流程"
+        fi
+        die "离线前端安装/构建失败；请在依赖缓存完整的环境构建，或用 --prebuilt-web 提供校验通过的产物"
+      fi
+      warn "构建失败且在线 dist 被改动，正在还原"
+      if ! restore_live_dist; then
+        warn "自动还原失败；发布前备份保留在 $PREV_DIST"
+        KEEP_TMP=1
+      fi
+      die "前端构建失败，且在线 dist 被改动；已还原并拒绝继续"
     fi
-    die "前端构建失败，且在线 dist 被改动；已还原并拒绝继续"
+  elif [ "$ACTION" = "build-web-only" ]; then
+    die "缺 pnpm；--build-web-only 不会调用 Docker，请在构建机安装 pnpm 9 后重试"
+  else
+    build_web_from_docker
   fi
 
   if ! live_unchanged; then
@@ -1449,6 +1481,18 @@ ensure_live_dist_dir() {
   if [ "$WEB_MODE" != "prebuilt" ] && [ ! -w "$LIVE_DIST" ]; then
     die "在线前端目录不可写：${LIVE_DIST}（请检查所有者/权限）"
   fi
+}
+
+# 首次安装或 dist 缺少 API 启动所需的静态入口时，必须先把已校验产物放进
+# bind mount 源目录。否则 compose up 会用空宿主目录遮住镜像内的 /app/web，
+# StaticFiles 在应用导入时退出，安装器永远等不到 readyz。
+publish_web_if_unusable() {
+  [ "$WEB_MODE" != "prebuilt" ] || return 0
+  if [ -f "$LIVE_DIST/index.html" ] && [ -d "$LIVE_DIST/assets" ]; then
+    return 0
+  fi
+  say "在线前端入口缺失，先发布已校验产物再启动 API…"
+  publish_web
 }
 
 # 把暂存产物原地同步到在线 dist。目录本身不换名、不删除、不重建，
@@ -1524,7 +1568,10 @@ start_services() {
     return 0
   fi
   warn "docker compose up 失败（退出码 ${rc}）"
-  die "启动失败（上面有日志）；前端未发布，在线 dist 未被替换（首次安装时可能为空目录）；但新容器可能已部分创建/替换，请检查容器状态"
+  if [ "$PUBLISHED" = "1" ]; then
+    die "启动失败（上面有日志）；首次安装前端已保留在在线 dist，便于修复后重试；新容器可能已部分创建/替换，请检查容器状态"
+  fi
+  die "启动失败（上面有日志）；在线 dist 保持发布前内容；新容器可能已部分创建/替换，请检查容器状态"
 }
 
 # --- 前置检查 -------------------------------------------------------------
@@ -1560,7 +1607,7 @@ LING_TEST_MODE=0
 LING_COOKIE_SECURE=0
 LING_PORT=$PORT
 # api 自己发布固定宿主端口（LING_PORT），而 compose 非 swarm 模式下
-# `ports` 只能给一个容器 —— 2 副本会端口冲突、第二个起不来。
+# ports 只能给一个容器 —— 2 副本会端口冲突、第二个起不来。
 # 所以这里与 compose 默认值（replicas: ${LING_API_REPLICAS:-1}）保持一致：
 # 一条命令装出来的就是 1 副本。要多副本必须自己前置反代（deploy/nginx.conf
 # 保留给那种用法，但它不再是 compose 服务）。
@@ -1803,7 +1850,11 @@ wait_ready() {
   done
   dc ps || true
   dc logs --tail 30 api || true
-  warn "服务未就绪；前端尚未发布，在线 dist 未被替换（首次安装时可能是空目录）"
+  if [ "$PUBLISHED" = "1" ]; then
+    warn "首次安装前端已在启动前发布并保留在在线 dist，便于修复后重试"
+  else
+    warn "服务未就绪；在线 dist 保持发布前内容"
+  fi
   warn "新的后端容器可能已经替换旧容器：请按容器日志/数据库迁移结果人工决定回滚镜像，不能只回滚前端"
   die "等了 120 秒还没就绪（检查端口 ${USE_PORT}，来自 compose 解析）"
 }
@@ -1826,7 +1877,8 @@ install_summary() {
   say "  常用："
   say "    bash deploy/install.sh --status      # 状态"
   say "    bash deploy/install.sh --logs api    # 日志"
-  say "    bash deploy/install.sh               # 升级（重新构建并滚动重启）"
+  say "    bash deploy/upgrade.sh               # 获取远端快进更新并部署"
+  say "    bash deploy/install.sh               # 仅部署当前检出，不拉取代码"
   say "    bash deploy/install.sh --down        # 停掉（数据保留）"
 }
 
@@ -1857,6 +1909,9 @@ do_install() {
   build_images
   # 必须在 up 之前让 bind mount 源目录存在；默认模式还要求可写。
   ensure_live_dist_dir
+  # 可用的旧前端允许在新后端 ready 后再切换；首次安装没有旧前端时，
+  # 要先填充 bind mount，否则 API 会因 /app/web/assets 缺失而启动失败。
+  publish_web_if_unusable
   # 从这里开始会改运行状态（起/替容器）；此后的失败都可能是“已迁移/已重启”，
   # 执行器看到 deploy/verify 就应该走人工确认，而不是盲目回滚。
   phase_write deploy
@@ -1865,7 +1920,7 @@ do_install() {
   wait_ready
   if [ "$WEB_MODE" = "prebuilt" ]; then
     ok "预构建前端保持不变（未替换在线 dist）"
-  else
+  elif [ "$PUBLISHED" != "1" ]; then
     publish_web
   fi
   # 只有前端发布（或预构建确认）也完成才算整条部署成功。
