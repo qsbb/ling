@@ -1953,6 +1953,81 @@ def test_dockerfile_ships_connectors_package() -> None:
     assert "connectors" in pyproject, "pyproject 没把 connectors 打进 wheel"
 
 
+def _assert_dockerfile_source_cache_layout(text: str) -> None:
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    dependency_start = lines.index("FROM ${LING_PYTHON_BASE} AS runtime-dependencies")
+    app_start = lines.index("FROM ${LING_PYTHON_BASE} AS app-wheel")
+    runtime_start = lines.index("FROM ${LING_PYTHON_BASE} AS runtime")
+    dependencies = lines[dependency_start:app_start]
+    app = lines[app_start:runtime_start]
+    runtime = lines[runtime_start:]
+
+    assert "COPY deploy/requirements.runtime.lock ./requirements.runtime.lock" in dependencies
+    assert any(line.startswith("RUN pip wheel") for line in dependencies)
+    assert "COPY src ./src" not in dependencies, "依赖层不能复制应用源码"
+    assert "COPY connectors ./connectors" not in dependencies, "依赖层不能复制渠道源码"
+    assert app.index("COPY src ./src") < app.index(
+        "RUN python -m build --wheel --no-isolation --outdir /app-wheel"
+    )
+
+    dependency_wheels = runtime.index(
+        "COPY --from=runtime-dependencies /wheels /wheels"
+    )
+    dependency_install = next(
+        index
+        for index, line in enumerate(runtime)
+        if line.startswith("RUN pip install --no-cache-dir --no-index --find-links /wheels")
+    )
+    assert runtime[dependency_install + 1].startswith(
+        "-r /tmp/requirements.runtime.lock"
+    )
+    app_wheel = runtime.index("COPY --from=app-wheel /app-wheel /app-wheel")
+    app_install = next(
+        index
+        for index, line in enumerate(runtime)
+        if line.startswith(
+            "RUN pip install --no-cache-dir --no-index --no-deps /app-wheel/*.whl"
+        )
+    )
+    source_copy = runtime.index("COPY --chown=ling:ling src ./src")
+    assert dependency_wheels < dependency_install < app_wheel < app_install < source_copy
+    assert runtime.index('ARG LING_COMMIT=""') > runtime.index(
+        "RUN chmod +x /app/deploy/entrypoint.sh"
+    ), "提交元数据不能使内容层缓存失效"
+
+
+def test_dockerfile_keeps_dependency_and_application_layers_separate() -> None:
+    from pathlib import Path
+
+    text = Path("deploy/Dockerfile.api").read_text()
+    _assert_dockerfile_source_cache_layout(text)
+
+
+def test_dockerfile_cache_guard_rejects_source_and_metadata_regressions() -> None:
+    from pathlib import Path
+
+    text = Path("deploy/Dockerfile.api").read_text()
+    source_mutant = text.replace(
+        "WORKDIR /build\nCOPY deploy/requirements.runtime.lock",
+        "WORKDIR /build\nCOPY src ./src\nCOPY deploy/requirements.runtime.lock",
+        1,
+    )
+    with pytest.raises(AssertionError, match="依赖层不能复制应用源码"):
+        _assert_dockerfile_source_cache_layout(source_mutant)
+
+    metadata_mutant = text.replace(
+        "COPY --from=runtime-dependencies /wheels /wheels",
+        'ARG LING_COMMIT=""\nCOPY --from=runtime-dependencies /wheels /wheels',
+        1,
+    )
+    with pytest.raises(AssertionError, match="提交元数据不能使内容层缓存失效"):
+        _assert_dockerfile_source_cache_layout(metadata_mutant)
+
+
 def test_worker_container_has_network_egress() -> None:
     """worker 必须能出网。
 

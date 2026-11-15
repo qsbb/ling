@@ -195,6 +195,7 @@ def deploy_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "alembic.ini",
         "deploy/Dockerfile.api",
         "deploy/entrypoint.sh",
+        "deploy/requirements.runtime.lock",
     ):
         _touch(repo / rel, f"# stub {rel}\n")
     for rel in ("src/ling/__init__.py", "connectors/__init__.py", "migrations/versions/.keep"):

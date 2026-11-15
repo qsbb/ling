@@ -1,10 +1,10 @@
-# 注意：镜像构建（deploy/Dockerfile.api，三阶段）会在**镜像内**构建 Web，
+# 注意：镜像构建（deploy/Dockerfile.api，四阶段）会在**镜像内**构建 Web，
 # 并调用 deploy/web_manifest.py 生成/校验前端清单。下面这些路径是构建输入，
 # **不能**排除，否则 `pnpm build` 或清单生成会直接失败（fail closed，不是静默降级）：
 #   clients/web-console/{package.json,pnpm-lock.yaml,index.html,tsconfig.json,
 #                        vite.config.ts,src/**}
 #   pyproject.toml、README.md、alembic.ini
-#   deploy/{Dockerfile.api,entrypoint.sh,web_manifest.py}
+#   deploy/{Dockerfile.api,entrypoint.sh,web_manifest.py,requirements.runtime.lock}
 #   src/**、connectors/**、migrations/**
 # 改这个文件时请对照 Dockerfile 的 COPY 列表一起看。
 .git

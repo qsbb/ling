@@ -43,6 +43,7 @@ backend_files = [
     "alembic.ini",
     "deploy/Dockerfile.api",
     "deploy/entrypoint.sh",
+    "deploy/requirements.runtime.lock",
 ]
 backend_dirs = ["src", "connectors", "migrations"]
 skip_names = {

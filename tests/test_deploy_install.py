@@ -36,6 +36,7 @@ BACKEND_FILES = [
     "alembic.ini",
     "deploy/Dockerfile.api",
     "deploy/entrypoint.sh",
+    "deploy/requirements.runtime.lock",
 ]
 BACKEND_DIRS = ["src", "connectors", "migrations"]
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".DS_Store")
@@ -501,6 +502,7 @@ def test_default_install_builds_then_starts_and_prints_help_without_secrets(
     assert "src/App.tsx" in data["release_inputs"]
     assert "public/robots.txt" in data["release_inputs"]
     assert "backend/src/ling/__init__.py" in data["release_inputs"]
+    assert "backend/deploy/requirements.runtime.lock" in data["release_inputs"]
 
     env_text = (repo / "deploy" / ".env").read_text(encoding="utf-8")
     # 只断言**生效行**：绝对路径只允许出现在注释里当人工核对提示。旧断言直接
