@@ -197,4 +197,37 @@ worker 容器 ID 为 `bcb45f76c6755658e61b11bef5df2ab04278cd4c63ab60d6269bfe5e95
 
 **整体发版验收仍为 No-Go。** `0.0.9` 尚无正式 GHCR 稳定镜像，真实网页镜像更新
 的直连与加速线路、两次连续升级、更新器中断及状态对账未绑定到本候选验收。
-源码模式备份恢复与回滚也尚未实测。本轮未推送、打 tag、创建 Release 或操作生产环境。
+源码模式在线业务库实际恢复与跨 schema 回退尚未实测。本轮未推送、打 tag、创建
+Release 或操作生产环境。
+
+### 备份、恢复演练与人工切换补测
+
+验收方先固定备份产物、实际记录、配置与媒体哈希、容器身份、失败阶段及重试的判据，
+再在同一隔离项目执行。在线备份退出码为 0；manifest 中 PostgreSQL dump、墓碑
+与媒体文件的 SHA-256 均与产物一致，墓碑状态为 `ok`，根密钥来源为 `env`，媒体
+状态为 `present`。`restore_drill.sh` 退出码为 0，演练库
+`ling_009_accept_drill` 的迁移 head 为 `0078_proactive_daily_quota`，用户、会话、
+轮次、消息计数为 1、2、4、8，数据库哨兵仍为 `root-077-retry`；在线服务保持 200。
+停止 API/worker 后的 oneshot 备份和恢复演练也均退出码为 0，manifest 记录
+`app_data_read=oneshot`，随后服务重启成功。
+
+不存在的 Compose override 使安装器在容器变更前以退出码 1 停止；容器 ID、`.env`
+指纹、数据库和媒体哨兵不变。撤销该故障后用 `--prebuilt-web` 重试，退出码为 0，
+API、worker、PostgreSQL 恢复健康。
+
+历史 `6910890` 镜像已不在测试机，验收方从该提交重新构建本地镜像并核对 OCI
+revision。`git diff` 显示它与 `0cfc9be` 的业务源码、迁移、Dockerfile、Compose
+及前端无差异，数据库 schema head 同为 0078。在隔离项目人工切至旧本地镜像、
+再切回 `0cfc9be` 本地镜像，两个操作均退出码为 0，`/readyz`、首页、服务健康、
+数据库和媒体哨兵保持正常。临时隔离测试用户的同一 Cookie 在当前镜像登录 200，
+切旧及切回后请求 `/v1/auth/me`、`/v1/dashboard` 均为 200，Cookie jar 哈希不变。
+该临时用户、subject、会话及口令/Cookie 临时文件已清理，最终业务计数恢复到
+1、2、4、8。跨镜像会话核验使用真实 HTTP 请求，没有重做 Chromium 双标签测试。
+
+媒体归档哨兵位于 `/data/media/acceptance/sentinel.txt`，其哈希以 `f5be91d2` 开头，
+归档内校验一致；上文 `f6d6e4c8` 哈希属于媒体目录外的
+`/data/acceptance/marker.txt`，单独用于核验应用卷保留。备份目录位于测试机
+受限路径，含私密配置快照和原始日志，未公开原文。
+
+这些结果证明同 schema 下的备份、演练库恢复、部署前失败后重试及本地镜像人工
+切换。在线业务库实际恢复、跨 schema 迁移回退及 GHCR 正式镜像网页升级仍未验收。

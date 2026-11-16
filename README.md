@@ -183,8 +183,9 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 项目中，已按一行命令验证源码模式的干净首装、快进升级与重复部署；严格 `umask 077`
 下的普通用户及 root 首装、配置与 PostgreSQL/媒体数据保留也通过。真实浏览器验证了
 首次登录、强制改密、刷新、新标签、容器普通重启和测试模式对话。测试模式使用 fake
-provider。源码模式备份恢复/回滚以及 `0.0.9` 正式镜像的网页更新、直连/加速线路与
-中断恢复仍未完成验收；自助更新默认关闭。详细范围见
+provider。隔离项目还通过了备份与恢复演练库校验，以及同 schema 本地镜像的人工
+切换和回切；在线业务库实际恢复、跨 schema 回退及 `0.0.9` 正式镜像的网页更新、
+直连/加速线路与中断恢复仍未完成验收。自助更新默认关闭。详细范围见
 [验收记录](docs/evidence/single-command-install-upgrade.md) 与 [更新说明](docs/UPDATES.md)。
 
 ## 安全与隐私
