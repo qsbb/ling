@@ -567,6 +567,7 @@ tree_replace() {
 import os
 import pathlib
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -588,6 +589,7 @@ def copy_atomic(source, target):
         fail(f"无法在 {target.parent} 创建临时文件：{exc}")
     try:
         shutil.copy2(str(source), tmp_name)
+        os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, str(target))
     except OSError as exc:
         fail(f"写入 {target} 失败：{exc}")
@@ -604,6 +606,7 @@ if dst.is_symlink():
     fail("目标目录不能是符号链接")
 try:
     dst.mkdir(parents=True, exist_ok=True)
+    os.chmod(dst, stat.S_IMODE(dst.stat().st_mode) | 0o055)
 except OSError as exc:
     fail(f"无法创建目标目录：{exc}")
 
@@ -640,6 +643,7 @@ for rel in sorted(src_files):
 for rel in sorted(src_dirs):
     try:
         (dst / rel).mkdir(parents=True, exist_ok=True)
+        os.chmod(dst / rel, stat.S_IMODE((dst / rel).stat().st_mode) | 0o055)
     except OSError as exc:
         fail(f"无法创建目录 {rel}：{exc}")
 
@@ -1460,6 +1464,7 @@ build_web() {
 ensure_web() {
   if [ "$WEB_MODE" = "prebuilt" ]; then
     web_manifest verify "$LIVE_DIST" || die "预构建前端校验失败；拒绝启动/升级"
+    web_static_accessible || die "预构建前端文件不可供容器读取；请让 dist 内目录可遍历、文件可读"
     ok "预构建前端与源码（含后端发布输入）及清单匹配"
   else
     build_web
@@ -1483,12 +1488,38 @@ ensure_live_dist_dir() {
   fi
 }
 
+# 静态资源会以非 root 用户在容器内读取，目录与文件都要有相应权限。
+web_static_accessible() {
+  python3 - "$LIVE_DIST" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(1)
+for current, dirs, files in os.walk(root, followlinks=False):
+    directory = pathlib.Path(current)
+    if stat.S_IMODE(directory.stat().st_mode) & 0o005 != 0o005:
+        raise SystemExit(1)
+    for name in dirs:
+        if (directory / name).is_symlink():
+            raise SystemExit(1)
+    for name in files:
+        path = directory / name
+        if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) & 0o004 != 0o004:
+            raise SystemExit(1)
+PY
+}
+
 # 首次安装或 dist 缺少 API 启动所需的静态入口时，必须先把已校验产物放进
 # bind mount 源目录。否则 compose up 会用空宿主目录遮住镜像内的 /app/web，
 # StaticFiles 在应用导入时退出，安装器永远等不到 readyz。
 publish_web_if_unusable() {
   [ "$WEB_MODE" != "prebuilt" ] || return 0
-  if [ -f "$LIVE_DIST/index.html" ] && [ -d "$LIVE_DIST/assets" ]; then
+  if [ -f "$LIVE_DIST/index.html" ] && [ -d "$LIVE_DIST/assets" ] \
+    && web_static_accessible; then
     return 0
   fi
   say "在线前端入口缺失，先发布已校验产物再启动 API…"

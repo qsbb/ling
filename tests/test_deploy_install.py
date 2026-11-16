@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -1644,6 +1645,51 @@ def test_publish_preserves_dist_inode_and_handles_collisions(
     assert not (dist_dir(repo) / "old-only.js").exists()
     assert (dist_dir(repo) / "index.html").read_text(encoding="utf-8").startswith("<!doctype html>")
     assert "保留目录 inode" in proc.stdout or "inode" in proc.stdout
+
+
+def test_install_publishes_web_readable_by_container_with_strict_umask(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    repo, env = fake_repo
+    Path(env["CALL_LOG"]).write_text("", encoding="utf-8")
+
+    proc = subprocess.run(
+        ["bash", "-c", "umask 077; exec bash deploy/install.sh"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    dist = dist_dir(repo)
+    for path in (dist, dist / "assets", dist / "public", dist / "public" / "nested"):
+        if path.exists():
+            assert stat.S_IMODE(path.stat().st_mode) & 0o005 == 0o005, path
+    for path in (dist / "index.html", dist / "assets" / "app.js"):
+        assert stat.S_IMODE(path.stat().st_mode) & 0o004 == 0o004, path
+
+
+def test_install_repairs_unreadable_web_left_by_failed_first_install(
+    fake_repo: tuple[Path, dict[str, str]],
+) -> None:
+    repo, env = fake_repo
+    seed_old_dist(repo)
+    dist = dist_dir(repo)
+    for path in (dist, dist / "assets"):
+        path.chmod(0o700)
+    for path in (dist / "index.html", dist / "assets" / "old.js"):
+        path.chmod(0o600)
+
+    proc, calls = run_install(repo, env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "先发布已校验产物" in proc.stdout
+    assert "up -d --no-build" in calls
+    assert stat.S_IMODE(dist.stat().st_mode) & 0o005 == 0o005
+    assert stat.S_IMODE((dist / "assets").stat().st_mode) & 0o005 == 0o005
+    assert stat.S_IMODE((dist / "index.html").stat().st_mode) & 0o004 == 0o004
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root 不受目录写权限限制")
