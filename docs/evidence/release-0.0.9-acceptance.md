@@ -43,7 +43,7 @@
   | `ghcr.io/qsbb/ling-updater:v0.0.8` | `sha256:281736db4dedcb29643b01e1be52638c6a019ce7b282bb0d83895a067281fd0f` | `sha256:9dad77f6253bc55dfe959ff8bb211973e5513337ab6a57a040de59ba540f93fd` | `sha256:a30d22af9d10d6a9587e030cf7ba30b4aceacf16f9c9b917252ecde5974d9e1b` |
 
 - Python 测试显式设置 `LING_TEST_DATABASE_URL` 与 `LING_DATABASE_URL` 为 `postgresql+asyncpg://ling@127.0.0.1:55432/ling_test`，并持有 `/tmp/ling_test_lock.sh` 提供的原子锁。测试前后只读查询均为数据库 `ling_test`、角色 `ling`、地址 `127.0.0.1:55432`；共享库 `alembic_version` 保持 `0067_connector_instances`。仓库迁移 head 为 `0078_proactive_daily_quota`；集成 fixture 使用临时 schema，迁移验收在测试自建数据库运行，本轮没有升级共享测试库。
-- `docker`、`podman`、`buildah` 均不在本机 PATH。本轮没有 SSH 到测试机或连接 NAS/生产端；不以既有生产状态作为证据。
+- 本机 PATH 没有 `docker`、`podman`、`buildah`。对 Linux 开发机（文档脱敏地址 `192.0.2.21`）只做 SSH 权限只读检查：Docker client `29.7.2`、Compose `5.5.0`；SSH 用户不在 docker 组，Docker socket 拒绝访问，`sudo -n docker` 返回“需要密码”。未成功调用 Docker daemon、未查看/改变容器或卷，也未连接 NAS/生产端。
 
 **A1 判定：通过（候选、远端状态与本地数据库隔离均有快照；不代表发布门禁通过）。**
 
@@ -62,7 +62,7 @@
 
 ### A3：源码首装与升级
 
-当前 `deploy/install.sh` / `deploy/upgrade.sh` 只完成静态语法检查，未在 `62e41c9` 的干净 Docker 环境按候选 README 命令首装、升级或做失败恢复。历史 5.21 隔离部署结果绑定 `0cfc9be`；脚本 hash 相同不足以替代完整候选运行记录。本机没有 Docker/Compose runtime，本轮不接触远端主机。
+当前 `deploy/install.sh` / `deploy/upgrade.sh` 只完成静态语法检查，未在 `62e41c9` 的干净 Docker 环境按候选 README 命令首装、升级或做失败恢复。历史隔离部署结果绑定 `0cfc9be`；脚本 hash 相同不足以替代完整候选运行记录。本机没有 Docker runtime；测试机虽安装 Docker，但当前 SSH 用户无 daemon 权限且非交互 sudo 要求密码，因此没有启动远端部署。
 
 **A3 判定：需外部动作。**
 
@@ -125,4 +125,4 @@ README、CHANGELOG、DEPLOYMENT、UPDATES、历史隔离部署说明与本记录
 
 **整体 Go/No-Go：No-Go。** 版本字符串正确、旧稳定镜像身份可核验、本地隔离测试通过，都不能替代 main 祖先、当前候选镜像和真实部署更新门禁。
 
-**唯一所需外部动作：**若要解除 No-Go，由有权限的维护者明确授权一次非生产发布验收窗口：候选经 PR 合入 `main` 并运行 release workflow，同时提供隔离 Linux Docker/PostgreSQL 环境完成候选源码安装、真实镜像/updater 与 GHCR 稳定版网页升级验收。当前明确禁止推送、打 tag、创建 Release；本轮没有执行这些动作，也没有访问 NAS 生产端。
+**唯一所需外部动作：**若要解除 No-Go，由有发布权限的维护者在后续窗口明确授权一次完整的非生产验收/发布流程：提供可运行 Docker 的隔离 Linux/PostgreSQL 执行器、将候选经 PR 合入 `main` 并运行 Release workflow，再按正式流程生成稳定镜像后完成当前候选的源码安装、真实 updater 与 GHCR 网页升级验收。该授权必须明确覆盖候选推送、稳定 tag 与 Release；本轮按用户要求均未执行，也没有访问 NAS 生产端。
