@@ -191,11 +191,17 @@ export function connectorViewOf(
   const connectors = (body as { connectors?: unknown }).connectors;
   if (!Array.isArray(connectors)) return null;
   const found = connectors.find(
-    (item): item is ConnectorView =>
-      item !== null &&
-      typeof item === 'object' &&
-      (item as { id?: unknown }).id === scope &&
-      Array.isArray((item as { fields?: unknown }).fields),
+    (item): item is ConnectorView => {
+      if (item === null || typeof item !== 'object') return false;
+      const view = item as { id?: unknown; fields?: unknown; generation?: unknown };
+      return (
+        view.id === scope &&
+        Array.isArray(view.fields) &&
+        typeof view.generation === 'number' &&
+        Number.isSafeInteger(view.generation) &&
+        view.generation >= 0
+      );
+    },
   );
   return found ?? null;
 }
@@ -767,12 +773,13 @@ export interface ConnectorInstancePanelProps {
    */
   onSelectInstance?: (instanceId: string) => void;
   /**
-   * 按实例读到的字段视图上报给页面。`fields === null` 表示"这一份不成立"
+   * 按实例读到的完整连接器视图上报给页面。`view === null` 表示"这一份不成立"
    * （读失败，或响应没回显实例、无法证明属于它），页面据此**别拿它当基准**。
    *
-   * 只对这个**选中的**实例报：页面拿它给卡片当字段视图、并据此建草案。
+   * 字段与 generation 必须来自同一次 scoped GET，否则保存会把实例字段配上默认
+   * generation，服务端会稳定返回 409。只对这个**选中的**实例上报。
    */
-  onInstanceView?: (instanceId: string, fields: ConnectorField[] | null) => void;
+  onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
   /**
    * 这个 scope 下**有未保存改动**的实例 id（由页面算，因为草案由页面持有）。
    *
@@ -905,31 +912,31 @@ export function ConnectorInstancePanel({
   }, [selectedId]);
 
   /**
-   * 把"按实例读到的字段视图"上报给页面。
+   * 把"按实例读到的连接器视图"上报给页面。
    *
    * 只报**能证明属于选中实例**的那一份（`scoped` 非空且 id 对得上）；否则报
    * `null`，让页面知道"这个实例的现状拿不到"——页面宁可让输入框空着，也不
    * 拿默认实例的值冒充。不报的话页面就没有这个实例的字段可分，卡片会画成空白
    * 而看不出原因。
    *
-   * 与选中上报同样用"值没变就不再报"断开重渲染环：字段数组只在一次成功读取后
-   * 才换新引用，所以按引用比较即可。
+   * 与选中上报同样用"值没变就不再报"断开重渲染环：视图对象只在一次成功读取后
+   * 才换新引用，所以按引用比较即可。generation 也由此与字段保持同一快照。
    */
-  const reportedView = useRef<{ instanceId: string; fields: ConnectorField[] | null } | null>(null);
+  const reportedView = useRef<{ instanceId: string; view: ConnectorView | null } | null>(null);
   useEffect(() => {
     if (selectedId === null || selectedId === DEFAULT_INSTANCE_ID) return;
-    const fields =
+    const view =
       scoped !== null &&
       scoped.instanceId === selectedId &&
       Array.isArray(scoped.view?.fields)
-        ? scoped.view.fields
+        ? scoped.view
         : null;
     const previous = reportedView.current;
-    if (previous !== null && previous.instanceId === selectedId && previous.fields === fields) {
+    if (previous !== null && previous.instanceId === selectedId && previous.view === view) {
       return;
     }
-    reportedView.current = { instanceId: selectedId, fields };
-    onInstanceView?.(selectedId, fields);
+    reportedView.current = { instanceId: selectedId, view };
+    onInstanceView?.(selectedId, view);
   }, [selectedId, scoped, onInstanceView]);
 
   /** 取字段视图；选中实例不在列表里时为 null。 */

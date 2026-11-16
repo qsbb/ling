@@ -134,6 +134,7 @@ interface PutCall {
 interface Harness {
   page: Page;
   puts: PutCall[];
+  scopedGenerations: number[];
   policyCalls: Array<{ method: 'preview' | 'save'; instanceId: string; body: unknown }>;
   /** 列表端点被调用了几次（刷新/新建后要重读）。 */
   listCalls: () => number;
@@ -149,6 +150,10 @@ interface OpenOptions {
    */
   views?: Record<string, ConnectorsResponse>;
   policyOverrides?: Record<string, WindowDialoguePolicySet>;
+  /** Mock the scoped config revision check and advance it after each accepted PUT. */
+  advanceScopedGeneration?: boolean;
+  /** Simulate a competing write before the first PUT reaches the server. */
+  conflictFirstPut?: boolean;
   /** 每次 PUT 的返回，按顺序排队；用完一律 500。 */
   plans?: { kind: 'ok'; result: ConnectorChangeResult }[];
 }
@@ -219,12 +224,12 @@ function applyPolicyChange(
   return next;
 }
 
-function changeResult(instanceId: string): ConnectorChangeResult {
+function changeResult(instanceId: string, generation = 4): ConnectorChangeResult {
   return {
     schema_version: 'v2',
     operation_id: `crev_${instanceId}`,
     scope: 'onebot',
-    generation: 4,
+    generation,
     status: 'active',
     state: 'active',
     changed: true,
@@ -250,9 +255,11 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
   const page = await context.newPage();
 
   const puts: PutCall[] = [];
+  const scopedGenerations: number[] = [];
   const policyCalls: Harness['policyCalls'] = [];
   const plans = [...(options.plans ?? [])];
   const items = options.items ?? [DEFAULT_ROW, ROW_A, ROW_B];
+  const views = options.views ?? {};
   const policyOverrides = Object.fromEntries(
     Object.entries(options.policyOverrides ?? {
       alpha: {
@@ -268,7 +275,7 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
 
   // 页面级 `GET /v1/settings/connectors`（不带实例）→ 默认实例的诊断与字段。
   const pageBody = makeResponse({
-    connectors: [makeConnector({ fields: onebotFields() })],
+    connectors: [makeConnector({ generation: 0, fields: onebotFields() })],
   });
 
   await page.route('**/*', async (route) => {
@@ -359,12 +366,14 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
       const instanceId = url.searchParams.get('instance_id');
       if (instanceId === null) return route.fulfill(json(pageBody));
       // 按实例读：**回显** instance_id，让面板能自证这份视图属于这个实例。
-      const body = options.views?.[instanceId];
+      const body = views[instanceId];
       if (!body) {
         return route.fulfill(
           json({ error: { code: 'internal', message: `测试没为实例 ${instanceId} 准备视图` } }, 500),
         );
       }
+      const scopedConnector = body.connectors.find((connector) => connector.id === 'onebot');
+      if (scopedConnector) scopedGenerations.push(scopedConnector.generation);
       return route.fulfill(
         json({
           ...body,
@@ -387,6 +396,74 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
         ifMatch: route.request().headers()['if-match'] ?? null,
         body,
       });
+      if (options.advanceScopedGeneration) {
+        const instanceId = url.searchParams.get('instance_id');
+        const currentView = instanceId === null ? undefined : views[instanceId];
+        const currentConnector = currentView?.connectors.find(
+          (connector) => connector.id === 'onebot',
+        );
+        if (!instanceId || !currentView || !currentConnector) {
+          return route.fulfill(
+            json({ error: { code: 'internal', message: '缺少实例版本视图' } }, 500),
+          );
+        }
+        if (options.conflictFirstPut && puts.length === 1) {
+          const generation = currentConnector.generation + 1;
+          views[instanceId] = {
+            ...currentView,
+            connectors: currentView.connectors.map((connector) =>
+              connector.id === 'onebot' ? { ...connector, generation } : connector,
+            ),
+          };
+          return route.fulfill(
+            json({
+              error: {
+                code: 'conflict',
+                message: '配置刚被别处改过，请刷新后再保存',
+                detail: 'generation_conflict',
+              },
+            }, 409),
+          );
+        }
+        if (puts[puts.length - 1]?.ifMatch !== String(currentConnector.generation)) {
+          return route.fulfill(
+            json({
+              error: {
+                code: 'conflict',
+                message: '配置刚被别处改过，请刷新后再保存',
+                detail: 'generation_conflict',
+              },
+            }, 409),
+          );
+        }
+        const generation = currentConnector.generation + 1;
+        views[instanceId] = {
+          ...currentView,
+          connectors: currentView.connectors.map((connector) => {
+            if (connector.id !== 'onebot') return connector;
+            return {
+              ...connector,
+              generation,
+              fields: connector.fields.map((field) => {
+                const key = field.key || field.name;
+                if (Object.hasOwn(body.set, key)) {
+                  return {
+                    ...field,
+                    value: body.set[key] as typeof field.value,
+                    source: 'db' as const,
+                    configured: true,
+                  };
+                }
+                if (body.clear.includes(key)) {
+                  return { ...field, value: null, source: 'default' as const, configured: false };
+                }
+                return field;
+              }),
+            };
+          }),
+        };
+        return route.fulfill(json(changeResult(instanceId, generation), 202));
+      }
       const plan = plans.shift();
       if (!plan) {
         return route.fulfill(
@@ -405,7 +482,7 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
   await page.waitForFunction(() => document.styleSheets.length > 3, undefined, {
     timeout: 20_000,
   });
-  return { page, puts, policyCalls, listCalls: () => listCalls };
+  return { page, puts, scopedGenerations, policyCalls, listCalls: () => listCalls };
 }
 
 /**
@@ -430,10 +507,11 @@ async function selectInstance(page: Page, instanceId: string) {
 }
 
 /** 给某个实例造一份"它自己"的字段视图（API_BASE 值不同，方便分辨）。 */
-function viewFor(apiBase: string): ConnectorsResponse {
+function viewFor(apiBase: string, generation = 0): ConnectorsResponse {
   return makeResponse({
     connectors: [
       makeConnector({
+        generation,
         fields: onebotFields().map((field) =>
           field.key === 'LING_ONEBOT_API_BASE'
             ? { ...field, value: apiBase, source: 'db' as const, configured: true }
@@ -508,6 +586,113 @@ describe('接入器实例：左列表右详情', () => {
     expect(put.url).toBe('/v1/settings/connectors/onebot?instance_id=beta');
     expect(put.body.set).toEqual({ LING_ONEBOT_API_BASE: 'http://192.0.2.30:5700' });
     expect(put.body).not.toHaveProperty('instance_id');
+  }, TIMEOUT);
+
+  it('保存后刷新：同一非默认实例的第二次保存使用 scoped GET 的新 generation', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    expect(scopedGenerations[scopedGenerations.length - 1]).toBe(0);
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    expect(puts[0]?.ifMatch).toBe('0');
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.getByTestId('connector-instance-panel-onebot').waitFor({ timeout: 20_000 });
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.31:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.32:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[1]?.instanceId).toBe('beta');
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
+  }, TIMEOUT);
+
+  it('非默认实例保存后先重读 scoped generation，再允许同页连续保存', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.31:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.32:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[0]?.ifMatch).toBe('0');
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
+  }, TIMEOUT);
+
+  it('409 后刷新状态重读选中实例的 generation，随后保存成功', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+      conflictFirstPut: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    expect(puts[0]?.ifMatch).toBe('0');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('error');
+
+    await page.getByTestId('connector-onebot-notice-reload').click();
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => page.getByTestId('connector-onebot-note').textContent())
+      .toContain('当前版本 1');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
   }, TIMEOUT);
 
   it('实例策略保留 false 与显式空人格，并预览后按当前实例提交 set、clear 和令牌', async (ctx) => {
