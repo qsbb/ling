@@ -81,3 +81,75 @@ README.md: 23b2220d863514f6031b35db304bef9f14d68442c412936636c356a0e6f96916
 后续候选提交 `c86c84d` 增加了 `tests/integration/test_login_session_commit_order.py`。在本地隔离 PostgreSQL 回归中，测试于登录响应刚发出、请求依赖尚未结束时立即携带响应 cookie 请求 `/v1/dashboard`；修复前得到 401，登录路由在返回响应前提交会话后得到 200。认证相关 22 项定向测试通过。
 
 这证明当前应用事务时序可以复现该类竞态，并覆盖了修复行为；它不能证明 5.21 上一次浏览器失败必然由同一原因导致，也不代表 `c86c84d` 已在 Docker 容器或真实浏览器中复验。上文 34/34 的浏览器结果仍属于 `d7e8e676`，不能归到该候选提交。
+
+### 2026-11-16 `c86c84d` 后续容器与浏览器补证
+
+以下补测更新上段的“尚未在 Docker 容器或真实浏览器中复验”状态。结论按证据来源区分；历史的 34/34 和此前隔离安装/升级结果仍按其各自版本与范围解释。
+
+| 验收项 | 结果 | 能证明 / 不能证明 |
+|---|---|---|
+| 单行源码首装、快进升级、重复升级 | 历史演练通过，非候选验收 | 本文前段所列源码快照在隔离 PostgreSQL 部署中保留 `.env` 与数据库卷；没有证据把这些运行绑定到 `c86c84d` 的安装脚本，不能计作候选验收，也不是已发布镜像的网页更新验收。 |
+| 登录会话提交时序 | 通过；父提交变异失败 | 当前候选回归测试在 `c86c84d` 通过；同一测试复制到父提交 `e8cbab3` 后，登录为 200、紧随其后的总览为 401。该反例证明测试能区分修复前后，不证明旧浏览器故障必由此根因造成。 |
+| 5.21 loopback 服务浏览器观测 | 通过，范围有限 | Chromium 对 loopback 转发的测试服务实测：`/readyz` 200，`/v1/version` 自报版本 `0.0.8`、提交 `c86c84d1a529d39416af1082e5139f9619f80e40`；登录后 61 ms 的总览请求为 200。两个标签页上 48 个 `/v1/auth/me` 与 `/v1/dashboard` 只读请求全部 200；刷新及第二标签页复用成功，前后 cookie 指纹一致。保留的日志没有请求发起时间或可重放的发起脚本，故不能证明这 48 个请求确实重叠；也不能证明服务重启后的 cookie 连续性，或把自报提交绑定到已检查的容器 ID / 镜像摘要。 |
+| 候选容器身份与普通重启 | 操作者提供的快照，未独立复核 | 操作者提供的 `docker inspect` 显示 api/worker OCI revision 为 `c86c84d`；本地 image ID 分别为 `sha256:70ece4423f704629e3720a58cd92f916859468818d97a4dde5f2b7dcaa44d62d` 与 `sha256:2f7372873bfc339308e5ee21a8df189d3473881b7cf9041a11798cf7e87c167f`。操作者提供的 10:21:12 至 10:22:05 +0800 重启前后快照显示 api/worker 重启，容器与镜像 ID、卷名、`.env` SHA-256 `bfc33cfa3be0e7176bed514a50bb3ae8e518919b07989aa7cc9639c19491791c` 及 PostgreSQL 计数 `users/windows/turns/messages = 1/3/8/16` 未变，健康检查正常。原始 inspect/重启输出未落入本仓库；这些信息不能把浏览器观测绑定到该镜像，也没有测重启后的已登录 cookie、更新器中断恢复或升级期间的数据迁移。镜像 ID 不是 GHCR 多架构 index digest。 |
+| 更新页 mock 浏览器套件 | 模拟套件通过，636/636 | 桌面与移动视口覆盖离线/恢复、POST 响应丢失、任务恢复/轮询及人工门禁；测试对全部 `/v1/**` 使用 mock，不是服务端或 Docker 更新端到端验收。 |
+| updater stub 模拟 | 本地模拟通过，16 项 | 覆盖镜像预取身份、预取失败、重复请求和迁移前后重启对账；使用本地 stub，不访问真实 Docker/GHCR，不证明真实中断恢复。 |
+| GHCR 稳定发布目标 | 未通过 / 当前无目标 | 2026-11-16 的 `RegistryClient.stable_tags()` 查询日志记录到 6 个稳定 tag：`v0.0.2`、`v0.0.3`、`v0.0.4`、`v0.0.5`、`v0.0.6`、`v0.0.8`；本次查询的最高值为 `v0.0.8`，与服务当前版本相同。更新器只接受 `vX.Y.Z` 稳定 tag，忽略 `sha-*`；因此目前没有已观察到的更高版本可供网页更新与两阶段镜像升级验收。未查询/记录对应 GHCR index digest。 |
+
+#### 可复核证据
+
+本轮核对时工作树 HEAD 为 `327101a2acbd8bd38dde5032c0b1c7dd9976226e`，候选 `c86c84d1a529d39416af1082e5139f9619f80e40` 是其祖先。回归、updater 与浏览器测试所涉源文件在候选和 HEAD 间无差异（`git diff --quiet c86c84d1 HEAD -- <files>` 退出码 0）；SHA-256：
+
+```text
+src/ling/api/routes/auth.py
+  12405cad861bdbdf0963f6f815ee22fc02f8b0fcfd592f24e56a02c1eeeb8369
+tests/integration/test_login_session_commit_order.py
+  7439e6feb9dab143ea05b8464f150ebbf3e8820773e1e96acd18164b066b51de
+deploy/updater/updater.py
+  d08a6ec184b7968f47419f40dc7983e365fb1b89ff57ad45bad8325d03ed27d6
+deploy/updater/registry.py
+  ffe819268b8edbff823dd997177a284838d242496a20017067ecea1aa80b2172
+tests/test_updater.py
+  21d5bd70033c3c73cd9341c6b3457c4e85597a2a725ca57ceb78bda2f806f1ff
+tests/integration/test_version_image_update.py
+  2c8497b9242892c348d9861a17affc477e6ab55c283d8dba41a09cf621de8b35
+tests/e2e/update_browser.mjs
+  5ee0ac016073c8f90ac6c597de4037901b8d0f9578b488d6ae9bccd363b25d89
+```
+
+本机原始日志及 SHA-256：
+
+```text
+/tmp/ling-auth-regression-c86-projectvenv.log
+  423b1d0e014eb1eab96f4420f7b344c2615be505dd574b756ac884826ca74f2d
+/tmp/ling-auth-regression-prefx.log
+  642f69d1a03c7a7cdce576907b2a11e62cbc4ada463570b30382ab8f53f1c03e
+/tmp/ling-auth-interleaved-20261116-c86.log
+  cc17b81f573082288ad0d853524920d5601d6eaf54d2db7b08408fc7391beb5a
+/var/tmp/ling-auth-browser-c86.log
+  54dee31169577b4af07f06b9fe602d422fa2c9e2edb7f45b91737ab9f4b08e00
+/var/tmp/ling-auth-browser-after-upgrade-c86.log
+  7fe115307418c01b6fefae40d3f56e6316f1286050170c235be1423f9bfb44f8
+/tmp/ling-update-browser-20261116-c86.log
+  6f0c89a75524f813c52c74f71aed732a9e2b911307963383b1f07852c6e653af
+/tmp/ling-image-updater-sim-20261116-c86-pinned.log
+  2a4b2ab6df93923c3fa1eba9505d1924cdf7851b747e40336cf5a1d4c1b6a56d
+/tmp/ling-ghcr-tags-20261116.log
+  1bad1248ac56013089d74e20b6da95a20ce319a451c4956cce56be1cde079514
+```
+
+`/var/tmp/ling-auth-browser-c86.log` 与 `...after-upgrade-c86.log` 各记录 34/34，但使用 fake provider；日志没有 HTTP 状态或镜像 digest，故只作辅助 UI 证据。`tests/e2e/update_browser.mjs` 的 `attachMocks()` 将所有 `/v1/**` 路由交由 mock 处理。
+
+本轮只读 tag 查询由 `deploy/updater/registry.py` 的 `RegistryClient` 执行。`gh api /users/qsbb/packages/container/ling-api/versions` 因当前 token 缺少 `read:packages` 返回 403；该失败不影响前述匿名 registry 客户端结果，也不作为版本清单证据。
+
+#### Go / No-Go
+
+**当前结论：No-Go，不授权新的镜像发布或生产升级。** 登录修复的本地回归与 loopback 服务浏览器观测符合预期，但浏览器结果没有绑定到 OCI digest；当前也没有高于 `0.0.8` 的稳定 GHCR 目标，因而真实镜像升级路径不可执行。历史源码单行安装/升级不计作本候选验收；操作者提供的普通容器重启快照也不足以代替下列实测。
+
+唯一版本决策：用户指定一个高于 `0.0.8` 的下一目标版本。版本选择本身不授权推送、打 tag 或发布；需要另行明确授权发布，并先让该候选出现在 updater 固定 GHCR 源，真实镜像更新验收才能开始。目标确定且候选可用后，剩余技术门禁为：
+
+- 归档原始 Docker inspect/重启输出，并用容器 ID、OCI revision、GHCR index/platform digest 将浏览器所测 API/worker 服务绑定到确切镜像；另外记录 updater 容器 ID，并核对其运行镜像的 GHCR index/platform digest。
+- 将候选提交固定在干净环境，按该候选 README 原文执行源码模式的一行命令首次安装与升级；记录 README commit/SHA、实际执行的完整命令、安装提交，以及升级起始提交和目标提交，并记录相关脚本哈希。以隔离 PostgreSQL 核验配置、数据库及媒体数据在成功与失败路径后的保留/恢复。此项与镜像模式验收分开签核。
+- 在隔离 PostgreSQL 部署中用真实发布镜像完成首装及至少两次连续网页镜像升级，分别覆盖 GHCR 直连和至少一条加速线路，逐项核验目标摘要、实际运行摘要、版本、配置、PostgreSQL 与媒体数据。
+- 记录各更新阶段耗时、成功/失败文案与诊断；验证并发/重复请求、浏览器断线重连、更新器重启，以及中断后真实状态对账。
+- 在容器切换/重启前后复验登录 cookie 与会话；成功、失败和中断路径都核对 PostgreSQL、媒体数据、配置及恢复状态。
