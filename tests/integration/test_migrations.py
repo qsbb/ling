@@ -384,26 +384,67 @@ def test_migration_cli_accepts_escaped_password_without_leaking_it(
     migrated_db: MigratedDatabase, driver: str, mode: str
 ) -> None:
     password = "fake@password"
-    url = make_url(migrated_db.url).set(drivername=driver, password=password).render_as_string(
-        hide_password=False
-    )
+    database = make_url(migrated_db.url).database
+    role = f"ling_migration_cli_{uuid.uuid4().hex[:12]}"
+    url = make_url(migrated_db.url).set(
+        drivername=driver, username=role, password=password
+    ).render_as_string(hide_password=False)
     assert "%40" in url
-    env = os.environ.copy()
-    env["LING_DATABASE_URL"] = url
-    env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    result = subprocess.run(
-        [sys.executable, "-m", "ling.migrate", mode],
-        cwd=PROJECT_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    assert password not in result.stdout + result.stderr
-    assert "fake%40password" not in result.stdout + result.stderr
-    assert _current_version(migrated_db.url) == migrated_db.head
+    role_created = False
+    try:
+        asyncio.run(
+            _execute(
+                TEST_DB_URL,
+                f"CREATE ROLE {role} LOGIN PASSWORD '{password}'",
+            )
+        )
+        role_created = True
+        asyncio.run(
+            _execute(TEST_DB_URL, f'GRANT CONNECT ON DATABASE "{database}" TO {role}')
+        )
+        asyncio.run(
+            _execute(
+                migrated_db.url,
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE alembic_version "
+                f"TO {role}",
+            )
+        )
+
+        env = os.environ.copy()
+        env["LING_DATABASE_URL"] = url
+        env["PYTHONPATH"] = os.pathsep.join((str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)))
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-m", "ling.migrate", mode],
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert password not in result.stdout + result.stderr
+        assert "fake%40password" not in result.stdout + result.stderr
+        assert _current_version(migrated_db.url) == migrated_db.head
+    finally:
+        if role_created:
+            try:
+                asyncio.run(
+                    _execute(
+                        migrated_db.url,
+                        f"REVOKE ALL PRIVILEGES ON TABLE alembic_version FROM {role}",
+                    )
+                )
+            finally:
+                try:
+                    asyncio.run(
+                        _execute(
+                            TEST_DB_URL,
+                            f'REVOKE CONNECT ON DATABASE "{database}" FROM {role}',
+                        )
+                    )
+                finally:
+                    asyncio.run(_execute(TEST_DB_URL, f"DROP ROLE {role}"))
 
 
 @pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
