@@ -155,7 +155,7 @@ contracts/       导出的 JSON Schema
 - [API 契约](docs/API-WEB-V1.md)
 - [设置分类](docs/SETTINGS-TAXONOMY.md)
 - [架构决策记录 (ADR)](docs/adr/)
-- [升级与自动更新](docs/UPDATES.md)（默认关闭，未在真实 Docker 上演练）
+- [升级与自动更新](docs/UPDATES.md)（网页自动更新默认关闭；源码安装与升级已在隔离 Docker 项目验证）
 - [注意力设计](docs/ATTENTION-DESIGN.md) · [自主性设计](docs/AUTONOMY-DESIGN.md) · [群聊轮询](docs/GROUP-POLLING-DESIGN.md)
 
 ## 开发
@@ -178,12 +178,14 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：正式 Release `v0.0.8` 于 2026-11-13 发布。当前工作树版本字段仍为
-`0.0.8`，但候选 `c86c84d` 比该 Release 提交多 37 个提交，并非已发布镜像的源码快照。
-源码模式的一行首装、升级、重复升级及配置/PostgreSQL 卷保留已在隔离 Docker 项目验证，
-测试提交截至 `d7e8e676`；当前候选后续的认证时序修复只完成了本地 PostgreSQL 回归，尚未
-在容器中复验。源码模式备份恢复/回滚和当前候选的镜像网页更新验收仍未完成；自助更新默认
-关闭。详细边界见 [docs/UPDATES.md](docs/UPDATES.md)。
+发布与升级：最新正式 Release 为 2026-11-13 发布的 `v0.0.8`。当前源码版本为
+`0.0.9` 候选，提交 `0cfc9be`，尚未发布为正式镜像。在隔离 PostgreSQL 和 Docker
+项目中，已按一行命令验证源码模式的干净首装、快进升级与重复部署；严格 `umask 077`
+下的普通用户及 root 首装、配置与 PostgreSQL/媒体数据保留也通过。真实浏览器验证了
+首次登录、强制改密、刷新、新标签、容器普通重启和测试模式对话。测试模式使用 fake
+provider。源码模式备份恢复/回滚以及 `0.0.9` 正式镜像的网页更新、直连/加速线路与
+中断恢复仍未完成验收；自助更新默认关闭。详细范围见
+[验收记录](docs/evidence/single-command-install-upgrade.md) 与 [更新说明](docs/UPDATES.md)。
 
 ## 安全与隐私
 
