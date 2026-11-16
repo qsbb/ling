@@ -47,7 +47,8 @@ jobs:
       - name: 安装
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          # scripts/dev_env.sh is sourced by zsh in a regression test.
+          sudo apt-get install -y --no-install-recommends ffmpeg zsh
           python -m pip install -U pip build
           pip install -e ".[dev,speech-codecs]"
           ffmpeg -version
