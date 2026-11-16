@@ -476,7 +476,15 @@ if subcommand is None:
 project = project or "ling"
 
 state = load()
-log("docker-env %s LING_APP_IMAGE=%s" % (subcommand, os.environ.get("LING_APP_IMAGE", "")))
+log(
+    "docker-env %s project=%s LING_APP_IMAGE=%s LING_APP_COMPOSE_PROJECT=%s"
+    % (
+        subcommand,
+        project,
+        os.environ.get("LING_APP_IMAGE", ""),
+        os.environ.get("LING_APP_COMPOSE_PROJECT", ""),
+    )
+)
 
 if subcommand == "config":
     if os.environ.get("STUB_CONFIG_EXIT", "0") != "0":
@@ -2103,6 +2111,36 @@ def test_install_with_updater_starts_the_separate_compose_project(ws: Workspace)
     assert state["layout"]["updater"]["docker"]["gid_source"] == "explicit"
     assert state["update"]["enabled"] is False
     assert "更新已启用" not in (result.stdout + result.stderr)
+
+
+def test_custom_updater_targets_its_application_project(ws: Workspace) -> None:
+    """自定义应用项目名必须贯穿 updater env 与启动它的 Compose 子进程。"""
+    ws.env["LING_APP_COMPOSE_PROJECT"] = "wrong-host-project"
+    result = run_install(
+        ws,
+        extra=[
+            "--project",
+            "ling-verify",
+            "--updater-digest",
+            UPDATER_TARGET,
+            "--with-updater",
+            "--docker-gid",
+            "999",
+        ],
+        readyz=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    updater_values = _updater_env_lines(ws.install_dir / "updater" / ".env")
+    assert updater_values.get("LING_APP_COMPOSE_PROJECT") == "ling-verify"
+
+    updater_start = [
+        line
+        for line in ws.calls()
+        if line.startswith("docker-env up project=ling-verify-updater ")
+    ]
+    assert len(updater_start) == 1, updater_start
+    assert "LING_APP_COMPOSE_PROJECT=ling-verify" in updater_start[0]
 
 
 def test_install_with_updater_requires_a_pinned_digest(ws: Workspace) -> None:

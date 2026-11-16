@@ -2560,6 +2560,9 @@ def render_updater_env(options: InstallOptions) -> str:
         "# 应用安装根（含 .env、.ling-install.lock 与 compose/ 文件组）。",
         f"LING_INSTALL_DIR={layout.root}",
         "",
+        "# 更新器发布时操作的应用 Compose 项目（不能用更新器自身的 -p 项目名）。",
+        f"LING_APP_COMPOSE_PROJECT={options.project}",
+        "",
         "# 宿主 Docker socket 与它的组 gid（compose 的 group_add 必填插值）。",
         f"LING_DOCKER_SOCKET={options.docker_socket}",
     ]
@@ -5543,6 +5546,7 @@ class Installer:
         for key in list(env):
             if key.startswith(("LING_UPDATER_", "COMPOSE_")) or key in (
                 "LING_INSTALL_DIR",
+                "LING_APP_COMPOSE_PROJECT",
                 "LING_BACKUP_DIR",
                 "LING_DOCKER_SOCKET",
                 "LING_DOCKER_GID",
@@ -5551,6 +5555,7 @@ class Installer:
         env.update(
             {
                 "LING_INSTALL_DIR": str(self.layout.root),
+                "LING_APP_COMPOSE_PROJECT": self.o.project,
                 "LING_BACKUP_DIR": str(self.o.backup_dir),
                 "LING_DOCKER_SOCKET": str(self.o.docker_socket),
                 "LING_UPDATER_REQUESTS_DIR": str(self.layout.updater_requests_dir),
