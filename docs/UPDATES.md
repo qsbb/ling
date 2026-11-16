@@ -6,7 +6,7 @@
 >   `deploy/update/executor.py`。
 > - **镜像模式**（固定在 OCI 摘要上的镜像）：§10。API 端点是
 >   `POST /v1/version/image-update-requests` / `GET /v1/version/image-update`，
->   宿主侧是独立项目 `ling-updater`。**`executor.py` 不能用于镜像模式**——
+>   宿主侧是独立项目 `<应用项目名>-updater`（默认 `ling-updater`）。**`executor.py` 不能用于镜像模式**——
 >   它下载 tag 源码、构建再调 `install.sh`，跑的是另一套拓扑（见 §4 开头）。
 
 > **先看结论**
@@ -16,10 +16,11 @@
 >   `deploy/install.sh` 本身只构建并部署当前 checkout，不拉取代码。镜像模式的安装与
 >   升级见 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐) 与本文 §10。
 > - 截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`（API 发布时间
->   `2026-11-13T16:48:41Z`，上海时间 2026-11-14）。当前
->   本地 `0.0.9` 代码候选为 `62e41c9`，尚未推送或打 tag；GitHub `main` 为
->   `0d36dbad`，候选领先 47 个提交且不是 `main` 的祖先，不能通过 release tag 祖先门禁。
->   2026-11-17 只读核验的 GHCR 稳定 tag 最高仍为 `v0.0.8`；摘要明细见候选验收记录。
+>   `2026-11-13T16:48:41Z`，上海时间 2026-11-14）。`0.0.9` 候选在 PR #1，包含
+>   实现修复提交 `981a815`，尚未合入或打 tag；GitHub `main` 最近核验为
+>   `0d36dbadc4c8f688df2775e81f1e5e795006a271`，候选不是 `main` 的祖先。最终候选 SHA
+>   与 CI 状态以 PR head 和[验收记录](evidence/release-0.0.9-acceptance.md)为准。
+>   GHCR 稳定 tag 最高仍为 `v0.0.8`；摘要明细见候选验收记录。
 > - 镜像更新器现在直接从 GHCR 读取稳定版 tag 与镜像 index digest；
 >   `deploy/releases.json` 不再参与目标版本或摘要判定。发现新版本不等于网页更新链路
 >   已验收：开关仍默认关闭，当前候选尚未完成容器级镜像更新复验。
@@ -32,7 +33,8 @@
 >   手动源码升级不需要启用该执行器。
 > - **演练范围要按位置分开说**：源码模式一行首装、快进升级、重复部署和 PostgreSQL /
 >   媒体数据保留，以及备份/演练库恢复和同 schema 本地镜像切换，来自 2026-11-16
->   的历史快照 `0cfc9be` 隔离 Docker 记录；不代表当前代码候选 `62e41c9` 已重跑这些流程。
+>   的历史快照 `0cfc9be` 隔离 Docker 记录；不代表当前代码候选 `981a815` 已重跑源码模式流程。
+>   当前候选在 5.21 另验过两轮连接器保存和一次使用旧稳定镜像的 CLI 首装，边界见验收记录。
 >   在线业务库实际恢复和跨 schema 回退仍未验证。
 >   镜像模式已在
 >   **隔离项目 `ling-drill`**（端口 6521、独立卷、独立根密钥）
@@ -51,7 +53,7 @@
 
 > 本节（以及 §2–§9）只描述**源码模式**通道：宿主执行器下载 tag 源码、在宿主构建、
 > 再调用 `install.sh`。镜像模式的管线完全不同（API 写固定 digest 请求 → 独立
-> `ling-updater` 拉镜像并切换），见 §10。
+> `<应用项目名>-updater`（默认 `ling-updater`）拉镜像并切换），见 §10。
 
 ```
 Web ──POST /v1/version/update-requests──▶ API（容器内 uid 10001）
@@ -300,7 +302,7 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
 > **边界先写清楚**：`deploy/update/executor.py` 只能服务源码模式部署——它 `git
 > archive` tag 源码、在宿主构建、再调该 release 树里的 `install.sh`（那是
 > `deploy/compose.yaml`，带 `build:` 与前端 bind）。**镜像模式必须用 §10 的新通道
-> （`/v1/version/image-update-requests` + 独立 `ling-updater`）**，两者不能混用：
+> （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`）**，两者不能混用：
 >
 > - 镜像模式的 API 会直接拒绝这条通道的提交（409 `image_mode_requires_image_channel`）；
 > - 反过来，旧执行器在镜像模式拓扑上会去构建并部署**另一套**主文件，不是在升级
@@ -769,7 +771,7 @@ fail-closed 判据）；必须先人工迁移。
 
 - 源码模式的一行首装、快进升级、重复部署及 `.env` / PostgreSQL / 媒体数据保留已于
   2026-11-16 在 5.21 隔离 Docker 项目实测，**当时**使用的最终候选为 `0cfc9be`；这些
-  结果不是当前代码候选 `62e41c9` 的重新验收。普通用户与 root
+  结果不是当前代码候选 `981a815` 的源码模式重新验收。普通用户与 root
   在严格 `umask 077` 下的干净首装均通过，失败后的修复与重试也已验证；源码模式
   备份与演练库恢复、同 schema 本地镜像人工切换与回切已验证；在线业务库实际恢复
   与跨 schema 回退仍未验证。详情见
@@ -781,7 +783,7 @@ fail-closed 判据）；必须先人工迁移。
 - 宿主执行器需要 root 才能创建 `/run/ling-update/*` 与备份/切换容器；
 - 截至 2026-11-17，GitHub 最新正式 Release 仍为 `v0.0.8`（API 发布时间
   `2026-11-13T16:48:41Z`，上海时间 2026-11-14）；当前
-  本地代码候选为 `0.0.9`、`62e41c9`，尚未进入正式 Release。镜像模式版本发现走 GHCR
+  代码候选为 `0.0.9`、在 PR #1，尚未进入正式 Release。镜像模式版本发现走 GHCR
   稳定标签，见 §10；2026-11-17 核实两镜像稳定 tag 清单均最高为 `v0.0.8`，且无
   `v0.0.9`。
 - 更新通道默认关闭（`LING_UPDATE_ENABLED=0`）；**目录照常挂**，关闭时 API 仍会
@@ -882,9 +884,12 @@ fail-closed 判据）；必须先人工迁移。
 - **可用目标**只来自更新器的 `available_targets` / `recommended_target`：API 不读
   发布目录（镜像模式的 API 没有 `deploy/` 挂载），也不接受调用方给的摘要。
 
-### 10.4 更新器：独立项目 `ling-updater`，**只有它持 Docker socket**
+### 10.4 更新器：独立项目 `<应用项目名>-updater`（默认 `ling-updater`），**只有它持 Docker socket**
 
 - 独立 Compose 项目（`deploy/updater/compose.yaml`），**不随应用 compose 启停**；
+  `ling install --project <应用项目名>` 会派生 updater 项目名 `<应用项目名>-updater`。
+  updater 自身启动时用的 Compose `-p` 是 updater 项目名；容器内
+  `LING_COMPOSE_PROJECT` 则始终指向应用项目名，两者不能互换。
   API/worker 不挂 Docker socket、不执行部署。`ling install` 只准备宿主侧前提
   （`<dir>/updater/{requests,state}`、`<dir>/updater/.env`），且**默认不拉起**它。
 - 处理顺序：轮询请求目录 → **自己重新校验**（目录内兼容目标、**按版本重新解析目标
@@ -967,7 +972,7 @@ fail-closed 判据）；必须先人工迁移。
   三次连续升级（A→B→C→D）、更新器 idle 重启对账；**未完成**的是中断中任务的
   真机对账（仅单测）。`v0.0.8` 已有正式发布的镜像摘要，因此“缺第二个摘要”不再是
   当前限制；历史代码快照 `0cfc9be` 有源码容器与浏览器验收记录，但当前本地代码候选
-  `62e41c9` 未重跑这些流程，正式镜像更新流程也尚未复验。
+  `981a815` 未重跑这些源码/故障路径，正式镜像更新流程也尚未复验。
   因剩余设计验收项未完成，
   开关**仍然保持 0**。
 - 打开还需要更新器镜像来自发布证据（`--updater-digest` / `LING_UPDATER_IMAGE`），

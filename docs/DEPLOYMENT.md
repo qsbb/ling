@@ -1810,7 +1810,7 @@ HSTS 头存在、TLS 1.1 握手被拒。
 
 > 本节只讲**源码模式**的部署边界：宿主执行器 `deploy/update/executor.py` 取 tag
 > 源码 → 构建 → 调 `install.sh`。它**不能**用于镜像模式；镜像模式是另一套通道
-> （`/v1/version/image-update-requests` + 独立 `ling-updater`），见
+> （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`），见
 > [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练) 与本文 §11。
 > 完整管线、宿主执行器命令、失败语义与人工恢复步骤见 [UPDATES.md](UPDATES.md)。
 > **演练范围要分开说**：源码模式的完整升级仍未真机演练；镜像模式已在隔离项目
@@ -1901,7 +1901,7 @@ compose up -d --force-recreate api
 | 主 Compose 文件 | `deploy/compose.yaml`（api/worker 有 `build:`，Web 从宿主 bind 到 `/app/web`） | `deploy/compose.image.yaml`（api/worker 只认必填 `LING_APP_IMAGE`，Web 已烤进镜像） |
 | 版本标识 | `LING_COMMIT` 构建参数 + 本地镜像名 | 固定 OCI **index digest**（`/v1/version` 读容器内 `LING_APP_IMAGE`；commit 取自镜像内烤入的 `LING_COMMIT`，与 OCI 标注 `org.opencontainers.image.revision` 同源，发布/更新器再交叉核对） |
 | 日常升级 | `bash deploy/upgrade.sh`（快进获取远端后构建部署，[UPDATES.md](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
-| 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `ling-updater` + `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
+| 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `<应用项目名>-updater`（默认 `ling-updater`）+ `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
 | 可选 WS 端口 override | `deploy/compose.ws.example.yaml` | `deploy/compose.image.ws.example.yaml` |
 
 两份主文件**只能择一，禁止叠加 `-f`**：叠加会让旧 `build:`/前端 bind 仍然生效。
@@ -1920,9 +1920,10 @@ compose up -d --force-recreate api
    > 截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；API 发布时间为
    > `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。本轮只读核验 GHCR
    > `v0.0.8` API/updater index digest 与 amd64、arm64 平台摘要，未发现 `v0.0.9` tag。
-   > 当前本地代码候选为 `0.0.9`、提交 `62e41c9`，尚未推送或打 tag。GitHub `main`
-   > 为 `0d36dbad`；该代码候选领先 47 个提交且不是 `main` 的祖先，故不能通过 release
-   > tag 祖先门禁。此前隔离部署验证绑定历史快照 `0cfc9be`，不是当前候选验收。
+   > 当前 `0.0.9` 候选位于 PR #1，实现修复提交为 `981a815`，尚未合入或打 tag。GitHub
+   > `main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选不是 `main`
+   > 祖先，release tag 门禁未满足。此前源码隔离部署验证绑定历史快照 `0cfc9be`；5.21 本轮实跑只覆盖
+   > 连接器两轮保存与旧稳定镜像下的 CLI 首装，细节见验收记录。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -1944,7 +1945,10 @@ compose up -d --force-recreate api
      `0.0.0.0` 会提示 TLS/反代/防火墙，**不会自动开放公网**。
    - **更新器默认不拉起**：不给 `--updater-digest`（或 `LING_UPDATER_IMAGE`）就
      不配置更新器，输出与安装状态都明确"网页更新不可用"；给了 `--with-updater`
-     才会起独立项目 `ling-updater`。当前也不该指望网页更新（见
+     才会起独立 Compose 项目。默认应用项目 `ling` 对应 `ling-updater`；若指定
+     `--project ling-verify`，更新器项目为 `ling-verify-updater`，但更新器容器内的
+     `LING_COMPOSE_PROJECT` 仍是 `ling-verify`，用于操作对应的应用项目。当前也不该
+     指望网页更新（见
      [UPDATES.md §10](UPDATES.md)）。
    - 产物落在 `<dir>` 下：`compose/compose.image.yaml`（由源文件生成，唯一改动是
      api 的宿主端口绑定变成 `${LING_HOST:-127.0.0.1}:${LING_PORT:-6520}:6520`，
@@ -2028,14 +2032,14 @@ python3 deploy/release/publish.py \
 退出码能区分失败阶段：`0` 成功、`2` 参数/非 digest、`10` 预检、`11` 锁、`12`
 归档、`13` 备份、`14` 拉取/身份、`15` 迁移、`16` 迁移后的切换/验证失败。
 
-**网页更新**：需要独立 `ling-updater` 与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
+**网页更新**：需要独立 `<应用项目名>-updater`（默认 `ling-updater`）与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
 三次连续升级；这不等于当前候选已完成容器与浏览器复验。`LING_UPDATE_ENABLED` 仍默认
 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
 `deploy/releases.json` 决定。`v0.0.8` 已正式发布；2026-11-17 只读查询 GHCR 核对到
 API 与 updater 的 index/platform digest，明细见[候选验收记录](evidence/release-0.0.9-acceptance.md)。
-本轮未检查生产环境。当前本地代码候选 `62e41c9` 尚未做候选绑定的镜像更新容器与真实
-浏览器/API/PG 验收；`0cfc9be` 的隔离部署记录不能替代这些门禁，因此
+本轮未检查生产环境。代码候选 `981a815` 尚未在候选绑定的 updater 镜像上执行真实网页
+版本升级；连接器两轮保存和旧稳定镜像下的 CLI 首装不替代该验收，因此
 仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 

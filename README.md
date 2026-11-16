@@ -155,7 +155,7 @@ contracts/       导出的 JSON Schema
 - [API 契约](docs/API-WEB-V1.md)
 - [设置分类](docs/SETTINGS-TAXONOMY.md)
 - [架构决策记录 (ADR)](docs/adr/)
-- [升级与自动更新](docs/UPDATES.md)（网页自动更新默认关闭；源码安装与升级已在隔离 Docker 项目验证）
+- [升级与自动更新](docs/UPDATES.md)（网页自动更新默认关闭；源码安装与升级的隔离实测绑定历史快照 `0cfc9be`）
 - [注意力设计](docs/ATTENTION-DESIGN.md) · [自主性设计](docs/AUTONOMY-DESIGN.md) · [群聊轮询](docs/GROUP-POLLING-DESIGN.md)
 
 ## 开发
@@ -180,19 +180,29 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 
 发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
 记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
-`0.0.9` 代码候选为 `62e41c9`，尚未推送、打 tag 或发布。GitHub `main` 为
-`0d36dbad`；该代码候选比 `main` 多 47 个提交，且不是 `main` 的祖先，因此
-release workflow 的 tag 祖先门禁未满足。
+`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（实现提交 `981a815`；
+最终候选 SHA 以该 PR 的最新 head 为准），尚未合入 `main`、打 tag 或发布。GitHub
+`main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选仍不满足 release
+workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器实例 generation 刷新和
+自定义 updater 项目名修复。远端状态、复验文件哈希与提交边界见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
 
 此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
-不能当作当前候选验收。当前候选的本机全量 Python、Web、Flutter、静态检查和版本
-门禁结果见[验收记录](docs/evidence/release-0.0.9-acceptance.md)；本轮只读核实了当前
-GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定镜像。其中连接器浏览器
-测试模拟 `/v1` API，PostgreSQL 集成测试另行运行，未构成真实浏览器、API 与 PG 的
-组合验收。当前候选的 Docker 首装/升级、真实镜像/updater、候选 GHCR digest、真实 API
-浏览器路径和稳定版网页更新仍未验收。自助更新默认关闭。历史部署范围见
+不能当作当前候选验收。`981a815` 已在 5.21 隔离项目通过非默认 OneBot 两轮保存的
+真实 Chromium/API/PostgreSQL 路径；另用 `ling install` 在隔离项目启动旧稳定版
+`v0.0.8` API/updater 镜像，验证自定义项目名传递。两项只覆盖连接器保存和 CLI 启动，
+同一 CLI 隔离项目的备份/恢复也读回 PG 哨兵并核对媒体指纹；该项目作为未来单跳
+`v0.0.8 → v0.0.9` 网页升级基线保留，尚未实际升级。这些结果不代表当前候选 updater
+镜像或网页升级通过。原始快照的全量 Python/Flutter、当前候选的 Web 全套与 CLI 定向
+检查结果见[验收记录](docs/evidence/release-0.0.9-acceptance.md)；本轮只读核实了当前
+GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定镜像。本地连接器组件测试仍
+将 `/v1` 路由 mock；已通过的 5.21 真实连接器路径单独记录。源码模式首装/升级、当前
+候选 updater 镜像、候选 GHCR digest 与稳定版网页升级仍未验收。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
+
+镜像安装器使用自定义 `--project <应用项目名>` 时，updater 项目名会派生为
+`<应用项目名>-updater`，而 updater 内的 `LING_COMPOSE_PROJECT` 仍指向应用项目；
+详见 [DEPLOYMENT.md §11](docs/DEPLOYMENT.md#11-镜像模式部署推荐)。
 
 ## 安全与隐私
 

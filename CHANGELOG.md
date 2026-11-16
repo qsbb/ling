@@ -16,13 +16,14 @@
 - 登录响应前提交会话，避免紧随登录的总览请求偶发 401。
 - 业务运行要求 PostgreSQL，修复并发创建会话、租约与数据库连接池相关竞态。
 - 源码模式支持一行首装与快进升级；严格 `umask 077` 下生成的前端目录可被 API 容器读取。
+- 非默认连接器实例保存后重读本实例 generation；自定义应用项目名也会传到 updater，避免后续保存冲突或更新目标回退到 `ling`。
 
 ### 验证范围
 
-- 当前本地代码候选 `62e41c9`：隔离 PostgreSQL 全量 pytest 退出码 0；按 collect-only 6610 项、进度日志 14 个 skip 和 3 个 xfail 推算为 6593 passed（pytest 未打印汇总行）。Web 为 1039 passed、1 skipped；Flutter 为 3 passed。Ruff、MyPy、Web 类型检查与构建、Flutter analyze、版本一致性和 release catalog 检查通过，证据见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
-- 连接器实例浏览器验收为 Playwright 真浏览器，但 `/v1` 由 route mock 提供；PostgreSQL 后端集成测试单独运行。两者没有组成真实浏览器/API/PG 端到端验收。
+- 原始快照 `62e41c9` 的全量 Python 测试退出码为 0；6593 passed 是依据 6610 个选中用例、14 个 skip 和 3 个 xfail 推算，pytest 未打印汇总行。候选 `981a815c` 的 Web 全套为 1042 passed、1 skipped，CLI 自定义项目名定向安装用例 4 passed，Web 构建与类型检查通过；5.21 隔离环境另通过候选 API 的连接器两轮保存，以及以旧稳定镜像启动自定义项目的 CLI 实装检查。完整 Python suite 未在后续工作树重跑。详见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+- 本地连接器浏览器测试使用 `/v1` route mock；候选 API 的非默认 OneBot 两轮保存另在 5.21 隔离环境由真实 Chromium/API/PostgreSQL 验收。
 - 历史隔离 Docker 安装、升级、备份与恢复结果绑定 `0cfc9be`；早期 34/34 浏览器结果绑定更早快照，均不改写为当前候选结果，详见隔离部署记录。
-- 当前候选没有对应的 GitHub Actions run 或 GHCR 稳定镜像；只读核验到的最新稳定镜像仍是 `v0.0.8`。候选也尚未合入 main，Docker/updater/网页升级验收未完成。发布状态仍为 No-Go。
+- 当前候选尚无 Release workflow 结果或 GHCR 稳定镜像；PR CI 正在运行，只读核验到的最新稳定镜像仍是 `v0.0.8`。候选尚未合入 main，Docker/updater/网页升级验收未完成。发布状态仍为 No-Go。
 
 ## [0.0.8] - 2026-11-13
 
