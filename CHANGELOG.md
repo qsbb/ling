@@ -19,10 +19,10 @@
 
 ### 验证范围
 
-- 最终候选 `0cfc9be` 的本地全量 pytest 退出码为 0，进度标记为 6593 passed、14 skipped、3 xfailed。Web 串行测试为 1039 passed、1 skipped。
-- 5.21 隔离 PostgreSQL 与 Docker 项目完成源码首装、升级、重复部署、配置及数据保留；真实浏览器测试模式的主要流程为 34/34。
-- 隔离项目的在线与停机备份、演练库恢复、同 schema 本地镜像人工切换及跨镜像 Cookie 请求通过。
-- 正式 GHCR 镜像和网页镜像更新链路尚未完成候选验收，发布状态仍为 No-Go。
+- 当前本地代码候选 `62e41c9`：隔离 PostgreSQL 全量 pytest 退出码 0；按 collect-only 6610 项、进度日志 14 个 skip 和 3 个 xfail 推算为 6593 passed（pytest 未打印汇总行）。Web 为 1039 passed、1 skipped；Flutter 为 3 passed。Ruff、MyPy、Web 类型检查与构建、Flutter analyze、版本一致性和 release catalog 检查通过，证据见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+- 连接器实例浏览器验收为 Playwright 真浏览器，但 `/v1` 由 route mock 提供；PostgreSQL 后端集成测试单独运行。两者没有组成真实浏览器/API/PG 端到端验收。
+- 历史隔离 Docker 安装、升级、备份与恢复结果绑定 `0cfc9be`；早期 34/34 浏览器结果绑定更早快照，均不改写为当前候选结果，详见隔离部署记录。
+- 当前候选没有对应的 GitHub Actions run 或 GHCR 稳定镜像；只读核验到的最新稳定镜像仍是 `v0.0.8`。候选也尚未合入 main，Docker/updater/网页升级验收未完成。发布状态仍为 No-Go。
 
 ## [0.0.8] - 2026-11-13
 

@@ -178,15 +178,21 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：最新正式 Release 为 2026-11-13 发布的 `v0.0.8`。当前源码版本为
-`0.0.9` 候选，提交 `0cfc9be`，尚未发布为正式镜像。在隔离 PostgreSQL 和 Docker
-项目中，已按一行命令验证源码模式的干净首装、快进升级与重复部署；严格 `umask 077`
-下的普通用户及 root 首装、配置与 PostgreSQL/媒体数据保留也通过。真实浏览器验证了
-首次登录、强制改密、刷新、新标签、容器普通重启和测试模式对话。测试模式使用 fake
-provider。隔离项目还通过了备份与恢复演练库校验，以及同 schema 本地镜像的人工
-切换和回切；在线业务库实际恢复、跨 schema 回退及 `0.0.9` 正式镜像的网页更新、
-直连/加速线路与中断恢复仍未完成验收。自助更新默认关闭。详细范围见
-[验收记录](docs/evidence/single-command-install-upgrade.md) 与 [更新说明](docs/UPDATES.md)。
+发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
+记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
+`0.0.9` 代码候选为 `62e41c9`，尚未推送、打 tag 或发布。GitHub `main` 为
+`0d36dbad`；该代码候选比 `main` 多 47 个提交，且不是 `main` 的祖先，因此
+release workflow 的 tag 祖先门禁未满足。
+
+此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
+不能当作当前候选验收。当前候选的本机全量 Python、Web、Flutter、静态检查和版本
+门禁结果见[验收记录](docs/evidence/release-0.0.9-acceptance.md)；本轮只读核实了当前
+GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定镜像。其中连接器浏览器
+测试模拟 `/v1` API，PostgreSQL 集成测试另行运行，未构成真实浏览器、API 与 PG 的
+组合验收。当前候选的 Docker 首装/升级、真实镜像/updater、候选 GHCR digest、真实 API
+浏览器路径和稳定版网页更新仍未验收。自助更新默认关闭。历史部署范围见
+[隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
+[更新说明](docs/UPDATES.md)。
 
 ## 安全与隐私
 

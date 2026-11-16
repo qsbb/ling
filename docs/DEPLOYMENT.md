@@ -1917,9 +1917,12 @@ compose up -d --force-recreate api
    > index 包含当前宿主平台；它不读取 `deploy/releases.json` 来选择目标。该文件仍由 CI
    > 校验并保留为仓库发布元数据，但不是部署安装清单或网页更新信任源。
 
-   > 截至 2026-11-16，最新正式 Release 为 `v0.0.8`，发布于 2026-11-13；其两个镜像
-   > digest 已由对应 workflow 的 `image` / `updater-image` 作业核验。当前工作树同样报告
-   > 版本 `0.0.8`，但候选 `c86c84d` 比该 Release 提交多 37 个提交，不应当作已发布镜像。
+   > 截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；API 发布时间为
+   > `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。本轮只读核验 GHCR
+   > `v0.0.8` API/updater index digest 与 amd64、arm64 平台摘要，未发现 `v0.0.9` tag。
+   > 当前本地代码候选为 `0.0.9`、提交 `62e41c9`，尚未推送或打 tag。GitHub `main`
+   > 为 `0d36dbad`；该代码候选领先 47 个提交且不是 `main` 的祖先，故不能通过 release
+   > tag 祖先门禁。此前隔离部署验证绑定历史快照 `0cfc9be`，不是当前候选验收。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -2029,8 +2032,10 @@ python3 deploy/release/publish.py \
 三次连续升级；这不等于当前候选已完成容器与浏览器复验。`LING_UPDATE_ENABLED` 仍默认
 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
-`deploy/releases.json` 决定。`v0.0.8` 已正式发布并有 CI 核验过的 API / updater digest；
-本次没有检查生产环境，且当前候选 `c86c84d` 尚未做镜像更新容器与真实浏览器验收，因此
+`deploy/releases.json` 决定。`v0.0.8` 已正式发布；2026-11-17 只读查询 GHCR 核对到
+API 与 updater 的 index/platform digest，明细见[候选验收记录](evidence/release-0.0.9-acceptance.md)。
+本轮未检查生产环境。当前本地代码候选 `62e41c9` 尚未做候选绑定的镜像更新容器与真实
+浏览器/API/PG 验收；`0cfc9be` 的隔离部署记录不能替代这些门禁，因此
 仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
