@@ -49,6 +49,7 @@
 - docs-only 更新推送前快照：`HEAD=ab0ddf41b81245bce40701ea1fdfebdba79bd06e`、分支 `lingxi/release-0.0.8`；`git status --short` 仅列 `README.md`、`CHANGELOG.md`、`docs/DEPLOYMENT.md`、`docs/UPDATES.md`、本记录五份文档。该时点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录（加入本条之前）`01f429d44d894916588d558084b073c20e5beb380f8bb5e466d51db4a48276f9`。代码文件仍为已验 SHA：`ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`、`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。
 - 本次 docs-only 提交前快照：`HEAD=ab0ddf41b81245bce40701ea1fdfebdba79bd06e`、分支 `lingxi/release-0.0.8`；`git status --short` 仅列 README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录五份文档。该时点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录（加入本条之前）`35743d7f1d0b25ce60f0f0e9fb89d54841e392c174c6fadc2b4ca0e604bf9faa`。已验源文件仍相同：`ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`、`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。
 - 本轮接续文档复核起点（2026-11-17）：`HEAD=fb0d5fb92b5599e3f59b6022a4f4b4d0aabe712a`、分支 `lingxi/release-0.0.8`，`git status --short` 为空，`origin/lingxi/release-0.0.8` 与 HEAD 相同。起点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录 `52d92377a82035b86c38a259d73e981bd6598afc3a852e5e6d35d6dcadc0f7a8`。这些值绑定复核前快照，不是后续修改后的哈希。
+- 2026-11-17 14:31（Asia/Shanghai）在 5.21 测试主机通过 sudo 对隔离项目 `ling-image-candidate-ab0ddf4-20261117` 执行只读 `docker ps -a` 名称过滤。该项下 API、worker、PostgreSQL 均显示 healthy，updater 显示 Up；本次没有执行容器命令、数据库查询或资源变更。此观测确认目标隔离项目仍在运行，不替代前述镜像摘要、卷身份与数据恢复记录。
 - 实现/运行验收候选 `ab0ddf41b81245bce40701ea1fdfebdba79bd06e` 是 `8fc335b` 上的 docs-only 提交；相对于已通过运行的源代码，代码、测试和部署文件没有改变。候选实际容器安装前的工作树 `git status --short` 为空；`ConnectorsPage.tsx` SHA-256=`92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`，`deploy/cli/ling.py`=`0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。docs-only 更新后新 PR head 将变化，须为新 head 重跑门禁和 SHA 镜像身份检查。
 
   | 镜像 | index digest | linux/amd64 | linux/arm64 |
@@ -171,7 +172,7 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 
 | ID | 结论 |
 |---|---|
-| A1 | 通过（快照和本机隔离范围） |
+| A1 | 通过（候选快照、隔离测试范围及 5.21 命名隔离项目的只读容器核对） |
 | A2 | 部分通过，整体未验（连接器两轮保存、登录进入总览、关系列表读取、新标签/刷新会话与窄屏通过；关系合并/拆分和完整日程未验） |
 | A3 | 未验（源码模式首装/升级未在候选上实跑；镜像模式首装已在 A6 实测） |
 | A4 | 失败（未满足 main 祖先门禁；`ab0ddf4` PR CI 与 SHA-only 必需门禁通过，Python 3.12 首轮一条失败后重跑通过；`fb0d5fb` 文档 head 的 PR CI 三项也通过） |
