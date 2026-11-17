@@ -29,8 +29,10 @@
 > - 镜像更新器直接从 GHCR 读取稳定版 tag 与镜像 index digest；`deploy/releases.json`
 >   不参与目标选择。隔离 `v0.0.8` 镜像基线已由当前 `v0.0.9` updater 经 GHCR 直连完成一跳
 >   更新，用时 34 秒；浏览器在请求受理后断开，重连观察到成功，阶段、日志、API/worker digest、
->   提交、迁移、PG/媒体计数和 Cookie 均核验。仍未测试加速线路、updater 中断恢复和故障矩阵；
->   v0.0.8 页面也没有线路选择器。自动更新继续默认关闭。
+>   提交、迁移、PG/媒体计数和 Cookie 均核验。另一次中断复测在 `prepare` 阶段停止 updater，
+>   重启后进入 `needs_manual`；人工确认后遗留 `claimed` 请求仍令重试 API 返回 409。v0.0.8 API
+>   对 `download_source` 返回 422，页面也没有线路选择器，所以中断恢复与加速线路均未通过。
+>   自动更新继续默认关闭。
 > - 自动更新默认关闭（`LING_UPDATE_ENABLED=0`），**关闭时这套改动不影响已经跑着的
 >   服务**：通道目录照常挂载（compose 早就接线了，见 §2），但开关是 0，界面上不会
 >   出现可点的“更新”入口；`GET /v1/version/update` 仍会读 status 里的心跳来回答
@@ -828,10 +830,10 @@ fail-closed 判据）；必须先人工迁移。
 >   当前 `v0.0.9` updater 另已在隔离 v0.0.8 稳定镜像项目真实执行一跳直连更新，状态 succeeded；
 >   **仍未完成**：故障注入**已做**坏摘要、错仓库、不在兼容目标、错提交、缺确认、多字段、非法
 >   JSON、重放、断连重连、端口冲突、API 未认证、拉取失败、迁移跳过、备份篡改，**未做**
->   head 不一致 / 并发请求 / 旧执行器残留（这三项依赖真实升级场景）；中断中任务的真实
->   对账（只有 3 条单测 + 变异验证）；生产库有真实数据时的恢复（生产库 `messages=0`/
->   `memories=0`）；arm64 运行（镜像双架构已构建，宿主是 x86_64）；当前候选 updater 的忙时
->   重启、中断对账和失败故障路径。`ab0ddf4` 候选容器和 `f381a8c` 源码实例的 Chromium 路径
+>   head 不一致 / 并发请求 / 旧执行器残留（这三项依赖真实升级场景）；2026-11-18 中断复测在
+>   `prepare` 阶段进入 `needs_manual`，支持确认后遗留 `claimed` 请求仍使 API 返回 409，恢复未通过；
+>   生产库有真实数据时的恢复（生产库 `messages=0`/`memories=0`）；arm64 运行（镜像双架构已构建，宿主是 x86_64）；
+>   当前候选 updater 的忙时重启及其他失败故障路径。`ab0ddf4` 候选容器和 `f381a8c` 源码实例的 Chromium 路径
 >   已验，但不能覆盖这些更新器故障路径。
 > - **不能宣称“网页一键更新可用”**：`LING_UPDATE_ENABLED` 默认 `0`（插值，
 >   可用 `ling install --with-updater --enable-updates` 打开）。默认关闭是因为上述验收项仍
@@ -1007,9 +1009,15 @@ fail-closed 判据）；必须先人工迁移。
   迁移 head `0078`、业务/媒体行数、专属卷、恢复点和更新后 Cookie 均核对通过。浏览器在
   请求 201 后关闭，重连后读到成功状态；进度页展示五阶段完成、直连 GHCR 和 34 秒耗时。
   该运行启用 `LING_TEST_MODE=1`，不证明真实模型能力。
+  2026-11-18 中断复测：真实 v0.8 → v0.9 请求在 updater `prepare` 阶段被停止，迁移未尝试；
+  因任务尚无旧服务容器/head 快照，重启后任务为 `needs_manual/old_service_unverified`，没有谎报旧版。
+  人工核对旧 API、worker、PG 后，使用 updater 的 `--acknowledge-manual <request_id>` 成功解除；
+  但 `claimed-<request_id>.json` 仍留在 requests 目录，API 对新请求继续返回 409 `update_in_progress`，
+  因此该路径没有完成恢复。`download_source=gh_proxy` 发送到 v0.8 API 得到 422 `invalid_request_body`，
+  且请求目录未变化。
 - 仍未完成：GH-Proxy/EdgeOne/custom mirror 的真实下载与 UI 线路选择、busy updater restart、
-  updater 任务中断后对账、head 不一致/并发/旧执行器残留及迁移/验证失败注入、arm64 主机运行、
-  含真实媒体数据的恢复。`ling status` 在网页更新成功后仍将安装时 v0.0.8 状态与 v0.0.9
+  head 不一致/并发/旧执行器残留及迁移/验证失败注入、arm64 主机运行、含真实媒体数据的恢复。
+  `ling status` 在网页更新成功后仍将安装时 v0.0.8 状态与 v0.0.9
   实况比较并报告 8 项差异；没有手工改写安装记录。`LING_UPDATE_ENABLED` 继续默认 `0`，未连接
   生产环境。
 - 源码一行升级仍未验收：固定 v0.0.8 checkout 没有 `deploy/upgrade.sh`，执行 README 命令时

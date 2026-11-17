@@ -244,7 +244,17 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 - 当前 updater 任务于 `2026-11-17T21:33:45Z` 开始、`21:34:19Z` 结束，用时 34 秒；日志依次记录备份、迁移、维护门禁关闭、目标 API 内网验证、恢复宿主端口及最终 digest/head 核验。最后阶段 `verify`，无 failure、warnings 或 next actions，`maintenance=released/verified=true`。进度页显示五阶段全完成、用时 34 秒、来源“直连 GHCR”；updater 回到 online/idle，`backup_gate=ok`。
 - 更新后 API 与 worker 实际 RepoDigest 均为 v0.0.9 index，OCI revision 均为 `f381a8c76df43a24b60944c91e22be46501bbd8c`；updater 容器实际 digest 为 `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`，revision 同为 `f381a8c...`。PG head 为 `0078_proactive_daily_quota`，计数保持 `1/3/4/8/0/1`，媒体文件与哨兵 SHA 不变，app/db 卷名不变。env 权限均为 0600；更新后 API `.env` SHA 为 `47576eab844c1843bb51ffbb23054c0bec62274e280eae7450ac4009a979e1ee`，updater `.env` SHA 为 `46a33b234f2f72f6f05329d22527b36815e080399c353b6142e4512cc4aff51f`。
 - 更新成功后，`ling status` 仍以安装时的 v0.0.8 `install-state.json` 对照实时部署，报告 8 项记录/实况差异，包括 digest、commit/version、迁移 head 和最近备份；状态文件没有自动同步。本次没有手工改写记录来消除差异。
-- 本次没有执行 GH-Proxy/EdgeOne/custom mirror 下载，没有测试 busy updater restart、任务中断后的 reconciliation、migration/verify 故障注入或真实失败回滚。浏览器断开后本任务继续并成功只证明断线不会取消该任务，不证明 updater 进程中断恢复；v0.0.8 页面也没有实际线路选择器。
+- 上述 34 秒成功任务本身没有执行 GH-Proxy/EdgeOne/custom mirror 下载，也没有注入 busy restart、任务中断、migration/verify 故障或真实失败回滚。浏览器断开后该任务继续并成功只证明断线不会取消任务；后续独立中断实验见下节。v0.0.8 页面没有实际线路选择器。
+
+**2026-11-18：updater 中断与旧 API 线路字段复测**
+
+- 在独立项目 `ling-a6-interruption-20261118`（loopback `20521`）使用发布代码 checkout `f381a8c76df43a24b60944c91e22be46501bbd8c` 的安装器，固定 API/worker 到 v0.0.8 index `sha256:77a20bb9cfde183e64eb1349b773666fc673c6f4a945abe9d889451c026207f1`，更新器固定为 v0.0.9 index `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`。安装前该 Compose 项目、目录和端口均为空闲；初始迁移 head 为 `0070_voice_reply_projection`，API `/readyz=200`，更新页报告 v0.0.8 当前摘要及 v0.0.9 目标摘要，更新器 `online/idle`、protocol 1、version 1.0.0。
+- API 容器 ID `b1b0672343bb4510bad049ec8e85b6a7dc2daa0462d52dd3f1349b79ac999337`、worker `1b03ef7aab7e3e8d276df2f22833c7f431d186241ee7012d549b043c34762eb2`、PostgreSQL `23d2367753501051d497d1274f10cdb3e7d62f4efdab4ddde4fee25f3a402265`；API/worker 的 `Config.Image` 与 image ID 均为指定 v0.8 摘要，状态 healthy。中断后的独立核对仍得到 API 版本/提交 `0.0.8` / `0d36dbadc4c8f688df2775e81f1e5e795006a271`、PG head `0070_voice_reply_projection`、计数 `users/windows/turns/messages/media_evidence = 1/0/0/0/0`。`.env` mode `0600`，SHA-256 `a10502163e790ccb0e0b3d87baf8ea513fb59677b8e5e2e4b86279e28b30fb09`。
+- `ling backup` 退出 0，dump `ling-20261118-072216.dump` SHA-256 `ead9152c3cc72c134afce521eac3eec70a4cc96d748c7bee7710aefdb2b3c104`；manifest SHA-256 `a2bc920f127ace8547adce5af7f09474c291ee346c8781305837011d180c883f`，`tombstones_state=ok`、`media_state=absent`、`keys_env_set=true`。`ling restore-drill --db ling_a6_interruption_20261118_drill` 退出 0，恢复计数 `1/0/0/0/0` 并确认库内无媒体引用。安装、backup、drill 日志 SHA-256 分别为 `205c23622bc3773a97d40732088a35182eaca638e7ffa489d44c820d7f50b12f`、`e0763c1f4922c9ed30bec1a48c54f0c7f27e865ac9b89261041bc0647c1fe864`、`b4f98a94fe3c273fef6c98e1c5a36fcb7f3d6bdb473d53d131a012a9b4f9575a`；日志权限已收紧为 `0600`。
+- 真实 HTTP 更新请求 `18ba0848f932493383755abae0d7e0df` 返回 201，目标为 v0.0.9 API digest。观察到 updater task `running/prepare` 且 `migration.attempted=false` 后，对唯一目标 updater 容器执行 `docker stop --time 0`，退出 0。显式启动 updater 后，任务进入 `needs_manual`，failure `old_service_unverified`，`still_on_old_version=null`，maintenance `unknown`；任务没有尝试迁移，旧 API/worker 和 PG 仍可用。task 记录中断时 `previous.services={}`、`previous.head=null`。
+- 使用 updater 支持的 `--acknowledge-manual 18ba0848f932493383755abae0d7e0df`，退出 0；task 变为 `resolved`、updater 回到 `idle`。但已认领的 `claimed-18ba0848f932493383755abae0d7e0df.json` 仍留在请求目录（SHA-256 `954a70b1ccbcf5cf2490cb3a787e0a17756aac869e4388aeaf60ec6656d52ca6`）。随后以新 request ID `efa0ecbcacbb444b9e32a22d2fcdc336` 重试，API 返回 409 `update_in_progress`，请求目录未增加文件。task/status 文件 SHA-256 为 `6bec67c93ba558d33fb9c2705f9fd1ab4498b4599b343e65cfa740f10e603a85` / `0817c9aded7bbb329cdc8c5ae1200e716c227e02e34accc7830d0adf05f3d9f0`。代码路径上，`acknowledge_manual()` 只更新 task/status；API 的 `_image_pending_request_ids()` 仍将 `claimed-*` 视为进行中，因此支持的确认后无法提交新任务。
+- 在同一 v0.8 API 上发送带 `download_source=gh_proxy` 的新请求 `9830cd494bf24bedacc72b51454a6d0d`，返回 422 `invalid_request_body`，请求目录未变化。v0.8 页面没有线路选择控件，旧 API 也不接受线路字段；未伪造稳定目标或手改请求文件。
+- 清理时只对本轮两个命名 Compose 项目执行 `down --remove-orphans`，未传 `--volumes`；容器和网络均已移除，app/db volumes `ling-a6-interruption-20261118_app-data`、`ling-a6-interruption-20261118_db-data` 及受限配置、备份和请求现场保留。未操作其他 Compose 项目、`5.88` 或 NAS 生产。
 
 **发布后状态表**
 
@@ -255,11 +265,11 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 | A3 | 部分通过但整体项未通过；源码部署与数据保留验证成功，v0.0.8 README 升级命令因该 tag 缺 `deploy/upgrade.sh` 退出 127，首装需额外准备前端产物 |
 | A4 | 通过；release workflow 全部成功，保留同 SHA 较早一次间歇失败 |
 | A5 | 通过；`v0.0.9` 双平台摘要、OCI revision 与运行 API RepoDigest 匹配 |
-| A6 | 部分通过；当前 v0.9 updater 一跳直连成功，进度/日志/浏览器断线后重连已观察；忙时重启、中断对账、失败矩阵未验，`ling status` 安装记录未同步 |
-| A7 | 部分通过；当前 updater 从 v0.8 稳定 API 经 GHCR 直连升到 v0.9 成功；v0.8 UI 没有线路选择器，加速线路未实测 |
+| A6 | 部分通过且恢复门禁未通过；直连更新、进度/日志/浏览器断线后重连已验；prepare 阶段中断后进入 `needs_manual`，支持确认后 stale `claimed` 请求仍使新任务 409，重试恢复失败；其他故障矩阵未验，`ling status` 安装记录未同步 |
+| A7 | 部分通过；v0.8 稳定 API 经 GHCR 直连升 v0.9 成功；v0.8 UI 无线路选择，v0.8 API 对 `download_source` 返回 422，加速线路未实测 |
 | A8 | 通过；文档与发布后状态对齐，完整测试/扫描结果见记录末尾 |
 
-**当前发布验收与更新通道签核：No-Go。** `v0.0.9` 已发布，当前 updater 也已完成一跳直连更新；但固定 v0.0.8 源码 checkout 缺少 README 要求的 `deploy/upgrade.sh`，在 5.21 上直接首装又缺 `pnpm`，所以“一行首装/升级”判据未通过。仍缺实际加速线路、updater 忙时重启/中断对账和故障注入，关系/日程冻结范围也未完整覆盖。此判定不否认 Release、镜像身份或成功的一跳实测。
+**当前发布验收与更新通道签核：No-Go。** `v0.0.9` 已发布，GHCR 直连一跳成功；但固定 v0.0.8 源码 checkout 缺少 README 要求的 `deploy/upgrade.sh`，在 5.21 上直接首装又缺 `pnpm`，所以“一行首装/升级”判据未通过。更新线路被 v0.8 API 拒绝；中断恢复在 `prepare` 阶段进入人工门禁，支持确认后仍因遗留 claimed 请求无法重试。加速线路、其他忙时/故障矩阵及关系/日程冻结范围仍未完整覆盖。此判定不否认 Release、镜像身份或成功的一跳直连实测。
 
 **A8：文档与本地验证**
 

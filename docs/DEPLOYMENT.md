@@ -1820,8 +1820,10 @@ HSTS 头存在、TLS 1.1 握手被拒。
 > **演练范围要分开说**：源码模式在隔离 Docker 上完成过候选升级和数据保留核验，但固定
 > `v0.0.8` checkout 没有 README 中的 `deploy/upgrade.sh`，从旧基线直接运行失败；该路径的
 > 一行升级未通过。镜像模式已在隔离项目 `ling-drill` 上真机跑通历史新装、备份恢复、三次
-> 连续升级；本轮还验证了 `v0.0.9` updater 从 `v0.0.8` 稳定镜像直连更新一跳。加速线路和
-> 任务中断恢复仍未验；这些结果都不代表生产 `ling` 或完整无人值守更新能力通过。
+> 连续升级；本轮还验证了 `v0.0.9` updater 从 `v0.0.8` 稳定镜像直连更新一跳。另一次中断
+> 实验在 `prepare` 阶段停止 updater，重启后进入人工门禁；支持的人工确认没有清除遗留
+> `claimed` 请求，API 重试仍返回 409。加速线路也未实测；这些结果不代表生产 `ling` 或完整
+> 无人值守更新能力通过。
 
 `api` 容器本身没有任何 Docker 权限；它只能往宿主共享的 requests 目录写一条
 固定 JSON，真正的构建/切换由宿主上的独立执行器完成。Compose 只给 **api** 注入
@@ -2046,7 +2048,9 @@ python3 deploy/release/publish.py \
 保留的 `v0.0.8` 隔离镜像基线现已通过真实 Chromium 确认，并经 GHCR 直连完成一跳
 网页更新到 `v0.0.9`；由当前 `v0.0.9` updater 执行。任务用时 34 秒并成功，浏览器在
 HTTP 201 后断开，重新连接后观察到已完成；迁移、digest、PG/媒体行数、卷和 Cookie 均核验。
-加速线路、忙时重启、中断恢复与失败注入仍未实测。`LING_UPDATE_ENABLED` 仍默认
+加速线路、忙时重启及迁移/验证故障注入仍未实测。中断复测曾在 `prepare` 阶段进入
+`needs_manual`；人工确认后遗留 `claimed` 请求仍阻止 API 重试，故中断恢复未通过。
+`LING_UPDATE_ENABLED` 仍默认
 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
 `deploy/releases.json` 决定。Release workflow `44112900865` 构建并核验了 `v0.0.9`
@@ -2055,7 +2059,8 @@ API/updater 双平台镜像；GHCR 原始 index 与平台 manifest 摘要及 OCI
 均启用 `LING_TEST_MODE=1`；另一个 `v0.0.8` 镜像基线为 32/33，重试按钮断言失败且原因未定位。
 独立镜像项目经 GHCR 直连完成 `v0.0.8 → v0.0.9` 一跳，由当前 `v0.0.9` updater 执行，
 核验运行摘要、迁移、业务行数、媒体、卷及更新后 Cookie。README 升级命令从 v0.0.8 checkout
-启动时因缺少 `deploy/upgrade.sh` 失败；加速线路、任务中断恢复与失败注入仍未完成，故网页与源码
+启动时因缺少 `deploy/upgrade.sh` 失败；加速线路、更新器其他中断阶段和失败注入仍未完成，且已测
+中断路径无法在人工确认后重试，故网页与源码
 一行更新验收均不能整体签核（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 

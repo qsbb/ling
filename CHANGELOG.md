@@ -23,7 +23,7 @@
 - Release workflow run `44112900865` 对 tag/main SHA `f381a8c76df43a24b60944c91e22be46501bbd8c` 的 verify、Python 3.12/3.13、Web、mobile、API image、updater-image 与 release jobs 全部成功。较早的 push CI run `44102373375` 中，Python 3.12 的 `test_slow_media_does_not_block_ordinary_events` 失败；release workflow 对同一 SHA 重跑通过，原因尚未定位。
 - GHCR `v0.0.9` API index 为 `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`，updater index 为 `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`；amd64/arm64 manifest 与 OCI version/revision 均独立核验。详情见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
 - 固定 `v0.0.8` 源码基线的 Chromium/API/PostgreSQL W0 为 34/34，候选源码升级后 W0 也为 34/34；二者启用 `LING_TEST_MODE=1`，只证明 Web/API/fake-provider 路径。另一个 `v0.0.8` 镜像基线 W0 为 32/33，唯一失败为模型错误场景未显示重试按钮，原因未定位。
-- 隔离 `v0.0.8 → v0.0.9` GHCR 直连网页更新已由当前 `v0.0.9` updater 完成，用时 34 秒；迁移、API/worker digest、PG/媒体行数、浏览器断线后的成功状态和登录 Cookie 均核验。未测加速线路、updater 中断恢复或故障矩阵。源码升级部署成功，但 v0.0.8 checkout 缺 README 所写的 `deploy/upgrade.sh`，直接的一行升级以退出码 127 失败；在 5.21 首装还需预先构建并复制前端。整体一行部署和更新通道验收均维持 No-Go。
+- 隔离 `v0.0.8 → v0.0.9` GHCR 直连网页更新已由当前 `v0.0.9` updater 完成，用时 34 秒；迁移、API/worker digest、PG/媒体行数、浏览器断线后的成功状态和登录 Cookie 均核验。另在隔离项目实测 updater 于 `prepare` 阶段中断：重启后进入人工门禁；支持的人工确认后，遗留 `claimed` 请求仍使重试 API 返回 409 `update_in_progress`。v0.0.8 API 对 `download_source` 返回 422，故加速线路仍未实测。源码升级部署成功，但 v0.0.8 checkout 缺 README 所写的 `deploy/upgrade.sh`，直接的一行升级以退出码 127 失败；在 5.21 首装还需预先构建并复制前端。整体一行部署和更新通道验收均维持 No-Go。
 
 ## [0.0.8] - 2026-11-13
 
