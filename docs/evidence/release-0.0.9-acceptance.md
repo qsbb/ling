@@ -123,11 +123,11 @@ Successful jobs verified `version=0.0.9`, `revision=ab0ddf41b81245bce40701ea1fdf
 
 该候选项目 `ling backup` 生成完整 dump，CLI 校验 `dump_sha256` 与 manifest 一致；`ling restore-drill` 恢复到项目专属 `_drill` 数据库，通过关键表、墓碑和媒体覆盖核对。新库行数为 `users=1, windows=0, turns=0, messages=0, memories=0`，因此本次没有非空业务数据哨兵可证明有记录被恢复。备份后 `ling doctor` 为 `ok=27, warn=1, fail=0`；唯一 warn 为隔离项目没有 root crontab 备份任务。上述步骤均未触碰生产库、NAS 或 `v0.0.8` 基线项目。
 
-候选 updater 的镜像和运行容器身份已验，但因自动更新开关保持关闭且 GHCR 尚无 `v0.0.9` 稳定 tag，仍未验证候选 updater 的真实更新任务阶段/耗时、重复/并发、断线、忙闲重启、中断对账、迁移故障、maintenance gate，或稳定版网页升级前后的 Cookie/配置/PostgreSQL/媒体状态。因此候选镜像启动通过不代表更新链路通过。
+截至 2026-11-17，候选 updater 的镜像和运行容器身份已验，但自动更新开关保持关闭且 GHCR 尚无 `v0.0.9` 稳定 tag；当时尚未验证候选 updater 的真实更新任务阶段/耗时、重复/并发、断线、忙闲重启、中断对账、迁移故障、maintenance gate，或稳定版网页升级前后的 Cookie/配置/PostgreSQL/媒体状态。因此候选镜像启动通过不代表更新链路通过。
 
 **A6 判定：部分通过。** 候选 API/updater 固定摘要已在独立 5.21 项目实际启动，status/doctor、真实 Chromium 登录与页面/API 路径、首份备份和隔离 restore-drill 通过；真实网页更新及 updater 故障注入仍未验。
 
-### A7：稳定版网页更新
+### A7：稳定版网页更新（截至 2026-11-17）
 
 GHCR 只读查询没有 `v0.0.9` 稳定 tag 或对应 digest。未创建 tag/Release，也未在隔离镜像部署中从 `v0.0.8` 经 GHCR 直连及可达加速线路升级。旧镜像上的检查请求不是版本升级。5.21 CLI 隔离项目已保留作升级基线。若正式流程只产生一个新的稳定版本，本轮最多能验一跳 `v0.0.8 → v0.0.9`；没有第二个可区分的稳定摘要时，不得宣称两跳连续升级已验，也不伪造 tag 或放宽 updater 校验。
 
@@ -169,7 +169,7 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 
 **A8 判定：通过（记录区分原始基线、最终代码候选、旧镜像报告与 mock 边界；不代表发布门禁通过）。**
 
-### 最终判定
+### 最终判定（截至 2026-11-17）
 
 | ID | 结论 |
 |---|---|
@@ -184,4 +184,66 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 
 **整体 Go/No-Go：No-Go。** 候选不在 `main` 祖先链；候选 updater 的实际更新任务与稳定版网页升级仍未验，且当前没有 `v0.0.9` 稳定 tag 可供单跳升级。
 
-**剩余门禁：**`ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR head `3a7a1f8` 的 CI 三项也通过。本条文档说明是在该 run 后新增，待新 head CI。合并后还须对 main 合并提交运行 SHA-only image workflow，再创建稳定 tag。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。此快照时 PR 尚未合并，本轮没有创建稳定 tag/Release 或访问 NAS 生产端。
+
+**剩余门禁（该历史快照）：**`ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR head `3a7a1f8` 的 CI 三项也通过。本条文档说明是在该 run 后新增，待新 head CI。合并后还须对 main 合并提交运行 SHA-only image workflow，再创建稳定 tag。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。此快照时 PR 尚未合并，本轮没有创建稳定 tag/Release 或访问 NAS 生产端。
+
+### 2026-11-18 发布后复验
+
+本节更新当前发布和实际更新状态；上文各项仍保留其观测日期与历史边界。目标范围限于命名隔离项目与本地工作树，没有连接 NAS 或生产部署。
+
+**A1：当前快照与远端身份**
+
+- 本地 `HEAD`、`origin/main` 与 `v0.0.9` tag 解引用均为 `f381a8c76df43a24b60944c91e22be46501bbd8c`；分支为 `lingxi/release-0.0.9-final-acceptance`。本节编辑只涉及文档，版本、源代码、测试和部署实现未改。
+- GitHub Release [`v0.0.9`](https://github.com/qsbb/ling/releases/tag/v0.0.9) 的发布时间为 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）。release workflow [run `44112900865`](https://github.com/qsbb/ling/actions/runs/44112900865) 的 verify、Python 3.12/3.13、Web、mobile、API image、updater-image 与 release jobs 全部成功。
+- 同一 SHA 的较早 push CI run `44102373375` 中，Python 3.12 的 `test_slow_media_does_not_block_ordinary_events` 失败（“慢媒体把普通事件也堵住了”）；release workflow 对该 SHA 重跑全绿。失败原因未定位，保留为间歇风险。
+- GHCR `v0.0.9` index 与平台 manifest：
+
+  | 镜像 | index digest | linux/amd64 manifest | linux/arm64 manifest |
+  |---|---|---|---|
+  | `ghcr.io/qsbb/ling-api:v0.0.9` | `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756` | `sha256:0cca394aa99aef2be8c0d71f8e2a44650ae8407b542a06f011dbb196522a6b20` | `sha256:68e60fc2162fd288b337c5847d2be17597a73d3c0325d5304d30464afc5cb321` |
+  | `ghcr.io/qsbb/ling-updater:v0.0.9` | `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429` | `sha256:6a77a0e8a9dd85915f59108167365fafece0a2c5c5637d06afc3dd4af25565ee` | `sha256:c82cce538de2b290f073b9cdafdc2df3510fe3f328a392d65e82e710a8c853ad` |
+
+- Registry manifest/config reads confirmed both indexes contain amd64 and arm64, and all platform image labels report `version=0.0.9`, `revision=f381a8c76df43a24b60944c91e22be46501bbd8c`, source `https://github.com/qsbb/ling`.
+
+**A2：当前候选真实浏览器路径**
+
+- 独立源码项目 `ling-src-one-line-20261118` 的 checkout 为完整 SHA `f381a8c76df43a24b60944c91e22be46501bbd8c`；API、worker、PostgreSQL healthy，迁移 head `0078_proactive_daily_quota`，端口 `20488`，应用卷为 `ling-src-one-line-20261118_app-data`。首次安装前账户有强制改密标志。真实 Chromium 完成登录、强制改密（接口 204）、改密后 `/v1/auth/me` 与 dashboard 200；之后 `LING_TEST_MODE=1` 的 W0 套件通过 34/34，包含桌面/手机聊天、刷新、停止/重试、设置、账号及总览路径。日志 `/tmp/ling-w0-candidate-0.0.9-20261118.log`。
+- 测试期间以 Compose 环境覆盖临时启用 `LING_TEST_MODE=1`，测试后用原 `.env` 重建 API/worker，确认 `LING_TEST_MODE=0` 且 `/readyz=200`。临时口令通过恢复表保存原哈希后使用；测试结束原哈希、更新时间和 `must_change_password=true` 均核对恢复，7 个测试会话吊销，恢复表删除。浏览器套件新增的对话数据留在此命名隔离测试库。
+- 旧版源码项目 `ling-src-upgrade-20261118`（`v0.0.8` commit `0d36dbadc4c8f688df2775e81f1e5e795006a271`）W0 套件通过 34/34，日志 `/tmp/ling-w0-source-acceptance-20261118-r1-redacted.log`。第一次使用错误测试账号时登录失败，没有通过鉴权或执行写操作；随后用临时账户口令重跑。原密码哈希与账户标记已恢复，17 个测试会话吊销。
+- 这两组结果使用 fake provider；横幅和回复标记显示测试模式，不证明真实模型能力。关系合并/拆分、权限拒绝、大量数据分页和完整日程失败恢复仍未覆盖。
+
+**A3：源码模式安装与升级**
+
+`f381a8c` 源码实例已观察到专属项目/卷、版本 commit、迁移与健康状态，浏览器路径已验；本轮没有独立保存首次源码安装的完整命令和干净前状态，也没有在该候选执行源码升级与失败恢复。因此仍不能将本项记为通过。
+
+**A6/A7：隔离镜像更新实测**
+
+- 基线项目 `ling-image-accept-009-cli-20261117` 的 API/updater 原摘要分别为 `sha256:77a20bb9cfde183e64eb1349b773666fc673c6f4a945abe9d889451c026207f1` 与 `sha256:281736db4dedcb29643b01e1be52638c6a019ce7b282bb0d83895a067281fd0f`，两镜像 revision 均为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`。项目 `LING_UPDATE_ENABLED=1`、`LING_TEST_MODE=1`，数据库迁移 head 为 `0070_voice_reply_projection`，API/worker/PG 健康。
+- 更新前真实 Chromium W0 套件通过 34/34；隔离 PostgreSQL 为 `users/windows/turns/messages/memories = 1/2/4/8/0`。日志 `/tmp/ling-w0-image-v0.0.8-20261118.log`。此步骤使用测试 fake provider。
+- `ling backup` 退出 0；dump `ling-20261118-025321.dump` 的 SHA-256 为 `a51841de7a2b437ee5303f10fda2cfc6c2884074519c3b4266e7cbf287f7692f`，manifest/墓碑与媒体状态校验通过。`ling restore-drill --db ling_codex_a7_20261118_drill` 退出 0，在项目专属 `_drill` 数据库恢复 1 个用户并核对 dump、墓碑、媒体覆盖。Updater 重启后读取到完整恢复点 `backup-0df756761bf8`，`backup_gate=ok`。
+- 门禁诊断过程：旧状态的 `no_manifest` 时间早于既有备份；updater 重启后发现旧 root-owned `0600` manifest 但报告 `manifest_unreadable`。通过正式 `ling backup` 新建 manifest 后，updater 再次启动读取到完整恢复点并放行。没有手工改权限或绕过门禁；更新前已记录 `backup_gate=ok`。
+- 真实浏览器在 `/settings/about` 确认目标后选择默认 GHCR 直连、勾选迁移风险确认并提交；API 返回 `201`，request ID `0df756761bf887f9a4673b60b0ef76a3`。旧 `v0.0.8` updater 任务于 `2026-11-17T19:09:10Z` 开始、`19:10:02Z` 结束，状态 `succeeded`、最后阶段 `verify`，无失败码。迁移从 `0070_voice_reply_projection` 到 `0078_proactive_daily_quota`，maintenance gate `released/verified=true`；更新器备份完整，墓碑 `ok`，媒体 `absent` 与空媒体引用一致。
+- 更新后 API 与 worker 的 `RepoDigest` 均为 `ghcr.io/qsbb/ling-api@sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`，OCI labels 为 `0.0.9` / `f381a8c76df43a24b60944c91e22be46501bbd8c`，健康检查通过。PostgreSQL 仍为 `users/windows/turns/messages/memories = 1/2/4/8/0`；应用卷名保持 `ling-image-accept-009-cli-20261117_app-data`，端口与测试开关不变。主 `.env` SHA-256 从 `71394e4ff5eb81a22826d366ba26141ec6bd8af8f28cd924d39732973b0ac25a` 变为 `28ea37882b6e8a852bd862b3a1b0fc04aafafb1f7bec5da40928a738bc3d7231`，其中 `LING_APP_IMAGE` 更新到目标 digest；`updater/.env` SHA-256 保持 `a8b2078095c2a5b80ccba72741f717e249a893231fc12e569992503d4de2c252`。更新后原浏览器会话 `/v1/auth/me=200`、dashboard=200，cookie 指纹一致。
+- 该请求由旧 `v0.0.8` updater 镜像执行；`v0.0.9` updater 镜像已独立核验，但本次没有替换/验证它执行更新。任务有一条非阻断 warning：更新器容器看不到宿主 Docker 根目录，因此磁盘余量未核对。直连一跳成功不等于加速线路、并发/断线/中断故障路径或连续两跳验收。
+- 更新后已恢复 `ling` 测试账户原密码哈希/标志，吊销 9 个测试会话并删除临时恢复表；确认只留下该测试项目数据。没有触碰其他 Compose 项目、NAS 或生产端。
+
+**发布后状态表**
+
+| ID | 当前结论 |
+|---|---|
+| A1 | 通过；tag/main、镜像摘要与隔离边界已核验 |
+| A2 | 部分通过；多组三十四项浏览器套件通过，冻结范围尚未完整覆盖 |
+| A3 | 未验；缺当前候选源码一行安装的完整可复核命令与源码升级记录 |
+| A4 | 通过；release workflow 全部成功，保留同 SHA 较早一次间歇失败 |
+| A5 | 通过；`v0.0.9` 双平台摘要、OCI revision 与运行 API RepoDigest 匹配 |
+| A6 | 部分通过；旧 updater 单跳更新成功，当前 updater 与故障矩阵未验 |
+| A7 | 部分通过；GHCR 直连 `v0.0.8 → v0.0.9` 成功，加速路线未验 |
+| A8 | 通过；文档与发布后状态对齐，完整测试/扫描结果见记录末尾 |
+
+**当前更新通道签核：No-Go。** 尚缺候选源码升级、当前 updater 的更新任务与故障注入、加速线路以及关系/日程冻结范围。该判定针对完整更新验收，不否定 `v0.0.9` 已正式发布或本次隔离单跳实测结果。
+
+**A8：文档与本地验证**
+
+- 本地全量 Python pytest 以 HEAD `f381a8c76df43a24b60944c91e22be46501bbd8c` 运行，持有 `/tmp/ling_test_lock.sh` 原子锁，`LING_TEST_DATABASE_URL` 与 `LING_DATABASE_URL` 均指向隔离 `ling_test`；退出码 0、进度 100%。`-q` 日志没有最终用例计数，不推算 passed/skipped/xfail 总数。日志：`/tmp/ling-pytest-release-docs-20261118.log`。仅出现 Starlette/httpx、Alembic `path_separator` 与 multiprocessing fork 的 deprecation warnings。
+- 文档修改前固定的关键源文件 SHA-256：`clients/web-console/src/connector-instances.browser.test.tsx=a5179d63d5d60051e6fe63fecfde79056b7c4430624fb17ecf701bc13c9ee975`；`clients/web-console/src/components/ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`；`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`；`tests/test_cli_install.py=5458e249b57f02444f8bbd93391c1832942ce4af59906653413ff21f3587e243`；`deploy/install.sh=bdafce6f36a9f7485c72f266f34a3f9afcf1d381eca1c400b6b8f19f055cd661`；`deploy/upgrade.sh=2567627ee95f92d18ed13a193d01e471fbe80a2086e262751dc10c4e6ee53623`；`deploy/compose.yaml=b8ad9834592dbec57eea272b7c73d1a7eb955fea64d2e41db05de9949b25fb10`。全量运行前后工作区均只涉及文档，源代码与测试未改。
+- `git diff --check` 通过；修改文档的编码完整性和敏感内容扫描均通过。

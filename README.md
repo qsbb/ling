@@ -178,25 +178,21 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
-记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
-`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（含 Web/CLI 实现提交
-`1edc369`、`981a815`），尚未合入 `main`、打 tag 或发布。GitHub
-`main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选仍不满足 release
-workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器实例 generation 刷新和
-自定义 updater 项目名修复。远端状态、复验文件哈希与提交边界见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+发布与升级：GitHub 已于 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）
+正式发布 `v0.0.9`。tag、`main` 与 release workflow run `44112900865` 均绑定
+`f381a8c76df43a24b60944c91e22be46501bbd8c`；该 run 的 verify、Python 3.12/3.13、
+Web、mobile、API image、updater-image 与 release jobs 全部成功。GHCR 两个 index 及
+amd64/arm64 manifest 的 digest、OCI version/revision 已独立核验，详见
+[验收记录](docs/evidence/release-0.0.9-acceptance.md)。同一 SHA 较早的 push CI 有一条
+慢媒体并发用例失败，release workflow 重跑通过；原因未定位，记录仍保留。
 
-此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
-不能当作当前候选验收。`981a815` 已在 5.21 隔离项目通过非默认 OneBot 两轮保存的
-真实 Chromium/API/PostgreSQL 路径；`ab0ddf4` 的 API/updater SHA 镜像也已在独立 5.21
-Compose 项目安装并运行。候选镜像的 `/readyz`、版本/提交、迁移 head、运行摘要与专属卷
-均核对通过；真实 Chromium 登录总览、关系页和连接器页 API 请求、375px 布局，以及新标签/
-刷新会话恢复均通过。`ling backup` 和隔离 `restore-drill` 通过，更新器容器以固定摘要运行，
-自动更新开关保持关闭。测试启用了 `LING_TEST_MODE=1`，不代表真实模型能力。PR CI 的
-Python 3.12 首轮有一条 QQBot 投递用例失败，单 job 重跑通过，原因未定位；细节见
-[验收记录](docs/evidence/release-0.0.9-acceptance.md)。候选的源码模式首装/升级、关系合并/
-拆分、候选 updater 实际执行网页更新和稳定版网页升级仍未验收。GHCR 最高稳定 tag 仍为
-`v0.0.8`；SHA-only 镜像不等于 `v0.0.9` Release。自助更新默认关闭。历史部署范围见
+历史隔离部署结果仍绑定各自记录的旧快照。另在独立源码 Compose 项目对 `v0.0.8`
+旧稳定版执行真实 Chromium/API/PostgreSQL 浏览器套件，34/34 通过；该实例启用
+`LING_TEST_MODE=1`，回复由 fake provider 生成，不证明真实模型能力，也不是当前
+`v0.0.9` 候选源码安装/升级或真实模型验收。隔离 `v0.0.8` 镜像已通过 GHCR 直连实际更新到
+`v0.0.9`，并核验迁移、数据计数、运行 digest 与登录 cookie；该任务由旧 `v0.0.8` updater
+执行。加速线路、当前 `v0.0.9` updater 的更新任务、关系合并/拆分和当前候选源码模式升级仍未验收，
+因此整体更新通道签核仍为 No-Go。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
 
