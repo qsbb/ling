@@ -15,15 +15,15 @@
 
 - 登录响应前提交会话，避免紧随登录的总览请求偶发 401。
 - 业务运行要求 PostgreSQL，修复并发创建会话、租约与数据库连接池相关竞态。
-- 源码模式支持一行首装与快进升级；严格 `umask 077` 下生成的前端目录可被 API 容器读取。
+- 源码模式提供首装命令和快进升级脚本；严格 `umask 077` 下生成的前端目录可被 API 容器读取。首装构建需要 pnpm 9+；固定 v0.0.8 checkout 不含新增的 `deploy/upgrade.sh`，因此从该基线的一行升级仍需 bootstrap，未达到本次验收判据。
 - 非默认连接器实例保存后重读本实例 generation；自定义应用项目名也会传到 updater，避免后续保存冲突或更新目标回退到 `ling`。
 
 ### 验证范围
 
 - Release workflow run `44112900865` 对 tag/main SHA `f381a8c76df43a24b60944c91e22be46501bbd8c` 的 verify、Python 3.12/3.13、Web、mobile、API image、updater-image 与 release jobs 全部成功。较早的 push CI run `44102373375` 中，Python 3.12 的 `test_slow_media_does_not_block_ordinary_events` 失败；release workflow 对同一 SHA 重跑通过，原因尚未定位。
 - GHCR `v0.0.9` API index 为 `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`，updater index 为 `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`；amd64/arm64 manifest 与 OCI version/revision 均独立核验。详情见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
-- 真实 Chromium/API/PostgreSQL 浏览器套件对旧稳定源码 `0d36dbadc4c8f688df2775e81f1e5e795006a271`（`v0.0.8`）的隔离实例通过 34/34。运行启用 `LING_TEST_MODE=1`，故只证明 Web、API 与 fake provider 链路，不证明真实模型能力；实例数据仍属测试数据。
-- 隔离 `v0.0.8 → v0.0.9` GHCR 直连网页更新已由真实 updater 完成，迁移至 `0078`、API/worker digest、PG 行数及更新后登录 cookie 均核验；实际执行者为旧 `v0.0.8` updater，且测试模式启用。加速线路、当前 `v0.0.9` updater 更新任务/故障注入、候选源码模式首装/升级、关系合并/拆分仍未验收；更新通道签核维持 No-Go。
+- 固定 `v0.0.8` 源码基线的 Chromium/API/PostgreSQL W0 为 34/34，候选源码升级后 W0 也为 34/34；二者启用 `LING_TEST_MODE=1`，只证明 Web/API/fake-provider 路径。另一个 `v0.0.8` 镜像基线 W0 为 32/33，唯一失败为模型错误场景未显示重试按钮，原因未定位。
+- 隔离 `v0.0.8 → v0.0.9` GHCR 直连网页更新已由当前 `v0.0.9` updater 完成，用时 34 秒；迁移、API/worker digest、PG/媒体行数、浏览器断线后的成功状态和登录 Cookie 均核验。未测加速线路、updater 中断恢复或故障矩阵。源码升级部署成功，但 v0.0.8 checkout 缺 README 所写的 `deploy/upgrade.sh`，直接的一行升级以退出码 127 失败；在 5.21 首装还需预先构建并复制前端。整体一行部署和更新通道验收均维持 No-Go。
 
 ## [0.0.8] - 2026-11-13
 

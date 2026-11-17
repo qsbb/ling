@@ -41,8 +41,11 @@ QQ、微信、Web 控制台、移动端都只是**连接到她的渠道**，她�
 
 ### Docker（推荐）
 
-需要 Git、Docker Engine 和 Docker Compose v2。整行执行后会在当前目录创建 `ling`，
-生成本机配置、构建镜像并启动服务；没有预装 pnpm 也可以安装。
+需要 Git、Docker Engine、Docker Compose v2 和 pnpm 9+。整行执行后会在当前目录创建
+`ling`，生成本机配置、构建前端和 API 镜像并启动服务。没有 pnpm 的部署主机需要先在
+构建机对同一提交运行 `bash deploy/install.sh --build-web-only`，再把匹配的源码与
+`clients/web-console/dist` 一并传到部署机，并使用 `--prebuilt-web` 安装；这条路径包含
+独立的构建/传递步骤。
 
 ```bash
 git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
@@ -59,8 +62,10 @@ bash deploy/install.sh               # 仅重新部署当前检出，不拉取�
 bash deploy/install.sh --down        # 停止服务，保留数据
 ```
 
-`deploy/upgrade.sh` 适用于源码安装，会获取当前分支远端并只接受快进更新，再调用标准安装
-流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
+`deploy/upgrade.sh` 适用于包含该脚本的源码 checkout，会获取当前分支远端并只接受快进更新，
+再调用标准安装流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
+注意：`v0.0.8` checkout 不含此脚本，因此不能从固定 v0.0.8 源码基线直接运行这条升级命令；
+`v0.0.9` 的单行升级命令无法自举进入旧 checkout，本次验收将该路径判为未通过。
 镜像模式不使用这个脚本。网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动
 更新仍需按 [docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
 
@@ -186,13 +191,18 @@ amd64/arm64 manifest 的 digest、OCI version/revision 已独立核验，详见
 [验收记录](docs/evidence/release-0.0.9-acceptance.md)。同一 SHA 较早的 push CI 有一条
 慢媒体并发用例失败，release workflow 重跑通过；原因未定位，记录仍保留。
 
-历史隔离部署结果仍绑定各自记录的旧快照。另在独立源码 Compose 项目对 `v0.0.8`
-旧稳定版执行真实 Chromium/API/PostgreSQL 浏览器套件，34/34 通过；该实例启用
-`LING_TEST_MODE=1`，回复由 fake provider 生成，不证明真实模型能力，也不是当前
-`v0.0.9` 候选源码安装/升级或真实模型验收。隔离 `v0.0.8` 镜像已通过 GHCR 直连实际更新到
-`v0.0.9`，并核验迁移、数据计数、运行 digest 与登录 cookie；该任务由旧 `v0.0.8` updater
-执行。加速线路、当前 `v0.0.9` updater 的更新任务、关系合并/拆分和当前候选源码模式升级仍未验收，
-因此整体更新通道签核仍为 No-Go。自助更新默认关闭。历史部署范围见
+历史隔离部署结果仍绑定各自记录的旧快照。固定 `v0.0.8` 源码基线与候选源码实例的真实
+Chromium/API/PostgreSQL W0 套件分别通过 34/34；源码升级也在隔离项目完成，保留数据库、
+配置、媒体和 Cookie。但 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，从该
+基线直接执行升级命令以退出码 127 失败；5.21 也缺 `pnpm`，首装需另行准备匹配的前端产物，
+所以固定基线的一行首装/升级验收未通过。上述浏览器测试启用 `LING_TEST_MODE=1`，回复由 fake
+provider 生成，不证明真实模型能力。
+
+隔离 `v0.0.8` 镜像基线已由 `v0.0.9` updater 经 GHCR 直连实际更新到 `v0.0.9`。任务成功，
+用时 34 秒，阶段进度、日志、运行 digest、迁移、数据/媒体和更新后登录 Cookie 均核验；浏览器
+在请求受理后断开，重连时任务已成功。该测试没有覆盖加速线路、任务中断恢复或失败注入；`v0.0.8`
+页面也没有线路选择控件。关系合并/拆分和日程失败恢复仍未完整覆盖，`ling status` 的安装记录
+更新后仍显示安装时旧版本。整体更新通道签核维持 No-Go。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
 

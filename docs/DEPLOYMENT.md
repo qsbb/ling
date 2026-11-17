@@ -664,7 +664,9 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - **演练意义上的几项仍未完成**（与上面那次迁移不是一回事）：两次连续网页升级、head 不一致 /
   并发请求 / 旧执行器残留的故障注入、生产库有真实数据时的恢复（生产库 `messages=0`、
   `memories=0`）、arm64 运行、真实浏览器端到端点一遍
-- 源码模式的完整升级演练（备份 → 构建 → 切换 → 失败恢复）仍未在真实 Docker 上做
+- 源码模式已在隔离 Docker 上执行候选升级并核对数据库、配置、媒体、卷和 Cookie 保留；
+  完整的备份 → 构建 → 切换 → 失败恢复演练仍未完成。固定 v0.0.8 checkout 不含 README
+  所述的 `deploy/upgrade.sh`，因此旧基线无法直接用该命令开始升级。
 - 从 edge 拓扑迁移的**整条链路**（`down --remove-orphans` → 改 `.env` →
   `install.sh` → `adopt-current`）只在 stub 测试与文档里走过，**没有在真实
   Docker 上演练**；迁移前请务必先备份，并按 §7 的第 5、6 步逐条核对
@@ -1815,9 +1817,11 @@ HSTS 头存在、TLS 1.1 握手被拒。
 > （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`），见
 > [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练) 与本文 §11。
 > 完整管线、宿主执行器命令、失败语义与人工恢复步骤见 [UPDATES.md](UPDATES.md)。
-> **演练范围要分开说**：源码模式的完整升级仍未真机演练；镜像模式已在隔离项目
-> `ling-drill` 上真机跑通（新装、备份恢复、三次连续升级），但**没有**在生产
-> `ling` 上演练。两者都不应被说成"已验证的无人值守升级能力"。
+> **演练范围要分开说**：源码模式在隔离 Docker 上完成过候选升级和数据保留核验，但固定
+> `v0.0.8` checkout 没有 README 中的 `deploy/upgrade.sh`，从旧基线直接运行失败；该路径的
+> 一行升级未通过。镜像模式已在隔离项目 `ling-drill` 上真机跑通历史新装、备份恢复、三次
+> 连续升级；本轮还验证了 `v0.0.9` updater 从 `v0.0.8` 稳定镜像直连更新一跳。加速线路和
+> 任务中断恢复仍未验；这些结果都不代表生产 `ling` 或完整无人值守更新能力通过。
 
 `api` 容器本身没有任何 Docker 权限；它只能往宿主共享的 requests 目录写一条
 固定 JSON，真正的构建/切换由宿主上的独立执行器完成。Compose 只给 **api** 注入
@@ -1925,8 +1929,10 @@ compose up -d --force-recreate api
    > `44112900865` 的 verify、Python 3.12/3.13、Web、mobile、image、updater-image
    > 与 release jobs 全部成功。GHCR 上两个 `v0.0.9` index、amd64/arm64 manifest
    > 和 OCI version/revision 已独立核验，摘要见[验收记录](evidence/release-0.0.9-acceptance.md)。
-   > 这不代表网页更新已验：隔离环境的旧稳定版浏览器测试走源码模式和 fake provider；
-   > `v0.0.8 → v0.0.9` 镜像更新、当前候选源码模式首装/升级仍未完成。
+   > 发布验收仍为 No-Go。固定 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，
+   > 从该基线执行升级命令退出 127；5.21 缺 `pnpm`，源码首装需额外准备匹配的前端产物。
+   > 候选源码升级在手工快进后成功；当前 `v0.0.9` updater 也已从 `v0.0.8` 镜像基线
+   > 经 GHCR 直连完成一跳，详情和未通过项见[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -2038,17 +2044,19 @@ python3 deploy/release/publish.py \
 **网页更新**：需要独立 `<应用项目名>-updater`（默认 `ling-updater`）与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
 三次连续升级。`v0.0.9` 已正式发布且 GHCR 的 API/updater index 与平台 manifest 已核验，
 保留的 `v0.0.8` 隔离镜像基线现已通过真实 Chromium 确认，并经 GHCR 直连完成一跳
-网页更新到 `v0.0.9`；由 `v0.0.8` updater 执行。加速线路和当前 `v0.0.9` updater
-故障路径仍未实测。`LING_UPDATE_ENABLED` 仍默认
+网页更新到 `v0.0.9`；由当前 `v0.0.9` updater 执行。任务用时 34 秒并成功，浏览器在
+HTTP 201 后断开，重新连接后观察到已完成；迁移、digest、PG/媒体行数、卷和 Cookie 均核验。
+加速线路、忙时重启、中断恢复与失败注入仍未实测。`LING_UPDATE_ENABLED` 仍默认
 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
 `deploy/releases.json` 决定。Release workflow `44112900865` 构建并核验了 `v0.0.9`
 API/updater 双平台镜像；GHCR 原始 index 与平台 manifest 摘要及 OCI revision 均已复核。
-真实 Chromium/API/PostgreSQL 浏览器套件在 `v0.0.8` 源码隔离项目与 `v0.0.9` 候选源码项目
-各通过 34/34，均启用 `LING_TEST_MODE=1`。另在独立 `v0.0.8` 镜像项目经 GHCR 直连完成
-`v0.0.8 → v0.0.9` 一跳更新，核验运行摘要、迁移、业务行数及 cookie；由旧 `v0.0.8`
-updater 执行，任务成功但报告宿主 Docker 根目录空间不可见的 warning。加速线路、当前
-`v0.0.9` updater 的真实任务与故障注入仍未完成，因此网页更新验收仍不能整体签核（细节与未验证项见
+真实 Chromium/API/PostgreSQL W0 套件在 `v0.0.8` 源码隔离项目与候选源码升级后各通过 34/34，
+均启用 `LING_TEST_MODE=1`；另一个 `v0.0.8` 镜像基线为 32/33，重试按钮断言失败且原因未定位。
+独立镜像项目经 GHCR 直连完成 `v0.0.8 → v0.0.9` 一跳，由当前 `v0.0.9` updater 执行，
+核验运行摘要、迁移、业务行数、媒体、卷及更新后 Cookie。README 升级命令从 v0.0.8 checkout
+启动时因缺少 `deploy/upgrade.sh` 失败；加速线路、任务中断恢复与失败注入仍未完成，故网页与源码
+一行更新验收均不能整体签核（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
 ### 11.4 三条硬边界
