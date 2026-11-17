@@ -180,8 +180,8 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 
 发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
 记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
-`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（实现提交 `981a815`；
-最终候选 SHA 以该 PR 的最新 head 为准），尚未合入 `main`、打 tag 或发布。GitHub
+`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（含 Web/CLI 实现提交
+`1edc369`、`981a815`），尚未合入 `main`、打 tag 或发布。GitHub
 `main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选仍不满足 release
 workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器实例 generation 刷新和
 自定义 updater 项目名修复。远端状态、复验文件哈希与提交边界见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
@@ -194,9 +194,8 @@ workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器
 `v0.0.8 → v0.0.9` 网页升级基线保留，尚未实际升级。这些结果不代表当前候选 updater
 镜像或网页升级通过。原始快照的全量 Python/Flutter、当前候选的 Web 全套与 CLI 定向
 检查结果见[验收记录](docs/evidence/release-0.0.9-acceptance.md)；本轮只读核实了当前
-GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定镜像。本地连接器组件测试仍
-将 `/v1` 路由 mock；已通过的 5.21 真实连接器路径单独记录。源码模式首装/升级、当前
-候选 updater 镜像、候选 GHCR digest 与稳定版网页升级仍未验收。自助更新默认关闭。历史部署范围见
+GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定 tag。最终候选的 SHA 镜像已由
+workflow `43989637070` 为文档修订前代码 head `8fc335b` 构建：API index `sha256:5e9ad176bf647ea688bdb5a4482913319e69a2b70ec7dc8025f28253131116ea`，updater index `sha256:52c368e6d50404486f15b28e87a5307e25e7bd8210d2961cd47e61ec069706ad`。文档提交会产生新 PR head，应另按该 SHA 构建。当前候选 updater 镜像尚未在 5.21 容器中运行，源码模式首装/升级和稳定版网页升级仍未验收。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
 
