@@ -676,8 +676,10 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - 镜像模式演练**没有覆盖**的项：**中断中任务的对账**（只有 3 条单测 + 变异
   验证，真机四次尝试都因工具/时序失败）、**生产库有真实数据时的恢复**（演练库
   `messages=0/memories=0/turns=0`，墓碑/媒体是"0 对 0"）、**arm64 运行**（镜像
-  构建了双架构，但宿主是 x86_64）、**浏览器端到端点一遍**（前端测试通过，没在
-  真实部署的浏览器里点过）。详见 `P5-DRILL.md` 与 `DELIVERY.md`。
+  构建了双架构，但宿主是 x86_64）。候选 `ab0ddf4` 已在独立 5.21 项目用真实
+  Chromium 验过登录、关系/连接器页面 API、新标签/刷新会话和 375px 布局；但日程完整
+  用户流程、关系合并/拆分，以及 updater 驱动的网页更新与故障路径仍未覆盖。
+  详见 `P5-DRILL.md`、`DELIVERY.md` 与候选[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 > 判断某项是否真的能用，看它有没有对应的测试或本节的验证记录；
 > 只写了代码没有记录的地方，按未验证对待。
@@ -2034,7 +2036,8 @@ python3 deploy/release/publish.py \
 归档、`13` 备份、`14` 拉取/身份、`15` 迁移、`16` 迁移后的切换/验证失败。
 
 **网页更新**：需要独立 `<应用项目名>-updater`（默认 `ling-updater`）与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
-三次连续升级；这不等于当前候选已完成容器与浏览器复验。`LING_UPDATE_ENABLED` 仍默认
+三次连续升级；候选 `ab0ddf4` 的 API/updater 固定摘要容器、普通 Chromium 页面/API 路径也已在新的独立项目验过，
+但没有通过 updater 执行真实网页更新。`LING_UPDATE_ENABLED` 仍默认
 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
 `deploy/releases.json` 决定。`v0.0.8` 已正式发布；2026-11-17 只读查询 GHCR 核对到

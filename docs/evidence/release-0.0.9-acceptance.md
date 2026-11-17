@@ -38,6 +38,7 @@
 - GitHub API 于 2026-11-17 只读核验：`main=0d36dbadc4c8f688df2775e81f1e5e795006a271`；最新正式 Release 为 `v0.0.8`，`published_at=2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41），tag 解引用到同一 main SHA。最初快照 `62e41c9` 的 `v0.0.9` tag 查询为 404、对应 Actions run 数为 0。`v0.0.8` Release workflow run `43458504082` 的 verify、Python 3.12/3.13 CI、mobile、web、image、updater-image 和 release jobs 均成功；这是旧 Release 的结果，不是候选结果。
 - 实现提交 `981a815c67b689b1bb863a3a858ac5358e99ee6d` 的 PR CI run `43977747265` 三项均通过。文档修订前最终候选 head `8fc335b8b6723b72f49d3f160ddf2bc7792a4bff` 的 PR CI run `43983345542` 三项也均通过。
 - 文档修订前最终候选 head 为 `8fc335b8b6723b72f49d3f160ddf2bc7792a4bff`。其 PR CI run `43983345542` 的 Python 3.12、Python 3.13、Web 全部成功；持锁本地全量 pytest 退出码 0、进度 100%，日志 `/tmp/ling-pytest-final-0.0.9-8fc335b.log`，该 `-q` 运行无最终数量汇总。Ruff、版本检查、release catalog、敏感信息/U+FFFD 扫描及 `git diff --check` 均通过。
+- 文档提交 `fb0d5fb92b5599e3f59b6022a4f4b4d0aabe712a` 后只读检查 PR #1 head 与本地 HEAD 一致；CI run `44025317841` 对该 head 的 Web、Python 3.12、Python 3.13 均成功。本轮接续时工作树干净，`origin/lingxi/release-0.0.8` 与该 SHA 一致；此后文案校准发生在该 CI run 之后，尚未推送，因此不声称这些后续文档字节已在 PR CI 验证。
 - 该 head 的 SHA-only `workflow_dispatch` run `43989637070` 全部成功：verify、mobile、Python 3.12/3.13、Web、API image、updater-image；release job 按设计 skipped。标签只含 `sha-8fc335b8b6723b72f49d3f160ddf2bc7792a4bff`，没有创建稳定 tag/Release。
 - `8fc335b` 的 SHA 镜像构建证据见 A5 历史记录。随后为实现/运行验收候选 `ab0ddf4` 另跑 PR CI 和 SHA-only workflow；其镜像与运行结果分列于后续条目及当前 A5/A6。
 - 实现与安装验收绑定的后续候选 head `ab0ddf41b81245bce40701ea1fdfebdba79bd06e`（本次文档复验前的 PR head；基于同一 Web/CLI 实现再加 docs-only 提交）。PR CI run `44006742093` 最终三项均通过：Web、Python 3.13、Python 3.12。Python 3.12 首次 attempt 有一条 QQBot 投递集成用例失败；同一 job 单独重跑成功，本机隔离 PostgreSQL 对应单例也通过。失败原因未定位，因此保留为并行全量测试的间歇风险，不把首轮失败从记录中抹去。
@@ -47,6 +48,7 @@
 - 2026-11-17 全量 pytest 结束后、补写本段前的工作树快照：`HEAD=8fc335b8b6723b72f49d3f160ddf2bc7792a4bff`、分支 `lingxi/release-0.0.8`；`git status --short` 仅列 `README.md`、`CHANGELOG.md`、`docs/DEPLOYMENT.md`、`docs/UPDATES.md`、本记录五份文档。该时点 SHA-256：README `42c8bb19082f716e86db44eec145031d45d9f6363e837dfcb1e40baa3e434c9c`；CHANGELOG `f50c00fba8aa36c2a6b65e6e49cc8ac1eea52498fe1352e9f0d894a352300c22`；DEPLOYMENT `99ac189547ae653fd2dd3dbaa1df989c3066032a81f0969d55439ed17838fae9`；UPDATES `cb2e95a54556ed88fd7cbc2260c8a4956a00ff6d2295b671383645619d8ed167`；本记录 `2b69f0c7894f67397c2f1e7286d379621482e71166845f36ca9e9ed61bc57061`。这些是测试完成后的观察值；本次运行开始前没有单独保存这五份文档的 SHA 清单，因此不将它们冒记为运行前哈希。代码文件复验后 SHA：`ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`、`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。
 - docs-only 更新推送前快照：`HEAD=ab0ddf41b81245bce40701ea1fdfebdba79bd06e`、分支 `lingxi/release-0.0.8`；`git status --short` 仅列 `README.md`、`CHANGELOG.md`、`docs/DEPLOYMENT.md`、`docs/UPDATES.md`、本记录五份文档。该时点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录（加入本条之前）`01f429d44d894916588d558084b073c20e5beb380f8bb5e466d51db4a48276f9`。代码文件仍为已验 SHA：`ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`、`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。
 - 本次 docs-only 提交前快照：`HEAD=ab0ddf41b81245bce40701ea1fdfebdba79bd06e`、分支 `lingxi/release-0.0.8`；`git status --short` 仅列 README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录五份文档。该时点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录（加入本条之前）`35743d7f1d0b25ce60f0f0e9fb89d54841e392c174c6fadc2b4ca0e604bf9faa`。已验源文件仍相同：`ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`、`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。
+- 本轮接续文档复核起点（2026-11-17）：`HEAD=fb0d5fb92b5599e3f59b6022a4f4b4d0aabe712a`、分支 `lingxi/release-0.0.8`，`git status --short` 为空，`origin/lingxi/release-0.0.8` 与 HEAD 相同。起点 SHA-256：README `eea22e87afe5b07e2df5974648bb1b918212624890d2fb727881603a6ec12399`；CHANGELOG `a2567b624352123dfd5dee940280402af9720e6a309be69632529c79c5c9c11a`；DEPLOYMENT `4b4836d0552283686d131fa1382266a68cd305c468e02a71cc487806339f7e05`；UPDATES `a8eb8d3625d12340348f99d0a7dead9963491f1e854295884c9a440b49c063c6`；本记录 `52d92377a82035b86c38a259d73e981bd6598afc3a852e5e6d35d6dcadc0f7a8`。这些值绑定复核前快照，不是后续修改后的哈希。
 - 实现/运行验收候选 `ab0ddf41b81245bce40701ea1fdfebdba79bd06e` 是 `8fc335b` 上的 docs-only 提交；相对于已通过运行的源代码，代码、测试和部署文件没有改变。候选实际容器安装前的工作树 `git status --short` 为空；`ConnectorsPage.tsx` SHA-256=`92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`，`deploy/cli/ling.py`=`0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`。docs-only 更新后新 PR head 将变化，须为新 head 重跑门禁和 SHA 镜像身份检查。
 
   | 镜像 | index digest | linux/amd64 | linux/arm64 |
@@ -131,7 +133,7 @@ GHCR 只读查询没有 `v0.0.9` 稳定 tag 或对应 digest。未创建 tag/Rel
 
 ### A8：文档与本地测试结果
 
-README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `62e41c9`、实现提交 `1edc369`/`981a815`、实现与运行验收候选 `ab0ddf4` 和历史部署快照 `0cfc9be`。本次文档修订形成新的 PR head；推送后仍须对该 head 重跑 PR CI 与 SHA-only 镜像身份工作流。`deploy/update-notes.json` 文案与候选变更范围一致，版本号未改动。本记录不自引用文档提交 SHA。
+README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `62e41c9`、实现提交 `1edc369`/`981a815`、实现与运行验收候选 `ab0ddf4` 和历史部署快照 `0cfc9be`。PR #1 文档 head `fb0d5fb` 的 Web、Python 3.12、Python 3.13 CI 均成功；本轮接续修订仅涉及文档，尚未推送或进入 CI。若推送该文档提交，仍须对新 PR head 重跑 PR CI；若要求镜像身份绑定完整新 SHA，也须运行 SHA-only 镜像工作流。`deploy/update-notes.json` 文案与候选变更范围一致，版本号未改动。本记录不自引用文档提交 SHA。
 
 原始快照 `62e41c9` 的验证基线（不能替代后续工作树的复验）：
 
@@ -170,14 +172,14 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 | ID | 结论 |
 |---|---|
 | A1 | 通过（快照和本机隔离范围） |
-| A2 | 部分通过，整体未验（连接器两轮保存、登录进入总览、关系列表读取和窄屏通过；关系合并/拆分、新标签刷新和完整日程未验） |
+| A2 | 部分通过，整体未验（连接器两轮保存、登录进入总览、关系列表读取、新标签/刷新会话与窄屏通过；关系合并/拆分和完整日程未验） |
 | A3 | 未验（源码模式首装/升级未在候选上实跑；镜像模式首装已在 A6 实测） |
-| A4 | 失败（未满足 main 祖先门禁；`ab0ddf4` PR CI 与 SHA-only 必需门禁通过，Python 3.12 首轮一条失败后重跑通过） |
-| A5 | 通过（`ab0ddf4` SHA 镜像 index、平台摘要与 OCI 身份已验证；本次文档修订的新 head 待重建） |
+| A4 | 失败（未满足 main 祖先门禁；`ab0ddf4` PR CI 与 SHA-only 必需门禁通过，Python 3.12 首轮一条失败后重跑通过；`fb0d5fb` 文档 head 的 PR CI 三项也通过） |
+| A5 | 通过（`ab0ddf4` SHA 镜像 index、平台摘要与 OCI 身份已验证；当前未推送的文档修订没有对应的新 SHA 镜像身份工作流） |
 | A6 | 部分通过（候选 API/updater 容器、浏览器/API 路径、备份与 restore-drill 已验；真实网页更新和 updater 故障注入未验） |
 | A7 | 需外部动作（无稳定 tag，未跑真实网页升级） |
 | A8 | 通过（候选/历史范围已区分，No-Go 明确） |
 
 **整体 Go/No-Go：No-Go。** 候选不在 `main` 祖先链；候选 updater 的实际更新任务与稳定版网页升级仍未验，且当前没有 `v0.0.9` 稳定 tag 可供单跳升级。
 
-**剩余门禁：**候选 `ab0ddf4` 的 PR CI 最终通过、SHA-only 双镜像及 5.21 隔离容器/浏览器 smoke 已完成；本次 docs-only 更新会形成新 PR head，推送后仍需重跑 PR CI 与 SHA-only 镜像身份工作流。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 真实更新路径及直连/加速/断线/中断对账未完成。候选不在 `main` 祖先链。本轮没有合并 PR、创建稳定 tag/Release 或访问 NAS 生产端。
+**剩余门禁：**候选 `ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR 文档 head `fb0d5fb` 的 CI 三项也通过。当前工作区的进一步文案校准尚未推送或进入 CI。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。候选不在 `main` 祖先链。本轮没有合并 PR、创建稳定 tag/Release 或访问 NAS 生产端。
