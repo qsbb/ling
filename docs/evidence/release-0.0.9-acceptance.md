@@ -39,6 +39,7 @@
 - 实现提交 `981a815c67b689b1bb863a3a858ac5358e99ee6d` 的 PR CI run `43977747265` 三项均通过。文档修订前最终候选 head `8fc335b8b6723b72f49d3f160ddf2bc7792a4bff` 的 PR CI run `43983345542` 三项也均通过。
 - 文档修订前最终候选 head 为 `8fc335b8b6723b72f49d3f160ddf2bc7792a4bff`。其 PR CI run `43983345542` 的 Python 3.12、Python 3.13、Web 全部成功；持锁本地全量 pytest 退出码 0、进度 100%，日志 `/tmp/ling-pytest-final-0.0.9-8fc335b.log`，该 `-q` 运行无最终数量汇总。Ruff、版本检查、release catalog、敏感信息/U+FFFD 扫描及 `git diff --check` 均通过。
 - 文档提交 `fb0d5fb92b5599e3f59b6022a4f4b4d0aabe712a` 后只读检查 PR #1 head 与本地 HEAD 一致；CI run `44025317841` 对该 head 的 Web、Python 3.12、Python 3.13 均成功。本轮接续时工作树干净，`origin/lingxi/release-0.0.8` 与该 SHA 一致。之后的文案校准分别提交于 `96abcd3` 和 `915644d`，只改文档；run `44025317841` 的证据不覆盖这两个提交。
+- 后续 PR head `3a7a1f8b27006e6375c8138ee9bb17f23b7a572a` 的 PR CI run `44087255580` 于 2026-11-17 完成；Web、Python 3.12、Python 3.13 均成功。此后仅本验收文档再追加说明；该 CI 不覆盖本条新内容。代码与部署实现未变。
 - 该 head 的 SHA-only `workflow_dispatch` run `43989637070` 全部成功：verify、mobile、Python 3.12/3.13、Web、API image、updater-image；release job 按设计 skipped。标签只含 `sha-8fc335b8b6723b72f49d3f160ddf2bc7792a4bff`，没有创建稳定 tag/Release。
 - `8fc335b` 的 SHA 镜像构建证据见 A5 历史记录。随后为实现/运行验收候选 `ab0ddf4` 另跑 PR CI 和 SHA-only workflow；其镜像与运行结果分列于后续条目及当前 A5/A6。
 - 实现与安装验收绑定的后续候选 head `ab0ddf41b81245bce40701ea1fdfebdba79bd06e`（本次文档复验前的 PR head；基于同一 Web/CLI 实现再加 docs-only 提交）。PR CI run `44006742093` 最终三项均通过：Web、Python 3.13、Python 3.12。Python 3.12 首次 attempt 有一条 QQBot 投递集成用例失败；同一 job 单独重跑成功，本机隔离 PostgreSQL 对应单例也通过。失败原因未定位，因此保留为并行全量测试的间歇风险，不把首轮失败从记录中抹去。
@@ -134,7 +135,7 @@ GHCR 只读查询没有 `v0.0.9` 稳定 tag 或对应 digest。未创建 tag/Rel
 
 ### A8：文档与本地测试结果
 
-README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `62e41c9`、实现提交 `1edc369`/`981a815`、实现与运行验收候选 `ab0ddf4` 和历史部署快照 `0cfc9be`。PR #1 文档 head `fb0d5fb` 的 Web、Python 3.12、Python 3.13 CI 均成功；本轮接续修订仅涉及文档，尚未推送或进入 CI。若推送该文档提交，仍须对新 PR head 重跑 PR CI；若要求镜像身份绑定完整新 SHA，也须运行 SHA-only 镜像工作流。`deploy/update-notes.json` 文案与候选变更范围一致，版本号未改动。本记录不自引用文档提交 SHA。
+README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `62e41c9`、实现提交 `1edc369`/`981a815`、实现与运行验收候选 `ab0ddf4` 和历史部署快照 `0cfc9be`。PR #1 head `3a7a1f8` 的 Web、Python 3.12、Python 3.13 CI run `44087255580` 均成功。本轮新增的文档说明发生在该 run 之后，仅改验收记录；推送后仍需为新的 PR head 重跑 CI。镜像身份仍绑定 `ab0ddf4`；合并后应先对 main 合并提交运行 SHA-only workflow，再打稳定 tag。`deploy/update-notes.json` 文案与候选变更范围一致，版本号未改动。本记录不自引用文档提交 SHA。
 
 原始快照 `62e41c9` 的验证基线（不能替代后续工作树的复验）：
 
@@ -175,12 +176,12 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 | A1 | 通过（候选快照、隔离测试范围及 5.21 命名隔离项目的只读容器核对） |
 | A2 | 部分通过，整体未验（连接器两轮保存、登录进入总览、关系列表读取、新标签/刷新会话与窄屏通过；关系合并/拆分和完整日程未验） |
 | A3 | 未验（源码模式首装/升级未在候选上实跑；镜像模式首装已在 A6 实测） |
-| A4 | 失败（未满足 main 祖先门禁；`ab0ddf4` PR CI 与 SHA-only 必需门禁通过，Python 3.12 首轮一条失败后重跑通过；`fb0d5fb` 文档 head 的 PR CI 三项也通过） |
-| A5 | 通过（`ab0ddf4` SHA 镜像 index、平台摘要与 OCI 身份已验证；这些摘要绑定 `ab0ddf4`，不代表后续 docs-only PR head 的 SHA 镜像身份） |
+| A4 | 失败（此记录时 PR 尚未合并，main 祖先门禁未满足；`ab0ddf4` PR CI 与 SHA-only 必需门禁通过，Python 3.12 首轮一条失败后重跑通过；`fb0d5fb` 与 `3a7a1f8` 两个 PR 文档 head 的 CI 三项均通过） |
+| A5 | 通过（`ab0ddf4` SHA 镜像 index、平台摘要与 OCI 身份已验证；摘要绑定 `ab0ddf4`，新文档 head `3a7a1f8` 没有单独的 SHA 镜像身份工作流） |
 | A6 | 部分通过（候选 API/updater 容器、浏览器/API 路径、备份与 restore-drill 已验；真实网页更新和 updater 故障注入未验） |
 | A7 | 需外部动作（无稳定 tag，未跑真实网页升级） |
 | A8 | 通过（候选/历史范围已区分，No-Go 明确） |
 
 **整体 Go/No-Go：No-Go。** 候选不在 `main` 祖先链；候选 updater 的实际更新任务与稳定版网页升级仍未验，且当前没有 `v0.0.9` 稳定 tag 可供单跳升级。
 
-**剩余门禁：**候选 `ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR 文档 head `fb0d5fb` 的 CI 三项也通过。`96abcd3` 与 `915644d` 是其后的文档校准，run `44025317841` 不覆盖它们；最终 PR head 仍需对应的 CI 和镜像身份检查。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。候选不在 `main` 祖先链。本轮没有合并 PR、创建稳定 tag/Release 或访问 NAS 生产端。
+**剩余门禁：**`ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR head `3a7a1f8` 的 CI 三项也通过。本条文档说明是在该 run 后新增，待新 head CI。合并后还须对 main 合并提交运行 SHA-only image workflow，再创建稳定 tag。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。此快照时 PR 尚未合并，本轮没有创建稳定 tag/Release 或访问 NAS 生产端。
