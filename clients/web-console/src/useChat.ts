@@ -302,6 +302,10 @@ export function useChat(
   const messagesRef = useRef<UiMessage[]>([]);
   const activeTurnRef = useRef<TurnView | null>(null);
   const recallProposalsRef = useRef<RecallProposalView[]>([]);
+  // A response started before a successful local change cannot replace that change.
+  const sessionsRevisionRef = useRef(0);
+  const sessionsRequestRef = useRef(0);
+  const sessionsAppliedRef = useRef(0);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -351,12 +355,27 @@ export function useChat(
     setLive(next);
   }, []);
 
-  const reloadSessions = useCallback(() => {
-    void api
-      .listSessions()
-      .then((list) => setSessions(list))
-      .catch(() => undefined);
+  const loadSessions = useCallback(async (isActive: () => boolean = () => true) => {
+    const revision = sessionsRevisionRef.current;
+    const request = ++sessionsRequestRef.current;
+    const list = await api.listSessions();
+    if (!isActive() || revision !== sessionsRevisionRef.current || request < sessionsAppliedRef.current) {
+      return null;
+    }
+    sessionsAppliedRef.current = request;
+    const seen = new Set<string>();
+    const unique = list.filter((item) => {
+      if (seen.has(item.session_id)) return false;
+      seen.add(item.session_id);
+      return true;
+    });
+    setSessions(unique);
+    return unique;
   }, []);
+
+  const reloadSessions = useCallback(() => {
+    void loadSessions().catch(() => undefined);
+  }, [loadSessions]);
 
   const loadMessages = useCallback(async (sessionId: string) => {
     if (!sessionId) return;
@@ -489,9 +508,11 @@ export function useChat(
 
     (async () => {
       try {
-        const list = await api.listSessions();
-        if (cancelled) return;
-        setSessions(list);
+        let list: SessionRecord[] | null = null;
+        while (!cancelled && list === null) {
+          list = await loadSessions(() => !cancelled);
+        }
+        if (cancelled || list === null) return;
         let target = routeSessionId;
         if (target && !list.some((session) => session.session_id === target)) {
           target = null;
@@ -502,7 +523,8 @@ export function useChat(
           } else {
             const created = await api.createSession();
             if (cancelled) return;
-            setSessions([created]);
+            sessionsRevisionRef.current += 1;
+            setSessions((prev) => [created, ...prev.filter((item) => item.session_id !== created.session_id)]);
             target = created.session_id;
           }
           navigate(routePath({ name: 'chat', sessionId: target }), { replace: true });
@@ -527,7 +549,7 @@ export function useChat(
     return () => {
       cancelled = true;
     };
-  }, [routeSessionId, loadMessages, loadRecallProposals, commitLive]);
+  }, [routeSessionId, loadMessages, loadRecallProposals, loadSessions, commitLive]);
 
   useEffect(
     () => () => {
@@ -897,13 +919,10 @@ export function useChat(
         if (abortRef.current === controller) abortRef.current = null;
         const current = liveRef.current;
         if (current && current.actorKey === actorKey) commitLive(null);
-        void api
-          .listSessions()
-          .then((list) => setSessions(list))
-          .catch(() => undefined);
+        reloadSessions();
       }
     },
-    [addRecallProposals, commitLive, loadMessages, loadRecallProposals, onTestMode],
+    [addRecallProposals, commitLive, loadMessages, loadRecallProposals, onTestMode, reloadSessions],
   );
 
   /* ------------------------------------------------------------ 用户动作 */
@@ -1091,7 +1110,8 @@ export function useChat(
     void api
       .createSession()
       .then((created) => {
-        setSessions((prev) => [created, ...prev]);
+        sessionsRevisionRef.current += 1;
+        setSessions((prev) => [created, ...prev.filter((item) => item.session_id !== created.session_id)]);
         navigate(routePath({ name: 'chat', sessionId: created.session_id }));
       })
       .catch((error: unknown) => {
@@ -1105,6 +1125,7 @@ export function useChat(
     if (!trimmed) return;
     try {
       const updated = await api.renameSession(sessionId, trimmed);
+      sessionsRevisionRef.current += 1;
       setSessions((prev) =>
         prev.map((session) => (session.session_id === sessionId ? updated : session)),
       );
@@ -1117,6 +1138,7 @@ export function useChat(
   const pinSession = useCallback(async (sessionId: string, pinned: boolean) => {
     try {
       const updated = await api.pinSession(sessionId, pinned);
+      sessionsRevisionRef.current += 1;
       setSessions((prev) =>
         prev.map((session) => (session.session_id === sessionId ? updated : session)),
       );

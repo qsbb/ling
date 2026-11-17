@@ -289,10 +289,10 @@ describe('时间轴顶部：两套日期 / 时区 / 时间戳', () => {
     expect(note).toContain(ACTOR_TZ);
   });
 
-  it('generated_at 与 outline_due_at 分开显示，不合并成一句「更新于」', () => {
+  it('计划最近变更与生成到期分开显示', () => {
     const html = renderTimeline();
     expect(html).toContain('生成到期');
-    expect(html).toContain('实际提交');
+    expect(html).toContain('计划最近变更');
     // outline_due_at = 11-07T02:00Z -> 上海 10:00；generated_at 13:45Z -> 上海 21:45。
     expect(sliceByTestId(html, 'tl-due-at', 'dd')).toContain('11-07 10:00');
     expect(sliceByTestId(html, 'tl-generated-at', 'dd')).toContain('11-07 21:45');
@@ -339,6 +339,58 @@ describe('state 六值文案', () => {
   it('ready / empty 不显示原因码', () => {
     expect(renderTimeline({ state: 'ready' })).not.toContain('原因码：');
     expect(renderTimeline({ state: 'empty', segments: [], facts: [], intents: [] })).not.toContain('原因码：');
+  });
+
+  it('展示服务端解释与确切的模型成功时间', () => {
+    const html = renderTimeline({
+      state: 'degraded',
+      last_error_code: 'model_timeout',
+      reason_explanation: '生成日程时模型请求超时。',
+      last_model_outline_at: '2025-12-31T23:05:00Z',
+    });
+    expect(sliceByTestId(html, 'tl-reason', 'p')).toContain('生成日程时模型请求超时。');
+    expect(sliceByTestId(html, 'tl-last-model', 'p')).toContain('2026-01-01 07:05');
+    const unknown = renderTimeline({ state: 'failed', reason_explanation: null, last_model_outline_at: null });
+    expect(sliceByTestId(unknown, 'tl-reason', 'p')).toContain('具体原因暂不明确');
+    expect(sliceByTestId(unknown, 'tl-last-model', 'p')).toContain('未知');
+  });
+
+  it('只展示服务端可判断的未安排时段', () => {
+    const missing = renderTimeline({ unplanned: null });
+    expect(sliceByTestId(missing, 'tl-unplanned', 'section')).toContain('未知');
+    const covered = renderTimeline({
+      unplanned: {
+        scope_start_at: '2026-11-07T16:00:00Z',
+        scope_end_at: '2026-11-08T16:00:00Z',
+        periods: [],
+      },
+    });
+    expect(sliceByTestId(covered, 'tl-unplanned', 'section')).toContain('覆盖全部时段');
+    const gap = renderTimeline({
+      unplanned: {
+        scope_start_at: '2026-11-07T16:00:00Z',
+        scope_end_at: '2026-11-08T16:00:00Z',
+        periods: [{ start_at: '2026-11-08T00:00:00Z', end_at: '2026-11-08T02:00:00Z' }],
+      },
+    });
+    const section = sliceByTestId(gap, 'tl-unplanned', 'section');
+    expect(section).toContain('11-08 08:00');
+    expect(section).toContain('11-08 10:00');
+    expect(section).not.toContain('覆盖全部时段');
+  });
+
+  it('夏令时回拨产生相同钟点时标出两端不同的偏移', () => {
+    const html = renderTimeline({
+      display_timezone: 'America/New_York',
+      unplanned: {
+        scope_start_at: '2026-11-01T04:00:00Z',
+        scope_end_at: '2026-11-02T05:00:00Z',
+        periods: [{ start_at: '2026-11-01T05:30:00Z', end_at: '2026-11-01T06:30:00Z' }],
+      },
+    });
+    const section = sliceByTestId(html, 'tl-unplanned', 'section');
+    expect(section).toContain('11-01 01:30 (GMT-4)–11-01 01:30 (GMT-5)');
+    expect(section).toContain('11-01 00:00 (GMT-4)–11-02 00:00 (GMT-5)');
   });
 
   it('unavailable 给「重试」，且绝不显示成「今天没安排」', () => {
@@ -474,15 +526,15 @@ describe('层级折叠（parent_id）', () => {
   });
 
   it('段高按时间比例，且有下限与上限', () => {
-    // 6 小时 = 360 分钟 → 216px，封顶 180px。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-night')!)).toBe(180);
-    // 4 小时 = 240 分钟 → 144px（未封顶）。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-block')!)).toBe(144);
-    // 15 分钟 → 9px，抬到下限 36px。
-    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-minute')!)).toBe(36);
+    // 长时段保留轻微高度差，同时避免休息段占满首屏。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-night')!)).toBe(72);
+    // 4 小时按紧凑比例折算，使用可读高度下限。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-block')!)).toBe(56);
+    // 短时段同样保证可读高度。
+    expect(segmentHeightPx(SEGMENTS.find((s) => s.segment_id === 'seg-minute')!)).toBe(56);
     const html = renderTimeline();
-    expect(html).toContain('min-height:144px');
-    expect(html).toContain('min-height:36px');
+    expect(html).toContain('min-height:56px');
+    expect(html).toContain('min-height:56px');
   });
 });
 

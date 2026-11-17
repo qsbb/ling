@@ -629,6 +629,18 @@
       "additionalProperties": true,
       "description": "最近一次安装任务（只给卡片与详情用，**不参与**发现结论）。\n\n旧任务的全部字段（``request_id``/``target``/``migration``/``backup``/\n``failure``/``warnings``/``next_actions`` …）仍按白名单原样透传一个版本。",
       "properties": {
+        "download_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Download Source"
+        },
         "failed_code": {
           "anyOf": [
             {
@@ -680,6 +692,33 @@
       "additionalProperties": true,
       "description": "更新器诊断：在线、状态、协议、版本。",
       "properties": {
+        "download_sources": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Download Sources"
+        },
+        "mirror_available": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mirror Available"
+        },
         "online": {
           "anyOf": [
             {

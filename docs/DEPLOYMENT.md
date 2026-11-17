@@ -4,6 +4,10 @@
 
 本机没有 Docker 时，用便携 PostgreSQL + Python 虚拟环境。
 
+数据库地址需要显式配置。此前使用本地 SQLite 的用户应先备份旧文件及相关密钥，
+确认迁移和回退方案后再切换。下面的 PostgreSQL 示例不会自动导入旧数据；回退时保留
+旧版本、原数据库文件及其密钥，并恢复原有数据库配置。
+
 ```bash
 cd /opt/ling
 
@@ -18,12 +22,15 @@ scripts/dev_pg.sh start
 # 3) 前端构建（可选，首次需要）
 cd clients/web-console && pnpm install && pnpm build && cd ../..
 
-# 4) 启动
+# 4) 确认数据库并启动（本例对应上面创建的本地 PostgreSQL）
+export LING_DATABASE_URL='postgresql+asyncpg://ling@127.0.0.1:55432/ling'
 . scripts/dev_env.sh
 export LING_WEB_DIST=$PWD/clients/web-console/dist
 python -m ling
 # → http://127.0.0.1:8080（开发默认端口，与容器里的 6520 无关）
 ```
+
+连接地址支持 `postgresql://` 和 `postgresql+asyncpg://`。运行时使用 asyncpg 驱动，其他驱动格式会在启动前拒绝。
 
 开发默认 `LING_TEST_MODE=1`，对话由确定性 fake provider 生成，界面显著标注
 “测试模式：回复由确定性 fake provider 生成，非真实模型能力”。
@@ -669,8 +676,10 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 - 镜像模式演练**没有覆盖**的项：**中断中任务的对账**（只有 3 条单测 + 变异
   验证，真机四次尝试都因工具/时序失败）、**生产库有真实数据时的恢复**（演练库
   `messages=0/memories=0/turns=0`，墓碑/媒体是"0 对 0"）、**arm64 运行**（镜像
-  构建了双架构，但宿主是 x86_64）、**浏览器端到端点一遍**（前端测试通过，没在
-  真实部署的浏览器里点过）。详见 `P5-DRILL.md` 与 `DELIVERY.md`。
+  构建了双架构，但宿主是 x86_64）。候选 `ab0ddf4` 已在独立 5.21 项目用真实
+  Chromium 验过登录、关系/连接器页面 API、新标签/刷新会话和 375px 布局；但日程完整
+  用户流程、关系合并/拆分，以及 updater 驱动的网页更新与故障路径仍未覆盖。
+  详见 `P5-DRILL.md`、`DELIVERY.md` 与候选[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 > 判断某项是否真的能用，看它有没有对应的测试或本节的验证记录；
 > 只写了代码没有记录的地方，按未验证对待。
@@ -1803,7 +1812,7 @@ HSTS 头存在、TLS 1.1 握手被拒。
 
 > 本节只讲**源码模式**的部署边界：宿主执行器 `deploy/update/executor.py` 取 tag
 > 源码 → 构建 → 调 `install.sh`。它**不能**用于镜像模式；镜像模式是另一套通道
-> （`/v1/version/image-update-requests` + 独立 `ling-updater`），见
+> （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`），见
 > [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练) 与本文 §11。
 > 完整管线、宿主执行器命令、失败语义与人工恢复步骤见 [UPDATES.md](UPDATES.md)。
 > **演练范围要分开说**：源码模式的完整升级仍未真机演练；镜像模式已在隔离项目
@@ -1893,45 +1902,31 @@ compose up -d --force-recreate api
 | 安装入口 | `bash deploy/install.sh`（在源码 checkout 里） | `ling install --digest ...`（宿主不需要源码树） |
 | 主 Compose 文件 | `deploy/compose.yaml`（api/worker 有 `build:`，Web 从宿主 bind 到 `/app/web`） | `deploy/compose.image.yaml`（api/worker 只认必填 `LING_APP_IMAGE`，Web 已烤进镜像） |
 | 版本标识 | `LING_COMMIT` 构建参数 + 本地镜像名 | 固定 OCI **index digest**（`/v1/version` 读容器内 `LING_APP_IMAGE`；commit 取自镜像内烤入的 `LING_COMMIT`，与 OCI 标注 `org.opencontainers.image.revision` 同源，发布/更新器再交叉核对） |
-| 日常升级 | 人工取新源码 → `install.sh`（[UPDATES.md §7](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
-| 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `ling-updater` + `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
+| 日常升级 | `bash deploy/upgrade.sh`（快进获取远端后构建部署，[UPDATES.md](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
+| 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `<应用项目名>-updater`（默认 `ling-updater`）+ `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
 | 可选 WS 端口 override | `deploy/compose.ws.example.yaml` | `deploy/compose.image.ws.example.yaml` |
 
 两份主文件**只能择一，禁止叠加 `-f`**：叠加会让旧 `build:`/前端 bind 仍然生效。
 
 ### 11.2 完整流程（全新安装）
 
-1. **从可信发布目录挑一个版本，再去 Release 正文取它的 index digest。** 目录文件是
-   `deploy/releases.json`（schema 1，只记录**发布决策**：`version`、源 `commit`、
-   `min_from`、`has_migration`、`released_at`；格式与校验规则见
-   `deploy/release/catalog.py` 文件头）：
+1. **从正式 Release 对应的 release workflow job summary 取得 API 镜像 index digest。**
+   Release 正文中的 digest 仅方便复制、可被编辑；手工安装前与该次运行的 `image` 作业
+   summary 核对。网页更新器则直接从 GHCR 发现稳定版 tag 和 digest，二者不要混为一谈。
 
-   ```bash
-   python3 deploy/release/catalog.py validate    # CI 也跑这一条，坏了就不该用
-   ```
+   > **摘要来源**：API 镜像使用 `ghcr.io/qsbb/ling-api@sha256:<64 hex>` 形式的
+   > index digest。网页更新器从 GHCR 的稳定版 tag 列表读取最新版本和 digest，并确认
+   > index 包含当前宿主平台；它不读取 `deploy/releases.json` 来选择目标。该文件仍由 CI
+   > 校验并保留为仓库发布元数据，但不是部署安装清单或网页更新信任源。
 
-   > 这条校验工具用到了 `datetime.UTC`，需要 **Python 3.11+**（本机 `python3` 是
-   > 3.9/3.10 时会直接 `ImportError`）；CI 用 `setup-python` 安装的版本跑，没问题。
-   > `ling` / `publish.py` 本身不需要第三方依赖，也没有这个版本限制。
-
-   > **目录里没有 digest。** 目标摘要是"构建之后才存在"的值，而目录条目是"构建
-   > 之前就要提交"的发布元数据，两者顺序相反；过去要求先写死 digest，导致每发一版
-   > 都要「构建 → 取 digest → 手改目录 → 再提交」，重新打包同一版本还会被 `add`
-   > 拒绝。现在：
-   >
-   > - **人工装/人工升**：digest 从该次 release workflow 的 job summary 或 Release
-   >   正文里取（**index digest**：`ghcr.io/qsbb/ling-api@sha256:<64 hex>`），交给
-   >   `ling install --digest` / `publish.py --digest`；
-   > - **网页更新**：由更新器在刷新目录时自己解析
-   >   `docker manifest inspect ghcr.io/qsbb/ling-api:v<version>`，取**本机架构**那条
-   >   平台 manifest 的 digest。两者都被 `publish.py` 的 `verify_repo_digests` 接受，
-   >   拉取后照旧核提交/平台/当前摘要。
-   >
-   > 所以"发版"只需要一次提交：把版本/源提交/跨度写进目录（`catalog.py add`），
-   > **不需要**再回来补 digest。
-
-   > **现状**：仓库里的 `deploy/releases.json` 目前有 `0.0.3`（`min_from` 0.0.2，
-   > 含迁移）。发布新版本时按上面的格式追加一条，不要手填一个"看起来像"的摘要。
+   > 截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；API 发布时间为
+   > `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。本轮只读核验 GHCR
+   > `v0.0.8` API/updater index digest 与 amd64、arm64 平台摘要，未发现 `v0.0.9` tag。
+   > 代码/运行候选 `ab0ddf4` 位于 PR #1，含实现提交 `1edc369` 与 `981a815`；文档更新后 PR head 另有 docs-only 提交。
+   > 尚未合入或打 tag。GitHub `main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选不是
+   > `main` 祖先，release tag 门禁未满足。历史源码隔离部署绑定 `0cfc9be`；`ab0ddf4` 的镜像模式
+   > 首装、健康、固定摘要与真实浏览器/API 路径已在独立 5.21 项目验收，源码模式升级和网页更新仍未完成。
+   > 详细边界见[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -1953,7 +1948,10 @@ compose up -d --force-recreate api
      `0.0.0.0` 会提示 TLS/反代/防火墙，**不会自动开放公网**。
    - **更新器默认不拉起**：不给 `--updater-digest`（或 `LING_UPDATER_IMAGE`）就
      不配置更新器，输出与安装状态都明确"网页更新不可用"；给了 `--with-updater`
-     才会起独立项目 `ling-updater`。当前也不该指望网页更新（见
+     才会起独立 Compose 项目。默认应用项目 `ling` 对应 `ling-updater`；若指定
+     `--project ling-verify`，更新器项目为 `ling-verify-updater`，但更新器容器内的
+     `LING_COMPOSE_PROJECT` 仍是 `ling-verify`，用于操作对应的应用项目。当前也不该
+     指望网页更新（见
      [UPDATES.md §10](UPDATES.md)）。
    - 产物落在 `<dir>` 下：`compose/compose.image.yaml`（由源文件生成，唯一改动是
      api 的宿主端口绑定变成 `${LING_HOST:-127.0.0.1}:${LING_PORT:-6520}:6520`，
@@ -2037,12 +2035,18 @@ python3 deploy/release/publish.py \
 退出码能区分失败阶段：`0` 成功、`2` 参数/非 digest、`10` 预检、`11` 锁、`12`
 归档、`13` 备份、`14` 拉取/身份、`15` 迁移、`16` 迁移后的切换/验证失败。
 
-**网页更新**：需要独立 `ling-updater` 与新的镜像更新通道。通道代码已就绪，且在
-隔离项目 `ling-drill` 上真机跑通了三次连续升级；生产 `ling` 已于 2026-11-05 迁到
-镜像模式，但**两次连续网页升级没在生产上走完**——目前只发布过一个镜像摘要
-（`42bba216`），没有第二个 digest。镜像模式 compose 里 `LING_UPDATE_ENABLED` 仍
-默认 `0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改 `.env` 打开）。仓库里的 `deploy/releases.json` 现在有 `0.0.3` 一条（`min_from` 为 `0.0.2`，且**不含 digest**：摘要由更新器刷新目录时从 registry 解析）；部署机当前版本不在那条的 `min_from` 里时，网页仍会显示 `no_available_target`。
-所以现在仍不要对用户宣称"可以在网页里更新"（细节与未验证项见
+**网页更新**：需要独立 `<应用项目名>-updater`（默认 `ling-updater`）与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
+三次连续升级；候选 `ab0ddf4` 的 API/updater 固定摘要容器、普通 Chromium 页面/API 路径也已在新的独立项目验过，
+但没有通过 updater 执行真实网页更新。`LING_UPDATE_ENABLED` 仍默认
+`0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
+`.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
+`deploy/releases.json` 决定。`v0.0.8` 已正式发布；2026-11-17 只读查询 GHCR 核对到
+API 与 updater 的 index/platform digest，明细见[候选验收记录](evidence/release-0.0.9-acceptance.md)。
+本轮未检查生产环境。代码/运行候选 `ab0ddf4` 的 SHA API/updater 镜像由 workflow `44015600964`
+构建并核验 OCI revision 与双平台 index，且在 5.21 全新隔离项目实际安装；API、worker、PostgreSQL
+健康，运行摘要、迁移 head、专属数据卷、更新器摘要及浏览器登录/页面路径均核验通过。该环境启用
+`LING_TEST_MODE=1`，网页更新开关仍为 0；没有执行候选 updater 更新任务或 `v0.0.8 → v0.0.9`
+真实网页升级。因此仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
 ### 11.4 三条硬边界
@@ -2071,6 +2075,20 @@ python3 deploy/release/publish.py \
 字段级注释（含会被拒绝的写法）都在 [`deploy/env.example`](../deploy/env.example)，
 本节不复制。
 
+镜像更新支持直连 GHCR、GH-Proxy 的主站、hk 和 EdgeOne 线路，以及管理员配置的
+自定义加速仓库。界面显示的线路能力来自在线更新器，配置格式有效不代表已经测试连通。
+旧更新器没有声明内置线路时，页面保留直连；曾声明自定义仓库能力的更新器仍可选择它。
+
+需要自定义仓库时，在更新器专用的 `<安装根>/updater/.env` 配置
+`LING_UPDATER_GHCR_MIRROR=registry.example.invalid/ghcr.io/qsbb/ling-api`，
+并使用包含该配置项和对应功能的更新器 Compose 文件及镜像重建更新器。值应是仓库
+完整路径，不含协议、凭据、tag 或 digest。GH-Proxy 线路的仓库路径按其
+[Docker 镜像配置说明](https://gh-proxy.com/docs/docker-mirror)拼接。
+
+更新器使用官方目标的同一摘要预取，随后仍从 GHCR 获取官方引用并执行原有身份校验。
+版本发现和最终引用仍需要连接 GHCR，预取能否复用镜像层取决于 Docker 守护进程及
+加速仓库的实际表现。进度和最近任务会显示记录的下载方式，旧任务可能没有记录。
+
 > **两条通道不共用同一套开关**：镜像模式主文件的 `LING_UPDATE_ENABLED` 默认取
 > `0`；源码模式的旧执行器 `deploy/update/executor.py` 会在它自己拉起的
 > `install.sh` **子进程环境**里设 `LING_UPDATE_ENABLED=1`（只影响该子进程，不写
@@ -2081,11 +2099,12 @@ python3 deploy/release/publish.py \
 > `ling-drill` 上真机跑通**（不是 stub；记录见 `shots/deploy-research/`）。
 > **生产 `ling` 已于 2026-11-05 迁移到镜像模式**（过程见 §6：首装曾失败、手工补齐、
 > `ling adopt --force` 登记，记录里 14 项 `unknown`），但那是**一次人工迁移**，
-> 不是演练；演练意义上的下面这些**仍未完成**：两次连续网页升级（目前只发布过一个
-> 镜像摘要 `42bba216`，没有第二个 digest 可升）、head 不一致 / 并发请求 / 旧执行器
-> 残留的故障注入、中断中任务的对账（仅单测）、生产库有真实数据时的恢复（生产库
-> `messages=0`/`memories=0`）、arm64 运行、真实浏览器端到端点一遍。
-> GHCR package 可见性、宿主架构、真实部署路径与端口仍要现场确认，
+> 不是演练。`v0.0.8` 已正式发布并有 CI 核验过的 API / updater digest，旧记录“只发布过
+> 一个摘要”已过期；这本身不证明当前候选的连续网页升级已通过。head 不一致 / 并发请求 /
+> 旧执行器残留的故障注入、中断中任务的对账（仅单测）、生产库有真实数据时的恢复
+> （历史记录 `messages=0`/`memories=0`）、arm64 运行，以及当前候选的镜像更新浏览器流程
+> 仍未完成。本次没有连接生产或部署主机；其当前版本、GHCR 可达性、架构、部署路径与端口、
+> 更新器 Docker socket/GID 仍需现场确认。
 > 不要照抄 `/opt/ling`、`/vol1/ling-backups` 这类示例。
 
 ### 11.6 语音条依赖（ffmpeg + pysilk-mod）

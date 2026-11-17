@@ -1302,11 +1302,36 @@ export interface ProactiveOpportunity {
   reason: string;
   /** 生成好的开场白。null = 还没生成。 */
   draft_text: string | null;
+  /** 语音正文被隐藏时仍可区分已生成与尚未生成。 */
+  draft_available?: boolean;
+  draft_state?: string | null;
+  draft_origin?: 'bound' | 'unknown' | null;
+  output_modality?: string;
   expires_at: string;
+}
+
+export interface ProactiveRecord {
+  opportunity_id: string;
+  kind: string;
+  reason: string;
+  reason_code: string | null;
+  has_source: boolean;
+  state: string;
+  draft_state?: string | null;
+  draft_origin?: 'bound' | 'unknown' | null;
+  created_at: string;
+  sent_at: string | null;
+  gate: { allowed: boolean | null; reasons: string[]; checked_at: string | null };
+  delivery_state: string | null;
+  web_saved: boolean;
+  terminal_reason: string | null;
+  receipt: { state: string; channel: string; observed_at: string } | null;
 }
 
 export interface ProactiveResponse {
   pending: ProactiveOpportunity[];
+  /** 旧版本服务端可能没有此字段。 */
+  recent?: ProactiveRecord[];
   gate: boolean;
   gate_reasons: string[];
   /** 主动发送是否真的实现了。false 时候选只会过期，不会变成消息。 */
@@ -1439,6 +1464,8 @@ export interface LifeTimelineOut {
   revision: number;
   /** 最近一次失败/降级/待复核的**原因码**（如 `degraded_late`），不是文案。 */
   last_error_code: string | null;
+  /** 由服务端根据实际原因码生成；旧版本服务端可能未提供。 */
+  reason_explanation?: string | null;
   display_date: string;
   display_timezone: string;
   display_timezone_source: TimezoneSource;
@@ -1452,9 +1479,17 @@ export interface LifeTimelineOut {
   /** 生成到期时刻（D−1 角色本地 21:00），与 `generated_at` 不是一回事。 */
   outline_due_at: string;
   timezone_source: string;
-  /** 当前版本**实际提交**时刻；无计划行时为 null。 */
+  /** 计划行最后修改时间，失败标记等操作也可能修改它。 */
   generated_at: string | null;
+  /** 最近成功提交模型大纲的时间，缺失时未知。 */
+  last_model_outline_at?: string | null;
   segments: LifeTimelineSegment[];
+  /** 计划窗口内未被当前计划覆盖的区间；null 表示无法判断。 */
+  unplanned?: {
+    scope_start_at: string;
+    scope_end_at: string;
+    periods: Array<{ start_at: string; end_at: string }>;
+  } | null;
   facts: LifeTimelineFact[];
   intents: DayIntentSummary[];
   /** 未来日尚未生成大纲：`intents` 是展望，不是 D+1…D+7 的日计划。 */
@@ -1930,6 +1965,14 @@ export interface ImageUpdateTargetV2 {
   commit: string | null;
 }
 
+/** 更新器支持的镜像下载方式。 */
+export type ImageDownloadSource =
+  | 'direct'
+  | 'gh_proxy'
+  | 'gh_proxy_hk'
+  | 'gh_proxy_edgeone'
+  | 'mirror';
+
 /**
  * 最近一次安装任务（只给卡片与详情用；不参与发现结论的判定）。
  *
@@ -1944,6 +1987,8 @@ export interface ImageUpdateTaskV2 {
   stage: string | null;
   version: string | null;
   failed_code: string | null;
+  /** 旧任务可能没有记录下载方式。 */
+  download_source?: ImageDownloadSource | null;
   /** 当前请求 ID（设计文档详情区要求）。 */
   request_id?: string | null;
   /** 后端码表文案（中文）；缺失时前端按 `state` 翻译。 */
@@ -1967,6 +2012,7 @@ export interface ImageUpdatePendingRequestV2 {
   request_id: string;
   created_at?: string | null;
   target_digest?: string | null;
+  download_source?: ImageDownloadSource | null;
 }
 
 /** 按需检查的终态元数据（更新器写 `catalog_check`，API 白名单投影）。 */
@@ -2002,6 +2048,10 @@ export interface ImageUpdateUpdaterDetailsV2 {
   state?: string | null;
   protocol?: number | null;
   version?: string | null;
+  /** null 表示未报告，true 表示自定义仓库配置格式有效。 */
+  mirror_available?: boolean | null;
+  /** null 表示未报告；列出支持的方式不代表已经测试连通性。 */
+  download_sources?: ImageDownloadSource[] | null;
 }
 
 /** 恢复点诊断。 */
@@ -2055,13 +2105,14 @@ export interface ImageUpdateCheckAck {
   created_at?: string;
 }
 
-/** `POST /v1/version/image-update-requests` 的**固定 5 键**请求体。 */
+/** 直连请求有五个字段，加速请求另带下载方式。 */
 export interface ImageUpdateSubmission {
   request_id: string;
   target_digest: string;
   expected_current_digest: string;
   expected_current_commit: string;
   operator_confirmed: true;
+  download_source?: Exclude<ImageDownloadSource, 'direct'>;
 }
 
 /** 提交回执（201）：请求已写入，等待更新器接手。 */

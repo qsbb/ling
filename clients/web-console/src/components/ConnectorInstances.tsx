@@ -34,13 +34,24 @@
  * instance_id 存配置"时才被补建）。这时画的是"新建第一个实例"的引导，
  * 不是"加载失败"，也不是一片空白。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '../api';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  api,
+  personaId,
+  type ConversationPolicyScope,
+  type InstanceDialoguePolicy,
+  type InstanceDialoguePolicyPreview,
+  type WindowDialoguePolicyField,
+  type WindowDialoguePolicyFields,
+  type WindowDialoguePolicyValue,
+  type WindowPolicyChange,
+} from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
   ConnectorField,
   ConnectorInstance,
   ConnectorView,
+  PersonaSummary,
 } from '../types';
 import {
   buildConnectorChange,
@@ -180,13 +191,398 @@ export function connectorViewOf(
   const connectors = (body as { connectors?: unknown }).connectors;
   if (!Array.isArray(connectors)) return null;
   const found = connectors.find(
-    (item): item is ConnectorView =>
-      item !== null &&
-      typeof item === 'object' &&
-      (item as { id?: unknown }).id === scope &&
-      Array.isArray((item as { fields?: unknown }).fields),
+    (item): item is ConnectorView => {
+      if (item === null || typeof item !== 'object') return false;
+      const view = item as { id?: unknown; fields?: unknown; generation?: unknown };
+      return (
+        view.id === scope &&
+        Array.isArray(view.fields) &&
+        typeof view.generation === 'number' &&
+        Number.isSafeInteger(view.generation) &&
+        view.generation >= 0
+      );
+    },
   );
   return found ?? null;
+}
+
+type PolicyFieldKind = 'persona' | 'boolean' | 'integer';
+
+interface PolicyFieldDefinition {
+  key: WindowDialoguePolicyField;
+  label: string;
+  kind: PolicyFieldKind;
+  trueLabel?: string;
+  falseLabel?: string;
+}
+
+interface PolicyFieldState {
+  global_value: WindowDialoguePolicyValue;
+  instance_override: WindowDialoguePolicyValue;
+  has_instance_override: boolean;
+  effective: WindowDialoguePolicyValue;
+  source: 'global' | 'instance' | 'session';
+  session_override: WindowDialoguePolicyValue;
+}
+
+const INSTANCE_POLICY_FIELDS: PolicyFieldDefinition[] = [
+  { key: 'persona_id', label: '人格', kind: 'persona' },
+  {
+    key: 'private_may_stay_silent',
+    label: '私聊可沉默',
+    kind: 'boolean',
+    trueLabel: '允许沉默',
+    falseLabel: '不允许选择沉默',
+  },
+  {
+    key: 'group_mention_requires_reply',
+    label: '群里被点名',
+    kind: 'boolean',
+    trueLabel: '必须回应',
+    falseLabel: '由模型决定',
+  },
+  {
+    key: 'group_attention_deferred',
+    label: '群聊判断',
+    kind: 'boolean',
+    trueLabel: '先进入队列',
+    falseLabel: '即时判断',
+  },
+  { key: 'group_turn_budget', label: '群聊发言预算', kind: 'integer' },
+  {
+    key: 'rest_may_skip',
+    label: '休息时',
+    kind: 'boolean',
+    trueLabel: '允许跳过',
+    falseLabel: '仍会判断',
+  },
+];
+
+const EMPTY_POLICY_SELECTIONS = Object.fromEntries(
+  INSTANCE_POLICY_FIELDS.map(({ key }) => [key, 'inherit']),
+) as Record<WindowDialoguePolicyField, string>;
+
+function isConversationPolicyScope(scope: string): scope is ConversationPolicyScope {
+  return scope === 'onebot' || scope === 'qqbot';
+}
+
+function instancePolicyField(
+  fields: WindowDialoguePolicyFields,
+  key: WindowDialoguePolicyField,
+): PolicyFieldState {
+  return fields[key] as PolicyFieldState;
+}
+
+function selectionFor(field: PolicyFieldState, definition: PolicyFieldDefinition): string {
+  if (!field.has_instance_override) return 'inherit';
+  if (definition.kind === 'persona') {
+    return field.instance_override === null
+      ? 'persona:none'
+      : `persona:${String(field.instance_override)}`;
+  }
+  return `value:${String(field.instance_override)}`;
+}
+
+function selectionValue(
+  definition: PolicyFieldDefinition,
+  selection: string,
+): WindowDialoguePolicyValue | null {
+  if (selection === 'inherit') return null;
+  if (definition.kind === 'persona') {
+    return selection === 'persona:none' ? null : selection.slice('persona:'.length);
+  }
+  if (definition.kind === 'boolean') return selection === 'value:true';
+  return Number(selection.slice('value:'.length));
+}
+
+function assignPolicyValue(
+  set: WindowPolicyChange['set'],
+  key: WindowDialoguePolicyField,
+  value: WindowDialoguePolicyValue,
+): void {
+  switch (key) {
+    case 'persona_id': set.persona_id = value as string | null; break;
+    case 'private_may_stay_silent': set.private_may_stay_silent = value as boolean; break;
+    case 'group_mention_requires_reply': set.group_mention_requires_reply = value as boolean; break;
+    case 'group_attention_deferred': set.group_attention_deferred = value as boolean; break;
+    case 'group_turn_budget': set.group_turn_budget = value as number; break;
+    case 'rest_may_skip': set.rest_may_skip = value as boolean; break;
+  }
+}
+
+function instancePolicyChange(
+  policy: InstanceDialoguePolicy,
+  selections: Record<WindowDialoguePolicyField, string>,
+): WindowPolicyChange {
+  const change: WindowPolicyChange = { set: {}, clear: [] };
+  for (const definition of INSTANCE_POLICY_FIELDS) {
+    const current = instancePolicyField(policy.fields, definition.key);
+    const selection = selections[definition.key];
+    if (selection === 'inherit') {
+      if (current.has_instance_override) change.clear.push(definition.key);
+      continue;
+    }
+    const value = selectionValue(definition, selection);
+    if (!current.has_instance_override || current.instance_override !== value) {
+      assignPolicyValue(change.set, definition.key, value);
+    }
+  }
+  return change;
+}
+
+function changedPolicyFields(change: WindowPolicyChange): WindowDialoguePolicyField[] {
+  const setFields = INSTANCE_POLICY_FIELDS
+    .filter(({ key }) => Object.hasOwn(change.set, key))
+    .map(({ key }) => key);
+  return [...setFields, ...change.clear];
+}
+
+function policySourceLabel(source: PolicyFieldState['source']): string {
+  if (source === 'session') return '会话设置';
+  return source === 'instance' ? '平台实例' : '全局';
+}
+
+function personaLabel(id: string | null, personas: PersonaSummary[]): string {
+  if (id === null) return '不注入人格';
+  const persona = personas.find((item) => personaId(item) === id);
+  return persona?.display_name?.trim() || persona?.name?.trim() || id;
+}
+
+function policyValueLabel(
+  definition: PolicyFieldDefinition,
+  value: WindowDialoguePolicyValue,
+  personas: PersonaSummary[],
+): string {
+  if (definition.kind === 'persona') {
+    return personaLabel(typeof value === 'string' ? value : null, personas);
+  }
+  if (definition.kind === 'integer') return `${String(value)} 次`;
+  return value === true ? definition.trueLabel ?? '开启' : definition.falseLabel ?? '关闭';
+}
+
+function personaPolicyOptions(
+  policy: InstanceDialoguePolicy,
+  personas: PersonaSummary[],
+): Array<{ value: string; label: string }> {
+  const options = new Map<string, string>();
+  for (const persona of personas) {
+    const id = personaId(persona);
+    if (id) options.set(id, persona.display_name?.trim() || persona.name?.trim() || id);
+  }
+  const field = instancePolicyField(policy.fields, 'persona_id');
+  for (const value of [field.global_value, field.instance_override, field.effective, field.session_override]) {
+    if (typeof value === 'string' && value !== '' && !options.has(value)) options.set(value, value);
+  }
+  return [...options].map(([id, label]) => ({ value: `persona:${id}`, label }));
+}
+
+function selectionsFromPolicy(policy: InstanceDialoguePolicy): Record<WindowDialoguePolicyField, string> {
+  return Object.fromEntries(
+    INSTANCE_POLICY_FIELDS.map((definition) => [
+      definition.key,
+      selectionFor(instancePolicyField(policy.fields, definition.key), definition),
+    ]),
+  ) as Record<WindowDialoguePolicyField, string>;
+}
+
+function InstanceDialoguePolicyPanel({
+  scope,
+  instanceId,
+  canEdit,
+  disabled,
+}: {
+  scope: ConversationPolicyScope;
+  instanceId: string;
+  canEdit: boolean;
+  disabled: boolean;
+}) {
+  const [policy, setPolicy] = useState<InstanceDialoguePolicy | null>(null);
+  const [selections, setSelections] = useState(EMPTY_POLICY_SELECTIONS);
+  const [personas, setPersonas] = useState<PersonaSummary[]>([]);
+  const [preview, setPreview] = useState<InstanceDialoguePolicyPreview | null>(null);
+  const [previewChange, setPreviewChange] = useState<WindowPolicyChange | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [personaError, setPersonaError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    api.instanceDialoguePolicy(scope, instanceId).then((result) => {
+      if (!active) return;
+      setPolicy(result);
+      setSelections(selectionsFromPolicy(result));
+    }).catch((reason: unknown) => {
+      if (active) {
+        const explained = explainError(reason);
+        setError(explained.detail ?? explained.hint ?? explained.reason);
+      }
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    api.listPersonas().then((result) => {
+      if (active) setPersonas(result.items);
+    }).catch((reason: unknown) => {
+      if (active) {
+        const explained = explainError(reason);
+        setPersonaError(explained.detail ?? explained.hint ?? explained.reason);
+      }
+    });
+    return () => { active = false; };
+  }, [scope, instanceId]);
+
+  const change = policy ? instancePolicyChange(policy, selections) : null;
+  const canPreview = change !== null && changedPolicyFields(change).length > 0;
+
+  async function previewPolicy() {
+    if (!change || !canPreview || disabled || busy) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await api.previewInstanceDialoguePolicy(scope, instanceId, change);
+      setPreviewChange(change);
+      setPreview(result);
+    } catch (reason) {
+      const explained = explainError(reason);
+      setError(explained.detail ?? explained.hint ?? explained.reason);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function savePolicy() {
+    if (!preview || !previewChange || disabled || busy) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const saved = await api.saveInstanceDialoguePolicy(
+        scope,
+        instanceId,
+        previewChange,
+        preview.preview_token,
+      );
+      setPolicy(saved);
+      setSelections(selectionsFromPolicy(saved));
+      setPreview(null);
+      setPreviewChange(null);
+      setNotice('设置已保存。');
+    } catch (reason) {
+      const explained = explainError(reason);
+      setError(explained.detail ?? explained.hint ?? explained.reason);
+      setPreview(null);
+      setPreviewChange(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateSelection(key: WindowDialoguePolicyField, value: string) {
+    setSelections((current) => ({ ...current, [key]: value }));
+    setPreview(null);
+    setPreviewChange(null);
+    setError('');
+    setNotice('');
+  }
+
+  return (
+    <section
+      className="connector-instance-policy"
+      aria-label="会话行为"
+      data-testid={`connector-instance-policy-${scope}-${instanceId}`}
+    >
+      <h4>会话行为</h4>
+      {loading ? <p role="status">正在读取会话策略…</p> : null}
+      {policy ? (
+        <>
+          <div className="connector-instance-policy__fields">
+            {INSTANCE_POLICY_FIELDS.map((definition) => {
+              const field = instancePolicyField(policy.fields, definition.key);
+              const selectId = `instance-policy-${scope}-${instanceId}-${definition.key}`;
+              return (
+                <div className="connector-instance-policy__row" key={definition.key}>
+                  <div className="connector-instance-policy__current">
+                    <label htmlFor={selectId}>{definition.label}</label>
+                    <output>
+                      {policyValueLabel(definition, field.effective, personas)} · {policySourceLabel(field.source)}
+                    </output>
+                  </div>
+                  <select
+                    id={selectId}
+                    value={selections[definition.key]}
+                    disabled={!canEdit || disabled || busy}
+                    onChange={(event) => updateSelection(definition.key, event.target.value)}
+                  >
+                    <option value="inherit">继承全局</option>
+                    {definition.kind === 'persona' ? (
+                      <>
+                        <option value="persona:none">不注入人格</option>
+                        {personaPolicyOptions(policy, personas).map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </>
+                    ) : definition.kind === 'boolean' ? (
+                      <>
+                        <option value="value:true">{definition.trueLabel}</option>
+                        <option value="value:false">{definition.falseLabel}</option>
+                      </>
+                    ) : Array.from({ length: 20 }, (_, index) => index + 1).map((value) => (
+                      <option key={value} value={`value:${value}`}>{value} 次</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+          {preview && previewChange ? (
+            <div className="connector-instance-policy__preview" role="status">
+              <ul>
+                {changedPolicyFields(previewChange).map((key) => {
+                  const definition = INSTANCE_POLICY_FIELDS.find((item) => item.key === key);
+                  if (!definition) return null;
+                  const current = instancePolicyField(preview.current.fields, key);
+                  const proposed = instancePolicyField(preview.proposed.fields, key);
+                  return (
+                    <li key={key}>
+                      <strong>{definition.label}</strong>{' '}
+                      {policyValueLabel(definition, current.effective, personas)} · {policySourceLabel(current.source)}{' → '}
+                      {policyValueLabel(definition, proposed.effective, personas)} · {policySourceLabel(proposed.source)}
+                    </li>
+                  );
+                })}
+              </ul>
+              <p>
+                影响活跃会话 {preview.proposed.affected_active_windows} 个、已归档会话 {preview.proposed.affected_archived_windows} 个；
+                其中 {preview.proposed.session_shadowed_windows} 个仍由会话设置决定。
+              </p>
+              <div className="connector-instance-policy__actions">
+                <button type="button" className="button button--primary button--small" disabled={disabled || busy} onClick={() => void savePolicy()}>
+                  确认保存
+                </button>
+                <button type="button" className="button button--small" disabled={disabled || busy} onClick={() => { setPreview(null); setPreviewChange(null); }}>
+                  返回修改
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="button button--small"
+              disabled={!canEdit || disabled || busy || !canPreview}
+              onClick={() => void previewPolicy()}
+            >
+              预览更改
+            </button>
+          )}
+        </>
+      ) : null}
+      {error ? <p className="connector-instance-policy__error" role="alert">{error}</p> : null}
+      {personaError ? <p className="connector-instance-policy__error" role="alert">{personaError}</p> : null}
+      {notice ? <p role="status">{notice}</p> : null}
+    </section>
+  );
 }
 
 export interface InstanceListProps {
@@ -377,12 +773,13 @@ export interface ConnectorInstancePanelProps {
    */
   onSelectInstance?: (instanceId: string) => void;
   /**
-   * 按实例读到的字段视图上报给页面。`fields === null` 表示"这一份不成立"
+   * 按实例读到的完整连接器视图上报给页面。`view === null` 表示"这一份不成立"
    * （读失败，或响应没回显实例、无法证明属于它），页面据此**别拿它当基准**。
    *
-   * 只对这个**选中的**实例报：页面拿它给卡片当字段视图、并据此建草案。
+   * 字段与 generation 必须来自同一次 scoped GET，否则保存会把实例字段配上默认
+   * generation，服务端会稳定返回 409。只对这个**选中的**实例上报。
    */
-  onInstanceView?: (instanceId: string, fields: ConnectorField[] | null) => void;
+  onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
   /**
    * 这个 scope 下**有未保存改动**的实例 id（由页面算，因为草案由页面持有）。
    *
@@ -394,6 +791,8 @@ export interface ConnectorInstancePanelProps {
    * 不传时退回面板自算（保留单独使用面板的场合）。
    */
   dirtyInstanceIds?: ReadonlySet<string>;
+  /** 当前实例的字段与保存动作，放在详情栏中。 */
+  children?: ReactNode;
 }
 
 /**
@@ -435,6 +834,7 @@ export function ConnectorInstancePanel({
   onSelectInstance,
   onInstanceView,
   dirtyInstanceIds,
+  children,
 }: ConnectorInstancePanelProps) {
   const [list, setList] = useState<ListState>({ status: 'loading' });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -512,31 +912,31 @@ export function ConnectorInstancePanel({
   }, [selectedId]);
 
   /**
-   * 把"按实例读到的字段视图"上报给页面。
+   * 把"按实例读到的连接器视图"上报给页面。
    *
    * 只报**能证明属于选中实例**的那一份（`scoped` 非空且 id 对得上）；否则报
    * `null`，让页面知道"这个实例的现状拿不到"——页面宁可让输入框空着，也不
    * 拿默认实例的值冒充。不报的话页面就没有这个实例的字段可分，卡片会画成空白
    * 而看不出原因。
    *
-   * 与选中上报同样用"值没变就不再报"断开重渲染环：字段数组只在一次成功读取后
-   * 才换新引用，所以按引用比较即可。
+   * 与选中上报同样用"值没变就不再报"断开重渲染环：视图对象只在一次成功读取后
+   * 才换新引用，所以按引用比较即可。generation 也由此与字段保持同一快照。
    */
-  const reportedView = useRef<{ instanceId: string; fields: ConnectorField[] | null } | null>(null);
+  const reportedView = useRef<{ instanceId: string; view: ConnectorView | null } | null>(null);
   useEffect(() => {
     if (selectedId === null || selectedId === DEFAULT_INSTANCE_ID) return;
-    const fields =
+    const view =
       scoped !== null &&
       scoped.instanceId === selectedId &&
       Array.isArray(scoped.view?.fields)
-        ? scoped.view.fields
+        ? scoped.view
         : null;
     const previous = reportedView.current;
-    if (previous !== null && previous.instanceId === selectedId && previous.fields === fields) {
+    if (previous !== null && previous.instanceId === selectedId && previous.view === view) {
       return;
     }
-    reportedView.current = { instanceId: selectedId, fields };
-    onInstanceView?.(selectedId, fields);
+    reportedView.current = { instanceId: selectedId, view };
+    onInstanceView?.(selectedId, view);
   }, [selectedId, scoped, onInstanceView]);
 
   /** 取字段视图；选中实例不在列表里时为 null。 */
@@ -775,8 +1175,7 @@ export function ConnectorInstancePanel({
             <div className="connector-instances__empty" data-testid={`connector-instance-panel-${scope}-empty`}>
               <strong>还没有任何实例</strong>
               <span>
-                这是全新部署时的正常状态（默认实例只在第一次保存配置时才由服务端补建）。
-                在下面建第一个——建好之后，右边的配置就属于它。
+                新建一个实例，填写这个账号的连接配置。
               </span>
             </div>
           ) : null}
@@ -824,10 +1223,21 @@ export function ConnectorInstancePanel({
             <p className="panel__note" data-testid={`connector-instance-panel-${scope}-nothing-selected`}>
               {hasLoadedList && items.length === 0
                 ? '左侧建好第一个实例后，这里会显示它的配置。'
-                : '在左侧选一个实例，这里显示它的配置。'}
+                : selectedId === null
+                  ? '当前显示默认实例配置。实例列表读取成功后可切换其他账号。'
+                  : '正在读取所选实例的配置…'}
             </p>
           ) : (
             <>
+              <div className="connector-instances__identity">
+                <span className="connector-instances__avatar" aria-hidden="true">
+                  {selected?.display_name.slice(0, 1).toUpperCase()}
+                </span>
+                <div>
+                  <h3>{selected?.display_name}</h3>
+                  <p>{connector.label} · {selected ? instanceStatusLabel(selected) : ''}</p>
+                </div>
+              </div>
               {/*
                * **绝不在这里再放一个 `ConnectorCard`。**
                *
@@ -837,8 +1247,8 @@ export function ConnectorInstancePanel({
                * 列表与表单成倍增长。这个 bug 不会报错、`tsc` 也看不见（参数
                * 类型完全合法），只有真的在浏览器里数元素才会发现。
                *
-               * 所以右侧详情**只放实例级的动作**（改名/启停/删除/通知），
-               * 字段表单留在卡片自己的位置上。
+               * 右侧详情放实例级动作，字段表单由调用方作为 children 传入。
+               * 实例面板本身不递归创建卡片。
                */}
               <div
                 className="connector-instances__toolbar"
@@ -995,6 +1405,16 @@ export function ConnectorInstancePanel({
 
             </>
           )}
+          {list.status === 'ready' && items.length === 0 ? null : children}
+          {isConversationPolicyScope(scope) && canEdit && selected && selected.deleted_at === null ? (
+            <InstanceDialoguePolicyPanel
+              key={`${scope}::${selected.instance_id}`}
+              scope={scope}
+              instanceId={selected.instance_id}
+              canEdit={canEdit}
+              disabled={busy}
+            />
+          ) : null}
         </div>
       </div>
     </div>

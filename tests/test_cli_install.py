@@ -476,7 +476,15 @@ if subcommand is None:
 project = project or "ling"
 
 state = load()
-log("docker-env %s LING_APP_IMAGE=%s" % (subcommand, os.environ.get("LING_APP_IMAGE", "")))
+log(
+    "docker-env %s project=%s LING_APP_IMAGE=%s LING_APP_COMPOSE_PROJECT=%s"
+    % (
+        subcommand,
+        project,
+        os.environ.get("LING_APP_IMAGE", ""),
+        os.environ.get("LING_APP_COMPOSE_PROJECT", ""),
+    )
+)
 
 if subcommand == "config":
     if os.environ.get("STUB_CONFIG_EXIT", "0") != "0":
@@ -2103,6 +2111,36 @@ def test_install_with_updater_starts_the_separate_compose_project(ws: Workspace)
     assert state["layout"]["updater"]["docker"]["gid_source"] == "explicit"
     assert state["update"]["enabled"] is False
     assert "更新已启用" not in (result.stdout + result.stderr)
+
+
+def test_custom_updater_targets_its_application_project(ws: Workspace) -> None:
+    """自定义应用项目名必须贯穿 updater env 与启动它的 Compose 子进程。"""
+    ws.env["LING_APP_COMPOSE_PROJECT"] = "wrong-host-project"
+    result = run_install(
+        ws,
+        extra=[
+            "--project",
+            "ling-verify",
+            "--updater-digest",
+            UPDATER_TARGET,
+            "--with-updater",
+            "--docker-gid",
+            "999",
+        ],
+        readyz=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    updater_values = _updater_env_lines(ws.install_dir / "updater" / ".env")
+    assert updater_values.get("LING_APP_COMPOSE_PROJECT") == "ling-verify"
+
+    updater_start = [
+        line
+        for line in ws.calls()
+        if line.startswith("docker-env up project=ling-verify-updater ")
+    ]
+    assert len(updater_start) == 1, updater_start
+    assert "LING_APP_COMPOSE_PROJECT=ling-verify" in updater_start[0]
 
 
 def test_install_with_updater_requires_a_pinned_digest(ws: Workspace) -> None:
@@ -3784,81 +3822,3 @@ def test_container_version_probe_agrees_with_real_app(monkeypatch: pytest.Monkey
     assert payload == {"version": app_version, "commit": build_commit()}
     assert payload["commit"] == COMMIT
     assert current_version(), "/v1/version 的版本实现必须仍能给出非空版本"
-
-
-@contextlib.asynccontextmanager
-async def _real_app_client(tmp_path: Path):
-    """起**真实 FastAPI 应用**（ASGI，不绑端口、不需要 PostgreSQL）。
-
-    sqlite + `create_all_for_dev` 足够让 `/readyz` 真的 200、`/v1/version` 真的
-    401 —— 这正是要核的鉴权事实；用例不依赖 127.0.0.1:55432 的测试库。
-    """
-    from httpx import ASGITransport, AsyncClient
-
-    from ling.app import create_app
-    from ling.config import Settings
-    from ling.infra.db import create_all_for_dev, dispose_engine, init_engine
-
-    settings = Settings(
-        env="test",
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
-        data_dir=tmp_path / "data",
-        bootstrap_admin_user="tester",
-        bootstrap_admin_password="tester-password",
-        root_key="probe-root-key",
-        test_mode=True,
-        cookie_secure=False,
-        actor_id="actor_ling",
-        persona_id="persona_ling",
-        access_mode="off",
-        access_list=frozenset(),
-        onebot_ws_port=None,
-        onebot_ws_url=None,
-        qqbot_enabled=False,
-    )
-    await dispose_engine()
-    engine = init_engine(settings)
-    await create_all_for_dev(engine)
-    app = create_app(settings)
-    try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://127.0.0.1:6520"
-        ) as client:
-            yield client
-    finally:
-        await dispose_engine()
-
-
-async def test_declared_http_probe_paths_are_unauthenticated_on_real_app(
-    tmp_path: Path,
-) -> None:
-    """每一条登记过的探活路径，在真实应用上未鉴权都必须**不是** 401/403。"""
-    ling = _load_module("ling_cli_probe_auth", LING_PY)
-    assert ling.HTTP_PROBE_PATHS, "探活路径表不能是空的"
-    async with _real_app_client(tmp_path) as client:
-        for probe in ling.HTTP_PROBE_PATHS:
-            response = await client.get(probe)
-            assert response.status_code not in (401, 403), (
-                f"探活 {probe} 需要鉴权（{response.status_code}）：安装/状态/诊断"
-                f"不持有用户凭据，这样的探活永远失败。响应：{response.text[:200]}"
-            )
-            assert response.status_code == 200, (probe, response.status_code, response.text[:200])
-        # 这一条是根治点：`/v1/version` 未鉴权就是 401，不能用它当探活。
-        version = await client.get("/v1/version")
-        assert version.status_code == 401, version.text
-        assert version.json()["error"]["code"] == "unauthorized"
-
-
-async def test_v1_version_still_requires_auth(tmp_path: Path) -> None:
-    """`/v1/version` 仍然要鉴权：没有为了给探活让路而把它改开。"""
-    async with _real_app_client(tmp_path) as client:
-        for path in (
-            "/v1/version",
-            "/v1/version/check-release",
-            "/v1/version/update",
-            "/v1/version/image-update",
-            "/v1/health/model",
-        ):
-            response = await client.get(path)
-            assert response.status_code == 401, (path, response.status_code, response.text[:200])
-        assert (await client.get("/healthz")).status_code == 200

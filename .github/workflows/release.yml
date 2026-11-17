@@ -101,7 +101,7 @@ jobs:
       # 但不发 Release 也会被 needs 连带挡掉——宁可这样也不要推错仓库的 package）。
       IMAGE: ghcr.io/qsbb/ling-api
     # release job 把这个 digest 写进 Release 正文（正文可编辑，只方便复制；
-    # 可信来源仍是本 job 的 summary 与 deploy/releases.json）。
+    # 人工部署核对本 job summary，网页更新则由更新器直接查询 GHCR。
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
@@ -589,9 +589,9 @@ jobs:
             echo "LING_UPDATER_IMAGE=ghcr.io/qsbb/ling-updater@$UPDATER_DIGEST"
             echo '```'
             echo
-            echo "> **本正文是可编辑内容，不是摘要的可信来源。** 部署只认对应 workflow run"
-            echo "> 的 job summary 里记录的 index digest（以及仓库内 \`deploy/releases.json\`"
-            echo "> 目录里的记录）。上面两个值只方便人复制；粘贴前请与 summary 核对。"
+            echo "> **本正文是可编辑内容，不是摘要的可信来源。** 人工部署请与对应 workflow run"
+            echo "> 的 job summary 核对 index digest；网页更新由更新器直接查询 GHCR。"
+            echo "> 仓库内 \`deploy/releases.json\` 不参与网页更新目标选择。"
           } > "$body.final"
           gh release create "$RELEASE_TAG" \
             --verify-tag \

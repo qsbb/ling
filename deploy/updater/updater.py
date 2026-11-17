@@ -326,6 +326,13 @@ STATUS_SCHEMA = 1
 TASK_SCHEMA = 1
 
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# 这些路径只用于以官方摘要预取；版本发现与最终部署仍使用官方仓库。
+PREFETCH_REPOSITORIES = {
+    "gh_proxy": "gh-proxy.com/docker/ghcr.io/qsbb/ling-api",
+    "gh_proxy_hk": "hk.gh-proxy.com/docker/ghcr.io/qsbb/ling-api",
+    "gh_proxy_edgeone": "edgeone.gh-proxy.com/docker/ghcr.io/qsbb/ling-api",
+}
+DOWNLOAD_SOURCES = ("direct", *PREFETCH_REPOSITORIES, "mirror")
 REQUEST_KEYS = frozenset(
     {
         "schema",
@@ -335,6 +342,7 @@ REQUEST_KEYS = frozenset(
         "expected_current_commit",
         "operator_confirmed",
         "created_at",
+        "download_source",
     }
 )
 REQUEST_REQUIRED = (
@@ -933,12 +941,9 @@ class Config:
     backup_timeout: float
     once: bool
     acknowledge: str
-    # **没有** registry/镜像名/tag 的配置项：发现目标固定是
-    # ``ghcr.io/qsbb/ling-api``（见模块 docstring「版本从哪来」）。请求方
-    # （网页/API/请求文件）无法影响它，配置也不能——否则"registry 地址"就变成
-    # 新的信任面，而它本来只是一个常量。测试通过
-    # ``registry.REGISTRY_ENV``（``LING_UPDATER_REGISTRY``）把 base URL 指到本地
-    # stub，生产不设这个变量。
+    # 发现目标固定是 ``ghcr.io/qsbb/ling-api``，请求方不能改变这一身份。
+    # 可选加速仓库只用于预取同一摘要，不参与版本发现或最终镜像身份判定。
+    # 测试通过 ``registry.REGISTRY_ENV`` 把发现地址指到本地 stub。
 
     # 「检查更新」限流窗口（秒）：请求触发的刷新在窗口内最多真正处理一次，
     # 多余的请求文件直接删掉（``release_check.reason_detail="throttled"``，
@@ -949,6 +954,19 @@ class Config:
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def mirror_repository() -> str | None:
+    """Return the operator-configured mirror repository, without tags or credentials."""
+    value = _env("LING_UPDATER_GHCR_MIRROR")
+    pattern = r"[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+"
+    if len(value) > 255 or re.fullmatch(pattern, value) is None:
+        return None
+    registry = value.partition("/")[0]
+    _, separator, port = registry.partition(":")
+    if separator and not 1 <= int(port) <= 65535:
+        return None
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1271,6 +1289,10 @@ def load_request(path: Path) -> dict[str, Any]:
             "operator_confirmed 必须是 JSON true",
             ["网页必须在所有者二次确认后才写请求；更新器不接受缺省/字符串形式。"],
         )
+    if data.get("download_source", "direct") not in DOWNLOAD_SOURCES:
+        raise UpdaterError(
+            EXIT_REJECTED, "request_rejected", "prepare", "下载方式不受支持"
+        )
     return data
 
 
@@ -1322,6 +1344,7 @@ def new_task(
         "schema": TASK_SCHEMA,
         "protocol": PROTOCOL,
         "request_id": request_id,
+        "download_source": request.get("download_source", "direct"),
         "state": TASK_RUNNING,
         "stage": "prepare",
         "started_at": now,
@@ -1417,8 +1440,12 @@ def task_view(task: dict[str, Any] | None) -> dict[str, Any] | None:
     maintenance = task.get("maintenance") or {}
     rollback = task.get("rollback") or {}
     failure = task.get("failure")
+    download_source = task.get("download_source")
+    if download_source not in DOWNLOAD_SOURCES:
+        download_source = None
     return {
         "request_id": task.get("request_id"),
+        "download_source": download_source,
         "state": task.get("state"),
         "stage": task.get("stage"),
         "started_at": task.get("started_at"),
@@ -2366,6 +2393,11 @@ class StatusWriter:
             self._recommended,
             self._notes,
         )
+        mirror_configured = mirror_repository() is not None
+        payload["updater"]["mirror_available"] = mirror_configured
+        payload["updater"]["download_sources"] = [
+            source for source in DOWNLOAD_SOURCES if source != "mirror" or mirror_configured
+        ]
         text = serialize_status(payload)
         assert_status_sanitized(self.cfg, sanitize_scan_text(payload))
         if text == self._last and not force:
@@ -2958,6 +2990,27 @@ class _UpdaterContextMixin:
 
     # -------------------------------------------------- 拉取与复核
     def pull_and_prepare(self) -> None:
+        source = self.task.get("download_source", "direct")
+        if source != "direct":
+            mirror = mirror_repository() if source == "mirror" else PREFETCH_REPOSITORIES.get(source)
+            if mirror is None:
+                raise self.pub.PublishError(
+                    self.pub.EXIT_PULL,
+                    "failed_pull",
+                    "pull",
+                    "未配置可用的镜像加速仓库",
+                    ["检查更新器的镜像加速仓库配置后重试。"],
+                )
+            self.log.emit("从加速仓库预取目标镜像（此步不影响在线服务）")
+            self.run_checked(
+                ["docker", "pull", f"{mirror}@sha256:{self.o.target_hex}"],
+                timeout=self.o.backup_timeout,
+                exit_code=self.pub.EXIT_PULL,
+                status="failed_pull",
+                step="pull",
+                message="从加速仓库预取镜像失败",
+                next_actions=["检查加速仓库和网络，或重新选择直连。"],
+            )
         pub = self.pub
         self.log.emit("拉取目标镜像（此步不影响在线服务）")
         self.run_checked(

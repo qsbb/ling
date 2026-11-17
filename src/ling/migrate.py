@@ -71,15 +71,12 @@ async def _alembic_available() -> bool:
 
 async def upgrade() -> int:
     settings = get_settings()
-    if settings.db_require_postgres and not settings.is_postgres:
-        print("[migrate] 拒绝在非 PostgreSQL 上执行生产迁移", file=sys.stderr)
-        return 2
     engine = init_engine(settings)
     if await _alembic_available():
         from alembic import command
 
         cfg = _alembic_config()
-        cfg.set_main_option("sqlalchemy.url", settings.database_url)
+        cfg.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
         # Alembic 是同步 API：放到线程里跑，避免阻塞事件循环
         await asyncio.to_thread(command.upgrade, cfg, "head")
         print("[migrate] alembic upgrade head 完成")
@@ -106,7 +103,7 @@ async def stamp(revision: str = "head") -> int:
     from alembic import command
 
     cfg = _alembic_config()
-    cfg.set_main_option("sqlalchemy.url", settings.database_url)
+    cfg.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
     await asyncio.to_thread(command.stamp, cfg, revision)
     print(f"[migrate] 已登记版本 {revision}（未执行建表）")
     return 0

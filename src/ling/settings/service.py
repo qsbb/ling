@@ -461,6 +461,16 @@ class ConfigService:
         # （旧修订）时兜底；发布过带该键的修订之后以修订为准。
         self._log_denials_default = log_denials_default
 
+    def with_session(self, session: AsyncSession) -> ConfigService:
+        """在另一事务中使用相同的引导配置读取设置。"""
+        return ConfigService(
+            session,
+            self._box,
+            test_mode_default=self._test_mode_default,
+            persona_id=self._persona_id,
+            log_denials_default=self._log_denials_default,
+        )
+
     # ---------------------------------------------------------- 读取
 
     async def published_revision(self) -> ConfigRevision | None:
@@ -833,6 +843,9 @@ class ConfigService:
         return issues
 
     async def publish(self, revision: int, *, published_by: str | None = None) -> int:
+        from ling.settings.window_policy import lock_dialogue_config
+
+        await lock_dialogue_config(self._session)
         row = (
             await self._session.execute(
                 select(ConfigRevision).where(ConfigRevision.revision == revision)
@@ -851,6 +864,7 @@ class ConfigService:
                 status_code=422,
                 detail="; ".join(f"{i.field}: {i.message}" for i in blocking),
             )
+        await lock_dialogue_config(self._session, changed=True)
         await self._session.execute(
             update(ConfigRevision)
             .where(ConfigRevision.state == "published")
@@ -933,6 +947,9 @@ class ConfigService:
         secret = secret.strip()
         if not secret:
             raise LingError(ErrorCode.invalid_request, "密钥不能为空", status_code=422)
+        from ling.settings.window_policy import lock_dialogue_config
+
+        await lock_dialogue_config(self._session)
         row = (
             await self._session.execute(
                 select(ProviderCredential).where(ProviderCredential.provider_id == provider_id)
@@ -961,6 +978,9 @@ class ConfigService:
         return {"last4": last4, "fingerprint": fingerprint}
 
     async def delete_secret(self, provider_id: str) -> None:
+        from ling.settings.window_policy import lock_dialogue_config
+
+        await lock_dialogue_config(self._session)
         row = (
             await self._session.execute(
                 select(ProviderCredential).where(ProviderCredential.provider_id == provider_id)
@@ -995,9 +1015,13 @@ class ConfigService:
         没有已发布修订时**不造修订**：此时进程都跑在引导配置上，没有生效
         配置可改，凭空发布一份反而会把 ``test_mode`` 等引导行为固化下来。
         """
+        from ling.settings.window_policy import lock_dialogue_config
+
+        await lock_dialogue_config(self._session)
         published = await self.published_revision()
         if published is None:
             return None
+        await lock_dialogue_config(self._session, changed=True)
         payload = copy.deepcopy(dict(published.payload or {}))
         next_rev = await self._next_revision_number()
         # 先降级旧的，再插入新的——顺序与 ``publish()`` 一致。反过来写的话，

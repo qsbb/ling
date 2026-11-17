@@ -70,6 +70,7 @@ import type {
   RecallResult,
   VoiceReferenceUpload,
 } from './types';
+import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -390,7 +391,218 @@ export interface TranscriptionJob {
   error: {code: string; message: string} | null;
 }
 
+export interface WindowDialoguePolicy {
+  field: 'private_may_stay_silent';
+  global_value: boolean;
+  override: boolean | null;
+  effective: boolean;
+  source: WindowDialoguePolicySource;
+  fields: WindowDialoguePolicyFields;
+  origin_status: WindowDialoguePolicyOriginStatus;
+  instance_scope: ConversationPolicyScope | null;
+  instance_id: string | null;
+  global_revision: number;
+  instance_revision: number;
+  session_revision: number;
+}
+
+export type WindowDialoguePolicyField =
+  | 'persona_id'
+  | 'private_may_stay_silent'
+  | 'group_mention_requires_reply'
+  | 'group_attention_deferred'
+  | 'group_turn_budget'
+  | 'rest_may_skip';
+
+export type WindowDialoguePolicySource = 'global' | 'instance' | 'session';
+export type WindowDialoguePolicyOriginStatus = 'known' | 'unknown' | 'not_applicable';
+export type ConversationPolicyScope = 'onebot' | 'qqbot';
+
+export interface WindowDialoguePolicyPersonaField {
+  global_value: string | null;
+  instance_override: string | null;
+  has_instance_override: boolean;
+  session_override: string | null;
+  has_session_override: boolean;
+  effective: string | null;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyBooleanField {
+  global_value: boolean;
+  instance_override: boolean | null;
+  has_instance_override: boolean;
+  session_override: boolean | null;
+  has_session_override: boolean;
+  effective: boolean;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyIntegerField {
+  global_value: number;
+  instance_override: number | null;
+  has_instance_override: boolean;
+  session_override: number | null;
+  has_session_override: boolean;
+  effective: number;
+  source: WindowDialoguePolicySource;
+}
+
+export interface WindowDialoguePolicyFields {
+  persona_id: WindowDialoguePolicyPersonaField;
+  private_may_stay_silent: WindowDialoguePolicyBooleanField;
+  group_mention_requires_reply: WindowDialoguePolicyBooleanField;
+  group_attention_deferred: WindowDialoguePolicyBooleanField;
+  group_turn_budget: WindowDialoguePolicyIntegerField;
+  rest_may_skip: WindowDialoguePolicyBooleanField;
+}
+
+export type WindowDialoguePolicyValue = boolean | number | string | null;
+
+export interface WindowDialoguePolicySet {
+  persona_id?: string | null;
+  private_may_stay_silent?: boolean;
+  group_mention_requires_reply?: boolean;
+  group_attention_deferred?: boolean;
+  group_turn_budget?: number;
+  rest_may_skip?: boolean;
+}
+
+export interface WindowPolicyChange {
+  set: WindowDialoguePolicySet;
+  clear: WindowDialoguePolicyField[];
+}
+
+export interface WindowDialoguePolicyProposed {
+  override: boolean | null;
+  effective: boolean;
+  source: WindowDialoguePolicySource;
+  fields: WindowDialoguePolicyFields;
+}
+
+export interface WindowPolicyPreview {
+  current: WindowDialoguePolicy;
+  proposed: WindowDialoguePolicyProposed;
+  preview_token: string;
+  expires_at: number;
+}
+
+export interface WindowOriginBindingCandidate {
+  scope: ConversationPolicyScope;
+  instance_id: string;
+  display_name: string;
+  enabled: boolean;
+}
+
+export interface WindowOriginBindingOptions {
+  scope: ConversationPolicyScope;
+  candidates: WindowOriginBindingCandidate[];
+  manually_bound: boolean;
+}
+
+export interface WindowOriginBindingChange {
+  scope: ConversationPolicyScope | null;
+  instance_id: string | null;
+}
+
+export interface WindowOriginBindingPreview {
+  current: WindowDialoguePolicy;
+  proposed: WindowDialoguePolicy;
+  target: WindowOriginBindingCandidate | null;
+  preview_token: string;
+  expires_at: number;
+}
+
+export interface InstanceDialoguePolicy {
+  schema_version: 'v1';
+  scope: ConversationPolicyScope;
+  instance_id: string;
+  fields: WindowDialoguePolicyFields;
+  global_revision: number;
+  instance_revision: number;
+  impact_epoch: number;
+  affected_active_windows: number;
+  affected_archived_windows: number;
+  session_shadowed_windows: number;
+}
+
+export interface InstanceDialoguePolicyProposed {
+  fields: WindowDialoguePolicyFields;
+  affected_active_windows: number;
+  affected_archived_windows: number;
+  session_shadowed_windows: number;
+}
+
+export interface InstanceDialoguePolicyPreview {
+  current: InstanceDialoguePolicy;
+  proposed: InstanceDialoguePolicyProposed;
+  preview_token: string;
+  expires_at: number;
+}
+
 export const api = {
+  windowDialoguePolicy(sessionId: string): Promise<WindowDialoguePolicy> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`);
+  },
+  previewWindowPolicy(sessionId: string, change: WindowPolicyChange): Promise<WindowPolicyPreview> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy/preview`, jsonInit('POST', change));
+  },
+  saveWindowPolicy(sessionId: string, change: WindowPolicyChange, token: string): Promise<WindowDialoguePolicy> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`,
+      jsonInit('PUT', { ...change, preview_token: token }));
+  },
+  windowOriginBinding(sessionId: string): Promise<WindowOriginBindingOptions> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding`);
+  },
+  previewWindowOriginBinding(
+    sessionId: string,
+    change: WindowOriginBindingChange,
+  ): Promise<WindowOriginBindingPreview> {
+    return request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding/preview`,
+      jsonInit('POST', change),
+    );
+  },
+  saveWindowOriginBinding(
+    sessionId: string,
+    change: WindowOriginBindingChange,
+    token: string,
+  ): Promise<WindowDialoguePolicy> {
+    return request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding`,
+      jsonInit('PUT', { ...change, preview_token: token }),
+    );
+  },
+  instanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+  ): Promise<InstanceDialoguePolicy> {
+    return request<InstanceDialoguePolicy>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy`,
+    );
+  },
+  previewInstanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+    change: WindowPolicyChange,
+  ): Promise<InstanceDialoguePolicyPreview> {
+    return request<InstanceDialoguePolicyPreview>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy/preview`,
+      jsonInit('POST', change),
+    );
+  },
+  saveInstanceDialoguePolicy(
+    scope: ConversationPolicyScope,
+    instanceId: string,
+    change: WindowPolicyChange,
+    token: string,
+  ): Promise<InstanceDialoguePolicy> {
+    return request<InstanceDialoguePolicy>(
+      `${connectorInstancePath(scope, instanceId)}/dialogue-policy`,
+      jsonInit('PUT', { ...change, preview_token: token }),
+    );
+  },
+
   uploadAudio(sessionId: string, file: File): Promise<{asset_id: string; duration_seconds: number}> {
     const form = new FormData();
     form.append('file', file);
@@ -935,6 +1147,19 @@ export const api = {
     if (q) params.set('q', q);
     const suffix = params.toString();
     return request<SubjectsResponse>(`/v1/accounts/subjects${suffix ? `?${suffix}` : ''}`);
+  },
+  subjectDetails<K extends SubjectDetailSection>(
+    subjectId: string,
+    section: K,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<SubjectDetailPage<SubjectDetailItems[K]>> {
+    const params = new URLSearchParams({ section });
+    if (cursor) params.set('cursor', cursor);
+    return request<SubjectDetailPage<SubjectDetailItems[K]>>(
+      `/v1/accounts/subjects/${encodeURIComponent(subjectId)}/details?${params}`,
+      { signal },
+    );
   },
   mergeSubjects(body: { source_id: string; target_id: string }): Promise<MergeResult> {
     return request<MergeResult>('/v1/accounts/subjects/merge', jsonInit('POST', body));

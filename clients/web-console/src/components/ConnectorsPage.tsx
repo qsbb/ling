@@ -59,6 +59,7 @@ import type {
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, CheckIcon, RefreshIcon } from './Icons';
 import {
+  connectorViewOf,
   ConnectorInstancePanel,
   DEFAULT_INSTANCE_ID,
   instanceFormKey,
@@ -728,10 +729,10 @@ export function FieldRow({
       data-invalid={invalid ? 'true' : undefined}
     >
       <label className="connector-field__name" htmlFor={cleared ? undefined : id} title={key}>
-        {key}
+        {field.label}
       </label>
       <span className="connector-field__label">
-        <span>{field.label}</span>
+        <span className="connector-field__key">{key}</span>
         {field.kind === 'secret' && field.preview ? (
           <span className="connector-field__preview" data-testid={`connector-preview-${key}`}>
             当前值 {field.preview}
@@ -832,6 +833,8 @@ export interface ConnectorFormProps {
   saving: boolean;
   /** 提交中的一句话（"正在保存…"），期间表单只读。 */
   formNote: string | null;
+  /** 当前实例视图尚未验证时禁止提交。 */
+  saveDisabled?: boolean;
   notice: SaveNotice | null;
   /** 字段级错误（422 的 `error.field`）：只标对应那一行。 */
   fieldError: string | null;
@@ -879,7 +882,7 @@ interface ConnectorCardProps extends ConnectorFormProps {
    * 面板 → 卡片 → 页面。
    */
   onSelectInstance?: (instanceId: string) => void;
-  onInstanceView?: (instanceId: string, fields: ConnectorField[] | null) => void;
+  onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
 }
 
 /**
@@ -974,12 +977,10 @@ export function ConnectorCard({
         onSelectInstance={onSelectInstance}
         onInstanceView={onInstanceView}
         dirtyInstanceIds={dirtyInstanceIds}
-      />
-
-      <h3 className="connector-card__subtitle">配置项</h3>
+      >
+      <h3 className="connector-card__subtitle">接入设置</h3>
       <p className="connector-card__note">
-        存在服务端的数据库覆盖层里，保存后立刻按新配置重建连接。密钥只报"设了没有"，
-        网页上不存在回显——密码框留空表示不修改。
+        保存后立即尝试连接。密码框留空表示保留已保存的密钥。
       </p>
 
       <form
@@ -1028,7 +1029,7 @@ export function ConnectorCard({
           <button
             type="submit"
             className="button button--primary button--small"
-            disabled={!editable || form.saving}
+            disabled={!editable || form.saving || form.saveDisabled === true}
             data-testid={`connector-${connector.id}-save`}
           >
             {form.saving ? '保存中…' : '保存并生效'}
@@ -1066,7 +1067,9 @@ export function ConnectorCard({
                      * （`connectors.browser.test.tsx`：保存后 note 含"当前版本 4"）。
                      */
                     (form.notice?.tone === 'warn' ? form.notice.text : null) ??
-                    `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`
+                    (form.saveDisabled
+                      ? '实例版本暂不可用，请刷新状态'
+                      : `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`)
                 : '只有所有者可以修改')}
           </span>
         </div>
@@ -1084,6 +1087,7 @@ export function ConnectorCard({
         <strong>怎么改：</strong>
         {renderInlineCode(connector.guidance)}
       </p>
+      </ConnectorInstancePanel>
     </section>
   );
 }
@@ -1315,13 +1319,13 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
    * `?instance_id=` 读得到，所以由面板回灌到页面，页面再拿它给卡片当字段来源，
    * 并在切换（或视图迟到）时用**这个实例自己的值**建草案。
    */
-  const [instanceFields, setInstanceFields] = useState<Record<string, ConnectorField[]>>({});
+  const [instanceViews, setInstanceViews] = useState<Record<string, ConnectorView>>({});
   /**
-   * `scope → 选中实例的字段视图**不可得**`（读取失败，或响应没回显实例）。
+   * `scope → 选中实例的视图**不可得**`（读取失败，或响应没回显实例）。
    *
    * 与"这个实例确实什么都没配"是两件事，界面上也不能一样：前者要把输入框
-   * 空着**并说明为什么空**，否则空表单会被读成"它真的是空的"。所以不能只靠
-   * `instanceFields[scope] === undefined` 一个信号表达两种含义。
+   * 空着**并说明为什么空**，否则空表单会被读成"它真的是空的"。字段与 generation
+   * 也必须一起保存，避免把实例字段和页面默认实例的并发版本拼在一起。
    */
   const [instanceUnverified, setInstanceUnverified] = useState<Record<string, boolean>>({});
   const [pending, setPending] = useState<Record<string, PendingState>>({});
@@ -1386,11 +1390,11 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
    * 立刻按它建草案；拿不到视图就走"不可得"那条路：输入框空着、并说明为什么
    * 空。**空着是诚实的，画出默认实例的值不是。**
    *
-   * `instanceFields`（画什么）与 `instanceUnverified`（能不能当真）必须成对
+   * `instanceViews`（字段 + generation）与 `instanceUnverified`（能不能当真）必须成对
    * 更新：只改一份就会出现"空表单看起来像这个实例真的没配"。
    */
   const handleInstanceView = useCallback(
-    (scope: string, instanceId: string, fields: ConnectorField[] | null) => {
+    (scope: string, instanceId: string, view: ConnectorView | null) => {
       if (instanceId === DEFAULT_INSTANCE_ID) return;
       /*
        * 键**必须带 instanceId**。
@@ -1408,19 +1412,19 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
        * `instanceFormKey` 早就是 `(scope, instanceId)` 分区的，只有这两份没跟上。
        */
       const viewKey = instanceFormKey(scope, instanceId);
-      setInstanceFields((previous) => {
-        if (fields === null) {
+      setInstanceViews((previous) => {
+        if (view === null) {
           if (!Object.prototype.hasOwnProperty.call(previous, viewKey)) return previous;
           const next = { ...previous };
           delete next[viewKey];
           return next;
         }
-        if (previous[viewKey] === fields) return previous;
-        return { ...previous, [viewKey]: fields };
+        if (previous[viewKey] === view) return previous;
+        return { ...previous, [viewKey]: view };
       });
       setInstanceUnverified((previous) => {
         const was = previous[viewKey] === true;
-        if (fields === null) {
+        if (view === null) {
           return was ? previous : { ...previous, [viewKey]: true };
         }
         if (!was) return previous;
@@ -1428,9 +1432,40 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         delete next[viewKey];
         return next;
       });
-      setForms((previous) => ensureInstanceForm(previous, scope, instanceId, fields ?? []));
+      setForms((previous) => ensureInstanceForm(previous, scope, instanceId, view?.fields ?? []));
     },
     [],
+  );
+
+  const refreshInstanceView = useCallback(
+    async (scope: string, instanceId: string) => {
+      const formKey = instanceFormKey(scope, instanceId);
+      const dropSavedDraft = () => {
+        setForms((previous) => {
+          if (!Object.prototype.hasOwnProperty.call(previous, formKey)) return previous;
+          const next = { ...previous };
+          delete next[formKey];
+          return next;
+        });
+      };
+      try {
+        const body = await api.connectors(instanceId);
+        const view = body.instance_id === instanceId ? connectorViewOf(body, scope) : null;
+        handleInstanceView(scope, instanceId, view);
+        if (view === null) {
+          dropSavedDraft();
+          return;
+        }
+        setForms((previous) => ({
+          ...previous,
+          [formKey]: { draft: draftFromFields(view.fields), clearKeys: [] },
+        }));
+      } catch {
+        handleInstanceView(scope, instanceId, null);
+        dropSavedDraft();
+      }
+    },
+    [handleInstanceView],
   );
 
   const selectInstance = useCallback((scope: string, instanceId: string) => {
@@ -1498,7 +1533,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
    * 撤销某个 `(scope, instanceId)` 的改动。
    *
    * 非默认实例的"已保存的值"页面级 GET 拿不到，只有面板按实例读回的那份
-   * （`instanceFields[scope]`）。两处都没有就退化成空表单（"撤销"不是"回填
+   * （`instanceViews[instanceFormKey(scope, instanceId)]`）。两处都没有就退化成空表单（"撤销"不是"回填
    * 别人的值"）。
    */
   const revertDraft = useCallback(
@@ -1554,20 +1589,24 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       }));
       try {
         const result = await api.saveConnectorConfig(scope, change, generation, instanceId);
-        setPending((previous) => ({
-          ...previous,
-          [scope]: { saving: false, notice: describeChangeResult(result), fieldError: null },
-        }));
         const settled = result.state === 'active' || result.state === 'unchanged';
         // 只有真正生效（或确实什么都没变）才丢掉草案；rolled_back / degraded
         // 一律保留用户填的内容，方便他改完再存。
         if (settled) {
-          setForms((previous) => ({
-            ...previous,
-            [formKey]: { draft: draftFromFields(fields), clearKeys: [] },
-          }));
+          if (instanceId === DEFAULT_INSTANCE_ID) {
+            setForms((previous) => ({
+              ...previous,
+              [formKey]: { draft: draftFromFields(fields), clearKeys: [] },
+            }));
+          } else {
+            await refreshInstanceView(scope, instanceId);
+          }
         }
         await reload(settled);
+        setPending((previous) => ({
+          ...previous,
+          [scope]: { saving: false, notice: describeChangeResult(result), fieldError: null },
+        }));
       } catch (err) {
         const notice = describeSaveError(err);
         setPending((previous) => ({
@@ -1580,7 +1619,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         }));
       }
     },
-    [forms, reload],
+    [forms, refreshInstanceView, reload],
   );
 
   const runReset = useCallback(async () => {
@@ -1616,7 +1655,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
     scope: string,
     instanceId: string,
     fields: ConnectorField[],
-    generation: number,
+    generation: number | null,
   ): ConnectorFormProps => {
     const now = pending[scope] ?? IDLE;
     const form = forms[instanceFormKey(scope, instanceId)];
@@ -1626,12 +1665,21 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       onEdit: (key, value) => editField(scope, instanceId, key, value),
       onToggleClear: (key) => toggleClear(scope, instanceId, key),
       onResetDraft: () => revertDraft(scope, instanceId, fields),
-      onSave: () => void save(scope, instanceId, fields, generation),
+      onSave: () => {
+        if (generation !== null) void save(scope, instanceId, fields, generation);
+      },
       saving: now.saving,
+      saveDisabled: generation === null,
       formNote: now.saving ? '正在保存：要等服务端切换完成才算生效…' : null,
       notice: now.notice,
       fieldError: now.fieldError,
-      onReload: () => void load(),
+      onReload: () => {
+        if (instanceId === DEFAULT_INSTANCE_ID) {
+          void load();
+        } else {
+          void Promise.all([reload(false), refreshInstanceView(scope, instanceId)]);
+        }
+      },
     };
   };
 
@@ -1643,8 +1691,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
       <h1 className="page__title">接入器</h1>
       <p className="page__hint">
-        她从哪条线收发消息：OneBot（NapCat 等）与 QQ 官方机器人。配置存在服务端的数据库
-        覆盖层里，<strong>保存后立刻尝试生效</strong>；密钥永远不回显，密码框留空表示不修改。
+        管理各平台账号与连接方式。选中实例后修改配置，<strong>保存后立刻尝试生效</strong>。
       </p>
 
       <div className="connectors-page__actions">
@@ -1742,6 +1789,10 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       {state.status === 'ready'
         ? state.body.connectors.map((connector) => {
             const instanceId = instanceOf(connector.id);
+            const instanceView =
+              instanceId === DEFAULT_INSTANCE_ID
+                ? null
+                : instanceViews[instanceFormKey(connector.id, instanceId)] ?? null;
             /*
              * 卡片画哪个实例的字段：选中的是默认实例 → 页面级视图（本来就是它的）；
              * 其余 → 面板按 `?instance_id=` 读回、且**能证明**属于它的那份。
@@ -1751,9 +1802,13 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
             const fields =
               instanceId === DEFAULT_INSTANCE_ID
                 ? connector.fields
-                : (instanceFields[instanceFormKey(connector.id, instanceId)] ?? []);
+                : (instanceView?.fields ?? []);
+            const generation =
+              instanceId === DEFAULT_INSTANCE_ID ? connector.generation : (instanceView?.generation ?? null);
             const view: ConnectorView =
-              instanceId === DEFAULT_INSTANCE_ID ? connector : { ...connector, fields };
+              instanceId === DEFAULT_INSTANCE_ID
+                ? connector
+                : { ...connector, fields, generation: generation ?? connector.generation };
             return (
               <ConnectorCard
                 /*
@@ -1772,8 +1827,8 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 panelConnector={connector}
                 instanceId={instanceId}
                 onSelectInstance={(next) => selectInstance(connector.id, next)}
-                onInstanceView={(nextId, nextFields) =>
-                  handleInstanceView(connector.id, nextId, nextFields)
+                onInstanceView={(nextId, nextView) =>
+                  handleInstanceView(connector.id, nextId, nextView)
                 }
                 /*
                  * 非默认实例、且它的字段视图还没读回（或读失败）：说明**为什么
@@ -1786,7 +1841,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                       : '正在读取这个实例的字段视图…读到之前下面的输入框是空的，它们不代表这个实例的配置为空。'
                     : null
                 }
-                {...formPropsFor(connector.id, instanceId, fields, connector.generation)}
+                {...formPropsFor(connector.id, instanceId, fields, generation)}
               />
             );
           })

@@ -52,7 +52,13 @@ def _at(day: date, hour: int, minute: int = 0) -> datetime:
 
 
 async def _insert_plan(
-    plan_day: date, *, state: str = "ready", revision: int = 1, error: str | None = None
+    plan_day: date,
+    *,
+    state: str = "ready",
+    revision: int = 1,
+    error: str | None = None,
+    actor_id: str = ACTOR,
+    last_model_outline_at: datetime | None = None,
 ) -> str:
     """直接落一行计划头（模拟"夜里跑过、停在某个状态"的现场）。"""
     start, end = plan_day_window(plan_day, TZ)
@@ -61,7 +67,7 @@ async def _insert_plan(
         session.add(
             DayPlanRow(
                 id=plan_id,
-                actor_id=ACTOR,
+                actor_id=actor_id,
                 plan_day=plan_day,
                 timezone=TZ,
                 timezone_source="preference",
@@ -73,6 +79,7 @@ async def _insert_plan(
                 state=state,
                 generation_source="model" if state == "ready" else "rule",
                 last_error_code=error,
+                last_model_outline_at=last_model_outline_at,
                 created_at=start,
                 updated_at=start,
             )
@@ -277,6 +284,7 @@ async def test_owner_gets_segments_intents_and_dream_narrative(logged_in: TestEn
     assert body["plan_state"] == "ready"
     assert body["revision"] == 1
     assert body["generated_at"]
+    assert body["last_model_outline_at"] is None  # 旧记录不能推测成功时间
     assert body["horizon_unplanned"] is True
     assert body["has_private_content"] is False
 
@@ -342,6 +350,86 @@ async def test_non_owner_cannot_read_private_segment_or_dream(
     assert body["dream"]["narrative"] is None
     assert body["dream"]["title"] is None
     assert body["dream"]["status"] == "ready"
+
+
+async def test_gaps_are_exact_for_owner_and_unknown_for_member(
+    web_env: TestEnv, logged_in: TestEnv
+) -> None:
+    plan_id = await _insert_plan(DAY)
+    parent = await _insert_segment(
+        plan_id, start_at=_at(DAY, 8), end_at=_at(DAY, 12), title="上午", is_leaf=False
+    )
+    await _insert_segment(
+        plan_id, start_at=_at(DAY, 9), end_at=_at(DAY, 10), title="阅读", parent_id=parent,
+        layer="hour",
+    )
+    await _insert_segment(
+        plan_id, start_at=_at(DAY, 14), end_at=_at(DAY, 15), title="私事",
+        visibility="actor_private",
+    )
+    await _insert_segment(
+        plan_id, start_at=_at(DAY, 17), end_at=_at(DAY, 18), title="旧计划",
+        status="superseded",
+    )
+    owner_response = await logged_in.client.get(
+        "/v1/life/timeline", params={"date": DAY.isoformat()}
+    )
+    assert owner_response.status_code == 200
+    coverage = owner_response.json()["unplanned"]
+    assert coverage is not None
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    assert [(parse(item["start_at"]), parse(item["end_at"])) for item in coverage["periods"]] == [
+        (_at(DAY, 0), _at(DAY, 8)),
+        (_at(DAY, 12), _at(DAY, 14)),
+        (_at(DAY, 15), _at(NEXT_DAY, 0)),
+    ]
+    await _create_member()
+    async with _member_client(web_env) as client:
+        await _login(client)
+        member_response = await client.get(
+            "/v1/life/timeline", params={"date": DAY.isoformat()}
+        )
+    assert member_response.status_code == 200
+    assert member_response.json()["unplanned"] is None
+    assert member_response.json()["hidden_segment_count"] == 1
+
+
+async def test_explanation_and_last_success_are_scoped_to_actor(logged_in: TestEnv) -> None:
+    older = _at(DAY - timedelta(days=1), 10)
+    latest = _at(DAY, 10)
+    await _insert_plan(DAY - timedelta(days=1), last_model_outline_at=older)
+    await _insert_plan(DAY, state="degraded", error="model_timeout", last_model_outline_at=latest)
+    await _insert_plan(DAY, actor_id="another_actor", last_model_outline_at=latest + timedelta(days=1))
+    response = await logged_in.client.get("/v1/life/timeline", params={"date": DAY.isoformat()})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reason_explanation"] == "生成日程时模型请求超时。"
+    assert datetime.fromisoformat(body["last_model_outline_at"].replace("Z", "+00:00")) == latest
+
+
+async def test_gap_scope_is_clipped_to_actual_plan_when_timezones_differ(
+    web_env: TestEnv, logged_in: TestEnv
+) -> None:
+    await _insert_plan(DAY)
+    await _create_member()
+    async with _member_client(web_env) as client:
+        await _login(client)
+        saved = await client.put(
+            "/v1/settings/preferences", json={"timezone": "America/New_York"}
+        )
+        assert saved.status_code == 200
+        response = await client.get("/v1/life/timeline", params={"date": DAY.isoformat()})
+    assert response.status_code == 200
+    coverage = response.json()["unplanned"]
+    assert coverage is not None
+    assert coverage["scope_start_at"].startswith("2026-11-08T05:00:00")
+    assert coverage["scope_end_at"].startswith("2026-11-08T16:00:00")
+    assert coverage["periods"] == [{
+        "start_at": coverage["scope_start_at"], "end_at": coverage["scope_end_at"]
+    }]
 
 
 # ---------------------------------------------------------------- ③ 双时区

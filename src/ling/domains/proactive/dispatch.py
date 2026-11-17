@@ -67,15 +67,25 @@ operation_id，平台也无从按它去重或对账。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from ling.infra.models import IdempotencyKey, ProactiveOpportunity, Window, utcnow
+from ling.infra.models import (
+    IdempotencyKey,
+    ProactiveDraftBinding,
+    ProactiveOpportunity,
+    Window,
+    utcnow,
+)
+from ling.infra.proactive_quota import ProactiveQuotaReservation
 from ling.infra.security import new_id
 from ling.logging_setup import emit_event
 from ling.ports.channel import ChannelConnector
@@ -87,6 +97,123 @@ STALE_CLAIM_SECONDS = 300
 PROACTIVE_DISPATCH_SCOPE = "proactive_dispatch"
 _DISPATCH_IN_PROGRESS = "v1:in_progress"
 _DISPATCH_FINAL_STATES = frozenset({"sent", "rejected", "failed", "uncertain"})
+
+
+def _local_quota_day(now: datetime, timezone_name: str | None) -> tuple[date, datetime, datetime]:
+    try:
+        timezone = ZoneInfo(timezone_name or "UTC")
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("UTC")
+    local_day = now.astimezone(timezone).date()
+    start = datetime.combine(local_day, time.min, tzinfo=timezone).astimezone(UTC)
+    end = datetime.combine(local_day + timedelta(days=1), time.min, tzinfo=timezone).astimezone(UTC)
+    return local_day, start, end
+
+
+@asynccontextmanager
+async def _short_quota_session(session: AsyncSession):
+    """Yield a fresh PostgreSQL session so its transaction never spans a send."""
+    if session.get_bind().dialect.name != "postgresql":
+        raise RuntimeError("主动联系日额度预留需要 PostgreSQL")
+    bind = session.bind
+    engine = bind if isinstance(bind, AsyncEngine) else bind.engine
+    async with (
+        engine.connect() as connection,
+        AsyncSession(bind=connection, expire_on_commit=False) as short,
+        short.begin(),
+    ):
+        yield short
+
+
+async def _lock_subject_quota(
+    session: AsyncSession, *, actor_id: str, subject_id: str
+) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": "proactive-daily-quota:" + json.dumps([actor_id, subject_id])},
+    )
+
+
+async def _reserve_daily_quota(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    subject_id: str,
+    opportunity_id: str,
+    daily_limit: int,
+    timezone_name: str | None,
+    now: datetime | None,
+) -> bool:
+    async with _short_quota_session(session) as short:
+        await _lock_subject_quota(short, actor_id=actor_id, subject_id=subject_id)
+        reserved_at = now or utcnow()
+        local_day, start, end = _local_quota_day(reserved_at, timezone_name)
+        existing = await short.get(
+            ProactiveQuotaReservation, opportunity_id, populate_existing=True
+        )
+        if existing is not None and existing.state in {"reserved", "sent", "uncertain"}:
+            return True
+        active_count = await short.scalar(
+            select(func.count()).select_from(ProactiveQuotaReservation).where(
+                ProactiveQuotaReservation.actor_id == actor_id,
+                ProactiveQuotaReservation.subject_id == subject_id,
+                ProactiveQuotaReservation.local_day == local_day,
+                ProactiveQuotaReservation.state.in_(("reserved", "sent", "uncertain")),
+            )
+        )
+        legacy_sent_count = await short.scalar(
+            select(func.count()).select_from(ProactiveOpportunity).where(
+                ProactiveOpportunity.actor_id == actor_id,
+                ProactiveOpportunity.subject_id == subject_id,
+                ProactiveOpportunity.sent_at >= start,
+                ProactiveOpportunity.sent_at < end,
+                ~select(ProactiveQuotaReservation.opportunity_id)
+                .where(ProactiveQuotaReservation.opportunity_id == ProactiveOpportunity.id)
+                .exists(),
+            )
+        )
+        if int(active_count or 0) + int(legacy_sent_count or 0) >= max(0, daily_limit):
+            return False
+        if existing is None:
+            existing = ProactiveQuotaReservation(
+                opportunity_id=opportunity_id,
+                actor_id=actor_id,
+                subject_id=subject_id,
+                local_day=local_day,
+                state="reserved",
+                reserved_at=reserved_at,
+                updated_at=reserved_at,
+            )
+            short.add(existing)
+        else:
+            existing.actor_id = actor_id
+            existing.subject_id = subject_id
+            existing.local_day = local_day
+            existing.state = "reserved"
+            existing.reserved_at = reserved_at
+            existing.updated_at = reserved_at
+        return True
+
+
+async def _settle_daily_quota(
+    session: AsyncSession, *, opportunity_id: str, delivery_state: str
+) -> None:
+    state = (
+        "sent" if delivery_state in {"sent", "delivered"}
+        else "uncertain" if delivery_state == "uncertain"
+        else "released"
+    )
+    row = await session.get(ProactiveQuotaReservation, opportunity_id, populate_existing=True)
+    if row is not None and row.state != "released":
+        row.state = state
+        row.updated_at = utcnow()
+
+
+async def _release_daily_quota(session: AsyncSession, *, opportunity_id: str) -> None:
+    row = await session.get(ProactiveQuotaReservation, opportunity_id, populate_existing=True)
+    if row is not None and row.state == "reserved":
+        row.state = "released"
+        row.updated_at = utcnow()
 
 
 def _claim_is_stale(created_at: datetime | None, now: datetime) -> bool:
@@ -133,6 +260,12 @@ async def _recover_abandoned_claims(
         opportunity.delivery_state = "uncertain"
         opportunity.rejected_reason = "投递认领已超时，平台可能已收到"
         claim.result_ref = "v1:uncertain:abandoned"
+        quota = await session.get(
+            ProactiveQuotaReservation, opportunity.id, populate_existing=True
+        )
+        if quota is not None and quota.state == "reserved":
+            quota.state = "uncertain"
+            quota.updated_at = now
         recovered += 1
     if recovered:
         await session.commit()
@@ -241,7 +374,172 @@ async def _target_window_ref(
     if row is None:
         return None
     # 群窗口的 title 也是 window_ref，但私聊条件已经挡住了
-    return str(row.title or "") or None
+    return row.platform_reference or None
+
+
+async def _bound_delivery_target(
+    session: AsyncSession,
+    *,
+    opportunity: ProactiveOpportunity,
+    binding: ProactiveDraftBinding,
+    config_reader: object,
+    deliver_to_web: bool,
+    connector_for_window: Callable[..., Awaitable[ChannelConnector | None]] | None,
+) -> tuple[Window, ChannelConnector | None] | None:
+    """Use the drafted target, or a currently eligible equivalent fallback."""
+    from typing import cast
+
+    from ling.contracts.v1 import Modality
+    from ling.domains.proactive.binding import (
+        equivalent_settings,
+        snapshot_metadata,
+        target_fingerprint,
+    )
+    from ling.settings.service import ConfigService
+    from ling.settings.window_policy import runtime_window_snapshot
+
+    if (binding.state != "ready" or not binding.target_window_id or not isinstance(binding.snapshot, dict)
+            or not isinstance(binding.snapshot.get("target_fingerprint"), str)):
+        return None
+    windows = list((await session.scalars(select(Window).where(
+        Window.actor_id == opportunity.actor_id,
+        Window.subject_id == opportunity.subject_id,
+        Window.visibility == "subject_private",
+        Window.archived.is_(False),
+        Window.channel.in_(("onebot", "qqbot", "web")),
+    ).order_by(Window.last_message_at.desc().nulls_last(), Window.id))).all())
+
+    async def eligible(window: Window) -> tuple[Window, ChannelConnector | None] | None:
+        if window.channel == "web":
+            return (window, None) if deliver_to_web else None
+        if connector_for_window is None or not window.platform_reference:
+            return None
+        if window.trusted_instance_key is not None:
+            connector = await connector_for_window(
+                str(window.channel), window.platform_reference, instance_key=window.trusted_instance_key,
+            )
+        else:
+            connector = await connector_for_window(str(window.channel), window.platform_reference)
+        if connector is None:
+            return None
+        caps = connector.capabilities()
+        if not caps.enabled or not caps.supports_private or not caps.supports_proactive:
+            return None
+        if opportunity.output_modality == "voice" and not caps.media_supported(Modality.audio):
+            return None
+        return window, connector
+
+    original = next((window for window in windows if window.id == binding.target_window_id), None)
+    if original is not None and target_fingerprint(original) == binding.snapshot["target_fingerprint"]:
+        selected = await eligible(original)
+        if selected is not None:
+            return selected
+    for window in sorted(windows, key=lambda item: item.channel == "web"):
+        if window.id == binding.target_window_id:
+            continue
+        selected = await eligible(window)
+        if selected is None:
+            continue
+        try:
+            current = await runtime_window_snapshot(cast(ConfigService, config_reader), window.id)
+            if equivalent_settings(binding.snapshot, snapshot_metadata(current)):
+                return selected
+        except Exception:  # noqa: BLE001 - an unverified fallback must not be used
+            logger.info("无法核实主动草稿的候选目标，暂不投递")
+    return None
+
+
+async def bound_delivery_target_allowed(
+    session: AsyncSession, *, opportunity_id: str, window_id: str, config_reader: object,
+    channel: str, expected_target: str,
+) -> bool:
+    """Finish the guarded configuration check before the caller can enter send()."""
+    async with _short_quota_session(session) as short:
+        return await _bound_delivery_target_allowed_in_session(
+            short,
+            opportunity_id=opportunity_id,
+            window_id=window_id,
+            config_reader=config_reader,
+            channel=channel,
+            expected_target=expected_target,
+        )
+
+
+async def _bound_delivery_target_allowed_in_session(
+    session: AsyncSession, *, opportunity_id: str, window_id: str, config_reader: object,
+    channel: str, expected_target: str,
+) -> bool:
+    """Recheck a bound delivery under transaction locks before its final write or send."""
+    from typing import cast
+
+    from ling.domains.proactive.binding import (
+        equivalent_settings,
+        snapshot_metadata,
+        target_fingerprint,
+    )
+    from ling.settings.service import ConfigService
+    from ling.settings.window_policy import lock_dialogue_config, runtime_window_snapshot
+
+    await lock_dialogue_config(session)
+    opportunity = await session.scalar(
+        select(ProactiveOpportunity).where(ProactiveOpportunity.id == opportunity_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
+    binding = await session.get(ProactiveDraftBinding, opportunity_id, populate_existing=True)
+    window = await session.scalar(
+        select(Window).where(Window.id == window_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
+    if (
+        opportunity is None or opportunity.state != "dispatching" or binding is None
+        or binding.state != "ready" or not isinstance(binding.snapshot, dict)
+        or window is None or window.archived or window.channel != channel
+        or window.visibility != "subject_private" or window.actor_id != opportunity.actor_id
+        or window.subject_id != opportunity.subject_id
+        or not isinstance(binding.snapshot.get("target_fingerprint"), str)
+        or target_fingerprint(window) != expected_target
+    ):
+        return False
+    expires_at = opportunity.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at <= utcnow() or not opportunity.draft_text:
+        return False
+    try:
+        config = cast(ConfigService, config_reader)
+        effective = await config.with_session(session).effective()
+        if not effective.dialogue.proactive_delivery_enabled:
+            return False
+        if window.id == binding.target_window_id:
+            return target_fingerprint(window) == binding.snapshot["target_fingerprint"]
+        if window.id != binding.target_window_id:
+            current = await runtime_window_snapshot(config, window.id)
+            if not equivalent_settings(binding.snapshot, snapshot_metadata(current)):
+                return False
+    except Exception:  # noqa: BLE001 - an unverified target must not be used
+        logger.info("无法再次核实主动草稿的目标，暂不投递")
+        return False
+    return True
+
+
+async def _release_pre_send_claim(session: AsyncSession, *, opportunity_id: str) -> None:
+    """Release a claim only while no external delivery has begun."""
+    opportunity = await session.scalar(
+        select(ProactiveOpportunity).where(ProactiveOpportunity.id == opportunity_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
+    claim = await session.scalar(select(IdempotencyKey).where(
+        IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
+        IdempotencyKey.key == opportunity_id,
+    ).with_for_update())
+    if (opportunity is not None and opportunity.state == "dispatching" and claim is not None
+            and claim.result_ref == _DISPATCH_IN_PROGRESS):
+        await session.delete(claim)
+        await _release_daily_quota(session, opportunity_id=opportunity_id)
+        opportunity.state = "bound_candidate"
+        opportunity.last_gate_allowed = False
+        opportunity.last_gate_reasons = ["草稿对应的目标暂不可用"]
+    await session.commit()
 
 
 class _SendProbe:
@@ -325,7 +623,7 @@ async def dispatch_pending(
     now: datetime | None = None,
     limit: int = MAX_PER_ROUND,
     deliver_to_web: bool = False,
-    connector_for_window: Callable[[str, str], Awaitable[ChannelConnector | None]] | None = None,
+    connector_for_window: Callable[..., Awaitable[ChannelConnector | None]] | None = None,
     voice_dispatch: Callable[[ProactiveOpportunity, Window, object | None], Awaitable[str]]
     | None = None,
 ) -> dict[str, int | str]:
@@ -396,6 +694,11 @@ async def dispatch_pending(
             operation_id=operation_id,
             delivery_state=delivery_state,
         )
+        await _settle_daily_quota(
+            session,
+            opportunity_id=row.id,
+            delivery_state=state,
+        )
         await _set_claim_result(session, opportunity_id=row.id, state=state)
         await session.commit()
 
@@ -405,7 +708,7 @@ async def dispatch_pending(
                 select(ProactiveOpportunity)
                 .where(
                     ProactiveOpportunity.actor_id == actor_id,
-                    ProactiveOpportunity.state == "candidate",
+                    ProactiveOpportunity.state.in_(("candidate", "bound_candidate")),
                     ProactiveOpportunity.draft_text.is_not(None),
                     ProactiveOpportunity.expires_at > moment,  # type: ignore[arg-type]
                 )
@@ -419,49 +722,101 @@ async def dispatch_pending(
 
     sent = rejected = 0
     failed = uncertain = recovered_uncertain
-    gate_cache: dict[str, object] = {}
-
     async def reserve(row: ProactiveOpportunity) -> bool:
         nonlocal failed, uncertain
-        claim_state = await _claim_opportunity(session, row, now=moment)
+        checked_at = now or utcnow()
+        claim_state = await _claim_opportunity(session, row, now=checked_at)
         if claim_state == "uncertain":
             failed += 1
             uncertain += 1
-        return claim_state == "claimed"
+        if claim_state != "claimed":
+            return False
+        reserved = await _reserve_daily_quota(
+            session,
+            actor_id=actor_id,
+            subject_id=row.subject_id,
+            opportunity_id=row.id,
+            daily_limit=int(effective.dialogue.proactive_daily_limit),
+            timezone_name=(
+                subject_timezones.get(row.subject_id)
+                if subject_timezones is not None
+                else None
+            ) or subject_timezone,
+            now=now,
+        )
+        if not reserved:
+            await _release_pre_send_claim(session, opportunity_id=row.id)
+            row.state = "bound_candidate" if await session.get(
+                ProactiveDraftBinding, row.id
+            ) is not None else "candidate"
+            row.last_gate_allowed = False
+            row.last_gate_reasons = ["已达到每日主动联系额度"]
+            row.last_gate_at = checked_at
+            await session.commit()
+            return False
+        return True
 
     for row in rows:
-        gate = gate_cache.get(row.subject_id)
-        if gate is None:
-            # 每个人的时区：自己的偏好 > 实例级兜底。别把某一个人的时区
-            # 套给别人——那等于让别人的勿扰时段按"我"的作息算。
-            gate = await service.gate(
-                subject_id=row.subject_id,
-                now=moment,
-                subject_timezone=(
-                    subject_timezones.get(row.subject_id)
-                    if subject_timezones is not None
-                    else None
-                )
-                or subject_timezone,
-                channel_can_proactive=True,
-            )
-            gate_cache[row.subject_id] = gate
+        checked_at = now or utcnow()
+        # Each candidate receives a fresh gate evaluation. A same-subject cached
+        # result would let several opportunities reuse one daily-quota decision.
+        gate = await service.gate(
+            subject_id=row.subject_id,
+            now=checked_at,
+            subject_timezone=(
+                subject_timezones.get(row.subject_id)
+                if subject_timezones is not None
+                else None
+            ) or subject_timezone,
+            channel_can_proactive=True,
+        )
+        # 记录调度器当时真正执行的检查，不把页面上的当前快照冒充历史决策。
+        # 关停发送、缺草稿或尚未扫描到的候选不会经过这里，保持未知。
+        row.last_gate_allowed = bool(getattr(gate, "allowed", False))
+        row.last_gate_reasons = list(getattr(gate, "reasons", []))
+        row.last_gate_at = checked_at
         if not getattr(gate, "allowed", False):
             # 门控没过就留着，不标 rejected——它只是"现在还不是时候"
             continue
 
+        binding = await session.get(ProactiveDraftBinding, row.id)
+        bound_web_window: Window | None = None
+        selected_target_fingerprint: str | None = None
         selected = connector
         window_ref = None
         selected_window: Window | None = None
-        if connector_for_window is not None:
+        if binding is not None:
+            bound = await _bound_delivery_target(
+                session, opportunity=row, binding=binding, config_reader=config_reader,
+                deliver_to_web=deliver_to_web, connector_for_window=connector_for_window,
+            )
+            if bound is None:
+                row.last_gate_allowed = False
+                row.last_gate_reasons = ["草稿对应的目标暂不可用"]
+                continue
+            bound_target, selected = bound
+            from ling.domains.proactive.binding import target_fingerprint
+
+            selected_target_fingerprint = target_fingerprint(bound_target)
+            if bound_target.channel == "web":
+                bound_web_window = bound_target
+            else:
+                selected_window = bound_target
+                window_ref = bound_target.platform_reference
+        elif connector_for_window is not None:
             target = await session.scalar(select(Window).where(
                 Window.subject_id == row.subject_id,
                 Window.channel.in_(("onebot", "qqbot")),
                 Window.visibility == "subject_private", Window.archived.is_(False),
             ).order_by(Window.last_message_at.desc().nulls_last()).limit(1))
             if target is not None:
-                window_ref = str(target.title or "")
-                selected = await connector_for_window(str(target.channel), window_ref)
+                window_ref = target.platform_reference
+                if target.trusted_instance_key is not None:
+                    selected = await connector_for_window(
+                        str(target.channel), window_ref, instance_key=target.trusted_instance_key,
+                    )
+                else:
+                    selected = await connector_for_window(str(target.channel), window_ref)
                 if selected is not None:
                     capabilities = selected.capabilities()
                     supports_voice = True
@@ -481,7 +836,7 @@ async def dispatch_pending(
             # Web 投递：没有外部渠道时的唯一路径。
             if not deliver_to_web:
                 continue
-            window = await _target_window(
+            window = bound_web_window or await _target_window(
                 session, subject_id=row.subject_id, channel="web"
             )
             if window is None:
@@ -515,6 +870,9 @@ async def dispatch_pending(
                         delivery_state="uncertain",
                     )
                     raise
+                if result == "target_unavailable" and binding is not None:
+                    await _release_pre_send_claim(session, opportunity_id=row.id)
+                    continue
                 await settle(
                     row,
                     state="sent" if result == "delivered" else result,
@@ -525,6 +883,12 @@ async def dispatch_pending(
                 uncertain += result == "uncertain"
                 continue
             if not await reserve(row):
+                continue
+            if binding is not None and not await bound_delivery_target_allowed(
+                session, opportunity_id=row.id, window_id=window.id, config_reader=config_reader,
+                channel="web", expected_target=selected_target_fingerprint or "",
+            ):
+                await _release_pre_send_claim(session, opportunity_id=row.id)
                 continue
             await _append_web_message(
                 session,
@@ -555,7 +919,7 @@ async def dispatch_pending(
                     select(Window)
                     .where(
                         Window.subject_id == row.subject_id,
-                        Window.title == window_ref,
+                        func.coalesce(Window.connector_window_ref, Window.title) == window_ref,
                         Window.channel.in_(("onebot", "qqbot")),
                         Window.visibility == "subject_private",
                         Window.archived.is_(False),
@@ -563,6 +927,12 @@ async def dispatch_pending(
                     .order_by(Window.last_message_at.desc().nulls_last())
                     .limit(1)
                 )
+            if binding is not None and window is not None and not await bound_delivery_target_allowed(
+                session, opportunity_id=row.id, window_id=window.id, config_reader=config_reader,
+                channel=str(window.channel), expected_target=selected_target_fingerprint or "",
+            ):
+                await _release_pre_send_claim(session, opportunity_id=row.id)
+                continue
             try:
                 result = (
                     await voice_dispatch(row, window, selected)
@@ -588,6 +958,12 @@ async def dispatch_pending(
             continue
 
         if not await reserve(row):
+            continue
+        if binding is not None and selected_window is not None and not await bound_delivery_target_allowed(
+            session, opportunity_id=row.id, window_id=selected_window.id, config_reader=config_reader,
+            channel=str(selected_window.channel), expected_target=selected_target_fingerprint or "",
+        ):
+            await _release_pre_send_claim(session, opportunity_id=row.id)
             continue
         delivery = DeliveryService(session)
         probe = _SendProbe(selected)

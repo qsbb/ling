@@ -7,19 +7,13 @@
 3. 「真删：原文和派生数据都从库里清掉」
 
 这个文件钉的是**领域层**的判定（`domains/memory/purge.py`），不经过 HTTP、
-不经过 worker。跑在 sqlite 内存库上：这些用例要验证的是"哪些行被删了、
-哪些字段被换了"，与方言无关；真实 PostgreSQL 上的竞态与端到端在
-`tests/integration/test_memory_purge_flow.py`。
-
-为什么用 sqlite 而不是测试库：单元回归必须能在没有 127.0.0.1:55432 的机器
-上跑。把"领域逻辑对不对"和"这个环境有没有 PG"绑在一起，等于让前者永远
-没法单独跑。
+不经过 worker。数据库行为运行在隔离 PostgreSQL schema 中；真实 PostgreSQL
+上的竞态与端到端在 `tests/integration/test_memory_purge_flow.py`。
 """
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ling.domains.memory.purge import (
     MemoryPurgeError,
@@ -31,7 +25,6 @@ from ling.domains.memory.purge import (
     purge_subject,
     request_purge,
 )
-from ling.infra.db import Base
 from ling.infra.models import (
     AwarenessItemRow,
     CoreMemoryRow,
@@ -53,16 +46,9 @@ CANARY = "他对花生过敏这件事不要提"
 
 
 @pytest.fixture()
-async def session_factory():
-    """一个建好全部表的 sqlite 内存库 + 会话工厂。"""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        await engine.dispose()
+def session_factory(postgres_session_factory):
+    """Use the shared isolated PostgreSQL schema for domain persistence tests."""
+    return postgres_session_factory
 
 
 async def _seed(factory) -> dict[str, str]:  # noqa: ANN001 - 测试夹具，类型从简

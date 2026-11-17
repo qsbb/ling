@@ -106,6 +106,29 @@ export function levelRank(level: string): number {
   }
 }
 
+const ACCESS_PATH_LABELS: Record<string, string> = {
+  '/v1/version/image-update': '读取镜像更新状态',
+  '/v1/version': '读取当前版本',
+  '/v1/health': '检查服务健康状态',
+  '/readyz': '检查服务就绪状态',
+};
+
+/** 把常见轮询访问日志改成动作描述，状态码与耗时仍保留用于排查。 */
+export function displayLogMessage(message: string): string {
+  const match = message.match(/^(GET|POST|PUT|PATCH|DELETE) (\/[^ ]*) → (\d{3})(?: \(([^)]+)\))?$/);
+  if (!match) return message;
+  if (match[1] !== 'GET') return message;
+  const path = match[2];
+  const status = match[3];
+  const duration = match[4];
+  if (!path || !status) return message;
+  const action = ACCESS_PATH_LABELS[path];
+  if (!action) return message;
+  const code = Number(status);
+  const result = code >= 400 ? '失败' : code >= 200 && code < 300 ? '成功' : '';
+  return `${action}${result}（${status}${duration ? `，${duration}` : ''}）`;
+}
+
 function pad(value: number, width = 2): string {
   return String(value).padStart(width, '0');
 }
@@ -191,7 +214,7 @@ export function logLineParts(
     time: formatLogTime(entry.timestamp, withMillis),
     level: entry.level.toUpperCase(),
     logger: entry.logger || '(未命名 logger)',
-    message: entry.message,
+    message: displayLogMessage(entry.message),
   };
 }
 
@@ -775,7 +798,9 @@ export function LogsList({ items, level, showLogger, showMillis = true, kind }: 
             </time>
             <span className={`logs__level logs__level--${tone}`}>{parts.level}</span>
             {showLogger ? <span className="logs__logger">{parts.logger}</span> : null}
-            <span className="logs__message">{parts.message}</span>
+            <span className="logs__message" title={parts.message !== entry.message ? entry.message : undefined}>
+              {parts.message}
+            </span>
           </li>
         );
       })}

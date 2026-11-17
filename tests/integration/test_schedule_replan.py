@@ -620,6 +620,11 @@ async def test_replan_accept_rewrites_only_the_scope(web_env: TestEnv) -> None: 
     """接受提议：区间外逐字段不变、区间内换段、plan_id 不变、revision+1、不写经历。"""
     await _seed_routine()
     ids = await _seed_day()
+    original_success_time = _at(8 * 60)
+    async with session_scope() as session:
+        plan = await session.get(DayPlanRow, ids["plan"])
+        assert plan is not None
+        plan.last_model_outline_at = original_success_time
     before = await _snapshots(ids["plan"])
 
     outcome, router = await _replan(
@@ -642,6 +647,7 @@ async def test_replan_accept_rewrites_only_the_scope(web_env: TestEnv) -> None: 
     plan = await _plan_row(ids["plan"])
     assert str(plan.id) == ids["plan"], "plan_id 必须稳定"
     assert plan.revision == 2
+    assert plan.last_model_outline_at == original_success_time
 
     after = await _snapshots(ids["plan"])
     # 区间外：18:00 的晚饭、两段预计睡眠，逐字段不变

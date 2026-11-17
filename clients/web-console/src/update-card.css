@@ -173,6 +173,96 @@
   min-width: 0;
 }
 
+.update-progress {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.update-progress__elapsed {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.update-progress__step {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+
+.update-progress__marker {
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+
+.update-progress__step--done {
+  color: var(--success, #39765c);
+}
+
+.update-progress__step--done .update-progress__marker {
+  background: currentColor;
+}
+
+.update-progress__step--current {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.update-progress__step--current .update-progress__marker {
+  border: 2px solid var(--accent);
+  background: var(--accent);
+}
+
+.update-progress__step--stopped {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.update-progress__state {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+
+.update-progress__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.update-download-source {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.update-download-source label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.update-download-source p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
 .update-details__list {
   list-style: none;
   margin: 0;

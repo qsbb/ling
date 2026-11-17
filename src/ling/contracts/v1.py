@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from datetime import date, datetime
@@ -15,11 +16,31 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 
 SCHEMA_VERSION: Literal["v1"] = "v1"
 
 IdStr = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+def _json_integer(value: Any) -> Any:
+    """JSON Schema 的 integer 也接受数值等于整数的浮点表示。"""
+    if type(value) is float and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
+NonnegativeJsonInteger = Annotated[StrictInt, Field(ge=0), BeforeValidator(_json_integer)]
 
 # 媒体引用：与 ``IdStr`` **故意不同**。
 #
@@ -607,6 +628,142 @@ class ContextContribution(StrictModel):
     token_budget: int = Field(default=0, ge=0)
 
 
+DialoguePolicySource = Literal["global", "instance", "session"]
+DialoguePolicyOriginStatus = Literal["known", "unknown", "not_applicable"]
+
+
+class WindowDialoguePolicyPersonaField(StrictModel):
+    """人格字段允许显式 null，且保留继承状态。"""
+
+    global_value: StrictStr | None
+    instance_override: StrictStr | None
+    has_instance_override: bool
+    session_override: StrictStr | None
+    has_session_override: bool
+    effective: StrictStr | None
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyBooleanField(StrictModel):
+    """布尔字段只接受 JSON boolean。"""
+
+    global_value: StrictBool
+    instance_override: StrictBool | None
+    has_instance_override: bool
+    session_override: StrictBool | None
+    has_session_override: bool
+    effective: StrictBool
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyIntegerField(StrictModel):
+    """预算字段只接受 JSON integer。"""
+
+    global_value: StrictInt
+    instance_override: StrictInt | None
+    has_instance_override: bool
+    session_override: StrictInt | None
+    has_session_override: bool
+    effective: StrictInt
+    source: DialoguePolicySource
+
+
+class WindowDialoguePolicyFields(StrictModel):
+    """六个会话字段分别使用对应的 JSON 类型。"""
+
+    persona_id: WindowDialoguePolicyPersonaField
+    private_may_stay_silent: WindowDialoguePolicyBooleanField
+    group_mention_requires_reply: WindowDialoguePolicyBooleanField
+    group_attention_deferred: WindowDialoguePolicyBooleanField
+    group_turn_budget: WindowDialoguePolicyIntegerField
+    rest_may_skip: WindowDialoguePolicyBooleanField
+
+
+class WindowDialoguePolicyView(StrictModel):
+    """逐字段给出全局、可信实例、会话覆盖与生效值。"""
+
+    field: Literal["private_may_stay_silent"]
+    global_value: StrictBool
+    override: StrictBool | None
+    effective: StrictBool
+    source: DialoguePolicySource
+    fields: WindowDialoguePolicyFields
+    origin_status: DialoguePolicyOriginStatus
+    instance_scope: StrictStr | None
+    instance_id: StrictStr | None
+    global_revision: NonnegativeJsonInteger
+    instance_revision: NonnegativeJsonInteger
+    session_revision: NonnegativeJsonInteger
+
+
+class WindowDialoguePolicyProposed(StrictModel):
+    """一次会话设置修改预览后的值和来源。"""
+
+    override: StrictBool | None
+    effective: StrictBool
+    source: DialoguePolicySource
+    fields: WindowDialoguePolicyFields
+
+
+class WindowDialoguePolicyPreview(StrictModel):
+    """预览包含修改前后的值以及用于确认的短期令牌。"""
+
+    current: WindowDialoguePolicyView
+    proposed: WindowDialoguePolicyProposed
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
+
+
+class WindowOriginBindingCandidate(StrictModel):
+    scope: Literal["onebot", "qqbot"]
+    instance_id: StrictStr
+    display_name: StrictStr
+    enabled: StrictBool
+
+
+class WindowOriginBindingOptions(StrictModel):
+    scope: Literal["onebot", "qqbot"]
+    candidates: list[WindowOriginBindingCandidate]
+    manually_bound: StrictBool
+
+
+class WindowOriginBindingPreview(StrictModel):
+    current: WindowDialoguePolicyView
+    proposed: WindowDialoguePolicyView
+    target: WindowOriginBindingCandidate | None
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyView(StrictModel):
+    """平台实例的逐字段覆盖与当前影响范围摘要。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    scope: Literal["onebot", "qqbot"]
+    instance_id: StrictStr
+    fields: WindowDialoguePolicyFields
+    global_revision: NonnegativeJsonInteger
+    instance_revision: NonnegativeJsonInteger
+    impact_epoch: NonnegativeJsonInteger
+    affected_active_windows: NonnegativeJsonInteger
+    affected_archived_windows: NonnegativeJsonInteger
+    session_shadowed_windows: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyProposed(StrictModel):
+    fields: WindowDialoguePolicyFields
+    affected_active_windows: NonnegativeJsonInteger
+    affected_archived_windows: NonnegativeJsonInteger
+    session_shadowed_windows: NonnegativeJsonInteger
+
+
+class InstanceDialoguePolicyPreview(StrictModel):
+    current: InstanceDialoguePolicyView
+    proposed: InstanceDialoguePolicyProposed
+    preview_token: str = Field(min_length=1, max_length=2048)
+    expires_at: NonnegativeJsonInteger
+
+
 class SessionRecord(StrictModel):
     """会话窗口的权威记录（不是浏览器缓存）。"""
 
@@ -996,12 +1153,27 @@ class DreamCard(StrictModel):
     restricted: bool = False
 
 
+class LifeTimelineUnplannedPeriod(StrictModel):
+    """计划窗口中没有当前计划段覆盖的半开区间。"""
+
+    start_at: datetime
+    end_at: datetime
+
+
+class LifeTimelineUnplanned(StrictModel):
+    """仅描述当前受众可可靠判断的计划窗口。"""
+
+    scope_start_at: datetime
+    scope_end_at: datetime
+    periods: list[LifeTimelineUnplannedPeriod] = Field(default_factory=list)
+
+
 class LifeTimelineOut(StrictModel):
     """`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。
 
-    ``generated_at`` 是**当前版本提交时刻**（`day_plans.updated_at`）；
-    ``outline_due_at`` 是生成到期时刻（D−1 角色本地 21:00）。两者分开：
-    "应当什么时候生成"和"实际上什么时候生成"不是同一件事。
+    ``generated_at`` 沿用旧字段，实际是计划行最后修改时间；失败标记等操作也会
+    修改它。``last_model_outline_at`` 是真实提交过的最近模型大纲时间，旧记录
+    无从确认时为 null。``outline_due_at`` 是生成到期时刻。
     """
 
     schema_version: Literal["v1"] = SCHEMA_VERSION
@@ -1012,6 +1184,9 @@ class LifeTimelineOut(StrictModel):
     revision: int = Field(default=0, ge=0, description="计划版本号；0 = 没有计划行")
     last_error_code: str | None = Field(
         default=None, description="最近一次失败/降级/待复核的原因码（不含正文）"
+    )
+    reason_explanation: str | None = Field(
+        default=None, description="当前失败、降级或待复核原因的自然语言说明"
     )
     display_date: date
     display_timezone: str
@@ -1026,7 +1201,13 @@ class LifeTimelineOut(StrictModel):
     outline_due_at: datetime
     timezone_source: str = Field(description="计划行记录的时区来源；无行时取角色侧解析结果")
     generated_at: datetime | None = None
+    last_model_outline_at: datetime | None = Field(
+        default=None, description="本角色最近一次成功提交模型大纲的时间；无法确认时为 null"
+    )
     segments: list[LifeTimelineSegment] = Field(default_factory=list)
+    unplanned: LifeTimelineUnplanned | None = Field(
+        default=None, description="可判断的未安排时段；计划不可用或受众无法核实时为 null"
+    )
     facts: list[LifeTimelineFact] = Field(default_factory=list)
     intents: list[DayIntentSummary] = Field(default_factory=list)
     horizon_unplanned: bool = Field(
@@ -1418,6 +1599,8 @@ class ImageUpdateTaskRow(CompatModel):
     version: str | None = None
     # 失败码（白名单内）；成功/未失败为 null。
     failed_code: str | None = None
+    # 旧任务可能没有记录下载方式。
+    download_source: str | None = None
 
 
 class ImageUpdateCatalogDetails(CompatModel):
@@ -1504,6 +1687,9 @@ class ImageUpdateUpdaterDetails(CompatModel):
     state: str | None = None
     protocol: int | None = None
     version: str | None = None
+    # None 表示旧更新器未报告，True 只表示配置格式有效。
+    mirror_available: bool | None = None
+    download_sources: list[str] | None = None
 
 
 class ImageUpdateBackupGateDetails(CompatModel):
@@ -1854,6 +2040,8 @@ __all__ = [
     "LifeTimelineFact",
     "LifeTimelineOut",
     "LifeTimelineSegment",
+    "LifeTimelineUnplanned",
+    "LifeTimelineUnplannedPeriod",
     "MemoryProposal",
     "Modality",
     "ModelRole",

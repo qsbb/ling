@@ -11,11 +11,17 @@ import re
 import secrets
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.persona.scenarios import clean_overrides
-from ling.infra.models import Persona, Window, utcnow
+from ling.infra.models import (
+    InstanceDialogueOverride,
+    Persona,
+    Window,
+    WindowDialogueOverride,
+    utcnow,
+)
 
 logger = logging.getLogger("ling.domains.persona")
 
@@ -228,6 +234,28 @@ class PersonaInUseError(PersonaConflictError):
         self.in_use_windows = in_use_windows
 
 
+class PersonaSessionOverrideError(PersonaConflictError):
+    """一个或多个会话设置显式引用了该人格。"""
+
+    def __init__(self, persona_id: str, override_windows: int) -> None:
+        super().__init__(
+            f"{persona_id} 被 {override_windows} 个会话设置显式选择，请先清除这些覆盖"
+        )
+        self.persona_id = persona_id
+        self.override_windows = override_windows
+
+
+class PersonaInstanceOverrideError(PersonaConflictError):
+    """一个或多个平台实例设置显式引用了该人格。"""
+
+    def __init__(self, persona_id: str, override_instances: int) -> None:
+        super().__init__(
+            f"{persona_id} 被 {override_instances} 个平台实例设置显式选择，请先清除这些覆盖"
+        )
+        self.persona_id = persona_id
+        self.override_instances = override_instances
+
+
 # --------------------------------------------------------------------------- #
 # 「当前激活的人格」的**跨域公开入口**
 # --------------------------------------------------------------------------- #
@@ -272,6 +300,23 @@ async def active_persona_view(session: object | None = None) -> PersonaView | No
         return None if row is None else PersonaService._to_view(row)
 
 
+class PersonaIdSnapshot(str):
+    """已经解析的人格 ID，包括明确表示无人格的空字符串。"""
+
+
+class PersonaSnapshot(PersonaIdSnapshot):
+    """平台入站共享的人格内容，首次读取时固定到本次处理结束。"""
+
+    view: PersonaView | None
+    view_loaded: bool
+
+    def __new__(cls, persona_id: str) -> PersonaSnapshot:
+        snapshot = super().__new__(cls, persona_id)
+        snapshot.view = None
+        snapshot.view_loaded = False
+        return snapshot
+
+
 class PersonaService:
     """人格（persona）的**唯一写入方**，多套并存、同一时间只有一套生效。
 
@@ -294,16 +339,20 @@ class PersonaService:
         一样。关键字名也从 ``default_persona_id`` 改成 ``persona_id``：它已经
         不是"默认值"，而是"这一份服务对象是谁"。
         """
-        explicit = persona_id if persona_id is not None else kwargs.pop("persona_id", None)
+        explicit: object = persona_id if persona_id is not None else kwargs.pop("persona_id", None)
         default_param = kwargs.pop("default_persona_id", None)
         if kwargs:
             raise TypeError(f"PersonaService 不认识的参数：{'、'.join(sorted(kwargs))}")
         self._session = session
-        # 显式指定优先；``default_persona_id`` 只为兼容旧关键字名。
-        self._persona_id: str | None = explicit or default_param  # type: ignore[assignment]
+        # 普通空串沿用动态解析；快照空串表示这一轮确定没有人格。
+        self._persona_id: object = (
+            explicit if isinstance(explicit, PersonaIdSnapshot) else explicit or default_param
+        )
 
     async def _resolved_id(self) -> str:
         persona_id = self._persona_id
+        if isinstance(persona_id, PersonaIdSnapshot):
+            return persona_id
         if persona_id:
             return str(persona_id)
         from ling.domains.persona.current import resolve_active_persona_id
@@ -340,7 +389,16 @@ class PersonaService:
         后者会把"切错 id"伪装成"人格被重置了"（新行是空的），而这两件事的
         修法完全不同。
         """
-        pid = persona_id or await self._resolved_id()
+        pid = (
+            persona_id
+            if isinstance(persona_id, PersonaIdSnapshot)
+            else persona_id or await self._resolved_id()
+        )
+        if isinstance(pid, PersonaSnapshot):
+            view = await self.get_or_none(pid)
+            if view is None:
+                raise PersonaNotFoundError(pid)
+            return view
         return self._to_view(await self._row(pid))
 
     async def get_or_none(self, persona_id: str | None = None) -> PersonaView | None:
@@ -349,7 +407,23 @@ class PersonaService:
         给"根本没配人格"的新装用：调用方要把它渲染成"暂无人设"，而不是 404。
         只有**读**允许走这条路——写永远要求行存在。
         """
-        pid = persona_id or await self._resolved_id()
+        pid = (
+            persona_id
+            if isinstance(persona_id, PersonaIdSnapshot)
+            else persona_id or await self._resolved_id()
+        )
+        if isinstance(pid, PersonaSnapshot):
+            if pid.view_loaded:
+                return pid.view
+            try:
+                row = await self._row_or_none(pid)
+                pid.view = None if row is None else self._to_view(row)
+            except Exception:
+                # 决策读失败时，它与回复都沿用无人格结果；下一条消息重试。
+                pid.view_loaded = True
+                raise
+            pid.view_loaded = True
+            return pid.view
         row = await self._row_or_none(pid)
         return None if row is None else self._to_view(row)
 
@@ -501,6 +575,20 @@ class PersonaService:
         in_use = await self._non_empty_window_count(persona_id)
         if in_use:
             raise PersonaInUseError(persona_id, in_use)
+        override_windows = await self._session.scalar(
+            select(func.count())
+            .select_from(WindowDialogueOverride)
+            .where(WindowDialogueOverride.overrides.contains({"persona_id": persona_id}))
+        )
+        if override_windows:
+            raise PersonaSessionOverrideError(persona_id, override_windows)
+        override_instances = await self._session.scalar(
+            select(func.count())
+            .select_from(InstanceDialogueOverride)
+            .where(InstanceDialogueOverride.overrides.contains({"persona_id": persona_id}))
+        )
+        if override_instances:
+            raise PersonaInstanceOverrideError(persona_id, override_instances)
         view = self._to_view(persona)
         await self._session.delete(persona)
         await self._session.flush()
@@ -739,8 +827,10 @@ __all__ = [
     "active_persona_id",
     "active_persona_view",
     "PersonaConflictError",
+    "PersonaInstanceOverrideError",
     "PersonaInUseError",
     "PersonaNotFoundError",
+    "PersonaSessionOverrideError",
     "PersonaService",
     "PersonaView",
     "empty_persona_view",

@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, time
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -685,6 +688,7 @@ async def list_proactive(
     view: str = "participant",
 ) -> dict:
     from ling.api.deps import authorize_message_view
+    from ling.domains.proactive.history import recent_opportunities
 
     operator = authorize_message_view(auth, view)
     service = ProactivityService(session, actor_id=_actor_id(settings))
@@ -693,6 +697,12 @@ async def list_proactive(
     except Exception:  # noqa: BLE001 - 读不到配置就按"未开启"报，不假装已开
         effective_dialogue = None
     pending = await service.pending(auth.user.subject_id)
+    recent = await recent_opportunities(
+        session,
+        actor_id=_actor_id(settings),
+        subject_id=auth.user.subject_id,
+        operator=operator,
+    )
     # **必须真的探测**渠道能力，不能硬编码 False。
     # 原来这里写死 False，于是 gate 永远说"当前渠道不支持主动投递"——
     # 无论 OneBot 配置得多完整，主动联系都不可能出现。
@@ -742,11 +752,16 @@ async def list_proactive(
                 "reason": o.reason,
                 # 生成好的开场白；None 表示还没生成（不是"生成了空的"）
                 "draft_text": o.draft_text if operator or o.output_modality != "voice" else "",
+                "draft_available": o.draft_text is not None,
+                "draft_state": o.draft_state,
+                "draft_origin": o.draft_origin,
                 "output_modality": o.output_modality,
                 "expires_at": o.expires_at.isoformat(),
             }
             for o in pending
+            if operator or o.visibility in {"subject_private", "public"}
         ],
+        "recent": recent,
         "gate": gate.allowed,
         "gate_reasons": gate.reasons,
         # **诚实标记**：候选会被收集，但目前没有任何代码把它变成消息。
@@ -1448,6 +1463,205 @@ async def list_subjects(
         "has_more": offset + len(page) < total,
         "q": needle or None,
     }
+
+
+def _subject_detail_cursor(section: str, row_id: str, at: datetime | None = None) -> str:
+    payload = {"section": section, "id": row_id}
+    if at is not None:
+        payload["at"] = at.isoformat()
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def _parse_subject_detail_cursor(
+    section: str, cursor: str | None
+) -> tuple[str | None, datetime | None]:
+    if cursor is None:
+        return None, None
+    try:
+        if len(cursor) > 1024:
+            raise ValueError
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        row_id = payload["id"]
+        if (
+            payload["section"] != section
+            or not isinstance(row_id, str)
+            or not 1 <= len(row_id) <= 64
+        ):
+            raise ValueError
+        if section == "accounts":
+            return row_id, None
+        at = datetime.fromisoformat(payload["at"])
+        if at.tzinfo is None:
+            raise ValueError
+        return row_id, at
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise LingError(ErrorCode.invalid_request, "分页位置无效", status_code=422) from None
+
+
+@router.get("/accounts/subjects/{subject_id}/details")
+async def subject_details(
+    subject_id: str,
+    auth: CurrentAuth,
+    session: DbSession,
+    settings: SettingsDep,
+    section: Literal["accounts", "interactions", "memories"],
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict:
+    """按需读取一个人的账号、互动或记忆，并在数据库中过滤可见范围。"""
+    from sqlalchemy import and_, exists, or_, select
+
+    from ling.domains.identity.service import IdentityService
+    from ling.domains.memory.purge import open_purge_subjects
+    from ling.infra.models import (
+        ActorAccount,
+        MemoryPurgeTombstone,
+        MemoryRow,
+        Message,
+        RelationshipEvent,
+        Subject,
+        Turn,
+        Window,
+    )
+
+    if not 1 <= limit <= 100:
+        raise LingError(ErrorCode.invalid_request, "limit 必须在 1..100 之间", status_code=422)
+    cursor_id, cursor_at = _parse_subject_detail_cursor(section, cursor)
+    if await session.get(Subject, subject_id) is None:
+        raise LingError(ErrorCode.not_found, "身份不存在", status_code=404)
+
+    # 合并只改变账号的归属视图，不向其他主体授予私有内容的权限。
+    own_subject = subject_id == auth.user.subject_id
+    access = "full"
+    # Each section selects a different ORM model, then projects its own fields.
+    query: Any
+    if section == "accounts":
+        group = await IdentityService(session).subject_group(subject_id)
+        query = select(ActorAccount).where(ActorAccount.subject_id.in_(list(group)))
+        if cursor_id is not None:
+            query = query.where(ActorAccount.id > cursor_id)
+        query = query.order_by(ActorAccount.id)
+    elif section == "interactions":
+        if not own_subject:
+            return {
+                "section": section,
+                "access": "restricted",
+                "items": [],
+                "next_cursor": None,
+            }
+        query = select(RelationshipEvent).where(
+            RelationshipEvent.subject_id == subject_id,
+            RelationshipEvent.actor_id == _actor_id(settings),
+            # 关系事件本身不带受众。只有能追溯到本人私聊且原消息未撤回的
+            # 事件才可展示；缺少轮次或窗口的历史记录保持未知。
+            exists().where(
+                Turn.id == RelationshipEvent.turn_id,
+                Window.id == Turn.window_id,
+                Window.subject_id == subject_id,
+                Window.actor_id == _actor_id(settings),
+                Window.visibility.in_(("subject_private", "window_private", "public")),
+                exists().where(
+                    Message.turn_id == Turn.id,
+                    Message.window_id == Window.id,
+                    Message.role == "user",
+                    or_(
+                        Message.sender_subject_id.is_(None),
+                        Message.sender_subject_id == subject_id,
+                    ),
+                ),
+                ~exists().where(
+                    Message.turn_id == Turn.id,
+                    Message.window_id == Window.id,
+                    Message.role == "user",
+                    Message.retracted_at.is_not(None),
+                ),
+            ),
+        )
+        if cursor_id is not None and cursor_at is not None:
+            query = query.where(
+                or_(
+                    RelationshipEvent.occurred_at < cursor_at,
+                    and_(
+                        RelationshipEvent.occurred_at == cursor_at,
+                        RelationshipEvent.id < cursor_id,
+                    ),
+                )
+            )
+        query = query.order_by(RelationshipEvent.occurred_at.desc(), RelationshipEvent.id.desc())
+    else:
+        group = await IdentityService(session).subject_group(subject_id)
+        if own_subject and await open_purge_subjects(session, subject_ids=list(group)):
+            return {"section": section, "access": "purging", "items": [], "next_cursor": None}
+        access = "full" if own_subject else "public"
+        visible = ("subject_private", "public") if own_subject else ("public",)
+        # 两个字段都要核验：从群聊或私聊得来的内容不能仅因 visibility 标为
+        # public 就跨来源公开。清理墓碑也参与每次查询，避免清理前残留被读到。
+        query = select(MemoryRow).where(
+            MemoryRow.subject_id == subject_id,
+            MemoryRow.retracted.is_(False),
+            MemoryRow.archived_at.is_(None),
+            MemoryRow.visibility.in_(visible),
+            MemoryRow.source_visibility.in_(visible),
+            ~exists().where(
+                MemoryPurgeTombstone.subject_id.in_(list(group)),
+                MemoryPurgeTombstone.state.in_(("pending", "running", "failed")),
+            ),
+        )
+        if cursor_id is not None and cursor_at is not None:
+            query = query.where(
+                or_(
+                    MemoryRow.created_at < cursor_at,
+                    and_(MemoryRow.created_at == cursor_at, MemoryRow.id < cursor_id),
+                )
+            )
+        query = query.order_by(MemoryRow.created_at.desc(), MemoryRow.id.desc())
+
+    rows = list((await session.execute(query.limit(limit + 1))).scalars())
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+        last = page[-1]
+        at = None
+        if section == "interactions":
+            at = last.occurred_at
+        elif section == "memories":
+            at = last.created_at
+        next_cursor = _subject_detail_cursor(section, last.id, at)
+
+    if section == "accounts":
+        items = [{**_account_row(row), "subject_id": row.subject_id} for row in page]
+    elif section == "interactions":
+        items = [
+            {
+                "event_id": row.id,
+                "kind": row.kind,
+                "origin": row.origin,
+                "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+            }
+            for row in page
+        ]
+    else:
+        items = [
+            {
+                "memory_id": row.id,
+                "kind": row.kind,
+                "text": row.text,
+                "visibility": row.visibility,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "valid_until": row.valid_until.isoformat() if row.valid_until else None,
+            }
+            for row in page
+        ]
+    return {"section": section, "access": access, "items": items, "next_cursor": next_cursor}
 
 
 @router.post("/accounts/subjects/merge")

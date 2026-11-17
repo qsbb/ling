@@ -150,17 +150,13 @@ def upgrade() -> None:
 
     # 2) 在途互斥（部分唯一索引）
     #
-    # `postgresql_where` 而不是 `sqlite_where` 之外再写一份：SQLAlchemy 的
-    # `op.create_index` 支持方言专属的 WHERE，两个都给了才能让 SQLite 派的
-    # 测试库也建得出这条索引（本项目的测试库是 PG，但迁移的可移植性不该
-    # 因为"恰好只有 PG"而丢掉）。
+    # PostgreSQL 的部分唯一索引，约束同一证据同时只有一个在途读取。
     op.create_index(
         "uq_media_read_job_active_evidence",
         "media_read_jobs",
         ["evidence_id", "tool_version"],
         unique=True,
         postgresql_where=sa.text("state IN ('pending', 'running')"),
-        sqlite_where=sa.text("state IN ('pending', 'running')"),
     )
 
 

@@ -13,7 +13,6 @@ import os
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -104,24 +103,23 @@ class _FixedRouter:
 
 
 class _TestConfig:
+    def with_session(self, *_args, **_kwargs):  # noqa: ANN201
+        return self
+
     async def read_secret(self, *_args, **_kwargs):  # noqa: ANN201
         return None
 
     async def effective(self):  # noqa: ANN201
-        return SimpleNamespace(
-            # `domains/persona/current.py::effective_persona_id` 会读这个字段
-            # 决定"这一轮用哪套人格"。真实的 `EffectiveConfig` 有它（默认
-            # `"persona_ling"`），替身漏掉会让 draft 阶段直接 AttributeError——
-            # 配置替身必须与真类在**被读到**的字段上保持一致。
-            persona_id="persona_ling",
-            dialogue=SimpleNamespace(
+        from ling.models.registry import bootstrap_config
+
+        config = bootstrap_config(test_mode=True, persona_id="persona_ling")
+        return replace(
+            config,
+            dialogue=replace(
+                config.dialogue,
                 proactive_delivery_enabled=True,
                 proactive_daily_limit=2,
-                quiet_start=(23, 0),
-                quiet_end=(8, 0),
-                voice=SimpleNamespace(kind=None),
-                voice_willingness="natural",
-            )
+            ),
         )
 
 

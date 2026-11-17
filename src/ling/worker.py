@@ -52,6 +52,7 @@ from ling.ports.channel import ChannelConnector
 if TYPE_CHECKING:
     from ling.domains.media.assets import GeneratedMediaService
     from ling.domains.speech.orchestration import SpeechOrchestrator
+    from ling.infra.models import Window
     from ling.ports.config import EffectiveConfig
 
     # `AudioInput` 只出现在 `_load_reference_audio` 的**返回注解**里（本文件
@@ -1219,7 +1220,7 @@ async def _build_video_describer(call_id: str) -> tuple[object | None, Callable[
             ).where(MediaReadJob.call_id == call_id))
         if window is None:
             return None
-        return await _group_reply_connector(str(window.channel or ""), str(window.title or ""))
+        return await _connector_for_window(window)
 
     fetch_media = make_media_fetcher(
         None, connector_loader=source_connector,
@@ -1424,6 +1425,10 @@ async def _run_deferred_turn(
     from ling.infra.security import SecretBox
     from ling.kernel.turn import CancelRegistry, TurnCoordinator
     from ling.settings.service import ConfigService
+    from ling.settings.window_policy import (
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
 
     settings = get_settings()
     router = _MEMORY_ROUTER
@@ -1447,14 +1452,19 @@ async def _run_deferred_turn(
             test_mode_default=settings.test_mode,
             persona_id=settings.persona_id,
         )
-        effective = await config.effective()
-        conversation = ConversationService(
-            session, actor_id=settings.actor_id, persona_id=settings.persona_id
-        )
+        snapshot = await runtime_window_snapshot(config, window_id)
+        effective = snapshot.config
+        conversation = ConversationService(session, actor_id=settings.actor_id)
         turn = await conversation.create_turn(
             window_id,
             client_turn_id=f"deferred:{reply_id}",
             config_revision=effective.revision,
+        )
+        await record_conversation_attempt_snapshot(
+            session,
+            turn_id=turn.id,
+            attempt=int(turn.attempt or 1),
+            snapshot=snapshot,
         )
         turn_id = turn.id
 
@@ -1482,7 +1492,7 @@ async def _run_deferred_turn(
         settings=settings,
         router=router,  # type: ignore[arg-type]
         actor_id=settings.actor_id,
-        persona_id=settings.persona_id,
+        persona_id=snapshot.persona,
         cancels=CancelRegistry(),
         secret_reader=_SECRET_CACHE.get,
         speak_lease=SpeakLeaseStore(),
@@ -1496,6 +1506,7 @@ async def _run_deferred_turn(
         # 传原文会把旧输入再喂一遍，变成"她又说了一遍"。
         user_text="",
         config=effective,
+        persona_id=snapshot.persona,
         # 延后回复落在**原窗口**所在的渠道上，能力也取自那里。
         # 这个渠道一定是 web/空（`_deferred_window_deliverable` 已把外部渠道
         # 拒成 `channel_unsupported`），所以通常是 None；仍按 window 查，
@@ -1729,14 +1740,14 @@ async def _deliver_deferred_fallback(*, window_id: str, subject_id: str) -> bool
             handled_reason="hard_deadline_fallback",
         )
         channel = str(window.channel or "")
-        window_ref = str(window.title or "")
+        window_ref = window.platform_reference
         is_group = is_group_visibility(window.visibility)
 
     if channel in {"", "web"} or not window_ref:
         # 没有外部渠道：落库即送达（Web 面板就是投递面）。
         return channel in {"", "web"}
 
-    connector = await _group_reply_connector(channel, window_ref)
+    connector = await _connector_for_window(window)
     if connector is None:
         return False
     caps = getattr(connector, "capabilities", None)
@@ -1918,9 +1929,7 @@ async def handle_media_describe(payload: dict) -> None:
                 window = await session.get(Window, window_id)
                 if window is None:
                     return None
-                return await _group_reply_connector(
-                    str(window.channel or ""), str(window.title or ""),
-                )
+                return await _connector_for_window(window)
 
             describer = MediaDescriber(
                 service=service,
@@ -2011,7 +2020,18 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             from ling.capabilities.voice_reply import VoiceReplyService, record_voice_reply
             from ling.contracts.v1 import Origin
             from ling.domains.conversation.service import ConversationService
-            from ling.infra.models import Message
+            from ling.domains.proactive.binding import target_fingerprint
+            from ling.domains.proactive.dispatch import bound_delivery_target_allowed
+            from ling.infra.models import Message, ProactiveDraftBinding
+
+            binding = await session.get(ProactiveDraftBinding, opportunity.id)
+            selected_target = target_fingerprint(window)
+            selected_channel = str(window.channel)
+            if binding is not None and not await bound_delivery_target_allowed(
+                session, opportunity_id=opportunity.id, window_id=window.id, config_reader=config,
+                channel=selected_channel, expected_target=selected_target,
+            ):
+                return "target_unavailable"
 
             effective = await config.effective()
             voice = VoiceReplyService(session, settings=settings)
@@ -2026,6 +2046,9 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             message = cast(Message, await session.get(Message, view.message_id))
             message.output_modality = "voice"
             message.speech_state = "pending"
+            # The next authorization check locks this window in another transaction.
+            # Commit first so this message's window update cannot block that check.
+            await session.commit()
             prepared = await voice.prepare(effective, secret_reader=config.read_secret)
             if prepared is None:
                 message.speech_state = "failed"
@@ -2034,12 +2057,19 @@ async def handle_proactive_dispatch(payload: dict) -> None:
                 return "failed"
 
             async def allowed() -> bool:
-                return await _proactive_voice_allowed(
+                valid = await _proactive_voice_allowed(
                     session,
                     opportunity_id=opportunity.id,
                     window_id=window.id,
                     subject_id=opportunity.subject_id,
+                    config_reader=config,
                 )
+                if valid and binding is not None:
+                    return await bound_delivery_target_allowed(
+                        session, opportunity_id=opportunity.id, window_id=window.id, config_reader=config,
+                        channel=selected_channel, expected_target=selected_target,
+                    )
+                return valid
 
             try:
                 if not await voice.synthesize(
@@ -2059,7 +2089,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
                 delivered = await voice.deliver(
                     message,
                     connector=connector,
-                    window_ref=str(window.title or ""),
+                    window_ref=window.platform_reference,
                     subject_id=opportunity.subject_id,
                     is_group=False,
                 )
@@ -2129,8 +2159,7 @@ async def handle_proactive_draft(payload: dict) -> None:
     "她今天为什么突然找我"。所以先让草稿可观察：生成出来存进 draft_text，
     让人看到"她会说什么"，确认之后再开真发送。
     """
-    from ling.domains.persona.service import PersonaService
-    from ling.domains.proactive.draft import draft_pending
+    from ling.domains.proactive.bound_draft import draft_bound_pending
     from ling.infra.security import SecretBox
     from ling.settings.service import ConfigService
 
@@ -2152,55 +2181,20 @@ async def handle_proactive_draft(payload: dict) -> None:
             SecretBox(settings),
             test_mode_default=settings.test_mode,
         )
-        # 当前激活的人格 = 已发布配置里的 `persona_id`（`domains/persona/current.py`）。
-        # 这里原来取 `settings.persona_id`（环境变量），切人格之后主动草稿
-        # 会继续按旧人设写。`get_or_none`：新装没人格时草稿用空人设。
-        active = await PersonaService(session).get_or_none()
-        view_prompt = str(active.system_prompt or "") if active else ""
-
-        async def proactive_voice_help(opportunity, effective) -> str:
+        async def proactive_voice_help(window, snapshot, channel_audio) -> tuple[str, bool]:  # noqa: ANN001, ARG001
             from ling.capabilities.voice_reply import VoiceReplyService, voice_help
-            from ling.contracts.v1 import Modality
-            from ling.infra.models import Window
 
-            target = await session.scalar(
-                select(Window)
-                .where(
-                    Window.subject_id == opportunity.subject_id,
-                    Window.visibility == "subject_private",
-                    Window.archived.is_(False),
-                    Window.channel.in_(("onebot", "qqbot")),
-                )
-                .order_by(Window.last_message_at.desc().nulls_last())
-                .limit(1)
-            )
-            channel_audio = False
-            if target is not None:
-                connector = await _group_reply_connector(target.channel, str(target.title or ""))
-                if connector is not None:
-                    caps = connector.capabilities()
-                    channel_audio = caps.enabled and caps.media_supported(Modality.audio)
             if not channel_audio:
-                web = await session.scalar(
-                    select(Window.id)
-                    .where(
-                        Window.subject_id == opportunity.subject_id,
-                        Window.channel == "web",
-                        Window.visibility == "subject_private",
-                        Window.archived.is_(False),
-                    )
-                    .limit(1)
+                return "当前没有语音投递渠道。只生成文字草稿，不得输出 [speak]。", False
+            async with session_scope() as voice_session:
+                reader = config.with_session(voice_session)
+                prepared = await VoiceReplyService(voice_session, settings=settings).prepare(
+                    snapshot.config,
+                    secret_reader=reader.read_secret,
                 )
-                channel_audio = web is not None
-            if not channel_audio:
-                return "当前没有语音投递渠道。只生成文字草稿，不得输出 [speak]。"
-            prepared = await VoiceReplyService(session, settings=settings).prepare(
-                effective,
-                secret_reader=config.read_secret,
-            )
             if prepared is None:
-                return "语音合成未配置可用音色。只生成文字草稿，不得输出 [speak]。"
-            return voice_help(effective.dialogue.voice_willingness)
+                return "语音合成未配置可用音色。只生成文字草稿，不得输出 [speak]。", False
+            return voice_help(snapshot.config.dialogue.voice_willingness), True
 
         def interpret_proactive_draft(text: str) -> tuple[str, str, bool]:
             from ling.capabilities.expression_choice import parse_speak_choice
@@ -2212,12 +2206,11 @@ async def handle_proactive_draft(payload: dict) -> None:
                 bool(choice.explicit and choice.rejected),
             )
 
-        stats = await draft_pending(
-            session,
+        stats = await draft_bound_pending(
             actor_id=settings.actor_id,
             router=router,
-            config_reader=config,
-            persona=view_prompt,
+            config=config,
+            connector_for_window=_connector_for_window,
             limit=int(payload.get("limit") or 5),
             voice_help_for=proactive_voice_help,
             interpret_draft=interpret_proactive_draft,
@@ -2308,7 +2301,9 @@ async def handle_embedding_backfill(payload: dict) -> None:
         logger.info("向量补算：写入 %d 条", done)
 
 
-async def _channel_capabilities(channel: str, window_ref: str) -> CapabilityDescriptor | None:
+async def _channel_capabilities(
+    channel: str, window_ref: str, *, instance_key: tuple[str, str] | None = None,
+) -> CapabilityDescriptor | None:
     """这一轮所在渠道的能力声明（喂给 `ContextCompiler` 决定提示词能列哪些动作）。
 
     ``None`` 表示**没有外部渠道**（Web 面板 / 内部直发，见 `channel in {"", "web"}`
@@ -2318,7 +2313,10 @@ async def _channel_capabilities(channel: str, window_ref: str) -> CapabilityDesc
     能力取自**连接器自己的声明**（`connector.capabilities()`），不是别处查表：
     查表就等于又维护一份"哪个渠道支持什么"，而那份表迟早和连接器漂移。
     """
-    connector = await _group_reply_connector(channel, window_ref)
+    if instance_key is not None:
+        connector = await _group_reply_connector(channel, window_ref, instance_key=instance_key)
+    else:
+        connector = await _group_reply_connector(channel, window_ref)
     if connector is None:
         return None
     caps = getattr(connector, "capabilities", None)
@@ -2341,18 +2339,34 @@ async def _window_channel_capabilities(window_id: str) -> CapabilityDescriptor |
         return None
     if window is None:
         return None
-    return await _channel_capabilities(str(window.channel or ""), str(window.title or ""))
+    return await _channel_capabilities(
+        str(window.channel or ""), window.platform_reference,
+        instance_key=window.trusted_instance_key,
+    )
 
 
-async def _group_reply_connector(channel: str, window_ref: str) -> ChannelConnector | None:
-    """按窗口的账号命名空间解析当前已发布且启用的连接器。"""
+async def _group_reply_connector(
+    channel: str, window_ref: str, *, instance_key: tuple[str, str] | None = None,
+) -> ChannelConnector | None:
+    """解析窗口所属的已发布连接器，历史窗口按命名空间查找。"""
     from ling.capabilities.channels import load_window_connector
 
     try:
+        if instance_key is not None:
+            return await load_window_connector(channel, window_ref, instance_key=instance_key)
         return await load_window_connector(channel, window_ref)
     except Exception:  # noqa: BLE001 - 单个实例不可用时保留任务，后续重试
         logger.warning("窗口连接器暂不可用 channel=%s", channel, exc_info=False)
         return None
+
+
+async def _connector_for_window(window: Window) -> ChannelConnector | None:
+    channel = str(window.channel or "")
+    if window.trusted_instance_key is not None:
+        return await _group_reply_connector(
+            channel, window.platform_reference, instance_key=window.trusted_instance_key,
+        )
+    return await _group_reply_connector(channel, window.platform_reference)
 
 
 async def _proactive_voice_allowed(
@@ -2361,18 +2375,37 @@ async def _proactive_voice_allowed(
     opportunity_id: str,
     window_id: str,
     subject_id: str,
+    config_reader: object,
 ) -> bool:
     from ling.infra.models import ProactiveOpportunity, Window
 
     opportunity = await session.get(ProactiveOpportunity, opportunity_id, populate_existing=True)
     window = await session.get(Window, window_id, populate_existing=True)
-    return bool(
+    expires_at = opportunity.expires_at if opportunity is not None else None
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    valid = bool(
         opportunity is not None
         and opportunity.state == "dispatching"
+        and expires_at is not None
+        and expires_at > utcnow()
         and window is not None
         and not window.archived
         and str(window.subject_id) == subject_id
     )
+    if not valid:
+        return False
+
+    from typing import cast
+
+    from ling.infra.db import short_session_scope
+    from ling.settings.service import ConfigService
+    from ling.settings.window_policy import lock_dialogue_config
+
+    async with short_session_scope() as current_session:
+        await lock_dialogue_config(current_session)
+        current = await cast(ConfigService, config_reader).with_session(current_session).effective()
+        return bool(current.dialogue.proactive_delivery_enabled)
 
 
 async def _reply_in_group_window(  # noqa: ANN001
@@ -2381,6 +2414,7 @@ async def _reply_in_group_window(  # noqa: ANN001
     config,
     window,
     result,
+    runtime_snapshot=None,
 ) -> tuple[bool, str]:
     """把「决定回了」变成「真的发出去了」：生成 → 投递。
 
@@ -2398,6 +2432,10 @@ async def _reply_in_group_window(  # noqa: ANN001
     from ling.domains.conversation.service import ConversationService
     from ling.infra.security import new_id
     from ling.kernel.turn import CancelRegistry, TurnCoordinator
+    from ling.settings.window_policy import (
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
 
     settings = get_settings()
     router = _MEMORY_ROUTER
@@ -2407,14 +2445,19 @@ async def _reply_in_group_window(  # noqa: ANN001
     # 生成用的 subject 是**最近开口的那个人**：群窗口的 subject 是主人，
     # 拿它当"对谁"是错误归属（与决策侧取 speaker 保持一致）。
     subject_id = result.speaker_subject_id or window.subject_id
-    conversation = ConversationService(
-        session, actor_id=settings.actor_id, persona_id=settings.persona_id
-    )
-    effective = await config.effective()
+    snapshot = runtime_snapshot or await runtime_window_snapshot(config, window.id)
+    effective = snapshot.config
+    conversation = ConversationService(session, actor_id=settings.actor_id)
     turn = await conversation.create_turn(
         window.id,
         client_turn_id=new_id("attn"),
         config_revision=effective.revision,
+    )
+    await record_conversation_attempt_snapshot(
+        session,
+        turn_id=turn.id,
+        attempt=int(turn.attempt or 1),
+        snapshot=snapshot,
     )
     # 轮次任务跑在**自己的会话**里（`TurnCoordinator._execute` 用 session_scope），
     # 必须先提交，否则它看不到刚建的 turn 行——与 `InboundBridge` 同一条约束。
@@ -2425,7 +2468,7 @@ async def _reply_in_group_window(  # noqa: ANN001
         # `_MEMORY_ROUTER` 只声明成 object（预热失败时为 None，上面已挡住）
         router=router,  # type: ignore[arg-type]
         actor_id=settings.actor_id,
-        persona_id=settings.persona_id,
+        persona_id=snapshot.persona,
         cancels=CancelRegistry(),
         # 群聊自动回复同样走记忆检索：没有这个读取器就只能用环境变量那套。
         secret_reader=_SECRET_CACHE.get,
@@ -2438,9 +2481,11 @@ async def _reply_in_group_window(  # noqa: ANN001
         # 这里把批次文本作为"她正在回什么"的输入。
         user_text=result.batch_text,
         config=effective,
+        persona_id=snapshot.persona,
         # 群回复发生在窗口所属渠道上，能力取自该渠道的连接器声明。
         channel_capabilities=await _channel_capabilities(
-            str(window.channel or ""), str(window.title or ""),
+            str(window.channel or ""), window.platform_reference,
+            instance_key=window.trusted_instance_key,
         ),
     )
 
@@ -2488,13 +2533,13 @@ async def _reply_in_group_window(  # noqa: ANN001
         channel = str(window.channel or "")
         if channel in {"", "web"}:
             return voice_message.speech_state == "ready", ""
-        connector = await _group_reply_connector(channel, str(window.title or ""))
+        connector = await _connector_for_window(window)
         if connector is None:
             return False, "语音来源实例当前不可用"
         delivered = await VoiceReplyService(session, settings=settings).deliver(
             voice_message,
             connector=connector,
-            window_ref=str(window.title or ""),
+            window_ref=window.platform_reference,
             subject_id=subject_id,
             is_group=is_group_visibility(window.visibility),
         )
@@ -2512,15 +2557,15 @@ async def _reply_in_group_window(  # noqa: ANN001
         # 用户下次打开就能看到。没有外部渠道可发，也不算失败。
         return True, ""
 
-    window_ref = str(window.title or "")
+    window_ref = window.platform_reference
     try:
-        connector = await _group_reply_connector(channel, window_ref)
+        connector = await _connector_for_window(window)
     except Exception as exc:  # noqa: BLE001 - 构造失败按"没发出去"处理
         return False, f"渠道 {channel} 连接器构造失败：{type(exc).__name__}"
     if connector is None:
         return False, f"渠道 {channel} 没有可用的连接器"
 
-    window_ref = str(window.title or "")
+    window_ref = window.platform_reference
     if not window_ref:
         return False, "窗口缺少平台标识（window_ref），无法投递"
 
@@ -3170,17 +3215,32 @@ async def handle_attention_tick(payload: dict) -> None:
         reply_delivery_enabled = False
         if due_windows:
             reply_delivery_enabled = await _group_reply_delivery_enabled(config)
+        from ling.settings.window_policy import FixedConfigReader, runtime_window_snapshot
+
         for window_id in due_windows:
-            # 决策上下文由 attention 域统一构造——worker 不再自己拼，
-            # 之前这里硬编码 recent_actor_turns=0，等于防刷屏上限在轮询
-            # 路径上永远不生效。
-            _chooser = make_group_chooser(
-                session=session,
-                actor_id=actor_id,
-                window_id=window_id,
-                router=router,
-                config_reader=config,
-            )
+            snapshot = None
+            try:
+                snapshot = await runtime_window_snapshot(config, window_id)
+            except Exception as exc:  # noqa: BLE001 - 配置不可读时保留未读消息
+                logger.exception("群聊配置快照读取失败 window=%s", window_id)
+
+                async def _snapshot_unavailable(
+                    *_args, error=exc, **_kwargs
+                ):  # noqa: ANN002, ANN003, ANN202
+                    raise error
+
+                _chooser = _snapshot_unavailable
+            else:
+                # 决策上下文由 attention 域统一构造。当前窗口的策略和人格
+                # 固定在一次短读取中，生成阶段复用同一快照。
+                _chooser = make_group_chooser(
+                    session=session,
+                    actor_id=actor_id,
+                    window_id=window_id,
+                    router=router,
+                    config_reader=FixedConfigReader(snapshot.config),
+                    persona_id=snapshot.persona,
+                )
 
             result = await scheduler.poll_window(window_id, chooser=_chooser)
             polls += 1
@@ -3205,6 +3265,7 @@ async def handle_attention_tick(payload: dict) -> None:
                                 config=config,
                                 window=window,
                                 result=result,
+                                runtime_snapshot=snapshot,
                             )
                     except Exception as exc:  # noqa: BLE001 - 一个窗口失败不能拖垮整轮
                         logger.exception("群聊回应生成/投递异常 window=%s", window_id)
@@ -4437,7 +4498,7 @@ def _config_reader(session):  # noqa: ANN001, ANN202
 
 
 def _aware_moment(value: datetime | None) -> datetime | None:
-    """DB 读回的时间可能是 naive（sqlite）；统一按 UTC 解释，别拿它直接相减。"""
+    """Normalize naive timestamps as UTC before doing time arithmetic."""
     if value is None:
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
@@ -5286,15 +5347,15 @@ async def _replan_notice_target(
         .scalars()
         .first()
     )
-    if row is None or not row.title:
+    if row is None or not row.platform_reference:
         return None
     if channel and str(row.channel or "") != channel:
         return None
-    parsed = split_window_ref(str(row.title))
+    parsed = split_window_ref(row.platform_reference)
     if parsed is None:
         return None
     _instance, kind, _target = parsed
-    return str(row.title), str(row.subject_id or ""), kind == "group"
+    return row.platform_reference, str(row.subject_id or ""), kind == "group"
 
 
 async def _send_replan_notice(
@@ -5389,9 +5450,7 @@ async def _send_replan_notice(
 
         async with session_scope() as session:
             window = await session.get(Window, window_id)
-        connector = (await _group_reply_connector(
-            str(window.channel or ""), str(window.title or ""),
-        )) if window is not None else None
+        connector = await _connector_for_window(window) if window is not None else None
     except Exception:  # noqa: BLE001 - 无法定位渠道时保留本地消息
         logger.warning("重排回话：渠道解析失败 turn=%s", turn_id, exc_info=True)
         connector = None

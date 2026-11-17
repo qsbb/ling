@@ -89,7 +89,7 @@ def trim_to_sentence(text: str, limit: int = MAX_DRAFT_CHARS) -> str:
 
 
 async def draft_for(
-    session: AsyncSession,
+    session: AsyncSession | None,
     *,
     opportunity: ProactiveOpportunity,
     router: object,

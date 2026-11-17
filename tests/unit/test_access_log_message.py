@@ -192,6 +192,36 @@ async def test_polling_success_is_still_silent(
     assert _completed(caplog) == [], [r.getMessage() for r in caplog.records]
 
 
+async def test_update_polling_is_quiet_only_for_successful_get(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def update_status(request):  # noqa: ANN001, ANN202
+        status = int(request.query_params.get("status", "200"))
+        return JSONResponse({"ok": status == 200}, status_code=status)
+
+    app = Starlette(
+        routes=[Route("/v1/version/image-update", update_status, methods=["GET", "POST"])]
+    )
+    app.add_middleware(BaseHTTPMiddleware, dispatch=observability_middleware)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        with caplog.at_level(logging.INFO, logger=ACCESS_LOGGER):
+            assert (await client.get("/v1/version/image-update")).status_code == 200
+            assert _completed(caplog) == []
+
+            assert (await client.get("/v1/version/image-update?status=302")).status_code == 302
+            assert (await client.get("/v1/version/image-update?status=503")).status_code == 503
+            assert (await client.post("/v1/version/image-update")).status_code == 200
+
+    events = _completed(caplog)
+    assert len(events) == 3
+    assert events[0].getMessage().startswith("读取镜像更新状态 → 302")
+    assert re.fullmatch(
+        r"读取镜像更新状态 → 503（[\d.]+ms，服务不可用）", events[1].getMessage()
+    )
+    assert events[2].getMessage().startswith("POST /v1/version/image-update → 200（")
+
+
 async def test_include_router_prefix_is_restored(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

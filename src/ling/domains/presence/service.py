@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +29,9 @@ from ling.domains.evidence import FACT_KINDS, EvidenceKind
 from ling.domains.fallback import DependencyState, DependencyValue, ResolvedInput
 from ling.infra.models import PresenceState, SceneCommitRow, utcnow
 from ling.ports.config import LifePolicy
+
+if TYPE_CHECKING:
+    from sqlalchemy.dialects.postgresql.dml import Insert as PostgreSQLInsert
 
 # 场景状态。``unknown`` 是**合法且常用**的答案：
 # 没有证据时就说不知道，不硬编一个"我在看书"。
@@ -229,17 +233,31 @@ class PresenceService:
 
     async def _row(self) -> PresenceState:
         row = await self._session.get(PresenceState, self._actor_id)
-        if row is None:
-            row = PresenceState(
-                actor_id=self._actor_id,
-                energy=70,
-                social_load=20,
-                settled_at=utcnow(),
-                revision=0,
-            )
-            self._session.add(row)
-            await self._session.flush()
-        return row
+        if row is not None:
+            return row
+
+        values = {
+            "actor_id": self._actor_id,
+            "energy": 70,
+            "social_load": 20,
+            "settled_at": utcnow(),
+            "revision": 0,
+        }
+        if self._session.get_bind().dialect.name != "postgresql":
+            raise RuntimeError("状态初始化需要 PostgreSQL")
+        from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+
+        statement: PostgreSQLInsert = postgresql_insert(PresenceState)
+
+        # A concurrent transaction may have inserted this actor after our read.
+        # Keep its values and leave the transaction boundary to the caller.
+        await self._session.execute(
+            statement.values(**values)
+            .on_conflict_do_nothing(index_elements=[PresenceState.actor_id])
+        )
+        return (await self._session.execute(
+            select(PresenceState).where(PresenceState.actor_id == self._actor_id)
+        )).scalar_one()
 
     async def settle(
         self, *, now: datetime | None = None, asleep: bool = False

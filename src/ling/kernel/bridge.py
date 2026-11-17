@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.audit import behavior_event, hash_account_ref
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from ling.config import Settings
     from ling.infra.models import Turn
     from ling.ports.channel import ChannelConnector
+    from ling.settings.window_policy import RuntimeWindowSnapshot
 
 logger = logging.getLogger("ling.kernel.bridge")
 
@@ -334,6 +335,10 @@ def describe_timeout(result: TurnResult) -> str:
     )
 
 
+class WindowOriginConflictError(RuntimeError):
+    """历史窗口存在无法自动判定的实例归属。"""
+
+
 class InboundBridge:
     """渠道事件 → 一轮对话 → 回复。"""
 
@@ -355,6 +360,8 @@ class InboundBridge:
         # 与 `_defer_group_attention` 的区别：那个是**配置**说"群消息先放着"，
         # 这个是**这条消息**没有回复资格——哪怕配置允许立即回，也不该开口。
         observe_only: bool = False,
+        # 由可信路由或网关传入稳定实例身份，不从账号命名空间推断。
+        trusted_instance_key: tuple[str, str] | None = None,
         # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`，
         # 真相来源是已发布配置的 `persona_id`）。写死一个 id 等于"在设置里
         # 切换人格之后，入站消息仍然按旧人格处理"。
@@ -376,10 +383,18 @@ class InboundBridge:
         self._group_mention_on_reply = group_mention_on_reply
         self._auto_register_private = auto_register_private
         self._observe_only = observe_only
+        self._trusted_instance_key = trusted_instance_key
         self._persona_id = persona_id
         self._actor_id = actor_id
+        self._runtime_snapshot: RuntimeWindowSnapshot | None = None
 
-    async def handle(self, envelope: InteractionEnvelope, *, resume_message_id: str | None = None) -> BridgeResult:
+    async def handle(
+        self,
+        envelope: InteractionEnvelope,
+        *,
+        resume_message_id: str | None = None,
+        resume_window_id: str | None = None,
+    ) -> BridgeResult:
         # 1) 身份：私聊只接受**已证明**的绑定（不猜）；群聊允许"只认识账号"。        #
         # 原来群里没走过绑定流程的人整条被拒——她只能听见已绑定的人说话，
         # 等于在有别人的群里是聋的。现在群里自动建 known 级 subject：
@@ -476,9 +491,35 @@ class InboundBridge:
         window_subject = subject_id
         if is_group:
             window_subject = await identity.owner_subject_id() or subject_id
-        window = await self._ensure_window(
-            subject_id=window_subject, envelope=envelope, is_group=is_group
+        from ling.settings.window_policy import runtime_window_snapshot_in_session
+
+        async with self._session.begin_nested():
+            if resume_window_id is None:
+                window, window_created = await self._ensure_window(
+                    subject_id=window_subject, envelope=envelope, is_group=is_group
+                )
+            else:
+                window = await self._resume_window(
+                    window_id=resume_window_id,
+                    subject_id=window_subject,
+                    envelope=envelope,
+                    is_group=is_group,
+                )
+                window_created = False
+            runtime_snapshot = await runtime_window_snapshot_in_session(
+                self._session, self._config_service(), window.id
+            )
+            if window_created:
+                window.persona_id = str(runtime_snapshot.resolved.persona_id.value or "")
+                await self._session.flush()
+
+        self._runtime_snapshot = runtime_snapshot
+        self._persona_id = runtime_snapshot.persona
+        has_new_audio = resume_message_id is None and any(
+            part.modality.value == "audio" for part in envelope.parts
         )
+        if not has_new_audio:
+            await self._session.commit()
 
         # envelope.parts 是契约里的 InputPart，只有 text 段进正文
         text = "".join(
@@ -507,7 +548,7 @@ class InboundBridge:
         )
 
         audio_ids = []
-        if resume_message_id is None and any(p.modality.value == "audio" for p in envelope.parts):
+        if has_new_audio:
             from ling.domains.media.service import MediaEvidenceService
             from ling.domains.speech.transcription import TranscriptionError, create_job
 
@@ -517,7 +558,7 @@ class InboundBridge:
                 if evidence is not None and evidence.kind == "audio":
                     audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
             if audio_ids and (not is_group or addressed):
-                effective = await self._config_service().effective()
+                effective = runtime_snapshot.config
                 try:
                     job = await create_job(
                         self._session, window_id=window.id, subject_id=subject_id,
@@ -526,7 +567,12 @@ class InboundBridge:
                         mode="send", config=effective,
                         payload={"audio": audio_ids, "text": _MEDIA_MARKERS.sub("", text).strip(),
                                  "envelope": envelope.model_dump(mode="json"),
-                                 "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0]},
+                                 "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0],
+                                 "trusted_instance": (
+                                     {"scope": self._trusted_instance_key[0],
+                                      "instance_id": self._trusted_instance_key[1]}
+                                     if self._trusted_instance_key is not None else None
+                                 )},
                     )
                     if job.source_message_id:
                         await self._remember_platform_message_id(job.source_message_id, envelope)
@@ -536,6 +582,9 @@ class InboundBridge:
                 except TranscriptionError as exc:
                     return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
                                         window_id=window.id, media_evidence_ids=media_ids)
+
+        if has_new_audio:
+            await self._session.commit()
 
         # 群里被 @ 但**没有正文**：等对方补一句。
         # QQ 里「先 @ 再发正文」很常见，立刻决策只能看到孤零零一个 @。
@@ -724,8 +773,7 @@ class InboundBridge:
         conversation = ConversationService(
             self._session, actor_id=self._actor_id, persona_id=self._persona_id
         )
-        config_service = self._config_service()
-        effective = await config_service.effective()
+        effective = runtime_snapshot.config
         turn = await self._ensure_turn(
             conversation,
             window_id=window.id,
@@ -782,6 +830,14 @@ class InboundBridge:
             window_id=window.id,
             message_id=user_row.message_id,
         )
+        from ling.settings.window_policy import record_conversation_attempt_snapshot
+
+        await record_conversation_attempt_snapshot(
+            self._session,
+            turn_id=turn.id,
+            attempt=int(turn.attempt or 1),
+            snapshot=runtime_snapshot,
+        )
         # 轮次任务用自己的会话，必须先提交，否则后台看不到 turn 行
         await self._session.commit()
 
@@ -792,6 +848,7 @@ class InboundBridge:
             turn_id=turn.id,
             text=text,
             effective=effective,
+            persona_id=runtime_snapshot.persona,
             # "instance:external_id" —— 记忆按它记录来源账号
             source_account=f"{envelope.connector_instance}:{envelope.account_ref or ''}",
             # **这一条消息**里的称呼（群名片优先）。必须透传到
@@ -1408,37 +1465,158 @@ class InboundBridge:
         subject_id: str,
         envelope: InteractionEnvelope,
         is_group: bool,
-    ) -> Window:
-        """按渠道窗口标识复用/创建窗口。
-
-        群聊窗口按 ``window_ref`` 找，**不带 subject_id 条件**：
-        同一个群里不同成员必须落到同一个窗口，否则角色看到的是
-        一段段孤立的私聊，无法判断群里的气氛与是否该接话。
-        """
+    ) -> tuple[Window, bool]:
+        """按受信实例和平台目标复用窗口，旧来源只做唯一候选回退。"""
         channel = str(getattr(self._connector, "connector_id", "unknown"))
-        stmt = select(Window).where(
+        reference = str(envelope.window_ref or "")
+        instance_key = self._trusted_instance_key
+        if instance_key is not None:
+            scope, instance_id = instance_key
+            if scope != channel or not instance_id:
+                raise ValueError("平台入站实例身份与连接器协议不匹配")
+            await self._ensure_connector_instance(scope, instance_id)
+
+        lock_key = "ling-window-origin:" + ":".join(
+            (self._actor_id, channel, "group" if is_group else subject_id, reference)
+        )
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": lock_key},
+        )
+        return await self._find_or_create_window(
+            subject_id=subject_id,
+            envelope=envelope,
+            is_group=is_group,
+            channel=channel,
+            instance_key=instance_key,
+        )
+
+    async def _resume_window(
+        self,
+        *,
+        window_id: str,
+        subject_id: str,
+        envelope: InteractionEnvelope,
+        is_group: bool,
+    ) -> Window:
+        """转写恢复只能回到原任务所属的会话。"""
+        window = await self._session.get(Window, window_id, populate_existing=True)
+        channel = str(getattr(self._connector, "connector_id", "unknown"))
+        reference = str(envelope.window_ref or "")
+        if (
+            window is None
+            or window.archived
+            or window.actor_id != self._actor_id
+            or window.channel != channel
+            or (window.connector_window_ref or window.title) != reference
+            or window.visibility != ("group_scope" if is_group else "subject_private")
+            or (not is_group and window.subject_id != subject_id)
+        ):
+            raise WindowOriginConflictError("语音来源会话已变化，无法恢复处理")
+        if (
+            self._trusted_instance_key is not None
+            and window.origin_status == "known"
+            and (window.origin_scope, window.origin_instance_id) != self._trusted_instance_key
+        ):
+            raise WindowOriginConflictError("语音来源实例与会话归属不一致")
+        return window
+
+    async def _ensure_connector_instance(self, scope: str, instance_id: str) -> None:
+        from ling.infra.models import DEFAULT_INSTANCE_ID
+        from ling.settings.connector_instances import (
+            ConnectorInstanceError,
+            ConnectorInstanceService,
+        )
+
+        service = ConnectorInstanceService(self._session)
+        try:
+            if instance_id == DEFAULT_INSTANCE_ID:
+                await service.ensure_default(scope=scope)
+            await service.require_live(scope=scope, instance_id=instance_id)
+        except ConnectorInstanceError as exc:
+            raise ValueError("平台入站连接器实例已不存在或已停用") from exc
+
+    async def _find_or_create_window(
+        self,
+        *,
+        subject_id: str,
+        envelope: InteractionEnvelope,
+        is_group: bool,
+        channel: str,
+        instance_key: tuple[str, str] | None,
+    ) -> tuple[Window, bool]:
+        reference = str(envelope.window_ref or "")
+        reference_match = or_(
+            Window.connector_window_ref == reference,
+            and_(Window.connector_window_ref.is_(None), Window.title == reference),
+        )
+        base = select(Window).where(
             Window.actor_id == self._actor_id,
             Window.channel == channel,
-            Window.title == envelope.window_ref,
+            reference_match,
         )
         if not is_group:
-            stmt = stmt.where(Window.subject_id == subject_id)
-        existing = (await self._session.execute(stmt)).scalars().first()
-        if existing is not None:
-            return existing
+            base = base.where(Window.subject_id == subject_id)
+
+        if instance_key is not None:
+            exact_rows = list(
+                (
+                    await self._session.execute(
+                        base.where(
+                            Window.origin_status == "known",
+                            Window.origin_scope == instance_key[0],
+                            Window.origin_instance_id == instance_key[1],
+                        ).limit(2)
+                    )
+                ).scalars()
+            )
+            if len(exact_rows) > 1:
+                raise WindowOriginConflictError("同一平台实例存在多个匹配会话")
+            if exact_rows:
+                return exact_rows[0], False
+
+            bound_to_another = await self._session.scalar(
+                base.where(
+                    Window.origin_status == "known",
+                    Window.origin_manually_bound.is_(True),
+                    or_(
+                        Window.origin_scope != instance_key[0],
+                        Window.origin_instance_id != instance_key[1],
+                    ),
+                ).limit(1)
+            )
+            if bound_to_another is not None:
+                raise WindowOriginConflictError("平台会话已绑定其他实例，请先检查会话归属")
+
+        unknown_rows = list(
+            (
+                await self._session.execute(
+                    base.where(Window.origin_status == "unknown").limit(2)
+                )
+            ).scalars()
+        )
+        if len(unknown_rows) > 1:
+            raise WindowOriginConflictError("历史平台会话来源不唯一，无法安全归属")
+        if unknown_rows:
+            return unknown_rows[0], False
 
         window = Window(
             id=f"win_{__import__('uuid').uuid4().hex[:24]}",
             actor_id=self._actor_id,
-            persona_id=self._persona_id,
+            persona_id=str(self._persona_id or ""),
             subject_id=subject_id,
             title=envelope.window_ref,
             channel=channel,
             visibility="group_scope" if is_group else "subject_private",
+            connector_window_ref=reference,
+            origin_scope=None if instance_key is None else instance_key[0],
+            origin_instance_id=None if instance_key is None else instance_key[1],
+            origin_status="unknown" if instance_key is None else "known",
         )
         self._session.add(window)
         await self._session.flush()
-        return window
+        return window, True
+
 
     async def _defer_group_attention(self) -> bool:
         """当前配置下，普通群消息是否延后决策。读不到配置按**延后**处理——
@@ -1447,6 +1625,8 @@ class InboundBridge:
         """
         if not self._group_attention_deferred:
             return True
+        if self._runtime_snapshot is not None:
+            return bool(self._runtime_snapshot.config.dialogue.group_attention_deferred)
         with contextlib.suppress(Exception):
             effective = await self._config_service().effective()
             return bool(effective.dialogue.group_attention_deferred)
@@ -1486,11 +1666,18 @@ class InboundBridge:
         mentioned = channel_mentioned or text_mentioned or replied_to_actor
         recent = await self._recent_actor_turns(window.id)
         budget = DecisionContext.group_turn_budget
-        # 配置读失败退回默认，不阻断对话——"设置服务挂了"不该表现成"群里永远不接话"
-        with contextlib.suppress(Exception):
-            budget = int(
-                (await self._config_service().effective()).dialogue.group_turn_budget
-            )
+        config_reader = self._config_service()
+        persona_id = self._persona_id
+        if self._runtime_snapshot is not None:
+            from ling.settings.window_policy import FixedConfigReader
+
+            config_reader = FixedConfigReader(self._runtime_snapshot.config)
+            persona_id = self._runtime_snapshot.persona
+            budget = self._runtime_snapshot.resolved.group_turn_budget.value
+        else:
+            # 配置读失败退回默认，不阻断对话。
+            with contextlib.suppress(Exception):
+                budget = int((await config_reader.effective()).dialogue.group_turn_budget)
         ctx = DecisionContext(
             is_group=is_group,
             mentioned=mentioned,
@@ -1507,7 +1694,7 @@ class InboundBridge:
         # 参与、为什么这样决定，现在都可查。
         return await AutonomyTurnService(
             router=self._router,
-            config_reader=self._config_service(),
+            config_reader=config_reader,
             situation_reader=make_situation_reader(
                 self._session,
                 actor_id=self._actor_id,
@@ -1518,7 +1705,7 @@ class InboundBridge:
                 subject_id=None if is_group else subject_id,
             ),
             persona_reader=make_persona_reader(
-                self._session, persona_id=self._persona_id, scenario=scenario_key_for(ctx)
+                self._session, persona_id=persona_id, scenario=scenario_key_for(ctx)
             ),
         ).choose(ctx, text=text)
 
@@ -1586,6 +1773,7 @@ class InboundBridge:
         turn_id: str,
         text: str,
         effective: object,
+        persona_id: str | None = None,
         source_account: str | None = None,
         # 当前这条入站消息的平台 message id（连接器给的）。上下文靠它渲染
         # `[msg_id:…]`——她最常引用的就是"正在回的这条"。
@@ -1616,6 +1804,7 @@ class InboundBridge:
             turn_id=turn_id,
             user_text=text,
             config=effective,
+            persona_id=persona_id,
             # 这一轮所在渠道的能力声明，决定提示词能列哪些动作
             # （`[poke:…]` 只有真的能拍的渠道才该出现）。
             channel_capabilities=self._current_capabilities(),

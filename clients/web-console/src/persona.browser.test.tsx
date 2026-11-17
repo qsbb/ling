@@ -173,6 +173,7 @@ async function openPersona(
   const context = await browser.newContext({
     viewport: { width: 1280, height: 900 },
     reducedMotion: 'reduce',
+    timezoneId: 'Asia/Shanghai',
   });
   contexts.push(context);
   const page = await context.newPage();

@@ -25,7 +25,6 @@ x-logging: &default-logging
 x-app-env: &app-env
   LING_ENV: production
   LING_DATABASE_URL: postgresql+asyncpg://ling:${POSTGRES_PASSWORD:-ling-dev-password}@db:5432/ling
-  LING_REQUIRE_POSTGRES: "1"
   LING_BOOTSTRAP_ADMIN: ${LING_BOOTSTRAP_ADMIN:-ling}
   LING_BOOTSTRAP_ADMIN_PASSWORD: ${LING_BOOTSTRAP_ADMIN_PASSWORD:-}
   LING_TEST_MODE: ${LING_TEST_MODE:-0}
@@ -140,6 +139,7 @@ services:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
         # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        APT_MIRROR_HOST: ${APT_MIRROR_HOST:-}
         # 构建提交标记（/v1/version 的 commit）。install.sh 在构建前解析本检出
         # 的 git HEAD 或宿主执行器传的 LING_COMMIT；为空时运行时报 null，
         # 不伪造。这只是版本标记，不是发布签名。
@@ -252,6 +252,7 @@ services:
         LING_PYTHON_BASE: ${LING_PYTHON_BASE:-python:3.13-slim}
         # PyPI 慢/超时会让构建失败；install.sh 探不通时会自动换成镜像源
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        APT_MIRROR_HOST: ${APT_MIRROR_HOST:-}
         LING_COMMIT: ${LING_COMMIT:-}
     restart: unless-stopped
     command: ["worker"]

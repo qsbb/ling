@@ -55,7 +55,7 @@ _QUIET_PATHS = frozenset(
 #
 # 只静默**成功**的请求：失败（4xx/5xx）仍然要留痕。一个一直 500 的日志接口
 # 恰恰是最需要被看见的——把它一起静掉，问题就只剩界面上的一句"读取失败"。
-_POLLING_PATHS = frozenset({"/v1/logs"})
+_POLLING_PATHS = frozenset({"/v1/logs", "/v1/version/image-update"})
 
 # ---------------------------------------------------------------- 访问日志的措辞
 #
@@ -121,6 +121,7 @@ _ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/v1/channels"): "读取渠道列表",
     ("GET", "/v1/accounts"): "读取账号列表",
     ("GET", "/v1/version"): "读取版本",
+    ("GET", "/v1/version/image-update"): "读取镜像更新状态",
 }
 
 # 4xx/5xx 的一句话解释。表里没有的状态码按类别兜底（见 `_status_hint`）。
@@ -310,10 +311,12 @@ async def observability_middleware(
         response.headers[TRACE_HEADER] = trace_id
 
         path = request.url.path
-        # 轮询端点成功时不记访问日志（见 `_POLLING_PATHS` 的说明）；失败照记。
+        # 轮询 GET 成功时不记访问日志（见 `_POLLING_PATHS` 的说明）；失败照记。
         # 这里用**原始路径**判断，与展示用的模板互不影响。
         quiet = path in _QUIET_PATHS or (
-            path in _POLLING_PATHS and response.status_code < 400
+            request.method == "GET"
+            and path in _POLLING_PATHS
+            and 200 <= response.status_code < 300
         )
         if not quiet:
             template = route_template(request)

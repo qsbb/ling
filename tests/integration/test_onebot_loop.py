@@ -134,6 +134,42 @@ async def test_private_message_gets_a_reply(logged_in: TestEnv) -> None:
     assert str(call["body"]["user_id"]) == QQ_USER
 
 
+async def test_runtime_snapshot_releases_config_guard_before_decision(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """快照完成后必须释放配置守卫，不能把它带进接话决策。"""
+    import asyncio
+
+    from ling.infra.db import get_session_factory
+    from ling.kernel.autonomy import TurnChoice
+    from ling.kernel.bridge import InboundBridge
+    from ling.settings.window_policy import lock_dialogue_config
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    competing_reads: list[bool] = []
+
+    async def decide(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        async with get_session_factory()() as session:
+            await asyncio.wait_for(lock_dialogue_config(session), timeout=1)
+            await session.rollback()
+        competing_reads.append(True)
+        return TurnChoice(
+            respond=False,
+            reason="并发读取验证",
+            skip_code="group_not_addressed",
+        )
+
+    monkeypatch.setattr(InboundBridge, "_decide", decide)
+    response = await _post(logged_in, _event_body(message_id=801))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["accepted"] is True, response.text
+    assert response.json()["decision"] == "silence"
+    assert competing_reads == [True]
+
+
 async def test_reply_is_persisted(logged_in: TestEnv) -> None:
     """机器人的回复必须落库（可审计、可重放）。"""
     fake = FakeOneBot()
@@ -2189,3 +2225,518 @@ async def test_ws_server_bad_frame_does_not_raise(logged_in: TestEnv) -> None:
     assert await server.handle_raw("不是 json") is None
     assert await server.handle_raw(b"{broken") is None
     assert await server.handle_raw("[1,2]") is None
+
+
+async def test_inbound_uses_active_persona_after_switch(logged_in: TestEnv) -> None:
+    """平台入站使用当前发布的人格，并在切换后让下一轮使用新人格。"""
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    original_router = logged_in.app.state.router
+    generated_messages: list[str] = []
+    decision_messages: list[str] = []
+
+    class CapturingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_messages.append("\n".join(message.content or "" for message in messages))
+                payload = '{"respond":true,"reason":"测试","length":"normal"}'
+                yield ModelChunk(delta=payload), StreamOutcome()
+                yield ModelChunk(done=True), StreamOutcome(text=payload)
+                return
+            generated_messages.append("\n".join(message.content or "" for message in messages))
+            async for item in original_router.stream(
+                config, profile=profile, messages=messages, **kwargs
+            ):
+                yield item
+
+    logged_in.app.state.router = CapturingRouter()
+    persona_ids = []
+    for label in ("甲", "乙"):
+        response = await logged_in.client.post(
+            "/v1/personas", json={"display_name": label, "system_prompt": f"人格设定{label}"}
+        )
+        assert response.status_code == 201, response.text
+        persona_ids.append(response.json()["persona_id"])
+
+    for index, (label, persona_id) in enumerate(zip(("甲", "乙"), persona_ids, strict=True)):
+        response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
+        assert response.status_code == 200, response.text
+        response = await _post(logged_in, _event_body(message_id=800 + index))
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+        for prompt in (decision_messages[-1], generated_messages[-1]):
+            assert f"人格设定{label}" in prompt
+            assert f"人格设定{'乙' if label == '甲' else '甲'}" not in prompt
+
+    async with session_scope() as session:
+        windows = list((await session.execute(select(Window).where(Window.channel == "onebot"))).scalars())
+        assert len(windows) == 1
+        assert windows[0].persona_id == persona_ids[0]
+
+
+async def test_inbound_persona_stays_stable_when_switched_during_decision(
+    logged_in: TestEnv,
+) -> None:
+    """处理中切换人格不会改变本条消息，下一条消息会读取新的发布配置。"""
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    persona_ids = []
+    for label in ("甲", "乙"):
+        response = await logged_in.client.post(
+            "/v1/personas", json={"display_name": label, "system_prompt": f"人格设定{label}"}
+        )
+        assert response.status_code == 201, response.text
+        persona_ids.append(response.json()["persona_id"])
+    assert (await logged_in.client.post(f"/v1/personas/{persona_ids[0]}/activate")).status_code == 200
+
+    original_router = logged_in.app.state.router
+    decision_messages: list[str] = []
+    generated_messages: list[str] = []
+
+    class SwitchingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            prompt = "\n".join(message.content or "" for message in messages)
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_messages.append(prompt)
+                if len(decision_messages) == 1:
+                    response = await logged_in.client.post(
+                        f"/v1/personas/{persona_ids[1]}/activate"
+                    )
+                    assert response.status_code == 200, response.text
+                payload = '{"respond":true,"reason":"测试","length":"normal"}'
+                yield ModelChunk(delta=payload), StreamOutcome()
+                yield ModelChunk(done=True), StreamOutcome(text=payload)
+                return
+            generated_messages.append(prompt)
+            async for item in original_router.stream(
+                config, profile=profile, messages=messages, **kwargs
+            ):
+                yield item
+
+    logged_in.app.state.router = SwitchingRouter()
+    for event_id in (810, 811):
+        response = await _post(logged_in, _event_body(message_id=event_id))
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+
+    assert len(decision_messages) == len(generated_messages) == 2
+    for prompt in (decision_messages[0], generated_messages[0]):
+        assert "人格设定甲" in prompt
+        assert "人格设定乙" not in prompt
+    for prompt in (decision_messages[1], generated_messages[1]):
+        assert "人格设定乙" in prompt
+        assert "人格设定甲" not in prompt
+
+
+async def test_inbound_empty_persona_snapshot_survives_midturn_activation(
+    logged_in: TestEnv,
+) -> None:
+    """空人格覆盖时，本条保持无人格，下一条读取新配置。"""
+    from ling.infra.models import ConfigRevision
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    response = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "乙", "system_prompt": "人格设定乙"}
+    )
+    assert response.status_code == 201, response.text
+    persona_id = response.json()["persona_id"]
+    response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
+    assert response.status_code == 200, response.text
+
+    async with session_scope() as session:
+        revision = (
+            await session.execute(
+                select(ConfigRevision).where(ConfigRevision.state == "published")
+            )
+        ).scalar_one()
+        revision.payload = {**revision.payload, "persona_id": ""}
+
+    decision_messages: list[str] = []
+    generated_messages: list[str] = []
+
+    class SwitchingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            prompt = "\n".join(message.content or "" for message in messages)
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_messages.append(prompt)
+                if len(decision_messages) == 1:
+                    response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
+                    assert response.status_code == 200, response.text
+                payload = '{"respond":true,"reason":"测试","length":"normal"}'
+                yield ModelChunk(delta=payload), StreamOutcome()
+                yield ModelChunk(done=True), StreamOutcome(text=payload)
+                return
+            generated_messages.append(prompt)
+            payload = "乙：空人格时的回复" if len(generated_messages) == 1 else "乙：新人格的回复"
+            yield ModelChunk(delta=payload), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=payload)
+
+    logged_in.app.state.router = SwitchingRouter()
+    for event_id in (820, 821):
+        response = await _post(logged_in, _event_body(message_id=event_id))
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+
+    assert len(decision_messages) == len(generated_messages) == 2
+    for prompt in (decision_messages[0], generated_messages[0]):
+        assert "人格设定乙" not in prompt
+    for prompt in (decision_messages[1], generated_messages[1]):
+        assert "人格设定乙" in prompt
+    sent_texts = [
+        "".join(segment["data"]["text"] for segment in call["body"]["message"]
+                if segment["type"] == "text")
+        for call in fake.sent if call["action"] == "send_private_msg"
+    ]
+    assert sent_texts == ["乙：空人格时的回复", "新人格的回复"]
+    async with session_scope() as session:
+        windows = list((await session.execute(select(Window).where(Window.channel == "onebot"))).scalars())
+        assert len(windows) == 1
+        assert windows[0].persona_id == ""
+
+
+async def test_inbound_config_snapshot_failure_releases_event_for_retry(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配置快照不可读时保留事件认领，修复读取后可重投同一事件。"""
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+    from ling.settings.service import ConfigService
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+
+    original_effective = ConfigService.effective
+    attempts = 0
+
+    async def fail_once(self):  # noqa: ANN001, ANN202
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("模拟全局配置快照读取失败")
+        return await original_effective(self)
+
+    monkeypatch.setattr(ConfigService, "effective", fail_once)
+
+    class CapturingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            payload = (
+                '{"respond":true,"reason":"测试","length":"normal"}'
+                if messages and "只输出一个 JSON 对象" in (messages[0].content or "")
+                else "配置恢复后的回复"
+            )
+            yield ModelChunk(delta=payload), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=payload)
+
+    logged_in.app.state.router = CapturingRouter()
+    body = _event_body(message_id=842)
+
+    first = await _post(logged_in, body)
+    assert first.status_code == 200, first.text
+    assert first.json()["accepted"] is False, first.text
+    assert "可重投" in first.json()["reason"], first.text
+    assert not [call for call in fake.sent if call["action"] == "send_private_msg"]
+
+    retried = await _post(logged_in, body)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["delivered"] is True, retried.text
+    assert attempts == 2
+
+    duplicate = await _post(logged_in, body)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True, duplicate.text
+    assert len([call for call in fake.sent if call["action"] == "send_private_msg"]) == 1
+
+
+async def test_persona_service_keeps_ordinary_empty_id_dynamic(logged_in: TestEnv) -> None:
+    """普通空串、None 和兼容关键字仍采用原来的动态解析约定。"""
+    from ling.domains.persona.service import (
+        PersonaIdSnapshot,
+        PersonaNotFoundError,
+        PersonaService,
+    )
+
+    response = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "甲", "system_prompt": "人格设定甲"}
+    )
+    assert response.status_code == 201, response.text
+    persona_id = response.json()["persona_id"]
+    response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
+    assert response.status_code == 200, response.text
+
+    async with session_scope() as session:
+        services = (
+            PersonaService(session),
+            PersonaService(session, None),
+            PersonaService(session, ""),
+            PersonaService(session, persona_id=""),
+            PersonaService(session, default_persona_id=""),
+        )
+        for service in services:
+            view = await service.get_or_none("")
+            assert view is not None
+            assert view.persona_id == persona_id
+            assert (await service.get("")).persona_id == persona_id
+        pinned_empty = PersonaService(session, PersonaIdSnapshot(""))
+        assert await pinned_empty.get_or_none() is None
+        assert await pinned_empty.get_or_none(PersonaIdSnapshot("")) is None
+        with pytest.raises(PersonaNotFoundError):
+            await pinned_empty.get()
+
+
+@pytest.mark.parametrize("change", ["edit", "delete"])
+async def test_inbound_persona_content_stays_stable_during_decision(
+    logged_in: TestEnv, change: str,
+) -> None:
+    """决策后编辑或删除人格时，本条回复仍使用决策时读取的内容。"""
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    first_persona = {
+        "display_name": "前名",
+        "system_prompt": "前版性格设定",
+        "traits": {"口吻": "前版特征"},
+        "boundaries": ["前版边界"],
+        "scenario_prompts": {"private": "前版场景"},
+    }
+    next_persona = {
+        "display_name": "后名",
+        "system_prompt": "后版性格设定",
+        "traits": {"口吻": "后版特征"},
+        "boundaries": ["后版边界"],
+        "scenario_prompts": {"private": "后版场景"},
+    }
+    first = await logged_in.client.post("/v1/personas", json=first_persona)
+    assert first.status_code == 201, first.text
+    first_id = first.json()["persona_id"]
+    second_id = None
+    if change == "delete":
+        second = await logged_in.client.post("/v1/personas", json=next_persona)
+        assert second.status_code == 201, second.text
+        second_id = second.json()["persona_id"]
+    response = await logged_in.client.post(f"/v1/personas/{first_id}/activate")
+    assert response.status_code == 200, response.text
+
+    decision_messages: list[str] = []
+    generated_messages: list[str] = []
+
+    class ChangingPersonaRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            prompt = "\n".join(message.content or "" for message in messages)
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_messages.append(prompt)
+                if len(decision_messages) == 1:
+                    if change == "edit":
+                        response = await logged_in.client.put(
+                            f"/v1/personas/{first_id}", json=next_persona
+                        )
+                        assert response.status_code == 200, response.text
+                    else:
+                        response = await logged_in.client.post(
+                            f"/v1/personas/{second_id}/activate"
+                        )
+                        assert response.status_code == 200, response.text
+                        response = await logged_in.client.delete(f"/v1/personas/{first_id}")
+                        assert response.status_code == 200, response.text
+                payload = '{"respond":true,"reason":"测试","length":"normal"}'
+            else:
+                generated_messages.append(prompt)
+                payload = "前名：第一条回复" if len(generated_messages) == 1 else "后名：第二条回复"
+            yield ModelChunk(delta=payload), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=payload)
+
+    logged_in.app.state.router = ChangingPersonaRouter()
+    for event_id in (830, 831):
+        response = await _post(logged_in, _event_body(message_id=event_id))
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+
+    assert len(decision_messages) == len(generated_messages) == 2
+    for prompt in (decision_messages[0], generated_messages[0]):
+        for text in ("前版性格设定", "前版特征", "前版边界", "前版场景"):
+            assert text in prompt
+        assert "后版性格设定" not in prompt
+    for prompt in (decision_messages[1], generated_messages[1]):
+        for text in ("后版性格设定", "后版特征", "后版边界", "后版场景"):
+            assert text in prompt
+        assert "前版性格设定" not in prompt
+    sent_texts = [
+        "".join(
+            segment["data"]["text"] for segment in call["body"]["message"]
+            if segment["type"] == "text"
+        )
+        for call in fake.sent if call["action"] == "send_private_msg"
+    ]
+    assert sent_texts == ["第一条回复", "第二条回复"]
+
+
+async def test_inbound_persona_read_failure_stays_empty_until_next_message(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """决策阶段读人格失败时，这条消息按无人格处理，下一条可以重新读取。"""
+    from ling.domains.persona.service import PersonaService
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    response = await logged_in.client.post(
+        "/v1/personas", json={"display_name": "甲", "system_prompt": "可恢复的人格正文"}
+    )
+    assert response.status_code == 201, response.text
+    persona_id = response.json()["persona_id"]
+    response = await logged_in.client.post(f"/v1/personas/{persona_id}/activate")
+    assert response.status_code == 200, response.text
+
+    original_read = PersonaService._row_or_none
+    attempts = 0
+
+    async def fail_once(self, requested_id):  # noqa: ANN001, ANN202
+        nonlocal attempts
+        if requested_id == persona_id:
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("模拟人格读取失败")
+        return await original_read(self, requested_id)
+
+    monkeypatch.setattr(PersonaService, "_row_or_none", fail_once)
+    decision_messages: list[str] = []
+    generated_messages: list[str] = []
+
+    class CapturingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            prompt = "\n".join(message.content or "" for message in messages)
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_messages.append(prompt)
+                payload = '{"respond":true,"reason":"测试","length":"normal"}'
+            else:
+                generated_messages.append(prompt)
+                payload = "甲：第一条回复" if len(generated_messages) == 1 else "甲：第二条回复"
+            yield ModelChunk(delta=payload), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=payload)
+
+    logged_in.app.state.router = CapturingRouter()
+    for event_id in (840, 841):
+        response = await _post(logged_in, _event_body(message_id=event_id))
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+
+    assert len(decision_messages) == len(generated_messages) == 2
+    for prompt in (decision_messages[0], generated_messages[0]):
+        assert "可恢复的人格正文" not in prompt
+    for prompt in (decision_messages[1], generated_messages[1]):
+        assert "可恢复的人格正文" in prompt
+    sent_texts = [
+        "".join(
+            segment["data"]["text"] for segment in call["body"]["message"]
+            if segment["type"] == "text"
+        )
+        for call in fake.sent if call["action"] == "send_private_msg"
+    ]
+    assert sent_texts == ["甲：第一条回复", "第二条回复"]
+
+
+@pytest.mark.parametrize("config_state", ["bootstrap", "published", "legacy_published"])
+async def test_inbound_persona_uses_application_bootstrap_or_published_config(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, config_state: str,
+) -> None:
+    """应用默认人格、全局默认人格和发布人格不同时，按真实配置优先级决策并回复。"""
+    from dataclasses import replace
+
+    import ling.config as config_module
+    from ling.domains.persona.service import PersonaService
+    from ling.infra.models import ActorEvent, ConfigRevision
+    from ling.models.router import StreamOutcome
+    from ling.ports.model import ModelChunk
+
+    app_id = "persona_application_bootstrap"
+    global_id = "persona_global_bootstrap"
+    published_id = "persona_published_override"
+    app_prompt = "应用引导人格的独有内容"
+    global_prompt = "进程全局人格的独有内容"
+    published_prompt = "已发布人格的独有内容"
+
+    logged_in.app.state.settings = replace(logged_in.settings, persona_id=app_id)
+    global_settings = replace(logged_in.settings, persona_id=global_id)
+    monkeypatch.setattr(config_module, "get_settings", lambda: global_settings)
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+
+    async with session_scope() as session:
+        assert (await session.execute(
+            select(ConfigRevision).where(ConfigRevision.state == "published")
+        )).scalar_one_or_none() is None
+        personas = PersonaService(session)
+        for persona_id, name, prompt in (
+            (app_id, "应用引导", app_prompt),
+            (global_id, "全局引导", global_prompt),
+            (published_id, "发布人格", published_prompt),
+        ):
+            await personas.create(persona_id=persona_id, display_name=name, system_prompt=prompt)
+
+    if config_state != "bootstrap":
+        response = await logged_in.client.post(f"/v1/personas/{published_id}/activate")
+        assert response.status_code == 200, response.text
+        if config_state == "legacy_published":
+            async with session_scope() as session:
+                revision = (await session.execute(
+                    select(ConfigRevision).where(ConfigRevision.state == "published")
+                )).scalar_one()
+                payload = dict(revision.payload)
+                payload.pop("persona_id")
+                revision.payload = payload
+
+    decision_prompts: list[str] = []
+    generation_prompts: list[str] = []
+
+    class CapturingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003
+            prompt = "\n".join(message.content or "" for message in messages)
+            if messages and "只输出一个 JSON 对象" in (messages[0].content or ""):
+                decision_prompts.append(prompt)
+                output = '{"respond":true,"reason":"测试","length":"normal"}'
+            else:
+                generation_prompts.append(prompt)
+                output = "测试回复"
+            yield ModelChunk(delta=output), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=output)
+
+    logged_in.app.state.router = CapturingRouter()
+    response = await _post(logged_in, _event_body(message_id=850))
+    assert response.status_code == 200, response.text
+    assert response.json()["delivered"] is True, response.text
+    assert len(decision_prompts) == len(generation_prompts) == 1
+
+    expected_id = published_id if config_state == "published" else app_id
+    expected_prompt = published_prompt if config_state == "published" else app_prompt
+    unexpected_prompts = {app_prompt, global_prompt, published_prompt} - {expected_prompt}
+    for prompt in (decision_prompts[0], generation_prompts[0]):
+        assert expected_prompt in prompt
+        assert all(other not in prompt for other in unexpected_prompts)
+
+    async with session_scope() as session:
+        windows = list((await session.execute(
+            select(Window).where(Window.channel == "onebot")
+        )).scalars())
+        events = list((await session.execute(
+            select(ActorEvent).where(ActorEvent.type.like("turn.%"))
+        )).scalars())
+    assert len(windows) == 1 and windows[0].persona_id == expected_id
+    assert len(events) == 1 and events[0].persona_id == expected_id

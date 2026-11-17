@@ -48,6 +48,13 @@ stop_one() {
 
 case "${1:-start}" in
   start)
+    case "${LING_DATABASE_URL:-}" in
+      postgresql://*|postgresql+asyncpg://*) ;;
+      *)
+        echo "请先设置 LING_DATABASE_URL，使用 PostgreSQL 地址，格式为 postgresql:// 或 postgresql+asyncpg://。" >&2
+        exit 2
+        ;;
+    esac
     start_one "api"    "$API_PID"    "python -m ling"        "$PID_DIR/ling8080.log"
     start_one "worker" "$WORKER_PID" "python -m ling.worker" "$PID_DIR/ling_worker.log"
     ;;

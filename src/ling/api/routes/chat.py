@@ -42,6 +42,7 @@ from ling.kernel.autonomy import TurnChoice
 from ling.kernel.decision import TurnDecision
 from ling.kernel.turn import TurnCoordinator, TurnStreamEvent
 from ling.logging_setup import emit_event
+from ling.ports.config import ConfigReader
 
 logger = logging.getLogger("ling.api.chat")
 
@@ -63,15 +64,15 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _coordinator(request: Request, settings: SettingsDep, router_: RouterDep) -> TurnCoordinator:
+def _coordinator(
+    request: Request, settings: SettingsDep, router_: RouterDep, *, persona_id: str | None = None
+) -> TurnCoordinator:
     return TurnCoordinator(
         router=router_,
         settings=settings,
         actor_id=settings.actor_id,
-        # ``None`` = 本轮用**当前激活**的人格（`domains/persona/current.py`）。
-        # 原来是 `settings.persona_id`（环境变量），在设置里切了人格之后
-        # Web 对话仍然按旧人设跑——而且不会报错。
-        persona_id=None,
+        # 未传快照的调用方继续在本轮解析当前激活的人格。
+        persona_id=persona_id,
         cancels=request.app.state.cancels,
         arbiter=getattr(request.app.state, "arbiter", None),
         stream_log=getattr(request.app.state, "stream_log", None),
@@ -124,6 +125,7 @@ async def _choose_by_autonomy(
     actor_id: str,
     window_id: str,
     subject_id: str,
+    persona_id: str | None = None,
 ) -> TurnChoice:
     """Web 路径的「回不回」——与 QQ 用**同一个**选择器。
 
@@ -148,7 +150,7 @@ async def _choose_by_autonomy(
         ),
         persona_reader=make_persona_reader(
             config_session,
-            persona_id=None,  # None = 当前激活的人格
+            persona_id=persona_id,
             scenario=scenario_key_for(ctx),  # type: ignore[arg-type]
         ),
     ).choose(ctx, text=text)  # type: ignore[arg-type]
@@ -163,6 +165,7 @@ async def _evaluate_turn_decision(
     *,
     config_session: object,
     actor_id: str,
+    persona_id: str | None = None,
 ) -> TurnChoice:
     """计算本轮接话决策。
 
@@ -202,6 +205,7 @@ async def _evaluate_turn_decision(
         actor_id=actor_id,
         window_id=window_id,
         subject_id=subject_id,
+        persona_id=persona_id,
     )
 
 
@@ -225,11 +229,11 @@ async def _refresh_config_if_stale(request: Request) -> None:
     watcher = getattr(request.app.state, "revision_watcher", None)
     if watcher is None:
         return
-    from ling.infra.db import session_scope
+    from ling.infra.db import short_session_scope
     from ling.settings.refresh import current_revision, refresh_secrets
 
     try:
-        async with session_scope() as session:
+        async with short_session_scope() as session:
             if not await watcher.stale(session):
                 return
             settings = request.app.state.settings
@@ -850,9 +854,7 @@ async def send_transcribed_turn(
 ) -> StreamingResponse:
     # 配置可能刚被另一个副本改过：按修订号懒刷新密钥，
     # 否则本进程会继续用旧密钥，表现为"有时能聊有时不能"。
-    await _refresh_config_if_stale(request)
     window = await conversation.get_window(session_id, subject_id=auth.user.subject_id)
-    effective = await config.effective()
     text = body.text.strip()
     if not text:
         raise LingError(ErrorCode.invalid_request, "消息不能为空", status_code=422)
@@ -860,10 +862,26 @@ async def send_transcribed_turn(
     existing = await conversation.find_turn(window.id, body.client_turn_id)
     if existing is not None:
         view = await conversation.turn_view(existing)
-        msgs = await conversation.list_messages(window.id, limit=200)
-        actor_msg = next(
-            (m for m in msgs if m.turn_id == existing.id and m.role == "actor"), None
+        from sqlalchemy import select
+
+        from ling.infra.models import ConversationAttemptSnapshot, Message
+
+        attempt = int(existing.attempt or 1)
+        snapshot_record = await conversation.session.get(
+            ConversationAttemptSnapshot, (existing.id, attempt)
         )
+        actor_msg = await conversation.session.scalar(
+            select(Message)
+            .where(
+                Message.turn_id == existing.id,
+                Message.attempt == attempt,
+                Message.role == "actor",
+            )
+            .order_by(Message.sequence.desc())
+            .limit(1)
+        )
+        actor_message = conversation._to_view(actor_msg) if actor_msg is not None else None
+        replay_test_mode = None if snapshot_record is None else snapshot_record.test_mode
 
         async def replay() -> AsyncIterator[bytes]:
             yield _sse(
@@ -872,17 +890,20 @@ async def send_transcribed_turn(
                     "turn_id": existing.id,
                     "state": view.state.value,
                     "replayed": True,
-                    "test_mode": effective.test_mode,
+                    "test_mode": replay_test_mode,
                 },
             )
-            if view.state is TurnState.completed and actor_msg is not None:
+            if view.state is TurnState.completed:
                 yield _sse(
                     "turn.completed",
                     {
                         "turn_id": existing.id,
                         "state": view.state.value,
-                        "model_label": actor_msg.model_label,
-                        "message": actor_msg.to_contract().model_dump(mode="json"),
+                        "model_label": actor_message.model_label if actor_message is not None else None,
+                        "message": (
+                            actor_message.to_contract().model_dump(mode="json")
+                            if actor_message is not None else None
+                        ),
                         "replayed": True,
                     },
                 )
@@ -905,7 +926,7 @@ async def send_transcribed_turn(
                     {
                         "turn_id": existing.id,
                         "state": view.state.value,
-                        "text": actor_msg.to_contract().text if actor_msg else "",
+                        "text": actor_message.to_contract().text if actor_message else "",
                         "error": {
                             "code": (view.error_code or ErrorCode.cancelled).value,
                             "message": "该轮次此前未完成，可点击重试",
@@ -916,6 +937,18 @@ async def send_transcribed_turn(
 
         return StreamingResponse(replay(), media_type="text/event-stream", headers=SSE_HEADERS)
 
+    await _refresh_config_if_stale(request)
+    from ling.settings.window_policy import (
+        FixedConfigReader,
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
+
+    snapshot = await runtime_window_snapshot(config, window.id)
+    effective = snapshot.config
+    persona_id = snapshot.persona
+    decision_config: ConfigReader = FixedConfigReader(effective)
+
     # --- 接话决策：确定性硬规则优先，模型只在弹性区间参与 ---
     # 设计文档 §6.1 候选：回答/澄清/沉默/延后；§1 第 7 条：确定性代码最终裁决。
     decision = await _evaluate_turn_decision(
@@ -923,9 +956,10 @@ async def send_transcribed_turn(
         window,
         text,
         auth.user.subject_id,
-        config,
+        decision_config,
         config_session=conversation.session,
         actor_id=settings.actor_id,
+        persona_id=persona_id,
     )
 
     turn = await conversation.create_turn(
@@ -1033,15 +1067,22 @@ async def send_transcribed_turn(
         return StreamingResponse(
             silent(), media_type="text/event-stream", headers=SSE_HEADERS
         )
+    await record_conversation_attempt_snapshot(
+        conversation.session,
+        turn_id=turn.id,
+        attempt=int(turn.attempt or 1),
+        snapshot=snapshot,
+    )
     # 轮次任务使用自己的数据库会话：必须先提交请求会话，否则后台看不到 turn 行
     await conversation.session.commit()
-    coordinator = _coordinator(request, settings, router_)
+    coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
     queue = await coordinator.run_turn(
         window_id=window.id,
         subject_id=auth.user.subject_id,
         turn_id=turn.id,
         user_text=text,
         config=effective,
+        persona_id=persona_id,
         # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
         # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此
         # 不列 `[poke:…]` 这类渠道动作，因为它们在 Web 上无处执行。
@@ -1281,7 +1322,14 @@ async def retry_turn(
             turn_id, from_states={TurnState.stopping}, to_state=TurnState.stopped
         )
 
-    effective = await config.effective()
+    from ling.settings.window_policy import (
+        record_conversation_attempt_snapshot,
+        runtime_window_snapshot,
+    )
+
+    snapshot = await runtime_window_snapshot(config, window.id)
+    effective = snapshot.config
+    persona_id = snapshot.persona
     messages = await conversation.list_messages(window.id, limit=400)
     user_text = ""
     for msg in reversed(messages):
@@ -1296,15 +1344,22 @@ async def retry_turn(
     # 用户能看到"上一段未完成"和"重新回答"，而不是旧文本凭空消失。
     bumped = await conversation.bump_attempt(turn_id)
     new_attempt = int(bumped.attempt or 1)
+    await record_conversation_attempt_snapshot(
+        conversation.session,
+        turn_id=turn_id,
+        attempt=new_attempt,
+        snapshot=snapshot,
+    )
     await conversation.session.commit()
 
-    coordinator = _coordinator(request, settings, router_)
+    coordinator = _coordinator(request, settings, router_, persona_id=persona_id)
     queue = await coordinator.run_turn(
         window_id=window.id,
         subject_id=auth.user.subject_id,
         turn_id=turn_id,
         user_text=user_text,
         config=effective,
+        persona_id=persona_id,
         attempt=new_attempt,
         # Web 面板**没有外部连接器**：这条路径上"落库即送达"，没有平台可调，
         # 所以没有渠道能力可声明。显式传 None（不是忘了传）——提示词据此

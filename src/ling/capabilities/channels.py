@@ -234,10 +234,19 @@ def connector_for_namespace(app: Any, scope: str, namespace: str) -> ChannelConn
     return runtime.for_namespace(namespace, scope) if runtime is not None else None
 
 
-async def load_window_connector(channel: str, window_ref: str) -> ChannelConnector | None:
+async def load_window_connector(
+    channel: str,
+    window_ref: str,
+    *,
+    instance_key: tuple[str, str] | None = None,
+) -> ChannelConnector | None:
     """worker 从当前已发布配置构造窗口所属实例，停用或删除后拒绝投递。"""
     if channel not in {"", "onebot", "qqbot"}:
         return None
+    if instance_key is not None:
+        scope, instance_id = instance_key
+        if scope not in {"onebot", "qqbot"} or (channel and channel != scope) or not instance_id:
+            return None
     from sqlalchemy import select
 
     from ling.config import get_settings
@@ -259,6 +268,8 @@ async def load_window_connector(channel: str, window_ref: str) -> ChannelConnect
             if not any(row.scope == protocol and row.instance_id == DEFAULT_INSTANCE_ID
                        for row in rows):
                 ids.append((protocol, DEFAULT_INSTANCE_ID))
+        if instance_key is not None:
+            ids = [key for key in ids if key == instance_key]
         connector: ChannelConnector
         for channel, instance_id in ids:
             config = await ov.resolve_field_values(

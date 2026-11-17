@@ -108,7 +108,14 @@ async def qqbot_events(request: Request, instance_id: str = "default") -> JSONRe
 
     from ling.kernel.inbound_intake import process_inbound_payload
 
-    return JSONResponse(await process_inbound_payload(request.app, connector, payload))
+    return JSONResponse(
+        await process_inbound_payload(
+            request.app,
+            connector,
+            payload,
+            trusted_instance_key=("qqbot", instance_id),
+        )
+    )
 
 
 @router.get("/instances/{instance_id}/health")

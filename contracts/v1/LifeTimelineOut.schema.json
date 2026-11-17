@@ -353,6 +353,57 @@
       "title": "LifeTimelineSegment",
       "type": "object"
     },
+    "LifeTimelineUnplanned": {
+      "additionalProperties": false,
+      "description": "仅描述当前受众可可靠判断的计划窗口。",
+      "properties": {
+        "periods": {
+          "items": {
+            "$ref": "#/$defs/LifeTimelineUnplannedPeriod"
+          },
+          "title": "Periods",
+          "type": "array"
+        },
+        "scope_end_at": {
+          "format": "date-time",
+          "title": "Scope End At",
+          "type": "string"
+        },
+        "scope_start_at": {
+          "format": "date-time",
+          "title": "Scope Start At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope_start_at",
+        "scope_end_at"
+      ],
+      "title": "LifeTimelineUnplanned",
+      "type": "object"
+    },
+    "LifeTimelineUnplannedPeriod": {
+      "additionalProperties": false,
+      "description": "计划窗口中没有当前计划段覆盖的半开区间。",
+      "properties": {
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_at",
+        "end_at"
+      ],
+      "title": "LifeTimelineUnplannedPeriod",
+      "type": "object"
+    },
     "TimelineState": {
       "description": "只读生活时间轴的对外状态（设计 §7/§8）。\n\n这几种状态**必须互相区分**，否则\"今天没安排\"和\"读不到今天\"在界面上\n长得一模一样：\n\n- ``empty``：这一天没有计划行——真的没有，不是故障；\n- ``pending``：行已建、大纲还没生成（例如 21:00 到期前）；\n- ``ready``：模型或规则大纲已提交，内容可当计划读；\n- ``degraded``：有行，但内容是规则兜底（模型不可用/输出被拒收）；\n- ``failed``：最近一次生成失败，原因在 ``last_error_code``；\n- ``unavailable``：这一次读取出错，投影拿不到。",
       "enum": [
@@ -369,7 +420,7 @@
   },
   "$id": "https://ling.local/contracts/v1/LifeTimelineOut.schema.json",
   "additionalProperties": false,
-  "description": "`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。\n\n``generated_at`` 是**当前版本提交时刻**（`day_plans.updated_at`）；\n``outline_due_at`` 是生成到期时刻（D−1 角色本地 21:00）。两者分开：\n\"应当什么时候生成\"和\"实际上什么时候生成\"不是同一件事。",
+  "description": "`GET /v1/life/timeline` 的响应：一天的只读时间轴投影。\n\n``generated_at`` 沿用旧字段，实际是计划行最后修改时间；失败标记等操作也会\n修改它。``last_model_outline_at`` 是真实提交过的最近模型大纲时间，旧记录\n无从确认时为 null。``outline_due_at`` 是生成到期时刻。",
   "properties": {
     "actor_timezone": {
       "title": "Actor Timezone",
@@ -485,6 +536,20 @@
       "description": "最近一次失败/降级/待复核的原因码（不含正文）",
       "title": "Last Error Code"
     },
+    "last_model_outline_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "本角色最近一次成功提交模型大纲的时间；无法确认时为 null",
+      "title": "Last Model Outline At"
+    },
     "note": {
       "anyOf": [
         {
@@ -531,6 +596,19 @@
       "title": "Plan Window Start At",
       "type": "string"
     },
+    "reason_explanation": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "当前失败、降级或待复核原因的自然语言说明",
+      "title": "Reason Explanation"
+    },
     "revision": {
       "default": 0,
       "description": "计划版本号；0 = 没有计划行",
@@ -565,6 +643,18 @@
       "description": "计划行记录的时区来源；无行时取角色侧解析结果",
       "title": "Timezone Source",
       "type": "string"
+    },
+    "unplanned": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LifeTimelineUnplanned"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "可判断的未安排时段；计划不可用或受众无法核实时为 null"
     }
   },
   "required": [

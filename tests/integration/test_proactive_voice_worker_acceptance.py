@@ -393,3 +393,80 @@ async def test_worker_archived_window_during_tts_discards_audio(
     assert len(tts.calls) == 1
     assert protocol_wire.sends() == []
     assert len((await _snapshot(candidate))[2]) == 1
+
+
+async def test_unbound_voice_rechecks_delivery_switch_after_tts(
+    logged_in: TestEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol_wire: ProtocolWire,
+) -> None:
+    env = logged_in
+    model = _VoiceModelEndpoint("此路径不应调用草稿模型")
+    tts = _VoiceTtsEndpoint(pause=True)
+    candidate = await _prepare_candidate(
+        env, monkeypatch, channel="web", model=model, tts=tts
+    )
+    protocol_wire.calls.clear()
+    task = asyncio.create_task(worker.handle_proactive_dispatch({}))
+    try:
+        await _wait_for_tts(task, tts)
+        draft = await env.client.put(
+            "/v1/settings/draft",
+            json={"dialogue": {"proactive_delivery_enabled": False}},
+        )
+        assert draft.status_code == 200, draft.text
+        published = await env.client.post(
+            "/v1/settings/publish", json={"revision": draft.json()["revision"]}
+        )
+        assert published.status_code == 200, published.text
+        tts.release.set()
+        await asyncio.wait_for(task, timeout=20)
+    finally:
+        tts.release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    opportunity, claim, messages, jobs = await _snapshot(candidate)
+    assert opportunity.state == "failed" and opportunity.sent_at is None
+    assert claim.result_ref == "v1:failed"
+    assert len(tts.calls) == len(messages) == len(jobs) == 1
+    assert messages[0].speech_state == "cancelled" and messages[0].audio_asset_id is None
+    assert jobs[0].state == "cancelled"
+    assert protocol_wire.sends() == []
+    assert model.requests == []
+
+
+async def test_unbound_voice_rechecks_expiry_after_tts(
+    logged_in: TestEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol_wire: ProtocolWire,
+) -> None:
+    env = logged_in
+    model = _VoiceModelEndpoint("此路径不应调用草稿模型")
+    tts = _VoiceTtsEndpoint(pause=True)
+    candidate = await _prepare_candidate(
+        env, monkeypatch, channel="web", model=model, tts=tts
+    )
+    protocol_wire.calls.clear()
+    task = asyncio.create_task(worker.handle_proactive_dispatch({}))
+    try:
+        await _wait_for_tts(task, tts)
+        async with session_scope() as session:
+            opportunity = await session.get(ProactiveOpportunity, candidate.opportunity_id)
+            assert opportunity is not None
+            opportunity.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        tts.release.set()
+        await asyncio.wait_for(task, timeout=20)
+    finally:
+        tts.release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    opportunity, claim, messages, jobs = await _snapshot(candidate)
+    assert opportunity.state == "failed" and opportunity.sent_at is None
+    assert claim.result_ref == "v1:failed"
+    assert len(tts.calls) == len(messages) == len(jobs) == 1
+    assert messages[0].speech_state == "cancelled" and messages[0].audio_asset_id is None
+    assert jobs[0].state == "cancelled"
+    assert protocol_wire.sends() == []
+    assert model.requests == []

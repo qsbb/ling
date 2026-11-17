@@ -63,12 +63,14 @@ class OneBotWsServer:
         app: object,
         connector: ChannelConnector,
         token: str | None = None,
+        trusted_instance_key: tuple[str, str] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.token = token
         self._app = app
         self._connector = connector
+        self._trusted_instance_key = trusted_instance_key
         self.clients = 0
         self.received = 0
         self.last_error: str | None = None
@@ -122,7 +124,12 @@ class OneBotWsServer:
         self.received += 1
         post_type = payload.get("post_type")
         try:
-            result = await process_inbound_payload(self._app, self._connector, payload)
+            result = await process_inbound_payload(
+                self._app,
+                self._connector,
+                payload,
+                trusted_instance_key=self._trusted_instance_key,
+            )
         except Exception as exc:  # noqa: BLE001 - 单条失败不能断连接
             logger.exception("WS 入站处理失败（连接保持）")
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]

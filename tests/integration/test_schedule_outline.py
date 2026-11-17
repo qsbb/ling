@@ -27,11 +27,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from ling.domains.agenda.intents import (
     CONFIRM_ENTRY_USER,
@@ -46,6 +47,9 @@ from ling.domains.agenda.timeline import (
     REASON_SLEEP_BOUNDARY,
     REPLAN_TODO_TAG,
     Anchor,
+    RoutineSnapshot,
+    StaleRevisionError,
+    _commit_revision,
     build_persona_projection,
     ensure_day_plan,
     intention_short_id,
@@ -317,6 +321,156 @@ async def test_outline_creates_one_row_and_is_idempotent(web_env: TestEnv) -> No
     ordered = sorted(leaves, key=lambda item: item.start_at)
     for previous, current in zip(ordered, ordered[1:], strict=False):
         assert previous.end_at <= current.start_at
+
+
+async def test_model_success_timestamp_survives_failure_and_transaction_rollback(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ARG001
+    commit_time = NOW + timedelta(days=40)
+    clock = [commit_time]
+    monkeypatch.setattr("ling.domains.agenda.timeline.utcnow", lambda: clock[0])
+    await _seed()
+    initial, _ = await _outline(responses=[_valid_outline()])
+    assert initial.state == "ready"
+    row = await _day_row()
+    assert row.last_model_outline_at == commit_time
+    original_revision = row.revision
+
+    clock[0] = commit_time + timedelta(minutes=1)
+    with pytest.raises(RuntimeError, match="roll back"):
+        async with session_scope() as session:
+            result = await ensure_day_plan(
+                session,
+                actor_id=ACTOR,
+                router=_StubRouter([_valid_outline()]),
+                config_reader=_StubConfig(_config()),
+                plan_day=PLAN_DAY,
+                now=NOW + timedelta(minutes=1),
+                timezone=TZ,
+                force=True,
+            )
+            assert result.state == "ready"
+            raise RuntimeError("roll back")
+
+    row = await _day_row()
+    assert row.last_model_outline_at == commit_time
+    assert row.revision == original_revision
+
+    clock[0] = commit_time + timedelta(minutes=2)
+    async with session_scope() as session:
+        degraded = await ensure_day_plan(
+            session,
+            actor_id=ACTOR,
+            router=None,
+            config_reader=None,
+            plan_day=PLAN_DAY,
+            now=NOW + timedelta(minutes=2),
+            timezone=TZ,
+            force=True,
+        )
+    assert degraded.state == "degraded"
+    assert (await _day_row()).last_model_outline_at == commit_time
+
+    clock[0] = commit_time + timedelta(minutes=3)
+    async with session_scope() as session:
+        regenerated = await ensure_day_plan(
+            session,
+            actor_id=ACTOR,
+            router=_StubRouter([_valid_outline()]),
+            config_reader=_StubConfig(_config()),
+            plan_day=PLAN_DAY,
+            now=NOW + timedelta(minutes=3),
+            timezone=TZ,
+            force=True,
+        )
+    assert regenerated.state == "ready"
+    assert (await _day_row()).last_model_outline_at == commit_time + timedelta(minutes=3)
+
+
+async def test_losing_revision_cas_cannot_advance_success_timestamp(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ARG001
+    clock = [NOW]
+    monkeypatch.setattr("ling.domains.agenda.timeline.utcnow", lambda: clock[0])
+    await _seed()
+    initial, _ = await _outline(responses=[_valid_outline()])
+    assert initial.state == "ready"
+    clock[0] = NOW + timedelta(minutes=10)
+
+    async with session_scope() as stale_session:
+        stale_row = await load_day_plan(stale_session, actor_id=ACTOR, plan_day=PLAN_DAY)
+        assert stale_row is not None
+        async with session_scope() as other_session:
+            await other_session.execute(
+                update(DayPlanRow)
+                .where(DayPlanRow.id == stale_row.id)
+                .values(revision=int(stale_row.revision) + 1)
+            )
+        with pytest.raises(StaleRevisionError):
+            await _commit_revision(
+                stale_session,
+                row=stale_row,
+                segments=[],
+                state="ready",
+                source="model",
+                error_code=None,
+                now=NOW + timedelta(minutes=1),
+                routine=RoutineSnapshot(wake_minute=480, rest_minute=1380, revision=1, timezone=TZ),
+                timezone=TZ,
+                timezone_source="explicit",
+                timezone_revision=0,
+            )
+    assert (await _day_row()).last_model_outline_at == NOW
+
+
+async def test_cancelled_outline_preserves_last_successful_model_time(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ARG001
+    clock = [NOW]
+    monkeypatch.setattr("ling.domains.agenda.timeline.utcnow", lambda: clock[0])
+    await _seed()
+    initial, _ = await _outline(responses=[_valid_outline()])
+    assert initial.state == "ready"
+    initial_revision = (await _day_row()).revision
+    clock[0] = NOW + timedelta(minutes=10)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class WaitingRouter:
+        async def stream(self, config, *, profile, messages, **kwargs):  # noqa: ANN001, ANN003, ARG002
+            started.set()
+            await release.wait()
+            yield ModelChunk(delta=_valid_outline()), StreamOutcome()
+
+    async def generate() -> None:
+        async with session_scope() as session:
+            await ensure_day_plan(
+                session,
+                actor_id=ACTOR,
+                router=WaitingRouter(),
+                config_reader=_StubConfig(_config()),
+                plan_day=PLAN_DAY,
+                now=NOW + timedelta(minutes=1),
+                timezone=TZ,
+                force=True,
+            )
+
+    task = asyncio.create_task(generate())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    row = await _day_row()
+    assert row.last_model_outline_at == NOW
+    assert row.revision == initial_revision
+    assert row.state == "ready"
 
 
 # ---------------------------------------------------------------- 坏输出降级

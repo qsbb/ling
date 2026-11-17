@@ -24,6 +24,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { createServer, type ViteDevServer } from 'vite';
 import react from '@vitejs/plugin-react';
+import type {
+  InstanceDialoguePolicy,
+  WindowDialoguePolicyFields,
+  WindowPolicyChange,
+  WindowDialoguePolicySet,
+} from './api';
 import {
   makeConnector,
   makeResponse,
@@ -128,6 +134,8 @@ interface PutCall {
 interface Harness {
   page: Page;
   puts: PutCall[];
+  scopedGenerations: number[];
+  policyCalls: Array<{ method: 'preview' | 'save'; instanceId: string; body: unknown }>;
   /** 列表端点被调用了几次（刷新/新建后要重读）。 */
   listCalls: () => number;
 }
@@ -141,16 +149,87 @@ interface OpenOptions {
    * 键是实例 id；没给的实例 → 返回 `{}`（模拟"服务端没有实例维度"）。
    */
   views?: Record<string, ConnectorsResponse>;
+  policyOverrides?: Record<string, WindowDialoguePolicySet>;
+  /** Mock the scoped config revision check and advance it after each accepted PUT. */
+  advanceScopedGeneration?: boolean;
+  /** Simulate a competing write before the first PUT reaches the server. */
+  conflictFirstPut?: boolean;
   /** 每次 PUT 的返回，按顺序排队；用完一律 500。 */
   plans?: { kind: 'ok'; result: ConnectorChangeResult }[];
 }
 
-function changeResult(instanceId: string): ConnectorChangeResult {
+function instancePolicy(
+  instanceId: string,
+  overrides: WindowDialoguePolicySet = {},
+  revision = 0,
+): InstanceDialoguePolicy {
+  const personaHas = Object.hasOwn(overrides, 'persona_id');
+  const personaValue = personaHas ? overrides.persona_id ?? null : null;
+  const privateHas = Object.hasOwn(overrides, 'private_may_stay_silent');
+  const privateValue = privateHas ? overrides.private_may_stay_silent ?? null : null;
+  const mentionHas = Object.hasOwn(overrides, 'group_mention_requires_reply');
+  const mentionValue = mentionHas ? overrides.group_mention_requires_reply ?? null : null;
+  const deferredHas = Object.hasOwn(overrides, 'group_attention_deferred');
+  const deferredValue = deferredHas ? overrides.group_attention_deferred ?? null : null;
+  const budgetHas = Object.hasOwn(overrides, 'group_turn_budget');
+  const budgetValue = budgetHas ? overrides.group_turn_budget ?? null : null;
+  const restHas = Object.hasOwn(overrides, 'rest_may_skip');
+  const restValue = restHas ? overrides.rest_may_skip ?? null : null;
+  const fields: WindowDialoguePolicyFields = {
+    persona_id: {
+      global_value: 'p-global', instance_override: personaValue, has_instance_override: personaHas,
+      session_override: null, has_session_override: false,
+      effective: personaHas ? personaValue : 'p-global', source: personaHas ? 'instance' : 'global',
+    },
+    private_may_stay_silent: {
+      global_value: true, instance_override: privateValue, has_instance_override: privateHas,
+      session_override: null, has_session_override: false,
+      effective: privateHas ? privateValue as boolean : true, source: privateHas ? 'instance' : 'global',
+    },
+    group_mention_requires_reply: {
+      global_value: true, instance_override: mentionValue, has_instance_override: mentionHas,
+      session_override: null, has_session_override: false,
+      effective: mentionHas ? mentionValue as boolean : true, source: mentionHas ? 'instance' : 'global',
+    },
+    group_attention_deferred: {
+      global_value: true, instance_override: deferredValue, has_instance_override: deferredHas,
+      session_override: null, has_session_override: false,
+      effective: deferredHas ? deferredValue as boolean : true, source: deferredHas ? 'instance' : 'global',
+    },
+    group_turn_budget: {
+      global_value: 4, instance_override: budgetValue, has_instance_override: budgetHas,
+      session_override: null, has_session_override: false,
+      effective: budgetHas ? budgetValue as number : 4, source: budgetHas ? 'instance' : 'global',
+    },
+    rest_may_skip: {
+      global_value: true, instance_override: restValue, has_instance_override: restHas,
+      session_override: null, has_session_override: false,
+      effective: restHas ? restValue as boolean : true, source: restHas ? 'instance' : 'global',
+    },
+  };
+  return {
+    schema_version: 'v1', scope: 'onebot', instance_id: instanceId, fields,
+    global_revision: 1, instance_revision: revision, impact_epoch: 3,
+    affected_active_windows: 2, affected_archived_windows: 1, session_shadowed_windows: 1,
+  };
+}
+
+function applyPolicyChange(
+  current: WindowDialoguePolicySet,
+  change: WindowPolicyChange,
+): WindowDialoguePolicySet {
+  const next: WindowDialoguePolicySet = { ...current };
+  for (const key of change.clear) delete next[key];
+  Object.assign(next, change.set);
+  return next;
+}
+
+function changeResult(instanceId: string, generation = 4): ConnectorChangeResult {
   return {
     schema_version: 'v2',
     operation_id: `crev_${instanceId}`,
     scope: 'onebot',
-    generation: 4,
+    generation,
     status: 'active',
     state: 'active',
     changed: true,
@@ -176,13 +255,27 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
   const page = await context.newPage();
 
   const puts: PutCall[] = [];
+  const scopedGenerations: number[] = [];
+  const policyCalls: Harness['policyCalls'] = [];
   const plans = [...(options.plans ?? [])];
   const items = options.items ?? [DEFAULT_ROW, ROW_A, ROW_B];
+  const views = options.views ?? {};
+  const policyOverrides = Object.fromEntries(
+    Object.entries(options.policyOverrides ?? {
+      alpha: {
+        private_may_stay_silent: false,
+        group_attention_deferred: false,
+        group_turn_budget: 5,
+      },
+    }).map(([id, values]) => [id, { ...values }]),
+  ) as Record<string, WindowDialoguePolicySet>;
+  const policyRevisions: Record<string, number> = {};
   let listCalls = 0;
+  let policyPreviewCount = 0;
 
   // 页面级 `GET /v1/settings/connectors`（不带实例）→ 默认实例的诊断与字段。
   const pageBody = makeResponse({
-    connectors: [makeConnector({ fields: onebotFields() })],
+    connectors: [makeConnector({ generation: 0, fields: onebotFields() })],
   });
 
   await page.route('**/*', async (route) => {
@@ -211,6 +304,12 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
     }
     if (path === '/v1/version') return route.fulfill(json({ current: '0.0.6' }));
     if (path === '/v1/persona') return route.fulfill(json({ name: '灵', display_name: '灵' }));
+    if (path === '/v1/personas') {
+      return route.fulfill(json({ items: [
+        { id: 'p-global', persona_id: 'p-global', name: 'default', display_name: '全局人格' },
+        { id: 'p-alt', persona_id: 'p-alt', name: 'alternate', display_name: '备用人格' },
+      ], total: 2 }));
+    }
     if (path === '/v1/sessions') return route.fulfill(json({ sessions: [] }));
 
     // 实例列表
@@ -229,17 +328,52 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
       );
     }
 
+    const policyMatch = path.match(/^\/v1\/settings\/connectors\/onebot\/instances\/([^/]+)\/dialogue-policy(?:\/(preview))?$/);
+    if (policyMatch) {
+      const instanceId = decodeURIComponent(policyMatch[1] ?? '');
+      const isPreview = policyMatch[2] === 'preview';
+      if (!isPreview && method === 'GET') {
+        return route.fulfill(json(instancePolicy(
+          instanceId,
+          policyOverrides[instanceId] ?? {},
+          policyRevisions[instanceId] ?? 0,
+        )));
+      }
+      if (isPreview && method === 'POST') {
+        const body = JSON.parse(route.request().postData() ?? '{}') as WindowPolicyChange;
+        policyCalls.push({ method: 'preview', instanceId, body });
+        const current = instancePolicy(instanceId, policyOverrides[instanceId] ?? {}, policyRevisions[instanceId] ?? 0);
+        const proposed = instancePolicy(instanceId, applyPolicyChange(policyOverrides[instanceId] ?? {}, body), policyRevisions[instanceId] ?? 0);
+        policyPreviewCount += 1;
+        return route.fulfill(json({
+          current,
+          proposed,
+          preview_token: `policy-preview-${policyPreviewCount}`,
+          expires_at: 9999999999,
+        }));
+      }
+      if (!isPreview && method === 'PUT') {
+        const body = JSON.parse(route.request().postData() ?? '{}') as WindowPolicyChange & { preview_token: string };
+        policyCalls.push({ method: 'save', instanceId, body });
+        policyOverrides[instanceId] = applyPolicyChange(policyOverrides[instanceId] ?? {}, body);
+        policyRevisions[instanceId] = (policyRevisions[instanceId] ?? 0) + 1;
+        return route.fulfill(json(instancePolicy(instanceId, policyOverrides[instanceId], policyRevisions[instanceId])));
+      }
+    }
+
     // 页面级读（不带实例）
     if (path === '/v1/settings/connectors' && method === 'GET') {
       const instanceId = url.searchParams.get('instance_id');
       if (instanceId === null) return route.fulfill(json(pageBody));
       // 按实例读：**回显** instance_id，让面板能自证这份视图属于这个实例。
-      const body = options.views?.[instanceId];
+      const body = views[instanceId];
       if (!body) {
         return route.fulfill(
           json({ error: { code: 'internal', message: `测试没为实例 ${instanceId} 准备视图` } }, 500),
         );
       }
+      const scopedConnector = body.connectors.find((connector) => connector.id === 'onebot');
+      if (scopedConnector) scopedGenerations.push(scopedConnector.generation);
       return route.fulfill(
         json({
           ...body,
@@ -262,6 +396,74 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
         ifMatch: route.request().headers()['if-match'] ?? null,
         body,
       });
+      if (options.advanceScopedGeneration) {
+        const instanceId = url.searchParams.get('instance_id');
+        const currentView = instanceId === null ? undefined : views[instanceId];
+        const currentConnector = currentView?.connectors.find(
+          (connector) => connector.id === 'onebot',
+        );
+        if (!instanceId || !currentView || !currentConnector) {
+          return route.fulfill(
+            json({ error: { code: 'internal', message: '缺少实例版本视图' } }, 500),
+          );
+        }
+        if (options.conflictFirstPut && puts.length === 1) {
+          const generation = currentConnector.generation + 1;
+          views[instanceId] = {
+            ...currentView,
+            connectors: currentView.connectors.map((connector) =>
+              connector.id === 'onebot' ? { ...connector, generation } : connector,
+            ),
+          };
+          return route.fulfill(
+            json({
+              error: {
+                code: 'conflict',
+                message: '配置刚被别处改过，请刷新后再保存',
+                detail: 'generation_conflict',
+              },
+            }, 409),
+          );
+        }
+        if (puts[puts.length - 1]?.ifMatch !== String(currentConnector.generation)) {
+          return route.fulfill(
+            json({
+              error: {
+                code: 'conflict',
+                message: '配置刚被别处改过，请刷新后再保存',
+                detail: 'generation_conflict',
+              },
+            }, 409),
+          );
+        }
+        const generation = currentConnector.generation + 1;
+        views[instanceId] = {
+          ...currentView,
+          connectors: currentView.connectors.map((connector) => {
+            if (connector.id !== 'onebot') return connector;
+            return {
+              ...connector,
+              generation,
+              fields: connector.fields.map((field) => {
+                const key = field.key || field.name;
+                if (Object.hasOwn(body.set, key)) {
+                  return {
+                    ...field,
+                    value: body.set[key] as typeof field.value,
+                    source: 'db' as const,
+                    configured: true,
+                  };
+                }
+                if (body.clear.includes(key)) {
+                  return { ...field, value: null, source: 'default' as const, configured: false };
+                }
+                return field;
+              }),
+            };
+          }),
+        };
+        return route.fulfill(json(changeResult(instanceId, generation), 202));
+      }
       const plan = plans.shift();
       if (!plan) {
         return route.fulfill(
@@ -280,7 +482,7 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
   await page.waitForFunction(() => document.styleSheets.length > 3, undefined, {
     timeout: 20_000,
   });
-  return { page, puts, listCalls: () => listCalls };
+  return { page, puts, scopedGenerations, policyCalls, listCalls: () => listCalls };
 }
 
 /**
@@ -305,10 +507,11 @@ async function selectInstance(page: Page, instanceId: string) {
 }
 
 /** 给某个实例造一份"它自己"的字段视图（API_BASE 值不同，方便分辨）。 */
-function viewFor(apiBase: string): ConnectorsResponse {
+function viewFor(apiBase: string, generation = 0): ConnectorsResponse {
   return makeResponse({
     connectors: [
       makeConnector({
+        generation,
         fields: onebotFields().map((field) =>
           field.key === 'LING_ONEBOT_API_BASE'
             ? { ...field, value: apiBase, source: 'db' as const, configured: true }
@@ -383,6 +586,210 @@ describe('接入器实例：左列表右详情', () => {
     expect(put.url).toBe('/v1/settings/connectors/onebot?instance_id=beta');
     expect(put.body.set).toEqual({ LING_ONEBOT_API_BASE: 'http://192.0.2.30:5700' });
     expect(put.body).not.toHaveProperty('instance_id');
+  }, TIMEOUT);
+
+  it('保存后刷新：同一非默认实例的第二次保存使用 scoped GET 的新 generation', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    expect(scopedGenerations[scopedGenerations.length - 1]).toBe(0);
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    expect(puts[0]?.ifMatch).toBe('0');
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.getByTestId('connector-instance-panel-onebot').waitFor({ timeout: 20_000 });
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.31:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.32:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[1]?.instanceId).toBe('beta');
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
+  }, TIMEOUT);
+
+  it('非默认实例保存后先重读 scoped generation，再允许同页连续保存', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.31:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.32:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[0]?.ifMatch).toBe('0');
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
+  }, TIMEOUT);
+
+  it('409 后刷新状态重读选中实例的 generation，随后保存成功', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, scopedGenerations } = await openInstances({
+      views: { beta: viewFor('http://192.0.2.22:5700', 0) },
+      advanceScopedGeneration: true,
+      conflictFirstPut: true,
+    });
+
+    await selectInstance(page, 'beta');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+    expect(puts[0]?.ifMatch).toBe('0');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('error');
+
+    await page.getByTestId('connector-onebot-notice-reload').click();
+    await expect
+      .poll(() => scopedGenerations[scopedGenerations.length - 1])
+      .toBe(1);
+    await expect
+      .poll(() => page.getByTestId('connector-onebot-note').textContent())
+      .toContain('当前版本 1');
+    await expect
+      .poll(() => inputOf(page, 'LING_ONEBOT_API_BASE').inputValue())
+      .toBe('http://192.0.2.22:5700');
+
+    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.31:5700');
+    await page.getByTestId('connector-onebot-save').click();
+    await page.getByTestId('connector-onebot-notice').waitFor({ timeout: 15_000 });
+
+    expect(puts).toHaveLength(2);
+    expect(puts[1]?.ifMatch).toBe('1');
+    expect(await page.getByTestId('connector-onebot-notice').getAttribute('data-tone')).toBe('ok');
+  }, TIMEOUT);
+
+  it('实例策略保留 false 与显式空人格，并预览后按当前实例提交 set、clear 和令牌', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, policyCalls } = await openInstances({
+      views: {
+        alpha: viewFor('http://192.0.2.21:5700'),
+        beta: viewFor('http://192.0.2.22:5700'),
+      },
+      policyOverrides: {
+        alpha: {
+          private_may_stay_silent: false,
+          group_attention_deferred: false,
+        },
+      },
+    });
+
+    await selectInstance(page, 'alpha');
+    const persona = page.locator('#instance-policy-onebot-alpha-persona_id');
+    const privateSilence = page.locator('#instance-policy-onebot-alpha-private_may_stay_silent');
+    const mentionReply = page.locator('#instance-policy-onebot-alpha-group_mention_requires_reply');
+    const deferredAttention = page.locator('#instance-policy-onebot-alpha-group_attention_deferred');
+    const turnBudget = page.locator('#instance-policy-onebot-alpha-group_turn_budget');
+    const restMaySkip = page.locator('#instance-policy-onebot-alpha-rest_may_skip');
+
+    await expect.poll(() => persona.inputValue()).toBe('inherit');
+    await expect.poll(() => privateSilence.inputValue()).toBe('value:false');
+    await expect.poll(() => mentionReply.inputValue()).toBe('inherit');
+    await expect.poll(() => deferredAttention.inputValue()).toBe('value:false');
+    await expect.poll(() => turnBudget.inputValue()).toBe('inherit');
+    await expect.poll(() => restMaySkip.inputValue()).toBe('inherit');
+    for (const field of [
+      'persona_id',
+      'private_may_stay_silent',
+      'group_mention_requires_reply',
+      'group_attention_deferred',
+      'group_turn_budget',
+      'rest_may_skip',
+    ]) {
+      expect(await page.locator(`#instance-policy-onebot-alpha-${field}`).count()).toBe(1);
+    }
+    expect(await page.locator('#instance-policy-onebot-alpha-private_may_stay_silent')
+      .locator('xpath=..').locator('output').textContent()).toContain('不允许选择沉默 · 平台实例');
+    expect(await page.locator('#instance-policy-onebot-alpha-group_mention_requires_reply')
+      .locator('xpath=..').locator('output').textContent()).toContain('必须回应 · 全局');
+    expect(await page.locator('#instance-policy-onebot-alpha-group_turn_budget')
+      .locator('xpath=..').locator('output').textContent()).toContain('4 次 · 全局');
+    expect(await page.locator('#instance-policy-onebot-alpha-rest_may_skip')
+      .locator('xpath=..').locator('output').textContent()).toContain('允许跳过 · 全局');
+
+    await persona.selectOption('persona:none');
+    await mentionReply.selectOption('value:false');
+    await deferredAttention.selectOption('inherit');
+    await turnBudget.selectOption('value:7');
+    await restMaySkip.selectOption('value:true');
+    await page.getByRole('button', { name: '预览更改' }).click();
+
+    await expect.poll(() => policyCalls.length).toBe(1);
+    expect(policyCalls[0]).toEqual({
+      method: 'preview',
+      instanceId: 'alpha',
+      body: {
+        set: {
+          persona_id: null,
+          group_mention_requires_reply: false,
+          group_turn_budget: 7,
+          rest_may_skip: true,
+        },
+        clear: ['group_attention_deferred'],
+      },
+    });
+    await expect.poll(() => page.getByRole('button', { name: '确认保存' }).isVisible()).toBe(true);
+    expect(await page.locator('.connector-instance-policy__preview').textContent()).toContain('不注入人格');
+    expect(await page.locator('.connector-instance-policy__preview').textContent()).toContain('由模型决定');
+    expect(await page.locator('.connector-instance-policy__preview').textContent()).toContain('7 次 · 平台实例');
+    expect(await page.locator('.connector-instance-policy__preview').textContent()).toContain('允许跳过 · 平台实例');
+
+    await page.getByRole('button', { name: '确认保存' }).click();
+    await expect.poll(() => policyCalls.length).toBe(2);
+    await expect.poll(() => page.getByText('设置已保存。').isVisible()).toBe(true);
+    expect(policyCalls[1]).toEqual({
+      method: 'save',
+      instanceId: 'alpha',
+      body: {
+        set: {
+          persona_id: null,
+          group_mention_requires_reply: false,
+          group_turn_budget: 7,
+          rest_may_skip: true,
+        },
+        clear: ['group_attention_deferred'],
+        preview_token: 'policy-preview-1',
+      },
+    });
+    await expect.poll(() => persona.inputValue()).toBe('persona:none');
+    await expect.poll(() => turnBudget.inputValue()).toBe('value:7');
+    await expect.poll(() => restMaySkip.inputValue()).toBe('value:true');
   }, TIMEOUT);
 
   it('切实例时草稿被重置：A 的未保存输入不会出现在 B 上', async (ctx) => {

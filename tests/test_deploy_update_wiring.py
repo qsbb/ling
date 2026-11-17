@@ -194,7 +194,9 @@ def deploy_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "README.md",
         "alembic.ini",
         "deploy/Dockerfile.api",
+        "deploy/configure_apt_mirror.py",
         "deploy/entrypoint.sh",
+        "deploy/requirements.runtime.lock",
     ):
         _touch(repo / rel, f"# stub {rel}\n")
     for rel in ("src/ling/__init__.py", "connectors/__init__.py", "migrations/versions/.keep"):
@@ -205,6 +207,9 @@ def deploy_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         _touch(web / name, "{}\n")
     _touch(web / "src" / "main.ts", "export {};\n")
     _touch(web / "public" / "robots.txt", "User-agent: *\n")
+    # 阶段标记用例模拟已有部署的升级，确保仍覆盖“先启动并 ready，再切换前端”。
+    _touch(web / "dist" / "index.html", "<!doctype html><title>previous</title>\n")
+    _touch(web / "dist" / "assets" / "previous.js", "console.log('previous');\n")
 
     bin_dir = tmp_path / "bin"
     _write_exe(bin_dir / "pnpm", _PNPM)
@@ -498,14 +503,14 @@ def test_phase_stays_deploy_when_service_start_fails(
     assert "启动失败" in proc.stderr
     assert phase.read_text(encoding="utf-8") == "deploy\n"
     assert "phase-at-up deploy" in calls
-    # 前端不能已经发布（发布在 readyz 之后）。
+    # 已有部署应等 readyz 后再发布，避免新前端配未就绪的后端。
     assert "前端已发布" not in proc.stdout
 
 
 def test_phase_stays_verify_when_readyz_fails(
     deploy_repo: tuple[Path, dict[str, str]], tmp_path: Path
 ) -> None:
-    """容器已起但没就绪：标记停在 verify，前端仍未发布。"""
+    """已有部署的容器没就绪：标记停在 verify，旧前端保持不变。"""
     repo, env = deploy_repo
     phase = tmp_path / "phase"
     proc, calls = run_install(
@@ -521,7 +526,7 @@ def test_phase_stays_verify_when_readyz_fails(
     assert "就绪" in proc.stderr
     assert phase.read_text(encoding="utf-8") == "verify\n"
     assert "phase-at-readyz verify" in calls
-    assert "前端尚未发布" in proc.stdout
+    assert "在线 dist 保持发布前内容" in proc.stdout
 
 
 def test_installer_lock_blocks_concurrent_run(

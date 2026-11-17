@@ -54,25 +54,7 @@ const contexts: BrowserContext[] = [];
 beforeAll(async () => {
   try {
     server = await createServer({
-      // ===== PROBE P5 (temporary: no backend here, let the client middleware answer) =====
-      plugins: [
-        react(),
-        {
-          name: 'probe-sink',
-          configureServer(devServer) {
-            devServer.middlewares.use('/__probe', (req, res) => {
-              let body = '';
-              req.on('data', (chunk) => (body += chunk));
-              req.on('end', () => {
-                console.log('[P5_PROBE]', body);
-                res.statusCode = 204;
-                res.end();
-              });
-            });
-          },
-        },
-      ],
-      // ===== PROBE P5 (temporary) =====
+      plugins: [react()],
       configFile: false,
       logLevel: 'silent',
       root: ROOT,
@@ -148,9 +130,8 @@ const VALUE = {
    * S9 新建出来的实例。
    *
    * 必须单独给一份值：mock 的兜底是 `VALUE[instanceId] ?? VALUE.qqbot`，
-   * 缺这一项时 `main` 会拿到 qqbot 的值，而 S9 判"视图到位"的标准是
-   * "输入框里的值**不是默认实例的**"——兜底值恰好也不是默认值，于是判据
-   * 能过，但那证明的是一个凑巧的值，不是"这个实例自己的视图到了"。
+   * 缺这一项时 `main` 会拿到 qqbot 的值；S9 必须用精确值判定视图属于 `main`，
+   * 不能只检查它与默认实例的值不同。
    * 给一份专属值，判据才真的指向"main 的视图"。
    */
   main: 'http://192.0.2.24:5700',
@@ -248,25 +229,6 @@ async function open(options: Options = {}): Promise<Ui> {
   const posts: { url: string; body: unknown }[] = [];
   const pageErrors: string[] = [];
   page.on('pageerror', (error) => pageErrors.push(String(error).slice(0, 300)));
-
-  // ===== PROBE P3 (temporary: network layer truth for the S9 POST) =====
-  page.on('request', (request) => {
-    if (request.url().includes('/instances') && request.method() === 'POST') {
-      console.log('[P0_REQUEST]', request.url(), request.method());
-    }
-  });
-  page.on('requestfailed', (request) => {
-    if (request.url().includes('/instances')) {
-      console.log('[P0_REQUESTFAILED]', request.url(), JSON.stringify(request.failure()));
-    }
-  });
-  page.on('response', async (response) => {
-    if (!response.url().includes('/instances')) return;
-    console.log('[P0_RESPONSE]', response.request().method(), response.status(), response.url());
-  });
-  page.on('console', (message) => {
-    console.log('[PAGE]', message.text());
-  });
 
   /*
    * 实例目录**必须是可变的**：新建成功后，真实后端的 `GET .../instances`
@@ -657,31 +619,8 @@ describe('验收：实例面板', () => {
     const { page, posts, puts } = await open({ items: [], created: row({ instance_id: 'main', display_name: '主号' }) });
 
     await page.getByTestId('connector-instance-name').fill('主号');
-    // ===== PROBE P2/P4 (temporary) =====
-    console.log(
-      '[P4_URL]',
-      page.url(),
-      'forms=',
-      await page.locator('form.connector-instance-create').count(),
-      'cookies=',
-      JSON.stringify(await page.context().cookies()),
-    );
-    page.on('request', (request) => {
-      if (request.method() === 'POST' && request.url().includes('/instances')) {
-        console.log('[P4_POST_HEADERS]', JSON.stringify(request.headers()));
-      }
-    });
-    // ===== PROBE P2/P4 (temporary) =====
     await page.getByTestId('connector-instance-create-submit').click();
     await expect.poll(() => posts.length).toBe(1);
-    // ===== PROBE P2 (temporary) =====
-    await page.waitForTimeout(3_000);
-    console.log(
-      '[P2_COUNT_AFTER]',
-      JSON.stringify(await page.locator('[data-testid="connector-instance-main"]').count()),
-    );
-    console.log('[P2_URL_AFTER]', JSON.stringify(page.url()));
-    // ===== PROBE P2 (temporary) =====
     // 后端派生 instance_id：body 只给显示名，前端不猜 id。
     expect(posts[0]!.body).toEqual({ display_name: '主号' });
 
@@ -692,7 +631,6 @@ describe('验收：实例面板', () => {
      * 因此「没有改动」时点保存不会发请求（发出去就是一次空写）。所以这里必须先
      * 让 main 的视图真的出现，否则用例测的是"还没来得及读"，不是"发错实例"。
      */
-    // `expect.poll(...).not.toBe(x)` 不返回轮询值：自己留一个变量记最后一次结果。
     let lastViewState = 'unknown';
     await expect
       .poll(
@@ -703,15 +641,7 @@ describe('验收：实例面板', () => {
             return lastViewState;
           }
           const shown = await input.first().inputValue({ timeout: 500 }).catch(() => 'unreadable');
-          /*
-           * "视图到位"的标准：输入框里是**这个新实例自己的已保存值**
-           * （`VALUE.main`），既不是默认实例的值，也不是空/读不出。
-           *
-           * 这里原来写的是 `shown.includes('192.0.2.99')`——那是 S4 用例里
-           * **用户手填的草稿值**，S9 从头到尾没填过它。新建出来的实例不可能
-           * 显示一个从没输入过的字符串，于是这条永远判不成 `own-view`，
-           * 用例永远报"未能验证"。判据本身写错了，不是实现不到位。
-           */
+          // "视图到位"必须是这个新实例自己的已保存值，不是默认值或其它实例的值。
           if (shown === VALUE.main) lastViewState = 'own-view';
           else if (shown === VALUE.default) lastViewState = 'default-view';
           else lastViewState = shown === 'unreadable' ? 'unreadable' : `other:${shown}`;
@@ -719,24 +649,7 @@ describe('验收：实例面板', () => {
         },
         { timeout: 20_000, interval: 150 },
       )
-      .not.toBe('unreadable');
-    void lastViewState;
-    /*
-     * 两种结局分开报告，不同结论：
-     *  - `own-view`：字段视图到位 → 继续测"保存发到哪个实例"。
-     *  - `no-field-form` / `default-view`：**新建之后这个实例的字段视图始终没到**，
-     *    页面要么没有字段表单、要么只敢显示默认实例的值并标注"不是这个实例的"。
-     *    这时没有可改的输入框，于是**"新建实例后保存到新实例"这条路径无法被验证**。
-     *    它**不算通过**，也不算"发了错的 id"——如实判为"未能验证"，附实测值。
-     */
-    const landed = lastViewState;
-    if (landed !== 'own-view') {
-      throw new Error(
-        `新建实例后未能拿到它自己的字段视图（实测状态：${landed}）。` +
-          `因此"新建第一个实例后保存到该实例"这条判据**无法验证**：界面上没有属于它的输入框可改。` +
-          `这不是"保存发错了 id"，而是"新建之后视图不到位"——需要在实现侧确认，不作为通过。`,
-      );
-    }
+      .toBe('own-view');
     await fieldInput(page).fill('http://192.0.2.30:5700');
 
     // 选中态必须真的落到新实例上（否则后面测的就不是"新实例"）。

@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # 用户时区的**默认值**（IANA 名）。
@@ -38,6 +41,38 @@ def _int(name: str, default: int) -> int:
     return int(raw)
 
 
+def require_database_url(value: str | None) -> str:
+    """确认数据库来源明确，失败时不展示连接地址或凭据。"""
+    if value is None or not value.strip():
+        raise RuntimeError(
+            "未设置 LING_DATABASE_URL。请明确配置现有 PostgreSQL 数据库地址，"
+            "例如 postgresql+asyncpg://用户:密码@主机:5432/数据库。"
+            "如果此前使用 SQLite（例如 .data/ling.db），请先备份并确认数据迁移方案，"
+            "切换 PostgreSQL 不会自动迁移或删除旧数据库。"
+        )
+    try:
+        url = make_url(value)
+    except (ArgumentError, ValueError):
+        raise RuntimeError(
+            "LING_DATABASE_URL 格式无效。请填写有效的数据库连接地址，"
+            "例如 postgresql+asyncpg://用户:密码@主机:5432/数据库。"
+        ) from None
+    if url.get_backend_name() != "postgresql":
+        raise RuntimeError(
+            "LING_DATABASE_URL 必须指向 PostgreSQL。"
+            "如果此前使用 SQLite，请保留并备份原数据库文件及密钥，"
+            "确认数据迁移方案后再切换；回退时使用旧版本和原配置。"
+        )
+    if url.drivername == "postgresql":
+        return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.drivername != "postgresql+asyncpg":
+        raise RuntimeError(
+            "LING_DATABASE_URL 的 PostgreSQL 驱动不受支持。"
+            "请使用 postgresql:// 或 postgresql+asyncpg:// 地址。"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     """进程级启动配置（不含日常业务设置）。"""
@@ -50,13 +85,10 @@ class Settings:
     host: str = field(default_factory=lambda: os.environ.get("LING_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _int("LING_PORT", 8080))
 
-    # 数据库：默认本地 sqlite 便于零依赖启动，生产必须给 PostgreSQL URL
+    # 数据库连接必须显式提供，避免遗漏配置时连接到另一份数据。
     database_url: str = field(
-        default_factory=lambda: os.environ.get(
-            "LING_DATABASE_URL", "sqlite+aiosqlite:///./.data/ling.db"
-        )
+        default_factory=lambda: require_database_url(os.environ.get("LING_DATABASE_URL"))
     )
-    db_require_postgres: bool = field(default_factory=lambda: _bool("LING_REQUIRE_POSTGRES", False))
     # 测试隔离：把连接固定到一个 schema（仅 PostgreSQL 生效）
     db_search_path: str | None = field(
         default_factory=lambda: os.environ.get("LING_DB_SEARCH_PATH") or None
@@ -287,10 +319,6 @@ class Settings:
     allow_public_publish: bool = field(
         default_factory=lambda: _bool("LING_ALLOW_PUBLIC_PUBLISH", False)
     )
-
-    @property
-    def is_postgres(self) -> bool:
-        return self.database_url.startswith("postgresql") or self.database_url.startswith("postgres")
 
     @property
     def secret_key_path(self) -> Path:

@@ -98,6 +98,13 @@ const TIMELINE = {
   outline_due_at: '2026-11-07T02:00:00Z',
   timezone_source: 'preference',
   generated_at: '2026-11-07T13:45:00Z',
+  last_model_outline_at: '2026-11-07T13:45:00Z',
+  reason_explanation: null,
+  unplanned: {
+    scope_start_at: '2026-11-07T16:00:00Z',
+    scope_end_at: '2026-11-08T05:00:00Z',
+    periods: [{ start_at: '2026-11-07T22:00:00Z', end_at: '2026-11-07T23:00:00Z' }],
+  },
   segments: [
     {
       schema_version: 'v1',
@@ -440,6 +447,8 @@ const EMPTY_TIMELINE = {
   plan_state: null,
   revision: 0,
   generated_at: null,
+  last_model_outline_at: null,
+  unplanned: null,
   segments: [],
   facts: [],
   intents: [],
@@ -567,12 +576,50 @@ async function assertNoHorizontalOverflow(
 
 describe('真实浏览器：生活时间轴与总览两块', () => {
   it(
+    '375：夏令时回拨的空档显示不同偏移',
+    async (ctx) => {
+      if (skip(ctx)) return;
+      const mock = scheduleMock({
+        timeline: () => ({
+          ...TIMELINE,
+          display_date: '2026-11-01',
+          display_timezone: 'America/New_York',
+          plan_day: '2026-11-01',
+          actor_timezone: 'America/New_York',
+          unplanned: {
+            scope_start_at: '2026-11-01T04:00:00Z',
+            scope_end_at: '2026-11-02T05:00:00Z',
+            periods: [{ start_at: '2026-11-01T05:30:00Z', end_at: '2026-11-01T06:30:00Z' }],
+          },
+        }),
+      });
+      const page = await openRoute('/life', { width: 375, height: 667 }, 'life-timeline', mock);
+      const unplanned = page.locator('[data-testid="tl-unplanned"]');
+      await unplanned.waitFor();
+      expect(await unplanned.innerText()).toContain('11-01 01:30 (GMT-4)–11-01 01:30 (GMT-5)');
+      await assertNoHorizontalOverflow(page, 'life 375 夏令时回拨', ['page', 'timeline']);
+    },
+    TIMEOUT,
+  );
+
+  it(
     '1440：时间轴 / 总览都没有横向溢出',
     async (ctx) => {
       if (skip(ctx)) return;
       const life = await openRoute('/life', { width: 1440, height: 900 }, 'life-timeline');
       await life.locator('[data-testid="tl-seg-seg-hour"]').waitFor();
       await assertNoHorizontalOverflow(life, 'life 1440', ['page', 'timeline']);
+      const diagnostics = life.locator('[data-testid="tl-diagnostics"]');
+      expect(await diagnostics.getAttribute('open')).toBeNull();
+      expect(await life.locator('[data-testid="tl-generated-at"]').isVisible()).toBe(false);
+      expect(await life.locator('[data-testid="tl-state"]').isVisible()).toBe(true);
+      expect(await life.locator('[data-testid="tl-last-model"]').innerText()).toContain('2026-11-07 21:45');
+      expect(await life.locator('[data-testid="tl-unplanned"]').innerText()).toContain('11-08 06:00');
+      await diagnostics.locator('summary').click();
+      expect(await life.locator('[data-testid="tl-generated-at"]').isVisible()).toBe(true);
+      await diagnostics.locator('summary').click();
+      await life.screenshot({ path: '/tmp/ling-life-redesign-desktop.png', fullPage: true });
+
       // 折叠按钮真的在（不是只有文字）且默认展开
       const toggle = life.locator('[data-testid="tl-toggle-seg-block"]');
       expect(await toggle.getAttribute('aria-expanded')).toBe('true');
@@ -595,7 +642,12 @@ describe('真实浏览器：生活时间轴与总览两块', () => {
       if (skip(ctx)) return;
       const life = await openRoute('/life', { width: 375, height: 667 }, 'life-timeline');
       await life.locator('[data-testid="tl-seg-seg-hour"]').waitFor();
+      expect(await life.locator('[data-testid="tl-unplanned"]').innerText()).toContain('11-08 07:00');
       const widths = await assertNoHorizontalOverflow(life, 'life 375', ['page', 'timeline']);
+      await life.locator('[data-testid="tl-diagnostics"] summary').click();
+      await assertNoHorizontalOverflow(life, 'life 375 expanded details', ['page', 'timeline']);
+      await life.screenshot({ path: '/tmp/ling-life-redesign-mobile.png', fullPage: true });
+
       // 375 下时间列折进段内，标题允许换行：段本身没有被裁掉。
       expect(await life.locator('[data-testid="tl-seg-seg-block"]').count()).toBe(1);
       expect((widths.timeline?.client ?? 0)).toBeLessThanOrEqual(375);

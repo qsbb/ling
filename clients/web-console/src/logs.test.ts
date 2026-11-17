@@ -33,6 +33,7 @@ import {
   LogsToolbar,
   describeCounts,
   describeDenials,
+  displayLogMessage,
   describeKindFilter,
   formatLogTime,
   formatLogTimestampFull,
@@ -197,6 +198,36 @@ describe('级别 → 颜色档与排序', () => {
   it('认不出来的级别按 info 档显示（但文字原样保留，见渲染断言）', () => {
     expect(levelTone('notice')).toBe('info');
     expect(levelRank('notice')).toBe(levelRank('info'));
+  });
+});
+
+describe('访问日志面向用户的消息', () => {
+  it('把常见轮询 GET 翻译成动作，同时保留状态码和耗时', () => {
+    expect(displayLogMessage('GET /v1/version/image-update → 200 (11.8ms)')).toBe(
+      '读取镜像更新状态成功（200，11.8ms）',
+    );
+  });
+
+  it('把失败请求标成失败，并保留错误状态码', () => {
+    expect(displayLogMessage('GET /v1/version/image-update → 503 (21ms)')).toBe(
+      '读取镜像更新状态失败（503，21ms）',
+    );
+  });
+
+  it('重定向只展示状态码，不当作成功', () => {
+    expect(displayLogMessage('GET /v1/version/image-update → 302 (5ms)')).toBe(
+      '读取镜像更新状态（302，5ms）',
+    );
+  });
+
+  it('未收录的访问路径和普通应用日志保持原文', () => {
+    expect(displayLogMessage('GET /v1/unknown → 200 (1ms)')).toBe(
+      'GET /v1/unknown → 200 (1ms)',
+    );
+    expect(displayLogMessage('桥接就绪')).toBe('桥接就绪');
+    expect(displayLogMessage('POST /v1/version/image-update → 405 (1ms)')).toBe(
+      'POST /v1/version/image-update → 405 (1ms)',
+    );
   });
 });
 

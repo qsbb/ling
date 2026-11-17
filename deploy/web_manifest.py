@@ -42,7 +42,9 @@ backend_files = [
     "README.md",
     "alembic.ini",
     "deploy/Dockerfile.api",
+    "deploy/configure_apt_mirror.py",
     "deploy/entrypoint.sh",
+    "deploy/requirements.runtime.lock",
 ]
 backend_dirs = ["src", "connectors", "migrations"]
 skip_names = {

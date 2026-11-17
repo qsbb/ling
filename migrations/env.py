@@ -9,7 +9,10 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from ling.config import require_database_url
+from ling.infra import conversation_policy_audit as _policy_audit  # noqa: F401
 from ling.infra import models as _models  # noqa: F401 - 注册全部表
+from ling.infra import proactive_quota as _proactive_quota  # noqa: F401
 from ling.infra.db import Base
 
 config = context.config
@@ -27,11 +30,10 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    return os.environ.get(
-        "LING_DATABASE_URL",
-        config.get_main_option("sqlalchemy.url")
-        or "postgresql+asyncpg://ling@127.0.0.1:55432/ling",
-    )
+    url = os.environ.get("LING_DATABASE_URL")
+    if url is None:
+        url = config.get_main_option("sqlalchemy.url")
+    return require_database_url(url)
 
 
 def run_migrations_offline() -> None:

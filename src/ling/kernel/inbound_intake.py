@@ -116,8 +116,24 @@ async def _log_denials_enabled(state: object) -> bool:
     return enabled
 
 
+def _connector_event_scope(
+    connector_instance: str,
+    trusted_instance_key: tuple[str, str] | None,
+    *,
+    recall: bool = False,
+) -> str:
+    if trusted_instance_key is None:
+        scope = f"connector:{connector_instance}"
+    else:
+        stable_scope, instance_id = trusted_instance_key
+        scope = f"connector:{stable_scope}:{instance_id}"
+    return f"{scope}:recall" if recall else scope
+
+
 async def process_inbound_payload(app: object, connector: ChannelConnector, payload: dict,
-                                  *, _asr_resume: tuple | None = None) -> dict:
+                                  *,
+                                  trusted_instance_key: tuple[str, str] | None = None,
+                                  _asr_resume: tuple | None = None) -> dict:
     """处理一条已经解析好的平台事件（字典）。
 
     返回要回给上报方的 JSON。**业务失败也返回 accepted=False 而不是抛错**——
@@ -167,7 +183,9 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
     from ling.contracts.v1 import RecallEvent
 
     if isinstance(envelope, RecallEvent):
-        return await _process_recall(app, envelope)
+        return await _process_recall(
+            app, envelope, trusted_instance_key=trusted_instance_key
+        )
 
     state = app.state  # type: ignore[attr-defined]
     settings = state.settings
@@ -218,13 +236,14 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
 
     from ling.domains.conversation.service import ConversationService
     from ling.kernel.access import OBSERVE_ONLY
-    from ling.kernel.bridge import InboundBridge
+    from ling.kernel.bridge import InboundBridge, WindowOriginConflictError
 
     connector_instance = connector.instance_id  # type: ignore[attr-defined]
+    event_scope = _connector_event_scope(connector_instance, trusted_instance_key)
     async with session_scope() as session:
         conversation = ConversationService(session)
         claimed = None if _asr_resume else await conversation.claim_event(
-            scope=f"connector:{connector_instance}",
+            scope=event_scope,
             key=envelope.external_event_id,
         )
         if claimed is not None:
@@ -255,7 +274,12 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
         # 原来写的是 `getattr(state, "cancels", CancelRegistry())`——默认值
         # 会被**立即求值**，无论属性在不在都白建一个 `CancelRegistry`。
         # 改成 `None` 兜底再 `or` 一个，语义相同但不白建。
+        from ling.domains.persona.service import PersonaIdSnapshot
         from ling.kernel.turn import CancelRegistry, TurnCoordinator
+
+        # 这里只传引导人格。真正运行快照由 Bridge 在窗口归属确定后一次解析，
+        # 避免在入站层先读全局配置、随后又被实例/会话快照覆盖。
+        persona_id = PersonaIdSnapshot(str(getattr(settings, "persona_id", "") or ""))
 
         coordinator = getattr(state, "bridge_coordinator", None)
         if coordinator is None:
@@ -263,7 +287,7 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
                 settings=settings,
                 router=state.router,
                 actor_id=settings.actor_id,
-                persona_id=settings.persona_id,
+                persona_id=persona_id,
                 cancels=getattr(state, "cancels", None) or CancelRegistry(),
                 arbiter=getattr(state, "arbiter", None),
                 stream_log=getattr(state, "stream_log", None),
@@ -284,25 +308,48 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
             group_mention_on_reply=settings.group_mention_on_reply,
             auto_register_private=settings.auto_register_private,
             observe_only=decision.verdict == OBSERVE_ONLY,
-            persona_id=settings.persona_id,
+            persona_id=persona_id,
+            trusted_instance_key=trusted_instance_key,
         )
         try:
-            result = await bridge.handle(envelope, resume_message_id=_asr_resume[1]) if _asr_resume else await bridge.handle(envelope)
+            if _asr_resume:
+                result = await bridge.handle(
+                    envelope,
+                    resume_message_id=_asr_resume[1],
+                    resume_window_id=_asr_resume[2],
+                )
+            else:
+                result = await bridge.handle(envelope)
+        except WindowOriginConflictError as exc:
+            logger.warning("平台会话归属冲突，事件暂不处理: %s", exc)
+            await session.rollback()
+            if not _asr_resume:
+                await conversation.release_event(
+                    scope=event_scope,
+                    key=envelope.external_event_id,
+                )
+            await session.commit()
+            return {
+                "accepted": False,
+                "reason": str(exc),
+            }
         except Exception as exc:  # noqa: BLE001 - 任何失败都要能重投
             logger.exception("事件处理失败，撤回认领以便重投")
-            await conversation.release_event(
-                scope=f"connector:{connector_instance}",
-                key=envelope.external_event_id,
-            )
+            await session.rollback()
+            if not _asr_resume:
+                await conversation.release_event(
+                    scope=event_scope,
+                    key=envelope.external_event_id,
+                )
             await session.commit()
             return {
                 "accepted": False,
                 "reason": f"处理失败，可重投: {type(exc).__name__}",
             }
 
-        if result.accepted and result.reply_text and not result.delivered:
+        if not _asr_resume and result.accepted and result.reply_text and not result.delivered:
             await conversation.release_event(
-                scope=f"connector:{connector_instance}",
+                scope=event_scope,
                 key=envelope.external_event_id,
             )
             await session.commit()
@@ -328,7 +375,12 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
     }
 
 
-async def _process_recall(app: object, event: object) -> dict:
+async def _process_recall(
+    app: object,
+    event: object,
+    *,
+    trusted_instance_key: tuple[str, str] | None = None,
+) -> dict:
     """处理一条撤回通知：**不产生消息、不触发回复、不调用模型**。
 
     ## 为什么独立于消息链路
@@ -352,13 +404,16 @@ async def _process_recall(app: object, event: object) -> dict:
 
     assert isinstance(event, RecallEvent)
     connector_instance = event.connector_instance
+    event_scope = _connector_event_scope(
+        connector_instance, trusted_instance_key, recall=True
+    )
     async with session_scope() as session:
         conversation = ConversationService(session)
         # 事件级幂等：同一撤回被平台重投时，第二次直接返回 duplicate。
         # 这与 `retract_message` 里的条件更新是**两层**保护——条件更新保证
         # "数据只变一次"，这里保证"日志也只记一次"。
         claimed = await conversation.claim_event(
-            scope=f"connector:{connector_instance}:recall",
+            scope=event_scope,
             key=event.external_event_id,
         )
         if claimed is not None:
@@ -369,11 +424,12 @@ async def _process_recall(app: object, event: object) -> dict:
             outcome = await conversation.retract_message(
                 window_ref=str(event.window_ref or ""),
                 platform_message_id=str(event.platform_message_id),
+                trusted_instance_key=trusted_instance_key,
             )
         except Exception as exc:  # noqa: BLE001 - 失败要能被平台重投
             logger.exception("撤回处理失败，撤回认领以便重投")
             await conversation.release_event(
-                scope=f"connector:{connector_instance}:recall",
+                scope=event_scope,
                 key=event.external_event_id,
             )
             await session.commit()

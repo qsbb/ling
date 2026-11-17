@@ -4,6 +4,7 @@ import type { UserInfo } from '../types';
 import { useChat, type UiMessage } from '../useChat';
 import { Composer } from './Composer';
 import { AudioInputComposer } from './AudioInputComposer';
+import { WindowPolicy } from './WindowPolicy';
 import { AlertIcon, PencilIcon } from './Icons';
 import { MessageList } from './MessageList';
 import {
@@ -48,6 +49,7 @@ export function ChatPage({
   const chat = useChat(sessionId, onTestMode);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
+  const [policyOpen, setPolicyOpen] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
@@ -82,6 +84,7 @@ export function ChatPage({
 
   useEffect(() => {
     stickToBottom.current = true;
+    setPolicyOpen(false);
   }, [chat.currentId]);
 
   useEffect(() => {
@@ -234,6 +237,12 @@ export function ChatPage({
                 生成中
               </span>
             ) : null}
+            {user.role === 'owner' && session && !session.archived ? (
+              <button type="button" className="ghost-button" onClick={() => setPolicyOpen((open) => !open)}
+                aria-expanded={policyOpen}>
+                会话设置
+              </button>
+            ) : null}
             {!editingTitle && session && renamable ? (
               <button type="button" className="ghost-button" onClick={startTitleEdit}>
                 <PencilIcon /> 改名
@@ -241,6 +250,10 @@ export function ChatPage({
             ) : null}
           </div>
         </header>
+
+        {policyOpen && session ? (
+          <WindowPolicy key={session.session_id} sessionId={session.session_id} onClose={() => setPolicyOpen(false)} />
+        ) : null}
 
         {chat.loadError ? (
           <div className="load-error" role="alert">

@@ -1,8 +1,9 @@
 # ling API 镜像（amd64/arm64，纯 CPU 即可运行）
 #
-# 三阶段：
+# 四阶段：
 #   web     Node 22 + pnpm：冻结锁文件装依赖并构建前端，产出 /web/dist
-#   builder Python：把 pyproject 声明的东西打成 wheel
+#   deps    Python：按独立运行依赖锁构建 wheelhouse
+#   app     Python：只构建 ling 应用 wheel
 #   runtime 精简运行时：wheel + 源码 + 阶段 1 的 Web dist，非 root 运行
 #
 # 镜像**自带** Web 静态文件（不再靠 compose 把宿主 dist bind 到 /app/web）：
@@ -64,74 +65,48 @@ RUN pnpm build && test -f dist/index.html
 
 
 # ---------------------------------------------------------------------------
-# 阶段 2：Python wheel
+# 阶段 2：运行依赖 wheelhouse
 # ---------------------------------------------------------------------------
-FROM ${LING_PYTHON_BASE} AS builder
+FROM ${LING_PYTHON_BASE} AS runtime-dependencies
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    UV_SYSTEM_PYTHON=0
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /build
-COPY pyproject.toml README.md ./
-COPY src ./src
-# **必须拷**：pyproject 里声明的 wheel 包含 `connectors`（渠道连接器）。
-# 少这一行的话构建会因为找不到包而打不出完整 wheel——或者在能容忍缺失时
-# 静默产出一个没有 connectors 的镜像，表现为容器里 QQ/NapCat 全部连不上，
-# 日志只说"缺少凭据"或干脆没有日志。dev 里正常、容器里死掉，就是这种坑。
-COPY connectors ./connectors
+COPY deploy/requirements.runtime.lock ./requirements.runtime.lock
 # PyPI 在部分网络环境下**超时频繁**（实测 NAS 上 `ReadTimeoutError`
 # 导致整次部署失败）。这里加两个东西：
 #   1. `--retries/--timeout`：给慢网络留余地，而不是一次超时就放弃
 #   2. `PIP_INDEX_URL`：允许换镜像源（国内可用清华源），默认仍是官方 PyPI
-#
-# `.[speech-codecs]` 这里的方括号是**必须的**，不是笔误（2026-11-11 实测）：
-#
-#   `pip wheel .` 只解析 pyproject 的**核心** dependencies，**不会**下载任何
-#   optional-dependencies 里的包。于是 `pysilk-mod` 根本不进 /wheels，
-#   runtime 阶段那个离线 `pip install /wheels/*.whl` 也就装不上它——
-#   镜像里 `import pysilk` 必然失败，语音发不出去（能力声明会诚实地说
-#   "没有 audio"，但用户要的是能发）。
-#
-#   写成 `.[speech-codecs]` 之后实测 /wheels 里多出
-#   `pysilk_mod-1.6.4-cp313-cp313-manylinux_2_17_{x86_64,aarch64}...whl`。
-#
-# **为什么这里能拿到正确架构的 wheel**：builder 与 runtime 用同一个
-# `${LING_PYTHON_BASE}` 且都**没有** `--platform=$BUILDPLATFORM` 覆盖，
-# 所以 buildx 多平台构建时 builder 跟着目标架构走（arm64 阶段由 QEMU 执行），
-# pip 解出的就是该架构的 manylinux wheel。builder 与 runtime 的平台/解释器
-# 因此天然一致，不需要额外传 `--platform` 给 pip。
+ARG PIP_INDEX_URL=""
+RUN pip wheel --no-cache-dir --retries 5 --timeout 60 \
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} \
+      --only-binary=:all: --wheel-dir /wheels -r requirements.runtime.lock
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3：应用 wheel
+# ---------------------------------------------------------------------------
+FROM ${LING_PYTHON_BASE} AS app-wheel
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+COPY pyproject.toml README.md ./
 ARG PIP_INDEX_URL=""
 RUN pip install --no-cache-dir --retries 5 --timeout 60 \
-      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} build \
- && pip wheel --no-cache-dir --retries 5 --timeout 60 \
-      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} --wheel-dir /wheels \
-      ".[speech-codecs]" \
- && ls /wheels
+      ${PIP_INDEX_URL:+--index-url ${PIP_INDEX_URL}} build hatchling
+COPY src ./src
+# pyproject 的 wheel 包含渠道连接器，镜像中必须保留它。
+COPY connectors ./connectors
+RUN python -m build --wheel --no-isolation --outdir /app-wheel
 
 
 # ---------------------------------------------------------------------------
-# 阶段 3：运行时
+# 阶段 4：运行时
 # ---------------------------------------------------------------------------
 FROM ${LING_PYTHON_BASE} AS runtime
-
-# 构建提交标记：由 CI（release.yml 的 image job）或 install.sh 在构建前解析
-# （发布提交的 40 位 sha）。没有就是空串——运行时 /v1/version 报 commit=null，
-# 而不是把未知提交伪装成真实提交。只在 runtime 阶段声明：builder 阶段不需要，
-# 也不该影响 wheel 内容。
-ARG LING_COMMIT=""
-# 版本与仓库来源：CI 传 tag 对应版本与仓库 URL；源码模式不传时为空串。
-# 它们与 LING_COMMIT 一起**同时**写进 ENV 和 OCI 标注（同一个 ARG 来源），
-# 所以"镜像内 env"与"OCI 标注"不会各说一套；CI 还会按摘要把镜像拉回来
-# 再核对一次（release.yml 的「核对镜像标注」步骤）。
-ARG LING_VERSION=""
-ARG LING_SOURCE="https://github.com/qsbb/ling"
-ENV LING_COMMIT=${LING_COMMIT}
-
-LABEL org.opencontainers.image.title="ling-api" \
-      org.opencontainers.image.source="${LING_SOURCE}" \
-      org.opencontainers.image.version="${LING_VERSION}" \
-      org.opencontainers.image.revision="${LING_COMMIT}"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -167,38 +142,21 @@ RUN groupadd --system --gid 10001 ling \
 # 与无头容器无关的推荐包。`rm -rf /var/lib/apt/lists/*` 必须留在**同一层**，
 # 否则那几十 MB 的索引会固化进镜像。
 #
-# 放在 pip install 之前：apt 层只依赖基础镜像，几乎不会失效，可以长期命中
-# 缓存；而 pip 安装层依赖 /wheels（每次源码变更都会变）。
-RUN apt-get update \
+# FFmpeg 与应用及其 Python 依赖分层，源码更新不会重跑 apt 安装。
+# APT_MIRROR_HOST 只替换官方 Debian 主机名，不接受 URL 或 shell 内容；留空时
+# 保留基础镜像自带的软件源。这样慢网络可在 deploy/.env 选镜像，签名校验照常。
+ARG APT_MIRROR_HOST=""
+COPY deploy/configure_apt_mirror.py /tmp/configure_apt_mirror.py
+RUN python3 /tmp/configure_apt_mirror.py "$APT_MIRROR_HOST" \
+ && rm /tmp/configure_apt_mirror.py \
+ && apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /wheels /wheels
-# `--no-index --find-links /wheels`：**纯离线**安装，不访问 PyPI。wheel 已经
-# 在 builder 阶段全部下载好了（含 speech-codecs extra 的 pysilk-mod）。
-#
-# ## 为什么要写 `ling[speech-codecs]` 而不是 `/wheels/*.whl`
-#
-# 真正的失败点在 **builder**：`pip wheel .` 只解析核心 dependencies，
-# `pysilk-mod` 根本不会进 /wheels（已在 builder 阶段改成 `.[speech-codecs]`）。
-# 这一层再写 `/wheels/*.whl` 的话，装的 wheel 集合里没有 pysilk-mod——
-# 实测 `import pysilk` → ModuleNotFoundError，语音发不出去。
-#
-# 反过来，**只要 pysilk 的 wheel 在 /wheels 里**，`/wheels/*.whl` 其实也能装上它
-# （逐个点名 wheel 时 pip 会满足 `extra == 'speech-codecs'` 标记，实测如此）。
-# 但那种写法把正确性押在"glob 恰好吃到全部 wheel"上：将来 /wheels 里多一个
-# 无关 wheel、或换 pip 版本改变该行为，就会静默退化成"少装一个包"。
-# 按**包名 + extra** 安装是显式声明依赖关系，pip 自己从 /wheels 解析传递闭包，
-# 不依赖 glob 的巧合。实测装全 39 个包且 `import pysilk` 成功。
-#
-# 也不能写成 `/wheels/*.whl[speech-codecs]`（2026-11-11 实测）：shell 会把
-# `[speech-codecs]` 当成字符类，glob 匹配不到任何文件，pip 报
-# `Invalid wheel filename (wrong number of parts): '*'`。
-#
-# `--no-index` 顺带保证"离线安装"不是靠运气：PyPI 上有同名包时也不会去下载，
-# 装的一定是 builder 刚打出来的那一份。
-#
+COPY deploy/requirements.runtime.lock /tmp/requirements.runtime.lock
+COPY --from=runtime-dependencies /wheels /wheels
+# 运行依赖在锁定的 wheelhouse 中安装，不访问 PyPI。
 # ## 自检为什么不能只 `import pysilk`
 #
 # 预编译 wheel 里的 C 扩展有两个"装上了但用不了"的失败模式：
@@ -229,13 +187,19 @@ if not back:
 print(f"语音依赖自检通过：pysilk 编码 {len(data)} 字节、解码 {len(back)} 字节；ffmpeg 可用")
 PY
 
-# 自检**先跑**、`rm -rf /wheels` 放最后：清理是收尾动作，不能夹在
-# "装完"和"验完"之间——万一将来有人在这条链中间插步骤，顺序不该靠运气。
-RUN pip install --no-cache-dir --no-index --find-links /wheels "ling[speech-codecs]" \
+# 依赖自检完成后再清理 wheelhouse。
+RUN pip install --no-cache-dir --no-index --find-links /wheels \
+      -r /tmp/requirements.runtime.lock \
  && ffmpeg -version >/dev/null \
  && python /tmp/silk_smoke.py \
  && rm -rf /wheels \
- && rm -f /tmp/silk_smoke.py
+ && rm -f /tmp/silk_smoke.py /tmp/requirements.runtime.lock
+
+# 源码变化只重装应用 wheel，依赖安装层保持缓存。
+COPY --from=app-wheel /app-wheel /app-wheel
+RUN pip install --no-cache-dir --no-index --no-deps /app-wheel/*.whl \
+ && pip check \
+ && rm -rf /app-wheel
 
 COPY --chown=ling:ling src ./src
 # 同上：入口脚本与部分运行期代码会 `import connectors.*`，镜像里必须有。
@@ -250,7 +214,7 @@ COPY --from=web --chown=ling:ling /web/dist /app/web
 
 # 下面是 deploy/web_manifest.py 的 `release_inputs` 全部输入，缺一个就 fail closed：
 #   仓库根：pyproject.toml / README.md / alembic.ini
-#   deploy/：Dockerfile.api / entrypoint.sh（本文件与入口脚本也进清单哈希）
+#   deploy/：Dockerfile.api / entrypoint.sh / requirements.runtime.lock
 #   src / connectors / migrations 全树（上面已经拷了）
 #   clients/web-console：package.json / pnpm-lock.yaml / index.html /
 #                        tsconfig.json / vite.config.ts 与 src 全树
@@ -258,7 +222,9 @@ COPY --from=web --chown=ling:ling /web/dist /app/web
 # 独立复核（在容器里也能手动重跑 verify）。**不放** .env、token、Docker socket
 # 或宿主 .run：那些也不在 .dockerignore 放行的范围内。
 COPY --chown=ling:ling pyproject.toml README.md ./
-COPY --chown=ling:ling deploy/Dockerfile.api deploy/entrypoint.sh deploy/web_manifest.py ./deploy/
+COPY --chown=ling:ling deploy/Dockerfile.api deploy/entrypoint.sh \
+     deploy/web_manifest.py deploy/requirements.runtime.lock \
+     deploy/configure_apt_mirror.py ./deploy/
 COPY --chown=ling:ling \
      clients/web-console/package.json \
      clients/web-console/pnpm-lock.yaml \
@@ -282,6 +248,17 @@ RUN python3 /app/deploy/web_manifest.py create /app clients/web-console /app/web
 # /app/deploy/entrypoint.sh。仓库内没有其它地方引用旧路径（compose 不覆盖
 # entrypoint；`run ... api migrate` 走的是 CMD）。
 RUN chmod +x /app/deploy/entrypoint.sh
+
+# 放在全部内容层之后，使源码更新不影响依赖安装层的缓存。
+ARG LING_COMMIT=""
+ARG LING_VERSION=""
+ARG LING_SOURCE="https://github.com/qsbb/ling"
+ENV LING_COMMIT=${LING_COMMIT}
+
+LABEL org.opencontainers.image.title="ling-api" \
+      org.opencontainers.image.source="${LING_SOURCE}" \
+      org.opencontainers.image.version="${LING_VERSION}" \
+      org.opencontainers.image.revision="${LING_COMMIT}"
 
 USER ling
 # 容器内固定监听 6520（entrypoint 的 uvicorn / compose 的 expose 与 healthcheck

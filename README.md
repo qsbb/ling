@@ -41,42 +41,41 @@ QQ、微信、Web 控制台、移动端都只是**连接到她的渠道**，她�
 
 ### Docker（推荐）
 
-```bash
-git clone https://github.com/qsbb/ling.git
-cd ling
-bash deploy/install.sh
-```
-
-脚本会自动生成密钥、构建镜像、起服务，最后打印控制台地址与账号密码。
+需要 Git、Docker Engine 和 Docker Compose v2。整行执行后会在当前目录创建 `ling`，
+生成本机配置、构建镜像并启动服务；没有预装 pnpm 也可以安装。
 
 ```bash
-bash deploy/install.sh --status      # 状态
-bash deploy/install.sh --logs api    # 日志
-bash deploy/install.sh               # 升级（在**当前源码**上重新构建并重启）
-bash deploy/install.sh --down        # 停止（数据保留）
+git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
 ```
 
-> **升级前必读**
-> `deploy/install.sh` 只会**构建并部署当前这份源码**，不会 `git pull`、也不会去
-> GitHub 下载新版本。仓库目前**还没有发布正式 Release**，自动更新默认关闭
-> （`LING_UPDATE_ENABLED=0`）。想升级要先在宿主机上人工接管：取到新源码后重新运行
-> `install.sh`（它会保留 `deploy/.env` 与数据卷）。
-> 更新执行器（`deploy/update/`，默认不启用）只负责在**已经人工纳管**的机器上按
-> tag/commit 执行同一套安装流程；第一次纳管必须人工完成，见
-> [docs/UPDATES.md](docs/UPDATES.md)。
-> 升级前先备份数据库与 `deploy/.env`。API 容器是只读根文件系统、非 root，**没有
-> Docker socket**，也没有挂宿主源码树；真实 Docker 上的升级/回滚演练**尚未完成**，
-> 不要把自动更新当成已验证能力。
+首次启动会生成密钥和管理员账号。安装成功后显示控制台地址与用户名，随机初始密码
+只写入 API 启动日志，可用下面的日志命令查看；首次登录后需要修改密码。
 
-> 首次启动会**生成随机密码并打印在启动日志里**（安装脚本也会把它取出来显示）。
-> 只有 `deploy/install.sh --admin-user <名字>` 能改用户名；默认 `ling`。
-> 登录后会**强制要求修改密码**——随机口令只当一次性登船票。
+```bash
+bash deploy/upgrade.sh                # 拉取当前分支快进更新并部署
+bash deploy/install.sh --status      # 查看状态
+bash deploy/install.sh --logs api    # 查看 API 日志和首次登录密码
+bash deploy/install.sh               # 仅重新部署当前检出，不拉取代码
+bash deploy/install.sh --down        # 停止服务，保留数据
+```
+
+`deploy/upgrade.sh` 适用于源码安装，会获取当前分支远端并只接受快进更新，再调用标准安装
+流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
+镜像模式不使用这个脚本。网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动
+更新仍需按 [docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
+
+需要回滚保障时，升级前另行备份数据库和 `deploy/.env`。默认管理员名为 `ling`，可在首装
+时用 `--admin-user <名字>` 修改。
 
 ### 本地开发
 
 前置：`uv`（≥0.5）、`pnpm`（≥9）、`python3.11`（`scripts/dev_pg.sh` 用它跑便携
 PostgreSQL——`pgserver` 目前没有 3.13 的 wheel，所以 PostgreSQL 和运行 ling 的
 Python 是两份不同的解释器）。
+
+数据库地址需要显式配置。此前使用本地 SQLite 的用户应先备份旧文件及相关密钥，
+确认数据迁移与回退方案后再切换。下面的 PostgreSQL 示例不会自动导入旧数据。
+回退时保留旧版本、原数据库文件及其密钥，并恢复原有数据库配置。
 
 ```bash
 uv venv --python 3.13 .venv && . .venv/bin/activate
@@ -85,9 +84,13 @@ uv pip install -e ".[dev]"
 scripts/dev_pg.sh start                      # 便携 PostgreSQL，端口 55432（内部用 3.11）
 cd clients/web-console && pnpm install && pnpm build && cd ../..
 
+# 请先确认连接的是需要使用的数据库。
+export LING_DATABASE_URL='postgresql+asyncpg://ling@127.0.0.1:55432/ling'
 . scripts/dev_env.sh
 python -m ling                               # → http://127.0.0.1:8080
 ```
+
+连接地址支持 `postgresql://` 和 `postgresql+asyncpg://`。运行时使用 asyncpg 驱动，其他驱动格式会在启动前拒绝。
 
 默认 `LING_TEST_MODE=1`：对话由确定性 fake provider 生成，界面会固定显示测试模式提示。
 **测试模式不会调用真实模型**，用于开发与回归。
@@ -152,7 +155,7 @@ contracts/       导出的 JSON Schema
 - [API 契约](docs/API-WEB-V1.md)
 - [设置分类](docs/SETTINGS-TAXONOMY.md)
 - [架构决策记录 (ADR)](docs/adr/)
-- [升级与自动更新](docs/UPDATES.md)（默认关闭，未在真实 Docker 上演练）
+- [升级与自动更新](docs/UPDATES.md)（网页自动更新默认关闭；源码安装与升级的隔离实测绑定历史快照 `0cfc9be`）
 - [注意力设计](docs/ATTENTION-DESIGN.md) · [自主性设计](docs/AUTONOMY-DESIGN.md) · [群聊轮询](docs/GROUP-POLLING-DESIGN.md)
 
 ## 开发
@@ -175,9 +178,31 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：仓库目前**没有发布正式 Release**，也没有经过真实 Docker 的升级/回滚
-演练。`install.sh` 只部署当前源码；自助更新默认关闭，第一次升级必须人工纳管，
-见 [docs/UPDATES.md](docs/UPDATES.md)。
+发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
+记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
+`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（含 Web/CLI 实现提交
+`1edc369`、`981a815`），尚未合入 `main`、打 tag 或发布。GitHub
+`main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选仍不满足 release
+workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器实例 generation 刷新和
+自定义 updater 项目名修复。远端状态、复验文件哈希与提交边界见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+
+此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
+不能当作当前候选验收。`981a815` 已在 5.21 隔离项目通过非默认 OneBot 两轮保存的
+真实 Chromium/API/PostgreSQL 路径；`ab0ddf4` 的 API/updater SHA 镜像也已在独立 5.21
+Compose 项目安装并运行。候选镜像的 `/readyz`、版本/提交、迁移 head、运行摘要与专属卷
+均核对通过；真实 Chromium 登录总览、关系页和连接器页 API 请求、375px 布局，以及新标签/
+刷新会话恢复均通过。`ling backup` 和隔离 `restore-drill` 通过，更新器容器以固定摘要运行，
+自动更新开关保持关闭。测试启用了 `LING_TEST_MODE=1`，不代表真实模型能力。PR CI 的
+Python 3.12 首轮有一条 QQBot 投递用例失败，单 job 重跑通过，原因未定位；细节见
+[验收记录](docs/evidence/release-0.0.9-acceptance.md)。候选的源码模式首装/升级、关系合并/
+拆分、候选 updater 实际执行网页更新和稳定版网页升级仍未验收。GHCR 最高稳定 tag 仍为
+`v0.0.8`；SHA-only 镜像不等于 `v0.0.9` Release。自助更新默认关闭。历史部署范围见
+[隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
+[更新说明](docs/UPDATES.md)。
+
+镜像安装器使用自定义 `--project <应用项目名>` 时，updater 项目名会派生为
+`<应用项目名>-updater`，而 updater 内的 `LING_COMPOSE_PROJECT` 仍指向应用项目；
+详见 [DEPLOYMENT.md §11](docs/DEPLOYMENT.md#11-镜像模式部署推荐)。
 
 ## 安全与隐私
 

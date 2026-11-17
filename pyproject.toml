@@ -1,6 +1,6 @@
 [project]
 name = "ling"
-version = "0.0.8"
+version = "0.0.9"
 description = "ling：独立的拟人化 AI 角色系统（会话优先）"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,7 +21,6 @@ dependencies = [
   "pydantic-settings>=2.5,<3",
   "sqlalchemy[asyncio]>=2.0.35,<2.1",
   "asyncpg>=0.29,<1",
-  "aiosqlite>=0.20,<1",
   "alembic>=1.13,<2",
   "httpx>=0.27,<1",
   "python-multipart>=0.0.9,<1",
@@ -44,6 +43,7 @@ dev = [
   "pytest-asyncio>=0.24,<1",
   # 并行跑用例：CI 上 3126 个用例串行要 35 分钟，4 核上并行约 10 分钟。
   "pytest-xdist>=3.6,<4",
+  "jsonschema>=4.23,<5",
   "ruff>=0.6,<1",
   "mypy>=1.11,<2",
 ]

@@ -150,7 +150,7 @@
 | --- | --- |
 | `domains/presence/` | **已接线**：457 行（`service.py` 273 + `load.py` 167），被 `kernel/self_view.py:103`（自我视图的在场/场景）、`api/routes/dashboard.py:227`（面板）、`kernel/autonomy.py:554`、`worker.py:1566` 消费 |
 | `capabilities/embodiment.py` | 321 行，只被 `manage.py` 当状态字符串读，**无功能接线** |
-| `ports/speech.py` | 入站**有**链路（`POST /speech/segments` → `SpeechService` 落库，final 才进主链）；**无**按模型职责构造的 ASR/TTS provider，`/v1/speech` 恒返回 `configured: False`。`speech.asr`/`speech.tts`/`realtime.voice` 因此已移入 `RESERVED_PROFILES`，设置页不再展示 |
+| `ports/speech.py` | 入站转写与回复语音均已接线：ASR 支持 SiliconFlow / DashScope，TTS 支持 MiniMax / FishAudio / MiMo；`/v1/speech` 按已配置 provider 返回状态。自动化覆盖使用替身 provider 的接线与 API 行为；当前候选尚未用真实厂商凭据验证识别、合成和实际播放 |
 | 视觉/相机/位置 | **图片描述已进模型输入**（`kernel/context.py:384-395` 的 media 车道，含"推断"标注）；**相机与位置不进**——`media_refs` 之外的采集本就没有实现，且 `perception.camera`/`perception.location` 被 `PolicyGate` 硬门拦（未授权默认拒绝） |
 | 工具调用 | `/v1/tools` 可单独调，但 `ModelRequest` **没有 tools 字段**，不进对话环 |
 | 公开发布 | 默认关闭，仅审批流骨架 |

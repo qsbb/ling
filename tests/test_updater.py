@@ -153,6 +153,7 @@ BACKUP_GATE_KEYS = {
 }
 TASK_VIEW_KEYS = {
     "request_id",
+    "download_source",
     "state",
     "stage",
     "started_at",
@@ -213,7 +214,7 @@ def image_labels(version_env, default, revision):
 def target_image():
     return {
         "Id": "sha256:target-image",
-        "RepoDigests": [os.environ["STUB_TARGET"]],
+        "RepoDigests": [os.environ.get("STUB_TARGET_REPO_DIGEST", os.environ["STUB_TARGET"])],
         "Architecture": os.environ.get("STUB_IMAGE_ARCH", os.environ["STUB_HOST_ARCH"]),
         "Os": "linux",
         "Size": 100 * 1024 * 1024,
@@ -598,6 +599,9 @@ if args[0] == "volume" and len(args) > 1 and args[1] == "inspect":
         for name in args[2:]
     ])
     sys.exit(0)
+
+if args[0] == "pull":
+    sys.exit(int(os.environ.get("STUB_MIRROR_PULL_EXIT", "0")))
 
 if args[0] != "compose":
     # tag/save/load 等归档类命令：更新器**不**做镜像归档，出现即视为回归。
@@ -2450,6 +2454,132 @@ def test_success_path_uses_target_digest_and_records_identity(ws: Workspace) -> 
     assert ws.docker_state()["api_port_published"] is True
 
 
+def test_direct_pull_skips_configured_mirror(ws: Workspace) -> None:
+    write_request(ws)
+    result = run_updater(ws, env={
+        "LING_UPDATER_GHCR_MIRROR": "registry.example.invalid/ghcr.io/qsbb/ling-api",
+    })
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not [line for line in ws.calls() if line.startswith("docker pull ")]
+    assert any(" pull api worker" in line for line in ws.compose_calls())
+    assert ws.task()["state"] == "succeeded"
+    assert f"LING_APP_IMAGE={TARGET}\n" in ws.env_file.read_text()
+
+
+def test_mirror_prefetch_keeps_canonical_digest_for_deployment(ws: Workspace) -> None:
+    mirror = "registry.example.invalid/ghcr.io/qsbb/ling-api"
+    write_request(ws, extra={"download_source": "mirror"})
+    result = run_updater(ws, env={"LING_UPDATER_GHCR_MIRROR": mirror})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = ws.calls()
+    prefetch = f"docker pull {mirror}@sha256:{TARGET_HEX}"
+    prefetch_index = calls.index(prefetch)
+    canonical_pull = next(i for i, call in enumerate(calls) if " pull api worker" in call)
+    assert prefetch_index < canonical_pull
+    assert ws.task()["state"] == "succeeded"
+    assert ws.task()["target"]["digest"] == TARGET
+    assert f"LING_APP_IMAGE={TARGET}\n" in ws.env_file.read_text()
+    assert ws.status()["updater"]["mirror_available"] is True
+    assert "mirror" in ws.status()["updater"]["download_sources"]
+    assert ws.status()["task"]["download_source"] == "mirror"
+    assert mirror not in ws.status_text()
+
+
+@pytest.mark.parametrize("port", ["1", "443", "65535"])
+def test_mirror_repository_valid_port_is_reported_and_used(ws: Workspace, port: str) -> None:
+    mirror = f"registry.example.invalid:{port}/ghcr.io/qsbb/ling-api"
+    write_request(ws, extra={"download_source": "mirror"})
+    result = run_updater(ws, env={"LING_UPDATER_GHCR_MIRROR": mirror})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert ws.status()["updater"]["mirror_available"] is True
+    assert "mirror" in ws.status()["updater"]["download_sources"]
+    assert f"docker pull {mirror}@sha256:{TARGET_HEX}" in ws.calls()
+    assert mirror not in ws.status_text()
+
+
+@pytest.mark.parametrize(("source", "repository"), [
+    ("gh_proxy", "gh-proxy.com/docker/ghcr.io/qsbb/ling-api"),
+    ("gh_proxy_hk", "hk.gh-proxy.com/docker/ghcr.io/qsbb/ling-api"),
+    ("gh_proxy_edgeone", "edgeone.gh-proxy.com/docker/ghcr.io/qsbb/ling-api"),
+])
+def test_builtin_sources_prefetch_same_digest_and_keep_official_identity(
+    ws: Workspace, source: str, repository: str
+) -> None:
+    write_request(ws, extra={"download_source": source})
+    result = run_updater(ws)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = ws.calls()
+    prefetch = f"docker pull {repository}@sha256:{TARGET_HEX}"
+    canonical_pull = next(i for i, call in enumerate(calls) if " pull api worker" in call)
+    assert calls.index(prefetch) < canonical_pull
+    assert f"LING_APP_IMAGE={TARGET}\n" in ws.env_file.read_text()
+    assert ws.status()["task"]["download_source"] == source
+    assert source in ws.status()["updater"]["download_sources"]
+    assert ws.status()["updater"]["mirror_available"] is False
+    assert "mirror" not in ws.status()["updater"]["download_sources"]
+
+
+@pytest.mark.parametrize("source", ["gh_proxy", "gh_proxy_hk", "gh_proxy_edgeone"])
+def test_builtin_prefetch_failure_never_enters_migration(ws: Workspace, source: str) -> None:
+    write_request(ws, extra={"download_source": source})
+    result = run_updater(ws, env={"STUB_MIRROR_PULL_EXIT": "1"})
+    assert result.returncode == 14
+    assert any(line.startswith("docker pull ") for line in ws.calls())
+    assert not [line for line in ws.compose_calls() if " pull " in line or " run " in line]
+    assert ws.task()["migration"]["attempted"] is False
+    assert ws.status()["task"]["download_source"] == source
+    assert f"LING_APP_IMAGE={OLD_REF}\n" in ws.env_file.read_text()
+
+
+def test_builtin_prefetch_still_rejects_wrong_official_digest(ws: Workspace) -> None:
+    write_request(ws, extra={"download_source": "gh_proxy"})
+    result = run_updater(ws, env={"STUB_TARGET_REPO_DIGEST": OLD_REF})
+    assert result.returncode == 14
+    assert any(line.startswith("docker pull gh-proxy.com/") for line in ws.calls())
+    assert any(" pull api worker" in line for line in ws.compose_calls())
+    assert ws.task()["failure"]["stage"] == "updater_self_check"
+    assert ws.task()["migration"]["attempted"] is False
+    assert f"LING_APP_IMAGE={OLD_REF}\n" in ws.env_file.read_text()
+
+
+def test_mirror_prefetch_failure_never_enters_migration(ws: Workspace) -> None:
+    write_request(ws, extra={"download_source": "mirror"})
+    result = run_updater(ws, env={
+        "LING_UPDATER_GHCR_MIRROR": "registry.example.invalid/ghcr.io/qsbb/ling-api",
+        "STUB_MIRROR_PULL_EXIT": "1",
+    })
+    assert result.returncode == 14
+    assert not [line for line in ws.compose_calls() if " pull " in line or " run " in line]
+    assert ws.task()["migration"]["attempted"] is False
+    assert f"LING_APP_IMAGE={OLD_REF}\n" in ws.env_file.read_text()
+
+
+@pytest.mark.parametrize("mirror", [
+    "https://registry.example.invalid/repo",
+    "user:password@registry.example.invalid/repo",
+    "registry.example.invalid/repo:latest",
+    "registry.example.invalid/repo;true",
+    "registry.example.invalid:0/repo",
+    "registry.example.invalid:00000/repo",
+    "registry.example.invalid:65536/repo",
+    "registry.example.invalid:99999/repo",
+    "registry.example.invalid:100000/repo",
+    "",
+])
+def test_mirror_requested_without_valid_configuration_does_not_pull(
+    ws: Workspace, mirror: str
+) -> None:
+    write_request(ws, extra={"download_source": "mirror"})
+    result = run_updater(ws, env={"LING_UPDATER_GHCR_MIRROR": mirror})
+    assert result.returncode == 14
+    assert not [line for line in ws.calls() if line.startswith("docker pull ")]
+    assert not [line for line in ws.compose_calls() if " pull " in line or " run " in line]
+    assert ws.status()["updater"]["mirror_available"] is False
+    assert "mirror" not in ws.status()["updater"]["download_sources"]
+    if mirror:
+        assert mirror not in ws.status_text()
+
+
 def test_success_persists_target_digest_into_app_env_file(ws: Workspace) -> None:
     """缺陷①：更新成功后**宿主** `.env` 必须真的指向目标摘要（真实文件断言）。"""
     before = ws.env_file.read_bytes()
@@ -2609,7 +2739,7 @@ def test_status_file_is_sanitized_and_fixed_shape(ws: Workspace) -> None:
     status = ws.status()
     assert set(status) == STATUS_KEYS
     assert set(status["task"]) == TASK_VIEW_KEYS
-    assert set(status["updater"]) == {"state", "version"}
+    assert set(status["updater"]) == {"state", "version", "mirror_available", "download_sources"}
     # 加法字段的形状也是固定码表（不放自由文本、不放路径、不放主机名）。
     check = status["release_check"]
     assert set(check) == RELEASE_CHECK_KEYS
