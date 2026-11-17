@@ -1920,10 +1920,11 @@ compose up -d --force-recreate api
    > 截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；API 发布时间为
    > `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。本轮只读核验 GHCR
    > `v0.0.8` API/updater index digest 与 amd64、arm64 平台摘要，未发现 `v0.0.9` tag。
-   > 当前 `0.0.9` 候选位于 PR #1，含实现提交 `1edc369` 与 `981a815`，尚未合入或打 tag。GitHub
-   > `main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选不是 `main`
-   > 祖先，release tag 门禁未满足。此前源码隔离部署验证绑定历史快照 `0cfc9be`；5.21 本轮实跑只覆盖
-   > 连接器两轮保存与旧稳定镜像下的 CLI 首装，细节见验收记录。
+   > 代码/运行候选 `ab0ddf4` 位于 PR #1，含实现提交 `1edc369` 与 `981a815`；文档更新后 PR head 另有 docs-only 提交。
+   > 尚未合入或打 tag。GitHub `main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选不是
+   > `main` 祖先，release tag 门禁未满足。历史源码隔离部署绑定 `0cfc9be`；`ab0ddf4` 的镜像模式
+   > 首装、健康、固定摘要与真实浏览器/API 路径已在独立 5.21 项目验收，源码模式升级和网页更新仍未完成。
+   > 详细边界见[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
    Docker/Compose 与 GHCR 拉取权限：
@@ -2038,10 +2039,11 @@ python3 deploy/release/publish.py \
 `.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
 `deploy/releases.json` 决定。`v0.0.8` 已正式发布；2026-11-17 只读查询 GHCR 核对到
 API 与 updater 的 index/platform digest，明细见[候选验收记录](evidence/release-0.0.9-acceptance.md)。
-本轮未检查生产环境。文档修订前代码 head `8fc335b` 的 SHA API/updater 镜像已由 workflow `43989637070`
-构建并验证 OCI revision 与双平台 index；本次 docs-only 提交改变 PR head，需为新 head 重建镜像。尚未在 5.21 隔离项目启动候选镜像或执行
-真实网页版本升级。连接器两轮保存和旧稳定镜像下的 CLI 首装不替代该验收，因此
-仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
+本轮未检查生产环境。代码/运行候选 `ab0ddf4` 的 SHA API/updater 镜像由 workflow `44015600964`
+构建并核验 OCI revision 与双平台 index，且在 5.21 全新隔离项目实际安装；API、worker、PostgreSQL
+健康，运行摘要、迁移 head、专属数据卷、更新器摘要及浏览器登录/页面路径均核验通过。该环境启用
+`LING_TEST_MODE=1`，网页更新开关仍为 0；没有执行候选 updater 更新任务或 `v0.0.8 → v0.0.9`
+真实网页升级。因此仍不要宣称当前候选已通过网页更新验收（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 
 ### 11.4 三条硬边界

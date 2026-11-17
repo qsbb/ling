@@ -20,10 +20,10 @@
 
 ### 验证范围
 
-- PR #1 对应代码候选的全量 Python pytest 持隔离 PostgreSQL 锁运行，退出码 0、进度 100%；`-q` 未输出汇总行，日志见验收记录。PR CI Python 3.12/3.13 与 Web 均通过；Web 本机全套 1042 passed、1 skipped，构建、Ruff、版本和 release catalog 检查通过。
-- 文档修订前代码 head `8fc335b` 的 workflow_dispatch run `43989637070` 构建并校验了 API/updater 双平台 SHA 镜像。5.21 隔离 smoke 覆盖真实登录、OneBot 两轮保存与 PG 读回、关系列表读取及窄屏布局、日程一次 202；第二次生成请求被预算/模型门禁 409 拒绝。关系合并/拆分、新标签刷新与稳定版网页升级仍未完成。浏览器组件测试对 `/v1` 使用 route mock。详见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+- 代码候选全量 Python pytest 在隔离 PostgreSQL 锁内两次退出码 0、进度 100%；`-q` 无用例总数。PR CI run `44006742093` 最终 Python 3.12/3.13 与 Web 均通过；Python 3.12 首轮一条 QQBot 投递测试失败、重跑通过，原因未定位。Web 本机全套 1042 passed、1 skipped，构建、Ruff、版本和 release catalog 检查通过。
+- SHA-only workflow `44015600964` 为 `ab0ddf4` 构建并核验 API/updater 双平台镜像。隔离 5.21 项目用这两个固定摘要完成镜像首装、迁移、健康与版本/卷身份核验；真实 Chromium 登录、新标签/刷新、关系/连接器页 API 与窄屏布局通过；备份和隔离恢复演练通过。测试模式启用，且网页更新开关关闭，因此真实网页升级、关系合并/拆分、真实模型能力仍未验。浏览器组件测试的 `/v1` 使用 route mock。详见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
 - 历史隔离 Docker 安装、升级、备份与恢复结果绑定 `0cfc9be`；早期 34/34 浏览器结果绑定更早快照，均不改写为当前候选结果，详见隔离部署记录。
-- 已验证的代码 head 有 SHA-only image/updater 镜像，但没有 `v0.0.9` 稳定 tag 或 Release。候选尚未合入 main；5.21 候选容器与稳定版网页升级验收未完成，文档提交后的新 head 还需自己的 SHA 镜像。发布状态仍为 No-Go。
+- `ab0ddf4` 有 SHA-only API/updater 镜像及隔离候选容器运行证据，但没有 `v0.0.9` 稳定 tag 或 Release。候选尚未合入 main；稳定版网页升级与 updater 实际更新链路仍未验。发布状态仍为 No-Go。
 
 ## [0.0.8] - 2026-11-13
 

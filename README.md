@@ -188,14 +188,15 @@ workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器
 
 此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
 不能当作当前候选验收。`981a815` 已在 5.21 隔离项目通过非默认 OneBot 两轮保存的
-真实 Chromium/API/PostgreSQL 路径；另用 `ling install` 在隔离项目启动旧稳定版
-`v0.0.8` API/updater 镜像，验证自定义项目名传递。两项只覆盖连接器保存和 CLI 启动，
-同一 CLI 隔离项目的备份/恢复也读回 PG 哨兵并核对媒体指纹；该项目作为未来单跳
-`v0.0.8 → v0.0.9` 网页升级基线保留，尚未实际升级。这些结果不代表当前候选 updater
-镜像或网页升级通过。原始快照的全量 Python/Flutter、当前候选的 Web 全套与 CLI 定向
-检查结果见[验收记录](docs/evidence/release-0.0.9-acceptance.md)；本轮只读核实了当前
-GHCR 稳定 tag 与 `v0.0.8` 镜像摘要，没有 `v0.0.9` 稳定 tag。最终候选的 SHA 镜像已由
-workflow `43989637070` 为文档修订前代码 head `8fc335b` 构建：API index `sha256:5e9ad176bf647ea688bdb5a4482913319e69a2b70ec7dc8025f28253131116ea`，updater index `sha256:52c368e6d50404486f15b28e87a5307e25e7bd8210d2961cd47e61ec069706ad`。文档提交会产生新 PR head，应另按该 SHA 构建。当前候选 updater 镜像尚未在 5.21 容器中运行，源码模式首装/升级和稳定版网页升级仍未验收。自助更新默认关闭。历史部署范围见
+真实 Chromium/API/PostgreSQL 路径；`ab0ddf4` 的 API/updater SHA 镜像也已在独立 5.21
+Compose 项目安装并运行。候选镜像的 `/readyz`、版本/提交、迁移 head、运行摘要与专属卷
+均核对通过；真实 Chromium 登录总览、关系页和连接器页 API 请求、375px 布局，以及新标签/
+刷新会话恢复均通过。`ling backup` 和隔离 `restore-drill` 通过，更新器容器以固定摘要运行，
+自动更新开关保持关闭。测试启用了 `LING_TEST_MODE=1`，不代表真实模型能力。PR CI 的
+Python 3.12 首轮有一条 QQBot 投递用例失败，单 job 重跑通过，原因未定位；细节见
+[验收记录](docs/evidence/release-0.0.9-acceptance.md)。候选的源码模式首装/升级、关系合并/
+拆分、候选 updater 实际执行网页更新和稳定版网页升级仍未验收。GHCR 最高稳定 tag 仍为
+`v0.0.8`；SHA-only 镜像不等于 `v0.0.9` Release。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
 
