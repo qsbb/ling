@@ -523,6 +523,27 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _install_owner_handoff_stubs(backup_env: dict[str, object], tmp_path: Path, *, runner_uid: str) -> Path:
+    """模拟目录属主探测和 chown，不修改宿主文件属主。"""
+    bin_dir = backup_env["bin"]
+    assert isinstance(bin_dir, Path)
+    chown_calls = tmp_path / "chown.calls"
+    _write_executable(
+        bin_dir / "id",
+        f'#!/bin/sh\n[ "$1" = "-u" ] && {{ echo "{runner_uid}"; exit 0; }}\nexit 2\n',
+    )
+    _write_executable(bin_dir / "stat", "#!/bin/sh\nprintf '%s\\n' '12002:12002'\n")
+    _write_executable(
+        bin_dir / "chown",
+        '#!/bin/sh\nprintf \'%s\\0\' "$@" >> "${CHOWN_CALLS:?}"\n'
+        'exit "${CHOWN_EXIT:-0}"\n',
+    )
+    env = backup_env["env"]
+    assert isinstance(env, dict)
+    env["CHOWN_CALLS"] = str(chown_calls)
+    return chown_calls
+
+
 def _tar_bytes(entries: dict[str, bytes]) -> bytes:
     """在内存里造一份真实 tar：backup.sh 会用本地 ``tar -tf`` 校验完整性。"""
     buffer = io.BytesIO()
@@ -847,6 +868,49 @@ def test_compose_backup_includes_root_key_and_media(
     assert run.calls("CP_CALLS") == []
     # 半成品全部清理。
     assert run.leftovers() == []
+
+
+def test_compose_backup_hands_private_artifacts_to_backup_directory_owner(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    """root cron/CLI 的产物要交给拥有隔离备份目录的非 root updater。"""
+    chown_calls = _install_owner_handoff_stubs(backup_env, tmp_path, runner_uid="0")
+    env = dict(backup_env["env"])
+    env["LING_ROOT_KEY"] = ROOT_KEY_BODY
+    run = _run_backup(tmp_path, env)
+    assert run.proc.returncode == 0, run.outputs()
+
+    args = chown_calls.read_bytes().split(b"\0")
+    assert args[-1] == b""
+    handed_paths = {Path(value.decode()) for value in args[2:-1]}
+    manifest = next(run.out.glob("manifest-*.txt"))
+    fields = run.manifest()
+    assert args[:2] == [b"-h", b"12002:12002"]
+    assert {
+        run.out / fields["dump"],
+        run.out / fields["tombstones"],
+        manifest,
+        run.out / fields["media"],
+        run.out / "keys",
+        run.out / "keys" / "root.key",
+    } <= handed_paths
+    assert (run.out / fields["media"]).stat().st_mode & 0o777 == 0o600
+    assert (run.out / "keys" / "root.key").stat().st_mode & 0o777 == 0o600
+
+
+def test_compose_backup_handoff_failure_does_not_claim_success(
+    tmp_path: Path, backup_env: dict[str, object]
+) -> None:
+    chown_calls = _install_owner_handoff_stubs(backup_env, tmp_path, runner_uid="0")
+    env = dict(backup_env["env"])
+    env["LING_ROOT_KEY"] = ROOT_KEY_BODY
+    env["CHOWN_EXIT"] = "1"
+    run = _run_backup(tmp_path, env)
+
+    assert run.proc.returncode == 8, run.outputs()
+    assert "无法把恢复点交给目录属主" in run.proc.stderr, run.proc.stderr
+    assert next(run.out.glob("manifest-*.txt")).is_file()
+    assert chown_calls.is_file()
 
 
 def test_absent_key_and_media_are_recorded_explicitly(
