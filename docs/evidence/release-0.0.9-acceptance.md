@@ -123,11 +123,11 @@ Successful jobs verified `version=0.0.9`, `revision=ab0ddf41b81245bce40701ea1fdf
 
 该候选项目 `ling backup` 生成完整 dump，CLI 校验 `dump_sha256` 与 manifest 一致；`ling restore-drill` 恢复到项目专属 `_drill` 数据库，通过关键表、墓碑和媒体覆盖核对。新库行数为 `users=1, windows=0, turns=0, messages=0, memories=0`，因此本次没有非空业务数据哨兵可证明有记录被恢复。备份后 `ling doctor` 为 `ok=27, warn=1, fail=0`；唯一 warn 为隔离项目没有 root crontab 备份任务。上述步骤均未触碰生产库、NAS 或 `v0.0.8` 基线项目。
 
-候选 updater 的镜像和运行容器身份已验，但因自动更新开关保持关闭且 GHCR 尚无 `v0.0.9` 稳定 tag，仍未验证候选 updater 的真实更新任务阶段/耗时、重复/并发、断线、忙闲重启、中断对账、迁移故障、maintenance gate，或稳定版网页升级前后的 Cookie/配置/PostgreSQL/媒体状态。因此候选镜像启动通过不代表更新链路通过。
+截至 2026-11-17，候选 updater 的镜像和运行容器身份已验，但自动更新开关保持关闭且 GHCR 尚无 `v0.0.9` 稳定 tag；当时尚未验证候选 updater 的真实更新任务阶段/耗时、重复/并发、断线、忙闲重启、中断对账、迁移故障、maintenance gate，或稳定版网页升级前后的 Cookie/配置/PostgreSQL/媒体状态。因此候选镜像启动通过不代表更新链路通过。
 
 **A6 判定：部分通过。** 候选 API/updater 固定摘要已在独立 5.21 项目实际启动，status/doctor、真实 Chromium 登录与页面/API 路径、首份备份和隔离 restore-drill 通过；真实网页更新及 updater 故障注入仍未验。
 
-### A7：稳定版网页更新
+### A7：稳定版网页更新（截至 2026-11-17）
 
 GHCR 只读查询没有 `v0.0.9` 稳定 tag 或对应 digest。未创建 tag/Release，也未在隔离镜像部署中从 `v0.0.8` 经 GHCR 直连及可达加速线路升级。旧镜像上的检查请求不是版本升级。5.21 CLI 隔离项目已保留作升级基线。若正式流程只产生一个新的稳定版本，本轮最多能验一跳 `v0.0.8 → v0.0.9`；没有第二个可区分的稳定摘要时，不得宣称两跳连续升级已验，也不伪造 tag 或放宽 updater 校验。
 
@@ -169,7 +169,7 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 
 **A8 判定：通过（记录区分原始基线、最终代码候选、旧镜像报告与 mock 边界；不代表发布门禁通过）。**
 
-### 最终判定
+### 最终判定（截至 2026-11-17）
 
 | ID | 结论 |
 |---|---|
@@ -184,4 +184,108 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 
 **整体 Go/No-Go：No-Go。** 候选不在 `main` 祖先链；候选 updater 的实际更新任务与稳定版网页升级仍未验，且当前没有 `v0.0.9` 稳定 tag 可供单跳升级。
 
-**剩余门禁：**`ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR head `3a7a1f8` 的 CI 三项也通过。本条文档说明是在该 run 后新增，待新 head CI。合并后还须对 main 合并提交运行 SHA-only image workflow，再创建稳定 tag。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。此快照时 PR 尚未合并，本轮没有创建稳定 tag/Release 或访问 NAS 生产端。
+
+**剩余门禁（该历史快照）：**`ab0ddf4` 的 PR CI、SHA-only 双镜像及 5.21 隔离容器/普通浏览器页面路径已验；PR head `3a7a1f8` 的 CI 三项也通过。本条文档说明是在该 run 后新增，待新 head CI。合并后还须对 main 合并提交运行 SHA-only image workflow，再创建稳定 tag。源码模式首装/升级、关系合并/拆分、稳定版单跳网页升级、updater 执行真实更新任务及直连/加速/断线/中断对账未完成。此快照时 PR 尚未合并，本轮没有创建稳定 tag/Release 或访问 NAS 生产端。
+
+### 2026-11-18 发布后复验
+
+本节更新当前发布和实际更新状态；上文各项仍保留其观测日期与历史边界。目标范围限于命名隔离项目与本地工作树，没有连接 NAS 或生产部署。
+
+**A1：当前快照与远端身份**
+
+- 发布代码、`origin/main` 与 `v0.0.9` tag 解引用均为 `f381a8c76df43a24b60944c91e22be46501bbd8c`；验收分支为 `lingxi/release-0.0.9-final-acceptance`，本轮开始时的文档提交为 `d43f3af4042e7488711d240450319498cdbf66c3`。本节复验只涉及文档和 5.21 上的隔离测试资源，没有改版本、源代码、测试或部署实现。
+- GitHub Release [`v0.0.9`](https://github.com/qsbb/ling/releases/tag/v0.0.9) 的发布时间为 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）。release workflow [run `44112900865`](https://github.com/qsbb/ling/actions/runs/44112900865) 的 verify、Python 3.12/3.13、Web、mobile、API image、updater-image 与 release jobs 全部成功。
+- 同一 SHA 的较早 push CI run `44102373375` 中，Python 3.12 的 `test_slow_media_does_not_block_ordinary_events` 失败（“慢媒体把普通事件也堵住了”）；release workflow 对该 SHA 重跑全绿。失败原因未定位，保留为间歇风险。
+- GHCR `v0.0.9` index 与平台 manifest：
+
+  | 镜像 | index digest | linux/amd64 manifest | linux/arm64 manifest |
+  |---|---|---|---|
+  | `ghcr.io/qsbb/ling-api:v0.0.9` | `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756` | `sha256:0cca394aa99aef2be8c0d71f8e2a44650ae8407b542a06f011dbb196522a6b20` | `sha256:68e60fc2162fd288b337c5847d2be17597a73d3c0325d5304d30464afc5cb321` |
+  | `ghcr.io/qsbb/ling-updater:v0.0.9` | `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429` | `sha256:6a77a0e8a9dd85915f59108167365fafece0a2c5c5637d06afc3dd4af25565ee` | `sha256:c82cce538de2b290f073b9cdafdc2df3510fe3f328a392d65e82e710a8c853ad` |
+
+- Registry manifest/config reads confirmed both indexes contain amd64 and arm64, and all platform image labels report `version=0.0.9`, `revision=f381a8c76df43a24b60944c91e22be46501bbd8c`, source `https://github.com/qsbb/ling`.
+
+**A2：当前候选真实浏览器路径**
+
+- 独立源码项目 `ling-src-one-line-20261118` 的 checkout 为完整 SHA `f381a8c76df43a24b60944c91e22be46501bbd8c`；API、worker、PostgreSQL healthy，迁移 head `0078_proactive_daily_quota`，端口 `20488`，应用卷为 `ling-src-one-line-20261118_app-data`。首次安装前账户有强制改密标志。真实 Chromium 完成登录、强制改密（接口 204）、改密后 `/v1/auth/me` 与 dashboard 200；之后 `LING_TEST_MODE=1` 的 W0 套件通过 34/34，包含桌面/手机聊天、刷新、停止/重试、设置、账号及总览路径。日志 `/tmp/ling-w0-candidate-0.0.9-20261118.log`。
+- 测试期间以 Compose 环境覆盖临时启用 `LING_TEST_MODE=1`，测试后用原 `.env` 重建 API/worker，确认 `LING_TEST_MODE=0` 且 `/readyz=200`。临时口令通过恢复表保存原哈希后使用；测试结束原哈希、更新时间和 `must_change_password=true` 均核对恢复，7 个测试会话吊销，恢复表删除。浏览器套件新增的对话数据留在此命名隔离测试库。
+- 旧版源码项目 `ling-src-upgrade-20261118`（`v0.0.8` commit `0d36dbadc4c8f688df2775e81f1e5e795006a271`）W0 套件通过 34/34，日志 `/tmp/ling-w0-source-acceptance-20261118-r1-redacted.log`。第一次使用错误测试账号时登录失败，没有通过鉴权或执行写操作；随后用临时账户口令重跑。原密码哈希与账户标记已恢复，17 个测试会话吊销。
+- 发布后新增的固定源码检查中，`ling-src-bootstrap-release009-20261118` 的 `v0.0.8` checkout W0 套件通过 34/34，日志 `/tmp/ling-w0-bootstrap-old-source-v0.0.8-20261118.log`；`v0.0.8` 镜像项目 `ling-image-current-updater-20261118` 的 W0 套件为 32/33，唯一失败是“桌面：失败后可见重试按钮”，日志 `/tmp/ling-w0-image-current-updater-v0.0.8-20261118.log`。截图中该错误场景实际收到正常 fake 回复；失败原因未定位，不能把这组镜像基线浏览器套件记为全通过。
+- 旧源码项目 `ling-src-release009-20261118` 升到候选后，候选 W0 套件通过 34/34，日志 `/tmp/ling-w0-source-v0.0.9-after-upgrade-20261118.log`。这些浏览器结果使用 `LING_TEST_MODE=1` 和 fake provider；它们不证明真实模型能力。关系合并/拆分、权限拒绝、大量数据分页和完整日程失败恢复仍未覆盖。
+
+**A3：源码模式安装与升级**
+
+- 固定 v0.0.8 checkout 的首次命令 `bash deploy/install.sh --project ling-src-release009-20261118 --port 20490` 在容器、卷和 `.env` 创建前以“缺 pnpm”退出 1；当时 5.21 没有 `pnpm`。在 Mac 对同一源码运行 `bash deploy/install.sh --build-web-only`、把匹配的 `dist` 复制到隔离 checkout 后，`--prebuilt-web` 首装成功。构建产物清单与源码匹配；安装创建项目专属卷，`.env` 权限为 0600。首装过程中出现一条非致命 `ports: command not found`，安装仍健康完成。
+- 源码实例 `ling-src-release009-20261118` 在 v0.0.8 上完成 W0 与媒体上传后，数据库 head 为 `0070_voice_reply_projection`，`users/windows/turns/messages/memories/media_evidence = 1/3/4/8/0/1`；媒体 SHA 分别为 `2c8772be6e1d925eded3b93729fda19d0f1cf31a3b9c8537a2a81d34921d8944` 和 `a3fc2de06e10af91f6360dc21db363f5c3abad53e51e15883a8e0b1b89461915`，`.env` SHA 为 `777f9b5898f8a6bc21c1e058b7aa62f3ca49882dab6dff270b7f9dbd6e55ad86`。项目专属 app/db 卷为 `ling-src-release009-20261118_app-data` / `ling-src-release009-20261118_db-data`。
+- 从 v0.0.8 checkout 原样执行 README 升级命令 `bash deploy/upgrade.sh --project ling-src-bootstrap-release009-20261118 --port 20493`，shell 在任何变更前以退出码 127 报 `deploy/upgrade.sh: No such file or directory`；该 tag 不包含此文件。因此 v0.0.8 部署不能按 v0.0.9 README 中的升级命令启动快进升级。
+- 另一个 v0.0.8 源码项目中，先人工 `git pull --ff-only` 到 `f381a8c`，再运行候选 `bash deploy/upgrade.sh --project ling-src-release009-20261118 --prebuilt-web`，源码部署成功。这证明候选安装脚本可在保留卷上升级旧 schema；但它不是从干净 v0.0.8 checkout 执行 README 单行升级命令，不能填补上面的 bootstrap 缺口。升级后 `/readyz=200`、head 为 `0078_proactive_daily_quota`、业务表计数保持 `1/3/4/8/0/1`，`.env` SHA、两个媒体 SHA 与 app/db 卷名不变；升级前浏览器 Cookie 的 `/v1/auth/me` 与 dashboard 在升级后均为 200。升级后 W0 34/34。
+- 单独的 `ling-src-bootstrap-release009-20261118` 在 v0.0.8 首装并通过 W0 34/34；README 升级脚本失败后，`docker compose down` 未删除数据卷。以同一 Compose/env 重新启动后，`/readyz=200`、数据库仍为 `0070|1|2|4|8|0`，媒体哨兵 SHA `e757e934e3e7fe56b2dca74b51be3d2e8e871f7b11f44bc5e4e2eac361fe6870`、`.env` SHA `573cc191a2a7ad86825885e0381c5a3d87e5d5789884d2216eeb598dce4a6e4b` 均保持。
+- 操作偏差与清理：一次候选 `install.sh --prebuilt-web` 忘记传 `--project`，误用默认项目名 `ling`；启动在端口 `20490` 已被目标隔离实例占用时失败。操作前已确认默认项目没有容器/卷；本次新建资源标签和创建时间均核对后，用该隔离 checkout 执行 `docker compose down --volumes --remove-orphans` 清理，确认没有 `ling` 项目容器/卷残留。目标 `ling-src-release009-20261118` 服务和卷未受影响；没有改动其他 Compose 项目。
+
+**A3 判定：部分通过，整体项未通过。** 候选源码部署在显式准备匹配前端并快进代码后能保留 PostgreSQL、配置、媒体和卷；但固定 v0.0.8 checkout 没有 README 要求的 `deploy/upgrade.sh`，而 5.21 直接源码首装缺少 `pnpm`。无法证明固定基线能按文档中的一行命令完成首装与升级。
+
+**A6/A7：隔离镜像更新实测**
+
+- 基线项目 `ling-image-accept-009-cli-20261117` 的 API/updater 原摘要分别为 `sha256:77a20bb9cfde183e64eb1349b773666fc673c6f4a945abe9d889451c026207f1` 与 `sha256:281736db4dedcb29643b01e1be52638c6a019ce7b282bb0d83895a067281fd0f`，两镜像 revision 均为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`。项目 `LING_UPDATE_ENABLED=1`、`LING_TEST_MODE=1`，数据库迁移 head 为 `0070_voice_reply_projection`，API/worker/PG 健康。
+- 更新前真实 Chromium W0 套件通过 34/34；隔离 PostgreSQL 为 `users/windows/turns/messages/memories = 1/2/4/8/0`。日志 `/tmp/ling-w0-image-v0.0.8-20261118.log`。此步骤使用测试 fake provider。
+- `ling backup` 退出 0；dump `ling-20261118-025321.dump` 的 SHA-256 为 `a51841de7a2b437ee5303f10fda2cfc6c2884074519c3b4266e7cbf287f7692f`，manifest/墓碑与媒体状态校验通过。`ling restore-drill --db ling_codex_a7_20261118_drill` 退出 0，在项目专属 `_drill` 数据库恢复 1 个用户并核对 dump、墓碑、媒体覆盖。Updater 重启后读取到完整恢复点 `backup-0df756761bf8`，`backup_gate=ok`。
+- 门禁诊断过程：旧状态的 `no_manifest` 时间早于既有备份；updater 重启后发现旧 root-owned `0600` manifest 但报告 `manifest_unreadable`。通过正式 `ling backup` 新建 manifest 后，updater 再次启动读取到完整恢复点并放行。没有手工改权限或绕过门禁；更新前已记录 `backup_gate=ok`。
+- 真实浏览器在 `/settings/about` 确认目标后选择默认 GHCR 直连、勾选迁移风险确认并提交；API 返回 `201`，request ID `0df756761bf887f9a4673b60b0ef76a3`。旧 `v0.0.8` updater 任务于 `2026-11-17T19:09:10Z` 开始、`19:10:02Z` 结束，状态 `succeeded`、最后阶段 `verify`，无失败码。迁移从 `0070_voice_reply_projection` 到 `0078_proactive_daily_quota`，maintenance gate `released/verified=true`；更新器备份完整，墓碑 `ok`，媒体 `absent` 与空媒体引用一致。
+- 更新后 API 与 worker 的 `RepoDigest` 均为 `ghcr.io/qsbb/ling-api@sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`，OCI labels 为 `0.0.9` / `f381a8c76df43a24b60944c91e22be46501bbd8c`，健康检查通过。PostgreSQL 仍为 `users/windows/turns/messages/memories = 1/2/4/8/0`；应用卷名保持 `ling-image-accept-009-cli-20261117_app-data`，端口与测试开关不变。主 `.env` SHA-256 从 `71394e4ff5eb81a22826d366ba26141ec6bd8af8f28cd924d39732973b0ac25a` 变为 `28ea37882b6e8a852bd862b3a1b0fc04aafafb1f7bec5da40928a738bc3d7231`，其中 `LING_APP_IMAGE` 更新到目标 digest；`updater/.env` SHA-256 保持 `a8b2078095c2a5b80ccba72741f717e249a893231fc12e569992503d4de2c252`。更新后原浏览器会话 `/v1/auth/me=200`、dashboard=200，cookie 指纹一致。
+- 该请求由旧 `v0.0.8` updater 镜像执行；`v0.0.9` updater 镜像已独立核验，但本次没有替换/验证它执行更新。任务有一条非阻断 warning：更新器容器看不到宿主 Docker 根目录，因此磁盘余量未核对。直连一跳成功不等于加速线路、并发/断线/中断故障路径或连续两跳验收。
+- 更新后已恢复 `ling` 测试账户原密码哈希/标志，吊销 9 个测试会话并删除临时恢复表；确认只留下该测试项目数据。没有触碰其他 Compose 项目、NAS 或生产端。
+
+**当前 v0.0.9 updater：v0.0.8 稳定镜像一跳复验**
+
+- 独立项目 `ling-image-current-updater-20261118` 用 v0.0.8 API index `sha256:77a20bb9cfde183e64eb1349b773666fc673c6f4a945abe9d889451c026207f1`、源提交 `0d36dbadc4c8f688df2775e81f1e5e795006a271`，以及当前 updater index `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429` 首装，项目与目录均独立，端口 `20492`。CLI 首装迁移到 `0070_voice_reply_projection` 后，updater 初次启动因宿主 Docker address pool 无空闲子网失败；只停止了本轮已完成的源码测试项目网络并保留卷，随后同一 updater 容器启动成功。此为测试宿主网络容量限制。
+- 更新前隔离 PostgreSQL 为 `0070_voice_reply_projection|1|3|4|8|0|1`；媒体上传文件和哨兵 SHA 分别为 `2c8772be6e1d925eded3b93729fda19d0f1cf31a3b9c8537a2a81d34921d8944` 与 `64eb1a1b0fd872f1e2da8ec690fceabd2bf36e847250eb25ab20d21656b523ef`。真实 Chromium W0 为 32/33，唯一失败项及边界见 A2。
+- 更新前 `ling backup` 成功：dump SHA `434250f41cd198991c872be52c6d5e9fa8196bda41bada65a48d55b87e0c568e`，媒体归档 SHA `1f78ee7942bc927d992f64fda4bd857d68ed56c1e573cc8ac42453dc8e4f958a`，`media_state=present`、`tombstones_state=ok`。`restore-drill` 在隔离库 `ling_image_current_updater_20261118_drill` 成功恢复 `1/3/4/8/0` 条 users/windows/turns/messages/memories，并核对媒体覆盖 `1/1`，未改业务库。
+- v0.0.8 实际运行的更新页没有下载线路选择控件，目标检查显示 v0.0.9 后默认经 GHCR 直连。浏览器勾选迁移风险并提交，API 返回 201，request ID `223384061f9ea72d907fa2bec221bf4f`，目标 API digest `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`。收到 201 后关闭浏览器；任务仍运行时没有该浏览器连接，随后重连查询结果。第一个轮询脚本因在未导航页面上使用相对 URL 失败；修正为先导航再轮询后，同一 request ID 显示 `succeeded`，升级后 `/v1/auth/me=200`、dashboard=200。
+- 当前 updater 任务于 `2026-11-17T21:33:45Z` 开始、`21:34:19Z` 结束，用时 34 秒；日志依次记录备份、迁移、维护门禁关闭、目标 API 内网验证、恢复宿主端口及最终 digest/head 核验。最后阶段 `verify`，无 failure、warnings 或 next actions，`maintenance=released/verified=true`。进度页显示五阶段全完成、用时 34 秒、来源“直连 GHCR”；updater 回到 online/idle，`backup_gate=ok`。
+- 更新后 API 与 worker 实际 RepoDigest 均为 v0.0.9 index，OCI revision 均为 `f381a8c76df43a24b60944c91e22be46501bbd8c`；updater 容器实际 digest 为 `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`，revision 同为 `f381a8c...`。PG head 为 `0078_proactive_daily_quota`，计数保持 `1/3/4/8/0/1`，媒体文件与哨兵 SHA 不变，app/db 卷名不变。env 权限均为 0600；更新后 API `.env` SHA 为 `47576eab844c1843bb51ffbb23054c0bec62274e280eae7450ac4009a979e1ee`，updater `.env` SHA 为 `46a33b234f2f72f6f05329d22527b36815e080399c353b6142e4512cc4aff51f`。
+- 更新成功后，`ling status` 仍以安装时的 v0.0.8 `install-state.json` 对照实时部署，报告 8 项记录/实况差异，包括 digest、commit/version、迁移 head 和最近备份；状态文件没有自动同步。本次没有手工改写记录来消除差异。
+- 上述 34 秒成功任务本身没有执行 GH-Proxy/EdgeOne/custom mirror 下载，也没有注入 busy restart、任务中断、migration/verify 故障或真实失败回滚。浏览器断开后该任务继续并成功只证明断线不会取消任务；后续独立中断实验见下节。v0.0.8 页面没有实际线路选择器。
+
+**2026-11-18：updater 中断与旧 API 线路字段复测**
+
+- 在独立项目 `ling-a6-interruption-20261118`（loopback `20521`）使用发布代码 checkout `f381a8c76df43a24b60944c91e22be46501bbd8c` 的安装器，固定 API/worker 到 v0.0.8 index `sha256:77a20bb9cfde183e64eb1349b773666fc673c6f4a945abe9d889451c026207f1`，更新器固定为 v0.0.9 index `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`。安装前该 Compose 项目、目录和端口均为空闲；初始迁移 head 为 `0070_voice_reply_projection`，API `/readyz=200`，更新页报告 v0.0.8 当前摘要及 v0.0.9 目标摘要，更新器 `online/idle`、protocol 1、version 1.0.0。
+- API 容器 ID `b1b0672343bb4510bad049ec8e85b6a7dc2daa0462d52dd3f1349b79ac999337`、worker `1b03ef7aab7e3e8d276df2f22833c7f431d186241ee7012d549b043c34762eb2`、PostgreSQL `23d2367753501051d497d1274f10cdb3e7d62f4efdab4ddde4fee25f3a402265`；API/worker 的 `Config.Image` 与 image ID 均为指定 v0.8 摘要，状态 healthy。中断后的独立核对仍得到 API 版本/提交 `0.0.8` / `0d36dbadc4c8f688df2775e81f1e5e795006a271`、PG head `0070_voice_reply_projection`、计数 `users/windows/turns/messages/media_evidence = 1/0/0/0/0`。`.env` mode `0600`，SHA-256 `a10502163e790ccb0e0b3d87baf8ea513fb59677b8e5e2e4b86279e28b30fb09`。
+- `ling backup` 退出 0，dump `ling-20261118-072216.dump` SHA-256 `ead9152c3cc72c134afce521eac3eec70a4cc96d748c7bee7710aefdb2b3c104`；manifest SHA-256 `a2bc920f127ace8547adce5af7f09474c291ee346c8781305837011d180c883f`，`tombstones_state=ok`、`media_state=absent`、`keys_env_set=true`。`ling restore-drill --db ling_a6_interruption_20261118_drill` 退出 0，恢复计数 `1/0/0/0/0` 并确认库内无媒体引用。安装、backup、drill 日志 SHA-256 分别为 `205c23622bc3773a97d40732088a35182eaca638e7ffa489d44c820d7f50b12f`、`e0763c1f4922c9ed30bec1a48c54f0c7f27e865ac9b89261041bc0647c1fe864`、`b4f98a94fe3c273fef6c98e1c5a36fcb7f3d6bdb473d53d131a012a9b4f9575a`；日志权限已收紧为 `0600`。
+- 真实 HTTP 更新请求 `18ba0848f932493383755abae0d7e0df` 返回 201，目标为 v0.0.9 API digest。观察到 updater task `running/prepare` 且 `migration.attempted=false` 后，对唯一目标 updater 容器执行 `docker stop --time 0`，退出 0。显式启动 updater 后，任务进入 `needs_manual`，failure `old_service_unverified`，`still_on_old_version=null`，maintenance `unknown`；任务没有尝试迁移，旧 API/worker 和 PG 仍可用。task 记录中断时 `previous.services={}`、`previous.head=null`。
+- 使用 updater 支持的 `--acknowledge-manual 18ba0848f932493383755abae0d7e0df`，退出 0；task 变为 `resolved`、updater 回到 `idle`。但已认领的 `claimed-18ba0848f932493383755abae0d7e0df.json` 仍留在请求目录（SHA-256 `954a70b1ccbcf5cf2490cb3a787e0a17756aac869e4388aeaf60ec6656d52ca6`）。随后以新 request ID `efa0ecbcacbb444b9e32a22d2fcdc336` 重试，API 返回 409 `update_in_progress`，请求目录未增加文件。task/status 文件 SHA-256 为 `6bec67c93ba558d33fb9c2705f9fd1ab4498b4599b343e65cfa740f10e603a85` / `0817c9aded7bbb329cdc8c5ae1200e716c227e02e34accc7830d0adf05f3d9f0`。代码路径上，`acknowledge_manual()` 只更新 task/status；API 的 `_image_pending_request_ids()` 仍将 `claimed-*` 视为进行中，因此支持的确认后无法提交新任务。
+- 在同一 v0.8 API 上发送带 `download_source=gh_proxy` 的新请求 `9830cd494bf24bedacc72b51454a6d0d`，返回 422 `invalid_request_body`，请求目录未变化。v0.8 页面没有线路选择控件，旧 API 也不接受线路字段；未伪造稳定目标或手改请求文件。
+- 清理时只对本轮两个命名 Compose 项目执行 `down --remove-orphans`，未传 `--volumes`；容器和网络均已移除，app/db volumes `ling-a6-interruption-20261118_app-data`、`ling-a6-interruption-20261118_db-data` 及受限配置、备份和请求现场保留。未操作其他 Compose 项目、`5.88` 或 NAS 生产。
+
+**发布后状态表**
+
+| ID | 当前结论 |
+|---|---|
+| A1 | 通过；tag/main、镜像摘要与隔离边界已核验 |
+| A2 | 部分通过；多组三十四项浏览器套件通过，冻结范围尚未完整覆盖 |
+| A3 | 发布时的 README 路径未通过；发布后当前 README/源码已在无 pnpm 的隔离主机完成一行首装与 v0.0.8 bootstrap 升级，配置、PG、媒体和卷保持 |
+| A4 | 通过；release workflow 全部成功，保留同 SHA 较早一次间歇失败 |
+| A5 | 通过；`v0.0.9` 双平台摘要、OCI revision 与运行 API RepoDigest 匹配 |
+| A6 | 发布的 v0.0.9 镜像仍有确认后遗留 claim 的缺陷；工作树修复已通过定向与全量测试，并在 5.21 用 v0.9 基础镜像挂载候选脚本完成真实容器确认/归档。候选未构建成新镜像；更新后 API 重试、其他故障矩阵和 `ling status` 同步仍未验 |
+| A7 | 部分通过；v0.8 稳定 API 经 GHCR 直连升 v0.9 成功；v0.8 UI 无线路选择，v0.8 API 对 `download_source` 返回 422，加速线路未实测 |
+| A8 | 通过；文档与发布后状态对齐，完整测试/扫描结果见记录末尾 |
+
+**当前发布验收与更新通道签核：No-Go。** `v0.0.9` 已发布，GHCR 直连一跳成功。发布时 README 的 v0.0.8 bootstrap/无 pnpm 首装路径未通过；发布后当前 README/源码已在隔离 5.21 环境通过一行首装和旧检出 bootstrap 升级。发布的 v0.0.9 updater 中断确认缺陷也已在工作树修复，并由真实 updater 基础镜像挂载候选脚本完成容器内确认与归档；该修复尚未构建或发布成新镜像。v0.8 API 不接受下载线路字段，加速线路、其他忙时/故障矩阵及关系/日程冻结范围未完整覆盖，因此发布后完整更新通道仍为 No-Go。
+
+**A8：文档与本地验证**
+
+- 本地全量 Python pytest 以发布代码 SHA `f381a8c76df43a24b60944c91e22be46501bbd8c` 运行，持有 `/tmp/ling_test_lock.sh` 原子锁，`LING_TEST_DATABASE_URL` 与 `LING_DATABASE_URL` 均指向隔离 `ling_test`；退出码 0、进度 100%。`-q` 日志没有最终用例计数，不推算 passed/skipped/xfail 总数。日志：`/tmp/ling-pytest-release-docs-20261118.log`。仅出现 Starlette/httpx、Alembic `path_separator` 与 multiprocessing fork 的 deprecation warnings。
+- 文档修改前固定的关键源文件 SHA-256：`clients/web-console/src/connector-instances.browser.test.tsx=a5179d63d5d60051e6fe63fecfde79056b7c4430624fb17ecf701bc13c9ee975`；`clients/web-console/src/components/ConnectorsPage.tsx=92f83aa93029a0132f25b7c3a1bceba050b8dd1ad7ce5f54f747298662ea91ec`；`deploy/cli/ling.py=0e19469b63015ac4bb6ff83a98f9bed5814eaf560ffcf9602c798a49d3926f2f`；`tests/test_cli_install.py=5458e249b57f02444f8bbd93391c1832942ce4af59906653413ff21f3587e243`；`deploy/install.sh=bdafce6f36a9f7485c72f266f34a3f9afcf1d381eca1c400b6b8f19f055cd661`；`deploy/upgrade.sh=2567627ee95f92d18ed13a193d01e471fbe80a2086e262751dc10c4e6ee53623`；`deploy/compose.yaml=b8ad9834592dbec57eea272b7c73d1a7eb955fea64d2e41db05de9949b25fb10`。全量运行前后工作区均只涉及文档，源代码与测试未改。
+- `git diff --check` 通过；修改文档的编码完整性和敏感内容扫描均通过。
+- 本轮涉及的 W0 日志 SHA-256：v0.8 源码 `60ddb75f353581ed0487a697ff2c7916f405ead842f71df4318136b7f14d8a69`；候选升级后源码 `098dbd69619bbe96e8d3dd1d7e5c5ac4b320b6ca916c4b73c21c115a661b77c3`；v0.8 bootstrap `683b115a5378b2d863bd02abb055c75a852b51ff084f68dce6292f95c96b3bc6`；v0.8 镜像 `a2b4c2e36353bc0a11e7f5494d2bd2c72cbf629a11aeaa1b7d4127ab2223a88d`。当前 updater 进度截图 SHA-256：`c819cf65a54766314513444f4c64dfa22896fc4505300c9dbbb35b2052af5874`。
+- 本轮及交接指定的 `ling-src-release009-20261118`、`ling-src-bootstrap-release009-20261118`、`ling-src-one-line-20261118`、`ling-src-upgrade-20261118`、`ling-image-current-updater-20261118` 与 `ling-image-accept-009-cli-20261117` 项目容器/updater 均已停止；这些项目的 app/db volumes 保留。旧安装记录、源码 checkout 和备份产物仍在隔离目录供复核。更早的 `ling-image-candidate-ab0ddf4-20261117`、`ling-accept-*`、`ling-auth-accept-*` 项目在本轮开始前已运行，本轮未改动。验收 SSH 隧道已关闭；未连接 `5.88` 或 NAS 生产。
+
+### 2026-11-18 发布后工作树修复
+
+- 本节对应发布后工作树，不改变 `v0.0.9` tag `f381a8c76df43a24b60944c91e22be46501bbd8c`、GHCR 摘要或上文 A1–A8 的发布时结论。当前 README 的无 pnpm 首装与 v0.0.8 bootstrap 升级已在 5.21 隔离项目实测；完整记录见[单行安装与升级证据](single-command-install-upgrade.md#2026-11-18-发布后单行源码复验)。两个项目容器/网络已停止，app/db volumes 保留。
+- updater 修复提交 `a9fdb7f` 让人工确认与任务处理共用单飞锁，在清除 `needs_manual` 前先归档 claim；归档失败时保留门禁。普通终态任务归档失败会留下诊断并由后续轮次重试，重试成功前不接新请求。发布的 `v0.0.9` updater 镜像未包含此提交，也没有构建或发布新镜像。
+- 定向测试覆盖中断 claim 归档、归档失败保留人工门禁、成功任务归档失败后的下一轮恢复、确认期间单飞锁冲突、API 对待处理/已归档请求的判定，以及 bootstrap 成功/本地分叉拒绝。修复后的四组定向套件退出码为 0，日志 `/tmp/ling-full-dev-patched-targeted-r2-20261118.log`；Ruff 与 `py_compile` 通过，仓库标准 `mypy src connectors` 对 234 个源文件通过。
+- 5.21 上的 `ling-src-bootstrap-release009-20261118` 与 `ling-src-fresh-v009-oneline-20261118` 曾各有 API、worker、PostgreSQL healthy。随后只对这两个精确 Compose 项目执行 `down --remove-orphans`，未传 `--volumes`；容器/网络已移除，四个命名数据卷仍存在。未访问 NAS/生产。
+- 5.21 中断确认复放：在 `ling-a6-interruption-20261118` 的隔离状态目录中保留原始快照后，将同一任务/claim 夹具恢复到 `needs_manual`。状态快照 SHA-256：task `6bec67c93ba558d33fb9c2705f9fd1ab4498b4599b343e65cfa740f10e603a85`、status `4ddebf33783d07e552f6f284508e3d7fc20e68bdd91358a338a6e859cffb2284`；请求 ID `18ba0848f932493383755abae0d7e0df`。以 GHCR v0.0.9 updater index `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`（OCI revision `f381a8c76df43a24b60944c91e22be46501bbd8c`）为基础，通过只读 bind mount 执行候选脚本 SHA-256 `6021ce766ea9fdebf388e20cd70a7ffbb969ee222a6975a4f2716cde0e847b97`。一次性容器以退出码 0 输出 `已解除人工门禁`；之后 task=`resolved`、failure 仍为 `old_service_unverified`、next actions 为空、updater=`idle`，claimed 文件消失，archive 中同名文件 SHA-256 仍为 `954a70b1ccbcf5cf2490cb3a787e0a17756aac869e4388aeaf60ec6656d52ca6`。容器使用宿主 Docker socket 完成状态刷新后以 `--rm` 移除。此项验证候选脚本在真实镜像运行环境的恢复/归档行为，不等于候选已构建为 OCI 镜像，也没有在恢复后向旧 API 提交新请求。
+- 修复测试的变异验证：临时让 `acknowledge_manual()` 跳过 claim 归档后，`test_acknowledge_manual_archives_interrupted_claim` 按预期失败，因 claim 仍存在；恢复原代码后，人工确认归档、归档失败保留门禁、单飞锁冲突和成功任务下一轮归档四项通过。红日志 `/tmp/ling-updater-ack-mutation-red-20261118.log` SHA-256 `bf1fdced5a1858d7311acac5f39a9aa0a0315abdd2d500786a00f95e54a24885`；绿日志 `/tmp/ling-updater-ack-mutation-green-20261118.log` SHA-256 `c4b808d34f4db00b333696dec1f3a43a2887d8bfe0cb7af07a3cb98ff43a7830`。变异后 updater SHA 恢复为上列候选 SHA。
+- 修复快照全量 Python pytest：以 `a9fdb7fff16d05c844564c6ad813e7ad808d494a` 加工作树 bootstrap 测试运行，持 `/tmp/ling_test_lock.sh` 锁，两个数据库 URL 均指向 `ling_test`；退出码 0、进度 100%。`-q` 没有汇总用例数，不从进度条推算。日志 `/tmp/ling-full-pytest-post-a9fdb7f-20261118.log`，SHA-256 `0a9e9e1b694ff9a5f7e50ab6fa950aff2e0200cf3cf2d75275e66c7885dcfc08`。Ruff、`py_compile` 与仓库标准 `mypy src connectors`（234 个源文件）通过。
+- `git diff --check`、U+FFFD 与敏感凭据/内网地址扫描通过；提交前已复核文档 SHA 与工作树状态，提交后 `git status --short` 为空。整体发布后更新通道仍为 No-Go。

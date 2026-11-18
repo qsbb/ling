@@ -42,7 +42,8 @@ QQ、微信、Web 控制台、移动端都只是**连接到她的渠道**，她�
 ### Docker（推荐）
 
 需要 Git、Docker Engine 和 Docker Compose v2。整行执行后会在当前目录创建 `ling`，
-生成本机配置、构建镜像并启动服务；没有预装 pnpm 也可以安装。
+生成本机配置、构建前端和 API 镜像并启动服务。宿主有 pnpm 9+ 时可在本机编译前端；
+没有 pnpm 时，安装器使用 Dockerfile 的 Web 构建阶段，不必另行传递前端产物。
 
 ```bash
 git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
@@ -59,10 +60,19 @@ bash deploy/install.sh               # 仅重新部署当前检出，不拉取�
 bash deploy/install.sh --down        # 停止服务，保留数据
 ```
 
-`deploy/upgrade.sh` 适用于源码安装，会获取当前分支远端并只接受快进更新，再调用标准安装
-流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
-镜像模式不使用这个脚本。网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动
-更新仍需按 [docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
+固定 `v0.0.8` 源码检出尚无 `deploy/upgrade.sh`。从该检出根目录执行下面这条 bootstrap
+命令：工作区必须干净，当前提交和已有本地 `main` 都必须是 `origin/main` 的祖先；否则停止，
+不移动分支、不运行安装器。通过检查后快进到 `main` 并调用标准升级脚本。
+
+```bash
+test -z "$(git status --porcelain --untracked-files=normal)" && git fetch --no-tags origin main && git merge-base --is-ancestor HEAD FETCH_HEAD && { ! git show-ref --verify --quiet refs/heads/main || git merge-base --is-ancestor refs/heads/main FETCH_HEAD; } && git switch -C main FETCH_HEAD && bash deploy/upgrade.sh
+```
+
+`deploy/upgrade.sh` 适用于包含该脚本的源码 checkout，会获取当前分支远端并只接受快进更新，
+再调用标准安装流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
+bootstrap 中任一 Git 检查失败都会停止，不会运行安装器。镜像模式不使用这两个源码升级命令。
+网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动更新仍需按
+[docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
 
 需要回滚保障时，升级前另行备份数据库和 `deploy/.env`。默认管理员名为 `ling`，可在首装
 时用 `--admin-user <名字>` 修改。
@@ -178,25 +188,28 @@ cd clients/web-console && pnpm typecheck && pnpm test && pnpm build
 功能已实现并有测试覆盖，但**仍在演进中**。数据库 schema、配置项和部分 API
 可能变动。生产使用前请先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的注意事项一节。
 
-发布与升级：截至 2026-11-17，GitHub 最新正式 Release 为 `v0.0.8`；GitHub API
-记录发布时间为 `2026-11-13T16:48:41Z`（上海时间 2026-11-14 00:48:41）。当前本地
-`0.0.9` 候选位于[PR #1](https://github.com/qsbb/ling/pull/1)（含 Web/CLI 实现提交
-`1edc369`、`981a815`），尚未合入 `main`、打 tag 或发布。GitHub
-`main` 最近核验为 `0d36dbadc4c8f688df2775e81f1e5e795006a271`；候选仍不满足 release
-workflow 的祖先门禁。最初验收快照 `62e41c9` 之后又加入连接器实例 generation 刷新和
-自定义 updater 项目名修复。远端状态、复验文件哈希与提交边界见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+发布与升级：GitHub 已于 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）
+正式发布 `v0.0.9`。tag、`main` 与 release workflow run `44112900865` 均绑定
+`f381a8c76df43a24b60944c91e22be46501bbd8c`；该 run 的 verify、Python 3.12/3.13、
+Web、mobile、API image、updater-image 与 release jobs 全部成功。GHCR 两个 index 及
+amd64/arm64 manifest 的 digest、OCI version/revision 已独立核验，详见
+[验收记录](docs/evidence/release-0.0.9-acceptance.md)。同一 SHA 较早的 push CI 有一条
+慢媒体并发用例失败，release workflow 重跑通过；原因未定位，记录仍保留。
 
-此前隔离 Docker 的源码首装、升级、数据保留与恢复演练绑定历史快照 `0cfc9be`，
-不能当作当前候选验收。`981a815` 已在 5.21 隔离项目通过非默认 OneBot 两轮保存的
-真实 Chromium/API/PostgreSQL 路径；`ab0ddf4` 的 API/updater SHA 镜像也已在独立 5.21
-Compose 项目安装并运行。候选镜像的 `/readyz`、版本/提交、迁移 head、运行摘要与专属卷
-均核对通过；真实 Chromium 登录总览、关系页和连接器页 API 请求、375px 布局，以及新标签/
-刷新会话恢复均通过。`ling backup` 和隔离 `restore-drill` 通过，更新器容器以固定摘要运行，
-自动更新开关保持关闭。测试启用了 `LING_TEST_MODE=1`，不代表真实模型能力。PR CI 的
-Python 3.12 首轮有一条 QQBot 投递用例失败，单 job 重跑通过，原因未定位；细节见
-[验收记录](docs/evidence/release-0.0.9-acceptance.md)。候选的源码模式首装/升级、关系合并/
-拆分、候选 updater 实际执行网页更新和稳定版网页升级仍未验收。GHCR 最高稳定 tag 仍为
-`v0.0.8`；SHA-only 镜像不等于 `v0.0.9` Release。自助更新默认关闭。历史部署范围见
+历史隔离部署结果仍绑定各自记录的旧快照。固定 `v0.0.8` 源码基线与候选源码实例的真实
+Chromium/API/PostgreSQL W0 套件分别通过 34/34；源码升级也在隔离项目完成，保留数据库、
+配置、媒体和 Cookie。但 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，从该
+基线直接执行升级命令以退出码 127 失败；5.21 也缺 `pnpm`，首装需另行准备匹配的前端产物，
+所以固定基线的一行首装/升级验收未通过。上述浏览器测试启用 `LING_TEST_MODE=1`，回复由 fake
+provider 生成，不证明真实模型能力。
+
+隔离 `v0.0.8` 镜像基线已由 `v0.0.9` updater 经 GHCR 直连实际更新到 `v0.0.9`。任务成功，
+用时 34 秒，阶段进度、日志、运行 digest、迁移、数据/媒体和更新后登录 Cookie 均核验；浏览器
+在请求受理后断开，重连时任务已成功。另一次隔离中断试验在 updater 的 `prepare` 阶段停止进程；
+重启后进入 `needs_manual`。人工确认虽解除任务门禁，遗留的 `claimed` 请求仍使下一次 API 请求返回
+409 `update_in_progress`，所以中断恢复未通过。v0.0.8 页面没有线路选择控件，旧 API 也拒绝
+`download_source` 字段。加速线路与失败注入仍未验；关系合并/拆分和日程失败恢复仍未完整覆盖，`ling status` 的安装记录
+更新后仍显示安装时旧版本。整体更新通道签核维持 No-Go。自助更新默认关闭。历史部署范围见
 [隔离部署记录](docs/evidence/single-command-install-upgrade.md) 与
 [更新说明](docs/UPDATES.md)。
 

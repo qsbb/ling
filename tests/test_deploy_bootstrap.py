@@ -13,6 +13,15 @@ from deploy.configure_apt_mirror import configure_apt_mirror
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 UPGRADE = REPO_ROOT / "deploy" / "upgrade.sh"
+BOOTSTRAP_UPGRADE = (
+    "test -z \"$(git status --porcelain --untracked-files=normal)\""
+    " && git fetch --no-tags origin main"
+    " && git merge-base --is-ancestor HEAD FETCH_HEAD"
+    " && { ! git show-ref --verify --quiet refs/heads/main"
+    " || git merge-base --is-ancestor refs/heads/main FETCH_HEAD; }"
+    " && git switch -C main FETCH_HEAD"
+    " && bash deploy/upgrade.sh"
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -154,6 +163,104 @@ def test_one_line_upgrade_fast_forwards_and_preserves_configuration(tmp_path: Pa
     assert (install_root / "version.txt").read_text(encoding="utf-8") == "second\n"
     assert env_file.read_text(encoding="utf-8") == "LING_ROOT_KEY=test-secret\n"
     assert len(log_path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_v008_checkout_bootstraps_missing_upgrade_script_in_one_line(
+    tmp_path: Path,
+) -> None:
+    remote, source, install_root, log_path = _source_repo(tmp_path)
+    clone = _clone_install(remote, install_root)
+    assert clone.returncode == 0, clone.stderr
+    old_commit = _git(install_root, "rev-parse", "HEAD")
+
+    (source / "version.txt").write_text("checkpoint\n", encoding="utf-8")
+    _git(source, "add", "version.txt")
+    _git(source, "commit", "-m", "main checkpoint")
+    _git(source, "push")
+    fast_forward = subprocess.run(
+        ["git", "-C", str(install_root), "pull", "--ff-only", "origin", "main"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert fast_forward.returncode == 0, fast_forward.stderr
+    checkout = subprocess.run(
+        ["git", "-C", str(install_root), "checkout", "--detach", old_commit],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert checkout.returncode == 0, checkout.stderr
+
+    env_file = install_root / "deploy" / ".env"
+    env_file.write_text("LING_ROOT_KEY=preserve-me\n", encoding="utf-8")
+    (source / "deploy" / "upgrade.sh").write_text(
+        UPGRADE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (source / "version.txt").write_text("second\n", encoding="utf-8")
+    _git(source, "add", "deploy/upgrade.sh", "version.txt")
+    _git(source, "commit", "-m", "add upgrade entry point")
+    _git(source, "push")
+
+    result = subprocess.run(
+        ["bash", "-c", BOOTSTRAP_UPGRADE],
+        cwd=install_root,
+        env=_test_env(tmp_path, install_root, log_path),
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(install_root, "branch", "--show-current") == "main"
+    assert (install_root / "version.txt").read_text(encoding="utf-8") == "second\n"
+    assert env_file.read_text(encoding="utf-8") == "LING_ROOT_KEY=preserve-me\n"
+    assert log_path.read_text(encoding="utf-8").splitlines() == [
+        f"{install_root}|"
+    ]
+
+
+def test_v008_bootstrap_refuses_to_reset_diverged_local_main(tmp_path: Path) -> None:
+    remote, source, install_root, log_path = _source_repo(tmp_path)
+    clone = _clone_install(remote, install_root)
+    assert clone.returncode == 0, clone.stderr
+    old_commit = _git(install_root, "rev-parse", "HEAD")
+
+    (source / "deploy" / "upgrade.sh").write_text(
+        UPGRADE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (source / "version.txt").write_text("remote update\n", encoding="utf-8")
+    _git(source, "add", "deploy/upgrade.sh", "version.txt")
+    _git(source, "commit", "-m", "remote upgrade")
+    _git(source, "push")
+
+    _git(install_root, "config", "user.name", "Test")
+    _git(install_root, "config", "user.email", "test@example.invalid")
+    (install_root / "version.txt").write_text("local-only commit\n", encoding="utf-8")
+    _git(install_root, "add", "version.txt")
+    _git(install_root, "commit", "-m", "local-only work")
+    local_main = _git(install_root, "rev-parse", "main")
+    checkout = subprocess.run(
+        ["git", "-C", str(install_root), "checkout", "--detach", old_commit],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert checkout.returncode == 0, checkout.stderr
+
+    result = subprocess.run(
+        ["bash", "-c", BOOTSTRAP_UPGRADE],
+        cwd=install_root,
+        env=_test_env(tmp_path, install_root, log_path),
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert _git(install_root, "rev-parse", "HEAD") == old_commit
+    assert _git(install_root, "rev-parse", "main") == local_main
+    assert not log_path.exists()
 
 
 def test_one_line_upgrade_can_repeat_current_version_without_losing_configuration(

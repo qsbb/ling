@@ -3,7 +3,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.0.9] - 待发布
+## [Unreleased]
+
+> 以下是 `v0.0.9` 发布后的工作树改动，不属于已发布 tag 或 GHCR 镜像。
+
+### 修复
+
+- 人工确认在 updater 单飞锁内先归档遗留请求，再解除门禁；归档失败时保留门禁。终态任务的归档失败会记录并在后续轮次重试，期间不接新请求。
+
+### 部署
+
+- README 的源码安装路径支持无 pnpm 主机通过 Dockerfile 构建前端，并为固定 `v0.0.8` 检出提供受保护的单行 bootstrap 快进升级命令。
+
+## [0.0.9] - 2026-11-18
 
 ### 新增
 
@@ -15,15 +27,15 @@
 
 - 登录响应前提交会话，避免紧随登录的总览请求偶发 401。
 - 业务运行要求 PostgreSQL，修复并发创建会话、租约与数据库连接池相关竞态。
-- 源码模式支持一行首装与快进升级；严格 `umask 077` 下生成的前端目录可被 API 容器读取。
+- 源码模式提供首装命令和快进升级脚本；严格 `umask 077` 下生成的前端目录可被 API 容器读取。首装构建需要 pnpm 9+；固定 v0.0.8 checkout 不含新增的 `deploy/upgrade.sh`，因此从该基线的一行升级仍需 bootstrap，未达到本次验收判据。
 - 非默认连接器实例保存后重读本实例 generation；自定义应用项目名也会传到 updater，避免后续保存冲突或更新目标回退到 `ling`。
 
 ### 验证范围
 
-- 代码候选全量 Python pytest 在隔离 PostgreSQL 锁内两次退出码 0、进度 100%；`-q` 无用例总数。PR CI run `44006742093` 最终 Python 3.12/3.13 与 Web 均通过；Python 3.12 首轮一条 QQBot 投递测试失败、重跑通过，原因未定位。Web 本机全套 1042 passed、1 skipped，构建、Ruff、版本和 release catalog 检查通过。
-- SHA-only workflow `44015600964` 为 `ab0ddf4` 构建并核验 API/updater 双平台镜像。隔离 5.21 项目用这两个固定摘要完成镜像首装、迁移、健康与版本/卷身份核验；真实 Chromium 登录、新标签/刷新、关系/连接器页 API 与窄屏布局通过；备份和隔离恢复演练通过。测试模式启用，且网页更新开关关闭，因此真实网页升级、关系合并/拆分、真实模型能力仍未验。浏览器组件测试的 `/v1` 使用 route mock。详见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
-- 历史隔离 Docker 安装、升级、备份与恢复结果绑定 `0cfc9be`；早期 34/34 浏览器结果绑定更早快照，均不改写为当前候选结果，详见隔离部署记录。
-- `ab0ddf4` 有 SHA-only API/updater 镜像及隔离候选容器运行证据，但没有 `v0.0.9` 稳定 tag 或 Release。候选尚未合入 main；稳定版网页升级与 updater 实际更新链路仍未验。发布状态仍为 No-Go。
+- Release workflow run `44112900865` 对 tag/main SHA `f381a8c76df43a24b60944c91e22be46501bbd8c` 的 verify、Python 3.12/3.13、Web、mobile、API image、updater-image 与 release jobs 全部成功。较早的 push CI run `44102373375` 中，Python 3.12 的 `test_slow_media_does_not_block_ordinary_events` 失败；release workflow 对同一 SHA 重跑通过，原因尚未定位。
+- GHCR `v0.0.9` API index 为 `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756`，updater index 为 `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`；amd64/arm64 manifest 与 OCI version/revision 均独立核验。详情见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
+- 固定 `v0.0.8` 源码基线的 Chromium/API/PostgreSQL W0 为 34/34，候选源码升级后 W0 也为 34/34；二者启用 `LING_TEST_MODE=1`，只证明 Web/API/fake-provider 路径。另一个 `v0.0.8` 镜像基线 W0 为 32/33，唯一失败为模型错误场景未显示重试按钮，原因未定位。
+- 隔离 `v0.0.8 → v0.0.9` GHCR 直连网页更新已由当前 `v0.0.9` updater 完成，用时 34 秒；迁移、API/worker digest、PG/媒体行数、浏览器断线后的成功状态和登录 Cookie 均核验。另在隔离项目实测 updater 于 `prepare` 阶段中断：重启后进入人工门禁；支持的人工确认后，遗留 `claimed` 请求仍使重试 API 返回 409 `update_in_progress`。v0.0.8 API 对 `download_source` 返回 422，故加速线路仍未实测。源码升级部署成功，但 v0.0.8 checkout 缺 README 所写的 `deploy/upgrade.sh`，直接的一行升级以退出码 127 失败；在 5.21 首装还需预先构建并复制前端。整体一行部署和更新通道验收均维持 No-Go。
 
 ## [0.0.8] - 2026-11-13
 
@@ -186,10 +198,6 @@
 - **历史队列事件的原文没被清掉**：`subject_id` 是新增列，历史行全为 NULL，只按该列
   过滤等于一条都选不中。改为「按列 OR 按 payload 归属」取并集。
 - 消息左右改为「她的话靠右」后，群聊与网页私聊方向一致。
-
-## [Unreleased]
-
-（暂无）
 
 ## [0.0.5] - 2026-11-09
 

@@ -238,3 +238,10 @@ revision。`git diff` 显示它与 `0cfc9be` 的业务源码、迁移、Dockerfi
 
 这些结果证明同 schema 下的备份、演练库恢复、部署前失败后重试及本地镜像人工
 切换。在线业务库实际恢复、跨 schema 迁移回退及 GHCR 正式镜像网页升级仍未验收。
+
+## 2026-11-18 发布后单行源码复验
+
+- 在无 pnpm 的 5.21 隔离项目 `ling-src-fresh-v009-oneline-20261118`，按当前 README 的源码首装命令构建并启动服务；API、worker、PostgreSQL healthy。真实 Chromium W0 为 34/34，日志 `/tmp/ling-w0-bootstrap-v009-20261118.log`，SHA-256 `4899825946b457c1d814c3ca024d5e9455f28bb276f761786922c3e3afe72616`。该浏览器运行使用 `LING_TEST_MODE=1` 和 fake provider。
+- 在 `ling-src-bootstrap-release009-20261118` 中，从固定 `v0.0.8` commit `0d36dbadc4c8f688df2775e81f1e5e795006a271` 执行当前 README bootstrap 命令，快进到当时 `origin/main=f381a8c76df43a24b60944c91e22be46501bbd8c`，再调用 `deploy/upgrade.sh`。升级后 API healthy，迁移 head 为 `0078_proactive_daily_quota`，业务计数 `users/windows/turns/messages = 1/2/4/8`；`.env` 与媒体标记文件前后 SHA-256 一致。
+- 两个项目的容器和网络已用各自 Compose 文件执行 `down --remove-orphans`；没有使用 `--volumes`。app/db volumes 均保留：`ling-src-fresh-v009-oneline-20261118_{app-data,db-data}`、`ling-src-bootstrap-release009-20261118_{app-data,db-data}`。
+- 这次复验覆盖发布后的当前 README 命令和 `f381a8c` 源码。它不改变 `v0.0.9` 发布时 README 缺少 bootstrap、旧检出直接运行 `deploy/upgrade.sh` 退出 127 的历史结果，也不覆盖本地后续 updater 修复。
