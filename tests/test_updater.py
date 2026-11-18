@@ -2454,6 +2454,31 @@ def test_success_path_uses_target_digest_and_records_identity(ws: Workspace) -> 
     assert ws.docker_state()["api_port_published"] is True
 
 
+def test_successful_update_retries_failed_claim_archive(ws: Workspace) -> None:
+    write_request(ws)
+    archive = ws.requests_dir / "archive"
+    archive.mkdir()
+    archive.chmod(0o500)
+
+    try:
+        result = run_updater(ws)
+    finally:
+        archive.chmod(0o700)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert ws.task()["state"] == "succeeded"
+    claimed = ws.requests_dir / f"claimed-{REQUEST_ID}.json"
+    archived = archive / claimed.name
+    assert claimed.exists()
+    assert "归档失败" in result.stdout + result.stderr
+
+    retry = run_updater(ws)
+
+    assert retry.returncode == 0, (retry.stdout, retry.stderr)
+    assert not claimed.exists()
+    assert archived.is_file()
+
+
 def test_direct_pull_skips_configured_mirror(ws: Workspace) -> None:
     write_request(ws)
     result = run_updater(ws, env={
@@ -2849,6 +2874,58 @@ def test_needs_manual_blocks_new_tasks_until_acknowledged(ws: Workspace) -> None
     assert ws.status()["updater"]["state"] == "idle"
 
 
+def test_acknowledge_manual_archives_interrupted_claim(ws: Workspace) -> None:
+    request = write_request(ws, request_id=REQUEST_ID_B)
+    claimed = ws.requests_dir / f"claimed-{REQUEST_ID_B}.json"
+    os.replace(request, claimed)
+    seed_task(
+        ws,
+        state="needs_manual",
+        stage="prepare",
+        attempted=False,
+        previous_head=None,
+        maintenance="unknown",
+    )
+
+    ack = run_updater(ws, extra=["--acknowledge-manual", REQUEST_ID_B])
+
+    assert ack.returncode == 0, (ack.stdout, ack.stderr)
+    assert ws.task()["state"] == "resolved"
+    assert ws.status()["updater"]["state"] == "idle"
+    assert not claimed.exists()
+    assert (ws.requests_dir / "archive" / claimed.name).exists()
+
+
+def test_acknowledge_manual_keeps_gate_when_claim_cannot_be_archived(
+    ws: Workspace,
+) -> None:
+    request = write_request(ws, request_id=REQUEST_ID_B)
+    claimed = ws.requests_dir / f"claimed-{REQUEST_ID_B}.json"
+    os.replace(request, claimed)
+    seed_task(
+        ws,
+        state="needs_manual",
+        stage="prepare",
+        attempted=False,
+        previous_head=None,
+        maintenance="unknown",
+    )
+    blocked = run_updater(ws)
+    assert blocked.returncode == 17, (blocked.stdout, blocked.stderr)
+
+    archive = ws.requests_dir / "archive"
+    archived_claim = archive / claimed.name
+    archived_claim.mkdir()
+    (archived_claim / "keep").write_text("occupied", encoding="utf-8")
+
+    ack = run_updater(ws, extra=["--acknowledge-manual", REQUEST_ID_B])
+
+    assert ack.returncode == 17, (ack.stdout, ack.stderr)
+    assert ws.task()["state"] == "needs_manual"
+    assert ws.status()["updater"]["state"] == "needs_manual"
+    assert claimed.exists()
+
+
 # ---------------------------------------------------------------- 单飞
 
 
@@ -2897,6 +2974,38 @@ def test_single_flight_second_instance_is_busy(ws: Workspace) -> None:
     assert result.returncode == 3, (result.stdout, result.stderr)
     assert mutating_calls(ws) == []
     assert (ws.requests_dir / f"request-{REQUEST_ID}.json").exists()
+
+
+def test_acknowledge_manual_respects_single_flight_lock(ws: Workspace) -> None:
+    claimed = ws.requests_dir / f"claimed-{REQUEST_ID_B}.json"
+    claimed.write_text("{}", encoding="utf-8")
+    seed_task(
+        ws,
+        state="needs_manual",
+        stage="prepare",
+        attempted=False,
+        previous_head=None,
+        maintenance="unknown",
+    )
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(ws.state_dir / "updater.lock")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert helper.stdout is not None
+        assert helper.stdout.readline().strip() == "locked"
+        result = run_updater(ws, extra=["--acknowledge-manual", REQUEST_ID_B])
+    finally:
+        if helper.stdin is not None:
+            helper.stdin.close()
+        helper.wait(timeout=10)
+
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert ws.task()["state"] == "needs_manual"
+    assert not (ws.state_dir / "status.json").exists()
+    assert claimed.exists()
 
 
 # ---------------------------------------------------------------- 跨工具安装锁

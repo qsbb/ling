@@ -754,6 +754,28 @@ async def test_post_in_progress_when_pending_exists(logged_in: TestEnv, tmp_path
     assert _request_files(base) == [f"request-{pending}.json"]
 
 
+async def test_archived_manual_claim_no_longer_blocks_new_update(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
+    base = _configure(logged_in, tmp_path)
+    _write_status(base)
+    request_id = _write_pending_request(base)
+    claimed = base / "requests" / f"claimed-{request_id}.json"
+    (base / "requests" / f"request-{request_id}.json").rename(claimed)
+
+    blocked = await _post(logged_in)
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["detail"] == "update_in_progress"
+
+    archive = base / "requests" / "archive"
+    archive.mkdir()
+    claimed.rename(archive / claimed.name)
+
+    accepted = await _post(logged_in)
+    assert accepted.status_code == 201, accepted.text
+    assert _request_files(base) == [f"request-{accepted.json()['request_id']}.json"]
+
+
 # ---------------------------------------------------------------- 开关与门禁
 
 

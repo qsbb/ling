@@ -409,6 +409,9 @@ TASK_SUCCEEDED = "succeeded"
 TASK_FAILED_NOT_STARTED = "failed_not_started"
 TASK_NEEDS_MANUAL = "needs_manual"
 TASK_RESOLVED = "resolved"
+TASK_TERMINAL_STATES = frozenset(
+    {TASK_SUCCEEDED, TASK_FAILED_NOT_STARTED, TASK_RESOLVED}
+)
 
 MAINT_ACTIVE = "active"
 MAINT_RELEASED = "released"
@@ -2501,13 +2504,33 @@ def claim_request(cfg: Config, path: Path) -> Path | None:
     return claimed
 
 
-def archive_claim(cfg: Config, claimed: Path) -> None:
+def archive_claim(cfg: Config, claimed: Path) -> bool:
     archive_dir = cfg.requests_dir / "archive"
     try:
         archive_dir.mkdir(exist_ok=True, mode=0o700)
         os.replace(claimed, archive_dir / claimed.name)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def archive_terminal_claim(updater: Updater) -> bool:
+    """重试归档终态任务留下的 claim；状态不确定时继续 fail closed。"""
+    task = updater.task
+    if task is None or task.get("state") not in TASK_TERMINAL_STATES:
+        return True
+    request_id = task.get("request_id")
+    if not isinstance(request_id, str) or REQUEST_ID_RE.fullmatch(request_id) is None:
+        return True
+    claimed = updater.cfg.requests_dir / f"claimed-{request_id}.json"
+    if not claimed.exists():
+        return True
+    if archive_claim(updater.cfg, claimed):
+        return True
+    updater.emit(
+        f"任务 {request_id} 已结束，但请求归档失败；本轮暂不接新请求，下一轮重试"
+    )
+    return False
 
 
 def already_processed(cfg: Config, request_id: str) -> bool:
@@ -4137,30 +4160,51 @@ def acknowledge_manual(
 ) -> int:
     store = TaskStore(cfg, pub)
     status = StatusWriter(cfg, pub, tool)
+    lock = TaskLock(cfg)
     try:
-        task = store.read()
+        acquired = lock.acquire()
     except UpdaterError as error:
         print(f"[updater] {error.detail}", file=sys.stderr)
         return error.exit_code
-    if task is None:
-        print("[updater] 没有任务记录，无需解除", file=sys.stderr)
-        return EXIT_REJECTED
-    if task.get("state") != TASK_NEEDS_MANUAL:
-        print(
-            f"[updater] 任务 {task.get('request_id')} 不在 needs_manual 状态",
-            file=sys.stderr,
-        )
-        return EXIT_REJECTED
-    if task.get("request_id") != request_id:
-        print("[updater] request_id 不匹配，拒绝解除", file=sys.stderr)
-        return EXIT_REJECTED
-    task["state"] = TASK_RESOLVED
-    task["finished_at"] = pub.utc_now()
-    task["next_actions"] = []
-    store.write(task)
-    status.write("idle", task, force=True)
-    print(f"[updater] 已解除人工门禁：{request_id}")
-    return EXIT_OK
+    if not acquired:
+        print("[updater] 更新器正在处理任务，稍后再确认人工门禁", file=sys.stderr)
+        return EXIT_BUSY
+    try:
+        try:
+            task = store.read()
+        except UpdaterError as error:
+            print(f"[updater] {error.detail}", file=sys.stderr)
+            return error.exit_code
+        if task is None:
+            print("[updater] 没有任务记录，无需解除", file=sys.stderr)
+            return EXIT_REJECTED
+        if task.get("state") != TASK_NEEDS_MANUAL:
+            print(
+                f"[updater] 任务 {task.get('request_id')} 不在 needs_manual 状态",
+                file=sys.stderr,
+            )
+            return EXIT_REJECTED
+        if task.get("request_id") != request_id:
+            print("[updater] request_id 不匹配，拒绝解除", file=sys.stderr)
+            return EXIT_REJECTED
+
+        claimed = cfg.requests_dir / f"claimed-{request_id}.json"
+        if claimed.exists() and not archive_claim(cfg, claimed):
+            print(
+                "[updater] 无法归档已认领的请求，保留人工门禁；检查请求目录权限后重试",
+                file=sys.stderr,
+            )
+            return EXIT_NEEDS_MANUAL
+
+        task["state"] = TASK_RESOLVED
+        task["finished_at"] = pub.utc_now()
+        task["next_actions"] = []
+        store.write(task)
+        status.write("idle", task, force=True)
+        print(f"[updater] 已解除人工门禁：{request_id}")
+        return EXIT_OK
+    finally:
+        lock.release()
 
 
 def run_once(updater: Updater) -> int:
@@ -4192,6 +4236,8 @@ def run_once(updater: Updater) -> int:
             updater.status.write("needs_manual", None, force=True)
             return error.exit_code
         updater.task = task
+        if not archive_terminal_claim(updater):
+            return EXIT_BUSY
         if task is not None and task.get("state") == TASK_RUNNING:
             return updater.reconcile()
         if task is not None and task.get("state") == TASK_NEEDS_MANUAL:
@@ -4219,7 +4265,10 @@ def run_once(updater: Updater) -> int:
                 updater.status.write("needs_manual", updater.task, force=True)
                 return EXIT_NEEDS_MANUAL
             finally:
-                archive_claim(cfg, claimed)
+                if not archive_claim(cfg, claimed):
+                    updater.emit(
+                        f"请求 {claimed.name} 已处理，但归档失败；下一轮会重试收尾"
+                    )
         refreshes = pending_refreshes(cfg)
         if refreshes:
             return updater.process_refresh(refreshes[0])
