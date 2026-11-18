@@ -367,6 +367,22 @@ Registry manifest 原始字节重算值与 `Docker-Content-Digest` header 相同
 - 三个定向测试文件在仓库 `.venv`、本机隔离 PostgreSQL `ling_test` 与测试锁下退出码为 0；日志 `/tmp/ling-focused-20261119.log` SHA-256 `1bc9c9c45a4e2a02763b8fe10b52e30c5f573fc29a88ac77a6caedf3298fb9fb`。该 quiet 日志只记录进度，不据此推算用例数。
 - 反向变异均按判据失败：移除备份交接后两条新测试失败（未调用 chown、交接失败仍返回 0），日志 `/tmp/ling-backup-handoff-mutation-red-20261119.log` SHA-256 `5b3ce66cf561ac5a59c180d76a91eb7eabc7c81af26e2d1af9bcfa78cda50d00`；移除刷新时重算门禁后，新 manifest 仍显示 `restore_point=false`，一条测试失败，日志 `/tmp/ling-updater-backup-gate-mutation-red-20261119.log` SHA-256 `19309c2c2e4265b1ae25a14cf18d17a0a5ad553fbc6c42a9786dd9e60a951913`。变异恢复后的 `backup.sh` 与 `updater.py` SHA-256 分别为 `6e6e8058f17f8e20a7327366bb3b94b9eddc8d7c7a81d76f958fcc73ad4870c5` 和 `ef1af7a87f87c3646fb2258888d822f19d3e64b1615d5486e9ccf0f1f6cb565a`。
 - 全量 pytest 使用相同隔离库与锁退出码为 0：`6607 passed, 14 skipped, 28 deselected, 3 xfailed`，耗时 `2549.68s`。日志 `/tmp/ling-followup-full-pytest-20261119.log` SHA-256 `b11a13f1c30966b4994b69ee4e151f7b775728c548e5a84bf829f75fd857f6a9`。日志中出现一次测试 HTTP handler 的连接处理异常行，pytest 随后继续且最终退出 0；该行未单独归因。Ruff、`mypy src connectors`（234 个源文件）、`py_compile`、`bash -n` 与 `git diff --check` 均通过。
-- 脱敏复核没有发现聊天凭据或实际 `192.168.x.x` 地址进入仓库。广义 `sk-` 扫描会命中脱敏实现和明确的测试假密钥，不把这些匹配误报为真实凭据。5.21 上对既有隔离项目 `ling-a6-interruption-20261118` 只读检查未见运行容器，app/db volumes 仍保留；本节没有在 5.21 启动新项目，也没有验证上述修复的真实容器行为。
+- 脱敏复核没有发现聊天凭据或实际局域网地址进入仓库。广义 `sk-` 扫描会命中脱敏实现和明确的测试假密钥，不把这些匹配误报为真实凭据。5.21 上对既有隔离项目 `ling-a6-interruption-20261118` 只读检查未见运行容器，app/db volumes 仍保留；本节没有在 5.21 启动新项目，也没有验证上述修复的真实容器行为。
 
 **本节判定**：本机源码测试通过，但尚无本地修复的 PR CI、合并 SHA 镜像或 5.21 容器复验；不得把这些结果表述为已发布修复。`v0.0.9` 的 Release 镜像仍绑定 `f381a8c`，完整发布后更新通道仍为 No-Go。
+
+### 2026-11-19 本地 W0 隔离栈复验
+
+本节记录本机工作树的验收工具扩展，不改变 `v0.0.9` tag、正式 Release、`main` 或现有镜像摘要；结果不能外推为已发布候选通过。
+
+- W0 运行前观测到 `HEAD=9b3bbca4e2c43d83dd9fc7577f54b75e2fe5e7ce`，工作树改动限于 `tests/e2e/w0_browser.mjs` 与 `tests/integration/test_output_equivalence.py`。最终 W0 被测文件 SHA-256 分别为 `2d01f90da94611a770c48dfcda2cc9c45c2ca4373e539523af03f80e65ae7bf2` 与 `9d6a3bdd256e929ef9f010314daf57e3b086246f1369d646f7a8875809a729a2`。
+- 使用 Node.js 24.21.0、Playwright 1.63.0、Chromium 153，在本机随机端口、自建 PostgreSQL 隔离库、真实 API 和 Vite 前端上运行，退出码 0：`51/51`。日志 `/tmp/ling-w0-expanded-final-20261119-r3.log` SHA-256 `3339c2b087b98726d12081d89248ec4739cc25d5fa73781acc67b6463ceb6acf`。
+- 真实关系列表首屏为 50/124，继续分页读完 124 条；合并经刷新仍可见，随后拆分成功；成员读取他人互动为 `restricted` 空列表，读取含私有哨兵的记忆不返回正文，手动生成返回 403。窄屏关系列表文档宽度与 375px 视口一致。QQBot 假密钥保存只返回脱敏值，空密钥不改值、显式清除生效；OneBot 监听端口冲突后为 `rolled_back`，旧配置和 generation `1→1` 保留。隔离子进程没有继承宿主 `LING_*` 配置。
+- 日程主人时间轴初始状态为 `empty`；手动提交返回 202/`queued`，浏览器显示处理中提示。为避免 worker 启动时自动投递的 catch-up 作业抢先改变夹具状态，脚本现在等手动作业已入队后才启动隔离 worker。worker 将该作业推进到 `degraded`，`plan_state=degraded`、revision `1`；浏览器显示规则降级的人话提示，刷新后 API/PostgreSQL 读回相同状态与 revision。该环境没有可用模型路由；本结果证明队列消费、降级呈现和持久化，不证明模型成功生成或失败重试。
+- 当前 worker 接线反向变异（删除启动调用、把终态等待缩短到 5 秒）得到预期红：47/48，唯一失败为“真实 worker 将手动作业推进到终态”。日志 `/tmp/ling-w0-worker-mutation-final-red-20261119.log` SHA-256 `55254d9c74ad6de18cbbabed49466143ce67dfa3a4fabf49257b3ddac0b9a88f`。恢复后 `w0_browser.mjs` SHA-256 与上述通过运行完全一致。宿主环境过滤的反向变异也在启动检查处失败，日志 `/tmp/ling-w0-env-mutation-red-20261119.log` SHA-256 `fb47d39c97aafd8c45b0c429afeee95e04894b14dd74473b01d1053bad71cfad`；检查日志没有合成密钥哨兵。
+- `test_output_equivalence.py` 固定环境事实时钟后，完整测试文件连续两次均为 `7 passed`；移除记忆来源过滤的反向变异使跨群完整模型输入等价测试按预期失败。通过日志 SHA-256 均为 `83a1593c5b5783693fe3006d1f6597bcb4f3a5968f23b59481ee09a0477f910a`，变异红日志为 `86c60124c59177c427d726fa00c5b6888ae1c1b9f72a6bd1f4c78cc4b072cf64`。
+- 一次使用 ChatGPT 内置 Node 24.22.1 的启动尝试因 Rollup 原生模块 Team ID 不匹配，在 Vite 就绪前退出；该次没有浏览器断言，不计入结果。改用本机 Node 24.21.0 后通过。成功运行与反向变异运行均报告随机端口已释放、仅本轮隔离数据库已删除；完成后的进程检查未见残留 API、worker、Vite 或 W0 进程。
+- 在上述工作树快照之后，按 `/tmp/ling_test_lock.sh` 持锁并同时设置 `LING_TEST_DATABASE_URL` 与 `LING_DATABASE_URL`，执行 `.venv/bin/python -m pytest -q` 退出码 0，进度到 100%，无失败摘要。完整日志 `/tmp/ling-full-pytest-final-20261119.log` SHA-256 `704e0443d7dd75f94b7b0d08dfb95924f7a5c0a5db5c5c0273f2b1a8f9a73a5f`；日志含 Starlette/httpx、Alembic `path_separator` 和 multiprocessing fork 弃用警告，未将警告当作失败。测试锁在退出 trap 中释放并复查不存在。
+- 提交前静态检查：`.venv/bin/ruff check src connectors tests`、`.venv/bin/mypy src connectors`（234 个源文件）、`node --check tests/e2e/w0_browser.mjs`、`git diff --check` 均退出码 0；U+FFFD、聊天口令和私有地址扫描均无命中。
+
+**本节判定**：本地 W0 测试范围已扩展且变异可检出 worker 接线缺失，但它运行于当前工作树并使用测试/规则降级环境。冻结验收中的真实模型成功与重试、完整 updater 故障矩阵、源码首装/升级固定基线等仍未因此通过；发布与完整更新通道仍为 No-Go。
