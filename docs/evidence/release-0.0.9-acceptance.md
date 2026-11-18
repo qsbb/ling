@@ -351,3 +351,16 @@ Registry manifest 原始字节重算值与 `Docker-Content-Digest` header 相同
 - 手动生成任务在本轮环境中没有观测到终态，故不证明日程最终成功/失败、重试或生成内容；该项仍不能算完整日程验收。其余冻结的连接器密钥清空/失败回滚、关系数据权限边界全集和网页 updater 故障矩阵，也没有由这次 W0 运行覆盖。因此 A2 仍为部分通过，整体发布与更新通道仍为 No-Go。
 - 最终日志 `/tmp/ling-w0-real-acceptance-20261118-r6.log` SHA-256 `baffa56c1e427ace6f5b3ad46a63a9c9aa2616a0b9338ec2e7e4661b608addf5`。被测文件 SHA-256：`tests/e2e/w0_browser.mjs=c3e67f733415b2402f785c7eaa3d516e08a5d035d417b3a48d5d082fcc57ec6b`、`tests/e2e/seed_relationship_acceptance.py=86ae9eb8ead2d14ef9844f72cc1aaa2f351ed15237dcc23b8488a9fbbdd3a996`、`tests/e2e/README.md=59b4f9b681f567afe14e13ea57b046c530d93587ec7afaa47dc7c5402cc69a54`。日志汇总为 43/43；本轮专属 PostgreSQL 库已删除、两个随机监听端口已释放，复查没有遗留 W0 数据库或测试进程。
 - 一次性启动诊断曾因 ChatGPT 内置 Node 的 Team ID 与 Rollup 原生模块不一致而在 Vite 启动前失败，未执行浏览器断言；切换到本机 Node 后完整运行通过。脚本现从创建隔离库时就记录栈所有权，以便之后的 API/Vite 启动错误也走清理分支。首次失败留下的唯一随机测试库已按精确名称删除；该诊断不计入 43/43。
+
+### 2026-11-19 发布后恢复点门禁修复
+
+本节记录发布后的两个源码修复，不改变 `v0.0.9` tag、正式 Release 或其镜像摘要。代码提交为 `4f79bed241b512a16c814141e31504f9aa838a6b` 与 `d0e60c980edd32412a63e48cd7967ec5665ec665`；改动尚未进入 `main` 或已发布镜像。
+
+- `backup.sh` 由 root cron/CLI 写入隔离备份目录时，现在把本轮 dump、墓碑、manifest、媒体归档和根密钥交给备份目录属主，保留原权限位；属主读取或交接失败时返回非零，不把不可读恢复点报告为成功。updater 的按需刷新现在会重算恢复点门禁，避免 updater 启动后新建备份仍显示旧的 `no_manifest`。对应测试验证成功交接、交接失败和刷新后的新 manifest。
+- 测试前快照记录于 `/tmp/ling-followup-pytest-snapshot-20261119.txt`，SHA-256 `bdeb4df9f9359b943516f94f3b9942a45839530aa1b60f33e1f592580397b2ae`；快照时 `HEAD=128b87e40081f066b8672442ce71d39544990353`，工作树列出 7 个待测文件及逐文件 SHA。提交后的两个代码提交包含相同文件内容。
+- 三个定向测试文件在仓库 `.venv`、本机隔离 PostgreSQL `ling_test` 与测试锁下退出码为 0；日志 `/tmp/ling-focused-20261119.log` SHA-256 `1bc9c9c45a4e2a02763b8fe10b52e30c5f573fc29a88ac77a6caedf3298fb9fb`。该 quiet 日志只记录进度，不据此推算用例数。
+- 反向变异均按判据失败：移除备份交接后两条新测试失败（未调用 chown、交接失败仍返回 0），日志 `/tmp/ling-backup-handoff-mutation-red-20261119.log` SHA-256 `5b3ce66cf561ac5a59c180d76a91eb7eabc7c81af26e2d1af9bcfa78cda50d00`；移除刷新时重算门禁后，新 manifest 仍显示 `restore_point=false`，一条测试失败，日志 `/tmp/ling-updater-backup-gate-mutation-red-20261119.log` SHA-256 `19309c2c2e4265b1ae25a14cf18d17a0a5ad553fbc6c42a9786dd9e60a951913`。变异恢复后的 `backup.sh` 与 `updater.py` SHA-256 分别为 `6e6e8058f17f8e20a7327366bb3b94b9eddc8d7c7a81d76f958fcc73ad4870c5` 和 `ef1af7a87f87c3646fb2258888d822f19d3e64b1615d5486e9ccf0f1f6cb565a`。
+- 全量 pytest 使用相同隔离库与锁退出码为 0：`6607 passed, 14 skipped, 28 deselected, 3 xfailed`，耗时 `2549.68s`。日志 `/tmp/ling-followup-full-pytest-20261119.log` SHA-256 `b11a13f1c30966b4994b69ee4e151f7b775728c548e5a84bf829f75fd857f6a9`。日志中出现一次测试 HTTP handler 的连接处理异常行，pytest 随后继续且最终退出 0；该行未单独归因。Ruff、`mypy src connectors`（234 个源文件）、`py_compile`、`bash -n` 与 `git diff --check` 均通过。
+- 脱敏复核没有发现聊天凭据或实际 `192.168.x.x` 地址进入仓库。广义 `sk-` 扫描会命中脱敏实现和明确的测试假密钥，不把这些匹配误报为真实凭据。5.21 上对既有隔离项目 `ling-a6-interruption-20261118` 只读检查未见运行容器，app/db volumes 仍保留；本节没有在 5.21 启动新项目，也没有验证上述修复的真实容器行为。
+
+**本节判定**：本机源码测试通过，但尚无本地修复的 PR CI、合并 SHA 镜像或 5.21 容器复验；不得把这些结果表述为已发布修复。`v0.0.9` 的 Release 镜像仍绑定 `f381a8c`，完整发布后更新通道仍为 No-Go。
