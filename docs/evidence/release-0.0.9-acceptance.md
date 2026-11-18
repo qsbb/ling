@@ -341,3 +341,13 @@ Registry manifest 原始字节重算值与 `Docker-Content-Digest` header 相同
 - 此 follow-up 尚未推送、没有 PR CI，也不在 `2ef949f` SHA 镜像或 `v0.0.9` tag 中；它是本地待合并代码，不可表述为已发布修复。
 
 **当前结论：稳定发布与完整更新通道仍 No-Go。** SHA-only CI/镜像和 5.21 隔离安装验收通过，但现有 `v0.0.9` 稳定 tag 指向旧镜像，本次没有选择或创建下一稳定版本；网页 updater 的真实候选更新任务、加速线路和故障矩阵未验，A2/A3 冻结范围也未全部完成。`0178521` 还需进入远端评审/CI 后才能成为远端候选。
+
+### 2026-11-18 本地工作树真实浏览器验收扩展
+
+本节只记录本地 E2E 验收工具的后续改动；不改变 `v0.0.9` tag、`main=2ef949f`、OCI 摘要或此前发布门禁结论。
+
+- `tests/e2e/w0_browser.mjs` 现在只在默认自建栈中增加真实数据验收：由 `tests/e2e/seed_relationship_acceptance.py` 向本轮随机 PostgreSQL 库写入 123 个关系主体、一个成员用户和一条私有记忆哨兵。显式复用外部 `BASE_URL` 时不注入数据，并跳过这些写入型专项。
+- 使用 Playwright 1.63.0、Chromium 153、本机 Node 24.21.0 跑完整 W0，43/43 通过。关系页在真实 Chromium/API/PostgreSQL 中首屏返回 50 条，翻页读完 124 条；真实合并经刷新仍存在，随后拆分成功；375px 文档宽度等于视口宽度。成员读他人互动为 `restricted` 空列表，读含私有哨兵的记忆返回 `public` 空列表；成员触发大纲生成得到 403。主人时间轴读取为 200，点击生成得到 202 / `queued`，页面显示“已经排上队了，她正在准备，稍等一下再看”，没有宣称生成完成。
+- 手动生成任务在本轮环境中没有观测到终态，故不证明日程最终成功/失败、重试或生成内容；该项仍不能算完整日程验收。其余冻结的连接器密钥清空/失败回滚、关系数据权限边界全集和网页 updater 故障矩阵，也没有由这次 W0 运行覆盖。因此 A2 仍为部分通过，整体发布与更新通道仍为 No-Go。
+- 最终日志 `/tmp/ling-w0-real-acceptance-20261118-r6.log` SHA-256 `baffa56c1e427ace6f5b3ad46a63a9c9aa2616a0b9338ec2e7e4661b608addf5`。被测文件 SHA-256：`tests/e2e/w0_browser.mjs=c3e67f733415b2402f785c7eaa3d516e08a5d035d417b3a48d5d082fcc57ec6b`、`tests/e2e/seed_relationship_acceptance.py=86ae9eb8ead2d14ef9844f72cc1aaa2f351ed15237dcc23b8488a9fbbdd3a996`、`tests/e2e/README.md=59b4f9b681f567afe14e13ea57b046c530d93587ec7afaa47dc7c5402cc69a54`。日志汇总为 43/43；本轮专属 PostgreSQL 库已删除、两个随机监听端口已释放，复查没有遗留 W0 数据库或测试进程。
+- 一次性启动诊断曾因 ChatGPT 内置 Node 的 Team ID 与 Rollup 原生模块不一致而在 Vite 启动前失败，未执行浏览器断言；切换到本机 Node 后完整运行通过。脚本现从创建隔离库时就记录栈所有权，以便之后的 API/Vite 启动错误也走清理分支。首次失败留下的唯一随机测试库已按精确名称删除；该诊断不计入 43/43。
