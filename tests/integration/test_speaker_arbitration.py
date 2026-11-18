@@ -142,17 +142,38 @@ async def test_queued_turn_speaks_after_release(logged_in: TestEnv) -> None:
         "session_id"
     ]
 
-    # B 先启动（会排队），A 占着不放
+    # B 先启动（会排队），A 占着不放。先建轮次再观察 queued 事件，不能用
+    # 固定 sleep 猜模型任务已经跑到仲裁点；慢 CI 上 sleep 结束时 B 可能还没
+    # acquire，随后释放 A 会让 B 直接取得占用，测试就失去了原本要覆盖的路径。
     coordinator._arbiter.acquire(window_id=win_a, turn_id="manual")  # noqa: SLF001
-    task_b = asyncio.create_task(
-        _run_turn(logged_in, coordinator, win_b, logged_in.subject_id, "排队后说话")
+    turn_id = await _make_turn(logged_in, win_b, "排队后说话")
+    queue = await coordinator.run_turn(
+        window_id=win_b,
+        subject_id=logged_in.subject_id,
+        turn_id=turn_id,
+        user_text="排队后说话",
+        config=_fast_config(),
     )
-    # 给 B 一点时间进入排队
-    await asyncio.sleep(0.4)
+
+    events_b = []
+    while True:
+        item = await asyncio.wait_for(queue.get(), timeout=30)
+        if item is None:
+            break
+        events_b.append((item.event, item.data))
+        if item.event == "turn.queued":
+            break
+    assert events_b and events_b[-1][0] == "turn.queued", "B 未进入排队状态"
+
     # 释放 A，B 应被提升
     coordinator._arbiter.release(window_id=win_a, turn_id="manual")  # noqa: SLF001
 
-    _, events_b = await asyncio.wait_for(task_b, timeout=60)
+    while True:
+        item = await asyncio.wait_for(queue.get(), timeout=60)
+        if item is None:
+            break
+        events_b.append((item.event, item.data))
+
     names_b = [n for n, _ in events_b]
     completed = [d for n, d in events_b if n == "turn.completed"]
     assert completed
@@ -162,6 +183,7 @@ async def test_queued_turn_speaks_after_release(logged_in: TestEnv) -> None:
     if payload["decision"] == "reply":
         assert payload["message"] is not None
         assert "turn.speaking" in names_b, "输出前应先通知取得发言权"
+        assert names_b.index("turn.speaking") < names_b.index("delta")
     else:
         assert payload["decision"] == "deferred_by_floor"
         assert payload["message"] is None, "未取得发言权却交付了正文"
