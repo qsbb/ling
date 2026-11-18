@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import update
@@ -31,6 +32,15 @@ from ling.kernel.context import ContextCompiler
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
+
+
+@pytest.fixture(autouse=True)
+def freeze_environment_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep prompt equality checks focused on audience data, not wall-clock drift."""
+    import ling.kernel.env_facts as env_facts
+
+    fixed_now = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    monkeypatch.setattr(env_facts, "_utcnow", lambda: fixed_now)
 
 
 async def _window(env: TestEnv, *, visibility: str = "subject_private", title: str = "w") -> str:

@@ -52,6 +52,11 @@ import { loadChromium } from './lib/playwright.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
 const RUN_ID = makeRunId();
+const HOST_ENV_SENTINELS = Object.freeze({
+  LING_QQBOT_APP_ID: `w0-host-app-sentinel-${RUN_ID}`,
+  LING_QQBOT_CLIENT_SECRET: `w0-host-secret-sentinel-${RUN_ID}`,
+});
+const HOST_ENV_FOR_CHILD = Object.freeze({ ...process.env, ...HOST_ENV_SENTINELS });
 const PG_PORT = Number(process.env.LING_PGPORT || 55432);
 const PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
 /** 共享 / 保留端口：既不能当 BASE_URL，也不能当本次自起服务的端口。 */
@@ -247,8 +252,22 @@ let apiBase = null;
 let webPort = null;
 let apiPort = null;
 let tmpRoot = null;
+let serviceEnv = null;
 /** 复用外部实例时，本脚本不拥有它，收尾时也不能杀它。 */
 let ownsStack = false;
+
+function childEnvironment(overrides = {}) {
+  const inherited = Object.fromEntries(
+    Object.entries(HOST_ENV_FOR_CHILD).filter(([key]) => !key.startsWith('LING_')),
+  );
+  const env = { ...inherited, ...overrides };
+  assert(
+    env.LING_QQBOT_APP_ID !== HOST_ENV_SENTINELS.LING_QQBOT_APP_ID &&
+      env.LING_QQBOT_CLIENT_SECRET !== HOST_ENV_SENTINELS.LING_QQBOT_CLIENT_SECRET,
+    '隔离子进程环境泄漏了宿主 LING_* 配置',
+  );
+  return env;
+}
 
 async function bootIsolatedStack() {
   // 1) 库：先 CREATE，被占用就换名；只删本次自己建的。
@@ -271,8 +290,7 @@ async function bootIsolatedStack() {
   fs.mkdirSync(dataDir, { recursive: true });
   const apiLog = path.join(SHOTS, 'api.log');
   fs.writeFileSync(apiLog, '');
-  const apiEnv = {
-    ...process.env,
+  serviceEnv = childEnvironment({
     LING_ENV: 'dev',
     LING_HOST: '127.0.0.1',
     LING_PORT: String(apiPort),
@@ -291,10 +309,10 @@ async function bootIsolatedStack() {
     LING_USER_TIMEZONE: 'Asia/Shanghai',
     // 前端由 Vite dev 提供（它负责 /v1、/healthz、/readyz 代理）。
     LING_WEB_DIST: '',
-  };
+  });
   const apiChild = startProcess('api', PYTHON, ['-m', 'ling'], {
     cwd: REPO_ROOT,
-    env: apiEnv,
+    env: serviceEnv,
     logPath: apiLog,
   });
   servers.push({ child: apiChild, label: `api:${apiPort}` });
@@ -319,7 +337,7 @@ async function bootIsolatedStack() {
     [viteBin, '--port', String(webPort), '--strictPort', '--host', '127.0.0.1'],
     {
       cwd: path.join(REPO_ROOT, 'clients', 'web-console'),
-      env: { ...process.env, LING_API_TARGET: apiBase },
+      env: childEnvironment({ LING_API_TARGET: apiBase }),
       logPath: webLog,
     },
   );
@@ -336,6 +354,28 @@ async function bootIsolatedStack() {
     `隔离栈：库 ${DB_NAME}@127.0.0.1:${PG_PORT} · API ${apiBase} · 前端 ${BASE_URL}` +
       `（跑完 kill 进程组 + 只删这个库）`,
   );
+}
+
+async function startIsolatedWorker() {
+  assert(ownsStack && serviceEnv, '只有自建隔离栈才能启动 W0 worker');
+  const workerLog = path.join(SHOTS, 'worker.log');
+  fs.writeFileSync(workerLog, '');
+  const child = startProcess('worker', PYTHON, ['-m', 'ling.worker'], {
+    cwd: REPO_ROOT,
+    env: serviceEnv,
+    logPath: workerLog,
+  });
+  servers.push({ child, label: 'worker' });
+  await waitUntil(
+    () =>
+      child.exitCode === null &&
+      child.signalCode === null &&
+      fs.readFileSync(workerLog, 'utf8').includes('worker 启动 env='),
+    `隔离 worker 启动（日志 ${workerLog}）`,
+    60_000,
+    250,
+  );
+  record('日程：独立 worker 在隔离配置下启动', true);
 }
 
 /* ---------------------------------------------------------- 收尾（幂等 + 单飞） */
@@ -1090,7 +1130,7 @@ function seedRelationshipAcceptanceData() {
   const result = spawnSync(PYTHON, [seedPath, '127.0.0.1', String(PG_PORT), DB_NAME], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
-    env: { ...process.env, PYTHONPATH: path.join(REPO_ROOT, 'src') },
+    env: childEnvironment({ PYTHONPATH: path.join(REPO_ROOT, 'src') }),
   });
   if (result.status !== 0) {
     throw new Error(
@@ -1275,6 +1315,230 @@ async function runMemberPermissionAcceptance(browser) {
   await context.close();
 }
 
+async function runConnectorRuntimeAcceptance(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const loggedIn = await login(page);
+  if (!loggedIn) {
+    record('连接器：真实 API 的密钥保存/清除与回滚', false, 'owner login failed');
+    await context.close();
+    return;
+  }
+
+  const result = await page.evaluate(
+    async ({ occupiedPort, hostSentinels, runId }) => {
+      async function request(path, { method = 'GET', body = null, generation = null } = {}) {
+        const headers = {};
+        if (body !== null) headers['Content-Type'] = 'application/json';
+        if (generation !== null) headers['If-Match'] = String(generation);
+        const response = await fetch(path, {
+          method,
+          credentials: 'same-origin',
+          headers,
+          ...(body === null ? {} : { body: JSON.stringify(body) }),
+        });
+        let payload = null;
+        try {
+          payload = await response.json();
+        } catch {
+          /* The result records status only; response text may contain credentials. */
+        }
+        return { status: response.status, body: payload };
+      }
+
+      const scope = (payload, name) => payload.connectors.find((item) => item.id === name);
+      const field = (payload, name, key) => scope(payload, name).fields.find((item) => item.key === key);
+      const hasAnySecret = (payload, secrets) => {
+        const serialized = JSON.stringify(payload ?? {});
+        return secrets.some((secret) => serialized.includes(secret));
+      };
+      const initial = await request('/v1/settings/connectors');
+      if (initial.status !== 200 || !initial.body) {
+        return {
+          isolatedHostCredentials: false,
+          qqSaveMasked: false,
+          qqBlankAndClear: false,
+          onebotRollback: false,
+          initialStatus: initial.status,
+          qqStatus: 0,
+          rollbackStatus: 0,
+          rollbackState: 'unavailable',
+          generationBefore: -1,
+          generationAfter: -1,
+        };
+      }
+
+      const initialApp = field(initial.body, 'qqbot', 'LING_QQBOT_APP_ID');
+      const initialClientSecret = field(initial.body, 'qqbot', 'LING_QQBOT_CLIENT_SECRET');
+      const isolatedHostCredentials =
+        initialApp.source === 'default' &&
+        initialClientSecret.source === 'default' &&
+        !initialApp.configured &&
+        !initialClientSecret.configured &&
+        !hasAnySecret(initial.body, Object.values(hostSentinels));
+
+      const qqValues = {
+        LING_QQBOT_APP_ID: `w0-fake-app-${runId}`,
+        LING_QQBOT_CLIENT_SECRET: `w0-fake-client-secret-${runId}`,
+        LING_QQBOT_BOT_SECRET: `w0-fake-bot-secret-${runId}`,
+      };
+      const initialQq = scope(initial.body, 'qqbot');
+      const saved = await request('/v1/settings/connectors/qqbot', {
+        method: 'PUT',
+        generation: initialQq.generation,
+        body: { set: qqValues },
+      });
+      const savedView = await request('/v1/settings/connectors');
+      const savedSecrets = Object.values(qqValues);
+      const savedApp = savedView.body && field(savedView.body, 'qqbot', 'LING_QQBOT_APP_ID');
+      const savedClientSecret = savedView.body && field(savedView.body, 'qqbot', 'LING_QQBOT_CLIENT_SECRET');
+      const qqSaveMasked =
+        saved.status === 202 &&
+        saved.body?.state === 'active' &&
+        savedView.status === 200 &&
+        savedApp?.source === 'db' &&
+        savedApp.configured &&
+        savedApp.value === null &&
+        savedApp.preview &&
+        savedClientSecret?.source === 'db' &&
+        savedClientSecret.configured &&
+        savedClientSecret.value === null &&
+        savedClientSecret.preview &&
+        !hasAnySecret(saved.body, savedSecrets) &&
+        !hasAnySecret(savedView.body, savedSecrets);
+
+      const savedQq = savedView.body ? scope(savedView.body, 'qqbot') : { generation: -1 };
+      const blank = await request('/v1/settings/connectors/qqbot', {
+        method: 'PUT',
+        generation: savedQq.generation,
+        body: { set: { LING_QQBOT_CLIENT_SECRET: '' } },
+      });
+      const afterBlank = await request('/v1/settings/connectors');
+      const afterBlankSecret =
+        afterBlank.body && field(afterBlank.body, 'qqbot', 'LING_QQBOT_CLIENT_SECRET');
+      const blankIsNoop =
+        blank.status === 200 &&
+        blank.body?.state === 'unchanged' &&
+        blank.body?.generation === savedQq.generation &&
+        afterBlank.status === 200 &&
+        afterBlankSecret?.source === 'db' &&
+        afterBlankSecret.configured &&
+        !hasAnySecret(blank.body, savedSecrets) &&
+        !hasAnySecret(afterBlank.body, savedSecrets);
+
+      const clear = await request('/v1/settings/connectors/qqbot', {
+        method: 'PUT',
+        generation: savedQq.generation,
+        body: { clear: Object.keys(qqValues) },
+      });
+      const afterClear = await request('/v1/settings/connectors');
+      const clearedFields = afterClear.body
+        ? Object.keys(qqValues).map((key) => field(afterClear.body, 'qqbot', key))
+        : [];
+      const qqCleared =
+        clear.status === 202 &&
+        clear.body?.state === 'active' &&
+        afterClear.status === 200 &&
+        clearedFields.length === Object.keys(qqValues).length &&
+        clearedFields.every(
+          (item) => item.source === 'default' && !item.configured && item.value === null && item.preview === null,
+        ) &&
+        !hasAnySecret(clear.body, savedSecrets) &&
+        !hasAnySecret(afterClear.body, savedSecrets);
+
+      const initialOnebot = scope(initial.body, 'onebot');
+      const previousSelfId = '100200300';
+      const previous = await request('/v1/settings/connectors/onebot', {
+        method: 'PUT',
+        generation: initialOnebot.generation,
+        body: { set: { LING_ONEBOT_SELF_ID: previousSelfId } },
+      });
+      const beforeRollback = await request('/v1/settings/connectors');
+      const beforeOnebot = beforeRollback.body && scope(beforeRollback.body, 'onebot');
+      const rollbackToken = `w0-fake-onebot-token-${runId}`;
+      const rollback = await request('/v1/settings/connectors/onebot', {
+        method: 'PUT',
+        generation: beforeOnebot?.generation ?? -1,
+        body: {
+          set: {
+            LING_ONEBOT_WS_HOST: '127.0.0.1',
+            LING_ONEBOT_WS_PORT: String(occupiedPort),
+            LING_ONEBOT_WS_TOKEN: rollbackToken,
+          },
+        },
+      });
+      const operation = rollback.body?.operation_id
+        ? await request(`/v1/settings/connectors/operations/${encodeURIComponent(rollback.body.operation_id)}`)
+        : { status: 0, body: null };
+      const afterRollback = await request('/v1/settings/connectors');
+      const afterOnebot = afterRollback.body && scope(afterRollback.body, 'onebot');
+      const preservedField = afterRollback.body && field(afterRollback.body, 'onebot', 'LING_ONEBOT_SELF_ID');
+      const restoredPort = afterRollback.body && field(afterRollback.body, 'onebot', 'LING_ONEBOT_WS_PORT');
+      const restoredToken = afterRollback.body && field(afterRollback.body, 'onebot', 'LING_ONEBOT_WS_TOKEN');
+      const health = await request('/healthz');
+      const rollbackSecrets = [...savedSecrets, rollbackToken];
+      const onebotRollback =
+        previous.status === 202 &&
+        previous.body?.state === 'active' &&
+        beforeRollback.status === 200 &&
+        rollback.status === 202 &&
+        rollback.body?.state === 'rolled_back' &&
+        rollback.body?.generation === beforeOnebot?.generation &&
+        operation.status === 200 &&
+        operation.body?.state === 'rolled_back' &&
+        afterRollback.status === 200 &&
+        afterOnebot?.generation === beforeOnebot?.generation &&
+        preservedField?.value === previousSelfId &&
+        restoredPort?.value !== String(occupiedPort) &&
+        !restoredToken?.configured &&
+        health.status === 200 &&
+        !hasAnySecret(rollback.body, rollbackSecrets) &&
+        !hasAnySecret(operation.body, rollbackSecrets) &&
+        !hasAnySecret(afterRollback.body, rollbackSecrets);
+
+      return {
+        isolatedHostCredentials,
+        qqSaveMasked,
+        qqBlankAndClear: blankIsNoop && qqCleared,
+        onebotRollback,
+        initialStatus: initial.status,
+        qqStatus: saved.status,
+        blankStatus: blank.status,
+        clearStatus: clear.status,
+        rollbackStatus: rollback.status,
+        rollbackState: String(rollback.body?.state ?? 'missing'),
+        operationState: String(operation.body?.state ?? 'missing'),
+        generationBefore: Number(beforeOnebot?.generation ?? -1),
+        generationAfter: Number(afterOnebot?.generation ?? -1),
+      };
+    },
+    { occupiedPort: apiPort, hostSentinels: HOST_ENV_SENTINELS, runId: RUN_ID },
+  );
+
+  record(
+    '连接器：合成宿主 QQBot 凭据没有进入隔离 API',
+    result.isolatedHostCredentials,
+    `initial=${result.initialStatus}`,
+  );
+  record(
+    'QQBot：保存假凭据后只返回脱敏字段',
+    result.qqSaveMasked,
+    `http=${result.qqStatus}`,
+  );
+  record(
+    'QQBot：空密钥不改值，显式清除回到默认值',
+    result.qqBlankAndClear,
+    `blank=${result.blankStatus} clear=${result.clearStatus}`,
+  );
+  record(
+    'OneBot：监听端口冲突后 rolled_back 且旧配置/代际保留',
+    result.onebotRollback,
+    `http=${result.rollbackStatus} state=${result.rollbackState}/${result.operationState} ` +
+      `generation=${result.generationBefore}->${result.generationAfter}`,
+  );
+  await context.close();
+}
+
 async function runLifeTimelineAcceptance(browser) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
@@ -1302,12 +1566,23 @@ async function runLifeTimelineAcceptance(browser) {
     await context.close();
     return;
   }
-  const submit = page.waitForResponse((response) => {
-    const request = response.request();
-    return request.method() === 'POST' && new URL(response.url()).pathname === '/v1/life/outline-jobs';
-  });
-  await generate.click();
-  const response = await submit;
+  let response;
+  try {
+    const submit = page.waitForResponse((candidate) => {
+      const request = candidate.request();
+      return request.method() === 'POST' && new URL(candidate.url()).pathname === '/v1/life/outline-jobs';
+    });
+    await generate.click();
+    response = await submit;
+  } catch (error) {
+    record(
+      '日程：真实提交入队后显示进行中状态',
+      false,
+      error instanceof Error ? error.message : String(error),
+    );
+    await context.close();
+    return;
+  }
   const body = await response.json();
   const status = page.locator('[data-testid="tl-generate-status"]');
   await page.waitForFunction(
@@ -1326,6 +1601,98 @@ async function runLifeTimelineAcceptance(browser) {
       ['queued', 'running'].includes(body.state) &&
       !/已经排好了|生成成功/.test(message),
     `http=${response.status()} state=${body.state} note=${message}`,
+  );
+
+  if (response.status() !== 202 || typeof body.job_id !== 'string') {
+    record('日程：真实 worker 将手动作业推进到终态', false, '没有可轮询的 job_id');
+    await context.close();
+    return;
+  }
+
+  await startIsolatedWorker();
+
+  const terminalStates = new Set(['ready', 'degraded', 'failed', 'blocked']);
+  let job;
+  try {
+    job = await waitUntil(
+      async () => {
+        const current = await page.evaluate(async (jobId) => {
+          const result = await fetch(`/v1/life/outline-jobs/${encodeURIComponent(jobId)}`, {
+            credentials: 'same-origin',
+          });
+          return { status: result.status, body: await result.json() };
+        }, body.job_id);
+        if (current.status !== 200) throw new Error(`作业状态 HTTP ${current.status}`);
+        return terminalStates.has(current.body.state) ? current.body : false;
+      },
+      '日程作业由隔离 worker 推进到终态',
+      180_000,
+      500,
+    );
+  } catch (error) {
+    record(
+      '日程：真实 worker 将手动作业推进到终态',
+      false,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw error;
+  }
+  record(
+    '日程：真实 worker 将手动作业推进到终态',
+    terminalStates.has(job.state),
+    `state=${job.state} plan_state=${job.plan_state} revision=${job.revision}`,
+  );
+
+  let uiFinished = false;
+  await page
+    .waitForFunction(
+      () => {
+        const element = document.querySelector('[data-testid="tl-generate-status"]');
+        return Boolean(element && !/排队|正在/.test(element.textContent ?? ''));
+      },
+      undefined,
+      { timeout: 20_000 },
+    )
+    .then(() => {
+      uiFinished = true;
+    })
+    .catch(() => {});
+  const finalMessage = await page.locator('[data-testid="tl-generate-status"]').innerText().catch(() => '');
+  record(
+    '日程：浏览器轮询显示终态人话且不显示原因码',
+    uiFinished && (!job.reason_code || !finalMessage.includes(job.reason_code)),
+    `state=${job.state} note=${finalMessage}`,
+  );
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator('[data-testid="life-timeline"]').waitFor({ timeout: 20000 });
+  const persisted = await page.evaluate(async (jobId) => {
+    const [timelineResponse, jobResponse] = await Promise.all([
+      fetch('/v1/life/timeline', { credentials: 'same-origin' }),
+      fetch(`/v1/life/outline-jobs/${encodeURIComponent(jobId)}`, { credentials: 'same-origin' }),
+    ]);
+    return {
+      timelineStatus: timelineResponse.status,
+      timeline: await timelineResponse.json(),
+      jobStatus: jobResponse.status,
+      job: await jobResponse.json(),
+    };
+  }, body.job_id);
+  const noPlanExpected = job.state === 'failed' || job.state === 'blocked';
+  const timelineMatchesJob = noPlanExpected
+    ? persisted.timeline.revision === job.revision
+    : persisted.timeline.revision === job.revision &&
+      persisted.timeline.plan_state === job.plan_state &&
+      job.revision > 0;
+  record(
+    '日程：刷新后从 PostgreSQL 读回终态与计划修订',
+    persisted.timelineStatus === 200 &&
+      persisted.jobStatus === 200 &&
+      persisted.job.state === job.state &&
+      persisted.job.revision === job.revision &&
+      timelineMatchesJob,
+    `state=${persisted.job.state} plan_state=${persisted.timeline.plan_state} ` +
+      `revision=${persisted.timeline.revision}`,
   );
   await context.close();
 }
@@ -1355,6 +1722,7 @@ async function runSettingsPage(browser) {
 let exitCode = 0;
 let browser = null;
 try {
+  childEnvironment();
   if (BASE_URL) {
     // 复用外部实例：本脚本不拥有它，也不会删它的库。这条路径的残余风险是
     // 「写的到底是哪个库」只能由调用方保证——所以 BASE_URL 必须显式给、必须
@@ -1367,7 +1735,6 @@ try {
   if (!(await waitReady())) {
     throw new Error(`服务未就绪：${BASE_URL}/readyz`);
   }
-
   browser = await chromium.launch({ executablePath: EXECUTABLE });
   console.log(`Playwright：${PLAYWRIGHT_ORIGIN}`);
   console.log(`浏览器：${browser.version()}${EXECUTABLE ? `（CHROME_PATH=${EXECUTABLE}）` : '（内置缓存）'}`);
@@ -1382,6 +1749,7 @@ try {
   if (ownsStack) {
     await runRelationshipAcceptance(browser);
     await runMemberPermissionAcceptance(browser);
+    await runConnectorRuntimeAcceptance(browser);
     await runLifeTimelineAcceptance(browser);
   }
 } catch (error) {
