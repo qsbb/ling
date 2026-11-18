@@ -3638,7 +3638,7 @@ class Updater:
 
     # -------------------------------------------------- 按需刷新（检查更新）
     def process_refresh(self, path: Path) -> int:
-        """处理一个 ``refresh-<id>.json``：**立刻**查一次 registry + 读更新说明。
+        """处理一个 ``refresh-<id>.json``：刷新恢复点、registry 与更新说明。
 
         这条路**只做只读动作**（GHCR 的 tags/list + manifest、``docker
         ps/inspect`` 读当前版本、可选一次 GitHub Release）：不拉镜像、不备份、
@@ -3710,6 +3710,8 @@ class Updater:
             return EXIT_OK
         try:
             # 绕过 5 分钟自动刷新节流：用户点了检查，就必须**现在**去查。
+            # 手动备份可能在 updater 启动后才完成，恢复点门禁也要随这次检查更新。
+            self.status.refresh_backup_gate()
             self.status.refresh_release_check(requested=True, request_id=name_id)
             self.status.write("idle", self.task, force=True)
             summary = self.status.summary()

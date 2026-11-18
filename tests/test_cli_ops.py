@@ -967,6 +967,41 @@ def test_backup_uses_install_compose_group(ops: Ops) -> None:
     assert backup_dir.is_dir()
 
 
+def test_backup_outputs_are_owned_by_the_requested_updater(ops: Ops) -> None:
+    with late_readyz(ops.ws) as server:
+        install = run_install(
+            ops.ws,
+            extra=[
+                "--updater-digest",
+                UPDATER_TARGET,
+                "--with-updater",
+                "--docker-gid",
+                "999",
+            ],
+        )
+        assert server.wait_ready(10.0)
+    assert install.returncode == 0, (install.stdout, install.stderr)
+
+    result = ops.run(backup_argv(ops))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    state = ops.ws.install_state()
+    backup_dir = Path(state["backup"]["dir"])
+    updater_user = state["layout"]["updater"]["user"]
+    expected = (updater_user["uid"], updater_user["gid"])
+    manifest = next(backup_dir.glob("manifest-*.txt"))
+    fields = dict(
+        line.split("=", 1)
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    artifacts = [manifest, backup_dir / fields["dump"], backup_dir / fields["tombstones"]]
+    if fields.get("media") not in (None, "absent"):
+        artifacts.append(backup_dir / fields["media"])
+    if fields.get("keys_root_file"):
+        artifacts.append(backup_dir / fields["keys_root_file"])
+    assert all((path.stat().st_uid, path.stat().st_gid) == expected for path in artifacts)
+
+
 def test_backup_reports_incomplete_manifest(ops: Ops) -> None:
     install_ok(ops)
     result = ops.run(backup_argv(ops), env={"STUB_BACKUP_MODE": "no_dump_sha"})

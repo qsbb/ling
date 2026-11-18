@@ -6060,7 +6060,7 @@ class Installer:
         password = self.secret_values.get("LING_BOOTSTRAP_ADMIN_PASSWORD")
         if not password:
             return
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if self.o.interactive:
             self.password_shown = True
             self.state["admin"]["password_shown_once"] = True
             with contextlib.suppress(OSError):
@@ -9719,6 +9719,7 @@ def backup_command(args: argparse.Namespace) -> int:
             print(f"  - {problem}")
         print("结论：这份备份**不能**当作可恢复的恢复点（`ling backup` 非 0）。")
         return EXIT_STATUS_MISMATCH
+
     print("结论：备份完成，manifest 关键字段与产物哈希一致。")
     print("      下一步：`ling restore-drill` 做一次隔离恢复演练（不要在生产库上试）。")
     return EXIT_OK

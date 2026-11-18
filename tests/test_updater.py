@@ -3649,6 +3649,44 @@ def test_refresh_request_triggers_a_real_registry_check(ws: Workspace) -> None:
     assert REFRESH_ID in saved["processed"]
 
 
+def test_refresh_request_rechecks_backup_gate_after_new_manifest(ws: Workspace) -> None:
+    """同一 updater 运行期间新增备份后，用户刷新应立即看到新的恢复点。"""
+    updater = _updater_module()
+    args = [
+        "--requests-dir",
+        str(ws.requests_dir),
+        "--state-dir",
+        str(ws.state_dir),
+        "--compose-file",
+        str(ws.compose_file),
+        "--env-file",
+        str(ws.env_file),
+        "--backup-dir",
+        str(ws.backup_dir),
+        "--backup-script",
+        str(ws.backup_script),
+        "--publish-py",
+        str(PUBLISH_PY),
+        "--release-catalog",
+        str(ws.release_catalog),
+    ]
+    cfg = updater.parse_config(args)
+    instance = updater.Updater(cfg, updater.load_publish(cfg.publish_py))
+
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+
+    write_manifest(ws, "20261118-120000")
+    path = write_refresh(ws)
+    assert updater.run_once(instance) == 0
+    assert not path.exists()
+
+    gate = ws.status()["backup_gate"]
+    assert gate["restore_point"] is True
+    assert gate["backup_id"] == "20261118-120000"
+    assert gate["reason"] == "ok"
+
+
 def test_same_refresh_id_is_not_processed_twice(ws: Workspace) -> None:
     """同一个 request_id 再写回来 → 只删文件，不再查（跨进程幂等）。"""
     write_refresh(ws, REFRESH_ID)

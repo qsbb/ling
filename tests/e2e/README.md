@@ -41,12 +41,12 @@
 | --- | --- | --- | --- |
 | `memory_browser.mjs` | 是（自建一次性库） | `<tmp>/ling-e2e/memory-<运行 id>` | 40 项；含 real-403 / real-500 |
 | `nav_browser.mjs` | 是（自建一次性库） | `<tmp>/ling-e2e/nav-<运行 id>` | 36 项 |
-| `w0_browser.mjs` | 是（自建一次性库；默认自起栈） | `<tmp>/ling-e2e/w0-<运行 id>` | 34 项；会写库，故默认自起栈、拒绝 8080 |
+| `w0_browser.mjs` | 是（自建一次性库；默认自起栈） | `<tmp>/ling-e2e/w0-<运行 id>` | 43 项；会写库，故默认自起栈、拒绝 8080 |
 | `dashboard_browser.mjs` | 否（`/v1/**` 全 mock） | `<tmp>/ling-e2e/dashboard-<运行 id>` | 92 项 |
 | `update_browser.mjs` | 否（`/v1/**` 全 mock） | `<tmp>/ling-e2e/update-<运行 id>` | 预览构建产物 |
 
 > 上表的「N 项」是**实测**数字（`exit 0` 时的汇总行），不是设计稿里的旧值：
-> memory 40 / nav 36 / w0 34 / dashboard 92。新增或删除断言时请同步这一列。
+> memory 40 / nav 36 / w0 43 / dashboard 92。新增或删除断言时请同步这一列。
 
 ## 已知坑（防未来误红）
 

@@ -46,8 +46,9 @@
 #      **不算 5**，仍 exit 0
 #   6  **备份锁被占用**（另一个实例正在同一 OUT_DIR 上运行；或残留锁接管失败）
 #   7  缺少 sha256 工具（sha256sum / shasum / openssl 都没有；在任何磁盘动作之前退出）
+#   8  备份完整，但不能把产物交给备份目录属主（镜像模式 updater）
 #
-# 注：0–7 是脚本显式/常见的状态，**不是封闭集合**；`set -e` 会透传底层命令的
+# 注：0–8 是脚本显式/常见的状态，**不是封闭集合**；`set -e` 会透传底层命令的
 # 状态（命令缺失 127、psql 自身 exit 2 等），不能假设只会出现这 8 个值。
 #
 # 约束（设计文档 §10）：数据库备份与媒体清单要在同一恢复点验证；
@@ -233,6 +234,56 @@ BACKUP_OK=0
 KEYS_ARCHIVED=0
 KEYS_PREEXISTED=0
 KEYS_PREV=""
+
+handoff_backup_artifacts() {
+  local directory_owner="" owner_uid="" owner_gid="" runner_uid="" path
+  local -a artifacts=("$OUT_DIR/ling-$STAMP.dump" "$OUT_DIR/tombstones-$STAMP.txt")
+  artifacts+=("$OUT_DIR/manifest-$STAMP.txt")
+  if [[ "$MEDIA_NAME" != "absent" ]]; then
+    artifacts+=("$OUT_DIR/$MEDIA_NAME")
+  fi
+  if [[ "$KEYS_FILE" == "keys/root.key" && -f "$OUT_DIR/keys/root.key" ]]; then
+    artifacts+=("$OUT_DIR/keys" "$OUT_DIR/keys/root.key")
+  fi
+  if [[ -f "$OUT_DIR/version-$STAMP.txt" ]]; then
+    artifacts+=("$OUT_DIR/version-$STAMP.txt")
+  fi
+
+  directory_owner="$(stat -c '%u:%g' "$OUT_DIR" 2>/dev/null)" || \
+    directory_owner="$(stat -f '%u:%g' "$OUT_DIR" 2>/dev/null)" || {
+      echo "[backup] 无法读取备份目录属主，不能确认更新器可读取恢复点" >&2
+      return 1
+    }
+  owner_uid="${directory_owner%%:*}"
+  owner_gid="${directory_owner#*:}"
+  if [[ ! "$owner_uid" =~ ^[0-9]+$ || ! "$owner_gid" =~ ^[0-9]+$ ]]; then
+    echo "[backup] 备份目录属主格式无效，不能确认更新器可读取恢复点" >&2
+    return 1
+  fi
+  runner_uid="$(id -u)" || {
+    echo "[backup] 无法读取当前 uid，不能交接备份文件权限" >&2
+    return 1
+  }
+  if [[ "$runner_uid" == "$owner_uid" ]]; then
+    return 0
+  fi
+  if [[ "$runner_uid" != "0" ]]; then
+    echo "[backup] 当前 uid=${runner_uid}，备份目录属主=${owner_uid}:${owner_gid}；" \
+      "当前用户不能把恢复点交给目录属主" >&2
+    return 1
+  fi
+  for path in "${artifacts[@]}"; do
+    if [[ -L "$path" ]]; then
+      echo "[backup] 拒绝把符号链接交给备份目录属主：${path##*/}" >&2
+      return 1
+    fi
+  done
+  if ! chown -h "$owner_uid:$owner_gid" "${artifacts[@]}"; then
+    echo "[backup] 备份完整，但无法把恢复点交给目录属主 ${owner_uid}:${owner_gid}" >&2
+    return 1
+  fi
+  echo "[backup] 已把受限恢复点交给备份目录属主 ${owner_uid}:${owner_gid}"
+}
 
 # ---------------------------------------------------------------- 并发锁
 #
@@ -1347,6 +1398,7 @@ exec cat /data/root.key
     echo "media_sha256=$MEDIA_HASH"
   } > "$OUT_DIR/manifest-$STAMP.txt"
   BACKUP_OK=1
+  handoff_backup_artifacts || exit 8
   # 轮转放在**成功之后**：BACKUP_OK 已经置 1，所以轮转里的任何意外都不会触发
   # 失败清理（那会把刚做好的这份备份删掉）；run_prune 自身也从不返回非零。
   run_prune || true
@@ -1491,5 +1543,6 @@ media_sha256=$MEDIA_HASH
 MANIFEST
 
 BACKUP_OK=1
+handoff_backup_artifacts || exit 8
 run_prune || true
 echo "[backup] 完成：$OUT_DIR/ling-$STAMP.dump"

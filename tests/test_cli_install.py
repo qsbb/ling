@@ -47,7 +47,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -3466,6 +3466,58 @@ def _load_module(name: str, path: Path) -> ModuleType:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _password_output_probe(monkeypatch: pytest.MonkeyPatch, *, interactive: bool):
+    ling = _load_module("ling_cli_password_output", LING_PY)
+    installer = object.__new__(ling.Installer)
+    password = "test-password-value"
+    installer.o = SimpleNamespace(interactive=interactive)
+    installer.layout = SimpleNamespace(env_file=Path("/restricted/.env"))
+    installer.secret_values = {"LING_BOOTSTRAP_ADMIN_PASSWORD": password}
+    installer.state = {"admin": {"password_shown_once": False}}
+    installer.password_shown = False
+    lines: list[str] = []
+    writes: list[bool] = []
+    installer.say = lines.append
+    installer.write_state = lambda: writes.append(True)
+
+    class Tty:
+        @staticmethod
+        def isatty() -> bool:
+            return True
+
+    monkeypatch.setattr(ling.sys, "stdin", Tty())
+    monkeypatch.setattr(ling.sys, "stdout", Tty())
+    installer.print_password_once()
+    return installer, password, "\n".join(lines), writes
+
+
+def test_noninteractive_install_never_prints_password_even_with_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer, password, output, writes = _password_output_probe(
+        monkeypatch, interactive=False
+    )
+
+    assert password not in output
+    assert "未在非交互终端显示" in output
+    assert installer.password_shown is False
+    assert installer.state["admin"]["password_shown_once"] is False
+    assert writes == []
+
+
+def test_interactive_tty_still_shows_password_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer, password, output, writes = _password_output_probe(
+        monkeypatch, interactive=True
+    )
+
+    assert password in output
+    assert installer.password_shown is True
+    assert installer.state["admin"]["password_shown_once"] is True
+    assert writes == [True]
 
 
 def test_shared_lock_and_redirect_invariants() -> None:
