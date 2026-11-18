@@ -234,6 +234,8 @@ def test_v008_bootstrap_refuses_to_reset_diverged_local_main(tmp_path: Path) -> 
     _git(source, "commit", "-m", "remote upgrade")
     _git(source, "push")
 
+    _git(install_root, "config", "user.name", "Test")
+    _git(install_root, "config", "user.email", "test@example.invalid")
     (install_root / "version.txt").write_text("local-only commit\n", encoding="utf-8")
     _git(install_root, "add", "version.txt")
     _git(install_root, "commit", "-m", "local-only work")
