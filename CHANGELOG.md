@@ -5,7 +5,7 @@
 
 ## [Unreleased]
 
-> 以下是 `v0.0.9` 正式 Release/tag 之后的改动。updater 修复已进入 `2ef949f` SHA-only 候选镜像；本地 CLI follow-up 尚未推送，不属于稳定 tag 或稳定镜像。
+> 以下是 `v0.0.9` 正式 Release/tag 之后的改动。updater 修复已进入 `2ef949f` SHA-only 候选镜像；CLI follow-up `0178521` 已纳入 PR #3，但不属于现有稳定 tag 或稳定镜像。
 
 ### 修复
 
@@ -20,7 +20,7 @@
 
 - 合并提交 `2ef949f517ebb09d09fbf10c2a943515945d3cef` 的 SHA-only workflow `44261602307` 中 verify、Python 3.12/3.13、Web、mobile、API image 与 updater-image 全部成功；Release job 按手动触发设计跳过。两个镜像均为 `0.0.9`，OCI revision 为该合并提交；摘要及隔离部署证据见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
 - `2ef949f` 固定摘要镜像在 5.21 命名隔离项目完成安装、`ling status`、`ling doctor`、真实 Chromium W0（34/34）、备份和隔离库恢复。W0 使用 `LING_TEST_MODE=1`；没有执行稳定版网页升级或真实模型调用。
-- 后续本地提交 `0178521` 修复带 TTY 的非交互口令回显；CLI 定向变异、完整 `tests/test_cli_install.py` 和 CI 等价全量 Python 套件通过。该本地 follow-up 尚未推送，也不属于 `2ef949f` 的 SHA 镜像或 `v0.0.9` 稳定 tag。
+- 提交 `0178521` 修复带 TTY 的非交互口令回显；CLI 定向变异、完整 `tests/test_cli_install.py` 和 CI 等价全量 Python 套件通过。该提交已纳入 PR #3，但不属于 `2ef949f` 的 SHA 镜像或 `v0.0.9` 稳定 tag。
 
 ## [0.0.9] - 2026-11-18
 

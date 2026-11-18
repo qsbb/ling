@@ -333,14 +333,20 @@ Registry manifest 原始字节重算值与 `Docker-Content-Digest` header 相同
 | A7 | 未验；SHA tag 不作为稳定更新目标，本次未发布新稳定版本或运行网页升级 |
 | A8 | 文档已按正式 tag、main SHA-only 候选和本地 follow-up 分开记录；本地 follow-up 另见下节 |
 
-**本地 follow-up `01785218e1ca862c8040f320169b246fde047227`**
+**本地 follow-up `01785218e1ca862c8040f320169b246fde047227`（PR #3 之前的状态快照）**
 
 - 将初始口令显示判据改为使用 CLI 已解析的 `interactive` 状态，避免 `--non-interactive` 在有 TTY 的 SSH/自动化终端回显密码；真正交互模式仍只显示一次并记录 `password_shown_once`。
 - 新增两条测试区分非交互隐藏与交互显示。将实现临时变异回旧 TTY 判据时，`test_noninteractive_install_never_prints_password_even_with_tty` 按预期失败；恢复后 `tests/test_cli_install.py` 整文件退出 0。红日志 `/tmp/ling-cli-password-mutation-red.log` SHA-256 `e68f79275059537345a4c913f4ad57120d98d3808d234147d3d235f6b5e35fd3`；CLI 全文件日志 `/tmp/ling-cli-install-full-after-password-fix.log` SHA-256 `c42bc1dcf3d10acea1a8ec00930fb77dd0ec47a79a450a1ffd72e07025d063c8`。
 - Ruff、`py_compile`、`git diff --check` 通过。全量 pytest 持 `/tmp/ling_test_lock.sh` 锁并设置两个 PostgreSQL URL；迁移链单独运行、登录加固单独运行、其余 `tests/` 使用 4 个 xdist worker，三个步骤退出码均为 0、100%，quiet 模式没有最终用例汇总，不推算数量。日志 SHA-256：迁移 `fe1146195285cfb24a5c3144b7e70f045e611308ff88a6568b72dd50a084e56e`；登录加固 `83a1593c5b5783693fe3006d1f6597bcb4f3a5968f23b59481ee09a0477f910a`；主体套件 `6fd6fa9443dd8514ccde403404e12e0872ca5a99f6908d3cf2d2e355978ee748`。较早串行尝试在 3% 时按计划中断，不计为测试结果。
-- 此 follow-up 尚未推送、没有 PR CI，也不在 `2ef949f` SHA 镜像或 `v0.0.9` tag 中；它是本地待合并代码，不可表述为已发布修复。
+- 截至本段记录时，此 follow-up 尚未推送、没有 PR CI，也不在 `2ef949f` SHA 镜像或 `v0.0.9` tag 中；它当时是本地待合并代码。现已纳入 PR #3，但仍不属于既有稳定镜像/tag。
 
-**当前结论：稳定发布与完整更新通道仍 No-Go。** SHA-only CI/镜像和 5.21 隔离安装验收通过，但现有 `v0.0.9` 稳定 tag 指向旧镜像，本次没有选择或创建下一稳定版本；网页 updater 的真实候选更新任务、加速线路和故障矩阵未验，A2/A3 冻结范围也未全部完成。`0178521` 还需进入远端评审/CI 后才能成为远端候选。
+**本段记录时的结论：稳定发布与完整更新通道仍 No-Go。** SHA-only CI/镜像和 5.21 隔离安装验收通过，但现有 `v0.0.9` 稳定 tag 指向旧镜像，本次没有选择或创建下一稳定版本；网页 updater 的真实候选更新任务、加速线路和故障矩阵未验，A2/A3 冻结范围也未全部完成。`0178521` 当时还需进入远端评审/CI。
+
+### 2026-11-19 PR #3 初始 head CI
+
+- PR #3 初始 head `c00b7a937613fff3c3c26835f8d195fb403ff908`，base `2ef949f517ebb09d09fbf10c2a943515945d3cef`。CI run `44356509597` 的 Web、Python 3.12 与 Python 3.13 jobs 全部成功，耗时分别为 3:00、30:26、35:17。
+- 该 head 已包含 CLI 提交 `01785218e1ca862c8040f320169b246fde047227`。本段只记录这个已验证 head；后续文档校准会产生新的 PR head，并须以新 head 的 CI 结果判断。
+- 此时 PR 尚未合并，未生成该候选的 SHA-only 镜像；现有 `v0.0.9` tag/Release 与镜像 digest 未变。
 
 ### 2026-11-18 本地工作树真实浏览器验收扩展
 

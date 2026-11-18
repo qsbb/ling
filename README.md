@@ -222,7 +222,8 @@ provider 生成，不证明真实模型能力。
 固定摘要已在 5.21 独立项目完成安装、真实浏览器 W0 34/34、备份和隔离库恢复；完整边界见
 [验收记录](docs/evidence/release-0.0.9-acceptance.md)。这没有移动现有 `v0.0.9` tag：它仍指向
 `f381a8c76df43a24b60944c91e22be46501bbd8c`，SHA-only 候选没有稳定 Release。后续本地提交
-`0178521` 还修正了带 TTY 的 `--non-interactive` 初始口令回显；该 follow-up 尚未推送或跑远端 CI。
+`0178521` 还修正了带 TTY 的 `--non-interactive` 初始口令回显；它已纳入 PR #3，但尚未进入
+现有稳定 tag/镜像。该提交的验证范围见[验收记录](docs/evidence/release-0.0.9-acceptance.md)。
 
 ## 安全与隐私
 
