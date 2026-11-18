@@ -6060,7 +6060,7 @@ class Installer:
         password = self.secret_values.get("LING_BOOTSTRAP_ADMIN_PASSWORD")
         if not password:
             return
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if self.o.interactive:
             self.password_shown = True
             self.state["admin"]["password_shown_once"] = True
             with contextlib.suppress(OSError):
