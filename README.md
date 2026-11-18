@@ -41,11 +41,9 @@ QQ、微信、Web 控制台、移动端都只是**连接到她的渠道**，她�
 
 ### Docker（推荐）
 
-需要 Git、Docker Engine、Docker Compose v2 和 pnpm 9+。整行执行后会在当前目录创建
-`ling`，生成本机配置、构建前端和 API 镜像并启动服务。没有 pnpm 的部署主机需要先在
-构建机对同一提交运行 `bash deploy/install.sh --build-web-only`，再把匹配的源码与
-`clients/web-console/dist` 一并传到部署机，并使用 `--prebuilt-web` 安装；这条路径包含
-独立的构建/传递步骤。
+需要 Git、Docker Engine 和 Docker Compose v2。整行执行后会在当前目录创建 `ling`，
+生成本机配置、构建前端和 API 镜像并启动服务。宿主有 pnpm 9+ 时可在本机编译前端；
+没有 pnpm 时，安装器使用 Dockerfile 的 Web 构建阶段，不必另行传递前端产物。
 
 ```bash
 git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
@@ -62,12 +60,19 @@ bash deploy/install.sh               # 仅重新部署当前检出，不拉取�
 bash deploy/install.sh --down        # 停止服务，保留数据
 ```
 
+固定 `v0.0.8` 源码检出尚无 `deploy/upgrade.sh`。从该检出根目录执行下面这条 bootstrap
+命令：工作区必须干净，当前提交和已有本地 `main` 都必须是 `origin/main` 的祖先；否则停止，
+不移动分支、不运行安装器。通过检查后快进到 `main` 并调用标准升级脚本。
+
+```bash
+test -z "$(git status --porcelain --untracked-files=normal)" && git fetch --no-tags origin main && git merge-base --is-ancestor HEAD FETCH_HEAD && { ! git show-ref --verify --quiet refs/heads/main || git merge-base --is-ancestor refs/heads/main FETCH_HEAD; } && git switch -C main FETCH_HEAD && bash deploy/upgrade.sh
+```
+
 `deploy/upgrade.sh` 适用于包含该脚本的源码 checkout，会获取当前分支远端并只接受快进更新，
 再调用标准安装流程；工作区有未提交改动时会停止。已有 `deploy/.env` 和 PostgreSQL 数据卷会保留。
-注意：`v0.0.8` checkout 不含此脚本，因此不能从固定 v0.0.8 源码基线直接运行这条升级命令；
-`v0.0.9` 的单行升级命令无法自举进入旧 checkout，本次验收将该路径判为未通过。
-镜像模式不使用这个脚本。网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动
-更新仍需按 [docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
+bootstrap 中任一 Git 检查失败都会停止，不会运行安装器。镜像模式不使用这两个源码升级命令。
+网页自动更新默认关闭（`LING_UPDATE_ENABLED=0`），首次启用自动更新仍需按
+[docs/UPDATES.md](docs/UPDATES.md) 完成宿主纳管。
 
 需要回滚保障时，升级前另行备份数据库和 `deploy/.env`。默认管理员名为 `ling`，可在首装
 时用 `--admin-user <名字>` 修改。

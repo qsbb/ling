@@ -11,13 +11,12 @@
 
 > **先看结论**
 >
-> - 源码模式首次安装命令需要 pnpm 9+。日常手动升级用
->   `bash deploy/upgrade.sh`，它检查干净工作区、快进获取当前分支远端后调用安装器。
->   `deploy/install.sh` 本身只构建并部署当前 checkout，不拉取代码。镜像模式的安装与
->   升级见 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐) 与本文 §10。
->   没有 pnpm 的部署机要另行构建并传递匹配的 `dist`。固定 `v0.0.8` checkout 不含
->   `deploy/upgrade.sh`；从该旧基线执行 README 升级命令得到 `No such file or directory`，
->   bootstrap 路径未提供，所以“从 v0.0.8 起的一行升级”尚未实现/验收。
+> - 当前 README 的源码首装不要求部署机安装 pnpm：宿主有 pnpm 9+ 时本机构建，缺少时由
+>   Dockerfile Web 阶段构建。日常手动升级用 `bash deploy/upgrade.sh`；固定 `v0.0.8`
+>   checkout 通过 README 的 bootstrap 命令先验证工作区和分支祖先，再快进到 `main` 并运行升级脚本。
+>   2026-11-18 在 5.21 无 pnpm 的隔离项目完成一行首装，并从固定 `v0.0.8` 检出完成 bootstrap
+>   升级；服务健康，PG head 为 `0078_proactive_daily_quota`，业务计数、`.env` 和媒体标记哈希保持。
+>   这是发布后的 README/源码部署复验，不改写发布时 `v0.0.9` 文档缺少 bootstrap 的失败记录。
 > - GitHub 已于 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）发布
 >   `v0.0.9`。tag、`main` 与 release workflow run `44112900865` 均绑定
 >   `f381a8c76df43a24b60944c91e22be46501bbd8c`；verify、Python 3.12/3.13、Web、mobile、
@@ -32,7 +31,9 @@
 >   提交、迁移、PG/媒体计数和 Cookie 均核验。另一次中断复测在 `prepare` 阶段停止 updater，
 >   重启后进入 `needs_manual`；人工确认后遗留 `claimed` 请求仍令重试 API 返回 409。v0.0.8 API
 >   对 `download_source` 返回 422，页面也没有线路选择器，所以中断恢复与加速线路均未通过。
->   自动更新继续默认关闭。
+>   自动更新继续默认关闭。发布的 `v0.0.9` updater 仍有确认后遗留 claim 的缺陷；工作树提交
+>   `a9fdb7f` 已在单飞锁内归档并重试清理，定向与全量测试通过；候选脚本也在 5.21 的 v0.9
+>   updater 基础镜像中完成一次真实容器确认/归档，但尚未构建或发布新 updater 镜像。
 > - 自动更新默认关闭（`LING_UPDATE_ENABLED=0`），**关闭时这套改动不影响已经跑着的
 >   服务**：通道目录照常挂载（compose 早就接线了，见 §2），但开关是 0，界面上不会
 >   出现可点的“更新”入口；`GET /v1/version/update` 仍会读 status 里的心跳来回答
@@ -1020,9 +1021,10 @@ fail-closed 判据）；必须先人工迁移。
   `ling status` 在网页更新成功后仍将安装时 v0.0.8 状态与 v0.0.9
   实况比较并报告 8 项差异；没有手工改写安装记录。`LING_UPDATE_ENABLED` 继续默认 `0`，未连接
   生产环境。
-- 源码一行升级仍未验收：固定 v0.0.8 checkout 没有 `deploy/upgrade.sh`，执行 README 命令时
-  以 127 退出；在 5.21 的直接源码安装也因缺 `pnpm` 失败，只有另行构建并复制匹配前端后才装成。
-  候选源码升级在手工快进后成功并保留数据，但这不满足从 v0.0.8 checkout 开始的一行命令判据。
+- 发布时的源码一行升级未验收：`v0.0.8` checkout 没有 `deploy/upgrade.sh`，当时的 README 命令以
+  127 退出；5.21 无 pnpm 的首装也曾失败。发布后当前 README 增加 bootstrap 与 Dockerfile Web
+  构建路径，2026-11-18 在隔离 5.21 项目完成无 pnpm 一行首装和从 `v0.0.8` 检出的 bootstrap
+  升级，服务健康且 PG、配置、媒体标记保持；结果与限制见验收记录。
 - 当前 `v0.0.9` registry digest 已由 GH Actions 发布 workflow 核验；本轮还在隔离测试主机
   实际拉取并运行了 API index。未检查生产部署主机的 GHCR 可达性、架构、目录权限或 socket/GID。
 - **这里列的不再包含"`publish.py` 要求开关=0"**：那条断言已删除（§10.7）。

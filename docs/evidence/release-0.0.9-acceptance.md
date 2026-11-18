@@ -262,14 +262,14 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 |---|---|
 | A1 | 通过；tag/main、镜像摘要与隔离边界已核验 |
 | A2 | 部分通过；多组三十四项浏览器套件通过，冻结范围尚未完整覆盖 |
-| A3 | 部分通过但整体项未通过；源码部署与数据保留验证成功，v0.0.8 README 升级命令因该 tag 缺 `deploy/upgrade.sh` 退出 127，首装需额外准备前端产物 |
+| A3 | 发布时的 README 路径未通过；发布后当前 README/源码已在无 pnpm 的隔离主机完成一行首装与 v0.0.8 bootstrap 升级，配置、PG、媒体和卷保持 |
 | A4 | 通过；release workflow 全部成功，保留同 SHA 较早一次间歇失败 |
 | A5 | 通过；`v0.0.9` 双平台摘要、OCI revision 与运行 API RepoDigest 匹配 |
-| A6 | 部分通过且恢复门禁未通过；直连更新、进度/日志/浏览器断线后重连已验；prepare 阶段中断后进入 `needs_manual`，支持确认后 stale `claimed` 请求仍使新任务 409，重试恢复失败；其他故障矩阵未验，`ling status` 安装记录未同步 |
+| A6 | 发布的 v0.0.9 镜像仍有确认后遗留 claim 的缺陷；工作树修复已通过定向与全量测试，并在 5.21 用 v0.9 基础镜像挂载候选脚本完成真实容器确认/归档。候选未构建成新镜像；更新后 API 重试、其他故障矩阵和 `ling status` 同步仍未验 |
 | A7 | 部分通过；v0.8 稳定 API 经 GHCR 直连升 v0.9 成功；v0.8 UI 无线路选择，v0.8 API 对 `download_source` 返回 422，加速线路未实测 |
 | A8 | 通过；文档与发布后状态对齐，完整测试/扫描结果见记录末尾 |
 
-**当前发布验收与更新通道签核：No-Go。** `v0.0.9` 已发布，GHCR 直连一跳成功；但固定 v0.0.8 源码 checkout 缺少 README 要求的 `deploy/upgrade.sh`，在 5.21 上直接首装又缺 `pnpm`，所以“一行首装/升级”判据未通过。更新线路被 v0.8 API 拒绝；中断恢复在 `prepare` 阶段进入人工门禁，支持确认后仍因遗留 claimed 请求无法重试。加速线路、其他忙时/故障矩阵及关系/日程冻结范围仍未完整覆盖。此判定不否认 Release、镜像身份或成功的一跳直连实测。
+**当前发布验收与更新通道签核：No-Go。** `v0.0.9` 已发布，GHCR 直连一跳成功。发布时 README 的 v0.0.8 bootstrap/无 pnpm 首装路径未通过；发布后当前 README/源码已在隔离 5.21 环境通过一行首装和旧检出 bootstrap 升级。发布的 v0.0.9 updater 中断确认缺陷也已在工作树修复，并由真实 updater 基础镜像挂载候选脚本完成容器内确认与归档；该修复尚未构建或发布成新镜像。v0.8 API 不接受下载线路字段，加速线路、其他忙时/故障矩阵及关系/日程冻结范围未完整覆盖，因此发布后完整更新通道仍为 No-Go。
 
 **A8：文档与本地验证**
 
@@ -278,3 +278,14 @@ README、CHANGELOG、DEPLOYMENT、UPDATES 与本记录区分原始代码快照 `
 - `git diff --check` 通过；修改文档的编码完整性和敏感内容扫描均通过。
 - 本轮涉及的 W0 日志 SHA-256：v0.8 源码 `60ddb75f353581ed0487a697ff2c7916f405ead842f71df4318136b7f14d8a69`；候选升级后源码 `098dbd69619bbe96e8d3dd1d7e5c5ac4b320b6ca916c4b73c21c115a661b77c3`；v0.8 bootstrap `683b115a5378b2d863bd02abb055c75a852b51ff084f68dce6292f95c96b3bc6`；v0.8 镜像 `a2b4c2e36353bc0a11e7f5494d2bd2c72cbf629a11aeaa1b7d4127ab2223a88d`。当前 updater 进度截图 SHA-256：`c819cf65a54766314513444f4c64dfa22896fc4505300c9dbbb35b2052af5874`。
 - 本轮及交接指定的 `ling-src-release009-20261118`、`ling-src-bootstrap-release009-20261118`、`ling-src-one-line-20261118`、`ling-src-upgrade-20261118`、`ling-image-current-updater-20261118` 与 `ling-image-accept-009-cli-20261117` 项目容器/updater 均已停止；这些项目的 app/db volumes 保留。旧安装记录、源码 checkout 和备份产物仍在隔离目录供复核。更早的 `ling-image-candidate-ab0ddf4-20261117`、`ling-accept-*`、`ling-auth-accept-*` 项目在本轮开始前已运行，本轮未改动。验收 SSH 隧道已关闭；未连接 `5.88` 或 NAS 生产。
+
+### 2026-11-18 发布后工作树修复
+
+- 本节对应发布后工作树，不改变 `v0.0.9` tag `f381a8c76df43a24b60944c91e22be46501bbd8c`、GHCR 摘要或上文 A1–A8 的发布时结论。当前 README 的无 pnpm 首装与 v0.0.8 bootstrap 升级已在 5.21 隔离项目实测；完整记录见[单行安装与升级证据](single-command-install-upgrade.md#2026-11-18-发布后单行源码复验)。两个项目容器/网络已停止，app/db volumes 保留。
+- updater 修复提交 `a9fdb7f` 让人工确认与任务处理共用单飞锁，在清除 `needs_manual` 前先归档 claim；归档失败时保留门禁。普通终态任务归档失败会留下诊断并由后续轮次重试，重试成功前不接新请求。发布的 `v0.0.9` updater 镜像未包含此提交，也没有构建或发布新镜像。
+- 定向测试覆盖中断 claim 归档、归档失败保留人工门禁、成功任务归档失败后的下一轮恢复、确认期间单飞锁冲突、API 对待处理/已归档请求的判定，以及 bootstrap 成功/本地分叉拒绝。修复后的四组定向套件退出码为 0，日志 `/tmp/ling-full-dev-patched-targeted-r2-20261118.log`；Ruff 与 `py_compile` 通过，仓库标准 `mypy src connectors` 对 234 个源文件通过。
+- 5.21 上的 `ling-src-bootstrap-release009-20261118` 与 `ling-src-fresh-v009-oneline-20261118` 曾各有 API、worker、PostgreSQL healthy。随后只对这两个精确 Compose 项目执行 `down --remove-orphans`，未传 `--volumes`；容器/网络已移除，四个命名数据卷仍存在。未访问 NAS/生产。
+- 5.21 中断确认复放：在 `ling-a6-interruption-20261118` 的隔离状态目录中保留原始快照后，将同一任务/claim 夹具恢复到 `needs_manual`。状态快照 SHA-256：task `6bec67c93ba558d33fb9c2705f9fd1ab4498b4599b343e65cfa740f10e603a85`、status `4ddebf33783d07e552f6f284508e3d7fc20e68bdd91358a338a6e859cffb2284`；请求 ID `18ba0848f932493383755abae0d7e0df`。以 GHCR v0.0.9 updater index `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`（OCI revision `f381a8c76df43a24b60944c91e22be46501bbd8c`）为基础，通过只读 bind mount 执行候选脚本 SHA-256 `6021ce766ea9fdebf388e20cd70a7ffbb969ee222a6975a4f2716cde0e847b97`。一次性容器以退出码 0 输出 `已解除人工门禁`；之后 task=`resolved`、failure 仍为 `old_service_unverified`、next actions 为空、updater=`idle`，claimed 文件消失，archive 中同名文件 SHA-256 仍为 `954a70b1ccbcf5cf2490cb3a787e0a17756aac869e4388aeaf60ec6656d52ca6`。容器使用宿主 Docker socket 完成状态刷新后以 `--rm` 移除。此项验证候选脚本在真实镜像运行环境的恢复/归档行为，不等于候选已构建为 OCI 镜像，也没有在恢复后向旧 API 提交新请求。
+- 修复测试的变异验证：临时让 `acknowledge_manual()` 跳过 claim 归档后，`test_acknowledge_manual_archives_interrupted_claim` 按预期失败，因 claim 仍存在；恢复原代码后，人工确认归档、归档失败保留门禁、单飞锁冲突和成功任务下一轮归档四项通过。红日志 `/tmp/ling-updater-ack-mutation-red-20261118.log` SHA-256 `bf1fdced5a1858d7311acac5f39a9aa0a0315abdd2d500786a00f95e54a24885`；绿日志 `/tmp/ling-updater-ack-mutation-green-20261118.log` SHA-256 `c4b808d34f4db00b333696dec1f3a43a2887d8bfe0cb7af07a3cb98ff43a7830`。变异后 updater SHA 恢复为上列候选 SHA。
+- 修复快照全量 Python pytest：以 `a9fdb7fff16d05c844564c6ad813e7ad808d494a` 加工作树 bootstrap 测试运行，持 `/tmp/ling_test_lock.sh` 锁，两个数据库 URL 均指向 `ling_test`；退出码 0、进度 100%。`-q` 没有汇总用例数，不从进度条推算。日志 `/tmp/ling-full-pytest-post-a9fdb7f-20261118.log`，SHA-256 `0a9e9e1b694ff9a5f7e50ab6fa950aff2e0200cf3cf2d75275e66c7885dcfc08`。Ruff、`py_compile` 与仓库标准 `mypy src connectors`（234 个源文件）通过。
+- `git diff --check`、U+FFFD 与敏感凭据/内网地址扫描通过；提交前已复核文档 SHA 与工作树状态，提交后 `git status --short` 为空。整体发布后更新通道仍为 No-Go。

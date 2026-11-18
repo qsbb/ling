@@ -1817,12 +1817,15 @@ HSTS 头存在、TLS 1.1 握手被拒。
 > （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`），见
 > [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练) 与本文 §11。
 > 完整管线、宿主执行器命令、失败语义与人工恢复步骤见 [UPDATES.md](UPDATES.md)。
-> **演练范围要分开说**：源码模式在隔离 Docker 上完成过候选升级和数据保留核验，但固定
-> `v0.0.8` checkout 没有 README 中的 `deploy/upgrade.sh`，从旧基线直接运行失败；该路径的
-> 一行升级未通过。镜像模式已在隔离项目 `ling-drill` 上真机跑通历史新装、备份恢复、三次
+> **演练范围要分开说**：发布时固定 `v0.0.8` checkout 没有 README 中的 `deploy/upgrade.sh`，
+> 从旧基线直接运行失败。发布后当前 README 增加了受保护的 bootstrap 快进命令，并在 5.21
+> 隔离环境完成无 pnpm 一行首装和 `v0.0.8` 检出升级；服务、PG、配置与媒体标记均核对通过。
+> 这些是当前仓库文档/源码部署路径的复验，不改变发布时的记录。镜像模式已在隔离项目 `ling-drill` 上真机跑通历史新装、备份恢复、三次
 > 连续升级；本轮还验证了 `v0.0.9` updater 从 `v0.0.8` 稳定镜像直连更新一跳。另一次中断
-> 实验在 `prepare` 阶段停止 updater，重启后进入人工门禁；支持的人工确认没有清除遗留
-> `claimed` 请求，API 重试仍返回 409。加速线路也未实测；这些结果不代表生产 `ling` 或完整
+> 实验在 `prepare` 阶段停止 updater，重启后进入人工门禁；发布的人工确认没有清除遗留
+> `claimed` 请求，API 重试仍返回 409。工作树提交 `a9fdb7f` 已修复归档与单飞顺序，并在
+> 5.21 以 v0.9 updater 基础镜像挂载候选脚本完成真实容器确认/归档；候选尚未构建或发布为新镜像。
+> 加速线路也未实测；这些结果不代表生产 `ling` 或完整
 > 无人值守更新能力通过。
 
 `api` 容器本身没有任何 Docker 权限；它只能往宿主共享的 requests 目录写一条
@@ -1931,9 +1934,10 @@ compose up -d --force-recreate api
    > `44112900865` 的 verify、Python 3.12/3.13、Web、mobile、image、updater-image
    > 与 release jobs 全部成功。GHCR 上两个 `v0.0.9` index、amd64/arm64 manifest
    > 和 OCI version/revision 已独立核验，摘要见[验收记录](evidence/release-0.0.9-acceptance.md)。
-   > 发布验收仍为 No-Go。固定 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，
-   > 从该基线执行升级命令退出 127；5.21 缺 `pnpm`，源码首装需额外准备匹配的前端产物。
-   > 候选源码升级在手工快进后成功；当前 `v0.0.9` updater 也已从 `v0.0.8` 镜像基线
+   > 发布验收仍为 No-Go。发布时固定 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，
+   > 从该基线执行当时的升级命令退出 127；5.21 缺 `pnpm`，源码首装需额外准备匹配的前端产物。
+   > 发布后当前 README 加入 bootstrap 与 Dockerfile Web 构建路径，已在隔离 5.21 环境通过一行
+   > 首装和旧检出升级。当前 `v0.0.9` updater 也已从 `v0.0.8` 镜像基线
    > 经 GHCR 直连完成一跳，详情和未通过项见[验收记录](evidence/release-0.0.9-acceptance.md)。
 
 2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
@@ -2059,8 +2063,10 @@ API/updater 双平台镜像；GHCR 原始 index 与平台 manifest 摘要及 OCI
 均启用 `LING_TEST_MODE=1`；另一个 `v0.0.8` 镜像基线为 32/33，重试按钮断言失败且原因未定位。
 独立镜像项目经 GHCR 直连完成 `v0.0.8 → v0.0.9` 一跳，由当前 `v0.0.9` updater 执行，
 核验运行摘要、迁移、业务行数、媒体、卷及更新后 Cookie。README 升级命令从 v0.0.8 checkout
-启动时因缺少 `deploy/upgrade.sh` 失败；加速线路、更新器其他中断阶段和失败注入仍未完成，且已测
-中断路径无法在人工确认后重试，故网页与源码
+启动时因缺少 `deploy/upgrade.sh` 失败；这是发布时的 README/检出结果。发布后当前 README 已加入
+bootstrap，并在无 pnpm 的隔离测试机完成一行首装及旧检出升级。工作树 `a9fdb7f` 修复了 updater
+人工确认后的 claim 归档；该脚本在 5.21 的 v0.9 基础镜像中通过只读挂载实测，但没有构建为新镜像。
+加速线路、更新器其他中断阶段和失败注入仍未完成，故网页与源码
 一行更新验收均不能整体签核（细节与未验证项见
 [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
 

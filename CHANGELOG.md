@@ -3,6 +3,18 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+> 以下是 `v0.0.9` 发布后的工作树改动，不属于已发布 tag 或 GHCR 镜像。
+
+### 修复
+
+- 人工确认在 updater 单飞锁内先归档遗留请求，再解除门禁；归档失败时保留门禁。终态任务的归档失败会记录并在后续轮次重试，期间不接新请求。
+
+### 部署
+
+- README 的源码安装路径支持无 pnpm 主机通过 Dockerfile 构建前端，并为固定 `v0.0.8` 检出提供受保护的单行 bootstrap 快进升级命令。
+
 ## [0.0.9] - 2026-11-18
 
 ### 新增
