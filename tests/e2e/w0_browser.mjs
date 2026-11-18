@@ -33,7 +33,7 @@
  *   `node_modules`。干净检出先跑一次 `pnpm -C clients/web-console install`，否则解析不到
  *   playwright（解析顺序与报错见 `lib/playwright.mjs`）。后端 API 还要求仓库 `.venv`。
  */
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -260,6 +260,9 @@ async function bootIsolatedStack() {
     runId: RUN_ID,
   });
   DB_NAME = created.name;
+  // Ownership begins when the database is created, not after every service is ready.
+  // A later startup failure must still clean up the processes and database already owned.
+  ownsStack = true;
 
   // 2) API：真 PostgreSQL + 临时数据目录（不读仓库 .data/ 里的真实根密钥）。
   apiPort = await freePort();
@@ -329,7 +332,6 @@ async function bootIsolatedStack() {
     60_000,
   );
 
-  ownsStack = true;
   console.log(
     `隔离栈：库 ${DB_NAME}@127.0.0.1:${PG_PORT} · API ${apiBase} · 前端 ${BASE_URL}` +
       `（跑完 kill 进程组 + 只删这个库）`,
@@ -1082,6 +1084,252 @@ async function runAccountPage(browser) {
   await context.close();
 }
 
+function seedRelationshipAcceptanceData() {
+  assert(ownsStack && DB_NAME, '关系验收数据只允许写入本脚本创建的隔离库');
+  const seedPath = path.join(HERE, 'seed_relationship_acceptance.py');
+  const result = spawnSync(PYTHON, [seedPath, '127.0.0.1', String(PG_PORT), DB_NAME], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, PYTHONPATH: path.join(REPO_ROOT, 'src') },
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `关系验收数据注入失败（exit=${result.status}）：${result.stderr || result.stdout}`,
+    );
+  }
+  console.log(result.stdout.trim());
+}
+
+async function runRelationshipAcceptance(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const loggedIn = await login(page);
+  if (!loggedIn) {
+    record('关系：隔离 PostgreSQL 中真实分页与合并/拆分', false, 'owner login failed');
+    await context.close();
+    return;
+  }
+
+  await page.locator('[data-testid="nav-relationships"]').click();
+  await page.locator('[data-testid="subject-card"]').first().waitFor({ timeout: 15000 });
+  const initial = await page.evaluate(async () => {
+    const response = await fetch('/v1/accounts/subjects?limit=50&offset=0', {
+      credentials: 'same-origin',
+    });
+    return { status: response.status, body: await response.json() };
+  });
+  const firstPageCount = await page.locator('[data-testid="subject-card"]').count();
+  const total = initial.body?.total;
+  record(
+    '关系：真实浏览器/API/PostgreSQL 首屏仅加载 50 条',
+    initial.status === 200 && firstPageCount === 50 && Number(total) >= 120,
+    `status=${initial.status} rows=${firstPageCount} total=${total}`,
+  );
+
+  let loaded = firstPageCount;
+  while (loaded < Number(total) && loaded < 500) {
+    const button = page.getByTestId('load-more');
+    if ((await button.count()) === 0) break;
+    await button.click();
+    const expected = Math.min(loaded + 50, Number(total));
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('[data-testid="subject-card"]').length === count,
+      expected,
+      { timeout: 15000 },
+    );
+    loaded = expected;
+  }
+  const reachedEnd = (await page.getByTestId('no-more').count()) === 1;
+  record(
+    '关系：真实分页翻到底且总数一致',
+    loaded === Number(total) && reachedEnd,
+    `loaded=${loaded} total=${total}`,
+  );
+
+  const search = page.getByTestId('subjects-search');
+  await search.fill('Acceptance merge');
+  await search.press('Enter');
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="subject-card"]').length === 2,
+    undefined,
+    { timeout: 15000 },
+  );
+  const source = page
+    .locator('[data-testid="subject-card"]')
+    .filter({ hasText: 'Acceptance merge source' });
+  await source.getByTestId('merge-open').click();
+  await page.getByTestId('merge-target').selectOption('e2e-merge-target');
+  await page.getByTestId('merge-button').click();
+  await page.getByTestId('identity-message').waitFor({ timeout: 15000 });
+  const mergeMessage = await page.getByTestId('identity-message').innerText();
+  const mergePersisted = mergeMessage.includes('数据没有搬动');
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator('[data-testid="subject-card"]').first().waitFor({ timeout: 15000 });
+  await page.getByTestId('subjects-search').fill('Acceptance merge source');
+  await page.getByTestId('subjects-search').press('Enter');
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="subject-card"]').length === 1,
+    undefined,
+    { timeout: 15000 },
+  );
+  const mergedSource = page.locator('[data-testid="subject-card"]').first();
+  const persistedBadge = (await mergedSource.getByTestId('merged-badge').count()) === 1;
+  await mergedSource.getByTestId('unmerge-button').click();
+  await page.getByTestId('identity-message').waitFor({ timeout: 15000 });
+  const unmergeMessage = await page.getByTestId('identity-message').innerText();
+  const unmerged = unmergeMessage.includes('已拆开');
+  record(
+    '关系：真实 API 合并写入 PostgreSQL、刷新可见并能拆分',
+    mergePersisted && persistedBadge && unmerged,
+    `merge=${mergePersisted} reload=${persistedBadge} unmerge=${unmerged}`,
+  );
+
+  await page.getByTestId('subjects-search').fill('');
+  await page.getByTestId('subjects-search').press('Enter');
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="subject-card"]').length === 50,
+    undefined,
+    { timeout: 15000 },
+  );
+  await page.setViewportSize({ width: 375, height: 667 });
+  const widths = await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    document: document.documentElement.scrollWidth,
+  }));
+  record(
+    '关系：真实数据列表在 375px 手机视口不横向溢出',
+    widths.document <= widths.viewport,
+    `document=${widths.document} viewport=${widths.viewport}`,
+  );
+  await shot(page, 'relationships-01-mobile');
+  await context.close();
+}
+
+async function runMemberPermissionAcceptance(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+  await page.locator('input[type="password"]').waitFor({ timeout: 15000 });
+  await page.locator('input[name="username"], input').first().fill('acceptance-member');
+  await page.locator('input[type="password"]').first().fill('e2e-member-test-password');
+  await page.locator('button[type="submit"]').first().click();
+  await page.waitForFunction(
+    () => !document.querySelector('input[type="password"]'),
+    undefined,
+    { timeout: 15000 },
+  );
+  const result = await page.evaluate(async () => {
+    const details = await fetch(
+      '/v1/accounts/subjects/e2e-merge-target/details?section=interactions',
+      { credentials: 'same-origin' },
+    );
+    const detailsBody = await details.json();
+    const memories = await fetch(
+      '/v1/accounts/subjects/e2e-merge-target/details?section=memories',
+      { credentials: 'same-origin' },
+    );
+    const memoriesBody = await memories.json();
+    const timeline = await fetch('/v1/life/timeline', { credentials: 'same-origin' });
+    const timelineBody = await timeline.json();
+    const outline = await fetch('/v1/life/outline-jobs', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plan_day: timelineBody.plan_day,
+        force: false,
+        request_id: 'member-forbidden-e2e',
+      }),
+    });
+    return {
+      detailsStatus: details.status,
+      access: detailsBody.access,
+      items: detailsBody.items,
+      memoriesStatus: memories.status,
+      memoryAccess: memoriesBody.access,
+      memories: memoriesBody.items,
+      timelineStatus: timeline.status,
+      outlineStatus: outline.status,
+      outlineBody: await outline.json(),
+    };
+  });
+  record(
+    '关系：非主人查看他人互动只返回 restricted 空列表',
+    result.detailsStatus === 200 && result.access === 'restricted' && result.items.length === 0,
+    `status=${result.detailsStatus} access=${result.access} items=${result.items.length}`,
+  );
+  record(
+    '关系：非主人读取他人私有记忆时不泄露哨兵正文',
+    result.memoriesStatus === 200 &&
+      result.memoryAccess === 'public' &&
+      result.memories.length === 0 &&
+      !JSON.stringify(result.memories).includes('Private acceptance sentinel'),
+    `status=${result.memoriesStatus} access=${result.memoryAccess} items=${result.memories.length}`,
+  );
+  record(
+    '日程：非主人不能触发手动生成',
+    result.timelineStatus === 200 && result.outlineStatus === 403,
+    `timeline=${result.timelineStatus} outline=${result.outlineStatus}`,
+  );
+  await context.close();
+}
+
+async function runLifeTimelineAcceptance(browser) {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const loggedIn = await login(page);
+  if (!loggedIn) {
+    record('日程：真实 API 时间轴在浏览器中可读', false, 'owner login failed');
+    await context.close();
+    return;
+  }
+  await page.locator('[data-testid="nav-life"]').click();
+  await page.locator('[data-testid="life-timeline"]').waitFor({ timeout: 20000 });
+  const timeline = await page.evaluate(async () => {
+    const response = await fetch('/v1/life/timeline', { credentials: 'same-origin' });
+    return { status: response.status, body: await response.json() };
+  });
+  const visibleState = (await page.locator('[data-testid="tl-state"]').count()) === 1;
+  record(
+    '日程：真实浏览器/API/PostgreSQL 显示当前时间轴状态',
+    timeline.status === 200 && Boolean(timeline.body.plan_day) && visibleState,
+    `status=${timeline.status} plan_day=${timeline.body.plan_day} state=${timeline.body.state}`,
+  );
+  const generate = page.locator('[data-testid="tl-generate-button"]');
+  if (await generate.count() !== 1) {
+    record('日程：真实时间轴提供手动生成入口', false, 'generation button missing');
+    await context.close();
+    return;
+  }
+  const submit = page.waitForResponse((response) => {
+    const request = response.request();
+    return request.method() === 'POST' && new URL(response.url()).pathname === '/v1/life/outline-jobs';
+  });
+  await generate.click();
+  const response = await submit;
+  const body = await response.json();
+  const status = page.locator('[data-testid="tl-generate-status"]');
+  await page.waitForFunction(
+    () => {
+      const el = document.querySelector('[data-testid="tl-generate-status"]');
+      return Boolean(el && el.getAttribute('data-tone') === 'info' && /排队|正在/.test(el.textContent ?? ''));
+    },
+    undefined,
+    { timeout: 10000 },
+  );
+  const message = await status.innerText();
+  record(
+    '日程：真实提交入队后显示进行中状态，不误报完成',
+    response.status() === 202 &&
+      typeof body.job_id === 'string' &&
+      ['queued', 'running'].includes(body.state) &&
+      !/已经排好了|生成成功/.test(message),
+    `http=${response.status()} state=${body.state} note=${message}`,
+  );
+  await context.close();
+}
+
 async function runSettingsPage(browser) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
@@ -1093,7 +1341,7 @@ async function runSettingsPage(browser) {
     const body = await page.textContent('body');
     record('桌面：设置页可打开且显示职责绑定',
       /dialogue\.fast|职责|模型/.test(body || ''));
-    const leaks = /sk-[A-Za-z0-9]{8,}/.test(body || '');
+    const leaks = /s(?:k-)[A-Za-z0-9]{8,}/.test(body || '');
     record('桌面：设置页不回显密钥原文', !leaks);
     await shot(page, 'desktop-08-settings');
   } else {
@@ -1123,12 +1371,19 @@ try {
   browser = await chromium.launch({ executablePath: EXECUTABLE });
   console.log(`Playwright：${PLAYWRIGHT_ORIGIN}`);
   console.log(`浏览器：${browser.version()}${EXECUTABLE ? `（CHROME_PATH=${EXECUTABLE}）` : '（内置缓存）'}`);
+  if (ownsStack) seedRelationshipAcceptanceData();
+  else skip('关系/权限/日程真实 API 专项', '复用外部实例时不注入测试数据');
   await runDesktop(browser);
   await runMobile(browser);
   await runFailureRetry(browser);
   await runSettingsPage(browser);
   await runAccountPage(browser);
   await runDashboard(browser);
+  if (ownsStack) {
+    await runRelationshipAcceptance(browser);
+    await runMemberPermissionAcceptance(browser);
+    await runLifeTimelineAcceptance(browser);
+  }
 } catch (error) {
   console.error(`\nFAIL  ${error instanceof Error ? error.message : String(error)}`);
   exitCode = 1;
