@@ -143,6 +143,18 @@
       "description": "保留位：目前没有设备概念，读它永远得到 None",
       "title": "Device Ref"
     },
+    "display_text": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Display Text"
+    },
     "event_id": {
       "anyOf": [
         {

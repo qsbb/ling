@@ -1,0 +1,68 @@
+{
+  "$defs": {
+    "WindowOriginBindingCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "title": "Display Name",
+          "type": "string"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "instance_id": {
+          "title": "Instance Id",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "onebot",
+            "qqbot"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "instance_id",
+        "display_name",
+        "enabled"
+      ],
+      "title": "WindowOriginBindingCandidate",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/WindowOriginBindingOptions.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "candidates": {
+      "items": {
+        "$ref": "#/$defs/WindowOriginBindingCandidate"
+      },
+      "title": "Candidates",
+      "type": "array"
+    },
+    "manually_bound": {
+      "title": "Manually Bound",
+      "type": "boolean"
+    },
+    "scope": {
+      "enum": [
+        "onebot",
+        "qqbot"
+      ],
+      "title": "Scope",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scope",
+    "candidates",
+    "manually_bound"
+  ],
+  "title": "WindowOriginBindingOptions",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

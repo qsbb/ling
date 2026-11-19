@@ -60,7 +60,10 @@
     "WindowDialoguePolicyFields": "WindowDialoguePolicyFields.schema.json",
     "WindowDialoguePolicyPreview": "WindowDialoguePolicyPreview.schema.json",
     "WindowDialoguePolicyProposed": "WindowDialoguePolicyProposed.schema.json",
-    "WindowDialoguePolicyView": "WindowDialoguePolicyView.schema.json"
+    "WindowDialoguePolicyView": "WindowDialoguePolicyView.schema.json",
+    "WindowOriginBindingCandidate": "WindowOriginBindingCandidate.schema.json",
+    "WindowOriginBindingOptions": "WindowOriginBindingOptions.schema.json",
+    "WindowOriginBindingPreview": "WindowOriginBindingPreview.schema.json"
   },
   "schema_version": "v1"
 }
