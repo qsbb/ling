@@ -45,7 +45,7 @@ async function openUpdatePage(
     downloadSource?: string;
     requestSource?: string;
     updateView?: () => Partial<ImageUpdateV2>;
-    onCheck?: (requestId: string) => void;
+    onSubmit?: (body: Record<string, unknown>) => void;
   } = {},
 ) {
   await page.route('**/*', async (route) => {
@@ -62,10 +62,10 @@ async function openUpdatePage(
         test_mode: false,
         csrf_token: 'csrf',
       };
-    } else if (path === '/v1/version/image-update-checks' && options.onCheck) {
-      const requestId = route.request().postDataJSON().request_id;
-      options.onCheck(requestId);
-      body = { request_id: requestId };
+    } else if (path === '/v1/version/image-update-requests' && options.onSubmit) {
+      const submission = route.request().postDataJSON();
+      options.onSubmit(submission);
+      return route.fulfill({ status: 201, json: { request_id: submission.request_id } });
     } else if (path === '/v1/version/image-update') {
       body = {
         schema_version: 'v1', state: 'latest', message: '当前已是最新', checked_at: null,
@@ -99,47 +99,94 @@ async function openUpdatePage(
   await page.getByTestId('image-update-panel').waitFor();
 }
 
-it('备份后重新检查走真实按钮接线，门禁通过后显示更新动作', async () => {
+it('没有历史备份时，确认一次即可更新；执行进度在刷新后仍可见', async () => {
   if (!browser) throw new Error(`浏览器不可用：${launchError}`);
   const page = await browser.newPage({ viewport: { width: 375, height: 900 } });
   const target = { version: '0.0.9', digest: `ghcr.io/qsbb/ling-api@sha256:${'b'.repeat(64)}`, commit: null };
-  const checks: string[] = [];
-  const updateRequests: string[] = [];
+  const current = { version: '0.0.8', digest: `ghcr.io/qsbb/ling-api@sha256:${'a'.repeat(64)}`, commit: 'c'.repeat(40) };
+  const submissions: Record<string, unknown>[] = [];
+  const postPaths: string[] = [];
   page.on('request', (request) => {
-    if (request.method() === 'POST' && request.url().endsWith('/v1/version/image-update-requests')) {
-      updateRequests.push(request.url());
-    }
+    if (request.method() === 'POST') postPaths.push(new URL(request.url()).pathname);
   });
   try {
     await openUpdatePage(page, 'succeeded', 'verify', {
+      onSubmit: (body) => submissions.push(body),
+      updateView: () => ({
+        state: 'available', target, current,
+        task: submissions.length ? {
+          state: 'running', stage: 'backup', version: target.version, failed_code: null,
+          request_id: String(submissions[0]?.request_id),
+        } : null,
+        details: {
+          updater: { online: true }, catalog: {},
+          backup_gate: { restore_point: false, reason: 'no_manifest' },
+        },
+      }),
+    });
+    const primary = page.getByTestId('image-update-primary');
+    await expect.poll(() => page.getByTestId('image-update-current').textContent()).toBe('v0.0.8 → v0.0.9');
+    expect(await page.getByTestId('image-update-panel').innerText()).not.toContain('ling backup');
+    await page.getByText('更新说明', { exact: true }).click();
+    expect(await page.getByTestId('image-update-notes-empty').isVisible()).toBe(true);
+    await primary.click();
+    const confirm = page.getByTestId('image-update-confirm');
+    await expect.poll(() => confirm.innerText()).toContain('更新前会自动备份');
+    expect(submissions).toHaveLength(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.getByTestId('image-update-submit').click();
+    await expect.poll(() => submissions).toMatchObject([{
+      target_digest: target.digest, expected_current_digest: current.digest,
+      expected_current_commit: current.commit, operator_confirmed: true,
+    }]);
+    const stage = page.getByTestId('image-update-conclusion');
+    await expect.poll(() => stage.innerText()).toContain('备份');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect.poll(() => stage.innerText()).toContain('备份');
+    expect(await page.getByTestId('image-update-details').count()).toBe(0);
+    expect(postPaths).toEqual(['/v1/version/image-update-requests']);
+  } finally {
+    await page.close();
+  }
+}, 30_000);
+
+it('确认打开后，如果轮询发现同版本的摘要已变，不能静默提交新目标', async () => {
+  if (!browser) throw new Error(`浏览器不可用：${launchError}`);
+  const page = await browser.newPage();
+  const digest = (c: string) => `ghcr.io/qsbb/ling-api@sha256:${c.repeat(64)}`;
+  const current = { version: '0.0.8', digest: digest('a'), commit: 'c'.repeat(40) };
+  const submissions: Record<string, unknown>[] = [];
+  let targetDigest = digest('b');
+  let latestRead = '';
+  try {
+    await page.clock.install();
+    await openUpdatePage(page, 'succeeded', 'verify', {
       noTask: true,
-      onCheck: (id) => checks.push(id),
+      onSubmit: (body) => submissions.push(body),
       updateView: () => {
-        const ready = checks.length > 0;
+        latestRead = targetDigest;
         return {
-          state: ready ? 'available' : 'newer_unavailable',
-          message: ready ? '发现新版，可以更新。' : '发现新版，但缺少备份。',
-          reason: ready ? null : 'backup_gate_missing',
-          target,
-          checked_at: ready ? '2026-11-20T00:00:01Z' : '2026-11-20T00:00:00Z',
-          details: {
-            updater: { online: true },
-            catalog: ready ? { check: { check_id: checks[0], state: 'succeeded' } } : {},
-            backup_gate: { restore_point: ready, reason: ready ? 'ok' : 'no_manifest' },
-          },
+          state: 'available', current,
+          target: { version: '0.0.9', digest: targetDigest, commit: null },
         };
       },
     });
-    const guidance = page.getByTestId('image-update-backup-guidance');
     const primary = page.getByTestId('image-update-primary');
-    await expect.poll(() => guidance.textContent()).toContain('ling backup');
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-    expect(await primary.textContent()).toBe('备份后重新检查');
     await primary.click();
-    await expect.poll(() => primary.textContent(), { timeout: 8_000 }).toBe('更新到 v0.0.9');
-    expect(checks).toHaveLength(1);
-    expect(await guidance.count()).toBe(0);
-    expect(updateRequests).toEqual([]);
+    await page.getByTestId('image-update-confirm').waitFor();
+    targetDigest = digest('d');
+    await page.clock.fastForward(16_000);
+    await expect.poll(() => latestRead).toBe(digest('d'));
+    // 诊断读取的是轮询后的目标；确认仍绑定打开时的旧摘要。
+    await page.getByTestId('image-update-details-toggle').click();
+    await page.locator(`[title="${digest('d')}"]`).waitFor();
+    await page.getByTestId('image-update-submit').click();
+    await expect.poll(() => page.getByTestId('image-update-submit-error').innerText())
+      .toContain('请重新确认更新');
+    expect(submissions).toEqual([]);
+    await primary.click();
+    await page.getByTestId('image-update-submit').click();
+    await expect.poll(() => submissions).toMatchObject([{ target_digest: digest('d') }]);
   } finally {
     await page.close();
   }
@@ -314,8 +361,8 @@ describe('镜像下载方式', () => {
         await page.goto(`${baseUrl}/settings/about`, { waitUntil: 'domcontentloaded' });
         await page.getByTestId('image-update-primary').click();
         await page.getByTestId('image-update-confirm').waitFor();
+        await page.locator('.update-download-options > summary').click();
         await page.locator(`input[name="image-download-source"][value="${source}"]`).check();
-        await page.getByTestId('image-update-risk-ack').check();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
         await page.getByTestId('image-update-submit').click();
         await expect.poll(() => submitted).toMatchObject({

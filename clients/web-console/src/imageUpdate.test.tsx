@@ -24,7 +24,6 @@ import {
   IMAGE_CHECK_TIMEOUT_TEXT,
   IMAGE_NOTES_COLLAPSE_LIMIT,
   IMAGE_STAGE_UNKNOWN_LABEL,
-  IMAGE_UPDATE_REUSE_CHECK_MS,
   IMAGE_UPDATE_STAGES,
   ImageUpdatePage,
   ImageUpdatePanel,
@@ -44,7 +43,7 @@ import {
   imageCheckNotice,
   imagePollDelayMs,
   imageTaskActivity,
-  imageUpdateConfirmAfterCheck,
+  imageUpdateMatchesConfirmation,
   imageUpdateFailureText,
   imageUpdateNotesView,
   imageUpdatePrimaryAction,
@@ -189,14 +188,12 @@ function renderPanel(overrides: Partial<ImageUpdatePanelProps> = {}): string {
     checking: false,
     checkNotice: null,
     confirming: false,
-    riskAcknowledged: false,
     submitting: false,
     submitError: null,
     nowMs: NOW,
     onCheck: () => undefined,
     onStartConfirm: () => undefined,
     onCancelConfirm: () => undefined,
-    onToggleRisk: () => undefined,
     onConfirm: () => undefined,
     ...overrides,
   };
@@ -296,7 +293,7 @@ describe('四态：一句话结论 + 一个主按钮', () => {
   it('可更新：结论 +「更新到 v0.0.4」，并出现更新内容区', () => {
     const view = availableView();
     const markup = renderPanel({ state: { ...initialImageUpdateState(), view } });
-    expect(markup).toContain('发现新版 v0.0.4，可以更新。');
+    expect(markup).toContain('v0.0.3 → v0.0.4');
     expect(primaryButton(markup)).toBe('更新到 v0.0.4');
     expect(actionKind(markup)).toBe('update');
     expect(markup).toContain('data-testid="image-update-notes"');
@@ -311,30 +308,17 @@ describe('四态：一句话结论 + 一个主按钮', () => {
     expect(markup).not.toContain('更新到 v0.0.4');
   });
 
-  it('只有首要门禁是备份且没有活动任务时，才给所有者宿主操作指引', () => {
+  it('没有历史备份也显示更新，备份事实留在诊断区', () => {
     const base = availableView();
-    const blocked = blockedView({
-      reason: 'backup_gate_missing',
-      newer: base.newer,
-      details: { ...base.details, backup_gate: { restore_point: false, reason: 'keys_missing' } },
+    const view = availableView({
+      details: { ...base.details, backup_gate: { restore_point: false, reason: 'no_manifest' } },
     });
-    const render = (view: ImageUpdateV2, canWrite = true) => renderPanel({
-      state: { ...initialImageUpdateState(), view }, canWrite, defaultDetailsOpen: true,
-    });
-    const positive = render(blocked);
-    expect(primaryButton(positive)).toBe('备份后重新检查');
-    expect(positive).toContain('宿主机');
-    expect(positive).toContain('<code>ling backup</code>');
-    expect(positive).toContain('最近的备份缺少用于恢复配置的根密钥');
-    for (const markup of [
-      render(blocked, false),
-      render({ ...blocked, reason: 'update_disabled' }),
-      render({ ...blocked, task: makeTask() }),
-      render({ ...blocked, state: 'latest', newer: [] }),
-    ]) {
-      expect(markup).not.toContain('ling backup');
-      expect(markup).not.toContain('备份后重新检查');
-    }
+    const options = { state: { ...initialImageUpdateState(), view } };
+    const markup = renderPanel(options);
+    expect(primaryButton(markup)).toBe('更新到 v0.0.4');
+    expect(markup).not.toContain('ling backup');
+    expect(markup).not.toContain('no_manifest');
+    expect(renderPanel({ ...options, defaultDetailsOpen: true })).toContain('no_manifest');
   });
 
   it('暂不能确认：结论 +「重试检查」，且不出现「已是最新」', () => {
@@ -435,7 +419,6 @@ describe('非 owner：同一套四态，但主按钮是「查看详情」', () =
       state: { ...initialImageUpdateState(), view: availableView() },
       canWrite: false,
       confirming: true,
-      riskAcknowledged: true,
     });
     expect(markup).toContain('data-testid="image-update-confirm"');
     expect(markup).toMatch(/data-testid="image-update-submit"[^>]*disabled=""/);
@@ -522,7 +505,7 @@ describe('活动任务覆盖结论展示，不许再检查或安装', () => {
         },
       }),
     });
-    expect(describeImageLastTaskLine(verified)).toContain('三项核验一致');
+    expect(describeImageLastTaskLine(verified)).toBe('上次更新已完成。');
     expect(describeImageLastTaskLine(verified)).not.toContain('更新成功');
 
     const mismatch = makeView({
@@ -533,7 +516,7 @@ describe('活动任务覆盖结论展示，不许再检查或安装', () => {
         migration: { attempted: true, target_head: 'head-2', current_after: 'head-2' },
       }),
     });
-    expect(describeImageLastTaskLine(mismatch)).toBe('上次更新已结束；不一致：运行容器 digest。');
+    expect(describeImageLastTaskLine(mismatch)).toBe('上次更新已结束，核验结果请看诊断。');
 
     const incomplete = makeView({
       task: makeTask({
@@ -543,15 +526,20 @@ describe('活动任务覆盖结论展示，不许再检查或安装', () => {
         migration: { attempted: true, target_head: 'head-2', current_after: 'head-2' },
       }),
     });
-    expect(describeImageLastTaskLine(incomplete)).toBe('上次更新已结束；无法核实：应用提交。');
+    expect(describeImageLastTaskLine(incomplete)).toBe('上次更新已结束，核验结果请看诊断。');
 
     const mixed = makeView({ task: makeTask({
       state: 'succeeded', stage: 'verify', target: { digest: TARGET_DIGEST, commit: null },
       migration: { attempted: true, target_head: 'head-2', current_after: 'head-1' },
     }) });
-    expect(renderPanel({ state: { ...initialImageUpdateState(), view: mixed } })).toContain(
-      '上次更新已结束；不一致：运行容器 digest、迁移 head；无法核实：应用提交。',
-    );
+    const state = { ...initialImageUpdateState(), view: mixed };
+    const collapsed = renderPanel({ state });
+    expect(collapsed).toContain('上次更新已结束，核验结果请看诊断。');
+    expect(collapsed).not.toContain('运行容器 digest');
+    const diagnostic = renderPanel({ state, defaultDetailsOpen: true });
+    expect(diagnostic).toContain('缺失，无法确认');
+    expect(diagnostic.match(/>不一致</g)).toHaveLength(2);
+
   });
 
   it('needs_manual 任务首屏保留可发现的提示', () => {
@@ -584,7 +572,7 @@ describe('「更新内容」只显示后端给的，不自己编', () => {
     expect(markup).toContain('data-testid="image-update-notes-url"');
     expect(markup).toContain('完整更新日志');
     expect(markup).toContain('https://github.com/qsbb/ling/blob/main/CHANGELOG.md');
-    expect(markup).toContain('更新内容（v0.0.4）');
+    expect(markup).toMatch(/<details class="update-notes" data-testid="image-update-notes"><summary[^>]*>更新说明/);
   });
 
   it('没有摘要或条目时，保留全文入口，不谎称发布方没有说明', () => {
@@ -1401,25 +1389,21 @@ describe('主按钮判定矩阵', () => {
     expect(imageUpdatePrimaryAction(null, { canWrite: true }).kind).toBe('retry');
   });
 
-  it('「更新到 vX」复查：目标版本与摘要都没变才进入确认', () => {
-    const before = { version: '0.0.4', digest: TARGET_DIGEST, commit: TARGET_COMMIT };
-    expect(imageUpdateConfirmAfterCheck(before, availableView())).toBe(true);
-    expect(
-      imageUpdateConfirmAfterCheck(
-        before,
-        availableView({ target: { ...before, digest: CURRENT_DIGEST } }),
-      ),
-    ).toBe(false);
-    expect(
-      imageUpdateConfirmAfterCheck(
-        before,
-        availableView({ target: { ...before, version: '0.0.5' } }),
-      ),
-    ).toBe(false);
-    expect(imageUpdateConfirmAfterCheck(before, blockedView())).toBe(false);
-    expect(imageUpdateConfirmAfterCheck(before, null)).toBe(false);
-    expect(imageUpdateConfirmAfterCheck(null, availableView())).toBe(false);
-    expect(IMAGE_UPDATE_REUSE_CHECK_MS).toBe(30000);
+  it('确认绑定当前镜像和目标；轮询更新身份后必须重新确认', () => {
+    const before = availableView();
+    const target = before.target!;
+    expect(imageUpdateMatchesConfirmation(before, availableView())).toBe(true);
+    for (const changed of [
+      availableView({ target: { ...target, digest: CURRENT_DIGEST } }),
+      availableView({ target: { ...target, version: '0.0.5' } }),
+      availableView({ current: { ...before.current, digest: TARGET_DIGEST } }),
+      availableView({ current: { ...before.current, commit: TARGET_COMMIT } }),
+      availableView({ task: makeTask({ state: 'running' }) }),
+      blockedView(), null,
+    ]) {
+      expect(imageUpdateMatchesConfirmation(before, changed)).toBe(false);
+    }
+    expect(imageUpdateMatchesConfirmation(null, before)).toBe(false);
     expect(IMAGE_CHECK_POLL_MS).toBe(2000);
     expect(IMAGE_CHECK_TIMEOUT_MS).toBe(20000);
     expect(IMAGE_CHECK_DEBOUNCE_MS).toBe(10000);
@@ -1668,22 +1652,28 @@ describe('提交请求体与请求编号', () => {
     expect(explainImageSubmitError(new Error('boom')).refresh).toBe(true);
   });
 
-  it('确认块写明停机与迁移不可撤销，未勾选不能提交', () => {
+  it('同一次确认写明自动备份、停机与不会自动回退，无需额外勾选', () => {
     const markup = renderPanel({
       state: { ...initialImageUpdateState(), view: availableView() },
       confirming: true,
     });
-    expect(markup).toContain('短暂停机');
-    expect(markup).toContain('不可撤销');
-    expect(markup).toContain('data-testid="image-update-risk-ack"');
-    expect(markup).toMatch(/data-testid="image-update-submit"[^>]*disabled=""/);
+    expect(markup).toContain('更新前会自动备份');
+    expect(markup).toContain('服务将短暂停用');
+    expect(markup).toContain('数据库迁移后不会自动回退');
+    expect(markup).not.toContain('type="checkbox"');
+    expect(markup).not.toMatch(/data-testid="image-update-submit"[^>]*disabled=""/);
+  });
 
-    const acknowledged = renderPanel({
-      state: { ...initialImageUpdateState(), view: availableView() },
-      confirming: true,
-      riskAcknowledged: true,
-    });
-    expect(acknowledged).not.toMatch(/data-testid="image-update-submit"[^>]*disabled=""/);
+  it('备份失败只在旧服务验证通过时显示旧版本可用', () => {
+    const task = makeTask({ state: 'failed_not_started', failed_code: 'backup_failed',
+      migration: { attempted: false } });
+    expect(describeImageLastTaskLine(makeView({ task: { ...task, still_on_old_version: true } })))
+      .toContain('已确认旧版本可用');
+    expect(describeImageLastTaskLine(makeView({ task: { ...task, still_on_old_version: null } })))
+      .not.toContain('旧版本可用');
+    expect(describeImageLastTaskLine(makeView({
+      task: { ...task, state: 'needs_manual', still_on_old_version: false },
+    }))).toContain('未能确认旧服务可用');
   });
 
   it('所有状态都没有百分比/剩余时间，也没有回退按钮', () => {
