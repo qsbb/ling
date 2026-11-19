@@ -32,6 +32,11 @@ from ling.capabilities.tools import (
     MEDIA_WATCH_VIDEO_TOOL_ID,
     build_default_registry,
 )
+from ling.capabilities.web_search import (
+    WEB_SEARCH_TOOL_ID,
+    explicit_search_query,
+    register_web_search,
+)
 from ling.contracts.v1 import (
     CapabilityDescriptor,
     ChatMessage,
@@ -42,6 +47,7 @@ from ling.contracts.v1 import (
     TurnState,
     new_id,
 )
+from ling.domains.awareness.service import IsolationMode
 from ling.domains.conversation.recall import (
     finalize_recall_text,
     parse_recall_markers,
@@ -700,7 +706,7 @@ class TurnCoordinator:
         tool_registry: ToolRegistry | None = None,
         # 知识查询还需按本轮受众注册。撤回走用户确认回路。
         tool_allowlist: frozenset[str] = frozenset(
-            {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID}
+            {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID, WEB_SEARCH_TOOL_ID}
         ),
         settings: Settings | None = None,
     ) -> None:
@@ -1186,6 +1192,7 @@ class TurnCoordinator:
                     config=config,
                     profile=profile,
                     window_id=window_id,
+                    user_text=user_text,
                     audience=(
                         compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
                     ),
@@ -2980,6 +2987,7 @@ class TurnCoordinator:
         profile: str,
         audience: AudienceSnapshot | None = None,
         window_id: str | None = None,
+        user_text: str = "",
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -3029,6 +3037,15 @@ class TurnCoordinator:
                 media_window_id=window_id,
                 watch_video=media_callback,
             )
+            if (
+                self._settings is not None
+                and self._settings.brave_search_api_key
+                and audience is not None
+                and audience.mode is not IsolationMode.sealed
+                and not audience.is_group
+                and (query := explicit_search_query(user_text)) is not None
+            ):
+                register_web_search(registry, key=self._settings.brave_search_api_key, query=query)
         if not profile_supports_native_tools(profile):
             return _ToolLedger(
                 availability=ToolAvailability(

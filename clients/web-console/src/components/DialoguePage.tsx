@@ -103,7 +103,7 @@ const FIELDS: PolicyField[] = [
   {
     key: 'tools_enabled',
     label: '允许对话调用工具',
-    hint: '开启后，已声明支持工具调用的对话模型可以查询当前时间和本轮可读的本地资料。',
+    hint: '需要支持原生工具的对话模型。配置 Brave Search API 密钥后，非密封私聊中可用「搜索：关键词」查询公开网页。',
     kind: 'bool',
   },
   {

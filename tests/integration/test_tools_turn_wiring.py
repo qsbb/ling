@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from ling import worker
+from ling.capabilities import web_search
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
@@ -238,6 +240,7 @@ def _tool_payload(
         "clock_now": CLOCK_NOW_TOOL_ID,
         "knowledge_search": KNOWLEDGE_SEARCH_TOOL_ID,
         "media_watch_video": MEDIA_WATCH_VIDEO_TOOL_ID,
+        "web_search": web_search.WEB_SEARCH_TOOL_ID,
     }[endpoint.tool_name]
     assert payload["provider_call_id"] == CALL_ID
     return payload
@@ -388,6 +391,46 @@ async def _add_knowledge(
             row = await session.get(KnowledgeItem, item.item_id)
             row.valid_until = datetime.now(UTC) - timedelta(seconds=1)
         return item.item_id
+
+
+@pytest.mark.parametrize("allowed", [True, False], ids=["private", "sealed"])
+async def test_explicit_public_search_in_the_web_tool_loop(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch, allowed: bool,
+) -> None:
+    key = "fixture-search-key"
+    logged_in.app.state.settings = replace(logged_in.app.state.settings, brave_search_api_key=key)
+    requests = []
+
+    def search(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"web": {"results": [{
+            "title": "公开资料", "url": "https://library.example.test/catalog",
+            "description": "不可信网页摘要",
+        }]}})
+
+    client = partial(httpx.AsyncClient, transport=httpx.MockTransport(search))
+    monkeypatch.setattr(web_search, "httpx", SimpleNamespace(**(vars(httpx) | {"AsyncClient": client})))
+    endpoint.tool_name = "web_search"
+    endpoint.arguments = {}
+    await _bind_model(logged_in, enabled=True)
+    if not allowed:
+        changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
+        assert changed.status_code == 200
+    reply = await _web_reply(logged_in, text="搜索：公开资料")
+    if not allowed:
+        assert requests == []
+        assert "web_search" not in {item["function"]["name"] for item in endpoint.requests[0]["tools"]}
+        return
+
+    request, = requests
+    assert request.url.host == "api.search.brave.com"
+    assert dict(request.url.params) == {"q": "公开资料", "count": "3"}
+    assert request.headers["X-Subscription-Token"] == key
+    assert key not in json.dumps(endpoint.requests)
+    payload = _tool_payload(endpoint, available=("clock_now", "knowledge_search", "web_search"))
+    assert payload["content_trust"] == "data_not_instructions"
+    assert payload["untrusted"] is True
+    assert "https://library.example.test/catalog" in reply
 
 
 async def test_web_knowledge_search_returns_current_scoped_results(

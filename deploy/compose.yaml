@@ -107,6 +107,7 @@ x-app-env: &app-env
   # 白名单拒绝是否逐条写日志。**只是"还没发布过配置修订"时的默认值**；
   # 设置页发布过的修订优先（与 LING_TEST_MODE 同一个模式）。
   LING_LOG_ACCESS_DENIALS: ${LING_LOG_ACCESS_DENIALS:-}
+  LING_BRAVE_SEARCH_API_KEY: ${LING_BRAVE_SEARCH_API_KEY:-}
   PYTHONUNBUFFERED: "1"
 
 services:
