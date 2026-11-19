@@ -40,20 +40,17 @@ import {
   forgetReducer,
   formatAbsoluteTime,
   formatRelativeTime,
-  groupByKind,
   includeMode,
-  includeSummary,
   isForgetAccepted,
   isForgetPolling,
   kindLabel,
-  limitNotice,
   pollForgetProgress,
   purgeCountsOf,
   memoryErrorCopy,
-  memoryFooterNote,
   memoryTabFromHref,
   memoryTabHref,
   originLabel,
+  searchLoadedMemories,
   sortByCreatedDesc,
   type ForgetAcceptedResponse,
   type ForgetState,
@@ -235,7 +232,6 @@ function renderBody(
       handlers: overrides.handlers ?? HANDLERS,
       notice: overrides.notice ?? null,
       onDismissNotice: overrides.onDismissNotice ?? (() => undefined),
-      onReloadAll: overrides.onReloadAll ?? (() => undefined),
     }),
   );
 }
@@ -310,27 +306,21 @@ describe('记忆页路由（/memory）', () => {
 describe('记忆页整体渲染', () => {
   const html = renderToStaticMarkup(h(MemoryPage, {}));
 
-  it('渲染两个 tab，当前只选中内容 tab', () => {
-    expect(html).toContain('记忆内容');
-    expect(html).toContain('记忆与学习（调参）');
-    expect(html.match(/aria-selected="true"/g) ?? []).toHaveLength(1);
-    expect(html).toContain('aria-selected="true"');
-    expect(html).toContain('data-testid="mem-tab-content"');
-    expect(html).toContain('data-testid="mem-tab-settings"');
+  it('四个分区都有深链，初始只选中记忆库', () => {
+    for (const [tab, label] of [
+      ['content', '记忆库'], ['core', '核心记忆'], ['settings', '学习设置'], ['privacy', '隐私与清理'],
+    ] as const) {
+      expect(html).toContain(`href="${memoryTabHref(tab)}"`);
+      expect(html).toContain(`data-testid="mem-tab-${tab}">${label}</a>`);
+      expect(memoryTabFromHref(memoryTabHref(tab))).toBe(tab);
+    }
+    expect(html.match(/aria-current="location"/g) ?? []).toHaveLength(1);
+    expect(html).not.toContain('aria-current="page"'); // 页面级当前项由应用主导航管理。
   });
 
-  it('首屏是各分段的加载态，不是整页 spinner 或错误', () => {
-    expect(html).toContain('正在读取核心记忆');
+  it('首屏可以搜索本批、没有假分页', () => {
     expect(html).toContain('正在读取记忆列表');
-  });
-
-  it('把契约边界写在页面上：无详情端点、无分页', () => {
-    expect(html).toContain('没有单条详情端点');
-    expect(html).toContain('没有分页');
-    expect(html).toContain('单次最多取 200 条');
-  });
-
-  it('不假装有分页控件', () => {
+    expect(html).toContain('搜索已加载的记忆');
     expect(html).not.toContain('下一页');
     expect(html).not.toContain('上一页');
     expect(html).not.toContain('page=2');
@@ -434,67 +424,22 @@ describe('核心记忆分段', () => {
     expect(html).toContain('href="/settings/account"');
     expect(html).toContain('设置 → 账号');
     expect(html).not.toContain('账号页');
-    // 恢复方式是可执行动作：点页脚的「重新读取全部」，或重新进入本页
-    expect(html).toContain('重新读取全部');
-    expect(html).toContain('或重新进入本页');
+    expect(html).toContain('重新进入本页');
     // 2026-11 验收实测：停在 403 的 4 秒内 `/v1/memory`、`/v1/core-memory` 请求数为 0，
     // 也没有 focus / visibilitychange 重新取数。这句不实陈述不许再写回来。
     expect(html).not.toContain('本页会自动恢复');
     expect(html).not.toContain('该会话');
   });
 
-  it('读取失败时表单可编辑，但保存按钮禁用并写明原因（报告以此为准）', () => {
-    const html = renderToStaticMarkup(
-      h(CoreMemorySection, {
-        state: {
-          status: 'error',
-          data: null,
-          error: {
-            reason: '服务端内部错误',
-            hint: '',
-            retriable: true,
-            code: 'internal',
-            detail: null,
-            traceId: null,
-          },
-        },
-        handlers: HANDLERS,
-        onReload: () => undefined,
-      }),
-    );
-    // 输入框没有 disabled：表单仍可填写
-    expect(html).not.toMatch(/<input[^>]*disabled/);
-    // 但保存按钮禁用：canSubmit 要求 status === 'ok'
-    expect(html).toMatch(/<button[^>]*disabled[^>]*>保存核心记忆<\/button>/);
-    // 界面必须解释这个差异，不能让人以为「能打字就能保存」
-    expect(html).toContain('data-testid="mem-core-form-blocked"');
-    expect(html).toContain('可以填写');
-    expect(html).toContain('重试成功');
-  });
-
-  it('403 时表单说明不指向不存在的重试，而是说权限修好前不启用', () => {
-    const html = renderToStaticMarkup(
-      h(CoreMemorySection, {
-        state: {
-          status: 'error',
-          data: null,
-          error: {
-            reason: '没有权限访问该会话',
-            hint: '',
-            retriable: false,
-            code: 'forbidden',
-            detail: null,
-            traceId: null,
-          },
-        },
-        handlers: HANDLERS,
-        onReload: () => undefined,
-      }),
-    );
-    const blocked = html.slice(html.indexOf('data-testid="mem-core-form-blocked"'));
-    expect(blocked).toContain('当前账号没有访问权限');
-    expect(blocked).toContain('可以填写');
-    expect(blocked).not.toContain('重试成功');
+  it('读取失败时不开放核心记忆写入', () => {
+    const html = renderToStaticMarkup(h(CoreMemorySection, {
+      state: { status: 'error', data: null, error: null },
+      handlers: HANDLERS,
+      onReload: () => undefined,
+    }));
+    expect(html).toContain('核心记忆读不到');
+    expect(html).not.toContain('添加条目');
+    expect(html).not.toContain('data-testid="mem-core-form"');
   });
 
   it('注入说明写清例外：群聊过滤 / 800 字符预算 / 完全隔离模式', () => {
@@ -538,10 +483,10 @@ describe('核心记忆分段', () => {
       h(CoreMemorySection, { state: ok(coreResponse(items)), handlers: HANDLERS, onReload: () => undefined }),
     );
     expect(html).toContain('已达 20 条上限');
-    expect(html).toContain('新增按钮已禁用');
+    expect(html).toMatch(/<button[^>]*disabled[^>]*>添加条目<\/button>/);
     expect(html).toContain('20 / 20 条');
-    // 没有填写 label 时提交按钮必须是 disabled（不存在「点一下能绕过上限」）
-    expect(html).toMatch(/<button[^>]*disabled[^>]*>保存核心记忆<\/button>/);
+    expect(html).toContain('编辑');
+    expect(html).not.toContain('data-testid="mem-core-form"');
   });
 
   it('删除是软删除，二次确认里写清「没有恢复入口」', () => {
@@ -563,7 +508,7 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
     const html = renderList({ state: ok(listResponse([])), include: null });
     expect(html).toContain('data-testid="mem-list-empty"');
     expect(html).toContain('没有现行记忆');
-    expect(html).toContain('显示已撤回 / 显示已归档');
+    expect(html).toContain('默认不含已撤回或已归档的条目');
   });
 
   it('include=all 的空态不说「可能被撤回」，因为已经取回墓碑了', () => {
@@ -572,7 +517,7 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
       include: 'all',
       flags: { retracted: true, archived: true },
     });
-    expect(html).toContain('没有任何记忆（包括已撤回与已归档）');
+    expect(html).toContain('当前范围内没有条目');
     expect(html).not.toContain('可能是条目被撤回或归档了');
   });
 
@@ -622,9 +567,9 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
     const data = listResponse([MEM_A], { total: 260, has_more: true, limit: 200 });
     const html = renderList({ state: ok(data), limit: 200 });
     expect(html).toContain('data-testid="mem-limit-notice"');
-    expect(html).toContain('只显示了最近 1 条');
-    expect(html).toContain('接口没有分页');
-    expect(html).toContain('最大 200');
+    expect(html).toContain('还有 259 条未加载');
+    expect(html).toContain('接口最多返回 200 条');
+    expect(html).not.toContain('加载最近 200 条');
     expect(html).not.toContain('下一页');
   });
 
@@ -633,26 +578,21 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
     expect(includeMode({ retracted: true, archived: false })).toBe('retracted');
     expect(includeMode({ retracted: false, archived: true })).toBe('archived');
     expect(includeMode({ retracted: true, archived: true })).toBe('all');
-    expect(includeSummary(null)).toContain('默认只看现行记忆');
-    expect(includeSummary('retracted')).toContain('仍不含已归档');
-    expect(includeSummary('archived')).toContain('仍不含已撤回');
-    expect(includeSummary('all')).toContain('含既撤回又归档');
   });
 
-  it('始终说明「最多显示 N 条」，不靠 has_more 才说', () => {
-    const html = renderList({ state: ok(listResponse([MEM_A])) });
-    expect(html).toContain('data-testid="mem-page-size"');
-    expect(html).toContain('本次');
-    expect(html).toContain('最多显示 50 条');
-    expect(html).toContain('没有分页');
+  it('批次没取全且还能扩大时，提供真实的 200 条加载入口', () => {
+    const html = renderList({ state: ok(listResponse([MEM_A], { total: 80, has_more: true })) });
+    expect(html).toContain('还有 79 条未加载');
+    expect(html).toContain('搜索仅限本批');
+    expect(html).toContain('加载最近 200 条');
   });
 
-  it('渲染 include 说明与两个显式开关', () => {
+  it('历史筛选按原有两个独立开关展示', () => {
     const html = renderList({ include: 'retracted', flags: { retracted: true, archived: false } });
-    expect(html).toContain('显示已撤回（include=retracted）');
-    expect(html).toContain('显示已归档（include=archived）');
-    expect(html).toContain('include=retracted：现行记忆 + 已撤回');
-    expect(html).toContain('不参与召回');
+    expect(html).toContain('显示已撤回');
+    expect(html).toContain('显示已归档');
+    expect(html).toContain('同时加载历史条目');
+    expect(html).toContain('包含历史');
   });
 });
 
@@ -662,13 +602,13 @@ describe('记忆列表行：时间 / 来源 / 置信度 / 墓碑标记', () => {
   it('显示绝对时间（相对时间只是括号里的辅助）', () => {
     const html = renderList({ state: ok(listResponse([MEM_A])) });
     expect(html).toContain(formatAbsoluteTime(MEM_A.created_at));
-    expect(html).toContain('记于');
-    expect(html).toMatch(/（\d+ (分钟|小时|天|个月|年)前）|（刚刚）/);
+    expect(html).toContain('记下时间');
+    expect(html).toMatch(/\d+ (分钟|小时|天|个月|年)前|刚刚/);
   });
 
   it('显示 origin 中文与置信度百分比', () => {
     const html = renderList({ state: ok(listResponse([MEM_A])) });
-    expect(html).toContain('来源：你说的');
+    expect(html).toContain('你说的');
     expect(html).toContain('置信度 80%');
   });
 
@@ -678,8 +618,8 @@ describe('记忆列表行：时间 / 来源 / 置信度 / 墓碑标记', () => {
       include: 'retracted',
       flags: { retracted: true, archived: false },
     });
-    expect(html).toContain('已撤回：地址过时');
-    expect(html).toContain('墓碑：只读');
+    expect(html).toContain('撤回理由：地址过时');
+    expect(html).toContain('历史记录 · 只读');
     expect(html).not.toContain('撤回…');
     expect(html).not.toContain('纠正…');
   });
@@ -690,7 +630,9 @@ describe('记忆列表行：时间 / 来源 / 置信度 / 墓碑标记', () => {
       include: 'all',
       flags: { retracted: true, archived: true },
     });
-    expect(html).toContain('已被纠正（新条目 mem_c）');
+    expect(html).toContain('已被纠正');
+    expect(html).toContain('纠正后的条目');
+    expect(html).toContain('mem_c');
   });
 
   it('已归档条目标「已归档」，并保留归档时间', () => {
@@ -707,36 +649,28 @@ describe('记忆列表行：时间 / 来源 / 置信度 / 墓碑标记', () => {
     const inferred = { ...MEM_A, origin: 'model_inference' };
     const html = renderList({ state: ok(listResponse([inferred])) });
     expect(html).toContain('推测，不是事实');
-    expect(html).toContain('来源：模型推测');
+    expect(html).toContain('模型推测');
   });
 
-  it('详情只用列表数据渲染（含 memory_id / 可见范围 / 来源事件），并注明没有单条端点', () => {
+  it('详情只使用批次数据，呈现编号、可见范围和来源事件', () => {
     const html = renderList({ state: ok(listResponse([MEM_A])) });
-    // summary 在 320px 下不能折出 2–3 字孤行，所以文案压短；
-    // 「没有单条详情端点」的完整口径仍在页头 .mem__boundary（见整体渲染用例）。
-    expect(html).toContain('详情（列表数据，无单条详情接口）');
+    expect(html).toContain('记忆详情');
+    expect(html).toContain('记录编号与来源事件');
     expect(html).toContain('mem_a');
-    expect(html).toContain('仅本人（subject_private）');
+    expect(html).toContain('仅本人');
     expect(html).toContain('turn:1');
   });
 
-  it('按 kind 分段，已知三类固定顺序，未知 kind 原样显示', () => {
+  it('同一时间轴按记下时间排列，不按类型重排', () => {
     const rows = [
-      { ...MEM_A, memory_id: 'p', kind: 'procedure', text: '先看日程再看记忆' },
-      { ...MEM_A, memory_id: 'e', kind: 'episode', text: '昨天去了湖边' },
-      { ...MEM_A, memory_id: 'a', kind: 'assertion', text: '她住在杭州' },
-      { ...MEM_A, memory_id: 'x', kind: 'mystery', text: '神秘类型' },
+      { ...MEM_A, memory_id: 'p', kind: 'procedure', created_at: '2026-06-04T00:00:00Z', text: '先看日程再看记忆' },
+      { ...MEM_A, memory_id: 'e', kind: 'episode', created_at: '2026-10-04T00:00:00Z', text: '昨天去了湖边' },
+      { ...MEM_A, memory_id: 'x', kind: 'mystery', created_at: '2026-09-04T00:00:00Z', text: '神秘类型' },
     ];
-    const groups = groupByKind(rows);
-    expect(groups.map((group) => group.kind)).toEqual([
-      'episode',
-      'assertion',
-      'procedure',
-      'mystery',
-    ]);
     const html = renderList({ state: ok(listResponse(rows)) });
-    expect(html.indexOf(kindLabel('episode'))).toBeLessThan(html.indexOf(kindLabel('assertion')));
-    expect(html).toContain('神秘类型');
+    expect(html.indexOf('昨天去了湖边')).toBeLessThan(html.indexOf('神秘类型'));
+    expect(html.indexOf('神秘类型')).toBeLessThan(html.indexOf('先看日程再看记忆'));
+    expect(html).toContain('mystery');
   });
 
   it('时间倒序（服务端已排序，前端也不漂）', () => {
@@ -771,8 +705,8 @@ describe('前端筛选（kind / 时间）', () => {
 
   it('筛选只作用于已取回的数据：界面明说已取回 X 条 / 筛选后 Y 条', () => {
     const html = renderList({ state: ok(listResponse([MEM_A, MEM_C_ARCHIVED])) });
-    expect(html).toContain('只过滤已取回的条目');
-    expect(html).toContain('已取回 2 条');
+    expect(html).toContain('搜索已加载的记忆');
+    expect(html).toContain('已加载 2 条');
   });
 
   it('筛选后为空时给专门的空态，而不是说「没有记忆」', () => {
@@ -781,7 +715,7 @@ describe('前端筛选（kind / 时间）', () => {
       filters: { kind: 'assertion', range: 'all' },
     });
     expect(html).toContain('data-testid="mem-filter-empty"');
-    expect(html).toContain('没有条目符合当前的类型 / 时间筛选');
+    expect(html).toContain('这批记忆里没有匹配项');
   });
 });
 
@@ -923,94 +857,6 @@ describe('部分失败：一块失败不盖住整页', () => {
   });
 });
 
-/* ------------------------------------------------------------------ 页脚文案 */
-
-describe('页脚文案跟着分段状态走（403 不再说「重试按钮就在那个分段里」）', () => {
-  const forbiddenError = {
-    reason: '没有权限访问该会话',
-    hint: '',
-    retriable: false,
-    code: 'forbidden',
-    detail: null,
-    traceId: null,
-  };
-  const forbidden = (detail: string | null = null) => ({
-    status: 'error' as const,
-    data: null,
-    error: { ...forbiddenError, detail },
-  });
-  const internal = {
-    status: 'error' as const,
-    data: null,
-    error: {
-      reason: '服务端内部错误',
-      hint: '可以重试',
-      retriable: true,
-      code: 'internal',
-      detail: null,
-      traceId: null,
-    },
-  };
-
-  it('两个分段都 403：页脚不承诺重试按钮，改为「不提供重试」', () => {
-    const html = renderBody(forbidden(), forbidden());
-    expect(html).toContain('data-foot-mode="non-retriable"');
-    expect(html).not.toContain('重试按钮就在那个分段里');
-    expect(html).toContain('不提供重试按钮');
-    // 页脚必须给可照做的下一步，不能只说「按那个分段里的说明处理」（那分段里没有可执行办法）
-    expect(html).toContain('先按该分段里写的原因处理');
-    expect(html).toContain('设置 → 账号');
-    expect(html).toContain('改完密码');
-    expect(html).toContain('重新读取全部');
-    expect(html).not.toContain('请按那个分段里的说明处理');
-    expect(html).toContain('失败的「核心记忆、记忆列表」');
-    // 「重新读取全部」仍然是可点的刷新入口
-    expect(html).toMatch(/<button[^>]*>.*?重新读取全部<\/button>/);
-  });
-
-  it('只有一个分段 403（另一个成功）也不承诺「分段里有重试按钮」', () => {
-    const html = renderBody(forbidden('must_change_password'), ok(listResponse([MEM_A])));
-    expect(html).toContain('data-foot-mode="non-retriable"');
-    expect(html).not.toContain('重试按钮就在那个分段里');
-    expect(html).toContain('失败的「核心记忆」');
-  });
-
-  it('可重试失败（500）：页脚仍说重试按钮在分段里', () => {
-    const html = renderBody(internal, ok(listResponse([MEM_A])));
-    expect(html).toContain('data-foot-mode="retriable"');
-    expect(html).toContain('重试按钮就在那个分段里');
-    expect(html).not.toContain('不提供重试按钮');
-  });
-
-  it('无失败：页脚是通用说明，带 data-foot-mode="idle"', () => {
-    const html = renderBody(ok(coreResponse([CORE_ITEM])), ok(listResponse([MEM_A])));
-    expect(html).toContain('data-foot-mode="idle"');
-    expect(html).toContain('「重新读取全部」会同时刷新核心记忆与记忆列表');
-  });
-
-  it('memoryFooterNote 是纯函数：按 retryable 分流并点名分段', () => {
-    const both403 = memoryFooterNote(forbidden(), forbidden());
-    expect(both403.mode).toBe('non-retriable');
-    expect(both403.nonRetriable).toEqual(['核心记忆', '记忆列表']);
-    expect(both403.retriable).toEqual([]);
-    expect(both403.text).not.toContain('重试按钮就在那个分段里');
-    // 不可重试分支必须指路到可照做的动作（改密 → 重新读取），而不是只说「按分段里的说明处理」
-    expect(both403.text).toContain('先按该分段里写的原因处理');
-    expect(both403.text).toContain('设置 → 账号');
-    expect(both403.text).toContain('重新读取全部');
-    expect(both403.text).not.toContain('请按那个分段里的说明处理');
-
-    const retriableNote = memoryFooterNote(internal, ok(listResponse([MEM_A])));
-    expect(retriableNote.mode).toBe('retriable');
-    expect(retriableNote.retriable).toEqual(['核心记忆']);
-    expect(retriableNote.text).toContain('重试按钮就在那个分段里');
-
-    const idleNote = memoryFooterNote(ok(coreResponse([])), ok(listResponse([])));
-    expect(idleNote.mode).toBe('idle');
-    expect(idleNote.nonRetriable).toEqual([]);
-  });
-});
-
 /* ------------------------------------------------------------------ 错误文案 */
 
 describe('错误文案：按资源粒度 + 可操作性', () => {
@@ -1041,8 +887,7 @@ describe('错误文案：按资源粒度 + 可操作性', () => {
     const copy = memoryErrorCopy('core', { ...forbidden, detail: 'must_change_password' });
     expect(copy.hint).toContain('首次登录还没改初始口令');
     expect(copy.hint).toContain('设置 → 账号');
-    expect(copy.hint).toContain('重新读取全部');
-    expect(copy.hint).toContain('或重新进入本页');
+    expect(copy.hint).toContain('重新进入本页');
     // 页面不会自动恢复：不要写回「本页会自动恢复」
     expect(copy.hint).not.toContain('本页会自动恢复');
     expect(copy.retryable).toBe(false);
@@ -1324,11 +1169,12 @@ describe('展示工具', () => {
     expect(coreOriginLabel('weird')).toBe('weird');
   });
 
-  it('limitNotice 只在 has_more 时出现，并说清没有分页', () => {
-    expect(limitNotice(listResponse([MEM_A]))).toBeNull();
-    const notice = limitNotice(listResponse([MEM_A], { total: 120, has_more: true, limit: 50 }));
-    expect(notice).toContain('还有 119 条没有显示');
-    expect(notice).toContain('没有分页');
+  it('本地搜索仅匹配批次正文，可同时查多个词并统一大小写与全半角', () => {
+    const row = { ...MEM_A, text: 'ＡＩ 项目：她住在杭州' };
+    expect(searchLoadedMemories([row, MEM_C_ARCHIVED], 'ai  杭州')).toEqual([row]);
+    expect(searchLoadedMemories([row], '杭州 苏州')).toEqual([]);
+    expect(searchLoadedMemories([row], row.memory_id)).toEqual([]);
+    expect(searchLoadedMemories([row], '  ')).toEqual([row]);
   });
 
   it('withNode 帮助函数防止空渲染的假绿', () => {
