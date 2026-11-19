@@ -26,12 +26,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
+
 from ling.domains.conversation.service import (
     ConversationService,
     sort_windows_for_display,
 )
 from ling.infra.db import session_scope
-from ling.infra.models import RelationshipState, Subject, Window
+from ling.infra.models import RelationshipState, Subject, User, Window
 from tests.integration.conftest import TestEnv, logged_in  # noqa: F401 - fixture
 
 
@@ -82,6 +84,86 @@ async def _set_familiarity(env: TestEnv, subject_id: str, value: float) -> None:
             )
         else:
             existing.familiarity = value
+
+
+async def test_manual_order_survives_activity_and_respects_pin_groups(logged_in: TestEnv) -> None:  # noqa: F811
+    now = datetime.now(UTC)
+    oldest = await _make_window(logged_in, title="oldest", updated_at=now - timedelta(days=3))
+    middle = await _make_window(logged_in, title="middle", updated_at=now - timedelta(days=2))
+    newest = await _make_window(logged_in, title="newest", updated_at=now - timedelta(days=1))
+    pinned = await _make_window(logged_in, title="pinned", updated_at=now, pinned_at=now)
+    path = "/v1/sessions"
+
+    async def listed() -> list[str]:
+        response = await logged_in.client.get(path)
+        assert response.status_code == 200, response.text
+        return [row["session_id"] for row in response.json()["sessions"]]
+
+    selected = {oldest, middle, newest, pinned}
+    assert [row for row in await listed() if row in selected] == [pinned, newest, middle, oldest]
+    move = await logged_in.client.post(
+        f"{path}/{oldest}/move", json={"anchor_id": newest, "before": True}
+    )
+    assert move.status_code == 204, move.text
+    async with session_scope() as session:
+        old_window = await session.get(Window, oldest)
+        middle_window = await session.get(Window, middle)
+        assert old_window is not None and old_window.updated_at == now - timedelta(days=3)
+        assert middle_window is not None
+        middle_window.updated_at = now + timedelta(days=1)
+    assert [row for row in await listed() if row in selected] == [pinned, oldest, newest, middle]
+
+    cross_group = await logged_in.client.post(
+        f"{path}/{oldest}/move", json={"anchor_id": pinned, "before": True}
+    )
+    assert cross_group.status_code == 422, cross_group.text
+    pin = await logged_in.client.post(f"{path}/{middle}/pin", json={"pinned": True})
+    assert pin.status_code == 200, pin.text
+    assert [row for row in await listed() if row in selected] == [middle, pinned, oldest, newest]
+    move = await logged_in.client.post(
+        f"{path}/{middle}/move", json={"anchor_id": pinned, "before": False}
+    )
+    assert move.status_code == 204, move.text
+    assert [row for row in await listed() if row in selected] == [pinned, middle, oldest, newest]
+    repin = await logged_in.client.post(f"{path}/{middle}/pin", json={"pinned": True})
+    assert repin.status_code == 200, repin.text
+    assert [row for row in await listed() if row in selected] == [middle, pinned, oldest, newest]
+
+
+async def test_presentation_edits_keep_existing_permissions(logged_in: TestEnv) -> None:  # noqa: F811
+    async with session_scope() as session:
+        service = ConversationService(session)
+        channel = await service.create_window(
+            subject_id=logged_in.subject_id, title="onebot-default:group:100200400", channel="onebot"
+        )
+        web = await service.create_window(subject_id=logged_in.subject_id, title="原名")
+        foreign = await service.create_window(subject_id="subj_unrelated", title="其他会话")
+        channel_id, web_id, foreign_id = channel.id, web.id, foreign.id
+
+    path = "/v1/sessions"
+    unavailable = await logged_in.client.post(
+        f"{path}/{web_id}/move", json={"anchor_id": foreign_id, "before": True}
+    )
+    assert unavailable.status_code == 404, unavailable.text
+
+    async with session_scope() as session:
+        user = await session.scalar(select(User).where(User.subject_id == logged_in.subject_id))
+        assert user is not None
+        user.role = "member"
+
+    renamed_person = await logged_in.client.patch(
+        f"/v1/accounts/subjects/{logged_in.subject_id}", json={"display_name": "未授权"}
+    )
+    rename_channel = await logged_in.client.patch(f"{path}/{channel_id}", json={"title": "未授权"})
+    pin_channel = await logged_in.client.post(f"{path}/{channel_id}/pin", json={"pinned": True})
+    reorder = await logged_in.client.post(
+        f"{path}/{web_id}/move", json={"anchor_id": channel_id, "before": True}
+    )
+    assert all(response.status_code == 403 for response in (
+        renamed_person, rename_channel, pin_channel, reorder
+    ))
+    rename_web = await logged_in.client.patch(f"{path}/{web_id}", json={"title": "网页新名"})
+    assert rename_web.status_code == 200 and rename_web.json()["title"] == "网页新名"
 
 
 async def test_list_is_ordered_by_familiarity_not_by_activity(  # noqa: F811

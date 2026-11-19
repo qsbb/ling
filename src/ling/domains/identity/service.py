@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.errors import LingError, unauthorized
+from ling.api.errors import LingError, not_found, unauthorized
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import ActorAccount, AuthSession, Subject, User, utcnow
 from ling.infra.security import (
@@ -763,12 +763,19 @@ class IdentityService:
         拒绝三种情况：自己并自己、目标本身是被合并者、会形成环。
         这几种都是"操作者选错了"，早失败比事后串号好。
         """
-        from ling.infra.models import Subject
-
         if source_id == target_id:
             raise ValueError("不能把 subject 合并到自己")
-        source = await self._session.get(Subject, source_id)
-        target = await self._session.get(Subject, target_id)
+        # 同一顺序锁住两端，避免两次反向合并同时把对方判为独立身份。
+        rows = await self._session.scalars(
+            select(Subject)
+            .where(Subject.id.in_((source_id, target_id)))
+            .order_by(Subject.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        by_id = {row.id: row for row in rows}
+        source = by_id.get(source_id)
+        target = by_id.get(target_id)
         if source is None or target is None:
             raise ValueError("subject 不存在")
         if getattr(target, "merged_into", None):
@@ -780,6 +787,24 @@ class IdentityService:
         await self._session.flush()
         logger.info("合并 subject：%s -> %s（数据未搬动，可拆分）", source_id, target_id)
         return {"source_id": source_id, "target_id": target_id, "moved": 0}
+
+    async def rename_subject(self, subject_id: str, display_name: str) -> Subject:
+        name = display_name.strip()
+        if not name or len(name) > 128 or "\x00" in name:
+            raise LingError(ErrorCode.invalid_request, "请输入 1 到 128 个字符的姓名", status_code=422)
+        subject = await self._session.get(
+            Subject, subject_id, with_for_update=True, populate_existing=True
+        )
+        if subject is None:
+            raise not_found("自然人不存在")
+        if subject.merged_into is not None:
+            raise LingError(
+                ErrorCode.conflict, "身份已合并，请刷新后选择合并后的自然人", status_code=409
+            )
+        subject.display_name = name
+        subject.display_name_manual = True
+        await self._session.flush()
+        return subject
 
     async def unmerge_subject(self, source_id: str) -> dict:
         """把 source 从合并里拆出来。
@@ -1004,8 +1029,12 @@ class IdentityService:
             # savepoint，回滚时 ORM 状态会与库不一致——那时应改成独立 session
             # 的旁路写，不要在这里硬扛。
             async with self._session.begin_nested():
-                row = await self._session.get(Subject, subject_id)
-                if row is None:
+                row = await self._session.get(
+                    Subject, subject_id, with_for_update=True, populate_existing=True
+                )
+                if row is None or row.merged_into is not None:
+                    return None
+                if row.display_name_manual:
                     return None
                 if normalize_display_name(row.display_name) == candidate:
                     # 库里已经是这个名字（可能别的副本先写了）：不产生 UPDATE，

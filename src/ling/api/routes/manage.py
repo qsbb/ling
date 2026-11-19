@@ -1345,14 +1345,15 @@ async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> di
     return by_subject
 
 
-def _subject_row(s: object, by_subject: dict[str, list[dict]]) -> dict:
+def _subject_row(s: Subject, by_subject: dict[str, list[dict]], *, operator: bool) -> dict:
     """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
     return {
-        "subject_id": s.id,  # type: ignore[attr-defined]
-        "display_name": s.display_name,  # type: ignore[attr-defined]
-        "trust_level": getattr(s, "trust_level", "known"),
-        "merged_into": getattr(s, "merged_into", None),
-        "accounts": by_subject.get(s.id, []),  # type: ignore[attr-defined]
+        "subject_id": s.id,
+        "display_name": s.display_name,
+        "trust_level": s.trust_level,
+        "merged_into": s.merged_into,
+        "can_rename": operator and s.merged_into is None,
+        "accounts": by_subject.get(s.id, []),
     }
 
 
@@ -1456,7 +1457,10 @@ async def list_subjects(
 
     return {
         "schema_version": SCHEMA_VERSION,
-        "subjects": [_subject_row(s, by_subject) for s in page],
+        "subjects": [
+            _subject_row(s, by_subject, operator=auth.user.role in {"owner", "admin"})
+            for s in page
+        ],
         "limit": limit,
         "offset": offset,
         "total": total,
@@ -1662,6 +1666,22 @@ async def subject_details(
             for row in page
         ]
     return {"section": section, "access": access, "items": items, "next_cursor": next_cursor}
+
+
+class RenameSubjectBody(BaseModel):
+    display_name: str = Field(max_length=128)
+
+
+@router.patch("/accounts/subjects/{subject_id}")
+async def rename_subject(
+    subject_id: str, body: RenameSubjectBody, auth: CurrentAuth, session: DbSession
+) -> dict:
+    from ling.domains.identity.service import IdentityService
+
+    if auth.user.role not in {"owner", "admin"}:
+        raise LingError(ErrorCode.forbidden, "需要管理员权限", status_code=403)
+    subject = await IdentityService(session).rename_subject(subject_id, body.display_name)
+    return {"subject_id": subject.id, "display_name": subject.display_name}
 
 
 @router.post("/accounts/subjects/merge")

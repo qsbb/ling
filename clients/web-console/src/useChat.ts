@@ -206,15 +206,9 @@ export interface ChatState {
   reloadMessages: () => void;
   reloadSessions: () => void;
   createSession: () => void;
-  renameSession: (sessionId: string, title: string) => Promise<void>;
-  /**
-   * 置顶 / 取消置顶。
-   *
-   * 成功后**替换整条记录**（后端返回的 `SessionRecord` 带新的 `pinned`），
-   * 顺序由 `SessionSidebar` 按 `pinned` 分组——两处共用同一个字段，
-   * 不在前端另存一份"置顶 id 集合"（两份状态必然有一天不一致）。
-   */
+  renameSession: (sessionId: string, title: string) => Promise<boolean>;
   pinSession: (sessionId: string, pinned: boolean) => Promise<void>;
+  moveSession: (sessionId: string, anchorId: string, before: boolean) => Promise<void>;
   selectSession: (sessionId: string) => void;
   dismissNotice: () => void;
   /** 她提议撤回、还没处理完的（挂在对应消息下面）。 */
@@ -1121,19 +1115,29 @@ export function useChat(
   }, []);
 
   const renameSession = useCallback(async (sessionId: string, title: string) => {
-    const trimmed = title.trim();
-    if (!trimmed) return;
     try {
-      const updated = await api.renameSession(sessionId, trimmed);
+      const updated = await api.renameSession(sessionId, title.trim());
       sessionsRevisionRef.current += 1;
       setSessions((prev) =>
         prev.map((session) => (session.session_id === sessionId ? updated : session)),
       );
+      reloadSessions();
+      return true;
     } catch (error) {
       const explained = explainError(error);
       setNotice({ kind: 'error', text: `改名失败：${explained.reason}` });
+      return false;
     }
-  }, []);
+  }, [reloadSessions]);
+
+  const refreshOrder = useCallback(async () => {
+    try {
+      await loadSessions();
+    } catch (error) {
+      const explained = explainError(error);
+      setNotice({ kind: 'error', text: `顺序已保存，会话列表刷新失败：${explained.reason}` });
+    }
+  }, [loadSessions]);
 
   const pinSession = useCallback(async (sessionId: string, pinned: boolean) => {
     try {
@@ -1147,8 +1151,22 @@ export function useChat(
       // 失败要说清"没置顶成功"，不能静默——用户会以为点上了，
       // 下次刷新发现顺序没变，只会以为界面在乱跳。
       setNotice({ kind: 'error', text: `${pinned ? '置顶' : '取消置顶'}失败：${explained.reason}` });
+      return;
     }
-  }, []);
+    await refreshOrder();
+  }, [refreshOrder]);
+
+  const moveSession = useCallback(async (sessionId: string, anchorId: string, before: boolean) => {
+    try {
+      await api.moveSession(sessionId, anchorId, before);
+      sessionsRevisionRef.current += 1;
+    } catch (error) {
+      const explained = explainError(error);
+      setNotice({ kind: 'error', text: `调整顺序失败：${explained.reason}` });
+      return;
+    }
+    await refreshOrder();
+  }, [refreshOrder]);
 
   const selectSession = useCallback((sessionId: string) => {
     if (sessionId === currentIdRef.current) return;
@@ -1289,6 +1307,7 @@ export function useChat(
     createSession,
     renameSession,
     pinSession,
+    moveSession,
     selectSession,
     dismissNotice,
     recallProposals,

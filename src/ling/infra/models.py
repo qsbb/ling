@@ -102,6 +102,9 @@ class Subject(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(128), default="用户")
+    display_name_manual: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa.false()
+    )
     proof_level: Mapped[str] = mapped_column(String(32), default="password")  # password|device|admin
     # 亲疏等级：限制的是**记忆范围**，不是权限。
     #   owner    主人，全部私聊记忆，可触发跨窗召回
@@ -230,6 +233,8 @@ class Window(Base, TimestampMixin):
     persona_id: Mapped[str] = mapped_column(String(64))
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(128), default="新的对话")
+    display_name_override: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    manual_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     channel: Mapped[str] = mapped_column(String(32), default="web")
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
     connector_window_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)

@@ -10,6 +10,7 @@ import {
   PlusIcon,
   SettingsIcon,
 } from './Icons';
+import './session-sidebar.css';
 
 /**
  * 会话该按哪套版式渲染。
@@ -71,12 +72,11 @@ export interface SessionHeading {
  */
 export function describeSession(session: SessionLike): SessionHeading {
   const rawTitle = (session.title ?? '').trim();
-  const ref =
-    parseChannelRef(rawTitle) ??
-    parseChannelRef(session.window_id) ??
-    parseChannelRef(session.subject_id) ??
-    null;
   const channel = (session.channel ?? '').trim().toLowerCase();
+  const ref =
+    channel === 'web'
+      ? null
+      : parseChannelRef(rawTitle) ?? parseChannelRef(session.window_id) ?? parseChannelRef(session.subject_id);
   const hasPeer = Boolean((session.peer_id ?? '').trim());
   // 旧服务端没有 channel 字段：有没有对端号码就是"是不是渠道窗口"的证据。
   const kind: DialogueKind =
@@ -117,14 +117,12 @@ export function describeSession(session: SessionLike): SessionHeading {
   };
 }
 
-/**
- * 只有网页会话可以改名。
- *
- * 渠道窗口的标题就是窗口键：改名会让 `bridge._ensure_window` 找不到旧窗口，
- * 下一条群消息会再建一个同名窗口，群聊被劈成两段。名字请由 `display_name` 给。
- */
-export function canRenameSession(session: SessionLike): boolean {
-  return describeSession(session).kind === 'web';
+export function canManageSessionOrder(role: string): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
+export function canRenameSession(session: SessionLike, role?: string): boolean {
+  return describeSession(session).kind === 'web' || canManageSessionOrder(role ?? '');
 }
 
 interface SessionSidebarProps {
@@ -135,15 +133,9 @@ interface SessionSidebarProps {
   onClose: () => void;
   onSelect: (sessionId: string) => void;
   onCreate: () => void;
-  onRename: (sessionId: string, title: string) => Promise<void>;
-  /**
-   * 置顶 / 取消置顶。
-   *
-   * 为什么是 `Promise<void>` 而不是返回新记录：列表由上层持有，置顶会改变
-   * **顺序**，由上层按同一条规则重排才一致（`pinned` 字段就在记录里）。
-   * 这里只负责发起意图。
-   */
+  onRename: (sessionId: string, title: string) => Promise<boolean>;
   onPin: (sessionId: string, pinned: boolean) => Promise<void>;
+  onMove: (sessionId: string, anchorId: string, before: boolean) => Promise<void>;
   onNavigateSettings: () => void;
   onNavigatePersona: () => void;
   onLogout: () => void;
@@ -159,13 +151,17 @@ export function SessionSidebar({
   onCreate,
   onRename,
   onPin,
+  onMove,
   onNavigateSettings,
   onNavigatePersona,
   onLogout,
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  const [orderBusy, setOrderBusy] = useState(false);
+  const [savingName, setSavingName] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const canReorder = canManageSessionOrder(user.role);
 
   useEffect(() => {
     if (editingId) inputRef.current?.focus();
@@ -178,10 +174,26 @@ export function SessionSidebar({
   };
 
   const commit = async () => {
-    if (!editingId) return;
-    const id = editingId;
-    await onRename(id, draft);
-    setEditingId(null);
+    const session = sessions.find((item) => item.session_id === editingId);
+    if (!session || savingName || (describeSession(session).kind === 'web' && !draft.trim())) return;
+    setSavingName(true);
+    try {
+      if (await onRename(session.session_id, draft)) {
+        setEditingId((current) => current === session.session_id ? null : current);
+      }
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  const changeOrder = async (action: () => Promise<void>) => {
+    if (orderBusy) return;
+    setOrderBusy(true);
+    try {
+      await action();
+    } finally {
+      setOrderBusy(false);
+    }
   };
 
   // 空气泡是新建后没说话的会话。留着它们只会把真对话挤出视野，
@@ -223,11 +235,15 @@ export function SessionSidebar({
           {visible.length === 0 ? (
             <p className="sidebar__empty">还没有会话</p>
           ) : (
-            ordered.map((session) => {
+            ordered.map((session, index) => {
               const active = session.session_id === currentId;
               const editing = editingId === session.session_id;
               const heading = describeSession(session);
-              const renamable = canRenameSession(session);
+              const renamable = canRenameSession(session, user.role);
+              const previous = ordered[index - 1];
+              const next = ordered[index + 1];
+              const sameGroup = (neighbor: SessionRecord | undefined) =>
+                neighbor && Boolean(neighbor.pinned) === Boolean(session.pinned);
               return (
                 <div
                   key={session.session_id}
@@ -248,12 +264,18 @@ export function SessionSidebar({
                         value={draft}
                         maxLength={60}
                         aria-label="会话名称"
+                        placeholder={heading.kind === 'web' ? undefined : '使用渠道名称'}
+                        disabled={savingName}
                         onChange={(event) => setDraft(event.target.value)}
                         onKeyDown={(event) => {
                           if (event.key === 'Escape') setEditingId(null);
                         }}
                       />
-                      <button type="submit" className="button button--small button--primary">
+                      <button
+                        type="submit"
+                        className="button button--small button--primary"
+                        disabled={savingName || (heading.kind === 'web' && !draft.trim())}
+                      >
                         保存
                       </button>
                       <button
@@ -303,15 +325,6 @@ export function SessionSidebar({
                           <PencilIcon />
                         </button>
                       ) : null}
-                      {/*
-                        置顶按钮。**只对能改名的会话显示**（`renamable`）：
-                        网页会话是我们自己的，渠道窗口（QQ 群/私聊）不归这里管，
-                        给它一个"置顶"按钮等于承诺一个管不住的东西。
-
-                        已置顶时图标实心 + `aria-pressed`，读屏能听出状态；
-                        取消置顶不弹确认——它是一个可逆的轻动作，
-                        弹确认只会让"点错了"比"撤销"更麻烦。
-                      */}
                       {renamable ? (
                         <button
                           type="button"
@@ -322,10 +335,33 @@ export function SessionSidebar({
                           aria-pressed={Boolean(session.pinned)}
                           title={session.pinned ? '取消置顶' : '置顶'}
                           data-testid="session-pin"
-                          onClick={() => void onPin(session.session_id, !session.pinned)}
+                          disabled={orderBusy}
+                          onClick={() => void changeOrder(() => onPin(session.session_id, !session.pinned))}
                         >
                           <PinIcon filled={Boolean(session.pinned)} />
                         </button>
+                      ) : null}
+                      {canReorder && (sameGroup(previous) || sameGroup(next)) ? (
+                        <div className="session__order">
+                          {([[previous, true, '上移', '↑'], [next, false, '下移', '↓']] as const)
+                            .map(([neighbor, before, label, icon]) => (
+                              <button
+                                key={label}
+                                type="button"
+                                className="icon-button session__move-button"
+                                aria-label={`${label}：${heading.title}`}
+                                title={label}
+                                disabled={orderBusy || !sameGroup(neighbor)}
+                                onClick={() => {
+                                  if (neighbor) {
+                                    void changeOrder(() => onMove(session.session_id, neighbor.session_id, before));
+                                  }
+                                }}
+                              >
+                                {icon}
+                              </button>
+                            ))}
+                        </div>
                       ) : null}
                     </>
                   )}

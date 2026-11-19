@@ -155,7 +155,10 @@ function pageOf(query: URLSearchParams): { status: number; body: unknown } {
         .includes(needle),
     );
   }
-  const page = rows.slice(offset, offset + limit);
+  const page = rows.slice(offset, offset + limit).map((row) => ({
+    ...row,
+    can_rename: !row.merged_into,
+  }));
   return {
     status: 200,
     body: {
@@ -256,6 +259,16 @@ async function openRelations(
       const source = store.find((row) => row.subject_id === body.source_id);
       if (source) source.merged_into = body.target_id;
       return route.fulfill(json({ source_id: body.source_id, target_id: body.target_id, moved: 0 }));
+    }
+    if (/^\/v1\/accounts\/subjects\/[^/]+$/.test(pathname) && method === 'PATCH') {
+      const subjectId = decodeURIComponent(pathname.split('/')[4] ?? '');
+      const subject = store.find((row) => row.subject_id === subjectId);
+      if (!subject || subject.merged_into) {
+        return route.fulfill(json({ error: { code: 'conflict', message: '请选择合并后的自然人' } }, 409));
+      }
+      const body = route.request().postDataJSON() as { display_name: string };
+      subject.display_name = body.display_name;
+      return route.fulfill(json({ subject_id: subjectId, display_name: subject.display_name }));
     }
     if (/^\/v1\/accounts\/subjects\/[^/]+\/unmerge$/.test(pathname) && method === 'POST') {
       const sourceId = decodeURIComponent(pathname.split('/')[4] ?? '');
@@ -436,7 +449,8 @@ describe('关系页：不再卡死（真浏览器）', () => {
     const stats = await domStats(page);
     console.info(`[identity.browser] 2000 条关系 → 首屏 DOM ${stats.elements} 元素`);
     expect(stats.cards).toBe(PAGE_SIZE);
-    expect(stats.elements).toBeLessThan(800);
+    // 每张可编辑卡片新增一个改名按钮，保留其余页面元素的预算。
+    expect(stats.elements).toBeLessThan(800 + PAGE_SIZE);
 
     // 3. **核心断言**：一个 <option> 都没有，也没有 <select>
     expect(stats.options).toBe(0);
@@ -474,7 +488,7 @@ describe('关系页：不再卡死（真浏览器）', () => {
     expect(stats.options).toBe(0);
   }, TEST_TIMEOUT);
 
-  it('合并 → 刷新后已合并 → 拆开：整条链路在真浏览器里走通', async (ctx) => {
+  it('合并后可改目标姓名，拆开后源姓名仍在', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
     const { page } = await openRelations({ width: 1440, height: 900 });
@@ -508,13 +522,19 @@ describe('关系页：不再卡死（真浏览器）', () => {
     // 已合并的那张卡片仍然属于**被合并的人**（源头），不是目标
     expect(await mergedCard.innerText()).toContain('已合并');
     expect(await page.locator('[data-testid="merged-badge"]').count()).toBe(1);
-    console.info(`[identity.browser] 合并 ${sourceName} → ${targetLabel}`);
+    expect(await mergedCard.getByRole('button', { name: '改名', exact: true }).count()).toBe(0);
+    const targetCard = page.getByTestId('subject-card').filter({ hasText: targetLabel });
+    await targetCard.getByRole('button', { name: '改名', exact: true }).click();
+    await targetCard.getByRole('textbox', { name: '自然人姓名' }).fill('两个账号的共同姓名');
+    await targetCard.getByRole('button', { name: '保存' }).click();
+    await page.getByTestId('subject-card').filter({ hasText: '两个账号的共同姓名' }).waitFor();
 
     // 拆开还原
     await mergedCard.getByTestId('unmerge-button').click();
     await page.getByTestId('identity-message').waitFor();
     expect(await page.getByTestId('identity-message').innerText()).toContain('已拆开');
-    expect(await page.getByTestId('merged-badge').count()).toBe(0);
+    await expect.poll(async () => page.getByTestId('merged-badge').count()).toBe(0);
+    await page.getByTestId('subject-card').filter({ hasText: sourceName }).waitFor();
   }, TEST_TIMEOUT);
 
   it('「加载更多」按 offset 续页，到底显示「没有更多了」', async (ctx) => {

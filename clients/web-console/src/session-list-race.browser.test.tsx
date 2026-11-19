@@ -130,3 +130,56 @@ describe('会话列表请求交错', () => {
     }, 20000);
   }
 });
+
+it('管理员可在侧栏改渠道会话名并保存手动顺序', async () => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 850 } });
+  contexts.push(context);
+  const page = await context.newPage();
+  const groupKey = 'onebot-default:group:100200300';
+  const group = { ...session('group'), title: groupKey, channel: 'onebot', display_name: '渠道群名' };
+  const web = { ...session('web'), title: '网页会话' };
+  let sessions = [web, group];
+  const requests: unknown[] = [];
+  await page.route('**/v1/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/v1/auth/me') {
+      return route.fulfill(json({
+        user: { id: 'u', username: 'test', role: 'owner', subject_id: 'subject' },
+        test_mode: false,
+      }));
+    }
+    if (path === '/v1/sessions') return route.fulfill(json({ sessions }));
+    if (path === '/v1/sessions/group' && request.method() === 'PATCH') {
+      const body = request.postDataJSON() as { title: string };
+      requests.push(body);
+      group.display_name = body.title;
+      return route.fulfill(json(group));
+    }
+    if (path === '/v1/sessions/group/move' && request.method() === 'POST') {
+      requests.push(request.postDataJSON());
+      sessions = [group, web];
+      return route.fulfill({ status: 204 });
+    }
+    if (path === '/v1/sessions/group/messages') {
+      return route.fulfill(json({ messages: [], active_turn: null }));
+    }
+    return route.fulfill(json({ error: { code: 'not_found', message: '目标不存在' } }, 404));
+  });
+  await page.goto(`${address}/s/group`, { waitUntil: 'domcontentloaded' });
+  const row = page.locator('[data-session-id="group"]');
+  await row.getByRole('button', { name: '改名：渠道群名' }).click();
+  await row.getByRole('textbox', { name: '会话名称' }).fill('管理员群名');
+  await row.getByRole('button', { name: '保存' }).click();
+  await expect.poll(async () => page.getByTestId('session-title').innerText()).toBe('管理员群名');
+  expect(await row.locator('.session__subtitle').innerText()).toBe(groupKey);
+
+  await row.getByRole('button', { name: '上移：管理员群名' }).click();
+  const ids = () => page.locator('[data-session-id]').evaluateAll(
+    (nodes) => nodes.map((node) => node.getAttribute('data-session-id')),
+  );
+  await expect.poll(ids).toEqual(['group', 'web']);
+  expect(requests).toEqual([{ title: '管理员群名' }, { anchor_id: 'web', before: true }]);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect.poll(ids).toEqual(['group', 'web']);
+}, 20000);

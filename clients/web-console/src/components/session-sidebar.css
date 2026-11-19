@@ -1,0 +1,9 @@
+.session__order {
+  display: grid;
+  align-content: center;
+}
+
+.session__order .session__move-button {
+  width: 28px;
+  height: 26px;
+}

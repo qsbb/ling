@@ -324,6 +324,52 @@ async def test_conversation_title_follows_the_rename(logged_in: TestEnv) -> None
     assert names[window_id] == "懒懒"
 
 
+async def test_rename_merged_person_requires_the_canonical_id(logged_in: TestEnv) -> None:  # noqa: F811
+    source_id = await _provision(name="同名")
+    target_id = logged_in.subject_id
+    async with session_scope() as session:
+        subject = await session.get(Subject, target_id)
+        assert subject is not None
+        subject.display_name = "同名"
+
+    path = "/v1/accounts/subjects"
+    merge = await logged_in.client.post(
+        f"{path}/merge", json={"source_id": source_id, "target_id": target_id}
+    )
+    assert merge.status_code == 200, merge.text
+    response = await logged_in.client.get(path)
+    people = {person["subject_id"]: person for person in response.json()["subjects"]}
+    assert people[target_id]["can_rename"] is True
+    assert people[source_id]["can_rename"] is False
+
+    stale = await logged_in.client.patch(f"{path}/{source_id}", json={"display_name": "误改"})
+    assert stale.status_code == 409, stale.text
+    # 入站会话已解析身份时，可能已把旧名字读进 ORM 缓存。
+    async with session_scope() as ingress:
+        cached = await ingress.get(Subject, target_id)
+        assert cached is not None and cached.display_name == "同名"
+        renamed = await logged_in.client.patch(
+            f"{path}/{target_id}", json={"display_name": "  人工姓名  "}
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json() == {"subject_id": target_id, "display_name": "人工姓名"}
+        observed = await IdentityService(ingress).observe_display_name(
+            CONNECTOR, QQ, subject_id=target_id, nickname="渠道新昵称"
+        )
+        assert observed is None
+
+    reset_display_name_cache()
+    assert await _observe(nickname="进程重启后看到的昵称") is None
+    found = await logged_in.client.get(path, params={"q": "人工姓名"})
+    assert [row["subject_id"] for row in found.json()["subjects"]] == [target_id]
+    assert await _display_name(source_id) == "同名"
+
+    unmerged = await logged_in.client.post(f"{path}/{source_id}/unmerge")
+    assert unmerged.status_code == 200, unmerged.text
+    assert await _observe(nickname="进程重启后看到的昵称") == "进程重启后看到的昵称"
+    assert await _display_name(target_id) == "人工姓名"
+
+
 # ------------------------------------------------------------------ 纯函数
 
 

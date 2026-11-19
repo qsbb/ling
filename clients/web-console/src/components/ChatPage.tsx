@@ -47,7 +47,8 @@ export function ChatPage({
   onLogout,
 }: ChatPageProps) {
   const chat = useChat(sessionId, onTestMode);
-  const [editingTitle, setEditingTitle] = useState(false);
+  const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
+  const [savingTitle, setSavingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const [policy, setPolicy] = useState<{ sessionId: string; open: boolean } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -80,7 +81,9 @@ export function ChatPage({
       : heading.kind === 'channel'
         ? 'private'
         : heading.kind;
-  const renamable = session ? canRenameSession(session) : false;
+  const renamable = session ? canRenameSession(session, user.role) : false;
+  const editingTitle = renamable && editingTitleId !== null && editingTitleId === chat.currentId;
+  const titleRequired = heading?.kind === 'web';
   const busy = chat.live !== null || chat.activeTurn !== null;
   const stopping = chat.live?.state === 'stopping' || chat.activeTurn?.state === 'stopping';
   const elapsed = useElapsed(chat.live?.startedAt ?? null);
@@ -88,6 +91,7 @@ export function ChatPage({
   useEffect(() => {
     stickToBottom.current = true;
     setPolicy(null);
+    setEditingTitleId(null);
   }, [chat.currentId]);
 
   useEffect(() => {
@@ -111,13 +115,19 @@ export function ChatPage({
   const startTitleEdit = () => {
     if (!chat.currentId) return;
     setTitleDraft(heading?.title ?? '');
-    setEditingTitle(true);
+    setEditingTitleId(chat.currentId);
   };
 
   const commitTitle = async () => {
-    if (!chat.currentId) return;
-    await chat.renameSession(chat.currentId, titleDraft);
-    setEditingTitle(false);
+    if (!editingTitle || !editingTitleId || savingTitle || (titleRequired && !titleDraft.trim())) return;
+    setSavingTitle(true);
+    try {
+      if (await chat.renameSession(editingTitleId, titleDraft)) {
+        setEditingTitleId((current) => current === editingTitleId ? null : current);
+      }
+    } finally {
+      setSavingTitle(false);
+    }
   };
 
   const closePrompt = useCallback(() => {
@@ -168,6 +178,7 @@ export function ChatPage({
         }}
         onRename={chat.renameSession}
         onPin={chat.pinSession}
+        onMove={chat.moveSession}
         onNavigateSettings={onOpenSettings}
         onNavigatePersona={onOpenPersona}
         onLogout={onLogout}
@@ -188,18 +199,24 @@ export function ChatPage({
                 value={titleDraft}
                 maxLength={60}
                 aria-label="会话名称"
+                placeholder={titleRequired ? undefined : '使用渠道名称'}
+                disabled={savingTitle}
                 onChange={(event) => setTitleDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === 'Escape') setEditingTitle(false);
+                  if (event.key === 'Escape') setEditingTitleId(null);
                 }}
               />
-              <button type="submit" className="button button--small button--primary">
+              <button
+                type="submit"
+                className="button button--small button--primary"
+                disabled={savingTitle || (titleRequired && !titleDraft.trim())}
+              >
                 保存
               </button>
               <button
                 type="button"
                 className="button button--small"
-                onClick={() => setEditingTitle(false)}
+                onClick={() => setEditingTitleId(null)}
               >
                 取消
               </button>

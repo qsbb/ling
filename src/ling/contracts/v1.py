@@ -1489,6 +1489,7 @@ class SubjectRow(StrictModel):
     display_name: str
     trust_level: str
     merged_into: IdStr | None = None
+    can_rename: bool = False
     accounts: list[SubjectAccountOut] = Field(default_factory=list)
 
 

@@ -131,6 +131,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
   /** 展开中的那张卡片选中的目标。切换卡片时清掉，避免"带着上一个人的选择"提交。 */
   const [mergeTarget, setMergeTarget] = useState('');
   const [detailFor, setDetailFor] = useState<string | null>(null);
+  const [rename, setRename] = useState<{ subjectId: string; name: string } | null>(null);
 
   /**
    * 取一页并替换列表。`offset=0` 是首屏 / 刷新 / 换筛选词；
@@ -142,6 +143,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
     setMergeFor(null);
     setMergeTarget('');
     setDetailFor(null);
+    setRename(null);
     try {
       const data = await api.subjects({ limit: SUBJECTS_PAGE_SIZE, offset: 0, q: query });
       setSubjects(data.subjects);
@@ -189,9 +191,27 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
   };
 
   const openMergeFor = (subjectId: string) => {
+    setRename(null);
     setMergeFor((current) => (current === subjectId ? null : subjectId));
     setMergeTarget('');
     setMessage(null);
+  };
+
+  const saveName = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!rename?.name.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      await api.renameSubject(rename.subjectId, rename.name.trim());
+      setMessage('姓名已保存。');
+      await load(appliedSearch);
+    } catch (err) {
+      setError(explainError(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const merge = async (sourceId: string) => {
@@ -301,6 +321,23 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
             </button>
             {detailButton}
           </div>
+        ) : rename?.subjectId === subject.subject_id && subject.can_rename ? (
+          <form className="account-card__actions" onSubmit={(event) => void saveName(event)}>
+            <input
+              className="input input--small"
+              aria-label="自然人姓名"
+              value={rename.name}
+              maxLength={128}
+              disabled={busy}
+              onChange={(event) => setRename({ subjectId: subject.subject_id, name: event.target.value })}
+            />
+            <button type="submit" className="button button--small" disabled={busy || !rename.name.trim()}>
+              保存
+            </button>
+            <button type="button" className="button button--small" disabled={busy} onClick={() => setRename(null)}>
+              取消
+            </button>
+          </form>
         ) : isEditing ? (
           <div className="account-card__actions">
             {others.length === 0 ? (
@@ -347,6 +384,19 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
           </div>
         ) : (
           <div className="account-card__actions">
+            {subject.can_rename ? (
+              <button
+                type="button"
+                className="button button--small"
+                disabled={busy}
+                onClick={() => {
+                  setMergeFor(null);
+                  setRename({ subjectId: subject.subject_id, name: subject.display_name });
+                }}
+              >
+                改名
+              </button>
+            ) : null}
             <button
               type="button"
               className="button button--small"

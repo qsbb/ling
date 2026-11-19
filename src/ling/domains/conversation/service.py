@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import bindparam, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.errors import not_found
+from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, SessionRecord, TurnState
 from ling.infra.models import (
     ActorAccount,
@@ -106,11 +106,12 @@ def split_window_ref(ref: str) -> tuple[str, str, str] | None:
 def sort_windows_for_display(
     windows: Sequence[Window], familiarity: dict[str, float]
 ) -> list[Window]:
-    """会话展示顺序：**置顶 → 好感度 → 最近活跃**（都是倒序）。
+    """先按置顶分组，再按手动顺序、置顶时刻、好感度和最近活跃排序。
 
-    ## 三个键各自的"缺失值"排哪里
+    ## 排序键缺失值
 
     - ``pinned_at is None``（未置顶）→ 排在所有置顶之后；
+    - ``manual_order is None`` → 排在本组手动排序的窗口之后；
     - ``familiarity`` 不在字典里 → 视为 ``-inf``（排在所有已知好感度之后）；
     - ``updated_at`` 缺失 → 视为最旧。
 
@@ -127,12 +128,14 @@ def sort_windows_for_display(
     """
     import math
 
-    def key(window: Window) -> tuple[int, float, float, float, str]:
+    def key(window: Window) -> tuple[int, float, float, float, float, str]:
         pinned = getattr(window, "pinned_at", None)
+        manual_order = getattr(window, "manual_order", None)
         fam = familiarity.get(str(window.subject_id or ""))
         return (
             # 置顶的排 0（更靠前）；未置顶 1。
             0 if pinned is not None else 1,
+            manual_order if manual_order is not None else float("inf"),
             # 置顶时刻越晚越靠前；未置顶时这一位全等，交给好感度决定。
             -_timestamp(pinned) if pinned is not None else 0.0,
             # 好感度越大越靠前；未知给 -inf。
@@ -369,9 +372,8 @@ class ConversationService:
 
         ## 排序（用户原话：「置顶 + 其他按照好感度」）
 
-        1. **置顶优先**，置顶内部按 ``pinned_at`` 倒序（最近置顶的更靠上）；
-        2. **好感度倒序**（``familiarity``，查不到 = ``null`` 排最后）；
-        3. ``updated_at`` 倒序（最近有动静的更靠上）。
+        置顶与未置顶分别使用手动顺序。没有指定顺序的窗口按置顶时刻、
+        好感度和最近活跃排序。
 
         ## 为什么排序放在这里，而不是接口层
 
@@ -400,7 +402,7 @@ class ConversationService:
         return sort_windows_for_display(rows, familiarity or {})
 
     async def set_window_pinned(
-        self, window_id: str, *, subject_id: str, pinned: bool
+        self, window_id: str, *, subject_id: str, pinned: bool, operator: bool = False
     ) -> Window:
         """置顶 / 取消置顶（**幂等**：重复置顶只是刷新时刻，不报错）。
 
@@ -412,10 +414,72 @@ class ConversationService:
         位置，而它其实安静了一星期——列表看起来像自己乱动了。同理取消置顶
         也不改：会话应该回到它按好感度/活跃度本该在的位置，而不是"刚刚活跃过"。
         """
+        await self._lock_window_order(subject_id)
         window = await self.get_window(window_id, subject_id=subject_id)
-        window.pinned_at = utcnow() if pinned else None
-        await self._session.flush()
+        self._require_channel_editor(window, operator)
+        manual_order = None
+        if pinned:
+            first_rank = await self._session.scalar(
+                select(func.min(Window.manual_order)).where(
+                    Window.subject_id == subject_id,
+                    Window.archived.is_(False),
+                    Window.pinned_at.is_not(None),
+                    Window.id != window_id,
+                )
+            )
+            if first_rank is not None:
+                manual_order = first_rank - 1
+        await self._session.execute(
+            Window.__table__.update()
+            .where(Window.id == window_id)
+            .values(
+                pinned_at=utcnow() if pinned else None,
+                manual_order=manual_order,
+                updated_at=Window.updated_at,
+            )
+        )
+        await self._session.refresh(window)
         return window
+
+    async def _lock_window_order(self, subject_id: str) -> None:
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"ling-window-order:{subject_id}"},
+        )
+
+    async def move_window(
+        self, window_id: str, *, subject_id: str, anchor_id: str, before: bool
+    ) -> None:
+        """在同一置顶分组中，将会话放到指定会话之前或之后。"""
+        await self._lock_window_order(subject_id)
+        windows = await self.list_windows(subject_id)
+        by_id = {window.id: window for window in windows}
+        window = by_id.get(window_id)
+        anchor = by_id.get(anchor_id)
+        if window is None or anchor is None:
+            raise not_found("会话不存在")
+        if window_id == anchor_id or (window.pinned_at is None) != (anchor.pinned_at is None):
+            raise LingError(ErrorCode.invalid_request, "请选择同一分组的另一会话", status_code=422)
+
+        group = [
+            candidate
+            for candidate in sort_windows_for_display(windows, await self.familiarities(windows))
+            if (candidate.pinned_at is None) == (window.pinned_at is None)
+        ]
+        group.remove(window)
+        group.insert(group.index(anchor) + (0 if before else 1), window)
+        ranks = [
+            {"target_id": candidate.id, "rank": index}
+            for index, candidate in enumerate(group)
+            if candidate.manual_order != index
+        ]
+        if ranks:
+            await self._session.execute(
+                Window.__table__.update()
+                .where(Window.id == bindparam("target_id"))
+                .values(manual_order=bindparam("rank"), updated_at=Window.updated_at),
+                ranks,
+            )
 
     async def get_window(self, window_id: str, *, subject_id: str) -> Window:
         """读取窗口并校验归属；跨用户一律 404（不泄露存在性）。"""
@@ -451,6 +515,11 @@ class ConversationService:
             return window
         raise not_found("会话不存在")
 
+    @staticmethod
+    def _require_channel_editor(window: Window, operator: bool) -> None:
+        if window.channel != "web" and not operator:
+            raise LingError(ErrorCode.forbidden, "渠道会话需要管理员权限", status_code=403)
+
     async def update_window(
         self,
         window_id: str,
@@ -458,10 +527,25 @@ class ConversationService:
         subject_id: str,
         title: str | None = None,
         archived: bool | None = None,
+        operator: bool = False,
     ) -> Window:
         window = await self.get_window(window_id, subject_id=subject_id)
         if title is not None:
-            window.title = title.strip()[:MAX_TITLE_LEN] or DEFAULT_WINDOW_TITLE
+            name = title.strip()[:MAX_TITLE_LEN]
+            if "\x00" in name:
+                raise LingError(ErrorCode.invalid_request, "会话名称包含无效字符", status_code=422)
+            self._require_channel_editor(window, operator)
+            if window.channel == "web":
+                window.title = name or DEFAULT_WINDOW_TITLE
+            else:
+                await self._session.execute(
+                    Window.__table__.update()
+                    .where(Window.id == window_id)
+                    .values(display_name_override=name or None, updated_at=Window.updated_at)
+                )
+                await self._session.refresh(window)
+                if archived is None:
+                    return window
         if archived is not None:
             window.archived = archived
         window.updated_at = utcnow()
@@ -547,7 +631,7 @@ class ConversationService:
             updated_at=_as_utc(window.updated_at),
             message_count=window.message_count or 0,
             archived=bool(window.archived),
-            display_name=display_name,
+            display_name=window.display_name_override or display_name,
             channel=channel,
             peer_id=peer_id,
             pinned=getattr(window, "pinned_at", None) is not None,
@@ -555,7 +639,7 @@ class ConversationService:
         )
 
     async def peer_display_names(
-        self, windows: Sequence[Window]
+        self, windows: Sequence[Window], friend_names: dict[str, tuple[str, str]] | None = None
     ) -> dict[str, str | None]:
         """私聊窗口 id → 对端昵称（``subjects.display_name``）。群/网页窗口不出现。
 
@@ -576,24 +660,25 @@ class ConversationService:
         查不到（窗口指向的 subject 已不存在、名字是空白）就返回 ``None``，
         由前端回退——不编名字。
         """
-        wanted = {
-            w.subject_id
-            for w in windows
-            if w.subject_id and window_target(w)[1] == "private"
-        }
+        private = [window for window in windows if window_target(window)[1] == "private"]
+        wanted = {window.subject_id for window in private}
         if not wanted:
             return {}
         rows = (
             await self._session.execute(
-                select(Subject.id, Subject.display_name).where(Subject.id.in_(list(wanted)))
+                select(Subject.id, Subject.display_name, Subject.display_name_manual).where(
+                    Subject.id.in_(wanted)
+                )
             )
         ).all()
-        names = {subject_id: str(name or "").strip() for subject_id, name in rows}
-        return {
-            w.id: (names.get(w.subject_id) or None)
-            for w in windows
-            if window_target(w)[1] == "private"
-        }
+        subjects = {subject_id: ((name or "").strip(), manual) for subject_id, name, manual in rows}
+        friend_names = friend_names or {}
+        names: dict[str, str | None] = {}
+        for window in private:
+            name, manual = subjects.get(window.subject_id, ("", False))
+            remark, nickname = friend_names.get(window.id, ("", ""))
+            names[window.id] = remark or (name if manual else nickname or name) or None
+        return names
 
     # ---------------------------------------------------------- 轮次
 

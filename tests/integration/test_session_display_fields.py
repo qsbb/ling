@@ -227,6 +227,30 @@ async def test_private_window_uses_peer_nickname_as_title(logged_in: TestEnv) ->
     assert row["channel"] == "onebot"
 
 
+async def test_private_conversation_uses_manual_person_name_before_platform_nickname(
+    logged_in: TestEnv,  # noqa: F811
+) -> None:
+    class FriendNamesConnector(_GroupNameConnector):
+        remark: str | None = None
+
+        async def fetch_friend_names(self) -> dict:
+            return {SENDER_QQ: (self.remark, "渠道昵称")}
+
+    window_id = await _private_window(logged_in)
+    connector = FriendNamesConnector()
+    logged_in.app.state.onebot_connector = connector
+    path = f"/v1/sessions/{window_id}"
+    assert (await logged_in.client.get(path)).json()["display_name"] == "渠道昵称"
+
+    renamed = await logged_in.client.patch(
+        f"/v1/accounts/subjects/{logged_in.subject_id}", json={"display_name": "人工姓名"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert (await logged_in.client.get(path)).json()["display_name"] == "人工姓名"
+    connector.remark = "好友备注"
+    assert (await logged_in.client.get(path)).json()["display_name"] == "好友备注"
+
+
 async def test_private_window_without_nickname_stays_null(logged_in: TestEnv) -> None:  # noqa: F811
     """拿不到昵称（名字是空白）就返回 null，由前端回退「私聊 号码」——不编。"""
     await _rename_subject(logged_in.subject_id, "   ")
@@ -420,8 +444,8 @@ async def test_observe_only_group_message_says_why_it_cannot_speak(logged_in: Te
     assert "资格" in body["reason"], body
 
 
-async def test_group_window_title_is_not_used_as_display_name(logged_in: TestEnv) -> None:  # noqa: F811
-    """真实入站建的群窗口：title 是平台标识，采集不到群名时 display_name 为 null。"""
+async def test_channel_rename_preserves_the_inbound_routing_key(logged_in: TestEnv) -> None:  # noqa: F811
+    """渠道改名后，依赖旧 title 路由的下一条消息仍然落到原窗口。"""
     fake = FakeOneBot()
     _install(logged_in, fake)
     await _bind(logged_in)
@@ -444,9 +468,40 @@ async def test_group_window_title_is_not_used_as_display_name(logged_in: TestEnv
         ).scalars().first()
         assert window is not None
         window_id = window.id
+        window.connector_window_ref = None
 
     # FakeOneBot 对 get_group_info 回的是 data=None → 拿不到群名
     row = _session((await logged_in.client.get("/v1/sessions")).json(), window_id)
     assert row["display_name"] is None
     assert row["peer_id"] == "700000001"
     assert row["title"] == f"{CFG.instance_id}:group:700000001"
+
+    path = f"/v1/sessions/{window_id}"
+    renamed = await logged_in.client.patch(path, json={"title": "  晚饭讨论  "})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == row["title"]
+    assert renamed.json()["display_name"] == "晚饭讨论"
+    assert renamed.json()["peer_id"] == row["peer_id"]
+
+    received = await _post(
+        logged_in,
+        _event_body(
+            message_id=778,
+            message_type="group",
+            sub_type="normal",
+            group_id=700000001,
+            message="第二条群消息",
+            raw_message="第二条群消息",
+        ),
+    )
+    assert received.status_code == 200, received.text
+    history = await logged_in.client.get(f"{path}/messages")
+    assert any(msg["text"] == "第二条群消息" for msg in history.json()["messages"]), history.text
+    listed = _session((await logged_in.client.get("/v1/sessions")).json(), window_id)
+    assert listed["title"] == row["title"]
+    assert listed["display_name"] == "晚饭讨论"
+
+    cleared = await logged_in.client.patch(path, json={"title": " "})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["title"] == row["title"]
+    assert cleared.json()["display_name"] is None
