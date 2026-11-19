@@ -310,6 +310,21 @@ describe('Web 会话对话设置', () => {
     ]);
   }, 20000);
 
+  for (const width of [375, 1440]) {
+    it(`重复点击只切换同一个会话面板，宽度 ${width}`, async (ctx) => {
+      if (error) { console.warn(error); ctx.skip(); return; }
+      const { page } = await openChat('owner', width);
+      const button = page.getByRole('button', { name: '会话设置' });
+      const panel = page.locator('#active-window-policy .window-policy');
+      for (const count of [1, 0, 1, 0, 1]) {
+        await button.click();
+        await expect.poll(() => button.getAttribute('aria-expanded')).toBe(String(count === 1));
+        await expect.poll(() => panel.isVisible()).toBe(count === 1);
+        expect(await panel.count()).toBe(1);
+      }
+    }, 20000);
+  }
+
   it('成员看不到修改入口', async (ctx) => {
     if (error) { console.warn(error); ctx.skip(); return; }
     const { page } = await openChat('member', 1440);

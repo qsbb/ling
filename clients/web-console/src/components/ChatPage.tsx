@@ -49,7 +49,7 @@ export function ChatPage({
   const chat = useChat(sessionId, onTestMode);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
-  const [policyOpen, setPolicyOpen] = useState(false);
+  const [policy, setPolicy] = useState<{ sessionId: string; open: boolean } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
@@ -68,6 +68,9 @@ export function ChatPage({
   const promptEnabled = canOpenPromptSnapshot(user.role);
 
   const session = chat.sessions.find((item) => item.session_id === chat.currentId) ?? null;
+  const canEditPolicy = user.role === 'owner' && session !== null && !session.archived;
+  const policyMounted = canEditPolicy && policy?.sessionId === session.session_id;
+  const policyOpen = policyMounted && policy.open;
   // 标题给人看（群名/昵称），副标题留给机器键；读不到名字时按号码回退。
   const heading = session ? describeSession(session) : null;
   // 拆不出群/私聊的旧渠道窗口按私聊排（署名、靠左），不硬猜。
@@ -84,7 +87,7 @@ export function ChatPage({
 
   useEffect(() => {
     stickToBottom.current = true;
-    setPolicyOpen(false);
+    setPolicy(null);
   }, [chat.currentId]);
 
   useEffect(() => {
@@ -237,9 +240,17 @@ export function ChatPage({
                 生成中
               </span>
             ) : null}
-            {user.role === 'owner' && session && !session.archived ? (
-              <button type="button" className="ghost-button" onClick={() => setPolicyOpen((open) => !open)}
-                aria-expanded={policyOpen}>
+            {canEditPolicy ? (
+              <button
+                type="button"
+                className="ghost-button"
+                aria-expanded={policyOpen}
+                aria-controls="active-window-policy"
+                onClick={() => setPolicy((current) => ({
+                  sessionId: session.session_id,
+                  open: current?.sessionId !== session.session_id || !current.open,
+                }))}
+              >
                 会话设置
               </button>
             ) : null}
@@ -251,9 +262,13 @@ export function ChatPage({
           </div>
         </header>
 
-        {policyOpen && session ? (
-          <WindowPolicy key={session.session_id} sessionId={session.session_id} onClose={() => setPolicyOpen(false)} />
-        ) : null}
+        <div id="active-window-policy" hidden={!policyOpen}>
+          {policyMounted ? (
+            <WindowPolicy key={session.session_id} sessionId={session.session_id} onClose={() => {
+              setPolicy({ sessionId: session.session_id, open: false });
+            }} />
+          ) : null}
+        </div>
 
         {chat.loadError ? (
           <div className="load-error" role="alert">
