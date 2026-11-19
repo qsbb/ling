@@ -26,6 +26,7 @@ from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
+from ling.domains.memory.recall_query import should_skip_automatic_recall
 from ling.domains.memory.service import MemoryService, RecallResult
 from ling.domains.persona.service import PersonaService, format_traits, view_is_empty
 
@@ -757,6 +758,9 @@ class ContextCompiler:
         allowed = visibility_set(snapshot)
         if not snapshot.allows_long_term_memory():
             recall = RecallResult()
+        elif should_skip_automatic_recall(user_text):
+            recall = RecallResult()
+            compiled_meta["memory_recall_skipped"] = "low_information"
         else:
             from ling.domains.memory.service import wants_history
 
