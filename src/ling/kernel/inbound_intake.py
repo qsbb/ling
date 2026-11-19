@@ -313,10 +313,14 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
             group_mention_on_reply=settings.group_mention_on_reply,
             auto_register_private=settings.auto_register_private,
             observe_only=decision.verdict == OBSERVE_ONLY,
+            reply_when_addressed=decision.reply_when_addressed,
             persona_id=persona_id,
             trusted_instance_key=trusted_instance_key,
         )
         try:
+            enrich_display = getattr(connector, "enrich_inbound_display", None)
+            if not _asr_resume and callable(enrich_display):
+                envelope = await enrich_display(envelope, payload)
             if _asr_resume:
                 result = await bridge.handle(
                     envelope,
@@ -526,7 +530,9 @@ def _log_inbound_behavior(
     else:
         scene = "群聊" if is_group else "私聊"
 
-    preview = clip(next((p.text for p in envelope.parts if p.text and p.text.strip()), None), 60)
+    preview = clip(envelope.display_text or next(
+        (p.text for p in envelope.parts if p.text and p.text.strip()), None
+    ), 60)
     if not preview:
         media_types = {"image", "audio", "video"}
         media = next((p.modality for p in envelope.parts if p.modality in media_types), envelope.modality)

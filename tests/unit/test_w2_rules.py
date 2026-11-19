@@ -1795,7 +1795,7 @@ def test_deploy_compose_passes_feature_env_into_containers() -> None:
     required = {
         "LING_QQBOT_ENABLED", "LING_QQBOT_APP_ID", "LING_QQBOT_CLIENT_SECRET",
         "LING_QQBOT_INSTANCE_ID", "LING_QQBOT_SANDBOX", "LING_QQBOT_PROACTIVE",
-        "LING_ACCESS_MODE", "LING_ACCESS_LIST", "LING_USER_TIMEZONE",
+        "LING_ACCESS_MODE", "LING_ACCESS_LIST", "LING_ACCESS_GROUPS", "LING_USER_TIMEZONE",
         "LING_ONEBOT_API_BASE", "LING_ONEBOT_SELF_ID", "LING_ONEBOT_INSTANCE_ID",
         "LING_ONEBOT_SECRET",
         # 反向 WS 服务端三件套：原来**一项都没列**，于是设了也进不了容器，
@@ -1854,7 +1854,7 @@ def test_deploy_env_example_documents_them_too() -> None:
     from pathlib import Path
 
     text = Path("deploy/env.example").read_text()
-    for key in ("LING_QQBOT_APP_ID", "LING_QQBOT_CLIENT_SECRET", "LING_ACCESS_LIST",
+    for key in ("LING_QQBOT_APP_ID", "LING_QQBOT_CLIENT_SECRET", "LING_ACCESS_LIST", "LING_ACCESS_GROUPS",
                 "LING_USER_TIMEZONE", "LING_ONEBOT_SECRET",
                 "LING_ONEBOT_WS_PORT", "LING_ONEBOT_WS_TOKEN", "LING_ONEBOT_WS_HOST",
                 "LING_ONEBOT_WS_URL"):

@@ -344,7 +344,7 @@ QQBOT_FIELDS: tuple[FieldSpec, ...] = (
     _switch("LING_QQBOT_SUPPORTS_GROUP", SCOPE_QQBOT, "声明支持群聊", default=True),
 )
 
-# --- 白名单：2 项（设计 §3；`LING_ACCESS_GROUPS` 本轮仍走 env）---
+# --- 出入许可 ---
 
 ACCESS_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec(
@@ -358,6 +358,7 @@ ACCESS_FIELDS: tuple[FieldSpec, ...] = (
         control="select",
     ),
     _list("LING_ACCESS_LIST", SCOPE_ACCESS, "发送者白名单（QQ 号，按字符串比较）", max_len=32),
+    _list("LING_ACCESS_GROUPS", SCOPE_ACCESS, "群聊白名单（按群标识匹配）"),
 )
 
 REGISTRY: tuple[FieldSpec, ...] = (*ONEBOT_FIELDS, *QQBOT_FIELDS, *ACCESS_FIELDS)

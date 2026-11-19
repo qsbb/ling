@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import secrets
@@ -285,6 +286,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _access_effective = await _ov.current_access_snapshot(session, settings=settings)
 
     app.state.access_snapshot = _access_effective
+    app.state.settings = dataclasses.replace(
+        settings,
+        access_mode=_access_effective.mode,
+        access_list=_access_effective.allow_list,
+        access_groups=_access_effective.allow_groups,
+    )
     connector_runtime = ConnectorRuntime(app)
     app.state.connector_runtime = connector_runtime
     async def _start_onebot(values: dict, instance_id: str) -> dict:
@@ -350,7 +357,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         `kernel/inbound_intake` 的授权判断读的是 ``app.state.settings``；
         这里用 ``dataclasses.replace`` 造一份新的 frozen Settings，只改
-        ``access_mode`` / ``access_list``，然后**一次赋值**换上去。
+        出入许可的模式和名单，然后**一次赋值**换上去。
 
         为什么用替换而不是"让入站自己去查 DB"：
         - 入站路径在每条消息上，加一次 DB 查询是白给；
@@ -360,8 +367,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         赋值是同步的（中间没有 await），所以在 asyncio 单线程里对其他协程
         原子可见——不会出现"验签读旧 token、授权读新名单"。
         """
-        import dataclasses
-
         from ling.settings import connector_fields as _cf2
 
         old_settings = app.state.settings
@@ -369,12 +374,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             old_settings,
             access_mode=str(values.get("LING_ACCESS_MODE") or "off"),
             access_list=frozenset(_cf2.normalize_list(values.get("LING_ACCESS_LIST"))),
+            access_groups=frozenset(_cf2.normalize_list(values.get("LING_ACCESS_GROUPS"))),
         )
         app.state.settings = new_settings
-        async with session_scope() as session:
-            app.state.access_snapshot = await _ov.current_access_snapshot(
-                session, settings=new_settings
-            )
         logger.info(
             "出入许可已生效 mode=%s 名单=%d 人",
             new_settings.access_mode,
@@ -400,7 +402,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     connector_runtime.register(
         _cf.SCOPE_ACCESS, _plan_access,
         values={"LING_ACCESS_MODE": _access_effective.mode,
-                "LING_ACCESS_LIST": sorted(_access_effective.allow_list)},
+                "LING_ACCESS_LIST": sorted(_access_effective.allow_list),
+                "LING_ACCESS_GROUPS": sorted(_access_effective.allow_groups)},
     )
 
     from ling.infra.models import DEFAULT_INSTANCE_ID, ConnectorConfigHead, ConnectorInstance
@@ -557,6 +560,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/api/openapi.json" if settings.env != "production" else None,
     )
     app.state.settings = settings
+    app.state.connector_config_baseline = settings
     app.add_exception_handler(LingError, ling_error_handler)  # type: ignore[arg-type]
     # 记忆端点（`/v1/memory*`、`/v1/core-memory*`）的 422 统一成
     # ErrorResponse；其它路径仍是 FastAPI 默认的 `{"detail":[...]}`。

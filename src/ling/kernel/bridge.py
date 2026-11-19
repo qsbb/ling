@@ -360,6 +360,7 @@ class InboundBridge:
         # 与 `_defer_group_attention` 的区别：那个是**配置**说"群消息先放着"，
         # 这个是**这条消息**没有回复资格——哪怕配置允许立即回，也不该开口。
         observe_only: bool = False,
+        reply_when_addressed: bool = False,
         # 由可信路由或网关传入稳定实例身份，不从账号命名空间推断。
         trusted_instance_key: tuple[str, str] | None = None,
         # ``None`` = 用**当前激活**的人格（`domains/persona/current.py`，
@@ -383,6 +384,7 @@ class InboundBridge:
         self._group_mention_on_reply = group_mention_on_reply
         self._auto_register_private = auto_register_private
         self._observe_only = observe_only
+        self._reply_when_addressed = reply_when_addressed
         self._trusted_instance_key = trusted_instance_key
         self._persona_id = persona_id
         self._actor_id = actor_id
@@ -525,6 +527,7 @@ class InboundBridge:
         text = "".join(
             part.text or "" for part in envelope.parts if part.modality.value == "text"
         ).strip()
+        display_text = (envelope.display_text or text).strip()
 
         # 媒体必须在文本判断**之前**登记，否则纯图片消息会被整条丢掉，
         # 连"收到过一张图"都留不下痕迹，描述任务也就无从捡起。
@@ -546,6 +549,9 @@ class InboundBridge:
             channel_mentioned=envelope.mentions_actor,
             replied_to_actor=bool(envelope.reply_to),
         )
+        observe = self._observe_only and not (
+            self._reply_when_addressed and envelope.mentions_actor
+        )
 
         audio_ids = []
         if has_new_audio:
@@ -557,7 +563,7 @@ class InboundBridge:
                 evidence = await svc.get(eid, window_id=window.id)
                 if evidence is not None and evidence.kind == "audio":
                     audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
-            if audio_ids and (not is_group or addressed):
+            if audio_ids and not observe and (not is_group or addressed):
                 effective = runtime_snapshot.config
                 try:
                     job = await create_job(
@@ -588,7 +594,7 @@ class InboundBridge:
 
         # 群里被 @ 但**没有正文**：等对方补一句。
         # QQ 里「先 @ 再发正文」很常见，立刻决策只能看到孤零零一个 @。
-        if is_group and addressed and not text.strip() and not media_ids:
+        if is_group and addressed and not observe and not text.strip() and not media_ids:
             from ling.domains.attention.service import GroupAttentionScheduler
 
             conversation = ConversationService(
@@ -597,7 +603,7 @@ class InboundBridge:
             pending_row = await conversation.adopt_input(
                 resume_message_id, window.id,
                 role="user",
-                text=text,
+                text=display_text,
                 attention_state="unseen",
                 # 群窗口是多个人的：不记谁说的，之后就没法回指"你刚问的"
                 sender_subject_id=subject_id,
@@ -657,7 +663,6 @@ class InboundBridge:
         # 不看 `_defer_group_attention` 的配置——那个开关是"要不要把普通群消息
         # 先放着"，管的是策略；这里管的是资格（这个人/这个群有没有资格让她
         # 主动说话）。把两件事合并，配置一改就会让陌生人获得发言权。
-        observe = self._observe_only
         plain_group = is_group and not addressed and not _looks_urgent(text)
         if observe or (plain_group and await self._defer_group_attention()):
             conversation = ConversationService(
@@ -666,7 +671,7 @@ class InboundBridge:
             observed_row = await conversation.adopt_input(
                 resume_message_id, window.id,
                 role="user",
-                text=text,
+                text=display_text,
                 attention_state="unseen",
                 sender_subject_id=subject_id,
             )
@@ -711,7 +716,7 @@ class InboundBridge:
             msg = await conversation.adopt_input(
                 resume_message_id, window.id,
                 role="user",
-                text=text,
+                text=display_text,
                 handled_as="ignored",
                 handled_reason=decision.reason,
                 sender_subject_id=subject_id,
@@ -813,7 +818,7 @@ class InboundBridge:
         user_row = await conversation.adopt_input(
             resume_message_id, window.id,
             role="user",
-            text=text,
+            text=display_text,
             turn_id=turn.id,
             handled_as="replied",
             handled_reason=decision.reason,

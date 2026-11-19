@@ -262,7 +262,9 @@ def validate_full(scope: str, values: dict[str, Any]) -> None:
             )
     if scope == cf.SCOPE_ACCESS:
         mode = str(values.get("LING_ACCESS_MODE") or "off").strip()
-        if mode == "whitelist" and not cf.normalize_list(values.get("LING_ACCESS_LIST")):
+        if mode == "whitelist" and not any(cf.normalize_list(values.get(key)) for key in (
+            "LING_ACCESS_LIST", "LING_ACCESS_GROUPS",
+        )):
             raise ConnectorServiceError(
                 "invalid_config",
                 "白名单模式但名单是空的：这样谁都不能跟她说话",

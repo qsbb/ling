@@ -59,6 +59,8 @@ class ParsedMessage:
     """解析结果：给模型看的文本 + 结构化元信息。"""
 
     text: str = ""
+    display_text: str = ""
+    mention_ids: list[str] = field(default_factory=list)
     parts: list[InputPart] = field(default_factory=list)
     media_refs: list[str] = field(default_factory=list)
     # 是否 @ 了机器人自己（群聊接话判断的关键线索）
@@ -88,52 +90,55 @@ def _parse_cq_params(raw: str) -> dict[str, str]:
     return out
 
 
-def parse_message(message: object, *, self_id: str | None = None) -> ParsedMessage:
+def parse_message(message: object, *, self_id: str | None = None,
+                  mention_names: dict[str, str] | None = None) -> ParsedMessage:
     """解析 OneBot 的 message 字段（字符串或数组）。"""
     if isinstance(message, str):
-        return _parse_string(message, self_id=self_id)
+        return _parse_string(message, self_id=self_id, names=mention_names or {})
     if isinstance(message, list):
-        return _parse_array(message, self_id=self_id)
+        return _parse_array(message, self_id=self_id, names=mention_names or {})
     return ParsedMessage()
 
 
-def _parse_string(message: str, *, self_id: str | None) -> ParsedMessage:
+def _parse_string(message: str, *, self_id: str | None, names: dict[str, str]) -> ParsedMessage:
     result = ParsedMessage()
     cursor = 0
     for match in _CQ_RE.finditer(message):
         if match.start() > cursor:
             _append_text(result, _cq_unescape(message[cursor : match.start()]))
-        _handle_segment(result, match.group(1), _parse_cq_params(match.group(2)), self_id)
+        _handle_segment(result, match.group(1), _parse_cq_params(match.group(2)), self_id, names)
         cursor = match.end()
     if cursor < len(message):
         _append_text(result, _cq_unescape(message[cursor:]))
     return result
 
 
-def _parse_array(segments: list[object], *, self_id: str | None) -> ParsedMessage:
+def _parse_array(segments: list[object], *, self_id: str | None, names: dict[str, str]) -> ParsedMessage:
     result = ParsedMessage()
     for seg in segments:
         if not isinstance(seg, dict):
             continue
         seg_type = str(seg.get("type") or "")
         data = seg.get("data")
-        _handle_segment(result, seg_type, data if isinstance(data, dict) else {}, self_id)
+        _handle_segment(result, seg_type, data if isinstance(data, dict) else {}, self_id, names)
     return result
 
 
 def _handle_segment(
-    result: ParsedMessage, seg_type: str, data: dict, self_id: str | None
+    result: ParsedMessage, seg_type: str, data: dict, self_id: str | None, names: dict[str, str]
 ) -> None:
     if seg_type == "text":
         _append_text(result, str(data.get("text") or ""))
     elif seg_type == "at":
         qq = str(data.get("qq") or "")
+        if qq and qq != "all":
+            result.mention_ids.append(qq)
         if self_id and qq == str(self_id):
             result.mentions_self = True
-            # @机器人 本身不该作为正文喂给模型（"@ling 你好" → "你好"）
+            result.display_text += f"@{names.get(qq, qq)}"
             return
         if qq and qq != "all":
-            _append_text(result, f"@{qq}")
+            _append_text(result, f"@{names.get(qq, qq)}")
     elif seg_type == "reply":
         reply_id = data.get("id")
         if reply_id is not None:
@@ -188,6 +193,7 @@ def _append_text(result: ParsedMessage, text: str) -> None:
     if not text:
         return
     result.text += text
+    result.display_text += text
 
 
 def build_text_segments(text: str) -> list[dict]:

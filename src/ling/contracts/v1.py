@@ -357,6 +357,8 @@ class InteractionEnvelope(StrictModel):
     )
     modality: Modality = Modality.text
     parts: list[InputPart] = Field(default_factory=list)
+    # 文本片段用于决策；这里保留不算正文的显示内容（例如给角色自己的 @）。
+    display_text: str | None = None
     reply_to: IdStr | None = None
     media_refs: list[MediaRef] = Field(
         default_factory=list,

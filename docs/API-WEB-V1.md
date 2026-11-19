@@ -420,7 +420,7 @@ DB 已生效覆盖  >  进程启动时的 env 快照  >  代码默认值
 | `editable` | owner 为 true；非 owner 只读 |
 
 字段清单是**服务端白名单**（`ling/settings/connector_fields.py`，onebot 12 项 /
-qqbot 12 项 / access 2 项）。请求里出现白名单之外的键（`LING_ROOT_KEY`、
+qqbot 12 项 / access 3 项）。请求里出现白名单之外的键（`LING_ROOT_KEY`、
 `DATABASE_URL`…）一律 `422 invalid_field`——不能把"任意环境变量写入"开成口子。
 
 #### 保存
@@ -447,6 +447,10 @@ qqbot 12 项 / access 2 项）。请求里出现白名单之外的键（`LING_RO
 `stop()`/`start()` 绝不在事务里，否则拿着行锁等网络。切换失败时用**旧配置重新
 构造**一份（旧对象 stop 之后不保证能再 start，见设计 §4），并让
 `app.state` 继续指向可用的那份。
+
+`access` 支持发送者名单 `LING_ACCESS_LIST` 和群聊名单 `LING_ACCESS_GROUPS`。
+群名单只在 `whitelist` 模式生效：名单内的群可响应真实的 @，不会让普通群消息主动触发回复。
+保存 `[]` 表示显式清空名单；用 `clear` 才回到启动配置。
 
 **白名单不需要重连**：它换掉进程里的 `Settings` 快照（一次赋值，asyncio 单线程里
 原子可见），入站判断下一条消息就按新名单走。这样不会出现"验签读旧 token、授权读

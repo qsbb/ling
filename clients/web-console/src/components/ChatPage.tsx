@@ -281,7 +281,10 @@ export function ChatPage({
 
         <div id="active-window-policy" hidden={!policyOpen}>
           {policyMounted ? (
-            <WindowPolicy key={session.session_id} sessionId={session.session_id} onClose={() => {
+            <WindowPolicy key={session.session_id} sessionId={session.session_id}
+              accessTarget={(heading?.kind === 'group' || heading?.kind === 'private') && session.peer_id
+                ? { kind: heading.kind, id: session.peer_id }
+                : undefined} onClose={() => {
               setPolicy({ sessionId: session.session_id, open: false });
             }} />
           ) : null}

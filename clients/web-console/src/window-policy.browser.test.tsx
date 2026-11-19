@@ -147,6 +147,7 @@ async function openChat(
   width: number,
   originStatus: 'known' | 'unknown' | 'not_applicable' = 'not_applicable',
   channel: 'web' | 'onebot' | 'qqbot' = 'web',
+  peerId?: string,
 ) {
   if (!browser) throw new Error(error ?? '浏览器未启动');
   const context = await browser.newContext({ viewport: { width, height: 850 } });
@@ -163,7 +164,7 @@ async function openChat(
     const req = route.request();
     const path = new URL(req.url()).pathname;
     if (path === '/v1/auth/me') return route.fulfill(json({ user: { id: 'u', username: 'test', role, subject_id: 's', display_name: '用户' }, test_mode: false }));
-    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: '测试', channel, peer_id: null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
+    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: peerId ? `onebot-test:group:${peerId}` : '测试', channel, peer_id: peerId ?? null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
     if (path === '/v1/sessions/w/messages') return route.fulfill(json({ messages: [], active_turn: null }));
     if (path === '/v1/personas') return route.fulfill(json({ items: [{ id: 'p-global', persona_id: 'p-global', name: 'default', display_name: '全局人格' }], active_persona_id: 'p-global', total: 1 }));
     if (path === '/v1/sessions/w/dialogue-policy' && req.method() === 'GET') {
@@ -228,6 +229,41 @@ async function openChat(
 }
 
 describe('Web 会话对话设置', () => {
+  it('快捷加入和移除当前群，不覆盖其他群或发送者', async (ctx) => {
+    if (error) { console.warn(error); ctx.skip(); return; }
+    const { page } = await openChat('owner', 375, 'known', 'onebot', '100200300');
+    let groups = ['100200301'];
+    let generation = 4;
+    const writes: unknown[] = [];
+    await page.route('**/v1/settings/connectors', (route) => route.fulfill(json({ access: {
+      editable: true, generation, fields: [
+        { key: 'LING_ACCESS_MODE', value: 'whitelist' },
+        { key: 'LING_ACCESS_LIST', value: ['100200302'] },
+        { key: 'LING_ACCESS_GROUPS', value: groups },
+      ],
+    } })));
+    await page.route('**/v1/settings/connectors/access', (route) => {
+      const req = route.request();
+      const body = req.postDataJSON() as { set: { LING_ACCESS_GROUPS: string[] } };
+      writes.push({ method: req.method(), generation: req.headers()['if-match'], body });
+      groups = body.set.LING_ACCESS_GROUPS;
+      generation += 1;
+      return route.fulfill(json({ state: 'active', generation }));
+    });
+    await page.getByRole('button', { name: '会话设置' }).click();
+    const control = page.getByRole('checkbox', { name: '本群在白名单中' });
+    await expect.poll(() => control.isEnabled()).toBe(true);
+    expect(await control.isChecked()).toBe(false);
+    await control.click();
+    await expect.poll(async () => await control.isEnabled() && await control.isChecked()).toBe(true);
+    await control.click();
+    await expect.poll(async () => await control.isEnabled() && !(await control.isChecked())).toBe(true);
+    expect(writes).toEqual([
+      { method: 'PUT', generation: '4', body: { set: { LING_ACCESS_GROUPS: ['100200301', '100200300'] }, clear: [] } },
+      { method: 'PUT', generation: '5', body: { set: { LING_ACCESS_GROUPS: ['100200301'] }, clear: [] } },
+    ]);
+  }, 20000);
+
   for (const width of [375, 1440]) {
     it(`逐字段显示来源并预览保存 set 与 clear，宽度 ${width}`, async (ctx) => {
       if (error) { console.warn(error); ctx.skip(); return; }

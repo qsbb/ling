@@ -873,7 +873,7 @@ async def get_connectors(
         views.append(view)
     field_views = await _connector_field_views(
         session,
-        settings=settings,
+        settings=request.app.state.connector_config_baseline,
         app_state=request.app.state,
         include_sensitive=is_owner,
         instances=live,
@@ -1006,9 +1006,18 @@ def _connector_service(request: Request, auth: object, session: AsyncSession):  
 
     app_state = request.app.state
     return ConnectorConfigService(
-        settings=app_state.settings,
+        settings=app_state.connector_config_baseline,
         box=getattr(app_state, "secret_box", None),
         runtime=getattr(app_state, "connector_runtime", None),
+    )
+
+
+async def _refresh_access_snapshot(request: Request, session: AsyncSession) -> None:
+    from ling.settings.connector_overrides import current_access_snapshot
+
+    state = request.app.state
+    state.access_snapshot = await current_access_snapshot(
+        session, settings=state.connector_config_baseline
     )
 
 
@@ -1387,6 +1396,9 @@ async def put_connector_config(
             field=exc.field_name,
         ) from exc
 
+    if scope == cf.SCOPE_ACCESS and result.state == OP_ACTIVE:
+        await _refresh_access_snapshot(request, session)
+
     # 审计：只记字段名 + 指纹 + 结果，**绝不写值或预览**（设计 §6）。
     if result.changed or result.state not in {OP_UNCHANGED}:
 
@@ -1495,6 +1507,7 @@ async def reset_connector_config(
     """
     from ling.settings import connector_fields as cf
     from ling.settings.connector_service import (
+        OP_ACTIVE,
         OP_DEGRADED,
         OP_ROLLED_BACK,
         OP_UNCHANGED,
@@ -1541,6 +1554,8 @@ async def reset_connector_config(
             continue
         if result.state in {OP_ROLLED_BACK, OP_DEGRADED}:
             failed = True
+        if scope == cf.SCOPE_ACCESS and result.state == OP_ACTIVE:
+            await _refresh_access_snapshot(request, session)
         results.append(
             {
                 "scope": scope,
