@@ -39,14 +39,14 @@
 
 | 脚本 | 真数据库 | 输出目录默认 | 备注 |
 | --- | --- | --- | --- |
-| `memory_browser.mjs` | 是（自建一次性库） | `<tmp>/ling-e2e/memory-<运行 id>` | 40 项；含 real-403 / real-500 |
+| `memory_browser.mjs` | 是（自建一次性库） | `<tmp>/ling-e2e/memory-<运行 id>` | 15 项；覆盖记忆详情、核心记忆编辑与停用、撤回与纠正、真实 worker 物理删除、学习设置、real-403 / real-500。含桌面与手机截图。拒绝 `BASE_URL` / `API_BASE`；worktree 可用 `E2E_PYTHON=/abs/path/to/venv/bin/python`。 |
 | `nav_browser.mjs` | 是（自建一次性库） | `<tmp>/ling-e2e/nav-<运行 id>` | 36 项 |
 | `w0_browser.mjs` | 是（自建一次性库；默认自起栈） | `<tmp>/ling-e2e/w0-<运行 id>` | 51 项；会写库，故默认自起栈、拒绝 8080 |
 | `dashboard_browser.mjs` | 否（`/v1/**` 全 mock） | `<tmp>/ling-e2e/dashboard-<运行 id>` | 92 项 |
 | `update_browser.mjs` | 否（`/v1/**` 全 mock） | `<tmp>/ling-e2e/update-<运行 id>` | 预览构建产物 |
 
 > 上表的「N 项」是**实测**数字（`exit 0` 时的汇总行），不是设计稿里的旧值：
-> memory 40 / nav 36 / w0 51 / dashboard 92。新增或删除断言时请同步这一列。
+> memory 15 / nav 36 / w0 51 / dashboard 92。新增或删除断言时请同步这一列。
 
 ## 已知坑（防未来误红）
 
