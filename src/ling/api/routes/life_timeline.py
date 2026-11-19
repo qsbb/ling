@@ -125,7 +125,7 @@ NOTE_UNAVAILABLE = "暂时无法读取时间轴"
 NOTE_DREAM_RESTRICTED = "梦是角色私有内容，你看不到正文"
 
 REASON_EXPLANATIONS = {
-    "model_unavailable": "生成时没有可用的模型。",
+    "model_unavailable": "日程生成需要可用的「记忆提取」（memory.extract）模型，请在设置中检查职责绑定。",
     "model_timeout": "生成日程时模型请求超时。",
     "model_error": "生成日程时模型调用发生错误。",
     "outline_invalid": "模型生成的日程未通过校验。",

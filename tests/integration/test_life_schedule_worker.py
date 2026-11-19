@@ -40,6 +40,7 @@ from ling.infra.models import (
     DayPlanRow,
     DreamReportRow,
     OutboxEvent,
+    ScheduleSegmentRow,
     SleepSettlementRow,
 )
 from ling.infra.security import new_id
@@ -86,8 +87,10 @@ async def _seed_routine(revision: int = 1) -> None:
 def _freeze(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
     """把 worker 的 `utcnow` 固定住，并钉住规范时区（不读开发机 shell）。"""
     from ling import worker
+    from ling.domains.agenda import timeline
 
     monkeypatch.setattr(worker, "utcnow", lambda: moment)
+    monkeypatch.setattr(timeline, "utcnow", lambda: moment)
     monkeypatch.setenv("LING_USER_TIMEZONE", TZ)
 
 
@@ -156,9 +159,11 @@ class _CountingRouter:
     def __init__(self, text: str = "") -> None:
         self._text = text
         self.calls = 0
+        self.prompts: list[str] = []
 
     async def stream(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         self.calls += 1
+        self.prompts.append(_kwargs["messages"][0].content)
         text = self._text
         yield ModelChunk(delta=text), StreamOutcome()
         yield ModelChunk(done=True), StreamOutcome(text=text)
@@ -194,16 +199,16 @@ def _usable_config() -> EffectiveConfig:
     )
 
 
-def _valid_outline(day: date) -> str:
-    """一段落在清醒时段（09:00–10:00）、不压睡眠锚点的大纲。"""
+def _valid_outline(day: date, start_hour: int = 9) -> str:
+    """一段落在清醒时段、不压睡眠锚点的大纲。"""
     return json.dumps(
         {
             "segments": [
                 {
                     "kind": "work",
                     "title": "写代码",
-                    "start_at": local_minute_instant(day, 9 * 60, TZ).isoformat(),
-                    "end_at": local_minute_instant(day, 10 * 60, TZ).isoformat(),
+                    "start_at": _at(day, start_hour * 60).isoformat(),
+                    "end_at": _at(day, (start_hour + 1) * 60).isoformat(),
                     "place_id": None,
                     "flexibility": "flexible",
                 }
@@ -408,6 +413,201 @@ async def test_delayed_due_event_downgrades_to_late(
     assert row is not None
     assert row.state == "degraded"
     assert row.last_error_code == REASON_DEGRADED_LATE
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_manual_outline_after_wake_uses_only_remaining_window(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch, expired: bool,
+) -> None:
+    from ling import worker
+    from ling.domains.agenda.outline_jobs import enqueue_manual_outline
+
+    await _seed_routine()
+    time_now = _at(TOMORROW if expired else LOCAL_DAY, 10 * 60)
+    _freeze(monkeypatch, time_now)
+    router = _CountingRouter(text=_valid_outline(LOCAL_DAY, start_hour=12))
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
+    monkeypatch.setattr(worker, "_config_reader", lambda _session: _StubConfig(_usable_config()))
+    async with session_scope() as session:
+        await enqueue_manual_outline(
+            session, actor_id=ACTOR, plan_day=LOCAL_DAY, force=False, now=time_now,
+        )
+        await session.commit()
+    event, = await _outbox("schedule.outline")
+    await worker.handle_schedule_outline(event.payload)
+
+    row = await _day_plan(LOCAL_DAY)
+    assert row is not None
+    if expired:
+        assert router.calls == 0
+        assert row.last_error_code == REASON_DEGRADED_LATE
+    else:
+        assert router.calls == 1
+        assert row.state == "ready"
+        async with session_scope() as session:
+            segment, = (await session.scalars(select(ScheduleSegmentRow).where(
+                ScheduleSegmentRow.plan_id == row.id, ScheduleSegmentRow.title == "写代码",
+            ))).all()
+        assert segment.start_at == _at(LOCAL_DAY, 12 * 60) > time_now
+
+
+async def test_boundary_recovery_retries_remaining_day_with_active_persona(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling import worker
+    from ling.domains.agenda.timeline import (
+        OUTLINE_RECOVERY_LEAD_MINUTES,
+        OUTLINE_RECOVERY_STEP_MINUTES,
+    )
+
+    async def activate(name: str, interest: str) -> None:
+        persona = await logged_in.client.post("/v1/personas", json={
+            "display_name": name, "system_prompt": f"完整人设正文{name}",
+            "traits": {"interests": interest}, "boundaries": ["不在周末加班"],
+        })
+        assert persona.status_code == 201, persona.text
+        activated = await logged_in.client.post(f"/v1/personas/{persona.json()['persona_id']}/activate")
+        assert activated.status_code == 200, activated.text
+
+    await activate("甲", "玩风筝")
+    await _seed_routine()
+    await _insert_day_plan(LOCAL_DAY, state="degraded", revision=1, error_code=REASON_DEGRADED_LATE)
+    first = WAKE_MINUTE + OUTLINE_RECOVERY_STEP_MINUTES
+    second = first + OUTLINE_RECOVERY_STEP_MINUTES
+    monkeypatch.setattr(worker, "_config_reader", lambda _session: _StubConfig(_usable_config()))
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", None)
+
+    _freeze(monkeypatch, _at(LOCAL_DAY, first - OUTLINE_RECOVERY_LEAD_MINUTES - 1))
+    await worker.handle_life_schedule({})
+    assert await _outbox("schedule.outline") == []
+
+    async def take_boundary(minute: int):
+        _freeze(monkeypatch, _at(LOCAL_DAY, minute - OUTLINE_RECOVERY_LEAD_MINUTES))
+        await worker.handle_life_schedule({})
+        await worker.handle_life_schedule({})
+        claim = await worker.claim_next_outbox_event(only_topic="schedule.outline")
+        assert claim is not None
+        assert claim.payload["recovery_before"] == _at(LOCAL_DAY, minute).isoformat()
+        return claim
+
+    claim = await take_boundary(first)
+    await worker.handle_schedule_outline(claim.payload)
+    failed = await _day_plan(LOCAL_DAY)
+    assert failed is not None and failed.last_error_code == "model_unavailable"
+
+    await activate("乙", "烧制青瓷")
+
+    class PersonaRouter(_CountingRouter):
+        async def stream(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            outline = json.loads(_valid_outline(LOCAL_DAY, start_hour=15))
+            prompt = kwargs["messages"][0].content
+            outline["segments"][0]["title"] = "烧制青瓷" if "烧制青瓷" in prompt else "玩风筝"
+            self._text = json.dumps(outline, ensure_ascii=False)
+            async for chunk in super().stream(*args, **kwargs):
+                yield chunk
+
+    router = PersonaRouter()
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
+    # The first worker committed its fallback but the outbox is still unacknowledged.
+    await worker.handle_schedule_outline(claim.payload)
+    replayed = await _day_plan(LOCAL_DAY)
+    assert router.calls == 0 and replayed is not None and replayed.revision == failed.revision
+    await worker.settle_outbox_event(claim, ok=True)
+    await worker.handle_life_schedule({})
+    assert len(await _outbox("schedule.outline")) == 1
+
+    claim = await take_boundary(second)
+    assert router.calls == 0
+    await worker.handle_schedule_outline(claim.payload)
+    await worker.settle_outbox_event(claim, ok=True)
+    assert router.calls == 1
+    prompt, = router.prompts
+    assert "烧制青瓷" in prompt and "不在周末加班" in prompt
+    assert "玩风筝" not in prompt and "完整人设正文" not in prompt
+    recovered = await _day_plan(LOCAL_DAY)
+    assert recovered is not None and recovered.state == "ready"
+    async with session_scope() as session:
+        segment, = (await session.scalars(select(ScheduleSegmentRow).where(
+            ScheduleSegmentRow.plan_id == recovered.id, ScheduleSegmentRow.source == "model",
+        ))).all()
+    assert segment.start_at == _at(LOCAL_DAY, 15 * 60)
+    assert segment.title == "烧制青瓷"
+    _freeze(monkeypatch, _at(LOCAL_DAY, second + OUTLINE_RECOVERY_STEP_MINUTES - 1))
+    await worker.handle_life_schedule({})
+    assert len(await _outbox("schedule.outline")) == 2
+
+
+@pytest.mark.parametrize("missed", [False, True])
+async def test_recovery_rejects_earlier_segments_or_stale_jobs(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch, missed: bool,
+) -> None:
+    from ling import worker
+    from ling.domains.agenda.timeline import OUTLINE_MAX_CALLS, OUTLINE_RECOVERY_STEP_MINUTES
+
+    await _seed_routine()
+    boundary = WAKE_MINUTE + OUTLINE_RECOVERY_STEP_MINUTES
+    # No existing plan row: boot the worker during the first recovery window.
+    _freeze(monkeypatch, _at(LOCAL_DAY, boundary - 10))
+    early = json.loads(_valid_outline(LOCAL_DAY))
+    early["segments"][0]["start_at"] = _at(LOCAL_DAY, boundary - 5).isoformat()
+    early["segments"][0]["end_at"] = _at(LOCAL_DAY, boundary + 60).isoformat()
+    router = _CountingRouter(text=json.dumps(early))
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
+    monkeypatch.setattr(worker, "_config_reader", lambda _session: _StubConfig(_usable_config()))
+    await worker.handle_life_schedule({})
+    claim = await worker.claim_next_outbox_event(only_topic="schedule.outline")
+    assert claim is not None
+    assert claim.payload["recovery_before"] == _at(LOCAL_DAY, boundary).isoformat()
+    if missed:
+        _freeze(monkeypatch, _at(LOCAL_DAY, boundary))
+    await worker.handle_schedule_outline(claim.payload)
+    await worker.settle_outbox_event(claim, ok=True)
+    row = await _day_plan(LOCAL_DAY)
+    if missed:
+        assert router.calls == 0
+        assert row is None
+    else:
+        assert router.calls == OUTLINE_MAX_CALLS
+        assert row is not None and row.state == "degraded"
+        assert row.last_error_code == "outline_invalid"
+        assert await _count(ScheduleSegmentRow, plan_id=row.id, source="model") == 0
+        _freeze(monkeypatch, _at(LOCAL_DAY, boundary + OUTLINE_RECOVERY_STEP_MINUTES - 10))
+        await worker.handle_life_schedule({})
+        assert len(await _outbox("schedule.outline")) == 1
+
+
+@pytest.mark.parametrize("late_response", [False, True])
+async def test_recovery_discards_response_after_boundary(
+    web_env: TestEnv, monkeypatch: pytest.MonkeyPatch, late_response: bool,
+) -> None:
+    from ling import worker
+    from ling.domains.agenda.timeline import OUTLINE_RECOVERY_STEP_MINUTES
+    from ling.infra.models import BehaviorModelCallRow
+
+    await _seed_routine()
+    plan_id = await _insert_day_plan(LOCAL_DAY, state="degraded", revision=1, error_code=REASON_DEGRADED_LATE)
+    boundary = WAKE_MINUTE + OUTLINE_RECOVERY_STEP_MINUTES
+    _freeze(monkeypatch, _at(LOCAL_DAY, boundary) - timedelta(seconds=1))
+
+    class SlowRouter(_CountingRouter):
+        async def stream(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            if late_response:
+                _freeze(monkeypatch, _at(LOCAL_DAY, boundary) + timedelta(seconds=1))
+            async for chunk in super().stream(*args, **kwargs):
+                yield chunk
+
+    router = SlowRouter(text=_valid_outline(LOCAL_DAY, start_hour=boundary // 60))
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", router)
+    monkeypatch.setattr(worker, "_config_reader", lambda _session: _StubConfig(_usable_config()))
+    await worker.handle_life_schedule({})
+    claim = await worker.claim_next_outbox_event(only_topic="schedule.outline")
+    assert claim is not None
+    await worker.handle_schedule_outline(claim.payload)
+    row = await _day_plan(LOCAL_DAY)
+    assert router.calls == 1 and row is not None
+    assert await _count(BehaviorModelCallRow, actor_id=ACTOR, plan_day=LOCAL_DAY, kind="outline") == 1
+    assert row.revision == (1 if late_response else 2)
+    assert await _count(ScheduleSegmentRow, plan_id=plan_id, source="model") == (0 if late_response else 1)
 
 
 # ---------------------------------------------------------------- 梦与结算

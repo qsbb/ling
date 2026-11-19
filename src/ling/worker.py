@@ -4609,8 +4609,9 @@ async def _schedule_outline(
     - 快照（时区/作息）变了 → 新 key，需要重排（`ensure_day_plan` 自己会
       判断"快照没变就返回 unchanged"，所以不会白烧模型）；
     - 可恢复失败（模型暂不可用/超时/报错）→ 醒前最多再补两次，带 15 分钟
-      退避；终态原因码（非法输出/预算耗尽/degraded_late）不再重试。
+      退避；醒后时段补排走独立的幂等键。
     """
+    from ling.domains.agenda.outline_jobs import job_like_prefix
     from ling.domains.agenda.timeline import (
         FINAL_REASON_CODES,
         PHASE_LATE,
@@ -4621,18 +4622,20 @@ async def _schedule_outline(
     row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
     tz_rev = int(row.timezone_revision) if row is not None else 0
     routine_rev = int(row.routine_revision) if row is not None else routine_revision
-    base = f"outline:{actor_id}:{plan_day.isoformat()}:t{tz_rev}:r{routine_rev}"
-    prior = list(
+    prefix = job_like_prefix(actor_id=actor_id, plan_day=plan_day)
+    base = f"{prefix}t{tz_rev}:r{routine_rev}"
+    jobs = list(
         (
             await session.execute(
                 select(OutboxEvent)
-                .where(OutboxEvent.id.like(_like_prefix(base), escape="\\"))
+                .where(OutboxEvent.id.like(_like_prefix(prefix), escape="\\"))
                 .order_by(OutboxEvent.created_at, OutboxEvent.id)
             )
         ).scalars()
     )
-    if any(str(event.state) in ("pending", "in_flight") for event in prior):
+    if any(str(event.state) in ("pending", "in_flight") for event in jobs):
         return False  # 已有在途作业：等它跑完再说
+    prior = [event for event in jobs if event.id.startswith(f"{base}:")]
 
     snapshot_same = (
         row is not None
@@ -4688,6 +4691,38 @@ async def _schedule_outline(
             "timezone_source": timezone_source,
             "attempt": attempt,
             "scanned_at": now.isoformat(),
+        },
+        now=now,
+    )
+
+
+async def _schedule_outline_recovery(
+    session,  # noqa: ANN001
+    *, actor_id: str, plan_day: date, boundary: datetime, now: datetime,
+) -> bool:
+    from ling.domains.agenda.outline_jobs import job_like_prefix
+    from ling.domains.agenda.timeline import load_day_plan, outline_needs_recovery
+
+    row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+    if not outline_needs_recovery(row):
+        return False
+    prefix = job_like_prefix(actor_id=actor_id, plan_day=plan_day)
+    inflight = await session.scalar(
+        select(OutboxEvent.id).where(
+            OutboxEvent.id.like(_like_prefix(prefix), escape="\\"),
+            OutboxEvent.topic == "schedule.outline",
+            OutboxEvent.state.in_(("pending", "in_flight")),
+        ).limit(1)
+    )
+    if inflight is not None:
+        return False
+    return await _enqueue_once(
+        session,
+        event_id=f"{prefix}recover:{int(boundary.timestamp())}",
+        topic="schedule.outline",
+        payload={
+            "actor_id": actor_id, "plan_day": plan_day.isoformat(),
+            "recovery_before": boundary.isoformat(),
         },
         now=now,
     )
@@ -4932,6 +4967,7 @@ async def handle_life_schedule(payload: dict) -> None:
     from ling.domains.agenda.service import AgendaService
     from ling.domains.agenda.timeline import (
         outline_due_decision,
+        outline_recovery_boundary,
         plan_day_for,
         resolve_plan_timezone,
     )
@@ -4976,6 +5012,16 @@ async def handle_life_schedule(payload: dict) -> None:
                 plan_day=stale_day,
             )
             candidates.setdefault(stale_day, stale_phase)
+        boundary = outline_recovery_boundary(
+            now, plan_day=local_day, timezone=timezone,
+            wake_minute=routine.wake_minute, rest_minute=routine.rest_minute,
+        )
+        if boundary is not None:
+            if await _schedule_outline_recovery(
+                session, actor_id=actor_id, plan_day=local_day, boundary=boundary, now=now,
+            ):
+                enqueued.append(f"schedule.outline:{local_day.isoformat()}:recovery")
+            candidates.pop(local_day, None)
         for plan_day, candidate_phase in candidates.items():
             if await _schedule_outline(
                 session,
@@ -5083,6 +5129,16 @@ async def handle_schedule_outline(payload: dict) -> None:
         logger.warning("schedule.outline 收到未知相位 %r，按 due 处理", phase)
         phase = PHASE_DUE
     now = _schedule_now()
+    recovery_before = None
+    if "recovery_before" in payload:
+        raw = payload["recovery_before"]
+        try:
+            recovery_before = datetime.fromisoformat(str(raw))
+        except ValueError:
+            logger.warning("schedule.outline 补排缺少有效的时段边界，跳过")
+            return
+        if recovery_before.tzinfo is None:
+            return
     async with session_scope() as session:
         outcome = await outline_work(
             session,
@@ -5098,7 +5154,11 @@ async def handle_schedule_outline(payload: dict) -> None:
             # 手动"重新生成"带着 force：它只放宽"已生成就短路"这一条，
             # 预算 / lease / 段的替代规则一并照旧。
             force=bool(payload.get(FORCE_KEY)),
+            manual=payload.get("manual") is True,
+            recovery_before=recovery_before,
         )
+    if outcome.phase == "recovery" and outcome.state == "unchanged":
+        return
     logger.info(
         "大纲作业完成 day=%s phase=%s state=%s revision=%s segments=%s calls=%s reason=%s",
         plan_day,
