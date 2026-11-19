@@ -147,17 +147,14 @@
 ``deploy/releases.json`` 的解析/校验代码暂时留着（桥接期旧更新器还要用），
 但**更新器不再依赖它们**。
 
-恢复点门禁为什么必须是**独立顶层字段**
-======================================
-``task`` 只在更新器**处理过一次任务之后**才存在，而第一次任务又要先过恢复点
-门禁：只看 ``task.backup`` 就是死锁——全新镜像部署的网页更新会永远显示"不可
-安装"。所以 ``backup_gate`` 与任务无关，直接**扫描备份目录**里最近的 manifest
-（cron/手动备份在备份根目录，更新器自己的快照在 ``release-<id>/`` 里，两者都看）。
+历史恢复点诊断
+==============
+``backup_gate`` 扫描历史备份，与当前任务无关，不决定新版能否提交。
+cron/手动备份在备份根目录；更新器自己的快照在 ``release-<id>/``，两者都看。
 
 它只是**廉价的静态核对**（字段齐全、产物在位、状态允许恢复），不重算哈希：
 真正的哈希/身份门禁在复用实现里，每次更新都会把 manifest 与产物逐字节核一遍。
-``checked_at`` 记录这份判断的时间；更新器**启动时算一次、每处理完一个任务再算
-一次**并写进状态文件，idle 时也在（否则 API 又只能看 task）。
+``checked_at`` 记录这份判断的时间。更新器在启动、任务结束、按需检查和空闲时定期刷新。
 
 ``reason`` 是码表码，不是文案：``backup_dir_unreadable`` / ``no_manifest`` /
 ``manifest_unreadable`` / ``manifest_incomplete`` / ``tombstones_not_ok`` /
@@ -436,6 +433,7 @@ RELEASE_CHECK_REASONS = registry.REASONS
 # 空闲时重查 registry 的间隔（秒）。发版是低频事件，5 分钟足够；用户点
 # 「检查更新」走 refresh 请求，**绕过**这个节流。
 CHECK_INTERVAL_SECONDS = 300.0
+BACKUP_GATE_INTERVAL_SECONDS = 60.0
 # 安装前复核最多从最新 tag 往下探多少个（见 :func:`Updater.assert_target_digest_current`）。
 # 只允许升级 → 正常情况第一次就命中；8 个是"旧页面上的候选"能容忍的纵深上限。
 MAX_DRIFT_PROBE_TAGS = 8
@@ -563,7 +561,7 @@ WARNING_TEXT = {
     "maintenance_reenforced": "已迁移后验证失败：维护门禁已重新关上（未切回旧镜像）",
 }
 
-# 恢复点门禁的 reason 是**码表码**（文案由 API 自己那份码表翻译，见
+# 历史恢复点的 reason 是**码表码**（文案由 API 自己那份码表翻译，见
 # src/ling/api/routes/version.py 的 IMAGE_BACKUP_GATE_REASONS）。
 # 码表：ok / backup_dir_unreadable / no_manifest / manifest_unreadable /
 #       manifest_incomplete / tombstones_not_ok / media_partial / keys_missing
@@ -1583,7 +1581,7 @@ def _manifest_dump_present(manifest: Path, fields: dict[str, str]) -> bool:
 
 
 def _manifest_gate(manifest: Path, pub: ModuleType) -> dict[str, Any]:
-    """把一份 manifest 翻成恢复点门禁；任何不确定都按"没有恢复点"处理。"""
+    """把一份 manifest 翻成历史恢复点诊断；任何不确定都按"没有恢复点"处理。"""
     parser = getattr(pub, "parse_manifest", None)
     if parser is None:
         # 发布模块是运行时按路径加载的；缺这个函数说明更新器与发行包不是同一次
@@ -1654,11 +1652,7 @@ def _manifest_gate(manifest: Path, pub: ModuleType) -> dict[str, Any]:
 
 
 def backup_gate(cfg: Config, pub: ModuleType) -> dict[str, Any]:
-    """扫描备份目录里**最近**的 manifest，得出与 task 无关的恢复点门禁。
-
-    与 task 解耦是关键：第一次任务之前没有 ``task``，不能因此说"没有恢复点"
-    （那会把全新部署的网页更新永久锁死）。这里只看备份目录的事实。
-    """
+    """只读扫描最近的历史备份；它既不拦截提交，也不替代本次备份校验。"""
     manifest, reason = _latest_manifest(cfg.backup_dir)
     if manifest is None:
         return _empty_backup_gate(pub, reason or "no_manifest")
@@ -2035,30 +2029,49 @@ def _note_line(value: object, limit: int) -> str | None:
 
 
 def _release_body_note(body: object) -> tuple[str | None, list[str]]:
-    """把 Release 正文压成 ``(summary, items)``：首行当摘要，列表项当条目。
+    """按原顺序摘取发布说明的正文和列表，不在更新卡片渲染完整 Markdown。
 
-    **不改写、不总结、不加重要程度**：这是发布方原话（设计 §附「文案纪律」）。
-    只做折行归一、长度上限与条目数上限——超限的那条按字数截断，不整条丢掉
-    （整条丢掉会让"他写了但页面没有"变成新的困惑）。
+    跳过标题、表格、代码和流水线附加的部署段及比较链接；完整格式留给原文页面。
     """
     summary: str | None = None
     items: list[str] = []
     if not isinstance(body, str):
         return None, items
+    deployment_level: int | None = None
+    fence: str | None = None
     for raw in body.splitlines():
         stripped = raw.strip()
-        if not stripped or stripped.startswith(("#", "```", "|")):
+        if fence is not None:
+            if stripped.startswith(fence) and not stripped.strip(fence[0]):
+                fence = None
             continue
-        is_bullet = stripped[0] in "-*+"
-        text = _note_line(stripped.lstrip("-*+> \t"), MAX_NOTE_ITEM_CHARS)
+        if raw.startswith("    ") or raw[:4].lstrip(" ").startswith("\t"):
+            continue
+        opening = re.match(r"(`{3,}|~{3,})", stripped)
+        if opening:
+            fence = opening[0]
+            continue
+        heading = re.fullmatch(r"(#{1,6})\s+(.+?)\s*#*", stripped)
+        if heading:
+            level = len(heading[1])
+            if deployment_level is not None and level <= deployment_level:
+                deployment_level = None
+            if heading[2] == "部署用 index digest" and deployment_level is None:
+                deployment_level = level
+            continue
+        if deployment_level is not None or not stripped or stripped.startswith("|"):
+            continue
+        bullet = re.match(r"[-*+]\s+", stripped)
+        line = stripped[bullet.end() :] if bullet else stripped
+        if re.match(r"(?:\*\*|__)?Full Changelog(?:\*\*|__)?\s*:", line, re.IGNORECASE):
+            continue
+        text = _note_line(line.lstrip("> \t"), MAX_NOTE_ITEM_CHARS)
         if text is None:
             continue
-        if is_bullet:
-            if len(items) >= MAX_NOTE_ITEMS:
-                continue
-            items.append(text)
-        elif summary is None:
+        if bullet is None and summary is None and not items:
             summary = _note_line(text, MAX_NOTE_SUMMARY_CHARS)
+        elif len(items) < MAX_NOTE_ITEMS:
+            items.append(text)
     return summary, items
 
 
@@ -2080,7 +2093,7 @@ def github_release_note(version: str) -> dict[str, Any] | None:
     url = _note_line(payload.get("html_url"), MAX_NOTE_URL_CHARS)
     if url is not None and not url.startswith("https://"):
         url = None
-    if summary is None and not items:
+    if summary is None and not items and url is None:
         return None
     return {"summary": summary, "items": items, "url": url}
 
@@ -2263,13 +2276,13 @@ class StatusWriter:
     ``backup_gate`` **不在每次写状态时重算**：``checked_at`` 每次都变，内容就
     永远不同，空闲轮询会每 5 秒刷一次盘（这个类存在的意义正好相反）。所以恢复
     点门禁只在明确的时机重算：更新器启动时一次（:class:`Updater` 构造）、每处理
-    完一个任务一次（:meth:`Updater.refresh_status_after_task`）。本类的
+    完一个任务、手动检查，以及空闲时独立于 GHCR 每分钟复查一次。本类的
     ``write`` 在**从未算过**时兜底算一次，覆盖 ``--acknowledge-manual`` 这类
     不进主循环的入口。
 
     ``release_check`` / ``available_targets`` / ``recommended_target`` /
-    ``release_notes`` 的刷新时机与恢复点门禁完全一致（启动、每处理完一个任务），
-    外加「用户点了检查更新」。**这一组刷新会碰 Docker（只读）与网络**——当前版本
+    ``release_notes`` 也在启动、每次任务结束和手动检查时刷新。**这一组刷新会碰
+    Docker（只读）与网络**——当前版本
     读运行中 api 镜像的 OCI 标注，新版本要查 GHCR 的 ``tags/list`` 与 manifest
     digest。所以它被 :meth:`refresh_release_check_if_due` 的 5 分钟节流挡着，
     **绝不能**放进 5 秒的主轮询：那样所有部署实例每 5 秒就打一次 GHCR。
@@ -2285,6 +2298,7 @@ class StatusWriter:
         self.tool = tool
         self._last: str | None = None
         self._gate: dict[str, Any] | None = None
+        self._backup_checked_at = 0.0
         self._check: dict[str, Any] | None = None
         # 上次查 registry 的时间（monotonic）；0 表示还没查过。
         self._checked_at = 0.0
@@ -2296,10 +2310,15 @@ class StatusWriter:
             "notes": {},
         }
 
-    # ------------------------------------------------------------ 恢复点门禁
+    # ------------------------------------------------------------ 历史备份
     def refresh_backup_gate(self) -> dict[str, Any]:
         self._gate = backup_gate(self.cfg, self.pub)
+        self._backup_checked_at = time.monotonic()
         return self._gate
+
+    def refresh_backup_gate_if_due(self) -> None:
+        if time.monotonic() - self._backup_checked_at >= BACKUP_GATE_INTERVAL_SECONDS:
+            self.refresh_backup_gate()
 
     # ------------------------------------------------------------ 版本发现
     def refresh_release_check(
@@ -3479,8 +3498,7 @@ class Updater:
         self.tool = catalog_tool
         self.store = TaskStore(cfg, pub)
         self.status = StatusWriter(cfg, pub, catalog_tool)
-        # **启动时算一次**恢复点门禁：idle 也要有（否则 API 只能看 task，
-        # 第一次更新之前永远"不可安装"）。
+        # 启动时即提供历史备份诊断，不必等第一次任务结束。
         self.status.refresh_backup_gate()
         # 版本发现同理：idle 也要有"有没有新版本"，否则网页的「更新」按钮永远
         # 「暂无可用目标」。这一刷只发**只读**调用（docker ps/inspect 读运行中
@@ -3623,7 +3641,7 @@ class Updater:
             self.refresh_status_after_task()
 
     def refresh_status_after_task(self) -> None:
-        """重算恢复点门禁/可用目标并按任务实况重写状态（含失败/人工门禁的收尾）。"""
+        """重算历史备份状态/可用目标并按任务实况重写状态（含失败/人工门禁的收尾）。"""
         self.status.refresh_backup_gate()
         # 成功后受限 env 已指向目标摘要：当前版本随之变化，目标列表必须重算
         # （否则刚装上的那个版本会继续显示成"可用目标"）。
@@ -3710,7 +3728,7 @@ class Updater:
             return EXIT_OK
         try:
             # 绕过 5 分钟自动刷新节流：用户点了检查，就必须**现在**去查。
-            # 手动备份可能在 updater 启动后才完成，恢复点门禁也要随这次检查更新。
+            # 手动备份可能在 updater 启动后才完成，随按需检查刷新历史诊断。
             self.status.refresh_backup_gate()
             self.status.refresh_release_check(requested=True, request_id=name_id)
             self.status.write("idle", self.task, force=True)
@@ -4274,7 +4292,8 @@ def run_once(updater: Updater) -> int:
         refreshes = pending_refreshes(cfg)
         if refreshes:
             return updater.process_refresh(refreshes[0])
-        # 空闲也要低频重读目录：否则发版之后页面一直显示"没有新版本"。
+        # 备份是本地事实，可比 registry 更快刷新，且不会创建新备份。
+        updater.status.refresh_backup_gate_if_due()
         updater.status.refresh_release_check_if_due()
         updater.status.write("idle", task)
         return EXIT_OK

@@ -2013,25 +2013,10 @@ function SourceAboutPage({ onBack }: AboutPageProps) {
   );
 }
 
-/* ==================================================== 镜像模式：更新卡片（四态）
+/* ==================================================== 镜像模式：版本、确认、进度
  *
- * 设计依据 `docs/UPDATE-UX-DESIGN.md`（本批的权威）：
- *
- * - 首屏只有：当前版本、**服务端给的一句话结论**、检查时间、一个主按钮。
- *   三段横幅、原因码墙、安装门禁 notes、目标 `sha256` 都不再上首屏。
- * - 四态与按钮：已是最新 →「检查更新」；可更新 →「更新到 vX」；
- *   有新版暂不可用 →「重新检查」；暂不能确认 →「重试检查」。
- *   活动任务覆盖结论展示（「正在更新 vX：阶段」+「查看进度」），此时不许再检查/安装。
- *   非 owner 用同一套四态结论，但主按钮是「查看详情」，不写任何请求。
- * - 「检查更新」是**真检查**：`POST /v1/version/image-update-checks` 写一个检查请求，
- *   等更新器认领并重新取目录/解析摘要；随后每 2 秒重读 GET，按回执的检查编号匹配
- *   `details.catalog.check`（对不上时退回 `checked_at` 变新）。最多等 20 秒，超时
- *   如实说「更新器没有回应」；失败/超时**不清掉上次结论**。
- * - 「更新内容」只在可更新 / 有新版暂不可用两态出现，内容全部来自后端
- *   （`notes` 是发布方原话，前端不改写、不总结、不推断）；`notes_url` 才给
- *   「完整更新日志」链接。
- * - 详情/诊断默认折叠：digest/commit、目录来源与状态、更新器、恢复点、`newer[]`
- *   的不可用原因、推荐目标、最近任务。原因码只允许出现在这里，且必须配一句人话。
+ * 服务端决定可用状态；历史备份仅供诊断。本次备份校验由独立更新器执行。
+ * 安装确认绑定当前版本与目标摘要；提交与执行时仍分别由 API 和更新器重新核对。
  */
 
 const IMAGE_REQUEST_ID_RE = /^[0-9a-f]{32}$/;
@@ -2046,8 +2031,6 @@ export const IMAGE_CHECK_POLL_MS = 2000;
 export const IMAGE_CHECK_TIMEOUT_MS = 20000;
 /** 前端去抖：10 秒内重复点击不再发请求（服务端锁与 30 秒限流是最终保证）。 */
 export const IMAGE_CHECK_DEBOUNCE_MS = 10000;
-/** 「更新到 vX」先复用 30 秒内刚完成的检查，不重复打扰更新器。 */
-export const IMAGE_UPDATE_REUSE_CHECK_MS = 30000;
 
 export const IMAGE_CHECK_FAILED_TEXT = '这次检查没成功';
 export const IMAGE_CHECK_TIMEOUT_TEXT = '检查超时（更新器没有回应），你可以稍后重试';
@@ -2577,18 +2560,22 @@ export function describeImageTaskLine(view: ImageUpdateV2 | null): string | null
 export function describeImageLastTaskLine(view: ImageUpdateV2 | null): string | null {
   const task = view?.task ?? null;
   if (task === null || imageTaskActivity(view) !== 'none') return null;
-  if (task.state === 'needs_manual') return '上次更新需要处理：先按详情里的失败码处理，再检查。';
+  if (task.state === 'needs_manual') {
+    const failure = task.failure?.message ?? imageUpdateFailureText(task.failed_code);
+    const recovery = task.migration?.attempted === false && task.still_on_old_version !== true
+      ? '；未能确认旧服务可用'
+      : '';
+    return `上次更新需要处理：${failure}${recovery}。`;
+  }
   if (task.state === 'succeeded') {
-    // 不写「更新成功」：三项核验有任何一端缺失/不一致，就只能说「已结束」。
-    const checks = imageUpdateVerification(task, view?.current ?? null);
-    if (checks.some((check) => check.ok === false)) return '上次更新已结束，但三项核验不一致。';
-    if (checks.some((check) => check.ok === null)) {
-      return '上次更新已结束，但三项核验值不全，不能确认成功。';
-    }
-    return '上次更新已完成（三项核验一致）。';
+    const allVerified = imageUpdateVerification(task, view?.current ?? null)
+      .every((check) => check.ok === true);
+    return allVerified ? '上次更新已完成。' : '上次更新已结束，核验结果请看诊断。';
   }
   if (task.state === 'failed_not_started' || task.failed_code !== null) {
-    return `上次更新失败：${task.failure?.message ?? imageUpdateFailureText(task.failed_code)}`;
+    const failure = task.failure?.message ?? imageUpdateFailureText(task.failed_code);
+    const recovery = task.still_on_old_version === true ? '；已确认旧版本可用' : '';
+    return `上次更新失败：${failure}${recovery}`;
   }
   return null;
 }
@@ -2710,17 +2697,15 @@ export function imageUpdatePrimaryAction(
   }
 }
 
-/**
- * 点「更新到 vX」后的复查结论：目标版本与摘要都没变，才进入现有风险确认。
- * 版本、摘要、状态任何一项变化都停在这里（由页面显示新结论）。
- */
-export function imageUpdateConfirmAfterCheck(
-  before: ImageUpdateTargetV2 | null,
+/** 确认后只能提交用户看到的那一对当前镜像/目标；轮询不能偷换它们。 */
+export function imageUpdateMatchesConfirmation(
+  before: ImageUpdateV2 | null,
   after: ImageUpdateV2 | null,
 ): boolean {
-  if (before === null || after === null) return false;
-  if (after.state !== 'available' || after.target === null) return false;
-  return after.target.version === before.version && after.target.digest === before.digest;
+  if (!before?.target || !after?.target || after.state !== 'available') return false;
+  if (imageTaskActivity(after) !== 'none') return false;
+  return after.target.version === before.target.version && after.target.digest === before.target.digest &&
+    after.current.digest === before.current.digest && after.current.commit === before.current.commit;
 }
 
 /* ------------------------------------------------------------ 更新内容 */
@@ -3019,7 +3004,7 @@ export interface ImageUpdatePanelProps {
   /** 失败/超时的一行人话；成功为 null。 */
   checkNotice: string | null;
   confirming: boolean;
-  riskAcknowledged: boolean;
+  confirmationTarget?: ImageUpdateTargetV2 | null;
   submitting: boolean;
   submitError: ImageUpdateSubmitError | null;
   downloadSource?: ImageDownloadSource;
@@ -3031,7 +3016,6 @@ export interface ImageUpdatePanelProps {
   onCheck: () => void;
   onStartConfirm: () => void;
   onCancelConfirm: () => void;
-  onToggleRisk: () => void;
   onConfirm: () => void;
 }
 
@@ -3040,7 +3024,7 @@ export interface ImageUpdatePanelProps {
  * `renderToStaticMarkup` 断言首屏只有「当前版本 / 一句话结论 / 检查于 / 一个主按钮」。
  */
 export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
-  const { state, canWrite, checking, checkNotice, confirming, riskAcknowledged, submitting, submitError } =
+  const { state, canWrite, checking, checkNotice, confirming, submitting, submitError } =
     props;
   const [detailsOpen, setDetailsOpen] = useState(props.defaultDetailsOpen === true);
   const [taskOpen, setTaskOpen] = useState(false);
@@ -3073,6 +3057,11 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   const taskLine = describeImageTaskLine(view);
   const lastTaskLine = describeImageLastTaskLine(view);
   const notes = imageUpdateNotesView(view);
+  const newVersion = imageVersionLabel(notes?.version ?? null);
+  const versionLabel = imageVersionLabel(current.version);
+  const versionPath = activity === 'none' && view?.state === 'available' && versionLabel && newVersion
+    ? `${versionLabel} → ${newVersion}`
+    : null;
   const notesItems =
     notes === null
       ? []
@@ -3081,17 +3070,10 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         : notes.items.slice(0, IMAGE_NOTES_COLLAPSE_LIMIT);
   const hiddenNotes = notes === null ? 0 : notes.items.length - notesItems.length;
   const message = typeof view?.message === 'string' ? view.message.trim() : '';
-  // 活动任务覆盖结论展示（服务端也会把 message 换成进度；这里用同一份结构化事实，
-  // 保证文案固定为「正在更新 vX：阶段」/「更新请求已提交，等待开始」）。
-  const conclusion =
-    activity !== 'none' && taskLine !== null
-      ? taskLine
-      : view === null
-        ? '正在读取更新状态…'
-        : message !== ''
-          ? message
-          : '服务端没有给出结论';
-  const versionLabel = imageVersionLabel(current.version);
+  // 当前任务阶段是主界面的一部分，展开进度只为查看更多信息。
+  const conclusion = taskLine ?? (view === null
+    ? '正在读取更新状态…'
+    : message || '服务端没有给出结论');
 
   const onPrimary = () => {
     switch (action.kind) {
@@ -3112,14 +3094,18 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   return (
     <section className="panel update-card" aria-label="更新" data-testid="image-update-panel">
       <p className="update-card__version" data-testid="image-update-current">
-        {versionLabel === null ? '当前版本未知' : `当前 ${versionLabel}`}
+        {versionPath ?? (versionLabel === null ? '当前版本未知' : `当前 ${versionLabel}`)}
       </p>
-      <p className="update-card__conclusion" data-testid="image-update-conclusion">
-        {conclusion}
-      </p>
-      <p className="update-card__checked" data-testid="image-update-checked">
-        {describeImageCheckedAt(view?.checked_at ?? null, nowMs)}
-      </p>
+      {versionPath === null ? (
+        <p className="update-card__conclusion" role="status" data-testid="image-update-conclusion">
+          {conclusion}
+        </p>
+      ) : null}
+      {activity === 'none' && versionPath === null ? (
+        <p className="update-card__checked" data-testid="image-update-checked">
+          {describeImageCheckedAt(view?.checked_at ?? null, nowMs)}
+        </p>
+      ) : null}
 
       {lastTaskLine !== null ? (
         <p className="update-card__last-task" data-testid="image-update-last-task">
@@ -3152,7 +3138,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
           onClick={onPrimary}
           disabled={action.disabled || submitting}
         >
-          {action.label}
+          {action.kind === 'progress' && taskOpen ? '收起进度详情' : action.label}
         </button>
         {task !== null && activity === 'none' ? (
           <button
@@ -3178,30 +3164,25 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         ) : null}
       </div>
 
-      {notes !== null ? (
-        <section className="update-notes" data-testid="image-update-notes">
-          <h3 className="update-notes__title">
-            更新内容
-            {imageVersionLabel(notes.version) === null
-              ? ''
-              : `（${imageVersionLabel(notes.version) ?? ''}）`}
-          </h3>
+      {notes !== null && activity === 'none' ? (
+        <details className="update-notes" data-testid="image-update-notes">
+          <summary className="update-notes__title">更新说明</summary>
           {notes.summary === null ? null : (
             <p className="update-notes__summary" data-testid="image-update-notes-summary">
               {notes.summary}
             </p>
           )}
-          {notes.items.length === 0 ? (
+          {notes.items.length === 0 && notes.summary === null ? (
             <p className="update-notes__empty" data-testid="image-update-notes-empty">
-              这一版没有提供更新说明
+              {notes.url === null ? '这一版没有提供更新说明' : '此处暂无更新摘要。'}
             </p>
-          ) : (
+          ) : notes.items.length > 0 ? (
             <ul className="update-notes__list" data-testid="image-update-notes-items">
               {notesItems.map((item, index) => (
                 <li key={`${index}-${item}`}>{item}</li>
               ))}
             </ul>
-          )}
+          ) : null}
           {hiddenNotes > 0 ? (
             <button
               type="button"
@@ -3223,7 +3204,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               完整更新日志
             </a>
           )}
-        </section>
+        </details>
       ) : null}
 
       {taskOpen && activity === 'queued' ? (
@@ -3307,21 +3288,6 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
                 </>
               )}
             </dd>
-            <dt>三项核验</dt>
-            <dd>
-              <ul className="update-details__list">
-                {imageUpdateVerification(task, current).map((check) => (
-                  <li className="update-details__item" key={check.id}>
-                    {check.label}：
-                    <code title={check.expected ?? undefined}>{shortRef(check.expected)}</code>{' '}
-                    对照 <code title={check.actual ?? undefined}>{shortRef(check.actual)}</code>{' '}
-                    <span className="about-facts__muted">
-                      {check.ok === null ? '缺失，无法确认' : check.ok ? '一致' : '不一致'}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </dd>
           </dl>
         </div>
       ) : null}
@@ -3380,7 +3346,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
                 <span className="about-facts__muted"> · 协议 v{updater.protocol}</span>
               )}
             </dd>
-            <dt>恢复点</dt>
+            <dt>历史备份</dt>
             <dd data-testid="image-update-detail-backup">
               {imageBackupGateText(backupGate)}
               {backupGate?.reason ? (
@@ -3517,73 +3483,42 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
         </div>
       ) : null}
 
-      {confirming ? (
+      {confirming && activity === 'none' ? (
         <div className="update-confirm" data-testid="image-update-confirm">
           <p className="update-confirm__lead">
             确认更新到{' '}
-            {target === null ? '目标版本' : (imageVersionLabel(target.version) ?? '目标版本')}
+            {imageVersionLabel((props.confirmationTarget ?? target)?.version ?? null) ?? '目标版本'}
           </p>
-          <dl className="about-facts">
-            <dt>当前</dt>
-            <dd>
-              <code>{imageVersionLabel(current.version) ?? '未知'}</code>{' '}
-              <span className="about-facts__muted">{shortDigestRef(current.digest)}</span>
-            </dd>
-            <dt>目标</dt>
-            <dd>
-              <code title={target?.digest ?? undefined}>
-                {target === null ? '未知' : shortDigestRef(target.digest)}
-              </code>
-            </dd>
-          </dl>
-          <fieldset className="update-download-source">
-            <legend>下载方式</legend>
-            {IMAGE_DOWNLOAD_SOURCES.map((source) => (
-              <label key={source}>
-                <input
-                  type="radio"
-                  name="image-download-source"
-                  value={source}
-                  checked={(props.downloadSource ?? 'direct') === source}
-                  onChange={() => props.onDownloadSourceChange?.(source)}
-                  disabled={submitting || !imageDownloadSourceSupported(updater, source)}
-                />
-                {IMAGE_DOWNLOAD_SOURCE_LABELS[source]}
-              </label>
-            ))}
-            <p>线路连通性尚未检测。加速线路先预取镜像层，仍需连接 GHCR 确认版本和镜像身份。</p>
-            {updater.online !== true ? (
-              <p>更新器当前离线，无法确认线路能力。</p>
-            ) : !Array.isArray(reportedSources) ? (
-              <p>当前更新器未声明内置线路能力。</p>
-            ) : null}
-            {updater.online === true && mirrorStatus === false ? (
-              <p>自定义仓库未配置或配置格式有误。</p>
-            ) : updater.online === true && mirrorStatus === null ? (
-              <p>更新器未报告自定义仓库配置状态。</p>
-            ) : null}
-          </fieldset>
-          <ul className="update-risk">
-            <li>
-              更新会短暂停机：维护门禁生效期间控制台、机器人和定时任务都会暂停写入，正在生成的回复会中断。
-            </li>
-            <li>
-              更新前会做一次一致备份；但数据库迁移一旦执行就不可撤销，系统不会自动恢复旧镜像或旧数据，
-              失败后需要人工处理。
-            </li>
-            <li>
-              是否成功只以运行容器 digest、应用提交与迁移 head 三项核验为准，不以命令退出码或页面重连为准。
-            </li>
-          </ul>
-          <label className="update-risk-ack">
-            <input
-              type="checkbox"
-              checked={riskAcknowledged}
-              onChange={props.onToggleRisk}
-              data-testid="image-update-risk-ack"
-            />
-            <span>我已知晓会短暂停机，且数据库迁移不可撤销</span>
-          </label>
+          <p>更新前会自动备份，服务将短暂停用；数据库迁移后不会自动回退。</p>
+          <details className="update-download-options">
+            <summary>下载方式：{imageDownloadSourceLabel(props.downloadSource ?? 'direct')}</summary>
+            <fieldset className="update-download-source" aria-label="下载方式">
+              {IMAGE_DOWNLOAD_SOURCES.map((source) => (
+                <label key={source}>
+                  <input
+                    type="radio"
+                    name="image-download-source"
+                    value={source}
+                    checked={(props.downloadSource ?? 'direct') === source}
+                    onChange={() => props.onDownloadSourceChange?.(source)}
+                    disabled={submitting || !imageDownloadSourceSupported(updater, source)}
+                  />
+                  {IMAGE_DOWNLOAD_SOURCE_LABELS[source]}
+                </label>
+              ))}
+              <p>线路连通性尚未检测。加速线路先预取镜像层，仍需连接 GHCR 确认版本和镜像身份。</p>
+              {updater.online !== true ? (
+                <p>更新器当前离线，无法确认线路能力。</p>
+              ) : !Array.isArray(reportedSources) ? (
+                <p>当前更新器未声明内置线路能力。</p>
+              ) : null}
+              {updater.online === true && mirrorStatus === false ? (
+                <p>自定义仓库未配置或配置格式有误。</p>
+              ) : updater.online === true && mirrorStatus === null ? (
+                <p>更新器未报告自定义仓库配置状态。</p>
+              ) : null}
+            </fieldset>
+          </details>
           <div className="panel__actions">
             <button
               type="button"
@@ -3600,7 +3535,7 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               data-testid="image-update-submit"
               onClick={props.onConfirm}
               disabled={
-                !riskAcknowledged || submitting || !canWrite || target === null ||
+                submitting || !canWrite || view?.state !== 'available' || target === null ||
                 !imageDownloadSourceSupported(updater, props.downloadSource ?? 'direct')
               }
             >
@@ -3636,8 +3571,7 @@ export function ImageUpdatePage({
       : applyImageUpdatePoll(initialImageUpdateState(), initialView),
   );
   const [canWrite, setCanWrite] = useState(initialCanWrite === true);
-  const [confirming, setConfirming] = useState(false);
-  const [riskAcknowledged, setRiskAcknowledged] = useState(false);
+  const [confirmation, setConfirmation] = useState<ImageUpdateV2 | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<ImageUpdateSubmitError | null>(null);
   const [downloadSource, setDownloadSource] = useState<ImageDownloadSource>('direct');
@@ -3765,32 +3699,21 @@ export function ImageUpdatePage({
     return result;
   }, [canWrite, mergeView]);
 
-  const beginUpdate = useCallback(async () => {
-    if (!canWrite) return;
+  const beginUpdate = useCallback(() => {
     const before = stateRef.current.view;
-    if (before === null || before.state !== 'available' || before.target === null) return;
-    const lastFinished = attemptRef.current.finishedAtMs;
-    if (
-      attemptRef.current.status === 'done' &&
-      lastFinished !== null &&
-      Date.now() - lastFinished < IMAGE_UPDATE_REUSE_CHECK_MS
-    ) {
-      setSubmitError(null);
-      setRiskAcknowledged(false);
-      setConfirming(true);
-      return;
-    }
-    const result = await runCheck();
-    if (result.status !== 'ok') return;
-    if (!imageUpdateConfirmAfterCheck(before.target, result.view)) return;
+    if (!canWrite || !imageUpdateMatchesConfirmation(before, before)) return;
     setSubmitError(null);
-    setRiskAcknowledged(false);
-    setConfirming(true);
-  }, [canWrite, runCheck]);
+    setConfirmation(before);
+  }, [canWrite]);
 
   const submit = useCallback(async () => {
-    if (submittingRef.current || !canWrite) return;
+    if (submittingRef.current || !canWrite || confirmation === null) return;
     const snapshot = stateRef.current.view;
+    if (!imageUpdateMatchesConfirmation(confirmation, snapshot)) {
+      setConfirmation(null);
+      setSubmitError({ reason: '更新目标或当前状态已变化', hint: '请重新确认更新。', refresh: true });
+      return;
+    }
     const targetDigest = snapshot?.target?.digest ?? null;
     let requestId: string;
     try {
@@ -3814,8 +3737,7 @@ export function ImageUpdatePage({
           : '先检查更新，确认目标摘要与当前摘要后再提交。',
         refresh: true,
       });
-      setConfirming(false);
-      setRiskAcknowledged(false);
+      setConfirmation(null);
       return;
     }
     submittingRef.current = true;
@@ -3826,19 +3748,17 @@ export function ImageUpdatePage({
       const next = withSubmittedRequest(stateRef.current, ack.request_id);
       stateRef.current = next;
       setState(next);
-      setConfirming(false);
-      setRiskAcknowledged(false);
+      setConfirmation(null);
       setPollNonce((value) => value + 1);
     } catch (error) {
       setSubmitError(explainImageSubmitError(error));
-      setConfirming(false);
-      setRiskAcknowledged(false);
+      setConfirmation(null);
       setPollNonce((value) => value + 1);
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [canWrite, downloadSource]);
+  }, [canWrite, confirmation, downloadSource]);
 
   return (
     <section className="page">
@@ -3853,8 +3773,8 @@ export function ImageUpdatePage({
         canWrite={canWrite}
         checking={checking}
         checkNotice={checkNotice}
-        confirming={confirming}
-        riskAcknowledged={riskAcknowledged}
+        confirming={confirmation !== null}
+        confirmationTarget={confirmation?.target}
         submitting={submitting}
         submitError={submitError}
         downloadSource={downloadSource}
@@ -3863,13 +3783,11 @@ export function ImageUpdatePage({
           void runCheck();
         }}
         onStartConfirm={() => {
-          void beginUpdate();
+          beginUpdate();
         }}
         onCancelConfirm={() => {
-          setConfirming(false);
-          setRiskAcknowledged(false);
+          setConfirmation(null);
         }}
-        onToggleRisk={() => setRiskAcknowledged((value) => !value)}
         onConfirm={() => {
           void submit();
         }}

@@ -29,6 +29,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1051,6 +1052,11 @@ media_sha="$(sha "$out/media-$stamp.tar")"
   echo "media_state=present"
   echo "media_sha256=$media_sha"
 } > "$out/manifest-$stamp.txt"
+if [ "$mode" = "incomplete_manifest" ]; then
+  rm -- "$out/$dump"
+elif [ "$mode" = "fail_after_manifest" ]; then
+  exit 5
+fi
 printf 'backup-complete %s\n' "$out" >> "${CALL_LOG:?}"
 '''
 
@@ -2294,9 +2300,12 @@ def test_updater_missing_root_key_fails_before_backup(ws: Workspace) -> None:
     assert not [line for line in ws.compose_calls() if " run " in line]
 
 
-def test_backup_failure_never_migrates(ws: Workspace) -> None:
+@pytest.mark.parametrize("mode", ["fail", "fail_after_manifest", "incomplete_manifest"])
+def test_backup_failure_never_migrates(ws: Workspace, mode: str) -> None:
+    # 即使已有完整历史恢复点，也不能替代本次更新创建的备份。
+    write_manifest(ws)
     write_request(ws)
-    result = run_updater(ws, env={"FAKE_BACKUP_MODE": "fail"})
+    result = run_updater(ws, env={"FAKE_BACKUP_MODE": mode})
     assert result.returncode == 13, (result.stdout, result.stderr)
     assert not [line for line in ws.compose_calls() if " run " in line]
     task = ws.task()
@@ -2305,6 +2314,7 @@ def test_backup_failure_never_migrates(ws: Workspace) -> None:
     assert task["state"] == "failed_not_started"
     # 未迁移：恢复旧 worker/api 并实测（allow 回到旧镜像）。
     assert calls_with(ws, f"docker-env up LING_APP_IMAGE={OLD_REF}")
+    assert task["still_on_old_version"] is True
 
 
 # ---------------------------------------------------------------- 已迁移失败
@@ -2431,6 +2441,7 @@ def test_maintenance_gate_rejects_model_drift_before_touching_anything(ws: Works
 
 
 def test_success_path_uses_target_digest_and_records_identity(ws: Workspace) -> None:
+    assert list(ws.backup_dir.iterdir()) == []
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -3687,6 +3698,63 @@ def test_refresh_request_rechecks_backup_gate_after_new_manifest(ws: Workspace) 
     assert gate["reason"] == "ok"
 
 
+def test_idle_backup_scan_refreshes_status_independently_of_registry(
+    ws: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 直接调用 run_once（保留同一个更新器实例）；使用与子进程用例相同的本地替身。
+    for key in os.environ.keys() - ws.env.keys():
+        monkeypatch.delenv(key)
+    for key, value in ws.env.items():
+        monkeypatch.setenv(key, value)
+    updater = _updater_module()
+    clock = 1000.0
+    monkeypatch.setattr(
+        updater, "time",
+        SimpleNamespace(monotonic=lambda: clock, strftime=time.strftime, gmtime=time.gmtime),
+    )
+    cfg = updater.parse_config([
+        "--requests-dir", str(ws.requests_dir),
+        "--state-dir", str(ws.state_dir),
+        "--compose-file", str(ws.compose_file),
+        "--env-file", str(ws.env_file),
+        "--backup-dir", str(ws.backup_dir),
+        "--backup-script", str(ws.backup_script),
+        "--publish-py", str(PUBLISH_PY),
+        "--release-catalog", str(ws.release_catalog),
+    ])
+    instance = updater.Updater(cfg, updater.load_publish(cfg.publish_py))
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+    registry_calls = ws.status_registry_calls()
+    assert any("tags/list" in call for call in registry_calls)
+
+    manifest = write_manifest(ws, "20261118-120000")
+    files_after_backup = sorted(ws.backup_dir.rglob("*"))
+    start = clock
+    interval = updater.BACKUP_GATE_INTERVAL_SECONDS
+    clock = start + interval - 1
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+
+    clock = start + interval
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["restore_point"] is True
+    assert ws.status_registry_calls() == registry_calls
+    assert sorted(ws.backup_dir.rglob("*")) == files_after_backup
+
+    manifest.unlink()
+    clock = start + interval * 2
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+    assert ws.status_registry_calls() == registry_calls
+
+    clock = start + updater.CHECK_INTERVAL_SECONDS
+    assert updater.run_once(instance) == 0
+    assert sum("tags/list" in call for call in ws.status_registry_calls()) == 2
+    assert mutating_calls(ws) == []
+
+
 def test_same_refresh_id_is_not_processed_twice(ws: Workspace) -> None:
     """同一个 request_id 再写回来 → 只删文件，不再查（跨进程幂等）。"""
     write_refresh(ws, REFRESH_ID)
@@ -3891,7 +3959,15 @@ def test_release_notes_fall_back_to_the_github_release(ws: Workspace) -> None:
             "html_url": "https://github.com/qsbb/ling/releases/tag/v0.0.2",
             "draft": False,
             "prerelease": False,
-            "body": "日程与发送链路修复\n\n- 完成证据分三类\n- 长链接不再整条被拒\n",
+            "body": (
+                "日程与发送链路修复\n\n- 完成证据分三类\n"
+                "```text\n- 代码块不应显示\n```\n"
+                "**Full Changelog**: https://example.test/compare\n"
+                "## 部署用 index digest\n宿主部署引用：\n"
+                "~~~~sh\n## 假标题\n- 假条目\n~~~~\n"
+                "### 子节\n- 部署校验说明\n"
+                "## 其他改动\n- 保留 `ling status` 与 [说明](https://example.test/docs)\n"
+            ),
         }
     ).encode("utf-8")
     result = run_updater(ws)
@@ -3900,8 +3976,36 @@ def test_release_notes_fall_back_to_the_github_release(ws: Workspace) -> None:
     assert notes["state"] == "ok"
     entry = notes["notes"][TARGET_VERSION]
     assert entry["summary"] == "日程与发送链路修复"
-    assert entry["items"] == ["完成证据分三类", "长链接不再整条被拒"]
+    assert entry["items"] == [
+        "完成证据分三类", "保留 `ling status` 与 [说明](https://example.test/docs)",
+    ]
     assert entry["url"].startswith("https://github.com/qsbb/ling/releases/tag/")
+
+
+def test_release_notes_keep_link_when_there_is_no_user_summary(ws: Workspace) -> None:
+    url = f"https://github.com/qsbb/ling/releases/tag/v{TARGET_VERSION}"
+    ws.http.release_body = json.dumps({
+        "html_url": url,
+        "body": "* **Full Changelog**: https://example.test/compare\n"
+        "## 部署用 index digest\n宿主部署引用：\n```\nLING_APP_IMAGE=example\n```\n",
+    }).encode("utf-8")
+    assert run_updater(ws).returncode == 0
+    assert ws.status()["release_notes"]["notes"][TARGET_VERSION] == {
+        "summary": None, "items": [], "url": url,
+    }
+
+
+def test_release_notes_preserve_excerpt_order_and_ignore_indented_code() -> None:
+    updater = _updater_module()
+    body = (
+        "## 功能改动\n- 第一条\n\n"
+        "    - 不是发布条目\n"
+        "  \t- tab 缩进也不是发布条目\n\n"
+        "后续正文里的部署提醒仍然保留。\n- 最后一条\n"
+    )
+    assert updater._release_body_note(body) == (
+        None, ["第一条", "后续正文里的部署提醒仍然保留。", "最后一条"],
+    )
 
 
 def test_release_notes_github_failure_does_not_change_the_target(ws: Workspace) -> None:

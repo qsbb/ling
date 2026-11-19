@@ -879,10 +879,7 @@ async def create_update_request(
 #    ``idle``，也绝不转发原始日志、备份路径、口令或更新器自己写的 message 文本。
 # 3. 镜像模式下老端点 ``POST /v1/version/update-requests`` **显式拒绝**（见上面
 #    ``create_update_request``）：不能在同一 ``v1`` 语义下把更新源换成 digest。
-# 4. 恢复点门禁读 ``status.json`` 的**顶层** ``backup_gate``（更新器扫描备份目录
-#    得出，与任务无关）；只有该字段**缺失**时才回退到 ``task.backup``（兼容旧状态
-#    文件）。原因是死锁：``task`` 要等第一次任务处理完才存在，而第一次任务要先过
-#    恢复点门禁——只看 ``task.backup`` 的话，全新镜像部署的网页更新永远不可安装。
+# 4. 历史备份只作诊断。更新器会在任务中停写、创建并校验本次恢复点，再迁移。
 # 5. **发现事实只有一个来源**：更新器写的 ``status.json`` 顶层 ``release_check``
 #    （它自己查 registry 的 tags/manifest 得出的脱敏结论）。API **不再读**可信
 #    发布目录：``deploy/releases.json`` / ``catalog.py`` / ``min_from`` /
@@ -1095,7 +1092,6 @@ IMAGE_UNKNOWN_REASONS: dict[str, str] = {
 IMAGE_UNAVAILABLE_REASONS: dict[str, str] = {
     "digest_unresolved": "新版已发布，但暂时取不到安装包",
     "platform_unsupported": "新版本没有适合这台机器的镜像",
-    "backup_gate_missing": "更新前需要一个可用备份，请先完成一次备份",
     "update_disabled": "本机尚未启用网页更新",
     "manual_required": "上次更新还没处理完，请先按提示处理上次更新",
     "current_image_unknown": "无法确认当前运行的是哪一版镜像",
@@ -1176,10 +1172,6 @@ IMAGE_REASON_MESSAGES: dict[str, str] = {
     "updater_offline": "更新器离线：状态已过期，无法确认它还能执行更新",
     "manual_required": "更新器要求人工处理（上一个任务未收尾），暂不接受新任务",
     "update_in_progress": "已有更新请求在进行中，不能重复提交",
-    "backup_gate_missing": (
-        "没有可用的恢复点：备份目录里看不到完整的备份 manifest，"
-        "更新前的备份/恢复门禁未就绪"
-    ),
     "current_image_unknown": "无法确认当前运行镜像摘要或提交，暂不允许更新",
     "no_available_target": "暂无可更新的版本（镜像仓库里没有比当前更高、且摘要可用的版本）",
     "target_not_available": "目标摘要不是这次检查发现的新版本，拒绝提交",
@@ -1213,7 +1205,6 @@ IMAGE_REASON_STATUS: dict[str, int] = {
     "updater_offline": 409,
     "manual_required": 409,
     "update_in_progress": 409,
-    "backup_gate_missing": 409,
     "current_image_unknown": 409,
     "no_available_target": 409,
     "target_not_available": 409,
@@ -1251,10 +1242,6 @@ IMAGE_REASON_NEXT_ACTIONS: dict[str, tuple[str, ...]] = {
     "updater_offline": ("检查 ling-updater 容器状态与状态目录写权限，等它重新写状态",),
     "manual_required": ("在宿主按任务 ID 人工核对后执行 --acknowledge-manual",),
     "update_in_progress": ("等待当前任务结束；不要重复提交，也不要手工改动请求目录",),
-    "backup_gate_missing": (
-        "在宿主跑一次备份（ling backup 或每日 cron），确认备份目录里有完整的"
-        "manifest；更新器写出 restore_point=true 的 backup_gate 后即可网页更新",
-    ),
     "current_image_unknown": ("在宿主把 LING_APP_IMAGE 与 LING_COMMIT 注入 API 容器后重启",),
     "no_available_target": (
         "重新检查一次更新；仍然没有目标就核对更新器到镜像仓库（GHCR）的连通性与"
@@ -2146,12 +2133,8 @@ class ImageUpdateChannel:
         self.task = _image_task_view(raw_task)
         self.task_unreadable = raw_task is not None and self.task is None
         self.pending_ids = _image_pending_request_ids(self.requests_dir)
-        # **恢复点门禁优先读顶层 ``backup_gate``**：它由更新器扫描备份目录得出，
-        # 与 task 无关。只看 ``task.backup`` 会死锁——第一次更新之前根本没有 task，
-        # 而第一次更新又要先过这道门（全新镜像部署的网页更新永远"不可安装"）。
-        # 只有状态文件里**没有**这个字段时才回退到 ``task.backup``（兼容旧更新器
-        # 写出的状态文件）。字段存在但内容不认识/自相矛盾时**不**回退：门禁是
-        # fail closed 的，宁可说"没有恢复点"也不拿旧任务记录蒙混过关。
+        # 历史恢复点仅作诊断；顶层字段缺失才兼容旧任务的备份记录。
+        # 字段存在但无效时不拿旧任务冒充当前可用的恢复点。
         raw_gate = None if payload is None else payload.get("backup_gate")
         self.backup_gate_present = raw_gate is not None
         self.backup_gate = _image_backup_gate_view(raw_gate) if raw_gate is not None else None
@@ -2340,7 +2323,7 @@ class ImageUpdateChannel:
     def _install_blocker(self) -> str | None:
         """会挡住安装、但**不影响**「有没有新版本」的门禁。
 
-        顺序与 :meth:`reason` 一致（开关 → 人工门禁 → 恢复点 → 当前镜像），但
+        顺序与 :meth:`reason` 一致（开关 → 人工门禁 → 当前镜像），但
         刻意不含"进行中"：活动任务的进度由 ``task`` 展示，``state`` 仍按发现结果
         给（设计 §卡片与四态：「活动任务覆盖结论展示」而不是新增第五种状态）。
         """
@@ -2348,8 +2331,6 @@ class ImageUpdateChannel:
             return "update_disabled"
         if self.updater["state"] == "needs_manual":
             return "manual_required"
-        if self.restore_point is None:
-            return "backup_gate_missing"
         if current_image_ref() is None or _image_commit(build_commit()) is None:
             return "current_image_unknown"
         return None
@@ -2663,7 +2644,7 @@ class ImageUpdateChannel:
         """返回第一个不适用的 reason；全部通过返回 None。
 
         顺序是刻意排的：拓扑 → 开关 → 权限 → 通道目录 → 状态 → 协议 → 人工门禁
-        → 进行中/重复 → 离线 → 恢复点 → 当前镜像。已经明确「进行中」或「重复」
+        → 进行中/重复 → 离线 → 当前镜像。已经明确「进行中」或「重复」
         时不再报「离线」——那会让正在跑任务的更新器看起来像是死了。
         """
         if not self.image_mode:
@@ -2694,8 +2675,6 @@ class ImageUpdateChannel:
             return "update_in_progress"
         if not self.updater["online"]:
             return "updater_offline"
-        if self.restore_point is None:
-            return "backup_gate_missing"
         if current_image_ref() is None or _image_commit(build_commit()) is None:
             return "current_image_unknown"
         if self.target is None:
@@ -2978,7 +2957,7 @@ async def create_image_update_request(
 
     1. 所有者权限 → 来源/CSRF → 限流；
     2. 请求体上限 + 固定格式（多余字段/非 digest/未确认一律 422）；
-    3. 通道门禁（开关、更新器在线、协议、恢复点、当前镜像…）→ 409/403；
+    3. 通道门禁（开关、更新器在线、协议、当前镜像…）→ 409/403；
     4. 期望当前值与实测的 ``LING_COMMIT`` / ``LING_APP_IMAGE`` 逐项比对；
     5. 在 ``requests/.lock`` 内复查重复/进行中，再临时文件 + rename 原子写入。
     """

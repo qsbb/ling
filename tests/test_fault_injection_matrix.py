@@ -27,7 +27,7 @@
 11. 断连重连（前端轮询中断后继续）——同一 request_id 延续，不断言失败
 12. 旧执行器残留（源码模式 pending.json / 旧 status）——显式拒绝或忽略
 13. 并发请求（同时两个请求 / 同一 request_id 重放）——单飞、第二个被拒
-14. API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不是这次检查发现的那个）
+14. API 侧门禁（开关关、更新器离线、协议不兼容、目标不是这次检查发现的那个）
 
 **复用**：``tests/test_release_publish.py`` 的 publish 工作区与 docker stub、
 ``tests/test_updater.py`` 的 updater 工作区与 docker stub、
@@ -473,10 +473,10 @@ def test_04_publish_refuses_migration_when_media_partial(
 
 
 @pytest.mark.w0_web
-async def test_04_api_blocks_request_when_media_partial(
+async def test_04_api_reports_historical_media_partial(
     logged_in: Any, tmp_path: Path
 ) -> None:
-    """清单第 4 条（API 侧）：恢复点媒体不完整 → 不可安装、拒绝提交、原因可执行。"""
+    """过往备份不完整只作诊断，迁移由本次备份校验约束。"""
     base = api_harness._configure(logged_in, tmp_path)
     api_harness._write_status(
         base,
@@ -485,16 +485,14 @@ async def test_04_api_blocks_request_when_media_partial(
         backup_gate=api_harness._gate(media="partial", reason="media_partial"),
     )
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["restore_point"] is False
     assert view["backup_gate"]["media_state"] == "partial"
     assert "媒体" in (view["backup_gate"]["reason_message"] or "")
-    assert view["next_actions"]
     response = await api_harness._post(logged_in)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == "backup_gate_missing"
-    assert api_harness._request_files(base) == []
+    assert response.status_code == 201, response.text
+    assert len(api_harness._request_files(base)) == 1
 
 
 def test_04_updater_backup_gate_reports_media_partial(
@@ -535,10 +533,10 @@ def test_05_publish_refuses_migration_when_root_key_absent(
 
 
 @pytest.mark.w0_web
-async def test_05_api_blocks_request_when_root_key_missing(
+async def test_05_api_reports_historical_root_key_missing(
     logged_in: Any, tmp_path: Path
 ) -> None:
-    """清单第 5 条（API 侧）：缺根密钥 → 恢复点无效、不可安装、拒绝提交。"""
+    """过往备份不完整只作诊断，迁移由本次备份校验约束。"""
     base = api_harness._configure(logged_in, tmp_path)
     api_harness._write_status(
         base,
@@ -548,16 +546,15 @@ async def test_05_api_blocks_request_when_root_key_missing(
         ),
     )
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["restore_point"] is False
     assert view["backup_gate"]["keys_env_set"] == "false"
     assert view["backup_gate"]["keys_root"] == "absent"
     assert "根密钥" in (view["backup_gate"]["reason_message"] or "")
     response = await api_harness._post(logged_in)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == "backup_gate_missing"
-    assert api_harness._request_files(base) == []
+    assert response.status_code == 201, response.text
+    assert len(api_harness._request_files(base)) == 1
 
 
 def test_05_updater_backup_gate_reports_keys_missing(
@@ -1234,7 +1231,7 @@ async def test_13_api_duplicate_request_id_replay_writes_only_one_file(
 
 
 # ================================================================ 清单第 14 条
-# API 侧门禁（开关关、更新器离线、协议不兼容、无恢复点、目标不是这次发现的那个）。
+# API 侧门禁（开关关、更新器离线、协议不兼容、目标不是这次发现的那个）。
 
 
 @pytest.mark.parametrize(
@@ -1243,7 +1240,6 @@ async def test_13_api_duplicate_request_id_replay_writes_only_one_file(
         ("disabled", "update_disabled"),
         ("offline", "updater_offline"),
         ("protocol", "protocol_unsupported"),
-        ("no_restore_point", "backup_gate_missing"),
         ("target_not_discovered", "target_not_available"),
     ],
 )
@@ -1251,7 +1247,7 @@ async def test_13_api_duplicate_request_id_replay_writes_only_one_file(
 async def test_14_api_gates_reject_with_actionable_reason(
     logged_in: Any, tmp_path: Path, case: str, expected_reason: str
 ) -> None:
-    """清单第 14 条：五类门禁都必须拒绝，并给出可执行原因（文案 + 下一步）。"""
+    """清单第 14 条：四类门禁都必须拒绝，并给出可执行原因（文案 + 下一步）。"""
     target_digest = api_harness.TARGET_DIGEST
     if case == "disabled":
         base = api_harness._configure(logged_in, tmp_path, enabled=False)
@@ -1262,15 +1258,6 @@ async def test_14_api_gates_reject_with_actionable_reason(
     elif case == "protocol":
         base = api_harness._configure(logged_in, tmp_path)
         api_harness._write_status(base, protocol=2)
-    elif case == "no_restore_point":
-        base = api_harness._configure(logged_in, tmp_path)
-        api_harness._write_status(
-            base,
-            task=None,
-            backup_gate=api_harness._gate(
-                restore_point=False, reason="manifest_incomplete"
-            ),
-        )
     else:
         base = api_harness._configure(logged_in, tmp_path)
         api_harness._write_status(base)

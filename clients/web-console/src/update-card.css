@@ -97,9 +97,6 @@
 /* ---------------------------------------------------------------- 更新内容 */
 
 .update-notes {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
   padding-top: 12px;
   border-top: 1px dashed var(--line);
   min-width: 0;
@@ -113,6 +110,15 @@
   color: var(--ink);
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.update-notes__title,
+.update-download-options > summary {
+  cursor: pointer;
+}
+
+.update-notes[open] > :not(summary) {
+  margin-top: 8px;
 }
 
 .update-notes__summary {
@@ -149,7 +155,7 @@
 }
 
 .update-notes__link {
-  align-self: flex-start;
+  display: inline-block;
   max-width: 100%;
   color: var(--accent);
   font-size: 12.5px;
