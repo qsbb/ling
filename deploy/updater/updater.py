@@ -2036,30 +2036,49 @@ def _note_line(value: object, limit: int) -> str | None:
 
 
 def _release_body_note(body: object) -> tuple[str | None, list[str]]:
-    """把 Release 正文压成 ``(summary, items)``：首行当摘要，列表项当条目。
+    """按原顺序摘取发布说明的正文和列表，不在更新卡片渲染完整 Markdown。
 
-    **不改写、不总结、不加重要程度**：这是发布方原话（设计 §附「文案纪律」）。
-    只做折行归一、长度上限与条目数上限——超限的那条按字数截断，不整条丢掉
-    （整条丢掉会让"他写了但页面没有"变成新的困惑）。
+    跳过标题、表格、代码和流水线附加的部署段及比较链接；完整格式留给原文页面。
     """
     summary: str | None = None
     items: list[str] = []
     if not isinstance(body, str):
         return None, items
+    deployment_level: int | None = None
+    fence: str | None = None
     for raw in body.splitlines():
         stripped = raw.strip()
-        if not stripped or stripped.startswith(("#", "```", "|")):
+        if fence is not None:
+            if stripped.startswith(fence) and not stripped.strip(fence[0]):
+                fence = None
             continue
-        is_bullet = stripped[0] in "-*+"
-        text = _note_line(stripped.lstrip("-*+> \t"), MAX_NOTE_ITEM_CHARS)
+        if raw.startswith("    ") or raw[:4].lstrip(" ").startswith("\t"):
+            continue
+        opening = re.match(r"(`{3,}|~{3,})", stripped)
+        if opening:
+            fence = opening[0]
+            continue
+        heading = re.fullmatch(r"(#{1,6})\s+(.+?)\s*#*", stripped)
+        if heading:
+            level = len(heading[1])
+            if deployment_level is not None and level <= deployment_level:
+                deployment_level = None
+            if heading[2] == "部署用 index digest" and deployment_level is None:
+                deployment_level = level
+            continue
+        if deployment_level is not None or not stripped or stripped.startswith("|"):
+            continue
+        bullet = re.match(r"[-*+]\s+", stripped)
+        line = stripped[bullet.end() :] if bullet else stripped
+        if re.match(r"(?:\*\*|__)?Full Changelog(?:\*\*|__)?\s*:", line, re.IGNORECASE):
+            continue
+        text = _note_line(line.lstrip("> \t"), MAX_NOTE_ITEM_CHARS)
         if text is None:
             continue
-        if is_bullet:
-            if len(items) >= MAX_NOTE_ITEMS:
-                continue
-            items.append(text)
-        elif summary is None:
+        if bullet is None and summary is None and not items:
             summary = _note_line(text, MAX_NOTE_SUMMARY_CHARS)
+        elif len(items) < MAX_NOTE_ITEMS:
+            items.append(text)
     return summary, items
 
 
@@ -2081,7 +2100,7 @@ def github_release_note(version: str) -> dict[str, Any] | None:
     url = _note_line(payload.get("html_url"), MAX_NOTE_URL_CHARS)
     if url is not None and not url.startswith("https://"):
         url = None
-    if summary is None and not items:
+    if summary is None and not items and url is None:
         return None
     return {"summary": summary, "items": items, "url": url}
 

@@ -3949,7 +3949,15 @@ def test_release_notes_fall_back_to_the_github_release(ws: Workspace) -> None:
             "html_url": "https://github.com/qsbb/ling/releases/tag/v0.0.2",
             "draft": False,
             "prerelease": False,
-            "body": "日程与发送链路修复\n\n- 完成证据分三类\n- 长链接不再整条被拒\n",
+            "body": (
+                "日程与发送链路修复\n\n- 完成证据分三类\n"
+                "```text\n- 代码块不应显示\n```\n"
+                "**Full Changelog**: https://example.test/compare\n"
+                "## 部署用 index digest\n宿主部署引用：\n"
+                "~~~~sh\n## 假标题\n- 假条目\n~~~~\n"
+                "### 子节\n- 部署校验说明\n"
+                "## 其他改动\n- 保留 `ling status` 与 [说明](https://example.test/docs)\n"
+            ),
         }
     ).encode("utf-8")
     result = run_updater(ws)
@@ -3958,8 +3966,36 @@ def test_release_notes_fall_back_to_the_github_release(ws: Workspace) -> None:
     assert notes["state"] == "ok"
     entry = notes["notes"][TARGET_VERSION]
     assert entry["summary"] == "日程与发送链路修复"
-    assert entry["items"] == ["完成证据分三类", "长链接不再整条被拒"]
+    assert entry["items"] == [
+        "完成证据分三类", "保留 `ling status` 与 [说明](https://example.test/docs)",
+    ]
     assert entry["url"].startswith("https://github.com/qsbb/ling/releases/tag/")
+
+
+def test_release_notes_keep_link_when_there_is_no_user_summary(ws: Workspace) -> None:
+    url = f"https://github.com/qsbb/ling/releases/tag/v{TARGET_VERSION}"
+    ws.http.release_body = json.dumps({
+        "html_url": url,
+        "body": "* **Full Changelog**: https://example.test/compare\n"
+        "## 部署用 index digest\n宿主部署引用：\n```\nLING_APP_IMAGE=example\n```\n",
+    }).encode("utf-8")
+    assert run_updater(ws).returncode == 0
+    assert ws.status()["release_notes"]["notes"][TARGET_VERSION] == {
+        "summary": None, "items": [], "url": url,
+    }
+
+
+def test_release_notes_preserve_excerpt_order_and_ignore_indented_code() -> None:
+    updater = _updater_module()
+    body = (
+        "## 功能改动\n- 第一条\n\n"
+        "    - 不是发布条目\n"
+        "  \t- tab 缩进也不是发布条目\n\n"
+        "后续正文里的部署提醒仍然保留。\n- 最后一条\n"
+    )
+    assert updater._release_body_note(body) == (
+        None, ["第一条", "后续正文里的部署提醒仍然保留。", "最后一条"],
+    )
 
 
 def test_release_notes_github_failure_does_not_change_the_target(ws: Workspace) -> None:
