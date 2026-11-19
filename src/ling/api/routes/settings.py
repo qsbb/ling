@@ -647,7 +647,7 @@ async def _connector_field_views(
     session: AsyncSession,
     *,
     settings: object,
-    app_state: object,
+    access_baseline: object,
     include_sensitive: bool,
     instances: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, object]]]:
@@ -692,7 +692,7 @@ async def _connector_field_views(
             session,
             scope=scope,
             instance_id=(instances or {}).get(scope, DEFAULT_INSTANCE_ID),
-            settings=settings,
+            settings=access_baseline if scope == cf.SCOPE_ACCESS else settings,
             onebot=onebot_cfg,
             qqbot=qqbot_cfg,
             include_secrets=False,
@@ -873,8 +873,8 @@ async def get_connectors(
         views.append(view)
     field_views = await _connector_field_views(
         session,
-        settings=request.app.state.connector_config_baseline,
-        app_state=request.app.state,
+        settings=settings,
+        access_baseline=request.app.state.connector_config_baseline,
         include_sensitive=is_owner,
         instances=live,
     )
