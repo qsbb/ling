@@ -115,8 +115,6 @@ PROVIDER_CAPABILITIES: dict[ProviderKind, frozenset[ModelCapability]] = {
     # - `ADAPTER_NATIVE_TOOLS_KINDS`：**本仓库适配器**实现了编解码的 kind；
     # - `provider_native_tools_support()`：具体实例的显式声明。
     ProviderKind.openai_compatible: frozenset({ModelCapability.chat}),
-    # Responses / Anthropic：协议有工具，但本仓库适配器**未实现**——
-    # 不发 `tools`、不解析工具事件（见 `ADAPTER_NATIVE_TOOLS_KINDS` 的说明）。
     ProviderKind.anthropic: frozenset({ModelCapability.chat}),
     ProviderKind.chat_responses: frozenset({ModelCapability.chat}),
     ProviderKind.local: frozenset({ModelCapability.chat}),
@@ -248,27 +246,22 @@ def profile_supports_native_tools(profile: str) -> bool:
 #: ``openai_compatible`` 与 ``local`` 共用 Chat Completions 编解码，
 #: 发送 ``tools`` / ``tool_choice`` 并解析流式 ``delta.tool_calls``。
 #:
-#: **Responses（``chat_responses``）与 Anthropic（``anthropic``）未实现。**
-#: 它们的回灌形状不是 ``role:"tool"``，不能复用这个适配器的编解码；本期
-#: 明确不做。对它们的正确处理是"这一轮工具标为不可用"，**不是**退化成
-#: "让模型把查询写成文本标签"——那种退化没有执行、没有回灌，模型只能编。
+#: ``chat_responses`` 与 ``anthropic`` 各自使用原生的调用／回灌形状。
 ADAPTER_NATIVE_TOOLS_KINDS: frozenset[str] = frozenset(
-    {ProviderKind.openai_compatible.value, ProviderKind.local.value}
+    {
+        ProviderKind.openai_compatible.value,
+        ProviderKind.local.value,
+        ProviderKind.chat_responses.value,
+        ProviderKind.anthropic.value,
+    }
 )
 
 
 def kind_may_have_native_tools(kind: str) -> bool:
     """这个 kind 的**协议 + 本仓库适配器**有没有工具编解码能力。
 
-    它是**必要条件，不是充分条件**：
-
-    - ``openai_compatible`` / ``local``：适配器实现了 ``tools`` / 流式 ``tool_calls``；
-      但兼容层里有的端点直接丢掉 ``tools`` 字段还返回 200，所以真实判据是
-      适配器**实例**的声明（:func:`provider_native_tools_support`）；
-    - ``anthropic`` / ``chat_responses``：协议本身有工具，但本仓库适配器
-      **未实现**，所以这里为 ``False``——"未实现"的结果是这一轮工具标为
-      不可用，**不**退化成"让模型把查询写成文本标签"；
-    - ``fake`` / TTS 等：为 ``False``。
+    这是必要条件，不是充分条件：每个端点还要显式启用
+    （:func:`provider_native_tools_support`）。
 
     未知 kind → ``False``（失败关闭）。
     """
@@ -542,6 +535,20 @@ class ToolDefinition:
 
 
 @dataclass(frozen=True)
+class ProviderToolReplay:
+    """同一轮、同一模型目标回灌时需要的供应商原始上下文。
+
+    适配器写入并读回；编排层只原样携带，不解析、不执行、不落库或外发。
+    例如 Responses 的加密 reasoning item，或 Anthropic 的签名 thinking 块。
+    """
+
+    kind: ProviderKind
+    provider_id: str
+    model_id: str
+    items: tuple[dict[str, Any], ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
 class ToolCall:
     """模型提出的**一次**工具调用（供应商 wire 里的 ``tool_calls[i]``）。
 
@@ -565,6 +572,7 @@ class ToolCall:
     name: str
     arguments: str = ""
     raw_index: int = 0
+    provider_replay: ProviderToolReplay | None = field(default=None, repr=False, compare=False)
 
     def parsed_arguments(self) -> dict[str, Any]:
         """解析参数。解析失败抛 ``ValueError``（带可读原因），不要静默成 ``{}``。
@@ -699,6 +707,7 @@ __all__ = [
     "PROVIDER_CAPABILITIES",
     "ChatMessageIn",
     "ModelChunkKind",
+    "ProviderToolReplay",
     "ToolCall",
     "ToolDefinition",
     "VideoPart",

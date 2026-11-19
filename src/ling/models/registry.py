@@ -90,6 +90,7 @@ class ProviderRegistry:
                 provider_id=cfg.provider_id,
                 base_url=cfg.base_url or "https://api.anthropic.com/v1",
                 api_key=self._secret_reader(cfg.provider_id),
+                native_tools=cfg.extra.get("native_tools") is True,
                 timeout_seconds=cfg.timeout_seconds,
                 secret_hint=self._secret_hint,
             )
@@ -100,6 +101,7 @@ class ProviderRegistry:
                 provider_id=cfg.provider_id,
                 base_url=cfg.base_url or "https://api.openai.com/v1",
                 api_key=self._secret_reader(cfg.provider_id),
+                native_tools=cfg.extra.get("native_tools") is True,
                 timeout_seconds=cfg.timeout_seconds,
                 secret_hint=self._secret_hint,
             )

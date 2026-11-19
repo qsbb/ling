@@ -334,6 +334,30 @@ function renderProvider(provider: ProviderDraftInput, knownKinds: string[] = [])
   );
 }
 
+describe('供应商原生工具配置', () => {
+  it.each(['chat_responses', 'anthropic', 'openai_compatible', 'local'])(
+    '%s 必须显式开启才显示已启用',
+    (kind) => {
+      const provider = { ...PROVIDERS[0]!, kind };
+      const toolSwitch = (html: string) =>
+        html.match(/<button[^>]*aria-label="端点支持原生工具调用"[^>]*>/)?.[0];
+      expect(toolSwitch(renderProvider(provider))).toContain('aria-checked="false"');
+      expect(toolSwitch(renderProvider({ ...provider, extra: { native_tools: 'true' } }))).toContain(
+        'aria-checked="false"',
+      );
+      expect(toolSwitch(renderProvider({ ...provider, extra: { native_tools: true } }))).toContain(
+        'aria-checked="true"',
+      );
+    },
+  );
+
+  it('未接原生工具编解码的类型不展示开关', () => {
+    expect(renderProvider({ ...PROVIDERS[0]!, kind: 'fake' })).not.toContain(
+      'aria-label="端点支持原生工具调用"',
+    );
+  });
+});
+
 describe('下拉值与草稿的互转', () => {
   it('跟随槽位 → FOLLOW；单独指定 → provider::model', () => {
     expect(roleSelectValue(undefined)).toBe(FOLLOW_SLOT);

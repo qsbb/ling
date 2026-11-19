@@ -663,7 +663,7 @@ export function ProvidersPanel({
                   }
                 />
               </label>
-              {selected.kind === 'openai_compatible' || selected.kind === 'local' ? (
+              {['openai_compatible', 'local', 'chat_responses', 'anthropic'].includes(selected.kind) ? (
                 <div className="ms-field ms-field--wide">
                   <span className="ms-field__label">端点支持原生工具调用</span>
                   <MsSwitch
@@ -676,7 +676,7 @@ export function ProvidersPanel({
                     }
                   />
                   <span className="ms-hint">
-                    确认该端点及对话模型支持流式工具调用后开启。
+                    确认该端点及对话模型支持原生流式工具调用后开启；此项不改变工具权限。
                   </span>
                 </div>
               ) : null}

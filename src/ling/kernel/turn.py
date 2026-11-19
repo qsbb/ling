@@ -3739,6 +3739,7 @@ class _ToolCallStream:
                     "id": call.provider_call_id,
                     "name": call.name,
                     "arguments": call.arguments,
+                    "replay": call.provider_replay,
                 }
             else:
                 # 后续分片：只补**还没有**的字段。开始事件里的 name 可能只有
@@ -3752,6 +3753,8 @@ class _ToolCallStream:
                     else:
                         slot["name"] += call.name
                 slot["arguments"] += call.arguments
+                if call.provider_replay is not None:
+                    slot["replay"] = call.provider_replay
         if chunk.tool_arguments_delta is not None:
             slot = self._slot_for(chunk.provider_call_id)
             if slot is not None:
@@ -3766,6 +3769,7 @@ class _ToolCallStream:
             "id": call.provider_call_id,
             "name": call.name,
             "arguments": call.arguments,
+            "replay": call.provider_replay,
         }
 
     def _slot_for(self, provider_call_id: str | None) -> dict[str, Any] | None:
@@ -3788,6 +3792,7 @@ class _ToolCallStream:
                 name=str(self.calls[index]["name"] or ""),
                 arguments=str(self.calls[index]["arguments"] or ""),
                 raw_index=index,
+                provider_replay=self.calls[index]["replay"],
             )
             for index in sorted(self.calls)
         ]

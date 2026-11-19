@@ -143,12 +143,9 @@ def test_wired_profile_only() -> None:
 # ------------------------------------------------------- 4. 供应商 kind 不支持
 
 
-@pytest.mark.parametrize("kind", ["anthropic", "chat_responses", "fake"])
+@pytest.mark.parametrize("kind", ["fake", "mimo_chat"])
 def test_kind_without_codec_is_kind_has_no_native_tools(kind: str) -> None:
     """角色对、开关开、注册表也有，但 kind 没有编解码 → ``kind_has_no_native_tools``。
-
-    三个 kind 一起参数化，是因为它们的**修法相同**（换供应商类型），但成因
-    不同：两个是"协议有工具、本仓库适配器未实现"，一个是"根本没有这个概念"。
 
     这一条的打点很关键：`_config(kind=...)` 把 provider 的 kind 换掉，而
     router 仍声明支持。如果实现先问 router 再问 kind，这里会变成

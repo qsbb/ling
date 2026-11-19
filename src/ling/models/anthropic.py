@@ -26,14 +26,25 @@ from typing import Any
 
 import httpx
 
+from ling.models.native_tools import (
+    internal_tool_name,
+    scoped_tool_replay,
+    tool_message_groups,
+    tool_protocol_error,
+    tool_schema,
+    wire_tool_name,
+)
 from ling.ports.model import (
     ChatMessageIn,
     ModelChunk,
+    ModelChunkKind,
     ModelError,
     ModelErrorKind,
     ModelRequest,
     ProbeResult,
     ProviderKind,
+    ProviderToolReplay,
+    ToolCall,
     Usage,
 )
 
@@ -50,12 +61,14 @@ class AnthropicProvider:
         api_key: str | None,
         timeout_seconds: float = 60.0,
         secret_hint: Callable[[str], str] | None = None,
+        native_tools: bool = False,
     ) -> None:
         self.provider_id = provider_id
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout_seconds
         self._secret_hint = secret_hint
+        self.supports_native_tools = native_tools is True
         self.last_usage: Usage | None = None
 
     def _headers(self) -> dict[str, str]:
@@ -81,15 +94,34 @@ class AnthropicProvider:
                 message = f"供应商 {self.provider_id} 还没有保存密钥"
             raise ModelError(ModelErrorKind.missing_secret, message, retriable=False)
 
+        self.last_usage = None
+        use_tools = self.supports_native_tools and bool(request.tools)
         system_parts: list[str] = []
         turns: list[dict[str, Any]] = []
-        # 循环变量不叫 `message`：上面密钥那段已经用同名局部变量存错误文案，
-        # 复用同名会让 mypy 把这条消息推断成 str。
-        for item in request.messages:
+        for item, results in tool_message_groups(
+            request.messages, enabled=self.supports_native_tools
+        ):
             if item.role == "system":
                 system_parts.append(item.content)
-                continue
-            turns.append(_encode_turn(item))
+            elif item.tool_calls:
+                replay = scoped_tool_replay(
+                    item.tool_calls,
+                    kind=self.kind,
+                    provider_id=self.provider_id,
+                    model_id=request.model_id,
+                )
+                turns.extend(
+                    (
+                        {"role": "assistant", "content": _encode_call_batch(item, replay)},
+                        # 所有并行结果必须在紧随其后的同一条 user 消息里。
+                        {
+                            "role": "user",
+                            "content": [_encode_tool_result(result) for result in results],
+                        },
+                    )
+                )
+            else:
+                turns.append(_encode_turn(item))
 
         payload: dict[str, Any] = {
             "model": request.model_id,
@@ -104,6 +136,22 @@ class AnthropicProvider:
             payload["system"] = "\n\n".join(system_parts)
         if request.temperature is not None:
             payload["temperature"] = request.temperature
+
+        if use_tools:
+            payload["tools"] = [
+                {
+                    "name": wire_tool_name(tool.name),
+                    "description": tool.description,
+                    "input_schema": tool_schema(tool),
+                    **({"strict": True} if tool.strict else {}),
+                }
+                for tool in request.tools
+            ]
+            if request.tool_choice is not None or request.parallel_tool_calls is False:
+                choice = request.tool_choice or "auto"
+                payload["tool_choice"] = {"type": "any" if choice == "required" else choice}
+                if choice != "none" and request.parallel_tool_calls is False:
+                    payload["tool_choice"]["disable_parallel_tool_use"] = True
 
         url = f"{self._base_url}/messages"
         try:
@@ -130,36 +178,61 @@ class AnthropicProvider:
                         f"供应商返回 HTTP {response.status_code}: {body}",
                         retriable=response.status_code >= 500,
                     )
+                blocks = _ToolBlocks() if use_tools else None
+                stop: str | None = None
+                prompt = completion = 0
                 async for line in response.aiter_lines():
                     line = line.strip()
                     if not line or not line.startswith("data:"):
                         continue
-                    data = line[5:].strip()
                     try:
-                        parsed = json.loads(data)
+                        parsed = json.loads(line[5:].strip())
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(parsed, dict):
+                        continue
                     event = parsed.get("type")
-                    if event == "content_block_delta":
-                        delta = (parsed.get("delta") or {}).get("text")
-                        if delta:
-                            yield ModelChunk(delta=str(delta))
-                    elif event == "message_delta":
-                        usage = parsed.get("usage") or {}
+                    if blocks is not None:
+                        blocks.feed(event, parsed)
+                    if event == "content_block_start":
+                        block = parsed.get("content_block") or {}
+                        if block.get("type") == "text" and block.get("text"):
+                            yield ModelChunk(delta=block["text"])
+                    elif event == "content_block_delta":
+                        delta = parsed.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            yield ModelChunk(delta=str(delta["text"]))
+                    elif event in {"message_start", "message_delta"}:
+                        envelope = (
+                            parsed.get("message") or {} if event == "message_start" else parsed
+                        )
+                        usage = envelope.get("usage") or {}
                         if usage:
-                            prompt = int(usage.get("input_tokens", 0) or 0)
-                            completion = int(usage.get("output_tokens", 0) or 0)
+                            prompt = int(usage.get("input_tokens", prompt) or 0)
+                            completion = int(usage.get("output_tokens", completion) or 0)
                             self.last_usage = Usage(
                                 prompt_tokens=prompt,
                                 completion_tokens=completion,
                                 total_tokens=prompt + completion,
                             )
-                        stop = (parsed.get("delta") or {}).get("stop_reason")
-                        if stop:
-                            yield ModelChunk(done=True, finish_reason=str(stop))
+                        if event == "message_delta":
+                            stop = (parsed.get("delta") or {}).get("stop_reason") or stop
                     elif event == "message_stop":
-                        # 某些代理不发 message_delta，靠这个兜底结束。
-                        yield ModelChunk(done=True, finish_reason="stop")
+                        if blocks is not None and (stop == "tool_use" or blocks.has_tool_calls):
+                            if stop != "tool_use" or request.tool_choice == "none":
+                                raise tool_protocol_error(
+                                    "Anthropic 工具步骤未正常结束或调用未获许可"
+                                )
+                            for call in blocks.complete(self.provider_id, request.model_id):
+                                yield ModelChunk(
+                                    kind=ModelChunkKind.tool_call,
+                                    tool_call=call,
+                                    provider_call_id=call.provider_call_id,
+                                    tool_call_complete=True,
+                                )
+                            stop = "tool_calls"
+                        yield ModelChunk(done=True, finish_reason=stop or "stop")
+                        return
                     elif event == "error":
                         detail = (parsed.get("error") or {}).get("message") or "未知错误"
                         raise ModelError(
@@ -167,6 +240,10 @@ class AnthropicProvider:
                             f"供应商 {self.provider_id} 返回错误: {detail}",
                             retriable=False,
                         )
+                if use_tools:
+                    raise tool_protocol_error("Anthropic 流在工具步骤结束前断开")
+                if stop:
+                    yield ModelChunk(done=True, finish_reason=stop)
         except httpx.TimeoutException as exc:
             raise ModelError(
                 ModelErrorKind.timeout, f"供应商 {self.provider_id} 响应超时", retriable=True
@@ -216,6 +293,134 @@ class AnthropicProvider:
         except (json.JSONDecodeError, AttributeError):
             pass
         return ProbeResult(ok=True, detail="端点可达且鉴权通过", models=models[:50])
+
+
+class _ToolBlocks:
+    """Collect official indexed content blocks until the whole step commits."""
+
+    def __init__(self) -> None:
+        self.blocks: dict[int, dict[str, Any]] = {}
+        self.arguments: dict[int, list[str]] = {}
+        self.closed: set[int] = set()
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.arguments)
+
+    def feed(self, event: str | None, payload: dict[str, Any]) -> None:
+        index = payload.get("index")
+        if not isinstance(index, int):
+            return
+        if event == "content_block_start":
+            block = payload.get("content_block") or {}
+            block_type = block.get("type")
+            if block_type in {"tool_use", "thinking", "redacted_thinking", "text"}:
+                self.blocks[index] = dict(block)
+            if block_type == "tool_use":
+                self.arguments[index] = []
+        elif event == "content_block_delta" and index in self.blocks:
+            block = self.blocks[index]
+            delta = payload.get("delta") or {}
+            delta_type = str(delta.get("type") or "")
+            if block["type"] == "tool_use" and delta_type == "input_json_delta":
+                self.arguments[index].append(delta.get("partial_json") or "")
+            else:
+                field = {
+                    ("text", "text_delta"): "text",
+                    ("thinking", "thinking_delta"): "thinking",
+                    ("thinking", "signature_delta"): "signature",
+                }.get((block["type"], delta_type))
+                if field is not None:
+                    block[field] = (block.get(field) or "") + (delta.get(field) or "")
+        elif event == "content_block_stop":
+            self.closed.add(index)
+
+    def complete(self, provider_id: str, model_id: str) -> list[ToolCall]:
+        if not self.arguments or not self.closed.issuperset(self.blocks):
+            raise tool_protocol_error("Anthropic 缺少完整的工具调用内容块")
+        items = sorted(self.blocks.items())
+        replay = ProviderToolReplay(
+            ProviderKind.anthropic, provider_id, model_id, tuple(block for _, block in items)
+        )
+        calls: list[ToolCall] = []
+        seen: set[str] = set()
+        for index, block in items:
+            if block["type"] != "tool_use":
+                continue
+            call_id, name = block.get("id"), block.get("name")
+            arguments = "".join(self.arguments[index])
+            if not arguments and isinstance(block.get("input"), dict):
+                arguments = json.dumps(block["input"], ensure_ascii=False)
+            if (
+                not isinstance(call_id, str)
+                or not call_id.strip()
+                or call_id in seen
+                or not isinstance(name, str)
+                or not name
+            ):
+                raise tool_protocol_error("Anthropic 返回了无法回灌的工具调用")
+            # Anthropic 的 tool_use.input 必须是对象，不能原样回灌破损的 JSON。
+            _parse_tool_input(arguments)
+            seen.add(call_id)
+            calls.append(ToolCall(call_id, internal_tool_name(name), arguments, index, replay))
+        return calls
+
+
+def _parse_tool_input(arguments: str) -> dict[str, Any]:
+    try:
+        value = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        raise tool_protocol_error("Anthropic 工具调用参数不是有效的 JSON 对象") from exc
+    if not isinstance(value, dict):
+        raise tool_protocol_error("Anthropic 工具调用参数不是有效的 JSON 对象")
+    return value
+
+
+def _encode_call_batch(
+    message: ChatMessageIn,
+    replay: ProviderToolReplay | None,
+) -> list[dict[str, Any]]:
+    calls = {
+        call.provider_call_id: {
+            "type": "tool_use",
+            "id": call.provider_call_id,
+            "name": wire_tool_name(call.name),
+            "input": _parse_tool_input(call.arguments or "{}"),
+        }
+        for call in message.tool_calls
+    }
+    if replay is None:
+        encoded = _encode_turn(message)["content"]
+        blocks = (
+            ([{"type": "text", "text": encoded}] if encoded else [])
+            if isinstance(encoded, str)
+            else encoded
+        )
+        return [*blocks, *calls.values()]
+    blocks = []
+    for block in replay.items:
+        if block["type"] == "tool_use":
+            call = calls.pop(block["id"], None)
+            if call is not None:
+                blocks.append(call)
+        else:
+            blocks.append(block)
+    return [*blocks, *calls.values()]
+
+
+def _encode_tool_result(result: ChatMessageIn) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": result.provider_call_id,
+        "content": result.content,
+    }
+    try:
+        payload = json.loads(result.content)
+    except json.JSONDecodeError:
+        return block
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        block["is_error"] = True
+    return block
 
 
 def _encode_turn(message: ChatMessageIn) -> dict[str, Any]:
