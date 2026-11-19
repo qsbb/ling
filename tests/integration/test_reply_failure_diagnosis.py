@@ -13,9 +13,8 @@
 本模块做四件事：
 
 1. 证明链路本身是通的（群消息 → 决策 → 生成 → 投递拿得到文本）；
-2. **复现**失败：让生成抛 ``ModelError``，断言日志与线上逐字一致——
-   同时证明"额度耗尽 / 鉴权失败 / 职责没有可用模型"这三种**完全不同的原因**
-   在日志里长得一模一样（这本身就是缺陷）；
+2. 让生成抛 ``ModelError``：入站和处置共用一行摘要，详情区分额度耗尽、
+   鉴权失败、职责没有可用模型等不同原因；
 3. 复现「供应商日额度用完」这条具体路径（`TokenQuotaStore` + 真实
    `ModelRouter`）：它不是故障、换家或等明天就好，却和密钥失效一样让轮次失败；
 4. 复现「职责解析不到可用模型」：真实 ``ModelRouter._resolved_binding``
@@ -212,9 +211,11 @@ async def _allow_immediate_group_decision(env: TestEnv) -> None:
         await svc.publish(draft.revision)
 
 
-def _behavior_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+def _inbound_behavior_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
-        r.getMessage() for r in caplog.records if r.name == "ling.behavior"
+        record for record in caplog.records
+        if record.name == "ling.behavior"
+        and getattr(record, "event_name", None) == "inbound_received"
     ]
 
 
@@ -285,13 +286,7 @@ async def test_model_error_reproduces_production_logs(
     message: str,
     retriable: bool,
 ) -> None:
-    """任何 ``ModelError`` 都收敛成同一句"轮次结束但没有可交付文本"。
-
-    修复前：**四种完全不同的原因，日志里一个字都不差**（只有 ``turn.failed |``
-    和一个 ``state=failed``）。这就是用户截图那三行，也是他无从下手的原因。
-    修复后：``code`` 与原因必须出现在同一行里——但状态机本身没变
-    （仍然是 failed、仍然没有可交付文本），变的只是**它说出来**。
-    """
+    """轮次失败时，入站摘要只报处置，结构化详情保留具体失败码。"""
     fake = _FakeOneBot()
     _install(logged_in, fake)
     await _bind(logged_in)
@@ -318,17 +313,17 @@ async def test_model_error_reproduces_production_logs(
         f"轮次结束但没有可交付文本（state=failed，error={kind.value}）"
     ), body
 
-    # ---- 与线上截图对齐的三行（第 2、3 行逐字相同）
+    # 运维诊断与面板里的入站详情分别保留供应商原因和本消息的处理结果。
     bridge = _bridge_lines(caplog)
     failures = [line for line in bridge if "失败（failed）：" in line]
     assert failures, bridge
     no_text = [line for line in bridge if line == "轮次结束但没有可交付文本"]
     assert no_text, bridge
-    behaviors = _behavior_lines(caplog)
-    assert (
-        f"对 Co 的话：没接话（轮次结束但没有可交付文本（state=failed，"
-        f"error={kind.value}））" in behaviors
-    ), behaviors
+    record, = _inbound_behavior_records(caplog)
+    assert record.getMessage() == "QQ 私聊里Co说：「111」 · 决定回复，未送达"
+    details = record.attributes["attributes"]
+    assert details["reason"] == body["reason"]
+    assert details["delivered"] is False
     # 原因写在失败那一行里，不用再去别处猜
     assert kind.value in failures[-1], failures[-1]
     assert message in failures[-1], failures[-1]
@@ -365,9 +360,9 @@ async def test_failure_log_does_not_say_why(caplog: pytest.LogCaptureFixture, lo
     # 原因与错误码都要落在这一行里
     assert "quota_exhausted" in line, line
     assert "额度已用完" in line, line
-    # 行为日志同样要能回答"为什么没接话"
-    behaviors = _behavior_lines(caplog)
-    assert any("quota_exhausted" in item for item in behaviors), behaviors
+    # 面板展开同一条入站记录就能看到原因，不必再找另一行。
+    record, = _inbound_behavior_records(caplog)
+    assert "quota_exhausted" in record.attributes["attributes"]["reason"]
 
 
 # ---------------------------------------------------------------- 3. 额度耗尽（真实 router + 真实记账）
