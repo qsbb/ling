@@ -54,6 +54,11 @@
           "title": "Accounts",
           "type": "array"
         },
+        "can_rename": {
+          "default": false,
+          "title": "Can Rename",
+          "type": "boolean"
+        },
         "display_name": {
           "title": "Display Name",
           "type": "string"

@@ -1596,6 +1596,7 @@ export interface SubjectRow {
   trust_level: string;
   /** 非空表示这个 subject 已被合并到别人名下（值就是那个人）。 */
   merged_into: string | null;
+  can_rename?: boolean;
   accounts: AccountRow[];
 }
 

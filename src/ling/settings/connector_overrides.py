@@ -224,6 +224,7 @@ _SETTINGS_ATTRS: dict[str, str] = {
     "LING_ONEBOT_WS_URL": "onebot_ws_url",
     "LING_ACCESS_MODE": "access_mode",
     "LING_ACCESS_LIST": "access_list",
+    "LING_ACCESS_GROUPS": "access_groups",
     "LING_QQBOT_ENABLED": "qqbot_enabled",
     "LING_QQBOT_APP_ID": "qqbot_app_id",
     "LING_QQBOT_CLIENT_SECRET": "qqbot_client_secret",
@@ -268,7 +269,7 @@ _QQBOT_ATTRS: dict[str, str] = {
 
 
 #: 名单类字段（值是集合/列表，需要先摊平成逗号串再解析）
-_LIST_KEYS = frozenset({"LING_ONEBOT_MEDIA_HOSTS", "LING_ACCESS_LIST"})
+_LIST_KEYS = frozenset({"LING_ONEBOT_MEDIA_HOSTS", "LING_ACCESS_LIST", "LING_ACCESS_GROUPS"})
 
 
 def _as_textish(value: Any) -> Any:
@@ -636,13 +637,13 @@ async def current_access_snapshot(
     *,
     settings: object | None = None,
 ) -> AccessSnapshot:
-    """读白名单的有效配置。``allow_groups`` 本轮仍来自 env（设计 §3）。"""
+    """读白名单的有效配置。"""
     resolved = await resolve_field_values(
         session, scope=cf.SCOPE_ACCESS, settings=settings, include_secrets=False
     )
     mode = str(resolved.get("LING_ACCESS_MODE") or "off")
     allow = resolved.items("LING_ACCESS_LIST")
-    groups = frozenset(getattr(settings, "access_groups", frozenset()) or frozenset())
+    groups = resolved.items("LING_ACCESS_GROUPS")
     return AccessSnapshot(
         generation=resolved.generation, mode=mode, allow_list=allow, allow_groups=groups
     )

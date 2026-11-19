@@ -95,7 +95,7 @@ JOB_NOTES: dict[str, str] = {
 #: 失败原因码 → 人话。**前端不许显示原因码**（设计 §0 的底线）。
 FAILURE_NOTES: dict[str, str] = {
     "budget_exhausted": "今天用来生成日程的调用次数或额度用完了，可以在设置里调整预算上限",
-    "model_unavailable": "现在没有可用的模型来排日程，可以先按规则安排，等模型恢复后再生成",
+    "model_unavailable": "日程生成需要可用的「记忆提取」模型，请在设置中检查 memory.extract 职责绑定",
     "outline_invalid": "模型给出的安排不合规，已经改按规则安排",
     "degraded_late": "这一天已经开始一段时间了，只能补接下来的确定安排",
     "needs_review": "有几个安排互相冲突，需要有人看一眼",

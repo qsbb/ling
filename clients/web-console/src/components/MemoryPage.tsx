@@ -1,28 +1,7 @@
 /**
- * 记忆内容页（`/memory`）。
- *
- * 页面上有四件不同性质的事，必须各自可见、互不掩盖：
- *
- * 1. **核心记忆**（`GET/PUT/DELETE /v1/core-memory`）：每轮常驻，20 条上限；
- *    同 label 覆盖而不是新增；删除是软删（active=false），没有恢复入口。
- * 2. **记忆列表**（`GET /v1/memory`）：按 kind 分段、时间倒序；默认**不显示**
- *    已撤回/已归档，墓碑要显式 `include=retracted|archived|all` 才取回。
- * 3. **单条操作**：撤回（必填理由）、纠正（supersede，旧条目变「已被纠正」）。
- * 4. **危险区**：遗忘全部（`POST /v1/memory/forget`）——二次确认 + 明说不可撤销 +
- *    **真删**（记忆 / 情节 / 核心记忆 / 意识条目 / 向量 / 实体关联 / 检索记录全部从库里
- *    物理删除）。清理在后台完成，所以提交后还要轮询 `GET /v1/memory/purge/status`
- *    拿到真实计数；轮询有上限（`PURGE_POLL_MAX_ATTEMPTS`），超时就说"仍在进行"。
- * 5. **「记忆与学习」调参 tab**（`?tab=settings`）：原 `/settings/memory` 的 4 个参数。
- *
- * 边界（读契约冻结时验收方点名的缺口，**不假装支持**）：
- * - **没有单条详情端点**（`GET /v1/memory/{id}` 不存在）：每行的「详情」只用列表
- *   已返回的字段渲染，不做二次请求，也不编造字段。
- * - **没有分页**（没有 offset/cursor，只有 limit 1..200）：界面只说「最多显示 N 条」，
- *   截断时明确告诉人「更早的条目在接口层面不可达」，不画假翻页。
- * - 无 `memory_episodes` / 实体 / 向量 / 检索日志读取端点：一律不做。
- *
- * 另一条硬要求：**任何一块读失败都不许盖住整页**。核心记忆 403 时列表照常显示，
- * 反之亦然——分段级错误条与整页错误面板是两种不同的东西。
+ * 记忆页：先找记录，再查看来源、可见范围与纠正历史。
+ * 浏览器只搜索已经加载的一批（最多 200 条），不调用对话召回，也无单条详情 API。
+ * 核心记忆、学习设置和永久清理互相独立，后台清理不随页内切换而取消。
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
@@ -46,34 +25,21 @@ import type {
   MemoryListResponse,
   MemoryRecord,
 } from '../types';
-import { AlertIcon, PencilIcon, RefreshIcon } from './Icons';
+import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
 
 /* ==================================================================== 文案表 */
 
-/** kind 的顺序与说法。`episode` 是发生过的事，`assertion` 是事实，`procedure` 是做法。 */
-const KIND_ORDER = ['episode', 'assertion', 'procedure'] as const;
+const BROWSE_KINDS = [
+  { value: 'all', label: '全部' },
+  { value: 'assertion', label: '事实与线索' },
+  { value: 'episode', label: '经历' },
+  { value: 'procedure', label: '做法' },
+] as const;
 
-const KIND_LABEL: Record<string, string> = {
-  episode: '情节 · 发生过什么',
-  assertion: '断言 · 关于你的事实',
-  procedure: '程序 · 做事的方式',
-};
-
-const KIND_SHORT: Record<string, string> = {
-  episode: '情节',
-  assertion: '断言',
-  procedure: '程序',
-};
-
-/** 认不出来的 kind 原样显示，不吞、不瞎翻译。 */
 export function kindLabel(kind: string): string {
-  return KIND_LABEL[kind] ?? (kind || '未分类');
-}
-
-export function kindShort(kind: string): string {
-  return KIND_SHORT[kind] ?? (kind || '未分类');
+  return BROWSE_KINDS.find((item) => item.value === kind)?.label ?? (kind || '未分类');
 }
 
 /**
@@ -194,26 +160,6 @@ export function includeMode(flags: TombstoneFlags): MemoryInclude | null {
   return null;
 }
 
-/** 当前可见集的说明。include 的语义是「追加哪一类墓碑」，不是「只查哪一类」。 */
-export function includeSummary(include: MemoryInclude | null): string {
-  switch (include) {
-    case 'retracted':
-      return 'include=retracted：现行记忆 + 已撤回（仍不含已归档）。';
-    case 'archived':
-      return 'include=archived：现行记忆 + 已归档（仍不含已撤回）。';
-    case 'all':
-      return 'include=all：全部条目（含既撤回又归档的）。';
-    default:
-      return '未传 include：默认只看现行记忆（不含已撤回、不含已归档）。';
-  }
-}
-
-export function tombstoneHint(include: MemoryInclude | null): string {
-  return include === null
-    ? '已撤回 / 已归档的条目只是「默认不可见」，数据仍在库里供审计——勾选上面的开关可以取回。'
-    : '墓碑只用于对账与追溯：它们不参与召回，界面上也只能查看。';
-}
-
 /* ==================================================================== 前端筛选 */
 
 export interface MemoryFilters {
@@ -254,41 +200,6 @@ export function sortByCreatedDesc(rows: MemoryRecord[]): MemoryRecord[] {
     const right = parseIso(b.created_at)?.getTime() ?? Number.NEGATIVE_INFINITY;
     return right - left;
   });
-}
-
-export interface KindGroup {
-  kind: string;
-  rows: MemoryRecord[];
-}
-
-/** 按 kind 分段。已知三类按固定顺序，未知 kind 排在后面（原样显示）。 */
-export function groupByKind(rows: MemoryRecord[]): KindGroup[] {
-  const buckets = new Map<string, MemoryRecord[]>();
-  for (const row of rows) {
-    const bucket = buckets.get(row.kind);
-    if (bucket) bucket.push(row);
-    else buckets.set(row.kind, [row]);
-  }
-  const groups: KindGroup[] = [];
-  for (const kind of KIND_ORDER) {
-    const bucket = buckets.get(kind);
-    if (bucket && bucket.length > 0) {
-      groups.push({ kind, rows: bucket });
-      buckets.delete(kind);
-    }
-  }
-  for (const [kind, bucket] of buckets) {
-    if (bucket.length > 0) groups.push({ kind, rows: bucket });
-  }
-  return groups;
-}
-
-/** 截断说明：没有分页，所以必须说清「最多显示 N 条」和截掉了多少。 */
-export function limitNotice(data: MemoryListResponse): string | null {
-  if (!data.has_more) return null;
-  return `只显示了最近 ${data.memories.length} 条；当前口径共 ${data.total} 条，还有 ${
-    data.total - data.memories.length
-  } 条没有显示。接口没有分页（只有 limit，最大 200），更早的条目在接口层面不可达。`;
 }
 
 /* ==================================================================== 分段状态 */
@@ -338,8 +249,7 @@ export const ACCOUNT_SETTINGS_HREF = '/settings/account';
  * 两条事实依据：
  * - **不能承诺自动恢复**。2026-11 验收实测：停在 403 状态下监听 4 秒，
  *   `/v1/memory`、`/v1/core-memory` 请求数 0；`MemoryPage`、`App.tsx` 里也没有
- *   focus / visibilitychange 重新取数。所以恢复只能靠用户点「重新读取全部」
- *   （页脚）或重新进入本页。
+ *   focus / visibilitychange 重新取数。改完密码后重新进入本页。
  * - 真首次登录时 `App.tsx`（`must_change_password` 分支）会整页接管成改密页，
  *   `/memory` 根本挂载不了。这段 403 文案的真实受众只有「登录后会话中途被外部
  *   置位」这种边缘情况，它不是首次登录的常见路径。
@@ -347,7 +257,7 @@ export const ACCOUNT_SETTINGS_HREF = '/settings/account';
 export const ACCOUNT_GATE_COPY = {
   prefix: '这条 403 来自账号闸：首次登录还没改初始口令，到 ',
   link: '设置 → 账号',
-  suffix: ' 改完密码后，回来点页面底部的「重新读取全部」，或重新进入本页。',
+  suffix: ' 改完密码后，重新进入本页。',
 } as const;
 
 /**
@@ -404,74 +314,6 @@ export function memoryErrorCopy(resource: MemoryResource, error: ExplainedError 
   }
   // 其它错误原样透出，不替服务端编原因；重试与否听从 `retriable`。
   return { reason: error.reason || '请求失败', hint: error.hint, retryable: error.retriable };
-}
-
-/* ==================================================================== 页脚文案 */
-
-export type FooterMode = 'idle' | 'retriable' | 'non-retriable';
-
-export interface MemoryFooterNote {
-  mode: FooterMode;
-  /** 失败且不可重试的分段名（中文），用于文案里点名。 */
-  nonRetriable: string[];
-  /** 失败但可重试的分段名（中文）。 */
-  retriable: string[];
-  text: string;
-}
-
-const FOOT_LEAD = '「重新读取全部」会同时刷新核心记忆与记忆列表。';
-/** 只在「没有失败」或「失败的分段都可重试」时成立。 */
-const FOOT_RETRIABLE = '单个分段失败时，重试按钮就在那个分段里，不会清掉其它已经显示的数据。';
-
-/**
- * 页脚文案随分段状态走，不能无条件说「重试按钮就在那个分段里」。
- *
- * 2026-11 复核实测：403 态的两个分段都是 `data-retriable="false"`、块内
- * **0 个 `<button>`**，而同屏页脚还在说「重试按钮就在那个分段里」——对 403
- * 这是假的，会让人去错误块里找一个不存在的按钮。
- *
- * 分支规则：
- * - 只要有一个失败分段不可重试（403 / 参数错误等），就不再承诺「分段里有重试
- *   按钮」，改成如实说明「该分段不提供重试，请按分段里的说明处理」；
- * - 没有失败、或失败分段都可重试（500 / 网络失败）时，原句仍然成立——页脚是
- *   跟着 `core` / `list` 状态重算的，不会在 403 态残留。
- */
-export function memoryFooterNote(
-  core: SectionState<CoreMemoryListResponse>,
-  list: SectionState<MemoryListResponse>,
-): MemoryFooterNote {
-  const nonRetriable: string[] = [];
-  const retriable: string[] = [];
-  const sections: Array<{ name: string; state: SectionState<unknown>; resource: MemoryResource }> = [
-    { name: '核心记忆', state: core, resource: 'core' },
-    { name: '记忆列表', state: list, resource: 'list' },
-  ];
-  for (const section of sections) {
-    if (section.state.status !== 'error') continue;
-    if (memoryErrorCopy(section.resource, section.state.error).retryable) {
-      retriable.push(section.name);
-    } else {
-      nonRetriable.push(section.name);
-    }
-  }
-  if (nonRetriable.length > 0) {
-    return {
-      mode: 'non-retriable',
-      nonRetriable,
-      retriable,
-      text:
-        `${FOOT_LEAD}失败的「${nonRetriable.join('、')}」分段不提供重试按钮` +
-        '（403 这类不可重试的错误，再请求一次也不会有不同结果）：先按该分段里写的原因处理' +
-        '（若是账号闸，去「设置 → 账号」改完密码），再点这里的「重新读取全部」或重新进入本页。' +
-        '重新读取不会清掉其它已经显示的数据。',
-    };
-  }
-  return {
-    mode: retriable.length > 0 ? 'retriable' : 'idle',
-    nonRetriable,
-    retriable,
-    text: `${FOOT_LEAD}${FOOT_RETRIABLE}`,
-  };
 }
 
 /* ==================================================================== 删除进度 */
@@ -775,7 +617,14 @@ export interface Notice {
 
 /* ==================================================================== 页头与 tab */
 
-export type MemoryTab = 'content' | 'settings';
+export type MemoryTab = 'content' | 'core' | 'settings' | 'privacy';
+
+const MEMORY_TABS: Array<{ id: MemoryTab; label: string }> = [
+  { id: 'content', label: '记忆库' },
+  { id: 'core', label: '核心记忆' },
+  { id: 'settings', label: '学习设置' },
+  { id: 'privacy', label: '隐私与清理' },
+];
 
 /**
  * 从地址推导 tab。
@@ -787,13 +636,14 @@ export function memoryTabFromHref(href: string): MemoryTab {
   const [rawPath = '', rawQuery = ''] = href.split('?');
   const path = rawPath.replace(/\/+$/, '') || '/';
   const params = new URLSearchParams(rawQuery);
-  if (params.get('tab') === 'settings') return 'settings';
+  const tab = params.get('tab');
+  if (tab === 'core' || tab === 'settings' || tab === 'privacy') return tab;
   if (path === '/settings/memory') return 'settings';
   return 'content';
 }
 
 export function memoryTabHref(tab: MemoryTab): string {
-  return tab === 'settings' ? '/memory?tab=settings' : '/memory';
+  return tab === 'content' ? '/memory' : `/memory?tab=${tab}`;
 }
 
 /* ==================================================================== 分段外壳 */
@@ -928,6 +778,12 @@ export function CoreMemorySection({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ExplainedError | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const editorRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editorOpen) editorRef.current?.focus();
+  }, [editorOpen, editingId]);
 
   const trimmedLabel = form.label.trim();
   const conflict = useMemo(
@@ -947,6 +803,7 @@ export function CoreMemorySection({
   const resetForm = () => {
     setForm(EMPTY_CORE_FORM);
     setEditingId(null);
+    setEditorOpen(false);
   };
 
   const startEdit = (item: CoreMemoryItem) => {
@@ -958,6 +815,7 @@ export function CoreMemorySection({
     });
     setEditingId(item.core_id);
     setError(null);
+    setEditorOpen(true);
   };
 
   const submit = async () => {
@@ -995,20 +853,38 @@ export function CoreMemorySection({
 
   return (
     <section className="panel mem-section" aria-labelledby="mem-core-title" data-testid="mem-core">
-      <header className="panel__head">
-        <h2 id="mem-core-title">核心记忆</h2>
-        <span className="panel__count" data-testid="mem-core-count">
-          {state.status === 'ok' ? `${items.length} / ${limit} 条` : '—'}
-        </span>
+      <header className="mem-core-head">
+        <div>
+          <h2 id="mem-core-title">核心记忆</h2>
+          <p>适合放称呼、约定等希望她经常记得的事。</p>
+        </div>
+        <div className="mem-core-head__actions">
+          {state.status === 'ok' ? (
+            <>
+              <span className="mem-muted" data-testid="mem-core-count">{items.length} / {limit} 条</span>
+              <button type="button" className="ghost-button" onClick={onReload} aria-label="刷新核心记忆"><RefreshIcon size={15} /></button>
+              <button type="button" className="button button--primary" aria-expanded={editorOpen && !editingId}
+                disabled={atLimit || pending}
+                onClick={() => {
+                  if (editorOpen && !editingId) { resetForm(); return; }
+                  setForm(EMPTY_CORE_FORM);
+                  setEditingId(null);
+                  setError(null);
+                  setEditorOpen(true);
+                }}>
+                添加条目
+              </button>
+            </>
+          ) : null}
+        </div>
       </header>
-      <p className="panel__note">
-        这些条目会<strong>随每一轮对话进入上下文</strong>，但<strong>不保证全部注入</strong>：
-        群聊里只注入作用域为「群聊 / 全局」的条目（「私聊」条目只在私聊出现）；单轮注入预算
-        800 字符（含「- [label]」前缀），超出时<strong>按优先级截断</strong>；会话处于
-        「完全隔离（sealed）」模式时不注入。正因为每轮都占上下文，每账号上限才是 {limit} 条。
-        同一个 label 再次保存会<strong>覆盖</strong>原条目（文本、优先级、作用域都会换掉，
-        不会新增第二条）。删除是软删除：只是停用，数据仍在库里，但页面没有恢复入口。
-      </p>
+      <details className="mem-core-rules">
+        <summary>什么时候会用到这些条目？</summary>
+        <p>核心记忆无需检索，但不保证全部注入。群聊里只注入作用域为「群聊 / 全局」的条目；
+          完全隔离模式不注入。单轮 800 字符预算，超出时按优先级截断。</p>
+        <p>保存同名标签会覆盖原条目。删除是软删除：停用后原文仍保留，页面没有恢复入口。</p>
+      </details>
+      {atLimit ? <p className="mem-note">已达 {limit} 条上限，可编辑或停用已有条目。</p> : null}
 
       {state.status === 'loading' ? <LoadingLines label="正在读取核心记忆…" /> : null}
 
@@ -1022,111 +898,24 @@ export function CoreMemorySection({
         </p>
       ) : null}
 
-      {state.status === 'ok' && items.length > 0 ? (
-        <ul className="mem-core-list" data-testid="mem-core-list">
-          {items.map((item) => (
-            <li key={item.core_id} className="mem-core-item" data-core-id={item.core_id}>
-              <div className="mem-core-item__head">
-                <span className="mem-core-item__label">{item.label}</span>
-                <span className="mem-core-item__meta">
-                  优先级 {item.priority} · {scopeLabel(item.scope)} · 来源 {coreOriginLabel(item.origin_kind)}
-                </span>
-              </div>
-              <p className="mem-core-item__text">{item.text}</p>
-              <p className="mem-core-item__time">
-                创建 <time dateTime={item.created_at ?? undefined}>{formatAbsoluteTime(item.created_at)}</time>
-                {' · '}更新{' '}
-                <time dateTime={item.updated_at ?? undefined}>{formatAbsoluteTime(item.updated_at)}</time>
-              </p>
-              <div className="mem-core-item__actions">
-                <button type="button" className="button button--small mem-action" onClick={() => startEdit(item)}>
-                  <PencilIcon size={13} /> 编辑
-                </button>
-                <button
-                  type="button"
-                  className="button button--small mem-action mem-action--danger"
-                  aria-expanded={confirmDeleteId === item.core_id}
-                  onClick={() => setConfirmDeleteId(confirmDeleteId === item.core_id ? null : item.core_id)}
-                >
-                  停用…
-                </button>
-              </div>
-              {confirmDeleteId === item.core_id ? (
-                <div className="mem-confirm" role="group" aria-label={`停用核心记忆 ${item.label}`}>
-                  <p className="mem-confirm__title">
-                    <AlertIcon size={13} /> 确认停用核心记忆「{item.label}」？
-                  </p>
-                  <p className="mem-confirm__body">
-                    这是<strong>软删除</strong>：条目变成 inactive，不再注入每一轮；数据库里仍保留这一行。
-                    <strong>页面没有恢复入口</strong>，要恢复只能重新保存一条同 label 的条目。
-                  </p>
-                  <div className="mem-confirm__actions">
-                    <button
-                      type="button"
-                      className="button button--small mem-action mem-action--danger"
-                      disabled={pending}
-                      onClick={() => void remove(item)}
-                    >
-                      {pending ? '停用中…' : '确认停用'}
-                    </button>
-                    <button type="button" className="button button--small" onClick={() => setConfirmDeleteId(null)}>
-                      取消
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-
+      {editorOpen && state.status === 'ok' ? (
       <div className="mem-core-form" data-testid="mem-core-form">
         <h3 className="mem-core-form__title">
           {editingId ? '编辑 / 覆盖核心记忆' : '新增核心记忆'}
           {atLimit ? <span className="mem-badge mem-badge--warn">已满 {limit} 条</span> : null}
         </h3>
 
-        {atLimit ? (
-          <p className="mem-note mem-note--warn">
-            已达 {limit} 条上限：新增按钮已禁用。要加新条目，请先停用一条；给已有 label
-            重新保存仍然是覆盖，不受上限影响。
-          </p>
-        ) : null}
-
         {editingId ? (
           <p className="mem-note">
-            正在编辑已有条目；把 label 改成别的名字会变成另一条（可能撞上 20 条上限）。
-          </p>
-        ) : null}
-
-        {/*
-         * 核心记忆 GET 失败时表单仍然可以填（受控输入没有 disabled），但
-         * `canSubmit` 要求 `state.status === 'ok'`，所以保存按钮是禁用的。
-         * 这条说明必须写在界面上：否则「输入框能打字」会被误读成「能保存」。
-         * 403（无权限）时不能写「等重试成功」——那种情况没有重试按钮，也重试无用。
-         */}
-        {state.status === 'error' ? (
-          <p className="mem-note mem-note--warn" data-testid="mem-core-form-blocked">
-            {memoryErrorCopy('core', state.error).retryable ? (
-              <>
-                核心记忆读取失败：下面的表单<strong>可以填写</strong>，但「保存核心记忆」要等上面的
-                重试成功、拿到现有条目之后才会启用——否则看不到是否已满 {limit} 条、也判断不了
-                同名覆盖，容易盲目写错。
-              </>
-            ) : (
-              <>
-                核心记忆读不到（当前账号没有访问权限）：下面的表单<strong>可以填写</strong>，但
-                「保存核心记忆」不会启用——读不到现有条目就判断不了是否已满 {limit} 条、也判断不了
-                同名覆盖；账号权限修好之前写进去只会盲写。
-              </>
-            )}
+            更换标签会新建另一条记忆，不会重命名原条目。
           </p>
         ) : null}
 
         <div className="mem-core-form__grid">
           <label className="mem-field">
-            <span>label（同名覆盖）</span>
+            <span>标签（同名覆盖）</span>
             <input
+              ref={editorRef}
               type="text"
               value={form.label}
               maxLength={64}
@@ -1193,13 +982,76 @@ export function CoreMemorySection({
           >
             {pending ? '保存中…' : conflict ? '保存并覆盖' : '保存核心记忆'}
           </button>
-          {editingId || form.label || form.text ? (
-            <button type="button" className="button button--small mem-action" onClick={resetForm} disabled={pending}>
-              清空表单
-            </button>
-          ) : null}
+          <button type="button" className="button button--small mem-action" onClick={resetForm} disabled={pending}>
+            取消
+          </button>
         </div>
       </div>
+      ) : null}
+
+      {state.status === 'ok' && items.length > 0 ? (
+        <ul className="mem-core-list" data-testid="mem-core-list">
+          {items.map((item) => (
+            <li key={item.core_id} className="mem-core-item" data-core-id={item.core_id}>
+              <div className="mem-core-item__head">
+                <span className="mem-core-item__label">{item.label}</span>
+                <span className="mem-core-item__meta">
+                  优先级 {item.priority} · {scopeLabel(item.scope)} · 来源 {coreOriginLabel(item.origin_kind)}
+                </span>
+              </div>
+              <p className="mem-core-item__text">{item.text}</p>
+              <p className="mem-core-item__time">
+                创建 <time dateTime={item.created_at ?? undefined}>{formatAbsoluteTime(item.created_at)}</time>
+                {' · '}更新{' '}
+                <time dateTime={item.updated_at ?? undefined}>{formatAbsoluteTime(item.updated_at)}</time>
+              </p>
+              <div className="mem-core-item__actions">
+                <button type="button" className="button button--small mem-action" disabled={pending} onClick={() => startEdit(item)}>
+                  <PencilIcon size={13} /> 编辑
+                </button>
+                <button
+                  type="button"
+                  className="button button--small mem-action mem-action--danger"
+                  aria-expanded={confirmDeleteId === item.core_id}
+                  disabled={pending}
+                  onClick={() => {
+                    setError(null);
+                    setConfirmDeleteId(confirmDeleteId === item.core_id ? null : item.core_id);
+                  }}
+                >
+                  停用…
+                </button>
+              </div>
+              {confirmDeleteId === item.core_id ? (
+                <div className="mem-confirm" role="group" aria-label={`停用核心记忆 ${item.label}`}>
+                  <p className="mem-confirm__title">
+                    <AlertIcon size={13} /> 确认停用核心记忆「{item.label}」？
+                  </p>
+                  <p className="mem-confirm__body">
+                    这是<strong>软删除</strong>：条目变成 inactive，不再注入每一轮；数据库里仍保留这一行。
+                    <strong>页面没有恢复入口</strong>，要恢复只能重新保存一条同 label 的条目。
+                  </p>
+                  <InlineError error={error} resource="core" />
+                  <div className="mem-confirm__actions">
+                    <button
+                      type="button"
+                      className="button button--small mem-action mem-action--danger"
+                      disabled={pending}
+                      onClick={() => void remove(item)}
+                    >
+                      {pending ? '停用中…' : '确认停用'}
+                    </button>
+                    <button type="button" className="button button--small" disabled={pending} onClick={() => setConfirmDeleteId(null)}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
     </section>
   );
 }
@@ -1219,407 +1071,391 @@ export interface MemoryListSectionProps {
   onReload: () => void;
 }
 
-interface RowAction {
-  memoryId: string;
-  mode: 'retract' | 'supersede';
-  text: string;
+function historyStatus(row: MemoryRecord): string | null {
+  if (row.superseded_by) return '已被纠正';
+  if (row.retracted) return '已撤回';
+  if (row.archived_at) return '已归档';
+  return null;
 }
 
-export function MemoryListSection({
-  state,
-  include,
-  flags,
-  onFlagsChange,
-  limit,
-  onLimitChange,
-  filters,
-  onFiltersChange,
-  handlers,
-  onReload,
-}: MemoryListSectionProps): React.ReactElement {
-  const fetched = state.data?.memories ?? [];
-  const filtered = useMemo(() => sortByCreatedDesc(filterMemories(fetched, filters)), [fetched, filters]);
-  const groups = useMemo(() => groupByKind(filtered), [filtered]);
-  const [action, setAction] = useState<RowAction | null>(null);
-  const [reason, setReason] = useState('');
-  const [newText, setNewText] = useState('');
-  const [pending, setPending] = useState(false);
-  const [actionError, setActionError] = useState<ExplainedError | null>(null);
+export function searchLoadedMemories(rows: MemoryRecord[], query: string): MemoryRecord[] {
+  const normalize = (value: string) => value.normalize('NFKC').toLowerCase();
+  const terms = normalize(query).trim().split(/\s+/u).filter(Boolean);
+  return terms.length === 0 ? rows : rows.filter((row) => {
+    const text = normalize(row.text);
+    return terms.every((term) => text.includes(term));
+  });
+}
 
-  const openAction = (row: MemoryRecord, mode: 'retract' | 'supersede') => {
-    setAction({ memoryId: row.memory_id, mode, text: row.text });
+function MemoryInspector({
+  row,
+  loaded,
+  headingRef,
+  onBack,
+  onSelect,
+  onChanged,
+  handlers,
+}: {
+  row: MemoryRecord;
+  loaded: MemoryRecord[];
+  headingRef: React.RefObject<HTMLHeadingElement | null>;
+  onBack: () => void;
+  onSelect: (id: string) => void;
+  onChanged: () => void;
+  handlers: MemoryHandlers;
+}): React.ReactElement {
+  const [mode, setMode] = useState<'retract' | 'supersede' | null>(null);
+  const [reason, setReason] = useState('');
+  const [newText, setNewText] = useState(row.text);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<ExplainedError | null>(null);
+  const status = historyStatus(row);
+  const relative = formatRelativeTime(row.created_at);
+  const formRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (mode) formRef.current?.focus();
+  }, [mode]);
+
+  const updateMode = (next: typeof mode) => {
+    setMode(next);
     setReason('');
     setNewText(row.text);
-    setActionError(null);
+    setError(null);
   };
 
-  const closeAction = () => {
-    setAction(null);
-    setActionError(null);
-    setPending(false);
-  };
+  const valid = mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim());
 
-  const submitAction = async () => {
-    if (!action || pending) return;
+  const submit = async () => {
+    if (!mode || !valid || pending || status) return;
     setPending(true);
-    setActionError(null);
+    setError(null);
     try {
-      if (action.mode === 'retract') {
-        await handlers.retract(action.memoryId, reason.trim());
-      } else {
-        await handlers.supersede(
-          action.memoryId,
-          newText.trim(),
-          reason.trim() || '用户纠正',
-        );
-      }
-      closeAction();
+      if (mode === 'retract') await handlers.retract(row.memory_id, reason.trim());
+      else await handlers.supersede(row.memory_id, newText.trim(), reason.trim() || '用户纠正');
+      updateMode(null);
+      onChanged();
     } catch (cause) {
-      setActionError(explainError(cause));
+      setError(explainError(cause));
+    } finally {
       setPending(false);
     }
   };
 
-  const trimmedReason = reason.trim();
-  const canConfirm =
-    action !== null &&
-    !pending &&
-    (action.mode === 'retract' ? trimmedReason.length > 0 : newText.trim().length > 0);
+  const changeLink = (id: string, label: string) => (
+    <li key={id}>
+      {loaded.some((item) => item.memory_id === id) ? (
+        <button type="button" className="mem-text-button" disabled={pending} onClick={() => onSelect(id)}>{label}</button>
+      ) : (
+        <>{label} <span className="mem-muted">· 不在本批</span></>
+      )}
+      <code>{id}</code>
+    </li>
+  );
 
   return (
-    <section className="panel mem-section" aria-labelledby="mem-list-title" data-testid="mem-list">
-      <header className="panel__head">
-        <h2 id="mem-list-title">记忆列表</h2>
-        <span className="panel__count" data-testid="mem-list-count">
-          {state.status === 'ok' && state.data
-            ? `${state.data.total} 条（口径）· 已取回 ${state.data.memories.length} 条`
-            : '—'}
-        </span>
+    <article className="mem-inspector" aria-labelledby="mem-detail-title" data-testid="mem-inspector">
+      <button type="button" className="ghost-button mem-inspector__back" disabled={pending} onClick={onBack}>
+        <ArrowLeftIcon size={15} /> 回到列表
+      </button>
+      <header className="mem-inspector__head">
+        <h3 id="mem-detail-title" ref={headingRef} tabIndex={-1}>记忆详情</h3>
+        {status ? <span className="mem-badge mem-badge--tombstone">历史记录 · 只读</span> : null}
       </header>
-
-      <div className="mem-filters">
-        <fieldset className="mem-filters__group">
-          <legend>墓碑（默认不显示）</legend>
-          <label className="mem-check">
-            <input
-              type="checkbox"
-              checked={flags.retracted}
-              onChange={(event) => onFlagsChange({ ...flags, retracted: event.target.checked })}
-            />
-            <span>显示已撤回（include=retracted）</span>
-          </label>
-          <label className="mem-check">
-            <input
-              type="checkbox"
-              checked={flags.archived}
-              onChange={(event) => onFlagsChange({ ...flags, archived: event.target.checked })}
-            />
-            <span>显示已归档（include=archived）</span>
-          </label>
-          <p className="mem-filters__note" data-testid="mem-include-summary">
-            {includeSummary(include)}
-          </p>
-          <p className="mem-filters__note">{tombstoneHint(include)}</p>
-        </fieldset>
-
-        <div className="mem-filters__row">
-          <label className="mem-field mem-field--inline">
-            <span>类型</span>
-            <select
-              value={filters.kind}
-              onChange={(event) => {
-                const value = event.target.value;
-                onFiltersChange({
-                  ...filters,
-                  kind:
-                    value === 'episode' || value === 'assertion' || value === 'procedure'
-                      ? value
-                      : 'all',
-                });
-              }}
-            >
-              <option value="all">全部类型</option>
-              <option value="episode">情节</option>
-              <option value="assertion">断言</option>
-              <option value="procedure">程序</option>
-            </select>
-          </label>
-          <label className="mem-field mem-field--inline">
-            <span>时间范围</span>
-            <select
-              value={filters.range}
-              onChange={(event) => {
-                const value = event.target.value;
-                onFiltersChange({
-                  ...filters,
-                  range: value === '7d' || value === '30d' ? value : 'all',
-                });
-              }}
-            >
-              <option value="all">全部时间</option>
-              <option value="7d">最近 7 天</option>
-              <option value="30d">最近 30 天</option>
-            </select>
-          </label>
-          <label className="mem-field mem-field--inline">
-            <span>单次最多取</span>
-            <select value={limit} onChange={(event) => onLimitChange(Number(event.target.value))}>
-              {LIMIT_OPTIONS.map((option) => (
-                <option key={option} value={option}>
-                  {option} 条
-                </option>
-              ))}
-            </select>
-          </label>
+      <div className="mem-inspector__story">
+        <div className="mem-inspector__tags">
+          <span className="mem-badge">{kindLabel(row.kind)}</span>
+          {row.origin === 'model_inference' ? <span className="mem-badge mem-badge--warn">推测，不是事实</span> : null}
+          {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
-        <p className="mem-filters__note">
-          类型与时间范围<strong>只过滤已取回的条目</strong>（后端没有这两个参数，所以不做假筛选）：
-          已取回 {fetched.length} 条，筛选后 {filtered.length} 条。
-        </p>
-        <p className="mem-filters__note" data-testid="mem-page-size">
-          接口<strong>没有分页</strong>：本次<strong>最多显示 {limit} 条</strong>
-          （可调到 200；更早的条目要多取只能调大 limit，界面不提供翻页）。
-        </p>
+        <p className="mem-inspector__text">{row.text}</p>
+        {!status ? (
+          <div className="mem-inspector__actions">
+            <button
+              type="button" className="button button--small button--primary"
+              aria-expanded={mode === 'supersede'} disabled={pending}
+              onClick={() => updateMode(mode === 'supersede' ? null : 'supersede')}
+            ><PencilIcon size={14} /> 纠正…</button>
+            <button
+              type="button" className="button button--small mem-action--danger"
+              aria-expanded={mode === 'retract'} disabled={pending}
+              onClick={() => updateMode(mode === 'retract' ? null : 'retract')}
+            >撤回…</button>
+          </div>
+        ) : null}
       </div>
 
-      {state.status === 'loading' ? <LoadingLines label="正在读取记忆列表…" /> : null}
-
-      {state.status === 'error' ? (
-        <SectionError title="记忆列表" resource="list" error={state.error} onRetry={onReload} />
-      ) : null}
-
-      {state.status === 'ok' && state.data ? (
-        <>
-          {limitNotice(state.data) ? (
-            <p className="mem-note mem-note--warn" role="status" data-testid="mem-limit-notice">
-              {limitNotice(state.data)}
-            </p>
-          ) : null}
-
-          {fetched.length === 0 ? (
-            <div className="mem-empty" data-testid="mem-list-empty">
-              {include === null ? (
-                <>
-                  <p>没有现行记忆（未撤回且未归档）。</p>
-                  <p>
-                    如果她确实记得什么，可能是条目被撤回或归档了——勾选上面的「显示已撤回 /
-                    显示已归档」取回墓碑看看。
-                  </p>
-                </>
-              ) : (
-                <>
-                  <p>没有任何记忆（包括已撤回与已归档）。</p>
-                  <p>她还没记住这件事；新记忆会在对话后由记忆抽取任务写入。</p>
-                </>
-              )}
-            </div>
-          ) : filtered.length === 0 ? (
-            <div className="mem-empty" data-testid="mem-filter-empty">
-              <p>已取回 {fetched.length} 条，但没有条目符合当前的类型 / 时间筛选。</p>
-              <p>筛选只作用于这一批数据（后端没有类型与时间参数）；调宽条件或点「刷新」重取。</p>
-            </div>
+      {mode && !status ? (
+        <form
+          className="mem-confirm mem-confirm--item"
+          aria-label={mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
+          onSubmit={(event) => { event.preventDefault(); void submit(); }}
+        >
+          <p className="mem-confirm__title">
+            <AlertIcon size={14} /> {mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
+          </p>
+          {mode === 'retract' ? (
+            <>
+              <p className="mem-confirm__body">撤回后不再参与召回，但不会删除。可在历史记录中查看。</p>
+              <label className="mem-field">
+                <span>撤回理由</span>
+                <textarea ref={formRef} value={reason} rows={2} maxLength={500} required disabled={pending}
+                  onChange={(event) => setReason(event.target.value)} />
+              </label>
+            </>
           ) : (
-            <div className="mem-groups" data-testid="mem-groups">
-              {groups.map((group) => (
-                <section key={group.kind} className="mem-group" aria-label={kindLabel(group.kind)}>
-                  <h3 className="mem-group__title">
-                    {kindLabel(group.kind)}
-                    <span className="mem-group__count">{group.rows.length} 条</span>
-                  </h3>
-                  <ul className="mem-list">
-                    {group.rows.map((row) => {
-                      const archived = row.archived_at !== null;
-                      const tombstone = row.retracted || archived;
-                      const isAction = action?.memoryId === row.memory_id;
-                      const relative = formatRelativeTime(row.created_at);
-                      return (
-                        <li
-                          key={row.memory_id}
-                          className={`mem-item${tombstone ? ' mem-item--tombstone' : ''}`}
-                          data-testid="mem-row"
-                          data-memory-id={row.memory_id}
-                        >
-                          <div className="mem-item__head">
-                            <p className="mem-item__text">{row.text}</p>
-                            {tombstone ? (
-                              <span className="mem-item__readonly">墓碑：只读</span>
-                            ) : (
-                              <div className="mem-item__actions">
-                                <button
-                                  type="button"
-                                  className="button button--small mem-action mem-action--danger"
-                                  aria-expanded={isAction && action?.mode === 'retract'}
-                                  onClick={() => (isAction && action?.mode === 'retract' ? closeAction() : openAction(row, 'retract'))}
-                                >
-                                  撤回…
-                                </button>
-                                <button
-                                  type="button"
-                                  className="button button--small mem-action"
-                                  aria-expanded={isAction && action?.mode === 'supersede'}
-                                  onClick={() =>
-                                    isAction && action?.mode === 'supersede'
-                                      ? closeAction()
-                                      : openAction(row, 'supersede')
-                                  }
-                                >
-                                  纠正…
-                                </button>
-                              </div>
-                            )}
-                          </div>
-
-                          <p className="mem-item__meta">
-                            <span className="mem-item__time">
-                              记于{' '}
-                              <time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>
-                              {relative ? <span className="mem-item__relative">（{relative}）</span> : null}
-                            </span>
-                            <span>来源：{originLabel(row.origin)}</span>
-                            <span>{confidenceLabel(row.confidence)}</span>
-                            <span className="mem-item__kind">{kindShort(row.kind)}</span>
-                          </p>
-
-                          <div className="mem-item__badges">
-                            {row.retracted ? (
-                              <span className="mem-badge mem-badge--tombstone">
-                                已撤回{row.retract_reason ? `：${row.retract_reason}` : ''}
-                              </span>
-                            ) : null}
-                            {row.superseded_by ? (
-                              <span className="mem-badge mem-badge--superseded">
-                                已被纠正（新条目 {row.superseded_by}）
-                              </span>
-                            ) : null}
-                            {row.supersedes ? (
-                              <span className="mem-badge">由这条纠正了旧条目 {row.supersedes}</span>
-                            ) : null}
-                            {archived ? <span className="mem-badge mem-badge--archived">已归档</span> : null}
-                            {row.origin === 'model_inference' ? (
-                              <span className="mem-badge mem-badge--warn">推测，不是事实</span>
-                            ) : null}
-                          </div>
-
-                          <details className="mem-item__detail">
-                            <summary>详情（列表数据，无单条详情接口）</summary>
-                            <dl className="mem-detail">
-                              <div>
-                                <dt>memory_id</dt>
-                                <dd>{row.memory_id}</dd>
-                              </div>
-                              <div>
-                                <dt>kind</dt>
-                                <dd>{row.kind}</dd>
-                              </div>
-                              <div>
-                                <dt>可见范围</dt>
-                                <dd>{visibilityLabel(row.visibility)}（{row.visibility}）</dd>
-                              </div>
-                              <div>
-                                <dt>有效期至</dt>
-                                <dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd>
-                              </div>
-                              <div>
-                                <dt>归档时间</dt>
-                                <dd>{row.archived_at ? formatAbsoluteTime(row.archived_at) : '未归档'}</dd>
-                              </div>
-                              <div>
-                                <dt>撤回理由</dt>
-                                <dd>{row.retract_reason ?? '—'}</dd>
-                              </div>
-                              <div>
-                                <dt>来源事件</dt>
-                                <dd>{row.source_event_ids.length > 0 ? row.source_event_ids.join('、') : '无'}</dd>
-                              </div>
-                            </dl>
-                          </details>
-
-                          {isAction && action ? (
-                            <div
-                              className="mem-confirm mem-confirm--item"
-                              role="group"
-                              aria-label={action.mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
-                            >
-                              <p className="mem-confirm__title">
-                                <AlertIcon size={13} />
-                                {action.mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
-                              </p>
-                              {action.mode === 'retract' ? (
-                                <>
-                                  <p className="mem-confirm__body">
-                                    撤回后它不再参与召回，也会从默认列表消失；数据不会删除，
-                                    勾选「显示已撤回」仍能看到这条墓碑。
-                                  </p>
-                                  <label className="mem-field mem-field--wide">
-                                    <span>撤回理由（必填，1..500 字，会记进墓碑）</span>
-                                    <textarea
-                                      value={reason}
-                                      rows={2}
-                                      maxLength={500}
-                                      placeholder="例如：这条说法已经过时"
-                                      onChange={(event) => setReason(event.target.value)}
-                                    />
-                                  </label>
-                                </>
-                              ) : (
-                                <>
-                                  <p className="mem-confirm__body">
-                                    旧条目会被标成「已被纠正」并退出召回；新条目继承同样的类型、
-                                    可见范围与来源事件。两条都会留在库里。
-                                  </p>
-                                  <label className="mem-field mem-field--wide">
-                                    <span>新的说法（必填，1..4000 字）</span>
-                                    <textarea
-                                      value={newText}
-                                      rows={3}
-                                      maxLength={4000}
-                                      onChange={(event) => setNewText(event.target.value)}
-                                    />
-                                  </label>
-                                  <label className="mem-field mem-field--wide">
-                                    <span>纠正理由（可选，默认「用户纠正」）</span>
-                                    <input
-                                      type="text"
-                                      value={reason}
-                                      maxLength={500}
-                                      placeholder="用户纠正"
-                                      onChange={(event) => setReason(event.target.value)}
-                                    />
-                                  </label>
-                                </>
-                              )}
-
-                              <InlineError error={actionError} resource="list" />
-
-                              <div className="mem-confirm__actions">
-                                <button
-                                  type="button"
-                                  className="button button--small mem-action mem-action--danger"
-                                  disabled={!canConfirm}
-                                  onClick={() => void submitAction()}
-                                >
-                                  {pending
-                                    ? '提交中…'
-                                    : action.mode === 'retract'
-                                      ? '确认撤回'
-                                      : '确认纠正'}
-                                </button>
-                                <button type="button" className="button button--small mem-action" onClick={closeAction}>
-                                  取消
-                                </button>
-                              </div>
-                            </div>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </section>
-              ))}
-            </div>
+            <>
+              <p className="mem-confirm__body">用新条目替代旧说法。可见范围和来源保留，旧条目退出召回。</p>
+              <label className="mem-field">
+                <span>新的说法</span>
+                <textarea ref={formRef} value={newText} rows={4} maxLength={4000} required disabled={pending}
+                  onChange={(event) => setNewText(event.target.value)} />
+              </label>
+              <label className="mem-field">
+                <span>纠正理由（选填）</span>
+                <input value={reason} maxLength={500} placeholder="用户纠正" disabled={pending}
+                  onChange={(event) => setReason(event.target.value)} />
+              </label>
+            </>
           )}
-        </>
+          <InlineError error={error} resource="list" />
+          <div className="mem-confirm__actions">
+            <button type="submit" className={`button button--small ${mode === 'retract' ? 'mem-action--danger' : 'button--primary'}`} disabled={!valid || pending}>
+              {pending ? '提交中…' : mode === 'retract' ? '确认撤回' : '确认纠正'}
+            </button>
+            <button type="button" className="button button--small" disabled={pending} onClick={() => updateMode(null)}>取消</button>
+          </div>
+        </form>
       ) : null}
+
+      <section className="mem-inspector__section" aria-label="来源与可见范围">
+        <h4>来源与可见范围</h4>
+        <dl className="mem-facts">
+          <div><dt>来源</dt><dd>{originLabel(row.origin)}</dd></div>
+          <div><dt>可见范围</dt><dd>{visibilityLabel(row.visibility)}</dd></div>
+          <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
+          <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
+        </dl>
+      </section>
+      {row.retract_reason || row.archived_at || row.supersedes || row.superseded_by ? (
+        <section className="mem-inspector__section" aria-label="变更记录">
+          <h4>变更记录</h4>
+          {row.retract_reason ? <p>撤回理由：{row.retract_reason}</p> : null}
+          {row.archived_at ? <p>归档于 {formatAbsoluteTime(row.archived_at)}</p> : null}
+          <ul className="mem-change-list">
+            {row.superseded_by ? changeLink(row.superseded_by, '纠正后的条目') : null}
+            {row.supersedes ? changeLink(row.supersedes, '纠正前的条目') : null}
+          </ul>
+        </section>
+      ) : null}
+      <details className="mem-inspector__technical">
+        <summary>记录编号与来源事件</summary>
+        <dl className="mem-facts">
+          <div><dt>记忆编号</dt><dd><code>{row.memory_id}</code></dd></div>
+          <div><dt>系统评分</dt><dd>{confidenceLabel(row.confidence)}<small> · 不代表事实已核实</small></dd></div>
+          <div className="mem-facts__wide"><dt>来源事件</dt><dd>{row.source_event_ids.length ? row.source_event_ids.join('、') : '未记录'}</dd></div>
+        </dl>
+      </details>
+    </article>
+  );
+}
+
+export function MemoryListSection({
+  state, include, flags, onFlagsChange, limit, onLimitChange, filters,
+  onFiltersChange, handlers, onReload,
+}: MemoryListSectionProps): React.ReactElement {
+  const [query, setQuery] = useState('');
+  const [scope, setScope] = useState('');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const rowElement = useRef<HTMLButtonElement | null>(null);
+  const restoreFocus = useRef(false);
+  const data = state.status === 'ok' ? state.data : null;
+  const fetched = data?.memories ?? [];
+  const filtered = sortByCreatedDesc(searchLoadedMemories(
+    filterMemories(fetched, filters).filter((row) => !scope || row.visibility === scope),
+    query,
+  ));
+  const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : filtered[0];
+  const mobileInspectorOpen = Boolean(selectedId && selected);
+  const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
+  const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
+  const activeFilterCount = Number(filters.range !== 'all') + Number(Boolean(scope))
+    + Number(flags.retracted) + Number(flags.archived) + Number(limit !== LIMIT_OPTIONS[0]);
+  const filteredByUser = Boolean(query.trim() || scope || filters.kind !== 'all' || filters.range !== 'all');
+
+  useEffect(() => {
+    if (selectedId) headingRef.current?.focus();
+    else if (restoreFocus.current) {
+      restoreFocus.current = false;
+      const element = rowElement.current;
+      if (element?.isConnected) element.focus();
+      else searchRef.current?.focus();
+    }
+  }, [selectedId]);
+
+  const goBack = () => {
+    restoreFocus.current = true;
+    setSelectedId(null);
+  };
+
+  const clearDiscovery = () => {
+    setQuery('');
+    setScope('');
+    onFiltersChange(DEFAULT_FILTERS);
+    setSelectedId(null);
+    searchRef.current?.focus();
+  };
+
+  const selectedFromHistory = (id: string) => {
+    if (!filtered.some((row) => row.memory_id === id)) {
+      setQuery('');
+      setScope('');
+      onFiltersChange(DEFAULT_FILTERS);
+    }
+    setSelectedId(id);
+  };
+
+  return (
+    <section
+      className={`mem-workspace${mobileInspectorOpen ? ' mem-workspace--reading' : ''}`}
+      aria-label="长期记忆库"
+      data-testid="mem-list"
+    >
+      <div className="mem-index">
+        <header className="mem-index__head">
+          <h2>长期记忆</h2>
+          {data ? (
+            <button type="button" className="ghost-button mem-index__refresh" onClick={onReload} aria-label="刷新记忆库">
+              <RefreshIcon size={15} />
+            </button>
+          ) : null}
+        </header>
+        <div className="mem-index__tools">
+          <label className="mem-search">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" width="18" height="18">
+              <circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 5 5" strokeLinecap="round" />
+            </svg>
+            <input ref={searchRef} type="search" value={query} onChange={(event) => { setQuery(event.target.value); setSelectedId(null); }}
+              aria-label="搜索已加载的记忆" placeholder="搜索已加载的记忆" />
+          </label>
+          <button
+            type="button" className="button button--small mem-index__filter" aria-expanded={showFilters} aria-controls="mem-discovery-filters"
+            onClick={() => setShowFilters((value) => !value)}
+          >筛选{activeFilterCount ? ` · ${activeFilterCount}` : null}</button>
+        </div>
+        <div className="mem-kinds" role="group" aria-label="记忆类型">
+          {BROWSE_KINDS.map(({ value, label }) => (
+            <button key={value} type="button" aria-pressed={filters.kind === value}
+              onClick={() => { onFiltersChange({ ...filters, kind: value }); setSelectedId(null); }}>{label}</button>
+          ))}
+        </div>
+        <div className="mem-facet-panel" id="mem-discovery-filters" hidden={!showFilters}>
+          <div className="mem-facet-panel__fields">
+            <label className="mem-field"><span>记下时间</span>
+              <select value={filters.range} onChange={(event) => {
+                const value = event.target.value;
+                onFiltersChange({ ...filters, range: value === '7d' || value === '30d' ? value : 'all' });
+                setSelectedId(null);
+              }}>
+                <option value="all">全部时间</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
+              </select>
+            </label>
+            <label className="mem-field"><span>可见范围</span>
+              <select value={scope} onChange={(event) => { setScope(event.target.value); setSelectedId(null); }}>
+                <option value="">全部范围</option>
+                {scopes.map((option) => <option key={option} value={option}>{visibilityLabel(option)}</option>)}
+              </select>
+            </label>
+            <label className="mem-field"><span>加载上限</span>
+              <select value={limit} onChange={(event) => { onLimitChange(Number(event.target.value)); setSelectedId(null); }}>
+                {LIMIT_OPTIONS.map((option) => <option key={option} value={option}>{option} 条</option>)}
+              </select>
+            </label>
+          </div>
+          <fieldset className="mem-history-switches">
+            <legend>同时加载历史条目</legend>
+            <label className="mem-check"><input type="checkbox" checked={flags.retracted}
+              onChange={(event) => { onFlagsChange({ ...flags, retracted: event.target.checked }); setSelectedId(null); }} />显示已撤回</label>
+            <label className="mem-check"><input type="checkbox" checked={flags.archived}
+              onChange={(event) => { onFlagsChange({ ...flags, archived: event.target.checked }); setSelectedId(null); }} />显示已归档</label>
+          </fieldset>
+        </div>
+
+        {state.status === 'loading' ? <LoadingLines label="正在读取记忆列表…" /> : null}
+        {state.status === 'error' ? (
+          <SectionError title="记忆列表" resource="list" error={state.error} onRetry={onReload} />
+        ) : null}
+        {data ? (
+          <>
+            <div className="mem-index__count" role="status" data-testid="mem-list-count">
+              <span>已加载 {fetched.length} 条{filteredByUser ? ` · 匹配 ${filtered.length} 条` : ''}</span>
+              <span>{include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
+            </div>
+            {data.has_more ? (
+              <p className="mem-index__boundary" data-testid="mem-limit-notice">
+                还有 {data.total - fetched.length} 条未加载。搜索仅限本批。
+                {limit < 200 ? (
+                  <> <button type="button" className="mem-text-button" onClick={() => { onLimitChange(200); setSelectedId(null); }}>加载最近 200 条</button></>
+                ) : ' 接口最多返回 200 条，无法继续加载。'}
+              </p>
+            ) : null}
+            {fetched.length === 0 ? (
+              <div className="mem-index__empty" data-testid="mem-list-empty">
+                <strong>{include ? '当前范围内没有条目' : '没有现行记忆'}</strong>
+                <p>{include ? '可以调整历史记录和加载范围。' : '默认不含已撤回或已归档的条目。'}</p>
+                <button type="button" className="mem-text-button" onClick={() => setShowFilters(true)}>查看筛选选项</button>
+              </div>
+            ) : filtered.length === 0 ? (
+              <div className="mem-index__empty" data-testid="mem-filter-empty">
+                <strong>这批记忆里没有匹配项</strong>
+                <p>试试短一点的关键词，或放宽筛选。</p>
+                <button type="button" className="mem-text-button" onClick={clearDiscovery}>清除搜索和筛选</button>
+              </div>
+            ) : (
+              <ul className="mem-index__rows" aria-label="记忆列表" data-testid="mem-results">
+                {filtered.map((row) => {
+                  const status = historyStatus(row);
+                  return (
+                    <li key={row.memory_id}>
+                      <button type="button" className="mem-record" aria-current={selected?.memory_id === row.memory_id ? 'true' : undefined}
+                        onClick={(event) => {
+                          rowElement.current = event.currentTarget;
+                          if (selectedId === row.memory_id) headingRef.current?.focus();
+                          else setSelectedId(row.memory_id);
+                        }}>
+                        <span className="mem-record__top"><span>{kindLabel(row.kind)}</span>
+                          <time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time></span>
+                        <span className="mem-record__preview">{row.text}</span>
+                        <span className="mem-record__meta">
+                          <span>{originLabel(row.origin)}</span><span>{visibilityLabel(row.visibility)}</span>
+                          {status ? <span className="mem-record__status">{status}</span> : null}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </>
+        ) : null}
+      </div>
+
+      <div className="mem-workspace__detail">
+        {selected ? (
+          <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched}
+            headingRef={headingRef} handlers={handlers} onBack={goBack}
+            onSelect={selectedFromHistory} onChanged={goBack} />
+        ) : data ? (
+          <div className="mem-inspector mem-inspector--empty">
+            <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
+            <strong>在列表中选择一条记忆</strong>
+            <p>查看完整内容、来源和可见范围。</p>
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -1909,6 +1745,7 @@ export function MemoryDangerZone({
 /* ==================================================================== 内容区（可测） */
 
 export interface MemoryContentBodyProps {
+  tab?: MemoryTab;
   core: SectionState<CoreMemoryListResponse>;
   list: SectionState<MemoryListResponse>;
   include: MemoryInclude | null;
@@ -1923,7 +1760,6 @@ export interface MemoryContentBodyProps {
   handlers: MemoryHandlers;
   notice: Notice | null;
   onDismissNotice: () => void;
-  onReloadAll: () => void;
 }
 
 /**
@@ -1933,6 +1769,7 @@ export interface MemoryContentBodyProps {
  * 整页不许被一个错误盖住。
  */
 export function MemoryContentBody({
+  tab = 'content',
   core,
   list,
   include,
@@ -1947,11 +1784,7 @@ export function MemoryContentBody({
   handlers,
   notice,
   onDismissNotice,
-  onReloadAll,
 }: MemoryContentBodyProps): React.ReactElement {
-  // 页脚只说当下成立的话：403 这类不可重试分段没有重试按钮（见 memoryFooterNote）。
-  const footNote = memoryFooterNote(core, list);
-
   return (
     <div className="mem-content">
       {notice ? (
@@ -1963,36 +1796,41 @@ export function MemoryContentBody({
         </div>
       ) : null}
 
-      <CoreMemorySection state={core} handlers={handlers} onReload={handlers.reloadCore} />
-
-      <MemoryListSection
-        state={list}
-        include={include}
-        flags={flags}
-        onFlagsChange={onFlagsChange}
-        limit={limit}
-        onLimitChange={onLimitChange}
-        filters={filters}
-        onFiltersChange={onFiltersChange}
-        handlers={handlers}
-        onReload={handlers.reloadList}
-      />
-
-      <MemoryDangerZone state={forget} dispatch={onForgetAction} handlers={handlers} />
-
-      <p className="mem-foot" data-testid="mem-foot" data-foot-mode={footNote.mode}>
-        {footNote.text}
-        <button type="button" className="ghost-button" onClick={onReloadAll}>
-          <RefreshIcon /> 重新读取全部
-        </button>
-      </p>
+      <div hidden={tab !== 'content'}>
+        <MemoryListSection
+          state={list}
+          include={include}
+          flags={flags}
+          onFlagsChange={onFlagsChange}
+          limit={limit}
+          onLimitChange={onLimitChange}
+          filters={filters}
+          onFiltersChange={onFiltersChange}
+          handlers={handlers}
+          onReload={handlers.reloadList}
+        />
+      </div>
+      <div hidden={tab !== 'core'}>
+        <CoreMemorySection state={core} handlers={handlers} onReload={handlers.reloadCore} />
+      </div>
+      <div hidden={tab !== 'privacy'} className="mem-privacy">
+        <section className="panel mem-privacy__intro" aria-labelledby="mem-privacy-title">
+          <h2 id="mem-privacy-title">隐私与清理</h2>
+          <dl className="mem-facts">
+            <div><dt>停用核心记忆</dt><dd>停止进入对话，原文仍保留。</dd></div>
+            <div><dt>撤回单条记忆</dt><dd>停止参与召回，历史记录仍可查。</dd></div>
+            <div><dt>遗忘全部</dt><dd>删除当前账号的记忆及相关派生数据，不可恢复。</dd></div>
+          </dl>
+        </section>
+        <MemoryDangerZone state={forget} dispatch={onForgetAction} handlers={handlers} />
+      </div>
     </div>
   );
 }
 
 /* ==================================================================== 内容区容器 */
 
-export function MemoryContent(): React.ReactElement {
+export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.ReactElement {
   const [core, setCore] = useState<SectionState<CoreMemoryListResponse>>(loadingSection<CoreMemoryListResponse>());
   const [list, setList] = useState<SectionState<MemoryListResponse>>(loadingSection<MemoryListResponse>());
   const [flags, setFlags] = useState<TombstoneFlags>({ retracted: false, archived: false });
@@ -2002,34 +1840,46 @@ export function MemoryContent(): React.ReactElement {
   const [forget, dispatchForget] = useReducer(forgetReducer, INITIAL_FORGET);
 
   const include = includeMode(flags);
+  const latestQuery = useRef({ limit, include });
+  latestQuery.current = { limit, include };
+  const coreRequest = useRef(0);
+  const listRequest = useRef(0);
 
   const loadCore = useCallback(async () => {
+    const requestId = ++coreRequest.current;
     setCore((current) => (current.data ? current : loadingSection<CoreMemoryListResponse>()));
     try {
       const data = await api.listCoreMemory();
+      if (requestId !== coreRequest.current) return;
       setCore({ status: 'ok', data, error: null });
     } catch (cause) {
+      if (requestId !== coreRequest.current) return;
       setCore({ status: 'error', data: null, error: explainError(cause) });
     }
   }, []);
 
   const loadList = useCallback(async () => {
-    setList((current) => (current.data ? current : loadingSection<MemoryListResponse>()));
+    const requestId = ++listRequest.current;
+    const query = latestQuery.current;
+    setList((current) => current.data?.limit === query.limit && current.data.include === query.include
+      ? current : loadingSection<MemoryListResponse>());
     try {
-      const data = await api.listMemories({ limit, include });
+      const data = await api.listMemories(query);
+      if (requestId !== listRequest.current) return;
       setList({ status: 'ok', data, error: null });
     } catch (cause) {
+      if (requestId !== listRequest.current) return;
       setList({ status: 'error', data: null, error: explainError(cause) });
     }
-  }, [limit, include]);
+  }, []);
 
   useEffect(() => {
-    void loadCore();
-  }, [loadCore]);
+    if (tab === 'core') void loadCore();
+  }, [loadCore, tab]);
 
   useEffect(() => {
-    void loadList();
-  }, [loadList]);
+    if (tab === 'content') void loadList();
+  }, [loadList, limit, include, tab]);
 
 
   const handlers: MemoryHandlers = useMemo(
@@ -2038,7 +1888,7 @@ export function MemoryContent(): React.ReactElement {
         await api.retractMemory(memoryId, reason);
         setNotice({
           tone: 'ok',
-          text: '已撤回。它不再参与召回，也已从默认列表消失；勾选「显示已撤回」仍可查看墓碑。',
+          text: '已撤回，不再参与召回。可在「筛选 → 显示已撤回」中查看。',
         });
         await loadList();
       },
@@ -2046,7 +1896,7 @@ export function MemoryContent(): React.ReactElement {
         await api.supersedeMemory(memoryId, text, reason);
         setNotice({
           tone: 'ok',
-          text: '已纠正。旧条目被标成「已被纠正」并退出召回，新条目已写入；两条都保留在库里。',
+          text: '纠正已保存。旧条目退出召回，可在历史记录中查看。',
         });
         await loadList();
       },
@@ -2137,8 +1987,9 @@ export function MemoryContent(): React.ReactElement {
 
   return (
     <MemoryContentBody
+      tab={tab}
       core={core}
-      list={list}
+      list={list.data && (list.data.limit !== limit || list.data.include !== include) ? loadingSection() : list}
       include={include}
       flags={flags}
       onFlagsChange={setFlags}
@@ -2151,10 +2002,6 @@ export function MemoryContent(): React.ReactElement {
       handlers={handlers}
       notice={notice}
       onDismissNotice={() => setNotice(null)}
-      onReloadAll={() => {
-        void loadCore();
-        void loadList();
-      }}
     />
   );
 }
@@ -2278,72 +2125,32 @@ export function MemorySettingsTab({ onBack }: MemorySettingsTabProps): React.Rea
 export function MemoryPage(): React.ReactElement {
   const href = useLocationHref();
   const tab = memoryTabFromHref(href);
-
-  const openTab = (next: MemoryTab) => {
-    if (next === tab) return;
-    navigate(memoryTabHref(next));
-  };
-
   return (
     <section className="page mem">
       <header className="mem__head">
-        <div>
-          <h1 className="page__title">记忆</h1>
-          <p className="page__subtitle">
-            这里能看、能改她记住什么：核心记忆每轮注入（群聊只注入群聊/全局条目、超出 800
-            字符预算会截断、完全隔离模式不注入），长期记忆按类型分段。
-            时间一律显示绝对时间（括号里是相对时间），按本机时区。
-          </p>
-          <p className="mem__boundary">
-            诚实边界：接口没有单条详情端点（详情全部来自列表数据），也没有分页——单次最多取 200 条。
-          </p>
-        </div>
+        <h1 className="page__title">记忆</h1>
+        <p className="page__subtitle">查看她记下的事，并纠正不准确的内容。</p>
       </header>
-
-      <div className="mem-tabs" role="tablist" aria-label="记忆页分区">
-        <button
-          type="button"
-          role="tab"
-          id="mem-tab-content"
-          aria-selected={tab === 'content'}
-          aria-controls="mem-panel-content"
-          className={`mem-tab${tab === 'content' ? ' mem-tab--active' : ''}`}
-          data-testid="mem-tab-content"
-          onClick={() => openTab('content')}
-        >
-          记忆内容
-        </button>
-        <button
-          type="button"
-          role="tab"
-          id="mem-tab-settings"
-          aria-selected={tab === 'settings'}
-          aria-controls="mem-panel-settings"
-          className={`mem-tab${tab === 'settings' ? ' mem-tab--active' : ''}`}
-          data-testid="mem-tab-settings"
-          onClick={() => openTab('settings')}
-        >
-          记忆与学习（调参）
-        </button>
+      <nav className="mem-tabs" aria-label="记忆分区">
+        {MEMORY_TABS.map(({ id, label }) => (
+          <a
+            key={id}
+            href={memoryTabHref(id)}
+            className={`mem-tab${id === tab ? ' mem-tab--active' : ''}`}
+            aria-current={id === tab ? 'location' : undefined}
+            data-testid={`mem-tab-${id}`}
+            onClick={(event) => {
+              if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              event.preventDefault();
+              if (id !== tab) navigate(memoryTabHref(id));
+            }}
+          >{label}</a>
+        ))}
+      </nav>
+      <div hidden={tab === 'settings'}>
+        <MemoryContent tab={tab} />
       </div>
-
-      <div
-        id="mem-panel-content"
-        role="tabpanel"
-        aria-labelledby="mem-tab-content"
-        hidden={tab !== 'content'}
-      >
-        {tab === 'content' ? <MemoryContent /> : null}
-      </div>
-
-      <div
-        id="mem-panel-settings"
-        role="tabpanel"
-        aria-labelledby="mem-tab-settings"
-        hidden={tab !== 'settings'}
-      >
-        {tab === 'settings' ? <MemorySettingsTab onBack={() => openTab('content')} /> : null}
-      </div>
+      {tab === 'settings' ? <MemorySettingsTab onBack={() => navigate('/memory')} /> : null}
     </section>
   );
 }

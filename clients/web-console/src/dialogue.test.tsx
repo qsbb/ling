@@ -96,18 +96,19 @@ function sessionTitles(html: string): string[] {
   );
 }
 
-function renderSidebar(sessions: SessionRecord[]): string {
+function renderSidebar(sessions: SessionRecord[], user = USER): string {
   return renderToStaticMarkup(
     <SessionSidebar
       sessions={sessions}
       currentId={null}
       open={false}
-      user={USER}
+      user={user}
       onClose={() => undefined}
       onSelect={() => undefined}
       onCreate={() => undefined}
-      onRename={async () => undefined}
+      onRename={async () => true}
       onPin={async () => undefined}
+      onMove={async () => undefined}
       onNavigateSettings={() => undefined}
       onNavigatePersona={() => undefined}
       onLogout={() => undefined}
@@ -243,8 +244,10 @@ describe('会话命名：群名作标题，机器键只当副标题', () => {
     expect(canRenameSession(sessionFixture({ session_id: 'win_old', title: '我给它改的名字', peer_id: '1' }))).toBe(false);
   });
 
-  it('渠道窗口不允许在界面上改名（改标题会让 bridge 找不到同一个群）', () => {
-    expect(canRenameSession(sessionFixture({ session_id: 'win_g', title: GROUP_REF }))).toBe(false);
+  it('渠道改名需要管理员权限，网页会话可以改名', () => {
+    const group = sessionFixture({ session_id: 'win_g', title: GROUP_REF });
+    expect(canRenameSession(group, 'member')).toBe(false);
+    expect(canRenameSession(group, 'admin')).toBe(true);
     expect(canRenameSession(sessionFixture({ session_id: 'win_w', title: '深夜聊天' }))).toBe(true);
   });
 
@@ -287,11 +290,11 @@ describe('会话列表：标题、副标题、渠道标签、键盘可达', () =
     expect(html).toContain('>网页<');
   });
 
-  it('列表项与会话按钮都是原生 button，且渠道会话没有改名入口', () => {
+  it('列表项保留原生按钮，成员只能改网页会话名', () => {
     const html = renderSidebar([
       sessionFixture({ session_id: 'win_group', title: GROUP_REF }),
       sessionFixture({ session_id: 'win_web', title: '深夜聊天', channel: 'web' }),
-    ]);
+    ], { ...USER, role: 'member' });
     expect(countOf(html, '<button type="button" class="session__main"')).toBe(2);
     // 只有网页会话能改名，且改名按钮本身是 button
     expect(countOf(html, 'aria-label="改名：')).toBe(1);
@@ -612,16 +615,20 @@ describe('置顶：按钮与排序（R8 前端）', () => {
     expect(html).toContain('aria-pressed="false"');
   });
 
-  it('渠道窗口没有置顶按钮——那是这里管不住的东西', () => {
-    const html = renderSidebar([
+  it('管理员可以改名和置顶渠道窗口', () => {
+    const sessions = [
       sessionFixture({
         session_id: 'onebot-default:group:100200300',
         title: 'onebot-default:group:100200300',
         channel: 'onebot-default',
         peer_id: '100200300',
       }),
-    ]);
-    expect(html).toContain('群 100200300');
-    expect(html).not.toContain('data-testid="session-pin"');
+    ];
+    const owner = renderSidebar(sessions);
+    const member = renderSidebar(sessions, { ...USER, role: 'member' });
+    expect(owner).toContain('改名：群 100200300');
+    expect(owner).toContain('data-testid="session-pin"');
+    expect(member).not.toContain('改名：群 100200300');
+    expect(member).not.toContain('data-testid="session-pin"');
   });
 });

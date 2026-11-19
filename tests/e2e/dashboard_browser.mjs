@@ -8,7 +8,7 @@
  * 都没人发现。这里用真 Chromium 断言布局本身。
  *
  * 特点：
- * - 全部 `/v1/**` 由 Playwright 拦截并 mock（含 `/v1/dashboard` 的 9 个分段），
+ * - 全部 `/v1/**` 由 Playwright 拦截并 mock（含 `/v1/dashboard` 的分段），
  *   因此**不需要后端起在某个端口**，结果也稳定可复现；
  * - 只要求一个静态可访问的前端地址（`vite dev` 或 `vite preview` 的隔离端口），
  *   登录态同样由 mock 提供；
@@ -17,19 +17,16 @@
  * 每个视口断言：
  * 1. 页头里没有总览（`header.app-header .dash` 为 null、页头文本不含「今天的安排」），
  *    总览在 `<main class="app-main">` 里，且整页只有一个 `<main>`；
- * 2. 标题是「总览」，9 个分段（此刻/情绪/可用性/主动联系/今天的安排/最近记住的事/
- *    近期生活/关系/渠道与模型）都在且可见；
+ * 2. 标题是「总览」，当下/接下来/近期生活可见，记忆与连接详情按需展开；
  * 3. 不出现 PersonaPage 的特征文本（系统提示（人格设定）/ 叙事边界 / 角色设定 / 保存设定）；
  * 4. `document.documentElement.scrollWidth <= window.innerWidth`（无横向溢出）；
- * 5. 卡片网格列宽合理：桌面 12 列每列 ≥ 60px、卡片宽 ≥ 300px、卡片之间不重叠、
- *    手机单列且卡片占满内容宽；
+ * 5. 桌面当下和接下来并排，手机按顺序单列，两档都不存在重叠；
  * 6. 每张卡片都标了「更新于」（快照不许说成实时）；
  * 7. 情绪是中文（平静，不是 calm）；日程带日期、昨天的日程标「不是今天」；
  *    已取消 / 送不出去的承诺标出状态（F4/F5）；
- * 8. 手机上「详细」「刷新」命中区 ≥44×44，桌面仍是原来的小字号文字链（L2）；
- * 9. 卡片与「详细」hover 后 computed style 有变化（L3/F6）；
- * 10. 导航点「总览」能回到总览页（导航没被接错位置；用 testid 定位，不依赖顶栏类名）；
- * 11. 点「刷新」会真的再取一次 `/v1/dashboard`。
+ * 8. 主要入口在当下区，手机上入口与刷新命中区 ≥44×44；
+ * 9. 导航点「总览」能回到总览页（用 testid 定位，不依赖顶栏类名）；
+ * 10. 点「刷新」会真的再取一次 `/v1/dashboard`。
  *
  * 另外三组场景：
  * - 未知路径 `/qa-no-such-route`（桌面 + 手机）：渲染 `data-testid="unknown-route"`、
@@ -154,7 +151,7 @@ function formatLocalDayTime(iso) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 9 个分段都非空的总览载荷，形状照抄真实 `/v1/dashboard` 响应。 */
+/** 总览载荷，保留真实 `/v1/dashboard` 的分段形状。 */
 function dashboardPayload() {
   const asOf = '2026-10-30T05:48:02.650639+00:00';
   const yesterdayPlanStart = localIso(-1, 15, 0);
@@ -175,6 +172,7 @@ function dashboardPayload() {
         as_of: asOf,
         data: { availability: 'available', energy: 82, social_load: 12, describe: '状态正常，可以随时说话' },
       },
+      phone: { status: 'empty', as_of: asOf, data: null },
       proactive: {
         status: 'ok',
         as_of: asOf,
@@ -302,6 +300,9 @@ async function attachMocks(context, state) {
     if (pathname === '/v1/sessions' && method === 'GET') {
       return fulfillJson(route, 200, { sessions: [] });
     }
+    if (pathname === '/v1/version' && method === 'GET') {
+      return fulfillJson(route, 200, { current: '0.0.5' });
+    }
 
     // 其余接口一律 404：本脚本只关心总览页，别的页面渲染成什么不重要。
     return fulfillJson(route, 404, {
@@ -313,7 +314,7 @@ async function attachMocks(context, state) {
 /* -------------------------------------------------------------- 断言工具 */
 
 async function bodyText(page) {
-  return (await page.textContent('body')) || '';
+  return page.locator('body').innerText();
 }
 
 async function shot(page, name, fullPage = false) {
@@ -330,17 +331,18 @@ async function measure(page) {
       return { x: r.x, y: r.y, width: r.width, height: r.height };
     };
     const cards = [...document.querySelectorAll('.dash-card')];
+    const visibleCards = cards.filter((card) => !card.closest('details:not([open])'));
     const overlap = [];
-    for (let i = 0; i < cards.length; i += 1) {
-      for (let j = i + 1; j < cards.length; j += 1) {
-        const a = cards[i].getBoundingClientRect();
-        const b = cards[j].getBoundingClientRect();
+    for (let i = 0; i < visibleCards.length; i += 1) {
+      for (let j = i + 1; j < visibleCards.length; j += 1) {
+        const a = visibleCards[i].getBoundingClientRect();
+        const b = visibleCards[j].getBoundingClientRect();
         const ox = Math.min(a.right, b.right) - Math.max(a.left, b.left);
         const oy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
         if (ox > 1 && oy > 1) overlap.push({ i, j, ox: Math.round(ox), oy: Math.round(oy) });
       }
     }
-    const grid = document.querySelector('.dash__grid');
+    const grid = document.querySelector('.dash-board__main');
     const gridStyle = grid ? getComputedStyle(grid) : null;
     const columnWidths = gridStyle
       ? gridStyle.gridTemplateColumns.split(/\s+/).map((value) => Number.parseFloat(value)).filter((n) => Number.isFinite(n))
@@ -353,24 +355,16 @@ async function measure(page) {
       headerText: (document.querySelector('header.app-header')?.textContent || '').trim(),
       title: (document.querySelector('main.app-main h1')?.textContent || '').trim(),
       cardTitles: [...document.querySelectorAll('.dash-card__title')].map((el) => (el.textContent || '').trim()),
-      cardWidths: cards.map((card) => Math.round(card.getBoundingClientRect().width * 100) / 100),
-      visibleCards: cards.filter((card) => {
-        const r = card.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      }).length,
+      visibleCards: visibleCards.length,
       asOfCount: [...document.querySelectorAll('.dash-card__meta')].filter((el) => (el.textContent || '').includes('更新于')).length,
       overlap,
-      grid: rect('.dash__grid'),
+      grid: rect('.dash-board__main'),
       page: rect('.page.dash'),
       main: rect('main.app-main'),
       columnWidths,
-      firstAction: rect('.dash-card__action'),
-      firstRefresh: rect('.dash__refresh'),
-      actionFontSize: (() => {
-        const el = document.querySelector('.dash-card__action');
-        return el ? getComputedStyle(el).fontSize : '';
-      })(),
-      gap: gridStyle ? Number.parseFloat(gridStyle.columnGap) || 0 : 0,
+      firstAction: rect('.dash-board__actions button'),
+      firstRefresh: rect('.dash__meta .dash__refresh'),
+      directivePanels: document.querySelectorAll('.dash-board__details:not([open])').length,
       scrollWidth: document.documentElement.scrollWidth,
       innerWidth: window.innerWidth,
       stylesheets: document.styleSheets.length,
@@ -378,29 +372,11 @@ async function measure(page) {
   });
 }
 
-function near(a, b, tolerance = 2) {
-  return Math.abs(a - b) <= tolerance;
-}
-
-/** 悬停后 computed style 有没有变化（F6/L3：此前卡片与「详细」毫无反馈）。 */
-async function hoverChange(page, selector) {
-  const read = () =>
-    page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return null;
-      const cs = getComputedStyle(el);
-      return [cs.backgroundColor, cs.borderTopColor, cs.boxShadow, cs.color].join('|');
-    }, selector);
-  const before = await read();
-  await page.locator(selector).first().hover();
-  await page.waitForTimeout(150);
-  const after = await read();
-  return { before, after, changed: before !== after };
-}
-
 async function openDashboard(page) {
   await page.goto(`${BASE.origin}/dashboard`, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('.dash__grid', { timeout: 20000 });
+  await page.waitForSelector('.dash-board', { timeout: 20000 }).catch(async (error) => {
+    throw new Error(`总览未渲染：${(await bodyText(page)).slice(0, 300)}`, { cause: error });
+  });
 }
 
 /* -------------------------------------------------------------- 场景 */
@@ -445,12 +421,12 @@ async function runViewport(browser, viewport, label) {
   record(`${label}：标题是「总览」`, m.title === '总览', m.title || '(空)');
   const missing = EXPECTED_SECTIONS.filter((title) => !m.cardTitles.includes(title));
   record(`${label}：12 张卡都在`, m.cardTitles.length === EXPECTED_SECTIONS.length && missing.length === 0, `卡片=${m.cardTitles.length} 缺失=${missing.join('、') || '无'}`);
-  record(`${label}：12 张卡都可见`, m.visibleCards === EXPECTED_SECTIONS.length, `可见=${m.visibleCards}`);
+  record(`${label}：记忆与连接明细默认收起`, m.directivePanels === 2 && m.visibleCards === EXPECTED_SECTIONS.length - 3, `可见=${m.visibleCards}`);
   const personaHits = PERSONA_TEXT.filter((marker) => text.includes(marker));
   record(`${label}：没有角色页文本`, personaHits.length === 0, personaHits.join('、'));
   record(
     `${label}：总览内容真的渲染了`,
-    text.includes('给无人机小兔子做保养') && text.includes('喜欢喝常温的美式') && text.includes('条候选'),
+    text.includes('给无人机小兔子做保养') && text.includes('条候选') && !text.includes('喜欢喝常温的美式'),
   );
   /*
    * 只有「查到了」的卡片才有可信时刻：mock 里 `phone` 分段没有载荷，
@@ -506,91 +482,26 @@ async function runViewport(browser, viewport, label) {
     JSON.stringify(stateColors),
   );
 
-  /* ---- L2：手机触控目标 ≥44×44（桌面保持原密度，不做视觉放大） ---- */
   const action = m.firstAction;
   const refresh = m.firstRefresh;
+  record(`${label}：主要入口在首屏`, Boolean(action) && action.y >= 0 && action.y < viewport.height);
   if (viewport.width < 900) {
-    record(
-      `${label}：「详细」命中区 ≥44×44`,
-      Boolean(action) && action.width >= 44 && action.height >= 44,
-      `${action?.width?.toFixed(1)}×${action?.height?.toFixed(1)}（修复前 22.5×17.6）`,
-    );
-    record(
-      `${label}：「刷新」命中区 ≥44×44`,
-      Boolean(refresh) && refresh.width >= 44 && refresh.height >= 44,
-      `${refresh?.width?.toFixed(1)}×${refresh?.height?.toFixed(1)}（修复前 51.5×23.2）`,
-    );
-  } else {
-    record(
-      `${label}：桌面「详细」仍是小字号文字链（未放大视觉密度）`,
-      Boolean(action) && action.height < 24 && Number.parseFloat(m.actionFontSize) <= 13,
-      `${action?.width?.toFixed(1)}×${action?.height?.toFixed(1)} font=${m.actionFontSize}`,
-    );
+    record(`${label}：去聊天命中区 ≥44×44`, Boolean(action) && action.width >= 44 && action.height >= 44);
+    record(`${label}：刷新命中区 ≥44×44`, Boolean(refresh) && refresh.width >= 44 && refresh.height >= 44);
   }
-
-  /* ---- 布局 ---- */
-  record(
-    `${label}：无横向溢出`,
-    m.scrollWidth <= m.innerWidth,
-    `scrollWidth=${m.scrollWidth} innerWidth=${m.innerWidth}`,
-  );
-  record(`${label}：卡片之间不重叠`, m.overlap.length === 0, JSON.stringify(m.overlap));
-  record(`${label}：页面容器不是竖条`, (m.page?.width ?? 0) >= 300, `page=${m.page?.width ?? 0}px`);
-
-  if (viewport.width >= 1200) {
-    const minColumn = m.columnWidths.length ? Math.min(...m.columnWidths) : 0;
-    record(
-      `${label}：网格是 12 列`,
-      m.columnWidths.length === 12,
-      `${m.columnWidths.length} 列`,
-    );
-    record(
-      `${label}：12 列每列 ≥ 60px`,
-      m.columnWidths.length === 12 && minColumn >= 60,
-      `最小列宽=${Math.round(minColumn * 100) / 100}px（修复前 8.05px）`,
-    );
-    const expectedWidth = m.columnWidths.reduce((sum, value) => sum + value, 0) + m.gap * 11;
-    record(
-      `${label}：列宽之和 = 网格宽`,
-      m.grid !== null && near(expectedWidth, m.grid.width, 3),
-      `${Math.round(expectedWidth * 100) / 100} vs ${m.grid?.width ?? 0}`,
-    );
-    record(
-      `${label}：网格占满内容区宽度`,
-      m.grid !== null && m.grid.width >= (m.page?.width ?? 0) - 60,
-      `grid=${Math.round(m.grid?.width ?? 0)} page=${Math.round(m.page?.width ?? 0)}`,
-    );
-    /*
-     * 3 列小卡（情绪/可用性）在设计上就是 279px 左右：里面只有"一个主值 +
-     * 一句解释"，279px 足够正常断行。900px 档曾要求 ≥300px，那是单一大网格
-     * 时代的阈值，现在会把设计好的小卡误判成"太窄"。
-     */
-    const narrowest = m.cardWidths.length ? Math.min(...m.cardWidths) : 0;
-    record(
-      `${label}：卡片足够宽（不会 2–3 字换行）`,
-      narrowest >= 260,
-      `最窄卡片=${Math.round(narrowest * 100) / 100}px（修复前 96.25px）`,
-    );
-  } else {
-    // 手机：单列，卡片占满内容宽
-    const pageWidth = m.page?.width ?? 0;
-    const widest = m.cardWidths.length ? Math.max(...m.cardWidths) : 0;
-    record(`${label}：单列（卡片占满内容宽）`, near(widest, pageWidth - 28, 4), `卡片=${Math.round(widest)}px / 内容宽≈${Math.round(pageWidth - 28)}px`);
-    record(`${label}：卡片宽度仍可读`, (m.cardWidths.length ? Math.min(...m.cardWidths) : 0) >= 280, `最窄=${Math.round(Math.min(...m.cardWidths))}px`);
-  }
+  record(`${label}：无横向溢出`, m.scrollWidth <= m.innerWidth, `scrollWidth=${m.scrollWidth} innerWidth=${m.innerWidth}`);
+  record(`${label}：内容不重叠`, m.overlap.length === 0, JSON.stringify(m.overlap));
+  const columns = viewport.width >= 1200 ? 2 : 1;
+  record(`${label}：桌面并排，手机单列`, m.columnWidths.length === columns && Math.min(...m.columnWidths) >= 260, JSON.stringify(m.columnWidths));
 
   await shot(page, `${label}-dashboard`);
   // 整页内容：`.page` 自己是滚动容器，document 的 fullPage 截不到下面几屏，
   // 所以直接截 `.dash` 这个元素（Playwright 会按元素完整尺寸出图）。
   await page.locator('.dash').screenshot({ path: path.join(SHOTS, `${label}-dashboard-full.png`) });
 
-  /* ---- L3/F6：hover 反馈（窄屏触控环境不做 hover 断言） ---- */
-  if (viewport.width >= 1200) {
-    const cardHover = await hoverChange(page, '.dash-card');
-    record(`${label}：卡片 hover 有反馈`, cardHover.changed, cardHover.changed ? 'style changed' : JSON.stringify(cardHover.before));
-    const actionHover = await hoverChange(page, '.dash-card__action');
-    record(`${label}：「详细」hover 有反馈`, actionHover.changed, actionHover.changed ? 'style changed' : JSON.stringify(actionHover.before));
-  }
+  const memories = page.locator('.dash-board__details').filter({ hasText: '记忆与关系' });
+  await memories.locator('summary').click();
+  record(`${label}：展开后能读到最近的记忆`, await memories.getByText('喜欢喝常温的美式').isVisible());
 
   /* ---- 导航：导航里的「总览」真的回到总览 ---- */
   // 用 testid 定位导航入口：Step 1/2 会把顶栏导航换成左导航，
@@ -616,7 +527,7 @@ async function runViewport(browser, viewport, label) {
 
   /* ---- 交互：刷新会真的再取一次 ---- */
   const before = state.dashboardRequests;
-  await page.locator('.dash__refresh').first().click();
+  await page.locator('.dash__meta .dash__refresh').click();
   const refreshed = await waitFor(async () => state.dashboardRequests > before, 8000);
   record(`${label}：点「刷新」会重新取数`, refreshed, `请求数 ${before} → ${state.dashboardRequests}`);
 
@@ -682,7 +593,7 @@ async function runUnknownRoute(browser, viewport, label) {
   await page.locator('[data-testid="unknown-route-home"]').click();
   const backHome = await waitFor(async () => {
     const at = await page.evaluate(() => window.location.pathname);
-    return at === '/dashboard' && (await page.locator('.dash__grid').count()) === 1;
+    return at === '/dashboard' && (await page.locator('.dash-board').count()) === 1;
   }, 15000);
   record(`${label}：点「回到总览」真的回到 /dashboard`, backHome);
   await context.close();

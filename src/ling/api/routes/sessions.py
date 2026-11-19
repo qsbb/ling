@@ -11,8 +11,10 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
 from ling.api.deps import ConversationDep, CurrentAuth, DbSession, authorize_message_view
-from ling.api.errors import not_found
+from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import (
+    ErrorCode,
+    IdStr,
     PromptBlock,
     PromptSnapshotItem,
     PromptSnapshotModel,
@@ -138,65 +140,30 @@ async def _friend_names_by_instance(
     return names
 
 
-async def _friend_remark_names(
-    request: Request,
-    windows: Sequence[Window],
-    friends: dict[str, dict[str, tuple[str | None, str | None]]] | None = None,
-) -> dict[str, str | None]:
-    """私聊窗口 id → **好友备注优先**的显示名。
-
-    ## 优先级（用户要的就是这个）
-
-        remark（好友备注）> nickname（昵称）> subjects.display_name > None
-
-    「备注」是**用户自己**给这个人起的叫法，比对方自己填的昵称更贴近用户
-    心里那个人。昵称是对方自称，库里的人级名字是入站时记下的快照——三者
-    不同的时候，用户最认的是自己写的备注。
-
-    ## 拿不到就是 None
-
-    不在好友列表（群里认识的、临时会话）、连接器不支持、超时时，这一项
-    没有值，**回退给** ``subjects.display_name``（由调用方合并）。
-    都拿不到才返回 ``None``，前端回退成「私聊 {id}」。
-    """
-    table = (
-        friends
-        if friends is not None
-        else await _friend_names_by_instance(request, windows)
-    )
-    out: dict[str, str | None] = {}
+async def _friend_names_by_window(
+    request: Request, windows: Sequence[Window]
+) -> dict[str, tuple[str, str]]:
+    """私聊窗口 id → 好友备注和渠道昵称。"""
+    table = await _friend_names_by_instance(request, windows)
+    out: dict[str, tuple[str, str]] = {}
     for window in windows:
-        channel, kind, peer_id = window_target(window)
+        _, kind, peer_id = window_target(window)
         if kind != "private" or not peer_id:
             continue
         namespace = str(window.title or "").split(":", 1)[0]
         remark, nickname = table.get(namespace, {}).get(peer_id, (None, None))
-        chosen = (remark or nickname or "").strip()
-        if chosen:
-            out[window.id] = chosen[:128]
+        out[window.id] = ((remark or "").strip()[:128], (nickname or "").strip()[:128])
     return out
 
 
 async def _display_names(
     request: Request, conversation: ConversationService, windows: Sequence[Window]
 ) -> dict[str, str | None]:
-    """会话的**人话名字**：群窗口靠采集，私聊窗口按 备注 > 昵称 > 库里的名字。
-
-    三段来源，优先级从高到低：
-
-    - **群**：群名只有平台知道（``get_group_info``），读侧外呼采集，失败 ``None``；
-    - **私聊·好友备注**：``get_friend_list`` 的 ``remark``（整表一次，带缓存）；
-    - **私聊·昵称**：同一个接口的 ``nickname``，再退到 ``subjects.display_name``
-      （入站时身份域写进去的人级昵称）。
-
-    都不编名字：采集不到/查不到就是 ``None``，由前端按 ``channel`` +
-    ``peer_id`` 回退成「群 100…」「私聊 100200301」。
-    """
-    names = await conversation.peer_display_names(windows)
-    # 好友备注/昵称覆盖库里的名字（更贴近用户自己的叫法）。
-    friends = await _friend_names_by_instance(request, windows)
-    names.update(await _friend_remark_names(request, windows, friends))
-    names.update(await _group_display_names(request, windows))
+    """没有会话别名时，使用群名或私聊对端的显示名。"""
+    unnamed = [window for window in windows if not window.display_name_override]
+    private_names = await _friend_names_by_window(request, unnamed)
+    names = await conversation.peer_display_names(unnamed, private_names)
+    names.update(await _group_display_names(request, unnamed))
     return names
 
 
@@ -221,7 +188,7 @@ async def _session_record(
 async def list_sessions(
     request: Request, auth: CurrentAuth, conversation: ConversationDep
 ) -> SessionListOut:
-    """会话列表：**置顶 → 好感度 → 最近活跃**（用户原话：「可置顶，其他按好感度」）。
+    """会话列表按置顶分组，再按手动顺序与默认规则排序。
 
     顺序由 `sort_windows_for_display` 定，接口层不自己写排序规则——三个入口
     （这里、默认会话兜底、将来的移动端）必须共享同一份顺序。
@@ -269,6 +236,25 @@ class PinSessionBody(BaseModel):
     pinned: bool
 
 
+class MoveSessionBody(BaseModel):
+    anchor_id: IdStr
+    before: bool
+
+
+@router.post("/sessions/{session_id}/move", status_code=204)
+async def move_session(
+    session_id: str,
+    body: MoveSessionBody,
+    auth: CurrentAuth,
+    conversation: ConversationDep,
+) -> None:
+    if auth.user.role not in {"owner", "admin"}:
+        raise LingError(ErrorCode.forbidden, "需要管理员权限", status_code=403)
+    await conversation.move_window(
+        session_id, subject_id=auth.user.subject_id, anchor_id=body.anchor_id, before=body.before
+    )
+
+
 @router.post("/sessions/{session_id}/pin", response_model=SessionRecord)
 async def pin_session(
     session_id: str,
@@ -292,12 +278,15 @@ async def pin_session(
 
     ## 返回整条 `SessionRecord`
 
-    前端拿它直接替换列表里的那一行，不必再发一次列表请求——置顶会改变
-    顺序，但顺序由前端按同一条规则重排即可（`pinned` 字段在记录里）。
+    列表的更新顺序可通过 `GET /sessions` 获取。
     """
-    window = await conversation.set_window_pinned(
-        session_id, subject_id=auth.user.subject_id, pinned=body.pinned
-    )
+    async with independent_session_scope() as session:
+        window = await conversation.with_session(session).set_window_pinned(
+            session_id,
+            subject_id=auth.user.subject_id,
+            pinned=body.pinned,
+            operator=auth.user.role in {"owner", "admin"},
+        )
     familiarity = await conversation.familiarities([window])
     return await _session_record(
         request, conversation, window, familiarity=familiarity
@@ -341,6 +330,7 @@ async def update_session(
         subject_id=auth.user.subject_id,
         title=body.title,
         archived=body.archived,
+        operator=auth.user.role in {"owner", "admin"},
     )
     return await _session_record(request, conversation, window)
 

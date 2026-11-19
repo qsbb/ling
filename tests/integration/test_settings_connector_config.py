@@ -161,7 +161,9 @@ async def test_empty_overrides_match_pre_upgrade(web_env: TestEnv, logged_in: Te
     assert {"LING_ONEBOT_ACCESS_TOKEN", "LING_ONEBOT_SELF_ID"} <= keys
     assert len(_scope(body, "onebot")["fields"]) == 12
     assert len(_scope(body, "qqbot")["fields"]) == 12
-    assert len(_scope(body, "access")["fields"]) == 2
+    assert {field["key"] for field in _scope(body, "access")["fields"]} == {
+        "LING_ACCESS_MODE", "LING_ACCESS_LIST", "LING_ACCESS_GROUPS",
+    }
 
 
 # ---------------------------------------------------------------- ② 写入
@@ -706,6 +708,32 @@ async def test_inbound_reads_the_same_effective_snapshot(
     snapshot = web_env.app.state.access_snapshot
     assert "100200300" in snapshot.allow_list
     assert snapshot.mode == "whitelist"
+
+
+async def test_group_allowlist_can_override_and_restore_bootstrap_values(
+    web_env: TestEnv, logged_in: TestEnv  # noqa: F811
+) -> None:
+    from dataclasses import replace
+
+    from ling.settings.connector_overrides import current_access_snapshot
+
+    state = web_env.app.state
+    baseline = replace(state.connector_config_baseline, access_groups=frozenset({"100200301"}))
+    state.connector_config_baseline = baseline
+    response = await _put(web_env, "access", {"set": {"LING_ACCESS_GROUPS": []}})
+    assert response.status_code == 202, response.text
+    assert state.settings.access_groups == frozenset()
+    async with session_scope() as session:
+        snapshot = await current_access_snapshot(session, settings=baseline)
+    assert snapshot.allow_groups == frozenset()
+    assert _field(await _get(web_env), "access", "LING_ACCESS_GROUPS")["value"] == []
+
+    response = await web_env.client.post(
+        f"{ENDPOINT}/reset", headers={**ORIGIN, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 200 and response.json()["ok"] is True, response.text
+    assert state.settings.access_groups == frozenset({"100200301"})
+    assert state.access_snapshot.allow_groups == state.settings.access_groups
 
 
 async def test_access_change_does_not_restart_connections(

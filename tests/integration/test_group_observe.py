@@ -125,6 +125,41 @@ async def test_owner_in_group_can_still_be_answered(logged_in: TestEnv) -> None:
     assert response.json()["accepted"] is True, response.text
 
 
+async def test_group_allowlist_toggle_applies_to_explicit_mentions_only(logged_in: TestEnv) -> None:  # noqa: F811
+    from tests.integration.test_settings_connector_config import _put
+
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+
+    async def save(groups: list[str], generation: int) -> None:
+        response = await _put(logged_in, "access", {"set": {"LING_ACCESS_GROUPS": groups}},
+                              headers={"If-Match": str(generation)})
+        assert response.status_code == 202 and response.json()["state"] == "active", response.text
+
+    configured = await _put(logged_in, "access", {"set": {
+        "LING_ACCESS_MODE": "whitelist", "LING_ACCESS_LIST": [QQ_USER],
+        "LING_ACCESS_GROUPS": [str(OTHER_GROUP)],
+    }})
+    assert configured.status_code == 202, configured.text
+
+    async def event(message_id: int, message: str):  # noqa: ANN202
+        return (await _post(logged_in, _event_body(
+            message_type="group", sub_type="normal", group_id=KNOWN_GROUP,
+            user_id=STRANGER, message_id=message_id, message=message, raw_message=message,
+        ))).json()
+
+    at_self = "[CQ:at,qq=10001] 你好"
+    assert (await event(781, at_self))["decision"] == "deferred_attention"
+    await save([str(OTHER_GROUP), str(KNOWN_GROUP)], 1)
+    assert (await event(782, "[CQ:at,qq=30003] 你好"))["decision"] == "deferred_attention"
+    delivered = await event(783, at_self)
+    assert delivered["delivered"] is True, delivered
+    await save([str(OTHER_GROUP)], 2)
+    assert (await event(784, at_self))["decision"] == "deferred_attention"
+    assert logged_in.app.state.settings.access_groups == frozenset({str(OTHER_GROUP)})
+    assert [call["action"] for call in fake.sent] == ["send_group_msg"]
+
+
 # ------------------------------------------------ 拒绝日志开关（三态改造后）
 
 @pytest.mark.asyncio

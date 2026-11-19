@@ -519,22 +519,9 @@ async def get_dashboard(
 
         channels = await channel_connectivity(session, settings=settings, app=request.app)
 
-        # 模型职责有没有绑定：没绑 = 她说不出话，这是首屏必须能看出来的
-        bound: list[str] = []
-        try:
-            effective = await config.effective()
-            bound = [
-                name
-                for name, binding in effective.profiles.items()
-                if getattr(binding, "provider_id", None)
-            ]
-        except Exception as exc:  # noqa: BLE001 - 读不到就按未绑定报
-            # 不静默：这条一旦吞掉，界面会显示"没绑定模型"，
-            # 而真实原因是读配置出错——两者排查方向完全相反。
-            logger.warning(
-                "仪表盘读模型绑定失败：%s: %s", type(exc).__name__, exc
-            )
-            bound = []
+        # 让分段 guard 报出读取失败，不能把它误报成「未配置模型」。
+        effective = await config.effective()
+        bound = [name for name, binding in effective.profiles.items() if binding.provider_id]
 
         return _section(
             SECTION_OK,

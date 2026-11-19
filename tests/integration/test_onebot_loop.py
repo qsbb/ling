@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -52,6 +53,8 @@ class FakeOneBot:
     async def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content or b"{}")
         action = str(request.url).rsplit("/", 1)[-1]
+        if action == "get_group_member_info":
+            return httpx.Response(200, json={"status": "ok", "retcode": 0, "data": {}})
         self.sent.append({"action": action, "body": body})
         if self._fail_after is not None and len(self.sent) <= self._fail_after:
             return httpx.Response(
@@ -321,6 +324,67 @@ async def test_group_reply_uses_group_action(logged_in: TestEnv) -> None:
     group_calls = [c for c in fake.sent if c["action"] == "send_group_msg"]
     assert group_calls, "群消息没走 send_group_msg"
     assert str(group_calls[0]["body"]["group_id"]) == GROUP
+
+
+async def test_group_mention_uses_event_self_id_and_stores_card(logged_in: TestEnv) -> None:
+    fake = FakeOneBot()
+    lookups: list[dict] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/get_group_member_info"):
+            lookup = json.loads(request.content)
+            lookups.append(lookup)
+            return httpx.Response(200, json={"status": "ok", "retcode": 0, "data": {
+                "card": "小溪", "nickname": "溪流",
+            }})
+        return await fake.handler(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        logged_in.app.state.onebot_connector = OneBotV11Connector(replace(CFG, self_id=None), http=client)
+        await _bind(logged_in)
+        event = {"message_type": "group", "group_id": int(GROUP), "sub_type": "normal"}
+        reply = await _post(logged_in, _event_body(
+            **event, message="@10001你好", raw_message="[CQ:at,qq=10001]你好",
+        ))
+        assert reply.json()["delivered"] is True, reply.text
+        followup = await _post(logged_in, _event_body(
+            **event, message_id=778, message=[{"type": "at", "data": {"qq": 10001}}],
+        ))
+        assert followup.json()["decision"] == "deferred_attention", followup.text
+        assert "补充" in followup.json()["reason"]
+        plain = await _post(logged_in, _event_body(
+            **event, message_id=779, message="@10001你好", raw_message="@10001你好",
+        ))
+        assert plain.json()["decision"] == "deferred_attention", plain.text
+
+    assert lookups == [{"group_id": GROUP, "user_id": "10001"}]
+    async with session_scope() as session:
+        texts = set((await session.scalars(select(Message.text).where(Message.role == "user"))).all())
+    assert {"@小溪你好", "@小溪", "@10001你好"} <= texts
+
+
+async def test_group_mention_keeps_rendered_name_when_member_lookup_has_no_name(
+    logged_in: TestEnv, caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeOneBot()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fake.handler)) as client:
+        logged_in.app.state.onebot_connector = OneBotV11Connector(replace(CFG, self_id=None), http=client)
+        await _bind(logged_in)
+        event = {"message_type": "group", "group_id": int(GROUP), "sub_type": "normal"}
+        with caplog.at_level("INFO", logger="ling.behavior"):
+            reply = await _post(logged_in, _event_body(
+                **event, message="@x你好", raw_message="[CQ:at,qq=10001]你好",
+            ))
+        assert reply.json()["delivered"] is True, reply.text
+        assert any("说：「@x你好」" in record.getMessage() for record in caplog.records)
+        plain = await _post(logged_in, _event_body(
+            **event, message_id=778, message="@x你好", raw_message="@x你好",
+        ))
+        assert plain.json()["decision"] == "deferred_attention", plain.text
+
+    async with session_scope() as session:
+        texts = (await session.scalars(select(Message.text).where(Message.role == "user"))).all()
+    assert texts.count("@x你好") == 2
 
 
 # ------------------------------------------------------------------ 失败重投（此前实现的可靠性缺陷）

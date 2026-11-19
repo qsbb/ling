@@ -21,7 +21,7 @@ import hashlib
 import hmac
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -178,6 +178,9 @@ class OneBotV11Connector(ChannelConnector):
         # 读接口上，等 15 秒的群名不如先显示「群 123」。
         self.group_name_timeout = 2.0
         self.group_name_cache_max = 512
+        self._mention_name_cache: OrderedDict[tuple[str, str], tuple[float, str | None]] = (
+            OrderedDict()
+        )
 
         # 好友名/备注缓存：**一次 `get_friend_list` 拿全量**，不是逐个查。
         #
@@ -1255,16 +1258,9 @@ class OneBotV11Connector(ChannelConnector):
         if is_group and not group_id:
             raise ChannelError(ChannelErrorKind.rejected, "群消息缺少 group_id")
 
-        parsed: ParsedMessage = parse_message(
-            payload.get("message"), self_id=self._config.self_id
-        )
-        # 字符串格式时 raw_message 更完整（含 CQ 码）；
-        # 数组格式时 message 已经是结构化，直接用解析结果。
-        if not parsed.text.strip() and isinstance(payload.get("raw_message"), str):
-            parsed = parse_message(payload["raw_message"], self_id=self._config.self_id)
-
         message_id = str(payload.get("message_id") or "")
         self_id = str(payload.get("self_id") or self._config.self_id or "")
+        _, parsed = self._parse_inbound_message(payload)
         # 去重键必须包含 self_id 与 message_id：同一 QQ 号下 message_id 唯一，
         # 但多实例共库时只靠 message_id 会互相覆盖。
         external_event_id = f"{self_id}:{message_id}" if message_id else new_id("obe")
@@ -1301,10 +1297,68 @@ class OneBotV11Connector(ChannelConnector):
             # 于是空正文的 @ 直接被契约校验拒掉，连 bridge 都到不了——
             # 用户看到的是"@ 了她却毫无反应"。
             parts=[InputPart(modality=Modality.text, text=parsed.text), *parsed.parts],
+            display_text=parsed.display_text if parsed.mention_ids else None,
             reply_to=parsed.reply_to_message_id,
             media_refs=parsed.media_refs,
             mentions_actor=parsed.mentions_self,
         )
+
+    def _parse_inbound_message(self, payload: dict) -> tuple[object, ParsedMessage]:
+        self_id = str(self._config.self_id or payload.get("self_id") or "").strip()
+        message = payload.get("message")
+        parsed = parse_message(message, self_id=self_id)
+        raw = payload.get("raw_message")
+        if isinstance(raw, str) and not (isinstance(message, list) and message):
+            raw_parsed = parse_message(raw, self_id=self_id)
+            if not parsed.mention_ids and raw_parsed.mention_ids:
+                # CQ 提供账号和正文；平台渲染过的 message 可能已经带名字。
+                # 它只用于显示，不能改变点名身份或喂给模型的正文。
+                if parsed.display_text.strip() and not parsed.media_refs:
+                    raw_parsed.display_text = parsed.display_text
+                return raw, raw_parsed
+            if not parsed.text.strip() and not parsed.mention_ids and not parsed.media_refs:
+                return raw, raw_parsed
+        return message, parsed
+
+    async def enrich_inbound_display(
+        self, envelope: InteractionEnvelope, payload: dict
+    ) -> InteractionEnvelope:
+        if payload.get("message_type") != "group":
+            return envelope
+        group_id = str(payload.get("group_id") or "")
+        source, parsed = self._parse_inbound_message(payload)
+        accounts = list(dict.fromkeys(qq for qq in parsed.mention_ids if qq.isascii() and qq.isdigit()))[:8]
+        if not group_id or not accounts:
+            return envelope
+        names = await asyncio.gather(*(self._mention_name(group_id, qq) for qq in accounts))
+        resolved = {qq: name for qq, name in zip(accounts, names, strict=True) if name is not None}
+        if not resolved:
+            return envelope
+        self_id = str(self._config.self_id or payload.get("self_id") or "").strip()
+        named = parse_message(source, self_id=self_id, mention_names=resolved)
+        return envelope.model_copy(update={"display_text": named.display_text})
+
+    async def _mention_name(self, group_id: str, account: str) -> str | None:
+        key = (group_id, account)
+        cached = self._mention_name_cache.get(key)
+        if cached is not None and time.monotonic() < cached[0]:
+            self._mention_name_cache.move_to_end(key)
+            return cached[1]
+        name = None
+        try:
+            data = await asyncio.wait_for(
+                self._call("get_group_member_info", {"group_id": group_id, "user_id": account}),
+                timeout=1.0,
+            )
+            if isinstance(data, dict):
+                name = _clean_name(data.get("card")) or _clean_name(data.get("nickname"))
+        except (ChannelError, TimeoutError):
+            pass
+        self._mention_name_cache[key] = (time.monotonic() + (300 if name else 30), name)
+        self._mention_name_cache.move_to_end(key)
+        if len(self._mention_name_cache) > 1024:
+            self._mention_name_cache.popitem(last=False)
+        return name
 
     async def fetch_media(self, media_ref: str) -> tuple[bytes, str]:
         """下载媒体。OneBot 的图片/语音给的是 http(s) url 或本地 file 路径。

@@ -147,6 +147,7 @@ async function openChat(
   width: number,
   originStatus: 'known' | 'unknown' | 'not_applicable' = 'not_applicable',
   channel: 'web' | 'onebot' | 'qqbot' = 'web',
+  peerId?: string,
 ) {
   if (!browser) throw new Error(error ?? '浏览器未启动');
   const context = await browser.newContext({ viewport: { width, height: 850 } });
@@ -163,7 +164,7 @@ async function openChat(
     const req = route.request();
     const path = new URL(req.url()).pathname;
     if (path === '/v1/auth/me') return route.fulfill(json({ user: { id: 'u', username: 'test', role, subject_id: 's', display_name: '用户' }, test_mode: false }));
-    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: '测试', channel, peer_id: null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
+    if (path === '/v1/sessions') return route.fulfill(json({ sessions: [{ schema_version: 'v1', session_id: 'w', window_id: 'w', actor_id: 'a', subject_id: 's', title: peerId ? `onebot-test:group:${peerId}` : '测试', channel, peer_id: peerId ?? null, created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 0, archived: false }] }));
     if (path === '/v1/sessions/w/messages') return route.fulfill(json({ messages: [], active_turn: null }));
     if (path === '/v1/personas') return route.fulfill(json({ items: [{ id: 'p-global', persona_id: 'p-global', name: 'default', display_name: '全局人格' }], active_persona_id: 'p-global', total: 1 }));
     if (path === '/v1/sessions/w/dialogue-policy' && req.method() === 'GET') {
@@ -228,6 +229,41 @@ async function openChat(
 }
 
 describe('Web 会话对话设置', () => {
+  it('快捷加入和移除当前群，不覆盖其他群或发送者', async (ctx) => {
+    if (error) { console.warn(error); ctx.skip(); return; }
+    const { page } = await openChat('owner', 375, 'known', 'onebot', '100200300');
+    let groups = ['100200301'];
+    let generation = 4;
+    const writes: unknown[] = [];
+    await page.route('**/v1/settings/connectors', (route) => route.fulfill(json({ access: {
+      editable: true, generation, fields: [
+        { key: 'LING_ACCESS_MODE', value: 'whitelist' },
+        { key: 'LING_ACCESS_LIST', value: ['100200302'] },
+        { key: 'LING_ACCESS_GROUPS', value: groups },
+      ],
+    } })));
+    await page.route('**/v1/settings/connectors/access', (route) => {
+      const req = route.request();
+      const body = req.postDataJSON() as { set: { LING_ACCESS_GROUPS: string[] } };
+      writes.push({ method: req.method(), generation: req.headers()['if-match'], body });
+      groups = body.set.LING_ACCESS_GROUPS;
+      generation += 1;
+      return route.fulfill(json({ state: 'active', generation }));
+    });
+    await page.getByRole('button', { name: '会话设置' }).click();
+    const control = page.getByRole('checkbox', { name: '本群在白名单中' });
+    await expect.poll(() => control.isEnabled()).toBe(true);
+    expect(await control.isChecked()).toBe(false);
+    await control.click();
+    await expect.poll(async () => await control.isEnabled() && await control.isChecked()).toBe(true);
+    await control.click();
+    await expect.poll(async () => await control.isEnabled() && !(await control.isChecked())).toBe(true);
+    expect(writes).toEqual([
+      { method: 'PUT', generation: '4', body: { set: { LING_ACCESS_GROUPS: ['100200301', '100200300'] }, clear: [] } },
+      { method: 'PUT', generation: '5', body: { set: { LING_ACCESS_GROUPS: ['100200301'] }, clear: [] } },
+    ]);
+  }, 20000);
+
   for (const width of [375, 1440]) {
     it(`逐字段显示来源并预览保存 set 与 clear，宽度 ${width}`, async (ctx) => {
       if (error) { console.warn(error); ctx.skip(); return; }
@@ -310,9 +346,48 @@ describe('Web 会话对话设置', () => {
     ]);
   }, 20000);
 
+  for (const width of [375, 1440]) {
+    it(`重复点击只切换同一个会话面板，宽度 ${width}`, async (ctx) => {
+      if (error) { console.warn(error); ctx.skip(); return; }
+      const { page } = await openChat('owner', width);
+      const button = page.getByRole('button', { name: '会话设置' });
+      const panel = page.locator('#active-window-policy .window-policy');
+      for (const count of [1, 0, 1, 0, 1]) {
+        await button.click();
+        await expect.poll(() => button.getAttribute('aria-expanded')).toBe(String(count === 1));
+        await expect.poll(() => panel.isVisible()).toBe(count === 1);
+        expect(await panel.count()).toBe(1);
+      }
+    }, 20000);
+  }
+
   it('成员看不到修改入口', async (ctx) => {
     if (error) { console.warn(error); ctx.skip(); return; }
     const { page } = await openChat('member', 1440);
     expect(await page.getByRole('button', { name: '会话设置' }).count()).toBe(0);
   }, 20000);
 });
+
+it('日志详情支持键盘展开，缓冲淘汰旧行后仍展开原消息', async (ctx) => {
+  if (error) { console.warn(error); ctx.skip(); return; }
+  const { page } = await openChat('owner', 375);
+  const makeLog = (second: number, message: string) => ({
+    timestamp: `2026-11-14T00:00:0${second}Z`, level: 'info', logger: 'ling.behavior',
+    kind: 'behavior', event_name: 'inbound_received', message,
+    attributes: { attributes: { reason: '这个原因只在详情里', external_event_id: `fixture-${second}` } },
+  });
+  const current = makeLog(2, 'QQ 群里夜落星河说：「[image]」 · 暂缓处理');
+  let items = [makeLog(1, '旧记录'), current];
+  await page.route('**/v1/logs*', (route) => route.fulfill(json({ items, buffered: 2, capacity: 2 })));
+  await page.goto(`${address}/logs`);
+  const row = page.getByTestId('logs-row').filter({ hasText: current.message });
+  const summary = row.locator('summary');
+  await summary.waitFor();
+  expect(await row.getByText('这个原因只在详情里', { exact: true }).isVisible()).toBe(false);
+  await summary.press('Enter');
+  await row.getByText('这个原因只在详情里', { exact: true }).waitFor();
+  items = [current, makeLog(3, '新记录')];
+  await page.getByText('新记录', { exact: true }).waitFor();
+  expect(await row.getByText('这个原因只在详情里', { exact: true }).isVisible()).toBe(true);
+  expect(await page.getByTestId('logs-row').filter({ hasText: '新记录' }).locator('details[open]').count()).toBe(0);
+}, 20000);

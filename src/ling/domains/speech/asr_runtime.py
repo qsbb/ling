@@ -351,7 +351,10 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
         from ling.contracts.v1 import InputPart, InteractionEnvelope, Modality
         from ling.kernel.inbound_intake import process_inbound_payload
         original = InteractionEnvelope.model_validate(payload["envelope"])
-        env = original.model_copy(update={"parts": [InputPart(modality=Modality.text, text=text)]})
+        env = original.model_copy(update={
+            "parts": [InputPart(modality=Modality.text, text=text)],
+            "display_text": None,
+        })
         connector, trusted_key = _source_connector(app, payload)
         outcome = await process_inbound_payload(
             app,

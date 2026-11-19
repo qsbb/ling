@@ -57,11 +57,18 @@ INTENTS_GROUP_AND_C2C = 1 << 25
 # 重连退避
 RECONNECT_MIN = 2.0
 RECONNECT_MAX = 60.0
+HELLO_TIMEOUT = 15.0
 
 # 关闭码 → 下一步动作
 ACTION_IDENTIFY = "identify"
 ACTION_RESUME = "resume"
 ACTION_STOP = "stop"
+
+
+class _ReconnectRequested(Exception):
+    def __init__(self, op: int) -> None:
+        self.op = op
+        super().__init__(f"gateway op={op}")
 
 
 def action_for_close(code: int | None) -> str:
@@ -177,6 +184,8 @@ class QQBotGateway:
                 self.state = GatewayState(
                     session_id=str(data.get("session_id") or ""), last_seq=seq
                 )
+                self.connected = True
+                self.last_error = None
                 emit_event(
                     logger,
                     logging.INFO,
@@ -191,6 +200,8 @@ class QQBotGateway:
                 )
                 return None
             if event == "RESUMED":
+                self.connected = True
+                self.last_error = None
                 emit_event(
                     logger,
                     logging.INFO,
@@ -241,8 +252,12 @@ class QQBotGateway:
                 },
             )
             return None
-        if op in (11, 7, 9):
-            # 心跳 ACK / 服务器要求重连（7）/ 会话失效（9）
+        if op == 7:
+            raise _ReconnectRequested(7)
+        if op == 9:
+            self.state = GatewayState()
+            raise _ReconnectRequested(9)
+        if op == 11:
             return None
 
         logger.info("QQ 网关忽略未知 op=%s", op)
@@ -282,8 +297,12 @@ class QQBotGateway:
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=20, proxy=None
                 ) as ws:
-                    self.connected = True
-                    delay = self._min
+                    self._hello_interval_ms = 0.0
+                    hello = await asyncio.wait_for(ws.recv(), timeout=HELLO_TIMEOUT)
+                    frame = json.loads(hello)
+                    if not isinstance(frame, dict) or frame.get("op") != 10:
+                        raise RuntimeError("QQ 网关首次帧不是 Hello")
+                    await self.handle_frame(hello)
                     token = await self._connector.access_token()
                     if action == ACTION_RESUME:
                         await ws.send(json.dumps(build_resume(token, self.state)))
@@ -307,14 +326,26 @@ class QQBotGateway:
                         with contextlib.suppress(asyncio.CancelledError, Exception):
                             await heartbeat
             except asyncio.CancelledError:
-                self.connected = False
                 raise
+            except _ReconnectRequested as exc:
+                self.last_error = str(exc)
+                emit_event(
+                    logger,
+                    logging.WARNING,
+                    event_name="connector_disconnected",
+                    message="QQ 网关要求重新连接" if exc.op == 7 else "QQ 网关会话失效，将重新鉴权",
+                    attributes={
+                        "channel": "qqbot",
+                        "gateway_op": exc.op,
+                        "next_action": ACTION_RESUME if self.state.can_resume else ACTION_IDENTIFY,
+                        "connection_state": "disconnected",
+                    },
+                )
             except websockets.exceptions.ConnectionClosed as exc:
                 # 关闭码决定还能不能继续：见 action_for_close 的说明
-                self.connected = False
-                decision = action_for_close(getattr(exc, "code", None))
-                self.last_error = f"closed code={getattr(exc, 'code', None)}"
-                code = getattr(exc, "code", None)
+                code = exc.rcvd.code if exc.rcvd is not None else None
+                decision = action_for_close(code)
+                self.last_error = f"closed code={code}"
                 # 状态机事件：连接关闭 / 计划重连 / 永久停止，三种分开记
                 emit_event(
                     logger,
@@ -338,7 +369,6 @@ class QQBotGateway:
                     # 会新开会话，旧 session 作废
                     self.state = GatewayState()
             except Exception as exc:  # noqa: BLE001 - 任何异常都重连
-                self.connected = False
                 self.last_error = f"{type(exc).__name__}: {exc}"[:200]
                 emit_event(
                     logger,
@@ -354,6 +384,8 @@ class QQBotGateway:
                     },
                 )
             finally:
+                if self.connected:
+                    delay = self._min
                 self.connected = False
 
             if self._stopped:

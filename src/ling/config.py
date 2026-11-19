@@ -105,6 +105,10 @@ class Settings:
     # 根加密密钥（用于加密供应商密钥）。缺省时使用数据目录下的本地文件，
     # 生产必须通过 Docker secret / 环境注入。
     root_key: str = field(default_factory=lambda: os.environ.get("LING_ROOT_KEY", ""))
+    brave_search_api_key: str = field(
+        default_factory=lambda: os.environ.get("LING_BRAVE_SEARCH_API_KEY", "").strip(),
+        repr=False,
+    )
 
     # 会话 cookie
     cookie_name: str = field(default_factory=lambda: os.environ.get("LING_COOKIE_NAME", "ling_sid"))

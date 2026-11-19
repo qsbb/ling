@@ -592,8 +592,11 @@ describe('方法名（logger）开关：默认不显示，打开才显示', () =
     const html = renderToStaticMarkup(
       h(LogsList, { level: 'all', showLogger: false, items: rows }),
     );
-    expect(html).not.toContain('ling.kernel.bridge');
-    expect(html).not.toContain('ling.connectors.onebot.ws_server');
+    const summaries = html.match(/<summary[^>]*>[\s\S]*?<\/summary>/g) ?? [];
+    expect(summaries).toHaveLength(2);
+    expect(summaries.join('')).not.toContain('ling.kernel.bridge');
+    expect(summaries.join('')).not.toContain('ling.connectors.onebot.ws_server');
+    expect(html).toContain('<dt>来源</dt><dd>ling.kernel.bridge</dd>');
     // DOM 里根本没有那一列：空占位格会把消息列挤窄
     expect(html).not.toContain('logs__logger');
     // 由修饰类把列宽换成三列（时间/级别/消息），见 logs.css

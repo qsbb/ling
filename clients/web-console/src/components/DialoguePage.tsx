@@ -36,6 +36,7 @@ import {
 } from '../voiceSettings';
 import type { VoiceWillingness } from '../types';
 import { PolicyForm, fieldKeyWithinSection, type PolicyField } from './PolicyForm';
+import { ToolStatus } from './ToolStatus';
 import { VoiceSettings } from './VoiceSettings';
 
 interface DialoguePageProps {
@@ -103,7 +104,7 @@ const FIELDS: PolicyField[] = [
   {
     key: 'tools_enabled',
     label: '允许对话调用工具',
-    hint: '开启后，已声明支持工具调用的对话模型可以查询当前时间和本轮可读的本地资料。',
+    hint: '需要支持原生工具的对话模型。配置 Brave Search API 密钥后，非密封私聊中可用「搜索：关键词」查询公开网页。',
     kind: 'bool',
   },
   {
@@ -273,10 +274,12 @@ export function DialoguePage({ onBack, backLabel }: DialoguePageProps) {
           }
         }
         if (!voice.loaded) {
-          return <p className="page__hint">正在读取语音设置…</p>;
+          return <><ToolStatus /><p className="page__hint">正在读取语音设置…</p></>;
         }
         if (voice.error) {
           return (
+            <>
+            <ToolStatus />
             <div className="banner banner--error" role="status">
               <div>
                 <strong>没能读取语音设置</strong>
@@ -288,18 +291,22 @@ export function DialoguePage({ onBack, backLabel }: DialoguePageProps) {
                 重试
               </button>
             </div>
+            </>
           );
         }
         return (
-          <VoiceSettings
-            willingness={voice.willingness}
-            onWillingness={(next) => setVoice((current) => ({ ...current, willingness: next }))}
-            draft={voice.draft}
-            onDraft={setDraft}
-            issues={merged}
-            saving={saving}
-            onUploadingChange={setUploading}
-          />
+          <>
+            <ToolStatus />
+            <VoiceSettings
+              willingness={voice.willingness}
+              onWillingness={(next) => setVoice((current) => ({ ...current, willingness: next }))}
+              draft={voice.draft}
+              onDraft={setDraft}
+              issues={merged}
+              saving={saving}
+              onUploadingChange={setUploading}
+            />
+          </>
         );
       }}
     />

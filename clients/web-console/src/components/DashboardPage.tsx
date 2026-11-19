@@ -287,11 +287,10 @@ export function Card({
  * 平铺在同一个网格里，人只能逐张读卡片标题才知道哪张是"此刻"、哪张是
  * "未来"；区块标题把顺序写死在版面上，而不是留给读者自己归纳。
  */
-export function DashboardZone({ id, title, hint }: { id: string; title: string; hint: string }) {
+export function DashboardZone({ id, title }: { id: string; title: string }) {
   return (
     <header className="dash-zone" data-zone={id}>
       <h2 className="dash-zone__title">{title}</h2>
-      <p className="dash-zone__hint">{hint}</p>
     </header>
   );
 }
@@ -818,11 +817,7 @@ export function IntentTeaserBody({ data }: { data: Record<string, unknown> }): R
 }
 
 /**
- * 12 列网格的正文（4 个区块 / 12 张卡）。
- *
- * 从 `DashboardPage` 里拆出来是为了能在 SSR 下断言区块顺序、每块独立降级和
- * 首屏密度——`DashboardPage` 自己第一次渲染永远停在"加载中"。它只拿一个
- * 已经解析好的 `DashboardResponse`，不负责取数、轮询或整页错误。
+ * 优先回答当下状态和接下来的安排。历史细项与诊断默认收起。
  */
 export function DashboardBody({
   data,
@@ -842,16 +837,29 @@ export function DashboardBody({
   const intent: DashboardSection = s.intent_teaser ?? MISSING_SECTION;
   const horizonUnplanned = (intent.data as Partial<IntentTeaserOut> | null | undefined)
     ?.horizon_unplanned;
+  const bound = s.connectivity?.data?.bound_model_roles;
+  const needsModel = s.connectivity?.status === 'ok' && Array.isArray(bound)
+    && !bound.includes('dialogue.fast') && !bound.includes('dialogue.deep');
   return (
-    <div className="dash__grid">
-      {/* ---------------------------------------------------------- A 现在 */}
-      <DashboardZone id="now" title="现在" hint="她此刻在做什么、能不能聊" />
+    <div className="dash-board">
+      {needsModel ? (
+        <div className="dash-jump" role="status">
+          <span>尚未绑定对话模型，聊天可能无法回复。</span>
+          <button type="button" className="dash__refresh" onClick={onOpenSettings}>去设置</button>
+        </div>
+      ) : null}
+      <div className="dash-board__main">
+      <section className="dash-board__stream" aria-label="她现在怎样">
+      <DashboardZone id="now" title="她现在怎样" />
+      <div className="dash-board__actions">
+        <button type="button" className="button" onClick={onOpenChat}>去聊天</button>
+        <button type="button" className="dash__refresh" onClick={onOpenNow}>查看生活</button>
+      </div>
       <Card
         title="此刻"
         span={6}
         section={s.activity}
         onRetry={onRetry}
-        action={{ label: '查看生活', onClick: onOpenNow }}
       >
         {(d) => (
           <>
@@ -874,7 +882,6 @@ export function DashboardBody({
         span={3}
         section={s.presence}
         onRetry={onRetry}
-        action={{ label: '去聊天', onClick: onOpenChat }}
       >
         {(d) => {
           /*
@@ -956,7 +963,7 @@ export function DashboardBody({
         合起来说会把"她在看手机"这个具体事实换成更含糊的一句。
         `empty`（此刻没有媒体活动）就不渲染——没这件事，不用摆个空壳。
       */}
-      {s.media && s.media.status === 'ok' ? (
+      {s.media && s.media.status !== 'empty' ? (
         <Card title="正在忙什么" span={6} section={s.media} onRetry={onRetry}>
           {(d) => <MediaBody data={d} />}
         </Card>
@@ -989,13 +996,10 @@ export function DashboardBody({
           );
         }}
       </Card>
+      </section>
 
-      {/* ------------------------------------------------------ B 接下来 */}
-      <DashboardZone
-        id="next"
-        title="接下来"
-        hint="她可能做什么 / 已约定什么 —— 计划与承诺，不是已经发生的事"
-      />
+      <section className="dash-board__stream" aria-label="接下来">
+      <DashboardZone id="next" title="接下来" />
 
       <Card
         title="今天的节奏"
@@ -1003,7 +1007,6 @@ export function DashboardBody({
         section={outline}
         renderWhenEmpty
         onRetry={onRetry}
-        action={{ label: '查看生活', onClick: onOpenNow }}
       >
         {(d) => <TodayOutlineBody data={d} />}
       </Card>
@@ -1014,7 +1017,6 @@ export function DashboardBody({
         section={s.agenda}
         renderWhenEmpty
         onRetry={onRetry}
-        action={{ label: '查看生活', onClick: onOpenNow }}
       >
         {(d) => <AgendaBody data={d} />}
       </Card>
@@ -1027,18 +1029,14 @@ export function DashboardBody({
         onRetry={onRetry}
         // 「未安排」常驻可见：意向不等于日程，这条不能只在有内容时才说。
         badge={horizonUnplanned === false ? undefined : '未安排'}
-        action={{ label: '查看生活', onClick: onOpenNow }}
       >
         {(d) => <IntentTeaserBody data={d} />}
       </Card>
+      </section>
+      </div>
 
-      {/* ------------------------------------------- C 已留下的记录 */}
-      <DashboardZone
-        id="records"
-        title="已留下的记录"
-        hint="已经发生的经历、已经记住的事 —— 与「接下来」里的计划分开读"
-      />
-
+      <section className="dash-board__stream" aria-label="最近发生">
+      <DashboardZone id="records" title="最近发生" />
       <Card title="近期生活" span={6} section={s.timeline} onRetry={onRetry}>
         {(d) => {
           const items = (d.items as Array<Record<string, unknown>>) ?? [];
@@ -1057,7 +1055,11 @@ export function DashboardBody({
           );
         }}
       </Card>
+      </section>
 
+      <details className="dash-board__details">
+      <summary>记忆与关系</summary>
+      <div className="dash-board__main">
       <Card title="最近记住的事" span={6} section={s.memories} onRetry={onRetry}>
         {(d) => {
           const items = (d.items as Array<Record<string, unknown>>) ?? [];
@@ -1096,13 +1098,11 @@ export function DashboardBody({
           </>
         )}
       </Card>
+      </div>
+      </details>
 
-      <DashboardZone
-        id="connectivity"
-        title="连接状态"
-        hint="渠道与模型能不能用 —— 她说不出话时，问题通常在这里"
-      />
-
+      <details className="dash-board__details" open={s.connectivity?.status === 'unavailable' || undefined}>
+      <summary data-zone="connectivity">连接状态</summary>
       <Card
         title="渠道与模型"
         span={12}
@@ -1140,6 +1140,7 @@ export function DashboardBody({
           );
         }}
       </Card>
+      </details>
     </div>
   );
 }
@@ -1223,8 +1224,7 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
         <div className="dash__heading">
           <h1 className="dash__title">总览</h1>
           <p className="dash__subtitle">
-            {displayDate ? `今天是 ${displayDate} · ` : ''}
-            先看她此刻怎样，再看接下来要做什么
+            {displayDate}
           </p>
         </div>
         <div className="dash__meta">
@@ -1255,11 +1255,6 @@ export function DashboardPage({ onOpenNow, onOpenChat, onOpenSettings }: Dashboa
         onRetry={reload}
       />
 
-      <p className="dash__foot">
-        <button type="button" className="dash__refresh" onClick={onOpenChat}>
-          直接去聊天
-        </button>
-      </p>
     </div>
   );
 }

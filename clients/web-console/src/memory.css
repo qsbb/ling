@@ -12,85 +12,9 @@
  * 3. 危险操作不能只靠颜色区分——危险块同时有图标、文字标题、「不可撤销」文案与虚线边框。
  */
 
-/*
- * 中文段落的末行孤字（只剩 2–3 字）在 375 / 320 特别刺眼。
- * `text-wrap: pretty` 让浏览器在换行时照顾末行（Chrome 117+）；不支持的老浏览器
- * 会忽略这条声明，退回默认换行，不影响布局。只作用于段落/列表项：按钮 / tab /
- * 标题本来就较短或 nowrap，不受影响。
- */
 .page.mem p,
 .page.mem li {
   text-wrap: pretty;
-}
-
-/*
- * 实测（Chromium headless 1223）：`pretty` 只保证不出现「单字」末行，中文里
- * 2–3 字的末行仍会出现——页脚「数据。」、320 诚实边界「200 条。」、调参
- * 「生效。」、320 记忆正文「很大」。这几处都是短段落/短条目，改用 `balance`
- * 把各行拉平才真正消掉；浏览器不支持或段落超过 balance 的行数上限时会退回
- * 默认换行（不会比默认更差；未列入本规则的段落仍由上面的 pretty 照顾）。
- */
-.page.mem .mem__boundary,
-.page.mem .mem-filters__note,
-.page.mem .mem-foot,
-.page.mem .mem-policy-status p,
-.page.mem .mem-policy-status li,
-.page.mem .mem-item__text {
-  text-wrap: balance;
-}
-
-
-.mem__head {
-  max-width: 980px;
-}
-
-.mem__boundary {
-  margin: 6px 0 0;
-  font-size: 12px;
-  line-height: 1.7;
-  color: var(--ink-faint);
-  padding: 8px 10px;
-  border-left: 2px solid var(--line-strong);
-  background: rgba(0, 0, 0, 0.015);
-  border-radius: 0 8px 8px 0;
-  max-width: 760px;
-}
-
-/* ------------------------------------------------------------------ tab */
-
-.mem-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 3px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--paper-raised);
-  align-self: flex-start;
-  max-width: 100%;
-}
-
-.mem-tab {
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: 13.5px;
-  padding: 7px 14px;
-  border-radius: 9px;
-  min-height: 36px;
-  white-space: nowrap;
-}
-
-.mem-tab:hover {
-  background: rgba(0, 0, 0, 0.04);
-  color: var(--ink);
-}
-
-.mem-tab--active {
-  background: var(--paper);
-  border-color: var(--line-strong);
-  color: var(--ink);
-  font-weight: 600;
 }
 
 /* ------------------------------------------------------------- 内容区骨架 */
@@ -128,17 +52,6 @@
 
 .mem-section .panel__note {
   margin: 0;
-}
-
-.mem-foot {
-  margin: 0;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  color: var(--ink-faint);
-  font-size: 12px;
-  line-height: 1.7;
 }
 
 /* --------------------------------------------------------------- 核心记忆 */
@@ -289,54 +202,6 @@
   background: #f1d9d3;
 }
 
-/* --------------------------------------------------------------- 筛选区 */
-
-.mem-filters {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--paper);
-  min-width: 0;
-}
-
-.mem-filters__group {
-  border: 0;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-  min-width: 0;
-}
-
-.mem-filters__group legend {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--ink-soft);
-  padding: 0;
-  margin-bottom: 4px;
-  width: 100%;
-}
-
-.mem-filters__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px 16px;
-}
-
-.mem-filters__note {
-  margin: 0;
-  width: 100%;
-  color: var(--ink-faint);
-  font-size: 11.5px;
-  line-height: 1.6;
-}
-
 .mem-check {
   display: inline-flex;
   align-items: center;
@@ -361,124 +226,6 @@
   min-height: 36px;
 }
 
-/* --------------------------------------------------------------- 列表 */
-
-.mem-groups {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  min-width: 0;
-}
-
-.mem-group {
-  min-width: 0;
-}
-
-.mem-group__title {
-  margin: 0 0 6px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--ink-soft);
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.mem-group__count {
-  font-weight: 400;
-  color: var(--ink-faint);
-  font-size: 11.5px;
-}
-
-.mem-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.mem-item {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 12px;
-  background: var(--paper-raised);
-  min-width: 0;
-}
-
-/* 墓碑：虚线边框 + 降低不透明度，形状上就能和现行记忆分开（不只靠颜色）。 */
-.mem-item--tombstone {
-  border-style: dashed;
-  background: var(--paper);
-}
-
-.mem-item__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 0;
-}
-
-.mem-item__text {
-  margin: 0;
-  flex: 1;
-  min-width: 0;
-  font-size: 13.5px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
-}
-
-.mem-item__readonly {
-  flex: none;
-  font-size: 11.5px;
-  color: var(--ink-faint);
-  border: 1px dashed var(--line-strong);
-  border-radius: 6px;
-  padding: 2px 6px;
-  white-space: nowrap;
-}
-
-.mem-item__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  flex: none;
-}
-
-.mem-item__meta {
-  margin: 6px 0 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  color: var(--ink-faint);
-  font-size: 11.5px;
-  line-height: 1.6;
-}
-
-.mem-item__relative {
-  color: var(--ink-faint);
-}
-
-.mem-item__kind {
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  padding: 0 7px;
-  font-size: 11px;
-}
-
-.mem-item__badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.mem-item__badges:empty {
-  display: none;
-}
-
 .mem-badge {
   display: inline-flex;
   align-items: center;
@@ -499,64 +246,10 @@
   color: var(--warn);
 }
 
-.mem-badge--superseded {
-  border-color: #c7cbb6;
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.mem-badge--archived {
-  border-style: dashed;
-  color: var(--ink-soft);
-}
-
 .mem-badge--warn {
   border-color: #e0c48d;
   background: var(--warn-soft);
   color: var(--warn);
-}
-
-/* --------------------------------------------------------------- 详情 */
-
-.mem-item__detail {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--ink-soft);
-}
-
-.mem-item__detail summary {
-  cursor: pointer;
-  color: var(--ink-faint);
-  padding: 4px 0;
-  font-size: 11.5px;
-}
-
-.mem-item__detail summary:hover {
-  color: var(--ink);
-}
-
-.mem-detail {
-  margin: 4px 0 0;
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 3px 12px;
-  font-size: 11.5px;
-}
-
-.mem-detail > div {
-  display: contents;
-}
-
-.mem-detail dt {
-  color: var(--ink-faint);
-  white-space: nowrap;
-}
-
-.mem-detail dd {
-  margin: 0;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
 }
 
 /* --------------------------------------------------------------- 确认/错误 */
@@ -882,30 +575,6 @@
 /* --------------------------------------------------------------- 窄屏 */
 
 @media (max-width: 640px) {
-  .mem-tabs {
-    align-self: stretch;
-  }
-
-  .mem-tab {
-    flex: 1 1 0;
-    min-height: 44px;
-    padding-left: 8px;
-    padding-right: 8px;
-    white-space: normal;
-  }
-
-  /*
-   * 触控目标 ≥44×44（F7 硬约束）。
-   *
-   * 这里覆盖**页面上每一个**可交互元素，而不只是行内操作按钮：
-   * `summary`（详情）、`.ghost-button`（重新读取全部 / 关闭）、表单
-   * input/select/textarea（核心表单 + 筛选）、所有 button，以及
-   * `.mem-check` 这种把原生小复选框包起来的 label（可点击区域 = label）。
-   * 用 min-height / min-width / padding 撑开，不用 transform: scale 之类的
-   * 视觉缩放（那只会让点击区域与视觉尺寸对不上）。
-   *
-   * 桌面（>640px）不进入这个媒体查询，布局与字号保持原样。
-   */
   .mem button,
   .mem summary,
   .mem .mem-check,
@@ -914,14 +583,12 @@
     min-width: 44px;
   }
 
-  /* 文字型幽灵按钮（「重新读取全部」「关闭」）：只加 min-* 仍可能只有 40 宽。 */
   .mem .ghost-button {
     min-height: 44px;
     min-width: 44px;
     padding: 10px 12px;
   }
 
-  /* 表单控件（含行内筛选的 select）：44 高，靠 padding 撑，不缩字号。 */
   .mem-field input:not([type='checkbox']):not([type='radio']),
   .mem-field select,
   .mem-field textarea,
@@ -942,62 +609,8 @@
     height: 20px;
   }
 
-  /*
-   * <summary> 只有 4px 内边距时高度约 26px。改成 flex 居中 + 44 最小高度，
-   * 并补一个 ▸/▾ 指示符（flex 会吃掉浏览器默认的 disclosure marker，
-   * 没有指示符就看不出「详情」可展开）。
-   */
-  .mem-item__detail summary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 44px;
-    min-width: 44px;
-    padding: 10px 0;
-    line-height: 1.5;
-  }
-
-  .mem-item__detail summary::before {
-    content: '▸';
-    flex: none;
-    font-size: 10px;
-    color: var(--ink-faint);
-  }
-
-  .mem-item__detail[open] > summary::before {
-    content: '▾';
-  }
-
   .mem-core-form__grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .mem-filters__row {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 8px;
-  }
-
-  .mem-field--inline {
-    justify-content: space-between;
-    white-space: normal;
-  }
-
-  .mem-field--inline select {
-    min-width: 120px;
-  }
-
-  .mem-item__head {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .mem-item__actions {
-    flex-wrap: wrap;
-  }
-
-  .mem-item__actions .button {
-    flex: 1 1 45%;
   }
 
   .mem-confirm__actions .button,
@@ -1005,65 +618,276 @@
     flex: 1 1 45%;
   }
 
-  .mem-detail {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0;
-  }
-
-  .mem-detail dd {
-    margin: 0 0 4px;
-  }
-
   .mem-danger__start {
     align-self: stretch;
   }
 }
 
-/*
- * 320px 档：两个 tab 并排时「记忆与学习（调参）」会被挤成孤字换行
- * （第二行只剩「参）」），违反「不出现 2–3 字换行」的视觉硬规则。
- * 这里改成整行堆叠：每个 tab 独占一行，文字保持一行。
- */
-@media (max-width: 360px) {
-  .mem-tab {
-    flex: 1 1 100%;
-  }
 
-  /*
-   * 320 档的可读宽度：2026-11 复核实测，98 字长正文在这里排成 7 行，末行只剩
-   * 「人。」（1 汉字）。根因不是字号，而是 `text-wrap: balance` 在 Chromium 有
-   * 行数上限（约 6 行），超过就**整段跳过**、退回默认换行，尾行长度不再受控。
-   *
-   * 用布局手段把正文重新塞回 balance 的处理范围：收窄记忆页卡片的横向内边距
-   * （面板 18→14、条目 12→10），再把正文从 13.5px 微调到 13px（见下一条规则），
-   * 正文可读宽度从约 228px 提到约 240px、每行约 18 个汉字。98 字因此从 7 行
-   * 降到 6 行，balance 重新生效，各行被拉平。
-   *
-   * 不截断、不加省略号、不隐藏文字：正文仍然完整可读。375 及更宽不进入这个
-   * 媒体查询（那边本来就在 balance 的行数上限内），布局与字号保持原样。
-   *
-   * 极限（见 TASK123 报告）：这只能覆盖「≤ 6 行」的段落——320 下约 ≤108 字，
-   * 375 下约 ≤120 字。更长的正文仍会被 balance 跳过；在禁止截断/省略的前提下，
-   * 纯 CSS 布局无法保证任意长度的末行都 ≥4 字。
-   */
-  .page.mem .panel {
-    padding-left: 14px;
-    padding-right: 14px;
-  }
+/* Memory workspace: local discovery, one complete record, and separate account controls. */
+.page.mem {
+  gap: 16px;
+  padding-top: clamp(16px, 3vw, 32px);
+}
 
-  .page.mem .mem-item {
-    padding-left: 10px;
-    padding-right: 10px;
-  }
+.page.mem [hidden] { display: none !important; }
+.mem__head { max-width: 100%; }
+.mem__head .page__title { font-size: clamp(26px, 4vw, 35px); letter-spacing: .09em; margin: 0 0 4px; }
 
-  /*
-   * 正文再微调半个字号（13.5 → 13px）：配合上面的内边距，320 下每行约 18 个
-   * 汉字，98 字稳定排成 6 行；即使外壳把可用宽度再挤掉约 19px（240 → 221），
-   * 每行还有 17 字、98 字仍是 6 行，不会掉回 7 行。行高保持 1.7（22.1px），
-   * 比原字号只紧一点点，仍可读。
-   */
-  .page.mem .mem-item__text {
-    font-size: 13px;
-    line-height: 1.7;
-  }
+.mem .mem-tabs {
+  width: 100%;
+  align-self: stretch;
+  gap: clamp(2px, 1.6vw, 16px);
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: 0;
+}
+
+.mem .mem-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  min-height: 44px;
+  padding: 7px clamp(8px, 1.5vw, 15px);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 7px 7px 0 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.mem .mem-tab:hover { color: var(--ink); background: var(--paper-sunken); }
+
+.mem .mem-tab--active {
+  border-bottom-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.mem-workspace {
+  display: grid;
+  grid-template-columns: minmax(290px, .84fr) minmax(0, 1.16fr);
+  align-items: start;
+  gap: clamp(12px, 2vw, 22px);
+  min-width: 0;
+}
+
+.mem-index,
+.mem-inspector {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-card);
+}
+
+.mem-index { padding: 13px 0 0; }
+.mem-index__head,
+.mem-index__tools,
+.mem-kinds,
+.mem-index__count {
+  padding-inline: clamp(12px, 1.55vw, 18px);
+}
+
+.mem-index__head,
+.mem-core-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.mem-index__head { align-items: center; padding-bottom: 6px; }
+.mem-index__head h2,
+.mem-core-head h2,
+.mem-privacy__intro h2 {
+  margin: 0;
+  font: 500 20px/1.3 var(--font-serif);
+  letter-spacing: .035em;
+}
+
+.mem-index__refresh { display: inline-grid; place-items: center; min-height: 36px; min-width: 36px; }
+.mem-index__tools { display: flex; align-items: stretch; gap: 8px; padding-bottom: 10px; }
+.mem-index__filter { flex: none; min-height: 44px; }
+.mem-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 11px;
+  background: var(--paper);
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  color: var(--ink-soft);
+}
+
+.mem-search:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mem-search svg { flex: none; }
+.mem-search input {
+  font: inherit;
+  font-size: 14px;
+  min-width: 0;
+  width: 100%;
+  min-height: 42px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--ink);
+}
+
+.mem-kinds { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding-bottom: 12px; }
+.mem-kinds button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12px;
+  padding: 5px 11px;
+  min-height: 31px;
+}
+.mem-kinds button:hover { border-color: var(--accent); }
+.mem-kinds button[aria-pressed="true"] { color: var(--ink); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+
+.mem-facet-panel {
+  margin: 0 12px 10px;
+  padding: 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.mem-facet-panel__fields { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.mem-facet-panel .mem-field select { width: 100%; }
+.mem-history-switches { min-width: 0; border: 0; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.mem-history-switches legend { padding: 0; color: var(--ink-soft); font-size: 12px; margin-bottom: 4px; }
+.mem-history-switches label { display: flex; align-items: center; gap: 5px; }
+.mem-history-switches input { margin: 0; }
+
+.mem-index__count {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding-top: 9px;
+  padding-bottom: 9px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.mem-index__boundary { margin: 0; padding: 8px 14px; font-size: 12px; line-height: 1.55; color: var(--ink-soft); background: var(--paper); }
+.mem-index > .mem-loading,
+.mem-index > .mem-error { margin: 8px 12px 14px; }
+.mem-index__empty { border-top: 1px solid var(--line); margin: 0; padding: 24px 18px; color: var(--ink-soft); }
+.mem-index__empty p { margin: 5px 0 4px; font-size: 13px; }
+.mem-text-button {
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  font: inherit;
+  background: transparent;
+  border: 0;
+  padding: 4px 1px;
+}
+
+.mem-index__rows { margin: 0; list-style: none; padding: 0; }
+.mem-index__rows > li { border-top: 1px solid var(--line); min-width: 0; }
+.mem-index__rows > li:last-child > button { border-radius: 0 0 14px 14px; }
+.mem-record {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+  text-align: left;
+  padding: 11px clamp(12px, 1.5vw, 17px);
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+}
+.mem-record:hover { background: var(--paper); }
+.mem-record[aria-current="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.mem-record__top,
+.mem-record__meta { font-size: 11.5px; color: var(--ink-soft); display: flex; flex-wrap: wrap; gap: 3px 9px; align-items: center; }
+.mem-record__top { justify-content: space-between; }
+.mem-record__top time { font-variant-numeric: tabular-nums; }
+.mem-record__preview {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.mem-record__status { border: 1px dashed var(--line-strong); padding: 0 6px; border-radius: 5px; }
+
+.mem-workspace__detail { min-width: 0; position: sticky; top: 2px; }
+.mem-inspector {
+  padding: clamp(14px, 2.2vw, 22px);
+  max-height: max(480px, calc(100dvh - 215px));
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.mem-inspector__head { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 7px; }
+.mem-inspector__head h3 { margin: 0; font: 500 16px/1.4 var(--font-serif); color: var(--ink-soft); }
+.mem-inspector__story { padding: 15px 0 16px; }
+.mem-inspector__tags, .mem-inspector__actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.mem-inspector__text {
+  margin: 12px 0 16px;
+  white-space: pre-wrap;
+  font: 500 clamp(16px, 1.7vw, 20px)/1.72 var(--font-serif);
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+.mem-inspector__section, .mem-inspector__technical { border-top: 1px solid var(--line); padding: 13px 0 8px; }
+.mem-inspector__section h4 { margin: 0 0 9px; font-size: 13px; color: var(--ink); }
+.mem-inspector__section p { line-height: 1.6; font-size: 13px; color: var(--ink-soft); }
+.mem-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; margin: 8px 0 6px; overflow-wrap: anywhere; }
+.mem-facts__wide { grid-column: 1/-1; }
+.mem-facts dt { font-size: 12px; margin-bottom: 2px; color: var(--ink-soft); }
+.mem-facts dd { margin: 0; font-size: 13.5px; color: var(--ink); line-height: 1.55; }
+.mem-facts time { white-space: nowrap; }
+.mem-facts small { display: inline-block; margin-inline-start: 3px; color: var(--ink-soft); font-size: 11px; }
+.mem-inspector__technical summary, .mem-core-rules summary { cursor: pointer; color: var(--ink-soft); font-size: 13px; }
+.mem-inspector__technical summary { min-height: 34px; align-content: center; }
+.mem-inspector--empty { min-height: 240px; display: grid; align-content: center; text-align: center; gap: 6px; color: var(--ink-soft); }
+.mem-inspector--empty p { margin: 0; font-size: 13px; }
+.mem-inspector__placeholder { font-size: 28px; color: var(--accent); }
+.mem .mem-inspector__back { display: none; }
+.mem-change-list { color: var(--ink-soft); padding-left: 19px; margin: 0; font-size: 13px; }
+.mem-change-list code { margin-left: 8px; font-size: 11px; }
+.mem-muted { font-size: 12px; color: var(--ink-soft); }
+.mem-core-head p { font-size: 13px; line-height: 1.6; color: var(--ink-soft); margin: 4px 0 0; }
+.mem-core-head__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.mem-core-rules { background: var(--paper); padding: 7px 12px; border-radius: 8px; }
+.mem-core-rules p { font-size: 13px; line-height: 1.65; margin: 8px 0 3px; color: var(--ink-soft); }
+.mem-privacy:not([hidden]) { display: grid; gap: 16px; }
+.mem-privacy__intro .mem-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mem-privacy__intro .mem-facts dt { font-weight: 650; color: var(--ink); }
+
+@media (min-width: 761px) {
+  .mem-index__rows { max-height: max(300px, calc(100dvh - 367px)); overflow: auto; }
+}
+@media (max-width: 760px) {
+  .mem-workspace { grid-template-columns: minmax(0, 1fr); }
+  .mem-workspace__detail { display: none; position: static; }
+  .mem-workspace--reading .mem-index { display: none; }
+  .mem-workspace--reading .mem-workspace__detail { display: block; }
+  .mem .mem-inspector__back { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; margin: 0 0 5px; }
+  .mem-inspector { max-height: none; overflow: visible; }
+  .mem-index__refresh, .mem-kinds button, .mem-inspector__technical summary, .mem-core-rules summary,
+  .mem-history-switches label, .mem-text-button { min-height: 44px; }
+  .mem .mem-tab { flex: 1 0 auto; }
+  .mem-record[aria-current="true"] { background: transparent; box-shadow: none; }
+  .mem-privacy__intro .mem-facts { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 370px) {
+  .mem .mem-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mem-index__count { gap: 2px 6px; }
+  .mem-kinds button { padding-inline: 8px; }
 }

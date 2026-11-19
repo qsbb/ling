@@ -281,9 +281,11 @@ describe('两块各自的 status（一块坏不影响整页）', () => {
 });
 
 describe('查看生活入口', () => {
-  it('「今天的节奏」卡片上有「查看生活」按钮（不是只写着"详细"）', () => {
-    const html = card(renderCards(section('ok', TODAY), section('ok', INTENT)), '今天的节奏');
-    expect(html).toContain('查看生活');
+  it('首屏操作区提供唯一的「查看生活」按钮', () => {
+    const html = renderCards(section('ok', TODAY), section('ok', INTENT));
+    const actions = html.match(/<div class="dash-board__actions">(.*?)<\/div>/)?.[1];
+    expect(actions).toMatch(/<button[^>]*>查看生活<\/button>/);
+    expect(html.match(/>查看生活<\/button>/g)).toHaveLength(1);
   });
 
   it('状态文案六值各有中文', () => {

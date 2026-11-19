@@ -99,7 +99,7 @@ WatchVideo = Callable[[str, list[str]], Awaitable[dict[str, object]]]
 
 
 class ToolRegistry:
-    """白名单工具注册表。只允许内置能力；不支持任意插件热加载。"""
+    """白名单工具注册表。工具由主程序显式装配，不热加载任意代码。"""
 
     def __init__(self, *, allow_irreversible: bool = False) -> None:
         self._specs: dict[str, ToolSpec] = {}

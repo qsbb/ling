@@ -667,7 +667,7 @@ export const api = {
    * 置顶 / 取消置顶。后端**幂等**：重复置顶只刷新 `pinned_at`（于是"刚置顶
    * 的那个"排到置顶组第一位），重复取消写回 NULL 也不报错。
    *
-   * 返回整条 `SessionRecord`——前端直接替换列表里那一行，不必再拉一次列表。
+   * 返回更新后的记录。列表顺序由 GET /sessions 提供。
    */
   pinSession(sessionId: string, pinned: boolean): Promise<SessionRecord> {
     return request<SessionRecord>(`/v1/sessions/${encodeURIComponent(sessionId)}/pin`, {
@@ -678,6 +678,12 @@ export const api = {
     return request<SessionRecord>(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
       ...jsonInit('PATCH', { title }),
     });
+  },
+  moveSession(sessionId: string, anchorId: string, before: boolean): Promise<void> {
+    return request<void>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/move`,
+      jsonInit('POST', { anchor_id: anchorId, before }),
+    );
   },
   messages(sessionId: string, limit = 200): Promise<MessagesResponse> {
     const query = new URLSearchParams({ limit: String(limit) });
@@ -1163,6 +1169,12 @@ export const api = {
   },
   mergeSubjects(body: { source_id: string; target_id: string }): Promise<MergeResult> {
     return request<MergeResult>('/v1/accounts/subjects/merge', jsonInit('POST', body));
+  },
+  renameSubject(subjectId: string, displayName: string): Promise<{ subject_id: string; display_name: string }> {
+    return request<{ subject_id: string; display_name: string }>(
+      `/v1/accounts/subjects/${encodeURIComponent(subjectId)}`,
+      jsonInit('PATCH', { display_name: displayName }),
+    );
   },
   unmergeSubject(sourceId: string): Promise<UnmergeResult> {
     return request<UnmergeResult>(

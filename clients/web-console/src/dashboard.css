@@ -423,3 +423,28 @@
   font-size: 11.5px;
   line-height: 1.5;
 }
+.dash .dash-board { display: grid; gap: 18px; }
+.dash .dash-board__main { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 4fr); gap: clamp(20px, 4vw, 56px); align-items: start; }
+.dash .dash-board__stream { min-width: 0; }
+.dash .dash-board .dash-zone { display: block; margin: 0; padding: 0 0 10px; border: 0; }
+.dash .dash-board .dash-zone__title { font-size: 17px; letter-spacing: 0; }
+.dash .dash-board__actions { display: flex; gap: 12px; align-items: center; margin-bottom: 6px; }
+.dash .dash-board__actions button { min-height: 44px; }
+.dash .dash-board .dash-card {
+  grid-column: auto;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  min-height: 0;
+  padding: 12px 0;
+  overflow-wrap: anywhere;
+}
+.dash .dash-board [data-testid='dash-此刻'] .dash-now__line strong { font-size: 22px; }
+.dash .dash-board__details { min-width: 0; border-top: 1px solid var(--line); }
+.dash .dash-board__details > summary { cursor: pointer; padding: 12px 0; color: var(--ink-soft); }
+.dash .dash-board .dash-jump { justify-content: space-between; }
+.dash .dash-board .dash-jump button { flex-shrink: 0; }
+@media (max-width: 900px) {
+  .dash .dash-board__main { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+}

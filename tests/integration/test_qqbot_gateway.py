@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 
@@ -128,8 +129,14 @@ class _FakeWS:
     def __init__(self, sent: list[dict], close_code: int | None) -> None:
         self._sent = sent
         self._close_code = close_code
+        self._hello_received = False
+
+    async def recv(self) -> str:
+        self._hello_received = True
+        return json.dumps({"op": 10, "d": {"heartbeat_interval": 12000}})
 
     async def send(self, raw: str) -> None:
+        assert self._hello_received, "鉴权必须等待本次连接的 Hello"
         self._sent.append(json.loads(raw))
 
     def __aiter__(self):  # noqa: ANN204
@@ -171,8 +178,6 @@ async def test_run_sends_identify_when_no_session(monkeypatch) -> None:  # noqa:
     monkeypatch.setattr(websockets, "connect", _connect)
     gw = QQBotGateway(connector=_Connector(), app=object(), reconnect_min=0.01)
 
-    import asyncio
-
     task = asyncio.create_task(gw.run())
     await asyncio.sleep(0.2)
     gw._stopped = True
@@ -186,8 +191,6 @@ async def test_run_sends_identify_when_no_session(monkeypatch) -> None:  # noqa:
 
 async def test_run_resumes_when_session_exists(monkeypatch) -> None:  # noqa: ANN001
     """有会话时先发 Resume（补发漏掉的事件），不是重新 Identify。"""
-    import asyncio
-
     import websockets
 
     sent: list[dict] = []
@@ -214,6 +217,62 @@ async def test_run_resumes_when_session_exists(monkeypatch) -> None:  # noqa: AN
 
     assert sent and sent[0]["op"] == 6, sent[:1]
     assert sent[0]["d"]["seq"] == 99
+
+
+@pytest.mark.parametrize(("control_op", "next_auth_op"), [(7, 6), (9, 2)])
+async def test_gateway_control_frame_reconnects_and_receives_message(
+    monkeypatch, control_op: int, next_auth_op: int,  # noqa: ANN001
+) -> None:
+    import websockets
+
+    from ling.kernel import inbound_intake
+
+    handshakes = []
+    inbound = asyncio.get_running_loop().create_future()
+
+    async def receive(_app, _connector, frame, *, trusted_instance_key):  # noqa: ANN001, ANN202
+        inbound.set_result((frame["d"]["id"], trusted_instance_key))
+        return {"accepted": True}
+
+    monkeypatch.setattr(inbound_intake, "process_inbound_payload", receive)
+
+    async def handle(ws):  # noqa: ANN001, ANN202
+        await ws.send(json.dumps({"op": 10, "d": {"heartbeat_interval": 12000}}))
+        auth = json.loads(await ws.recv())
+        handshakes.append(auth)
+        if len(handshakes) == 1:
+            await ws.send(json.dumps({"op": 0, "s": 41, "t": "READY", "d": {"session_id": "old"}}))
+            await ws.send(json.dumps({"op": control_op, "d": False}))
+            # 模拟平台发出通知后保持 socket 打开，只有主动重连才能收到下一条。
+            await ws.wait_closed()
+            return
+        ready = "RESUMED" if next_auth_op == 6 else "READY"
+        await ws.send(json.dumps({"op": 0, "s": 42, "t": ready, "d": {"session_id": "new"}}))
+        await ws.send(json.dumps({"op": 0, "s": 43, "t": "C2C_MESSAGE_CREATE", "d": {"id": "after-reconnect"}}))
+        await ws.wait_closed()
+
+    async with websockets.serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+
+        class Connector:
+            async def api_get(self, _path: str) -> dict[str, str]:
+                return {"url": f"ws://127.0.0.1:{port}"}
+
+            async def access_token(self) -> str:
+                return "test-token"
+
+        key = ("qqbot", "test-instance")
+        gw = QQBotGateway(connector=Connector(), app=object(), trusted_instance_key=key, reconnect_min=0.01)
+        gw.start()
+        try:
+            assert await asyncio.wait_for(inbound, 3) == ("after-reconnect", key)
+            assert [auth["op"] for auth in handshakes] == [2, next_auth_op]
+            if next_auth_op == 6:
+                assert handshakes[1]["d"]["session_id"] == "old"
+                assert handshakes[1]["d"]["seq"] == 41
+            assert gw.connected and gw.last_error is None and gw.state.last_seq == 43
+        finally:
+            await gw.stop()
 
 
 def test_api_base_is_the_documented_unified_host() -> None:

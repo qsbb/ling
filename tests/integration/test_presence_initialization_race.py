@@ -249,6 +249,11 @@ async def test_simultaneous_real_inbound_initializes_presence_once(
     await _pair(logged_in, scope)
     await _chat(logged_in, monkeypatch)
     await _bind(logged_in, scope)
+    # Both turns must reach prompt compilation concurrently to race on the first
+    # presence read. Do not also require either turn to finish within the other
+    # turn's floor wait budget; speaker arbitration has its own integration tests.
+    monkeypatch.setattr(logged_in.app.state, "speak_lease", None)
+    monkeypatch.setattr(logged_in.app.state, "arbiter", None)
     async with session_scope() as session:
         assert await session.get(PresenceState, "actor_ling") is None
     backend_pids = _synchronize_missing_reads(monkeypatch, "actor_ling")

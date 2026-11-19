@@ -230,6 +230,9 @@ PHASE_DUE = "due"  # D−1 21:00 之后的正常到期
 PHASE_CATCHUP = "catchup"  # 错过 21:00，但还没到 D 的醒点
 PHASE_LATE = "late"  # 已到/过了 D 的醒点：只补确定性锚点，不再调模型
 
+OUTLINE_RECOVERY_STEP_MINUTES = 180
+OUTLINE_RECOVERY_LEAD_MINUTES = 15
+
 # 一段经历/一条承诺进 prompt 的上限：prompt 有硬上限，宁可少给。
 MAX_EXPERIENCE_SUMMARIES = 5
 MAX_PLACES = 12
@@ -515,6 +518,8 @@ _OUTLINE_INSTRUCTIONS = """你是角色「{name}」的日计划器。
     不能写自由文本。
 13. `memory` 只是背景（已经证实发生过的经历、核心记忆、相处偏好、owner 明确
     授权的事实）：**不得**把它写成今天的新事情，也不要引用其中的原文。
+14. 用 `persona_summary` 的习惯、兴趣、价值观和边界选择可变活动；缺失项不猜。
+    人设只影响可选安排，不能改睡眠或已确认约定，也不能编造现实经历。
 
 输入快照（JSON）：
 {snapshot}
@@ -597,6 +602,30 @@ def outline_due_at(plan_day: date, timezone: str) -> datetime:
     zone = resolve_zone(timezone)
     due_day = plan_day - timedelta(days=1)
     return _local_minute_instant(due_day, OUTLINE_DUE_MINUTE, zone)
+
+
+def outline_recovery_boundary(
+    now: datetime, *, plan_day: date, timezone: str, wake_minute: int, rest_minute: int,
+) -> datetime | None:
+    """The next daytime boundary, only during its short pre-start window."""
+    wake, rest = wake_minute % 1440, rest_minute % 1440
+    # With no sleep window, treat the whole local day as available.
+    start, end = (0, 1440) if wake == rest else (wake, rest if rest > wake else 1440)
+    for minute in range(start + OUTLINE_RECOVERY_STEP_MINUTES, end, OUTLINE_RECOVERY_STEP_MINUTES):
+        boundary = local_minute_instant(plan_day, minute, timezone)
+        if boundary - timedelta(minutes=OUTLINE_RECOVERY_LEAD_MINUTES) <= now < boundary:
+            return boundary
+    return None
+
+
+def outline_needs_recovery(row: DayPlanRow | None) -> bool:
+    return (
+        row is None
+        or row.state == "pending"
+        or (row.state == "degraded" and row.last_error_code in (
+            RETRYABLE_REASON_CODES | {REASON_DEGRADED_LATE}
+        ))
+    )
 
 
 def plan_day_for(instant: datetime, timezone: str | None) -> date:
@@ -2952,6 +2981,7 @@ async def _commit_revision(
     timezone: str,
     timezone_source: str,
     timezone_revision: int,
+    not_before: datetime | None = None,
 ) -> tuple[int, int, list[tuple[ScheduleSegmentRow, SegmentDraft]]]:
     """CAS 提交一版：段先 supersede 未来段，再插新段，最后抬 ``revision``。
 
@@ -2964,7 +2994,7 @@ async def _commit_revision(
     """
     expected = int(row.revision)
     new_revision = expected + 1
-    floor = max(now, _aware(row.window_start_at))
+    floor = max(now, _aware(row.window_start_at), not_before or now)
 
     async with session.begin_nested():
         # 只动"还没开始"的当前段：已过去的、已经开始的段是历史，不改写。
@@ -3676,6 +3706,7 @@ async def ensure_day_plan(
     timezone_source: str | None = None,
     lease_owner: str | None = None,
     force: bool = False,
+    recovery_boundary: datetime | None = None,
 ) -> OutlineOutcome:
     """确保某个**计划日**有一版可用大纲（幂等）。
 
@@ -3762,8 +3793,9 @@ async def ensure_day_plan(
         routine=routine,
     )
 
-    # 可变起点：过去永不回填；catch-up 也从 now 开始。
-    not_before = max(now, window_start)
+    # 可变起点：不回填过去；时段补排只替换边界之后的可选安排。
+    anchor_floor = max(now, window_start)
+    not_before = max(anchor_floor, recovery_boundary or now)
     places = await _valid_places(session, actor_id)
     place_ids = {item["id"] for item in places}
     persona = (
@@ -3811,6 +3843,8 @@ async def ensure_day_plan(
 
     model_ready = await _outline_model_ready(router, config_reader)
     for _attempt in range(OUTLINE_MAX_CALLS):
+        if recovery_boundary is not None and utcnow() >= recovery_boundary:
+            break
         if not model_ready:
             # 没有可用模型：**一次都不调**（设计 §0：无可用模型 = 0 次），
             # 也不占预算行——否则"没绑职责"会白吃掉当日 quota。
@@ -3936,12 +3970,6 @@ async def ensure_day_plan(
 
     if state != "ready":
         # 兜底：只铺锚点（睡眠/已确认约定），没有可选活动就是"没什么安排"。
-        drafts = rule_outline(
-            anchors=anchors,
-            window_start=window_start,
-            window_end=window_end,
-            not_before=not_before,
-        )
         state = "degraded"
         source = "rule"
         if reason_code is None:
@@ -3960,9 +3988,17 @@ async def ensure_day_plan(
         anchors=anchors,
         window_start=window_start,
         window_end=window_end,
-        not_before=not_before,
+        not_before=anchor_floor,
     )
     merged = _merge_drafts(anchor_drafts, drafts)
+
+    if recovery_boundary is not None and utcnow() >= recovery_boundary:
+        # A model call can cross the boundary. Keep its budget record, not its plan.
+        return _outcome(
+            row, state="unchanged", segments=0, source=str(row.generation_source),
+            reason_code=row.last_error_code, timezone=timezone,
+            timezone_source=timezone_source, routine=routine, calls=calls,
+        )
 
     try:
         new_revision, inserted, created = await _commit_revision(
@@ -3977,6 +4013,7 @@ async def ensure_day_plan(
             timezone=timezone,
             timezone_source=timezone_source,
             timezone_revision=timezone_revision,
+            not_before=not_before,
         )
     except StaleRevisionError:
         return _outcome(
@@ -4074,6 +4111,8 @@ async def outline_work(
     timezone_source: str | None = None,
     lease_owner: str | None = None,
     force: bool = False,
+    manual: bool = False,
+    recovery_before: datetime | None = None,
 ) -> OutlineOutcome:
     """按**目标日 + 相位**跑一次大纲作业（调度唯一该调的入口）。
 
@@ -4089,7 +4128,7 @@ async def outline_work(
       原因码钉成 ``degraded_late``；醒后新约定走事件局部重排，不在这里补造早晨。
 
     相位只会**更保守**：调用方给 ``due``、但按 ``now`` 其实已经过了醒点，会
-    自动降成 ``late``（不烧一次注定过期的模型调用）。反过来不会"升级"。
+    自动降成 ``late``。显式手动作业和未错过边界的时段补排可生成剩余可变时间段。
 
     进 prompt 之前先做**确定性惰性过期**（:meth:`IntentService.expire_due`，
     零模型、纯时间比较）：目标日已过或提议超过 TTL 的意向不该再影响今天，
@@ -4104,6 +4143,31 @@ async def outline_work(
     else:
         timezone_source = timezone_source or "explicit"
     routine = await _routine_snapshot(session, actor_id)
+    if recovery_before is not None:
+        row = await load_day_plan(session, actor_id=actor_id, plan_day=plan_day)
+        boundary = outline_recovery_boundary(
+            moment, plan_day=plan_day, timezone=timezone,
+            wake_minute=routine.wake_minute, rest_minute=routine.rest_minute,
+        )
+        # A worker can commit the fallback and crash before acknowledging the outbox.
+        # A completed revision within this window already covered this recovery slot.
+        covered = (
+            row is not None and row.state == "degraded"
+            and _aware(row.updated_at) >= recovery_before - timedelta(minutes=OUTLINE_RECOVERY_LEAD_MINUTES)
+        )
+        if boundary != recovery_before or covered or not outline_needs_recovery(row):
+            return OutlineOutcome(
+                plan_id=row.id if row else "", plan_day=plan_day, state="unchanged",
+                revision=int(row.revision) if row else 0, segments=0,
+                source=str(row.generation_source) if row else "baseline", phase="recovery",
+            )
+        await IntentService(session, actor_id=actor_id).expire_due(now=moment)
+        recovered = await ensure_day_plan(
+            session, actor_id=actor_id, router=router, config_reader=config_reader,
+            plan_day=plan_day, now=moment, timezone=timezone, timezone_source=timezone_source,
+            lease_owner=lease_owner, force=True, recovery_boundary=boundary,
+        )
+        return replace(recovered, phase="recovery")
     await IntentService(session, actor_id=actor_id).expire_due(now=moment)
     _target, actual = outline_due_decision(
         moment,
@@ -4112,6 +4176,8 @@ async def outline_work(
         plan_day=plan_day,
     )
     effective = _effective_phase(requested=phase, actual=actual)
+    if manual and effective == PHASE_LATE and moment < plan_day_window(plan_day, timezone)[1]:
+        effective = PHASE_CATCHUP
 
     if effective == PHASE_LATE:
         # 零模型：把 router/config_reader 显式置空，结构上堵死模型调用。

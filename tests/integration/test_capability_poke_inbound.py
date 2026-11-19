@@ -42,6 +42,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import httpx
 from connectors.onebot.connector import OneBotV11Connector
@@ -49,6 +50,8 @@ from connectors.onebot.settings import OneBotConfig
 
 from ling.domains.identity.service import IdentityService
 from ling.infra.db import session_scope
+from ling.kernel import turn as turn_module
+from ling.kernel.context import CompiledContext
 from ling.kernel.turn import TurnCoordinator
 from tests.integration.conftest import TestEnv
 
@@ -97,63 +100,18 @@ class RecordingCoordinator:
     已绑定的引用（这正是 `docs/evidence/test-pollution-reload.md` 记的坑）。
     patch 属性本身可以工作，因为 `_execute` 里是模块内引用。
 
-    ## 为什么必须消费 queue 到结束（这里踩过一次）
-
-    `run_turn` 内部是：
-
-    ```python
-    task = asyncio.create_task(self._execute(...))    # turn.py:737
-    ...
-    return queue                                      # 立刻返回
-    ```
-
-    **`run_turn` 返回时 `_execute` 还没跑。** 所以第一版这样写是错的：
-
-    ```python
-    with patch.object(ContextCompiler, "compile", _spy):
-        return await self._inner.run_turn(**kwargs)   # ← 返回时 compile 还没被调用
-    # with 退出，spy 卸载
-    ```
-
-    `_execute` 要等事件循环下一轮才 `compile`，那时 **spy 已经不在了**，
-    `recorder.compiled` 必然是空的 `[]`。**这是必然，不是偶发**——两条测试
-    因此在干净工作区上稳定失败（而在被污染的中间状态上"通过"，因为那时
-    改动让断言走了别的分支）。
-
-    ## 正确做法：在 patch 内把这一轮跑完
-
-    从 `run_turn` 拿到的 `queue` 里消费到 `None`（流结束标记）。那时
-    `_execute` 一定已经跑完、`compile` 一定已经调用过，`compiled` 才有值。
+    `run_turn` 启动后台生成后就返回队列。观察范围必须覆盖整个 HTTP 请求，
+    让 bridge 独自消费回复事件和结束标记。
     """
 
     def __init__(self, inner) -> None:  # noqa: ANN001
         self._inner = inner
         self.calls: list[dict] = []
-        self.compiled: list[object] = []
+        self.compiled: list[CompiledContext] = []
 
     async def run_turn(self, **kwargs):  # noqa: ANN003, ANN201
         self.calls.append(dict(kwargs))
-        from unittest.mock import patch
-
-        from ling.kernel import turn as turn_module
-
-        real_compile = turn_module.ContextCompiler.compile
-
-        async def _spy(self_, *args, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
-            result = await real_compile(self_, *args, **kw)
-            self.compiled.append(result)
-            return result
-
-        with patch.object(turn_module.ContextCompiler, "compile", _spy):
-            queue = await self._inner.run_turn(**kwargs)
-            # **必须消费到 `None`**：`run_turn` 起完后台 task 就返回了，
-            # 不把这一轮跑完，spy 会在 `_execute` 调用 `compile` 之前卸载。
-            # 见类 docstring 里那段事故说明。
-            while True:
-                event = await queue.get()
-                if event is None:
-                    break
-            return queue
+        return await self._inner.run_turn(**kwargs)
 
     def __getattr__(self, name: str):  # noqa: ANN204
         # `request_stop` / `partial_text` 这些仍要走真实实现
@@ -224,6 +182,13 @@ async def _run_inbound(env: TestEnv, body: bytes) -> RecordingCoordinator:
             cancels=env.app.state.cancels,
         )
     recorder = RecordingCoordinator(inner)
+    real_compile = turn_module.ContextCompiler.compile
+
+    async def record_compile(compiler, *args, **kwargs) -> CompiledContext:  # noqa: ANN001, ANN002, ANN003
+        compiled = await real_compile(compiler, *args, **kwargs)
+        recorder.compiled.append(compiled)
+        return compiled
+
     # `starlette.datastructures.State` 在属性**不存在**时抛 `AttributeError`，
     # 而 `delattr` 也不被支持（它是 `__setattr__` 写进 `_state` 字典的）。
     # 所以用 `_state` 字典判断/还原，别用 `getattr(..., None)` + `delattr`。
@@ -232,8 +197,11 @@ async def _run_inbound(env: TestEnv, body: bytes) -> RecordingCoordinator:
     previous = state.get("bridge_coordinator")
     env.app.state.bridge_coordinator = recorder
     try:
-        response = await _post(env, body)
+        with patch.object(turn_module.ContextCompiler, "compile", record_compile):
+            response = await _post(env, body)
         assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["delivered"] is True, result
     finally:
         if had_previous:
             env.app.state.bridge_coordinator = previous

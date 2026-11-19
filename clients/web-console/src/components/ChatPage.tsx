@@ -47,9 +47,10 @@ export function ChatPage({
   onLogout,
 }: ChatPageProps) {
   const chat = useChat(sessionId, onTestMode);
-  const [editingTitle, setEditingTitle] = useState(false);
+  const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
+  const [savingTitle, setSavingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
-  const [policyOpen, setPolicyOpen] = useState(false);
+  const [policy, setPolicy] = useState<{ sessionId: string; open: boolean } | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
@@ -68,6 +69,9 @@ export function ChatPage({
   const promptEnabled = canOpenPromptSnapshot(user.role);
 
   const session = chat.sessions.find((item) => item.session_id === chat.currentId) ?? null;
+  const canEditPolicy = user.role === 'owner' && session !== null && !session.archived;
+  const policyMounted = canEditPolicy && policy?.sessionId === session.session_id;
+  const policyOpen = policyMounted && policy.open;
   // 标题给人看（群名/昵称），副标题留给机器键；读不到名字时按号码回退。
   const heading = session ? describeSession(session) : null;
   // 拆不出群/私聊的旧渠道窗口按私聊排（署名、靠左），不硬猜。
@@ -77,14 +81,17 @@ export function ChatPage({
       : heading.kind === 'channel'
         ? 'private'
         : heading.kind;
-  const renamable = session ? canRenameSession(session) : false;
+  const renamable = session ? canRenameSession(session, user.role) : false;
+  const editingTitle = renamable && editingTitleId !== null && editingTitleId === chat.currentId;
+  const titleRequired = heading?.kind === 'web';
   const busy = chat.live !== null || chat.activeTurn !== null;
   const stopping = chat.live?.state === 'stopping' || chat.activeTurn?.state === 'stopping';
   const elapsed = useElapsed(chat.live?.startedAt ?? null);
 
   useEffect(() => {
     stickToBottom.current = true;
-    setPolicyOpen(false);
+    setPolicy(null);
+    setEditingTitleId(null);
   }, [chat.currentId]);
 
   useEffect(() => {
@@ -108,13 +115,19 @@ export function ChatPage({
   const startTitleEdit = () => {
     if (!chat.currentId) return;
     setTitleDraft(heading?.title ?? '');
-    setEditingTitle(true);
+    setEditingTitleId(chat.currentId);
   };
 
   const commitTitle = async () => {
-    if (!chat.currentId) return;
-    await chat.renameSession(chat.currentId, titleDraft);
-    setEditingTitle(false);
+    if (!editingTitle || !editingTitleId || savingTitle || (titleRequired && !titleDraft.trim())) return;
+    setSavingTitle(true);
+    try {
+      if (await chat.renameSession(editingTitleId, titleDraft)) {
+        setEditingTitleId((current) => current === editingTitleId ? null : current);
+      }
+    } finally {
+      setSavingTitle(false);
+    }
   };
 
   const closePrompt = useCallback(() => {
@@ -165,6 +178,7 @@ export function ChatPage({
         }}
         onRename={chat.renameSession}
         onPin={chat.pinSession}
+        onMove={chat.moveSession}
         onNavigateSettings={onOpenSettings}
         onNavigatePersona={onOpenPersona}
         onLogout={onLogout}
@@ -185,18 +199,24 @@ export function ChatPage({
                 value={titleDraft}
                 maxLength={60}
                 aria-label="会话名称"
+                placeholder={titleRequired ? undefined : '使用渠道名称'}
+                disabled={savingTitle}
                 onChange={(event) => setTitleDraft(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === 'Escape') setEditingTitle(false);
+                  if (event.key === 'Escape') setEditingTitleId(null);
                 }}
               />
-              <button type="submit" className="button button--small button--primary">
+              <button
+                type="submit"
+                className="button button--small button--primary"
+                disabled={savingTitle || (titleRequired && !titleDraft.trim())}
+              >
                 保存
               </button>
               <button
                 type="button"
                 className="button button--small"
-                onClick={() => setEditingTitle(false)}
+                onClick={() => setEditingTitleId(null)}
               >
                 取消
               </button>
@@ -237,9 +257,17 @@ export function ChatPage({
                 生成中
               </span>
             ) : null}
-            {user.role === 'owner' && session && !session.archived ? (
-              <button type="button" className="ghost-button" onClick={() => setPolicyOpen((open) => !open)}
-                aria-expanded={policyOpen}>
+            {canEditPolicy ? (
+              <button
+                type="button"
+                className="ghost-button"
+                aria-expanded={policyOpen}
+                aria-controls="active-window-policy"
+                onClick={() => setPolicy((current) => ({
+                  sessionId: session.session_id,
+                  open: current?.sessionId !== session.session_id || !current.open,
+                }))}
+              >
                 会话设置
               </button>
             ) : null}
@@ -251,9 +279,16 @@ export function ChatPage({
           </div>
         </header>
 
-        {policyOpen && session ? (
-          <WindowPolicy key={session.session_id} sessionId={session.session_id} onClose={() => setPolicyOpen(false)} />
-        ) : null}
+        <div id="active-window-policy" hidden={!policyOpen}>
+          {policyMounted ? (
+            <WindowPolicy key={session.session_id} sessionId={session.session_id}
+              accessTarget={(heading?.kind === 'group' || heading?.kind === 'private') && session.peer_id
+                ? { kind: heading.kind, id: session.peer_id }
+                : undefined} onClose={() => {
+              setPolicy({ sessionId: session.session_id, open: false });
+            }} />
+          ) : null}
+        </div>
 
         {chat.loadError ? (
           <div className="load-error" role="alert">

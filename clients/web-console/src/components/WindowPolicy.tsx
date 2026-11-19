@@ -16,7 +16,7 @@ import {
   type WindowPolicyChange,
   type WindowPolicyPreview,
 } from '../api';
-import type { PersonaSummary } from '../types';
+import type { ConnectorAccessGroup, PersonaSummary } from '../types';
 
 type PolicyFieldState = WindowDialoguePolicyFields[WindowDialoguePolicyField];
 
@@ -363,7 +363,72 @@ function WindowOriginBinding({
   );
 }
 
-export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+type AccessTarget = { kind: 'group' | 'private'; id: string };
+
+function WindowAllowlist({ target }: { target: AccessTarget }) {
+  const [access, setAccess] = useState<ConnectorAccessGroup | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const fieldKey = target.kind === 'group' ? 'LING_ACCESS_GROUPS' : 'LING_ACCESS_LIST';
+  const value = access?.fields.find((field) => field.key === fieldKey)?.value;
+  const items = Array.isArray(value) ? value : typeof value === 'string' && value !== '' ? value.split(',') : [];
+  const mode = access?.fields.find((field) => field.key === 'LING_ACCESS_MODE')?.value;
+  const listed = items.includes(target.id);
+  const enabled = access?.editable && mode === 'whitelist' && value !== undefined;
+
+  useEffect(() => {
+    let active = true;
+    void api.connectors().then((result) => {
+      if (active) setAccess(result.access ?? null);
+    }).catch((reason: unknown) => {
+      if (active) setError(errorText(reason));
+    }).finally(() => { if (active) setBusy(false); });
+    return () => { active = false; };
+  }, []);
+
+  async function update(checked: boolean) {
+    if (!access || !enabled || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = checked ? [...items, target.id] : items.filter((item) => item !== target.id);
+      const result = await api.saveConnectorConfig('access', { set: { [fieldKey]: next }, clear: [] }, access.generation);
+      if (result.state !== 'active' && result.state !== 'unchanged') {
+        setError(result.error_safe || '白名单更改未生效');
+      }
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+    try {
+      setAccess((await api.connectors()).access ?? null);
+    } catch (reason) {
+      setAccess(null);
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="window-policy__access">
+      <label>
+        <input type="checkbox" checked={listed} disabled={busy || !enabled}
+          onChange={(event) => void update(event.target.checked)} />
+        {target.kind === 'group' ? '本群在白名单中' : '该账号在白名单中'}
+      </label>
+      {access && mode !== 'whitelist' ? <small>当前未启用白名单模式。</small> : null}
+      {mode === 'whitelist' && value === undefined ? <small>服务端不支持快捷修改。</small> : null}
+      {!busy && !access && !error ? <small>当前无法读取出入许可。</small> : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
+export function WindowPolicy({ sessionId, onClose, accessTarget }: {
+  sessionId: string;
+  onClose: () => void;
+  accessTarget?: AccessTarget;
+}) {
   const [policy, setPolicy] = useState<WindowDialoguePolicy | null>(null);
   const [selections, setSelections] = useState(EMPTY_SELECTIONS);
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
@@ -446,6 +511,7 @@ export function WindowPolicy({ sessionId, onClose }: { sessionId: string; onClos
         </strong>
         <button type="button" className="ghost-button" onClick={onClose}>关闭</button>
       </div>
+      {accessTarget ? <WindowAllowlist key={`${accessTarget.kind}:${accessTarget.id}`} target={accessTarget} /> : null}
       {policy ? (
         <>
           <div aria-label="对话规则">

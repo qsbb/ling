@@ -1,0 +1,35 @@
+{
+  "$id": "https://ling.local/contracts/v1/WindowOriginBindingCandidate.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "display_name": {
+      "title": "Display Name",
+      "type": "string"
+    },
+    "enabled": {
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "instance_id": {
+      "title": "Instance Id",
+      "type": "string"
+    },
+    "scope": {
+      "enum": [
+        "onebot",
+        "qqbot"
+      ],
+      "title": "Scope",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scope",
+    "instance_id",
+    "display_name",
+    "enabled"
+  ],
+  "title": "WindowOriginBindingCandidate",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

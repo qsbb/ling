@@ -774,25 +774,31 @@ export interface LogsListProps {
  * 每一拍把整屏日志重念一遍，实际效果是这一页对读屏用户完全不可用。
  */
 export function LogsList({ items, level, showLogger, showMillis = true, kind }: LogsListProps) {
+  const occurrences = new Map<string, number>();
   return (
     <ol
       // 没有 logger 列时由修饰类换一套列宽（见 logs.css），时间/级别仍定宽对齐
       className={`logs__list${showLogger ? '' : ' logs__list--no-logger'}`}
       data-testid="logs-list"
     >
-      {items.map((entry, index) => {
+      {items.map((entry) => {
         const parts = logLineParts(entry, showMillis);
         const tone = levelTone(entry.level);
-        // 行 key 用「时间戳+logger+序号」：同一毫秒可能有多条完全相同的行
-        // （例如同样的告警刷两次），只靠内容做 key 会让 React 复用错行。
+        const identity = JSON.stringify([entry.timestamp, entry.logger, entry.event_name, entry.message, entry.trace_id, entry.attributes]);
+        const occurrence = (occurrences.get(identity) ?? 0) + 1;
+        occurrences.set(identity, occurrence);
+        const attrs = entry.attributes;
+        const inbound = entry.event_name === 'inbound_received' ? attrs?.attributes as Record<string, unknown> | undefined : undefined;
         return (
           <li
             className={`logs__row logs__row--${tone}`}
             data-testid="logs-row"
             data-level={entry.level}
-            key={`${entry.timestamp}|${entry.logger}|${index}`}
+            key={`${identity}:${occurrence}`}
             title={entry.trace_id ? `trace_id ${entry.trace_id}` : undefined}
           >
+            <details className="logs__entry">
+              <summary className="logs__summary">
             <time className="logs__time" dateTime={entry.timestamp} title={formatLogTimestampFull(entry.timestamp)}>
               {parts.time}
             </time>
@@ -801,6 +807,21 @@ export function LogsList({ items, level, showLogger, showMillis = true, kind }: 
             <span className="logs__message" title={parts.message !== entry.message ? entry.message : undefined}>
               {parts.message}
             </span>
+              </summary>
+              <div className="logs__details">
+                <dl>
+                  <dt>时间</dt><dd>{formatLogTimestampFull(entry.timestamp)}</dd>
+                  <dt>来源</dt><dd>{entry.logger}</dd>
+                  {entry.event_name ? <><dt>事件</dt><dd>{entry.event_name}</dd></> : null}
+                  {typeof inbound?.reason === 'string' && inbound.reason ? <><dt>原因</dt><dd>{inbound.reason}</dd></> : null}
+                  {entry.trace_id ? <><dt>追踪</dt><dd>{entry.trace_id}</dd></> : null}
+                  {entry.turn_id ? <><dt>轮次</dt><dd>{entry.turn_id}</dd></> : null}
+                  {entry.session_id ? <><dt>会话</dt><dd>{entry.session_id}</dd></> : null}
+                </dl>
+                {parts.message !== entry.message ? <p>{entry.message}</p> : null}
+                {attrs && Object.keys(attrs).length ? <pre>{JSON.stringify(attrs, null, 2)}</pre> : null}
+              </div>
+            </details>
           </li>
         );
       })}

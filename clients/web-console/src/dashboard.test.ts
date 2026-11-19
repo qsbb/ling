@@ -1025,12 +1025,12 @@ describe('§5 总览布局：区块顺序与栅格跨度', () => {
     );
   }
 
-  it('区块顺序：现在 → 接下来 → 已留下的记录 → 连接状态', () => {
+  it('区块顺序：当下 → 接下来 → 最近发生 → 连接状态', () => {
     const markup = renderBody(readyPayload());
     const zones = [...markup.matchAll(/data-zone="([^"]+)"/g)].map((m) => m[1]);
     expect(zones).toEqual(['now', 'next', 'records', 'connectivity']);
     // 区块标题就是人读到的那四个词
-    for (const title of ['现在', '接下来', '已留下的记录', '连接状态']) {
+    for (const title of ['她现在怎样', '接下来', '最近发生', '连接状态']) {
       expect(markup).toContain(title);
     }
   });
@@ -1050,19 +1050,17 @@ describe('§5 总览布局：区块顺序与栅格跨度', () => {
     expect(order.indexOf('未来意向')).toBeLessThan(recordsIdx);
   });
 
-  it('栅格跨度：此刻 6、可用性 3、情绪 3、未来意向 12、渠道与模型 12', () => {
+  it('常用入口放在当下区，记忆和连接信息可按需展开', () => {
     const markup = renderBody(readyPayload());
-    const span = (title: string) => {
-      const at = markup.indexOf(`data-testid="dash-${title}"`);
-      const open = markup.lastIndexOf('<section', at);
-      return /dash-card--span(\d+)/.exec(markup.slice(open, at))?.[1];
-    };
-    expect(span('此刻')).toBe('6');
-    expect(span('可用性')).toBe('3');
-    expect(span('情绪')).toBe('3');
-    expect(span('未来意向')).toBe('12');
-    expect(span('今天的安排')).toBe('6');
-    expect(span('渠道与模型')).toBe('12');
+    const actions = markup.indexOf('class="dash-board__actions"');
+    expect(actions).toBeGreaterThan(0);
+    expect(markup.indexOf('去聊天', actions)).toBeLessThan(markup.indexOf('data-zone="next"'));
+    expect(markup).toContain('<details class="dash-board__details"><summary>记忆与关系</summary>');
+    expect(markup).toContain('<details class="dash-board__details"><summary data-zone="connectivity">');
+    expect(markup).not.toContain('尚未绑定对话模型');
+    const data = readyPayload();
+    data.sections.connectivity.data!.bound_model_roles = ['memory.extract'];
+    expect(renderBody(data)).toContain('尚未绑定对话模型');
   });
 
   it('每张有内容的卡都带一个明确入口（不把功能藏进"详细"两个字）', () => {

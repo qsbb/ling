@@ -1,5 +1,9 @@
 # 贡献指南
 
+## 本地启动
+
+从[部署手册的本地开发章节](docs/DEPLOYMENT.md#1-本地开发无-docker)配置 Python、PostgreSQL 和 Web 控制台。开发默认开启 `LING_TEST_MODE=1`；外部凭据、私有数据和本地设计草稿不要提交。
+
 ## 提交信息
 
 遵循 [Conventional Commits](https://www.conventionalcommits.org/)：
@@ -18,23 +22,32 @@
 | `perf` | 性能 |
 | `test` | 只改测试 |
 | `docs` | 只改文档 |
-| `chore` | 构建、依赖、工具 |
+| `build` / `ci` / `chore` | 构建、CI 或其他维护 |
 
-**首行不超过 50 个字符**（最长 72），否则 GitHub 会截断成一行省略号。
-body 每行 72 字符内换行。
+首行不超过 50 个字符，正文每行不超过 72 个字符。不要顺手修改版本号。
 
-## 代码要求
+## 本地检查
 
-提交前跑：
+后端测试使用隔离 PostgreSQL。使用 `scripts/dev_pg.sh start` 的默认配置时，它会创建 `ling` 和 `ling_test` 两个库；**不要把任一测试变量指向真实业务库**。共享测试库运行 pytest 前需按 [AGENTS.md](AGENTS.md#跑-pytest-必须持锁) 持锁。
 
 ```bash
-ruff check . && mypy src connectors && pytest tests
-cd clients/web-console && pnpm typecheck && pnpm build
+export LING_TEST_DATABASE_URL='postgresql+asyncpg://ling@127.0.0.1:55432/ling_test'
+export LING_DATABASE_URL="$LING_TEST_DATABASE_URL"
+ruff check . && mypy src connectors && python -m pytest tests
+git diff --check
 ```
+
+语音编解码测试另需 `ffmpeg` 与 `.[dev,speech-codecs]`。Web 改动可从仓库根目录执行：
+
+```bash
+(cd clients/web-console && pnpm install --frozen-lockfile && pnpm exec playwright install chromium && pnpm typecheck && pnpm test && pnpm build)
+```
+
+提交说明标明实际执行的检查，不把 stub 测试、真实浏览器验收和生产部署混为一谈。CI 入口见 [ci.yml](.github/workflows/ci.yml)。
 
 ## 改行为之前先改契约
 
-`contracts/` 下的 13 份 v1 schema 是接口的单一真源。改动流程：
+`src/ling/contracts/v1.py` 是 v1 模型源文件，`contracts/` 保存导出的 JSON Schema。改动流程：
 
 1. 改 `src/ling/contracts/v1.py`
 2. 跑 `python scripts/export_contracts.py`
