@@ -103,7 +103,7 @@ pnpm -C clients/web-console install
 > `配置错误：找不到 playwright。` + 三行「哪一级、为什么没成」
 > + `修复：pnpm -C clients/web-console install`，退出码 2。
 
-后端 API 还需要仓库的 Python 虚拟环境（`.venv`，见根 `README.md` 的 `uv venv` 一节）；
+后端 API 还需要仓库的 Python 虚拟环境（`.venv`，见[本地开发说明](../../docs/DEPLOYMENT.md#1-本地开发无-docker)）；
 `memory` / `nav` / `w0` 三个会自起真 API 的脚本都靠它连 PostgreSQL。
 
 ### 默认一条命令（`w0_browser.mjs`）

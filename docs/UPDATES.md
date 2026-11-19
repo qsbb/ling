@@ -1,68 +1,15 @@
 # 升级与自动更新（默认关闭）
 
-> **两条通道，先分清自己在哪条上**
->
-> - **源码模式**（`install.sh` 构建当前源码）：§1–§9 描述的就是这条，宿主执行器是
->   `deploy/update/executor.py`。
-> - **镜像模式**（固定在 OCI 摘要上的镜像）：§10。API 端点是
->   `POST /v1/version/image-update-requests` / `GET /v1/version/image-update`，
->   宿主侧是独立项目 `<应用项目名>-updater`（默认 `ling-updater`）。**`executor.py` 不能用于镜像模式**——
->   它下载 tag 源码、构建再调 `install.sh`，跑的是另一套拓扑（见 §4 开头）。
+## 先选升级方式
 
-> **先看结论**
->
-> - 当前 README 的源码首装不要求部署机安装 pnpm：宿主有 pnpm 9+ 时本机构建，缺少时由
->   Dockerfile Web 阶段构建。日常手动升级用 `bash deploy/upgrade.sh`；固定 `v0.0.8`
->   checkout 通过 README 的 bootstrap 命令先验证工作区和分支祖先，再快进到 `main` 并运行升级脚本。
->   2026-11-18 在 5.21 无 pnpm 的隔离项目完成一行首装，并从固定 `v0.0.8` 检出完成 bootstrap
->   升级；服务健康，PG head 为 `0078_proactive_daily_quota`，业务计数、`.env` 和媒体标记哈希保持。
->   这是发布后的 README/源码部署复验，不改写发布时 `v0.0.9` 文档缺少 bootstrap 的失败记录。
-> - GitHub 已于 `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）发布
->   `v0.0.9`。tag、`main` 与 release workflow run `44112900865` 均绑定
->   `f381a8c76df43a24b60944c91e22be46501bbd8c`；verify、Python 3.12/3.13、Web、mobile、
->   API image、updater-image 与 release jobs 全部成功。GHCR API/updater index digest
->   分别为 `sha256:477146f2e2989e8df50a36b6ccc4b696c1b8072e66206d07849695e709724756` 与
->   `sha256:324f211911a2f41a6538104c6c29b9a4c9eb913e4de15969fbc1b0be704c7429`，平台摘要见
->   [验收记录](evidence/release-0.0.9-acceptance.md)。同一 SHA 较早 push CI 的 Python 3.12
->   慢媒体并发测试失败，release workflow 重跑通过，原因未定位。
-> - 镜像更新器直接从 GHCR 读取稳定版 tag 与镜像 index digest；`deploy/releases.json`
->   不参与目标选择。隔离 `v0.0.8` 镜像基线已由当前 `v0.0.9` updater 经 GHCR 直连完成一跳
->   更新，用时 34 秒；浏览器在请求受理后断开，重连观察到成功，阶段、日志、API/worker digest、
->   提交、迁移、PG/媒体计数和 Cookie 均核验。另一次中断复测在 `prepare` 阶段停止 updater，
->   重启后进入 `needs_manual`；人工确认后遗留 `claimed` 请求仍令重试 API 返回 409。v0.0.8 API
->   对 `download_source` 返回 422，页面也没有线路选择器，所以中断恢复与加速线路均未通过。
->   自动更新继续默认关闭。正式 `v0.0.9` tag 的 updater 仍不含确认后 claim 归档修复；修复提交
->   `a9fdb7f` 已合入 main 候选 `2ef949f517ebb09d09fbf10c2a943515945d3cef`，SHA-only workflow
->   `44261602307` 构建并核验了 API/updater 双平台镜像。候选 updater index 为
->   `sha256:0b52baf2045759013b177eb4ff81ee34cfbb19cc5b4738e01e5ab209817bcd54`，并已在 5.21
->   隔离项目启动、由 `ling doctor` 核对 digest/protocol。该部署没有执行真实更新任务，稳定 tag
->   仍指向旧 `v0.0.9` 镜像。CLI 提交 `0178521` 修正带 TTY 的非交互口令回显，现已纳入 PR #3；
->   它不属于现有 `v0.0.9` 稳定 tag/镜像。
-> - 自动更新默认关闭（`LING_UPDATE_ENABLED=0`），**关闭时这套改动不影响已经跑着的
->   服务**：通道目录照常挂载（compose 早就接线了，见 §2），但开关是 0，界面上不会
->   出现可点的“更新”入口；`GET /v1/version/update` 仍会读 status 里的心跳来回答
->   `executor.online`，只是 `reason=disabled`；不会有任何路径去写 requests 或触发
->   部署。现有部署不需要为重装/重启，升级仍走人工路径（见 §7）。
-> - 第一次启用**网页自动更新**必须由人**人工纳管**：确认配置与备份，再安装宿主执行器。
->   手动源码升级不需要启用该执行器。
-> - **演练范围要按位置分开说**：源码模式一行首装、快进升级、重复部署和 PostgreSQL /
->   媒体数据保留，以及备份/演练库恢复和同 schema 本地镜像切换，来自 2026-11-16
->   的历史快照 `0cfc9be` 隔离 Docker 记录；不代表 main 候选 `2ef949f` 已重跑源码模式流程。
->   候选 `2ef949f` 已在 5.21 隔离项目完成固定摘要镜像首装、真实 Chromium/API W0 34/34、
->   `ling status`/`doctor`、备份与隔离恢复演练；没有执行网页镜像更新。边界见验收记录。
->   在线业务库实际恢复和跨 schema 回退仍未验证。
->   镜像模式已在
->   **隔离项目 `ling-drill`**（端口 6521、独立卷、独立根密钥）
->   上真机跑通新装、备份恢复与三次连续无人值守升级。生产 `ling` **已于 2026-11-05
->   从源码模式迁移到镜像模式**（首装失败过、手工补齐后用 `ling adopt --force` 登记，
->   见 [DEPLOYMENT.md §6](DEPLOYMENT.md#6-验证状态哪些验过哪些没验)），但那是一次
->   人工迁移，不是演练。2026-11-05 记录的生产状态不是本次现场核查结果；本次未连接
->   生产环境，不能据此推断当前生产版本或运行状态。网页更新仍有 head 不一致 / 并发请求 /
->   旧执行器残留的故障注入、中断中任务的真机对账（仅单测）、生产库有真实数据时的恢复、
->   arm64 运行及当前候选镜像更新浏览器流程等未完成项（见 §10.8）。
->   本文描述的接线与契约不等于“已验证的无人值守升级”。
-> - API 容器只读、非 root、**没有 Docker socket**；它只能写一条固定 JSON 请求，
->   真正部署由宿主上的独立执行器完成（两条通道都遵守这条边界）。
+| 当前部署 | 手动升级 | 网页通道 |
+| --- | --- | --- |
+| 源码：`deploy/compose.yaml`，本机构建 | [备份后运行 `bash deploy/upgrade.sh`](#7-源码模式怎么升级人工路径) | 宿主执行器 `deploy/update/executor.py`，见 §1–§9 |
+| 镜像：`compose.image.yaml`，固定 `LING_APP_IMAGE` | [按镜像摘要发布](DEPLOYMENT.md#113-镜像模式的升级) | 独立 `<应用项目名>-updater` 项目，见 [§10](#10-镜像模式的更新通道新协议隔离项目已真机演练) |
+
+自动更新默认关闭（`LING_UPDATE_ENABLED=0`）；手动升级不需要启用它。首次启用网页通道前，必须在宿主配置对应执行器并确认可恢复的备份。API 容器不持有 Docker socket，只提交受约束的请求，由独立执行器部署。
+
+源码一行首装及旧检出升级有隔离 PostgreSQL 复验记录。镜像网页更新也有直连成功记录，但中断恢复、加速线路和故障场景尚未完整验收。实验所用提交、镜像摘要和失败记录见[发布验收](evidence/release-0.0.9-acceptance.md)与[隔离部署记录](evidence/single-command-install-upgrade.md)，不代表生产环境已核验。
 
 ## 1. 源码模式的管线总览
 
@@ -602,23 +549,33 @@ LING_UPDATE_STATUS_DIR: /run/ling-update/status
    而 `-p` 是否承重取决于 compose 文件有无顶层 `name:`，本仓库有，但仍应显式给）。装完仍要 `crontab -l | grep backup.sh` 核对那一行确实带着
    `LING_COMPOSE_PROJECT`，并 `tail -f /mnt/backup/ling/backup.log` 看第一次真
    产出了 dump——**“已安装每日备份”不等于“备出来了”**。
-2. 在宿主机取到目标版本源码（`git fetch` 后切到对应 tag/commit，或解压归档）。
-3. 在该源码树运行 `bash deploy/install.sh`；脚本会保留已有 `deploy/.env`，
-   重新构建镜像、滚动重启并发布前端。若这份 checkout 和 canonical env 不在同一
-   棵树，且 env 里 `LING_WEB_DIST_HOST` 是旧树的绝对路径，手动运行前先
-   `export LING_WEB_DIST_HOST="$(pwd)/clients/web-console/dist"`（并保留
-   `LING_INSTALL_COMPOSE_OVERRIDE`、更新通道等其它 bind 上下文）。
-4. 检查 `bash deploy/install.sh --status` 与 `/readyz`，登录确认版本
+2. 在原安装目录执行 `bash deploy/upgrade.sh`。它检查干净工作区，只做 Git 快进，
+   然后调用安装器；使用自定义项目名或 Compose override 时，传入与原部署一致的参数与环境。
+   非快进时先人工核对历史，不要强制覆盖。有 `edge` 旧拓扑的部署先做 §7.1 的迁移。
+3. 检查 `bash deploy/install.sh --status` 与 `/readyz`，登录确认版本
    （`/v1/version` 的 `commit` 应等于目标 sha）**——这是需要登录的用户接口；
    自动探活不持凭据，不要拿它当探针**。
 
-第一次启用自助更新之前，还需要：`deploy/update/executor.py init` →
-`doctor` → `adopt-current`，确认 requests/status 权限与执行器识别到的
-commit/version。**确认 source_root 已经具备新版的 `.gitignore` /
-`.dockerignore`（`.run/` 等）与跨 release 锁支持、且 `git status` 干净**，再
-把 `LING_UPDATE_ENABLED` 改成 1。改完必须让 api **重建/重启**（`docker compose
-… up -d`，必要时 `--force-recreate`）；`restart` 不会重新读取 `.env`/环境变量，
-开关不会生效。
+若需部署指定 tag/commit 或源码归档，先人工准备目标源码，再在该源码树执行
+`bash deploy/install.sh`，替代第 2 步。它不取远端代码；部署时需沿用原 `.env` 和 Compose
+项目名。若 `.env` 中 `LING_WEB_DIST_HOST` 是旧源码树的绝对路径，先执行
+`export LING_WEB_DIST_HOST="$(pwd)/clients/web-console/dist"`，同时保留原有 Compose
+override 等部署参数。
+
+第一次启用自助更新之前，还需要按[宿主执行器说明](#4-宿主执行器只支持源码模式)
+执行 `init`、`doctor` 和 `adopt-current`，确认目录权限、识别到的构建提交及版本。
+确认源码目录干净，且已具备新版的 `.gitignore`、`.dockerignore` 和跨 release 锁支持，
+再设置 `LING_UPDATE_ENABLED=1` 并重建 API 容器；`restart` 不会重新读取 `.env`。
+
+### 从 v0.0.8 源码检出升级
+
+固定 `v0.0.8` 源码检出没有 `deploy/upgrade.sh`。完成上述备份后，从该检出根目录执行：
+
+```bash
+test -z "$(git status --porcelain --untracked-files=normal)" && git fetch --no-tags origin main && git merge-base --is-ancestor HEAD FETCH_HEAD && { ! git show-ref --verify --quiet refs/heads/main || git merge-base --is-ancestor refs/heads/main FETCH_HEAD; } && git switch -C main FETCH_HEAD && bash deploy/upgrade.sh
+```
+
+工作区必须干净；当前提交和已有本地 `main` 必须均为远端目标的祖先。任一前置检查失败时，不切换分支、不部署。此命令仅供符合条件的源码检出使用；镜像模式、有分叉的历史或已定制的分支不走这条路径。
 
 ### 7.1 从 edge 拓扑迁移（旧部署升级必做）
 
@@ -1004,7 +961,7 @@ fail-closed 判据）；必须先人工迁移。
 
 - **能**：源码模式通道按 §7 人工升级；镜像模式按
   [DEPLOYMENT.md §11](DEPLOYMENT.md#11-镜像模式部署推荐) 人工跑
-  `publish.py <digest>` 升级。**在隔离项目 `ling-drill` 上**，网页更新通道的
+  `publish.py --digest ...` 升级。**在隔离项目 `ling-drill` 上**，网页更新通道的
   完整链路（请求 → 更新器 → 备份 → 迁移 → 维护门禁切换 → 三项核验）已真机
   跑通三次连续升级。那次历史演练使用宿主侧测试发布数据；当前更新器已改为直接从
   GHCR 发现稳定版 tag，因此该演练证明了当时的执行链路，不替代当前 registry 发现和
@@ -1027,7 +984,7 @@ fail-closed 判据）；必须先人工迁移。
   实况比较并报告 8 项差异；没有手工改写安装记录。`LING_UPDATE_ENABLED` 继续默认 `0`，未连接
   生产环境。
 - 发布时的源码一行升级未验收：`v0.0.8` checkout 没有 `deploy/upgrade.sh`，当时的 README 命令以
-  127 退出；5.21 无 pnpm 的首装也曾失败。发布后当前 README 增加 bootstrap 与 Dockerfile Web
+  127 退出；隔离宿主无 pnpm 的首装也曾失败。发布后增加[旧检出升级命令](#从-v008-源码检出升级)与 Dockerfile Web
   构建路径，2026-11-18 在隔离 5.21 项目完成无 pnpm 一行首装和从 `v0.0.8` 检出的 bootstrap
   升级，服务健康且 PG、配置、媒体标记保持；结果与限制见验收记录。
 - 当前 `v0.0.9` registry digest 已由 GH Actions 发布 workflow 核验；本轮还在隔离测试主机

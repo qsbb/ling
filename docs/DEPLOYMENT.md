@@ -1,16 +1,24 @@
 # ling 部署与运维手册
 
+先确认你要用哪种部署方式。同一实例只能使用一份主 Compose 文件，不要叠加源码和镜像模式的配置。
+
+| 场景 | 从这里开始 |
+| --- | --- |
+| 在 Linux 上从源码安装 | [Docker Compose](#2-docker-composelinux) |
+| 使用 CI 已构建的镜像 | [镜像模式部署](#11-镜像模式部署推荐) |
+| 开发、修改代码或使用测试模型 | [本地开发](#1-本地开发无-docker) |
+| 已装好，需要接模型或 QQ | [设置模型](#3-设置模型唯一入口) · [接入 QQ](#6-接入-qqonebot-v11) |
+| 升级、备份恢复或排障 | [升级指南](UPDATES.md) · [备份与恢复](#4-备份与恢复) · [故障排查](#5-故障排查) |
+
 ## 1. 本地开发（无 Docker）
 
-本机没有 Docker 时，用便携 PostgreSQL + Python 虚拟环境。
+在仓库根目录执行。准备 `uv` 及用于编译 Web 控制台的 Node.js 和 pnpm（CI 使用 Node.js 22、pnpm 9）。下面给应用创建 Python 3.13 环境，便携 PostgreSQL 脚本通过 `uv` 另建 Python 3.11 环境。
 
 数据库地址需要显式配置。此前使用本地 SQLite 的用户应先备份旧文件及相关密钥，
 确认迁移和回退方案后再切换。下面的 PostgreSQL 示例不会自动导入旧数据；回退时保留
 旧版本、原数据库文件及其密钥，并恢复原有数据库配置。
 
 ```bash
-cd /opt/ling
-
 # 1) 依赖
 uv venv --python 3.13 .venv
 . .venv/bin/activate
@@ -20,7 +28,7 @@ uv pip install -e ".[dev]"
 scripts/dev_pg.sh start
 
 # 3) 前端构建（可选，首次需要）
-cd clients/web-console && pnpm install && pnpm build && cd ../..
+(cd clients/web-console && pnpm install --frozen-lockfile && pnpm build)
 
 # 4) 确认数据库并启动（本例对应上面创建的本地 PostgreSQL）
 export LING_DATABASE_URL='postgresql+asyncpg://ling@127.0.0.1:55432/ling'
@@ -65,14 +73,15 @@ python -c "from connectors.onebot.silk import default_codec; print(default_codec
 > [§11「镜像模式部署（推荐）」](#11-镜像模式部署推荐)；把现有源码部署切过去见
 > [§12「从源码模式迁移到镜像模式」](#12-从源码模式迁移到镜像模式)。
 
+首装需要 Git、Bash、Python 3、curl、Docker Engine 和 Docker Compose v2。在你希望存放源码的目录运行：
+
 ```bash
-cd /opt/ling
-bash deploy/install.sh              # 一条命令：生成配置、构建、起服务、等就绪
-# 结束时会打印实际控制台地址：新生成的 .env 默认 18080，已有 .env 则按
-# LING_PORT。--port 可以改新生成 .env 的端口。
+git clone --depth 1 https://github.com/qsbb/ling.git ling && cd ling && bash deploy/install.sh
 ```
 
-或手动：
+脚本结束时会打印实际控制台地址。新装默认宿主端口为 `18080`；宿主没有 pnpm 时，脚本在 Docker 中构建前端。已有源码实例升级请按[源码升级步骤](UPDATES.md#7-源码模式怎么升级人工路径)。
+
+如需自行管理构建和 Compose，以下为手动首装示例。不要对已经安装的实例执行 `cp`，它会覆盖配置：
 
 ```bash
 cp deploy/env.example deploy/.env
@@ -80,7 +89,7 @@ cp deploy/env.example deploy/.env
 # （固定值，用于加密供应商密钥），并把 LING_TEST_MODE 设为 0
 
 cd clients/web-console && pnpm install && pnpm build && cd ../..
-docker compose -f deploy/compose.yaml --project-name ling-dev up -d --build
+docker compose --env-file deploy/.env -f deploy/compose.yaml --project-name ling-dev up -d --build
 curl http://127.0.0.1:6520/readyz
 ```
 
@@ -119,7 +128,7 @@ curl http://127.0.0.1:6520/readyz
 ```
 
 ```bash
-docker logs ling-api-1 2>&1 | grep -A4 '首次安装'
+bash deploy/install.sh --logs api
 ```
 
 拿到后登录，系统会**强制要求改密码**（改密前除 `/v1/auth/*` 外全部 403）。
@@ -624,6 +633,8 @@ docker logs ling-api-1 2>&1 | grep security_inbound_denied
 可以各自搜到**，不用再靠猜。
 
 ## 6. 验证状态（哪些验过、哪些没验）
+
+本节保留早期拓扑与镜像部署的验证记录，不代表当前生产状态。后续隔离 PostgreSQL 首装、升级、浏览器及更新器验证见[隔离部署记录](evidence/single-command-install-upgrade.md)和[发布验收记录](evidence/release-0.0.9-acceptance.md)。
 
 **已验证**（后文 §7–§9 是这些验证的记录）：
 
@@ -1817,18 +1828,7 @@ HSTS 头存在、TLS 1.1 握手被拒。
 > （`/v1/version/image-update-requests` + 独立 `<应用项目名>-updater`，默认 `ling-updater`），见
 > [UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练) 与本文 §11。
 > 完整管线、宿主执行器命令、失败语义与人工恢复步骤见 [UPDATES.md](UPDATES.md)。
-> **演练范围要分开说**：发布时固定 `v0.0.8` checkout 没有 README 中的 `deploy/upgrade.sh`，
-> 从旧基线直接运行失败。发布后当前 README 增加了受保护的 bootstrap 快进命令，并在 5.21
-> 隔离环境完成无 pnpm 一行首装和 `v0.0.8` 检出升级；服务、PG、配置与媒体标记均核对通过。
-> 这些是当前仓库文档/源码部署路径的复验，不改变发布时的记录。镜像模式已在隔离项目 `ling-drill` 上真机跑通历史新装、备份恢复、三次
-> 连续升级；本轮还验证了 `v0.0.9` updater 从 `v0.0.8` 稳定镜像直连更新一跳。另一次中断
-> 实验在 `prepare` 阶段停止 updater，重启后进入人工门禁；发布的 `v0.0.9` 人工确认没有清除遗留
-> `claimed` 请求，API 重试仍返回 409。修复已合入 main 候选 `2ef949f`，SHA-only workflow
-> `44261602307` 构建了 API/updater 双平台镜像；updater index 为
-> `sha256:0b52baf2045759013b177eb4ff81ee34cfbb19cc5b4738e01e5ab209817bcd54`。该候选在 5.21
-> 隔离项目通过固定摘要安装、真实 Chromium W0 34/34、备份及隔离库恢复；没有执行 updater 更新任务。
-> 稳定 `v0.0.9` tag 仍指向修复前代码。CLI 提交 `0178521` 修复带 TTY 的非交互口令回显，现已纳入
-> PR #3，但不属于现有稳定 tag/镜像。加速线路也未实测；这些结果不代表生产 `ling` 或完整无人值守更新能力通过。
+> 手动源码升级不需要启用此通道。隔离演练的提交、镜像和未通过项以[验收记录](evidence/release-0.0.9-acceptance.md)为准。
 
 `api` 容器本身没有任何 Docker 权限；它只能往宿主共享的 requests 目录写一条
 固定 JSON，真正的构建/切换由宿主上的独立执行器完成。Compose 只给 **api** 注入
@@ -1913,7 +1913,7 @@ compose up -d --force-recreate api
 | 安装入口 | `bash deploy/install.sh`（在源码 checkout 里） | `ling install --digest ...`（宿主不需要源码树） |
 | 主 Compose 文件 | `deploy/compose.yaml`（api/worker 有 `build:`，Web 从宿主 bind 到 `/app/web`） | `deploy/compose.image.yaml`（api/worker 只认必填 `LING_APP_IMAGE`，Web 已烤进镜像） |
 | 版本标识 | `LING_COMMIT` 构建参数 + 本地镜像名 | 固定 OCI **index digest**（`/v1/version` 读容器内 `LING_APP_IMAGE`；commit 取自镜像内烤入的 `LING_COMMIT`，与 OCI 标注 `org.opencontainers.image.revision` 同源，发布/更新器再交叉核对） |
-| 日常升级 | `bash deploy/upgrade.sh`（快进获取远端后构建部署，[UPDATES.md](UPDATES.md)） | `publish.py <digest>`（人工）或网页更新（需独立更新器） |
+| 日常升级 | `bash deploy/upgrade.sh`（快进获取远端后构建部署，[UPDATES.md](UPDATES.md)） | `publish.py --digest ...`（人工）；网页更新默认关闭 |
 | 自助更新执行器 | `deploy/update/executor.py`（**只支持源码模式**） | 独立项目 `<应用项目名>-updater`（默认 `ling-updater`）+ `/v1/version/image-update-requests`（[UPDATES.md §10](UPDATES.md)） |
 | 可选 WS 端口 override | `deploy/compose.ws.example.yaml` | `deploy/compose.image.ws.example.yaml` |
 
@@ -1930,20 +1930,12 @@ compose up -d --force-recreate api
    > index 包含当前宿主平台；它不读取 `deploy/releases.json` 来选择目标。该文件仍由 CI
    > 校验并保留为仓库发布元数据，但不是部署安装清单或网页更新信任源。
 
-   > 截至 2026-11-18，GitHub 已正式发布 `v0.0.9`，发布时间为
-   > `2026-11-17T16:01:11Z`（上海时间 `2026-11-18 00:01:11`）。tag 与 `main`
-   > 指向 `f381a8c76df43a24b60944c91e22be46501bbd8c`；release workflow run
-   > `44112900865` 的 verify、Python 3.12/3.13、Web、mobile、image、updater-image
-   > 与 release jobs 全部成功。GHCR 上两个 `v0.0.9` index、amd64/arm64 manifest
-   > 和 OCI version/revision 已独立核验，摘要见[验收记录](evidence/release-0.0.9-acceptance.md)。
-   > 发布验收仍为 No-Go。发布时固定 `v0.0.8` checkout 不含 README 所写的 `deploy/upgrade.sh`，
-   > 从该基线执行当时的升级命令退出 127；5.21 缺 `pnpm`，源码首装需额外准备匹配的前端产物。
-   > 发布后当前 README 加入 bootstrap 与 Dockerfile Web 构建路径，已在隔离 5.21 环境通过一行
-   > 首装和旧检出升级。当前 `v0.0.9` updater 也已从 `v0.0.8` 镜像基线
-   > 经 GHCR 直连完成一跳，详情和未通过项见[验收记录](evidence/release-0.0.9-acceptance.md)。
+   > 历史镜像的构建提交、运行记录及已验证范围见[发布验收记录](evidence/release-0.0.9-acceptance.md)。安装时仍要核对目标发布的摘要，不要把历史记录里的摘要当作当前版本。
 
-2. **安装。** 宿主不需要源码树，但需要 `python3`（脚本是纯标准库，3.9+）、
-   Docker/Compose 与 GHCR 拉取权限：
+2. **安装。** 宿主不需要构建源码，但需要 `python3`（3.9+）、Docker/Compose 与
+   GHCR 拉取权限。若没有独立的部署文件，从上一步核对过的构建提交取得仓库归档，
+   解压后在归档根目录执行下列命令。不要只取 `ling.py`：安装器还会读取同一版本的
+   Compose 模板及配套部署文件。
 
    ```bash
    python3 deploy/cli/ling.py install --non-interactive \
@@ -2019,7 +2011,7 @@ compose up -d --force-recreate api
 
 ### 11.3 镜像模式的升级
 
-**人工（推荐、也是当前唯一可宣称的路径）**：
+**推荐按固定摘要手动发布**：
 
 ```bash
 python3 deploy/release/publish.py \
@@ -2049,30 +2041,7 @@ python3 deploy/release/publish.py \
 退出码能区分失败阶段：`0` 成功、`2` 参数/非 digest、`10` 预检、`11` 锁、`12`
 归档、`13` 备份、`14` 拉取/身份、`15` 迁移、`16` 迁移后的切换/验证失败。
 
-**网页更新**：需要独立 `<应用项目名>-updater`（默认 `ling-updater`）与镜像更新通道。隔离项目 `ling-drill` 曾真机跑通
-三次连续升级。`v0.0.9` 已正式发布且 GHCR 的 API/updater index 与平台 manifest 已核验，
-保留的 `v0.0.8` 隔离镜像基线现已通过真实 Chromium 确认，并经 GHCR 直连完成一跳
-网页更新到 `v0.0.9`；由当前 `v0.0.9` updater 执行。任务用时 34 秒并成功，浏览器在
-HTTP 201 后断开，重新连接后观察到已完成；迁移、digest、PG/媒体行数、卷和 Cookie 均核验。
-加速线路、忙时重启及迁移/验证故障注入仍未实测。中断复测曾在 `prepare` 阶段进入
-`needs_manual`；人工确认后遗留 `claimed` 请求仍阻止 API 重试，故中断恢复未通过。
-`LING_UPDATE_ENABLED` 仍默认
-`0`（`${LING_UPDATE_ENABLED:-0}`，可用 `ling install --with-updater --enable-updates` 或改
-`.env` 打开）。更新目标由更新器直接从 GHCR 稳定版 tag 发现，不由仓库
-`deploy/releases.json` 决定。Release workflow `44112900865` 构建并核验了 `v0.0.9`
-API/updater 双平台镜像；GHCR 原始 index 与平台 manifest 摘要及 OCI revision 均已复核。
-真实 Chromium/API/PostgreSQL W0 套件在 `v0.0.8` 源码隔离项目与候选源码升级后各通过 34/34，
-均启用 `LING_TEST_MODE=1`；另一个 `v0.0.8` 镜像基线为 32/33，重试按钮断言失败且原因未定位。
-独立镜像项目经 GHCR 直连完成 `v0.0.8 → v0.0.9` 一跳，由当前 `v0.0.9` updater 执行，
-核验运行摘要、迁移、业务行数、媒体、卷及更新后 Cookie。README 升级命令从 v0.0.8 checkout
-启动时因缺少 `deploy/upgrade.sh` 失败；这是发布时的 README/检出结果。发布后当前 README 已加入
-bootstrap，并在无 pnpm 的隔离测试机完成一行首装及旧检出升级。updater claim 归档修复已包含在
-`2ef949f` SHA-only updater 镜像并通过构建身份检查；该候选镜像已在 5.21 隔离部署启动，但没有
-执行真实更新任务。CLI 提交 `0178521` 修复非交互口令回显，现已纳入 PR #3，但不属于上述 `2ef949f`
-候选镜像或 `v0.0.9` 稳定 tag。
-加速线路、更新器其他中断阶段和失败注入仍未完成，故网页与源码
-一行更新验收均不能整体签核（细节与未验证项见
-[UPDATES.md §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)）。
+**网页更新**：默认关闭，需要独立 `<应用项目名>-updater`，不能用源码模式的宿主执行器代替。隔离环境有 GHCR 直连成功记录，但这不等于完整自动更新验收通过。启用条件见[更新指南 §10](UPDATES.md#10-镜像模式的更新通道新协议隔离项目已真机演练)，中断恢复和故障用例的结果见[发布验收记录](evidence/release-0.0.9-acceptance.md)。
 
 ### 11.4 三条硬边界
 
