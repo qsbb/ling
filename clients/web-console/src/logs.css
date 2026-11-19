@@ -257,18 +257,41 @@
 }
 
 .logs__row {
+  border-left: 2px solid transparent;
+}
+
+.logs__summary {
   display: grid;
   /* 时间 / 级别 / logger 固定列宽，消息吃掉剩下的；等宽字体下三列会真的对齐 */
   grid-template-columns: 84px 62px minmax(90px, 190px) minmax(0, 1fr);
   gap: 10px;
   padding: 2px 12px;
-  border-left: 2px solid transparent;
   align-items: baseline;
+  cursor: pointer;
+  padding-right: 28px;
+  position: relative;
 }
+
+.logs__summary::after {
+  content: '›' / '';
+  position: absolute;
+  right: 10px;
+  top: 2px;
+  color: var(--ink-faint);
+}
+
+.logs__entry[open] > .logs__summary::after { transform: rotate(90deg); }
+.logs__summary::-webkit-details-marker { display: none; }
+.logs__summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.logs__details { margin: 0 12px 8px; padding: 8px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.logs__details dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; }
+.logs__details dt { color: var(--ink-soft); }
+.logs__details dd { margin: 0; }
+.logs__details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* 关掉 logger 列时把那一列**真正去掉**（DOM 里也没有节点，见 LogsList）：
    只把内容藏起来会留下一个空列，消息列被白白挤窄，窄屏上更明显。 */
-.logs__list--no-logger .logs__row {
+.logs__list--no-logger .logs__summary {
   grid-template-columns: 84px 62px minmax(0, 1fr);
 }
 
@@ -384,18 +407,18 @@
 
   /* 375px 放不下四列：时间与级别并到第一行，logger 与消息在下面。
      不改成横向滚动——那会让"读一条完整日志"变成左右拖。 */
-  .logs__row {
+  .logs__summary {
     grid-template-columns: 84px minmax(0, 1fr);
     grid-template-areas:
       'time level'
       'logger logger'
       'message message';
     row-gap: 1px;
-    padding: 6px 10px;
+    padding: 6px 28px 6px 10px;
   }
 
   /* 没有 logger 行时连那一行网格也去掉，别留 1px 的空行 */
-  .logs__list--no-logger .logs__row {
+  .logs__list--no-logger .logs__summary {
     grid-template-columns: 84px minmax(0, 1fr);
     grid-template-areas:
       'time level'

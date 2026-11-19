@@ -27,10 +27,15 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from ling.infra.db import session_scope
 from ling.kernel.visibility import group_id_from_window_ref, is_group_window_ref
 from ling.ports.channel import ChannelConnector
+
+if TYPE_CHECKING:
+    from ling.contracts.v1 import InteractionEnvelope
+    from ling.kernel.bridge import BridgeResult
 
 logger = logging.getLogger("ling.kernel.inbound")
 
@@ -358,7 +363,10 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
         # 是因为 inbound_intake 是所有渠道的唯一汇合点——放 bridge 里，
         # QQ 官方机器人那条路会漏。
         _log_inbound_behavior(
-            envelope, result, is_group=is_group_window_ref(envelope.window_ref)
+            envelope,
+            result,
+            is_group=is_group_window_ref(envelope.window_ref),
+            platform=trusted_instance_key[0] if trusted_instance_key else None,
         )
 
     return {
@@ -494,125 +502,68 @@ async def _process_recall(
 
 
 def _log_inbound_behavior(
-    envelope: object, result: object, *, is_group: bool
+    envelope: InteractionEnvelope,
+    result: BridgeResult,
+    *,
+    is_group: bool,
+    platform: str | None = None,
 ) -> None:
-    """把一次入站处理说成一句人话。
-
-    两条日志对应两种视角：
-
-    - ``received``  她**收到**了什么（谁、在哪、说了什么）
-    - ``handled``   她**怎么处理**的（接话 / 先放着 / 没懂）
-
-    ## 动作与理由必须来自不同字段
-
-    ``result.reason`` 只放**理由**（「群里的普通消息」）；动作（「先放着，
-    等她刷到」）来自 ``BridgeResult.action``（延后处置由 bridge 说清楚在等
-    什么），没有时由这里按 ``decision`` 补。以前 bridge 把动作也写进了
-    reason，于是日志变成「先放着，等她刷到（群里的普通消息，先放着，
-    等她刷到）」——同一句话说两遍，还占两倍长度。两个字段各写一份是
-    冗余的根源，职责分开之后重复就无从发生。
-    """
+    """一次桥接受理只记一行，详细理由与投递回执留给展开视图。"""
     from ling.audit import behavior_event
+    from ling.logging_setup import logging_context, redact_value
 
-    sender = getattr(envelope, "sender_name", None) or "有人"
-    text = ""
-    for part in getattr(envelope, "parts", None) or []:
-        if getattr(part, "text", None):
-            text = part.text
-            break
-    scene = "群里" if is_group else "私聊里"
+    def clip(value: str | None, limit: int) -> str:
+        text = " ".join(redact_value(value or "").split())
+        return text if len(text) <= limit else text[:limit] + "…"
 
-    # 正文截断：行为日志是给人快速扫的，不是全文存档（全文在 messages 表）。
-    preview = text.strip().replace("\n", " ")[:60]
-    received = f"{sender} 在{scene}说话" + (f"：「{preview}」" if preview else "（没有文字）")
-    behavior_event(
-        "inbound_received",
-        received,
-        attributes={
-            "window_ref": getattr(envelope, "window_ref", ""),
-            "is_group": is_group,
-            "has_media": bool(getattr(envelope, "media_refs", None)),
-        },
-    )
-
-    if not getattr(result, "accepted", False):
-        return
-    reason = str(getattr(result, "reason", "") or "")
-    delivered = bool(getattr(result, "delivered", False))
-    decision = str(getattr(result, "decision", "") or "")
-    if decision == "deferred_attention":
-        # 动作由 bridge 给（"先放着，等她刷到" / "先放着，等她补一句正文"）：
-        # 同样是"延后"，等的东西不一样，这里不替它猜。
-        action = str(getattr(result, "action", "") or "") or "先放着，等她刷到"
-        handled = f"{action}（{reason}）" if reason else action
-    elif getattr(result, "reply_text", None) and delivered:
-        handled = "回了"
-    elif getattr(result, "reply_text", None):
-        handled = f"想回但没发出去（{reason}）" if reason else "想回但没发出去"
+    family = platform or envelope.window_ref.partition(":")[0]
+    if family in {"onebot", "qqbot", "qq"}:
+        scene = "QQ 房间" if envelope.window_ref.startswith("qq:channel:") else (
+            "QQ 群" if is_group else "QQ 私聊"
+        )
+    elif family == "wechat":
+        scene = "微信群" if is_group else "微信私聊"
     else:
-        handled = f"没接话（{reason}）" if reason else "没接话"
+        scene = "群聊" if is_group else "私聊"
 
-    window_ref = str(getattr(envelope, "window_ref", "") or "")
-    # 她**没开口**的处置（先放着 / 没接话）同一窗口连着出现时只完整记一次。
-    # 开了口（回了 / 想回但没发出去）**每次都记**——那才是用户真正要看的事，
-    # 合并掉等于隐瞒她说过话。
-    if decision in {"deferred_attention", "silence"} and _is_repeated_handled(
-        window_ref, f"{decision}|{handled}"
-    ):
-        return
-    behavior_event(
-        "inbound_handled",
-        f"对 {sender} 的话：{handled}",
-        outcome=decision or ("replied" if delivered else "silent"),
-        attributes={
-            "window_ref": window_ref,
-            "decision": decision,
-            "delivered": delivered,
-        },
-    )
+    preview = clip(next((p.text for p in envelope.parts if p.text and p.text.strip()), None), 60)
+    if not preview:
+        media_types = {"image", "audio", "video"}
+        media = next((p.modality for p in envelope.parts if p.modality in media_types), envelope.modality)
+        preview = f"[{media}]" if media in media_types else (
+            "[media]" if envelope.media_refs else "（没有文字）"
+        )
+    if not result.accepted:
+        outcome, status = "rejected", "未受理"
+    elif 0 < result.parts_sent < result.parts_total:
+        outcome, status = "partial_delivery", f"部分送达（{result.parts_sent}/{result.parts_total}）"
+    elif result.delivered:
+        outcome, status = "delivered", "已回复"
+    elif result.decision == "reply" or result.reply_text:
+        outcome, status = "reply_not_delivered", "决定回复，未送达"
+    elif result.decision == "deferred_attention":
+        outcome, status = "deferred_attention", clip(result.action, 60) or "暂缓处理"
+    elif result.decision == "silence" or result.handled_as == "ignored":
+        outcome, status = "silence", "未接话"
+    else:
+        outcome, status = "accepted", "已受理"
 
-
-# ---------------------------------------------------------------- 处置日志降噪
-
-# 同一窗口、同一句处置的"安静期"（秒）。
-#
-# 群聊热闹时每条普通消息都产生一行「先放着，等她刷到（群里的普通消息）」，
-# 一行信息量都没有，却把 500 条缓冲里的位置占满。这个值决定"多久没有新的
-# 同类处置就再记一次"——不是丢弃，是合并：窗口里重新安静下来之后，
-# 下一条消息会重新完整记一行。
-_HANDLED_NOTE_SECONDS = 120.0
-
-# 记着多少个窗口：只是短时降噪状态，超了就按"最久没说话"淘汰。
-# 不做无界字典——长跑进程里那会随群数一直长。
-_HANDLED_NOTE_MAX_WINDOWS = 512
-
-# ``window_ref -> (上次记下的处置签名, monotonic 时间戳)``。
-_handled_notes: dict[str, tuple[str, float]] = {}
-
-
-def _is_repeated_handled(window_ref: str, signature: str) -> bool:
-    """这句处置刚刚在同一窗口记过吗？（是 → 本次省略，别的什么都不丢）
-
-    只影响 ``inbound_handled`` 这一行：``inbound_received`` 仍然逐条记
-    （那条里有正文，是真正要看的），``handled_reason`` 落库更是完全不受
-    影响——这里从头到尾没碰过数据库和 ``BridgeResult``。
-    """
-    now = time.monotonic()
-    previous = _handled_notes.get(window_ref)
-    repeated = (
-        previous is not None
-        and previous[0] == signature
-        and now - previous[1] < _HANDLED_NOTE_SECONDS
-    )
-    # 时间戳每次都推到"现在"：只要这个窗口还在连着说同类的话，就一直算
-    # 同一段，不再冒新的行；真正安静下来之后再开口，才会重新记。
-    _handled_notes[window_ref] = (signature, now)
-    if len(_handled_notes) > _HANDLED_NOTE_MAX_WINDOWS:
-        for stale, _ in sorted(_handled_notes.items(), key=lambda kv: kv[1][1])[
-            : len(_handled_notes) - _HANDLED_NOTE_MAX_WINDOWS
-        ]:
-            _handled_notes.pop(stale, None)
-    return repeated
+    with logging_context(turn_id=result.turn_id, session_id=result.window_id):
+        behavior_event(
+            "inbound_received",
+            f"{scene}里{clip(envelope.sender_name, 48) or '有人'}说：「{preview}」 · {status}",
+            outcome=outcome,
+            attributes={
+                "scene": scene,
+                "window_ref": envelope.window_ref,
+                "external_event_id": envelope.external_event_id,
+                "decision": result.decision,
+                "reason": clip(result.reason, 240),
+                "delivered": result.delivered,
+                "parts_sent": result.parts_sent,
+                "parts_total": result.parts_total,
+            },
+        )
 
 
 __all__ = ["process_inbound_payload"]

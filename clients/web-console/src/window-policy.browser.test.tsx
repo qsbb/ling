@@ -331,3 +331,27 @@ describe('Web 会话对话设置', () => {
     expect(await page.getByRole('button', { name: '会话设置' }).count()).toBe(0);
   }, 20000);
 });
+
+it('日志详情支持键盘展开，缓冲淘汰旧行后仍展开原消息', async (ctx) => {
+  if (error) { console.warn(error); ctx.skip(); return; }
+  const { page } = await openChat('owner', 375);
+  const makeLog = (second: number, message: string) => ({
+    timestamp: `2026-11-14T00:00:0${second}Z`, level: 'info', logger: 'ling.behavior',
+    kind: 'behavior', event_name: 'inbound_received', message,
+    attributes: { attributes: { reason: '这个原因只在详情里', external_event_id: `fixture-${second}` } },
+  });
+  const current = makeLog(2, 'QQ 群里夜落星河说：「[image]」 · 暂缓处理');
+  let items = [makeLog(1, '旧记录'), current];
+  await page.route('**/v1/logs*', (route) => route.fulfill(json({ items, buffered: 2, capacity: 2 })));
+  await page.goto(`${address}/logs`);
+  const row = page.getByTestId('logs-row').filter({ hasText: current.message });
+  const summary = row.locator('summary');
+  await summary.waitFor();
+  expect(await row.getByText('这个原因只在详情里', { exact: true }).isVisible()).toBe(false);
+  await summary.press('Enter');
+  await row.getByText('这个原因只在详情里', { exact: true }).waitFor();
+  items = [current, makeLog(3, '新记录')];
+  await page.getByText('新记录', { exact: true }).waitFor();
+  expect(await row.getByText('这个原因只在详情里', { exact: true }).isVisible()).toBe(true);
+  expect(await page.getByTestId('logs-row').filter({ hasText: '新记录' }).locator('details[open]').count()).toBe(0);
+}, 20000);
