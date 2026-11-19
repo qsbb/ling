@@ -2085,6 +2085,8 @@ export interface ImageUpdateV2 {
   /** 排队中的请求；非空 = 已提交、还没开始。旧字段，后端保留一个版本。 */
   request?: ImageUpdatePendingRequestV2 | null;
   details: ImageUpdateDetailsV2;
+  /** 服务端按权限与安装门禁优先级给出的首要阻塞；旧服务端可能不提供。 */
+  reason?: string | null;
   /**
    * 契约正文未列：`AboutPage` 靠它二选一（镜像卡片 / 源码模式页）。缺省按镜像
    * 模式处理；只有显式 `false` 才走源码模式。

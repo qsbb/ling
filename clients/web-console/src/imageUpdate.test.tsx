@@ -311,6 +311,32 @@ describe('四态：一句话结论 + 一个主按钮', () => {
     expect(markup).not.toContain('更新到 v0.0.4');
   });
 
+  it('只有首要门禁是备份且没有活动任务时，才给所有者宿主操作指引', () => {
+    const base = availableView();
+    const blocked = blockedView({
+      reason: 'backup_gate_missing',
+      newer: base.newer,
+      details: { ...base.details, backup_gate: { restore_point: false, reason: 'keys_missing' } },
+    });
+    const render = (view: ImageUpdateV2, canWrite = true) => renderPanel({
+      state: { ...initialImageUpdateState(), view }, canWrite, defaultDetailsOpen: true,
+    });
+    const positive = render(blocked);
+    expect(primaryButton(positive)).toBe('备份后重新检查');
+    expect(positive).toContain('宿主机');
+    expect(positive).toContain('<code>ling backup</code>');
+    expect(positive).toContain('最近的备份缺少用于恢复配置的根密钥');
+    for (const markup of [
+      render(blocked, false),
+      render({ ...blocked, reason: 'update_disabled' }),
+      render({ ...blocked, task: makeTask() }),
+      render({ ...blocked, state: 'latest', newer: [] }),
+    ]) {
+      expect(markup).not.toContain('ling backup');
+      expect(markup).not.toContain('备份后重新检查');
+    }
+  });
+
   it('暂不能确认：结论 +「重试检查」，且不出现「已是最新」', () => {
     const view = unknownView();
     const markup = renderPanel({ state: { ...initialImageUpdateState(), view } });
@@ -507,7 +533,7 @@ describe('活动任务覆盖结论展示，不许再检查或安装', () => {
         migration: { attempted: true, target_head: 'head-2', current_after: 'head-2' },
       }),
     });
-    expect(describeImageLastTaskLine(mismatch)).toContain('三项核验不一致');
+    expect(describeImageLastTaskLine(mismatch)).toBe('上次更新已结束；不一致：运行容器 digest。');
 
     const incomplete = makeView({
       task: makeTask({
@@ -517,7 +543,15 @@ describe('活动任务覆盖结论展示，不许再检查或安装', () => {
         migration: { attempted: true, target_head: 'head-2', current_after: 'head-2' },
       }),
     });
-    expect(describeImageLastTaskLine(incomplete)).toContain('三项核验值不全');
+    expect(describeImageLastTaskLine(incomplete)).toBe('上次更新已结束；无法核实：应用提交。');
+
+    const mixed = makeView({ task: makeTask({
+      state: 'succeeded', stage: 'verify', target: { digest: TARGET_DIGEST, commit: null },
+      migration: { attempted: true, target_head: 'head-2', current_after: 'head-1' },
+    }) });
+    expect(renderPanel({ state: { ...initialImageUpdateState(), view: mixed } })).toContain(
+      '上次更新已结束；不一致：运行容器 digest、迁移 head；无法核实：应用提交。',
+    );
   });
 
   it('needs_manual 任务首屏保留可发现的提示', () => {
@@ -553,11 +587,19 @@ describe('「更新内容」只显示后端给的，不自己编', () => {
     expect(markup).toContain('更新内容（v0.0.4）');
   });
 
-  it('items 为空：显示「这一版没有提供更新说明」', () => {
+  it('没有摘要或条目时，保留全文入口，不谎称发布方没有说明', () => {
+    const view = availableView({ newer: [makeNewer({ notes: [], summary: null })] });
+    const markup = renderPanel({ state: { ...initialImageUpdateState(), view } });
+    expect(markup).toContain('此处暂无更新摘要');
+    expect(markup).toContain('data-testid="image-update-notes-url"');
+    expect(markup).not.toContain('data-testid="image-update-notes-items"');
+  });
+
+  it('只有摘要也算有内容，不显示空状态', () => {
     const view = availableView({ newer: [makeNewer({ notes: [] })] });
     const markup = renderPanel({ state: { ...initialImageUpdateState(), view } });
-    expect(markup).toContain('这一版没有提供更新说明');
-    expect(markup).not.toContain('data-testid="image-update-notes-items"');
+    expect(markup).toContain('日程子系统与发送链路的可靠性修复');
+    expect(markup).not.toContain('data-testid="image-update-notes-empty"');
   });
 
   it('没有 notes_url 就不显示「完整更新日志」', () => {

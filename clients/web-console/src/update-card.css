@@ -46,6 +46,21 @@
   overflow-wrap: anywhere;
 }
 
+.update-card__backup {
+  display: grid;
+  gap: 4px;
+  padding-inline-start: 12px;
+  border-inline-start: 2px solid var(--warn);
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.update-card__backup strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
 .update-card__last-task {
   margin: 0;
   font-size: 12.5px;

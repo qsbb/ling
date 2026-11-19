@@ -2020,7 +2020,7 @@ function SourceAboutPage({ onBack }: AboutPageProps) {
  * - 首屏只有：当前版本、**服务端给的一句话结论**、检查时间、一个主按钮。
  *   三段横幅、原因码墙、安装门禁 notes、目标 `sha256` 都不再上首屏。
  * - 四态与按钮：已是最新 →「检查更新」；可更新 →「更新到 vX」；
- *   有新版暂不可用 →「重新检查」；暂不能确认 →「重试检查」。
+ *   有新版暂不可用 →「重新检查」（备份拦截时附宿主操作指引）；暂不能确认 →「重试检查」。
  *   活动任务覆盖结论展示（「正在更新 vX：阶段」+「查看进度」），此时不许再检查/安装。
  *   非 owner 用同一套四态结论，但主按钮是「查看详情」，不写任何请求。
  * - 「检查更新」是**真检查**：`POST /v1/version/image-update-checks` 写一个检查请求，
@@ -2579,11 +2579,15 @@ export function describeImageLastTaskLine(view: ImageUpdateV2 | null): string | 
   if (task === null || imageTaskActivity(view) !== 'none') return null;
   if (task.state === 'needs_manual') return '上次更新需要处理：先按详情里的失败码处理，再检查。';
   if (task.state === 'succeeded') {
-    // 不写「更新成功」：三项核验有任何一端缺失/不一致，就只能说「已结束」。
     const checks = imageUpdateVerification(task, view?.current ?? null);
-    if (checks.some((check) => check.ok === false)) return '上次更新已结束，但三项核验不一致。';
-    if (checks.some((check) => check.ok === null)) {
-      return '上次更新已结束，但三项核验值不全，不能确认成功。';
+    const mismatched = checks.filter((check) => check.ok === false).map((check) => check.label);
+    const missing = checks.filter((check) => check.ok === null).map((check) => check.label);
+    const issues = [
+      mismatched.length ? `不一致：${mismatched.join('、')}` : null,
+      missing.length ? `无法核实：${missing.join('、')}` : null,
+    ].filter(Boolean);
+    if (issues.length) {
+      return `上次更新已结束；${issues.join('；')}。`;
     }
     return '上次更新已完成（三项核验一致）。';
   }
@@ -2668,6 +2672,21 @@ export interface ImageUpdateAction {
   disabled: boolean;
 }
 
+function imageUpdateNeedsBackup(view: ImageUpdateV2 | null, canWrite: boolean): boolean {
+  return canWrite && view?.state === 'newer_unavailable' && view.reason === 'backup_gate_missing' &&
+    imageTaskActivity(view) === 'none';
+}
+
+const IMAGE_BACKUP_REASON_TEXT: Record<string, string> = {
+  no_manifest: '尚未找到备份记录。',
+  backup_dir_unreadable: '更新器无法读取备份目录，请先检查目录挂载和读取权限。',
+  manifest_unreadable: '最近的备份记录无法读取，请检查备份文件和读取权限。',
+  manifest_incomplete: '最近的备份记录不完整，或缺少备份文件。',
+  tombstones_not_ok: '最近的备份没有完整记录已删除数据。',
+  media_partial: '最近的备份没有完整归档媒体。',
+  keys_missing: '最近的备份缺少用于恢复配置的根密钥。',
+};
+
 /**
  * 卡片唯一的主按钮。四态各一个；活动任务/非 owner 优先覆盖。
  * `busy` 时按钮禁用并显示「正在检查…」。
@@ -2704,7 +2723,11 @@ export function imageUpdatePrimaryAction(
     case 'latest':
       return { kind: 'check', label: checkingLabel ?? '检查更新', disabled: busy };
     case 'newer_unavailable':
-      return { kind: 'recheck', label: checkingLabel ?? '重新检查', disabled: busy };
+      return {
+        kind: 'recheck',
+        label: checkingLabel ?? (imageUpdateNeedsBackup(view, options.canWrite) ? '备份后重新检查' : '重新检查'),
+        disabled: busy,
+      };
     default:
       return { kind: 'retry', label: checkingLabel ?? '重试检查', disabled: busy };
   }
@@ -3068,11 +3091,13 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   const backupGate = view?.details?.backup_gate ?? null;
 
   const activity = imageTaskActivity(view);
+  const needsBackup = imageUpdateNeedsBackup(view, canWrite);
   const action = imageUpdatePrimaryAction(view, { canWrite, busy: checking });
   const connection = describeImageConnection(state);
   const taskLine = describeImageTaskLine(view);
   const lastTaskLine = describeImageLastTaskLine(view);
   const notes = imageUpdateNotesView(view);
+  const newVersion = imageVersionLabel(notes?.version ?? null);
   const notesItems =
     notes === null
       ? []
@@ -3086,11 +3111,11 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
   const conclusion =
     activity !== 'none' && taskLine !== null
       ? taskLine
-      : view === null
-        ? '正在读取更新状态…'
-        : message !== ''
-          ? message
-          : '服务端没有给出结论';
+      : needsBackup
+        ? `发现新版${newVersion ? ` ${newVersion}` : ''}，更新前需要一份可用备份。`
+        : view === null
+          ? '正在读取更新状态…'
+          : message || '服务端没有给出结论';
   const versionLabel = imageVersionLabel(current.version);
 
   const onPrimary = () => {
@@ -3117,6 +3142,12 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
       <p className="update-card__conclusion" data-testid="image-update-conclusion">
         {conclusion}
       </p>
+      {needsBackup ? (
+        <div className="update-card__backup" data-testid="image-update-backup-guidance">
+          <strong>{IMAGE_BACKUP_REASON_TEXT[backupGate?.reason ?? ''] ?? '尚未确认有可用的备份。'}</strong>
+          <span>在宿主机运行 <code>ling backup</code>。</span>
+        </div>
+      ) : null}
       <p className="update-card__checked" data-testid="image-update-checked">
         {describeImageCheckedAt(view?.checked_at ?? null, nowMs)}
       </p>
@@ -3191,17 +3222,17 @@ export function ImageUpdatePanel(props: ImageUpdatePanelProps) {
               {notes.summary}
             </p>
           )}
-          {notes.items.length === 0 ? (
+          {notes.items.length === 0 && notes.summary === null ? (
             <p className="update-notes__empty" data-testid="image-update-notes-empty">
-              这一版没有提供更新说明
+              {notes.url === null ? '这一版没有提供更新说明' : '此处暂无更新摘要。'}
             </p>
-          ) : (
+          ) : notes.items.length > 0 ? (
             <ul className="update-notes__list" data-testid="image-update-notes-items">
               {notesItems.map((item, index) => (
                 <li key={`${index}-${item}`}>{item}</li>
               ))}
             </ul>
-          )}
+          ) : null}
           {hiddenNotes > 0 ? (
             <button
               type="button"

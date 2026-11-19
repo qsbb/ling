@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
 import { createServer, type ViteDevServer } from 'vite';
 import react from '@vitejs/plugin-react';
+import type { ImageUpdateV2 } from './types';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 let browser: Browser | null = null;
@@ -38,7 +39,14 @@ async function openUpdatePage(
   page: Page,
   state: string,
   stage: string,
-  options: { queued?: boolean; noTask?: boolean; downloadSource?: string; requestSource?: string } = {},
+  options: {
+    queued?: boolean;
+    noTask?: boolean;
+    downloadSource?: string;
+    requestSource?: string;
+    updateView?: () => Partial<ImageUpdateV2>;
+    onCheck?: (requestId: string) => void;
+  } = {},
 ) {
   await page.route('**/*', async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -54,6 +62,10 @@ async function openUpdatePage(
         test_mode: false,
         csrf_token: 'csrf',
       };
+    } else if (path === '/v1/version/image-update-checks' && options.onCheck) {
+      const requestId = route.request().postDataJSON().request_id;
+      options.onCheck(requestId);
+      body = { request_id: requestId };
     } else if (path === '/v1/version/image-update') {
       body = {
         schema_version: 'v1', state: 'latest', message: '当前已是最新', checked_at: null,
@@ -68,6 +80,7 @@ async function openUpdatePage(
           started_at: '2026-11-14T00:00:00Z', finished_at: '2026-11-14T00:05:00Z',
         },
         details: { catalog: {}, updater: {}, backup_gate: null },
+        ...options.updateView?.(),
       };
     } else if (path === '/v1/version') {
       body = { current: '0.0.8' };
@@ -85,6 +98,52 @@ async function openUpdatePage(
   await page.goto(`${baseUrl}/settings/about`, { waitUntil: 'domcontentloaded' });
   await page.getByTestId('image-update-panel').waitFor();
 }
+
+it('备份后重新检查走真实按钮接线，门禁通过后显示更新动作', async () => {
+  if (!browser) throw new Error(`浏览器不可用：${launchError}`);
+  const page = await browser.newPage({ viewport: { width: 375, height: 900 } });
+  const target = { version: '0.0.9', digest: `ghcr.io/qsbb/ling-api@sha256:${'b'.repeat(64)}`, commit: null };
+  const checks: string[] = [];
+  const updateRequests: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/v1/version/image-update-requests')) {
+      updateRequests.push(request.url());
+    }
+  });
+  try {
+    await openUpdatePage(page, 'succeeded', 'verify', {
+      noTask: true,
+      onCheck: (id) => checks.push(id),
+      updateView: () => {
+        const ready = checks.length > 0;
+        return {
+          state: ready ? 'available' : 'newer_unavailable',
+          message: ready ? '发现新版，可以更新。' : '发现新版，但缺少备份。',
+          reason: ready ? null : 'backup_gate_missing',
+          target,
+          checked_at: ready ? '2026-11-20T00:00:01Z' : '2026-11-20T00:00:00Z',
+          details: {
+            updater: { online: true },
+            catalog: ready ? { check: { check_id: checks[0], state: 'succeeded' } } : {},
+            backup_gate: { restore_point: ready, reason: ready ? 'ok' : 'no_manifest' },
+          },
+        };
+      },
+    });
+    const guidance = page.getByTestId('image-update-backup-guidance');
+    const primary = page.getByTestId('image-update-primary');
+    await expect.poll(() => guidance.textContent()).toContain('ling backup');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect(await primary.textContent()).toBe('备份后重新检查');
+    await primary.click();
+    await expect.poll(() => primary.textContent(), { timeout: 8_000 }).toBe('更新到 v0.0.9');
+    expect(checks).toHaveLength(1);
+    expect(await guidance.count()).toBe(0);
+    expect(updateRequests).toEqual([]);
+  } finally {
+    await page.close();
+  }
+}, 30_000);
 
 describe('更新任务进度入口', () => {
   for (const noTask of [true, false]) {
