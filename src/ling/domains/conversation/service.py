@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import bindparam, delete, func, or_, select, text
+from sqlalchemy import Table, bindparam, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
@@ -34,6 +34,7 @@ from ling.infra.security import new_id
 
 DEFAULT_WINDOW_TITLE = "新的对话"
 MAX_TITLE_LEN = 60
+_WINDOWS_TABLE = cast(Table, Window.__table__)
 
 # 渠道窗口 ``title`` 里存的平台窗口标识形如 ``<instance>:<kind>:<target>``，
 # kind 只可能是这两种。其它形态一律当作"不是平台标识"——
@@ -430,7 +431,7 @@ class ConversationService:
             if first_rank is not None:
                 manual_order = first_rank - 1
         await self._session.execute(
-            Window.__table__.update()
+            _WINDOWS_TABLE.update()
             .where(Window.id == window_id)
             .values(
                 pinned_at=utcnow() if pinned else None,
@@ -475,7 +476,7 @@ class ConversationService:
         ]
         if ranks:
             await self._session.execute(
-                Window.__table__.update()
+                _WINDOWS_TABLE.update()
                 .where(Window.id == bindparam("target_id"))
                 .values(manual_order=bindparam("rank"), updated_at=Window.updated_at),
                 ranks,
@@ -539,7 +540,7 @@ class ConversationService:
                 window.title = name or DEFAULT_WINDOW_TITLE
             else:
                 await self._session.execute(
-                    Window.__table__.update()
+                    _WINDOWS_TABLE.update()
                     .where(Window.id == window_id)
                     .values(display_name_override=name or None, updated_at=Window.updated_at)
                 )
