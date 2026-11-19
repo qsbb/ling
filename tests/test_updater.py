@@ -1052,6 +1052,11 @@ media_sha="$(sha "$out/media-$stamp.tar")"
   echo "media_state=present"
   echo "media_sha256=$media_sha"
 } > "$out/manifest-$stamp.txt"
+if [ "$mode" = "incomplete_manifest" ]; then
+  rm -- "$out/$dump"
+elif [ "$mode" = "fail_after_manifest" ]; then
+  exit 5
+fi
 printf 'backup-complete %s\n' "$out" >> "${CALL_LOG:?}"
 '''
 
@@ -2295,9 +2300,12 @@ def test_updater_missing_root_key_fails_before_backup(ws: Workspace) -> None:
     assert not [line for line in ws.compose_calls() if " run " in line]
 
 
-def test_backup_failure_never_migrates(ws: Workspace) -> None:
+@pytest.mark.parametrize("mode", ["fail", "fail_after_manifest", "incomplete_manifest"])
+def test_backup_failure_never_migrates(ws: Workspace, mode: str) -> None:
+    # 即使已有完整历史恢复点，也不能替代本次更新创建的备份。
+    write_manifest(ws)
     write_request(ws)
-    result = run_updater(ws, env={"FAKE_BACKUP_MODE": "fail"})
+    result = run_updater(ws, env={"FAKE_BACKUP_MODE": mode})
     assert result.returncode == 13, (result.stdout, result.stderr)
     assert not [line for line in ws.compose_calls() if " run " in line]
     task = ws.task()
@@ -2306,6 +2314,7 @@ def test_backup_failure_never_migrates(ws: Workspace) -> None:
     assert task["state"] == "failed_not_started"
     # 未迁移：恢复旧 worker/api 并实测（allow 回到旧镜像）。
     assert calls_with(ws, f"docker-env up LING_APP_IMAGE={OLD_REF}")
+    assert task["still_on_old_version"] is True
 
 
 # ---------------------------------------------------------------- 已迁移失败
@@ -2432,6 +2441,7 @@ def test_maintenance_gate_rejects_model_drift_before_touching_anything(ws: Works
 
 
 def test_success_path_uses_target_digest_and_records_identity(ws: Workspace) -> None:
+    assert list(ws.backup_dir.iterdir()) == []
     write_request(ws)
     result = run_updater(ws)
     assert result.returncode == 0, (result.stdout, result.stderr)

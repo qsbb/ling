@@ -5,7 +5,7 @@
 ``docs/IMAGE-DEPLOYMENT-DESIGN.md`` §2 最后一行（旧 ``executor.py`` 不兼容镜像拓扑）。
 
 覆盖：镜像模式判定、固定请求体（多余字段/非 digest/未确认）、原子写与文件权限、
-任务 ID 重入、开关/在线/协议/恢复点/当前镜像门禁、限流、最近登录（**只在安装
+任务 ID 重入、开关/在线/协议/当前镜像门禁、限流、最近登录（**只在安装
 请求上**）、脱敏白名单、四态投影（唯一事实源 = 更新器的 ``release_check``）、
 ``release_notes`` 的三种状态、按需检查接口，以及旧的源码端点被显式拒绝/行为不变。
 
@@ -15,8 +15,7 @@
 
 两条**必修**回归各有一组用例：
 
-- ``backup_gate``（与 task 无关的恢复点门禁）：有备份、没有 task 也要可安装；
-  没有备份时报"没有可用的恢复点"而不是"更新器离线"；旧状态文件仍回退到
+- ``backup_gate`` 仅诊断历史恢复点，不阻塞更新。旧状态文件仍回退到
   ``task.backup``；字段存在时以它为准（不回退）。
 - ``LING_APP_IMAGE`` 注入 api/worker 的 ``environment``：否则 API 拿不到当前摘要，
   ``GET`` 报 ``current_image_unknown``、``POST`` 409。
@@ -906,41 +905,38 @@ async def test_running_task_blocks_and_shows_real_stage(
         _backup(backup_id=""),
     ],
 )
-async def test_restore_point_gate(logged_in: TestEnv, tmp_path: Path, backup: dict[str, object]) -> None:
+async def test_unusable_task_backup_is_diagnostic_only(
+    logged_in: TestEnv, tmp_path: Path, backup: dict[str, object]
+) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=_task(backup=backup))
-    response = await _post(logged_in)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == "backup_gate_missing"
-    view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    view = await _view(logged_in)
+    assert view["state"] == "available"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["restore_point"] is False
-    # 四态那句话讲人话（"需要一个可用备份"），码表原文在 reason_message；
-    # 原因码在 reason 里。
-    assert view["state"] == "newer_unavailable"
-    assert "备份" in view["message"]
-    assert "恢复点" in (view["reason_message"] or "")
-    assert "_" not in view["message"]
-    assert _request_files(base) == []
+    assert view["backup_gate"]["source"] == "task"
+    assert (await _post(logged_in)).status_code == 201
+    assert len(_request_files(base)) == 1
 
 
-async def test_no_task_means_no_restore_point(logged_in: TestEnv, tmp_path: Path) -> None:
-    """**旧状态文件**（没有 ``backup_gate``）且没有 task → 没有恢复点。
-
-    这条用例守的是"回退到 ``task.backup``"的兼容路径：不是全新部署的正常路径。
-    改前它是死锁的复现（有备份也一样不可安装）；修法见下面 ``backup_gate`` 的用例。
-    """
+async def test_legacy_status_without_any_backup_is_installable(
+    logged_in: TestEnv, tmp_path: Path
+) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=None)
-    view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    view = await _view(logged_in)
+    assert view["state"] == "available"
+    assert view["reason"] is None
     assert view["task"] is None
+    assert view["details"]["backup_gate"] is None
     assert view["backup_gate"]["source"] is None
+    response = await _post(logged_in)
+    assert response.status_code == 201, response.text
+    assert _request_files(base) == [f'request-{response.json()["request_id"]}.json']
 
 
-# ------------------------------------------------- 恢复点门禁（与 task 无关的 backup_gate）
+# ------------------------------------------------- 历史恢复点诊断
 
 
 def _compose_service_env(service: str) -> dict[str, object]:
@@ -954,11 +950,7 @@ def _compose_service_env(service: str) -> dict[str, object]:
 async def test_backup_gate_without_task_is_installable(
     logged_in: TestEnv, tmp_path: Path
 ) -> None:
-    """回归（必修 A）：备份目录里有可用恢复点、status 里**没有 task** → 可安装。
-
-    改前：``restore_point`` 只从 ``task.backup`` 推导，task 为 null ⇒ 永远
-    ``backup_gate_missing``。全新镜像部署的第一次网页更新因此永远不可能发生。
-    """
+    """没有任务时仍能独立报告已有的历史恢复点。"""
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=None, backup_gate=_gate())
     view = (await logged_in.client.get("/v1/version/image-update")).json()
@@ -979,37 +971,10 @@ async def test_backup_gate_without_task_is_installable(
     assert len(_request_files(base)) == 1
 
 
-async def test_missing_backup_gate_and_no_task_is_not_updater_offline(
-    logged_in: TestEnv, tmp_path: Path
-) -> None:
-    """没有 ``backup_gate``、没有 task → 「没有可用的恢复点」，**不是**「更新器离线」。"""
-    base = _configure(logged_in, tmp_path)
-    _write_status(base, task=None)
-    view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["updater"]["online"] is True
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
-    assert view["reason"] != "updater_offline"
-    assert "没有可用的恢复点" in (view["reason_message"] or "")
-    assert "离线" not in (view["reason_message"] or "")
-    assert view["state"] == "newer_unavailable"
-    assert "备份" in view["message"]
-    assert view["backup_gate"]["restore_point"] is False
-    assert _request_files(base) == []
-
-
 async def test_stale_backup_gate_is_still_installable(
     logged_in: TestEnv, tmp_path: Path
 ) -> None:
-    """``checked_at`` 很早**不**单独判不可安装（刻意取舍，理由见下）。
-
-    更新器只在「启动」与「处理完任务」时重算并写 ``checked_at``：一个健康、长期
-    空闲的更新器写出很早的时间是**正常状态**，不是故障。状态文件的新鲜度已经由
-    ``updater.online``（``updated_at`` ≤ 120 秒）单独把关；再拿 ``checked_at``
-    判一次"过期"会在毫无故障时把更新锁掉——等于把死锁换个形式装回来。
-    "备份被删了、门禁却还说有"由更新器在迁移前重新核 manifest + 产物哈希兜底
-    （``publish.Context.validate_backup_manifest``）。
-    """
+    """历史备份的检查时间按原值展示，不影响提交。"""
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=None, backup_gate=_gate(checked_at=_STALE))
     view = (await logged_in.client.get("/v1/version/image-update")).json()
@@ -1043,32 +1008,32 @@ async def test_stale_backup_gate_is_still_installable(
         ),
     ],
 )
-async def test_backup_gate_without_usable_restore_point_blocks(
+async def test_unusable_historical_backup_does_not_block(
     logged_in: TestEnv, tmp_path: Path, gate: dict[str, object], reason_text: str
 ) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=None, backup_gate=gate)
-    response = await _post(logged_in)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == "backup_gate_missing"
-    view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    view = await _view(logged_in)
+    assert view["state"] == "available"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["restore_point"] is False
     assert view["backup_gate"]["source"] == "backup_gate"
     assert reason_text in (view["backup_gate"]["reason_message"] or "")
-    assert _request_files(base) == []
+    response = await _post(logged_in)
+    assert response.status_code == 201, response.text
+    assert _request_files(base) == [f'request-{response.json()["request_id"]}.json']
 
 
 async def test_backup_gate_true_is_not_trusted_without_complete(
     logged_in: TestEnv, tmp_path: Path
 ) -> None:
-    """更新器说 ``restore_point=true`` 但 ``complete=false``：API 不盲信，按不可安装。"""
+    """更新器说 ``restore_point=true`` 但 ``complete=false``：API 不盲信，按无恢复点显示。"""
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=None, backup_gate=_gate(restore_point=True, complete=False))
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["restore_point"] is False
 
 
@@ -1079,8 +1044,8 @@ async def test_malformed_backup_gate_does_not_fall_back_to_task(
     base = _configure(logged_in, tmp_path)
     _write_status(base, task=_task(backup=_backup()), backup_gate="not-a-dict")
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["source"] == "backup_gate"
     assert view["backup_gate"]["restore_point"] is False
     assert view["backup_gate"]["complete"] is False
@@ -1097,8 +1062,8 @@ async def test_backup_gate_takes_precedence_over_task_backup(
         backup_gate=_gate(restore_point=False, complete=False, backup_id=None, reason="no_manifest"),
     )
     view = (await logged_in.client.get("/v1/version/image-update")).json()
-    assert view["installable"] is False
-    assert view["reason"] == "backup_gate_missing"
+    assert view["installable"] is True
+    assert view["reason"] is None
     assert view["backup_gate"]["source"] == "backup_gate"
     assert view["backup_gate"]["restore_point"] is False
 
@@ -2318,7 +2283,6 @@ async def test_queued_request_keeps_state_and_says_waiting(
 @pytest.mark.parametrize(
     "mutate",
     [
-        "backup_gate_missing",
         "update_disabled",
         "current_image_unknown",
         "manual_required",
@@ -2330,9 +2294,7 @@ async def test_gate_blocks_availability_but_state_still_reports_newer(
     """安装门禁不过 → 「有新版暂不可用」，且原因就是那道门（不是删掉新版）。"""
     base = _configure(logged_in, tmp_path, enabled=mutate != "update_disabled")
     kwargs: dict[str, object] = {}
-    if mutate == "backup_gate_missing":
-        kwargs["task"] = None
-    elif mutate == "current_image_unknown":
+    if mutate == "current_image_unknown":
         monkeypatch.delenv("LING_APP_IMAGE")
     elif mutate == "manual_required":
         kwargs["state"] = "needs_manual"

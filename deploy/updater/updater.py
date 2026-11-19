@@ -147,17 +147,14 @@
 ``deploy/releases.json`` 的解析/校验代码暂时留着（桥接期旧更新器还要用），
 但**更新器不再依赖它们**。
 
-恢复点门禁为什么必须是**独立顶层字段**
-======================================
-``task`` 只在更新器**处理过一次任务之后**才存在，而第一次任务又要先过恢复点
-门禁：只看 ``task.backup`` 就是死锁——全新镜像部署的网页更新会永远显示"不可
-安装"。所以 ``backup_gate`` 与任务无关，直接**扫描备份目录**里最近的 manifest
-（cron/手动备份在备份根目录，更新器自己的快照在 ``release-<id>/`` 里，两者都看）。
+历史恢复点诊断
+==============
+``backup_gate`` 扫描历史备份，与当前任务无关，不决定新版能否提交。
+cron/手动备份在备份根目录；更新器自己的快照在 ``release-<id>/``，两者都看。
 
 它只是**廉价的静态核对**（字段齐全、产物在位、状态允许恢复），不重算哈希：
 真正的哈希/身份门禁在复用实现里，每次更新都会把 manifest 与产物逐字节核一遍。
-``checked_at`` 记录这份判断的时间；更新器**启动时算一次、每处理完一个任务再算
-一次**并写进状态文件，idle 时也在（否则 API 又只能看 task）。
+``checked_at`` 记录这份判断的时间。更新器在启动、任务结束、按需检查和空闲时定期刷新。
 
 ``reason`` 是码表码，不是文案：``backup_dir_unreadable`` / ``no_manifest`` /
 ``manifest_unreadable`` / ``manifest_incomplete`` / ``tombstones_not_ok`` /
@@ -564,7 +561,7 @@ WARNING_TEXT = {
     "maintenance_reenforced": "已迁移后验证失败：维护门禁已重新关上（未切回旧镜像）",
 }
 
-# 恢复点门禁的 reason 是**码表码**（文案由 API 自己那份码表翻译，见
+# 历史恢复点的 reason 是**码表码**（文案由 API 自己那份码表翻译，见
 # src/ling/api/routes/version.py 的 IMAGE_BACKUP_GATE_REASONS）。
 # 码表：ok / backup_dir_unreadable / no_manifest / manifest_unreadable /
 #       manifest_incomplete / tombstones_not_ok / media_partial / keys_missing
@@ -1584,7 +1581,7 @@ def _manifest_dump_present(manifest: Path, fields: dict[str, str]) -> bool:
 
 
 def _manifest_gate(manifest: Path, pub: ModuleType) -> dict[str, Any]:
-    """把一份 manifest 翻成恢复点门禁；任何不确定都按"没有恢复点"处理。"""
+    """把一份 manifest 翻成历史恢复点诊断；任何不确定都按"没有恢复点"处理。"""
     parser = getattr(pub, "parse_manifest", None)
     if parser is None:
         # 发布模块是运行时按路径加载的；缺这个函数说明更新器与发行包不是同一次
@@ -1655,11 +1652,7 @@ def _manifest_gate(manifest: Path, pub: ModuleType) -> dict[str, Any]:
 
 
 def backup_gate(cfg: Config, pub: ModuleType) -> dict[str, Any]:
-    """扫描备份目录里**最近**的 manifest，得出与 task 无关的恢复点门禁。
-
-    与 task 解耦是关键：第一次任务之前没有 ``task``，不能因此说"没有恢复点"
-    （那会把全新部署的网页更新永久锁死）。这里只看备份目录的事实。
-    """
+    """只读扫描最近的历史备份；它既不拦截提交，也不替代本次备份校验。"""
     manifest, reason = _latest_manifest(cfg.backup_dir)
     if manifest is None:
         return _empty_backup_gate(pub, reason or "no_manifest")
@@ -2317,7 +2310,7 @@ class StatusWriter:
             "notes": {},
         }
 
-    # ------------------------------------------------------------ 恢复点门禁
+    # ------------------------------------------------------------ 历史备份
     def refresh_backup_gate(self) -> dict[str, Any]:
         self._gate = backup_gate(self.cfg, self.pub)
         self._backup_checked_at = time.monotonic()
@@ -3505,8 +3498,7 @@ class Updater:
         self.tool = catalog_tool
         self.store = TaskStore(cfg, pub)
         self.status = StatusWriter(cfg, pub, catalog_tool)
-        # **启动时算一次**恢复点门禁：idle 也要有（否则 API 只能看 task，
-        # 第一次更新之前永远"不可安装"）。
+        # 启动时即提供历史备份诊断，不必等第一次任务结束。
         self.status.refresh_backup_gate()
         # 版本发现同理：idle 也要有"有没有新版本"，否则网页的「更新」按钮永远
         # 「暂无可用目标」。这一刷只发**只读**调用（docker ps/inspect 读运行中
@@ -3649,7 +3641,7 @@ class Updater:
             self.refresh_status_after_task()
 
     def refresh_status_after_task(self) -> None:
-        """重算恢复点门禁/可用目标并按任务实况重写状态（含失败/人工门禁的收尾）。"""
+        """重算历史备份状态/可用目标并按任务实况重写状态（含失败/人工门禁的收尾）。"""
         self.status.refresh_backup_gate()
         # 成功后受限 env 已指向目标摘要：当前版本随之变化，目标列表必须重算
         # （否则刚装上的那个版本会继续显示成"可用目标"）。
@@ -3736,7 +3728,7 @@ class Updater:
             return EXIT_OK
         try:
             # 绕过 5 分钟自动刷新节流：用户点了检查，就必须**现在**去查。
-            # 手动备份可能在 updater 启动后才完成，恢复点门禁也要随这次检查更新。
+            # 手动备份可能在 updater 启动后才完成，随按需检查刷新历史诊断。
             self.status.refresh_backup_gate()
             self.status.refresh_release_check(requested=True, request_id=name_id)
             self.status.write("idle", self.task, force=True)
