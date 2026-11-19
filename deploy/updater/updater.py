@@ -436,6 +436,7 @@ RELEASE_CHECK_REASONS = registry.REASONS
 # 空闲时重查 registry 的间隔（秒）。发版是低频事件，5 分钟足够；用户点
 # 「检查更新」走 refresh 请求，**绕过**这个节流。
 CHECK_INTERVAL_SECONDS = 300.0
+BACKUP_GATE_INTERVAL_SECONDS = 60.0
 # 安装前复核最多从最新 tag 往下探多少个（见 :func:`Updater.assert_target_digest_current`）。
 # 只允许升级 → 正常情况第一次就命中；8 个是"旧页面上的候选"能容忍的纵深上限。
 MAX_DRIFT_PROBE_TAGS = 8
@@ -2263,13 +2264,13 @@ class StatusWriter:
     ``backup_gate`` **不在每次写状态时重算**：``checked_at`` 每次都变，内容就
     永远不同，空闲轮询会每 5 秒刷一次盘（这个类存在的意义正好相反）。所以恢复
     点门禁只在明确的时机重算：更新器启动时一次（:class:`Updater` 构造）、每处理
-    完一个任务一次（:meth:`Updater.refresh_status_after_task`）。本类的
+    完一个任务、手动检查，以及空闲时独立于 GHCR 每分钟复查一次。本类的
     ``write`` 在**从未算过**时兜底算一次，覆盖 ``--acknowledge-manual`` 这类
     不进主循环的入口。
 
     ``release_check`` / ``available_targets`` / ``recommended_target`` /
-    ``release_notes`` 的刷新时机与恢复点门禁完全一致（启动、每处理完一个任务），
-    外加「用户点了检查更新」。**这一组刷新会碰 Docker（只读）与网络**——当前版本
+    ``release_notes`` 也在启动、每次任务结束和手动检查时刷新。**这一组刷新会碰
+    Docker（只读）与网络**——当前版本
     读运行中 api 镜像的 OCI 标注，新版本要查 GHCR 的 ``tags/list`` 与 manifest
     digest。所以它被 :meth:`refresh_release_check_if_due` 的 5 分钟节流挡着，
     **绝不能**放进 5 秒的主轮询：那样所有部署实例每 5 秒就打一次 GHCR。
@@ -2285,6 +2286,7 @@ class StatusWriter:
         self.tool = tool
         self._last: str | None = None
         self._gate: dict[str, Any] | None = None
+        self._backup_checked_at = 0.0
         self._check: dict[str, Any] | None = None
         # 上次查 registry 的时间（monotonic）；0 表示还没查过。
         self._checked_at = 0.0
@@ -2299,7 +2301,12 @@ class StatusWriter:
     # ------------------------------------------------------------ 恢复点门禁
     def refresh_backup_gate(self) -> dict[str, Any]:
         self._gate = backup_gate(self.cfg, self.pub)
+        self._backup_checked_at = time.monotonic()
         return self._gate
+
+    def refresh_backup_gate_if_due(self) -> None:
+        if time.monotonic() - self._backup_checked_at >= BACKUP_GATE_INTERVAL_SECONDS:
+            self.refresh_backup_gate()
 
     # ------------------------------------------------------------ 版本发现
     def refresh_release_check(
@@ -4274,7 +4281,8 @@ def run_once(updater: Updater) -> int:
         refreshes = pending_refreshes(cfg)
         if refreshes:
             return updater.process_refresh(refreshes[0])
-        # 空闲也要低频重读目录：否则发版之后页面一直显示"没有新版本"。
+        # 备份是本地事实，可比 registry 更快刷新，且不会创建新备份。
+        updater.status.refresh_backup_gate_if_due()
         updater.status.refresh_release_check_if_due()
         updater.status.write("idle", task)
         return EXIT_OK

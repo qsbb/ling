@@ -29,6 +29,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -3685,6 +3686,63 @@ def test_refresh_request_rechecks_backup_gate_after_new_manifest(ws: Workspace) 
     assert gate["restore_point"] is True
     assert gate["backup_id"] == "20261118-120000"
     assert gate["reason"] == "ok"
+
+
+def test_idle_backup_scan_refreshes_status_independently_of_registry(
+    ws: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 直接调用 run_once（保留同一个更新器实例）；使用与子进程用例相同的本地替身。
+    for key in os.environ.keys() - ws.env.keys():
+        monkeypatch.delenv(key)
+    for key, value in ws.env.items():
+        monkeypatch.setenv(key, value)
+    updater = _updater_module()
+    clock = 1000.0
+    monkeypatch.setattr(
+        updater, "time",
+        SimpleNamespace(monotonic=lambda: clock, strftime=time.strftime, gmtime=time.gmtime),
+    )
+    cfg = updater.parse_config([
+        "--requests-dir", str(ws.requests_dir),
+        "--state-dir", str(ws.state_dir),
+        "--compose-file", str(ws.compose_file),
+        "--env-file", str(ws.env_file),
+        "--backup-dir", str(ws.backup_dir),
+        "--backup-script", str(ws.backup_script),
+        "--publish-py", str(PUBLISH_PY),
+        "--release-catalog", str(ws.release_catalog),
+    ])
+    instance = updater.Updater(cfg, updater.load_publish(cfg.publish_py))
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+    registry_calls = ws.status_registry_calls()
+    assert any("tags/list" in call for call in registry_calls)
+
+    manifest = write_manifest(ws, "20261118-120000")
+    files_after_backup = sorted(ws.backup_dir.rglob("*"))
+    start = clock
+    interval = updater.BACKUP_GATE_INTERVAL_SECONDS
+    clock = start + interval - 1
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+
+    clock = start + interval
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["restore_point"] is True
+    assert ws.status_registry_calls() == registry_calls
+    assert sorted(ws.backup_dir.rglob("*")) == files_after_backup
+
+    manifest.unlink()
+    clock = start + interval * 2
+    assert updater.run_once(instance) == 0
+    assert ws.status()["backup_gate"]["reason"] == "no_manifest"
+    assert ws.status_registry_calls() == registry_calls
+
+    clock = start + updater.CHECK_INTERVAL_SECONDS
+    assert updater.run_once(instance) == 0
+    assert sum("tags/list" in call for call in ws.status_registry_calls()) == 2
+    assert mutating_calls(ws) == []
 
 
 def test_same_refresh_id_is_not_processed_twice(ws: Workspace) -> None:
