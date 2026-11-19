@@ -15,12 +15,19 @@ _ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 _MAX_QUERY = 240
 _MAX_RESPONSE = 256 * 1024
 _RESULTS = 3
+_COMMAND = re.compile(r"^(?:/search(?:$|[\s:：])|搜索\s*[:：])", re.IGNORECASE)
 _REQUEST = re.compile(
-    r"^(?:/search(?:\s+|[:：])|(?:请|能不能)?(?:帮我|给我)?(?:"
-    r"(?:上网|联网|在网上)(?:搜索|搜一下|搜|查一下|查)|搜索一下|搜索|搜一下|搜个|搜一搜|搜)"
-    r"\s*[:：]?\s*)(?P<query>.+)$",
+    r"^(?:/search(?:\s+|[:：])|搜索(?:\s+|[:：])|(?:请你?|能不能|能否|能|可以|麻烦)?"
+    r"(?:(?:上网|联网|在网上)(?:搜索|搜一下|搜|查一下|查)|"
+    r"(?:帮我|给我|替我)(?:搜索一下|搜索|搜一下|搜个|搜一搜|搜)|"
+    r"搜索一下|搜一下|搜个|搜一搜)\s*[:：]?\s*)(?P<query>.+)$",
     re.IGNORECASE,
 )
+
+
+def has_explicit_search_command(user_text: str) -> bool:
+    """Recognize slash/colon command syntax even when the query is invalid."""
+    return _COMMAND.match(user_text.strip()) is not None
 
 
 def explicit_search_query(user_text: str) -> str | None:
@@ -32,6 +39,10 @@ def explicit_search_query(user_text: str) -> str | None:
     if not match:
         return None
     query = match["query"].strip()
+    if not has_explicit_search_command(text) and query.startswith(
+        ("是什么意思", "什么意思", "怎么用", "有什么用")
+    ):
+        return None  # 在讨论这个说法，而不是要查询一个主题。
     return query if 0 < len(query) <= _MAX_QUERY else None
 
 
@@ -73,7 +84,11 @@ async def _search(key: str, query: str) -> str:
             client.stream(
                 "GET", _ENDPOINT,
                 params={"q": query, "count": _RESULTS},
-                headers={"X-Subscription-Token": key, "Accept": "application/json"},
+                headers={
+                    "X-Subscription-Token": key,
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                },
             ) as response,
         ):
             if response.status_code in {401, 403}:
@@ -82,6 +97,8 @@ async def _search(key: str, query: str) -> str:
                 raise ValueError("网页搜索额度或频率受限，请稍后重试")
             if response.status_code != 200:
                 raise ValueError("网页搜索服务暂不可用")
+            if response.headers.get("content-encoding", "identity").lower().strip() != "identity":
+                raise ValueError("网页搜索服务返回了不支持的压缩响应")
             body = bytearray()
             async for chunk in response.aiter_bytes():
                 if len(body) + len(chunk) > _MAX_RESPONSE:

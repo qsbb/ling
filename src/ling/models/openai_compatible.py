@@ -388,6 +388,8 @@ def _encode_tool(tool: object) -> dict[str, Any]:
     required = schema.get("required")
     if required:
         encoded["required"] = list(required)
+    if schema.get("additionalProperties") is False:
+        encoded["additionalProperties"] = False
     function["parameters"] = encoded
     if getattr(tool, "strict", False):
         function["strict"] = True

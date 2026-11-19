@@ -26,15 +26,23 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.capabilities.tool_plugins import (
+    PluginManifestError,
+    load_tool_plugins,
+    parse_plugin_command,
+    register_tool_plugin,
+)
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
+    ToolOutcome,
     build_default_registry,
 )
 from ling.capabilities.web_search import (
     WEB_SEARCH_TOOL_ID,
     explicit_search_query,
+    has_explicit_search_command,
     register_web_search,
 )
 from ling.contracts.v1 import (
@@ -47,7 +55,7 @@ from ling.contracts.v1 import (
     TurnState,
     new_id,
 )
-from ling.domains.awareness.service import IsolationMode
+from ling.domains.awareness.service import AwarenessService, IsolationMode
 from ling.domains.conversation.recall import (
     finalize_recall_text,
     parse_recall_markers,
@@ -1169,35 +1177,30 @@ class TurnCoordinator:
                 #
                 # 位置刻意在权限硬门与停止检查**之后**：被拦下/被停止的轮次
                 # 根本没有调用模型，也就不该留下"她看到过这段"的记录。
-                await self._capture_prompt_snapshot(
-                    window_id=window_id,
-                    turn_id=turn_id,
-                    compiled=compiled,
-                    messages=messages,
-                    config=config,
-                    profile=profile,
-                    attempt=attempt,
-                )
-
-                # ---- 本轮的工具状态（原生工具调用）----
-                #
-                # 只建状态，**不做任何 I/O**：生产开关默认关闭时
-                # `tool_ledger.enabled` 一定是 False，下面的主循环与改动前
-                # 逐字节一致（只在收尾处多一次恒真判断）。
-                #
-                # 三条判据（开关 / 能力闸 / 开放清单）为什么都在这里而不是
-                # 路由器里，见 `_tool_ledger_for_turn`。
+                # 先判定工具。明确指令若被拦截，本轮只回本地说明，不调用模型，
+                # 因而也不应该留下「模型看过的提示词」。
                 tool_rounds = _ToolRounds()
                 tool_ledger = self._tool_ledger_for_turn(
                     config=config,
                     profile=profile,
                     window_id=window_id,
                     user_text=user_text,
+                    attempt=attempt,
                     audience=(
                         compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
                     ),
                 )
                 tool_ledger.turn_id = turn_id
+                if not tool_ledger.explicit_guidance:
+                    await self._capture_prompt_snapshot(
+                        window_id=window_id,
+                        turn_id=turn_id,
+                        compiled=compiled,
+                        messages=messages,
+                        config=config,
+                        profile=profile,
+                        attempt=attempt,
+                    )
 
                 # 一旦本流的**已生成原文**里出现过观看标记（完整的或半截的），
                 # 其后的正文就先不外发——它可能依赖"到底看到了什么"，而视频
@@ -2988,6 +2991,7 @@ class TurnCoordinator:
         audience: AudienceSnapshot | None = None,
         window_id: str | None = None,
         user_text: str = "",
+        attempt: int = 1,
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -2996,7 +3000,7 @@ class TurnCoordinator:
         ## 能力闸是**两道**，缺一不可
 
         1. ``kind_may_have_native_tools``：协议 + 本仓库适配器有没有工具编解码。
-           Responses / Anthropic 的适配器**未实现**，所以在这里就出局。
+           不支持当前工具回路的适配器在这里出局。
         2. ``router.native_tools_support``：**这一轮的这个实例**有没有声明支持。
            同一个 ``openai_compatible`` 下，有的端点认 ``tools``，有的把字段
            丢掉还返回 200——后者只有实例自己能说清楚。
@@ -3010,23 +3014,47 @@ class TurnCoordinator:
 
         """
         model_id, kind = self._resolved_tool_target(config, profile)
+        explicit_search = explicit_search_query(user_text)
+        first_word = user_text.strip().split(maxsplit=1)[:1]
+        plugin_requested = first_word == ["/plugin"]
+        search_requested = explicit_search is not None or has_explicit_search_command(user_text)
+        explicit_request = plugin_requested or search_requested
+
+        def unavailable(reason: str, guidance: str = "") -> _ToolLedger:
+            return _ToolLedger(
+                availability=ToolAvailability(
+                    enabled=False, reason=reason, provider_kind=kind, model_id=model_id
+                ),
+                explicit_guidance=guidance if explicit_request else "",
+            )
+
         enabled = self._tool_calls_enabled
         registry = self._tool_registry
         if enabled is None:
             enabled = config.dialogue.tools_enabled
         if not enabled:
-            return _ToolLedger(
-                availability=ToolAvailability(
-                    enabled=False, reason="switch_off", provider_kind=kind, model_id=model_id
-                )
+            return unavailable("switch_off", "工具调用没开启。请在「人设 → 对话」开启工具调用并发布配置。")
+        if explicit_request and (
+            audience is None or audience.is_group or audience.mode is IsolationMode.sealed
+        ):
+            return unavailable("external_tool_scope", "外部工具只在非密封的私聊中使用，这次没有发送内容。")
+        if explicit_request and attempt > 1:
+            return unavailable("external_tool_retry", "重试不会重复调用外部工具。如需再查，请发送一条新指令。")
+        if registry is None and self._tool_calls_enabled is not None:
+            return unavailable("no_registry", "当前没有可用的工具注册表，操作未执行。")
+        if not profile_supports_native_tools(profile):
+            return unavailable("profile_not_wired", "当前对话职责不支持工具调用，操作未执行。")
+        if not kind_may_have_native_tools(kind):
+            return unavailable(
+                "kind_has_no_native_tools", "当前对话模型的接入协议不支持工具调用，操作未执行。"
             )
+        if not self._router.native_tools_support(config, profile):
+            return unavailable(
+                "instance_has_no_native_tools",
+                "当前对话模型没启用原生工具。请确认模型支持工具后，在供应商设置中启用并发布。",
+            )
+        explicit_tool_id = ""
         if registry is None:
-            if self._tool_calls_enabled is not None:
-                return _ToolLedger(
-                    availability=ToolAvailability(
-                        enabled=False, reason="no_registry", provider_kind=kind, model_id=model_id
-                    )
-                )
             media_callback = self._watch_video
             if media_callback is None and window_id:
                 video_binding = config.resolve_profile(VIDEO_PROFILE)
@@ -3037,46 +3065,36 @@ class TurnCoordinator:
                 media_window_id=window_id,
                 watch_video=media_callback,
             )
-            if (
-                self._settings is not None
-                and self._settings.brave_search_api_key
-                and audience is not None
-                and audience.mode is not IsolationMode.sealed
-                and not audience.is_group
-                and (query := explicit_search_query(user_text)) is not None
-            ):
-                register_web_search(registry, key=self._settings.brave_search_api_key, query=query)
-        if not profile_supports_native_tools(profile):
-            return _ToolLedger(
-                availability=ToolAvailability(
-                    enabled=False,
-                    reason="profile_not_wired",
-                    provider_kind=kind,
-                    model_id=model_id,
-                )
-            )
-        if not kind_may_have_native_tools(kind):
-            return _ToolLedger(
-                availability=ToolAvailability(
-                    enabled=False,
-                    reason="kind_has_no_native_tools",
-                    provider_kind=kind,
-                    model_id=model_id,
-                )
-            )
-        if not self._router.native_tools_support(config, profile):
-            return _ToolLedger(
-                availability=ToolAvailability(
-                    enabled=False,
-                    reason="instance_has_no_native_tools",
-                    provider_kind=kind,
-                    model_id=model_id,
-                )
-            )
+            if search_requested:
+                if explicit_search is None:
+                    return unavailable("missing_query", "用法：/search 关键词（最多 240 字，单行）。")
+                if self._settings is None or not self._settings.brave_search_api_key:
+                    return unavailable("search_not_configured", "网页搜索未配置 Brave Search 密钥，这次没有联网。")
+                register_web_search(registry, key=self._settings.brave_search_api_key, query=explicit_search)
+                explicit_tool_id = WEB_SEARCH_TOOL_ID
+            elif plugin_requested:
+                command = parse_plugin_command(user_text)
+                if command is None:
+                    return unavailable("invalid_plugin_command", "用法：/plugin 插件ID 输入（最多 400 字）。")
+                try:
+                    plugins = load_tool_plugins(self._settings.data_dir) if self._settings else ()
+                except PluginManifestError:
+                    return unavailable("invalid_plugin_manifest", "插件清单无法读取，请检查部署配置。")
+                plugin_id, text = command
+                plugin = next((p for p in plugins if p.enabled and p.id == plugin_id), None)
+                if plugin is None:
+                    return unavailable("plugin_not_enabled", "找不到这个已启用的插件，操作未执行。")
+                register_tool_plugin(registry, plugin, text=text)
+                explicit_tool_id = plugin.tool_id
+        elif explicit_request:
+            return unavailable("no_explicit_tool", "当前没有开放此工具，操作未执行。")
         definitions = tuple(
             _definition_from_spec(spec)
             for spec in registry.list_model_tools()
-            if spec.tool_id in self._tool_allowlist
+            if (
+                spec.tool_id == explicit_tool_id if explicit_tool_id
+                else spec.tool_id in self._tool_allowlist
+            )
         )
         if not definitions:
             return _ToolLedger(
@@ -3089,6 +3107,8 @@ class TurnCoordinator:
             )
         return _ToolLedger(
             registry=registry,
+            explicit_tool_id=explicit_tool_id,
+            external_subject_id=audience.subject_id if explicit_tool_id and audience else "",
             availability=ToolAvailability(
                 enabled=True,
                 tools=definitions,
@@ -3182,6 +3202,11 @@ class TurnCoordinator:
         """
         delivered = ""
         target_label: str | None = None
+
+        if ledger.explicit_guidance:
+            state.delivered = ledger.explicit_guidance
+            await on_visible(state.delivered)
+            return
 
         if not ledger.enabled:
             # 普通轮次：一次调用，逐帧外发。**不**经过工具装配器，
@@ -3277,7 +3302,11 @@ class TurnCoordinator:
                     tools=definitions,
                     # 批次用满后必须**不再提调用**：预算没了就该说实话，
                     # 而不是再提出一批永远得不到执行的调用。
-                    tool_choice="none" if rounds.batches >= MAX_TOOL_BATCHES else "auto",
+                    tool_choice=(
+                        ("required" if rounds.batches == 0 else "none")
+                        if ledger.explicit_tool_id
+                        else "none" if rounds.batches >= MAX_TOOL_BATCHES else "auto"
+                    ),
                     # 本期不主动开并行：各家支持度不同，而"结果按提出顺序
                     # 回灌"已经能容纳乱序完成。留给供应商默认。
                     parallel_tool_calls=None,
@@ -3304,6 +3333,10 @@ class TurnCoordinator:
                     return
                 proposals = calls.proposed()
                 if not proposals:
+                    if ledger.explicit_tool_id and not rounds.batches:
+                        state.delivered = "对话模型没有执行工具，这次操作未完成。请检查模型的工具调用支持。"
+                        await on_visible(state.delivered)
+                        return
                     if tool_finish:
                         raise ModelError(
                             ModelErrorKind.error,
@@ -3319,7 +3352,7 @@ class TurnCoordinator:
                     state.delivered = delivered
                     state.target_label = target_label
                     return
-                if rounds.batches >= MAX_TOOL_BATCHES:
+                if rounds.batches >= (1 if ledger.explicit_tool_id else MAX_TOOL_BATCHES):
                     raise ModelError(
                         ModelErrorKind.error,
                         "工具调用已达批次上限，模型没有给出最终回答",
@@ -3348,6 +3381,21 @@ class TurnCoordinator:
                     raise ModelError(
                         ModelErrorKind.error, "模型未提供可配对的工具调用 ID", retriable=False
                     )
+                if ledger.explicit_tool_id and not any(
+                    run["outcome"] == ToolOutcome.succeeded.value for run in ledger.executed
+                ):
+                    # 不把模型提供的参数名、外部响应或异常内容变成带动作语义的回复原文。
+                    if any(item["code"] == "external_tool_scope" for item in ledger.rejected):
+                        failure = "会话已切换为密封模式，或暂时无法核对权限，没有发送内容。"
+                    elif ledger.rejected:
+                        failure = "模型没有提供这一轮开放工具的有效调用。"
+                    elif ledger.explicit_tool_id == WEB_SEARCH_TOOL_ID:
+                        failure = "搜索服务调用失败，请检查 Brave Search 密钥、额度或网络。"
+                    else:
+                        failure = "插件调用失败，请检查插件服务是否可用、是否按约定返回结果。"
+                    state.delivered = f"这次没有完成工具操作：{failure}"
+                    await on_visible(state.delivered)
+                    return
                 request_messages = [*request_messages, *tail]
                 pending_results = tail[1:]
         except ModelError as exc:
@@ -3438,7 +3486,12 @@ class TurnCoordinator:
                 continue
             registry = ledger.registry
             spec = registry.spec(call.name) if registry else None
-            if spec is None or not spec.model_callable or call.name not in self._tool_allowlist:
+            allowed = (
+                call.name == ledger.explicit_tool_id and len(accepted_calls) == 1
+                if ledger.explicit_tool_id
+                else call.name in self._tool_allowlist
+            )
+            if spec is None or not spec.model_callable or not allowed:
                 _reject("tool_not_available", "这一轮没有开放这个工具，未执行")
                 continue
             try:
@@ -3450,6 +3503,16 @@ class TurnCoordinator:
             if schema_problem:
                 _reject("invalid_arguments", schema_problem, outcome="failed")
                 continue
+            if ledger.explicit_tool_id:
+                try:
+                    async with session_scope() as current:
+                        policy = await AwarenessService(current).policy(ledger.external_subject_id)
+                    allowed = policy.mode is not IsolationMode.sealed
+                except Exception:  # noqa: BLE001 - cannot verify privacy, do not make the request
+                    allowed = False
+                if not allowed:
+                    _reject("external_tool_scope", "无法确认非密封私聊权限，没有发送内容")
+                    continue
             if getattr(token, "stopped", False):
                 _reject("stopped", "这一轮被停止了，未执行")
                 continue
@@ -3702,6 +3765,8 @@ def validate_tool_arguments(schema: dict[str, Any], args: dict[str, Any]) -> str
             return f"缺少必填参数: {', '.join(missing)}"
     properties = schema.get("properties")
     if isinstance(properties, dict):
+        if schema.get("additionalProperties") is False and args.keys() - properties.keys():
+            return "工具不接受声明之外的参数"
         for name, spec in properties.items():
             if name not in args or not isinstance(spec, dict):
                 continue
@@ -3870,6 +3935,9 @@ class _ToolLedger:
     turn_id: str = ""
     availability: ToolAvailability | None = None
     registry: ToolRegistry | None = None
+    explicit_tool_id: str = ""
+    explicit_guidance: str = ""
+    external_subject_id: str = ""
     executed: list[dict[str, str]] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
     forwarded: list[PromptToolResult] = field(default_factory=list)

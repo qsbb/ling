@@ -303,6 +303,27 @@ async function checkedWillingness(page: Page): Promise<string | null> {
 /* ------------------------------------------------------------ 用例 */
 
 describe('对话工具设置', () => {
+  it('展开时读取真实生效状态，并区分模型声明和插件启停', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page } = await openDialogue();
+    let requests = 0;
+    await page.route('**/v1/settings/tool-status', (route) => {
+      requests += 1;
+      return route.fulfill(json({
+        tools_enabled: false, search_configured: false, manifest_valid: true,
+        profiles: { 'dialogue.fast': 'ready', 'dialogue.deep': 'instance_not_enabled' },
+        plugins: [{ id: 'catalog', name: '目录', enabled: true }, { id: 'old', name: '旧插件', enabled: false }],
+      }));
+    });
+    await page.getByText('工具状态与自定义插件', { exact: true }).click();
+    await page.getByText('/plugin catalog 输入', { exact: true }).waitFor();
+    expect(requests).toBe(1);
+    expect(await page.getByText('已发布的对话工具开关：关闭', { exact: true }).isVisible()).toBe(true);
+    expect(await page.getByText('快速对话：已声明支持', { exact: true }).isVisible()).toBe(true);
+    expect(await page.getByText('深入对话：未启用原生工具', { exact: true }).isVisible()).toBe(true);
+    expect(await page.getByText('旧插件：已停用', { exact: true }).isVisible()).toBe(true);
+  }, TIMEOUT);
+
   it('旧配置默认关闭，开启后随对话策略保存', async (ctx) => {
     if (skip(ctx)) return;
     const { page, drafts } = await openDialogue();

@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from ling import worker
-from ling.capabilities import web_search
+from ling.capabilities import tool_plugins, web_search
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
@@ -34,7 +34,7 @@ from ling.infra.db import get_session_factory, session_scope
 from ling.infra.models import KnowledgeItem, PromptSnapshot, ProviderTokenUsage
 from ling.kernel import turn as turn_module
 from ling.kernel.turn import MAX_TOOL_CALLS_PER_BATCH, MAX_TOOL_CALLS_PER_TURN
-from ling.models import openai_compatible
+from ling.models import anthropic, chat_responses, openai_compatible
 from ling.models.quota import TokenQuotaStore
 from ling.models.registry import ProviderRegistry
 from ling.models.router import ModelRouter, StreamOutcome
@@ -74,6 +74,7 @@ class _ToolEndpoint:
         self.script: list[tuple[dict | list[dict], str]] = []
         self.fail_request: int | None = None
         self.pause_continuation: asyncio.Event | None = None
+        self.pause_proposal: tuple[asyncio.Event, asyncio.Event] | None = None
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -104,7 +105,10 @@ class _ToolEndpoint:
             "arguments": json.dumps(self.arguments),
         }
         call = {"index": 0, "id": CALL_ID, "type": "function", "function": function}
-        return _model_response({"tool_calls": [call]}, "tool_calls")
+        proposed = _model_response({"tool_calls": [call]}, "tool_calls")
+        if len(self.requests) == 1 and self.pause_proposal is not None:
+            return httpx.Response(200, stream=_GatedModelStream(proposed.content, *self.pause_proposal))
+        return proposed
 
 
 class _PausedModelStream(httpx.AsyncByteStream):
@@ -115,6 +119,18 @@ class _PausedModelStream(httpx.AsyncByteStream):
         yield b'data: {"choices":[{"delta":{"content":"candidate"}}]}\n\n'
         self.paused.set()
         await asyncio.Event().wait()
+
+
+class _GatedModelStream(httpx.AsyncByteStream):
+    def __init__(self, data: bytes, started: asyncio.Event, release: asyncio.Event) -> None:
+        self.data = data
+        self.started = started
+        self.release = release
+
+    async def __aiter__(self):
+        self.started.set()
+        await self.release.wait()
+        yield self.data
 
 
 @pytest.fixture
@@ -219,7 +235,8 @@ def _tool_payload(
     first, second = endpoint.requests
     tools = {item["function"]["name"]: item["function"] for item in first["tools"]}
     assert tuple(tools) == available
-    assert tools["clock_now"]["parameters"]["properties"]["tz"]["type"] == "string"
+    if "clock_now" in tools:
+        assert tools["clock_now"]["parameters"]["properties"]["tz"]["type"] == "string"
     if "knowledge_search" in tools:
         schema = tools["knowledge_search"]["parameters"]
         assert schema["required"] == ["query"]
@@ -241,7 +258,7 @@ def _tool_payload(
         "knowledge_search": KNOWLEDGE_SEARCH_TOOL_ID,
         "media_watch_video": MEDIA_WATCH_VIDEO_TOOL_ID,
         "web_search": web_search.WEB_SEARCH_TOOL_ID,
-    }[endpoint.tool_name]
+    }.get(endpoint.tool_name, endpoint.tool_name)
     assert payload["provider_call_id"] == CALL_ID
     return payload
 
@@ -419,7 +436,8 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     reply = await _web_reply(logged_in, text="搜索：公开资料")
     if not allowed:
         assert requests == []
-        assert "web_search" not in {item["function"]["name"] for item in endpoint.requests[0]["tools"]}
+        assert endpoint.requests == []
+        assert "非密封" in reply
         return
 
     request, = requests
@@ -427,10 +445,193 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     assert dict(request.url.params) == {"q": "公开资料", "count": "3"}
     assert request.headers["X-Subscription-Token"] == key
     assert key not in json.dumps(endpoint.requests)
-    payload = _tool_payload(endpoint, available=("clock_now", "knowledge_search", "web_search"))
+    payload = _tool_payload(endpoint, available=("web_search",))
+    assert [request["tool_choice"] for request in endpoint.requests] == ["required", "none"]
     assert payload["content_trust"] == "data_not_instructions"
     assert payload["untrusted"] is True
     assert "https://library.example.test/catalog" in reply
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["switch-off", "provider-ignored-tools"])
+async def test_explicit_search_never_claims_it_ran_without_a_call(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, enabled: bool,
+) -> None:
+    logged_in.app.state.settings = replace(
+        logged_in.app.state.settings, brave_search_api_key="fixture-search-key",
+    )
+    await _bind_model(logged_in, enabled=enabled)
+    endpoint.script = [({"content": "我已经查到了（其实没有调用）。"}, "stop")]
+    reply = await _web_reply(logged_in, text="/search 公开资料")
+    if enabled:
+        request, = endpoint.requests
+        assert request["tool_choice"] == "required"
+        assert "没有执行工具" in reply
+    else:
+        assert endpoint.requests == []
+        assert "工具调用没开启" in reply
+    assert "我已经查到了" not in reply
+
+
+@pytest.mark.parametrize("text", ["/search：", "/search:" + "长" * 241])
+async def test_invalid_slash_search_gets_usage_not_model_guess(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, text: str,
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    assert "用法：/search" in await _web_reply(logged_in, text=text)
+    assert endpoint.requests == []
+
+
+@pytest.mark.parametrize("kind", ["chat_responses", "anthropic"])
+async def test_native_web_tool_roundtrip_preserves_provider_private_replay(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    opaque = "opaque-provider-fixture"
+    call = {"type": "function_call", "id": "fc_fixture", "call_id": CALL_ID,
+            "name": "clock_now", "arguments": "{}", "status": "completed"}
+    reason = {"type": "reasoning", "id": "rs_fixture", "summary": [], "encrypted_content": opaque}
+    thinking = {"type": "thinking", "thinking": "internal", "signature": opaque}
+    if kind == "chat_responses":
+        adapter = chat_responses
+        initial = [{"type": "response.completed", "response": {"output": [reason, call]}}]
+        completed = [
+            {"type": "response.output_text.delta", "delta": "已读取当前时间"},
+            {"type": "response.completed", "response": {"output": []}},
+        ]
+    else:
+        adapter = anthropic
+        initial = [
+            {"type": "content_block_start", "index": 0, "content_block": thinking},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {
+                "type": "tool_use", "id": CALL_ID, "name": "clock_now", "input": {},
+            }},
+            {"type": "content_block_stop", "index": 1},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+            {"type": "message_stop"},
+        ]
+        completed = [
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "text_delta", "text": "已读取当前时间",
+            }},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+    requests: list[dict] = []
+
+    def model(request: httpx.Request) -> httpx.Response:
+        events = (initial, completed)[len(requests)]
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            text="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+        )
+
+    client = partial(httpx.AsyncClient, transport=httpx.MockTransport(model))
+    monkeypatch.setattr(adapter, "httpx", SimpleNamespace(**(vars(httpx) | {"AsyncClient": client})))
+    logged_in.app.state.router = ModelRouter(ProviderRegistry(lambda _: "fixture-key"))
+    await _bind_model(logged_in, enabled=True, kind=kind)
+    events = await _web_turn(logged_in, text="现在几点了？")
+    assert _reply_text(events) == "已读取当前时间"
+    assert opaque not in json.dumps(events)
+    first, second = requests
+    if kind == "chat_responses":
+        assert "clock_now" in {tool["name"] for tool in first["tools"]}
+        assert reason in second["input"]
+        output, = [item for item in second["input"] if item.get("type") == "function_call_output"]
+        assert output["call_id"] == CALL_ID
+        result = json.loads(output["output"])
+    else:
+        assert "clock_now" in {tool["name"] for tool in first["tools"]}
+        assert thinking in second["messages"][-2]["content"]
+        output, = second["messages"][-1]["content"]
+        assert output["tool_use_id"] == CALL_ID
+        result = json.loads(output["content"])
+    assert result["tool_id"] == CLOCK_NOW_TOOL_ID and result["outcome"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    "scenario", [
+        "private", "sealed", "sealed-during-model", "model-argument", "wrong-tool",
+        "disabled", "ordinary", "retry",
+    ],
+)
+async def test_operator_http_plugin_requires_explicit_private_command(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch, scenario: str,
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    plugin_url = "https://plugin.example.test/v1/call"
+    manifest = logged_in.settings.data_dir / tool_plugins.MANIFEST_NAME
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({
+        "schema_version": "v1",
+        "plugins": [{"id": "catalog", "name": "查目录", "endpoint": plugin_url, "enabled": scenario != "disabled"}],
+    }))
+    status = await logged_in.client.get("/v1/settings/tool-status")
+    assert status.status_code == 200, status.text
+    assert status.json()["plugins"] == [
+        {"id": "catalog", "name": "查目录", "enabled": scenario != "disabled"},
+    ]
+    assert plugin_url not in status.text
+    assert status.json()["profiles"]["dialogue.fast"] == "ready"
+    http_requests: list[httpx.Request] = []
+
+    def plugin(request: httpx.Request) -> httpx.Response:
+        http_requests.append(request)
+        return httpx.Response(200, json={"schema_version": "v1", "result": "找到目录记录"})
+
+    client = partial(httpx.AsyncClient, transport=httpx.MockTransport(plugin))
+    monkeypatch.setattr(tool_plugins, "httpx", SimpleNamespace(**(vars(httpx) | {"AsyncClient": client})))
+    endpoint.tool_name = "clock_now" if scenario == "wrong-tool" else "plugin_catalog"
+    endpoint.arguments = {"text": "模型私加的输入"} if scenario == "model-argument" else {}
+    if scenario == "sealed":
+        changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
+        assert changed.status_code == 200
+    text = "试试目录插件" if scenario == "ordinary" else "/plugin catalog 只发送这段"
+    if scenario == "sealed-during-model":
+        started, release = asyncio.Event(), asyncio.Event()
+        endpoint.pause_proposal = started, release
+        task = asyncio.create_task(_web_reply(logged_in, text=text))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
+            assert changed.status_code == 200
+        finally:
+            release.set()
+            reply = await asyncio.wait_for(task, timeout=5)
+        assert http_requests == []
+        assert "没有发送内容" in reply
+        return
+    if scenario == "retry":
+        endpoint.fail_request = 2
+        events = await _web_turn(logged_in, text=text)
+        failed, = [data for name, data in events if name == "turn.failed"]
+        assert len(http_requests) == 1
+        response = await logged_in.client.post(f"/v1/turns/{failed['turn_id']}/retry")
+        assert response.status_code == 200, response.text
+        assert "请发送一条新指令" in _reply_text(await read_sse(response))
+        assert len(http_requests) == 1 and len(endpoint.requests) == 2
+        return
+    reply = await _web_reply(logged_in, text=text)
+    if scenario != "private":
+        assert http_requests == []
+        if scenario == "ordinary":
+            assert all(
+                item["function"]["name"] != "plugin_catalog" for item in endpoint.requests[0]["tools"]
+            )
+        elif scenario in {"sealed", "disabled"}:
+            assert endpoint.requests == []
+        elif scenario in {"wrong-tool", "model-argument"}:
+            assert "没有完成工具操作" in reply
+        return
+
+    request, = http_requests
+    assert str(request.url) == plugin_url
+    assert json.loads(request.content) == {"schema_version": "v1", "text": "只发送这段"}
+    assert plugin_url not in json.dumps(endpoint.requests)
+    payload = _tool_payload(endpoint, available=("plugin_catalog",))
+    assert payload["content_trust"] == "data_not_instructions"
+    assert [request["tool_choice"] for request in endpoint.requests] == ["required", "none"]
+    assert "找到目录记录" in reply
 
 
 async def test_web_knowledge_search_returns_current_scoped_results(
