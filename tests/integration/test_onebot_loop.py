@@ -363,6 +363,30 @@ async def test_group_mention_uses_event_self_id_and_stores_card(logged_in: TestE
     assert {"@小溪你好", "@小溪", "@10001你好"} <= texts
 
 
+async def test_group_mention_keeps_rendered_name_when_member_lookup_has_no_name(
+    logged_in: TestEnv, caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeOneBot()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fake.handler)) as client:
+        logged_in.app.state.onebot_connector = OneBotV11Connector(replace(CFG, self_id=None), http=client)
+        await _bind(logged_in)
+        event = {"message_type": "group", "group_id": int(GROUP), "sub_type": "normal"}
+        with caplog.at_level("INFO", logger="ling.behavior"):
+            reply = await _post(logged_in, _event_body(
+                **event, message="@x你好", raw_message="[CQ:at,qq=10001]你好",
+            ))
+        assert reply.json()["delivered"] is True, reply.text
+        assert any("说：「@x你好」" in record.getMessage() for record in caplog.records)
+        plain = await _post(logged_in, _event_body(
+            **event, message_id=778, message="@x你好", raw_message="@x你好",
+        ))
+        assert plain.json()["decision"] == "deferred_attention", plain.text
+
+    async with session_scope() as session:
+        texts = (await session.scalars(select(Message.text).where(Message.role == "user"))).all()
+    assert texts.count("@x你好") == 2
+
+
 # ------------------------------------------------------------------ 失败重投（此前实现的可靠性缺陷）
 
 

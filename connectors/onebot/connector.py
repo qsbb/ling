@@ -1297,7 +1297,7 @@ class OneBotV11Connector(ChannelConnector):
             # 于是空正文的 @ 直接被契约校验拒掉，连 bridge 都到不了——
             # 用户看到的是"@ 了她却毫无反应"。
             parts=[InputPart(modality=Modality.text, text=parsed.text), *parsed.parts],
-            display_text=parsed.display_text if parsed.mentions_self else None,
+            display_text=parsed.display_text if parsed.mention_ids else None,
             reply_to=parsed.reply_to_message_id,
             media_refs=parsed.media_refs,
             mentions_actor=parsed.mentions_self,
@@ -1310,8 +1310,13 @@ class OneBotV11Connector(ChannelConnector):
         raw = payload.get("raw_message")
         if isinstance(raw, str) and not (isinstance(message, list) and message):
             raw_parsed = parse_message(raw, self_id=self_id)
-            if (not parsed.text.strip() and not parsed.mention_ids and not parsed.media_refs
-                    or (not parsed.mention_ids and raw_parsed.mention_ids)):
+            if not parsed.mention_ids and raw_parsed.mention_ids:
+                # CQ 提供账号和正文；平台渲染过的 message 可能已经带名字。
+                # 它只用于显示，不能改变点名身份或喂给模型的正文。
+                if parsed.display_text.strip() and not parsed.media_refs:
+                    raw_parsed.display_text = parsed.display_text
+                return raw, raw_parsed
+            if not parsed.text.strip() and not parsed.mention_ids and not parsed.media_refs:
                 return raw, raw_parsed
         return message, parsed
 
