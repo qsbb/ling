@@ -2258,29 +2258,31 @@ def test_ws_server_token_is_enforced() -> None:
     assert not server._authorized(missing.path, missing.headers)
 
 
-async def test_ws_server_without_token_rejects_and_refuses_to_start() -> None:
-    """没配 token → 一律拒绝，且 `start()` **直接抛错、不监听**。
-
-    ## 为什么改掉了旧断言
-
-    旧断言是 `server._authorized("/", {})` 为 True，理由是"没配 token 时不校验，
-    但会打一条 warning 让'谁都能连'看得见"。warning 是日志，不是门：这个端口
-    一旦开起来，推来的事件会直接进对话链路（白名单、身份、决策、投递），
-    没 token 就等于把"以某个白名单 QQ 号说话"的能力交给任何能连上端口的人。
-    改成 fail-closed：连启动都不允许，这样配置错误在部署时就暴露，
-    而不是安静跑到被冒充之后才发现。
-    """
-    from connectors.onebot.ws_server import OneBotWsAuthError, OneBotWsServer
+@pytest.mark.parametrize("token,source_ips", [(None, ""), (None, "127.0.0.1"), ("test-token", "")])
+async def test_ws_server_optional_auth_with_real_connection(token, source_ips) -> None:
+    import websockets
+    from connectors.onebot.ws_server import OneBotWsServer
 
     server = OneBotWsServer(
-        host="127.0.0.1", port=1, app=object(), connector=object(), token=None
+        host="127.0.0.1", port=0, app=object(), connector=object(), token=token, source_ips=source_ips,
     )
-    assert not server._authorized("/", {})
-    assert not server._authorized("/?access_token=", {})
-    with pytest.raises(OneBotWsAuthError):
-        await server.start()
-    # 没有真的开始监听：`_server` 仍是 None，`stop()` 是空操作
-    assert server._server is None
+    assert not server._authorized("/", {}, peer="198.51.100.10")
+    assert server._authorized("/", {}, peer="172.20.0.5") is (not token and not source_ips)
+    await server.start()
+    try:
+        port = server._server.sockets[0].getsockname()[1]
+        url = f"ws://127.0.0.1:{port}"
+        if token:
+            async with websockets.connect(url) as ws:
+                with pytest.raises(websockets.exceptions.ConnectionClosedError) as denied:
+                    await ws.recv()
+                assert denied.value.rcvd.code == 1008
+        extra = {"Authorization": f"Bearer {token}"} if token else None
+        async with websockets.connect(url, additional_headers=extra) as ws:
+            await (await ws.ping())
+            assert server.clients == 1
+    finally:
+        await server.stop()
 
 
 async def test_ws_server_bad_frame_does_not_raise(logged_in: TestEnv) -> None:

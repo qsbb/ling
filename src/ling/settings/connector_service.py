@@ -233,8 +233,7 @@ def validate_full(scope: str, values: dict[str, Any]) -> None:
     """校验**合并后的完整有效配置**（不是只校验这次改的那几项）。
 
     为什么整体再校验一次：单个字段各自合法、合起来不成立的组合是存在的
-    （配了 WS 端口却没令牌 → 服务端 fail-closed 起不来；白名单模式没名单
-    → 收紧成"谁都不能说话"，而用户以为自己只是清了名单）。
+    （如白名单模式没有名单，会把所有正常消息也挡掉）。
     只校验增量的话，这些要到切换时才发现，代价是白停一次连接。
     """
     for spec in cf.fields_for(scope):
@@ -251,15 +250,6 @@ def validate_full(scope: str, values: dict[str, Any]) -> None:
         except cf.FieldError as exc:
             raise ConnectorServiceError("invalid_field", exc.reason, field_name=spec.key) from exc
 
-    if scope == cf.SCOPE_ONEBOT:
-        port = str(values.get("LING_ONEBOT_WS_PORT") or "").strip()
-        token = str(values.get("LING_ONEBOT_WS_TOKEN") or "").strip()
-        if port and not token:
-            raise ConnectorServiceError(
-                "invalid_config",
-                "配了 WS 端口就必须同时配 WS 令牌（没有令牌时服务端拒绝启动）",
-                field_name="LING_ONEBOT_WS_TOKEN",
-            )
     if scope == cf.SCOPE_ACCESS:
         mode = str(values.get("LING_ACCESS_MODE") or "off").strip()
         if mode == "whitelist" and not any(cf.normalize_list(values.get(key)) for key in (

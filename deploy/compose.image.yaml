@@ -75,6 +75,7 @@ x-app-env: &app-env
   LING_ONEBOT_API_BASE: ${LING_ONEBOT_API_BASE:-}
   LING_ONEBOT_ACCESS_TOKEN: ${LING_ONEBOT_ACCESS_TOKEN:-}
   LING_ONEBOT_SECRET: ${LING_ONEBOT_SECRET:-}
+  LING_ONEBOT_SOURCE_IPS: ${LING_ONEBOT_SOURCE_IPS:-}
   LING_ONEBOT_SELF_ID: ${LING_ONEBOT_SELF_ID:-}
   LING_ONEBOT_INSTANCE_ID: ${LING_ONEBOT_INSTANCE_ID:-onebot-default}
   LING_ONEBOT_SUPPORTS_GROUP: ${LING_ONEBOT_SUPPORTS_GROUP:-1}
@@ -83,9 +84,7 @@ x-app-env: &app-env
   # 于是设了也进不了容器：表现为"配了 WS 端口却永远没监听"，
   # 而且日志里没有任何异常。WS 默认不启用（LING_ONEBOT_WS_PORT 留空即可）。
   #
-  # LING_ONEBOT_WS_TOKEN **必填**（配了端口就必须同时配它）：没有 token 时
-  # WS 服务端会**拒绝启动**（fail-closed），端口一开就等于把"往对话链路推事件"
-  # 的能力交给任何能连上的人。
+  # Token 可选；留空只接受本机或内网直连，不要把免认证入口转发到公网。
   # LING_ONEBOT_WS_HOST 默认 127.0.0.1，只有显式改成 0.0.0.0 才对外。
   LING_ONEBOT_WS_PORT: ${LING_ONEBOT_WS_PORT:-}
   LING_ONEBOT_WS_TOKEN: ${LING_ONEBOT_WS_TOKEN:-}

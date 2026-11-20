@@ -1379,12 +1379,7 @@ export function ConnectorInstancePanel({
                   role="status"
                   data-testid="connector-instance-view-warning"
                 >
-                  <strong>这里的"当前值"不是这个实例的。</strong>
-                  按实例读取没有成功（实例刚被删除、服务端版本较旧，或者响应没有告诉我们它读的是
-                  哪个实例），所以下面显示的是默认实例（<code>{DEFAULT_INSTANCE_ID}</code>）已保存的
-                  值，<strong>只作参考，不代表这个实例现在的配置</strong>。
-                  <strong>保存会写进你选中的「{selected?.display_name}」（{selectedId}）</strong>，
-                  不影响默认实例。
+                  尚未读到「{selected?.display_name}」的配置，此时不能保存接入设置。
                 </div>
               ) : null}
 

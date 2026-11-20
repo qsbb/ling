@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+from connectors.inbound_access import source_allowed
 
 from ling.contracts.v1 import (
     CapabilityDescriptor,
@@ -1122,33 +1123,13 @@ class OneBotV11Connector(ChannelConnector):
 
     # ------------------------------------------------------------ 入站
 
-    async def verify_inbound(self, headers: dict[str, str], body: bytes) -> bool:
-        """校验上报来源。**没配 secret 就一律拒绝**（fail-closed）。
-
-        配了 secret 就必须验 HMAC-SHA1；配了 self_id 就要求
-        ``X-Self-ID`` 与之一致（防止别的实例误配到同一入口）。
-
-        ## 为什么没配 secret 时不再放行
-
-        原实现按 OneBot 规范允许"未加密上报"（只要求带 ``X-Self-ID``），
-        理由是"依赖网络隔离"。这个前提在默认部署下**不成立**：
-
-        - ``POST /v1/onebot/events`` 这条路由**没有任何 auth 依赖**
-          （见 ``src/ling/api/routes/onebot.py``），端口 6520 默认对外发布；
-        - ``deploy/env.example`` 里 ``LING_ONEBOT_SECRET=`` 默认为空；
-        - 正常使用必须配 ``LING_ACCESS_LIST``，而名单里就是 QQ 号。
-
-        于是任何能访问 6520 的人只要伪造 ``X-Self-ID`` 和
-        ``user_id=<白名单里的 QQ 号>``，就能以该用户身份对话、写记忆、
-        让她向真实好友发言。这是完整的账号接管，不是理论风险。
-
-        因此：secret 是这条入口的**必要条件**。没配 = 全部 403，
-        启动时另打一条 ERROR 日志说明怎么配（见 ``ling/app.py``）。
-        """
+    async def verify_inbound(
+        self, headers: dict[str, str], body: bytes, *, peer: str | None = None,
+    ) -> bool:
+        """本机和内网直连可免签；配置密钥时，即使是本机也必须验签。"""
         secret = self._config.secret
-        if not secret:
-            # 没有密钥就没有任何可信来源的判据。X-Self-ID 是请求方自己填的，
-            # 不构成凭据。
+        if not source_allowed(peer, headers, has_credential=bool(secret),
+                              allowed_ips=self._config.source_ips):
             return False
 
         normalized = {k.lower(): v for k, v in headers.items()}
@@ -1156,11 +1137,13 @@ class OneBotV11Connector(ChannelConnector):
         if self._config.self_id:
             if not self_id or str(self_id).strip() != str(self._config.self_id):
                 return False
-        elif not self_id:
+        elif secret and not self_id:
             return False
 
+        if not secret:
+            return True
         signature = normalized.get("x-signature") or ""
-        if not signature.startswith("sha1="):
+        if not signature.startswith("sha1=") or not signature.isascii():
             return False
         expected = hmac.new(
             secret.encode("utf-8"), body, hashlib.sha1

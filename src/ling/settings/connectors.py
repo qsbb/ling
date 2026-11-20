@@ -52,24 +52,20 @@ STATUS_CONNECTED = "connected"
 CONNECTOR_REASON_TEXT: dict[str, str] = {
     # --- OneBot ---
     "onebot_no_inbound_path": (
-        "没有任何入站通道：WS 端口、WS 地址、HTTP 上报密钥三项都没配"
+        "尚未配置 WebSocket；本机或内网也可直接使用 HTTP 上报。"
     ),
-    "onebot_ws_token_missing": (
-        "配了 WS 端口但没有 token：服务端会拒绝启动（端口一开，推来的事件"
-        "直接进对话链路，没 token 等于谁都能冒充）"
-    ),
-    "onebot_ws_server_client": "NapCat 已连入 WS 服务端",
-    "onebot_ws_client_connected": "ling 已连上 OneBot 的 WS 服务端",
+    "onebot_ws_server_client": "OneBot 已连入 Ling",
+    "onebot_ws_client_connected": "Ling 已连上 OneBot",
     "onebot_ws_server_not_started": (
         "端口已配置，但进程里没有 WS 服务端（改完 .env 没重启，或启动时失败）"
     ),
     "onebot_ws_client_not_started": (
         "WS 地址已配置，但进程里没有出站连接（改完 .env 没重启？）"
     ),
-    "onebot_ws_server_waiting": "WS 服务端在监听，但还没有客户端连入",
+    "onebot_ws_server_waiting": "Ling 正在监听，等待 OneBot 连入。",
     "onebot_ws_client_disconnected": "出站 WS 连接已启动，但当前是断的",
     "onebot_http_only": (
-        "只配了 HTTP 上报：这条路径没有持久连接，「收到才算通」在这里看不到"
+        "HTTP 不保持连接，不能从这里判断是否收到消息。"
     ),
     # --- QQ 官方机器人 ---
     "qqbot_credentials_missing": "凭据不全（需要 APP_ID 与 CLIENT_SECRET 两项）",
@@ -88,7 +84,6 @@ CONNECTOR_REASON_TEXT: dict[str, str] = {
 _ENV_HINT = "宿主部署目录的 `.env`"
 
 # 两个渠道的**必需**凭据（只有这些参与 configured 判定）。
-_ONEBOT_REQUIRED = ("LING_ONEBOT_WS_TOKEN",)
 _QQBOT_REQUIRED = ("LING_QQBOT_APP_ID", "LING_QQBOT_CLIENT_SECRET")
 
 
@@ -153,7 +148,7 @@ def _onebot_fields(settings: Any, onebot: Any) -> tuple[ConnectorField, ...]:
         ),
         _secret(
             "LING_ONEBOT_WS_TOKEN",
-            "WS 服务端令牌（与 NapCat 侧 wsClient 的 token 逐字符一致）",
+            "反向 WebSocket Token（可选）",
             bool(settings.onebot_ws_token),
         ),
         # 反向 WS 地址可能内嵌 `?access_token=...`，所以按密钥处理、不回显。
@@ -234,34 +229,22 @@ def _join_names(names: list[str]) -> str:
     return " 与 ".join(f"`{name}`" for name in names)
 
 
-def _onebot_guidance(
-    status: str, reason: str, fields: tuple[ConnectorField, ...]
-) -> str:
+def _onebot_guidance(status: str, reason: str, *, received: int | None) -> str:
     if status == STATUS_CONNECTED:
+        if received == 0:
+            return "已建立连接，尚未收到事件。请发一条测试消息确认收发。"
         return "已连接，没有需要改的。"
-    if reason == "onebot_ws_token_missing":
-        return (
-            f"在{_ENV_HINT} 里补上 {_join_names(_missing(fields, _ONEBOT_REQUIRED))}"
-            "（与 NapCat 侧 wsClient 的 token 逐字符一致）：没有 token 时 WS 服务端"
-            "拒绝启动。改完重启 api 服务。"
-        )
     if reason == "onebot_no_inbound_path":
-        return (
-            f"在{_ENV_HINT} 里任选一条入站路径：`LING_ONEBOT_WS_PORT` + "
-            "`LING_ONEBOT_WS_TOKEN`（NapCat 连进来，推荐）、`LING_ONEBOT_WS_URL`"
-            "（ling 连出去）、或 `LING_ONEBOT_SECRET`（HTTP 上报）。"
-            "改完重启 api 服务。"
-        )
+        return "在接入设置中选择与 OneBot 端一致的连接方向。"
     if reason == "onebot_ws_server_not_started":
         return (
             "端口已配但进程里没有 WS 服务端：多半是改完 `.env` 没重启 api 服务；"
-            "重启后仍然没有，就看启动日志——端口被占用、缺 token 都会让它起不来。"
+            "重启后仍然没有，请检查启动日志里的端口或监听地址错误。"
         )
     if reason == "onebot_ws_server_waiting":
         return (
-            "服务端已在监听，等 NapCat 连入：在 NapCat 侧把反向 WS 客户端指向 "
-            "`ws://<ling 地址>:<LING_ONEBOT_WS_PORT>` 并填同一个 token。"
-            "容器部署还要发布该端口（见 `deploy/compose.ws.example.yaml`）。"
+            "把 OneBot 的 WebSocket 客户端指向 `ws://<Ling 地址>:<对外端口>`。"
+            "跨容器连接请确认监听地址和端口映射；设置了 Token 时两边须一致。"
         )
     if reason == "onebot_ws_client_not_started":
         return (
@@ -274,9 +257,7 @@ def _onebot_guidance(
         )
     if reason == "onebot_http_only":
         return (
-            "只配了 HTTP 上报：它没有持久连接，收不到上报就是断的。在 NapCat 侧"
-            "确认 httpClients 指向 `/v1/onebot/events`，且 token 与 "
-            "`LING_ONEBOT_SECRET` 逐字符一致。"
+            "配置 HTTP 上报后发一条测试消息，在日志中检查是否收到。"
         )
     return f"在{_ENV_HINT} 里检查 `LING_ONEBOT_*`，改完重启 api 服务。"
 
@@ -321,19 +302,12 @@ def _runtime(connections: int | None, received: int | None) -> dict[str, int | N
 
 
 def _onebot_runtime(ws_server: Any, ws_client: Any) -> dict[str, int | None]:
-    # WS 服务端优先：它是推荐方向，且连接数就是 NapCat 的个数。
-    if ws_server is not None:
-        return _runtime(
-            int(getattr(ws_server, "clients", 0) or 0),
-            int(getattr(ws_server, "received", 0) or 0),
-        )
-    if ws_client is not None:
-        return _runtime(
-            1 if getattr(ws_client, "connected", False) else 0,
-            int(getattr(ws_client, "received", 0) or 0),
-        )
-    # 只配了 HTTP 上报：没有可观察的连接对象。
-    return _runtime(None, None)
+    if ws_server is None and ws_client is None:
+        return _runtime(None, None)
+    return _runtime(
+        int(getattr(ws_server, "clients", 0) or 0) + int(bool(getattr(ws_client, "connected", False))),
+        sum(int(getattr(ws, "received", 0) or 0) for ws in (ws_server, ws_client)),
+    )
 
 
 def _qqbot_runtime(gateway: Any) -> dict[str, int | None]:
@@ -356,26 +330,18 @@ def _onebot_view(settings: Any, onebot: Any, app_state: Any) -> dict[str, Any]:
     这是代码里唯一存在的"打开/关闭"，不另外发明一个。
     """
     ws_port = settings.onebot_ws_port
-    ws_token = bool(settings.onebot_ws_token)
     ws_url = settings.onebot_ws_url
-    http_secret = bool(onebot.secret)
 
-    # 三种入站模式各自"能不能起来"：WS 服务端要端口 + token（fail-closed），
-    # WS 客户端只要有地址，HTTP 上报只要密钥。
-    ws_server_ready = bool(ws_port and ws_token)
+    ws_server_ready = bool(ws_port)
     ws_client_ready = bool(ws_url)
-    http_ready = http_secret
-    configured = ws_server_ready or ws_client_ready or http_ready
-    enabled = bool(ws_port or ws_url or http_secret)
+    http_configured = bool(onebot.secret or getattr(onebot, "source_ips", ""))
+    configured = ws_server_ready or ws_client_ready or http_configured
 
     ws_server = getattr(app_state, "onebot_ws_server", None) if app_state is not None else None
     ws_client = getattr(app_state, "onebot_ws", None) if app_state is not None else None
 
     if not configured:
-        # 只配了端口没配 token 与"完全没配"要分开：前者是差一项，后者是没开始。
-        reason = (
-            "onebot_ws_token_missing" if (ws_port and not ws_token) else "onebot_no_inbound_path"
-        )
+        reason = "onebot_no_inbound_path"
         status = STATUS_NOT_CONFIGURED
     elif int(getattr(ws_server, "clients", 0) or 0) > 0:
         status, reason = STATUS_CONNECTED, "onebot_ws_server_client"
@@ -393,20 +359,21 @@ def _onebot_view(settings: Any, onebot: Any, app_state: Any) -> dict[str, Any]:
         status, reason = STATUS_DISCONNECTED, "onebot_http_only"
 
     fields = _onebot_fields(settings, onebot)
+    runtime = _onebot_runtime(ws_server, ws_client)
     return {
         "id": "onebot",
         "label": "OneBot（NapCat / Lagrange / go-cqhttp）",
         "configured": configured,
-        "enabled": enabled,
+        "enabled": configured,
         "status": status,
         "status_reason": reason,
         "status_message": CONNECTOR_REASON_TEXT.get(reason, CONNECTOR_REASON_TEXT["unknown"]),
-        "guidance": _onebot_guidance(status, reason, fields),
+        "guidance": _onebot_guidance(status, reason, received=runtime["received"]),
         # 只读：值在宿主 `.env` 里，本页不给编辑入口。
         "editable": False,
         "storage": "env",
         "fields": [f.to_dict() for f in fields],
-        "runtime": _onebot_runtime(ws_server, ws_client),
+        "runtime": runtime,
     }
 
 

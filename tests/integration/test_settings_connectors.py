@@ -173,9 +173,10 @@ async def test_shape_and_reason_codes(logged_in) -> None:
         # 状态码必须在码表里，文案来自码表（前端不另维护一份翻译）。
         assert channel["status_reason"] in CONNECTOR_REASON_TEXT
         assert channel["status_message"] == CONNECTOR_REASON_TEXT[channel["status_reason"]]
-        # 每个渠道都要有一句"怎么改"，且点名真实的环境变量。
+        # 每个渠道给出下一步；只有依赖平台凭据时才点名环境变量。
         assert channel["guidance"]
-        assert "LING_" in channel["guidance"]
+        if channel["id"] == "qqbot":
+            assert "LING_QQBOT_" in channel["guidance"]
         for field in channel["fields"]:
             # `key` 是 v2 契约名；`name`/`set` 是兼容别名（旧前端读它们）。
             assert set(field) >= {
@@ -214,7 +215,7 @@ async def test_onebot_not_configured(logged_in) -> None:
     assert channel["enabled"] is False
     assert channel["status"] == "not_configured"
     assert channel["status_reason"] == "onebot_no_inbound_path"
-    assert "没有任何入站通道" in channel["status_message"]
+    assert "尚未配置 WebSocket" in channel["status_message"]
     # 未配置时不许出现"失败/不通"这类词：它会把人引去查一条从未建立的连接。
     assert "失败" not in channel["status_message"]
     for name in (
@@ -224,22 +225,23 @@ async def test_onebot_not_configured(logged_in) -> None:
         "LING_ONEBOT_SECRET",
     ):
         assert _field(channel, name)["set"] is False, name
-    assert "LING_ONEBOT_WS_PORT" in channel["guidance"]
+    assert "连接方向" in channel["guidance"]
 
 
-async def test_onebot_port_without_token_is_its_own_reason(logged_in) -> None:
-    """只配了端口没配 token：和服务端"拒绝启动"对应，不能说成同一件事。"""
+async def test_onebot_port_without_token_can_wait_for_connection(logged_in, caplog) -> None:
     _use_settings(logged_in, onebot_ws_port=6799, onebot_ws_token=None)
+    logged_in.app.state.onebot_ws_server = FakeOneBotWsServer(clients=0, received=0)
     channel = _channel(await _fetch(logged_in), "onebot")
 
-    assert channel["configured"] is False
-    # 端口配了（想启用），但起不来：enabled 与 configured 在这里必须分开。
+    assert channel["configured"] is True
     assert channel["enabled"] is True
-    assert channel["status"] == "not_configured"
-    assert channel["status_reason"] == "onebot_ws_token_missing"
+    assert channel["status"] == "configured_disconnected"
+    assert channel["status_reason"] == "onebot_ws_server_waiting"
     assert _field(channel, "LING_ONEBOT_WS_PORT")["set"] is True
     assert _field(channel, "LING_ONEBOT_WS_TOKEN")["set"] is False
-    assert "LING_ONEBOT_WS_TOKEN" in channel["guidance"]
+    assert "设置了 Token 时" in channel["guidance"]
+    assert not any("OneBot 未配置 LING_ONEBOT_SECRET" in record.getMessage()
+                   for record in caplog.get_records("setup"))
 
 
 async def test_onebot_configured_but_server_waiting(logged_in) -> None:

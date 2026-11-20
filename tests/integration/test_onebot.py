@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -158,22 +159,8 @@ async def test_wrong_self_id_rejected() -> None:
     assert ok is False
 
 
-async def test_no_secret_rejects_everything() -> None:
-    """未配 secret → **一律拒绝**（fail-closed）。
-
-    ## 为什么改掉了旧断言
-
-    旧断言是 `verify_inbound({"X-Self-ID": "10001"}, b"{}") is True`，
-    理由是"未配 secret 是降级状态（依赖网络隔离）"。这个前提在默认部署下
-    不成立：`/v1/onebot/events` 没有任何 auth 依赖，6520 默认对外发布，
-    `deploy/env.example` 里 `LING_ONEBOT_SECRET=` 默认就是空。于是任何能
-    访问该端口的人伪造 `X-Self-ID` + `user_id=<白名单 QQ 号>` 就能以该用户
-    身份对话、写记忆、让她向真实好友发言——完整的账号接管。
-
-    `X-Self-ID` 是请求方自己填的，不构成凭据，所以"没有 secret"就等于
-    "没有可信来源判据"，只能拒绝。旧断言保护的是一个错误行为，
-    不能为了跑通而保留它。
-    """
+async def test_no_secret_rejects_unknown_peer() -> None:
+    """拿不到来源时，不能把 HTTP 上报当成本机直连。"""
     connector = OneBotV11Connector(
         OneBotConfig(api_base="http://x", self_id="10001", instance_id="i")
     )
@@ -187,6 +174,35 @@ async def test_no_secret_rejects_everything() -> None:
         )
         is False
     )
+
+
+@pytest.mark.parametrize("path", ["/v1/onebot/events", "/v1/onebot/instances/default/events"])
+async def test_http_source_controls_are_optional_but_enforced_when_configured(web_env, path) -> None:
+    body = b'{"post_type":"meta_event","self_id":10001}'
+    headers = {"X-Self-ID": "10001"}
+    unsigned = replace(CONFIG, secret=None)
+
+    async def post(peer, config, extra_headers=None):
+        web_env.app.state.onebot_connector = OneBotV11Connector(config)
+        transport = httpx.ASGITransport(app=web_env.app, client=(peer, 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.post(path, content=body, headers={**headers, **(extra_headers or {})})
+
+    for peer in ("127.0.0.1", "172.20.0.5", "::ffff:10.0.0.2"):
+        assert (await post(peer, unsigned)).status_code == 200
+    assert (await post("198.51.100.10", unsigned)).status_code == 403
+    assert (await post("127.0.0.1", unsigned, {"X-Forwarded-For": "127.0.0.1"})).status_code == 403
+    assert (await post("127.0.0.1", unsigned, {"Origin": "https://example.test"})).status_code == 403
+    restricted = replace(unsigned, source_ips="127.0.0.1, ::1")
+    assert (await post("::1", restricted)).status_code == 200
+    assert (await post("172.20.0.5", restricted)).status_code == 403
+    assert (await post("127.0.0.1", CONFIG)).status_code == 403
+    sig = hmac.new(b"hmac-secret", body, hashlib.sha1).hexdigest()
+    signed = {"X-Signature": f"sha1={sig}"}
+    assert (await post("198.51.100.10", CONFIG, signed)).status_code == 200
+    signed_restricted = replace(CONFIG, source_ips="127.0.0.1")
+    assert (await post("127.0.0.1", signed_restricted, signed)).status_code == 200
+    assert (await post("172.20.0.5", signed_restricted, signed)).status_code == 403
 
 
 # ------------------------------------------------------------------ 归一化

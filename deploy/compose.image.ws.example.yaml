@@ -17,11 +17,10 @@
 # 从 `config`、`pull`、`run`、`up` 到备份和恢复演练**必须**用同一组 `-f`
 # 文件和同一个项目名，否则会命中另一套拓扑（设计 §4）。
 #
-# 前置条件（缺一不可）：
+# 配置：
 #
 # 1. 受限 `deploy/.env` 里 `LING_ONEBOT_WS_PORT=6799`（与下面 ports 的两段一致）；
-# 2. `LING_ONEBOT_WS_TOKEN=<随机串>` —— **没有 token 时服务端拒绝启动**，
-#    端口一开就等于把"往对话链路推事件"的能力交给任何能连上的人；
+# 2. `LING_ONEBOT_WS_TOKEN` 可选；本机或内网直连可留空，不要转发到公网；
 # 3. `LING_ONEBOT_WS_HOST=0.0.0.0` —— 默认 127.0.0.1 在容器里等于只有容器
 #    自己能连，宿主上的 NapCat 依然连不进来；
 # 4. NapCat 侧 `onebot11_<QQ>.json` 的 `network.websocketClients[]` 填
