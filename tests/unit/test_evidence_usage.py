@@ -67,9 +67,9 @@ def test_render_groups_by_usage() -> None:
         _hit("用户也许住杭州", 0.2, Origin.user_statement),
     ]
     text = render_evidence(hits)
-    assert "可以直接说出来" in text
-    assert "不要当成确凿事实复述" in text
-    assert "不要主动断言" in text
+    assert "记得的事：\n- 用户喜欢下雨天" in text
+    assert "可以影响回应方式）：\n- 用户可能养猫" in text
+    assert "有需要再确认）：\n- 用户也许住杭州" in text
     # 三组都要出现各自的条目
     assert "用户喜欢下雨天" in text
     assert "用户可能养猫" in text
@@ -79,19 +79,20 @@ def test_render_groups_by_usage() -> None:
 def test_render_only_present_groups() -> None:
     """只有一种类别时不该输出空组标题。"""
     text = render_evidence([_hit("用户喜欢下雨天", 0.9, Origin.user_statement)])
-    assert "可以直接说出来" in text
-    assert "不要主动断言" not in text
+    assert "记得的事：\n- 用户喜欢下雨天" in text
+    assert "模糊的印象" not in text
 
 
 def test_render_empty_is_empty() -> None:
     assert render_evidence([]) == ""
 
 
-def test_mention_carries_origin_and_confidence() -> None:
-    """可以直接说出来的那组要带来源与置信度，便于模型/审计判断依据。"""
+def test_mention_keeps_text_without_audit_metadata() -> None:
     text = render_evidence([_hit("用户喜欢下雨天", 0.9, Origin.user_statement)])
-    assert "user_statement" in text
-    assert "0.90" in text
+    assert "用户喜欢下雨天" in text
+    assert "自然接进对话" in text
+    assert "user_statement" not in text
+    assert "0.90" not in text
 
 
 def test_tone_group_omits_provenance() -> None:

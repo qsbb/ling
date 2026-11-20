@@ -55,15 +55,15 @@ async def test_core_memory_injected_every_turn(logged_in: TestEnv) -> None:
     assert "边界" in blob
 
 
-async def test_core_memory_marked_as_always_present(logged_in: TestEnv) -> None:
-    """注入文本要说明"每轮都在"，避免模型把它当成检索到的旧信息。"""
+async def test_core_memory_is_distinct_from_recalled_history(logged_in: TestEnv) -> None:
+    """核心记忆作为相处要点出现，不混成过去发生的事。"""
     async with session_scope() as session:
         await CoreMemoryService(session).upsert(
             subject_id=logged_in.subject_id, label="称呼", text="叫他阿澄"
         )
     window_id = await _window(logged_in)
     blob = await _compile(logged_in, window_id)
-    assert "始终记住" in blob or "每轮" in blob
+    assert "和对方相处时记住这些：\n- [称呼] 叫他阿澄" in blob
 
 
 async def test_private_core_memory_hidden_in_group(logged_in: TestEnv) -> None:

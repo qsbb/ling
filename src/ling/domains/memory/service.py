@@ -28,6 +28,7 @@ from ling.infra.models import (
     MemoryEpisode,
     MemoryRetrievalLog,
     MemoryRow,
+    User,
     utcnow,
 )
 from ling.infra.security import new_id
@@ -569,6 +570,13 @@ class MemoryService:
         from ling.domains.identity.service import IdentityService
 
         subjects = await IdentityService(self._session).subject_group(subject_id)
+        if len(subjects) > 1:
+            # Merged channel identities may share memories; separate web logins remain separate.
+            principals = list(await self._session.scalars(
+                select(User.subject_id).where(User.subject_id.in_(subjects)).distinct().limit(2)
+            ))
+            if len(principals) > 1:
+                subjects = {subject_id}
 
         # **读侧硬门**：请求已接受但物理删除还没跑完的这段时间里，行还在库里。
         # 不加这道门，用户刚点完"删除"，下一轮对话她就会把那些事再说一遍——
@@ -1659,10 +1667,7 @@ def _is_historical(hit: object) -> bool:
 
 
 def render_evidence(hits: list) -> str:
-    """按表达策略分组渲染证据车道。
-
-    分组本身就是给模型的指令：不同组能说的话不一样。
-    """
+    """Give the character context, with only the distinctions that change its use."""
     groups: dict[str, list] = {"mention": [], "tone": [], "uncertain": [], "history": []}
     for hit in hits:
         # 历史事实单独成组：它们**现在不成立**，只能用于回答"以前怎样"，
@@ -1672,42 +1677,18 @@ def render_evidence(hits: list) -> str:
         else:
             groups[classify_usage(hit)].append(hit)
 
-    blocks: list[str] = []
-    if groups["mention"]:
-        lines = [
-            f"- {h.text}（来源 {getattr(getattr(h, 'origin', None), 'value', '')}"
-            f"，置信度 {float(getattr(h, 'confidence', 0.0)):.2f}）"
-            for h in groups["mention"]
-        ]
-        blocks.append("你确实记得的事（可以直接说出来）：\n" + "\n".join(lines))
-    if groups["tone"]:
-        lines = [f"- {h.text}" for h in groups["tone"]]
-        blocks.append(
-            "你有印象、但不必点明出处的事（当作语气的底色即可，"
-            "不要当成确凿事实复述）：\n" + "\n".join(lines)
-        )
-    if groups["uncertain"]:
-        lines = [f"- {h.text}" for h in groups["uncertain"]]
-        blocks.append(
-            "你只是隐约觉得的事（对方提起时可以试探确认，"
-            "不要主动断言）：\n" + "\n".join(lines)
-        )
-    if groups["history"]:
-        lines = [f"- {h.text}" for h in groups["history"]]
-        blocks.append(
-            "这些是**以前**的情况，现在已经不是这样了"
-            "（只在对方问起过去时提到，不要说成现状）：\n" + "\n".join(lines)
-        )
-    if blocks:
-        # 这一条是「核心记忆证据权限」：
-        # 光把记忆分类还不够，还得说清**冲突时的优先级**。
-        # 没有这句时，用户说"我搬去成都了"而记忆写着"住在杭州"，
-        # 模型会拿记忆去反驳对方——那是把记忆当成比当事人更权威的证据。
-        blocks.append(
-            "**以上都是你记得的事。如果对方这一轮说了不同的情况，"
-            "以对方现在说的为准**——不要拿记忆去反驳他，也不要追问"
-            "「你不是说……」。"
-        )
+    if not hits:
+        return ""
+    labels = {
+        "mention": "记得的事",
+        "tone": "熟悉的线索（可以影响回应方式）",
+        "uncertain": "模糊的印象（有需要再确认）",
+        "history": "以前的情况（不代表现在）",
+    }
+    blocks = ["聊到相关的事时，把这些记忆自然接进对话。情况有变化时，以对方现在说的为准。"]
+    for key, label in labels.items():
+        if groups[key]:
+            blocks.append(f"{label}：\n" + "\n".join(f"- {hit.text}" for hit in groups[key]))
     return "\n\n".join(blocks)
 
 

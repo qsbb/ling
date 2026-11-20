@@ -1331,7 +1331,7 @@ def test_evidence_render_states_conflict_priority() -> None:
     )
     text = render_evidence([hit])
     assert "以对方现在说的为准" in text, f"没说冲突优先级：{text}"
-    assert "不要拿记忆去反驳" in text
+    assert "情况有变化时" in text
 
 
 def test_evidence_render_omits_contract_when_empty() -> None:

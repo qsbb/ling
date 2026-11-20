@@ -35,7 +35,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import delete
 
-from ling.contracts.v1 import Visibility
+from ling.contracts.v1 import MemoryProposal, Origin, Visibility
+from ling.domains.identity.service import IdentityService
 from ling.domains.memory.service import RECALL_CANDIDATE_LIMIT, MemoryService
 from ling.infra.db import session_scope
 from ling.infra.models import MemoryEpisode, MemoryRow, Subject
@@ -48,6 +49,31 @@ pytestmark = pytest.mark.w0_web
 
 SUBJ = "subj_recall_scope"
 NEEDLE_TEXT = "主人最喜欢的颜色是紫色"
+
+
+async def test_private_recall_is_scoped_to_each_web_login(logged_in: TestEnv) -> None:  # noqa: F811
+    async with session_scope() as session:
+        other = await IdentityService(session).create_user(
+            username="reading-sample", password="synthetic-password",
+        )
+        assert other.subject_id != logged_in.subject_id
+        subject = await session.get(Subject, other.subject_id)
+        assert subject is not None
+        subject.merged_into = logged_in.subject_id
+        a, b = logged_in.subject_id, other.subject_id
+        subjects = {a: "夜跑偏好：公园", b: "夜跑偏好：体育场"}
+        service = MemoryService(session)
+        for sid, label in subjects.items():
+            await service.propose(MemoryProposal(
+                proposal_id=f"fixture-{sid}", kind="assertion", text=label,
+                origin=Origin.user_statement, visibility=Visibility.subject_private,
+                source_event_ids=["evt_synthetic"], confidence=0.9,
+            ), subject_id=sid)
+        for sid, label in subjects.items():
+            result = await service.recall(
+                subject_id=sid, query="夜跑偏好", visibility_allow={Visibility.subject_private},
+            )
+            assert [hit.text for hit in result.hits] == [label]
 
 
 async def _clear() -> None:

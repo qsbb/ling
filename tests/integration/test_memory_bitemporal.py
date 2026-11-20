@@ -172,5 +172,5 @@ def test_history_rendered_as_past(logged_in: object) -> None:
     )
     text = render_evidence([hit])
     assert "以前" in text
-    assert "现在已经不是这样" in text
-    assert "可以直接说出来" not in text, "历史事实被混进了可直接表述的组"
+    assert "以前的情况（不代表现在）：\n- 用户住在杭州" in text
+    assert "记得的事：" not in text, "历史事实被混进了可直接表述的组"

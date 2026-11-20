@@ -157,7 +157,7 @@ class CoreMemoryService:
         if not lines:
             return ""
         return (
-            "你必须始终记住的关于对方的要点（每轮都在，不依赖检索）：\n"
+            "和对方相处时记住这些：\n"
             + "\n".join(lines)
         )
 
