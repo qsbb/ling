@@ -159,7 +159,7 @@ async def test_empty_overrides_match_pre_upgrade(web_env: TestEnv, logged_in: Te
     # OneBot 以前根本不在视图里的两项，现在必须在（设计 §3）。
     keys = {f["key"] for f in _scope(body, "onebot")["fields"]}
     assert {"LING_ONEBOT_ACCESS_TOKEN", "LING_ONEBOT_SELF_ID"} <= keys
-    assert len(_scope(body, "onebot")["fields"]) == 12
+    assert len(_scope(body, "onebot")["fields"]) == 13
     assert len(_scope(body, "qqbot")["fields"]) == 12
     assert {field["key"] for field in _scope(body, "access")["fields"]} == {
         "LING_ACCESS_MODE", "LING_ACCESS_LIST", "LING_ACCESS_GROUPS",
@@ -359,14 +359,23 @@ async def test_set_and_clear_same_key_is_422(
     assert response.status_code == 422
 
 
-async def test_ws_port_without_token_is_invalid_config(
+async def test_ws_port_without_token_is_valid_config(
     web_env: TestEnv, logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
 ) -> None:
-    """单看每一项都合法、合起来起不来 → 422（在切换之前拦住）。"""
     response = await _put(web_env, "onebot", {"set": {"LING_ONEBOT_WS_PORT": "6700"}})
+    assert response.status_code == 202, response.text
+    assert response.json()["state"] == "active"
+    assert _field(await _get(web_env), "onebot", "LING_ONEBOT_WS_TOKEN")["configured"] is False
+
+
+async def test_onebot_source_ips_rejects_non_ip_before_switch(
+    web_env: TestEnv, logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
+) -> None:
+    valid = await _put(web_env, "onebot", {"set": {"LING_ONEBOT_SOURCE_IPS": "127.0.0.1, ::1"}})
+    assert valid.status_code == 202, valid.text
+    response = await _put(web_env, "onebot", {"set": {"LING_ONEBOT_SOURCE_IPS": "0.0.0.0/0"}})
     assert response.status_code == 422, response.text
-    assert response.json()["error"]["detail"] == "invalid_config"
-    assert fake_runtime.stop_calls == 0
+    assert _field(await _get(web_env), "onebot", "LING_ONEBOT_SOURCE_IPS")["value"] == "127.0.0.1, ::1"
 
 
 async def test_empty_secret_means_no_change(

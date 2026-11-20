@@ -150,6 +150,16 @@ def _check_port(field: str, value: str) -> None:
         raise FieldError(field, "端口必须在 1–65535 之间")
 
 
+def _check_source_ips(field: str, value: str) -> None:
+    from connectors.inbound_access import parse_source_ips
+
+    try:
+        if value.strip() and not parse_source_ips(value):
+            raise ValueError
+    except ValueError as exc:
+        raise FieldError(field, "请填写单个 IP 地址，多个用逗号分隔；不接受网段或域名") from exc
+
+
 def _check_access_mode(field: str, value: str) -> None:
     if value not in ACCESS_MODES:
         raise FieldError(field, f"只能填 {' / '.join(ACCESS_MODES)}")
@@ -257,7 +267,7 @@ def _list(key: str, scope: str, label: str, *, max_len: int = 64) -> FieldSpec:
     )
 
 
-# --- OneBot：12 项（设计 §3）---
+# --- OneBot ---
 
 ONEBOT_FIELDS: tuple[FieldSpec, ...] = (
     _text(
@@ -267,22 +277,24 @@ ONEBOT_FIELDS: tuple[FieldSpec, ...] = (
         default="http://127.0.0.1:5700",
         validate=lambda f, v: _check_url(f, v, schemes=("http", "https")),
     ),
-    _secret("LING_ONEBOT_ACCESS_TOKEN", SCOPE_ONEBOT, "访问令牌（调 OneBot API 用）"),
-    _text("LING_ONEBOT_SELF_ID", SCOPE_ONEBOT, "机器人自己的 QQ 号（校验上报来源）", max_len=32),
-    _secret("LING_ONEBOT_SECRET", SCOPE_ONEBOT, "HTTP 上报签名密钥（HMAC-SHA1）"),
+    _secret("LING_ONEBOT_ACCESS_TOKEN", SCOPE_ONEBOT, "HTTP API 访问令牌（可选）"),
+    _text("LING_ONEBOT_SELF_ID", SCOPE_ONEBOT, "机器人 QQ 号（可选）", max_len=32),
+    _secret("LING_ONEBOT_SECRET", SCOPE_ONEBOT, "HTTP 上报签名密钥（可选）"),
+    _text("LING_ONEBOT_SOURCE_IPS", SCOPE_ONEBOT, "来源 IP 白名单（可选，逗号分隔）",
+          validate=_check_source_ips),
     _text(
         "LING_ONEBOT_WS_PORT",
         SCOPE_ONEBOT,
-        "WS 服务端端口（NapCat 连进来；留空=不启用）",
+        "Ling 监听端口",
         max_len=5,
         validate=_check_port,
     ),
-    _secret("LING_ONEBOT_WS_TOKEN", SCOPE_ONEBOT, "WS 服务端令牌", control="password"),
-    _secret("LING_ONEBOT_WS_URL", SCOPE_ONEBOT, "出站 WS 地址（ling 主动连 NapCat）"),
+    _secret("LING_ONEBOT_WS_TOKEN", SCOPE_ONEBOT, "反向 WebSocket Token（可选）"),
+    _secret("LING_ONEBOT_WS_URL", SCOPE_ONEBOT, "OneBot 服务端地址（ws:// 或 wss://）"),
     _text(
         "LING_ONEBOT_WS_HOST",
         SCOPE_ONEBOT,
-        "WS 服务端监听地址",
+        "Ling 监听地址",
         default="127.0.0.1",
         max_len=64,
         validate=_check_host,
@@ -304,14 +316,14 @@ ONEBOT_FIELDS: tuple[FieldSpec, ...] = (
 QQBOT_FIELDS: tuple[FieldSpec, ...] = (
     _switch("LING_QQBOT_ENABLED", SCOPE_QQBOT, "渠道开关", default=False),
     _secret(
-        "LING_QQBOT_APP_ID", SCOPE_QQBOT, "AppID（开放平台「开发设置」）", control="password"
+        "LING_QQBOT_APP_ID", SCOPE_QQBOT, "AppID（平台必需）", control="password"
     ),
-    _secret("LING_QQBOT_CLIENT_SECRET", SCOPE_QQBOT, "AppSecret（换 access_token 用）"),
-    _secret("LING_QQBOT_BOT_SECRET", SCOPE_QQBOT, "Webhook 签名密钥 BotSecret"),
+    _secret("LING_QQBOT_CLIENT_SECRET", SCOPE_QQBOT, "AppSecret（平台必需）"),
+    _secret("LING_QQBOT_BOT_SECRET", SCOPE_QQBOT, "BotSecret（使用平台 Webhook 时设置）"),
     _text(
         "LING_QQBOT_WEBHOOK_PUBLIC_KEY",
         SCOPE_QQBOT,
-        "Ed25519 公钥 hex（给公钥时优先用它验签）",
+        "Webhook 验签公钥（可选，优先用于验签）",
         max_len=256,
     ),
     _text(

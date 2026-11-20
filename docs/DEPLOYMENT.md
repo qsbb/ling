@@ -878,24 +878,22 @@ OneBot V11 是 NapCat / Lagrange / go-cqhttp 共同实现的协议。ling 提供
 ```bash
 # deploy/.env
 LING_ONEBOT_API_BASE=http://127.0.0.1:5700   # OneBot 实现的 HTTP API
-LING_ONEBOT_ACCESS_TOKEN=<出站调用凭据：对应 NapCat 的 httpServers[].token>
-LING_ONEBOT_SECRET=<入站签名密钥：对应 NapCat 的 httpClients[].token，必填>
+LING_ONEBOT_ACCESS_TOKEN=                 # 可选：NapCat 的 HTTP API 启用 Token 时填写
+LING_ONEBOT_SECRET=                       # 可选：对应 NapCat httpClients[].token
+LING_ONEBOT_SOURCE_IPS=                   # 可选：单个或多个直连来源 IP，逗号分隔
 LING_ONEBOT_SELF_ID=<机器人 QQ 号>
 LING_ONEBOT_INSTANCE_ID=onebot-main
 ```
 
-#### ⚠️ 破坏性变更：`LING_ONEBOT_SECRET` 现在是**必填**（HTTP 上报模式）
+#### HTTP 上报密钥与反向 WebSocket Token 可选
 
-**不配 = `/v1/onebot/events` 拒绝所有上报（403）。** 容器会照常 healthy、
-`/readyz` 照常 200，但 QQ **完全不回话**——这是最容易被忽略的一种失败形态。
+本机或内网直连时，密钥、Token、来源 IP 白名单都可以留空。HTTP 上报密钥与
+反向 WS Token 各自独立；填了哪项，哪条入口就必须通过对应校验。填了来源 IP
+白名单时，直连的 HTTP 上报和反向 WS 都必须匹配名单；它不替代签名或 Token。
 
-为什么改成 fail-closed：这条路由没有任何鉴权依赖，而 6520 默认对外发布。
-`X-Self-ID` 是请求方自己填的，不构成凭据。任何能访问 6520 的人只要伪造
-`X-Self-ID` 和 `user_id=<白名单里的 QQ 号>`，就能以该用户身份对话、写记忆、
-让她向真实好友发言。所以 secret 成了这条入口的**必要条件**。
-
-启动日志里会有对应的一条记录：配了其它 `LING_ONEBOT_*` 时是 ERROR，
-完全没配 OneBot 时是 WARNING（后者可以忽略）。
+无凭据时只接受本机和私有网络地址直连，不接受浏览器或带转发头的请求。
+公网、反代或端口转发场景要配置凭据或从网络层隔离入口。不会保留真实来源地址的
+转发器可能使公网请求看起来像内网请求，不要把无凭据入口转发到公网。
 
 #### `LING_ONEBOT_SECRET` 与 `LING_ONEBOT_ACCESS_TOKEN` 不是一回事
 
@@ -917,9 +915,8 @@ if (this.config.token) {
 }
 ```
 
-所以如果 NapCat 侧只填了一个 token，`LING_ONEBOT_SECRET` 必须与它**逐字符相同**。
-配成不同的值 ⇒ 每条上报都验签失败 ⇒ **仍然全 403**，而日志里只看到"签名不匹配"。
-生成一个：`openssl rand -hex 16`。
+启用 HTTP 上报签名时，`LING_ONEBOT_SECRET` 与 NapCat 的上报 Token 必须一致。
+需要生成随机密钥时可用 `openssl rand -hex 16`。
 
 NapCat 侧要开：
 - **HTTP 服务器**：端口 5700（对应 `LING_ONEBOT_API_BASE`）
@@ -935,8 +932,8 @@ HTTP 上报要求 **NapCat 能访问到 ling**。不想让 API 绑 `0.0.0.0` 暴
 
 | 模式 | 谁连谁 | 配置 | 要不要发布端口 |
 | --- | --- | --- | --- |
-| **反向 WS 服务端**（推荐） | ling 监听，NapCat 连进来 | `LING_ONEBOT_WS_PORT` + `LING_ONEBOT_WS_TOKEN`（必填，缺了拒绝启动）+ `LING_ONEBOT_WS_HOST=0.0.0.0` | **要**（容器里还得另加一份 override，见下） |
-| **反向 WS 客户端** | ling 主动连 NapCat 的 wsServer | `LING_ONEBOT_WS_URL=ws://<napcat>:<端口>` | **不要**（ling 是连出去的一方） |
+| **反向 WS 服务端**（推荐） | Ling 监听，NapCat 连进来 | `LING_ONEBOT_WS_PORT`；容器监听用 `LING_ONEBOT_WS_HOST=0.0.0.0`，Token 可选 | **要**（容器里另加一份 override） |
+| **WS 客户端** | Ling 主动连 NapCat 的 wsServer | `LING_ONEBOT_WS_URL=ws://<napcat>:<端口>` | **不要** |
 
 **容器部署（compose）里服务端模式的端口默认不发布**：基础 `deploy/compose.yaml`
 的 api 只发布 `${LING_PORT:-6520}:6520`。不配 WS 的部署不该多出一个对外端口，
@@ -994,7 +991,7 @@ LING_ONEBOT_PROACTIVE=0           # 主动推送能力位（平台权限探测�
 模型窗口装不下就调 `LING_CONTEXT_BUDGET_SCALE`（整体等比缩），不必改代码。
 **不要**去改单个车道的数字——那会让"谁该让位"变成一堆手工调参。
 
-### 6.1.3 NapCat 侧：必须配「HTTP 上报」（实测跑通）
+### 6.1.3 NapCat 的 HTTP 上报配置
 
 ling 的 OneBot 连接器支持 **HTTP 上报**（`httpClients` 推给 ling）与两种 WS
 （见 6.1.0）。HTTP 上报这条路的 NapCat 侧配置如下。
@@ -1015,7 +1012,7 @@ ling 的 OneBot 连接器支持 **HTTP 上报**（`httpClients` 推给 ling）�
         "url": "http://<ling 所在机器>:6520/v1/onebot/events",
         "messagePostFormat": "array",
         "reportSelfMessage": false,
-        "token": "<= LING_ONEBOT_SECRET，必填>",
+        "token": "",
         "heartInterval": 30000
       }
     ]
@@ -1025,9 +1022,8 @@ ling 的 OneBot 连接器支持 **HTTP 上报**（`httpClients` 推给 ling）�
 
 四个容易踩的点：
 
-1. **`httpClients[].token` 必须填**，且与 `LING_ONEBOT_SECRET` 逐字符相同。
-   NapCat 用它当 HMAC key 算 `x-signature`；ling 侧没配 secret 或两边不一致，
-   上报一律 403，而容器是 healthy 的——表现为"机器人在线但完全不回话"。
+1. **`httpClients[].token` 可留空**（本机或内网直连）。启用签名时，两端分别填写
+   同一个值；Ling 已设密钥，但上报没带签名或签名不匹配时，会返回 403。
 2. **`httpServers[].token` 对应 `LING_ONEBOT_ACCESS_TOKEN`**（出站调用），
    不是 `LING_ONEBOT_SECRET`。两处填同一个值也可以，但必须各自对上，
    否则 API 调用会 401/403（能收事件却发不出去）。

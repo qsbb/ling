@@ -1871,7 +1871,7 @@ def test_deploy_env_example_names_the_napcat_field_for_secret() -> None:
     不同的值，NapCat 侧只填了一个 token，验签必然失败 ⇒ 仍然全 403，
     而日志只看到"签名不匹配"。
 
-    所以这里钉住三件事：必填、对应 `httpClients[].token`、与 ACCESS_TOKEN 的区别。
+    所以这里钉住三件事：可选、对应 `httpClients[].token`、与 ACCESS_TOKEN 的区别。
     """
     from pathlib import Path
 
@@ -1879,12 +1879,12 @@ def test_deploy_env_example_names_the_napcat_field_for_secret() -> None:
     # 找到 LING_ONEBOT_SECRET= 那一行往上的注释块
     lines = text.splitlines()
     index = next(i for i, line in enumerate(lines) if line.startswith("LING_ONEBOT_SECRET="))
-    comment = "\n".join(lines[max(0, index - 25) : index])
-    assert "必填" in comment, f"env.example 没写 SECRET 是必填：{comment}"
+    comment = "\n".join(lines[max(0, index - 2) : index])
+    assert "可选" in comment and "必填" not in comment
     assert "httpClients[].token" in comment, (
         f"env.example 没写 SECRET 对应 NapCat 的 httpClients[].token：{comment}"
     )
-    assert "ACCESS_TOKEN" in comment, (
+    assert "不是 httpServers" in comment, (
         f"env.example 没写清 SECRET 与 ACCESS_TOKEN 的区别：{comment}"
     )
 

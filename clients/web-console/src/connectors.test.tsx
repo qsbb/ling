@@ -172,12 +172,12 @@ describe('四态渲染互不串', () => {
     expect(markup).not.toContain('`');
   });
 
-  it('已配置未连接：说"未连接"，不复用"未配置"的文案', () => {
+  it('反向 WebSocket 已监听：显示等待连入，不误报失败', () => {
     const markup = render(DISCONNECTED);
 
     expect(markup).toContain('data-status="configured_disconnected"');
-    expect(markup).toContain('connector-card--warn');
-    expect(markup).toContain('已配置 · 未连接');
+    expect(markup).toContain('connector-card--neutral');
+    expect(markup).toContain('等待 OneBot 连入');
     expect(markup).not.toContain('未配置');
     expect(markup).not.toContain('已连接');
     expect(markup).not.toContain('connector-card--ok');
@@ -222,9 +222,9 @@ describe('可编辑：每个字段都有控件，密钥只有密码框', () => {
     expect(markup).not.toContain('readonly');
   });
 
-  it('12 个真实键名都渲染出了自己的输入控件', () => {
+  it('OneBot 的每个注册字段都渲染出自己的输入控件', () => {
     const markup = render(makeConnector({ fields: onebotFields() }));
-    expect(FIELD_IDS_FOR_TESTS.onebot).toHaveLength(12);
+    expect(FIELD_IDS_FOR_TESTS.onebot).toHaveLength(13);
     for (const key of FIELD_IDS_FOR_TESTS.onebot) {
       expect(markup).toContain(`data-testid="connector-input-${key}"`);
     }

@@ -24,13 +24,6 @@ logger = logging.getLogger("ling.api.onebot")
 router = APIRouter(prefix="/v1/onebot", tags=["onebot"])
 
 
-def _config():  # noqa: ANN202
-    # 与 worker 共用同一份解析，避免两边漂移
-    from ling.capabilities.channels import onebot_config
-
-    return onebot_config()
-
-
 def _connector(request: Request, instance_id: str = "default"):  # noqa: ANN202
     from ling.capabilities.channels import connector_for_instance
 
@@ -56,10 +49,11 @@ async def onebot_events(request: Request, instance_id: str = "default") -> JSONR
     connector = _connector(request, instance_id)
     headers = {k: v for k, v in request.headers.items()}
 
-    if not await connector.verify_inbound(headers, body):
-        # 验签失败用 403：这是"来源不可信"，不该被当成正常事件吞掉
-        logger.warning("OneBot 上报验签失败")
-        raise LingError(ErrorCode.forbidden, "OneBot 上报验签失败", status_code=403)
+    if not await connector.verify_inbound(
+        headers, body, peer=request.client.host if request.client else None,
+    ):
+        logger.warning("OneBot HTTP 上报被拒绝：请检查来源 IP 或签名配置")
+        raise LingError(ErrorCode.forbidden, "OneBot 上报的来源 IP 或签名未通过校验", status_code=403)
 
     import json
 

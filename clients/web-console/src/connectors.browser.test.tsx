@@ -240,6 +240,36 @@ function inputOf(page: Page, key: string) {
 
 /* ------------------------------------------------------------ 用例 */
 
+it('OneBot 按连接方向展开，HTTP 校验可选且展开操作不改变已编辑的端口', async (ctx) => {
+  if (skip(ctx)) return;
+  const base = makeResponse();
+  const body = makeResponse({ connectors: base.connectors.map((connector) => connector.id === 'onebot'
+    ? { ...connector, fields: connector.fields.map((field) =>
+      ['LING_ONEBOT_SECRET', 'LING_ONEBOT_WS_TOKEN'].includes(field.key)
+        ? { ...field, configured: false, set: false, preview: null } : field) }
+    : connector) });
+  const { page, puts } = await openConnectors({ width: 375, height: 800 }, [
+    { kind: 'ok', result: changeResult('onebot', 'active') },
+  ], { body });
+
+  expect(await page.getByTestId('connector-onebot-status').textContent()).toContain('等待 OneBot 连入');
+  const port = inputOf(page, 'LING_ONEBOT_WS_PORT');
+  await port.fill('6799');
+  expect(await inputOf(page, 'LING_ONEBOT_WS_TOKEN').inputValue()).toBe('');
+  const http = page.getByTestId('onebot-group-http');
+  expect(await inputOf(page, 'LING_ONEBOT_SECRET').isVisible()).toBe(false);
+  await http.locator('summary').click();
+  expect(await http.textContent()).toContain('/v1/onebot/events');
+  expect(await inputOf(page, 'LING_ONEBOT_SECRET').isVisible()).toBe(true);
+  expect(await inputOf(page, 'LING_ONEBOT_SOURCE_IPS').isVisible()).toBe(false);
+  await page.getByTestId('onebot-group-advanced').locator('summary').click();
+  expect(await inputOf(page, 'LING_ONEBOT_SOURCE_IPS').isVisible()).toBe(true);
+  expect(await port.inputValue()).toBe('6799');
+  await page.getByTestId('connector-onebot-save').click();
+  await page.getByTestId('connector-onebot-notice').waitFor();
+  expect(puts[0]?.body).toEqual({ set: { LING_ONEBOT_WS_PORT: '6799' }, clear: [] });
+}, TIMEOUT);
+
 describe('接入器：真的能改并保存', () => {
   it('改一个字段 → 保存：请求体只含那一个键，If-Match 是当前 generation，界面说已生效', async (ctx) => {
     if (skip(ctx)) return;

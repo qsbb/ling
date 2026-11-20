@@ -120,6 +120,33 @@
   color: var(--ink);
 }
 
+.connector-groups {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.connector-group {
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.connector-group > summary {
+  align-content: center;
+  min-height: 44px;
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.connector-group__note {
+  margin: 2px 6px 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
 /* ---------------------------------------------------------------- 徽标 */
 
 /* 文案里反引号包住的变量名：等宽 + 一点点底色，与中文说明区分开。 */

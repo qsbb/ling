@@ -52,7 +52,7 @@ export LING_ONEBOT_SECRET=${LING_ONEBOT_SECRET:-}
 # **推荐用服务端模式**：ling 监听，NapCat 连过来。
 # 入站方向取「NapCat 主动连 ling」这一侧：实测该方向能稳定收到消息事件。
 export LING_ONEBOT_WS_PORT=${LING_ONEBOT_WS_PORT:-}
-# **配了 WS_PORT 就必须配 TOKEN**：没有 token 时 WS 服务端拒绝启动。
+# 本机或内网直连可留空；配置后，NapCat 连入时须提供相同的 Token。
 export LING_ONEBOT_WS_TOKEN=${LING_ONEBOT_WS_TOKEN:-}
 # 监听地址，默认只听本机；要对外必须显式改成 0.0.0.0。
 export LING_ONEBOT_WS_HOST=${LING_ONEBOT_WS_HOST:-127.0.0.1}

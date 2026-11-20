@@ -38,18 +38,11 @@ import json
 import logging
 from typing import Any
 
+from connectors.inbound_access import source_allowed
+
 from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.connectors.onebot.ws_server")
-
-
-class OneBotWsAuthError(RuntimeError):
-    """WS 服务端缺 token 等鉴权前置条件不满足，**拒绝启动**。
-
-    单独一个异常类型，是为了让 ``ling/app.py`` 能把它和"端口被占用"
-    这类启动失败区分开：前者是配置错误（必须改配置），后者可能只是
-    另一个进程占着端口（重试或换端口即可）。
-    """
 
 
 class OneBotWsServer:
@@ -63,11 +56,13 @@ class OneBotWsServer:
         app: object,
         connector: ChannelConnector,
         token: str | None = None,
+        source_ips: str = "",
         trusted_instance_key: tuple[str, str] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.token = token
+        self.source_ips = source_ips
         self._app = app
         self._connector = connector
         self._trusted_instance_key = trusted_instance_key
@@ -78,19 +73,12 @@ class OneBotWsServer:
 
     # ------------------------------------------------------------ 鉴权
 
-    def _authorized(self, path: str, headers: Any) -> bool:
-        """**没有 token 就一律拒绝**。
-
-        NapCat 的 wsClient 把 token 放在 `Authorization: Bearer <token>`
-        或 URL 的 `?access_token=` 里（两种实现都有）。两种都认。
-
-        原实现在没配 token 时直接返回 True（只打一条 warning），等于
-        "任何能连上这个端口的人都能往对话链路里推事件"。这里改成
-        fail-closed：没 token 时连启动都不允许（见 ``start()``），
-        即使有人绕过启动直接调这个方法，也一律拒绝。
-        """
-        if not self.token:
+    def _authorized(self, path: str, headers: Any, *, peer: str | None = None) -> bool:
+        if not source_allowed(peer, headers, has_credential=bool(self.token),
+                              allowed_ips=self.source_ips):
             return False
+        if not self.token:
+            return True
         auth = ""
         try:
             auth = str(headers.get("Authorization") or "")
@@ -156,8 +144,10 @@ class OneBotWsServer:
     async def _handler(self, ws: Any) -> None:
         path = getattr(getattr(ws, "request", None), "path", "") or ""
         headers = getattr(getattr(ws, "request", None), "headers", {}) or {}
-        if not self._authorized(path, headers):
-            logger.warning("OneBot WS 服务端拒绝连接：token 不匹配")
+        remote = ws.remote_address
+        peer = remote[0] if isinstance(remote, tuple) and remote else None
+        if not self._authorized(path, headers, peer=peer):
+            logger.warning("OneBot 反向 WS 连接被拒绝：请检查来源 IP 或 Token")
             await ws.close(code=1008, reason="unauthorized")
             return
 
@@ -178,20 +168,9 @@ class OneBotWsServer:
     # ------------------------------------------------------------ 启停
 
     async def start(self) -> None:
-        """启动监听。**没有 token 直接抛错，不启动。**
-
-        为什么是抛错而不是 warning 后放行：这个端口一旦开起来，推来的
-        事件会直接进对话链路（白名单、身份、决策、投递都在同一套受理里）。
-        没有 token 就等于把「以某个白名单 QQ 号说话」的能力交给任何
-        能连上端口的人。warning 是会被忽略的——它是日志，不是门。
-        """
+        """启动监听；入站来源和可选 Token 在连接时校验。"""
         import websockets
 
-        if not self.token:
-            raise OneBotWsAuthError(
-                f"OneBot WS 服务端缺少 token（{self.host}:{self.port}）："
-                "拒绝启动。请在 OneBot 侧与 LING_ONEBOT_WS_TOKEN 配同一个值"
-            )
         self._server = await websockets.serve(self._handler, self.host, self.port)
         logger.info("OneBot WS 服务端已监听 ws://%s:%d", self.host, self.port)
 
@@ -214,4 +193,4 @@ class OneBotWsServer:
         }
 
 
-__all__ = ["OneBotWsAuthError", "OneBotWsServer"]
+__all__ = ["OneBotWsServer"]

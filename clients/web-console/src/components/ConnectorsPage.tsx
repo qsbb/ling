@@ -111,7 +111,13 @@ export interface ConnectorStatusPresentation {
  * 状态码 → 徽标。**未知码不猜**：给一个明确的"状态未知"，而不是挑一个
  * 看起来最像的态（那会把"后端加了新状态"伪装成"一切正常/一切坏了"）。
  */
-export function describeConnectorStatus(status: string): ConnectorStatusPresentation {
+export function describeConnectorStatus(status: string, reason?: string): ConnectorStatusPresentation {
+  if (reason === 'onebot_http_only') {
+    return { label: 'HTTP 上报', tone: 'neutral', hint: '按请求接收，不保持长连接。' };
+  }
+  if (reason === 'onebot_ws_server_waiting') {
+    return { label: '等待 OneBot 连入', tone: 'neutral', hint: 'Ling 正在监听。' };
+  }
   switch (status) {
     case 'not_configured':
       return {
@@ -852,10 +858,7 @@ interface ConnectorCardProps extends ConnectorFormProps {
   /**
    * 给实例面板用的**默认实例**视图，应当始终是页面级那一次 GET 的结果。
    *
-   * 为什么不直接用 `connector`：非默认实例的 `connector` 可能是一份空字段的
-   * 视图，而面板会拿它 `draftFromFields()` 现造草案——空字段会让面板抛
-   * `fields is not iterable` 并整块崩掉。面板的四态诊断描述的是"这条渠道"，
-   * 也不该跟着实例走。不传时退回 `connector`（老调用点/测试）。
+   * 切换实例时，面板仍用默认实例的基线。诊断和编辑表单则用选中实例的视图。
    */
   panelConnector?: ConnectorView;
   /**
@@ -885,12 +888,62 @@ interface ConnectorCardProps extends ConnectorFormProps {
   onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
 }
 
-/**
- * 一张接入器卡：上面是四态诊断（原样保留），下面是可编辑表单。
- *
- * 表单**始终展开**：用户点进来就是为了改，"点进去居然没有配置界面"正是这一轮
- * 要修的问题；再套一层"先点编辑"只会让人以为又是只读的。
- */
+const ONEBOT_GROUPS = [
+  { id: 'reverse', title: 'OneBot 连入 Ling · 反向 WebSocket',
+    keys: ['LING_ONEBOT_WS_PORT', 'LING_ONEBOT_WS_HOST', 'LING_ONEBOT_WS_TOKEN'] },
+  { id: 'direct', title: 'Ling 连接 OneBot · WebSocket', keys: ['LING_ONEBOT_WS_URL'] },
+  { id: 'http', title: 'OneBot 向 Ling 上报 · HTTP', keys: ['LING_ONEBOT_SECRET'] },
+  { id: 'api', title: 'Ling 发送消息 · OneBot HTTP API',
+    keys: ['LING_ONEBOT_API_BASE', 'LING_ONEBOT_ACCESS_TOKEN'] },
+  { id: 'advanced', title: '来源限制与高级设置', keys: ['LING_ONEBOT_SOURCE_IPS', 'LING_ONEBOT_SELF_ID'] },
+];
+
+function ConnectorFields({ connector, instanceId, form, renderField }: {
+  connector: ConnectorView;
+  instanceId?: string;
+  form: ConnectorFormProps;
+  renderField: (field: ConnectorField) => ReactNode;
+}) {
+  if (connector.id !== 'onebot') {
+    return <ul className="connector-fields">{connector.fields.map(renderField)}</ul>;
+  }
+  const fieldKey = (field: ConnectorField) => field.key || field.name;
+  const has = (key: string) => connector.fields.some((field) => fieldKey(field) === key && isFieldSet(field));
+  const hasPort = has('LING_ONEBOT_WS_PORT');
+  const hasUrl = has('LING_ONEBOT_WS_URL');
+  const hasHttpConfig = has('LING_ONEBOT_SECRET') || connector.status_reason === 'onebot_http_only';
+  const eventsPath = instanceId && instanceId !== DEFAULT_INSTANCE_ID
+    ? `/v1/onebot/instances/${encodeURIComponent(instanceId)}/events`
+    : '/v1/onebot/events';
+  return (
+    <div className="connector-groups" aria-label="OneBot 接入方式">
+      {ONEBOT_GROUPS.map(({ id, title, keys }) => {
+        const fields = connector.fields.filter((field) => keys.includes(fieldKey(field)) ||
+          (id === 'advanced' && !ONEBOT_GROUPS.some((group) => group.keys.includes(fieldKey(field)))));
+        if (fields.length === 0) return null;
+        const invalid = fields.some((field) => fieldKey(field) === form.fieldError);
+        const open = id === 'api' || (id === 'reverse' && (hasPort || (!hasUrl && !hasHttpConfig))) ||
+          (id === 'direct' && hasUrl) || (id === 'http' && hasHttpConfig);
+        return (
+          <details key={id} className="connector-group" data-testid={`onebot-group-${id}`} open={open || invalid}>
+            <summary>{title}</summary>
+            {id === 'reverse' ? (
+              <p className="connector-group__note">OneBot 客户端目标：<code>ws://&lt;Ling 地址&gt;:&lt;对外端口&gt;</code>。
+                本机或内网直连可留空 Token；设置后两端须一致。</p>
+            ) : id === 'http' ? (
+              <p className="connector-group__note">HTTP 上报路径：<code>{eventsPath}</code>。
+                本机或内网直连可不填密钥；设置后与 OneBot 的上报 Token 一致。</p>
+            ) : id === 'advanced' && fields.some((field) => fieldKey(field) === 'LING_ONEBOT_SOURCE_IPS') ? (
+              <p className="connector-group__note">IP 白名单仅限制直连的反向 WebSocket 和 HTTP 上报；留空不额外限制 IP。</p>
+            ) : null}
+            <ul className="connector-fields">{fields.map(renderField)}</ul>
+          </details>
+        );
+      })}
+    </div>
+  );
+}
+
 export function ConnectorCard({
   connector,
   panelConnector,
@@ -900,8 +953,10 @@ export function ConnectorCard({
   onInstanceView,
   ...form
 }: ConnectorCardProps) {
-  const presentation = describeConnectorStatus(connector.status);
-  const runtime = connectorRuntimeLine(connector.runtime);
+  const presentation = emptyFieldsReason
+    ? { label: '状态暂不可用', tone: 'neutral' }
+    : describeConnectorStatus(connector.status, connector.status_reason);
+  const runtime = !emptyFieldsReason && connectorRuntimeLine(connector.runtime);
   const editable = connector.editable;
   const change = useMemo(
     () => buildConnectorChange(connector.fields, form.draft, form.clearKeys),
@@ -949,14 +1004,11 @@ export function ConnectorCard({
         </span>
       </div>
 
-      <p className="connector-card__hint" data-testid={`connector-${connector.id}-hint`}>
-        {presentation.hint}
-      </p>
-
-      <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
-        <strong>当前情况：</strong>
-        {renderInlineCode(connector.status_message)}
-      </p>
+      {!emptyFieldsReason ? (
+        <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
+          {renderInlineCode(connector.status_message)}
+        </p>
+      ) : null}
 
       {runtime ? (
         <p className="connector-card__runtime" data-testid={`connector-${connector.id}-runtime`}>
@@ -979,9 +1031,6 @@ export function ConnectorCard({
         dirtyInstanceIds={dirtyInstanceIds}
       >
       <h3 className="connector-card__subtitle">接入设置</h3>
-      <p className="connector-card__note">
-        保存后立即尝试连接。密码框留空表示保留已保存的密钥。
-      </p>
 
       <form
         className="connector-form"
@@ -1007,8 +1056,7 @@ export function ConnectorCard({
             {emptyFieldsReason}
           </p>
         ) : null}
-        <ul className="connector-fields">
-          {connector.fields.map((field) => {
+        <ConnectorFields connector={connector} instanceId={instanceId} form={form} renderField={(field) => {
             const key = field.key || field.name;
             return (
               <FieldRow
@@ -1022,8 +1070,7 @@ export function ConnectorCard({
                 onToggleClear={() => form.onToggleClear(key)}
               />
             );
-          })}
-        </ul>
+        }} />
 
         <div className="connector-form__actions" role="group" aria-label="保存">
           <button
@@ -1083,10 +1130,11 @@ export function ConnectorCard({
         />
       ) : null}
 
-      <p className="connector-card__guidance" data-testid={`connector-${connector.id}-guidance`}>
-        <strong>怎么改：</strong>
-        {renderInlineCode(connector.guidance)}
-      </p>
+      {!emptyFieldsReason ? (
+        <p className="connector-card__guidance" data-testid={`connector-${connector.id}-guidance`}>
+          {renderInlineCode(connector.guidance)}
+        </p>
+      ) : null}
       </ConnectorInstancePanel>
     </section>
   );
@@ -1808,7 +1856,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
             const view: ConnectorView =
               instanceId === DEFAULT_INSTANCE_ID
                 ? connector
-                : { ...connector, fields, generation: generation ?? connector.generation };
+                : instanceView ?? { ...connector, fields, runtime: { connections: null, received: null } };
             return (
               <ConnectorCard
                 /*
@@ -1819,10 +1867,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 key={connector.id}
                 connector={view}
                 /*
-                 * 面板自己那份**默认实例**视图：它不随选中变化，所以卡片上
-                 * 「四态诊断」讲的始终是"这条渠道现在怎么样"，而不是去读一个
-                 * 被换成**空字段数组**的视图（那会让面板 `draftFromFields([])`
-                 * 拿不到字段、直接抛错整块崩掉）。
+                 * 面板单独使用默认实例作为基线；卡片诊断来自选中的实例。
                  */
                 panelConnector={connector}
                 instanceId={instanceId}
@@ -1837,8 +1882,8 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 emptyFieldsReason={
                   instanceId !== DEFAULT_INSTANCE_ID && fields.length === 0
                     ? instanceUnverified[instanceFormKey(connector.id, instanceId)] === true
-                      ? '没读到这个实例的字段视图（读取失败，或响应没说明它读的是哪个实例）。下面的输入框因此是空的——它不代表这个实例的配置为空，保存前请先确认。'
-                      : '正在读取这个实例的字段视图…读到之前下面的输入框是空的，它们不代表这个实例的配置为空。'
+                      ? '无法读取该实例的配置，请刷新状态。'
+                      : '正在读取该实例的配置…'
                     : null
                 }
                 {...formPropsFor(connector.id, instanceId, fields, generation)}
@@ -1854,11 +1899,6 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         />
       ) : null}
 
-      <p className="page__hint">
-        保存是"一次切换"：先校验、再写候选修订、然后按新配置重建连接。
-        <strong>只有返回「已生效」才算成功</strong>；新配置起不来时服务端会自动恢复旧配置，
-        并在上面明确告诉你"没生效"。
-      </p>
     </section>
   );
 }

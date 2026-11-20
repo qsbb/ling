@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-import os
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -228,43 +227,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.secret_cache[pid] = secret
         app.state.revision_watcher.mark_loaded(await current_revision(session))
 
-    # OneBot **HTTP 上报入口**的密钥自检。
-    #
-    # `/v1/onebot/events` 这条路由**没有 auth 依赖**，端口 6520 默认对外发布，
-    # 所以 `LING_ONEBOT_SECRET` 是它唯一的来源判据；为空时 `verify_inbound`
-    # 一律返回 False（fail-closed，见 connectors/onebot/connector.py）。
-    #
-    # 这里**只打日志、不拒绝启动**：这条入口是"可不用"的（很多部署走
-    # WS 客户端/服务端模式，根本不配 HTTP 上报）。为了让一个没在用的入口
-    # 而让整个服务起不来，是把安全改成了可用性事故。所以：入口自己拒绝，
-    # 启动时把"没配 secret，上报会全部 403"喊出来。
-    #
-    # 级别分两档：**配了 OneBot 才 ERROR**（那时这条入口本该工作，却全 403），
-    # 完全没配 OneBot 时只 WARNING——否则每次启动都有一条"可以忽略的 ERROR"，
-    # 会把真正的 ERROR 淹掉。
-    from ling.capabilities.channels import onebot_config as _onebot_config_for_check
-
-    _onebot_cfg = _onebot_config_for_check()
-    if not _onebot_cfg.secret:
-        _onebot_in_use = bool(
-            os.environ.get("LING_ONEBOT_API_BASE")
-            or os.environ.get("LING_ONEBOT_ACCESS_TOKEN")
-            or os.environ.get("LING_ONEBOT_SELF_ID")
-            or os.environ.get("LING_ONEBOT_WS_PORT")
-            or os.environ.get("LING_ONEBOT_WS_URL")
-        )
-        _msg = (
-            "OneBot 未配置 LING_ONEBOT_SECRET：/v1/onebot/events 会拒绝**所有**"
-            "上报（403）。这条路由没有鉴权依赖，未配密钥时放行等于允许任何人"
-            "伪造 X-Self-ID + 白名单 QQ 号冒充用户。"
-            "走 WS 模式（不用 HTTP 上报）时这条入口本来就用不到；"
-            "要用 HTTP 上报，请在 OneBot 侧与 .env 里配同一个 secret。"
-        )
-        if _onebot_in_use:
-            logger.error("%s", _msg)
-        else:
-            logger.warning("%s", _msg)
-
     # ---------------------------------------------------------- 接入器构造
     #
     # 以前的写法是在这里**直接读 env 构造**（`onebot_config()` / `settings.qqbot_*`），
@@ -308,6 +270,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 server = OneBotWsServer(
                     host=config.ws_host, port=runtime_settings.onebot_ws_port,
                     app=app, connector=connector, token=runtime_settings.onebot_ws_token,
+                    source_ips=config.source_ips,
                     trusted_instance_key=("onebot", instance_id),
                 )
                 components["onebot_ws_server"] = server

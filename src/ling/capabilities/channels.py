@@ -35,13 +35,13 @@ def onebot_config():  # noqa: ANN201
         api_base=os.environ.get("LING_ONEBOT_API_BASE", "http://127.0.0.1:5700"),
         access_token=os.environ.get("LING_ONEBOT_ACCESS_TOKEN") or None,
         secret=os.environ.get("LING_ONEBOT_SECRET") or None,
+        source_ips=(os.environ.get("LING_ONEBOT_SOURCE_IPS") or "").strip(),
         self_id=os.environ.get("LING_ONEBOT_SELF_ID") or None,
         instance_id=os.environ.get("LING_ONEBOT_INSTANCE_ID", "onebot-default"),
         supports_group=os.environ.get("LING_ONEBOT_SUPPORTS_GROUP", "1") == "1",
         supports_proactive=os.environ.get("LING_ONEBOT_PROACTIVE", "0") == "1",
         media_allowed_hosts=hosts or DEFAULT_MEDIA_HOSTS,
-        # WS 服务端监听地址。默认只听本机：要对外必须显式设成 0.0.0.0，
-        # 且没有 token 时服务端会拒绝启动（见 connectors/onebot/ws_server.py）。
+        # WS 默认只监听本机；跨容器连接需显式修改监听地址。
         ws_host=os.environ.get("LING_ONEBOT_WS_HOST", "127.0.0.1"),
     )
 
@@ -321,8 +321,8 @@ async def channel_connectivity(session, *, settings: object, app: Any) -> list[d
             else:
                 configured |= bool(resolved.text("LING_ONEBOT_WS_URL")
                                    or fields["LING_ONEBOT_SECRET"].configured
-                                   or (resolved.text("LING_ONEBOT_WS_PORT")
-                                       and fields["LING_ONEBOT_WS_TOKEN"].configured))
+                                   or resolved.text("LING_ONEBOT_SOURCE_IPS")
+                                   or resolved.text("LING_ONEBOT_WS_PORT"))
         connectors = runtime.connectors(scope) if runtime is not None else ()
         proactive_ready = any(c.capabilities().enabled and c.capabilities().supports_proactive
                               for c in connectors)

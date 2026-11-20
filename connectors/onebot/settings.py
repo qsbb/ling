@@ -70,9 +70,7 @@ class OneBotConfig:
     # 反向上报签名密钥。配了 secret 后 OneBot 会在每次上报带
     # X-Signature: sha1=<hmac_sha1(secret, body)>，必须校验。
     #
-    # **这是入站的必要条件**：为空时 ``verify_inbound`` 一律返回 False。
-    # 原实现为空时放行（"依赖网络隔离"），但 ``/v1/onebot/events`` 没有
-    # 任何 auth 依赖且端口默认对外发布，等于谁都能冒充白名单里的 QQ 号。
+    # 未配置时只接收本机或内网直连的上报。
     secret: str | None = None
     # 机器人自己的 QQ 号。用于校验上报的 X-Self-ID 与事件 self_id 一致，
     # 不一致说明上报来自别的实例，应拒绝。
@@ -89,7 +87,7 @@ class OneBotConfig:
     # QQ 单条消息文本上限（实践中约 4500，留余量）
     max_text_length: int = 4000
     # 反向 WS **服务端**监听的地址。默认只听本机：NapCat 通常在同机/同网段，
-    # 需要对外时显式改成 0.0.0.0（改之前先确认 token 已配，否则启动会直接失败）。
+    # 跨容器或跨主机时显式指定可达的监听地址。
     ws_host: str = "127.0.0.1"
     # 下载媒体时允许的域名（主机名，不含端口）。见 ``DEFAULT_MEDIA_HOSTS``。
     media_allowed_hosts: frozenset[str] = field(
@@ -121,6 +119,8 @@ class OneBotConfig:
     voice_max_bytes: int = DEFAULT_VOICE_MAX_BYTES
     # 短时签名 URL 的有效期（秒）。签名由外部回调提供，本层只透传。
     voice_signed_url_ttl_seconds: int = 300
+    # 可选的来源 IP 限制，作用于 HTTP 上报及反向 WS（逗号分隔）。
+    source_ips: str = ""
 
     def voice_options(self) -> VoiceSendOptions:
         """把语音发送相关的字段收成 `VoiceSendOptions`。"""
