@@ -145,39 +145,42 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
 }
 
+const HTTP_ERROR_CODES: Partial<Record<number, string>> = {
+  401: 'unauthorized',
+  403: 'forbidden',
+  404: 'not_found',
+  409: 'conflict',
+  429: 'rate_limited',
+};
+
 export async function parseErrorResponse(response: Response): Promise<ApiError> {
-  let text = '';
-  try {
-    text = await response.text();
-  } catch {
-    text = '';
-  }
   let payload: unknown = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = null;
-    }
+  try {
+    payload = await response.json();
+  } catch {
+    // A proxy or an older backend may return a different response shape.
   }
+  const fallback = `请求失败（HTTP ${response.status}）`;
+  const traceId = response.headers.get('X-Trace-Id');
   const error = (payload as { error?: Record<string, unknown> } | null)?.error;
-  if (error && typeof error === 'object') {
-    const code = typeof error.code === 'string' ? error.code : 'internal';
-    const message = typeof error.message === 'string' ? error.message : response.statusText;
+  if (error && typeof error.code === 'string' && error.code) {
     return new ApiError(
       response.status,
-      code,
-      message || `请求失败（HTTP ${response.status}）`,
+      error.code,
+      typeof error.message === 'string' && error.message ? error.message : fallback,
       error.retriable === true,
       typeof error.detail === 'string' ? error.detail : null,
-      typeof error.trace_id === 'string' ? error.trace_id : null,
+      typeof error.trace_id === 'string' ? error.trace_id : traceId,
     );
   }
+  const clientError = response.status >= 400 && response.status < 500;
   return new ApiError(
     response.status,
-    response.status === 401 ? 'unauthorized' : 'internal',
-    text.slice(0, 300) || response.statusText || `请求失败（HTTP ${response.status}）`,
-    response.status >= 500,
+    HTTP_ERROR_CODES[response.status] ?? (clientError ? 'invalid_request' : 'internal'),
+    fallback,
+    response.status >= 500 || response.status === 429,
+    null,
+    traceId,
   );
 }
 

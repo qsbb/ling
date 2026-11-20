@@ -413,7 +413,9 @@ async def test_scope_and_write_guards(logged_in: TestEnv) -> None:
         result = await logged_in.client.get(f"/v1/sessions/{manageable}/dialogue-policy")
         assert result.status_code == 200, result.text
     url = f"/v1/sessions/{window}/dialogue-policy/preview"
-    assert (await logged_in.client.post(url, json=change(False))).status_code == 403
+    no_origin = logged_in.client.build_request("POST", url, json=change(False))
+    del no_origin.headers["Origin"]
+    assert (await logged_in.client.send(no_origin)).status_code == 403
     assert (await logged_in.client.post(url, json=change(False), headers={"Origin": "https://elsewhere.test"})).status_code == 403
     assert (await logged_in.client.post(url, content="{}", headers={**ORIGIN, "Content-Type": "text/plain"})).status_code == 422
     async with AsyncClient(transport=ASGITransport(app=logged_in.app), base_url="http://testserver") as member:

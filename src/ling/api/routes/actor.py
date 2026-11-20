@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from ling.api.deps import CurrentAuth, DbSession, PersonaDep, SettingsDep
 from ling.api.errors import LingError
+from ling.api.guards import OwnerWrite
 from ling.contracts.v1 import ErrorCode, Origin
 from ling.domains.persona.scenarios import (
     SCENARIOS,
@@ -164,7 +165,7 @@ async def get_persona(auth: CurrentAuth, persona: PersonaDep) -> PersonaActiveOu
 @router.put("/persona", response_model=PersonaActiveOut)
 async def update_persona(
     body: PersonaUpdate,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     persona: PersonaDep,
     session: DbSession,
     settings: SettingsDep,

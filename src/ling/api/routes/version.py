@@ -37,8 +37,10 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Request, Response
 
+from ling.api import guards
 from ling.api.deps import CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError
+from ling.api.guards import OwnerWriteUpdate
 from ling.config import Settings
 from ling.contracts.v1 import (
     ErrorCode,
@@ -68,6 +70,13 @@ from ling.updates.service import (
 
 logger = logging.getLogger("ling.api.version")
 
+# Compatibility for the old update-route imports.
+DETAIL_CONTENT_TYPE_REQUIRED = guards.DETAIL_CONTENT_TYPE_REQUIRED
+DETAIL_ORIGIN_MISMATCH = guards.DETAIL_ORIGIN_MISMATCH
+DETAIL_ORIGIN_REQUIRED = guards.DETAIL_ORIGIN_REQUIRED
+_origin_problem = guards._origin_problem
+_require_json_content_type = guards._require_json_content_type
+
 # 固定地址：不接受客户端传入的 URL，也不跟随重定向。
 GITHUB_RELEASE_URL = "https://api.github.com/repos/qsbb/ling/releases/latest"
 # tag → commit 解析也只允许这一个仓库的 API host（不接受任何用户提供的 URL）。
@@ -85,10 +94,7 @@ _MAX_TAG_BYTES = 200
 MAX_UPDATE_BODY_BYTES = 4096
 
 # POST 校验失败时使用的固定 detail 码（前端按码显示文案，不解析自然语言）。
-DETAIL_CONTENT_TYPE_REQUIRED = "content_type_required"
 DETAIL_UPDATE_HEADER_REQUIRED = "update_header_required"
-DETAIL_ORIGIN_REQUIRED = "origin_required"
-DETAIL_ORIGIN_MISMATCH = "origin_mismatch"
 DETAIL_INVALID_BODY = "invalid_request_body"
 DETAIL_BODY_TOO_LARGE = "request_body_too_large"
 
@@ -621,86 +627,8 @@ def _parse_submission(raw: bytes) -> UpdateSubmission:
     )
 
 
-def _origin_key(scheme: str, netloc: str) -> tuple[str, str, int] | None:
-    """``(scheme, host, port)``：同源判定必须包含 scheme。
-
-    ``http://host:443`` 与 ``https://host:443`` 同端口但不同源；只看 host/port
-    会把一次明文请求当成 TLS 请求放行。默认端口按 scheme 归一化。
-    """
-    lowered = scheme.strip().lower()
-    if lowered not in ("http", "https"):
-        return None
-    try:
-        parsed = urlsplit(f"{lowered}://{netloc}")
-        host = (parsed.hostname or "").lower().rstrip(".")
-        port = parsed.port
-    except ValueError:
-        return None
-    if not host:
-        return None
-    if port is None:
-        port = 443 if lowered == "https" else 80
-    if not 1 <= port <= 65535:
-        return None
-    return lowered, host, port
-
-
-def _origin_problem(request: Request, settings: Settings) -> str | None:
-    """cookie 请求必须同源；Bearer 可省略 Origin，但带了就一样要校验。
-
-    这里用 ``request.url``（uvicorn 的 ``--proxy-headers`` 已按可信代理配置
-    还原 scheme/host），**不**自己解析 ``X-Forwarded-*``：盲信任请求头等于
-    把同源校验交给攻击者。
-
-    浏览器发出的 Origin 只有 ``scheme://host[:port]``。任何带 path/query/
-    fragment/userinfo 的 Origin 都不是浏览器同源请求，直接拒绝——否则
-    ``http://host/v1/../../`` 这类字符串会绕过粗粒度的前缀比较。
-    """
-    origin = request.headers.get("origin")
-    cookie_auth = bool(request.cookies.get(settings.cookie_name))
-    if origin is None:
-        return DETAIL_ORIGIN_REQUIRED if cookie_auth else None
-    if not origin or any(ch.isspace() for ch in origin):
-        # 浏览器不会在 Origin 里带空白；带空白的一律不是可信同源请求。
-        return DETAIL_ORIGIN_MISMATCH
-    raw = origin
-    try:
-        parsed = urlsplit(raw)
-    except ValueError:
-        return DETAIL_ORIGIN_MISMATCH
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-        return DETAIL_ORIGIN_MISMATCH
-    if parsed.username or parsed.password:
-        return DETAIL_ORIGIN_MISMATCH
-    # 只接受裸 origin：空 path 或单个 "/"；query/fragment 一律拒绝。
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        return DETAIL_ORIGIN_MISMATCH
-    origin_key = _origin_key(parsed.scheme, parsed.netloc)
-    request_key = _origin_key(request.url.scheme, request.url.netloc)
-    if origin_key is None or request_key is None or origin_key != request_key:
-        return DETAIL_ORIGIN_MISMATCH
-    return None
-
-
-def _require_json_content_type(request: Request) -> None:
-    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if media_type != "application/json":
-        raise LingError(
-            ErrorCode.invalid_request,
-            "更新请求必须是 application/json",
-            status_code=422,
-            detail=DETAIL_CONTENT_TYPE_REQUIRED,
-        )
-
-
-def _require_update_headers(request: Request) -> None:
-    """写接口的固定头：``Content-Type: application/json`` + ``X-Ling-Update: 1``。
-
-    ``X-Ling-Update`` 是**防误触标记**（避免表单/普通脚本误打写接口），真正的
-    跨站防护是同源校验。按需检查只能写一条刷新请求、不改任何状态，前端不发这个
-    头，所以它只调 :func:`_require_json_content_type`（安装写接口仍两者都要）。
-    """
-    _require_json_content_type(request)
+def _require_update_confirmation(request: Request) -> None:
+    """安装请求的防误触标记；只排队检查更新的接口不要求它。"""
     if request.headers.get("x-ling-update") != "1":
         raise LingError(
             ErrorCode.invalid_request,
@@ -758,7 +686,7 @@ def _conflict(detail: str) -> LingError:
 
 @router.post("/version/update-requests", status_code=201)
 async def create_update_request(
-    auth: CurrentAuth,
+    auth: OwnerWriteUpdate,
     settings: SettingsDep,
     request: Request,
     response: Response,
@@ -771,13 +699,6 @@ async def create_update_request(
     返回 409 + 固定 detail，让调用方去用 ``image-update-requests``。
     """
     response.headers["Cache-Control"] = "no-store"
-    if auth.user.role != "owner":
-        raise LingError(
-            ErrorCode.forbidden,
-            "只有所有者可以发起更新",
-            status_code=403,
-            detail="not_owner",
-        )
     if image_mode_active(settings):
         raise LingError(
             ErrorCode.conflict,
@@ -785,15 +706,7 @@ async def create_update_request(
             status_code=409,
             detail="image_mode_requires_image_channel",
         )
-    _require_update_headers(request)
-    origin_problem = _origin_problem(request, settings)
-    if origin_problem is not None:
-        raise LingError(
-            ErrorCode.forbidden,
-            "更新请求来源校验失败",
-            status_code=403,
-            detail=origin_problem,
-        )
+    _require_update_confirmation(request)
     raw = await _read_update_body(request)
     try:
         submission = _parse_submission(raw)
@@ -2946,7 +2859,7 @@ async def image_update_status(
 
 @router.post("/version/image-update-requests", status_code=201)
 async def create_image_update_request(
-    auth: CurrentAuth,
+    auth: OwnerWriteUpdate,
     settings: SettingsDep,
     request: Request,
     response: Response,
@@ -2962,17 +2875,7 @@ async def create_image_update_request(
     5. 在 ``requests/.lock`` 内复查重复/进行中，再临时文件 + rename 原子写入。
     """
     response.headers["Cache-Control"] = "no-store"
-    if auth.user.role != "owner":
-        raise _image_error("not_owner")
-    _require_update_headers(request)
-    origin_problem = _origin_problem(request, settings)
-    if origin_problem is not None:
-        raise LingError(
-            ErrorCode.forbidden,
-            "更新请求来源校验失败",
-            status_code=403,
-            detail=origin_problem,
-        )
+    _require_update_confirmation(request)
     if not _image_limiter(request).allow(auth.user.id):
         raise _image_error("rate_limited")
     raw = await _read_update_body(request)
@@ -3060,7 +2963,7 @@ async def create_image_update_request(
 
 @router.post("/version/image-update-checks", status_code=202)
 async def create_image_update_check(
-    auth: CurrentAuth,
+    auth: OwnerWriteUpdate,
     settings: SettingsDep,
     request: Request,
     response: Response,
@@ -3087,17 +2990,6 @@ async def create_image_update_check(
       安装请求 ``POST /v1/version/image-update-requests`` 才写安装任务。
     """
     response.headers["Cache-Control"] = "no-store"
-    if auth.user.role != "owner":
-        raise _image_error("not_owner")
-    _require_json_content_type(request)
-    origin_problem = _origin_problem(request, settings)
-    if origin_problem is not None:
-        raise LingError(
-            ErrorCode.forbidden,
-            "更新请求来源校验失败",
-            status_code=403,
-            detail=origin_problem,
-        )
     if not _image_limiter(request).allow(auth.user.id):
         raise _image_error("rate_limited")
     raw = await _read_update_body(request)

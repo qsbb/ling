@@ -35,6 +35,7 @@ from unittest.mock import patch
 import pytest
 
 from ling.api.errors import LingError
+from ling.api.guards import OwnerWriteGuard, require_owner
 from ling.api.routes.chat import MAX_VOICE_BYTES, VOICE_MIME_BY_CONTAINER
 from ling.api.routes.settings import (
     VOICE_REFERENCE_RETENTION_DAYS,
@@ -87,6 +88,7 @@ class _User:
 @dataclass
 class _Auth:
     user: _User
+    source: str = "cookie"
 
 
 class _Request:
@@ -97,7 +99,9 @@ class _Request:
     """
 
     def __init__(self, *, origin: str | None = None, cookie: str | None = None) -> None:
-        self.headers = {"origin": origin} if origin else {}
+        self.headers = {"content-type": "multipart/form-data; boundary=test"}
+        if origin is not None:
+            self.headers["origin"] = origin
         self.cookies = {"ling_session": cookie} if cookie is not None else {}
         self.url = _URL()
         self.app = _App()
@@ -148,9 +152,15 @@ async def _call(
     auth: _Auth | None = None,
     request: _Request | None = None,
 ) -> dict[str, object]:
+    auth = auth or _Auth(user=_User())
+    # Direct tests exercise the shared dependencies before the upload body is
+    # read. The live HTTP tests separately prove FastAPI wires them in.
+    request = request or _Request(origin="http://127.0.0.1:8080")
+    authorized = OwnerWriteGuard(content_type="multipart/form-data")(
+        request, require_owner(auth)  # type: ignore[arg-type]
+    )
     return await upload_voice_reference(
-        request=request or _Request(),  # type: ignore[arg-type]
-        auth=auth or _Auth(user=_User()),  # type: ignore[arg-type]
+        auth=authorized,
         session=_Session(),  # type: ignore[arg-type]
         settings=_Settings(),  # type: ignore[arg-type]
         upload=upload,  # type: ignore[arg-type]

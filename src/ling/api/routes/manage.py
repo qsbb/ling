@@ -17,7 +17,9 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
+from ling.api.error_handlers import PublicValidationError
 from ling.api.errors import LingError
+from ling.api.guards import OwnerWrite, OwnerWriteAction
 from ling.audit import audit_event
 from ling.config import Settings
 from ling.contracts.v1 import (
@@ -1674,18 +1676,16 @@ class RenameSubjectBody(BaseModel):
 
 @router.patch("/accounts/subjects/{subject_id}")
 async def rename_subject(
-    subject_id: str, body: RenameSubjectBody, auth: CurrentAuth, session: DbSession
+    subject_id: str, body: RenameSubjectBody, auth: OwnerWrite, session: DbSession
 ) -> dict:
     from ling.domains.identity.service import IdentityService
 
-    if auth.user.role not in {"owner", "admin"}:
-        raise LingError(ErrorCode.forbidden, "需要管理员权限", status_code=403)
     subject = await IdentityService(session).rename_subject(subject_id, body.display_name)
     return {"subject_id": subject.id, "display_name": subject.display_name}
 
 
 @router.post("/accounts/subjects/merge")
-async def merge_subjects(body: MergeSubjectBody, auth: CurrentAuth, session: DbSession) -> dict:
+async def merge_subjects(body: MergeSubjectBody, auth: OwnerWrite, session: DbSession) -> dict:
     """把两个 subject 认成同一个人。**只写一个指针，不搬数据。**
 
     数据不搬动是为了能拆：拆开时只需要清掉指针，账号和记忆立刻回到原主。
@@ -1703,7 +1703,7 @@ async def merge_subjects(body: MergeSubjectBody, auth: CurrentAuth, session: DbS
 
 
 @router.post("/accounts/subjects/{source_id}/unmerge")
-async def unmerge_subject(source_id: str, auth: CurrentAuth, session: DbSession) -> dict:
+async def unmerge_subject(source_id: str, auth: OwnerWriteAction, session: DbSession) -> dict:
     """把某个 subject 从合并里拆出来。
 
     除了清指针，还会按 `source_account` 把**合并期间写在别人名下**的记忆
@@ -1721,7 +1721,7 @@ async def unmerge_subject(source_id: str, auth: CurrentAuth, session: DbSession)
 
 
 @router.post("/accounts/bind")
-async def bind_account(body: BindAccountBody, auth: CurrentAuth, session: DbSession) -> dict:
+async def bind_account(body: BindAccountBody, auth: OwnerWrite, session: DbSession) -> dict:
     """绑定渠道账号（QQ 号 / 微信 openid 等）。
 
     **这一步是 OneBot/QQ 接入的前置条件**：入站事件要先解析成自然人，
@@ -1755,7 +1755,7 @@ async def bind_account(body: BindAccountBody, auth: CurrentAuth, session: DbSess
 
 
 @router.post("/accounts/{account_id}/prove")
-async def prove_account(account_id: str, auth: CurrentAuth, session: DbSession) -> dict:
+async def prove_account(account_id: str, auth: OwnerWriteAction, session: DbSession) -> dict:
     """把绑定标记为已证明（人工确认账号归属后调用）。"""
     from ling.api.errors import LingError
     from ling.contracts.v1 import ErrorCode
@@ -1776,7 +1776,7 @@ async def prove_account(account_id: str, auth: CurrentAuth, session: DbSession) 
 
 
 @router.delete("/accounts/{account_id}")
-async def unbind_account(account_id: str, auth: CurrentAuth, session: DbSession) -> dict:
+async def unbind_account(account_id: str, auth: OwnerWriteAction, session: DbSession) -> dict:
     """解绑。保留 revoked_at 供审计，解绑后不再解析成该自然人。"""
     from ling.api.errors import LingError
     from ling.contracts.v1 import ErrorCode
@@ -1834,7 +1834,8 @@ class ToolCallBody(BaseModel):
         ``False`` 然后继续——那样请求会 200，调用方会以为自己的确认生效了。
         """
         if isinstance(data, dict) and "confirmed" in data:
-            raise ValueError(
+            raise PublicValidationError(
+                "confirmed",
                 "这个端点不能自证确认（confirmed 不是请求体字段）："
                 "不可逆动作的确认必须走提议端点，"
                 "即 POST /v1/sessions/{id}/recall-proposals/{proposal_id}/confirm"
@@ -1873,7 +1874,7 @@ async def call_tool(
     tool_id: str,
     body: ToolCallBody,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
 ) -> dict:
     """执行工具（**永远以"未确认"身份执行**）。

@@ -74,11 +74,14 @@ async def _upload_without_origin(
     是因为"缺 Origin"与"Origin 不对"是两条不同的拒绝路径，实现抄错时会只漏
     其中一条。
     """
-    return await logged_in.client.post(
+    request = logged_in.client.build_request(
+        "POST",
         URL,
         # 文件名故意带路径穿越：实现**一次都不该用**它。
         files={"upload": ("../../etc/evil.wav", data, content_type)},
     )
+    del request.headers["Origin"]
+    return await logged_in.client.send(request)
 
 
 async def _upload_with_origin(logged_in: TestEnv, data: bytes, *, content_type: str = "audio/wav"):  # noqa: ANN202
@@ -273,7 +276,7 @@ async def test_anonymous_cannot_upload(web_env: TestEnv) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 五·五、同源校验在 HTTP 层的两条（与单测的 `_Request` 替身配对）
+# 五·五、同源校验在 HTTP 层
 # --------------------------------------------------------------------------- #
 
 

@@ -524,6 +524,7 @@ async def test_missing_origin_is_rejected(
     web_env: TestEnv, logged_in: TestEnv, fake_runtime: FakeRuntime  # noqa: F811
 ) -> None:
     """cookie 会话必须带 Origin；缺了就是 fail-closed（不是"默认放行"）。"""
+    del web_env.client.headers["Origin"]
     response = await web_env.client.put(
         f"{ENDPOINT}/onebot",
         json={"set": {"LING_ONEBOT_ACCESS_TOKEN": "x"}},

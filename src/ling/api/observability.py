@@ -141,9 +141,8 @@ _STATUS_HINTS: dict[int, str] = {
     504: "上游超时",
 }
 
-# SPA 兜底路由的模板。它匹配**任何** GET，所以模板本身不携带信息——
-# 命中它就等于"没有路由"，退回 `_safe_path`。
-_CATCH_ALL_TEMPLATE = "/{full_path:path}"
+# SPA 兜底不携带具体路由信息，按原始路径脱敏。使用不含转换器的模板。
+_CATCH_ALL_TEMPLATE = "/{full_path}"
 
 # 未命中路由时的判据：含数字且不算短的段、或超长段，一律当 id
 # （`sess_ab12cd34`、`1728394`、uuid、一长串 token 都落在这里）。
@@ -254,7 +253,11 @@ def route_template(request: Request) -> str:
     """
     route = request.scope.get("route")
     local = getattr(route, "path", None)
-    if not isinstance(local, str) or not local or local == _CATCH_ALL_TEMPLATE:
+    if (
+        not isinstance(local, str)
+        or not local
+        or getattr(route, "path_format", None) == _CATCH_ALL_TEMPLATE
+    ):
         return _safe_path(request.url.path)
     # 静态挂载（`app.mount("/assets", StaticFiles(...))`）没有"模板"可言，
     # 用挂载点当接口名，免得每个文件名在日志里各成一行。

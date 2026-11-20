@@ -124,17 +124,12 @@ def _assert_error_shape(response, expected_code: str = "invalid_request") -> Non
 
 
 def _assert_pydantic_error_shape(response, field: str | None = None) -> None:
-    """统一形状 + 指明字段 + 带 pydantic 原始报错（`error.detail`）。
-
-    `detail` 非空是"这条 422 真由 pydantic 的 `RequestValidationError` 抛出、
-    再被 `create_app` 的前缀处理器翻译"的证据：端点内显式校验抛的 `LingError`
-    不带 detail。约束若又退回端点（task-105 的做法），这里会红。
-    """
+    """框架校验返回字段名，不回显验证器的原始说明或输入。"""
     _assert_error_shape(response)
     error = response.json()["error"]
     if field is not None:
         assert field in error["message"], error
-    assert error["detail"], f"应当保留 pydantic 的原始校验信息（detail）: {error}"
+    assert error["detail"] == error["field"] == (field or "body"), error
     # trace_id 必须真的能定位那一次请求：体内有、响应头同名
     assert error["trace_id"], error
     assert response.headers.get("X-Trace-Id") == error["trace_id"], response.headers
@@ -143,63 +138,48 @@ def _assert_pydantic_error_shape(response, field: str | None = None) -> None:
 # ------------------------------------------------------- 错误形状的作用范围
 
 
-async def test_validation_errors_outside_memory_keep_fastapi_default(
+async def test_validation_errors_outside_memory_use_v1_contract(
     logged_in: TestEnv,
 ) -> None:
-    """非记忆路径仍是 FastAPI 默认的 `{"detail":[...]}`。
-
-    前缀处理器只覆盖 `/v1/memory*`、`/v1/core-memory*`；把它改成全局会让
-    其它端点（这里是登录与隔离模式）的 422 形状一起变——那是没被批准的
-    行为变更，本用例就是这条边界的探针。
-    """
     login = await logged_in.client.post("/v1/auth/login", json={})
-    assert login.status_code == 422, login.text
-    assert set(login.json()) == {"detail"}, login.text
-    assert isinstance(login.json()["detail"], list)
+    _assert_pydantic_error_shape(login, "username")
 
-    # 同样带 pattern 的字段，但不在记忆前缀内 → 仍是默认形状
     isolation = await logged_in.client.put("/v1/isolation", json={"mode": "nonsense"})
-    assert isolation.status_code == 422, isolation.text
-    assert set(isolation.json()) == {"detail"}, isolation.text
+    _assert_pydantic_error_shape(isolation, "mode")
+    assert "nonsense" not in isolation.text
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "field"),
     [
-        {"args": []},
-        {"confirmed": "notabool"},
-        {"window_id": 3},
+        ({"args": []}, "args"),
+        ({"confirmed": "notabool"}, "confirmed"),
+        ({"synthetic-unknown-field": "synthetic-unknown-value"}, None),
+        ({"window_id": 3}, "window_id"),
     ],
 )
-async def test_tools_validation_errors_keep_fastapi_default(
-    logged_in: TestEnv, payload: dict[str, object]
+async def test_tools_validation_errors_use_v1_contract(
+    logged_in: TestEnv, payload: dict[str, object], field: str | None
 ) -> None:
-    """非记忆端点（tools）的 422 仍是 FastAPI 原生 `{"detail":[...]}`。
-
-    前缀处理器只覆盖 `/v1/memory*`、`/v1/core-memory*`；如果把它扩大成全局，
-    tools 这类既有端点的客户端就解析不到 `detail` 列表了。
-    """
-    response = await logged_in.client.post("/v1/tools/anything/call", json=payload)
-    assert response.status_code == 422, response.text
-    body = response.json()
-    assert set(body) == {"detail"}, body
-    assert isinstance(body["detail"], list)
+    response = await logged_in.client.post(
+        "/v1/tools/anything/call", json=payload, headers={"Origin": "http://testserver"}
+    )
+    _assert_pydantic_error_shape(response, field)
+    if field == "confirmed":
+        assert "确认必须走提议端点" in response.json()["error"]["message"]
+        assert "notabool" not in response.text
+    if field is None:
+        assert "synthetic-unknown-field" not in response.text
+        assert "synthetic-unknown-value" not in response.text
 
 
 @pytest.mark.parametrize("path", ["/v1/memoryfoo", "/v1/memories"])
-async def test_memory_prefix_does_not_match_lookalike_paths(logged_in: TestEnv, path: str) -> None:
-    """`/v1/memoryfoo`、`/v1/memories` 不是记忆端点，不能落进统一 422 形状。
-
-    前缀匹配必须是整段（`path == prefix or path.startswith(prefix + "/")`）。
-    改成裸 `startswith("/v1/memory")` 会把这两个路径也交给前缀处理器。
-    它们没有路由，实际命中 404（有前端构建时是 SPA 兜底的
-    `{"detail":"not found"}`，否则是 Starlette 默认的 `{"detail":"Not Found"}`）。
-    """
+async def test_unknown_memory_paths_use_v1_not_found(logged_in: TestEnv, path: str) -> None:
     response = await logged_in.client.get(path)
     assert response.status_code == 404, response.text
     body = response.json()
-    assert set(body) == {"detail"}, body
-    assert body["detail"].lower() == "not found", body
+    assert body["schema_version"] == "v1", body
+    assert body["error"]["code"] == "not_found", body
 
 
 # ---------------------------------------------- /openapi.json 的约束保真度
@@ -637,7 +617,7 @@ async def test_post_memory_pydantic_only_fields_use_error_shape(
 ) -> None:
     """端点**没有**显式校验的字段也必须返回统一形状。
 
-    这几条只有 pydantic 拦得住，所以它们绿 = 前缀处理器真的在翻译
+    这几条只有 pydantic 拦得住，所以它们绿 = v1 处理器真的在翻译
     `RequestValidationError`，而不是端点里另写了校验。
     """
     payload = {

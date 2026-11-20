@@ -36,6 +36,7 @@ from sqlalchemy import and_, func, or_, select
 
 from ling.api.deps import CurrentAuth, DbSession, PersonaDep
 from ling.api.errors import LingError
+from ling.api.guards import OwnerWrite, OwnerWriteAction
 
 # 与旧接口共用同一份字段定义与序列化，避免"哪些字段可改 / 场景键怎么报错"
 # 在两个接口里各写一份、然后走散。`actor.py` 不在导入期反向依赖本模块，
@@ -128,16 +129,6 @@ class ActivateOut(BaseModel):
     config_revision: int
 
 
-def _require_owner(auth: CurrentAuth) -> None:
-    if str(getattr(auth.user, "role", "")) != "owner":
-        raise LingError(
-            ErrorCode.forbidden,
-            "只有所有者可以修改人格",
-            status_code=403,
-            detail="not_owner",
-        )
-
-
 def _not_found(persona_id: str) -> LingError:
     return LingError(
         ErrorCode.not_found,
@@ -187,7 +178,7 @@ async def list_personas(auth: CurrentAuth, persona: PersonaDep) -> PersonaListOu
 
 @router.post("/personas", response_model=PersonaOut, status_code=201)
 async def create_persona(
-    body: PersonaCreate, auth: CurrentAuth, persona: PersonaDep, session: DbSession
+    body: PersonaCreate, auth: OwnerWrite, persona: PersonaDep, session: DbSession
 ) -> PersonaOut:
     """新建一张人格卡。**id 由服务端生成**（``persona_<slug>-<6 位随机>``）。
 
@@ -195,7 +186,6 @@ async def create_persona(
     用户的第一件事通常是写内容，创建即生效等于把正在用的人格先换成一个
     空的。"设为当前"要显式调 ``POST /v1/personas/{id}/activate``。
     """
-    _require_owner(auth)
     _validate_body(body)
     settings = _settings()
     view = await persona.create(
@@ -243,7 +233,7 @@ async def get_persona_detail(
 async def update_persona_detail(
     persona_id: str,
     body: PersonaUpdate,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     persona: PersonaDep,
     session: DbSession,
 ) -> PersonaOut:
@@ -252,7 +242,6 @@ async def update_persona_detail(
     与旧 `PUT /v1/persona` 的区别只有"改哪一个"：那个改的是**当前激活**
     的人格，这个改的是指定的那一个（卡片点「编辑」时用）。
     """
-    _require_owner(auth)
     validate_scenario_keys(body.scenario_prompts)
     try:
         view = await persona.update(
@@ -297,7 +286,7 @@ async def update_persona_detail(
 
 @router.delete("/personas/{persona_id}", status_code=204)
 async def delete_persona(
-    persona_id: str, auth: CurrentAuth, persona: PersonaDep, session: DbSession
+    persona_id: str, auth: OwnerWriteAction, persona: PersonaDep, session: DbSession
 ) -> None:
     """删一张卡。**当前激活的不能删**（先切走）；有非空会话的也不能删。
 
@@ -305,7 +294,6 @@ async def delete_persona(
     不是外键（见 `PersonaService.delete` 的说明）。事件保留原值 = "当时发生
     过什么"的记录不被改写。
     """
-    _require_owner(auth)
     await lock_dialogue_config(session)
     try:
         view = await persona.delete(persona_id)
@@ -383,7 +371,7 @@ async def delete_persona(
 
 @router.post("/personas/{persona_id}/activate", response_model=ActivateOut)
 async def activate_persona(
-    persona_id: str, auth: CurrentAuth, persona: PersonaDep, session: DbSession
+    persona_id: str, auth: OwnerWriteAction, persona: PersonaDep, session: DbSession
 ) -> ActivateOut:
     """切换当前激活的人格：改配置里的 ``persona_id`` 并**发布一条新修订**。
 
@@ -408,7 +396,6 @@ async def activate_persona(
       不把历史对话改归属：那等于把旧人格说过的话重新算到新人格头上；
     - 名字缓存立刻失效（切人格往往也换了名字）。
     """
-    _require_owner(auth)
     try:
         view = await persona.get(persona_id)
     except PersonaNotFoundError as exc:

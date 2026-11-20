@@ -123,7 +123,9 @@ async def test_binding_rejects_invalid_targets_stale_preview_and_unauthorized(
     window_id = await _window(env)
     url = f"/v1/sessions/{window_id}/origin-binding"
     body = {"scope": "onebot", "instance_id": "alpha"}
-    assert (await env.client.post(f"{url}/preview", json=body)).status_code == 403
+    no_origin = env.client.build_request("POST", f"{url}/preview", json=body)
+    del no_origin.headers["Origin"]
+    assert (await env.client.send(no_origin)).status_code == 403
     assert (await env.client.post(f"{url}/preview", json={"scope": "qqbot", "instance_id": "alpha"}, headers=ORIGIN)).status_code == 422
     assert (await env.client.post(f"{url}/preview", json={"scope": "onebot", "instance_id": "bravo"}, headers=ORIGIN)).status_code == 409
     assert (await env.client.post(f"{url}/preview", json={"scope": "onebot", "instance_id": "missing"}, headers=ORIGIN)).status_code == 404

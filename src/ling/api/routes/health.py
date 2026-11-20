@@ -21,7 +21,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ling.api.deps import CurrentAuth
+from ling.api.guards import OwnerAuth
 from ling.config import Settings
 
 logger = logging.getLogger("ling.api.health")
@@ -88,7 +88,7 @@ async def readyz(request: Request) -> JSONResponse:
 
 
 @router.get("/v1/health/model")
-async def model_health(request: Request, auth: CurrentAuth) -> dict[str, object]:
+async def model_health(request: Request, auth: OwnerAuth) -> dict[str, object]:
     """各职责 profile 的熔断摘要。含 ``env`` 与职责绑定，必须鉴权。"""
     settings: Settings = request.app.state.settings
     from ling.api.deps import config_service

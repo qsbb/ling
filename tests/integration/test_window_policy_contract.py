@@ -298,6 +298,7 @@ def test_json_integer_validation_matches_exported_schema(field, value, accepted)
 async def test_missing_or_cross_origin_still_rejected(logged_in: TestEnv) -> None:
     window = await create_window(logged_in)
     endpoint = f"/v1/sessions/{window}/dialogue-policy/preview"
+    del logged_in.client.headers["Origin"]
     assert (await logged_in.client.post(endpoint, json=change(False))).status_code == 403
     response = await logged_in.client.post(
         endpoint, json=change(False), headers={"Origin": "https://example.invalid"}

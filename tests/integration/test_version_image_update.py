@@ -368,9 +368,12 @@ async def test_post_cookie_requires_same_origin_and_update_header(
 ) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base)
-    missing_origin = await logged_in.client.post(
+    missing_request = logged_in.client.build_request(
+        "POST",
         "/v1/version/image-update-requests", json=_body(), headers={"X-Ling-Update": "1"}
     )
+    del missing_request.headers["Origin"]
+    missing_origin = await logged_in.client.send(missing_request)
     assert missing_origin.status_code == 403
     assert missing_origin.json()["error"]["detail"] == "origin_required"
     foreign = await logged_in.client.post(
@@ -2708,6 +2711,7 @@ async def test_check_requires_owner(logged_in: TestEnv, tmp_path: Path) -> None:
 async def test_check_requires_same_origin(logged_in: TestEnv, tmp_path: Path) -> None:
     base = _configure(logged_in, tmp_path)
     _write_status(base)
+    del logged_in.client.headers["Origin"]
     missing = await logged_in.client.post(
         "/v1/version/image-update-checks", json={"request_id": uuid.uuid4().hex}
     )

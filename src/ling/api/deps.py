@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +43,7 @@ def get_router(request: Request) -> ModelRouter:
 class AuthContext:
     user: UserView
     token: str
+    source: Literal["cookie", "bearer"]
 
 
 def authorize_message_view(auth: AuthContext, view: str) -> bool:
@@ -59,7 +60,9 @@ def authorize_message_view(auth: AuthContext, view: str) -> bool:
 async def current_auth(request: Request, session: DbSession) -> AuthContext:
     settings: Settings = request.app.state.settings
     token = request.cookies.get(settings.cookie_name) or ""
+    source: Literal["cookie", "bearer"] = "cookie"
     if not token:
+        source = "bearer"
         header = request.headers.get("authorization", "")
         if header.lower().startswith("bearer "):
             token = header[7:].strip()
@@ -82,7 +85,7 @@ async def current_auth(request: Request, session: DbSession) -> AuthContext:
                 status_code=403,
                 detail="must_change_password",
             )
-    return AuthContext(user=user, token=token)
+    return AuthContext(user=user, token=token, source=source)
 
 
 CurrentAuth = Annotated[AuthContext, Depends(current_auth)]

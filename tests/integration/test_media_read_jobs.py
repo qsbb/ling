@@ -26,7 +26,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from ling.contracts.v1 import MediaReadJobState
+from ling.contracts.v1 import ErrorResponse, MediaReadJobState
 from ling.domains.consent.service import ConsentService
 from ling.domains.media.jobs import (
     MEDIA_READ_QUEUE_DEADLINE,
@@ -296,7 +296,9 @@ async def test_missing_feedback_mode_says_it_is_required(logged_in: TestEnv) -> 
     )
 
     assert r.status_code == 422, r.text
-    assert "feedback_mode 必填" in r.text
+    error = ErrorResponse.model_validate(r.json()).error
+    assert error.code == "invalid_request" and error.field == "feedback_mode"
+    assert "feedback_mode 必填" in error.message and "evidence_only" in error.message
 
 
 async def test_body_rejects_other_feedback_modes(logged_in: TestEnv) -> None:  # noqa: F811

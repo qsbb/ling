@@ -9,8 +9,11 @@
              "detail": null, "trace_id": "tr_..." } }
 ```
 
-错误码集合见 `src/ling/contracts/v1.py` §7。HTTP 状态码：400/422 请求问题、401 未登录、
-403 越权、404 不存在、409 冲突、429 限速、500 内部、503 供应商不可用。
+错误码集合见 `src/ling/contracts/v1.py`。HTTP 状态码：400/422 请求问题、401 未登录、
+403 越权、404 不存在、405 不支持该方法、409 冲突、429 限速、500 内部、503 供应商不可用。
+框架参数校验返回 `422 invalid_request`，`error.field` 与 `error.detail` 标明首个出错的字段；
+无法识别字段时只报告请求位置，不回显输入或解析器原文。端点明确提供的固定操作提示仍保留。
+平台回调用于验签或确认收件的响应仍遵循各自协议。
 
 ## 1. 认证
 
@@ -21,6 +24,14 @@
 | GET | `/v1/auth/me` | 当前用户；未登录 401 |
 
 `user` 形状：`{id, username, role, subject_id, display_name}`。
+
+会话、记忆和个人偏好仍按登录身份与数据归属授权。修改全局设置、接入器、人格、
+对话策略、身份绑定、触发安装或手动检查更新、手动告警和直接调用管理工具均要求 `owner`。
+这些操作以 Cookie 认证时必须带与请求 URL 同源的 `Origin`；只用 Bearer 认证时不检查
+`Origin`。两者同时出现时仍优先使用会话 Cookie。管理请求携带的数据默认用
+`application/json`；无请求体的管理操作不用为校验补一个空对象，音色上传保持 `multipart/form-data`。
+运维摘要、实例级统计和提示词快照只对所有者开放；运行日志仍允许 `owner` 或 `admin` 查看。
+这些是控制台 API 的要求，不改变各平台回调的配置和鉴权。
 
 ## 2. 会话（窗口）
 
@@ -313,7 +324,7 @@ cancelled/expired`。所以前端可以放心轮询 GET。
 | POST | `/v1/settings/providers/{provider_id}/probe` | `{ok, detail, latency_ms, models[], checked_at}`（只读，不写修订） |
 | GET | `/v1/settings/usage` | `{day, usage: {provider_id: {used_tokens, estimated}}, limits: {provider_id: n \| null}}`；`estimated=true` 表示当日账里含本地估算（部分调用没拿到供应商 usage 回执） |
 | GET | `/v1/settings/connectors` | `{schema_version: "v2", as_of, can_edit, connectors: [{id, label, configured, enabled, status, status_reason, status_message, guidance, editable, storage, generation, activation, fields[], runtime}], access: {id, generation, activation, editable, fields[]}}`；接入器诊断 **+ 可配置字段**；`fields[].kind=secret` 只回 `configured`/`preview`，`value` 恒 null（必鉴权） |
-| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。owner + 同源 Origin（必鉴权） |
+| PUT | `/v1/settings/connectors/{scope}` | `{set: {KEY: value}, clear: [KEY]}` → `{operation_id, generation, state, changed, timings, error_code}`；scope 为 `onebot`/`qqbot`/`access`。`If-Match: <generation>` 必带（并发保存只有一个赢家）。202 = 已受理并尝试过，**终态看 `state`**（`active`/`unchanged`/`rolled_back`/`degraded`）。要求 `owner`，Cookie 登录时必须同源 |
 | GET | `/v1/settings/connectors/operations/{operation_id}` | `{operation_id, scope, state, generation, active_generation, started_at, activated_at, error_code, error_safe}`；202 之后用它确认**真的**生效了（必鉴权，owner） |
 | POST | `/v1/settings/connectors/reset` | 清空三个 scope 的覆盖（回退 env/默认）→ `{ok, results: [{scope, state, cleared[], operation_id?, error_code?}]}`；任一 scope 失败则 `ok=false` 并保留原 active（**不出现"部分恢复默认却报成功"**）（必鉴权，owner） |
 | POST | `/v1/settings/resolve` | `{providers?, profiles?, slots?, test_mode?}` → `{slots[], profile_resolutions[]}`；按**草稿**算每个职责的生效模型，**只算不写** |
@@ -820,15 +831,12 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 `scope`/`priority`——统一返回 `422 invalid_request` 的 `ErrorResponse` 形状
 （`{"schema_version":"v1","error":{code,message,retriable,detail,trace_id}}`），
 不是 FastAPI 默认的 `{"detail":[...]}`。pydantic 校验失败时，`error.detail`
-带 pydantic 的原始报错原文、`error.message` 里带字段名；端点级 `LingError`
+与 `error.field` 给出字段名、`error.message` 说明该字段不合法；端点级 `LingError`
 （`limit` 越界、`include` 非法）仍返回同一种 `ErrorResponse` 形状，但
 `error.detail` 为 `null`、`error.message` 是端点自己写的说明；整个 body
 完全缺失时 `error.message` 是「请求体 参数不合法」。
 
-实现方式是**约束优先留在 pydantic、只翻译响应形状**：`create_app` 注册了一个按
-路径前缀生效的 `RequestValidationError` 处理器
-（`ling.app.memory_request_validation_handler`），只覆盖 `/v1/memory*` 与
-`/v1/core-memory*`；其它路径继续用 FastAPI 默认形状，不受影响。
+约束仍留在 pydantic；`ling.api.error_handlers` 负责把 `/v1` 下的框架错误翻译成统一形状。
 `/openapi.json` 与运行时的对应关系如实列举如下：
 
 - `kind`/`text`/`confidence`/`source_event_ids`/`reason`/`scope`/`priority`：

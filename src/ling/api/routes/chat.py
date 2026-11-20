@@ -35,6 +35,7 @@ from ling.api.deps import (
     RouterDep,
     SettingsDep,
 )
+from ling.api.error_handlers import PublicValidationError
 from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ErrorCode, MediaReadJobOut, TurnState
 from ling.infra.models import Window
@@ -440,7 +441,8 @@ class CreateReadJobBody(BaseModel):
         ``wait=true``），这里只补缺字段的解释。
         """
         if isinstance(data, dict) and "feedback_mode" not in data:
-            raise ValueError(
+            raise PublicValidationError(
+                "feedback_mode",
                 "feedback_mode 必填，首期只接受 evidence_only"
                 "（这个入口只写证据，不主动补话；不写不等于默认）"
             )

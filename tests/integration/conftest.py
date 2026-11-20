@@ -29,6 +29,7 @@ TEST_DB_URL = os.environ.get(
 )
 
 pytestmark_web = pytest.mark.w0_web
+WEB_ORIGIN = "http://testserver"
 
 
 @dataclass
@@ -119,7 +120,11 @@ async def web_env(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[TestEnv]:
     app = create_app(settings)
     transport = ASGITransport(app=app)
     async with (
-        AsyncClient(transport=transport, base_url="http://testserver") as client,
+        # Simulate same-origin browser requests. Tests for non-browser or
+        # rejected origins explicitly remove or replace this header.
+        AsyncClient(
+            transport=transport, base_url=WEB_ORIGIN, headers={"Origin": WEB_ORIGIN}
+        ) as client,
         app.router.lifespan_context(app),
     ):
         yield TestEnv(client=client, settings=settings, schema=schema, app=app)

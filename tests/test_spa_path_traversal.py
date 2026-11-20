@@ -392,8 +392,15 @@ def test_normal_paths_still_served(site: Site) -> None:
     assert INDEX_HTML in nested.text
 
 
-@pytest.mark.parametrize("path", ["/v1/nope", "/api/nope", "/healthz-nope", "/readyz-nope"])
+@pytest.mark.parametrize("path", ["/api/nope", "/healthz-nope", "/readyz-nope"])
 def test_reserved_prefixes_still_404(site: Site, path: str) -> None:
     response = site.client.get(path)
     assert response.status_code == 404
     assert response.json() == {"detail": "not found"}
+
+
+def test_unknown_v1_path_uses_json_error_contract(site: Site) -> None:
+    response = site.client.get("/v1/nope")
+    assert response.status_code == 404
+    assert response.json()["schema_version"] == "v1"
+    assert response.json()["error"]["code"] == "not_found"

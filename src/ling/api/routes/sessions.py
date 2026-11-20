@@ -5,13 +5,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
-from ling.api.deps import ConversationDep, CurrentAuth, DbSession, authorize_message_view
+from ling.api.deps import (
+    AuthContext,
+    ConversationDep,
+    CurrentAuth,
+    DbSession,
+    authorize_message_view,
+)
 from ling.api.errors import LingError, not_found
+from ling.api.guards import OwnerGuard
 from ling.contracts.v1 import (
     ErrorCode,
     IdStr,
@@ -393,6 +401,7 @@ async def list_messages(
 
 # 「不存在」与「不属于你」的**唯一**文案：两条路径逐字节相同。
 _PROMPT_MISSING = "消息不存在"
+_PromptOwner = Annotated[AuthContext, Depends(OwnerGuard(missing_message=_PROMPT_MISSING))]
 
 
 def _item_at(raw: object) -> datetime | None:
@@ -478,7 +487,7 @@ def _snapshot_tool_results(payload: dict) -> list[PromptToolResult]:
 @router.get("/messages/{message_id}/prompt", response_model=PromptSnapshotOut)
 async def get_message_prompt(
     message_id: str,
-    auth: CurrentAuth,
+    auth: _PromptOwner,
     session: DbSession,
 ) -> PromptSnapshotOut:
     """`GET /v1/messages/{message_id}/prompt` —— 这条回复当时看到的上下文。

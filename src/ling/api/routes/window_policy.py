@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession
 from ling.api.errors import LingError
-from ling.api.routes.version import _origin_problem, _require_json_content_type
+from ling.api.guards import OwnerAuth, OwnerWrite
 from ling.audit import audit_event
 from ling.contracts.v1 import (
     ErrorCode,
@@ -130,16 +130,6 @@ class OriginBindingChange(BaseModel):
 
 class OriginBindingCommit(OriginBindingChange):
     preview_token: str = Field(min_length=1, max_length=2048)
-
-
-def _write_guards(request: Request, auth: CurrentAuth) -> None:
-    if auth.user.role != "owner":
-        raise LingError(ErrorCode.forbidden, "只有所有者可以修改会话设置", status_code=403)
-    _require_json_content_type(request)
-    if _origin_problem(request, request.app.state.settings) is not None:
-        raise LingError(
-            ErrorCode.forbidden, "这个请求的来源不可信", status_code=403, detail="bad_origin"
-        )
 
 
 def _record_policy_audit(
@@ -733,11 +723,9 @@ async def _binding_plan(
 async def get_origin_binding_options(
     session_id: str,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerAuth,
     session: DbSession,
 ) -> WindowOriginBindingOptions:
-    if auth.user.role != "owner":
-        raise LingError(ErrorCode.forbidden, "只有所有者可以管理平台来源", status_code=403)
     await lock_dialogue_config(session)
     window = await policy_window(
         session,
@@ -776,11 +764,10 @@ async def preview_origin_binding(
     session_id: str,
     body: OriginBindingChange,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> WindowOriginBindingPreview:
-    _write_guards(request, auth)
     await lock_dialogue_config(session)
     window = await policy_window(
         session,
@@ -814,11 +801,10 @@ async def put_origin_binding(
     session_id: str,
     body: OriginBindingCommit,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> WindowDialoguePolicyView:
-    _write_guards(request, auth)
     token = _read_token(request, body.preview_token)
     if (
         token.get("purpose") != "window_origin_binding"
@@ -901,11 +887,10 @@ async def preview_policy(
     session_id: str,
     body: PolicyChange,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> WindowDialoguePolicyPreview:
-    _write_guards(request, auth)
     await lock_dialogue_config(session)
     window = await policy_window(
         session,
@@ -943,11 +928,10 @@ async def put_policy(
     session_id: str,
     body: PolicyCommit,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> WindowDialoguePolicyView:
-    _write_guards(request, auth)
     token = _read_token(request, body.preview_token)
     if (
         token.get("user_id") != auth.user.id
@@ -1018,12 +1002,10 @@ async def get_instance_policy(
     scope: str,
     instance_id: str,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerAuth,
     session: DbSession,
     config: ConfigDep,
 ) -> InstanceDialoguePolicyView:
-    if auth.user.role != "owner":
-        raise LingError(ErrorCode.forbidden, "只有所有者可以查看平台实例设置", status_code=403)
     scope = _require_instance_scope(scope)
     await lock_dialogue_config(session)
     _, effective, row, generation = await _load_instance_policy(
@@ -1055,11 +1037,10 @@ async def preview_instance_policy(
     instance_id: str,
     body: PolicyChange,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> InstanceDialoguePolicyPreview:
-    _write_guards(request, auth)
     scope = _require_instance_scope(scope)
     await lock_dialogue_config(session)
     _, effective, row, generation = await _load_instance_policy(
@@ -1144,11 +1125,10 @@ async def put_instance_policy(
     instance_id: str,
     body: PolicyCommit,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     config: ConfigDep,
 ) -> InstanceDialoguePolicyView:
-    _write_guards(request, auth)
     scope = _require_instance_scope(scope)
     token = _read_token(request, body.preview_token)
     if (

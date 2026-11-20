@@ -18,7 +18,8 @@ from fastapi import APIRouter, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.deps import CurrentAuth, DbSession
+from ling.api.deps import DbSession
+from ling.api.guards import OwnerAuth, OwnerWriteAction
 from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent, Turn
 
 router = APIRouter(prefix="/v1/health", tags=["health"])
@@ -207,13 +208,13 @@ async def collect_status(session: AsyncSession) -> dict:
 
 
 @router.get("/ops")
-async def ops_status(session: DbSession, auth: CurrentAuth) -> dict:
+async def ops_status(session: DbSession, auth: OwnerAuth) -> dict:
     """运维状态：把"可能出问题的地方"变成可执行的告警项。"""
     return await collect_status(session)
 
 
 @router.post("/ops/notify")
-async def ops_notify(session: DbSession, auth: CurrentAuth, request: Request) -> dict:
+async def ops_notify(session: DbSession, auth: OwnerWriteAction, request: Request) -> dict:
     """手动触发一次告警推送（便于验证 webhook 配好没有）。"""
     from ling.ops.notify import notify_if_needed
 
@@ -225,8 +226,8 @@ async def ops_notify(session: DbSession, auth: CurrentAuth, request: Request) ->
 
 
 @router.get("/stats", include_in_schema=False)
-async def stats(session: DbSession, auth: CurrentAuth) -> dict:
-    """轻量统计（供趋势观察，不参与告警）。"""
+async def stats(session: DbSession, auth: OwnerAuth) -> dict:
+    """实例级轻量统计（供所有者观察趋势，不参与告警）。"""
     memories = int(
         (
             await session.execute(

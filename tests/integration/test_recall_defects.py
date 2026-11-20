@@ -44,7 +44,7 @@ from connectors.onebot.connector import OneBotV11Connector
 from connectors.onebot.settings import OneBotConfig
 from sqlalchemy import select
 
-from ling.contracts.v1 import DeliveryState, OperationState
+from ling.contracts.v1 import DeliveryState, ErrorResponse, OperationState
 from ling.domains.conversation.recall import (
     RecallRejected,
     check_recallable_message,
@@ -208,7 +208,9 @@ async def test_tool_call_body_cannot_self_confirm(logged_in: TestEnv) -> None:  
     assert row is not None and row.recalled_at is None
 
     # 错误信息要能指路（不能只说"字段多余"）
-    assert "确认" in json.dumps(response.json(), ensure_ascii=False)
+    error = ErrorResponse.model_validate(response.json()).error
+    assert error.code == "invalid_request" and error.field == "confirmed"
+    assert "确认必须走提议端点" in error.message
 
 
 async def test_tool_call_without_confirmed_needs_confirmation(logged_in: TestEnv) -> None:  # noqa: F811

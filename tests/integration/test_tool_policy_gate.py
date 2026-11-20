@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from ling.capabilities.tools import ToolRegistry, ToolRisk, ToolSpec
+from ling.contracts.v1 import ErrorResponse
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -121,7 +122,9 @@ async def test_wire_cannot_self_confirm_irreversible_tool(
         json={"args": {"k": "v"}, "confirmed": True},
     )
     assert response.status_code == 422, response.text
-    assert "确认" in response.text, "拒绝文案要指向『确认走提议端点』"
+    error = ErrorResponse.model_validate(response.json()).error
+    assert error.code == "invalid_request" and error.field == "confirmed"
+    assert "/recall-proposals/{proposal_id}/confirm" in error.message
     assert logged_in.app.state.tool_executed == [], "请求体自证确认竟然执行了"
 
 

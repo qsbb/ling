@@ -536,22 +536,6 @@
     "operation": "DELETE /v1/settings/connectors/{scope}/instances/{instance_id}",
     "status": 200
   },
-  "deleteConnectorInstance/web-request": {
-    "body": {
-      "error": {
-        "code": "string",
-        "detail": "string",
-        "field": "null",
-        "message": "string",
-        "retriable": "boolean",
-        "trace_id": "string"
-      },
-      "schema_version": "string"
-    },
-    "media_type": "application/json",
-    "operation": "DELETE /v1/settings/connectors/{scope}/instances/{instance_id}",
-    "status": 422
-  },
   "instanceDialoguePolicy": {
     "body": {
       "affected_active_windows": "integer",
@@ -1086,22 +1070,6 @@
     "media_type": "application/json",
     "operation": "POST /v1/settings/connectors/reset",
     "status": 200
-  },
-  "resetConnectorConfig/web-request": {
-    "body": {
-      "error": {
-        "code": "string",
-        "detail": "string",
-        "field": "null",
-        "message": "string",
-        "retriable": "boolean",
-        "trace_id": "string"
-      },
-      "schema_version": "string"
-    },
-    "media_type": "application/json",
-    "operation": "POST /v1/settings/connectors/reset",
-    "status": 422
   },
   "saveConnectorConfig": {
     "body": {

@@ -377,6 +377,7 @@ async def test_post_cookie_requires_same_origin(
 ) -> None:
     base = _configure(logged_in, tmp_path)
     _heartbeat(base)
+    del logged_in.client.headers["Origin"]
     response = await logged_in.client.post(
         "/v1/version/update-requests",
         json=_body(),
@@ -408,6 +409,7 @@ async def test_post_bearer_without_origin_allowed(
     token = logged_in.client.cookies.get(logged_in.settings.cookie_name)
     assert token
     logged_in.client.cookies.clear()
+    del logged_in.client.headers["Origin"]
     response = await logged_in.client.post(
         "/v1/version/update-requests",
         json=_body(),
@@ -640,6 +642,7 @@ async def test_post_terminal_failed_allows_retry(
     "origin",
     [
         "http://testserver.example",  # 不同主机
+        "http://testserver.",  # 不同的浏览器 origin
         "https://testserver:80",  # 同端口不同 scheme
         "http://testserver:443",  # 同主机不同端口
         "http://user:pass@testserver",  # 带 userinfo

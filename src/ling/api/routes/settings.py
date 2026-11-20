@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
 from ling.api.errors import LingError
+from ling.api.guards import OwnerAuth, OwnerWrite, OwnerWriteAction, OwnerWriteUpload
 from ling.audit import audit_event
 from ling.contracts.v1 import (
     ConnectorAccessGroupOut,
@@ -971,36 +972,6 @@ class ConnectorChangeBody(BaseModel):
     clear: list[str] = Field(default_factory=list)
 
 
-def _require_connector_write_guards(request: Request, auth: object) -> None:
-    """owner + 同源（复用更新通道那套门禁，不自创弱校验）。
-
-    为什么不能只判 ``role == owner``：cookie 会话被 CSRF 借用时，"当前用户是
-    owner"这条依然成立，所以还要校验 **Origin 同源**。
-    """
-    from ling.api.routes.version import (  # noqa: PLC2701 - 同一进程内的门禁复用
-        _origin_problem,
-        _require_json_content_type,
-    )
-
-    if str(getattr(getattr(auth, "user", None), "role", "")) != "owner":
-        raise LingError(
-            ErrorCode.forbidden,
-            "只有所有者可以修改接入器配置",
-            status_code=403,
-            detail="not_owner",
-        )
-    _require_json_content_type(request)
-    problem = _origin_problem(request, request.app.state.settings)
-    if problem is not None:
-        # 跨站 / 缺失 Origin 一律拒绝（设计 §6：``bad_origin``）。
-        raise LingError(
-            ErrorCode.forbidden,
-            "这个请求的来源不可信",
-            status_code=403,
-            detail="bad_origin",
-        )
-
-
 def _connector_service(request: Request, auth: object, session: AsyncSession):  # noqa: ANN202
     from ling.settings.connector_service import ConnectorConfigService
 
@@ -1112,8 +1083,7 @@ async def list_connector_instances(
 async def create_connector_instance(
     scope: str,
     body: ConnectorInstanceCreateBody,
-    request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     response: Response,
 ) -> dict[str, object]:
@@ -1131,7 +1101,6 @@ async def create_connector_instance(
         instance_view,
     )
 
-    _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
     service = ConnectorInstanceService(session)
     try:
@@ -1161,8 +1130,7 @@ async def rename_connector_instance(
     scope: str,
     instance_id: str,
     body: ConnectorInstanceRenameBody,
-    request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     response: Response,
 ) -> dict[str, object]:
@@ -1173,7 +1141,6 @@ async def rename_connector_instance(
         instance_view,
     )
 
-    _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
     service = ConnectorInstanceService(session)
     try:
@@ -1200,7 +1167,7 @@ async def set_connector_instance_enabled(
     instance_id: str,
     body: ConnectorInstanceEnabledBody,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     response: Response,
 ) -> dict[str, object]:
@@ -1214,7 +1181,6 @@ async def set_connector_instance_enabled(
         instance_view,
     )
 
-    _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
     from ling.settings.connector_service import ConnectorServiceError
 
@@ -1243,7 +1209,7 @@ async def delete_connector_instance(
     scope: str,
     instance_id: str,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWriteAction,
     session: DbSession,
     response: Response,
 ) -> dict[str, object]:
@@ -1258,7 +1224,6 @@ async def delete_connector_instance(
         instance_view,
     )
 
-    _require_connector_write_guards(request, auth)
     _require_instance_scope(scope)
     from ling.settings.connector_service import ConnectorServiceError
 
@@ -1287,7 +1252,7 @@ async def put_connector_config(
     scope: str,
     body: ConnectorChangeBody,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     response: Response,
     instance_id: str | None = None,
@@ -1317,7 +1282,6 @@ async def put_connector_config(
         ConnectorServiceError,
     )
 
-    _require_connector_write_guards(request, auth)
     if not cf.is_known_scope(scope):
         raise LingError(ErrorCode.not_found, "没有这个接入器", status_code=404)
 
@@ -1474,7 +1438,7 @@ async def put_connector_config(
 
 @router.get("/settings/connectors/operations/{operation_id}")
 async def get_connector_operation(
-    operation_id: str, auth: CurrentAuth, session: DbSession
+    operation_id: str, auth: OwnerAuth, session: DbSession
 ) -> dict[str, object]:
     """按 operation_id 查一次生效操作的状态（owner only，设计 §6）。
 
@@ -1483,10 +1447,6 @@ async def get_connector_operation(
     """
     from ling.settings.connector_service import operation_view
 
-    if str(getattr(auth.user, "role", "")) != "owner":
-        raise LingError(
-            ErrorCode.forbidden, "只有所有者可以查看", status_code=403, detail="not_owner"
-        )
     view = await operation_view(session, operation_id)
     if view is None:
         raise LingError(ErrorCode.not_found, "没有这个操作", status_code=404)
@@ -1496,7 +1456,7 @@ async def get_connector_operation(
 @router.post("/settings/connectors/reset")
 async def reset_connector_config(
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWriteAction,
     session: DbSession,
     response: Response,
 ) -> dict[str, object]:
@@ -1515,7 +1475,6 @@ async def reset_connector_config(
         ConnectorServiceError,
     )
 
-    _require_connector_write_guards(request, auth)
     service = _connector_service(request, auth, session)
     results: list[dict[str, object]] = []
     failed = False
@@ -1584,7 +1543,7 @@ async def reset_connector_config(
 
 @router.put("/settings/draft")
 async def save_draft(
-    body: DraftBody, auth: CurrentAuth, config: ConfigDep
+    body: DraftBody, auth: OwnerWrite, config: ConfigDep
 ) -> dict[str, object]:
     result = await config.save_draft(
         # exclude_unset：老客户端不带 models 时表示"别动清单"，
@@ -1787,7 +1746,7 @@ async def quick_config_preview(
 
 @router.post("/settings/publish")
 async def publish(
-    body: PublishBody, request: Request, auth: CurrentAuth, config: ConfigDep
+    body: PublishBody, request: Request, auth: OwnerWrite, config: ConfigDep
 ) -> dict[str, object]:
     revision = await config.publish(body.revision, published_by=auth.user.id)
     request.app.state.registry.invalidate()
@@ -1813,7 +1772,7 @@ async def publish(
 
 @router.post("/settings/rollback")
 async def rollback(
-    body: RollbackBody, request: Request, auth: CurrentAuth, config: ConfigDep
+    body: RollbackBody, request: Request, auth: OwnerWrite, config: ConfigDep
 ) -> dict[str, object]:
     revision = await config.rollback(body.to_revision)
     request.app.state.registry.invalidate()
@@ -1841,7 +1800,7 @@ async def set_secret(
     provider_id: str,
     body: SecretBody,
     request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     config: ConfigDep,
 ) -> dict[str, object]:
     status = await config.set_secret(provider_id, body.secret)
@@ -1859,7 +1818,7 @@ async def set_secret(
 
 @router.delete("/settings/providers/{provider_id}/secret")
 async def delete_secret(
-    provider_id: str, request: Request, auth: CurrentAuth, config: ConfigDep
+    provider_id: str, request: Request, auth: OwnerWriteAction, config: ConfigDep
 ) -> dict[str, object]:
     await config.delete_secret(provider_id)
     request.app.state.secret_cache.pop(provider_id, None)
@@ -1869,7 +1828,7 @@ async def delete_secret(
 
 @router.post("/settings/providers/{provider_id}/probe")
 async def probe_provider(
-    provider_id: str, auth: CurrentAuth, config: ConfigDep, router_: RouterDep
+    provider_id: str, auth: OwnerWriteAction, config: ConfigDep, router_: RouterDep
 ) -> dict[str, object]:
     effective = await config.effective()
     started = time.monotonic()
@@ -1996,40 +1955,9 @@ VOICE_REFERENCE_WINDOW_ID = "__voice_reference__"
 VOICE_REFERENCE_RETENTION_DAYS = 0
 
 
-def _require_voice_reference_guards(request: Request, auth: object) -> None:
-    """owner + **同源**。与 `_require_connector_write_guards` 同一套门禁。
-
-    只有那一处不同：**不调 `_require_json_content_type`**——这是 multipart，
-    要求 ``application/json`` 会把唯一的合法请求形态拒掉。少的那一层不会削弱
-    CSRF 防护：真正的跨站防护是同源校验（Origin），`_origin_problem` 对
-    "cookie 会话 + 缺 Origin" 是**拒绝**的，所以第三方页面发起的 multipart
-    表单（浏览器一定会带它自己的 Origin）照样被挡在 403。
-
-    为什么"当前用户是 owner"单独不够：cookie 会话被 CSRF 借用时它依然成立。
-    """
-    from ling.api.routes.version import _origin_problem  # noqa: PLC2701 - 同一进程内的门禁复用
-
-    if str(getattr(getattr(auth, "user", None), "role", "")) != "owner":
-        raise LingError(
-            ErrorCode.forbidden,
-            "只有所有者可以上传音色参考音频",
-            status_code=403,
-            detail="not_owner",
-        )
-    problem = _origin_problem(request, request.app.state.settings)
-    if problem is not None:
-        raise LingError(
-            ErrorCode.forbidden,
-            "这个请求的来源不可信",
-            status_code=403,
-            detail="bad_origin",
-        )
-
-
 @router.post("/settings/speech/voice-reference")
 async def upload_voice_reference(
-    request: Request,
-    auth: CurrentAuth,
+    auth: OwnerWriteUpload,
     session: DbSession,
     settings: SettingsDep,
     upload: UploadFile = File(...),
@@ -2062,8 +1990,6 @@ async def upload_voice_reference(
     from ling.domains.media.assets import GeneratedMediaService
     from ling.infra.security import load_signing_root_key
     from ling.models.tts_common import sniff_container
-
-    _require_voice_reference_guards(request, auth)
 
     # `upload.filename` **一次都不用**：它只可能是 `../../etc/passwd` 这类东西，
     # 而 `save_bytes` 按内容 digest 命名，这条路径根本不拼用户给的字符串。

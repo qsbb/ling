@@ -421,15 +421,9 @@ async def test_api_connector_and_window_settings(capture: Capture) -> None:
     )
 
     await capture.raw("setConnectorInstanceEnabled", path_args=instance, json={"enabled": False})
-    # The current Web calls omit Content-Type for these bodyless writes.
-    await capture.raw(
-        "deleteConnectorInstance", variant="web-request", status=422, path_args=instance
-    )
-    await capture.raw("resetConnectorConfig", variant="web-request", status=422)
-    await capture.raw(
-        "deleteConnectorInstance", path_args=instance, headers={"Content-Type": "application/json"}
-    )
-    await capture.raw("resetConnectorConfig", headers={"Content-Type": "application/json"})
+    # Exercise the Web's actual bodyless requests, keeping the success shapes.
+    await capture.raw("deleteConnectorInstance", path_args=instance)
+    await capture.raw("resetConnectorConfig")
     capture.check("connectors")
 
 
