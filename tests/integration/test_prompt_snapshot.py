@@ -364,14 +364,16 @@ async def test_expired_state_and_purge_keep_semantics(logged_in: TestEnv) -> Non
     turn_id, events = await _run_turn(logged_in, window_id=window_id, text="会过期的话")
     message_id, _ = _reply(events)
 
-    # 把过期时间推到过去：等价于"保留期到了、清理任务还没跑"
+    # 整体回拨时间，模拟保留期已到，同时满足 expires_at > created_at。
     async with session_scope() as session:
         row = (
             await session.execute(
                 select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
             )
         ).scalar_one()
-        row.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        expiry = datetime.now(UTC) - timedelta(minutes=1)
+        row.created_at += expiry - row.expires_at
+        row.expires_at = expiry
         await session.flush()
 
     expired_body = await _get_prompt(logged_in.client, message_id)
@@ -409,7 +411,9 @@ async def test_expired_state_and_purge_keep_semantics(logged_in: TestEnv) -> Non
                 select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id)
             )
         ).scalar_one()
-        row.expires_at = datetime.now(UTC) - timedelta(days=30)
+        expiry = datetime.now(UTC) - timedelta(days=30)
+        row.created_at += expiry - row.expires_at
+        row.expires_at = expiry
         await session.flush()
     async with session_scope() as session:
         gone = await purge_expired_prompt_snapshots(session)

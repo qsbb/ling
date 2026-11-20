@@ -1399,7 +1399,9 @@ async def test_prompt_snapshot_matches_forwarded_tool_results(
             select(PromptSnapshot).where(PromptSnapshot.turn_id == snapshot["turn_id"])
         )
         assert row is not None
-        row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        expiry = datetime.now(UTC) - timedelta(seconds=1)
+        row.created_at += expiry - row.expires_at
+        row.expires_at = expiry
 
     expired = (await logged_in.client.get(f"/v1/messages/{message_id}/prompt")).json()
     assert expired["state"] == "expired"

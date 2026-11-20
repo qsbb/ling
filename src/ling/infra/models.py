@@ -111,7 +111,7 @@ class Subject(Base, TimestampMixin):
     #   known    聊过但未验证身份，记忆只限本群相关
     #   stranger 第一次见，不写记忆
     # 跨窗事实（Awareness）对非 owner 一律不注入。
-    trust_level: Mapped[str] = mapped_column(String(32), default="known")
+    trust_level: Mapped[str] = mapped_column(String(32), default="known", server_default="known")
     merged_into: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 遗忘代次：每接受一次"删除这个人的记忆"请求就 +1。
     #
@@ -159,7 +159,9 @@ class Persona(Base, TimestampMixin):
     # 场景覆盖：只存**写过的那些场景**，没写的不落库，读时回落到
     # `domains/persona/scenarios.py` 的内置默认。存"生效文本"会把默认值
     # 复制进每一行——以后想改默认，已有的人设永远收不到。
-    scenario_prompts: Mapped[dict] = mapped_column(JSON, default=dict)
+    scenario_prompts: Mapped[dict] = mapped_column(
+        JSON, default=dict, server_default=sa.text("'{}'::json")
+    )
     published: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -382,6 +384,12 @@ class ConversationAttemptSnapshot(Base):
 
     __tablename__ = "conversation_attempt_snapshots"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["instance_scope", "instance_id"],
+            ["connector_instances.scope", "connector_instances.instance_id"],
+            name="fk_conversation_attempt_connector_instance",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             "(origin_status = 'known' AND instance_scope IS NOT NULL "
             "AND instance_scope IN ('onebot', 'qqbot') AND instance_id IS NOT NULL) OR "
@@ -573,9 +581,9 @@ class WindowContext(Base):
     # 已滚出原文窗口的早期对话摘要。由 Conversation 域维护，不是长期记忆。
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 摘要覆盖到哪条消息 sequence（含）。用于增量摘要与失效判断。
-    summary_through_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    summary_through_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 摘要生成时依据的消息条数，便于解释"摘要了什么"
-    summary_message_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_message_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -612,6 +620,9 @@ class PromptSnapshot(Base):
     __tablename__ = "prompt_snapshots"
     __table_args__ = (
         UniqueConstraint("turn_id", name="uq_prompt_snapshots_turn"),
+        CheckConstraint("size_bytes >= 0", name="ck_prompt_snapshots_size_bytes"),
+        CheckConstraint("schema_version >= 1", name="ck_prompt_snapshots_schema_version"),
+        CheckConstraint("expires_at > created_at", name="ck_prompt_snapshots_expiry"),
         Index("ix_prompt_snapshots_actor_created", "actor_id", "created_at"),
         # 读接口按消息反查快照；清理任务扫过期时间。名字必须与
         # `0053_prompt_snapshots.py` 逐字一致（否则 autogenerate 会把它当成
@@ -628,9 +639,9 @@ class PromptSnapshot(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # payload 的**结构**版本（不是契约 v1）。结构变了就升它，老行照原样读，
     # 读侧按版本决定怎么渲染——不要把老快照读崩。
-    schema_version: Mapped[int] = mapped_column(Integer, default=1)
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # 真正要发出去的那份 messages（+ 每条的语义块标签与 token 估算）。
     # 到期后由维护任务清空正文，只留 model / token_total 这类非内容元数据；
     # 这里**不存**原始用户输入之外的任何东西（输入本来就在 messages 里）。
@@ -733,7 +744,7 @@ class ConnectorInstance(Base):
     #: 实例身份。与 scope 组成主键——两个 scope 可以各有一个 ``default``。
     instance_id: Mapped[str] = mapped_column(String(16), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(64))
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(
@@ -775,7 +786,9 @@ class ConnectorConfigRevision(Base):
     )
     # 上一版（用于回退时读"旧的有效覆盖集合"）。为空表示这是该 scope 的第一版。
     parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    state: Mapped[str] = mapped_column(
+        String(24), default="pending", index=True, server_default="pending"
+    )
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(
@@ -816,7 +829,7 @@ class ConnectorOverrideValue(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    revision_id: Mapped[str] = mapped_column(String(64), index=True)
+    revision_id: Mapped[str] = mapped_column(String(64))
     # 注册表里的固定 key（迁移不从请求动态生成 schema，见 settings/connector_fields.py）
     field_key: Mapped[str] = mapped_column(String(64))
     value_kind: Mapped[str] = mapped_column(String(16))
@@ -864,7 +877,7 @@ class ConnectorConfigHead(Base):
     active_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     candidate_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 单调递增的代际号：客户端的 If-Match 与副本 ACK 都以它为准
-    generation: Mapped[int] = mapped_column(Integer, default=0)
+    generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -893,10 +906,11 @@ class ConnectorRuntimeAck(Base):
             name="uq_connector_ack_generation",
         ),
         Index("ix_connector_ack_generation", "generation"),
+        Index("ix_connector_ack_scope", "scope"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    scope: Mapped[str] = mapped_column(String(16), index=True)
+    scope: Mapped[str] = mapped_column(String(16))
     #: 这条 ACK 是哪个实例的。
     instance_id: Mapped[str] = mapped_column(
         String(16), default="default", server_default="default"
@@ -904,9 +918,9 @@ class ConnectorRuntimeAck(Base):
     generation: Mapped[int] = mapped_column(Integer)
     replica_id: Mapped[str] = mapped_column(String(64))
     # prepared | activated | failed
-    phase: Mapped[str] = mapped_column(String(16), default="prepared")
+    phase: Mapped[str] = mapped_column(String(16), default="prepared", server_default="prepared")
     # ok | degraded | unknown —— 与 phase 分开：切过去了但远端没连上是 degraded
-    health: Mapped[str] = mapped_column(String(16), default="unknown")
+    health: Mapped[str] = mapped_column(String(16), default="unknown", server_default="unknown")
     error_safe: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -944,10 +958,10 @@ class ProviderTokenUsage(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider_id: Mapped[str] = mapped_column(String(64), index=True)
     day: Mapped[date] = mapped_column(sa.Date, index=True)
-    tokens: Mapped[int] = mapped_column(Integer, default=0)
-    estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    estimated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=sa.text("now()")
     )
 
 
@@ -1000,6 +1014,7 @@ class OutboxEvent(Base):
     """同库事务 outbox：worker 至少一次处理，消费者按 id 去重。"""
 
     __tablename__ = "outbox_events"
+    __table_args__ = (Index("ix_outbox_events_subject_state", "subject_id", "state"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     topic: Mapped[str] = mapped_column(String(64), index=True)
@@ -1043,6 +1058,14 @@ class MemoryPurgeTombstone(Base):
     """
 
     __tablename__ = "memory_purge_tombstones"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'running', 'done', 'failed')",
+            name="ck_memory_purge_tombstones_state",
+        ),
+        CheckConstraint("generation >= 1", name="ck_memory_purge_tombstones_generation"),
+        Index("ix_memory_purge_tombstones_subject", "subject_id", "requested_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1111,9 +1134,9 @@ class PresenceState(Base, TimestampMixin):
 
     actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # 0-100。低精力只影响表达长度与主动意愿，**不影响是否回答**
-    energy: Mapped[int] = mapped_column(Integer, default=70)
+    energy: Mapped[int] = mapped_column(Integer, default=70, server_default="70")
     # 0-100。高社交负担时少追问，同样不影响回答
-    social_load: Mapped[int] = mapped_column(Integer, default=20)
+    social_load: Mapped[int] = mapped_column(Integer, default=20, server_default="20")
     # 0-100 饱腹（模拟值，不是生理指标）。与 energy 共用同一个 `settled_at`
     # 惰性结算：不另起"饥饿 tick"。默认 70 是**模拟初值**，不伪造过去的餐食。
     satiety: Mapped[int] = mapped_column(
@@ -1123,7 +1146,7 @@ class PresenceState(Base, TimestampMixin):
     settled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
-    revision: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class ActorRoutineRow(Base):
@@ -1141,13 +1164,15 @@ class ActorRoutineRow(Base):
 
     actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # IANA 时区。角色自己的晨晚边界按它算，绝不从服务器时区推断
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Shanghai", server_default="Asia/Shanghai"
+    )
     # 0-1439。允许 wake > rest 表达跨午夜（例如凌晨 2 点睡、10 点起）
-    wake_minute: Mapped[int] = mapped_column(Integer, default=8 * 60)
-    rest_minute: Mapped[int] = mapped_column(Integer, default=23 * 60)
+    wake_minute: Mapped[int] = mapped_column(Integer, default=8 * 60, server_default="480")
+    rest_minute: Mapped[int] = mapped_column(Integer, default=23 * 60, server_default="1380")
     # configured（用户/人格设定） / default
-    source: Mapped[str] = mapped_column(String(16), default="default")
-    revision: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(16), default="default", server_default="default")
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class AgendaPlanRow(Base, TimestampMixin):
@@ -1168,14 +1193,22 @@ class AgendaPlanRow(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(120))
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Shanghai", server_default="Asia/Shanghai"
+    )
     # tentative（可能）/ confirmed（已确认）
-    commitment_level: Mapped[str] = mapped_column(String(16), default="tentative")
+    commitment_level: Mapped[str] = mapped_column(
+        String(16), default="tentative", server_default="tentative"
+    )
     # planned / active / done / cancelled / skipped
-    state: Mapped[str] = mapped_column(String(16), default="planned", index=True)
+    state: Mapped[str] = mapped_column(
+        String(16), default="planned", index=True, server_default="planned"
+    )
     place_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
-    revision: Mapped[int] = mapped_column(Integer, default=0)
+    source_event_ids: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=sa.text("'[]'::json")
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class SceneCommitRow(Base):
@@ -1192,12 +1225,14 @@ class SceneCommitRow(Base):
 
     actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # chat / focus / rest / errand / unknown
-    state: Mapped[str] = mapped_column(String(16), default="unknown")
+    state: Mapped[str] = mapped_column(String(16), default="unknown", server_default="unknown")
     activity_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     place_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # simulated（模拟生活） / tool_receipt（有真实回执） / user_stated
-    origin: Mapped[str] = mapped_column(String(24), default="simulated")
-    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    origin: Mapped[str] = mapped_column(String(24), default="simulated", server_default="simulated")
+    source_event_ids: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=sa.text("'[]'::json")
+    )
     committed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -1220,7 +1255,7 @@ class OpsAlertState(Base):
     last_sent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    count: Mapped[int] = mapped_column(Integer, default=0)
+    count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class EntityRow(Base, TimestampMixin):
@@ -1242,9 +1277,9 @@ class EntityRow(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
     name: Mapped[str] = mapped_column(String(64))
-    kind: Mapped[str] = mapped_column(String(24), default="other")
+    kind: Mapped[str] = mapped_column(String(24), default="other", server_default="other")
     # 同一实体的其他叫法（小写归一化后比对）
-    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    aliases: Mapped[list] = mapped_column(JSON, default=list, server_default=sa.text("'[]'::json"))
 
 
 class MemoryEntityRow(Base):
@@ -1261,7 +1296,7 @@ class MemoryEntityRow(Base):
 
     memory_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    role: Mapped[str] = mapped_column(String(24), default="about")
+    role: Mapped[str] = mapped_column(String(24), default="about", server_default="about")
 
 
 class MemoryEmbeddingRow(Base):
@@ -1319,12 +1354,12 @@ class CoreMemoryRow(Base, TimestampMixin):
     label: Mapped[str] = mapped_column(String(64))
     text: Mapped[str] = mapped_column(Text)
     # 优先级：预算不够时先保留优先级高的（数字越小越先保留）
-    priority: Mapped[int] = mapped_column(Integer, default=100)
+    priority: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
     # 来源：manual（用户显式要求记住）/ derived（从长期记忆提升）
-    origin_kind: Mapped[str] = mapped_column(String(24), default="manual")
+    origin_kind: Mapped[str] = mapped_column(String(24), default="manual", server_default="manual")
     # 归属作用域：private 只在该 subject 的私聊；group 在群里也生效
-    scope: Mapped[str] = mapped_column(String(24), default="private")
-    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    scope: Mapped[str] = mapped_column(String(24), default="private", server_default="private")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True, server_default="true")
 
 
 # ------------------------------------------------------------------ 跨实例协调（多进程部署）
@@ -1352,7 +1387,7 @@ class TurnControlRow(Base):
     turn_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # 与 Turn.attempt 对齐。存量行默认 1：既兼容旧数据，
     # 又让"上一轮留下的幽灵标记"在 retry（attempt≥2）后自然失效。
-    attempt: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    attempt: Mapped[int] = mapped_column(Integer, primary_key=True, default=1, server_default="1")
     stop_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1375,7 +1410,7 @@ class SpeakLeaseRow(Base):
     turn_id: Mapped[str] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     # 排队 key 列表（window#turn），让提升顺序在实例间一致
-    queue: Mapped[list] = mapped_column(JSON, default=list)
+    queue: Mapped[list] = mapped_column(JSON, default=list, server_default=sa.text("'[]'::json"))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -1395,9 +1430,9 @@ class SessionPolicyRow(Base, TimestampMixin):
 
     subject_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # sealed | per_window | continuous
-    mode: Mapped[str] = mapped_column(String(24), default="per_window")
+    mode: Mapped[str] = mapped_column(String(24), default="per_window", server_default="per_window")
     # 切换模式时的修订号，便于审计与"切换后旧派生是否失效"的判断
-    revision: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class UserPreferenceRow(Base, TimestampMixin):
@@ -1425,7 +1460,7 @@ class UserPreferenceRow(Base, TimestampMixin):
     # 因为库里可能有手工改过的值。
     timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 改动次数。便于回答"这人的时区什么时候被改过"，与 SessionPolicyRow 对齐。
-    revision: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     # 视频读取模式：``frames``（抽帧，默认）/ ``native``（原生视频输入）。
     # 为空 = 没设过，读侧按 ``frames`` 处理（见 settings/user_preferences.py）。
     # **用户偏好**，不是模型配置：换个模型不该把"我怎么看视频"重置掉。
@@ -1450,12 +1485,18 @@ class AwarenessItemRow(Base):
     # actor_private | subject_scoped | group_scoped | public
     audience: Mapped[str] = mapped_column(String(32), index=True)
     source_window_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    source_visibility: Mapped[str] = mapped_column(String(32), default="window_private")
-    origin: Mapped[str] = mapped_column(String(32), default="user_statement")
+    source_visibility: Mapped[str] = mapped_column(
+        String(32), default="window_private", server_default="window_private"
+    )
+    origin: Mapped[str] = mapped_column(
+        String(32), default="user_statement", server_default="user_statement"
+    )
     # 溯源：原事实被纠正/撤回时，派生条目必须能级联失效（此前实现的问题缺这列）
-    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
-    consent_revision: Mapped[int] = mapped_column(Integer, default=0)
-    policy_revision: Mapped[int] = mapped_column(Integer, default=1)
+    source_event_ids: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=sa.text("'[]'::json")
+    )
+    consent_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    policy_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     invalidated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1512,7 +1553,7 @@ class MemoryRow(Base, TimestampMixin):
     value: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 产生时的可见范围（subject_private / window_private / group_scope / public）
     source_visibility: Mapped[str] = mapped_column(
-        String(32), default="subject_private", index=True
+        String(32), default="subject_private", index=True, server_default="subject_private"
     )
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1564,7 +1605,7 @@ class MemoryEpisode(Base, TimestampMixin):
     turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # 来源窗口的可见范围：群里的情节不能当成私聊事实被召回
     source_visibility: Mapped[str] = mapped_column(
-        String(32), default="subject_private", index=True
+        String(32), default="subject_private", index=True, server_default="subject_private"
     )
     summary: Mapped[str] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(String(32))
@@ -1599,13 +1640,17 @@ class SelfExperienceRow(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     actor_id: Mapped[str] = mapped_column(String(64), index=True)
     # activity / scene / milestone
-    kind: Mapped[str] = mapped_column(String(24), default="activity")
+    kind: Mapped[str] = mapped_column(String(24), default="activity", server_default="activity")
     summary: Mapped[str] = mapped_column(Text)
     # 来源事件（activity:<id> 等）。用于追溯，也用于去重
-    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    source_event_ids: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=sa.text("'[]'::json")
+    )
     dedupe_key: Mapped[str] = mapped_column(String(192))
-    origin: Mapped[str] = mapped_column(String(24), default="simulated")
-    visibility: Mapped[str] = mapped_column(String(32), default="actor_private")
+    origin: Mapped[str] = mapped_column(String(24), default="simulated", server_default="simulated")
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="actor_private", server_default="actor_private"
+    )
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
@@ -1701,10 +1746,12 @@ class AffectState(Base):
     decay_per_hour: Mapped[float] = mapped_column(Float, default=0.15)
     # 作用域（ADR-0004 修正）：global = 可跨窗口的粗粒度语气趋势；
     # window = 只属于某个窗口（带具体原因，绝不跨窗口）。
-    scope: Mapped[str] = mapped_column(String(16), default="global", index=True)
+    scope: Mapped[str] = mapped_column(
+        String(16), default="global", index=True, server_default="global"
+    )
     # global 作用域存空串而非 NULL：PostgreSQL 中 NULL 互不相等，
     # 会让 (actor, emotion, scope, window_id) 唯一约束对 global 行失效。
-    window_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    window_id: Mapped[str] = mapped_column(String(64), default="", index=True, server_default="")
     # 最后产生/刷新这条情绪记录的轮次。worker 幂等的依据：
     # 同一 turn 对同一 (emotion, scope, window) 只调整一次，
     # 否则重复处理会不断叠加强度（此前实现的缺陷）。
@@ -1760,7 +1807,7 @@ class PhoneStateRow(Base, TimestampMixin):
 
     actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # idle | watching
-    state: Mapped[str] = mapped_column(String(16), default="idle")
+    state: Mapped[str] = mapped_column(String(16), default="idle", server_default="idle")
     # 在看的时候在看哪个应用/哪个窗口（"QQ · 摸鱼群"）；不看的时候为空
     watching_app: Mapped[str | None] = mapped_column(String(48), nullable=True)
     watching_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -1777,6 +1824,12 @@ class PhoneStateRow(Base, TimestampMixin):
     last_result: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 那段时间本来在做什么（"在写日记"），界面上用来解释为什么是这个间隔
     last_context: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=sa.text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=sa.text("now()")
+    )
 
 
 class ActivityRow(Base, TimestampMixin):
@@ -1796,10 +1849,14 @@ class ActivityRow(Base, TimestampMixin):
     # 来源计划（可空：临时起意没有计划）
     plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # simulated（模拟生活）/ tool_receipt（真实回执）/ user_stated
-    origin: Mapped[str] = mapped_column(String(24), default="simulated")
-    source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    origin: Mapped[str] = mapped_column(String(24), default="simulated", server_default="simulated")
+    source_event_ids: Mapped[list] = mapped_column(
+        JSON, default=list, server_default=sa.text("'[]'::json")
+    )
     # 谁能知道。私聊促成的活动默认不进群聊
-    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="subject_private", server_default="subject_private"
+    )
     # 这条活动由哪个日程段（叶段）启动。可空 = 临时起意/历史活动。
     # **不复用 `plan_id`**：那一个字符串已经指 `agenda_plans`，
     # 让同一个字段指两张表会同时失去外键与审计能力。
@@ -1922,9 +1979,11 @@ class ProactiveOpportunity(Base):
         DateTime(timezone=True), nullable=True
     )
     # 谁能知道这件事（机会本身也可能带隐私）
-    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="subject_private", server_default="subject_private"
+    )
     # 是否期待对方回应。生活分享默认 False——不能因为没人回就追问
-    reply_expected: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_expected: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     channel_hint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -1977,7 +2036,9 @@ class KnowledgeItem(Base, TimestampMixin):
     owner_subject_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
-    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="subject_private", server_default="subject_private"
+    )
 
 
 class DeviceRow(Base, TimestampMixin):
@@ -2054,14 +2115,18 @@ class MediaEvidenceRow(Base, TimestampMixin):
     subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     window_id: Mapped[str] = mapped_column(String(64), index=True)
     # image / audio / video / emoji
-    kind: Mapped[str] = mapped_column(String(16), default="image")
+    kind: Mapped[str] = mapped_column(String(16), default="image", server_default="image")
     # 外部引用（对象存储 key、URL、本地相对路径），不存二进制
     media_ref: Mapped[str] = mapped_column(String(512))
     # user_upload / camera / model_generated
-    origin: Mapped[str] = mapped_column(String(24), default="user_upload")
-    visibility: Mapped[str] = mapped_column(String(32), default="window_private")
+    origin: Mapped[str] = mapped_column(
+        String(24), default="user_upload", server_default="user_upload"
+    )
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="window_private", server_default="window_private"
+    )
     # 记录这条证据时生效的授权修订。撤权后据此失效。
-    consent_revision: Mapped[int] = mapped_column(Integer, default=0)
+    consent_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 看见了什么/推断出什么。**可能是猜的**，看 origin。
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 描述是谁产生的：human / model_inference
@@ -2126,6 +2191,11 @@ class MediaReadJob(Base):
 
     __tablename__ = "media_read_jobs"
     __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'running', 'succeeded', 'failed', 'timeout', 'unknown', "
+            "'cancelled', 'expired', 'budget_denied')",
+            name="ck_media_read_jobs_state",
+        ),
         UniqueConstraint(
             "actor_id", "window_id", "request_key", name="uq_media_read_job_request"
         ),
@@ -2160,16 +2230,20 @@ class MediaReadJob(Base):
     # 工具版本：改行为就要改它。部分唯一索引按它分组。
     tool_version: Mapped[str] = mapped_column(String(64))
     # 首期只有 `video`（这个作业只读视频）。留字段是为了将来扩展时不用迁移。
-    mode: Mapped[str] = mapped_column(String(24), default="video")
+    mode: Mapped[str] = mapped_column(String(24), default="video", server_default="video")
     # **首期固定 `evidence_only`**：只把结果写成证据，不主动补话。
-    feedback_mode: Mapped[str] = mapped_column(String(32), default="evidence_only")
+    feedback_mode: Mapped[str] = mapped_column(
+        String(32), default="evidence_only", server_default="evidence_only"
+    )
     # 登记时生效的授权修订（`consent_revisions`）。撤权后据此判"这条还该不该读"。
     # 存的是**哪一条授权**，不是布尔：撤权审计时要指回具体的人。
     authorization_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # --- 状态机 ---
     # 取值见 `domains/media/jobs.py::JobState`。迁移里有 CHECK 约束兜底。
-    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    state: Mapped[str] = mapped_column(
+        String(24), default="pending", index=True, server_default="pending"
+    )
     # 稳定错误码（`model_unavailable` / `download_failed` / ...），人话在接口里映射。
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 结果引用：成功时指向 **evidence_id**（描述写进那条证据，不另存一份副本）。
@@ -2177,7 +2251,7 @@ class MediaReadJob(Base):
     result_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     requested_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
+        DateTime(timezone=True), default=utcnow, server_default=sa.text("now()")
     )
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -2204,7 +2278,7 @@ class MediaReadJob(Base):
     )
     # 每次抢占 +1。结果提交时带 `WHERE lease_generation = :gen`，旧代次的提交
     # 更新行数为 0——这是"被接管的作业不会写出两份结果"的唯一保证。
-    lease_generation: Mapped[int] = mapped_column(Integer, default=0)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class IntentRow(Base, TimestampMixin):
@@ -2236,20 +2310,28 @@ class IntentRow(Base, TimestampMixin):
     window_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # reply | note | act | reach_out
-    kind: Mapped[str] = mapped_column(String(24), default="reach_out")
+    kind: Mapped[str] = mapped_column(String(24), default="reach_out", server_default="reach_out")
     # 想达成什么（不是最终文案）
     goal: Mapped[str] = mapped_column(Text)
     # 为什么有这个念头。**必须引用具体来源**
     rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
     # message / self / event
-    source_kind: Mapped[str] = mapped_column(String(24), default="message")
+    source_kind: Mapped[str] = mapped_column(
+        String(24), default="message", server_default="message"
+    )
     source_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    origin: Mapped[str] = mapped_column(String(32), default="model_inference")
-    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    origin: Mapped[str] = mapped_column(
+        String(32), default="model_inference", server_default="model_inference"
+    )
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="subject_private", server_default="subject_private"
+    )
 
     # open | consumed | dropped | expired
-    state: Mapped[str] = mapped_column(String(24), default="open", index=True)
+    state: Mapped[str] = mapped_column(
+        String(24), default="open", index=True, server_default="open"
+    )
     # 不到点不试
     not_before: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -2258,7 +2340,7 @@ class IntentRow(Base, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, server_default="0.5")
     dedupe_key: Mapped[str] = mapped_column(String(192))
 
 
@@ -2284,7 +2366,7 @@ class InteractionLoadRow(Base, TimestampMixin):
     actor_id: Mapped[str] = mapped_column(String(64), index=True)
     # 作用域：窗口 id。跨受众的累计在这里是被禁止的
     scope_key: Mapped[str] = mapped_column(String(128))
-    local_load: Mapped[float] = mapped_column(Float, default=0.0)
+    local_load: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
     # 上次结算时间。衰减从这里推算，不靠后台任务
     settled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
@@ -2314,7 +2396,7 @@ class AttentionCursorRow(Base, TimestampMixin):
     window_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # 已处理到的消息序（只用于调度，不替代逐条的 attention_state）
-    last_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    last_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     lease_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -2350,10 +2432,10 @@ class AttentionPollLogRow(Base):
     polled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
-    unseen_count: Mapped[int] = mapped_column(Integer, default=0)
-    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    unseen_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 影子基线：如果每条消息各调一次会调几次
-    baseline_calls: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_calls: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     decision: Mapped[str] = mapped_column(String(24))
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -2374,10 +2456,10 @@ class TogetherSessionRow(Base, TimestampMixin):
     kind: Mapped[str] = mapped_column(String(16))
     title: Mapped[str] = mapped_column(String(200))
     host_subject_id: Mapped[str] = mapped_column(String(64))
-    state: Mapped[str] = mapped_column(String(16), default="active")
+    state: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
     # 每个参与者各自的上报位置。**服务端不猜"看到哪了"**——
     # 进度只能来自客户端真实回报。
-    progress: Mapped[dict] = mapped_column(JSON, default=dict)
+    progress: Mapped[dict] = mapped_column(JSON, default=dict, server_default=sa.text("'{}'::json"))
 
 
 class TogetherParticipantRow(Base):
@@ -2503,18 +2585,24 @@ class DayPlanRow(Base, TimestampMixin):
     plan_day: Mapped[date] = mapped_column(Date)
     # 生成这一版时用的角色规范时区与来源（preference/env/default）
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
-    timezone_source: Mapped[str] = mapped_column(String(16), default="default")
+    timezone_source: Mapped[str] = mapped_column(
+        String(16), default="default", server_default="default"
+    )
     # 排程快照版本：时区**或**作息变化时 +1。幂等键用它，
     # 让"换了时区要重排"与"同一天重复调度不重排"能区分开。
-    timezone_revision: Mapped[int] = mapped_column(Integer, default=0)
-    routine_revision: Mapped[int] = mapped_column(Integer, default=0)
+    timezone_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    routine_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     window_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     window_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    revision: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # pending（还没生成）/ ready（模型或规则大纲已提交）/ degraded（兜底生成）
-    state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    state: Mapped[str] = mapped_column(
+        String(16), default="pending", index=True, server_default="pending"
+    )
     # model / rule / baseline：这一版大纲的可信来源。规则兜底必须能一眼看出来。
-    generation_source: Mapped[str] = mapped_column(String(16), default="rule")
+    generation_source: Mapped[str] = mapped_column(
+        String(16), default="rule", server_default="rule"
+    )
     # 最近一次失败/降级的确定性原因码（不含正文、不含路径）
     last_error_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
     # 最近一次模型大纲成功提交的时间；旧数据与只有规则兜底时为未知。
@@ -2622,11 +2710,13 @@ class ScheduleIntentionRow(Base, TimestampMixin):
     # 不是 UTC 日期：解析/展示都按 IANA 时区投影，不能拿服务器时区推断。
     target_start_day: Mapped[date] = mapped_column(Date)
     target_end_day: Mapped[date] = mapped_column(Date)
-    target_timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    target_timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Shanghai", server_default="Asia/Shanghai"
+    )
     # 类别（受 INTENTION_KINDS 白名单约束）；标题只是短主题，不参与唯一性。
-    kind: Mapped[str] = mapped_column(String(32), default="other")
+    kind: Mapped[str] = mapped_column(String(32), default="other", server_default="other")
     title: Mapped[str] = mapped_column(String(120))
-    state: Mapped[str] = mapped_column(String(24), default="proposed")
+    state: Mapped[str] = mapped_column(String(24), default="proposed", server_default="proposed")
     # model / user / actor / recurrence
     source_kind: Mapped[str] = mapped_column(String(16))
     # 来源 ID：turn_id / commitment_id / recurrence_rule_id / 上游 intention_id。
@@ -2649,11 +2739,13 @@ class ScheduleIntentionRow(Base, TimestampMixin):
     prep_source_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
     prep_due_day: Mapped[date | None] = mapped_column(Date, nullable=True)
     # 0-100。展望排序在同状态内用它打破平手，不改变状态优先级。
-    priority: Mapped[int] = mapped_column(Integer, default=50)
-    horizon_rev: Mapped[int] = mapped_column(Integer, default=1)
+    priority: Mapped[int] = mapped_column(Integer, default=50, server_default="50")
+    horizon_rev: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     # actor_private / subject_private / window_private / group_scope / public
-    visibility: Mapped[str] = mapped_column(String(32), default="actor_private")
-    revision: Mapped[int] = mapped_column(Integer, default=1)
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="actor_private", server_default="actor_private"
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class ScheduleRecurrenceRuleRow(Base, TimestampMixin):
@@ -2705,15 +2797,19 @@ class ScheduleRecurrenceRuleRow(Base, TimestampMixin):
     weekday: Mapped[int] = mapped_column(Integer)
     start_local_minute: Mapped[int] = mapped_column(Integer)
     end_local_minute: Mapped[int] = mapped_column(Integer)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Shanghai", server_default="Asia/Shanghai"
+    )
     effective_start_day: Mapped[date] = mapped_column(Date)
     effective_end_day: Mapped[date] = mapped_column(Date)
     # active / paused / cancelled
-    state: Mapped[str] = mapped_column(String(16), default="active")
+    state: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
     # 用户确认的凭据（消息/确认记录 ID）。**不是**模型输出，模型无权建 active 规则。
     confirmation_source_ref: Mapped[str] = mapped_column(String(160))
-    revision: Mapped[int] = mapped_column(Integer, default=1)
-    visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    visibility: Mapped[str] = mapped_column(
+        String(32), default="subject_private", server_default="subject_private"
+    )
 
 
 class ScheduleSegmentRow(Base, TimestampMixin):
@@ -2809,7 +2905,7 @@ class ScheduleSegmentRow(Base, TimestampMixin):
     actor_id: Mapped[str] = mapped_column(String(64), index=True)
     parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 根段为 ''（见类注释：NULL 会绕过唯一约束）
-    parent_key: Mapped[str] = mapped_column(String(64), default="")
+    parent_key: Mapped[str] = mapped_column(String(64), default="", server_default="")
     # block / hour / minute
     layer: Mapped[str] = mapped_column(String(8), default="block")
     # 活动类别（meal/work/leisure/...）。受服务层白名单约束。
@@ -2818,17 +2914,21 @@ class ScheduleSegmentRow(Base, TimestampMixin):
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     place_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    commitment_level: Mapped[str] = mapped_column(String(16), default="tentative")
+    commitment_level: Mapped[str] = mapped_column(
+        String(16), default="tentative", server_default="tentative"
+    )
     # current / superseded / cancelled。**不物理删除**：旧段要能被审计/解释。
-    status: Mapped[str] = mapped_column(String(16), default="current", index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="current", index=True, server_default="current"
+    )
     # 只有叶段可以启动活动
-    is_leaf: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_leaf: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     # '' 表示可变段；sleep/commitment 是**不可移动锚点**
-    anchor_kind: Mapped[str] = mapped_column(String(16), default="")
+    anchor_kind: Mapped[str] = mapped_column(String(16), default="", server_default="")
     # model / rule / baseline / user
-    source: Mapped[str] = mapped_column(String(16), default="model")
+    source: Mapped[str] = mapped_column(String(16), default="model", server_default="model")
     # 这个段属于哪一版（与 day_plans.revision 对齐）
-    revision_created: Mapped[int] = mapped_column(Integer, default=0)
+    revision_created: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 在哪一版被结束（superseded 时填）；NULL = 仍是当前版本
     revision_ended: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
@@ -2870,7 +2970,7 @@ class ScheduleChangeRequestRow(Base, TimestampMixin):
         ForeignKey("day_plans.id", name="fk_schedule_change_plan"),
         nullable=True,
     )
-    base_revision: Mapped[int] = mapped_column(Integer, default=0)
+    base_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     decision: Mapped[str] = mapped_column(String(16))
     reason_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
     range_start_at: Mapped[datetime | None] = mapped_column(
@@ -2931,12 +3031,12 @@ class BehaviorModelCallRow(Base):
     # outline / refine / replan / dream
     kind: Mapped[str] = mapped_column(String(16))
     # 聊天窗口（replan 用）。空串代替 NULL：唯一键/索引里 NULL 互不相等。
-    window_id: Mapped[str] = mapped_column(String(64), default="")
+    window_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     idempotency_key: Mapped[str] = mapped_column(String(160))
-    attempt: Mapped[int] = mapped_column(Integer, default=1)
-    state: Mapped[str] = mapped_column(String(16), default="reserved")
-    reserved_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    reserved_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    state: Mapped[str] = mapped_column(String(16), default="reserved", server_default="reserved")
+    reserved_input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    reserved_output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     actual_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(
@@ -2975,14 +3075,16 @@ class DreamReportRow(Base, TimestampMixin):
     # 醒来所在本地日期（跨日作息以实际预计醒点定义）
     sleep_date: Mapped[date] = mapped_column(Date)
     # ready / failed / missed / no_dream
-    status: Mapped[str] = mapped_column(String(16), default="no_dream")
+    status: Mapped[str] = mapped_column(String(16), default="no_dream", server_default="no_dream")
     title: Mapped[str | None] = mapped_column(String(120), nullable=True)
     narrative: Mapped[str | None] = mapped_column(Text, nullable=True)
     mood: Mapped[str | None] = mapped_column(String(32), nullable=True)
     cue_ids: Mapped[list] = mapped_column(JSON, default=list)
     transform_ids: Mapped[list] = mapped_column(JSON, default=list)
-    origin: Mapped[str] = mapped_column(String(16), default="simulated")
-    visibility: Mapped[str] = mapped_column(String(24), default="actor_private")
+    origin: Mapped[str] = mapped_column(String(16), default="simulated", server_default="simulated")
+    visibility: Mapped[str] = mapped_column(
+        String(24), default="actor_private", server_default="actor_private"
+    )
     plan_id: Mapped[str | None] = mapped_column(
         String(64),
         ForeignKey("day_plans.id", name="fk_dream_reports_plan"),
@@ -3010,7 +3112,7 @@ class SleepSettlementRow(Base, TimestampMixin):
     # 睡前/醒后的 global 情绪快照（只存粗粒度标签与强度，不存原文）
     global_affect_before: Mapped[dict] = mapped_column(JSON, default=dict)
     global_affect_after: Mapped[dict] = mapped_column(JSON, default=dict)
-    source_routine_revision: Mapped[int] = mapped_column(Integer, default=0)
+    source_routine_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class AffectSignalRow(Base):
@@ -3048,11 +3150,11 @@ class AffectSignalRow(Base):
     actor_id: Mapped[str] = mapped_column(String(64), index=True)
     source_event_id: Mapped[str] = mapped_column(String(64))
     # global（可跨窗口的粗粒度趋势）/ window（只属于某窗口）
-    scope: Mapped[str] = mapped_column(String(16), default="global")
+    scope: Mapped[str] = mapped_column(String(16), default="global", server_default="global")
     # global 存空串而不是 NULL（同 affect_states）
-    window_id: Mapped[str] = mapped_column(String(64), default="")
+    window_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     emotion: Mapped[str] = mapped_column(String(32))
-    intensity: Mapped[float] = mapped_column(Float, default=0.0)
+    intensity: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
     valence: Mapped[float | None] = mapped_column(Float, nullable=True)
     arousal: Mapped[float | None] = mapped_column(Float, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(
@@ -3156,16 +3258,19 @@ class MediaSlotRow(Base):
     """
 
     __tablename__ = "media_slots"
+    __table_args__ = (
+        CheckConstraint("phase IN ('held', 'active')", name="ck_media_slots_phase"),
+    )
 
     resource_key: Mapped[str] = mapped_column(String(64), primary_key=True)
     holder_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # held：已拿到执行权；active：执行者已就绪、耗时动作真的开始了。
     # 只有 active 才能对外说"她正在看东西"——held 只能说"正在处理媒体请求"。
-    phase: Mapped[str] = mapped_column(String(16), default="held")
-    kind: Mapped[str] = mapped_column(String(24), default="")
-    actor_id: Mapped[str] = mapped_column(String(64), default="")
-    window_id: Mapped[str] = mapped_column(String(64), default="")
-    subject_id: Mapped[str] = mapped_column(String(64), default="")
+    phase: Mapped[str] = mapped_column(String(16), default="held", server_default="held")
+    kind: Mapped[str] = mapped_column(String(24), default="", server_default="")
+    actor_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    window_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    subject_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     activity_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(
@@ -3174,7 +3279,7 @@ class MediaSlotRow(Base):
     lease_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    generation: Mapped[int] = mapped_column(BigInteger, default=0)
+    generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
 
 
 class MemoryConsolidationRow(Base):
@@ -3192,6 +3297,7 @@ class MemoryConsolidationRow(Base):
 
     __tablename__ = "memory_consolidations"
     __table_args__ = (
+        CheckConstraint("state IN ('ok', 'skipped', 'failed')", name="ck_memory_consolidations_state"),
         UniqueConstraint(
             "actor_id", "subject_id", "sleep_date",
             name="uq_memory_consolidations_night",
@@ -3244,6 +3350,15 @@ class DeferredReply(Base):
 
     __tablename__ = "deferred_replies"
     __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'claimed', 'delivered', 'cancelled', 'failed')",
+            name="ck_deferred_replies_state",
+        ),
+        CheckConstraint(
+            "applied_delay_ms >= 0 AND applied_delay_ms <= 300000",
+            name="ck_deferred_replies_delay_cap",
+        ),
+        CheckConstraint("hard_deadline_at > chosen_due_at", name="ck_deferred_replies_deadline_order"),
         # 同一轮最多一条延后记录。这是"重复扫描只产生一个轮次"的**库级**保证，
         # 不靠进程内去重（多副本时那种去重等于没有）。
         Index("uq_deferred_replies_source_turn", "source_turn_id", unique=True),
@@ -3268,12 +3383,12 @@ class DeferredReply(Base):
     #: 为什么是**派生**栅栏而不是"取消代次"计数器：新输入入口分散在 web 路由、
     #: 入站桥、注意力轮询三处，任何"顺手 +1"的钩子都必然漏一处，而漏掉的表现是
     #: "她插进新话题补了一句"——极难复现。派生没有写入点，也就没有漏写的可能。
-    input_sequence: Mapped[int] = mapped_column(BigInteger, default=0)
+    input_sequence: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
 
     # --- 时长（三个数，见类注释）---
-    requested_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0)
-    applied_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0)
-    clamped: Mapped[bool] = mapped_column(Boolean, default=False)
+    requested_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    applied_delay_ms: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    clamped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # --- 截止 ---
     #: 到点被 worker 认领。
@@ -3283,12 +3398,12 @@ class DeferredReply(Base):
     hard_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     # --- 状态机 ---
-    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    state: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending")
     reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     #: 这次交付用的是兜底短句（"刚才想晚点回你，但没能及时整理好"）。
     #: 单独一列是因为"她回了"与"她回的是那句兜底"必须能分开——把兜底记成正常
     #: 交付，就等于声称她当时真的想清楚了。
-    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # --- 交付结果 ---
     delivered_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -3299,7 +3414,7 @@ class DeferredReply(Base):
     lease_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    claim_generation: Mapped[int] = mapped_column(Integer, default=0)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     #: 模型**可能已经调用**的时间。`claimed -> pending` 的重排只允许它为空时：
     #: 非空意味着可能已经收了费、用户也可能已经看到内容，自动重跑会二次收费。
     model_started_at: Mapped[datetime | None] = mapped_column(

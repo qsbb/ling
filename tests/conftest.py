@@ -12,8 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from ling.infra import models as _models  # noqa: F401 - register all tables
-from ling.infra.db import Base
+from ling.infra.db import create_all_for_dev
 
 
 @pytest_asyncio.fixture
@@ -42,8 +41,7 @@ async def postgres_session_factory() -> AsyncIterator[async_sessionmaker[AsyncSe
             database_url,
             connect_args={"server_settings": {"search_path": schema}},
         )
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+        await create_all_for_dev(engine)
         yield async_sessionmaker(engine, expire_on_commit=False)
     finally:
         if engine is not None:

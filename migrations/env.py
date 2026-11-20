@@ -1,4 +1,4 @@
-"""Alembic 环境。目标 metadata 来自 ling.infra.models。"""
+"""Alembic 环境。目标 metadata 由共享的 ORM 注册入口填充。"""
 
 from __future__ import annotations
 
@@ -10,10 +10,8 @@ from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from ling.config import require_database_url
-from ling.infra import conversation_policy_audit as _policy_audit  # noqa: F401
-from ling.infra import models as _models  # noqa: F401 - 注册全部表
-from ling.infra import proactive_quota as _proactive_quota  # noqa: F401
 from ling.infra.db import Base
+from ling.infra.orm_registry import import_all_models
 
 config = context.config
 if config.config_file_name is not None:
@@ -26,6 +24,7 @@ if config.config_file_name is not None:
     # 逻辑静默失效，而且是"看起来通过"的那种失效。所以这里显式关掉。
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
+import_all_models()
 target_metadata = Base.metadata
 
 

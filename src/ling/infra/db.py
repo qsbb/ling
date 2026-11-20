@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from ling.config import Settings, require_database_url
+from ling.infra.orm_registry import import_all_models
 
 
 class Base(DeclarativeBase):
@@ -115,10 +116,6 @@ async def short_session_scope() -> AsyncIterator[AsyncSession]:
 
 async def create_all_for_dev(engine: AsyncEngine) -> None:
     """开发/测试用建表。生产走 Alembic 迁移（migrations/）。"""
-    # 必须先 import 所有模型模块，让 metadata 完整
-    from ling.infra import conversation_policy_audit as _policy_audit  # noqa: F401
-    from ling.infra import models as _models  # noqa: F401
-    from ling.infra import proactive_quota as _proactive_quota  # noqa: F401
-
+    import_all_models()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

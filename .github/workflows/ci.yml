@@ -111,9 +111,8 @@ jobs:
         # 通过 `uses: ./.github/workflows/ci.yml` 复用本 job，打 tag 发版时同样会跑。
         run: python deploy/release/catalog.py validate
       - name: 迁移链 + alembic check
-        # 迁移冒烟单跑一步：它在非 PostgreSQL 环境会 **skip**（不是 fail），
-        # 埋在整包 pytest 里会静默消失。先确认端口真的可连，再把这一步的成败
-        # 单独暴露在 job 列表上——省得"迁移链断了"被误读成业务测试的问题。
+        # 迁移需要 PostgreSQL，结构漂移不再允许 xfail。单独运行此门禁，
+        # 让迁移失败与业务测试失败在 job 列表里可区分。
         run: |
           python - <<'PY'
           import socket

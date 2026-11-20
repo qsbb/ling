@@ -39,10 +39,8 @@
 
 ## 为什么这张表不在 `infra/models.py`
 
-与 `media_assets` 同样的理由：`models.py` 是全库 schema 的权威清单，但它
-此刻正被 SP04/SP05 改动。分文件放**行为完全一样**（同一个 `Base`），只是
-避免同文件冲突。导入顺序：任何要用这张表的地方（迁移检查、测试建表、服务）
-都必须 `import ling.infra.media_playback` 一次。
+与 `media_assets` 一样，播放事件独立定义，但仍使用共同的 `Base`。
+迁移检查与建表由 `orm_registry.import_all_models()` 统一注册。
 """
 
 from __future__ import annotations
@@ -50,7 +48,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ling.infra.db import Base
@@ -81,15 +79,25 @@ class MediaPlayEventRow(Base, TimestampMixin):
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
 
     #: 累计听过几次。**统计量不是凭据**：丢一次不影响任何判定。
-    play_count: Mapped[int] = mapped_column(Integer, default=1)
-    first_played_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_played_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    play_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    first_played_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()")
+    )
+    last_played_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()")
+    )
     #: 最后一次听到的位置（毫秒）。用来回答"他听完没有"，不用于断点续播
     #: （音频很短，续播反而让人以为少了一段）。
     position_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 是否听到过结尾（`ended` 事件）。**只有明确收到 ended 才为真**——
     #: 把"播到 99%"当成听完，会让"他根本没听完"这个信号消失。
-    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=text("now()")
+    )
 
 
 def play_state_for(rows: Iterable[MediaPlayEventRow]) -> dict[str, MediaPlayEventRow]:

@@ -13,7 +13,8 @@ from pathlib import Path
 from sqlalchemy import text
 
 from ling.config import get_settings
-from ling.infra.db import Base, dispose_engine, init_engine
+from ling.infra.db import Base, create_all_for_dev, dispose_engine, init_engine
+from ling.infra.orm_registry import import_all_models
 
 
 def _project_root() -> Path:
@@ -81,10 +82,7 @@ async def upgrade() -> int:
         await asyncio.to_thread(command.upgrade, cfg, "head")
         print("[migrate] alembic upgrade head 完成")
     else:
-        import ling.infra.models  # noqa: F401 - 注册所有表
-
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        await create_all_for_dev(engine)
         print("[migrate] 无 Alembic 修订，已用 metadata.create_all（幂等）")
     async with engine.connect() as conn:
         version = (await conn.execute(text("SELECT version()"))).scalar_one()
@@ -116,9 +114,7 @@ async def preflight() -> int:
     """
     from sqlalchemy import inspect as sa_inspect
 
-    import ling.infra.models  # noqa: F401
-    from ling.infra.db import Base
-
+    import_all_models()
     settings = get_settings()
     engine = init_engine(settings)
     problems: list[str] = []

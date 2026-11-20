@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ling.infra.db import Base
@@ -38,15 +38,17 @@ class MediaAssetRow(Base, TimestampMixin):
     subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     #: audio / image / video。首版只写 audio，但列不限定死。
-    kind: Mapped[str] = mapped_column(String(16), default="audio")
+    kind: Mapped[str] = mapped_column(String(16), default="audio", server_default="audio")
     #: 具体格式：mp3 / wav / ogg / silk …（由产出方声明，不靠猜扩展名）。
-    format: Mapped[str] = mapped_column(String(16), default="mp3")
+    format: Mapped[str] = mapped_column(String(16), default="mp3", server_default="mp3")
     #: MIME 类型。播放与渠道都用它决定怎么处理。
-    mime_type: Mapped[str] = mapped_column(String(96), default="audio/mpeg")
+    mime_type: Mapped[str] = mapped_column(
+        String(96), default="audio/mpeg", server_default="audio/mpeg"
+    )
 
     #: 相对 `data_dir` 的路径（`generated_media/ab/abcd…`）。
     relative_path: Mapped[str] = mapped_column(String(256))
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     #: 采样率（Hz）。音频才有，其他可空。
     sample_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 时长（毫秒）。**毫秒整数而不是浮点秒**：浮点在库里比较/求和会出现
@@ -69,6 +71,12 @@ class MediaAssetRow(Base, TimestampMixin):
 
     #: 备注/失败原因。只用于人工排查，不参与任何判定。
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=text("now()")
+    )
 
     def is_live(self, *, now: datetime | None = None) -> bool:
         """是否可对外提供：已 ready、未删除、未过期。"""
@@ -95,13 +103,21 @@ class MediaAssetGrantRow(Base, TimestampMixin):
     actor_id: Mapped[str] = mapped_column(String(64))
     window_id: Mapped[str] = mapped_column(String(64))
     subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    purpose: Mapped[str] = mapped_column(String(32), default="tts_output")
+    purpose: Mapped[str] = mapped_column(
+        String(32), default="tts_output", server_default="tts_output"
+    )
     turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     producer: Mapped[str | None] = mapped_column(String(64), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=text("now()")
+    )
 
     def is_live(self, *, now: datetime | None = None) -> bool:
         current = now or utcnow()
