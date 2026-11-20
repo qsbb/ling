@@ -76,6 +76,14 @@
         "版本摘要不再混入部署指令，确认后不会悄悄切换更新目标"
       ],
       "url": "https://github.com/qsbb/ling/releases/tag/v0.0.11"
+    },
+    "0.0.12": {
+      "summary": "修复 OneBot 接入凭据限制，按连接方向整理接入设置",
+      "items": [
+        "本机或内网直连的 HTTP 上报和反向 WebSocket 可不填入站凭据；已配置的密钥、Token 和来源 IP 白名单仍生效",
+        "接入页显示所选实例的连接状态，HTTP 上报不再被当作长连接"
+      ],
+      "url": "https://github.com/qsbb/ling/releases/tag/v0.0.12"
     }
   }
 }
