@@ -1078,6 +1078,20 @@ function historyStatus(row: MemoryRecord): string | null {
   return null;
 }
 
+function libraryEmptyNote(data: MemoryListResponse): string {
+  switch (data.extraction?.state) {
+    case 'purging': return '记忆正在清理。';
+    case 'pending': return '对话已排队，等待提炼。';
+    case 'in_flight': return '后台正在提炼，稍后可以刷新查看。';
+    case 'retrying': return '最近一次提炼未完成，后台会重试。';
+    case 'dead': return '最近一次提炼失败，可在日志查看原因。';
+    case 'done': return '最近的提炼任务已结束，当前没有现行条目。';
+    default: return data.extraction === null
+      ? '当前身份还没有提炼任务。其他渠道的记录需要绑定到同一自然人。'
+      : '默认不含已撤回或已归档的条目。';
+  }
+}
+
 export function searchLoadedMemories(rows: MemoryRecord[], query: string): MemoryRecord[] {
   const normalize = (value: string) => value.normalize('NFKC').toLowerCase();
   const terms = normalize(query).trim().split(/\s+/u).filter(Boolean);
@@ -1169,7 +1183,7 @@ function MemoryInspector({
           {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
         <p className="mem-inspector__text">{row.text}</p>
-        {!status ? (
+        {!status && row.can_edit !== false ? (
           <div className="mem-inspector__actions">
             <button
               type="button" className="button button--small button--primary"
@@ -1252,7 +1266,9 @@ function MemoryInspector({
         <summary>记录编号与来源事件</summary>
         <dl className="mem-facts">
           <div><dt>记忆编号</dt><dd><code>{row.memory_id}</code></dd></div>
-          <div><dt>系统评分</dt><dd>{confidenceLabel(row.confidence)}<small> · 不代表事实已核实</small></dd></div>
+          {row.confidence === null ? null : (
+            <div><dt>系统评分</dt><dd>{confidenceLabel(row.confidence)}<small> · 不代表事实已核实</small></dd></div>
+          )}
           <div className="mem-facts__wide"><dt>来源事件</dt><dd>{row.source_event_ids.length ? row.source_event_ids.join('、') : '未记录'}</dd></div>
         </dl>
       </details>
@@ -1405,7 +1421,7 @@ export function MemoryListSection({
             {fetched.length === 0 ? (
               <div className="mem-index__empty" data-testid="mem-list-empty">
                 <strong>{include ? '当前范围内没有条目' : '没有现行记忆'}</strong>
-                <p>{include ? '可以调整历史记录和加载范围。' : '默认不含已撤回或已归档的条目。'}</p>
+                <p>{include ? '可以调整历史记录和加载范围。' : libraryEmptyNote(data)}</p>
                 <button type="button" className="mem-text-button" onClick={() => setShowFilters(true)}>查看筛选选项</button>
               </div>
             ) : filtered.length === 0 ? (

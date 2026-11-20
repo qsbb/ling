@@ -1257,6 +1257,7 @@ export const api = {
   listMemories(options: { limit?: number; include?: MemoryInclude | null } = {}): Promise<MemoryListResponse> {
     const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
     if (options.include) query.set('include', options.include);
+    query.set('view', 'library');
     return request<MemoryListResponse>(`/v1/memory?${query.toString()}`);
   },
 

@@ -368,7 +368,7 @@ export interface MemoryRecord {
   text: string;
   origin: string;
   visibility: string;
-  confidence: number;
+  confidence: number | null;
   retracted: boolean;
   retract_reason: string | null;
   supersedes: string | null;
@@ -377,6 +377,8 @@ export interface MemoryRecord {
   valid_until: string | null;
   created_at: string | null;
   archived_at: string | null;
+  can_edit?: boolean;
+  record_type?: 'memory' | 'experience';
 }
 
 export interface MemoryListResponse {
@@ -390,6 +392,7 @@ export interface MemoryListResponse {
   /** 回显请求里的原始值；默认不传时为 null。 */
   include: string | null;
   note?: string;
+  extraction?: { state: string; at: string | null } | null;
 }
 
 export interface CoreMemoryItem {

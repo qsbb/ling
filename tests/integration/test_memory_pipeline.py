@@ -157,6 +157,35 @@ async def test_episode_is_recallable_later(logged_in: TestEnv) -> None:
     assert any("团子" in t for t in texts), f"Episode 未被检索到，实际 {texts}"
 
 
+async def test_library_shows_episode_from_completed_turn_without_assertions(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling import worker
+
+    async def library() -> dict:
+        response = await logged_in.client.get("/v1/memory", params={"view": "library"})
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert (await library())["extraction"] is None
+    session_id = (
+        await logged_in.client.post("/v1/sessions", json={"title": "记忆库经历"})
+    ).json()["session_id"]
+    text = "周六和朋友整理了书架"
+    events = await _send(logged_in.client, session_id, text)
+    assert events[-1][0] == "turn.completed"
+    before = await library()
+    assert before["total"] == 0 and before["extraction"]["state"] == "pending"
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", None)
+    assert await worker.drain_outbox(limit=1, only_topic="memory.extract") == 1
+    after = await library()
+    assert after["extraction"]["state"] == "done" and after["total"] == 1
+    assert after["memories"][0]["record_type"] == "experience"
+    assert text in after["memories"][0]["text"]
+    assert (await logged_in.client.get("/v1/memory")).json()["total"] == 0
+
+
 async def test_episode_respects_audience(logged_in: TestEnv) -> None:
     """群聊上下文不得召回私聊 Episode。"""
     from ling.contracts.v1 import Origin, Visibility

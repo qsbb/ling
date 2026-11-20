@@ -855,6 +855,13 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 | --- | --- | --- | --- |
 | `limit` | `50` | 整数 `1..200` | 单次最多返回条数。**无分页**：没有 `offset` / `cursor`，只有 `limit`；`limit` 上限 200，超过 200 条的部分在接口层面**不可达** |
 | `include` | 不传（`null`） | `retracted` / `archived` / `all` | 显式取回墓碑；其它值 `422 invalid_request` |
+| `view` | 不传 | `library` | Web 记忆库使用的附加视图；不传时仍只读当前账号的原有记忆条目 |
+
+`view=library` 把已记下的对话经历与提炼条目一起按时间列出。经历记录是只读的，
+以 `record_type: "experience"` 区分，`confidence` 为 `null`。列表与写操作仍限于当前账号
+对应的自然人；其他身份的存量不会仅因账号合并就出现在这里。
+`extraction` 是最近一次提炼任务的状态与时间，无任务时为 `null`；`done` 只表示任务结束，
+是否有现行内容以列表为准。
 
 默认可见集**只含现行记忆**：`retracted=false` **且** `archived_at IS NULL`。
 已撤回（`retracted=true`）与已归档（`archived_at` 非空）的行只是**默认不可见**，

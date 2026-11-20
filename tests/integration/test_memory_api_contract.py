@@ -25,6 +25,8 @@ from ling.infra.models import (
     CoreMemoryRow,
     MemoryEpisode,
     MemoryRow,
+    OutboxEvent,
+    Subject,
     utcnow,
 )
 from tests.integration.conftest import TestEnv
@@ -112,6 +114,76 @@ async def _seed_memory_for(subject_id: str, text: str = "别人的记忆") -> st
         )
     assert memory_id
     return memory_id
+
+
+async def test_library_shows_saved_experience_without_changing_legacy_api(logged_in: TestEnv) -> None:
+    subject = logged_in.subject_id
+    other = await _other_subject()
+    foreign_episode = await _seed_episode(other, "另一位使用者的经历")
+    own_episode = await _seed_episode(subject, "实存的对话经历")
+    own_fact = await _create_memory(logged_in, "留下的偏好")
+    async with session_scope() as session:
+        session.add(Subject(id="subj_channel_fixture", merged_into=subject, display_name="测试渠道"))
+    await _seed_episode("subj_channel_fixture", "仍登记在旧渠道身份的经历")
+    archived = await _seed_episode(subject, "归档经历")
+    async with session_scope() as session:
+        await session.execute(update(MemoryEpisode).where(
+            MemoryEpisode.id == archived,
+        ).values(archived_at=utcnow()))
+
+    legacy = (await logged_in.client.get("/v1/memory")).json()
+    assert [row["memory_id"] for row in legacy["memories"]] == [own_fact]
+    response = await logged_in.client.get("/v1/memory", params={"view": "library"})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    rows = {row["memory_id"]: row for row in data["memories"]}
+    assert set(rows) == {own_fact, own_episode}
+    assert data["total"] == 2 and data["has_more"] is False
+    assert rows[own_fact]["can_edit"] is True
+    assert rows[own_episode]["text"] == "实存的对话经历"
+    assert rows[own_episode]["record_type"] == "experience"
+    assert rows[own_episode]["confidence"] is None and rows[own_episode]["can_edit"] is False
+
+    history = (await logged_in.client.get(
+        "/v1/memory", params={"view": "library", "include": "archived", "limit": 1},
+    )).json()
+    assert history["total"] == 3 and history["has_more"] is True
+    assert history["memories"][0]["memory_id"] == archived
+
+    # Even an explicit merge must not hand over a separate Web user's private records.
+    async with session_scope() as session:
+        await session.execute(update(Subject).where(Subject.id == other).values(merged_into=subject))
+    merged = (await logged_in.client.get("/v1/memory", params={"view": "library"})).json()
+    assert own_episode in {row["memory_id"] for row in merged["memories"]}
+    assert foreign_episode not in {row["memory_id"] for row in merged["memories"]}
+
+
+async def test_library_empty_state_uses_actual_extraction_job(logged_in: TestEnv) -> None:
+    async def library() -> dict:
+        response = await logged_in.client.get("/v1/memory", params={"view": "library"})
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert (await library())["extraction"] is None
+    async with session_scope() as session:
+        session.add(OutboxEvent(
+            id="obx_memory_fixture", topic="memory.extract",
+            payload={"subject_id": logged_in.subject_id, "user_text": "内部任务正文"},
+            last_error="内部异常详情",
+        ))
+    assert (await library())["extraction"]["state"] == "pending"
+    for state, attempts, expected in [
+        ("pending", 1, "retrying"), ("in_flight", 1, "in_flight"),
+        ("dead", 5, "dead"), ("done", 0, "done"),
+    ]:
+        async with session_scope() as session:
+            await session.execute(update(OutboxEvent).where(
+                OutboxEvent.id == "obx_memory_fixture",
+            ).values(state=state, attempts=attempts))
+        data = await library()
+        assert data["extraction"]["state"] == expected
+        assert data["memories"] == [] and data["total"] == 0
+        assert "内部任务正文" not in str(data) and "内部异常详情" not in str(data)
 
 
 def _assert_error_shape(response, expected_code: str = "invalid_request") -> None:

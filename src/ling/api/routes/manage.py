@@ -114,6 +114,7 @@ async def list_memory(
             json_schema_extra={"enum": list(MEMORY_INCLUDE_MODES)},
         ),
     ] = None,
+    view: Literal["library"] | None = None,
 ) -> dict:
     """列出当前自然人**现行**的长期记忆。
 
@@ -133,30 +134,17 @@ async def list_memory(
             "include 只能是 retracted、archived 或 all",
             status_code=422,
         )
+    from ling.domains.memory.library import memory_record, read_library
+
+    if view == "library":
+        return await read_library(session, auth.user.subject_id, limit=limit, include=include)
+
     effective = include or "active"
     service = MemoryService(session)
     rows = await service.list_memories(auth.user.subject_id, limit=limit, include=effective)
     total = await service.count_memories(auth.user.subject_id, include=effective)
     return {
-        "memories": [
-            {
-                "memory_id": r.id,
-                "kind": r.kind,
-                "text": r.text,
-                "origin": r.origin,
-                "visibility": r.visibility,
-                "confidence": r.confidence,
-                "retracted": r.retracted,
-                "retract_reason": r.retract_reason,
-                "supersedes": r.supersedes,
-                "superseded_by": r.superseded_by,
-                "source_event_ids": r.source_event_ids or [],
-                "valid_until": r.valid_until.isoformat() if r.valid_until else None,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "archived_at": r.archived_at.isoformat() if r.archived_at else None,
-            }
-            for r in rows
-        ],
+        "memories": [memory_record(row) for row in rows],
         # 无分页（没有 offset/cursor）；limit 只截断，total/has_more 说明还有没有。
         "limit": limit,
         "total": total,
