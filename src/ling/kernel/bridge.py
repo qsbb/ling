@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, or_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.audit import behavior_event, hash_account_ref
@@ -1337,25 +1338,21 @@ class InboundBridge:
 
         注意这里只登记、不描述：描述要调视觉模型，属于另一条链路。
         """
-        refs: list[str] = []
         kinds: dict[str, str] = {}
         for part in envelope.parts:
             if part.modality.value == "text" or not part.media_ref:
                 continue
-            refs.append(part.media_ref)
             kinds[part.media_ref] = _kind_of(part.modality.value, part.mime_type)
         for ref in envelope.media_refs:
-            if ref not in refs:
-                refs.append(ref)
-                kinds[ref] = "image"
+            kinds.setdefault(ref, "image")
 
-        if not refs:
+        if not kinds:
             return [], None
 
         service = MediaEvidenceService(self._session, actor_id=self._actor_id)
         recorded: list[str] = []
         failures: list[str] = []
-        for ref in refs:
+        for ref, kind in kinds.items():
             try:
                 # 每个媒体一个 SAVEPOINT：登记是**旁路**（本函数的文档就在说
                 # "媒体登记失败不阻断文本轮次"），而 `record()` 内部会
@@ -1370,8 +1367,9 @@ class InboundBridge:
                         subject_id=subject_id,
                         window_id=window_id,
                         media_ref=ref,
-                        kind=kinds.get(ref, "image"),
-                        source_event_id=f"{envelope.external_event_id}:{ref}",
+                        kind=kind,
+                        source_event_id=envelope.external_event_id,
+                        dedupe_by_ref=True,
                         consent_subjects=(owner_subject_id,) if owner_subject_id else (),
                     )
             except MediaEvidenceError as exc:
@@ -1391,6 +1389,8 @@ class InboundBridge:
                     attributes={
                         "reason_code": "media_evidence_record_failed",
                         "error_type": type(exc).__name__,
+                        "sqlstate": getattr(exc.orig, "sqlstate", None)
+                        if isinstance(exc, DBAPIError) else None,
                     },
                 )
                 failures.append(f"媒体登记失败（{type(exc).__name__}）")
@@ -1405,7 +1405,7 @@ class InboundBridge:
             # 只是日志从"每个 ref 一行"压成"这条消息一行"。
             reasons = "；".join(dict.fromkeys(failures))
             logger.info(
-                "收到 %d 个媒体，跳过 %d 个：%s", len(refs), len(failures), reasons
+                "收到 %d 个媒体，跳过 %d 个：%s", len(kinds), len(failures), reasons
             )
         return recorded, (failures[0] if failures else None)
 

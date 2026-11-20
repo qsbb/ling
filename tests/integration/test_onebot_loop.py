@@ -19,6 +19,7 @@ import pytest
 from connectors.onebot.connector import OneBotV11Connector
 from connectors.onebot.settings import OneBotConfig
 from sqlalchemy import select
+from sqlalchemy import text as sql_text
 
 from ling.domains.consent.service import ConsentService
 from ling.domains.identity.service import IdentityService
@@ -540,6 +541,83 @@ async def test_image_evidence_lands_in_db(logged_in: TestEnv) -> None:
         assert row.kind == "image"
         assert row.media_ref.startswith("a1b2c3.jpg") or "a1b2c3" in row.media_ref
         assert row.description is None, "入库时不应该有描述"
+
+
+async def test_qq_image_urls_are_stored_intact_and_deduped(logged_in: TestEnv) -> None:
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+
+    prefix = "https://media.example.test/image?sig="
+    refs = [prefix + "a" * 270, prefix + "b" * (2047 - len(prefix)) + "z"]
+    images = [{"type": "image", "data": {"url": ref}} for ref in refs]
+    event = _event_body(message=images)
+    first = (await _post(logged_in, event)).json()
+    assert first["media_note"] is None, first
+    assert len(first["media_evidence_ids"]) == 2, first
+    assert "已记录媒体证据" in first["reason"]
+    assert (await _post(logged_in, event)).json()["duplicate"] is True
+
+    mixed = (await _post(logged_in, _event_body(
+        message_id=778,
+        message=[{"type": "text", "data": {"text": "这两张图有什么区别？"}}, *images],
+    ))).json()
+    assert mixed["accepted"] and mixed["delivered"], mixed
+    assert mixed["media_note"] is None, mixed
+    assert len(mixed["media_evidence_ids"]) == 2, mixed
+
+    async with session_scope() as session:
+        rows = list((await session.scalars(select(MediaEvidenceRow))).all())
+        assert {r.id for r in rows} == set(first["media_evidence_ids"] + mixed["media_evidence_ids"])
+        assert {r.media_ref for r in rows} == set(refs)
+        assert {r.source_event_id for r in rows} == {"10001:777", "10001:778"}
+        assert len({r.dedupe_key for r in rows}) == 4
+        assert await session.scalar(select(Message.id).where(
+            Message.role == "user", Message.text == "这两张图有什么区别？[image][image]"
+        ))
+
+
+async def test_pure_image_is_retryable_if_postgres_rejects_commit(
+    logged_in: TestEnv, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    async with session_scope() as session:
+        await session.execute(sql_text("""
+            CREATE FUNCTION reject_media_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'synthetic failure while committing media';
+            END;
+            $$
+        """))
+        await session.execute(sql_text("""
+            CREATE CONSTRAINT TRIGGER reject_media_commit AFTER INSERT ON media_evidence
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_media_commit()
+        """))
+
+    event = _event_body(message=_IMAGE_CQ, raw_message=_IMAGE_CQ)
+    with caplog.at_level("INFO", logger="ling.behavior"):
+        response = await _post(logged_in, event)
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"] is False
+        assert "可重投" in response.json()["reason"]
+        assert not any("已登记媒体" in record.getMessage() for record in caplog.records)
+
+        async with session_scope() as session:
+            assert await session.scalar(select(MediaEvidenceRow.id)) is None
+            await session.execute(sql_text("DROP TRIGGER reject_media_commit ON media_evidence"))
+            await session.execute(sql_text("DROP FUNCTION reject_media_commit()"))
+
+        retried = (await _post(logged_in, event)).json()
+        assert not retried.get("duplicate"), retried
+        assert len(retried["media_evidence_ids"]) == 1 and retried["media_note"] is None
+        assert any("已登记媒体" in record.getMessage() for record in caplog.records)
+        assert (await _post(logged_in, event)).json().get("duplicate") is True
+
+    async with session_scope() as session:
+        assert list(await session.scalars(select(MediaEvidenceRow.id))) == retried["media_evidence_ids"]
 
 
 async def test_image_plus_text_still_replies(logged_in: TestEnv) -> None:

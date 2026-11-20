@@ -2117,7 +2117,7 @@ class MediaEvidenceRow(Base, TimestampMixin):
     # image / audio / video / emoji
     kind: Mapped[str] = mapped_column(String(16), default="image", server_default="image")
     # 外部引用（对象存储 key、URL、本地相对路径），不存二进制
-    media_ref: Mapped[str] = mapped_column(String(512))
+    media_ref: Mapped[str] = mapped_column(String(2048))
     # user_upload / camera / model_generated
     origin: Mapped[str] = mapped_column(
         String(24), default="user_upload", server_default="user_upload"

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,8 +56,11 @@ class MediaEvidenceError(Exception):
 
 
 def dedupe_key_for(source_event_id: str) -> str:
-    """同一个来源事件只产生一条证据。重复回调不重复记。"""
-    return f"media:{source_event_id}"
+    """保留已在库里的短键，长引用使用固定长度的指纹。"""
+    key = f"media:{source_event_id}"
+    if len(key) <= 192:
+        return key
+    return f"media-sha256:{hashlib.sha256(source_event_id.encode()).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,7 @@ class MediaEvidenceService:
         origin: str = ORIGIN_UPLOAD,
         visibility: str = DEFAULT_VISIBILITY,
         source_event_id: str | None = None,
+        dedupe_by_ref: bool = False,
         expires_at: datetime | None = None,
         consent_subjects: Sequence[str] | None = None,
     ) -> EvidenceView:
@@ -150,7 +155,11 @@ class MediaEvidenceService:
                 f"未授权描述入站媒体（授权记录 scope={INBOUND_SCOPE}）"
             )
 
-        key = dedupe_key_for(source_event_id or media_ref)
+        # 渠道一条消息可能有多张图。附件引用只参与去重，不属于来源事件 ID。
+        identity = source_event_id or media_ref
+        if dedupe_by_ref and source_event_id:
+            identity = f"{source_event_id}:{media_ref}"
+        key = dedupe_key_for(identity)
         # **去重必须按窗口**。原来全局按 key 查，于是两个窗口收到同一张图时，
         # 后一个窗口拿到的是**前一个窗口的** evidence——它的 window_id 对不上，
         # 描述任务按窗口取待办永远取不到，而且跨窗口引用了别人的证据。
@@ -164,11 +173,7 @@ class MediaEvidenceService:
             subject_id=subject_id,
             window_id=window_id,
             kind=kind,
-            # 列宽 512。契约的 `MediaRef` 上限是 2048（见 contracts/v1.py），
-            # 超过 512 的外部引用会在这里被**静默截断**，之后 fetch_media
-            # 拿到的是一个坏 URL。真实 QQ 图片 URL 约 300–400 字符，暂时够用；
-            # 要根治得加宽这一列（迁移），不要在契约层假装 2048 已完全支持。
-            media_ref=media_ref[:512],
+            media_ref=media_ref,
             origin=origin,
             visibility=visibility,
             consent_revision=consent.revision,

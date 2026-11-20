@@ -676,6 +676,31 @@ def test_upgrade_from_0079_keeps_existing_subject_data() -> None:
             ]
 
 
+def test_media_reference_upgrade_preserves_legacy_rows_and_accepts_long_values() -> None:
+    with _temporary_database() as url:
+        _run_alembic("upgrade", url, "0079_manual_names_and_order")
+        asyncio.run(_execute(url, """
+            INSERT INTO media_evidence
+                (id, actor_id, window_id, media_ref, source_event_id, dedupe_key, created_at, updated_at)
+            VALUES ('old', 'actor', 'window', 'legacy.jpg', 'evt:legacy.jpg',
+                    'media:evt:legacy.jpg', now(), now())
+        """))
+        _run_alembic("upgrade", url, "head")
+        asyncio.run(_execute(url, """
+            INSERT INTO media_evidence
+                (id, actor_id, window_id, media_ref, source_event_id, dedupe_key, created_at, updated_at)
+            VALUES ('long', 'actor', 'window', repeat('x', 2047) || 'z', 'evt-2',
+                    'media:test-long', now(), now())
+        """))
+        assert asyncio.run(_fetch(url, """
+            SELECT id, length(media_ref), right(media_ref, 1), source_event_id, dedupe_key
+            FROM media_evidence ORDER BY id
+        """)) == [
+            ("long", 2048, "z", "evt-2", "media:test-long"),
+            ("old", 10, "g", "evt:legacy.jpg", "media:evt:legacy.jpg"),
+        ]
+
+
 def test_recent_two_migrations_downgrade_then_upgrade(
     migrated_db: MigratedDatabase,
 ) -> None:

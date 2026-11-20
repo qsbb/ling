@@ -329,6 +329,11 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
                 )
             else:
                 result = await bridge.handle(envelope)
+            if not _asr_resume and result.accepted and result.reply_text and not result.delivered:
+                await conversation.release_event(scope=event_scope, key=envelope.external_event_id)
+            # Pure media leaves the write pending in this session. Commit before reporting
+            # success, inside the same retry boundary as the rest of inbound processing.
+            await session.commit()
         except WindowOriginConflictError as exc:
             logger.warning("平台会话归属冲突，事件暂不处理: %s", exc)
             await session.rollback()
@@ -355,13 +360,6 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
                 "accepted": False,
                 "reason": f"处理失败，可重投: {type(exc).__name__}",
             }
-
-        if not _asr_resume and result.accepted and result.reply_text and not result.delivered:
-            await conversation.release_event(
-                scope=event_scope,
-                key=envelope.external_event_id,
-            )
-            await session.commit()
 
         # 行为日志：**她这一侧**发生了什么。放在这里而不是 bridge 内部，
         # 是因为 inbound_intake 是所有渠道的唯一汇合点——放 bridge 里，
@@ -539,7 +537,9 @@ def _log_inbound_behavior(
         preview = f"[{media}]" if media in media_types else (
             "[media]" if envelope.media_refs else "（没有文字）"
         )
-    if not result.accepted:
+    if not result.accepted and result.media_evidence_ids:
+        outcome, status = "media_recorded", "已登记媒体"
+    elif not result.accepted:
         outcome, status = "rejected", "未受理"
     elif 0 < result.parts_sent < result.parts_total:
         outcome, status = "partial_delivery", f"部分送达（{result.parts_sent}/{result.parts_total}）"
@@ -565,6 +565,7 @@ def _log_inbound_behavior(
                 "external_event_id": envelope.external_event_id,
                 "decision": result.decision,
                 "reason": clip(result.reason, 240),
+                **({"media_note": clip(result.media_note, 160)} if result.media_note else {}),
                 "delivered": result.delivered,
                 "parts_sent": result.parts_sent,
                 "parts_total": result.parts_total,
