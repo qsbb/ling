@@ -201,9 +201,8 @@ describe('四态渲染互不串', () => {
     expect(markup).toContain('已连接');
     expect(markup).not.toContain('未配置');
     expect(markup).not.toContain('未连接');
-    // 已连接时指引必须是"没有需要改的"，不能还是"去宿主 .env 里补"。
-    expect(guidanceOf(markup)).toContain('已连接，没有需要改的');
-    expect(guidanceOf(markup)).not.toContain('宿主部署目录');
+    // 已连接用状态表示，不再重复画一份操作指引。
+    expect(guidanceOf(markup)).toBe('');
   });
 });
 
@@ -222,12 +221,19 @@ describe('可编辑：每个字段都有控件，密钥只有密码框', () => {
     expect(markup).not.toContain('readonly');
   });
 
-  it('OneBot 的每个注册字段都渲染出自己的输入控件', () => {
-    const markup = render(makeConnector({ fields: onebotFields() }));
+  it('OneBot 注册字段在对应接法下可配置，不把三套表单混在一起', () => {
+    const reverse = render(makeConnector({ fields: onebotFields() }));
+    const direct = render(makeConnector({ fields: onebotFields(), status_reason: 'onebot_ws_client_connected' }));
+    const http = render(makeConnector({
+      fields: onebotFields().filter((field) => field.key !== 'LING_ONEBOT_WS_PORT'), status_reason: 'onebot_http_only',
+    }));
     expect(FIELD_IDS_FOR_TESTS.onebot).toHaveLength(13);
     for (const key of FIELD_IDS_FOR_TESTS.onebot) {
-      expect(markup).toContain(`data-testid="connector-input-${key}"`);
+      expect(reverse + direct + http).toContain(`data-testid="connector-input-${key}"`);
     }
+    expect(reverse).not.toContain('data-testid="connector-input-LING_ONEBOT_WS_URL"');
+    expect(direct).not.toContain('data-testid="connector-input-LING_ONEBOT_WS_PORT"');
+    expect(http).not.toContain('data-testid="connector-input-LING_ONEBOT_WS_TOKEN"');
   });
 
   it('密钥是 password 框，值恒空，占位符说"已设置（留空则不修改）"', () => {

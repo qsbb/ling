@@ -154,7 +154,7 @@ type PutPlan =
 async function openConnectors(
   viewport: { width: number; height: number },
   plans: PutPlan[] = [],
-  options: { body?: ConnectorsResponse } = {},
+  options: { body?: ConnectorsResponse; compact?: boolean } = {},
 ): Promise<Harness> {
   if (!browser || launchError) throw new Error(launchError ?? '浏览器未启动');
   const context = await browser.newContext({ viewport, reducedMotion: 'reduce' });
@@ -230,6 +230,9 @@ async function openConnectors(
   await page.getByTestId('connector-onebot').waitFor({ timeout: 20_000 });
   // Vite 开发态下样式是模块注入的：等样式真的生效再量布局。
   await page.waitForFunction(() => document.styleSheets.length > 3, undefined, { timeout: 20_000 });
+  if (!options.compact) {
+    await page.getByTestId('onebot-group-advanced').locator('summary').click();
+  }
   return { page, puts, posts };
 }
 
@@ -240,7 +243,7 @@ function inputOf(page: Page, key: string) {
 
 /* ------------------------------------------------------------ 用例 */
 
-it('OneBot 按连接方向展开，HTTP 校验可选且展开操作不改变已编辑的端口', async (ctx) => {
+it('切换平台和接法只改变当前视图，不改已有凭据或草稿', async (ctx) => {
   if (skip(ctx)) return;
   const base = makeResponse();
   const body = makeResponse({ connectors: base.connectors.map((connector) => connector.id === 'onebot'
@@ -250,20 +253,34 @@ it('OneBot 按连接方向展开，HTTP 校验可选且展开操作不改变已�
     : connector) });
   const { page, puts } = await openConnectors({ width: 375, height: 800 }, [
     { kind: 'ok', result: changeResult('onebot', 'active') },
-  ], { body });
+  ], { body, compact: true });
 
   expect(await page.getByTestId('connector-onebot-status').textContent()).toContain('等待 OneBot 连入');
   const port = inputOf(page, 'LING_ONEBOT_WS_PORT');
   await port.fill('6799');
-  expect(await inputOf(page, 'LING_ONEBOT_WS_TOKEN').inputValue()).toBe('');
-  const http = page.getByTestId('onebot-group-http');
+  expect(await inputOf(page, 'LING_ONEBOT_WS_TOKEN').isVisible()).toBe(false);
   expect(await inputOf(page, 'LING_ONEBOT_SECRET').isVisible()).toBe(false);
-  await http.locator('summary').click();
-  expect(await http.textContent()).toContain('/v1/onebot/events');
-  expect(await inputOf(page, 'LING_ONEBOT_SECRET').isVisible()).toBe(true);
-  expect(await inputOf(page, 'LING_ONEBOT_SOURCE_IPS').isVisible()).toBe(false);
+  const method = page.getByLabel('配置接法');
+  await method.selectOption('http');
+  expect(await page.getByTestId('onebot-group-http').textContent()).toContain('/v1/onebot/events');
+  const pending = page.getByTestId('onebot-other-changes');
+  expect(await pending.getByTestId('connector-input-LING_ONEBOT_WS_PORT').inputValue()).toBe('6799');
   await page.getByTestId('onebot-group-advanced').locator('summary').click();
+  expect(await inputOf(page, 'LING_ONEBOT_SECRET').inputValue()).toBe('');
+  expect(await inputOf(page, 'LING_ONEBOT_SECRET').isVisible()).toBe(true);
   expect(await inputOf(page, 'LING_ONEBOT_SOURCE_IPS').isVisible()).toBe(true);
+  await page.getByTestId('connector-clear-LING_ONEBOT_SECRET').click();
+  await method.selectOption('direct');
+  expect(await inputOf(page, 'LING_ONEBOT_WS_URL').isVisible()).toBe(true);
+  expect(await inputOf(page, 'LING_ONEBOT_API_BASE').isVisible()).toBe(true);
+  expect(await inputOf(page, 'LING_ONEBOT_SOURCE_IPS').count()).toBe(0);
+  expect(await pending.getByTestId('connector-cleared-LING_ONEBOT_SECRET').isVisible()).toBe(true);
+  await pending.getByTestId('connector-clear-LING_ONEBOT_SECRET').click();
+  await page.getByRole('button', { name: 'QQ 官方机器人', exact: true }).click();
+  expect(await inputOf(page, 'LING_QQBOT_APP_ID').isVisible()).toBe(true);
+  expect(await method.isVisible()).toBe(false);
+  await page.getByRole('button', { name: 'OneBot', exact: true }).click();
+  await method.selectOption('reverse');
   expect(await port.inputValue()).toBe('6799');
   await page.getByTestId('connector-onebot-save').click();
   await page.getByTestId('connector-onebot-notice').waitFor();
@@ -352,6 +369,7 @@ describe('接入器：真的能改并保存', () => {
       { kind: 'ok', result: changeResult('access', 'active') },
     ]);
 
+    await page.getByRole('button', { name: '出入许可', exact: true }).click();
     await page.getByTestId('connector-input-LING_ACCESS_LIST').fill('100200300\n0456');
     await page.getByTestId('connector-access-save').click();
     await page.getByTestId('connector-access-notice').waitFor();
@@ -505,6 +523,7 @@ describe('接入器：恢复默认要二次确认', () => {
     if (skip(ctx)) return;
     const { page, posts } = await openConnectors({ width: 1440, height: 1000 });
 
+    await page.getByText('管理', { exact: true }).click();
     await page.getByTestId('connectors-reset').click();
     await page.getByTestId('connectors-reset-confirm').waitFor();
     expect(posts).toHaveLength(0);

@@ -512,7 +512,8 @@ function viewFor(apiBase: string, generation = 0): ConnectorsResponse {
     connectors: [
       makeConnector({
         generation,
-        fields: onebotFields().map((field) =>
+        status_reason: 'onebot_http_only',
+        fields: onebotFields().filter((field) => field.key !== 'LING_ONEBOT_WS_PORT').map((field) =>
           field.key === 'LING_ONEBOT_API_BASE'
             ? { ...field, value: apiBase, source: 'db' as const, configured: true }
             : field,
@@ -850,6 +851,7 @@ describe('接入器实例：左列表右详情', () => {
     await expect.poll(() => empty.isVisible()).toBe(true);
     expect(await empty.textContent()).toContain('还没有任何实例');
     // 引导里要有一个真的能用的入口。
+    await page.getByTestId('connector-instance-add-onebot').click();
     await expect.poll(() => page.getByTestId('connector-instance-name').isVisible()).toBe(true);
     await expect.poll(() => page.getByTestId('connector-instance-create-submit').isVisible()).toBe(
       true,

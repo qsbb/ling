@@ -837,6 +837,7 @@ export function ConnectorInstancePanel({
   children,
 }: ConnectorInstancePanelProps) {
   const [list, setList] = useState<ListState>({ status: 'loading' });
+  const createDialog = useRef<HTMLDialogElement>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [forms, setForms] = useState<Record<string, InstanceFormState>>({});
   const [mutation, setMutation] = useState<SaveNotice | null>(null);
@@ -1149,10 +1150,16 @@ export function ConnectorInstancePanel({
       <div className="connector-instances__layout">
         <aside className="connector-instances__rail" aria-label={`${connector.label} 的实例`}>
           <div className="connector-instances__rail-head">
-            <span>实例</span>
-            <span className="connector-instances__count" data-testid={`connector-instance-panel-${scope}-count`}>
+            <span>实例 <span className="connector-instances__count" data-testid={`connector-instance-panel-${scope}-count`}>
               {hasLoadedList ? items.length : '—'}
-            </span>
+            </span></span>
+            {editable ? (
+              <button type="button" className="button button--small connector-instance-add"
+                data-testid={`connector-instance-add-${scope}`} disabled={pageBusy}
+                onClick={() => createDialog.current?.showModal()}>
+                + 添加
+              </button>
+            ) : null}
           </div>
 
           {list.status === 'loading' ? (
@@ -1196,19 +1203,18 @@ export function ConnectorInstancePanel({
           ) : null}
 
           {editable ? (
-            <CreateInstanceForm
-              scope={scope}
-              busy={pageBusy}
-              onCreated={(instance) => {
-                setMutation({
-                  tone: 'ok',
-                  text: `已新建「${instance.display_name}」（${instance.instance_id}）。`,
-                  detail: '它现在有自己的一份配置，保存时不会再影响其它实例。',
-                });
+            <dialog ref={createDialog} className="connector-create-dialog" aria-labelledby={`connector-create-title-${scope}`}>
+              <div className="connector-create-dialog__head">
+                <h3 id={`connector-create-title-${scope}`}>添加{scope === 'onebot' ? ' OneBot' : ' QQ 机器人'}</h3>
+                <button type="button" className="ghost-button" onClick={() => createDialog.current?.close()}>关闭</button>
+              </div>
+              <CreateInstanceForm scope={scope} busy={pageBusy} onCreated={(instance) => {
+                createDialog.current?.close();
+                setMutation({ tone: 'ok', text: `已添加「${instance.display_name}」` });
                 setSelectedId(instance.instance_id);
                 void load();
-              }}
-            />
+              }} />
+            </dialog>
           ) : null}
         </aside>
 
@@ -1235,7 +1241,6 @@ export function ConnectorInstancePanel({
                 </span>
                 <div>
                   <h3>{selected?.display_name}</h3>
-                  <p>{connector.label} · {selected ? instanceStatusLabel(selected) : ''}</p>
                 </div>
               </div>
               {/*

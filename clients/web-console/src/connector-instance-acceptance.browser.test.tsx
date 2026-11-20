@@ -142,7 +142,8 @@ function viewWithValue(apiBase: string): ConnectorsResponse {
   return makeResponse({
     connectors: [
       makeConnector({
-        fields: onebotFields().map((field) =>
+        status_reason: 'onebot_http_only',
+        fields: onebotFields().filter((field) => field.key !== 'LING_ONEBOT_WS_PORT').map((field) =>
           field.key === 'LING_ONEBOT_API_BASE'
             ? { ...field, value: apiBase, source: 'db' as const, configured: true }
             : field,
@@ -551,6 +552,7 @@ describe('验收：实例面板', () => {
      * 的文案都满足规格；这里只要求它不空、且同屏有一个能提交的新建表单。
      */
     expect(text.trim().length).toBeGreaterThan(0);
+    await page.getByTestId('connector-instance-add-onebot').click();
     await expect.poll(() => page.getByTestId('connector-instance-name').isVisible()).toBe(true);
     await expect
       .poll(() => page.getByTestId('connector-instance-create-submit').isVisible())
@@ -618,6 +620,7 @@ describe('验收：实例面板', () => {
     if (skip(ctx)) return;
     const { page, posts, puts } = await open({ items: [], created: row({ instance_id: 'main', display_name: '主号' }) });
 
+    await page.getByTestId('connector-instance-add-onebot').click();
     await page.getByTestId('connector-instance-name').fill('主号');
     await page.getByTestId('connector-instance-create-submit').click();
     await expect.poll(() => posts.length).toBe(1);

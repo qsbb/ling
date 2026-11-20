@@ -70,6 +70,8 @@ interface ConnectorsPageProps {
   onBack: () => void;
 }
 
+const PLATFORM_NAMES: Record<string, string> = { onebot: 'OneBot', qqbot: 'QQ 官方机器人', access: '出入许可' };
+
 type LoadState =
   | { status: 'loading' }
   | { status: 'ready'; body: ConnectorsResponse }
@@ -888,58 +890,115 @@ interface ConnectorCardProps extends ConnectorFormProps {
   onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
 }
 
-const ONEBOT_GROUPS = [
-  { id: 'reverse', title: 'OneBot 连入 Ling · 反向 WebSocket',
-    keys: ['LING_ONEBOT_WS_PORT', 'LING_ONEBOT_WS_HOST', 'LING_ONEBOT_WS_TOKEN'] },
-  { id: 'direct', title: 'Ling 连接 OneBot · WebSocket', keys: ['LING_ONEBOT_WS_URL'] },
-  { id: 'http', title: 'OneBot 向 Ling 上报 · HTTP', keys: ['LING_ONEBOT_SECRET'] },
-  { id: 'api', title: 'Ling 发送消息 · OneBot HTTP API',
-    keys: ['LING_ONEBOT_API_BASE', 'LING_ONEBOT_ACCESS_TOKEN'] },
-  { id: 'advanced', title: '来源限制与高级设置', keys: ['LING_ONEBOT_SOURCE_IPS', 'LING_ONEBOT_SELF_ID'] },
-];
+const ONEBOT_METHODS = ['reverse', 'direct', 'http'] as const;
+type OneBotMethod = typeof ONEBOT_METHODS[number];
 
-function ConnectorFields({ connector, instanceId, form, renderField }: {
+const ONEBOT_PRIMARY: Record<OneBotMethod, readonly string[]> = {
+  reverse: ['LING_ONEBOT_WS_PORT'],
+  direct: ['LING_ONEBOT_WS_URL'],
+  http: ['LING_ONEBOT_API_BASE'],
+};
+const ONEBOT_MODE_OPTIONS: Record<OneBotMethod, readonly string[]> = {
+  reverse: ['LING_ONEBOT_WS_HOST', 'LING_ONEBOT_WS_TOKEN'],
+  direct: [],
+  http: ['LING_ONEBOT_SECRET'],
+};
+const ONEBOT_SEND_ADDRESS = 'LING_ONEBOT_API_BASE';
+const ONEBOT_SEND_TOKEN = 'LING_ONEBOT_ACCESS_TOKEN';
+const ONEBOT_IPS = 'LING_ONEBOT_SOURCE_IPS';
+
+function connectorFieldKey(field: ConnectorField) { return field.key || field.name; }
+
+function fieldsForKeys(fields: ConnectorField[], keys: readonly string[]) {
+  const byKey = new Map(fields.map((field) => [connectorFieldKey(field), field]));
+  return keys.flatMap((key) => byKey.get(key) ?? []);
+}
+
+function ConnectorFields({ connector, instanceId, form, change, renderField }: {
   connector: ConnectorView;
   instanceId?: string;
   form: ConnectorFormProps;
+  change: ConnectorChangeRequest;
   renderField: (field: ConnectorField) => ReactNode;
 }) {
+  const onebotFields = connector.fields;
+  const has = (key: string) => onebotFields.some((field) => connectorFieldKey(field) === key && isFieldSet(field));
+  const defaultMethod: OneBotMethod = connector.status_reason?.includes('onebot_ws_client')
+    ? 'direct' : has('LING_ONEBOT_WS_PORT') ? 'reverse'
+      : has('LING_ONEBOT_WS_URL') ? 'direct'
+        : has('LING_ONEBOT_SECRET') || connector.status_reason === 'onebot_http_only' ? 'http' : 'reverse';
+  const [choice, setChoice] = useState<OneBotMethod | null>(null);
+  const errorMethod = ONEBOT_METHODS.find((mode) => (
+    [...ONEBOT_PRIMARY[mode], ...ONEBOT_MODE_OPTIONS[mode]].includes(form.fieldError ?? '')
+  ));
+  const method = choice ?? errorMethod ?? defaultMethod;
+  if (!connector.fields.length) return null;
+  if (connector.id === 'qqbot') {
+    const keys = ['LING_QQBOT_APP_ID', 'LING_QQBOT_CLIENT_SECRET', 'LING_QQBOT_SANDBOX'];
+    const main = fieldsForKeys(connector.fields, keys);
+    const advanced = connector.fields.filter((field) => !keys.includes(connectorFieldKey(field)));
+    return <>
+      <ul className="connector-fields">{main.map(renderField)}</ul>
+      {advanced.length ? (
+        <details className="connector-group" open={advanced.some((field) => connectorFieldKey(field) === form.fieldError) || undefined}>
+          <summary>高级设置与 Webhook</summary>
+          <ul className="connector-fields">{advanced.map(renderField)}</ul>
+        </details>
+      ) : null}
+    </>;
+  }
   if (connector.id !== 'onebot') {
     return <ul className="connector-fields">{connector.fields.map(renderField)}</ul>;
   }
-  const fieldKey = (field: ConnectorField) => field.key || field.name;
-  const has = (key: string) => connector.fields.some((field) => fieldKey(field) === key && isFieldSet(field));
-  const hasPort = has('LING_ONEBOT_WS_PORT');
-  const hasUrl = has('LING_ONEBOT_WS_URL');
-  const hasHttpConfig = has('LING_ONEBOT_SECRET') || connector.status_reason === 'onebot_http_only';
   const eventsPath = instanceId && instanceId !== DEFAULT_INSTANCE_ID
     ? `/v1/onebot/instances/${encodeURIComponent(instanceId)}/events`
     : '/v1/onebot/events';
+  const primary = fieldsForKeys(onebotFields, method === 'http'
+    ? ONEBOT_PRIMARY.http : [...ONEBOT_PRIMARY[method], ONEBOT_SEND_ADDRESS]);
+  const otherMethodKeys = ONEBOT_METHODS.flatMap((mode) => [...ONEBOT_PRIMARY[mode], ...ONEBOT_MODE_OPTIONS[mode]]);
+  const advanced = [
+    ...fieldsForKeys(onebotFields, ONEBOT_MODE_OPTIONS[method]),
+    ...fieldsForKeys(onebotFields, [ONEBOT_SEND_TOKEN, ...(method === 'direct' ? [] : [ONEBOT_IPS])]),
+    ...onebotFields.filter((field) => {
+      const key = connectorFieldKey(field);
+      return !otherMethodKeys.includes(key) && key !== ONEBOT_SEND_TOKEN && key !== ONEBOT_IPS;
+    }),
+  ];
+  const shown = new Set([...primary, ...advanced].map(connectorFieldKey));
+  const pending = fieldsForKeys(onebotFields, [...Object.keys(change.set), ...change.clear])
+    .filter((field) => !shown.has(connectorFieldKey(field)));
+  const invalid = (fields: ConnectorField[]) => fields.some((field) => connectorFieldKey(field) === form.fieldError);
   return (
-    <div className="connector-groups" aria-label="OneBot 接入方式">
-      {ONEBOT_GROUPS.map(({ id, title, keys }) => {
-        const fields = connector.fields.filter((field) => keys.includes(fieldKey(field)) ||
-          (id === 'advanced' && !ONEBOT_GROUPS.some((group) => group.keys.includes(fieldKey(field)))));
-        if (fields.length === 0) return null;
-        const invalid = fields.some((field) => fieldKey(field) === form.fieldError);
-        const open = id === 'api' || (id === 'reverse' && (hasPort || (!hasUrl && !hasHttpConfig))) ||
-          (id === 'direct' && hasUrl) || (id === 'http' && hasHttpConfig);
-        return (
-          <details key={id} className="connector-group" data-testid={`onebot-group-${id}`} open={open || invalid}>
-            <summary>{title}</summary>
-            {id === 'reverse' ? (
-              <p className="connector-group__note">OneBot 客户端目标：<code>ws://&lt;Ling 地址&gt;:&lt;对外端口&gt;</code>。
-                本机或内网直连可留空 Token；设置后两端须一致。</p>
-            ) : id === 'http' ? (
-              <p className="connector-group__note">HTTP 上报路径：<code>{eventsPath}</code>。
-                本机或内网直连可不填密钥；设置后与 OneBot 的上报 Token 一致。</p>
-            ) : id === 'advanced' && fields.some((field) => fieldKey(field) === 'LING_ONEBOT_SOURCE_IPS') ? (
-              <p className="connector-group__note">IP 白名单仅限制直连的反向 WebSocket 和 HTTP 上报；留空不额外限制 IP。</p>
-            ) : null}
-            <ul className="connector-fields">{fields.map(renderField)}</ul>
-          </details>
-        );
-      })}
+    <div className="connector-groups">
+      <label className="connector-method" htmlFor="onebot-method">
+        <span>配置接法</span>
+        <select id="onebot-method" className="connector-input" value={method}
+          onChange={(event) => setChoice(event.target.value as OneBotMethod)}>
+          <option value="reverse">反向 WebSocket</option>
+          <option value="direct">正向 WebSocket</option>
+          <option value="http">HTTP 上报</option>
+        </select>
+      </label>
+      <div data-testid={`onebot-group-${method}`}>
+        {method === 'reverse' ? (
+          <p className="connector-group__note">OneBot 连接目标：<code>ws://&lt;Ling 地址&gt;:&lt;对外端口&gt;</code></p>
+        ) : method === 'http' ? (
+          <p className="connector-group__note">上报路径：<code>{eventsPath}</code></p>
+        ) : null}
+        <ul className="connector-fields">{primary.map(renderField)}</ul>
+      </div>
+      {advanced.length ? (
+        <details key={`${method}-options`} className="connector-group" data-testid="onebot-group-advanced" open={invalid(advanced) || undefined}>
+          <summary>高级设置与可选凭据</summary>
+          <ul className="connector-fields">{advanced.map(renderField)}</ul>
+        </details>
+      ) : null}
+      {pending.length ? (
+        <div className="connector-method-pending" data-testid="onebot-other-changes">
+          <strong>其他接法中待保存的改动</strong>
+          <ul className="connector-fields">{pending.map(renderField)}</ul>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -993,7 +1052,7 @@ export function ConnectorCard({
     >
       <div className="connector-card__head">
         <h2 className="connector-card__title" id={`connector-${connector.id}-title`}>
-          {connector.label}
+          {PLATFORM_NAMES[connector.id] ?? connector.label}
         </h2>
         <span
           className={`connector-status connector-status--${presentation.tone}`}
@@ -1030,8 +1089,6 @@ export function ConnectorCard({
         onInstanceView={onInstanceView}
         dirtyInstanceIds={dirtyInstanceIds}
       >
-      <h3 className="connector-card__subtitle">接入设置</h3>
-
       <form
         className="connector-form"
         // `key` 带上当前实例：切实例时 React **重建**这个表单子树，任何内部
@@ -1056,7 +1113,7 @@ export function ConnectorCard({
             {emptyFieldsReason}
           </p>
         ) : null}
-        <ConnectorFields connector={connector} instanceId={instanceId} form={form} renderField={(field) => {
+        <ConnectorFields connector={connector} instanceId={instanceId} form={form} change={change.change} renderField={(field) => {
             const key = field.key || field.name;
             return (
               <FieldRow
@@ -1130,10 +1187,13 @@ export function ConnectorCard({
         />
       ) : null}
 
-      {!emptyFieldsReason ? (
-        <p className="connector-card__guidance" data-testid={`connector-${connector.id}-guidance`}>
-          {renderInlineCode(connector.guidance)}
-        </p>
+      {!emptyFieldsReason && connector.guidance && presentation.tone !== 'ok' ? (
+        <details className="connector-group">
+          <summary>连接诊断</summary>
+          <p className="connector-card__guidance" data-testid={`connector-${connector.id}-guidance`}>
+            {renderInlineCode(connector.guidance)}
+          </p>
+        </details>
       ) : null}
       </ConnectorInstancePanel>
     </section>
@@ -1351,6 +1411,7 @@ export function ensureInstanceForm(
 
 export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
+  const [platform, setPlatform] = useState<string | null>(null);
   const [forms, setForms] = useState<Record<string, FormState>>({});
   /**
    * 每个 scope 当前选中的实例。面板上报、页面存——保存要用它拼 `?instance_id=`，
@@ -1383,6 +1444,10 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
   const body = state.status === 'ready' ? state.body : null;
   const canEdit = body?.can_edit === true;
+  const platforms = [...(body?.connectors.map(({ id, label }) => ({ id, label })) ?? []),
+    ...(body?.access ? [{ id: 'access', label: '出入许可' }] : [])];
+  const activePlatform = platforms.some(({ id }) => id === platform) ? platform
+    : body?.connectors.find(({ configured }) => configured)?.id ?? platforms[0]?.id;
 
   /** 某个 scope 当前选中的实例 id（没有选中时按默认实例）。 */
   const instanceOf = useCallback(
@@ -1737,11 +1802,8 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         <ArrowLeftIcon /> 返回设置
       </button>
 
-      <h1 className="page__title">接入器</h1>
-      <p className="page__hint">
-        管理各平台账号与连接方式。选中实例后修改配置，<strong>保存后立刻尝试生效</strong>。
-      </p>
-
+      <div className="connectors-page__head">
+        <h1 className="page__title">接入器</h1>
       <div className="connectors-page__actions">
         <button
           type="button"
@@ -1750,25 +1812,38 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
           onClick={() => void load()}
           disabled={state.status === 'loading' || anySaving}
         >
-          <RefreshIcon /> 重新读取
+          <RefreshIcon /> 刷新
         </button>
         {state.status === 'ready' ? (
-          <span className="panel__count" data-testid="connectors-as-of">
+          <span className="panel__count connector-refresh-time" data-testid="connectors-as-of">
             读取于 {formatAsOf(state.body.as_of)}
           </span>
         ) : null}
         {canEdit ? (
-          <button
-            type="button"
-            className="button button--small"
-            data-testid="connectors-reset"
-            disabled={anySaving}
-            onClick={() => setConfirmReset(true)}
-          >
-            恢复默认
-          </button>
+          <details className="connector-page-options">
+            <summary>管理</summary>
+            <button
+              type="button"
+              className="button button--small"
+              data-testid="connectors-reset"
+              disabled={anySaving}
+              onClick={() => setConfirmReset(true)}
+            >恢复默认</button>
+          </details>
         ) : null}
       </div>
+      </div>
+
+      {platforms.length ? (
+        <nav className="connectors-page__platforms" aria-label="接入类别">
+          {platforms.map(({ id, label }) => (
+            <button key={id} type="button" aria-pressed={id === activePlatform}
+              className="connector-platform" onClick={() => setPlatform(id)}>
+              {PLATFORM_NAMES[id] ?? label}
+            </button>
+          ))}
+        </nav>
+      ) : null}
 
       {state.status === 'ready' && !canEdit ? (
         <p className="panel__note" data-testid="connectors-readonly">
@@ -1782,7 +1857,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
           role="alertdialog"
           aria-labelledby="connector-reset-title"
         >
-          <strong id="connector-reset-title">把三个接入器的网页覆盖全部清掉？</strong>
+          <strong id="connector-reset-title">恢复所有接入设置的默认值？</strong>
           <p>
             会回退到环境变量或代码默认值（不是清空成空白），并立刻按回退后的配置重建连接。
             这一步不能撤销。
@@ -1858,13 +1933,13 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 ? connector
                 : instanceView ?? { ...connector, fields, runtime: { connections: null, received: null } };
             return (
+              <div key={connector.id} className="connector-workspace" hidden={activePlatform !== connector.id}>
               <ConnectorCard
                 /*
                  * 卡片本身**不**带 `key={instanceId}`：那会连面板一起重建，
                  * 面板的选中态和列表会被打回初始值。切实例的"物理隔离"由表单
                  * 子树自己的 `key` 负责（见卡片里 `<form>` 上那条注释）。
                  */
-                key={connector.id}
                 connector={view}
                 /*
                  * 面板单独使用默认实例作为基线；卡片诊断来自选中的实例。
@@ -1888,15 +1963,18 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 }
                 {...formPropsFor(connector.id, instanceId, fields, generation)}
               />
+              </div>
             );
           })
         : null}
 
       {state.status === 'ready' && state.body.access ? (
+        <div className="connector-workspace" hidden={activePlatform !== 'access'}>
         <AccessCard
           group={state.body.access}
           {...formPropsFor('access', DEFAULT_INSTANCE_ID, state.body.access.fields, state.body.access.generation)}
         />
+        </div>
       ) : null}
 
     </section>
