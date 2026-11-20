@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -39,6 +40,14 @@ def _int(name: str, default: int) -> int:
     if raw is None or not raw.strip():
         return default
     return int(raw)
+
+
+def warn_deprecated_env() -> None:
+    # 从首次发布此变更起至少保留两个小版本；不再解析或记录旧值。
+    if "LING_OBSERVE_WINDOW_MESSAGES" in os.environ:
+        logging.getLogger(__name__).warning(
+            "LING_OBSERVE_WINDOW_MESSAGES 已弃用且不再生效，请从环境变量或 .env 中删除。"
+        )
 
 
 def require_database_url(value: str | None) -> str:
@@ -184,13 +193,6 @@ class Settings:
             for part in (os.environ.get("LING_ACCESS_GROUPS") or "").split(",")
             if part.strip()
         )
-    )
-    # 「看一眼手机」时，一次最多带多少条群消息进上下文。
-    #
-    # 为什么要有上限：不在白名单的群可能一天刷几千条，全塞进上下文既贵又把
-    # 真正重要的内容淹掉。人的做法也是"扫一眼最近的"，不会从头翻。
-    observe_window_messages: int = field(
-        default_factory=lambda: _int("LING_OBSERVE_WINDOW_MESSAGES", 30)
     )
     # 白名单拒绝是否逐条写日志。
     #

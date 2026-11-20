@@ -26,7 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, Response
 
 from ling import __version__
 from ling.api.errors import LingError, error_response, ling_error_handler
-from ling.config import Settings, get_settings
+from ling.config import Settings, get_settings, warn_deprecated_env
 from ling.contracts.v1 import ErrorCode
 from ling.domains.identity.service import IdentityService, LoginRateLimiter
 from ling.infra.coordination import SpeakLeaseStore, TurnControlStore
@@ -145,6 +145,7 @@ async def _bootstrap(settings: Settings) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    warn_deprecated_env()
     engine = init_engine(settings)
     if settings.env != "production":
         # 开发/测试：自动建表。生产由 Alembic 迁移负责。
@@ -433,13 +434,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if quota is not None:
             await quota.aclose()
         await dispose_engine()
-
-
-def _fingerprint(value: str) -> str:
-    """身份类字段（AppID）的短指纹：日志里只用它，不出现原值。"""
-    import hashlib
-
-    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:8] if value else ""
 
 
 def _safe_db(url: str) -> str:

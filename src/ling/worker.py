@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import select, update
 
-from ling.config import get_settings
+from ling.config import get_settings, warn_deprecated_env
 from ling.contracts.v1 import CapabilityDescriptor
 from ling.domains.media.errors import MediaRefError
 from ling.domains.media.jobs import MEDIA_READ_TOPIC
@@ -6175,6 +6175,7 @@ async def drain_outbox(
 
 
 async def run_forever(poll_seconds: float = 2.0) -> None:
+    warn_deprecated_env()
     settings = get_settings()
     init_engine(settings)
     last_maintenance = 0.0
