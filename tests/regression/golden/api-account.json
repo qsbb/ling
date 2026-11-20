@@ -1,0 +1,338 @@
+{
+  "changeAccount": {
+    "body": {
+      "username": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PATCH /v1/auth/account",
+    "status": 200
+  },
+  "changePassword": {
+    "media_type": null,
+    "operation": "POST /v1/auth/password",
+    "status": 204
+  },
+  "consents/empty": {
+    "body": {
+      "consents": [],
+      "defaults": {
+        "camera": "boolean",
+        "location": "boolean",
+        "memory.cross_device": "boolean",
+        "public_publish": "boolean"
+      },
+      "known_scopes": [
+        "string"
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/consents",
+    "status": 200
+  },
+  "consents/populated": {
+    "body": {
+      "consents": [
+        {
+          "granted": "boolean",
+          "note": "null",
+          "revision": "integer",
+          "scope": "string",
+          "valid_until": "null"
+        }
+      ],
+      "defaults": {
+        "camera": "boolean",
+        "location": "boolean",
+        "memory.cross_device": "boolean",
+        "public_publish": "boolean"
+      },
+      "known_scopes": [
+        "string"
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/consents",
+    "status": 200
+  },
+  "dashboard": {
+    "body": {
+      "generated_at": "string",
+      "schema_version": "string",
+      "sections": {
+        "activity": {
+          "as_of": "string",
+          "data": "null",
+          "status": "string"
+        },
+        "affect": {
+          "as_of": "string",
+          "data": {
+            "cause": "null",
+            "emotion": "string",
+            "intensity": "number",
+            "tone_hint": "string",
+            "updated_at": "string"
+          },
+          "status": "string"
+        },
+        "agenda": {
+          "as_of": "string",
+          "data": "null",
+          "status": "string"
+        },
+        "connectivity": {
+          "as_of": "string",
+          "data": {
+            "bound_model_roles": [
+              "string"
+            ],
+            "channels": [
+              {
+                "channel": "string",
+                "configured": "boolean",
+                "proactive_ready": "boolean",
+                "proactive_reason": "string",
+                "reason": "string"
+              }
+            ]
+          },
+          "status": "string"
+        },
+        "intent_teaser": {
+          "as_of": "string",
+          "data": {
+            "horizon_unplanned": "boolean",
+            "items": [],
+            "note": "string",
+            "schema_version": "string"
+          },
+          "status": "string"
+        },
+        "media": {
+          "as_of": "string",
+          "data": {},
+          "status": "string"
+        },
+        "memories": {
+          "as_of": "string",
+          "data": "null",
+          "status": "string"
+        },
+        "phone": {
+          "as_of": "string",
+          "data": {
+            "fallback": {
+              "reason": "string",
+              "source": "string",
+              "state": "string",
+              "upstream": "string",
+              "used": "boolean"
+            },
+            "next_look_interval_minutes": "integer"
+          },
+          "status": "string"
+        },
+        "presence": {
+          "as_of": "string",
+          "data": {
+            "availability": "string",
+            "describe": "string",
+            "describe_note": "string",
+            "energy": "integer",
+            "fallback": {
+              "reason": "string",
+              "source": "string",
+              "state": "string",
+              "upstream": "string",
+              "used": "boolean"
+            },
+            "scene": {
+              "expired": "boolean",
+              "note": "string",
+              "state": "string"
+            },
+            "social_load": "integer"
+          },
+          "status": "string"
+        },
+        "proactive": {
+          "as_of": "string",
+          "data": {
+            "delivery_enabled": "boolean",
+            "gate_reason": "string"
+          },
+          "status": "string"
+        },
+        "relationship": {
+          "as_of": "string",
+          "data": {
+            "boundaries": [],
+            "familiarity": "number",
+            "last_interaction_at": "null",
+            "trust": "number"
+          },
+          "status": "string"
+        },
+        "timeline": {
+          "as_of": "string",
+          "data": "null",
+          "status": "string"
+        },
+        "today_outline": {
+          "as_of": "string",
+          "data": {
+            "actor_timezone": "string",
+            "display_date": "string",
+            "display_timezone": "string",
+            "items": [],
+            "note": "string",
+            "plan_day": "string",
+            "schema_version": "string",
+            "state": "string"
+          },
+          "status": "string"
+        }
+      },
+      "timezone": "string",
+      "timezone_source": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/dashboard",
+    "status": 200
+  },
+  "login": {
+    "body": {
+      "config_revision": "integer",
+      "csrf_token": "string",
+      "schema_version": "string",
+      "test_mode": "boolean",
+      "user": {
+        "display_name": "string",
+        "id": "string",
+        "must_change_password": "boolean",
+        "role": "string",
+        "subject_id": "string",
+        "username": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/auth/login",
+    "status": 200
+  },
+  "logout": {
+    "body": {
+      "ok": "boolean"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/auth/logout",
+    "status": 200
+  },
+  "me": {
+    "body": {
+      "config_revision": "integer",
+      "csrf_token": "string",
+      "schema_version": "string",
+      "test_mode": "boolean",
+      "user": {
+        "display_name": "string",
+        "id": "string",
+        "must_change_password": "boolean",
+        "role": "string",
+        "subject_id": "string",
+        "username": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/auth/me",
+    "status": 200
+  },
+  "me/logged-out": {
+    "body": {
+      "error": {
+        "code": "string",
+        "detail": "null",
+        "field": "null",
+        "message": "string",
+        "retriable": "boolean",
+        "trace_id": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/auth/me",
+    "status": 401
+  },
+  "setConsent": {
+    "body": {
+      "granted": "boolean",
+      "revision": "integer",
+      "scope": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/consents",
+    "status": 200
+  },
+  "setTimezone": {
+    "body": {
+      "common": [
+        "string"
+      ],
+      "default": "string",
+      "env": "null",
+      "schema_version": "string",
+      "source": "string",
+      "stored": "string",
+      "timezone": "string",
+      "video_mode": "string",
+      "video_mode_default": "string",
+      "video_modes": [
+        "string"
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/preferences",
+    "status": 200
+  },
+  "setVideoMode": {
+    "body": {
+      "common": [
+        "string"
+      ],
+      "default": "string",
+      "env": "null",
+      "schema_version": "string",
+      "source": "string",
+      "stored": "string",
+      "timezone": "string",
+      "video_mode": "string",
+      "video_mode_default": "string",
+      "video_modes": [
+        "string"
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/preferences",
+    "status": 200
+  },
+  "userPreferences": {
+    "body": {
+      "common": [
+        "string"
+      ],
+      "default": "string",
+      "env": "null",
+      "schema_version": "string",
+      "source": "string",
+      "stored": "null",
+      "timezone": "string",
+      "video_mode": "string",
+      "video_mode_default": "string",
+      "video_modes": [
+        "string"
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/preferences",
+    "status": 200
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "confirmRecall": {
+    "body": {
+      "attempts": "integer",
+      "message_id": "string",
+      "note": "string",
+      "reason_code": "null",
+      "recalled_at": "string",
+      "receipt_id": "null",
+      "schema_version": "string",
+      "state": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{conversation_id}/recall-proposals/{proposal_id}/confirm",
+    "status": 200
+  },
+  "declineRecall": {
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{conversation_id}/recall-proposals/{proposal_id}/decline",
+    "status": 204
+  },
+  "recallProposals/empty": {
+    "body": [],
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{conversation_id}/recall-proposals",
+    "status": 200
+  },
+  "recallProposals/populated": {
+    "body": [
+      {
+        "created_at": "string",
+        "message_id": "string",
+        "note": "string",
+        "proposal_id": "string",
+        "schema_version": "string",
+        "window_id": "string"
+      }
+    ],
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{conversation_id}/recall-proposals",
+    "status": 200
+  }
+}

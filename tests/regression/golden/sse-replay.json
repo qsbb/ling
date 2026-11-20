@@ -1,0 +1,45 @@
+[
+  {
+    "data": {
+      "replayed": "boolean",
+      "state": "string",
+      "test_mode": "boolean",
+      "turn_id": "string"
+    },
+    "event": "turn.started"
+  },
+  {
+    "data": {
+      "message": {
+        "attempt": "integer",
+        "audio_asset_id": "null",
+        "created_at": "string",
+        "error_code": "null",
+        "handled_as": "null",
+        "handled_reason": "null",
+        "message_id": "string",
+        "model_label": "string",
+        "origin": "string",
+        "output_modality": "string",
+        "recall_state": "null",
+        "recalled_at": "null",
+        "retracted_at": "null",
+        "role": "string",
+        "schema_version": "string",
+        "sender_id": "null",
+        "sender_name": "null",
+        "sequence": "integer",
+        "speech_delivery_state": "null",
+        "speech_state": "string",
+        "state": "string",
+        "text": "string",
+        "turn_id": "string"
+      },
+      "model_label": "string",
+      "replayed": "boolean",
+      "state": "string",
+      "turn_id": "string"
+    },
+    "event": "turn.completed"
+  }
+]

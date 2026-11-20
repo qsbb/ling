@@ -1,0 +1,328 @@
+{
+  "deleteCoreMemory": {
+    "body": {
+      "active": "boolean",
+      "core_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "DELETE /v1/core-memory/{core_id}",
+    "status": 200
+  },
+  "forgetAllMemories": {
+    "body": {
+      "events_cancelled": "integer",
+      "generation": "integer",
+      "state": "string",
+      "tombstone_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/memory/forget",
+    "status": 200
+  },
+  "listCoreMemory": {
+    "body": {
+      "items": [
+        {
+          "core_id": "string",
+          "created_at": "string",
+          "label": "string",
+          "origin_kind": "string",
+          "priority": "integer",
+          "scope": "string",
+          "text": "string",
+          "updated_at": "string"
+        }
+      ],
+      "limit": "integer",
+      "note": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/core-memory",
+    "status": 200
+  },
+  "listMemories/current": {
+    "body": {
+      "has_more": "boolean",
+      "include": "null",
+      "limit": "integer",
+      "memories": [
+        {
+          "archived_at": "null",
+          "confidence": "number",
+          "created_at": "string",
+          "kind": "string",
+          "memory_id": "string",
+          "origin": "string",
+          "retract_reason": "null",
+          "retracted": "boolean",
+          "source_event_ids": [
+            "string"
+          ],
+          "superseded_by": "null",
+          "supersedes": "null",
+          "text": "string",
+          "valid_until": "null",
+          "visibility": "string"
+        }
+      ],
+      "note": "string",
+      "total": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/memory",
+    "status": 200
+  },
+  "listMemories/retracted": {
+    "body": {
+      "has_more": "boolean",
+      "include": "string",
+      "limit": "integer",
+      "memories": [
+        {
+          "archived_at": "null",
+          "confidence": "number",
+          "created_at": "string",
+          "kind": "string",
+          "memory_id": "string",
+          "origin": "string",
+          "retract_reason": "null",
+          "retracted": "boolean",
+          "source_event_ids": [
+            "string"
+          ],
+          "superseded_by": "null",
+          "supersedes": "string",
+          "text": "string",
+          "valid_until": "null",
+          "visibility": "string"
+        },
+        {
+          "archived_at": "null",
+          "confidence": "number",
+          "created_at": "string",
+          "kind": "string",
+          "memory_id": "string",
+          "origin": "string",
+          "retract_reason": "string",
+          "retracted": "boolean",
+          "source_event_ids": [
+            "string"
+          ],
+          "superseded_by": "null",
+          "supersedes": "null",
+          "text": "string",
+          "valid_until": "null",
+          "visibility": "string"
+        },
+        {
+          "archived_at": "null",
+          "confidence": "number",
+          "created_at": "string",
+          "kind": "string",
+          "memory_id": "string",
+          "origin": "string",
+          "retract_reason": "string",
+          "retracted": "boolean",
+          "source_event_ids": [
+            "string"
+          ],
+          "superseded_by": "string",
+          "supersedes": "null",
+          "text": "string",
+          "valid_until": "null",
+          "visibility": "string"
+        }
+      ],
+      "note": "string",
+      "total": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/memory",
+    "status": 200
+  },
+  "mergeSubjects": {
+    "body": {
+      "moved": "integer",
+      "source_id": "string",
+      "target_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/accounts/subjects/merge",
+    "status": 200
+  },
+  "purgeStatus": {
+    "body": {
+      "items": [
+        {
+          "awareness_deleted": "integer",
+          "completed_at": "null",
+          "core_deleted": "integer",
+          "embeddings_deleted": "integer",
+          "entities_deleted": "integer",
+          "episodes_deleted": "integer",
+          "error_code": "null",
+          "events_cancelled": "integer",
+          "events_scrubbed": "integer",
+          "memories_deleted": "integer",
+          "requested_at": "string",
+          "retrieval_logs_deleted": "integer",
+          "state": "string",
+          "tombstone_id": "string"
+        }
+      ],
+      "note": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/memory/purge/status",
+    "status": 200
+  },
+  "renameSubject": {
+    "body": {
+      "display_name": "string",
+      "subject_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PATCH /v1/accounts/subjects/{subject_id}",
+    "status": 200
+  },
+  "retractMemory": {
+    "body": {
+      "memory_id": "string",
+      "retracted": "boolean"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/memory/{memory_id}/retract",
+    "status": 200
+  },
+  "subjectDetails/accounts": {
+    "body": {
+      "access": "string",
+      "items": [
+        {
+          "account_id": "string",
+          "connector_instance": "string",
+          "external_account_id": "string",
+          "proof": "string",
+          "revoked": "boolean",
+          "subject_id": "string"
+        }
+      ],
+      "next_cursor": "null",
+      "section": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/accounts/subjects/{subject_id}/details",
+    "status": 200
+  },
+  "subjectDetails/interactions": {
+    "body": {
+      "access": "string",
+      "items": [
+        {
+          "event_id": "string",
+          "kind": "string",
+          "occurred_at": "string",
+          "origin": "string"
+        }
+      ],
+      "next_cursor": "null",
+      "section": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/accounts/subjects/{subject_id}/details",
+    "status": 200
+  },
+  "subjectDetails/memories": {
+    "body": {
+      "access": "string",
+      "items": [
+        {
+          "created_at": "string",
+          "kind": "string",
+          "memory_id": "string",
+          "text": "string",
+          "valid_until": "null",
+          "visibility": "string"
+        }
+      ],
+      "next_cursor": "null",
+      "section": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/accounts/subjects/{subject_id}/details",
+    "status": 200
+  },
+  "subjects": {
+    "body": {
+      "has_more": "boolean",
+      "limit": "integer",
+      "offset": "integer",
+      "q": "null",
+      "schema_version": "string",
+      "subjects": [
+        {
+          "accounts": [],
+          "can_rename": "boolean",
+          "display_name": "string",
+          "merged_into": "null",
+          "subject_id": "string",
+          "trust_level": "string"
+        },
+        {
+          "accounts": [
+            {
+              "account_id": "string",
+              "connector_instance": "string",
+              "external_account_id": "string",
+              "proof": "string",
+              "revoked": "boolean"
+            }
+          ],
+          "can_rename": "boolean",
+          "display_name": "string",
+          "merged_into": "null",
+          "subject_id": "string",
+          "trust_level": "string"
+        }
+      ],
+      "total": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/accounts/subjects",
+    "status": 200
+  },
+  "supersedeMemory": {
+    "body": {
+      "memory_id": "string",
+      "supersedes": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/memory/{memory_id}/supersede",
+    "status": 200
+  },
+  "unmergeSubject": {
+    "body": {
+      "restored_memories": "integer",
+      "source_id": "string",
+      "was_merged_into": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/accounts/subjects/{source_id}/unmerge",
+    "status": 200
+  },
+  "upsertCoreMemory": {
+    "body": {
+      "core_id": "string",
+      "created_at": "string",
+      "label": "string",
+      "origin_kind": "string",
+      "priority": "integer",
+      "scope": "string",
+      "text": "string",
+      "updated_at": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/core-memory",
+    "status": 200
+  }
+}

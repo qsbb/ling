@@ -1,0 +1,526 @@
+{
+  "activatePersona": {
+    "body": {
+      "config_revision": "integer",
+      "persona_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/personas/{persona_id}/activate",
+    "status": 200
+  },
+  "activity": {
+    "body": {
+      "current": {
+        "activity_id": "string",
+        "checkpoint": {
+          "$map": []
+        },
+        "completion_evidence": "null",
+        "ended_at": "null",
+        "kind": "string",
+        "origin": "string",
+        "place_id": "null",
+        "started_at": "string",
+        "state": "string"
+      },
+      "history": [
+        {
+          "activity_id": "string",
+          "checkpoint": {
+            "$map": []
+          },
+          "completion_evidence": "null",
+          "ended_at": "null",
+          "kind": "string",
+          "origin": "string",
+          "place_id": "null",
+          "started_at": "string",
+          "state": "string"
+        }
+      ],
+      "note": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/activity",
+    "status": 200
+  },
+  "createOutlineJob": {
+    "body": {
+      "enqueued": "boolean",
+      "job_id": "string",
+      "note": "string",
+      "plan_day": "string",
+      "plan_state": "null",
+      "reason_code": "null",
+      "revision": "integer",
+      "schema_version": "string",
+      "state": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/life/outline-jobs",
+    "status": 202
+  },
+  "createPersona": {
+    "body": {
+      "boundaries": [],
+      "display_name": "string",
+      "name": "string",
+      "persona_id": "string",
+      "revision": "integer",
+      "scenario_prompts": {},
+      "scenarios": [
+        {
+          "custom": "boolean",
+          "default_text": "string",
+          "key": "string",
+          "label": "string",
+          "text": "string",
+          "when": "string"
+        }
+      ],
+      "system_prompt": "string",
+      "traits": {}
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/personas",
+    "status": 201
+  },
+  "createPersona/inactive": {
+    "body": {
+      "boundaries": [],
+      "display_name": "string",
+      "name": "string",
+      "persona_id": "string",
+      "revision": "integer",
+      "scenario_prompts": {},
+      "scenarios": [
+        {
+          "custom": "boolean",
+          "default_text": "string",
+          "key": "string",
+          "label": "string",
+          "text": "string",
+          "when": "string"
+        }
+      ],
+      "system_prompt": "string",
+      "traits": {}
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/personas",
+    "status": 201
+  },
+  "deletePersona": {
+    "media_type": "application/json",
+    "operation": "DELETE /v1/personas/{persona_id}",
+    "status": 204
+  },
+  "getLogs": {
+    "body": {
+      "buffered": "integer",
+      "capacity": "integer",
+      "denied_total": "integer",
+      "items": [
+        {
+          "attributes": {
+            "$map": [
+              [
+                {
+                  "$map": [
+                    "string"
+                  ]
+                }
+              ]
+            ]
+          },
+          "event_name": "string",
+          "kind": "string",
+          "level": "string",
+          "logger": "string",
+          "message": "string",
+          "timestamp": "string"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/logs",
+    "status": 200
+  },
+  "getPersona": {
+    "body": {
+      "boundaries": [],
+      "display_name": "string",
+      "name": "string",
+      "persona_id": "string",
+      "revision": "integer",
+      "scenario_prompts": {},
+      "scenarios": [
+        {
+          "custom": "boolean",
+          "default_text": "string",
+          "key": "string",
+          "label": "string",
+          "text": "string",
+          "when": "string"
+        }
+      ],
+      "system_prompt": "string",
+      "traits": {}
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/personas/{persona_id}",
+    "status": 200
+  },
+  "goals": {
+    "body": {
+      "goals": [
+        {
+          "goal_id": "string",
+          "horizon": "string",
+          "note": "null",
+          "progress": "number",
+          "state": "string",
+          "title": "string"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/goals",
+    "status": 200
+  },
+  "lifeTimeline/empty": {
+    "body": {
+      "actor_timezone": "string",
+      "actor_timezone_source": "string",
+      "display_date": "string",
+      "display_timezone": "string",
+      "display_timezone_source": "string",
+      "display_window_end_at": "string",
+      "display_window_start_at": "string",
+      "dream": "null",
+      "facts": [],
+      "generated_at": "null",
+      "has_private_content": "boolean",
+      "hidden_fact_count": "integer",
+      "hidden_intent_count": "integer",
+      "hidden_segment_count": "integer",
+      "horizon_unplanned": "boolean",
+      "intents": [],
+      "last_error_code": "null",
+      "last_model_outline_at": "null",
+      "note": "string",
+      "outline_due_at": "string",
+      "plan_day": "string",
+      "plan_state": "null",
+      "plan_window_end_at": "string",
+      "plan_window_start_at": "string",
+      "reason_explanation": "null",
+      "revision": "integer",
+      "schema_version": "string",
+      "segments": [],
+      "state": "string",
+      "superseded_segment_count": "integer",
+      "timezone_source": "string",
+      "unplanned": "null"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/life/timeline",
+    "status": 200
+  },
+  "lifeTimeline/planned": {
+    "body": {
+      "actor_timezone": "string",
+      "actor_timezone_source": "string",
+      "display_date": "string",
+      "display_timezone": "string",
+      "display_timezone_source": "string",
+      "display_window_end_at": "string",
+      "display_window_start_at": "string",
+      "dream": {
+        "narrative": "string",
+        "origin": "string",
+        "restricted": "boolean",
+        "schema_version": "string",
+        "status": "string",
+        "title": "string",
+        "visibility": "string"
+      },
+      "facts": [
+        {
+          "activity_id": "string",
+          "ended_at": "null",
+          "evidence_kind": "string",
+          "origin": "string",
+          "place_id": "null",
+          "scene_valid_until": "null",
+          "schema_version": "string",
+          "started_at": "string",
+          "state": "string"
+        }
+      ],
+      "generated_at": "string",
+      "has_private_content": "boolean",
+      "hidden_fact_count": "integer",
+      "hidden_intent_count": "integer",
+      "hidden_segment_count": "integer",
+      "horizon_unplanned": "boolean",
+      "intents": [
+        {
+          "intention_id": "string",
+          "priority": "integer",
+          "schema_version": "string",
+          "source_kind": "string",
+          "state": "string",
+          "target_end_day": "string",
+          "target_start_day": "string",
+          "visibility": "string"
+        }
+      ],
+      "last_error_code": "null",
+      "last_model_outline_at": "null",
+      "note": "null",
+      "outline_due_at": "string",
+      "plan_day": "string",
+      "plan_state": "string",
+      "plan_window_end_at": "string",
+      "plan_window_start_at": "string",
+      "reason_explanation": "null",
+      "revision": "integer",
+      "schema_version": "string",
+      "segments": [
+        {
+          "anchor_kind": "string",
+          "commitment_level": "string",
+          "continues_from_previous_day": "boolean",
+          "continues_next_day": "boolean",
+          "display_end_at": "string",
+          "display_start_at": "string",
+          "end_at": "string",
+          "is_leaf": "boolean",
+          "layer": "string",
+          "parent_id": "null",
+          "place_id": "null",
+          "plan_day": "string",
+          "plan_id": "string",
+          "revision": "integer",
+          "schema_version": "string",
+          "segment_id": "string",
+          "source": "string",
+          "start_at": "string",
+          "status": "string",
+          "title": "string"
+        },
+        {
+          "anchor_kind": "string",
+          "commitment_level": "string",
+          "continues_from_previous_day": "boolean",
+          "continues_next_day": "boolean",
+          "display_end_at": "string",
+          "display_start_at": "string",
+          "end_at": "string",
+          "is_leaf": "boolean",
+          "layer": "string",
+          "parent_id": "string",
+          "place_id": "null",
+          "plan_day": "string",
+          "plan_id": "string",
+          "revision": "integer",
+          "schema_version": "string",
+          "segment_id": "string",
+          "source": "string",
+          "start_at": "string",
+          "status": "string",
+          "title": "string"
+        }
+      ],
+      "state": "string",
+      "superseded_segment_count": "integer",
+      "timezone_source": "string",
+      "unplanned": {
+        "periods": [
+          {
+            "end_at": "string",
+            "start_at": "string"
+          }
+        ],
+        "scope_end_at": "string",
+        "scope_start_at": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/life/timeline",
+    "status": 200
+  },
+  "listPersonas/empty": {
+    "body": {
+      "active_persona_id": "string",
+      "items": [],
+      "total": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/personas",
+    "status": 200
+  },
+  "listPersonas/populated": {
+    "body": {
+      "active_persona_id": "string",
+      "items": [
+        {
+          "boundary_count": "integer",
+          "display_name": "string",
+          "has_content": "boolean",
+          "is_active": "boolean",
+          "name": "string",
+          "persona_id": "string",
+          "published": "boolean",
+          "revision": "integer",
+          "scenario_count": "integer",
+          "system_prompt_chars": "integer",
+          "trait_count": "integer"
+        }
+      ],
+      "total": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/personas",
+    "status": 200
+  },
+  "outlineJob": {
+    "body": {
+      "enqueued": "boolean",
+      "job_id": "string",
+      "note": "string",
+      "plan_day": "string",
+      "plan_state": "null",
+      "reason_code": "null",
+      "revision": "integer",
+      "schema_version": "string",
+      "state": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/life/outline-jobs/{job_id}",
+    "status": 200
+  },
+  "persona": {
+    "body": {
+      "active": "boolean",
+      "boundaries": [],
+      "display_name": "string",
+      "exists": "boolean",
+      "name": "string",
+      "persona_id": "string",
+      "revision": "integer",
+      "scenario_prompts": {},
+      "scenarios": [
+        {
+          "custom": "boolean",
+          "default_text": "string",
+          "key": "string",
+          "label": "string",
+          "text": "string",
+          "when": "string"
+        }
+      ],
+      "system_prompt": "string",
+      "traits": {}
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/persona",
+    "status": 200
+  },
+  "proactive": {
+    "body": {
+      "delivery_enabled": "boolean",
+      "delivery_implemented": "boolean",
+      "draft_implemented": "boolean",
+      "gate": "boolean",
+      "gate_reasons": [
+        "string"
+      ],
+      "note": "string",
+      "pending": [
+        {
+          "draft_available": "boolean",
+          "draft_origin": "string",
+          "draft_state": "null",
+          "draft_text": "string",
+          "expires_at": "string",
+          "kind": "string",
+          "opportunity_id": "string",
+          "output_modality": "string",
+          "reason": "string"
+        }
+      ],
+      "recent": [
+        {
+          "created_at": "string",
+          "delivery_state": "null",
+          "draft_origin": "string",
+          "draft_state": "null",
+          "gate": {
+            "allowed": "null",
+            "checked_at": "null",
+            "reasons": []
+          },
+          "has_source": "boolean",
+          "kind": "string",
+          "opportunity_id": "string",
+          "reason": "string",
+          "reason_code": "string",
+          "receipt": "null",
+          "sent_at": "null",
+          "state": "string",
+          "terminal_reason": "null",
+          "web_saved": "boolean"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/proactive",
+    "status": 200
+  },
+  "timeline": {
+    "body": {
+      "events": [
+        {
+          "id": "string",
+          "occurred_at": "string",
+          "origin": "string",
+          "revision": "integer",
+          "summary": "string",
+          "type": "string",
+          "visibility": "string",
+          "window_id": "null"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/actor/timeline",
+    "status": 200
+  },
+  "updatePersonaById": {
+    "body": {
+      "boundaries": [],
+      "display_name": "string",
+      "name": "string",
+      "persona_id": "string",
+      "revision": "integer",
+      "scenario_prompts": {},
+      "scenarios": [
+        {
+          "custom": "boolean",
+          "default_text": "string",
+          "key": "string",
+          "label": "string",
+          "text": "string",
+          "when": "string"
+        }
+      ],
+      "system_prompt": "string",
+      "traits": {}
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/personas/{persona_id}",
+    "status": 200
+  }
+}

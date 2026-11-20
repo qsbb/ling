@@ -1,0 +1,349 @@
+{
+  "createSession": {
+    "body": {
+      "actor_id": "string",
+      "archived": "boolean",
+      "channel": "string",
+      "created_at": "string",
+      "display_name": "null",
+      "familiarity": "null",
+      "message_count": "integer",
+      "peer_id": "null",
+      "pinned": "boolean",
+      "schema_version": "string",
+      "session_id": "string",
+      "subject_id": "string",
+      "title": "string",
+      "updated_at": "string",
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions",
+    "status": 201
+  },
+  "createSession/unnamed": {
+    "body": {
+      "actor_id": "string",
+      "archived": "boolean",
+      "channel": "string",
+      "created_at": "string",
+      "display_name": "null",
+      "familiarity": "null",
+      "message_count": "integer",
+      "peer_id": "null",
+      "pinned": "boolean",
+      "schema_version": "string",
+      "session_id": "string",
+      "subject_id": "string",
+      "title": "string",
+      "updated_at": "string",
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions",
+    "status": 201
+  },
+  "listSessions/empty": {
+    "body": {
+      "sessions": [
+        {
+          "actor_id": "string",
+          "archived": "boolean",
+          "channel": "string",
+          "created_at": "string",
+          "display_name": "null",
+          "familiarity": "null",
+          "message_count": "integer",
+          "peer_id": "null",
+          "pinned": "boolean",
+          "schema_version": "string",
+          "session_id": "string",
+          "subject_id": "string",
+          "title": "string",
+          "updated_at": "string",
+          "window_id": "string"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions",
+    "status": 200
+  },
+  "listSessions/populated": {
+    "body": {
+      "sessions": [
+        {
+          "actor_id": "string",
+          "archived": "boolean",
+          "channel": "string",
+          "created_at": "string",
+          "display_name": "null",
+          "familiarity": "null",
+          "message_count": "integer",
+          "peer_id": "null",
+          "pinned": "boolean",
+          "schema_version": "string",
+          "session_id": "string",
+          "subject_id": "string",
+          "title": "string",
+          "updated_at": "string",
+          "window_id": "string"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions",
+    "status": 200
+  },
+  "messagePrompt": {
+    "body": {
+      "created_at": "string",
+      "dropped_items": "integer",
+      "expires_at": "string",
+      "message_id": "string",
+      "model": {
+        "config_revision": "integer",
+        "model_id": "string",
+        "profile": "string",
+        "provider_id": "string",
+        "schema_version": "string",
+        "source": "string"
+      },
+      "note": "null",
+      "schema_version": "string",
+      "sections": [
+        {
+          "collapsed": "boolean",
+          "items": [
+            {
+              "at": "null",
+              "content": "string",
+              "index": "integer",
+              "lane": "string",
+              "role": "string",
+              "schema_version": "string",
+              "sender": "null",
+              "tokens": "integer",
+              "truncated": "boolean"
+            }
+          ],
+          "key": "string",
+          "label": "string",
+          "role": "string",
+          "schema_version": "string",
+          "tokens": "integer"
+        },
+        {
+          "collapsed": "boolean",
+          "items": [
+            {
+              "at": "string",
+              "content": "string",
+              "index": "integer",
+              "lane": "string",
+              "role": "string",
+              "schema_version": "string",
+              "sender": "null",
+              "tokens": "integer",
+              "truncated": "boolean"
+            }
+          ],
+          "key": "string",
+          "label": "string",
+          "role": "string",
+          "schema_version": "string",
+          "tokens": "integer"
+        }
+      ],
+      "state": "string",
+      "token_total": "integer",
+      "tool_transcript": [],
+      "tool_transcript_truncated": "boolean",
+      "truncated": "boolean",
+      "turn_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/messages/{message_id}/prompt",
+    "status": 200
+  },
+  "messagePrompt/missing": {
+    "body": {
+      "error": {
+        "code": "string",
+        "detail": "null",
+        "field": "null",
+        "message": "string",
+        "retriable": "boolean",
+        "trace_id": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/messages/{message_id}/prompt",
+    "status": 404
+  },
+  "messagePrompt/unavailable": {
+    "body": {
+      "created_at": "null",
+      "dropped_items": "integer",
+      "expires_at": "null",
+      "message_id": "string",
+      "model": "null",
+      "note": "string",
+      "schema_version": "string",
+      "sections": [],
+      "state": "string",
+      "token_total": "integer",
+      "tool_transcript": [],
+      "tool_transcript_truncated": "boolean",
+      "truncated": "boolean",
+      "turn_id": "null"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/messages/{message_id}/prompt",
+    "status": 200
+  },
+  "messages/empty": {
+    "body": {
+      "active_turn": "null",
+      "messages": []
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/messages",
+    "status": 200
+  },
+  "messages/populated": {
+    "body": {
+      "active_turn": "null",
+      "messages": [
+        {
+          "attempt": "integer",
+          "audio_asset_id": "null",
+          "created_at": "string",
+          "error_code": "null",
+          "handled_as": "null",
+          "handled_reason": "null",
+          "message_id": "string",
+          "model_label": "null",
+          "origin": "string",
+          "output_modality": "string",
+          "recall_state": "null",
+          "recalled_at": "null",
+          "retracted_at": "null",
+          "role": "string",
+          "schema_version": "string",
+          "sender_id": "null",
+          "sender_name": "null",
+          "sequence": "integer",
+          "speech_delivery_state": "null",
+          "speech_state": "string",
+          "state": "string",
+          "text": "string",
+          "turn_id": "null"
+        },
+        {
+          "attempt": "integer",
+          "audio_asset_id": "null",
+          "created_at": "string",
+          "error_code": "null",
+          "handled_as": "null",
+          "handled_reason": "null",
+          "message_id": "string",
+          "model_label": "string",
+          "origin": "string",
+          "output_modality": "string",
+          "recall_state": "null",
+          "recalled_at": "null",
+          "retracted_at": "null",
+          "role": "string",
+          "schema_version": "string",
+          "sender_id": "null",
+          "sender_name": "null",
+          "sequence": "integer",
+          "speech_delivery_state": "null",
+          "speech_state": "string",
+          "state": "string",
+          "text": "string",
+          "turn_id": "string"
+        },
+        {
+          "attempt": "integer",
+          "audio_asset_id": "null",
+          "created_at": "string",
+          "error_code": "null",
+          "handled_as": "string",
+          "handled_reason": "string",
+          "message_id": "string",
+          "model_label": "null",
+          "origin": "string",
+          "output_modality": "string",
+          "recall_state": "null",
+          "recalled_at": "null",
+          "retracted_at": "null",
+          "role": "string",
+          "schema_version": "string",
+          "sender_id": "null",
+          "sender_name": "null",
+          "sequence": "integer",
+          "speech_delivery_state": "null",
+          "speech_state": "string",
+          "state": "string",
+          "text": "string",
+          "turn_id": "string"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/messages",
+    "status": 200
+  },
+  "moveSession": {
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/move",
+    "status": 204
+  },
+  "pinSession": {
+    "body": {
+      "actor_id": "string",
+      "archived": "boolean",
+      "channel": "string",
+      "created_at": "string",
+      "display_name": "null",
+      "familiarity": "null",
+      "message_count": "integer",
+      "peer_id": "null",
+      "pinned": "boolean",
+      "schema_version": "string",
+      "session_id": "string",
+      "subject_id": "string",
+      "title": "string",
+      "updated_at": "string",
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/pin",
+    "status": 200
+  },
+  "renameSession": {
+    "body": {
+      "actor_id": "string",
+      "archived": "boolean",
+      "channel": "string",
+      "created_at": "string",
+      "display_name": "null",
+      "familiarity": "null",
+      "message_count": "integer",
+      "peer_id": "null",
+      "pinned": "boolean",
+      "schema_version": "string",
+      "session_id": "string",
+      "subject_id": "string",
+      "title": "string",
+      "updated_at": "string",
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PATCH /v1/sessions/{session_id}",
+    "status": 200
+  }
+}

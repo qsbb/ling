@@ -1,0 +1,8 @@
+{
+  "data": {
+    "state": "string",
+    "turn_id": "string",
+    "was_running": "boolean"
+  },
+  "status": 200
+}

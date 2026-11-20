@@ -1,0 +1,418 @@
+{
+  "checkRelease": {
+    "body": {
+      "current": "string",
+      "html_url": "string",
+      "is_newer": "boolean",
+      "latest": "string",
+      "published_at": "string",
+      "release_id": "integer",
+      "schema_version": "string",
+      "status": "string",
+      "target_commit": "string",
+      "update_eligible": "boolean",
+      "update_reason": "null"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version/check-release",
+    "status": 200
+  },
+  "imageUpdate/available": {
+    "body": {
+      "available_targets": [
+        {
+          "commit": "null",
+          "compatible": "boolean",
+          "digest": "string",
+          "has_migration": "null",
+          "incompatible_reason": "null",
+          "incompatible_reason_message": "null",
+          "version": "string"
+        }
+      ],
+      "backup_gate": {
+        "backup_id": "string",
+        "checked_at": "null",
+        "complete": "boolean",
+        "keys_env_set": "string",
+        "keys_root": "string",
+        "media_state": "string",
+        "reason": "null",
+        "reason_message": "null",
+        "restore_point": "boolean",
+        "source": "string",
+        "tombstones_state": "string"
+      },
+      "catalog": {
+        "check": {
+          "check_id": "null",
+          "finished_at": "string",
+          "reason": "null",
+          "reason_message": "null",
+          "source": "string",
+          "started_at": "null",
+          "state": "string"
+        },
+        "checked_at": "string",
+        "current_version": "string",
+        "entries": "integer",
+        "reason": "null",
+        "reason_message": "null",
+        "source": "string",
+        "state": "string",
+        "state_message": "string"
+      },
+      "checked_at": "string",
+      "current": {
+        "commit": "string",
+        "digest": "string",
+        "version": "string"
+      },
+      "details": {
+        "backup_gate": {
+          "backup_id": "string",
+          "checked_at": "null",
+          "complete": "boolean",
+          "keys_env_set": "string",
+          "keys_root": "string",
+          "media_state": "string",
+          "reason": "null",
+          "reason_message": "null",
+          "restore_point": "boolean",
+          "source": "string",
+          "tombstones_state": "string"
+        },
+        "catalog": {
+          "check": {
+            "check_id": "null",
+            "finished_at": "string",
+            "reason": "null",
+            "reason_message": "null",
+            "source": "string",
+            "started_at": "null",
+            "state": "string"
+          },
+          "checked_at": "string",
+          "current_version": "string",
+          "entries": "integer",
+          "reason": "null",
+          "reason_message": "null",
+          "source": "string",
+          "state": "string",
+          "state_message": "string"
+        },
+        "release_check": {
+          "check_id": "null",
+          "checked_at": "string",
+          "current": {
+            "digest": "string",
+            "version": "string"
+          },
+          "latest": {
+            "commit": "null",
+            "digest": "string",
+            "version": "string"
+          },
+          "reason": "null",
+          "reason_detail": "null",
+          "reason_message": "null",
+          "source": "string",
+          "state": "string",
+          "tag_count": "integer"
+        },
+        "updater": {
+          "age_seconds": "number",
+          "download_sources": "null",
+          "mirror_available": "null",
+          "online": "boolean",
+          "protocol": "integer",
+          "state": "string",
+          "updated_at": "string",
+          "version": "string"
+        }
+      },
+      "enabled": "boolean",
+      "image_mode": "boolean",
+      "installable": "boolean",
+      "message": "string",
+      "newer": [
+        {
+          "commit": "null",
+          "compatible": "boolean",
+          "digest": "string",
+          "has_migration": "null",
+          "incompatible_reason": "null",
+          "incompatible_reason_message": "null",
+          "notes": [],
+          "notes_url": "null",
+          "summary": "null",
+          "version": "string"
+        }
+      ],
+      "next_actions": [],
+      "reason": "null",
+      "reason_message": "null",
+      "request": "null",
+      "schema_version": "string",
+      "state": "string",
+      "target": {
+        "commit": "null",
+        "digest": "string",
+        "has_migration": "null",
+        "version": "string"
+      },
+      "task": {
+        "backup": {
+          "complete": "boolean",
+          "id": "string",
+          "keys_env_set": "string",
+          "keys_root": "string",
+          "media_state": "string",
+          "tombstones_state": "string"
+        },
+        "download_source": "null",
+        "failed_code": "null",
+        "failure": "null",
+        "finished_at": "string",
+        "maintenance": {
+          "state": "string",
+          "verified": "boolean"
+        },
+        "migration": {
+          "attempted": "boolean",
+          "current_after": "string",
+          "current_before": "string",
+          "target_head": "string"
+        },
+        "next_actions": [],
+        "previous": {
+          "commit": "string",
+          "digest": "string"
+        },
+        "request_id": "string",
+        "rollback": {
+          "attempted": "boolean",
+          "verified": "boolean"
+        },
+        "stage": "string",
+        "stage_message": "string",
+        "started_at": "string",
+        "state": "string",
+        "state_message": "string",
+        "still_on_old_version": "boolean",
+        "target": {
+          "commit": "string",
+          "digest": "string"
+        },
+        "updated_at": "string",
+        "version": "string",
+        "warnings": []
+      },
+      "updater": {
+        "age_seconds": "number",
+        "download_sources": "null",
+        "mirror_available": "null",
+        "online": "boolean",
+        "protocol": "integer",
+        "state": "string",
+        "updated_at": "string",
+        "version": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version/image-update",
+    "status": 200
+  },
+  "imageUpdate/source-mode": {
+    "body": {
+      "available_targets": [],
+      "backup_gate": {
+        "backup_id": "null",
+        "checked_at": "null",
+        "complete": "boolean",
+        "keys_env_set": "null",
+        "keys_root": "null",
+        "media_state": "null",
+        "reason": "null",
+        "reason_message": "null",
+        "restore_point": "boolean",
+        "source": "null",
+        "tombstones_state": "null"
+      },
+      "catalog": {
+        "check": "null",
+        "checked_at": "null",
+        "current_version": "null",
+        "entries": "integer",
+        "reason": "null",
+        "reason_message": "null",
+        "source": "null",
+        "state": "null",
+        "state_message": "null"
+      },
+      "checked_at": "null",
+      "current": {
+        "commit": "string",
+        "digest": "null",
+        "version": "null"
+      },
+      "details": {
+        "backup_gate": "null",
+        "catalog": {
+          "check": "null",
+          "checked_at": "null",
+          "current_version": "null",
+          "entries": "integer",
+          "reason": "null",
+          "reason_message": "null",
+          "source": "null",
+          "state": "null",
+          "state_message": "null"
+        },
+        "release_check": "null",
+        "updater": {
+          "age_seconds": "null",
+          "download_sources": "null",
+          "mirror_available": "null",
+          "online": "boolean",
+          "protocol": "null",
+          "state": "string",
+          "updated_at": "null",
+          "version": "null"
+        }
+      },
+      "enabled": "boolean",
+      "image_mode": "boolean",
+      "installable": "boolean",
+      "message": "string",
+      "newer": [],
+      "next_actions": [
+        "string"
+      ],
+      "reason": "string",
+      "reason_message": "string",
+      "request": "null",
+      "schema_version": "string",
+      "state": "string",
+      "target": "null",
+      "task": "null",
+      "updater": {
+        "age_seconds": "null",
+        "download_sources": "null",
+        "mirror_available": "null",
+        "online": "boolean",
+        "protocol": "null",
+        "state": "string",
+        "updated_at": "null",
+        "version": "null"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version/image-update",
+    "status": 200
+  },
+  "imageUpdateCheck": {
+    "body": {
+      "accepted": "boolean",
+      "request_id": "string",
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/version/image-update-checks",
+    "status": 202
+  },
+  "imageUpdateCheck/deduped": {
+    "body": {
+      "accepted": "boolean",
+      "request_id": "string",
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/version/image-update-checks",
+    "status": 200
+  },
+  "requestImageUpdate": {
+    "body": {
+      "created_at": "string",
+      "expected_current_commit": "string",
+      "expected_current_digest": "string",
+      "request_id": "string",
+      "schema_version": "string",
+      "state": "string",
+      "state_message": "string",
+      "target_digest": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/version/image-update-requests",
+    "status": 201
+  },
+  "requestUpdate": {
+    "body": {
+      "backup_warnings": [],
+      "created_at": "string",
+      "error_code": "null",
+      "message": "string",
+      "request_id": "string",
+      "stage": "string",
+      "state": "string",
+      "target_commit": "string",
+      "target_tag": "string",
+      "updated_at": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/version/update-requests",
+    "status": 201
+  },
+  "updateStatus/disabled": {
+    "body": {
+      "current_job": "null",
+      "enabled": "boolean",
+      "executor": {
+        "last_seen_at": "null",
+        "online": "boolean"
+      },
+      "reason": "string",
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version/update",
+    "status": 200
+  },
+  "updateStatus/queued": {
+    "body": {
+      "current_job": {
+        "backup_warnings": [],
+        "created_at": "string",
+        "error_code": "null",
+        "message": "string",
+        "request_id": "string",
+        "stage": "string",
+        "state": "string",
+        "target_commit": "string",
+        "target_tag": "string",
+        "updated_at": "string"
+      },
+      "enabled": "boolean",
+      "executor": {
+        "last_seen_at": "string",
+        "online": "boolean"
+      },
+      "reason": "string",
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version/update",
+    "status": 200
+  },
+  "version": {
+    "body": {
+      "commit": "string",
+      "current": "string",
+      "schema_version": "string",
+      "web_manifest_sha256": "null"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/version",
+    "status": 200
+  }
+}

@@ -1,0 +1,1459 @@
+{
+  "connectorInstances/empty": {
+    "body": {
+      "include_deleted": "boolean",
+      "items": [],
+      "schema_version": "string",
+      "scope": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/connectors/{scope}/instances",
+    "status": 200
+  },
+  "connectorInstances/populated": {
+    "body": {
+      "include_deleted": "boolean",
+      "items": [
+        {
+          "created_at": "string",
+          "created_by": "string",
+          "deletable": "boolean",
+          "deleted_at": "null",
+          "display_name": "string",
+          "enabled": "boolean",
+          "instance_id": "string",
+          "scope": "string"
+        }
+      ],
+      "schema_version": "string",
+      "scope": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/connectors/{scope}/instances",
+    "status": 200
+  },
+  "connectors/default": {
+    "body": {
+      "access": {
+        "activation": {
+          "ack_count": "integer",
+          "activated_at": "null",
+          "active_generation": "integer",
+          "active_revision_id": "null",
+          "candidate_generation": "null",
+          "candidate_revision_id": "null",
+          "error_code": "null",
+          "error_safe": "null",
+          "expected_count": "integer",
+          "generation": "integer",
+          "last_revision_id": "null",
+          "last_state": "null",
+          "scope": "string",
+          "started_at": "null",
+          "state": "string"
+        },
+        "editable": "boolean",
+        "fields": [
+          {
+            "configured": "boolean",
+            "control": "string",
+            "editable": "boolean",
+            "key": "string",
+            "kind": "string",
+            "label": "string",
+            "name": "string",
+            "preview": "null",
+            "scope": "string",
+            "set": "boolean",
+            "source": "string",
+            "value": "null"
+          },
+          {
+            "configured": "boolean",
+            "control": "string",
+            "editable": "boolean",
+            "key": "string",
+            "kind": "string",
+            "label": "string",
+            "name": "string",
+            "preview": "null",
+            "scope": "string",
+            "set": "boolean",
+            "source": "string",
+            "value": "string"
+          }
+        ],
+        "generation": "integer",
+        "id": "string"
+      },
+      "as_of": "string",
+      "can_edit": "boolean",
+      "connectors": [
+        {
+          "activation": {
+            "ack_count": "integer",
+            "activated_at": "null",
+            "active_generation": "integer",
+            "active_revision_id": "null",
+            "candidate_generation": "null",
+            "candidate_revision_id": "null",
+            "error_code": "null",
+            "error_safe": "null",
+            "expected_count": "integer",
+            "generation": "integer",
+            "last_revision_id": "null",
+            "last_state": "null",
+            "scope": "string",
+            "started_at": "null",
+            "state": "string"
+          },
+          "configured": "boolean",
+          "editable": "boolean",
+          "enabled": "boolean",
+          "fields": [
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "boolean"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "null"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "string"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": [
+                "string"
+              ]
+            }
+          ],
+          "generation": "integer",
+          "guidance": "string",
+          "id": "string",
+          "label": "string",
+          "runtime": {
+            "connections": "null",
+            "received": "null"
+          },
+          "status": "string",
+          "status_message": "string",
+          "status_reason": "string",
+          "storage": "string"
+        },
+        {
+          "activation": {
+            "ack_count": "integer",
+            "activated_at": "null",
+            "active_generation": "integer",
+            "active_revision_id": "null",
+            "candidate_generation": "null",
+            "candidate_revision_id": "null",
+            "error_code": "null",
+            "error_safe": "null",
+            "expected_count": "integer",
+            "generation": "integer",
+            "last_revision_id": "null",
+            "last_state": "null",
+            "scope": "string",
+            "started_at": "null",
+            "state": "string"
+          },
+          "configured": "boolean",
+          "editable": "boolean",
+          "enabled": "boolean",
+          "fields": [
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "boolean"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "null"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "string"
+            }
+          ],
+          "generation": "integer",
+          "guidance": "string",
+          "id": "string",
+          "label": "string",
+          "runtime": {
+            "connections": "null",
+            "received": "null"
+          },
+          "status": "string",
+          "status_message": "string",
+          "status_reason": "string",
+          "storage": "string"
+        }
+      ],
+      "instance_id": "string",
+      "instances": {
+        "access": "string",
+        "onebot": "string",
+        "qqbot": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/connectors",
+    "status": 200
+  },
+  "connectors/instance": {
+    "body": {
+      "access": {
+        "activation": {
+          "ack_count": "integer",
+          "activated_at": "null",
+          "active_generation": "integer",
+          "active_revision_id": "null",
+          "candidate_generation": "null",
+          "candidate_revision_id": "null",
+          "error_code": "null",
+          "error_safe": "null",
+          "expected_count": "integer",
+          "generation": "integer",
+          "last_revision_id": "null",
+          "last_state": "null",
+          "scope": "string",
+          "started_at": "null",
+          "state": "string"
+        },
+        "editable": "boolean",
+        "fields": [
+          {
+            "configured": "boolean",
+            "control": "string",
+            "editable": "boolean",
+            "key": "string",
+            "kind": "string",
+            "label": "string",
+            "name": "string",
+            "preview": "null",
+            "scope": "string",
+            "set": "boolean",
+            "source": "string",
+            "value": "null"
+          },
+          {
+            "configured": "boolean",
+            "control": "string",
+            "editable": "boolean",
+            "key": "string",
+            "kind": "string",
+            "label": "string",
+            "name": "string",
+            "preview": "null",
+            "scope": "string",
+            "set": "boolean",
+            "source": "string",
+            "value": "string"
+          }
+        ],
+        "generation": "integer",
+        "id": "string"
+      },
+      "as_of": "string",
+      "can_edit": "boolean",
+      "connectors": [
+        {
+          "activation": {
+            "ack_count": "integer",
+            "activated_at": "null",
+            "active_generation": "integer",
+            "active_revision_id": "null",
+            "candidate_generation": "null",
+            "candidate_revision_id": "null",
+            "error_code": "null",
+            "error_safe": "null",
+            "expected_count": "integer",
+            "generation": "integer",
+            "last_revision_id": "null",
+            "last_state": "null",
+            "scope": "string",
+            "started_at": "null",
+            "state": "string"
+          },
+          "configured": "boolean",
+          "editable": "boolean",
+          "enabled": "boolean",
+          "fields": [
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "boolean"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "null"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "string"
+            }
+          ],
+          "generation": "integer",
+          "guidance": "string",
+          "id": "string",
+          "label": "string",
+          "runtime": {
+            "connections": "null",
+            "received": "null"
+          },
+          "status": "string",
+          "status_message": "string",
+          "status_reason": "string",
+          "storage": "string"
+        },
+        {
+          "activation": {
+            "ack_count": "integer",
+            "activated_at": "string",
+            "active_generation": "integer",
+            "active_revision_id": "string",
+            "candidate_generation": "null",
+            "candidate_revision_id": "null",
+            "error_code": "null",
+            "error_safe": "null",
+            "expected_count": "integer",
+            "generation": "integer",
+            "last_revision_id": "string",
+            "last_state": "string",
+            "scope": "string",
+            "started_at": "string",
+            "state": "string"
+          },
+          "configured": "boolean",
+          "editable": "boolean",
+          "enabled": "boolean",
+          "fields": [
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "boolean"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "null"
+            },
+            {
+              "configured": "boolean",
+              "control": "string",
+              "editable": "boolean",
+              "key": "string",
+              "kind": "string",
+              "label": "string",
+              "name": "string",
+              "preview": "null",
+              "scope": "string",
+              "set": "boolean",
+              "source": "string",
+              "value": "string"
+            }
+          ],
+          "generation": "integer",
+          "guidance": "string",
+          "id": "string",
+          "label": "string",
+          "runtime": {
+            "connections": "null",
+            "received": "null"
+          },
+          "status": "string",
+          "status_message": "string",
+          "status_reason": "string",
+          "storage": "string"
+        }
+      ],
+      "instance_id": "string",
+      "instances": {
+        "access": "string",
+        "onebot": "string",
+        "qqbot": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/connectors",
+    "status": 200
+  },
+  "createConnectorInstance": {
+    "body": {
+      "item": {
+        "created_at": "string",
+        "created_by": "string",
+        "deletable": "boolean",
+        "deleted_at": "null",
+        "display_name": "string",
+        "enabled": "boolean",
+        "instance_id": "string",
+        "scope": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/connectors/{scope}/instances",
+    "status": 201
+  },
+  "deleteConnectorInstance": {
+    "body": {
+      "item": {
+        "created_at": "string",
+        "created_by": "string",
+        "deletable": "boolean",
+        "deleted_at": "string",
+        "display_name": "string",
+        "enabled": "boolean",
+        "instance_id": "string",
+        "scope": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "DELETE /v1/settings/connectors/{scope}/instances/{instance_id}",
+    "status": 200
+  },
+  "deleteConnectorInstance/web-request": {
+    "body": {
+      "error": {
+        "code": "string",
+        "detail": "string",
+        "field": "null",
+        "message": "string",
+        "retriable": "boolean",
+        "trace_id": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "DELETE /v1/settings/connectors/{scope}/instances/{instance_id}",
+    "status": 422
+  },
+  "instanceDialoguePolicy": {
+    "body": {
+      "affected_active_windows": "integer",
+      "affected_archived_windows": "integer",
+      "fields": {
+        "group_attention_deferred": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_mention_requires_reply": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_turn_budget": {
+          "effective": "integer",
+          "global_value": "integer",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "persona_id": {
+          "effective": "string",
+          "global_value": "string",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "private_may_stay_silent": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "rest_may_skip": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        }
+      },
+      "global_revision": "integer",
+      "impact_epoch": "integer",
+      "instance_id": "string",
+      "instance_revision": "integer",
+      "schema_version": "string",
+      "scope": "string",
+      "session_shadowed_windows": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/connectors/{scope}/instances/{instance_id}/dialogue-policy",
+    "status": 200
+  },
+  "previewInstanceDialoguePolicy": {
+    "body": {
+      "current": {
+        "affected_active_windows": "integer",
+        "affected_archived_windows": "integer",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "global_revision": "integer",
+        "impact_epoch": "integer",
+        "instance_id": "string",
+        "instance_revision": "integer",
+        "schema_version": "string",
+        "scope": "string",
+        "session_shadowed_windows": "integer"
+      },
+      "expires_at": "integer",
+      "preview_token": "string",
+      "proposed": {
+        "affected_active_windows": "integer",
+        "affected_archived_windows": "integer",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "boolean",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "session_shadowed_windows": "integer"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/connectors/{scope}/instances/{instance_id}/dialogue-policy/preview",
+    "status": 200
+  },
+  "previewWindowOriginBinding": {
+    "body": {
+      "current": {
+        "effective": "boolean",
+        "field": "string",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "global_revision": "integer",
+        "global_value": "boolean",
+        "instance_id": "null",
+        "instance_revision": "integer",
+        "instance_scope": "null",
+        "origin_status": "string",
+        "override": "null",
+        "session_revision": "integer",
+        "source": "string"
+      },
+      "expires_at": "integer",
+      "preview_token": "string",
+      "proposed": {
+        "effective": "boolean",
+        "field": "string",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "boolean",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "global_revision": "integer",
+        "global_value": "boolean",
+        "instance_id": "string",
+        "instance_revision": "integer",
+        "instance_scope": "string",
+        "origin_status": "string",
+        "override": "null",
+        "session_revision": "integer",
+        "source": "string"
+      },
+      "target": {
+        "display_name": "string",
+        "enabled": "boolean",
+        "instance_id": "string",
+        "scope": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/origin-binding/preview",
+    "status": 200
+  },
+  "previewWindowPolicy": {
+    "body": {
+      "current": {
+        "effective": "boolean",
+        "field": "string",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "boolean",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "global_revision": "integer",
+        "global_value": "boolean",
+        "instance_id": "string",
+        "instance_revision": "integer",
+        "instance_scope": "string",
+        "origin_status": "string",
+        "override": "null",
+        "session_revision": "integer",
+        "source": "string"
+      },
+      "expires_at": "integer",
+      "preview_token": "string",
+      "proposed": {
+        "effective": "boolean",
+        "fields": {
+          "group_attention_deferred": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_mention_requires_reply": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "group_turn_budget": {
+            "effective": "integer",
+            "global_value": "integer",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "integer",
+            "source": "string"
+          },
+          "persona_id": {
+            "effective": "string",
+            "global_value": "string",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          },
+          "private_may_stay_silent": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "boolean",
+            "session_override": "null",
+            "source": "string"
+          },
+          "rest_may_skip": {
+            "effective": "boolean",
+            "global_value": "boolean",
+            "has_instance_override": "boolean",
+            "has_session_override": "boolean",
+            "instance_override": "null",
+            "session_override": "null",
+            "source": "string"
+          }
+        },
+        "override": "null",
+        "source": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/dialogue-policy/preview",
+    "status": 200
+  },
+  "renameConnectorInstance": {
+    "body": {
+      "item": {
+        "created_at": "string",
+        "created_by": "string",
+        "deletable": "boolean",
+        "deleted_at": "null",
+        "display_name": "string",
+        "enabled": "boolean",
+        "instance_id": "string",
+        "scope": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/connectors/{scope}/instances/{instance_id}",
+    "status": 200
+  },
+  "resetConnectorConfig": {
+    "body": {
+      "ok": "boolean",
+      "results": [
+        {
+          "cleared": [],
+          "scope": "string",
+          "state": "string"
+        }
+      ],
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/connectors/reset",
+    "status": 200
+  },
+  "resetConnectorConfig/web-request": {
+    "body": {
+      "error": {
+        "code": "string",
+        "detail": "string",
+        "field": "null",
+        "message": "string",
+        "retriable": "boolean",
+        "trace_id": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/connectors/reset",
+    "status": 422
+  },
+  "saveConnectorConfig": {
+    "body": {
+      "ack_count": "integer",
+      "active_revision_id": "string",
+      "changed": "boolean",
+      "error_code": "null",
+      "error_safe": "null",
+      "expected_count": "integer",
+      "finished_at": "string",
+      "generation": "integer",
+      "instance_id": "string",
+      "operation_id": "string",
+      "revision_id": "string",
+      "schema_version": "string",
+      "scope": "string",
+      "started_at": "string",
+      "state": "string",
+      "status": "string",
+      "timings": {}
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/connectors/{scope}",
+    "status": 202
+  },
+  "saveInstanceDialoguePolicy": {
+    "body": {
+      "affected_active_windows": "integer",
+      "affected_archived_windows": "integer",
+      "fields": {
+        "group_attention_deferred": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_mention_requires_reply": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_turn_budget": {
+          "effective": "integer",
+          "global_value": "integer",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "persona_id": {
+          "effective": "string",
+          "global_value": "string",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "private_may_stay_silent": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "boolean",
+          "session_override": "null",
+          "source": "string"
+        },
+        "rest_may_skip": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        }
+      },
+      "global_revision": "integer",
+      "impact_epoch": "integer",
+      "instance_id": "string",
+      "instance_revision": "integer",
+      "schema_version": "string",
+      "scope": "string",
+      "session_shadowed_windows": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/connectors/{scope}/instances/{instance_id}/dialogue-policy",
+    "status": 200
+  },
+  "saveWindowOriginBinding": {
+    "body": {
+      "effective": "boolean",
+      "field": "string",
+      "fields": {
+        "group_attention_deferred": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_mention_requires_reply": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_turn_budget": {
+          "effective": "integer",
+          "global_value": "integer",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "persona_id": {
+          "effective": "string",
+          "global_value": "string",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "private_may_stay_silent": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "boolean",
+          "session_override": "null",
+          "source": "string"
+        },
+        "rest_may_skip": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        }
+      },
+      "global_revision": "integer",
+      "global_value": "boolean",
+      "instance_id": "string",
+      "instance_revision": "integer",
+      "instance_scope": "string",
+      "origin_status": "string",
+      "override": "null",
+      "session_revision": "integer",
+      "source": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/sessions/{session_id}/origin-binding",
+    "status": 200
+  },
+  "saveWindowPolicy": {
+    "body": {
+      "effective": "boolean",
+      "field": "string",
+      "fields": {
+        "group_attention_deferred": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_mention_requires_reply": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_turn_budget": {
+          "effective": "integer",
+          "global_value": "integer",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "integer",
+          "source": "string"
+        },
+        "persona_id": {
+          "effective": "string",
+          "global_value": "string",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "private_may_stay_silent": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "boolean",
+          "session_override": "null",
+          "source": "string"
+        },
+        "rest_may_skip": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        }
+      },
+      "global_revision": "integer",
+      "global_value": "boolean",
+      "instance_id": "string",
+      "instance_revision": "integer",
+      "instance_scope": "string",
+      "origin_status": "string",
+      "override": "null",
+      "session_revision": "integer",
+      "source": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/sessions/{session_id}/dialogue-policy",
+    "status": 200
+  },
+  "setConnectorInstanceEnabled": {
+    "body": {
+      "item": {
+        "created_at": "string",
+        "created_by": "string",
+        "deletable": "boolean",
+        "deleted_at": "null",
+        "display_name": "string",
+        "enabled": "boolean",
+        "instance_id": "string",
+        "scope": "string"
+      },
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/connectors/{scope}/instances/{instance_id}/enabled",
+    "status": 200
+  },
+  "windowDialoguePolicy": {
+    "body": {
+      "effective": "boolean",
+      "field": "string",
+      "fields": {
+        "group_attention_deferred": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_mention_requires_reply": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "group_turn_budget": {
+          "effective": "integer",
+          "global_value": "integer",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "persona_id": {
+          "effective": "string",
+          "global_value": "string",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        },
+        "private_may_stay_silent": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "boolean",
+          "session_override": "null",
+          "source": "string"
+        },
+        "rest_may_skip": {
+          "effective": "boolean",
+          "global_value": "boolean",
+          "has_instance_override": "boolean",
+          "has_session_override": "boolean",
+          "instance_override": "null",
+          "session_override": "null",
+          "source": "string"
+        }
+      },
+      "global_revision": "integer",
+      "global_value": "boolean",
+      "instance_id": "string",
+      "instance_revision": "integer",
+      "instance_scope": "string",
+      "origin_status": "string",
+      "override": "null",
+      "session_revision": "integer",
+      "source": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/dialogue-policy",
+    "status": 200
+  },
+  "windowOriginBinding": {
+    "body": {
+      "candidates": [
+        {
+          "display_name": "string",
+          "enabled": "boolean",
+          "instance_id": "string",
+          "scope": "string"
+        }
+      ],
+      "manually_bound": "boolean",
+      "scope": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/origin-binding",
+    "status": 200
+  }
+}

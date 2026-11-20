@@ -1,0 +1,370 @@
+{
+  "VoicePlayer.audio": {
+    "media_type": "audio/wav",
+    "operation": "GET /v1/media/generated/{file_id}",
+    "status": 200
+  },
+  "VoicePlayer.audio/range": {
+    "media_type": "audio/wav",
+    "operation": "GET /v1/media/generated/{file_id}",
+    "status": 206
+  },
+  "cancelTranscription": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "DELETE /v1/sessions/{session_id}/transcriptions/{job_id}",
+    "status": 200
+  },
+  "commitTranscription": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {
+        "audio": [
+          {
+            "confidence": "null",
+            "language": "string",
+            "provider_request_id": "null",
+            "text": "string",
+            "usage": {
+              "audio_seconds": "null",
+              "characters": "null",
+              "currency": "null",
+              "estimated_cost": "null",
+              "input_tokens": "null",
+              "input_units": "null",
+              "output_tokens": "null",
+              "unit_kind": "null",
+              "usage_source": "string"
+            }
+          }
+        ],
+        "estimated_audio_seconds": "number",
+        "origin": "string"
+      },
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/transcriptions/{job_id}/commit",
+    "status": 200
+  },
+  "createTranscription": {
+    "body": {
+      "charged_seconds": "integer",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/transcriptions",
+    "status": 202
+  },
+  "createTranscription/second": {
+    "body": {
+      "charged_seconds": "integer",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/transcriptions",
+    "status": 202
+  },
+  "retryTranscription": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/transcriptions/{job_id}/retry",
+    "status": 202
+  },
+  "transcription/failed": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": {
+        "code": "string",
+        "message": "string"
+      },
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/transcriptions/{job_id}",
+    "status": 200
+  },
+  "transcription/finished": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {
+        "audio": [
+          {
+            "confidence": "null",
+            "language": "string",
+            "provider_request_id": "null",
+            "text": "string",
+            "usage": {
+              "audio_seconds": "null",
+              "characters": "null",
+              "currency": "null",
+              "estimated_cost": "null",
+              "input_tokens": "null",
+              "input_units": "null",
+              "output_tokens": "null",
+              "unit_kind": "null",
+              "usage_source": "string"
+            }
+          }
+        ],
+        "estimated_audio_seconds": "number",
+        "origin": "string"
+      },
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/transcriptions/{job_id}",
+    "status": 200
+  },
+  "transcription/queued": {
+    "body": {
+      "charged_seconds": "number",
+      "created_at": "string",
+      "error": "null",
+      "job_id": "string",
+      "message_id": "null",
+      "mode": "string",
+      "result": {},
+      "revision": "integer",
+      "state": "string",
+      "submission": "string",
+      "text": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/transcriptions/{job_id}",
+    "status": 200
+  },
+  "uploadAudio": {
+    "body": {
+      "asset_id": "string",
+      "duration_seconds": "number",
+      "mime": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/audio-inputs",
+    "status": 201
+  },
+  "uploadMedia": {
+    "body": {
+      "bytes": "integer",
+      "evidence_id": "string",
+      "kind": "string",
+      "mime": "string",
+      "note": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/sessions/{session_id}/media",
+    "status": 200
+  },
+  "uploadVoiceReference": {
+    "body": {
+      "asset_id": "string",
+      "duration_ms": "null",
+      "format": "string",
+      "mime_type": "string",
+      "retention_days": "integer",
+      "schema_version": "string",
+      "size_bytes": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/speech/voice-reference",
+    "status": 200
+  },
+  "voiceMessages.fetchOperatorSpeechText": {
+    "body": {
+      "message": {
+        "attempt": "integer",
+        "audio_asset_id": "string",
+        "created_at": "string",
+        "error_code": "null",
+        "handled_as": "null",
+        "handled_reason": "null",
+        "message_id": "string",
+        "model_label": "null",
+        "origin": "string",
+        "output_modality": "string",
+        "recall_state": "null",
+        "recalled_at": "null",
+        "retracted_at": "null",
+        "role": "string",
+        "schema_version": "string",
+        "sender_id": "null",
+        "sender_name": "null",
+        "sequence": "integer",
+        "speech_delivery_state": "string",
+        "speech_state": "string",
+        "state": "string",
+        "text": "string",
+        "turn_id": "null"
+      },
+      "schema_version": "string",
+      "view": "string",
+      "voice": {
+        "created_at": "string",
+        "delivered": "boolean",
+        "duration_ms": "integer",
+        "expires_at": "string",
+        "format": "string",
+        "kind": "string",
+        "last_played_at": "null",
+        "message_id": "string",
+        "mime_type": "string",
+        "play_count": "integer",
+        "played": "boolean",
+        "sample_rate": "integer",
+        "schema_version": "string",
+        "size_bytes": "integer",
+        "text": "string",
+        "url": "string",
+        "window_id": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/speech/messages/{message_id}",
+    "status": 200
+  },
+  "voiceMessages.fetchVoiceMessages/empty": {
+    "body": {
+      "schema_version": "string",
+      "voice_messages": [],
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/voice-messages",
+    "status": 200
+  },
+  "voiceMessages.fetchVoiceMessages/ready": {
+    "body": {
+      "schema_version": "string",
+      "voice_messages": [
+        {
+          "created_at": "string",
+          "delivered": "boolean",
+          "duration_ms": "integer",
+          "expires_at": "string",
+          "format": "string",
+          "kind": "string",
+          "last_played_at": "null",
+          "message_id": "string",
+          "mime_type": "string",
+          "play_count": "integer",
+          "played": "boolean",
+          "sample_rate": "integer",
+          "schema_version": "string",
+          "size_bytes": "integer",
+          "text": "string",
+          "url": "string",
+          "window_id": "string"
+        }
+      ],
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/sessions/{session_id}/voice-messages",
+    "status": 200
+  },
+  "voiceMessages.refetchVoiceUrl": {
+    "body": {
+      "created_at": "string",
+      "delivered": "boolean",
+      "duration_ms": "integer",
+      "expires_at": "string",
+      "format": "string",
+      "kind": "string",
+      "last_played_at": "null",
+      "message_id": "string",
+      "mime_type": "string",
+      "play_count": "integer",
+      "played": "boolean",
+      "sample_rate": "integer",
+      "schema_version": "string",
+      "size_bytes": "integer",
+      "text": "string",
+      "url": "string",
+      "window_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/messages/{message_id}/voice",
+    "status": 200
+  },
+  "voiceMessages.reportPlayback": {
+    "body": {
+      "completed": "boolean",
+      "delivered": "boolean",
+      "last_played_at": "string",
+      "message_id": "string",
+      "play_count": "integer",
+      "played": "boolean",
+      "schema_version": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/messages/{message_id}/playback",
+    "status": 200
+  }
+}

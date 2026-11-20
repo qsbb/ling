@@ -1,0 +1,504 @@
+{
+  "ToolStatus.load": {
+    "body": {
+      "manifest_valid": "boolean",
+      "plugins": [],
+      "profiles": {
+        "dialogue.deep": "string",
+        "dialogue.fast": "string",
+        "dialogue.group": "string"
+      },
+      "search_configured": "boolean",
+      "tools_enabled": "boolean"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/tool-status",
+    "status": 200
+  },
+  "deleteSecret": {
+    "body": {
+      "has_secret": "boolean",
+      "provider_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "DELETE /v1/settings/providers/{provider_id}/secret",
+    "status": 200
+  },
+  "probeProvider": {
+    "body": {
+      "checked_at": "string",
+      "detail": "string",
+      "latency_ms": "integer",
+      "models": [
+        "string"
+      ],
+      "ok": "boolean",
+      "provider_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/providers/{provider_id}/probe",
+    "status": 200
+  },
+  "publish": {
+    "body": {
+      "published_revision": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/publish",
+    "status": 200
+  },
+  "publish/second": {
+    "body": {
+      "published_revision": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/publish",
+    "status": 200
+  },
+  "quickConfigPreview": {
+    "body": {
+      "profiles": [
+        {
+          "enabled": "boolean",
+          "fallback_model_id": "null",
+          "fallback_provider_id": "null",
+          "mode": "string",
+          "model_id": "string",
+          "profile": "string",
+          "provider_id": "string"
+        }
+      ],
+      "rows": [
+        {
+          "change": "string",
+          "change_kind": "string",
+          "model_id": "null",
+          "profile": "string",
+          "provider_id": "null",
+          "slot": "string",
+          "slot_label": "string"
+        }
+      ],
+      "schema_version": "string",
+      "summary": {
+        "overrides": "integer",
+        "repairs": "integer",
+        "still_unavailable": "integer",
+        "total": "integer",
+        "unchanged": "integer"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/quick-config/preview",
+    "status": 200
+  },
+  "rollback": {
+    "body": {
+      "published_revision": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/rollback",
+    "status": 200
+  },
+  "saveDraft": {
+    "body": {
+      "revision": "integer",
+      "state": "string",
+      "validation_errors": []
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/draft",
+    "status": 200
+  },
+  "saveDraft/second": {
+    "body": {
+      "revision": "integer",
+      "state": "string",
+      "validation_errors": []
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/draft",
+    "status": 200
+  },
+  "setSecret": {
+    "body": {
+      "fingerprint": "string",
+      "last4": "string",
+      "provider_id": "string"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/settings/providers/{provider_id}/secret",
+    "status": 200
+  },
+  "settingsConfig": {
+    "body": {
+      "dialogue": {
+        "group_attention_deferred": "boolean",
+        "group_mention_requires_reply": "boolean",
+        "group_reply_delivery_enabled": "boolean",
+        "group_turn_budget": "integer",
+        "private_may_stay_silent": "boolean",
+        "proactive_daily_limit": "integer",
+        "proactive_delivery_enabled": "boolean",
+        "quiet_end_minute": "integer",
+        "quiet_start_minute": "integer",
+        "rest_may_skip": "boolean",
+        "tools_enabled": "boolean",
+        "voice": {
+          "emotion": "null",
+          "kind": "null",
+          "pitch": "integer",
+          "reference_asset_id": "null",
+          "speed": "number",
+          "voice_id": "null",
+          "vol": "number"
+        },
+        "voice_willingness": "string"
+      },
+      "known_kinds": [
+        "string"
+      ],
+      "known_profiles": [
+        "string"
+      ],
+      "life": {
+        "energy_decay_per_hour": "number",
+        "max_live_plans": "integer",
+        "scene_ttl_minutes": "integer",
+        "social_load_decay_per_hour": "number",
+        "social_load_per_turn": "number"
+      },
+      "log_access_denials": "boolean",
+      "memory": {
+        "max_retention_days": "integer",
+        "recency_half_life_days": "number",
+        "relative_score_floor": "number",
+        "rerank_top_n": "integer"
+      },
+      "memory_sources": {
+        "memory.embed": "null",
+        "memory.rerank": "null"
+      },
+      "profile_capabilities": {
+        "dialogue.fast": "string",
+        "dialogue.group": "string",
+        "memory.embed": "string",
+        "memory.extract": "string",
+        "memory.rerank": "string",
+        "perception.video": "string",
+        "perception.vision": "string",
+        "speech.asr": "string",
+        "speech.tts": "string"
+      },
+      "profile_resolutions": [
+        {
+          "effective": "null",
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "null",
+          "source": "string"
+        },
+        {
+          "effective": "null",
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "string",
+          "source": "string"
+        },
+        {
+          "effective": {
+            "model_id": "string",
+            "provider_id": "string"
+          },
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "string",
+          "source": "string"
+        }
+      ],
+      "profiles": [
+        {
+          "enabled": "boolean",
+          "fallback_model_id": "null",
+          "fallback_provider_id": "null",
+          "mode": "string",
+          "model_id": "string",
+          "profile": "string",
+          "provider_id": "string"
+        }
+      ],
+      "providers": [
+        {
+          "base_url": "null",
+          "capabilities": [
+            "string"
+          ],
+          "daily_token_limit": "null",
+          "enabled": "boolean",
+          "extra": {
+            "$map": [
+              "number"
+            ]
+          },
+          "has_secret": "boolean",
+          "kind": "string",
+          "max_output_tokens": "null",
+          "models": [
+            {
+              "enabled": "boolean",
+              "model_id": "string",
+              "note": "string"
+            }
+          ],
+          "provider_id": "string",
+          "secret_fingerprint": "string",
+          "secret_last4": "string",
+          "timeout_seconds": "number"
+        }
+      ],
+      "reserved_profiles": {
+        "dialogue.deep": "string",
+        "moderation.advisory": "string",
+        "planning": "string",
+        "realtime.voice": "string",
+        "reflection": "string"
+      },
+      "revision": "integer",
+      "revisions": [
+        {
+          "created_at": "string",
+          "note": "null",
+          "published_at": "string",
+          "revision": "integer",
+          "state": "string",
+          "validation_errors": []
+        },
+        {
+          "created_at": "string",
+          "note": "string",
+          "published_at": "string",
+          "revision": "integer",
+          "state": "string",
+          "validation_errors": []
+        }
+      ],
+      "schema_version": "string",
+      "slots": [
+        {
+          "configured": "boolean",
+          "hint": "string",
+          "label": "string",
+          "model_id": "string",
+          "provider_id": "string",
+          "roles": [
+            "string"
+          ],
+          "slot": "string",
+          "usable": "boolean"
+        }
+      ],
+      "test_mode": "boolean",
+      "unbound_degradations": {
+        "memory.embed": "string",
+        "memory.rerank": "string",
+        "perception.vision": "string",
+        "speech.asr": "string",
+        "speech.tts": "string"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/config",
+    "status": 200
+  },
+  "settingsHealth": {
+    "body": {
+      "health": {
+        "$map": []
+      },
+      "profiles": {
+        "$map": [
+          {
+            "enabled": "boolean",
+            "model_id": "string",
+            "provider_id": "string"
+          }
+        ]
+      },
+      "revision": "integer",
+      "test_mode": "boolean"
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/health",
+    "status": 200
+  },
+  "settingsResolve": {
+    "body": {
+      "profile_resolutions": [
+        {
+          "effective": "null",
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "null",
+          "source": "string"
+        },
+        {
+          "effective": "null",
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "string",
+          "source": "string"
+        },
+        {
+          "effective": {
+            "model_id": "string",
+            "provider_id": "string"
+          },
+          "enabled": "boolean",
+          "fell_back": "boolean",
+          "profile": "string",
+          "reason": "string",
+          "requested": "null",
+          "slot": "string",
+          "source": "string"
+        }
+      ],
+      "schema_version": "string",
+      "slots": [
+        {
+          "configured": "boolean",
+          "hint": "string",
+          "label": "string",
+          "model_id": "string",
+          "provider_id": "string",
+          "roles": [
+            "string"
+          ],
+          "slot": "string",
+          "usable": "boolean"
+        }
+      ]
+    },
+    "media_type": "application/json",
+    "operation": "POST /v1/settings/resolve",
+    "status": 200
+  },
+  "settingsUsage": {
+    "body": {
+      "day": "string",
+      "limits": {
+        "$map": [
+          "null"
+        ]
+      },
+      "usage": {
+        "$map": [
+          {
+            "day": "string",
+            "estimated": "boolean",
+            "used_tokens": "integer"
+          }
+        ]
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/usage",
+    "status": 200
+  },
+  "taxonomy": {
+    "body": {
+      "categories": [
+        {
+          "available": "boolean",
+          "boundary": "string",
+          "editable_route": "null",
+          "groups": [
+            {
+              "defaults_to": "string",
+              "key": "string",
+              "label": "string"
+            }
+          ],
+          "index": "integer",
+          "key": "string",
+          "label": "string",
+          "status_route": "null",
+          "verb": "string"
+        },
+        {
+          "available": "boolean",
+          "boundary": "string",
+          "editable_route": "null",
+          "groups": [
+            {
+              "defaults_to": "string",
+              "key": "string",
+              "label": "string"
+            }
+          ],
+          "index": "integer",
+          "key": "string",
+          "label": "string",
+          "status_route": "string",
+          "verb": "string"
+        },
+        {
+          "available": "boolean",
+          "boundary": "string",
+          "editable_route": "string",
+          "groups": [
+            {
+              "defaults_to": "string",
+              "key": "string",
+              "label": "string"
+            }
+          ],
+          "index": "integer",
+          "key": "string",
+          "label": "string",
+          "status_route": "null",
+          "verb": "string"
+        },
+        {
+          "available": "boolean",
+          "boundary": "string",
+          "editable_route": "string",
+          "groups": [
+            {
+              "defaults_to": "string",
+              "key": "string",
+              "label": "string"
+            }
+          ],
+          "index": "integer",
+          "key": "string",
+          "label": "string",
+          "status_route": "string",
+          "verb": "string"
+        }
+      ],
+      "summary": {
+        "editable": "integer",
+        "pending": "integer",
+        "total": "integer"
+      }
+    },
+    "media_type": "application/json",
+    "operation": "GET /v1/settings/taxonomy",
+    "status": 200
+  }
+}

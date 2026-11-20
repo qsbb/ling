@@ -1,0 +1,92 @@
+[
+  {
+    "data": {
+      "config_revision": "integer",
+      "decision": "string",
+      "decision_hard": "boolean",
+      "decision_reason": "string",
+      "model_status": "string",
+      "skip_code": "string",
+      "state": "string",
+      "test_mode": "boolean",
+      "turn_id": "string",
+      "user_message": {
+        "attempt": "integer",
+        "audio_asset_id": "null",
+        "created_at": "string",
+        "error_code": "null",
+        "handled_as": "string",
+        "handled_reason": "string",
+        "message_id": "string",
+        "model_label": "null",
+        "origin": "string",
+        "output_modality": "string",
+        "recall_state": "null",
+        "recalled_at": "null",
+        "retracted_at": "null",
+        "role": "string",
+        "schema_version": "string",
+        "sender_id": "null",
+        "sender_name": "null",
+        "sequence": "integer",
+        "speech_delivery_state": "null",
+        "speech_state": "string",
+        "state": "string",
+        "text": "string",
+        "turn_id": "string"
+      }
+    },
+    "event": "turn.started"
+  },
+  {
+    "data": {
+      "text": "string",
+      "turn_id": "string"
+    },
+    "event": "delta"
+  },
+  {
+    "data": {
+      "chunks": "integer",
+      "decision": "string",
+      "expression": {
+        "at": [],
+        "poke": [],
+        "quote": "null"
+      },
+      "message": {
+        "attempt": "integer",
+        "audio_asset_id": "null",
+        "created_at": "string",
+        "error_code": "null",
+        "handled_as": "null",
+        "handled_reason": "null",
+        "message_id": "string",
+        "model_label": "string",
+        "origin": "string",
+        "output_modality": "string",
+        "recall_state": "null",
+        "recalled_at": "null",
+        "retracted_at": "null",
+        "role": "string",
+        "schema_version": "string",
+        "sender_id": "null",
+        "sender_name": "null",
+        "sequence": "integer",
+        "speech_delivery_state": "null",
+        "speech_state": "string",
+        "state": "string",
+        "text": "string",
+        "turn_id": "string"
+      },
+      "model_label": "string",
+      "quote_dropped": "null",
+      "raw_chars": "integer",
+      "recall_proposals": [],
+      "state": "string",
+      "suppressed_reason": "null",
+      "turn_id": "string"
+    },
+    "event": "turn.stopped"
+  }
+]

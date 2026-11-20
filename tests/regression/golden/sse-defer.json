@@ -1,0 +1,70 @@
+[
+  {
+    "data": {
+      "config_revision": "integer",
+      "decision": "string",
+      "decision_hard": "boolean",
+      "decision_reason": "string",
+      "model_status": "string",
+      "skip_code": "string",
+      "state": "string",
+      "test_mode": "boolean",
+      "turn_id": "string",
+      "user_message": {
+        "attempt": "integer",
+        "audio_asset_id": "null",
+        "created_at": "string",
+        "error_code": "null",
+        "handled_as": "string",
+        "handled_reason": "string",
+        "message_id": "string",
+        "model_label": "null",
+        "origin": "string",
+        "output_modality": "string",
+        "recall_state": "null",
+        "recalled_at": "null",
+        "retracted_at": "null",
+        "role": "string",
+        "schema_version": "string",
+        "sender_id": "null",
+        "sender_name": "null",
+        "sequence": "integer",
+        "speech_delivery_state": "null",
+        "speech_state": "string",
+        "state": "string",
+        "text": "string",
+        "turn_id": "string"
+      }
+    },
+    "event": "turn.started"
+  },
+  {
+    "data": {
+      "applied_seconds": "integer",
+      "clamped": "boolean",
+      "delay_id": "string",
+      "due_at": "string",
+      "hard_deadline_at": "string",
+      "note": "string",
+      "requested_seconds": "integer",
+      "turn_id": "string"
+    },
+    "event": "turn.deferred"
+  },
+  {
+    "data": {
+      "chunks": "integer",
+      "decision": "string",
+      "expression": "null",
+      "message": "null",
+      "model_label": "string",
+      "quote_dropped": "null",
+      "raw_chars": "integer",
+      "recall_proposals": [],
+      "state": "string",
+      "suppressed_reason": "null",
+      "turn_id": "string"
+    },
+    "event": "turn.completed"
+  }
+]
