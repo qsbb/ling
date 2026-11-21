@@ -107,6 +107,23 @@ async def test_cancel_preview_clears_caption_and_audio(tmp_path: Path):
     assert obs.status == "STOPPED" and obs.path == ""
 
 
+async def test_obs_output_change_interrupts_playback_without_waiting_for_stage_poll(tmp_path: Path):
+    clip = tmp_path / "clip.wav"
+    clip.touch()
+    obs = Obs()
+    stage = ObsStage(obs.call, Program("Studio", "Voice", "Caption"))
+    playing = asyncio.create_task(stage.play(clip, "Prior stream"))
+    await asyncio.wait_for(obs.playing.wait(), timeout=1)
+    assert obs.caption_changes[-1] == ("PLAYING", "Prior stream")
+
+    await stage.on_stream_state({"outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING"})
+    await stage.on_stream_state({"outputState": "OBS_WEBSOCKET_OUTPUT_STARTING"})
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(playing, timeout=1)
+    assert obs.caption_changes[-1][1] == ""
+    assert obs.status == "STOPPED" and obs.path == ""
+
+
 async def test_old_end_and_source_replacement_do_not_complete_new_clip(tmp_path: Path):
     clip = tmp_path / "clip.wav"
     clip.touch()

@@ -216,7 +216,8 @@ class StageAgent:
 
     async def _cancel_speech(self) -> None:
         if self.playback is not None and not self.playback.done():
-            self.playback.cancel()
+            if not self.playback.cancelling():
+                self.playback.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.playback
 

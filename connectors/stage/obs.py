@@ -40,6 +40,7 @@ class ObsStage:
         self._level = 0.0
         self._playing = False
         self._lock = asyncio.Lock()
+        self._play_task: asyncio.Task | None = None
         self.output_serial = 0
         self.output_generation: int | None = None
         self.output_stopping = False
@@ -53,6 +54,11 @@ class ObsStage:
         elif state in {"OBS_WEBSOCKET_OUTPUT_STOPPING", "OBS_WEBSOCKET_OUTPUT_STOPPED"}:
             self.output_generation = None
             self.output_stopping = True
+        else:
+            return
+        # The WebSocket listener must keep reading while playback cleans up via RPC.
+        if self._play_task and not self._play_task.done() and not self._play_task.cancelling():
+            self._play_task.cancel()
 
     async def on_meters(self, data: dict[str, Any]) -> None:
         for source in data.get("inputs", ()):
@@ -111,52 +117,59 @@ class ObsStage:
         if not audio.is_file() or audio.suffix.lower() not in {".wav", ".mp3"}:
             raise StageError("语音必须是本机 WAV 或 MP3 文件")
         async with self._lock:
-            await self._check_scene()
-            await self._caption("")
-            if (await self._media())["mediaState"] in {
-                "OBS_MEDIA_STATE_PLAYING", "OBS_MEDIA_STATE_OPENING", "OBS_MEDIA_STATE_BUFFERING"
-            }:
-                raise StageError("OBS 语音源正在播放")
-            if (await self._input(self.program.audio))["inputSettings"].get("local_file") == str(audio):
-                # OBS does not restart an unchanged file on a settings update.
-                raise StageError("请为每个播出段使用独立音频文件")
-            self._level = 0.0
-            played_ms = 0
+            self._play_task = asyncio.current_task()
             try:
-                async with asyncio.timeout(timeout):
-                    await self._set(self.program.audio, {
-                        "is_local_file": True,
-                        "local_file": str(audio),
-                        "looping": False,
-                        "restart_on_activate": False,
-                    })
-                    while True:
-                        status = await self._media()
-                        current = (await self._input(self.program.audio))["inputSettings"]
-                        if current.get("local_file") != str(audio):
-                            return Playback("interrupted", played_ms)
-                        state = status["mediaState"]
-                        if state == "OBS_MEDIA_STATE_PLAYING":
-                            await self._check_scene()
-                            if not self._playing:
-                                await self._caption(caption)
-                                self._playing = True
-                            played_ms = max(played_ms, status.get("mediaCursor") or 0)
-                            if self._mouth:
-                                await self._mouth(min(1.0, math.sqrt(max(self._level, 0.0))))
-                        elif state == "OBS_MEDIA_STATE_ENDED" and self._playing:
-                            return Playback("completed", status.get("mediaDuration") or played_ms)
-                        elif state == "OBS_MEDIA_STATE_ERROR":
-                            raise StageError("OBS 无法播放这段语音")
-                        elif self._playing:
-                            return Playback("interrupted", played_ms)
-                        await asyncio.sleep(0.05)
-            except TimeoutError as exc:
-                raise StageError("等待 OBS 播放超时") from exc
+                return await self._play_locked(audio, caption, timeout=timeout)
             finally:
-                self._playing = False
-                self._level = 0.0
-                await self._cleanup(str(audio))
+                self._play_task = None
+
+    async def _play_locked(self, audio: Path, caption: str, *, timeout: float) -> Playback:
+        await self._check_scene()
+        await self._caption("")
+        if (await self._media())["mediaState"] in {
+            "OBS_MEDIA_STATE_PLAYING", "OBS_MEDIA_STATE_OPENING", "OBS_MEDIA_STATE_BUFFERING"
+        }:
+            raise StageError("OBS 语音源正在播放")
+        if (await self._input(self.program.audio))["inputSettings"].get("local_file") == str(audio):
+            # OBS does not restart an unchanged file on a settings update.
+            raise StageError("请为每个播出段使用独立音频文件")
+        self._level = 0.0
+        played_ms = 0
+        try:
+            async with asyncio.timeout(timeout):
+                await self._set(self.program.audio, {
+                    "is_local_file": True,
+                    "local_file": str(audio),
+                    "looping": False,
+                    "restart_on_activate": False,
+                })
+                while True:
+                    status = await self._media()
+                    current = (await self._input(self.program.audio))["inputSettings"]
+                    if current.get("local_file") != str(audio):
+                        return Playback("interrupted", played_ms)
+                    state = status["mediaState"]
+                    if state == "OBS_MEDIA_STATE_PLAYING":
+                        await self._check_scene()
+                        if not self._playing:
+                            await self._caption(caption)
+                            self._playing = True
+                        played_ms = max(played_ms, status.get("mediaCursor") or 0)
+                        if self._mouth:
+                            await self._mouth(min(1.0, math.sqrt(max(self._level, 0.0))))
+                    elif state == "OBS_MEDIA_STATE_ENDED" and self._playing:
+                        return Playback("completed", status.get("mediaDuration") or played_ms)
+                    elif state == "OBS_MEDIA_STATE_ERROR":
+                        raise StageError("OBS 无法播放这段语音")
+                    elif self._playing:
+                        return Playback("interrupted", played_ms)
+                    await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise StageError("等待 OBS 播放超时") from exc
+        finally:
+            self._playing = False
+            self._level = 0.0
+            await self._cleanup(str(audio))
 
     async def _check_scene(self) -> None:
         current = await self._call("GetCurrentProgramScene", {})
@@ -181,14 +194,14 @@ class ObsStage:
 
     async def _cleanup(self, file: str) -> None:
         with contextlib.suppress(Exception):
+            await self._caption("")
+        with contextlib.suppress(Exception):
             settings = (await self._input(self.program.audio))["inputSettings"]
             if settings.get("local_file") == file:
                 await self._call("TriggerMediaInputAction", {
                     "inputName": self.program.audio, "mediaAction": "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP",
                 })
                 await self._set(self.program.audio, {"local_file": ""})
-        with contextlib.suppress(Exception):
-            await self._caption("")
         if self._mouth:
             with contextlib.suppress(Exception):
                 await self._mouth(0.0)
