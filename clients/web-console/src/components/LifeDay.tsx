@@ -3,12 +3,19 @@ import { formatInZone } from './LifeTimeline';
 
 const KIND: Record<string, string> = {
   writing: '写作',
+  write: '写作',
   reading: '读书',
+  read: '读书',
   resting: '休息',
+  rest: '休息',
   walking: '散步',
+  walk: '散步',
   thinking: '想事情',
   working: '工作',
+  work: '工作',
   eating: '吃饭',
+  meal: '吃饭',
+  sleep: '睡觉',
   listening: '听音乐',
 };
 
@@ -64,14 +71,16 @@ export function LifeIllustration({ active }: { active: boolean }) {
 interface LifeDayProps {
   activity: ActivityResponse | null;
   timeline: LifeTimelineOut | null;
+  timelineFailed?: boolean;
 }
 
 /** 同一份时间轴的阅读视图；完整层级、事实和诊断仍交给 LifeTimeline。 */
-export function LifeDay({ activity, timeline }: LifeDayProps) {
+export function LifeDay({ activity, timeline, timelineFailed = false }: LifeDayProps) {
   const current = activity?.current?.state === 'running' ? activity.current : null;
   const future = timeline ? futureSegments(timeline) : [];
-  const facts = timeline?.facts.filter((fact) => fact.state === 'completed' && fact.evidence_kind !== 'clock_only') ?? [];
-  const factTitles = facts.map((fact) => timeline?.segments.find((segment) => segment.segment_id === fact.activity_id)?.title ?? '一段日常');
+  const facts = timeline?.facts.filter((fact) => fact.state === 'completed'
+    && (fact.evidence_kind === 'observed' || fact.evidence_kind === 'user_confirmed')) ?? [];
+  const activityById = new Map(activity?.history.map((item) => [item.activity_id, item]));
   const intents = timeline?.intents ?? [];
 
   return (
@@ -80,7 +89,7 @@ export function LifeDay({ activity, timeline }: LifeDayProps) {
         <div className="life-hero__copy">
           <div className="life-hero__eyebrow"><span className="life-hero__dot" />此刻的她</div>
           <h1>{current ? `正在${activityKind(current.kind)}` : '这一刻，还没有她的消息'}</h1>
-          <p>{current ? current.note : '她这会儿在做什么，我还不知道。'}</p>
+          {current?.note ? <p>{current.note}</p> : null}
           <div className="life-hero__meta">
             {current?.started_at && timeline ? <span>从 {formatInZone(current.started_at, timeline.display_timezone)} 开始</span> : null}
             {current?.origin === 'simulated' ? <span>模拟日常</span> : null}
@@ -104,15 +113,28 @@ export function LifeDay({ activity, timeline }: LifeDayProps) {
               </li>
             ))}
           </ol>
+        ) : timelineFailed || timeline?.state === 'unavailable' ? (
+          <p className="life-day-empty">暂时读不到今天的安排。</p>
         ) : timeline ? (
           <p className="life-day-empty" data-testid="life-day-empty">
             {timeline.state === 'empty' ? '今天还没有排日程。' : timeline.segments.length ? '今天的安排里，没有接下来的时段。' : '今天的安排还没有展开。'}
           </p>
         ) : <p className="life-day-empty">今天的安排正在读取。</p>}
-        {factTitles.length ? (
+        {timeline && facts.length ? (
           <div className="life-happened" data-testid="life-happened">
             <h3>今天留下的片段</h3>
-            <p>{factTitles.slice(0, 3).join(' · ')}</p>
+            <ul>
+              {facts.slice(-3).reverse().map((fact) => {
+                const record = activityById.get(fact.activity_id);
+                const timestamp = fact.ended_at ?? fact.started_at;
+                return (
+                  <li key={fact.activity_id}>
+                    {timestamp ? <time>{formatInZone(timestamp, timeline.display_timezone)} · </time> : null}
+                    {record ? activityKind(record.kind) : '活动已结束'}
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         ) : null}
       </section>

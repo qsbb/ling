@@ -39,7 +39,7 @@ describe('生活首屏', () => {
 
   it('只有 running 才展示明确活动，非事实计划仍留在今天', () => {
     const activity: ActivityResponse = { current: {
-      activity_id: 'a', kind: 'reading', state: 'running', origin: 'simulated',
+      activity_id: 'a', kind: 'read', state: 'running', origin: 'simulated',
       started_at: '2026-11-08T00:05:00Z', ended_at: null, completion_evidence: null, note: '窗边有点风。',
     }, history: [], note: '' };
     const html = renderToStaticMarkup(h(LifeDay, { activity, timeline: TIMELINE }));
@@ -49,6 +49,28 @@ describe('生活首屏', () => {
     expect(html.indexOf('life-presence')).toBeLessThan(html.indexOf('life-today-title'));
     expect(html).toContain('<strong>读一会儿书</strong>');
     expect(activityKind('writing')).toBe('写作');
+  });
+
+  it('已发生的片段只匹配同一个活动，并排除时钟推演', () => {
+    const observed = {
+      schema_version: 'v1', activity_id: 'act-observed', origin: 'tool_receipt',
+      state: 'completed', evidence_kind: 'observed', scene_valid_until: null,
+      started_at: '2026-11-08T00:01:00Z', ended_at: '2026-11-08T00:05:00Z', place_id: null,
+    };
+    const completed = {
+      activity_id: observed.activity_id, kind: 'write', state: 'completed', origin: 'tool_receipt',
+      started_at: observed.started_at, ended_at: observed.ended_at, completion_evidence: '已保存',
+    };
+    const html = renderToStaticMarkup(h(LifeDay, {
+      activity: {
+        current: null, note: '',
+        history: [completed, { ...completed, activity_id: 'act-clock', kind: 'sleep', origin: 'simulated' }],
+      },
+      timeline: { ...TIMELINE, facts: [observed, { ...observed, activity_id: 'act-clock', evidence_kind: 'clock_only' }] },
+    }));
+    expect(html).toContain('今天留下的片段');
+    expect(html).toContain('08:05 · </time>写作');
+    expect(html).not.toContain('睡觉');
   });
 
   it('今天排除父层、过期与非当前计划', () => {

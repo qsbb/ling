@@ -583,8 +583,14 @@ async function assertNoHorizontalOverflow(
       if (skip(ctx)) return;
       const page = await openRoute('/life?from=test', { width: 375, height: 667 }, 'life-presence');
       expect(await page.locator('[data-testid="life-full-schedule"]').getAttribute('open')).toBeNull();
+      expect(await page.getByRole('heading', { name: '主动联系' }).isVisible()).toBe(false);
       await page.screenshot({ path: '/tmp/ling-life-now-mobile.png', fullPage: true });
       await assertNoHorizontalOverflow(page, 'life 375 默认首屏', ['page']);
+      await page.getByText('更多生活记录', { exact: true }).click();
+      await page.getByRole('heading', { name: '活动记录', exact: true }).waitFor();
+      await page.getByRole('heading', { name: '主动联系', exact: true }).waitFor();
+      await page.getByRole('heading', { name: '目标', exact: true }).waitFor();
+      await assertNoHorizontalOverflow(page, 'life 375 更多记录', ['page']);
       await page.getByRole('button', { name: '生活节奏' }).click();
       await page.getByRole('heading', { name: '生活与活动', exact: true }).waitFor();
       const rhythm = new URL(page.url());
@@ -628,6 +634,7 @@ async function assertNoHorizontalOverflow(
       await expect.poll(() => page.locator('[data-testid="life-presence"]').innerText()).toContain('正在读书');
       await expect.poll(() => page.locator('[data-testid="life-presence"]').innerText()).toContain('窗边有点风。');
       await expect.poll(() => page.getByRole('alert').innerText()).toContain('timeline offline');
+      await page.getByText('暂时读不到今天的安排。', { exact: true }).waitFor();
     },
     TIMEOUT,
   );
