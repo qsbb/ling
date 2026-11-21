@@ -503,7 +503,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(window_policy_routes.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
-    from ling.api.routes import memory_import, transcriptions
+    from ling.api.routes import live, memory_import, transcriptions
+    app.include_router(live.router, prefix="/v1")
     app.include_router(memory_import.router, prefix="/v1")
     app.include_router(transcriptions.router, prefix="/v1")
     # 主动撤回自己发的消息（破坏性动作，独立路由与独立授权边界）

@@ -402,6 +402,16 @@ def handler(topic: str) -> Callable[[Handler], Handler]:
     return register
 
 
+@handler("livestream.speech")
+async def handle_livestream_speech(payload: dict) -> None:
+    from ling.domains.live.speech import build_speech
+
+    await build_speech(
+        get_settings(), _MEMORY_ROUTER,
+        session_id=payload["session_id"], speech_id=payload["speech_id"],
+    )
+
+
 async def wait_for_schema(*, attempts: int = 60, interval: float = 2.0) -> bool:
     """等 schema 就绪。
 

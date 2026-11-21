@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import hmac
+from datetime import datetime
+from typing import Annotated, Literal
+
+from connectors.inbound_access import parse_source_ips, source_allowed
+from fastapi import Request
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ling.api.errors import LingError, not_found
+from ling.contracts.v1 import ErrorCode
+from ling.infra.models import ConnectorInstance
+from ling.infra.security import hash_token
+from ling.settings.connector_instances import (
+    ConnectorInstanceError,
+    ConnectorInstanceService,
+    normalize_instance_id,
+)
+
+CUSTOM_SCOPE = "custom_http"
+Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+
+
+class CustomConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    display_name: str = Field(min_length=1, max_length=64)
+    room_id: Identifier
+    enabled: bool = True
+    source_ips: str = Field(default="", max_length=4096)
+    token: SecretStr | None = None
+    signing_secret: SecretStr | None = None
+    stage_token: SecretStr | None = None
+    public_topic: str = Field(default="", max_length=400)
+    max_minutes: int = Field(default=30, ge=1, le=240)
+    obs_control: bool = False
+
+
+class Sender(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Identifier | None = None
+    name: str | None = Field(default=None, max_length=128)
+
+
+class CustomEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    event_id: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    kind: Literal["comment", "entrance", "like", "gift", "live_start", "live_end"]
+    room_id: Identifier
+    occurred_at: AwareDatetime
+    session_id: str | None = Field(default=None, max_length=64)
+    sender: Sender | None = None
+    text: str = Field(default="", max_length=500)
+
+
+def account_namespace(instance_id: str) -> str:
+    return f"custom-http.{instance_id}"
+
+
+def custom_view(row: ConnectorInstance) -> dict:
+    settings = row.custom_config or {}
+    return {
+        "id": row.instance_id,
+        "display_name": row.display_name,
+        "enabled": row.enabled,
+        "feature": settings.get("feature"),
+        "account_prefix": account_namespace(row.instance_id),
+        "event_path": f"/v1/custom/{row.instance_id}/events",
+        "room_id": settings.get("room_id"),
+        "source_ips": settings.get("source_ips", ""),
+        "token_set": bool(settings.get("token_hash")),
+        "signing_secret_set": bool(settings.get("signing_secret")),
+        "stage_token_set": bool(settings.get("stage_token_hash")),
+        "public_topic": settings.get("public_topic", ""),
+        "max_minutes": settings.get("max_minutes", 30),
+        "obs_control": settings.get("obs_control", False),
+        "last_received_at": settings.get("last_received_at"),
+    }
+
+
+async def require_custom(
+    session: AsyncSession, instance_id: str, *, lock: bool = False,
+) -> ConnectorInstance:
+    row = await session.get(
+        ConnectorInstance, (CUSTOM_SCOPE, instance_id),
+        with_for_update=lock, populate_existing=lock,
+    )
+    if row is None or row.deleted_at is not None:
+        raise not_found("自定义接入器不存在")
+    return row
+
+
+async def configure_custom(
+    session: AsyncSession,
+    request: Request,
+    instance_id: str,
+    config: CustomConfig,
+    *,
+    created_by: str,
+    feature: str | None = None,
+) -> ConnectorInstance:
+    instance_id = normalize_instance_id(instance_id)
+    try:
+        parse_source_ips(config.source_ips)
+    except ValueError as exc:
+        raise LingError(ErrorCode.invalid_request, "来源白名单需填写 IP 地址", status_code=422) from exc
+    service = ConnectorInstanceService(session)
+    # Serialize manual configuration and feature registration for the same key.
+    from sqlalchemy import func, select
+
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"custom:{instance_id}"))))
+    row = await session.get(ConnectorInstance, (CUSTOM_SCOPE, instance_id), with_for_update=True)
+    old = (row.custom_config or {}) if row else {}
+    if row and feature and old.get("feature") != feature:
+        raise LingError(ErrorCode.conflict, "接入器前缀已被其他配置占用", status_code=409)
+    if row and (old.get("room_id") != config.room_id):
+        raise LingError(ErrorCode.conflict, "房间已绑定，请为新房间创建接入器", status_code=409)
+    from ling.domains.live.room import active_session
+
+    active = await active_session(session, request.app.state.settings.actor_id, lock=True)
+    if active and active.connector_id == instance_id:
+        if config.enabled:
+            raise LingError(ErrorCode.conflict, "请结束当前直播后修改配置", status_code=409)
+        active.state = "stopping"
+    try:
+        if row is None:
+            row = await service.create(
+                scope=CUSTOM_SCOPE, instance_id=instance_id, display_name=config.display_name,
+                enabled=config.enabled, created_by=created_by,
+            )
+        elif row.display_name != config.display_name:
+            row = await service.rename(
+                scope=CUSTOM_SCOPE, instance_id=instance_id, display_name=config.display_name,
+            )
+    except ConnectorInstanceError as exc:
+        code = ErrorCode.conflict if exc.status_code == 409 else ErrorCode.invalid_request
+        raise LingError(code, exc.message, status_code=exc.status_code) from exc
+
+    settings = dict(old)
+    settings.update(config.model_dump(exclude={
+        "token", "signing_secret", "stage_token", "display_name", "enabled",
+    }))
+    if feature:
+        settings["feature"] = feature
+    for key, value in (("token_hash", config.token), ("stage_token_hash", config.stage_token)):
+        if value is not None:
+            secret = value.get_secret_value()
+            if secret and not 16 <= len(secret) <= 256:
+                raise LingError(ErrorCode.invalid_request, "令牌应为 16 到 256 个字符", status_code=422)
+            settings[key] = hash_token(secret) if secret else ""
+    if config.signing_secret is not None:
+        secret = config.signing_secret.get_secret_value()
+        settings["signing_secret"] = request.app.state.secret_box.encrypt(secret) if secret else ""
+    # Keep the stage credential usable for cleanup while stopping.
+    if active and active.connector_id == instance_id:
+        settings["stage_token_hash"] = old.get("stage_token_hash", "")
+    row.custom_config = settings
+    row.enabled = config.enabled
+    await session.flush()
+    return row
+
+
+def _bearer_matches(request: Request, expected: str) -> bool:
+    scheme, _, value = request.headers.get("Authorization", "").partition(" ")
+    return bool(
+        expected and scheme.lower() == "bearer"
+        and hmac.compare_digest(hash_token(value.strip()), expected)
+    )
+
+
+def require_stage(request: Request, settings: dict) -> None:
+    if not _bearer_matches(request, settings.get("stage_token_hash", "")):
+        raise LingError(ErrorCode.forbidden, "舞台端令牌校验失败", status_code=403)
+
+
+def require_ingress(request: Request, config: ConnectorInstance, body: bytes) -> None:
+    settings = config.custom_config or {}
+    token = settings.get("token_hash", "")
+    signature = settings.get("signing_secret", "")
+    allowed = source_allowed(
+        request.client.host if request.client else None,
+        request.headers, has_credential=bool(token or signature),
+        allowed_ips=settings.get("source_ips", ""),
+    )
+    if token:
+        allowed = allowed and _bearer_matches(request, token)
+    if signature and allowed:
+        secret = request.app.state.secret_box.decrypt(signature).encode()
+        digest = "sha256=" + hmac.digest(secret, body, "sha256").hex()
+        given = request.headers.get("X-Ling-Signature", "").encode()
+        allowed = hmac.compare_digest(given, digest.encode())
+    if not allowed:
+        raise LingError(ErrorCode.forbidden, "接入器来源或凭据校验失败", status_code=403)
+    if not config.enabled:
+        raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
+
+
+def event_is_fresh(event: CustomEvent, now: datetime, *, max_age: float = 30) -> bool:
+    return -5 <= (now - event.occurred_at).total_seconds() <= max_age

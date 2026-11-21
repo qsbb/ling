@@ -735,7 +735,8 @@ class ConnectorInstance(Base):
             "scope", "display_name", name="uq_connector_instance_display_name"
         ),
         CheckConstraint(
-            "scope IN ('onebot', 'qqbot', 'access')", name="ck_connector_instance_scope"
+            "scope IN ('onebot', 'qqbot', 'access', 'custom_http')",
+            name="ck_connector_instance_scope",
         ),
         Index("ix_connector_instance_scope_deleted", "scope", "deleted_at"),
     )
@@ -750,6 +751,41 @@ class ConnectorInstance(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    custom_config: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+
+
+class LiveSessionRow(Base):
+    """One bounded, stage-owned broadcast run."""
+
+    __tablename__ = "live_sessions"
+    __table_args__ = (
+        Index(
+            "uq_live_session_active_actor", "actor_id", unique=True,
+            postgresql_where=text("state IN ('preview', 'starting', 'live', 'stopping')"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    connector_id: Mapped[str] = mapped_column(String(16))
+    room_id: Mapped[str] = mapped_column(String(128))
+    window_id: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    runtime: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class LiveViewerRow(Base):
+    """An explicitly saved, room-scoped public note."""
+
+    __tablename__ = "live_viewers"
+
+    connector_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    room_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_ref: Mapped[str] = mapped_column(String(128), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(128))
+    note: Mapped[str] = mapped_column(Text)
 
 
 class ConnectorConfigRevision(Base):
