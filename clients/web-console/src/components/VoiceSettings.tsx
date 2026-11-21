@@ -370,9 +370,6 @@ export function VoiceSettings({
                   onChange={(event) => patch('emotion', event.target.value)}
                 />
               </span>
-              <span className="memory-form__hint">
-                留空就不发这一项。猜一个情绪会让语音听起来莫名其妙，所以这里不预填。
-              </span>
               <FieldError message={issueFor(issues, 'emotion')} testid="voice-error-emotion" />
             </label>
           </div>

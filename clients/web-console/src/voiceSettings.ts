@@ -278,10 +278,8 @@ export function voicePayloadFrom(draft: VoiceDraft): Record<string, unknown> {
     } else if (field === 'pitch') {
       payload.pitch = Math.round(numberOr(draft.pitch, 0));
     } else if (field === 'emotion') {
-      // 留空**不发这一项**（不是发空串）：后端把空串和"没填"当同一件事，
-      // 但发空串会在审计里留下一次没有意义的"改了 emotion"。
-      const emotion = draft.emotion.trim();
-      if (emotion !== '') payload.emotion = emotion;
+      // 配置按字段合并。用空串清除旧值，省略字段会保留旧值。
+      payload.emotion = draft.emotion.trim();
     }
   }
   return payload;

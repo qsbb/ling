@@ -192,9 +192,9 @@ describe('请求体：只发这一家拥有的字段', () => {
     expect(voicePayloadFrom({ ...MINIMAX_FILLED, kind: null })).toEqual({ kind: null });
   });
 
-  it('emotion 留空就不发这一项（不猜情绪），不是发空串', () => {
+  it('emotion 留空时明确清除已保存的情绪', () => {
     const payload = voicePayloadFrom({ ...MINIMAX_FILLED, emotion: '  ' });
-    expect(payload).not.toHaveProperty('emotion');
+    expect(payload.emotion).toBe('');
   });
 
   it('数字清空时回落默认值；pitch 取整', () => {
