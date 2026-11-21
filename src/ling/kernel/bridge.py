@@ -231,6 +231,18 @@ class BridgeResult:
     # parts_sent < parts_total 表示**部分送达**，不能对外说"发出去了"。
     parts_total: int = 0
     parts_sent: int = 0
+    delivery_uncertain: bool = False
+
+
+@dataclass(frozen=True)
+class ReplyDelivery:
+    parts_sent: int
+    parts_total: int
+    uncertain: bool = False
+
+    @property
+    def delivered(self) -> bool:
+        return self.parts_total > 0 and self.parts_sent == self.parts_total
 
 
 @dataclass
@@ -297,16 +309,16 @@ def describe_no_text(result: TurnResult) -> str:
     return f"轮次结束但没有可交付文本（state={state}）"
 
 
-def describe_delivery(delivered: bool, *, parts_sent: int, parts_total: int) -> str:
+def describe_delivery(delivery: ReplyDelivery) -> str:
     """投递结果按收到的回执统计。缺少回执时保留送达结果的不确定性。"""
-    if delivered:
+    if delivery.delivered:
         return "已回复"
-    if parts_total <= 0:
-        # 一段都没规划出来：正文非空却切不出段，属于上游 bug，别声称发过
-        return "已回复（未规划出可发送的段）"
-    if parts_sent <= 0:
-        return f"未确认送达（0/{parts_total} 段）"
-    return f"部分确认送达（{parts_sent}/{parts_total} 段）"
+    if delivery.parts_total == 0:
+        return "未规划出可发送的段"
+    if delivery.parts_sent > 0:
+        return f"部分确认送达（{delivery.parts_sent}/{delivery.parts_total} 段）"
+    status = "未确认送达" if delivery.uncertain else "未送达"
+    return f"{status}（0/{delivery.parts_total} 段）"
 
 
 def describe_timeout(result: TurnResult) -> str:
@@ -973,7 +985,7 @@ class InboundBridge:
             )
 
         # 6) 投递（分段顺序发，每段独立 Operation 与回执，可对账）
-        delivered, parts_sent, parts_total = await self._deliver(
+        delivery = await self._deliver(
             envelope=envelope,
             text=reply_text,
             subject_id=subject_id,
@@ -981,6 +993,7 @@ class InboundBridge:
             # 段级幂等键由本轮 turn 派生（重投复用同一个 turn）
             turn_id=turn.id,
         )
+        delivered = delivery.delivered
         if turn_result.quote_dropped:
             emit_event(
                 logger,
@@ -1002,8 +1015,8 @@ class InboundBridge:
                 "outcome": "delivered" if delivered else "partial_delivery",
                 "turn_state": str(turn_result.state),
                 "is_group": is_group,
-                "parts_total": parts_total,
-                "parts_sent": parts_sent,
+                "parts_total": delivery.parts_total,
+                "parts_sent": delivery.parts_sent,
             },
         )
         # 「回了」只能在**真的发出去**之后说。
@@ -1012,7 +1025,7 @@ class InboundBridge:
         # 全失败时行为日志成了「想回但没发出去（已回复）」——同一行里自相
         # 矛盾，运维读到的是"她说回了"，而对方一个字都没收到。逐段发出的
         # 情况则必须说清楚发了几段，否则"她只说了半句"永远查不出来。
-        reason = describe_delivery(delivered, parts_sent=parts_sent, parts_total=parts_total)
+        reason = describe_delivery(delivery)
         handled_as = "replied" if delivered else "failed"
         if not delivered:
             # 消息处置结果按**投递事实**改写：`turn._finalize` 记的是"生成了
@@ -1033,8 +1046,9 @@ class InboundBridge:
             media_evidence_ids=media_ids,
             media_note=media_note,
             handled_as=handled_as,
-            parts_total=parts_total,
-            parts_sent=parts_sent,
+            parts_total=delivery.parts_total,
+            parts_sent=delivery.parts_sent,
+            delivery_uncertain=delivery.uncertain,
         )
 
     # ------------------------------------------------------------ 内部
@@ -1175,14 +1189,15 @@ class InboundBridge:
         """重投时只**续发剩下的段**（已发段由段级幂等跳过）。"""
         from ling.domains.conversation.service import ConversationService
 
-        delivered, parts_sent, parts_total = await self._deliver(
+        delivery = await self._deliver(
             envelope=envelope,
             text=text,
             subject_id=subject_id,
             expression={},
             turn_id=turn.id,
         )
-        reason = describe_delivery(delivered, parts_sent=parts_sent, parts_total=parts_total)
+        delivered = delivery.delivered
+        reason = describe_delivery(delivery)
         emit_event(
             logger,
             logging.INFO if delivered else logging.WARNING,
@@ -1192,8 +1207,8 @@ class InboundBridge:
                 "turn_id": turn.id,
                 "outcome": "resumed" if delivered else "partial_delivery",
                 "resumed": True,
-                "parts_total": parts_total,
-                "parts_sent": parts_sent,
+                "parts_total": delivery.parts_total,
+                "parts_sent": delivery.parts_sent,
                 "is_group": is_group,
             },
         )
@@ -1217,8 +1232,9 @@ class InboundBridge:
             media_evidence_ids=media_ids,
             media_note=media_note,
             handled_as="replied" if delivered else "failed",
-            parts_total=parts_total,
-            parts_sent=parts_sent,
+            parts_total=delivery.parts_total,
+            parts_sent=delivery.parts_sent,
+            delivery_uncertain=delivery.uncertain,
         )
 
     # ------------------------------------------------------------ 超时收尾
@@ -1917,8 +1933,8 @@ class InboundBridge:
         # 原实现用的是 `plan_{uuid4()}`，重投必然拿到新 plan_id，幂等直接失效，
         # 那正是"重投必然重发第 1 段"的根因（调研 §5 P0-1）。
         turn_id: str | None = None,
-    ) -> tuple[bool, int, int]:
-        """把一条回复按语义分段顺序投递。返回 (是否全部送达, 已发段数, 总段数)。
+    ) -> ReplyDelivery:
+        """按顺序投递回复，返回确认的段数及是否仍有待确认的投递。
 
         **每段只在上一段拿到真实回执之后才发**——这就是"不是一次全倒出去"。
 
@@ -1970,7 +1986,7 @@ class InboundBridge:
 
                     await record_voice_reply(self._session, voice_message)
                     await self._session.commit()
-                    return False, 0, 1
+                    return ReplyDelivery(parts_sent=0, parts_total=1)
                 delivered = await VoiceReplyService(
                     self._session,
                     settings=self._settings or get_settings(),
@@ -1982,7 +1998,11 @@ class InboundBridge:
                     is_group=is_group,
                 )
                 await self._session.commit()
-                return delivered, int(delivered), 1
+                return ReplyDelivery(
+                    parts_sent=int(delivered),
+                    parts_total=1,
+                    uncertain=voice_message.speech_delivery_state == "uncertain",
+                )
         # 渠道硬上限：能拿到就用，拿不到让 `plan_parts` 用保守兜底。
         # 不传这个值就等于"假设渠道没有上限"——正是尾段被整条拒收的成因。
         caps = getattr(self._connector, "capabilities", None)
@@ -1992,7 +2012,7 @@ class InboundBridge:
                 limit = int(caps().max_text_length) or None
         parts = plan_parts(text, is_group=is_group, max_part_chars=limit)
         if not parts:
-            return (False, 0, 0)
+            return ReplyDelivery(parts_sent=0, parts_total=0)
 
         # **确定性** plan_id：同一轮重投必须落回同一组段键。
         plan_id = f"plan_{turn_id}" if turn_id else f"plan_{uuid.uuid4().hex[:16]}"
@@ -2009,6 +2029,7 @@ class InboundBridge:
         sent = 0
         skipped = 0
         attempted = 0
+        uncertain = False
         for index, part in enumerate(parts, 1):
             payload_extra = {
                 "reply_plan": plan_id,
@@ -2050,6 +2071,7 @@ class InboundBridge:
                     continue
                 # uncertain / 运行中：**绝不重发**（重发就是重复消息）。
                 # 后面的段也不能抢跑：顺序错乱比少一段更难解释。
+                uncertain = True
                 emit_event(
                     logger,
                     logging.WARNING,
@@ -2070,20 +2092,23 @@ class InboundBridge:
                 if outcome.state is OperationState.uncertain and outcome.operation_id:
                     # 不确定 → **立刻对一次账**（有 id 走 get_msg，没 id 走历史比对）。
                     # 查到就继续；查不到就保持 uncertain 交给周期对账，**不重发**。
-                    reconciled = await service.reconcile(
+                    outcome = await service.reconcile(
                         self._connector, outcome.operation_id  # type: ignore[arg-type]
                     )
                     await self._session.commit()
-                    if reconciled.state is OperationState.succeeded:
+                    if outcome.state is OperationState.succeeded:
                         sent += 1
                         continue
+                uncertain = outcome.state is OperationState.uncertain
                 # 「为什么没送达」的唯一权威记录：状态、错误码、第几段。
                 # 不记正文——投递失败不代表可以把内容抄进日志。
                 emit_event(
                     logger,
                     logging.WARNING,
                     event_name="delivery_failed",
-                    message="这一段没送达，停止后续段",
+                    message=(
+                        "这一段未确认送达，停止后续段" if uncertain else "这一段没送达，停止后续段"
+                    ),
                     attributes={
                         "channel": getattr(self._connector, "connector_id", ""),
                         "delivery_state": str(getattr(outcome, "state", "")),
@@ -2124,7 +2149,7 @@ class InboundBridge:
                 },
             )
 
-        return (sent == len(parts), sent, len(parts))
+        return ReplyDelivery(parts_sent=sent, parts_total=len(parts), uncertain=uncertain)
 
 
 __all__ = ["BridgeResult", "InboundBridge"]

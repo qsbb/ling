@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -508,8 +509,6 @@ def _install_voice_runtime(
     model: _VoiceModelEndpoint,
     tts: _VoiceTtsEndpoint,
 ) -> None:
-    import httpx
-
     import ling.worker as worker_module
     from ling.models import minimax_tts, openai_compatible
     from ling.models.registry import ProviderRegistry
@@ -1077,9 +1076,23 @@ async def test_cancelled_persisted_synthesis_is_uncertain_and_not_retried(
     assert canonical not in ordinary.text
 
 
-async def test_onebot_http_reply_delivers_one_record_without_canonical_text(
+@pytest.mark.parametrize(
+    ("platform_result", "delivery_state", "reason", "summary"),
+    [
+        ("confirmed", "delivered", "已回复", "已回复"),
+        ("missing_id", "uncertain", "未确认送达（0/1 段）", "决定回复，未确认送达"),
+        ("rejected", "failed", "未送达（0/1 段）", "决定回复，未送达"),
+    ],
+    ids=["confirmed", "missing-id", "rejected"],
+)
+async def test_onebot_http_reply_sends_one_record_and_reports_platform_result(
     logged_in: TestEnv,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    platform_result: str,
+    delivery_state: str,
+    reason: str,
+    summary: str,
 ) -> None:
     env = logged_in
     canonical = "OneBot 直回只发送一条语音。"
@@ -1107,15 +1120,31 @@ async def test_onebot_http_reply_delivers_one_record_without_canonical_text(
                 source_duration_seconds=0.1,
             )
 
+    class _ReplyPlatform(FakeOneBot):
+        async def handler(self, request: httpx.Request) -> httpx.Response:
+            response = await super().handler(request)
+            if platform_result == "missing_id" and request.url.path == "/send_private_msg":
+                return httpx.Response(200, json={"status": "ok", "retcode": 0, "data": {}})
+            return response
+
     monkeypatch.setattr(onebot_voice, "default_codec", _FixtureSilkCodec)
-    platform = FakeOneBot()
+    platform = _ReplyPlatform(fail_after=1 if platform_result == "rejected" else None)
     _install(env, platform)
     await _bind(env)
 
-    response = await _post(env, _event_body())
+    with caplog.at_level(logging.INFO, logger="ling.behavior"):
+        response = await _post(env, _event_body())
     assert response.status_code == 200, response.text
-    assert response.json()["accepted"] is True, response.text
-    assert response.json()["delivered"] is True, response.text
+    body = response.json()
+    assert body["accepted"] is True, body
+    assert body["delivered"] is (delivery_state == "delivered"), body
+    assert body["reason"] == reason, body
+    record, = [
+        entry for entry in caplog.records
+        if entry.name == "ling.behavior"
+        and getattr(entry, "event_name", None) == "inbound_received"
+    ]
+    assert record.getMessage().endswith(f" · {summary}")
     assert len(tts.calls) == 1
     assert len(platform.sent) == 1, platform.sent
     delivery = platform.sent[0]
@@ -1145,6 +1174,7 @@ async def test_onebot_http_reply_delivers_one_record_without_canonical_text(
         assert message.text == canonical
         assert message.output_modality == "voice"
         assert message.speech_state == "ready"
+        assert message.speech_delivery_state == delivery_state
         assert message.audio_asset_id
 
     ordinary = await env.client.get(f"/v1/sessions/{window.id}/messages")

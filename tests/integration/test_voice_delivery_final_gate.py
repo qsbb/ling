@@ -9,6 +9,7 @@ import pytest
 
 from ling.infra.db import session_scope
 from ling.infra.models import Message, Turn, Window
+from ling.kernel.bridge import InboundBridge, ReplyDelivery
 
 pytestmark = pytest.mark.w0_web
 
@@ -39,7 +40,7 @@ async def _deliver_voice(
     turn_state: str = "completed",
     archived: bool = False,
     newer_user_message: bool = False,
-) -> tuple[tuple[bool, int, int], Message]:
+) -> tuple[ReplyDelivery, Message]:
     from ling.capabilities import voice_reply as voice_reply_module
 
     _DeliveryProbe.calls = []
@@ -100,8 +101,6 @@ async def _deliver_voice(
             )
             await session.flush()
 
-        from ling.kernel.bridge import InboundBridge
-
         bridge = InboundBridge(
             session,
             coordinator=object(),
@@ -125,7 +124,7 @@ async def test_completed_current_turn_reaches_voice_delivery(
 ) -> None:
     result, message = await _deliver_voice(web_env, monkeypatch)
 
-    assert result == (True, 1, 1)
+    assert result == ReplyDelivery(parts_sent=1, parts_total=1)
     assert _DeliveryProbe.calls == [(message.id, "voice_gate_subject", False)]
 
 
@@ -145,6 +144,6 @@ async def test_stale_voice_turn_is_cancelled_before_delivery(
     }[case]
     result, message = await _deliver_voice(web_env, monkeypatch, **options)
 
-    assert result == (False, 0, 1)
+    assert result == ReplyDelivery(parts_sent=0, parts_total=1)
     assert _DeliveryProbe.calls == []
     assert message.speech_delivery_state == "cancelled"

@@ -545,6 +545,8 @@ def _log_inbound_behavior(
         outcome, status = "partial_delivery", f"部分送达（{result.parts_sent}/{result.parts_total}）"
     elif result.delivered:
         outcome, status = "delivered", "已回复"
+    elif result.delivery_uncertain:
+        outcome, status = "reply_delivery_uncertain", "决定回复，未确认送达"
     elif result.decision == "reply" or result.reply_text:
         outcome, status = "reply_not_delivered", "决定回复，未送达"
     elif result.decision == "deferred_attention":

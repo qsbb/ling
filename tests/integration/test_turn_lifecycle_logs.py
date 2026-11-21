@@ -112,13 +112,13 @@ async def test_delivery_failure_is_explained_by_logs(web_env, caplog) -> None:
             {"window_ref": "fake:private:10001", "connector_instance": "fake"},
         )()
         with caplog.at_level(logging.WARNING, logger="ling.kernel.bridge"):
-            delivered, sent, total = await bridge._deliver(  # noqa: SLF001
+            delivery = await bridge._deliver(  # noqa: SLF001
                 envelope=envelope, text="一二三四五。六七八九十。", subject_id="subj_x"
             )
 
-    assert delivered is False
-    assert sent == 0
-    assert total >= 1
+    assert delivery.delivered is False
+    assert delivery.parts_sent == 0
+    assert delivery.parts_total >= 1
 
     events = _events(caplog, "delivery_failed")
     assert events, [r.getMessage() for r in caplog.records]

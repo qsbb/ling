@@ -159,12 +159,13 @@ async def _deliver_via_bridge(env: TestEnv, connector: object, *, text: str, win
         chunking.PART_DELAY_SECONDS = 0.0
         async with session_scope() as session:
             bridge._session = session  # noqa: SLF001 - 单测里替换协作者
-            return await asyncio.wait_for(
+            delivery = await asyncio.wait_for(
                 bridge._deliver(  # noqa: SLF001
                     envelope=envelope, text=text, subject_id="subject_a7"
                 ),
                 timeout=60,
             )
+            return delivery.delivered, delivery.parts_sent, delivery.parts_total
     finally:
         import ling.capabilities.chunking as chunking
 

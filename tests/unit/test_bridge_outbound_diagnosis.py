@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from ling.kernel.bridge import TurnResult, describe_delivery, describe_no_text
+from ling.kernel.bridge import ReplyDelivery, TurnResult, describe_delivery, describe_no_text
 
 
 def test_suppressed_turn_says_it_was_suppressed() -> None:
@@ -65,25 +65,25 @@ def test_model_error_wording_is_unchanged(code: str) -> None:
 
 
 def test_all_parts_delivered_says_replied() -> None:
-    assert describe_delivery(True, parts_sent=3, parts_total=3) == "已回复"
+    assert describe_delivery(ReplyDelivery(parts_sent=3, parts_total=3)) == "已回复"
 
 
 def test_zero_parts_delivered_does_not_claim_replied() -> None:
     """一段都没发出去：以前这里写的是"已回复"，行为日志于是自相矛盾。"""
-    reason = describe_delivery(False, parts_sent=0, parts_total=3)
+    reason = describe_delivery(ReplyDelivery(parts_sent=0, parts_total=3))
     assert "已回复" not in reason
     assert "0/3" in reason
 
 
 def test_partial_delivery_reports_counts() -> None:
     """只发出去一部分：必须带 `1/3`，否则"她只说了半句"永远查不出来。"""
-    reason = describe_delivery(False, parts_sent=1, parts_total=3)
+    reason = describe_delivery(ReplyDelivery(parts_sent=1, parts_total=3))
     assert "1/3" in reason
     assert "已回复" not in reason
 
 
 def test_no_planned_parts_is_not_reported_as_failure() -> None:
     """正文非空却切不出段（上游 bug）：不谎称"发出去了"，也不谎称"对方没收到"。"""
-    reason = describe_delivery(False, parts_sent=0, parts_total=0)
+    reason = describe_delivery(ReplyDelivery(parts_sent=0, parts_total=0))
     assert "0/" not in reason
     assert "未规划" in reason
