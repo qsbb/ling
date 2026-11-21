@@ -107,6 +107,27 @@ async def _row_counts() -> list[int]:
         ]
 
 
+async def test_preview_distinguishes_native_astrbot_export(logged_in: TestEnv) -> None:
+    header = {
+        "record_type": "header", "format": "astrbot-memory-jsonl", "version": 1,
+        "plugin": "astrbot_plugin_memory_companion", "encoding": "utf-8",
+    }
+    record = {"record_type": "memory", "data": {"id": "example", "content": "测试记忆"}}
+    before = await _row_counts()
+    for format_, expected in (
+        ("astrbot-memory-jsonl", "astrbot_native_archive"),
+        ("other-memory-jsonl", "unsupported_archive"),
+    ):
+        data = ("\n".join(json.dumps(row) for row in ({**header, "format": format_}, record)) + "\n").encode()
+        response = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["detail"] == expected
+        if expected == "astrbot_native_archive":
+            assert "SQLite" in error["message"]
+    assert await _row_counts() == before
+
+
 async def test_converted_snapshot_reaches_library_and_private_recall(
     logged_in: TestEnv, tmp_path: Path,
 ) -> None:

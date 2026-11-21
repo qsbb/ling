@@ -4,14 +4,22 @@ Ling 接收 AstrBot Memory Companion 中本人和指定旧 Bot 的 QQ 私聊长�
 
 ## 生成迁移文件
 
-在 AstrBot 的 Memory Companion 插件数据目录找到 `memory_companion.db`，用 SQLite 的备份功能生成一份独立快照。需要两个原始 QQ 号，分别对应旧 Bot 和本人。在 Ling 仓库根目录运行以下命令，将示例 QQ 号换成自己的。
+`/mcomp data export` 生成的 `memory-companion-日期-时间.jsonl` 缺少原有效期、有效状态和归属 Bot 字段。Ling 需要从插件的 SQLite 备份取得这些字段。
+
+在 AstrBot 的 Memory Companion 插件数据目录找到 `memory_companion.db`，为独立备份选一个新文件名，然后用 SQLite 生成快照。
 
 ```bash
-python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db old-memories.jsonl \
+sqlite3 /path/to/memory_companion.db ".backup 'memory-companion-backup.db'"
+```
+
+在 Ling 仓库根目录运行转换命令。把备份路径、旧 Bot 的 QQ 和本人的 QQ 换成实际值。
+
+```bash
+python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db ling-memories.jsonl \
   --bot-qq 200300400 --owner-qq 100200300
 ```
 
-脚本只读备份和选中的私聊范围，生成一个 UTF-8 JSONL 文件。每份上限为 8 MiB、5000 条记录。上限不足时，用较小的 `--limit` 和输出提示中的 `--offset` 从同一份备份继续转换，逐份导入。原生 `/mcomp data export` 文件缺少部分有效性和归属字段，请从 SQLite 备份生成迁移文件。
+在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。每份上限为 8 MiB、5000 条记录。超过导入或服务端上传上限时，用较小的 `--limit` 和输出提示中的 `--offset` 从同一份备份继续转换，逐份导入。
 
 ## API
 
@@ -70,6 +78,7 @@ const result = await fetch('/v1/memory/import/commit', {
 | 409 | `preview_invalid` | 保留文件，重新预览 |
 | 409 | `qq_binding_required` | 引导核对自然人设置里的本人 QQ 绑定 |
 | 409 | `destination_unavailable`、`memory_purge_in_progress` | 显示服务端说明，恢复后重新预览 |
+| 422 | `astrbot_native_archive` | 引导使用 SQLite 备份生成迁移文件 |
 | 413 / 422 | `file_too_large`、`too_many_records`、`invalid_encoding`、`unsupported_archive`、`invalid_source_pair` | 保留错误反馈，允许换文件 |
 
 成功后刷新 `GET /v1/memory?view=library`。导入条目附带 `import_source`。其中 `source` 为 `astrbot_memory_companion`，其余字段有原记录 ID、原类型、平台、会话、QQ、发生时间、原创建和更新时间以及原有效期。详情可显示「来自 AstrBot」及原时间。摘要以旧经历保存，按模型总结处理。断言仍沿用 Ling 正常的纠正和撤回操作。私聊记忆受 Ling 现有的可见范围和保留策略约束。

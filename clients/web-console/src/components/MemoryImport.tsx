@@ -19,7 +19,7 @@
  *   文件错了才需要换文件，那是另一条路径。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { api, ApiError } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import type {
   MemoryImportCommit,
@@ -124,7 +124,13 @@ export function zeroAcceptedHint(
   };
 }
 
-/** 导入相关错误的用户可执行说法；认不出来的交回 explainError。 */
+const IMPORT_GUIDE_URL = 'https://github.com/qsbb/ling/blob/main/docs/ASTRBOT-MEMORY-IMPORT.md';
+type ImportError = ExplainedError & { status?: number };
+
+function explainImportError(cause: unknown): ImportError {
+  return { ...explainError(cause), status: cause instanceof ApiError ? cause.status : undefined };
+}
+
 export interface ImportErrorCopy {
   reason: string;
   hint: string;
@@ -134,7 +140,8 @@ export interface ImportErrorCopy {
   needsAnotherFile: boolean;
 }
 
-export function importErrorCopy(error: ExplainedError): ImportErrorCopy {
+/** 导入相关错误的用户可执行说法；认不出来的交回 explainError。 */
+export function importErrorCopy(error: ImportError): ImportErrorCopy {
   switch (error.detail) {
     case 'preview_invalid':
       return {
@@ -160,11 +167,28 @@ export function importErrorCopy(error: ExplainedError): ImportErrorCopy {
       return { reason: '文件超过 5000 条记录', hint: '用 --limit 与输出提示里的 --offset 分段导出。', needsRepreview: false, needsAnotherFile: true };
     case 'invalid_encoding':
       return { reason: '文件不是 UTF-8 编码', hint: '用导出脚本重新生成，不要手工另存。', needsRepreview: false, needsAnotherFile: true };
+    case 'astrbot_native_archive':
+      return {
+        reason: '这是 AstrBot 原生导出',
+        hint: '用插件的 SQLite 备份生成 Ling 迁移文件，再选择生成的 .jsonl。',
+        needsRepreview: false,
+        needsAnotherFile: true,
+      };
     case 'unsupported_archive':
       return { reason: '不是导出脚本生成的迁移文件', hint: '请选择转换脚本产出的 .jsonl。', needsRepreview: false, needsAnotherFile: true };
     case 'invalid_source_pair':
       return { reason: '旧 Bot 和你的 QQ 相同', hint: '导出时两个 QQ 号必须不同。', needsRepreview: false, needsAnotherFile: true };
+    case 'content_type_required':
+      return { reason: '上传格式不匹配', hint: '刷新页面后重新选择文件。', needsRepreview: false, needsAnotherFile: false };
     default:
+      if (error.status === 413) {
+        return {
+          reason: '文件超出服务端上传上限',
+          hint: '用较小的 --limit 分段生成迁移文件，再逐份导入。',
+          needsRepreview: false,
+          needsAnotherFile: true,
+        };
+      }
       return { reason: error.reason, hint: error.hint, needsRepreview: false, needsAnotherFile: false };
   }
 }
@@ -211,7 +235,7 @@ export interface MemoryImportPanelProps {
  */
 export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: MemoryImportPanelProps): React.ReactElement {
   const [step, setStep] = useState<ImportStep>({ name: 'pick' });
-  const [error, setError] = useState<ExplainedError | null>(null);
+  const [error, setError] = useState<ImportError | null>(null);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
@@ -237,7 +261,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
       if (!alive.current) return;
       // 失败时**保留文件**：回 pick 但记住 lastFile，让「重新预览」一步可用。
       setStep({ name: 'pick' });
-      setError(explainError(cause));
+      setError(explainImportError(cause));
     }
   }, []);
 
@@ -254,7 +278,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
     } catch (cause) {
       if (!alive.current) return;
       setStep({ name: 'preview', file, preview });
-      setError(explainError(cause));
+      setError(explainImportError(cause));
     }
   }, [onCommitted]);
 
@@ -295,7 +319,6 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
           copy={copy}
           retainedFile={lastFile.current}
           onRepreview={() => (lastFile.current ? void runPreview(lastFile.current) : reset())}
-          onReset={reset}
         />
       ) : null}
 
@@ -342,7 +365,6 @@ function PickStage({
   copy,
   retainedFile,
   onRepreview,
-  onReset,
 }: {
   dragging: boolean;
   busy: boolean;
@@ -353,7 +375,6 @@ function PickStage({
   copy: ImportErrorCopy | null;
   retainedFile: File | null;
   onRepreview: () => void;
-  onReset: () => void;
 }): React.ReactElement {
   return (
     <>
@@ -368,7 +389,7 @@ function PickStage({
         onDrop={(event) => {
           event.preventDefault();
           onDragState(false);
-          onPick(event.dataTransfer.files?.[0]);
+          if (!busy) onPick(event.dataTransfer.files?.[0]);
         }}
       >
         <input
@@ -378,7 +399,10 @@ function PickStage({
           aria-label="选择迁移文件"
           data-testid="import-file-input"
           disabled={busy}
-          onChange={(event) => onPick(event.target.files?.[0])}
+          onChange={(event) => {
+            onPick(event.currentTarget.files?.[0]);
+            event.currentTarget.value = '';
+          }}
         />
         <span className="import-drop__title">选择迁移文件</span>
         <span className="import-drop__meta">.jsonl，由导出脚本生成</span>
@@ -389,7 +413,14 @@ function PickStage({
           <AlertIcon size={14} />
           <div>
             <strong>{copy.reason}</strong>
-            {copy.hint ? <p>{copy.hint}</p> : null}
+            {copy.hint ? (
+              <p>
+                {copy.hint}
+                {copy.needsAnotherFile ? (
+                  <a href={IMPORT_GUIDE_URL} target="_blank" rel="noreferrer">迁移指南</a>
+                ) : null}
+              </p>
+            ) : null}
             {error.traceId ? <p className="import-error__trace">trace：{error.traceId}</p> : null}
           </div>
         </div>
@@ -399,14 +430,16 @@ function PickStage({
         <div className="import-retained" data-testid="import-retained">
           <div>
             <strong>{retainedFile.name}</strong>
-            <span>已选文件还在</span>
+            {copy?.needsAnotherFile ? null : <span>已选文件还在</span>}
           </div>
           <div className="import-retained__actions">
-            <button type="button" className="button button--small" onClick={onRepreview}>
-              {copy?.needsRepreview ? '重新预览' : '再试一次'}
-            </button>
+            {!copy?.needsAnotherFile ? (
+              <button type="button" className="button button--small" onClick={onRepreview} disabled={busy}>
+                {copy?.needsRepreview ? '重新预览' : '再试一次'}
+              </button>
+            ) : null}
             {copy?.needsAnotherFile || copy?.needsRepreview ? (
-              <button type="button" className="ghost-button" onClick={onReset}>
+              <button type="button" className="ghost-button" onClick={() => inputRef.current?.click()}>
                 换个文件
               </button>
             ) : null}
