@@ -36,6 +36,7 @@ from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
+    MEMORY_SOURCE_TOOL_ID,
     ToolOutcome,
     build_default_registry,
 )
@@ -117,6 +118,7 @@ if TYPE_CHECKING:
     from ling.capabilities.tools import ToolRegistry, ToolResult, ToolSpec
     from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
     from ling.config import Settings
+    from ling.domains.memory.service import MemoryHit
     from ling.infra.coordination import LeaseResult, SpeakLeaseStore
     from ling.kernel.context import CompiledContext, CompiledMessage
 
@@ -714,7 +716,10 @@ class TurnCoordinator:
         tool_registry: ToolRegistry | None = None,
         # 知识查询还需按本轮受众注册。撤回走用户确认回路。
         tool_allowlist: frozenset[str] = frozenset(
-            {CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID, WEB_SEARCH_TOOL_ID}
+            {
+                CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID,
+                MEMORY_SOURCE_TOOL_ID, WEB_SEARCH_TOOL_ID,
+            }
         ),
         settings: Settings | None = None,
     ) -> None:
@@ -1189,6 +1194,7 @@ class TurnCoordinator:
                     audience=(
                         compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
                     ),
+                    memory_sources=compiled.memory_sources,
                 )
                 tool_ledger.turn_id = turn_id
                 if not tool_ledger.explicit_guidance:
@@ -2989,6 +2995,7 @@ class TurnCoordinator:
         config: EffectiveConfig,
         profile: str,
         audience: AudienceSnapshot | None = None,
+        memory_sources: dict[str, MemoryHit] | None = None,
         window_id: str | None = None,
         user_text: str = "",
         attempt: int = 1,
@@ -3062,6 +3069,7 @@ class TurnCoordinator:
                     media_callback = self._watch_videos
             registry = build_default_registry(
                 knowledge_audience=audience,
+                memory_sources=memory_sources,
                 media_window_id=window_id,
                 watch_video=media_callback,
             )

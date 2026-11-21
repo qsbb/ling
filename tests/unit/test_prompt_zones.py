@@ -203,17 +203,12 @@ def test_default_budgets_keys_are_exactly_active_system_lanes() -> None:
     assert set(DEFAULT_BUDGETS) == expected
 
 
-def test_default_budgets_values_are_unchanged_from_the_original_table() -> None:
-    """**行为不变证据**：逐项对照重构前 `context.py` 手写的那张表。
-
-    数值一旦漂移，`_total_soft_hard()` 推出来的软／硬上限就跟着变，
-    于是"什么时候开始丢东西"也变——那不是本次重构该做的事。
-    """
-    original = {
+def test_default_budgets_match_the_configured_lane_limits() -> None:
+    expected = {
         "persona": 100_000,
         "short_memory": 4_000,
         "core_memory": 6_000,
-        "evidence": 6_000,
+        "evidence": 420,
         "knowledge": 3_000,
         "world": 2_000,
         "self_state": 2_000,
@@ -224,7 +219,7 @@ def test_default_budgets_values_are_unchanged_from_the_original_table() -> None:
         "constraints": 1_200,
         "scenario": 600,
     }
-    assert original == DEFAULT_BUDGETS
+    assert expected == DEFAULT_BUDGETS
 
 
 def test_protected_lanes_are_unchanged() -> None:

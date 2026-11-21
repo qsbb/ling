@@ -21,15 +21,19 @@ from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
+    MEMORY_SOURCE_TOOL_ID,
     ToolRegistry,
     build_default_registry,
 )
+from ling.contracts.v1 import Origin, TurnState, Visibility
 from ling.domains.consent.service import ConsentService
+from ling.domains.conversation.service import ConversationService
 from ling.domains.knowledge.service import KnowledgeService
 from ling.domains.media.describe import MediaDescriber
 from ling.domains.media.service import INBOUND_SCOPE, MediaEvidenceService
 from ling.domains.media.video import short_ref_for
 from ling.domains.media.watch import VideoWatchService, make_watch_callback
+from ling.domains.memory.service import MemoryService
 from ling.infra.db import get_session_factory, session_scope
 from ling.infra.models import KnowledgeItem, PromptSnapshot, ProviderTokenUsage
 from ling.kernel import turn as turn_module
@@ -257,6 +261,7 @@ def _tool_payload(
         "clock_now": CLOCK_NOW_TOOL_ID,
         "knowledge_search": KNOWLEDGE_SEARCH_TOOL_ID,
         "media_watch_video": MEDIA_WATCH_VIDEO_TOOL_ID,
+        "memory_source": MEMORY_SOURCE_TOOL_ID,
         "web_search": web_search.WEB_SEARCH_TOOL_ID,
     }.get(endpoint.tool_name, endpoint.tool_name)
     assert payload["provider_call_id"] == CALL_ID
@@ -669,6 +674,61 @@ async def test_web_knowledge_search_returns_current_scoped_results(
         for message in endpoint.requests[1]["messages"]
         if message["role"] != "tool"
     )
+
+
+@pytest.mark.parametrize("same_window", [True, False])
+async def test_web_memory_source_is_bound_to_visible_history(
+    logged_in: TestEnv, endpoint: _ToolEndpoint, same_window: bool,
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    endpoint.tool_name = "memory_source"
+    endpoint.arguments = {"ref": "m1"}
+    source = (await logged_in.client.post("/v1/sessions", json={"title": "面试旧对话"})).json()
+    window_id = source["session_id"]
+    original = "面试在岚桥公司，记得带本子。"
+    async with session_scope() as session:
+        conversation = ConversationService(session)
+        turn = await conversation.create_turn(
+            window_id, client_turn_id="old-memory-turn", config_revision=0,
+        )
+        message = await conversation.add_message(window_id, role="user", text=original, turn_id=turn.id)
+        await conversation.set_turn_state(turn.id, TurnState.completed)
+        await conversation.save_summary(
+            window_id, summary="聊过周五的面试。", through_sequence=message.sequence, message_count=1,
+        )
+        await MemoryService(session).record_episode(
+            subject_id=logged_in.subject_id, window_id=window_id,
+            summary="用户：周五有一场面试。",
+            source_event_ids=[f"turn:{turn.id}"], turn_id=turn.id,
+            visibility=Visibility.subject_private, origin=Origin.external_observation,
+        )
+
+    if not same_window:
+        response = await logged_in.client.post("/v1/sessions", json={"title": "新会话"})
+        window_id = response.json()["session_id"]
+    response = await logged_in.client.post(
+        f"/v1/sessions/{window_id}/turns",
+        json={"client_turn_id": "memory-followup", "text": "面试那家公司的名字是什么？"},
+    )
+    assert response.status_code == 200, response.text
+    await read_sse(response)
+    advertised = ("clock_now", "knowledge_search", "memory_source") if same_window else (
+        "clock_now", "knowledge_search",
+    )
+    payload = _tool_payload(endpoint, available=advertised)
+    first_prompt = " ".join(message["content"] for message in endpoint.requests[0]["messages"])
+    assert "周五有一场面试" in first_prompt and original not in first_prompt
+    if same_window:
+        assert "[m1]" in first_prompt
+        assert payload["outcome"] == "succeeded"
+        assert payload["content_trust"] == "data_not_instructions"
+        assert json.loads(payload["data"])["messages"] == [
+            {"speaker": "用户", "text": original, "truncated": False},
+        ]
+    else:
+        assert "[m1]" not in first_prompt
+        assert payload["error"]["code"] == "tool_not_available"
+        assert original not in json.dumps(endpoint.requests[1], ensure_ascii=False)
 
 
 async def test_video_tool_uses_the_current_turn_watch_callback(

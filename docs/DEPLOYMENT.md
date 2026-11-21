@@ -981,12 +981,12 @@ LING_ACCESS_LIST=10001       # 逗号分隔的 QQ 号
 ```bash
 LING_USER_TIMEZONE=Asia/Shanghai  # 兜底时区；优先级：设置页填的 > 这个变量 > Asia/Shanghai
                                   # （勿扰时段、每日限额、「今天」的边界都按它算）
-LING_CONTEXT_BUDGET_SCALE=1.0     # 整体缩放上下文预算（0.5 ≈ 74k token）
+LING_CONTEXT_BUDGET_SCALE=1.0     # 整体缩放上下文预算（0.5 ≈ 72k token）
 LING_ONEBOT_PROACTIVE=0           # 主动推送能力位（平台权限探测结果，不是偏好）
 ```
 
-上下文预算默认合计约 **149k token**：车道 128.6k（其中**人设 100k**，2026-11-09
-按用户要求从 10k 提到 100k）+ 最近原文层 20k。
+上下文预算默认合计约 **143k token**，包括约 123k 的车道预算和 20k 的最近对话原文。
+车道预算里，人设占 100k。每轮自动召回的记忆最多注入 3 条，合计约 420 token。
 
 模型窗口装不下就调 `LING_CONTEXT_BUDGET_SCALE`（整体等比缩），不必改代码。
 **不要**去改单个车道的数字——那会让"谁该让位"变成一堆手工调参。

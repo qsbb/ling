@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 from ling.contracts.v1 import new_id
 
 if TYPE_CHECKING:
+    from ling.domains.memory.service import MemoryHit
     from ling.kernel.audience import AudienceSnapshot
 
 
@@ -411,6 +412,7 @@ RECALL_TOOL_ID = "message.recall"
 #: 可用性判断侧、测试断言侧写的是同一个常量。
 CLOCK_NOW_TOOL_ID = "clock.now"
 KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
+MEMORY_SOURCE_TOOL_ID = "memory.source"
 MEDIA_WATCH_VIDEO_TOOL_ID = "media.watch_video"
 _KNOWLEDGE_RESULT_CHARS = 3000
 _KNOWLEDGE_CLAIM_CHARS = 600
@@ -472,11 +474,48 @@ async def _watch_video(
     )
 
 
+def _memory_source_tool(
+    audience: AudienceSnapshot, sources: dict[str, MemoryHit]
+) -> ToolHandler:
+    available = dict(sources)
+    used = False
+
+    async def handler(args: dict[str, Any]) -> str:
+        from ling.domains.memory.service import MemoryService
+        from ling.infra.db import session_scope
+        from ling.settings.service import published_memory_policy
+
+        nonlocal used
+        hit = available.get(args["ref"])
+        if hit is None or used:
+            raise ValueError("请使用本轮记忆里的编号，每轮可补查一次。")
+        used = True
+        async with session_scope() as session:
+            service = MemoryService(session, policy=await published_memory_policy(session))
+            messages = await service.read_source(hit, audience=audience)
+        # Keep the entire JSON result inside the tool output budget, including escapes.
+        while messages:
+            data = json.dumps({"messages": messages}, ensure_ascii=False)
+            if len(data) <= 1_200:
+                return data
+            last = messages[-1]
+            text = str(last["text"])
+            if not text:
+                messages.pop()
+                continue
+            last["text"] = text[:len(text) // 2]
+            last["truncated"] = True
+        return '{"messages":[]}'
+
+    return handler
+
+
 def build_default_registry(
     *,
     allow_irreversible: bool = False,
     include_recall: bool = True,
     knowledge_audience: AudienceSnapshot | None = None,
+    memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
 ) -> ToolRegistry:
@@ -555,6 +594,33 @@ def build_default_registry(
             ),
             partial(_search_knowledge, audience=knowledge_audience),
         )
+        if memory_sources:
+            registry.register(
+                ToolSpec(
+                    tool_id=MEMORY_SOURCE_TOOL_ID,
+                    version="1.0.0",
+                    description=(
+                        "对方追问确切细节时，按本轮记忆的编号补查一小段原话。"
+                        "每轮可查一次，平常接话可直接用大意。"
+                    ),
+                    risk=ToolRisk.read_only,
+                    requires_confirmation=False,
+                    reversible=True,
+                    model_callable=True,
+                    model_result_chars=1_200,
+                    input_schema={
+                        "type": "object",
+                        "properties": {"ref": {
+                            "type": "string",
+                            "enum": list(memory_sources),
+                            "description": "本轮记忆里显示的编号",
+                        }},
+                        "required": ["ref"],
+                        "additionalProperties": False,
+                    },
+                ),
+                _memory_source_tool(knowledge_audience, memory_sources),
+            )
     if media_window_id and watch_video is not None:
         registry.register(
             ToolSpec(
@@ -653,6 +719,7 @@ def build_default_registry(
 __all__ = [
     "CLOCK_NOW_TOOL_ID",
     "KNOWLEDGE_SEARCH_TOOL_ID",
+    "MEMORY_SOURCE_TOOL_ID",
     "MEDIA_WATCH_VIDEO_TOOL_ID",
     "RECALL_TOOL_ID",
     "RecallToolError",
