@@ -412,7 +412,7 @@ RECALL_TOOL_ID = "message.recall"
 #: 可用性判断侧、测试断言侧写的是同一个常量。
 CLOCK_NOW_TOOL_ID = "clock.now"
 KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
-MEMORY_SOURCE_TOOL_ID = "memory.source"
+MEMORY_SOURCE_TOOL_ID = "memory_source"
 MEDIA_WATCH_VIDEO_TOOL_ID = "media.watch_video"
 _KNOWLEDGE_RESULT_CHARS = 3000
 _KNOWLEDGE_CLAIM_CHARS = 600

@@ -243,7 +243,7 @@ ZONES: tuple[ZoneSpec, ...] = (
         (
             LaneSpec("short_memory", 4_000, 10, None, True),
             LaneSpec("core_memory", 6_000, 20, 30),
-            LaneSpec("evidence", 420, 30, 20),
+            LaneSpec("evidence", 6_000, 30, 20),
             LaneSpec("knowledge", 3_000, 40, 10),
         ),
     ),

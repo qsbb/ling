@@ -267,6 +267,7 @@ def _budget_scale() -> float:
 
 
 _SCALE = _budget_scale()
+AUTOMATIC_MEMORY_TOKEN_BUDGET = max(1, int(420 * min(1.0, _SCALE)))
 if _SCALE != 1.0:
     DEFAULT_BUDGETS = {k: max(80, int(v * _SCALE)) for k, v in DEFAULT_BUDGETS.items()}
     # 最近原文层**也要缩**。它是最宽的一块（20k），漏掉它的话
@@ -1572,7 +1573,7 @@ class ContextCompiler:
                 trace_window_id=window_id,
                 audience=snapshot,
             )
-        evidence_budget = DEFAULT_BUDGETS["evidence"]
+        evidence_budget = min(DEFAULT_BUDGETS["evidence"], AUTOMATIC_MEMORY_TOKEN_BUDGET)
         original_text = {message.message_id: message.text for message in fetched}
         history_roles: dict[str, set[str]] = {}
         for message in usable:

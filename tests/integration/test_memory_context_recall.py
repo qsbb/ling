@@ -15,7 +15,7 @@ from ling.domains.memory import providers
 from ling.domains.memory.service import MemoryService
 from ling.infra.db import session_scope
 from ling.infra.models import MemoryEpisode, MemoryRetrievalLog, MemoryRow
-from ling.kernel.context import DEFAULT_BUDGETS, ContextCompiler, estimate_tokens
+from ling.kernel.context import ContextCompiler, estimate_tokens
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -186,7 +186,7 @@ async def test_prompt_keeps_three_distinct_memories_and_counts_only_injection(
         assert sum(evidence.count(text) for text in texts) == 3
         assert "ep_duplicate" not in result.memory_ids
         assert "曾经聊过的话" not in evidence
-        assert estimate_tokens(evidence) <= DEFAULT_BUDGETS["evidence"]
+        assert estimate_tokens(evidence) <= 420
         assert len(result.memory_ids) == 3 and result.meta["evidence_dropped"] == 3
         rows = list(await session.scalars(select(MemoryRow)))
         assert {row.id for row in rows if row.access_count} == set(result.memory_ids)

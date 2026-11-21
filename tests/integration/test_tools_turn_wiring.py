@@ -261,7 +261,6 @@ def _tool_payload(
         "clock_now": CLOCK_NOW_TOOL_ID,
         "knowledge_search": KNOWLEDGE_SEARCH_TOOL_ID,
         "media_watch_video": MEDIA_WATCH_VIDEO_TOOL_ID,
-        "memory_source": MEMORY_SOURCE_TOOL_ID,
         "web_search": web_search.WEB_SEARCH_TOOL_ID,
     }.get(endpoint.tool_name, endpoint.tool_name)
     assert payload["provider_call_id"] == CALL_ID
@@ -681,7 +680,7 @@ async def test_web_memory_source_is_bound_to_visible_history(
     logged_in: TestEnv, endpoint: _ToolEndpoint, same_window: bool,
 ) -> None:
     await _bind_model(logged_in, enabled=True)
-    endpoint.tool_name = "memory_source"
+    endpoint.tool_name = MEMORY_SOURCE_TOOL_ID
     endpoint.arguments = {"ref": "m1"}
     source = (await logged_in.client.post("/v1/sessions", json={"title": "面试旧对话"})).json()
     window_id = source["session_id"]
@@ -712,9 +711,9 @@ async def test_web_memory_source_is_bound_to_visible_history(
     )
     assert response.status_code == 200, response.text
     await read_sse(response)
-    advertised = ("clock_now", "knowledge_search", "memory_source") if same_window else (
-        "clock_now", "knowledge_search",
-    )
+    advertised = ("clock_now", "knowledge_search")
+    if same_window:
+        advertised += (MEMORY_SOURCE_TOOL_ID,)
     payload = _tool_payload(endpoint, available=advertised)
     first_prompt = " ".join(message["content"] for message in endpoint.requests[0]["messages"])
     assert "周五有一场面试" in first_prompt and original not in first_prompt

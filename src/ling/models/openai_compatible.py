@@ -39,7 +39,6 @@ from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
-    MEMORY_SOURCE_TOOL_ID,
 )
 from ling.capabilities.web_search import WEB_SEARCH_TOOL_ID
 from ling.ports.model import (
@@ -59,7 +58,6 @@ _TOOL_WIRE_NAMES = {
     CLOCK_NOW_TOOL_ID: "clock_now",
     KNOWLEDGE_SEARCH_TOOL_ID: "knowledge_search",
     MEDIA_WATCH_VIDEO_TOOL_ID: "media_watch_video",
-    MEMORY_SOURCE_TOOL_ID: "memory_source",
     WEB_SEARCH_TOOL_ID: "web_search",
 }
 _TOOL_IDS_BY_WIRE_NAME = {name: tool_id for tool_id, name in _TOOL_WIRE_NAMES.items()}
