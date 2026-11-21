@@ -479,7 +479,10 @@ async def _publish_voice_settings(
         "private_may_stay_silent": False,
     }
     if with_voice:
-        dialogue["voice"] = {"kind": "minimax_tts", "voice_id": "fixture-voice"}
+        dialogue["voice"] = {
+            "kind": "minimax_tts", "voice_id": "fixture-voice",
+            "speed": 1.1, "vol": 0.8, "pitch": -2, "emotion": "happy",
+        }
     draft = await env.client.put(
         "/v1/settings/draft",
         json={"providers": providers, "profiles": profiles, "dialogue": dialogue},
@@ -586,7 +589,9 @@ async def test_web_final_speak_is_one_hidden_voice_message_with_playback(
     message = _completed_message(events)
 
     assert len(tts.calls) == 1, f"预期一次 TTS，实际请求 {len(tts.calls)} 次"
-    assert tts.calls[0]["voice_setting"]["voice_id"] == "fixture-voice"
+    assert tts.calls[0]["voice_setting"] == {
+        "voice_id": "fixture-voice", "speed": 1.1, "vol": 0.8, "pitch": -2, "emotion": "happy",
+    }
     assert tts.calls[0]["text"] == canonical
     assert canonical not in participant_output, participant_output
     assert "[speak]" not in participant_output
@@ -1148,6 +1153,36 @@ async def test_onebot_http_reply_delivers_one_record_without_canonical_text(
     operator = await env.client.get(f"/v1/speech/messages/{message_id}")
     assert operator.status_code == 200, operator.text
     assert operator.json()["message"]["text"] == canonical
+
+
+async def test_onebot_replay_does_not_repeat_uncertain_tts(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.integration.test_onebot_loop import FakeOneBot, _bind, _event_body, _install, _post
+
+    tts = _VoiceTtsEndpoint(fail=True)
+    model = _VoiceModelEndpoint("[speak] 测试合成结果不确定。")
+    _install_voice_runtime(logged_in, monkeypatch, model, tts)
+    await _publish_voice_settings(logged_in)
+    platform = FakeOneBot()
+    _install(logged_in, platform)
+    await _bind(logged_in)
+
+    request = _event_body(message="请用语音回答")
+    original = (await _post(logged_in, request)).json()
+    assert original["accepted"] and not original["delivered"], original
+    assert len(tts.calls) == 1
+    first_model_calls = len(model.requests)
+
+    replay = (await _post(logged_in, request)).json()
+    assert replay["turn_id"] == original["turn_id"], replay
+    assert not replay["delivered"] and platform.sent == [], replay
+    assert len(tts.calls) == 1
+    assert len(model.requests) == first_model_calls
+
+    async with session_scope() as session:
+        jobs = (await session.scalars(select(SpeechSynthesisJob))).all()
+        assert len(jobs) == 1 and jobs[0].state == "uncertain"
 
 
 @pytest.mark.parametrize("tts_configured", [True, False], ids=["provider-failure", "missing-tts"])

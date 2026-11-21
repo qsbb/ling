@@ -298,22 +298,15 @@ def describe_no_text(result: TurnResult) -> str:
 
 
 def describe_delivery(delivered: bool, *, parts_sent: int, parts_total: int) -> str:
-    """投递之后的一句话结论：**发了几段就是几段**。
-
-    为什么不能一律写"已回复"：`parts_sent == 0` 时对方一个字都没收到，
-    而 `0 < parts_sent < parts_total` 是"她说了前半句、后半句永远没到"——
-    后者比全失败更难发现，因为用户会以为她只想说那么一句。
-
-    措辞里带上 ``1/3`` 这种数字，运维不用翻 DB 就能判断是"哪一次没发全"。
-    """
+    """投递结果按收到的回执统计。缺少回执时保留送达结果的不确定性。"""
     if delivered:
         return "已回复"
     if parts_total <= 0:
         # 一段都没规划出来：正文非空却切不出段，属于上游 bug，别声称发过
         return "已回复（未规划出可发送的段）"
     if parts_sent <= 0:
-        return f"投递失败（0/{parts_total} 段发出，对方没有收到）"
-    return f"部分送达（{parts_sent}/{parts_total} 段发出，后面的段没到）"
+        return f"未确认送达（0/{parts_total} 段）"
+    return f"部分确认送达（{parts_sent}/{parts_total} 段）"
 
 
 def describe_timeout(result: TurnResult) -> str:
@@ -1140,25 +1133,21 @@ class InboundBridge:
     # ------------------------------------------------------------ 重投续发
 
     async def _resumable_reply(self, turn_id: str) -> str | None:
-        """这一轮**已经生成过正文、而且已经发过至少一段**时，返回那段正文。
-
-        为什么要续发而不是重新生成：① 二次生成会让同一轮出现两版不一样的话；
-        ② 段级幂等键是按第一版的段序号记的，换一版文字等于"已发段被跳过、
-        剩下的段发成另一句话"——那样用户会看到两段互不衔接的内容。
-        """
+        """继续已写入的语音回复，或已有分段投递记录的文字回复。"""
         from ling.capabilities.delivery import PART_SCOPE
         from ling.infra.models import IdempotencyKey, Message
 
-        text = (
-            await self._session.execute(
-                select(Message.text)
-                .where(Message.turn_id == turn_id, Message.role == "actor")
-                .order_by(Message.sequence.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if not text:
+        message = await self._session.scalar(
+            select(Message)
+            .where(Message.turn_id == turn_id, Message.role == "actor")
+            .order_by(Message.sequence.desc())
+            .limit(1)
+        )
+        if message is None or not message.text:
             return None
+        # 合成可能已计费，即使还没有创建投递段，也要沿用同一条语音消息。
+        if message.output_modality == "voice":
+            return str(message.text)
         claimed = (
             await self._session.execute(
                 select(IdempotencyKey.key)
@@ -1169,7 +1158,7 @@ class InboundBridge:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        return str(text) if claimed else None
+        return str(message.text) if claimed else None
 
     async def _resume_delivery(
         self,

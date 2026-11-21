@@ -281,7 +281,8 @@ async def test_port_wrapper_emits_start_chunk_end_and_forwards_params() -> None:
         operation_id="op", attempt_id="1", window_id="w", turn_id=None, config_revision=1
     )
 
-    events = [e async for e in provider.synthesize(_request(MiniMaxVoice("male-qn")), call=call)]
+    voice = MiniMaxVoice("male-qn", speed=1.1, vol=0.8, pitch=-2, emotion="happy")
+    events = [e async for e in provider.synthesize(_request(voice), call=call)]
 
     assert [type(e) for e in events] == [TtsStart, TtsChunk, TtsEnd], events
     start, chunk, end = events
@@ -289,7 +290,7 @@ async def test_port_wrapper_emits_start_chunk_end_and_forwards_params() -> None:
     assert isinstance(chunk, TtsChunk) and chunk.sequence == 0 and chunk.audio
     assert isinstance(end, TtsEnd) and end.usage.usage_source == "estimated"
     # 音色确实以那家的关键字参数转发下去（不是被吞掉、用默认嗓音）。
-    assert adapter.calls == [("你好呀", {"voice_id": "male-qn"})]
+    assert adapter.calls == [("你好呀", {"voice": voice})]
 
 
 async def test_port_wrapper_refuses_mismatched_voice() -> None:

@@ -59,6 +59,7 @@ from ling.models.tts_common import (
     scrub,
     sniff_container,
 )
+from ling.ports.speech import MiniMaxVoice
 
 #: 国际站与中文站是两个**独立**的账号体系，密钥不通用。用户选错站点的表现
 #: 是 401，而 401 的提示是"检查密钥"——所以两个地址都要能填。
@@ -159,19 +160,25 @@ class MiniMaxTts:
 
     # -------------------------------------------------------------- 请求构造
 
-    def build_payload(self, text: str, *, voice_id: str = "") -> dict[str, object]:
+    def build_payload(
+        self, text: str, *, voice_id: str = "", voice: MiniMaxVoice | None = None,
+    ) -> dict[str, object]:
         """拼请求体。**独立成方法**，这样测试可以只验 wire 形状不碰网络。"""
-        voice = (voice_id or self.voice_id).strip()
+        if voice is None:
+            voice = MiniMaxVoice(
+                voice_id or self.voice_id, self.speed, self.volume, self.pitch, self.emotion,
+            )
         voice_setting: dict[str, object] = {
-            "voice_id": voice,
-            "speed": self.speed,
-            "vol": self.volume,
-            "pitch": self.pitch,
+            "voice_id": voice.voice_id.strip(),
+            "speed": voice.speed,
+            "vol": voice.vol,
+            "pitch": voice.pitch,
         }
         # **只在配了情绪时才发**：老模型（speech-01/02）收到 emotion 会 400，
         # 而用户不一定知道自己选的是哪一代。
-        if self.emotion:
-            voice_setting["emotion"] = self.emotion
+        emotion = (voice.emotion or "").strip()
+        if emotion:
+            voice_setting["emotion"] = emotion
         return {
             "model": self.model,
             "text": text,
@@ -200,7 +207,8 @@ class MiniMaxTts:
     # -------------------------------------------------------------- 主流程
 
     async def synthesize(
-        self, text: str, *, voice_id: str = "", language_boost: str = ""
+        self, text: str, *, voice_id: str = "", voice: MiniMaxVoice | None = None,
+        language_boost: str = "",
     ) -> SynthesizedAudio:
         """把 ``text`` 合成成音频。
 
@@ -216,15 +224,15 @@ class MiniMaxTts:
                 "MiniMax API Key 未配置，请在设置里填写后重试",
                 retriable=False,
             )
-        voice = (voice_id or self.voice_id).strip()
-        if not voice:
+        selected_id = voice.voice_id if voice is not None else voice_id or self.voice_id
+        if not selected_id.strip():
             raise TtsError(
                 TtsErrorKind.not_configured,
                 "MiniMax Voice ID 未配置（需填 MiniMax 控制台里的音色 ID，如 male-qn-qingse）",
                 retriable=False,
             )
 
-        payload = self.build_payload(spoken, voice_id=voice)
+        payload = self.build_payload(spoken, voice_id=selected_id, voice=voice)
         if language_boost:
             payload["language_boost"] = language_boost
 

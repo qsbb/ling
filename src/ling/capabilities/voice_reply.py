@@ -112,7 +112,7 @@ def voice_help(willingness: VoiceWillingness) -> str:
 
     preference = VOICE_WILLINGNESS_PROMPTS.get(willingness, VOICE_WILLINGNESS_PROMPTS["natural"])
     return (
-        preference + "决定用语音时，在最终回复最前"
+        preference + "对方明确请求语音时，优先用语音回复。决定用语音时，在最终回复最前"
         "写一个 [speak]，后面只写真正要说的话。否则直接写文字，不解释标签。"
         "一次语音保持简短，不拆成语音和文字两份。"
     )

@@ -453,7 +453,7 @@ _MIME_BY_CONTAINER: dict[str, str] = {
 def _voice_kwargs(voice: object, *, expected_kind: str) -> dict[str, object]:
     """按**值对象的类型**翻成那家的关键字参数，并核对它与 kind 是否一致。
 
-    三家各要各的（MiniMax `voice_id` / Fish `reference_id` / MiMo 参考音频字节），
+    三家各要各的（MiniMax 音色参数 / Fish `reference_id` / MiMo 参考音频字节），
     没有统一的 `voice_key`（§17.2 撤销了跨厂商映射）。传错类型时**明确失败**。
     """
     kind_of_voice = _KIND_OF_VOICE.get(type(voice))
@@ -471,7 +471,7 @@ def _voice_kwargs(voice: object, *, expected_kind: str) -> dict[str, object]:
         )
 
     if isinstance(voice, MiniMaxVoice):
-        return {"voice_id": voice.voice_id}
+        return {"voice": voice}
     if isinstance(voice, FishAudioVoice):
         return {"reference_id": voice.reference_id}
     assert isinstance(voice, MimoReferenceVoice)  # 上面三种已穷举
