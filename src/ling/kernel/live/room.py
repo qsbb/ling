@@ -151,6 +151,7 @@ async def open_session(
             "mode": mode, "role": plan.role, "topic": plan.public_topic,
             "host_name": plan.host_name, "companion_auto_reply": plan.companion_auto_reply,
             "queue": [], "device_id": device_id, "next_host_at": now.isoformat(),
+            "authorized_scene": (config.get("autonomous_binding") or {}).get("scene") if ends_at else None,
         },
         deadline_at=min(deadline, ends_at) if ends_at else deadline,
         created_at=now,

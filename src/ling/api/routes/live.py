@@ -128,13 +128,22 @@ async def save_plan(
     plan = body.model_dump(mode="json")
     previous = plan_from_config(config)
     same_window = body.autonomous_window is not None and body.autonomous_window == previous.autonomous_window
-    if same_window and body == previous and config.get("live_plan"):
+    if same_window and body == previous and config.get("autonomous_binding"):
         return custom_view(connector)
     if same_window and config.get("autonomous_state") == "started":
         raise LingError(ErrorCode.conflict, "该授权已使用，请选择新的开播时段", status_code=409)
+    binding = None
+    if body.autonomous_window:
+        stage = config.get("stage_observation") or {}
+        seen = stage.get("seen_at")
+        if not config.get("stage_token_hash") or not stage.get("scene") or not seen or (
+            utcnow() - datetime.fromisoformat(seen) > timedelta(seconds=10)
+        ):
+            raise LingError(ErrorCode.conflict, "请先连接舞台端并核对 OBS 场景", status_code=409)
+        binding = {"device_id": stage["device_id"], "scene": stage["scene"]}
     connector.custom_config = {
         **config, "live_plan": plan, "plan_pending": True,
-        "autonomous_state": None, "autonomous_offer": None,
+        "autonomous_state": None, "autonomous_offer": None, "autonomous_binding": binding,
     }
     return custom_view(connector)
 
@@ -146,7 +155,7 @@ async def clear_plan(
     connector = await require_custom(session, instance_id, lock=True)
     connector.custom_config = {
         **connector.custom_config, "live_plan": None, "plan_pending": False,
-        "autonomous_state": None, "autonomous_offer": None,
+        "autonomous_state": None, "autonomous_offer": None, "autonomous_binding": None,
     }
     run = await active_session(session, settings.actor_id, lock=True)
     if run and run.connector_id == instance_id and run.runtime.get("autonomous"):
@@ -322,7 +331,8 @@ async def stage_tick(
         record_stage_observation(connector, body)
     if run is None and not body.obs_active and not body.obs_reconnecting:
         action = prepare_autonomy(
-            session, connector, device_id=body.device_id, broadcast_ready=body.broadcast_ready,
+            session, connector, device_id=body.device_id, scene=body.scene,
+            broadcast_ready=body.broadcast_ready,
         )
         return {"session_id": None, "action": action}
     if run is None or run.connector_id != instance_id:

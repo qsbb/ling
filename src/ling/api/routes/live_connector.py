@@ -70,6 +70,7 @@ def custom_view(row: ConnectorInstance) -> dict:
         "live_plan": plan_from_config(settings).model_dump(mode="json"),
         "has_plan": bool(settings.get("live_plan")),
         "plan_pending": bool(settings.get("plan_pending")),
+        "authorized_scene": (settings.get("autonomous_binding") or {}).get("scene"),
         "stage_observation": settings.get("stage_observation"),
         "last_received_at": settings.get("last_received_at"),
     }
@@ -159,6 +160,9 @@ async def configure_custom(
         raise LingError(ErrorCode.invalid_request, "上报与舞台请使用不同令牌", status_code=422)
     if not config.enabled or settings.get("stage_token_hash") != old.get("stage_token_hash"):
         settings.pop("stage_observation", None)
+        if "live_plan" in settings:
+            settings["autonomous_binding"] = None
+            settings["autonomous_offer"] = None
     row.custom_config = settings
     row.enabled = config.enabled
     await session.flush()

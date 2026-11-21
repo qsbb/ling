@@ -34,11 +34,14 @@ def authorization(connector: ConnectorInstance) -> dict | None:
 
 
 def prepare_autonomy(
-    session: AsyncSession, connector: ConnectorInstance, *, device_id: str, broadcast_ready: bool,
+    session: AsyncSession, connector: ConnectorInstance, *, device_id: str, scene: str | None,
+    broadcast_ready: bool,
 ) -> str:
     window = authorization(connector)
     config = connector.custom_config or {}
     if window is None or config.get("autonomous_state"):
+        return "hold"
+    if "live_plan" in config and config.get("autonomous_binding") != {"device_id": device_id, "scene": scene}:
         return "hold"
     if not broadcast_ready:
         return "prepare"

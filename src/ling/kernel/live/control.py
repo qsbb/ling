@@ -87,6 +87,10 @@ async def update_stage(session: AsyncSession, run: LiveSessionRow, report: Stage
     # A device first learns the session ID, then reports evidence for that exact run.
     if report.session_id != run.id:
         return {**base, "action": "hold"}
+    if run.state == "starting" and runtime.get("authorized_scene") not in {None, report.scene}:
+        request_stop(run)
+        run.runtime = {**run.runtime, "detail": "OBS 场景与本场开播授权不一致"}
+        runtime = run.runtime
     run.runtime = {
         **runtime, "device_id": report.device_id, "stage_seen_at": now.isoformat(),
         "obs_active": report.obs_active, "obs_reconnecting": report.obs_reconnecting,

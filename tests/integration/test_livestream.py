@@ -383,3 +383,40 @@ async def test_companion_joins_and_leaves_an_externally_owned_broadcast(logged_i
         assert (await env.client.post(cue, json={"text": "请再聊一句"})).status_code == 409
         async with session_scope() as db:
             assert await db.scalar(select(func.count()).select_from(Operation)) == 0
+
+
+async def test_plan_authorization_is_bound_to_the_observed_device_and_scene(logged_in):
+    env = logged_in
+    assert (await env.client.put(
+        f"{CUSTOM}/bili-live", json={**ROOM_CONFIG, "obs_control": True},
+    )).status_code == 200
+    now = datetime.now(UTC)
+    window = {
+        "starts_at": (now - timedelta(minutes=1)).isoformat(),
+        "ends_at": (now + timedelta(minutes=2)).isoformat(),
+    }
+    plan = "/v1/live/plans/bili-live"
+    assert (await env.client.put(plan, json={"autonomous_window": window})).status_code == 409
+
+    async with peer_client(env, headers={"Authorization": f"Bearer {TOKEN}"}) as stage:
+        async def observe(scene, **changes):
+            response = await stage.post(
+                f"{SOURCE}/stage", json=stage_body(None, scene=scene, **changes),
+            )
+            assert response.status_code == 200, response.text
+            return response.json()["action"]
+
+        assert await observe("Studio 1") == "hold"
+        configured = await env.client.put(plan, json={"autonomous_window": window})
+        assert configured.status_code == 200, configured.text
+        assert configured.json()["authorized_scene"] == "Studio 1"
+        assert await observe("Studio 2", broadcast_ready=True) == "hold"
+        assert await observe("Studio 1", device_id="not_the_stage", broadcast_ready=True) == "hold"
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(OutboxEvent)) == 0
+        assert await observe("Studio 1") == "prepare"
+        assert await observe("Studio 1", broadcast_ready=True) == "hold"
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(OutboxEvent).where(
+                OutboxEvent.topic == "livestream.decide",
+            )) == 1
