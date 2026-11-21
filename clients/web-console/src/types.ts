@@ -379,20 +379,111 @@ export interface MemoryRecord {
   archived_at: string | null;
   can_edit?: boolean;
   record_type?: 'memory' | 'experience';
+  /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
+  import_source?: MemoryImportSource;
 }
+
+/**
+ * 导入条目的原始来源（`import_source`）。
+ *
+ * 时间字段**可能为空**（原记录没有发生时间、没有有效期），页面上不许拿
+ * `created_at` 去顶替 `occurred_at`——那是两条不同的时间。
+ */
+export interface MemoryImportSource {
+  source: string;
+  record_id: string;
+  memory_type: string;
+  platform: string;
+  session_id: string;
+  bot_qq: string;
+  owner_qq: string;
+  occurred_at: string | null;
+  created_at: string;
+  updated_at: string;
+  valid_from: string | null;
+  valid_to: string | null;
+}
+
+/**
+ * `GET /v1/memory?view=library&source=...` 的来源筛选取值（闭集）。
+ *
+ * 不叫 `MemorySource`：那个名字已经是「嵌入/重排由什么提供」（binding/env），
+ * 两者含义无关，同名会让调用方以为可以互换。
+ */
+export type MemoryImportSourceFilter = 'astrbot_memory_companion';
 
 export interface MemoryListResponse {
   memories: MemoryRecord[];
-  /** 单次返回上限（1..200，默认 50）。**没有分页**：没有 offset / cursor。 */
+  /** 单次返回上限（1..200，默认 50）。 */
   limit: number;
   /** 当前 include 口径下的总行数（不受 limit 截断）。 */
   total: number;
-  /** `total > memories.length`：limit 把结果截掉了。 */
+  /** `total > offset + memories.length`：还有更早的页。 */
   has_more: boolean;
   /** 回显请求里的原始值；默认不传时为 null。 */
   include: string | null;
+  /** 只在按来源筛选时回显（`view=library&source=...`）。 */
+  source?: string;
+  /** 只在按来源筛选时回显；翻页时加上 `limit`。 */
+  offset?: number;
   note?: string;
   extraction?: { state: string; at: string | null } | null;
+}
+
+/* ------------------------------------------------ 从 AstrBot 导入（契约见同名文档） */
+
+/** 服务端确定的目标：`qq` 是本人，`bot_qq` 是导出的旧 Bot。 */
+export interface MemoryImportDestination {
+  subject_id: string;
+  display_name: string;
+  qq: string;
+  bot_qq: string;
+}
+
+/** 预览里的真实样本（最多 12 条，文本最多 400 字）。 */
+export interface MemoryImportSample {
+  source_id: string;
+  kind: 'episode' | 'assertion';
+  text: string;
+  occurred_at: string | null;
+  created_at: string;
+  valid_until: string | null;
+}
+
+/** 跳过原因（闭集，页面文案见 SKIP_REASON_TEXT）。 */
+export type MemoryImportSkipReason =
+  | 'invalid_record'
+  | 'outside_private_pair'
+  | 'unsupported_memory'
+  | 'inactive'
+  | 'not_reviewed'
+  | 'restricted'
+  | 'not_yet_valid'
+  | 'expired'
+  | 'retention_expired';
+
+export interface MemoryImportCounts {
+  total: number;
+  accepted?: number;
+  imported?: number;
+  duplicates: number;
+  skipped: number;
+  skip_reasons: Partial<Record<MemoryImportSkipReason, number>>;
+}
+
+export interface MemoryImportPreview extends MemoryImportCounts {
+  destination: MemoryImportDestination;
+  accepted: number;
+  sample: MemoryImportSample[];
+  /** 没有可导入条目时为 null。 */
+  confirmation_token: string | null;
+  /** 没有可导入条目时为 null。 */
+  expires_at: string | null;
+}
+
+export interface MemoryImportCommit extends MemoryImportCounts {
+  destination: MemoryImportDestination;
+  imported: number;
 }
 
 export interface CoreMemoryItem {

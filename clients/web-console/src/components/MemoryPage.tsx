@@ -21,11 +21,13 @@ import type {
   CoreMemoryInput,
   CoreMemoryItem,
   CoreMemoryListResponse,
+  MemoryImportSourceFilter,
   MemoryInclude,
   MemoryListResponse,
   MemoryRecord,
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
+import { MemoryImportPanel } from './MemoryImport';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
 
@@ -1069,6 +1071,27 @@ export interface MemoryListSectionProps {
   onFiltersChange: (filters: MemoryFilters) => void;
   handlers: MemoryHandlers;
   onReload: () => void;
+  /** 来源筛选：null = 全部来源。 */
+  source?: MemoryImportSourceFilter | null;
+  onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
+  /** 已加载的累计条数（按来源翻页时 = offset）；翻页按钮据此取下一页。 */
+  loadedCount?: number;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
+  importPanelOpen?: boolean;
+  onToggleImport?: () => void;
+  onCloseImport?: () => void;
+}
+
+/** 来源筛选的显示文案。`null` 是"不筛"，不是某一类来源。 */
+export const SOURCE_OPTIONS: Array<{ value: MemoryImportSourceFilter | null; label: string }> = [
+  { value: null, label: '全部来源' },
+  { value: 'astrbot_memory_companion', label: 'AstrBot 记忆' },
+];
+
+export function sourceLabel(source: string | null | undefined): string {
+  if (!source) return '';
+  return SOURCE_OPTIONS.find((option) => option.value === source)?.label ?? source;
 }
 
 function historyStatus(row: MemoryRecord): string | null {
@@ -1246,11 +1269,51 @@ function MemoryInspector({
         <h4>来源与可见范围</h4>
         <dl className="mem-facts">
           <div><dt>来源</dt><dd>{originLabel(row.origin)}</dd></div>
+          {row.import_source ? (
+            <div className="mem-facts__wide" data-testid="mem-import-source">
+              <dt>来自 AstrBot</dt>
+              <dd>
+                <span>{row.import_source.owner_qq} → {row.import_source.bot_qq}</span>
+                <code>{row.import_source.record_id}</code>
+              </dd>
+            </div>
+          ) : null}
           <div><dt>可见范围</dt><dd>{visibilityLabel(row.visibility)}</dd></div>
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
       </section>
+      {row.import_source ? (
+        <section className="mem-inspector__section" aria-label="在 AstrBot 里的时间" data-testid="mem-import-times">
+          <h4>在 AstrBot 里的时间</h4>
+          <dl className="mem-facts">
+            {row.import_source.occurred_at ? (
+              <div>
+                <dt>发生时间</dt>
+                <dd><time dateTime={row.import_source.occurred_at}>{formatAbsoluteTime(row.import_source.occurred_at)}</time></dd>
+              </div>
+            ) : null}
+            <div>
+              <dt>原创建时间</dt>
+              <dd><time dateTime={row.import_source.created_at}>{formatAbsoluteTime(row.import_source.created_at)}</time></dd>
+            </div>
+            <div>
+              <dt>原更新时间</dt>
+              <dd><time dateTime={row.import_source.updated_at}>{formatAbsoluteTime(row.import_source.updated_at)}</time></dd>
+            </div>
+            {row.import_source.valid_to ? (
+              <div>
+                <dt>原有效期至</dt>
+                <dd><time dateTime={row.import_source.valid_to}>{formatAbsoluteTime(row.import_source.valid_to)}</time></dd>
+              </div>
+            ) : null}
+            <div className="mem-facts__wide">
+              <dt>原会话</dt>
+              <dd><code>{row.import_source.session_id}</code> · {row.import_source.memory_type}</dd>
+            </div>
+          </dl>
+        </section>
+      ) : null}
       {row.retract_reason || row.archived_at || row.supersedes || row.superseded_by ? (
         <section className="mem-inspector__section" aria-label="变更记录">
           <h4>变更记录</h4>
@@ -1278,7 +1341,9 @@ function MemoryInspector({
 
 export function MemoryListSection({
   state, include, flags, onFlagsChange, limit, onLimitChange, filters,
-  onFiltersChange, handlers, onReload,
+  onFiltersChange, handlers, onReload, source, onSourceChange = () => {},
+  loadedCount = 0, onLoadMore = () => {}, loadingMore = false, importPanelOpen = false,
+  onToggleImport = () => {}, onCloseImport = () => {},
 }: MemoryListSectionProps): React.ReactElement {
   const [query, setQuery] = useState('');
   const [scope, setScope] = useState('');
@@ -1336,18 +1401,33 @@ export function MemoryListSection({
 
   return (
     <section
-      className={`mem-workspace${mobileInspectorOpen ? ' mem-workspace--reading' : ''}`}
+      /*
+       窄屏下详情栏平时不显示；导入面板也挂在这一栏，所以只要面板开着就进
+       「阅读态」——否则手机上点得到入口、却看不到面板。
+      */
+      className={`mem-workspace${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
       aria-label="长期记忆库"
       data-testid="mem-list"
     >
       <div className="mem-index">
         <header className="mem-index__head">
           <h2>长期记忆</h2>
-          {data ? (
-            <button type="button" className="ghost-button mem-index__refresh" onClick={onReload} aria-label="刷新记忆库">
-              <RefreshIcon size={15} />
+          <div className="mem-index__head-actions">
+            <button
+              type="button"
+              className="button button--small"
+              data-testid="mem-import-entry"
+              aria-expanded={importPanelOpen}
+              onClick={onToggleImport}
+            >
+              导入旧记忆
             </button>
-          ) : null}
+            {data ? (
+              <button type="button" className="ghost-button mem-index__refresh" onClick={onReload} aria-label="刷新记忆库">
+                <RefreshIcon size={15} />
+              </button>
+            ) : null}
+          </div>
         </header>
         <div className="mem-index__tools">
           <label className="mem-search">
@@ -1390,6 +1470,22 @@ export function MemoryListSection({
                 {LIMIT_OPTIONS.map((option) => <option key={option} value={option}>{option} 条</option>)}
               </select>
             </label>
+            <label className="mem-field"><span>来源</span>
+              <select
+                aria-label="按来源筛选"
+                data-testid="mem-source"
+                value={source ?? ''}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  onSourceChange(value === 'astrbot_memory_companion' ? 'astrbot_memory_companion' : null);
+                  setSelectedId(null);
+                }}
+              >
+                {SOURCE_OPTIONS.map((option) => (
+                  <option key={option.label} value={option.value ?? ''}>{option.label}</option>
+                ))}
+              </select>
+            </label>
           </div>
           <fieldset className="mem-history-switches">
             <legend>同时加载历史条目</legend>
@@ -1408,12 +1504,17 @@ export function MemoryListSection({
           <>
             <div className="mem-index__count" role="status" data-testid="mem-list-count">
               <span>已加载 {fetched.length} 条{filteredByUser ? ` · 匹配 ${filtered.length} 条` : ''}</span>
-              <span>{include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
+              <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
             </div>
             {data.has_more ? (
               <p className="mem-index__boundary" data-testid="mem-limit-notice">
-                还有 {data.total - fetched.length} 条未加载。搜索仅限本批。
-                {limit < 200 ? (
+                还有 {Math.max(0, data.total - (source ? loadedCount : fetched.length))} 条未加载。搜索仅限本批。
+                {source ? (
+                  <> <button type="button" className="mem-text-button" data-testid="mem-load-more"
+                    disabled={loadingMore} onClick={onLoadMore}>
+                    {loadingMore ? '正在加载…' : '加载更早的记忆'}
+                  </button></>
+                ) : limit < 200 ? (
                   <> <button type="button" className="mem-text-button" onClick={() => { onLimitChange(200); setSelectedId(null); }}>加载最近 200 条</button></>
                 ) : ' 接口最多返回 200 条，无法继续加载。'}
               </p>
@@ -1447,6 +1548,7 @@ export function MemoryListSection({
                         <span className="mem-record__preview">{row.text}</span>
                         <span className="mem-record__meta">
                           <span>{originLabel(row.origin)}</span><span>{visibilityLabel(row.visibility)}</span>
+                          {row.import_source ? <span className="mem-record__status">AstrBot</span> : null}
                           {status ? <span className="mem-record__status">{status}</span> : null}
                         </span>
                       </button>
@@ -1470,6 +1572,19 @@ export function MemoryListSection({
             <strong>在列表中选择一条记忆</strong>
             <p>查看完整内容、来源和可见范围。</p>
           </div>
+        ) : null}
+        {importPanelOpen ? (
+          <>
+            {/* 阅读态会收起索引列，这里必须有回到列表的出口，否则窄屏会卡在面板里。 */}
+            <button type="button" className="ghost-button mem-inspector__back" data-testid="import-back"
+              onClick={() => { onCloseImport(); onReload(); }}>
+              <ArrowLeftIcon size={15} /> 回到记忆库
+            </button>
+            <MemoryImportPanel
+              onViewImported={() => { onSourceChange('astrbot_memory_companion'); onCloseImport(); }}
+              onClose={() => { onCloseImport(); onReload(); }}
+            />
+          </>
         ) : null}
       </div>
     </section>
@@ -1776,6 +1891,13 @@ export interface MemoryContentBodyProps {
   handlers: MemoryHandlers;
   notice: Notice | null;
   onDismissNotice: () => void;
+  source?: MemoryImportSourceFilter | null;
+  onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
+  importPanelOpen?: boolean;
+  onToggleImport?: () => void;
+  onCloseImport?: () => void;
 }
 
 /**
@@ -1800,6 +1922,13 @@ export function MemoryContentBody({
   handlers,
   notice,
   onDismissNotice,
+  source = null,
+  onSourceChange = () => {},
+  onLoadMore = () => {},
+  loadingMore = false,
+  importPanelOpen = false,
+  onToggleImport = () => {},
+  onCloseImport = () => {},
 }: MemoryContentBodyProps): React.ReactElement {
   return (
     <div className="mem-content">
@@ -1824,6 +1953,14 @@ export function MemoryContentBody({
           onFiltersChange={onFiltersChange}
           handlers={handlers}
           onReload={handlers.reloadList}
+          source={source}
+          onSourceChange={onSourceChange}
+          loadedCount={list.data?.memories.length ?? 0}
+          onLoadMore={onLoadMore}
+          loadingMore={loadingMore}
+          importPanelOpen={importPanelOpen}
+          onToggleImport={onToggleImport}
+          onCloseImport={onCloseImport}
         />
       </div>
       <div hidden={tab !== 'core'}>
@@ -1852,14 +1989,22 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const [flags, setFlags] = useState<TombstoneFlags>({ retracted: false, archived: false });
   const [limit, setLimit] = useState<number>(50);
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_FILTERS);
+  const [source, setSource] = useState<MemoryImportSourceFilter | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [forget, dispatchForget] = useReducer(forgetReducer, INITIAL_FORGET);
 
   const include = includeMode(flags);
-  const latestQuery = useRef({ limit, include });
-  latestQuery.current = { limit, include };
+  const latestQuery = useRef({ limit, include, source });
+  latestQuery.current = { limit, include, source };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
+  // 翻页要读"此刻已取回多少条"，但 `loadMore` 不想因此每次列表变化就换身份
+  // （换了身份，调用方传下去的回调也跟着变）。
+  const listRef = useRef(list);
+  listRef.current = list;
+  const loadingMoreRef = useRef(false);
 
   const loadCore = useCallback(async () => {
     const requestId = ++coreRequest.current;
@@ -1874,11 +2019,15 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     }
   }, []);
 
+  /**
+   * 取第一页。换了来源就从 `offset=0` 重来——来源变了，"已加载多少条"
+   * 说的已经是另一个集合，接着往后续会拼出两段不相干的列表。
+   */
   const loadList = useCallback(async () => {
     const requestId = ++listRequest.current;
     const query = latestQuery.current;
     setList((current) => current.data?.limit === query.limit && current.data.include === query.include
-      ? current : loadingSection<MemoryListResponse>());
+      && (current.data.source ?? null) === query.source ? current : loadingSection<MemoryListResponse>());
     try {
       const data = await api.listMemories(query);
       if (requestId !== listRequest.current) return;
@@ -1889,13 +2038,50 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     }
   }, []);
 
+  /**
+   * 按来源翻到下一页：`offset` 用**当前已经取回的条数**，不另外记账。
+   *
+   * 另外记一个计数器会让"刷新后接着翻"与"来源一变重来"两件事互相打架：
+   * 计数器忘了归零，就会从旧来源的长度继续取，跳掉一整页。
+   */
+  const loadMore = useCallback(async () => {
+    const query = latestQuery.current;
+    const current = listRef.current.data;
+    if (!query.source || !current || !current.has_more || loadingMoreRef.current) return;
+    const offset = current.memories.length;
+    const requestId = ++listRequest.current;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const next = await api.listMemories({ ...query, offset });
+      if (requestId !== listRequest.current) return;
+      setList((state) => state.data ? {
+        status: 'ok',
+        data: {
+          ...next,
+          memories: [...state.data.memories, ...next.memories],
+          offset: state.data.offset,
+        },
+        error: null,
+      } : { status: 'ok', data: next, error: null });
+    } catch (cause) {
+      if (requestId !== listRequest.current) return;
+      setNotice({ tone: 'warn', text: `加载更早的记忆失败：${explainError(cause).reason}` });
+    } finally {
+      if (requestId === listRequest.current) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (tab === 'core') void loadCore();
   }, [loadCore, tab]);
 
   useEffect(() => {
     if (tab === 'content') void loadList();
-  }, [loadList, limit, include, tab]);
+  }, [loadList, limit, include, source, tab]);
 
 
   const handlers: MemoryHandlers = useMemo(
@@ -2018,6 +2204,13 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       handlers={handlers}
       notice={notice}
       onDismissNotice={() => setNotice(null)}
+      source={source}
+      onSourceChange={setSource}
+      onLoadMore={() => void loadMore()}
+      loadingMore={loadingMore}
+      importPanelOpen={importOpen}
+      onToggleImport={() => setImportOpen((open) => !open)}
+      onCloseImport={() => setImportOpen(false)}
     />
   );
 }

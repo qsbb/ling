@@ -1,0 +1,413 @@
+/*
+ * 「导入旧记忆」面板。
+ *
+ * 单独一个文件、类名统一 `import-` 前缀：memory.css 由并行任务维护，这里
+ * 只新增自己的规则，不改它的任何一条。
+ *
+ * 三条继承自记忆页的硬约束，这里同样成立：
+ * 1. 375px 单列、无横向溢出——所有文本容器 `min-width: 0` +
+ *    `overflow-wrap: anywhere`，长 QQ 号、长样本文字都不会撑开；
+ * 2. 窄屏触控 ≥ 44×44；
+ * 3. 不靠颜色单独表达状态：零可导入、错误、结果都有文字标题。
+ *
+ * 视觉上它是一张"纸"而不是一层浮窗：记忆库是内容页，浮窗会盖掉刚导入的
+ * 结果。所以确认后仍留在原位，由底部按钮把人带回列表。
+ */
+
+.import-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-card);
+  padding: clamp(14px, 2vw, 20px);
+  overflow-wrap: anywhere;
+}
+
+.import-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.import-panel__head h2 {
+  margin: 0;
+  font: 500 19px/1.3 var(--font-serif);
+  letter-spacing: .03em;
+}
+
+.import-panel__head h2:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.import-panel__close {
+  display: inline-grid;
+  place-items: center;
+  min-width: 36px;
+  min-height: 36px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-soft);
+}
+
+.import-panel__close:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.import-panel__busy {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* --------------------------------------------------------------- 选文件 */
+
+.import-drop {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 5px;
+  min-height: 148px;
+  padding: 20px 16px;
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 13px;
+  background: var(--paper);
+  cursor: pointer;
+  text-align: center;
+}
+
+.import-drop:hover,
+.import-drop--over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.import-drop:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * 原生 file 控件在 Safari/Chrome 里样式各异且很难压进卡片，这里把 input
+ * 视觉隐藏但**保持可聚焦、可点击**（用 label 承载点击，键盘从 input 进入）。
+ */
+.import-drop input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.import-drop__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.import-drop__meta {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.import-retained {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.import-retained > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.import-retained strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.import-retained span {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.import-retained__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* --------------------------------------------------------------- 错误 */
+
+.import-error {
+  display: flex;
+  gap: 9px;
+  padding: 11px 13px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--danger, #b4574f);
+  border-radius: 11px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.import-error svg { flex: none; margin-top: 2px; }
+.import-error strong { font-size: 13.5px; }
+.import-error p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.6; color: var(--ink-soft); }
+.import-error__trace { font-variant-numeric: tabular-nums; }
+
+/* --------------------------------------------------------------- 预览 */
+
+.import-facts {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.import-facts__wide { min-width: 0; }
+.import-facts dt { font-size: 12px; color: var(--ink-soft); margin-bottom: 3px; }
+.import-facts dd {
+  margin: 0;
+  font-size: 15px;
+  color: var(--ink);
+  line-height: 1.5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 9px;
+}
+
+.import-facts dd code {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.import-pair {
+  font-variant-numeric: tabular-nums;
+  font-size: 15.5px !important;
+  letter-spacing: .01em;
+}
+
+.import-pair__arrow { color: var(--ink-soft); }
+
+.import-count-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 9px;
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.import-count-block__value {
+  font: 600 30px/1 var(--font-serif);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.import-count-block__unit { font-size: 14px; color: var(--ink); }
+.import-count-block__total { margin-inline-start: auto; font-size: 12px; color: var(--ink-soft); }
+
+.import-count-block--empty { border-style: dashed; }
+
+.import-zero {
+  display: block;
+  padding: 12px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 11px;
+  background: var(--paper);
+}
+
+.import-zero strong { display: block; font-size: 14px; }
+.import-zero p { margin: 5px 0 0; font-size: 13px; line-height: 1.62; color: var(--ink-soft); }
+
+.import-samples { min-width: 0; }
+.import-samples h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.import-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.import-samples ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 7px;
+  max-height: min(38vh, 320px);
+  overflow: auto;
+}
+
+.import-samples li {
+  display: grid;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-raised);
+  min-width: 0;
+}
+
+.import-sample__kind {
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.import-sample__text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.import-samples time {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------- 次一级：重复与跳过 */
+
+.import-secondary {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.import-secondary > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.import-secondary__sum { font-variant-numeric: tabular-nums; }
+
+.import-skip {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0 13px 12px;
+}
+
+.import-skip > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.import-skip dt { min-width: 0; }
+.import-skip dd { margin: 0; font-variant-numeric: tabular-nums; color: var(--ink); }
+
+/* --------------------------------------------------------------- 动作 */
+
+.import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+}
+
+.import-expiry {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------- 结果 */
+
+.import-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px 20px;
+  padding: 14px 15px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.import-result__main {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 14px;
+}
+
+.import-result__main svg { color: var(--accent); align-self: center; }
+
+.import-result__rest {
+  display: flex;
+  gap: 18px;
+  margin: 0 0 0 auto;
+}
+
+.import-result__rest > div { text-align: end; }
+.import-result__rest dt { font-size: 12px; color: var(--ink-soft); }
+.import-result__rest dd {
+  margin: 0;
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+@media (max-width: 760px) {
+  .import-panel__close,
+  .import-secondary > summary,
+  .import-actions .button,
+  .import-actions .ghost-button,
+  .import-retained__actions .button,
+  .import-retained__actions .ghost-button {
+    min-height: 44px;
+  }
+
+  .import-drop { min-height: 132px; }
+  .import-count-block__total { margin-inline-start: 0; }
+  .import-result__rest { margin-inline-start: 0; }
+  .import-samples ul { max-height: none; }
+}

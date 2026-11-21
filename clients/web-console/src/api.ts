@@ -63,7 +63,10 @@ import type {
   CoreMemoryInput,
   CoreMemoryListResponse,
   MemoryInclude,
+  MemoryImportCommit,
+  MemoryImportPreview,
   MemoryListResponse,
+  MemoryImportSourceFilter,
   LogQuery,
   LogsResponse,
   RecallProposal,
@@ -71,6 +74,9 @@ import type {
   VoiceReferenceUpload,
 } from './types';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
+
+/** 两个导入端点的请求格式：文件原始字节，NDJSON。 */
+export const IMPORT_CONTENT_TYPE = 'application/x-ndjson';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -1248,17 +1254,71 @@ export const api = {
 
   /* ------------------------------------------------------------ 记忆
    *
-   * 只调用 docs/API-WEB-V1.md §10 冻结的 8 个端点。刻意**没有**：
-   * 单条详情（GET /v1/memory/{id} 不存在）、分页（没有 offset/cursor）、
-   * memory_episodes / 实体 / 向量 / 检索日志的读取端点。
+   * 只调用 docs/API-WEB-V1.md §10 冻结的端点，外加
+   * docs/ASTRBOT-MEMORY-IMPORT.md 定义的两个导入端点。刻意**没有**：
+   * 单条详情（GET /v1/memory/{id} 不存在）、memory_episodes / 实体 / 向量 /
+   * 检索日志的读取端点。
    */
 
-  /** 记忆列表。`include` 不传 = 只看现行记忆（未撤回且未归档）。 */
-  listMemories(options: { limit?: number; include?: MemoryInclude | null } = {}): Promise<MemoryListResponse> {
+  /**
+   * 记忆列表（记忆库视图）。
+   *
+   * `include` 不传 = 只看现行记忆（未撤回且未归档）。
+   *
+   * `source` 只在 `view=library` 下合法，且服务端要求带 `source` 时一并给
+   * `offset`（`offset` 单独出现是 422）。这里把两者绑在一起发：调用方只
+   * 说明「按哪个来源、从第几条开始」，拼合法请求是这一层的事。
+   */
+  listMemories(
+    options: {
+      limit?: number;
+      include?: MemoryInclude | null;
+      source?: MemoryImportSourceFilter | null;
+      offset?: number;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<MemoryListResponse> {
     const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
-    if (options.include) query.set('include', options.include);
     query.set('view', 'library');
-    return request<MemoryListResponse>(`/v1/memory?${query.toString()}`);
+    if (options.include) query.set('include', options.include);
+    if (options.source) {
+      query.set('source', options.source);
+      query.set('offset', String(options.offset ?? 0));
+    }
+    return request<MemoryListResponse>(`/v1/memory?${query.toString()}`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+  },
+
+  /**
+   * 预览一次 AstrBot 迁移文件（只读）。
+   *
+   * 请求体是**文件原始字节**：后端按这份字节算摘要，并用它签确认令牌。
+   * 所以这里既不读成文本、也不做转码——`body: file` 就是原文；换成
+   * `file.text()` 会让摘要对不上，确认时必然 `preview_invalid`。
+   */
+  previewMemoryImport(file: File, signal?: AbortSignal): Promise<MemoryImportPreview> {
+    return request<MemoryImportPreview>('/v1/memory/import/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': IMPORT_CONTENT_TYPE },
+      body: file,
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /**
+   * 确认导入：带预览给的令牌，服务端重新核对同一份字节。
+   *
+   * 回包里 `imported` 可能与预览的 `accepted` 不同（确认时又到期的、并发
+   * 已写入的都算重复），页面以这个值为准。
+   */
+  commitMemoryImport(file: File, token: string, signal?: AbortSignal): Promise<MemoryImportCommit> {
+    return request<MemoryImportCommit>('/v1/memory/import/commit', {
+      method: 'POST',
+      headers: { 'Content-Type': IMPORT_CONTENT_TYPE, 'X-Ling-Import-Token': token },
+      body: file,
+      ...(signal ? { signal } : {}),
+    });
   },
 
   /** 撤回一条记忆：必填理由；重复撤回幂等。 */
