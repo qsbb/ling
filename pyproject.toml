@@ -77,7 +77,7 @@ dev = [
 # 发原始 wav/mp3——NapCat 收到非 SILK 会去调宿主机上不存在的
 # `ntsilk_s16le` muxer，用户一条语音都收不到。
 speech-codecs = ["pysilk-mod>=1.6.4,<2"]
-stage = ["simpleobsws>=1.4.3,<2", "pyvts>=0.3.3,<0.4", "aiofiles>=24,<27"]
+stage = ["simpleobsws>=1.4.3,<2", "pyvts>=0.3.3,<0.4", "aiofiles>=24,<27", "filelock>=3.16,<4"]
 # 本地开发/CI 使用的便携 PostgreSQL（无 Docker 时的真实数据库测试）
 # 便携 PostgreSQL 由 scripts/dev_pg.sh 在 Python 3.11 侧 venv 安装（pgserver 无 cp313 wheel）
 

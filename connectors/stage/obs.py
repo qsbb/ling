@@ -53,6 +53,10 @@ class ObsStage:
     async def stream_status(self) -> dict[str, Any]:
         return await self._call("GetStreamStatus", {})
 
+    async def stream_server(self) -> str:
+        response = await self._call("GetStreamServiceSettings", {})
+        return str(response["streamServiceSettings"].get("server", ""))
+
     async def prepare(self, *, switch_scene: bool = False) -> None:
         items = await self._call("GetSceneItemList", {"sceneName": self.program.scene})
         required = {self.program.audio, self.program.captions}
