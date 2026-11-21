@@ -577,6 +577,28 @@ async function assertNoHorizontalOverflow(
   return widths;
 }
 
+it('1920：生活页在主栏内居中，状态标题保持单行', async (ctx) => {
+  if (skip(ctx)) return;
+  const page = await openRoute('/life', { width: 1920, height: 1080 }, 'life-presence');
+  const layout = await page.getByTestId('life-presence').evaluate((card) => {
+    const main = card.closest('main')!.getBoundingClientRect();
+    const bounds = card.getBoundingClientRect();
+    const title = document.createRange();
+    title.selectNodeContents(card.querySelector('h1')!);
+    return {
+      width: bounds.width,
+      left: bounds.left - main.left,
+      right: main.right - bounds.right,
+      lines: new Set(Array.from(title.getClientRects(), (rect) => rect.top)).size,
+    };
+  });
+  expect(layout.width).toBeGreaterThanOrEqual(960);
+  expect(layout.width).toBeLessThanOrEqual(980);
+  expect(Math.abs(layout.left - layout.right)).toBeLessThan(20);
+  expect(layout.lines).toBe(1);
+  await assertNoHorizontalOverflow(page, 'life 1920', ['page']);
+}, TIMEOUT);
+
   it(
     '此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退',
     async (ctx) => {
