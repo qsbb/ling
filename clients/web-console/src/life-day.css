@@ -1,0 +1,149 @@
+/* 生活首页：先看一个人，再看这一天；运营状态不占据首屏。 */
+.life-page {
+  max-width: 980px;
+  color: #3f413b;
+}
+
+.life-page__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  margin-bottom: 20px;
+}
+
+.life-page__header .page__title { margin: 0; }
+
+.life-rhythm-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.life-rhythm-link:hover { color: var(--text); background: var(--accent-soft); }
+
+.life-hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  align-items: center;
+  min-height: 274px;
+  overflow: hidden;
+  padding: 34px 44px;
+  border: 1px solid #e3dccd;
+  border-radius: 18px;
+  background: linear-gradient(112deg, #f8f4e9 0%, #f3eddf 65%, #ebe5d6 100%);
+}
+
+.life-hero__copy { position: relative; z-index: 1; }
+.life-hero__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 19px;
+  color: #7c806e;
+  font-size: 13px;
+  letter-spacing: .12em;
+}
+.life-hero__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #a1a28f;
+}
+.life-hero--active .life-hero__dot { background: #778c69; box-shadow: 0 0 0 4px #778c6912; }
+.life-hero h1 {
+  max-width: 390px;
+  margin: 0;
+  color: #45473e;
+  font-family: Georgia, 'Songti SC', 'Noto Serif CJK SC', serif;
+  font-size: clamp(26px, 3.1vw, 36px);
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: -.035em;
+}
+.life-hero__copy > p {
+  max-width: 390px;
+  margin: 12px 0 0;
+  color: #888578;
+  font-size: 14px;
+  line-height: 1.9;
+}
+.life-hero__meta { display: flex; gap: 14px; margin-top: 18px; color: #999181; font-size: 12px; }
+.life-scene { width: 100%; height: auto; opacity: .94; }
+.life-scene__steam { opacity: .6; }
+@media (prefers-reduced-motion: no-preference) {
+  .life-scene__steam { animation: life-steam 4s ease-in-out infinite; }
+  @keyframes life-steam { 50% { opacity: .2; transform: translateY(-3px); } }
+}
+
+.life-today { margin: 35px 5px 0; }
+.life-section-heading { display: flex; align-items: baseline; gap: 16px; }
+.life-section-heading h2, .life-later h2 {
+  margin: 0;
+  color: #53564b;
+  font-family: Georgia, 'Songti SC', serif;
+  font-size: 22px;
+  font-weight: 500;
+}
+.life-section-heading time { color: #9b9689; font-size: 12px; }
+.life-day-list { list-style: none; padding: 0; margin: 22px 0 0; }
+.life-day-list li { display: grid; grid-template-columns: 56px 20px minmax(0, 1fr); min-height: 65px; }
+.life-day-list > li > time { padding-top: 3px; color: #8e8b7d; font-size: 13px; font-variant-numeric: tabular-nums; }
+.life-day-list__line { position: relative; display: flex; justify-content: center; }
+.life-day-list__line::after { content: ''; position: absolute; top: 12px; bottom: -2px; width: 1px; background: #e3ddcf; }
+.life-day-list li:last-child .life-day-list__line::after { display: none; }
+.life-day-list__line i { z-index: 1; width: 7px; height: 7px; margin-top: 7px; border: 1px solid #b0ad9c; border-radius: 50%; background: var(--bg); }
+.life-day-list li:first-child .life-day-list__line i { border-color: #829274; background: #829274; box-shadow: 0 0 0 4px #82927410; }
+.life-day-list li > div { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 0 0 22px 9px; }
+.life-day-list strong { color: #55574e; font-size: 15px; font-weight: 500; }
+.life-day-list li > div > span { flex: none; color: #aaa395; font-size: 11px; }
+.life-day-empty { margin: 20px 0 0 76px; color: #969184; font-size: 14px; }
+.life-happened { margin: 1px 0 0 76px; padding: 17px 20px; border-left: 2px solid #ded8c9; background: #eee9dc55; }
+.life-happened h3 { margin: 0 0 7px; color: #969082; font-size: 11px; font-weight: 500; }
+.life-happened p { margin: 0; color: #6c6c60; font-size: 13px; line-height: 1.7; }
+
+.life-later { margin: 33px 5px 0; padding-top: 27px; border-top: 1px solid #e4dfd4; }
+.life-later h2 { font-size: 18px; }
+.life-later__items { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 25px; margin-top: 20px; }
+.life-later__items > div { display: flex; flex-direction: column; gap: 7px; }
+.life-later__items span { color: #aaa395; font-size: 11px; }
+.life-later__items strong { color: #68695e; font-size: 14px; font-weight: 500; }
+.life-later__items time { color: #969184; font-size: 12px; }
+
+.life-full-schedule { margin: 36px 5px 0; border-top: 1px solid #e1dcd0; }
+.life-full-schedule summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 19px 2px; color: #77796e; cursor: pointer; font-size: 14px; list-style: none; }
+.life-full-schedule summary::-webkit-details-marker { display: none; }
+.life-full-schedule summary::after { content: '+'; order: 3; color: #9e9b8e; font-size: 19px; }
+.life-full-schedule[open] summary::after { content: '−'; }
+.life-full-schedule__hint { margin-left: auto; color: #aaa395; font-size: 11px; }
+.life-full-schedule__body { padding: 0 0 20px; }
+.life-full-schedule .tl-panel__title { display: none; }
+.life-full-schedule .tl-window { margin-top: 0; }
+
+@media (max-width: 700px) {
+  .life-page__header { margin-bottom: 14px; }
+  .life-hero { grid-template-columns: minmax(0, 1fr) 155px; min-height: 235px; padding: 28px 24px; }
+  .life-hero h1 { font-size: 25px; }
+  .life-hero__copy > p { font-size: 13px; }
+  .life-scene { width: 185px; max-width: none; margin-left: -25px; }
+  .life-later__items { grid-template-columns: 1fr; gap: 19px; }
+}
+@media (max-width: 460px) {
+  .life-hero { display: block; padding: 27px 24px 18px; }
+  .life-hero__copy { max-width: 100%; }
+  .life-hero h1 { max-width: 280px; font-size: 25px; }
+  .life-scene { display: block; width: 170px; margin: -12px -4px -8px auto; }
+  .life-today { margin-top: 28px; }
+  .life-day-list li { grid-template-columns: 48px 18px minmax(0, 1fr); }
+  .life-day-list li > div { display: block; }
+  .life-day-list li > div > span { display: block; margin-top: 5px; }
+  .life-day-empty, .life-happened { margin-left: 66px; }
+  .life-full-schedule__hint { display: none; }
+}

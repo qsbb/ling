@@ -56,6 +56,11 @@ export function lifeTabFromHref(href: string): LifeTab {
   return 'now';
 }
 
-export function lifeTabHref(tab: LifeTab): string {
-  return tab === 'rhythm' ? '/life?tab=rhythm' : '/life';
+export function lifeTabHref(tab: LifeTab, href?: string): string {
+  if (href === undefined) return tab === 'rhythm' ? '/life?tab=rhythm' : '/life';
+  const url = new URL(href, 'http://localhost');
+  url.pathname = '/life';
+  if (tab === 'rhythm') url.searchParams.set('tab', 'rhythm');
+  else url.searchParams.delete('tab');
+  return `${url.pathname}${url.search}${url.hash}`;
 }

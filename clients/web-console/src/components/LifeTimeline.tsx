@@ -1412,7 +1412,9 @@ export interface LifeTimelinePanelProps {
   title?: string;
   /** 默认走真实 `api`；测试注入假实现。 */
   client?: TimelinePanelApi;
-  /** 轮询参数留给测试钉住时间（生产用默认 1.5s / 60s）。 */
+  /** 首屏已读取的时间轴；生成终态后仍由此面板重读。 */
+  timeline?: LifeTimelineOut | null;
+  onTimelineChange?: (timeline: LifeTimelineOut) => void;
   pollMs?: number;
   maxMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -1432,13 +1434,15 @@ export interface LifeTimelinePanelProps {
 export function LifeTimelinePanel({
   title = '今天的时间轴',
   client = api,
+  timeline: initialTimeline = null,
+  onTimelineChange,
   pollMs,
   maxMs,
   sleep,
   makeRequestId,
 }: LifeTimelinePanelProps) {
-  const [timeline, setTimeline] = useState<LifeTimelineOut | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [timeline, setTimeline] = useState<LifeTimelineOut | null>(initialTimeline);
+  const [loading, setLoading] = useState(initialTimeline === null);
   const [error, setError] = useState<ExplainedError | null>(null);
   const [view, setView] = useState<OutlineJobView>(OUTLINE_IDLE_VIEW);
 
@@ -1446,17 +1450,26 @@ export function LifeTimelinePanel({
     setLoading(true);
     setError(null);
     try {
-      setTimeline(await client.lifeTimeline());
+      const next = await client.lifeTimeline();
+      setTimeline(next);
+      onTimelineChange?.(next);
     } catch (cause) {
       setError(explainError(cause));
     } finally {
       setLoading(false);
     }
-  }, [client]);
+  }, [client, onTimelineChange]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (initialTimeline === null) void load();
+  }, [initialTimeline, load]);
+
+  useEffect(() => {
+    if (initialTimeline !== null) {
+      setTimeline(initialTimeline);
+      setLoading(false);
+    }
+  }, [initialTimeline]);
 
   // 调度器跟着这一块的生命周期走：卸载后不再往已消失的组件里写状态。
   const mounted = useRef(true);

@@ -521,6 +521,11 @@ async function openRoute(
   });
 
   await page.goto(`${baseUrl}${path}`, { waitUntil: 'domcontentloaded' });
+  if (waitTestId === 'life-timeline') {
+    await page.locator('[data-testid="life-full-schedule"]').evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+  }
   await page.locator(`[data-testid="${waitTestId}"]`).waitFor();
   return page;
 }
@@ -571,6 +576,61 @@ async function assertNoHorizontalOverflow(
   }
   return widths;
 }
+
+  it(
+    '此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退',
+    async (ctx) => {
+      if (skip(ctx)) return;
+      const page = await openRoute('/life?from=test', { width: 375, height: 667 }, 'life-presence');
+      expect(await page.locator('[data-testid="life-full-schedule"]').getAttribute('open')).toBeNull();
+      await page.screenshot({ path: '/tmp/ling-life-now-mobile.png', fullPage: true });
+      await assertNoHorizontalOverflow(page, 'life 375 默认首屏', ['page']);
+      await page.getByRole('button', { name: '生活节奏' }).click();
+      await page.getByRole('heading', { name: '生活与活动', exact: true }).waitFor();
+      const rhythm = new URL(page.url());
+      expect(rhythm.pathname + rhythm.search).toBe('/life?from=test&tab=rhythm');
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: '生活与活动', exact: true }).waitFor();
+      await page.getByRole('button', { name: '返回生活' }).click();
+      await page.locator('[data-testid="life-presence"]').waitFor();
+      expect(new URL(page.url()).search).toBe('?from=test');
+      await page.goBack();
+      await page.getByRole('heading', { name: '生活与活动', exact: true }).waitFor();
+      await page.goForward();
+      await page.locator('[data-testid="life-presence"]').waitFor();
+      expect(new URL(page.url()).search).toBe('?from=test');
+    },
+    TIMEOUT,
+  );
+
+  it(
+    '时间轴失败仍展示已确认的 running 活动，不把计划当此刻',
+    async (ctx) => {
+      if (skip(ctx)) return;
+      const page = await openRoute('/life', { width: 1440, height: 900 }, 'life-presence');
+      await page.route('**/v1/**', async (route) => {
+        const pathname = new URL(route.request().url()).pathname;
+        if (pathname === '/v1/activity') {
+          return route.fulfill(json({ current: {
+            activity_id: 'a', kind: 'reading', state: 'running', origin: 'simulated',
+            started_at: '2026-11-08T00:05:00Z', ended_at: null,
+            completion_evidence: null, note: '窗边有点风。',
+          }, history: [], note: '' }));
+        }
+        if (pathname === '/v1/life/timeline') {
+          return route.fulfill(json({ error: { code: 'offline', message: 'timeline offline' } }, 503));
+        }
+        return route.continue();
+      });
+      await page.getByRole('button', { name: '生活节奏' }).click();
+      await page.getByRole('heading', { name: '生活与活动', exact: true }).waitFor();
+      await page.getByRole('button', { name: '返回生活' }).click();
+      await expect.poll(() => page.locator('[data-testid="life-presence"]').innerText()).toContain('正在读书');
+      await expect.poll(() => page.locator('[data-testid="life-presence"]').innerText()).toContain('窗边有点风。');
+      await expect.poll(() => page.getByRole('alert').innerText()).toContain('timeline offline');
+    },
+    TIMEOUT,
+  );
 
 /* ------------------------------------------------------------ 测试 */
 
@@ -682,8 +742,17 @@ describe('真实浏览器：手动生成日程', () => {
       // 提交之前一律是空计划（按钮 = 生成）；提交之后（终态重读）是 ready 的计划。
       // 不用"第 n 次读取"计数：React 严格模式下开发环境会读两次。
       const posted = { value: false };
+      const generated = {
+        ...TIMELINE,
+        segments: [...TIMELINE.segments, {
+          ...TIMELINE.segments[3]!,
+          segment_id: 'generated-reading',
+          title: '读一会儿书',
+          display_end_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        }],
+      };
       const mock = scheduleMock({
-        timeline: () => (posted.value ? TIMELINE : EMPTY_TIMELINE),
+        timeline: () => (posted.value ? generated : EMPTY_TIMELINE),
         create: () => {
           posted.value = true;
           return { status: 202, body: jobPayload() };
@@ -726,6 +795,7 @@ describe('真实浏览器：手动生成日程', () => {
       );
       expect(mock.calls.polls.length).toBeGreaterThanOrEqual(2);
       expect(mock.calls.timelineReads).toBeGreaterThanOrEqual(2); // 终态后重读了时间轴
+      await expect.poll(() => page.locator('.life-today').innerText()).toContain('读一会儿书');
 
       // 重排：点一下先出确认条，**没确认之前不发请求**。
       const before = mock.calls.posts.length;

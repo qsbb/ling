@@ -105,6 +105,8 @@ describe('生活页 tab：?tab=rhythm ↔ 生活节奏', () => {
     }
     expect(lifeTabHref('rhythm')).toBe('/life?tab=rhythm');
     expect(lifeTabHref('now')).toBe('/life');
+    expect(lifeTabHref('rhythm', '/life?from=test')).toBe('/life?from=test&tab=rhythm');
+    expect(lifeTabHref('now', '/life?from=test&tab=rhythm')).toBe('/life?from=test');
   });
 });
 
