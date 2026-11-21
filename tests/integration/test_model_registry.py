@@ -130,3 +130,56 @@ async def test_probe_reports_checked_at(logged_in: TestEnv) -> None:
     assert body["ok"] is True
     assert isinstance(body["latency_ms"], int)
     assert datetime.fromisoformat(body["checked_at"])
+
+
+async def test_model_probe_uses_the_model_id_from_each_requested_row(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    await _publish_models(logged_in)
+    calls: list[str] = []
+
+    async def probe_model(config, provider_id: str, model_id: str):
+        calls.append(model_id)
+        from ling.ports.model import ProbeResult
+
+        return ProbeResult(
+            ok=model_id == "deterministic",
+            detail="模型已返回文本" if model_id == "deterministic" else "模型调用失败",
+            latency_ms=7,
+        )
+
+    monkeypatch.setattr(logged_in.app.state.router, "probe_model", probe_model)
+    first = await logged_in.client.post(
+        "/v1/settings/providers/fake/model-probe", json={"model_id": "vision-1"}
+    )
+    second = await logged_in.client.post(
+        "/v1/settings/providers/fake/model-probe", json={"model_id": "deterministic"}
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert calls == ["vision-1", "deterministic"]
+    assert first.json()["model_id"] == "vision-1"
+    assert first.json()["ok"] is False
+    assert second.json()["model_id"] == "deterministic"
+    assert second.json()["ok"] is True
+
+
+async def test_model_probe_rejects_ids_not_in_the_saved_provider_list(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    await _publish_models(logged_in)
+    called = False
+
+    async def probe_model(config, provider_id: str, model_id: str):
+        nonlocal called
+        called = True
+        raise AssertionError("unlisted model must not be called")
+
+    monkeypatch.setattr(logged_in.app.state.router, "probe_model", probe_model)
+    response = await logged_in.client.post(
+        "/v1/settings/providers/fake/model-probe", json={"model_id": "not-listed"}
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert "不在已保存" in response.json()["detail"]
+    assert called is False

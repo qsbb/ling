@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import time
+import wave
 
+import httpx
 from fastapi import APIRouter, File, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +36,8 @@ from ling.ports.model import (
     SLOT_HINTS,
     SLOT_LABELS,
     SLOT_ORDER,
+    ProbeResult,
+    ProviderKind,
     provider_capabilities,
     required_capability,
     slot_for_profile,
@@ -96,6 +101,10 @@ class ProviderIn(BaseModel):
     timeout_seconds: float = 60.0
     max_output_tokens: int | None = None
     daily_token_limit: int | None = None
+
+
+class ProviderModelProbeIn(BaseModel):
+    model_id: str = Field(min_length=1, max_length=200)
 
 
 class ProfileIn(BaseModel):
@@ -1837,7 +1846,14 @@ async def probe_provider(
 ) -> dict[str, object]:
     effective = await config.effective()
     started = time.monotonic()
-    result = await router_.probe(effective, provider_id)
+    provider = effective.providers.get(provider_id)
+    if provider and provider.kind in {
+        ProviderKind.dashscope_asr.value,
+        ProviderKind.siliconflow_asr.value,
+    }:
+        result = await _probe_asr_catalog(provider, config)
+    else:
+        result = await router_.probe(effective, provider_id)
     # 有的 provider 自己量了延迟（fake 是 0），有的没有（OpenAI 兼容接口的
     # probe 只拉 /models）。没有就由路由补上整次探测的墙钟时间——界面要显示
     # 「多少毫秒」，null 会变成「null 毫秒」。
@@ -1856,6 +1872,153 @@ async def probe_provider(
         # 时间戳只用于界面标注"这次检查发生在什么时候"。
         "checked_at": utcnow().isoformat(),
     }
+
+
+@router.post("/settings/providers/{provider_id}/model-probe")
+async def probe_provider_model(
+    provider_id: str,
+    body: ProviderModelProbeIn,
+    auth: OwnerWriteAction,
+    config: ConfigDep,
+    router_: RouterDep,
+) -> dict[str, object]:
+    effective = await config.effective()
+    provider = effective.providers.get(provider_id)
+    model_id = body.model_id.strip()
+    if provider is None:
+        result = ProbeResult(ok=False, detail="供应商不存在")
+    elif not any(model.model_id == model_id for model in provider.models):
+        result = ProbeResult(ok=False, detail="该模型不在已保存的模型清单中")
+    elif provider.kind in {
+        ProviderKind.dashscope_asr.value,
+        ProviderKind.siliconflow_asr.value,
+    }:
+        result = await _probe_asr_model(provider, model_id, config)
+    else:
+        result = await router_.probe_model(effective, provider_id, model_id)
+    return {
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "ok": result.ok,
+        "detail": result.detail,
+        "latency_ms": result.latency_ms or 0,
+        "models": result.models,
+        "checked_at": utcnow().isoformat(),
+    }
+
+
+async def _probe_asr_catalog(provider, config) -> ProbeResult:
+    secret = await config.read_secret(provider.provider_id)
+    if not secret:
+        return ProbeResult(ok=False, detail="供应商尚未保存密钥")
+    base = (provider.base_url or "").rstrip("/")
+    if provider.kind == ProviderKind.dashscope_asr.value:
+        if not base:
+            base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        elif base.endswith("/api/v1"):
+            base = base.removesuffix("/api/v1") + "/compatible-mode/v1"
+    else:
+        base = base or "https://api.siliconflow.cn/v1"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{base}/models", headers={"Authorization": f"Bearer {secret}"}
+            )
+    except httpx.TimeoutException:
+        return ProbeResult(ok=False, detail="连接检查超时")
+    except httpx.HTTPError:
+        return ProbeResult(ok=False, detail="无法连接供应商模型目录")
+    if response.status_code in (401, 403):
+        return ProbeResult(ok=False, detail="鉴权失败：密钥无效或权限不足")
+    if response.status_code >= 400:
+        return ProbeResult(ok=False, detail=f"模型目录返回 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+        models = [
+            str(item["id"])
+            for item in payload.get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+    except (ValueError, AttributeError):
+        return ProbeResult(ok=False, detail="模型目录响应格式无效")
+    return ProbeResult(ok=True, detail="鉴权通过，已读取模型目录", models=models[:100])
+
+
+async def _probe_asr_model(provider, model_id: str, config) -> ProbeResult:
+    if "realtime" in model_id.lower():
+        return ProbeResult(
+            ok=False,
+            detail="这是实时语音模型；当前 Ling 识别接口只支持文件转写",
+        )
+    secret = await config.read_secret(provider.provider_id)
+    if not secret:
+        return ProbeResult(ok=False, detail="供应商尚未保存密钥")
+    if provider.kind == ProviderKind.dashscope_asr.value:
+        from ling.models.dashscope_asr import DashScopeAsr
+
+        base_url = provider.base_url or "https://dashscope.aliyuncs.com/api/v1"
+        if base_url.rstrip("/").endswith("/compatible-mode/v1"):
+            base_url = base_url.rstrip("/").removesuffix("/compatible-mode/v1") + "/api/v1"
+        adapter = DashScopeAsr(
+            provider_id=provider.provider_id,
+            api_key=secret,
+            base_url=base_url,
+            timeout_seconds=provider.timeout_seconds,
+        )
+    else:
+        from ling.models.siliconflow_asr import SiliconFlowAsr
+
+        adapter = SiliconFlowAsr(
+            provider_id=provider.provider_id,
+            api_key=secret,
+            base_url=provider.base_url or "https://api.siliconflow.cn/v1",
+            timeout_seconds=provider.timeout_seconds,
+        )
+
+    # Only a short silent WAV is sent; user audio is never included in a probe.
+    audio_bytes = io.BytesIO()
+    with wave.open(audio_bytes, "wb") as audio_file:
+        audio_file.setnchannels(1)
+        audio_file.setsampwidth(2)
+        audio_file.setframerate(16000)
+        audio_file.writeframes(b"\x00\x00" * 8000)
+    from ling.ports.speech import (
+        AsrRequest,
+        AudioInput,
+        AudioSpec,
+        SpeechCall,
+        SpeechError,
+        SpeechErrorKind,
+    )
+
+    audio = AudioInput(
+        content=audio_bytes.getvalue(),
+        filename="probe.wav",
+        spec=AudioSpec(
+            mime_type="audio/wav", container="wav", codec="pcm_s16le",
+            sample_rate_hz=16000, channels=1,
+        ),
+    )
+    started = time.monotonic()
+    try:
+        result = await adapter.transcribe(
+            AsrRequest(model_id, audio),
+            call=SpeechCall("provider-model-probe", "provider-model-probe", "settings", None, 0),
+        )
+        detail = "模型已完成识别请求" if result.text else "模型已响应，但没有识别出文字"
+        return ProbeResult(ok=True, detail=detail, latency_ms=int((time.monotonic() - started) * 1000))
+    except SpeechError as exc:
+        if exc.kind is SpeechErrorKind.unintelligible:
+            return ProbeResult(
+                ok=True,
+                detail="模型已响应；静音测试音频没有识别出文字",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        return ProbeResult(
+            ok=False,
+            detail=f"模型识别测试失败：{exc.message}",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
 
 
 @router.get("/settings/health")

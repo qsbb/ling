@@ -1033,6 +1033,12 @@ export const api = {
       { method: 'POST' },
     );
   },
+  probeProviderModel(providerId: string, modelId: string): Promise<ProbeResult> {
+    return request<ProbeResult>(
+      `/v1/settings/providers/${encodeURIComponent(providerId)}/model-probe`,
+      jsonInit('POST', { model_id: modelId }),
+    );
+  },
   /** 今日各供应商已用 token。取不到时页面照常工作，只是不显示用量。 */
   settingsUsage(): Promise<{
     day: string | null;

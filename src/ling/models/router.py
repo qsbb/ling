@@ -480,6 +480,65 @@ class ModelRouter:
         except Exception as exc:  # noqa: BLE001
             return ProbeResult(ok=False, detail=f"连接检查失败: {exc}")
 
+    async def probe_model(
+        self, config: EffectiveConfig, provider_id: str, model_id: str
+    ) -> ProbeResult:
+        """Use a tiny text request to verify that one listed model can generate."""
+        cfg = config.providers.get(provider_id)
+        if cfg is None:
+            return ProbeResult(ok=False, detail=f"provider 未登记: {provider_id}")
+        try:
+            provider = self._registry.get(cfg)
+        except UnknownProviderError as exc:
+            return ProbeResult(ok=False, detail=str(exc))
+
+        request = ModelRequest(
+            model_id=model_id,
+            messages=[ChatMessageIn(role="user", content="Reply with OK.")],
+            max_tokens=4,
+            profile="dialogue.fast",
+            config_revision=config.revision,
+            timeout_seconds=min(cfg.timeout_seconds, 30.0),
+        )
+        stream = provider.stream(request)
+        started = time.monotonic()
+        try:
+            async for chunk in stream:
+                if chunk.delta:
+                    return ProbeResult(
+                        ok=True,
+                        detail="模型已返回文本",
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                    )
+                if chunk.done:
+                    return ProbeResult(
+                        ok=False,
+                        detail="模型请求完成，但没有返回文本",
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                    )
+            return ProbeResult(
+                ok=False,
+                detail="模型连接结束，没有返回结果",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        except ModelError as exc:
+            return ProbeResult(
+                ok=False,
+                detail=f"模型调用失败：{exc.message}",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("model probe failed provider=%s model=%s", provider_id, model_id)
+            return ProbeResult(
+                ok=False,
+                detail="模型调用失败，请检查端点、模型 ID 和服务端日志",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
     def health_snapshot(self) -> dict[str, dict[str, object]]:
         return {
             key: {

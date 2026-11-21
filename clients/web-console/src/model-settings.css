@@ -758,6 +758,29 @@
   font-size: 10.5px;
 }
 
+.ms-model__probe {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 10.5px;
+}
+
+.ms-model__probe-result {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.ms-model__probe-result--ok {
+  color: var(--ms-success, #28774b);
+}
+
+.ms-model__probe-result--error {
+  color: var(--ms-danger);
+}
+
 .ms-rolechip {
   display: inline-flex;
   align-items: center;

@@ -358,6 +358,14 @@ describe('供应商原生工具配置', () => {
   });
 });
 
+describe('供应商模型逐项测试', () => {
+  it('每个已列模型都有自己的测试操作', () => {
+    const html = renderProvider(PROVIDERS[0]!);
+    expect(html).toContain('aria-label="测试模型 m-fast"');
+    expect(html).toContain('aria-label="测试模型 m-big"');
+  });
+});
+
 describe('下拉值与草稿的互转', () => {
   it('跟随槽位 → FOLLOW；单独指定 → provider::model', () => {
     expect(roleSelectValue(undefined)).toBe(FOLLOW_SLOT);

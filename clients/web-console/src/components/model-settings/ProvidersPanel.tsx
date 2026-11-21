@@ -178,7 +178,9 @@ export function ProvidersPanel({
   const [secretInput, setSecretInput] = useState('');
   const [secretBusy, setSecretBusy] = useState(false);
   const [probeBusy, setProbeBusy] = useState(false);
+  const [modelProbeBusy, setModelProbeBusy] = useState<Record<string, boolean>>({});
   const [probes, setProbes] = useState<Record<string, ProbeResult>>({});
+  const [modelProbes, setModelProbes] = useState<Record<string, ProbeResult>>({});
   const runRef = useRef<HTMLDetailsElement>(null);
   const [actionError, setActionError] = useState('');
 
@@ -251,7 +253,9 @@ export function ProvidersPanel({
   // 嵌入/重排没有 `/chat/completions` 形状的端点，`ModelRouter.probe` 对它们
   // 只会报"不是对话供应商"。按钮不该长得像能用。
   const probeUnsupported = Boolean(
-    selected?.capabilities && !selected.capabilities.includes('chat'),
+    selected?.capabilities
+      && !selected.capabilities.includes('chat')
+      && !selected.capabilities.includes('asr'),
   );
 
   const patchModels = (models: ProviderModel[]) => {
@@ -376,6 +380,31 @@ export function ProvidersPanel({
       }));
     } finally {
       setProbeBusy(false);
+    }
+  };
+
+  const runModelProbe = async (modelId: string) => {
+    if (!selected) return;
+    const key = `${selected.provider_id}/${modelId}`;
+    setModelProbeBusy((current) => ({ ...current, [key]: true }));
+    setActionError('');
+    try {
+      const result = await api.probeProviderModel(selected.provider_id, modelId);
+      setModelProbes((current) => ({ ...current, [key]: result }));
+    } catch (error) {
+      const explained = explainError(error);
+      setModelProbes((current) => ({
+        ...current,
+        [key]: {
+          provider_id: selected.provider_id,
+          ok: false,
+          detail: explained.detail ?? explained.reason,
+          latency_ms: 0,
+          models: [],
+        },
+      }));
+    } finally {
+      setModelProbeBusy((current) => ({ ...current, [key]: false }));
     }
   };
 
@@ -809,12 +838,25 @@ export function ProvidersPanel({
                 ) : null}
                 {(selected.models ?? []).map((model) => {
                   const bound = rolesForModel(resolutions, selected.provider_id, model.model_id);
+                  const modelProbeKey = `${selected.provider_id}/${model.model_id}`;
+                  const modelProbe = modelProbes[modelProbeKey];
                   return (
                     <div className={`ms-model${model.enabled ? '' : ' ms-model--off'}`} key={model.model_id}>
                       <div className="ms-model__main">
                         <code className="ms-model__id">{model.model_id}</code>
                       </div>
                       <div className="ms-model__roles">
+                        <button
+                          type="button"
+                          className="ms-btn ms-btn--sm ms-model__probe"
+                          aria-label={`测试模型 ${model.model_id}`}
+                          title="单独测试这个模型"
+                          disabled={!canProbe || modelProbeBusy[modelProbeKey]}
+                          onClick={() => void runModelProbe(model.model_id)}
+                        >
+                          <RefreshIcon size={12} />
+                          {modelProbeBusy[modelProbeKey] ? '测试中…' : '测试'}
+                        </button>
                         {bound.length === 0 ? (
                           <span className="ms-muted ms-model__nobind">未绑定职责</span>
                         ) : (
@@ -845,6 +887,15 @@ export function ProvidersPanel({
                       >
                         ×
                       </button>
+                      {modelProbe ? (
+                        <p
+                          className={`ms-model__probe-result${modelProbe.ok ? ' ms-model__probe-result--ok' : ' ms-model__probe-result--error'}`}
+                          role="status"
+                        >
+                          {modelProbe.ok ? '可用' : '失败'} · {modelProbe.detail}
+                          {modelProbe.latency_ms ? ` · ${modelProbe.latency_ms} 毫秒` : ''}
+                        </p>
+                      ) : null}
                     </div>
                   );
                 })}
