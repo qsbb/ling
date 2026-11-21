@@ -195,6 +195,8 @@ export type ImportStep =
   | { name: 'done'; file: File; preview: MemoryImportPreview; result: MemoryImportCommit };
 
 export interface MemoryImportPanelProps {
+  /** 确认成功后的回调：让记忆库刷新，避免列表停在导入前的批次。 */
+  onCommitted: () => void;
   /** 导入按钮点「查看 AstrBot 记忆」时，把记忆库切到该来源并刷新。 */
   onViewImported: () => void;
   /** 关闭面板（不改变已导入的数据）。 */
@@ -207,7 +209,7 @@ export interface MemoryImportPanelProps {
  * 打开就显示"选文件"，因为**入口本身就是这一步**——先给一个空白页让人再点
  * 一次"开始"，只是多一层。选完立刻预览，中间不设"下一步"。
  */
-export function MemoryImportPanel({ onViewImported, onClose }: MemoryImportPanelProps): React.ReactElement {
+export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: MemoryImportPanelProps): React.ReactElement {
   const [step, setStep] = useState<ImportStep>({ name: 'pick' });
   const [error, setError] = useState<ExplainedError | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -248,12 +250,14 @@ export function MemoryImportPanel({ onViewImported, onClose }: MemoryImportPanel
       if (!alive.current) return;
       setStep({ name: 'done', file, preview, result });
       titleRef.current?.focus();
+      // 只有真的写进去了才刷新列表；失败时上一步已经回到预览态。
+      if (result.imported > 0) onCommitted();
     } catch (cause) {
       if (!alive.current) return;
       setStep({ name: 'preview', file, preview });
       setError(explainError(cause));
     }
-  }, []);
+  }, [onCommitted]);
 
   const pickFile = (file: File | null | undefined) => {
     if (!file) return;

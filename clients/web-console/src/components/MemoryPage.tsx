@@ -1562,11 +1562,11 @@ export function MemoryListSection({
       </div>
 
       <div className="mem-workspace__detail">
-        {selected ? (
+        {selected && !importPanelOpen ? (
           <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched}
             headingRef={headingRef} handlers={handlers} onBack={goBack}
             onSelect={selectedFromHistory} onChanged={goBack} />
-        ) : data ? (
+        ) : data && !importPanelOpen ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
             <strong>在列表中选择一条记忆</strong>
@@ -1581,7 +1581,10 @@ export function MemoryListSection({
               <ArrowLeftIcon size={15} /> 回到记忆库
             </button>
             <MemoryImportPanel
-              onViewImported={() => { onSourceChange('astrbot_memory_companion'); onCloseImport(); }}
+              // 导入完成后列表要立刻反映真实内容：否则左侧还停在导入前的批次，
+              // 结果页说"新增 5 条"、列表却写着"已加载 0 条"。
+              onCommitted={onReload}
+              onViewImported={() => { onSourceChange('astrbot_memory_companion'); onReload(); onCloseImport(); }}
               onClose={() => { onCloseImport(); onReload(); }}
             />
           </>

@@ -267,7 +267,12 @@
   padding: 0;
   display: grid;
   gap: 7px;
-  max-height: min(38vh, 320px);
+  /*
+   * 样本是可滚动的次级内容，主操作（确认导入）必须在首屏可见：
+   * 这里限高而不是让样本把按钮顶下去。手机端放开（见文件末尾的窄屏规则），
+   * 因为窄屏本来就要滚动，限高反而只剩两行可看。
+   */
+  max-height: min(24vh, 220px);
   overflow: auto;
 }
 
@@ -410,4 +415,22 @@
   .import-count-block__total { margin-inline-start: 0; }
   .import-result__rest { margin-inline-start: 0; }
   .import-samples ul { max-height: none; }
+}
+
+/* --------------------------------------------------- 详情里的「来自 AstrBot」
+ *
+ * 记忆库详情沿用 `.mem-facts` 的两列栅格，`dd` 不是 flex，QQ 与记录编号会
+ * 直接粘在一起（显示成「…200300400mm_0002」）。只给这一处补间距与换行，
+ * 不动 memory.css 的既有规则。
+ */
+[data-testid="mem-import-source"] dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 9px;
+}
+
+[data-testid="mem-import-source"] dd code {
+  font-size: 11.5px;
+  color: var(--ink-soft);
 }
