@@ -39,6 +39,9 @@ class StageAgent:
         self.deadline = None
         self.ready = False
         self.broadcast_ready = False
+        self.companion_attached = False
+        self.attachment_id: str | None = None
+        self._attachment: tuple[ObsStage, int] | None = None
         self._output: tuple[ObsStage, int] | None = None
         self._stopping_output: tuple[ObsStage, int] | None = None
 
@@ -65,6 +68,10 @@ class StageAgent:
 
     async def tick(self, stage: ObsStage) -> None:
         status = await stage.stream_status()
+        if self._attachment and not self._still_attached(stage, status):
+            await self._cancel_speech()
+            self.ready = False
+            self.control = "uncertain"
         if self._stopping_output and not status["outputActive"]:
             self.control = "stopped"
             self._forget_stream()
@@ -86,6 +93,7 @@ class StageAgent:
             "obs_active": status["outputActive"],
             "obs_reconnecting": status.get("outputReconnecting", False), "ready": self.ready,
             "broadcast_ready": self.broadcast_ready,
+            "scene": stage.program.scene, "attachment_id": self.attachment_id,
             "control": self.control or ("started" if self._owns(stage, status) else None),
             "playback": self.report,
         })
@@ -99,14 +107,23 @@ class StageAgent:
             self.report = None  # A receipt cannot move to another session.
             self.session_id = session_id
             self.ready = False
+            self.broadcast_ready = False
+            self.attachment_id = None
+            self._attachment = None
         self.deadline = order.get("deadline_at")
         action = order["action"]
-        if action in {"stop", "hold", "prepare"}:
+        self.companion_attached = order.get("role") == "companion" and order.get("mode") == "broadcast"
+        if action in {"stop", "hold", "prepare", "detach"}:
             await self._cancel_speech()
-        if action == "stop" and not self._stopping_output:
+        if action == "stop" and not self.companion_attached and not self._stopping_output:
             self.control = await self._stop(stage)
-        elif action == "start":
+        elif action == "start" and not self.companion_attached:
             self.control = await self._start(stage)
+        elif action == "detach":
+            self.control = "detached"
+            self.attachment_id = None
+            self._attachment = None
+            self.ready = False
         elif action == "prepare":
             self.broadcast_ready = False
             if self.stream_server and await stage.stream_server() == self.stream_server:
@@ -118,9 +135,19 @@ class StageAgent:
                     self.broadcast_ready = True
         elif action == "speak" and self.playback is None:
             self.playback = asyncio.create_task(self._speak(stage, order))
-        if self.session_id and not self.ready and not status["outputActive"]:
+        if self.session_id and not self.ready and action not in {"stop", "detach"} and (
+            (self.companion_attached and self._attachment is None and status["outputActive"]
+             and not status.get("outputReconnecting") and not stage.output_stopping)
+            or (not self.companion_attached and not status["outputActive"] and not status.get("outputReconnecting"))
+        ):
             try:
-                await stage.prepare(switch_scene=True)
+                output_serial = stage.output_serial
+                await stage.prepare(switch_scene=not self.companion_attached)
+                if self.companion_attached:
+                    if stage.output_serial != output_serial or stage.output_stopping:
+                        return
+                    self._attachment = (stage, output_serial)
+                    self.attachment_id = os.urandom(16).hex()
                 self.ready = True
             except StageError as exc:
                 logger.warning("%s", exc)
@@ -156,6 +183,12 @@ class StageAgent:
             stage.output_generation is not None and status["outputActive"]
             and self._output == (stage, stage.output_generation)
             and self.state.get("session_id") == self.session_id
+        )
+
+    def _still_attached(self, stage: ObsStage, status: dict) -> bool:
+        return bool(
+            self._attachment == (stage, stage.output_serial)
+            and status["outputActive"] and not stage.output_stopping
         )
 
     def _forget_stream(self) -> None:
@@ -206,6 +239,14 @@ class StageAgent:
                 response.raise_for_status()
                 if len(response.content) > 10 * 1024 * 1024:
                     raise StageError("舞台音频超出文件上限")
+                status = await stage.stream_status()
+                if status.get("outputReconnecting") or (
+                    order["mode"] == "preview" and status["outputActive"]
+                ) or (
+                    order["mode"] == "broadcast"
+                    and not (self._still_attached(stage, status) if self.companion_attached else self._owns(stage, status))
+                ):
+                    return {"speech_id": identity, "state": "interrupted"}
                 with TemporaryDirectory(prefix="ling-stage-") as folder:
                     audio = Path(folder) / f"{identity}.{order['format']}"
                     audio.write_bytes(response.content)

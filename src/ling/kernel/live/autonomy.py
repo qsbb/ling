@@ -11,7 +11,7 @@ from ling.domains.identity.service import IdentityService
 from ling.infra.db import session_scope
 from ling.infra.models import ConnectorInstance, OutboxEvent, utcnow
 from ling.infra.security import SecretBox, new_id
-from ling.kernel.live.events import CUSTOM_SCOPE
+from ling.kernel.live.events import CUSTOM_SCOPE, plan_from_config
 from ling.kernel.live.room import LiveConflict, LiveForbidden, active_session, open_session
 from ling.models.router import ModelRouter
 from ling.ports.model import ChatMessageIn
@@ -22,14 +22,15 @@ logger = logging.getLogger(__name__)
 
 def authorization(connector: ConnectorInstance) -> dict | None:
     config = connector.custom_config or {}
-    window = config.get("autonomous_window")
+    plan = plan_from_config(config)
+    window = plan.autonomous_window
     if not (
         connector.enabled and config.get("obs_control") and config.get("stage_token_hash")
-        and window and datetime.fromisoformat(window["starts_at"]) <= utcnow()
-        < datetime.fromisoformat(window["ends_at"])
+        and plan.role == "host" and window and window.starts_at <= utcnow() < window.ends_at
+        and ("live_plan" not in config or config.get("plan_pending"))
     ):
         return None
-    return window
+    return window.model_dump(mode="json")
 
 
 def prepare_autonomy(
@@ -84,7 +85,7 @@ async def consider_start(
                             content="你是直播主持人。现在是所有者预先授权的开播时段。"
                             "按公开主题决定是否想开场，只回复「开播」或「等待」。",
                         ),
-                        ChatMessageIn(role="user", content=connector.custom_config["public_topic"]),
+                        ChatMessageIn(role="user", content=plan_from_config(connector.custom_config).public_topic),
                     ],
                 ):
                     if outcome.error is not None:
@@ -102,12 +103,13 @@ async def consider_start(
             return
         if should_start and utcnow() - datetime.fromisoformat(offer) <= timedelta(seconds=30):
             owner = await IdentityService(session).owner_subject_id()
-            if owner and await active_session(session, settings.actor_id) is None:
+            window = authorization(connector)
+            if owner and window and await active_session(session, settings.actor_id) is None:
                 try:
                     run = await open_session(
                         session, connector, actor_id=settings.actor_id, persona_id=settings.persona_id,
                         subject_id=owner, mode="broadcast", device_id=device_id,
-                        ends_at=datetime.fromisoformat(authorization(connector)["ends_at"]),
+                        ends_at=datetime.fromisoformat(window["ends_at"]),
                     )
                 except (LiveConflict, LiveForbidden):
                     decision = "wait"

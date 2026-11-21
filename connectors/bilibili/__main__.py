@@ -44,7 +44,7 @@ class Forwarder:
         self.queue: asyncio.Queue[tuple[dict, str | None]] = asyncio.Queue(maxsize=64)
         self.session_id: str | None = None
         self.room_id: str | None = None
-        self.platform: dict | None = None
+        self.platform: tuple[dict, str] | None = None
         self.next_probe = 0.0
 
     def headers(self, body: bytes) -> dict[str, str]:
@@ -60,8 +60,8 @@ class Forwarder:
             return
         event = event_from_message(kind, message)
         if kind in PLATFORM_EVENTS:
-            self.platform = event
-            self.next_probe = monotonic() + 20
+            if self.session_id is not None:
+                self.platform = (event, self.session_id)
         elif self.session_id is not None:
             if self.queue.full():
                 self.queue.get_nowait()
@@ -74,6 +74,7 @@ class Forwarder:
         return response.json()["status"]
 
     async def room_status(self, room_id: str) -> dict | None:
+        now = datetime.now(UTC)
         response = await self.room_http.get(ROOM_INFO, params={"room_id": room_id})
         response.raise_for_status()
         body = response.json()
@@ -81,7 +82,6 @@ class Forwarder:
         live = data.get("live_status")
         if body.get("code") != 0 or str(data.get("room_id")) != room_id or live not in {0, 1, 2}:
             return None
-        now = datetime.now(UTC)
         return {
             "room_id": room_id, "kind": "live_start" if live == 1 else "live_end",
             "occurred_at": now.isoformat(), "event_id": f"room-status:{now.timestamp()}",
@@ -94,12 +94,15 @@ class Forwarder:
                 response = await self.http.get(f"{self.path}/session", headers=self.headers(b""))
                 response.raise_for_status()
                 source = response.json()
+                if source["session_id"] != self.session_id:
+                    self.next_probe = 0
                 self.session_id = source["session_id"]
                 self.room_id = source["room_id"]
-                if self.session_id is not None and self.platform and self.platform["room_id"] == self.room_id:
-                    key = (self.session_id, self.platform["event_id"])
-                    if key != sent_platform:
-                        await self._post(self.platform, self.session_id)
+                if self.platform:
+                    event, session_id = self.platform
+                    key = (session_id, event["event_id"])
+                    if session_id == self.session_id and event["room_id"] == self.room_id and key != sent_platform:
+                        await self._post(event, session_id)
                         sent_platform = key
                 if self.session_id is not None and monotonic() >= self.next_probe:
                     self.next_probe = monotonic() + 10

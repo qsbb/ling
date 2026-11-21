@@ -42,14 +42,17 @@ class ObsStage:
         self._lock = asyncio.Lock()
         self.output_serial = 0
         self.output_generation: int | None = None
+        self.output_stopping = False
 
     async def on_stream_state(self, data: dict[str, Any]) -> None:
         state = data.get("outputState")
         if state == "OBS_WEBSOCKET_OUTPUT_STARTING":
             self.output_serial += 1
             self.output_generation = self.output_serial
+            self.output_stopping = False
         elif state in {"OBS_WEBSOCKET_OUTPUT_STOPPING", "OBS_WEBSOCKET_OUTPUT_STOPPED"}:
             self.output_generation = None
+            self.output_stopping = True
 
     async def on_meters(self, data: dict[str, Any]) -> None:
         for source in data.get("inputs", ()):

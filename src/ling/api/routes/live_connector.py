@@ -4,40 +4,26 @@ import hmac
 
 from connectors.inbound_access import parse_source_ips, source_allowed
 from fastapi import Request
-from pydantic import (
-    AwareDatetime,
-    BaseModel,
-    ConfigDict,
-    Field,
-    SecretStr,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import ConnectorInstance
 from ling.infra.security import hash_token
-from ling.kernel.live.events import CUSTOM_SCOPE, Identifier, account_namespace
-from ling.kernel.live.room import active_session
+from ling.kernel.live.events import (
+    CUSTOM_SCOPE,
+    BroadcastWindow,
+    Identifier,
+    account_namespace,
+    plan_from_config,
+)
+from ling.kernel.live.room import active_session, request_stop
 from ling.settings.connector_instances import (
     ConnectorInstanceError,
     ConnectorInstanceService,
     normalize_instance_id,
 )
-
-
-class BroadcastWindow(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    starts_at: AwareDatetime
-    ends_at: AwareDatetime
-
-    @model_validator(mode="after")
-    def ordered(self) -> BroadcastWindow:
-        if self.starts_at >= self.ends_at:
-            raise ValueError("授权结束时间必须晚于开始时间")
-        return self
 
 
 class CustomConfig(BaseModel):
@@ -81,6 +67,10 @@ def custom_view(row: ConnectorInstance) -> dict:
         "obs_control": settings.get("obs_control", False),
         "autonomous_window": settings.get("autonomous_window"),
         "autonomous_state": settings.get("autonomous_state"),
+        "live_plan": plan_from_config(settings).model_dump(mode="json"),
+        "has_plan": bool(settings.get("live_plan")),
+        "plan_pending": bool(settings.get("plan_pending")),
+        "stage_observation": settings.get("stage_observation"),
         "last_received_at": settings.get("last_received_at"),
     }
 
@@ -124,9 +114,9 @@ async def configure_custom(
         raise LingError(ErrorCode.conflict, "房间已绑定，请为新房间创建接入器", status_code=409)
     active = await active_session(session, request.app.state.settings.actor_id, lock=True)
     if active and active.connector_id == instance_id:
-        if config.enabled:
+        if config.enabled and not (old.get("obs_control") and not config.obs_control):
             raise LingError(ErrorCode.conflict, "请结束当前直播后修改配置", status_code=409)
-        active.state = "stopping"
+        request_stop(active)
     try:
         if row is None:
             row = await service.create(
@@ -142,10 +132,12 @@ async def configure_custom(
         raise LingError(code, exc.message, status_code=exc.status_code) from exc
 
     settings = dict(old)
+    legacy_fields = {"public_topic", "max_minutes", "autonomous_window"}
     settings.update(config.model_dump(mode="json", exclude={
         "token", "signing_secret", "stage_token", "display_name", "enabled",
+        *(legacy_fields - config.model_fields_set),
     }))
-    if settings["autonomous_window"] != old.get("autonomous_window"):
+    if "live_plan" not in settings and settings.get("autonomous_window") != old.get("autonomous_window"):
         settings.pop("autonomous_state", None)
     if feature:
         settings["feature"] = feature
@@ -161,8 +153,12 @@ async def configure_custom(
     # Keep the stage credential usable for cleanup while stopping.
     if active and active.connector_id == instance_id:
         settings["stage_token_hash"] = old.get("stage_token_hash", "")
+        for key in ("token_hash", "signing_secret", "source_ips"):
+            settings[key] = old.get(key, "")
     if settings.get("stage_token_hash") and settings["stage_token_hash"] == settings.get("token_hash"):
         raise LingError(ErrorCode.invalid_request, "上报与舞台请使用不同令牌", status_code=422)
+    if not config.enabled or settings.get("stage_token_hash") != old.get("stage_token_hash"):
+        settings.pop("stage_observation", None)
     row.custom_config = settings
     row.enabled = config.enabled
     await session.flush()
@@ -200,5 +196,3 @@ def require_ingress(request: Request, config: ConnectorInstance, body: bytes) ->
         allowed = hmac.compare_digest(given, digest.encode())
     if not allowed:
         raise LingError(ErrorCode.forbidden, "接入器来源或凭据校验失败", status_code=403)
-    if not config.enabled:
-        raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)

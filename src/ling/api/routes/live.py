@@ -26,19 +26,23 @@ from ling.domains.media.assets import AssetError, GeneratedMediaService
 from ling.infra.models import ConnectorInstance, LiveSessionRow, LiveViewerRow, utcnow
 from ling.infra.security import load_signing_root_key
 from ling.kernel.live.autonomy import prepare_autonomy
-from ling.kernel.live.control import StageStatus, update_stage
-from ling.kernel.live.events import CUSTOM_SCOPE, CustomEvent
+from ling.kernel.live.control import StageStatus, record_stage_observation, update_stage
+from ling.kernel.live.events import CUSTOM_SCOPE, CustomEvent, LivePlan, plan_from_config
 from ling.kernel.live.room import (
     ACTIVE,
     LiveConflict,
     LiveForbidden,
     LiveNotFound,
     active_session,
+    cue_speech,
     finish_session,
+    observed_platform,
     open_session,
     receive_event,
+    request_stop,
     save_viewer,
     session_view,
+    stage_is_fresh,
 )
 
 router = APIRouter(tags=["livestream"])
@@ -88,11 +92,66 @@ async def enable_feature(
 @router.get("/live/sessions/current")
 async def current_live(_auth: OwnerAuth, session: DbSession, settings: SettingsDep) -> dict:
     run = await active_session(session, settings.actor_id)
+    active = run is not None
     if run is None:
         run = await session.scalar(select(LiveSessionRow).where(
             LiveSessionRow.actor_id == settings.actor_id,
         ).order_by(LiveSessionRow.created_at.desc()).limit(1))
-    return {"session": session_view(run) if run else None}
+    planned = await session.scalar(select(ConnectorInstance.instance_id).where(
+        ConnectorInstance.scope == CUSTOM_SCOPE, ConnectorInstance.enabled.is_(True),
+        ConnectorInstance.deleted_at.is_(None),
+        ConnectorInstance.custom_config["plan_pending"].as_boolean().is_(True),
+    ).order_by(ConnectorInstance.created_at).limit(1))
+    recent = run and utcnow() - datetime.fromisoformat(
+        run.runtime.get("ended_at") or run.created_at.isoformat(),
+    ) < timedelta(hours=24)
+    return {
+        "session": session_view(run) if run else None,
+        "planned_connector_id": planned,
+        "navigation_visible": bool(planned or active or recent),
+    }
+
+
+@router.put("/live/plans/{instance_id}")
+async def save_plan(
+    instance_id: str, body: LivePlan, _auth: OwnerWrite, session: DbSession, settings: SettingsDep,
+) -> dict:
+    connector = await require_custom(session, instance_id, lock=True)
+    config = connector.custom_config
+    if not connector.enabled:
+        raise LingError(ErrorCode.conflict, "请先启用接入器", status_code=409)
+    if body.autonomous_window and not config.get("obs_control"):
+        raise LingError(ErrorCode.forbidden, "请先授权舞台控制 OBS 推流", status_code=403)
+    run = await active_session(session, settings.actor_id, lock=True)
+    if run and run.connector_id == instance_id:
+        raise LingError(ErrorCode.conflict, "请结束当前场次再修改计划", status_code=409)
+    plan = body.model_dump(mode="json")
+    previous = plan_from_config(config)
+    same_window = body.autonomous_window is not None and body.autonomous_window == previous.autonomous_window
+    if same_window and body == previous and config.get("live_plan"):
+        return custom_view(connector)
+    if same_window and config.get("autonomous_state") == "started":
+        raise LingError(ErrorCode.conflict, "该授权已使用，请选择新的开播时段", status_code=409)
+    connector.custom_config = {
+        **config, "live_plan": plan, "plan_pending": True,
+        "autonomous_state": None, "autonomous_offer": None,
+    }
+    return custom_view(connector)
+
+
+@router.delete("/live/plans/{instance_id}")
+async def clear_plan(
+    instance_id: str, _auth: OwnerWriteAction, session: DbSession, settings: SettingsDep,
+) -> dict:
+    connector = await require_custom(session, instance_id, lock=True)
+    connector.custom_config = {
+        **connector.custom_config, "live_plan": None, "plan_pending": False,
+        "autonomous_state": None, "autonomous_offer": None,
+    }
+    run = await active_session(session, settings.actor_id, lock=True)
+    if run and run.connector_id == instance_id and run.runtime.get("autonomous"):
+        request_stop(run)
+    return custom_view(connector)
 
 
 class OpenLive(BaseModel):
@@ -137,8 +196,26 @@ async def stop_live(
         if not run.runtime.get("device_id") and not run.runtime.get("start_operation"):
             finish_session(run, detail="本场已结束")
         else:
-            run.state = "stopping"
+            request_stop(run)
     return session_view(run)
+
+
+class StageCue(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    text: str = Field(min_length=1, max_length=400)
+
+
+@router.post("/live/sessions/{session_id}/cue", status_code=202)
+async def cue_live(
+    session_id: str, body: StageCue, _auth: OwnerWrite, session: DbSession, settings: SettingsDep,
+) -> dict:
+    run = await _get_session(session, settings, session_id, lock=True)
+    try:
+        cue_speech(run, body.text)
+    except LiveConflict as exc:
+        raise LingError(ErrorCode.conflict, str(exc), status_code=409) from exc
+    return {"accepted": True}
 
 
 class SaveViewer(BaseModel):
@@ -196,6 +273,9 @@ async def source_session(
     connector = await require_custom(session, instance_id)
     require_ingress(request, connector, b"")
     run = await active_session(session, settings.actor_id)
+    settling = run is not None and run.connector_id == instance_id and run.state == "stopping"
+    if not connector.enabled and not settling:
+        raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
     return {
         "session_id": run.id if run and run.connector_id == instance_id else None,
         "room_id": connector.custom_config["room_id"],
@@ -217,11 +297,16 @@ async def push_custom_event(
     config = connector.custom_config or {}
     if event.room_id != config["room_id"]:
         raise LingError(ErrorCode.forbidden, "事件房间与接入器配置不一致", status_code=403)
+    run = await active_session(session, settings.actor_id, lock=True)
+    matches = run is not None and run.connector_id == instance_id
+    if not connector.enabled and not (
+        matches and run.state == "stopping" and event.kind in {"live_start", "live_end"}
+    ):
+        raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
     last = config.get("last_received_at")
     if not last or now - datetime.fromisoformat(last) >= timedelta(seconds=5):
         connector.custom_config = {**config, "last_received_at": now.isoformat()}
-    run = await active_session(session, settings.actor_id, lock=True)
-    if run is None or run.connector_id != instance_id:
+    if not matches:
         return {"status": "no_session"}
     return {"status": receive_event(run, event, now=now)}
 
@@ -233,6 +318,8 @@ async def stage_tick(
     connector = await require_custom(session, instance_id, lock=True)
     require_stage(request, connector.custom_config or {})
     run = await active_session(session, settings.actor_id, lock=True)
+    if connector.enabled and (run is None or run.runtime.get("device_id") in {None, body.device_id}):
+        record_stage_observation(connector, body)
     if run is None and not body.obs_active and not body.obs_reconnecting:
         action = prepare_autonomy(
             session, connector, device_id=body.device_id, broadcast_ready=body.broadcast_ready,
@@ -252,11 +339,17 @@ async def stage_audio(
     require_stage(request, connector.custom_config or {})
     run = await _get_session(session, settings, session_id)
     pending = run.runtime.get("speech")
+    now = utcnow()
     if (
-        run.connector_id != instance_id or run.state not in {"preview", "live"}
-        or utcnow() >= run.deadline_at
+        not connector.enabled or run.connector_id != instance_id or run.state not in {"preview", "live"}
+        or not stage_is_fresh(run.runtime, now) or not run.runtime.get("stage_ready")
+        or run.runtime.get("obs_reconnecting")
+        or run.runtime.get("obs_active") != (run.state == "live")
+        or (run.state == "live" and observed_platform(run.runtime, now) is not True)
+        or (run.state == "preview" and observed_platform(run.runtime, now) is True)
+        or now >= run.deadline_at
         or not pending or pending["id"] != speech_id or pending["phase"] != "sent"
-        or datetime.fromisoformat(pending["expires_at"]) <= utcnow()
+        or datetime.fromisoformat(pending["expires_at"]) <= now
     ):
         raise not_found("这段语音已失效")
     media = GeneratedMediaService(

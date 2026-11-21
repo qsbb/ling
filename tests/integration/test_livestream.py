@@ -10,7 +10,7 @@ from ling import worker
 from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
 from ling.domains.identity.service import IdentityService
 from ling.infra.db import session_scope
-from ling.infra.models import ActivityRow, ActorAccount, MemoryRow, OutboxEvent
+from ling.infra.models import ActivityRow, ActorAccount, MemoryRow, Operation, OutboxEvent
 from ling.kernel.live.autonomy import consider_start
 from ling.ports.model import ModelChunk
 from ling.ports.speech import (
@@ -151,6 +151,10 @@ async def test_broadcast_waits_for_observed_platform_and_owned_obs(logged_in):
                 OutboxEvent.topic == "livestream.speech"
             )) == 1
         assert (await env.client.post(f"{RUNS}/{run_id}/stop")).status_code == 200
+        disabled = await env.client.put(f"{CUSTOM}/bili-live", json={**ROOM_CONFIG, "enabled": False})
+        assert disabled.status_code == 200, disabled.text
+        assert (await source.get(f"{SOURCE}/session")).json()["session_id"] == run_id
+        assert (await source.post(f"{SOURCE}/events", json=comment(run_id))).status_code == 409
         assert await status(obs_active=True) == "stop"
         assert await status(control="stopped") == "hold"
         assert await public_state() == "stopping"
@@ -327,3 +331,55 @@ async def test_autonomous_start_respects_decision_and_authorization(logged_in):
         assert datetime.fromisoformat(state["deadline_at"]) <= now + timedelta(minutes=2)
         assert (await status(session_id=state["id"], device_id="other_stage_device"))["action"] == "hold"
         assert (await status(session_id=state["id"]))["action"] == "start"
+
+
+async def test_companion_joins_and_leaves_an_externally_owned_broadcast(logged_in):
+    env = logged_in
+    assert (await env.client.put(f"{CUSTOM}/bili-live", json=ROOM_CONFIG)).status_code == 200
+    plan = {"role": "companion", "host_name": "小禾", "public_topic": "与小禾聊配乐"}
+    response = await env.client.put("/v1/live/plans/bili-live", json=plan)
+    assert response.status_code == 200, response.text
+    current = (await env.client.get(f"{RUNS}/current")).json()
+    assert current["navigation_visible"] and current["planned_connector_id"] == "bili-live"
+    opened = await env.client.post(RUNS, json={"connector_id": "bili-live", "mode": "broadcast"})
+    assert opened.status_code == 201, opened.text
+    run_id = opened.json()["id"]
+    assert opened.json()["role"] == "companion"
+    async with (
+        peer_client(env, headers={"Authorization": f"Bearer {TOKEN}"}) as stage,
+        peer_client(env) as source,
+    ):
+        async def tick(**changes):
+            status = stage_body(run_id, obs_active=True, attachment_id="external_output_1") | changes
+            response = await stage.post(f"{SOURCE}/stage", json=status)
+            assert response.status_code == 200, response.text
+            return response.json()["action"]
+
+        assert await tick() == "hold"
+        live = await source.post(
+            f"{SOURCE}/events", json=comment(run_id, event_id="platform-on", kind="live_start"),
+        )
+        assert live.json()["status"] == "accepted"
+        assert await tick(attachment_id=None) == "hold"
+        assert await tick() == "ready"
+        assert (await source.post(f"{SOURCE}/events", json=comment(run_id))).json()["status"] == "accepted"
+        assert await tick() == "ready"
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(OutboxEvent)) == 0
+        cue = f"{RUNS}/{run_id}/cue"
+        assert (await source.post(cue, json={"text": "请接着聊配乐"})).status_code == 401
+        assert (await env.client.post(cue, json={"text": "请接着聊配乐"})).status_code == 202
+        assert (await env.client.post(cue, json={"text": "请接着聊配乐"})).status_code == 409
+        assert await tick() == "ready"
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(OutboxEvent).where(
+                OutboxEvent.topic == "livestream.speech"
+            )) == 1
+        assert (await env.client.post(f"{RUNS}/{run_id}/stop")).status_code == 200
+        assert await tick() == "detach"
+        assert await tick(control="detached") == "hold"
+        ended = (await env.client.get(f"{RUNS}/current")).json()["session"]
+        assert ended["state"] == "ended" and ended["obs_active"] and ended["platform_live"]
+        assert (await env.client.post(cue, json={"text": "请再聊一句"})).status_code == 409
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(Operation)) == 0

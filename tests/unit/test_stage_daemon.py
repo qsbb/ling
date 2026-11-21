@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 from connectors.stage.daemon import StageAgent
@@ -10,6 +11,8 @@ class Stage:
         self.target = "rtmp://127.0.0.1:19365/live"
         self.output_serial = 0
         self.output_generation = None
+        self.output_stopping = False
+        self.program = SimpleNamespace(scene="Test program")
         self.starts = 0
         self.stops = 0
         self.delay_stop = False
