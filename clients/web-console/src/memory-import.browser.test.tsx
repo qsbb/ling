@@ -95,6 +95,7 @@ interface MockOptions {
   commitError?: { detail: string; status: number; code: string; message: string };
   previewError?: { detail: string; status: number; code: string; message: string };
   morePages?: boolean;
+  waitForPage?: (offset: number) => Promise<void>;
 }
 
 async function open(options: MockOptions = {}) {
@@ -153,6 +154,7 @@ async function open(options: MockOptions = {}) {
           const offset = Number(url.searchParams.get('offset') ?? 0);
           const rows = options.memories ?? [];
           if (source && source !== SOURCE) return route.fulfill(apiError('invalid_request', '来源不支持', 422));
+          await options.waitForPage?.(offset);
           const sliced = rows.slice(offset, offset + limit);
           const hasMore = options.morePages ? offset + limit < rows.length + limit : rows.length > offset + limit;
           return route.fulfill(json({
@@ -259,6 +261,52 @@ describe('导入旧记忆', () => {
     expect(next?.searchParams.get('offset')).toBe('3');
   }, CASE_TIMEOUT);
 
+  it('刷新第一页会结束旧翻页状态，下一次仍能加载剩余记忆', async () => {
+    const rows = Array.from({ length: 52 }, (_, index) => memory(`mem_${index}`, `导入条目 ${index}`));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { page, reads } = await open({
+      memories: rows,
+      async waitForPage(offset) {
+        if (offset > 0) await held;
+      },
+    });
+    await page.getByRole('button', { name: '筛选', exact: true }).click();
+    await page.getByTestId('mem-source').selectOption(SOURCE);
+    const more = page.getByTestId('mem-load-more');
+    await more.click();
+    try {
+      await expect.poll(() => reads.some((url) => url.searchParams.get('offset') === '50')).toBe(true);
+      const firstPage = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.ok() && url.pathname === '/v1/memory' && url.searchParams.get('offset') === '0';
+      });
+      await page.getByRole('button', { name: '刷新记忆库', exact: true }).click();
+      await firstPage;
+      await expect.poll(() => more.isEnabled()).toBe(true);
+    } finally {
+      release();
+    }
+    expect(await page.getByTestId('mem-results').locator('li').count()).toBe(50);
+    await more.click();
+    await expect.poll(() => page.getByTestId('mem-results').locator('li').count()).toBe(52);
+    expect(await more.count()).toBe(0);
+  }, CASE_TIMEOUT);
+
+  it('零新增时分别报告重复和跳过', async () => {
+    const { page } = await open({
+      previewBody: { total: 3, accepted: 1, skipped: 2, skip_reasons: { expired: 2 } },
+      commitBody: { total: 3, imported: 0, duplicates: 1, skipped: 2, skip_reasons: { expired: 2 } },
+    });
+    await previewFile(page);
+    await page.getByTestId('import-confirm').click();
+    expect(await page.getByTestId('import-result-duplicates').innerText()).toBe('1');
+    expect(await page.getByTestId('import-result-skipped').innerText()).toBe('2');
+    const result = await page.getByTestId('import-zero-result').innerText();
+    expect(result).toContain('可展开查看跳过原因');
+    expect(result).not.toContain('已经在库里了');
+  }, CASE_TIMEOUT);
+
   it('G1/G2：详情显示来自 AstrBot；occurred_at 为空时不伪造发生时间', async () => {
     const rows = [memory('mem_imported', '不吃香菜', {
       source: SOURCE, record_id: 'mm_2', memory_type: 'manual_memory', platform: 'aiocqhttp',
@@ -275,22 +323,22 @@ describe('导入旧记忆', () => {
   }, CASE_TIMEOUT);
 
   it('H1：预览失效时保留文件，一步重新预览', async () => {
-    let first = true;
     const context = await browser.newContext({ viewport: { width: 1366, height: 900 }, reducedMotion: 'reduce' });
     contexts.push(context);
     const page = await context.newPage();
     page.setDefaultTimeout(WAIT);
     let previewCalls = 0;
+    const sentTokens: (string | undefined)[] = [];
     await context.route('**/v1/**', async (route) => {
       const request = route.request();
       const url = new URL(request.url());
       if (request.method() === 'POST' && url.pathname.endsWith('/preview')) {
         previewCalls += 1;
-        return route.fulfill(json(preview()));
+        return route.fulfill(json(preview({ confirmation_token: `token-${previewCalls}` })));
       }
       if (request.method() === 'POST' && url.pathname.endsWith('/commit')) {
-        if (first) {
-          first = false;
+        sentTokens.push(request.headers()['x-ling-import-token']);
+        if (sentTokens.at(-1) === 'token-1') {
           return route.fulfill(apiError('conflict', '预览已失效，请重新预览', 409, 'preview_invalid'));
         }
         return route.fulfill(json({ total: 5, imported: 5, duplicates: 0, skipped: 0, skip_reasons: {}, destination: DESTINATION }));
@@ -317,11 +365,16 @@ describe('导入旧记忆', () => {
     await page.getByTestId('import-confirm').click();
     await page.getByTestId('import-error').waitFor();
     expect(await page.getByTestId('import-error').getAttribute('data-error-detail')).toBe('preview_invalid');
+    expect(await page.getByTestId('import-confirm').count()).toBe(0);
+    expect(await page.getByTestId('import-expiry').count()).toBe(0);
     const before = previewCalls;
     // 不需要重新选文件：点「重新预览」就够
     await page.getByRole('button', { name: '重新预览' }).click();
     await page.getByTestId('import-confirm').waitFor();
     expect(previewCalls).toBe(before + 1);
+    await page.getByTestId('import-confirm').click();
+    await page.getByTestId('import-result-imported').waitFor();
+    expect(sentTokens).toEqual(['token-1', 'token-2']);
   }, CASE_TIMEOUT);
 
   it('I2：手机 375 宽预览无横向溢出，且能走完导入', async () => {

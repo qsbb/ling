@@ -1994,7 +1994,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_FILTERS);
   const [source, setSource] = useState<MemoryImportSourceFilter | null>(null);
   const [importOpen, setImportOpen] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [listBusy, setListBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [forget, dispatchForget] = useReducer(forgetReducer, INITIAL_FORGET);
 
@@ -2007,7 +2007,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   // （换了身份，调用方传下去的回调也跟着变）。
   const listRef = useRef(list);
   listRef.current = list;
-  const loadingMoreRef = useRef(false);
+  const listBusyRef = useRef(false);
 
   const loadCore = useCallback(async () => {
     const requestId = ++coreRequest.current;
@@ -2029,6 +2029,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const loadList = useCallback(async () => {
     const requestId = ++listRequest.current;
     const query = latestQuery.current;
+    listBusyRef.current = true;
+    setListBusy(true);
     setList((current) => current.data?.limit === query.limit && current.data.include === query.include
       && (current.data.source ?? null) === query.source ? current : loadingSection<MemoryListResponse>());
     try {
@@ -2038,6 +2040,12 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     } catch (cause) {
       if (requestId !== listRequest.current) return;
       setList({ status: 'error', data: null, error: explainError(cause) });
+    } finally {
+      // Refresh takes over from any pending page and releases the control when it settles.
+      if (requestId === listRequest.current) {
+        listBusyRef.current = false;
+        setListBusy(false);
+      }
     }
   }, []);
 
@@ -2050,11 +2058,13 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const loadMore = useCallback(async () => {
     const query = latestQuery.current;
     const current = listRef.current.data;
-    if (!query.source || !current || !current.has_more || loadingMoreRef.current) return;
+    if (!query.source || !current?.has_more || listBusyRef.current
+      || current.source !== query.source || current.limit !== query.limit
+      || current.include !== query.include) return;
     const offset = current.memories.length;
     const requestId = ++listRequest.current;
-    loadingMoreRef.current = true;
-    setLoadingMore(true);
+    listBusyRef.current = true;
+    setListBusy(true);
     try {
       const next = await api.listMemories({ ...query, offset });
       if (requestId !== listRequest.current) return;
@@ -2072,8 +2082,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       setNotice({ tone: 'warn', text: `加载更早的记忆失败：${explainError(cause).reason}` });
     } finally {
       if (requestId === listRequest.current) {
-        loadingMoreRef.current = false;
-        setLoadingMore(false);
+        listBusyRef.current = false;
+        setListBusy(false);
       }
     }
   }, []);
@@ -2210,7 +2220,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       source={source}
       onSourceChange={setSource}
       onLoadMore={() => void loadMore()}
-      loadingMore={loadingMore}
+      loadingMore={listBusy}
       importPanelOpen={importOpen}
       onToggleImport={() => setImportOpen((open) => !open)}
       onCloseImport={() => setImportOpen(false)}

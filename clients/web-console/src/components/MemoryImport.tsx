@@ -147,7 +147,7 @@ export function importErrorCopy(error: ExplainedError): ImportErrorCopy {
       return {
         reason: '还没有确认的本人 QQ 绑定',
         hint: '到「关系」里核对自然人，把本人 QQ 绑定到这个账号后再预览。',
-        needsRepreview: false,
+        needsRepreview: true,
         needsAnotherFile: false,
       };
     case 'memory_purge_in_progress':
@@ -250,8 +250,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
       if (!alive.current) return;
       setStep({ name: 'done', file, preview, result });
       titleRef.current?.focus();
-      // 只有真的写进去了才刷新列表；失败时上一步已经回到预览态。
-      if (result.imported > 0) onCommitted();
+      onCommitted();
     } catch (cause) {
       if (!alive.current) return;
       setStep({ name: 'preview', file, preview });
@@ -558,7 +557,12 @@ function PreviewStage({
       ) : null}
 
       <div className="import-actions">
-        {empty ? (
+        {copy?.needsRepreview ? (
+          <>
+            <button type="button" className="button" onClick={onRepreview}>重新预览</button>
+            <button type="button" className="ghost-button" onClick={onChooseAnother}>换个文件</button>
+          </>
+        ) : empty ? (
           <>
             <button type="button" className="button" onClick={onChooseAnother}>
               换个文件
@@ -585,7 +589,7 @@ function PreviewStage({
         )}
       </div>
 
-      {preview.expires_at ? (
+      {preview.expires_at && !copy?.needsRepreview ? (
         <p className="import-expiry" data-testid="import-expiry">
           预览在 {sampleTime(preview.expires_at)} 前有效
         </p>
@@ -649,7 +653,7 @@ function ResultStage({
 
       {result.imported === 0 ? (
         <p className="import-zero" data-testid="import-zero-result">
-          这次没有新增条目：{result.duplicates > 0 ? '文件里的记忆都已经在库里了。' : '记录在确认时已不满足导入条件。'}
+          这次没有新增条目。{result.skipped > 0 ? '可展开查看跳过原因。' : result.duplicates > 0 ? '这些记录已经在库里了。' : null}
         </p>
       ) : null}
 
