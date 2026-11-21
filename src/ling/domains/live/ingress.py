@@ -6,7 +6,15 @@ from typing import Annotated, Literal
 
 from connectors.inbound_access import parse_source_ips, source_allowed
 from fastapi import Request
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    model_validator,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
@@ -23,6 +31,19 @@ CUSTOM_SCOPE = "custom_http"
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
 
 
+class BroadcastWindow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def ordered(self) -> BroadcastWindow:
+        if self.starts_at >= self.ends_at:
+            raise ValueError("授权结束时间必须晚于开始时间")
+        return self
+
+
 class CustomConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -36,6 +57,13 @@ class CustomConfig(BaseModel):
     public_topic: str = Field(default="", max_length=400)
     max_minutes: int = Field(default=30, ge=1, le=240)
     obs_control: bool = False
+    autonomous_window: BroadcastWindow | None = None
+
+    @model_validator(mode="after")
+    def require_obs_control(self) -> CustomConfig:
+        if self.autonomous_window and not self.obs_control:
+            raise ValueError("自主开播需要允许控制 OBS 推流")
+        return self
 
 
 class Sender(BaseModel):
@@ -78,6 +106,8 @@ def custom_view(row: ConnectorInstance) -> dict:
         "public_topic": settings.get("public_topic", ""),
         "max_minutes": settings.get("max_minutes", 30),
         "obs_control": settings.get("obs_control", False),
+        "autonomous_window": settings.get("autonomous_window"),
+        "autonomous_state": settings.get("autonomous_state"),
         "last_received_at": settings.get("last_received_at"),
     }
 
@@ -141,9 +171,11 @@ async def configure_custom(
         raise LingError(code, exc.message, status_code=exc.status_code) from exc
 
     settings = dict(old)
-    settings.update(config.model_dump(exclude={
+    settings.update(config.model_dump(mode="json", exclude={
         "token", "signing_secret", "stage_token", "display_name", "enabled",
     }))
+    if settings["autonomous_window"] != old.get("autonomous_window"):
+        settings.pop("autonomous_state", None)
     if feature:
         settings["feature"] = feature
     for key, value in (("token_hash", config.token), ("stage_token_hash", config.stage_token)):
@@ -158,6 +190,8 @@ async def configure_custom(
     # Keep the stage credential usable for cleanup while stopping.
     if active and active.connector_id == instance_id:
         settings["stage_token_hash"] = old.get("stage_token_hash", "")
+    if settings.get("stage_token_hash") and settings["stage_token_hash"] == settings.get("token_hash"):
+        raise LingError(ErrorCode.invalid_request, "上报与舞台请使用不同令牌", status_code=422)
     row.custom_config = settings
     row.enabled = config.enabled
     await session.flush()

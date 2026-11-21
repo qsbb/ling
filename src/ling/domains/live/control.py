@@ -27,6 +27,7 @@ class StageStatus(BaseModel):
     obs_active: bool
     obs_reconnecting: bool = False
     ready: bool = True
+    broadcast_ready: bool = False
     control: Literal["started", "stopped", "blocked", "uncertain"] | None = None
     playback: PlaybackReport | None = None
 
@@ -65,10 +66,16 @@ async def update_stage(session: AsyncSession, run: LiveSessionRow, report: Stage
     broadcast = runtime["mode"] == "broadcast"
     if now >= run.deadline_at:
         run.state = "stopping"
-    if run.state == "live" and runtime.get("platform_live") is False:
+    if run.state == "live" and (
+        runtime.get("platform_live") is False
+        or (not report.obs_active and not report.obs_reconnecting)
+        or report.control == "uncertain"
+    ):
         run.state = "stopping"
     if report.control == "started" and runtime.get("start_operation") and report.obs_active:
         run.runtime = {**run.runtime, "owns_output": True}
+    if not report.obs_active and not report.obs_reconnecting or report.control == "uncertain":
+        run.runtime = {**run.runtime, "owns_output": False}
     if report.control in {"blocked", "uncertain"} and run.state == "starting":
         await _operation(session, run, "start", "uncertain" if report.control == "uncertain" else "failed")
         run.state = "stopping"
@@ -101,7 +108,10 @@ async def update_stage(session: AsyncSession, run: LiveSessionRow, report: Stage
                 operation = await session.get(Operation, runtime["start_operation"])
                 if operation is not None and operation.state == "running":
                     operation.state = "cancelled"
-            finish_session(run, detail=run.runtime.get("detail") or "本场已结束")
+            detail = run.runtime.get("detail")
+            if not detail and broadcast and run.runtime.get("platform_live") is None:
+                detail = "OBS 已停止，平台房间状态待核实"
+            finish_session(run, detail=detail or "本场已结束")
         return {**base, "action": "hold"}
 
     if run.state == "starting":

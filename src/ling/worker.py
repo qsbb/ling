@@ -412,6 +412,13 @@ async def handle_livestream_speech(payload: dict) -> None:
     )
 
 
+@handler("livestream.decide")
+async def handle_livestream_decide(payload: dict) -> None:
+    from ling.domains.live.autonomy import consider_start
+
+    await consider_start(get_settings(), _MEMORY_ROUTER, **payload)
+
+
 async def wait_for_schema(*, attempts: int = 60, interval: float = 2.0) -> bool:
     """等 schema 就绪。
 

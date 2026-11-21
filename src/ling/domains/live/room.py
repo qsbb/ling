@@ -65,6 +65,8 @@ async def open_session(
     persona_id: str,
     subject_id: str,
     mode: str,
+    device_id: str | None = None,
+    ends_at: datetime | None = None,
 ) -> LiveSessionRow:
     config = connector.custom_config or {}
     if not connector.enabled or not config.get("stage_token_hash"):
@@ -73,11 +75,16 @@ async def open_session(
         raise LingError(ErrorCode.forbidden, "这个房间未授权控制 OBS 推流", status_code=403)
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"live:{actor_id}"))))
     old = await active_session(session, actor_id, lock=True)
+    now = utcnow()
+    if old is not None and now >= old.deadline_at and not old.runtime.get("start_operation"):
+        finish_session(old, detail="本场已到期")
+        await session.flush()
+        old = None
     if old is not None:
         if old.connector_id == connector.instance_id and old.runtime["mode"] == mode:
             return old
         raise LingError(ErrorCode.conflict, "已有直播场次正在运行或停止", status_code=409)
-    now = utcnow()
+    deadline = now + timedelta(minutes=config.get("max_minutes", 30))
     window = Window(
         id=new_id("win"), actor_id=actor_id, subject_id=subject_id, persona_id=persona_id,
         channel="livestream", visibility="public", title=connector.display_name, archived=True,
@@ -87,8 +94,9 @@ async def open_session(
         id=new_id("live"), actor_id=actor_id, connector_id=connector.instance_id,
         room_id=config["room_id"], window_id=window.id,
         state="preview" if mode == "preview" else "starting",
-        runtime={"mode": mode, "topic": config.get("public_topic", ""), "queue": []},
-        deadline_at=now + timedelta(minutes=config.get("max_minutes", 30)),
+        runtime={"mode": mode, "topic": config.get("public_topic", ""), "queue": [],
+                 "device_id": device_id, "next_host_at": now.isoformat()},
+        deadline_at=min(deadline, ends_at) if ends_at else deadline,
         created_at=now,
     )
     session.add(run)
@@ -230,13 +238,20 @@ def next_speech(session: AsyncSession, run: LiveSessionRow, *, now: datetime) ->
 
     queue = fresh_comments(runtime, now)
     runtime["queue"] = queue
-    if queue:
+    host_due = runtime["mode"] == "broadcast" and runtime["topic"] and (
+        datetime.fromisoformat(runtime["next_host_at"]) <= now
+    )
+    if queue or host_due:
         interacted = runtime.get("interacted", {})
         followup = next((item for item in queue if item["account_ref"] in interacted), None)
-        comment = followup if followup and not runtime.get("last_was_followup") else queue[0]
+        if queue:
+            comment = followup if followup and not runtime.get("last_was_followup") else queue[0]
+            runtime["queue"] = [item for item in queue if item["id"] != comment["id"]]
+        else:
+            comment = {"display_name": None, "account_ref": None, "text": ""}
+        runtime["next_host_at"] = (now + timedelta(seconds=45)).isoformat()
         runtime["last_was_followup"] = comment["account_ref"] in interacted
         speech_id = new_id("speech")
-        runtime["queue"] = [item for item in queue if item["id"] != comment["id"]]
         runtime["speech"] = {
             "id": speech_id, "phase": "generating", "comment": comment,
             "expires_at": (now + timedelta(seconds=40)).isoformat(),

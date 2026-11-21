@@ -14,6 +14,7 @@ from ling.api.deps import DbSession, SettingsDep
 from ling.api.errors import LingError, not_found
 from ling.api.guards import OwnerAuth, OwnerWrite, OwnerWriteAction
 from ling.contracts.v1 import ErrorCode
+from ling.domains.live.autonomy import prepare_autonomy
 from ling.domains.live.control import StageStatus, update_stage
 from ling.domains.live.ingress import (
     CUSTOM_SCOPE,
@@ -218,9 +219,14 @@ async def push_custom_event(
 async def stage_tick(
     instance_id: str, body: StageStatus, request: Request, session: DbSession, settings: SettingsDep,
 ) -> dict:
-    connector = await require_custom(session, instance_id)
+    connector = await require_custom(session, instance_id, lock=True)
     require_stage(request, connector.custom_config or {})
     run = await active_session(session, settings.actor_id, lock=True)
+    if run is None and not body.obs_active and not body.obs_reconnecting:
+        action = prepare_autonomy(
+            session, connector, device_id=body.device_id, broadcast_ready=body.broadcast_ready,
+        )
+        return {"session_id": None, "action": action}
     if run is None or run.connector_id != instance_id:
         return {"session_id": None, "action": "hold"}
     return await update_stage(session, run, body)

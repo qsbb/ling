@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 
 from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
 from ling.domains.identity.service import IdentityService
+from ling.domains.live.autonomy import consider_start
 from ling.domains.live.speech import build_speech
 from ling.infra.db import session_scope
 from ling.infra.models import ActivityRow, ActorAccount, MemoryRow, OutboxEvent
@@ -139,7 +140,8 @@ async def test_broadcast_waits_for_observed_platform_and_owned_obs(logged_in):
         assert event.json() == {"status": "accepted"}
         assert await status(obs_active=False) == "hold"
         assert await public_state() == "starting"
-        assert await status(obs_active=True) == "ready"
+        assert await status(obs_active=True) == "hold"
+        assert await status(obs_active=True, control="started") == "ready"
         assert await public_state() == "live"
         event = await source.post(f"{SOURCE}/events", json=comment(run_id))
         assert event.json()["status"] == "accepted"
@@ -262,3 +264,66 @@ async def test_only_played_viewers_belong_to_room_memory(logged_in, monkeypatch)
             ))
             assert account.external_account_id == "first-id"
             assert await IdentityService(db).canonical_subject(account.subject_id) == env.subject_id
+
+
+async def test_autonomous_start_respects_decision_and_authorization(logged_in):
+    env = logged_in
+    now = datetime.now(UTC)
+
+    def request_window(before, after):
+        return {
+            **ROOM_CONFIG, "obs_control": True, "public_topic": "今晚聊配乐",
+            "autonomous_window": {"starts_at": before.isoformat(), "ends_at": after.isoformat()},
+        }
+
+    class Router:
+        answer = "等待"
+
+        async def stream(self, _effective, *, profile, messages):
+            assert messages[-1].content == "今晚聊配乐"
+            yield ModelChunk(delta=self.answer, done=True), SimpleNamespace(error=None)
+
+    router = Router()
+    async with peer_client(env, headers={"Authorization": f"Bearer {TOKEN}"}) as stage:
+        async def status(**changes):
+            response = await stage.post(f"{SOURCE}/stage", json=stage_body(None, **changes))
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        async def decide():
+            async with session_scope() as db:
+                row = await db.scalar(
+                    select(OutboxEvent).where(OutboxEvent.topic == "livestream.decide")
+                    .order_by(OutboxEvent.created_at.desc()).limit(1)
+                )
+                args = row.payload
+            await consider_start(env.settings, router, **args)
+
+        assert (await env.client.put(f"{CUSTOM}/bili-live", json=request_window(
+            now + timedelta(minutes=2), now + timedelta(minutes=5),
+        ))).status_code == 200
+        assert (await status(broadcast_ready=True))["action"] == "hold"
+        async with session_scope() as db:
+            assert await db.scalar(select(func.count()).select_from(OutboxEvent).where(
+                OutboxEvent.topic == "livestream.decide"
+            )) == 0
+        assert (await env.client.put(f"{CUSTOM}/bili-live", json=request_window(
+            now - timedelta(minutes=1), now + timedelta(minutes=1),
+        ))).status_code == 200
+        assert (await status())["action"] == "prepare"
+        assert (await status(broadcast_ready=True))["action"] == "hold"
+        await decide()
+        assert (await env.client.get(f"{RUNS}/current")).json()["session"] is None
+        assert (await env.client.get(CUSTOM)).json()["connectors"][0]["autonomous_state"] == "wait"
+        router.answer = "开播"
+        assert (await status(broadcast_ready=True))["session_id"] is None
+        assert (await env.client.put(f"{CUSTOM}/bili-live", json=request_window(
+            now - timedelta(minutes=1), now + timedelta(minutes=2),
+        ))).status_code == 200
+        await status(broadcast_ready=True)
+        await decide()
+        state = (await env.client.get(f"{RUNS}/current")).json()["session"]
+        assert state["state"] == "starting"
+        assert datetime.fromisoformat(state["deadline_at"]) <= now + timedelta(minutes=2)
+        assert (await status(session_id=state["id"], device_id="other_stage_device"))["action"] == "hold"
+        assert (await status(session_id=state["id"]))["action"] == "start"
