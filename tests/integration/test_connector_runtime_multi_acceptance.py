@@ -94,6 +94,8 @@ class ProtocolWire:
                 "body": body,
             }
         )
+        if request.url.path == "/expired.silk":
+            return httpx.Response(410)
         if request.url.path.endswith(".wav"):
             return httpx.Response(200, content=_wave_bytes(), headers={"content-type": "audio/wav"})
         if request.url.path.endswith("/app/getAppAccessToken"):
@@ -346,6 +348,8 @@ def _event(
         message: str | list[dict[str, Any]] = text
         if audio_ref:
             message = [{"type": "record", "data": {"file": audio_ref, "url": audio_ref}}]
+            if text:
+                message.insert(0, {"type": "text", "data": {"text": text}})
         payload = {
             "time": int(time.time()),
             "self_id": int(SELF_ID),
@@ -781,6 +785,91 @@ async def test_disable_enable_and_delete_preserve_other_instance(
     assert listing.status_code == 200, listing.text
     assert "alpha" not in {item["instance_id"] for item in listing.json()["items"]}
     assert "bravo" in {item["instance_id"] for item in listing.json()["items"]}
+
+
+async def test_asr_download_failure_preserves_onebot_caption(
+    logged_in: TestEnv, protocol_wire: ProtocolWire, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = logged_in
+    await _pair(env, "onebot")
+    chat = await _chat(env, monkeypatch, asr=True)
+    await _bind(env, "onebot")
+    granted = await env.client.put("/v1/consents", json={"scope": "media.inbound", "granted": True})
+    assert granted.status_code == 200, granted.text
+    secret = await env.client.put(
+        "/v1/settings/providers/accept-asr/secret", json={"secret": "fixture-asr-key"},
+    )
+    assert secret.status_code == 200, secret.text
+
+    caption = "附件下载失败也要处理这句正文"
+    event = _event("onebot", caption, audio_ref="https://audio.example.test/expired.silk")
+    response = await _post(env, "onebot", "alpha", event)
+    assert response.json()["reason"] == "语音识别已排队", response.text
+    assert await asr_runtime.process_job(env.app)
+
+    async with session_scope() as session:
+        job = await session.scalar(select(AsrJob))
+        assert job is not None and job.state == "failed"
+        assert job.submission == "committed", job.error_message
+        assert job.text == caption
+    assert [call["path"] for call in protocol_wire.calls].count("/expired.silk") == 1
+    assert sum(caption in item for item in chat.inputs()) == 1
+    assert protocol_wire.sends()
+
+
+@pytest.mark.parametrize("mentioned", [False, True], ids=["quoted-someone", "mentioned-ling"])
+async def test_onebot_group_audio_requires_mention_and_rechecks_access(
+    logged_in: TestEnv, protocol_wire: ProtocolWire, monkeypatch: pytest.MonkeyPatch,
+    mentioned: bool,
+) -> None:
+    env = logged_in
+    await _pair(env, "onebot")
+    await _chat(env, monkeypatch, asr=True)
+    granted = await env.client.put("/v1/consents", json={"scope": "media.inbound", "granted": True})
+    assert granted.status_code == 200, granted.text
+    group_id = "100200330"
+    access = await env.client.put(f"{BASE}/access", headers=ORIGIN, json={"set": {
+        "LING_ACCESS_MODE": "whitelist",
+        "LING_ACCESS_LIST": ["100200399"] if mentioned else [USER_ID],
+        "LING_ACCESS_GROUPS": [group_id],
+    }})
+    assert access.status_code == 202, access.text
+    event = json.loads(_event("onebot", "", audio_ref="https://audio.example.test/alpha.wav"))
+    event.update({"message_type": "group", "group_id": int(group_id), "sub_type": "normal"})
+    directed = {"type": "at", "data": {"qq": SELF_ID}} if mentioned else {
+        "type": "reply", "data": {"id": "9002", "qq": "100200399"},
+    }
+    event["message"].insert(0, directed)
+    response = await _post(env, "onebot", "alpha", json.dumps(event).encode())
+    assert response.status_code == 200, response.text
+    assert len(response.json()["media_evidence_ids"]) == 1, response.text
+    async with session_scope() as session:
+        job = await session.scalar(select(AsrJob))
+        assert (job is not None) is mentioned, response.text
+    if mentioned:
+        assert response.json()["reason"] == "语音识别已排队", response.text
+        assert job is not None
+        secret = await env.client.put(
+            "/v1/settings/providers/accept-asr/secret", json={"secret": "fixture-asr-key"},
+        )
+        assert secret.status_code == 200, secret.text
+
+        async def unexpected_transcribe(*args, **kwargs):
+            pytest.fail("群许可撤销后不应向 ASR 供应商提交语音")
+
+        monkeypatch.setattr(
+            "ling.models.siliconflow_asr.SiliconFlowAsr.transcribe", unexpected_transcribe,
+        )
+        change = await env.client.put(f"{BASE}/access", headers=ORIGIN, json={"set": {
+            "LING_ACCESS_GROUPS": [],
+        }})
+        assert change.status_code == 202, change.text
+        assert await asr_runtime.process_job(env.app, job.id)
+        async with session_scope() as session:
+            aborted = await session.get(AsrJob, job.id)
+            assert aborted is not None and aborted.error_code == "forbidden"
+            assert aborted.charged_seconds == 0
+    assert not any(call["path"] == "/alpha.wav" for call in protocol_wire.calls)
 
 
 @pytest.mark.parametrize("scope", ["onebot", "qqbot"])

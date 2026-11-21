@@ -28,6 +28,15 @@ async def lock_scope(session: AsyncSession, key: str) -> None:
         await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
 
 
+def can_auto_transcribe(
+    *, is_group: bool, mentions_actor: bool, may_reply: bool, reply_when_addressed: bool,
+) -> bool:
+    """群语音自动转写只接受平台确认的 @，并使用当前出入许可。"""
+    if is_group:
+        return mentions_actor and (may_reply or reply_when_addressed)
+    return may_reply
+
+
 async def require_authorized(session: AsyncSession, job: AsrJob) -> Window:
     window = await session.get(Window, job.window_id, populate_existing=True)
     if window is None or window.archived:

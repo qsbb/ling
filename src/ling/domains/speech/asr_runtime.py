@@ -16,11 +16,17 @@ from ling.api.deps import AuthContext
 from ling.domains.conversation.service import ConversationService
 from ling.domains.media.assets import GeneratedMediaService
 from ling.domains.speech.audio_input import prepare_audio
-from ling.domains.speech.transcription import TranscriptionError, lock_scope, require_authorized
+from ling.domains.speech.transcription import (
+    TranscriptionError,
+    can_auto_transcribe,
+    lock_scope,
+    require_authorized,
+)
 from ling.infra.asr_jobs import AsrCallReservation, AsrJob
 from ling.infra.db import session_scope
 from ling.infra.models import Message
 from ling.infra.security import load_signing_root_key
+from ling.ports.channel import ChannelError
 from ling.ports.speech import AsrRequest, SpeechCall, SpeechError
 from ling.settings.service import ConfigService, effective_from_payload
 
@@ -29,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_TEXT_FALLBACK_STATES = ("failed", "unknown", "unintelligible", "no_speech")
+_TEXT_FALLBACK_STATES = ("failed", "unknown", "unintelligible", "no_speech", "expired")
 
 
 def media_service(session, app) -> GeneratedMediaService:
@@ -45,12 +51,19 @@ async def check_access(app, session, job: AsrJob) -> None:
         from ling.kernel.visibility import group_id_from_window_ref
         env = job.payload["envelope"]
         settings = app.state.settings
+        group_id = group_id_from_window_ref(env["window_ref"])
         access = check_channel(env.get("account_ref"), mode=settings.access_mode,
                                allow_list=settings.access_list,
-                               group_id=group_id_from_window_ref(env["window_ref"]),
+                               group_id=group_id,
                                allow_groups=settings.access_groups)
-        if not access.observable:
+        if not can_auto_transcribe(
+            is_group=group_id is not None,
+            mentions_actor=env.get("mentions_actor") is True,
+            may_reply=access.allowed,
+            reply_when_addressed=access.reply_when_addressed,
+        ):
             raise TranscriptionError("forbidden", "当前账号已失去渠道访问资格", 403)
+        _source_connector(app, job.payload)
 
 
 def _source_connector(app, payload: dict) -> tuple[ChannelConnector, tuple[str, str] | None]:
@@ -166,7 +179,10 @@ async def _process_audio(
         fetch = make_media_fetcher(
             connector, media_root=settings.data_dir / "media", max_bytes=10 * 1024 * 1024
         )
-        raw, _ = await fetch(item["ref"])
+        try:
+            raw, _ = await fetch(item["ref"])
+        except ChannelError as exc:
+            raise TranscriptionError("audio_download", "无法下载平台语音") from exc
 
     prepared = await prepare_audio(raw)
     if prepared.silent:

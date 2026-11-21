@@ -545,6 +545,26 @@ async def test_expired_queue_state_survives_get_and_can_be_retried(
     assert [row.text for row in await _messages(window) if row.role == "user"] == [recognition.phrase]
 
 
+async def test_expired_queue_preserves_original_text(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window, asset, recognition, wire = await _setup(logged_in, monkeypatch)
+    caption = "转写排队超时后照常发送正文"
+    created = await _create(logged_in, window, asset, text=caption)
+    job_id = created["job_id"]
+    async with session_scope() as session:
+        job = await session.get(AsrJob, job_id)
+        job.queued_at = datetime.now(UTC) - timedelta(minutes=2)
+    assert not await asr_runtime.process_job(logged_in.app, job_id)
+    await _run_worker_polls(logged_in.app, monkeypatch)
+
+    result = await _state(logged_in, window, job_id)
+    assert result["state"] == "expired" and result["submission"] == "committed", result
+    assert recognition.calls == 0
+    assert sum(caption in item for item in wire.inputs()) == 1
+    assert [row.text for row in await _messages(window) if row.role == "user"] == [caption]
+
+
 async def _reservations(job_id: str) -> list[AsrCallReservation]:
     async with session_scope() as session:
         return list((await session.scalars(select(AsrCallReservation).where(

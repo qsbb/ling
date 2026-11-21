@@ -529,6 +529,8 @@ class InboundBridge:
             part.text or "" for part in envelope.parts if part.modality.value == "text"
         ).strip()
         display_text = (envelope.display_text or text).strip()
+        # 连接器插入的媒体标记留在上下文里。判断用户写没写正文时只看可读文字。
+        readable = _MEDIA_MARKERS.sub("", text).strip()
 
         # 媒体必须在文本判断**之前**登记，否则纯图片消息会被整条丢掉，
         # 连"收到过一张图"都留不下痕迹，描述任务也就无从捡起。
@@ -557,14 +559,23 @@ class InboundBridge:
         audio_ids = []
         if has_new_audio:
             from ling.domains.media.service import MediaEvidenceService
-            from ling.domains.speech.transcription import TranscriptionError, create_job
+            from ling.domains.speech.transcription import (
+                TranscriptionError,
+                can_auto_transcribe,
+                create_job,
+            )
 
             svc = MediaEvidenceService(self._session, actor_id=self._actor_id)
             for eid in media_ids:
                 evidence = await svc.get(eid, window_id=window.id)
                 if evidence is not None and evidence.kind == "audio":
                     audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
-            if audio_ids and not observe and (not is_group or addressed):
+            if audio_ids and can_auto_transcribe(
+                is_group=is_group,
+                mentions_actor=envelope.mentions_actor,
+                may_reply=not self._observe_only,
+                reply_when_addressed=self._reply_when_addressed,
+            ):
                 effective = runtime_snapshot.config
                 try:
                     job = await create_job(
@@ -572,7 +583,7 @@ class InboundBridge:
                         actor_id=self._actor_id,
                         request_key=f"{envelope.connector_instance}:{envelope.external_event_id}",
                         mode="send", config=effective,
-                        payload={"audio": audio_ids, "text": _MEDIA_MARKERS.sub("", text).strip(),
+                        payload={"audio": audio_ids, "text": readable,
                                  "envelope": envelope.model_dump(mode="json"),
                                  "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0],
                                  "trusted_instance": (
@@ -587,8 +598,10 @@ class InboundBridge:
                     return BridgeResult(accepted=True, reason="语音识别已排队", decision="deferred_attention",
                                         subject_id=subject_id, window_id=window.id, media_evidence_ids=media_ids)
                 except TranscriptionError as exc:
-                    return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
-                                        window_id=window.id, media_evidence_ids=media_ids)
+                    if not readable:
+                        return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
+                                            window_id=window.id, media_evidence_ids=media_ids)
+                    media_note = media_note or str(exc)
 
         if has_new_audio:
             await self._session.commit()
@@ -630,12 +643,6 @@ class InboundBridge:
                 media_evidence_ids=media_ids,
                 media_note=media_note,
             )
-
-        # 连接器会把媒体换成 ``[image]`` / ``[voice]`` 这类占位标记塞进正文。
-        # 它们是**连接器的痕迹，不是用户说的话**：只发一张图时正文等于
-        # "[image]"，若照字面判"有文本"就会拿 "[image]" 当用户发言去回复。
-        # 占位标记仍保留在 text 里给模型当提示，只在"有没有真话"的判断上剥掉。
-        readable = _MEDIA_MARKERS.sub("", text).strip()
 
         if not readable:
             if media_ids:

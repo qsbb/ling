@@ -24,6 +24,7 @@ from sqlalchemy import text as sql_text
 from ling.domains.consent.service import ConsentService
 from ling.domains.identity.service import IdentityService
 from ling.domains.media.service import INBOUND_SCOPE
+from ling.infra.asr_jobs import AsrJob
 from ling.infra.db import session_scope
 from ling.infra.models import MediaEvidenceRow, Message, Window
 from tests.integration.conftest import TestEnv
@@ -576,6 +577,38 @@ async def test_qq_image_urls_are_stored_intact_and_deduped(logged_in: TestEnv) -
         assert await session.scalar(select(Message.id).where(
             Message.role == "user", Message.text == "这两张图有什么区别？[image][image]"
         ))
+
+
+@pytest.mark.parametrize("with_text", [True, False], ids=["mixed-text", "audio-only"])
+async def test_onebot_keeps_text_when_asr_is_unconfigured(
+    logged_in: TestEnv, with_text: bool,
+) -> None:
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+
+    caption = "这句正文应照常送入对话"
+    segments = [{"type": "record", "data": {"url": "https://media.example.test/fixture.silk"}}]
+    if with_text:
+        segments.insert(0, {"type": "text", "data": {"text": caption}})
+    event = _event_body(message=segments)
+    response = (await _post(logged_in, event)).json()
+    assert len(response["media_evidence_ids"]) == 1, response
+    assert response["accepted"] is with_text, response
+    assert response["delivered"] is with_text
+    notice = response["media_note"] if with_text else response["reason"]
+    assert "绑定并启用语音识别模型" in (notice or ""), response
+    assert bool(fake.sent) is with_text
+    assert (await _post(logged_in, event)).json()["duplicate"] is True
+
+    async with session_scope() as session:
+        assert await session.scalar(select(AsrJob.id)) is None
+        row = await session.scalar(select(Message).where(Message.role == "user"))
+        if with_text:
+            assert row is not None and caption in row.text
+        else:
+            assert row is None
 
 
 async def test_pure_image_is_retryable_if_postgres_rejects_commit(
