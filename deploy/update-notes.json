@@ -94,6 +94,16 @@
         "忽略废弃的群观察配置，对齐现有 PostgreSQL 表结构；不新增数据库迁移"
       ],
       "url": "https://github.com/qsbb/ling/releases/tag/v0.0.13"
+    },
+    "0.0.14": {
+      "summary": "更新生活与平台接入页面，支持导入 AstrBot 旧记忆，修复 QQ 语音收发",
+      "items": [
+        "生活页聚焦当前活动与今日安排。平台接入按账号配置，页头显示实际收到的 OneBot HTTP 上报",
+        "可预览并导入 AstrBot QQ 私聊记忆，查看保存的经历及导入来源",
+        "修复长媒体链接登记、语音无法识别时附言丢失、MiniMax 音色参数遗漏和重投重复合成，区分缺回执与拒收",
+        "升级扩展 PostgreSQL 媒体引用字段，并增加记忆导入来源字段"
+      ],
+      "url": "https://github.com/qsbb/ling/releases/tag/v0.0.14"
     }
   }
 }
