@@ -1543,7 +1543,7 @@ async def reset_connector_config(
 
 @router.put("/settings/draft")
 async def save_draft(
-    body: DraftBody, auth: OwnerWrite, config: ConfigDep
+    body: DraftBody, auth: OwnerWrite, config: ConfigDep, session: DbSession
 ) -> dict[str, object]:
     result = await config.save_draft(
         # exclude_unset：老客户端不带 models 时表示"别动清单"，
@@ -1565,6 +1565,8 @@ async def save_draft(
         note=body.note,
         created_by=auth.user.id,
     )
+    # 控制台收到草稿的成功响应后会立即发布。
+    await session.commit()
     return {
         "revision": result.revision,
         "state": result.state,
@@ -1746,19 +1748,22 @@ async def quick_config_preview(
 
 @router.post("/settings/publish")
 async def publish(
-    body: PublishBody, request: Request, auth: OwnerWrite, config: ConfigDep
+    body: PublishBody, request: Request, auth: OwnerWrite, config: ConfigDep, session: DbSession
 ) -> dict[str, object]:
     revision = await config.publish(body.revision, published_by=auth.user.id)
+    secrets = {}
+    for pid in (await config.effective()).providers:
+        secret = await config.read_secret(pid)
+        if secret:
+            secrets[pid] = secret
+    await session.commit()
     request.app.state.registry.invalidate()
     request.app.state.secret_cache.clear()
+    request.app.state.secret_cache.update(secrets)
     # 「入站拒绝日志」开关也在配置修订里，而受理路径把它缓存在 app.state
     # （TTL 见 inbound_intake）。发布/回滚发生在控制面，本进程的缓存立刻
     # 失效，别让用户等一个 TTL 才看到开关生效。
     request.app.state._log_denials_cache = None
-    for pid in (await config.effective()).providers:
-        secret = await config.read_secret(pid)
-        if secret:
-            request.app.state.secret_cache[pid] = secret
     # 配置发布是"改了系统行为"的动作，必须留痕：谁、从哪个修订、改成哪个
     audit_event(
         "config_published",

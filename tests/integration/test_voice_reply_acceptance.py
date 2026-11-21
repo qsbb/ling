@@ -23,6 +23,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from sqlalchemy import select
+from starlette.types import Message as ASGIMessage
+from starlette.types import Receive, Scope, Send
 
 from ling.contracts.v1 import TurnState
 from ling.domains.conversation.service import ConversationService
@@ -31,6 +33,7 @@ from ling.domains.media.assets import GeneratedMediaService
 from ling.domains.speech.orchestration import SYNTHESIS_SCOPE, SynthesisState, decode_state
 from ling.infra.db import session_scope
 from ling.infra.models import (
+    ConfigRevision,
     DeferredReply,
     IdempotencyKey,
     Message,
@@ -42,6 +45,41 @@ from ling.infra.security import load_signing_root_key
 from tests.integration.conftest import TestEnv, read_sse
 
 pytestmark = pytest.mark.w0_web
+
+
+async def test_voice_settings_committed_before_success_response(logged_in: TestEnv) -> None:
+    observed: dict[str, tuple[int, str] | None] = {}
+
+    async def observe_response(scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_visibility(message: ASGIMessage) -> None:
+            if message["type"] == "http.response.start" and message["status"] == 200:
+                async with session_scope() as reader:
+                    row = await reader.scalar(
+                        select(ConfigRevision).order_by(ConfigRevision.revision.desc()).limit(1)
+                    )
+                    observed[scope["path"]] = (row.revision, row.state) if row else None
+            await send(message)
+
+        await logged_in.app(scope, receive, send_with_visibility)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=observe_response),
+        base_url=logged_in.client.base_url,
+        cookies=logged_in.client.cookies,
+        headers=logged_in.client.headers,
+    ) as client:
+        draft = await client.put(
+            "/v1/settings/draft", json={"dialogue": {"voice_willingness": "expressive"}}
+        )
+        assert draft.status_code == 200, draft.text
+        revision = draft.json()["revision"]
+        published = await client.post("/v1/settings/publish", json={"revision": revision})
+        assert published.status_code == 200, published.text
+
+    assert observed == {
+        "/v1/settings/draft": (revision, "draft"),
+        "/v1/settings/publish": (revision, "published"),
+    }
 
 
 @dataclass(frozen=True)
