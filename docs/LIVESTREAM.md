@@ -32,7 +32,7 @@ ling-stage --server http://127.0.0.1:8080 --instance bili-live \
 
 ```bash
 uv pip install 'httpx>=0.27,<1' 'aiohttp>=3.9,<4' 'Brotli>=1.1,<2' 'pure-protobuf>=3.1.2,<4'
-uv pip install --no-deps 'https://codeload.github.com/xfgryujk/blivedm/tar.gz/3bf17fe862b8c2fc6bc04c81c3f0c5db95de93d6'
+uv pip install --no-deps 'https://github.com/xfgryujk/blivedm/archive/3bf17fe862b8c2fc6bc04c81c3f0c5db95de93d6.tar.gz'
 python -m connectors.bilibili --server http://127.0.0.1:8080 --instance bili-live
 ```
 
