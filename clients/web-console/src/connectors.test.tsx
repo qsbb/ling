@@ -19,7 +19,6 @@ import {
   ACCESS_MODES,
   buildConnectorChange,
   connectorFieldState,
-  connectorRuntimeLine,
   describeChangeResult,
   describeConnectorStatus,
   describeResetResult,
@@ -205,19 +204,19 @@ describe('四态渲染互不串', () => {
     expect(guidanceOf(markup)).toBe('');
   });
 
-  it('观察到 HTTP 上报时显示接收计数并打开 HTTP 配置', () => {
+  it('观察到 HTTP 上报时在顶部显示状态，并打开 HTTP 配置', () => {
     const markup = render(makeConnector({
       configured: true,
       status: 'http_received',
       status_reason: 'onebot_http_received',
+      status_message: '本次运行已收到此账号的 HTTP 上报。',
       runtime: { connections: null, received: 2, http_received: 2 },
       fields: [makeField({ key: 'LING_ONEBOT_SECRET', kind: 'secret', configured: false })],
     }));
 
-    expect(markup).toContain('已收到 HTTP 上报');
-    expect(markup).toContain('已收 2 条 HTTP 上报');
+    expect(markup).toContain('本次运行已收到此账号的 HTTP 上报。');
     expect(markup).toContain('data-testid="onebot-group-http"');
-    expect(markup).not.toContain('条连接');
+    expect(markup).not.toContain('data-testid="connector-onebot-delivery"');
   });
 });
 
@@ -675,31 +674,6 @@ describe('字段：密钥只报"设没设"', () => {
     expect(markup).toContain('LING_QQBOT_WEBHOOK_PUBLIC_KEY');
     expect(markup).toContain('connector-field__state--unset');
     expect(markup).toContain('来自环境变量');
-  });
-});
-
-describe('运行时那一行：没有可观察的连接就不编数字', () => {
-  it('connections 为 null（只配了 HTTP 上报）时整行不显示', () => {
-    expect(connectorRuntimeLine({ connections: null, received: null })).toBeNull();
-  });
-
-  it('零连接与服务端在等客户端都能读出来', () => {
-    expect(connectorRuntimeLine({ connections: 0, received: 0 })).toBe(
-      '当前没有连接，已收 0 帧事件',
-    );
-  });
-
-  it('已连接但一帧都没收到时，把这件事说出来', () => {
-    expect(connectorRuntimeLine({ connections: 1, received: 0 })).toContain('还没推过任何数据');
-    expect(connectorRuntimeLine({ connections: 1, received: 132 })).toBe(
-      '当前 1 条连接，已收 132 帧事件',
-    );
-  });
-
-  it('同一账号把 WebSocket 帧和 HTTP 上报分别展示', () => {
-    expect(connectorRuntimeLine({ connections: 1, received: 8, http_received: 2 })).toBe(
-      'WebSocket 当前 1 条连接，已收 6 帧 · 已收 2 条 HTTP 上报',
-    );
   });
 });
 

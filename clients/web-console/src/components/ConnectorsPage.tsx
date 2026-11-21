@@ -53,11 +53,10 @@ import type {
   ConnectorChangeResult,
   ConnectorField,
   ConnectorResetResponse,
-  ConnectorRuntime,
   ConnectorsResponse,
   ConnectorView,
 } from '../types';
-import { AlertIcon, ArrowDownIcon, ArrowLeftIcon, CheckIcon, ChevronRightIcon, MessageIcon, RefreshIcon, SendIcon, SlidersIcon } from './Icons';
+import { AlertIcon, ArrowLeftIcon, CheckIcon, ChevronRightIcon, MessageIcon, RefreshIcon, SlidersIcon } from './Icons';
 import {
   connectorViewOf,
   ConnectorInstancePanel,
@@ -195,28 +194,6 @@ export function connectorFieldState(field: ConnectorField): string {
   }
   const value = textValueOf(field);
   return value === '' ? '未设置' : value;
-}
-
-/**
- * 运行时一句话（连接数 + 已收帧数）。
- *
- * HTTP 上报与长连接分别统计。
- */
-export function connectorRuntimeLine(runtime: ConnectorRuntime): string | null {
-  const httpReceived = runtime.http_received ?? 0;
-  const httpLine = httpReceived > 0 ? `已收 ${httpReceived} 条 HTTP 上报` : null;
-  if (runtime.connections === null) return httpLine;
-  const connections =
-    runtime.connections === 0 ? '当前没有连接' : `当前 ${runtime.connections} 条连接`;
-  if (httpLine) {
-    const wsReceived = (runtime.received ?? 0) - httpReceived;
-    return `WebSocket ${connections}，已收 ${wsReceived} 帧 · ${httpLine}`;
-  }
-  const received = runtime.received === null ? '' : `，已收 ${runtime.received} 帧事件`;
-  if (runtime.connections > 0 && runtime.received === 0) {
-    return `${connections}${received}：连接是通的，但对面还没推过任何数据。`;
-  }
-  return `${connections}${received}`;
 }
 
 /** 来源徽标文案：DB 覆盖 / 环境变量 / 默认值。未知来源如实说"来源未知"。 */
@@ -1078,7 +1055,6 @@ export function ConnectorCard({
   const presentation = emptyFieldsReason
     ? { label: '状态暂不可用', tone: 'neutral' }
     : describeConnectorStatus(connector.status, connector.status_reason);
-  const runtime = !emptyFieldsReason && connectorRuntimeLine(connector.runtime);
   const editable = connector.editable;
   const change = useMemo(
     () => buildConnectorChange(connector.fields, form.draft, form.clearKeys),
@@ -1105,11 +1081,6 @@ export function ConnectorCard({
   const replyAddress = connector.fields.find((field) => connectorFieldKey(field) === ONEBOT_SEND_ADDRESS);
   const hasReplyAddress = replyAddress !== undefined && textValueOf(replyAddress) !== '';
   const [settingsOpen, setSettingsOpen] = useState(() => connector.id !== 'onebot' || !hasReplyAddress);
-  let receiveStatus = '暂无接收状态';
-  if (connector.status === 'disabled') receiveStatus = '账号已停用';
-  else if (connector.status === 'http_received') receiveStatus = '已收到 HTTP 上报';
-  else if ((connector.runtime.received ?? 0) > 0) receiveStatus = '已收到平台事件';
-  else if (connector.status === 'connected') receiveStatus = '已连接，等待事件';
   const submit = () => {
     if (!form.saving) form.onSave();
   };
@@ -1135,34 +1106,16 @@ export function ConnectorCard({
       </div>
 
       {!emptyFieldsReason ? (
-        <>
-          <div className="connector-card__diagnosis" data-testid={`connector-${connector.id}-diagnosis`}>
-            <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
-              {renderInlineCode(connector.status_message)}
+        <div className="connector-card__diagnosis" data-testid={`connector-${connector.id}-diagnosis`}>
+          <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
+            {renderInlineCode(connector.status_message)}
+          </p>
+          {connector.guidance ? (
+            <p className="connector-card__next" data-testid={`connector-${connector.id}-guidance`}>
+              {renderInlineCode(connector.guidance)}
             </p>
-            {connector.guidance ? (
-              <p className="connector-card__next" data-testid={`connector-${connector.id}-guidance`}>
-                {renderInlineCode(connector.guidance)}
-              </p>
-            ) : null}
-          </div>
-          <div className="connector-delivery" data-testid={`connector-${connector.id}-delivery`}>
-            <section aria-label="接收消息">
-              <h3><ArrowDownIcon />接收消息</h3>
-              <strong>{receiveStatus}</strong>
-              {runtime ? <p data-testid={`connector-${connector.id}-runtime`}>{runtime}</p> : null}
-            </section>
-            <section aria-label="发送回复">
-              <h3><SendIcon />发送回复</h3>
-              {connector.id === 'onebot' && !hasReplyAddress ? (
-                <><strong className="connector-text--warn">尚未配置回复通道</strong><p>在连接设置中填写 HTTP API 地址。</p></>
-              ) : (
-                <><strong>{connector.id === 'onebot' ? '已配置 HTTP API 地址' : '等待实际发送回执'}</strong>
-                  {connector.id === 'onebot' ? <p>发送结果请查看消息回执。</p> : null}</>
-              )}
-            </section>
-          </div>
-        </>
+          ) : null}
+        </div>
       ) : null}
 
       {/*

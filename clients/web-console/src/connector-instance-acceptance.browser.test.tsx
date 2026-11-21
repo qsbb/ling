@@ -433,7 +433,8 @@ describe('验收：实例面板', () => {
     await expect.poll(() => page.getByRole('heading', { name: '平台', exact: true }).isVisible()).toBe(true);
     await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').textContent()).toContain('平台已连上');
     await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').textContent()).toContain('还没有发送消息的通道');
-    await expect.poll(() => page.getByTestId('connector-onebot-runtime').textContent()).toContain('已收 2 帧事件');
+    expect(await page.getByRole('heading', { name: '接收消息', exact: true }).count()).toBe(0);
+    expect(await page.getByRole('heading', { name: '发送回复', exact: true }).count()).toBe(0);
     await expect.poll(() => page.getByTestId('connector-onebot-status').textContent()).toContain('已连接');
     await expect.poll(() => page.getByRole('heading', { name: '访问权限' }).count()).toBe(0);
     await page.getByTestId('connector-platform-access').click();

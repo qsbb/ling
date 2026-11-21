@@ -62,14 +62,6 @@ export function SlidersIcon({ size = 17, className }: IconProps) {
   );
 }
 
-export function ArrowDownIcon({ size = 17, className }: IconProps) {
-  return (
-    <svg {...base(size, className)}>
-      <path d="M12 4v15m-5-5 5 5 5-5" />
-    </svg>
-  );
-}
-
 /** 总览：四宫格（一屏看全）。 */
 export function DashboardIcon({ size = 17, className }: IconProps) {
   return (
