@@ -145,6 +145,8 @@ export function describeConnectorStatus(status: string, reason?: string): Connec
         tone: 'ok',
         hint: '当前连着，不需要改任何东西。',
       };
+    case 'http_received':
+      return { label: 'HTTP 上报', tone: 'ok', hint: '已收到此账号的 HTTP 上报。' };
     default:
       return {
         label: '状态未知',
@@ -198,13 +200,18 @@ export function connectorFieldState(field: ConnectorField): string {
 /**
  * 运行时一句话（连接数 + 已收帧数）。
  *
- * `connections === null` 表示这条入站路径没有可观察的连接对象（只配了 HTTP
- * 上报），此时**不编数字**：整行不显示。
+ * HTTP 上报与长连接分别统计。
  */
 export function connectorRuntimeLine(runtime: ConnectorRuntime): string | null {
-  if (runtime.connections === null) return null;
+  const httpReceived = runtime.http_received ?? 0;
+  const httpLine = httpReceived > 0 ? `已收 ${httpReceived} 条 HTTP 上报` : null;
+  if (runtime.connections === null) return httpLine;
   const connections =
     runtime.connections === 0 ? '当前没有连接' : `当前 ${runtime.connections} 条连接`;
+  if (httpLine) {
+    const wsReceived = (runtime.received ?? 0) - httpReceived;
+    return `WebSocket ${connections}，已收 ${wsReceived} 帧 · ${httpLine}`;
+  }
   const received = runtime.received === null ? '' : `，已收 ${runtime.received} 帧事件`;
   if (runtime.connections > 0 && runtime.received === 0) {
     return `${connections}${received}：连接是通的，但对面还没推过任何数据。`;
@@ -973,10 +980,16 @@ function ConnectorFields({ connector, instanceId, form, change, renderField }: {
 }) {
   const onebotFields = connector.fields;
   const has = (key: string) => onebotFields.some((field) => connectorFieldKey(field) === key && isFieldSet(field));
-  const defaultMethod: OneBotMethod = connector.status_reason?.includes('onebot_ws_client')
-    ? 'direct' : has('LING_ONEBOT_WS_PORT') ? 'reverse'
-      : has('LING_ONEBOT_WS_URL') ? 'direct'
-        : has('LING_ONEBOT_SECRET') || connector.status_reason === 'onebot_http_only' ? 'http' : 'reverse';
+  const hasReverse = has('LING_ONEBOT_WS_PORT');
+  const reason = connector.status_reason;
+  let defaultMethod: OneBotMethod = 'reverse';
+  if (reason === 'onebot_http_received') {
+    defaultMethod = 'http';
+  } else if (reason?.startsWith('onebot_ws_client') || (!hasReverse && has('LING_ONEBOT_WS_URL'))) {
+    defaultMethod = 'direct';
+  } else if (!hasReverse && (reason === 'onebot_http_only' || has('LING_ONEBOT_SECRET'))) {
+    defaultMethod = 'http';
+  }
   const [choice, setChoice] = useState<OneBotMethod | null>(null);
   const errorMethod = ONEBOT_METHODS.find((mode) => (
     [...ONEBOT_PRIMARY[mode], ...ONEBOT_MODE_OPTIONS[mode]].includes(form.fieldError ?? '')
@@ -1094,6 +1107,7 @@ export function ConnectorCard({
   const [settingsOpen, setSettingsOpen] = useState(() => connector.id !== 'onebot' || !hasReplyAddress);
   let receiveStatus = '暂无接收状态';
   if (connector.status === 'disabled') receiveStatus = '账号已停用';
+  else if (connector.status === 'http_received') receiveStatus = '已收到 HTTP 上报';
   else if ((connector.runtime.received ?? 0) > 0) receiveStatus = '已收到平台事件';
   else if (connector.status === 'connected') receiveStatus = '已连接，等待事件';
   const submit = () => {

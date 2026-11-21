@@ -46,6 +46,7 @@ STATUS_NOT_CONFIGURED = "not_configured"
 STATUS_DISABLED = "disabled"
 STATUS_DISCONNECTED = "configured_disconnected"
 STATUS_CONNECTED = "connected"
+STATUS_HTTP_RECEIVED = "http_received"
 
 # 「这个状态为什么是这样」的码表。码给程序判断，文案给人读；前端只显示文案，
 # 不自己再维护一份翻译（否则后端的判定改了，前端还在说旧理由）。
@@ -64,9 +65,8 @@ CONNECTOR_REASON_TEXT: dict[str, str] = {
     ),
     "onebot_ws_server_waiting": "Ling 正在监听，等待 OneBot 连入。",
     "onebot_ws_client_disconnected": "出站 WS 连接已启动，但当前是断的",
-    "onebot_http_only": (
-        "HTTP 不保持连接，不能从这里判断是否收到消息。"
-    ),
+    "onebot_http_only": "等待收到 HTTP 上报。",
+    "onebot_http_received": "本次运行已收到此账号的 HTTP 上报。",
     # --- QQ 官方机器人 ---
     "qqbot_credentials_missing": "凭据不全（需要 APP_ID 与 CLIENT_SECRET 两项）",
     "qqbot_channel_disabled": "凭据已配好，但渠道开关是关的（LING_QQBOT_ENABLED=0）",
@@ -234,6 +234,8 @@ def _onebot_guidance(status: str, reason: str, *, received: int | None) -> str:
         if received == 0:
             return "已建立连接，尚未收到事件。请发一条测试消息确认收发。"
         return "已连接，没有需要改的。"
+    if status == STATUS_HTTP_RECEIVED:
+        return ""
     if reason == "onebot_no_inbound_path":
         return "在接入设置中选择与 OneBot 端一致的连接方向。"
     if reason == "onebot_ws_server_not_started":
@@ -323,22 +325,18 @@ def _qqbot_runtime(gateway: Any) -> dict[str, int | None]:
 
 
 def _onebot_view(settings: Any, onebot: Any, app_state: Any) -> dict[str, Any]:
-    """OneBot 的只读视图。
-
-    OneBot **没有独立的渠道开关**（``/v1/onebot/events`` 常驻注册，配了 WS 端口/
-    地址就在启动时起对应组件），所以 ``enabled`` 报的是"有没有配入站路径"——
-    这是代码里唯一存在的"打开/关闭"，不另外发明一个。
-    """
+    """结合当前实例的配置、WS 连接和已观察到的 HTTP 上报。"""
     ws_port = settings.onebot_ws_port
     ws_url = settings.onebot_ws_url
 
     ws_server_ready = bool(ws_port)
     ws_client_ready = bool(ws_url)
-    http_configured = bool(onebot.secret or getattr(onebot, "source_ips", ""))
-    configured = ws_server_ready or ws_client_ready or http_configured
-
     ws_server = getattr(app_state, "onebot_ws_server", None) if app_state is not None else None
     ws_client = getattr(app_state, "onebot_ws", None) if app_state is not None else None
+    connector = getattr(app_state, "onebot_connector", None) if app_state is not None else None
+    http_received = getattr(connector, "http_received", 0)
+    http_configured = bool(http_received or onebot.secret or getattr(onebot, "source_ips", ""))
+    configured = ws_server_ready or ws_client_ready or http_configured
 
     if not configured:
         reason = "onebot_no_inbound_path"
@@ -347,6 +345,8 @@ def _onebot_view(settings: Any, onebot: Any, app_state: Any) -> dict[str, Any]:
         status, reason = STATUS_CONNECTED, "onebot_ws_server_client"
     elif bool(getattr(ws_client, "connected", False)):
         status, reason = STATUS_CONNECTED, "onebot_ws_client_connected"
+    elif http_received:
+        status, reason = STATUS_HTTP_RECEIVED, "onebot_http_received"
     elif ws_server_ready and ws_server is None:
         status, reason = STATUS_DISCONNECTED, "onebot_ws_server_not_started"
     elif ws_client_ready and ws_client is None:
@@ -360,6 +360,9 @@ def _onebot_view(settings: Any, onebot: Any, app_state: Any) -> dict[str, Any]:
 
     fields = _onebot_fields(settings, onebot)
     runtime = _onebot_runtime(ws_server, ws_client)
+    if http_received:
+        runtime["http_received"] = http_received
+        runtime["received"] = (runtime["received"] or 0) + http_received
     return {
         "id": "onebot",
         "label": "OneBot（NapCat / Lagrange / go-cqhttp）",
@@ -420,7 +423,8 @@ def connector_views(settings: Any, app_state: Any = None) -> list[dict[str, Any]
     """两个渠道的只读视图。
 
     ``app_state`` 是 FastAPI 的 ``app.state``：连接状态只能从里面已经构造好的
-    运行时对象读（``onebot_ws_server`` / ``onebot_ws`` / ``qqbot_gateway``），
+    运行时对象读（``onebot_connector`` / ``onebot_ws_server`` / ``onebot_ws`` /
+    ``qqbot_gateway``），
     这里**不发任何网络探测**——设置页会被反复打开，不能拿它当探活工具。
     对象不存在就是不存在（说明没启动），不猜。
     """

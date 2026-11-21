@@ -66,6 +66,11 @@ async def onebot_events(request: Request, instance_id: str = "default") -> JSONR
     if not isinstance(payload, dict):
         raise LingError(ErrorCode.invalid_request, "上报正文必须是对象", status_code=400)
 
+    # 统计通过入口校验的 OneBot 事件，心跳与消息都计入。
+    post_type = payload.get("post_type")
+    if isinstance(post_type, str) and post_type.strip():
+        connector.http_received += 1
+
     # 收到 payload 之后的一切都在 kernel/inbound_intake —— HTTP、WebSocket 与
     # QQ 官方机器人 Webhook 三条入站必须共用同一套（白名单、去重、身份、
     # 决策、投递），分成几份实现迟早有一条忘了某个检查，而且是静默的。

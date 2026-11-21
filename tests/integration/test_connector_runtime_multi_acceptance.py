@@ -480,6 +480,58 @@ async def test_new_onebot_namespace_does_not_inherit_default_credentials(
     assert response.json()["instance"] == "legacy-onebot"
 
 
+async def test_onebot_http_status_uses_events_observed_for_each_instance(
+    logged_in: TestEnv,
+    protocol_wire: ProtocolWire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = logged_in
+    for instance_id in ("alpha", "bravo"):
+        await _create(env, "onebot", instance_id)
+        response = await _save(
+            env, "onebot", instance_id,
+            {"LING_ONEBOT_API_BASE": f"https://{instance_id}.onebot.example.test"},
+        )
+        assert response.status_code == 202, response.text
+        assert response.json()["state"] == "active", response.text
+        view = await _view(env, "onebot", instance_id)
+        assert view["status"] == "not_configured"
+        fields = {field["key"]: field for field in view["fields"]}
+        for key in ("LING_ONEBOT_SECRET", "LING_ONEBOT_ACCESS_TOKEN", "LING_ONEBOT_SOURCE_IPS"):
+            assert not fields[key]["configured"], key
+
+    await _chat(env, monkeypatch)
+    await _bind(env, "onebot")
+    path = "/v1/onebot/instances/alpha/events"
+    event = _event("onebot", "验证 HTTP 上报及回复")
+    browser_post = await env.client.post(path, content=event)
+    assert browser_post.status_code == 403, browser_post.text
+    transport = httpx.ASGITransport(app=env.app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as connector:
+        invalid = await connector.post(path, content=b"not-json")
+        assert invalid.status_code == 400, invalid.text
+        empty = await connector.post(path, json={})
+        assert empty.status_code == 200, empty.text
+        assert (await _view(env, "onebot", "alpha"))["runtime"]["received"] is None
+
+        response = await connector.post(
+            path, content=event,
+            headers={"Content-Type": "application/json", "X-Self-ID": SELF_ID},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["delivered"] is True, response.text
+    assert {call["host"] for call in protocol_wire.sends()} == {"alpha.onebot.example.test"}
+
+    alpha = await _view(env, "onebot", "alpha")
+    assert alpha["configured"] is True
+    assert alpha["status"] == "http_received"
+    assert alpha["status_reason"] == "onebot_http_received"
+    assert alpha["runtime"] == {"connections": None, "received": 1, "http_received": 1}
+    bravo = await _view(env, "onebot", "bravo")
+    assert bravo["status"] == "not_configured"
+    assert bravo["runtime"] == {"connections": None, "received": None}
+
+
 @pytest.mark.parametrize("scope", ["onebot", "qqbot"])
 async def test_hot_update_and_generation_compare_only_touch_target(
     logged_in: TestEnv,

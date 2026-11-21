@@ -853,7 +853,7 @@ async def get_connectors(
         components = runtime.components(scope, selected) if runtime is not None and hasattr(runtime, "components") else {}
         if selected == DEFAULT_INSTANCE_ID:
             components = {name: getattr(request.app.state, name, None) for name in (
-                "onebot_ws_server", "onebot_ws", "qqbot_gateway",
+                "onebot_connector", "onebot_ws_server", "onebot_ws", "qqbot_gateway",
             )}
         runtime_settings = ov.ConnectorRuntimeSettings().with_values(scope, values)
         view_settings = SimpleNamespace(**vars(settings))

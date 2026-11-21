@@ -686,8 +686,7 @@ export interface DraftResponse {
 /**
  * 接入器（`GET /v1/settings/connectors`）的视图。
  *
- * 四态而不是三态：`disabled` 只出现在 QQ 官方机器人上——凭据配好了但渠道开关
- * 是关的。把它说成"未连接"是错的（连接从没被尝试过），去查连接只会白费时间。
+ * `disabled` 表示账号或渠道已停用。`http_received` 表示观测到 OneBot HTTP 上报。
  *
  * 契约见 `src/ling/contracts/v1.py` 的 `ConnectorsOut`；字段注册表见
  * `src/ling/settings/connector_fields.py`。
@@ -696,7 +695,8 @@ export type ConnectorStatus =
   | 'not_configured'
   | 'disabled'
   | 'configured_disconnected'
-  | 'connected';
+  | 'connected'
+  | 'http_received';
 
 /**
  * 字段四档（`ling/settings/connector_fields.py:23-29`）。
@@ -742,10 +742,12 @@ export interface ConnectorField {
 }
 
 export interface ConnectorRuntime {
-  /** 当前连接数；null = 这条路径没有可观察的连接对象（例如只配了 HTTP 上报） */
+  /** 当前长连接数，HTTP 上报时可为 null */
   connections: number | null;
-  /** 已收帧/事件数；null 同上。已连接但恒为 0 本身是有用的结论。 */
+  /** 本次运行收到的帧和事件总数。 */
   received: number | null;
+  /** OneBot 收到的 HTTP 上报数，已计入 received。 */
+  http_received?: number;
 }
 
 /**

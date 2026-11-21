@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+import httpx
 import pytest
 
 from ling.settings.connectors import CONNECTOR_REASON_TEXT
@@ -304,6 +305,22 @@ async def test_onebot_http_only_is_not_reported_as_connected(logged_in, monkeypa
     assert channel["status"] == "configured_disconnected"
     assert channel["status_reason"] == "onebot_http_only"
     assert channel["runtime"] == {"connections": None, "received": None}
+
+
+async def test_default_onebot_http_reception_preserves_live_ws_status(logged_in) -> None:
+    _use_settings(logged_in, onebot_ws_port=6799)
+    logged_in.app.state.onebot_ws_server = FakeOneBotWsServer(clients=1, received=6)
+    transport = httpx.ASGITransport(app=logged_in.app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as connector:
+        response = await connector.post("/v1/onebot/events", json={
+            "post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": 100200300,
+        })
+        assert response.status_code == 200, response.text
+
+    channel = _channel(await _fetch(logged_in), "onebot")
+    assert channel["status"] == "connected"
+    assert channel["status_reason"] == "onebot_ws_server_client"
+    assert channel["runtime"] == {"connections": 1, "received": 7, "http_received": 1}
 
 
 # ------------------------------------------------------------------ QQBot 三态

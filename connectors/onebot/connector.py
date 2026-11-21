@@ -143,6 +143,8 @@ class OneBotV11Connector(ChannelConnector):
         self._config = config
         self._http = http
         self.instance_id = config.instance_id
+        # HTTP 上报按当前实例的运行周期计数，与 WebSocket 帧计数独立。
+        self.http_received = 0
         # 探活结果的短缓存。``health()`` 会**外呼** NapCat（``get_login_info``），
         # 之前端点没有鉴权也没缓存：任何能访问 6520 的人都能用它当放大器，
         # 一秒几十次地打 NapCat。缓存只是限流，不是能力——鉴权在路由层。

@@ -204,6 +204,21 @@ describe('四态渲染互不串', () => {
     // 已连接用状态表示，不再重复画一份操作指引。
     expect(guidanceOf(markup)).toBe('');
   });
+
+  it('观察到 HTTP 上报时显示接收计数并打开 HTTP 配置', () => {
+    const markup = render(makeConnector({
+      configured: true,
+      status: 'http_received',
+      status_reason: 'onebot_http_received',
+      runtime: { connections: null, received: 2, http_received: 2 },
+      fields: [makeField({ key: 'LING_ONEBOT_SECRET', kind: 'secret', configured: false })],
+    }));
+
+    expect(markup).toContain('已收到 HTTP 上报');
+    expect(markup).toContain('已收 2 条 HTTP 上报');
+    expect(markup).toContain('data-testid="onebot-group-http"');
+    expect(markup).not.toContain('条连接');
+  });
 });
 
 describe('可编辑：每个字段都有控件，密钥只有密码框', () => {
@@ -678,6 +693,12 @@ describe('运行时那一行：没有可观察的连接就不编数字', () => {
     expect(connectorRuntimeLine({ connections: 1, received: 0 })).toContain('还没推过任何数据');
     expect(connectorRuntimeLine({ connections: 1, received: 132 })).toBe(
       '当前 1 条连接，已收 132 帧事件',
+    );
+  });
+
+  it('同一账号把 WebSocket 帧和 HTTP 上报分别展示', () => {
+    expect(connectorRuntimeLine({ connections: 1, received: 8, http_received: 2 })).toBe(
+      'WebSocket 当前 1 条连接，已收 6 帧 · 已收 2 条 HTTP 上报',
     );
   });
 });

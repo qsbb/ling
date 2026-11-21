@@ -610,7 +610,8 @@
 .connectors-platform--selected > svg:last-child { color: var(--accent); }
 .connectors-platform__icon { display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 28px; border-radius: 8px; background: var(--accent-soft); font-size: 12px; font-weight: 700; }
 .connectors-platform__dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--line-strong); }
-.connectors-platform__dot--connected { background: var(--success); }
+.connectors-platform__dot--connected,
+.connectors-platform__dot--http_received { background: var(--ok); }
 .connectors-platform__dot--configured_disconnected { background: var(--warn); }
 .connectors-workspace .connector-card { padding: 0; border: 0; background: transparent; box-shadow: none; }
 .connectors-workspace .connector-card__head { min-height: 44px; margin-bottom: 16px; }
