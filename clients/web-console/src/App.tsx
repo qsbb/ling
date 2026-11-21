@@ -9,6 +9,8 @@ import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
 import { ConnectorsPage } from './components/ConnectorsPage';
 import { LifeNowPage } from './components/LifeNowPage';
+import { LiveHeader, LiveStopDialog, useCurrentLive } from './components/LiveControls';
+import { LivePage } from './components/LivePage';
 import { LogsPage } from './components/LogsPage';
 import { MemoryPage } from './components/MemoryPage';
 import { PersonaPage } from './components/PersonaPage';
@@ -21,7 +23,9 @@ import { NavDrawer, Sidenav, activeNavId } from './components/Navigation';
 import { useNarrowLayout, useNavExpanded, useOverlay } from './shell';
 // 总览页的布局补丁单独成文件：styles.css 由并行任务在改，不去挤那份文件。
 import './dashboard.css';
+import './live.css';
 import { legacyRedirectTarget, navigate, routePath, useRoute, type Route } from './route';
+import { liveStatus } from './live';
 import type { AuthResponse, UserInfo } from './types';
 
 type AuthState =
@@ -70,7 +74,12 @@ export function mainPage(props: MainPageProps): ReactElement {
         />
       );
     case 'now':
-      return <LifeNowPage onBack={goChat} />;
+      return <LifeNowPage onBack={goChat} liveActivity={props.liveActivity} />;
+    case 'live':
+      return user.role === 'owner' && props.live ? (
+        <LivePage current={props.live.data} statusError={props.live.error} refresh={props.live.refresh}
+          onGo={onGo} onStop={props.onStopLive ?? (() => undefined)} />
+      ) : <p className="page__hint">直播控制台由所有者管理。</p>;
     case 'settings':
       return <SettingsHub onBack={goChat} onOpen={onGo} />;
     case 'model':
@@ -189,6 +198,9 @@ export interface MainPageProps {
   onLogout: () => void;
   /** 关闭侧栏后再跳转；所有导航都走这里，避免某处忘了收侧栏。 */
   onGo: (path: string) => void;
+  live?: ReturnType<typeof useCurrentLive>;
+  liveActivity?: string;
+  onStopLive?: () => void;
 }
 
 export interface AppShellProps {
@@ -260,6 +272,27 @@ export function AppShell({
   const nav = useNavExpanded();
   const version = useAppVersion();
   const active = activeNavId(route);
+  const live = useCurrentLive(user.role === 'owner', route.name === 'live');
+  const liveRun = live.data?.session;
+  const running = liveRun && liveRun.state !== 'ended' ? liveRun : null;
+  const livePresentation = running ? liveStatus(running, !live.error) : null;
+  const liveActivity = livePresentation?.tone === 'live' ? livePresentation.label
+    : live.data?.planned_connector_id && !live.error ? '计划直播' : undefined;
+  const showLive = live.data?.navigation_visible === true;
+  const [confirmLiveStop, setConfirmLiveStop] = useState<string | null>(null);
+  const stopId = running?.state !== 'stopping' ? running?.id : undefined;
+
+  useEffect(() => {
+    if (!stopId) return;
+    const open = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.code === 'KeyL') {
+        event.preventDefault();
+        setConfirmLiveStop(stopId);
+      }
+    };
+    window.addEventListener('keydown', open);
+    return () => window.removeEventListener('keydown', open);
+  }, [stopId]);
 
   const onGo = useCallback(
     (path: string) => {
@@ -348,6 +381,8 @@ export function AppShell({
           <span className="brand__text">ling</span>
         </button>
         <div className="app-header__spacer" />
+        {running ? <LiveHeader run={running} reachable={!live.error} onGo={() => onGo('/live')}
+          onStop={() => setConfirmLiveStop(running.id)} /> : null}
         {/*
           桌面账号区：用户名 + 退出。窄屏不渲染——那里的归宿是抽屉底部的
           `nav-account`（同一个断点只出现一份 `nav-logout`）。
@@ -375,6 +410,8 @@ export function AppShell({
             active={active}
             expanded={nav.expanded}
             version={version}
+            showLive={showLive}
+            liveTone={livePresentation?.tone}
             onToggle={nav.toggle}
             onGo={onGo}
           />
@@ -390,6 +427,9 @@ export function AppShell({
               onUserChange,
               onLogout,
               onGo,
+              live,
+              liveActivity,
+              onStopLive: () => { if (stopId) setConfirmLiveStop(stopId); },
             })}
           </main>
         </div>
@@ -400,12 +440,17 @@ export function AppShell({
           open={overlay.active === 'nav'}
           active={active}
           version={version}
+          showLive={showLive}
+          liveTone={livePresentation?.tone}
           accountName={user.display_name || user.username}
           onClose={overlay.close}
           onGo={onGo}
           onLogout={onLogout}
         />
       ) : null}
+      {running && running.id === confirmLiveStop ? <LiveStopDialog run={running}
+        onClose={() => setConfirmLiveStop(null)}
+        onStopped={() => { setConfirmLiveStop(null); live.refresh(); }} /> : null}
     </div>
   );
 }

@@ -189,6 +189,7 @@ const ROUTE_NAME_SET = {
   dashboard: true,
   chat: true,
   now: true,
+  live: true,
   settings: true,
   model: true,
   memory: true,
