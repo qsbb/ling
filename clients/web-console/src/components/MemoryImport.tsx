@@ -309,7 +309,12 @@ export function MemoryImportPanel({ onViewImported, onClose }: MemoryImportPanel
       ) : null}
 
       {step.name === 'done' ? (
-        <ResultStage result={step.result} preview={step.preview} onViewImported={onViewImported} />
+        <ResultStage
+          result={step.result}
+          preview={step.preview}
+          onViewImported={onViewImported}
+          onClose={onClose}
+        />
       ) : null}
 
       {busy ? (
@@ -591,10 +596,12 @@ function ResultStage({
   result,
   preview,
   onViewImported,
+  onClose,
 }: {
   result: MemoryImportCommit;
   preview: MemoryImportPreview;
   onViewImported: () => void;
+  onClose: () => void;
 }): React.ReactElement {
   const entries = skipEntries(result.skip_reasons);
   return (
@@ -646,8 +653,8 @@ function ResultStage({
         <button type="button" className="button" data-testid="import-view-imported" onClick={onViewImported}>
           查看 AstrBot 记忆
         </button>
-        <button type="button" className="ghost-button" onClick={onViewImported}>
-          关掉，去记忆库
+        <button type="button" className="ghost-button" onClick={onClose}>
+          关闭
         </button>
       </div>
 
