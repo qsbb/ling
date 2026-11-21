@@ -6,10 +6,10 @@ from types import SimpleNamespace
 import httpx
 from sqlalchemy import func, select
 
+from ling import worker
 from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
 from ling.domains.identity.service import IdentityService
 from ling.domains.live.autonomy import consider_start
-from ling.domains.live.speech import build_speech
 from ling.infra.db import session_scope
 from ling.infra.models import ActivityRow, ActorAccount, MemoryRow, OutboxEvent
 from ling.ports.model import ModelChunk
@@ -193,7 +193,13 @@ async def test_only_played_viewers_belong_to_room_memory(logged_in, monkeypatch)
             prompts.append(messages[-1].content)
             yield ModelChunk(delta="谢谢你问起今天的配乐。", done=True), SimpleNamespace(error=None)
 
+    async def no_router_refresh():
+        pass
+
     monkeypatch.setattr(VoiceReplyService, "prepare", prepare)
+    monkeypatch.setattr(worker, "get_settings", lambda: env.settings)
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", Router())
+    monkeypatch.setattr(worker, "refresh_memory_router_if_stale", no_router_refresh)
     async with session_scope() as db:
         db.add(MemoryRow(
             id="private-sentinel", kind="episode", text="不得进直播模型的私聊哨兵",
@@ -225,13 +231,7 @@ async def test_only_played_viewers_belong_to_room_memory(logged_in, monkeypatch)
             received = await source.post(f"{SOURCE}/events", json=event)
             assert received.json()["status"] == "accepted"
             assert (await tick(run_id))["action"] == "ready"
-            async with session_scope() as db:
-                outbox = await db.scalar(
-                    select(OutboxEvent).where(OutboxEvent.topic == "livestream.speech")
-                    .order_by(OutboxEvent.created_at.desc()).limit(1)
-                )
-                work = outbox.payload
-            await build_speech(env.settings, Router(), **work)
+            assert await worker.drain_outbox(only_topic="livestream.speech") == 1
             order = await tick(run_id)
             assert order["action"] == "speak", order
             assert order["text"] == spoken[-1]

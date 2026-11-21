@@ -6399,6 +6399,8 @@ MEDIA_EXCLUDED_FROM_MAIN_WORKER: frozenset[str] = frozenset({"media.video.read"}
 OUTBOX_TOPICS: frozenset[str] = frozenset({
     "commitment.dispatch",
     "dream.generate",
+    "livestream.decide",
+    "livestream.speech",
     "memory.archive",
     "memory.extract",
     # 真删的清理阶段：由 `POST /v1/memory/forget` 在**同一事务**里投递。
