@@ -74,6 +74,7 @@ import type {
   VoiceReferenceUpload,
 } from './types';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
+import type { LiveConnector, LiveConnectorInput, LiveSession, LiveViewer } from './live';
 
 /** 两个导入端点的请求格式：文件原始字节，NDJSON。 */
 export const IMPORT_CONTENT_TYPE = 'application/x-ndjson';
@@ -550,6 +551,33 @@ export interface InstanceDialoguePolicyPreview {
 }
 
 export const api = {
+  customConnectors(): Promise<{ connectors: LiveConnector[] }> {
+    return request('/v1/settings/custom-connectors');
+  },
+  saveCustomConnector(id: string, body: LiveConnectorInput, feature: 'bilibili' | null): Promise<LiveConnector> {
+    const base = feature ? '/v1/settings/live-features/bilibili' : '/v1/settings/custom-connectors';
+    return request(`${base}/${encodeURIComponent(id)}`, jsonInit('PUT', body));
+  },
+  currentLiveSession(): Promise<{ session: LiveSession | null }> {
+    return request('/v1/live/sessions/current');
+  },
+  startLiveSession(id: string, mode: LiveSession['mode']): Promise<LiveSession> {
+    return request('/v1/live/sessions', jsonInit('POST', { connector_id: id, mode }));
+  },
+  stopLiveSession(id: string): Promise<LiveSession> {
+    return request(`/v1/live/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+  },
+  rememberLiveViewer(id: string, accountRef: string, note: string): Promise<LiveViewer> {
+    return request(`/v1/live/sessions/${encodeURIComponent(id)}/viewers`,
+      jsonInit('PUT', { account_ref: accountRef, note }));
+  },
+  liveViewers(id: string): Promise<{ viewers: Array<LiveViewer & { note: string }> }> {
+    return request(`/v1/live/viewers/${encodeURIComponent(id)}`);
+  },
+  forgetLiveViewer(id: string, account: string): Promise<{ deleted: boolean }> {
+    const query = new URLSearchParams({ account_ref: account });
+    return request(`/v1/live/viewers/${encodeURIComponent(id)}?${query}`, { method: 'DELETE' });
+  },
   windowDialoguePolicy(sessionId: string): Promise<WindowDialoguePolicy> {
     return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`);
   },

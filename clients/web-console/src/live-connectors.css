@@ -1,0 +1,17 @@
+.live-connector { border-bottom: 1px solid var(--line); padding: 0.75rem 0; margin-bottom: 0.75rem; }
+.live-connector > summary { cursor: pointer; font-weight: 600; }
+.live-connector__body,
+.live-connector__session { display: grid; min-width: 0; gap: 0.75rem; }
+.live-connector__body { margin-top: 0.75rem; }
+.live-connector__form { display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); }
+.live-connector label { display: grid; gap: 0.25rem; min-width: 0; }
+.live-connector input:not([type="checkbox"]),
+.live-connector select { width: 100%; min-width: 0; }
+.live-connector .live-connector__check { display: flex; align-items: center; gap: 0.4rem; }
+.live-connector__form > .live-connector__actions { grid-column: 1 / -1; }
+.live-connector__actions,
+.live-connector__status,
+.live-connector__viewer { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.live-connector__status code { overflow-wrap: anywhere; }
+.live-connector__session { border-top: 1px solid var(--line); padding-top: 0.75rem; }
+.live-connector__viewer > :is(input, span) { flex: 1 1 12rem; overflow-wrap: anywhere; }
