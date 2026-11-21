@@ -326,7 +326,8 @@ async function open(options: Options = {}): Promise<Ui> {
        */
       return route.fulfill(
         json({
-          ...scopedTo(scope, viewWithValue(base)),
+          // 默认实例与页面级视图是同一份后端状态；其他实例才有独立字段。
+          ...scopedTo(scope, instanceId === 'default' ? pageBody : viewWithValue(base)),
           instance_id: instanceId,
           /*
            * 真实后端的 `instances` 是**逐 scope** 的：别的 scope 没有这个实例
@@ -368,8 +369,12 @@ async function open(options: Options = {}): Promise<Ui> {
 }
 
 /** 字段表单里的输入框（面板自己也有 `<input>`：新建实例的显示名）。 */
-function fieldInput(page: Page, key = 'LING_ONEBOT_API_BASE') {
-  return page.locator(`.connector-fields [data-testid="connector-input-${key}"]`);
+async function fieldInput(page: Page, key = 'LING_ONEBOT_API_BASE') {
+  const input = page.locator(`.connector-fields [data-testid="connector-input-${key}"]`);
+  if (await input.count() && !(await input.isVisible())) {
+    await page.locator('.connector-settings > summary').click();
+  }
+  return input;
 }
 
 async function pick(page: Page, instanceId: string) {
@@ -393,12 +398,54 @@ async function pick(page: Page, instanceId: string) {
 }
 
 async function shownValue(page: Page): Promise<string> {
-  return fieldInput(page).inputValue();
+  return (await fieldInput(page)).inputValue();
 }
 
 /* ------------------------------------------------------------ 用例 */
 
 describe('验收：实例面板', () => {
+  it('首屏是平台导航、账号目录和下一步；入站正常不等于回复已配置', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts, posts } = await open({
+      pageBody: {
+        ...PAGE_BODY,
+        connectors: PAGE_BODY.connectors.map((connector) => ({
+          ...connector,
+          configured: true,
+          enabled: true,
+          status: 'connected',
+          status_reason: 'onebot_connected',
+          status_message: '平台已连上，但还没有发送消息的通道。',
+          guidance: '配置回复通道后发送一条消息，并以实际回执确认。',
+          runtime: { connections: 1, received: 2 },
+          fields: connector.fields.map((field) => {
+            if (field.key === 'LING_ONEBOT_API_BASE') {
+              return { ...field, value: null, set: false, configured: false, source: 'default' as const };
+            }
+            return field.key === 'LING_ONEBOT_WS_URL'
+              ? { ...field, value: 'ws://192.0.2.2:6700', set: true, configured: true, source: 'db' as const }
+              : field;
+          }),
+        })),
+      },
+    });
+    await expect.poll(() => page.getByTestId('connector-platform-onebot').getAttribute('aria-pressed')).toBe('true');
+    await expect.poll(() => page.getByRole('heading', { name: '平台', exact: true }).isVisible()).toBe(true);
+    await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').textContent()).toContain('平台已连上');
+    await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').textContent()).toContain('还没有发送消息的通道');
+    await expect.poll(() => page.getByTestId('connector-onebot-runtime').textContent()).toContain('已收 2 帧事件');
+    await expect.poll(() => page.getByTestId('connector-onebot-status').textContent()).toContain('已连接');
+    await expect.poll(() => page.getByRole('heading', { name: '访问权限' }).count()).toBe(0);
+    await page.getByTestId('connector-platform-access').click();
+    await expect.poll(() => page.getByTestId('connector-access').isVisible()).toBe(true);
+    await expect.poll(() => page.getByRole('heading', { name: '出入许可（谁能跟她说话）' }).isVisible()).toBe(true);
+    await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').isVisible()).toBe(false);
+    await page.getByTestId('connector-platform-onebot').click();
+    await expect.poll(() => page.getByTestId('connector-onebot-diagnosis').isVisible()).toBe(true);
+    expect(puts).toEqual([]);
+    expect(posts).toEqual([]);
+  }, TIMEOUT);
+
   it('S1 左侧列表：显示名 / 启停 / 是否默认 / 恰好一个选中', async (ctx) => {
     if (skip(ctx)) return;
     const { page } = await open();
@@ -430,7 +477,7 @@ describe('验收：实例面板', () => {
     await pick(page, 'beta');
     await expect.poll(() => shownValue(page)).toBe(VALUE.beta);
 
-    await fieldInput(page).fill('http://192.0.2.30:5700');
+    await (await fieldInput(page)).fill('http://192.0.2.30:5700');
     await page.getByTestId('connector-onebot-save').click();
     await expect.poll(() => puts.length).toBe(1);
 
@@ -453,7 +500,7 @@ describe('验收：实例面板', () => {
     await pick(page, 'alpha');
     await expect.poll(() => shownValue(page)).toBe(VALUE.alpha);
     const draftA = 'http://192.0.2.99:5700';
-    await fieldInput(page).fill(draftA);
+    await (await fieldInput(page)).fill(draftA);
 
     // 切到 beta：必须显示 **beta 自己的值**，不是 A 的草稿、也不是默认实例的值。
     await pick(page, 'beta');
@@ -475,7 +522,7 @@ describe('验收：实例面板', () => {
 
     await pick(page, 'alpha');
     await expect.poll(() => shownValue(page)).toBe(VALUE.alpha);
-    await fieldInput(page).fill('http://192.0.2.99:5700');
+    await (await fieldInput(page)).fill('http://192.0.2.99:5700');
     await pick(page, 'beta');
     await pick(page, 'alpha');
 
@@ -638,7 +685,7 @@ describe('验收：实例面板', () => {
     await expect
       .poll(
         async () => {
-          const input = fieldInput(page);
+          const input = await fieldInput(page);
           if ((await input.count()) === 0) {
             lastViewState = 'no-field-form';
             return lastViewState;
@@ -653,7 +700,7 @@ describe('验收：实例面板', () => {
         { timeout: 20_000, interval: 150 },
       )
       .toBe('own-view');
-    await fieldInput(page).fill('http://192.0.2.30:5700');
+    await (await fieldInput(page)).fill('http://192.0.2.30:5700');
 
     // 选中态必须真的落到新实例上（否则后面测的就不是"新实例"）。
     await expect
@@ -673,7 +720,7 @@ describe('验收：实例面板', () => {
     await expect
       .poll(async () => {
         if (puts.length > 0) return 'sent';
-        const input = fieldInput(page);
+        const input = await fieldInput(page);
         if ((await input.count()) === 0) return 'no-field-form';
         const shown = await input.first().inputValue({ timeout: 500 }).catch(() => '');
         return shown === VALUE.default ? 'refused-as-unverified' : 'stuck';

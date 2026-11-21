@@ -57,7 +57,7 @@ import type {
   ConnectorsResponse,
   ConnectorView,
 } from '../types';
-import { AlertIcon, ArrowLeftIcon, CheckIcon, RefreshIcon } from './Icons';
+import { AlertIcon, ArrowDownIcon, ArrowLeftIcon, CheckIcon, ChevronRightIcon, MessageIcon, RefreshIcon, SendIcon, SlidersIcon } from './Icons';
 import {
   connectorViewOf,
   ConnectorInstancePanel,
@@ -890,6 +890,56 @@ interface ConnectorCardProps extends ConnectorFormProps {
   onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
 }
 
+/** 页面级平台导航：只负责选择平台，不把导航误当成连接动作。 */
+function ConnectorNavigation({
+  connectors,
+  selected,
+  hasAccess,
+  onSelect,
+}: {
+  connectors: ConnectorView[];
+  selected: string | undefined;
+  hasAccess: boolean;
+  onSelect: (scope: string) => void;
+}) {
+  return (
+    <nav className="connectors-platforms" aria-label="平台">
+      <div className="connectors-platforms__head">
+        <MessageIcon />
+        <h2>平台</h2>
+      </div>
+      {connectors.map((connector) => (
+        <button
+          key={connector.id}
+          type="button"
+          className={`connectors-platform${connector.id === selected ? ' connectors-platform--selected' : ''}`}
+          aria-pressed={connector.id === selected}
+          data-testid={`connector-platform-${connector.id}`}
+          onClick={() => onSelect(connector.id)}
+        >
+          <span className="connectors-platform__icon" aria-hidden="true">{connector.id === 'onebot' ? 'Ob' : 'Q'}</span>
+          <span>{PLATFORM_NAMES[connector.id] ?? connector.label}</span>
+          <span className={`connectors-platform__dot connectors-platform__dot--${connector.status}`} aria-hidden="true" />
+          <ChevronRightIcon />
+        </button>
+      ))}
+      {hasAccess ? (
+        <button
+          type="button"
+          className={`connectors-platform${selected === 'access' ? ' connectors-platform--selected' : ''}`}
+          aria-pressed={selected === 'access'}
+          data-testid="connector-platform-access"
+          onClick={() => onSelect('access')}
+        >
+          <SlidersIcon />
+          <span>谁能使用 Ling</span>
+          <ChevronRightIcon />
+        </button>
+      ) : null}
+    </nav>
+  );
+}
+
 const ONEBOT_METHODS = ['reverse', 'direct', 'http'] as const;
 type OneBotMethod = typeof ONEBOT_METHODS[number];
 
@@ -1039,6 +1089,13 @@ export function ConnectorCard({
     return out;
   }, [change.dirty, form.clearKeys, instanceId]);
   const verifyState = connector.activation?.state ?? null;
+  const replyAddress = connector.fields.find((field) => connectorFieldKey(field) === ONEBOT_SEND_ADDRESS);
+  const hasReplyAddress = replyAddress !== undefined && textValueOf(replyAddress) !== '';
+  const [settingsOpen, setSettingsOpen] = useState(() => connector.id !== 'onebot' || !hasReplyAddress);
+  let receiveStatus = '暂无接收状态';
+  if (connector.status === 'disabled') receiveStatus = '账号已停用';
+  else if ((connector.runtime.received ?? 0) > 0) receiveStatus = '已收到平台事件';
+  else if (connector.status === 'connected') receiveStatus = '已连接，等待事件';
   const submit = () => {
     if (!form.saving) form.onSave();
   };
@@ -1064,15 +1121,34 @@ export function ConnectorCard({
       </div>
 
       {!emptyFieldsReason ? (
-        <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
-          {renderInlineCode(connector.status_message)}
-        </p>
-      ) : null}
-
-      {runtime ? (
-        <p className="connector-card__runtime" data-testid={`connector-${connector.id}-runtime`}>
-          {runtime}
-        </p>
+        <>
+          <div className="connector-card__diagnosis" data-testid={`connector-${connector.id}-diagnosis`}>
+            <p className="connector-card__reason" data-testid={`connector-${connector.id}-reason`}>
+              {renderInlineCode(connector.status_message)}
+            </p>
+            {connector.guidance ? (
+              <p className="connector-card__next" data-testid={`connector-${connector.id}-guidance`}>
+                {renderInlineCode(connector.guidance)}
+              </p>
+            ) : null}
+          </div>
+          <div className="connector-delivery" data-testid={`connector-${connector.id}-delivery`}>
+            <section aria-label="接收消息">
+              <h3><ArrowDownIcon />接收消息</h3>
+              <strong>{receiveStatus}</strong>
+              {runtime ? <p data-testid={`connector-${connector.id}-runtime`}>{runtime}</p> : null}
+            </section>
+            <section aria-label="发送回复">
+              <h3><SendIcon />发送回复</h3>
+              {connector.id === 'onebot' && !hasReplyAddress ? (
+                <><strong className="connector-text--warn">尚未配置回复通道</strong><p>在连接设置中填写 HTTP API 地址。</p></>
+              ) : (
+                <><strong>{connector.id === 'onebot' ? '已配置 HTTP API 地址' : '等待实际发送回执'}</strong>
+                  {connector.id === 'onebot' ? <p>发送结果请查看消息回执。</p> : null}</>
+              )}
+            </section>
+          </div>
+        </>
       ) : null}
 
       {/*
@@ -1089,112 +1165,110 @@ export function ConnectorCard({
         onInstanceView={onInstanceView}
         dirtyInstanceIds={dirtyInstanceIds}
       >
-      <form
-        className="connector-form"
-        // `key` 带上当前实例：切实例时 React **重建**这个表单子树，任何内部
-        // 残留（将来有人加一个不受控输入/useState 缓冲）都带不过来。这是防串
-        // 草稿的第二道闸，第一道是 `(scope, instanceId)` 分区键。
-        //
-        // **只加在这里，不能加在卡片或面板上**：那会连面板一起重建，面板的
-        // 选中态与列表会被打回初始值（选中态变 null、列表退回 loading），
-        // 切实例时看起来像"点一下就全清空了"。
-        key={`${connector.id}::${instanceId ?? ''}`}
-        onSubmit={(event) => {
-          event.preventDefault();
-          submit();
-        }}
-      >
-        {emptyFieldsReason ? (
-          <p
-            className="connector-form__note connector-form__note--warn"
-            role="status"
-            data-testid={`connector-${connector.id}-fields-unverified`}
+          <details
+            className="connector-settings"
+            open={settingsOpen}
+            onToggle={(event) => setSettingsOpen(event.currentTarget.open)}
           >
-            {emptyFieldsReason}
-          </p>
+            <summary><SlidersIcon /><h3 className="connector-card__subtitle">连接设置</h3></summary>
+            <form
+              className="connector-form"
+              // `key` 带上当前实例：切实例时 React **重建**这个表单子树，任何内部
+              // 残留（将来有人加一个不受控输入/useState 缓冲）都带不过来。这是防串
+              // 草稿的第二道闸，第一道是 `(scope, instanceId)` 分区键。
+              //
+              // **只加在这里，不能加在卡片或面板上**：那会连面板一起重建，面板的
+              // 选中态与列表会被打回初始值（选中态变 null、列表退回 loading），
+              // 切实例时看起来像"点一下就全清空了"。
+              key={`${connector.id}::${instanceId ?? ''}`}
+              onSubmit={(event) => {
+                event.preventDefault();
+                submit();
+              }}
+            >
+              {emptyFieldsReason ? (
+                <p
+                  className="connector-form__note connector-form__note--warn"
+                  role="status"
+                  data-testid={`connector-${connector.id}-fields-unverified`}
+                >
+                  {emptyFieldsReason}
+                </p>
+              ) : null}
+              <ConnectorFields connector={connector} instanceId={instanceId} form={form} change={change.change} renderField={(field) => {
+                  const key = field.key || field.name;
+                  return (
+                    <FieldRow
+                      key={key}
+                      field={field}
+                      draft={form.draft[key]}
+                      cleared={form.clearKeys.includes(key)}
+                      disabled={!editable || form.saving}
+                      invalid={form.fieldError === key}
+                      onEdit={(value) => form.onEdit(key, value)}
+                      onToggleClear={() => form.onToggleClear(key)}
+                    />
+                  );
+              }} />
+
+              <div className="connector-form__actions" role="group" aria-label="保存">
+                <button
+                  type="submit"
+                  className="button button--primary button--small"
+                  disabled={!editable || form.saving || form.saveDisabled === true}
+                  data-testid={`connector-${connector.id}-save`}
+                >
+                  {form.saving ? '保存中…' : '保存并生效'}
+                </button>
+                <button
+                  type="button"
+                  className="button button--small"
+                  disabled={!editable || form.saving}
+                  data-testid={`connector-${connector.id}-revert`}
+                  onClick={form.onResetDraft}
+                >
+                  撤销修改
+                </button>
+                <button
+                  type="button"
+                  className="button button--small"
+                  disabled={form.saving}
+                  data-testid={`connector-${connector.id}-reload`}
+                  onClick={form.onReload}
+                >
+                  <RefreshIcon /> 刷新状态
+                </button>
+                <span className="connector-form__note" data-testid={`connector-${connector.id}-note`}>
+                  {form.formNote ??
+                    (editable
+                      ? change.dirty
+                        ? '有未保存的改动'
+                        : /*
+                           * 保存被**挡下**时（"没有要保存的改动"这类 `warn`）必须说一句，
+                           * 否则用户点了保存却什么反应都没有。
+                           *
+                           * 但**只有 `warn` 走这里**：`ok`（"已生效…"）已经由上面那块
+                           * 通知区显示，挤进这一行会把版本号顶掉——而版本号是"这次生效的
+                           * 是哪一版"的唯一可见证据，既有浏览器测试正是拿它断言的
+                           * （`connectors.browser.test.tsx`：保存后 note 含"当前版本 4"）。
+                           */
+                          (form.notice?.tone === 'warn' ? form.notice.text : null) ??
+                          (form.saveDisabled
+                            ? '实例版本暂不可用，请刷新状态'
+                            : `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`)
+                      : '只有所有者可以修改')}
+                </span>
+              </div>
+            </form>
+          </details>
+
+        {form.notice ? (
+          <Notice
+            notice={form.notice}
+            testId={`connector-${connector.id}-notice`}
+            onReload={form.onReload}
+          />
         ) : null}
-        <ConnectorFields connector={connector} instanceId={instanceId} form={form} change={change.change} renderField={(field) => {
-            const key = field.key || field.name;
-            return (
-              <FieldRow
-                key={key}
-                field={field}
-                draft={form.draft[key]}
-                cleared={form.clearKeys.includes(key)}
-                disabled={!editable || form.saving}
-                invalid={form.fieldError === key}
-                onEdit={(value) => form.onEdit(key, value)}
-                onToggleClear={() => form.onToggleClear(key)}
-              />
-            );
-        }} />
-
-        <div className="connector-form__actions" role="group" aria-label="保存">
-          <button
-            type="submit"
-            className="button button--primary button--small"
-            disabled={!editable || form.saving || form.saveDisabled === true}
-            data-testid={`connector-${connector.id}-save`}
-          >
-            {form.saving ? '保存中…' : '保存并生效'}
-          </button>
-          <button
-            type="button"
-            className="button button--small"
-            disabled={!editable || form.saving}
-            data-testid={`connector-${connector.id}-revert`}
-            onClick={form.onResetDraft}
-          >
-            撤销修改
-          </button>
-          <button
-            type="button"
-            className="button button--small"
-            disabled={form.saving}
-            data-testid={`connector-${connector.id}-reload`}
-            onClick={form.onReload}
-          >
-            <RefreshIcon /> 刷新状态
-          </button>
-          <span className="connector-form__note" data-testid={`connector-${connector.id}-note`}>
-            {form.formNote ??
-              (editable
-                ? change.dirty
-                  ? '有未保存的改动'
-                  : /*
-                     * 保存被**挡下**时（"没有要保存的改动"这类 `warn`）必须说一句，
-                     * 否则用户点了保存却什么反应都没有。
-                     *
-                     * 但**只有 `warn` 走这里**：`ok`（"已生效…"）已经由上面那块
-                     * 通知区显示，挤进这一行会把版本号顶掉——而版本号是"这次生效的
-                     * 是哪一版"的唯一可见证据，既有浏览器测试正是拿它断言的
-                     * （`connectors.browser.test.tsx`：保存后 note 含"当前版本 4"）。
-                     */
-                    (form.notice?.tone === 'warn' ? form.notice.text : null) ??
-                    (form.saveDisabled
-                      ? '实例版本暂不可用，请刷新状态'
-                      : `当前版本 ${connector.generation} · ${describeVerifyState(verifyState)}`)
-                : '只有所有者可以修改')}
-          </span>
-        </div>
-      </form>
-
-      {form.notice ? (
-        <Notice
-          notice={form.notice}
-          testId={`connector-${connector.id}-notice`}
-          onReload={form.onReload}
-        />
-      ) : null}
-
-      {!emptyFieldsReason && connector.guidance && presentation.tone !== 'ok' ? (
-        <details className="connector-group">
-          <summary>连接诊断</summary>
-          <p className="connector-card__guidance" data-testid={`connector-${connector.id}-guidance`}>
-            {renderInlineCode(connector.guidance)}
-          </p>
-        </details>
-      ) : null}
       </ConnectorInstancePanel>
     </section>
   );
@@ -1803,47 +1877,39 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
       </button>
 
       <div className="connectors-page__head">
-        <h1 className="page__title">接入器</h1>
-      <div className="connectors-page__actions">
-        <button
-          type="button"
-          className="button button--small"
-          data-testid="connectors-refresh"
-          onClick={() => void load()}
-          disabled={state.status === 'loading' || anySaving}
-        >
-          <RefreshIcon /> 刷新
-        </button>
-        {state.status === 'ready' ? (
-          <span className="panel__count connector-refresh-time" data-testid="connectors-as-of">
-            读取于 {formatAsOf(state.body.as_of)}
-          </span>
-        ) : null}
-        {canEdit ? (
-          <details className="connector-page-options">
-            <summary>管理</summary>
-            <button
-              type="button"
-              className="button button--small"
-              data-testid="connectors-reset"
-              disabled={anySaving}
-              onClick={() => setConfirmReset(true)}
-            >恢复默认</button>
-          </details>
-        ) : null}
+        <div>
+          <h1 className="page__title">平台接入</h1>
+          <p className="page__hint">连接平台账号，让 Ling 收发消息。</p>
+        </div>
+        <div className="connectors-page__actions">
+          <button
+            type="button"
+            className="button button--small"
+            data-testid="connectors-refresh"
+            onClick={() => void load()}
+            disabled={state.status === 'loading' || anySaving}
+          >
+            <RefreshIcon /> 刷新
+          </button>
+          {state.status === 'ready' ? (
+            <span className="panel__count connector-refresh-time" data-testid="connectors-as-of">
+              读取于 {formatAsOf(state.body.as_of)}
+            </span>
+          ) : null}
+          {canEdit ? (
+            <details className="connector-page-options">
+              <summary>管理</summary>
+              <button
+                type="button"
+                className="button button--small"
+                data-testid="connectors-reset"
+                disabled={anySaving}
+                onClick={() => setConfirmReset(true)}
+              >恢复默认</button>
+            </details>
+          ) : null}
+        </div>
       </div>
-      </div>
-
-      {platforms.length ? (
-        <nav className="connectors-page__platforms" aria-label="接入类别">
-          {platforms.map(({ id, label }) => (
-            <button key={id} type="button" aria-pressed={id === activePlatform}
-              className="connector-platform" onClick={() => setPlatform(id)}>
-              {PLATFORM_NAMES[id] ?? label}
-            </button>
-          ))}
-        </nav>
-      ) : null}
 
       {state.status === 'ready' && !canEdit ? (
         <p className="panel__note" data-testid="connectors-readonly">
@@ -1909,74 +1975,83 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         </p>
       ) : null}
 
-      {state.status === 'ready'
-        ? state.body.connectors.map((connector) => {
-            const instanceId = instanceOf(connector.id);
-            const instanceView =
-              instanceId === DEFAULT_INSTANCE_ID
-                ? null
-                : instanceViews[instanceFormKey(connector.id, instanceId)] ?? null;
-            /*
-             * 卡片画哪个实例的字段：选中的是默认实例 → 页面级视图（本来就是它的）；
-             * 其余 → 面板按 `?instance_id=` 读回、且**能证明**属于它的那份。
-             * 还没有那份视图时用**空字段列表**，让输入框空着——画默认实例的值
-             * 会让人以为 B 已经配好了，那正是"名字比实现强"。
-             */
-            const fields =
-              instanceId === DEFAULT_INSTANCE_ID
-                ? connector.fields
-                : (instanceView?.fields ?? []);
-            const generation =
-              instanceId === DEFAULT_INSTANCE_ID ? connector.generation : (instanceView?.generation ?? null);
-            const view: ConnectorView =
-              instanceId === DEFAULT_INSTANCE_ID
-                ? connector
-                : instanceView ?? { ...connector, fields, runtime: { connections: null, received: null } };
-            return (
-              <div key={connector.id} className="connector-workspace" hidden={activePlatform !== connector.id}>
-              <ConnectorCard
-                /*
-                 * 卡片本身**不**带 `key={instanceId}`：那会连面板一起重建，
-                 * 面板的选中态和列表会被打回初始值。切实例的"物理隔离"由表单
-                 * 子树自己的 `key` 负责（见卡片里 `<form>` 上那条注释）。
-                 */
-                connector={view}
-                /*
-                 * 面板单独使用默认实例作为基线；卡片诊断来自选中的实例。
-                 */
-                panelConnector={connector}
-                instanceId={instanceId}
-                onSelectInstance={(next) => selectInstance(connector.id, next)}
-                onInstanceView={(nextId, nextView) =>
-                  handleInstanceView(connector.id, nextId, nextView)
-                }
-                /*
-                 * 非默认实例、且它的字段视图还没读回（或读失败）：说明**为什么
-                 * 空着**，而不是让一个空表单被读成"这个实例真的什么都没配"。
-                 */
-                emptyFieldsReason={
-                  instanceId !== DEFAULT_INSTANCE_ID && fields.length === 0
-                    ? instanceUnverified[instanceFormKey(connector.id, instanceId)] === true
-                      ? '无法读取该实例的配置，请刷新状态。'
-                      : '正在读取该实例的配置…'
-                    : null
-                }
-                {...formPropsFor(connector.id, instanceId, fields, generation)}
-              />
-              </div>
-            );
-          })
-        : null}
+      {state.status === 'ready' ? (
+        <div className="connectors-workspace">
+          <ConnectorNavigation
+            connectors={state.body.connectors}
+            selected={activePlatform ?? undefined}
+            hasAccess={Boolean(state.body.access)}
+            onSelect={setPlatform}
+          />
+          <div className="connectors-workspace__main">
+            {state.body.connectors.map((connector) => {
+              const instanceId = instanceOf(connector.id);
+              const instanceView =
+                instanceId === DEFAULT_INSTANCE_ID
+                  ? null
+                  : instanceViews[instanceFormKey(connector.id, instanceId)] ?? null;
+              /*
+               * 卡片画哪个实例的字段：选中的是默认实例 → 页面级视图（本来就是它的）；
+               * 其余 → 面板按 `?instance_id=` 读回、且**能证明**属于它的那份。
+               * 还没有那份视图时用**空字段列表**，让输入框空着——画默认实例的值
+               * 会让人以为 B 已经配好了，那正是"名字比实现强"。
+               */
+              const fields =
+                instanceId === DEFAULT_INSTANCE_ID
+                  ? connector.fields
+                  : (instanceView?.fields ?? []);
+              const generation =
+                instanceId === DEFAULT_INSTANCE_ID ? connector.generation : (instanceView?.generation ?? null);
+              const view: ConnectorView =
+                instanceId === DEFAULT_INSTANCE_ID
+                  ? connector
+                  : instanceView ?? { ...connector, fields, runtime: { connections: null, received: null } };
+              return (
+                <div key={connector.id} className="connector-workspace" hidden={activePlatform !== connector.id}>
+                  <ConnectorCard
+                    /*
+                     * 卡片本身**不**带 `key={instanceId}`：那会连面板一起重建，
+                     * 面板的选中态和列表会被打回初始值。切实例的"物理隔离"由表单
+                     * 子树自己的 `key` 负责（见卡片里 `<form>` 上那条注释）。
+                     */
+                    connector={view}
+                    /*
+                     * 面板单独使用默认实例作为基线；卡片诊断来自选中的实例。
+                     */
+                    panelConnector={connector}
+                    instanceId={instanceId}
+                    onSelectInstance={(next) => selectInstance(connector.id, next)}
+                    onInstanceView={(nextId, nextView) =>
+                      handleInstanceView(connector.id, nextId, nextView)
+                    }
+                    /*
+                     * 非默认实例、且它的字段视图还没读回（或读失败）：说明**为什么
+                     * 空着**，而不是让一个空表单被读成"这个实例真的什么都没配"。
+                     */
+                    emptyFieldsReason={
+                      instanceId !== DEFAULT_INSTANCE_ID && fields.length === 0
+                        ? instanceUnverified[instanceFormKey(connector.id, instanceId)] === true
+                          ? '无法读取该实例的配置，请刷新状态。'
+                          : '正在读取该实例的配置…'
+                        : null
+                    }
+                    {...formPropsFor(connector.id, instanceId, fields, generation)}
+                  />
+                </div>
+              );
+            })}
 
-      {state.status === 'ready' && state.body.access ? (
-        <div className="connector-workspace" hidden={activePlatform !== 'access'}>
-        <AccessCard
-          group={state.body.access}
-          {...formPropsFor('access', DEFAULT_INSTANCE_ID, state.body.access.fields, state.body.access.generation)}
-        />
+            {state.body.access ? (
+              <div className="connector-workspace" hidden={activePlatform !== 'access'}>
+                <AccessCard
+                  group={state.body.access}
+                  {...formPropsFor('access', DEFAULT_INSTANCE_ID, state.body.access.fields, state.body.access.generation)}
+                />
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
-
     </section>
   );
 }

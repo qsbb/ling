@@ -366,7 +366,7 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
       const instanceId = url.searchParams.get('instance_id');
       if (instanceId === null) return route.fulfill(json(pageBody));
       // 按实例读：**回显** instance_id，让面板能自证这份视图属于这个实例。
-      const body = views[instanceId];
+      const body = instanceId === 'default' ? pageBody : views[instanceId];
       if (!body) {
         return route.fulfill(
           json({ error: { code: 'internal', message: `测试没为实例 ${instanceId} 准备视图` } }, 500),
@@ -477,8 +477,13 @@ async function openInstances(options: OpenOptions = {}): Promise<Harness> {
   });
 
   await page.goto(`${baseUrl}/settings/connectors`, { waitUntil: 'domcontentloaded' });
-  // 实例面板挂进页面需要页面级 GET 先回来，所以等它的 testid。
-  await page.getByTestId('connector-instance-panel-onebot').waitFor({ timeout: 20_000 });
+  // 先等列表的默认选中，再展开配置；不应与初次列表读取竞争选中态。
+  if (items.length > 0 && !options.listError) {
+    await expect
+      .poll(() => page.getByTestId(`connector-instance-${items[0]?.instance_id}`).getAttribute('aria-current'))
+      .toBe('true');
+    await openSettings(page);
+  }
   await page.waitForFunction(() => document.styleSheets.length > 3, undefined, {
     timeout: 20_000,
   });
@@ -498,12 +503,19 @@ function inputOf(page: Page, key: string) {
   return page.locator(`.connector-fields [data-testid="connector-input-${key}"]`);
 }
 
+async function openSettings(page: Page) {
+  const settings = page.locator('.connector-settings');
+  if ((await settings.getAttribute('open')) === null) await settings.locator(':scope > summary').click();
+  await expect.poll(() => settings.getAttribute('open')).toBe('');
+}
+
 async function selectInstance(page: Page, instanceId: string) {
   await page.getByTestId(`connector-instance-${instanceId}`).click();
   // 选中态落到 DOM 上：等它真的变成 current，而不是靠"点了就算"。
   await expect
     .poll(() => page.getByTestId(`connector-instance-${instanceId}`).getAttribute('aria-current'))
     .toBe('true');
+  await openSettings(page);
 }
 
 /** 给某个实例造一份"它自己"的字段视图（API_BASE 值不同，方便分辨）。 */
@@ -849,7 +861,7 @@ describe('接入器实例：左列表右详情', () => {
 
     const empty = page.getByTestId('connector-instance-panel-onebot-empty');
     await expect.poll(() => empty.isVisible()).toBe(true);
-    expect(await empty.textContent()).toContain('还没有任何实例');
+    expect(await empty.textContent()).toContain('添加第一个账号');
     // 引导里要有一个真的能用的入口。
     await page.getByTestId('connector-instance-add-onebot').click();
     await expect.poll(() => page.getByTestId('connector-instance-name').isVisible()).toBe(true);
@@ -885,15 +897,16 @@ describe('接入器实例：左列表右详情', () => {
     });
 
     await selectInstance(page, 'default');
+    await openSettings(page);
     const del = page.getByTestId('connector-instance-delete');
-    await expect.poll(() => del.isVisible()).toBe(true);
-    expect(await del.isDisabled()).toBe(true);
+    await expect.poll(() => del.isDisabled()).toBe(true);
     const reason = (await page.getByTestId('connector-instance-delete-reason').textContent()) ?? '';
     expect(reason).toContain('默认实例');
     expect(reason).toContain('不能删除');
 
     // 换成普通实例：按钮可用，原因清空。
     await selectInstance(page, 'alpha');
+    await openSettings(page);
     await expect.poll(() => del.isDisabled()).toBe(false);
     expect(((await page.getByTestId('connector-instance-delete-reason').textContent()) ?? '').trim()).toBe(
       '',

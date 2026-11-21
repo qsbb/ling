@@ -718,7 +718,7 @@ export function CreateInstanceForm({ scope, busy, onCreated }: CreateInstanceFor
       }}
     >
       <label className="connector-instance-create__label" htmlFor={`instance-name-${scope}`}>
-        新实例的显示名
+        账号名称
       </label>
       <input
         id={`instance-name-${scope}`}
@@ -736,7 +736,7 @@ export function CreateInstanceForm({ scope, busy, onCreated }: CreateInstanceFor
         data-testid="connector-instance-create-submit"
         disabled={name.trim() === '' || pending || busy}
       >
-        {pending ? '正在创建…' : '新建实例'}
+        {pending ? '正在创建…' : '创建账号'}
       </button>
       {error ? (
         <p className="connector-instance-create__error" role="alert" data-testid="connector-instance-create-error">
@@ -1150,7 +1150,7 @@ export function ConnectorInstancePanel({
       <div className="connector-instances__layout">
         <aside className="connector-instances__rail" aria-label={`${connector.label} 的实例`}>
           <div className="connector-instances__rail-head">
-            <span>实例 <span className="connector-instances__count" data-testid={`connector-instance-panel-${scope}-count`}>
+            <span>账号 <span className="connector-instances__count" data-testid={`connector-instance-panel-${scope}-count`}>
               {hasLoadedList ? items.length : '—'}
             </span></span>
             {editable ? (
@@ -1180,10 +1180,7 @@ export function ConnectorInstancePanel({
 
           {hasLoadedList && items.length === 0 ? (
             <div className="connector-instances__empty" data-testid={`connector-instance-panel-${scope}-empty`}>
-              <strong>还没有任何实例</strong>
-              <span>
-                新建一个实例，填写这个账号的连接配置。
-              </span>
+              <strong>添加第一个账号</strong>
             </div>
           ) : null}
 
@@ -1228,7 +1225,7 @@ export function ConnectorInstancePanel({
           {!hasSelection ? (
             <p className="panel__note" data-testid={`connector-instance-panel-${scope}-nothing-selected`}>
               {hasLoadedList && items.length === 0
-                ? '左侧建好第一个实例后，这里会显示它的配置。'
+                ? '创建账号后填写连接地址，保存并测试。'
                 : selectedId === null
                   ? '当前显示默认实例配置。实例列表读取成功后可切换其他账号。'
                   : '正在读取所选实例的配置…'}

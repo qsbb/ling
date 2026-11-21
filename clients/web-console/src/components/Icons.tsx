@@ -44,6 +44,32 @@ export function NavIcon({ size = 20, className }: IconProps) {
   );
 }
 
+export function ChevronRightIcon({ size = 16, className }: IconProps) {
+  return <ChevronIcon size={size} className={className} />;
+}
+
+export function MessageIcon({ size = 17, className }: IconProps) {
+  return <ChatIcon size={size} className={className} />;
+}
+
+export function SlidersIcon({ size = 17, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <path d="M4 7h6m4 0h6M4 17h10m4 0h2" />
+      <circle cx="12" cy="7" r="2" />
+      <circle cx="16" cy="17" r="2" />
+    </svg>
+  );
+}
+
+export function ArrowDownIcon({ size = 17, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <path d="M12 4v15m-5-5 5 5 5-5" />
+    </svg>
+  );
+}
+
 /** 总览：四宫格（一屏看全）。 */
 export function DashboardIcon({ size = 17, className }: IconProps) {
   return (

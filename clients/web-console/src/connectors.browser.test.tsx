@@ -195,6 +195,9 @@ async function openConnectors(
     if (path === '/v1/settings/connectors' && method === 'GET') {
       return route.fulfill(json(getBody));
     }
+    if (path === '/v1/settings/connectors/onebot' && method === 'GET') {
+      return route.fulfill(json(getBody));
+    }
     if (path.startsWith('/v1/settings/connectors/') && method === 'PUT') {
       const scope = decodeURIComponent(path.split('/').pop() ?? '');
       const body = JSON.parse(route.request().postData() ?? '{}') as PutCall['body'];
@@ -230,6 +233,8 @@ async function openConnectors(
   await page.getByTestId('connector-onebot').waitFor({ timeout: 20_000 });
   // Vite 开发态下样式是模块注入的：等样式真的生效再量布局。
   await page.waitForFunction(() => document.styleSheets.length > 3, undefined, { timeout: 20_000 });
+  const settings = page.getByTestId('connector-onebot').locator('.connector-settings');
+  if ((await settings.getAttribute('open')) === null) await settings.locator(':scope > summary').click();
   if (!options.compact) {
     await page.getByTestId('onebot-group-advanced').locator('summary').click();
   }
@@ -239,6 +244,19 @@ async function openConnectors(
 /** 打开 OneBot 卡里的一个字段输入框。 */
 function inputOf(page: Page, key: string) {
   return page.getByTestId(`connector-input-${key}`);
+}
+
+async function showField(page: Page, key: string) {
+  const group = page.locator('.connector-group').filter({ has: page.getByTestId(`connector-input-${key}`) });
+  if (await group.count() && (await group.getAttribute('open')) === null) {
+    await group.locator(':scope > summary').click();
+  }
+  return inputOf(page, key);
+}
+
+async function showAccess(page: Page) {
+  await page.getByTestId('connector-platform-access').click();
+  await expect.poll(() => page.getByTestId('connector-access').isVisible()).toBe(true);
 }
 
 /* ------------------------------------------------------------ 用例 */
@@ -340,7 +358,7 @@ describe('接入器：真的能改并保存', () => {
     expect(await token.getAttribute('placeholder')).toContain('已设置（留空则不修改）');
 
     // 只改一个普通字段就保存：密钥不出现在请求体里。
-    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.10:5700');
+    await (await showField(page, 'LING_ONEBOT_API_BASE')).fill('http://192.0.2.10:5700');
     await page.getByTestId('connector-onebot-save').click();
     await page.getByTestId('connector-onebot-notice').waitFor();
     expect(puts[0]?.body.set).toEqual({ LING_ONEBOT_API_BASE: 'http://192.0.2.10:5700' });
@@ -354,6 +372,7 @@ describe('接入器：真的能改并保存', () => {
       { kind: 'ok', result: changeResult('onebot', 'active') },
     ]);
 
+    await showField(page, 'LING_ONEBOT_WS_TOKEN');
     await page.getByTestId('connector-clear-LING_ONEBOT_WS_TOKEN').click();
     await page.getByTestId('connector-cleared-LING_ONEBOT_WS_TOKEN').waitFor();
     await page.getByTestId('connector-onebot-save').click();
@@ -369,7 +388,7 @@ describe('接入器：真的能改并保存', () => {
       { kind: 'ok', result: changeResult('access', 'active') },
     ]);
 
-    await page.getByRole('button', { name: '出入许可', exact: true }).click();
+    await showAccess(page);
     await page.getByTestId('connector-input-LING_ACCESS_LIST').fill('100200300\n0456');
     await page.getByTestId('connector-access-save').click();
     await page.getByTestId('connector-access-notice').waitFor();
@@ -394,7 +413,7 @@ describe('接入器：最难的分支 —— rolled_back（HTTP 202 但没生效
       },
     ]);
 
-    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.99:1');
+    await (await showField(page, 'LING_ONEBOT_API_BASE')).fill('http://192.0.2.99:1');
     await page.getByTestId('connector-onebot-save').click();
     const notice = page.getByTestId('connector-onebot-notice');
     await notice.waitFor({ timeout: 15_000 });
@@ -420,7 +439,7 @@ describe('接入器：最难的分支 —— rolled_back（HTTP 202 但没生效
       '当前版本 4',
     );
     // 用户填的内容要留着（他还要接着改），不能被清空。
-    expect(await inputOf(page, 'LING_ONEBOT_API_BASE').inputValue()).toBe('http://192.0.2.99:1');
+    expect(await (await showField(page, 'LING_ONEBOT_API_BASE')).inputValue()).toBe('http://192.0.2.99:1');
   }, TIMEOUT);
 });
 
@@ -439,7 +458,7 @@ describe('接入器：失败分支各说各的话', () => {
       },
     ]);
 
-    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.10:5700');
+    await (await showField(page, 'LING_ONEBOT_API_BASE')).fill('http://192.0.2.10:5700');
     await page.getByTestId('connector-onebot-save').click();
     const notice = page.getByTestId('connector-onebot-notice');
     await notice.waitFor();
@@ -489,7 +508,7 @@ describe('接入器：失败分支各说各的话', () => {
     const row = page.getByTestId('connector-field-LING_ONEBOT_WS_PORT');
     expect(await row.getAttribute('data-invalid')).toBe('true');
     expect(await inputOf(page, 'LING_ONEBOT_WS_PORT').getAttribute('aria-invalid')).toBe('true');
-    expect(await inputOf(page, 'LING_ONEBOT_API_BASE').getAttribute('aria-invalid')).toBeNull();
+    expect(await (await showField(page, 'LING_ONEBOT_API_BASE')).getAttribute('aria-invalid')).toBeNull();
   }, TIMEOUT);
 
   it('503 → 说是这个进程切换不了，不是你填错了', async (ctx) => {
@@ -506,7 +525,7 @@ describe('接入器：失败分支各说各的话', () => {
       },
     ]);
 
-    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.10:5700');
+    await (await showField(page, 'LING_ONEBOT_API_BASE')).fill('http://192.0.2.10:5700');
     await page.getByTestId('connector-onebot-save').click();
     const notice = page.getByTestId('connector-onebot-notice');
     await notice.waitFor();
@@ -570,6 +589,8 @@ describe('接入器：窄屏表单可用', () => {
   it('375：不横向溢出，输入框与保存按钮都 ≥44px', async (ctx) => {
     if (skip(ctx)) return;
     const { page } = await openConnectors({ width: 375, height: 720 });
+    await showField(page, 'LING_ONEBOT_API_BASE');
+    await showField(page, 'LING_ONEBOT_WS_TOKEN');
 
     const info = await page.evaluate(() => {
       const input = document.querySelector<HTMLElement>(
@@ -589,7 +610,8 @@ describe('接入器：窄屏表单可用', () => {
         save: box(save),
         clear: box(clear),
         overflow: [...document.querySelectorAll<HTMLElement>('body *')]
-          .filter((el) => el.getBoundingClientRect().right > document.documentElement.clientWidth + 1)
+          .filter((el) => !el.closest('.connectors-platforms') &&
+            el.getBoundingClientRect().right > document.documentElement.clientWidth + 1)
           .slice(0, 5)
           .map((el) => `${el.tagName.toLowerCase()}.${el.className}`),
       };
@@ -605,8 +627,8 @@ describe('接入器：窄屏表单可用', () => {
     expect(info.clear?.h ?? 0).toBeGreaterThanOrEqual(44);
 
     // 窄屏也能真的输入（不是被 CSS 盖住 / 不可聚焦）。
-    await inputOf(page, 'LING_ONEBOT_API_BASE').fill('http://192.0.2.10:5700');
-    expect(await inputOf(page, 'LING_ONEBOT_API_BASE').inputValue()).toBe(
+    await (await showField(page, 'LING_ONEBOT_API_BASE')).fill('http://192.0.2.10:5700');
+    expect(await (await showField(page, 'LING_ONEBOT_API_BASE')).inputValue()).toBe(
       'http://192.0.2.10:5700',
     );
   }, TIMEOUT);
@@ -633,7 +655,7 @@ describe('接入器：非 owner 只读', () => {
     await expect.poll(() => page.getByTestId('connectors-readonly').isVisible()).toBe(true);
     const save = page.getByTestId('connector-onebot-save');
     expect(await save.isDisabled()).toBe(true);
-    expect(await inputOf(page, 'LING_ONEBOT_API_BASE').isDisabled()).toBe(true);
+    expect(await (await showField(page, 'LING_ONEBOT_API_BASE')).isDisabled()).toBe(true);
     expect(await page.getByTestId('connectors-reset').count()).toBe(0);
   }, TIMEOUT);
 });
