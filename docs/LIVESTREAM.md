@@ -1,6 +1,8 @@
 # 自定义接入与直播
 
-在 Web 控制台打开「设置 → 接入器 → 自定义接入与直播」。选择 B 站直播并保存启用会注册接入器。同一 ID 再次启用时沿用原入口和观众账号前缀。其他服务可创建自定义 HTTP 类型。
+在 Web 控制台打开「设置 → 接入器 → 自定义接入器」。选择 B 站直播并保存启用会注册接入器。同一 ID 再次启用时沿用原入口和观众账号前缀。其他服务可创建自定义 HTTP 类型。
+
+从接入器打开「管理直播」进入 `/live`。由所有者在这里保存本场计划、试音、开播或加入陪伴。保存计划后、场次运行期间及结束后的 24 小时内，左侧导航会显示直播入口。运行中的场次可以从任意页面的页头停止。
 
 ## 在直播电脑上运行舞台
 
@@ -22,7 +24,7 @@ ling-stage --server http://127.0.0.1:8080 --instance bili-live \
   --avatar-source 'Ling 皮套' --vts-model '实际模型 ID' --mouth-parameter MouthOpen
 ```
 
-首次连接 VTS 时批准 Ling Stage 插件。默认令牌保存在 `~/.ling-stage/vts-token`。常驻端下载的是本场语音，字幕在 OBS 开始播放后显示，完成或取消后清除。VTS 口型只取指定语音源音量。Ling 的模型和语音供应商沿用已发布的对话与 TTS 配置。
+首次连接 VTS 时批准 Ling Stage 插件。默认令牌保存在 `~/.ling-stage/vts-token`。常驻端下载本场语音，字幕随 OBS 播放显示，播放完成或取消时清除。VTS 口型只取指定语音源音量。Ling 的模型和语音供应商沿用已发布的对话与 TTS 配置。浏览器可以递交试音话题与查看状态，画面、声音和字幕在直播电脑的 OBS 中预览。
 
 ## B 站采集
 
@@ -36,7 +38,7 @@ uv pip install --no-deps 'https://github.com/xfgryujk/blivedm/archive/3bf17fe862
 python -m connectors.bilibili --server http://127.0.0.1:8080 --instance bili-live
 ```
 
-如配置了上报令牌或签名密钥，采集端分别读取 `LING_INGRESS_TOKEN` 和 `LING_INGRESS_SIGNING_SECRET`。观众可以从本场已播出的互动中选择记住，并到「关系」合并账号。系统按房间保存公开备注。
+如配置了上报令牌或签名密钥，采集端分别读取 `LING_INGRESS_TOKEN` 和 `LING_INGRESS_SIGNING_SECRET`。从本场已播出的互动中选择观众并保存公开备注，再到「关系」合并账号。账号归属使用接入器前缀和平台稳定 ID，昵称用于显示，场内候选队列与互动记录有数量上限。
 
 ## 其他服务上报
 
@@ -56,8 +58,12 @@ python -m connectors.bilibili --server http://127.0.0.1:8080 --instance bili-liv
 
 `sender.id` 使用来源提供的稳定账号 ID，缺失时按匿名处理。其他事件类型为 `entrance`、`like`、`gift`、`live_start`、`live_end`。配置令牌时发送 `Authorization: Bearer <token>`。配置签名时发送 `X-Ling-Signature: sha256=<hex>`，摘要用配置密钥对请求原始字节计算 HMAC-SHA256，读取场次时签空正文。
 
-## 开停播
+## 主播与陪伴助手
 
-确认 OBS 使用专门的节目场景、正确的推流目标和目标直播间的串流配置。舞台命令增加 `--stream-server`，填 OBS 内配置的推流服务地址。随后在网页允许启停 OBS 推流，可手动开播，或为一次自主开播授权开始、结束时间。自主模式由模型在有效时段内选择开场或等待，实际播出同时受单场上限和授权结束时间约束。
+每场在 `/live` 选择角色、公开主题和时长。主播可以主动开场与回应弹幕。陪伴助手可以按配置的称呼与主播互动，默认等所有者在网页递话，开启「允许她挑选弹幕回应」后才会自行挑选。角色分工、轻量弹幕筛选和字幕随发言清理参考了 AstrBot 的直播陪伴插件。 [AstrBot Live Stream Companion](https://github.com/menglimi/astrbot_plugin_live_stream_companion#readme)
 
-B 站采集用开放平台的房间开停播通知，并用房间状态补查。平台若要求主播先在官方界面开房，需要在那里完成该步骤。部署时先验证该账号能否通过已配置的 OBS 推流方式自动开房与停播，再授权自主模式。控制台分别显示 OBS 推流和目标房间状态。 [B 站开放平台接口](https://open-live.bilibili.com/document/eba8e2e1-847d-e908-2e5c-7a1ec7d9266f)
+**主播**在接入设置允许启停 OBS，舞台命令配置与 OBS 一致的 `--stream-server`。在本场选择手动开播，或授权她在指定时间范围内决定是否开场。授权绑定已连接的舞台设备、OBS 场景和房间。保存授权后结束预览，让单次开播决定在授权窗口内执行。实际时长受单场上限和授权结束时间约束。
+
+**陪伴助手**使用主播已在播的节目场景，在 OBS 将 Ling 的专用媒体源和字幕源加入该场景。舞台绑定所加入的 OBS 输出，场景由主播控制。退出只清理她的语音、字幕和口型，主播的节目继续。外部 OBS 推流换代时，本段发言会中断。
+
+B 站采集用开放平台的开停播通知与房间状态补查。网页分别显示 OBS 推流、平台房间与下播回执。平台要求主播在直播中心开房或结束时，在官方页面完成。启用自主模式前，先用该账号验证配置的推流方式能否一并开关房间。 [B 站开放平台接口](https://open-live.bilibili.com/document/eba8e2e1-847d-e908-2e5c-7a1ec7d9266f)
