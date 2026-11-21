@@ -11,7 +11,8 @@ from typing import Any
 
 from connectors.stage.obs import ObsStage, Program, StageError
 
-# obs-websocket v5 high-volume InputVolumeMeters subscription.
+# obs-websocket v5 event subscription flags.
+OUTPUT_EVENTS = 1 << 6
 INPUT_VOLUME_METERS = 1 << 16
 
 
@@ -56,7 +57,7 @@ async def connect_stage(
         url=f"ws://127.0.0.1:{obs_port}",
         password=obs_password,
         identification_parameters=simpleobsws.IdentificationParameters(
-            eventSubscriptions=INPUT_VOLUME_METERS if vts_model else 0,
+            eventSubscriptions=OUTPUT_EVENTS | (INPUT_VOLUME_METERS if vts_model else 0),
         ),
     )
     async with AsyncExitStack() as stack:
@@ -78,6 +79,7 @@ async def connect_stage(
             ))
             await vts.require_model(vts_model)
         stage = ObsStage(call, program, mouth=vts.mouth if vts else None)
+        obs.register_event_callback(stage.on_stream_state, "StreamStateChanged")
         if vts:
             obs.register_event_callback(stage.on_meters, "InputVolumeMeters")
         yield stage

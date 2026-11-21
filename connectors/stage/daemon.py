@@ -11,7 +11,6 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import time
 
 import httpx
 
@@ -40,6 +39,8 @@ class StageAgent:
         self.deadline = None
         self.ready = False
         self.broadcast_ready = False
+        self._output: tuple[ObsStage, int] | None = None
+        self._stopping_output: tuple[ObsStage, int] | None = None
 
     def _save(self) -> None:
         temp = self.journal.with_suffix(".tmp")
@@ -64,12 +65,18 @@ class StageAgent:
 
     async def tick(self, stage: ObsStage) -> None:
         status = await stage.stream_status()
-        if self.state.get("started_at") is not None:
-            if not self._owns(status):
+        if self._stopping_output and not status["outputActive"]:
+            self.control = "stopped"
+            self._forget_stream()
+        elif self._stopping_output and self._stopping_output != (stage, stage.output_serial):
+            self.control = "uncertain"
+            self._forget_stream()
+        elif self.state.get("deadline") and not self._stopping_output:
+            if not self._owns(stage, status):
                 self.control = "uncertain" if status["outputActive"] else "stopped"
                 self._forget_stream()
             elif self._seconds_left(self.state["deadline"]) <= 0:
-                self.control = await self._stop(stage, status)
+                self.control = await self._stop(stage)
                 status = await stage.stream_status()
         if self.playback is not None and self.playback.done():
             self.report = self.playback.result()
@@ -79,7 +86,7 @@ class StageAgent:
             "obs_active": status["outputActive"],
             "obs_reconnecting": status.get("outputReconnecting", False), "ready": self.ready,
             "broadcast_ready": self.broadcast_ready,
-            "control": self.control or ("started" if self._owns(status) else None),
+            "control": self.control or ("started" if self._owns(stage, status) else None),
             "playback": self.report,
         })
         response.raise_for_status()
@@ -96,8 +103,8 @@ class StageAgent:
         action = order["action"]
         if action in {"stop", "hold", "prepare"}:
             await self._cancel_speech()
-        if action == "stop":
-            self.control = await self._stop(stage, status)
+        if action == "stop" and not self._stopping_output:
+            self.control = await self._stop(stage)
         elif action == "start":
             self.control = await self._start(stage)
         elif action == "prepare":
@@ -117,7 +124,7 @@ class StageAgent:
                 self.ready = True
             except StageError as exc:
                 logger.warning("%s", exc)
-        elif self._owns(status):
+        elif self._owns(stage, status):
             self.ready = True
 
     async def _start(self, stage: ObsStage) -> str:
@@ -125,48 +132,53 @@ class StageAgent:
             return "blocked"
         if await stage.stream_server() != self.stream_server:
             return "blocked"
-        began = time()
+        before = stage.output_serial
         try:
             await stage.start_stream()
             async with asyncio.timeout(10):
                 while True:
                     remote = await stage.stream_status()
                     if remote["outputActive"] and not remote.get("outputReconnecting", False):
-                        start = time() - remote["outputDuration"] / 1000
-                        if start < began - 1:
+                        if stage.output_serial > before + 1:
                             return "uncertain"
-                        self.state.update(
-                            session_id=self.session_id, started_at=start, deadline=self.deadline,
-                        )
-                        self._save()
-                        return "started"
+                        if stage.output_generation == before + 1:
+                            self._output = (stage, before + 1)
+                            self.state.update(session_id=self.session_id, deadline=self.deadline)
+                            self._save()
+                            return "started"
                     await asyncio.sleep(0.25)
         except Exception as exc:
             logger.warning("OBS 开播回执待核对，类型=%s", type(exc).__name__)
             return "uncertain"
 
-    def _owns(self, status: dict) -> bool:
-        started = self.state.get("started_at")
+    def _owns(self, stage: ObsStage, status: dict) -> bool:
         return bool(
-            started is not None and status["outputActive"]
+            stage.output_generation is not None and status["outputActive"]
+            and self._output == (stage, stage.output_generation)
             and self.state.get("session_id") == self.session_id
-            and abs(time() - status["outputDuration"] / 1000 - started) < 3
         )
 
     def _forget_stream(self) -> None:
+        self._output = None
+        self._stopping_output = None
         for key in ("session_id", "started_at", "deadline"):
             self.state.pop(key, None)
         self._save()
 
-    async def _stop(self, stage: ObsStage, status: dict) -> str:
+    async def _stop(self, stage: ObsStage) -> str | None:
+        target_matches = self.stream_server and await stage.stream_server() == self.stream_server
+        status = await stage.stream_status()
         if not status["outputActive"]:
             self._forget_stream()
             return "stopped"
-        if self._owns(status) and self.stream_server and await stage.stream_server() == self.stream_server:
+        if self._owns(stage, status) and target_matches:
+            self._stopping_output = (stage, stage.output_serial)
+            self._output = None
             await stage.stop_stream()
             if not (await stage.stream_status())["outputActive"]:
                 self._forget_stream()
                 return "stopped"
+            return None
         return "uncertain"
 
     async def _cancel_speech(self) -> None:
