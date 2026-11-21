@@ -9,9 +9,9 @@ from sqlalchemy import func, select
 from ling import worker
 from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
 from ling.domains.identity.service import IdentityService
-from ling.domains.live.autonomy import consider_start
 from ling.infra.db import session_scope
 from ling.infra.models import ActivityRow, ActorAccount, MemoryRow, OutboxEvent
+from ling.kernel.live.autonomy import consider_start
 from ling.ports.model import ModelChunk
 from ling.ports.speech import (
     AudioSpec,

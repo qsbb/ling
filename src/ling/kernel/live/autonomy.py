@@ -8,11 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.config import Settings
 from ling.domains.identity.service import IdentityService
-from ling.domains.live.ingress import CUSTOM_SCOPE
-from ling.domains.live.room import active_session, open_session
 from ling.infra.db import session_scope
 from ling.infra.models import ConnectorInstance, OutboxEvent, utcnow
 from ling.infra.security import SecretBox, new_id
+from ling.kernel.live.events import CUSTOM_SCOPE
+from ling.kernel.live.room import LiveConflict, LiveForbidden, active_session, open_session
 from ling.models.router import ModelRouter
 from ling.ports.model import ChatMessageIn
 from ling.settings.service import ConfigService
@@ -103,15 +103,13 @@ async def consider_start(
         if should_start and utcnow() - datetime.fromisoformat(offer) <= timedelta(seconds=30):
             owner = await IdentityService(session).owner_subject_id()
             if owner and await active_session(session, settings.actor_id) is None:
-                from ling.api.errors import LingError
-
                 try:
                     run = await open_session(
                         session, connector, actor_id=settings.actor_id, persona_id=settings.persona_id,
                         subject_id=owner, mode="broadcast", device_id=device_id,
                         ends_at=datetime.fromisoformat(authorization(connector)["ends_at"]),
                     )
-                except LingError:
+                except (LiveConflict, LiveForbidden):
                     decision = "wait"
                 else:
                     run.runtime = {**run.runtime, "autonomous": True}

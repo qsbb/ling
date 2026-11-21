@@ -7,9 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.activity.service import ActivityService
-from ling.domains.live.room import finish_session, next_speech, settle_speech
 from ling.infra.models import LiveSessionRow, Operation, utcnow
 from ling.infra.security import new_id
+from ling.kernel.live.room import finish_session, next_speech, settle_speech
 
 
 class PlaybackReport(BaseModel):

@@ -13,30 +13,33 @@ from sqlalchemy import select
 from ling.api.deps import DbSession, SettingsDep
 from ling.api.errors import LingError, not_found
 from ling.api.guards import OwnerAuth, OwnerWrite, OwnerWriteAction
-from ling.contracts.v1 import ErrorCode
-from ling.domains.live.autonomy import prepare_autonomy
-from ling.domains.live.control import StageStatus, update_stage
-from ling.domains.live.ingress import (
-    CUSTOM_SCOPE,
+from ling.api.routes.live_connector import (
     CustomConfig,
-    CustomEvent,
     configure_custom,
     custom_view,
     require_custom,
     require_ingress,
     require_stage,
 )
-from ling.domains.live.room import (
+from ling.contracts.v1 import ErrorCode
+from ling.domains.media.assets import AssetError, GeneratedMediaService
+from ling.infra.models import ConnectorInstance, LiveSessionRow, LiveViewerRow, utcnow
+from ling.infra.security import load_signing_root_key
+from ling.kernel.live.autonomy import prepare_autonomy
+from ling.kernel.live.control import StageStatus, update_stage
+from ling.kernel.live.events import CUSTOM_SCOPE, CustomEvent
+from ling.kernel.live.room import (
     ACTIVE,
+    LiveConflict,
+    LiveForbidden,
+    LiveNotFound,
     active_session,
+    finish_session,
     open_session,
     receive_event,
     save_viewer,
     session_view,
 )
-from ling.domains.media.assets import AssetError, GeneratedMediaService
-from ling.infra.models import ConnectorInstance, LiveSessionRow, LiveViewerRow, utcnow
-from ling.infra.security import load_signing_root_key
 
 router = APIRouter(tags=["livestream"])
 
@@ -104,10 +107,15 @@ async def start_live(
     body: OpenLive, auth: OwnerWrite, session: DbSession, settings: SettingsDep,
 ) -> dict:
     row = await require_custom(session, body.connector_id, lock=True)
-    run = await open_session(
-        session, row, actor_id=settings.actor_id, persona_id=settings.persona_id,
-        subject_id=auth.user.subject_id, mode=body.mode,
-    )
+    try:
+        run = await open_session(
+            session, row, actor_id=settings.actor_id, persona_id=settings.persona_id,
+            subject_id=auth.user.subject_id, mode=body.mode,
+        )
+    except LiveConflict as exc:
+        raise LingError(ErrorCode.conflict, str(exc), status_code=409) from exc
+    except LiveForbidden as exc:
+        raise LingError(ErrorCode.forbidden, str(exc), status_code=403) from exc
     return session_view(run)
 
 
@@ -126,8 +134,6 @@ async def stop_live(
 ) -> dict:
     run = await _get_session(session, settings, session_id, lock=True)
     if run.state in ACTIVE:
-        from ling.domains.live.room import finish_session
-
         if not run.runtime.get("device_id") and not run.runtime.get("start_operation"):
             finish_session(run, detail="本场已结束")
         else:
@@ -148,9 +154,14 @@ async def remember_viewer(
     session_id: str, body: SaveViewer, _auth: OwnerWrite, session: DbSession, settings: SettingsDep,
 ) -> dict:
     run = await _get_session(session, settings, session_id, lock=True)
-    row = await save_viewer(
-        session, run, account_ref=body.account_ref, note=body.note, merge_into=body.merge_into,
-    )
+    try:
+        row = await save_viewer(
+            session, run, account_ref=body.account_ref, note=body.note, merge_into=body.merge_into,
+        )
+    except LiveNotFound as exc:
+        raise not_found(str(exc)) from exc
+    except LiveConflict as exc:
+        raise LingError(ErrorCode.conflict, str(exc), status_code=409) from exc
     return {"account_ref": row.account_ref, "display_name": row.display_name, "note": row.note}
 
 

@@ -404,7 +404,7 @@ def handler(topic: str) -> Callable[[Handler], Handler]:
 
 @handler("livestream.speech")
 async def handle_livestream_speech(payload: dict) -> None:
-    from ling.domains.live.speech import build_speech
+    from ling.kernel.live.speech import build_speech
 
     await build_speech(
         get_settings(), _MEMORY_ROUTER,
@@ -414,7 +414,7 @@ async def handle_livestream_speech(payload: dict) -> None:
 
 @handler("livestream.decide")
 async def handle_livestream_decide(payload: dict) -> None:
-    from ling.domains.live.autonomy import consider_start
+    from ling.kernel.live.autonomy import consider_start
 
     await consider_start(get_settings(), _MEMORY_ROUTER, **payload)
 

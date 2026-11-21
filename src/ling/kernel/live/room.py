@@ -5,10 +5,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.api.errors import LingError, not_found
-from ling.contracts.v1 import ErrorCode
 from ling.domains.identity.service import IdentityService, normalize_display_name
-from ling.domains.live.ingress import CustomEvent, account_namespace, event_is_fresh
 from ling.infra.models import (
     ConnectorInstance,
     LiveSessionRow,
@@ -19,12 +16,25 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.infra.security import new_id
+from ling.kernel.live.events import CustomEvent, account_namespace, event_is_fresh
 
 ACTIVE = ("preview", "starting", "live", "stopping")
 MAX_WAITING = 8
 MAX_RECENT_IDS = 512
 MAX_VIEWERS = 40
 MAX_HISTORY = 8
+
+
+class LiveConflict(ValueError):
+    pass
+
+
+class LiveForbidden(PermissionError):
+    pass
+
+
+class LiveNotFound(LookupError):
+    pass
 
 
 async def active_session(
@@ -70,9 +80,9 @@ async def open_session(
 ) -> LiveSessionRow:
     config = connector.custom_config or {}
     if not connector.enabled or not config.get("stage_token_hash"):
-        raise LingError(ErrorCode.conflict, "请启用接入器并配置舞台端令牌", status_code=409)
+        raise LiveConflict("请启用接入器并配置舞台端令牌")
     if mode == "broadcast" and not config.get("obs_control"):
-        raise LingError(ErrorCode.forbidden, "这个房间未授权控制 OBS 推流", status_code=403)
+        raise LiveForbidden("这个房间未授权控制 OBS 推流")
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"live:{actor_id}"))))
     old = await active_session(session, actor_id, lock=True)
     now = utcnow()
@@ -83,7 +93,7 @@ async def open_session(
     if old is not None:
         if old.connector_id == connector.instance_id and old.runtime["mode"] == mode:
             return old
-        raise LingError(ErrorCode.conflict, "已有直播场次正在运行或停止", status_code=409)
+        raise LiveConflict("已有直播场次正在运行或停止")
     deadline = now + timedelta(minutes=config.get("max_minutes", 30))
     window = Window(
         id=new_id("win"), actor_id=actor_id, subject_id=subject_id, persona_id=persona_id,
@@ -162,7 +172,7 @@ async def save_viewer(
 ) -> LiveViewerRow:
     candidate = run.runtime.get("interacted", {}).get(account_ref)
     if not candidate:
-        raise not_found("本场没有这位观众的已播出互动")
+        raise LiveNotFound("本场没有这位观众的已播出互动")
     namespace = account_namespace(run.connector_id)
     # The same account can be selected simultaneously in separate runs.
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"{namespace}:{account_ref}"))))
@@ -170,14 +180,14 @@ async def save_viewer(
     name = candidate["display_name"] or "直播观众"
     source = await identity.resolve_or_provision(namespace, account_ref, display_name=name)
     if source is None:
-        raise LingError(ErrorCode.conflict, "账号目前不可关联", status_code=409)
+        raise LiveConflict("账号目前不可关联")
     if merge_into and await identity.canonical_subject(source) != merge_into:
         if await session.get(Subject, merge_into) is None:
-            raise not_found("目标自然人不存在")
+            raise LiveNotFound("目标自然人不存在")
         try:
             await identity.merge_subjects(source, merge_into)
         except ValueError as exc:
-            raise LingError(ErrorCode.conflict, str(exc), status_code=409) from exc
+            raise LiveConflict(str(exc)) from exc
     key = (run.connector_id, run.room_id, account_ref)
     row = await session.get(LiveViewerRow, key)
     if row is None:

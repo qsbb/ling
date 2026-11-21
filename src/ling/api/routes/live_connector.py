@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hmac
-from datetime import datetime
-from typing import Annotated, Literal
 
 from connectors.inbound_access import parse_source_ips, source_allowed
 from fastapi import Request
@@ -12,7 +10,6 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
-    StringConstraints,
     model_validator,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,14 +18,13 @@ from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ErrorCode
 from ling.infra.models import ConnectorInstance
 from ling.infra.security import hash_token
+from ling.kernel.live.events import CUSTOM_SCOPE, Identifier, account_namespace
+from ling.kernel.live.room import active_session
 from ling.settings.connector_instances import (
     ConnectorInstanceError,
     ConnectorInstanceService,
     normalize_instance_id,
 )
-
-CUSTOM_SCOPE = "custom_http"
-Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
 
 
 class BroadcastWindow(BaseModel):
@@ -64,29 +60,6 @@ class CustomConfig(BaseModel):
         if self.autonomous_window and not self.obs_control:
             raise ValueError("自主开播需要允许控制 OBS 推流")
         return self
-
-
-class Sender(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: Identifier | None = None
-    name: str | None = Field(default=None, max_length=128)
-
-
-class CustomEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    event_id: Annotated[str, StringConstraints(min_length=1, max_length=128)]
-    kind: Literal["comment", "entrance", "like", "gift", "live_start", "live_end"]
-    room_id: Identifier
-    occurred_at: AwareDatetime
-    session_id: str | None = Field(default=None, max_length=64)
-    sender: Sender | None = None
-    text: str = Field(default="", max_length=500)
-
-
-def account_namespace(instance_id: str) -> str:
-    return f"custom-http.{instance_id}"
 
 
 def custom_view(row: ConnectorInstance) -> dict:
@@ -149,8 +122,6 @@ async def configure_custom(
         raise LingError(ErrorCode.conflict, "接入器前缀已被其他配置占用", status_code=409)
     if row and (old.get("room_id") != config.room_id):
         raise LingError(ErrorCode.conflict, "房间已绑定，请为新房间创建接入器", status_code=409)
-    from ling.domains.live.room import active_session
-
     active = await active_session(session, request.app.state.settings.actor_id, lock=True)
     if active and active.connector_id == instance_id:
         if config.enabled:
@@ -231,7 +202,3 @@ def require_ingress(request: Request, config: ConnectorInstance, body: bytes) ->
         raise LingError(ErrorCode.forbidden, "接入器来源或凭据校验失败", status_code=403)
     if not config.enabled:
         raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
-
-
-def event_is_fresh(event: CustomEvent, now: datetime, *, max_age: float = 30) -> bool:
-    return -5 <= (now - event.occurred_at).total_seconds() <= max_age
