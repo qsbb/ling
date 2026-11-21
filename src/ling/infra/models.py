@@ -1531,6 +1531,7 @@ class MemoryRow(Base, TimestampMixin):
     visibility: Mapped[str] = mapped_column(String(32))
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    import_source: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     # 来源窗口与来源可见范围：跨受众过滤必须能判断"这是哪个群说的"
     # 没有这两列就只能按 visibility 粗过滤，"群 A 的内容进群 B" 拦不住。
     source_window_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

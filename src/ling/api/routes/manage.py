@@ -115,6 +115,8 @@ async def list_memory(
         ),
     ] = None,
     view: Literal["library"] | None = None,
+    source: Literal["astrbot_memory_companion"] | None = None,
+    offset: Annotated[int, Query(ge=0, le=2_147_483_647)] = 0,
 ) -> dict:
     """列出当前自然人**现行**的长期记忆。
 
@@ -136,8 +138,14 @@ async def list_memory(
         )
     from ling.domains.memory.library import memory_record, read_library
 
+    if (source is not None and view != "library") or (offset and source is None):
+        raise LingError(
+            ErrorCode.invalid_request, "按导入来源翻页需要同时选择记忆库视图与来源", status_code=422,
+        )
     if view == "library":
-        return await read_library(session, auth.user.subject_id, limit=limit, include=include)
+        return await read_library(
+            session, auth.user.subject_id, limit=limit, include=include, source=source, offset=offset,
+        )
 
     effective = include or "active"
     service = MemoryService(session)

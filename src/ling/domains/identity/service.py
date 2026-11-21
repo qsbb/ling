@@ -13,7 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found, unauthorized
@@ -1107,6 +1107,68 @@ class IdentityService:
         # 跟随合并指针：账号仍挂在原来的 subject 上，但**解析结果**必须是
         # 合并后的那个人——否则合并之后两个号还是两个人。
         return await self.canonical_subject(row.subject_id)
+
+    async def resolve_proven_login_binding(
+        self,
+        *,
+        subject_id: str,
+        connector_instances: set[str],
+        external_account_id: str,
+        lock: bool = False,
+    ) -> tuple[Subject, ActorAccount]:
+        """Find a proven account owned by this login or a directly merged channel identity."""
+        session = self._session
+        subject = await session.get(Subject, subject_id)
+        if subject is None or subject.merged_into is not None:
+            raise LingError(
+                ErrorCode.conflict, "当前自然人无法接收记忆", status_code=409,
+                detail="destination_unavailable",
+            )
+        source_has_login = exists(select(User.id).where(User.subject_id == Subject.id))
+        query = (
+            select(ActorAccount)
+            .join(Subject, Subject.id == ActorAccount.subject_id)
+            .where(
+                ActorAccount.connector_instance.in_(connector_instances),
+                ActorAccount.external_account_id == external_account_id,
+                ActorAccount.revoked_at.is_(None),
+                ActorAccount.proof.in_(self.PROVEN_LEVELS),
+                or_(
+                    Subject.id == subject_id,
+                    and_(Subject.merged_into == subject_id, ~source_has_login),
+                ),
+            )
+            .order_by(ActorAccount.subject_id != subject_id, ActorAccount.id)
+            .limit(1)
+        )
+        binding = await session.scalar(query)
+        if lock and binding is not None:
+            # Use the same subject lock order as merge_subjects. Recheck membership
+            # and proof after waiting for an in-flight merge, split or revoke.
+            subjects = await session.scalars(
+                select(Subject)
+                .where(Subject.id.in_((subject_id, binding.subject_id)))
+                .order_by(Subject.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if subject not in subjects.all() or subject.merged_into is not None:
+                raise LingError(
+                    ErrorCode.conflict, "当前自然人无法接收记忆", status_code=409,
+                    detail="destination_unavailable",
+                )
+            binding = await session.scalar(
+                query.where(
+                    ActorAccount.id == binding.id,
+                    ActorAccount.subject_id == binding.subject_id,
+                ).with_for_update(of=ActorAccount).execution_options(populate_existing=True)
+            )
+        if binding is None:
+            raise LingError(
+                ErrorCode.conflict, "请先确认此 QQ 已绑定到你在 Ling 的自然人",
+                status_code=409, detail="qq_binding_required",
+            )
+        return subject, binding
 
     async def binding_proof(
         self, connector_instance: str, external_account_id: str

@@ -140,6 +140,7 @@ _AUDIT_MESSAGES: dict[str, str] = {
     "config_rolled_back": "配置已回滚",
     "provider_secret_set": "供应商密钥已更新",
     "memory_retracted": "记忆已撤回",
+    "memory_imported": "已导入旧记忆",
     "memory_forgotten": "记忆已清除",
     # 真删是两段式的，所以审计必须分三段记：
     # `memory_forgotten` = 请求已接受（同步、只封住读写），
