@@ -115,6 +115,9 @@ class ObsStage:
                     })
                     while True:
                         status = await self._media()
+                        current = (await self._input(self.program.audio))["inputSettings"]
+                        if current.get("local_file") != str(audio):
+                            return Playback("interrupted", played_ms)
                         state = status["mediaState"]
                         if state == "OBS_MEDIA_STATE_PLAYING":
                             await self._check_scene()
@@ -124,9 +127,7 @@ class ObsStage:
                             played_ms = max(played_ms, status.get("mediaCursor") or 0)
                             if self._mouth:
                                 await self._mouth(min(1.0, math.sqrt(max(self._level, 0.0))))
-                        elif state == "OBS_MEDIA_STATE_ENDED":
-                            if not self._playing:
-                                raise StageError("未观察到语音开始播放")
+                        elif state == "OBS_MEDIA_STATE_ENDED" and self._playing:
                             return Playback("completed", status.get("mediaDuration") or played_ms)
                         elif state == "OBS_MEDIA_STATE_ERROR":
                             raise StageError("OBS 无法播放这段语音")

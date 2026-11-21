@@ -15,6 +15,7 @@ class Obs:
         self.streaming = False
         self.scene = "Studio"
         self.settings_updates = 0
+        self.initial_state = "PLAYING"
 
     async def call(self, method, data):
         name = data.get("inputName")
@@ -40,7 +41,7 @@ class Obs:
                 if self.path:
                     self.settings_updates += 1
                     self.started = True
-                    self.status = "PLAYING"
+                    self.status = self.initial_state
             else:
                 self.caption_changes.append((self.status, data["inputSettings"]["text"]))
         elif method == "GetMediaInputStatus":
@@ -104,3 +105,23 @@ async def test_cancel_preview_clears_caption_and_audio(tmp_path: Path):
         await running
     assert obs.caption_changes[-1][1] == ""
     assert obs.status == "STOPPED" and obs.path == ""
+
+
+async def test_old_end_and_source_replacement_do_not_complete_new_clip(tmp_path: Path):
+    clip = tmp_path / "clip.wav"
+    clip.touch()
+    obs = Obs()
+    obs.initial_state = "ENDED"
+    stage = ObsStage(obs.call, Program("Studio", "Voice", "Caption"))
+    running = asyncio.create_task(stage.preview(clip, "Caption"))
+    await asyncio.sleep(0.07)
+    assert not running.done()
+    assert all(text == "" for _, text in obs.caption_changes)
+    obs.status = "PLAYING"
+    await asyncio.wait_for(obs.playing.wait(), timeout=1)
+    assert obs.caption_changes[-1] == ("PLAYING", "Caption")
+    obs.path = "/elsewhere/other.wav"
+    obs.status = "ENDED"
+    assert (await running).state == "interrupted"
+    assert obs.caption_changes[-1][1] == ""
+    assert obs.path == "/elsewhere/other.wav"
