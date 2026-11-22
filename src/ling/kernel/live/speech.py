@@ -112,9 +112,11 @@ async def build_speech(
                         session.add(message)
                         await session.flush()
                     text = message.text
-                    if message.audio_asset_id or await voice.synthesize(
-                        message, prepared=prepared, subject_id=None, allowed=allowed,
-                    ):
+                    if not message.audio_asset_id:
+                        await voice.synthesize(
+                            message, prepared=prepared, subject_id=None, allowed=allowed,
+                        )
+                    if message.audio_asset_id:
                         asset = await voice.media.view_for_window(
                             message.audio_asset_id, requester_actor=run.actor_id,
                             requester_window=run.window_id,

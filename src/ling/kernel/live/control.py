@@ -41,7 +41,7 @@ class StageStatus(BaseModel):
 
 
 def record_stage_observation(connector: ConnectorInstance, report: StageStatus) -> None:
-    config = connector.custom_config
+    config = connector.custom_config or {}
     previous = config.get("stage_observation") or {}
     now = utcnow()
     status = {

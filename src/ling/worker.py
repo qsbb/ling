@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from ling.domains.media.assets import GeneratedMediaService
     from ling.domains.speech.orchestration import SpeechOrchestrator
     from ling.infra.models import Window
+    from ling.models.router import ModelRouter
     from ling.ports.config import EffectiveConfig
 
     # `AudioInput` 只出现在 `_load_reference_audio` 的**返回注解**里（本文件
@@ -101,7 +102,7 @@ logger = logging.getLogger("ling.worker")
 # worker 侧的密钥缓存与模型路由：Provider 构造需要**同步**读密钥，
 # 而数据库是异步的，所以启动时预热一次，之后从内存取。
 _SECRET_CACHE: dict[str, str] = {}
-_MEMORY_ROUTER: object | None = None
+_MEMORY_ROUTER: ModelRouter | None = None
 # 本进程加载到的配置修订号；变了就重载路由与密钥
 _SECRET_CACHE_REVISION: int = -1
 
@@ -2489,8 +2490,7 @@ async def _reply_in_group_window(  # noqa: ANN001
 
     coordinator = TurnCoordinator(
         settings=settings,
-        # `_MEMORY_ROUTER` 只声明成 object（预热失败时为 None，上面已挡住）
-        router=router,  # type: ignore[arg-type]
+        router=router,
         actor_id=settings.actor_id,
         persona_id=snapshot.persona,
         cancels=CancelRegistry(),

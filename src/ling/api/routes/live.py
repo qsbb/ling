@@ -117,7 +117,7 @@ async def save_plan(
     instance_id: str, body: LivePlan, _auth: OwnerWrite, session: DbSession, settings: SettingsDep,
 ) -> dict:
     connector = await require_custom(session, instance_id, lock=True)
-    config = connector.custom_config
+    config = connector.custom_config or {}
     if not connector.enabled:
         raise LingError(ErrorCode.conflict, "请先启用接入器", status_code=409)
     if body.autonomous_window and not config.get("obs_control"):
@@ -154,7 +154,7 @@ async def clear_plan(
 ) -> dict:
     connector = await require_custom(session, instance_id, lock=True)
     connector.custom_config = {
-        **connector.custom_config, "live_plan": None, "plan_pending": False,
+        **(connector.custom_config or {}), "live_plan": None, "plan_pending": False,
         "autonomous_state": None, "autonomous_offer": None, "autonomous_binding": None,
     }
     run = await active_session(session, settings.actor_id, lock=True)
@@ -267,7 +267,7 @@ async def forget_viewer(
 ) -> dict:
     connector = await require_custom(session, instance_id)
     row = await session.get(
-        LiveViewerRow, (instance_id, connector.custom_config["room_id"], account_ref),
+        LiveViewerRow, (instance_id, (connector.custom_config or {}).get("room_id", ""), account_ref),
     )
     if row is None:
         raise not_found("没有保存这位观众的房间备注")
@@ -287,7 +287,7 @@ async def source_session(
         raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
     return {
         "session_id": run.id if run and run.connector_id == instance_id else None,
-        "room_id": connector.custom_config["room_id"],
+        "room_id": (connector.custom_config or {}).get("room_id", ""),
     }
 
 
@@ -304,18 +304,19 @@ async def push_custom_event(
         raise LingError(ErrorCode.invalid_request, "事件格式有误", status_code=422) from exc
     now = utcnow()
     config = connector.custom_config or {}
-    if event.room_id != config["room_id"]:
+    if event.room_id != config.get("room_id"):
         raise LingError(ErrorCode.forbidden, "事件房间与接入器配置不一致", status_code=403)
     run = await active_session(session, settings.actor_id, lock=True)
-    matches = run is not None and run.connector_id == instance_id
+    if run is not None and run.connector_id != instance_id:
+        run = None
     if not connector.enabled and not (
-        matches and run.state == "stopping" and event.kind in {"live_start", "live_end"}
+        run is not None and run.state == "stopping" and event.kind in {"live_start", "live_end"}
     ):
         raise LingError(ErrorCode.conflict, "接入器已停用", status_code=409)
     last = config.get("last_received_at")
     if not last or now - datetime.fromisoformat(last) >= timedelta(seconds=5):
         connector.custom_config = {**config, "last_received_at": now.isoformat()}
-    if not matches:
+    if run is None:
         return {"status": "no_session"}
     return {"status": receive_event(run, event, now=now)}
 

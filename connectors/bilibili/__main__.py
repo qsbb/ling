@@ -20,7 +20,7 @@ ROOM_INFO = "https://api.live.bilibili.com/room/v1/Room/get_info"
 
 def event_from_message(kind: str, message: Any) -> dict:
     timestamp = int(message.timestamp)
-    event = {
+    event: dict[str, Any] = {
         "kind": kind,
         "event_id": str(message.msg_id or f"{kind}:{message.room_id}:{timestamp}:{message.open_id}"),
         "room_id": str(message.room_id),
@@ -104,7 +104,7 @@ class Forwarder:
                     if session_id == self.session_id and event["room_id"] == self.room_id and key != sent_platform:
                         await self._post(event, session_id)
                         sent_platform = key
-                if self.session_id is not None and monotonic() >= self.next_probe:
+                if self.session_id is not None and self.room_id is not None and monotonic() >= self.next_probe:
                     self.next_probe = monotonic() + 10
                     try:
                         state = await self.room_status(self.room_id)
@@ -117,9 +117,9 @@ class Forwarder:
                 for _ in range(16):
                     if self.queue.empty():
                         break
-                    item, session_id = self.queue.get_nowait()
-                    if session_id and session_id == self.session_id and item["room_id"] == self.room_id:
-                        await self._post(item, session_id)
+                    item, queued_session_id = self.queue.get_nowait()
+                    if queued_session_id and queued_session_id == self.session_id and item["room_id"] == self.room_id:
+                        await self._post(item, queued_session_id)
             except httpx.HTTPError:
                 self.session_id = None
                 logger.warning("暂时无法向 Ling 上报 B 站事件，请检查接入器状态和凭据")
@@ -132,8 +132,8 @@ async def _run(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise SystemExit("请先按直播接入文档安装 blivedm") from exc
     credentials = [
-        os.environ.get("BILIBILI_ACCESS_KEY_ID"), os.environ.get("BILIBILI_ACCESS_KEY_SECRET"),
-        os.environ.get("BILIBILI_APP_ID"), os.environ.get("BILIBILI_ANCHOR_CODE"),
+        os.environ.get("BILIBILI_ACCESS_KEY_ID", ""), os.environ.get("BILIBILI_ACCESS_KEY_SECRET", ""),
+        os.environ.get("BILIBILI_APP_ID", ""), os.environ.get("BILIBILI_ANCHOR_CODE", ""),
     ]
     if not all(credentials):
         raise SystemExit("请设置 B 站开放平台应用凭据和主播身份码")

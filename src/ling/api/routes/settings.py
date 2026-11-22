@@ -1950,6 +1950,8 @@ async def _probe_asr_catalog(provider, config) -> ProbeResult:
 
 
 async def _probe_asr_model(provider, model_id: str, config) -> ProbeResult:
+    from ling.ports.speech import AsrProvider
+
     if "realtime" in model_id.lower():
         return ProbeResult(
             ok=False,
@@ -1958,6 +1960,7 @@ async def _probe_asr_model(provider, model_id: str, config) -> ProbeResult:
     secret = await config.read_secret(provider.provider_id)
     if not secret:
         return ProbeResult(ok=False, detail="供应商尚未保存密钥")
+    adapter: AsrProvider
     if provider.kind == ProviderKind.dashscope_asr.value:
         from ling.models.dashscope_asr import DashScopeAsr
 

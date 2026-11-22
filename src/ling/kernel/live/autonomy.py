@@ -54,11 +54,12 @@ def prepare_autonomy(
     return "hold"
 
 
-def _offered(connector: ConnectorInstance | None, offer: str) -> bool:
+def _offered(connector: ConnectorInstance, offer: str) -> bool:
+    config = connector.custom_config or {}
     return bool(
-        connector is not None and authorization(connector)
-        and connector.custom_config.get("autonomous_state") == "deciding"
-        and connector.custom_config.get("autonomous_offer") == offer
+        authorization(connector)
+        and config.get("autonomous_state") == "deciding"
+        and config.get("autonomous_offer") == offer
     )
 
 
@@ -71,7 +72,7 @@ async def consider_start(
     try:
         async with asyncio.timeout(12), session_scope() as session:
             connector = await session.get(ConnectorInstance, key)
-            if not _offered(connector, offer):
+            if connector is None or not _offered(connector, offer):
                 return
             if router is not None and await active_session(session, settings.actor_id) is None:
                 config = ConfigService(
@@ -88,7 +89,7 @@ async def consider_start(
                             content="你是直播主持人。现在是所有者预先授权的开播时段。"
                             "按公开主题决定是否想开场，只回复「开播」或「等待」。",
                         ),
-                        ChatMessageIn(role="user", content=plan_from_config(connector.custom_config).public_topic),
+                        ChatMessageIn(role="user", content=plan_from_config(connector.custom_config or {}).public_topic),
                     ],
                 ):
                     if outcome.error is not None:
@@ -102,7 +103,7 @@ async def consider_start(
 
     async with session_scope() as session:
         connector = await session.get(ConnectorInstance, key, with_for_update=True)
-        if not _offered(connector, offer):
+        if connector is None or not _offered(connector, offer):
             return
         if should_start and utcnow() - datetime.fromisoformat(offer) <= timedelta(seconds=30):
             owner = await IdentityService(session).owner_subject_id()
@@ -119,4 +120,4 @@ async def consider_start(
                 else:
                     run.runtime = {**run.runtime, "autonomous": True}
                     decision = "started"
-        connector.custom_config = {**connector.custom_config, "autonomous_state": decision}
+        connector.custom_config = {**(connector.custom_config or {}), "autonomous_state": decision}

@@ -33,10 +33,10 @@ class StageAgent:
             self._save()
         self.session_id = self.state.get("session_id")
         self.stream_server = stream_server
-        self.playback = None
-        self.report = None
-        self.control = None
-        self.deadline = None
+        self.playback: asyncio.Task[dict] | None = None
+        self.report: dict | None = None
+        self.control: str | None = None
+        self.deadline: str | None = None
         self.ready = False
         self.broadcast_ready = False
         self.companion_attached = False
