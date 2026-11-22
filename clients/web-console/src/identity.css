@@ -1,44 +1,214 @@
+/**
+ * 关系页样式。
+ *
+ * 布局承担解释，不靠辅助文案：
+ *
+ * - **姓名一列**：字号最大、最先被读到，这是用户带着来的信息。
+ * - **平台徽标一行**：平台名 + 账号数，靠形状（小圆角块 + 数字角标）表达
+ *   "他在这几个平台上各有一个号"，不需要再写一句「平台账号：」。
+ * - **操作收在行尾**：改名 / 合并 / 详情三个动词并列，不抢姓名的位置。
+ * - **并入记录缩进一行**：缩进本身就说明"这些是上面那个人的号"，
+ *   所以只写账号概况 + 拆开按钮，不重复写一遍「已合并」。
+ */
+
 .identity-page {
-  gap: 18px;
+  gap: 16px;
 }
 
 .identity-heading {
   display: flex;
-  align-items: start;
+  align-items: baseline;
   justify-content: space-between;
-  gap: 24px;
+  gap: 16px;
 }
 
-.identity-heading .page__hint {
-  margin-bottom: 0;
-}
-
-.identity-help {
-  max-width: 300px;
-  font-size: 12px;
-  color: var(--ink-soft);
-}
-
-.identity-help summary {
-  cursor: pointer;
-  min-height: 36px;
-  padding: 8px 0;
-}
-
-.identity-help p {
-  line-height: 1.7;
+.identity-heading__count {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .identity-page .identity-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
   margin: 0;
-  padding: 12px;
+  padding: 10px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--paper-raised);
 }
 
 .identity-page .identity-search input {
-  min-height: 40px;
+  flex: 1 1 200px;
+  min-height: 38px;
+}
+
+/* ------------------------------------------------------------ 自然人列表 */
+
+/*
+ * `overflow: hidden` 只用来把圆角裁在子行背景上，**不能让列表变成滚动容器**：
+ * 它是 `.page`（flex 列）的子项，一旦给了确定的可用高度，最后几行会被裁掉，
+ * 而 `scrollIntoView` 仍能滚到"被裁掉的位置"，让人以为一切正常。
+ *
+ * 所以纵向必须 `visible`，让列表随内容增高、由 `.page` 负责滚动。
+ */
+.identity-list {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--paper-raised);
+  overflow-x: hidden;
+  overflow-y: visible;
+}
+
+.person-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+
+.person-row:last-child {
+  border-bottom: 0;
+}
+
+.person-row--detail-open {
+  background: var(--paper-sunken);
+}
+
+.person-row__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.person-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 600;
+  flex: 0 0 38px;
+}
+
+.person-row__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.person-row__name-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.person-row__name {
+  font-size: 16px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.person-row__name--unset {
+  color: var(--ink-faint);
+  font-weight: 500;
+}
+
+.person-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  min-width: 0;
+}
+
+.person-row__platforms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.person-row__platforms--empty {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.platform-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--paper);
+  font-size: 12px;
+  color: var(--ink-soft);
+  max-width: 100%;
+}
+
+.platform-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14ch;
+}
+
+.platform-chip__count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.person-row__hint {
+  font-size: 12px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.person-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.person-row__actions .button {
+  min-height: 34px;
+}
+
+/*
+ * 「已并入」那一段：成员记录自己占一行，缩进与底色说明"这些是别人的号"，
+ * 不需要再加一句「以下为已并入的记录」。
+ */
+.identity-merged {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .identity-section-title {
@@ -46,6 +216,7 @@
   align-items: center;
   gap: 8px;
   margin: 0;
+  font-size: 14px;
 }
 
 .identity-section-title span {
@@ -54,91 +225,293 @@
   font-weight: 400;
 }
 
-.identity-list {
-  flex-shrink: 0;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--paper-raised, #fcfaf6);
-  overflow: hidden;
+.identity-merged .person-row {
+  background: var(--paper-sunken);
 }
 
-.identity-page .account-card {
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(200px, 1.2fr) auto;
+.identity-merged .person-avatar {
+  background: var(--paper);
+  color: var(--ink-faint);
+}
+
+.identity-merged .person-row__name {
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+
+/* 已并入目标不在本页：单独一块，说明为什么它们没被折进任何人。 */
+.identity-orphans {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--paper-sunken);
+}
+
+.identity-orphans__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.identity-orphans__row {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
-  margin: 0;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  border-radius: 0;
-  padding: 16px;
+  gap: 8px;
   min-width: 0;
 }
 
-.identity-page .account-card:last-child {
-  border-bottom: 0;
-}
-
-.identity-page .account-card__head {
-  margin: 0;
-  min-width: 0;
-}
-
-.identity-page .account-card__head strong {
+.identity-orphans__name {
   overflow-wrap: anywhere;
 }
 
-.identity-avatar {
-  display: inline-grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
-  border-radius: 10px;
-  background: var(--paper-sunken, #eee9dc);
-  color: var(--accent);
-  font-weight: 600;
+.identity-orphans__row .button {
+  margin-left: auto;
 }
 
-.identity-page .account-card__accounts {
+.identity-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+}
+
+/* ------------------------------------------------------------ 弹层 */
+
+.merge-dialog,
+.rename-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-soft);
+  color: var(--ink);
+}
+
+.merge-dialog::backdrop,
+.rename-dialog::backdrop {
+  background: rgb(16 27 23 / 40%);
+}
+
+.merge-dialog__title,
+.rename-dialog__title {
+  margin: 0 0 14px;
+  font-size: 17px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/* 源 / 目标并排：位置本身就是"谁并进谁"，不需要额外的箭头图形。 */
+.merge-dialog__parties {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.merge-dialog__party {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper);
   min-width: 0;
 }
 
-.identity-page .account-row code {
+.merge-dialog__party--target {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.merge-dialog__party header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.merge-dialog__role {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-faint);
+}
+
+.merge-dialog__party strong {
+  font-size: 15px;
   overflow-wrap: anywhere;
+}
+
+.merge-dialog__accounts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.merge-dialog__account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   font-size: 12px;
 }
 
-.identity-page .account-card__actions {
-  margin: 0;
-  justify-content: flex-end;
+.merge-dialog__platform {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+/* 确认面板里完整显示外部 ID：这里正是核对的地方，缩写不够用。 */
+.merge-dialog__id {
+  font-size: 12px;
+  overflow-wrap: anywhere;
   min-width: 0;
 }
 
-.identity-page .account-card--editing {
-  background: var(--paper-sunken, #f3eee3);
+.merge-dialog__platforms {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.merge-dialog__empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.merge-dialog__note {
+  margin: 0 0 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.merge-dialog__actions,
+.rename-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.merge-dialog .banner,
+.rename-dialog .banner {
+  margin-bottom: 12px;
+}
+
+/* 候选搜索：结果是一列可点的行，靠高亮表达选中。 */
+.merge-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+}
+
+.merge-candidates__label {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.merge-candidates .input {
+  min-height: 38px;
+}
+
+.merge-candidates__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.merge-candidates__option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'name meta'
+    'ids ids';
+  gap: 2px 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.merge-candidates__option:hover {
+  border-color: var(--line-strong);
+}
+
+.merge-candidates__option--selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
   box-shadow: inset 3px 0 var(--accent);
 }
 
-.identity-page .account-card--editing .account-card__actions {
-  grid-column: 1 / -1;
-  justify-content: flex-start;
-  padding-top: 8px;
+.merge-candidates__name {
+  grid-area: name;
+  font-size: 14px;
+  overflow-wrap: anywhere;
 }
 
-.identity-page .account-card .button {
-  min-height: 36px;
+.merge-candidates__meta {
+  grid-area: meta;
+  font-size: 12px;
+  color: var(--ink-faint);
+  white-space: nowrap;
 }
+
+.merge-candidates__ids {
+  grid-area: ids;
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.rename-dialog__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------ 详情 */
 
 .identity-detail {
-  grid-column: 1 / -1;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
   min-width: 0;
-  padding: 16px;
-  border-radius: 10px;
-  background: var(--paper-sunken, #f3eee3);
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--paper);
+  border: 1px solid var(--line);
 }
 
 .identity-detail__section {
@@ -146,8 +519,18 @@
 }
 
 .identity-detail__section h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 0 0 10px;
   font-size: 13px;
+}
+
+.identity-detail__count {
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
 }
 
 .identity-detail__section .page__hint {
@@ -166,6 +549,7 @@
 
 .identity-detail__row code {
   overflow-wrap: anywhere;
+  font-size: 12px;
 }
 
 .identity-detail__memory {
@@ -178,44 +562,71 @@
 }
 
 .identity-detail__error {
-  color: var(--danger, #a33);
+  color: var(--danger);
   font-size: 12px;
 }
+
+/* ------------------------------------------------------------ 窄屏 */
 
 @media (max-width: 800px) {
   .identity-heading {
     flex-direction: column;
-    gap: 4px;
+    align-items: flex-start;
+    gap: 2px;
   }
 
-  .identity-help {
-    max-width: none;
+  .person-row {
+    padding: 12px;
   }
 
-  .identity-page .account-card {
-    grid-template-columns: minmax(0, 1fr) auto;
+  /* 窄屏：姓名与操作分两行，操作占满一行方便点按。 */
+  .person-row__main {
+    grid-template-columns: auto minmax(0, 1fr);
     gap: 10px;
   }
 
-  .identity-page .account-card__accounts {
+  .person-row__actions {
     grid-column: 1 / -1;
-    grid-row: 2;
+    justify-content: flex-start;
   }
 
-  .identity-page .account-card__head {
-    align-items: center;
-  }
-
-  .identity-page .account-card .button {
+  .person-row__actions .button {
     min-height: 44px;
+    flex: 1 1 auto;
   }
 
-  .identity-page .account-card--editing .account-card__actions {
-    grid-row: 3;
+  .merge-dialog,
+  .rename-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 24px);
+    padding: 14px;
+  }
+
+  .merge-dialog__parties {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .merge-dialog__actions .button,
+  .rename-dialog__actions .button {
+    min-height: 44px;
+    flex: 1 1 auto;
+  }
+
+  .merge-candidates__option {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'name'
+      'meta'
+      'ids';
+    padding: 10px;
+    min-height: 56px;
+  }
+
+  .merge-candidates__meta {
+    white-space: normal;
   }
 
   .identity-detail {
     grid-template-columns: minmax(0, 1fr);
-    grid-row: auto;
   }
 }

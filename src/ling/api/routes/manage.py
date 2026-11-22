@@ -1318,6 +1318,43 @@ def _account_row(a: object) -> dict:
     }
 
 
+async def _merged_member_counts(session: DbSession, subject_ids: list[str]) -> dict[str, int]:
+    """这一页每个 subject 被多少个身份**并入**（一条 `GROUP BY`，与账号无关）。
+
+    ## 计数为什么必须由服务端给
+
+    `merged_into` 指向某一行的记录，在列表里是**别的行**，可能在别的页、也可能
+    被 `q` 筛掉。前端拿不到它们，就不可能自己算准——早先"把成员折进目标行"的
+    做法，在"按目标账号搜索"时直接失效（成员不在结果里，于是同一行凭空变空）。
+    所以数量由服务端给，且**只给数量**：成员明细由详情接口按整组返回。
+
+    ## 为什么不和账号查询合并成一条
+
+    账号表里没有账号的 subject 一行都不返回。把它与账号查询 OUTER JOIN 起来，
+    "没有账号但有人并入"的那一行就必须再补一条查询——实测那正好把页面的业务
+    查询从 4 条推到 5 条，而这条查询在数据量增长时仍是一条（不随行数增长）。
+    与其用一条更复杂的 SQL 换一个更好看的数字，不如老实承认这里多了一次聚合，
+    并在 `test_manage_subjects_paging.py` 里把预算与理由一起写清。
+
+    多级合并（A→B→C）只数直接指向本行的记录，与"拆开这一行能看到几条"一致。
+    成环的历史脏数据不会让这里死循环——它只是一次 `GROUP BY`。
+    """
+    from sqlalchemy import func, select
+
+    from ling.infra.models import Subject
+
+    if not subject_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Subject.merged_into, func.count())
+            .where(Subject.merged_into.in_(subject_ids))
+            .group_by(Subject.merged_into)
+        )
+    ).all()
+    return {target: int(count) for target, count in rows if target is not None}
+
+
 async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> dict[str, list[dict]]:
     """只取这一页的账号，仍然是一条 SQL（不是逐条再查）。"""
     from sqlalchemy import select
@@ -1343,7 +1380,13 @@ async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> di
     return by_subject
 
 
-def _subject_row(s: Subject, by_subject: dict[str, list[dict]], *, operator: bool) -> dict:
+def _subject_row(
+    s: Subject,
+    by_subject: dict[str, list[dict]],
+    merged_counts: dict[str, int],
+    *,
+    operator: bool,
+) -> dict:
     """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
     return {
         "subject_id": s.id,
@@ -1352,6 +1395,7 @@ def _subject_row(s: Subject, by_subject: dict[str, list[dict]], *, operator: boo
         "merged_into": s.merged_into,
         "can_rename": operator and s.merged_into is None,
         "accounts": by_subject.get(s.id, []),
+        "merged_member_count": merged_counts.get(s.id, 0),
     }
 
 
@@ -1451,12 +1495,16 @@ async def list_subjects(
         )
 
     page, total = await _subjects_page(session, where, limit, offset)
-    by_subject = await _accounts_by_subject(session, [s.id for s in page])
+    page_ids = [s.id for s in page]
+    by_subject = await _accounts_by_subject(session, page_ids)
+    merged_counts = await _merged_member_counts(session, page_ids)
 
     return {
         "schema_version": SCHEMA_VERSION,
         "subjects": [
-            _subject_row(s, by_subject, operator=auth.user.role in {"owner", "admin"})
+            _subject_row(
+                s, by_subject, merged_counts, operator=auth.user.role in {"owner", "admin"}
+            )
             for s in page
         ],
         "limit": limit,

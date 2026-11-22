@@ -219,8 +219,14 @@ async def test_page_query_touches_only_this_page_of_accounts(logged_in: TestEnv)
     assert len(listing["subjects"]) == 50
 
     business = [s for s in statements if "FROM subjects" in s or "FROM actor_accounts" in s]
-    # 鉴权链里有 1 条 subjects 查询（按 user），业务侧是"一页 + count + 这一页的账号"
-    assert len(business) <= 4, f"业务查询条数偏多：{business}"
+    # 鉴权链里有 1 条 subjects 查询（按 user）；业务侧是：
+    # 一页 + count + 这一页的账号 + **这一页的并入计数**（`GROUP BY merged_into`）。
+    #
+    # 第四条是 2026-11 关系页改版新增的：列表要显示「已并入 N 个号」，而并入的
+    # 记录是别的行、可能在别的页，前端算不出来。它是一条 `GROUP BY`，条数不随
+    # 数据量增长，所以把预算从 4 提到 5——**这是需求变化，不是性能回退**。
+    # 真正要守住的两件事仍在下面各自断言：账号一条 SQL 取回、按这一页的 id 收窄。
+    assert len(business) <= 5, f"业务查询条数偏多：{business}"
     assert (
         not any("SELECT subjects.id," in s and "WHERE subjects.id = $1" in s for s in business)
         or True

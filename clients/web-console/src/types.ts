@@ -1705,6 +1705,14 @@ export interface SubjectRow {
   merged_into: string | null;
   can_rename?: boolean;
   accounts: AccountRow[];
+  /**
+   * 有多少身份**并入**了这一行。
+   *
+   * 列表只显示这个数（「已并入 3 个号」），不展开成员：成员记录在列表里是
+   * 别的行、可能在别的页，为了这一句把它全取回来会让首屏重新变重。
+   * 成员明细由详情接口按整组返回。
+   */
+  merged_member_count?: number;
 }
 
 /**

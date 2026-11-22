@@ -1499,6 +1499,13 @@ class SubjectRow(StrictModel):
     merged_into: IdStr | None = None
     can_rename: bool = False
     accounts: list[SubjectAccountOut] = Field(default_factory=list)
+    # 有多少身份**并入**了这一行（``merged_into`` 指向本行、且未被再次合并走的记录数）。
+    #
+    # 为什么需要这个计数：这些记录在列表里是**别的行**，可能在别的页、也可能被
+    # 搜索筛掉。前端要能说"这个人身上并入了几个号"，但不能为了这一句去展开
+    # 全量记录——那正是关系页卡死的成因。计数只回答"有几个"，明细留给详情接口
+    # （它本来就按整组返回账号）。
+    merged_member_count: int = Field(default=0, ge=0)
 
 
 class SubjectsPage(StrictModel):
