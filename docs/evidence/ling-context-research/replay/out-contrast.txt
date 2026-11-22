@@ -1,0 +1,19 @@
+case	A_old	B_anchor	C_quote	old_in_annotated	history	evidence	summary	skip	chars
+A1B1C1	True	True	True	True	2	0	0		316
+A1B1C0	True	True	False	True	2	0	0		280
+A1B0C1	True	False	True	True	2	0	0		303
+A1B0C0	True	False	False	True	2	0	0		267
+A0B1C1	False	True	True	True	1	0	0		307
+A0B1C0	False	True	False	False	1	0	0		271
+A0B0C1	False	False	True	True	1	0	0		294
+A0B0C0	False	False	False	False	1	0	0		258
+
+RAW_JSONL_START
+{"case": "A1B1C1", "A_old_in_hist": true, "B_anchor_in_turn": true, "C_quote_injected": true, "old_fragment_in_annotated": true, "n_history": 2, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 316, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A1B1C0", "A_old_in_hist": true, "B_anchor_in_turn": true, "C_quote_injected": false, "old_fragment_in_annotated": true, "n_history": 2, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 280, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A1B0C1", "A_old_in_hist": true, "B_anchor_in_turn": false, "C_quote_injected": true, "old_fragment_in_annotated": true, "n_history": 2, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 303, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A1B0C0", "A_old_in_hist": true, "B_anchor_in_turn": false, "C_quote_injected": false, "old_fragment_in_annotated": true, "n_history": 2, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 267, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A0B1C1", "A_old_in_hist": false, "B_anchor_in_turn": true, "C_quote_injected": true, "old_fragment_in_annotated": true, "n_history": 1, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 307, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A0B1C0", "A_old_in_hist": false, "B_anchor_in_turn": true, "C_quote_injected": false, "old_fragment_in_annotated": false, "n_history": 1, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 271, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A0B0C1", "A_old_in_hist": false, "B_anchor_in_turn": false, "C_quote_injected": true, "old_fragment_in_annotated": true, "n_history": 1, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 294, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
+{"case": "A0B0C0", "A_old_in_hist": false, "B_anchor_in_turn": false, "C_quote_injected": false, "old_fragment_in_annotated": false, "n_history": 1, "n_evidence": 0, "n_summary": 0, "skip": "", "annotated_chars": 258, "n_calls": 1, "n_calls_kind": "ContextCompiler.compile", "n_llm_calls": 0, "m12_status": "UNKNOWN_NO_REAL_MODEL_OUTPUT", "source": "COMPILED_INPUT_ONLY__NO_MODEL_OUTPUT"}
