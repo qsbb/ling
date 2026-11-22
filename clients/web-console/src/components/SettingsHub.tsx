@@ -264,6 +264,13 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
     note: '运维动作：看版本、查更新、装更新，以及只读的运行状态。',
     entries: [
       {
+        key: 'backupRestore',
+        label: '整包备份与恢复',
+        verb: '创建完整恢复点，导入前核对版本与数据覆盖，并从宿主单命令入口恢复。',
+        path: '/settings/backup-restore',
+        testid: 'open-backup-restore',
+      },
+      {
         key: 'about',
         label: '关于与版本',
         verb: '查看当前版本与构建提交；手动检查 GitHub 上有没有新 Release，并按门禁安装。',

@@ -42,6 +42,8 @@ export type Route =
    * 是设置子页——渠道配置属于实例运维，不是她那一边的内容。
    */
   | { name: 'connectors' }
+  /** 整包备份与导入恢复（设置子页；宿主单命令入口见 deploy/backup/restore_full.py）。 */
+  | { name: 'backupRestore' }
   /** 运行日志（`GET /v1/logs`）。一级导航项，不是设置子页。 */
   | { name: 'logs' }
   /** 旧地址命中精确重定向表：由壳层用 `replace` 换掉，不是一页内容。 */
@@ -93,6 +95,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings/privacy') return { name: 'privacy' };
   if (path === '/settings/about') return { name: 'about' };
   if (path === '/settings/connectors') return { name: 'connectors' };
+  if (path === '/settings/backup-restore') return { name: 'backupRestore' };
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
   // 「关系」是一级页：它和 `/persona`、`/life` 平级，不是 `/settings/*` 的子项。
@@ -159,6 +162,8 @@ export function routePath(route: Route): string {
       return '/settings/about';
     case 'connectors':
       return '/settings/connectors';
+    case 'backupRestore':
+      return '/settings/backup-restore';
     case 'logs':
       return '/logs';
     case 'chat':

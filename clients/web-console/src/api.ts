@@ -1523,6 +1523,52 @@ export const api = {
       ...(signal ? { signal } : {}),
     });
   },
+
+  /* ------------------------------------------------ 整包备份与导入恢复 */
+
+  backupRestoreStatus(signal?: AbortSignal): Promise<{
+    package_dir: string;
+    packages: Array<{
+      name: string;
+      version?: string | null;
+      commit?: string | null;
+      migration?: string | null;
+      artifact?: string | null;
+    }>;
+    requests: Array<Record<string, unknown>>;
+    target_arch: string;
+  }> {
+    return request('/v1/backup-restore/status', { cache: 'no-store', ...(signal ? { signal } : {}) });
+  },
+  backupRestoreInspect(name: string, signal?: AbortSignal): Promise<{
+    ok: boolean;
+    errors: string[];
+    warnings: string[];
+    manifest?: Record<string, unknown>;
+    deploy_env?: string;
+    required_bytes?: number;
+  }> {
+    return request(`/v1/backup-restore/packages/${encodeURIComponent(name)}/inspect`, {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+  backupRestoreCreate(body: { note: string }): Promise<{ request_id: string; status: string }> {
+    return request('/v1/backup-restore/backups', jsonInit('POST', body));
+  },
+  backupRestorePreflight(body: { package: string; target_version?: string }): Promise<{
+    request_id: string;
+    status: string;
+  }> {
+    return request('/v1/backup-restore/imports/preflight', jsonInit('POST', body));
+  },
+  backupRestoreConfirm(body: { package: string; target_version?: string; confirm: boolean }): Promise<{
+    request_id: string;
+    status: string;
+    preflight: { ok: boolean; errors: string[] };
+  }> {
+    return request('/v1/backup-restore/imports/confirm', jsonInit('POST', body));
+  },
 };
 
 export type { UserInfo };

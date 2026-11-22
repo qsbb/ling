@@ -8,6 +8,7 @@ import { DashboardPage } from './components/DashboardPage';
 import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
 import { ConnectorsPage } from './components/ConnectorsPage';
+import { BackupRestorePage } from './components/BackupRestorePage';
 import { LifeNowPage } from './components/LifeNowPage';
 import { LiveHeader, LiveStopDialog, useCurrentLive } from './components/LiveControls';
 import { LivePage } from './components/LivePage';
@@ -108,6 +109,8 @@ export function mainPage(props: MainPageProps): ReactElement {
     case 'connectors':
       // 接入器：只读诊断（值在宿主 `.env`，页面不给编辑入口）。
       return <ConnectorsPage onBack={goSettings} />;
+    case 'backupRestore':
+      return <BackupRestorePage onBack={goSettings} />;
     case 'persona':
       return <PersonaPage onBack={goChat} />;
     case 'legacyRedirect':

@@ -199,6 +199,7 @@ const ROUTE_NAME_SET = {
   account: true,
   about: true,
   connectors: true,
+  backupRestore: true,
   logs: true,
   legacyRedirect: true,
   notFound: true,
