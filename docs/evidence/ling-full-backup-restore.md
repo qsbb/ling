@@ -140,7 +140,9 @@ command -v pg_dump        -> pg_dump-missing
 
 ## 8. 交付状态
 
-最终提交：`947196811853635447f8f0b5fcb782fd573cc40f`
+功能提交：`29891a152bb7e8669b70854d183a3c4a3d04c0b1`
+
+最终 HEAD：以交付工作树 `git rev-parse HEAD` 为准；本报告回填提交位于功能提交之后。
 
 提交信息：`feat(backup): 增加整包备份与导入恢复流程`
 
