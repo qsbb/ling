@@ -10,7 +10,7 @@ a. 链完整性（纯静态，不需要数据库）：revision 唯一、down_rev
    单 head、从 root 到 head 拓扑有序且覆盖所有迁移文件；
 b. 真实 upgrade：在临时数据库上 ``alembic upgrade head``，抽查关键表、
    关键偏索引与 ``alembic_version``；
-c. downgrade 冒烟：最近两个迁移 downgrade 后再 upgrade 回 head；
+c. downgrade 冒烟：回退最近两层迁移后再 upgrade 回 head；
 d. ``alembic check``：没有待生成迁移；
 e. 建表对照：对比两个干净 PostgreSQL 库的默认值、约束等，并单独核对迁移种子。
 
@@ -701,15 +701,20 @@ def test_media_reference_upgrade_preserves_legacy_rows_and_accepts_long_values()
         ]
 
 
-def test_recent_two_migrations_downgrade_then_upgrade(
+def test_recent_migrations_downgrade_then_upgrade(
     migrated_db: MigratedDatabase,
 ) -> None:
-    assert len(migrated_db.order) >= 3
-    target = migrated_db.order[-3]
+    migrations = _chain().migrations
+    # Alembic cannot resolve a relative downgrade through a merge revision.
+    (target,) = {
+        ancestor
+        for parent in migrations[migrated_db.head].down_revisions
+        for ancestor in migrations[parent].down_revisions
+    }
     config = _alembic_config(migrated_db.url)
     with _database_url_env(migrated_db.url):
         try:
-            command.downgrade(config, "-2")
+            command.downgrade(config, target)
             assert _current_version(migrated_db.url) == target
         finally:
             command.upgrade(config, "head")
@@ -1393,7 +1398,7 @@ def test_0064_downgrade_does_not_restore_data() -> None:
     """降级**不还原数据**：不报错、不写入，只记 warning。
 
     为什么不是 raise：仓库里没有任何其他迁移在 downgrade 里 raise，且
-    `alembic downgrade` 必须能沿链回退（`test_recent_two_migrations_*`、
+    `alembic downgrade` 必须能沿链回退（`test_recent_migrations_*`、
     `test_0052_*`、`test_0053_*` 都依赖这点）。
     """
     with _fresh_db_at(_REV_0064) as url:

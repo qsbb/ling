@@ -62,7 +62,10 @@
   },
   "createPersona": {
     "body": {
+      "anti_prompt_injection": "boolean",
+      "anti_prompt_leak": "boolean",
       "boundaries": [],
+      "deny_ai_assistant": "boolean",
       "display_name": "string",
       "name": "string",
       "persona_id": "string",
@@ -87,7 +90,10 @@
   },
   "createPersona/inactive": {
     "body": {
+      "anti_prompt_injection": "boolean",
+      "anti_prompt_leak": "boolean",
       "boundaries": [],
+      "deny_ai_assistant": "boolean",
       "display_name": "string",
       "name": "string",
       "persona_id": "string",
@@ -148,7 +154,10 @@
   },
   "getPersona": {
     "body": {
+      "anti_prompt_injection": "boolean",
+      "anti_prompt_leak": "boolean",
       "boundaries": [],
+      "deny_ai_assistant": "boolean",
       "display_name": "string",
       "name": "string",
       "persona_id": "string",
@@ -366,7 +375,10 @@
       "active_persona_id": "string",
       "items": [
         {
+          "anti_prompt_injection": "boolean",
+          "anti_prompt_leak": "boolean",
           "boundary_count": "integer",
+          "deny_ai_assistant": "boolean",
           "display_name": "string",
           "has_content": "boolean",
           "is_active": "boolean",
@@ -404,7 +416,10 @@
   "persona": {
     "body": {
       "active": "boolean",
+      "anti_prompt_injection": "boolean",
+      "anti_prompt_leak": "boolean",
       "boundaries": [],
+      "deny_ai_assistant": "boolean",
       "display_name": "string",
       "exists": "boolean",
       "name": "string",
@@ -500,7 +515,10 @@
   },
   "updatePersonaById": {
     "body": {
+      "anti_prompt_injection": "boolean",
+      "anti_prompt_leak": "boolean",
       "boundaries": [],
+      "deny_ai_assistant": "boolean",
       "display_name": "string",
       "name": "string",
       "persona_id": "string",

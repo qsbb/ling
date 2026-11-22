@@ -1,6 +1,10 @@
 {
   "ToolStatus.load": {
     "body": {
+      "external_capabilities": [
+        "string"
+      ],
+      "external_plugins": [],
       "manifest_valid": "boolean",
       "plugins": [],
       "profiles": {

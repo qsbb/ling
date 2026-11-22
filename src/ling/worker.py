@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import select, update
 
+from ling.capabilities.external_plugins_service import PLUGIN_COMPLETED_TOPIC
 from ling.config import get_settings, warn_deprecated_env
 from ling.contracts.v1 import CapabilityDescriptor
 from ling.domains.media.errors import MediaRefError
@@ -400,6 +401,13 @@ def handler(topic: str) -> Callable[[Handler], Handler]:
         return fn
 
     return register
+
+
+@handler(PLUGIN_COMPLETED_TOPIC)
+async def handle_plugin_completed(payload: dict) -> None:
+    from ling.capabilities.external_plugins_service import deliver_completed_event
+
+    await deliver_completed_event(payload)
 
 
 @handler("livestream.speech")
@@ -6397,6 +6405,7 @@ MEDIA_EXCLUDED_FROM_MAIN_WORKER: frozenset[str] = frozenset({"media.video.read"}
 # `schedule.*` / `dream.*` / `sleep.*` 由 `life.schedule` 在到期边界投递，
 # 真正的模型调用发生在这些 handler 里（认领事务之外，见 outbox 小节）。
 OUTBOX_TOPICS: frozenset[str] = frozenset({
+    PLUGIN_COMPLETED_TOPIC,
     "commitment.dispatch",
     "dream.generate",
     "livestream.decide",

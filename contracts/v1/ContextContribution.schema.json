@@ -45,7 +45,8 @@
         "goals",
         "capabilities",
         "constraints",
-        "scenario"
+        "scenario",
+        "dialogue_guard"
       ],
       "title": "Lane",
       "type": "string"

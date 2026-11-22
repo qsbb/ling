@@ -466,6 +466,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from ling.api.body_limit import BodySizeLimitMiddleware
     from ling.api.observability import observability_middleware
     from ling.api.routes import actor, auth, chat, health, manage, media, onebot, ops, sessions
+    from ling.api.routes import external_plugins as external_plugins_routes
     from ling.api.routes import logs as logs_routes
     from ling.api.routes import persona as persona_routes
     from ling.api.routes import recall as recall_routes
@@ -515,6 +516,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(media.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(tool_plugins_routes.router, prefix="/v1")
+    app.include_router(external_plugins_routes.router, prefix="/v1")
     app.include_router(actor.router, prefix="/v1")
     # 多套人格（`/v1/personas`）：列表/新建/详情/编辑/删除/切换。
     # 与 `actor.py` 里的单例 `/v1/persona`（= 当前激活人格的快捷方式）并存。
