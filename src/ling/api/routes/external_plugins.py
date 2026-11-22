@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from ling.api.deps import CurrentAuth, DbSession, SettingsDep
 from ling.api.errors import LingError, forbidden, invalid
 from ling.capabilities.external_plugin_contract import RegisterBody
 from ling.capabilities.external_plugins_service import (
     ExternalPluginService,
+    PluginIdentityMismatch,
     PluginServiceError,
     to_public,
 )
@@ -96,6 +97,10 @@ async def enable_plugin(
     service = _service(request, session)
     try:
         row = await service.set_enabled(plugin_id, body.enabled)
+    except PluginIdentityMismatch as exc:
+        # Persist the quarantine even though the requested enable failed.
+        await session.commit()
+        raise invalid(str(exc)) from exc
     except PluginServiceError as exc:
         raise invalid(str(exc)) from exc
     return to_public(row)
@@ -122,6 +127,9 @@ async def sync_plugin(
     service = _service(request, session)
     try:
         row = await service.sync(plugin_id)
+    except PluginIdentityMismatch as exc:
+        await session.commit()
+        raise invalid(str(exc)) from exc
     except PluginServiceError as exc:
         raise invalid(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - same boundary as register

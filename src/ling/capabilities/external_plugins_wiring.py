@@ -14,9 +14,13 @@ from typing import Any
 from ling.capabilities.external_plugins_service import (
     COMMAND_PREFIX,
     ExternalPluginService,
+    PluginServiceError,
+    _as_list,
+    allows,
     to_public,
 )
-from ling.capabilities.tools import ToolRisk, ToolRegistry, ToolSpec
+from ling.capabilities.tools import ToolHandler, ToolRisk, ToolSpec
+from ling.infra.db import session_scope, short_session_scope
 from ling.infra.models import ExternalPluginRow
 
 EXPLICIT_COMMAND_PATTERN = re.compile(
@@ -68,36 +72,35 @@ def external_tool_spec(
     )
 
 
-def external_tool_handler(
-    plugin: ExternalPluginRow, name: str, *, service: ExternalPluginService
-) -> Any:
+def external_tool_handler(plugin: ExternalPluginRow, name: str) -> ToolHandler:
+    plugin_id, updated_at = plugin.id, plugin.updated_at
+
     async def handler(args: dict[str, Any]) -> str:
-        return await service.invoke(
-            plugin=plugin,
-            method="tools.call",
-            params={"tool": name, "arguments": args},
-        )
+        async with session_scope() as session:
+            service = ExternalPluginService(session)
+            current = await service.get(plugin_id)
+            if current is None or current.updated_at != updated_at:
+                raise PluginServiceError("插件登记已变更")
+            return await service.invoke(
+                plugin=current,
+                method="tools.call",
+                params={"tool": name, "arguments": args},
+            )
 
     return handler
 
 
-def register_external_tools(
-    registry: ToolRegistry, plugin: ExternalPluginRow, *, service: ExternalPluginService
-) -> list[str]:
-    """Register this plugin's declared tools into the given per-turn registry."""
-    registered: list[str] = []
-    for declaration in _declarations(plugin, "tools"):
-        spec = external_tool_spec(plugin, declaration)
-        if spec is None:
-            continue
-        name = str(declaration.get("name") or "")
-        registry.register(
-            spec,
-            external_tool_handler(plugin, name, service=service),
-            replace=True,
-        )
-        registered.append(spec.tool_id)
-    return registered
+async def load_external_tools() -> list[tuple[ToolSpec, ToolHandler]]:
+    definitions: list[tuple[ToolSpec, ToolHandler]] = []
+    async with short_session_scope() as session:
+        for plugin in await ExternalPluginService(session).enabled_plugins():
+            if not allows(plugin, "tools"):
+                continue
+            for declaration in _declarations(plugin, "tools"):
+                spec = external_tool_spec(plugin, declaration)
+                if spec is not None:
+                    definitions.append((spec, external_tool_handler(plugin, declaration["name"])))
+    return definitions
 
 
 def find_command(plugin: ExternalPluginRow, name: str) -> dict[str, Any] | None:
@@ -108,8 +111,6 @@ def find_command(plugin: ExternalPluginRow, name: str) -> dict[str, Any] | None:
 
 
 def _declarations(plugin: ExternalPluginRow, key: str) -> list[dict[str, Any]]:
-    from ling.capabilities.external_plugins_service import _as_list
-
     return [item for item in _as_list(getattr(plugin, key)) if isinstance(item, dict)]
 
 

@@ -26,22 +26,20 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.capabilities.external_plugins_service import (
+    ExternalPluginService,
+    PluginServiceError,
+)
+from ling.capabilities.external_plugins_wiring import (
+    find_command,
+    load_external_tools,
+    parse_external_command,
+)
 from ling.capabilities.tool_plugins import (
     PluginManifestError,
     load_tool_plugins,
     parse_plugin_command,
     register_tool_plugin,
-)
-from ling.capabilities.external_plugins_service import (
-    COMMAND_PREFIX,
-    ExternalPluginService,
-    PluginServiceError,
-)
-from ling.capabilities.external_plugins_wiring import (
-    external_tool_id,
-    find_command,
-    parse_external_command,
-    register_external_tools,
 )
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
@@ -126,7 +124,7 @@ from ling.ports.model import (
 
 if TYPE_CHECKING:
     from ling.capabilities.tag_specs import TurnEnvironment
-    from ling.capabilities.tools import ToolRegistry, ToolResult, ToolSpec
+    from ling.capabilities.tools import ToolHandler, ToolRegistry, ToolResult, ToolSpec
     from ling.capabilities.voice_reply import PreparedVoice, VoiceReplyService
     from ling.config import Settings
     from ling.domains.memory.service import MemoryHit
@@ -1190,18 +1188,19 @@ class TurnCoordinator:
 
                 # 外部插件的显式用户命令：/plugincmd <plugin_id> <command> <text>
                 # 不在模型回路里执行，但仍受同一受众门（非密封私聊、首次尝试）约束。
+                audience = compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
+                external_scope = (
+                    audience is not None
+                    and not audience.is_group
+                    and audience.mode is not IsolationMode.sealed
+                    and attempt == 1
+                )
                 ext_command = parse_external_command(user_text)
                 if ext_command is not None:
-                    _ext_audience = (
-                        compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
-                    )
                     ext_allowed = (
                         self._tool_calls_enabled is not False
                         and config.dialogue.tools_enabled
-                        and _ext_audience is not None
-                        and not _ext_audience.is_group
-                        and _ext_audience.mode is not IsolationMode.sealed
-                        and attempt == 1
+                        and external_scope
                     )
                     if not ext_allowed:
                         delivered = "外部插件命令只在非密封私聊中使用，这次没有发送内容。"
@@ -1272,30 +1271,16 @@ class TurnCoordinator:
                 tool_rounds = _ToolRounds()
                 # 外部插件工具：管理员登记 + 授予 tools + 本轮受众允许才注册。
                 # 注册在 run_turn 的 async 上下文里完成；账本函数本身是同步的。
-                external_tool_defs: list[tuple[Any, Any, Any]] = []
-                if self._settings is not None:
+                external_tool_defs: list[tuple[ToolSpec, ToolHandler]] = []
+                if (
+                    self._settings is not None
+                    and self._tool_registry is None
+                    and config.dialogue.tools_enabled
+                    and self._tool_calls_enabled is not False
+                    and external_scope
+                ):
                     try:
-                        async with session_scope() as ext_session:
-                            ext_service = ExternalPluginService(ext_session)
-                            for ext_row in await ext_service.enabled_plugins():
-                                if "tools" not in _ext_list(ext_row.granted_capabilities):
-                                    continue
-                                from ling.capabilities.external_plugins_wiring import (
-                                    external_tool_handler,
-                                    external_tool_spec,
-                                )
-                                from ling.capabilities.external_plugins_service import _as_list
-
-                                for decl in _as_list(ext_row.tools):
-                                    if not isinstance(decl, dict):
-                                        continue
-                                    spec = external_tool_spec(ext_row, decl)
-                                    if spec is None:
-                                        continue
-                                    handler = external_tool_handler(
-                                        ext_row, str(decl.get("name")), service=ext_service
-                                    )
-                                    external_tool_defs.append((ext_row, spec, handler))
+                        external_tool_defs = await load_external_tools()
                     except Exception:  # noqa: BLE001 - plugin registration must not break a turn
                         logger.info("外部插件工具本轮不可用")
                 tool_ledger = self._tool_ledger_for_turn(
@@ -1305,9 +1290,7 @@ class TurnCoordinator:
                     user_text=user_text,
                     attempt=attempt,
                     external_tool_defs=external_tool_defs,
-                    audience=(
-                        compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
-                    ),
+                    audience=audience,
                     memory_sources=compiled.memory_sources,
                 )
                 tool_ledger.turn_id = turn_id
@@ -3153,7 +3136,7 @@ class TurnCoordinator:
         window_id: str | None = None,
         user_text: str = "",
         attempt: int = 1,
-        external_tool_defs: Sequence[tuple[Any, Any, Any]] = (),
+        external_tool_defs: Sequence[tuple[ToolSpec, ToolHandler]] = (),
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -3254,14 +3237,12 @@ class TurnCoordinator:
         # external_tool_defs 由 async 调用方预先收集（spec + handler），
         # 在本轮的 registry 上同步注册，避免污染全局默认注册表。
         external_tool_ids: set[str] = set()
-        for _ext_row, _ext_spec, _ext_handler in external_tool_defs:
-            if registry is None:
-                break
-            try:
-                registry.register(_ext_spec, _ext_handler, replace=True)
-                external_tool_ids.add(_ext_spec.tool_id)
-            except Exception:  # noqa: BLE001 - one bad plugin must not break the turn
-                logger.info("外部插件工具注册失败")
+        if registry is not None and not explicit_tool_id:
+            name_counts = Counter(spec.tool_id for spec, _ in external_tool_defs)
+            for spec, handler in external_tool_defs:
+                if name_counts[spec.tool_id] == 1 and registry.spec(spec.tool_id) is None:
+                    registry.register(spec, handler)
+                    external_tool_ids.add(spec.tool_id)
         definitions = tuple(
             _definition_from_spec(spec)
             for spec in registry.list_model_tools()
@@ -3282,7 +3263,7 @@ class TurnCoordinator:
         return _ToolLedger(
             registry=registry,
             explicit_tool_id=explicit_tool_id,
-            external_subject_id=audience.subject_id if explicit_tool_id and audience else "",
+            external_subject_id=audience.subject_id if audience else "",
             external_tool_ids=frozenset(external_tool_ids),
             availability=ToolAvailability(
                 enabled=True,
@@ -3678,7 +3659,7 @@ class TurnCoordinator:
             if schema_problem:
                 _reject("invalid_arguments", schema_problem, outcome="failed")
                 continue
-            if ledger.explicit_tool_id:
+            if ledger.explicit_tool_id or call.name in ledger.external_tool_ids:
                 try:
                     async with session_scope() as current:
                         policy = await AwarenessService(current).policy(ledger.external_subject_id)
@@ -3849,21 +3830,6 @@ def _encode_tool_results(
         payload["detail"] = detail
     payload["error"] = error
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _ext_list(value: object) -> list[Any]:
-    """Decode a JSON capability column without trusting its runtime type."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            import json as _json
-
-            parsed = _json.loads(value)
-        except ValueError:
-            return []
-        return parsed if isinstance(parsed, list) else []
-    return []
 
 
 def _tool_error(code: str, message: str) -> dict[str, str]:

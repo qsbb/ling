@@ -16,26 +16,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling import __version__ as HOST_VERSION
 from ling.capabilities.external_plugin_contract import (
-    SUPPORTED_CAPABILITIES,
-    ExternalPluginError,
     HostCall,
     HostResult,
-    InvokeFailure,
     PluginManifest,
     RegisterBody,
     version_in_range,
 )
 from ling.capabilities.external_plugins_client import (
     PluginClient,
-    PluginHealth,
     PluginRejected,
     PluginUnavailable,
 )
 from ling.capabilities.tool_plugins import (
     MANIFEST_NAME as LEGACY_MANIFEST_NAME,
+)
+from ling.capabilities.tool_plugins import (
     load_tool_plugins,
 )
 from ling.contracts.v1 import new_id
+from ling.infra.db import short_session_scope
 from ling.infra.models import ExternalPluginRow, ExternalPluginStateRow
 
 MAX_STATE_VALUE_CHARS = 4096
@@ -51,6 +50,10 @@ class PluginServiceError(RuntimeError):
     """Safe-to-display service error with no endpoint or secret details."""
 
 
+class PluginIdentityMismatch(PluginServiceError):
+    """The endpoint presented a different manifest identity."""
+
+
 def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
@@ -61,6 +64,15 @@ def _as_list(value: Any) -> list[Any]:
             return []
         return parsed if isinstance(parsed, list) else []
     return []
+
+
+def allows(plugin: ExternalPluginRow, capability: str) -> bool:
+    return (
+        plugin.enabled
+        and plugin.status in {"ready", "registered"}
+        and capability in _as_list(plugin.capabilities)
+        and capability in _as_list(plugin.granted_capabilities)
+    )
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -141,8 +153,7 @@ class ExternalPluginService:
         if row is None:
             raise PluginServiceError("插件不存在")
         manifest = await self._client.fetch_manifest(row.endpoint)
-        if manifest.id != plugin_id:
-            raise PluginServiceError("插件 ID 与端点声明不一致")
+        await self._verify_identity(row, manifest)
         row.name = manifest.name
         row.version = manifest.version
         row.api_version = manifest.api_version
@@ -175,10 +186,12 @@ class ExternalPluginService:
                 row.updated_at = datetime.now(UTC)
                 await self._session.flush()
                 raise PluginServiceError("插件不可用，未启用")
+            assert health.manifest is not None
+            await self._verify_identity(row, health.manifest)
             if not version_in_range(
                 HOST_VERSION,
-                minimum=health.manifest.min_host_version,  # type: ignore[union-attr]
-                maximum=health.manifest.max_host_version,  # type: ignore[union-attr]
+                minimum=health.manifest.min_host_version,
+                maximum=health.manifest.max_host_version,
             ):
                 row.status = "incompatible"
                 row.last_error = "插件与当前 Ling 版本不兼容"
@@ -193,8 +206,19 @@ class ExternalPluginService:
         await self._session.flush()
         return row
 
+    async def _verify_identity(self, row: ExternalPluginRow, manifest: PluginManifest) -> None:
+        if manifest.id == row.id:
+            return
+        error = PluginIdentityMismatch("插件 ID 与端点声明不一致，已停用")
+        row.enabled = False
+        row.status = "identity_mismatch"
+        row.last_error = str(error)
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+        raise error
+
     async def unregister(self, plugin_id: str) -> None:
-        row = await self.get(plugin_id)
+        row = await self._session.get(ExternalPluginRow, plugin_id, with_for_update=True)
         if row is None:
             raise PluginServiceError("插件不存在")
         await self._session.execute(
@@ -211,7 +235,7 @@ class ExternalPluginService:
             raise PluginServiceError("插件不存在")
         health = await self._client.health(row.endpoint)
         result = to_public(row)
-        result["reachable"] = health.ok
+        result["reachable"] = health.ok and health.manifest is not None and health.manifest.id == plugin_id
         result["health_checked_at"] = health.checked_at.isoformat() if health.checked_at else None
         return result
 
@@ -234,52 +258,59 @@ class ExternalPluginService:
             for plugin in plugins
         ]
 
-    def host_call_executor(self, plugin: ExternalPluginRow) -> Any:
-        """Only host.state calls that were declared AND granted are executed."""
-        granted = set(_as_list(plugin.granted_capabilities))
-        allowed = "host.state" in granted and "host.state" in _as_list(plugin.capabilities)
+    def host_call_executor(
+        self, plugin: ExternalPluginRow, *, invocation_capability: str = "host.state"
+    ) -> Any:
+        plugin_id, endpoint, created_at = plugin.id, plugin.endpoint, plugin.created_at
 
         async def execute(calls: list[HostCall], request_id: str) -> list[HostResult]:
-            results: list[HostResult] = []
-            for call in calls:
-                if not allowed or call.capability != "host.state":
-                    results.append(
+            # Check the registration under the same short transaction as the state
+            # operation. Release the lock before sending results over HTTP.
+            async with short_session_scope() as session:
+                current = await session.get(ExternalPluginRow, plugin_id, with_for_update=True)
+                if (
+                    current is None
+                    or current.endpoint != endpoint
+                    or current.created_at != created_at
+                    or not allows(current, invocation_capability)
+                    or not allows(current, "host.state")
+                ):
+                    return [
                         HostResult(call_id=call.call_id, ok=False, error="capability_not_granted")
-                    )
-                    continue
-                if len(call.key) > 128 or (call.value is not None and len(call.value) > MAX_STATE_VALUE_CHARS):
-                    results.append(
-                        HostResult(call_id=call.call_id, ok=False, error="state_value_too_large")
-                    )
-                    continue
-                try:
-                    value = await self._state(plugin.id, call)
+                        for call in calls
+                    ]
+                results: list[HostResult] = []
+                for call in calls:
+                    if call.value is not None and len(call.value) > MAX_STATE_VALUE_CHARS:
+                        results.append(
+                            HostResult(call_id=call.call_id, ok=False, error="state_value_too_large")
+                        )
+                        continue
+                    value = await self._state(session, plugin_id, call)
                     results.append(HostResult(call_id=call.call_id, ok=True, value=value))
-                except PluginServiceError as exc:
-                    results.append(HostResult(call_id=call.call_id, ok=False, error=str(exc)))
-            return results
+                return results
 
         return execute
 
-    async def _state(self, plugin_id: str, call: HostCall) -> str | None:
+    @staticmethod
+    async def _state(session: AsyncSession, plugin_id: str, call: HostCall) -> str | None:
         now = datetime.now(UTC)
+        row = await session.get(ExternalPluginStateRow, (plugin_id, call.key))
         if call.op == "get":
-            row = await self._session.get(ExternalPluginStateRow, (plugin_id, call.key))
             if row is None:
                 return None
             if row.expires_at is not None and row.expires_at <= now:
-                await self._session.delete(row)
-                await self._session.flush()
+                await session.delete(row)
+                await session.flush()
                 return None
             return row.value
-        row = await self._session.get(ExternalPluginStateRow, (plugin_id, call.key))
         if row is None:
             row = ExternalPluginStateRow(plugin_id=plugin_id, key=call.key)
         row.value = call.value or ""
         row.expires_at = now + timedelta(seconds=DEFAULT_STATE_TTL_SECONDS)
         row.updated_at = now
-        self._session.add(row)
-        await self._session.flush()
+        session.add(row)
+        await session.flush()
         return None
 
     async def invoke(
@@ -293,8 +324,7 @@ class ExternalPluginService:
         if not plugin.enabled or plugin.status not in {"ready", "registered"}:
             raise PluginServiceError("插件未启用")
         cap = "tools" if method == "tools.call" else "commands"
-        granted = set(_as_list(plugin.granted_capabilities))
-        if cap not in granted or cap not in _as_list(plugin.capabilities):
+        if not allows(plugin, cap):
             raise PluginServiceError("插件未获得该能力授权")
         rid = request_id or new_id("plgreq")
         try:
@@ -304,7 +334,7 @@ class ExternalPluginService:
                 method=method,
                 params=params,
                 request_id=rid,
-                host_executor=self.host_call_executor(plugin),
+                host_executor=self.host_call_executor(plugin, invocation_capability=cap),
             )
         except (PluginUnavailable, PluginRejected) as exc:
             await self._mark_failure(plugin, exc)
@@ -357,6 +387,7 @@ __all__ = [
     "COMMAND_PREFIX",
     "LEGACY_COMMAND_PREFIX",
     "ExternalPluginService",
+    "PluginIdentityMismatch",
     "PluginServiceError",
     "to_public",
 ]
