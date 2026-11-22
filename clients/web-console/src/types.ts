@@ -1521,6 +1521,14 @@ export interface LifeTimelineSegment {
 export interface LifeTimelineFact {
   schema_version: string;
   activity_id: string;
+  /**
+   * 活动自身的类型（写作/读书/…）。
+   *
+   * 旧后端缺这个字段，也可能给 null 或给一个映射表里没有的值——三种情况都按
+   * 「说不出她做了什么」处理，界面显示「活动记录」，**不要**拿 `/v1/life/activity`
+   * 的最近 10 条 history 去补名字：那份按 `updated_at` 倒序、与窗口无关。
+   */
+  kind?: string | null;
   /** running / paused / completed / failed。 */
   state: string;
   origin: string;

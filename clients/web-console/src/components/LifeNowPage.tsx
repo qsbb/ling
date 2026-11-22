@@ -122,12 +122,15 @@ export function LifeNowPage({ onBack, liveActivity }: { onBack: () => void; live
 
   const load = useCallback(async () => {
     setError(null);
+    // 时间线是首屏唯一的数据来源：活动名字来自 facts[].kind，
+    // **不**拿 /v1/life/activity 的最近 10 条去补（那份按 updated_at 排序、
+    // 与窗口无关，补出来的名字会和时间线的时间对不上）。
     const [activityResult, timelineResult] = await Promise.allSettled([api.activity(), api.lifeTimeline()]);
     if (activityResult.status === 'fulfilled') setActivity(activityResult.value);
     setTimeline(timelineResult.status === 'fulfilled' ? timelineResult.value : null);
     setTimelineFailed(timelineResult.status === 'rejected');
-    const cause = activityResult.status === 'rejected' ? activityResult.reason
-      : timelineResult.status === 'rejected' ? timelineResult.reason : null;
+    // 首屏只因为**时间线**失败而报错；活动接口失败只影响「更多生活记录」。
+    const cause = timelineResult.status === 'rejected' ? timelineResult.reason : null;
     setError(cause === null ? null : explainError(cause));
   }, []);
 
@@ -162,7 +165,11 @@ export function LifeNowPage({ onBack, liveActivity }: { onBack: () => void; live
         </div>
       ) : null}
 
-      <LifeDay activity={activity} timeline={timeline} timelineFailed={timelineFailed} />
+      <LifeDay
+        timeline={timeline}
+        timelineFailed={timelineFailed}
+        fallbackCurrent={activity?.current ?? null}
+      />
 
       {liveActivity ? <button type="button" className="button button--small" data-testid="life-live"
         onClick={() => navigate('/live')}>{liveActivity} <span aria-hidden="true">›</span></button> : null}

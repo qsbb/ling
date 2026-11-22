@@ -825,3 +825,157 @@
     align-items: center;
   }
 }
+
+/* ============================================================ 当天的合并视图
+ *
+ * 这一组样式对应「一条活动只出现一次」：
+ * - 活动记录落在**它自己真实的时间位置**（段内或被归属），不再在右栏复制一份；
+ * - `clock_only` 收进 `.tl-checks` 折叠组，不占时间线主体；
+ * - 跨午夜的时间按展示窗口裁剪，真实起止另起一行。
+ *
+ * 活动名（`tl-fact__name`）是这一行里最该被先读到的：先知道"做了什么"，
+ * 再谈证据。所以它排第一、用正文色；证据与来源退到后面。
+ */
+
+.tl-fact__name {
+  flex: none;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tl-fact__real {
+  flex-basis: 100%;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 进行中：左侧加一条实线，与"已经结束"的实心块在形状上分开。 */
+.tl-fact--live {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* 没有宿主的记录：虚线边 + 不参与时间列对齐。 */
+.tl-fact--loose {
+  border-style: dashed;
+  background: transparent;
+}
+
+.tl-seg__facts .tl-fact {
+  margin-top: 4px;
+}
+
+/* -------------------------------------------------------------- 时间检查 */
+
+.tl-checks {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-sunken);
+  min-width: 0;
+}
+
+.tl-checks > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 9px;
+  padding: 10px 14px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 12px;
+  list-style: none;
+}
+
+.tl-checks > summary::-webkit-details-marker { display: none; }
+.tl-checks > summary::after {
+  content: '+';
+  order: 9;
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: 15px;
+}
+.tl-checks[open] > summary::after { content: '−'; }
+
+.tl-checks__title { color: var(--ink); font-weight: 600; }
+
+.tl-checks__count {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--paper-raised);
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-checks__hint { color: var(--ink-faint); font-size: 11.5px; overflow-wrap: anywhere; }
+
+.tl-checks__hidden {
+  margin: 0;
+  padding: 0 14px 10px;
+  color: var(--warn);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.tl-checks__list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 6px;
+}
+
+.tl-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 6px 14px;
+  border-top: 1px dotted var(--line-strong);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.tl-check:first-child { border-top: 0; }
+
+.tl-check__time {
+  min-width: 92px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-check__origin,
+.tl-check__label { color: var(--ink-faint); }
+
+.tl-check__label { margin-left: auto; }
+
+/* ---------------------------------------------------------- 不属于任何时段 */
+
+.tl-loose {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line-strong);
+  min-width: 0;
+}
+
+.tl-loose__title {
+  margin: 0 0 7px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.tl-loose__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+/* 合并视图之后不再有右栏，但 `.tl-body` 仍被别处引用；保持单列。 */
+.tl-body { grid-template-columns: minmax(0, 1fr); }

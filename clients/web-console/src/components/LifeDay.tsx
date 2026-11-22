@@ -1,23 +1,17 @@
 import type { ActivityResponse, LifeTimelineOut, LifeTimelineSegment } from '../types';
-import { formatInZone } from './LifeTimeline';
+import {
+  activityName,
+  currentScene,
+  formatInZone,
+  isLiveNow,
+  mergeDayTimeline,
+  nextPlannedSegment,
+} from './LifeTimeline';
 
-const KIND: Record<string, string> = {
-  writing: '写作',
-  write: '写作',
-  reading: '读书',
-  read: '读书',
-  resting: '休息',
-  rest: '休息',
-  walking: '散步',
-  walk: '散步',
-  thinking: '想事情',
-  working: '工作',
-  work: '工作',
-  eating: '吃饭',
-  meal: '吃饭',
-  sleep: '睡觉',
-  listening: '听音乐',
-};
+/*
+ * 活动类型的映射只在 LifeTimeline 里存一份（`activityName`）。这里保留
+ * `activityKind` 这个名字给旧调用点，实现直接委托——两份映射表迟早会漂。
+ */
 
 const INTENT_STATE: Record<string, string> = {
   proposed: '一个念头',
@@ -25,8 +19,9 @@ const INTENT_STATE: Record<string, string> = {
   confirmed: '已确认这天',
 };
 
+/** @deprecated 用 `activityName`：它能在类型缺失/null/未知时说「活动记录」。 */
 export function activityKind(kind: string): string {
-  return KIND[kind] ?? kind.replaceAll('_', ' ');
+  return activityName(kind);
 }
 
 export function futureSegments(timeline: LifeTimelineOut, now = new Date()): LifeTimelineSegment[] {
@@ -69,73 +64,135 @@ export function LifeIllustration({ active }: { active: boolean }) {
 }
 
 interface LifeDayProps {
-  activity: ActivityResponse | null;
   timeline: LifeTimelineOut | null;
   timelineFailed?: boolean;
+  /**
+   * 时间轴拿不到时的兜底来源：`/v1/activity` 的 current。
+   *
+   * 只在**没有时间线**时用它——时间线是首选依据（它带 scene_valid_until，
+   * 能判断情景是否过期）。活动接口没有有效期字段，所以这条路径上情景的有效性
+   * 无从确认；界面据此只写"正在做"，**不写**有效期。
+   */
+  fallbackCurrent?: ActivityResponse['current'] | null;
+  /** 判断"此刻"的参照时刻（测试可钉住）。 */
+  now?: Date;
 }
 
-/** 同一份时间轴的阅读视图；完整层级、事实和诊断仍交给 LifeTimeline。 */
-export function LifeDay({ activity, timeline, timelineFailed = false }: LifeDayProps) {
-  const current = activity?.current?.state === 'running' ? activity.current : null;
-  const future = timeline ? futureSegments(timeline) : [];
-  const facts = timeline?.facts.filter((fact) => fact.state === 'completed'
-    && (fact.evidence_kind === 'observed' || fact.evidence_kind === 'user_confirmed')) ?? [];
-  const activityById = new Map(activity?.history.map((item) => [item.activity_id, item]));
+/**
+ * 首屏阅读视图：此刻 → 接下来 → 今天的安排与已留下的记录。
+ *
+ * 三处口径在这里收敛成一处：**活动记录只从 `mergeDayTimeline()` 来**。
+ * 以前这一块自己按 `state === 'completed'` 另筛了一遍「今天留下的片段」，
+ * 与时间线里那两处的口径都不一样——同一件事在页面上有三种说法。
+ */
+export function LifeDay({ timeline, timelineFailed = false, fallbackCurrent, now }: LifeDayProps) {
+  const at = now ?? new Date();
+  const merged = timeline ? mergeDayTimeline(timeline) : null;
+  const scene = timeline ? currentScene(timeline.facts, at) : null;
+  /*
+   * 时间线读不到时，仍要回答"此刻她是不是在做着什么"——但只能给出活动接口
+   * 明确说的 `running`。计划时段**永远**不能顶替它（那是打算，不是事实）。
+   */
+  const fallbackScene = !timeline && fallbackCurrent?.state === 'running' ? fallbackCurrent : null;
+  const headlineKind = scene ? scene.kind : fallbackScene ? fallbackScene.kind : null;
+  const headlineStart = scene ? scene.started_at : fallbackScene ? fallbackScene.started_at : null;
+  const headlineUntil = scene ? scene.scene_valid_until : null;
+  const next = timeline ? nextPlannedSegment(timeline.segments, at) : null;
+  // 只数不列：内容由完整安排里那一处承担（见下面的渲染注释）。
+  const recentCount = merged ? merged.records.filter((record) => !isLiveNow(record.fact, at)).length : 0;
   const intents = timeline?.intents ?? [];
 
   return (
     <>
-      <section className={`life-hero ${current ? 'life-hero--active' : ''}`} data-testid="life-presence" data-activity={current ? 'running' : 'unknown'}>
+      <section
+        className={`life-hero ${headlineKind ? 'life-hero--active' : ''}`}
+        data-testid="life-presence"
+        data-activity={headlineKind ? 'running' : 'unknown'}
+      >
         <div className="life-hero__copy">
           <div className="life-hero__eyebrow"><span className="life-hero__dot" />此刻的她</div>
-          <h1>{current ? `正在${activityKind(current.kind)}` : '这一刻，还没有她的消息'}</h1>
-          {current?.note ? <p>{current.note}</p> : null}
-          <div className="life-hero__meta">
-            {current?.started_at && timeline ? <span>从 {formatInZone(current.started_at, timeline.display_timezone)} 开始</span> : null}
-            {current?.origin === 'simulated' ? <span>模拟日常</span> : null}
-          </div>
+          {headlineKind ? (
+            <>
+              <h1 data-testid="life-now-headline">正在{activityName(headlineKind)}</h1>
+              <div className="life-hero__meta" data-testid="life-now-basis">
+                {headlineStart ? (
+                  <span>
+                    {formatInZone(headlineStart, timeline?.display_timezone ?? browserTimeZone())} 起
+                  </span>
+                ) : null}
+                {headlineUntil ? (
+                  <span>情景有效至 {formatInZone(headlineUntil, timeline!.display_timezone)}</span>
+                ) : null}
+              </div>
+              {/* 活动接口自带的一句近况；时间线那份事实里没有这个字段，所以只在这里出。 */}
+              {fallbackScene?.note ? (
+                <p className="life-hero__note" data-testid="life-now-note">{fallbackScene.note}</p>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <h1 data-testid="life-now-headline">暂无当前活动记录</h1>
+              <div className="life-hero__meta" data-testid="life-now-basis">
+                <span>情景已经过期，或者这一刻还没有提交过记录</span>
+              </div>
+            </>
+          )}
         </div>
-        <LifeIllustration active={Boolean(current)} />
+        <LifeIllustration active={Boolean(headlineKind)} />
       </section>
+
+      {timeline && next ? (
+        <section className="life-next" data-testid="life-next">
+          <span className="life-next__label">接下来</span>
+          <strong className="life-next__title">{next.title}</strong>
+          <time className="life-next__time">
+            {formatInZone(next.display_start_at, timeline.display_timezone)} 起
+          </time>
+        </section>
+      ) : null}
 
       <section className="life-today" aria-labelledby="life-today-title">
         <div className="life-section-heading">
           <h2 id="life-today-title">今天</h2>
           {timeline ? <time>{dayLabel(timeline.display_date)}</time> : null}
         </div>
-        {future.length > 0 ? (
-          <ol className="life-day-list" data-testid="life-upcoming">
-            {future.slice(0, 4).map((segment) => (
-              <li key={segment.segment_id}>
-                <time>{formatInZone(segment.display_start_at, timeline!.display_timezone)}</time>
-                <span className="life-day-list__line"><i /></span>
-                <div><strong>{segment.title}</strong><span>{formatInZone(segment.display_end_at, timeline!.display_timezone)} 前</span></div>
-              </li>
-            ))}
-          </ol>
-        ) : timelineFailed || timeline?.state === 'unavailable' ? (
+        {timelineFailed || timeline?.state === 'unavailable' ? (
           <p className="life-day-empty">暂时读不到今天的安排。</p>
-        ) : timeline ? (
+        ) : timeline && timeline.segments.length === 0 ? (
           <p className="life-day-empty" data-testid="life-day-empty">
-            {timeline.state === 'empty' ? '今天还没有排日程。' : timeline.segments.length ? '今天的安排里，没有接下来的时段。' : '今天的安排还没有展开。'}
+            {timeline.state === 'empty' ? '今天还没有排日程。' : '今天的安排还没有展开。'}
           </p>
-        ) : <p className="life-day-empty">今天的安排正在读取。</p>}
-        {timeline && facts.length ? (
-          <div className="life-happened" data-testid="life-happened">
-            <h3>今天留下的片段</h3>
-            <ul>
-              {facts.slice(-3).reverse().map((fact) => {
-                const record = activityById.get(fact.activity_id);
-                const timestamp = fact.ended_at ?? fact.started_at;
-                return (
-                  <li key={fact.activity_id}>
-                    {timestamp ? <time>{formatInZone(timestamp, timeline.display_timezone)} · </time> : null}
-                    {record ? activityKind(record.kind) : '活动已结束'}
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
+        ) : timeline ? (
+          /*
+           * 「今天」这一块必须真的给出今天的安排：首屏只有"此刻 + 接下来"时，
+           * 剩下的一天在页面上是空的——读者会以为没有安排。这里列**叶段**，
+           * 父段只作分组（它没有独立的时刻表意义）。
+           */
+          <ol className="life-day-list" data-testid="life-plan-list">
+            {leafSegments(timeline).map((segment) => {
+              const phase = dayPhase(segment, at);
+              return (
+                <li key={segment.segment_id} data-phase={phase} data-testid={`life-plan-${segment.segment_id}`}>
+                  <time>{formatInZone(segment.display_start_at, timeline.display_timezone)}</time>
+                  <span className="life-day-list__line"><i /></span>
+                  <div>
+                    <strong>{segment.title}</strong>
+                    <span>{formatInZone(segment.display_end_at, timeline.display_timezone)} 前</span>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        ) : null}
+        {/*
+          这里**不再列一遍活动**。首屏曾经单独渲染「今天留下的片段」，与时间线
+          段内那一份、右列那一份各说一次，同一条活动在页面上出现三回。
+          现在首屏只给出"今天留下了几条"这个计数，内容留给完整安排里的那唯一一处。
+        */}
+        {recentCount > 0 && timeline ? (
+          <p className="life-happened-count" data-testid="life-happened">
+            今天已经留下 {recentCount} 条活动记录，按时间排在下面的完整安排里。
+          </p>
         ) : null}
       </section>
 
@@ -154,4 +211,41 @@ export function LifeDay({ activity, timeline, timelineFailed = false }: LifeDayP
       ) : null}
     </>
   );
+}
+
+
+/** 兼容旧调用点：`activity` 参数不再参与渲染（见文件头注释）。 */
+export type { ActivityResponse };
+
+/**
+ * 没有时间线时的时间格式来源。
+ *
+ * 只有"时间轴读不到"这一条路径会走到这里；此时**不猜用户的展示时区**
+ * （后端给的 display_timezone 才是权威），退回浏览器时区并把时刻精确到分钟，
+ * 这样最坏情况也只是钟点可能与偏好时区不同，而不是显示一个错误的日期。
+ */
+function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+/** 今天的叶段，按开始时间排。父段不单独占行（它没有自己的时刻表意义）。 */
+export function leafSegments(timeline: LifeTimelineOut): LifeTimelineSegment[] {
+  return timeline.segments
+    .filter((segment) => segment.is_leaf && segment.status === 'current')
+    .slice()
+    .sort((a, b) => a.display_start_at.localeCompare(b.display_start_at));
+}
+
+/** 已过去 / 此刻 / 未到，按**展示区间**判，只用于画状态。 */
+export function dayPhase(segment: LifeTimelineSegment, now: Date): 'past' | 'now' | 'upcoming' {
+  const start = new Date(segment.display_start_at).getTime();
+  const end = new Date(segment.display_end_at).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) return 'upcoming';
+  if (end <= now.getTime()) return 'past';
+  if (start <= now.getTime()) return 'now';
+  return 'upcoming';
 }
