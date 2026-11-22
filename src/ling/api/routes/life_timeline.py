@@ -572,13 +572,15 @@ async def _load_facts(
     scene = await session.get(SceneCommitRow, actor_id)
     scene_activity = str(scene.activity_id) if scene is not None and scene.activity_id else None
     scene_until = scene.valid_until if scene is not None else None
-    if scene_until is not None and _aware(scene_until) <= _aware(now):
-        scene_until = None  # 过期即 unknown，不冒充现状
+    if scene_until is not None and (
+        _aware(scene_until) <= _aware(now) or not window_start <= now < window_end
+    ):
+        scene_until = None
 
     activity_start = func.coalesce(ActivityRow.started_at, ActivityRow.ended_at, ActivityRow.created_at)
     # 缺结束时刻的旧记录只归属开始日。有效情景能证明当前活动仍在继续。
     reaches_window = or_(activity_start >= window_start, ActivityRow.ended_at > window_start)
-    if scene_until is not None and scene_activity is not None and window_start <= now < window_end:
+    if scene_until is not None and scene_activity is not None:
         reaches_window = or_(reaches_window, and_(
             ActivityRow.id == scene_activity,
             ActivityRow.state == "running",

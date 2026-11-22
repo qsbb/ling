@@ -110,6 +110,7 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
     assert set(today) == {"old_check", "crosses_midnight", "today_check"}
     assert today["old_check"]["scene_valid_until"] is not None
     assert set(await facts(previous)) == {"ends_at_midnight", "crosses_midnight"}
+    assert (await facts(earlier))["old_check"]["scene_valid_until"] is None
 
 
 async def _insert_plan(
