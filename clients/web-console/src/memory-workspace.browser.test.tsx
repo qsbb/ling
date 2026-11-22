@@ -93,6 +93,7 @@ const SETTINGS = {
   profile_capabilities: {}, memory_sources: { 'memory.embed': 'none', 'memory.rerank': 'none' },
   memory: {
     relative_score_floor: 0.35, rerank_top_n: 7, recency_half_life_days: 19, max_retention_days: RETENTION,
+    max_injected_memories: 3,
   },
 };
 
@@ -339,6 +340,35 @@ describe('记忆工作区：独立浏览器验收', () => {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await current(page, '隐私与清理');
     await visible(privacyControl(page));
+  }, CASE_TIMEOUT);
+
+  it('学习设置发布每轮带入的旧记忆条数并回显零值', async () => {
+    const { page } = await openWorkspace({ start: '学习设置' });
+    let published = SETTINGS.memory;
+    let draft = published;
+    let revision = SETTINGS.revision;
+    await page.route(`**${CONFIG}`, route => route.fulfill(json({ ...SETTINGS, revision, memory: published })));
+    await page.route('**/v1/settings/draft', route => {
+      draft = route.request().postDataJSON().memory;
+      return route.fulfill(json({ revision: revision + 1, validation_errors: [] }));
+    });
+    await page.route('**/v1/settings/publish', route => {
+      revision = route.request().postDataJSON().revision;
+      published = draft;
+      return route.fulfill(json({ revision }));
+    });
+
+    const field = page.getByRole('spinbutton', { name: /^每轮最多带入的旧记忆/ });
+    await visible(field);
+    expect(await field.inputValue()).toBe('3');
+    expect(await field.getAttribute('min')).toBe('0');
+    expect(await field.getAttribute('max')).toBe('12');
+    await field.fill('0');
+    await page.getByRole('button', { name: '保存并发布' }).click();
+    await expect.poll(() => published.max_injected_memories, { timeout: WAIT }).toBe(0);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await visible(field);
+    expect(await field.inputValue()).toBe('0');
   }, CASE_TIMEOUT);
 
   for (const action of [

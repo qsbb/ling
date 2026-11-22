@@ -170,6 +170,7 @@
       },
       "log_access_denials": "boolean",
       "memory": {
+        "max_injected_memories": "integer",
         "max_retention_days": "integer",
         "recency_half_life_days": "number",
         "relative_score_floor": "number",

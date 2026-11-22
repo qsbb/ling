@@ -197,6 +197,7 @@ const CONFIG: SettingsConfig = {
     rerank_top_n: 20,
     recency_half_life_days: 120,
     max_retention_days: 3650,
+    max_injected_memories: 3,
   },
   life: {
     scene_ttl_minutes: 15,

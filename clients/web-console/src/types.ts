@@ -346,6 +346,7 @@ export interface MemoryPolicy {
   rerank_top_n: number;
   recency_half_life_days: number;
   max_retention_days: number;
+  max_injected_memories: number;
 }
 
 /* ------------------------------------------------------------ 记忆内容页 */

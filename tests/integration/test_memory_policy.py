@@ -27,9 +27,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select, text
 
+from ling.domains.conversation.service import ConversationService
+from ling.domains.memory.core import CoreMemoryService
 from ling.domains.memory.service import MemoryService
 from ling.infra.db import session_scope
-from ling.infra.models import ConfigRevision, MemoryRow
+from ling.infra.models import ConfigRevision, MemoryRow, PromptSnapshot
 from ling.ports.config import MemoryPolicy
 from ling.settings.service import _memory_policy, published_memory_policy
 from tests.integration.conftest import TestEnv, read_sse
@@ -41,6 +43,7 @@ DEFAULTS = {
     "rerank_top_n": 20,
     "recency_half_life_days": 120.0,
     "max_retention_days": 3650,
+    "max_injected_memories": 3,
 }
 
 # 这三条记忆都命中同一个查询；只有 `old` 够老（61 天）。
@@ -146,6 +149,7 @@ async def test_memory_roundtrip(logged_in: TestEnv) -> None:
                 "rerank_top_n": 8,
                 "recency_half_life_days": 30.0,
                 "max_retention_days": 180,
+                "max_injected_memories": 5,
             }
         },
     )
@@ -154,6 +158,7 @@ async def test_memory_roundtrip(logged_in: TestEnv) -> None:
         "rerank_top_n": 8,
         "recency_half_life_days": 30.0,
         "max_retention_days": 180,
+        "max_injected_memories": 5,
     }
 
 
@@ -163,12 +168,15 @@ async def test_memory_partial_update_keeps_other_fields(logged_in: TestEnv) -> N
     这条最容易写错：合并时把没传的字段当成 None 写回去，
     用户改个重排条数，结果召回下限和保留期一起被重置。
     """
-    await _publish(logged_in, {"memory": {"rerank_top_n": 8, "max_retention_days": 180}})
+    await _publish(logged_in, {"memory": {
+        "rerank_top_n": 8, "max_retention_days": 180, "max_injected_memories": 0,
+    }})
     body = await _publish(logged_in, {"memory": {"rerank_top_n": 12}})
 
     assert body["memory"]["rerank_top_n"] == 12
     assert body["memory"]["max_retention_days"] == 180, "没传的字段被重置了"
     assert body["memory"]["relative_score_floor"] == DEFAULTS["relative_score_floor"]
+    assert body["memory"]["max_injected_memories"] == 0
 
 
 # ---------------------------------------------------------------- 校验
@@ -183,6 +191,10 @@ async def test_memory_partial_update_keeps_other_fields(logged_in: TestEnv) -> N
         ("rerank_top_n", 1000),
         ("recency_half_life_days", 0),
         ("max_retention_days", 0),
+        ("max_injected_memories", -1),
+        ("max_injected_memories", 13),
+        ("max_injected_memories", 3.5),
+        ("max_injected_memories", True),
     ],
 )
 async def test_out_of_range_is_rejected(logged_in: TestEnv, field: str, value: float) -> None:
@@ -292,6 +304,58 @@ async def test_published_policy_takes_effect_on_next_turn(logged_in: TestEnv) ->
     assert after == {close}, (
         f"relative_score_floor=1.0 应当只留下最相关的一条，实际 {sorted(after)}"
     )
+
+
+async def test_published_memory_limit_controls_the_prompt(logged_in: TestEnv) -> None:
+    session_id = await _new_session(logged_in)
+    current_history = "今天我们约好去散步"
+    core_fact = "请称呼我为小溪"
+    notes = [
+        "桂花乌龙适合雨后在南窗慢慢喝。",
+        "茉莉绿茶常和烤杏仁搭配。",
+        "白毫银针是从茶山集市买回来的。",
+        "陈皮普洱用浅色陶杯泡最好喝。",
+        "蜜香红茶可以带给朋友当礼物。",
+    ]
+    async with session_scope() as session:
+        for index, note in enumerate(notes):
+            session.add(MemoryRow(
+                id=f"mem_injection_{index}", subject_id=logged_in.subject_id,
+                kind="assertion", text="用户喜欢喝" + note * 7, origin="user_statement",
+                visibility="subject_private", confidence=0.9,
+                source_event_ids=[f"fixture_{index}"],
+            ))
+        await ConversationService(session).add_message(session_id, role="user", text=current_history)
+        await CoreMemoryService(session).upsert(
+            subject_id=logged_in.subject_id, label="称呼", text=core_fact,
+        )
+
+    async def assert_prompt_count(expected: int) -> None:
+        events = await _send_turn(logged_in, session_id)
+        turn_id = next(data["turn_id"] for name, data in events if name == "turn.completed")
+        async with session_scope() as session:
+            snapshot = await session.scalar(select(PromptSnapshot).where(PromptSnapshot.turn_id == turn_id))
+        assert snapshot is not None
+        sections = snapshot.payload["messages"]
+        evidence = " ".join(message["content"] for message in sections if message["lane"] == "evidence")
+        assert sum(note in evidence for note in notes) == expected
+        assert any(current_history in message["content"] for message in sections if message["lane"] == "history")
+        assert any(core_fact in message["content"] for message in sections if message["lane"] == "core_memory")
+
+    await assert_prompt_count(3)
+    draft = await logged_in.client.put("/v1/settings/draft", json={"memory": {"max_injected_memories": 5}})
+    assert draft.status_code == 200, draft.text
+    await assert_prompt_count(3)
+    published = await logged_in.client.post(
+        "/v1/settings/publish", json={"revision": draft.json()["revision"]},
+    )
+    assert published.status_code == 200, published.text
+    await assert_prompt_count(5)
+
+    await _publish(logged_in, {"memory": {"max_injected_memories": 0}})
+    await _reset_recall_marks(logged_in.subject_id)
+    await assert_prompt_count(0)
+    assert await _recalled_ids(logged_in.subject_id) == set()
 
 
 async def test_retention_ruling_row_value_is_a_shorter_request(logged_in: TestEnv) -> None:
