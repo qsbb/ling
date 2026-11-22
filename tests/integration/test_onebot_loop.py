@@ -1184,6 +1184,34 @@ async def test_private_reply_is_split_and_reassembles(
     assert rejoined == _LONG_REPLY, f"分段拼不回原稿：{rejoined[:60]!r}"
 
 
+async def test_private_quote_and_sentence_end_stay_in_the_same_message(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ling.capabilities.chunking as chunking
+
+    monkeypatch.setattr(chunking, "PART_DELAY_SECONDS", 0.0)
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    parts = [
+        "引航者……我这边只记到一句。",
+        "你昨天好像说的是「晚上好呀」。",
+        "别的我这会儿想不起来了，困得有点糊。你再提个词，我慢慢接。",
+    ]
+    stub = _LongReplyRouter(logged_in.app.state.router, long_text="\n\n".join(parts))
+    monkeypatch.setattr(logged_in.app.state, "router", stub)
+
+    body = (await _post(logged_in, _event_body(message="昨天我说过什么"))).json()
+
+    assert stub.generation_calls == 1
+    assert body["parts_sent"] == body["parts_total"] == len(parts), body
+    assert [call["action"] for call in fake.sent] == ["send_private_msg"] * len(parts)
+    assert [
+        "".join(seg["data"]["text"] for seg in call["body"]["message"] if seg["type"] == "text")
+        for call in fake.sent
+    ] == parts
+
+
 @pytest.mark.parametrize("separator", ["\n\n", "/n/n", r"\n\n"])
 async def test_group_paragraphs_are_sent_as_separate_messages(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, separator: str,

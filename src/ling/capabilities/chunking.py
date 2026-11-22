@@ -45,9 +45,11 @@ _SENTENCE_END = re.compile(r"(?<=[。！？!?…])|(?<=\.\s)|(?<=\n)")
 # fenced code block：```...```
 _CODE_FENCE = re.compile(r"```.*?```", re.S)
 # 行内代码与中英文引号
-_INLINE_PROTECTED = re.compile(r"`[^`\n]+`|「[^」]*」|『[^』]*』|\"[^\"]{2,}\"")
+_INLINE_PROTECTED = re.compile(
+    r"`[^`\n]+`|(?:「[^」]*」|『[^』]*』|\"[^\"]{2,}\"|“[^”]*”|‘[^’]*’)[。！？.!?…]*"
+)
 _GROUP_INLINE_PROTECTED = re.compile(
-    _INLINE_PROTECTED.pattern + r"""|“[^”]*”|‘[^’]*’|https?://[^\s\\<>`"'“”‘’「」『』，。！？；、]+"""
+    _INLINE_PROTECTED.pattern + r"""|https?://[^\s\\<>`"'“”‘’「」『』，。！？；、]+"""
 )
 _GROUP_BREAK = re.compile(r"(?:\\n){2,}|(?:/n){2,}")
 
@@ -166,33 +168,17 @@ MAX_PARTS_GROUP = DEFAULT_GROUP_REPLY_MAX_PARTS
 PART_DELAY_SECONDS = 1.2
 
 
-def _newline_units(text: str) -> list[str]:
-    """按换行拆成"消息单元"，**但代码块/引号内部绝不拆**。
-
-    换行是模型决定"分几条发"的信号，所以优先尊重。但代码块本身是多行的，
-    按换行一刀切会把可执行内容切碎——那是本模块开头三条硬约束的第一条。
-    所以只拆受保护片段**之外**的换行。
-    """
-    units: list[str] = []
-    for piece, protected in _split_protected(text):
-        if protected:
-            units.append(piece)
-            continue
-        for line in piece.split("\n"):
-            if line.strip():
-                units.append(line)
-    return units
-
-
-def _group_units(text: str) -> list[str]:
-    """保留段间换行，合并到同一条时仍能看清原来的段落。"""
+def _paragraph_units(text: str, *, is_group: bool) -> list[str]:
+    """Split only at line breaks outside protected spans."""
+    pattern = _GROUP_INLINE_PROTECTED if is_group else _INLINE_PROTECTED
     units = [""]
-    for piece, protected in _split_protected(text, _GROUP_INLINE_PROTECTED):
+    for piece, protected in _split_protected(text, pattern):
         if protected:
             units[-1] += piece
             continue
-        normalized = _GROUP_BREAK.sub("\n\n", piece)
-        for line in normalized.splitlines(keepends=True):
+        if is_group:
+            piece = _GROUP_BREAK.sub("\n\n", piece)
+        for line in piece.splitlines(keepends=True):
             units[-1] += line
             if line.endswith("\n") and units[-1].strip():
                 units.append("")
@@ -375,14 +361,14 @@ def plan_parts(
     # 那是给散文段落设计的。用在聊天上会把「你今天累啦？/ 谁让你又
     # 闷着不出去转转。/ 走，去小吃街加个餐」三句合并成一段——而模型的
     # 换行恰恰是它决定"分三条发"的信号。合并规则不该覆盖它。
+    units = _paragraph_units(text, is_group=is_group)
     if is_group:
-        group_units = _group_units(text)
-        text = "".join(group_units)
+        text = "".join(units)
         if not text.strip():
             return []
-        units = [unit for unit in group_units if unit.strip()]
     else:
-        units = _newline_units(text)
+        units = [unit.strip("\r\n") for unit in units]
+    units = [unit for unit in units if unit.strip()]
     segments: list[str] = []
     group_segment_limit = min(MAX_SEGMENT_CHARS, limit)
     if len(units) > 1 and is_group:
@@ -417,7 +403,7 @@ def plan_parts(
         pieces.extend(_cut_oversize(segment[len(body):], limit))
 
     max_parts = max_group_parts if is_group else MAX_PARTS_PRIVATE
-    if is_group and len(pieces) <= max_parts:
+    if len(pieces) <= max_parts and (is_group or (len(units) > 1 and len(text) <= limit)):
         parts = pieces
     else:
         parts = _pack_units(
