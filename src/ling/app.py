@@ -473,6 +473,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         health,
         manage,
         media,
+        memory_import,
         onebot,
         ops,
         sessions,
@@ -493,7 +494,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         BodySizeLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
-        streamed_upload_path=backup_restore.UPLOAD_PATH,
+        streamed_upload_paths=(backup_restore.UPLOAD_PATH, *memory_import.UPLOAD_PATHS),
     )
 
     # 最外层：给每个请求一个 trace_id，并记录访问日志。
@@ -520,7 +521,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(window_policy_routes.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
-    from ling.api.routes import live, memory_import, transcriptions
+    from ling.api.routes import live, transcriptions
     app.include_router(live.router, prefix="/v1")
     app.include_router(memory_import.router, prefix="/v1")
     app.include_router(transcriptions.router, prefix="/v1")

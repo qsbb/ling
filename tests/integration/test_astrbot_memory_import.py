@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from collections.abc import AsyncIterator
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -263,6 +265,70 @@ async def test_commit_rechecks_eligibility_and_binds_file(
     assert [(row["kind"], row["origin"]) for row in result] == [("assertion", "user_statement")]
 
 
+async def test_large_archive_previews_and_imports_every_batch(logged_in: TestEnv, tmp_path: Path) -> None:
+    await _bind(logged_in)
+    record_count = 5_001
+    template = _record(content="合成记忆" * 600)
+    snapshot = tmp_path / "snapshot.db"
+    _sqlite_snapshot(snapshot, *(
+        {**template, "id": f"record-{number:05}"} for number in range(record_count)
+    ))
+    path = tmp_path / "archive.jsonl"
+    assert convert(snapshot, path, bot_qq=BOT_QQ, owner_qq=OWNER_QQ) == (record_count, False)
+    with path.open("rb") as file:
+        file.readline()
+        first_record = file.readline()
+    with path.open("ab") as file:
+        file.write(first_record)
+    size = path.stat().st_size
+    assert size > 32 * 1024 * 1024
+
+    async def body() -> AsyncIterator[bytes]:
+        with path.open("rb") as file:
+            while chunk := file.read(65_536):
+                yield chunk
+
+    length_headers = {**HEADERS, "Content-Length": str(size)}
+    preview = await logged_in.client.post(PREFIX + "/preview", content=body(), headers=length_headers)
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert report["total"] == record_count + 1
+    assert report["accepted"] == record_count
+    assert report["destination"]["subject_id"] == logged_in.subject_id
+    assert report["duplicates"] == 1
+    assert report["skipped"] == 0
+    assert report["sample"][0]["source_id"] == "record-00000"
+    assert (await _row_counts())[0] == 0
+
+    headers = {**HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
+    commit = await logged_in.client.post(PREFIX + "/commit", content=body(), headers=headers)
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["total"] == record_count + 1
+    assert commit.json()["imported"] == record_count
+    assert commit.json()["duplicates"] == 1
+    async with session_scope() as session:
+        rows = await session.execute(select(MemoryRow.subject_id, MemoryRow.import_source["record_id"].as_string()))
+        assert set(rows) == {(logged_in.subject_id, f"record-{number:05}") for number in range(record_count)}
+
+    repeated = await logged_in.client.post(PREFIX + "/commit", content=body(), headers={**headers, **length_headers})
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["imported"] == 0
+    assert repeated.json()["duplicates"] == record_count + 1
+    repeated_preview = await logged_in.client.post(PREFIX + "/preview", content=body(), headers=HEADERS)
+    assert repeated_preview.status_code == 200, repeated_preview.text
+    assert repeated_preview.json()["duplicates"] == record_count + 1
+    assert repeated_preview.json()["confirmation_token"] is None
+
+
+def test_archive_skips_an_oversized_line_and_reads_the_next_record() -> None:
+    header, record = _archive(_record()).splitlines(keepends=True)
+    content = header + b"x" * (importer.MAX_RECORD_BYTES + 50) + b"\n" + record
+    archive = importer.parse_archive(BytesIO(content), digest=hashlib.sha256(content).hexdigest())
+    invalid, valid = archive.records
+    assert invalid is None
+    assert valid is not None and valid.id == "memo-original"
+
+
 async def test_requires_owner_origin_and_current_proven_binding(web_env: TestEnv) -> None:
     data = _archive(_record())
     response = await web_env.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
@@ -318,8 +384,10 @@ def test_confirmation_binds_authenticated_actor_target_generation_and_expiry() -
     target = importer.ImportTarget(dest, "binding-id", "binding-revision", 0)
     inputs = {"user_id": "user-a", "target": target, "digest": "record-digest", "retention_days": 3650}
     deadline = now + timedelta(minutes=5)
-    token = importer.sign_confirmation(b"root", **inputs, expires=int(deadline.timestamp()))
-    importer.check_confirmation(b"root", token=token, now=now, **inputs)
+    token = importer.sign_confirmation(
+        b"root", **inputs, reviewed_at=int(now.timestamp()), expires=int(deadline.timestamp()),
+    )
+    assert importer.check_confirmation(b"root", token=token, now=now, **inputs) == now.replace(microsecond=0)
     changes = [
         {"user_id": "user-b"},
         {"target": replace(target, destination=dest.model_copy(update={"subject_id": "subject-b"}))},

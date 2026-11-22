@@ -9,8 +9,6 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-MAX_BYTES = 8 * 1024 * 1024
-MAX_RECORDS = 5_000
 _QQ = re.compile(r"[1-9][0-9]{4,19}", re.ASCII)
 _SELECT = """
     SELECT id, memory_type, subject_kind, subject_id, object_kind, object_id, scope,
@@ -66,12 +64,12 @@ def _record(row: sqlite3.Row) -> dict:
 
 
 def convert(
-    snapshot: Path, output: Path, *, bot_qq: str, owner_qq: str, offset: int, limit: int,
+    snapshot: Path, output: Path, *, bot_qq: str, owner_qq: str, offset: int = 0, limit: int | None = None,
 ) -> tuple[int, bool]:
     if not _QQ.fullmatch(bot_qq) or not _QQ.fullmatch(owner_qq) or bot_qq == owner_qq:
         raise ValueError("请填写两个不同的 QQ 号，分别对应旧 Bot 和你本人")
-    if not 0 <= offset <= 2**63 - 1 or not 1 <= limit <= MAX_RECORDS:
-        raise ValueError(f"--offset 不能为负，--limit 必须在 1 到 {MAX_RECORDS} 之间")
+    if not 0 <= offset <= 2**63 - 1 or (limit is not None and not 1 <= limit < 2**63 - 1):
+        raise ValueError("--offset 需要非负整数，--limit 需要正整数，且应在 SQLite 整数范围内")
     snapshot = snapshot.expanduser().resolve(strict=True)
     if Path(f"{snapshot}-wal").exists() or Path(f"{snapshot}-journal").exists():
         raise ValueError("请使用独立的 SQLite 备份，当前文件还有 WAL 或日志文件")
@@ -83,19 +81,12 @@ def convert(
     with closing(sqlite3.connect(f"{snapshot.as_uri()}?mode=ro&immutable=1", uri=True)) as db:
         db.row_factory = sqlite3.Row
         cursor = db.execute(_SELECT, {
-            "bot_qq": bot_qq, "owner_qq": owner_qq, "offset": offset, "limit": limit + 1,
+            "bot_qq": bot_qq, "owner_qq": owner_qq, "offset": offset, "limit": -1 if limit is None else limit + 1,
         })
         with output.open("xb") as handle:
             try:
-                size = 0
-
                 def write(payload: dict) -> None:
-                    nonlocal size
-                    line = (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode()
-                    size += len(line)
-                    if size > MAX_BYTES:
-                        raise ValueError("导出超过 8 MiB，请减小 --limit 并分批转换")
-                    handle.write(line)
+                    handle.write((json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode())
 
                 write(header)
                 count = 0
@@ -118,7 +109,7 @@ def main() -> None:
     parser.add_argument("--bot-qq", required=True, help="旧机器人 QQ 号")
     parser.add_argument("--owner-qq", required=True, help="本人的 QQ 号")
     parser.add_argument("--offset", type=int, default=0, help="同一份备份中从第几条之后开始")
-    parser.add_argument("--limit", type=int, default=MAX_RECORDS, help="本批最多处理多少条")
+    parser.add_argument("--limit", type=int, help="可选：最多处理多少条，默认导出所有匹配记录")
     args = parser.parse_args()
     try:
         count, more = convert(

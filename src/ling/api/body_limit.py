@@ -119,18 +119,18 @@ class BodySizeLimitMiddleware:
     """
 
     def __init__(
-        self, app: ASGIApp, max_body_bytes: int, streamed_upload_path: str | None = None
+        self, app: ASGIApp, max_body_bytes: int, streamed_upload_paths: tuple[str, ...] = (),
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
-        self.streamed_upload_path = streamed_upload_path
+        self.streamed_upload_paths = frozenset(streamed_upload_paths)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        # Full snapshots can be larger than the JSON/media limit. This route streams to disk.
-        if scope["method"] == "POST" and scope["path"] == self.streamed_upload_path:
+        # These authorized file upload routes stream to disk.
+        if scope["method"] == "POST" and scope["path"] in self.streamed_upload_paths:
             return await self.app(scope, receive, send)
 
         raw = _header(scope, _CONTENT_LENGTH)

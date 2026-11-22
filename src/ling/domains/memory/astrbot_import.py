@@ -6,24 +6,36 @@ import hashlib
 import hmac
 import json
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
-from typing import Annotated, Literal
+from itertools import islice
+from typing import Annotated, BinaryIO, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import select
+from sqlalchemy import Column, MetaData, String, Table, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.schema import CreateTable
+from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
 from ling.infra.models import MemoryRow
 
-MAX_BYTES = 8 * 1024 * 1024
-MAX_RECORDS = 5_000
 PREVIEW_LIMIT = 12
+RECORD_BATCH_SIZE = 128
+# Preserve every record accepted by the former 8 MiB archive limit.
+MAX_RECORD_BYTES = 8 * 1024 * 1024
 TOKEN_TTL = timedelta(minutes=15)
 SOURCE = "astrbot_memory_companion"
+_PREVIEW_IDS = Table(
+    "ling_memory_import_preview_ids",
+    MetaData(),
+    Column("id", String(64), primary_key=True),
+    schema="pg_temp",
+    prefixes=["TEMPORARY"],
+    postgresql_on_commit="DROP",
+)
 _SUMMARY_TYPES = {"conversation_summary", "daily_digest", "memory_decay_summary"}
 _STATEMENT_TYPES = {"manual_memory", "explicit_memory", "user_profile", "user_preference"}
 _QQ_PLATFORMS = {"aiocqhttp", "onebot", "qq"}
@@ -151,22 +163,38 @@ class ArchiveRecord(BaseModel):
 @dataclass(frozen=True)
 class Archive:
     header: ArchiveHeader
-    records: list[ArchiveRecord | None]
+    records: Iterator[ArchiveRecord | None]
     digest: str
 
 
-def parse_archive(data: bytes) -> Archive:
-    if len(data) > MAX_BYTES:
-        raise ArchiveError("file_too_large")
-    if data.startswith(b"SQLite format 3\x00"):
-        raise ArchiveError("unsupported_archive")
+def _decode(line: bytes) -> str:
     try:
-        data.decode("utf-8")
+        return line.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ArchiveError("invalid_encoding") from exc
 
-    lines = BytesIO(data)
-    header_line = lines.readline().removeprefix(b"\xef\xbb\xbf")
+
+def _records(file: BinaryIO) -> Iterator[ArchiveRecord | None]:
+    while line := file.readline(MAX_RECORD_BYTES + 1):
+        if len(line) > MAX_RECORD_BYTES:
+            while line and not line.endswith(b"\n"):
+                line = file.readline(65_536)
+            yield None
+            continue
+        if not line.strip():
+            continue
+        record = _decode(line)
+        try:
+            yield ArchiveRecord.model_validate_json(record, strict=True)
+        except ValidationError:
+            yield None
+
+
+def parse_archive(file: BinaryIO, *, digest: str) -> Archive:
+    line = file.readline(MAX_RECORD_BYTES + 1)
+    if len(line) > MAX_RECORD_BYTES or line.startswith(b"SQLite format 3\x00"):
+        raise ArchiveError("unsupported_archive")
+    header_line = _decode(line.removeprefix(b"\xef\xbb\xbf"))
     try:
         header = ArchiveHeader.model_validate_json(header_line, strict=True)
     except ValidationError as exc:
@@ -177,17 +205,7 @@ def parse_archive(data: bytes) -> Archive:
         raise ArchiveError("astrbot_native_archive") from exc
     if header.bot_qq == header.owner_qq:
         raise ArchiveError("invalid_source_pair")
-    records: list[ArchiveRecord | None] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        if len(records) >= MAX_RECORDS:
-            raise ArchiveError("too_many_records")
-        try:
-            records.append(ArchiveRecord.model_validate_json(line, strict=True))
-        except ValidationError:
-            records.append(None)
-    return Archive(header, records, hashlib.sha256(data).hexdigest())
+    return Archive(header, _records(file), digest)
 
 
 class Destination(BaseModel):
@@ -206,14 +224,16 @@ class ImportTarget:
 
 
 def sign_confirmation(
-    root_key: bytes, *, user_id: str, target: ImportTarget, digest: str, expires: int, retention_days: int,
+    root_key: bytes, *, user_id: str, target: ImportTarget, digest: str,
+    reviewed_at: int, expires: int, retention_days: int,
 ) -> str:
     payload = json.dumps([
-        "ling:astrbot-memory-import:v1", user_id, target.destination.subject_id,
-        target.binding_id, target.binding_revision, target.forget_generation, digest, expires, retention_days,
+        "ling:astrbot-memory-import:v2", user_id, target.destination.subject_id,
+        target.binding_id, target.binding_revision, target.forget_generation,
+        digest, reviewed_at, expires, retention_days,
     ], separators=(",", ":")).encode()
     signature = hmac.digest(root_key, payload, "sha256").hex()
-    return f"{expires}.{signature}"
+    return f"{reviewed_at}.{expires}.{signature}"
 
 
 def check_confirmation(
@@ -226,19 +246,22 @@ def check_confirmation(
     now: datetime,
     retention_days: int,
 ) -> datetime:
-    expires, _, _ = token.partition(".")
+    reviewed_at, _, remainder = token.partition(".")
+    expires, _, _ = remainder.partition(".")
     if (
-        len(token) > 80 or not token.isascii()
+        len(token) > 90 or not token.isascii()
+        or not reviewed_at.isdecimal() or len(reviewed_at) > 12
         or not expires.isdecimal() or len(expires) > 12
         or int(expires) <= now.timestamp()
     ):
         raise ArchiveError("preview_invalid")
     expected = sign_confirmation(
-        root_key, user_id=user_id, target=target, digest=digest, expires=int(expires), retention_days=retention_days,
+        root_key, user_id=user_id, target=target, digest=digest,
+        reviewed_at=int(reviewed_at), expires=int(expires), retention_days=retention_days,
     )
     if not hmac.compare_digest(token, expected):
         raise ArchiveError("preview_invalid")
-    return datetime.fromtimestamp(int(expires), UTC) - TOKEN_TTL
+    return datetime.fromtimestamp(int(reviewed_at), UTC)
 
 
 class ImportCounts(BaseModel):
@@ -257,10 +280,11 @@ class ImportSample(BaseModel):
     valid_until: datetime | None
 
 
-@dataclass
-class ImportPlan:
+@dataclass(frozen=True)
+class ImportResult:
     counts: ImportCounts
-    candidates: list[tuple[str, ArchiveRecord]]
+    accepted: int
+    sample: list[ImportSample]
 
 
 def _memory_id(subject_id: str, header: ArchiveHeader, source_id: str) -> str:
@@ -268,7 +292,7 @@ def _memory_id(subject_id: str, header: ArchiveHeader, source_id: str) -> str:
     return "mem_as_" + hashlib.sha256(key.encode()).hexdigest()[:56]
 
 
-async def plan_import(
+async def process_archive(
     session: AsyncSession,
     *,
     archive: Archive,
@@ -276,67 +300,96 @@ async def plan_import(
     now: datetime,
     retention_days: int,
     reviewed_at: datetime | None = None,
-) -> ImportPlan:
+    write: bool = False,
+) -> ImportResult:
     cutoff = now - timedelta(days=retention_days)
-    skipped: Counter[SkipReason] = Counter()
-    candidates: dict[str, ArchiveRecord] = {}
-    duplicates = 0
-    for record in archive.records:
-        if record is None:
-            skipped["invalid_record"] += 1
-            continue
-        reason = record.skip_reason(
-            archive.header, now=now, reviewed_at=reviewed_at or now, retention_cutoff=cutoff,
-        )
-        if reason:
-            skipped[reason] += 1
-            continue
-        memory_id = _memory_id(target.destination.subject_id, archive.header, record.id)
-        if memory_id in candidates:
-            duplicates += 1
-            continue
-        candidates[memory_id] = record
+    review_time = reviewed_at or now
+    skip_reasons: Counter[SkipReason] = Counter()
+    sample: list[ImportSample] = []
+    total = duplicates = accepted = 0
+    if not write:
+        await session.execute(CreateTable(_PREVIEW_IDS))
+    while batch := await run_in_threadpool(list, islice(archive.records, RECORD_BATCH_SIZE)):
+        total += len(batch)
+        candidates: dict[str, ArchiveRecord] = {}
+        for record in batch:
+            reason = "invalid_record" if record is None else record.skip_reason(
+                archive.header, now=now, reviewed_at=review_time, retention_cutoff=cutoff,
+            )
+            if reason is not None:
+                skip_reasons[reason] += 1
+                continue
+            assert record is not None
+            memory_id = _memory_id(target.destination.subject_id, archive.header, record.id)
+            if memory_id in candidates:
+                duplicates += 1
+                continue
+            candidates[memory_id] = record
 
-    existing = set(await session.scalars(
-        select(MemoryRow.id).where(MemoryRow.id.in_(list(candidates)))
-    )) if candidates else set()
-    return ImportPlan(
+        if not candidates:
+            continue
+        if write:
+            inserted = await _insert_memories(
+                session, header=archive.header, target=target, candidates=candidates,
+                retention_days=retention_days,
+            )
+            accepted += inserted
+            duplicates += len(candidates) - inserted
+            continue
+
+        # The transaction's temporary index deduplicates across batches without retaining all IDs in the API process.
+        fresh = set(await session.scalars(
+            insert(_PREVIEW_IDS).on_conflict_do_nothing().returning(_PREVIEW_IDS.c.id),
+            [{"id": memory_id} for memory_id in candidates],
+        ))
+        duplicates += len(candidates) - len(fresh)
+        if not fresh:
+            continue
+        existing = set(await session.scalars(
+            select(MemoryRow.id).where(MemoryRow.id.in_(fresh))
+        ))
+        duplicates += len(existing)
+        accepted += len(fresh) - len(existing)
+        if len(sample) < PREVIEW_LIMIT:
+            for memory_id, record in candidates.items():
+                if memory_id in fresh and memory_id not in existing:
+                    sample.append(_sample(record))
+                    if len(sample) == PREVIEW_LIMIT:
+                        break
+    return ImportResult(
         counts=ImportCounts(
-            total=len(archive.records),
-            duplicates=duplicates + len(existing),
-            skipped=sum(skipped.values()),
-            skip_reasons=dict(skipped),
+            total=total,
+            duplicates=duplicates,
+            skipped=sum(skip_reasons.values()),
+            skip_reasons=dict(skip_reasons),
         ),
-        candidates=[(memory_id, record) for memory_id, record in candidates.items() if memory_id not in existing],
+        accepted=accepted,
+        sample=sample,
     )
 
 
-def sample_records(plan: ImportPlan) -> list[ImportSample]:
-    return [
-        ImportSample(
-            source_id=record.id,
-            kind="episode" if record.is_summary else "assertion",
-            text=record.content[:400],
-            occurred_at=record.occurred_at,
-            created_at=record.created_at,
-            valid_until=record.valid_to,
-        )
-        for _, record in plan.candidates[:PREVIEW_LIMIT]
-    ]
+def _sample(record: ArchiveRecord) -> ImportSample:
+    return ImportSample(
+        source_id=record.id,
+        kind="episode" if record.is_summary else "assertion",
+        text=record.content[:400],
+        occurred_at=record.occurred_at,
+        created_at=record.created_at,
+        valid_until=record.valid_to,
+    )
 
 
-async def insert_memories(
+async def _insert_memories(
     session: AsyncSession,
     *,
-    archive: Archive,
+    header: ArchiveHeader,
     target: ImportTarget,
-    plan: ImportPlan,
+    candidates: dict[str, ArchiveRecord],
     retention_days: int,
 ) -> int:
     rows = []
-    header = archive.header
-    for memory_id, record in plan.candidates:
-        ref = f"astrbot:{header.bot_qq}:{header.owner_qq}"
+    ref = f"astrbot:{header.bot_qq}:{header.owner_qq}"
+    for memory_id, record in candidates.items():
         rows.append({
             "id": memory_id,
             "subject_id": target.destination.subject_id,
@@ -371,8 +424,6 @@ async def insert_memories(
                 "valid_to": record.valid_to.isoformat() if record.valid_to else None,
             },
         })
-    if not rows:
-        return 0
     stmt = insert(MemoryRow).on_conflict_do_nothing(index_elements=[MemoryRow.id]).returning(MemoryRow.id)
     inserted = await session.scalars(stmt, rows)
     return len(inserted.all())

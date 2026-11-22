@@ -19,7 +19,9 @@ python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db l
   --bot-qq 200300400 --owner-qq 100200300
 ```
 
-在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。每份上限为 8 MiB、5000 条记录。超过导入或服务端上传上限时，用较小的 `--limit` 和输出提示中的 `--offset` 从同一份备份继续转换，逐份导入。
+在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。转换脚本默认导出整份，仍可用 `--limit` 和 `--offset` 主动选取一段。
+
+导入接口按批读取和写入，临时文件使用 Ling 数据目录所在的磁盘。预览与确认均上传同一份文件，界面可以沿用已选的文件。若自行配置了反代，确保它允许这两条导入路径传输大文件。仓库的 nginx 模板已有对应配置。
 
 ## API
 
@@ -79,7 +81,8 @@ const result = await fetch('/v1/memory/import/commit', {
 | 409 | `qq_binding_required` | 引导核对自然人设置里的本人 QQ 绑定 |
 | 409 | `destination_unavailable`、`memory_purge_in_progress` | 显示服务端说明，恢复后重新预览 |
 | 422 | `astrbot_native_archive` | 引导使用 SQLite 备份生成迁移文件 |
-| 413 / 422 | `file_too_large`、`too_many_records`、`invalid_encoding`、`unsupported_archive`、`invalid_source_pair` | 保留错误反馈，允许换文件 |
+| 422 | `invalid_encoding`、`unsupported_archive`、`invalid_source_pair` | 保留错误反馈，允许换文件 |
+| 413 | 入口反代限制上传大小 | 确认反代的上传配置，保留文件以便重试 |
 
 成功后刷新 `GET /v1/memory?view=library`。导入条目附带 `import_source`。其中 `source` 为 `astrbot_memory_companion`，其余字段有原记录 ID、原类型、平台、会话、QQ、发生时间、原创建和更新时间以及原有效期。详情可显示「来自 AstrBot」及原时间。摘要以旧经历保存，按模型总结处理。断言仍沿用 Ling 正常的纠正和撤回操作。私聊记忆受 Ling 现有的可见范围和保留策略约束。
 
