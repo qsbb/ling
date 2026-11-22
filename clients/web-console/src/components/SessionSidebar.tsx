@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatSessionTime } from '../format';
 import type { SessionRecord, UserInfo } from '../types';
 import {
@@ -125,6 +125,62 @@ export function canRenameSession(session: SessionLike, role?: string): boolean {
   return describeSession(session).kind === 'web' || canManageSessionOrder(role ?? '');
 }
 
+/**
+ * 列表里"一行能读到什么"：
+ *
+ * 名称 → 群/私聊 → 选中 → 近期活动。操作（改名/置顶/排序/外部 ID）不进主行，
+ * 收进每条的「更多」菜单，避免图七那种"每条常驻四个图标"把可读信息挤走。
+ */
+export interface SessionRow {
+  session: SessionRecord;
+  heading: SessionHeading;
+  active: boolean;
+  renamable: boolean;
+  /** 同一分组（置顶 / 非置顶）里的上下邻居，用于排序项是否可用。 */
+  previous: SessionRecord | null;
+  next: SessionRecord | null;
+}
+
+/**
+ * 分组 + 组内顺序。
+ *
+ * **置顶的排到前面**，组内保持后端给的顺序（= 最近活跃倒序）。
+ *
+ * 为什么不在这里再按 `updated_at` 排一次：后端 `sessions.py` 已经按
+ * `pinned_at DESC, 最近活跃 DESC` 给过顺序了。前端重排一遍就有了两套
+ * 排序规则，哪天两边不一致就是"列表看着乱但说不清哪不对"。
+ *
+ * 空气泡（新建后没说话）不占位置——除当前这条正在看以外。
+ */
+export function buildSessionRows(
+  sessions: SessionRecord[],
+  currentId: string | null,
+  role: string,
+): SessionRow[] {
+  const visible = sessions.filter(
+    (session) => session.message_count > 0 || session.session_id === currentId,
+  );
+  const ordered = [
+    ...visible.filter((session) => session.pinned),
+    ...visible.filter((session) => !session.pinned),
+  ];
+  const canReorder = canManageSessionOrder(role);
+  return ordered.map((session, index) => {
+    const previous = ordered[index - 1] ?? null;
+    const next = ordered[index + 1] ?? null;
+    const sameGroup = (neighbor: SessionRecord | null) =>
+      neighbor !== null && Boolean(neighbor.pinned) === Boolean(session.pinned);
+    return {
+      session,
+      heading: describeSession(session),
+      active: session.session_id === currentId,
+      renamable: canRenameSession(session, role),
+      previous: canReorder && sameGroup(previous) ? previous : null,
+      next: canReorder && sameGroup(next) ? next : null,
+    };
+  });
+}
+
 interface SessionSidebarProps {
   sessions: SessionRecord[];
   currentId: string | null;
@@ -139,6 +195,46 @@ interface SessionSidebarProps {
   onNavigateSettings: () => void;
   onNavigatePersona: () => void;
   onLogout: () => void;
+}
+
+/** 菜单在同一时刻只能开一个：开着 A 点 B 是"换到 B"，不是两个都开。 */
+function useExclusiveMenu() {
+  const [openId, setOpenIdState] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * `close` 必须是**稳定引用**：它被写进「换会话就收起」那个 effect 的依赖里，
+   * 每次渲染换一个新函数会让 effect 每帧重跑，把用户刚展开的菜单立刻收掉。
+   */
+  const close = useCallback(() => setOpenIdState(null), []);
+  const setOpenId = setOpenIdState;
+
+  useEffect(() => {
+    if (openId === null) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (rootRef.current?.contains(target)) return;
+      setOpenId(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpenId(null);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [openId]);
+
+  return {
+    openId,
+    rootRef,
+    toggle: (id: string) => {
+      setOpenId((current) => (current === id ? null : id) as string | null);
+    },
+    close,
+  };
 }
 
 export function SessionSidebar({
@@ -160,17 +256,30 @@ export function SessionSidebar({
   const [draft, setDraft] = useState('');
   const [orderBusy, setOrderBusy] = useState(false);
   const [savingName, setSavingName] = useState(false);
+  const [detailId, setDetailId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const canReorder = canManageSessionOrder(user.role);
+  const menu = useExclusiveMenu();
+  const rows = useMemo(
+    () => buildSessionRows(sessions, currentId, user.role),
+    [sessions, currentId, user.role],
+  );
 
   useEffect(() => {
     if (editingId) inputRef.current?.focus();
   }, [editingId]);
 
+  // 换会话 / 收起侧栏时把菜单与"按需展开的外部 ID"一起收掉：
+  // 留着它们等于让上一条会话的操作挂在新会话上。
+  useEffect(() => {
+    menu.close();
+    setDetailId(null);
+  }, [currentId, menu.close]);
+
   const startEdit = (session: SessionRecord) => {
     setEditingId(session.session_id);
     // 改的是给人看的名字，不是机器键。
     setDraft(describeSession(session).title);
+    menu.close();
   };
 
   const commit = async () => {
@@ -179,7 +288,7 @@ export function SessionSidebar({
     setSavingName(true);
     try {
       if (await onRename(session.session_id, draft)) {
-        setEditingId((current) => current === session.session_id ? null : current);
+        setEditingId((current) => (current === session.session_id ? null : current));
       }
     } finally {
       setSavingName(false);
@@ -193,25 +302,9 @@ export function SessionSidebar({
       await action();
     } finally {
       setOrderBusy(false);
+      menu.close();
     }
   };
-
-  // 空气泡是新建后没说话的会话。留着它们只会把真对话挤出视野，
-  // 所以除当前这条正在看以外，不占列表位置（消息还被服务端留着）。
-  const visible = sessions.filter(
-    (session) => session.message_count > 0 || session.session_id === currentId,
-  );
-
-  // **置顶的排到前面**，组内保持后端给的顺序（= 最近活跃倒序）。
-  //
-  // 为什么不在这里再按 `updated_at` 排一次：后端 `sessions.py` 已经按
-  // `pinned_at DESC, 最近活跃 DESC` 给过顺序了。前端重排一遍就有了两套
-  // 排序规则，哪天两边不一致就是"列表看着乱但说不清哪不对"。
-  // 这里只做**分组**（置顶 / 非置顶），组内顺序原样保留。
-  const ordered = [
-    ...visible.filter((session) => session.pinned),
-    ...visible.filter((session) => !session.pinned),
-  ];
 
   return (
     <div className={`sidebar ${open ? 'sidebar--open' : ''}`} aria-label="会话列表">
@@ -232,22 +325,20 @@ export function SessionSidebar({
         </button>
 
         <nav className="sidebar__list" aria-label="我的会话">
-          {visible.length === 0 ? (
+          {rows.length === 0 ? (
             <p className="sidebar__empty">还没有会话</p>
           ) : (
-            ordered.map((session, index) => {
-              const active = session.session_id === currentId;
+            rows.map(({ session, heading, active, renamable, previous, next }) => {
               const editing = editingId === session.session_id;
-              const heading = describeSession(session);
-              const renamable = canRenameSession(session, user.role);
-              const previous = ordered[index - 1];
-              const next = ordered[index + 1];
-              const sameGroup = (neighbor: SessionRecord | undefined) =>
-                neighbor && Boolean(neighbor.pinned) === Boolean(session.pinned);
+              const menuOpen = menu.openId === session.session_id;
+              const detailOpen = detailId === session.session_id;
               return (
                 <div
                   key={session.session_id}
-                  className={`session ${active ? 'session--active' : ''}`}
+                  ref={menuOpen ? menu.rootRef : undefined}
+                  className={`session ${active ? 'session--active' : ''} ${
+                    menuOpen ? 'session--menu-open' : ''
+                  }`}
                   data-session-id={session.session_id}
                   data-kind={heading.kind}
                 >
@@ -296,75 +387,137 @@ export function SessionSidebar({
                           onClose();
                         }}
                         aria-current={active ? 'true' : undefined}
-                        title={`${heading.title} · ${heading.subtitle}`}
+                        // 悬停只给名字：外部键（窗口键/会话 id）会出现在
+                        // 「会话信息」里，不跟着主行的提示浮出来。
+                        title={heading.title}
                       >
                         <span className="session__heading">
                           <span className="session__title" title={heading.title}>
                             {heading.title}
                           </span>
+                          {session.pinned ? (
+                            <span className="session__pin-flag" title="已置顶">
+                              <PinIcon filled />
+                            </span>
+                          ) : null}
                           <span className="session__channel" data-kind={heading.kind}>
                             {heading.badge}
                           </span>
                         </span>
-                        {/* 副标题是完整会话键：CSS 省略号截断，悬停/读屏拿全量。 */}
-                        <span className="session__subtitle" title={heading.subtitle}>
-                          {heading.subtitle}
-                        </span>
+                        {/* 主行只读"名称 + 群/私聊 + 近期活动"。外部键按需展开，
+                            不占默认阅读宽度。 */}
                         <span className="session__meta">
-                          {session.message_count} 条 · {formatSessionTime(session.updated_at)}
+                          <span className="session__time">{formatSessionTime(session.updated_at)}</span>
+                          <span className="session__count">{session.message_count} 条</span>
                         </span>
                       </button>
-                      {renamable ? (
-                        <button
-                          type="button"
-                          className="session__edit-button icon-button"
-                          aria-label={`改名：${heading.title}`}
-                          title="改名"
-                          onClick={() => startEdit(session)}
-                        >
-                          <PencilIcon />
-                        </button>
-                      ) : null}
-                      {renamable ? (
-                        <button
-                          type="button"
-                          className={`session__pin-button icon-button ${session.pinned ? 'is-pinned' : ''}`}
-                          aria-label={
-                            session.pinned ? `取消置顶：${heading.title}` : `置顶：${heading.title}`
-                          }
-                          aria-pressed={Boolean(session.pinned)}
-                          title={session.pinned ? '取消置顶' : '置顶'}
-                          data-testid="session-pin"
-                          disabled={orderBusy}
-                          onClick={() => void changeOrder(() => onPin(session.session_id, !session.pinned))}
-                        >
-                          <PinIcon filled={Boolean(session.pinned)} />
-                        </button>
-                      ) : null}
-                      {canReorder && (sameGroup(previous) || sameGroup(next)) ? (
-                        <div className="session__order">
-                          {([[previous, true, '上移', '↑'], [next, false, '下移', '↓']] as const)
-                            .map(([neighbor, before, label, icon]) => (
-                              <button
-                                key={label}
-                                type="button"
-                                className="icon-button session__move-button"
-                                aria-label={`${label}：${heading.title}`}
-                                title={label}
-                                disabled={orderBusy || !sameGroup(neighbor)}
-                                onClick={() => {
-                                  if (neighbor) {
-                                    void changeOrder(() => onMove(session.session_id, neighbor.session_id, before));
-                                  }
-                                }}
-                              >
-                                {icon}
-                              </button>
-                            ))}
+                      <button
+                        type="button"
+                        className="session__more icon-button"
+                        aria-label={`更多操作：${heading.title}`}
+                        aria-haspopup="menu"
+                        aria-expanded={menuOpen}
+                        title="更多操作"
+                        onClick={() => menu.toggle(session.session_id)}
+                      >
+                        <span aria-hidden="true">⋯</span>
+                      </button>
+                      {menuOpen ? (
+                        <div className="session__menu" role="menu" data-testid="session-menu">
+                          {renamable ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="session__menu-item"
+                              aria-label={`改名：${heading.title}`}
+                              onClick={() => startEdit(session)}
+                            >
+                              <PencilIcon /> 改名
+                            </button>
+                          ) : null}
+                          {renamable ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className={`session__menu-item ${session.pinned ? 'is-pinned' : ''}`}
+                              aria-label={
+                                session.pinned ? `取消置顶：${heading.title}` : `置顶：${heading.title}`
+                              }
+                              aria-pressed={Boolean(session.pinned)}
+                              data-testid="session-pin"
+                              disabled={orderBusy}
+                              onClick={() => void changeOrder(() => onPin(session.session_id, !session.pinned))}
+                            >
+                              <PinIcon filled={Boolean(session.pinned)} />
+                              {session.pinned ? '取消置顶' : '置顶'}
+                            </button>
+                          ) : null}
+                          {previous ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="session__menu-item"
+                              aria-label={`上移：${heading.title}`}
+                              disabled={orderBusy}
+                              onClick={() => {
+                                void changeOrder(() => onMove(session.session_id, previous.session_id, true));
+                              }}
+                            >
+                              ↑ 上移
+                            </button>
+                          ) : null}
+                          {next ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="session__menu-item"
+                              aria-label={`下移：${heading.title}`}
+                              disabled={orderBusy}
+                              onClick={() => {
+                                void changeOrder(() => onMove(session.session_id, next.session_id, false));
+                              }}
+                            >
+                              ↓ 下移
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="session__menu-item"
+                            aria-expanded={detailOpen}
+                            aria-label={`会话信息：${heading.title}`}
+                            onClick={() => setDetailId(detailOpen ? null : session.session_id)}
+                          >
+                            会话信息
+                          </button>
                         </div>
                       ) : null}
                     </>
                   )}
+                  {detailOpen && !editing ? (
+                    <dl className="session__detail" data-testid="session-detail">
+                      <div>
+                        <dt>会话键</dt>
+                        <dd className="session__subtitle" title={heading.subtitle}>
+                          {heading.subtitle}
+                        </dd>
+                      </div>
+                      {session.group_reply_max_parts != null ? (
+                        <div>
+                          <dt>每轮最多</dt>
+                          <dd>{session.group_reply_max_parts} 条</dd>
+                        </div>
+                      ) : null}
+                      <div>
+                        <dt>建立于</dt>
+                        <dd>{formatSessionTime(session.created_at)}</dd>
+                      </div>
+                      <div>
+                        <dt>最近活动</dt>
+                        <dd>{formatSessionTime(session.updated_at)}</dd>
+                      </div>
+                    </dl>
+                  ) : null}
                 </div>
               );
             })

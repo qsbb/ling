@@ -775,8 +775,20 @@ export const api = {
       jsonInit('POST', { anchor_id: anchorId, before }),
     );
   },
-  messages(sessionId: string, limit = 200): Promise<MessagesResponse> {
+  /**
+   * 一段会话历史（`before_sequence` = 严格早于该 `sequence`）。
+   *
+   * 后端 `list_messages` 早就支持这个游标，前端一直只取固定 200 条——
+   * 于是"往上翻旧消息"根本没有第二页可翻。游标而不是 offset：消息是**追加**
+   * 的，offset 会随新消息漂移，游标不会（同一页永远同一批 `sequence`）。
+   */
+  messages(
+    sessionId: string,
+    limit = 200,
+    beforeSequence?: number | null,
+  ): Promise<MessagesResponse> {
     const query = new URLSearchParams({ limit: String(limit) });
+    if (beforeSequence != null) query.set('before_sequence', String(beforeSequence));
     return request<MessagesResponse>(
       `/v1/sessions/${encodeURIComponent(sessionId)}/messages?${query.toString()}`,
     );

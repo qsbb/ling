@@ -87,6 +87,11 @@ interface MessageListProps {
   activeTurn: TurnView | null;
   live: LiveTurn | null;
   loading: boolean;
+  /** 正在往上取更早的一页。 */
+  loadingOlder?: boolean;
+  /** 还有更早的历史（决定顶部那行是"读取更早"还是"已经到头"）。 */
+  hasMoreHistory?: boolean;
+  onLoadOlder?: () => void;
   onRetry: (turnId: string) => void;
   onResend: (message: UiMessage) => void;
   onStop: () => void;
@@ -348,55 +353,6 @@ function ErrorCard({ message, onRetry, onResend, onOpenSettings }: {
   );
 }
 
-function ActorMeta({
-  message,
-  liveTurnId,
-  onRetry,
-  variant,
-  align = 'start',
-}: {
-  message: UiMessage;
-  liveTurnId: string | null;
-  onRetry: (turnId: string) => void;
-  variant: DialogueVariant;
-  /** 她的话在右：状态与时间也贴右。 */
-  align?: 'start' | 'end';
-}) {
-  const stateText =
-    message.role === 'actor' ? statusText(message, liveTurnId, variant) : '';
-  return (
-    <div
-      className={`message__meta${align === 'end' ? ' message__meta--own' : ''}`}
-    >
-      {stateText ? (
-        <span className={`state state--${message.state}`}>
-          {message.state === 'completed' ? <CheckIcon size={12} /> : null}
-          {message.state === 'streaming' || message.state === 'pending' ? (
-            <span className="state__pulse" aria-hidden="true" />
-          ) : null}
-          {stateText}
-        </span>
-      ) : null}
-      {message.modelLabel ? (
-        <span className="message__model" title={message.modelLabel}>
-          {formatModelLabel(message.modelLabel)}
-        </span>
-      ) : null}
-      {message.attempt > 1 ? <span className="message__attempt">第 {message.attempt} 次尝试</span> : null}
-      {message.state === 'stopped' && message.turnId ? (
-        <button
-          type="button"
-          className="button button--small"
-          onClick={() => onRetry(message.turnId as string)}
-        >
-          <RefreshIcon /> 继续这一轮
-        </button>
-      ) : null}
-      <span className="message__time">{formatClock(message.createdAt)}</span>
-    </div>
-  );
-}
-
 /**
  * 她没回的原因。
  *
@@ -420,11 +376,183 @@ function SilenceNote({ note }: { note: { text: string; run: number } }) {
   );
 }
 
+/**
+ * 顶部「读取更早」。
+ *
+ * 为什么要有这一行而不只靠滚到顶自动拉：自动拉在触控板上会连发好几次
+ * （每次拼接又让 scrollTop 接近 0），给手滑的人一个明确的按钮，比让列表
+ * 自己动更可预期。滚动到顶也仍然触发一次（见 `onScroll`）。
+ */
+function HistoryEdge({
+  loading,
+  hasMore,
+  onLoad,
+}: {
+  loading: boolean;
+  hasMore: boolean;
+  onLoad: (() => void) | undefined;
+}) {
+  if (!hasMore && !loading) {
+    return (
+      <li className="messages__edge messages__edge--end" data-testid="history-start">
+        这里是这段对话的开头
+      </li>
+    );
+  }
+  return (
+    <li className="messages__edge" data-testid="history-edge">
+      <button
+        type="button"
+        className="messages__edge-button"
+        disabled={loading}
+        onClick={() => onLoad?.()}
+      >
+        {loading ? (
+          <>
+            <span className="spinner" aria-hidden="true" />
+            正在读取更早的消息…
+          </>
+        ) : (
+          '读取更早的消息'
+        )}
+      </button>
+    </li>
+  );
+}
+
+/** 消息类型的人话标签：媒体占位与语音共用一套"这是什么"的说明。 */
+const MEDIA_LABELS: Record<string, string> = {
+  image: '图片',
+  voice: '语音',
+  video: '视频',
+  file: '文件',
+  '表情包': '表情包',
+  '表情': '表情',
+};
+
+/**
+ * 正文里的媒体占位（`[image]` / `[voice]` …）。
+ *
+ * 连接器把入站媒体的**位置**以方括号标记写进正文（`bridge._MEDIA_MARKERS`
+ * 认的就是这一套），但没有任何字节或 URL 随消息契约下发——入站媒体按设计
+ * 不落本地盘。所以这里**不画一张假图片**：画成"这里有一张图片"的可读块，
+ * 让版式、阅读顺序和"她看到的是占位"这件事都不被藏起来。
+ */
+function MediaTokens({
+  text,
+  own,
+}: {
+  text: string;
+  own: boolean;
+}) {
+  const parts = text.split(/(\[(?:image|voice|video|file|表情包|表情)\])/g);
+  if (parts.length <= 1) return <>{text}</>;
+  return (
+    <>
+      {parts.map((part, index) => {
+        const matched = /^\[(image|voice|video|file|表情包|表情)\]$/.exec(part);
+        if (!matched) {
+          return part ? <span key={index}>{part}</span> : null;
+        }
+        const key = matched[1] ?? 'image';
+        return (
+          <span
+            key={index}
+            className="message__media"
+            data-kind={key}
+            data-testid="message-media"
+            data-own={own ? 'true' : undefined}
+          >
+            <span className="message__media-mark" aria-hidden="true" />
+            {MEDIA_LABELS[key] ?? '附件'}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * 一条消息的详情：模型、尝试次数、时间、以及「她这次看到了什么」。
+ *
+ * 这些原来散在气泡下方的 meta 行里——模型徽标每条都刷一遍，把真正要读的
+ * 状态（失败/停止/失败原因）淹掉。现在状态留在主行（它决定"要不要处理"），
+ * 其余收进这条消息自己的折叠区，默认收起。
+ */
+function MessageDetails({
+  message,
+  align,
+  promptEnabled,
+  promptOpen,
+  clock,
+  onOpenPrompt,
+}: {
+  message: UiMessage;
+  align: 'start' | 'end';
+  promptEnabled: boolean;
+  promptOpen: boolean;
+  clock: string;
+  onOpenPrompt: ((message: UiMessage, trigger: HTMLElement) => void) | undefined;
+}) {
+  const hasPrompt = message.role === 'actor' && promptEnabled && onOpenPrompt !== undefined;
+  /*
+   * 只放**主行没有**的事实。时间在主行（读历史时"什么时候说的"是阅读本身
+   * 需要的），这里再列一遍就是同一信息说两次；`clock` 仅用于 `title` 悬停。
+   */
+  type Fact = { label: string; value: string; title?: string };
+  const candidates: Array<Fact | null> = [
+    message.modelLabel ? { label: '模型', value: formatModelLabel(message.modelLabel), title: message.modelLabel } : null,
+    message.attempt > 1 ? { label: '尝试', value: `第 ${message.attempt} 次`, title: clock } : null,
+  ];
+  const facts = candidates.filter((item): item is Fact => item !== null);
+
+  if (!hasPrompt && facts.length === 0) return null;
+
+  return (
+    <details
+      className={`message__details${align === 'end' ? ' message__details--own' : ''}`}
+      data-testid="message-details"
+    >
+      {/*
+        summary 只写「详情」。原来写成「详情 · 她这次看到了什么」，展开后下面
+        又是一个同名按钮——同一句话在同一块里出现两次。
+      */}
+      <summary className="message__details-summary">详情</summary>
+      {facts.length > 0 ? (
+        <dl className="message__facts">
+          {facts.map((fact) => (
+            <div key={fact.label}>
+              <dt>{fact.label}</dt>
+              <dd title={fact.title}>{fact.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {hasPrompt ? (
+        <button
+          type="button"
+          className="message__prompt"
+          data-testid="prompt-entry"
+          aria-haspopup="dialog"
+          aria-expanded={promptOpen}
+          aria-controls={PROMPT_DRAWER_ID}
+          onClick={(event) => onOpenPrompt(message, event.currentTarget)}
+        >
+          {PROMPT_ENTRY_LABEL}
+        </button>
+      ) : null}
+    </details>
+  );
+}
+
 export function MessageList({
   messages,
   activeTurn,
   live,
   loading,
+  loadingOlder = false,
+  hasMoreHistory = false,
+  onLoadOlder,
   onRetry,
   onResend,
   onStop,
@@ -509,6 +637,9 @@ export function MessageList({
 
   return (
     <ol className="messages__list" aria-live="polite">
+      {messages.length > 0 ? (
+        <HistoryEdge loading={loadingOlder} hasMore={hasMoreHistory} onLoad={onLoadOlder} />
+      ) : null}
       {messages.length === 0 ? (
         <li className="messages__empty">
           <p className="messages__empty-title">开始一段对话</p>
@@ -526,6 +657,12 @@ export function MessageList({
           );
         }
         const streaming = message.state === 'streaming' || message.state === 'pending';
+        /*
+         * 失败且没有任何正文：气泡不画。错误卡片（下面）已经说清了失败原因
+         * 与可做的动作；再留一个空壳气泡，读者只会看到一块莫名其妙的色块。
+         * 有正文时气泡照旧保留——那是失败前已经生成出来的部分，不该藏。
+         */
+        const emptyFailure = message.state === 'failed' && !streaming && !message.text;
         const clock = formatClock(message.createdAt);
         const inboundState = row.inbound ? statusText(message, liveTurnId, variant) : '';
         /*
@@ -590,6 +727,7 @@ export function MessageList({
                   ) : null}
                 </div>
               ) : null}
+              {emptyFailure ? null : (
               <div
                 className={`message__bubble ${streaming ? 'message__bubble--streaming' : ''}${
                   message.recalledAt ? ' message__bubble--recalled' : ''
@@ -606,7 +744,9 @@ export function MessageList({
                   </span>
                 ) : null}
                 {message.text ? (
-                  <span className="message__text">{message.text}</span>
+                  <span className="message__text">
+                    <MediaTokens text={message.text} own={row.own} />
+                  </span>
                 ) : streaming ? (
                   <span className="message__typing" aria-label="正在生成">
                     <i />
@@ -621,11 +761,16 @@ export function MessageList({
                   </span>
                 ) : message.state === 'stopped' ? (
                   <span className="message__empty">已停止，未生成内容</span>
+                ) : message.state === 'failed' ? (
+                  // 失败时正文本来就可能是空的，而下面紧跟着错误卡片。
+                  // 再写一句「（无内容）」等于同一件事说两遍，还把错误推远。
+                  null
                 ) : (
                   <span className="message__empty">（无内容）</span>
                 )}
                 {streaming && message.text ? <span className="caret" aria-hidden="true" /> : null}
               </div>
+              )}
               {/*
                 语音消息（SP03）：`<audio>` 放不进气泡文本里——它是块级控件，
                 塞进 `message__text` 会让正文与播放器互相挤。所以挂在气泡**下面**，
@@ -654,55 +799,50 @@ export function MessageList({
               {/* 她想撤回这条：卡片紧贴在这条消息下面，不另找地方。 */}
               {renderProposals(message.messageId)}
               {/*
-                meta 行按"谁说的话"分，不再按"谁发起的请求"：
-                - 她：完整状态（模型、第几次尝试、停止后继续）——左右对调之后
-                  她自己出现在右边，这套原来只属于"我发的"渲染要跟着搬过来；
-                - 别人（`role=user`）：只留状态与时间，渠道会话里不逐条刷「已送达」。
+                主行只留**要人处理的信号**：失败/停止/生成中，以及"继续这一轮"。
+                模型名、第几次尝试这类"事后想核对"的信息收进下面的详情折叠区
+                （图七的问题就是它们逐条挤在气泡之间）。
+                时间保留在主行：读历史时"这条是什么时候说的"是阅读本身需要的。
               */}
-              {row.own ? (
-                <ActorMeta
-                  message={message}
-                  liveTurnId={liveTurnId}
-                  onRetry={onRetry}
-                  variant={variant}
-                  align="end"
-                />
-              ) : message.role === 'user' ? (
-                // 渠道会话的入站消息：只留时间，状态只在失败/待发时出现。
-                inboundState || clock ? (
-                  <div className="message__meta">
-                    {inboundState ? (
-                      <span className={`state state--${message.state}`}>{inboundState}</span>
+              <div
+                className={`message__meta${row.own ? ' message__meta--own' : ''}`}
+              >
+                {statusText(message, liveTurnId, variant) ? (
+                  <span className={`state state--${message.state}`}>
+                    {message.state === 'completed' ? <CheckIcon size={12} /> : null}
+                    {message.state === 'streaming' || message.state === 'pending' ? (
+                      <span className="state__pulse" aria-hidden="true" />
                     ) : null}
-                    {clock ? <span className="message__time">{clock}</span> : null}
-                  </div>
-                ) : null
-              ) : (
-                <ActorMeta
-                  message={message}
-                  liveTurnId={liveTurnId}
-                  onRetry={onRetry}
-                  variant={variant}
-                />
-              )}
+                    {statusText(message, liveTurnId, variant)}
+                  </span>
+                ) : null}
+                {message.state === 'stopped' && message.turnId ? (
+                  <button
+                    type="button"
+                    className="button button--small"
+                    onClick={() => onRetry(message.turnId as string)}
+                  >
+                    <RefreshIcon /> 继续这一轮
+                  </button>
+                ) : null}
+                {clock ? <span className="message__time">{clock}</span> : null}
+                {inboundState && !statusText(message, liveTurnId, variant) ? (
+                  <span className={`state state--${message.state}`}>{inboundState}</span>
+                ) : null}
+              </div>
               {/*
-                她的消息下面那行小字：她这一轮到底看到了什么。
+                详情折叠：模型、尝试次数、精确时间，以及「她这次看到了什么」。
                 没有 turn_id / 已经被归档的消息**也要能点**——服务端 404 时
                 抽屉里给「这次没有记录」，不在入口上提前猜。
               */}
-              {message.role === 'actor' && promptEnabled && onOpenPrompt ? (
-                <button
-                  type="button"
-                  className="message__prompt"
-                  data-testid="prompt-entry"
-                  aria-haspopup="dialog"
-                  aria-expanded={promptOpenKey === message.key}
-                  aria-controls={PROMPT_DRAWER_ID}
-                  onClick={(event) => onOpenPrompt(message, event.currentTarget)}
-                >
-                  {PROMPT_ENTRY_LABEL}
-                </button>
-              ) : null}
+              <MessageDetails
+                message={message}
+                align={row.own ? 'end' : 'start'}
+                promptEnabled={promptEnabled}
+                promptOpen={promptOpenKey === message.key}
+                clock={clock}
+                onOpenPrompt={onOpenPrompt}
+              />
               {row.silence ? <SilenceNote note={row.silence} /> : null}
             </div>
           </li>

@@ -376,12 +376,14 @@ describe('Web 会话对话设置', () => {
       if (error) { console.warn(error); ctx.skip(); return; }
       const { page } = await openChat('owner', width);
       const button = page.getByRole('button', { name: '会话设置' });
+      // 面板**只挂载一份**：收起时整个卸载，展开时重新挂载同一条会话。
+      // 所以「开着」= 存在且可见，「收起」= 0 个；任何时刻都不会出现第 2 个。
       const panel = page.locator('#active-window-policy .window-policy');
-      for (const count of [1, 0, 1, 0, 1]) {
+      for (const open of [true, false, true, false, true]) {
         await button.click();
-        await expect.poll(() => button.getAttribute('aria-expanded')).toBe(String(count === 1));
-        await expect.poll(() => panel.isVisible()).toBe(count === 1);
-        expect(await panel.count()).toBe(1);
+        await expect.poll(() => button.getAttribute('aria-expanded')).toBe(String(open));
+        await expect.poll(() => panel.count()).toBe(open ? 1 : 0);
+        expect(await panel.count()).toBeLessThanOrEqual(1);
       }
     }, 20000);
   }

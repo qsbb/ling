@@ -40,6 +40,8 @@ import type {
 /** 无新数据多久算超时（服务端会先给 provider_timeout，这里只兜底网络静默）。 */
 const STREAM_IDLE_MS = 45_000;
 const POLL_MS = 2_000;
+/** 一页历史条数。与后端 `list_messages` 的上限（500）留出余量。 */
+const PAGE_SIZE = 100;
 const STOP_FALLBACK_MS = 5_000;
 
 export interface UiMessage {
@@ -79,6 +81,12 @@ export interface UiMessage {
   recalledAt: string | null;
   /** 是她自己撤回的（区别于"对方撤回"）。 */
   recalledByActor: boolean;
+  /**
+   * 服务端单调序号。历史分页的游标就是它——本地未落库的消息没有序号（`null`）。
+   *
+   * 可选：既有测试 fixture 按旧字段集构造，缺省按 `null` 处理（= 不可作游标）。
+   */
+  sequence?: number | null;
 }
 
 export interface LiveTurn {
@@ -142,6 +150,7 @@ function buildServerMessage(message: ChatMessage): UiMessage {
     // 此时 `retracted_at` 不该覆盖它（那是"对方撤回"，语义不同）。
     recalledAt: optionalText(message.recalled_at) ?? optionalText(message.retracted_at),
     recalledByActor: Boolean(optionalText(message.recalled_at)),
+    sequence: typeof message.sequence === 'number' ? message.sequence : null,
   };
 }
 
@@ -176,6 +185,7 @@ function emptyActor(key: string, turnId: string | null): UiMessage {
     senderId: null,
     recalledAt: null,
     recalledByActor: false,
+    sequence: null,
   };
 }
 
@@ -198,6 +208,12 @@ export interface ChatState {
   notice: Notice | null;
   bootstrapping: boolean;
   loadingMessages: boolean;
+  /** 正在往上取更早的一页（界面在列表顶部显示一行"正在读取"）。 */
+  loadingOlder: boolean;
+  /** 还有更早的历史可以取。 */
+  hasMoreHistory: boolean;
+  /** 取更早的一页，并把它拼在现有消息前面（失败只落 notice，不动现有视图）。 */
+  loadOlder: () => void;
   loadError: ExplainedError | null;
   send: (text: string) => void;
   resend: (message: UiMessage) => void;
@@ -276,7 +292,17 @@ export function useChat(
   const [notice, setNotice] = useState<Notice | null>(null);
   const [bootstrapping, setBootstrapping] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [loadError, setLoadError] = useState<ExplainedError | null>(null);
+  /**
+   * 还有没有更早的一页。
+   *
+   * 判据是「这一页取满了 `PAGE_SIZE`」而不是「条数为 0」：后端没有给 total，
+   * 只有"这一页有没有被截断"这一个信号。取满就说可能还有——多点一次最多多
+   * 一次空请求，比"少一条没加载却显示已经到头"更可接受。
+   */
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const loadingOlderRef = useRef(false);
   const [recallProposals, setRecallProposals] = useState<RecallProposalView[]>([]);
   const [recallProposalsUnavailable, setRecallProposalsUnavailable] = useState(false);
   /*
@@ -376,10 +402,12 @@ export function useChat(
     setLoadingMessages(true);
     setLoadError(null);
     try {
-      const data = await api.messages(sessionId);
+      const data = await api.messages(sessionId, PAGE_SIZE);
       if (currentIdRef.current !== sessionId) return;
       setMessages(mapServerMessages(data.messages));
       setActiveTurn(data.active_turn);
+      // 第一页被截断 = 前面还有；没截断就是到头了。
+      setHasMoreHistory(data.messages.length >= PAGE_SIZE);
     } catch (error) {
       if (currentIdRef.current !== sessionId) return;
       const explained = explainError(error);
@@ -387,6 +415,54 @@ export function useChat(
     } finally {
       if (currentIdRef.current === sessionId) setLoadingMessages(false);
     }
+  }, []);
+
+  /**
+   * 往上取一页。
+   *
+   * 游标取**当前最早一条有 sequence 的消息**——不能用 `messages[0]`：列表首位
+   * 可能是本地刚发出、还没落库的那条（`sequence = null`），拿它当游标会
+   * 反复请求同一段历史。
+   *
+   * 合并按 `messageId` 去重：轮询在分页请求飞行期间可能已经把同一批消息
+   * 写进视图，直接 prepend 会出现重复 key（React 会开始丢行）。
+   */
+  const loadOlder = useCallback(() => {
+    const sessionId = currentIdRef.current;
+    if (!sessionId || loadingOlderRef.current) return;
+    const cursor = messagesRef.current.find(
+      (message) => typeof message.sequence === 'number',
+    )?.sequence;
+    if (cursor == null) {
+      setHasMoreHistory(false);
+      return;
+    }
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    void (async () => {
+      try {
+        const data = await api.messages(sessionId, PAGE_SIZE, cursor);
+        if (currentIdRef.current !== sessionId) return;
+        const older = mapServerMessages(data.messages);
+        setHasMoreHistory(older.length >= PAGE_SIZE);
+        if (older.length > 0) {
+          setMessages((prev) => {
+            const seen = new Set(prev.map((message) => message.key));
+            const head = older.filter((message) => !seen.has(message.key));
+            return head.length > 0 ? [...head, ...prev] : prev;
+          });
+        }
+      } catch (error) {
+        if (currentIdRef.current !== sessionId) return;
+        const explained = explainError(error);
+        if (explained.code !== 'unauthorized') {
+          setNotice({ kind: 'error', text: `读取更早的消息失败：${explained.reason}` });
+        }
+      } finally {
+        loadingOlderRef.current = false;
+        if (currentIdRef.current === sessionId) setLoadingOlder(false);
+      }
+    })();
   }, []);
 
   const reloadMessages = useCallback(() => {
@@ -498,6 +574,9 @@ export function useChat(
     // 语音同样按会话：切会话必须清空，否则播放器会挂到新会话的消息下面。
     setVoices(new Map());
     setVoicesUnavailable(false);
+    setHasMoreHistory(false);
+    loadingOlderRef.current = false;
+    setLoadingOlder(false);
     setBootstrapping(true);
 
     (async () => {
@@ -953,6 +1032,7 @@ export function useChat(
           senderId: null,
           recalledAt: null,
           recalledByActor: false,
+          sequence: null,
         },
       ]);
       void pump({
@@ -1297,6 +1377,9 @@ export function useChat(
     notice,
     bootstrapping,
     loadingMessages,
+    loadingOlder,
+    hasMoreHistory,
+    loadOlder,
     loadError,
     send,
     resend,

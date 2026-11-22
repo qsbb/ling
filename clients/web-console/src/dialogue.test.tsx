@@ -22,6 +22,7 @@ import {
   statusText,
 } from './components/MessageList';
 import {
+  buildSessionRows,
   canRenameSession,
   describeSession,
   parseChannelRef,
@@ -265,8 +266,8 @@ describe('会话命名：群名作标题，机器键只当副标题', () => {
 });
 
 describe('会话列表：标题、副标题、渠道标签、键盘可达', () => {
-  it('列表项的标题是群名/回退名，副标题才是完整会话键', () => {
-    const html = renderSidebar([
+  it('列表项的标题是群名/回退名，完整会话键默认不占阅读宽度', () => {
+    const sessions = [
       sessionFixture({
         session_id: 'win_group',
         title: GROUP_REF,
@@ -276,13 +277,22 @@ describe('会话列表：标题、副标题、渠道标签、键盘可达', () =
       }),
       sessionFixture({ session_id: 'win_private', title: PRIVATE_REF }),
       sessionFixture({ session_id: 'win_web', title: '深夜聊天', channel: 'web' }),
-    ]);
+    ];
+    const html = renderSidebar(sessions);
 
     expect(sessionTitles(html)).toEqual(['阿懒的家', '私聊 100200301', '深夜聊天']);
-    // 悬停拿全量：标题与副标题都带 title 属性
+    // 标题仍可悬停拿全量
     expect(html).toContain('title="阿懒的家"');
-    expect(html).toContain(`title="${GROUP_REF}"`);
-    expect(html).toContain(`title="${PRIVATE_REF}"`);
+    // **外部键默认不渲染**（需求 1：外部 ID 按需展开）：主行只读
+    // 名称 + 群/私聊 + 近期活动。机器键在会话信息里，由 buildSessionRows 给。
+    expect(html).not.toContain('class="session__subtitle"');
+    expect(html).not.toContain(`>${GROUP_REF}<`);
+    expect(html).not.toContain(`>${PRIVATE_REF}<`);
+    expect(buildSessionRows(sessions, null, 'owner').map((row) => row.heading.subtitle)).toEqual([
+      GROUP_REF,
+      PRIVATE_REF,
+      'win_web',
+    ]);
     // 群/私聊/网页三种会话在列表里一眼可分
     expect(countOf(html, 'class="session__channel"')).toBe(3);
     expect(html).toContain('>群<');
@@ -290,15 +300,23 @@ describe('会话列表：标题、副标题、渠道标签、键盘可达', () =
     expect(html).toContain('>网页<');
   });
 
-  it('列表项保留原生按钮，成员只能改网页会话名', () => {
-    const html = renderSidebar([
+  it('列表项保留原生按钮，成员只能改网页会话名（操作在「更多」菜单里）', () => {
+    const sessions = [
       sessionFixture({ session_id: 'win_group', title: GROUP_REF }),
       sessionFixture({ session_id: 'win_web', title: '深夜聊天', channel: 'web' }),
-    ], { ...USER, role: 'member' });
+    ];
+    const html = renderSidebar(sessions, { ...USER, role: 'member' });
     expect(countOf(html, '<button type="button" class="session__main"')).toBe(2);
-    // 只有网页会话能改名，且改名按钮本身是 button
-    expect(countOf(html, 'aria-label="改名：')).toBe(1);
-    expect(html).toContain('aria-label="改名：深夜聊天"');
+    // 主行不再常驻改名按钮：每条一个「更多」入口，菜单未展开时菜单项不渲染。
+    expect(countOf(html, 'class="session__more icon-button"')).toBe(2);
+    expect(countOf(html, 'class="session__menu"')).toBe(0);
+    expect(countOf(html, 'aria-label="改名：')).toBe(0);
+    // "成员只能改网页会话名"这条语义由菜单项集合决定——用纯函数钉住它。
+    const rows = buildSessionRows(sessions, null, 'member');
+    expect(rows.map((row) => [row.heading.title, row.renamable])).toEqual([
+      ['群 100200400', false],
+      ['深夜聊天', true],
+    ]);
   });
 });
 
@@ -595,27 +613,37 @@ describe('置顶：按钮与排序（R8 前端）', () => {
     expect(a).toBeLessThan(c);
   });
 
-  it('按钮带 aria-pressed，读屏能听出"已置顶/未置顶"', () => {
+  it('已置顶的那条在主行有可见标记，读屏能听出"已置顶"', () => {
     const pinnedHtml = renderSidebar([
       sessionFixture({ session_id: 'web-b', title: '已置顶', pinned: true }),
     ]);
     const plainHtml = renderSidebar([
       sessionFixture({ session_id: 'web-a', title: '没置顶', pinned: false }),
     ]);
-    expect(pinnedHtml).toContain('aria-pressed="true"');
-    expect(pinnedHtml).toContain('取消置顶');
-    expect(plainHtml).toContain('aria-pressed="false"');
-    expect(plainHtml).toContain('title="置顶"');
+    expect(pinnedHtml).toContain('class="session__pin-flag" title="已置顶"');
+    expect(plainHtml).not.toContain('class="session__pin-flag"');
+    // 置顶/取消置顶的按钮（带 aria-pressed）在「更多」菜单里，按需展开。
+    const rows = buildSessionRows(
+      [sessionFixture({ session_id: 'web-b', title: '已置顶', pinned: true })],
+      null,
+      'owner',
+    );
+    expect(rows[0]?.session.pinned).toBe(true);
   });
 
   it('旧服务端没有 pinned 字段时按"未置顶"处理，不报错', () => {
     const html = renderSidebar([
       sessionFixture({ session_id: 'web-a', title: '旧服务端' }),
     ]);
-    expect(html).toContain('aria-pressed="false"');
+    expect(html).not.toContain('class="session__pin-flag"');
+    expect(buildSessionRows(
+      [sessionFixture({ session_id: 'web-a', title: '旧服务端' })],
+      null,
+      'owner',
+    )[0]?.session.pinned).toBeFalsy();
   });
 
-  it('管理员可以改名和置顶渠道窗口', () => {
+  it('管理员可以改名和置顶渠道窗口，成员不行', () => {
     const sessions = [
       sessionFixture({
         session_id: 'onebot-default:group:100200300',
@@ -624,11 +652,13 @@ describe('置顶：按钮与排序（R8 前端）', () => {
         peer_id: '100200300',
       }),
     ];
+    // 菜单项由 `renamable` 决定；置顶/排序项与它同一开关。
+    expect(buildSessionRows(sessions, null, 'owner')[0]?.renamable).toBe(true);
+    expect(buildSessionRows(sessions, null, 'member')[0]?.renamable).toBe(false);
+    // 渲染层确认菜单入口对两种角色都在（只是成员展开后没有改名项）。
     const owner = renderSidebar(sessions);
     const member = renderSidebar(sessions, { ...USER, role: 'member' });
-    expect(owner).toContain('改名：群 100200300');
-    expect(owner).toContain('data-testid="session-pin"');
-    expect(member).not.toContain('改名：群 100200300');
-    expect(member).not.toContain('data-testid="session-pin"');
+    expect(countOf(owner, 'class="session__more icon-button"')).toBe(1);
+    expect(countOf(member, 'class="session__more icon-button"')).toBe(1);
   });
 });
