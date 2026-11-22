@@ -140,6 +140,23 @@ def test_preflight_rejects_an_empty_runtime_archive_even_with_matching_hash(pack
     assert "版本产物不是包含文件的 tar 归档" in report.errors
 
 
+def test_preflight_rejects_incomplete_runtime_member_with_matching_hash(package: Path) -> None:
+    name = "artifacts/app-image.tar"
+    runtime = package / name
+    with tarfile.open(runtime) as archive:
+        first_member = archive.next()
+        assert first_member is not None and first_member.size > 0
+        header_end = first_member.offset_data
+    runtime.write_bytes(runtime.read_bytes()[:header_end])
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][name] = f"sha256:{_hex(runtime.read_bytes())}"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    report = preflight_package(package)
+    assert not report.ok
+    assert "版本产物归档已损坏或不完整" in report.errors
+
+
 def test_preflight_rejects_files_reached_through_a_symlink(package: Path, tmp_path: Path) -> None:
     config = package / "config"
     external = tmp_path / "external"

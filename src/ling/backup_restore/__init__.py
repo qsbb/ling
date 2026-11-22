@@ -164,13 +164,24 @@ def _verify_file(
 
 
 def _check_runtime_archive(path: Path, report: PreflightReport) -> None:
+    contains_files = False
     try:
-        with tarfile.open(path) as archive:
-            if any(entry.isfile() for entry in archive):
-                return
-    except (OSError, tarfile.TarError):
-        pass
-    report.errors.append("版本产物不是包含文件的 tar 归档")
+        with tarfile.open(path, mode="r|*") as archive:
+            for entry in archive:
+                if not entry.isfile():
+                    continue
+                stream = archive.extractfile(entry)
+                if stream is None:
+                    raise tarfile.ReadError("missing archive member")
+                with stream:
+                    while stream.read(1024 * 1024):
+                        pass
+                contains_files = True
+    except (EOFError, OSError, tarfile.TarError):
+        report.errors.append("版本产物归档已损坏或不完整")
+        return
+    if not contains_files:
+        report.errors.append("版本产物不是包含文件的 tar 归档")
 
 
 def preflight_package(
