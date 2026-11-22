@@ -7,39 +7,35 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
 import shutil
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import (
     FORMAT_VERSION,
     MANIFEST_NAME,
+    ROOT_KEY_FILE,
+    RUNTIME_FILES,
     BackupRestoreError,
     current_runtime_arch,
     estimate_required_bytes,
+    preflight_package,
+    sha256_file,
 )
 
 
-def _digest(path: Path) -> str:
-    hash_value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            hash_value.update(chunk)
-    return f"sha256:{hash_value.hexdigest()}"
-
-
-def _copy(source: Path, destination: Path, *, mode: int | None = None) -> str:
+def _copy(source: Path, destination: Path) -> str:
     if not source.is_file():
         raise BackupRestoreError(f"源文件不存在：{source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    if mode is not None:
-        os.chmod(destination, mode)
-    return _digest(destination)
+    shutil.copyfile(source, destination)
+    os.chmod(destination, 0o600)
+    return f"sha256:{sha256_file(destination)}"
 
 
 def build_full_package(
@@ -52,6 +48,7 @@ def build_full_package(
     compose_file: Path,
     tool_plugins: Path,
     persona_file: Path,
+    runtime_archive: Path,
     app_version: str,
     commit: str,
     migration: str,
@@ -61,31 +58,27 @@ def build_full_package(
     tombstones_state: str = "ok",
     secrets: dict[str, Any] | None = None,
 ) -> Path:
-    """生成一个可被 :func:`preflight_package` 接受的完整包。"""
+    """汇集宿主已有的备份、配置和发行产物，校验后公布包目录。"""
     if output.exists():
         raise BackupRestoreError(f"输出目录已存在：{output}")
-    output.mkdir(parents=True)
-    files: dict[str, str] = {}
-    files["database.dump"] = _copy(dump, output / "database.dump")
-    files["media.tar"] = _copy(media_tar, output / "media.tar")
-    files["config/deploy.env"] = _copy(deploy_env, output / "config" / "deploy.env", mode=0o600)
-    files["config/compose.yaml"] = _copy(compose_file, output / "config" / "compose.yaml")
-    files["state/tool-plugins.json"] = _copy(
-        tool_plugins, output / "state" / "tool-plugins.json"
-    )
-    files["state/persona.json"] = _copy(persona_file, output / "state" / "persona.json")
-    artifact_path = output / "artifacts" / "app-image.json"
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
-    files["artifacts/app-image.json"] = _digest(artifact_path)
+    mode = artifact.get("mode")
+    if not isinstance(mode, str) or mode not in RUNTIME_FILES:
+        raise BackupRestoreError("artifact.mode 必须是 image 或 source")
+    payload = {
+        "database.dump": dump,
+        "media.tar": media_tar,
+        "config/deploy.env": deploy_env,
+        "config/compose.yaml": compose_file,
+        "state/tool-plugins.json": tool_plugins,
+        "state/persona.json": persona_file,
+        RUNTIME_FILES[mode]: runtime_archive,
+    }
     if root_key is not None:
-        files["secrets/root.key"] = _copy(root_key, output / "secrets" / "root.key", mode=0o600)
+        payload[ROOT_KEY_FILE] = root_key
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
-        "created_at": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        ).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "version": {
             "app": app_version,
             "commit": commit,
@@ -103,14 +96,26 @@ def build_full_package(
         },
         "secrets": secrets or {"root_key_source": "file", "credential_scope": ["database"]},
         "integrity": {"tombstones_state": tombstones_state},
-        "resources": {
-            "required_bytes": estimate_required_bytes(output),
-            "platform": current_runtime_arch(),
-        },
-        "files": files,
         "host": {"arch": platform.machine(), "os": platform.system()},
     }
-    (output / MANIFEST_NAME).write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".backup-") as stage_dir:
+        stage = Path(stage_dir) / "package"
+        stage.mkdir(mode=0o700)
+        files = {name: _copy(source, stage / name) for name, source in payload.items()}
+        descriptor = stage / "artifacts" / "app-image.json"
+        descriptor.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+        files["artifacts/app-image.json"] = f"sha256:{sha256_file(descriptor)}"
+        manifest["files"] = files
+        manifest["resources"] = {
+            "required_bytes": estimate_required_bytes(stage),
+            "platform": current_runtime_arch(),
+        }
+        (stage / MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        report = preflight_package(stage)
+        if not report.ok:
+            raise BackupRestoreError("无法生成完整包：" + "；".join(report.errors))
+        stage.rename(output)
     return output

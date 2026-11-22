@@ -1,102 +1,81 @@
-"""整包备份与导入恢复的 Web 控制入口。
-
-这里刻意只做两件事：
-
-1. 只读当前受控目录里的备份列表、包清单和预检结果；
-2. owner 通过同源 POST 提交“创建/导入预检/确认恢复”请求，API 把请求原子写进
-   宿主执行器目录，不直接执行 docker，也不把密钥内容回给浏览器。
-
-真正的宿主单命令入口是 ``deploy/backup/restore_full.py``；即使 Web 不可用，
-管理员也能在宿主上完成恢复。
-"""
+"""所有者查看受控目录中的整包备份并校验文件。"""
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
-import time
+import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-from ling.api.deps import CurrentAuth, SettingsDep
-from ling.api.errors import LingError
-from ling.api.guards import OwnerWrite
-from ling.backup_restore import (
-    BackupRestoreError,
-    current_runtime_arch,
-    estimate_required_bytes,
-    preflight_package,
-    redact_env,
-)
+from ling.api.deps import SettingsDep
+from ling.api.errors import LingError, invalid, not_found
+from ling.api.guards import OwnerAuth, OwnerWrite
+from ling.backup_restore import SAFE_NAME, current_runtime_arch, load_manifest, preflight_package
+from ling.contracts.v1 import ErrorCode
 
 router = APIRouter(tags=["backup-restore"])
 
-REQUESTS_ENV = "LING_BACKUP_RESTORE_REQUESTS_DIR"
-DEFAULT_REQUESTS_DIRNAME = ".run/backup-restore/requests"
-DEFAULT_PACKAGE_DIRNAME = ".data/backup-packages"
-
-
-def _requests_dir(settings: SettingsDep) -> Path:
-    configured = os.environ.get(REQUESTS_ENV, "").strip()
-    return (
-        Path(configured).expanduser().resolve()
-        if configured
-        else settings.data_dir.parent / ".run" / "backup-restore" / "requests"
-    )
-
 
 def _package_dir(settings: SettingsDep) -> Path:
-    return settings.data_dir.parent / ".data" / "backup-packages"
+    configured = os.environ.get("LING_BACKUP_RESTORE_PACKAGES_DIR", "").strip()
+    return Path(configured).expanduser() if configured else settings.data_dir / "backup-packages"
 
 
-def _disk_free(path: Path) -> int | None:
-    try:
-        return shutil_disk_usage(path).free
-    except OSError:
-        return None
+def _display_fields(manifest: dict[str, Any], section: str, keys: tuple[str, ...]) -> dict[str, str]:
+    fields = manifest.get(section)
+    if not isinstance(fields, dict):
+        return {}
+    return {key: fields[key] for key in keys if isinstance(fields.get(key), str)}
 
 
-def shutil_disk_usage(path: Path):
-    import shutil
+def _list_packages(root: Path) -> list[dict[str, str | None]]:
+    packages = []
+    if root.is_dir():
+        for path in sorted(root.iterdir()):
+            if not SAFE_NAME.fullmatch(path.name) or not path.is_dir() or path.is_symlink():
+                continue
+            manifest, report = load_manifest(path)
+            if report.errors or not manifest:
+                continue
+            version = _display_fields(manifest, "version", ("app", "commit", "migration"))
+            artifact = _display_fields(manifest, "artifact", ("digest", "release_id"))
+            packages.append(
+                {
+                    "name": path.name,
+                    "version": version.get("app"),
+                    "commit": version.get("commit"),
+                    "migration": version.get("migration"),
+                    "artifact": artifact.get("digest") or artifact.get("release_id"),
+                }
+            )
+    return packages
 
-    return shutil.disk_usage(path)
 
-
-def _request_files(directory: Path) -> list[dict[str, Any]]:
-    if not directory.is_dir():
-        return []
-    rows: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError):
-            continue
-        if isinstance(payload, dict):
-            rows.append({"id": path.stem, **payload})
-    return rows
-
-
-def _write_request(directory: Path, action: str, payload: dict[str, Any]) -> str:
-    directory.mkdir(parents=True, exist_ok=True)
-    request_id = f"{int(time.time() * 1000)}-{action}"
-    target = directory / f"{request_id}.json"
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=directory, prefix=".request-", delete=False
+def _inspect(root: Path, name: str, target_version: str | None = None) -> dict[str, Any]:
+    if not SAFE_NAME.fullmatch(name):
+        raise invalid("请选择备份目录中的包名")
+    package = root / name
+    if package.is_symlink() or not package.is_dir():
+        raise not_found("备份包不存在")
+    report = preflight_package(
+        package,
+        target_version=target_version,
+        target_arch=current_runtime_arch(),
+        free_bytes=shutil.disk_usage(root).free,
     )
-    try:
-        json.dump({"action": action, **payload}, handle, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-        handle.close()
-        os.replace(handle.name, target)
-    finally:
-        if os.path.exists(handle.name):
-            os.unlink(handle.name)
-    return request_id
+    return {
+        "ok": report.ok,
+        "errors": report.errors,
+        "warnings": report.warnings,
+        "manifest": {
+            "version": _display_fields(report.manifest, "version", ("app", "commit", "migration")),
+            "secrets": _display_fields(report.manifest, "secrets", ("root_key_source",)),
+        },
+    }
 
 
 class BackupRequest(BaseModel):
@@ -104,135 +83,46 @@ class BackupRequest(BaseModel):
 
 
 class ImportRequest(BaseModel):
-    package: str = Field(min_length=1, max_length=1000)
+    package: str = Field(min_length=1, max_length=200)
     target_version: str | None = Field(default=None, max_length=200)
     confirm: bool = False
 
 
 @router.get("/backup-restore/status")
-async def status(settings: SettingsDep, response: Request) -> dict[str, Any]:
+async def status(auth: OwnerAuth, settings: SettingsDep, response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    root = _package_dir(settings)
-    packages: list[dict[str, Any]] = []
-    if root.is_dir():
-        for path in sorted(root.iterdir()):
-            manifest = path / "manifest.json"
-            if not manifest.is_file():
-                continue
-            try:
-                data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
-            packages.append(
-                {
-                    "name": path.name,
-                    "version": (data.get("version") or {}).get("app"),
-                    "commit": (data.get("version") or {}).get("commit"),
-                    "migration": (data.get("version") or {}).get("migration"),
-                    "artifact": (data.get("artifact") or {}).get("digest")
-                    or (data.get("artifact") or {}).get("release_id"),
-                }
-            )
     return {
-        "package_dir": str(root),
-        "packages": packages,
-        "requests": _request_files(_requests_dir(settings)),
+        "packages": await run_in_threadpool(_list_packages, _package_dir(settings)),
         "target_arch": current_runtime_arch(),
+        "operations_available": False,
     }
 
 
 @router.get("/backup-restore/packages/{name}/inspect")
-async def inspect_package(name: str, settings: SettingsDep, response: Request) -> dict[str, Any]:
-    response.headers["Cache-Control"] = "no-store"
-    if name in {".", ".."} or "/" in name or "\\" in name:
-        raise LingError("invalid_request", "非法包名", status_code=422)
-    package = _package_dir(settings) / name
-    report = preflight_package(
-        package,
-        target_arch=current_runtime_arch(),
-        free_bytes=_disk_free(package.parent),
-    )
-    env_file = package / "config" / "deploy.env"
-    env_preview = redact_env(env_file.read_text(encoding="utf-8")) if env_file.is_file() else ""
-    return {
-        **report.as_dict(),
-        "deploy_env": env_preview,
-        "required_bytes": estimate_required_bytes(package) if package.is_dir() else 0,
-    }
-
-
-@router.post("/backup-restore/backups")
-async def request_backup(
-    body: BackupRequest,
-    auth: OwnerWrite,
-    settings: SettingsDep,
-    response: Request,
+async def inspect_package(
+    name: str, auth: OwnerAuth, settings: SettingsDep, response: Response
 ) -> dict[str, Any]:
-    del auth
     response.headers["Cache-Control"] = "no-store"
-    request_id = _write_request(
-        _requests_dir(settings), "create_backup", {"note": body.note}
-    )
-    return {"request_id": request_id, "status": "queued"}
+    return await run_in_threadpool(_inspect, _package_dir(settings), name)
 
 
 @router.post("/backup-restore/imports/preflight")
 async def request_import_preflight(
-    body: ImportRequest,
-    auth: OwnerWrite,
-    settings: SettingsDep,
-    response: Request,
+    body: ImportRequest, auth: OwnerWrite, settings: SettingsDep, response: Response
 ) -> dict[str, Any]:
-    del auth
     response.headers["Cache-Control"] = "no-store"
-    package = Path(body.package)
-    if not package.is_absolute():
-        package = _package_dir(settings) / package
-    request_id = _write_request(
-        _requests_dir(settings),
-        "preflight_import",
-        {
-            "package": str(package),
-            "target_version": body.target_version,
-            "confirm": False,
-        },
+    return await run_in_threadpool(_inspect, _package_dir(settings), body.package, body.target_version)
+
+
+@router.post("/backup-restore/backups")
+async def request_backup(body: BackupRequest, auth: OwnerWrite) -> None:
+    raise LingError(
+        ErrorCode.unsupported_capability, "宿主整包备份尚未接通", status_code=503
     )
-    return {"request_id": request_id, "status": "queued"}
 
 
 @router.post("/backup-restore/imports/confirm")
-async def request_import_confirm(
-    body: ImportRequest,
-    auth: OwnerWrite,
-    settings: SettingsDep,
-    response: Request,
-) -> dict[str, Any]:
-    del auth
-    response.headers["Cache-Control"] = "no-store"
-    if not body.confirm:
-        raise LingError("invalid_request", "确认恢复必须显式 confirm=true", status_code=422)
-    package = Path(body.package)
-    if not package.is_absolute():
-        package = _package_dir(settings) / package
-    report = preflight_package(
-        package,
-        target_version=body.target_version,
-        target_arch=current_runtime_arch(),
-        free_bytes=_disk_free(package.parent),
+async def request_import_confirm(body: ImportRequest, auth: OwnerWrite) -> None:
+    raise LingError(
+        ErrorCode.unsupported_capability, "宿主整包恢复尚未接通", status_code=503
     )
-    if not report.ok:
-        raise LingError(
-            "invalid_request",
-            "预检未通过：" + "；".join(report.errors[:8]),
-            status_code=422,
-        )
-    request_id = _write_request(
-        _requests_dir(settings),
-        "confirm_restore",
-        {
-            "package": str(package),
-            "target_version": body.target_version,
-            "confirm": True,
-        },
-    )
-    return {"request_id": request_id, "status": "queued", "preflight": report.as_dict()}

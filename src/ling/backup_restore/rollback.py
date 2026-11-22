@@ -7,20 +7,22 @@
 
 from __future__ import annotations
 
-import hashlib
+import json
 import os
 import shutil
 import tarfile
 from pathlib import Path
 
-from . import MANIFEST_NAME, BackupRestoreError, load_manifest, preflight_package
+from . import BackupRestoreError, load_manifest, preflight_package, sha256_file
 
 
 def create_rollback_point(install_dir: Path, rollback_dir: Path) -> dict[str, str]:
-    """把当前目标目录按硬链接方式记录为回退点。"""
+    """复制安装目录文件，供后续核对与恢复配置。"""
     if not install_dir.is_dir():
         raise BackupRestoreError(f"安装目录不存在：{install_dir}")
-    rollback_dir.mkdir(parents=True, exist_ok=False)
+    if rollback_dir.resolve().is_relative_to(install_dir.resolve()):
+        raise BackupRestoreError("请将回退点放在安装目录之外")
+    rollback_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     files: dict[str, str] = {}
     for path in sorted(install_dir.rglob("*")):
         if not path.is_file() or path.is_symlink():
@@ -28,13 +30,10 @@ def create_rollback_point(install_dir: Path, rollback_dir: Path) -> dict[str, st
         rel = path.relative_to(install_dir)
         target = rollback_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(path, target)
-        except OSError:
-            shutil.copy2(path, target)
-        files[str(rel)] = hashlib.sha256(target.read_bytes()).hexdigest()
+        shutil.copy2(path, target)
+        files[str(rel)] = sha256_file(target)
     (rollback_dir / "rollback-manifest.json").write_text(
-        __import__("json").dumps({"files": files}, ensure_ascii=False, indent=2),
+        json.dumps({"files": files}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return files

@@ -10,15 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import (
-    FORMAT_VERSION,
-    BackupRestoreError,
-    build_restore_plan,
-    detect_artifact_mode,
-    load_manifest,
-    preflight_package,
-    redact_env,
-)
+from . import BackupRestoreError, build_restore_plan, load_manifest, preflight_package
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -66,22 +58,24 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
             return 0 if report.ok else 2
         if args.command == "inspect":
-            manifest, _ = load_manifest(args.package)
+            manifest, report = load_manifest(args.package)
+            if report.errors:
+                raise BackupRestoreError("；".join(report.errors))
+            artifact = manifest.get("artifact")
+            if not isinstance(artifact, dict):
+                raise BackupRestoreError("artifact 必须是对象")
             summary = {
                 "format_version": manifest.get("format_version"),
                 "version": manifest.get("version"),
                 "artifact": {
                     key: value
-                    for key, value in (manifest.get("artifact") or {}).items()
+                    for key, value in artifact.items()
                     if key != "env"
                 },
                 "scope": manifest.get("scope"),
                 "secrets": manifest.get("secrets"),
                 "integrity": manifest.get("integrity"),
             }
-            env_path = args.package / "config" / "deploy.env"
-            if env_path.is_file():
-                summary["deploy_env"] = redact_env(env_path.read_text(encoding="utf-8"))
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
         if not args.compose_files:

@@ -1,27 +1,22 @@
-"""Ling 整包备份与导入恢复的核心逻辑。
-
-这个模块只做可被普通 Python 验证的事：描述完整包清单、校验包内容、
-生成预检报告、构造隔离恢复命令。任何会启动容器/覆盖数据的动作都集中在
-``commands`` 里生成命令并由宿主执行器调用，核心函数本身不碰生产状态。
-"""
+"""Ling 整包备份的清单、文件校验与恢复计划。"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import platform
 import re
-import shutil
+import tarfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 FORMAT_VERSION = "ling-full-backup/v1"
 MANIFEST_NAME = "manifest.json"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RUNTIME_FILES = {"image": "artifacts/app-image.tar", "source": "artifacts/release.tar"}
 REQUIRED_FILES = (
     "database.dump",
     "media.tar",
@@ -31,7 +26,7 @@ REQUIRED_FILES = (
     "state/persona.json",
     "artifacts/app-image.json",
 )
-OPTIONAL_SECRETS = ("secrets/root.key",)
+ROOT_KEY_FILE = "secrets/root.key"
 SENSITIVE_ENV_KEYS = (
     "LING_ROOT_KEY",
     "POSTGRES_PASSWORD",
@@ -92,9 +87,9 @@ def redact_env(text: str) -> str:
 
 
 def detect_artifact_mode(manifest: dict[str, Any]) -> str:
-    artifact = manifest.get("artifact") or {}
-    mode = artifact.get("mode")
-    if mode in {"image", "source"}:
+    artifact = manifest.get("artifact")
+    mode = artifact.get("mode") if isinstance(artifact, dict) else None
+    if isinstance(mode, str) and mode in RUNTIME_FILES:
         return mode
     raise BackupRestoreError("artifact.mode 必须是 image 或 source")
 
@@ -115,21 +110,67 @@ class PreflightReport:
         }
 
 
+def _package_file(root: Path, name: str) -> Path:
+    path = root
+    if root.is_symlink():
+        raise BackupRestoreError("备份包目录不能是符号链接")
+    for part in Path(name).parts:
+        path = path / part
+        if path.is_symlink():
+            raise BackupRestoreError(f"备份包内不能使用符号链接：{name}")
+    return path
+
+
 def load_manifest(package_dir: Path) -> tuple[dict[str, Any], PreflightReport]:
-    path = package_dir / MANIFEST_NAME
     report = PreflightReport(ok=False)
-    if not path.is_file():
-        report.errors.append(f"缺少 {MANIFEST_NAME}")
-        return {}, report
     try:
+        path = _package_file(package_dir, MANIFEST_NAME)
+        if not path.is_file():
+            report.errors.append(f"缺少 {MANIFEST_NAME}")
+            return {}, report
         manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         report.errors.append(f"清单无法解析：{exc}")
         return {}, report
     if not isinstance(manifest, dict):
         report.errors.append("清单顶层必须是 JSON 对象")
         return {}, report
     return manifest, report
+
+
+def _manifest_object(report: PreflightReport, name: str) -> dict[str, Any]:
+    value = report.manifest.get(name)
+    if isinstance(value, dict):
+        return value
+    report.errors.append(f"{name} 必须是对象")
+    return {}
+
+
+def _verify_file(
+    package_dir: Path, name: str, digest: object, report: PreflightReport
+) -> Path | None:
+    try:
+        path = _package_file(package_dir, name)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise BackupRestoreError(f"必需文件缺失或为空：{name}")
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            raise BackupRestoreError(f"files.{name} 必须是 sha256:<64 hex>")
+        if f"sha256:{sha256_file(path)}" != digest:
+            raise BackupRestoreError(f"哈希不匹配：{name}")
+    except (OSError, BackupRestoreError) as exc:
+        report.errors.append(str(exc))
+        return None
+    return path
+
+
+def _check_runtime_archive(path: Path, report: PreflightReport) -> None:
+    try:
+        with tarfile.open(path) as archive:
+            if any(entry.isfile() for entry in archive):
+                return
+    except (OSError, tarfile.TarError):
+        pass
+    report.errors.append("版本产物不是包含文件的 tar 归档")
 
 
 def preflight_package(
@@ -143,7 +184,7 @@ def preflight_package(
     """在切换任何实例之前校验包；只读，不执行外部命令。"""
     manifest, report = load_manifest(package_dir)
     report.manifest = manifest
-    if not manifest:
+    if report.errors:
         return report
 
     if manifest.get("format_version") != FORMAT_VERSION:
@@ -151,109 +192,106 @@ def preflight_package(
             f"format_version 不是 {FORMAT_VERSION}：{manifest.get('format_version')!r}"
         )
 
-    files = manifest.get("files")
-    if not isinstance(files, dict):
-        report.errors.append("files 必须是文件名 → sha256 的对象")
-        files = {}
+    files = _manifest_object(report, "files")
+    secrets = _manifest_object(report, "secrets")
+    root_source = secrets.get("root_key_source")
+    if root_source not in ("file", "env"):
+        report.errors.append("包内必须包含生效的根密钥材料（file 或 env）")
+    if not isinstance(secrets.get("credential_scope"), list):
+        report.errors.append("secrets.credential_scope 必须是数组")
 
-    for name in REQUIRED_FILES:
-        path = package_dir / name
-        if not path.is_file() or path.stat().st_size == 0:
-            report.errors.append(f"必需文件缺失或为空：{name}")
-            continue
-        expected = files.get(name)
-        if not isinstance(expected, str) or not DIGEST_RE.fullmatch(expected):
-            report.errors.append(f"files.{name} 必须是 sha256:<64 hex>")
-            continue
-        actual = sha256_file(path)
-        if actual != expected.split(":", 1)[1]:
-            report.errors.append(f"哈希不匹配：{name}")
+    version = _manifest_object(report, "version")
+    for key in ("app", "commit", "migration", "config_revision"):
+        if not isinstance(version.get(key), str) or not version[key].strip():
+            report.errors.append(f"version.{key} 缺失")
+    if target_version and version.get("app") != target_version:
+        report.errors.append("版本不匹配")
 
-    for name in OPTIONAL_SECRETS:
-        expected = files.get(name)
-        if expected is None:
-            continue
-        path = package_dir / name
-        if not path.is_file() or path.stat().st_size == 0:
-            report.errors.append(f"清单声明的密钥材料缺失或为空：{name}")
-        elif not isinstance(expected, str) or not DIGEST_RE.fullmatch(expected):
-            report.errors.append(f"files.{name} 必须是 sha256:<64 hex>")
-        elif sha256_file(path) != expected.split(":", 1)[1]:
-            report.errors.append(f"密钥材料哈希不匹配：{name}")
-
-    secrets = manifest.get("secrets") or {}
-    if not isinstance(secrets, dict):
-        report.errors.append("secrets 必须是对象")
-    else:
-        if secrets.get("root_key_source") not in {"file", "env", "managed"}:
-            report.errors.append("secrets.root_key_source 必须是 file/env/managed")
-        if not isinstance(secrets.get("credential_scope"), list):
-            report.errors.append("secrets.credential_scope 必须是数组")
-
-    version = manifest.get("version") or {}
-    if not isinstance(version, dict):
-        report.errors.append("version 必须是对象")
-    else:
-        for key in ("app", "commit", "migration", "config_revision"):
-            if not version.get(key):
-                report.errors.append(f"version.{key} 缺失")
-        if target_version and str(version.get("app")) != target_version:
-            report.errors.append(
-                f"版本不匹配：清单 {version.get('app')!r}，目标 {target_version!r}"
-            )
-
-    artifact = manifest.get("artifact") or {}
-    if not isinstance(artifact, dict):
-        report.errors.append("artifact 必须是对象")
-    else:
+    artifact = _manifest_object(report, "artifact")
+    try:
         mode = detect_artifact_mode(manifest)
-        if mode == "image":
-            digest = artifact.get("digest")
-            if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
-                report.errors.append("镜像 artifact.digest 必须是 sha256:<64 hex>")
-            arch = artifact.get("platform")
-            if not arch:
-                report.errors.append("镜像 artifact.platform 缺失")
-            elif target_arch and str(arch) != target_arch:
-                report.errors.append(f"架构不匹配：清单 {arch!r}，目标 {target_arch!r}")
-            available = set(available_image_digests)
-            if available and digest not in available:
-                report.errors.append(f"镜像 digest 不可用：{digest}")
+    except BackupRestoreError as exc:
+        report.errors.append(str(exc))
+        mode = None
+
+    required = list(REQUIRED_FILES)
+    if mode is not None:
+        required.append(RUNTIME_FILES[mode])
+    if root_source == "file" or ROOT_KEY_FILE in files:
+        required.append(ROOT_KEY_FILE)
+    if files.keys() - set(required):
+        report.errors.append("清单包含未支持的文件路径")
+    paths = {}
+    for name in required:
+        path = _verify_file(package_dir, name, files.get(name), report)
+        if path is not None:
+            paths[name] = path
+
+    if mode and (runtime_path := paths.get(RUNTIME_FILES[mode])):
+        _check_runtime_archive(runtime_path, report)
+
+    env_path = paths.get("config/deploy.env")
+    if env_path is not None and root_source in ("file", "env"):
+        try:
+            has_env_key = bool(_read_env(env_path).get("LING_ROOT_KEY"))
+        except (OSError, UnicodeError):
+            report.errors.append("无法读取部署配置")
         else:
-            for key in ("release_id", "commit", "sha256"):
-                if not artifact.get(key):
-                    report.errors.append(f"源码 artifact.{key} 缺失")
+            if has_env_key != (root_source == "env"):
+                report.errors.append("清单密钥来源与部署配置不一致")
 
-    scope = manifest.get("scope") or {}
-    if not isinstance(scope, dict):
-        report.errors.append("scope 必须是对象")
-    else:
-        for key in ("database", "media", "plugins", "persona", "config"):
-            if key not in scope:
-                report.errors.append(f"scope.{key} 缺失")
-        external = scope.get("external_services") or []
-        if not isinstance(external, list):
-            report.errors.append("scope.external_services 必须是数组")
+    if mode == "image":
+        digest = artifact.get("digest")
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            report.errors.append("镜像 artifact.digest 必须是 sha256:<64 hex>")
+        elif (available := set(available_image_digests)) and digest not in available:
+            report.errors.append("镜像 digest 不可用")
+        arch = artifact.get("platform")
+        if not isinstance(arch, str) or not arch:
+            report.errors.append("镜像 artifact.platform 缺失")
+        elif target_arch and arch != target_arch:
+            report.errors.append("镜像架构不匹配")
+    elif mode == "source":
+        if not isinstance(artifact.get("release_id"), str) or not artifact["release_id"]:
+            report.errors.append("源码 artifact.release_id 缺失")
+        if artifact.get("commit") != version.get("commit"):
+            report.errors.append("源码产物 commit 与版本清单不一致")
+        if not files.get(RUNTIME_FILES[mode]) or artifact.get("sha256") != files[RUNTIME_FILES[mode]]:
+            report.errors.append("源码产物 SHA256 与文件清单不一致")
 
-    requested = (manifest.get("resources") or {}).get("required_bytes")
-    if isinstance(requested, int) and requested > 0:
-        if free_bytes is not None and free_bytes < requested:
-            report.errors.append(f"空间不足：需要 {requested}，可用 {free_bytes}")
-        elif free_bytes is None:
-            report.warnings.append("未提供目标可用空间，无法校验空间预检")
+    metadata = paths.get("artifacts/app-image.json")
+    if metadata is not None:
+        try:
+            matches = json.loads(metadata.read_text(encoding="utf-8")) == artifact
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            report.errors.append("产物描述与清单不一致")
 
-    integrity = manifest.get("integrity") or {}
-    if integrity.get("tombstones_state") != "ok":
+    scope = _manifest_object(report, "scope")
+    for key in ("database", "media", "plugins", "persona", "config"):
+        if key not in scope:
+            report.errors.append(f"scope.{key} 缺失")
+    if not isinstance(scope.get("external_services", []), list):
+        report.errors.append("scope.external_services 必须是数组")
+
+    requested = _manifest_object(report, "resources").get("required_bytes")
+    try:
+        measured = max(sum(path.stat().st_size for path in paths.values()) * 3, 1024**3)
+    except OSError:
+        report.errors.append("校验时备份包发生变化，请重新检查")
+        return report
+    required_bytes = max(requested, measured) if type(requested) is int else measured
+    if free_bytes is not None and free_bytes < required_bytes:
+        report.errors.append(f"空间不足：需要 {required_bytes}，可用 {free_bytes}")
+    elif free_bytes is None:
+        report.warnings.append("未提供目标可用空间")
+
+    if _manifest_object(report, "integrity").get("tombstones_state") != "ok":
         report.errors.append("撤回墓碑导出状态不是 ok")
 
     report.ok = not report.errors
     return report
-
-
-def _shell_join(args: Iterable[str]) -> str:
-    import shlex
-
-    return " ".join(shlex.quote(str(arg)) for arg in args)
 
 
 def build_restore_plan(
@@ -266,105 +304,30 @@ def build_restore_plan(
     target_db: str,
     rollback_dir: Path,
 ) -> dict[str, Any]:
-    """生成宿主单命令恢复入口使用的步骤；不执行任何步骤。"""
+    """列出恢复所需的阶段和目标，供部署时复核。"""
     if not SAFE_NAME.fullmatch(project):
         raise BackupRestoreError(f"非法 Compose 项目名：{project}")
     if not SAFE_NAME.fullmatch(target_db):
         raise BackupRestoreError(f"非法目标库名：{target_db}")
-    file_group: list[str] = []
-    for path in compose_files:
-        file_group.extend(["-f", str(path)])
-    group = ["docker", "compose", "-p", project, *file_group, "--env-file", str(env_file)]
-    dump = package_dir / "database.dump"
-    media = package_dir / "media.tar"
-    steps = [
-        {
-            "name": "preflight",
-            "command": _shell_join(
-                [
-                    "python3",
-                    "-m",
-                    "ling.backup_restore.cli",
-                    "preflight",
-                    str(package_dir),
-                ]
-            ),
-        },
-        {
-            "name": "lock",
-            "command": f"mkdir {_shell_join([str(install_dir / '.restore.lock')])}",
-        },
-        {
-            "name": "rollback-point",
-            "command": _shell_join(
-                [
-                    "python3",
-                    "-m",
-                    "ling.backup_restore.rollback",
-                    "create",
-                    str(install_dir),
-                    str(rollback_dir),
-                ]
-            ),
-        },
-        {
-            "name": "restore-database",
-            "command": _shell_join(
-                [
-                    *group,
-                    "exec",
-                    "-T",
-                    "db",
-                    "pg_restore",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--clean",
-                    "--if-exists",
-                    "-U",
-                    "ling",
-                    "-d",
-                    target_db,
-                ]
-            )
-            + f" < {_shell_join([str(dump)])}",
-        },
-        {
-            "name": "restore-media",
-            "command": _shell_join(
-                [
-                    "python3",
-                    "-m",
-                    "ling.backup_restore.restore_volume",
-                    str(media),
-                    str(install_dir),
-                ]
-            ),
-        },
-        {
-            "name": "switch-artifact",
-            "command": _shell_join(
-                [
-                    "python3",
-                    "-m",
-                    "ling.backup_restore.switch_artifact",
-                    str(package_dir),
-                    str(install_dir),
-                ]
-            ),
-        },
-        {"name": "start", "command": _shell_join([*group, "up", "-d"])},
-        {
-            "name": "health",
-            "command": _shell_join([*group, "ps"]),
-        },
-    ]
     return {
         "package": str(package_dir),
         "install_dir": str(install_dir),
+        "compose_files": list(map(str, compose_files)),
+        "env_file": str(env_file),
         "project": project,
         "target_db": target_db,
         "rollback_dir": str(rollback_dir),
-        "steps": steps,
+        "apply_ready": False,
+        "steps": [
+            "preflight",
+            "install-lock",
+            "rollback-point",
+            "stage-database",
+            "stage-app-data",
+            "verify-runtime",
+            "switch-and-check-health",
+            "rollback-on-failure",
+        ],
     }
 
 

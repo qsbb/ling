@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -48,6 +51,7 @@ def source(tmp_path: Path) -> dict[str, Path]:
         "compose": tmp_path / "src" / "compose.yaml",
         "plugins": tmp_path / "src" / "tool-plugins.json",
         "persona": tmp_path / "src" / "persona.json",
+        "runtime": tmp_path / "src" / "runtime.tar",
     }
     for name, path in paths.items():
         _write(path, f"{name}-content\n")
@@ -56,6 +60,8 @@ def source(tmp_path: Path) -> dict[str, Path]:
         payload = b"media-bytes"
         info.size = len(payload)
         archive.addfile(info, __import__("io").BytesIO(payload))
+    with tarfile.open(paths["runtime"], "w") as archive:
+        archive.add(paths["dump"], arcname="test-runtime-file")
     return paths
 
 
@@ -70,6 +76,7 @@ def package(tmp_path: Path, source: dict[str, Path]) -> Path:
         compose_file=source["compose"],
         tool_plugins=source["plugins"],
         persona_file=source["persona"],
+        runtime_archive=source["runtime"],
         app_version="0.0.14",
         commit="bd5ac914388abce6b7ae2be721dd58d64d7b7ce7",
         migration="0082_live_sessions",
@@ -93,6 +100,54 @@ def test_preflight_accepts_a_complete_package(package: Path) -> None:
     )
     assert report.ok, report.errors
     assert "model-provider" in report.manifest["scope"]["external_services"]
+    assert stat.S_IMODE(package.stat().st_mode) == 0o700
+    assert stat.S_IMODE((package / "config" / "deploy.env").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("file", ["artifacts/app-image.tar", "secrets/root.key"])
+def test_descriptor_cannot_substitute_for_runtime_or_root_key(package: Path, file: str) -> None:
+    (package / file).unlink()
+    report = preflight_package(package)
+    assert not report.ok
+    assert any(file in error for error in report.errors)
+
+
+def test_preflight_reports_malformed_sections(package: Path) -> None:
+    path = package / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["resources"] = ["bad schema"]
+    manifest["integrity"] = 1
+    manifest["artifact"]["mode"] = ["image"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    report = preflight_package(package)
+    assert not report.ok
+    assert "resources 必须是对象" in report.errors
+    assert "integrity 必须是对象" in report.errors
+    assert any("artifact.mode" in error for error in report.errors)
+
+
+def test_preflight_rejects_an_empty_runtime_archive_even_with_matching_hash(package: Path) -> None:
+    name = "artifacts/app-image.tar"
+    runtime = package / name
+    with tarfile.open(runtime, "w"):
+        pass
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][name] = f"sha256:{_hex(runtime.read_bytes())}"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    report = preflight_package(package)
+    assert not report.ok
+    assert "版本产物不是包含文件的 tar 归档" in report.errors
+
+
+def test_preflight_rejects_files_reached_through_a_symlink(package: Path, tmp_path: Path) -> None:
+    config = package / "config"
+    external = tmp_path / "external"
+    config.rename(external)
+    config.symlink_to(external, target_is_directory=True)
+    report = preflight_package(package)
+    assert not report.ok
+    assert any("config/deploy.env" in error and "符号链接" in error for error in report.errors)
 
 
 def test_preflight_rejects_missing_file(package: Path) -> None:
@@ -163,18 +218,17 @@ def test_restore_plan_contains_preflight_lock_rollback_and_health(package: Path,
         target_db="ling_drill",
         rollback_dir=tmp_path / "rollback",
     )
-    names = [step["name"] for step in plan["steps"]]
-    assert names == [
+    assert plan["steps"] == [
         "preflight",
-        "lock",
+        "install-lock",
         "rollback-point",
-        "restore-database",
-        "restore-media",
-        "switch-artifact",
-        "start",
-        "health",
+        "stage-database",
+        "stage-app-data",
+        "verify-runtime",
+        "switch-and-check-health",
+        "rollback-on-failure",
     ]
-    assert "--clean" in plan["steps"][3]["command"]
+    assert plan["apply_ready"] is False
     assert "ling_drill" == plan["project"] == plan["target_db"]
 
 
@@ -184,6 +238,54 @@ def test_rollback_point_records_hashes(tmp_path: Path) -> None:
     files = create_rollback_point(install, tmp_path / "rollback")
     assert files["data/root.key"] == _hex(b"key")
     assert (tmp_path / "rollback" / "rollback-manifest.json").is_file()
+    _write(install / "data" / "root.key", "rotated")
+    assert (tmp_path / "rollback" / "data" / "root.key").read_text() == "key"
+
+
+def test_host_apply_does_not_mutate_target_when_restore_is_unavailable(
+    package: Path, tmp_path: Path
+) -> None:
+    install = tmp_path / "install"
+    command = [
+        sys.executable, "deploy/backup/restore_full.py", "execute",
+        "--package", str(package), "--install-dir", str(install),
+        "--compose-file", str(install / "compose.yaml"),
+        "--env-file", str(install / ".env"), "--project", "ling_acceptance",
+        "--target-db", "ling_acceptance", "--rollback-dir", str(tmp_path / "rollback"),
+    ]
+    preview = subprocess.run(command, capture_output=True, text=True, check=True)
+    assert json.loads(preview.stdout)["apply_ready"] is False
+    execution = subprocess.run([*command, "--apply"], capture_output=True, text=True, check=False)
+    assert execution.returncode != 0
+    assert "整包恢复尚未接通" in execution.stderr
+    assert not install.exists()
+    assert not (tmp_path / "rollback").exists()
+
+
+def test_executor_distinguishes_preflight_from_restore(package: Path, tmp_path: Path) -> None:
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    status_dir = tmp_path / "status"
+    for action in ("preflight_import", "confirm_restore", "create_backup"):
+        (request_dir / f"{action}.json").write_text(
+            json.dumps({"action": action, "package": package.name, "confirm": True}),
+            encoding="utf-8",
+        )
+    subprocess.run(
+        [
+            sys.executable, "deploy/backup/backup_restore_executor.py",
+            "--requests-dir", str(request_dir), "--status-dir", str(status_dir),
+            "--packages-dir", str(package.parent), "--apply", "--once",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    for action, expected in (
+        ("preflight_import", "validated"), ("confirm_restore", "failed"),
+        ("create_backup", "failed"),
+    ):
+        result = json.loads((status_dir / f"{action}.json").read_text())
+        assert result["status"] == expected
 
 
 def test_restore_media_rejects_traversal(tmp_path: Path) -> None:

@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
-"""宿主单命令恢复入口：现有服务无法启动时也能执行。
-
-示例：
-  python3 deploy/backup/restore_full.py plan --package /vol1/backups/ling-full-001 \\
-    --install-dir /opt/ling --compose-file /opt/ling/deploy/compose.yaml \\
-    --env-file /opt/ling/.env --project ling --target-db ling
-
-  python3 deploy/backup/restore_full.py execute --package /vol1/backups/ling-full-001 \\
-    --install-dir /opt/ling --compose-file /opt/ling/deploy/compose.yaml \\
-    --env-file /opt/ling/.env --project ling --target-db ling \\
-    --rollback-dir /vol1/backups/rollback-001 --apply
-
-默认只生成计划；必须显式 --apply 才执行数据库/数据卷/产物切换。
-"""
+"""宿主整包检查和恢复计划入口。"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +18,6 @@ from ling.backup_restore import (  # noqa: E402
     BackupRestoreError,
     build_restore_plan,
     current_runtime_arch,
-    estimate_required_bytes,
     preflight_package,
 )
 
@@ -45,18 +29,8 @@ def _disk_free(path: Path) -> int | None:
         return None
 
 
-def _run(command: str, *, log: Path) -> int:
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"$ {command}\n")
-        stream.flush()
-        result = subprocess.run(command, shell=True, stdout=stream, stderr=subprocess.STDOUT)
-        stream.write(f"[exit={result.returncode}]\n")
-    return result.returncode
-
-
 def _preflight(args: argparse.Namespace) -> int:
-    package = Path(args.package).expanduser().resolve()
+    package = Path(args.package).expanduser().absolute()
     report = preflight_package(
         package,
         target_version=args.target_version,
@@ -83,9 +57,7 @@ def _plan(args: argparse.Namespace) -> int:
 
 
 def _execute(args: argparse.Namespace) -> int:
-    package = Path(args.package).expanduser().resolve()
-    install_dir = Path(args.install_dir).expanduser().resolve()
-    rollback_dir = Path(args.rollback_dir).expanduser().resolve()
+    package = Path(args.package).expanduser().absolute()
     report = preflight_package(
         package,
         target_version=args.target_version,
@@ -95,46 +67,10 @@ def _execute(args: argparse.Namespace) -> int:
     if not report.ok:
         print("预检失败：" + "；".join(report.errors), file=sys.stderr)
         return 2
-    required = estimate_required_bytes(package)
-    available = _disk_free(package.parent)
-    if available is not None and available < required:
-        print(f"空间不足：需要 {required}，可用 {available}", file=sys.stderr)
-        return 2
-    plan = build_restore_plan(
-        package,
-        install_dir=install_dir,
-        compose_files=[Path(item).expanduser().resolve() for item in args.compose_file],
-        env_file=Path(args.env_file).expanduser().resolve(),
-        project=args.project,
-        target_db=args.target_db,
-        rollback_dir=rollback_dir,
-    )
-    log_dir = Path(args.log_dir).expanduser().resolve() if args.log_dir else install_dir / "restore-logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log = log_dir / "restore.log"
-    print(f"计划已生成；日志：{log}")
     if not args.apply:
-        print(json.dumps(plan, ensure_ascii=False, indent=2))
-        print("未执行：加 --apply 才会切换实例。")
-        return 0
-    lock = install_dir / ".restore.lock"
-    try:
-        lock.mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
-        print(f"恢复锁被占用：{lock}", file=sys.stderr)
-        return 6
-    try:
-        for step in plan["steps"]:
-            rc = _run(step["command"], log=log)
-            if rc != 0:
-                with log.open("a", encoding="utf-8") as stream:
-                    stream.write(f"FAILED step={step['name']} rc={rc}\n")
-                print(f"恢复失败于 {step['name']}（exit {rc}）；详见 {log}", file=sys.stderr)
-                return rc or 1
-        print(f"恢复完成；日志：{log}")
-        return 0
-    finally:
-        shutil.rmtree(lock, ignore_errors=True)
+        return _plan(args)
+    print("整包恢复尚未接通：缺少版本切换和失败回退。", file=sys.stderr)
+    return 2
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -161,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--rollback-dir", required=True)
     plan.set_defaults(func=_plan)
 
-    execute = sub.add_parser("execute", help="执行恢复；需 --apply 才真正切换")
+    execute = sub.add_parser("execute", help="预检并显示恢复计划")
     common(execute)
     execute.add_argument("--install-dir", required=True)
     execute.add_argument("--compose-file", action="append", required=True, dest="compose_file")
