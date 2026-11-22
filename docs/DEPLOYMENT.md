@@ -275,6 +275,42 @@ bash deploy/install.sh --logs api
 
 ## 4. 备份与恢复
 
+### 整包备份
+
+在 Compose 宿主机上用 Python 3.12 或更新版本运行以下命令。整包包含 PostgreSQL、应用数据卷、当前镜像和生效的应用配置。备份期间 API 和 Worker 会短暂停止写入。
+
+    python3 deploy/backup/restore_full.py create /path/to/ling.ling-backup
+    python3 deploy/backup/restore_full.py inspect /path/to/ling.ling-backup
+    python3 deploy/backup/restore_full.py restore /path/to/ling.ling-backup
+
+以上示例使用源码模式的默认项目名和配置。镜像模式或安装时使用了自定义项目、环境文件、Compose override 的部署，在子命令前传入实际的 Compose 参数。
+
+    python3 deploy/backup/restore_full.py \
+      --compose-file /opt/ling/compose/compose.image.yaml \
+      --env-file /opt/ling/.env --project ling serve
+
+命令运行后，所有者可在「设置 → 维护与关于 → 备份与恢复」创建、下载、导入和恢复备份。运行宿主命令的账号需要 Docker 操作权限，以及更新请求目录的读写权限。
+
+早期镜像安装保存在 `compose/compose.image.yaml` 的模板可能缺少恢复配置。恢复前把下面的字段补进实际使用的 Compose 主文件，后续启动和更新继续使用这份文件。保留原项目名、`.env`、端口绑定与额外的 Compose 配置。
+
+```yaml
+services:
+  db:
+    environment:
+      PGDATA: ${LING_POSTGRES_DATA_DIR:-/var/lib/postgresql/data/pgdata}
+volumes:
+  db-data:
+    name: ${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}
+  app-data:
+    name: ${LING_RESTORE_APP_VOLUME:-${COMPOSE_PROJECT_NAME}_app-data}
+```
+
+恢复会保留当前宿主的网络与端口设置，把备份数据写到新卷，再启动备份版本。现有实例启动失败时会回到原配置与原卷。旧版恢复后可以从宿主查看执行结果。请私密保管备份文件，其中包含恢复应用所需的凭据。外部插件与接入器在其他服务里保存的数据由各服务备份。
+
+空实例也可直接执行 restore，使用当前的 Compose 文件及一个新的环境文件路径。源码模式生成的备份带有独立 Web 产物，恢复时使用源码模式的 Compose 文件。镜像模式离线恢复可直接使用包内镜像。如果恢复时原发布摘要还没有对应的本地镜像，联网后拉取清单记录的发布摘要，将 `LING_APP_IMAGE` 设回该摘要即可恢复网页更新。
+
+### 日常备份与隔离演练
+
 ```bash
 # 备份（数据库 dump + 墓碑清单 + app-data 卷里的 root.key 与 media 字节）。
 # 默认 compose 不发布 db 端口、宿主机也没有 DSN，所以要用 compose 模式。

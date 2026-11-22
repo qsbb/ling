@@ -1913,6 +1913,29 @@ install_summary() {
   say "    bash deploy/install.sh --down        # 停掉（数据保留）"
 }
 
+# Source builds use their own image tags and Web directory after a full restore.
+# The restored database and app-data volume selectors stay in deploy/.env.
+clear_restored_runtime() {
+  [ -f deploy/.env ] || return 0
+  python3 - deploy/.env <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+before = path.read_bytes()
+pattern = rb"(?m)^[ \t]*(?:export[ \t]+)?LING_RESTORE_(?:API_IMAGE|WORKER_IMAGE|WEB_DIST|MIGRATIONS)[ \t]*=[^\n]*(?:\n|$)"
+after = re.sub(pattern, b"", before)
+if after != before:
+    with path.open("r+b") as stream:
+        stream.write(after)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+PY
+}
+
 do_install() {
   # 阶段语义：从这里开始算“构建阶段”；失败意味着还没有碰容器/数据库。
   # 标记先写，连提交号格式错误这类“构建前失败”也能被正确归类。
@@ -1927,6 +1950,8 @@ do_install() {
   ensure_web
   preflight
   gen_env
+  export LING_RESTORE_API_IMAGE="" LING_RESTORE_WORKER_IMAGE=""
+  export LING_RESTORE_WEB_DIST="" LING_RESTORE_MIGRATIONS=""
   # 先用 compose 自己的解析结果确认 api 实际挂载的就是本次产物，并在有宿主
   # override 时核对持久数据卷没有被搬走；解析结果同时给 resolve_images 判断
   # “哪些基础镜像是显式配置的”（只读操作，仍在构建/变更之前）。
@@ -1946,6 +1971,7 @@ do_install() {
   # 从这里开始会改运行状态（起/替容器）；此后的失败都可能是“已迁移/已重启”，
   # 执行器看到 deploy/verify 就应该走人工确认，而不是盲目回滚。
   phase_write deploy
+  clear_restored_runtime || die "无法更新恢复后的部署配置"
   start_services
   phase_write verify
   wait_ready

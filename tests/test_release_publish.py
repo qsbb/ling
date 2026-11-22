@@ -1444,6 +1444,29 @@ def _model_with_api_env(**overrides: Any) -> dict[str, Any]:
     return model
 
 
+def test_publish_uses_restored_volume_only_when_it_is_mounted(monkeypatch) -> None:
+    publish = _publish_module()
+    model = _real_image_compose_model(16520)
+    group = model.get("name") or "ling"
+    restored = f"{group}_app-data-restore-a1234b5678cd"
+    model["volumes"]["app-data"]["name"] = restored
+    context = _compose_env_preflight(publish, model)
+    monkeypatch.setattr(
+        context, "list_containers", lambda *, service, all_states: [{"id": service}]
+    )
+    labels = {"com.docker.compose.volume": "app-data"}
+
+    def inspect(kind, container_id):
+        return {"Mounts": [{"Name": restored, "Destination": "/data"}]}
+
+    monkeypatch.setattr(context, "docker_inspect", inspect)
+    context.check_restored_volume("app-data", restored, labels)
+
+    monkeypatch.setattr(context, "docker_inspect", lambda *args: {"Mounts": []})
+    with pytest.raises(publish.PublishError, match="没有挂载恢复卷"):
+        context.check_restored_volume("app-data", restored, labels)
+
+
 @pytest.mark.parametrize(
     ("switch", "expected"),
     [

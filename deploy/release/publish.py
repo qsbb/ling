@@ -1635,7 +1635,8 @@ class Context:
                     f"命名卷 {key} 被声明为 external；不能确认旧数据是否在同一卷",
                 )
             actual = volume.get("name")
-            if actual != expected_name:
+            restored_name = re.escape(expected_name) + r"-restore-[0-9a-f]{12}"
+            if actual != expected_name and not re.fullmatch(restored_name, str(actual)):
                 raise PublishError(
                     EXIT_PREFLIGHT,
                     "failed_preflight",
@@ -1998,11 +1999,9 @@ class Context:
         return values
 
     def check_volumes(self) -> None:
-        names = [
-            f"{self.o.project}_app-data",
-            f"{self.o.project}_db-data",
-        ]
-        result = self.runner.run(["docker", "volume", "inspect", *names])
+        compose_volumes = self.config["volumes"]
+        names = {key: compose_volumes[key]["name"] for key in ("app-data", "db-data")}
+        result = self.runner.run(["docker", "volume", "inspect", *names.values()])
         if result.returncode != 0:
             raise PublishError(
                 EXIT_PREFLIGHT,
@@ -2028,11 +2027,7 @@ class Context:
         for item in data:
             if isinstance(item, dict) and item.get("Name"):
                 found[str(item["Name"])] = item
-        compose_volumes = self.config.get("volumes") or {}
-        for key, name in (
-            ("app-data", f"{self.o.project}_app-data"),
-            ("db-data", f"{self.o.project}_db-data"),
-        ):
+        for key, name in names.items():
             volume = found.get(name)
             if volume is None:
                 raise PublishError(
@@ -2061,20 +2056,31 @@ class Context:
                         f"{self.o.project!r}；卷身份不一致。"
                     ),
                 )
-            config_name = (compose_volumes.get(key) or {}).get("name")
-            if config_name != name:
-                raise PublishError(
-                    EXIT_PREFLIGHT,
-                    "failed_preflight",
-                    "volumes",
-                    f"卷 {key} 的 compose 解析名 {config_name!r} 与实际卷 {name!r} 不一致",
-                )
+            if name != f"{self.o.project}_{key}":
+                self.check_restored_volume(key, name, labels)
             self.record["volumes"][key] = {
                 "name": name,
                 "driver": driver,
-                "compose_name": config_name,
+                "compose_name": name,
                 "project_label": labels.get("com.docker.compose.project"),
             }
+
+    def check_restored_volume(self, key: str, name: str, labels: dict[str, str]) -> None:
+        services = ("db",) if key == "db-data" else ("api", "worker")
+        target = "/var/lib/postgresql/data" if key == "db-data" else "/data"
+        for service in services:
+            containers = self.list_containers(service=service, all_states=False)
+            mounts = (
+                self.docker_inspect("container", containers[0]["id"]).get("Mounts", [])
+                if len(containers) == 1 else []
+            )
+            if labels.get("com.docker.compose.volume") != key or not any(
+                mount.get("Name") == name and mount.get("Destination") == target for mount in mounts
+            ):
+                raise PublishError(
+                    EXIT_PREFLIGHT, "failed_preflight", "volumes",
+                    f"当前运行的 {service} 没有挂载恢复卷 {name}",
+                )
 
     def port_holders(self, port: int, protocol: str = "tcp") -> tuple[list[str], str]:
         """宿主端口的占用者（``ID|project|name``）与查询失败详情。

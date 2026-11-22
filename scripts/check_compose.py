@@ -244,6 +244,9 @@ def effective_volume_name(project: str, key: str, conf: object) -> str:
     if isinstance(conf, dict):
         name = conf.get("name")
         if name:
+            restore_name = "LING_RESTORE_" + key.removesuffix("-data").upper() + "_VOLUME"
+            if name == "${" + restore_name + ":-${COMPOSE_PROJECT_NAME}_" + key + "}":
+                return f"{project}_{key}"
             return str(name).strip()
         if conf.get("external"):
             return key

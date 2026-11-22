@@ -388,7 +388,7 @@ def test_image_volume_actual_name_cannot_be_overridden(
 ) -> None:
     """给卷加 name:/external: 会换到另一个卷 → 必须 FAIL（历史数据在旧卷里）。"""
     module, repo = compose_check
-    _edit(repo, IMAGE, "  db-data:\n", "  db-data:\n    name: ling-db-data\n")
+    _edit(repo, IMAGE, "${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}", "ling-db-data")
 
     assert module.main() == 1
     assert "name:" in capsys.readouterr().out
@@ -1169,7 +1169,7 @@ def test_image_volume_actual_name_is_a_single_independent_error(
 ) -> None:
     """`name: ling-db-data` 变异只产生**一条**错误，而且就是卷实际名断言。"""
     module, repo = compose_check
-    _edit(repo, IMAGE, "  db-data:\n", "  db-data:\n    name: ling-db-data\n")
+    _edit(repo, IMAGE, "${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}", "ling-db-data")
 
     assert module.main() == 1
 
@@ -1200,7 +1200,7 @@ def test_image_volume_explicit_correct_name_passes(
     实际挂的还是同一个卷，多写一行只是啰嗦；断言的是**最终名**，不是写法。
     """
     module, repo = compose_check
-    _edit(repo, IMAGE, "  db-data:\n", "  db-data:\n    name: ling_db-data\n")
+    _edit(repo, IMAGE, "${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}", "ling_db-data")
 
     assert module.main() == 0
 

@@ -465,7 +465,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from ling.api.body_limit import BodySizeLimitMiddleware
     from ling.api.observability import observability_middleware
-    from ling.api.routes import actor, auth, chat, health, manage, media, onebot, ops, sessions
+    from ling.api.routes import (
+        actor,
+        auth,
+        backup_restore,
+        chat,
+        health,
+        manage,
+        media,
+        onebot,
+        ops,
+        sessions,
+    )
     from ling.api.routes import external_plugins as external_plugins_routes
     from ling.api.routes import logs as logs_routes
     from ling.api.routes import persona as persona_routes
@@ -479,7 +490,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # `client_max_body_size 32m`，删掉反代后由应用自己承担；它只读
     # Content-Length、绝不消费 body 流（否则 SSE 流式回复会被破坏），
     # 所以可以安全地待在 observability 里面。
-    app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_body_bytes)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_body_bytes=settings.max_body_bytes,
+        streamed_upload_path=backup_restore.UPLOAD_PATH,
+    )
 
     # 最外层：给每个请求一个 trace_id，并记录访问日志。
     #
@@ -501,6 +516,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(onebot.router)
     app.include_router(ops.router)
     app.include_router(auth.router, prefix="/v1")
+    app.include_router(backup_restore.router, prefix="/v1")
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(window_policy_routes.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")

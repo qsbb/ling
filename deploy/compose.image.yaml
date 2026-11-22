@@ -154,7 +154,7 @@ services:
       POSTGRES_USER: ling
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ling-dev-password}
       POSTGRES_DB: ling
-      PGDATA: /var/lib/postgresql/data/pgdata
+      PGDATA: ${LING_POSTGRES_DATA_DIR:-/var/lib/postgresql/data/pgdata}
     volumes:
       - db-data:/var/lib/postgresql/data
     # 不发布端口：数据库只在 compose 内网可见
@@ -319,10 +319,11 @@ services:
     networks: [internal, egress]
 
 volumes:
-  # 键名沿用源码模式：项目名 ling + 键名 ⇒ 实际卷名 ling_db-data / ling_app-data。
-  # 不要给它们加 name:/external:，否则会换到另一个卷上（历史数据在旧卷里）。
+  # 默认沿用已有项目卷。完整恢复成功时由宿主命令记录新的卷名。
   db-data:
+    name: ${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}
   app-data:
+    name: ${LING_RESTORE_APP_VOLUME:-${COMPOSE_PROJECT_NAME}_app-data}
 
 networks:
   # 只有 db/api/worker 之间通信，**没有外网出口**。

@@ -153,6 +153,7 @@ export function activeNavId(route: Route): NavSectionId | null {
     case 'privacy':
     case 'account':
     case 'about':
+    case 'backup':
     case 'connectors':
       return 'settings';
     case 'legacyRedirect':

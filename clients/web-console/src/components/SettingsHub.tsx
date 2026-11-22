@@ -261,8 +261,15 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   {
     key: 'maintenance',
     title: '维护与关于',
-    note: '运维动作：看版本、查更新、装更新，以及只读的运行状态。',
+    note: '备份、恢复和版本更新。',
     entries: [
+      {
+        key: 'backup',
+        label: '备份与恢复',
+        verb: '创建或导入完整备份。',
+        path: '/settings/backup-restore',
+        testid: 'open-backup',
+      },
       {
         key: 'about',
         label: '关于与版本',

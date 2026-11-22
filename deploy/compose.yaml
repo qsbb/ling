@@ -121,7 +121,7 @@ services:
       POSTGRES_USER: ling
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ling-dev-password}
       POSTGRES_DB: ling
-      PGDATA: /var/lib/postgresql/data/pgdata
+      PGDATA: ${LING_POSTGRES_DATA_DIR:-/var/lib/postgresql/data/pgdata}
     volumes:
       - db-data:/var/lib/postgresql/data
     # 不发布端口：数据库只在 compose 内网可见
@@ -135,6 +135,7 @@ services:
 
   api:
     logging: *default-logging
+    image: ${LING_RESTORE_API_IMAGE:-${COMPOSE_PROJECT_NAME}-api}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -156,6 +157,7 @@ services:
       # 为什么不让容器内端口也跟着 LING_PORT 变：那样三处都得插值，任何一处
       # 漏了就变成"宿主发布 A、容器监听 B"，healthcheck 永远红、readyz 永远连不上。
       LING_PORT: "6520"
+      LING_RUN_MIGRATIONS: ${LING_RESTORE_MIGRATIONS:-1}
       # --- 自助更新通道（默认关闭，只有 api 拿得到）---
       # 开关默认 0：install.sh 不会自动打开，env.example 也保持关闭。
       # 打开前必须由宿主完成更新执行器初始化（建目录、赋权、备份）。
@@ -169,7 +171,7 @@ services:
     volumes:
       # 多副本共享同一份数据卷：root key 与本地回退都需要一致
       - app-data:/data
-      - ${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro
+      - ${LING_RESTORE_WEB_DIST:-${LING_WEB_DIST_HOST:-../clients/web-console/dist}}:/app/web:ro
       # 更新通道：api 只写请求、只读状态；目录在宿主上由更新执行器初始化
       # 创建并赋权（requests 给 uid 10001；status 只允许宿主写，非 0777）。
       # worker 不挂这两个目录、也没有更新开关/宿主路径；Web 侧永远不接触
@@ -247,6 +249,7 @@ services:
   # 重试不会产生重复记忆或重复放大关系。
   worker:
     logging: *default-logging
+    image: ${LING_RESTORE_WORKER_IMAGE:-${COMPOSE_PROJECT_NAME}-worker}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -305,7 +308,9 @@ services:
 
 volumes:
   db-data:
+    name: ${LING_RESTORE_DB_VOLUME:-${COMPOSE_PROJECT_NAME}_db-data}
   app-data:
+    name: ${LING_RESTORE_APP_VOLUME:-${COMPOSE_PROJECT_NAME}_app-data}
 
 networks:
   # 只有 db/api/worker 之间通信，**没有外网出口**。

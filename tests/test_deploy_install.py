@@ -1813,9 +1813,20 @@ def test_help_does_not_print_shell_implementation(
 
 
 def test_compose_default_mount_is_the_dist_checked_by_installer() -> None:
-    compose = (REPO_ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
-    assert "${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro" in compose
-    assert "LING_WEB_DIST: /app/web" in compose
+    yaml = pytest.importorskip("yaml")
+    from scripts.check_compose import interpolation_default, split_outside_braces
+
+    compose = yaml.safe_load((REPO_ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8"))
+    api = compose["services"]["api"]
+    (source,) = [
+        fields[0]
+        for entry in api["volumes"]
+        if (fields := split_outside_braces(entry))[1:] == ["/app/web", "ro"]
+    ]
+    deployment_default = interpolation_default(source)
+    assert deployment_default is not None
+    assert (interpolation_default(deployment_default) or deployment_default) == "../clients/web-console/dist"
+    assert api["environment"]["LING_WEB_DIST"] == "/app/web"
 
 
 # ---------------------------------------------------------------------------

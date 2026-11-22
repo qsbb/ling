@@ -37,6 +37,7 @@ export type Route =
   | { name: 'relationships' }
   | { name: 'account' }
   | { name: 'about' }
+  | { name: 'backup' }
   /**
    * 接入器（`GET /v1/settings/connectors`）：她从哪条线收发消息。
    * 是设置子页——渠道配置属于实例运维，不是她那一边的内容。
@@ -92,6 +93,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings/model') return { name: 'model' };
   if (path === '/settings/privacy') return { name: 'privacy' };
   if (path === '/settings/about') return { name: 'about' };
+  if (path === '/settings/backup-restore') return { name: 'backup' };
   if (path === '/settings/connectors') return { name: 'connectors' };
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
@@ -157,6 +159,8 @@ export function routePath(route: Route): string {
       return '/settings/account';
     case 'about':
       return '/settings/about';
+    case 'backup':
+      return '/settings/backup-restore';
     case 'connectors':
       return '/settings/connectors';
     case 'logs':

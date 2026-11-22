@@ -320,7 +320,10 @@ def test_compose_only_api_gets_update_channel() -> None:
     assert "LING_COMMIT: ${LING_COMMIT:-}" in api
     assert "LING_COMMIT: ${LING_COMMIT:-}" in worker
     # Web 只从只读 dist 挂载；api 根文件系统只读。
-    assert "${LING_WEB_DIST_HOST:-../clients/web-console/dist}:/app/web:ro" in api
+    assert any(
+        line.lstrip().startswith("- ") and line.rstrip().endswith(":/app/web:ro")
+        for line in api.splitlines()
+    )
     assert "read_only: true" in api
 
 

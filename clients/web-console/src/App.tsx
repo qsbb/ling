@@ -3,6 +3,7 @@ import { api, setUnauthorizedHandler } from './api';
 import { ChatPage } from './components/ChatPage';
 import { AboutPage } from './components/AboutPage';
 import { AccountPage } from './components/AccountPage';
+import { BackupRestorePage } from './components/BackupRestorePage';
 import { ChangePasswordView } from './components/ChangePasswordView';
 import { DashboardPage } from './components/DashboardPage';
 import { LoginView } from './components/LoginView';
@@ -105,6 +106,10 @@ export function mainPage(props: MainPageProps): ReactElement {
       return <IdentityPage onBack={goChat} />;
     case 'about':
       return <AboutPage onBack={goSettings} />;
+    case 'backup':
+      return user.role === 'owner'
+        ? <BackupRestorePage onBack={goSettings} />
+        : <p className="page__hint">备份与恢复由所有者管理。</p>;
     case 'connectors':
       // 接入器：只读诊断（值在宿主 `.env`，页面不给编辑入口）。
       return <ConnectorsPage onBack={goSettings} />;

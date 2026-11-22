@@ -550,7 +550,46 @@ export interface InstanceDialoguePolicyPreview {
   expires_at: number;
 }
 
+export interface BackupArchive {
+  name: string;
+  version: string;
+  commit: string;
+  migration: string;
+  created_at: string;
+  bytes: number;
+}
+
+export interface BackupStatus {
+  available: boolean;
+  archives: BackupArchive[];
+  jobs: {
+    id: string;
+    action: 'create' | 'restore';
+    status: 'queued' | 'running' | 'succeeded' | 'failed';
+    error?: string;
+  }[];
+}
+
+export function backupDownloadPath(name: string): string {
+  return '/v1/backup-restore/archives/' + encodeURIComponent(name);
+}
+
 export const api = {
+  backupStatus(signal?: AbortSignal): Promise<BackupStatus> {
+    return request('/v1/backup-restore/status', { cache: 'no-store', ...(signal ? { signal } : {}) });
+  },
+
+  importBackup(file: File): Promise<BackupArchive> {
+    return request('/v1/backup-restore/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    });
+  },
+
+  queueBackup(action: 'create' | 'restore', name?: string): Promise<{ id: string }> {
+    return request('/v1/backup-restore/jobs', jsonInit('POST', { action, name }));
+  },
   customConnectors(signal?: AbortSignal): Promise<{ connectors: LiveConnector[] }> {
     return request('/v1/settings/custom-connectors', { signal });
   },

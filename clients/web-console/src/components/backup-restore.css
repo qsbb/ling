@@ -1,0 +1,34 @@
+.backup-page__body {
+  width: min(100%, 52rem);
+  margin-inline: auto;
+}
+
+.backup-page__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.backup-page__archives {
+  padding: 0;
+  list-style: none;
+}
+
+.backup-page__archive,
+.backup-page__confirm {
+  border-block-start: 1px solid var(--border);
+  padding-block: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.backup-page__archive {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.backup-page__archive small {
+  display: block;
+}
