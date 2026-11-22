@@ -200,11 +200,13 @@ async def update_stage(session: AsyncSession, run: LiveSessionRow, report: Stage
             return {**base, "action": "start"}
         elif not runtime.get("start_operation") and report.obs_active:
             run.runtime = {**run.runtime, "detail": "OBS 已有其他推流"}
-        elif not owns_output and runtime.get("start_requested_at"):
-            if now - datetime.fromisoformat(runtime["start_requested_at"]) > timedelta(seconds=25):
-                await _operation(session, run, "start", "uncertain")
-                request_stop(run)
-                run.runtime = {**run.runtime, "detail": "开播回执超时，请核实 OBS"}
+        elif (
+            not owns_output and runtime.get("start_requested_at")
+            and now - datetime.fromisoformat(runtime["start_requested_at"]) > timedelta(seconds=25)
+        ):
+            await _operation(session, run, "start", "uncertain")
+            request_stop(run)
+            run.runtime = {**run.runtime, "detail": "开播回执超时，请核实 OBS"}
 
     if report.ready and (
         (run.state == "preview" and not report.obs_active and platform_live is not True)
