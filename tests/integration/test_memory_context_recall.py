@@ -146,6 +146,7 @@ async def test_recall_requires_relevance_before_ranking(
         cases = [
             ("今天用什么数据库？", []),
             ("入户柜的铰链松了怎么修？", []),
+            ("旧入户柜的铰链松了怎么修？", []),
             ("遮雨用的东西呢？", ["mem_umbrella"]),
         ]
         for query, expected in cases:
@@ -155,6 +156,35 @@ async def test_recall_requires_relevance_before_ranking(
             assert result.memory_ids == expected
             assert any(text in message.content for message in result.messages) is bool(expected)
         assert ["今天用什么数据库？"] in [call.args[0] for call in embed.await_args_list]
+
+
+async def test_question_keeps_its_topic_when_followed_by_background(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: None)
+    monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
+    window_id = await _window(logged_in)
+    fact = "备用钥匙在玄关蓝瓷罐"
+    async with session_scope() as session:
+        session.add(_memory(logged_in, "mem_spare_key", fact))
+
+    async with session_scope() as session:
+        compiler = ContextCompiler(session)
+        cases = [
+            "备用钥匙在哪儿？",
+            "备用钥匙在哪儿？我明早出门前得先收拾行李，想提前找出来。",
+        ]
+        for query in cases:
+            result = await compiler.compile(
+                subject_id=logged_in.subject_id, window_id=window_id, user_text=query,
+            )
+            assert result.memory_ids == ["mem_spare_key"]
+            assert any(fact in message.content for message in result.messages)
+        result = await compiler.compile(
+            subject_id=logged_in.subject_id, window_id=window_id,
+            user_text="备用钥匙先不说了，数据库怎么建表？",
+        )
+        assert result.memory_ids == []
 
 
 async def test_prompt_keeps_three_distinct_memories_and_counts_only_injection(

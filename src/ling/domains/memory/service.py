@@ -114,6 +114,8 @@ _RECALL_FILLER = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_RECALL = re.compile(r"记得|提过|说过|原文|原话|上次|那家公司|名字是什么|叫什么名字")
+_QUERY_CLAUSES = re.compile(r"[^\n，,。.!！;；?？]+[?？]?")
+_QUESTION_CUE = re.compile(r"[?？]|哪|什么|怎样|怎么|如何|几号|几点|多少|\b(?:what|where|when|who|how)\b", re.I)
 
 
 def _topic_tokens(text: str) -> set[str]:
@@ -121,9 +123,25 @@ def _topic_tokens(text: str) -> set[str]:
     return {token for token in _query_like_tokens(_RECALL_FILLER.sub(" ", text)) if len(token) >= 2}
 
 
-def _word_match(text: str, query_terms: set[str], *, explicit: bool) -> bool:
-    count = len(query_terms.intersection(_tokenize(text)))
-    return count > 0 and (explicit or count * 3 >= len(query_terms))
+def _query_topics(query: str, *, explicit: bool) -> list[set[str]]:
+    if not explicit:
+        questions = [
+            terms
+            for part in _QUERY_CLAUSES.findall(query)
+            if _QUESTION_CUE.search(part) and (terms := _topic_tokens(part))
+        ]
+        if questions:
+            return questions
+    return [_topic_tokens(query)]
+
+
+def _word_match(text: str, topics: list[set[str]], *, explicit: bool) -> bool:
+    document_terms = _tokenize(text)
+    for query_terms in topics:
+        count = len(query_terms.intersection(document_terms))
+        if count > 0 and (explicit or count * 3 >= len(query_terms)):
+            return True
+    return False
 
 
 # BM25 参数（k1/b 取通用默认值；中文 2-gram 下表现稳定）
@@ -644,10 +662,11 @@ class MemoryService:
             return result
 
         allowed = {v.value for v in visibility_allow}
-        topic_tokens = _topic_tokens(query)
         explicit_recall = bool(_EXPLICIT_RECALL.search(query)) or wants_history(query) or (
             needs_recent_topic(query.rsplit("\n", 1)[-1])
         )
+        topics = _query_topics(query, explicit=explicit_recall)
+        topic_tokens = set().union(*topics)
         base = select(MemoryRow).where(
             MemoryRow.subject_id.in_(subjects),
             MemoryRow.retracted.is_(False),
@@ -763,7 +782,7 @@ class MemoryService:
         vector_scores = await self._vector_scores(query, candidates) if self._embedder else {}
         ordered = [
             row for row in candidates
-            if _word_match(row.text, topic_tokens, explicit=explicit_recall)
+            if _word_match(row.text, topics, explicit=explicit_recall)
             or row.id in _entity_hit_ids
             or vector_scores.get(row.id, 0.0) >= _MIN_SEMANTIC_SIMILARITY
         ]
@@ -881,7 +900,7 @@ class MemoryService:
         )
         ep_pool = [
             ep for ep in episode_candidates
-            if _word_match(ep.summary, topic_tokens, explicit=explicit_recall)
+            if _word_match(ep.summary, topics, explicit=explicit_recall)
             or ep_vector_scores.get(ep.id, 0.0) >= _MIN_SEMANTIC_SIMILARITY
         ]
         # 情节查询没有 ORDER BY；先把池子按 id 定序，后面同分同置信度时
@@ -1792,7 +1811,7 @@ def classify_usage(hit: object) -> str:
 
 # 提问里出现这些词，说明用户问的是**过去**的状态，
 # 需要把已关闭的旧值也带上，否则"你以前住哪"永远答不出。
-HISTORY_QUERY_MARKERS = ("以前", "之前", "原来", "过去", "上次说过", "曾经", "旧")
+HISTORY_QUERY_MARKERS = ("以前", "之前", "原来", "过去", "上次说过", "曾经", "旧地址", "旧住址", "旧名字")
 
 
 def wants_history(text: str) -> bool:
