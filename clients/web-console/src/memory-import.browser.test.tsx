@@ -172,9 +172,57 @@ async function open(options: MockOptions = {}) {
   return { page, reads, imports };
 }
 
-const FILE = { name: 'old-memories.jsonl', mimeType: 'application/x-ndjson', buffer: Buffer.from('{"format":"ling-astrbot-memory-jsonl"}\n') };
+/** 上传给 Playwright 的文件；buffer 用 `Buffer<ArrayBuffer>`，与 setInputFiles 的声明一致。 */
+interface UploadFile {
+  name: string;
+  mimeType: string;
+  buffer: Buffer<ArrayBuffer>;
+}
 
-async function previewFile(page: Page, file = FILE) {
+const FILE: UploadFile = {
+  name: 'old-memories.jsonl',
+  mimeType: 'application/x-ndjson',
+  buffer: Buffer.from('{"format":"ling-astrbot-memory-jsonl"}\n'),
+};
+
+/*
+ * 合成大档案：**大于 32 MiB 且远多于 5000 条**。
+ *
+ * 这两个数字不是随便取的：32 MiB 是应用 `max_body_bytes` 的默认值（原来 nginx
+ * 的 `client_max_body_size 32m`），5000 是旧的记录总数上限。后端解除后，前端
+ * 不该再用它们拒绝文件——所以这份档案必须在界面上走通，而不是只当作被拦的样本。
+ *
+ * 生成方式：先铺满 > 5000 条合法记录，再用填充行把它撑过 32 MiB（服务端按
+ * `total = accepted + duplicates + skipped` 计，填充行落到 `invalid_record`）。
+ */
+const RECORD_COUNT = 5_100;
+const TARGET_BYTES = 32 * 1024 * 1024 + 256 * 1024;
+const SIZE_TEXT = `${(TARGET_BYTES / (1024 * 1024)).toFixed(1)} MB`;
+
+function buildLargeArchive(): Buffer<ArrayBuffer> {
+  const header = `${JSON.stringify({ format: 'ling-astrbot-memory-jsonl', version: 1 })}\n`;
+  const records: string[] = [];
+  for (let index = 0; index < RECORD_COUNT; index += 1) {
+    records.push(`${JSON.stringify({
+      record_id: `mm_${index}`, memory_type: 'manual_memory', platform: 'aiocqhttp',
+      owner_qq: '100200300', bot_qq: '200300400', session_id: 'aiocqhttp:FriendMessage:100200300',
+      text: `合成记忆 ${index}`, created_at: STAMP, valid_from: null, valid_to: null,
+    })}\n`);
+  }
+  let bytes = Buffer.byteLength(header) + records.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+  // 填充行是合法 JSON 但不满足记录 schema：服务端计入 invalid_record，不会伪装成可导入。
+  const filler = '{}\n';
+  for (; bytes <= TARGET_BYTES; bytes += filler.length) records.push(filler);
+  return Buffer.from(header + records.join(''), 'utf8') as Buffer<ArrayBuffer>;
+}
+
+const LARGE_FILE: UploadFile = {
+  name: 'ling-memories-large.jsonl',
+  mimeType: 'application/x-ndjson',
+  buffer: buildLargeArchive(),
+};
+
+async function previewFile(page: Page, file: UploadFile = FILE) {
   await page.getByTestId('mem-import-entry').click();
   await page.getByTestId('import-file-input').setInputFiles(file);
   await page.getByTestId('import-panel').waitFor({ state: 'visible' });
@@ -223,18 +271,30 @@ describe('导入旧记忆', () => {
     expect(imports).toHaveLength(1);
   }, CASE_TIMEOUT);
 
-  it('全局上传上限的 413 提示分批转换', async () => {
-    const { page } = await open({
+  it('413 指向反代上传配置，并保留已选文件以便重试', async () => {
+    const { page, imports } = await open({
       previewError: {
         code: 'invalid_request', status: 413,
-        detail: 'Content-Length=33554433 超过上限 33554432 字节',
+        detail: 'Content-Length=135668433 超过上限 33554432 字节',
         message: '请求体过大',
       },
     });
-    await previewFile(page);
-    expect(await page.getByTestId('import-error').innerText()).toContain('超出服务端上传上限');
-    expect(await page.getByTestId('import-error').innerText()).toContain('--limit');
-    expect(await page.getByRole('button', { name: '换个文件' }).isVisible()).toBe(true);
+    await previewFile(page, LARGE_FILE);
+    const error = await page.getByTestId('import-error').innerText();
+    expect(error).toContain('上传上限');
+    expect(error).toContain('client_max_body_size');
+    // 不再教人用 --limit 强制拆分：后端已解除总量限制，问题在入口反代。
+    expect(error).not.toContain('--limit');
+    expect(error).not.toContain('8 MiB');
+    expect(error).not.toContain('5000');
+    // 文件保留：名字与真实大小仍在，且能一步重试
+    expect(await page.getByTestId('import-retained-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-retained-meta').innerText()).toContain(SIZE_TEXT);
+    const retry = page.getByRole('button', { name: '再试一次' });
+    expect(await retry.isEnabled()).toBe(true);
+    await retry.click();
+    await expect.poll(() => imports.length).toBe(2);
+    expect(imports[1]?.bytes).toBe(LARGE_FILE.buffer.length);
   }, CASE_TIMEOUT);
 
   it('C1：重复与跳过放在次一级；D1：零条时没有确认按钮并给出下一步', async () => {
@@ -416,6 +476,224 @@ describe('导入旧记忆', () => {
     expect(sentTokens).toEqual(['token-1', 'token-2']);
   }, CASE_TIMEOUT);
 
+  /*
+   * 大档案走完整流程。判据：**两次请求的字节都等于文件真实大小**（同一份 File，
+   * 不经文本中转），且预览/确认/重复预览三次都能完成。
+   *
+   * 这条能证明：前端没有按 32 MiB 或 5000 条拒绝，也没有把 File 读成文本再发。
+   * 不能证明：服务端真的把 5xx 万条都收下了——路由是 mock 的，计数是假数。
+   */
+  it('大档案（>32 MiB、>5000 条）能走完预览、确认与重复预览', async () => {
+    /*
+     * 断言的是**实际发出的请求体字节**（`open()` 里已经收集），不是
+     * Content-Length 头：Playwright 转发 File 时是 chunked，没有这个头。
+     */
+    const { page, imports } = await open({
+      memories: [],
+      previewBody: {
+        total: 60_000, accepted: 5_100, duplicates: 40_000, skipped: 4_900,
+        skip_reasons: { invalid_record: 4_900 }, sample: [],
+      },
+      commitBody: { total: 60_000, imported: 5_100, duplicates: 40_000, skipped: 4_900, skip_reasons: { invalid_record: 4_900 } },
+    });
+
+    await previewFile(page, LARGE_FILE);
+    expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
+
+    await page.getByTestId('import-confirm').click();
+    await page.getByTestId('import-result-imported').waitFor();
+    expect(await page.getByTestId('import-result-imported').innerText()).toContain('5100');
+
+    // 重复预览：从结果页关掉再选同一份文件，预览仍然可用（预览只读）
+    await page.getByRole('button', { name: '关闭', exact: true }).click();
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-accepted-value').waitFor();
+    expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
+
+    // 三次请求都发的是用户选中的同一份 File，字节等于文件真实大小
+    const calls = imports.map((call) => ({ path: call.path, bytes: call.bytes }));
+    expect(calls).toEqual([
+      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
+      { path: '/v1/memory/import/commit', bytes: LARGE_FILE.buffer.length },
+      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
+    ]);
+    expect(LARGE_FILE.buffer.length).toBeGreaterThan(32 * 1024 * 1024);
+  }, CASE_TIMEOUT);
+
+  /*
+   * 等待状态与防连点。
+   *
+   * 判据：预览请求挂起时界面**明说在做什么**（不是假百分比），且连点只发一次
+   * 确认请求。能证明：点击去重与等待文案生效。不能证明：真实网速下的观感。
+   */
+  it('等待时说明在做什么，连点不会发出多份请求', async () => {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 900 }, reducedMotion: 'reduce' });
+    contexts.push(context);
+    const page = await context.newPage();
+    page.setDefaultTimeout(WAIT);
+    let previewCalls = 0;
+    let commitCalls = 0;
+    let releasePreview!: () => void;
+    let releaseCommit!: () => void;
+    const previewGate = new Promise<void>((resolve) => { releasePreview = resolve; });
+    const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+
+    await context.route('**/v1/**', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.method() === 'POST' && url.pathname.endsWith('/preview')) {
+        previewCalls += 1;
+        await previewGate;
+        return route.fulfill(json(preview()));
+      }
+      if (request.method() === 'POST' && url.pathname.endsWith('/commit')) {
+        commitCalls += 1;
+        await commitGate;
+        return route.fulfill(json({ total: 5, imported: 5, duplicates: 0, skipped: 0, skip_reasons: {}, destination: DESTINATION }));
+      }
+      if (request.method() === 'GET') {
+        if (url.pathname === '/v1/auth/me') {
+          return route.fulfill(json({
+            schema_version: 'v1', test_mode: false, csrf_token: 't', config_revision: 1,
+            user: { id: 'u', username: 'test', role: 'owner', subject_id: 'subj_owner', display_name: '小林', must_change_password: false },
+          }));
+        }
+        if (url.pathname === '/v1/memory') {
+          return route.fulfill(json({ memories: [], limit: 50, include: null, total: 0, has_more: false, note: '' }));
+        }
+        if (url.pathname === '/v1/version') return route.fulfill(json({ current: '0.0.0' }));
+        if (url.pathname === '/v1/sessions') return route.fulfill(json({ sessions: [] }));
+        if (url.pathname === '/v1/memory/purge/status') return route.fulfill(json({ items: [], note: '' }));
+      }
+      return route.fulfill(apiError('not_found', 'unknown', 404));
+    });
+
+    await page.goto(`${baseUrl}/memory`, { waitUntil: 'domcontentloaded' });
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+
+    // 预览挂起：要说明在等什么，且不出现伪造的百分比
+    const busy = page.getByTestId('import-busy');
+    await busy.waitFor();
+    const busyText = await busy.innerText();
+    expect(busyText).toContain('正在上传并读取这份文件');
+    expect(busyText).toContain(SIZE_TEXT);
+    expect(busyText).not.toMatch(/\d+\s*%/);
+    // 挂起期间文件选择器不可用：避免这一份还没回来就换另一份
+    expect(await page.getByTestId('import-file-input').isDisabled()).toBe(true);
+
+    releasePreview();
+    await page.getByTestId('import-confirm').waitFor();
+    expect(previewCalls).toBe(1);
+
+    /*
+     * 连点：在**同一帧**里派发两次 click，早于 React 把按钮改成 disabled。
+     *
+     * 为什么必须同一帧：等按钮 disabled 之后再点，浏览器会直接丢掉事件，
+     * 那时"只发一份请求"是被 disabled 保证的，跟 ref 守卫无关——这样的断言
+     * 去掉守卫仍然是绿的（已用变异确认）。真正要拦的是两次点击都读到旧状态
+     * 的那个窗口，所以这里用 `page.evaluate` 在同一个任务里连派两次。
+     */
+    const confirm = page.getByTestId('import-confirm');
+    await confirm.evaluate((node: HTMLElement) => {
+      node.click();
+      node.click();
+      node.click();
+    });
+    const busyCommit = page.getByTestId('import-busy');
+    await busyCommit.waitFor();
+    expect(await busyCommit.innerText()).toContain('正在写入记忆库');
+    // 三次点击只能换出一份请求
+    await expect.poll(() => commitCalls).toBe(1);
+    await page.waitForTimeout(300);
+    expect(commitCalls).toBe(1);
+    expect(await page.getByTestId('import-confirm').isDisabled()).toBe(true);
+
+    releaseCommit();
+    await page.getByTestId('import-result-imported').waitFor();
+    // 结果页如实显示 import 数
+    expect(await page.getByTestId('import-result-imported').innerText()).toContain('5');
+  }, CASE_TIMEOUT);
+
+  /*
+   * 重复占主导 vs 跳过占主导：零可导入时给的下一步必须不同。
+   *
+   * 两种输入在「可导入 0」这点上结果相同，只有"下一步做什么"能区分它们，
+   * 所以这里断言的是 headline 文本，而不是条数。
+   */
+  it('零可导入时区分"都已经导入过"和"文件不满足条件"', async () => {
+    const both = [
+      {
+        name: '重复更多',
+        body: {
+          total: 12_006, accepted: 0, duplicates: 12_000, skipped: 6,
+          skip_reasons: { invalid_record: 6 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '这些记忆都已经导入过了',
+        notHeadline: '不满足导入条件',
+      },
+      {
+        name: '跳过更多',
+        body: {
+          total: 12_006, accepted: 0, duplicates: 6, skipped: 12_000,
+          skip_reasons: { outside_private_pair: 12_000 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '不属于你与这个旧 Bot 的私聊',
+        notHeadline: '都已经导入过了',
+      },
+      {
+        // 大档案重复预览的形态：重复上万、但也有大量无效行。
+        // 这时不能说"这批都不满足条件"就让人回去重导——已经导入的要讲清楚。
+        name: '重复与无效行并存',
+        body: {
+          total: 8_059_277, accepted: 0, duplicates: 12_000, skipped: 8_047_277,
+          skip_reasons: { invalid_record: 8_047_277 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '已经导入过的 12000 条会跳过',
+        notHeadline: '重新导出迁移文件',
+      },
+    ];
+    for (const item of both) {
+      const { page } = await open({ memories: [], previewBody: item.body });
+      await previewFile(page);
+      const zero = await page.getByTestId('import-zero').innerText();
+      expect(zero, item.name).toContain(item.expectHeadline);
+      expect(zero, item.name).not.toContain(item.notHeadline);
+      expect(await page.getByTestId('import-confirm').count()).toBe(0);
+    }
+  }, CASE_TIMEOUT);
+
+  /*
+   * 解析报错：服务端读文件失败时，失败原因要能看懂、要能换文件。
+   *
+   * 两个 detail 分开验：`invalid_encoding` 与 `unsupported_archive` 在 UI 上
+   * 文案不同——只用其中一个断言，会漏掉"所有 422 都显示同一句"的实现。
+   */
+  it('解析报错给出可执行的下一步，且能换文件', async () => {
+    for (const [detail, expectText] of [
+      ['invalid_encoding', 'UTF-8'],
+      ['unsupported_archive', '转换脚本'],
+    ] as const) {
+      const { page, imports } = await open({
+        previewError: { code: 'invalid_request', status: 422, detail, message: '读不了这份文件' },
+      });
+      await previewFile(page);
+      const error = page.getByTestId('import-error');
+      await error.waitFor();
+      expect(await error.getAttribute('data-error-detail')).toBe(detail);
+      expect(await error.innerText()).toContain(expectText);
+      // 失败不静默：已选文件仍在，且明确说这份用不了
+      expect(await page.getByTestId('import-retained-name').innerText()).toBe(FILE.name);
+      expect(await page.getByTestId('import-retained-meta').innerText()).toContain('这份文件用不了');
+      const chooser = page.waitForEvent('filechooser');
+      await page.getByRole('button', { name: '换个文件' }).click();
+      expect(await chooser).toBeDefined();
+      expect(imports).toHaveLength(1);
+    }
+  }, CASE_TIMEOUT);
   it('I2：手机 375 宽预览无横向溢出，且能走完导入', async () => {
     const { page } = await open({ mobile: true, memories: [] });
     await page.getByTestId('mem-import-entry').click();
@@ -427,5 +705,26 @@ describe('导入旧记忆', () => {
     await page.getByTestId('import-confirm').click();
     await page.getByTestId('import-result-imported').waitFor();
     expect(await page.getByTestId('import-result-imported').innerText()).toContain('5');
+  }, CASE_TIMEOUT);
+
+  /*
+   * 手机宽度 + 大档案：文件名条与计数块都不能撑出横向滚动。
+   *
+   * 用 33 MB 那组常量，是因为长文件名（数字 + 连字符）最容易溢出；
+   * 判据是 `scrollWidth - clientWidth <= 0`，不是"看起来换行了"。
+   */
+  it('I3：手机 375 宽下大档案的文件名与计数不溢出', async () => {
+    const { page } = await open({
+      mobile: true, memories: [], previewBody: { total: 61_000, accepted: 5_100 },
+    });
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-accepted-value').waitFor();
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
   }, CASE_TIMEOUT);
 });

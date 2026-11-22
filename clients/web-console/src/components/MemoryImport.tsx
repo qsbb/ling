@@ -82,13 +82,19 @@ export function zeroAcceptedHint(
 ): { headline: string; next: string } {
   const entries = skipEntries(preview.skip_reasons).sort((a, b) => b.count - a.count);
   const dominant = entries[0];
+  /*
+   * 重复与跳过是两类不同的"零"：跳过要人回去改文件，重复只要去记忆库看。
+   * 所以先比数量再看原因——大档案重复预览时 both 都上万，只说跳过会让人
+   * 白折腾一遍导出脚本。
+   */
+  if (preview.duplicates > 0 && preview.duplicates >= (dominant?.count ?? 0)) {
+    return {
+      headline: '这些记忆都已经导入过了',
+      next: '直接去记忆库看即可，不需要再导一次。',
+    };
+  }
   if (!dominant) {
-    if (preview.duplicates > 0) {
-      return {
-        headline: '这些记忆都已经导入过了',
-        next: '直接去记忆库看即可，不需要再导一次。',
-      };
-    }
+    // 到这里 duplicates 必为 0：重复占主导的情况已在上面返回。
     return {
       headline: '这份文件里没有可导入的记忆',
       next: '确认导出脚本用的是本人的 QQ 和旧 Bot 的 QQ，再重新导出一份迁移文件。',
@@ -120,7 +126,9 @@ export function zeroAcceptedHint(
   }
   return {
     headline: '这批记录都不满足导入条件',
-    next: '重新导出迁移文件，或换一份文件再试。',
+    next: preview.duplicates > 0
+      ? `已经导入过的 ${preview.duplicates} 条会跳过，其余记录看折叠里的原因。`
+      : '重新导出迁移文件，或换一份文件再试。',
   };
 }
 
@@ -161,10 +169,6 @@ export function importErrorCopy(error: ImportError): ImportErrorCopy {
       return { reason: '记忆正在清理', hint: '清理结束后重新预览即可。', needsRepreview: true, needsAnotherFile: false };
     case 'destination_unavailable':
       return { reason: '目标记忆库暂不可用', hint: '稍后重新预览。', needsRepreview: true, needsAnotherFile: false };
-    case 'file_too_large':
-      return { reason: '文件超过 8 MiB', hint: '用较小的 --limit 分段导出，再逐份导入。', needsRepreview: false, needsAnotherFile: true };
-    case 'too_many_records':
-      return { reason: '文件超过 5000 条记录', hint: '用 --limit 与输出提示里的 --offset 分段导出。', needsRepreview: false, needsAnotherFile: true };
     case 'invalid_encoding':
       return { reason: '文件不是 UTF-8 编码', hint: '用导出脚本重新生成，不要手工另存。', needsRepreview: false, needsAnotherFile: true };
     case 'astrbot_native_archive':
@@ -182,11 +186,13 @@ export function importErrorCopy(error: ImportError): ImportErrorCopy {
       return { reason: '上传格式不匹配', hint: '刷新页面后重新选择文件。', needsRepreview: false, needsAnotherFile: false };
     default:
       if (error.status === 413) {
+        // 服务端与入口反代都可能拦下这份请求体。文件本身没问题，所以保留
+        // 已选文件：改完上传配置后「再试一次」即可，不必重新去磁盘找。
         return {
-          reason: '文件超出服务端上传上限',
-          hint: '用较小的 --limit 分段生成迁移文件，再逐份导入。',
+          reason: '文件超出了上传上限',
+          hint: '检查入口反代的上传大小设置（nginx 的 client_max_body_size），再对这份文件重试。',
           needsRepreview: false,
-          needsAnotherFile: true,
+          needsAnotherFile: false,
         };
       }
       return { reason: error.reason, hint: error.hint, needsRepreview: false, needsAnotherFile: false };
@@ -207,6 +213,21 @@ export function sampleTime(iso: string | null | undefined): string | null {
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(
     date.getHours(),
   )}:${pad2(date.getMinutes())}`;
+}
+
+/**
+ * 文件的真实大小（`File.size` 的字节数，不是估算）。
+ *
+ * 只用来让人判断「这次要等多久」：大文件停在等待状态是正常的。所以不设阈值、
+ * 不做「超过多少就劝你拆分」——服务端已经不再按总字节或总条数拒绝。
+ */
+export function fileSizeText(file: Pick<File, 'size'>): string {
+  const bytes = file.size;
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 /* ==================================================================== 状态机 */
@@ -241,32 +262,52 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
   const titleRef = useRef<HTMLHeadingElement>(null);
   const lastFile = useRef<File | null>(null);
   const alive = useRef(true);
+  /**
+   * 同一时刻只允许一份导入请求在飞。
+   *
+   * 为什么用 ref 而不是 `step`：连点时两次 `onClick` 可能在同一帧里读到同一个
+   * 旧的 `step`，两个守卫都放行 —— 那样预览和确认各发多份请求，确认还可能
+   * 让服务端分别写一遍。ref 的写入是同步的，下次点击立刻看得到。
+   */
+  const inFlight = useRef(false);
+  /** 离开面板/换文件时取消上一次预览，避免它回来覆盖新状态。 */
+  const previewAbort = useRef<AbortController | null>(null);
 
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
+      previewAbort.current?.abort();
     };
   }, []);
 
   const runPreview = useCallback(async (file: File) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    previewAbort.current?.abort();
+    const controller = new AbortController();
+    previewAbort.current = controller;
     lastFile.current = file;
     setError(null);
     setStep({ name: 'previewing', file });
     try {
-      const preview = await api.previewMemoryImport(file);
-      if (!alive.current) return;
+      const preview = await api.previewMemoryImport(file, controller.signal);
+      if (!alive.current || controller.signal.aborted) return;
       setStep({ name: 'preview', file, preview });
     } catch (cause) {
-      if (!alive.current) return;
+      if (!alive.current || controller.signal.aborted) return;
       // 失败时**保留文件**：回 pick 但记住 lastFile，让「重新预览」一步可用。
       setStep({ name: 'pick' });
       setError(explainImportError(cause));
+    } finally {
+      if (previewAbort.current === controller) previewAbort.current = null;
+      inFlight.current = false;
     }
   }, []);
 
   const runCommit = useCallback(async (file: File, preview: MemoryImportPreview) => {
-    if (!preview.confirmation_token) return;
+    if (!preview.confirmation_token || inFlight.current) return;
+    inFlight.current = true;
     setError(null);
     setStep({ name: 'committing', file, preview });
     try {
@@ -279,6 +320,8 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
       if (!alive.current) return;
       setStep({ name: 'preview', file, preview });
       setError(explainImportError(cause));
+    } finally {
+      inFlight.current = false;
     }
   }, [onCommitted]);
 
@@ -288,6 +331,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
   };
 
   const reset = () => {
+    previewAbort.current?.abort();
     lastFile.current = null;
     setError(null);
     setStep({ name: 'pick' });
@@ -324,6 +368,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
 
       {step.name === 'preview' || step.name === 'committing' ? (
         <PreviewStage
+          file={step.file}
           preview={step.preview}
           busy={step.name === 'committing'}
           error={error}
@@ -344,16 +389,53 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
       ) : null}
 
       {busy ? (
-        <p className="import-panel__busy" role="status">
-          <span className="spinner" aria-hidden="true" />
-          {step.name === 'previewing' ? '正在读取文件…' : '正在写入记忆…'}
-        </p>
+        <BusyState step={step} />
       ) : null}
     </section>
   );
 }
 
+/**
+ * 正在等待时说什么。
+ *
+ * 传输和解析在浏览器这一侧**分不开**：`fetch` 的 body 是整块 File，没有可观测
+ * 的上传事件，服务端也要收完才开始逐行解析。所以这里不编造百分比，只把
+ * 「文件有多大、正在做哪一步」讲清楚 —— 大文件停在这里是正常的，不是卡死。
+ */
+function BusyState({ step }: { step: ImportStep }): React.ReactElement | null {
+  if (step.name !== 'previewing' && step.name !== 'committing') return null;
+  const size = fileSizeText(step.file);
+  return (
+    <div className="import-panel__busy" role="status" data-testid="import-busy" aria-live="polite">
+      <span className="spinner" aria-hidden="true" />
+      <div>
+        <strong data-testid="import-busy-title">
+          {step.name === 'previewing' ? '正在上传并读取这份文件' : '正在写入记忆库'}
+        </strong>
+        <p>
+          {step.name === 'previewing' ? '读完给出可导入条数，不会写入。' : '写完后显示实际导入条数。'}
+          {size ? `文件 ${size}，条数越多等得越久。` : null}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /* ==================================================================== 第一步：选文件 */
+
+/**
+ * 已选文件此刻的状态：一句话，且必须是**真的**。
+ *
+ * 「已选文件还在」在失败后仍然成立，但它没回答「那我还能不能继续」。所以按
+ * 真实处境分三档：正在读它 / 上一份请求没有成功 / 可用还没开始读。
+ */
+export function retainedFileState(busy: boolean, copy: ImportErrorCopy | null): string {
+  if (busy) return '正在上传';
+  if (!copy) return '可用';
+  if (copy.needsAnotherFile) return '这份文件用不了';
+  if (copy.needsRepreview) return '需要重新预览';
+  return '这次没成功，可以重试';
+}
 
 function PickStage({
   dragging,
@@ -429,8 +511,13 @@ function PickStage({
       {retainedFile ? (
         <div className="import-retained" data-testid="import-retained">
           <div>
-            <strong>{retainedFile.name}</strong>
-            {copy?.needsAnotherFile ? null : <span>已选文件还在</span>}
+            <strong data-testid="import-retained-name">{retainedFile.name}</strong>
+            <span data-testid="import-retained-meta">
+              {fileSizeText(retainedFile)}
+              {fileSizeText(retainedFile) ? ' · ' : null}
+              {/* 这里只说这一份文件此刻的真实状态，不复述上面的错误。 */}
+              {retainedFileState(busy, copy)}
+            </span>
           </div>
           <div className="import-retained__actions">
             {!copy?.needsAnotherFile ? (
@@ -438,8 +525,8 @@ function PickStage({
                 {copy?.needsRepreview ? '重新预览' : '再试一次'}
               </button>
             ) : null}
-            {copy?.needsAnotherFile || copy?.needsRepreview ? (
-              <button type="button" className="ghost-button" onClick={() => inputRef.current?.click()}>
+            {copy?.needsAnotherFile || copy?.needsRepreview || !copy ? (
+              <button type="button" className="ghost-button" onClick={() => inputRef.current?.click()} disabled={busy}>
                 换个文件
               </button>
             ) : null}
@@ -537,6 +624,7 @@ function SkipBlock({
 }
 
 function PreviewStage({
+  file,
   preview,
   busy,
   error,
@@ -545,6 +633,7 @@ function PreviewStage({
   onRepreview,
   onChooseAnother,
 }: {
+  file: File;
   preview: MemoryImportPreview;
   busy: boolean;
   error: ExplainedError | null;
@@ -555,8 +644,14 @@ function PreviewStage({
 }): React.ReactElement {
   const empty = preview.accepted === 0;
   const zeroHint = empty ? zeroAcceptedHint(preview) : null;
+  const size = fileSizeText(file);
   return (
     <>
+      <p className="import-source-file" data-testid="import-file">
+        <strong data-testid="import-file-name">{file.name}</strong>
+        {size ? <span>{size}</span> : null}
+      </p>
+
       <DestinationBlock destination={preview.destination} />
 
       <div className={`import-count-block${empty ? ' import-count-block--empty' : ''}`} data-testid="import-accepted">
@@ -592,12 +687,16 @@ function PreviewStage({
       <div className="import-actions">
         {copy?.needsRepreview ? (
           <>
-            <button type="button" className="button" onClick={onRepreview}>重新预览</button>
-            <button type="button" className="ghost-button" onClick={onChooseAnother}>换个文件</button>
+            <button type="button" className="button" disabled={busy} onClick={onRepreview}>
+              重新预览
+            </button>
+            <button type="button" className="ghost-button" disabled={busy} onClick={onChooseAnother}>
+              换个文件
+            </button>
           </>
         ) : empty ? (
           <>
-            <button type="button" className="button" onClick={onChooseAnother}>
+            <button type="button" className="button" disabled={busy} onClick={onChooseAnother}>
               换个文件
             </button>
             <button type="button" className="ghost-button" disabled={busy} onClick={onRepreview}>
@@ -617,6 +716,9 @@ function PreviewStage({
             </button>
             <button type="button" className="ghost-button" disabled={busy} onClick={onRepreview}>
               重新预览
+            </button>
+            <button type="button" className="ghost-button" disabled={busy} onClick={onChooseAnother}>
+              换个文件
             </button>
           </>
         )}
