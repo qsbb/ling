@@ -6,7 +6,7 @@
 - 工作树：`/Users/lingxi/project/ling/.agents/worktrees/lingxi/persona-dialogue-options`
 - 分支：`lingxi/persona-dialogue-options`
 - 基线 SHA：`bd5ac914388abce6b7ae2be721dd58d64d7b7ce7`
-- 最终提交 SHA：见本分支 HEAD（`git log -1 --format=%H`）；提交后由主会话核对。
+- 最终提交 SHA：`fa0c447c0751d53bf954daedde3928478fe385af`
 - 迁移：新增 `0083_persona_dialogue_options`，`down_revision = 0082_live_sessions`，基线同上；`alembic heads` 实测唯一 head 为本 revision（日志 `docs/evidence/persona-dialogue-options/alembic-heads.log`）。
 
 ## 一、需求与口径
