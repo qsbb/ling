@@ -295,8 +295,8 @@ async def test_empty_persona_does_not_emit_guards(logged_in: TestEnv) -> None:
 
 async def test_snapshot_freezes_guards_with_persona(logged_in: TestEnv) -> None:
     """决策阶段切换人设时，本轮提示词仍用首轮解析的开关值。"""
-    from ling.domains.persona.service import PersonaSnapshot
     from ling.domains.persona import current as persona_current
+    from ling.domains.persona.service import PersonaSnapshot
 
     await _write_persona(logged_in, anti_prompt_injection=True)
     async with session_scope() as session:
