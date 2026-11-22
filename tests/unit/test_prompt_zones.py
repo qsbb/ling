@@ -228,12 +228,13 @@ def test_default_budgets_values_are_unchanged_from_the_original_table() -> None:
         "capabilities": 300,
         "constraints": 1_200,
         "scenario": 600,
+        "dialogue_guard": 512,
     }
     assert original == DEFAULT_BUDGETS
 
 
 def test_protected_lanes_are_unchanged() -> None:
-    assert frozenset({"persona", "constraints", "short_memory"}) == PROTECTED_LANES
+    assert frozenset({"persona", "constraints", "short_memory", "dialogue_guard"}) == PROTECTED_LANES
 
 
 def test_disabled_lane_takes_no_budget() -> None:
@@ -353,7 +354,7 @@ def test_identity_zone_is_never_shed() -> None:
     """身份区整区不参与牺牲。"""
     identity = next(z for z in ZONES if z.id == "identity")
     assert identity.shed_rank is None
-    assert {lane.name for lane in identity.lanes} == {"persona", "constraints"}
+    assert {lane.name for lane in identity.lanes} == {"persona", "constraints", "dialogue_guard"}
 
 
 def test_short_memory_is_protected_within_memory_zone() -> None:

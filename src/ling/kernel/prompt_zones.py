@@ -197,6 +197,7 @@ ZONES: tuple[ZoneSpec, ...] = (
         (
             LaneSpec("persona", 100_000, 10, None, True, frozenset({Gate.PERSONA_PRESENT})),
             LaneSpec("constraints", 1_200, 20, None, True, frozenset({Gate.PERSONA_PRESENT})),
+            LaneSpec("dialogue_guard", 512, 30, None, True, frozenset({Gate.PERSONA_PRESENT})),
         ),
     ),
     ZoneSpec(

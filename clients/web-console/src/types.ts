@@ -1036,6 +1036,9 @@ export interface Persona {
   /** 只含覆盖，不含默认。 */
   scenario_prompts: Record<string, string>;
   scenarios: PersonaScenario[];
+  anti_prompt_injection?: boolean;
+  anti_prompt_leak?: boolean;
+  deny_ai_assistant?: boolean;
 }
 
 export interface PersonaUpdate {
@@ -1046,6 +1049,9 @@ export interface PersonaUpdate {
   boundaries?: string[];
   /** 整组替换：空串 = 恢复默认，缺键 = 没有覆盖。 */
   scenario_prompts?: Record<string, string>;
+  anti_prompt_injection?: boolean;
+  anti_prompt_leak?: boolean;
+  deny_ai_assistant?: boolean;
 }
 
 /**
@@ -1107,6 +1113,9 @@ export interface PersonaCreate {
   traits?: Record<string, unknown>;
   boundaries?: string[];
   scenario_prompts?: Record<string, string>;
+  anti_prompt_injection?: boolean;
+  anti_prompt_leak?: boolean;
+  deny_ai_assistant?: boolean;
 }
 
 /**

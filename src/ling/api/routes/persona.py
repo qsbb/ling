@@ -96,6 +96,9 @@ class PersonaListItem(BaseModel):
     boundary_count: int
     scenario_count: int
     published: bool
+    anti_prompt_injection: bool = False
+    anti_prompt_leak: bool = False
+    deny_ai_assistant: bool = False
 
 
 class PersonaListOut(BaseModel):
@@ -115,6 +118,9 @@ class PersonaCreate(BaseModel):
     traits: dict | None = None
     boundaries: list[str] | None = None
     scenario_prompts: dict[str, str] | None = None
+    anti_prompt_injection: bool = False
+    anti_prompt_leak: bool = False
+    deny_ai_assistant: bool = False
 
 
 class ActivateOut(BaseModel):
@@ -161,6 +167,9 @@ def _item(view: PersonaView, *, active_id: str) -> PersonaListItem:
         boundary_count=len(view.boundaries or []),
         scenario_count=len(view.scenario_prompts or {}),
         published=True,
+        anti_prompt_injection=bool(getattr(view, "anti_prompt_injection", False)),
+        anti_prompt_leak=bool(getattr(view, "anti_prompt_leak", False)),
+        deny_ai_assistant=bool(getattr(view, "deny_ai_assistant", False)),
     )
 
 
@@ -194,6 +203,9 @@ async def create_persona(
         traits=body.traits,
         boundaries=body.boundaries,
         scenario_prompts=body.scenario_prompts,
+        anti_prompt_injection=body.anti_prompt_injection,
+        anti_prompt_leak=body.anti_prompt_leak,
+        deny_ai_assistant=body.deny_ai_assistant,
     )
     await _record(
         session,
@@ -251,6 +263,9 @@ async def update_persona_detail(
             traits=body.traits,
             boundaries=body.boundaries,
             scenario_prompts=body.scenario_prompts,
+            anti_prompt_injection=body.anti_prompt_injection,
+            anti_prompt_leak=body.anti_prompt_leak,
+            deny_ai_assistant=body.deny_ai_assistant,
         )
     except PersonaNotFoundError as exc:
         raise _not_found(persona_id) from exc
@@ -266,6 +281,9 @@ async def update_persona_detail(
             ("traits", body.traits),
             ("boundaries", body.boundaries),
             ("scenario_prompts", body.scenario_prompts),
+            ("anti_prompt_injection", body.anti_prompt_injection),
+            ("anti_prompt_leak", body.anti_prompt_leak),
+            ("deny_ai_assistant", body.deny_ai_assistant),
         )
         if value is not None
     ]

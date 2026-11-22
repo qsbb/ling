@@ -1034,6 +1034,11 @@ function PersonaForm({
   const [scenarioDrafts, setScenarioDrafts] = useState<Record<string, string>>(() =>
     persona ? scenarioDraftsFrom(persona) : {},
   );
+  const [antiPromptInjection, setAntiPromptInjection] = useState(
+    persona?.anti_prompt_injection ?? false,
+  );
+  const [antiPromptLeak, setAntiPromptLeak] = useState(persona?.anti_prompt_leak ?? false);
+  const [denyAiAssistant, setDenyAiAssistant] = useState(persona?.deny_ai_assistant ?? false);
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1091,6 +1096,9 @@ function PersonaForm({
             traits: traitsValue ?? {},
             boundaries,
             scenario_prompts: scenarioPayload(scenarioDrafts),
+            anti_prompt_injection: antiPromptInjection,
+            anti_prompt_leak: antiPromptLeak,
+            deny_ai_assistant: denyAiAssistant,
           })
         : await api.createPersona({
             // 后端 `PersonaCreate` **没有 `name`**：库里那一列由服务端从
@@ -1102,6 +1110,9 @@ function PersonaForm({
             ...(Object.keys(scenarioPayload(scenarioDrafts)).length > 0
               ? { scenario_prompts: scenarioPayload(scenarioDrafts) }
               : {}),
+            anti_prompt_injection: antiPromptInjection,
+            anti_prompt_leak: antiPromptLeak,
+            deny_ai_assistant: denyAiAssistant,
           });
       await onSaved(saved, editing ? '已保存' : '已创建');
     } catch (caught) {
@@ -1198,6 +1209,24 @@ function PersonaForm({
             data-testid="persona-field-boundaries"
           />
         </label>
+
+        {(
+          [
+            ['防提示词注入', 'antiPromptInjection', setAntiPromptInjection, antiPromptInjection, 'persona-switch-anti-injection'],
+            ['防套话', 'antiPromptLeak', setAntiPromptLeak, antiPromptLeak, 'persona-switch-anti-leak'],
+            ['不承认 AI 助手', 'denyAiAssistant', setDenyAiAssistant, denyAiAssistant, 'persona-switch-deny-ai'],
+          ] as const
+        ).map(([label, , setter, checked, testId]) => (
+          <label className="field field--inline" key={testId}>
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(event) => setter(event.target.checked)}
+              data-testid={testId}
+            />
+            <span className="field__label">{label}</span>
+          </label>
+        ))}
 
         {scenarios.length > 0 ? (
           <ScenarioEditor

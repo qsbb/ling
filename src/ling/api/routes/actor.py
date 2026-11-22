@@ -47,6 +47,9 @@ class PersonaOut(BaseModel):
     boundaries: list[str]
     scenario_prompts: dict
     scenarios: list[ScenarioOut]
+    anti_prompt_injection: bool = False
+    anti_prompt_leak: bool = False
+    deny_ai_assistant: bool = False
 
 
 # 人设正文的**接口侧**上限（字符）。原来 8000。
@@ -69,6 +72,9 @@ class PersonaUpdate(BaseModel):
     # 只放覆盖；某个键给空串 = 恢复默认。未知键直接报错，不静默丢弃——
     # 拼错一个键名而"保存成功、什么都不生效"是最难查的一类错。
     scenario_prompts: dict[str, str] | None = None
+    anti_prompt_injection: bool | None = None
+    anti_prompt_leak: bool | None = None
+    deny_ai_assistant: bool | None = None
 
 
 def validate_scenario_keys(scenario_prompts: dict[str, str] | None) -> None:
@@ -131,6 +137,9 @@ def _persona_out(view: PersonaView) -> PersonaOut:
             )
             for s in SCENARIOS
         ],
+        anti_prompt_injection=bool(getattr(view, "anti_prompt_injection", False)),
+        anti_prompt_leak=bool(getattr(view, "anti_prompt_leak", False)),
+        deny_ai_assistant=bool(getattr(view, "deny_ai_assistant", False)),
     )
 
 
@@ -209,6 +218,9 @@ async def update_persona(
             traits=body.traits,
             boundaries=body.boundaries,
             scenario_prompts=body.scenario_prompts,
+            anti_prompt_injection=body.anti_prompt_injection,
+            anti_prompt_leak=body.anti_prompt_leak,
+            deny_ai_assistant=body.deny_ai_assistant,
         )
         created = True
         # 刚建的行已经带上这次提交的内容；下面 `update` 只该"再改一次"时跑，
@@ -221,6 +233,9 @@ async def update_persona(
             traits=body.traits,
             boundaries=body.boundaries,
             scenario_prompts=body.scenario_prompts,
+            anti_prompt_injection=body.anti_prompt_injection,
+            anti_prompt_leak=body.anti_prompt_leak,
+            deny_ai_assistant=body.deny_ai_assistant,
         )
     # 改名后要立刻失效名字缓存：否则"剥离自己名字前缀"还在按旧名判断，
     # 新前缀就漏过去了。
@@ -236,6 +251,9 @@ async def update_persona(
             ("traits", body.traits),
             ("boundaries", body.boundaries),
             ("scenario_prompts", body.scenario_prompts),
+            ("anti_prompt_injection", body.anti_prompt_injection),
+            ("anti_prompt_leak", body.anti_prompt_leak),
+            ("deny_ai_assistant", body.deny_ai_assistant),
         )
         if value is not None
     ]

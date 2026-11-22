@@ -621,6 +621,8 @@ class ContextContribution(StrictModel):
         # 并进 persona，因为它可能为空、也可能被单独截断——混进人格车道
         # 之后，"人格被截了一半"和"这个场景没写"在日志里长得一样。
         "scenario",
+        # 人设三个对话开关装配出的短约束，受 PERSONA_PRESENT 门槛约束。
+        "dialogue_guard",
     ]
     text: str
     origin: Origin

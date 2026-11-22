@@ -163,6 +163,17 @@ class Persona(Base, TimestampMixin):
         JSON, default=dict, server_default=sa.text("'{}'::json")
     )
     published: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 对话层开关。三列独立存布尔，缺列/旧行由迁移补 false，
+    # 老 API 省略字段时沿用原值；它们只增加提示层约束，不改变权限与工具裁决。
+    anti_prompt_injection: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa.false()
+    )
+    anti_prompt_leak: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa.false()
+    )
+    deny_ai_assistant: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa.false()
+    )
 
 
 class ActorEvent(Base):

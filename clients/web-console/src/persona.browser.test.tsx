@@ -73,6 +73,9 @@ interface FakePersona {
   traits: Record<string, unknown>;
   boundaries: string[];
   scenario_prompts: Record<string, string>;
+  anti_prompt_injection: boolean;
+  anti_prompt_leak: boolean;
+  deny_ai_assistant: boolean;
   revision: number;
   published: boolean;
   created_at: string;
@@ -101,6 +104,9 @@ function seed(displayName: string, prompt: string, extra: Partial<FakePersona> =
     traits: {},
     boundaries: [],
     scenario_prompts: {},
+    anti_prompt_injection: false,
+    anti_prompt_leak: false,
+    deny_ai_assistant: false,
     revision: 3,
     published: true,
     created_at: CREATED,
@@ -162,7 +168,7 @@ function listItem(persona: FakePersona, backend: Backend) {
 
 /** 详情：完整的 `PersonaOut`（正文 + 场景对照）。 */
 function detail(persona: FakePersona, backend: Backend) {
-  return { ...listItem(persona, backend), system_prompt: persona.system_prompt, traits: persona.traits, boundaries: persona.boundaries, scenario_prompts: persona.scenario_prompts, scenarios: SCENARIOS };
+  return { ...listItem(persona, backend), system_prompt: persona.system_prompt, traits: persona.traits, boundaries: persona.boundaries, scenario_prompts: persona.scenario_prompts, anti_prompt_injection: persona.anti_prompt_injection, anti_prompt_leak: persona.anti_prompt_leak, deny_ai_assistant: persona.deny_ai_assistant, scenarios: SCENARIOS };
 }
 
 async function openPersona(
@@ -484,6 +490,52 @@ describe('有人设时的卡片列表', () => {
     await page.getByTestId('persona-edit-p1').click();
     await page.getByTestId('persona-form').waitFor();
     expect(await page.getByTestId('persona-field-system-prompt').inputValue()).toBe('');
+  }, 30_000);
+
+  it('三个对话开关逐项切换、保存后刷新保持，且互不牵连', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, backend } = await openPersona([
+      seed('心夏', '旧的人设', { id: 'p1' }),
+    ]);
+
+    await page.getByTestId('persona-edit-p1').click();
+    await page.getByTestId('persona-form').waitFor();
+    const injection = page.getByTestId('persona-switch-anti-injection');
+    const leak = page.getByTestId('persona-switch-anti-leak');
+    const ai = page.getByTestId('persona-switch-deny-ai');
+    expect(await injection.isChecked()).toBe(false);
+    expect(await leak.isChecked()).toBe(false);
+    expect(await ai.isChecked()).toBe(false);
+
+    await injection.check();
+    await leak.check();
+    await ai.check();
+    await page.getByRole('button', { name: '保存设定' }).click();
+    await page.getByTestId('persona-grid').waitFor();
+    await waitUntil(
+      async () => backend.personas[0]?.anti_prompt_injection === true
+        && backend.personas[0]?.anti_prompt_leak === true
+        && backend.personas[0]?.deny_ai_assistant === true,
+      '三个开关保存到后端',
+    );
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.getByTestId('persona-edit-p1').click();
+    await page.getByTestId('persona-form').waitFor();
+    expect(await injection.isChecked()).toBe(true);
+    expect(await leak.isChecked()).toBe(true);
+    expect(await ai.isChecked()).toBe(true);
+
+    await injection.uncheck();
+    await page.getByRole('button', { name: '保存设定' }).click();
+    await page.getByTestId('persona-grid').waitFor();
+    await waitUntil(
+      async () => backend.personas[0]?.anti_prompt_injection === false,
+      '只关闭防注入',
+    );
+    expect(backend.personas[0]?.anti_prompt_leak).toBe(true);
+    expect(backend.personas[0]?.deny_ai_assistant).toBe(true);
+    expect(backend.personas[0]?.system_prompt).toBe('旧的人设');
   }, 30_000);
 
   it('⋮ → 设为当前：调 activate，徽章跟着换卡片', async (ctx) => {
