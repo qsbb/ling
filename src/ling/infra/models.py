@@ -3269,6 +3269,8 @@ __all__ = [
     "MediaReadJob",
     "Window",
     "WindowContext",
+    "ExternalPluginRow",
+    "ExternalPluginStateRow",
     "utcnow",
 ]
 
@@ -3471,3 +3473,40 @@ class DeferredReply(Base):
 
 # Durable transcription tasks share the application's metadata.
 from ling.infra import asr_jobs as _asr_jobs  # noqa: E402,F401
+
+
+class ExternalPluginRow(Base):
+    """管理员登记的外部插件。端点是配置，不把插件代码加载进宿主进程。"""
+
+    __tablename__ = "external_plugins"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(512), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    api_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    min_host_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    max_host_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    capabilities: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    events: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    tools: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    commands: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    granted_capabilities: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="registered", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ExternalPluginStateRow(Base):
+    """插件自己的持久状态；namespace 按 plugin_id 隔离，不含宿主密钥。"""
+
+    __tablename__ = "external_plugin_state"
+
+    plugin_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

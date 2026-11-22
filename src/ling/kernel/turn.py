@@ -32,6 +32,17 @@ from ling.capabilities.tool_plugins import (
     parse_plugin_command,
     register_tool_plugin,
 )
+from ling.capabilities.external_plugins_service import (
+    COMMAND_PREFIX,
+    ExternalPluginService,
+    PluginServiceError,
+)
+from ling.capabilities.external_plugins_wiring import (
+    external_tool_id,
+    find_command,
+    parse_external_command,
+    register_external_tools,
+)
 from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
@@ -1177,6 +1188,80 @@ class TurnCoordinator:
                 # `_watch_claim_held` 与收尾处对它的使用。
                 withheld = False
 
+                # 外部插件的显式用户命令：/plugincmd <plugin_id> <command> <text>
+                # 不在模型回路里执行，但仍受同一受众门（非密封私聊、首次尝试）约束。
+                ext_command = parse_external_command(user_text)
+                if ext_command is not None:
+                    _ext_audience = (
+                        compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
+                    )
+                    ext_allowed = (
+                        self._tool_calls_enabled is not False
+                        and config.dialogue.tools_enabled
+                        and _ext_audience is not None
+                        and not _ext_audience.is_group
+                        and _ext_audience.mode is not IsolationMode.sealed
+                        and attempt == 1
+                    )
+                    if not ext_allowed:
+                        delivered = "外部插件命令只在非密封私聊中使用，这次没有发送内容。"
+                        await self._finalize(
+                            conversation=conversation,
+                            persona_id=persona_id,
+                            voice_state=voice_state,
+                            window_id=window_id,
+                            subject_id=subject_id,
+                            turn_id=turn_id,
+                            delivered=delivered,
+                            target_label=None,
+                            stopped=False,
+                            error=None,
+                            queue=queue,
+                            attempt=attempt,
+                            user_text=user_text,
+                            floor_held=held_by_me,
+                            source_account=source_account,
+                            replyable_ids=replyable_ids,
+                            expression_env=expression_env,
+                        )
+                        return
+                    ext_pid, ext_cmd, ext_text = ext_command
+                    try:
+                        async with session_scope() as ext_session:
+                            ext_service = ExternalPluginService(ext_session)
+                            ext_row = await ext_service.get(ext_pid)
+                            if ext_row is None or not ext_row.enabled:
+                                raise PluginServiceError("插件未启用")
+                            if find_command(ext_row, ext_cmd) is None:
+                                raise PluginServiceError("插件没有这个命令")
+                            delivered = await ext_service.invoke(
+                                plugin=ext_row,
+                                method="commands.call",
+                                params={"command": ext_cmd, "arguments": {"text": ext_text}},
+                            )
+                    except PluginServiceError:
+                        delivered = "插件调用失败，请检查插件是否已启用且服务可用。"
+                    await self._finalize(
+                        conversation=conversation,
+                        persona_id=persona_id,
+                        voice_state=voice_state,
+                        window_id=window_id,
+                        subject_id=subject_id,
+                        turn_id=turn_id,
+                        delivered=delivered,
+                        target_label=None,
+                        stopped=False,
+                        error=None,
+                        queue=queue,
+                        attempt=attempt,
+                        user_text=user_text,
+                        floor_held=held_by_me,
+                        source_account=source_account,
+                        replyable_ids=replyable_ids,
+                        expression_env=expression_env,
+                    )
+                    return
+
                 # 「查看本次提示词」：在**调模型之前**把真正要发出去的那份
                 # messages 存一份快照（独立事务、best-effort）。
                 #
@@ -1185,12 +1270,41 @@ class TurnCoordinator:
                 # 先判定工具。明确指令若被拦截，本轮只回本地说明，不调用模型，
                 # 因而也不应该留下「模型看过的提示词」。
                 tool_rounds = _ToolRounds()
+                # 外部插件工具：管理员登记 + 授予 tools + 本轮受众允许才注册。
+                # 注册在 run_turn 的 async 上下文里完成；账本函数本身是同步的。
+                external_tool_defs: list[tuple[Any, Any, Any]] = []
+                if self._settings is not None:
+                    try:
+                        async with session_scope() as ext_session:
+                            ext_service = ExternalPluginService(ext_session)
+                            for ext_row in await ext_service.enabled_plugins():
+                                if "tools" not in _ext_list(ext_row.granted_capabilities):
+                                    continue
+                                from ling.capabilities.external_plugins_wiring import (
+                                    external_tool_handler,
+                                    external_tool_spec,
+                                )
+                                from ling.capabilities.external_plugins_service import _as_list
+
+                                for decl in _as_list(ext_row.tools):
+                                    if not isinstance(decl, dict):
+                                        continue
+                                    spec = external_tool_spec(ext_row, decl)
+                                    if spec is None:
+                                        continue
+                                    handler = external_tool_handler(
+                                        ext_row, str(decl.get("name")), service=ext_service
+                                    )
+                                    external_tool_defs.append((ext_row, spec, handler))
+                    except Exception:  # noqa: BLE001 - plugin registration must not break a turn
+                        logger.info("外部插件工具本轮不可用")
                 tool_ledger = self._tool_ledger_for_turn(
                     config=config,
                     profile=profile,
                     window_id=window_id,
                     user_text=user_text,
                     attempt=attempt,
+                    external_tool_defs=external_tool_defs,
                     audience=(
                         compiled.snapshot if isinstance(compiled.snapshot, AudienceSnapshot) else None
                     ),
@@ -2923,6 +3037,22 @@ class TurnCoordinator:
             causation_id=turn_id,
         )
 
+        # 外部插件事件订阅：best-effort，事件端点故障绝不影响本轮聊天。
+        # event_id 稳定（turn_id + attempt + plugin_id），插件按 id 去重。
+        if state is TurnState.completed:
+            try:
+                ext_service = ExternalPluginService(conversation.session)
+                for ext_row in await ext_service.enabled_plugins():
+                    await ext_service.emit_completed(
+                        plugin=ext_row,
+                        turn_id=turn_id,
+                        window_id=window_id,
+                        subject_id=subject_id,
+                        attempt=attempt,
+                    )
+            except Exception:  # noqa: BLE001 - event delivery is never on the chat critical path
+                logger.info("外部插件事件投递失败（不影响本轮）")
+
         if state is TurnState.failed and error is not None:
             await queue.put(
                 TurnStreamEvent(
@@ -3023,6 +3153,7 @@ class TurnCoordinator:
         window_id: str | None = None,
         user_text: str = "",
         attempt: int = 1,
+        external_tool_defs: Sequence[tuple[Any, Any, Any]] = (),
     ) -> _ToolLedger:
         """决定这一轮**能不能**用工具、能用哪些。
 
@@ -3120,12 +3251,23 @@ class TurnCoordinator:
                 explicit_tool_id = plugin.tool_id
         elif explicit_request:
             return unavailable("no_explicit_tool", "当前没有开放此工具，操作未执行。")
+        # external_tool_defs 由 async 调用方预先收集（spec + handler），
+        # 在本轮的 registry 上同步注册，避免污染全局默认注册表。
+        external_tool_ids: set[str] = set()
+        for _ext_row, _ext_spec, _ext_handler in external_tool_defs:
+            if registry is None:
+                break
+            try:
+                registry.register(_ext_spec, _ext_handler, replace=True)
+                external_tool_ids.add(_ext_spec.tool_id)
+            except Exception:  # noqa: BLE001 - one bad plugin must not break the turn
+                logger.info("外部插件工具注册失败")
         definitions = tuple(
             _definition_from_spec(spec)
             for spec in registry.list_model_tools()
             if (
                 spec.tool_id == explicit_tool_id if explicit_tool_id
-                else spec.tool_id in self._tool_allowlist
+                else spec.tool_id in self._tool_allowlist or spec.tool_id in external_tool_ids
             )
         )
         if not definitions:
@@ -3141,6 +3283,7 @@ class TurnCoordinator:
             registry=registry,
             explicit_tool_id=explicit_tool_id,
             external_subject_id=audience.subject_id if explicit_tool_id and audience else "",
+            external_tool_ids=frozenset(external_tool_ids),
             availability=ToolAvailability(
                 enabled=True,
                 tools=definitions,
@@ -3521,7 +3664,7 @@ class TurnCoordinator:
             allowed = (
                 call.name == ledger.explicit_tool_id and len(accepted_calls) == 1
                 if ledger.explicit_tool_id
-                else call.name in self._tool_allowlist
+                else call.name in self._tool_allowlist or call.name in ledger.external_tool_ids
             )
             if spec is None or not spec.model_callable or not allowed:
                 _reject("tool_not_available", "这一轮没有开放这个工具，未执行")
@@ -3706,6 +3849,21 @@ def _encode_tool_results(
         payload["detail"] = detail
     payload["error"] = error
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _ext_list(value: object) -> list[Any]:
+    """Decode a JSON capability column without trusting its runtime type."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            import json as _json
+
+            parsed = _json.loads(value)
+        except ValueError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
 def _tool_error(code: str, message: str) -> dict[str, str]:
@@ -3970,6 +4128,7 @@ class _ToolLedger:
     explicit_tool_id: str = ""
     explicit_guidance: str = ""
     external_subject_id: str = ""
+    external_tool_ids: frozenset[str] = frozenset()
     executed: list[dict[str, str]] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
     forwarded: list[PromptToolResult] = field(default_factory=list)

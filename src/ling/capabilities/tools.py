@@ -113,11 +113,14 @@ class ToolRegistry:
         handler: ToolHandler,
         *,
         allow_irreversible: bool | None = None,
+        replace: bool = False,
     ) -> None:
         """注册一个工具。
 
-        ``allow_irreversible`` 是**逐次**的显式授权，默认 ``None`` = 用注册表
-        级的开关（``ToolRegistry(allow_irreversible=...)``）。
+        ``replace`` 只给本轮临时账本用（同一工具 id 在本轮重新装配一次），
+        默认仍禁止覆盖已有工具，避免全局注册表被无声替换。
+
+        ``allow_irreversible`` 是**逐次**的显式授权，默认 ``None`` = 用注册表级的开关（``ToolRegistry(allow_irreversible=...)``）。
 
         为什么需要它：注册表级的开关一开，**之后任何**不可逆工具都能注册进来；
         而真正要表达的是"这一个工具已经过评审、允许存在"。逐次的写法让授权
@@ -127,7 +130,7 @@ class ToolRegistry:
         它**不是**绕过确认：下面那条"必须 requires_confirmation"仍然生效，
         权限硬门（`manage.call_tool` 的 PolicyGate）也照旧。
         """
-        if spec.tool_id in self._specs:
+        if spec.tool_id in self._specs and not replace:
             raise ValueError(f"工具已注册: {spec.tool_id}")
         authorized = self._allow_irreversible if allow_irreversible is None else allow_irreversible
         if spec.risk in {ToolRisk.irreversible, ToolRisk.external_publish} and not authorized:
