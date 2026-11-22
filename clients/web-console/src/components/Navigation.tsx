@@ -32,6 +32,7 @@ import {
   PersonaIcon,
   RelationshipsIcon,
   SettingsIcon,
+  StopIcon,
 } from './Icons';
 
 /** 一级导航项的身份（与路由名分开：`now` 路由对应的是「生活」这一项）。 */
@@ -41,6 +42,7 @@ export type NavSectionId =
   | 'memory'
   | 'persona'
   | 'relationships'
+  | 'live'
   | 'life'
   | 'logs'
   | 'settings';
@@ -78,6 +80,12 @@ export const PRIMARY_NAV: readonly NavItemSpec[] = [
   { id: 'logs', testid: 'nav-logs', label: '日志', path: '/logs' },
 ];
 
+const LIVE_NAV: NavItemSpec = { id: 'live', testid: 'nav-live', label: '直播', path: '/live' };
+
+function visibleNav(live: boolean): readonly NavItemSpec[] {
+  return live ? PRIMARY_NAV.flatMap((item) => item.id === 'relationships' ? [item, LIVE_NAV] : [item]) : PRIMARY_NAV;
+}
+
 /** 底部固定项：设置（程序与运维）。版本号 badge 单独渲染。 */
 export const SETTINGS_NAV: NavItemSpec = {
   id: 'settings',
@@ -100,6 +108,7 @@ const ICONS: Record<NavSectionId, ReactElement> = {
   memory: <MemoryIcon />,
   persona: <PersonaIcon />,
   relationships: <RelationshipsIcon />,
+  live: <StopIcon />,
   life: <LifeIcon />,
   logs: <LogsIcon />,
   settings: <SettingsIcon />,
@@ -135,6 +144,8 @@ export function activeNavId(route: Route): NavSectionId | null {
       return 'relationships';
     case 'now':
       return 'life';
+    case 'live':
+      return 'live';
     case 'logs':
       return 'logs';
     case 'settings':
@@ -161,11 +172,13 @@ function NavItem({
   item,
   active,
   expanded,
+  liveTone,
   onGo,
 }: {
   item: NavItemSpec;
   active: boolean;
   expanded: boolean;
+  liveTone?: 'live' | 'attention' | 'neutral';
   onGo: (path: string) => void;
 }): ReactElement {
   return (
@@ -181,6 +194,7 @@ function NavItem({
         {ICONS[item.id]}
       </span>
       <span className="sidenav__label">{item.label}</span>
+      {item.id === 'live' && liveTone ? <span className="live-nav-dot" data-tone={liveTone} aria-hidden="true" /> : null}
     </button>
   );
 }
@@ -217,12 +231,14 @@ export interface SidenavProps {
   active: NavSectionId | null;
   expanded: boolean;
   version: string | null;
+  showLive?: boolean;
+  liveTone?: 'live' | 'attention' | 'neutral';
   onToggle: () => void;
   onGo: (path: string) => void;
 }
 
 /** 桌面左导航：56px 图标 rail ↔ 200px 展开。 */
-export function Sidenav({ active, expanded, version, onToggle, onGo }: SidenavProps): ReactElement {
+export function Sidenav({ active, expanded, version, showLive = false, liveTone, onToggle, onGo }: SidenavProps): ReactElement {
   return (
     <aside
       className="sidenav"
@@ -243,9 +259,9 @@ export function Sidenav({ active, expanded, version, onToggle, onGo }: SidenavPr
       </button>
       <nav className="sidenav__nav" aria-label="主导航">
         <ul className="sidenav__list">
-          {PRIMARY_NAV.map((item) => (
+          {visibleNav(showLive).map((item) => (
             <li key={item.testid} className="sidenav__list-item">
-              <NavItem item={item} active={active === item.id} expanded={expanded} onGo={onGo} />
+              <NavItem item={item} active={active === item.id} expanded={expanded} liveTone={liveTone} onGo={onGo} />
             </li>
           ))}
         </ul>
@@ -267,6 +283,8 @@ export interface NavDrawerProps {
   open: boolean;
   active: NavSectionId | null;
   version: string | null;
+  showLive?: boolean;
+  liveTone?: 'live' | 'attention' | 'neutral';
   /** 抽屉底部账号区显示的名字（`display_name || username`）。 */
   accountName: string;
   onClose: () => void;
@@ -284,6 +302,8 @@ export interface NavDrawerProps {
 export function NavDrawerPanel({
   active,
   version,
+  showLive = false,
+  liveTone,
   accountName,
   onClose,
   onGo,
@@ -309,9 +329,9 @@ export function NavDrawerPanel({
 
       <nav className="sidenav__nav" aria-label="主导航">
         <ul className="sidenav__list">
-          {PRIMARY_NAV.map((item) => (
+          {visibleNav(showLive).map((item) => (
             <li key={item.testid} className="sidenav__list-item">
-              <NavItem item={item} active={active === item.id} expanded onGo={onGo} />
+              <NavItem item={item} active={active === item.id} expanded liveTone={liveTone} onGo={onGo} />
             </li>
           ))}
         </ul>
@@ -358,6 +378,8 @@ export function NavDrawer({
   open,
   active,
   version,
+  showLive,
+  liveTone,
   accountName,
   onClose,
   onGo,
@@ -382,6 +404,8 @@ export function NavDrawer({
       <NavDrawerPanel
         active={active}
         version={version}
+        showLive={showLive}
+        liveTone={liveTone}
         accountName={accountName}
         onClose={onClose}
         onGo={onGo}

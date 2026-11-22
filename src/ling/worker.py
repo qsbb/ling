@@ -402,6 +402,23 @@ def handler(topic: str) -> Callable[[Handler], Handler]:
     return register
 
 
+@handler("livestream.speech")
+async def handle_livestream_speech(payload: dict) -> None:
+    from ling.kernel.live.speech import build_speech
+
+    await build_speech(
+        get_settings(), _MEMORY_ROUTER,
+        session_id=payload["session_id"], speech_id=payload["speech_id"],
+    )
+
+
+@handler("livestream.decide")
+async def handle_livestream_decide(payload: dict) -> None:
+    from ling.kernel.live.autonomy import consider_start
+
+    await consider_start(get_settings(), _MEMORY_ROUTER, **payload)
+
+
 async def wait_for_schema(*, attempts: int = 60, interval: float = 2.0) -> bool:
     """等 schema 就绪。
 
@@ -6382,6 +6399,8 @@ MEDIA_EXCLUDED_FROM_MAIN_WORKER: frozenset[str] = frozenset({"media.video.read"}
 OUTBOX_TOPICS: frozenset[str] = frozenset({
     "commitment.dispatch",
     "dream.generate",
+    "livestream.decide",
+    "livestream.speech",
     "memory.archive",
     "memory.extract",
     # 真删的清理阶段：由 `POST /v1/memory/forget` 在**同一事务**里投递。

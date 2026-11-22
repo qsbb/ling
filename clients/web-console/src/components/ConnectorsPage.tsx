@@ -63,6 +63,7 @@ import {
   DEFAULT_INSTANCE_ID,
   instanceFormKey,
 } from './ConnectorInstances';
+import { LiveConnectors } from './LiveConnectors';
 import '../connectors.css';
 
 interface ConnectorsPageProps {
@@ -1878,6 +1879,7 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         </div>
       </div>
 
+      {canEdit ? <LiveConnectors /> : null}
       {state.status === 'ready' && !canEdit ? (
         <p className="panel__note" data-testid="connectors-readonly">
           当前账号不是所有者：可以看，但不能改。修改接入器需要所有者账号。

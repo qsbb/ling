@@ -688,7 +688,7 @@ def test_models_match_migration() -> None:
         ConnectorRuntimeAck,
     )
 
-    with _fresh_db_at(REV) as url:
+    with _fresh_db_at("head") as url:
         for model, table in (
             (ConnectorInstance, "connector_instances"),
             (ConnectorConfigRevision, "connector_config_revisions"),

@@ -97,6 +97,25 @@ function renderDrawerPanel(): string {
   return renderToStaticMarkup(h(NavDrawerPanel, DRAWER_PROPS));
 }
 
+it('shows live between relationships and life only when the owner has a show', () => {
+  const active = activeNavId(parseRoute('/live'));
+  expect(active).toBe('live');
+  expect(navigationRegion(renderSidenav(true))).not.toContain('nav-live');
+  expect(navigationRegion(renderDrawerPanel())).not.toContain('nav-live');
+  const surfaces = [
+    renderToStaticMarkup(h(Sidenav, {
+      active, expanded: true, version: null, showLive: true, liveTone: 'attention', onToggle: NOOP, onGo: NOOP,
+    })),
+    renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, active, showLive: true, liveTone: 'attention' })),
+  ];
+  for (const surface of surfaces) {
+    const nav = navigationRegion(surface);
+    expect(nav.indexOf('nav-relationships')).toBeLessThan(nav.indexOf('nav-live'));
+    expect(nav.indexOf('nav-live')).toBeLessThan(nav.indexOf('nav-life'));
+    expect(nav).toMatch(/data-testid="nav-live"[^>]*aria-current="page"/);
+  }
+});
+
 /** 取出 `<nav aria-label="主导航">…</nav>` 这一段（取不到直接失败）。 */
 function navigationRegion(html: string): string {
   const landmark = html.indexOf('aria-label="主导航"');

@@ -107,7 +107,7 @@ function LifeRecords({ activity }: { activity: ActivityResponse | null }) {
   );
 }
 
-export function LifeNowPage({ onBack }: { onBack: () => void }) {
+export function LifeNowPage({ onBack, liveActivity }: { onBack: () => void; liveActivity?: string }) {
   const href = useLocationHref();
   const tab = lifeTabFromHref(href);
   const [activity, setActivity] = useState<ActivityResponse | null>(null);
@@ -163,6 +163,9 @@ export function LifeNowPage({ onBack }: { onBack: () => void }) {
       ) : null}
 
       <LifeDay activity={activity} timeline={timeline} timelineFailed={timelineFailed} />
+
+      {liveActivity ? <button type="button" className="button button--small" data-testid="life-live"
+        onClick={() => navigate('/live')}>{liveActivity} <span aria-hidden="true">›</span></button> : null}
 
       <details className="life-full-schedule" data-testid="life-full-schedule">
         <summary>看看完整安排</summary>

@@ -27,6 +27,7 @@ export type Route =
   | { name: 'dashboard' }
   | { name: 'chat'; sessionId: string | null }
   | { name: 'now' }
+  | { name: 'live' }
   | { name: 'settings' }
   | { name: 'model' }
   | { name: 'memory' }
@@ -86,6 +87,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/') return { name: 'chat', sessionId: null };
   if (path === '/dashboard') return { name: 'dashboard' };
   if (path === '/life') return { name: 'now' };
+  if (path === '/live') return { name: 'live' };
   if (path === '/memory') return { name: 'memory' };
   if (path === '/settings/model') return { name: 'model' };
   if (path === '/settings/privacy') return { name: 'privacy' };
@@ -137,6 +139,8 @@ export function routePath(route: Route): string {
       return '/dashboard';
     case 'now':
       return '/life';
+    case 'live':
+      return '/live';
     case 'settings':
       return '/settings';
     case 'model':
