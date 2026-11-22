@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import type { ActivityResponse, LifeTimelineOut, LifeTimelineSegment } from '../types';
 import {
   activityName,
@@ -63,6 +64,46 @@ export function LifeIllustration({ active }: { active: boolean }) {
   );
 }
 
+/**
+ * 一个会"自己走"的现在。
+ *
+ * 页面原来只在渲染那一刻取一次 `new Date()`，所以情景到期后**不会**自己变：
+ * 校验过的表现是"有效期还剩 20 秒时显示正在读书，过了 8 秒还在显示，
+ * 刷新才变成未知"。这不是数据问题——接口给的 `scene_valid_until` 一直是对的，
+ * 是界面没有在到期那一刻重新算。
+ *
+ * 这里按**最近的到期时刻**安排一次定时器：到期瞬间重算一次，然后把清理掉。
+ * 不用固定间隔轮询：那种写法要么太密（每秒重绘整页），要么在到期后仍空转。
+ */
+function useSceneClock(now: Date | undefined, expiries: readonly (string | null | undefined)[]): Date {
+  const fixed = now !== undefined;
+  const [tick, setTick] = useState(0);
+  // 每次 tick 重新取一次"现在"；固定 now 时直接用它。
+  const current = fixed ? now : new Date();
+
+  // 只有到期时刻的集合变化才需要重排定时器（拼成字符串作依赖，避免数组身份每次渲染都变）。
+  const expiryKey = expiries.map((value) => value ?? '').join('|');
+
+  useEffect(() => {
+    // 测试/验收钉住了 now 时，时间由外部决定，不挂定时器。
+    if (fixed) return undefined;
+    const upcoming = expiryKey
+      .split('|')
+      .filter(Boolean)
+      .map((value) => new Date(value).getTime())
+      .filter((time) => Number.isFinite(time))
+      .filter((time) => time > Date.now())
+      .sort((a, b) => a - b)[0];
+    if (upcoming === undefined) return undefined;
+    // 多等 1ms：到期时刻本身仍算有效（比较用 `>`），早一毫秒会漏掉这一帧。
+    const delay = Math.max(0, upcoming - Date.now()) + 1;
+    const timer = setTimeout(() => setTick((value) => value + 1), delay);
+    return () => clearTimeout(timer);
+  }, [fixed, expiryKey, tick]);
+
+  return current;
+}
+
 interface LifeDayProps {
   timeline: LifeTimelineOut | null;
   timelineFailed?: boolean;
@@ -86,7 +127,13 @@ interface LifeDayProps {
  * 与时间线里那两处的口径都不一样——同一件事在页面上有三种说法。
  */
 export function LifeDay({ timeline, timelineFailed = false, fallbackCurrent, now }: LifeDayProps) {
-  const at = now ?? new Date();
+  // 到期时刻跟着数据走：时间线里所有情景的有效期 + 兜底来源的那个。
+  const at = useSceneClock(
+    now,
+    // 兜底来源（`/v1/activity` 的 current）不带有效期字段，所以没有可挂的到期时刻：
+    // 那条路径上的"正在做"本来就不主张自己还在有效期内。
+    timeline?.facts.map((fact) => fact.scene_valid_until) ?? [],
+  );
   const merged = timeline ? mergeDayTimeline(timeline) : null;
   const scene = timeline ? currentScene(timeline.facts, at) : null;
   /*
