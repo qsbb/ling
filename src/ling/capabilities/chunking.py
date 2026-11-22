@@ -45,11 +45,9 @@ _SENTENCE_END = re.compile(r"(?<=[。！？!?…])|(?<=\.\s)|(?<=\n)")
 # fenced code block：```...```
 _CODE_FENCE = re.compile(r"```.*?```", re.S)
 # 行内代码与中英文引号
-_INLINE_PROTECTED = re.compile(
-    r"`[^`\n]+`|(?:「[^」]*」|『[^』]*』|\"[^\"]{2,}\"|“[^”]*”|‘[^’]*’)[。！？.!?…]*"
-)
+_INLINE_PROTECTED = re.compile(r"`[^`\n]+`|「[^」]*」|『[^』]*』|\"[^\"]{2,}\"")
 _GROUP_INLINE_PROTECTED = re.compile(
-    _INLINE_PROTECTED.pattern + r"""|https?://[^\s\\<>`"'“”‘’「」『』，。！？；、]+"""
+    _INLINE_PROTECTED.pattern + r"""|“[^”]*”|‘[^’]*’|https?://[^\s\\<>`"'“”‘’「」『』，。！？；、]+"""
 )
 _GROUP_BREAK = re.compile(r"(?:\\n){2,}|(?:/n){2,}")
 
