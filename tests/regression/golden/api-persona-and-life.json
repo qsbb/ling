@@ -259,6 +259,7 @@
           "activity_id": "string",
           "ended_at": "null",
           "evidence_kind": "string",
+          "kind": "string",
           "origin": "string",
           "place_id": "null",
           "scene_valid_until": "null",
