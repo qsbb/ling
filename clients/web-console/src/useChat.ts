@@ -280,6 +280,64 @@ function formatDuration(seconds: number): string {
   return `${Math.round(seconds)} 秒`;
 }
 
+/**
+ * 把「最新一批消息」并进已有视图，而不是替换它。
+ *
+ * 为什么必须合并：轮询与"停止后对齐"拿到的是**最新一页**（默认最近 200 条），
+ * 而视图里可能已经往上加载了几页更早的历史。直接 `setMessages(latest)` 会让
+ * 已经读到的第 1 条凭空消失，页顶却仍写着「这里是这段对话的开头」——
+ * 用户看到的是"历史被删了"。这正是验收复现的那条（260 条、加载过两页、
+ * 轮询一次后 oldest 从 1 变成 0）。
+ *
+ * 合并规则：
+ * - 服务端条目按 `key` 覆盖同一条（状态/正文以服务端为准）；
+ * - 服务端**没有**的条目：仍在本地新旧区间之内的保留（分页加载的更早历史、
+ *   还在飞的本地消息），区间之外才丢（窗口已经翻过去了）；
+ * - 顺序按 `sequence` 排；没有序号的本地消息排在末尾（它们是最新发出的）。
+ *
+ * `serverFloor` 是这一批里最小的 `sequence`：比它更早的条目来自分页，保留。
+ */
+export function mergeLatestPage(prev: UiMessage[], latest: UiMessage[]): UiMessage[] {
+  if (latest.length === 0) return prev;
+  const incoming = new Map(latest.map((message) => [message.key, message]));
+  const sequences = latest
+    .map((message) => message.sequence)
+    .filter((value): value is number => typeof value === 'number');
+  const serverFloor = sequences.length > 0 ? Math.min(...sequences) : null;
+
+  const merged = new Map<string, UiMessage>();
+  for (const message of prev) {
+    const fresh = incoming.get(message.key);
+    if (fresh) {
+      // 服务端说了算，但本地 `clientTurnId` 是前端独有的事实，别丢。
+      merged.set(message.key, { ...fresh, clientTurnId: message.clientTurnId ?? fresh.clientTurnId });
+      continue;
+    }
+    // 比这一页更早 = 用户往上翻出来的分页历史，保留。
+    if (typeof message.sequence === 'number') {
+      if (serverFloor !== null && message.sequence < serverFloor) {
+        merged.set(message.key, message);
+      }
+      continue;
+    }
+    // 没有序号的是本地消息（还没落库）：只要它还在飞或刚发出，就留着。
+    merged.set(message.key, message);
+  }
+  for (const message of latest) {
+    if (!merged.has(message.key)) merged.set(message.key, message);
+  }
+
+  const ordered = [...merged.values()].sort((left, right) => {
+    const a = left.sequence ?? null;
+    const b = right.sequence ?? null;
+    if (a === null && b === null) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return a - b;
+  });
+  return ordered;
+}
+
 export function useChat(
   routeSessionId: string | null,
   onTestMode: (value: boolean) => void,
@@ -404,10 +462,22 @@ export function useChat(
     try {
       const data = await api.messages(sessionId, PAGE_SIZE);
       if (currentIdRef.current !== sessionId) return;
-      setMessages(mapServerMessages(data.messages));
+      const latest = mapServerMessages(data.messages);
+      /*
+       * 视野是不是空的，**在更新函数外面**读 ref 决定。
+       *
+       * 写成"在 setMessages 的 updater 里记一个 flag、出来再读"是错的：
+       * React 可能把 updater 延后到渲染阶段才跑，那时 flag 还是初始值，
+       * 边界就会被静默地判错。ref 是同步的，这一帧读到什么就是什么。
+       */
+      const viewWasEmpty = messagesRef.current.length === 0;
+      setMessages((prev) => (viewWasEmpty ? latest : mergeLatestPage(prev, latest)));
       setActiveTurn(data.active_turn);
-      // 第一页被截断 = 前面还有；没截断就是到头了。
-      setHasMoreHistory(data.messages.length >= PAGE_SIZE);
+      // 只有整体替换时才重算边界。合并时视野边界由 `loadOlder` 维护——
+      // 拿"最新一页有没有取满"去改它，会把"还有更早的"误判成"到头了"。
+      if (viewWasEmpty) {
+        setHasMoreHistory(data.messages.length >= PAGE_SIZE);
+      }
     } catch (error) {
       if (currentIdRef.current !== sessionId) return;
       const explained = explainError(error);
@@ -641,9 +711,10 @@ export function useChat(
     const tick = async () => {
       if (cancelled) return;
       try {
-        const data = await api.messages(currentId);
+        const data = await api.messages(currentId, PAGE_SIZE);
         if (cancelled) return;
-        setMessages(mapServerMessages(data.messages));
+        // 合并而不是替换：轮询只负责"最新发生了什么"，不负责清空历史。
+        setMessages((prev) => mergeLatestPage(prev, mapServerMessages(data.messages)));
         setActiveTurn(data.active_turn);
       } catch {
         /* 网络抖动时保留当前视图，下个周期再试 */

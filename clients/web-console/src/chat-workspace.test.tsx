@@ -21,7 +21,7 @@ import { Composer } from './components/Composer';
 import { MessageList } from './components/MessageList';
 import { buildSessionRows, SessionSidebar } from './components/SessionSidebar';
 import type { SessionRecord } from './types';
-import type { UiMessage } from './useChat';
+import { mergeLatestPage, type UiMessage } from './useChat';
 
 vi.mock('./personaName', () => ({ usePersonaName: () => '灵' }));
 
@@ -345,5 +345,94 @@ describe('输入区：工具默认收起，限制按需表达', () => {
   it('换行提示与发送提示同处一行（保留中文输入法约定）', () => {
     const html = renderComposer();
     expect(html).toContain('Enter 发送 · Shift + Enter 换行');
+  });
+});
+
+describe('轮询/刷新与历史分页：合并而不是替换', () => {
+  /** 260 条的会话；返回 1..260 的 UiMessage。 */
+  const series = (from: number, to: number) => Array.from(
+    { length: to - from + 1 },
+    (_, index) => {
+      const sequence = from + index;
+      return message({
+        key: `m-${sequence}`,
+        messageId: `m-${sequence}`,
+        text: `第 ${sequence} 条`,
+        sequence,
+        role: sequence % 2 === 0 ? 'actor' : 'user',
+      });
+    },
+  );
+
+  it('最新一页不会删掉已经往上加载的更早历史', () => {
+    // 视图里已经有全部 260 条（分页加载过两次）
+    const view = series(1, 260);
+    // 轮询返回最新 200 条 + 两条新消息
+    const latest = [...series(61, 260), ...series(261, 262)];
+    const merged = mergeLatestPage(view, latest);
+
+    // 反例：整体替换会让这条红（oldest 变成 61）——正是验收日志里的现象。
+    expect(merged[0]?.sequence).toBe(1);
+    expect(merged).toHaveLength(262);
+    expect(merged.map((item) => item.sequence)).toEqual(
+      Array.from({ length: 262 }, (_, index) => index + 1),
+    );
+  });
+
+  it('服务端返回空数组时保持原视图（不能把历史清空）', () => {
+    const view = series(1, 20);
+    expect(mergeLatestPage(view, [])).toHaveLength(20);
+  });
+
+  it('本地未落库的消息排在末尾，且不会被"更早"规则误删', () => {
+    const view = [
+      ...series(1, 10),
+      message({ key: 'local-1', messageId: null, sequence: null, text: '刚发出的', local: true }),
+    ];
+    const merged = mergeLatestPage(view, series(5, 12));
+    expect(merged.map((item) => item.key)).toEqual([
+      'm-1', 'm-2', 'm-3', 'm-4', 'm-5', 'm-6', 'm-7', 'm-8', 'm-9', 'm-10',
+      'm-11', 'm-12', 'local-1',
+    ]);
+  });
+
+  it('同一条以服务端为准，但保留前端独有的 clientTurnId', () => {
+    const view = [
+      message({
+        key: 'm-5', messageId: 'm-5', sequence: 5, state: 'pending',
+        local: true, clientTurnId: 'client-abc',
+      }),
+    ];
+    const merged = mergeLatestPage(view, [
+      message({ key: 'm-5', messageId: 'm-5', sequence: 5, state: 'completed', text: '服务端版本' }),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.state).toBe('completed');
+    expect(merged[0]?.text).toBe('服务端版本');
+    expect(merged[0]?.clientTurnId).toBe('client-abc');
+  });
+
+  it('比最新一页更早的条目一律保留（宁可多留，不能删错）', () => {
+    /*
+     * 一个刻意的取舍，写下来免得后来人"优化"掉：
+     *
+     * 合并时唯一能拿到的信息是"这一批里最小的 sequence"。比它更早的条目，
+     * 要么是分页加载的历史，要么是别的来源（撤回清理、跨会话残留）。
+     * **两者在数据上无法区分**，而删错一条的后果是"历史凭空消失"——
+     * 正是这次验收要修的那个 bug。所以一律保留。
+     *
+     * 反例：如果改成"服务端没给的都丢"，这条会红，而真实的第 1 条也会一起丢。
+     */
+    const view = [...series(1, 5), ...series(300, 302)];
+    const merged = mergeLatestPage(view, series(300, 305));
+    expect(merged.slice(0, 5).map((item) => item.sequence)).toEqual([1, 2, 3, 4, 5]);
+    expect(merged.at(-1)?.sequence).toBe(305);
+  });
+
+  it('首屏（空视图）仍是整体替换，边界由这一页是否取满决定', () => {
+    // 这条钉的是区分力：合并逻辑不能顺带把"首屏边界"也算错。
+    const full = mergeLatestPage([], series(161, 260));
+    expect(full).toHaveLength(100);
+    expect(full[0]?.sequence).toBe(161);
   });
 });

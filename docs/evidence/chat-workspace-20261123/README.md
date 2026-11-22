@@ -123,3 +123,42 @@ vite build             ✓ built（chunk 体积警告为既有）
 - **引用块**：引用关系目前不进消息正文，没有可渲染的数据源。
 - **投递分段**：消息契约只暴露 `speech_delivery_state`，没有逐段投递数据可展示；
   本分支按现状使用已有字段。
+
+## 五、轮询/刷新与历史分页冲突（验收反馈 1）
+
+验收在 260 条、仍有 `active_turn` 的会话上复现：首屏最新 100 条 → 向上两页到第 1 条
+→ 轮询返回最新 200 条 + `active_turn=null` → **第 1 条消失**，页顶却仍写「开头」。
+
+根因：轮询与"停止后对齐"都走 `api.messages(sessionId)`（不带游标，默认最近 200 条），
+拿到结果后 `setMessages(latest)` **整体替换**。已经分页加载的更早历史被这一页覆盖掉，
+`hasMoreHistory` 也按"最新一页"重算，于是界面同时丢掉历史并把边界判错。
+
+修复（`clients/web-console/src/useChat.ts`）：
+
+- 新增 `mergeLatestPage(prev, latest)`：服务端条目按 `key` 覆盖同一条（保留前端独有的
+  `clientTurnId`），**比这一批最小 `sequence` 更早的条目一律保留**——它们只可能来自
+  分页加载，删错一条就是这次要修的 bug；本地未落库消息（无 `sequence`）排末尾。
+- 轮询与 `loadMessages` 都改为合并；**只有视图为空（首屏/切会话）时才整体替换**，
+  也只有那时才按"这一页是否取满"重算 `hasMoreHistory`。
+- "视图是不是空的"在 `setMessages` 之外读 ref 判定：写进 updater 里会被 React 延后执行，
+  边界会被静默判错。
+
+判据先在 `poll-history-criteria.md` 写定（早于看修复代码），再用
+`scripts/chat-poll-history-regression.mjs` 在真实 Chromium 里按验收日志逐项复现：
+
+| 变异 | 结果 |
+|---|---|
+| 轮询改回 `setMessages(latest)` | 「轮询后第 1 条仍在」红（oldest=61，即验收现象） |
+| 合并了消息但吞掉 `active_turn` | 「active_turn=null 后界面不再显示生成中」红 |
+| 合并后重算 `hasMoreHistory` | 「轮询后仍显示这里是开头」红 |
+
+三次变异后均逐字节恢复，`shasum -c` 校验 `useChat.ts`、`MessageList.tsx` 与变异前一致。
+
+请求序列复现了验收日志的形状：`limit=100 before=null` → `before=161` → `before=61`
+→ 轮询 `limit=100 before=null`。
+
+另修 `tests.log` 的 EOF 空行（`git diff --check` 报的那条）。
+
+新增判据（`scripts/chat-poll-history-regression.mjs`，桌面 1440）：
+轮询后 oldest=1 且是同一条、新消息 261/262 已并入、顺序严格递增无重复、
+页顶仍为「开头」、轮询期间 scrollTop 不动、`active_turn=null` 后停止轮询、无页面错误。

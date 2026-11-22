@@ -687,6 +687,11 @@ export function MessageList({
             className={rowClass}
             data-state={message.state}
             data-role={message.role}
+            /*
+              服务端序号：分页/轮询的游标与顺序都以它为准，也是真实浏览器里
+              唯一能"按序号断言"的东西（本地未落库的消息没有序号）。
+            */
+            data-sequence={message.sequence ?? undefined}
           >
             {/*
               头像与气泡**同侧**：她的话语在右，头像也在右（CSS 的
