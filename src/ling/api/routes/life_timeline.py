@@ -578,7 +578,7 @@ async def _load_facts(
     activity_start = func.coalesce(ActivityRow.started_at, ActivityRow.ended_at, ActivityRow.created_at)
     # 缺结束时刻的旧记录只归属开始日。有效情景能证明当前活动仍在继续。
     reaches_window = or_(activity_start >= window_start, ActivityRow.ended_at > window_start)
-    if scene_until is not None and scene_activity is not None and now >= window_start:
+    if scene_until is not None and scene_activity is not None and window_start <= now < window_end:
         reaches_window = or_(reaches_window, and_(
             ActivityRow.id == scene_activity,
             ActivityRow.state == "running",

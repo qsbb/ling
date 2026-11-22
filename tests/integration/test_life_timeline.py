@@ -58,6 +58,7 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
     from ling.api.routes import life_timeline
 
     previous = DAY - timedelta(days=1)
+    earlier = previous - timedelta(days=1)
     now = _at(DAY, 10)
 
     class Clock(datetime):
@@ -70,7 +71,7 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
         rows = [
             ActivityRow(
                 id="old_check", actor_id=ACTOR, kind="check", state="running",
-                started_at=_at(previous, 9), origin="simulated",
+                started_at=_at(earlier, 9), origin="simulated",
             ),
             ActivityRow(
                 id="ends_at_midnight", actor_id=ACTOR, kind="rest", state="completed",
@@ -93,7 +94,8 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
         assert response.status_code == 200, response.text
         return {fact["activity_id"]: fact for fact in response.json()["facts"]}
 
-    assert set(await facts(previous)) == {"old_check", "ends_at_midnight", "crosses_midnight"}
+    assert set(await facts(earlier)) == {"old_check"}
+    assert set(await facts(previous)) == {"ends_at_midnight", "crosses_midnight"}
     today = await facts(DAY)
     assert set(today) == {"crosses_midnight", "today_check"}
     assert today["today_check"]["evidence_kind"] == "clock_only"
@@ -107,6 +109,7 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
     today = await facts(DAY)
     assert set(today) == {"old_check", "crosses_midnight", "today_check"}
     assert today["old_check"]["scene_valid_until"] is not None
+    assert set(await facts(previous)) == {"ends_at_midnight", "crosses_midnight"}
 
 
 async def _insert_plan(
