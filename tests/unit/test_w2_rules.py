@@ -1038,7 +1038,7 @@ def test_total_budget_follows_the_persona_budget() -> None:
     lanes = sum(DEFAULT_BUDGETS.values())
     total = lanes + HISTORY_TOKEN_BUDGET
     assert DEFAULT_BUDGETS["persona"] == 100_000
-    assert lanes - DEFAULT_BUDGETS["persona"] == 28_600, "其余车道被动过了"
+    assert lanes - DEFAULT_BUDGETS["persona"] == 29_112, "其余车道被动过了"
     assert total == lanes + 20_000
 
 
@@ -1158,10 +1158,10 @@ def test_budget_scale_actually_resizes_the_tables() -> None:
     data = _import_context_in_subprocess("0.5")
 
     assert data["scale"] == 0.5, data
-    # 0.5 倍：人设 100k → 50k，历史 20k → 10k，车道和 128600 → 64300
+    # 0.5 倍：人设 100k → 50k，历史 20k → 10k，车道和 129112 → 64556
     assert data["persona"] == 50_000, data
     assert data["history"] == 10_000, data
-    assert data["total"] == 74_300, data
+    assert data["total"] == 74_556, data
 
 
 def test_budget_scale_garbage_does_not_zero_the_budgets() -> None:

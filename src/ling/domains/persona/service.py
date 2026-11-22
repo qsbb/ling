@@ -69,6 +69,10 @@ class PersonaView:
     # 只含**覆盖**，不含默认。读的地方一律走 `scenarios.effective_text()`，
     # 否则"默认值改了，已有人设还念旧版"这种错会到处复制。
     scenario_prompts: dict = field(default_factory=dict)
+    # 对话层开关。False = 现有人设原有行为；随 PersonaSnapshot 一起冻结。
+    anti_prompt_injection: bool = False
+    anti_prompt_leak: bool = False
+    deny_ai_assistant: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +151,9 @@ def empty_persona_view(persona_id: str = "") -> PersonaView:
         traits={},
         boundaries=[],
         scenario_prompts={},
+        anti_prompt_injection=False,
+        anti_prompt_leak=False,
+        deny_ai_assistant=False,
     )
 
 
@@ -438,6 +445,9 @@ class PersonaService:
         scenario_prompts: dict | None = None,
         persona_id: str | None = None,
         replace: bool = False,
+        anti_prompt_injection: bool | None = None,
+        anti_prompt_leak: bool | None = None,
+        deny_ai_assistant: bool | None = None,
     ) -> PersonaView:
         """新建一套人格。**id 自动生成**（见 :func:`new_persona_id`）。
 
@@ -470,6 +480,9 @@ class PersonaService:
             row.traits = dict(traits or {})
             row.boundaries = list(boundaries or [])
             row.scenario_prompts = clean_overrides(scenario_prompts or {})
+            row.anti_prompt_injection = anti_prompt_injection is True
+            row.anti_prompt_leak = anti_prompt_leak is True
+            row.deny_ai_assistant = deny_ai_assistant is True
             row.revision = int(row.revision or 0) + 1
             row.updated_at = utcnow()
             await self._session.flush()
@@ -488,6 +501,9 @@ class PersonaService:
             boundaries=list(boundaries or []),
             scenario_prompts=clean_overrides(scenario_prompts or {}),
             published=True,
+            anti_prompt_injection=anti_prompt_injection is True,
+            anti_prompt_leak=anti_prompt_leak is True,
+            deny_ai_assistant=deny_ai_assistant is True,
         )
         self._session.add(row)
         await self._session.flush()
@@ -503,6 +519,9 @@ class PersonaService:
         boundaries: list[str] | None = None,
         scenario_prompts: dict | None = None,
         persona_id: str | None = None,
+        anti_prompt_injection: bool | None = None,
+        anti_prompt_leak: bool | None = None,
+        deny_ai_assistant: bool | None = None,
     ) -> PersonaView:
         """改一套已存在的人格。``persona_id`` 为空时改**当前激活**的那一套。
 
@@ -525,6 +544,12 @@ class PersonaService:
             # 逐键合并会让"删掉这一条"无法表达——缺键既可能是"没改"
             # 也可能是"清空"，两种意思在同一个 payload 里分不开。
             persona.scenario_prompts = clean_overrides(scenario_prompts)
+        if anti_prompt_injection is not None:
+            persona.anti_prompt_injection = bool(anti_prompt_injection)
+        if anti_prompt_leak is not None:
+            persona.anti_prompt_leak = bool(anti_prompt_leak)
+        if deny_ai_assistant is not None:
+            persona.deny_ai_assistant = bool(deny_ai_assistant)
         persona.revision = int(persona.revision or 0) + 1
         persona.updated_at = utcnow()
         await self._session.flush()
@@ -663,6 +688,9 @@ class PersonaService:
             traits=dict(p.traits or {}),
             boundaries=[item for item in (p.boundaries or []) if isinstance(item, str)],
             scenario_prompts=dict(p.scenario_prompts or {}),
+            anti_prompt_injection=bool(getattr(p, "anti_prompt_injection", False)),
+            anti_prompt_leak=bool(getattr(p, "anti_prompt_leak", False)),
+            deny_ai_assistant=bool(getattr(p, "deny_ai_assistant", False)),
         )
 
 

@@ -545,9 +545,11 @@ def test_persona_budget_is_100k_tokens() -> None:
     from ling.kernel.context import DEFAULT_BUDGETS
 
     assert DEFAULT_BUDGETS["persona"] == 100_000
-    # 其余车道**一个都没动**：这条断言是为了防止"顺手把别的也调大"。
+    # 其余车道**一个都没动**：新增的 dialogue_guard（512）是本特性的独立车道，
+    # 除此之外仍是 28_600。断言拆开两层，既防“顺手把别的调大”，也允许本特性新增车道。
     others = {k: v for k, v in DEFAULT_BUDGETS.items() if k != "persona"}
-    assert sum(others.values()) == 28_600, others
+    assert others.get("dialogue_guard") == 512, others
+    assert sum(v for k, v in others.items() if k != "dialogue_guard") == 28_600, others
 
 
 def test_total_budget_grows_with_persona() -> None:
