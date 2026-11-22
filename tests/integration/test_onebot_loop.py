@@ -1179,12 +1179,29 @@ async def test_private_reply_is_split_and_reassembles(
     assert rejoined == _LONG_REPLY, f"分段拼不回原稿：{rejoined[:60]!r}"
 
 
-async def test_group_never_splits(logged_in: TestEnv) -> None:
-    """群聊恒为 1 段——拆成多条会绕过防刷屏上限。"""
-    from ling.capabilities.chunking import plan_parts
+@pytest.mark.parametrize("separator", ["\n\n", "/n/n", r"\n\n"])
+async def test_group_paragraphs_are_sent_as_separate_messages(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, separator: str,
+) -> None:
+    import ling.capabilities.chunking as chunking
 
-    assert len(plan_parts(_LONG_REPLY, is_group=True)) == 1
-    assert len(plan_parts(_LONG_REPLY, is_group=False)) >= 1
+    monkeypatch.setattr(chunking, "PART_DELAY_SECONDS", 0.0)
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    parts = ["先说结论。", "我再讲一下原因。"]
+    stub = _LongReplyRouter(logged_in.app.state.router, long_text=separator.join(parts))
+    monkeypatch.setattr(logged_in.app.state, "router", stub)
+
+    body = (await _post(logged_in, _group_event("[CQ:at,qq=10001] 帮我分开讲"))).json()
+
+    assert stub.generation_calls == 1
+    assert body["parts_sent"] == body["parts_total"] == len(parts), body
+    assert [call["action"] for call in fake.sent] == ["send_group_msg"] * len(parts)
+    assert [
+        "".join(seg["data"]["text"] for seg in call["body"]["message"] if seg["type"] == "text")
+        for call in fake.sent
+    ] == parts
 
 
 async def test_part_two_not_sent_when_part_one_fails(

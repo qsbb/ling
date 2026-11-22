@@ -43,6 +43,7 @@ _SENTENCE_END = re.compile(r"(?<=[。！？!?…])|(?<=\.\s)|(?<=\n)")
 _CODE_FENCE = re.compile(r"```.*?```", re.S)
 # 行内代码与中英文引号
 _INLINE_PROTECTED = re.compile(r"`[^`\n]+`|「[^」]*」|『[^』]*』|\"[^\"]{2,}\"")
+_GROUP_BREAK = re.compile(r"(?P<url>https?://[^\s<>()，。！？；、]+)|(?:\\n){2,}|(?:/n){2,}")
 
 
 def _split_protected(text: str) -> list[tuple[str, bool]]:
@@ -133,14 +134,9 @@ def split_semantic(
 
 # ---------------------------------------------------------------- 投递分段
 
-# 一次回复最多拆成几段。
-# 私聊 3 段：再多就不像"补充一句"，像刷屏。
-# 群聊 1 段：**不拆**。拆成多条会绕过防刷屏上限（`group_turn_budget`
-# 数的是消息条数），所以群聊默认单条。
-# 私聊上限 5 段：真人「连发」常常三四条，3 段会把第四条并进第三条，
-# 反而更不像在打字。群聊仍然恒 1 段（拆多条会绕过防刷屏上限）。
+# 一轮回复的常规段数。群聊频率限制另按回复轮次计算。
 MAX_PARTS_PRIVATE = 5
-MAX_PARTS_GROUP = 1
+MAX_PARTS_GROUP = 3
 
 # 两段之间的停顿（秒）。**这是模拟的节奏，不是真实回执**，
 # 所以它绝不写进 delivery 回执，只影响调度。
@@ -163,6 +159,21 @@ def _newline_units(text: str) -> list[str]:
         for line in piece.split("\n"):
             if line.strip():
                 units.append(line)
+    return units
+
+
+def _group_units(text: str) -> list[str]:
+    """保留段间换行，合并到同一条时仍能看清原来的段落。"""
+    units = [""]
+    for piece, protected in _split_protected(text):
+        if protected:
+            units[-1] += piece
+            continue
+        normalized = _GROUP_BREAK.sub(lambda match: match["url"] or "\n\n", piece)
+        for line in normalized.splitlines(keepends=True):
+            units[-1] += line
+            if line.endswith("\n") and units[-1].strip():
+                units.append("")
     return units
 
 
@@ -275,16 +286,15 @@ def plan_parts(
     *,
     is_group: bool,
     max_part_chars: int | None = None,
+    legacy_group_plan: bool = False,
 ) -> list[str]:
     """把一条完整回复规划成若干待发段。
 
     规则：
-    - 群聊恒为 1 段（不拆，避免绕过防刷屏上限）
-    - 私聊**正常长度**最多 ``MAX_PARTS_PRIVATE`` 段
+    - 正常长度按语义或换行分段，群最多 3 段，私聊最多 5 段
     - **每段 <= 渠道硬上限 ``max_part_chars``**——超过就发不出去，
       不是"整条被拒"就是"尾段丢失"，两种都不能接受
-    - **各段按序拼接必须等于原文本**——这是可机械检查的硬约束，
-      防止分段过程增删内容
+    - **各段保留正文**，分隔符和边缘空白可随发送边界调整
 
     ``max_part_chars`` 是**渠道硬上限**（``CapabilityDescriptor.max_text_length``），
     与切分阈值 ``MAX_SEGMENT_CHARS``（220，只管"切不切"）是两个概念。
@@ -300,11 +310,8 @@ def plan_parts(
         return []
     limit = DEFAULT_PART_LIMIT_CHARS if max_part_chars is None else max(1, int(max_part_chars))
 
-    if is_group:
-        # 群聊不拆：拆成多条会绕过 `group_turn_budget`（它数的是消息条数）。
-        # 唯一的例外是**物理上一条发不出去**：那时不拆等于整条丢失，
-        # 拆开至少话能说到。这种文本远超正常群聊回复长度，实际很少见。
-        return [text] if len(text) <= limit else _cut_oversize(text, limit)
+    if is_group and legacy_group_plan:
+        return _cut_oversize(text, limit)
 
     # **换行是模型自己决定的分段意图，优先尊重它。**
     #
@@ -312,9 +319,19 @@ def plan_parts(
     # 那是给散文段落设计的。用在聊天上会把「你今天累啦？/ 谁让你又
     # 闷着不出去转转。/ 走，去小吃街加个餐」三句合并成一段——而模型的
     # 换行恰恰是它决定"分三条发"的信号。合并规则不该覆盖它。
-    units = _newline_units(text)
-    if len(units) > 1:
-        segments: list[str] = []
+    if is_group:
+        group_units = _group_units(text)
+        text = "".join(group_units)
+        if not text.strip():
+            return []
+        units = [unit for unit in group_units if unit.strip()]
+    else:
+        units = _newline_units(text)
+    segments: list[str]
+    if len(units) > 1 and is_group:
+        segments = units
+    elif len(units) > 1:
+        segments = []
         for unit in units:
             # 单行过长时再走语义切分（受保护片段整块进，不拆）
             segments.extend(split_semantic(unit) if len(unit) > MAX_SEGMENT_CHARS else [unit])
@@ -328,7 +345,11 @@ def plan_parts(
     for segment in segments:
         pieces.extend(_cut_oversize(segment, limit) if len(segment) > limit else [segment])
 
-    parts = _pack_units(pieces, limit=limit, max_parts=MAX_PARTS_PRIVATE)
+    max_parts = MAX_PARTS_GROUP if is_group else MAX_PARTS_PRIVATE
+    if is_group and len(pieces) <= max_parts:
+        parts = pieces
+    else:
+        parts = _pack_units(pieces, limit=limit, max_parts=max_parts)
 
     # 可机械验证的约束：**内容不能丢**。
     #
@@ -343,6 +364,8 @@ def plan_parts(
 
     if _squash("".join(parts)) != _squash(text):
         return _cut_oversize(text, limit)
+    if is_group and len(units) > 1:
+        return [part.strip("\r\n") for part in parts if part.strip()]
     return parts
 
 

@@ -237,6 +237,54 @@ async def test_redelivery_does_not_resend_first_part(logged_in: TestEnv) -> None
     assert again["delivered"] is True, again
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+async def test_group_redelivery_uses_the_original_plan(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, legacy: bool,
+) -> None:
+    from ling.capabilities import chunking
+    from ling.kernel.bridge import InboundBridge
+
+    fake = _FakeOneBot(fail_sends={1 if legacy else 2})
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    message = "[CQ:at,qq=10001] 分段说一下"
+    event = json.loads(_event_body(message))
+    event.update(message_type="group", sub_type="normal", group_id=100200301)
+    payload = json.dumps(event).encode()
+    stub = _TextRouter(logged_in.app.state.router, "第一句。\n\n第二句。")
+    monkeypatch.setattr(logged_in.app.state, "router", stub)
+    monkeypatch.setattr(chunking, "PART_DELAY_SECONDS", 0.0)
+    deliver = InboundBridge._deliver
+
+    async def deliver_legacy(self, **kwargs):
+        return await deliver(self, **{**kwargs, "legacy_group_plan": True})
+
+    with monkeypatch.context() as before_upgrade:
+        if legacy:
+            before_upgrade.setattr(InboundBridge, "_deliver", deliver_legacy)
+        first = await _post(logged_in, payload)
+
+    if legacy:
+        async with session_scope() as session:
+            operation = await session.scalar(select(Operation).where(Operation.kind == "delivery"))
+            assert operation is not None
+            assert operation.payload["group_paragraphs"] is False
+            operation.payload = {
+                key: value for key, value in operation.payload.items() if key != "group_paragraphs"
+            }
+
+    expected = ["第一句。\n\n第二句。"] if legacy else ["第一句。", "第二句。"]
+    assert first["parts_total"] == len(expected), first
+    assert first["parts_sent"] == len(expected) - 1, first
+    assert fake.texts() == expected
+
+    again = await _post(logged_in, payload)
+
+    assert again["parts_sent"] == again["parts_total"] == len(expected), again
+    assert fake.texts() == [*expected, expected[-1]]
+    assert stub.generation_calls == 1
+
+
 async def test_all_parts_delivered_is_not_resent_on_redelivery(logged_in: TestEnv) -> None:
     """全部送达之后重投：由事件认领挡住，一次都不该再发。"""
     fake = _FakeOneBot()

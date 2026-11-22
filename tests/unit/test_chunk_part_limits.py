@@ -202,14 +202,29 @@ def test_single_oversized_code_block_is_cut_not_dropped() -> None:
     assert _squash("".join(parts)) == _squash(code), "代码块被切开时丢字了"
 
 
-def test_group_stays_single_part_unless_physically_impossible() -> None:
-    """群聊默认恒 1 段（拆多条会绕过 `group_turn_budget`），
-    只有"一条物理上发不出去"时才拆——那时不拆等于整条丢失。"""
+def test_group_semantic_parts_are_bounded_and_preserve_text() -> None:
     normal = _long_reply(600)
-    assert len(plan_parts(normal, is_group=True, max_part_chars=QQBOT_MAX_TEXT_LENGTH)) == 1
+    parts = plan_parts(normal, is_group=True, max_part_chars=QQBOT_MAX_TEXT_LENGTH)
+    assert 1 < len(parts) <= 3
+    assert "".join(parts) == normal
 
     oversized = _long_reply(6000)
     parts = plan_parts(oversized, is_group=True, max_part_chars=QQBOT_MAX_TEXT_LENGTH)
     assert len(parts) > 1, "超长群消息不拆等于整条发不出去"
     assert all(len(p) <= QQBOT_MAX_TEXT_LENGTH for p in parts)
     assert _squash("".join(parts)) == _squash(oversized)
+
+
+def test_group_paragraphs_keep_protected_text_and_link_paths() -> None:
+    quoted = r"先看这个字面量「\n\n」和 [链接](https://example.org/n/n)。"
+    code = '```text' + "\n" + '/n/n' + "\n" + '```'
+    assert plan_parts(f"{quoted}/n/n{code}/n/n最后看结果。", is_group=True) == [
+        quoted, code, "最后看结果。",
+    ]
+
+
+def test_group_extra_paragraphs_keep_readable_separators() -> None:
+    items = ["嗯", "之后确认一下", "还有个细节", "差不多了", "先这样"]
+    parts = plan_parts("\n\n".join(items), is_group=True)
+    assert len(parts) == 3
+    assert "\n\n".join(parts) == "\n\n".join(items)

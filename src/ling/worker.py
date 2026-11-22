@@ -2451,8 +2451,7 @@ async def _reply_in_group_window(  # noqa: ANN001
     （几十秒）、投递要拿平台回执，把这两件事塞进那条事务会让游标行一直
     `FOR UPDATE` 锁着，还会让"决策"和"结果"共用一个返回值。
 
-    群聊恒为一段（`plan_parts(is_group=True)`）：拆成多条会绕过防刷屏上限
-    （`group_turn_budget` 数的是消息条数）。
+    群聊的自然分段与接入器即时回复使用同一套规则。
     """
     from ling.domains.conversation.service import ConversationService
     from ling.infra.security import new_id
@@ -2636,7 +2635,12 @@ async def _reply_in_group_window(  # noqa: ANN001
     # 逐字节相同（`parse_speak_choice` 只在匹配到起始控制区时才改它），所以
     # 纯文字路径的分段结果与接线前完全一致。
     body = speak_choice.text if speak_choice.speak else reply_text
-    parts = plan_parts(body, is_group=is_group, max_part_chars=limit)
+    parts = plan_parts(
+        body,
+        is_group=is_group,
+        max_part_chars=limit,
+        legacy_group_plan=speech is not None,
+    )
     if not parts:
         return False, "回复文本为空"
 
@@ -2647,8 +2651,9 @@ async def _reply_in_group_window(  # noqa: ANN001
         if index > 1:
             # 上一段已经拿到回执才走到这里。停顿只是节奏，不是回执。
             await asyncio.sleep(PART_DELAY_SECONDS)
-        mentions = list((expression or {}).get("at") or [])
-        reply_to = (expression or {}).get("quote")
+        part_expression = {} if is_group and index > 1 else (expression or {})
+        mentions = list(part_expression.get("at") or [])
+        reply_to = part_expression.get("quote")
         if speech is not None and index == 1:
             # **只有首段**走语音裁决：一条语音对应一条消息。第二段起走下面的纯文字段
             # （降级时同理——`deliver_speech` 也只发一段）。
@@ -2681,7 +2686,7 @@ async def _reply_in_group_window(  # noqa: ANN001
                     # 她自己在生成时选的表达方式（@/引用/拍一拍）
                     mentions=mentions,
                     reply_to=reply_to,
-                    poke_targets=list((expression or {}).get("poke") or []),
+                    poke_targets=list(part_expression.get("poke") or []),
                 ),
                 actor_id=settings.actor_id,
                 subject_id=subject_id,

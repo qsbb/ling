@@ -1201,14 +1201,29 @@ class InboundBridge:
         media_note: str | None,
     ) -> BridgeResult:
         """重投时只**续发剩下的段**（已发段由段级幂等跳过）。"""
+        from ling.capabilities.delivery import PART_SCOPE
         from ling.domains.conversation.service import ConversationService
+        from ling.infra.models import IdempotencyKey, Operation
 
+        legacy_group_plan = False
+        if is_group:
+            first_part = await self._session.scalar(
+                select(Operation.payload)
+                .join(IdempotencyKey, IdempotencyKey.result_ref == Operation.id)
+                .where(
+                    IdempotencyKey.scope == PART_SCOPE,
+                    IdempotencyKey.key == f"plan_{turn.id}:1",
+                )
+            )
+            # 段号已用来记回执，升级时不能给同一段号重新分配正文。
+            legacy_group_plan = not (first_part or {}).get("group_paragraphs", False)
         delivery = await self._deliver(
             envelope=envelope,
             text=text,
             subject_id=subject_id,
             expression={},
             turn_id=turn.id,
+            legacy_group_plan=legacy_group_plan,
         )
         delivered = delivery.delivered
         reason = describe_delivery(delivery)
@@ -1949,14 +1964,14 @@ class InboundBridge:
         # 原实现用的是 `plan_{uuid4()}`，重投必然拿到新 plan_id，幂等直接失效，
         # 那正是"重投必然重发第 1 段"的根因（调研 §5 P0-1）。
         turn_id: str | None = None,
+        legacy_group_plan: bool = False,
     ) -> ReplyDelivery:
         """按顺序投递回复，返回确认的段数及是否仍有待确认的投递。
 
         **每段只在上一段拿到真实回执之后才发**——这就是"不是一次全倒出去"。
 
         六条硬约束：
-        1. 群聊恒为 1 段：拆成多条会绕过防刷屏上限（`group_turn_budget`
-           数的是消息条数）
+        1. 群聊按语义和显式换行分段，已有投递计划的轮次继续沿用原分段规则。
         2. **分段必须按渠道硬上限切**：`plan_parts` 收
            `max_part_chars=capabilities().max_text_length`。这是物理约束，
            与 `MAX_SEGMENT_CHARS`（220，只管"切不切"）不是一回事。
@@ -2026,7 +2041,12 @@ class InboundBridge:
         if callable(caps):
             with contextlib.suppress(Exception):
                 limit = int(caps().max_text_length) or None
-        parts = plan_parts(text, is_group=is_group, max_part_chars=limit)
+        parts = plan_parts(
+            text,
+            is_group=is_group,
+            max_part_chars=limit,
+            legacy_group_plan=legacy_group_plan,
+        )
         if not parts:
             return ReplyDelivery(parts_sent=0, parts_total=0)
 
@@ -2039,18 +2059,18 @@ class InboundBridge:
         # 出来的 `[msg_id:…]` 白名单核过一遍，连接器发之前还会再核一遍
         # "这个 id 我到底见过没有"（NapCat 对无效 reply 只会静默丢该段）。
         # 这里只负责把它塞进出站消息。
-        reply_to = (expression or {}).get("quote")
-
         gate = _gate_for(envelope.window_ref)
         sent = 0
         skipped = 0
         attempted = 0
         uncertain = False
         for index, part in enumerate(parts, 1):
+            part_expression = {} if is_group and index > 1 else (expression or {})
             payload_extra = {
                 "reply_plan": plan_id,
                 "part_ordinal": index,
                 "parts_total": len(parts),
+                "group_paragraphs": is_group and not legacy_group_plan,
             }
             async with gate.lock:
                 # 节奏与令牌桶都在锁内：同一窗口的两个轮次不会交错发送。
@@ -2064,9 +2084,9 @@ class InboundBridge:
                         is_group=is_group,
                         # **她自己选的**表达方式。代码不再替她决定"群里就该 @"——
                         # 那是把人设的判断写死在代码里。这里只负责"选了就做到"。
-                        mentions=list((expression or {}).get("at") or []),
-                        reply_to=reply_to,
-                        poke_targets=list((expression or {}).get("poke") or []),
+                        mentions=list(part_expression.get("at") or []),
+                        reply_to=part_expression.get("quote"),
+                        poke_targets=list(part_expression.get("poke") or []),
                     ),
                     actor_id=self._actor_id,
                     subject_id=subject_id,

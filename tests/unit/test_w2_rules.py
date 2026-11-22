@@ -717,12 +717,11 @@ def test_plan_parts_keeps_code_block_whole() -> None:
     assert "return 1" in holders[0], "代码块内容被切断"
 
 
-def test_plan_parts_group_is_single() -> None:
-    """群聊恒为一条：拆成多条会绕过防刷屏上限。"""
+def test_plan_parts_group_keeps_short_reply_in_one_part() -> None:
     from ling.capabilities.chunking import plan_parts
 
-    long_text = "。".join(f"这是第{i}句比较长的话用来撑长度" for i in range(20)) + "。"
-    assert len(plan_parts(long_text, is_group=True)) == 1
+    text = "好，我一会儿看看。你先去忙吧。"
+    assert plan_parts(text, is_group=True) == [text]
 
 
 def test_plan_parts_overflow_merges_instead_of_dropping() -> None:
