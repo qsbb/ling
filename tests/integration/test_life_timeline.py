@@ -31,6 +31,7 @@ from ling.infra.models import (
     ActivityRow,
     DayPlanRow,
     DreamReportRow,
+    SceneCommitRow,
     ScheduleSegmentRow,
 )
 from ling.infra.security import new_id
@@ -49,6 +50,63 @@ DREAM_NARRATIVE = "我站在一部只会向上的电梯里，楼层按钮全是�
 def _at(day: date, hour: int, minute: int = 0) -> datetime:
     """本地墙钟 day+hour:minute 的 UTC 瞬时。"""
     return local_minute_instant(day, hour * 60 + minute, TZ)
+
+
+async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling.api.routes import life_timeline
+
+    previous = DAY - timedelta(days=1)
+    now = _at(DAY, 10)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(life_timeline, "datetime", Clock)
+    async with session_scope() as session:
+        rows = [
+            ActivityRow(
+                id="old_check", actor_id=ACTOR, kind="check", state="running",
+                started_at=_at(previous, 9), origin="simulated",
+            ),
+            ActivityRow(
+                id="ends_at_midnight", actor_id=ACTOR, kind="rest", state="completed",
+                started_at=_at(previous, 23), ended_at=_at(DAY, 0), origin="tool_receipt",
+            ),
+            ActivityRow(
+                id="crosses_midnight", actor_id=ACTOR, kind="rest", state="completed",
+                started_at=_at(previous, 23), ended_at=_at(DAY, 0, 30), origin="tool_receipt",
+                completion_evidence="kind=observed;休息结束",
+            ),
+            ActivityRow(
+                id="today_check", actor_id=ACTOR, kind="check", state="running",
+                started_at=_at(DAY, 9), origin="simulated",
+            ),
+        ]
+        session.add_all(rows)
+
+    async def facts(day: date) -> dict:
+        response = await logged_in.client.get("/v1/life/timeline", params={"date": day.isoformat()})
+        assert response.status_code == 200, response.text
+        return {fact["activity_id"]: fact for fact in response.json()["facts"]}
+
+    assert set(await facts(previous)) == {"old_check", "ends_at_midnight", "crosses_midnight"}
+    today = await facts(DAY)
+    assert set(today) == {"crosses_midnight", "today_check"}
+    assert today["today_check"]["evidence_kind"] == "clock_only"
+    assert today["crosses_midnight"]["evidence_kind"] == "observed"
+
+    async with session_scope() as session:
+        session.add(SceneCommitRow(
+            actor_id=ACTOR, state="focus", activity_id="old_check",
+            committed_at=now, valid_until=now + timedelta(minutes=10),
+        ))
+    today = await facts(DAY)
+    assert set(today) == {"old_check", "crosses_midnight", "today_check"}
+    assert today["old_check"]["scene_valid_until"] is not None
 
 
 async def _insert_plan(

@@ -55,7 +55,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, RouterDep, SettingsDep
@@ -575,15 +575,25 @@ async def _load_facts(
     if scene_until is not None and _aware(scene_until) <= _aware(now):
         scene_until = None  # 过期即 unknown，不冒充现状
 
+    activity_start = func.coalesce(ActivityRow.started_at, ActivityRow.ended_at, ActivityRow.created_at)
+    # 缺结束时刻的旧记录只归属开始日。有效情景能证明当前活动仍在继续。
+    reaches_window = or_(activity_start >= window_start, ActivityRow.ended_at > window_start)
+    if scene_until is not None and scene_activity is not None and now >= window_start:
+        reaches_window = or_(reaches_window, and_(
+            ActivityRow.id == scene_activity,
+            ActivityRow.state == "running",
+            ActivityRow.ended_at.is_(None),
+        ))
+
     stmt = (
         select(ActivityRow)
         .where(
             ActivityRow.actor_id == actor_id,
             ActivityRow.state.in_(FACT_STATES),
-            or_(ActivityRow.started_at.is_(None), ActivityRow.started_at < window_end),
-            or_(ActivityRow.ended_at.is_(None), ActivityRow.ended_at >= window_start),
+            activity_start < window_end,
+            reaches_window,
         )
-        .order_by(ActivityRow.started_at, ActivityRow.id)
+        .order_by(activity_start, ActivityRow.id)
         .limit(FACTS_LIMIT)
     )
     rows = list((await session.execute(stmt)).scalars())
