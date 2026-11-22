@@ -5,7 +5,7 @@
  *
  * 桌面 1440×900
  *  1. 登录后落在 `/dashboard`，`/` 仍直达聊天；
- *  2. 七项导航都可达（总览/对话/记忆/人设/生活/日志 + 设置），每一项都真的换页，
+ *  2. 九项导航都可达（总览/对话/记忆/人设/关系/生活/日志/直播 + 设置），每一项都真的换页，
  *     且**同一时刻只有一个** `aria-current="page"`；
  *  3. `/settings/*` 高亮「设置」，`/s/:id` 高亮「对话」；
  *  4. 56px 图标 rail ↔ 200px 展开，`localStorage` 持久化，刷新后仍是上次那档；
@@ -493,22 +493,27 @@ async function runDesktop(browser) {
       el.getAttribute('data-testid'),
     ),
   );
+  /*
+   * `nav-live` 现在对所有者**恒在**（不再按 `navigation_visible` 显隐），
+   * 并且是第二个导航组的首项：排在主组（总览…日志）之后、底部设置之前。
+   * 这条在浏览器里再断一次，与 `nav.test.ts` 是两个独立实现。
+   */
   assert(
     JSON.stringify(railOrder) ===
       JSON.stringify([
         'nav-dashboard', 'nav-chat', 'nav-memory', 'nav-persona', 'nav-relationships',
-        'nav-life', 'nav-logs', 'nav-settings', 'nav-version',
+        'nav-life', 'nav-logs', 'nav-live', 'nav-settings', 'nav-version',
       ]),
     `左导航顺序不对：${railOrder.join(' → ')}`,
   );
   ok(
-    '桌面：导航顺序 总览→对话→记忆→人设→关系→生活→日志→设置→版本',
+    '桌面：导航顺序 总览→对话→记忆→人设→关系→生活→日志→直播→设置→版本',
     railOrder.join(' → '),
   );
 
   await shot(page, 'desktop-01-dashboard');
 
-  // 八项可达（关系是从设置里搬出来的一级页，和其余内容项同权）
+  // 九项可达（关系是从设置里搬出来的一级页；直播是第二个组的首项，新实例也在）
   const routes = [
     ['nav-dashboard', '/dashboard'],
     ['nav-chat', '/'],
@@ -517,6 +522,7 @@ async function runDesktop(browser) {
     ['nav-relationships', '/relationships'],
     ['nav-life', '/life'],
     ['nav-logs', '/logs'],
+    ['nav-live', '/live'],
     ['nav-settings', '/settings'],
   ];
   for (const [testid, href] of routes) {
@@ -530,7 +536,7 @@ async function runDesktop(browser) {
     assert(dims.scrollWidth <= dims.innerWidth, `${href} 出现横向滚动：${dims.scrollWidth}/${dims.innerWidth}`);
     await shot(page, `desktop-page-${testid.replace('nav-', '')}`);
   }
-  ok('桌面：八项导航都可达、URL 正确、当前项唯一');
+  ok('桌面：九项导航都可达、URL 正确、当前项唯一');
 
   // /settings/* 与 /s/:id 的高亮
   await gotoPage(page, '/settings/model');
@@ -863,7 +869,7 @@ async function runMobile(browser) {
   ok('窄屏：点 scrim 关闭抽屉');
 
   /*
-   * 抽屉里的七项都可达 + 路由切换自动关闭 + 当前项高亮。
+   * 抽屉里的八项都可达（含对所有者恒在的「直播」）+ 路由切换自动关闭 + 当前项高亮。
    *
    * 窄屏没有常驻导航，当前项只能在抽屉里看——所以每一步都「开抽屉 → 断言当前项
    * 唯一且对得上 → 点目标 → 断言地址与自动关闭 → 再开一次确认高亮已经跟过来」。
@@ -874,6 +880,7 @@ async function runMobile(browser) {
     ['nav-persona', '/persona'],
     ['nav-life', '/life'],
     ['nav-logs', '/logs'],
+    ['nav-live', '/live'],
     ['nav-settings', '/settings'],
     ['nav-dashboard', '/dashboard'],
   ];
@@ -911,7 +918,7 @@ async function runMobile(browser) {
     const dims = await overflow(page);
     assert(dims.scrollWidth <= dims.innerWidth + 1, `${href} 出现横向滚动：${dims.scrollWidth}/${dims.innerWidth}`);
   }
-  ok('窄屏：抽屉七项都可达、当前项唯一且跟随路由、切换后自动关闭、每页无横向滚动');
+  ok('窄屏：抽屉八项都可达、当前项唯一且跟随路由、切换后自动关闭、每页无横向滚动');
   await shot(page, 'mobile-03-memory');
 
   assert(pageErrors.length === 0, `窄屏出现未捕获异常：${pageErrors.join(' | ')}`);

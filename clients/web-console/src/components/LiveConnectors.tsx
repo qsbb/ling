@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { api } from '../api';
 import { explainError } from '../errors';
 import type { LiveConnector, LiveConnectorInput } from '../live';
-import { navigate } from '../route';
 import { RefreshIcon } from './Icons';
 import '../live-connectors.css';
 
@@ -97,7 +96,13 @@ export function LiveConnectors() {
         </select></label>
         <button type="button" className="button button--small" onClick={() => void act(async () => {})}
           disabled={busy}><RefreshIcon /> 刷新</button>
-        <button type="button" className="button button--small" onClick={() => navigate('/live')}>管理直播</button>
+        {/*
+          这里原先有一个「管理直播」按钮（`navigate('/live')`）。它和左栏的
+          「直播」是同一个目的地，而左栏那一项现在对所有者恒在——两个入口
+          指向同一页，一个还会在接入表单旁边把人拽走，于是「在这儿配好接入」
+          这件事容易半途而废。工作台里本来就有一个「接入设置」往回走
+          （`LivePage` 页头），往返仍然通畅，只是不再从这里多开一条岔路。
+        */}
       </div>
       {error ? <p role="alert" className="panel__note">{error}</p> : null}
       {connector ? <div className="live-connector__status">

@@ -24,6 +24,24 @@
 .live-note, .live-facts small { color: var(--ink-soft); font-size: 0.85rem; }
 .live-error { color: var(--danger); overflow-wrap: anywhere; }
 
+/*
+ * 首次进入（一个直播间都没有）时的三步。
+ *
+ * 用有序列表而不是三段独立说明：这里的信息本来就是「按这个顺序做完」，
+ * 序号是内容的一部分，不是排版装饰。宽度上限让长句子早点折行，
+ * 避免一条横贯整页的行让人放弃读。
+ */
+.live-empty { max-width: 34rem; }
+.live-empty > .live-note { margin: 0 0 0.5rem; }
+.live-empty__steps {
+  margin: 0 0 0.9rem;
+  padding-inline-start: 1.35rem;
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
 .live-plan {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

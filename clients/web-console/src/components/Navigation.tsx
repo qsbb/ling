@@ -80,10 +80,40 @@ export const PRIMARY_NAV: readonly NavItemSpec[] = [
   { id: 'logs', testid: 'nav-logs', label: '日志', path: '/logs' },
 ];
 
-const LIVE_NAV: NavItemSpec = { id: 'live', testid: 'nav-live', label: '直播', path: '/live' };
+/**
+ * 第二个导航组：**「直播」是组的第一项**，后面还留着一整个位置给同类功能
+ * （分类名与后续项由用户后定，这里先只放组结构和它的首项）。
+ *
+ * 为什么单独成组而不是插进 `PRIMARY_NAV`：上面那七项是「她这个人」的内容
+ * （总览/对话/记忆/人设/关系/生活/日志），直播是**对外开播**这件事，
+ * 它有自己的工作台、自己的运行状态、自己的配置。混在一起读，会被当成
+ * 「生活的另一个 tab」。组内首项必须是直播本身——一个可点击的导航目的地，
+ * 不是只能展开的容器：点它就直达 `/live`。
+ *
+ * **入场条件只有一个：所有者可访问。** 早先这里是 `navigation_visible`
+ * （`planned || active || recent`，见 `api/routes/live.py`），结果是**新实例、
+ * 没配过直播的人根本看不到入口**——他没有任何线索知道这里有个工作台，
+ * 必须先猜到一个不存在的地址才能开始配置。状态字段仍然有用，但它回答的是
+ * 「现在是不是在播 / 待播」，不该回答「这个功能对你存不存在」。
+ * 普通用户（非 owner）在 `App.tsx` 里就被挡在 `/live` 之外，这里同样不给他项。
+ */
+export const LIVE_GROUP: readonly NavItemSpec[] = [
+  { id: 'live', testid: 'nav-live', label: '直播', path: '/live' },
+];
 
-function visibleNav(live: boolean): readonly NavItemSpec[] {
-  return live ? PRIMARY_NAV.flatMap((item) => item.id === 'relationships' ? [item, LIVE_NAV] : [item]) : PRIMARY_NAV;
+/**
+ * 展开后的导航序列 = 主组 + 直播组。`grouped` 只用于表达组边界（间距/分隔线），
+ * **不改顺序语义**：扁平化之后仍然是「关系 → 直播 → 生活 → 日志」。
+ *
+ * 桌面 rail、展开态与窄屏抽屉都调这一个函数——三处的项、顺序、高亮
+ * 只有一份来源，抽屉不会是另一份手写列表。
+ */
+export function navGroups(forOwner: boolean): readonly (readonly NavItemSpec[])[] {
+  return forOwner ? [PRIMARY_NAV, LIVE_GROUP] : [PRIMARY_NAV];
+}
+
+export function visibleNav(forOwner: boolean): readonly NavItemSpec[] {
+  return navGroups(forOwner).flat();
 }
 
 /** 底部固定项：设置（程序与运维）。版本号 badge 单独渲染。 */
@@ -169,19 +199,15 @@ export function activeNavId(route: Route): NavSectionId | null {
   }
 }
 
-function NavItem({
-  item,
-  active,
-  expanded,
-  liveTone,
-  onGo,
-}: {
+interface NavItemProps {
   item: NavItemSpec;
   active: boolean;
   expanded: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
   onGo: (path: string) => void;
-}): ReactElement {
+}
+
+function NavItem({ item, active, expanded, liveTone, onGo }: NavItemProps): ReactElement {
   return (
     <button
       type="button"
@@ -195,8 +221,57 @@ function NavItem({
         {ICONS[item.id]}
       </span>
       <span className="sidenav__label">{item.label}</span>
+      {/*
+        状态点只是「现在在播 / 待开播」的补充，**不承担入口的可见性**：
+        `nav-live` 本身对所有者恒在，没有状态点时它就是一个普通导航项。
+        `aria-hidden`：它没有可读语义，状态已由 aria-current 与页内文案表达。
+      */}
       {item.id === 'live' && liveTone ? <span className="live-nav-dot" data-tone={liveTone} aria-hidden="true" /> : null}
     </button>
+  );
+}
+
+/**
+ * 导航组列表：组与组之间**只靠间距 + 一条分隔线**表达，不加标题、不加说明。
+ *
+ * 组只有一项时（直播组当前就是），分隔线是唯一的组信号——这正是要的：
+ * 它表达「从这里开始是另一类东西」，而不必先给这一类起好名字。
+ * 后续同类功能直接往 `LIVE_GROUP` 里加，分隔线之后的整段就是它们的位置。
+ *
+ * 为什么分组渲染只出现在这里：桌面 rail、展开态、窄屏抽屉**共用这一个循环**，
+ * 抽屉不会漏掉分组、也不会多写一份顺序。
+ */
+function NavGroups({
+  owner,
+  active,
+  expanded,
+  liveTone,
+  onGo,
+}: {
+  owner: boolean;
+  active: NavSectionId | null;
+  expanded: boolean;
+  liveTone?: 'live' | 'attention' | 'neutral';
+  onGo: (path: string) => void;
+}): ReactElement {
+  const groups = navGroups(owner);
+  return (
+    <>
+      {groups.map((group, index) => (
+        <ul
+          key={group[0]?.testid ?? `group-${index}`}
+          className="sidenav__list"
+          data-nav-group={group[0]?.id === 'live' ? 'live' : 'primary'}
+          data-group-first={index > 0 ? 'true' : undefined}
+        >
+          {group.map((item) => (
+            <li key={item.testid} className="sidenav__list-item">
+              <NavItem item={item} active={active === item.id} expanded={expanded} liveTone={liveTone} onGo={onGo} />
+            </li>
+          ))}
+        </ul>
+      ))}
+    </>
   );
 }
 
@@ -232,14 +307,19 @@ export interface SidenavProps {
   active: NavSectionId | null;
   expanded: boolean;
   version: string | null;
-  showLive?: boolean;
+  /**
+   * 是否所有者。**不是**「他有场次吗」：直播入口对所有者恒在，
+   * 场次状态只决定 `liveTone` 那个点。参数名刻意从 `showLive` 改过来——
+   * 旧名字会让下一个人以为这里还在做「按状态显隐」。
+   */
+  owner?: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
   onToggle: () => void;
   onGo: (path: string) => void;
 }
 
 /** 桌面左导航：56px 图标 rail ↔ 200px 展开。 */
-export function Sidenav({ active, expanded, version, showLive = false, liveTone, onToggle, onGo }: SidenavProps): ReactElement {
+export function Sidenav({ active, expanded, version, owner = false, liveTone, onToggle, onGo }: SidenavProps): ReactElement {
   return (
     <aside
       className="sidenav"
@@ -259,13 +339,7 @@ export function Sidenav({ active, expanded, version, showLive = false, liveTone,
         <ChevronIcon className={expanded ? 'sidenav__chevron' : 'sidenav__chevron sidenav__chevron--rail'} />
       </button>
       <nav className="sidenav__nav" aria-label="主导航">
-        <ul className="sidenav__list">
-          {visibleNav(showLive).map((item) => (
-            <li key={item.testid} className="sidenav__list-item">
-              <NavItem item={item} active={active === item.id} expanded={expanded} liveTone={liveTone} onGo={onGo} />
-            </li>
-          ))}
-        </ul>
+        <NavGroups owner={owner} active={active} expanded={expanded} liveTone={liveTone} onGo={onGo} />
         <div className="sidenav__foot">
           <NavItem
             item={SETTINGS_NAV}
@@ -284,7 +358,8 @@ export interface NavDrawerProps {
   open: boolean;
   active: NavSectionId | null;
   version: string | null;
-  showLive?: boolean;
+  /** 同 `SidenavProps.owner`：所有者可访问性，不是场次状态。 */
+  owner?: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
   /** 抽屉底部账号区显示的名字（`display_name || username`）。 */
   accountName: string;
@@ -303,7 +378,7 @@ export interface NavDrawerProps {
 export function NavDrawerPanel({
   active,
   version,
-  showLive = false,
+  owner = false,
   liveTone,
   accountName,
   onClose,
@@ -329,13 +404,7 @@ export function NavDrawerPanel({
       </div>
 
       <nav className="sidenav__nav" aria-label="主导航">
-        <ul className="sidenav__list">
-          {visibleNav(showLive).map((item) => (
-            <li key={item.testid} className="sidenav__list-item">
-              <NavItem item={item} active={active === item.id} expanded liveTone={liveTone} onGo={onGo} />
-            </li>
-          ))}
-        </ul>
+        <NavGroups owner={owner} active={active} expanded liveTone={liveTone} onGo={onGo} />
         <div className="sidenav__foot">
           <NavItem item={SETTINGS_NAV} active={active === SETTINGS_NAV.id} expanded onGo={onGo} />
           <VersionBadge version={version} onGo={onGo} />
@@ -379,7 +448,7 @@ export function NavDrawer({
   open,
   active,
   version,
-  showLive,
+  owner,
   liveTone,
   accountName,
   onClose,
@@ -405,7 +474,7 @@ export function NavDrawer({
       <NavDrawerPanel
         active={active}
         version={version}
-        showLive={showLive}
+        owner={owner}
         liveTone={liveTone}
         accountName={accountName}
         onClose={onClose}

@@ -133,6 +133,29 @@
   gap: 2px;
 }
 
+/*
+ * 导航组之间的边界：**间距 + 一条分隔线**，不写组名。
+ *
+ * 之所以不写标题：组里目前只有「直播」一项，而完整的一类功能还没定名
+ * （分类名由用户后定）。给一个组标题等于先替用户命名，之后加项还得再改一次；
+ * 而分隔线只表达「从这里起是另一类」，这层信息现在就是确定的。
+ *
+ * `data-group-first` 只加在**第二个及以后**的组上：第一组上方不该有分隔线。
+ * 桌面 rail（56px）、展开态（200px）与窄屏抽屉读同一份 CSS——
+ * 组边界在三处表现一致，不会「桌面上看得出分组、抽屉里连成一片」。
+ */
+.sidenav__list[data-group-first='true'] {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+/* rail 态下分隔线不要贴满整条宽度：留出和图标同宽的缩进，看起来属于这一列。 */
+.sidenav[data-expanded='false'] .sidenav__list[data-group-first='true'] {
+  margin-inline: 8px;
+  padding-top: 7px;
+}
+
 .sidenav__list-item {
   min-width: 0;
 }

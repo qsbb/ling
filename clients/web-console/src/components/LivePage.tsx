@@ -353,8 +353,31 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
               onChange={(event) => { setSelected(event.target.value); setActionError(''); setFeedback(''); }}>
               {connectors.map((item) => <option key={item.id} value={item.id}>{item.display_name}</option>)}
             </select></label>
+          ) : connectors ? (
+            /*
+             * 新实例的第一次进入：一个直播间都没有。这里不再只写一句
+             * 「请先在接入设置添加直播间」就结束——那句话把第一次配置变成了
+             * 一次离开，人得自己找回来。给一个能直接过去的入口，并且把
+             * 「配完什么才算能开播」按顺序说清（添加入口 → 舞台令牌 →
+             * 回本页填计划 → 开始），这样即使左栏入口先于配置出现，
+             * 落地页也是同一条路径的起点而不是死胡同。
+             */
+            <div className="live-empty" data-testid="live-empty">
+              <p className="live-note">还没有配置直播间。按顺序走完三步，回到本页就能开播：</p>
+              <ol className="live-empty__steps">
+                <li>在接入设置里添加直播间（自定义 HTTP 或 B 站直播）。</li>
+                <li>给接入器填「舞台令牌」，让直播电脑上的 OBS 连上这里。</li>
+                <li>回到本页选直播间、填本场计划，再开始直播。</li>
+              </ol>
+              <div className="live-actions">
+                <button type="button" className="button button--primary button--small"
+                  data-testid="live-empty-setup" onClick={() => onGo('/settings/connectors')}>
+                  去添加直播间
+                </button>
+              </div>
+            </div>
           ) : (
-            <p className="live-note">{connectors ? '请先在接入设置添加直播间。' : loadError ? '无法读取直播间。' : '正在读取直播间…'}</p>
+            <p className="live-note">{loadError ? '无法读取直播间。' : '正在读取直播间…'}</p>
           )}
           {connector ? <>
             <dl className="live-facts">
