@@ -52,6 +52,12 @@ class ArchiveHeader(BaseModel):
     owner_qq: QQ
 
 
+class _AstrBotNativeHeader(BaseModel):
+    record_type: Literal["header"]
+    format: Literal["astrbot-memory-jsonl"]
+    version: Literal[1]
+
+
 class ArchiveRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -160,10 +166,15 @@ def parse_archive(data: bytes) -> Archive:
         raise ArchiveError("invalid_encoding") from exc
 
     lines = BytesIO(data)
+    header_line = lines.readline().removeprefix(b"\xef\xbb\xbf")
     try:
-        header = ArchiveHeader.model_validate_json(lines.readline().removeprefix(b"\xef\xbb\xbf"), strict=True)
+        header = ArchiveHeader.model_validate_json(header_line, strict=True)
     except ValidationError as exc:
-        raise ArchiveError("unsupported_archive") from exc
+        try:
+            _AstrBotNativeHeader.model_validate_json(header_line, strict=True)
+        except ValidationError:
+            raise ArchiveError("unsupported_archive") from exc
+        raise ArchiveError("astrbot_native_archive") from exc
     if header.bot_qq == header.owner_qq:
         raise ArchiveError("invalid_source_pair")
     records: list[ArchiveRecord | None] = []

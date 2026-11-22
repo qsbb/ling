@@ -14,8 +14,8 @@ from ling.domains.conversation.service import ConversationService
 from ling.domains.memory import providers
 from ling.domains.memory.service import MemoryService
 from ling.infra.db import session_scope
-from ling.infra.models import MemoryRetrievalLog, MemoryRow
-from ling.kernel.context import ContextCompiler
+from ling.infra.models import MemoryEpisode, MemoryRetrievalLog, MemoryRow
+from ling.kernel.context import ContextCompiler, estimate_tokens
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -49,10 +49,8 @@ def _memory(env: TestEnv, memory_id: str, text: str, **fields: object) -> Memory
 async def test_low_information_turn_skips_semantic_recall(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, message: str
 ) -> None:
-    # 查询和候选的余弦相似度为零，融合仍可能用其他排名选中候选。
-    embed = AsyncMock(
-        side_effect=lambda texts: [[1.0, 0.0] if text == message else [0.0, 1.0] for text in texts]
-    )
+    # Make the semantic path eligible, so the automatic skip is what prevents recall.
+    embed = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
     embedder = SimpleNamespace(model_id="test-embedding", embed=embed)
     monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: embedder)
     monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
@@ -127,3 +125,140 @@ async def test_short_topic_and_explicit_history_still_recall(
                 )
             )
             assert log is not None and expected_id in log.hit_ids
+
+
+async def test_recall_requires_relevance_before_ranking(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "用户把雨具放在入户柜下层"
+    embed = AsyncMock(side_effect=lambda texts: [
+        [1.0, 0.0] if item in {text, "遮雨用的东西呢？"} else [0.0, 1.0] for item in texts
+    ])
+    embedder = SimpleNamespace(model_id="test-relevance", embed=embed)
+    monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: embedder)
+    monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
+    window_id = await _window(logged_in)
+    async with session_scope() as session:
+        session.add(_memory(logged_in, "mem_umbrella", text))
+
+    async with session_scope() as session:
+        compiler = ContextCompiler(session)
+        cases = [
+            ("今天用什么数据库？", []),
+            ("入户柜的铰链松了怎么修？", []),
+            ("旧入户柜的铰链松了怎么修？", []),
+            ("遮雨用的东西呢？", ["mem_umbrella"]),
+        ]
+        for query, expected in cases:
+            result = await compiler.compile(
+                subject_id=logged_in.subject_id, window_id=window_id, user_text=query,
+            )
+            assert result.memory_ids == expected
+            assert any(text in message.content for message in result.messages) is bool(expected)
+        assert ["今天用什么数据库？"] in [call.args[0] for call in embed.await_args_list]
+
+
+async def test_question_keeps_its_topic_when_followed_by_background(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: None)
+    monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
+    window_id = await _window(logged_in)
+    fact = "备用钥匙在玄关蓝瓷罐"
+    async with session_scope() as session:
+        session.add(_memory(logged_in, "mem_spare_key", fact))
+
+    async with session_scope() as session:
+        compiler = ContextCompiler(session)
+        cases = [
+            "备用钥匙在哪儿？",
+            "备用钥匙在哪儿？我明早出门前得先收拾行李，想提前找出来。",
+        ]
+        for query in cases:
+            result = await compiler.compile(
+                subject_id=logged_in.subject_id, window_id=window_id, user_text=query,
+            )
+            assert result.memory_ids == ["mem_spare_key"]
+            assert any(fact in message.content for message in result.messages)
+        result = await compiler.compile(
+            subject_id=logged_in.subject_id, window_id=window_id,
+            user_text="备用钥匙先不说了，数据库怎么建表？",
+        )
+        assert result.memory_ids == []
+
+
+async def test_prompt_keeps_three_distinct_memories_and_counts_only_injection(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: None)
+    monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
+    window_id = await _window(logged_in)
+    texts = [
+        "面试改期到下周一，地点在科技馆", "面试要带好作品集，老师会先检查",
+        "面试同行的是表姐，之后一起吃饭", "面试服装放在储藏柜，领带另外装",
+        "面试线路经过体育中心，出门要转公交",
+    ]
+    async with session_scope() as session:
+        for index, text in enumerate(texts):
+            session.add(_memory(logged_in, f"mem_interview_{index}", text))
+        session.add(MemoryEpisode(
+            id="ep_duplicate", subject_id=logged_in.subject_id, window_id=window_id,
+            summary=f"用户：{texts[0]}",
+            origin="external_observation", visibility="subject_private",
+            source_event_ids=["evt_example"],
+        ))
+
+    async with session_scope() as session:
+        result = await ContextCompiler(session).compile(
+            subject_id=logged_in.subject_id, window_id=window_id, user_text="面试",
+        )
+        evidence = next(message.content for message in result.annotated if message.lane == "evidence")
+        assert sum(evidence.count(text) for text in texts) == 3
+        assert "ep_duplicate" not in result.memory_ids
+        assert "曾经聊过的话" not in evidence
+        assert estimate_tokens(evidence) <= 420
+        assert len(result.memory_ids) == 3 and result.meta["evidence_dropped"] == 3
+        rows = list(await session.scalars(select(MemoryRow)))
+        assert {row.id for row in rows if row.access_count} == set(result.memory_ids)
+
+
+async def test_short_followup_uses_recent_topic_without_reinjecting_the_conversation(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(providers, "build_embedding", lambda *_a, **_kw: None)
+    monkeypatch.setattr(providers, "build_reranker", lambda *_a, **_kw: None)
+    window_id = await _window(logged_in)
+    earlier = "还记得我说的面试吗"
+    reply = "你说上周准备去复试，过得怎么样？"
+    async with session_scope() as session:
+        conversation = ConversationService(session)
+        await conversation.add_message(window_id, role="user", text=earlier, turn_id="test-recent")
+        await conversation.add_message(window_id, role="actor", text=reply, turn_id="test-recent")
+        session.add(MemoryEpisode(
+            id="ep_recent", subject_id=logged_in.subject_id, window_id=window_id,
+            turn_id="test-recent", summary=f"用户：{earlier}\nling：{reply}",
+            origin="external_observation", visibility="subject_private",
+            source_event_ids=["turn:test-recent"],
+        ))
+        session.add(MemoryEpisode(
+            id="ep_older", subject_id=logged_in.subject_id, window_id=window_id,
+            turn_id="test-older", summary="用户：我下周有个面试",
+            origin="external_observation", visibility="subject_private",
+            source_event_ids=["turn:test-older"],
+        ))
+        session.add(MemoryEpisode(
+            id="ep_older_paraphrase", subject_id=logged_in.subject_id, window_id=window_id,
+            summary="用户：下礼拜那场面试要准备一下。",
+            origin="external_observation", visibility="subject_private",
+            source_event_ids=["turn:test-older"],
+        ))
+
+    async with session_scope() as session:
+        result = await ContextCompiler(session).compile(
+            subject_id=logged_in.subject_id, window_id=window_id, user_text="哪家公司？",
+        )
+    assert len(result.memory_ids) == 1
+    assert result.memory_ids[0] in {"ep_older", "ep_older_paraphrase"}
+    assert sum(reply in message.content for message in result.messages) == 1
+    evidence = next(message.content for message in result.annotated if message.lane == "evidence")
+    assert "曾经聊过的话" in evidence and "面试" in evidence

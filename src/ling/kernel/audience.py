@@ -21,7 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from ling.contracts.v1 import Visibility
 from ling.domains.awareness.service import AwarenessService, IsolationMode
@@ -90,6 +92,14 @@ class AudienceSnapshot:
             source_window_id=episode.window_id,
         )
 
+    def memory_row_predicate(self) -> ColumnElement[bool]:
+        """Apply the source boundary before a limited SQL candidate search."""
+        source = MemoryRow.source_visibility
+        eligible = source.in_(self._allowed_sources())
+        if not self.is_group:
+            return eligible
+        return eligible & or_(source != "group_scope", MemoryRow.source_window_id == self.window_id)
+
     def _allowed_visibilities(self) -> set[str]:
         # 委托到唯一权威实现，避免规则漂移
         return {
@@ -106,18 +116,12 @@ class AudienceSnapshot:
         - 来源是群聊内容（group_scope）：必须就是本窗口这个群
         - 其他来源（私聊/窗口级）：只在私聊窗口可用；群聊里绝不出现
         """
-        if self.is_group:
-            if source_visibility not in _GROUP_ALLOWED_SOURCES:
-                return False
-            # 别的群的内容：即使 visibility 是 group_scope 也不允许
-            return not (
-                source_visibility == "group_scope" and source_window_id != self.window_id
-            )
-        # 私聊窗口
-        if source_visibility in _GROUP_ALLOWED_SOURCES - {"public"}:
-            # 群里说的话默认不进私聊（必须由本人明确提升，而不是自动）
-            return False
-        return source_visibility in _PRIVATE_ALLOWED_SOURCES
+        return source_visibility in self._allowed_sources() and (
+            source_visibility != "group_scope" or source_window_id == self.window_id
+        )
+
+    def _allowed_sources(self) -> set[str]:
+        return _GROUP_ALLOWED_SOURCES if self.is_group else _PRIVATE_ALLOWED_SOURCES
 
     # ---------------------------------------------------------- 创建
 

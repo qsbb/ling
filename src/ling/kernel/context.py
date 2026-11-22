@@ -26,8 +26,15 @@ from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
-from ling.domains.memory.recall_query import should_skip_automatic_recall
-from ling.domains.memory.service import MemoryService, RecallResult
+from ling.domains.memory.recall_query import needs_recent_topic, should_skip_automatic_recall
+from ling.domains.memory.service import (
+    MemoryHit,
+    MemoryService,
+    RecallResult,
+    overlapping_evidence,
+    render_evidence,
+    wants_history,
+)
 from ling.domains.persona.service import PersonaService, format_traits, view_is_empty
 
 # 提示词分区注册表：车道清单、预算、牺牲次序、保护集合、展示分组的**唯一**来源。
@@ -91,6 +98,8 @@ HISTORY_FETCH_CAP = 2000
 # 于是**这一轮**她看不到前几句在说什么（内容还在，但要等下一轮才进摘要）。
 # 一条消息把整块上下文挤掉，跟"最近一句被丢了"一样糟——宁可把那条截一半。
 _HISTORY_SINGLE_MESSAGE_SHARE = 0.5
+_MAX_AUTOMATIC_MEMORIES = 3
+_MEMORY_SHORTLIST = 12
 
 
 def estimate_tokens(text: str) -> int:
@@ -106,46 +115,48 @@ def estimate_tokens(text: str) -> int:
     return cjk + max(1, other // 4)
 
 
-# 各条车道的 token 预算。
-#
-# 原来合计只有约 8.3k——紧到人格剩 3.6k、最近对话只留 400。
-# 对陪伴型角色这是错的取舍：她"像不像那个人"主要靠人设 + 最近聊了什么，
-# 而这两条被压得最狠。同类产品的上下文预算普遍比这更宽。
-#
-# ## 现在合计约 149k token（2026-11-09 用户拍板「人设上限 10 万 token」）
-#
-# 人设从 10k 提到 **100k**，其余车道**一个都没动**（仍是 28600）。
-# 车道和 = 128600 token，另有最近原文层 `HISTORY_TOKEN_BUDGET = 20000`
-# 不在这个 dict 里，所以一轮的上下文上界约 **148.6k token**。
-#
-# ### 这个改动有一个必须说清的副作用：总预算跟着变大了
-#
-# 总预算（`_total_soft_hard()`）是 `sum(DEFAULT_BUDGETS.values()) * 2` 推出来的
-# ——它不是一个独立数字，而是"各车道之和 × 2 字符/token"。所以人设涨 10 倍，
-# **总预算也涨**：
-#
-#   - 改前：车道和 38600 token → 软上限 77200 字符 / 硬上限 92640 字符；
-#   - 改后：车道和 128600 token → 软上限 257200 字符 / 硬上限 308640 字符。
-#
-# 这意味着**历史与摘要现在能装得更多**（原来会被"总预算超了"按
-# `SACRIFICE_ORDER` 整条丢弃的记忆/证据/知识，现在可能留得下）。这是预期的
-# 连带效果，不是 bug——但它是一个**可观察的行为变化**：同一个窗口、同样的
-# 消息，改后进提示词的内容更多（以及"某块被丢掉了"的日志会更少出现）。
-#
-# ### 模型窗口装不下怎么办
-#
-# 约 149k token 的提示词只有大窗口模型接得住。装不下就调
-# `LING_CONTEXT_BUDGET_SCALE`（整体等比缩，如 0.5 ≈ 74k），**不要**去改单个
-# 车道的数字——那会让"谁该让位"变成一堆手工调参。默认 1.0 = 不缩。
-# 缩放会同时作用于车道和 `HISTORY_TOKEN_BUDGET`（见文件末尾的 `_SCALE` 段）。
-#
-# 硬上限还有一个更硬的后果：真撞上 `_total_soft_hard()` 的硬上限时，
-# `PROTECTED_LANES`（人设/约束/短记忆）**永不整条丢弃**，只会截断非受保护车道。
-# 所以"人设 10 万"在最坏情况下会把它人挤到只剩骨架——这是用户明确要的取舍：
-# 宁可少记得点，也要角色完整。
-# 车道预算与车道清单现在**只有一份来源**：`ling.kernel.prompt_zones`。
-# 那里按区域登记每条车道（谁产出的、多少 token、超限先丢谁、是否受保护），
-# 下面这些名字全是它的派生结果，不是第二份手写表。
+def _memory_evidence(
+    hits: list[MemoryHit], *, window_id: str, budget: int, history_roles: dict[str, set[str]]
+) -> tuple[list[MemoryHit], str, dict[str, MemoryHit]]:
+    selected: list[MemoryHit] = []
+    refs: dict[str, str] = {}
+    sources: dict[str, MemoryHit] = {}
+    text = ""
+    for hit in hits:
+        if hit.turn_id and hit.source_window_id == window_id:
+            roles = history_roles.get(hit.turn_id, set())
+            if (hit.kind == "episode" and {"user", "actor"} <= roles) or (
+                hit.kind == "assertion" and "user" in roles
+            ):
+                continue
+        if any(overlapping_evidence(hit, used) for used in selected):
+            continue
+        if hit.kind == "episode" and any(
+            other.kind == "assertion" and overlapping_evidence(hit, other) for other in hits
+        ):
+            continue
+        candidate_refs = dict(refs)
+        if (
+            hit.source_window_id == window_id
+            and hit.turn_id
+            and f"turn:{hit.turn_id}" in hit.source_event_ids
+        ):
+            candidate_refs[hit.memory_id] = f"m{len(selected) + 1}"
+        candidate = render_evidence([*selected, hit], refs=candidate_refs)
+        if estimate_tokens(candidate) > budget or len(candidate) > budget * 2:
+            continue
+        selected.append(hit)
+        refs = candidate_refs
+        if hit.memory_id in refs:
+            sources[refs[hit.memory_id]] = hit
+        text = candidate
+        if len(selected) == _MAX_AUTOMATIC_MEMORIES:
+            break
+    return selected, text, sources
+
+
+# `prompt_zones` is the source of lane budgets and their priority. The recent
+# transcript uses its own budget. `LING_CONTEXT_BUDGET_SCALE` scales both.
 #
 # 保留这些模块级别名而不是让调用方直接 import prompt_zones，是因为
 # `SACRIFICE_ORDER` / `PROTECTED_LANES` / `LANE_TO_KEY` 在测试与 API 里
@@ -256,6 +267,7 @@ def _budget_scale() -> float:
 
 
 _SCALE = _budget_scale()
+AUTOMATIC_MEMORY_TOKEN_BUDGET = max(1, int(420 * min(1.0, _SCALE)))
 if _SCALE != 1.0:
     DEFAULT_BUDGETS = {k: max(80, int(v * _SCALE)) for k, v in DEFAULT_BUDGETS.items()}
     # 最近原文层**也要缩**。它是最宽的一块（20k），漏掉它的话
@@ -411,6 +423,7 @@ class CompiledContext:
     messages: list[ChatMessageIn]
     contributions: list[ContextContribution] = field(default_factory=list)
     memory_ids: list[str] = field(default_factory=list)
+    memory_sources: dict[str, MemoryHit] = field(default_factory=dict)
     filtered_memories: int = 0
     meta: dict[str, object] = field(default_factory=dict)
     # 这条提示里**真的渲染出来**的消息 id：`{模型看到的 token: 原始平台 id}`。
@@ -755,75 +768,7 @@ class ContextCompiler:
             window_visibility=window_row.visibility,
         )
         compiled_meta["audience"] = snapshot.describe()
-        allowed = visibility_set(snapshot)
-        if not snapshot.allows_long_term_memory():
-            recall = RecallResult()
-        elif should_skip_automatic_recall(user_text):
-            recall = RecallResult()
-            compiled_meta["memory_recall_skipped"] = "low_information"
-        else:
-            from ling.domains.memory.service import wants_history
-
-            recall = await self._memory.recall(
-                subject_id=subject_id,
-                query=user_text,
-                # 用户问「以前住哪」时才把已关闭的旧值带上；
-                # 平时不带，否则改了住址之后旧值会干扰现状回答。
-                include_history=wants_history(user_text),
-                visibility_allow=allowed,
-                limit=6,
-                trace_window_id=window_id,
-                source_filter=(
-                    lambda r: snapshot.memory_row_visible(r)
-                    if hasattr(r, "kind")
-                    else snapshot.episode_visible(r)
-                ),
-            )
-        if recall.hits:
-            # 记录"这些记忆刚被想起"（检索层面），供后续判断长期不用。
-            with contextlib.suppress(Exception):  # 记录失败不影响本轮对话
-                await self._memory.mark_recalled([h.memory_id for h in recall.hits])
-
-            # **先按预算选，再只强化选中的**。
-            # 参照实现要求"只有真正进入提示词的记录才更新注入统计"：
-            # 若把"检索到但被预算截掉"也算强化，它们会越来越优先，
-            # 形成马太效应，长尾记忆永远出不来。
-            budget_chars = DEFAULT_BUDGETS["evidence"] * 2
-            selected: list = []
-            used = 0
-            for hit in recall.hits:
-                line_len = len(hit.text) + 30  # 预留来源/置信度的装饰开销
-                if used + line_len > budget_chars:
-                    break
-                selected.append(hit)
-                used += line_len
-            if selected:
-                with contextlib.suppress(Exception):  # 强化失败不影响对话
-                    await self._memory.reinforce([h.memory_id for h in selected])
-                compiled_meta["evidence_selected"] = len(selected)
-                compiled_meta["evidence_dropped"] = len(recall.hits) - len(selected)
-            # 按表达策略分组（mention / tone / uncertain）：
-            # 分组本身就是给模型的指令——不同组能说的话不一样。
-            # 平铺成"你记得的相关事实"会让模型把不确定的也当事实说出来。
-            from ling.domains.memory.service import render_evidence
-
-            evidence_text = render_evidence(selected)
-            # `render_evidence([])` 返回空串：检索命中但一条都装不下时，
-            # 不要把一条**空白的 system 消息**塞进提示（既没信息，又有些
-            # 供应商会直接拒掉空 content）。
-            if evidence_text:
-                contributions.append(
-                    ContextContribution(
-                        lane="evidence",
-                        text=evidence_text,
-                        origin=Origin.verified_source,
-                        visibility=Visibility.subject_private,
-                        source_event_ids=[
-                            eid for hit in selected for eid in hit.source_event_ids
-                        ],
-                        token_budget=DEFAULT_BUDGETS["evidence"],
-                    )
-                )
+        evidence_index = len(contributions)
 
         # 核心记忆（每轮常驻，不依赖检索）。
         # 放在证据之前：它是"永远成立"的少量要点，被长尾记忆挤掉就是角色失忆。
@@ -1512,82 +1457,8 @@ class ContextCompiler:
                 )
             )
 
-        # 车道预算执行：按字符近似 token（中文 1 字≈1 token，英文≈4 字符/token）。
-        # 超预算的车道截断并保留省略标记，而不是让提示无限增长。
-        #
-        # **顺序很重要：先按车道截断，再算总预算。**
-        # 反过来（原实现）的话，总预算看到的是"还没按车道截断"的原始长度：
-        # 一条超长的记忆块会把总额撑爆，于是别的车道被整条丢掉，
-        # 而那些内容在截断之后本来是装得下的——白丢信息。
-        #
-        # `ContextContribution` 是 **frozen** 的契约模型，不能原地赋值
-        # （`c.text = ...` 抛 `ValidationError`，不是"截断"）。所以造新对象。
-        # **空文本的车道整条不发**：一条 `content=""` 的 system 消息既没有任何
-        # 信息，又会在快照里变成一个"看起来注入了、其实是空的"块。任何车道
-        # （不只是人设）渲染出空串时都不该占消息位。
-        contributions = [c for c in contributions if c.text.strip()]
-
-        capped: list[ContextContribution] = []
-        for c in contributions:
-            budget_chars = max(80, c.token_budget * 2)  # 保守：按 2 字符/token 估算
-            if len(c.text) > budget_chars:
-                # **截断必须留痕**。人格被截一半时，角色会变成"设定对、
-                # 说话不像"，而所有日志都正常——这种错最难查。
-                logger.warning(
-                    "上下文车道 %s 超预算被截断：%d > %d 字符",
-                    c.lane,
-                    len(c.text),
-                    budget_chars,
-                )
-                c = c.model_copy(update={"text": c.text[:budget_chars] + "…（已截断）"})
-            capped.append(c)
-        contributions = capped
-
-        # ---------------------------------------------------------------- 总预算
-        #
-        # 逐车道截断只能防单条爆炸，防不住"每条都刚好不超、加起来超"。
-        # 这里再加一道**总预算**，并在超限时按优先级**整条丢弃**而不是
-        # 把人设截一半。
-        #
-        # 借鉴 同类实现 的
-        # 软/硬双层设计：超软上限先整层牺牲最不重要的，仍超硬上限才截断。
-        # 那边 P0（身份授权）/P1（当前轮）永不裁剪——这里对应
-        # persona / constraints，它们被截断比提示长更糟。
-        #
-        # **必须在"重复提醒/表达方式"之后执行**：这两段也是车道内容，
-        # 少算它们等于给自己开一道后门（原实现就是在这之前跑的，
-        # 于是 capabilities 两段永远不进总预算，注释却写着"要参与"）。
-        contributions = _apply_total_budget(contributions, compiled_meta)
-
-        # 每条消息在装配的**这一刻**就打上语义块标签（见 ``CompiledMessage``）。
-        # `messages` 由这份标注生成，不是另拼一遍——两次拼装迟早会不一致，
-        # 而"快照说他看到的"与"实际发出去的"不一致，正好是这功能最不该犯的错。
-        annotated: list[CompiledMessage] = [
-            CompiledMessage(
-                role="system",
-                content=c.text,
-                key=lane_key(c.lane),
-                lane=c.lane,
-            )
-            for c in contributions
-        ]
-
         # --- 分层装配：摘要层 + 最近原文层 ---
-        # 1) 摘要层：已滚出原文窗口的早期对话
-        # 复用上面已经读过的那一行（见 `_window_ctx_cache`）
         window_ctx = getattr(self, "_window_ctx_cache", None)
-        if window_ctx is not None and window_ctx.summary:
-            annotated.append(
-                CompiledMessage(
-                    role="system",
-                    content=(
-                        f"本窗口较早的对话摘要（截至第 {window_ctx.summary_through_sequence} 条，"
-                        f"共 {window_ctx.summary_message_count} 条）：\n{window_ctx.summary}"
-                    ),
-                    key="summary",
-                    lane="summary",
-                )
-            )
 
         # 2) 原文层：从**最新一条**往回装填，直到 token 预算用尽。
         #
@@ -1674,6 +1545,144 @@ class ContextCompiler:
                 window_id,
             )
             compiled_meta["history_cap_hit"] = True
+
+        allowed = visibility_set(snapshot)
+        if not snapshot.allows_long_term_memory():
+            recall = RecallResult()
+        elif should_skip_automatic_recall(user_text):
+            recall = RecallResult()
+            compiled_meta["memory_recall_skipped"] = "low_information"
+        else:
+            query = user_text
+            if needs_recent_topic(user_text):
+                for message in reversed(usable):
+                    if (
+                        message.role == "user" and message.retracted_at is None
+                        and (not is_group or message.sender_subject_id == subject_id)
+                        and not needs_recent_topic(message.text)
+                        and not should_skip_automatic_recall(message.text)
+                    ):
+                        query = f"{message.text[:180]}\n{user_text}"
+                        break
+            recall = await self._memory.recall(
+                subject_id=subject_id,
+                query=query,
+                include_history=wants_history(user_text),
+                visibility_allow=allowed,
+                limit=_MEMORY_SHORTLIST,
+                trace_window_id=window_id,
+                audience=snapshot,
+            )
+        evidence_budget = min(DEFAULT_BUDGETS["evidence"], AUTOMATIC_MEMORY_TOKEN_BUDGET)
+        original_text = {message.message_id: message.text for message in fetched}
+        history_roles: dict[str, set[str]] = {}
+        for message in usable:
+            if message.turn_id and original_text[message.message_id] == message.text:
+                history_roles.setdefault(message.turn_id, set()).add(message.role)
+        selected, evidence_text, memory_sources = _memory_evidence(
+            recall.hits, window_id=window_id, budget=evidence_budget, history_roles=history_roles
+        )
+        if recall.hits:
+            with contextlib.suppress(Exception):
+                await self._memory.mark_recalled([h.memory_id for h in recall.hits])
+        if evidence_text:
+            contributions.insert(
+                evidence_index,
+                ContextContribution(
+                    lane="evidence",
+                    text=evidence_text,
+                    origin=Origin.external_observation,
+                    visibility=Visibility.subject_private,
+                    source_event_ids=list(dict.fromkeys(
+                        eid for hit in selected for eid in hit.source_event_ids
+                    )),
+                    token_budget=evidence_budget,
+                ),
+            )
+
+        # 车道预算执行：按字符近似 token（中文 1 字≈1 token，英文≈4 字符/token）。
+        # 超预算的车道截断并保留省略标记，而不是让提示无限增长。
+        #
+        # **顺序很重要：先按车道截断，再算总预算。**
+        # 反过来（原实现）的话，总预算看到的是"还没按车道截断"的原始长度：
+        # 一条超长的记忆块会把总额撑爆，于是别的车道被整条丢掉，
+        # 而那些内容在截断之后本来是装得下的——白丢信息。
+        #
+        # `ContextContribution` 是 **frozen** 的契约模型，不能原地赋值
+        # （`c.text = ...` 抛 `ValidationError`，不是"截断"）。所以造新对象。
+        # **空文本的车道整条不发**：一条 `content=""` 的 system 消息既没有任何
+        # 信息，又会在快照里变成一个"看起来注入了、其实是空的"块。任何车道
+        # （不只是人设）渲染出空串时都不该占消息位。
+        contributions = [c for c in contributions if c.text.strip()]
+
+        capped: list[ContextContribution] = []
+        for c in contributions:
+            budget_chars = max(80, c.token_budget * 2)  # 保守：按 2 字符/token 估算
+            if len(c.text) > budget_chars:
+                # **截断必须留痕**。人格被截一半时，角色会变成"设定对、
+                # 说话不像"，而所有日志都正常——这种错最难查。
+                logger.warning(
+                    "上下文车道 %s 超预算被截断：%d > %d 字符",
+                    c.lane,
+                    len(c.text),
+                    budget_chars,
+                )
+                c = c.model_copy(update={"text": c.text[:budget_chars] + "…（已截断）"})
+            capped.append(c)
+        contributions = capped
+
+        # ---------------------------------------------------------------- 总预算
+        #
+        # 逐车道截断只能防单条爆炸，防不住"每条都刚好不超、加起来超"。
+        # 这里再加一道**总预算**，并在超限时按优先级**整条丢弃**而不是
+        # 把人设截一半。
+        #
+        # 借鉴 同类实现 的
+        # 软/硬双层设计：超软上限先整层牺牲最不重要的，仍超硬上限才截断。
+        # 那边 P0（身份授权）/P1（当前轮）永不裁剪——这里对应
+        # persona / constraints，它们被截断比提示长更糟。
+        #
+        # **必须在"重复提醒/表达方式"之后执行**：这两段也是车道内容，
+        # 少算它们等于给自己开一道后门（原实现就是在这之前跑的，
+        # 于是 capabilities 两段永远不进总预算，注释却写着"要参与"）。
+        contributions = _apply_total_budget(contributions, compiled_meta)
+        if not any(c.lane == "evidence" for c in contributions):
+            selected = []
+            memory_sources = {}
+        selected_ids = [hit.memory_id for hit in selected]
+        if recall.hits:
+            compiled_meta["evidence_selected"] = len(selected_ids)
+            compiled_meta["evidence_dropped"] = len(recall.hits) - len(selected_ids)
+        if selected_ids:
+            with contextlib.suppress(Exception):
+                await self._memory.reinforce(selected_ids)
+
+        # 每条消息在装配的**这一刻**就打上语义块标签（见 ``CompiledMessage``）。
+        # `messages` 由这份标注生成，不是另拼一遍——两次拼装迟早会不一致，
+        # 而"快照说他看到的"与"实际发出去的"不一致，正好是这功能最不该犯的错。
+        annotated: list[CompiledMessage] = [
+            CompiledMessage(
+                role="system",
+                content=c.text,
+                key=lane_key(c.lane),
+                lane=c.lane,
+            )
+            for c in contributions
+        ]
+
+        # 早期对话摘要放在最近原文之前。
+        if window_ctx is not None and window_ctx.summary:
+            annotated.append(
+                CompiledMessage(
+                    role="system",
+                    content=(
+                        f"本窗口较早的对话摘要（截至第 {window_ctx.summary_through_sequence} 条，"
+                        f"共 {window_ctx.summary_message_count} 条）：\n{window_ctx.summary}"
+                    ),
+                    key="summary",
+                    lane="summary",
+                )
+            )
 
         # 群聊里给每条用户消息标上「谁说的」。
         #
@@ -1842,7 +1851,8 @@ class ContextCompiler:
         return CompiledContext(
             messages=[ChatMessageIn(role=m.role, content=m.content) for m in annotated],
             contributions=contributions,
-            memory_ids=[h.memory_id for h in recall.hits],
+            memory_ids=selected_ids,
+            memory_sources=memory_sources,
             filtered_memories=recall.filtered_out,
             meta=compiled_meta,
             snapshot=snapshot,

@@ -176,6 +176,7 @@
 .import-error svg { flex: none; margin-top: 2px; }
 .import-error strong { font-size: 13.5px; }
 .import-error p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.6; color: var(--ink-soft); }
+.import-error a { margin-inline-start: 0.5em; color: inherit; text-decoration: underline; white-space: nowrap; }
 .import-error__trace { font-variant-numeric: tabular-nums; }
 
 /* --------------------------------------------------------------- 预览 */

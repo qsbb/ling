@@ -185,6 +185,12 @@ async def test_supersede_keeps_chain(logged_in: TestEnv) -> None:
     subject_id = logged_in_user_subject(logged_in)
     ids = await _seed(logged_in, subject_id, [{"text": "用户喜欢喝美式"}])
     async with session_scope() as session:
+        old = await session.get(MemoryRow, ids[0])
+        assert old is not None
+        old.source_window_id = "test-origin-window"
+        old.source_account = "onebot-test:100200300"
+        old.source_visibility = "window_private"
+        old.import_source = {"record_id": "test-import"}
         service = MemoryService(session)
         new_id = await service.supersede(ids[0], "用户其实更喜欢拿铁", reason="用户纠正")
         assert new_id is not None
@@ -198,6 +204,10 @@ async def test_supersede_keeps_chain(logged_in: TestEnv) -> None:
         )
         old = next(r for r in rows if r.id == ids[0])
         new = next(r for r in rows if r.id == new_id)
+        assert new.source_window_id == "test-origin-window"
+        assert new.source_account == "onebot-test:100200300"
+        assert new.source_visibility == "window_private"
+        assert new.import_source == {"record_id": "test-import"}
         assert old.retracted is True
         assert new.supersedes == old.id
         assert "拿铁" in new.text

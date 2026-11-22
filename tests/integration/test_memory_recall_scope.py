@@ -4,10 +4,8 @@
 
 ### 一、候选池按"最近更新"截断，最旧的高相关记忆永远读不到
 
-`recall()` 为了"每轮成本不随记忆总量增长"，先取
-`ORDER BY updated_at DESC LIMIT 500` 的候选池再排序。这本身是对的取舍，
-但**顺序依据是"最近更新"而不是"相关度"**——于是一条约一年没动过、恰好
-高度相关的记忆，只要库里有 500 条比它新的，就**永远不会进候选池**。
+`recall()` 曾只取最近更新的 500 条再排序。如今用有界的关键词补充池
+找回旧的相关事实，不能让新记录的数量决定旧事实是否可见。
 
 实测（本文件 `test_old_but_relevant_memory_survives_the_candidate_pool` 就是它
 的可复现形式）：500 条时召回、501 条时不召回，唯一变量是条数。
@@ -40,6 +38,7 @@ from ling.domains.identity.service import IdentityService
 from ling.domains.memory.service import RECALL_CANDIDATE_LIMIT, MemoryService
 from ling.infra.db import session_scope
 from ling.infra.models import MemoryEpisode, MemoryRow, Subject
+from ling.kernel.audience import AudienceSnapshot
 from tests.integration.conftest import (
     TestEnv,  # noqa: F401 - 类型注解
     logged_in,  # noqa: F401 - fixture
@@ -145,18 +144,6 @@ async def _recall_ids() -> set[str]:
 # ================================================== 一、候选池上限
 
 
-@pytest.mark.xfail(
-    reason=(
-        "已知真实缺陷（本轮实测确认，未修）：候选池按 updated_at 倒序取前 500 条，"
-        "所以库里有 500 条更新过的记忆时，一条一年没提过但高度相关的记忆"
-        "永远进不了候选池——实测 500 条时召回、501 条时一条都不返回。"
-        "修法方向：候选池要按相关度而非仅按时间选（例如"
-        "「最近 N 条 ∪ 全文/向量命中的 M 条」的有界并集），不能只靠时间倒序截断。"
-        "标 xfail 而不是删掉：这个用例就是缺陷的可复现形式，修好之后它会自动"
-        "XPASS，那时应当去掉这个标记。详见 docs/REQUIREMENTS-AUDIT.md「记忆召回」一节。"
-    ),
-    strict=False,
-)
 async def test_old_but_relevant_memory_survives_the_candidate_pool(
     logged_in: TestEnv,  # noqa: F811
 ) -> None:
@@ -196,6 +183,44 @@ async def test_old_but_relevant_memory_survives_the_candidate_pool(
         )
     finally:
         await _clear()
+
+
+async def test_keyword_supplement_filters_sources_before_the_limit(logged_in: TestEnv) -> None:  # noqa: F811
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        session.add_all([_noise(index, now) for index in range(RECALL_CANDIDATE_LIMIT)])
+        session.add(_needle(now))
+        for index in range(80):
+            row = _noise(RECALL_CANDIDATE_LIMIT + index, now - timedelta(days=90))
+            row.text = NEEDLE_TEXT
+            if index < 40:
+                row.source_visibility = "group_scope"
+                row.source_window_id = "test-other-group"
+            else:
+                row.retention_days = 1
+            session.add(row)
+
+    async with session_scope() as session:
+        audience = await AudienceSnapshot.freeze(
+            session, subject_id=SUBJ, window_id="test-private-window",
+            window_visibility="subject_private",
+        )
+        service = MemoryService(session)
+        result = await service.recall(
+            subject_id=SUBJ, query=NEEDLE_TEXT, visibility_allow={Visibility.subject_private},
+            audience=audience, now=now,
+        )
+        assert [hit.memory_id for hit in result.hits] == ["mem_needle"]
+        row = await session.get(MemoryRow, f"mem_noise_{RECALL_CANDIDATE_LIMIT:04d}")
+        assert row is not None
+        row.source_visibility = "subject_private"
+        row.text = "主人最喜欢的颜色是月白"
+        await session.flush()
+        result = await service.recall(
+            subject_id=SUBJ, query=NEEDLE_TEXT, visibility_allow={Visibility.subject_private},
+            audience=audience, now=now,
+        )
+        assert row.id in {hit.memory_id for hit in result.hits}
 
 
 # ================================================== 二、账号合并后的情节

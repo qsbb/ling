@@ -42,6 +42,9 @@ _ERRORS = {
     "too_many_records": (422, ErrorCode.invalid_request, "导入文件最多包含 5000 条记录"),
     "invalid_encoding": (422, ErrorCode.invalid_request, "导入文件需要使用 UTF-8 编码"),
     "unsupported_archive": (422, ErrorCode.invalid_request, "请选择 Ling 转换脚本生成的迁移文件"),
+    "astrbot_native_archive": (
+        422, ErrorCode.invalid_request, "这是 AstrBot 原生导出，请用插件的 SQLite 备份生成 Ling 迁移文件",
+    ),
     "invalid_source_pair": (422, ErrorCode.invalid_request, "旧 Bot QQ 和你的 QQ 必须不同"),
     "memory_purge_in_progress": (409, ErrorCode.conflict, "记忆正在清理，请稍后重新预览"),
     "preview_invalid": (409, ErrorCode.conflict, "预览已失效，请重新预览"),

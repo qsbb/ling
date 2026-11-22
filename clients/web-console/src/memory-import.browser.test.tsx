@@ -174,9 +174,9 @@ async function open(options: MockOptions = {}) {
 
 const FILE = { name: 'old-memories.jsonl', mimeType: 'application/x-ndjson', buffer: Buffer.from('{"format":"ling-astrbot-memory-jsonl"}\n') };
 
-async function previewFile(page: Page) {
+async function previewFile(page: Page, file = FILE) {
   await page.getByTestId('mem-import-entry').click();
-  await page.getByTestId('import-file-input').setInputFiles(FILE);
+  await page.getByTestId('import-file-input').setInputFiles(file);
   await page.getByTestId('import-panel').waitFor({ state: 'visible' });
 }
 
@@ -196,6 +196,45 @@ describe('导入旧记忆', () => {
     const [firstImport] = imports;
     expect(firstImport?.contentType).toBe('application/x-ndjson');
     expect(firstImport?.bytes).toBe(FILE.buffer.length);
+  }, CASE_TIMEOUT);
+
+  it('识别 AstrBot 原生导出并引导生成可导入的文件', async () => {
+    const { page, imports } = await open({
+      mobile: true,
+      previewError: {
+        code: 'invalid_request', status: 422, detail: 'astrbot_native_archive',
+        message: '请用 AstrBot 插件的 SQLite 备份生成 Ling 迁移文件',
+      },
+    });
+    await previewFile(page, {
+      name: 'memory-companion-20261121-013110.jsonl',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('{"record_type":"header","format":"astrbot-memory-jsonl","version":1}\n'),
+    });
+    const error = page.getByTestId('import-error');
+    expect(await error.innerText()).toContain('AstrBot 原生导出');
+    expect(await error.innerText()).toContain('SQLite 备份');
+    expect(await error.getByRole('link', { name: '迁移指南' }).getAttribute('href'))
+      .toContain('/docs/ASTRBOT-MEMORY-IMPORT.md');
+    expect(await page.getByRole('button', { name: '再试一次' }).count()).toBe(0);
+    const chooser = page.waitForEvent('filechooser');
+    await page.getByRole('button', { name: '换个文件' }).click();
+    expect(await chooser).toBeDefined();
+    expect(imports).toHaveLength(1);
+  }, CASE_TIMEOUT);
+
+  it('全局上传上限的 413 提示分批转换', async () => {
+    const { page } = await open({
+      previewError: {
+        code: 'invalid_request', status: 413,
+        detail: 'Content-Length=33554433 超过上限 33554432 字节',
+        message: '请求体过大',
+      },
+    });
+    await previewFile(page);
+    expect(await page.getByTestId('import-error').innerText()).toContain('超出服务端上传上限');
+    expect(await page.getByTestId('import-error').innerText()).toContain('--limit');
+    expect(await page.getByRole('button', { name: '换个文件' }).isVisible()).toBe(true);
   }, CASE_TIMEOUT);
 
   it('C1：重复与跳过放在次一级；D1：零条时没有确认按钮并给出下一步', async () => {
