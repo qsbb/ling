@@ -152,12 +152,14 @@ async def test_group_allowlist_toggle_applies_to_explicit_mentions_only(logged_i
     assert (await event(781, at_self))["decision"] == "deferred_attention"
     await save([str(OTHER_GROUP), str(KNOWN_GROUP)], 1)
     assert (await event(782, "[CQ:at,qq=30003] 你好"))["decision"] == "deferred_attention"
+    assert not fake.sent
     delivered = await event(783, at_self)
     assert delivered["delivered"] is True, delivered
+    assert delivered["parts_sent"] > 0
     await save([str(OTHER_GROUP)], 2)
     assert (await event(784, at_self))["decision"] == "deferred_attention"
     assert logged_in.app.state.settings.access_groups == frozenset({str(OTHER_GROUP)})
-    assert [call["action"] for call in fake.sent] == ["send_group_msg"]
+    assert [call["action"] for call in fake.sent] == ["send_group_msg"] * delivered["parts_sent"]
 
 
 # ------------------------------------------------ 拒绝日志开关（三态改造后）

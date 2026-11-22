@@ -228,3 +228,25 @@ def test_group_extra_paragraphs_keep_readable_separators() -> None:
     parts = plan_parts("\n\n".join(items), is_group=True)
     assert len(parts) == 3
     assert "\n\n".join(parts) == "\n\n".join(items)
+
+
+def test_group_keeps_a_long_url_and_honors_escaped_break_after_it() -> None:
+    url = "https://example.org/search?q=" + "x" * 257
+    plain = plan_parts(f"资料在这里：{url}。", is_group=True)
+    assert any(url in part for part in plain)
+    assert "".join(plain) == f"资料在这里：{url}。"
+
+    quote = "她说：“第一行/n/n第二行”"
+    text = quote + "\n\n" + url + r"\n\n" + "看完再聊。"
+    assert plan_parts(text, is_group=True) == [quote, url, "看完再聊。"]
+
+
+def test_group_keeps_code_whole_when_it_needs_an_extra_part() -> None:
+    code = "```text\n" + "乙" * 2690 + "\n```"
+    paragraphs = ["甲" * 1400, code, "丙" * 1700, "丁" * 1000]
+    parts = plan_parts(
+        "\n\n".join(paragraphs), is_group=True, max_part_chars=ONEBOT_MAX_TEXT_LENGTH,
+    )
+    assert any(code in part for part in parts)
+    assert all(len(part) <= ONEBOT_MAX_TEXT_LENGTH for part in parts)
+    assert "\n\n".join(parts) == "\n\n".join(paragraphs)

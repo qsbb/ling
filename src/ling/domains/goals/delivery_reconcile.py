@@ -300,10 +300,16 @@ async def reconcile_deliveries(
         if callable(caps):
             with contextlib.suppress(Exception):
                 part_limit = int(caps().max_text_length) or None
-        parts = plan_parts(text, is_group=is_group, max_part_chars=part_limit)
         plan_id = f"plan_{turn_id}"
+        legacy_group_plan = False
+        if is_group:
+            async with session_scope() as session:
+                legacy_group_plan = await DeliveryService(session).uses_legacy_group_plan(plan_id)
+        parts = plan_parts(
+            text, is_group=is_group, max_part_chars=part_limit, legacy_group_plan=legacy_group_plan,
+        )
         sent = 0
-        ok = True
+        ok = bool(parts)
         for index, part in enumerate(parts, 1):
             try:
                 async with session_scope() as session:
@@ -321,6 +327,7 @@ async def reconcile_deliveries(
                             "reply_plan": plan_id,
                             "part_ordinal": index,
                             "parts_total": len(parts),
+                            "group_paragraphs": is_group and not legacy_group_plan,
                             "source": "delivery.reconcile",
                         },
                         plan_id=plan_id,
@@ -332,7 +339,7 @@ async def reconcile_deliveries(
                 )
                 ok = False
                 break
-            if outcome.delivered or outcome.skipped:
+            if outcome.delivered or (outcome.skipped and outcome.state is OperationState.succeeded):
                 # skipped 且已送达 = 这一段早就发出去了（段级幂等命中）
                 sent += 1
                 # 续发也要有节奏：连发 5 段同样是刷屏（与 bridge 同一个理由，

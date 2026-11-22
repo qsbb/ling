@@ -88,6 +88,16 @@ class DeliveryService:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def uses_legacy_group_plan(self, plan_id: str) -> bool:
+        """Already claimed group replies keep the text previously assigned to each ordinal."""
+        first = (await self._session.execute(
+            select(Operation.payload)
+            .select_from(IdempotencyKey)
+            .outerjoin(Operation, Operation.id == IdempotencyKey.result_ref)
+            .where(IdempotencyKey.scope == PART_SCOPE, IdempotencyKey.key == f"{plan_id}:1")
+        )).one_or_none()
+        return first is not None and not (first[0] or {}).get("group_paragraphs", False)
+
     async def create_operation(
         self,
         *,

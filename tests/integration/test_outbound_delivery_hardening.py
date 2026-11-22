@@ -655,6 +655,72 @@ async def test_pending_delivery_is_resumed_once(
     assert len(fake.texts()) == 1, f"续发重复了：{fake.texts()}"
 
 
+@pytest.mark.parametrize("start", ["legacy", "current", "pending_only", "unconfirmed"])
+async def test_pending_group_delivery_retains_the_first_parts_plan(
+    logged_in: TestEnv, start: str,
+) -> None:
+    from ling.capabilities.delivery import PART_SCOPE
+    from ling.domains.goals.delivery_reconcile import reconcile_deliveries
+
+    fake = _FakeOneBot()
+    connector = _install(logged_in, fake)
+    window_ref = "onebot-hardening:group:100200301"
+    turn_id = "turn_pending_group"
+    plan_id = f"plan_{turn_id}"
+    actor_id = logged_in.settings.actor_id
+    paragraphs = ["甲" * 1000 + "。", "乙" * 3500 + "。"]
+    text = "\n\n".join(paragraphs)
+    limit = connector.capabilities().max_text_length
+    old_parts = plan_parts(text, is_group=True, max_part_chars=limit, legacy_group_plan=True)
+    assert len(old_parts) == 2 and old_parts[1] != paragraphs[1]
+    expected = old_parts if start == "legacy" else paragraphs
+
+    async with session_scope() as session:
+        window = Window(
+            id="win_pending_group", actor_id=actor_id, persona_id=logged_in.settings.persona_id,
+            subject_id=logged_in.subject_id, title=window_ref, channel="onebot",
+            visibility="group_scope",
+        )
+        session.add(window)
+        await session.flush()
+        session.add(Message(
+            id="msg_pending_group", window_id=window.id, turn_id=turn_id, role="actor",
+            text=text, state="stopped", origin="model_inference", sequence=1,
+        ))
+        service = DeliveryService(session)
+        if start == "unconfirmed":
+            session.add(IdempotencyKey(
+                id="idem_unconfirmed", scope=PART_SCOPE, key=f"{plan_id}:1",
+            ))
+        elif start in {"legacy", "current"}:
+            payload = {"group_paragraphs": True} if start == "current" else {}
+            first = await service.deliver(
+                connector=connector, actor_id=actor_id, subject_id=logged_in.subject_id,
+                message=OutboundMessage(
+                    operation_id="op_test_first", window_ref=window_ref,
+                    text=expected[0], is_group=True,
+                ),
+                plan_id=plan_id, part_ordinal=1, payload_extra=payload,
+            )
+            assert first.delivered
+        await service.record_pending(
+            connector_id="onebot", actor_id=actor_id, subject_id=logged_in.subject_id,
+            window_ref=window_ref, is_group=True, plan_id=plan_id, turn_id=turn_id,
+            reason="generation_timeout", detail="first part fixture",
+        )
+
+    async def no_pause(_seconds: float) -> None:
+        pass
+
+    result = await reconcile_deliveries(connector_for=lambda _channel: connector, pause=no_pause)
+    if start == "unconfirmed":
+        assert result.resumed == 0
+        assert not fake.texts()
+    else:
+        assert result.resumed == 1
+        assert fake.texts() == expected
+
+
 # ---------------------------------------------------------------- P0-3 真 id 引用
 
 

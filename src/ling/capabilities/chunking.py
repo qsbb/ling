@@ -43,10 +43,15 @@ _SENTENCE_END = re.compile(r"(?<=[。！？!?…])|(?<=\.\s)|(?<=\n)")
 _CODE_FENCE = re.compile(r"```.*?```", re.S)
 # 行内代码与中英文引号
 _INLINE_PROTECTED = re.compile(r"`[^`\n]+`|「[^」]*」|『[^』]*』|\"[^\"]{2,}\"")
-_GROUP_BREAK = re.compile(r"(?P<url>https?://[^\s<>()，。！？；、]+)|(?:\\n){2,}|(?:/n){2,}")
+_GROUP_INLINE_PROTECTED = re.compile(
+    _INLINE_PROTECTED.pattern + r"""|“[^”]*”|‘[^’]*’|https?://[^\s\\<>()\[\]`"'“”‘’，。！？；、]+"""
+)
+_GROUP_BREAK = re.compile(r"(?:\\n){2,}|(?:/n){2,}")
 
 
-def _split_protected(text: str) -> list[tuple[str, bool]]:
+def _split_protected(
+    text: str, inline_protected: re.Pattern[str] = _INLINE_PROTECTED,
+) -> list[tuple[str, bool]]:
     """把文本切成 [(片段, 是否受保护)]。
 
     受保护片段（代码块/行内代码/引号）**不参与切分**，
@@ -58,7 +63,7 @@ def _split_protected(text: str) -> list[tuple[str, bool]]:
     for start, end in spans:
         for i in range(start, end):
             covered[i] = True
-    for m in _INLINE_PROTECTED.finditer(text):
+    for m in inline_protected.finditer(text):
         if any(covered[m.start() : m.end()]):
             continue
         spans.append(m.span())
@@ -86,6 +91,7 @@ def split_semantic(
     *,
     target_chars: int = DEFAULT_TARGET_CHARS,
     max_chars: int = MAX_SEGMENT_CHARS,
+    inline_protected: re.Pattern[str] = _INLINE_PROTECTED,
 ) -> list[str]:
     """把一段话切成若干"一口气说得完"的段。
 
@@ -102,7 +108,7 @@ def split_semantic(
             segments.append(buffer.strip())
         buffer = ""
 
-    for piece, protected in _split_protected(text):
+    for piece, protected in _split_protected(text, inline_protected):
         if protected:
             # 受保护片段整块处理：放不下就先把当前段收掉，
             # 但它自己绝不被切开
@@ -165,11 +171,11 @@ def _newline_units(text: str) -> list[str]:
 def _group_units(text: str) -> list[str]:
     """保留段间换行，合并到同一条时仍能看清原来的段落。"""
     units = [""]
-    for piece, protected in _split_protected(text):
+    for piece, protected in _split_protected(text, _GROUP_INLINE_PROTECTED):
         if protected:
             units[-1] += piece
             continue
-        normalized = _GROUP_BREAK.sub(lambda match: match["url"] or "\n\n", piece)
+        normalized = _GROUP_BREAK.sub("\n\n", piece)
         for line in normalized.splitlines(keepends=True):
             units[-1] += line
             if line.endswith("\n") and units[-1].strip():
@@ -213,7 +219,9 @@ def _cut_oversize(unit: str, limit: int) -> list[str]:
     return pieces
 
 
-def _pack_units(pieces: list[str], *, limit: int, max_parts: int) -> list[str]:
+def _pack_units(
+    pieces: list[str], *, limit: int, max_parts: int, preserve_boundaries: bool = False,
+) -> list[str]:
     """把单元装箱成若干段：**每段 <= limit，段数不超过防刷屏上限**。
 
     为什么不是原来的"前 N 段 + 其余全并进最后一段"：
@@ -248,15 +256,18 @@ def _pack_units(pieces: list[str], *, limit: int, max_parts: int) -> list[str]:
     count = len(pieces)
     remaining_total, remaining_parts = total, target
     while start < count:
-        if remaining_parts <= 1:
+        if remaining_parts > 1:
+            # 本段目标长度：均衡值 / 给后续段留够空间 / 不超过硬上限
+            goal = min(float(limit), max(
+                remaining_total / remaining_parts,
+                remaining_total - (remaining_parts - 1) * limit,
+            ))
+        elif preserve_boundaries and remaining_total > limit:
+            # 尾段放不下时沿现有边界继续装，保留完整的链接和代码块。
+            goal = float(limit)
+        else:
             parts.append("".join(pieces[start:]))
             break
-        # 本段目标长度：均衡值 / 给后续段留够空间 / 不超过硬上限
-        goal = max(
-            remaining_total / remaining_parts,
-            remaining_total - (remaining_parts - 1) * limit,
-        )
-        goal = max(1.0, min(goal, float(limit)))
         end = start
         taken = 0
         while end < count:
@@ -327,29 +338,40 @@ def plan_parts(
         units = [unit for unit in group_units if unit.strip()]
     else:
         units = _newline_units(text)
-    segments: list[str]
+    segments: list[str] = []
     if len(units) > 1 and is_group:
-        segments = units
+        for unit in units:
+            body = unit.rstrip("\r\n")
+            if len(body) <= limit:
+                segments.append(unit)
+            else:
+                split = split_semantic(body, inline_protected=_GROUP_INLINE_PROTECTED)
+                split[-1] += unit[len(body):]
+                segments.extend(split)
     elif len(units) > 1:
-        segments = []
         for unit in units:
             # 单行过长时再走语义切分（受保护片段整块进，不拆）
             segments.extend(split_semantic(unit) if len(unit) > MAX_SEGMENT_CHARS else [unit])
     else:
-        segments = split_semantic(text)
-    if len(segments) <= 1:
+        pattern = _GROUP_INLINE_PROTECTED if is_group else _INLINE_PROTECTED
+        segments = split_semantic(text, inline_protected=pattern)
+    if len(segments) <= 1 and (not is_group or len(text) <= limit):
         return [text] if len(text) <= limit else _cut_oversize(text, limit)
 
     # 先保证每个单元自身不超限（单个语义段/代码块可能比渠道上限还长）
     pieces: list[str] = []
     for segment in segments:
-        pieces.extend(_cut_oversize(segment, limit) if len(segment) > limit else [segment])
+        body = segment.rstrip("\r\n") if is_group and len(segment) > limit else segment
+        pieces.extend(_cut_oversize(body, limit))
+        pieces.extend(_cut_oversize(segment[len(body):], limit))
 
     max_parts = MAX_PARTS_GROUP if is_group else MAX_PARTS_PRIVATE
     if is_group and len(pieces) <= max_parts:
         parts = pieces
     else:
-        parts = _pack_units(pieces, limit=limit, max_parts=max_parts)
+        parts = _pack_units(
+            pieces, limit=limit, max_parts=max_parts, preserve_boundaries=is_group,
+        )
 
     # 可机械验证的约束：**内容不能丢**。
     #

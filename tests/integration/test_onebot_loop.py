@@ -553,6 +553,9 @@ async def test_group_reply_to_bot_counts_as_addressed(logged_in: TestEnv) -> Non
         message="[CQ:at,qq=10001] 先解释一下潮汐",
     ))).json()
     await _prompt_for(earlier)
+    assert earlier["delivered"] is True, earlier
+    sent_before = sum(call["action"] == "send_group_msg" for call in fake.sent)
+    assert sent_before == earlier["parts_sent"] > 0
 
     # 9001 是上一轮真实投递回执返回的平台 id。
     body = _event_body(
@@ -565,7 +568,9 @@ async def test_group_reply_to_bot_counts_as_addressed(logged_in: TestEnv) -> Non
     snapshot = await _prompt_for(result)
     assert snapshot["context"]["reply_reference"] == "actor"
     assert any(item["lane"] == "quote" and item["sender"] == "你" for item in snapshot["messages"])
-    assert len([c for c in fake.sent if c["action"] == "send_group_msg"]) == 2
+    assert result["delivered"] is True, result
+    sent_after = sum(call["action"] == "send_group_msg" for call in fake.sent)
+    assert sent_after - sent_before == result["parts_sent"] > 0
 
 
 async def test_group_reply_tracks_quoted_speaker_and_stays_in_its_window(

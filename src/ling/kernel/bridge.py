@@ -1201,22 +1201,12 @@ class InboundBridge:
         media_note: str | None,
     ) -> BridgeResult:
         """重投时只**续发剩下的段**（已发段由段级幂等跳过）。"""
-        from ling.capabilities.delivery import PART_SCOPE
+        from ling.capabilities.delivery import DeliveryService
         from ling.domains.conversation.service import ConversationService
-        from ling.infra.models import IdempotencyKey, Operation
 
-        legacy_group_plan = False
-        if is_group:
-            first_part = await self._session.scalar(
-                select(Operation.payload)
-                .join(IdempotencyKey, IdempotencyKey.result_ref == Operation.id)
-                .where(
-                    IdempotencyKey.scope == PART_SCOPE,
-                    IdempotencyKey.key == f"plan_{turn.id}:1",
-                )
-            )
-            # 段号已用来记回执，升级时不能给同一段号重新分配正文。
-            legacy_group_plan = not (first_part or {}).get("group_paragraphs", False)
+        legacy_group_plan = is_group and await DeliveryService(self._session).uses_legacy_group_plan(
+            f"plan_{turn.id}"
+        )
         delivery = await self._deliver(
             envelope=envelope,
             text=text,
