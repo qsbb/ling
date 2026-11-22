@@ -1217,7 +1217,7 @@ function PersonaForm({
             ['不承认 AI 助手', 'denyAiAssistant', setDenyAiAssistant, denyAiAssistant, 'persona-switch-deny-ai'],
           ] as const
         ).map(([label, , setter, checked, testId]) => (
-          <label className="field field--inline" key={testId}>
+          <label className="field persona-dialogue-option" key={testId}>
             <input
               type="checkbox"
               checked={checked}

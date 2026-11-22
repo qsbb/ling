@@ -12,6 +12,12 @@
   flex-shrink: 0;
 }
 
+.field.persona-dialogue-option {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
 /* ------------------------------------------------------------ 空状态 */
 
 /*

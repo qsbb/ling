@@ -503,6 +503,24 @@ describe('有人设时的卡片列表', () => {
     const injection = page.getByTestId('persona-switch-anti-injection');
     const leak = page.getByTestId('persona-switch-anti-leak');
     const ai = page.getByTestId('persona-switch-deny-ai');
+    for (const width of [1440, 375]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const toggle of [injection, leak, ai]) {
+        const { gap, verticalOverlap } = await toggle.evaluate((checkbox) => {
+          const caption = checkbox.closest('label')?.querySelector('.field__label');
+          if (!caption) throw new Error('找不到对话开关的标签');
+          const control = checkbox.getBoundingClientRect();
+          const text = caption.getBoundingClientRect();
+          return {
+            gap: text.left - control.right,
+            verticalOverlap: Math.min(control.bottom, text.bottom) - Math.max(control.top, text.top),
+          };
+        });
+        expect(gap).toBeGreaterThanOrEqual(0);
+        expect(gap).toBeLessThanOrEqual(24);
+        expect(verticalOverlap).toBeGreaterThan(0);
+      }
+    }
     expect(await injection.isChecked()).toBe(false);
     expect(await leak.isChecked()).toBe(false);
     expect(await ai.isChecked()).toBe(false);
