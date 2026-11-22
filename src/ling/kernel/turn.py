@@ -63,7 +63,7 @@ from ling.domains.conversation.recall import (
     recallable_refs,
     resolve_recall_ref,
 )
-from ling.domains.conversation.service import ConversationService, MessageView
+from ling.domains.conversation.service import ConversationService, MessageView, ReplyReference
 from ling.domains.deferred.markers import (
     DeferIntent,
     parse_defer_marker,
@@ -210,6 +210,7 @@ def build_prompt_snapshot_payload(
     model: dict[str, object] | None = None,
     captured_at: datetime | None = None,
     attempt: int | None = None,
+    context: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], bool]:
     """把**真正要发出去的那份 messages** 装成快照 payload。
 
@@ -244,6 +245,8 @@ def build_prompt_snapshot_payload(
         payload["attempt"] = attempt
         payload["tool_transcript"] = []
         payload["tool_transcript_truncated"] = False
+    if context is not None:
+        payload["context"] = context
     if _snapshot_size(payload) <= PROMPT_SNAPSHOT_MAX_BYTES:
         return payload, False
 
@@ -828,6 +831,7 @@ class TurnCoordinator:
         # 只有连接器知道它（OneBot 的 `f"{self_id}:{message_id}"`），
         # 上下文用它给"正在回的这条"也标上 `[msg_id:…]`。
         current_message_platform_id: str | None = None,
+        reply_reference: ReplyReference | None = None,
     ) -> asyncio.Queue[TurnStreamEvent | None]:
         queue: asyncio.Queue[TurnStreamEvent | None] = asyncio.Queue()
         token = StopToken()
@@ -847,6 +851,7 @@ class TurnCoordinator:
                 channel_capabilities=channel_capabilities,
                 sender_name=sender_name,
                 current_message_platform_id=current_message_platform_id,
+                reply_reference=reply_reference,
             ),
             name=f"turn:{turn_id}",
         )
@@ -890,6 +895,7 @@ class TurnCoordinator:
         channel_capabilities: CapabilityDescriptor | None = None,
         sender_name: str | None = None,
         current_message_platform_id: str | None = None,
+        reply_reference: ReplyReference | None = None,
     ) -> None:
         delivered = ""
         target_label: str | None = None
@@ -1047,13 +1053,6 @@ class TurnCoordinator:
                     window_id=window_id,
                     user_text=user_text,
                     is_group=is_group_window,
-                    # **不要在这里给条数上限。** 这里原来是 `history_limit=20`：
-                    # 那个值不是"上下文里放 20 条"，而是"一次性只从库里取 20 条"，
-                    # 于是第 21 条往回的消息既不在原文里、也不在编译器的
-                    # `dropped` 里，**永远不会被压进摘要**——长会话里会出现一段
-                    # 谁都看不见的永久缺口（实测 31 条的窗口丢掉第 1~11 条）。
-                    # 放多少由 `HISTORY_TOKEN_BUDGET` 决定，取数按页往回走，
-                    # 见 `ContextCompiler.compile` 里"原文层"的装配。
                     # 请求路径已把本轮用户消息落库，这里必须排除以免重复输入
                     current_turn_id=turn_id,
                     # **当前这句**用本次称呼（群里 = 群名片优先）署名，而不是
@@ -1067,6 +1066,7 @@ class TurnCoordinator:
                     # 「正在回的这条」也要能被她引用：它的平台 id 只有调用方
                     # 知道（连接器给的），所以从上面一路透传下来。
                     current_message_platform_id=current_message_platform_id,
+                    reply_reference=reply_reference,
                 )
                 messages = list(compiled.messages)
                 # 上下文里每条入站消息都带了 `[msg_id:…]`（见
@@ -1939,8 +1939,32 @@ class TurnCoordinator:
                     )
                     for m in messages
                 ]
+            lanes = [item.lane for item in annotated]
+            context = {
+                "history_scope": compiled.meta.get("history_scope"),
+                "history_messages": lanes.count("history"),
+                "summary_included": "summary" in lanes,
+                "quote_included": "quote" in lanes,
+                "reply_reference": compiled.meta.get("reply_reference"),
+                "automatic_memories": len(compiled.memory_ids) if "evidence" in lanes else 0,
+                "memory_recall_skipped": compiled.meta.get("memory_recall_skipped"),
+            }
             payload, truncated = build_prompt_snapshot_payload(
-                annotated, model=_snapshot_model_info(config, profile), attempt=attempt
+                annotated, model=_snapshot_model_info(config, profile), attempt=attempt,
+                context=context,
+            )
+            emit_event(
+                logger,
+                logging.INFO,
+                event_name="context_compiled",
+                message="对话上下文已装配",
+                attributes={
+                    "turn_id": turn_id,
+                    "window_id": window_id,
+                    "attempt": attempt,
+                    "prompt_tokens": payload["token_total"],
+                    **context,
+                },
             )
             await save_prompt_snapshot(
                 actor_id=self._actor_id,

@@ -217,7 +217,7 @@ async def test_long_history_is_budgeted_and_rolled_up(logged_in: TestEnv) -> Non
 
     async with session_scope() as session:
         compiled = await ContextCompiler(session).compile(
-            subject_id=subject_id, window_id=session_id, user_text="继续", history_limit=100
+            subject_id=subject_id, window_id=session_id, user_text="最早聊的是什么", history_limit=100
         )
     history_tokens = sum(
         estimate_tokens(m.content) for m in compiled.messages if m.role != "system"
@@ -235,7 +235,7 @@ async def test_long_history_is_budgeted_and_rolled_up(logged_in: TestEnv) -> Non
 
 
 async def test_summary_is_injected_on_next_turn(logged_in: TestEnv) -> None:
-    """第二次编译时，摘要应作为独立 system 消息注入，角色能接上更早的话题。"""
+    """明确追问旧话题时，摘要作为独立 system 消息进入上下文。"""
     session_id, subject_id = await _window(logged_in)
     async with session_scope() as session:
         await ConversationService(session).save_summary(
@@ -246,7 +246,7 @@ async def test_summary_is_injected_on_next_turn(logged_in: TestEnv) -> None:
         )
     async with session_scope() as session:
         compiled = await ContextCompiler(session).compile(
-            subject_id=subject_id, window_id=session_id, user_text="我叫什么"
+            subject_id=subject_id, window_id=session_id, user_text="你还记得我以前说过我叫什么吗"
         )
     joined = "\n".join(m.content for m in compiled.messages)
     assert "阿澄" in joined, "摘要未被注入"

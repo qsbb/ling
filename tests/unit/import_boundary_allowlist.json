@@ -13,7 +13,6 @@
   ["domains/conversation/recall.py", "<module>", "ling.kernel.visibility.is_group_visibility"],
   ["domains/conversation/service.py", "<module>", "ling.api.errors.LingError"],
   ["domains/conversation/service.py", "<module>", "ling.api.errors.not_found"],
-  ["domains/conversation/service.py", "ConversationService.retract_message", "ling.kernel.context.PLATFORM_MESSAGE_ID_SCOPE"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.capabilities.delivery.DeliveryService"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.capabilities.delivery.reconcile_due"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.kernel.visibility.is_group_window_ref"],

@@ -110,6 +110,9 @@ class Kind(StrEnum):
     HISTORY = "history"
     """user/assistant 原文。有独立历史窗口，按消息条数滚动。"""
 
+    QUOTE = "quote"
+    """当前消息明确引用的历史发言。"""
+
     INPUT = "input"
     """本轮用户正文。**必须保留**——丢了就没有回复对象。"""
 
@@ -179,6 +182,8 @@ class ZoneSpec:
 # --------------------------------------------------------------------------- #
 # 唯一手写的车道清单
 # --------------------------------------------------------------------------- #
+
+QUOTE_TOKEN_BUDGET = 480
 
 ZONES: tuple[ZoneSpec, ...] = (
     ZoneSpec(
@@ -296,6 +301,16 @@ ZONES: tuple[ZoneSpec, ...] = (
         None,
         "history",
         (LaneSpec("history", 20_000, 10, None),),
+    ),
+    ZoneSpec(
+        "quote",
+        "引用",
+        "用户明确引用的原始发言",
+        Kind.QUOTE,
+        95,
+        None,
+        "input",
+        (LaneSpec("quote", QUOTE_TOKEN_BUDGET, 10, None),),
     ),
     ZoneSpec(
         "input",
@@ -540,11 +555,13 @@ def validate_registry(zones: tuple[ZoneSpec, ...] = ZONES) -> None:
             if not lane.active and lane.budget_tokens is not None:
                 raise ValueError(f"禁发车道不得占用预算: {lane.name}")
 
-    missing = {Kind.SUMMARY, Kind.HISTORY, Kind.INPUT} - set(structural)
+    expected_struct = {
+        Kind.SUMMARY: "summary", Kind.HISTORY: "history", Kind.QUOTE: "quote", Kind.INPUT: "input",
+    }
+    missing = set(expected_struct) - set(structural)
     if missing:
         raise ValueError(f"缺少结构区域: {sorted(k.value for k in missing)}")
 
-    expected_struct = {Kind.SUMMARY: "summary", Kind.HISTORY: "history", Kind.INPUT: "input"}
     for kind, lane_name in expected_struct.items():
         if structural[kind][0] != lane_name:
             raise ValueError(f"结构车道名称不符: {kind.value} 应为 {lane_name}")
@@ -552,9 +569,10 @@ def validate_registry(zones: tuple[ZoneSpec, ...] = ZONES) -> None:
     if not (
         structural[Kind.SUMMARY][1]
         < structural[Kind.HISTORY][1]
+        < structural[Kind.QUOTE][1]
         < structural[Kind.INPUT][1]
     ):
-        raise ValueError("摘要、历史、正文三者的消息顺序不符（应依次递增）")
+        raise ValueError("摘要、历史、引用、正文的消息顺序不符（应依次递增）")
 
     # 牺牲表必须覆盖所有"可牺牲"的 system 车道：漏一条的症状是那条车道
     # **永不**被软上限淘汰，一直占着预算直到被硬上限从中间截断。

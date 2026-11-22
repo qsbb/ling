@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -22,11 +22,12 @@ from sqlalchemy import select
 from sqlalchemy import text as sql_text
 
 from ling.domains.consent.service import ConsentService
+from ling.domains.conversation.service import ConversationService
 from ling.domains.identity.service import IdentityService
 from ling.domains.media.service import INBOUND_SCOPE
 from ling.infra.asr_jobs import AsrJob
 from ling.infra.db import session_scope
-from ling.infra.models import MediaEvidenceRow, Message, Window
+from ling.infra.models import MediaEvidenceRow, Message, PromptSnapshot, Window
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -114,6 +115,16 @@ def _headers(body: bytes, *, self_id: str = "10001") -> dict[str, str]:
 
 async def _post(env: TestEnv, body: bytes, **kwargs) -> httpx.Response:  # noqa: ANN003
     return await env.client.post("/v1/onebot/events", content=body, headers=_headers(body, **kwargs))
+
+
+async def _prompt_for(result: dict) -> dict:
+    assert result["decision"] == "reply" and result["delivered"], result
+    async with session_scope() as session:
+        snapshot = await session.scalar(
+            select(PromptSnapshot).where(PromptSnapshot.turn_id == result["turn_id"])
+        )
+        assert snapshot is not None and snapshot.payload and not snapshot.truncated
+        return snapshot.payload
 
 
 # ------------------------------------------------------------------ 闭环
@@ -208,6 +219,85 @@ async def test_window_is_channel_scoped(logged_in: TestEnv) -> None:
         )
     assert len(windows) == 1
     assert windows[0].title == f"onebot-loop:private:{QQ_USER}"
+
+
+async def test_private_chat_focus_keeps_history_available_for_explicit_references(
+    logged_in: TestEnv, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    old_text = "橙色天文台的四项改造计划"
+    first = (await _post(
+        logged_in, _event_body(message_id=7100, message=old_text)
+    )).json()
+    await _prompt_for(first)
+    async with session_scope() as session:
+        window_id = await session.scalar(select(Window.id).where(Window.channel == "onebot"))
+        assert window_id is not None
+        service = ConversationService(session)
+        old = await session.scalar(select(Message).where(Message.text == old_text))
+        assert old is not None
+        old.created_at = datetime.now(UTC) - timedelta(days=2)
+        await service.save_summary(
+            window_id, summary="旧摘要中有天文台的预算", through_sequence=old.sequence,
+            message_count=1,
+        )
+        for index in range(78):
+            await service.add_message(window_id, role="user", text=f"背景闲聊 {index:02}")
+
+    async def prompt(message_id: int, text: str) -> dict:
+        response = await _post(logged_in, _event_body(message_id=message_id, message=text))
+        assert response.status_code == 200, response.text
+        return await _prompt_for(response.json())
+
+    ordinary = await prompt(7101, "这周准备做什么")
+    history = [item["content"] for item in ordinary["messages"] if item["lane"] == "history"]
+    assert 2 <= len(history) <= 40
+    assert any("背景闲聊 77" in text for text in history)
+    assert all("背景闲聊 00" not in text for text in history)
+
+    adjacent_greeting = await prompt(7106, "你好")
+    assert any(
+        item["lane"] == "history" and "这周准备做什么" in item["content"]
+        for item in adjacent_greeting["messages"]
+    )
+    async with session_scope() as session:
+        for row in (await session.scalars(
+            select(Message).where(Message.window_id == window_id)
+        )).all():
+            row.created_at -= timedelta(days=1)
+
+    greeting = await prompt(7102, "早上好")
+    question = await prompt(7103, "？")
+    for result in (greeting, question):
+        assert not any(item["lane"] in {"summary", "evidence"} for item in result["messages"])
+        assert all(old_text not in item["content"] for item in result["messages"])
+    assert greeting["context"]["history_messages"] == 0
+    previous = [item for item in question["messages"] if item["lane"] == "history"]
+    assert [item["role"] for item in previous] == ["user", "assistant"]
+    assert "早上好" in previous[0]["content"]
+    assert any(
+        getattr(record, "event_name", "") == "context_compiled"
+        and record.attributes["history_scope"] == "nearby"
+        and record.attributes["history_messages"] == 2
+        for record in caplog.records
+    )
+
+    earlier = await prompt(7104, "早上好，接着说前天那个天文台计划")
+    assert any(
+        item["lane"] == "summary" and "天文台的预算" in item["content"]
+        for item in earlier["messages"]
+    )
+    quoted = await prompt(7105, "[CQ:reply,id=7100] ？")
+    assert any(
+        item["lane"] == "quote" and old_text in item["content"]
+        for item in quoted["messages"]
+    )
+    async with session_scope() as session:
+        windows = (await session.scalars(
+            select(Window.id).where(Window.channel == "onebot")
+        )).all()
+    assert windows == [window_id]
 
 
 async def test_unbound_account_not_accepted(logged_in: TestEnv) -> None:
@@ -458,16 +548,57 @@ async def test_group_reply_to_bot_counts_as_addressed(logged_in: TestEnv) -> Non
     _install(logged_in, fake)
     await _bind(logged_in)
 
-    # 不 @ 任何人，只引用一条消息
+    earlier = (await _post(logged_in, _event_body(
+        message_type="group", group_id=int(GROUP), sub_type="normal", message_id=776,
+        message="[CQ:at,qq=10001] 先解释一下潮汐",
+    ))).json()
+    await _prompt_for(earlier)
+
+    # 9001 是上一轮真实投递回执返回的平台 id。
     body = _event_body(
         message_type="group",
         group_id=int(GROUP),
         sub_type="normal",
-        message="[CQ:reply,id=424242] 那你刚才说的是什么意思",
+        message="[CQ:reply,id=9001] 那你刚才说的是什么意思",
     )
     result = (await _post(logged_in, body)).json()
-    assert result["decision"] == "reply", f"引用了机器人却沉默: {result}"
-    assert any(c["action"] == "send_group_msg" for c in fake.sent)
+    snapshot = await _prompt_for(result)
+    assert snapshot["context"]["reply_reference"] == "actor"
+    assert any(item["lane"] == "quote" and item["sender"] == "你" for item in snapshot["messages"])
+    assert len([c for c in fake.sent if c["action"] == "send_group_msg"]) == 2
+
+
+async def test_group_reply_tracks_quoted_speaker_and_stays_in_its_window(
+    logged_in: TestEnv,
+) -> None:
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _post(logged_in, _event_body(message_id=780, message="另一个私聊里的紫色月球"))
+
+    async def group(message_id: int, text: str) -> dict:
+        response = await _post(logged_in, _event_body(
+            message_id=message_id, message_type="group", group_id=int(GROUP),
+            sub_type="normal", message=text, sender={"nickname": "阿岚", "card": "阿岚"},
+        ))
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert (await group(781, "群友说蓝色天文馆"))["accepted"]
+    not_for_ling = await group(782, "[CQ:reply,id=781] ？")
+    assert not_for_ling["decision"] == "deferred_attention"
+    addressed = "[CQ:at,qq=10001] ？"
+    known = await _prompt_for(await group(783, "[CQ:reply,id=781]" + addressed))
+    quote, = [item for item in known["messages"] if item["lane"] == "quote"]
+    assert quote["sender"] == "阿岚"
+    assert "群友说蓝色天文馆" in quote["content"]
+    assert sum("群友说蓝色天文馆" in item["content"] for item in known["messages"]) == 1
+    unknown = await _prompt_for(await group(784, "[CQ:reply,id=780]" + addressed))
+    assert unknown["context"]["reply_reference"] == "unresolved"
+    assert "被引用的发言暂不可读" in unknown["messages"][-1]["content"]
+    assert all(
+        item["lane"] != "quote" and "另一个私聊里的紫色月球" not in item["content"]
+        for item in unknown["messages"]
+    )
 
 
 # ------------------------------------------------------------------ 媒体入库

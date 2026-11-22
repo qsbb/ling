@@ -478,7 +478,8 @@ async def test_block_labels_come_from_compiler(logged_in: TestEnv) -> None:
             window_id, summary="更早的对话摘要内容", through_sequence=0, message_count=2
         )
 
-    _, events = await _run_turn(logged_in, window_id=window_id, text="这轮的新输入")
+    text = "回忆一下我们最早聊了什么"
+    _, events = await _run_turn(logged_in, window_id=window_id, text=text)
     message_id, _ = _reply(events)
     body = await _get_prompt(logged_in.client, message_id)
     sections = {section["key"]: section for section in body["sections"]}
@@ -502,7 +503,7 @@ async def test_block_labels_come_from_compiler(logged_in: TestEnv) -> None:
     assert "summary" in sections
     assert "更早的对话摘要内容" in sections["summary"]["items"][0]["content"]
 
-    assert sections["input"]["items"][0]["content"] == "这轮的新输入"
+    assert sections["input"]["items"][0]["content"] == text
     assert sections["input"]["role"] == "user"
 
     # 顺序固定：system 在最前，input 在 history 之后

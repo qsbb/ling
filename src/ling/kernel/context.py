@@ -15,7 +15,7 @@ import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,10 +23,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import CapabilityDescriptor, ContextContribution, Origin, Visibility
 from ling.domains.consent.service import ConsentService
-from ling.domains.conversation.service import ConversationService
+from ling.domains.conversation.service import (
+    PLATFORM_MESSAGE_ID_SCOPE,
+    ConversationService,
+    MessageView,
+    ReplyReference,
+)
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
-from ling.domains.memory.recall_query import needs_recent_topic, should_skip_automatic_recall
+from ling.domains.memory.recall_query import (
+    asks_for_earlier_conversation,
+    needs_recent_topic,
+    opens_new_topic,
+    should_skip_automatic_recall,
+)
 from ling.domains.memory.service import (
     MemoryHit,
     MemoryService,
@@ -49,11 +59,12 @@ from ling.kernel.prompt_zones import (
     PROTECTED_LANES as _PROTECTED_LANES,
 )
 from ling.kernel.prompt_zones import (
-    SACRIFICE_ORDER as _SACRIFICE_ORDER,
-)
-from ling.kernel.prompt_zones import (
+    QUOTE_TOKEN_BUDGET,
     budget_overruns,
     lane_zone,
+)
+from ling.kernel.prompt_zones import (
+    SACRIFICE_ORDER as _SACRIFICE_ORDER,
 )
 from ling.ports.config import EffectiveConfig, MemoryPolicy
 from ling.ports.model import ChatMessageIn
@@ -74,11 +85,11 @@ _MEDIA_KIND_LABELS: dict[str, str] = {
     "emoji": "表情",
 }
 
-# 历史车道的 token 预算（不含 system 车道）。超过就滚动摘要。
-# 最近原文层的 token 上限。**这才是"接得上话"的真正瓶颈**——
-# 原来只有 1600，约装 20~30 条消息，之后就开始滚动摘要，细节全丢。
-# 车道预算再宽也救不了它。配合 50k 总预算调到 20k。
+# 历史原文受 token 预算限制，普通轮次另有近期取数边界。
 HISTORY_TOKEN_BUDGET = 20000
+RECENT_HISTORY_MESSAGES = 40
+NEARBY_HISTORY_MESSAGES = 4
+_GREETING_CONTINUITY = timedelta(minutes=5)
 # 滚动摘要本身的预算
 SUMMARY_TOKEN_BUDGET = 400
 
@@ -325,11 +336,12 @@ def lane_key(lane: str) -> str:
 #   （"她是不是假装看过"），必须能一眼看见它到底注入了什么。
 #
 # 这份映射来自 `prompt_zones` 的 `ZoneSpec.legacy_ui_key`，本文件不再手写。
-# 只取 system 类车道：`summary` / `history` / `input` 是结构车道，从不经过
+# 只取 system 类车道：`summary` / `history` / `quote` / `input` 不经过
 # `lane_key()`（它只对 `ContextContribution` 调用），留在映射里只会让人以为
 # 它们也能落进某个展示分组。
 LANE_TO_KEY: dict[str, str] = {
-    lane: key for lane, key in _LANE_TO_KEY.items() if lane not in {"summary", "history", "input"}
+    lane: key for lane, key in _LANE_TO_KEY.items()
+    if lane not in {"summary", "history", "quote", "input"}
 }
 
 # key → 给人看的标签。前端**直接用这个 label**，不要在前端再翻译一遍：
@@ -383,9 +395,6 @@ MAX_INLINE_MESSAGE_ID_CHARS = 20
 # （§4.2），上下文里放太旧的 id 只会在发送时已经被淘汰——那时引用仍会
 # 静默消失，所以不如少放几条、让模型优先引最近的。
 HISTORY_MESSAGE_ID_LIMIT = 12
-# `idempotency_keys` 里存"本地消息 id → 平台 message id"的作用域名。
-# 由入站桥在落库时写（`InboundBridge._remember_platform_message_id`）。
-PLATFORM_MESSAGE_ID_SCOPE = "platform_msgid"
 
 # 撤回但**她当时已经看过**的消息，在上下文里的旁白注记。
 #
@@ -565,6 +574,7 @@ class ContextCompiler:
         # 由入站桥从连接器取（只有连接器知道 OneBot 的
         # `f"{self_id}:{message_id}"` 这类拼法）。
         current_message_platform_id: str | None = None,
+        reply_reference: ReplyReference | None = None,
     ) -> CompiledContext:
         # ``get_or_none`` 而不是 ``get``：新装（或删除后）**一行人格都没有**
         # 是正常状态，此时 `empty_persona_view()` 让下面 `view_is_empty()`
@@ -577,6 +587,23 @@ class ContextCompiler:
             persona = empty_persona_view(self._persona_id or "")
         contributions: list[ContextContribution] = []
         compiled_meta: dict[str, object] = {}
+        quoted = reply_reference.message if reply_reference is not None else None
+        low_information = should_skip_automatic_recall(user_text)
+        if reply_reference is not None:
+            history_scope = "nearby"
+        elif opens_new_topic(user_text):
+            history_scope = "greeting" if low_information else "opening"
+        elif asks_for_earlier_conversation(user_text):
+            history_scope = "earlier"
+        elif low_information:
+            history_scope = "nearby"
+        else:
+            history_scope = "recent"
+        wants_earlier = history_scope == "earlier"
+        nearby = history_scope in {"nearby", "greeting"}
+        compiled_meta["history_scope"] = history_scope
+        if reply_reference is not None:
+            compiled_meta["reply_reference"] = quoted.role if quoted else "unresolved"
 
         # 她**现在还真撤得动**的那几条：本地消息 id → 撤回短号。
         #
@@ -1138,6 +1165,7 @@ class ContextCompiler:
         self._window_ctx_cache = ctx
         if (
             ctx is not None
+            and history_scope in {"recent", "earlier"}
             and _window_topic_live(ctx)
             and (ctx.topic or ctx.open_questions)
         ):
@@ -1218,13 +1246,13 @@ class ContextCompiler:
         # 跨端交接胶囊：只在**私聊**场景注入。
         # 胶囊承载的是本人私聊间的话题，群聊里出现就是跨受众泄漏（设计文档 §4.2）。
         try:
-            if not snapshot.allows_handoff_capsule():
-                raise RuntimeError("当前模式或受众不注入交接胶囊")
-            from ling.kernel.handoff import HandoffService
+            capsule = None
+            if history_scope in {"recent", "earlier"} and snapshot.allows_handoff_capsule():
+                from ling.kernel.handoff import HandoffService
 
-            capsule = await HandoffService(
-                self._session, actor_id=self._actor_id
-            ).read(subject_id=subject_id, current_window_id=window_id)
+                capsule = await HandoffService(
+                    self._session, actor_id=self._actor_id
+                ).read(subject_id=subject_id, current_window_id=window_id)
             if capsule is not None and (capsule.recent_topic or capsule.open_questions):
                 parts = ["你在另一个对话窗口里刚和这个人聊过："]
                 if capsule.recent_topic:
@@ -1459,37 +1487,28 @@ class ContextCompiler:
                 )
             )
 
-        # --- 分层装配：摘要层 + 最近原文层 ---
+        # 普通轮次的取数边界只作用于本轮。明确回指时仍可追溯旧原文和摘要。
         window_ctx = getattr(self, "_window_ctx_cache", None)
-
-        # 2) 原文层：从**最新一条**往回装填，直到 token 预算用尽。
-        #
-        # 两个细节都不能省：
-        #
-        # (a) **必须按页往回取，不能"取最新 N 条就停"**。原来 `turn.py` 传
-        #     `history_limit=20`，于是第 21 条之后的消息既不在原文里、也不在
-        #     `dropped` 里，永远压不进摘要——31 条消息的窗口里，第 1~11 条在
-        #     提示词里整块消失，而 `summary_through_sequence` 仍是 NULL（实测）。
-        #     页大小仍由调用方给（少了就多取几页），真正决定用多少的是预算。
-        #
-        # (b) **单条超预算时截断它，而不是 break**。原来最近一条一超预算
-        #     （粘贴一大段、长语音转写），`break` 让 `usable` 直接为空：
-        #     整块历史被压进摘要，而摘要这一轮还没进提示词——她一句话上文都看不到。
-        _through = int(getattr(window_ctx, "summary_through_sequence", 0) or 0)
+        through = int(getattr(window_ctx, "summary_through_sequence", 0) or 0)
+        recent_limit = NEARBY_HISTORY_MESSAGES if nearby else RECENT_HISTORY_MESSAGES
         page_size = max(1, min(int(history_limit or 1), HISTORY_FETCH_CAP))
+        if not wants_earlier:
+            page_size = min(page_size, recent_limit + 1)
         single_cap = max(1, int(HISTORY_TOKEN_BUDGET * _HISTORY_SINGLE_MESSAGE_SHARE))
-        fetched: list = []  # 从旧到新
-        usable: list = []  # 从新到旧，最后翻转
+        fetched: list[MessageView] = []
+        usable: list[MessageView] = []  # 从新到旧，最后翻转
         used_tokens = 0
         cursor: int | None = None
         budget_full = False
         cap_hit = False
+        focus_limited = False
         truncated = 0
-        while True:
+        greeting_since = datetime.now(UTC) - _GREETING_CONTINUITY
+        while history_scope != "opening":
             page = await self._conversation.messages_for_prompt(
                 window_id,
                 limit=page_size,
-                after_sequence=_through,
+                after_sequence=through,
                 before_sequence=cursor,
             )
             if not page:
@@ -1497,10 +1516,21 @@ class ContextCompiler:
             exhausted = len(page) < page_size
             # `messages_for_prompt` 返回从旧到新；这里一路按"新 → 旧"处理。
             newest_first = list(reversed(page))
-            fetched = newest_first + fetched
+            fetched.extend(newest_first)
             for msg in newest_first:
                 if current_turn_id and msg.turn_id == current_turn_id:
+                    greeting_since = msg.created_at - _GREETING_CONTINUITY
                     continue
+                if history_scope == "greeting" and msg.created_at < greeting_since:
+                    focus_limited = True
+                    break
+                if not wants_earlier and len(usable) == recent_limit:
+                    # 近期条数边界落在一问一答之间时，从后一轮开始。
+                    oldest = usable[-1]
+                    if msg.turn_id and msg.turn_id == oldest.turn_id and oldest.role == "actor":
+                        usable.pop()
+                    focus_limited = True
+                    break
                 cost = estimate_tokens(msg.text)
                 if cost > single_cap:
                     # 单条不许吃掉整块历史（见 `_HISTORY_SINGLE_MESSAGE_SHARE`）
@@ -1512,7 +1542,17 @@ class ContextCompiler:
                     break
                 usable.append(msg)
                 used_tokens += cost
-            if budget_full:
+                if (
+                    not wants_earlier and msg.role == "user" and msg.retracted_at is None
+                    and (not is_group or msg.sender_subject_id == subject_id)
+                    and (
+                        (nearby and msg.turn_id is not None)
+                        or opens_new_topic(msg.text)
+                    )
+                ):
+                    focus_limited = True
+                    break
+            if budget_full or focus_limited:
                 break
             if exhausted:
                 break
@@ -1529,13 +1569,14 @@ class ContextCompiler:
             )
 
         usable.reverse()
-        kept_ids = {m.message_id for m in usable}
-        dropped = [
-            m
-            for m in fetched
-            if m.message_id not in kept_ids
-            and not (current_turn_id and m.turn_id == current_turn_id)
-        ]
+        dropped: list[MessageView] = []
+        if wants_earlier and (budget_full or cap_hit):
+            kept_ids = {m.message_id for m in usable}
+            dropped = [
+                m for m in reversed(fetched)
+                if m.message_id not in kept_ids
+                and not (current_turn_id and m.turn_id == current_turn_id)
+            ]
         if cap_hit:
             # 窗口里积压了超过一轮读取上限的未摘要消息：这一轮读不完。
             # 仍然按"保留窗口起点"推进 through（否则每轮都卡在同一段，
@@ -1555,9 +1596,12 @@ class ContextCompiler:
         elif max_injected_memories == 0:
             recall = RecallResult()
             compiled_meta["memory_recall_skipped"] = "disabled_by_policy"
-        elif should_skip_automatic_recall(user_text):
+        elif low_information:
             recall = RecallResult()
             compiled_meta["memory_recall_skipped"] = "low_information"
+        elif history_scope == "opening":
+            recall = RecallResult()
+            compiled_meta["memory_recall_skipped"] = "topic_change"
         else:
             query = user_text
             if needs_recent_topic(user_text):
@@ -1679,7 +1723,7 @@ class ContextCompiler:
         ]
 
         # 早期对话摘要放在最近原文之前。
-        if window_ctx is not None and window_ctx.summary:
+        if wants_earlier and window_ctx is not None and window_ctx.summary:
             annotated.append(
                 CompiledMessage(
                     role="system",
@@ -1699,8 +1743,9 @@ class ContextCompiler:
         # 私聊不需要——那里只有一个"你"。
         speaker_names: dict[str, str] = {}
         if is_group:
+            named_messages = [*usable, quoted] if quoted is not None else usable
             wanted = {
-                m.sender_subject_id for m in usable if m.sender_subject_id
+                m.sender_subject_id for m in named_messages if m.sender_subject_id
             }
             if wanted:
                 from ling.infra.models import Subject as _Subject
@@ -1736,8 +1781,14 @@ class ContextCompiler:
             reply_ids,
             current_mark,
         ) = await self._message_id_marks(usable, current_message_platform_id)
+        quote_mark = None
+        if reply_reference is not None and quoted is not None and quoted.role == "user":
+            quote_mark = message_id_token(reply_reference.platform_id)
+            reply_ids[quote_mark] = reply_reference.platform_id
 
         for msg in usable:
+            if quoted is not None and msg.message_id == quoted.message_id:
+                continue
             role = "user" if msg.role == "user" else "assistant"
             content = msg.text
             name = speaker_names.get(msg.sender_subject_id or "")
@@ -1841,7 +1892,36 @@ class ContextCompiler:
             # 谁多传一次，她就会在私聊里收到「阿岚：今天有点累」——看起来像
             # 群里有人在说话，而不是用户在跟她说话。
             user_sender_name = None
+        if quoted is not None:
+            if quoted.role == "actor":
+                quote_sender = "你"
+                quote_prefix = "当前消息引用了你之前的一条回复。那一轮的正文："
+            elif is_group:
+                quote_sender = speaker_names.get(quoted.sender_subject_id or "", "群友")
+                quote_prefix = f"当前消息引用了{quote_sender}的发言："
+            else:
+                quote_sender = "对方"
+                quote_prefix = "当前消息引用了对方之前的发言："
+            quote_text = _fit_message_text(quoted.text, QUOTE_TOKEN_BUDGET)
+            if quoted.retracted_at is not None:
+                quote_text += RETRACTED_NOTE
+            if quoted.origin in {Origin.external_observation, Origin.verified_source}:
+                quote_text = f"{UNTRUSTED_WRAPPER}\n{quote_text}"
+            if quote_mark:
+                quote_prefix = f"{MESSAGE_ID_MARKER.format(token=quote_mark)} {quote_prefix}"
+            annotated.append(
+                CompiledMessage(
+                    role="user",
+                    content=f"{quote_prefix}\n{quote_text}",
+                    key="input",
+                    lane="quote",
+                    sender=quote_sender,
+                    at=quoted.created_at,
+                )
+            )
         current = f"{user_sender_name}：{user_text}" if user_sender_name else user_text
+        if reply_reference is not None and quoted is None:
+            current = f"（这条消息带有引用，被引用的发言暂不可读。）\n{current}"
         if current_mark:
             current = f"{MESSAGE_ID_MARKER.format(token=current_mark)} {current}"
         annotated.append(

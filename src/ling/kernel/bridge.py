@@ -32,7 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.audit import behavior_event, hash_account_ref
 from ling.contracts.v1 import InteractionEnvelope
-from ling.domains.conversation.service import ConversationService
+from ling.domains.conversation.service import (
+    PLATFORM_MESSAGE_ID_SCOPE,
+    ConversationService,
+    ReplyReference,
+)
 from ling.domains.identity.service import IdentityService
 from ling.domains.media.service import MediaEvidenceError, MediaEvidenceService
 from ling.infra.models import Message, Turn, Window
@@ -43,7 +47,6 @@ from ling.kernel.autonomy import (
     make_situation_reader,
     scenario_key_for,
 )
-from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
 from ling.kernel.decision import DecisionContext, classify_text
 from ling.kernel.turn import describe_turn_failure
 from ling.kernel.visibility import is_group_window_ref
@@ -549,13 +552,23 @@ class InboundBridge:
             owner_subject_id=window.subject_id,
         )
 
+        reply_reference = None
+        if envelope.reply_to:
+            quoted = await ConversationService(self._session).quoted_message(
+                window.id, envelope.reply_to
+            )
+            reply_reference = ReplyReference(envelope.reply_to, quoted)
+        replied_to_actor = bool(
+            reply_reference and reply_reference.message and reply_reference.message.role == "actor"
+        )
+
         # 「是不是冲她说的」要在"有没有可读文本"**之前**算：
         # 只有 @ 没有正文是真实场景，先按"没文本"拒掉就永远等不到补充。
         addressed = self._is_addressed(
             envelope,
             text,
             channel_mentioned=envelope.mentions_actor,
-            replied_to_actor=bool(envelope.reply_to),
+            replied_to_actor=replied_to_actor,
         )
         observe = self._observe_only and not (
             self._reply_when_addressed and envelope.mentions_actor
@@ -718,7 +731,7 @@ class InboundBridge:
         decision = await self._decide(
             window, text, subject_id, is_group,
             channel_mentioned=envelope.mentions_actor,
-            replied_to_actor=bool(envelope.reply_to),
+            replied_to_actor=replied_to_actor,
         )
         if not decision.respond:
             # **沉默不等于没看见。** 消息必须落库，否则她不会记得有人
@@ -874,6 +887,7 @@ class InboundBridge:
             # 当轮就该用新名片，而不是等落库再下一轮才生效。
             sender_name=envelope.sender_name,
             current_message_platform_id=self._platform_message_id(envelope),
+            reply_reference=reply_reference,
         )
         reply_text = turn_result.text
         if turn_result.timed_out:
@@ -1799,6 +1813,7 @@ class InboundBridge:
         # 它属于"这一条消息"，不是"这个人"，所以只能沿调用链透传，
         # 不能从库里读——库里那一列是旁路同步的结果，可能还没写进去。
         sender_name: str | None = None,
+        reply_reference: ReplyReference | None = None,
     ) -> TurnResult:
         """跑一轮，返回 ``TurnResult``（正文/状态/表达方式/失败原因/为什么没交付）。
 
@@ -1830,6 +1845,7 @@ class InboundBridge:
             # 「当前这句是谁说的」——群里用它给最后一行署名（群名片优先）
             sender_name=sender_name,
             current_message_platform_id=current_message_platform_id,
+            reply_reference=reply_reference,
         )
         reply_text = ""
         partial_text = ""

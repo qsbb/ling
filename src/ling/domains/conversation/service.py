@@ -14,16 +14,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import Table, bindparam, delete, func, or_, select, text
+from sqlalchemy import Table, bindparam, delete, func, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
 from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, SessionRecord, TurnState
 from ling.infra.models import (
     ActorAccount,
+    DeliveryReceiptRow,
     HandoffCapsuleRow,
     IdempotencyKey,
     Message,
+    Operation,
     Subject,
     Turn,
     Window,
@@ -34,6 +36,7 @@ from ling.infra.security import new_id
 
 DEFAULT_WINDOW_TITLE = "新的对话"
 MAX_TITLE_LEN = 60
+PLATFORM_MESSAGE_ID_SCOPE = "platform_msgid"
 _WINDOWS_TABLE = cast(Table, Window.__table__)
 
 # 渠道窗口 ``title`` 里存的平台窗口标识形如 ``<instance>:<kind>:<target>``，
@@ -302,6 +305,12 @@ RETRIABLE_STATES = {TurnState.failed, TurnState.stopped}
 
 def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class ReplyReference:
+    platform_id: str
+    message: MessageView | None
 
 
 class ConversationService:
@@ -1089,7 +1098,6 @@ class ConversationService:
         from sqlalchemy import and_, or_
 
         from ling.infra.models import IdempotencyKey, Window
-        from ling.kernel.context import PLATFORM_MESSAGE_ID_SCOPE
 
         moment = now or datetime.now(UTC)
         mid = str(platform_message_id or "").strip()
@@ -1298,6 +1306,40 @@ class ConversationService:
                 .limit(1)
             )
         ).scalar_one_or_none()
+
+    async def quoted_message(self, window_id: str, platform_id: str) -> MessageView | None:
+        """通过入站消息映射或出站回执定位本窗口的被引消息。"""
+        inbound = (
+            select(IdempotencyKey.key)
+            .where(
+                IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                IdempotencyKey.result_ref == platform_id,
+            )
+        )
+        outbound = (
+            select(Operation.payload["reply_plan"].as_string())
+            .join(DeliveryReceiptRow, DeliveryReceiptRow.operation_id == Operation.id)
+            .where(
+                Operation.kind == "delivery",
+                DeliveryReceiptRow.platform_message_id == platform_id,
+                DeliveryReceiptRow.state.in_(("sent", "delivered")),
+            )
+        )
+        rows = (await self._session.scalars(
+            select(Message)
+            .where(
+                Message.window_id == window_id,
+                Message.state == TurnState.completed.value,
+                visible_to_model(),
+                Message.recalled_at.is_(None),
+                or_(
+                    (Message.role == "user") & Message.id.in_(inbound),
+                    (Message.role == "actor") & (literal("plan_") + Message.turn_id).in_(outbound),
+                ),
+            )
+            .limit(2)
+        )).all()
+        return self._to_view(rows[0]) if len(rows) == 1 else None
 
     async def messages_for_prompt(
         self,

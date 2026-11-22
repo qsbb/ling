@@ -160,7 +160,7 @@ async def test_budget_overflow_rolls_up_without_losing_the_joint(logged_in: Test
     texts = [f"第{i}条{body}" for i in range((HISTORY_TOKEN_BUDGET // per) + 4)]
     await _seed(logged_in, window_id, sender=None, texts=texts)
 
-    compiled = await _compile(logged_in, window_id, text="刚才说到哪了")
+    compiled = await _compile(logged_in, window_id, text="最早聊的是什么")
     assert compiled.meta.get("rolled_up", 0) > 0, "应有消息被滚动进摘要"
 
     async with session_scope() as session:
@@ -172,7 +172,7 @@ async def test_budget_overflow_rolls_up_without_losing_the_joint(logged_in: Test
     # 摘要里每条只保留前 120 字符（`render_rollup`），所以用"第N条"这个前缀核对
     assert "第0条" in ctx.summary, "最早那条没有进摘要"
 
-    again = await _compile(logged_in, window_id, text="继续")
+    again = await _compile(logged_in, window_id, text="最早聊的是什么")
     assert "较早的对话摘要" in _blob(again)
     # 只看**原文层**：摘要块本身也在这条 blob 里，拿它做"有没有重复"的判据
     # 永远为真（自己跟自己重复）
@@ -190,7 +190,7 @@ async def test_budget_overflow_rolls_up_without_losing_the_joint(logged_in: Test
 
 
 async def test_summary_survives_short_memory_expiry(logged_in: TestEnv) -> None:
-    """闲置超过短记忆 TTL 之后，摘要**仍然**要进上下文。
+    """闲置超过短记忆 TTL 之后，明确回指仍可读取摘要。
 
     摘要和"本窗口正在聊"共用一行 `window_contexts`，但只有后者有时效。
     按整行 TTL 判过期，会让隔夜回来的对话完全接不上。
@@ -210,7 +210,7 @@ async def test_summary_survives_short_memory_expiry(logged_in: TestEnv) -> None:
         row.expires_at = datetime.now(UTC) - timedelta(minutes=5)
         session.add(row)
 
-    compiled = await _compile(logged_in, window_id, text="周六几点")
+    compiled = await _compile(logged_in, window_id, text="上次说好周六几点看展？")
     joined = _blob(compiled)
     assert "较早的对话摘要" in joined, "摘要跟着短记忆一起过期了"
     assert "我们约好周六去看展" in joined

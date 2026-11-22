@@ -91,6 +91,7 @@ def test_zone_message_order_matches_spec_table() -> None:
         "capabilities",
         "recap",
         "dialogue",
+        "quote",
         "input",
     )
 
@@ -107,6 +108,7 @@ def test_zone_message_order_matches_spec_table() -> None:
         ("capabilities", 70),
         ("recap", 80),
         ("dialogue", 90),
+        ("quote", 95),
         ("input", 100),
     ],
 )
@@ -133,13 +135,15 @@ def test_structural_zones_come_last_in_message_order() -> None:
     """摘要 → 历史 → 正文，必须依次在后。"""
     by_kind = {z.kind: z for z in ZONES}
     assert by_kind[Kind.SUMMARY].message_order < by_kind[Kind.HISTORY].message_order
-    assert by_kind[Kind.HISTORY].message_order < by_kind[Kind.INPUT].message_order
+    assert by_kind[Kind.HISTORY].message_order < by_kind[Kind.QUOTE].message_order
+    assert by_kind[Kind.QUOTE].message_order < by_kind[Kind.INPUT].message_order
 
 
 def test_structural_lanes_are_named_exactly() -> None:
     for kind, expected in (
         (Kind.SUMMARY, "summary"),
         (Kind.HISTORY, "history"),
+        (Kind.QUOTE, "quote"),
         (Kind.INPUT, "input"),
     ):
         zone = next(z for z in ZONES if z.kind is kind)
@@ -190,7 +194,8 @@ def test_context_reexports_the_registry_tables() -> None:
     assert CTX_SACRIFICE == SACRIFICE_ORDER
     assert CTX_PROTECTED == PROTECTED_LANES
     assert {
-        lane: key for lane, key in LANE_TO_KEY.items() if lane not in {"summary", "history", "input"}
+        lane: key for lane, key in LANE_TO_KEY.items()
+        if lane not in {"summary", "history", "quote", "input"}
     } == CTX_LANE_TO_KEY
 
 

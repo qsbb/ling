@@ -107,11 +107,7 @@ async def _compile(env: TestEnv, window_id: str, text: str) -> tuple[int, dict]:
 
 
 async def test_short_history_is_kept_verbatim(logged_in: TestEnv) -> None:
-    """没超 token 预算时，早期消息应**全部保留原文**。
-
-    这是零信息损失的正确行为——不该为了"有个摘要"而把还能装下的原文压掉。
-    回归的是"条数上限截断"：之前 limit=16/20，第 17/21 条之后的直接消失。
-    """
+    """明确找回早期聊天时，预算内的原文仍可读取。"""
     window_id = (
         await logged_in.client.post("/v1/sessions", json={"title": "rollup"})
     ).json()["session_id"]
@@ -130,9 +126,8 @@ async def test_short_history_is_kept_verbatim(logged_in: TestEnv) -> None:
             )
         return "\n".join(m.content for m in compiled.messages)
 
-    await _blob("turn_rollup_probe3a", "第0条是什么")
-    # 摘要在本轮末尾才写入，下一轮才可见
-    blob = await _blob("turn_rollup_probe3b", "第0条是什么")
+    await _blob("turn_rollup_probe3a", "明天想吃什么")
+    blob = await _blob("turn_rollup_probe3b", "最早聊的是什么")
     # 关键回归：第 0 条要么在原文、要么在摘要里，不能两头都没有
     assert "第0条短消息" in blob, (
         "最早的一条既不在原文也不在摘要里——被条数上限直接截掉了"
@@ -152,7 +147,7 @@ async def test_overflow_goes_into_summary(logged_in: TestEnv) -> None:
         _overflow_messages("比较长的消息，用来把上下文预算撑满。"),
     )
 
-    await _compile(logged_in, window_id, "刚才都聊了什么")
+    await _compile(logged_in, window_id, "最早聊的是什么")
     summary, through, count = await _summary(logged_in, window_id)
     assert summary, "超预算后没有生成摘要"
     assert through > 0, "summary_through_sequence 没有推进"
@@ -184,9 +179,10 @@ async def test_summary_advances_monotonically(logged_in: TestEnv) -> None:
         _overflow_messages("消息，"),
     )
 
-    await _compile(logged_in, window_id, "继续")
+    await _compile(logged_in, window_id, "最早聊的是什么")
     _, through_first, count_first = await _summary(logged_in, window_id)
-    await _compile(logged_in, window_id, "再继续")
+    assert through_first > 0
+    await _compile(logged_in, window_id, "最早聊的是什么")
     _, through_second, count_second = await _summary(logged_in, window_id)
 
     assert through_second >= through_first, "摘要覆盖位置倒退了"
@@ -209,7 +205,7 @@ async def test_summary_visible_in_next_context(logged_in: TestEnv) -> None:
         _overflow_messages("较早的内容，需要足够长才会触发滚动摘要。"),
     )
 
-    await _compile(logged_in, window_id, "继续")
+    await _compile(logged_in, window_id, "最早聊的是什么")
     summary, _, _ = await _summary(logged_in, window_id)
     assert summary
 
@@ -219,7 +215,7 @@ async def test_summary_visible_in_next_context(logged_in: TestEnv) -> None:
         compiled = await ContextCompiler(session).compile(
             subject_id=logged_in.subject_id,
             window_id=window_id,
-            user_text="刚才说到哪了",
+            user_text="最早聊的是什么",
             current_turn_id="turn_rollup_probe2",
         )
     blob = "\n".join(m.content for m in compiled.messages)

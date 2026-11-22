@@ -43,8 +43,8 @@ def _memory(env: TestEnv, memory_id: str, text: str, **fields: object) -> Memory
 
 @pytest.mark.parametrize(
     "message",
-    ["　嗯。 ", "你在吗？", "ＯＫ！", "...？", ""],
-    ids=["acknowledgment", "presence", "full-width-english", "punctuation", "empty"],
+    ["　嗯。 ", "你在吗？", "ＯＫ！", "...？", "", "早上好", "对"],
+    ids=["acknowledgment", "presence", "full-width-english", "punctuation", "empty", "greeting", "yes"],
 )
 async def test_low_information_turn_skips_semantic_recall(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch, message: str
@@ -72,7 +72,7 @@ async def test_low_information_turn_skips_semantic_recall(
         )
         assert compiled.memory_ids == []
         assert not any(item.lane == "evidence" for item in compiled.contributions)
-        assert any(item.role == "user" and earlier in item.content for item in compiled.messages)
+        assert any(item.lane == "history" and earlier in item.content for item in compiled.annotated)
         assert compiled.meta["memory_recall_skipped"] == "low_information"
         embed.assert_not_awaited()
         assert (await session.scalars(select(MemoryRetrievalLog))).all() == []
