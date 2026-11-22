@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import re
-from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -236,7 +235,7 @@ class InvokeFailure(_Strict):
 class PluginEvent(_Strict):
     """一次宿主事件。``event_id`` 是稳定键，插件必须据此去重。
 
-    重试语义：至少一次；插件返回 2xx 即视为收到，重复投递时插件必须幂等。
+    Worker 有限次数重试，插件返回 2xx 即视为收到，重复投递时插件必须幂等。
     事件 payload 只带 ID/时间/次数，不含正文、密钥或凭据。
     """
 

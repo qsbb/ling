@@ -28,8 +28,8 @@ Ling v1 允许第三方用一个独立 HTTP 服务提供工具、用户命令、
 3. 使用：
 
    - 用户命令：在非密封私聊发送 `/plugincmd example.notes lookup 茶`。
-   - 模型工具：开启原生工具后，模型可调用 `plugin_example_notes_lookup` 等工具；插件结果按不可信数据包裹后回灌。
-   - 事件：完成轮次时 Ling POST `{endpoint}/v1/events`，插件按 `event_id` 去重。
+   - 模型工具：开启原生工具后，模型可在非密封私聊的首次尝试中调用 `plugin_example_notes_lookup` 等工具。插件结果按不可信数据包裹后回灌。模型工具名冲突时，当轮隐藏冲突项。
+   - 事件：轮次完成后由 Ling worker POST `{endpoint}/v1/events`，插件按 `event_id` 去重。
    - 宿主状态：插件在 invoke 响应里请求 `host.state`，Ling 用同一 `request_id` 带回结果，最多 4 轮。
 
 ## 版本兼容
@@ -122,6 +122,7 @@ Ling 执行后以同一 `request_id` 再 POST 一次，把结果放进 `host_res
 ```
 
 `get` 返回 `value` 字符串或 `null`。每次值最多 4096 字符，默认 TTL 7 天；按 `plugin_id` 隔离，插件 A 读不到 B 的键。
+Ling 在每批宿主调用开始时复核启用状态和授权。每批成功的状态写入在返回 `host_results` 前提交。
 
 ### 事件（`POST /v1/events`）
 
@@ -135,8 +136,10 @@ Ling 执行后以同一 `request_id` 再 POST 一次，把结果放进 `host_res
 }
 ```
 
-- 稳定 ID：`event_id` 由 turn_id、attempt、plugin_id 组成。重复投递必须幂等。
-- 重试语义：至少一次；2xx 视为收到。事件端点 2 秒超时，失败不会让聊天失败，也不会无限重试。
+- 事件任务随轮次完成一同提交。入队失败会记录日志，聊天仍可完成。现有 Ling worker 从 PostgreSQL outbox 取任务，聊天请求无需等待 HTTP 投递。部署时 API 和 worker 都须能访问登记的端点。
+- `event_id` 由 turn_id、attempt、plugin_id 组成。同一任务的每次投递使用相同的 ID 和载荷。插件须按 ID 幂等处理。2xx 响应头即为确认。
+- 每次 HTTP 投递最多等待 2 秒。失败后按 2、4、8、16 秒退避，达到 5 次已记录失败后任务进入 `dead`。重试可能晚于后续事件到达，崩溃后的租约回收可能重复投递。
+- Worker 每次尝试前复核登记与事件授权。停用、撤权或更新登记后，尚未开始的旧任务会跳过。
 - 载荷只有 ID/时间/次数，不含正文、密钥或凭据。
 
 ## 管理与旧入口
@@ -151,11 +154,13 @@ Ling 执行后以同一 `request_id` 再 POST 一次，把结果放进 `host_res
 | `DELETE /v1/plugins/{id}` | owner/admin | 取消登记 |
 | `GET /v1/settings/tool-status` | owner/admin | 原工具状态页，新增 `external_plugins` 字段 |
 
+管理员可用 `POST /v1/plugins/register?force=true` 和完整登记请求更新原插件的授权。端点须保持登记的插件 ID。启用或同步时发现 ID 变更，Ling 会停用原登记。
+
 旧 `tool-plugins.json` 与 `/plugin catalog 茶` 继续工作；新登记插件使用 `/plugincmd`。旧的只读 HTTP 插件不自动变成 v1 插件，需管理员按本文重新登记。
 
 ## 失败与限制
 
-- 插件请求 6 秒超时、manifest 4 秒、事件 2 秒；响应上限 16 KiB；不跟随重定向，不接受压缩响应。
+- 插件调用 6 秒超时，manifest 4 秒，事件投递 2 秒。调用和 manifest 的响应正文上限为 16 KiB，仅接受未压缩数据。Ling 禁止跟随重定向。
 - 插件不可用、非 200、坏 JSON、错误 schema、无结果都变成明确失败；普通聊天仍完成。
 - 插件结果始终是 `output_untrusted`，进入模型前带数据边界，不能当指令。
 - 插件不能请求宿主密钥、会话历史、其他插件状态或任意数据库查询；未知能力被拒。

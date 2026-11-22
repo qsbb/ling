@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from ling.capabilities import external_plugins_client as plugin_client_mod
+from ling.capabilities.external_plugins_service import PLUGIN_COMPLETED_TOPIC
 from ling.infra.db import session_scope
-from ling.infra.models import ExternalPluginStateRow
+from ling.infra.models import ExternalPluginStateRow, OutboxEvent, utcnow
 from ling.models import openai_compatible
 from ling.models.registry import ProviderRegistry
 from ling.models.router import ModelRouter
@@ -39,8 +42,8 @@ def _manifest() -> dict[str, Any]:
         "api_version": API_VERSION,
         "min_host_version": HOST_VERSION,
         "max_host_version": HOST_VERSION,
-        "capabilities": ["tools", "commands", "host.state"],
-        "events": [],
+        "capabilities": ["tools", "commands", "host.state", "events"],
+        "events": ["turn.completed"],
         "tools": [{
             "name": "lookup",
             "description": "查询目录",
@@ -57,11 +60,19 @@ def _manifest() -> dict[str, Any]:
 class _Server:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.event_release: asyncio.Event | None = None
+        self.event_status = 204
         self.manifest_id = PLUGIN_ID
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    async def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/manifest":
             return httpx.Response(200, json={**_manifest(), "id": self.manifest_id})
+        if request.url.path == "/v1/events":
+            self.events.append(json.loads(request.content))
+            if self.event_release is not None:
+                await self.event_release.wait()
+            return httpx.Response(self.event_status)
         if request.url.path == "/v1/invoke":
             body = json.loads(request.content)
             self.calls.append(body)
@@ -124,13 +135,16 @@ def plugin_server(monkeypatch: pytest.MonkeyPatch) -> _Server:
     return server
 
 
-async def _register(logged_in: TestEnv) -> None:
+async def _register(logged_in: TestEnv, *, events: bool = False) -> None:
+    capabilities = ["tools", "commands", "host.state"]
+    if events:
+        capabilities.append("events")
     response = await logged_in.client.post(
         "/v1/plugins/register",
         json={
             "endpoint": ENDPOINT,
             "expected_id": PLUGIN_ID,
-            "granted_capabilities": ["tools", "commands", "host.state"],
+            "granted_capabilities": capabilities,
             "enabled": True,
         },
     )
@@ -236,3 +250,79 @@ async def test_changed_manifest_identity_deactivates_registration(
     assert status.json()["enabled"] is False and status.json()["reachable"] is False
     assert await wiring._web_reply(logged_in, text=text) != "插件返回的真实结果"
     assert len(plugin_server.calls) == 1
+
+
+async def test_completed_event_retries_after_request_finishes(
+    logged_in: TestEnv, endpoint: wiring._ToolEndpoint, plugin_server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling.worker import drain_outbox
+
+    await wiring._bind_model(logged_in, enabled=False)
+    await _register(logged_in, events=True)
+    plugin_server.event_release = asyncio.Event()
+    monkeypatch.setattr(plugin_client_mod, "EVENT_TIMEOUT_SECONDS", 0.15)
+
+    turn_events = await asyncio.wait_for(
+        wiring._web_turn(logged_in, text="Hello fixture"), timeout=5
+    )
+    assert wiring._reply_text(turn_events) == wiring.PLAIN_REPLY
+    assert plugin_server.events == []
+
+    topic = PLUGIN_COMPLETED_TOPIC
+    query = select(OutboxEvent).where(OutboxEvent.topic == topic)
+    assert await drain_outbox(limit=1, only_topic=topic) == 0
+    delivered, = plugin_server.events
+    async with session_scope() as session:
+        job = (await session.scalars(query)).one()
+        assert job.state == "pending" and job.attempts == 1 and job.available_at > utcnow()
+        job.available_at = utcnow()
+
+    plugin_server.event_release.set()
+    assert await drain_outbox(limit=1, only_topic=topic) == 1
+    assert plugin_server.events == [delivered, delivered]
+    completion, = [data for name, data in turn_events if name == "turn.completed"]
+    turn_id = completion["turn_id"]
+    assert delivered["event_id"] == f"evt_turn_completed_{turn_id}_1_{PLUGIN_ID}"
+    assert delivered["type"] == "turn.completed"
+    assert set(delivered["data"]) == {"turn_id", "window_id", "subject_id", "attempt"}
+    async with session_scope() as session:
+        assert (await session.scalars(query)).one().state == "done"
+
+    assert await wiring._web_reply(logged_in) == wiring.PLAIN_REPLY
+    response = await logged_in.client.post(f"/v1/plugins/{PLUGIN_ID}/disable")
+    assert response.status_code == 200, response.text
+    assert await drain_outbox(limit=1, only_topic=topic) == 1
+    assert plugin_server.events == [delivered, delivered]
+
+
+async def test_completed_event_stops_retrying_after_five_failures(
+    logged_in: TestEnv, endpoint: wiring._ToolEndpoint, plugin_server: _Server,
+) -> None:
+    from ling.worker import drain_outbox
+
+    await wiring._bind_model(logged_in, enabled=False)
+    await _register(logged_in, events=True)
+    plugin_server.event_status = 503
+    assert await wiring._web_reply(logged_in) == wiring.PLAIN_REPLY
+
+    topic = PLUGIN_COMPLETED_TOPIC
+    query = select(OutboxEvent).where(OutboxEvent.topic == topic)
+    for attempt, delay_seconds in enumerate((2, 4, 8, 16, None), start=1):
+        before = utcnow()
+        assert await drain_outbox(limit=1, only_topic=topic) == 0
+        after = utcnow()
+        assert len(plugin_server.events) == attempt
+        async with session_scope() as session:
+            job = (await session.scalars(query)).one()
+            assert job.attempts == attempt
+            if delay_seconds is None:
+                assert job.state == "dead"
+            else:
+                assert job.state == "pending"
+                delay = timedelta(seconds=delay_seconds)
+                assert before + delay <= job.available_at <= after + delay
+            job.available_at = utcnow()
+
+    assert await drain_outbox(limit=1, only_topic=topic) == 0
+    assert plugin_server.events == [plugin_server.events[0]] * 5

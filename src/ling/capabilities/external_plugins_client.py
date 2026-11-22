@@ -19,7 +19,6 @@ from ling import __version__ as HOST_VERSION
 from ling.capabilities.external_plugin_contract import (
     API_VERSION,
     SUPPORTED_CAPABILITIES,
-    ExternalPluginError,
     HostCall,
     HostResult,
     InvokeFailure,
@@ -91,13 +90,12 @@ class PluginClient:
         try:
             async with httpx.AsyncClient(
                 timeout=MANIFEST_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False
-            ) as client:
-                async with client.stream(
-                    "GET",
-                    _endpoint(endpoint, MANIFEST_PATH),
-                    headers={"Accept": "application/json", "Accept-Encoding": "identity"},
-                ) as response:
-                    payload = await _read_bounded(response)
+            ) as client, client.stream(
+                "GET",
+                _endpoint(endpoint, MANIFEST_PATH),
+                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+            ) as response:
+                payload = await _read_bounded(response)
         except (httpx.HTTPError, httpx.InvalidURL, PluginUnavailable) as exc:
             raise PluginUnavailable("无法读取插件 manifest") from exc
         try:
@@ -173,32 +171,33 @@ class PluginClient:
         raise PluginRejected("插件宿主调用次数超过上限")
 
     async def emit_event(self, *, endpoint: str, event: PluginEvent) -> bool:
-        """Best-effort event delivery; returns True on 2xx ack, never raises."""
+        """Make one delivery attempt and use the status as the acknowledgement."""
         try:
-            async with httpx.AsyncClient(
-                timeout=EVENT_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False
-            ) as client:
-                response = await client.post(
+            async with (
+                asyncio.timeout(EVENT_TIMEOUT_SECONDS),
+                httpx.AsyncClient(follow_redirects=False, trust_env=False) as client,
+                client.stream(
+                    "POST",
                     _endpoint(endpoint, EVENTS_PATH),
                     json=event.model_dump(mode="json"),
                     headers={"Accept": "application/json", "Accept-Encoding": "identity"},
-                )
-        except (httpx.HTTPError, httpx.InvalidURL):
+                ) as response,
+            ):
+                return 200 <= response.status_code < 300
+        except (TimeoutError, httpx.HTTPError, httpx.InvalidURL):
             return False
-        return 200 <= response.status_code < 300
 
     async def _post(self, endpoint: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout, follow_redirects=False, trust_env=False
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    _endpoint(endpoint, path),
-                    json=body,
-                    headers={"Accept": "application/json", "Accept-Encoding": "identity"},
-                ) as response:
-                    return await _read_bounded(response)
+            ) as client, client.stream(
+                "POST",
+                _endpoint(endpoint, path),
+                json=body,
+                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+            ) as response:
+                return await _read_bounded(response)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise PluginUnavailable("无法连接插件服务") from exc
 

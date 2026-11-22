@@ -3020,21 +3020,18 @@ class TurnCoordinator:
             causation_id=turn_id,
         )
 
-        # 外部插件事件订阅：best-effort，事件端点故障绝不影响本轮聊天。
-        # event_id 稳定（turn_id + attempt + plugin_id），插件按 id 去重。
+        # 随轮次提交事件任务，由 worker 在请求事务之外发送。
         if state is TurnState.completed:
             try:
-                ext_service = ExternalPluginService(conversation.session)
-                for ext_row in await ext_service.enabled_plugins():
-                    await ext_service.emit_completed(
-                        plugin=ext_row,
+                async with conversation.session.begin_nested():
+                    await ExternalPluginService(conversation.session).enqueue_completed(
                         turn_id=turn_id,
                         window_id=window_id,
                         subject_id=subject_id,
                         attempt=attempt,
                     )
-            except Exception:  # noqa: BLE001 - event delivery is never on the chat critical path
-                logger.info("外部插件事件投递失败（不影响本轮）")
+            except Exception:  # noqa: BLE001 - do not fail the turn if enqueueing fails
+                logger.warning("外部插件事件入队失败", exc_info=True)
 
         if state is TurnState.failed and error is not None:
             await queue.put(

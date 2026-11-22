@@ -16,8 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling import __version__ as HOST_VERSION
 from ling.capabilities.external_plugin_contract import (
+    API_VERSION,
     HostCall,
     HostResult,
+    PluginEvent,
     PluginManifest,
     RegisterBody,
     version_in_range,
@@ -35,13 +37,14 @@ from ling.capabilities.tool_plugins import (
 )
 from ling.contracts.v1 import new_id
 from ling.infra.db import short_session_scope
-from ling.infra.models import ExternalPluginRow, ExternalPluginStateRow
+from ling.infra.models import ExternalPluginRow, ExternalPluginStateRow, OutboxEvent
 
 MAX_STATE_VALUE_CHARS = 4096
 DEFAULT_STATE_TTL_SECONDS = 7 * 24 * 3600
 MAX_STATE_TTL_SECONDS = 30 * 24 * 3600
 COMMAND_PREFIX = "/plugincmd"
 LEGACY_COMMAND_PREFIX = "/plugin"
+PLUGIN_COMPLETED_TOPIC = "plugin.turn.completed"
 
 _LEGACY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
@@ -72,6 +75,28 @@ def allows(plugin: ExternalPluginRow, capability: str) -> bool:
         and plugin.status in {"ready", "registered"}
         and capability in _as_list(plugin.capabilities)
         and capability in _as_list(plugin.granted_capabilities)
+    )
+
+
+def _subscribes_to_completed(plugin: ExternalPluginRow) -> bool:
+    return allows(plugin, "events") and "turn.completed" in _as_list(plugin.events)
+
+
+def _completed_event(
+    plugin_id: str, turn_id: str, window_id: str, subject_id: str, attempt: int,
+    *, event_id: str | None = None,
+) -> PluginEvent:
+    return PluginEvent(
+        api_version=API_VERSION,
+        event_id=event_id or f"evt_turn_completed_{turn_id}_{attempt}_{plugin_id}",
+        type="turn.completed",
+        occurred_at=datetime.now(UTC).isoformat(),
+        data={
+            "turn_id": turn_id,
+            "window_id": window_id,
+            "subject_id": subject_id,
+            "attempt": attempt,
+        },
     )
 
 
@@ -115,7 +140,12 @@ class ExternalPluginService:
         return await self._session.get(ExternalPluginRow, plugin_id)
 
     async def enabled_plugins(self) -> list[ExternalPluginRow]:
-        return [row for row in await self.list() if row.enabled and row.status in {"ready", "registered"}]
+        result = await self._session.scalars(
+            select(ExternalPluginRow)
+            .where(ExternalPluginRow.enabled.is_(True), ExternalPluginRow.status.in_(("ready", "registered")))
+            .order_by(ExternalPluginRow.id)
+        )
+        return list(result.all())
 
     async def register(
         self, body: RegisterBody, *, force: bool = False
@@ -346,6 +376,31 @@ class ExternalPluginService:
         plugin.updated_at = datetime.now(UTC)
         await self._session.flush()
 
+    async def enqueue_completed(
+        self, *, turn_id: str, window_id: str, subject_id: str, attempt: int,
+    ) -> None:
+        subscribers = [
+            plugin for plugin in await self.enabled_plugins() if _subscribes_to_completed(plugin)
+        ]
+        if not subscribers:
+            return
+        from ling.domains.memory.purge import current_generation
+
+        generation = await current_generation(self._session, subject_id)
+        for plugin in subscribers:
+            event = _completed_event(plugin.id, turn_id, window_id, subject_id, attempt)
+            self._session.add(OutboxEvent(
+                id=new_id("obx"),
+                topic=PLUGIN_COMPLETED_TOPIC,
+                subject_id=subject_id,
+                forget_generation=generation,
+                payload={
+                    "plugin_id": plugin.id,
+                    "registration_updated_at": plugin.updated_at.isoformat(),
+                    "event": event.model_dump(mode="json"),
+                },
+            ))
+
     async def emit_completed(
         self,
         *,
@@ -357,30 +412,32 @@ class ExternalPluginService:
         event_id: str | None = None,
     ) -> bool:
         """Stable per-attempt event ID; repeated calls may redeliver the same event."""
-        if not plugin.enabled or "events" not in _as_list(plugin.granted_capabilities):
+        if not _subscribes_to_completed(plugin):
             return False
-        if "turn.completed" not in _as_list(plugin.events):
-            return False
-        from ling.capabilities.external_plugin_contract import API_VERSION, PluginEvent
-
-        event = PluginEvent(
-            api_version=API_VERSION,
-            event_id=event_id or f"evt_turn_completed_{turn_id}_{attempt}_{plugin.id}",
-            type="turn.completed",
-            occurred_at=datetime.now(UTC).isoformat(),
-            data={
-                "turn_id": turn_id,
-                "window_id": window_id,
-                "subject_id": subject_id,
-                "attempt": attempt,
-            },
+        event = _completed_event(
+            plugin.id, turn_id, window_id, subject_id, attempt, event_id=event_id
         )
-        try:
-            return await self._client.emit_event(endpoint=plugin.endpoint, event=event)
-        except Exception as exc:  # noqa: BLE001 - event delivery is never on the chat critical path
-            import logging
-            logging.getLogger("ling.plugins").warning("event emit failed: %r", exc)
-            return False
+        return await self._client.emit_event(endpoint=plugin.endpoint, event=event)
+
+
+async def deliver_completed_event(payload: dict[str, Any]) -> None:
+    from ling.domains.memory.purge import claim_still_valid
+
+    if payload.get("purged"):
+        return
+    async with short_session_scope() as session:
+        plugin = await session.get(ExternalPluginRow, payload["plugin_id"])
+        if (
+            plugin is None
+            or plugin.updated_at != datetime.fromisoformat(payload["registration_updated_at"])
+            or not _subscribes_to_completed(plugin)
+            or not await claim_still_valid(session)
+        ):
+            return
+        endpoint = plugin.endpoint
+    event = PluginEvent.model_validate(payload["event"])
+    if not await PluginClient().emit_event(endpoint=endpoint, event=event):
+        raise PluginServiceError("插件事件未收到 2xx 确认")
 
 
 __all__ = [
