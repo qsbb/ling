@@ -34,10 +34,7 @@ async def main() -> None:
                     hist = [(1, "user", OLD, None), (2, "actor", "好", None)] if a else [
                         (1, "user", "今天天气不错", None)
                     ]
-                    if b:
-                        text = "上次说的那个产品方案，整理好了吗"
-                    else:
-                        text = "早上好"
+                    text = "上次说的那个产品方案，整理好了吗" if b else "早上好"
                     if c:
                         text = f"[quote D-1 21:30 对方：{OLD}] " + text
                     rec = await run_case(case=name, user_text=text, history=hist, is_group=False)

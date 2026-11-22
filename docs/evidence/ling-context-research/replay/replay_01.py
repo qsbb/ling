@@ -16,13 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from ling.contracts.v1 import TurnState
-from ling.infra.models import Base, Message, Persona, Subject, Window, WindowContext
+from ling.infra.models import Base, Message, Persona, Subject, Window
 from ling.kernel.context import CompiledContext, ContextCompiler
 
 BASE_URL = os.environ.get(
@@ -71,7 +70,7 @@ async def seed(
         connector_window_ref=f"replay:private:{window_id}",
     ))
     await s.flush()  # 确保 Window 先入库，messages 的 FK 才满足
-    for seq, role, text, sender in history:
+    for seq, role, text, _sender in history:
         s.add(Message(
             id=f"{window_id}_m{seq}", window_id=window_id,
             role=role, text=text, state=TurnState.completed.value, sequence=seq,
