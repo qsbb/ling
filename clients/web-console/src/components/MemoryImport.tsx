@@ -73,28 +73,33 @@ export function skipEntries(
 /**
  * 零可导入时说"为什么会这样"。
  *
- * 只描述**最多的那个原因**：一条一条列出来是给"为什么少了几条"用的；
- * 这里一条都导不进来，用户要的是"我该去改什么"。返回 null 表示没有跳过
- * 原因（例如文件里本来就没有记录），由调用方给通用说法。
+ * 一条都导不进来往往不止一个原因，所以这里先分**形状**再谈原因：
+ *
+ * - 只有重复：文件本身就是导过的那一批，去记忆库看即可；
+ * - 重复 + 跳过：两种事实都要说。只提重复等于告诉用户"没问题"，
+ *   而实际还有记录被跳过了；只提跳过又让人以为白导过一遍。
+ *
+ * 只有"纯跳过"才落到"最多的那个原因"——那时用户要的就是"我该去改什么"。
  */
 export function zeroAcceptedHint(
-  preview: Pick<MemoryImportPreview, 'skip_reasons' | 'total' | 'duplicates'>,
+  preview: Pick<MemoryImportPreview, 'skip_reasons' | 'total' | 'duplicates' | 'skipped'>,
 ): { headline: string; next: string } {
   const entries = skipEntries(preview.skip_reasons).sort((a, b) => b.count - a.count);
   const dominant = entries[0];
-  /*
-   * 重复与跳过是两类不同的"零"：跳过要人回去改文件，重复只要去记忆库看。
-   * 所以先比数量再看原因——大档案重复预览时 both 都上万，只说跳过会让人
-   * 白折腾一遍导出脚本。
-   */
-  if (preview.duplicates > 0 && preview.duplicates >= (dominant?.count ?? 0)) {
+  if (preview.duplicates > 0 && preview.skipped > 0) {
+    const reasons = entries.map((entry) => entry.label).join('、');
+    return {
+      headline: '一部分已经导入过，另一部分被跳过',
+      next: `重复 ${preview.duplicates} 条已经导入过；跳过的 ${preview.skipped} 条里${reasons ? `有${reasons}，` : ''}原因见「重复与跳过」。`,
+    };
+  }
+  if (preview.duplicates > 0) {
     return {
       headline: '这些记忆都已经导入过了',
       next: '直接去记忆库看即可，不需要再导一次。',
     };
   }
   if (!dominant) {
-    // 到这里 duplicates 必为 0：重复占主导的情况已在上面返回。
     return {
       headline: '这份文件里没有可导入的记忆',
       next: '确认导出脚本用的是本人的 QQ 和旧 Bot 的 QQ，再重新导出一份迁移文件。',
@@ -126,9 +131,7 @@ export function zeroAcceptedHint(
   }
   return {
     headline: '这批记录都不满足导入条件',
-    next: preview.duplicates > 0
-      ? `已经导入过的 ${preview.duplicates} 条会跳过，其余记录看折叠里的原因。`
-      : '重新导出迁移文件，或换一份文件再试。',
+    next: '重新导出迁移文件，或换一份文件再试。',
   };
 }
 

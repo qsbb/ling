@@ -7,6 +7,7 @@
  * 全部 /v1 请求由 route 拦截，未知路由一律 404 —— 任何未声明的调用都不会
  * 悄悄落到真实后端。
  */
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -107,7 +108,9 @@ async function open(options: MockOptions = {}) {
   const page = await context.newPage();
   page.setDefaultTimeout(WAIT);
   const reads: URL[] = [];
-  const imports: { path: string; contentType: string | null; token: string | null; bytes: number }[] = [];
+  const imports: {
+    path: string; contentType: string | null; token: string | null; bytes: number; digest: string;
+  }[] = [];
 
   await context.route('**/v1/**', async (route) => {
     const request = route.request();
@@ -120,6 +123,11 @@ async function open(options: MockOptions = {}) {
         contentType: request.headers()['content-type'] ?? null,
         token: request.headers()['x-ling-import-token'] ?? null,
         bytes: body?.length ?? 0,
+        /*
+         * 摘要而非"字节数相同"：两次请求同样大小、内容不同也算不同文件。
+         * 有了它，"重试发的是同一份 File"才是一条真断言。
+         */
+        digest: body ? createHash('sha256').update(body).digest('hex') : '',
       });
       if (path.endsWith('/preview')) {
         if (options.previewError) {
@@ -292,9 +300,34 @@ describe('导入旧记忆', () => {
     expect(await page.getByTestId('import-retained-meta').innerText()).toContain(SIZE_TEXT);
     const retry = page.getByRole('button', { name: '再试一次' });
     expect(await retry.isEnabled()).toBe(true);
+
+    /*
+     * 等的是**浏览器真正发出的第二个请求**，不是"过一会儿再看数组长度"。
+     *
+     * 原来的写法用 `expect.poll(() => imports.length)`：默认只等 1 秒，而全量
+     * 并发时第二次要重发 33 MiB，一秒内到不了服务端，于是"单跑通过、组合失败"。
+     * 这类失败说明的是测量窗口，不是重试没发出去；所以换成事件等待，
+     * 并且**保留"第二次确实发了同一份文件"这条断言**——它是这条用例的重点。
+     */
+    const secondRequest = page.waitForRequest(
+      (request) => request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/preview'),
+      { timeout: WAIT },
+    );
     await retry.click();
-    await expect.poll(() => imports.length).toBe(2);
-    expect(imports[1]?.bytes).toBe(LARGE_FILE.buffer.length);
+    const sent = await secondRequest;
+
+    // 第二次请求体与已选文件逐字节相同（摘要比对，不是"大小相同"）
+    const body = sent.postDataBuffer();
+    expect(body?.length).toBe(LARGE_FILE.buffer.length);
+    expect(createHash('sha256').update(body ?? Buffer.alloc(0)).digest('hex')).toBe(
+      createHash('sha256').update(LARGE_FILE.buffer).digest('hex'),
+    );
+    // mock 侧也收到了两次预览，且两次摘要一致
+    await expect.poll(() => imports.filter((call) => call.path.endsWith('/preview')).length, { timeout: WAIT }).toBe(2);
+    const previews = imports.filter((call) => call.path.endsWith('/preview'));
+    expect(previews[0]?.digest).toBe(previews[1]?.digest);
+    expect(previews[1]?.bytes).toBe(LARGE_FILE.buffer.length);
+    expect(previews[1]?.contentType).toBe('application/x-ndjson');
   }, CASE_TIMEOUT);
 
   it('C1：重复与跳过放在次一级；D1：零条时没有确认按钮并给出下一步', async () => {
@@ -624,45 +657,66 @@ describe('导入旧记忆', () => {
    * 两种输入在「可导入 0」这点上结果相同，只有"下一步做什么"能区分它们，
    * 所以这里断言的是 headline 文本，而不是条数。
    */
-  it('零可导入时区分"都已经导入过"和"文件不满足条件"', async () => {
-    const both = [
+  /*
+   * 零可导入时，重复与跳过是两类必须分别陈述的事实。
+   *
+   * 这里的四组输入刻意让「可导入 0」在所有情况下都成立——那样只有文案能区分
+   * 实现好坏。第一组与第二组的差别**只在于有无跳过**，正是被推翻的那种实现
+   * （按数量比大小）会把它们混为一谈的地方。
+   */
+  it('零可导入时分别陈述重复与跳过，不把混合结果说成"都已经导入过"', async () => {
+    const cases = [
       {
-        name: '重复更多',
+        name: '纯重复',
+        body: {
+          total: 2, accepted: 0, duplicates: 2, skipped: 0,
+          skip_reasons: {}, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '这些记忆都已经导入过了',
+        expectBody: ['直接去记忆库看即可'],
+        notHeadline: ['跳过', '不满足导入条件'],
+      },
+      {
+        // 验收反例原文：duplicates=2、skipped=3、{invalid_record:2, retention_expired:1}
+        name: '混合：重复与跳过打平',
+        body: {
+          total: 5, accepted: 0, duplicates: 2, skipped: 3,
+          skip_reasons: { invalid_record: 2, retention_expired: 1 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '一部分已经导入过，另一部分被跳过',
+        expectBody: ['重复 2 条', '跳过的 3 条', '记录格式不完整', '已超过 Ling 的保留期'],
+        notHeadline: ['都已经导入过了', '直接去记忆库看即可'],
+      },
+      {
+        name: '混合：重复占多数',
         body: {
           total: 12_006, accepted: 0, duplicates: 12_000, skipped: 6,
           skip_reasons: { invalid_record: 6 }, confirmation_token: null, expires_at: null, sample: [],
         },
-        expectHeadline: '这些记忆都已经导入过了',
-        notHeadline: '不满足导入条件',
+        expectHeadline: '一部分已经导入过，另一部分被跳过',
+        expectBody: ['重复 12000 条', '跳过的 6 条'],
+        notHeadline: ['都已经导入过了'],
       },
       {
-        name: '跳过更多',
+        name: '纯跳过',
         body: {
-          total: 12_006, accepted: 0, duplicates: 6, skipped: 12_000,
+          total: 12_000, accepted: 0, duplicates: 0, skipped: 12_000,
           skip_reasons: { outside_private_pair: 12_000 }, confirmation_token: null, expires_at: null, sample: [],
         },
         expectHeadline: '不属于你与这个旧 Bot 的私聊',
-        notHeadline: '都已经导入过了',
-      },
-      {
-        // 大档案重复预览的形态：重复上万、但也有大量无效行。
-        // 这时不能说"这批都不满足条件"就让人回去重导——已经导入的要讲清楚。
-        name: '重复与无效行并存',
-        body: {
-          total: 8_059_277, accepted: 0, duplicates: 12_000, skipped: 8_047_277,
-          skip_reasons: { invalid_record: 8_047_277 }, confirmation_token: null, expires_at: null, sample: [],
-        },
-        expectHeadline: '已经导入过的 12000 条会跳过',
-        notHeadline: '重新导出迁移文件',
+        expectBody: [],
+        notHeadline: ['都已经导入过了', '一部分已经导入过'],
       },
     ];
-    for (const item of both) {
+    for (const item of cases) {
       const { page } = await open({ memories: [], previewBody: item.body });
       await previewFile(page);
       const zero = await page.getByTestId('import-zero').innerText();
       expect(zero, item.name).toContain(item.expectHeadline);
-      expect(zero, item.name).not.toContain(item.notHeadline);
-      expect(await page.getByTestId('import-confirm').count()).toBe(0);
+      for (const text of item.expectBody) expect(zero, item.name).toContain(text);
+      for (const text of item.notHeadline) expect(zero, item.name).not.toContain(text);
+      // 零可导入时没有确认按钮：这条对四组输入都成立，配对正向断言防止空集通过
+      expect(await page.getByTestId('import-confirm').count(), item.name).toBe(0);
     }
   }, CASE_TIMEOUT);
 
