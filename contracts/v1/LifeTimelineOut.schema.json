@@ -120,7 +120,7 @@
     },
     "LifeTimelineFact": {
       "additionalProperties": false,
-      "description": "已发生的活动进程（**不是**计划段）。\n\n``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明\"时间到了\"，\n不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。\n``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。",
+      "description": "已发生的活动进程（**不是**计划段）。\n\n``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明\"时间到了\"，\n不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。\n``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。\n``kind`` 是活动自身的类型。",
       "properties": {
         "activity_id": {
           "maxLength": 128,
@@ -144,6 +144,18 @@
         "evidence_kind": {
           "title": "Evidence Kind",
           "type": "string"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kind"
         },
         "origin": {
           "title": "Origin",

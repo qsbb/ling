@@ -609,6 +609,7 @@ async def _load_facts(
         facts.append(
             LifeTimelineFact(
                 activity_id=row.id,
+                kind=row.kind,
                 state=str(row.state),
                 origin=str(row.origin),
                 evidence_kind=activity_evidence_kind(row).value,

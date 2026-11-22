@@ -98,6 +98,8 @@ async def test_facts_only_span_days_when_an_interval_or_live_scene_supports_it(
     assert set(await facts(previous)) == {"ends_at_midnight", "crosses_midnight"}
     today = await facts(DAY)
     assert set(today) == {"crosses_midnight", "today_check"}
+    assert today["crosses_midnight"]["kind"] == "rest"
+    assert today["today_check"]["kind"] == "check"
     assert today["today_check"]["evidence_kind"] == "clock_only"
     assert today["crosses_midnight"]["evidence_kind"] == "observed"
 

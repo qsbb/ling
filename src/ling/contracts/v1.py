@@ -1114,10 +1114,12 @@ class LifeTimelineFact(StrictModel):
     ``evidence_kind`` 是完成证据的种类：``clock_only`` 只证明"时间到了"，
     不能当成她做过；``observed`` / ``user_confirmed`` 才是事实。
     ``scene_valid_until`` 只在情景提交仍有效时给出（过期即 unknown）。
+    ``kind`` 是活动自身的类型。
     """
 
     schema_version: Literal["v1"] = SCHEMA_VERSION
     activity_id: IdStr
+    kind: str | None = None
     state: str
     origin: str
     evidence_kind: str
