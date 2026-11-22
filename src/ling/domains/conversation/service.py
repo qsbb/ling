@@ -644,6 +644,7 @@ class ConversationService:
             display_name=window.display_name_override or display_name,
             channel=channel,
             peer_id=peer_id,
+            group_reply_max_parts=window.group_reply_max_parts,
             pinned=getattr(window, "pinned_at", None) is not None,
             familiarity=familiarity,
         )

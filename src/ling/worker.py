@@ -2594,7 +2594,7 @@ async def _reply_in_group_window(  # noqa: ANN001
         return False, "窗口缺少平台标识（window_ref），无法投递"
 
     from ling.capabilities.chunking import PART_DELAY_SECONDS, plan_parts
-    from ling.capabilities.delivery import DeliveryService
+    from ling.capabilities.delivery import DeliveryService, group_reply_budget
     from ling.capabilities.expression_choice import parse_speak_choice
     from ling.ports.channel import OutboundMessage
 
@@ -2635,10 +2635,12 @@ async def _reply_in_group_window(  # noqa: ANN001
     # 逐字节相同（`parse_speak_choice` 只在匹配到起始控制区时才改它），所以
     # 纯文字路径的分段结果与接线前完全一致。
     body = speak_choice.text if speak_choice.speak else reply_text
+    budget = group_reply_budget(connector, window_ref, window.group_reply_max_parts)
     parts = plan_parts(
         body,
         is_group=is_group,
         max_part_chars=limit,
+        max_group_parts=budget,
         legacy_group_plan=speech is not None,
     )
     if not parts:
@@ -2647,7 +2649,8 @@ async def _reply_in_group_window(  # noqa: ANN001
     service = DeliveryService(session)
     plan_id = f"plan_{new_id('attn')}"
     sent = 0
-    for index, part in enumerate(parts, 1):
+    sendable = parts[:budget] if is_group and speech is None else parts
+    for index, part in enumerate(sendable, 1):
         if index > 1:
             # 上一段已经拿到回执才走到这里。停顿只是节奏，不是回执。
             await asyncio.sleep(PART_DELAY_SECONDS)
@@ -2706,7 +2709,9 @@ async def _reply_in_group_window(  # noqa: ANN001
         if not outcome.delivered:
             return False, f"投递失败：{outcome.detail or str(outcome.state)}"
         sent += 1
-    return (sent == len(parts)), ""
+    if sent < len(parts):
+        return False, f"达到群聊回复条数上限，已发 {sent}/{len(parts)} 段"
+    return True, ""
 
 
 @dataclass(frozen=True)

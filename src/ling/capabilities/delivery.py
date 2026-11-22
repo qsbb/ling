@@ -15,7 +15,12 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.contracts.v1 import DeliveryState, ErrorCode, OperationState
+from ling.contracts.v1 import (
+    DEFAULT_GROUP_REPLY_MAX_PARTS,
+    DeliveryState,
+    ErrorCode,
+    OperationState,
+)
 from ling.infra.models import DeliveryReceiptRow, IdempotencyKey, Operation, utcnow
 from ling.infra.security import new_id
 from ling.ports.channel import (
@@ -38,6 +43,14 @@ from ling.ports.channel import (
 # 否则重投会拿到一个新的 plan_id，幂等直接失效——那正是"重投必然重发第 1 段"
 # 的根因（原实现的 plan_id 是 `plan_{uuid4()}`）。
 PART_SCOPE = "delivery_part"
+
+
+def group_reply_budget(connector: ChannelConnector, window_ref: str, maximum: int | None) -> int:
+    budget = maximum if maximum is not None else DEFAULT_GROUP_REPLY_MAX_PARTS
+    remaining = getattr(connector, "remaining_group_replies", None)
+    if callable(remaining) and (available := remaining(window_ref)) is not None:
+        return max(1, min(budget, available))
+    return budget
 
 # 对账状态机的工程初值（依据 docs/OUTBOUND-DELIVERY-RESEARCH.md §5 P0-2）。
 # **都没有经过真实 NapCat 长跑验证**，需要按线上观察调整。
@@ -88,7 +101,7 @@ class DeliveryService:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def uses_legacy_group_plan(self, plan_id: str) -> bool:
+    async def original_group_plan(self, plan_id: str) -> tuple[bool, int | None]:
         """Already claimed group replies keep the text previously assigned to each ordinal."""
         first = (await self._session.execute(
             select(Operation.payload)
@@ -96,7 +109,12 @@ class DeliveryService:
             .outerjoin(Operation, Operation.id == IdempotencyKey.result_ref)
             .where(IdempotencyKey.scope == PART_SCOPE, IdempotencyKey.key == f"{plan_id}:1")
         )).one_or_none()
-        return first is not None and not (first[0] or {}).get("group_paragraphs", False)
+        if first is None:
+            return False, None
+        payload = first[0] or {}
+        if not payload.get("group_paragraphs"):
+            return True, None
+        return False, payload.get("group_max_parts")
 
     async def create_operation(
         self,

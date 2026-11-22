@@ -248,6 +248,7 @@ class Window(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(128), default="新的对话")
     display_name_override: Mapped[str | None] = mapped_column(String(60), nullable=True)
     manual_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    group_reply_max_parts: Mapped[int | None] = mapped_column(Integer, nullable=True)
     channel: Mapped[str] = mapped_column(String(32), default="web")
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
     connector_window_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)

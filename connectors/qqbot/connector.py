@@ -386,6 +386,16 @@ class QQBotConnector(ChannelConnector):
 
     # ---------------------------------------------------- 被动回复窗口
 
+    def remaining_group_replies(self, window_ref: str) -> int | None:
+        """Number of replies remaining in the current group window, if known."""
+        window = self._passive.get(window_ref)
+        if self._config.supports_proactive or window is None or not window.is_group:
+            return None
+        ttl, maximum = self._config.passive_quota(is_group=True)
+        if self._now() - window.opened_at > ttl:
+            return None
+        return max(0, maximum - window.used)
+
     def _take_passive(
         self, window_ref: str, reply_to: str | None
     ) -> tuple[str, int] | None:

@@ -424,10 +424,58 @@ function WindowAllowlist({ target }: { target: AccessTarget }) {
   );
 }
 
-export function WindowPolicy({ sessionId, onClose, accessTarget }: {
+const DEFAULT_GROUP_REPLY_LIMIT = 10;
+
+function GroupReplyLimit({ sessionId, initial, onSaved }: {
+  sessionId: string;
+  initial: number | null;
+  onSaved?: () => void;
+}) {
+  const [current, setCurrent] = useState(initial);
+  const [selected, setSelected] = useState(initial);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function save() {
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api.setGroupReplyLimit(sessionId, selected);
+      setSelected(result.max_parts);
+      setCurrent(result.max_parts);
+      onSaved?.();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="window-policy__access">
+      <div className="window-policy__reply-limit">
+        <label htmlFor="group-reply-limit">每轮回复条数上限</label>
+        <select id="group-reply-limit" value={selected ?? ''} disabled={busy}
+          onChange={(event) => setSelected(event.target.value ? Number(event.target.value) : null)}>
+          <option value="">默认（{DEFAULT_GROUP_REPLY_LIMIT} 条）</option>
+          {Array.from({ length: DEFAULT_GROUP_REPLY_LIMIT }, (_, index) => index + 1).map((value) => (
+            <option key={value} value={value}>{value} 条</option>
+          ))}
+        </select>
+        <button type="button" className="button button--small" disabled={busy || selected === current}
+          onClick={() => void save()}>保存</button>
+      </div>
+      {error ? <p role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
+export function WindowPolicy({ sessionId, onClose, accessTarget, groupReplyLimit, onGroupReplyLimitSaved }: {
   sessionId: string;
   onClose: () => void;
   accessTarget?: AccessTarget;
+  groupReplyLimit?: number | null;
+  onGroupReplyLimitSaved?: () => void;
 }) {
   const [policy, setPolicy] = useState<WindowDialoguePolicy | null>(null);
   const [selections, setSelections] = useState(EMPTY_SELECTIONS);
@@ -512,6 +560,9 @@ export function WindowPolicy({ sessionId, onClose, accessTarget }: {
         <button type="button" className="ghost-button" onClick={onClose}>关闭</button>
       </div>
       {accessTarget ? <WindowAllowlist key={`${accessTarget.kind}:${accessTarget.id}`} target={accessTarget} /> : null}
+      {groupReplyLimit !== undefined
+        ? <GroupReplyLimit sessionId={sessionId} initial={groupReplyLimit} onSaved={onGroupReplyLimitSaved} />
+        : null}
       {policy ? (
         <>
           <div aria-label="对话规则">

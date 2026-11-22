@@ -48,6 +48,18 @@
       "default": null,
       "title": "Familiarity"
     },
+    "group_reply_max_parts": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Group Reply Max Parts"
+    },
     "message_count": {
       "default": 0,
       "minimum": 0,

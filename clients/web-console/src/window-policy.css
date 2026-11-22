@@ -32,6 +32,18 @@
   color: var(--text-muted, #766e61);
 }
 
+.window-policy__reply-limit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.window-policy .window-policy__reply-limit select {
+  width: auto;
+  max-width: 100%;
+}
+
 .window-policy select {
   width: min(100%, 24rem);
   padding: 0.5rem;

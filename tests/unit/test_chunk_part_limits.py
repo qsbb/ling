@@ -30,6 +30,7 @@ import pytest
 
 from ling.capabilities.chunking import (
     DEFAULT_PART_LIMIT_CHARS,
+    MAX_PARTS_GROUP,
     MAX_PARTS_PRIVATE,
     MAX_SEGMENT_CHARS,
     plan_parts,
@@ -205,7 +206,7 @@ def test_single_oversized_code_block_is_cut_not_dropped() -> None:
 def test_group_semantic_parts_are_bounded_and_preserve_text() -> None:
     normal = _long_reply(600)
     parts = plan_parts(normal, is_group=True, max_part_chars=QQBOT_MAX_TEXT_LENGTH)
-    assert 1 < len(parts) <= 3
+    assert 1 < len(parts) <= MAX_PARTS_GROUP
     assert "".join(parts) == normal
 
     oversized = _long_reply(6000)
@@ -225,7 +226,7 @@ def test_group_paragraphs_keep_protected_text_and_link_paths() -> None:
 
 def test_group_extra_paragraphs_keep_readable_separators() -> None:
     items = ["嗯", "之后确认一下", "还有个细节", "差不多了", "先这样"]
-    parts = plan_parts("\n\n".join(items), is_group=True)
+    parts = plan_parts("\n\n".join(items), is_group=True, max_group_parts=3)
     assert len(parts) == 3
     assert "\n\n".join(parts) == "\n\n".join(items)
 
@@ -246,7 +247,13 @@ def test_group_keeps_code_whole_when_it_needs_an_extra_part() -> None:
     paragraphs = ["甲" * 1400, code, "丙" * 1700, "丁" * 1000]
     parts = plan_parts(
         "\n\n".join(paragraphs), is_group=True, max_part_chars=ONEBOT_MAX_TEXT_LENGTH,
+        max_group_parts=3,
     )
     assert any(code in part for part in parts)
     assert all(len(part) <= ONEBOT_MAX_TEXT_LENGTH for part in parts)
     assert "\n\n".join(parts) == "\n\n".join(paragraphs)
+
+
+def test_group_default_allows_ten_separate_short_paragraphs() -> None:
+    paragraphs = [f"第 {index} 段。" for index in range(10)]
+    assert plan_parts("\n".join(paragraphs), is_group=True) == paragraphs

@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import re
+from collections import deque
+
+from ling.contracts.v1 import DEFAULT_GROUP_REPLY_MAX_PARTS
 
 # 目标段长。太短会碎，太长一次说完又显压迫。
 DEFAULT_TARGET_CHARS = 90
@@ -44,7 +47,7 @@ _CODE_FENCE = re.compile(r"```.*?```", re.S)
 # 行内代码与中英文引号
 _INLINE_PROTECTED = re.compile(r"`[^`\n]+`|「[^」]*」|『[^』]*』|\"[^\"]{2,}\"")
 _GROUP_INLINE_PROTECTED = re.compile(
-    _INLINE_PROTECTED.pattern + r"""|“[^”]*”|‘[^’]*’|https?://[^\s\\<>()\[\]`"'“”‘’，。！？；、]+"""
+    _INLINE_PROTECTED.pattern + r"""|“[^”]*”|‘[^’]*’|https?://[^\s\\<>`"'“”‘’「」『』，。！？；、]+"""
 )
 _GROUP_BREAK = re.compile(r"(?:\\n){2,}|(?:/n){2,}")
 
@@ -58,6 +61,17 @@ def _split_protected(
     它们原样作为一个整体进出。
     """
     spans: list[tuple[int, int]] = [m.span() for m in _CODE_FENCE.finditer(text)]
+    if inline_protected is _GROUP_INLINE_PROTECTED:
+        # Scan plain ranges separately so a quote in a fence cannot consume a later quote.
+        bounds = [(0, 0), *spans, (len(text), len(text))]
+        spans.extend(
+            match.span()
+            for (_, start), (end, _) in zip(bounds, bounds[1:], strict=False)
+            for match in inline_protected.finditer(text, start, end)
+        )
+        spans.sort()
+        return _split_at_spans(text, spans)
+
     # 行内受保护只在代码块之外找
     covered = [False] * len(text)
     for start, end in spans:
@@ -68,8 +82,10 @@ def _split_protected(
             continue
         spans.append(m.span())
     spans.sort()
-    if not spans:
-        return [(text, False)]
+    return _split_at_spans(text, spans)
+
+
+def _split_at_spans(text: str, spans: list[tuple[int, int]]) -> list[tuple[str, bool]]:
     out: list[tuple[str, bool]] = []
     cursor = 0
     for start, end in spans:
@@ -142,7 +158,7 @@ def split_semantic(
 
 # 一轮回复的常规段数。群聊频率限制另按回复轮次计算。
 MAX_PARTS_PRIVATE = 5
-MAX_PARTS_GROUP = 3
+MAX_PARTS_GROUP = DEFAULT_GROUP_REPLY_MAX_PARTS
 
 # 两段之间的停顿（秒）。**这是模拟的节奏，不是真实回执**，
 # 所以它绝不写进 delivery 回执，只影响调度。
@@ -217,6 +233,34 @@ def _cut_oversize(unit: str, limit: int) -> list[str]:
     if rest:
         pieces.append(rest)
     return pieces
+
+
+def _compact_group_parts(text: str, limit: int, max_parts: int) -> list[str]:
+    """Fill messages to capacity while keeping links, quotes and code blocks together."""
+    protected: deque[tuple[int, int]] = deque()
+    offset = 0
+    for piece, keep in _split_protected(text, _GROUP_INLINE_PROTECTED):
+        end = offset + len(piece)
+        if keep and len(piece) <= limit:
+            protected.append((offset, end))
+        offset = end
+
+    parts = []
+    start = 0
+    while len(text) - start > limit:
+        end = start + limit
+        while protected and protected[0][1] <= end:
+            protected.popleft()
+        if protected and protected[0][0] < end:
+            end = protected[0][0]
+        parts.append(text[start:end])
+        start = end
+    parts.append(text[start:])
+
+    if len(parts) > max_parts and len(text) <= max_parts * limit:
+        # The available replies fit the content if a protected span has to cross a boundary.
+        return [text[start : start + limit] for start in range(0, len(text), limit)]
+    return parts
 
 
 def _pack_units(
@@ -297,12 +341,13 @@ def plan_parts(
     *,
     is_group: bool,
     max_part_chars: int | None = None,
+    max_group_parts: int = MAX_PARTS_GROUP,
     legacy_group_plan: bool = False,
 ) -> list[str]:
     """把一条完整回复规划成若干待发段。
 
     规则：
-    - 正常长度按语义或换行分段，群最多 3 段，私聊最多 5 段
+    - 正常长度按语义或换行分段，群默认最多 10 段，私聊最多 5 段
     - **每段 <= 渠道硬上限 ``max_part_chars``**——超过就发不出去，
       不是"整条被拒"就是"尾段丢失"，两种都不能接受
     - **各段保留正文**，分隔符和边缘空白可随发送边界调整
@@ -339,22 +384,28 @@ def plan_parts(
     else:
         units = _newline_units(text)
     segments: list[str] = []
+    group_segment_limit = min(MAX_SEGMENT_CHARS, limit)
     if len(units) > 1 and is_group:
         for unit in units:
             body = unit.rstrip("\r\n")
             if len(body) <= limit:
                 segments.append(unit)
             else:
-                split = split_semantic(body, inline_protected=_GROUP_INLINE_PROTECTED)
+                split = split_semantic(
+                    body, max_chars=group_segment_limit, inline_protected=_GROUP_INLINE_PROTECTED,
+                )
                 split[-1] += unit[len(body):]
                 segments.extend(split)
     elif len(units) > 1:
         for unit in units:
             # 单行过长时再走语义切分（受保护片段整块进，不拆）
             segments.extend(split_semantic(unit) if len(unit) > MAX_SEGMENT_CHARS else [unit])
+    elif is_group:
+        segments = split_semantic(
+            text, max_chars=group_segment_limit, inline_protected=_GROUP_INLINE_PROTECTED,
+        )
     else:
-        pattern = _GROUP_INLINE_PROTECTED if is_group else _INLINE_PROTECTED
-        segments = split_semantic(text, inline_protected=pattern)
+        segments = split_semantic(text)
     if len(segments) <= 1 and (not is_group or len(text) <= limit):
         return [text] if len(text) <= limit else _cut_oversize(text, limit)
 
@@ -365,13 +416,15 @@ def plan_parts(
         pieces.extend(_cut_oversize(body, limit))
         pieces.extend(_cut_oversize(segment[len(body):], limit))
 
-    max_parts = MAX_PARTS_GROUP if is_group else MAX_PARTS_PRIVATE
+    max_parts = max_group_parts if is_group else MAX_PARTS_PRIVATE
     if is_group and len(pieces) <= max_parts:
         parts = pieces
     else:
         parts = _pack_units(
             pieces, limit=limit, max_parts=max_parts, preserve_boundaries=is_group,
         )
+    if is_group and len(parts) > max_parts:
+        parts = _compact_group_parts(text, limit, max_parts)
 
     # 可机械验证的约束：**内容不能丢**。
     #
@@ -385,7 +438,10 @@ def plan_parts(
         return re.sub(r"\s+", "", value)
 
     if _squash("".join(parts)) != _squash(text):
-        return _cut_oversize(text, limit)
+        return (
+            _compact_group_parts(text, limit, max_group_parts)
+            if is_group else _cut_oversize(text, limit)
+        )
     if is_group and len(units) > 1:
         return [part.strip("\r\n") for part in parts if part.strip()]
     return parts

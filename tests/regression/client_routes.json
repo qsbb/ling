@@ -84,6 +84,7 @@
     "sendTurn": "POST /v1/sessions/{session_id}/turns",
     "setConnectorInstanceEnabled": "PUT /v1/settings/connectors/{scope}/instances/{instance_id}/enabled",
     "setConsent": "PUT /v1/consents",
+    "setGroupReplyLimit": "PUT /v1/sessions/{session_id}/group-reply-limit",
     "setSecret": "PUT /v1/settings/providers/{provider_id}/secret",
     "setTimezone": "PUT /v1/settings/preferences",
     "setVideoMode": "PUT /v1/settings/preferences",

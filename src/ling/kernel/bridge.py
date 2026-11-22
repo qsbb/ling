@@ -1006,6 +1006,7 @@ class InboundBridge:
             expression=turn_result.expression or {},
             # 段级幂等键由本轮 turn 派生（重投复用同一个 turn）
             turn_id=turn.id,
+            group_max_parts=window.group_reply_max_parts,
         )
         delivered = delivery.delivered
         if turn_result.quote_dropped:
@@ -1201,19 +1202,15 @@ class InboundBridge:
         media_note: str | None,
     ) -> BridgeResult:
         """重投时只**续发剩下的段**（已发段由段级幂等跳过）。"""
-        from ling.capabilities.delivery import DeliveryService
         from ling.domains.conversation.service import ConversationService
 
-        legacy_group_plan = is_group and await DeliveryService(self._session).uses_legacy_group_plan(
-            f"plan_{turn.id}"
-        )
         delivery = await self._deliver(
             envelope=envelope,
             text=text,
             subject_id=subject_id,
             expression={},
             turn_id=turn.id,
-            legacy_group_plan=legacy_group_plan,
+            group_max_parts=window.group_reply_max_parts,
         )
         delivered = delivery.delivered
         reason = describe_delivery(delivery)
@@ -1954,6 +1951,7 @@ class InboundBridge:
         # 原实现用的是 `plan_{uuid4()}`，重投必然拿到新 plan_id，幂等直接失效，
         # 那正是"重投必然重发第 1 段"的根因（调研 §5 P0-1）。
         turn_id: str | None = None,
+        group_max_parts: int | None = None,
         legacy_group_plan: bool = False,
     ) -> ReplyDelivery:
         """按顺序投递回复，返回确认的段数及是否仍有待确认的投递。
@@ -1980,7 +1978,7 @@ class InboundBridge:
         （渠道不可达/平台拒收），而不是"这一段太长"。
         """
         from ling.capabilities.chunking import plan_parts
-        from ling.capabilities.delivery import DeliveryService
+        from ling.capabilities.delivery import DeliveryService, group_reply_budget
         from ling.contracts.v1 import OperationState
         from ling.ports.channel import OutboundMessage
 
@@ -2031,19 +2029,26 @@ class InboundBridge:
         if callable(caps):
             with contextlib.suppress(Exception):
                 limit = int(caps().max_text_length) or None
+
+        # 同一轮重投复用段号和开始投递时的条数上限。
+        plan_id = f"plan_{turn_id}" if turn_id else f"plan_{uuid.uuid4().hex[:16]}"
+        use_plan = turn_id is not None
+        service = DeliveryService(self._session)
+        saved_budget = None
+        if is_group and use_plan and not legacy_group_plan:
+            legacy_group_plan, saved_budget = await service.original_group_plan(plan_id)
+        budget = saved_budget or group_reply_budget(
+            self._connector, envelope.window_ref, group_max_parts,
+        )
         parts = plan_parts(
             text,
             is_group=is_group,
             max_part_chars=limit,
+            max_group_parts=budget,
             legacy_group_plan=legacy_group_plan,
         )
         if not parts:
             return ReplyDelivery(parts_sent=0, parts_total=0)
-
-        # **确定性** plan_id：同一轮重投必须落回同一组段键。
-        plan_id = f"plan_{turn_id}" if turn_id else f"plan_{uuid.uuid4().hex[:16]}"
-        use_plan = turn_id is not None
-        service = DeliveryService(self._session)
 
         # 引用段已经是**核对过的真 id**：`turn._finalize` 用上下文里真的渲染
         # 出来的 `[msg_id:…]` 白名单核过一遍，连接器发之前还会再核一遍
@@ -2054,13 +2059,15 @@ class InboundBridge:
         skipped = 0
         attempted = 0
         uncertain = False
-        for index, part in enumerate(parts, 1):
+        sendable = parts[:budget] if is_group and not legacy_group_plan else parts
+        for index, part in enumerate(sendable, 1):
             part_expression = {} if is_group and index > 1 else (expression or {})
             payload_extra = {
                 "reply_plan": plan_id,
                 "part_ordinal": index,
                 "parts_total": len(parts),
                 "group_paragraphs": is_group and not legacy_group_plan,
+                "group_max_parts": budget if is_group and not legacy_group_plan else None,
             }
             async with gate.lock:
                 # 节奏与令牌桶都在锁内：同一窗口的两个轮次不会交错发送。

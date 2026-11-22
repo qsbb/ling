@@ -9,11 +9,11 @@ import json
 import time
 import uuid
 from dataclasses import replace
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession
@@ -21,6 +21,7 @@ from ling.api.errors import LingError
 from ling.api.guards import OwnerAuth, OwnerWrite
 from ling.audit import audit_event
 from ling.contracts.v1 import (
+    DEFAULT_GROUP_REPLY_MAX_PARTS,
     ErrorCode,
     InstanceDialoguePolicyPreview,
     InstanceDialoguePolicyProposed,
@@ -107,6 +108,10 @@ class PolicyChange(BaseModel):
 
 class PolicyCommit(PolicyChange):
     preview_token: str = Field(min_length=1, max_length=2048)
+
+
+class GroupReplyLimit(BaseModel):
+    max_parts: Annotated[int, Field(strict=True, ge=1, le=DEFAULT_GROUP_REPLY_MAX_PARTS)] | None
 
 
 class OriginBindingChange(BaseModel):
@@ -858,6 +863,25 @@ async def put_origin_binding(
         attributes={"bound": candidate is not None},
     )
     return response
+
+
+@router.put("/sessions/{session_id}/group-reply-limit", response_model=GroupReplyLimit)
+async def set_group_reply_limit(
+    session_id: str, body: GroupReplyLimit, request: Request, auth: OwnerWrite, session: DbSession,
+) -> GroupReplyLimit:
+    window = await policy_window(
+        session, window_id=session_id, subject_id=auth.user.subject_id,
+        actor_id=request.app.state.settings.actor_id, allow_managed_groups=True,
+    )
+    require_active_window(window)
+    if window.visibility != "group_scope":
+        raise LingError(ErrorCode.invalid_request, "请选择群聊会话", status_code=422)
+    await session.execute(
+        update(Window).where(Window.id == window.id)
+        .values(group_reply_max_parts=body.max_parts, updated_at=Window.updated_at)
+    )
+    await session.commit()
+    return body
 
 
 @router.get("/sessions/{session_id}/dialogue-policy", response_model=WindowDialoguePolicyView)

@@ -229,6 +229,31 @@ async function openChat(
 }
 
 describe('Web 会话对话设置', () => {
+  it('保存当前群的分段上限，也可恢复默认', async (ctx) => {
+    if (error) { console.warn(error); ctx.skip(); return; }
+    const { page } = await openChat('owner', 375, 'known', 'onebot', '100200300');
+    const writes: unknown[] = [];
+    await page.route('**/v1/sessions/w/group-reply-limit', (route) => {
+      const body = route.request().postDataJSON();
+      writes.push({ method: route.request().method(), body });
+      return route.fulfill(json(body));
+    });
+    await page.getByRole('button', { name: '会话设置' }).click();
+    const limit = page.getByLabel('每轮回复条数上限');
+    const save = page.getByRole('button', { name: '保存', exact: true });
+    expect(await limit.inputValue()).toBe('');
+    await limit.selectOption('2');
+    await save.click();
+    await expect.poll(() => save.isDisabled()).toBe(true);
+    expect(await limit.inputValue()).toBe('2');
+    await limit.selectOption('');
+    await save.click();
+    await expect.poll(() => writes).toEqual([
+      { method: 'PUT', body: { max_parts: 2 } },
+      { method: 'PUT', body: { max_parts: null } },
+    ]);
+  }, 20000);
+
   it('快捷加入和移除当前群，不覆盖其他群或发送者', async (ctx) => {
     if (error) { console.warn(error); ctx.skip(); return; }
     const { page } = await openChat('owner', 375, 'known', 'onebot', '100200300');

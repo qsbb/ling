@@ -768,6 +768,9 @@ class InstanceDialoguePolicyPreview(StrictModel):
     expires_at: NonnegativeJsonInteger
 
 
+DEFAULT_GROUP_REPLY_MAX_PARTS = 10
+
+
 class SessionRecord(StrictModel):
     """会话窗口的权威记录（不是浏览器缓存）。"""
 
@@ -794,6 +797,7 @@ class SessionRecord(StrictModel):
     channel: str = "web"
     # 平台侧对端 id：群聊是群号、私聊是对方 QQ 号；web 窗口为 ``null``。
     peer_id: str | None = None
+    group_reply_max_parts: int | None = None
     # 是否已置顶。**列表排序的第一关键字**：置顶的永远在最前。
     #
     # 为什么不是 ``pinned_at``：前端只需要"要不要显示图钉"，时间戳是服务端

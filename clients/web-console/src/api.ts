@@ -764,6 +764,11 @@ export const api = {
       ...jsonInit('PATCH', { title }),
     });
   },
+  setGroupReplyLimit(sessionId: string, maxParts: number | null): Promise<{ max_parts: number | null }> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/group-reply-limit`, {
+      ...jsonInit('PUT', { max_parts: maxParts }),
+    });
+  },
   moveSession(sessionId: string, anchorId: string, before: boolean): Promise<void> {
     return request<void>(
       `/v1/sessions/${encodeURIComponent(sessionId)}/move`,

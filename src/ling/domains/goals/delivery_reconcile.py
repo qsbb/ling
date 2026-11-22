@@ -36,10 +36,10 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from ling.capabilities.delivery import DeliveryService, reconcile_due
+from ling.capabilities.delivery import DeliveryService, group_reply_budget, reconcile_due
 from ling.contracts.v1 import OperationState
 from ling.infra.db import session_scope
-from ling.infra.models import Message, Operation
+from ling.infra.models import Message, Operation, Window
 from ling.kernel.visibility import is_group_window_ref
 
 if TYPE_CHECKING:
@@ -155,18 +155,19 @@ async def _due_pending() -> list[tuple[str, str, str, str, str, str | None]]:
     return rows
 
 
-async def _actor_text(turn_id: str) -> str | None:
+async def _actor_reply(turn_id: str) -> tuple[str, int | None] | None:
     """这一轮已经落库的正文（生成超时后由收尾路径写入）。"""
     async with session_scope() as session:
         row = (
             await session.execute(
-                select(Message.text)
+                select(Message.text, Window.group_reply_max_parts)
+                .join(Window, Window.id == Message.window_id)
                 .where(Message.turn_id == turn_id, Message.role == "actor")
                 .order_by(Message.sequence.desc())
                 .limit(1)
             )
-        ).scalar_one_or_none()
-    return str(row) if row else None
+        ).one_or_none()
+    return (row.text, row.group_reply_max_parts) if row is not None and row.text else None
 
 
 async def _settle_pending(
@@ -267,8 +268,8 @@ async def reconcile_deliveries(
         subject_id,
     ) in await _due_pending():
         report.pending_scanned += 1
-        text = await _actor_text(turn_id)
-        if not text:
+        reply = await _actor_reply(turn_id)
+        if reply is None:
             # 正文还没落库：给收尾一点时间；太久了就放弃（留痕）。
             age = await _pending_age_seconds(operation_id, moment=moment)
             if age >= PENDING_MAX_AGE_SECONDS:
@@ -278,6 +279,7 @@ async def reconcile_deliveries(
                     detail="生成超时后一直没有等到正文落库，放弃续发（未投递）",
                 )
             continue
+        text, group_max_parts = reply
         connector = await _resolve(
             connector_for, channel, connector_for_window, window_ref
         )
@@ -302,15 +304,19 @@ async def reconcile_deliveries(
                 part_limit = int(caps().max_text_length) or None
         plan_id = f"plan_{turn_id}"
         legacy_group_plan = False
+        saved_budget = None
         if is_group:
             async with session_scope() as session:
-                legacy_group_plan = await DeliveryService(session).uses_legacy_group_plan(plan_id)
+                legacy_group_plan, saved_budget = await DeliveryService(session).original_group_plan(plan_id)
+        budget = saved_budget or group_reply_budget(connector, window_ref, group_max_parts)
         parts = plan_parts(
-            text, is_group=is_group, max_part_chars=part_limit, legacy_group_plan=legacy_group_plan,
+            text, is_group=is_group, max_part_chars=part_limit, max_group_parts=budget,
+            legacy_group_plan=legacy_group_plan,
         )
         sent = 0
         ok = bool(parts)
-        for index, part in enumerate(parts, 1):
+        sendable = parts[:budget] if is_group and not legacy_group_plan else parts
+        for index, part in enumerate(sendable, 1):
             try:
                 async with session_scope() as session:
                     outcome = await DeliveryService(session).deliver(
@@ -328,6 +334,7 @@ async def reconcile_deliveries(
                             "part_ordinal": index,
                             "parts_total": len(parts),
                             "group_paragraphs": is_group and not legacy_group_plan,
+                            "group_max_parts": budget if is_group and not legacy_group_plan else None,
                             "source": "delivery.reconcile",
                         },
                         plan_id=plan_id,
@@ -354,6 +361,11 @@ async def reconcile_deliveries(
                 operation_id,
                 ok=True,
                 detail=f"续发成功：{sent}/{len(parts)} 段（段级幂等跳过已发段）",
+            )
+        elif ok and sent < len(parts):
+            await _settle_pending(
+                operation_id, ok=False,
+                detail=f"达到群聊回复条数上限，已发 {sent}/{len(parts)} 段",
             )
         else:
             # 没发全：还年轻就再试一轮（已发段会被跳过）；太久了才放弃，

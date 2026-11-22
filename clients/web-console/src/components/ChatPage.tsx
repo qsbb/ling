@@ -282,6 +282,8 @@ export function ChatPage({
         <div id="active-window-policy" hidden={!policyOpen}>
           {policyMounted ? (
             <WindowPolicy key={session.session_id} sessionId={session.session_id}
+              groupReplyLimit={heading?.kind === 'group' ? session.group_reply_max_parts ?? null : undefined}
+              onGroupReplyLimitSaved={chat.reloadSessions}
               accessTarget={(heading?.kind === 'group' || heading?.kind === 'private') && session.peer_id
                 ? { kind: heading.kind, id: session.peer_id }
                 : undefined} onClose={() => {

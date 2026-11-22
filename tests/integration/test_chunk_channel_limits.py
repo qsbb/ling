@@ -51,6 +51,7 @@ ONE_BOT_CFG = OneBotConfig(
 )
 
 QQBOT_PRIVATE_OPENID = "openid-a7"
+QQBOT_GROUP_OPENID = "group-openid-a7"
 
 
 def _long_reply(chars: int) -> str:
@@ -224,6 +225,36 @@ async def test_onebot_long_reply_every_part_fits_and_all_are_sent(web_env: TestE
         f"有段超过 onebot 上限：{[len(t) for t in handler.texts]}"
     )
     assert _squash("".join(handler.texts)) == _squash(text), "分段丢字了"
+
+
+async def test_qqbot_group_long_reply_fits_the_current_passive_quota(web_env: TestEnv) -> None:
+    handler = _RecordingHandler()
+    connector = _qqbot_connector(handler)
+    connector.normalize_inbound({
+        "id": "evt-a7-group",
+        "op": 0,
+        "t": "GROUP_AT_MESSAGE_CREATE",
+        "d": {
+            "id": "qq-msg-a7-group",
+            "content": "讲一下",
+            "timestamp": datetime.now(UTC).isoformat(),
+            "group_openid": QQBOT_GROUP_OPENID,
+            "author": {"member_openid": QQBOT_PRIVATE_OPENID},
+        },
+    })
+    paragraphs = ["甲" * 500, "乙" * 1020] * 3
+    text = "\n\n".join(paragraphs)
+    window_ref = f"qqbot-a7:group:{QQBOT_GROUP_OPENID}"
+
+    delivered, sent, total = await _deliver_via_bridge(
+        web_env, connector, text=text, window_ref=window_ref,
+    )
+
+    assert delivered is True
+    assert 1 < sent == total == len(handler.texts) <= QQBOT_CFG.passive_max_replies_group
+    assert all(len(part) <= QQBOT_CFG.max_text_length for part in handler.texts)
+    assert _squash("".join(handler.texts)) == _squash(text)
+    assert connector.remaining_group_replies(window_ref) == QQBOT_CFG.passive_max_replies_group - sent
 
 
 async def test_bridge_passes_channel_limit_not_just_fallback(web_env: TestEnv) -> None:

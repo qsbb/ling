@@ -704,13 +704,8 @@ def test_media_reference_upgrade_preserves_legacy_rows_and_accepts_long_values()
 def test_recent_migrations_downgrade_then_upgrade(
     migrated_db: MigratedDatabase,
 ) -> None:
-    migrations = _chain().migrations
-    # Alembic cannot resolve a relative downgrade through a merge revision.
-    (target,) = {
-        ancestor
-        for parent in migrations[migrated_db.head].down_revisions
-        for ancestor in migrations[parent].down_revisions
-    }
+    # Downgrade to a named revision so this also works when head is a merge.
+    target = "0082_live_sessions"
     config = _alembic_config(migrated_db.url)
     with _database_url_env(migrated_db.url):
         try:

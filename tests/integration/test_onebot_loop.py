@@ -1209,6 +1209,69 @@ async def test_group_paragraphs_are_sent_as_separate_messages(
     ] == parts
 
 
+async def test_group_reply_limit_is_saved_applied_per_group_and_can_be_reset(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling.kernel.bridge import WindowSendGate
+
+    async def no_delay(self, *, first):
+        pass
+
+    monkeypatch.setattr(WindowSendGate, "pace", no_delay)
+    fake = FakeOneBot()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    paragraphs = [f"第 {index} 段。" for index in range(10)]
+    stub = _LongReplyRouter(logged_in.app.state.router, long_text="\n\n".join(paragraphs))
+    monkeypatch.setattr(logged_in.app.state, "router", stub)
+
+    async def reply(message_id: int, group: int) -> dict:
+        text = "[CQ:at,qq=10001] 分几段说"
+        response = await _post(logged_in, _event_body(
+            message_id=message_id, message_type="group", group_id=group, sub_type="normal",
+            message=text, raw_message=text,
+        ))
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    default = await reply(501, int(GROUP))
+    assert default["parts_sent"] == 10
+    sessions = (await logged_in.client.get("/v1/sessions")).json()["sessions"]
+    session_id = next(item["session_id"] for item in sessions if item["peer_id"] == GROUP)
+    path = f"/v1/sessions/{session_id}/group-reply-limit"
+    origin = {"Origin": "http://testserver"}
+    invalid = await logged_in.client.put(path, json={"max_parts": 0}, headers=origin)
+    assert invalid.status_code == 422
+    saved = await logged_in.client.put(path, json={"max_parts": 1}, headers=origin)
+    assert saved.status_code == 200, saved.text
+    session = await logged_in.client.get(f"/v1/sessions/{session_id}")
+    assert session.json()["group_reply_max_parts"] == 1
+
+    limited = await reply(502, int(GROUP))
+    assert limited["parts_sent"] == 1
+    assert fake.sent[-1]["body"]["message"] == [{
+        "type": "text", "data": {"text": "\n\n".join(paragraphs)},
+    }]
+    original = stub._long
+    long_text = "甲" * 4200
+    stub._long = long_text
+    sent_before = len(fake.sent)
+    overflow = await reply(505, int(GROUP))
+    stub._long = original
+    assert not overflow["delivered"]
+    assert overflow["parts_total"] > overflow["parts_sent"] == 1
+    assert len(fake.sent) - sent_before == 1
+    async with session_scope() as db:
+        stored = await db.scalar(select(Message.text).where(
+            Message.turn_id == overflow["turn_id"], Message.role == "actor",
+        ))
+    assert stored == long_text
+    assert (await reply(503, int(GROUP) + 1))["parts_sent"] == 10
+    reset = await logged_in.client.put(path, json={"max_parts": None}, headers=origin)
+    assert reset.status_code == 200, reset.text
+    assert (await reply(504, int(GROUP)))["parts_sent"] == 10
+
+
 async def test_part_two_not_sent_when_part_one_fails(
     logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:

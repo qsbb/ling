@@ -7,6 +7,7 @@
       "created_at": "string",
       "display_name": "null",
       "familiarity": "null",
+      "group_reply_max_parts": "null",
       "message_count": "integer",
       "peer_id": "null",
       "pinned": "boolean",
@@ -29,6 +30,7 @@
       "created_at": "string",
       "display_name": "null",
       "familiarity": "null",
+      "group_reply_max_parts": "null",
       "message_count": "integer",
       "peer_id": "null",
       "pinned": "boolean",
@@ -53,6 +55,7 @@
           "created_at": "string",
           "display_name": "null",
           "familiarity": "null",
+          "group_reply_max_parts": "null",
           "message_count": "integer",
           "peer_id": "null",
           "pinned": "boolean",
@@ -79,6 +82,7 @@
           "created_at": "string",
           "display_name": "null",
           "familiarity": "null",
+          "group_reply_max_parts": "null",
           "message_count": "integer",
           "peer_id": "null",
           "pinned": "boolean",
@@ -310,6 +314,7 @@
       "created_at": "string",
       "display_name": "null",
       "familiarity": "null",
+      "group_reply_max_parts": "null",
       "message_count": "integer",
       "peer_id": "null",
       "pinned": "boolean",
@@ -332,6 +337,7 @@
       "created_at": "string",
       "display_name": "null",
       "familiarity": "null",
+      "group_reply_max_parts": "null",
       "message_count": "integer",
       "peer_id": "null",
       "pinned": "boolean",
@@ -344,6 +350,14 @@
     },
     "media_type": "application/json",
     "operation": "PATCH /v1/sessions/{session_id}",
+    "status": 200
+  },
+  "setGroupReplyLimit": {
+    "body": {
+      "max_parts": "integer"
+    },
+    "media_type": "application/json",
+    "operation": "PUT /v1/sessions/{session_id}/group-reply-limit",
     "status": 200
   }
 }

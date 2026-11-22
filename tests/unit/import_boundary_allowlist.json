@@ -14,6 +14,7 @@
   ["domains/conversation/service.py", "<module>", "ling.api.errors.LingError"],
   ["domains/conversation/service.py", "<module>", "ling.api.errors.not_found"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.capabilities.delivery.DeliveryService"],
+  ["domains/goals/delivery_reconcile.py", "<module>", "ling.capabilities.delivery.group_reply_budget"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.capabilities.delivery.reconcile_due"],
   ["domains/goals/delivery_reconcile.py", "<module>", "ling.kernel.visibility.is_group_window_ref"],
   ["domains/goals/delivery_reconcile.py", "reconcile_deliveries", "ling.capabilities.chunking.plan_parts"],

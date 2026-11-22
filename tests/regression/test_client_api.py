@@ -15,7 +15,7 @@ from ling.domains.goals.service import GoalsService
 from ling.domains.speech.asr_runtime import process_job
 from ling.infra.asr_jobs import AsrJob
 from ling.infra.db import session_scope
-from ling.infra.models import MemoryRow, Operation, RelationshipEvent, Turn
+from ling.infra.models import MemoryRow, Operation, RelationshipEvent, Turn, Window
 from ling.kernel.turn import RECALL_PROPOSAL_KIND
 from ling.logging_setup import emit_event
 from tests.integration.conftest import TestEnv, read_sse
@@ -147,6 +147,14 @@ async def test_api_conversation(capture: Capture) -> None:
     )
     await capture.raw("pinSession", path_args=params, json={"pinned": True})
     await capture.raw("listSessions", variant="populated")
+    async with session_scope() as session:
+        group = Window(
+            id="win_sample_group", actor_id=capture.env.settings.actor_id,
+            persona_id=capture.env.settings.persona_id, subject_id=capture.env.subject_id,
+            title="onebot-sample:group:100200300", channel="onebot", visibility="group_scope",
+        )
+        session.add(group)
+    await capture.raw("setGroupReplyLimit", path_args={"session_id": "win_sample_group"}, json={"max_parts": 3})
     await capture.raw("messages", variant="empty", path_args=params)
 
     async with session_scope() as session:
