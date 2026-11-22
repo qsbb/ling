@@ -336,7 +336,7 @@ useEffect(() => {
 
 ### 5.2 ④ 记忆与学习 的实际实现与生效口径
 
-④ 的 memory 段（`GET/PUT /v1/settings/config` 的 `memory`）有 4 个参数。
+④ 的 memory 段通过 `GET /v1/settings/config` 读取，通过草稿和发布接口修改。
 **2026-11 之前它们能存、能发布、能回显，但运行时根本不读**——`MemoryService.__init__`
 支持 `policy=`，所有生产构造点却都是 `MemoryService(session)`，于是永远用代码默认值。
 现在改成下面这样，改任何一条都要同时改本节。
@@ -347,6 +347,7 @@ useEffect(() => {
 | `recency_half_life_days` | 召回排序的「新近度」一路（RRF 的一个排名信号） | 下一轮对话 | 120 |
 | `rerank_top_n` | **只在配置了重排模型时**决定前 N 条送去精排 | 下一轮对话 | 20 |
 | `max_retention_days` | 保留期硬上限：召回过滤 + `memory.archive` 归档 + 写入时盖章 | 立刻对「上限下调」生效；上调只影响之后写入的行 | 3650 |
+| `max_injected_memories` | 每轮自动带入的旧记忆上限，范围为 0 到 12 条。0 关闭自动召回 | 下一轮对话 | 3 |
 
 **生效路径（谁把策略交给谁）**
 

@@ -98,8 +98,9 @@ HISTORY_FETCH_CAP = 2000
 # 于是**这一轮**她看不到前几句在说什么（内容还在，但要等下一轮才进摘要）。
 # 一条消息把整块上下文挤掉，跟"最近一句被丢了"一样糟——宁可把那条截一半。
 _HISTORY_SINGLE_MESSAGE_SHARE = 0.5
-_MAX_AUTOMATIC_MEMORIES = 3
 _MEMORY_SHORTLIST = 12
+_MEMORY_TOKENS_PER_ITEM = 140
+_MIN_MEMORY_TOKEN_BUDGET = 420
 
 
 def estimate_tokens(text: str) -> int:
@@ -116,13 +117,16 @@ def estimate_tokens(text: str) -> int:
 
 
 def _memory_evidence(
-    hits: list[MemoryHit], *, window_id: str, budget: int, history_roles: dict[str, set[str]]
+    hits: list[MemoryHit], *,
+    window_id: str, budget: int, max_items: int, history_roles: dict[str, set[str]],
 ) -> tuple[list[MemoryHit], str, dict[str, MemoryHit]]:
     selected: list[MemoryHit] = []
     refs: dict[str, str] = {}
     sources: dict[str, MemoryHit] = {}
     text = ""
     for hit in hits:
+        if len(selected) >= max_items:
+            break
         if hit.turn_id and hit.source_window_id == window_id:
             roles = history_roles.get(hit.turn_id, set())
             if (hit.kind == "episode" and {"user", "actor"} <= roles) or (
@@ -150,8 +154,6 @@ def _memory_evidence(
         if hit.memory_id in refs:
             sources[refs[hit.memory_id]] = hit
         text = candidate
-        if len(selected) == _MAX_AUTOMATIC_MEMORIES:
-            break
     return selected, text, sources
 
 
@@ -267,7 +269,6 @@ def _budget_scale() -> float:
 
 
 _SCALE = _budget_scale()
-AUTOMATIC_MEMORY_TOKEN_BUDGET = max(1, int(420 * min(1.0, _SCALE)))
 if _SCALE != 1.0:
     DEFAULT_BUDGETS = {k: max(80, int(v * _SCALE)) for k, v in DEFAULT_BUDGETS.items()}
     # 最近原文层**也要缩**。它是最宽的一块（20k），漏掉它的话
@@ -495,9 +496,10 @@ class ContextCompiler:
         # 职责绑定（memory.embed / memory.rerank），装配它们要"已发布配置 +
         # 已解密密钥"这两样，而检索发生在本编译器里。不传时会退回环境变量
         # （旧部署的行为），传了则绑定优先。
+        self._memory_policy = memory_policy or MemoryPolicy()
         self._memory = MemoryService(
             session,
-            policy=memory_policy,
+            policy=self._memory_policy,
             config=model_config,
             secret_reader=secret_reader,
         )
@@ -1547,8 +1549,12 @@ class ContextCompiler:
             compiled_meta["history_cap_hit"] = True
 
         allowed = visibility_set(snapshot)
+        max_injected_memories = self._memory_policy.max_injected_memories
         if not snapshot.allows_long_term_memory():
             recall = RecallResult()
+        elif max_injected_memories == 0:
+            recall = RecallResult()
+            compiled_meta["memory_recall_skipped"] = "disabled_by_policy"
         elif should_skip_automatic_recall(user_text):
             recall = RecallResult()
             compiled_meta["memory_recall_skipped"] = "low_information"
@@ -1573,14 +1579,16 @@ class ContextCompiler:
                 trace_window_id=window_id,
                 audience=snapshot,
             )
-        evidence_budget = min(DEFAULT_BUDGETS["evidence"], AUTOMATIC_MEMORY_TOKEN_BUDGET)
+        base_evidence_budget = max(_MIN_MEMORY_TOKEN_BUDGET, max_injected_memories * _MEMORY_TOKENS_PER_ITEM)
+        evidence_budget = min(DEFAULT_BUDGETS["evidence"], int(base_evidence_budget * min(1.0, _SCALE)))
         original_text = {message.message_id: message.text for message in fetched}
         history_roles: dict[str, set[str]] = {}
         for message in usable:
             if message.turn_id and original_text[message.message_id] == message.text:
                 history_roles.setdefault(message.turn_id, set()).add(message.role)
         selected, evidence_text, memory_sources = _memory_evidence(
-            recall.hits, window_id=window_id, budget=evidence_budget, history_roles=history_roles
+            recall.hits, window_id=window_id, budget=evidence_budget,
+            max_items=max_injected_memories, history_roles=history_roles,
         )
         if recall.hits:
             with contextlib.suppress(Exception):

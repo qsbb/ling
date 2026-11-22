@@ -102,6 +102,9 @@ class ModelSlot:
         return bool(self.provider_id and self.model_id)
 
 
+MAX_INJECTED_MEMORIES = 12
+
+
 @dataclass(frozen=True)
 class MemoryPolicy:
     """记忆的召回与保留策略。
@@ -121,6 +124,8 @@ class MemoryPolicy:
     recency_half_life_days: float = 120.0
     # 记忆最长保留天数。超过的必被硬门挡掉。
     max_retention_days: int = 3650
+    # 每轮自动带入的旧记忆上限。0 关闭自动召回。
+    max_injected_memories: int = 3
 
 
 @dataclass(frozen=True)

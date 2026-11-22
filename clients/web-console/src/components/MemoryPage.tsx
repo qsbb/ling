@@ -2232,6 +2232,14 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
 
 const POLICY_FIELDS: PolicyField[] = [
   {
+    key: 'max_injected_memories',
+    label: '每轮最多带入的旧记忆',
+    hint: '0 表示关闭自动召回。',
+    step: 1,
+    min: 0,
+    max: 12,
+  },
+  {
     key: 'relative_score_floor',
     label: '召回相关性下限',
     hint: '只保留与最相关那条同量级的结果。调高 = 只想起最相关的，调低 = 更容易联想。',
@@ -2288,7 +2296,7 @@ const POLICY_FIELDS: PolicyField[] = [
  * 所以这里可以（也应该）写「下一轮对话起生效」，但必须同时写清两点例外。
  */
 export const MEMORY_POLICY_STATUS =
-  '生效状态：已接线。这 4 个参数会存成草稿并发布（回滚在设置页的版本列表里），发布后由运行时读取：' +
+  '生效状态：已接线。参数会存成草稿并发布（回滚在设置页的版本列表里），发布后由运行时读取：' +
   '对话侧在下一轮开始编译上下文时生效（进行中的轮次继续用旧策略）；' +
   '记忆提炼与归档在下一个后台事件里生效（worker 每次处理都会现读已发布修订，无需重启）。' +
   '两点例外必须知道：' +
@@ -2324,7 +2332,7 @@ export function MemorySettingsTab({ onBack }: MemorySettingsTabProps): React.Rea
           </li>
         </ul>
         <p className="mem-policy-status__foot">
-          这四个值的来源是 <code>GET /v1/settings/config</code> 的 <code>memory</code> 段，
+          参数来源是 <code>GET /v1/settings/config</code> 的 <code>memory</code> 段，
           保存走草稿 + 发布（与设置页的模型配置同一套修订机制）。
         </p>
       </div>

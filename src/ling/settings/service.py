@@ -23,6 +23,7 @@ from ling.infra.models import ConfigRevision, ProviderCredential, utcnow
 from ling.infra.security import SecretBox, new_id
 from ling.models.registry import bootstrap_config
 from ling.ports.config import (
+    MAX_INJECTED_MEMORIES,
     VOICE_KINDS,
     BindingMode,
     DialoguePolicy,
@@ -1439,6 +1440,7 @@ _MEMORY_BOUNDS: dict[str, tuple[float, float]] = {
     "rerank_top_n": (1, 100),
     "recency_half_life_days": (1.0, 3650.0),
     "max_retention_days": (1, 3650),
+    "max_injected_memories": (0, MAX_INJECTED_MEMORIES),
 }
 
 
@@ -1593,6 +1595,13 @@ def _memory_policy(raw: object) -> MemoryPolicy:
                 defaults.max_retention_days,
             )
         ),
+        max_injected_memories=int(
+            _clamp(
+                "max_injected_memories",
+                data.get("max_injected_memories"),
+                defaults.max_injected_memories,
+            )
+        ),
     )
 
 
@@ -1602,6 +1611,7 @@ def _policy_to_dict(policy: MemoryPolicy) -> dict[str, float | int]:
         "rerank_top_n": policy.rerank_top_n,
         "recency_half_life_days": policy.recency_half_life_days,
         "max_retention_days": policy.max_retention_days,
+        "max_injected_memories": policy.max_injected_memories,
     }
 
 

@@ -112,6 +112,7 @@ function configBody(dialogue: FakeDialogue) {
       rerank_top_n: 10,
       recency_half_life_days: 30,
       max_retention_days: 365,
+      max_injected_memories: 3,
     },
     life: {
       scene_ttl_minutes: 120,

@@ -23,6 +23,7 @@ from ling.contracts.v1 import (
 )
 from ling.infra.models import DEFAULT_INSTANCE_ID, utcnow
 from ling.ports.config import (
+    MAX_INJECTED_MEMORIES,
     BindingMode,
     EffectiveConfig,
     ResolutionSource,
@@ -133,6 +134,9 @@ class MemoryPolicyIn(BaseModel):
     rerank_top_n: int | None = Field(default=None, ge=1, le=100)
     recency_half_life_days: float | None = Field(default=None, gt=0, le=3650)
     max_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    max_injected_memories: int | None = Field(
+        default=None, ge=0, le=MAX_INJECTED_MEMORIES, strict=True,
+    )
 
 
 class LifePolicyIn(BaseModel):
@@ -414,6 +418,7 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             "rerank_top_n": effective.memory.rerank_top_n,
             "recency_half_life_days": effective.memory.recency_half_life_days,
             "max_retention_days": effective.memory.max_retention_days,
+            "max_injected_memories": effective.memory.max_injected_memories,
         },
         "life": {
             "scene_ttl_minutes": effective.life.scene_ttl_minutes,
