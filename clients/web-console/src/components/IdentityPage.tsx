@@ -323,14 +323,30 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
    * 用 `data-subject-id` 定位而不是"第几行"：合并会把被并入的记录折进目标，
    * 行号会变，id 不会。找不到（比如改名后被搜索条件筛掉了）就什么都不做——
    * 硬滚到某一行比不滚更让人困惑。
+   *
+   * ## 焦点为什么给按钮，而不是给行
+   *
+   * 行是一个 `<div>`，`div.focus()` 是**空操作**——它没有 `tabindex`，也不在
+   * tab 序列里。早先这里写的就是 `element.focus?.()`，看起来有"回到原记录"
+   * 的意图，实测焦点仍留在弹层关闭前的那个按钮上（探针读到 `activeElement`
+   * 是 `detail-open`，且 `data-subject-id` 为 null）。
+   *
+   * 两个选择：
+   * - 给行加 `tabindex="-1"`：可聚焦，但对读屏用户多出一个语义为空的停靠点；
+   * - 把焦点交给**该行自己的身份入口**（`detail-open` 按钮）：它就是"这一行
+   *   是谁"的可聚焦代表，键盘用户按回车能立刻回到详情，语义不丢。
+   *
+   * 选后者。滚动仍落在行上（`block: 'nearest'`），所以"视线回到原记录"与
+   * "键盘回到原记录"指的是同一个地方。
    */
   useEffect(() => {
     if (!returnTo) return;
     const selector = `[data-subject-id="${CSS.escape(returnTo)}"]`;
-    const element = document.querySelector<HTMLElement>(selector);
-    if (element) {
-      element.scrollIntoView({ block: 'nearest' });
-      element.focus?.();
+    const row = document.querySelector<HTMLElement>(selector);
+    if (row) {
+      row.scrollIntoView({ block: 'nearest' });
+      const focusTarget = row.querySelector<HTMLElement>('[data-testid="detail-open"]');
+      focusTarget?.focus();
     }
     setReturnTo(null);
   }, [returnTo, subjects]);

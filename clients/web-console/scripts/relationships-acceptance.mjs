@@ -73,6 +73,15 @@ async function waitForSettledList(page, timeoutMs = 20_000) {
   throw new Error('等搜索结果稳定超时');
 }
 
+/** 等某个弹层消失（`waitFor({ state: 'detached' })` 对 dialog 更直接）。 */
+async function expectDialogGone(page, testId, timeoutMs = 10_000) {
+  await page.waitForFunction(
+    (id) => !document.querySelector(`[data-testid="${id}"]`),
+    testId,
+    { timeout: timeoutMs },
+  );
+}
+
 async function shot(page, name, options = {}) {
   const file = path.join(OUT, `${name}.png`);
   await page.screenshot({ path: file, fullPage: options.fullPage ?? false });
@@ -410,6 +419,38 @@ async function main() {
   }));
   record('关闭详情', back);
   if (back.open !== 0) throw new Error('关闭后详情仍然存在');
+
+  // ---------------------------------------------------------------- 8b. 关闭弹层回到原记录
+  /*
+   * 从**远离那一行的地方**关闭：改名弹层位于顶层，关闭后浏览器把焦点清回
+   * body。必须由 `returnTo` 逻辑把它带回原记录——否则键盘用户会在页面上
+   * 失去位置。这条在真浏览器里量 `document.activeElement` 属于哪一行。
+   */
+  await page.getByTestId('subjects-search').fill('');
+  await page.getByTestId('subjects-search').press('Enter');
+  await waitForSettledList(page);
+  const deepCard = page.getByTestId('subject-card').nth(20);
+  await deepCard.scrollIntoViewIfNeeded();
+  const deepId = await deepCard.getAttribute('data-subject-id');
+  await deepCard.getByTestId('rename-open').click();
+  await page.getByTestId('rename-dialog').waitFor();
+  await page.getByTestId('rename-dialog').getByRole('button', { name: '取消' }).click();
+  await expectDialogGone(page, 'rename-dialog');
+  const returnState = await page.evaluate((id) => {
+    const active = document.activeElement;
+    const row = active?.closest?.('[data-subject-id]') ?? null;
+    const target = document.querySelector(`[data-subject-id="${CSS.escape(id)}"]`);
+    const rect = target?.getBoundingClientRect();
+    return {
+      focusRow: row?.getAttribute('data-subject-id') ?? null,
+      tag: active?.tagName ?? null,
+      inView: Boolean(rect && rect.top >= 0 && rect.bottom <= window.innerHeight),
+    };
+  }, deepId);
+  record('关闭弹层回到原记录', { ...returnState, expected: deepId });
+  if (returnState.focusRow !== deepId) throw new Error('焦点没有回到原记录所在的行');
+  if (!returnState.inView) throw new Error('原记录不在视口内');
+  await shot(page, '11b-return-to-record');
 
   // ---------------------------------------------------------------- 9. 窄屏
   const mobileContext = await browser.newContext({ viewport: { width: 375, height: 812 } });

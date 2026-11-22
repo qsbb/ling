@@ -719,6 +719,68 @@ describe('关系页：不再卡死（真浏览器）', () => {
     expect(await dialog.getByTestId('merge-confirm-target').innerText()).toContain('22000002');
   }, TEST_TIMEOUT);
 
+  it('关闭弹层后回到原来的记录：滚动可见，且焦点落回那一行', async (ctx) => {
+    if (skip(ctx)) return;
+    /*
+     * 这条钉住"回到原记录"的**可观测效果**，而且必须从**远离那一行的地方**关闭。
+     *
+     * 为什么强调这一点：我第一版测试是点该行自己的「详情」按钮来关详情的，
+     * 而那个按钮本来就在那一行里——焦点天然就在行内，于是**任何实现**都能
+     * 通过（把 `focus()` 退回成对 div 的空操作，测试照样绿）。这说明那条断言
+     * 测的是点击动作自身的副作用，与 `returnTo` 无关。
+     *
+     * 所以改成：从改名弹层（模态、位于页面顶层）里点取消关闭。此时
+     * `document.activeElement` 在弹层内部，关闭后浏览器会把它清回 body——
+     * 焦点**必须**由 `returnTo` 逻辑重新带回原记录所在的行，否则这条会红。
+     */
+    resetStore();
+    const { page } = await openRelations({ width: 1440, height: 700 });
+
+    const card = page.getByTestId('subject-card').nth(20);
+    await card.scrollIntoViewIfNeeded();
+    const subjectId = await card.getAttribute('data-subject-id');
+    expect(subjectId).toBeTruthy();
+
+    // 打开该行的改名弹层，再从弹层里取消
+    await card.getByTestId('rename-open').click();
+    const dialog = page.getByTestId('rename-dialog');
+    await dialog.waitFor();
+    // 关闭前焦点在弹层内部（不是在列表行里）——这是这条测试的前提
+    const beforeFocus = await page.evaluate(() => {
+      const active = document.activeElement;
+      return {
+        insideDialog: Boolean(active?.closest?.('[data-testid="rename-dialog"]')),
+        rowId: active?.closest?.('[data-subject-id]')?.getAttribute('data-subject-id') ?? null,
+      };
+    });
+    expect(beforeFocus.insideDialog, '焦点应当已经在弹层内部').toBe(true);
+    expect(beforeFocus.rowId, '关闭前焦点不应已经在原记录行里').toBeNull();
+
+    await dialog.getByRole('button', { name: '取消' }).click();
+    await expect.poll(async () => page.getByTestId('rename-dialog').count()).toBe(0);
+
+    const state = await page.evaluate((id) => {
+      const active = document.activeElement;
+      const row = active?.closest?.('[data-subject-id]') ?? null;
+      const target = document.querySelector(`[data-subject-id="${CSS.escape(id as string)}"]`);
+      let inView = false;
+      if (target) {
+        const rect = target.getBoundingClientRect();
+        inView = rect.top >= 0 && rect.bottom <= window.innerHeight;
+      }
+      return {
+        rowSubjectId: row?.getAttribute('data-subject-id') ?? null,
+        inView,
+        tag: active?.tagName ?? null,
+      };
+    }, subjectId);
+
+    expect(state.inView, '关闭后该记录不在视口内').toBe(true);
+    expect(state.rowSubjectId, '焦点没有回到原记录所在的行').toBe(subjectId);
+    // 焦点必须落在可操作元素上，否则键盘用户无法从这里继续
+    expect(state.tag).toBe('BUTTON');
+  }, TEST_TIMEOUT);
+
   it('搜索只命中被并入的记录时，说"目标不在结果里"而不是"找不到目标"', async (ctx) => {
     if (skip(ctx)) return;
     /*
