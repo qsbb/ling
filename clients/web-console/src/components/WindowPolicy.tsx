@@ -17,6 +17,7 @@ import {
   type WindowPolicyPreview,
 } from '../api';
 import type { ConnectorAccessGroup, PersonaSummary } from '../types';
+import { OneBotDeferred } from './OneBotDeferred';
 
 type PolicyFieldState = WindowDialoguePolicyFields[WindowDialoguePolicyField];
 
@@ -470,12 +471,14 @@ function GroupReplyLimit({ sessionId, initial, onSaved }: {
   );
 }
 
-export function WindowPolicy({ sessionId, onClose, accessTarget, groupReplyLimit, onGroupReplyLimitSaved }: {
+export function WindowPolicy({ sessionId, onClose, accessTarget, groupReplyLimit, onGroupReplyLimitSaved, onebotDeferred = false }: {
   sessionId: string;
   onClose: () => void;
   accessTarget?: AccessTarget;
   groupReplyLimit?: number | null;
   onGroupReplyLimitSaved?: () => void;
+  /** 只有 OneBot 私聊有这个设置；其他会话服务端一律 422，这里也就不挂载。 */
+  onebotDeferred?: boolean;
 }) {
   const [policy, setPolicy] = useState<WindowDialoguePolicy | null>(null);
   const [selections, setSelections] = useState(EMPTY_SELECTIONS);
@@ -563,6 +566,7 @@ export function WindowPolicy({ sessionId, onClose, accessTarget, groupReplyLimit
       {groupReplyLimit !== undefined
         ? <GroupReplyLimit sessionId={sessionId} initial={groupReplyLimit} onSaved={onGroupReplyLimitSaved} />
         : null}
+      {onebotDeferred ? <OneBotDeferred key={sessionId} sessionId={sessionId} /> : null}
       {policy ? (
         <>
           <div aria-label="对话规则">

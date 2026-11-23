@@ -11,7 +11,7 @@ import {
   PromptDrawer,
   promptEntryAction,
 } from './PromptDrawer';
-import { canRenameSession, describeSession, SessionSidebar } from './SessionSidebar';
+import { canRenameSession, describeSession, SessionSidebar, supportsOneBotDeferred } from './SessionSidebar';
 import './chat-page.css';
 
 interface ChatPageProps {
@@ -50,6 +50,7 @@ function SessionSettingsPanel({
   open,
   sessionId,
   groupReplyLimit,
+  onebotDeferred,
   accessTarget,
   onGroupReplyLimitSaved,
   onClose,
@@ -57,6 +58,7 @@ function SessionSettingsPanel({
   open: boolean;
   sessionId: string;
   groupReplyLimit: number | null | undefined;
+  onebotDeferred: boolean;
   accessTarget: { kind: 'group' | 'private'; id: string } | undefined;
   onGroupReplyLimitSaved: () => void;
   onClose: () => void;
@@ -99,6 +101,7 @@ function SessionSettingsPanel({
           key={sessionId}
           sessionId={sessionId}
           groupReplyLimit={groupReplyLimit}
+          onebotDeferred={onebotDeferred}
           onGroupReplyLimitSaved={onGroupReplyLimitSaved}
           accessTarget={accessTarget}
           onClose={onClose}
@@ -411,6 +414,7 @@ export function ChatPage({
             open={settingsOpen}
             sessionId={session.session_id}
             groupReplyLimit={heading?.kind === 'group' ? session.group_reply_max_parts ?? null : undefined}
+            onebotDeferred={!session.archived && supportsOneBotDeferred(session)}
             accessTarget={(heading?.kind === 'group' || heading?.kind === 'private') && session.peer_id
               ? { kind: heading.kind, id: session.peer_id }
               : undefined}

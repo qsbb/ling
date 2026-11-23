@@ -499,6 +499,16 @@ export interface WindowPolicyPreview {
   expires_at: number;
 }
 
+/**
+ * OneBot 私聊的「允许晚点回」开关。
+ *
+ * 服务端只对**未归档的 OneBot 私聊**给出这个设置；群聊、网页和官方 QQ 机器人
+ * 会话拿到的是 422，这里按「不展示」处理，不做本地猜测。
+ */
+export interface OneBotDeferredSetting {
+  enabled: boolean;
+}
+
 export interface WindowOriginBindingCandidate {
   scope: ConversationPolicyScope;
   instance_id: string;
@@ -637,6 +647,13 @@ export const api = {
   saveWindowPolicy(sessionId: string, change: WindowPolicyChange, token: string): Promise<WindowDialoguePolicy> {
     return request(`/v1/sessions/${encodeURIComponent(sessionId)}/dialogue-policy`,
       jsonInit('PUT', { ...change, preview_token: token }));
+  },
+  onebotDeferred(sessionId: string): Promise<OneBotDeferredSetting> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/onebot-deferred`);
+  },
+  setOnebotDeferred(sessionId: string, enabled: boolean): Promise<OneBotDeferredSetting> {
+    return request(`/v1/sessions/${encodeURIComponent(sessionId)}/onebot-deferred`,
+      jsonInit('PUT', { enabled }));
   },
   windowOriginBinding(sessionId: string): Promise<WindowOriginBindingOptions> {
     return request(`/v1/sessions/${encodeURIComponent(sessionId)}/origin-binding`);
