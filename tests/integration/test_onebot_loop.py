@@ -1187,10 +1187,13 @@ async def test_private_reply_is_split_and_reassembles(
 
 
 async def _quote_asr_fixture(
-    env: TestEnv, monkeypatch, *, fail_first: bool = False,
+    env: TestEnv, monkeypatch, *, fail_first: bool = False, choose_listen: bool = True,
 ) -> tuple[list[str], dict[str, str]]:
     from ling.domains.speech.asr_runtime import stop_worker
+    from ling.kernel.voice_quotes import VOICE_DECISION_PROMPT
+    from ling.models.router import StreamOutcome
     from ling.ports.channel import ChannelError, ChannelErrorKind
+    from ling.ports.model import ModelChunk
     from ling.ports.speech import AsrResult, SpeechUsage
     from tests.integration.test_asr_input import audio
 
@@ -1229,6 +1232,19 @@ async def _quote_asr_fixture(
             ok=True, reason="", provider=Provider(), provider_id="asrfixture", model_id="fixture",
         )
 
+    router = env.app.state.router
+    original_stream = router.stream
+
+    async def stream(config, *, messages, **kwargs):
+        if messages[0].content == VOICE_DECISION_PROMPT:
+            result = json.dumps({"action": "listen" if choose_listen else "respond"})
+            yield ModelChunk(delta=result), StreamOutcome()
+            yield ModelChunk(done=True), StreamOutcome(text=result)
+        else:
+            async for item in original_stream(config, messages=messages, **kwargs):
+                yield item
+
+    monkeypatch.setattr(router, "stream", stream)
     monkeypatch.setattr("ling.worker.make_media_fetcher", lambda *args, **kwargs: fetch)
     monkeypatch.setattr("ling.domains.speech.asr_providers.build_asr_provider", build)
     return reads, transcripts
@@ -1255,7 +1271,7 @@ async def test_private_quote_transcribes_the_selected_old_voice_and_reuses_it(
         evidence_ids[filename] = source["media_evidence_ids"][0]
 
     reads, transcripts = await _quote_asr_fixture(logged_in, monkeypatch)
-    request_text = "帮我听一下这条语音"
+    request_text = "方便告诉我里面的大意吗？"
     asked = _event_body(message_id=802, message=f"[CQ:reply,id=800]{request_text}")
     response = (await _post(logged_in, asked)).json()
     assert response["accepted"] and response["decision"] == "deferred_attention", response
@@ -1298,6 +1314,25 @@ async def test_private_quote_transcribes_the_selected_old_voice_and_reuses_it(
     assert request_text in quote["content"] and transcripts[older_ref] not in quote["content"]
     async with session_scope() as session:
         assert list(await session.scalars(select(AsrJob.id))) == [job_id]
+
+
+async def test_private_quote_respects_the_models_choice_to_leave_audio_unread(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    registered = (await _post(logged_in, _old_record(806, "old"))).json()
+    assert registered["media_evidence_ids"]
+    reads, _ = await _quote_asr_fixture(logged_in, monkeypatch, choose_listen=False)
+    response = (await _post(logged_in, _event_body(
+        message_id=807, message="[CQ:reply,id=806]方便告诉我里面的大意吗？",
+    ))).json()
+    prompt = await _prompt_for(response)
+    assert "尚未转写的语音" in prompt["messages"][-1]["content"]
+    assert not reads
+    async with session_scope() as session:
+        assert await session.scalar(select(AsrJob.id)) is None
 
 
 @pytest.mark.parametrize(("boundary", "reason", "state", "note"), [

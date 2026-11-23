@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,14 +20,18 @@ from ling.domains.media.service import (
 from ling.domains.speech.transcription import QuotedVoiceSource, quote_was_retracted
 from ling.infra.asr_jobs import AsrJob
 from ling.infra.models import MediaEvidenceRow
+from ling.ports.model import ChatMessageIn, ModelError
 
-_LISTEN_REQUEST = re.compile(
-    r"(?:请|麻烦)?(?:帮我|能不能|可以)?"
-    r"(?:听(?:一下|一听|听)?这[条段](?:语音)?"
-    r"|这[条段]语音(?:里)?(?:说了什么|说什么|讲了什么)"
-    r"|(?:转写|识别)(?:一下)?这[条段](?:语音)?)(?:吗|吧)?"
-)
+if TYPE_CHECKING:
+    from ling.models.router import ModelRouter
+    from ling.ports.config import EffectiveConfig
+
 _ONEBOT_ID = re.compile(r"-?[0-9]{1,20}")
+VOICE_DECISION_PROMPT = (
+    "对方引用了一条尚未转写的语音。根据这次发言，决定是否要实际听这条语音才能接话。"
+    "需要内容时选择 listen。只讨论发送、引用状态或者表达与内容无关时选择 respond。"
+    '只返回 JSON 对象 {"action":"listen"} 或 {"action":"respond"}。'
+)
 
 
 @dataclass(frozen=True)
@@ -34,8 +41,33 @@ class QuotedVoice:
     note: str | None = None
 
 
-def wants_quoted_voice(text: str) -> bool:
-    return _LISTEN_REQUEST.fullmatch(text.strip().rstrip("。？！?!").strip()) is not None
+async def choose_to_listen(router: ModelRouter | None, config: EffectiveConfig, text: str) -> bool:
+    """Let the dialogue model choose whether the quoted content is needed."""
+    asr = config.resolve_profile("speech.asr")
+    if router is None or not asr.usable or not asr.enabled:
+        return False
+    chunks: list[str] = []
+    characters = 0
+    try:
+        async with asyncio.timeout(8):
+            async for chunk, outcome in router.stream(
+                config, profile="dialogue.fast", allow_fallback=False,
+                messages=[
+                    ChatMessageIn(role="system", content=VOICE_DECISION_PROMPT),
+                    ChatMessageIn(role="user", content=text[:1000]),
+                ],
+            ):
+                if outcome.error is not None:
+                    return False
+                if chunk.delta:
+                    characters += len(chunk.delta)
+                    if characters > 512:
+                        return False
+                    chunks.append(chunk.delta)
+        packed = json.loads("".join(chunks))
+    except (ModelError, TimeoutError, ValueError, RecursionError):
+        return False
+    return isinstance(packed, dict) and packed.get("action") == "listen"
 
 
 def make_quote_source(

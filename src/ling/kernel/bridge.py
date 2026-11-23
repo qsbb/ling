@@ -24,7 +24,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import DBAPIError
@@ -55,6 +55,7 @@ from ling.logging_setup import emit_event
 if TYPE_CHECKING:
     from ling.config import Settings
     from ling.infra.models import Turn
+    from ling.models.router import ModelRouter
     from ling.ports.channel import ChannelConnector
     from ling.settings.window_policy import RuntimeWindowSnapshot
 
@@ -581,9 +582,9 @@ class InboundBridge:
             lock_scope,
         )
         from ling.kernel.voice_quotes import (
+            choose_to_listen,
             inspect_quoted_voice,
             make_quote_source,
-            wants_quoted_voice,
         )
 
         audio_ids: list[dict[str, str]] = []
@@ -591,7 +592,6 @@ class InboundBridge:
         if (
             reply_reference is not None and not has_new_audio and not is_group
             and not self._observe_only and getattr(self._connector, "connector_id", None) == "onebot"
-            and wants_quoted_voice(readable)
         ):
             from ling.kernel.inbound_intake import _connector_event_scope
 
@@ -603,20 +603,29 @@ class InboundBridge:
                 }),
             )
             if source is not None:
-                await lock_scope(self._session, f"asr:quote:{window.id}:{source['event_id']}")
                 voice = await inspect_quoted_voice(
                     self._session, source, actor_id=self._actor_id, window_id=window.id,
                     subject_id=subject_id, namespace=envelope.connector_instance,
                 )
+                if voice is not None and voice.items and resume_message_id is None:
+                    await self._session.commit()
+                    router = cast("ModelRouter | None", self._router)
+                    if await choose_to_listen(router, runtime_snapshot.config, readable):
+                        await lock_scope(self._session, f"asr:quote:{window.id}:{source['event_id']}")
+                        voice = await inspect_quoted_voice(
+                            self._session, source, actor_id=self._actor_id, window_id=window.id,
+                            subject_id=subject_id, namespace=envelope.connector_instance,
+                        )
+                        if voice is not None and voice.items:
+                            audio_ids = voice.items
+                            quoted_source = source
                 if voice is not None:
+                    note = "引用了一条尚未转写的语音" if voice.items and not audio_ids else voice.note
                     reply_reference = replace(
                         reply_reference,
                         message=reply_reference.message if voice.text else None,
-                        voice_text=voice.text, voice_note=voice.note,
+                        voice_text=voice.text, voice_note=note,
                     )
-                    if resume_message_id is None and voice.items:
-                        audio_ids = voice.items
-                        quoted_source = source
 
         if has_new_audio:
             svc = MediaEvidenceService(self._session, actor_id=self._actor_id)
