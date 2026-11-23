@@ -1,0 +1,102 @@
+[2026-11-23T02:12:32.909Z] vite http://127.0.0.1:5173
+[2026-11-23T02:12:33.007Z] --- desktop 1440x900
+[2026-11-23T02:12:34.397Z]   ok  会话列表有 3 条（实际 3）
+[2026-11-23T02:12:34.398Z]   ok  列表按名称显示（群名/昵称）
+[2026-11-23T02:12:34.399Z]   ok  当前选中可读：夜航船
+[2026-11-23T02:12:34.400Z]   ok  群/私聊/网页可区分
+[2026-11-23T02:12:34.401Z]   ok  每条都有近期活动时间
+[2026-11-23T02:12:34.402Z]   ok  外部会话键默认不出现
+[2026-11-23T02:12:34.451Z]   shot desktop-01-sessions.png
+[2026-11-23T02:12:34.524Z]   ok  会话信息里能读到完整会话键
+[2026-11-23T02:12:34.569Z]   shot desktop-02-session-detail.png
+[2026-11-23T02:12:34.603Z]   ok  媒体占位渲染成可读块（图片/语音）
+[2026-11-23T02:12:34.603Z]   ok  图片与语音都可读
+[2026-11-23T02:12:34.605Z]   ok  失败消息有可读错误区
+[2026-11-23T02:12:34.631Z]   ok  撤回过的那条有标记
+[2026-11-23T02:12:34.664Z]   ok  「她没回」的理由可读
+[2026-11-23T02:12:34.719Z]   shot desktop-03-messages.png
+[2026-11-23T02:12:34.720Z]   ok  主行不刷模型名（meta="16:00"）
+[2026-11-23T02:12:34.752Z]   ok  展开详情能看到模型
+[2026-11-23T02:12:34.806Z]   shot desktop-04-message-details.png
+[2026-11-23T02:12:34.930Z]   shot desktop-05-prompt-drawer.png
+[2026-11-23T02:12:34.994Z]   ok  关闭抽屉回到原阅读位置（120 → 120）
+[2026-11-23T02:12:35.781Z]   ok  确实带着游标取了更早一页（win_group:page1, win_group:before=101, win_group:before=1）
+[2026-11-23T02:12:35.782Z]   ok  拼接后内容变长（10796 → 21587）
+[2026-11-23T02:12:35.782Z]   ok  滚动位置按拼接高度补偿（位移 120px）
+[2026-11-23T02:12:35.848Z]   shot desktop-06-history-loaded.png
+[2026-11-23T02:12:36.063Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:36.236Z]   ok  设置面板数量 0（收起）
+[2026-11-23T02:12:36.380Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:36.530Z]   ok  设置面板数量 0（收起）
+[2026-11-23T02:12:36.694Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:36.750Z]   shot desktop-07-session-settings.png
+[2026-11-23T02:12:36.998Z]   ok  切会话后设置面板不残留
+[2026-11-23T02:12:37.066Z]   shot desktop-08-switched-session.png
+[2026-11-23T02:12:38.007Z]   ok  发送只发了一次（1）
+[2026-11-23T02:12:38.008Z]   ok  发送后仍有历史请求记录
+[2026-11-23T02:12:38.087Z]   shot desktop-09-sent.png
+[2026-11-23T02:12:38.169Z]   ok  未展开时不说时长/大小限制
+[2026-11-23T02:12:38.202Z]   ok  展开后才表达限制
+[2026-11-23T02:12:38.204Z]   ok  上传语音入口在语音区里
+[2026-11-23T02:12:38.205Z]   ok  录音入口在语音区里
+[2026-11-23T02:12:38.251Z]   shot desktop-10-audio-panel.png
+[2026-11-23T02:12:38.283Z]   ok  附件限制在使用时表达
+[2026-11-23T02:12:38.334Z]   shot desktop-11-attach-panel.png
+[2026-11-23T02:12:38.335Z]   ok  控制台无错误（）
+[2026-11-23T02:12:38.339Z] --- mobile 390x844
+[2026-11-23T02:12:39.136Z]   ok  会话列表有 3 条（实际 3）
+[2026-11-23T02:12:39.136Z]   ok  列表按名称显示（群名/昵称）
+[2026-11-23T02:12:39.137Z]   ok  当前选中可读：夜航船
+[2026-11-23T02:12:39.137Z]   ok  群/私聊/网页可区分
+[2026-11-23T02:12:39.138Z]   ok  每条都有近期活动时间
+[2026-11-23T02:12:39.138Z]   ok  外部会话键默认不出现
+[2026-11-23T02:12:39.186Z]   shot mobile-01-sessions.png
+[2026-11-23T02:12:39.248Z]   ok  会话信息里能读到完整会话键
+[2026-11-23T02:12:39.304Z]   shot mobile-02-session-detail.png
+[2026-11-23T02:12:39.336Z]   ok  媒体占位渲染成可读块（图片/语音）
+[2026-11-23T02:12:39.337Z]   ok  图片与语音都可读
+[2026-11-23T02:12:39.338Z]   ok  失败消息有可读错误区
+[2026-11-23T02:12:39.360Z]   ok  撤回过的那条有标记
+[2026-11-23T02:12:39.393Z]   ok  「她没回」的理由可读
+[2026-11-23T02:12:39.485Z]   shot mobile-03-messages.png
+[2026-11-23T02:12:39.487Z]   ok  主行不刷模型名（meta="16:00"）
+[2026-11-23T02:12:39.514Z]   ok  展开详情能看到模型
+[2026-11-23T02:12:39.599Z]   shot mobile-04-message-details.png
+[2026-11-23T02:12:39.715Z]   shot mobile-05-prompt-drawer.png
+[2026-11-23T02:12:39.772Z]   ok  关闭抽屉回到原阅读位置（120 → 120）
+[2026-11-23T02:12:40.565Z]   ok  确实带着游标取了更早一页（win_group:page1, win_group:before=101, win_group:before=1）
+[2026-11-23T02:12:40.565Z]   ok  拼接后内容变长（10350 → 22382）
+[2026-11-23T02:12:40.565Z]   ok  滚动位置按拼接高度补偿（位移 120px）
+[2026-11-23T02:12:40.659Z]   shot mobile-06-history-loaded.png
+[2026-11-23T02:12:40.867Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:41.029Z]   ok  设置面板数量 0（收起）
+[2026-11-23T02:12:41.178Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:41.334Z]   ok  设置面板数量 0（收起）
+[2026-11-23T02:12:41.493Z]   ok  设置面板数量 1（展开）
+[2026-11-23T02:12:41.563Z]   shot mobile-07-session-settings.png
+[2026-11-23T02:12:41.888Z]   ok  切会话后设置面板不残留
+[2026-11-23T02:12:41.975Z]   shot mobile-08-switched-session.png
+[2026-11-23T02:12:42.914Z]   ok  发送只发了一次（1）
+[2026-11-23T02:12:42.914Z]   ok  发送后仍有历史请求记录
+[2026-11-23T02:12:43.019Z]   shot mobile-09-sent.png
+[2026-11-23T02:12:43.132Z]   ok  未展开时不说时长/大小限制
+[2026-11-23T02:12:43.165Z]   ok  展开后才表达限制
+[2026-11-23T02:12:43.167Z]   ok  上传语音入口在语音区里
+[2026-11-23T02:12:43.168Z]   ok  录音入口在语音区里
+[2026-11-23T02:12:43.253Z]   shot mobile-10-audio-panel.png
+[2026-11-23T02:12:43.280Z]   ok  附件限制在使用时表达
+[2026-11-23T02:12:43.369Z]   shot mobile-11-attach-panel.png
+[2026-11-23T02:12:43.369Z]   ok  控制台无错误（）
+[2026-11-23T02:12:43.371Z] ALL CHECKS PASSED
+[2026-11-23T02:12:43.388Z] LOG /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/acceptance.log
+[2026-11-23T02:12:43.388Z] SHOT sessions /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-01-sessions.png
+[2026-11-23T02:12:43.388Z] SHOT sessionDetail /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-02-session-detail.png
+[2026-11-23T02:12:43.388Z] SHOT messages /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-03-messages.png
+[2026-11-23T02:12:43.388Z] SHOT details /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-04-message-details.png
+[2026-11-23T02:12:43.388Z] SHOT drawer /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-05-prompt-drawer.png
+[2026-11-23T02:12:43.388Z] SHOT history /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-06-history-loaded.png
+[2026-11-23T02:12:43.388Z] SHOT settings /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-07-session-settings.png
+[2026-11-23T02:12:43.388Z] SHOT switched /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-08-switched-session.png
+[2026-11-23T02:12:43.388Z] SHOT sent /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-09-sent.png
+[2026-11-23T02:12:43.388Z] SHOT audio /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-10-audio-panel.png
+[2026-11-23T02:12:43.388Z] SHOT attach /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/mobile-11-attach-panel.png

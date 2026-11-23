@@ -199,6 +199,11 @@ async function openChat(options: BackendOptions = {}) {
     return route.continue();
   });
   await page.goto(`${baseUrl}/s/s1`, { waitUntil: 'domcontentloaded' });
+  /*
+   * 语音区默认收起（需求 3：文字/附件/录音/上传语音整合进同一处，限制在用
+   * 到时才表达）。这里先点开"语音"，后面所有断言仍按原来的控件名走。
+   */
+  await page.getByRole('button', { name: '语音', exact: true }).click();
   await page.getByRole('group', { name: '语音输入', exact: true }).waitFor();
   await expect.poll(() => page.getByRole('button', { name: '上传语音', exact: true }).isEnabled()).toBe(true);
   return { page, calls, recognitionKeys };

@@ -168,13 +168,25 @@ it('管理员可在侧栏改渠道会话名并保存手动顺序', async () => {
   });
   await page.goto(`${address}/s/group`, { waitUntil: 'domcontentloaded' });
   const row = page.locator('[data-session-id="group"]');
-  await row.getByRole('button', { name: '改名：渠道群名' }).click();
+  const openMenu = async (name: string) => {
+    const more = row.getByRole('button', { name: `更多操作：${name}` });
+    if ((await more.getAttribute('aria-expanded')) !== 'true') await more.click();
+  };
+  // 改名在「更多」菜单里：主行只读名称/群聊/近期活动。
+  await openMenu('渠道群名');
+  await row.getByRole('menuitem', { name: '改名：渠道群名' }).click();
   await row.getByRole('textbox', { name: '会话名称' }).fill('管理员群名');
   await row.getByRole('button', { name: '保存' }).click();
   await expect.poll(async () => page.getByTestId('session-title').innerText()).toBe('管理员群名');
+
+  // 完整会话键不再常驻主行：菜单里的「会话信息」按需展开它。
+  await expect.poll(async () => row.locator('.session__subtitle').count()).toBe(0);
+  await openMenu('管理员群名');
+  await row.getByRole('menuitem', { name: '会话信息：管理员群名' }).click();
   expect(await row.locator('.session__subtitle').innerText()).toBe(groupKey);
 
-  await row.getByRole('button', { name: '上移：管理员群名' }).click();
+  await openMenu('管理员群名');
+  await row.getByRole('menuitem', { name: '上移：管理员群名' }).click();
   const ids = () => page.locator('[data-session-id]').evaluateAll(
     (nodes) => nodes.map((node) => node.getAttribute('data-session-id')),
   );

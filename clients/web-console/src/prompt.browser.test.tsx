@@ -241,12 +241,28 @@ async function openChat(
   await page.goto(`${baseUrl}/s/s1`, { waitUntil: 'domcontentloaded' });
   await page.locator('[data-testid="message-scroll"]').waitFor();
   if (options.expectEntry ?? true) {
-    await page.locator('[data-testid="prompt-entry"]').first().waitFor();
+    await page.locator('[data-testid="message-details"]').first().waitFor();
   }
   return { page, promptRequests };
 }
 
+/**
+ * 展开一条消息的详情。
+ *
+ * 入口（`prompt-entry`）现在收在每条消息自己的 `<details>` 里——图七的问题
+ * 正是这些"她这次看到了什么"逐条挂在气泡下面。所以浏览器测试必须先展开
+ * 详情，才点得到入口；这条辅助函数把"怎么展开"集中在一处。
+ */
+async function expandDetails(page: Page, index = 0): Promise<void> {
+  const details = page.getByTestId('message-details').nth(index);
+  await details.waitFor();
+  if (!(await details.evaluate((node) => (node as HTMLDetailsElement).open))) {
+    await details.locator('summary').click();
+  }
+}
+
 async function openDrawer(page: Page): Promise<void> {
+  await expandDetails(page, 0);
   await page.getByTestId('prompt-entry').first().click();
   await page.getByTestId('prompt-drawer').waitFor();
   await page.locator('[data-testid="prompt-snapshot"]').waitFor();
@@ -323,7 +339,11 @@ describe('真实浏览器：入口、请求、抽屉', () => {
       const { page, promptRequests } = await openChat('owner', { width: 1440, height: 900 });
       expect(promptRequests).toEqual([]);
 
-      // 入口只在她（actor）的消息下：msg-actor + msg-archived 两条
+      // 详情只在她的（actor）消息下有：msg-actor + msg-archived 两条。
+      // 展开后才出现「她这次看到了什么」入口。
+      expect(await page.getByTestId('message-details').count()).toBe(2);
+      await page.getByTestId('message-details').nth(0).locator('summary').click();
+      await page.getByTestId('message-details').nth(1).locator('summary').click();
       expect(await page.getByTestId('prompt-entry').count()).toBe(2);
 
       await openDrawer(page);
@@ -444,6 +464,7 @@ describe('真实浏览器：入口、请求、抽屉', () => {
     async (ctx) => {
       if (skip(ctx)) return;
       const owner = await openChat('owner', { width: 1440, height: 900 });
+      await expandDetails(owner.page, 1);
       await owner.page.getByTestId('prompt-entry').nth(1).click();
       await owner.page.getByTestId('prompt-missing').waitFor();
       expect(await owner.page.getByTestId('prompt-missing').innerText()).toContain('这次没有记录');
@@ -451,7 +472,10 @@ describe('真实浏览器：入口、请求、抽屉', () => {
       expect(await owner.page.locator('[data-testid="prompt-section"]').count()).toBe(0);
 
       const member = await openChat('member', { width: 1440, height: 900 }, { expectEntry: false });
+      // 非 owner 连入口带详情都不出现：后端对其他人 404，入口不给死路，
+      // 而"详情"折叠区唯一的内容就是那个入口——没有可展开的东西。
       expect(await member.page.getByTestId('prompt-entry').count()).toBe(0);
+      expect(await member.page.getByTestId('message-details').count()).toBe(0);
     },
     /*
      * 这一条开两个浏览器上下文，而**每个上下文的首屏都要在 Vite 冷启动 +

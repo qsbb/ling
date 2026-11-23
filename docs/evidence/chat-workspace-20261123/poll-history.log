@@ -1,0 +1,22 @@
+[2026-11-23T02:12:26.673Z] vite http://127.0.0.1:5173
+[2026-11-23T02:12:27.675Z]   ok  首屏是最新一页（161..260）
+[2026-11-23T02:12:27.675Z]   ok  首屏顶部给「读取更早」，不是「开头」
+[2026-11-23T02:12:27.881Z]   ok  两次向上加载后第 1 条在视图里（oldest=1）
+[2026-11-23T02:12:27.881Z]   ok  视图里是全部 260 条（260）
+[2026-11-23T02:12:27.882Z]   ok  到头后页顶显示「这里是这段对话的开头」
+[2026-11-23T02:12:28.003Z] 轮询开始（最新 200 条 + 两条新消息，active_turn=null）
+[2026-11-23T02:12:29.715Z]   ok  轮询带来的新消息已进入视图（sequence=262）
+[2026-11-23T02:12:30.020Z]   ok  轮询后第 1 条仍在（oldest=1）
+[2026-11-23T02:12:30.020Z]   ok  第 1 条仍是 sequence=1 的那条
+[2026-11-23T02:12:30.021Z]   ok  新消息已合并（newest=262）
+[2026-11-23T02:12:30.021Z]   ok  261、262 都在视图里
+[2026-11-23T02:12:30.021Z]   ok  顺序严格递增、无重复
+[2026-11-23T02:12:30.021Z]   ok  轮询后仍显示「这里是开头」（因为确实已加载到第 1 条）
+[2026-11-23T02:12:30.025Z]   ok  轮询期间阅读位置不动（0 → 0）
+[2026-11-23T02:12:30.026Z]   ok  active_turn=null 后界面不再显示「生成中」
+[2026-11-23T02:12:32.628Z]   ok  active_turn=null 后不再轮询（4 → 4）
+[2026-11-23T02:12:32.629Z]   ok  无页面错误（）
+[2026-11-23T02:12:32.682Z] SHOT /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/screens/poll-history-after.png
+[2026-11-23T02:12:32.682Z] 请求序列：[{"request":"messages","limit":100,"before":null},{"request":"messages","limit":100,"before":"161"},{"request":"messages","limit":100,"before":"61"},{"request":"messages","limit":100,"before":null}]
+[2026-11-23T02:12:32.698Z] ALL CHECKS PASSED
+[2026-11-23T02:12:32.698Z] LOG /Users/lingxi/project/ling/.agents/worktrees/chat-workspace-redesign/docs/evidence/chat-workspace-20261123/poll-history.log

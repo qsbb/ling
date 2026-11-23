@@ -271,3 +271,13 @@ export function AttachIcon({ size = 18, className }: IconProps) {
     </svg>
   );
 }
+
+/** 麦克风：语音输入入口。 */
+export function MicIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3" />
+    </svg>
+  );
+}

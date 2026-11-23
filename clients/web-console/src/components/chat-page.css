@@ -1,0 +1,547 @@
+/* -------------------------------------------------------------------------
+   对话页：标题栏、会话设置浮层、消息详情、媒体块、历史边界、输入区面板。
+
+   单独成文件而不是继续往 styles.css 里追加：那份文件正在被并行任务修改，
+   每加一段就多一次静默覆盖的机会（与 logs.css / dashboard.css 同一个理由）。
+   这里的规则只作用于本页自己的类名，不覆写别处。
+   ---------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------ 标题栏 */
+
+.chat-titlebar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px clamp(14px, 4vw, 40px) 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.chat-titlebar__titles {
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.chat-titlebar__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 副标题只放"现在能读到的状态"，不放机器键。 */
+.chat-titlebar__sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  min-height: 18px;
+}
+
+.chat-titlebar__stat::before {
+  content: '·';
+  margin-right: 6px;
+  opacity: 0.5;
+}
+
+.chat-titlebar__stat:first-child::before {
+  content: none;
+  margin: 0;
+}
+
+.chat-titlebar__stat--busy {
+  color: var(--accent);
+}
+
+.chat-titlebar__meta-toggle {
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.chat-titlebar__meta-toggle:hover {
+  color: var(--ink-soft);
+}
+
+/* 外部键：按需展开，等宽、可选中复制，不参与默认阅读宽度。 */
+.chat-titlebar__details {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-sunken);
+  font-size: 11.5px;
+}
+
+.chat-titlebar__details > div {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.chat-titlebar__details dt {
+  flex: none;
+  width: 4.5em;
+  color: var(--ink-faint);
+}
+
+.chat-titlebar__details dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.chat-titlebar__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  user-select: text;
+}
+
+.chat-titlebar__edit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1 1 260px;
+}
+
+.chat-titlebar__edit input {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #fffdf8;
+  font-size: 14px;
+}
+
+.chat-titlebar__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* ------------------------------------------------------------ 会话设置浮层 */
+
+/*
+   一个浮层、一个开关。重复点按钮 = toggle；切会话时上面那个 effect 把
+   `settingsOpen` 清零，所以既不会叠层，也不会把上一条会话的设置留在新会话上。
+   浮层只用 `position: absolute` 贴在消息区里，不推挤正文（窄屏推挤会把正文
+   挤到看不见），也不锁背景滚动。
+*/
+/*
+   遮罩从**标题栏下沿**开始（`top: 56px`），不盖住"会话设置"按钮本身：
+   否则小屏上第一次点开之后，按钮就被自己的遮罩压住，"再点一次 = 收起"
+   永远点不到（375 的验收路径正好走在这条线上）。
+*/
+.session-settings {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: 56px;
+  z-index: 30;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: clamp(8px, 2vh, 24px) clamp(10px, 4vw, 24px);
+  pointer-events: none;
+}
+
+.session-settings__scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(38, 34, 29, 0.16);
+  pointer-events: auto;
+  cursor: default;
+}
+
+.session-settings__panel {
+  position: relative;
+  z-index: 1;
+  width: min(680px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  border-radius: 14px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 18px 40px rgba(58, 48, 34, 0.16);
+  pointer-events: auto;
+  animation: session-settings-in 0.16s ease-out both;
+}
+
+@keyframes session-settings-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.session-settings__panel:focus {
+  outline: none;
+}
+
+.session-settings__panel .window-policy {
+  margin: 0;
+  border: 0;
+  background: transparent;
+}
+
+/* ------------------------------------------------------------ 消息详情 */
+
+/*
+   模型名、尝试次数这些"事后核对"的信息收进折叠区。主行只留时间与
+   失败/停止这类需要动手的状态。
+
+   `details` 原生折叠：无 JS、可键盘操作、默认收起不占版面。
+   `<summary>` 用箭头自绘，避免不同浏览器的高度不一致。
+*/
+.message__details {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+  max-width: 100%;
+}
+
+.message__details--own {
+  align-self: flex-end;
+}
+
+.message__details-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  list-style: none;
+  cursor: pointer;
+  padding: 2px 0;
+  color: var(--ink-faint);
+  user-select: none;
+}
+
+.message__details-summary::-webkit-details-marker {
+  display: none;
+}
+
+.message__details-summary::before {
+  content: '›';
+  display: inline-block;
+  transition: transform 0.14s ease;
+  opacity: 0.7;
+}
+
+.message__details[open] > .message__details-summary::before {
+  transform: rotate(90deg);
+}
+
+.message__details-summary:hover {
+  color: var(--ink-soft);
+}
+
+.message__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 6px 0 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--paper-sunken);
+}
+
+.message__facts > div {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.message__facts dt {
+  color: var(--ink-faint);
+  flex: none;
+}
+
+.message__facts dd {
+  margin: 0;
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.message__details .message__prompt {
+  margin-top: 6px;
+}
+
+/* ------------------------------------------------------------ 媒体块 */
+
+/*
+   正文里的 `[image]` / `[voice]` 占位画成可读的块。
+   **不画假图片**：入站媒体按设计不落盘，消息契约里也没有 URL；
+   假装有一张图比承认"这里只有占位"更糟。
+*/
+.message__media {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 3px 2px 0;
+  padding: 5px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  color: var(--ink-soft);
+  vertical-align: middle;
+  max-width: 100%;
+}
+
+.message__media-mark {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1.5px solid currentColor;
+  opacity: 0.55;
+  flex: none;
+}
+
+/* 语音与视频用同一种"有内容但不可播放"的语气，靠 data-kind 区分画面。 */
+.message__media[data-kind='voice'] .message__media-mark {
+  border-radius: 50% 50% 45% 45%;
+}
+
+.message__media[data-kind='video'] .message__media-mark {
+  border-radius: 2px;
+  transform: scaleX(1.15);
+}
+
+/* ------------------------------------------------------------ 历史边界 */
+
+.messages__edge {
+  display: flex;
+  justify-content: center;
+  padding: 2px 0 10px;
+  list-style: none;
+}
+
+.messages__edge--end {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  padding-bottom: 6px;
+}
+
+.messages__edge-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--ink-soft);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.messages__edge-button:hover:not(:disabled) {
+  background: #fff;
+  border-color: var(--line-strong);
+}
+
+.messages__edge-button:disabled {
+  cursor: progress;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------ 输入区面板 */
+
+.composer__panel {
+  max-width: 820px;
+  margin: 0 auto 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-soft);
+  display: grid;
+  gap: 8px;
+  animation: composer-panel-in 0.14s ease-out both;
+}
+
+@keyframes composer-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.composer__panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.composer__panel-title {
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);
+}
+
+.composer__panel-close {
+  border: 0;
+  background: none;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--ink-faint);
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.composer__panel-close:hover {
+  color: var(--ink);
+}
+
+.composer__panel-note {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+}
+
+.composer__attach-name {
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工具按钮：默认只是一枚静音图标，展开后才亮。 */
+.composer__tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 1px;
+  flex: none;
+}
+
+.composer__tool {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-faint);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.composer__tool:hover:not(:disabled) {
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+}
+
+.composer__tool.is-open {
+  background: var(--paper-sunken);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.composer__tool:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer__hint-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-soft);
+}
+
+.composer__hint-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+@media (max-width: 900px) {
+  .chat-titlebar {
+    padding: 10px 14px 8px;
+  }
+
+  .chat-titlebar__title {
+    font-size: 16px;
+  }
+
+  .session-settings {
+    padding: 8px;
+  }
+
+  .session-settings__panel {
+    width: 100%;
+    max-height: 100%;
+  }
+}
+
+@media (max-width: 560px) {
+  .composer__panel {
+    margin-bottom: 6px;
+  }
+
+  .composer__tool {
+    width: 30px;
+    height: 30px;
+  }
+}
+
+/* 减少动效偏好：所有位移都去掉，只留透明度（与 prompt-drawer.css 同一约定）。 */
+@media (prefers-reduced-motion: reduce) {
+  .session-settings__panel,
+  .composer__panel {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------------ 布局约束 */
+
+/*
+   主区必须自己吃掉剩余宽度并**限制**高度：`.chat-main` 在 styles.css 里只有
+   `min-height: 0` 与 `position: relative`，没有 `flex: 1` 也没有
+   `overflow: hidden`。于是长历史在窄屏把消息区撑高、输入区与撤回卡片被推到
+   可视区之外（截图里撤回卡片正好被输入框压住）。这里补上这两条，让
+   `.messages` 才是唯一滚动容器。
+*/
+.chat-main {
+  flex: 1;
+  overflow: hidden;
+}

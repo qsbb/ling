@@ -1,9 +1,260 @@
-.session__order {
-  display: grid;
-  align-content: center;
+/* -------------------------------------------------------------------------
+   会话侧栏：主行只读"名称 + 群/私聊 + 近期活动"，操作收进 ⋯ 菜单。
+
+   图七的问题：每条会话常驻改名/置顶/上移/下移四个图标，把标题挤成
+   一截省略号，而"这条是群还是私聊、多久没说话"反而读不到。这里把
+   操作降级成按需菜单，信息层回到主行。
+   ---------------------------------------------------------------------- */
+
+.session {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  border-radius: 11px;
+  position: relative;
 }
 
-.session__order .session__move-button {
-  width: 28px;
+/* 菜单开着时把整条抬到相邻条目之上，避免被后一条盖住。 */
+.session--menu-open {
+  z-index: 5;
+}
+
+.session__main {
+  display: grid;
+  gap: 3px;
+  padding: 8px 6px 8px 11px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 11px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.session__heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+  color: var(--ink);
+}
+
+.session--active .session__title {
+  font-weight: 600;
+}
+
+/* 置顶只用一个小图钉，不额外占一行、也不重复文字。 */
+.session__pin-flag {
+  display: inline-flex;
+  color: var(--accent);
+  opacity: 0.8;
+  flex: none;
+}
+
+/* 群 / 私聊 / 网页：方括号式的极短标签，比徽标省宽度。 */
+.session__channel {
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+}
+
+.session__channel[data-kind='group'] {
+  color: #6b5a3c;
+  border-color: #ddd0b6;
+  background: rgba(255, 252, 240, 0.75);
+}
+
+.session__channel[data-kind='private'] {
+  color: #4f5f52;
+  border-color: #ccd6c8;
+  background: rgba(246, 251, 244, 0.75);
+}
+
+/* 近期活动优先于条数：时间在左，条数是次要信息。 */
+.session__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--ink-faint);
+  min-width: 0;
+}
+
+.session__time {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.session__count {
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.session__more {
+  align-self: center;
+  flex: none;
+  width: 26px;
   height: 26px;
+  margin-right: 5px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.session:hover .session__more,
+.session:focus-within .session__more,
+.session--active .session__more,
+.session--menu-open .session__more {
+  opacity: 1;
+}
+
+.session__more:hover {
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--ink);
+}
+
+.session__more[aria-expanded='true'] {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.session__menu {
+  position: absolute;
+  top: calc(100% - 4px);
+  right: 6px;
+  z-index: 6;
+  min-width: 168px;
+  display: grid;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 11px;
+  background: var(--paper-raised);
+  box-shadow: 0 12px 28px rgba(58, 48, 34, 0.16);
+}
+
+.session__menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.session__menu-item:hover:not(:disabled) {
+  background: var(--paper-sunken);
+  color: var(--ink);
+}
+
+.session__menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.session__menu-item.is-pinned {
+  color: var(--accent);
+}
+
+/* 会话信息：默认收起，展开后是两列事实，不挤标题。 */
+.session__detail {
+  flex-basis: 100%;
+  display: grid;
+  gap: 3px;
+  margin: 2px 6px 8px 11px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+}
+
+.session__detail > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.session__detail dt {
+  flex: none;
+  width: 4.5em;
+  color: var(--ink-faint);
+}
+
+.session__detail dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink-soft);
+}
+
+.session__detail .session__subtitle {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.session__edit {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 9px;
+}
+
+.session__edit input {
+  flex: 1 1 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #fffdf8;
+  font-size: 13px;
+}
+
+/* 窄屏（侧栏是抽屉）里 ⋯ 常驻可见：没有悬停这回事。 */
+@media (max-width: 900px) {
+  .session__more {
+    opacity: 1;
+    width: 32px;
+    height: 32px;
+  }
+
+  .session__main {
+    padding: 9px 4px 9px 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session__more {
+    transition: none;
+  }
 }
