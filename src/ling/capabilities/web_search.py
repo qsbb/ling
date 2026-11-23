@@ -1,7 +1,8 @@
-"""Explicit, read-only public search. Only the current user's query leaves ling."""
+"""Search with the current user's query and read the first public result."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from urllib.parse import urlsplit
@@ -9,17 +10,19 @@ from urllib.parse import urlsplit
 import httpx
 
 from ling.capabilities.tools import ToolRegistry, ToolRisk, ToolSpec
+from ling.capabilities.web_read import PublicWebReadError, read_public_page
 
 WEB_SEARCH_TOOL_ID = "web.search"
 _ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 _MAX_QUERY = 240
 _MAX_RESPONSE = 256 * 1024
 _RESULTS = 3
+_PAGE_EXCERPT_CHARS = 1800
 _COMMAND = re.compile(r"^(?:/search(?:$|[\s:：])|搜索\s*[:：])", re.IGNORECASE)
 _REQUEST = re.compile(
     r"^(?:/search(?:\s+|[:：])|搜索(?:\s+|[:：])|(?:请你?|能不能|能否|能|可以|麻烦)?"
     r"(?:(?:上网|联网|在网上)(?:搜索|搜一下|搜|查一下|查)|"
-    r"(?:帮我|给我|替我)(?:搜索一下|搜索|搜一下|搜个|搜一搜|搜)|"
+    r"(?:帮我|给我|替我)(?:搜索一下|搜索|搜一下|搜个|搜一搜|搜|查一下|查一查|查查)|"
     r"搜索一下|搜一下|搜个|搜一搜)\s*[:：]?\s*)(?P<query>.+)$",
     re.IGNORECASE,
 )
@@ -62,15 +65,15 @@ def register_web_search(registry: ToolRegistry, *, key: str, query: str) -> None
             tool_id=WEB_SEARCH_TOOL_ID,
             version="1.0.0",
             description=(
-                "使用用户这条消息中的查询词搜索公开网页，无需参数。"
-                "回答时注明来源链接；失败或没有结果时明确说明，不得编造。"
+                "使用用户这条消息里的查询词搜索公开网页，并尝试读取第一条结果的正文，无需参数。"
+                "有正文时引用实际读到的来源链接；只拿到摘要时说明依据是搜索摘要。"
             ),
             risk=ToolRisk.read_only,
             requires_confirmation=False,
             reversible=True,
-            timeout_seconds=8,
+            timeout_seconds=14,
             model_callable=True,
-            model_result_chars=3200,
+            model_result_chars=7000,
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         search,
@@ -80,6 +83,7 @@ def register_web_search(registry: ToolRegistry, *, key: str, query: str) -> None
 async def _search(key: str, query: str) -> str:
     try:
         async with (
+            asyncio.timeout(7),
             httpx.AsyncClient(timeout=6, follow_redirects=False, trust_env=False) as client,
             client.stream(
                 "GET", _ENDPOINT,
@@ -104,7 +108,7 @@ async def _search(key: str, query: str) -> str:
                 if len(body) + len(chunk) > _MAX_RESPONSE:
                     raise ValueError("网页搜索响应超过大小限制")
                 body.extend(chunk)
-    except httpx.HTTPError:
+    except (TimeoutError, httpx.HTTPError):
         raise ValueError("未能连接网页搜索服务，请检查网络后重试") from None
 
     try:
@@ -124,7 +128,10 @@ async def _search(key: str, query: str) -> str:
             continue
         try:
             parsed = urlsplit(url)
-            if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username:
+            if (
+                parsed.scheme not in {"https", "http"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+            ):
                 continue
         except ValueError:
             continue
@@ -133,4 +140,18 @@ async def _search(key: str, query: str) -> str:
             "title": str(row.get("title") or "")[:100],
             "snippet": str(row.get("description") or "")[:240],
         })
-    return json.dumps({"results": results}, ensure_ascii=False)
+    payload: dict[str, object] = {"results": results}
+    if results:
+        url = results[0]["url"]
+        try:
+            page = await read_public_page(url)
+        except PublicWebReadError as exc:
+            payload["page_error"] = {"url": url, "reason": exc.reason, "detail": str(exc)}
+        else:
+            payload["page"] = {
+                "url": page.url,
+                "title": page.title,
+                "text": page.text[:_PAGE_EXCERPT_CHARS],
+                "truncated": page.truncated or len(page.text) > _PAGE_EXCERPT_CHARS,
+            }
+    return json.dumps(payload, ensure_ascii=False)
