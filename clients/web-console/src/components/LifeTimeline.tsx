@@ -243,10 +243,273 @@ export function factsForSegment(
   );
 }
 
+/* ------------------------------------------------------ 当天的合并视图 */
+
+/** 合并后的一条记录：事实 + 它落在哪一段（`null` = 没有宿主）。 */
+export interface DayRecord {
+  fact: LifeTimelineFact;
+  /** 宿主叶段 id。`null` = 找不到归属，它自己占一行。 */
+  segmentId: string | null;
+}
+
+export interface DayTimeline {
+  /** 有证据的记录，按 `activity_id` 唯一。 */
+  records: DayRecord[];
+  /** `clock_only`：只证明时间到了，收进可展开的「时间检查」。 */
+  checks: LifeTimelineFact[];
+  /** 分段归属：segment_id → 该段名下的记录。 */
+  bySegment: Map<string, DayRecord[]>;
+  /** 没有宿主的记录。**保留自己的开始时间**，不塞进任何段。 */
+  loose: DayRecord[];
+}
+
+/**
+ * 活动记录的措辞。
+ *
+ * `kind` 是活动自己的类型；旧后端没有这个字段、给了 null、或给了映射表外的值，
+ * 三种情况都只能说「活动记录」——**不编名字**，也不拿 history 去补。
+ */
+export function activityName(kind: string | null | undefined): string {
+  const raw = String(kind ?? '').trim();
+  if (!raw) return '活动记录';
+  const known = ACTIVITY_KIND[raw];
+  if (known) return known;
+  /*
+   * 未知类型一律回落「活动记录」。
+   *
+   * `kind` 在后端是自由字符串，不是枚举；把未知值原样显示会把内部代码
+   * （`call`、`wood_working` 之类）直接摆到读者面前——那不是在说"她做了什么"，
+   * 而是在展示我们的字段。说不出就说不说。
+   */
+  return '活动记录';
+}
+
+const ACTIVITY_KIND: Record<string, string> = {
+  writing: '写作',
+  write: '写作',
+  reading: '读书',
+  read: '读书',
+  resting: '休息',
+  rest: '休息',
+  walking: '散步',
+  walk: '散步',
+  thinking: '想事情',
+  working: '工作',
+  work: '工作',
+  eating: '吃饭',
+  meal: '吃饭',
+  cooking: '做饭',
+  sleep: '睡觉',
+  nap: '小睡',
+  listening: '听音乐',
+  music: '听音乐',
+  call: '接电话',
+  chatting: '聊天',
+  browsing: '上网',
+  cleaning: '打扫',
+  exercising: '运动',
+};
+
+const dayKeyFormatter = (timeZone: string) =>
+  new Intl.DateTimeFormat('en-CA', {
+    timeZone: safeTimeZone(timeZone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+/** 某时刻在展示时区里属于哪一天（用于判断跨午夜）。 */
+export function zoneDayKey(value: string | null | undefined, timeZone: string): string {
+  const date = toDate(value);
+  if (!date) return '';
+  return dayKeyFormatter(timeZone).format(date);
+}
+
+/**
+ * 一条记录在**展示窗口内**能看见的区间。
+ *
+ * 跨午夜时不再给出 `23:30–01:30` 这种回绕读数：今天这一侧裁到当日 24:00，
+ * 星期一侧从 00:00 起。真实起止由调用方另外给出。
+ */
+export function visibleRange(
+  fact: Pick<LifeTimelineFact, 'started_at' | 'ended_at'>,
+  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>,
+): { start: string | null; end: string | null; crossesForward: boolean; crossesBackward: boolean } {
+  const zone = timeline.display_timezone;
+  const day = timeline.display_date;
+  // 没有结束时刻 = **时间点**：它不是区间，不参与跨午夜裁剪。
+  // 这一条必须排在算 dayKey 之前——拿 `started_at` 去和"没有的"结束时刻比日期，
+  // 会让一条未结束的活动被当成跨天区间，显示成 `16:00–08:40` 这种回绕读数。
+  if (!fact.ended_at) {
+    return { start: fact.started_at, end: null, crossesForward: false, crossesBackward: false };
+  }
+  const startKey = zoneDayKey(fact.started_at, zone);
+  const endKey = zoneDayKey(fact.ended_at, zone);
+  // 往前跨：从**今天**开始、结束在之后的某一天（通常是次日）。
+  const crossesForward = Boolean(fact.started_at) && startKey === day && endKey > day;
+  // 往回收：结束在**今天**、但开始于更早的一天。原来的写法要求 startKey===day，
+  // 于是"从前一天延续进来"的记录永远算不出 crossesBackward，开始端也就没被裁到 00:00。
+  const crossesBackward = Boolean(fact.started_at) && startKey < day && endKey >= day;
+  // 午夜边界：往前跨的那一侧截到当日的末尾，往回收的那一侧从当日开头算起。
+  // 结尾端的 23:59:59 在显示时写作 **24:00**（见 `formatRecordRange`）——
+  // 「23:59」会被读成"提前一分钟结束"，而它其实一直持续到午夜。
+  if (crossesForward) return { start: fact.started_at, end: `${day}T23:59:59`, crossesForward: true, crossesBackward: false };
+  if (crossesBackward) return { start: `${day}T00:00:00`, end: fact.ended_at, crossesForward: false, crossesBackward: true };
+  return { start: fact.started_at, end: fact.ended_at, crossesForward: false, crossesBackward: false };
+}
+
+/**
+ * 把计划段与事实合成一条当天的序列。
+ *
+ * 唯一目标是那条不变量：**每个 `activity_id` 在当天页面里只呈现一次**。
+ * 之前三处各画一遍（段内、右列全量、首屏「今天留下的片段」），没有一处知道
+ * 别处也画了；在这里统一裁决，渲染层不再自己决定"要不要显示"。
+ *
+ * 归属规则，按顺序：
+ * 1. `clock_only` 不参与归属——它只证明时间到了，全部进「时间检查」；
+ * 2. 按**开始时刻**找唯一宿主叶段（包含该时刻的那一段）。放在某个计划旁边
+ *    只是排版依据，**不代表计划被执行了**，措辞上不许混为一谈；
+ * 3. 开始时刻不在任何叶段内时，只有与该段重叠才挂上去，取最早的一个
+ *    （按时间排，不随响应顺序变化）；
+ * 4. 都找不到 → 独立记录，保留自己的开始时间。
+ */
+export function mergeDayTimeline(
+  timeline: Pick<LifeTimelineOut, 'segments' | 'facts'>,
+): DayTimeline {
+  const checks: LifeTimelineFact[] = [];
+  const live = timeline.segments.filter((segment) => segment.status === 'current');
+  const leaves = live.filter((segment) => segment.is_leaf);
+
+  const records: DayRecord[] = [];
+  const bySegment = new Map<string, DayRecord[]>();
+  const loose: DayRecord[] = [];
+
+  for (const fact of timeline.facts) {
+    if (fact.evidence_kind === 'clock_only') {
+      checks.push(fact);
+      continue;
+    }
+    const start = toDate(fact.started_at);
+    let host: LifeTimelineSegment | null = null;
+    if (start) {
+      host =
+        leaves.find((segment) => {
+          const from = toDate(segment.display_start_at);
+          const to = toDate(segment.display_end_at);
+          return Boolean(from && to && from.getTime() <= start.getTime() && start.getTime() < to.getTime());
+        }) ?? null;
+      if (!host) {
+        // 开始时刻不在段内：重叠也算归属，但只取最早的一段，避免随顺序漂移。
+        const end = toDate(fact.ended_at) ?? start;
+        const reach = Math.max(end.getTime(), start.getTime() + 1);
+        host =
+          leaves
+            .filter((segment) => {
+              const from = toDate(segment.display_start_at);
+              const to = toDate(segment.display_end_at);
+              return Boolean(from && to && from.getTime() < reach && to.getTime() > start.getTime());
+            })
+            .sort((a, b) => a.display_start_at.localeCompare(b.display_start_at))[0] ?? null;
+      }
+    }
+    const record: DayRecord = { fact, segmentId: host ? host.segment_id : null };
+    records.push(record);
+    if (host) {
+      const bucket = bySegment.get(host.segment_id);
+      if (bucket) bucket.push(record);
+      else bySegment.set(host.segment_id, [record]);
+    } else {
+      loose.push(record);
+    }
+  }
+
+  checks.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+  loose.sort(sortByStart);
+  for (const bucket of bySegment.values()) bucket.sort(sortByStart);
+  return { records, checks, bySegment, loose };
+}
+
+function sortByStart(a: DayRecord, b: DayRecord): number {
+  const left = String(a.fact.started_at ?? '');
+  const right = String(b.fact.started_at ?? '');
+  return left.localeCompare(right) || a.fact.activity_id.localeCompare(b.fact.activity_id);
+}
+
+/** 此刻的情景：`running` **且** 有效期未过。过期即未知，不念旧账。 */
+export function currentScene(
+  facts: readonly LifeTimelineFact[],
+  now: Date,
+): LifeTimelineFact | null {
+  return (
+    facts.find((fact) => {
+      if (fact.state !== 'running') return false;
+      const until = toDate(fact.scene_valid_until);
+      return Boolean(until && until.getTime() > now.getTime());
+    }) ?? null
+  );
+}
+
+/**
+ * 下一项计划：**开始时刻晚于现在**的叶段。
+ *
+ * 已经开始的那一段不在这里再说一遍——它由此刻那一块承担。已经过去的也不选。
+ */
+export function nextPlannedSegment(
+  segments: readonly LifeTimelineSegment[],
+  now: Date,
+): LifeTimelineSegment | null {
+  const nowMs = now.getTime();
+  return (
+    segments
+      .filter((segment) => segment.status === 'current' && segment.is_leaf)
+      .filter((segment) => {
+        const start = toDate(segment.display_start_at);
+        return Boolean(start && start.getTime() > nowMs);
+      })
+      .sort((a, b) => a.display_start_at.localeCompare(b.display_start_at))[0] ?? null
+  );
+}
+
 /**
  * 事实的措辞。**证据不足就不能说"做过"**：
  * `clock_only` 只证明时间到了，`scene_valid_until=null` 表示此刻未知。
  */
+/**
+ * 记录的可见区间文案。
+ *
+ * 跨午夜时，被截断的那一端写成 **24:00**（而不是 23:59）：读者要知道
+ * "它一直持续到午夜"，而不是"它在 23:59 结束了"。
+ */
+export function formatRecordRange(
+  visible: { start: string | null; end: string | null; crossesForward: boolean; crossesBackward: boolean },
+  timeZone: string,
+): string {
+  const from = formatInZone(visible.start, timeZone);
+  let to = formatInZone(visible.end, timeZone);
+  if (visible.crossesForward && to === '23:59') to = '24:00';
+  if (!from && !to) return '';
+  return `${from || '—'}–${to || '—'}`;
+}
+
+/** 这条记录此刻还算不算"正在进行"：`running` 且有效期未过。 */
+export function isLiveNow(fact: LifeTimelineFact, now: Date): boolean {
+  if (fact.state !== 'running') return false;
+  const until = toDate(fact.scene_valid_until);
+  return Boolean(until && until.getTime() > now.getTime());
+}
+
+/**
+ * 记录的措辞。比 `evidenceLabel` 多一层：**正在进行的不叫"做过"**。
+ *
+ * 没有结束时刻的 running 记录，情景还有效时说「进行中」；情景过期后它只是
+ * 一条停在过去的记录，措辞退回「记录在此停下」——此刻那一块已经说未知了，
+ * 这里不能替它作证。
+ */
+export function factStateLabel(fact: LifeTimelineFact, now: Date): string {
+  if (fact.state === 'running') return isLiveNow(fact, now) ? '进行中' : '记录在此停下';
+  return evidenceLabel(fact.evidence_kind);
+}
+
 export function evidenceLabel(evidenceKind: string): string {
   switch (evidenceKind) {
     case 'clock_only':
@@ -295,16 +558,26 @@ export function sourceLabel(source: string): string {
 
 /** 活动的来源（与生活页旧列表同一套中文；未知值原样显示）。 */
 const FACT_ORIGIN_LABEL: Record<string, string> = {
-  simulated: '模拟',
+  simulated: '模拟日常',
+  // 后端写在 `activities.origin` 上的真实值是 `user_stated`（见 infra/models.py 的
+  // 注释）。这里同时收下 `user_statement`：那张表历史上两种拼法都出现过，
+  // 漏一个就会把内部代码 `user_stated` 直接显示给读者。
+  user_stated: '你说的',
   user_statement: '你说的',
   external_observation: '观察到的',
   verified_source: '查到的',
-  tool_receipt: '有回执',
+  tool_receipt: '工具回执',
   model_inference: '推测',
 };
 
+/**
+ * 来源措辞。**未知来源不原样露出**：`origin` 是自由字符串，
+ * 把 `foo_bar` 摆到界面上说明不了任何事，只会像一处没做完的占位。
+ */
 export function factOriginLabel(origin: string): string {
-  return FACT_ORIGIN_LABEL[origin] ?? origin;
+  const raw = String(origin ?? '').trim();
+  if (!raw) return '来源未标注';
+  return FACT_ORIGIN_LABEL[raw] ?? '其他来源';
 }
 
 export interface StateCopy {
@@ -451,28 +724,78 @@ export function segmentEmptyText(
 
 /* ---------------------------------------------------------------- 子组件 */
 
-function SegmentFacts({ facts, timeZone }: { facts: LifeTimelineFact[]; timeZone: string }) {
-  if (facts.length === 0) return null;
+interface RecordRowProps {
+  record: DayRecord;
+  now: Date;
+  timeZone: string;
+  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+  /** 没有宿主的记录：加一层虚线和「不属于任何时段」。 */
+  loose?: boolean;
+  testIdPrefix: string;
+}
+
+/**
+ * 一条活动记录。**唯一的呈现方式**——段内、独立列表都走这里，
+ * 所以措辞、时间口径、跨午夜处理不会在两处漂移。
+ */
+export function RecordRow({ record, now, timeZone, timeline, loose = false, testIdPrefix }: RecordRowProps) {
+  const fact = record.fact;
+  const live = isLiveNow(fact, now);
+  const visible = visibleRange(fact, timeline);
+  const shown = formatRecordRange(visible, timeZone) || '时间未知';
+  const realRange =
+    fact.started_at && fact.ended_at
+      ? `${formatDayTimeInZone(fact.started_at, timeZone)}–${formatDayTimeInZone(fact.ended_at, timeZone)}`
+      : '';
+  return (
+    <li
+      className={`tl-fact tl-fact--solid${live ? ' tl-fact--live' : ''}${loose ? ' tl-fact--loose' : ''}`}
+      data-testid={`${testIdPrefix}-${fact.activity_id}`}
+      data-evidence={fact.evidence_kind}
+      data-state={fact.state}
+      data-origin={fact.origin}
+    >
+      <span className="tl-fact__name">{activityName(fact.kind)}</span>
+      <span className="tl-fact__label">{factStateLabel(fact, now)}</span>
+      <span className="tl-fact__time">
+        {shown}
+        {visible.crossesForward ? ' · 跨到次日' : ''}
+        {visible.crossesBackward ? ' · 从前一天延续' : ''}
+      </span>
+      <span className="tl-fact__kind">{factOriginLabel(fact.origin)}</span>
+      {realRange && (visible.crossesForward || visible.crossesBackward) ? (
+        <span className="tl-fact__real">真实起止 {realRange}</span>
+      ) : null}
+      {live && fact.scene_valid_until ? (
+        <span className="tl-fact__scene">情景有效至 {formatInZone(fact.scene_valid_until, timeZone)}</span>
+      ) : null}
+    </li>
+  );
+}
+
+function SegmentFacts({
+  records,
+  now,
+  timeZone,
+  timeline,
+}: {
+  records: readonly DayRecord[];
+  now: Date;
+  timeZone: string;
+  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+}) {
+  if (records.length === 0) return null;
   return (
     <ul className="tl-seg__facts">
-      {facts.map((fact) => (
-        <li
-          key={fact.activity_id}
-          className="tl-fact tl-fact--solid"
-          data-testid={`tl-fact-${fact.activity_id}`}
-          data-evidence={fact.evidence_kind}
-        >
-          {/* 实心 = 有证据的已发生；与虚线/浅色的计划段在类名与语义上都分开。 */}
-          <span className="tl-fact__label">{evidenceLabel(fact.evidence_kind)}</span>
-          <span className="tl-fact__time">
-            {formatRangeInZone(fact.started_at, fact.ended_at, timeZone) || '时间未知'}
-          </span>
-          <span className="tl-fact__scene">
-            {fact.scene_valid_until
-              ? `情景有效至 ${formatInZone(fact.scene_valid_until, timeZone)}`
-              : '此刻情景状态未知'}
-          </span>
-        </li>
+      {records.map((record) => (
+        <RecordRow
+          key={record.fact.activity_id}
+          record={record}
+          now={now}
+          timeZone={timeZone}
+          timeline={timeline}
+          testIdPrefix="tl-fact"
+        />
       ))}
     </ul>
   );
@@ -481,21 +804,19 @@ function SegmentFacts({ facts, timeZone }: { facts: LifeTimelineFact[]; timeZone
 interface SegmentRowProps {
   node: SegmentNode;
   depth: number;
-  facts: readonly LifeTimelineFact[];
+  /** 合并结果：段 id → 它名下的记录。**不再**在这里自己过滤 facts。 */
+  bySegment: ReadonlyMap<string, DayRecord[]>;
   now: Date;
   timeZone: string;
+  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
   collapsed: ReadonlySet<string>;
   onToggle: (segmentId: string) => void;
 }
 
-function SegmentRow({ node, depth, facts, now, timeZone, collapsed, onToggle }: SegmentRowProps) {
+function SegmentRow({ node, depth, bySegment, now, timeZone, timeline, collapsed, onToggle }: SegmentRowProps) {
   const segment = node.segment;
   const phase = segmentPhase(segment, now);
-  const ownFacts = factsForSegment(
-    facts,
-    segment,
-    node.children.map((child) => child.segment),
-  );
+  const ownFacts = bySegment.get(segment.segment_id) ?? [];
   const hasChildren = node.children.length > 0;
   const isCollapsed = collapsed.has(segment.segment_id);
   const tag = commitmentTag(segment);
@@ -549,7 +870,7 @@ function SegmentRow({ node, depth, facts, now, timeZone, collapsed, onToggle }: 
             {formatRangeInZone(segment.display_start_at, segment.display_end_at, timeZone)}
           </span>
         </div>
-        <SegmentFacts facts={ownFacts} timeZone={timeZone} />
+        <SegmentFacts records={ownFacts} now={now} timeZone={timeZone} timeline={timeline} />
         {segment.continues_next_day ? (
           <span className="tl-seg__edge tl-seg__edge--next" data-testid="tl-continues-next">
             → 次日
@@ -564,9 +885,10 @@ function SegmentRow({ node, depth, facts, now, timeZone, collapsed, onToggle }: 
               key={child.segment.segment_id}
               node={child}
               depth={depth + 1}
-              facts={facts}
+              bySegment={bySegment}
               now={now}
               timeZone={timeZone}
+              timeline={timeline}
               collapsed={collapsed}
               onToggle={onToggle}
             />
@@ -579,8 +901,10 @@ function SegmentRow({ node, depth, facts, now, timeZone, collapsed, onToggle }: 
 
 export interface TimelineTrackProps {
   segments: readonly LifeTimelineSegment[];
-  facts: readonly LifeTimelineFact[];
+  /** 合并结果：段 id → 记录的归属表。记录只从这里进来，不再各自过滤 facts。 */
+  bySegment: ReadonlyMap<string, DayRecord[]>;
   timeZone: string;
+  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
   now: Date;
   /** 默认收起的父段 id（只作初始值；展开/收起由组件自己的状态管）。 */
   defaultCollapsed?: readonly string[];
@@ -592,8 +916,9 @@ export interface TimelineTrackProps {
  */
 export function TimelineTrack({
   segments,
-  facts,
+  bySegment,
   timeZone,
+  timeline,
   now,
   defaultCollapsed = [],
 }: TimelineTrackProps) {
@@ -616,9 +941,10 @@ export function TimelineTrack({
           key={node.segment.segment_id}
           node={node}
           depth={0}
-          facts={facts}
+          bySegment={bySegment}
           now={now}
           timeZone={timeZone}
+          timeline={timeline}
           collapsed={collapsed}
           onToggle={toggle}
         />
@@ -777,48 +1103,59 @@ function UnplannedPeriods({ timeline }: { timeline: LifeTimelineOut }) {
   );
 }
 
-export function TimelineFactsLane({
-  facts,
+/**
+ * 「时间检查」：`clock_only` 的落点。
+ *
+ * 这些记录只证明"时间到了"，不能证明她做过什么，所以**不进时间线主体**，
+ * 也不参与计划执行关系的表达。它们是可展开的一组，保留时间与来源。
+ *
+ * 之前这里是右列的「事实（有证据的已发生）」全量清单——那正是同一条活动
+ * 在页面里出现第二次的地方。清单删掉，只留这一组"仅到时"的检查。
+ */
+export function TimelineChecks({
+  checks,
   hiddenCount,
   timeZone,
 }: {
-  facts: readonly LifeTimelineFact[];
+  checks: readonly LifeTimelineFact[];
   hiddenCount: number;
   timeZone: string;
 }) {
+  if (checks.length === 0 && hiddenCount === 0) return null;
+  const empty = checks.length === 0;
   return (
-    <section className="tl-facts" aria-label="事实层">
-      <h3 className="tl-facts__title">事实（有证据的已发生）</h3>
-      {facts.length === 0 ? (
-        <p className="tl-facts__empty">
-          {hiddenCount > 0
-            ? `有 ${hiddenCount} 条活动因受众裁决被隐藏——不是没有发生。`
-            : '还没有带证据的活动记录。'}
+    <details className="tl-checks" data-testid="tl-checks" data-count={checks.length}>
+      <summary>
+        <span className="tl-checks__title">时间检查</span>
+        {empty ? null : <span className="tl-checks__count">{checks.length}</span>}
+        <span className="tl-checks__hint">
+          {empty ? '还没有仅到时的检查。' : '只证明时间到了，不代表她做过'}
+        </span>
+      </summary>
+      {hiddenCount > 0 ? (
+        <p className="tl-checks__hidden">
+          另有 {hiddenCount} 条活动因受众裁决被隐藏——不是没有发生。
         </p>
-      ) : (
-        <ul className="tl-facts__list">
-          {facts.map((fact) => (
+      ) : null}
+      {empty ? null : (
+        <ul className="tl-checks__list">
+          {checks.map((fact) => (
             <li
               key={fact.activity_id}
-              className="tl-fact tl-fact--solid"
-              data-testid={`tl-fact-lane-${fact.activity_id}`}
+              className="tl-check"
+              data-testid={`tl-check-${fact.activity_id}`}
               data-evidence={fact.evidence_kind}
             >
-              <span className="tl-fact__label">{evidenceLabel(fact.evidence_kind)}</span>
-              <span className="tl-fact__time">
+              <span className="tl-check__time">
                 {formatRangeInZone(fact.started_at, fact.ended_at, timeZone) || '时间未知'}
               </span>
-              <span className="tl-fact__kind">{factOriginLabel(fact.origin)}</span>
-              <span className="tl-fact__scene">
-                {fact.scene_valid_until
-                  ? `情景有效至 ${formatDayTimeInZone(fact.scene_valid_until, timeZone)}`
-                  : '此刻情景状态未知'}
-              </span>
+              <span className="tl-check__origin">{factOriginLabel(fact.origin)}</span>
+              <span className="tl-check__label">{activityName(fact.kind)}</span>
             </li>
           ))}
         </ul>
       )}
-    </section>
+    </details>
   );
 }
 
@@ -937,6 +1274,8 @@ export interface LifeTimelineProps {
 export function LifeTimeline({ timeline, now, defaultCollapsed, onRetry }: LifeTimelineProps) {
   const at = now ?? new Date();
   const timeZone = timeline.display_timezone;
+  // 合并一次，下面所有渲染都从这里取：记录只出现一次，是这一层的责任。
+  const merged = mergeDayTimeline(timeline);
   return (
     <section className="tl" data-testid="life-timeline" data-state={timeline.state}>
       <TimelineHeader timeline={timeline} onRetry={onRetry} />
@@ -950,29 +1289,50 @@ export function LifeTimeline({ timeline, now, defaultCollapsed, onRetry }: LifeT
         </p>
       ) : (
         <>
-          <div className={`tl-body${timeline.facts.length === 0 ? ' tl-body--no-facts' : ''}`}>
-            <div className="tl-plans">
-              <h3 className="tl-plans__title">今日计划</h3>
-              <p className="tl-plans__hint">时段表示预计安排，活动记录另列。</p>
-              {timeline.segments.length === 0 ? (
-                <p className="tl-plans__empty">{segmentEmptyText(timeline)}</p>
-              ) : (
-                <TimelineTrack
-                  segments={timeline.segments}
-                  facts={timeline.facts}
-                  timeZone={timeZone}
-                  now={at}
-                  defaultCollapsed={defaultCollapsed ?? []}
-                />
-              )}
-              <UnplannedPeriods timeline={timeline} />
-            </div>
-            <TimelineFactsLane
-              facts={timeline.facts}
-              hiddenCount={timeline.hidden_fact_count}
-              timeZone={timeZone}
-            />
+          <div className="tl-plans">
+            <h3 className="tl-plans__title">今日计划</h3>
+            {/*
+              这句话必须留着：活动落在某个时段旁边只是排版依据，
+              它**不表示**计划被执行了。没有这句，挨着放就会被读成"这一段做成了"。
+            */}
+            <p className="tl-plans__hint">时段表示预计安排；挨着的活动只是按时间排在一起，不代表计划被执行。</p>
+            {timeline.segments.length === 0 ? (
+              <p className="tl-plans__empty">{segmentEmptyText(timeline)}</p>
+            ) : (
+              <TimelineTrack
+                segments={timeline.segments}
+                bySegment={merged.bySegment}
+                timeZone={timeZone}
+                timeline={timeline}
+                now={at}
+                defaultCollapsed={defaultCollapsed ?? []}
+              />
+            )}
+            {merged.loose.length > 0 ? (
+              <section className="tl-loose" data-testid="tl-loose">
+                <h4 className="tl-loose__title">不属于任何时段</h4>
+                <ul className="tl-loose__list">
+                  {merged.loose.map((record) => (
+                    <RecordRow
+                      key={record.fact.activity_id}
+                      record={record}
+                      now={at}
+                      timeZone={timeZone}
+                      timeline={timeline}
+                      loose
+                      testIdPrefix="tl-fact-loose"
+                    />
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            <UnplannedPeriods timeline={timeline} />
           </div>
+          <TimelineChecks
+            checks={merged.checks}
+            hiddenCount={timeline.hidden_fact_count}
+            timeZone={timeZone}
+          />
           <IntentSection
             intents={timeline.intents}
             horizonUnplanned={timeline.horizon_unplanned}

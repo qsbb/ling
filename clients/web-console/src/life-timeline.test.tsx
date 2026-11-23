@@ -449,21 +449,44 @@ describe('计划层与事实层分开', () => {
     expect(html).toContain('做过');
   });
 
-  it('同一事实只挂一次（父段不再重复子段里的事实）', () => {
+  it('同一事实只出现一次：有证据的挂段内，clock_only 只进时间检查', () => {
     const html = renderTimeline();
-    const occurrences = html.split('data-testid="tl-fact-fact-clock"').length - 1;
-    expect(occurrences).toBe(1);
-    const observed = html.split('data-testid="tl-fact-fact-observed"').length - 1;
-    expect(observed).toBe(1);
+    // clock_only 不再是时间线上的一条记录——它只出现在「时间检查」里。
+    expect(html.split('data-testid="tl-check-fact-clock"').length - 1).toBe(1);
+    expect(html.split('data-testid="tl-fact-fact-clock"').length - 1).toBe(0);
+    // observed 挂在段内恰好一次；右列那份全量清单已经删掉，不会再有第二处。
+    expect(html.split('data-testid="tl-fact-fact-observed"').length - 1).toBe(1);
+    expect(html).not.toContain('data-testid="tl-fact-lane-fact-observed"');
   });
 
-  it('scene_valid_until=null 时说「此刻情景状态未知」', () => {
-    const html = renderTimeline();
-    expect(html).toContain('此刻情景状态未知');
+  /**
+   * 有效期是判断"此刻"的唯一依据。
+   *
+   * 两条输入的差别**只在** `scene_valid_until`（相对 `NOW` 之前/之后），
+   * 所以两条断言合起来才叫"按有效期判"：只看 state=running 的实现会让第二条绿、
+   * 第一条也绿；只看"有没有结束时间"的实现两条都会绿。
+   */
+  it('有效期未过才标注「情景有效至」，过期后措辞退回「记录在此停下」', () => {
     const valid = renderTimeline({
-      facts: [fact('fact-valid', { scene_valid_until: '2026-11-08T01:00:00Z' })],
+      facts: [fact('fact-valid', {
+        state: 'running',
+        started_at: '2026-11-07T23:00:00Z',      // NOW=00:10Z，未结束
+        scene_valid_until: '2026-11-08T09:00:00Z', // 比 NOW 晚 → 有效
+      })],
     });
     expect(valid).toContain('情景有效至');
+    expect(valid).toContain('进行中');
+
+    const expired = renderTimeline({
+      facts: [fact('fact-expired', {
+        state: 'running',
+        started_at: '2026-11-07T23:00:00Z',
+        scene_valid_until: '2026-11-08T00:01:00Z', // 比 NOW 早 → 过期
+      })],
+    });
+    expect(expired).not.toContain('情景有效至');
+    expect(expired).not.toContain('进行中');
+    expect(expired).toContain('记录在此停下');
   });
 });
 
@@ -737,8 +760,9 @@ describe('TimelineTrack 单独渲染', () => {
     const html = renderToStaticMarkup(
       h(TimelineTrack, {
         segments: [orphan],
-        facts: [],
+        bySegment: new Map(),
         timeZone: DISPLAY_TZ,
+        timeline: { display_date: '2026-11-08', display_timezone: DISPLAY_TZ },
         now: NOW,
       }),
     );

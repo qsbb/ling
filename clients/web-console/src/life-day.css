@@ -147,3 +147,35 @@
   .life-day-list li > div > span { display: block; margin-top: 5px; }
   .life-day-empty, .life-happened { margin-left: 66px; }
 }
+
+/* 「接下来」：此刻之下、时间线之上的一行。
+ * 它只承担一件事——现在之后的第一件计划。不要再加"下一项计划"这类标题，
+ * 位置和字号已经把"次要于此刻、优先于整天列表"说清楚了。 */
+.life-next {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 16px 5px 0;
+  padding: 11px 15px;
+  border: 1px solid #e3dccd;
+  border-radius: 12px;
+  background: #faf7f0;
+}
+
+.life-next__label { color: #a29c8c; font-size: 11px; letter-spacing: .1em; }
+.life-next__title { color: #55574e; font-size: 14px; font-weight: 500; }
+.life-next__time { margin-left: auto; color: #a29c8c; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.life-happened__state { color: #aaa395; font-size: 11.5px; }
+
+@media (max-width: 460px) {
+  .life-next__time { margin-left: 0; }
+}
+
+/* 兜底路径（时间轴读不到）才有的一句近况。 */
+.life-hero__note { max-width: 390px; margin: 10px 0 0; color: #888578; font-size: 13px; line-height: 1.8; }
+
+/* 首屏只报"留下几条"，内容在完整安排里（避免同一条活动出现两次）。 */
+.life-happened-count { margin: 14px 0 0 76px; color: #969184; font-size: 13px; }
+@media (max-width: 460px) { .life-happened-count { margin-left: 66px; } }
