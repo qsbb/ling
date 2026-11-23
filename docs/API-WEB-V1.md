@@ -48,6 +48,7 @@
 | GET | `/v1/sessions/{id}/recall-proposals` | 她提议撤回、**等用户确认**的那些（见 §3B） |
 | POST | `/v1/sessions/{id}/recall-proposals/{pid}/confirm` | 确认 → 真的撤回（走同一条工具 handler） |
 | POST | `/v1/sessions/{id}/recall-proposals/{pid}/decline` | 不要撤 → `204`，**平台零调用** |
+| GET / PUT | `/v1/sessions/{id}/onebot-deferred` | 所有者读取或更新 OneBot 私聊的晚回设置。请求和响应使用 `{"enabled": true}` 或 `{"enabled": false}`。默认关闭。开启时须有已确认的接入实例，否则返回 409。 |
 
 `ChatMessage` 来自 `contracts/v1`。`TurnView`：
 

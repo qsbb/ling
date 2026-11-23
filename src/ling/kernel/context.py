@@ -1499,7 +1499,14 @@ class ContextCompiler:
         # 被拒登记、按立即回复处理——用户看到"她说要晚点回，结果立刻回了"。
         #
         # 现在两处读同一个判据：给她的选项就是真的能执行的选项。
-        if defer_available(turn_env):
+        onebot_target = None
+        if channel == "onebot" and not is_group and user_text.strip():
+            from ling.kernel.onebot_deferred import current_onebot_target
+
+            onebot_target = await current_onebot_target(
+                self._session, window_id=window_id, subject_id=subject_id,
+            )
+        if defer_available(turn_env) or onebot_target is not None:
             contributions.append(
                 ContextContribution(
                     lane="capabilities",

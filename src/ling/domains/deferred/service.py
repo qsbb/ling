@@ -118,6 +118,7 @@ async def schedule(
     requested_delay_ms: int,
     clamped: bool,
     now: datetime | None = None,
+    delivery_target: dict | None = None,
 ) -> DeferredReply | None:
     """登记一条延后回复。返回**新建**的行；重复登记返回 ``None``。
 
@@ -138,6 +139,7 @@ async def schedule(
         subject_id=subject_id,
         source_turn_id=source_turn_id,
         source_message_id=source_message_id,
+        delivery_target=delivery_target,
         input_sequence=int(input_sequence),
         requested_delay_ms=int(requested_delay_ms),
         applied_delay_ms=int(applied_delay_ms),

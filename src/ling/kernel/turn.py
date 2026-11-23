@@ -2231,7 +2231,24 @@ class TurnCoordinator:
 
         window = await conversation.session.get(Window, window_id)
         channel = str(getattr(window, "channel", "") or "")
-        if channel not in deferred.SUPPORTED_CHANNELS:
+        delivery_target = None
+        source_message_id = None
+        if channel == "onebot" and user_text.strip():
+            from ling.kernel.onebot_deferred import current_onebot_target
+
+            delivery_target = await current_onebot_target(
+                conversation.session, window_id=window_id, subject_id=subject_id, settings=self._settings,
+            )
+            if delivery_target is None:
+                return None
+            source = await conversation.session.scalar(select(Message).where(
+                Message.turn_id == turn_id, Message.window_id == window_id,
+                Message.role == "user", Message.retracted_at.is_(None),
+            ).order_by(Message.sequence.desc()).limit(1))
+            if source is None:
+                return None
+            source_message_id, sequence = source.id, source.sequence
+        elif channel not in deferred.SUPPORTED_CHANNELS:
             # 不支持的渠道：**不登记**，让她正常回。
             # 登记了却到点发不出去，用户会白等一轮——比不支持更糟。
             logger.info(
@@ -2245,11 +2262,12 @@ class TurnCoordinator:
             window_id=window_id,
             subject_id=subject_id,
             source_turn_id=turn_id,
-            source_message_id=None,
+            source_message_id=source_message_id,
             input_sequence=int(sequence or 0),
             applied_delay_ms=int(intent.applied_seconds) * 1000,
             requested_delay_ms=int(intent.requested_seconds) * 1000,
             clamped=bool(intent.clamped),
+            delivery_target=delivery_target,
         )
         if row is None:
             # 同一轮已经有一条了（重试 / 两个入口都解析到标记）。
