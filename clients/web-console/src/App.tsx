@@ -6,6 +6,7 @@ import { AccountPage } from './components/AccountPage';
 import { BackupRestorePage } from './components/BackupRestorePage';
 import { ChangePasswordView } from './components/ChangePasswordView';
 import { DashboardPage } from './components/DashboardPage';
+import { DesktopPage } from './components/DesktopPage';
 import { LoginView } from './components/LoginView';
 import { ConsentPage } from './components/ConsentPage';
 import { ConnectorsPage } from './components/ConnectorsPage';
@@ -90,6 +91,16 @@ export function mainPage(props: MainPageProps): ReactElement {
     case 'logs':
       // 日志页自己拉数据、自己轮询，不需要壳层传会话/设置上下文。
       return <LogsPage />;
+    case 'desktop':
+      // 桌面任务页：**入口**只对所有者出现，但**路由**对所有人都存在。
+      // 成员直接敲地址时先在壳层挡下，给同一块"只对所有者开放"的说明——
+      // 不是 404（地址没错，是权限不够），也不让页面先发一轮注定 403 的请求。
+      // 页面里仍然保留 403 分支：所有者会话在浏览中被降级时，第一拍就会撞上它。
+      return user.role === 'owner' ? (
+        <DesktopPage siteUrl={props.siteUrl} />
+      ) : (
+        <DesktopForbiddenPage />
+      );
     case 'privacy':
       return <ConsentPage onBack={goSettings} />;
     case 'account':
@@ -192,6 +203,42 @@ export function UnknownRoutePage({
   return <NotFoundPage detail={String(unknown?.name ?? '未知')} onGo={onGo} />;
 }
 
+/**
+ * 成员直接访问 `/desktop` 时的说明。
+ *
+ * 与页面内部的 403 分支共用同一套文案意图：说清**为什么**只有所有者能进
+ * （配对令牌能让一台电脑登录并写记事本），而不是一句"无权限"。
+ */
+export function DesktopForbiddenPage(): ReactElement {
+  return (
+    <section className="page" data-testid="desktop-forbidden">
+      <h1 className="page__title">Windows 桌面任务</h1>
+      <div className="banner banner--error desktop-banner" role="alert">
+        <AlertIcon />
+        <div className="desktop-banner__body">
+          <strong>这个页面只对所有者开放</strong>
+          <div className="banner__detail">
+            配对令牌能让那台电脑登录并写记事本，所以配对、暂停与限时授权都只给所有者。
+            当前账号是普通成员，接口会返回 403。
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * 启动命令里要填的 Ling 地址。
+ *
+ * 用当前页面的 `origin`：所有者就是从这台机器的这个地址登录的，Windows 那台
+ * 电脑要访问的也是同一个地址（反代后面则由反代决定 origin）。取不到 origin
+ * （SSR/静态渲染）时给空串，`launchCommand` 会显示一个占位符而不是编一个域名。
+ */
+export function siteUrlOf(): string {
+  if (typeof window === 'undefined') return '';
+  return window.location.origin;
+}
+
 export interface MainPageProps {
   route: Route;
   user: UserInfo;
@@ -206,6 +253,8 @@ export interface MainPageProps {
   live?: ReturnType<typeof useCurrentLive>;
   liveActivity?: string;
   onStopLive?: () => void;
+  /** 当前站点的 origin，拼配对命令里的 `--url` 用。 */
+  siteUrl: string;
 }
 
 export interface AppShellProps {
@@ -445,6 +494,7 @@ export function AppShell({
               onGo,
               live,
               liveActivity,
+              siteUrl: siteUrlOf(),
               onStopLive: () => { if (stopId) setConfirmLiveStop(stopId); },
             })}
           </main>

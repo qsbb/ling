@@ -75,6 +75,7 @@ import type {
 } from './types';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
 import type { CurrentLive, LiveConnector, LiveConnectorInput, LivePlan, LiveSession, LiveViewer } from './live';
+import type { DesktopActivityStatus, DesktopStatus, DesktopTask } from './desktop';
 
 /** 两个导入端点的请求格式：文件原始字节，NDJSON。 */
 export const IMPORT_CONTENT_TYPE = 'application/x-ndjson';
@@ -1578,6 +1579,74 @@ export const api = {
       cache: 'no-store',
       ...(signal ? { signal } : {}),
     });
+  },
+
+  /* ------------------------------------------------------ Windows 桌面任务
+   *
+   * 只有所有者能调（普通成员收到 403）。写请求走同源 Cookie + JSON，
+   * 与其它写接口一致；`PUT /pair` 的响应**唯一一次**带令牌，
+   * `request()` 不缓存响应，也不把令牌写进任何日志。
+   */
+
+  /** `GET /v1/desktop`：设备、暂停开关、最近 20 条任务（新的在前）。 */
+  desktopStatus(signal?: AbortSignal): Promise<DesktopStatus> {
+    return request<DesktopStatus>('/v1/desktop', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /**
+   * 生成配对令牌。**重新配对**会立刻替换旧令牌、终止在途任务并暂停接收——
+   * 这些后果由界面在点之前讲清，接口本身不确认。
+   */
+  pairDesktop(name: string): Promise<{ token: string }> {
+    return request<{ token: string }>('/v1/desktop/pair', jsonInit('PUT', { name }));
+  },
+
+  /** 解除配对：撤销令牌、保留任务历史。204 无响应体。 */
+  unpairDesktop(): Promise<void> {
+    return request<void>('/v1/desktop/pair', { method: 'DELETE' });
+  },
+
+  /** 暂停/恢复接收。恢复要求伴生端就绪，否则 409 `desktop_not_ready`。 */
+  controlDesktop(paused: boolean): Promise<DesktopStatus> {
+    return request<DesktopStatus>('/v1/desktop/control', jsonInit('PUT', { paused }));
+  },
+
+  /**
+   * 提交一段测试文本。`request_id` 是 UUID v4，**重试必须沿用同一个**：
+   * 同号同文返回同一条任务（幂等），同号异文 409 `request_id_conflict`。
+   */
+  createDesktopTask(requestId: string, text: string): Promise<DesktopTask> {
+    return request<DesktopTask>('/v1/desktop/tasks', jsonInit('POST', { request_id: requestId, text }));
+  },
+
+  /** 取消单条任务。已结束的任务返回原结果，不会把成功的说成取消。 */
+  cancelDesktopTask(taskId: string): Promise<DesktopTask> {
+    return request<DesktopTask>(`/v1/desktop/tasks/${encodeURIComponent(taskId)}/cancel`, {
+      method: 'POST',
+    });
+  },
+
+  /** `GET /v1/desktop/autonomy`：当前限时授权，没有则 `grant: null`。 */
+  desktopAutonomy(signal?: AbortSignal): Promise<DesktopActivityStatus> {
+    return request<DesktopActivityStatus>('/v1/desktop/autonomy', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /** 保存一份限时授权（新授权替换旧的）。`request_id` 规则同任务提交。 */
+  authorizeDesktopActivity(
+    body: { request_id: string; start_at: string; end_at: string; text: string },
+  ): Promise<DesktopActivityStatus> {
+    return request<DesktopActivityStatus>('/v1/desktop/autonomy', jsonInit('PUT', body));
+  },
+
+  /** 撤销授权，返回撤销后的那份（`decision: "revoked"`）。 */
+  revokeDesktopActivity(): Promise<DesktopActivityStatus> {
+    return request<DesktopActivityStatus>('/v1/desktop/autonomy', { method: 'DELETE' });
   },
 };
 

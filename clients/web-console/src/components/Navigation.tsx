@@ -25,6 +25,7 @@ import {
   ChevronIcon,
   CloseIcon,
   DashboardIcon,
+  DesktopIcon,
   LifeIcon,
   LogoutIcon,
   LogsIcon,
@@ -45,6 +46,8 @@ export type NavSectionId =
   | 'live'
   | 'life'
   | 'logs'
+  /** Windows 桌面任务：**只对所有者**出现的入口（见 `PRIMARY_NAV` 的注释）。 */
+  | 'desktop'
   | 'settings';
 
 export interface NavItemSpec {
@@ -101,15 +104,15 @@ export const LIVE_GROUP: readonly NavItemSpec[] = [
   { id: 'live', testid: 'nav-live', label: '直播', path: '/live' },
 ];
 
+const OWNER_NAV: readonly NavItemSpec[] = [
+  { id: 'desktop', testid: 'nav-desktop', label: '桌面', path: '/desktop' },
+];
+
 /**
- * 展开后的导航序列 = 主组 + 直播组。`grouped` 只用于表达组边界（间距/分隔线），
- * **不改顺序语义**：扁平化之后仍然是「关系 → 直播 → 生活 → 日志」。
- *
- * 桌面 rail、展开态与窄屏抽屉都调这一个函数——三处的项、顺序、高亮
- * 只有一份来源，抽屉不会是另一份手写列表。
+ * 桌面侧栏与窄屏抽屉共用顺序。所有者可直接进入直播和桌面任务。
  */
 export function navGroups(forOwner: boolean): readonly (readonly NavItemSpec[])[] {
-  return forOwner ? [PRIMARY_NAV, LIVE_GROUP] : [PRIMARY_NAV];
+  return forOwner ? [PRIMARY_NAV, LIVE_GROUP, OWNER_NAV] : [PRIMARY_NAV];
 }
 
 export function visibleNav(forOwner: boolean): readonly NavItemSpec[] {
@@ -138,6 +141,7 @@ const ICONS: Record<NavSectionId, ReactElement> = {
   memory: <MemoryIcon />,
   persona: <PersonaIcon />,
   relationships: <RelationshipsIcon />,
+  desktop: <DesktopIcon />,
   live: <StopIcon />,
   life: <LifeIcon />,
   logs: <LogsIcon />,
@@ -178,6 +182,8 @@ export function activeNavId(route: Route): NavSectionId | null {
       return 'live';
     case 'logs':
       return 'logs';
+    case 'desktop':
+      return 'desktop';
     case 'settings':
     case 'model':
     case 'privacy':
@@ -261,7 +267,7 @@ function NavGroups({
         <ul
           key={group[0]?.testid ?? `group-${index}`}
           className="sidenav__list"
-          data-nav-group={group[0]?.id === 'live' ? 'live' : 'primary'}
+          data-nav-group={group === PRIMARY_NAV ? 'primary' : group[0]?.id}
           data-group-first={index > 0 ? 'true' : undefined}
         >
           {group.map((item) => (
@@ -307,11 +313,7 @@ export interface SidenavProps {
   active: NavSectionId | null;
   expanded: boolean;
   version: string | null;
-  /**
-   * 是否所有者。**不是**「他有场次吗」：直播入口对所有者恒在，
-   * 场次状态只决定 `liveTone` 那个点。参数名刻意从 `showLive` 改过来——
-   * 旧名字会让下一个人以为这里还在做「按状态显隐」。
-   */
+  /** 是否展示所有者可用的直播与桌面入口。 */
   owner?: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
   onToggle: () => void;

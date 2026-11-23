@@ -1,0 +1,791 @@
+/**
+ * Windows 桌面任务的样式。
+ *
+ * 放在独立文件里，沿用其它页面的做法（`dashboard.css` / `logs.css`），
+ * 类名统一 `desktop-` 前缀，不碰共享的 `.panel` / `.banner` 规则——
+ * 那些是别的页面也在用的。
+ *
+ * 布局上只做一件事：**让"此刻能不能做事"排在最前**。
+ * 所以页面是「两块并排的状态 → 当前这一步 → 提交 → 授权 → 历史」的单列流，
+ * 桌面宽度下状态两块并排、正文限宽 980（沿用 `.page` 的公式）；
+ * 窄屏全部单列，按钮独占一行，触摸目标不小于 40px。
+ */
+
+.desktop-page {
+  gap: 16px;
+}
+
+.desktop-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .desktop-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.desktop-card {
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: var(--shadow-card);
+  min-width: 0;
+}
+
+.desktop-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.desktop-card__title {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.desktop-card__meta {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.desktop-card__meta[data-over='true'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.desktop-card__note {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------- 状态徽标 */
+
+.desktop-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.desktop-state__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  flex: none;
+}
+
+.desktop-state[data-state='ready'] {
+  border-color: #cfdcc6;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.desktop-state[data-state='ready'] .desktop-state__dot {
+  background: var(--ok);
+}
+
+.desktop-state[data-state='unavailable'] {
+  border-color: #e6d6ae;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.desktop-state[data-state='unavailable'] .desktop-state__dot {
+  background: var(--warn);
+}
+
+.desktop-state[data-state='offline'] {
+  border-color: var(--line-strong);
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------- 设备 */
+
+.desktop-device__id {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.desktop-device__name {
+  font-family: var(--font-serif);
+  font-size: 19px;
+  letter-spacing: 0.02em;
+  overflow-wrap: anywhere;
+}
+
+.desktop-device__seen {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.desktop-receive {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-md);
+  background: var(--paper-sunken);
+  border: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.desktop-receive__label {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.desktop-receive__value {
+  font-size: 13px;
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.desktop-receive[data-intent='accepting'] .desktop-receive__value {
+  color: var(--ok);
+}
+
+.desktop-receive[data-intent='paused'] .desktop-receive__value {
+  color: var(--warn);
+}
+
+/* 结论：整页唯一一句"现在能不能提交"。 */
+.desktop-verdict {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  padding-left: 11px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.desktop-verdict[data-tone='ok'] {
+  border-left-color: var(--ok);
+  color: var(--ok);
+}
+
+.desktop-verdict[data-tone='blocked'] {
+  border-left-color: var(--warn);
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------- 表单 */
+
+.desktop-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.desktop-form__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.desktop-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.desktop-field__label {
+  font-size: 12px;
+  color: var(--ink-faint);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.desktop-field__count {
+  font-size: 11px;
+  color: var(--ink-faint);
+  margin-left: auto;
+}
+
+.desktop-field__input {
+  width: 100%;
+  padding: 8px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  font-size: 13.5px;
+  min-height: 38px;
+}
+
+.desktop-field__input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--paper-raised);
+}
+
+.desktop-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  font-size: 13.5px;
+  line-height: 1.7;
+  resize: vertical;
+  min-height: 96px;
+  /* 空格与换行在编辑框里本来就是字面量，这里显式写出来：
+     任何 `white-space` 的改动都会让"保留空格"这条要求悄悄失效。 */
+  white-space: pre-wrap;
+  font-family: var(--font-ui);
+}
+
+.desktop-textarea--short {
+  min-height: 76px;
+}
+
+.desktop-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--paper-raised);
+}
+
+.desktop-inline-error {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--danger);
+  line-height: 1.6;
+}
+
+.desktop-danger-note {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid #e6d6ae;
+  border-radius: 10px;
+  padding: 8px 11px;
+}
+
+.desktop-confirm {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--paper-sunken);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.desktop-confirm p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------- 令牌 */
+
+.desktop-token {
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.desktop-token__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.desktop-token__warn {
+  font-size: 11.5px;
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.desktop-token__row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.desktop-token__value {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 12.5px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line-strong);
+  /* 43 字符在窄屏必须能换行，否则整页横向溢出。 */
+  overflow-wrap: anywhere;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.desktop-steps-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.desktop-steps-list code {
+  font-size: 12px;
+  background: var(--paper-raised);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+.desktop-command {
+  margin-top: 6px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.desktop-command pre {
+  margin: 0;
+  flex: 1 1 260px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: #f2ede2;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.desktop-token__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.desktop-unpair {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.desktop-unpair__open {
+  color: var(--danger);
+}
+
+/* ------------------------------------------------------------- 任务 */
+
+.desktop-tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.desktop-task {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 11px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  background: var(--paper);
+  min-width: 0;
+}
+
+.desktop-task[data-expanded='true'] {
+  background: var(--paper-raised);
+  border-color: var(--line-strong);
+}
+
+.desktop-task[data-state='succeeded'] {
+  border-left: 3px solid var(--ok);
+}
+
+.desktop-task[data-state='failed'] {
+  border-left: 3px solid var(--danger);
+}
+
+.desktop-task[data-state='interrupted'] {
+  border-left: 3px solid var(--warn);
+}
+
+.desktop-task[data-state='cancelled'] {
+  border-left: 3px solid var(--line-strong);
+}
+
+.desktop-task__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.desktop-outcome {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.desktop-outcome--ok {
+  color: var(--ok);
+}
+
+.desktop-outcome--error {
+  color: var(--danger);
+}
+
+.desktop-outcome--warn {
+  color: var(--warn);
+}
+
+.desktop-outcome--idle {
+  color: var(--ink-soft);
+}
+
+.desktop-task__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.desktop-task__reason {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--paper-sunken);
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
+}
+
+.desktop-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--line-strong);
+}
+
+/* 四步进度：连接线用伪元素画，避免额外 DOM。 */
+.desktop-track {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  counter-reset: step;
+}
+
+.desktop-track__step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--ink-faint);
+  padding-right: 6px;
+  min-width: 0;
+}
+
+.desktop-track__mark {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.desktop-track__step[data-done='true'] .desktop-track__mark {
+  background: var(--accent);
+}
+
+.desktop-track__step[data-current='true'] .desktop-track__mark {
+  background: linear-gradient(90deg, var(--accent) 50%, var(--line) 50%);
+}
+
+.desktop-track__step[data-current='true'] .desktop-track__label {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.desktop-track__label {
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.desktop-task[data-state='failed'] .desktop-track__step[data-done='true'] .desktop-track__mark {
+  background: var(--danger);
+}
+
+.desktop-task[data-state='interrupted'] .desktop-track__step[data-done='true'] .desktop-track__mark {
+  background: var(--warn);
+}
+
+.desktop-task__detail {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.desktop-task__text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  /* 反馈里最要紧的一条：用户提交的空格/换行必须原样显示，
+     否则"保留空格"这件事在界面上看不出是不是真的保留了。 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 9.5em;
+  overflow-y: auto;
+}
+
+.desktop-task__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.desktop-task__times {
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.desktop-tasks--single {
+  gap: 0;
+}
+
+/* ------------------------------------------------------------- 提交 */
+
+.desktop-submit__actions {
+  justify-content: flex-start;
+}
+
+.desktop-submit__blocked {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  line-height: 1.55;
+  flex: 1 1 240px;
+}
+
+.desktop-retry,
+.desktop-last-sent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-soft);
+  background: var(--paper-sunken);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 11px;
+}
+
+.desktop-last-sent {
+  background: transparent;
+  border-style: dashed;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------- 授权 */
+
+.desktop-grant__decision {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+}
+
+.desktop-grant__decision[data-decision='queued'] {
+  border-color: #cfdcc6;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.desktop-grant__decision[data-decision='pending'],
+.desktop-grant__decision[data-decision='deciding'] {
+  border-color: #e6d6ae;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.desktop-grant__decision[data-decision='unavailable'],
+.desktop-grant__decision[data-decision='expired'],
+.desktop-grant__decision[data-decision='revoked'] {
+  color: var(--ink-faint);
+}
+
+.desktop-grant__current {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  background: var(--paper);
+}
+
+.desktop-grant__range {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.desktop-grant__detail,
+.desktop-grant__task {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.desktop-grant__text {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 8em;
+  overflow-y: auto;
+}
+
+.desktop-grant__times {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+@media (max-width: 560px) {
+  .desktop-grant__times {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.desktop-live-note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------- 提示条 */
+
+.desktop-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.desktop-banner__body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.desktop-banner__text,
+.desktop-banner__code {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.desktop-banner__code {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+/* 窄屏：按钮独占一行，触摸目标不小于 40px（iOS 的最小可点尺寸）。 */
+@media (max-width: 640px) {
+  .desktop-card {
+    padding: 14px;
+  }
+
+  .desktop-form__actions > .button,
+  .desktop-form__actions > .ghost-button,
+  .desktop-submit__actions > .button,
+  .desktop-token__row > .button {
+    min-height: 40px;
+  }
+
+  .desktop-token__row > .button,
+  .desktop-submit__actions > .button {
+    flex: 1 1 100%;
+  }
+
+  .desktop-receive {
+    align-items: stretch;
+  }
+
+  .desktop-receive > .button {
+    min-height: 40px;
+  }
+
+  .desktop-task__head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .desktop-track {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 0;
+  }
+}
