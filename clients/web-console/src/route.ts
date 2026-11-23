@@ -45,6 +45,14 @@ export type Route =
   | { name: 'connectors' }
   /** 运行日志（`GET /v1/logs`）。一级导航项，不是设置子页。 */
   | { name: 'logs' }
+  /**
+   * Windows 桌面任务（`/desktop`，`GET /v1/desktop`）。
+   *
+   * 只有所有者能进入：配对令牌能让一台电脑登录并写记事本，普通成员拿到的是
+   * 403。入口在导航里按 `user.role` 过滤，但**路由本身保留**——直接敲地址的
+   * 成员要在页面上看到"只对所有者开放"，而不是一个 404 让人以为地址错了。
+   */
+  | { name: 'desktop' }
   /** 旧地址命中精确重定向表：由壳层用 `replace` 换掉，不是一页内容。 */
   | { name: 'legacyRedirect'; to: string }
   /** 认不出来的 pathname。它不是一页"内容"，而是"这个地址不存在"。 */
@@ -104,6 +112,9 @@ export function parseRoute(pathname: string): Route {
   // `/logs` 是一级页，别写进 `/settings/*` 那一串：它是常驻的运维入口，
   // 不是设置里的子项（`activeNavId` 也跟着把它算成「日志」而不是「设置」）。
   if (path === '/logs') return { name: 'logs' };
+  // 一级页，和 `/logs` 同层：它是"这台电脑能不能替我做事"的运维/能力入口，
+  // 不是某个领域页的调参面板。
+  if (path === '/desktop') return { name: 'desktop' };
   if (path === '/settings/account') return { name: 'account' };
   const match = /^\/s\/([^/]+)$/.exec(path);
   if (match && match[1]) {
@@ -165,6 +176,8 @@ export function routePath(route: Route): string {
       return '/settings/connectors';
     case 'logs':
       return '/logs';
+    case 'desktop':
+      return '/desktop';
     case 'chat':
       return route.sessionId ? `/s/${encodeURIComponent(route.sessionId)}` : '/';
     case 'legacyRedirect':

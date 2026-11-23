@@ -54,6 +54,11 @@ const NOOP = () => undefined;
  * 之间——它和人设是同一个问题的两半（她是谁 / 你是谁、谁和谁是一个人），
  * 落位理由写在 `Navigation.tsx` 的 `PRIMARY_NAV` 上。
  * `nav-logs` 仍排在「生活」与「设置」之间（常驻运维入口，排在领域页之后）。
+ *
+ * **`nav-desktop`（桌面）是所有者专属项**，接在「日志」之后、底部「设置」之前：
+ * 它与日志同属"这台机器现在能做到什么"的运维视角。下面的顺序表是全所有者
+ * 视角（`USER.role === 'owner'`）；普通成员看到的序列由
+ * 「入口仅向所有者展示」那一组单独钉死。
  * 这里手写而不是从 `PRIMARY_NAV` 派生——派生出来的期望会跟着实现一起变，
  * 删掉一项也测不出来。
  */
@@ -65,11 +70,16 @@ const EXPECTED_ORDER = [
   'nav-relationships',
   'nav-life',
   'nav-logs',
+  'nav-desktop',
   'nav-settings',
   'nav-version',
 ];
 
-const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '关系', '生活', '日志', '设置'];
+const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '关系', '生活', '日志', '桌面', '设置'];
+
+/** 普通成员看到的序列：所有者专属项不出现，其余顺序一字不变。 */
+const MEMBER_ORDER = EXPECTED_ORDER.filter((id) => id !== 'nav-desktop');
+const MEMBER_LABELS = EXPECTED_LABELS.filter((label) => label !== '桌面');
 
 function renderShell(route: Route): string {
   return renderToStaticMarkup(
@@ -77,9 +87,18 @@ function renderShell(route: Route): string {
   );
 }
 
-function renderSidenav(expanded: boolean, active: NavSectionId | null = 'dashboard', version: string | null = '0.1.0'): string {
+/**
+ * 侧栏单独渲染。`owner` **必须显式给**：它默认 `false`（成员视角），
+ * 而顺序契约是全所有者视角——漏传时少一项，测试会红在这里而不是在别处。
+ */
+function renderSidenav(
+  expanded: boolean,
+  active: NavSectionId | null = 'dashboard',
+  version: string | null = '0.1.0',
+  owner = true,
+): string {
   return renderToStaticMarkup(
-    h(Sidenav, { active, expanded, version, onToggle: NOOP, onGo: NOOP }),
+    h(Sidenav, { active, expanded, version, owner, onToggle: NOOP, onGo: NOOP }),
   );
 }
 
@@ -87,6 +106,8 @@ function renderSidenav(expanded: boolean, active: NavSectionId | null = 'dashboa
 const DRAWER_PROPS = {
   active: 'memory',
   version: '0.1.0',
+  // 抽屉与桌面 rail 是同一套导航，所以这里也用所有者视角；成员视角另有一条测试。
+  owner: true,
   accountName: 'Ling',
   onClose: NOOP,
   onGo: NOOP,
@@ -149,7 +170,7 @@ function activeTestId(html: string): string | null {
 /* ------------------------------------------------------------------ 顺序 */
 
 describe('一级导航的顺序（用户拍板的 A 方案）', () => {
-  it('左导航按「总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志 → 设置 → 版本」排列', () => {
+  it('左导航按「总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志 → 桌面 → 设置 → 版本」排列', () => {
     // **断顺序**，不是「都在」：`toEqual` 对数组元素与位置同时生效，
     // 把「记忆」挪到「人设」后面、把「日志」塞到「生活」之前、把「关系」
     // 挤到「人设」前面、或把「设置」提到列表里，这条都会红。
@@ -161,13 +182,31 @@ describe('一级导航的顺序（用户拍板的 A 方案）', () => {
     // 显式再断一次相邻关系，失败信息能直接指出是哪一项挤错了位置
     const order = testidsIn(navigationRegion(renderShell({ name: 'dashboard' })));
     expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-life') + 1);
-    expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-settings') - 1);
+    // 桌面项插在日志与设置之间；日志与设置不再是紧邻
+    expect(order.indexOf('nav-desktop')).toBe(order.indexOf('nav-logs') + 1);
+    expect(order.indexOf('nav-desktop')).toBe(order.indexOf('nav-settings') - 1);
     expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-persona') + 1);
     expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-life') - 1);
   });
 
   it('导航文字的顺序同样是契约（testid 对但文字错也算错）', () => {
     expect(labelsIn(navigationRegion(renderShell({ name: 'dashboard' })))).toEqual(EXPECTED_LABELS);
+  });
+
+  it('入口仅向所有者展示：成员看不到「桌面」，其余顺序一字不变', () => {
+    const member: UserInfo = { ...USER, role: 'member' };
+    const html = renderToStaticMarkup(
+      h(AppShell, { route: { name: 'dashboard' }, user: member, testMode: false, onLogout: NOOP, onTestMode: NOOP, onUserChange: NOOP }),
+    );
+    // 两条一起断：只有负向断言时，"导航整块没渲染"也会通过。
+    expect(testidsIn(navigationRegion(html))).toEqual(MEMBER_ORDER);
+    expect(labelsIn(navigationRegion(html))).toEqual(MEMBER_LABELS);
+  });
+
+  it('所有者的「桌面」项指向 /desktop，且打开时高亮它自己', () => {
+    const order = testidsIn(navigationRegion(renderShell({ name: 'desktop' })));
+    expect(order).toContain('nav-desktop');
+    expect(activeTestId(navigationRegion(renderShell({ name: 'desktop' })))).toBe('nav-desktop');
   });
 
   it('设置与版本号固定在底部（不在七项内容导航里面）', () => {

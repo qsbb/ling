@@ -25,6 +25,7 @@ import {
   ChevronIcon,
   CloseIcon,
   DashboardIcon,
+  DesktopIcon,
   LifeIcon,
   LogoutIcon,
   LogsIcon,
@@ -45,6 +46,8 @@ export type NavSectionId =
   | 'live'
   | 'life'
   | 'logs'
+  /** Windows 桌面任务：**只对所有者**出现的入口（见 `PRIMARY_NAV` 的注释）。 */
+  | 'desktop'
   | 'settings';
 
 export interface NavItemSpec {
@@ -80,10 +83,29 @@ export const PRIMARY_NAV: readonly NavItemSpec[] = [
   { id: 'logs', testid: 'nav-logs', label: '日志', path: '/logs' },
 ];
 
+/**
+ * 所有者专属的导航项（不放进 `PRIMARY_NAV`）。
+ *
+ * 为什么单独一张表：`PRIMARY_NAV` 是"所有人都有的导航"，它的顺序与成员被
+ * `nav.test.ts` 按顺序钉死。把桌面任务塞进去，普通成员就会看到一个点进去是
+ * 403 的入口——那正是要求里"入口仅向所有者展示"要避免的。这里按角色过滤，
+ * 同时保持"路由仍然存在"（直达地址能看到明确的 403 说明，而不是 404）。
+ *
+ * 位置：接在「日志」之后、「设置」之前。它与日志同属"这台机器现在能做到什么"
+ * 的运维视角，而不是她的内容（人设/生活/关系）。
+ */
+export const OWNER_NAV: readonly NavItemSpec[] = [
+  { id: 'desktop', testid: 'nav-desktop', label: '桌面', path: '/desktop' },
+];
+
 const LIVE_NAV: NavItemSpec = { id: 'live', testid: 'nav-live', label: '直播', path: '/live' };
 
-function visibleNav(live: boolean): readonly NavItemSpec[] {
-  return live ? PRIMARY_NAV.flatMap((item) => item.id === 'relationships' ? [item, LIVE_NAV] : [item]) : PRIMARY_NAV;
+function visibleNav(live: boolean, owner: boolean): readonly NavItemSpec[] {
+  const base = live
+    ? PRIMARY_NAV.flatMap((item) => item.id === 'relationships' ? [item, LIVE_NAV] : [item])
+    : PRIMARY_NAV;
+  // 所有者项接在一级导航末尾（「日志」之后），「设置」固定在底部那一栏。
+  return owner ? [...base, ...OWNER_NAV] : base;
 }
 
 /** 底部固定项：设置（程序与运维）。版本号 badge 单独渲染。 */
@@ -108,6 +130,7 @@ const ICONS: Record<NavSectionId, ReactElement> = {
   memory: <MemoryIcon />,
   persona: <PersonaIcon />,
   relationships: <RelationshipsIcon />,
+  desktop: <DesktopIcon />,
   live: <StopIcon />,
   life: <LifeIcon />,
   logs: <LogsIcon />,
@@ -148,6 +171,8 @@ export function activeNavId(route: Route): NavSectionId | null {
       return 'live';
     case 'logs':
       return 'logs';
+    case 'desktop':
+      return 'desktop';
     case 'settings':
     case 'model':
     case 'privacy':
@@ -234,12 +259,23 @@ export interface SidenavProps {
   version: string | null;
   showLive?: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
+  /** 当前账号是否所有者：决定「桌面」这个入口出不出现。 */
+  owner?: boolean;
   onToggle: () => void;
   onGo: (path: string) => void;
 }
 
 /** 桌面左导航：56px 图标 rail ↔ 200px 展开。 */
-export function Sidenav({ active, expanded, version, showLive = false, liveTone, onToggle, onGo }: SidenavProps): ReactElement {
+export function Sidenav({
+  active,
+  expanded,
+  version,
+  showLive = false,
+  liveTone,
+  owner = false,
+  onToggle,
+  onGo,
+}: SidenavProps): ReactElement {
   return (
     <aside
       className="sidenav"
@@ -260,7 +296,7 @@ export function Sidenav({ active, expanded, version, showLive = false, liveTone,
       </button>
       <nav className="sidenav__nav" aria-label="主导航">
         <ul className="sidenav__list">
-          {visibleNav(showLive).map((item) => (
+          {visibleNav(showLive, owner).map((item) => (
             <li key={item.testid} className="sidenav__list-item">
               <NavItem item={item} active={active === item.id} expanded={expanded} liveTone={liveTone} onGo={onGo} />
             </li>
@@ -286,6 +322,8 @@ export interface NavDrawerProps {
   version: string | null;
   showLive?: boolean;
   liveTone?: 'live' | 'attention' | 'neutral';
+  /** 当前账号是否所有者：决定「桌面」这个入口出不出现。 */
+  owner?: boolean;
   /** 抽屉底部账号区显示的名字（`display_name || username`）。 */
   accountName: string;
   onClose: () => void;
@@ -305,6 +343,7 @@ export function NavDrawerPanel({
   version,
   showLive = false,
   liveTone,
+  owner = false,
   accountName,
   onClose,
   onGo,
@@ -330,7 +369,7 @@ export function NavDrawerPanel({
 
       <nav className="sidenav__nav" aria-label="主导航">
         <ul className="sidenav__list">
-          {visibleNav(showLive).map((item) => (
+          {visibleNav(showLive, owner).map((item) => (
             <li key={item.testid} className="sidenav__list-item">
               <NavItem item={item} active={active === item.id} expanded liveTone={liveTone} onGo={onGo} />
             </li>
@@ -381,6 +420,7 @@ export function NavDrawer({
   version,
   showLive,
   liveTone,
+  owner,
   accountName,
   onClose,
   onGo,
@@ -407,6 +447,7 @@ export function NavDrawer({
         version={version}
         showLive={showLive}
         liveTone={liveTone}
+        owner={owner}
         accountName={accountName}
         onClose={onClose}
         onGo={onGo}

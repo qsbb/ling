@@ -65,6 +65,7 @@ function mainProps(route: Route): MainPageProps {
     onUserChange: NOOP,
     onLogout: NOOP,
     onGo: NOOP,
+    siteUrl: 'https://ling.example',
   };
 }
 
@@ -201,6 +202,7 @@ const ROUTE_NAME_SET = {
   backup: true,
   connectors: true,
   logs: true,
+  desktop: true,
   legacyRedirect: true,
   notFound: true,
 } satisfies Record<Route['name'], true>;

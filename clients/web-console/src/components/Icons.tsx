@@ -229,6 +229,20 @@ export function LogsIcon({ size = 17, className }: IconProps) {
   );
 }
 
+/**
+ * 桌面任务（`/desktop`）：一台显示器 + 里面写字的行。
+ * 用意是"这台电脑替她写字"，而不是再画一个齿轮——齿轮已经是「设置」了。
+ */
+export function DesktopIcon({ size = 17, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <rect x="3.2" y="4.2" width="17.6" height="12" rx="1.8" />
+      <path d="M9.5 20h5M12 16.2V20" />
+      <path d="M6.6 8.2h5.2M6.6 11.4h8.8M6.6 14.6h3.6" />
+    </svg>
+  );
+}
+
 export function LogoutIcon({ size = 17, className }: IconProps) {
   return (
     <svg {...base(size, className)}>
