@@ -449,7 +449,7 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     if availability == "sealed":
         changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
         assert changed.status_code == 200
-    text = "帮我查一下公开资料" if availability == "readable" else "搜索：公开资料"
+    text = "帮我上网查一下公开资料" if availability == "readable" else "搜索：公开资料"
     reply = await _web_reply(logged_in, text=text)
     if availability == "sealed":
         assert requests == []

@@ -574,16 +574,16 @@ class InboundBridge:
             self._reply_when_addressed and envelope.mentions_actor
         )
 
-        from ling.domains.speech.relisten import (
-            inspect_quoted_voice,
-            make_quote_source,
-            wants_quoted_voice,
-        )
         from ling.domains.speech.transcription import (
             TranscriptionError,
             can_auto_transcribe,
             create_job,
             lock_scope,
+        )
+        from ling.kernel.voice_quotes import (
+            inspect_quoted_voice,
+            make_quote_source,
+            wants_quoted_voice,
         )
 
         audio_ids: list[dict[str, str]] = []

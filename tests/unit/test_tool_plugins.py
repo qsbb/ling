@@ -49,12 +49,13 @@ def test_only_exact_plugin_commands_provide_a_target(text: str) -> None:
 
 def test_explicit_search_is_not_a_match_for_discussing_search() -> None:
     assert explicit_search_query("能帮我搜一下博物馆") == "博物馆"
-    assert explicit_search_query("帮我查一下公开资料") == "公开资料"
+    assert explicit_search_query("帮我上网查一下公开资料") == "公开资料"
     assert explicit_search_query("搜索：博物馆") == "博物馆"
     assert explicit_search_query("搜索功能现在能用吗？") is None
     assert explicit_search_query("搜集博物馆资料有什么好处？") is None
     assert explicit_search_query("搜一下是什么意思？") is None
     assert explicit_search_query("帮我查一下是什么意思？") is None
+    assert explicit_search_query("帮我查一下时间再回答") is None
     assert has_explicit_search_command("/search：")
     assert has_explicit_search_command("/SEARCH:" + "长" * 241)
 
