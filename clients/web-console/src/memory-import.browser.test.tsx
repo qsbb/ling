@@ -569,8 +569,10 @@ describe('导入旧记忆', () => {
     page.setDefaultTimeout(WAIT);
     let previewCalls = 0;
     let commitCalls = 0;
+    let reportCommitStarted!: () => void;
     let releasePreview!: () => void;
     let releaseCommit!: () => void;
+    const commitStarted = new Promise<void>((resolve) => { reportCommitStarted = resolve; });
     const previewGate = new Promise<void>((resolve) => { releasePreview = resolve; });
     const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
 
@@ -584,6 +586,7 @@ describe('导入旧记忆', () => {
       }
       if (request.method() === 'POST' && url.pathname.endsWith('/commit')) {
         commitCalls += 1;
+        reportCommitStarted();
         await commitGate;
         return route.fulfill(json({ total: 5, imported: 5, duplicates: 0, skipped: 0, skip_reasons: {}, destination: DESTINATION }));
       }
@@ -639,14 +642,12 @@ describe('导入旧记忆', () => {
     const busyCommit = page.getByTestId('import-busy');
     await busyCommit.waitFor();
     expect(await busyCommit.innerText()).toContain('正在写入记忆库');
-    // 三次点击只能换出一份请求
-    await expect.poll(() => commitCalls).toBe(1);
-    await page.waitForTimeout(300);
-    expect(commitCalls).toBe(1);
+    await commitStarted;
     expect(await page.getByTestId('import-confirm').isDisabled()).toBe(true);
 
     releaseCommit();
     await page.getByTestId('import-result-imported').waitFor();
+    expect(commitCalls).toBe(1);
     // 结果页如实显示 import 数
     expect(await page.getByTestId('import-result-imported').innerText()).toContain('5');
   }, CASE_TIMEOUT);

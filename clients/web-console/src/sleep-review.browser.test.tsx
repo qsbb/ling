@@ -278,8 +278,8 @@ describe('夜间回顾（真浏览器）', () => {
   it('E 读取失败：说失败、可重试，不降级成空状态', async () => {
     const { page } = await openReview({ review: 'fail' });
     const review = page.getByTestId('sleep-review');
-    expect(await textOf(review)).toContain('夜间回顾没读出来');
     await page.getByTestId('sleep-retry').waitFor({ state: 'visible' });
+    expect(await textOf(review)).toContain('夜间回顾没读出来');
     // 负向：不能把"没读到"说成"没有"。
     expect(await countOf(page.getByTestId('sleep-empty'))).toBe(0);
     await shot(page, 'E-failed.png');
@@ -336,7 +336,7 @@ describe('夜间回顾（真浏览器）', () => {
       }],
     });
     const review = page.getByTestId('sleep-review');
-    expect(await textOf(review)).toContain('没有可核对的原话');
+    await review.getByText('这条没有可核对的原话。', { exact: true }).waitFor({ state: 'visible' });
     expect(await countOf(page.getByTestId('sleep-open-source'))).toBe(0);
     await shot(page, 'I-no-original-no-entry.png');
   }, CASE_TIMEOUT);
