@@ -247,7 +247,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   {
     key: 'connectors',
     title: '接入与连接',
-    note: '她从哪条线收发消息：OneBot（NapCat 等）与 QQ 官方机器人。可以在这里直接改，保存后立刻尝试生效。',
+    note: '她从哪条线收发消息，以及实例能调用哪些第三方能力。',
     entries: [
       {
         key: 'connectors',
@@ -255,6 +255,13 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
         verb: '改每条线的凭据与开关；保存会立刻切换，起不来会自动恢复旧配置。',
         path: '/settings/connectors',
         testid: 'open-connectors',
+      },
+      {
+        key: 'plugins',
+        label: '外部插件',
+        verb: '登记第三方的 HTTP 插件并逐项授权；启停前会真实探测端点。',
+        path: '/settings/plugins',
+        testid: 'open-plugins',
       },
     ],
   },
