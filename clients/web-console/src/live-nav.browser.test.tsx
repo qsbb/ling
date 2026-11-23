@@ -440,6 +440,36 @@ describe('直播入口与工作台（真浏览器）', () => {
      */
     await visible(dialog);
     await visible(dialog.locator('[role="status"]'));
+
+    /*
+     * 3. 已配置的房间也要够得着保存按钮。
+     *
+     * 这一条**只钉"够得着"，不钉"不出视口"**：实测（见本轮提交说明）`<dialog>`
+     * 在内容超出时浏览器自己会把高度收在视口内并让内容滚动，`max-height` 是多余
+     * 的——所以"高度 ≤ 视口"这条断言在有无该 CSS 时都成立，没有区分力，删掉。
+     *
+     * 真正会坏的是"按钮够不着"：已配置的房间比空表单多出三个「清除令牌」勾选框，
+     * 内容更长。这里滚到按钮并确认它进入视口且可点。
+     */
+    await page.goto(`${baseUrl}/live`, { waitUntil: 'networkidle' });
+    await visible(page.locator('[data-testid="live-page"]'));
+    await page.locator('[data-testid="live-room-settings-open"]').click();
+    await visible(dialog);
+    await dialog.locator('select').first().selectOption('room1');
+    await expect.poll(() => dialog.locator('input[name="clear_stage_token"]').count(), { timeout: 15_000 })
+      .toBe(1);
+
+    const save = dialog.getByRole('button', { name: '保存直播间' });
+    await save.scrollIntoViewIfNeeded();
+    const viewport = page.viewportSize();
+    const saveBox = await save.boundingBox();
+    expect(viewport).not.toBeNull();
+    expect(saveBox).not.toBeNull();
+    if (saveBox && viewport) {
+      expect(saveBox.y).toBeGreaterThanOrEqual(0);
+      expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(viewport.height);
+    }
+    expect(await save.isEnabled()).toBe(true);
   }, TIMEOUT);
 
   it('状态接口失效时入口不消失，也不白屏', async (ctx) => {
