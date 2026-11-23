@@ -209,7 +209,6 @@ async function open(
   const user = options.user ?? OWNER;
   const current = options.current === undefined ? EMPTY_CURRENT : options.current;
   const connectors = options.connectors ?? [];
-  /** 保存过的直播间：保存后列表 GET 要能读到它，否则表单会被打回"新建"。 */
   let saved: Record<string, unknown> | null = null;
 
   await page.route('**/v1/**', async (route) => {
@@ -234,14 +233,6 @@ async function open(
       await route.fulfill(json({ connectors: saved ? [...connectors, saved] : connectors }));
       return;
     }
-    /*
-     * 保存直播间：`PUT /v1/settings/custom-connectors/{id}`。
-     *
-     * 记下路径与请求体，**并把这一个直播间加进后续 GET 的列表**——保存后
-     * 页面会重新读一次列表，若 GET 还是空的，表单会被打回"新建"，那时"保存后
-     * 留在原地看到新值"就无从验证了。回显的视图按请求体造，字段名与后端
-     * `custom_view` 一致（这里只给这条用例用得到的那些）。
-     */
     if (method === 'PUT' && pathname.startsWith('/v1/settings/custom-connectors/')) {
       const id = decodeURIComponent(pathname.split('/').pop() ?? '');
       const body = request.postDataJSON() as Record<string, unknown>;
@@ -257,7 +248,8 @@ async function open(
         source_ips: String(body.source_ips ?? ''),
         token_set: Boolean(body.token),
         signing_secret_set: Boolean(body.signing_secret),
-        stage_token_set: Boolean(body.stage_token),
+        stage_token_set: body.stage_token === undefined
+          ? Boolean(saved?.stage_token_set) : Boolean(body.stage_token),
         public_topic: '',
         max_minutes: 30,
         obs_control: body.obs_control === true,
@@ -432,32 +424,16 @@ describe('直播入口与工作台（真浏览器）', () => {
       stage_token: 'stage-token-0123456789',
     });
 
-    /*
-     * 2. 保存后**弹窗仍然开着**，并且有可见的「已保存」。
-     *
-     * 这一条对着一个很容易写错的实现：保存成功就 `onClose()`。那样"存进去了
-     * 没有"只剩页头一句提示，而刚填的值一个都看不见——恰恰是最该确认的时刻。
-     */
     await visible(dialog);
     await visible(dialog.locator('[role="status"]'));
-
-    /*
-     * 3. 已配置的房间也要够得着保存按钮。
-     *
-     * 这一条**只钉"够得着"，不钉"不出视口"**：实测（见本轮提交说明）`<dialog>`
-     * 在内容超出时浏览器自己会把高度收在视口内并让内容滚动，`max-height` 是多余
-     * 的——所以"高度 ≤ 视口"这条断言在有无该 CSS 时都成立，没有区分力，删掉。
-     *
-     * 真正会坏的是"按钮够不着"：已配置的房间比空表单多出三个「清除令牌」勾选框，
-     * 内容更长。这里滚到按钮并确认它进入视口且可点。
-     */
-    await page.goto(`${baseUrl}/live`, { waitUntil: 'networkidle' });
-    await visible(page.locator('[data-testid="live-page"]'));
-    await page.locator('[data-testid="live-room-settings-open"]').click();
-    await visible(dialog);
-    await dialog.locator('select').first().selectOption('room1');
-    await expect.poll(() => dialog.locator('input[name="clear_stage_token"]').count(), { timeout: 15_000 })
-      .toBe(1);
+    const room = dialog.getByRole('combobox', { name: '直播间', exact: true });
+    const input = (name: string) => dialog.locator(`input[name="${name}"]`);
+    expect(await room.inputValue()).toBe('room1');
+    expect(await input('id').evaluate((element) => (element as HTMLInputElement).readOnly)).toBe(true);
+    expect(await input('room_id').evaluate((element) => (element as HTMLInputElement).readOnly)).toBe(true);
+    expect(await input('display_name').inputValue()).toBe('主房间');
+    expect(await input('stage_token').inputValue()).toBe('');
+    expect(await input('stage_token').getAttribute('placeholder')).toBe('已配置');
 
     const save = dialog.getByRole('button', { name: '保存直播间' });
     await save.scrollIntoViewIfNeeded();
@@ -470,6 +446,24 @@ describe('直播入口与工作台（真浏览器）', () => {
       expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(viewport.height);
     }
     expect(await save.isEnabled()).toBe(true);
+
+    await input('stage_token').fill('new-stage-token-123456');
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[1]?.body.stage_token).toBe('new-stage-token-123456');
+    expect(await input('stage_token').inputValue()).toBe('');
+    await input('clear_stage_token').check();
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[2]?.body.stage_token).toBe('');
+    expect(await input('clear_stage_token').count()).toBe(0);
+    expect(await input('stage_token').inputValue()).toBe('');
+
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[3]?.body).not.toHaveProperty('stage_token');
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click();
+    expect(await page.locator('.live-room-select select').inputValue()).toBe('room1');
   }, TIMEOUT);
 
   it('状态接口失效时入口不消失，也不白屏', async (ctx) => {

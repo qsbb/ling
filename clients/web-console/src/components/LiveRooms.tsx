@@ -220,8 +220,7 @@ export interface LiveRoomSettingsDialogProps {
   selectedId: string;
   onSelect: (id: string) => void;
   onClose: () => void;
-  /** 保存成功后：让持有列表的一方重新读一遍。 */
-  onSaved: (id: string) => void;
+  onSaved: (connector: LiveConnector) => void;
 }
 
 /**
@@ -237,6 +236,7 @@ export function LiveRoomSettingsDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState('');
+  const [formRevision, setFormRevision] = useState(0);
   const connector = connectors.find((item) => item.id === selectedId);
 
   useEffect(() => {
@@ -248,16 +248,10 @@ export function LiveRoomSettingsDialog({
     setError('');
     setSaved('');
     try {
-      await api.saveCustomConnector(id, body, feature);
-      /*
-       * 保存后**不关窗**。
-       *
-       * 关掉的话有两件事会一起丢掉：刚存进去的值回显不了（表单已经卸载），
-       * 而"到底存进去了没有"只剩一句页头提示——恰好是这次操作最需要确认的东西。
-       * 留在原地：表单按新值重建、状态行跟着刷新，人看着它变了才关。
-       */
+      const connector = await api.saveCustomConnector(id, body, feature);
+      onSaved(connector);
+      setFormRevision((value) => value + 1);
       setSaved('已保存');
-      onSaved(id);
     } catch (cause) {
       setError(explainError(cause).reason);
     } finally {
@@ -279,7 +273,7 @@ export function LiveRoomSettingsDialog({
         {connector ? <RoomStatus connector={connector} /> : null}
         {error ? <p className="live-room__error" role="alert">{error}</p> : null}
         {saved ? <p className="live-room__note" role="status">{saved}</p> : null}
-        <LiveRoomForm key={connector?.id || 'new'} connector={connector} busy={busy}
+        <LiveRoomForm key={`${connector?.id || 'new'}:${formRevision}`} connector={connector} busy={busy}
           submit={(id, body, feature) => void save(id, body, feature)}>
           <button type="button" className="button button--small" disabled={busy} onClick={onClose}>关闭</button>
         </LiveRoomForm>

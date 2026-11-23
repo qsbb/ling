@@ -414,7 +414,15 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
         selectedId={settingsId}
         onSelect={setSettingsId}
         onClose={() => setSettingsOpen(false)}
-        onSaved={(id) => { setSelected(id); setFeedback('直播间设置已保存'); refreshAll(); }}
+        onSaved={(saved) => {
+          setConnectors((rooms) => rooms?.some((room) => room.id === saved.id)
+            ? rooms.map((room) => room.id === saved.id ? saved : room)
+            : [...(rooms ?? []), saved]);
+          setSettingsId(saved.id);
+          setSelected(saved.id);
+          setFeedback('直播间设置已保存');
+          refreshAll();
+        }}
       /> : null}
     </article>
   );
