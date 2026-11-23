@@ -114,6 +114,16 @@
         "提供外部插件接口，以及 B 站直播事件与 OBS 舞台接入"
       ],
       "url": "https://github.com/qsbb/ling/releases/tag/v0.0.15"
+    },
+    "0.0.16": {
+      "summary": "更新对话、关系和生活页面，支持整份旧记忆导入、OneBot 私聊晚回与 Windows 桌面任务",
+      "items": [
+        "刷新对话时保留已加载的历史和阅读位置，修复重复消息和分段标点",
+        "记忆库可搜索更早的记录，夜间回顾可以打开原话的来源会话，AstrBot 旧记忆可整份导入",
+        "模型按需查询公开网页、核对记忆或回听引用的 OneBot 语音，OneBot 私聊可单独开启晚回",
+        "直播进入左侧独立导航，设置中可管理外部插件，Windows 伴生端支持记事本试跑与限时授权"
+      ],
+      "url": "https://github.com/qsbb/ling/releases/tag/v0.0.16"
     }
   }
 }
