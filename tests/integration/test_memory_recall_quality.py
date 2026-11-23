@@ -1,22 +1,37 @@
-"""Current-fact recall and the prompt that is compiled from it, on PostgreSQL."""
+"""Current-fact tools and their scoped retrieval on PostgreSQL."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.capabilities.tools import MEMORY_CURRENT_FACT_TOOL_ID
 from ling.contracts.v1 import Origin, TurnState, Visibility
 from ling.domains.conversation.service import ConversationService
 from ling.domains.memory import providers
 from ling.domains.memory.service import RECALL_CANDIDATE_LIMIT, MemoryService
 from ling.infra.db import session_scope
 from ling.infra.models import MemoryRetrievalLog, MemoryRow, Window
-from ling.kernel.audience import AudienceSnapshot
+from ling.kernel.audience import AudienceSnapshot, visibility_set
 from ling.kernel.context import ContextCompiler, estimate_tokens
 from ling.ports.config import MemoryPolicy
 from tests.integration.conftest import TestEnv
+from tests.integration.test_tools_turn_wiring import (
+    PLAIN_REPLY,
+    _bind_model,
+    _draft,
+    _publish,
+    _tool_payload,
+    _ToolEndpoint,
+    _web_reply,
+)
+from tests.integration.test_tools_turn_wiring import (
+    endpoint as endpoint,
+)
 
 pytestmark = pytest.mark.w0_web
 
@@ -56,12 +71,25 @@ async def _window(
     return window_id
 
 
-async def test_direct_paraphrases_find_old_facts_without_model_configuration(
-    logged_in: TestEnv,
+async def _recall_slot(
+    session: AsyncSession, env: TestEnv, window_id: str, slot: Literal["works_at", "lives_in"],
+    visibility: Visibility = Visibility.subject_private,
+) -> list[str]:
+    audience = await AudienceSnapshot.freeze(
+        session, subject_id=env.subject_id, window_id=window_id, window_visibility=visibility.value,
+    )
+    result = await MemoryService(session).recall(
+        subject_id=env.subject_id, query=slot, fact_slot=slot, audience=audience,
+        visibility_allow=visibility_set(audience),
+    )
+    return [hit.memory_id for hit in result.hits]
+
+
+async def test_model_selects_a_fact_from_beyond_the_recent_candidate_budget(
+    logged_in: TestEnv, endpoint: _ToolEndpoint,
 ) -> None:
     assert providers.build_embedding() is None
     assert providers.build_reranker() is None
-    window_id = await _window(logged_in)
     old = datetime.now(UTC) - timedelta(days=400)
     async with session_scope() as session:
         session.add_all([
@@ -82,28 +110,56 @@ async def test_direct_paraphrases_find_old_facts_without_model_configuration(
             _fact(logged_in, "color", "主人最喜欢的颜色是紫色", created_at=old, updated_at=old),
         ])
 
-    async with session_scope() as session:
-        compiler = ContextCompiler(session)
-        for query, memory_id, fact in [
-            (WORK_QUERY, "work", WORK_TEXT),
-            ("我目前在哪里任职？", "work", WORK_TEXT),
-            ("我现在定居何处？", "home", HOME_TEXT),
-            ("我最喜欢什么颜色", "color", "主人最喜欢的颜色是紫色"),
-        ]:
-            compiled = await compiler.compile(
-                subject_id=logged_in.subject_id, window_id=window_id, user_text=query,
-            )
-            assert compiled.memory_ids == [memory_id], query
-            evidence = next(item for item in compiled.contributions if item.lane == "evidence")
-            assert fact in evidence.text
-            assert "路线攻略" not in evidence.text and "指南目录" not in evidence.text
-            assert evidence.source_event_ids == [f"event:{memory_id}"]
-            assert estimate_tokens(evidence.text) <= evidence.token_budget
+    await _bind_model(logged_in, enabled=True)
+    utterance = "个人资料里，地址和单位那两栏你还记得什么？"
+    endpoint.tool_name = MEMORY_CURRENT_FACT_TOOL_ID
+    for slot, memory_id, fact in [("works_at", "work", WORK_TEXT), ("lives_in", "home", HOME_TEXT)]:
+        endpoint.requests.clear()
+        endpoint.arguments = {"slot": slot}
+        assert fact in await _web_reply(logged_in, text=utterance)
+        payload = _tool_payload(endpoint)
+        assert payload["outcome"] == "succeeded" and payload["untrusted"] is True
+        assert "路线攻略" not in payload["data"] and "指南目录" not in payload["data"]
+        first = endpoint.requests[0]
+        schema = next(item["function"]["parameters"] for item in first["tools"]
+                      if item["function"]["name"] == MEMORY_CURRENT_FACT_TOOL_ID)
+        assert schema["properties"]["slot"]["enum"] == ["works_at", "lives_in"]
+        assert fact not in str(first["messages"])
+        async with session_scope() as session:
+            traced = await session.scalar(select(MemoryRetrievalLog).where(
+                MemoryRetrievalLog.query == slot, MemoryRetrievalLog.strategy == "current_fact",
+            ))
+            assert traced is not None and traced.hit_ids == [memory_id]
 
-        traced = await session.scalar(select(MemoryRetrievalLog).where(
-            MemoryRetrievalLog.window_id == window_id, MemoryRetrievalLog.query == WORK_QUERY,
-        ))
-        assert traced is not None and traced.hit_ids == ["work"]
+    endpoint.requests.clear()
+    endpoint.script = [({"content": PLAIN_REPLY}, "stop")]
+    assert await _web_reply(logged_in, text=utterance) == PLAIN_REPLY
+    assert len(endpoint.requests) == 1
+    async with session_scope() as session:
+        direct_lookups = list(await session.scalars(select(MemoryRetrievalLog).where(
+            MemoryRetrievalLog.strategy == "current_fact",
+        )))
+        assert len(direct_lookups) == 2
+        window_id = await _window(logged_in)
+        compiled = await ContextCompiler(session).compile(
+            subject_id=logged_in.subject_id, window_id=window_id, user_text="我最喜欢什么颜色",
+        )
+        assert compiled.memory_ids == ["color"]
+
+
+async def test_current_fact_tool_respects_the_published_memory_budget(
+    logged_in: TestEnv, endpoint: _ToolEndpoint,
+) -> None:
+    await _bind_model(logged_in, enabled=True)
+    async with session_scope() as session:
+        session.add(_fact(logged_in, "work", WORK_TEXT, slot="works_at"))
+    await _publish(logged_in, await _draft(logged_in, {"memory": {"max_injected_memories": 0}}))
+    endpoint.tool_name = MEMORY_CURRENT_FACT_TOOL_ID
+    endpoint.arguments = {"slot": "works_at"}
+    assert "tool_not_available" in await _web_reply(logged_in, text=WORK_QUERY)
+    tools = [item["function"]["name"] for item in endpoint.requests[0]["tools"]]
+    assert MEMORY_CURRENT_FACT_TOOL_ID not in tools and "clock_now" in tools
+    assert WORK_TEXT not in str(endpoint.requests)
 
 
 async def test_current_slot_filters_audience_and_time_before_the_candidate_cap(
@@ -144,20 +200,12 @@ async def test_current_slot_filters_audience_and_time_before_the_candidate_cap(
         ])
 
     async with session_scope() as session:
-        compiler = ContextCompiler(session)
-        for window, is_group, query, expected in [
-            (group_a, True, WORK_QUERY, ["group_work"]),
-            (group_b, True, WORK_QUERY, []),
-            (private, False, WORK_QUERY, ["private_work"]),
-            (group_a, True, "栖木档案馆先不说了，数据库怎么建表？", []),
-            (group_a, True, "晚上好！", []),
+        for window, visibility, expected in [
+            (group_a, Visibility.group_scope, ["group_work"]),
+            (group_b, Visibility.group_scope, []),
+            (private, Visibility.subject_private, ["private_work"]),
         ]:
-            compiled = await compiler.compile(
-                subject_id=logged_in.subject_id, window_id=window,
-                is_group=is_group, user_text=query,
-            )
-            assert compiled.memory_ids == expected
-            assert any(item.lane == "evidence" for item in compiled.contributions) is bool(expected)
+            assert await _recall_slot(session, logged_in, window, "works_at", visibility) == expected
 
 
 async def test_correction_answers_current_fact_and_keeps_the_authorized_original(
@@ -190,11 +238,7 @@ async def test_correction_answers_current_fact_and_keeps_the_authorized_original
         session.add(inference)
 
     async with session_scope() as session:
-        compiled = await ContextCompiler(session).compile(
-            subject_id=logged_in.subject_id, window_id=window_id, user_text=WORK_QUERY,
-        )
-        assert compiled.memory_ids == ["work_guess"]
-        assert any("模糊的印象" in item.text for item in compiled.contributions if item.lane == "evidence")
+        assert await _recall_slot(session, logged_in, window_id, "works_at") == ["work_guess"]
 
     response = await logged_in.client.post(
         "/v1/memory/work_guess/supersede", json={"text": corrected, "reason": "合成纠正"},
@@ -212,16 +256,10 @@ async def test_correction_answers_current_fact_and_keeps_the_authorized_original
         assert new.source_visibility == old.source_visibility
         assert new.origin == Origin.user_statement.value and new.source_event_ids == source_event_ids
 
-        compiler = ContextCompiler(session)
-        current = await compiler.compile(
-            subject_id=logged_in.subject_id, window_id=window_id, user_text=WORK_QUERY,
-        )
-        assert current.memory_ids == [new_id] and current.memory_sources == {}
-        evidence = next(item.text for item in current.contributions if item.lane == "evidence")
-        assert corrected in evidence and "墨桥文化馆" not in evidence
+        assert await _recall_slot(session, logged_in, window_id, "works_at") == [new_id]
 
         history_query = "之前在墨桥文化馆代班的原话是什么？"
-        history = await compiler.compile(
+        history = await ContextCompiler(session).compile(
             subject_id=logged_in.subject_id, window_id=window_id, user_text=history_query,
         )
         assert history.memory_ids == [episode_id]
@@ -255,10 +293,7 @@ async def test_legacy_corrections_keep_the_fact_slot_across_two_edits(logged_in:
         assert last is not None and last.slot is None
 
     async with session_scope() as session:
-        compiled = await ContextCompiler(session).compile(
-            subject_id=logged_in.subject_id, window_id=window_id, user_text=WORK_QUERY,
-        )
-        assert compiled.memory_ids == [last_id]
+        assert await _recall_slot(session, logged_in, window_id, "works_at") == [last_id]
 
 
 async def test_injection_budget_does_not_change_the_recall_shortlist(logged_in: TestEnv) -> None:

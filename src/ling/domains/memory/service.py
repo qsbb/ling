@@ -19,13 +19,13 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
-from ling.domains.memory.recall_query import current_fact_slot, needs_recent_topic
+from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
     MemoryEpisode,
     MemoryRetrievalLog,
@@ -650,6 +650,7 @@ class MemoryService:
         source_filter: Callable[[MemoryRow | MemoryEpisode], bool] | None = None,
         include_history: bool = False,
         audience: MemoryAudience | None = None,
+        fact_slot: Literal["works_at", "lives_in"] | None = None,
     ) -> RecallResult:
         """先过滤权限/有效期/撤回，再按相关性排序。"""
         now = now or datetime.now(UTC)
@@ -681,16 +682,15 @@ class MemoryService:
             return result
 
         allowed = {v.value for v in visibility_allow}
-        slot = None if include_history else current_fact_slot(query)
-        if slot is not None:
+        if fact_slot is not None:
             current = await self._current_fact(
-                slot, subjects=subjects, allowed=allowed, now=now,
+                fact_slot, subjects=subjects, allowed=allowed, now=now,
                 audience=audience, source_filter=source_filter,
             )
+            result.strategy = "current_fact"
             if current is not None:
-                result.strategy = "current_fact"
                 result.hits = [_assertion_hit(current, 1.0 / (RRF_K + 1))]
-                return await self._finish_recall(result, query, trace_window_id)
+            return await self._finish_recall(result, query, trace_window_id)
 
         explicit_recall = bool(_EXPLICIT_RECALL.search(query)) or wants_history(query) or (
             needs_recent_topic(query.rsplit("\n", 1)[-1])
@@ -702,9 +702,6 @@ class MemoryService:
             MemoryRow.retracted.is_(False),
             MemoryRow.archived_at.is_(None),
         )
-        if slot is not None:
-            # Older and manually entered text may have no slot of its own.
-            base = base.where(MemoryRow.slot.is_(None))
         fetched_rows = list(
             (await self._session.execute(
                 base.order_by(MemoryRow.updated_at.desc(), MemoryRow.id.asc())

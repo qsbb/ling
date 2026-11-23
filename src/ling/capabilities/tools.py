@@ -415,6 +415,7 @@ RECALL_TOOL_ID = "message.recall"
 #: 可用性判断侧、测试断言侧写的是同一个常量。
 CLOCK_NOW_TOOL_ID = "clock.now"
 KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
+MEMORY_CURRENT_FACT_TOOL_ID = "memory_current_fact"
 MEMORY_SOURCE_TOOL_ID = "memory_source"
 MEDIA_WATCH_VIDEO_TOOL_ID = "media.watch_video"
 _KNOWLEDGE_RESULT_CHARS = 3000
@@ -513,11 +514,44 @@ def _memory_source_tool(
     return handler
 
 
+async def _recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+    from ling.domains.memory.service import MemoryService, render_evidence
+    from ling.infra.db import session_scope
+    from ling.infra.models import Window
+    from ling.kernel.audience import AudienceSnapshot, visibility_set
+    from ling.settings.service import published_memory_policy
+
+    slot = args.get("slot")
+    if slot != "works_at" and slot != "lives_in":
+        raise ValueError("事实类型应为 works_at 或 lives_in。")
+    empty = "没有查到可用的当前记录。"
+    async with session_scope() as session:
+        window = await session.get(Window, audience.window_id)
+        if window is None or window.archived or window.visibility != audience.window_visibility:
+            return empty
+        if not audience.is_group and window.subject_id != audience.subject_id:
+            return empty
+        current = await AudienceSnapshot.freeze(
+            session, subject_id=audience.subject_id,
+            window_id=window.id, window_visibility=window.visibility,
+        )
+        policy = await published_memory_policy(session)
+        if not current.allows_long_term_memory() or policy.max_injected_memories <= 0:
+            return empty
+        result = await MemoryService(session, policy=policy).recall(
+            subject_id=audience.subject_id, query=slot, fact_slot=slot, limit=1,
+            visibility_allow=visibility_set(audience) & visibility_set(current),
+            trace_window_id=window.id, audience=current,
+        )
+    return render_evidence(result.hits) or empty
+
+
 def build_default_registry(
     *,
     allow_irreversible: bool = False,
     include_recall: bool = True,
     knowledge_audience: AudienceSnapshot | None = None,
+    include_current_facts: bool = False,
     memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
@@ -597,6 +631,32 @@ def build_default_registry(
             ),
             partial(_search_knowledge, audience=knowledge_audience),
         )
+        if include_current_facts:
+            registry.register(
+                ToolSpec(
+                    tool_id=MEMORY_CURRENT_FACT_TOOL_ID,
+                    version="1.0.0",
+                    description=(
+                        "需要确认当前说话人的任职地点或住处时，补查一条仍有效的记忆。"
+                        "没有结果时表示缺少这类记录。用当前对话确认发生的变化。"
+                    ),
+                    risk=ToolRisk.read_only,
+                    requires_confirmation=False,
+                    reversible=True,
+                    model_callable=True,
+                    input_schema={
+                        "type": "object",
+                        "properties": {"slot": {
+                            "type": "string",
+                            "enum": ["works_at", "lives_in"],
+                            "description": "works_at 为任职地点，lives_in 为住处",
+                        }},
+                        "required": ["slot"],
+                        "additionalProperties": False,
+                    },
+                ),
+                partial(_recall_current_fact, audience=knowledge_audience),
+            )
         if memory_sources:
             registry.register(
                 ToolSpec(
@@ -722,6 +782,7 @@ def build_default_registry(
 __all__ = [
     "CLOCK_NOW_TOOL_ID",
     "KNOWLEDGE_SEARCH_TOOL_ID",
+    "MEMORY_CURRENT_FACT_TOOL_ID",
     "MEMORY_SOURCE_TOOL_ID",
     "MEDIA_WATCH_VIDEO_TOOL_ID",
     "RECALL_TOOL_ID",

@@ -21,6 +21,7 @@ from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
+    MEMORY_CURRENT_FACT_TOOL_ID,
     MEMORY_SOURCE_TOOL_ID,
     ToolRegistry,
     build_default_registry,
@@ -54,6 +55,7 @@ pytestmark = pytest.mark.w0_web
 CALL_ID = "call_fixture"
 PLAIN_REPLY = "这轮使用普通对话。"
 RESULT_PREFIX = "查询结果是："
+LOCAL_TOOLS = ("clock_now", "knowledge_search", MEMORY_CURRENT_FACT_TOOL_ID)
 
 
 def _model_response(delta: dict | list[dict], finish_reason: str) -> httpx.Response:
@@ -234,7 +236,7 @@ async def _web_reply(env: TestEnv, *, text: str = "现在几点了？") -> str:
 def _tool_payload(
     endpoint: _ToolEndpoint,
     *,
-    available: tuple[str, ...] = ("clock_now", "knowledge_search"),
+    available: tuple[str, ...] = LOCAL_TOOLS,
 ) -> dict:
     assert len(endpoint.requests) == 2, endpoint.requests
     first, second = endpoint.requests
@@ -447,7 +449,7 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     endpoint.arguments = {}
     await _bind_model(logged_in, enabled=True)
     native = availability in {"readable", "local_tool", "unrelated_query"}
-    normal_tools = ("clock_now", "knowledge_search", "web_search")
+    normal_tools = (*LOCAL_TOOLS, "web_search")
     if native:
         endpoint.arguments = {"query": "公开资料"}
     if availability == "local_tool":
@@ -748,7 +750,7 @@ async def test_web_memory_source_is_bound_to_visible_history(
     )
     assert response.status_code == 200, response.text
     await read_sse(response)
-    advertised = ("clock_now", "knowledge_search")
+    advertised = LOCAL_TOOLS
     if same_window:
         advertised += (MEMORY_SOURCE_TOOL_ID,)
     payload = _tool_payload(endpoint, available=advertised)
@@ -791,7 +793,7 @@ async def test_video_tool_uses_the_current_turn_watch_callback(
 
     payload = _tool_payload(
         endpoint,
-        available=("clock_now", "knowledge_search", "media_watch_video"),
+        available=("clock_now", "knowledge_search", "media_watch_video", MEMORY_CURRENT_FACT_TOOL_ID),
     )
     assert payload["outcome"] == "succeeded", payload
     assert payload["untrusted"] is True
@@ -829,7 +831,7 @@ async def test_video_tool_failure_is_not_encoded_as_empty_success(
 
     payload = _tool_payload(
         endpoint,
-        available=("clock_now", "knowledge_search", "media_watch_video"),
+        available=("clock_now", "knowledge_search", "media_watch_video", MEMORY_CURRENT_FACT_TOOL_ID),
     )
     assert payload["outcome"] == "failed", payload
     assert "data" not in payload
@@ -846,7 +848,7 @@ async def test_video_tool_is_not_advertised_without_video_profile(
 
     first_request = endpoint.requests[0]
     advertised = {tool["function"]["name"] for tool in first_request["tools"]}
-    assert advertised == {"clock_now", "knowledge_search"}
+    assert advertised == set(LOCAL_TOOLS)
 
 
 async def test_video_tool_reuses_window_scoped_media_authorization(

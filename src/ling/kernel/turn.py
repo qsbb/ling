@@ -45,6 +45,7 @@ from ling.capabilities.tools import (
     CLOCK_NOW_TOOL_ID,
     KNOWLEDGE_SEARCH_TOOL_ID,
     MEDIA_WATCH_VIDEO_TOOL_ID,
+    MEMORY_CURRENT_FACT_TOOL_ID,
     MEMORY_SOURCE_TOOL_ID,
     ToolOutcome,
     build_default_registry,
@@ -730,7 +731,7 @@ class TurnCoordinator:
         tool_allowlist: frozenset[str] = frozenset(
             {
                 CLOCK_NOW_TOOL_ID, KNOWLEDGE_SEARCH_TOOL_ID, MEDIA_WATCH_VIDEO_TOOL_ID,
-                MEMORY_SOURCE_TOOL_ID, WEB_SEARCH_TOOL_ID,
+                MEMORY_CURRENT_FACT_TOOL_ID, MEMORY_SOURCE_TOOL_ID, WEB_SEARCH_TOOL_ID,
             }
         ),
         settings: Settings | None = None,
@@ -3206,6 +3207,7 @@ class TurnCoordinator:
                     media_callback = self._watch_videos
             registry = build_default_registry(
                 knowledge_audience=audience,
+                include_current_facts=config.memory.max_injected_memories > 0,
                 memory_sources=memory_sources,
                 media_window_id=window_id,
                 watch_video=media_callback,
