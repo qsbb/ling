@@ -54,6 +54,12 @@ const NOOP = () => undefined;
  * 之间——它和人设是同一个问题的两半（她是谁 / 你是谁、谁和谁是一个人），
  * 落位理由写在 `Navigation.tsx` 的 `PRIMARY_NAV` 上。
  * `nav-logs` 仍排在「生活」与「设置」之间（常驻运维入口，排在领域页之后）。
+ * `nav-live`（直播）是**第二个导航组的首项**，排在主组七项之后、「设置/版本」之前：
+ * 组边界由间距与分隔线表达（`nav.css` 的 `data-group-first`），所以它**不插进**
+ * 「人设 → 关系 → 生活 → 日志」这条内容链——那条链是「她这个人」的读法，
+ * 直播是另一类东西（对外开播）。插进去会把内容链切成两截，而插在哪一截
+ * 都会暗示「它属于前面那一类」。这一项属于渲染结果（`renderShell` 用 owner），
+ * 所以序列里必须有它。
  * 这里手写而不是从 `PRIMARY_NAV` 派生——派生出来的期望会跟着实现一起变，
  * 删掉一项也测不出来。
  */
@@ -65,11 +71,21 @@ const EXPECTED_ORDER = [
   'nav-relationships',
   'nav-life',
   'nav-logs',
+  'nav-live',
   'nav-settings',
   'nav-version',
 ];
 
-const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '关系', '生活', '日志', '设置'];
+const EXPECTED_LABELS = ['总览', '对话', '记忆', '人设', '关系', '生活', '日志', '直播', '设置'];
+
+/**
+ * 普通用户看到的是**没有直播组的同一份序列**。
+ *
+ * 单独写一份而不是「EXPECTED_ORDER 过滤掉 nav-live」：过滤式的期望会跟着实现
+ * 一起漂——把直播插到别的位置、或顺手多给一组别的，过滤后照样相等。
+ */
+const EXPECTED_ORDER_MEMBER = EXPECTED_ORDER.filter((id) => id !== 'nav-live');
+const EXPECTED_LABELS_MEMBER = EXPECTED_LABELS.filter((label) => label !== '直播');
 
 function renderShell(route: Route): string {
   return renderToStaticMarkup(
@@ -97,23 +113,84 @@ function renderDrawerPanel(): string {
   return renderToStaticMarkup(h(NavDrawerPanel, DRAWER_PROPS));
 }
 
-it('shows live between relationships and life only when the owner has a show', () => {
+/**
+ * 直播入口的可见性。**这条测的是「入口存不存在」，不是「现在在不在播」。**
+ *
+ * 旧实现按 `navigation_visible`（`planned || active || recent`，见
+ * `api/routes/live.py:111`）显隐，结果是新实例、没配过直播的人左栏里什么都没有——
+ * 他既看不到工作台，也就没有入口去完成第一次配置。所以这里的三条分别钉住：
+ * 1. 所有者**没有场次也没有状态点**时，入口仍在（旧实现下这条红）；
+ * 2. 常驻项与 `liveTone` 解耦：有状态点时入口不会变成另一个地址；
+ * 3. 普通用户看不到它（权限在 `App.tsx` 的 `/live` 分支上，导航必须同一条线）。
+ */
+it('keeps the live entry for the owner even without a show (not gated by navigation_visible)', () => {
   const active = activeNavId(parseRoute('/live'));
   expect(active).toBe('live');
-  expect(navigationRegion(renderSidenav(true))).not.toContain('nav-live');
-  expect(navigationRegion(renderDrawerPanel())).not.toContain('nav-live');
+  // 没有场次、没有状态点：正是「新实例 / 未配置」那一档。
   const surfaces = [
-    renderToStaticMarkup(h(Sidenav, {
-      active, expanded: true, version: null, showLive: true, liveTone: 'attention', onToggle: NOOP, onGo: NOOP,
-    })),
-    renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, active, showLive: true, liveTone: 'attention' })),
+    renderToStaticMarkup(h(Sidenav, { active: 'dashboard', expanded: true, version: null, owner: true, onToggle: NOOP, onGo: NOOP })),
+    renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, owner: true })),
   ];
   for (const surface of surfaces) {
     const nav = navigationRegion(surface);
-    expect(nav.indexOf('nav-relationships')).toBeLessThan(nav.indexOf('nav-live'));
-    expect(nav.indexOf('nav-live')).toBeLessThan(nav.indexOf('nav-life'));
-    expect(nav).toMatch(/data-testid="nav-live"[^>]*aria-current="page"/);
+    expect(nav).toContain('data-testid="nav-live"');
+    // 入口是**可点击的导航目的地**，不是只能展开的容器：直接跳 `/live`。
+    expect(nav).toMatch(/data-testid="nav-live"[^>]*class="sidenav__item/);
+    expect(labelsIn(nav)).toContain('直播');
+    // 没有状态点时不出现那个装饰元素，避免「有圆点=有场次」被反读成「没圆点=没入口」。
+    expect(nav).not.toContain('live-nav-dot');
   }
+});
+
+it('places the live entry in its own group after the content chain and before settings', () => {
+  const active = activeNavId(parseRoute('/live'));
+  const surfaces = [
+    renderToStaticMarkup(h(Sidenav, {
+      active, expanded: true, version: null, owner: true, liveTone: 'attention', onToggle: NOOP, onGo: NOOP,
+    })),
+    renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, active, owner: true, liveTone: 'attention' })),
+  ];
+  for (const surface of surfaces) {
+    const nav = navigationRegion(surface);
+    // 按**元素标签**的位置排，不按字符串流：`data-nav-group="live"` 这个属性
+    // 本身也含有 `nav-live` 字样，直接 `indexOf('nav-live')` 会命中那个属性，
+    // 于是位置比较变成「组容器 vs 生活项」，看起来像顺序错了。
+    const at = (testid: string) => nav.indexOf(`data-testid="${testid}"`);
+    // 内容链整体在直播组之前；直播组在底部设置之前。
+    expect(at('nav-relationships')).toBeLessThan(at('nav-live'));
+    expect(at('nav-life')).toBeLessThan(at('nav-live'));
+    expect(at('nav-live')).toBeLessThan(at('nav-settings'));
+    expect(nav).toMatch(/data-testid="nav-live"[^>]*aria-current="page"/);
+    // 组结构：直播单独一个 `<ul data-nav-group="live">`，不是平铺进主组。
+    // 先定位到那个 `<ul>` 的真实起点（`data-nav-group` 出现在标签属性里，
+    // 直接从属性名切会从标签中间开始，取到的就不再是「这一组」）。
+    const liveListAt = nav.lastIndexOf('<ul', nav.indexOf('data-nav-group="live"'));
+    const primaryListAt = nav.lastIndexOf('<ul', nav.indexOf('data-nav-group="primary"'));
+    expect(primaryListAt).toBeGreaterThanOrEqual(0);
+    expect(liveListAt).toBeGreaterThan(primaryListAt);
+    // 第二个组带组边界标记（间距/分隔线的挂点）；第一个不带。
+    expect(nav).toContain('data-group-first="true"');
+    expect(nav.slice(primaryListAt, nav.indexOf('>', primaryListAt))).not.toContain('data-group-first');
+    // 直播项在它自己的组里、而且是那一组的第一项：切到本组 `</ul>` 为止。
+    const liveList = nav.slice(liveListAt, nav.indexOf('</ul>', liveListAt));
+    expect(testidsIn(liveList)).toEqual(['nav-live']);
+    expect(labelsIn(liveList)).toEqual(['直播']);
+    // 主组里没有直播：分组是真的分组，不是「主组多一项、外面再套个壳」。
+    const primaryList = nav.slice(primaryListAt, nav.indexOf('</ul>', primaryListAt));
+    expect(primaryList).not.toContain('nav-live');
+  }
+});
+
+it('does not give a non-owner the live entry, and its group disappears with it', () => {
+  const html = renderToStaticMarkup(h(Sidenav, {
+    active: 'dashboard', expanded: true, version: null, owner: false, onToggle: NOOP, onGo: NOOP,
+  }));
+  const nav = navigationRegion(html);
+  expect(nav).not.toContain('nav-live');
+  expect(nav).not.toContain('data-nav-group="live"');
+  // 负向断言必须配正向断言：主组照旧在，别把「没给直播」读成「导航坏了」。
+  expect(testidsIn(nav)).toEqual(EXPECTED_ORDER_MEMBER);
+  expect(labelsIn(nav)).toEqual(EXPECTED_LABELS_MEMBER);
 });
 
 /** 取出 `<nav aria-label="主导航">…</nav>` 这一段（取不到直接失败）。 */
@@ -149,7 +226,7 @@ function activeTestId(html: string): string | null {
 /* ------------------------------------------------------------------ 顺序 */
 
 describe('一级导航的顺序（用户拍板的 A 方案）', () => {
-  it('左导航按「总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志 → 设置 → 版本」排列', () => {
+  it('左导航按「总览 → 对话 → 记忆 → 人设 → 关系 → 生活 → 日志 → 直播 → 设置 → 版本」排列', () => {
     // **断顺序**，不是「都在」：`toEqual` 对数组元素与位置同时生效，
     // 把「记忆」挪到「人设」后面、把「日志」塞到「生活」之前、把「关系」
     // 挤到「人设」前面、或把「设置」提到列表里，这条都会红。
@@ -161,9 +238,32 @@ describe('一级导航的顺序（用户拍板的 A 方案）', () => {
     // 显式再断一次相邻关系，失败信息能直接指出是哪一项挤错了位置
     const order = testidsIn(navigationRegion(renderShell({ name: 'dashboard' })));
     expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-life') + 1);
-    expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-settings') - 1);
+    // 「日志紧挨设置那一侧」说的是**主组内部**的关系：日志是主组最后一项，
+    // 而且它下面除了直播组再没有别的内容项。直播组是独立的一组，
+    // 夹在日志与底部设置之间——所以这里断「日志是主组最后一项」，
+    // 而不是「日志的下一个就是设置」。
+    const primaryTail = order.slice(0, order.indexOf('nav-live'));
+    expect(primaryTail[primaryTail.length - 1]).toBe('nav-logs');
     expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-persona') + 1);
-    expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-life') - 1);
+    // 直播组整体在主组之后、底部设置之前：它紧挨着内容链的尾巴，
+    // 但不占用内容链内部的位置。
+    // 直播组紧接在主组之后：它是最后一个内容项（日志）的下一个，
+    // 且排在底部设置之前。这两条同时成立才算「组在内容链尾部、不夹在中间」。
+    expect(order.indexOf('nav-live')).toBeGreaterThan(order.indexOf('nav-logs'));
+    expect(order.indexOf('nav-live')).toBe(order.indexOf('nav-settings') - 1);
+  });
+
+  it('普通用户看到的序列里没有直播，其余项与位置完全不变', () => {
+    const html = renderToStaticMarkup(h(Sidenav, {
+      active: 'dashboard', expanded: true, version: null, owner: false, onToggle: NOOP, onGo: NOOP,
+    }));
+    const region = navigationRegion(html);
+    expect(testidsIn(region)).toEqual(EXPECTED_ORDER_MEMBER);
+    expect(labelsIn(region)).toEqual(EXPECTED_LABELS_MEMBER);
+    // 抽掉直播之后，相邻关系仍然是它原来的样子（不是把生活顶上来的另一种顺序）。
+    const order = testidsIn(region);
+    expect(order.indexOf('nav-relationships')).toBe(order.indexOf('nav-persona') + 1);
+    expect(order.indexOf('nav-logs')).toBe(order.indexOf('nav-life') + 1);
   });
 
   it('导航文字的顺序同样是契约（testid 对但文字错也算错）', () => {
@@ -532,8 +632,13 @@ describe('抽屉开关与浮层互斥（导航 vs 会话列表）', () => {
     // 关掉它的三个入口：关闭按钮（Escape / scrim 在 E2E 里测）
     expect(panel).toContain('data-testid="nav-close"');
     expect(panel).toContain('aria-label="关闭导航"');
-    // 抽屉里的顺序和桌面 rail 完全一致（不是另一套导航）
-    expect(testidsIn(navigationRegion(panel))).toEqual(EXPECTED_ORDER);
+    // 抽屉里的顺序和桌面 rail 完全一致（不是另一套导航）。
+    // 这里的 `renderDrawerPanel()` 不带 owner，所以序列里没有直播——
+    // 与「所有者才看得到直播」是同一条规则，不是抽屉漏了一项。
+    expect(testidsIn(navigationRegion(panel))).toEqual(EXPECTED_ORDER_MEMBER);
+    // 所有者视角下，抽屉与 rail 出现**完全相同**的序列（含直播组）。
+    const ownerPanel = renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, owner: true }));
+    expect(testidsIn(navigationRegion(ownerPanel))).toEqual(EXPECTED_ORDER);
     // 当前页带过来，不会因为在抽屉里就丢掉高亮
     expect(activeTestId(panel)).toBe('nav-memory');
   });

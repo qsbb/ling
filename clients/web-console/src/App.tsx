@@ -278,12 +278,23 @@ export function AppShell({
   const version = useAppVersion();
   const active = activeNavId(route);
   const live = useCurrentLive(user.role === 'owner', route.name === 'live');
+  const owner = user.role === 'owner';
   const liveRun = live.data?.session;
   const running = liveRun && liveRun.state !== 'ended' ? liveRun : null;
   const livePresentation = running ? liveStatus(running, !live.error) : null;
   const liveActivity = livePresentation?.tone === 'live' ? livePresentation.label
     : live.data?.planned_connector_id && !live.error ? '计划直播' : undefined;
-  const showLive = live.data?.navigation_visible === true;
+  /*
+   * 左栏的「直播」入口**只由所有者可访问性决定**，不再看
+   * `navigation_visible`（那是 `planned || active || recent`，见
+   * `api/routes/live.py`）。按状态显隐的真实代价是：新实例、没配过直播的人
+   * 完全看不到这个工作台，也就没有任何入口去完成「第一次配置」——
+   * 而配置正是让 `navigation_visible` 变真的那条路。入口先存在，状态再说话。
+   *
+   * `navigation_visible` 仍然有用，但只作为状态提示的证据之一
+   * （`planned_connector_id` 参与 `liveActivity`），不再决定可见性。
+   */
+  const showLiveEntry = owner;
   const [confirmLiveStop, setConfirmLiveStop] = useState<string | null>(null);
   const stopId = running?.state !== 'stopping' ? running?.id : undefined;
 
@@ -415,7 +426,7 @@ export function AppShell({
             active={active}
             expanded={nav.expanded}
             version={version}
-            showLive={showLive}
+            owner={showLiveEntry}
             liveTone={livePresentation?.tone}
             onToggle={nav.toggle}
             onGo={onGo}
@@ -445,7 +456,7 @@ export function AppShell({
           open={overlay.active === 'nav'}
           active={active}
           version={version}
-          showLive={showLive}
+          owner={showLiveEntry}
           liveTone={livePresentation?.tone}
           accountName={user.display_name || user.username}
           onClose={overlay.close}
