@@ -162,3 +162,37 @@ vite build             ✓ built（chunk 体积警告为既有）
 新增判据（`scripts/chat-poll-history-regression.mjs`，桌面 1440）：
 轮询后 oldest=1 且是同一条、新消息 261/262 已并入、顺序严格递增无重复、
 页顶仍为「开头」、轮询期间 scrollTop 不动、`active_turn=null` 后停止轮询、无页面错误。
+
+## 六、已确认消息重复显示（验收反馈 2）
+
+现象：发一条文字并收到回复，两条各显示一次；再发语音，语音提交触发当前会话刷新后，
+文字与回复**各显示两次**（计数 history=1、sent=2、reply=2、audio=1）。
+
+根因：本地先画出来的那行用的是 `local-user-<clientTurnId>` / `local-actor-<clientTurnId>`
+当 `key`；`turn.started` / `turn.completed` 只给它补上服务端 `messageId`，**`key` 不变**。
+随后 `reloadMessages` / 轮询带回的服务端记录用 `messageId` 当 `key`。`mergeLatestPage`
+只按 `key` 匹配，于是同一条消息被当成两条——本地那条和它的服务端版本同时留在视图里。
+
+修复（`clients/web-console/src/useChat.ts`，只改合并逻辑，界面不动）：
+
+- 去重先按 **`messageId`** 匹配，`key` 只作退路；
+- 认领后**把 `key` 换成服务端的**：本地 key 只是"还没落库"时的临时身份，留着会让
+  下一次刷新再走一遍同样的错配；`clientTurnId` 保留（重发要用）；
+- 认领过的服务端记录不再补一遍（否则又是一条重复）；
+- 没有 `messageId` 的本地消息、比最新一页更早的分页历史，行为与之前一致。
+
+判据（`src/chat-workspace.test.tsx` 新增两条）：已确认的本地行与服务端记录只留一条、
+`key` 换成服务端的、`clientTurnId` 不丢；未确认的本地消息仍保留。
+
+变异验证：「只按 key 去重」时该用例变红（6 条 vs 4 条），恢复后 sha256 一致。
+
+一处被否掉的改动：一度给 `applyFinal` 补了 `sequence`，但变异验证显示单元测试与
+浏览器用例都不依赖它（改回 `null` 仍全绿），说明那是无法证明的冗余，已删除。
+
+复验（生产构建 + 验收脚本 `browser-regressions.mjs`）：
+
+- `chatReconcile`：`history=1, sent=1, reply=1, audio=1`，PASS
+- `chat`（260 条分页/轮询/阅读位置）：`oldest=1, newest=1`，PASS
+- 本轮自有回归：轮询历史 `ALL CHECKS PASSED`；桌面 1440 + 手机 390 验收 `ALL CHECKS PASSED`
+
+日志：`docs/evidence/chat-workspace-20261123/chat-reconcile.log`

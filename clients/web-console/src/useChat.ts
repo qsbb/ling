@@ -299,18 +299,44 @@ function formatDuration(seconds: number): string {
  */
 export function mergeLatestPage(prev: UiMessage[], latest: UiMessage[]): UiMessage[] {
   if (latest.length === 0) return prev;
-  const incoming = new Map(latest.map((message) => [message.key, message]));
+
+  /*
+   * 去重必须按**服务端身份**（`messageId`）先匹配，`key` 只是退路。
+   *
+   * 本地先画出来的那条（`local-user-<clientTurnId>` / `local-actor-<clientTurnId>`）
+   * 在 `turn.started` / `turn.completed` 里被补上了服务端 `messageId`，但 `key`
+   * 保持不变。之后刷新（语音提交后的 `reloadMessages`、轮询）带回来的服务端
+   * 记录用的是 `messageId` 当 `key`——只按 `key` 去重会把同一条消息当成两条，
+   * 正是验收看到的 `sent=2, reply=2`。
+   */
+  const byKey = new Map(latest.map((message) => [message.key, message]));
+  const byId = new Map<string, UiMessage>();
+  for (const message of latest) {
+    if (message.messageId) byId.set(message.messageId, message);
+  }
   const sequences = latest
     .map((message) => message.sequence)
     .filter((value): value is number => typeof value === 'number');
   const serverFloor = sequences.length > 0 ? Math.min(...sequences) : null;
+  /** 已经认领过的服务端记录，最后不再补一遍（否则又是一条重复）。 */
+  const claimed = new Set<string>();
 
   const merged = new Map<string, UiMessage>();
   for (const message of prev) {
-    const fresh = incoming.get(message.key);
+    const fresh =
+      byKey.get(message.key)
+      ?? (message.messageId ? byId.get(message.messageId) : undefined);
     if (fresh) {
-      // 服务端说了算，但本地 `clientTurnId` 是前端独有的事实，别丢。
-      merged.set(message.key, { ...fresh, clientTurnId: message.clientTurnId ?? fresh.clientTurnId });
+      /*
+       * 服务端说了算。`key` 用服务端那条的：本地 key 只是"还没落库"时的临时
+       * 身份，保留它会让下一条消息再走一遍同样的错配。`clientTurnId` 是前端
+       * 独有的事实（重发要用），留着。
+       */
+      claimed.add(fresh.key);
+      merged.set(fresh.key, {
+        ...fresh,
+        clientTurnId: message.clientTurnId ?? fresh.clientTurnId,
+      });
       continue;
     }
     // 比这一页更早 = 用户往上翻出来的分页历史，保留。
@@ -320,11 +346,15 @@ export function mergeLatestPage(prev: UiMessage[], latest: UiMessage[]): UiMessa
       }
       continue;
     }
-    // 没有序号的是本地消息（还没落库）：只要它还在飞或刚发出，就留着。
+    /*
+     * 没有序号：本地还没落库的那条（或刚拿到 `messageId` 但这一页里还没有它）。
+     * 留着——正在飞的发送请求必须看得见。
+     */
     merged.set(message.key, message);
   }
   for (const message of latest) {
-    if (!merged.has(message.key)) merged.set(message.key, message);
+    if (claimed.has(message.key)) continue;
+    merged.set(message.key, message);
   }
 
   const ordered = [...merged.values()].sort((left, right) => {

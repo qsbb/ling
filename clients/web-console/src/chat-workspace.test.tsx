@@ -429,6 +429,66 @@ describe('轮询/刷新与历史分页：合并而不是替换', () => {
     expect(merged.at(-1)?.sequence).toBe(305);
   });
 
+  it('已拿到服务端 message_id 的本地行，不会与最新一页各亮一次', () => {
+    /*
+     * 验收复现的那条：发送后本地先画一行（key=local-user-…），
+     * `turn.started` 给它补上服务端 messageId，但 key 不变；随后语音提交触发
+     * `loadMessages`，最新一页带回同一条（key=messageId）。只按 key 去重会把
+     * 同一条消息当成两条，界面显示 sent=2 / reply=2。
+     */
+    const confirmedUser = message({
+      key: 'local-user-abc',
+      messageId: 'msg-2',
+      sequence: null,
+      local: false,
+      clientTurnId: 'abc',
+      text: '验收：刚发送的文字',
+    });
+    const confirmedActor = message({
+      key: 'local-actor-abc',
+      messageId: 'msg-3',
+      sequence: null,
+      local: false,
+      role: 'actor',
+      text: '验收：收到的文字回复',
+    });
+    const view = [
+      message({ key: 'msg-1', messageId: 'msg-1', sequence: 1, text: '已有历史' }),
+      confirmedUser,
+      confirmedActor,
+    ];
+    const latest = [
+      message({ key: 'msg-1', messageId: 'msg-1', sequence: 1, text: '已有历史' }),
+      message({ key: 'msg-2', messageId: 'msg-2', sequence: 2, text: '验收：刚发送的文字' }),
+      message({ key: 'msg-3', messageId: 'msg-3', sequence: 3, role: 'actor', text: '验收：收到的文字回复' }),
+      message({ key: 'msg-4', messageId: 'msg-4', sequence: 4, text: '验收：语音转写刷新标记' }),
+    ];
+    const merged = mergeLatestPage(view, latest);
+
+    // 反例：只按 key 去重时这里会是 5 条（本地两条 + 服务端三条）。
+    expect(merged).toHaveLength(4);
+    expect(merged.map((item) => item.messageId)).toEqual(['msg-1', 'msg-2', 'msg-3', 'msg-4']);
+    // 认领后 key 换成服务端的：下次刷新不会再走一遍同样的错配。
+    expect(merged[1]?.key).toBe('msg-2');
+    // 重发要用的 clientTurnId 不能丢。
+    expect(merged[1]?.clientTurnId).toBe('abc');
+  });
+
+  it('还没确认的本地消息仍然保留（不能为了去重把在飞的发送吞掉）', () => {
+    const view = [
+      message({ key: 'msg-1', messageId: 'msg-1', sequence: 1, text: '已有历史' }),
+      message({
+        key: 'local-user-new', messageId: null, sequence: null,
+        local: true, state: 'pending', text: '刚敲下的这句',
+      }),
+    ];
+    const merged = mergeLatestPage(view, [
+      message({ key: 'msg-1', messageId: 'msg-1', sequence: 1, text: '已有历史' }),
+    ]);
+    expect(merged.map((item) => item.key)).toEqual(['msg-1', 'local-user-new']);
+    expect(merged[1]?.state).toBe('pending');
+  });
+
   it('首屏（空视图）仍是整体替换，边界由这一页是否取满决定', () => {
     // 这条钉的是区分力：合并逻辑不能顺带把"首屏边界"也算错。
     const full = mergeLatestPage([], series(161, 260));
