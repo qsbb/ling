@@ -34,7 +34,9 @@ const json = (body: unknown, status = 200) => ({
 
 const onebotPrivate = {
   schema_version: 'v1', session_id: 'p1', window_id: 'p1', actor_id: 'a', subject_id: 's',
-  title: 'onebot-default:private:100200301', channel: 'onebot-default', peer_id: '100200301',
+  // `channel` 是契约里的协议值。窗口键（title）里的实例段是另一回事——
+  // 它受 `LING_ONEBOT_INSTANCE_ID` 影响，不能拿来判断渠道。
+  title: 'onebot-default:private:100200301', channel: 'onebot', peer_id: '100200301',
   created_at: '2026-11-14T00:00:00Z', updated_at: '2026-11-14T00:00:00Z', message_count: 2, archived: false,
 };
 const onebotPrivate2 = {
@@ -45,7 +47,12 @@ const onebotGroup = {
 };
 const qqbotPrivate = {
   ...onebotPrivate, session_id: 'q1', window_id: 'q1', title: 'qqbot-main:private:100200303',
-  channel: 'qqbot-main', peer_id: '100200303',
+  channel: 'qqbot', peer_id: '100200303',
+};
+/** 自定义 `LING_ONEBOT_INSTANCE_ID`：窗口键的实例段不以 `onebot-` 开头。 */
+const onebotCustomNamespace = {
+  ...onebotPrivate, session_id: 'c1', window_id: 'c1',
+  title: 'fixture-bridge:private:100200303', peer_id: '100200303',
 };
 const webSession = {
   schema_version: 'v1', session_id: 'w1', window_id: 'w1', actor_id: 'a', subject_id: 's',
@@ -342,6 +349,48 @@ describe('OneBot 私聊的「允许晚点回」', () => {
     expect(server.reads.at(-1)).toBe('p2');
     expect(server.writes).toEqual([]);
   }, 40000);
+
+  it('自定义实例命名空间的私聊也能读取和保存开关', async (ctx) => {
+    if (startupError) { console.warn(startupError); ctx.skip(); return; }
+    // 回归 2026-11-24 的真实失败：窗口键是 `fixture-bridge:private:…`，
+    // 实例段不以 `onebot-` 开头。判定若按前缀猜渠道，这里开关根本不渲染。
+    const { page, server } = await openChat('owner', [onebotCustomNamespace], 'known');
+    await openSettings(page);
+    const toggle = page.getByRole('checkbox', { name: '允许晚点回' });
+    await toggle.waitFor();
+    expect(await toggle.isChecked()).toBe(false);
+
+    await toggle.click();
+    await expect.poll(() => server.state.get('c1')).toBe(true);
+    await expect.poll(() => toggle.isChecked()).toBe(true);
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('[data-testid="message-scroll"]').waitFor();
+    await openSettings(page);
+    const reopened = page.getByRole('checkbox', { name: '允许晚点回' });
+    await reopened.waitFor();
+    expect(await reopened.isChecked()).toBe(true);
+    expect(server.writes).toEqual([{ sessionId: 'c1', enabled: true }]);
+  }, 30000);
+
+  it('自定义与默认命名空间的私聊各自保存，互不影响', async (ctx) => {
+    if (startupError) { console.warn(startupError); ctx.skip(); return; }
+    const { page, server } = await openChat(
+      'owner', [onebotPrivate, onebotCustomNamespace], 'known',
+    );
+    await openSettings(page);
+    await page.getByRole('checkbox', { name: '允许晚点回' }).click();
+    await expect.poll(() => server.state.get('p1')).toBe(true);
+
+    await page.getByRole('button', { name: /私聊 100200303/ }).first().click();
+    await switchTo(page, 'c1', '私聊 100200303');
+    await openSettings(page);
+    const custom = page.getByRole('checkbox', { name: '允许晚点回' });
+    await custom.waitFor();
+    expect(await custom.isChecked()).toBe(false);
+    expect(server.state.get('p1')).toBe(true);
+    expect(server.state.get('c1')).toBeUndefined();
+  }, 30000);
 
   it('上一会话的慢响应在卸载后被丢弃，不改写当前开关', async (ctx) => {
     if (startupError) { console.warn(startupError); ctx.skip(); return; }

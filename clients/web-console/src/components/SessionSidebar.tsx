@@ -123,20 +123,22 @@ export function describeSession(session: SessionLike): SessionHeading {
  * 服务端只对 OneBot 私聊实现这个设置（群聊 / 网页 / 官方 QQ 机器人一律 422），
  * 所以界面同样只在那里出现——不让用户点一个注定被拒的开关。
  *
- * 判定用窗口键的实例段：`onebot-default:private:…` 的实例段以 `onebot-` 开头，
- * 官方 QQ 机器人的实例段是 `qqbot-…`。拆不出键的旧渠道窗口不猜。
+ * **判据是契约字段，不是窗口键的形状。** `SessionRecord.channel` 是协议
+ * （`web` / `onebot` / `qqbot`），不是实例命名空间：`LING_ONEBOT_INSTANCE_ID`
+ * 可以随便起名，窗口键可能是 `fixture-bridge:private:100200303`、
+ * `default:private:…`，甚至不带前缀。按 `onebot-` 这种前缀去猜，自定义
+ * 命名空间的私聊会**静默不显示**开关——服务端明明 200 可用。
+ *
+ * 所以这里只问两件契约上稳定的事：
+ * 1. 会话类型是不是私聊（`describeSession` 从窗口键或 `peer_id` 得出）；
+ * 2. 渠道是不是 `onebot`（群聊由类型排除，官方 QQ 机器人的渠道是 `qqbot`）。
+ *
+ * 旧服务端没有 `channel` 字段时无法确认渠道，按不显示处理——宁可少显示，
+ * 也不要在 qqbot 会话上摆一个必然 422 的控件。
  */
 export function supportsOneBotDeferred(session: SessionLike): boolean {
-  const described = describeSession(session);
-  if (described.kind !== 'private') return false;
-  // 与 `describeSession` 同一条解析路径：`channel === 'web'` 时 title 是用户起的
-  // 名字，不能当窗口键读。
-  const channel = (session.channel ?? '').trim().toLowerCase();
-  if (channel === 'web') return false;
-  const ref = parseChannelRef(session.title)
-    ?? parseChannelRef(session.window_id)
-    ?? parseChannelRef(session.subject_id);
-  return ref?.instance.startsWith('onebot-') ?? false;
+  if (describeSession(session).kind !== 'private') return false;
+  return (session.channel ?? '').trim().toLowerCase() === 'onebot';
 }
 
 export function canManageSessionOrder(role: string): boolean {
