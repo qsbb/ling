@@ -239,7 +239,6 @@ async function openPersona(
       }
       return route.fulfill(json({ ...detail(active, backend), active: true, exists: true }));
     }
-    if (path === '/v1/actor/timeline') return route.fulfill(json({ events: [] }));
 
     if (path === '/v1/personas' && method === 'POST') {
       createBodies.push((body as Record<string, unknown>) ?? {});

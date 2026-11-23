@@ -1783,59 +1783,6 @@ button {
   font-size: 11.5px;
 }
 
-.timeline {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.timeline__item {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
-  padding: 9px 10px;
-  border-bottom: 1px solid var(--line);
-  font-size: 12.5px;
-}
-
-.timeline__item:last-child {
-  border-bottom: 0;
-}
-
-.timeline__main {
-  display: flex;
-  gap: 10px;
-  align-items: baseline;
-  min-width: 0;
-}
-
-.timeline__type {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 5px;
-  padding: 1px 6px;
-  flex: none;
-}
-
-.timeline__summary {
-  color: var(--ink-soft);
-}
-
-.timeline__meta {
-  display: flex;
-  gap: 9px;
-  color: var(--ink-faint);
-  font-size: 11px;
-  flex-wrap: wrap;
-}
-
 /* ------------------------------------------------------------ 响应式 */
 
 @media (max-width: 900px) {
