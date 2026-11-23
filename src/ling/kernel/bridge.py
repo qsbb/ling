@@ -23,7 +23,7 @@ import random
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, or_, select, text
@@ -574,52 +574,89 @@ class InboundBridge:
             self._reply_when_addressed and envelope.mentions_actor
         )
 
-        audio_ids = []
-        if has_new_audio:
-            from ling.domains.media.service import MediaEvidenceService
-            from ling.domains.speech.transcription import (
-                TranscriptionError,
-                can_auto_transcribe,
-                create_job,
-            )
+        from ling.domains.speech.relisten import (
+            inspect_quoted_voice,
+            make_quote_source,
+            wants_quoted_voice,
+        )
+        from ling.domains.speech.transcription import (
+            TranscriptionError,
+            can_auto_transcribe,
+            create_job,
+            lock_scope,
+        )
 
+        audio_ids: list[dict[str, str]] = []
+        quoted_source = None
+        if (
+            reply_reference is not None and not has_new_audio and not is_group
+            and not self._observe_only and getattr(self._connector, "connector_id", None) == "onebot"
+            and wants_quoted_voice(readable)
+        ):
+            from ling.kernel.inbound_intake import _connector_event_scope
+
+            source = make_quote_source(
+                envelope.external_event_id, reply_reference.platform_id, envelope.connector_instance,
+                recall_scopes=sorted({
+                    _connector_event_scope(envelope.connector_instance, key, recall=True)
+                    for key in (self._trusted_instance_key, None)
+                }),
+            )
+            if source is not None:
+                await lock_scope(self._session, f"asr:quote:{window.id}:{source['event_id']}")
+                voice = await inspect_quoted_voice(
+                    self._session, source, actor_id=self._actor_id, window_id=window.id,
+                    subject_id=subject_id, namespace=envelope.connector_instance,
+                )
+                if voice is not None:
+                    reply_reference = replace(
+                        reply_reference,
+                        message=reply_reference.message if voice.text else None,
+                        voice_text=voice.text, voice_note=voice.note,
+                    )
+                    if resume_message_id is None and voice.items:
+                        audio_ids = voice.items
+                        quoted_source = source
+
+        if has_new_audio:
             svc = MediaEvidenceService(self._session, actor_id=self._actor_id)
             for eid in media_ids:
                 evidence = await svc.get(eid, window_id=window.id)
                 if evidence is not None and evidence.kind == "audio":
                     audio_ids.append({"evidence_id": eid, "ref": evidence.media_ref})
-            if audio_ids and can_auto_transcribe(
-                is_group=is_group,
-                mentions_actor=envelope.mentions_actor,
-                may_reply=not self._observe_only,
-                reply_when_addressed=self._reply_when_addressed,
-            ):
-                effective = runtime_snapshot.config
-                try:
-                    job = await create_job(
-                        self._session, window_id=window.id, subject_id=subject_id,
-                        actor_id=self._actor_id,
-                        request_key=f"{envelope.connector_instance}:{envelope.external_event_id}",
-                        mode="send", config=effective,
-                        payload={"audio": audio_ids, "text": readable,
-                                 "envelope": envelope.model_dump(mode="json"),
-                                 "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0],
-                                 "trusted_instance": (
-                                     {"scope": self._trusted_instance_key[0],
-                                      "instance_id": self._trusted_instance_key[1]}
-                                     if self._trusted_instance_key is not None else None
-                                 )},
-                    )
-                    if job.source_message_id:
-                        await self._remember_platform_message_id(job.source_message_id, envelope)
-                    await self._session.commit()
-                    return BridgeResult(accepted=True, reason="语音识别已排队", decision="deferred_attention",
-                                        subject_id=subject_id, window_id=window.id, media_evidence_ids=media_ids)
-                except TranscriptionError as exc:
-                    if not readable:
-                        return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
-                                            window_id=window.id, media_evidence_ids=media_ids)
-                    media_note = media_note or str(exc)
+        if audio_ids and can_auto_transcribe(
+            is_group=is_group,
+            mentions_actor=envelope.mentions_actor,
+            may_reply=not self._observe_only,
+            reply_when_addressed=self._reply_when_addressed,
+        ):
+            payload = {
+                "audio": audio_ids, "text": readable, "envelope": envelope.model_dump(mode="json"),
+                "channel": getattr(self._connector, "connector_id", "onebot").split(".")[0],
+                "trusted_instance": (
+                    {"scope": self._trusted_instance_key[0], "instance_id": self._trusted_instance_key[1]}
+                    if self._trusted_instance_key is not None else None
+                ),
+            }
+            if quoted_source is not None:
+                payload["quoted_voice"] = quoted_source
+            try:
+                job = await create_job(
+                    self._session, window_id=window.id, subject_id=subject_id,
+                    actor_id=self._actor_id,
+                    request_key=f"{envelope.connector_instance}:{envelope.external_event_id}",
+                    mode="send", config=runtime_snapshot.config, payload=payload,
+                )
+                if job.source_message_id:
+                    await self._remember_platform_message_id(job.source_message_id, envelope)
+                await self._session.commit()
+                return BridgeResult(accepted=True, reason="语音识别已排队", decision="deferred_attention",
+                                    subject_id=subject_id, window_id=window.id, media_evidence_ids=media_ids)
+            except TranscriptionError as exc:
+                if not readable:
+                    return BridgeResult(accepted=False, reason=str(exc), subject_id=subject_id,
+                                        window_id=window.id, media_evidence_ids=media_ids)
+                media_note = media_note or str(exc)
 
         if has_new_audio:
             await self._session.commit()
