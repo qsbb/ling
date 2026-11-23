@@ -891,9 +891,17 @@ class OneBotDeferredSetting(BaseModel):
 async def _onebot_private_window(
     session_id: str, request: Request, auth: CurrentAuth, session: DbSession,
 ) -> Window:
+    """定位「这个开关只能挂在 OneBot 私聊上」的那个窗口。
+
+    `allow_managed_groups=True` 是**为了让下面的 422 说得出口**：不传它，
+    owner 自己的群窗口会在 `policy_window` 里直接 404（"会话不存在"），
+    前端只能把 404 当成"读失败"，于是群聊里显示一句莫名其妙的错误。
+    传了它，群聊会被放进来、再由下面那句按可见性判成 422——同样是拒绝，
+    但说的是"这个设置不适用于群聊"，而不是"会话不见了"。
+    """
     window = await policy_window(
         session, window_id=session_id, subject_id=auth.user.subject_id,
-        actor_id=request.app.state.settings.actor_id,
+        actor_id=request.app.state.settings.actor_id, allow_managed_groups=True,
     )
     require_active_window(window)
     if window.channel != "onebot" or window.visibility == "group_scope":

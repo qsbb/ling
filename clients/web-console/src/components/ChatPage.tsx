@@ -12,7 +12,7 @@ import {
   PromptDrawer,
   promptEntryAction,
 } from './PromptDrawer';
-import { canRenameSession, describeSession, SessionSidebar } from './SessionSidebar';
+import { canRenameSession, describeSession, SessionSidebar, supportsOneBotDeferred } from './SessionSidebar';
 
 interface ChatPageProps {
   sessionId: string | null;
@@ -284,6 +284,7 @@ export function ChatPage({
             <WindowPolicy key={session.session_id} sessionId={session.session_id}
               groupReplyLimit={heading?.kind === 'group' ? session.group_reply_max_parts ?? null : undefined}
               onGroupReplyLimitSaved={chat.reloadSessions}
+              onebotDeferred={!session.archived && supportsOneBotDeferred(session)}
               accessTarget={(heading?.kind === 'group' || heading?.kind === 'private') && session.peer_id
                 ? { kind: heading.kind, id: session.peer_id }
                 : undefined} onClose={() => {

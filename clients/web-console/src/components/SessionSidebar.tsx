@@ -117,6 +117,28 @@ export function describeSession(session: SessionLike): SessionHeading {
   };
 }
 
+/**
+ * 这条会话是否显示「允许晚点回」。
+ *
+ * 服务端只对 OneBot 私聊实现这个设置（群聊 / 网页 / 官方 QQ 机器人一律 422），
+ * 所以界面同样只在那里出现——不让用户点一个注定被拒的开关。
+ *
+ * 判定用窗口键的实例段：`onebot-default:private:…` 的实例段以 `onebot-` 开头，
+ * 官方 QQ 机器人的实例段是 `qqbot-…`。拆不出键的旧渠道窗口不猜。
+ */
+export function supportsOneBotDeferred(session: SessionLike): boolean {
+  const described = describeSession(session);
+  if (described.kind !== 'private') return false;
+  // 与 `describeSession` 同一条解析路径：`channel === 'web'` 时 title 是用户起的
+  // 名字，不能当窗口键读。
+  const channel = (session.channel ?? '').trim().toLowerCase();
+  if (channel === 'web') return false;
+  const ref = parseChannelRef(session.title)
+    ?? parseChannelRef(session.window_id)
+    ?? parseChannelRef(session.subject_id);
+  return ref?.instance.startsWith('onebot-') ?? false;
+}
+
 export function canManageSessionOrder(role: string): boolean {
   return role === 'owner' || role === 'admin';
 }

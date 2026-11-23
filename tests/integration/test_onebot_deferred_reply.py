@@ -5,10 +5,12 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from ling import worker
 from ling.domains.conversation.service import ConversationService
+from ling.domains.identity.service import IdentityService
 from ling.infra.db import session_scope
 from ling.infra.models import DeferredReply, Message, Operation, Window
 from ling.models.router import StreamOutcome
@@ -158,3 +160,66 @@ async def test_onebot_deferred_reply_rechecks_current_input_and_real_receipt(
         else:
             assert external_calls == [] and operations == []
         assert bool(settled.delivered_turn_id) is (outcome == "sent")
+
+
+async def test_deferred_setting_is_owner_only_and_private_onebot_only(logged_in: TestEnv) -> None:
+    """开关只对**所有者**的 OneBot **私聊**存在；群聊与网页给出 422 而不是 404。
+
+    404 与 422 的分界是"这个会话存在且你管得着"：
+    - 别人的会话、不存在的 id → 404（不泄露存在性）；
+    - 你自己的群聊 / 网页会话 → 422（存在、可管，但这个设置不适用）。
+    前端靠这条区分"读失败"与"本来就没有"，所以不能让群聊掉进 404。
+    """
+    fake = _Delivery()
+    _install(logged_in, fake)
+    await _bind(logged_in)
+    async with session_scope() as session:
+        service = ConversationService(session, actor_id=logged_in.settings.actor_id)
+        group = await service.create_window(subject_id=logged_in.subject_id, channel="onebot")
+        group.visibility = "group_scope"
+        group.origin_status = "unknown"
+        web = await service.create_window(subject_id=logged_in.subject_id)
+        other = await IdentityService(session).create_user(username="member", password="member-pass")
+        foreign = await service.create_window(subject_id=other.subject_id)
+        group_id, web_id, foreign_id = group.id, web.id, foreign.id
+
+    for unsuitable in (group_id, web_id):
+        response = await logged_in.client.get(f"/v1/sessions/{unsuitable}/onebot-deferred")
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "invalid_request"
+    for missing in (foreign_id, "missing-window"):
+        assert (await logged_in.client.get(f"/v1/sessions/{missing}/onebot-deferred")).status_code == 404
+
+    async with AsyncClient(transport=ASGITransport(app=logged_in.app), base_url="http://testserver") as member:
+        assert (await member.post("/v1/auth/login", json={"username": "member", "password": "member-pass"})).status_code == 200
+        assert (await member.get(f"/v1/sessions/{foreign_id}/onebot-deferred")).status_code == 403
+        assert (await member.put(
+            f"/v1/sessions/{foreign_id}/onebot-deferred", json={"enabled": False},
+            headers={"Origin": "http://testserver", "Content-Type": "application/json"},
+        )).status_code == 403
+
+
+async def test_unconfirmed_instance_blocks_enable_but_allows_disable(logged_in: TestEnv) -> None:
+    """没有可信实例时开启被拒（409），关闭仍然放行。
+
+    "只能开不能关"是个陷阱：用户在一个还没绑定实例的会话里看到开关是开的
+    （历史上开过、或实例后来被解绑），就必须能关掉。所以 409 只挂在
+    `enabled=True` 这一半上。
+    """
+    async with session_scope() as session:
+        service = ConversationService(session, actor_id=logged_in.settings.actor_id)
+        window = await service.create_window(subject_id=logged_in.subject_id, channel="onebot")
+        window.origin_status = "unknown"
+        window.origin_scope = None
+        window.origin_instance_id = None
+        window.onebot_defer_enabled = True
+        session_id = window.id
+
+    path = f"/v1/sessions/{session_id}/onebot-deferred"
+    assert (await logged_in.client.get(path)).json() == {"enabled": True}
+    blocked = await logged_in.client.put(path, json={"enabled": True}, headers={"Origin": "http://testserver"})
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "conflict"
+    off = await logged_in.client.put(path, json={"enabled": False}, headers={"Origin": "http://testserver"})
+    assert off.status_code == 200, off.text
+    assert off.json() == {"enabled": False}
