@@ -109,8 +109,8 @@ const DRAWER_PROPS = {
   onLogout: NOOP,
 } as const;
 
-function renderDrawerPanel(): string {
-  return renderToStaticMarkup(h(NavDrawerPanel, DRAWER_PROPS));
+function renderDrawerPanel(owner = true): string {
+  return renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, owner }));
 }
 
 /**
@@ -631,19 +631,16 @@ describe('抽屉开关与浮层互斥（导航 vs 会话列表）', () => {
   });
 
   it('抽屉面板是一个带名字的模态对话框，有关闭入口与同一套导航', () => {
-    const panel = renderDrawerPanel();
+    const panel = renderDrawerPanel(false);
     expect(panel).toContain('role="dialog"');
     expect(panel).toContain('aria-modal="true"');
     expect(panel).toContain('aria-label="导航"');
     // 关掉它的三个入口：关闭按钮（Escape / scrim 在 E2E 里测）
     expect(panel).toContain('data-testid="nav-close"');
     expect(panel).toContain('aria-label="关闭导航"');
-    // 抽屉里的顺序和桌面 rail 完全一致（不是另一套导航）。
-    // 这里的 `renderDrawerPanel()` 不带 owner，所以序列里没有直播——
-    // 与「所有者才看得到直播」是同一条规则，不是抽屉漏了一项。
+    // 两种角色在抽屉和桌面侧栏中分别看到相同的入口。
     expect(testidsIn(navigationRegion(panel))).toEqual(EXPECTED_ORDER_MEMBER);
-    // 所有者视角下，抽屉与 rail 出现**完全相同**的序列（含直播组）。
-    const ownerPanel = renderToStaticMarkup(h(NavDrawerPanel, { ...DRAWER_PROPS, owner: true }));
+    const ownerPanel = renderDrawerPanel();
     expect(testidsIn(navigationRegion(ownerPanel))).toEqual(EXPECTED_ORDER);
     // 当前页带过来，不会因为在抽屉里就丢掉高亮
     expect(activeTestId(panel)).toBe('nav-memory');
