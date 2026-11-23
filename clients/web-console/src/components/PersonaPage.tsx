@@ -28,10 +28,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { api, personaId } from '../api';
 import { explainError, type ExplainedError } from '../errors';
-import { formatSessionTime } from '../format';
 import { navigate, useLocationHref } from '../route';
 import { personaTabFromHref, personaTabHref, type PersonaTab } from '../tabs';
-import type { Persona, PersonaScenario, PersonaSummary, TimelineEvent } from '../types';
+import type { Persona, PersonaScenario, PersonaSummary } from '../types';
 import '../persona.css';
 import { DialoguePage } from './DialoguePage';
 import { AlertIcon, ArrowLeftIcon, CheckIcon, PencilIcon, PlusIcon, RefreshIcon } from './Icons';
@@ -569,7 +568,6 @@ function PersonaSettings() {
   /** 列表接口给的 `active_persona_id`（"哪套生效"的第二判据）。 */
   const [turnActiveId, setTurnActiveId] = useState<string | null>(null);
   const [current, setCurrent] = useState<Persona | null>(null);
-  const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [view, setView] = useState<PersonaView>({ kind: 'list' });
   const [creating, setCreating] = useState(false);
   const [menuFor, setMenuFor] = useState<string | null>(null);
@@ -593,20 +591,16 @@ function PersonaSettings() {
     setLoading(true);
     setLoadError(null);
     try {
-      // 列表是主角，`/v1/persona` 只是"哪套在生效"的**回退来源**、时间线是旁白：
-      // 两者谁挂了都不该让卡片列表整页消失，所以列表单独 try，其余 allSettled。
+      // 列表是主角，`/v1/persona` 只是"哪套在生效"的**回退来源**：
+      // 它挂了不该让卡片列表整页消失，所以列表单独 try，其余 allSettled。
       const list = await api.listPersonas();
-      const [currentResult, timelineResult] = await Promise.allSettled([
-        api.persona(),
-        api.timeline(50),
-      ]);
+      const [currentResult] = await Promise.allSettled([api.persona()]);
       if (!alive.current) return;
       const fallbackActive =
         currentResult.status === 'fulfilled' ? currentResult.value : null;
       setTurnActiveId(list.activePersonaId);
       setTotal(list.total);
       setCurrent(fallbackActive);
-      setEvents(timelineResult.status === 'fulfilled' ? timelineResult.value.events : []);
 
       // 列表项**没有正文**（后端刻意不带），卡片要摘要就得按 id 拉详情。
       // 失败的保持原样（渲染成"点开查看"），不影响整页——多取一份摘要
@@ -748,7 +742,6 @@ function PersonaSettings() {
       <PersonaForm
         persona={null}
         current={current}
-        events={events}
         busy={saving}
         error={formError}
         onBusyChange={setSaving}
@@ -797,7 +790,6 @@ function PersonaSettings() {
       <PersonaForm
         persona={target}
         current={current}
-        events={events}
         busy={saving}
         error={formError}
         onBusyChange={setSaving}
@@ -901,7 +893,6 @@ function PersonaSettings() {
         />
       ) : null}
 
-      {events.length > 0 ? <PersonaTimeline events={events} /> : null}
     </div>
   );
 }
@@ -981,7 +972,6 @@ interface PersonaFormProps {
   /** `null` = 新建。 */
   persona: PersonaSummary | null;
   current: Persona | null;
-  events: TimelineEvent[];
   /** 保存中：按钮文案与禁用都由它决定（状态归列表层，切回去时不会闪）。 */
   busy: boolean;
   onBusyChange: (busy: boolean) => void;
@@ -1011,7 +1001,6 @@ type TraitsState =
 function PersonaForm({
   persona,
   current,
-  events,
   busy,
   onBusyChange,
   error,
@@ -1254,40 +1243,6 @@ function PersonaForm({
           <span className="panel__hint">留空的字段不会写入，也不会用默认值补上</span>
         </div>
       </form>
-
-      {editing && events.length > 0 ? <PersonaTimeline events={events} /> : null}
     </div>
-  );
-}
-
-/* ------------------------------------------------------------ 角色时间线 */
-
-function PersonaTimeline({ events }: { events: TimelineEvent[] }) {
-  return (
-    <section className="panel">
-      <div className="panel__head">
-        <h2>角色时间线</h2>
-        <span className="panel__count">最近 {events.length} 条</span>
-      </div>
-      <p className="panel__note">
-        时间线是服务端权威事件序列（含来源与可见范围），不是浏览器拼出来的记录。
-      </p>
-      <ul className="timeline">
-        {events.map((event) => (
-          <li className="timeline__item" key={event.id}>
-            <div className="timeline__main">
-              <span className="timeline__type">{event.type}</span>
-              <span className="timeline__summary">{event.summary}</span>
-            </div>
-            <div className="timeline__meta">
-              <span>rev {event.revision}</span>
-              <span>{event.origin}</span>
-              <span>{event.visibility}</span>
-              <span>{formatSessionTime(event.occurred_at)}</span>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
   );
 }

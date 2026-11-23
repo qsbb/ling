@@ -452,10 +452,6 @@ function makeBackend(seed: PersonaSummary[]) {
       calls.push({ method: 'GET', path: '/v1/persona', body: null });
       return { ...(personas.find((item) => item.id === activeId) ?? seed[0]!), scenarios: [] };
     },
-    timeline: async () => {
-      calls.push({ method: 'GET', path: '/v1/actor/timeline', body: null });
-      return { events: [] };
-    },
     createPersona: async (body: Record<string, unknown>) => {
       calls.push({ method: 'POST', path: '/v1/personas', body });
       const created = {

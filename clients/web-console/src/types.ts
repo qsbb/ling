@@ -1140,21 +1140,6 @@ export interface PersonaListResponse {
   total?: number;
 }
 
-export interface TimelineEvent {
-  id: string;
-  type: string;
-  origin: string;
-  visibility: string;
-  revision: number;
-  occurred_at: string | null;
-  window_id: string | null;
-  summary: string;
-}
-
-export interface TimelineResponse {
-  events: TimelineEvent[];
-}
-
 /* ---------------------------------------------------------------- SSE */
 
 export interface SseEvent {

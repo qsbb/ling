@@ -42,7 +42,6 @@ import type {
   ActivityResponse,
   GoalsResponse,
   ProactiveResponse,
-  TimelineResponse,
   LifeTimelineOut,
   OutlineJobOut,
   SubjectsResponse,
@@ -1660,10 +1659,6 @@ export const api = {
       jsonInit('POST', {}),
     );
   },
-  timeline(limit = 50): Promise<TimelineResponse> {
-    return request<TimelineResponse>(`/v1/actor/timeline?limit=${limit}`);
-  },
-
   /* ------------------------------------------------------------ 运行日志
    *
    * 只读**本进程**的环形缓冲（`GET /v1/logs`）：没有分页、没有游标、
