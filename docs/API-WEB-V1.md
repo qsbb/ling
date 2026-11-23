@@ -853,7 +853,7 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 
 | 参数 | 默认 | 取值 | 说明 |
 | --- | --- | --- | --- |
-| `limit` | `50` | 整数 `1..200` | 单次最多返回条数。**无分页**：没有 `offset` / `cursor`，只有 `limit`；`limit` 上限 200，超过 200 条的部分在接口层面**不可达** |
+| `limit` | `50` | 整数 `1..200` | 单次最多返回条数，记忆库搜索可从指定位置开始读取 |
 | `include` | 不传（`null`） | `retracted` / `archived` / `all` | 显式取回墓碑；其它值 `422 invalid_request` |
 | `view` | 不传 | `library` | Web 记忆库使用的附加视图；不传时仍只读当前账号的原有记忆条目 |
 
@@ -900,9 +900,7 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 - 排序：`created_at DESC, memory_id DESC`。`memory_id` 是**稳定次级键**：
   同一 `created_at`（同秒/同微秒）的多行顺序也是确定的，同一查询重复执行
   不会漏行或重复。`total` 与当前页使用同一过滤口径。
-- **无分页**：只有 `limit`（上限 200），没有 `offset`/`cursor`。`limit` 截断后
-  更早的行在接口层面**不可达**；`total`/`has_more` 只回答"还有没有更早的"，
-  不提供翻页。需要第 200 条之前的内容时，按 `created_at` 收窄或直接查库。
+- 普通列表按 `limit` 截断。要浏览较旧记录，可使用下方记忆库搜索或导入来源分页。
 
 错误：未登录 `401`；`limit` 非整数、`limit` 越界或 `include` 非法 →
 `422 invalid_request`，使用统一 `ErrorResponse` 形状（见 §10 开头），
@@ -910,6 +908,14 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 判定，OpenAPI 只声明 `integer`、无 `minimum`/`maximum`；非整数由 pydantic
 拦。`include` 的三值由 OpenAPI 的 `enum` 声明；非法值仍由端点拒绝，
 `error.detail` 为 `null`。）
+
+#### 记忆库搜索与导入来源分页
+
+使用 `GET /v1/memory?view=library&q=杭州%20散步&limit=50&offset=0`，服务端会在当前自然人的可见范围内查询记忆正文和经历摘要。搜索词按空白分隔，每个词都需出现。搜索忽略大小写和全半角差异，`%` 与 `_` 作为普通字符匹配。`q` 最长 200 字符，空白按普通列表处理。
+
+`source=astrbot_memory_companion` 可与搜索或原有来源浏览一起使用。来源筛选仅返回相应的导入条目。非零 `offset` 用于有搜索词或来源的记忆库请求。搜索分页使用全体命中记录的共同顺序 `created_at DESC, memory_id DESC`。
+
+搜索与按来源浏览响应仍包含 `memories`、`total`、`limit`、`has_more`、`include`、`extraction`，并回传 `offset`。指定来源时回传 `source`。`total` 是当前过滤下的完整命中数，`has_more` 依据该数和当前页位置。清理进行中返回空列表。改查询或筛选时，客户端从 `offset=0` 开始。
 
 ### 10.2 记忆写端点
 

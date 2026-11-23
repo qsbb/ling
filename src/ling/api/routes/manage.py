@@ -117,6 +117,7 @@ async def list_memory(
     view: Literal["library"] | None = None,
     source: Literal["astrbot_memory_companion"] | None = None,
     offset: Annotated[int, Query(ge=0, le=2_147_483_647)] = 0,
+    q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> dict:
     """列出当前自然人**现行**的长期记忆。
 
@@ -138,13 +139,20 @@ async def list_memory(
         )
     from ling.domains.memory.library import memory_record, read_library
 
-    if (source is not None and view != "library") or (offset and source is None):
+    query = (q or "").strip()
+    if "\x00" in query or (query and view != "library"):
         raise LingError(
-            ErrorCode.invalid_request, "按导入来源翻页需要同时选择记忆库视图与来源", status_code=422,
+            ErrorCode.invalid_request, "请在记忆库视图中输入有效的搜索内容",
+            status_code=422, field="q",
+        )
+    if (source is not None and view != "library") or (offset and source is None and not query):
+        raise LingError(
+            ErrorCode.invalid_request, "请在记忆库视图中按搜索内容或导入来源翻页", status_code=422,
         )
     if view == "library":
         return await read_library(
-            session, auth.user.subject_id, limit=limit, include=include, source=source, offset=offset,
+            session, auth.user.subject_id, limit=limit, include=include, source=source,
+            offset=offset, query=query,
         )
 
     effective = include or "active"
