@@ -86,7 +86,7 @@ class AuthorizeDesktopActivity(CreateDesktopTask):
 
 
 class DesktopActivityGrant(AuthorizeDesktopActivity):
-    decision: Literal["pending", "rest", "queued", "expired", "revoked"] = "pending"
+    decision: Literal["pending", "deciding", "rest", "queued", "expired", "revoked", "unavailable"] = "pending"
     task_id: UUID4 | None = None
 
 

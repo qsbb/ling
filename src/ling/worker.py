@@ -3891,23 +3891,17 @@ async def _advance_timeline_boundaries(
     """
     from ling.domains.activity.service import ActivityService
     from ling.domains.agenda.timeline import boundary_view
-    from ling.domains.desktop.service import advance_grant
     from ling.domains.presence.service import (
         SCENE_REFRESH_REASON_SEGMENT,
         SCENE_REFRESH_REASON_SLEEP,
         PresenceService,
     )
+    from ling.kernel.desktop_activity import offer_activity
 
     activity = ActivityService(session, actor_id=actor_id)
     presence = PresenceService(session, actor_id=actor_id)
     view = await boundary_view(session, actor_id=actor_id, now=now)
-    leaf = view.active_leaf
-    if view.sleep is not None or (leaf is not None and leaf.kind == "rest"):
-        await advance_grant(session, actor_id=actor_id, now=now, rest=True)
-    elif view.commitment is None and leaf is not None and leaf.kind in {"free", "hobby", "writing", "write"}:
-        await advance_grant(
-            session, actor_id=actor_id, now=now, writing_slot=(leaf.segment_id, leaf.end_at),
-        )
+    await offer_activity(session, actor_id=actor_id, view=view, now=now)
     actions: list[str] = []
 
     current = await activity.current()
@@ -4013,6 +4007,13 @@ async def _advance_timeline_boundaries(
             await presence.clear_scene(now=now)
             actions.append("scene:unknown")
     return actions
+
+
+@handler("desktop.activity.decide")
+async def handle_desktop_activity_decide(payload: dict) -> None:
+    from ling.kernel.desktop_activity import decide_activity
+
+    await decide_activity(get_settings(), _MEMORY_ROUTER, clock=utcnow, **payload)
 
 
 @handler("life.tick")
@@ -6540,6 +6541,7 @@ MEDIA_EXCLUDED_FROM_MAIN_WORKER: frozenset[str] = frozenset({"media.video.read"}
 OUTBOX_TOPICS: frozenset[str] = frozenset({
     PLUGIN_COMPLETED_TOPIC,
     "commitment.dispatch",
+    "desktop.activity.decide",
     "dream.generate",
     "livestream.decide",
     "livestream.speech",

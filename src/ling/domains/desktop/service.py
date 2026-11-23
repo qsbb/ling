@@ -59,7 +59,7 @@ def current_grant(device: DesktopDeviceRow, now: datetime) -> DesktopActivityGra
     if device.activity_grant is None:
         return None
     grant = DesktopActivityGrant.model_validate(device.activity_grant)
-    if grant.decision == "pending" and grant.end_at <= now:
+    if grant.decision in {"pending", "deciding"} and grant.end_at <= now:
         grant.decision = "expired"
         store_grant(device, grant)
     return grant
@@ -75,40 +75,29 @@ async def revoke_grant(
     if task is not None and task.source == "life" and task.id == str(grant.task_id):
         state: TaskState = "interrupted" if task.state == "running" else "cancelled"
         finish(task, state, "authorization_revoked", now)
-    if grant.decision in {"pending", "queued"}:
+    if grant.decision in {"pending", "deciding", "queued"}:
         grant.decision = "revoked"
         store_grant(device, grant)
     return grant
 
 
-async def advance_grant(
-    session: AsyncSession, *, actor_id: str, now: datetime,
-    rest: bool = False, writing_slot: tuple[str, datetime] | None = None,
+async def queue_granted_write(
+    session: AsyncSession, device: DesktopDeviceRow, grant: DesktopActivityGrant, *,
+    now: datetime, segment_id: str, segment_end: datetime,
 ) -> None:
-    device = await lock_device(session, actor_id)
-    if device is None or device.activity_grant is None or not device.token_hash:
-        return
-    grant = current_grant(device, now)
-    if grant is None or grant.decision != "pending" or now < grant.start_at or device.paused:
-        return
-    if rest:
-        grant.decision = "rest"
-        store_grant(device, grant)
-        return
-    if writing_slot is None:
-        return
     if await active_task(session, device, now) is not None or device.paused or not ready(device, now):
+        grant.decision = "unavailable"
+        store_grant(device, grant)
         return
 
     task_id = str(grant.request_id)
-    if await session.get(DesktopTaskRow, (actor_id, task_id)) is not None:
+    if await session.get(DesktopTaskRow, (device.actor_id, task_id)) is not None:
         grant.decision = "revoked"
         store_grant(device, grant)
         return
-    segment_id, segment_end = writing_slot
     until = min(grant.end_at, segment_end)
     session.add(DesktopTaskRow(
-        id=task_id, actor_id=actor_id, text=grant.text, state="queued", created_at=now,
+        id=task_id, actor_id=device.actor_id, text=grant.text, state="queued", created_at=now,
         expires_at=min(until, now + QUEUE_TTL), source="life", source_segment_id=segment_id,
         authorized_until=until,
     ))
