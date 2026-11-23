@@ -63,14 +63,16 @@ import {
   DEFAULT_INSTANCE_ID,
   instanceFormKey,
 } from './ConnectorInstances';
-import { LiveConnectors } from './LiveConnectors';
+import { LiveRoomsPanel, useLiveRooms } from './LiveRooms';
 import '../connectors.css';
 
 interface ConnectorsPageProps {
   onBack: () => void;
 }
 
-const PLATFORM_NAMES: Record<string, string> = { onebot: 'OneBot', qqbot: 'QQ 官方机器人', access: '出入许可' };
+const PLATFORM_NAMES: Record<string, string> = {
+  onebot: 'OneBot', qqbot: 'QQ 官方机器人', live: '直播间', access: '出入许可',
+};
 
 type LoadState =
   | { status: 'loading' }
@@ -875,16 +877,31 @@ interface ConnectorCardProps extends ConnectorFormProps {
   onInstanceView?: (instanceId: string, view: ConnectorView | null) => void;
 }
 
+/** 平台图标里的两个字母：后端 scope 只有 onebot / qqbot，直播间是本地一项。 */
+function platformBadge(id: string): string {
+  if (id === 'onebot') return 'Ob';
+  if (id === 'qqbot') return 'Q';
+  return 'L';
+}
+
 /** 页面级平台导航：只负责选择平台，不把导航误当成连接动作。 */
 function ConnectorNavigation({
   connectors,
   selected,
   hasAccess,
+  hasLive,
+  liveStatus,
   onSelect,
 }: {
   connectors: ConnectorView[];
   selected: string | undefined;
   hasAccess: boolean;
+  hasLive: boolean;
+  /**
+   * 直播间的状态点。`null` = 还没有任何直播间（灰点）；其余按"有没有可用的
+   * 房间"给同一个绿/黄语义，与 OneBot/QQ 那边用的是同一套点，不新造一套。
+   */
+  liveStatus: 'connected' | 'configured_disconnected' | null;
   onSelect: (scope: string) => void;
 }) {
   return (
@@ -902,12 +919,34 @@ function ConnectorNavigation({
           data-testid={`connector-platform-${connector.id}`}
           onClick={() => onSelect(connector.id)}
         >
-          <span className="connectors-platform__icon" aria-hidden="true">{connector.id === 'onebot' ? 'Ob' : 'Q'}</span>
+          <span className="connectors-platform__icon" aria-hidden="true">{platformBadge(connector.id)}</span>
           <span>{PLATFORM_NAMES[connector.id] ?? connector.label}</span>
           <span className={`connectors-platform__dot connectors-platform__dot--${connector.status}`} aria-hidden="true" />
           <ChevronRightIcon />
         </button>
       ))}
+      {/*
+        直播间与 OneBot / QQ 官方机器人同级：它同样是"接一个外部平台"，
+        只是那一边的协议是直播舞台（OBS 推流 + 房间事件），而不是消息收发。
+        放在这里而不是页面顶部单独一块，是因为人找"我接了什么"时看的是同一列。
+      */}
+      {hasLive ? (
+        <button
+          type="button"
+          className={`connectors-platform${selected === 'live' ? ' connectors-platform--selected' : ''}`}
+          aria-pressed={selected === 'live'}
+          data-testid="connector-platform-live"
+          onClick={() => onSelect('live')}
+        >
+          <span className="connectors-platform__icon" aria-hidden="true">{platformBadge('live')}</span>
+          <span>{PLATFORM_NAMES.live}</span>
+          <span
+            className={`connectors-platform__dot${liveStatus ? ` connectors-platform__dot--${liveStatus}` : ''}`}
+            aria-hidden="true"
+          />
+          <ChevronRightIcon />
+        </button>
+      ) : null}
       {hasAccess ? (
         <button
           type="button"
@@ -1486,10 +1525,23 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
 
   const body = state.status === 'ready' ? state.body : null;
   const canEdit = body?.can_edit === true;
+  /*
+   * 直播间：**不是**后端 `connectors[]` 里的 scope，所以不能混进 `platforms`
+   * 那份数组（那份的每一项都对应 `?instance_id=` 与字段视图）。它作为左栏的
+   * 同级一项单独渲染，列表自己读。
+   */
+  const rooms = useLiveRooms();
   const platforms = [...(body?.connectors.map(({ id, label }) => ({ id, label })) ?? []),
+    ...(canEdit ? [{ id: 'live', label: '直播间' }] : []),
     ...(body?.access ? [{ id: 'access', label: '出入许可' }] : [])];
   const activePlatform = platforms.some(({ id }) => id === platform) ? platform
     : body?.connectors.find(({ configured }) => configured)?.id ?? platforms[0]?.id;
+  /**
+   * 左栏那个点：有已启用的房间 = 绿；只有停用的 = 黄；一个都没有 = 灰。
+   * 不给"已连接"——舞台连接是瞬时的，把它画成常绿点会让人以为随时在推流。
+   */
+  const liveDot = !rooms.connectors?.length ? null
+    : rooms.connectors.some((item) => item.enabled) ? 'connected' : 'configured_disconnected';
 
   /** 某个 scope 当前选中的实例 id（没有选中时按默认实例）。 */
   const instanceOf = useCallback(
@@ -1879,7 +1931,11 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
         </div>
       </div>
 
-      {canEdit ? <LiveConnectors /> : null}
+      {/*
+        这里原来是一个「自定义接入器」折叠块，管的是直播间的连接参数。
+        它现在整体搬到了左栏「平台」列表里的「直播间」——同一件事不该有两个
+        入口，而"我接了什么平台"这个问题的答案本来就该在那一列里。
+      */}
       {state.status === 'ready' && !canEdit ? (
         <p className="panel__note" data-testid="connectors-readonly">
           当前账号不是所有者：可以看，但不能改。修改接入器需要所有者账号。
@@ -1950,6 +2006,8 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
             connectors={state.body.connectors}
             selected={activePlatform ?? undefined}
             hasAccess={Boolean(state.body.access)}
+            hasLive={canEdit}
+            liveStatus={liveDot}
             onSelect={setPlatform}
           />
           <div className="connectors-workspace__main">
@@ -2009,6 +2067,21 @@ export function ConnectorsPage({ onBack }: ConnectorsPageProps) {
                 </div>
               );
             })}
+
+            {canEdit ? (
+              <div className="connector-workspace" hidden={activePlatform !== 'live'}>
+                <section className="connector-card" aria-labelledby="connector-live-title">
+                  <div className="connector-card__head">
+                    <h2 className="connector-card__title" id="connector-live-title">直播间</h2>
+                  </div>
+                  <p className="connector-card__next">
+                    直播电脑上的 OBS 用「舞台令牌」连到这里；房间事件从这里进来。
+                  </p>
+                  {rooms.error ? <p className="live-room__error" role="alert">{rooms.error}</p> : null}
+                  <LiveRoomsPanel connectors={rooms.connectors} onReload={rooms.reload} />
+                </section>
+              </div>
+            ) : null}
 
             {state.body.access ? (
               <div className="connector-workspace" hidden={activePlatform !== 'access'}>
