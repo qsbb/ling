@@ -1033,6 +1033,12 @@ class OneBotV11Connector(ChannelConnector):
         try:
             response = await client.post(url, json=params, headers=headers)
         except httpx.HTTPError as exc:
+            if action in {"send_private_msg", "send_group_msg"} and isinstance(
+                exc, (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError, httpx.WriteTimeout, httpx.RemoteProtocolError),
+            ):
+                raise ChannelError(
+                    ChannelErrorKind.uncertain, f"OneBot 未返回发送回执: {type(exc).__name__}",
+                ) from exc
             raise ChannelError(
                 ChannelErrorKind.unreachable,
                 f"OneBot 不可达: {type(exc).__name__}",

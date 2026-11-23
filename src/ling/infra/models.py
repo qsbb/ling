@@ -249,6 +249,7 @@ class Window(Base, TimestampMixin):
     display_name_override: Mapped[str | None] = mapped_column(String(60), nullable=True)
     manual_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     group_reply_max_parts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    onebot_defer_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa.false())
     channel: Mapped[str] = mapped_column(String(32), default="web")
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
     connector_window_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -3473,6 +3474,7 @@ class DeferredReply(Base):
     # --- 因果 ---
     source_turn_id: Mapped[str] = mapped_column(String(64))
     source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_target: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     #: 被延后那条用户消息的 `messages.sequence`。抢占判据是
     #: "这个窗口里出现了比它更大的 user 消息序号"，见 `service.input_preempted`。
     #:

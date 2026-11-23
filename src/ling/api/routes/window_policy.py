@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -880,6 +880,43 @@ async def set_group_reply_limit(
         update(Window).where(Window.id == window.id)
         .values(group_reply_max_parts=body.max_parts, updated_at=Window.updated_at)
     )
+    await session.commit()
+    return body
+
+
+class OneBotDeferredSetting(BaseModel):
+    enabled: StrictBool
+
+
+async def _onebot_private_window(
+    session_id: str, request: Request, auth: CurrentAuth, session: DbSession,
+) -> Window:
+    window = await policy_window(
+        session, window_id=session_id, subject_id=auth.user.subject_id,
+        actor_id=request.app.state.settings.actor_id,
+    )
+    require_active_window(window)
+    if window.channel != "onebot" or window.visibility == "group_scope":
+        raise LingError(ErrorCode.invalid_request, "请选择 OneBot 私聊会话", status_code=422)
+    return window
+
+
+@router.get("/sessions/{session_id}/onebot-deferred")
+async def get_onebot_deferred(
+    session_id: str, request: Request, auth: OwnerAuth, session: DbSession,
+) -> OneBotDeferredSetting:
+    window = await _onebot_private_window(session_id, request, auth, session)
+    return OneBotDeferredSetting(enabled=window.onebot_defer_enabled)
+
+
+@router.put("/sessions/{session_id}/onebot-deferred")
+async def set_onebot_deferred(
+    session_id: str, body: OneBotDeferredSetting, request: Request, auth: OwnerWrite, session: DbSession,
+) -> OneBotDeferredSetting:
+    window = await _onebot_private_window(session_id, request, auth, session)
+    if body.enabled and window.trusted_instance_key is None:
+        raise LingError(ErrorCode.conflict, "请先确认会话的 OneBot 接入实例", status_code=409)
+    window.onebot_defer_enabled = body.enabled
     await session.commit()
     return body
 

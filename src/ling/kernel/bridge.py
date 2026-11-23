@@ -277,6 +277,7 @@ class TurnResult:
     partial_chars: int = 0
     # 她想引用但 id 对不上（被降级为普通消息）。留痕，别让它静默消失。
     quote_dropped: str | None = None
+    deferred: bool = False
 
     @property
     def suppressed(self) -> bool:
@@ -936,6 +937,12 @@ class InboundBridge:
             reply_reference=reply_reference,
         )
         reply_text = turn_result.text
+        if turn_result.deferred and not turn_result.timed_out:
+            return BridgeResult(
+                accepted=True, reason="她选择稍后回复", subject_id=subject_id,
+                window_id=window.id, turn_id=turn.id, decision="deferred_attention",
+                media_evidence_ids=media_ids, media_note=media_note, handled_as="deferred",
+            )
         if turn_result.timed_out:
             # **生成超时**：不许当作"没有可交付文本"草草收场。
             #
@@ -1904,6 +1911,7 @@ class InboundBridge:
         raw_chars = 0
         quote_dropped: str | None = None
         timed_out = False
+        deferred = False
         while True:
             try:
                 event = await asyncio.wait_for(
@@ -1925,6 +1933,9 @@ class InboundBridge:
                 break
             name = getattr(event, "event", "")
             data = getattr(event, "data", {}) or {}
+            if name == "turn.deferred":
+                deferred = True
+                continue
             if name == "delta":
                 # 记下已流出的部分：超时收场时要用它判断"是不是真的什么都没说"。
                 partial_text += str(data.get("text") or "")
@@ -1981,6 +1992,7 @@ class InboundBridge:
             suppressed_reason=suppressed_reason,
             raw_chars=raw_chars,
             timed_out=timed_out,
+            deferred=deferred,
             # 只报字数、不报正文：日志/返回值里不需要把她的话再抄一份。
             partial_chars=len(partial_text),
             quote_dropped=quote_dropped,

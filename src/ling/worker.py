@@ -1400,6 +1400,79 @@ async def _deferred_window_deliverable(window_id: str, subject_id: str | None) -
     return ""
 
 
+async def _onebot_deferred_reason(reply_id: str, claim_generation: int) -> str:
+    from ling.domains.deferred import service as deferred
+    from ling.infra.models import DeferredReply, Message
+    from ling.kernel.onebot_deferred import current_onebot_target
+
+    settings = get_settings()
+    async with session_scope() as session:
+        row = await session.get(DeferredReply, reply_id)
+        now = utcnow()
+        if (
+            row is None or row.actor_id != settings.actor_id or row.state != "claimed"
+            or row.lease_owner != WORKER_ID or row.claim_generation != claim_generation
+            or row.lease_until is None or row.lease_until <= now or row.hard_deadline_at <= now
+        ):
+            return "claim_expired"
+        source = await session.get(Message, row.source_message_id) if row.source_message_id else None
+        if (
+            source is None or source.retracted_at is not None or source.role != "user"
+            or source.window_id != row.window_id or source.turn_id != row.source_turn_id
+            or source.sender_subject_id != row.subject_id or source.sequence != row.input_sequence
+        ):
+            return "source_unavailable"
+        target = await current_onebot_target(
+            session, window_id=row.window_id, subject_id=str(row.subject_id or ""), settings=settings,
+        )
+        if target is None or target != row.delivery_target:
+            return "target_changed"
+        if await deferred.input_preempted(session, window_id=row.window_id, input_sequence=row.input_sequence):
+            return deferred.PREEMPT_REASON_NEW_INPUT
+    return ""
+
+
+async def _discard_onebot_deferred_text(turn_id: str, *, cancelled: bool) -> None:
+    from sqlalchemy import update
+
+    from ling.contracts.v1 import TurnState
+    from ling.domains.conversation.service import ConversationService
+    from ling.infra.models import Message
+
+    state = TurnState.stopped if cancelled else TurnState.failed
+    async with session_scope() as session:
+        await ConversationService(session).set_turn_state(turn_id, state)
+        await session.execute(
+            update(Message).where(Message.turn_id == turn_id, Message.role == "actor")
+            .values(state=state.value, handled_as="failed")
+        )
+
+
+async def _send_onebot_deferred(
+    *, reply_id: str, claim_generation: int, turn_id: str, subject_id: str, text: str,
+    target: dict[str, str], connector: ChannelConnector,
+) -> tuple[str, str, str]:
+    from ling.capabilities.delivery import DeliveryService
+    from ling.infra.security import new_id
+    from ling.ports.channel import OutboundMessage
+
+    blocked = await _onebot_deferred_reason(reply_id, claim_generation)
+    if blocked:
+        return "cancelled", blocked, ""
+    async with session_scope() as session:
+        result = await DeliveryService(session).deliver(
+            connector=connector, actor_id=get_settings().actor_id, subject_id=subject_id,
+            message=OutboundMessage(
+                operation_id=new_id("op"), window_ref=target["window_ref"], text=text, is_group=False,
+            ),
+            plan_id=f"plan_{turn_id}", part_ordinal=1,
+            payload_extra={"source": "onebot.deferred_reply", "deferred_reply_id": reply_id},
+        )
+    if not result.delivered:
+        return "failed", f"delivery_{result.state}", ""
+    return "delivered", "", turn_id
+
+
 async def _run_deferred_turn(
     *,
     reply_id: str,
@@ -1407,6 +1480,7 @@ async def _run_deferred_turn(
     subject_id: str,
     input_sequence: int,
     claim_generation: int,
+    delivery_target: dict[str, str] | None = None,
 ) -> tuple[str, str, str]:
     """到点后跑一个**新的逻辑轮次**并投递。返回 ``(结果, 原因, 消息 id)``。
 
@@ -1462,7 +1536,19 @@ async def _run_deferred_turn(
         return "failed", "model_router_unavailable", ""
 
     # --- 栅栏 1：受众与窗口 ---
-    blocked = await _deferred_window_deliverable(window_id, subject_id)
+    connector = None
+    if delivery_target is not None:
+        blocked = await _onebot_deferred_reason(reply_id, claim_generation)
+        if not blocked:
+            connector = await _group_reply_connector(
+                "onebot", delivery_target["window_ref"],
+                instance_key=("onebot", delivery_target["instance_id"]),
+            )
+            namespace = delivery_target["window_ref"].rpartition(":private:")[0]
+            if connector is None or connector.instance_id != namespace:
+                blocked = "channel_unavailable"
+    else:
+        blocked = await _deferred_window_deliverable(window_id, subject_id)
     if blocked:
         return "cancelled", blocked, ""
 
@@ -1497,12 +1583,15 @@ async def _run_deferred_turn(
     # 模型调用**之前**单独提交 `model_started_at`：崩溃后靠它区分"还能重排"与
     # "可能已经收过费"。与 `media/jobs.py::mark_model_started` 同一语义。
     async with session_scope() as session:
-        await deferred.mark_model_started(
+        started = await deferred.mark_model_started(
             session,
             reply_id=reply_id,
             lease_owner=WORKER_ID,
             claim_generation=claim_generation,
         )
+    if delivery_target is not None and not started:
+        await _discard_onebot_deferred_text(turn_id, cancelled=True)
+        return "cancelled", "claim_expired", ""
 
     async def _still_allowed() -> bool:
         """外发闸：**落库之前**再问一次"这条回复还算数吗"。
@@ -1512,14 +1601,17 @@ async def _run_deferred_turn(
         又说话了。栅栏 3 在轮次结束后才判，那时消息早已落库、`turn.completed`
         已经带着它发给前端了，拦不住任何东西（阶段 3 的变异测试抓到了这一点）。
         """
+        if delivery_target is not None:
+            return not await _onebot_deferred_reason(reply_id, claim_generation)
         return not await _deferred_input_preempted(window_id, input_sequence)
 
+    cancels = CancelRegistry()
     coordinator = TurnCoordinator(
         settings=settings,
         router=router,  # type: ignore[arg-type]
         actor_id=settings.actor_id,
         persona_id=snapshot.persona,
-        cancels=CancelRegistry(),
+        cancels=cancels,
         secret_reader=_SECRET_CACHE.get,
         speak_lease=SpeakLeaseStore(),
         deliver_gate=_still_allowed,
@@ -1533,19 +1625,20 @@ async def _run_deferred_turn(
         user_text="",
         config=effective,
         persona_id=snapshot.persona,
-        # 延后回复落在**原窗口**所在的渠道上，能力也取自那里。
-        # 这个渠道一定是 web/空（`_deferred_window_deliverable` 已把外部渠道
-        # 拒成 `channel_unsupported`），所以通常是 None；仍按 window 查，
-        # 是为了将来放开外部渠道延后时不用再改这里。
-        channel_capabilities=await _window_channel_capabilities(window_id),
+        # OneBot 晚回走文字投递。Web 保留自己的语音能力。
+        channel_capabilities=None if delivery_target is not None else await _window_channel_capabilities(window_id),
     )
 
     reply_text = ""
     state = "unknown"
+    voice = False
     while True:
         try:
             event = await asyncio.wait_for(queue.get(), timeout=float(HARD_DEADLINE_SECONDS))
         except TimeoutError:
+            if delivery_target is not None:
+                cancels.stop(turn_id)
+                await _discard_onebot_deferred_text(turn_id, cancelled=False)
             return "failed", "generation_timeout", ""
         if event is None:
             break
@@ -1563,6 +1656,9 @@ async def _run_deferred_turn(
                 bool(reply_text.strip()),
             )
             if message.get("output_modality") == "voice":
+                if delivery_target is not None:
+                    voice = True
+                    continue
                 if message.get("speech_state") == "ready":
                     reply_text = "[语音]"
                 else:
@@ -1575,6 +1671,21 @@ async def _run_deferred_turn(
     #
     # 语义上也该如此：被抢占的那一轮根本没有"失败"，它是**作废**了。作废
     # 不需要道歉，也不需要兜底。
+    if delivery_target is not None and connector is not None:
+        blocked = await _onebot_deferred_reason(reply_id, claim_generation)
+        if blocked:
+            result = ("cancelled", blocked, "")
+        elif voice or state != "completed" or not reply_text.strip():
+            result = ("failed", "voice_not_delivered" if voice else f"no_text:{state}", "")
+        else:
+            result = await _send_onebot_deferred(
+                reply_id=reply_id, claim_generation=claim_generation, turn_id=turn_id,
+                subject_id=subject_id, text=reply_text, target=delivery_target, connector=connector,
+            )
+        if result[0] != "delivered":
+            await _discard_onebot_deferred_text(turn_id, cancelled=result[0] == "cancelled")
+        return result
+
     if await _deferred_input_preempted(window_id, input_sequence):
         return "cancelled", deferred.PREEMPT_REASON_NEW_INPUT, ""
 
@@ -1628,6 +1739,7 @@ async def handle_deferred_reply_sweep(payload: dict) -> None:  # noqa: ARG001
         subject_id=str(claimed.subject_id or ""),
         input_sequence=int(claimed.input_sequence),
         claim_generation=int(claimed.claim_generation),
+        delivery_target=claimed.delivery_target,
     )
     await _settle_deferred(
         claimed, outcome=outcome, reason=reason, delivered_turn_id=delivered_turn_id
@@ -1675,7 +1787,7 @@ async def _settle_deferred(  # noqa: ANN001
             )
         return
 
-    if reason == "voice_not_delivered":
+    if reason == "voice_not_delivered" or claimed.delivery_target is not None:
         async with session_scope() as session:
             await deferred.finish(
                 session,
