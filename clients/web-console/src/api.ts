@@ -1365,15 +1365,22 @@ export const api = {
    *
    * `include` 不传 = 只看现行记忆（未撤回且未归档）。
    *
-   * `source` 只在 `view=library` 下合法，且服务端要求带 `source` 时一并给
-   * `offset`（`offset` 单独出现是 422）。这里把两者绑在一起发：调用方只
-   * 说明「按哪个来源、从第几条开始」，拼合法请求是这一层的事。
+   * `q` 是服务端搜索：记忆正文与经历摘要都查，多个词按空白分隔且都要出现。
+   * `q` 只在 `view=library` 下合法，空白串按普通列表处理（这里不发，交给
+   * 服务端把「没搜索」和「搜了空」当同一件事）。
+   *
+   * `source` 与 `offset` 都只在 `view=library` 下合法。服务端对 `offset`
+   * 的规则是「单独出现且没有搜索词才 422」——有 `q` 或 `source` 任一即可。
+   * 所以这里按「这个请求会不会翻页」决定发不发：有搜索词或来源时才发
+   * `offset`（`0` 也照样发，让服务端回显页码口径）。
    */
   listMemories(
     options: {
       limit?: number;
       include?: MemoryInclude | null;
       source?: MemoryImportSourceFilter | null;
+      /** 服务端搜索词；空白串与不传等价。 */
+      q?: string | null;
       offset?: number;
       signal?: AbortSignal;
     } = {},
@@ -1381,10 +1388,10 @@ export const api = {
     const query = new URLSearchParams({ limit: String(options.limit ?? 50) });
     query.set('view', 'library');
     if (options.include) query.set('include', options.include);
-    if (options.source) {
-      query.set('source', options.source);
-      query.set('offset', String(options.offset ?? 0));
-    }
+    if (options.source) query.set('source', options.source);
+    const search = (options.q ?? '').trim();
+    if (search) query.set('q', search);
+    if (search || options.source) query.set('offset', String(options.offset ?? 0));
     return request<MemoryListResponse>(`/v1/memory?${query.toString()}`, {
       ...(options.signal ? { signal: options.signal } : {}),
     });

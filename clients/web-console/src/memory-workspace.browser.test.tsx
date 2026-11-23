@@ -107,7 +107,16 @@ interface MockOptions {
   mobile?: boolean;
   largeBatch?: boolean;
   fail?: typeof LIST | typeof CORE | typeof CONFIG;
+  /**
+   * 回到「服务端搜索之前」的行为：只按 `limit` 截断，**忽略 `q`/`offset`**。
+   * 用来证明浏览器用例确实依赖服务端搜索——旧行为下它们必须红。
+   */
+  ignoreServerSearch?: boolean;
   waitForList?: (request: Request, include: string | null) => Promise<void> | undefined;
+  /** 卡住某个搜索词的**第一次**响应，用来构造「旧查询的慢响应晚到」。 */
+  holdFirst?: string;
+  /** 由测试提供并释放的闸门；不传就用自己的内部闸门（永远不会放行）。 */
+  holdGate?: Promise<void>;
 }
 
 async function openWorkspace(options: MockOptions = {}) {
@@ -120,6 +129,14 @@ async function openWorkspace(options: MockOptions = {}) {
   page.setDefaultTimeout(WAIT);
   page.setDefaultNavigationTimeout(2 * WAIT);
   const reads: URL[] = [];
+  // `holdSearch` 用来把某个搜索词的那条响应卡在半空，构造「旧查询晚到」。
+  const held = gate();
+  let heldOnce = false;
+  /** 被 `holdFirst` 卡住的那条请求：测试要等它真的结束，而不是等"有请求结束"。 */
+  const heldRequests: Request[] = [];
+  let heldSettled = false;
+  let releaseSettled!: () => void;
+  const settledDone = new Promise<void>(resolve => { releaseSettled = resolve; });
   const writes: { method: string; path: string; body: unknown }[] = [];
   let rows = [FAVORITE, WALK, RETRACTED, ARCHIVED];
   if (options.largeBatch) {
@@ -148,19 +165,50 @@ async function openWorkspace(options: MockOptions = {}) {
         case LIST: {
           const limit = Number(url.searchParams.get('limit') ?? 50);
           const include = url.searchParams.get('include');
+          const q = url.searchParams.get('q');
+          const offset = Number(url.searchParams.get('offset') ?? 0);
           if (!Number.isInteger(limit) || limit < 1 || limit > 200 ||
-              (include !== null && !['retracted', 'archived', 'all'].includes(include))) {
+              (include !== null && !['retracted', 'archived', 'all'].includes(include)) ||
+              (q !== null && q.length > 200) || !Number.isInteger(offset) || offset < 0) {
             return route.fulfill(error('invalid_request', '无效的列表参数', 422));
           }
           const filtered = rows.filter(row =>
             (!row.retracted || include === 'retracted' || include === 'all') &&
             (!row.archived_at || include === 'archived' || include === 'all'));
-          // 快照在请求到达时取，控制的是它何时返回，不是修改当前服务器状态。
-          const payload = {
-            memories: filtered.slice(0, limit), limit, include, total: filtered.length,
-            has_more: filtered.length > limit, note: '',
+          /*
+            契约（docs/API-WEB-V1.md「记忆库搜索与导入来源分页」）：`q` 按空白分词，
+            每个词都要出现，忽略大小写与全半角；`total` 是全量命中数；
+            `has_more = total > offset + limit`；有 `q` 时回显 `offset`。
+          */
+          const terms = options.ignoreServerSearch || !q
+            ? []
+            : q.normalize('NFKC').toLowerCase().split(/\s+/u).filter(Boolean);
+          const matches = terms.length === 0 ? filtered : filtered.filter(item =>
+            terms.every(term => item.text.normalize('NFKC').toLowerCase().includes(term)));
+          const total = matches.length;
+          const page_ = options.ignoreServerSearch ? matches.slice(0, limit) : matches.slice(offset, offset + limit);
+          const payload: Record<string, unknown> = {
+            memories: page_, limit, include, total,
+            has_more: total > offset + limit, note: '',
           };
+          if (terms.length > 0 || options.ignoreServerSearch) payload.offset = options.ignoreServerSearch ? 0 : offset;
+          if (terms.length > 0) payload.q = q;
+          // 快照在请求到达时取，控制的是它何时返回，不是修改当前服务器状态。
           await options.waitForList?.(request, include);
+          if (q && q === options.holdFirst && !heldOnce) {
+            heldOnce = true;
+            heldRequests.push(request);
+            await (options.holdGate ?? held.promise);
+            // 落到这里 = serve 端已经放行；浏览器可能还在解析，再让测试等两帧。
+            heldSettled = true;
+            releaseSettled();
+            try {
+              return await route.fulfill(json(payload));
+            } catch (e) {
+              if (!request.failure() && !page.isClosed()) throw e;
+              return;
+            }
+          }
           try {
             return await route.fulfill(json(payload));
           } catch (e) {
@@ -192,12 +240,12 @@ async function openWorkspace(options: MockOptions = {}) {
     return route.fulfill(error('not_found', `${method} ${path}`, 404));
   });
   await page.goto(`${baseUrl}${TABS[options.start ?? '记忆库']}`, { waitUntil: 'domcontentloaded' });
-  return { page, reads, writes };
+  return { page, reads, writes, heldRequests, heldDone: () => heldSettled, settledDone };
 }
 
 const nav = (page: Page) => page.getByRole('navigation', { name: '记忆分区', exact: true });
 const tabLink = (page: Page, tab: Tab) => nav(page).getByRole('link', { name: tab, exact: true });
-const search = (page: Page) => page.getByRole('searchbox', { name: '搜索已加载的记忆', exact: true });
+const search = (page: Page) => page.getByRole('searchbox', { name: '搜索记忆库', exact: true });
 const results = (page: Page) => page.getByTestId('mem-results');
 const row = (page: Page, item: { text: string }) => results(page).getByRole('button', { name: item.text });
 const detail = (page: Page) => page.getByTestId('mem-inspector');
@@ -271,7 +319,7 @@ async function notWiderThanMobileViewport(page: Page) {
 }
 
 describe('记忆工作区：独立浏览器验收', () => {
-  it('只检索已加载的批次，告知范围且不把漏在批次之外的记录说成全库无结果', async () => {
+  it('搜索走服务端：能找到第一页之外的旧条目，计数与翻页如实反映命中量', async () => {
     const { page, reads } = await openWorkspace({ largeBatch: true });
     await visible(row(page, FAVORITE));
     await visible(row(page, WALK));
@@ -280,26 +328,161 @@ describe('记忆工作区：独立浏览器验收', () => {
     const limit = Number(readsAt(reads, LIST).at(-1)?.searchParams.get('limit') ?? 50);
     const count = page.getByText(new RegExp(`已加载\\s*${limit}\\s*条`)).filter({ visible: true }).first();
     await visible(count);
-    await visible(scopeMessage(page));
+    await hidden(scopeMessage(page));
+    // `largeBatch` 把 OUTSIDE_BATCH 放到了第 203 条：第一页永远看不到它。
     await hidden(row(page, OUTSIDE_BATCH));
 
-    await search(page).fill('桂花');
-    await hidden(row(page, WALK));
-    await visible(row(page, FAVORITE));
-    await visible(count);
-
+    // ① 命中落在第一页之外：只靠本地过滤会找不到，所以这条红就说明没真的接服务端。
     await search(page).fill('纸风车');
+    await visible(row(page, OUTSIDE_BATCH));
+    await hidden(row(page, FAVORITE));
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('q'), { timeout: WAIT })
+      .toBe('纸风车');
+    await visible(page.getByText(/匹配\s*1\s*条/).filter({ visible: true }).first());
+
+    // ② 多词：空格分隔且每个词都要出现。
+    await search(page).fill('桂花 茶');
+    await visible(row(page, FAVORITE));
+    await hidden(row(page, WALK));
+    await hidden(row(page, OUTSIDE_BATCH));
+    await search(page).fill('桂花 风车');
     await hidden(row(page, FAVORITE));
     await hidden(row(page, OUTSIDE_BATCH));
-    await visible(scopeMessage(page));
-    await visible(page.getByText(/无匹配|未匹配|没(?:有)?找到|未找到|没有.{0,10}(?:匹配|符合)|未发现.{0,10}(?:匹配|相关)|匹配\s*0\s*条|0\s*条匹配/)
-      .filter({ visible: true }).first());
-    await hidden(page.getByText(/(?:全库|整个记忆库|所有记忆).{0,16}(?:无结果|未找到|无匹配|没有|不存在)|(?:未找到|没有|不存在).{0,16}(?:全库|整个记忆库|所有记忆)/)
+    await visible(page.getByText(/没有匹配|匹配\s*0\s*条/).filter({ visible: true }).first());
+    // 搜索"没有结果"不能被说成"整库没有记忆"。
+    await hidden(page.getByText(/(?:全库|整个记忆库|所有记忆).{0,16}(?:无结果|未找到|无匹配|没有|不存在)|(?:它|她)?(?:还)?没有(?:现行)?记忆/)
       .filter({ visible: true }).first());
 
+    // ③ 清空后回到普通列表：最后一次请求与首次进入时同一组参数（不再带 q/offset）。
     await search(page).fill('');
     await visible(row(page, WALK));
-    expect(readsAt(reads, LIST).map(url => url.search)).toEqual(initialReads);
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.search, { timeout: WAIT })
+      .toBe(initialReads.at(-1));
+  }, CASE_TIMEOUT);
+
+  it('命中数超过一页时能继续往后翻，翻页沿用同一搜索结果', async () => {
+    const { page, reads } = await openWorkspace({ largeBatch: true });
+    await visible(row(page, FAVORITE));
+    // 202 条「批次样本」+ 首屏四条之一，命中足够跨页。
+    await search(page).fill('批次样本');
+    await expect.poll(() => Number(readsAt(reads, LIST).at(-1)?.searchParams.get('q') === '批次样本'), { timeout: WAIT }).toBe(1);
+    const firstPage = readsAt(reads, LIST).at(-1)!;
+    expect(firstPage.searchParams.get('offset')).toBe('0');
+    await expect.poll(() => page.getByTestId('mem-results').getByRole('button').count(), { timeout: WAIT })
+      .toBe(Number(firstPage.searchParams.get('limit') ?? 50));
+
+    const more = page.getByTestId('mem-load-more');
+    await visible(more);
+    const total = Number(await page.getByTestId('mem-list-count').innerText().then(text => /匹配\s*(\d+)\s*条/.exec(text)?.[1] ?? NaN));
+    expect(total).toBeGreaterThan(Number(firstPage.searchParams.get('limit') ?? 50));
+    // 第一页就要如实说「还有 152 条」：这是 `total - 已取回`，两处口径必须一致。
+    await expect.poll(() => page.getByTestId('mem-limit-notice').innerText(), { timeout: WAIT })
+      .toContain(`还有 ${total - Number(firstPage.searchParams.get('limit') ?? 50)} 条未取回`);
+    await more.click();
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('offset'), { timeout: WAIT })
+      .toBe(firstPage.searchParams.get('limit') ?? '50');
+    // 翻页请求必须带上同一个搜索词，不能退回普通列表的第一页。
+    expect(readsAt(reads, LIST).at(-1)?.searchParams.get('q')).toBe('批次样本');
+    await expect.poll(() => page.getByTestId('mem-results').getByRole('button').count(), { timeout: WAIT })
+      .toBeGreaterThan(Number(firstPage.searchParams.get('limit') ?? 50));
+
+    /*
+      一页 50 条、命中 202 条，所以要一直翻到底。每一页的 `offset` 都必须等于
+      当时已取回的条数——这是"不许跳页也不许重复"的唯一判据。
+    */
+    for (let round = 0; round < 10; round++) {
+      const count = Number(await page.getByTestId('mem-results').getByRole('button').count());
+      if (count >= total) break;
+      const button = page.getByTestId('mem-load-more');
+      await visible(button);
+      await button.click();
+      await expect.poll(() => Number(readsAt(reads, LIST).at(-1)?.searchParams.get('offset')), { timeout: WAIT })
+        .toBe(count);
+      await expect.poll(() => page.getByTestId('mem-results').getByRole('button').count(), { timeout: WAIT })
+        .toBeGreaterThan(count);
+    }
+    // 取回条数追平命中数后，「还有多少条」必须消失，不许停在一个假的"还有 0 条"。
+    await expect.poll(() => page.getByTestId('mem-list-count').innerText(), { timeout: WAIT })
+      .toContain(`已取回 ${total} 条`);
+    await hidden(page.getByTestId('mem-limit-notice'));
+    // 翻完之后列表里也没有重复行。
+    const ids = await page.getByTestId('mem-results').getByRole('button').evaluateAll(
+      nodes => nodes.map(node => node.textContent ?? ''),
+    );
+    expect(new Set(ids).size).toBe(ids.length);
+  }, CASE_TIMEOUT);
+
+  /*
+    构造方式必须是「**先发的那条**卡住」：卡住后发的那条永远不构成竞态——
+    它返回时已经是最新请求，写回本来就不算覆盖。
+    这里是慢的「桂花茶」→ 快的「纸风车」，「纸风车」先落地，再放开「桂花茶」。
+  */
+  it('快速改查询时，先发那条的慢响应不能覆盖后发的结果', async () => {
+    const slow = gate();
+    const gatePromise = slow;
+    const { page, reads, settledDone } = await openWorkspace({
+      largeBatch: true, holdFirst: '桂花茶', holdGate: gatePromise.promise,
+    });
+    const settled = new Set<Request>();
+    page.on('requestfinished', request => settled.add(request));
+    page.on('requestfailed', request => settled.add(request));
+    await visible(row(page, FAVORITE));
+    await search(page).fill('桂花茶');
+    await expect.poll(() => readsAt(reads, LIST).some(url => url.searchParams.get('q') === '桂花茶'), { timeout: WAIT })
+      .toBe(true);
+    await search(page).fill('纸风车');
+    await expect.poll(() => readsAt(reads, LIST).some(url => url.searchParams.get('q') === '纸风车'), { timeout: WAIT })
+      .toBe(true);
+    // 新的那条已经落地：列表里是纸风车，不是桂花茶。
+    await visible(row(page, OUTSIDE_BATCH));
+    await hidden(row(page, FAVORITE));
+    // 现在放开那条迟到的「桂花茶」响应：它落地就必须被丢弃。
+    slow.release();
+    // 必须等**那条慢请求**真的走完（fulfill 之后浏览器收到），否则观察不到覆盖。
+    await Promise.race([settledDone, new Promise((_, reject) => setTimeout(() => reject(new Error('慢响应没有走完')), WAIT))]);
+    await paint(page);
+    await paint(page);
+    await expect.poll(() => results(page).innerText().then(text => text.includes(FAVORITE.text)), { timeout: WAIT })
+      .toBe(false);
+    await visible(row(page, OUTSIDE_BATCH));
+    await expect.poll(() => page.getByTestId('mem-search').inputValue(), { timeout: WAIT }).toBe('纸风车');
+    await expect.poll(() => page.getByTestId('mem-list-count').innerText(), { timeout: WAIT })
+      .toContain('匹配 1 条');
+  }, CASE_TIMEOUT);
+
+  it('原生清除按钮清空输入后，列表同步回到普通列表（不是只在 DOM 里清掉）', async () => {
+    const { page, reads } = await openWorkspace({ largeBatch: true });
+    await visible(row(page, FAVORITE));
+    await search(page).fill('纸风车');
+    await visible(row(page, OUTSIDE_BATCH));
+    expect(readsAt(reads, LIST).at(-1)?.searchParams.get('q')).toBe('纸风车');
+    /*
+      原生清除装饰（右侧 ×）是浏览器内部绘制的，Playwright 点不到；但 Chromium
+      点它会派发 `search` 事件。这里用同样的方式驱动，验的正是那条接线：
+      只把 DOM 值清空、不同步状态，下面的断言就会红。
+    */
+    await search(page).evaluate((el: HTMLInputElement) => {
+      el.value = '';
+      el.dispatchEvent(new Event('search'));
+    });
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('q'), { timeout: WAIT })
+      .toBeNull();
+    await visible(row(page, FAVORITE));
+    await hidden(row(page, OUTSIDE_BATCH));
+    await expect.poll(() => page.getByTestId('mem-search').inputValue(), { timeout: WAIT }).toBe('');
+  }, CASE_TIMEOUT);
+
+  /*
+    反证：把服务端的 `q`/`offset` 关掉（回到"只按 limit 截断"的旧行为），
+    "找到第一页之外的旧条目"必须失败。这就是「必须失败于接线未做」的那一条。
+  */
+  it('反证：服务端不认 q 时，第一页之外的那条搜不到', async () => {
+    const { page } = await openWorkspace({ largeBatch: true, ignoreServerSearch: true });
+    await visible(row(page, FAVORITE));
+    await search(page).fill('纸风车');
+    await paint(page);
+    await paint(page);
+    await hidden(row(page, OUTSIDE_BATCH));
   }, CASE_TIMEOUT);
 
   it('四个分区是可导航的独立目的地，核心只在进入该分区后读取', async () => {

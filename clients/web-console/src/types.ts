@@ -426,7 +426,11 @@ export interface MemoryListResponse {
   include: string | null;
   /** 只在按来源筛选时回显（`view=library&source=...`）。 */
   source?: string;
-  /** 只在按来源筛选时回显；翻页时加上 `limit`。 */
+  /**
+   * 只在有搜索词或来源筛选时回显；翻页时加上 `limit`。
+   * 注意服务端**不回显 `q`**（`read_library` 只写 `offset`），前端要靠自己
+   * 记下"这批数据对应哪个查询"，不能读这个字段判断。
+   */
   offset?: number;
   note?: string;
   extraction?: { state: string; at: string | null } | null;
