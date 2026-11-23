@@ -52,6 +52,7 @@
     "RecallReceipt": "RecallReceipt.schema.json",
     "RuntimeScope": "RuntimeScope.schema.json",
     "SessionRecord": "SessionRecord.schema.json",
+    "SleepReviewsOut": "SleepReviewsOut.schema.json",
     "SubjectAccountOut": "SubjectAccountOut.schema.json",
     "SubjectRow": "SubjectRow.schema.json",
     "SubjectsPage": "SubjectsPage.schema.json",

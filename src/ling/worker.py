@@ -5824,9 +5824,7 @@ async def handle_memory_consolidate(payload: dict) -> None:
 
     整理会**归档**记忆并让摘要行取代它们参与召回。用模型写摘要，等于让
     模型编的一句话变成她记得的事——而记忆是这个项目里最不能编的东西。
-    第一版只做确定性整理（同槽位、同受众边界、够老、够低价值的归档），
-    每一件都可解释。真需要"这一天浓缩成一句话"时，必须新增一个明确标注
-    "非事实"的存储，不能复用记忆行。
+    整理采用确定性规则。回顾保存可追溯的索引，由读取入口从仍有效的来源取摘录。
 
     ## 为什么"预计"而不是"真的睡着"
 
@@ -5843,12 +5841,17 @@ async def handle_memory_consolidate(payload: dict) -> None:
     if not subject_id or sleep_date is None:
         logger.warning("memory.consolidate 缺少必要字段，跳过: %s", payload)
         return
+    try:
+        review_bedtime = datetime.fromisoformat(str(payload.get("bed_at") or ""))
+    except ValueError:
+        review_bedtime = None
     async with session_scope() as session:
         outcome = await consolidate_night(
             session,
             actor_id=actor_id,
             subject_id=subject_id,
             sleep_date=sleep_date,
+            review_bedtime=review_bedtime,
         )
     logger.info(
         "睡眠期记忆整理 sleep_date=%s state=%s 合并=%d 归档=%d already=%s",

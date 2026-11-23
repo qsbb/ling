@@ -1,0 +1,143 @@
+{
+  "$defs": {
+    "SleepReviewItem": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_id": {
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "original": {
+          "items": {
+            "$ref": "#/$defs/SleepReviewSource"
+          },
+          "title": "Original",
+          "type": "array"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "turn_id": {
+          "title": "Turn Id",
+          "type": "string"
+        },
+        "window_id": {
+          "title": "Window Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory_id",
+        "text",
+        "window_id",
+        "turn_id",
+        "original"
+      ],
+      "title": "SleepReviewItem",
+      "type": "object"
+    },
+    "SleepReviewNight": {
+      "additionalProperties": false,
+      "properties": {
+        "consolidation_state": {
+          "enum": [
+            "ok",
+            "skipped",
+            "failed"
+          ],
+          "title": "Consolidation State",
+          "type": "string"
+        },
+        "groups_merged": {
+          "title": "Groups Merged",
+          "type": "integer"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/SleepReviewItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "review_status": {
+          "enum": [
+            "ready",
+            "empty",
+            "unavailable"
+          ],
+          "title": "Review Status",
+          "type": "string"
+        },
+        "rows_archived": {
+          "title": "Rows Archived",
+          "type": "integer"
+        },
+        "sleep_date": {
+          "format": "date",
+          "title": "Sleep Date",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sleep_date",
+        "consolidation_state",
+        "reason",
+        "groups_merged",
+        "rows_archived",
+        "review_status",
+        "items"
+      ],
+      "title": "SleepReviewNight",
+      "type": "object"
+    },
+    "SleepReviewSource": {
+      "additionalProperties": false,
+      "properties": {
+        "speaker": {
+          "title": "Speaker",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "speaker",
+        "text",
+        "truncated"
+      ],
+      "title": "SleepReviewSource",
+      "type": "object"
+    }
+  },
+  "$id": "https://ling.local/contracts/v1/SleepReviewsOut.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "nights": {
+      "items": {
+        "$ref": "#/$defs/SleepReviewNight"
+      },
+      "title": "Nights",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "v1",
+      "default": "v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "title": "SleepReviewsOut",
+  "type": "object",
+  "x-ling-schema-version": "v1"
+}

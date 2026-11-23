@@ -3406,6 +3406,7 @@ class MemoryConsolidationRow(Base):
     reason: Mapped[str] = mapped_column(String(200), default="", server_default="")
     groups_merged: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     rows_archived: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    review_memory_ids: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
