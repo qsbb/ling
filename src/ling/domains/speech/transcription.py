@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import TypedDict
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import new_id
 from ling.domains.consent.service import ConsentService
-from ling.domains.conversation.service import ConversationService
+from ling.domains.conversation.service import PLATFORM_MESSAGE_ID_SCOPE, ConversationService
 from ling.infra.asr_jobs import AsrJob
-from ling.infra.models import Message, Window
+from ling.infra.models import IdempotencyKey, Message, Window
 from ling.ports.config import EffectiveConfig
 from ling.settings.service import payload_from_effective
 
@@ -21,6 +22,34 @@ class TranscriptionError(Exception):
         super().__init__(message)
         self.code = code
         self.status = status
+
+
+class QuotedVoiceSource(TypedDict):
+    event_id: str
+    platform_id: str
+    recall_key: str
+    recall_scopes: list[str]
+
+
+async def quote_was_retracted(
+    session: AsyncSession, source: QuotedVoiceSource, *, window_id: str,
+) -> bool:
+    # A recall event also exists when the original audio had no text message.
+    if await session.scalar(select(IdempotencyKey.id).where(
+        IdempotencyKey.scope.in_(source["recall_scopes"]),
+        IdempotencyKey.key == source["recall_key"],
+    ).limit(1)) is not None:
+        return True
+    return await session.scalar(
+        select(Message.id)
+        .join(IdempotencyKey, IdempotencyKey.key == Message.id)
+        .where(
+            Message.window_id == window_id, Message.role == "user",
+            Message.retracted_at.is_not(None),
+            IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+            IdempotencyKey.result_ref == source["platform_id"],
+        ).limit(1)
+    ) is not None
 
 
 async def lock_scope(session: AsyncSession, key: str) -> None:
@@ -49,11 +78,10 @@ async def require_authorized(session: AsyncSession, job: AsrJob) -> Window:
         msg = await session.get(Message, job.source_message_id, populate_existing=True)
         if msg is None or msg.retracted_at is not None:
             raise TranscriptionError("cancelled", "原消息已删除或撤回")
-    if quoted_voice := job.payload.get("quoted_voice"):
-        from ling.domains.speech.relisten import quote_was_retracted
-
-        if await quote_was_retracted(session, quoted_voice, window_id=window.id):
-            raise TranscriptionError("cancelled", "引用的那条语音已被撤回")
+    if (quoted_voice := job.payload.get("quoted_voice")) and await quote_was_retracted(
+        session, quoted_voice, window_id=window.id,
+    ):
+        raise TranscriptionError("cancelled", "引用的那条语音已被撤回")
     if job.state == "cancelled":
         raise TranscriptionError("cancelled", "语音识别已取消")
     return window

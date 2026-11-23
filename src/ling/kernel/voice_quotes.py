@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TypedDict
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.consent.service import ConsentService
-from ling.domains.conversation.service import PLATFORM_MESSAGE_ID_SCOPE
 from ling.domains.media.service import (
     INBOUND_SCOPE,
     MediaEvidenceError,
     MediaEvidenceService,
 )
+from ling.domains.speech.transcription import QuotedVoiceSource, quote_was_retracted
 from ling.infra.asr_jobs import AsrJob
-from ling.infra.models import IdempotencyKey, MediaEvidenceRow, Message
+from ling.infra.models import MediaEvidenceRow
 
 _LISTEN_REQUEST = re.compile(
     r"(?:请|麻烦)?(?:帮我|能不能|可以)?"
@@ -26,13 +25,6 @@ _LISTEN_REQUEST = re.compile(
     r"|(?:转写|识别)(?:一下)?这[条段](?:语音)?)(?:吗|吧)?"
 )
 _ONEBOT_ID = re.compile(r"-?[0-9]{1,20}")
-
-
-class QuotedVoiceSource(TypedDict):
-    event_id: str
-    platform_id: str
-    recall_key: str
-    recall_scopes: list[str]
 
 
 @dataclass(frozen=True)
@@ -58,27 +50,6 @@ def make_quote_source(
         "recall_key": f"{namespace}:recall:{platform_id}",
         "recall_scopes": recall_scopes,
     }
-
-
-async def quote_was_retracted(
-    session: AsyncSession, source: QuotedVoiceSource, *, window_id: str,
-) -> bool:
-    # A recall event also exists when the original audio had no text message.
-    if await session.scalar(select(IdempotencyKey.id).where(
-        IdempotencyKey.scope.in_(source["recall_scopes"]),
-        IdempotencyKey.key == source["recall_key"],
-    ).limit(1)) is not None:
-        return True
-    return await session.scalar(
-        select(Message.id)
-        .join(IdempotencyKey, IdempotencyKey.key == Message.id)
-        .where(
-            Message.window_id == window_id, Message.role == "user",
-            Message.retracted_at.is_not(None),
-            IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
-            IdempotencyKey.result_ref == source["platform_id"],
-        ).limit(1)
-    ) is not None
 
 
 async def inspect_quoted_voice(
