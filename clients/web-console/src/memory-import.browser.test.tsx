@@ -7,6 +7,7 @@
  * 全部 /v1 请求由 route 拦截，未知路由一律 404 —— 任何未声明的调用都不会
  * 悄悄落到真实后端。
  */
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -107,7 +108,9 @@ async function open(options: MockOptions = {}) {
   const page = await context.newPage();
   page.setDefaultTimeout(WAIT);
   const reads: URL[] = [];
-  const imports: { path: string; contentType: string | null; token: string | null; bytes: number }[] = [];
+  const imports: {
+    path: string; contentType: string | null; token: string | null; bytes: number; digest: string;
+  }[] = [];
 
   await context.route('**/v1/**', async (route) => {
     const request = route.request();
@@ -120,6 +123,11 @@ async function open(options: MockOptions = {}) {
         contentType: request.headers()['content-type'] ?? null,
         token: request.headers()['x-ling-import-token'] ?? null,
         bytes: body?.length ?? 0,
+        /*
+         * 摘要而非"字节数相同"：两次请求同样大小、内容不同也算不同文件。
+         * 有了它，"重试发的是同一份 File"才是一条真断言。
+         */
+        digest: body ? createHash('sha256').update(body).digest('hex') : '',
       });
       if (path.endsWith('/preview')) {
         if (options.previewError) {
@@ -172,9 +180,57 @@ async function open(options: MockOptions = {}) {
   return { page, reads, imports };
 }
 
-const FILE = { name: 'old-memories.jsonl', mimeType: 'application/x-ndjson', buffer: Buffer.from('{"format":"ling-astrbot-memory-jsonl"}\n') };
+/** 上传给 Playwright 的文件；buffer 用 `Buffer<ArrayBuffer>`，与 setInputFiles 的声明一致。 */
+interface UploadFile {
+  name: string;
+  mimeType: string;
+  buffer: Buffer<ArrayBuffer>;
+}
 
-async function previewFile(page: Page, file = FILE) {
+const FILE: UploadFile = {
+  name: 'old-memories.jsonl',
+  mimeType: 'application/x-ndjson',
+  buffer: Buffer.from('{"format":"ling-astrbot-memory-jsonl"}\n'),
+};
+
+/*
+ * 合成大档案：**大于 32 MiB 且远多于 5000 条**。
+ *
+ * 这两个数字不是随便取的：32 MiB 是应用 `max_body_bytes` 的默认值（原来 nginx
+ * 的 `client_max_body_size 32m`），5000 是旧的记录总数上限。后端解除后，前端
+ * 不该再用它们拒绝文件——所以这份档案必须在界面上走通，而不是只当作被拦的样本。
+ *
+ * 生成方式：先铺满 > 5000 条合法记录，再用填充行把它撑过 32 MiB（服务端按
+ * `total = accepted + duplicates + skipped` 计，填充行落到 `invalid_record`）。
+ */
+const RECORD_COUNT = 5_100;
+const TARGET_BYTES = 32 * 1024 * 1024 + 256 * 1024;
+const SIZE_TEXT = `${(TARGET_BYTES / (1024 * 1024)).toFixed(1)} MB`;
+
+function buildLargeArchive(): Buffer<ArrayBuffer> {
+  const header = `${JSON.stringify({ format: 'ling-astrbot-memory-jsonl', version: 1 })}\n`;
+  const records: string[] = [];
+  for (let index = 0; index < RECORD_COUNT; index += 1) {
+    records.push(`${JSON.stringify({
+      record_id: `mm_${index}`, memory_type: 'manual_memory', platform: 'aiocqhttp',
+      owner_qq: '100200300', bot_qq: '200300400', session_id: 'aiocqhttp:FriendMessage:100200300',
+      text: `合成记忆 ${index}`, created_at: STAMP, valid_from: null, valid_to: null,
+    })}\n`);
+  }
+  let bytes = Buffer.byteLength(header) + records.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+  // 填充行是合法 JSON 但不满足记录 schema：服务端计入 invalid_record，不会伪装成可导入。
+  const filler = '{}\n';
+  for (; bytes <= TARGET_BYTES; bytes += filler.length) records.push(filler);
+  return Buffer.from(header + records.join(''), 'utf8') as Buffer<ArrayBuffer>;
+}
+
+const LARGE_FILE: UploadFile = {
+  name: 'ling-memories-large.jsonl',
+  mimeType: 'application/x-ndjson',
+  buffer: buildLargeArchive(),
+};
+
+async function previewFile(page: Page, file: UploadFile = FILE) {
   await page.getByTestId('mem-import-entry').click();
   await page.getByTestId('import-file-input').setInputFiles(file);
   await page.getByTestId('import-panel').waitFor({ state: 'visible' });
@@ -223,18 +279,55 @@ describe('导入旧记忆', () => {
     expect(imports).toHaveLength(1);
   }, CASE_TIMEOUT);
 
-  it('全局上传上限的 413 提示分批转换', async () => {
-    const { page } = await open({
+  it('413 指向反代上传配置，并保留已选文件以便重试', async () => {
+    const { page, imports } = await open({
       previewError: {
         code: 'invalid_request', status: 413,
-        detail: 'Content-Length=33554433 超过上限 33554432 字节',
+        detail: 'Content-Length=135668433 超过上限 33554432 字节',
         message: '请求体过大',
       },
     });
-    await previewFile(page);
-    expect(await page.getByTestId('import-error').innerText()).toContain('超出服务端上传上限');
-    expect(await page.getByTestId('import-error').innerText()).toContain('--limit');
-    expect(await page.getByRole('button', { name: '换个文件' }).isVisible()).toBe(true);
+    await previewFile(page, LARGE_FILE);
+    const error = await page.getByTestId('import-error').innerText();
+    expect(error).toContain('上传上限');
+    expect(error).toContain('client_max_body_size');
+    // 不再教人用 --limit 强制拆分：后端已解除总量限制，问题在入口反代。
+    expect(error).not.toContain('--limit');
+    expect(error).not.toContain('8 MiB');
+    expect(error).not.toContain('5000');
+    // 文件保留：名字与真实大小仍在，且能一步重试
+    expect(await page.getByTestId('import-retained-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-retained-meta').innerText()).toContain(SIZE_TEXT);
+    const retry = page.getByRole('button', { name: '再试一次' });
+    expect(await retry.isEnabled()).toBe(true);
+
+    /*
+     * 等的是**浏览器真正发出的第二个请求**，不是"过一会儿再看数组长度"。
+     *
+     * 原来的写法用 `expect.poll(() => imports.length)`：默认只等 1 秒，而全量
+     * 并发时第二次要重发 33 MiB，一秒内到不了服务端，于是"单跑通过、组合失败"。
+     * 这类失败说明的是测量窗口，不是重试没发出去；所以换成事件等待，
+     * 并且**保留"第二次确实发了同一份文件"这条断言**——它是这条用例的重点。
+     */
+    const secondRequest = page.waitForRequest(
+      (request) => request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/preview'),
+      { timeout: WAIT },
+    );
+    await retry.click();
+    const sent = await secondRequest;
+
+    // 第二次请求体与已选文件逐字节相同（摘要比对，不是"大小相同"）
+    const body = sent.postDataBuffer();
+    expect(body?.length).toBe(LARGE_FILE.buffer.length);
+    expect(createHash('sha256').update(body ?? Buffer.alloc(0)).digest('hex')).toBe(
+      createHash('sha256').update(LARGE_FILE.buffer).digest('hex'),
+    );
+    // mock 侧也收到了两次预览，且两次摘要一致
+    await expect.poll(() => imports.filter((call) => call.path.endsWith('/preview')).length, { timeout: WAIT }).toBe(2);
+    const previews = imports.filter((call) => call.path.endsWith('/preview'));
+    expect(previews[0]?.digest).toBe(previews[1]?.digest);
+    expect(previews[1]?.bytes).toBe(LARGE_FILE.buffer.length);
+    expect(previews[1]?.contentType).toBe('application/x-ndjson');
   }, CASE_TIMEOUT);
 
   it('C1：重复与跳过放在次一级；D1：零条时没有确认按钮并给出下一步', async () => {
@@ -416,6 +509,245 @@ describe('导入旧记忆', () => {
     expect(sentTokens).toEqual(['token-1', 'token-2']);
   }, CASE_TIMEOUT);
 
+  /*
+   * 大档案走完整流程。判据：**两次请求的字节都等于文件真实大小**（同一份 File，
+   * 不经文本中转），且预览/确认/重复预览三次都能完成。
+   *
+   * 这条能证明：前端没有按 32 MiB 或 5000 条拒绝，也没有把 File 读成文本再发。
+   * 不能证明：服务端真的把 5xx 万条都收下了——路由是 mock 的，计数是假数。
+   */
+  it('大档案（>32 MiB、>5000 条）能走完预览、确认与重复预览', async () => {
+    /*
+     * 断言的是**实际发出的请求体字节**（`open()` 里已经收集），不是
+     * Content-Length 头：Playwright 转发 File 时是 chunked，没有这个头。
+     */
+    const { page, imports } = await open({
+      memories: [],
+      previewBody: {
+        total: 60_000, accepted: 5_100, duplicates: 40_000, skipped: 4_900,
+        skip_reasons: { invalid_record: 4_900 }, sample: [],
+      },
+      commitBody: { total: 60_000, imported: 5_100, duplicates: 40_000, skipped: 4_900, skip_reasons: { invalid_record: 4_900 } },
+    });
+
+    await previewFile(page, LARGE_FILE);
+    expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
+
+    await page.getByTestId('import-confirm').click();
+    await page.getByTestId('import-result-imported').waitFor();
+    expect(await page.getByTestId('import-result-imported').innerText()).toContain('5100');
+
+    // 重复预览：从结果页关掉再选同一份文件，预览仍然可用（预览只读）
+    await page.getByRole('button', { name: '关闭', exact: true }).click();
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-accepted-value').waitFor();
+    expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
+
+    // 三次请求都发的是用户选中的同一份 File，字节等于文件真实大小
+    const calls = imports.map((call) => ({ path: call.path, bytes: call.bytes }));
+    expect(calls).toEqual([
+      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
+      { path: '/v1/memory/import/commit', bytes: LARGE_FILE.buffer.length },
+      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
+    ]);
+    expect(LARGE_FILE.buffer.length).toBeGreaterThan(32 * 1024 * 1024);
+  }, CASE_TIMEOUT);
+
+  /*
+   * 等待状态与防连点。
+   *
+   * 判据：预览请求挂起时界面**明说在做什么**（不是假百分比），且连点只发一次
+   * 确认请求。能证明：点击去重与等待文案生效。不能证明：真实网速下的观感。
+   */
+  it('等待时说明在做什么，连点不会发出多份请求', async () => {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 900 }, reducedMotion: 'reduce' });
+    contexts.push(context);
+    const page = await context.newPage();
+    page.setDefaultTimeout(WAIT);
+    let previewCalls = 0;
+    let commitCalls = 0;
+    let releasePreview!: () => void;
+    let releaseCommit!: () => void;
+    const previewGate = new Promise<void>((resolve) => { releasePreview = resolve; });
+    const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+
+    await context.route('**/v1/**', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.method() === 'POST' && url.pathname.endsWith('/preview')) {
+        previewCalls += 1;
+        await previewGate;
+        return route.fulfill(json(preview()));
+      }
+      if (request.method() === 'POST' && url.pathname.endsWith('/commit')) {
+        commitCalls += 1;
+        await commitGate;
+        return route.fulfill(json({ total: 5, imported: 5, duplicates: 0, skipped: 0, skip_reasons: {}, destination: DESTINATION }));
+      }
+      if (request.method() === 'GET') {
+        if (url.pathname === '/v1/auth/me') {
+          return route.fulfill(json({
+            schema_version: 'v1', test_mode: false, csrf_token: 't', config_revision: 1,
+            user: { id: 'u', username: 'test', role: 'owner', subject_id: 'subj_owner', display_name: '小林', must_change_password: false },
+          }));
+        }
+        if (url.pathname === '/v1/memory') {
+          return route.fulfill(json({ memories: [], limit: 50, include: null, total: 0, has_more: false, note: '' }));
+        }
+        if (url.pathname === '/v1/version') return route.fulfill(json({ current: '0.0.0' }));
+        if (url.pathname === '/v1/sessions') return route.fulfill(json({ sessions: [] }));
+        if (url.pathname === '/v1/memory/purge/status') return route.fulfill(json({ items: [], note: '' }));
+      }
+      return route.fulfill(apiError('not_found', 'unknown', 404));
+    });
+
+    await page.goto(`${baseUrl}/memory`, { waitUntil: 'domcontentloaded' });
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+
+    // 预览挂起：要说明在等什么，且不出现伪造的百分比
+    const busy = page.getByTestId('import-busy');
+    await busy.waitFor();
+    const busyText = await busy.innerText();
+    expect(busyText).toContain('正在上传并读取这份文件');
+    expect(busyText).toContain(SIZE_TEXT);
+    expect(busyText).not.toMatch(/\d+\s*%/);
+    // 挂起期间文件选择器不可用：避免这一份还没回来就换另一份
+    expect(await page.getByTestId('import-file-input').isDisabled()).toBe(true);
+
+    releasePreview();
+    await page.getByTestId('import-confirm').waitFor();
+    expect(previewCalls).toBe(1);
+
+    /*
+     * 连点：在**同一帧**里派发两次 click，早于 React 把按钮改成 disabled。
+     *
+     * 为什么必须同一帧：等按钮 disabled 之后再点，浏览器会直接丢掉事件，
+     * 那时"只发一份请求"是被 disabled 保证的，跟 ref 守卫无关——这样的断言
+     * 去掉守卫仍然是绿的（已用变异确认）。真正要拦的是两次点击都读到旧状态
+     * 的那个窗口，所以这里用 `page.evaluate` 在同一个任务里连派两次。
+     */
+    const confirm = page.getByTestId('import-confirm');
+    await confirm.evaluate((node: HTMLElement) => {
+      node.click();
+      node.click();
+      node.click();
+    });
+    const busyCommit = page.getByTestId('import-busy');
+    await busyCommit.waitFor();
+    expect(await busyCommit.innerText()).toContain('正在写入记忆库');
+    // 三次点击只能换出一份请求
+    await expect.poll(() => commitCalls).toBe(1);
+    await page.waitForTimeout(300);
+    expect(commitCalls).toBe(1);
+    expect(await page.getByTestId('import-confirm').isDisabled()).toBe(true);
+
+    releaseCommit();
+    await page.getByTestId('import-result-imported').waitFor();
+    // 结果页如实显示 import 数
+    expect(await page.getByTestId('import-result-imported').innerText()).toContain('5');
+  }, CASE_TIMEOUT);
+
+  /*
+   * 重复占主导 vs 跳过占主导：零可导入时给的下一步必须不同。
+   *
+   * 两种输入在「可导入 0」这点上结果相同，只有"下一步做什么"能区分它们，
+   * 所以这里断言的是 headline 文本，而不是条数。
+   */
+  /*
+   * 零可导入时，重复与跳过是两类必须分别陈述的事实。
+   *
+   * 这里的四组输入刻意让「可导入 0」在所有情况下都成立——那样只有文案能区分
+   * 实现好坏。第一组与第二组的差别**只在于有无跳过**，正是被推翻的那种实现
+   * （按数量比大小）会把它们混为一谈的地方。
+   */
+  it('零可导入时分别陈述重复与跳过，不把混合结果说成"都已经导入过"', async () => {
+    const cases = [
+      {
+        name: '纯重复',
+        body: {
+          total: 2, accepted: 0, duplicates: 2, skipped: 0,
+          skip_reasons: {}, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '这些记忆都已经导入过了',
+        expectBody: ['直接去记忆库看即可'],
+        notHeadline: ['跳过', '不满足导入条件'],
+      },
+      {
+        // 验收反例原文：duplicates=2、skipped=3、{invalid_record:2, retention_expired:1}
+        name: '混合：重复与跳过打平',
+        body: {
+          total: 5, accepted: 0, duplicates: 2, skipped: 3,
+          skip_reasons: { invalid_record: 2, retention_expired: 1 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '一部分已经导入过，另一部分被跳过',
+        expectBody: ['重复 2 条', '跳过的 3 条', '记录格式不完整', '已超过 Ling 的保留期'],
+        notHeadline: ['都已经导入过了', '直接去记忆库看即可'],
+      },
+      {
+        name: '混合：重复占多数',
+        body: {
+          total: 12_006, accepted: 0, duplicates: 12_000, skipped: 6,
+          skip_reasons: { invalid_record: 6 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '一部分已经导入过，另一部分被跳过',
+        expectBody: ['重复 12000 条', '跳过的 6 条'],
+        notHeadline: ['都已经导入过了'],
+      },
+      {
+        name: '纯跳过',
+        body: {
+          total: 12_000, accepted: 0, duplicates: 0, skipped: 12_000,
+          skip_reasons: { outside_private_pair: 12_000 }, confirmation_token: null, expires_at: null, sample: [],
+        },
+        expectHeadline: '不属于你与这个旧 Bot 的私聊',
+        expectBody: [],
+        notHeadline: ['都已经导入过了', '一部分已经导入过'],
+      },
+    ];
+    for (const item of cases) {
+      const { page } = await open({ memories: [], previewBody: item.body });
+      await previewFile(page);
+      const zero = await page.getByTestId('import-zero').innerText();
+      expect(zero, item.name).toContain(item.expectHeadline);
+      for (const text of item.expectBody) expect(zero, item.name).toContain(text);
+      for (const text of item.notHeadline) expect(zero, item.name).not.toContain(text);
+      // 零可导入时没有确认按钮：这条对四组输入都成立，配对正向断言防止空集通过
+      expect(await page.getByTestId('import-confirm').count(), item.name).toBe(0);
+    }
+  }, CASE_TIMEOUT);
+
+  /*
+   * 解析报错：服务端读文件失败时，失败原因要能看懂、要能换文件。
+   *
+   * 两个 detail 分开验：`invalid_encoding` 与 `unsupported_archive` 在 UI 上
+   * 文案不同——只用其中一个断言，会漏掉"所有 422 都显示同一句"的实现。
+   */
+  it('解析报错给出可执行的下一步，且能换文件', async () => {
+    for (const [detail, expectText] of [
+      ['invalid_encoding', 'UTF-8'],
+      ['unsupported_archive', '转换脚本'],
+    ] as const) {
+      const { page, imports } = await open({
+        previewError: { code: 'invalid_request', status: 422, detail, message: '读不了这份文件' },
+      });
+      await previewFile(page);
+      const error = page.getByTestId('import-error');
+      await error.waitFor();
+      expect(await error.getAttribute('data-error-detail')).toBe(detail);
+      expect(await error.innerText()).toContain(expectText);
+      // 失败不静默：已选文件仍在，且明确说这份用不了
+      expect(await page.getByTestId('import-retained-name').innerText()).toBe(FILE.name);
+      expect(await page.getByTestId('import-retained-meta').innerText()).toContain('这份文件用不了');
+      const chooser = page.waitForEvent('filechooser');
+      await page.getByRole('button', { name: '换个文件' }).click();
+      expect(await chooser).toBeDefined();
+      expect(imports).toHaveLength(1);
+    }
+  }, CASE_TIMEOUT);
   it('I2：手机 375 宽预览无横向溢出，且能走完导入', async () => {
     const { page } = await open({ mobile: true, memories: [] });
     await page.getByTestId('mem-import-entry').click();
@@ -427,5 +759,26 @@ describe('导入旧记忆', () => {
     await page.getByTestId('import-confirm').click();
     await page.getByTestId('import-result-imported').waitFor();
     expect(await page.getByTestId('import-result-imported').innerText()).toContain('5');
+  }, CASE_TIMEOUT);
+
+  /*
+   * 手机宽度 + 大档案：文件名条与计数块都不能撑出横向滚动。
+   *
+   * 用 33 MB 那组常量，是因为长文件名（数字 + 连字符）最容易溢出；
+   * 判据是 `scrollWidth - clientWidth <= 0`，不是"看起来换行了"。
+   */
+  it('I3：手机 375 宽下大档案的文件名与计数不溢出', async () => {
+    const { page } = await open({
+      mobile: true, memories: [], previewBody: { total: 61_000, accepted: 5_100 },
+    });
+    await page.getByTestId('mem-import-entry').click();
+    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-accepted-value').waitFor();
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
   }, CASE_TIMEOUT);
 });

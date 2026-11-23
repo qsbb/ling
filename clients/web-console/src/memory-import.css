@@ -62,13 +62,57 @@
   color: var(--ink);
 }
 
+/*
+ * 等待状态：大文件上传+解析可能要几十秒，这里要说清"在做什么、还要等什么"，
+ * 而不是一句"正在读取"。不给百分比——浏览器这一侧拿不到分块进度，编一个
+ * 只会让人以为卡住了。
+ */
 .import-panel__busy {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 9px;
   margin: 0;
   font-size: 13px;
   color: var(--ink-soft);
+  min-width: 0;
+}
+
+.import-panel__busy > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.import-panel__busy strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.import-panel__busy p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* 预览阶段的已选文件：名字 + 真实大小，一行，可换行。 */
+.import-source-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin: 0;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.import-source-file strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 /* --------------------------------------------------------------- 选文件 */

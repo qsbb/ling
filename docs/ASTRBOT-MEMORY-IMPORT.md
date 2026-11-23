@@ -19,9 +19,9 @@ python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db l
   --bot-qq 200300400 --owner-qq 100200300
 ```
 
-在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。转换脚本默认导出整份，仍可用 `--limit` 和 `--offset` 主动选取一段。
+在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。转换脚本默认导出整份，`--limit` 和 `--offset` 只是可选的选取方式，不是必须的——服务端不再限制文件总字节或记录总数。
 
-导入接口按批读取和写入，临时文件使用 Ling 数据目录所在的磁盘。预览与确认均上传同一份文件，界面可以沿用已选的文件。若自行配置了反代，确保它允许这两条导入路径传输大文件。仓库的 nginx 模板已有对应配置。
+导入接口按批读取和写入，临时文件使用 Ling 数据目录所在的磁盘。预览与确认均上传同一份文件，界面可以沿用已选的文件，不会为第二次请求再次读盘或转成文本。超大文件在预览/确认期间显示的是「正在上传并读取」这类明确状态：浏览器拿不到分块进度，服务端也要收完才开始逐行解析，所以界面不显示百分比。若自行配置了反代，确保它允许这两条导入路径传输大文件；仓库的 nginx 模板已对这两条路径放开 `client_max_body_size`。遇到 413 时先检查反代的上传设置，界面会保留已选文件以便重试。
 
 ## API
 
@@ -58,7 +58,7 @@ const result = await fetch('/v1/memory/import/commit', {
 
 ## 结果和错误
 
-`total = accepted + duplicates + skipped`，确认后的公式用 `imported` 替换 `accepted`。每条被跳过的记录只计一个原因，`skip_reasons` 只列非零项。
+`total = accepted + duplicates + skipped`，确认后的公式用 `imported` 替换 `accepted`。每条被跳过的记录只计一个原因，`skip_reasons` 只列非零项。文件本身不限制总字节或总条数；单条记录超出校验范围（字段不合法、单行过长）时计入 `invalid_record`，而不是让整份文件失败。
 
 | 跳过原因 | 页面文案 |
 | --- | --- |
