@@ -201,6 +201,7 @@ const ROUTE_NAME_SET = {
   about: true,
   backup: true,
   connectors: true,
+  plugins: true,
   logs: true,
   desktop: true,
   legacyRedirect: true,

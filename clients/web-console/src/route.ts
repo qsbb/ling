@@ -3,6 +3,7 @@
  * 角色（/persona）、关系（/relationships）、生活（/life）、日志（/logs）、
  * 设置中心（/settings）、模型与生成（/settings/model）、
  * 权限与隐私（/settings/privacy）、接入器（/settings/connectors）、
+ * 外部插件（/settings/plugins）、
  * 登录名与密码（/settings/account）、关于与版本（/settings/about）。
  *
  * **设置只放程序与运维**（DESIGN §2）：行为调参回到它所属的领域页 ——
@@ -43,6 +44,11 @@ export type Route =
    * 是设置子页——渠道配置属于实例运维，不是她那一边的内容。
    */
   | { name: 'connectors' }
+  /**
+   * 外部插件（`/v1/plugins` 那组管理入口）：登记、授权、启停第三方 HTTP 插件。
+   * 设置子页，理由与接入器相同：登记一个端点属于实例运维。
+   */
+  | { name: 'plugins' }
   /** 运行日志（`GET /v1/logs`）。一级导航项，不是设置子页。 */
   | { name: 'logs' }
   /**
@@ -103,6 +109,7 @@ export function parseRoute(pathname: string): Route {
   if (path === '/settings/about') return { name: 'about' };
   if (path === '/settings/backup-restore') return { name: 'backup' };
   if (path === '/settings/connectors') return { name: 'connectors' };
+  if (path === '/settings/plugins') return { name: 'plugins' };
   if (path === '/settings') return { name: 'settings' };
   if (path === '/persona') return { name: 'persona' };
   // 「关系」是一级页：它和 `/persona`、`/life` 平级，不是 `/settings/*` 的子项。
@@ -174,6 +181,8 @@ export function routePath(route: Route): string {
       return '/settings/backup-restore';
     case 'connectors':
       return '/settings/connectors';
+    case 'plugins':
+      return '/settings/plugins';
     case 'logs':
       return '/logs';
     case 'desktop':

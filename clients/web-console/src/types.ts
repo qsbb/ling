@@ -2313,3 +2313,88 @@ export interface SleepReviewsResponse {
   schema_version: string;
   nights: SleepReviewNight[];
 }
+
+/* ------------------------------------------------------------------ 外部插件
+ *
+ * 契约来自 `src/ling/api/routes/external_plugins.py` 与
+ * `src/ling/capabilities/external_plugins_service.py:to_public()`。
+ * 全部来自真实运行观测（scripts/probe_external_plugins_api.py），不是猜测：
+ * 端点 `endpoint` **不出现在任何响应里**，服务端刻意不回流。
+ */
+
+/** 服务端已就绪的能力白名单（`GET /v1/settings/tool-status.external_capabilities`）。 */
+export type ExternalCapability = 'tools' | 'commands' | 'events' | 'host.state';
+
+/**
+ * 登记状态的**真实取值**（`ExternalPluginRow.status`）。
+ *
+ * - `ready`：可用；`enabled=false` 时是"已登记但关着"；
+ * - `registered`：`allows()` 也接受它，但当前写入路径只会产生 `ready`；
+ * - `unavailable`：最近一次启用探测或调用失败（`last_error` 有原因）；
+ * - `incompatible`：插件版本区间不含当前 Ling 版本；
+ * - `identity_mismatch`：端点声明的 id 变了，服务端已自动停用。
+ *
+ * 后端是自由字符串列，这里保留 `string` 兜底，避免新状态让整页白屏。
+ */
+export type ExternalPluginStatus =
+  | 'ready'
+  | 'registered'
+  | 'unavailable'
+  | 'incompatible'
+  | 'identity_mismatch'
+  | (string & {});
+
+/** 一条登记记录（`to_public()` 的完整形状）。 */
+export interface ExternalPlugin {
+  id: string;
+  name: string;
+  version: string;
+  api_version: string;
+  min_host_version: string;
+  max_host_version: string;
+  /** manifest 声明的能力。 */
+  capabilities: ExternalCapability[];
+  events: string[];
+  /** 工具**名字**（不是完整声明），服务端只回流名字。 */
+  tools: string[];
+  /** 命令**名字**。 */
+  commands: string[];
+  /** 管理员实际授予的能力——只有它与 `capabilities` 的交集才会被调用。 */
+  granted_capabilities: ExternalCapability[];
+  enabled: boolean;
+  status: ExternalPluginStatus;
+  /** 最近一次失败的原因（`TypeError: ...` 形式）；成功清空。 */
+  last_error: string | null;
+  /** ISO；null = 登记后从未检查过。 */
+  last_checked_at: string | null;
+}
+
+/** `GET /v1/plugins`：新登记 + 旧 `tool-plugins.json` 摘要（只读）。 */
+export interface ExternalPluginsResponse {
+  plugins: ExternalPlugin[];
+  legacy: LegacyToolPlugin[];
+}
+
+export interface LegacyToolPlugin {
+  id: string;
+  name: string;
+  enabled: boolean;
+  endpoint: null;
+  source: string;
+}
+
+/** `GET /v1/plugins/{id}/status`：列表字段 + 一次真实健康探测。 */
+export interface ExternalPluginStatusResponse extends ExternalPlugin {
+  /** 端点能连上**且**声明的 id 与登记一致。 */
+  reachable: boolean;
+  /** ISO；null = 这次探测没有拿到时间。 */
+  health_checked_at: string | null;
+}
+
+/** 登记请求体（`RegisterBody`，`extra=forbid`，多一个字段就 422）。 */
+export interface ExternalPluginRegisterBody {
+  endpoint: string;
+  expected_id?: string;
+  granted_capabilities?: ExternalCapability[];
+  enabled?: boolean;
+}

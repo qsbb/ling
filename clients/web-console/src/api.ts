@@ -73,6 +73,10 @@ import type {
   RecallResult,
   SleepReviewsResponse,
   VoiceReferenceUpload,
+  ExternalPlugin,
+  ExternalPluginRegisterBody,
+  ExternalPluginsResponse,
+  ExternalPluginStatusResponse,
 } from './types';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
 import type { CurrentLive, LiveConnector, LiveConnectorInput, LivePlan, LiveSession, LiveViewer } from './live';
@@ -1582,6 +1586,74 @@ export const api = {
    * 返回 `{persona_id}` 是后端回执，不是完整对象——切换后列表要重读一次，
    * 别拿回执拼一个"已激活"的本地状态。
    */
+  /* ---------------------------------------------------------------- 外部插件
+   *
+   * `/v1/plugins` 这组入口全部要求 owner/admin（成员会收到 403，不是空列表）。
+   * 形状来自 `scripts/probe_external_plugins_api.py` 的真实运行：
+   *
+   * - **端点不会被回流**：任何响应里都没有 `endpoint` 字段。页面因此不可能
+   *   "顺手把地址显示出来"——那是服务端刻意不提供的信息，不是前端遗漏。
+   * - 登记请求体 `extra=forbid`：多一个字段就是 422，这里只发契约里的四个键。
+   * - 失败时**不要只信错误文案**：`POST .../sync` 在 manifest 坏掉时只回一句
+   *   "插件同步失败，请检查端点是否可达且符合 v1 契约"，真正的 `last_error`
+   *   与 `status`（如 `identity_mismatch`）写在记录里。调用方必须重读列表。
+   */
+
+  /** 列表（含旧 `tool-plugins.json` 摘要）。 */
+  externalPlugins(signal?: AbortSignal): Promise<ExternalPluginsResponse> {
+    return request<ExternalPluginsResponse>('/v1/plugins', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /** 登记并抓取 manifest；成功返回落库后的记录。 */
+  registerExternalPlugin(body: ExternalPluginRegisterBody): Promise<ExternalPlugin> {
+    return request<ExternalPlugin>('/v1/plugins/register', jsonInit('POST', body));
+  },
+
+  /**
+   * 更新原登记的授权。服务端只在 `?force=true` 时允许覆盖同 id 的旧登记，
+   * 且仍须保持端点声明的 id——这是"改授权"的唯一路径。
+   */
+  updateExternalPlugin(
+    body: ExternalPluginRegisterBody,
+  ): Promise<ExternalPlugin> {
+    return request<ExternalPlugin>('/v1/plugins/register?force=true', jsonInit('POST', body));
+  },
+
+  /** 健康探测（会真实 GET 一次插件端点）。 */
+  externalPluginStatus(pluginId: string): Promise<ExternalPluginStatusResponse> {
+    return request<ExternalPluginStatusResponse>(
+      `/v1/plugins/${encodeURIComponent(pluginId)}/status`,
+      { cache: 'no-store' },
+    );
+  },
+
+  /** 启用/停用；启用会先探测端点与版本区间。 */
+  setExternalPluginEnabled(pluginId: string, enabled: boolean): Promise<ExternalPlugin> {
+    return request<ExternalPlugin>(
+      `/v1/plugins/${encodeURIComponent(pluginId)}/${enabled ? 'enable' : 'disable'}`,
+      jsonInit('POST', { enabled }),
+    );
+  },
+
+  /** 重新读取 manifest；授权项会被裁剪到新声明范围内。 */
+  syncExternalPlugin(pluginId: string): Promise<ExternalPlugin> {
+    return request<ExternalPlugin>(
+      `/v1/plugins/${encodeURIComponent(pluginId)}/sync`,
+      jsonInit('POST', {}),
+    );
+  },
+
+  /** 取消登记（同时把插件状态键值置为过期）。 */
+  unregisterExternalPlugin(pluginId: string): Promise<{ id: string; deleted: boolean }> {
+    return request<{ id: string; deleted: boolean }>(
+      `/v1/plugins/${encodeURIComponent(pluginId)}`,
+      { method: 'DELETE' },
+    );
+  },
+
   activatePersona(personaId: string): Promise<{ persona_id: string }> {
     return request<{ persona_id: string }>(
       `/v1/personas/${encodeURIComponent(personaId)}/activate`,

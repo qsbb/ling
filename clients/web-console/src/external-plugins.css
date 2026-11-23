@@ -1,0 +1,718 @@
+/* =========================================================================
+   外部插件页（/settings/plugins）
+
+   版式契约（browser 测试会断言这几条，改之前先想清楚）：
+
+   1. >760px：一条登记是**一行**——名字 / 状态 / 能力 / 操作在同一行；
+      ≤760px：折成竖排，DOM 顺序不变，只改 flex-direction。
+   2. 能力格是"声明 × 授予"两态合成的一格，不用两列文字。
+   3. 失败原因块（.ep-fix）跟着那一行走，展开在行下方，占满整行宽度。
+   4. 任何宽度都不横向溢出（表格型布局最容易在这里出问题，所以操作区
+      用 flex-wrap 而不是固定列宽）。
+   ========================================================================= */
+
+.ep-page {
+  --ep-row-gap: 10px;
+}
+
+.ep-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ep-head .back-link {
+  align-self: flex-start;
+}
+
+/* ------------------------------------------------------------------ 横幅 */
+
+.ep-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: var(--paper-raised);
+  font-size: 13px;
+}
+
+.ep-notice[data-tone='ok'] {
+  border-color: #c8d6bf;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.ep-notice[data-tone='error'] {
+  border-color: #e2c3bb;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.ep-notice__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.ep-notice__body strong {
+  display: block;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.ep-notice__body p {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
+  line-height: 1.65;
+}
+
+.ep-notice--compact {
+  margin-top: 10px;
+}
+
+.ep-trace {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  word-break: break-all;
+}
+
+/* ------------------------------------------------------------- 登记表单 */
+
+.ep-register {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.ep-register__toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 13px 16px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.ep-register__toggle:hover {
+  background: #f7f3ea;
+}
+
+.ep-register__plus {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-soft);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.ep-register__hint {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+
+.ep-form {
+  display: grid;
+  gap: 16px;
+  padding: 4px 16px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.ep-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ep-field label {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.ep-field input[type='text'] {
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: #fffdf9;
+  color: var(--ink);
+  font-size: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.ep-field input[type='text']:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.ep-field input[aria-invalid='true'] {
+  border-color: #c58d80;
+}
+
+.ep-field__help {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.ep-field__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.ep-optional {
+  margin-left: 4px;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.ep-grants {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.ep-grants legend {
+  padding: 0 0 6px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.ep-grant {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: #fffdf9;
+  cursor: pointer;
+}
+
+.ep-grant[data-checked='true'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ep-grant input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.ep-grant__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ep-grant__label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ep-grant__detail {
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.ep-form__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ep-enable-now {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.ep-enable-now input {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+
+.ep-form__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+/* --------------------------------------------------------------- 列表 */
+
+.ep-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ep-list__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  letter-spacing: 0.02em;
+}
+
+.ep-list__count {
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--paper-sunken);
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  font-weight: 500;
+  text-align: center;
+}
+
+.ep-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.ep-refresh:hover:not(:disabled) {
+  background: var(--paper-sunken);
+  color: var(--ink);
+}
+
+.ep-refresh:disabled {
+  opacity: 0.5;
+}
+
+.ep-empty {
+  margin: 0;
+  padding: 22px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--ink-faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+.ep-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ep-row {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-card);
+  border-left: 3px solid var(--line-strong);
+}
+
+.ep-row[data-state='active'] {
+  border-left-color: var(--ok);
+}
+
+.ep-row[data-state='blocked'] {
+  border-left-color: var(--danger);
+}
+
+/* 一行：名字 / 状态 / 能力 / 操作。 */
+.ep-row__main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.ep-row__id {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.ep-row__name {
+  font-size: 14.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.ep-row__slug {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
+.ep-badge {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  border: 1px solid transparent;
+}
+
+.ep-badge[data-tone='ok'] {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border-color: #c8d6bf;
+}
+
+.ep-badge[data-tone='off'] {
+  background: var(--paper-sunken);
+  color: var(--ink-faint);
+  border-color: var(--line);
+}
+
+.ep-badge[data-tone='error'] {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: #e2c3bb;
+}
+
+.ep-badge[data-tone='warn'] {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: #e5d3ae;
+}
+
+/* 能力格：未声明的灰掉，声明未授予的是空心。 */
+.ep-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.ep-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  background: transparent;
+}
+
+.ep-cap[data-declared='true'][data-on='false'] {
+  border-style: dashed;
+  border-color: var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.ep-cap[data-on='true'] {
+  border-color: #c8d6bf;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.ep-cap__mark {
+  display: inline-flex;
+  width: 12px;
+  height: 12px;
+  align-items: center;
+  justify-content: center;
+}
+
+.ep-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.ep-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--paper-raised);
+  color: var(--ink-soft);
+}
+
+.ep-icon-button:hover:not(:disabled) {
+  background: #f3eee4;
+  color: var(--ink);
+}
+
+.ep-icon-button:disabled {
+  opacity: 0.45;
+}
+
+.ep-remove {
+  color: var(--ink-faint);
+}
+
+.ep-remove:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.ep-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.button--danger {
+  border-color: #c58d80;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.button--danger:hover:not(:disabled) {
+  background: #f0d5cd;
+}
+
+/* 失败原因块：紧贴现有一行，占满整行宽度。 */
+.ep-fix {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--paper-sunken);
+  flex-wrap: wrap;
+}
+
+.ep-fix[data-tone='error'] {
+  background: var(--danger-soft);
+}
+
+.ep-fix[data-tone='warn'] {
+  background: var(--warn-soft);
+}
+
+.ep-fix__text {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.ep-fix__text strong {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.ep-fix__text p {
+  margin: 3px 0 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.ep-fix__hint {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.ep-grant-note {
+  margin: 0;
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.ep-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.ep-meta > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ep-meta dt {
+  color: var(--ink-faint);
+}
+
+.ep-meta dd {
+  margin: 0;
+  color: var(--ink-soft);
+  word-break: break-word;
+}
+
+.ep-health {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  padding-top: 2px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.ep-health[data-ok='true'] {
+  color: var(--ok);
+}
+
+.ep-health__when {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------- 旧入口 */
+
+.ep-legacy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+}
+
+.ep-legacy__title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.ep-legacy__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.ep-legacy__items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.ep-legacy__items li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.ep-legacy__items code {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.ep-legacy__items [data-on='true'] {
+  color: var(--ok);
+}
+
+.ep-legacy__items [data-on='false'] {
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------------ 窄屏 */
+
+@media (max-width: 760px) {
+  .ep-grants {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 折成竖排：同一个 DOM 顺序，只换方向。 */
+  .ep-row__main {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .ep-row__actions {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  /* 触控目标：窄屏按钮至少 40px 高，避免误触「取消登记」。 */
+  .ep-row__actions .button,
+  .ep-row__actions .ghost-button {
+    min-height: 40px;
+  }
+
+  .ep-icon-button {
+    width: 40px;
+    height: 40px;
+  }
+
+  .ep-form__foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ep-form__foot .button {
+    width: 100%;
+  }
+}
+
+/* 读失败时的占位：明显不是"空列表"，也不假装知道有没有插件。 */
+.ep-empty--failed {
+  border-style: solid;
+  border-color: #e2c3bb;
+  color: var(--danger);
+  background: var(--danger-soft);
+}

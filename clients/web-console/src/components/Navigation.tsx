@@ -191,6 +191,7 @@ export function activeNavId(route: Route): NavSectionId | null {
     case 'about':
     case 'backup':
     case 'connectors':
+    case 'plugins':
       return 'settings';
     case 'legacyRedirect':
       // 递归只有一层：`legacyRedirectTarget` 对"目标又是旧地址"返回 `notFound`。
