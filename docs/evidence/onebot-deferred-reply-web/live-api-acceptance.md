@@ -42,5 +42,8 @@
 - `23-unconfirmed-409.png` 开启被 409 拒绝，开关回到关闭并指向「平台来源」
 - `24-member.png` 非所有者没有会话设置入口
 
-日志：`web-tests.log`（45 文件 / 1107 通过 / 1 跳过）、`web-build.log`、
+自动化用例（`src/onebot-deferred.browser.test.tsx`，9 条）另外覆盖了窗口**来回**切换
+（A→B→A→B，每次重开都重新读服务端）与重复点开、关闭设置。
+
+日志：`web-tests.log`（45 文件 / 1108 通过 / 1 跳过）、`web-build.log`、
 `backend-deferred-tests.log`（8 通过）、`backend-policy-tests.log`（117 通过）。

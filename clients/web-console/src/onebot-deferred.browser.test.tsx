@@ -121,6 +121,8 @@ interface DeferredServer {
   state: Map<string, boolean>;
   /** PUT 的调用记录。 */
   writes: Array<{ sessionId: string; enabled: boolean }>;
+  /** GET 的调用记录，按到达顺序：用来证明每次重开都真的读了服务端。 */
+  reads: string[];
   /** 让下一次 GET 故意晚回，用来制造会话切换竞态。 */
   delayNextGet: Map<string, Promise<void>>;
   /** 让下一次 PUT 返回指定状态码。 */
@@ -131,6 +133,7 @@ function deferredServer(): DeferredServer {
   return {
     state: new Map(),
     writes: [],
+    reads: [],
     delayNextGet: new Map(),
     failNextPut: null,
   };
@@ -160,6 +163,7 @@ async function openChat(
     if (deferredMatch) {
       const sessionId = decodeURIComponent(deferredMatch[1] ?? '');
       if (method === 'GET') {
+        state.reads.push(sessionId);
         const wait = state.delayNextGet.get(sessionId);
         if (wait) {
           state.delayNextGet.delete(sessionId);
@@ -304,6 +308,40 @@ describe('OneBot 私聊的「允许晚点回」', () => {
     await first.waitFor();
     expect(await first.isChecked()).toBe(true);
   }, 30000);
+
+  it('窗口来回切换多次，每次都重新读服务端而不是复用上一次的值', async (ctx) => {
+    if (startupError) { console.warn(startupError); ctx.skip(); return; }
+    const { page, server } = await openChat('owner', [onebotPrivate, onebotPrivate2], 'known');
+    // p1 开着、p2 关着：两个方向都能看出"带错了值"。
+    server.state.set('p1', true);
+    server.state.set('p2', false);
+
+    const route = [
+      { id: 'p1', title: '私聊 100200301', expected: true },
+      { id: 'p2', title: '私聊 100200302', expected: false },
+      { id: 'p1', title: '私聊 100200301', expected: true },
+      { id: 'p2', title: '私聊 100200302', expected: false },
+    ];
+    await openSettings(page);
+    for (const step of route) {
+      if (page.url().endsWith(`/s/${step.id}`) === false) {
+        await page.getByRole('button', { name: new RegExp(step.title) }).first().click();
+        await switchTo(page, step.id, step.title);
+        await openSettings(page);
+      }
+      const toggle = page.getByRole('checkbox', { name: '允许晚点回' });
+      await toggle.waitFor();
+      expect(await toggle.isChecked()).toBe(step.expected);
+      // 关掉面板，下一步重新打开——重复点开也要重新读。
+      await page.getByRole('button', { name: '关闭' }).click();
+      await expect.poll(() => settingsRegion(page).count()).toBe(0);
+    }
+    // 每次重开都真的问了服务端，而不是复用内存里的上一份值：
+    // 读取次数不少于「初始 1 次 + 每轮各 1 次」，且最后一次读的是最后一个会话。
+    expect(server.reads.length).toBeGreaterThanOrEqual(1 + route.length);
+    expect(server.reads.at(-1)).toBe('p2');
+    expect(server.writes).toEqual([]);
+  }, 40000);
 
   it('上一会话的慢响应在卸载后被丢弃，不改写当前开关', async (ctx) => {
     if (startupError) { console.warn(startupError); ctx.skip(); return; }
