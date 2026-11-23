@@ -8,7 +8,7 @@
  * 悄悄落到真实后端。
  */
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,10 +27,16 @@ let server: ViteDevServer | undefined;
 let browser: Browser;
 let cacheDir: string | undefined;
 let baseUrl: string;
+let largeFile: { name: string; path: string; bytes: number; digest: string };
 const contexts: BrowserContext[] = [];
 
 beforeAll(async () => {
   cacheDir = await mkdtemp(join(tmpdir(), 'ling-import-vite-'));
+  const archive = buildLargeArchive();
+  const name = 'ling-memories-large.jsonl';
+  const path = join(cacheDir, name);
+  await writeFile(path, archive);
+  largeFile = { name, path, bytes: archive.length, digest: createHash('sha256').update(archive).digest('hex') };
   server = await createServer({
     root: ROOT, configFile: false, plugins: [react()], cacheDir, logLevel: 'silent',
     server: { host: '127.0.0.1', port: 0 },
@@ -207,7 +213,7 @@ const RECORD_COUNT = 5_100;
 const TARGET_BYTES = 32 * 1024 * 1024 + 256 * 1024;
 const SIZE_TEXT = `${(TARGET_BYTES / (1024 * 1024)).toFixed(1)} MB`;
 
-function buildLargeArchive(): Buffer<ArrayBuffer> {
+function buildLargeArchive(): Buffer {
   const header = `${JSON.stringify({ format: 'ling-astrbot-memory-jsonl', version: 1 })}\n`;
   const records: string[] = [];
   for (let index = 0; index < RECORD_COUNT; index += 1) {
@@ -217,20 +223,14 @@ function buildLargeArchive(): Buffer<ArrayBuffer> {
       text: `合成记忆 ${index}`, created_at: STAMP, valid_from: null, valid_to: null,
     })}\n`);
   }
-  let bytes = Buffer.byteLength(header) + records.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+  const body = Buffer.from(header + records.join(''), 'utf8');
   // 填充行是合法 JSON 但不满足记录 schema：服务端计入 invalid_record，不会伪装成可导入。
   const filler = '{}\n';
-  for (; bytes <= TARGET_BYTES; bytes += filler.length) records.push(filler);
-  return Buffer.from(header + records.join(''), 'utf8') as Buffer<ArrayBuffer>;
+  const count = Math.ceil((TARGET_BYTES - body.length) / filler.length);
+  return Buffer.concat([body, Buffer.alloc(count * filler.length, filler)]);
 }
 
-const LARGE_FILE: UploadFile = {
-  name: 'ling-memories-large.jsonl',
-  mimeType: 'application/x-ndjson',
-  buffer: buildLargeArchive(),
-};
-
-async function previewFile(page: Page, file: UploadFile = FILE) {
+async function previewFile(page: Page, file: UploadFile | string = FILE) {
   await page.getByTestId('mem-import-entry').click();
   await page.getByTestId('import-file-input').setInputFiles(file);
   await page.getByTestId('import-panel').waitFor({ state: 'visible' });
@@ -287,7 +287,7 @@ describe('导入旧记忆', () => {
         message: '请求体过大',
       },
     });
-    await previewFile(page, LARGE_FILE);
+    await previewFile(page, largeFile.path);
     const error = await page.getByTestId('import-error').innerText();
     expect(error).toContain('上传上限');
     expect(error).toContain('client_max_body_size');
@@ -296,7 +296,7 @@ describe('导入旧记忆', () => {
     expect(error).not.toContain('8 MiB');
     expect(error).not.toContain('5000');
     // 文件保留：名字与真实大小仍在，且能一步重试
-    expect(await page.getByTestId('import-retained-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-retained-name').innerText()).toBe(largeFile.name);
     expect(await page.getByTestId('import-retained-meta').innerText()).toContain(SIZE_TEXT);
     const retry = page.getByRole('button', { name: '再试一次' });
     expect(await retry.isEnabled()).toBe(true);
@@ -318,15 +318,13 @@ describe('导入旧记忆', () => {
 
     // 第二次请求体与已选文件逐字节相同（摘要比对，不是"大小相同"）
     const body = sent.postDataBuffer();
-    expect(body?.length).toBe(LARGE_FILE.buffer.length);
-    expect(createHash('sha256').update(body ?? Buffer.alloc(0)).digest('hex')).toBe(
-      createHash('sha256').update(LARGE_FILE.buffer).digest('hex'),
-    );
+    expect(body?.length).toBe(largeFile.bytes);
+    expect(createHash('sha256').update(body ?? Buffer.alloc(0)).digest('hex')).toBe(largeFile.digest);
     // mock 侧也收到了两次预览，且两次摘要一致
     await expect.poll(() => imports.filter((call) => call.path.endsWith('/preview')).length, { timeout: WAIT }).toBe(2);
     const previews = imports.filter((call) => call.path.endsWith('/preview'));
     expect(previews[0]?.digest).toBe(previews[1]?.digest);
-    expect(previews[1]?.bytes).toBe(LARGE_FILE.buffer.length);
+    expect(previews[1]?.bytes).toBe(largeFile.bytes);
     expect(previews[1]?.contentType).toBe('application/x-ndjson');
   }, CASE_TIMEOUT);
 
@@ -530,9 +528,9 @@ describe('导入旧记忆', () => {
       commitBody: { total: 60_000, imported: 5_100, duplicates: 40_000, skipped: 4_900, skip_reasons: { invalid_record: 4_900 } },
     });
 
-    await previewFile(page, LARGE_FILE);
+    await previewFile(page, largeFile.path);
     expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
-    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(largeFile.name);
     expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
 
     await page.getByTestId('import-confirm').click();
@@ -542,18 +540,18 @@ describe('导入旧记忆', () => {
     // 重复预览：从结果页关掉再选同一份文件，预览仍然可用（预览只读）
     await page.getByRole('button', { name: '关闭', exact: true }).click();
     await page.getByTestId('mem-import-entry').click();
-    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-file-input').setInputFiles(largeFile.path);
     await page.getByTestId('import-accepted-value').waitFor();
     expect(await page.getByTestId('import-accepted-value').innerText()).toContain('5100');
 
     // 三次请求都发的是用户选中的同一份 File，字节等于文件真实大小
     const calls = imports.map((call) => ({ path: call.path, bytes: call.bytes }));
     expect(calls).toEqual([
-      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
-      { path: '/v1/memory/import/commit', bytes: LARGE_FILE.buffer.length },
-      { path: '/v1/memory/import/preview', bytes: LARGE_FILE.buffer.length },
+      { path: '/v1/memory/import/preview', bytes: largeFile.bytes },
+      { path: '/v1/memory/import/commit', bytes: largeFile.bytes },
+      { path: '/v1/memory/import/preview', bytes: largeFile.bytes },
     ]);
-    expect(LARGE_FILE.buffer.length).toBeGreaterThan(32 * 1024 * 1024);
+    expect(largeFile.bytes).toBeGreaterThan(32 * 1024 * 1024);
   }, CASE_TIMEOUT);
 
   /*
@@ -609,7 +607,7 @@ describe('导入旧记忆', () => {
 
     await page.goto(`${baseUrl}/memory`, { waitUntil: 'domcontentloaded' });
     await page.getByTestId('mem-import-entry').click();
-    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-file-input').setInputFiles(largeFile.path);
 
     // 预览挂起：要说明在等什么，且不出现伪造的百分比
     const busy = page.getByTestId('import-busy');
@@ -773,9 +771,9 @@ describe('导入旧记忆', () => {
       mobile: true, memories: [], previewBody: { total: 61_000, accepted: 5_100 },
     });
     await page.getByTestId('mem-import-entry').click();
-    await page.getByTestId('import-file-input').setInputFiles(LARGE_FILE);
+    await page.getByTestId('import-file-input').setInputFiles(largeFile.path);
     await page.getByTestId('import-accepted-value').waitFor();
-    expect(await page.getByTestId('import-file-name').innerText()).toBe(LARGE_FILE.name);
+    expect(await page.getByTestId('import-file-name').innerText()).toBe(largeFile.name);
     expect(await page.getByTestId('import-file').innerText()).toContain(SIZE_TEXT);
     const overflow = await page.evaluate(
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
