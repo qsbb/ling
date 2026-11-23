@@ -163,6 +163,10 @@ function pageOf(query: URLSearchParams): { status: number; body: unknown } {
     can_rename: !row.merged_into,
     // 服务端字段：有多少身份并入这一行。成员可能不在本页，所以必须由服务端给。
     merged_member_count: store.filter((other) => other.merged_into === row.subject_id).length,
+    // 身份数 ≠ 账号数：一个被并入的身份可能挂好几个号。
+    merged_member_account_count: store
+      .filter((other) => other.merged_into === row.subject_id)
+      .reduce((sum, other) => sum + other.accounts.length, 0),
   }));
   return {
     status: 200,
@@ -239,10 +243,20 @@ async function openRelations(
         return route.fulfill(json({ error: { code: 'internal', message: '暂时无法读取记忆' } }, 503));
       }
       const isSelf = subjectId === 'subj_0000';
-      const subject = store.find((row) => row.subject_id === subjectId);
       const cursor = url.searchParams.get('cursor');
       if (section === 'accounts') {
-        const items = (subject?.accounts ?? []).map((account) => ({ ...account, subject_id: subjectId }));
+        /*
+         * 真实后端按 `subject_group` 返回**整组**账号：目标自己的 + 已并入它的
+         * 那些身份的。模拟接口早先只回自己那一行，于是"详情里有几个账号"这件事
+         * 在测试里永远看不到并入的部分——徽标与详情的一致性就没法验。
+         */
+        const groupIds = new Set<string>([subjectId]);
+        for (const row of store) {
+          if (row.merged_into === subjectId) groupIds.add(row.subject_id);
+        }
+        const items = store
+          .filter((row) => groupIds.has(row.subject_id))
+          .flatMap((row) => row.accounts.map((account) => ({ ...account, subject_id: row.subject_id })));
         return route.fulfill(json({ section, access: 'full', items, next_cursor: null }));
       }
       if (section === 'interactions') {
@@ -717,6 +731,95 @@ describe('关系页：不再卡死（真浏览器）', () => {
     expect(await option.innerText()).toContain('onebot');
     await option.click();
     expect(await dialog.getByTestId('merge-confirm-target').innerText()).toContain('22000002');
+  }, TEST_TIMEOUT);
+
+  it('一个被并入的身份挂两个账号时，列表说清身份数与账号数', async (ctx) => {
+    if (skip(ctx)) return;
+    /*
+     * 验收抓到的真实矛盾：一个被并入的身份挂了两个号时，徽标写「已并入 1 个号」，
+     * 详情里却列出两个账号。数字没错（数的是**身份**），错的是把它说成了"号"。
+     *
+     * 这条同时验证两种形状，因为只报单一数字的实现无法同时满足它们：
+     * - 情形 A：1 个身份、2 个账号 → 徽标必须两个数都写出来；
+     * - 情形 B：2 个身份、2 个账号 → 徽标只写身份数（账号数相等时重复无益）。
+     */
+    const template = SUBJECTS[0];
+    if (!template) throw new Error('缺少测试数据');
+    const account = (id: string, external: string) => ({
+      account_id: id,
+      connector_instance: 'napcat-2',
+      external_account_id: external,
+      proof: 'proven',
+      revoked: false,
+    });
+
+    // 情形 A：保留者 + 一个挂两个号的被并入身份
+    resetStore([
+      {
+        ...template,
+        subject_id: 'keeper_a',
+        display_name: '保留者甲',
+        merged_into: null,
+        accounts: [account('keeper_a_1', '11110001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_a',
+        display_name: '并入者甲',
+        merged_into: 'keeper_a',
+        accounts: [account('member_a_1', '22220001'), account('member_a_2', '22220002')],
+      },
+    ]);
+    {
+      const { page } = await openRelations({ width: 1440, height: 900 });
+      const keeper = page.locator('[data-testid="subject-card"][data-subject-id="keeper_a"]');
+      await keeper.waitFor();
+      const badge = (await keeper.getByTestId('merged-members-badge').innerText()).trim();
+      expect(badge).toContain('1 个身份');
+      expect(badge).toContain('2 个账号');
+      // 详情里确实是两个账号——徽标的数字必须和它一致，而不是各说各的
+      await keeper.getByTestId('detail-open').click();
+      const detail = keeper.getByTestId('subject-detail');
+      await expect.poll(async () => detail.getByLabel('关联账号').locator('.identity-detail__row').count())
+        .toBe(3);
+      // 关掉页面（每个用例一个新 context）
+      await page.close();
+    }
+
+    // 情形 B：两个被并入的身份，各挂一个号（账号数 = 身份数）
+    resetStore([
+      {
+        ...template,
+        subject_id: 'keeper_b',
+        display_name: '保留者乙',
+        merged_into: null,
+        accounts: [account('keeper_b_1', '33330001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_b1',
+        display_name: '并入者乙一',
+        merged_into: 'keeper_b',
+        accounts: [account('member_b1_1', '44440001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_b2',
+        display_name: '并入者乙二',
+        merged_into: 'keeper_b',
+        accounts: [account('member_b2_1', '44440002')],
+      },
+    ]);
+    {
+      const { page } = await openRelations({ width: 1440, height: 900 });
+      const keeper = page.locator('[data-testid="subject-card"][data-subject-id="keeper_b"]');
+      await keeper.waitFor();
+      const badge = (await keeper.getByTestId('merged-members-badge').innerText()).trim();
+      expect(badge).toContain('2 个身份');
+      // 两个数相等时不重复写账号数
+      expect(badge).not.toContain('个账号');
+      await page.close();
+    }
   }, TEST_TIMEOUT);
 
   it('关闭弹层后回到原来的记录：滚动可见，且焦点落回那一行', async (ctx) => {

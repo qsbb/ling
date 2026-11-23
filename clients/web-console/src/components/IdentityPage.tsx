@@ -111,6 +111,7 @@ export function mergeCandidates(
 function PersonRow({
   subject,
   mergedMemberCount,
+  mergedMemberAccountCount,
   mergedIntoName,
   sameNameRows,
   busy,
@@ -121,8 +122,10 @@ function PersonRow({
   detailOpen,
 }: {
   subject: SubjectRow;
-  /** 服务端给的"并入我名下的记录数"；已并入别人的行为 0。 */
+  /** 服务端给的"并入我名下的身份数"；已并入别人的行为 0。 */
   mergedMemberCount: number;
+  /** 那些身份一共挂了多少个账号（与身份数不同：一个身份可挂多个号）。 */
+  mergedMemberAccountCount: number;
   /** 已并入的目标姓名（本页能解析到才有）；独立的人为 `null`。 */
   mergedIntoName: string | null;
   sameNameRows: readonly SubjectRow[];
@@ -169,8 +172,21 @@ function PersonRow({
                 {mergedIntoName ? `已并入${mergedIntoName}` : '已并入另一个人'}
               </span>
             ) : mergedMemberCount > 0 ? (
+              /*
+               * 这里必须说清「身份」与「账号」是两件事。
+               *
+               * 一个被并入的身份可能挂着好几个号（QQ + OneBot + qqbot）。原来写
+               * 「已并入 N 个号」，而 N 数的是身份记录——一个身份两个号时显示
+               * 「已并入 1 个号」，详情里却能列出两个账号，两处直接打架
+               * （验收实测：badge「已并入 1 个号」/ 身份 1 / 账号 2）。
+               *
+               * 两个数相等时只说一次（`1 个身份 · 1 个账号` 有一半是废话），
+               * 不等时两个都写——那正是"并入的东西比看上去多"的时候。
+               */
               <span className="badge badge--muted" data-testid="merged-members-badge">
-                已并入 {mergedMemberCount} 个号
+                {mergedMemberAccountCount === mergedMemberCount
+                  ? `已并入 ${mergedMemberCount} 个身份`
+                  : `已并入 ${mergedMemberCount} 个身份 · ${mergedMemberAccountCount} 个账号`}
               </span>
             ) : null}
             {summary.accountCount > 0 && summary.hasUnverified ? (
@@ -581,6 +597,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
               key={subject.subject_id}
               subject={subject}
               mergedMemberCount={subject.merged_member_count ?? 0}
+              mergedMemberAccountCount={subject.merged_member_account_count ?? 0}
               mergedIntoName={null}
               sameNameRows={subjects}
               busy={busy || renameBusy}
@@ -618,6 +635,7 @@ export function IdentityPage({ onBack }: IdentityPageProps) {
                 key={row.subject_id}
                 subject={row}
                 mergedMemberCount={0}
+                mergedMemberAccountCount={0}
                 mergedIntoName={targetName}
                 sameNameRows={subjects}
                 busy={busy || renameBusy}

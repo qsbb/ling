@@ -271,7 +271,11 @@ async function main() {
     ? (await mergedTargetCard.getByTestId('merged-members-badge').innerText()).trim()
     : null;
   record('合并后目标行', { hasMembersBadge: memberBadge > 0, text: memberBadgeText });
-  if (memberBadge === 0) throw new Error('合并后目标行没有显示"已并入 N 个号"');
+  if (memberBadge === 0) throw new Error('合并后目标行没有显示并入信息');
+  // 徽标必须说清「身份」：数的是身份记录，不是账号。写成"个号"会和详情打架。
+  if (!/个身份/.test(memberBadgeText)) {
+    throw new Error(`徽标没有说明身份数（实际：${memberBadgeText}）`);
+  }
 
   /*
    * 被并入的记录在哪：列表是**按主体**返回的，成员行只在它自己落在结果集里时

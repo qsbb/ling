@@ -1506,6 +1506,13 @@ class SubjectRow(StrictModel):
     # 全量记录——那正是关系页卡死的成因。计数只回答"有几个"，明细留给详情接口
     # （它本来就按整组返回账号）。
     merged_member_count: int = Field(default=0, ge=0)
+    # 被并入的那些身份**一共挂了多少个账号**。
+    #
+    # 为什么两个数都要：一个被并入的身份可能挂好几个号（QQ + OneBot + qqbot）。
+    # 只给身份数时，界面上的「已并入 1 个号」会和详情里"并入了两个账号"打架
+    # （实测被验收抓到：badge「已并入 1 个号」/ mergedSubjects 1 / mergedAccounts 2）。
+    # 身份与账号是一对多，两个数不能互相推导——必须都给。
+    merged_member_account_count: int = Field(default=0, ge=0)
 
 
 class SubjectsPage(StrictModel):

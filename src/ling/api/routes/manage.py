@@ -1318,8 +1318,12 @@ def _account_row(a: object) -> dict:
     }
 
 
-async def _merged_member_counts(session: DbSession, subject_ids: list[str]) -> dict[str, int]:
-    """这一页每个 subject 被多少个身份**并入**（一条 `GROUP BY`，与账号无关）。
+async def _merged_member_counts(
+    session: DbSession, subject_ids: list[str]
+) -> dict[str, tuple[int, int]]:
+    """这一页每个 subject 被**几个身份**并入，以及这些身份一共挂**几个账号**。
+
+    返回 ``{target_id: (身份数, 账号数)}``，一条 `GROUP BY` 同时算出两个数。
 
     ## 计数为什么必须由服务端给
 
@@ -1336,23 +1340,45 @@ async def _merged_member_counts(session: DbSession, subject_ids: list[str]) -> d
     与其用一条更复杂的 SQL 换一个更好看的数字，不如老实承认这里多了一次聚合，
     并在 `test_manage_subjects_paging.py` 里把预算与理由一起写清。
 
+    ## 为什么同时给账号数
+
+    一个被并入的身份可能挂着好几个号（QQ + OneBot + qqbot）。只给"身份数"时，
+    界面上的「已并入 1 个号」会和详情里"并入了两个账号"直接打架——实测被验收
+    抓到（`badge="已并入 1 个号"`, `mergedSubjects=1`, `mergedAccounts=2`）。
+    两个数一起返回，界面才能说清"几个身份、几个账号"。
+
+    **账号数用 `COUNT(DISTINCT actor_accounts.id)`**：身份与账号是一对多，
+    直接 `COUNT` 会把"一个身份两个号"算成两行账号、又把这个行的身份数也放大，
+    两个数都会错。`DISTINCT` 是这条 JOIN 的正确性前提，不是优化。
+
     多级合并（A→B→C）只数直接指向本行的记录，与"拆开这一行能看到几条"一致。
     成环的历史脏数据不会让这里死循环——它只是一次 `GROUP BY`。
     """
     from sqlalchemy import func, select
 
-    from ling.infra.models import Subject
+    from ling.infra.models import ActorAccount, Subject
 
     if not subject_ids:
         return {}
-    rows = (
-        await session.execute(
-            select(Subject.merged_into, func.count())
-            .where(Subject.merged_into.in_(subject_ids))
-            .group_by(Subject.merged_into)
+    members = (
+        select(
+            Subject.merged_into.label("target_id"),
+            func.count(func.distinct(Subject.id)).label("member_count"),
+            func.count(func.distinct(ActorAccount.id)).label("account_count"),
         )
-    ).all()
-    return {target: int(count) for target, count in rows if target is not None}
+        .select_from(Subject)
+        .outerjoin(ActorAccount, ActorAccount.subject_id == Subject.id)
+        .where(Subject.merged_into.in_(subject_ids))
+        .group_by(Subject.merged_into)
+    )
+    rows = (await session.execute(members)).all()
+    # 目标里混进了本页 id 之外的脏数据时不要静默收下：只回本页出现的那些。
+    requested = set(subject_ids)
+    return {
+        target: (int(member_count), int(account_count))
+        for target, member_count, account_count in rows
+        if target is not None and target in requested
+    }
 
 
 async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> dict[str, list[dict]]:
@@ -1383,11 +1409,12 @@ async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> di
 def _subject_row(
     s: Subject,
     by_subject: dict[str, list[dict]],
-    merged_counts: dict[str, int],
+    merged_counts: dict[str, tuple[int, int]],
     *,
     operator: bool,
 ) -> dict:
     """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
+    member_count, member_account_count = merged_counts.get(s.id, (0, 0))
     return {
         "subject_id": s.id,
         "display_name": s.display_name,
@@ -1395,7 +1422,8 @@ def _subject_row(
         "merged_into": s.merged_into,
         "can_rename": operator and s.merged_into is None,
         "accounts": by_subject.get(s.id, []),
-        "merged_member_count": merged_counts.get(s.id, 0),
+        "merged_member_count": member_count,
+        "merged_member_account_count": member_account_count,
     }
 
 

@@ -1713,6 +1713,13 @@ export interface SubjectRow {
    * 成员明细由详情接口按整组返回。
    */
   merged_member_count?: number;
+  /**
+   * 那些身份一共挂了多少个**账号**。
+   *
+   * 与 `merged_member_count` 不是一回事：一个被并入的身份可能挂好几个号。
+   * 只有身份数时，界面写「已并入 1 个号」会和详情里的账号数打架。
+   */
+  merged_member_account_count?: number;
 }
 
 /**
