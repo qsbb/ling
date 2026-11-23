@@ -25,9 +25,11 @@ import type {
   MemoryInclude,
   MemoryListResponse,
   MemoryRecord,
+  SleepReviewsResponse,
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { MemoryImportPanel } from './MemoryImport';
+import { SleepReviewSection } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
 
@@ -629,10 +631,17 @@ export interface Notice {
 
 /* ==================================================================== 页头与 tab */
 
-export type MemoryTab = 'content' | 'core' | 'settings' | 'privacy';
+/**
+ * 记忆页的分区。
+ *
+ * `review` 是**夜间回顾**：和记忆库取的是同一批记忆，但时间口径不同
+ * （那晚窗口内 vs 当前有效），所以单列一栏而不是塞进列表。见 `SleepReview.tsx`。
+ */
+export type MemoryTab = 'content' | 'review' | 'core' | 'settings' | 'privacy';
 
 const MEMORY_TABS: Array<{ id: MemoryTab; label: string }> = [
   { id: 'content', label: '记忆库' },
+  { id: 'review', label: '夜间回顾' },
   { id: 'core', label: '核心记忆' },
   { id: 'settings', label: '学习设置' },
   { id: 'privacy', label: '隐私与清理' },
@@ -649,7 +658,7 @@ export function memoryTabFromHref(href: string): MemoryTab {
   const path = rawPath.replace(/\/+$/, '') || '/';
   const params = new URLSearchParams(rawQuery);
   const tab = params.get('tab');
-  if (tab === 'core' || tab === 'settings' || tab === 'privacy') return tab;
+  if (tab === 'core' || tab === 'settings' || tab === 'privacy' || tab === 'review') return tab;
   if (path === '/settings/memory') return 'settings';
   return 'content';
 }
@@ -1990,6 +1999,9 @@ export interface MemoryContentBodyProps {
   tab?: MemoryTab;
   core: SectionState<CoreMemoryListResponse>;
   list: SectionState<MemoryListResponse>;
+  /** 夜间回顾。与记忆库分开取数：回顾读失败不该连带列表也空掉。 */
+  review?: SectionState<SleepReviewsResponse>;
+  onReloadReview?: () => void;
   include: MemoryInclude | null;
   flags: TombstoneFlags;
   onFlagsChange: (flags: TombstoneFlags) => void;
@@ -2024,6 +2036,8 @@ export function MemoryContentBody({
   tab = 'content',
   core,
   list,
+  review = loadingSection<SleepReviewsResponse>(),
+  onReloadReview = () => {},
   include,
   flags,
   onFlagsChange,
@@ -2080,6 +2094,9 @@ export function MemoryContentBody({
           onCloseImport={onCloseImport}
         />
       </div>
+      <div hidden={tab !== 'review'}>
+        <SleepReviewSection state={review} onReload={onReloadReview} />
+      </div>
       <div hidden={tab !== 'core'}>
         <CoreMemorySection state={core} handlers={handlers} onReload={handlers.reloadCore} />
       </div>
@@ -2103,6 +2120,7 @@ export function MemoryContentBody({
 export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.ReactElement {
   const [core, setCore] = useState<SectionState<CoreMemoryListResponse>>(loadingSection<CoreMemoryListResponse>());
   const [list, setList] = useState<SectionState<MemoryListResponse>>(loadingSection<MemoryListResponse>());
+  const [review, setReview] = useState<SectionState<SleepReviewsResponse>>(loadingSection<SleepReviewsResponse>());
   const [flags, setFlags] = useState<TombstoneFlags>({ retracted: false, archived: false });
   const [limit, setLimit] = useState<number>(50);
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_FILTERS);
@@ -2120,6 +2138,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   latestQuery.current = { limit, include, source, q: query };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
+  const reviewRequest = useRef(0);
   // 翻页要读"此刻已取回多少条"，但 `loadMore` 不想因此每次列表变化就换身份
   // （换了身份，调用方传下去的回调也跟着变）。
   const listRef = useRef(list);
@@ -2249,6 +2268,35 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   }, [query]);
 
 
+  /**
+   * 取夜间回顾。
+   *
+   * 和列表各自记账（`reviewRequest`）：两个分区的请求互不取消。切到别的分区
+   * 再切回来会重新取一次——服务端每次重新验证来源，撤回/纠正过的条目会消失，
+   * 拿着上次的结果展示会让用户看到已经不该看的话。
+   */
+  const loadReview = useCallback(async () => {
+    const requestId = ++reviewRequest.current;
+    setReview((current) => (current.data ? current : loadingSection<SleepReviewsResponse>()));
+    try {
+      const data = await api.sleepReviews();
+      if (requestId !== reviewRequest.current) return;
+      setReview({ status: 'ok', data, error: null });
+    } catch (cause) {
+      if (requestId !== reviewRequest.current) return;
+      // 失败不写进列表/核心的 notice：这一块自己的失败在这个块里说清楚。
+      setReview({ status: 'error', data: null, error: explainError(cause) });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === 'review') void loadReview();
+  }, [loadReview, tab]);
+
+  const reviewReload = useCallback(() => {
+    void loadReview();
+  }, [loadReview]);
+
   const handlers: MemoryHandlers = useMemo(
     () => ({
       async retract(memoryId, reason) {
@@ -2357,6 +2405,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       tab={tab}
       core={core}
       list={list.data && (list.data.limit !== limit || list.data.include !== include) ? loadingSection() : list}
+      review={review}
+      onReloadReview={reviewReload}
       include={include}
       flags={flags}
       onFlagsChange={setFlags}

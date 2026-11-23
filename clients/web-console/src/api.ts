@@ -71,6 +71,7 @@ import type {
   LogsResponse,
   RecallProposal,
   RecallResult,
+  SleepReviewsResponse,
   VoiceReferenceUpload,
 } from './types';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from './relationshipDetail';
@@ -1462,6 +1463,22 @@ export const api = {
   /** 最近的清理记录：`{items: [...]}`，按时间倒序；没配信号 = 不取消。 */
   purgeStatus(signal?: AbortSignal): Promise<PurgeStatusResponse> {
     return request('/v1/memory/purge/status', {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  },
+
+  /**
+   * 夜间回顾（`GET /v1/memory/sleep-review`）。
+   *
+   * 只返回**当前自然人**的回顾，身份由同源登录 Cookie 决定，所以这里不传
+   * 任何 subject 参数——传了也只能是"我"，多一个参数只会让人以为可以看别人的。
+   *
+   * `cache: 'no-store'`：服务端每次重新验证来源，撤回/纠正/过期/失权的条目
+   * 会消失。命中缓存等于把已经不该看的那句话继续展示出来。
+   */
+  sleepReviews(signal?: AbortSignal): Promise<SleepReviewsResponse> {
+    return request<SleepReviewsResponse>('/v1/memory/sleep-review', {
       cache: 'no-store',
       ...(signal ? { signal } : {}),
     });
