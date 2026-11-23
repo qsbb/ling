@@ -19,13 +19,6 @@ _MAX_RESPONSE = 256 * 1024
 _RESULTS = 3
 _PAGE_EXCERPT_CHARS = 1800
 _COMMAND = re.compile(r"^(?:/search(?:$|[\s:：])|搜索\s*[:：])", re.IGNORECASE)
-_REQUEST = re.compile(
-    r"^(?:/search(?:\s+|[:：])|搜索(?:\s+|[:：])|(?:请你?|能不能|能否|能|可以|麻烦)?"
-    r"(?:(?:帮我|给我|替我)?(?:上网|联网|在网上)(?:搜索|搜一下|搜|查一下|查)|"
-    r"(?:帮我|给我|替我)(?:搜索一下|搜索|搜一下|搜个|搜一搜|搜)|"
-    r"搜索一下|搜一下|搜个|搜一搜)\s*[:：]?\s*)(?P<query>.+)$",
-    re.IGNORECASE,
-)
 
 
 def has_explicit_search_command(user_text: str) -> bool:
@@ -34,38 +27,60 @@ def has_explicit_search_command(user_text: str) -> bool:
 
 
 def explicit_search_query(user_text: str) -> str | None:
-    """No historical messages, model-composed query, or implicit lookup."""
+    """Parse the deliberate slash or colon command."""
     text = user_text.strip()
-    if len(text.splitlines()) != 1:
-        return None
-    match = _REQUEST.fullmatch(text)
-    if not match:
-        return None
-    query = match["query"].strip()
-    if not has_explicit_search_command(text) and query.startswith(
-        ("是什么意思", "什么意思", "怎么用", "有什么用")
-    ):
-        return None  # 在讨论这个说法，而不是要查询一个主题。
-    return query if 0 < len(query) <= _MAX_QUERY else None
+    command = _COMMAND.match(text)
+    return _query_text(text[command.end():]) if command else None
 
 
-def register_web_search(registry: ToolRegistry, *, key: str, query: str) -> None:
+def _query_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not 0 < len(text) <= _MAX_QUERY or any(ord(char) < 32 for char in text):
+        return None
+    return text
+
+
+def register_web_search(
+    registry: ToolRegistry, *, key: str, query: str | None = None, user_text: str = "",
+) -> None:
     result: str | None = None
+    sent_query: str | None = None
 
     async def search(args: dict[str, object]) -> str:
-        nonlocal result
-        if args:
-            raise ValueError("网页搜索只使用用户明确输入的查询词，不接受额外参数")
-        if result is None:
-            result = await _search(key, query)
+        nonlocal result, sent_query
+        selected: str | None
+        if query is not None:
+            if args:
+                raise ValueError("本次搜索已指定查询词")
+            selected = query
+        else:
+            selected = _query_text(args.get("query"))
+            if selected is None or selected not in user_text:
+                raise ValueError("请从用户当前消息中原样摘取查询词")
+        if sent_query is not None:
+            if selected == sent_query and result is not None:
+                return result
+            raise ValueError("这一轮已经查询过一次")
+        sent_query = selected
+        result = await _search(key, selected)
         return result
 
+    parameters: dict[str, object] = {"type": "object", "properties": {}, "additionalProperties": False}
+    if query is None:
+        parameters["properties"] = {
+            "query": {"type": "string", "minLength": 1, "maxLength": _MAX_QUERY},
+        }
+        parameters["required"] = ["query"]
+    query_help = "本次查询词由用户指定，无需参数。" if query else "query 要从当前用户消息中原样摘取。"
     registry.register(
         ToolSpec(
             tool_id=WEB_SEARCH_TOOL_ID,
             version="1.0.0",
             description=(
-                "使用用户这条消息里的查询词搜索公开网页，并尝试读取第一条结果的正文，无需参数。"
+                "查询需要公网资料才能回答的问题，并尝试读取第一条结果的正文。"
+                f"{query_help}"
                 "有正文时引用实际读到的来源链接；只拿到摘要时说明依据是搜索摘要。"
             ),
             risk=ToolRisk.read_only,
@@ -74,7 +89,7 @@ def register_web_search(registry: ToolRegistry, *, key: str, query: str) -> None
             timeout_seconds=14,
             model_callable=True,
             model_result_chars=7000,
-            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            input_schema=parameters,
         ),
         search,
     )

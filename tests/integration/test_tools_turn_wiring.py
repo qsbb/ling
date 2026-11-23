@@ -415,7 +415,7 @@ async def _add_knowledge(
         return item.item_id
 
 
-@pytest.mark.parametrize("availability", ["readable", "blocked", "sealed"])
+@pytest.mark.parametrize("availability", ["readable", "local_tool", "unrelated_query", "blocked", "sealed"])
 async def test_explicit_public_search_in_the_web_tool_loop(
     logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch, availability: str,
 ) -> None:
@@ -446,10 +446,19 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     endpoint.tool_name = "web_search"
     endpoint.arguments = {}
     await _bind_model(logged_in, enabled=True)
+    native = availability in {"readable", "local_tool", "unrelated_query"}
+    normal_tools = ("clock_now", "knowledge_search", "web_search")
+    if native:
+        endpoint.arguments = {"query": "公开资料"}
+    if availability == "local_tool":
+        endpoint.tool_name = "clock_now"
+        endpoint.arguments = {"tz": "Asia/Shanghai"}
+    elif availability == "unrelated_query":
+        endpoint.arguments = {"query": "旧消息里的任何号码"}
     if availability == "sealed":
         changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
         assert changed.status_code == 200
-    text = "帮我上网查一下公开资料" if availability == "readable" else "搜索：公开资料"
+    text = "公开资料中的开放日期是几号？" if native else "搜索：公开资料"
     reply = await _web_reply(logged_in, text=text)
     if availability == "sealed":
         assert requests == []
@@ -457,14 +466,20 @@ async def test_explicit_public_search_in_the_web_tool_loop(
         assert endpoint.requests == []
         assert "非密封" in reply
         return
+    if availability in {"local_tool", "unrelated_query"}:
+        assert not requests and not opened
+        choice = _tool_payload(endpoint, available=normal_tools)
+        assert choice["outcome"] == ("succeeded" if availability == "local_tool" else "failed")
+        return
 
     request, = requests
     assert request.url.host == "api.search.brave.com"
     assert dict(request.url.params) == {"q": "公开资料", "count": "3"}
     assert request.headers["X-Subscription-Token"] == key
     assert opened == [article] and key not in json.dumps(endpoint.requests)
-    payload = _tool_payload(endpoint, available=("web_search",))
-    assert [request["tool_choice"] for request in endpoint.requests] == ["required", "none"]
+    payload = _tool_payload(endpoint, available=normal_tools if native else ("web_search",))
+    choices = [request["tool_choice"] for request in endpoint.requests]
+    assert choices == (["auto", "auto"] if native else ["required", "none"])
     assert payload["content_trust"] == "data_not_instructions"
     assert payload["untrusted"] is True
     data = json.loads(payload["data"])

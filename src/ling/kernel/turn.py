@@ -3197,6 +3197,7 @@ class TurnCoordinator:
                 "当前对话模型没启用原生工具。请确认模型支持工具后，在供应商设置中启用并发布。",
             )
         explicit_tool_id = ""
+        external_tool_ids: set[str] = set()
         if registry is None:
             media_callback = self._watch_video
             if media_callback is None and window_id:
@@ -3230,11 +3231,17 @@ class TurnCoordinator:
                     return unavailable("plugin_not_enabled", "找不到这个已启用的插件，操作未执行。")
                 register_tool_plugin(registry, plugin, text=text)
                 explicit_tool_id = plugin.tool_id
+            elif (
+                audience is not None and not audience.is_group and audience.mode is not IsolationMode.sealed
+                and self._settings is not None and self._settings.brave_search_api_key
+                and attempt == 1 and user_text.strip()
+            ):
+                register_web_search(registry, key=self._settings.brave_search_api_key, user_text=user_text)
+                external_tool_ids.add(WEB_SEARCH_TOOL_ID)
         elif explicit_request:
             return unavailable("no_explicit_tool", "当前没有开放此工具，操作未执行。")
         # external_tool_defs 由 async 调用方预先收集（spec + handler），
         # 在本轮的 registry 上同步注册，避免污染全局默认注册表。
-        external_tool_ids: set[str] = set()
         if registry is not None and not explicit_tool_id:
             name_counts = Counter(spec.tool_id for spec, _ in external_tool_defs)
             for spec, handler in external_tool_defs:
