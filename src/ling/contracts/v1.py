@@ -1060,6 +1060,35 @@ class MemoryProposal(StrictModel):
     valid_until: datetime | None = None
 
 
+class SleepReviewSource(StrictModel):
+    speaker: str
+    text: str
+    truncated: bool
+
+
+class SleepReviewItem(StrictModel):
+    memory_id: str
+    text: str
+    window_id: str
+    turn_id: str
+    original: list[SleepReviewSource]
+
+
+class SleepReviewNight(StrictModel):
+    sleep_date: date
+    consolidation_state: Literal["ok", "skipped", "failed"]
+    reason: str
+    groups_merged: int
+    rows_archived: int
+    review_status: Literal["ready", "empty", "unavailable"]
+    items: list[SleepReviewItem]
+
+
+class SleepReviewsOut(StrictModel):
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    nights: list[SleepReviewNight] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 生活时间轴（只读）
 
 # 这一组是**只读投影**的契约（设计 §7）：`GET /v1/life/timeline` 与

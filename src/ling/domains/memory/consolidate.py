@@ -4,8 +4,8 @@
 
 「睡眠的时候应该要对记忆进行压缩或者什么样的，你可以让 Codex 设计一下」
 
-设计见 `docs/SLEEP-MEMORY-CONSOLIDATION.md`。本模块是它的第一版实现：
-**只做确定性整理**，不调模型、不生成摘要文本。
+设计见 `docs/SLEEP-MEMORY-CONSOLIDATION.md`。整理采用确定性规则。
+夜间回顾保存原有记忆的索引，读取时取当前仍有效的摘录和原话。
 
 ## 为什么第一版刻意不用模型
 
@@ -17,8 +17,7 @@
 - 按**全部受众边界**分组（主体/可见范围/来源窗口/origin），保证合并不会
   把群里的内容洗进私聊、不会把推断洗成用户的陈述。
 
-真正需要模型的"把这一天浓缩成一句话"留到以后——那时必须新增一个明确标注
-"非事实、不可直接断言"的存储，而不是复用记忆行。
+夜间回顾独立于自动召回，沿用现有记忆和原话的有效期及受众。
 
 ## 为什么挂在睡眠窗口而不是每日定时
 
@@ -39,6 +38,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import MemoryConsolidationRow, utcnow
@@ -75,6 +75,7 @@ async def consolidate_night(
     subject_id: str,
     sleep_date: date,
     now: datetime | None = None,
+    review_bedtime: datetime | None = None,
 ) -> ConsolidationOutcome:
     """整理某一晚的记忆。**幂等**：同一 (actor, subject, sleep_date) 只做一次。
 
@@ -89,15 +90,27 @@ async def consolidate_night(
 
     moment = now or utcnow()
 
-    existing = (
-        await session.execute(
-            select(MemoryConsolidationRow).where(
-                MemoryConsolidationRow.actor_id == actor_id,
-                MemoryConsolidationRow.subject_id == subject_id,
-                MemoryConsolidationRow.sleep_date == sleep_date,
-            )
+    lookup = select(MemoryConsolidationRow).where(
+        MemoryConsolidationRow.actor_id == actor_id,
+        MemoryConsolidationRow.subject_id == subject_id,
+        MemoryConsolidationRow.sleep_date == sleep_date,
+    )
+    existing = await session.scalar(lookup)
+    if existing is None:
+        row = MemoryConsolidationRow(
+            id=new_id("cons"), actor_id=actor_id, subject_id=subject_id, sleep_date=sleep_date,
+            state=STATE_SKIPPED, reason="", created_at=moment,
         )
-    ).scalar_one_or_none()
+        try:
+            async with session.begin_nested():
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            existing = await session.scalar(lookup)
+            if existing is None:
+                raise
+    else:
+        row = existing
     if existing is not None:
         # 这一晚已经整理过（含 skipped/failed）。**不重试**：
         # 失败重试会把"整理到一半"的状态反复覆盖，而归档是幂等的，
@@ -110,27 +123,12 @@ async def consolidate_night(
             already_done=True,
         )
 
-    row = MemoryConsolidationRow(
-        id=new_id("cons"),
-        actor_id=actor_id,
-        subject_id=subject_id,
-        sleep_date=sleep_date,
-        state=STATE_SKIPPED,
-        reason="",
-        created_at=moment,
-    )
-    session.add(row)
-    await session.flush()
-
     try:
-        service = MemoryService(
-            session, policy=await published_memory_policy(session)
-        )
-        policy = service.policy
-        # **按人整理**：只动本主体的记忆。分组键里虽有 subject_id（不会跨
-        # 主体合并），但那不等于"只处理这一个"——不加 scoped 过滤，给 A
-        # 整理的一晚会把 B 的记忆也归档（实测复现）。
-        result = await service.compact_low_value(now=moment, subject_id=subject_id)
+        async with session.begin_nested():
+            service = MemoryService(session, policy=await published_memory_policy(session))
+            policy = service.policy
+            # 归档范围是当前主体。
+            result = await service.compact_low_value(now=moment, subject_id=subject_id)
         groups = int(result.get("groups", 0) or 0)
         archived = int(result.get("archived", 0) or 0)
     except Exception as exc:  # noqa: BLE001 - 整理失败不能拖垮睡眠调度
@@ -143,6 +141,13 @@ async def consolidate_night(
         logger.warning("睡眠期记忆整理失败 subject=%s：%s", subject_id, type(exc).__name__)
         return ConsolidationOutcome(state=STATE_FAILED, reason=row.reason)
 
+    if review_bedtime is not None and review_bedtime.tzinfo and review_bedtime <= moment:
+        from ling.domains.memory.sleep_review import capture_review_ids
+
+        # 索引与归档在同一事务提交。索引异常时让 outbox 正常重试。
+        row.review_memory_ids = await capture_review_ids(
+            session, actor_id=actor_id, subject_id=subject_id, bedtime=review_bedtime, now=moment,
+        )
     row.finished_at = moment
     row.groups_merged = groups
     row.rows_archived = archived

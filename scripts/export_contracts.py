@@ -37,6 +37,7 @@ EXPORTED = [
     "OperationResult",
     "DeliveryReceipt",
     "MemoryProposal",
+    "SleepReviewsOut",
     "ErrorResponse",
     # 只读生活时间轴（设计 §7）：双时区、段/事实分层、未来意向与梦卡片。
     # 仪表盘两块摘要（today_outline / intent_teaser）也在这一组里。

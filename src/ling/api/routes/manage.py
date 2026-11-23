@@ -28,6 +28,7 @@ from ling.contracts.v1 import (
     ErrorCode,
     MemoryProposal,
     Origin,
+    SleepReviewsOut,
     Visibility,
 )
 from ling.domains.activity.service import ActivityService, InvalidTransition
@@ -160,6 +161,19 @@ async def list_memory(
         "include": include,
         "note": "默认只含未撤回且未归档的记忆；墓碑用 ?include=retracted|archived|all 取回",
     }
+
+
+@router.get("/memory/sleep-review")
+async def sleep_review(auth: CurrentAuth, session: DbSession, settings: SettingsDep) -> SleepReviewsOut:
+    """Read recent private nightly recaps with the current evidence."""
+    from ling.domains.memory.sleep_review import read_sleep_reviews
+    from ling.kernel.audience import AudienceSnapshot
+    from ling.settings.service import published_memory_policy
+
+    return await read_sleep_reviews(
+        session, actor_id=settings.actor_id, subject_id=auth.user.subject_id,
+        policy=await published_memory_policy(session), audience_type=AudienceSnapshot,
+    )
 
 
 @router.post("/memory")
