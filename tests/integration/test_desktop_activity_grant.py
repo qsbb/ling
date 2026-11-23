@@ -1,6 +1,9 @@
 """Run approved Notepad activities from the real life worker to its fact view."""
 
+import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -9,7 +12,10 @@ from sqlalchemy import select
 from ling import worker
 from ling.api.routes import desktop
 from ling.infra.db import session_scope
-from ling.infra.models import ActivityRow, ScheduleSegmentRow
+from ling.infra.models import ActivityRow, Persona, ScheduleSegmentRow
+from ling.kernel.desktop_activity import AUTONOMY_TOPIC
+from ling.models.router import StreamOutcome
+from ling.ports.model import ModelChunk
 from tests.integration.test_activity_boundaries import DAY, _at, _freeze, _seed_day, _seed_routine
 from tests.integration.test_desktop_tasks import PATH, POLL, _claim, _report
 from tests.integration.test_desktop_tasks import linked as linked
@@ -17,7 +23,10 @@ from tests.integration.test_desktop_tasks import linked as linked
 pytestmark = pytest.mark.w0_web
 
 
-@pytest.mark.parametrize("outcome", ["verified", "rest", "revoked", "expired", "locked", "mismatch"])
+@pytest.mark.parametrize("outcome", [
+    "verified", "rest", "chose_rest", "invalid", "revoked", "revoked_during_choice",
+    "changed_during_choice", "expired", "locked", "mismatch",
+])
 async def test_life_worker_spends_one_grant_and_records_only_verified_activity(
     linked, monkeypatch: pytest.MonkeyPatch, outcome: str,
 ) -> None:
@@ -27,14 +36,43 @@ async def test_life_worker_spends_one_grant_and_records_only_verified_activity(
     monkeypatch.setattr(desktop, "utcnow", lambda: clock)
     ids = await _seed_day()
     await _seed_routine()
+    persona_text = "你喜欢在上午写短文，也会按自己的状态安排休息。"
     async with session_scope() as session:
         segment = await session.get(ScheduleSegmentRow, ids["work"])
         assert segment is not None
         segment.kind = "rest" if outcome == "rest" else "hobby"
+        persona_id = worker.get_settings().persona_id
+        persona = await session.get(Persona, persona_id)
+        if persona is None:
+            session.add(Persona(id=persona_id, system_prompt=persona_text))
+        else:
+            persona.system_prompt = persona_text
 
     request_id = str(uuid4())
     note = "今夜记下三颗星\n春天要去天台。"
     expires = clock + timedelta(seconds=8 if outcome == "expired" else 120)
+    monkeypatch.setattr(worker, "refresh_memory_router_if_stale", AsyncMock())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[list] = []
+    paused_choice = outcome in {"revoked_during_choice", "changed_during_choice"}
+
+    async def stream(config, *, profile, messages, **kwargs):
+        assert profile == "dialogue.fast" and kwargs["allow_fallback"] is False
+        assert note not in str(messages)
+        assert persona_text in messages[1].content
+        calls.append(messages)
+        if paused_choice:
+            started.set()
+            await release.wait()
+        output = {
+            "chose_rest": '{"action":"rest"}',
+            "invalid": "我去写一段吧",
+        }.get(outcome, '{"action":"write"}')
+        yield ModelChunk(delta=output), StreamOutcome()
+        yield ModelChunk(done=True), StreamOutcome(text=output)
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", SimpleNamespace(stream=stream))
     body = {
         "request_id": request_id,
         "start_at": (clock - timedelta(seconds=10)).isoformat(),
@@ -47,10 +85,33 @@ async def test_life_worker_spends_one_grant_and_records_only_verified_activity(
     assert (await companion.post(POLL, json={"ready": True})).json() == {"task": None}
     await worker.handle_life_tick({})
     await worker.handle_life_tick({})
+    pending = (await owner.get(f"{PATH}/autonomy")).json()["grant"]
+    assert pending["decision"] == ("rest" if outcome == "rest" else "deciding")
+    assert (await owner.get(PATH)).json()["tasks"] == [] and calls == []
+    drain = asyncio.create_task(worker.drain_outbox(only_topic=AUTONOMY_TOPIC))
+    if paused_choice:
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            if outcome == "revoked_during_choice":
+                revoked = await asyncio.wait_for(owner.delete(f"{PATH}/autonomy"), timeout=3)
+                assert revoked.json()["grant"]["decision"] == "revoked"
+            else:
+                async with session_scope() as session:
+                    leaf = await session.get(ScheduleSegmentRow, ids["work"])
+                    assert leaf is not None
+                    leaf.kind = "work"
+        finally:
+            release.set()
+    assert await asyncio.wait_for(drain, timeout=8) == int(outcome != "rest")
+    assert len(calls) == int(outcome != "rest")
     state = (await owner.get(f"{PATH}/autonomy")).json()["grant"]
-    assert state["decision"] == ("rest" if outcome == "rest" else "queued")
+    decision = {
+        "rest": "rest", "chose_rest": "rest", "invalid": "unavailable",
+        "revoked_during_choice": "revoked", "changed_during_choice": "unavailable",
+    }.get(outcome, "queued")
+    assert state["decision"] == decision
 
-    if outcome == "rest":
+    if decision != "queued":
         assert await _claim(companion) is None
         assert (await owner.get(PATH)).json()["tasks"] == []
     else:
