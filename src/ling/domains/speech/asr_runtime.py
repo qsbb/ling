@@ -175,6 +175,8 @@ async def _process_audio(
                 await evidence.ensure_description_authorized(item["evidence_id"], window_id=job.window_id)
             except MediaEvidenceError as exc:
                 raise TranscriptionError("audio_unavailable", "原语音已过期或无法读取") from exc
+            if payload.get("quoted_voice"):
+                await check_access(app, session, job)
             raw = None
 
     if raw is None:

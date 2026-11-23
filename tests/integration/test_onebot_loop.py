@@ -1279,6 +1279,7 @@ async def test_private_quote_transcribes_the_selected_old_voice_and_reuses_it(
         assert snapshot is not None
         quote, = [item for item in snapshot.payload["messages"] if item["lane"] == "quote"]
         assert transcripts[older_ref] in quote["content"]
+        assert snapshot.payload["context"]["reply_reference"] == "voice"
         old_audio = await session.get(MediaEvidenceRow, evidence_ids["old"])
         assert old_audio is not None
         old_audio.expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -1301,12 +1302,14 @@ async def test_private_quote_transcribes_the_selected_old_voice_and_reuses_it(
 
 @pytest.mark.parametrize(("boundary", "reason", "state", "note"), [
     ("recall", "cancelled", "cancelled", "引用的那条语音已被撤回"),
+    ("recall_before_download", "cancelled", "cancelled", "引用的那条语音已被撤回"),
     ("revoked", "forbidden", "cancelled", "需要先开启对入站语音的识别授权"),
     ("expired", "audio_unavailable", "failed", "当前没有可用的引用语音转写"),
 ])
 async def test_private_quote_rechecks_audio_before_downloading(
     logged_in: TestEnv, monkeypatch, boundary: str, reason: str, state: str, note: str,
 ) -> None:
+    from ling.domains.media.service import MediaEvidenceService
     from ling.domains.speech.asr_runtime import process_job
 
     _install(logged_in, FakeOneBot())
@@ -1323,11 +1326,22 @@ async def test_private_quote_rechecks_audio_before_downloading(
         job_id = await session.scalar(select(AsrJob.id))
         assert job_id
 
-    if boundary == "recall":
+    async def recall_original() -> None:
         recalled = (await _post(logged_in, _event_body(
             post_type="notice", notice_type="friend_recall", message_id=810,
         ))).json()
         assert recalled["accepted"], recalled
+
+    if boundary == "recall":
+        await recall_original()
+    elif boundary == "recall_before_download":
+        check_evidence = MediaEvidenceService.ensure_description_authorized
+
+        async def check_then_recall(self, evidence_id, *, window_id):
+            await check_evidence(self, evidence_id, window_id=window_id)
+            await recall_original()
+
+        monkeypatch.setattr(MediaEvidenceService, "ensure_description_authorized", check_then_recall)
     elif boundary == "revoked":
         await _grant_inbound(logged_in, granted=False)
     else:

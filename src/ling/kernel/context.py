@@ -603,7 +603,8 @@ class ContextCompiler:
         nearby = history_scope in {"nearby", "greeting"}
         compiled_meta["history_scope"] = history_scope
         if reply_reference is not None:
-            compiled_meta["reply_reference"] = quoted.role if quoted else "unresolved"
+            target = quoted.role if quoted else "unresolved"
+            compiled_meta["reply_reference"] = "voice" if reply_reference.voice_text else target
 
         # 她**现在还真撤得动**的那几条：本地消息 id → 撤回短号。
         #
