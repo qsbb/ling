@@ -762,7 +762,7 @@ describe('TimelineTrack 单独渲染', () => {
         segments: [orphan],
         bySegment: new Map(),
         timeZone: DISPLAY_TZ,
-        timeline: { display_date: '2026-11-08', display_timezone: DISPLAY_TZ },
+        timeline: timeline(),
         now: NOW,
       }),
     );

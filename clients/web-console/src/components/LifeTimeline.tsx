@@ -310,52 +310,45 @@ const ACTIVITY_KIND: Record<string, string> = {
   exercising: '运动',
 };
 
-const dayKeyFormatter = (timeZone: string) =>
-  new Intl.DateTimeFormat('en-CA', {
-    timeZone: safeTimeZone(timeZone),
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
+type DisplayWindow = Pick<LifeTimelineOut, 'display_window_start_at' | 'display_window_end_at'>;
 
-/** 某时刻在展示时区里属于哪一天（用于判断跨午夜）。 */
-export function zoneDayKey(value: string | null | undefined, timeZone: string): string {
-  const date = toDate(value);
-  if (!date) return '';
-  return dayKeyFormatter(timeZone).format(date);
+interface VisibleRange {
+  start: string | null;
+  end: string | null;
+  crossesForward: boolean;
+  crossesBackward: boolean;
+  endsAtWindowEnd: boolean;
 }
 
 /**
  * 一条记录在**展示窗口内**能看见的区间。
  *
  * 跨午夜时不再给出 `23:30–01:30` 这种回绕读数：今天这一侧裁到当日 24:00，
- * 星期一侧从 00:00 起。真实起止由调用方另外给出。
+ * 跨入今天的一侧从窗口起点起算。真实起止由调用方另外给出。
  */
 export function visibleRange(
   fact: Pick<LifeTimelineFact, 'started_at' | 'ended_at'>,
-  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>,
-): { start: string | null; end: string | null; crossesForward: boolean; crossesBackward: boolean } {
-  const zone = timeline.display_timezone;
-  const day = timeline.display_date;
-  // 没有结束时刻 = **时间点**：它不是区间，不参与跨午夜裁剪。
-  // 这一条必须排在算 dayKey 之前——拿 `started_at` 去和"没有的"结束时刻比日期，
-  // 会让一条未结束的活动被当成跨天区间，显示成 `16:00–08:40` 这种回绕读数。
-  if (!fact.ended_at) {
-    return { start: fact.started_at, end: null, crossesForward: false, crossesBackward: false };
+  timeline: DisplayWindow,
+): VisibleRange {
+  const start = toDate(fact.started_at);
+  const end = toDate(fact.ended_at);
+  const windowStart = toDate(timeline.display_window_start_at);
+  const windowEnd = toDate(timeline.display_window_end_at);
+  if (!start || !end || !windowStart || !windowEnd || end <= windowStart || start >= windowEnd) {
+    return {
+      start: fact.started_at, end: fact.ended_at,
+      crossesForward: false, crossesBackward: false, endsAtWindowEnd: false,
+    };
   }
-  const startKey = zoneDayKey(fact.started_at, zone);
-  const endKey = zoneDayKey(fact.ended_at, zone);
-  // 往前跨：从**今天**开始、结束在之后的某一天（通常是次日）。
-  const crossesForward = Boolean(fact.started_at) && startKey === day && endKey > day;
-  // 往回收：结束在**今天**、但开始于更早的一天。原来的写法要求 startKey===day，
-  // 于是"从前一天延续进来"的记录永远算不出 crossesBackward，开始端也就没被裁到 00:00。
-  const crossesBackward = Boolean(fact.started_at) && startKey < day && endKey >= day;
-  // 午夜边界：往前跨的那一侧截到当日的末尾，往回收的那一侧从当日开头算起。
-  // 结尾端的 23:59:59 在显示时写作 **24:00**（见 `formatRecordRange`）——
-  // 「23:59」会被读成"提前一分钟结束"，而它其实一直持续到午夜。
-  if (crossesForward) return { start: fact.started_at, end: `${day}T23:59:59`, crossesForward: true, crossesBackward: false };
-  if (crossesBackward) return { start: `${day}T00:00:00`, end: fact.ended_at, crossesForward: false, crossesBackward: true };
-  return { start: fact.started_at, end: fact.ended_at, crossesForward: false, crossesBackward: false };
+  const crossesBackward = start < windowStart;
+  const crossesForward = end > windowEnd;
+  return {
+    start: crossesBackward ? timeline.display_window_start_at : fact.started_at,
+    end: crossesForward ? timeline.display_window_end_at : fact.ended_at,
+    crossesForward,
+    crossesBackward,
+    endsAtWindowEnd: end >= windowEnd,
+  };
 }
 
 /**
@@ -480,13 +473,9 @@ export function nextPlannedSegment(
  * 跨午夜时，被截断的那一端写成 **24:00**（而不是 23:59）：读者要知道
  * "它一直持续到午夜"，而不是"它在 23:59 结束了"。
  */
-export function formatRecordRange(
-  visible: { start: string | null; end: string | null; crossesForward: boolean; crossesBackward: boolean },
-  timeZone: string,
-): string {
+export function formatRecordRange(visible: VisibleRange, timeZone: string): string {
   const from = formatInZone(visible.start, timeZone);
-  let to = formatInZone(visible.end, timeZone);
-  if (visible.crossesForward && to === '23:59') to = '24:00';
+  const to = visible.endsAtWindowEnd ? '24:00' : formatInZone(visible.end, timeZone);
   if (!from && !to) return '';
   return `${from || '—'}–${to || '—'}`;
 }
@@ -728,7 +717,7 @@ interface RecordRowProps {
   record: DayRecord;
   now: Date;
   timeZone: string;
-  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+  timeline: DisplayWindow;
   /** 没有宿主的记录：加一层虚线和「不属于任何时段」。 */
   loose?: boolean;
   testIdPrefix: string;
@@ -782,7 +771,7 @@ function SegmentFacts({
   records: readonly DayRecord[];
   now: Date;
   timeZone: string;
-  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+  timeline: DisplayWindow;
 }) {
   if (records.length === 0) return null;
   return (
@@ -808,7 +797,7 @@ interface SegmentRowProps {
   bySegment: ReadonlyMap<string, DayRecord[]>;
   now: Date;
   timeZone: string;
-  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+  timeline: DisplayWindow;
   collapsed: ReadonlySet<string>;
   onToggle: (segmentId: string) => void;
 }
@@ -904,7 +893,7 @@ export interface TimelineTrackProps {
   /** 合并结果：段 id → 记录的归属表。记录只从这里进来，不再各自过滤 facts。 */
   bySegment: ReadonlyMap<string, DayRecord[]>;
   timeZone: string;
-  timeline: Pick<LifeTimelineOut, 'display_date' | 'display_timezone'>;
+  timeline: DisplayWindow;
   now: Date;
   /** 默认收起的父段 id（只作初始值；展开/收起由组件自己的状态管）。 */
   defaultCollapsed?: readonly string[];

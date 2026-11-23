@@ -300,7 +300,7 @@ describe('合并视图：每条活动只出现一次', () => {
 });
 
 describe('跨午夜按展示窗口裁剪', () => {
-  const timeline = { display_date: DAY, display_timezone: 'Asia/Shanghai' };
+  const timeline = TIMELINE;
 
   /**
    * 23:30 起、次日 01:30 止：今天这一侧必须裁到午夜，并且**用 24:00 表达**
@@ -350,6 +350,28 @@ describe('跨午夜按展示窗口裁剪', () => {
     expect(formatRecordRange(visible, 'Asia/Shanghai')).toBe('00:00–01:30');
   });
 
+  it('跨过展示窗口两端时用 API 给出的起止，兼容夏令时切换日', () => {
+    const visible = visibleRange({
+      started_at: '2026-03-08T04:30:00Z',
+      ended_at: '2026-03-09T05:30:00Z',
+    }, {
+      display_window_start_at: '2026-03-08T05:00:00Z',
+      display_window_end_at: '2026-03-09T04:00:00Z',
+    });
+    expect(visible.crossesBackward).toBe(true);
+    expect(visible.crossesForward).toBe(true);
+    expect(formatRecordRange(visible, 'America/New_York')).toBe('00:00–24:00');
+  });
+
+  it('恰好在午夜结束时显示 24:00，不标为跨到次日', () => {
+    const visible = visibleRange({
+      started_at: '2026-11-08T15:30:00Z',
+      ended_at: TIMELINE.display_window_end_at,
+    }, timeline);
+    expect(visible.crossesForward).toBe(false);
+    expect(formatRecordRange(visible, 'Asia/Shanghai')).toBe('23:30–24:00');
+  });
+
   /**
    * 没有结束时间 = 时间点。它不参与跨天裁剪，也不该被写成区间。
    * 这一条单独存在，因为"用 started_at 和缺失的 ended_at 比日期"正好会让它出错。
@@ -360,7 +382,10 @@ describe('跨午夜按展示窗口裁剪', () => {
       started_at: '2026-11-08T08:00:00Z',
     });
     const visible = visibleRange(point, timeline);
-    expect(visible).toEqual({ start: '2026-11-08T08:00:00Z', end: null, crossesForward: false, crossesBackward: false });
+    expect(visible).toEqual({
+      start: '2026-11-08T08:00:00Z', end: null,
+      crossesForward: false, crossesBackward: false, endsAtWindowEnd: false,
+    });
     expect(formatRecordRange(visible, 'Asia/Shanghai')).toBe('16:00–—');
   });
 });
