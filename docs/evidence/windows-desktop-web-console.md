@@ -66,6 +66,43 @@ Web 用 Vite 开发服务器（`LING_API_TARGET=http://127.0.0.1:8099`）代理�
 - 单测（`desktop.test.ts` / `desktop-render.test.tsx` / `desktop-polling.test.ts`）
   只测纯函数与 SSR 输出。
 
+## 怎么复验这一遍（可重跑的命令）
+
+前端本身不需要后端就能验：`pnpm run typecheck`、`pnpm run build`、
+`pnpm exec vitest run`（浏览器用例自带 Vite 服务器与 `/v1` 模拟，不需要真后端）。
+
+要复验**真实接口**那一段，需要三个本地进程：
+
+```bash
+# 1) 隔离 PostgreSQL（若本机已有实例在 55432，直接复用）
+cd .agents/worktrees/windows-desktop-web
+scripts/dev_pg.sh start                       # 或用已有实例
+createdb -h 127.0.0.1 -p 55432 -U ling ling_desktop_web
+LING_DATABASE_URL=postgresql+asyncpg://ling@127.0.0.1:55432/ling_desktop_web \
+  .venv/bin/python -m alembic upgrade head    # 需要到 0089
+
+# 2) API（工作树自己的 venv；根仓库的 .venv 指向根 src，不能直接用）
+source /tmp/ling_desktop_web.env              # LING_PORT=8099、bootstrap 口令、上面的库
+nohup .venv/bin/python -m ling > /tmp/ling_desktop_web_api.log 2>&1 &
+
+# 3) Web（把 /v1 代理到 8099）
+cd clients/web-console
+LING_API_TARGET=http://127.0.0.1:8099 pnpm exec vite --port 5199 --host 127.0.0.1
+```
+
+浏览器打开 `http://127.0.0.1:5199/desktop`，用引导账号登录（口令在该 env 文件里，
+不是真实部署口令）。伴生端那一段用脚本按 `companion/poll` + `report` 协议驱动即可：
+
+```bash
+TOK=<配对返回的 token>
+curl -s -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:8099/v1/desktop/companion/poll -d '{"ready":true}'
+# 再对 /v1/desktop/companion/tasks/{id}/report 依次发 opened → written → verified
+```
+
+`scripts/dev_pg.sh start` 建的库叫 `ling` / `ling_test`；本次实测用的是**另建的**
+`ling_desktop_web`，避免和同机其它任务共用状态。
+
 ## 仍未验证
 
 - **真实 Windows 电脑**：本次没有 Windows VM。伴生端由脚本按
