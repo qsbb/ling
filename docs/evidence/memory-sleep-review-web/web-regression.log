@@ -340,4 +340,3 @@ stdout | src/prompt.browser.test.tsx > 真实浏览器：入口、请求、抽�
       Tests  1119 passed | 1 skipped (1120)
    Start at  23:47:01
    Duration  35.59s (transform 2.32s, setup 0ms, collect 18.27s, tests 328.11s, environment 67ms, prepare 5.58s)
-
