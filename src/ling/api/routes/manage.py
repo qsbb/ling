@@ -1321,64 +1321,93 @@ def _account_row(a: object) -> dict:
 async def _merged_member_counts(
     session: DbSession, subject_ids: list[str]
 ) -> dict[str, tuple[int, int]]:
-    """这一页每个 subject 被**几个身份**并入，以及这些身份一共挂**几个账号**。
+    """这一页每个 subject 的合并组：**并入了几个身份、一共几个账号**。
 
-    返回 ``{target_id: (身份数, 账号数)}``，一条 `GROUP BY` 同时算出两个数。
+    返回 ``{target_id: (身份数, 账号数)}``，一条递归 CTE 沿 `merged_into` 展开。
 
-    ## 计数为什么必须由服务端给
+    ## 口径必须与详情接口一致（这条是回归修出来的）
 
-    `merged_into` 指向某一行的记录，在列表里是**别的行**，可能在别的页、也可能
-    被 `q` 筛掉。前端拿不到它们，就不可能自己算准——早先"把成员折进目标行"的
-    做法，在"按目标账号搜索"时直接失效（成员不在结果里，于是同一行凭空变空）。
-    所以数量由服务端给，且**只给数量**：成员明细由详情接口按整组返回。
+    早先这里只数**直接**指向本行的记录（`merged_into = 本行`）。单次合并看不出
+    问题，**连续合并**就露馅：A(2 个号) 并入 B(1 个号)，随后 B 并入 C(1 个号)。
+    此时只有 B 直接指向 C，于是列表说「并入 1 个身份」，而详情接口走
+    `IdentityService.subject_group()`——它沿链传递展开——给出 A、B、C 的 4 个账号。
+    同一份数据在两个地方各说各的（验收实测：`merged_member_count=1` vs 2 个身份/3 个账号）。
 
-    ## 为什么不和账号查询合并成一条
+    现在两边都用**传递闭包**：列表用一条递归 CTE（分组很便宜，不能为 50 行各跑
+    一次 `subject_group`），详情继续用 `subject_group`。两者算法不同、口径相同。
 
-    账号表里没有账号的 subject 一行都不返回。把它与账号查询 OUTER JOIN 起来，
-    "没有账号但有人并入"的那一行就必须再补一条查询——实测那正好把页面的业务
-    查询从 4 条推到 5 条，而这条查询在数据量增长时仍是一条（不随行数增长）。
-    与其用一条更复杂的 SQL 换一个更好看的数字，不如老实承认这里多了一次聚合，
-    并在 `test_manage_subjects_paging.py` 里把预算与理由一起写清。
+    ## 为什么不直接调 `subject_group`
 
-    ## 为什么同时给账号数
+    它是逐条主体的异步查询（`canonical_subject` 每步一次 `session.get`，
+    再迭代展开）。一页 50 人就是一串往返；而这里要的只是**计数**，
+    用 SQL 一条递归 CTE 就能算完。递归有上限（PostgreSQL 不会无限展开），
+    `UNION` 去重也顺手挡掉了成环的历史脏数据。
 
-    一个被并入的身份可能挂着好几个号（QQ + OneBot + qqbot）。只给"身份数"时，
-    界面上的「已并入 1 个号」会和详情里"并入了两个账号"直接打架——实测被验收
-    抓到（`badge="已并入 1 个号"`, `mergedSubjects=1`, `mergedAccounts=2`）。
-    两个数一起返回，界面才能说清"几个身份、几个账号"。
+    ## 账号数为什么用 `DISTINCT`
 
-    **账号数用 `COUNT(DISTINCT actor_accounts.id)`**：身份与账号是一对多，
-    直接 `COUNT` 会把"一个身份两个号"算成两行账号、又把这个行的身份数也放大，
-    两个数都会错。`DISTINCT` 是这条 JOIN 的正确性前提，不是优化。
-
-    多级合并（A→B→C）只数直接指向本行的记录，与"拆开这一行能看到几条"一致。
-    成环的历史脏数据不会让这里死循环——它只是一次 `GROUP BY`。
+    身份与账号是一对多。不做 `DISTINCT` 时，"一个身份两个号"会让 JOIN 出来两行，
+    身份数与账号数同时被放大。`DISTINCT` 是正确性前提，不是优化。
     """
-    from sqlalchemy import func, select
-
-    from ling.infra.models import ActorAccount, Subject
+    from sqlalchemy import text
 
     if not subject_ids:
         return {}
-    members = (
-        select(
-            Subject.merged_into.label("target_id"),
-            func.count(func.distinct(Subject.id)).label("member_count"),
-            func.count(func.distinct(ActorAccount.id)).label("account_count"),
+
+    # 每一步都受 `merged_into` 约束，PostgreSQL 会用到该列上的真实数据；
+    # `UNION`（不是 `UNION ALL`）自动去重，历史脏数据成环时不会无限展开。
+    closure = text(
+        """
+        WITH RECURSIVE
+        -- 1) 先把每个被查的 id 解析到它的**根**（与 `canonical_subject` 同义：
+        --    沿 merged_into 走到底；`UNION` 去重顺带挡掉成环的历史脏数据）。
+        roots(requested, node, depth) AS (
+            SELECT unnest(CAST(:ids AS varchar[])), unnest(CAST(:ids AS varchar[])), 0
+            UNION
+            SELECT r.requested, s.merged_into, r.depth + 1
+            FROM roots r
+            JOIN subjects s ON s.id = r.node
+            WHERE s.merged_into IS NOT NULL AND r.depth < 32
+        ),
+        canonical AS (
+            SELECT requested, node AS root
+            FROM roots r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM subjects s WHERE s.id = r.node AND s.merged_into IS NOT NULL
+            )
+        ),
+        -- 2) 从根向下展开整组（与 `subject_group` 的迭代展开同义）。
+        closure(root, member) AS (
+            SELECT root, root FROM canonical
+            UNION
+            SELECT c.root, s.id
+            FROM closure c
+            JOIN subjects s ON s.merged_into = c.member
+        ),
+        members AS (
+            SELECT root, member FROM closure WHERE member <> root
         )
-        .select_from(Subject)
-        .outerjoin(ActorAccount, ActorAccount.subject_id == Subject.id)
-        .where(Subject.merged_into.in_(subject_ids))
-        .group_by(Subject.merged_into)
+        SELECT
+            c.requested AS target_id,
+            count(DISTINCT m.member) AS member_count,
+            count(DISTINCT a.id) AS account_count
+        FROM canonical c
+        LEFT JOIN members m ON m.root = c.root
+        LEFT JOIN actor_accounts a ON a.subject_id = m.member
+        GROUP BY c.requested
+        """
     )
-    rows = (await session.execute(members)).all()
-    # 目标里混进了本页 id 之外的脏数据时不要静默收下：只回本页出现的那些。
-    requested = set(subject_ids)
-    return {
-        target: (int(member_count), int(account_count))
-        for target, member_count, account_count in rows
-        if target is not None and target in requested
-    }
+    rows = (await session.execute(closure, {"ids": list(subject_ids)})).all()
+    return {target: (int(member_count), int(account_count)) for target, member_count, account_count in rows}
+
+
+def _applies_to_own_row(subject: Subject) -> bool:
+    """这一行是不是"拥有者"，即它的汇总值该不该对外声称。
+
+    已被合并的身份（`merged_into` 非空）**不**声称成员：它已经是别人的一部分，
+    谈"它并入了谁"没有意义，而且会让调用方误以为它是独立的一组。详情接口对它
+    也是先解析到根再展开，与这里一致。
+    """
+    return subject.merged_into is None
 
 
 async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> dict[str, list[dict]]:
@@ -1414,7 +1443,12 @@ def _subject_row(
     operator: bool,
 ) -> dict:
     """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
-    member_count, member_account_count = merged_counts.get(s.id, (0, 0))
+    # 只有根（未被合并的行）才报告成员数；被合并的行报 0。
+    # 这与详情接口"先解析到根再展开"是同一口径：详情看这一行会给出整组，
+    # 但列表里这一行代表的是"已经被并进去的那个身份"本身。
+    member_count, member_account_count = (
+        merged_counts.get(s.id, (0, 0)) if _applies_to_own_row(s) else (0, 0)
+    )
     return {
         "subject_id": s.id,
         "display_name": s.display_name,
