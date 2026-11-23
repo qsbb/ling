@@ -736,13 +736,30 @@ class IdentityService:
         return subject_id
 
     async def subject_group(self, subject_id: str) -> set[str]:
-        """这个人当前包含哪些 subject（含被合并进来的）。"""
+        """这个人当前包含哪些 subject（含被合并进来的）。
+
+        ## 为什么不能设轮数上限（这条是深链回归修出来的）
+
+        原来写的是 `for _ in range(5)`，注释说"一层足够，多跑几轮容得下历史脏数据"。
+        但**连续合并**会造出比 5 更长的链：`merge_subjects` 每次都写 `source →
+        target`，A→B→C→D→E→F→G 时根是 G，展开要走 6 跳。定成 5 轮就漏掉最早的
+        那一环——验收实测：6 次合并后列表说"并入 6 个身份 / 8 个账号"（正确），
+        详情却只给 7 个账号，最早那个身份的两个号不见了。
+
+        所以这里**不设轮数**，只以"这一轮没有新增"为终止条件。迭代层数因此由数据
+        决定，而不是由一个写死的常数决定——常数和链表长度没有因果关系。
+
+        ## 环怎么办
+
+        `added` 只收"不在组里"的 id，而组每轮只增不减，所以成环的历史脏数据
+        会在某一轮得到 `added` 为空、自然停下，不会死循环。这与 `canonical_subject`
+        的环检测是同一个思路（那边靠 `seen` 集合，这边靠"集合不再增长"）。
+        """
         from ling.infra.models import Subject
 
         root = await self.canonical_subject(subject_id)
         group = {root}
-        # 一层足够（合并都指向同一个 root），但多跑几轮容得下历史脏数据
-        for _ in range(5):
+        while True:
             rows = (
                 await self._session.execute(
                     select(Subject).where(

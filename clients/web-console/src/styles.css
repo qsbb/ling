@@ -2788,6 +2788,26 @@ button {
   opacity: 0.65;
 }
 
+/*
+ * 验证状态的三档必须**在视觉上分开**：已验证 / 待验证 / 状态未知。
+ *
+ * 前两者用色相区分（绿 = 已确认，警告色 = 等一个人确认），第三档保持中性
+ * 灰——「我们不知道」不该长得像「还在等」。
+ */
+.badge--ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  background: var(--ok-soft);
+  opacity: 1;
+}
+
+.badge--warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+  background: var(--warn-soft);
+  opacity: 1;
+}
+
 .input--small {
   padding: 4px 8px;
   font-size: 13px;

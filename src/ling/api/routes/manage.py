@@ -1340,6 +1340,98 @@ def _account_row(a: object) -> dict:
     }
 
 
+async def _merged_member_counts(
+    session: DbSession, subject_ids: list[str]
+) -> dict[str, tuple[int, int]]:
+    """这一页每个 subject 的合并组：**并入了几个身份、一共几个账号**。
+
+    返回 ``{target_id: (身份数, 账号数)}``，一条递归 CTE 沿 `merged_into` 展开。
+
+    ## 口径必须与详情接口一致（这条是回归修出来的）
+
+    早先这里只数**直接**指向本行的记录（`merged_into = 本行`）。单次合并看不出
+    问题，**连续合并**就露馅：A(2 个号) 并入 B(1 个号)，随后 B 并入 C(1 个号)。
+    此时只有 B 直接指向 C，于是列表说「并入 1 个身份」，而详情接口走
+    `IdentityService.subject_group()`——它沿链传递展开——给出 A、B、C 的 4 个账号。
+    同一份数据在两个地方各说各的（验收实测：`merged_member_count=1` vs 2 个身份/3 个账号）。
+
+    现在两边都用**传递闭包**：列表用一条递归 CTE（分组很便宜，不能为 50 行各跑
+    一次 `subject_group`），详情继续用 `subject_group`。两者算法不同、口径相同。
+
+    ## 为什么不直接调 `subject_group`
+
+    它是逐条主体的异步查询（`canonical_subject` 每步一次 `session.get`，
+    再迭代展开）。一页 50 人就是一串往返；而这里要的只是**计数**，
+    用 SQL 一条递归 CTE 就能算完。递归有上限（PostgreSQL 不会无限展开），
+    `UNION` 去重也顺手挡掉了成环的历史脏数据。
+
+    ## 账号数为什么用 `DISTINCT`
+
+    身份与账号是一对多。不做 `DISTINCT` 时，"一个身份两个号"会让 JOIN 出来两行，
+    身份数与账号数同时被放大。`DISTINCT` 是正确性前提，不是优化。
+    """
+    from sqlalchemy import text
+
+    if not subject_ids:
+        return {}
+
+    # 每一步都受 `merged_into` 约束，PostgreSQL 会用到该列上的真实数据；
+    # `UNION`（不是 `UNION ALL`）自动去重，历史脏数据成环时不会无限展开。
+    closure = text(
+        """
+        WITH RECURSIVE
+        -- 1) 先把每个被查的 id 解析到它的**根**（与 `canonical_subject` 同义：
+        --    沿 merged_into 走到底；`UNION` 去重顺带挡掉成环的历史脏数据）。
+        roots(requested, node, depth) AS (
+            SELECT unnest(CAST(:ids AS varchar[])), unnest(CAST(:ids AS varchar[])), 0
+            UNION
+            SELECT r.requested, s.merged_into, r.depth + 1
+            FROM roots r
+            JOIN subjects s ON s.id = r.node
+            WHERE s.merged_into IS NOT NULL AND r.depth < 32
+        ),
+        canonical AS (
+            SELECT requested, node AS root
+            FROM roots r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM subjects s WHERE s.id = r.node AND s.merged_into IS NOT NULL
+            )
+        ),
+        -- 2) 从根向下展开整组（与 `subject_group` 的迭代展开同义）。
+        closure(root, member) AS (
+            SELECT root, root FROM canonical
+            UNION
+            SELECT c.root, s.id
+            FROM closure c
+            JOIN subjects s ON s.merged_into = c.member
+        ),
+        members AS (
+            SELECT root, member FROM closure WHERE member <> root
+        )
+        SELECT
+            c.requested AS target_id,
+            count(DISTINCT m.member) AS member_count,
+            count(DISTINCT a.id) AS account_count
+        FROM canonical c
+        LEFT JOIN members m ON m.root = c.root
+        LEFT JOIN actor_accounts a ON a.subject_id = m.member
+        GROUP BY c.requested
+        """
+    )
+    rows = (await session.execute(closure, {"ids": list(subject_ids)})).all()
+    return {target: (int(member_count), int(account_count)) for target, member_count, account_count in rows}
+
+
+def _applies_to_own_row(subject: Subject) -> bool:
+    """这一行是不是"拥有者"，即它的汇总值该不该对外声称。
+
+    已被合并的身份（`merged_into` 非空）**不**声称成员：它已经是别人的一部分，
+    谈"它并入了谁"没有意义，而且会让调用方误以为它是独立的一组。详情接口对它
+    也是先解析到根再展开，与这里一致。
+    """
+    return subject.merged_into is None
+
+
 async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> dict[str, list[dict]]:
     """只取这一页的账号，仍然是一条 SQL（不是逐条再查）。"""
     from sqlalchemy import select
@@ -1365,8 +1457,20 @@ async def _accounts_by_subject(session: DbSession, subject_ids: list[str]) -> di
     return by_subject
 
 
-def _subject_row(s: Subject, by_subject: dict[str, list[dict]], *, operator: bool) -> dict:
+def _subject_row(
+    s: Subject,
+    by_subject: dict[str, list[dict]],
+    merged_counts: dict[str, tuple[int, int]],
+    *,
+    operator: bool,
+) -> dict:
     """一行的对外形状（与 `SubjectRow` 契约同源，见 contracts/v1.py）。"""
+    # 只有根（未被合并的行）才报告成员数；被合并的行报 0。
+    # 这与详情接口"先解析到根再展开"是同一口径：详情看这一行会给出整组，
+    # 但列表里这一行代表的是"已经被并进去的那个身份"本身。
+    member_count, member_account_count = (
+        merged_counts.get(s.id, (0, 0)) if _applies_to_own_row(s) else (0, 0)
+    )
     return {
         "subject_id": s.id,
         "display_name": s.display_name,
@@ -1374,6 +1478,8 @@ def _subject_row(s: Subject, by_subject: dict[str, list[dict]], *, operator: boo
         "merged_into": s.merged_into,
         "can_rename": operator and s.merged_into is None,
         "accounts": by_subject.get(s.id, []),
+        "merged_member_count": member_count,
+        "merged_member_account_count": member_account_count,
     }
 
 
@@ -1473,12 +1579,16 @@ async def list_subjects(
         )
 
     page, total = await _subjects_page(session, where, limit, offset)
-    by_subject = await _accounts_by_subject(session, [s.id for s in page])
+    page_ids = [s.id for s in page]
+    by_subject = await _accounts_by_subject(session, page_ids)
+    merged_counts = await _merged_member_counts(session, page_ids)
 
     return {
         "schema_version": SCHEMA_VERSION,
         "subjects": [
-            _subject_row(s, by_subject, operator=auth.user.role in {"owner", "admin"})
+            _subject_row(
+                s, by_subject, merged_counts, operator=auth.user.role in {"owner", "admin"}
+            )
             for s in page
         ],
         "limit": limit,

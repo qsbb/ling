@@ -1,8 +1,24 @@
+/**
+ * 一个人的详情：账号（含完整外部 ID 与验证状态）、关系事件、可见记忆。
+ *
+ * ## 为什么完整 ID 只在这里出现
+ *
+ * 列表要回答「这个人是谁、挂了几个号」，详情要回答「具体是哪几个号」。
+ * 前一个问题需要短（尾号 + 平台 + 数量），后一个问题需要精确（完整 ID +
+ * 证明方式）。把两者压在同一行，是上一版姓名被数字淹没的原因。
+ *
+ * ## 三段各自独立加载
+ *
+ * 三段用不同的可见范围（账号按整组、事件只给本人、记忆按可见性），其中任何
+ * 一段失败都不该拖垮另两段——所以每段自带加载/失败/重试，不共用一个 loading。
+ */
+
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { explainError, type ExplainedError } from '../errors';
 import { accountProofLabel } from '../relationshipDetail';
 import type { SubjectDetailItems, SubjectDetailPage, SubjectDetailSection } from '../relationshipDetail';
+import { platformLabel } from '../relationshipSummary';
 
 function useDetailSection<K extends SubjectDetailSection>(subjectId: string, section: K) {
   const [page, setPage] = useState<SubjectDetailPage<SubjectDetailItems[K]> | null>(null);
@@ -118,23 +134,54 @@ function SectionStatus({ label, loading, error, hasMore, retry, loadMore }: Sect
   );
 }
 
+/**
+ * 证明状态的**视觉分级**：已验证是绿、未验证是警告色、未知是灰。
+ *
+ * 三档必须可分——「待验证」和「状态未知」不是同一件事，前者是等一个人确认，
+ * 后者是我们没有这个信息。用同一个灰色徽章表达两者，等于把「不知道」说成
+ * 「还在等」。
+ */
+function proofBadge(proof: string): { className: string; label: string } {
+  const label = accountProofLabel(proof);
+  if (label === '已证明') return { className: 'badge badge--ok', label };
+  if (label === '待验证') return { className: 'badge badge--warn', label };
+  return { className: 'badge badge--muted', label };
+}
+
 export function SubjectDetail({ subjectId }: { subjectId: string }) {
   const accounts = useDetailSection(subjectId, 'accounts');
   const interactions = useDetailSection(subjectId, 'interactions');
   const memories = useDetailSection(subjectId, 'memories');
 
+  const accountRows = accounts.page?.items ?? [];
+  const unverified = accountRows.filter(
+    (account) => proofBadge(account.proof).label !== '已证明',
+  ).length;
+
   return (
     <div className="identity-detail" data-testid="subject-detail">
       <section className="identity-detail__section" aria-label="关联账号">
-        <h3>关联账号</h3>
+        <h3>
+          关联账号
+          {accountRows.length > 0 ? <span className="identity-detail__count">{accountRows.length}</span> : null}
+        </h3>
         {accounts.page?.items.length === 0 ? <p className="page__hint">没有绑定账号</p> : null}
-        {accounts.page?.items.map((account) => (
-          <p className="identity-detail__row" key={account.account_id}>
-            <code>{account.connector_instance}:{account.external_account_id}</code>
-            <span className="badge">{accountProofLabel(account.proof)}</span>
-            {account.revoked ? <span className="badge badge--muted">已解绑</span> : null}
+        {unverified > 0 && !accounts.loading ? (
+          <p className="page__hint" data-testid="detail-unverified">
+            {unverified} 个账号还没有验证：它们能记录关系，但不能用来确定"这句话是谁说的"。
           </p>
-        ))}
+        ) : null}
+        {accountRows.map((account) => {
+          const badge = proofBadge(account.proof);
+          return (
+            <p className="identity-detail__row" key={account.account_id}>
+              <span className="merge-dialog__platform">{platformLabel(account.connector_instance)}</span>
+              <code>{account.external_account_id}</code>
+              <span className={badge.className}>{badge.label}</span>
+              {account.revoked ? <span className="badge badge--muted">已解绑</span> : null}
+            </p>
+          );
+        })}
         <SectionStatus label="账号" {...accounts} hasMore={Boolean(accounts.page?.next_cursor)} />
       </section>
 

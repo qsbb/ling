@@ -265,6 +265,8 @@
           "can_rename": "boolean",
           "display_name": "string",
           "merged_into": "null",
+          "merged_member_account_count": "integer",
+          "merged_member_count": "integer",
           "subject_id": "string",
           "trust_level": "string"
         },
@@ -281,6 +283,8 @@
           "can_rename": "boolean",
           "display_name": "string",
           "merged_into": "null",
+          "merged_member_account_count": "integer",
+          "merged_member_count": "integer",
           "subject_id": "string",
           "trust_level": "string"
         }

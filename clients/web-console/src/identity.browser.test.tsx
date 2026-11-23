@@ -6,16 +6,19 @@
  * 一个含全部候选的 `<select>` —— n 条关系 = n² 个 `<option>`，2000 条 = **4,023,210
  * 个 DOM 元素 / 289 MB**，SSR 就要 10.5 s，浏览器再建 400 万节点必卡死。
  *
- * 这个文件钉住修复后的四条性质，而且**必须在真浏览器里**量（SSR 量不到布局，
- * 也量不到"点一下之后还剩多少个节点"）：
+ * 这个文件钉住两类性质，**必须在真浏览器里**量（SSR 量不到布局，也量不到
+ * "点一下之后还剩多少个节点"）：
  *
- * 1. 未展开的卡片里**没有一个** `<option>`；整页首屏元素数与 `<option>` 总数都是
- *    个位数到几十（而不是 4,000,000）；
- * 2. **同时只有一张**卡片展开；切换时上一张自动收起；
- * 3. 合并 → 刷新后指针还在（「已合并」徽章）→「拆开」还原；分页「加载更多」
- *    能翻到第二页，到底显示「没有更多了」；
- * 4. 375 / 1440 两个视口都 `scrollWidth <= clientWidth`，包括**展开的那张卡片**
- *    （下拉里装着几十个候选，最容易撑破窄屏）。
+ * A. 不卡死（原报告 `shots/diag-relations-freeze-2026-11-09.md` 的回归）：
+ *    首屏只渲染一页；整页**没有** `<option>` / `<select>`；元素数有预算；
+ *    翻页按 `offset` 续取、到底说「没有更多了」；375 / 1440 都不横向溢出。
+ *
+ * B. 图六的关系页（本文件后半部分）：
+ *    1. **姓名是列表首要信息**，平台与账号数只做扫读；完整外部 ID 只在详情出现；
+ *    2. **同名的人能用平台 + 账号区分**，不需要名字不同；
+ *    3. 合并走**确认面板**，面板里同时看得到源、目标与双方账号；候选搜索
+ *       **跨分页**（人不在首屏也搜得到）；
+ *    4. 合并后**目标自然人能直接改名**；拆开还原；刷新后状态都还在。
  *
  * `/v1/**` 全部由 `page.route` 模拟（不碰真后端、不写库），与
  * `life-timeline.browser.test.tsx` 同一套做法。没有 playwright 浏览器时这一组
@@ -158,6 +161,12 @@ function pageOf(query: URLSearchParams): { status: number; body: unknown } {
   const page = rows.slice(offset, offset + limit).map((row) => ({
     ...row,
     can_rename: !row.merged_into,
+    // 服务端字段：有多少身份并入这一行。成员可能不在本页，所以必须由服务端给。
+    merged_member_count: store.filter((other) => other.merged_into === row.subject_id).length,
+    // 身份数 ≠ 账号数：一个被并入的身份可能挂好几个号。
+    merged_member_account_count: store
+      .filter((other) => other.merged_into === row.subject_id)
+      .reduce((sum, other) => sum + other.accounts.length, 0),
   }));
   return {
     status: 200,
@@ -234,10 +243,20 @@ async function openRelations(
         return route.fulfill(json({ error: { code: 'internal', message: '暂时无法读取记忆' } }, 503));
       }
       const isSelf = subjectId === 'subj_0000';
-      const subject = store.find((row) => row.subject_id === subjectId);
       const cursor = url.searchParams.get('cursor');
       if (section === 'accounts') {
-        const items = (subject?.accounts ?? []).map((account) => ({ ...account, subject_id: subjectId }));
+        /*
+         * 真实后端按 `subject_group` 返回**整组**账号：目标自己的 + 已并入它的
+         * 那些身份的。模拟接口早先只回自己那一行，于是"详情里有几个账号"这件事
+         * 在测试里永远看不到并入的部分——徽标与详情的一致性就没法验。
+         */
+        const groupIds = new Set<string>([subjectId]);
+        for (const row of store) {
+          if (row.merged_into === subjectId) groupIds.add(row.subject_id);
+        }
+        const items = store
+          .filter((row) => groupIds.has(row.subject_id))
+          .flatMap((row) => row.accounts.map((account) => ({ ...account, subject_id: row.subject_id })));
         return route.fulfill(json({ section, access: 'full', items, next_cursor: null }));
       }
       if (section === 'interactions') {
@@ -368,7 +387,7 @@ describe('关系页：不再卡死（真浏览器）', () => {
     expect(await page.getByTestId('subject-detail').count()).toBe(1);
   }, TEST_TIMEOUT);
 
-  it('列表和详情按真实证明状态区分管理员确认、已证明及待验证', async (ctx) => {
+  it('列表用「有未验证」扫读，详情按证明状态区分已证明 / 待验证 / 状态未知', async (ctx) => {
     if (skip(ctx)) return;
     const subject = SUBJECTS[0];
     const template = subject?.accounts[0];
@@ -385,19 +404,29 @@ describe('关系页：不再卡死（真浏览器）', () => {
     }]);
     const { page } = await openRelations({ width: 1440, height: 900 });
     const card = page.getByTestId('subject-card').first();
+
+    // 列表层：只给一个"有未验证"的扫读徽标，不逐条铺 ID 与证明
+    expect(await card.getByTestId('unverified-badge').count()).toBe(1);
+    expect(await card.innerText()).not.toContain('account-pending');
+
     await card.getByTestId('detail-open').click();
     const detail = card.getByTestId('subject-detail');
     await expect.poll(async () => detail.getByLabel('关联账号').locator('.identity-detail__row').count()).toBe(4);
 
-    for (const [proof, label] of [
-      ['admin', '已证明'],
-      ['proven', '已证明'],
-      ['pending', '待验证'],
-      ['unknown', '状态未知'],
-    ]) {
-      expect(await card.locator('.account-row').filter({ hasText: `account-${proof}` }).innerText()).toContain(label);
-      expect(await detail.getByLabel('关联账号').locator('.identity-detail__row').filter({ hasText: `account-${proof}` }).innerText()).toContain(label);
+    const expected: Array<[string, string, string]> = [
+      ['admin', '已证明', 'badge badge--ok'],
+      ['proven', '已证明', 'badge badge--ok'],
+      ['pending', '待验证', 'badge badge--warn'],
+      ['unknown', '状态未知', 'badge badge--muted'],
+    ];
+    for (const [proof, label, cls] of expected) {
+      const row = detail.getByLabel('关联账号').locator('.identity-detail__row').filter({ hasText: `account-${proof}` });
+      expect(await row.innerText()).toContain(label);
+      // 三档必须**在样式上**可分：同一个灰徽章等于把"未知"说成"还在等"。
+      expect(await row.locator(`.${cls.replaceAll(' ', '.')}`).count()).toBe(1);
     }
+    // 详情里给出"未验证意味着什么"，而不是只贴标签
+    expect(await detail.innerText()).toContain('个账号还没有验证');
   }, TEST_TIMEOUT);
 
   it('没有关系事件时说明统计范围和空态', async (ctx) => {
@@ -434,7 +463,7 @@ describe('关系页：不再卡死（真浏览器）', () => {
     }, TEST_TIMEOUT);
   }
 
-  it('首屏只渲染一页，且**没有**任何一个未展开卡片带 <option>', async (ctx) => {
+  it('首屏只渲染一页，整页没有 <option> / <select>，元素数在预算内', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
     const { page, calls } = await openRelations({ width: 1440, height: 900 });
@@ -449,92 +478,127 @@ describe('关系页：不再卡死（真浏览器）', () => {
     const stats = await domStats(page);
     console.info(`[identity.browser] 2000 条关系 → 首屏 DOM ${stats.elements} 元素`);
     expect(stats.cards).toBe(PAGE_SIZE);
-    // 每张可编辑卡片新增一个改名按钮，保留其余页面元素的预算。
-    expect(stats.elements).toBeLessThan(800 + PAGE_SIZE);
+    /*
+     * 预算按**这一版**的行结构重算，不是从旧数字抄来的。
+     *
+     * 每行新增的平台徽标（平台名 + 计数各一个元素）与三个按钮，
+     * 都是图六要求的信息（平台扫读、操作目标可见）——预算要跟着需求走，
+     * 但不能取消：它防的是"每条候选都渲染进首屏"这一类回归。
+     */
+    expect(stats.elements).toBeLessThan(1400);
 
-    // 3. **核心断言**：一个 <option> 都没有，也没有 <select>
+    // 3. **核心断言**：一个 <option> / <select> 都没有
     expect(stats.options).toBe(0);
     expect(stats.selects).toBe(0);
 
-    // 4. 这一页的 50 个人都是"未被合并"，所以每张卡片都有「合并到…」入口
+    // 4. 这一页的人都有「合并…」入口（是否可点由"有没有别人"决定，不再是预禁用）
     expect(await page.getByTestId('merge-open').count()).toBe(PAGE_SIZE);
   }, TEST_TIMEOUT);
 
-  it('同时只有一张卡片展开；切换时上一张收起；取消后回到零个 <select>', async (ctx) => {
+  it('合并面板一次只开一个；取消后回到零个弹层，并回到原记录', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
     const { page } = await openRelations({ width: 1440, height: 900 });
 
-    const initialStats = await domStats(page);
     const opens = page.getByTestId('merge-open');
     await opens.nth(0).click();
-    let stats = await domStats(page);
-    expect(stats.selects).toBe(1);
-    // 下拉里最多是"已加载的其他人"：49（首屏 50 条减去自己）+ 1 个占位
-    expect(stats.options).toBeLessThanOrEqual(PAGE_SIZE);
-    expect(stats.elements - initialStats.elements).toBeLessThanOrEqual(PAGE_SIZE + 5);
+    await page.getByTestId('merge-confirm').waitFor();
+    expect(await page.getByTestId('merge-confirm').count()).toBe(1);
 
-    // 点第二张：第一张必须收起 —— 不是两个 <select 并存
+    // 关掉第一张，换第二个人：仍然只有一个面板，而且标题里是第二个人
+    await page.getByTestId('merge-confirm').getByRole('button', { name: '取消' }).click();
+    await expect.poll(async () => page.getByTestId('merge-confirm').count()).toBe(0);
     await opens.nth(1).click();
-    stats = await domStats(page);
-    expect(stats.selects).toBe(1);
-    const editing = await page.locator('.account-card--editing').count();
-    expect(editing).toBe(1);
+    await page.getByTestId('merge-confirm').waitFor();
+    expect(await page.getByTestId('merge-confirm').count()).toBe(1);
 
-    // 取消：回到全只读
-    await page.getByTestId('merge-cancel').click();
-    stats = await domStats(page);
-    expect(stats.selects).toBe(0);
-    expect(stats.options).toBe(0);
+    await page.getByTestId('merge-confirm').getByRole('button', { name: '取消' }).click();
+    await expect.poll(async () => page.getByTestId('merge-confirm').count()).toBe(0);
+
+    // 取消不改数据：没有任何卡片被并进去
+    expect(await page.getByTestId('merged-badge').count()).toBe(0);
+    // 取消后仍能定位到原记录（它在页面上且可见）
+    const second = page.getByTestId('subject-card').nth(1);
+    expect(await second.isVisible()).toBe(true);
   }, TEST_TIMEOUT);
 
-  it('合并后可改目标姓名，拆开后源姓名仍在', async (ctx) => {
+  it('合并确认同时展示源、目标与双方账号，合并后目标可直接改名，拆开还原', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
     const { page } = await openRelations({ width: 1440, height: 900 });
 
-    const firstCard = page.locator('[data-testid="subject-card"]').first();
-    const sourceName = (await firstCard.locator('strong').first().innerText()).trim();
-    await firstCard.getByTestId('merge-open').click();
+    const sourceCard = page.getByTestId('subject-card').first();
+    const sourceName = (await sourceCard.getByTestId('person-name').innerText()).trim();
+    await sourceCard.getByTestId('merge-open').click();
 
-    // 选一个具体的目标（不是占位项）
-    const select = page.getByTestId('merge-target');
-    const targetValue = await select.locator('option').nth(1).getAttribute('value');
-    expect(targetValue).toBeTruthy();
-    const targetLabel = (await select.locator('option').nth(1).innerText()).trim();
-    await select.selectOption(targetValue as string);
+    const dialog = page.getByTestId('merge-confirm');
+    await dialog.waitFor();
 
-    const mergeButton = page.getByTestId('merge-button');
-    expect(await mergeButton.isEnabled()).toBe(true);
-    await mergeButton.click();
+    // 源在面板里就是刚才点的那个人
+    expect(await dialog.getByTestId('merge-confirm-source').innerText()).toContain(sourceName);
+
+    // 选目标：面板里的候选是按钮，不是 <select>
+    const targetOption = dialog.getByTestId('merge-candidate').nth(1);
+    const targetName = (await targetOption.locator('.merge-candidates__name').innerText()).trim();
+    await targetOption.click();
+
+    // 目标一侧接着就是它的账号：确认依据是账号，不是名字
+    const targetParty = dialog.getByTestId('merge-confirm-target');
+    await expect.poll(async () => targetParty.innerText()).toContain(targetName);
+    const targetIds = await targetParty.locator('.merge-dialog__id').allInnerTexts();
+    expect(targetIds.length).toBeGreaterThan(0);
+    // 确认面板里是**完整**外部 ID（列表上的缩写在这里不够核对）
+    for (const id of targetIds) expect(id).toMatch(/^\d+$/);
+
+    await dialog.getByTestId('merge-confirm-ok').click();
     await page.getByTestId('identity-message').waitFor();
-    expect(await page.getByTestId('identity-message').innerText()).toContain('已合并');
+    expect(await page.getByTestId('identity-message').innerText()).toContain('已把');
 
-    // 刷新（= 用户按 F5）：指针在库里，页面重新读出来仍显示"已合并"
+    // 刷新（= 用户按 F5）：指针在库里，页面重新读出来仍是同一个人
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('[data-testid="subject-card"]').first().waitFor();
-    const mergedCard = page
-      .locator('[data-testid="subject-card"]')
-      .filter({ hasText: sourceName })
-      .filter({ has: page.getByTestId('merged-badge') })
+    const mergedTarget = page
+      .getByTestId('subject-card')
+      .filter({ hasText: targetName })
       .first();
-    await mergedCard.waitFor();
-    // 已合并的那张卡片仍然属于**被合并的人**（源头），不是目标
-    expect(await mergedCard.innerText()).toContain('已合并');
-    expect(await page.locator('[data-testid="merged-badge"]').count()).toBe(1);
-    expect(await mergedCard.getByRole('button', { name: '改名', exact: true }).count()).toBe(0);
-    const targetCard = page.getByTestId('subject-card').filter({ hasText: targetLabel });
-    await targetCard.getByRole('button', { name: '改名', exact: true }).click();
-    await targetCard.getByRole('textbox', { name: '自然人姓名' }).fill('两个账号的共同姓名');
-    await targetCard.getByRole('button', { name: '保存' }).click();
-    await page.getByTestId('subject-card').filter({ hasText: '两个账号的共同姓名' }).waitFor();
+    await mergedTarget.waitFor();
+    /*
+     * 合并后：目标那一行显示「已并入 N 个号」（数量来自服务端），
+     * 被并入的记录在「已并入」那一段里自己占一行、写着并入了谁。
+     *
+     * 不把成员折进目标行是有意的：成员可能在别的页，折进去会让"整页浏览"
+     * 与"搜索只命中目标"两种情形显示成两样。
+     */
+    expect(await mergedTarget.getByTestId('merged-members-badge').count()).toBe(1);
+    const mergedSection = page.getByLabel('已并入的身份');
+    await mergedSection.waitFor();
+    const mergedRow = mergedSection.getByTestId('subject-card').first();
+    expect(await mergedRow.getByTestId('merged-badge').innerText()).toContain(targetName);
+    expect(await mergedRow.innerText()).toContain(sourceName);
+    expect(await mergedRow.getByTestId('unmerge-button').count()).toBe(1);
 
-    // 拆开还原
-    await mergedCard.getByTestId('unmerge-button').click();
+    // 合并后的目标自然人可以直接改名
+    await mergedTarget.getByTestId('rename-open').click();
+    const renameDialog = page.getByTestId('rename-dialog');
+    await renameDialog.waitFor();
+    await renameDialog.getByTestId('rename-input').fill('两个账号的共同姓名');
+    await renameDialog.getByTestId('rename-save').click();
+    // 改名后：目标行（独立的人）出现新姓名。用 person-list 限定，避免命中
+    // 「已并入」那一段里写着同一目标姓名的成员行。
+    const renamedTarget = page.getByTestId('person-list')
+      .getByTestId('subject-card')
+      .filter({ hasText: '两个账号的共同姓名' })
+      .first();
+    await renamedTarget.waitFor();
+    expect(await renamedTarget.getByTestId('person-name').innerText()).toBe('两个账号的共同姓名');
+
+    // 拆开还原：源从「已并入」那一段消失，重新成为独立的人
+    await mergedRow.getByTestId('unmerge-button').click();
     await page.getByTestId('identity-message').waitFor();
     expect(await page.getByTestId('identity-message').innerText()).toContain('已拆开');
     await expect.poll(async () => page.getByTestId('merged-badge').count()).toBe(0);
-    await page.getByTestId('subject-card').filter({ hasText: sourceName }).waitFor();
+    await page.getByTestId('person-list').getByTestId('subject-card')
+      .filter({ hasText: sourceName }).first().waitFor();
   }, TEST_TIMEOUT);
 
   it('「加载更多」按 offset 续页，到底显示「没有更多了」', async (ctx) => {
@@ -556,15 +620,14 @@ describe('关系页：不再卡死（真浏览器）', () => {
     // 到底：按钮消失，换成"没有更多了"
     await page.getByTestId('no-more').waitFor();
     expect(await page.getByTestId('load-more').count()).toBe(0);
-    expect(await page.getByTestId('subjects-count').innerText()).toContain('共 120 人');
+    expect(await page.getByTestId('subjects-count').innerText()).toContain('120 人');
 
-    // 翻了三页，仍然没有一个 <option>
     const stats = await domStats(page);
     expect(stats.options).toBe(0);
     console.info(`[identity.browser] 120 人翻到底：${stats.elements} 元素`);
   }, TEST_TIMEOUT);
 
-  it('搜索走服务端 q（不是只在当前页里筛）', async (ctx) => {
+  it('搜索走服务端 q，能搜到首屏没加载的人', async (ctx) => {
     if (skip(ctx)) return;
     resetStore();
     const { page, calls } = await openRelations({ width: 1440, height: 900 });
@@ -577,25 +640,330 @@ describe('关系页：不再卡死（真浏览器）', () => {
     const last = calls.at(-1);
     expect(last?.query.q).toBe('subj_0199');
     expect(last?.query.offset).toBe('0');
-    expect(await page.getByTestId('subjects-count').innerText()).toContain('共 1 人');
+    expect(await page.getByTestId('subjects-count').innerText()).toContain('1 人');
+    // 搜到的是那个人本身，而不是"当前页里碰巧含这几个字的"
+    expect(await page.locator('[data-testid="subject-card"]').first().getAttribute('data-subject-id'))
+      .toBe('subj_0199');
   }, TEST_TIMEOUT);
 
-  it('空态与「只有 1 条」都不会渲染下拉', async (ctx) => {
+  it('合并候选跨分页：目标不在首屏，也能搜到并选上', async (ctx) => {
+    if (skip(ctx)) return;
+    resetStore();
+    const { page, calls } = await openRelations({ width: 1440, height: 900 });
+
+    await page.getByTestId('merge-open').first().click();
+    const dialog = page.getByTestId('merge-confirm');
+    await dialog.waitFor();
+
+    // 首屏候选里不该有第 4 页的人
+    const beforeIds = await dialog.getByTestId('merge-candidate').count();
+    expect(beforeIds).toBeLessThanOrEqual(PAGE_SIZE);
+
+    await dialog.getByTestId('merge-candidate-search').fill('subj_0199');
+    await expect.poll(async () => dialog.getByTestId('merge-candidate').count()).toBe(1);
+
+    // 这一次搜索是**跨全部人**的服务端查询，不是本地过滤
+    const searchCalls = calls.filter((call) => call.path === '/v1/accounts/subjects' && call.query.q === 'subj_0199');
+    expect(searchCalls.length).toBeGreaterThan(0);
+    expect(await dialog.getByTestId('merge-candidates-count').innerText()).toContain('共 1 人');
+
+    await dialog.getByTestId('merge-candidate').first().click();
+    // 目标一侧显示**姓名 + 账号**（subj_0199 是第 200 个人：30000000 + 199*10 = 30001990）
+    const targetPartyText = async () => dialog.getByTestId('merge-confirm-target').innerText();
+    await expect.poll(targetPartyText).toContain('诊断用户0199');
+    expect(await targetPartyText()).toContain('30001990');
+    expect(await dialog.getByTestId('merge-confirm-ok').isEnabled()).toBe(true);
+  }, TEST_TIMEOUT);
+
+  it('同名的人用平台与账号区分，不靠名字', async (ctx) => {
+    if (skip(ctx)) return;
+    const template = SUBJECTS[0];
+    if (!template) throw new Error('缺少测试数据');
+    // 两个人同名「小明」，挂在不同平台的不同账号上
+    const twins = [
+      {
+        ...template,
+        subject_id: 'twin_a',
+        display_name: '小明',
+        accounts: [{
+          account_id: 'twin_a_1',
+          connector_instance: 'napcat-2',
+          external_account_id: '11000001',
+          proof: 'proven',
+          revoked: false,
+        }],
+      },
+      {
+        ...template,
+        subject_id: 'twin_b',
+        display_name: '小明',
+        accounts: [{
+          account_id: 'twin_b_1',
+          connector_instance: 'onebot-default',
+          external_account_id: '22000002',
+          proof: 'pending',
+          revoked: false,
+        }],
+      },
+    ];
+    resetStore(twins);
+    const { page } = await openRelations({ width: 1440, height: 900 });
+
+    const cards = page.getByTestId('subject-card');
+    expect(await cards.count()).toBe(2);
+    // 两个名字一样
+    expect(await cards.nth(0).getByTestId('person-name').innerText()).toBe('小明');
+    expect(await cards.nth(1).getByTestId('person-name').innerText()).toBe('小明');
+
+    // 但扫读信息不同：平台徽标 + 同名区分提示
+    const firstText = await cards.nth(0).getByTestId('person-platforms').innerText();
+    const secondText = await cards.nth(1).getByTestId('person-platforms').innerText();
+    expect(firstText).toContain('napcat');
+    expect(secondText).toContain('onebot');
+    expect(await cards.nth(0).getByTestId('same-name-hint').innerText()).toContain('…0001');
+    expect(await cards.nth(1).getByTestId('same-name-hint').innerText()).toContain('…0002');
+
+    // 合并确认里也一样能分开
+    await cards.nth(0).getByTestId('merge-open').click();
+    const dialog = page.getByTestId('merge-confirm');
+    await dialog.waitFor();
+    const option = dialog.getByTestId('merge-candidate').first();
+    expect(await option.innerText()).toContain('onebot');
+    await option.click();
+    expect(await dialog.getByTestId('merge-confirm-target').innerText()).toContain('22000002');
+  }, TEST_TIMEOUT);
+
+  it('一个被并入的身份挂两个账号时，列表说清身份数与账号数', async (ctx) => {
+    if (skip(ctx)) return;
+    /*
+     * 验收抓到的真实矛盾：一个被并入的身份挂了两个号时，徽标写「已并入 1 个号」，
+     * 详情里却列出两个账号。数字没错（数的是**身份**），错的是把它说成了"号"。
+     *
+     * 这条同时验证两种形状，因为只报单一数字的实现无法同时满足它们：
+     * - 情形 A：1 个身份、2 个账号 → 徽标必须两个数都写出来；
+     * - 情形 B：2 个身份、2 个账号 → 徽标只写身份数（账号数相等时重复无益）。
+     */
+    const template = SUBJECTS[0];
+    if (!template) throw new Error('缺少测试数据');
+    const account = (id: string, external: string) => ({
+      account_id: id,
+      connector_instance: 'napcat-2',
+      external_account_id: external,
+      proof: 'proven',
+      revoked: false,
+    });
+
+    // 情形 A：保留者 + 一个挂两个号的被并入身份
+    resetStore([
+      {
+        ...template,
+        subject_id: 'keeper_a',
+        display_name: '保留者甲',
+        merged_into: null,
+        accounts: [account('keeper_a_1', '11110001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_a',
+        display_name: '并入者甲',
+        merged_into: 'keeper_a',
+        accounts: [account('member_a_1', '22220001'), account('member_a_2', '22220002')],
+      },
+    ]);
+    {
+      const { page } = await openRelations({ width: 1440, height: 900 });
+      const keeper = page.locator('[data-testid="subject-card"][data-subject-id="keeper_a"]');
+      await keeper.waitFor();
+      const badge = (await keeper.getByTestId('merged-members-badge').innerText()).trim();
+      expect(badge).toContain('1 个身份');
+      expect(badge).toContain('2 个账号');
+      // 详情里确实是两个账号——徽标的数字必须和它一致，而不是各说各的
+      await keeper.getByTestId('detail-open').click();
+      const detail = keeper.getByTestId('subject-detail');
+      await expect.poll(async () => detail.getByLabel('关联账号').locator('.identity-detail__row').count())
+        .toBe(3);
+      // 关掉页面（每个用例一个新 context）
+      await page.close();
+    }
+
+    // 情形 B：两个被并入的身份，各挂一个号（账号数 = 身份数）
+    resetStore([
+      {
+        ...template,
+        subject_id: 'keeper_b',
+        display_name: '保留者乙',
+        merged_into: null,
+        accounts: [account('keeper_b_1', '33330001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_b1',
+        display_name: '并入者乙一',
+        merged_into: 'keeper_b',
+        accounts: [account('member_b1_1', '44440001')],
+      },
+      {
+        ...template,
+        subject_id: 'member_b2',
+        display_name: '并入者乙二',
+        merged_into: 'keeper_b',
+        accounts: [account('member_b2_1', '44440002')],
+      },
+    ]);
+    {
+      const { page } = await openRelations({ width: 1440, height: 900 });
+      const keeper = page.locator('[data-testid="subject-card"][data-subject-id="keeper_b"]');
+      await keeper.waitFor();
+      const badge = (await keeper.getByTestId('merged-members-badge').innerText()).trim();
+      expect(badge).toContain('2 个身份');
+      // 两个数相等时不重复写账号数
+      expect(badge).not.toContain('个账号');
+      await page.close();
+    }
+  }, TEST_TIMEOUT);
+
+  it('关闭弹层后回到原来的记录：滚动可见，且焦点落回那一行', async (ctx) => {
+    if (skip(ctx)) return;
+    /*
+     * 这条钉住"回到原记录"的**可观测效果**，而且必须从**远离那一行的地方**关闭。
+     *
+     * 为什么强调这一点：我第一版测试是点该行自己的「详情」按钮来关详情的，
+     * 而那个按钮本来就在那一行里——焦点天然就在行内，于是**任何实现**都能
+     * 通过（把 `focus()` 退回成对 div 的空操作，测试照样绿）。这说明那条断言
+     * 测的是点击动作自身的副作用，与 `returnTo` 无关。
+     *
+     * 所以改成：从改名弹层（模态、位于页面顶层）里点取消关闭。此时
+     * `document.activeElement` 在弹层内部，关闭后浏览器会把它清回 body——
+     * 焦点**必须**由 `returnTo` 逻辑重新带回原记录所在的行，否则这条会红。
+     */
+    resetStore();
+    const { page } = await openRelations({ width: 1440, height: 700 });
+
+    const card = page.getByTestId('subject-card').nth(20);
+    await card.scrollIntoViewIfNeeded();
+    const subjectId = await card.getAttribute('data-subject-id');
+    expect(subjectId).toBeTruthy();
+
+    // 打开该行的改名弹层，再从弹层里取消
+    await card.getByTestId('rename-open').click();
+    const dialog = page.getByTestId('rename-dialog');
+    await dialog.waitFor();
+    // 关闭前焦点在弹层内部（不是在列表行里）——这是这条测试的前提
+    const beforeFocus = await page.evaluate(() => {
+      const active = document.activeElement;
+      return {
+        insideDialog: Boolean(active?.closest?.('[data-testid="rename-dialog"]')),
+        rowId: active?.closest?.('[data-subject-id]')?.getAttribute('data-subject-id') ?? null,
+      };
+    });
+    expect(beforeFocus.insideDialog, '焦点应当已经在弹层内部').toBe(true);
+    expect(beforeFocus.rowId, '关闭前焦点不应已经在原记录行里').toBeNull();
+
+    await dialog.getByRole('button', { name: '取消' }).click();
+    await expect.poll(async () => page.getByTestId('rename-dialog').count()).toBe(0);
+
+    const state = await page.evaluate((id) => {
+      const active = document.activeElement;
+      const row = active?.closest?.('[data-subject-id]') ?? null;
+      const target = document.querySelector(`[data-subject-id="${CSS.escape(id as string)}"]`);
+      let inView = false;
+      if (target) {
+        const rect = target.getBoundingClientRect();
+        inView = rect.top >= 0 && rect.bottom <= window.innerHeight;
+      }
+      return {
+        rowSubjectId: row?.getAttribute('data-subject-id') ?? null,
+        inView,
+        tag: active?.tagName ?? null,
+      };
+    }, subjectId);
+
+    expect(state.inView, '关闭后该记录不在视口内').toBe(true);
+    expect(state.rowSubjectId, '焦点没有回到原记录所在的行').toBe(subjectId);
+    // 焦点必须落在可操作元素上，否则键盘用户无法从这里继续
+    expect(state.tag).toBe('BUTTON');
+  }, TEST_TIMEOUT);
+
+  it('搜索只命中被并入的记录时，说"目标不在结果里"而不是"找不到目标"', async (ctx) => {
+    if (skip(ctx)) return;
+    /*
+     * 真实里会遇到：合并之后按源的账号搜索，结果里只有源自己——目标在不同
+     * 页、或没被这次搜索命中。此时页面**不能**说"找不到目标"（目标存在），
+     * 也不能把它悄悄折进某个看着像的行。它要如实说明并保留拆开入口。
+     */
+    const template = SUBJECTS[0];
+    if (!template) throw new Error('缺少测试数据');
+    resetStore([
+      {
+        ...template,
+        subject_id: 'target_x',
+        display_name: '目标本人',
+        merged_into: null,
+        accounts: [{
+          account_id: 'target_x_1',
+          connector_instance: 'napcat-2',
+          external_account_id: '77000001',
+          proof: 'proven',
+          revoked: false,
+        }],
+      },
+      {
+        ...template,
+        subject_id: 'source_x',
+        display_name: '被并入的人',
+        // 目标在一次搜索里不一定被返回；这里模拟"服务端只给了源"
+        merged_into: 'target_x',
+        accounts: [{
+          account_id: 'source_x_1',
+          connector_instance: 'onebot-default',
+          external_account_id: '88000002',
+          proof: 'pending',
+          revoked: false,
+        }],
+      },
+    ]);
+    const { page } = await openRelations({ width: 1440, height: 900 });
+
+    // 搜索只命中源（昵称只在源上）
+    await page.getByTestId('subjects-search').fill('被并入的人');
+    await page.getByTestId('subjects-search').press('Enter');
+    await expect.poll(async () => page.getByTestId('subject-card').count()).toBe(1);
+
+    const orphanSection = page.getByLabel('目标不在本次结果中的并入记录');
+    await orphanSection.waitFor();
+    const text = await orphanSection.innerText();
+    expect(text).toContain('目标这次没有出现在结果里');
+    // 不能出现"找不到目标"这种把事情说死的判断
+    expect(text).not.toContain('找不到目标');
+    // 并入对象仍要照实写出来（id 是核对依据）
+    expect(text).toContain('target_x');
+    // 拆开与详情都可用：不能因为"没有目标行"就失去操作
+    const row = orphanSection.getByTestId('subject-card').first();
+    expect(await row.getByTestId('unmerge-button').count()).toBe(1);
+    expect(await row.getByTestId('detail-open').count()).toBe(1);
+    expect(await row.getAttribute('data-subject-id')).toBe('source_x');
+  }, TEST_TIMEOUT);
+
+  it('空态与「只有 1 条」都不渲染下拉，且只有 1 人时合并面板仍可搜索', async (ctx) => {
     if (skip(ctx)) return;
     resetStore([]);
     const { page } = await openRelations({ width: 1440, height: 900 }, { expectEmpty: true });
-    // 一个人都没有：卡片一个也没有，明确说"还没有认识任何人"
     expect(await page.getByTestId('subjects-empty').innerText()).toContain('还没有认识任何人');
     expect(await page.locator('[data-testid="subject-card"]').count()).toBe(0);
     expect(await page.locator('option').count()).toBe(0);
 
-    // 只有一个人：有卡片、能点开，但下拉里没有可选目标，也不能点「合并」
+    // 只有一个人：能打开合并面板，里面明确说已加载的人里没有目标
     resetStore(SUBJECTS.slice(0, 1));
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('[data-testid="subject-card"]').first().waitFor();
     expect(await page.getByTestId('subjects-empty').count()).toBe(0);
     expect(await page.locator('option').count()).toBe(0);
-    expect(await page.getByTestId('merge-open').isDisabled()).toBe(true);
+    await page.getByTestId('merge-open').click();
+    const dialog = page.getByTestId('merge-confirm');
+    await dialog.waitFor();
+    expect(await dialog.getByTestId('merge-candidates-empty').count()).toBe(1);
+    // 没有目标就不能提交
+    expect(await dialog.getByTestId('merge-confirm-ok').isDisabled()).toBe(true);
   }, TEST_TIMEOUT);
 });
 
@@ -628,10 +996,22 @@ describe('关系页：375 / 1440 不横向溢出', () => {
       expect(reachable).toBe(true);
 
 
-      // 展开第一张：下拉里装着 49 个候选（含长昵称），最窄视口下的关键场景
+      // 打开第一张的合并面板：候选是 49 个按钮（含长昵称）+
+      // 两块"源/目标 + 完整账号 ID"——最窄视口下最容易撑破的组合。
       await page.getByTestId('merge-open').first().click();
-      await page.getByTestId('merge-target').waitFor();
+      const dialog = page.getByTestId('merge-confirm');
+      await dialog.waitFor();
+      await dialog.getByTestId('merge-candidate').first().click();
+      await expect.poll(async () => dialog.getByTestId('merge-confirm-target').innerText()).toContain('保留的一方');
       await assertNoHorizontalOverflow(page, `${width} 展开合并`);
+
+      // 面板本身也不能横向溢出（它是独立于 .page 的顶层元素）
+      const dialogWidths = await dialog.evaluate((element) => ({
+        client: element.clientWidth,
+        scroll: element.scrollWidth,
+      }));
+      console.info(`[identity.browser] ${width} 合并面板: ${dialogWidths.scroll}/${dialogWidths.client}`);
+      expect(dialogWidths.scroll, `${width}px 合并面板横向溢出`).toBeLessThanOrEqual(dialogWidths.client + 1);
     }, TEST_TIMEOUT);
   }
 });
