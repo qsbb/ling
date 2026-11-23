@@ -13,7 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import Select, and_, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found, unauthorized
@@ -1125,6 +1125,30 @@ class IdentityService:
         # 合并后的那个人——否则合并之后两个号还是两个人。
         return await self.canonical_subject(row.subject_id)
 
+    def _proven_login_bindings(
+        self, subject_id: str, connector_instances: set[str],
+    ) -> Select[tuple[ActorAccount]]:
+        source_has_login = exists(select(User.id).where(User.subject_id == Subject.id))
+        return (
+            select(ActorAccount)
+            .join(Subject, Subject.id == ActorAccount.subject_id)
+            .where(
+                ActorAccount.connector_instance.in_(connector_instances),
+                ActorAccount.revoked_at.is_(None),
+                ActorAccount.proof.in_(self.PROVEN_LEVELS),
+                or_(
+                    Subject.id == subject_id,
+                    and_(Subject.merged_into == subject_id, ~source_has_login),
+                ),
+            )
+        )
+
+    async def proven_login_account_ids(self, subject_id: str, connector_instances: set[str]) -> set[str]:
+        query = self._proven_login_bindings(subject_id, connector_instances)
+        return set(await self._session.scalars(
+            query.with_only_columns(ActorAccount.external_account_id).distinct()
+        ))
+
     async def resolve_proven_login_binding(
         self,
         *,
@@ -1141,20 +1165,9 @@ class IdentityService:
                 ErrorCode.conflict, "当前自然人无法接收记忆", status_code=409,
                 detail="destination_unavailable",
             )
-        source_has_login = exists(select(User.id).where(User.subject_id == Subject.id))
         query = (
-            select(ActorAccount)
-            .join(Subject, Subject.id == ActorAccount.subject_id)
-            .where(
-                ActorAccount.connector_instance.in_(connector_instances),
-                ActorAccount.external_account_id == external_account_id,
-                ActorAccount.revoked_at.is_(None),
-                ActorAccount.proof.in_(self.PROVEN_LEVELS),
-                or_(
-                    Subject.id == subject_id,
-                    and_(Subject.merged_into == subject_id, ~source_has_login),
-                ),
-            )
+            self._proven_login_bindings(subject_id, connector_instances)
+            .where(ActorAccount.external_account_id == external_account_id)
             .order_by(ActorAccount.subject_id != subject_id, ActorAccount.id)
             .limit(1)
         )

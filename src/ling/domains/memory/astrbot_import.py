@@ -40,6 +40,7 @@ _SUMMARY_TYPES = {"conversation_summary", "daily_digest", "memory_decay_summary"
 _STATEMENT_TYPES = {"manual_memory", "explicit_memory", "user_profile", "user_preference"}
 _QQ_PLATFORMS = {"aiocqhttp", "onebot", "qq"}
 _PRIVATE_SESSIONS = {"friendmessage", "privatemessage", "friend", "private"}
+_ASTRBOT_NON_MEMORY_TYPES = ("identity", "relationship", "timeline", "acl_rule", "acl_policy")
 QQ = Annotated[str, Field(pattern=r"^[1-9][0-9]{4,19}$")]
 Reference = Annotated[str, Field(min_length=1, max_length=200)]
 Label = Annotated[str, Field(max_length=80)]
@@ -55,16 +56,19 @@ class ArchiveError(ValueError):
         self.detail = detail
 
 
-class ArchiveHeader(BaseModel):
+class SourcePair(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    format: Literal["ling-astrbot-memory-jsonl"]
-    version: Literal[1]
     bot_qq: QQ
     owner_qq: QQ
 
 
-class _AstrBotNativeHeader(BaseModel):
+class ArchiveHeader(SourcePair):
+    format: Literal["ling-astrbot-memory-jsonl"]
+    version: Literal[1]
+
+
+class AstrBotNativeHeader(BaseModel):
     record_type: Literal["header"]
     format: Literal["astrbot-memory-jsonl"]
     version: Literal[1]
@@ -112,26 +116,29 @@ class ArchiveRecord(BaseModel):
     def is_summary(self) -> bool:
         return self.memory_type in _SUMMARY_TYPES
 
-    def skip_reason(
-        self, header: ArchiveHeader, *, reviewed_at: datetime, now: datetime, retention_cutoff: datetime,
-    ) -> SkipReason | None:
+    def belongs_to(self, source: SourcePair) -> bool:
         instance, _, session = self.session_id.partition(":")
         session_kind, _, qq = session.partition(":")
-        if not (
+        return (
             self.platform in _QQ_PLATFORMS
-            and instance
+            and bool(instance)
             and session_kind.lower() in _PRIVATE_SESSIONS
-            and qq == header.owner_qq
+            and qq == source.owner_qq
             and self.scope == "private"
             and not self.group_id
             and self.visibility == "private_pair"
             and self.subject_kind == "user"
-            and self.subject_id == header.owner_qq
+            and self.subject_id == source.owner_qq
             and (self.object_kind, self.object_id) in {
-                ("bot", header.bot_qq), ("user", header.owner_qq),
+                ("bot", source.bot_qq), ("user", source.owner_qq),
             }
-            and self.owner_bot_id == header.bot_qq
-        ):
+            and self.owner_bot_id == source.bot_qq
+        )
+
+    def skip_reason(
+        self, source: SourcePair, *, reviewed_at: datetime, now: datetime, retention_cutoff: datetime,
+    ) -> SkipReason | None:
+        if not self.belongs_to(source):
             return "outside_private_pair"
         if self.validity_status != "active":
             return "inactive"
@@ -162,7 +169,7 @@ class ArchiveRecord(BaseModel):
 
 @dataclass(frozen=True)
 class Archive:
-    header: ArchiveHeader
+    source: SourcePair
     records: Iterator[ArchiveRecord | None]
     digest: str
 
@@ -174,7 +181,47 @@ def _decode(line: bytes) -> str:
         raise ArchiveError("invalid_encoding") from exc
 
 
-def _records(file: BinaryIO) -> Iterator[ArchiveRecord | None]:
+def _reference_ids(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        item for item in value if isinstance(item, str) and 0 < len(item) <= 200
+    ))
+
+
+def _native_memory(data: dict) -> ArchiveRecord | None:
+    subject, target = data.get("subject"), data.get("object")
+    if not isinstance(subject, dict) or not isinstance(target, dict):
+        return None
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    record = {key: data[key] for key in ArchiveRecord.model_fields if key in data}
+    message_ids = _reference_ids([data.get("message_id")]) + _reference_ids(
+        metadata.get("source_message_ids")
+    )
+    record.update(
+        subject_kind=subject.get("kind"),
+        subject_id=subject.get("id"),
+        object_kind=target.get("kind"),
+        object_id=target.get("id"),
+        owner_bot_id=data.get("owner_bot_id") or metadata.get("owner_bot_id")
+        or (target.get("id") if target.get("kind") == "bot" else ""),
+        # Match the plugin's defaults when portable exports omit these fields.
+        validity_status=data.get("validity_status") or metadata.get("validity_status")
+        or ("archived" if data.get("lifecycle") == "archived" else "active"),
+        sensitivity=data.get("sensitivity") or metadata.get("sensitivity") or "private",
+        valid_from=data.get("valid_from") or metadata.get("valid_from") or None,
+        valid_to=data.get("valid_to") or metadata.get("valid_to") or None,
+        occurred_at=data.get("occurred_at") or None,
+        source_event_ids=_reference_ids(metadata.get("source_event_ids")),
+        source_message_ids=list(dict.fromkeys(message_ids)),
+    )
+    return ArchiveRecord.model_validate(record)
+
+
+def _records(file: BinaryIO, *, native: bool) -> Iterator[ArchiveRecord | None]:
     while line := file.readline(MAX_RECORD_BYTES + 1):
         if len(line) > MAX_RECORD_BYTES:
             while line and not line.endswith(b"\n"):
@@ -185,27 +232,66 @@ def _records(file: BinaryIO) -> Iterator[ArchiveRecord | None]:
             continue
         record = _decode(line)
         try:
-            yield ArchiveRecord.model_validate_json(record, strict=True)
-        except ValidationError:
+            if not native:
+                yield ArchiveRecord.model_validate_json(record, strict=True)
+                continue
+            entry = json.loads(record)
+            record_type = entry.get("record_type") if isinstance(entry, dict) else None
+            if record_type in _ASTRBOT_NON_MEMORY_TYPES:
+                continue
+            data = entry.get("data") if record_type == "memory" else None
+            yield _native_memory(data) if isinstance(data, dict) else None
+        except (ValueError, RecursionError):
             yield None
 
 
-def parse_archive(file: BinaryIO, *, digest: str) -> Archive:
+def read_archive_header(file: BinaryIO) -> ArchiveHeader | AstrBotNativeHeader:
     line = file.readline(MAX_RECORD_BYTES + 1)
     if len(line) > MAX_RECORD_BYTES or line.startswith(b"SQLite format 3\x00"):
         raise ArchiveError("unsupported_archive")
     header_line = _decode(line.removeprefix(b"\xef\xbb\xbf"))
     try:
-        header = ArchiveHeader.model_validate_json(header_line, strict=True)
-    except ValidationError as exc:
+        return ArchiveHeader.model_validate_json(header_line, strict=True)
+    except ValidationError:
         try:
-            _AstrBotNativeHeader.model_validate_json(header_line, strict=True)
-        except ValidationError:
+            return AstrBotNativeHeader.model_validate_json(header_line, strict=True)
+        except ValidationError as exc:
             raise ArchiveError("unsupported_archive") from exc
-        raise ArchiveError("astrbot_native_archive") from exc
-    if header.bot_qq == header.owner_qq:
+
+
+def find_native_sources(file: BinaryIO, owner_qqs: set[str]) -> list[SourcePair]:
+    """Find QQ pairs belonging to the signed-in owner and rewind to the first record."""
+    start = file.tell()
+    pairs: dict[tuple[str, str], SourcePair] = {}
+    try:
+        for record in _records(file, native=True):
+            if record is None or record.subject_id not in owner_qqs:
+                continue
+            key = (record.subject_id, record.owner_bot_id)
+            if key in pairs or record.subject_id == record.owner_bot_id:
+                continue
+            try:
+                source = SourcePair(owner_qq=record.subject_id, bot_qq=record.owner_bot_id)
+            except ValidationError:
+                continue
+            if record.belongs_to(source):
+                pairs[key] = source
+    finally:
+        file.seek(start)
+    return [pairs[key] for key in sorted(pairs)]
+
+
+def open_archive(
+    file: BinaryIO, *, digest: str, header: ArchiveHeader | AstrBotNativeHeader, source: SourcePair | None,
+) -> Archive:
+    native = isinstance(header, AstrBotNativeHeader)
+    if isinstance(header, ArchiveHeader):
+        source = header
+    if source is None:
+        raise ArchiveError("preview_invalid")
+    if source.bot_qq == source.owner_qq:
         raise ArchiveError("invalid_source_pair")
-    return Archive(header, _records(file), digest)
+    return Archive(source, _records(file, native=native), digest)
 
 
 class Destination(BaseModel):
@@ -228,7 +314,8 @@ def sign_confirmation(
     reviewed_at: int, expires: int, retention_days: int,
 ) -> str:
     payload = json.dumps([
-        "ling:astrbot-memory-import:v2", user_id, target.destination.subject_id,
+        "ling:astrbot-memory-import:v3", user_id, target.destination.subject_id,
+        target.destination.qq, target.destination.bot_qq,
         target.binding_id, target.binding_revision, target.forget_generation,
         digest, reviewed_at, expires, retention_days,
     ], separators=(",", ":")).encode()
@@ -287,8 +374,8 @@ class ImportResult:
     sample: list[ImportSample]
 
 
-def _memory_id(subject_id: str, header: ArchiveHeader, source_id: str) -> str:
-    key = json.dumps([subject_id, header.bot_qq, header.owner_qq, source_id], separators=(",", ":"))
+def _memory_id(subject_id: str, source: SourcePair, source_id: str) -> str:
+    key = json.dumps([subject_id, source.bot_qq, source.owner_qq, source_id], separators=(",", ":"))
     return "mem_as_" + hashlib.sha256(key.encode()).hexdigest()[:56]
 
 
@@ -314,13 +401,13 @@ async def process_archive(
         candidates: dict[str, ArchiveRecord] = {}
         for record in batch:
             reason = "invalid_record" if record is None else record.skip_reason(
-                archive.header, now=now, reviewed_at=review_time, retention_cutoff=cutoff,
+                archive.source, now=now, reviewed_at=review_time, retention_cutoff=cutoff,
             )
             if reason is not None:
                 skip_reasons[reason] += 1
                 continue
             assert record is not None
-            memory_id = _memory_id(target.destination.subject_id, archive.header, record.id)
+            memory_id = _memory_id(target.destination.subject_id, archive.source, record.id)
             if memory_id in candidates:
                 duplicates += 1
                 continue
@@ -330,7 +417,7 @@ async def process_archive(
             continue
         if write:
             inserted = await _insert_memories(
-                session, header=archive.header, target=target, candidates=candidates,
+                session, source=archive.source, target=target, candidates=candidates,
                 retention_days=retention_days,
             )
             accepted += inserted
@@ -382,13 +469,13 @@ def _sample(record: ArchiveRecord) -> ImportSample:
 async def _insert_memories(
     session: AsyncSession,
     *,
-    header: ArchiveHeader,
+    source: SourcePair,
     target: ImportTarget,
     candidates: dict[str, ArchiveRecord],
     retention_days: int,
 ) -> int:
     rows = []
-    ref = f"astrbot:{header.bot_qq}:{header.owner_qq}"
+    ref = f"astrbot:{source.bot_qq}:{source.owner_qq}"
     for memory_id, record in candidates.items():
         rows.append({
             "id": memory_id,
@@ -415,8 +502,8 @@ async def _insert_memories(
                 "memory_type": record.memory_type,
                 "platform": record.platform,
                 "session_id": record.session_id,
-                "bot_qq": header.bot_qq,
-                "owner_qq": header.owner_qq,
+                "bot_qq": source.bot_qq,
+                "owner_qq": source.owner_qq,
                 "occurred_at": record.occurred_at.isoformat() if record.occurred_at else None,
                 "created_at": record.created_at.isoformat(),
                 "updated_at": record.updated_at.isoformat(),

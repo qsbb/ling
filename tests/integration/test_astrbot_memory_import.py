@@ -31,6 +31,11 @@ OWNER_QQ = "100200300"
 BOT_QQ = "200300400"
 PREFIX = "/v1/memory/import"
 HEADERS = {"Content-Type": "application/x-ndjson"}
+NATIVE_HEADERS = {
+    **HEADERS,
+    "X-Ling-Import-Owner-QQ": OWNER_QQ,
+    "X-Ling-Import-Bot-QQ": BOT_QQ,
+}
 
 
 def _record(source_id: str = "memo-original", **changes: object) -> dict:
@@ -74,6 +79,27 @@ def _archive(*records: dict) -> bytes:
     return ("\n".join(json.dumps(item, ensure_ascii=False) for item in (header, *records)) + "\n").encode()
 
 
+def _native_archive(*entries: dict, format_: str = "astrbot-memory-jsonl") -> bytes:
+    header = {
+        "record_type": "header", "format": format_, "version": 1,
+        "plugin": "astrbot_plugin_memory_companion", "encoding": "utf-8",
+    }
+    return ("\n".join(json.dumps(item, ensure_ascii=False) for item in (header, *entries)) + "\n").encode()
+
+
+def _native_entry(source_id: str, **changes: object) -> dict:
+    row = _record(source_id, session_id=f"default:FriendMessage:{OWNER_QQ}")
+    subject = {"kind": row.pop("subject_kind"), "id": row.pop("subject_id")}
+    target = {"kind": row.pop("object_kind"), "id": row.pop("object_id")}
+    metadata = {key: row.pop(key) for key in ("owner_bot_id", "source_event_ids", "source_message_ids")}
+    for key in ("validity_status", "sensitivity", "valid_from", "valid_to"):
+        row.pop(key)
+    return {"record_type": "memory", "data": {
+        **row, "subject": subject, "object": target, "metadata": metadata,
+        "message_id": "direct-message", **changes,
+    }}
+
+
 def _sqlite_snapshot(path: Path, *records: dict) -> None:
     rows = []
     for record in records:
@@ -110,24 +136,119 @@ async def _row_counts() -> list[int]:
 
 
 async def test_preview_distinguishes_native_astrbot_export(logged_in: TestEnv) -> None:
-    header = {
-        "record_type": "header", "format": "astrbot-memory-jsonl", "version": 1,
-        "plugin": "astrbot_plugin_memory_companion", "encoding": "utf-8",
-    }
-    record = {"record_type": "memory", "data": {"id": "example", "content": "测试记忆"}}
     before = await _row_counts()
-    for format_, expected in (
-        ("astrbot-memory-jsonl", "astrbot_native_archive"),
-        ("other-memory-jsonl", "unsupported_archive"),
+    for format_, status, expected in (
+        ("astrbot-memory-jsonl", 409, "qq_binding_required"),
+        ("other-memory-jsonl", 422, "unsupported_archive"),
     ):
-        data = ("\n".join(json.dumps(row) for row in ({**header, "format": format_}, record)) + "\n").encode()
+        data = _native_archive(_native_entry("example"), format_=format_)
         response = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
-        assert response.status_code == 422
-        error = response.json()["error"]
-        assert error["detail"] == expected
-        if expected == "astrbot_native_archive":
-            assert "SQLite" in error["message"]
+        assert response.status_code == status
+        assert response.json()["error"]["detail"] == expected
     assert await _row_counts() == before
+
+
+async def test_native_export_previews_and_imports_only_the_selected_private_pair(
+    logged_in: TestEnv,
+) -> None:
+    await _bind(logged_in)
+    before = await _row_counts()
+    valid_until = (datetime.now(UTC) + timedelta(days=3)).isoformat()
+    data = _native_archive(
+        _native_entry("summary"),
+        _native_entry("object-bot", metadata={}),
+        _native_entry(
+            "profile", object={"kind": "user", "id": OWNER_QQ},
+            memory_type="user_profile", reality_level="real_user_fact",
+            metadata={"owner_bot_id": BOT_QQ, "valid_to": valid_until},
+        ),
+        _native_entry("group", scope="group", group_id="100200301"),
+        _native_entry("stranger", subject={"kind": "user", "id": "100200302"}),
+        _native_entry("wrong-bot", metadata={"owner_bot_id": "200300401"}),
+        _native_entry("unknown-bot", object={"kind": "user", "id": OWNER_QQ}, metadata={}),
+        _native_entry("unknown-platform", platform="default"),
+        _native_entry("archived", lifecycle="archived"),
+        _native_entry("pending", review_status="pending"),
+        _native_entry("restricted", metadata={"sensitivity": "secret"}),
+        _native_entry("expired", metadata={"valid_to": "2000-01-01T00:00:00Z"}),
+        {"record_type": "memory", "data": {"content": "字段不全的记忆"}},
+        {"record_type": "timeline", "data": _native_entry("timeline")["data"]},
+        {"record_type": "identity", "data": {"entity_kind": "user", "entity_id": OWNER_QQ}},
+    )
+    not_bound = await logged_in.client.post(
+        PREFIX + "/preview", content=data,
+        headers={**NATIVE_HEADERS, "X-Ling-Import-Owner-QQ": "100200302"},
+    )
+    assert not_bound.status_code == 409 and not_bound.json()["error"]["detail"] == "qq_binding_required"
+    same_qq = await logged_in.client.post(
+        PREFIX + "/preview", content=data,
+        headers={**NATIVE_HEADERS, "X-Ling-Import-Bot-QQ": OWNER_QQ},
+    )
+    assert same_qq.status_code == 422 and same_qq.json()["error"]["detail"] == "invalid_source_pair"
+    unmatched = await logged_in.client.post(
+        PREFIX + "/preview",
+        content=_native_archive(_native_entry("unverified", platform="default")),
+        headers=HEADERS,
+    )
+    assert unmatched.status_code == 422 and unmatched.json()["error"]["detail"] == "astrbot_source_unmatched"
+    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert (report["total"], report["accepted"], report["skipped"]) == (13, 3, 10)
+    assert report["destination"]["qq"] == OWNER_QQ and report["destination"]["bot_qq"] == BOT_QQ
+    assert {sample["source_id"] for sample in report["sample"]} == {"summary", "object-bot", "profile"}
+    assert report["skip_reasons"] == {
+        "outside_private_pair": 5, "inactive": 1, "not_reviewed": 1,
+        "restricted": 1, "expired": 1, "invalid_record": 1,
+    }
+    assert await _row_counts() == before
+
+    headers = {**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
+    changed_pair = await logged_in.client.post(
+        PREFIX + "/commit", content=data, headers={**headers, "X-Ling-Import-Bot-QQ": "200300401"},
+    )
+    assert changed_pair.status_code == 409 and changed_pair.json()["error"]["detail"] == "preview_invalid"
+    assert await _row_counts() == before
+    commit = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["imported"] == 3
+    library = (await logged_in.client.get("/v1/memory?view=library&source=astrbot_memory_companion")).json()
+    rows = {row["import_source"]["record_id"]: row for row in library["memories"]}
+    assert set(rows) == {"summary", "object-bot", "profile"}
+    assert rows["summary"]["kind"] == "episode" and rows["summary"]["valid_until"] is None
+    assert rows["profile"]["kind"] == "assertion" and rows["profile"]["valid_until"] == valid_until
+    assert f"astrbot:{BOT_QQ}:{OWNER_QQ}:message:direct-message" in rows["summary"]["source_event_ids"]
+    repeat = await logged_in.client.post(
+        PREFIX + "/preview", content=_archive(_record("summary")), headers=HEADERS,
+    )
+    assert repeat.status_code == 200
+    assert (repeat.json()["accepted"], repeat.json()["duplicates"]) == (0, 1)
+
+
+async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    other_bot = "200300401"
+    data = _native_archive(
+        _native_entry("first"),
+        _native_entry("second", object={"kind": "bot", "id": other_bot}, metadata={"owner_bot_id": other_bot}),
+        _native_entry(
+            "unbound-owner", subject={"kind": "user", "id": "100200302"},
+            session_id="default:FriendMessage:100200302",
+        ),
+    )
+    response = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json() == {"sources": [
+        {"owner_qq": OWNER_QQ, "bot_qq": BOT_QQ},
+        {"owner_qq": OWNER_QQ, "bot_qq": other_bot},
+    ]}
+    response = await logged_in.client.post(
+        PREFIX + "/preview", content=data, headers={**NATIVE_HEADERS, "X-Ling-Import-Bot-QQ": other_bot},
+    )
+    assert response.status_code == 200
+    report = response.json()
+    assert report["destination"]["bot_qq"] == other_bot
+    assert [row["source_id"] for row in report["sample"]] == ["second"]
 
 
 async def test_converted_snapshot_reaches_library_and_private_recall(
@@ -323,7 +444,10 @@ async def test_large_archive_previews_and_imports_every_batch(logged_in: TestEnv
 def test_archive_skips_an_oversized_line_and_reads_the_next_record() -> None:
     header, record = _archive(_record()).splitlines(keepends=True)
     content = header + b"x" * (importer.MAX_RECORD_BYTES + 50) + b"\n" + record
-    archive = importer.parse_archive(BytesIO(content), digest=hashlib.sha256(content).hexdigest())
+    file = BytesIO(content)
+    archive = importer.open_archive(
+        file, digest=hashlib.sha256(content).hexdigest(), header=importer.read_archive_header(file), source=None,
+    )
     invalid, valid = archive.records
     assert invalid is None
     assert valid is not None and valid.id == "memo-original"

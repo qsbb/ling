@@ -2,9 +2,13 @@
 
 Ling 接收 AstrBot Memory Companion 中本人和指定旧 Bot 的 QQ 私聊长期记忆。迁移保留旧摘要、手工记忆、明确记忆和用户陈述型资料。Ling 按已确认的 OneBot QQ 绑定找到当前账号的记忆库。
 
-## 生成迁移文件
+## 直接导入插件的 JSONL
 
-`/mcomp data export` 生成的 `memory-companion-日期-时间.jsonl` 缺少原有效期、有效状态和归属 Bot 字段。Ling 需要从插件的 SQLite 备份取得这些字段。
+在「记忆 → 导入旧记忆」选择 `/mcomp data export` 生成的 `memory-companion-日期-时间.jsonl`。Ling 用当前自然人的已确认 QQ 绑定匹配文件中的私聊账号，从记录的 Bot ID 或 `metadata.owner_bot_id` 识别旧 Bot。匹配到一组来源时直接显示预览，匹配到多组时先选择一组。确认目标和样本后即可导入。
+
+原生导出包含记忆、身份、关系、时间线和权限配置。预览统计记忆记录，筛选本人 QQ 私聊长期记忆。记录中保留的审核状态、可见范围和有效期会参与筛选。缺失的有效期沿用 Ling 的保留期，原插件未导出的字段无法还原。
+
+## 从 SQLite 备份生成迁移文件
 
 在 AstrBot 的 Memory Companion 插件数据目录找到 `memory_companion.db`，为独立备份选一个新文件名，然后用 SQLite 生成快照。
 
@@ -19,7 +23,9 @@ python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db l
   --bot-qq 200300400 --owner-qq 100200300
 ```
 
-在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。转换脚本默认导出整份，`--limit` 和 `--offset` 只是可选的选取方式，不是必须的——服务端不再限制文件总字节或记录总数。
+在「记忆 → 导入旧记忆」选择生成的 `ling-memories.jsonl`，核对预览里的目标自然人和记忆样本后确认。转换脚本默认导出所有匹配记录。`--limit` 和 `--offset` 可选。
+
+## 大文件
 
 导入接口按批读取和写入，临时文件使用 Ling 数据目录所在的磁盘。预览与确认均上传同一份文件，界面可以沿用已选的文件，不会为第二次请求再次读盘或转成文本。超大文件在预览/确认期间显示的是「正在上传并读取」这类明确状态：浏览器拿不到分块进度，服务端也要收完才开始逐行解析，所以界面不显示百分比。若自行配置了反代，确保它允许这两条导入路径传输大文件；仓库的 nginx 模板已对这两条路径放开 `client_max_body_size`。遇到 413 时先检查反代的上传设置，界面会保留已选文件以便重试。
 
@@ -29,10 +35,12 @@ python3 scripts/export_astrbot_memories.py /path/to/memory-companion-backup.db l
 
 | 请求 | 成功响应 |
 | --- | --- |
-| `POST /v1/memory/import/preview` | `destination`、`total`、`accepted`、`duplicates`、`skipped`、`skip_reasons`、`sample`、`confirmation_token`、`expires_at` |
+| `POST /v1/memory/import/preview` | `destination`、`total`、`accepted`、`duplicates`、`skipped`、`skip_reasons`、`sample`、`confirmation_token`、`expires_at`。原生导出匹配到多组来源时返回 `sources` |
 | `POST /v1/memory/import/commit` | `destination`、`total`、`imported`、`duplicates`、`skipped`、`skip_reasons`。另传 `X-Ling-Import-Token` 请求头 |
 
 `destination` 包含 `subject_id`、`display_name`、`qq` 和 `bot_qq`。其中 `qq` 是本人的 QQ，`bot_qq` 是导出的旧 Bot。目标由服务端确定。直接绑定的本人 QQ，以及已归入本人自然人且没有独立 Web 登录的 QQ 身份，都可以通过核对。
+
+每个 `sources` 条目包含 `owner_qq` 和 `bot_qq`。选中一组后重新预览，通过 `X-Ling-Import-Owner-QQ` 和 `X-Ling-Import-Bot-QQ` 指定来源。确认原生导出时从预览的 `destination` 取这两个值。Ling 迁移文件直接使用文件首行的 QQ。
 
 `sample` 最多 12 条，每条有 `source_id`、`kind`、`text`、`occurred_at`、`created_at` 和 `valid_until`。样本文本最多 400 个字符，完整原文在导入后可在记忆库查看。有效期与发生时间可以为空。
 
@@ -45,12 +53,14 @@ const preview = await fetch('/v1/memory/import/preview', {
   body: file,
 });
 
-// After presenting the preview and receiving the user's confirmation.
+// Read destination and confirmation_token from a successful preview.
 const result = await fetch('/v1/memory/import/commit', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/x-ndjson',
     'X-Ling-Import-Token': confirmationToken,
+    'X-Ling-Import-Owner-QQ': destination.qq,
+    'X-Ling-Import-Bot-QQ': destination.bot_qq,
   },
   body: file,
 });
@@ -80,7 +90,7 @@ const result = await fetch('/v1/memory/import/commit', {
 | 409 | `preview_invalid` | 保留文件，重新预览 |
 | 409 | `qq_binding_required` | 引导核对自然人设置里的本人 QQ 绑定 |
 | 409 | `destination_unavailable`、`memory_purge_in_progress` | 显示服务端说明，恢复后重新预览 |
-| 422 | `astrbot_native_archive` | 引导使用 SQLite 备份生成迁移文件 |
+| 422 | `astrbot_source_unmatched` | 核对文件里的私聊账号与 Ling 中的本人 QQ 绑定 |
 | 422 | `invalid_encoding`、`unsupported_archive`、`invalid_source_pair` | 保留错误反馈，允许换文件 |
 | 413 | 入口反代限制上传大小 | 确认反代的上传配置，保留文件以便重试 |
 

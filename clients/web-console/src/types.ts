@@ -438,6 +438,15 @@ export interface MemoryListResponse {
 
 /* ------------------------------------------------ 从 AstrBot 导入（契约见同名文档） */
 
+export interface MemoryImportSourcePair {
+  owner_qq: string;
+  bot_qq: string;
+}
+
+export interface MemoryImportSourceChoices {
+  sources: MemoryImportSourcePair[];
+}
+
 /** 服务端确定的目标：`qq` 是本人，`bot_qq` 是导出的旧 Bot。 */
 export interface MemoryImportDestination {
   subject_id: string;
