@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1182,6 +1184,229 @@ async def test_private_reply_is_split_and_reassembles(
         seg["data"]["text"] for part in sent_parts for seg in part if seg["type"] == "text"
     )
     assert rejoined == _LONG_REPLY, f"分段拼不回原稿：{rejoined[:60]!r}"
+
+
+async def _quote_asr_fixture(
+    env: TestEnv, monkeypatch, *, fail_first: bool = False,
+) -> tuple[list[str], dict[str, str]]:
+    from ling.domains.speech.asr_runtime import stop_worker
+    from ling.ports.channel import ChannelError, ChannelErrorKind
+    from ling.ports.speech import AsrResult, SpeechUsage
+    from tests.integration.test_asr_input import audio
+
+    worker, = [task for task in asyncio.all_tasks() if task.get_name() == "asr-worker"]
+    await stop_worker(worker)
+    draft = await env.client.put("/v1/settings/draft", json={
+        "providers": [{
+            "provider_id": "asrfixture", "kind": "siliconflow_asr",
+            "base_url": "https://example.test/v1", "models": [{"model_id": "fixture"}],
+        }],
+        "profiles": [{"profile": "speech.asr", "provider_id": "asrfixture", "model_id": "fixture"}],
+        "dialogue": {"private_may_stay_silent": False},
+    })
+    assert draft.status_code == 200, draft.text
+    published = await env.client.post("/v1/settings/publish", json={"revision": draft.json()["revision"]})
+    assert published.status_code == 200, published.text
+    reads: list[str] = []
+    transcripts = {
+        "https://media.example.test/old.silk": "老录音里的琥珀纸船",
+        "https://media.example.test/new.silk": "另一份录音里的淡紫森林",
+    }
+
+    async def fetch(ref: str):
+        reads.append(ref)
+        assert ref in transcripts
+        if fail_first and len(reads) == 1:
+            raise ChannelError(ChannelErrorKind.unreachable, "fixture download failed")
+        return audio(), "audio/wav"
+
+    class Provider:
+        async def transcribe(self, request, *, call):
+            return AsrResult(transcripts[reads[-1]], "zh", None, None, SpeechUsage())
+
+    async def build(config, *, secret_reader):
+        return SimpleNamespace(
+            ok=True, reason="", provider=Provider(), provider_id="asrfixture", model_id="fixture",
+        )
+
+    monkeypatch.setattr("ling.worker.make_media_fetcher", lambda *args, **kwargs: fetch)
+    monkeypatch.setattr("ling.domains.speech.asr_providers.build_asr_provider", build)
+    return reads, transcripts
+
+
+def _old_record(message_id: int, filename: str) -> bytes:
+    return _event_body(message_id=message_id, message=[
+        {"type": "record", "data": {"url": f"https://media.example.test/{filename}.silk"}},
+    ])
+
+
+async def test_private_quote_transcribes_the_selected_old_voice_and_reuses_it(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    from ling.domains.speech.asr_runtime import process_job, submit_job
+
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    evidence_ids = {}
+    for mid, filename in ((800, "old"), (801, "new")):
+        source = (await _post(logged_in, _old_record(mid, filename))).json()
+        assert len(source["media_evidence_ids"]) == 1 and not source["delivered"], source
+        evidence_ids[filename] = source["media_evidence_ids"][0]
+
+    reads, transcripts = await _quote_asr_fixture(logged_in, monkeypatch)
+    request_text = "帮我听一下这条语音"
+    asked = _event_body(message_id=802, message=f"[CQ:reply,id=800]{request_text}")
+    response = (await _post(logged_in, asked)).json()
+    assert response["accepted"] and response["decision"] == "deferred_attention", response
+    assert (await _post(logged_in, asked)).json()["duplicate"] is True
+    async with session_scope() as session:
+        job, = list((await session.scalars(select(AsrJob))).all())
+        assert job.state == "queued"
+        job_id = job.id
+    assert await process_job(logged_in.app, job_id)
+    await submit_job(logged_in.app, job_id, automatic=True)
+    older_ref = "https://media.example.test/old.silk"
+    assert reads == [older_ref]
+    async with session_scope() as session:
+        job = await session.get(AsrJob, job_id)
+        assert job is not None and job.submission == "committed"
+        request = await session.get(Message, job.source_message_id)
+        assert request is not None and request.text == request_text
+        snapshot = await session.scalar(select(PromptSnapshot).where(
+            PromptSnapshot.turn_id == request.turn_id,
+        ))
+        assert snapshot is not None
+        quote, = [item for item in snapshot.payload["messages"] if item["lane"] == "quote"]
+        assert transcripts[older_ref] in quote["content"]
+        old_audio = await session.get(MediaEvidenceRow, evidence_ids["old"])
+        assert old_audio is not None
+        old_audio.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    cached = (await _post(logged_in, _event_body(
+        message_id=803, message="[CQ:reply,id=800]这条语音里说了什么？",
+    ))).json()
+    cached_prompt = await _prompt_for(cached)
+    quote, = [item for item in cached_prompt["messages"] if item["lane"] == "quote"]
+    assert transcripts[older_ref] in quote["content"] and reads == [older_ref]
+
+    text_quoted = (await _post(logged_in, _event_body(
+        message_id=804, message="[CQ:reply,id=802]听一下这条",
+    ))).json()
+    quote, = [item for item in (await _prompt_for(text_quoted))["messages"] if item["lane"] == "quote"]
+    assert request_text in quote["content"] and transcripts[older_ref] not in quote["content"]
+    async with session_scope() as session:
+        assert list(await session.scalars(select(AsrJob.id))) == [job_id]
+
+
+@pytest.mark.parametrize(("boundary", "reason", "state", "note"), [
+    ("recall", "cancelled", "cancelled", "引用的那条语音已被撤回"),
+    ("revoked", "forbidden", "cancelled", "需要先开启对入站语音的识别授权"),
+    ("expired", "audio_unavailable", "failed", "当前没有可用的引用语音转写"),
+])
+async def test_private_quote_rechecks_audio_before_downloading(
+    logged_in: TestEnv, monkeypatch, boundary: str, reason: str, state: str, note: str,
+) -> None:
+    from ling.domains.speech.asr_runtime import process_job
+
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    voice = (await _post(logged_in, _old_record(810, "old"))).json()
+    assert len(voice["media_evidence_ids"]) == 1
+    reads, _ = await _quote_asr_fixture(logged_in, monkeypatch)
+    queued = (await _post(logged_in, _event_body(
+        message_id=811, message="[CQ:reply,id=810]听一下这条",
+    ))).json()
+    assert queued["decision"] == "deferred_attention", queued
+    async with session_scope() as session:
+        job_id = await session.scalar(select(AsrJob.id))
+        assert job_id
+
+    if boundary == "recall":
+        recalled = (await _post(logged_in, _event_body(
+            post_type="notice", notice_type="friend_recall", message_id=810,
+        ))).json()
+        assert recalled["accepted"], recalled
+    elif boundary == "revoked":
+        await _grant_inbound(logged_in, granted=False)
+    else:
+        async with session_scope() as session:
+            old_audio = await session.get(MediaEvidenceRow, voice["media_evidence_ids"][0])
+            assert old_audio is not None
+            old_audio.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    assert await process_job(logged_in.app, job_id) and reads == []
+    async with session_scope() as session:
+        job = await session.get(AsrJob, job_id)
+        assert job is not None and (job.error_code, job.state) == (reason, state)
+        assert job.submission == ("suppressed" if state == "cancelled" else "committed")
+    again = (await _post(logged_in, _event_body(
+        message_id=812, message="[CQ:reply,id=810]听一下这条",
+    ))).json()
+    snapshot = await _prompt_for(again)
+    assert note in snapshot["messages"][-1]["content"]
+    async with session_scope() as session:
+        assert list(await session.scalars(select(AsrJob.id))) == [job_id]
+
+
+async def test_private_quote_cannot_open_voice_from_another_window_of_the_same_person(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    other_account = 20003
+    async with session_scope() as session:
+        await IdentityService(session).bind_account(
+            subject_id=logged_in.subject_id, connector_instance=CFG.instance_id,
+            external_account_id=str(other_account), proof="proven",
+        )
+    voice = (await _post(logged_in, _old_record(820, "old"))).json()
+    assert len(voice["media_evidence_ids"]) == 1
+    reads, _ = await _quote_asr_fixture(logged_in, monkeypatch)
+    response = (await _post(logged_in, _event_body(
+        user_id=other_account, message_id=821, message="[CQ:reply,id=820]听一下这条",
+    ))).json()
+    assert "被引用的发言暂不可读" in (await _prompt_for(response))["messages"][-1]["content"]
+    assert not reads
+    async with session_scope() as session:
+        source = await session.get(MediaEvidenceRow, voice["media_evidence_ids"][0])
+        request = await session.scalar(select(Message).where(
+            Message.turn_id == response["turn_id"], Message.role == "user",
+        ))
+        assert source is not None and request is not None
+        assert source.subject_id == request.sender_subject_id == logged_in.subject_id
+        assert source.window_id != request.window_id
+        assert await session.scalar(select(AsrJob.id)) is None
+
+
+async def test_private_quote_retries_download_on_a_new_explicit_request(
+    logged_in: TestEnv, monkeypatch,
+) -> None:
+    from ling.domains.speech.asr_runtime import process_job
+
+    _install(logged_in, FakeOneBot())
+    await _bind(logged_in)
+    await _grant_inbound(logged_in)
+    await _post(logged_in, _old_record(830, "old"))
+    reads, transcripts = await _quote_asr_fixture(logged_in, monkeypatch, fail_first=True)
+    for mid in (831, 832):
+        asked = (await _post(logged_in, _event_body(
+            message_id=mid, message="[CQ:reply,id=830]听一下这条",
+        ))).json()
+        assert asked["decision"] == "deferred_attention", asked
+        async with session_scope() as session:
+            current_id = await session.scalar(select(AsrJob.id).where(AsrJob.state == "queued"))
+            assert current_id
+        assert await process_job(logged_in.app, current_id)
+    older_ref = "https://media.example.test/old.silk"
+    assert reads == [older_ref, older_ref]
+    async with session_scope() as session:
+        failed, recovered = (await session.scalars(select(AsrJob).order_by(AsrJob.queued_at))).all()
+        assert (failed.state, failed.error_code, failed.submission) == ("failed", "audio_download", "committed")
+        assert recovered.state == "succeeded" and recovered.submission == "committed"
+        assert recovered.text == transcripts[older_ref]
 
 
 async def test_private_quote_and_sentence_end_stay_in_the_same_message(

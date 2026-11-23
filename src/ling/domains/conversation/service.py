@@ -311,6 +311,8 @@ def _as_utc(value: datetime) -> datetime:
 class ReplyReference:
     platform_id: str
     message: MessageView | None
+    voice_text: str = ""
+    voice_note: str | None = None
 
 
 class ConversationService:

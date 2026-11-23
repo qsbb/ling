@@ -19,6 +19,7 @@ from ling.domains.speech.audio_input import prepare_audio
 from ling.domains.speech.transcription import (
     TranscriptionError,
     can_auto_transcribe,
+    cancel_job,
     lock_scope,
     require_authorized,
 )
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TEXT_FALLBACK_STATES = ("failed", "unknown", "unintelligible", "no_speech", "expired")
+_ACCESS_DENIED_CODES = {"forbidden", "cancelled", "unavailable"}
 
 
 def media_service(session, app) -> GeneratedMediaService:
@@ -166,11 +168,13 @@ async def _process_audio(
                 requester_window=job.window_id,
             )
         else:
-            from ling.domains.media.service import MediaEvidenceService
+            from ling.domains.media.service import MediaEvidenceError, MediaEvidenceService
+
             evidence = MediaEvidenceService(session, actor_id=job.actor_id)
-            await evidence.ensure_description_authorized(
-                item["evidence_id"], window_id=job.window_id
-            )
+            try:
+                await evidence.ensure_description_authorized(item["evidence_id"], window_id=job.window_id)
+            except MediaEvidenceError as exc:
+                raise TranscriptionError("audio_unavailable", "原语音已过期或无法读取") from exc
             raw = None
 
     if raw is None:
@@ -279,17 +283,20 @@ async def process_job(app, job_id: str | None = None) -> bool:
                 AsrJob.id == job_id
             ).with_for_update())
             if job is not None and job.state == "running" and job.attempt == attempt:
-                job.state = (
-                    "unknown" if kind in {"timeout", "network", "unavailable"}
-                    else "unintelligible" if kind == "unintelligible"
-                    else "failed"
-                )
                 job.error_code = kind
                 job.error_message = str(exc)[:300]
-                job.revision += 1
-                if job.mode == "send" and job.payload.get("text", "").strip():
-                    job.text = job.payload["text"].strip()
-                    submit_text = True
+                if isinstance(exc, TranscriptionError) and kind in _ACCESS_DENIED_CODES:
+                    await cancel_job(session, job)
+                else:
+                    job.state = (
+                        "unknown" if kind in {"timeout", "network", "unavailable"}
+                        else "unintelligible" if kind == "unintelligible"
+                        else "failed"
+                    )
+                    job.revision += 1
+                    if job.mode == "send" and job.payload.get("text", "").strip():
+                        job.text = job.payload["text"].strip()
+                        submit_text = True
         if submit_text:
             await submit_job(app, job_id, automatic=True)
     except Exception:
@@ -332,7 +339,11 @@ async def submit_job(app, job_id: str, *, automatic: bool = False,
             job.edited_text = edited_text.strip()
         body = job.edited_text if job.edited_text is not None else job.text
         input_text = job.payload.get("text", "").strip()
-        text = input_text if body == input_text else "\n".join(x for x in (input_text, body) if x)
+        if job.payload.get("quoted_voice"):
+            # The recognition belongs to the quote, not to the current utterance.
+            text = input_text
+        else:
+            text = input_text if body == input_text else "\n".join(x for x in (input_text, body) if x)
         if len(text) > 8000:
             raise TranscriptionError("too_long", "消息文字超过 8000 字符", 422)
         if job.source_message_id is None:
@@ -430,7 +441,8 @@ async def worker_loop(app) -> None:
                         job = await session.get(AsrJob, job_id, populate_existing=True)
                         if job is not None and job.submission != "committed":
                             job.submission = "suppressed"
-                            job.state = "cancelled" if exc.code in {"forbidden", "cancelled", "unavailable"} else job.state
+                            if exc.code in _ACCESS_DENIED_CODES:
+                                job.state = "cancelled"
                             job.error_code = exc.code
                             job.error_message = str(exc)[:300]
                             job.text = ""

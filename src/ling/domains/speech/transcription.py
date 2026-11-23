@@ -49,6 +49,11 @@ async def require_authorized(session: AsyncSession, job: AsrJob) -> Window:
         msg = await session.get(Message, job.source_message_id, populate_existing=True)
         if msg is None or msg.retracted_at is not None:
             raise TranscriptionError("cancelled", "原消息已删除或撤回")
+    if quoted_voice := job.payload.get("quoted_voice"):
+        from ling.domains.speech.relisten import quote_was_retracted
+
+        if await quote_was_retracted(session, quoted_voice, window_id=window.id):
+            raise TranscriptionError("cancelled", "引用的那条语音已被撤回")
     if job.state == "cancelled":
         raise TranscriptionError("cancelled", "语音识别已取消")
     return window

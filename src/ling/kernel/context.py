@@ -1920,7 +1920,14 @@ class ContextCompiler:
             # 谁多传一次，她就会在私聊里收到「阿岚：今天有点累」——看起来像
             # 群里有人在说话，而不是用户在跟她说话。
             user_sender_name = None
-        if quoted is not None:
+        if reply_reference is not None and reply_reference.voice_text:
+            transcript = _fit_message_text(reply_reference.voice_text, QUOTE_TOKEN_BUDGET)
+            annotated.append(CompiledMessage(
+                role="user", content=f"当前引用语音的识别结果：\n{UNTRUSTED_WRAPPER}\n{transcript}",
+                key="input", lane="quote", sender=user_sender_name or "对方",
+                at=quoted.created_at if quoted else None,
+            ))
+        elif quoted is not None:
             if quoted.role == "actor":
                 quote_sender = "你"
                 quote_prefix = "当前消息引用了你之前的一条回复。那一轮的正文："
@@ -1948,8 +1955,11 @@ class ContextCompiler:
                 )
             )
         current = f"{user_sender_name}：{user_text}" if user_sender_name else user_text
-        if reply_reference is not None and quoted is None:
-            current = f"（这条消息带有引用，被引用的发言暂不可读。）\n{current}"
+        if reply_reference is not None:
+            if reply_reference.voice_note:
+                current = f"（{reply_reference.voice_note}。）\n{current}"
+            elif quoted is None and not reply_reference.voice_text:
+                current = f"（这条消息带有引用，被引用的发言暂不可读。）\n{current}"
         if current_mark:
             current = f"{MESSAGE_ID_MARKER.format(token=current_mark)} {current}"
         annotated.append(
