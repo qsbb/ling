@@ -120,6 +120,20 @@ const EMPTY_SCOPE = {
   items: [],
 };
 
+/** 两个窗口：回顾里两条记忆各自来自其中之一。 */
+const sessions = [
+  {
+    session_id: 'win_mem_garden', window_id: 'win_mem_garden', actor_id: 'a', subject_id: 's',
+    title: '阳台的花', created_at: STAMP, updated_at: STAMP, message_count: 1,
+    archived: false, display_name: '阳台的花', channel: 'web', peer_id: null, pinned: false,
+  },
+  {
+    session_id: 'win_mem_bridge', window_id: 'win_mem_bridge', actor_id: 'a', subject_id: 's',
+    title: '城西的石桥', created_at: STAMP, updated_at: STAMP, message_count: 1,
+    archived: false, display_name: '城西的石桥', channel: 'web', peer_id: null, pinned: false,
+  },
+];
+
 interface Options {
   review?: unknown | 'fail' | 'hang';
 }
@@ -152,7 +166,9 @@ async function openReview(options: Options = {}): Promise<{ page: Page; reads: s
           },
         }));
       case '/v1/version': return route.fulfill(json({ current: '0.0.0' }));
-      case '/v1/sessions': return route.fulfill(json({ sessions: [] }));
+      // 会话列表与消息：跳转后聊天页要靠它们真的落到目标会话上，
+      // 只断言 URL 变了证明不了"到了正确的那个会话"。
+      case '/v1/sessions': return route.fulfill(json({ sessions: sessions }));
       case '/v1/consents': return route.fulfill(json({ schema_version: 'v1', known_scopes: [], consents: [] }));
       case '/v1/memory/purge/status': return route.fulfill(json({ items: [], note: '' }));
       case REVIEW: {
@@ -160,6 +176,21 @@ async function openReview(options: Options = {}): Promise<{ page: Page; reads: s
         if (options.review === 'hang') return; // 永不 fulfill：停在读取中
         return route.fulfill(json({ schema_version: 'v1', nights: options.review ?? [] }));
       }
+    }
+    // `/v1/sessions/{id}/messages`：每个窗口给一条能辨认的消息。
+    const messageMatch = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(path);
+    if (messageMatch) {
+      const windowId = decodeURIComponent(messageMatch[1]!);
+      const session = sessions.find(s => s.session_id === windowId);
+      if (!session) return route.fulfill(error('not_found', '没有这个会话', 404));
+      return route.fulfill(json({
+        messages: [{
+          message_id: `msg_${windowId}`, role: 'user', text: `来自 ${windowId} 的一句话`,
+          sequence: 1, turn_id: `turn_${windowId}`, state: 'completed', created_at: STAMP,
+          retracted_at: null, retriable: false,
+        }],
+        active_turn: null,
+      }));
     }
     return route.fulfill(error('not_found', `${request.method()} ${path}`, 404));
   });
@@ -263,6 +294,51 @@ describe('夜间回顾（真浏览器）', () => {
     expect(await countOf(page.getByTestId('sleep-items'))).toBe(0);
     expect(await textOf(page.getByTestId('sleep-review'))).not.toContain('夜间回顾没读出来');
     await shot(page, 'F-original-gone.png');
+  }, CASE_TIMEOUT);
+
+  it('H 来源会话：两条不同窗口的原话各跳到自己的会话', async () => {
+    const { page } = await openReview({ review: [SKIPPED_READY] });
+
+    // 先展开第一条的原话，点它的入口。
+    const gardenRow = page.getByTestId('sleep-item-0');
+    await gardenRow.getByText(/^原话 \d+ 条$/).click();
+    const gardenOpen = gardenRow.getByTestId('sleep-open-source');
+    await gardenOpen.first().waitFor({ state: 'visible' });
+    expect(await gardenOpen.first().getAttribute('data-window-id')).toBe('win_mem_garden');
+    await gardenOpen.first().click();
+    // 真的落到那个会话：URL 与页面上的消息都要对得上。
+    await page.waitForURL(/\/s\/win_mem_garden$/);
+    await page.getByText('来自 win_mem_garden 的一句话').waitFor({ state: 'visible' });
+    await shot(page, 'H-source-garden.png');
+
+    // 回来看第二条，必须跳到**另一个**窗口，不是第一条那个。
+    await page.goBack();
+    await page.waitForURL(/\?tab=review$/);
+    const bridgeRow = page.getByTestId('sleep-item-1');
+    await bridgeRow.getByText(/^原话 \d+ 条$/).click();
+    const bridgeOpen = bridgeRow.getByTestId('sleep-open-source');
+    await bridgeOpen.first().waitFor({ state: 'visible' });
+    expect(await bridgeOpen.first().getAttribute('data-window-id')).toBe('win_mem_bridge');
+    await bridgeOpen.first().click();
+    await page.waitForURL(/\/s\/win_mem_bridge$/);
+    await page.getByText('来自 win_mem_bridge 的一句话').waitFor({ state: 'visible' });
+    await shot(page, 'H-source-bridge.png');
+  }, CASE_TIMEOUT);
+
+  it('I 没有原话就没有入口', async () => {
+    const { page } = await openReview({
+      review: [{
+        ...SKIPPED_READY,
+        items: [{
+          memory_id: 'mem_summary', text: '只有摘要没有原话', window_id: 'win_summary',
+          turn_id: 'turn_summary', original: [],
+        }],
+      }],
+    });
+    const review = page.getByTestId('sleep-review');
+    expect(await textOf(review)).toContain('没有可核对的原话');
+    expect(await countOf(page.getByTestId('sleep-open-source'))).toBe(0);
+    await shot(page, 'I-no-original-no-entry.png');
   }, CASE_TIMEOUT);
 
   it('G 入口：夜间回顾是独立分区，切走再回来仍有内容', async () => {

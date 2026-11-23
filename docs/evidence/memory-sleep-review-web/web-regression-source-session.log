@@ -1,0 +1,342 @@
+$ vitest run
+
+ RUN  v3.2.7 /Users/lingxi/project/ling/.agents/worktrees/memory-sleep-review-web/clients/web-console
+
+ ✓ src/sleep-review.test.ts (23 tests) 16ms
+stderr | src/memory-workspace.browser.test.tsx > 记忆工作区：独立浏览器验收 > 只检索已加载的批次，告知范围且不把漏在批次之外的记录说成全库无结果
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-memory-workspace-vite-MknI5d/deps/react-dom_client.js?v=af255c44 as it exceeds the max of 500KB.
+
+stderr | src/sleep-review.browser.test.tsx > 夜间回顾（真浏览器） > A 准备：读取中只显示加载，不宣称没有回顾
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-sleep-vite-3xwltc/deps/react-dom_client.js?v=391bbbad as it exceeds the max of 500KB.
+
+stdout | src/life-timeline.browser.test.tsx > 1920：生活页在主栏内居中，状态标题保持单行
+[life-timeline.browser] life 1920: documentElement 1920/1920, body 1920/1920, page 1720/1720, timeline 970/970, generate 968/968
+
+stdout | src/life-timeline.browser.test.tsx > 此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退
+[life-timeline.browser] life 375 默认首屏: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/life-timeline.browser.test.tsx > 此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退
+[life-timeline.browser] life 375 更多记录: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 375：夏令时回拨的空档显示不同偏移
+[life-timeline.browser] life 375 夏令时回拨: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/identity.browser.test.tsx > 关系页：不再卡死（真浏览器） > 375 宽度下展开详情不会横向溢出
+[identity.browser] 375 详情: documentElement 375/375, body 375/375, page 375/375, editingCard 0/0
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 1440：时间轴 / 总览都没有横向溢出
+[life-timeline.browser] life 1440: documentElement 1440/1440, body 1440/1440, page 1240/1240, timeline 970/970, generate 968/968
+
+stdout | src/identity.browser.test.tsx > 关系页：不再卡死（真浏览器） > 1440 宽度下展开详情不会横向溢出
+[identity.browser] 1440 详情: documentElement 1440/1440, body 1440/1440, page 1240/1240, editingCard 0/0
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 1440：时间轴 / 总览都没有横向溢出
+[life-timeline.browser] dashboard 1440: documentElement 1440/1440, body 1440/1440, page 1240/1240
+
+stdout | src/connectors.browser.test.tsx > 接入器：最难的分支 —— rolled_back（HTTP 202 但没生效） > 说"新配置没起来、已恢复旧配置、没有生效"，绝不出现"已生效"
+[connectors.browser] rolled_back 提示： 新配置没起来，已恢复旧配置——这次保存没有生效。她现在用的还是改之前那一份，旧连接也已经恢复。请按下面的原因改好再保存。 后端说明：切换时发生异常：RuntimeError
+
+stdout | src/identity.browser.test.tsx > 关系页：不再卡死（真浏览器） > 首屏只渲染一页，且**没有**任何一个未展开卡片带 <option>
+[identity.browser] 2000 条关系 → 首屏 DOM 822 元素
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 375：时间轴 / 总览都没有横向溢出（数字见 stdout）
+[life-timeline.browser] life 375: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 375：时间轴 / 总览都没有横向溢出（数字见 stdout）
+[life-timeline.browser] life 375 expanded details: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：生活时间轴与总览两块 > 375：时间轴 / 总览都没有横向溢出（数字见 stdout）
+[life-timeline.browser] dashboard 375: documentElement 375/375, body 375/375, page 375/375
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：手动生成日程 > 1440：空计划 → 点一次 → 正在生成 → ready → 按钮变重新生成（含确认与只发一次）
+[life-timeline.browser] life 1440 生成条: documentElement 1440/1440, body 1440/1440, page 1240/1240, timeline 970/970, generate 968/968
+
+ ✓ src/sleep-review.browser.test.tsx (9 tests) 12747ms
+   ✓ 夜间回顾（真浏览器） > A 准备：读取中只显示加载，不宣称没有回顾  5593ms
+   ✓ 夜间回顾（真浏览器） > B 可读 ok+ready：条目可读，原话可展开核对  1065ms
+   ✓ 夜间回顾（真浏览器） > C skipped+ready：不显示为失败，条目照常可读  863ms
+   ✓ 夜间回顾（真浏览器） > D 空：一条直接的空状态  635ms
+   ✓ 夜间回顾（真浏览器） > E 读取失败：说失败、可重试，不降级成空状态  712ms
+   ✓ 夜间回顾（真浏览器） > F 原话不可再用：empty 说清是来源已不能用，不是失败  705ms
+   ✓ 夜间回顾（真浏览器） > H 来源会话：两条不同窗口的原话各跳到自己的会话  1132ms
+   ✓ 夜间回顾（真浏览器） > I 没有原话就没有入口  656ms
+   ✓ 夜间回顾（真浏览器） > G 入口：夜间回顾是独立分区，切走再回来仍有内容  1019ms
+stdout | src/identity.browser.test.tsx > 关系页：不再卡死（真浏览器） > 「加载更多」按 offset 续页，到底显示「没有更多了」
+[identity.browser] 120 人翻到底：1774 元素
+
+ ✓ src/persona.browser.test.tsx (10 tests) 13970ms
+   ✓ 无人设时的空状态 > 页面中间显示「暂无人设」，新建按钮在中间而不是右上角  3668ms
+   ✓ 无人设时的空状态 > 点「新建人设」进入创建表单；空字段带 placeholder，输入框 value 为空  1038ms
+   ✓ 有人设时的卡片列表 > 右上角「创建人格」；当前生效的卡片带「当前使用」，其余没有  1016ms
+   ✓ 有人设时的卡片列表 > 宽屏 2 列、窄屏 1 列  803ms
+   ✓ 有人设时的卡片列表 > 点卡片进编辑，改完保存打到 PUT /v1/personas/{id}  1251ms
+   ✓ 有人设时的卡片列表 > 清空系统提示词能存下去（空就是空，不会被补回默认值）  960ms
+   ✓ 有人设时的卡片列表 > 三个对话开关逐项切换、保存后刷新保持，且互不牵连  2227ms
+   ✓ 有人设时的卡片列表 > ⋮ → 设为当前：调 activate，徽章跟着换卡片  1075ms
+   ✓ 有人设时的卡片列表 > ⋮ → 删除：先二次确认，取消就不发请求；确认才 DELETE  983ms
+   ✓ 有人设时的卡片列表 > 删除正在生效的人格被后端拒绝时，把原因显示在确认框里且不关框  715ms
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：手动生成日程 > 1440：空计划 → 点一次 → 正在生成 → ready → 按钮变重新生成（含确认与只发一次）
+[life-timeline.browser] life 1440 重排后: documentElement 1440/1440, body 1440/1440, page 1240/1240, timeline 970/970, generate 968/968
+
+ ✓ src/connector-instances.browser.test.tsx (11 tests) 15824ms
+   ✓ 接入器实例：左列表右详情 > 列表渲染每一项（显示名 + 身份 + 启停 + 默认），点选切换右侧  3008ms
+   ✓ 接入器实例：左列表右详情 > 保存时 instance_id 是**当前选中的那个**，不是默认值  1138ms
+   ✓ 接入器实例：左列表右详情 > 保存后刷新：同一非默认实例的第二次保存使用 scoped GET 的新 generation  2219ms
+   ✓ 接入器实例：左列表右详情 > 非默认实例保存后先重读 scoped generation，再允许同页连续保存  1267ms
+   ✓ 接入器实例：左列表右详情 > 409 后刷新状态重读选中实例的 generation，随后保存成功  1430ms
+   ✓ 接入器实例：左列表右详情 > 实例策略保留 false 与显式空人格，并预览后按当前实例提交 set、clear 和令牌  1300ms
+   ✓ 接入器实例：左列表右详情 > 切实例时草稿被重置：A 的未保存输入不会出现在 B 上  1744ms
+   ✓ 接入器实例：左列表右详情 > 空列表：显示"新建第一个实例"的引导，不是空白也不是错误  885ms
+   ✓ 接入器实例：左列表右详情 > 列表加载失败：显示错误与原因，不是空白  709ms
+   ✓ 接入器实例：左列表右详情 > 默认实例的删除按钮是禁用的，并写明原因  984ms
+   ✓ 接入器实例：左列表右详情 > 删除前有确认，并说明是软删（历史配置还在）  793ms
+stdout | src/identity.browser.test.tsx > 关系页：375 / 1440 不横向溢出 > 375px：只读状态与展开状态都不溢出
+[identity.browser] 375 只读: documentElement 375/375, body 375/375, page 375/375, editingCard 0/0
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：手动生成日程 > 375：生成条（含状态与确认条）不横向溢出
+[life-timeline.browser] life 375 生成条: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+stdout | src/identity.browser.test.tsx > 关系页：375 / 1440 不横向溢出 > 375px：只读状态与展开状态都不溢出
+[identity.browser] 375 展开合并: documentElement 375/375, body 375/375, page 375/375, editingCard 345/345
+
+stdout | src/life-timeline.browser.test.tsx > 真实浏览器：手动生成日程 > 375：生成条（含状态与确认条）不横向溢出
+[life-timeline.browser] life 375 409 状态: documentElement 375/375, body 375/375, page 375/375, timeline 337/337, generate 335/335
+
+ ✓ src/life-timeline.browser.test.tsx (8 tests) 16271ms
+   ✓ 1920：生活页在主栏内居中，状态标题保持单行  3045ms
+   ✓ 此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退  2054ms
+   ✓ 时间轴失败仍展示已确认的 running 活动，不把计划当此刻  1043ms
+   ✓ 真实浏览器：生活时间轴与总览两块 > 375：夏令时回拨的空档显示不同偏移  813ms
+   ✓ 真实浏览器：生活时间轴与总览两块 > 1440：时间轴 / 总览都没有横向溢出  2323ms
+   ✓ 真实浏览器：生活时间轴与总览两块 > 375：时间轴 / 总览都没有横向溢出（数字见 stdout）  1624ms
+   ✓ 真实浏览器：手动生成日程 > 1440：空计划 → 点一次 → 正在生成 → ready → 按钮变重新生成（含确认与只发一次）  4250ms
+   ✓ 真实浏览器：手动生成日程 > 375：生成条（含状态与确认条）不横向溢出  707ms
+ ✓ src/memory-workspace.browser.test.tsx (11 tests) 16595ms
+   ✓ 记忆工作区：独立浏览器验收 > 只检索已加载的批次，告知范围且不把漏在批次之外的记录说成全库无结果  5480ms
+   ✓ 记忆工作区：独立浏览器验收 > 四个分区是可导航的独立目的地，核心只在进入该分区后读取  1329ms
+   ✓ 记忆工作区：独立浏览器验收 > 学习设置发布每轮带入的旧记忆条数并回显零值  1348ms
+   ✓ 记忆工作区：独立浏览器验收 > 纠正：打开和取消不写入，确认后只提交目标记录  1202ms
+   ✓ 记忆工作区：独立浏览器验收 > 撤回：打开和取消不写入，确认后只提交目标记录  1104ms
+   ✓ 记忆工作区：独立浏览器验收 > 桌面用键盘从搜索进入搜索结果并打开匹配记忆  1346ms
+   ✓ 记忆工作区：独立浏览器验收 > 375 CSS px 触屏能打开详情并回到仍然可用的列表  1033ms
+   ✓ 记忆工作区：独立浏览器验收 > 切换历史筛选时，晚到只含撤回记录的响应不能覆盖已经显示的归档结果  1020ms
+   ✓ 记忆工作区：独立浏览器验收 > 记忆库读取失败有提示，不阻塞其他分区  857ms
+   ✓ 记忆工作区：独立浏览器验收 > 核心记忆读取失败有提示，不阻塞其他分区  670ms
+   ✓ 记忆工作区：独立浏览器验收 > 学习设置读取失败有提示，不阻塞其他分区  875ms
+stdout | src/identity.browser.test.tsx > 关系页：375 / 1440 不横向溢出 > 1440px：只读状态与展开状态都不溢出
+[identity.browser] 1440 只读: documentElement 1440/1440, body 1440/1440, page 1240/1240, editingCard 0/0
+
+ ✓ src/connectors.browser.test.tsx (13 tests) 16625ms
+   ✓ 切换平台和接法只改变当前视图，不改已有凭据或草稿  3670ms
+   ✓ 接入器：真的能改并保存 > 改一个字段 → 保存：请求体只含那一个键，If-Match 是当前 generation，界面说已生效  1043ms
+   ✓ 接入器：真的能改并保存 > 密钥留空不发；填了新值才发，且输入框始终不回显已有值  1178ms
+   ✓ 接入器：真的能改并保存 > 「清除」密钥 → 走 clear（不是 set:""），输入框换成一段说明  1094ms
+   ✓ 接入器：真的能改并保存 > 白名单组（access）也能保存，If-Match 用它自己的 generation  1458ms
+   ✓ 接入器：最难的分支 —— rolled_back（HTTP 202 但没生效） > 说"新配置没起来、已恢复旧配置、没有生效"，绝不出现"已生效"  948ms
+   ✓ 接入器：失败分支各说各的话 > 409 → 说"别处改过了"，给「刷新后重试」，不假装保存成功  1218ms
+   ✓ 接入器：失败分支各说各的话 > 422 → 点名那个键，说"一个连接都没停过"，只有那一行标红  1112ms
+   ✓ 接入器：失败分支各说各的话 > 503 → 说是这个进程切换不了，不是你填错了  1048ms
+   ✓ 接入器：恢复默认要二次确认 > 点「恢复默认」先弹确认；确认才 POST reset，并说清结果  1204ms
+   ✓ 接入器：实例与配置同屏 > 字段和保存按钮位于右侧详情栏，窄屏详情排在实例列表之后  928ms
+   ✓ 接入器：窄屏表单可用 > 375：不横向溢出，输入框与保存按钮都 ≥44px  730ms
+   ✓ 接入器：非 owner 只读 > can_edit=false 时没有保存按钮与「恢复默认」  708ms
+stdout | src/identity.browser.test.tsx > 关系页：375 / 1440 不横向溢出 > 1440px：只读状态与展开状态都不溢出
+[identity.browser] 1440 展开合并: documentElement 1440/1440, body 1440/1440, page 1240/1240, editingCard 978/978
+
+ ✓ src/window-policy.browser.test.tsx (11 tests) 16848ms
+   ✓ Web 会话对话设置 > 保存当前群的分段上限，也可恢复默认  3240ms
+   ✓ Web 会话对话设置 > 快捷加入和移除当前群，不覆盖其他群或发送者  1084ms
+   ✓ Web 会话对话设置 > 逐字段显示来源并预览保存 set 与 clear，宽度 375  1209ms
+   ✓ Web 会话对话设置 > 逐字段显示来源并预览保存 set 与 clear，宽度 1440  1107ms
+   ✓ Web 会话对话设置 > 编辑预览内容后会重新获取预览令牌  1322ms
+   ✓ Web 会话对话设置 > 历史平台窗口来源未知时不套用实例覆盖  792ms
+   ✓ Web 会话对话设置 > 历史平台会话可预览并确认来源绑定  1100ms
+   ✓ Web 会话对话设置 > 重复点击只切换同一个会话面板，宽度 375  1175ms
+   ✓ Web 会话对话设置 > 重复点击只切换同一个会话面板，宽度 1440  1390ms
+   ✓ Web 会话对话设置 > 成员看不到修改入口  602ms
+   ✓ 日志详情支持键盘展开，缓冲淘汰旧行后仍展开原消息  3429ms
+ ✓ src/identity.browser.test.tsx (14 tests) 16830ms
+   ✓ 关系页：不再卡死（真浏览器） > 按需展开详情、独立翻页并切换不同人的内容  3384ms
+   ✓ 关系页：不再卡死（真浏览器） > 列表和详情按真实证明状态区分管理员确认、已证明及待验证  968ms
+   ✓ 关系页：不再卡死（真浏览器） > 没有关系事件时说明统计范围和空态  1048ms
+   ✓ 关系页：不再卡死（真浏览器） > 详情某一部分失败时保留其他部分并可重试  906ms
+   ✓ 关系页：不再卡死（真浏览器） > 375 宽度下展开详情不会横向溢出  893ms
+   ✓ 关系页：不再卡死（真浏览器） > 1440 宽度下展开详情不会横向溢出  1489ms
+   ✓ 关系页：不再卡死（真浏览器） > 首屏只渲染一页，且**没有**任何一个未展开卡片带 <option>  752ms
+   ✓ 关系页：不再卡死（真浏览器） > 同时只有一张卡片展开；切换时上一张收起；取消后回到零个 <select>  1172ms
+   ✓ 关系页：不再卡死（真浏览器） > 合并后可改目标姓名，拆开后源姓名仍在  2007ms
+   ✓ 关系页：不再卡死（真浏览器） > 「加载更多」按 offset 续页，到底显示「没有更多了」  942ms
+   ✓ 关系页：不再卡死（真浏览器） > 搜索走服务端 q（不是只在当前页里筛）  635ms
+   ✓ 关系页：不再卡死（真浏览器） > 空态与「只有 1 条」都不会渲染下拉  870ms
+   ✓ 关系页：375 / 1440 不横向溢出 > 375px：只读状态与展开状态都不溢出  761ms
+   ✓ 关系页：375 / 1440 不横向溢出 > 1440px：只读状态与展开状态都不溢出  621ms
+ ✓ src/life-timeline.test.tsx (53 tests) 549ms
+ ✓ src/voice-settings.browser.test.tsx (19 tests) 17795ms
+   ✓ 对话工具设置 > 展开时读取真实生效状态，并区分模型声明和插件启停  3014ms
+   ✓ 对话工具设置 > 旧配置默认关闭，开启后随对话策略保存  814ms
+   ✓ 语音设置：意愿档位 > 三档都在，默认 natural，且每档下面有一句说明  664ms
+   ✓ 语音设置：意愿档位 > 回读：库里是 expressive 时选中 expressive，不是回到 natural  925ms
+   ✓ 语音设置：意愿档位 > 换档 → 保存：请求体里 dialogue.voice_willingness 是选中的那一档  798ms
+   ✓ 语音设置：意愿档位 > 档位能不能存，页面必须如实说（不许画一个能点却不生效的控件）  665ms
+   ✓ 语音设置：三家字段按 kind 切换 > 未选 kind：一个音色字段都不显示，并说清"只会发文字"  756ms
+   ✓ 语音设置：三家字段按 kind 切换 > minimax：voice_id + 语速/音量/音高/情绪 全部出现  1032ms
+   ✓ 语音设置：三家字段按 kind 切换 > fishaudio：**只有** voice_id，不显示语速/音量/音高/情绪  764ms
+   ✓ 语音设置：三家字段按 kind 切换 > mimo：只有参考音频上传，**不显示 speed/vol/pitch**，也不显示 voice_id  889ms
+   ✓ 语音设置：切 kind 清掉旧家的字段 > minimax（填了语速/音量/音高）→ mimo：切回来的 speed 是默认值，不是刚才填的  1058ms
+   ✓ 语音设置：切 kind 清掉旧家的字段 > minimax → mimo → 填参考音频 → 保存：请求体里**没有** speed/vol/pitch/voice_id  1097ms
+   ✓ 语音设置：切 kind 清掉旧家的字段 > minimax → fishaudio：voice_id 保住，四个参数不出现在请求体里  775ms
+   ✓ 语音设置：MiMo 参考音频上传 > 上传成功 → asset_id 填进表单 → 保存请求体里带它  921ms
+   ✓ 语音设置：MiMo 参考音频上传 > 上传失败 → 说清原因（413 给 MB）→ 可以重试并成功  699ms
+   ✓ 语音设置：MiMo 参考音频上传 > 上传失败（422 不是音频）→ 列出支持的格式  643ms
+   ✓ 语音设置：保存前拦截与字段级错误 > 选了 minimax 但没填 voice_id → 保存被拦，一个 PUT 都没发  704ms
+   ✓ 语音设置：保存前拦截与字段级错误 > 选了 mimo 但没上传 → 保存被拦，一个 PUT 都没发  490ms
+   ✓ 语音设置：保存前拦截与字段级错误 > 后端在 validation_errors 里报 voice.voice_id → 标在那个输入框上，不是只丢横幅  683ms
+ ✓ src/nav.test.ts (52 tests) 296ms
+ ✓ src/dashboard.test.ts (57 tests) 446ms
+ ✓ src/logs.test.ts (72 tests) 105ms
+ ✓ src/memory.test.ts (78 tests | 1 skipped) 206ms
+stderr | src/memory-import.browser.test.tsx > 导入旧记忆 > A1/B1/B2/B3/B4：空库也有入口，预览先讲清目标、来源与可导入条数
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-import-vite-EhMk1D/deps/react-dom_client.js?v=8499f626 as it exceeds the max of 500KB.
+
+stdout | src/dashboard-fallback.browser.test.tsx > 总览回退提示 @ 1440 > 日程不可用时页面上真的出现"默认值"说明，且不横向溢出
+[dashboard-fallback.browser] 1440: doc+0, body+0, hints=[{"w":633,"scrollW":631,"clientW":631}], cards=[{"scrollW":633,"clientW":633}]
+
+ ✓ src/connectors.test.tsx (55 tests) 195ms
+ ✓ src/model-settings.test.tsx (57 tests) 407ms
+ ✓ src/sse.test.ts (11 tests) 149ms
+ ✓ src/imageUpdate.test.tsx (93 tests) 276ms
+ ✓ src/connector-instances.test.tsx (20 tests) 36ms
+ ✓ src/recall.test.tsx (32 tests) 301ms
+stdout | src/dashboard-fallback.browser.test.tsx > 总览回退提示 @ 375 > 日程不可用时页面上真的出现"默认值"说明，且不横向溢出
+[dashboard-fallback.browser] 375: doc+0, body+0, hints=[{"w":347,"scrollW":345,"clientW":345}], cards=[{"scrollW":347,"clientW":347}]
+
+stdout | src/prompt.browser.test.tsx > 真实浏览器：入口、请求、抽屉 > 四种收起方式：Esc / X / 遮罩 / 再点入口；焦点进抽屉、关闭后回入口
+[prompt.browser] 抽屉打开时入口中心 (865.4, 324.9) 命中 button.message__prompt，面板 left=950.4
+
+stdout | src/settings-layout.browser.test.tsx > 权限页：一条权限 = 一行 > 每行是一行字的高度量级，已授权与未授权各一行，动作是撤回/授予
+[settings-layout.browser] consent 行高： 摄像头=65, 位置=65, 公开发布=65, 跨设备记忆召回=65, 主动联系=65, 上传媒体=65, 描述收到的图片/音频/视频=65, 设备与真实世界动作=65
+
+ ✓ src/voice-player.test.tsx (18 tests) 115ms
+ ✓ src/dashboard-life.test.tsx (14 tests) 284ms
+ ✓ src/imageUpdate.browser.test.tsx (25 tests) 23880ms
+   ✓ 没有历史备份时，确认一次即可更新；执行进度在刷新后仍可见  4045ms
+   ✓ 确认打开后，如果轮询发现同版本的摘要已变，不能静默提交新目标  1006ms
+   ✓ 更新任务进度入口 > 排队时显示等待状态，没有旧任务  875ms
+   ✓ 更新任务进度入口 > 排队时显示等待状态，保留旧任务  879ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 direct  751ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 gh_proxy  765ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 gh_proxy_hk  833ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 gh_proxy_edgeone  885ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 mirror  616ms
+   ✓ 更新任务进度入口 > 排队时显示当前请求的来源 未知  838ms
+   ✓ 更新任务进度入口 > 仅有排队任务时显示任务自己的来源  928ms
+   ✓ 更新任务进度入口 > succeeded 的任务刷新后仍可查看阶段及固定耗时  1786ms
+   ✓ 更新任务进度入口 > failed_not_started 的任务刷新后仍可查看阶段及固定耗时  1331ms
+   ✓ 更新任务进度入口 > needs_manual 的任务刷新后仍可查看阶段及固定耗时  1186ms
+   ✓ 更新任务进度入口 > 运行中阶段未知时不伪造阶段进度  566ms
+   ✓ 镜像下载方式 > 375px 下选择 gh_proxy 并提交  539ms
+   ✓ 镜像下载方式 > 375px 下选择 gh_proxy_hk 并提交  456ms
+   ✓ 镜像下载方式 > 375px 下选择 gh_proxy_edgeone 并提交  480ms
+   ✓ 镜像下载方式 > 375px 下选择 mirror 并提交  514ms
+   ✓ 镜像下载方式 > 1440px 下选择 gh_proxy 并提交  504ms
+   ✓ 镜像下载方式 > 1440px 下选择 gh_proxy_hk 并提交  913ms
+   ✓ 镜像下载方式 > 1440px 下选择 gh_proxy_edgeone 并提交  788ms
+   ✓ 镜像下载方式 > 1440px 下选择 mirror 并提交  684ms
+   ✓ 镜像下载方式 > running 的进度与最近任务显示记录的线路  678ms
+   ✓ 镜像下载方式 > succeeded 的进度与最近任务显示记录的线路  648ms
+ ✓ src/settings-layout.browser.test.tsx (4 tests) 6615ms
+   ✓ 设置页布局 > 1440：2 列等宽，每格至少 500px 宽、箭头都在  3220ms
+   ✓ 设置页布局 > 375：一列、不横向溢出、按钮不重叠  1116ms
+   ✓ 权限页：一条权限 = 一行 > 每行是一行字的高度量级，已授权与未授权各一行，动作是撤回/授予  1022ms
+   ✓ 权限页：一条权限 = 一行 > 375：行内不横向溢出，按钮独占一行且可点  957ms
+ ✓ src/prompt.test.tsx (32 tests) 160ms
+ ✓ src/dialogue.test.tsx (35 tests) 187ms
+ ✓ src/persona.test.tsx (34 tests) 71ms
+stdout | src/dashboard-fallback.browser.test.tsx > 总览回退提示：场景回退（可用性卡片）@ 375 > 场景不明时把默认值说出来，可用性那句话不被误标，且不横向溢出
+[dashboard-fallback.browser] 375 场景回退: doc+0, hints=[{"w":347,"scrollW":345,"clientW":345}]
+
+ ✓ src/dashboard-fallback.test.tsx (19 tests) 125ms
+ ✓ src/about.test.ts (70 tests) 43ms
+ ✓ src/life-day.test.tsx (4 tests) 39ms
+ ✓ src/session-list-race.browser.test.tsx (5 tests) 7447ms
+   ✓ 会话列表请求交错 > 375px：列表先包含新会话时不会重复添加  3266ms
+   ✓ 会话列表请求交错 > 375px：较旧列表晚返回时不会覆盖新会话  1259ms
+   ✓ 会话列表请求交错 > 1440px：列表先包含新会话时不会重复添加  879ms
+   ✓ 会话列表请求交错 > 1440px：较旧列表晚返回时不会覆盖新会话  821ms
+   ✓ 管理员可在侧栏改渠道会话名并保存手动顺序  885ms
+stdout | src/prompt.browser.test.tsx > 真实浏览器：入口、请求、抽屉 > 1440 / 375 宽度与横向溢出，且背景没有被锁死
+[prompt.browser] 1440: panel 489.59px (right 1440.00), doc 1440/1440
+
+ ✓ src/voice-settings.test.ts (39 tests) 12ms
+stdout | src/prompt.browser.test.tsx > 真实浏览器：入口、请求、抽屉 > 1440 / 375 宽度与横向溢出，且背景没有被锁死
+[prompt.browser] 375: panel 375 (left 0), doc 375/375, body 375/375, drawer inner 375/375
+
+ ✓ src/prompt.browser.test.tsx (5 tests) 7444ms
+   ✓ 真实浏览器：入口、请求、抽屉 > 点击入口 → 请求发出 → 抽屉打开，分区顺序 / token / 折叠 / 截断都对  3016ms
+   ✓ 真实浏览器：入口、请求、抽屉 > 显示实际回灌步骤、失败结果和截断提示  982ms
+   ✓ 真实浏览器：入口、请求、抽屉 > 四种收起方式：Esc / X / 遮罩 / 再点入口；焦点进抽屉、关闭后回入口  1099ms
+   ✓ 真实浏览器：入口、请求、抽屉 > 404（已归档的消息）→「这次没有记录」；非 owner 没有入口  1310ms
+   ✓ 真实浏览器：入口、请求、抽屉 > 1440 / 375 宽度与横向溢出，且背景没有被锁死  674ms
+ ✓ src/recall.browser.test.tsx (8 tests) 8034ms
+   ✓ 真实浏览器：撤回提议卡片 > 列表里有提议 → 卡片出现，挂在被撤那条下面，并带正文摘要  2887ms
+   ✓ 真实浏览器：撤回提议卡片 > 点「撤回」→ 只发一次 confirm → 卡片变「已撤回」、按钮消失、目标消息标已撤回  714ms
+   ✓ 真实浏览器：撤回提议卡片 > confirm 失败 → 显示后端 note 原文，且页面上没有 reason_code  876ms
+   ✓ 真实浏览器：撤回提议卡片 > 点「算了」→ 发 decline → 卡片变「好，不撤了」  795ms
+   ✓ 真实浏览器：撤回提议卡片 > 列表接口 500 → 只有卡片区降级，聊天照常（消息在、输入框能用）  513ms
+   ✓ 真实浏览器：撤回提议卡片 > 超过 120 秒的提议：按钮不渲染，文案「已经来不及撤了」  689ms
+   ✓ 真实浏览器：撤回提议卡片 > 375px：卡片与已撤回气泡都不横向溢出  595ms
+   ✓ 真实浏览器：撤回提议卡片 > 1440px：卡片与已撤回气泡都不横向溢出  482ms
+ ✓ src/settings-timezone.test.tsx (12 tests) 25ms
+ ✓ src/settings-layout.test.tsx (16 tests) 20ms
+ ✓ src/tabs.test.ts (12 tests) 7ms
+ ✓ src/api-errors.test.ts (10 tests) 13ms
+ ✓ src/proactive-history.test.tsx (5 tests) 15ms
+ ✓ src/deferred.test.ts (5 tests) 3ms
+ ✓ src/connector-instance-acceptance.browser.test.tsx (10 tests) 10807ms
+   ✓ 验收：实例面板 > 首屏是平台导航、账号目录和下一步；入站正常不等于回复已配置  3633ms
+   ✓ 验收：实例面板 > S1 左侧列表：显示名 / 启停 / 是否默认 / 恰好一个选中  381ms
+   ✓ 验收：实例面板 > S3 保存带的是**当前选中**实例的 instance_id（核心 A）  646ms
+   ✓ 验收：实例面板 > S4 切换实例后草稿按实例隔离（核心 B）  805ms
+   ✓ 验收：实例面板 > S4b 切回后保存：存下去的必须是**屏幕上显示的那个值**  1080ms
+   ✓ 验收：实例面板 > S5 空列表显示"新建第一个实例"的引导（核心 C）  674ms
+   ✓ 验收：实例面板 > S6 删除禁用读后端 deletable，而不是字面量 default  1074ms
+   ✓ 验收：实例面板 > S7 加载失败显示错误与重试，且不被画成"空列表"  650ms
+   ✓ 验收：实例面板 > S8 删除要确认，并说明历史配置还在  694ms
+   ✓ 验收：实例面板 > S9 新建第一个实例之后，保存发到**新实例**  747ms
+ ✓ src/dashboard-fallback.browser.test.tsx (7 tests) 9217ms
+   ✓ 总览回退提示 @ 1440 > 日程不可用时页面上真的出现"默认值"说明，且不横向溢出  3434ms
+   ✓ 总览回退提示 @ 1440 > 正常（日程算出来的）时不出现任何提示，口径与上面一致  1175ms
+   ✓ 总览回退提示 @ 375 > 日程不可用时页面上真的出现"默认值"说明，且不横向溢出  973ms
+   ✓ 总览回退提示 @ 375 > 正常（日程算出来的）时不出现任何提示，口径与上面一致  967ms
+   ✓ 总览回退提示：场景回退（可用性卡片）@ 375 > 场景不明时把默认值说出来，可用性那句话不被误标，且不横向溢出  879ms
+   ✓ 正在忙什么：真浏览器渲染 > 1440：自己的会话 → 说出在看什么，且无横向溢出  897ms
+   ✓ 正在忙什么：真浏览器渲染 > 375：别人的会话只说"正忙着"，且无横向溢出  632ms
+ ✓ src/memory-import.browser.test.tsx (11 tests) 11126ms
+   ✓ 导入旧记忆 > A1/B1/B2/B3/B4：空库也有入口，预览先讲清目标、来源与可导入条数  4312ms
+   ✓ 导入旧记忆 > 识别 AstrBot 原生导出并引导生成可导入的文件  577ms
+   ✓ 导入旧记忆 > 全局上传上限的 413 提示分批转换  710ms
+   ✓ 导入旧记忆 > C1：重复与跳过放在次一级；D1：零条时没有确认按钮并给出下一步  615ms
+   ✓ 导入旧记忆 > E1：显示服务端 imported，而不是预览的 accepted  725ms
+   ✓ 导入旧记忆 > F1/F2：查看 AstrBot 记忆切到来源，并且能按 offset 翻页  1851ms
+   ✓ 导入旧记忆 > 刷新第一页会结束旧翻页状态，下一次仍能加载剩余记忆  593ms
+   ✓ 导入旧记忆 > 零新增时分别报告重复和跳过  328ms
+   ✓ 导入旧记忆 > H1：预览失效时保留文件，一步重新预览  436ms
+ ✓ src/audio-input.test.tsx (17 tests) 29088ms
+   ✓ Web 语音输入交互 > 上传音频可预听，发送只提交一次真实文件与资产 ID  4609ms
+   ✓ Web 语音输入交互 > 草稿提交使用用户编辑后的文字与服务端版本  2430ms
+   ✓ Web 语音输入交互 > 刷新只恢复原 job，取消后刷新不再恢复  3536ms
+   ✓ Web 语音输入交互 > 失败后的重试与取消作用于同一 job  1251ms
+   ✓ Web 语音输入交互 > 创建响应丢失后重试提交复用资产与幂等标识  1035ms
+   ✓ Web 语音输入交互 > 创建响应丢失后刷新页面复用资产与幂等标识  1378ms
+   ✓ Web 语音输入交互 > 上传网络失败保留音频，成功重试后才创建任务  768ms
+   ✓ Web 语音输入交互 > 轮询网络恢复后查询原任务并显示结果  4937ms
+   ✓ Web 语音输入交互 > 识别失败但混合文字已提交时不再提供重试或移除任务  1903ms
+   ✓ Web 语音输入交互 > 任务停止处理后准确提示停止状态 succeeded  1776ms
+   ✓ Web 语音输入交互 > 任务停止处理后准确提示停止状态 failed  1683ms
+   ✓ Web 语音输入交互 > 超出字节上限与空音频在上传前给出反馈  824ms
+   ✓ Web 语音输入交互 > 录音停止释放麦克风，生成音频可预听和发送  1625ms
+
+ Test Files  45 passed (45)
+      Tests  1125 passed | 1 skipped (1126)
+   Start at  01:06:01
+   Duration  29.67s (transform 2.19s, setup 0ms, collect 15.11s, tests 261.26s, environment 9ms, prepare 3.96s)

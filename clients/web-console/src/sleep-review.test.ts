@@ -24,6 +24,7 @@ import {
   reviewStatusCopy,
   reasonDetail,
   sleepDateLabel,
+  sourceSessionHref,
   speakerLabel,
 } from './components/SleepReview';
 import { memoryTabFromHref, memoryTabHref } from './components/MemoryPage';
@@ -217,6 +218,74 @@ describe('原话可核对', () => {
     }));
     expect(html).toContain('没有可核对的原话');
     expect(html).not.toContain('<details');
+  });
+});
+
+/* ==================================================================== 来源会话 */
+
+describe('来源会话入口', () => {
+  /** 两条记忆来自不同窗口——这正是"只看文本分不出来"的场景。 */
+  function twoWindows(): SleepReviewNight {
+    return night({
+      items: [
+        {
+          memory_id: 'mem_garden', text: '每周给阳台的山茶浇水',
+          window_id: 'win_garden', turn_id: 'turn_garden',
+          original: [{ speaker: 'user', text: '我每周给阳台的山茶浇水', truncated: false }],
+        },
+        {
+          memory_id: 'mem_bridge', text: '参观过城西的石桥',
+          window_id: 'win_bridge', turn_id: 'turn_bridge',
+          original: [{ speaker: 'user', text: '今天去看了城西那座石桥', truncated: false }],
+        },
+      ],
+    });
+  }
+
+  it('有可读原话时，每条原话都带来源入口，且指向各自的窗口', () => {
+    const html = render(h(SleepReviewNightCard, { night: twoWindows() }));
+    // 每条原话各一个入口。
+    expect(html.split('data-testid="sleep-open-source"').length - 1).toBe(2);
+    // 按**行**切开来断言：只看整页里出现过两个窗口名是不够的——
+    // 两条都指向同一个窗口时，两个名字照样都在（行容器上带着自己的
+    // data-window-id），那样断言会在错误实现下依然通过。
+    const rows = html.split('data-testid="sleep-item-').slice(1);
+    expect(rows).toHaveLength(2);
+    const [first, second] = rows;
+    expect(first).toContain('data-window-id="win_garden"');
+    expect(first).toContain('data-testid="sleep-open-source"');
+    expect(second).toContain('data-window-id="win_bridge"');
+    expect(second).toContain('data-testid="sleep-open-source"');
+    // 第一行的入口不能指到第二个窗口，反之亦然。
+    expect(first).not.toContain('data-window-id="win_bridge"');
+    expect(second).not.toContain('data-window-id="win_garden"');
+  });
+
+  it('地址沿用既有 /s/{window_id} 路由并做编码', () => {
+    expect(sourceSessionHref('win_garden')).toBe('/s/win_garden');
+    // 需要转义的 id 走同一条 routePath，与聊天页内部跳转一致。
+    expect(sourceSessionHref('win a/b')).toBe('/s/win%20a%2Fb');
+  });
+
+  /**
+   * 没有可读原话时不给入口：只凭一条摘要跳进会话，用户到了那边也找不到
+   * 对应的句子，等于把一个找不到的目标伪装成可核对。
+   */
+  it('没有原话时不渲染来源入口', () => {
+    const html = render(h(SleepReviewNightCard, {
+      night: night({
+        items: [{ memory_id: 'mem_c', text: '只有摘要', window_id: 'win_c', turn_id: 't', original: [] }],
+      }),
+    }));
+    expect(html).toContain('没有可核对的原话');
+    expect(html).not.toContain('data-testid="sleep-open-source"');
+  });
+
+  it('原话不可再用的那一晚不给入口', () => {
+    const html = render(h(SleepReviewNightCard, {
+      night: night({ review_status: 'empty', items: [] }),
+    }));
+    expect(html).not.toContain('data-testid="sleep-open-source"');
   });
 });
 

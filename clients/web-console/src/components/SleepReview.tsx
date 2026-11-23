@@ -28,6 +28,20 @@
  * 服务端每次读取都重验来源，所以「原话不可再用」不是异常分支，而是正常结果：
  * 那一晚的条目可能在两次访问之间被撤回、纠正、过期或失去权限。这条路径必须
  * 自己说得清，不能让用户面对一个空面板猜发生了什么。
+ *
+ * ## 能读到原话，就要能走到它出现的地方
+ *
+ * 回顾是"她留下了什么"，核对是"这句话是在哪说的"。只给文本的话，用户没法确认
+ * 这句话属于哪次对话——尤其两条记忆来自不同窗口时，光看文本分不出来。
+ * 所以每条原话都带一个入口，指向 `item.window_id` 对应的会话。
+ *
+ * `window_id` 就是会话 id（服务端 `SessionRecord.session_id = window.id`），
+ * 所以沿用既有的 `/s/{id}` 路由与授权，不新增端点、不自己拼鉴权。
+ *
+ * 为什么入口挂在**原话**上而不是整条记忆上：一条记忆的 `window_id` 是它自己的
+ * 来源窗口，而原话才是用户真正要核对的那句话。契约里原话不单独带窗口，
+ * 它与记忆同源，所以两条路径指向同一个会话——入口挂在原话上更贴近"我在核对
+ * 这一句"的意图，同时展开区里也不再重复放第二个指向同一处的链接。
  */
 import React from 'react';
 import type {
@@ -38,6 +52,7 @@ import type {
 } from '../types';
 import type { ExplainedError } from '../errors';
 import type { SectionState } from './MemoryPage';
+import { navigate, routePath } from '../route';
 
 /* ==================================================================== 文案 */
 
@@ -113,8 +128,44 @@ export function speakerLabel(speaker: string): string {
 
 /* ==================================================================== 原话 */
 
-/** 一条原话。截断时明确标注，不让人误以为看到了全文。 */
-export function OriginalLine({ source }: { source: SleepReviewSource }): React.ReactElement {
+/**
+ * 来源会话的地址。
+ *
+ * `window_id` 就是会话 id，所以直接复用 `/s/{id}` 这条既有路由——不新增端点、
+ * 不自己拼鉴权，授权由聊天页原本那一套负责。地址编码与 `routePath` 保持一致，
+ * 避免窗口 id 里出现需要转义的字符时两条路径拼出不同结果。
+ */
+export function sourceSessionHref(windowId: string): string {
+  return routePath({ name: 'chat', sessionId: windowId });
+}
+
+/**
+ * 打开来源会话。
+ *
+ * 走 `navigate` 而不是 `<a href>`：这条路径与聊天页内部切会话是同一个动作
+ * （`useChat` 也用 `navigate(routePath({ name: 'chat', sessionId }))`），
+ * 用同一条路径才不会出现"点链接整页刷新、点会话列表是软跳转"两种行为。
+ * 地址仍由 `sourceSessionHref` 生成，所以中键/右键复制出来的链接是可用的。
+ */
+export function openSourceSession(windowId: string): void {
+  navigate(sourceSessionHref(windowId));
+}
+
+/**
+ * 一条原话。截断时明确标注，不让人误以为看到了全文。
+ *
+ * 末尾的入口是「这句话是在哪说的」：只给文本的话，两条来自不同窗口的记忆
+ * 在界面上长得一样，用户没法核对来源。
+ */
+export function OriginalLine({
+  source,
+  windowId,
+  onOpen,
+}: {
+  source: SleepReviewSource;
+  windowId: string;
+  onOpen: (windowId: string) => void;
+}): React.ReactElement {
   return (
     <li className="sleep-original">
       <span className="sleep-original__speaker">{speakerLabel(source.speaker)}</span>
@@ -122,6 +173,15 @@ export function OriginalLine({ source }: { source: SleepReviewSource }): React.R
         {source.text}
         {source.truncated ? <span className="sleep-original__clip">（原话较长，此处截断）</span> : null}
       </p>
+      <button
+        type="button"
+        className="sleep-original__open"
+        data-testid="sleep-open-source"
+        data-window-id={windowId}
+        onClick={() => onOpen(windowId)}
+      >
+        查看来源会话
+      </button>
     </li>
   );
 }
@@ -132,9 +192,17 @@ export function OriginalLine({ source }: { source: SleepReviewSource }): React.R
  * 用 `<details>` 而不是受控 state：展开与否是纯展示层的事，不需要跟着
  * 重新取数重置，也不需要为每个条目记一个布尔值。
  */
-export function SleepReviewRow({ item, index }: { item: SleepReviewItem; index: number }): React.ReactElement {
+export function SleepReviewRow({
+  item,
+  index,
+  onOpenSource = openSourceSession,
+}: {
+  item: SleepReviewItem;
+  index: number;
+  onOpenSource?: (windowId: string) => void;
+}): React.ReactElement {
   return (
-    <li className="sleep-row" data-testid={`sleep-item-${index}`}>
+    <li className="sleep-row" data-testid={`sleep-item-${index}`} data-window-id={item.window_id}>
       <p className="sleep-row__text">{item.text}</p>
       {item.original.length > 0 ? (
         <details className="sleep-row__original">
@@ -143,12 +211,19 @@ export function SleepReviewRow({ item, index }: { item: SleepReviewItem; index: 
           </summary>
           <ul className="sleep-originals">
             {item.original.map((source, position) => (
-              <OriginalLine key={`${item.memory_id}-${position}`} source={source} />
+              <OriginalLine
+                key={`${item.memory_id}-${position}`}
+                source={source}
+                windowId={item.window_id}
+                onOpen={onOpenSource}
+              />
             ))}
           </ul>
         </details>
       ) : (
         // 契约允许 `original` 为空数组；这时不该假装有原话可看。
+        // 没有可读原话就没有可核对的那句话，所以这里也不给来源入口——
+        // 只凭一条摘要跳进会话，用户到了那边也找不到对应的句子。
         <p className="sleep-row__no-original">这条没有可核对的原话。</p>
       )}
     </li>
@@ -170,7 +245,13 @@ export function reasonDetail(night: SleepReviewNight): string | null {
   return null;
 }
 
-export function SleepReviewNightCard({ night }: { night: SleepReviewNight }): React.ReactElement {
+export function SleepReviewNightCard({
+  night,
+  onOpenSource = openSourceSession,
+}: {
+  night: SleepReviewNight;
+  onOpenSource?: (windowId: string) => void;
+}): React.ReactElement {
   const consolidation = consolidationCopy(night.consolidation_state, night);
   const review = reviewStatusCopy(night.review_status);
   const detail = reasonDetail(night);
@@ -201,7 +282,12 @@ export function SleepReviewNightCard({ night }: { night: SleepReviewNight }): Re
       {night.items.length > 0 ? (
         <ol className="sleep-rows" data-testid="sleep-items">
           {night.items.map((item, index) => (
-            <SleepReviewRow key={item.memory_id} item={item} index={index} />
+            <SleepReviewRow
+              key={item.memory_id}
+              item={item}
+              index={index}
+              onOpenSource={onOpenSource}
+            />
           ))}
         </ol>
       ) : null}
@@ -214,6 +300,8 @@ export function SleepReviewNightCard({ night }: { night: SleepReviewNight }): Re
 export interface SleepReviewProps {
   state: SectionState<SleepReviewsResponse>;
   onReload: () => void;
+  /** 打开来源会话。测试注入，产品里走 `openSourceSession`。 */
+  onOpenSource?: (windowId: string) => void;
 }
 
 /**
@@ -226,7 +314,11 @@ export interface SleepReviewProps {
  * - 读到但 `nights` 为空：一条直接的空状态；
  * - 读到有内容：按服务端给的日期倒序渲染，不再前端排序。
  */
-export function SleepReviewSection({ state, onReload }: SleepReviewProps): React.ReactElement {
+export function SleepReviewSection({
+  state,
+  onReload,
+  onOpenSource = openSourceSession,
+}: SleepReviewProps): React.ReactElement {
   if (state.status === 'loading') {
     return (
       <div className="sleep" data-testid="sleep-review">
@@ -269,7 +361,7 @@ export function SleepReviewSection({ state, onReload }: SleepReviewProps): React
   return (
     <div className="sleep" data-testid="sleep-review">
       {nights.map((night) => (
-        <SleepReviewNightCard key={night.sleep_date} night={night} />
+        <SleepReviewNightCard key={night.sleep_date} night={night} onOpenSource={onOpenSource} />
       ))}
     </div>
   );
