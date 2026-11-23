@@ -30,6 +30,8 @@ from connectors.inbound_access import source_allowed
 
 from ling.contracts.v1 import (
     CapabilityDescriptor,
+    ContactAvailability,
+    ContactStatusEvent,
     DeliveryReceipt,
     DeliveryState,
     InputPart,
@@ -112,13 +114,19 @@ _MISSING_HINTS = ("消息不存在", "not found", "消息不存在或已撤回")
 # 判据只有一条：它不改变"我们手里的知识是否还成立"。撤回会改（所以它单独走
 # `_recall_from_notice`），入群/戳一戳/改名片都不会。
 #
+# **联系状态**（`group_decrease`）曾经在这个集合里，现在不在了：机器人自己
+# 被踢/退群会让"这个会话还能不能收到新消息"这件事从此不成立，而那条事件
+# 只来一次——丢掉它就永远不知道了。见 `_contact_change_from_notice`。
+#
+# 注意 `group_decrease` 里**大部分**仍该静默：别人退群/被踢与我们的窗口
+# 无关。所以它是"进入分派、但多数分支归于 ignored"，而不是留在这个集合里。
+#
 # 不在这里的类型一律记一条「暂不处理」——静默掉未知类型会让"平台加了新的
 # 撤回类事件"这类情况永远看不见。
 _IGNORED_NOTICE_TYPES: frozenset[str] = frozenset(
     {
         "notify",  # 戳一戳 / 群签到 / 运气王，sub_type 区分
         "group_increase",
-        "group_decrease",
         "group_admin",
         "group_card",
         "group_ban",
@@ -127,6 +135,22 @@ _IGNORED_NOTICE_TYPES: frozenset[str] = frozenset(
         "group_msg_emoji_like",  # NapCat 扩展：表情回应
     }
 )
+
+# `group_decrease.sub_type` → 我们这边"联系还在不在"。
+#
+# 规范（OneBot v11 notice.md）：
+#   leave    —— **发事件的人自己**主动退群（`user_id` 就是离开者）
+#   kick     —— 成员被踢（`user_id` 被踢的人，`operator_id` 是管理员）
+#   kick_me  —— **登录号（机器人自己）被踢**；部分实现还会带 `operator_id`
+#
+# 只有 `kick_me` 意味着"我们不在这个群了"。`leave` 要再看一眼 `user_id`
+# 是不是机器人自己（主动退群时 NapCat 也发 `leave`，而 v11 规范只给了
+# "主动退群"这一个含义，没区分是不是登录号）——这个判断在
+# `_contact_change_from_notice` 里做，因为它需要 `self_id`。
+_GROUP_DECREASE_REASONS: dict[str, ContactAvailability] = {
+    "kick_me": ContactAvailability.kicked,
+    "leave": ContactAvailability.left,
+}
 
 
 class OneBotV11Connector(ChannelConnector):
@@ -978,6 +1002,69 @@ class OneBotV11Connector(ChannelConnector):
             self_recall=bool(self_id) and (user_id == self_id or operator_id == self_id),
         )
 
+    def _contact_change_from_notice(self, payload: dict) -> ContactStatusEvent | None:
+        """``notice.group_decrease`` → `ContactStatusEvent`；与我们无关时返回 ``None``。
+
+        ## 只认"我们不在这个群了"
+
+        `group_decrease` 在活跃群里**很常见**：每天有人退群、被管理员踢。
+        那些人跟我们没有任何关系——窗口照样能收到消息，会话不该因此变灰。
+        所以这里只放行两种情况：
+
+        - ``sub_type=kick_me``：登录号（机器人自己）被踢，规范明说了；
+        - ``sub_type=leave`` 且 ``user_id`` 就是 ``self_id``：机器人自己退群。
+
+        其余一律返回 ``None``，由调用方按"已知且不重要"静默——**注意它不进
+        `_IGNORED_NOTICE_TYPES`**（那样会连 `kick_me` 一起静默掉），而是走
+        "分派后归入 ignored"这条路，日志里仍留得下"有人退群"这种事实。
+
+        ## 为什么用 ``self_id`` 而不是"这个群号有没有对应窗口"
+
+        "有没有窗口"不是判据：机器人被踢时那个群**当然**有窗口（否则我们根本
+        不认识它），而被踢之后窗口还在（用户要能翻旧记录）。用窗口去反推成员
+        关系是把两件事混起来，而且会在"窗口建好之前就被踢"这种边角上判错。
+
+        ## 为什么 `operator_id` 可能缺失
+
+        规范里主动退群时 ``operator_id`` 等于 ``user_id``；NapCat 的
+        ``kick_me`` 在部分版本里没有可解析的 ``operator_id``（见上游
+        constructSysMessage 的类型问题）。缺了就不编：``operator_ref`` 留空。
+        """
+        notice_type = str(payload.get("notice_type") or "")
+        if notice_type != "group_decrease":
+            return None
+        sub_type = str(payload.get("sub_type") or "")
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id:
+            # 没有群号就找不到窗口，记下来也没法对应到任何会话：**不猜**。
+            logger.debug("群成员减少通知缺少 group_id，按未匹配丢弃：sub_type=%s", sub_type)
+            return None
+        user_id = str(payload.get("user_id") or "").strip()
+        self_id = str(payload.get("self_id") or self._config.self_id or "").strip()
+        reason = _GROUP_DECREASE_REASONS.get(sub_type)
+        if reason is None:
+            # 规范之外的 sub_type：不认识就不动状态（宁可漏一次，也不要把
+            # 一个正常群灰掉）。
+            return None
+        if reason is ContactAvailability.left and not (self_id and user_id == self_id):
+            # 别人主动退群。与我们无关。
+            return None
+
+        return ContactStatusEvent(
+            connector_instance=self.instance_id,
+            # 去重键里带 sub_type：同一个群先 leave 再 kick_me 是两条事实，
+            # 但不能让第二次重投把第一次的日志重复记一遍。
+            external_event_id=f"{self.instance_id}:group_decrease:{group_id}:{sub_type}",
+            window_ref=window_ref_for(
+                is_group=True, target_id=group_id, instance_id=self.instance_id
+            ),
+            target_ref=group_id,
+            availability=reason,
+            user_ref=user_id or None,
+            operator_ref=str(payload.get("operator_id") or "").strip() or None,
+            occurred_at=_from_ts(payload.get("time")),
+        )
+
     def _remember_message_id(self, message_id: str, external_event_id: str) -> None:
         """记下一条见过的入站 message_id（引用白名单 + 上下文 id）。"""
         if message_id not in self._known_message_set:
@@ -1219,6 +1306,18 @@ class OneBotV11Connector(ChannelConnector):
                 return recall  # 类型故意与信封不同：它不是一条消息
 
             notice_type = str(payload.get("notice_type") or "")
+            if notice_type == "group_decrease":
+                # 与撤回同理：它不是一条消息，但它是"我们手里的知识"变了的
+                # 事实之一——机器人被踢/退群之后这个群再也收不到新消息了。
+                # 只在我们自己离开时返回事件，其余（别人退群）落到下面的
+                # ignored 分支。
+                contact = self._contact_change_from_notice(payload)
+                if contact is not None:
+                    return contact  # 类型故意与信封不同：它不是一条消息
+                raise ChannelError(
+                    ChannelErrorKind.ignored,
+                    f"notice:{notice_type}:{payload.get('sub_type') or ''}",
+                )
             if notice_type in _IGNORED_NOTICE_TYPES:
                 # 已知且**按设计**不进任何链路：戳一戳、入群、群名片…
                 # 它们在活跃群里很频繁，逐条记日志会把真正要看的东西挤出去。

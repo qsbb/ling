@@ -185,11 +185,15 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
     # **撤回通知不是一条消息**：它有自己的类型，走自己的处理路径。
     # 放在白名单/去重/决策之前一点点，但仍然走完整的去重与日志——
     # 早退会把"重复撤回只记一条日志"这件事交给调用方，那是错的。
-    from ling.contracts.v1 import RecallEvent
+    from ling.contracts.v1 import ContactStatusEvent, RecallEvent
 
     if isinstance(envelope, RecallEvent):
         return await _process_recall(
             app, envelope, trusted_instance_key=trusted_instance_key
+        )
+    if isinstance(envelope, ContactStatusEvent):
+        return await _process_contact_status(
+            envelope, trusted_instance_key=trusted_instance_key
         )
 
     state = app.state  # type: ignore[attr-defined]
@@ -500,6 +504,111 @@ async def _process_recall(
         "recalled": outcome.status == "retracted",
         "after_seen": bool(outcome.after_seen),
         "reason": outcome.status,
+    }
+
+
+async def _process_contact_status(
+    event: object,
+    *,
+    trusted_instance_key: tuple[str, str] | None = None,
+) -> dict:
+    """处理一条联系状态通知：**不产生消息、不触发回复、不调用模型**。
+
+    ## 它唯一要做的两件事
+
+    1. 在事件级去重（平台会重投）；
+    2. 把 ``contact_unavailable_*`` 写到**那个窗口**上。
+
+    ## 为什么不过访问白名单
+
+    与撤回同理：白名单管的是"能不能跟她说话"。而"机器人自己被踢出群"
+    是我们和**平台**之间的事实，与群里谁在不在白名单无关。
+
+    ## 为什么窗口可能找不到（这不是错误）
+
+    机器人被踢的群可能从没建过窗口（入站全部被白名单挡掉、或者建窗口
+    之前就被踢了）。那种情况下没有东西要标灰，记一行行为日志就够——
+    账号状态本身不需要我们记住。
+
+    ## 为什么写的是 ``updated_at`` 之外的东西
+
+    **绝不动 ``updated_at``**：那是"最近活跃"的时间轴，也是列表排序键。
+    改它会让一个刚被踢的群因为"刚刚活跃"跳到列表最前面——恰恰是用户最
+    不需要看到的那条。这句话与 ``set_window_pinned`` 里"置顶不动
+    ``updated_at``"是同一条理由。
+    """
+    from ling.audit import behavior_event
+    from ling.contracts.v1 import ContactStatusEvent
+    from ling.domains.conversation.service import ConversationService
+
+    assert isinstance(event, ContactStatusEvent)
+    connector_instance = event.connector_instance
+    event_scope = _connector_event_scope(connector_instance, trusted_instance_key)
+
+    async with session_scope() as session:
+        conversation = ConversationService(session)
+        claimed = await conversation.claim_event(
+            scope=event_scope,
+            key=event.external_event_id,
+        )
+        if claimed is not None:
+            return {"accepted": True, "duplicate": True, "reason": "重复的联系状态通知"}
+        await session.commit()
+
+        try:
+            updated = await conversation.mark_contact_unavailable(
+                window_ref=str(event.window_ref or ""),
+                reason=str(event.availability),
+                trusted_instance_key=trusted_instance_key,
+                occurred_at=event.occurred_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - 失败要能被平台重投
+            logger.exception("联系状态处理失败，释放认领以便重投")
+            await conversation.release_event(
+                scope=event_scope,
+                key=event.external_event_id,
+            )
+            await session.commit()
+            return {
+                "accepted": False,
+                "reason": f"联系状态处理失败，可重投: {type(exc).__name__}",
+            }
+        await session.commit()
+
+    reason = str(event.availability)
+    if updated is None:
+        # 没有对应窗口：正常情况（见 docstring），INFO 一行即可。
+        message = f"我在平台上不在对应会话里了（{reason}），但这里没有它的会话记录"
+    else:
+        where = {"left": "退出了", "kicked": "被移出", "friend_deleted": "不在好友里了"}.get(
+            reason, "不在"
+        )
+        message = f"我在平台上已经{where}这个会话对应的群，之后收不到它的新消息"
+
+    behavior_event(
+        "contact_unavailable",
+        message,
+        attributes={
+            "connector": connector_instance,
+            "availability": reason,
+            "window_ref": str(event.window_ref or ""),
+            # 目标与操作者只给 id，不给正文——这里从来没有可读文本。
+            "target_ref": str(event.target_ref or ""),
+            "user_ref": str(event.user_ref or ""),
+            "operator_ref": str(event.operator_ref or ""),
+            "window_matched": updated is not None,
+        },
+    )
+    logger.info(
+        "联系状态 processed: availability=%s window=%s matched=%s",
+        reason,
+        event.window_ref,
+        updated is not None,
+    )
+    return {
+        "accepted": True,
+        "availability": reason,
+        "window_matched": updated is not None,
     }
 
 

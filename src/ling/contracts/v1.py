@@ -390,6 +390,31 @@ class RecallKind(StrEnum):
     friend = "friend"
 
 
+class ContactAvailability(StrEnum):
+    """平台侧这个联系还在不在。
+
+    ## 为什么要有"原因"而不是一个 ``unavailable: bool``
+
+    三种不在的情况对用户的含义不同，界面上是一行灰字，但**排障时**要能区分：
+
+    - ``left``：机器人自己**主动退出**了群（``group_decrease`` + ``leave``）；
+    - ``kicked``：机器人被**踢出**群（``kick_me``）；群可能还在，只是我们进不去；
+    - ``friend_deleted``：对方**删了好友**（``get_friend_list`` 里查不到）。
+
+    ``kicked`` 和 ``left`` 在界面上的处置一样（都读不到新消息了），但把"被踢"
+    记成"自己退的"是错误归属——与撤回路径里 ``self_recall`` 单列的理由相同。
+
+    ## 为什么是字符串常量而不是布尔
+
+    布尔值只能回答"在不在"，答不出"为什么"。而"为什么"是这条信息唯一能
+    帮上忙的地方：用户看到灰掉的一行，第一个问题永远是"我怎么不在了"。
+    """
+
+    left = "left"
+    kicked = "kicked"
+    friend_deleted = "friend_deleted"
+
+
 class RecallEvent(StrictModel):
     """**一条撤回通知**——不是一条消息，也不该变成一条消息。
 
@@ -425,6 +450,52 @@ class RecallEvent(StrictModel):
     sender_name: str | None = None
     # 是不是她自己发的消息被撤回
     self_recall: bool = False
+    trace_id: IdStr | None = None
+
+
+class ContactStatusEvent(StrictModel):
+    """**一条联系状态通知**——不是一条消息，也不该变成一条消息。
+
+    ## 为什么要单独一个类型
+
+    与 :class:`RecallEvent` 完全同构的理由：信封的语义是"有人对我说了什么"，
+    它必然带 ``parts`` 并走决策→生成→投递。而"机器人自己退群了/被踢了"
+    没有正文、不该触发回复、更不该让模型以为群里有人说了话。
+
+    硬塞进信封只有两种写法，两种都是伪造：造一个空的用户发言，或者给信封
+    加一个"这条其实不是消息"的开关（信封从此有两种含义）。
+
+    ## 为什么只覆盖群，没有"好友被删"
+
+    ``notice.group_decrease`` 是 OneBot v11 规范事件，机器人自己离开群时
+    平台会推 ``sub_type=kick_me``。**好友被删没有等价事件**：v11 通知目录里
+    没有 ``friend_decrease``，NapCat 也不推。所以好友那一侧走**读侧比对**
+    （``get_friend_list`` 整表里查不到 = 已删，见
+    ``api/routes/sessions.py::_friend_availability``），不在这条链路里。
+
+    ## 记录的是**机器人的**成员关系，不是某个成员的
+
+    ``sub_type`` 为 ``leave``/``kick`` 时，离开的是 ``user_id`` 那个人——
+    机器人还在群里，窗口照样能收消息，**不算不可用**。只有 ``kick_me``
+    才意味着"我们不在这个群了"。连接器负责只把这一种送进来；这里再断言
+    一次，是因为搞错方向会让一个正常群被灰掉，而那是用户第一眼就看到的事。
+    """
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    connector_instance: IdStr
+    # 去重键（`<instance>:contact:<group_id>:<reason>`）。平台重投同一条只生效一次。
+    external_event_id: IdStr
+    # 会话引用（``onebot-x:group:100…``）：与信封的 ``window_ref`` 同一套坐标，
+    # 因为窗口就是按它找回的。
+    window_ref: IdStr
+    # 平台侧目标 id（群号）。排障时要能在 QQ 里对上。
+    target_ref: IdStr | None = None
+    availability: ContactAvailability
+    # 离开者的 QQ 号（``kick_me`` 时就是机器人自己）。
+    user_ref: IdStr | None = None
+    # 操作者（踢人的管理员）；主动退群时与 ``user_ref`` 相同，平台不给时为空。
+    operator_ref: IdStr | None = None
+    occurred_at: datetime | None = None
     trace_id: IdStr | None = None
 
 
@@ -806,10 +877,16 @@ class SessionRecord(StrictModel):
     pinned: bool = False
     # 这个会话对端的好感度（``relationship_states.familiarity``，0~1）。
     #
-    # 排序的第二关键字（降序）。**查不到就是 ``null``，不是 0**：
-    # 0 是"关系还没建立"，``null`` 是"我们根本不知道这个人"——把未知写成 0
-    # 会让一个从没聊过的人排到"聊过但还生疏"的人后面，而这两者本不该比较。
+    # **只做展示/排序输入的旁证，不再决定列表顺序**：用户要的是 QQ/微信那种
+    # "谁最近来过消息谁在上"，按好感度排会让安静很久的会话压在刚说过话的
+    # 上面。详见 ``domains/conversation/service.py::sort_windows_for_display``。
     familiarity: float | None = None
+    # 平台侧联系是否已经不在了（群被退/被踢、好友已删）；``None`` = 还在或未知。
+    #
+    # 前端据此**整行置灰但保留可点**：用户要能翻旧记录，只是不该以为还能
+    # 收到新消息。三个取值见 :class:`ContactAvailability`——不合并成一个布尔，
+    # 因为"我自己退的"和"被踢出来"在排障时是两件事。
+    contact_unavailable: ContactAvailability | None = None
 
 
 class ChatMessage(StrictModel):
@@ -2059,6 +2136,8 @@ __all__ = [
     "AudienceRule",
     "CapabilityDescriptor",
     "ChatMessage",
+    "ContactAvailability",
+    "ContactStatusEvent",
     "ContextContribution",
     "DayIntentSummary",
     "DeliveryReceipt",

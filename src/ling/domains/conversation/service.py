@@ -9,16 +9,24 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import Table, bindparam, delete, func, literal, or_, select, text
+from sqlalchemy import Table, and_, bindparam, delete, func, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
-from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, SessionRecord, TurnState
+from ling.contracts.v1 import (
+    ChatMessage,
+    ContactAvailability,
+    ErrorCode,
+    Origin,
+    SessionRecord,
+    TurnState,
+)
 from ling.infra.models import (
     ActorAccount,
     DeliveryReceiptRow,
@@ -33,6 +41,8 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.infra.security import new_id
+
+logger = logging.getLogger("ling.conversation")
 
 DEFAULT_WINDOW_TITLE = "新的对话"
 MAX_TITLE_LEN = 60
@@ -110,41 +120,44 @@ def split_window_ref(ref: str) -> tuple[str, str, str] | None:
 def sort_windows_for_display(
     windows: Sequence[Window], familiarity: dict[str, float]
 ) -> list[Window]:
-    """先按置顶分组，再按手动顺序、置顶时刻、好感度和最近活跃排序。
+    """先按置顶分组，再按手动顺序、置顶时刻、最近收消息时间排序。
+
+    ## 用户在 2026-11-24 明确要求的规则
+
+    「这个对话的顺序按照时间处理，最新收到消息的对话自动往上排，参考 QQ 微信
+    的这种逻辑」。所以主排序键是 ``updated_at``（= 最近一条消息的时刻），
+    倒序。**好感度不再是排序键**：按好感度排会让一个安静了三个月的会话压在
+    刚刚说过话的上面，而用户打开列表想要的永远是"谁刚找过我"。
+
+    ``familiarity`` 仍然收着、仍然随记录返回（关系页与展示要用它），只是
+    不参与定序。**保留参数而不是删掉**：三个调用方都要传同一份字典，
+    将来若要加"按熟络度打星标"之类，键位还在。
 
     ## 排序键缺失值
 
     - ``pinned_at is None``（未置顶）→ 排在所有置顶之后；
-    - ``manual_order is None`` → 排在本组手动排序的窗口之后；
-    - ``familiarity`` 不在字典里 → 视为 ``-inf``（排在所有已知好感度之后）；
+    - ``manual_order is None`` → 排在本组手动排序的窗口之后（管理员上移/下移
+      仍然有效：用户置顶之后仍可以手动调整置顶组内的次序）；
     - ``updated_at`` 缺失 → 视为最旧。
-
-    为什么"未知好感度"排最后而不是按 0 算：0 是"认识但还不熟"，
-    未知是"我们根本没有这个人的关系记录"。把未知当 0，会让一个刚被拉进群、
-    从没单独说过话的人**排在聊过几次的人前面**（因为后者可能是 0.1）。
-    用户要的是"按好感度排"，不是"按有没有记录排"。
 
     ## 为什么要有 `id` 兜底
 
     `list.sort` 是稳定的，但"稳定"依赖输入顺序（PG 不保证无 ORDER BY 的
-    返回顺序）。同一时刻置顶的两个会话，如果不给最后一级键，顺序会在两次
+    返回顺序）。同一时刻活跃的两个会话，如果不给最后一级键，顺序会在两次
     请求之间跳动——前端做局部更新时看起来像在乱抖。所以最后按 ``id`` 定序。
     """
-    import math
+    del familiarity  # 只保留签名：排序不再看它，见 docstring。
 
-    def key(window: Window) -> tuple[int, float, float, float, float, str]:
+    def key(window: Window) -> tuple[int, float, float, float, str]:
         pinned = getattr(window, "pinned_at", None)
         manual_order = getattr(window, "manual_order", None)
-        fam = familiarity.get(str(window.subject_id or ""))
         return (
             # 置顶的排 0（更靠前）；未置顶 1。
             0 if pinned is not None else 1,
             manual_order if manual_order is not None else float("inf"),
-            # 置顶时刻越晚越靠前；未置顶时这一位全等，交给好感度决定。
+            # 置顶时刻越晚越靠前；未置顶时这一位全等，交给最近活跃决定。
             -_timestamp(pinned) if pinned is not None else 0.0,
-            # 好感度越大越靠前；未知给 -inf。
-            -(fam if fam is not None and not math.isnan(fam) else float("-inf")),
-            # 最后一级：最近活跃倒序。用负时间戳让"越新越靠前"。
+            # 主排序键：最近收到消息的时刻倒序。用负时间戳让"越新越靠前"。
             -_timestamp(getattr(window, "updated_at", None)),
             str(window.id),
         )
@@ -499,6 +512,72 @@ class ConversationService:
         if window is None or window.subject_id != subject_id:
             raise not_found("会话不存在")
         return window
+    async def mark_contact_unavailable(
+        self,
+        *,
+        window_ref: str,
+        reason: str,
+        trusted_instance_key: tuple[str, str] | None = None,
+        occurred_at: datetime | None = None,
+    ) -> Window | None:
+        """把"平台侧这个联系不在了"记到对应窗口上；找不到窗口返回 ``None``。
+
+        ## 为什么按 ``window_ref`` 找而不是按 id
+
+        事件是从平台来的，它只知道 ``<instance>:group:<gid>`` 这个坐标；窗口
+        id 是本地概念。窗口就是按这个坐标建的（``bridge._ensure_window``：
+        ``title=envelope.window_ref``），所以这里用同一套坐标反查，命中
+        ``connector_window_ref``（新行）或 ``title``（历史行）任一个都算。
+
+        ## 为什么只认"可信实例"
+
+        同一台机器上可能挂着两个 OneBot 实例，其中一个是别人的测试号。
+        不限定实例就把 A 号的"我退了这个群"记到 B 号的窗口上。所以有
+        ``trusted_instance_key`` 时按它精确匹配；没有时只在**唯一命中**的
+        情况下写入（多于一个就放弃——宁可不标灰，也不要标错人）。
+
+        ## 幂等
+
+        重复调用只是把同样的值再写一遍（``occurred_at`` 也一并写）。平台重投
+        与进程重启后的重放都会撞到这里，所以它必须能安全重复执行。
+        """
+        reference = str(window_ref or "").strip()
+        if not reference:
+            return None
+        reference_match = or_(
+            Window.connector_window_ref == reference,
+            and_(Window.connector_window_ref.is_(None), Window.title == reference),
+        )
+        stmt = select(Window).where(reference_match)
+        if trusted_instance_key is not None:
+            stmt = stmt.where(
+                Window.origin_status == "known",
+                Window.origin_scope == trusted_instance_key[0],
+                Window.origin_instance_id == trusted_instance_key[1],
+            )
+        rows = list((await self._session.execute(stmt.limit(2))).scalars())
+        if len(rows) != 1:
+            if len(rows) > 1:
+                # 多于一个：无法判定是哪条会话，**不猜**。
+                logger.info(
+                    "联系状态无法定位会话（命中 %d 条，按不处理）：ref=%s", len(rows), reference
+                )
+            return None
+
+        window = rows[0]
+        await self._session.execute(
+            _WINDOWS_TABLE.update()
+            .where(Window.id == window.id)
+            .values(
+                contact_unavailable_reason=reason[:32],
+                contact_unavailable_at=occurred_at or utcnow(),
+                # **绝不动 updated_at**：那是列表排序键，改它会让刚被踢的群
+                # 跳到最前面。理由与 `set_window_pinned` 相同。
+                updated_at=Window.updated_at,
+            )
+        )
+        await self._session.refresh(window)
+        return window
 
     async def get_window_for_turn(self, window_id: str, *, subject_id: str) -> Window:
         """轮次用的窗口读取：**群窗口对所有成员开放**，私聊仍严格校验归属。
@@ -624,6 +703,7 @@ class ConversationService:
         *,
         display_name: str | None = None,
         familiarity: float | None = None,
+        contact_unavailable: str | None = None,
     ) -> SessionRecord:
         """窗口 → 契约记录。
 
@@ -631,6 +711,11 @@ class ConversationService:
         那是外呼（OneBot ``get_group_info``），不属于本域职责，本域也不该
         为了一个标题去认识连接器。采集不到就传 ``None``，前端按
         ``channel`` + ``peer_id`` 自己回退成「群 100…」。
+
+        ``contact_unavailable`` 同理由调用方给：它可能来自**库里**的
+        ``windows.contact_unavailable_reason``（群被踢/退出，事件写下来的），
+        也可能来自**读侧现查**（好友被删，``get_friend_list`` 里查不到）。
+        本域两者都不该知道——域只负责搬运。
         """
         channel, _kind, peer_id = window_target(window)
         return SessionRecord(
@@ -649,6 +734,9 @@ class ConversationService:
             group_reply_max_parts=window.group_reply_max_parts,
             pinned=getattr(window, "pinned_at", None) is not None,
             familiarity=familiarity,
+            contact_unavailable=(
+                ContactAvailability(contact_unavailable) if contact_unavailable else None
+            ),
         )
 
     async def peer_display_names(

@@ -1,4 +1,16 @@
-"""会话列表顺序：**置顶 → 好感度 → 最近活跃**（用户原话「可置顶，其他按好感度」）。
+"""会话列表顺序：**置顶 → 手动顺序 → 最近收到消息**（参考 QQ/微信）。
+
+## 2026-11-24 的规则变更
+
+用户原话：「这个对话的顺序按照时间处理，最新收到消息的对话自动往上排，参考
+qq 微信的这种逻辑」。此前的主排序键是**好感度**（更早的原话「其他按好感度」），
+查记录见 `docs/evidence/session-list-availability-20261124.md`。
+
+**好感度不再是排序键**：它会让安静三个月的会话压在刚说过话的上面，而用户
+打开列表想要的永远是"谁刚找过我"。因此本文件里两条把"按好感度排"当规范
+的用例已被**改写为验证新规则**——它们不是被删掉，而是被翻转：如果哪天排序
+键又被改回好感度，它们会立刻红。
+
 
 ## 为什么这个文件必须存在
 
@@ -166,25 +178,28 @@ async def test_presentation_edits_keep_existing_permissions(logged_in: TestEnv) 
     assert rename_web.status_code == 200 and rename_web.json()["title"] == "网页新名"
 
 
-async def test_list_is_ordered_by_familiarity_not_by_activity(  # noqa: F811
+async def test_list_is_ordered_by_recent_message_not_by_familiarity(  # noqa: F811
     logged_in: TestEnv,  # noqa: F811
 ) -> None:
-    """好感度高的会话排在**更近活跃**的会话前面。
+    """最近收到消息的排前面——**哪怕它对端的好感度更低**。
 
-    造数刻意相反：A 很活跃（updated_at 最新）但好感度低；B 很旧但好感度高。
-    按活跃排会得到 [A, B]，按好感度排应得到 [B, A]。
+    这条是 2026-11-24 规则变更的直接回归。造数让两个排序键**相反**：
+    `recent-low` 刚来过消息，"好感度"却低；`stale-high` 三十天没动静。
+    按好感度排会得到 [stale-high, recent-low]，按最近消息排应得到
+    [recent-low, stale-high]。所以只要有人把好感度键加回去，这里立刻红。
+
+    ## 这条用例能证明什么、不能证明什么
+
+    能证明：列表顺序跟随 `updated_at`。
+    不能证明：好感度完全不参与排序——单用户单 subject 时好感度是常量，
+    常量键与"没有这个键"在结果上不可区分。区分力由纯函数用例
+    `test_familiarity_does_not_override_recency` 提供（那里两个 subject 不同）。
     """
     now = datetime.now(UTC)
     await _make_window(logged_in, title="recent-low", updated_at=now)
     await _make_window(
         logged_in, title="stale-high", updated_at=now - timedelta(days=30)
     )
-    # 窗口的 subject_id 就是当前登录用户，两个窗口共享同一个 subject，
-    # 所以"每个窗口各自的好感度"在这个模型里无法不同。
-    #
-    # 这正是本用例要说的第一件事：**单用户单 subject 时好感度键是常量**，
-    # 排序退化到 updated_at 是数据模型决定的，不是 bug。真正的排序验证
-    # 必须用**不同 subject 的窗口**（见下一条用例）。
     response = await logged_in.client.get("/v1/sessions")
     assert response.status_code == 200, response.text
     titles = [item["title"] for item in response.json()["sessions"]]
@@ -208,18 +223,19 @@ async def test_pinned_windows_come_first(logged_in: TestEnv) -> None:  # noqa: F
     assert titles[0] == "old-pinned", f"置顶没排最前：{titles}"
 
 
-async def test_sort_uses_familiarity_when_subjects_differ(logged_in: TestEnv) -> None:  # noqa: F811
-    """**这条才是原 bug 的直接回归**：不同 subject 的窗口按好感度排。
+async def test_familiarity_does_not_override_recency(logged_in: TestEnv) -> None:  # noqa: F811
+    """不同 subject 的窗口：**好感度高也不能盖过"更近的消息"**。
 
-    纯函数层验证：给两个 updated_at 与 familiarity 相反顺序的窗口，
-    `sort_windows_for_display` 必须按好感度排。
+    上一轮这条用例断言的正好相反（它曾经是"按好感度排"的直接回归）。
+    现在要求反过来：`subj_close` 好感度 0.9 但九十天没说话，`subj_distant`
+    好感度 0.1 却是刚刚——列表必须把刚刚那个放前面。
 
-    为什么不走 HTTP：`/v1/sessions` 只返回**当前登录用户自己**的窗口，
-    它们的 subject_id 全相同，好感度是常量，无法从接口层区分"按好感度排"
-    与"按活跃排"。所以排序逻辑的验证放在纯函数层，接口层只验证置顶与
-    兜底（上面两条）。这是诚实的边界：接口层那条链路（先查 familiarity
-    再排序）由 `test_list_route_passes_familiarity_into_the_sort` 用
-    源码级断言钉住。
+    ## 为什么这条必须有
+
+    单 subject 的接口层用例里，好感度是常量，"按好感度排"和"按时间排"
+    结果相同，**它证明不了任何事**。只有让两个键指向相反顺序，才能区分
+    两种实现。这就是这条用例的全部价值：它是"好感度不再是排序键"这件事
+    唯一有区分力的证据。
     """
     now = datetime.now(UTC)
     stale_but_close = Window(
@@ -241,42 +257,42 @@ async def test_sort_uses_familiarity_when_subjects_differ(logged_in: TestEnv) ->
         updated_at=now,
     )
     ordered = sort_windows_for_display(
-        [recent_but_distant, stale_but_almost := stale_but_close],
+        [stale_but_close, recent_but_distant],
         {"subj_close": 0.9, "subj_distant": 0.1},
     )
-    assert [w.id for w in ordered] == ["win_a", "win_b"], (
-        "好感度没参与排序：更亲近但很久没说话的会话被排到了后面"
+    assert [w.id for w in ordered] == ["win_b", "win_a"], (
+        "好感度又盖过了最近消息：刚说过话的会话被压到九十天没动静的后面"
     )
-    assert stale_but_almost is stale_but_close
 
 
-async def test_unknown_familiarity_sorts_after_known(logged_in: TestEnv) -> None:  # noqa: F811
-    """没有关系行的窗口排在**已知好感度之后**，不是按 0 算。
+async def test_missing_updated_at_sorts_last(logged_in: TestEnv) -> None:  # noqa: F811
+    """`updated_at` 缺失（`None`）视为最旧，排在所有有时间戳的后面。
 
-    0 是"认识但还不熟"，未知是"根本没有关系记录"。把未知当 0，会让刚被
-    拉进群、从没单独说过话的人排在聊过几次的人前面。
+    这是排序键的缺失值契约，与好感度无关。原用例用"未知好感度排最后"表达了
+    同一件事，现在换个维度表达——因为好感度不再参与定序，用它能证明的东西
+    只剩"它没参与"。
     """
     now = datetime.now(UTC)
-    known = Window(
-        id="win_known",
+    timed = Window(
+        id="win_timed",
         actor_id="actor",
-        subject_id="subj_known",
-        title="known",
+        subject_id="subj_timed",
+        title="timed",
         channel="web",
         visibility="subject_private",
         updated_at=now - timedelta(days=10),
     )
-    unknown = Window(
-        id="win_unknown",
+    missing = Window(
+        id="win_missing",
         actor_id="actor",
-        subject_id="subj_unknown",
-        title="unknown",
+        subject_id="subj_missing",
+        title="missing",
         channel="web",
         visibility="subject_private",
-        updated_at=now,
+        updated_at=None,
     )
-    ordered = sort_windows_for_display([unknown, known], {"subj_known": 0.05})
-    assert [w.id for w in ordered] == ["win_known", "win_unknown"]
+    ordered = sort_windows_for_display([missing, timed], {})
+    assert [w.id for w in ordered] == ["win_timed", "win_missing"]
 
 
 def test_list_route_passes_familiarity_into_the_sort() -> None:

@@ -19,6 +19,7 @@ from typing import Protocol, runtime_checkable
 from ling.contracts.v1 import (
     AttachmentKind,
     CapabilityDescriptor,
+    ContactStatusEvent,
     DeliveryReceipt,
     InteractionEnvelope,
     Modality,
@@ -223,14 +224,20 @@ class ChannelConnector(Protocol):
         """签名与重放窗口校验。任何失败都必须返回 False，不做"宽松通过"。"""
         ...
 
-    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent:
+    def normalize_inbound(
+        self, payload: dict
+    ) -> InteractionEnvelope | RecallEvent | ContactStatusEvent:
         """把平台 payload 翻译成统一信封；不得在这里解析身份。
 
-        **除了信封，还可能返回 :class:`RecallEvent`**（对方撤回了某条消息）。
-        撤回不是一条消息：没有正文、不该触发回复、不该产生 ``messages`` 行，
-        所以它有自己的类型，由 ``inbound_intake`` 用 ``isinstance`` 分流。
-        把撤回硬塞进信封只有两种写法（造一条空发言 / 给信封加"这不是消息"的
-        开关），两种都是在伪造输入。
+        **除了信封，还可能返回两个"不是消息"的类型**，由 ``inbound_intake``
+        用 ``isinstance`` 分流：
+
+        - :class:`RecallEvent`：对方撤回了某条消息（没有正文、不该触发回复、
+          不该产生 ``messages`` 行）；
+        - :class:`ContactStatusEvent`：平台侧联系变了（机器人自己被踢/退群）。
+
+        把这两类硬塞进信封只有两种写法（造一条空发言 / 给信封加"这不是
+        消息"的开关），两种都是在伪造输入。
         """
         ...
 
