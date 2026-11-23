@@ -126,7 +126,6 @@ _MISSING_HINTS = ("消息不存在", "not found", "消息不存在或已撤回")
 _IGNORED_NOTICE_TYPES: frozenset[str] = frozenset(
     {
         "notify",  # 戳一戳 / 群签到 / 运气王，sub_type 区分
-        "group_increase",
         "group_admin",
         "group_card",
         "group_ban",
@@ -218,7 +217,8 @@ class OneBotV11Connector(ChannelConnector):
         # 为什么要缓存：会话列表每开一次页面就会问一遍，而好友列表在几百人的
         # 号上是几十 KB 的响应。10 分钟一次足够——改备注不会有人指望立刻生效，
         # 而"每开一次页面打一次 NapCat"是实打实的负担。
-        self._friend_names_cache: tuple[float, dict[str, tuple[str | None, str | None]]] | None = None
+        self._friend_names_cache: tuple[float, dict[str, tuple[str | None, str | None]] | None] | None = None
+        self._known_friend_ids: set[str] = set()
         self.friend_names_ttl = 600.0  # 成功后的复用时长（10 分钟）
         self.friend_names_miss_ttl = 60.0  # 失败后的静默时长（别一直打）
         self.friend_names_timeout = 3.0  # 比群名宽一点：它是整表响应
@@ -1003,58 +1003,33 @@ class OneBotV11Connector(ChannelConnector):
         )
 
     def _contact_change_from_notice(self, payload: dict) -> ContactStatusEvent | None:
-        """``notice.group_decrease`` → `ContactStatusEvent`；与我们无关时返回 ``None``。
-
-        ## 只认"我们不在这个群了"
-
-        `group_decrease` 在活跃群里**很常见**：每天有人退群、被管理员踢。
-        那些人跟我们没有任何关系——窗口照样能收到消息，会话不该因此变灰。
-        所以这里只放行两种情况：
-
-        - ``sub_type=kick_me``：登录号（机器人自己）被踢，规范明说了；
-        - ``sub_type=leave`` 且 ``user_id`` 就是 ``self_id``：机器人自己退群。
-
-        其余一律返回 ``None``，由调用方按"已知且不重要"静默——**注意它不进
-        `_IGNORED_NOTICE_TYPES`**（那样会连 `kick_me` 一起静默掉），而是走
-        "分派后归入 ignored"这条路，日志里仍留得下"有人退群"这种事实。
-
-        ## 为什么用 ``self_id`` 而不是"这个群号有没有对应窗口"
-
-        "有没有窗口"不是判据：机器人被踢时那个群**当然**有窗口（否则我们根本
-        不认识它），而被踢之后窗口还在（用户要能翻旧记录）。用窗口去反推成员
-        关系是把两件事混起来，而且会在"窗口建好之前就被踢"这种边角上判错。
-
-        ## 为什么 `operator_id` 可能缺失
-
-        规范里主动退群时 ``operator_id`` 等于 ``user_id``；NapCat 的
-        ``kick_me`` 在部分版本里没有可解析的 ``operator_id``（见上游
-        constructSysMessage 的类型问题）。缺了就不编：``operator_ref`` 留空。
-        """
+        """提取机器人自己的入群、退群与被移出通知。"""
         notice_type = str(payload.get("notice_type") or "")
-        if notice_type != "group_decrease":
-            return None
         sub_type = str(payload.get("sub_type") or "")
         group_id = str(payload.get("group_id") or "").strip()
         if not group_id:
-            # 没有群号就找不到窗口，记下来也没法对应到任何会话：**不猜**。
-            logger.debug("群成员减少通知缺少 group_id，按未匹配丢弃：sub_type=%s", sub_type)
             return None
         user_id = str(payload.get("user_id") or "").strip()
         self_id = str(payload.get("self_id") or self._config.self_id or "").strip()
-        reason = _GROUP_DECREASE_REASONS.get(sub_type)
-        if reason is None:
-            # 规范之外的 sub_type：不认识就不动状态（宁可漏一次，也不要把
-            # 一个正常群灰掉）。
-            return None
-        if reason is ContactAvailability.left and not (self_id and user_id == self_id):
-            # 别人主动退群。与我们无关。
-            return None
+        own_event = bool(self_id and user_id == self_id)
+        reason: ContactAvailability | None = None
+        if notice_type == "group_increase":
+            if sub_type not in {"approve", "invite"} or not own_event:
+                return None
+        else:
+            reason = _GROUP_DECREASE_REASONS.get(sub_type)
+            if reason is None or (reason is ContactAvailability.left and not own_event):
+                return None
+
+        occurred_at = _from_ts(payload.get("time"))
+        event_id = (
+            f"{self_id}:{notice_type}:{group_id}:{sub_type}:{occurred_at.timestamp()}"
+            if occurred_at is not None else new_id("obc")
+        )
 
         return ContactStatusEvent(
             connector_instance=self.instance_id,
-            # 去重键里带 sub_type：同一个群先 leave 再 kick_me 是两条事实，
-            # 但不能让第二次重投把第一次的日志重复记一遍。
-            external_event_id=f"{self.instance_id}:group_decrease:{group_id}:{sub_type}",
+            external_event_id=event_id,
             window_ref=window_ref_for(
                 is_group=True, target_id=group_id, instance_id=self.instance_id
             ),
@@ -1062,7 +1037,7 @@ class OneBotV11Connector(ChannelConnector):
             availability=reason,
             user_ref=user_id or None,
             operator_ref=str(payload.get("operator_id") or "").strip() or None,
-            occurred_at=_from_ts(payload.get("time")),
+            occurred_at=occurred_at,
         )
 
     def _remember_message_id(self, message_id: str, external_event_id: str) -> None:
@@ -1245,7 +1220,7 @@ class OneBotV11Connector(ChannelConnector):
         ).hexdigest()
         return hmac.compare_digest(signature[len("sha1=") :], expected)
 
-    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent:
+    def normalize_inbound(self, payload: dict) -> InteractionEnvelope | RecallEvent | ContactStatusEvent:
         """把 OneBot 事件翻译成交互信封；**撤回**除外（返回 `RecallEvent`）。
 
         只翻译，不改写语义：文本原样进 ``parts``，
@@ -1298,19 +1273,12 @@ class OneBotV11Connector(ChannelConnector):
                 ChannelErrorKind.ignored, f"message_sent:{message_id or ''}"
             )
         if post_type == "notice":
-            # **撤回**是唯一需要内核处理的 notice：对方把他的那条收回了，
-            # 我们不能再把原文喂给模型。其余 notice（戳一戳、入群、群名片
-            # 更新…）仍然不进入任何链路——它们没有需要撤回的知识。
             recall = self._recall_from_notice(payload)
             if recall is not None:
                 return recall  # 类型故意与信封不同：它不是一条消息
 
             notice_type = str(payload.get("notice_type") or "")
-            if notice_type == "group_decrease":
-                # 与撤回同理：它不是一条消息，但它是"我们手里的知识"变了的
-                # 事实之一——机器人被踢/退群之后这个群再也收不到新消息了。
-                # 只在我们自己离开时返回事件，其余（别人退群）落到下面的
-                # ignored 分支。
+            if notice_type in {"group_decrease", "group_increase"}:
                 contact = self._contact_change_from_notice(payload)
                 if contact is not None:
                     return contact  # 类型故意与信封不同：它不是一条消息
@@ -1347,6 +1315,8 @@ class OneBotV11Connector(ChannelConnector):
             raise ChannelError(ChannelErrorKind.rejected, "事件缺少 user_id")
         if is_group and not group_id:
             raise ChannelError(ChannelErrorKind.rejected, "群消息缺少 group_id")
+        if message_type == "private" and payload.get("sub_type") == "friend":
+            self._known_friend_ids.add(user_id)
 
         message_id = str(payload.get("message_id") or "")
         self_id = str(payload.get("self_id") or self._config.self_id or "")
@@ -1723,66 +1693,40 @@ class OneBotV11Connector(ChannelConnector):
         self._trim_group_name_cache()
         return name
 
-    async def fetch_friend_names(
-        self,
-    ) -> dict[str, tuple[str | None, str | None]]:
-        """好友列表 → ``{user_id: (remark, nickname)}``。**拿不到返回空字典，绝不抛**。
+    def was_friend(self, user_id: str) -> bool:
+        return user_id in self._known_friend_ids
 
-        ## 为什么必须调 `get_friend_list`
-
-        会话标题要显示"好友备注"。但 OneBot V11 里**备注不是消息事件的一部分**：
-        `sender` 只带 `nickname` / `card`；`get_stranger_info` 也只给昵称。
-        `remark`（备注）是**好友关系**上的字段，只有 `get_friend_list` 返回它。
-
-        所以这一项只能整表拉一次——没有"查单个好友备注"的接口。
-
-        ## 缓存
-
-        会话列表是**读侧**、每开一次页面都会问。不缓存就是每次开页面都让
-        NapCat 吐一遍全量好友列表。成功的 10 分钟内复用，失败 1 分钟内静默
-        （NapCat 刚重启时别让它挨一轮风暴）。
-
-        ## 失败为什么不抛
-
-        标题是次要信息。`get_friend_list` 在某些 OneBot 实现里没实现
-        （404 → ``unsupported``），也可能超时。为了一个标题让会话列表 500，
-        是拿主功能换次要信息。调用方拿到空字典就按"没有备注/昵称"处理，
-        前端回退成「私聊 {id}」。
-        """
+    async def fetch_friend_names(self) -> dict[str, tuple[str | None, str | None]] | None:
+        """当前好友表，按账号保留无名条目。读取失败时返回 ``None``。"""
         now = time.monotonic()
         cached = self._friend_names_cache
         if cached is not None:
             stamped, cached_names = cached
             ttl = (
                 self.friend_names_ttl
-                if cached_names
+                if cached_names is not None
                 else self.friend_names_miss_ttl
             )
             if now - stamped < ttl:
                 return cached_names
 
-        names: dict[str, tuple[str | None, str | None]] = {}
         try:
             data = await asyncio.wait_for(
                 self._call("get_friend_list", {}), timeout=self.friend_names_timeout
             )
-            rows = data if isinstance(data, list) else []
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                user_id = row.get("user_id")
-                if user_id is None:
-                    continue
-                remark = _clean_name(row.get("remark"))
-                nickname = _clean_name(row.get("nickname"))
-                if remark or nickname:
-                    names[str(user_id)] = (remark, nickname)
-        except (ChannelError, TimeoutError) as exc:
-            logger.debug(
-                "采集好友列表失败（标题回退为无名）：%s", type(exc).__name__
-            )
+            if not isinstance(data, list):
+                raise ValueError("好友列表响应不是数组")
+            names = {}
+            for row in data:
+                user_id = str(row.get("user_id") or "").strip() if isinstance(row, dict) else ""
+                if not user_id.isascii() or not user_id.isdigit():
+                    raise ValueError("好友列表缺少有效账号")
+                names[user_id] = (_clean_name(row.get("remark")), _clean_name(row.get("nickname")))
+            self._known_friend_ids.update(names)
         except Exception as exc:  # noqa: BLE001 - 采集是尽力而为，不能影响读侧
-            logger.debug("采集好友列表异常（回退为无名）：%s", type(exc).__name__)
+            logger.debug("采集好友列表失败：%s", type(exc).__name__)
+            self._friend_names_cache = (now, None)
+            return None
 
         self._friend_names_cache = (now, names)
         return names

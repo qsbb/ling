@@ -20,6 +20,7 @@ from ling.api.deps import (
 )
 from ling.api.errors import LingError, not_found
 from ling.api.guards import OwnerGuard
+from ling.capabilities.channels import connector_for_instance, connector_for_namespace
 from ling.contracts.v1 import (
     ContactAvailability,
     ErrorCode,
@@ -35,12 +36,13 @@ from ling.contracts.v1 import (
 )
 from ling.domains.conversation.service import (
     ConversationService,
-    sort_windows_for_display,
+    split_window_ref,
     window_target,
 )
 from ling.infra.db import independent_session_scope
 from ling.infra.models import Message, PromptSnapshot, Window
 from ling.kernel.context import KEY_LABELS, KEY_ORDER, estimate_tokens
+from ling.ports.channel import ChannelConnector
 
 router = APIRouter(tags=["sessions"])
 
@@ -61,6 +63,18 @@ class UpdateSessionBody(BaseModel):
 class MessagesOut(BaseModel):
     messages: list[dict]
     active_turn: dict | None = None
+
+
+def _window_connector(request: Request, window: Window) -> ChannelConnector | None:
+    parts = split_window_ref(window.platform_reference)
+    if parts is None:
+        return None
+    namespace, _, _ = parts
+    key = window.trusted_instance_key
+    if key is not None:
+        connector = connector_for_instance(request.app, *key)
+        return connector if connector is not None and connector.instance_id == namespace else None
+    return connector_for_namespace(request.app, window.channel, namespace)
 
 
 async def _group_display_names(
@@ -84,13 +98,10 @@ async def _group_display_names(
     # `fetch(peer)` 变成"对着 object 调用"。
     plan: dict[str, tuple[Callable[[str], Awaitable[str | None]], str]] = {}
     for window in windows:
-        channel, kind, peer_id = window_target(window)
+        _, kind, peer_id = window_target(window)
         if kind != "group" or not peer_id:
             continue
-        from ling.capabilities.channels import connector_for_namespace
-
-        namespace = str(window.title or "").split(":", 1)[0]
-        connector = connector_for_namespace(request.app, channel, namespace)
+        connector = _window_connector(request, window)
         fetch = getattr(connector, "fetch_group_name", None)
         if fetch is None:
             continue
@@ -109,204 +120,71 @@ async def _group_display_names(
     }
 
 
-async def _friend_names_by_instance(
+async def _friend_details(
     request: Request, windows: Sequence[Window]
-) -> dict[str, dict[str, tuple[str | None, str | None]]]:
-    """每个涉及到的账号命名空间 → ``{user_id: (remark, nickname)}``。
-
-    ## 为什么每个实例只调一次
-
-    ``fetch_friend_names`` 是**整表**接口（OneBot 没有"查单个好友备注"的
-    动作）。三个私聊窗口共用同一个连接器时，逐个窗口调就是三次全量响应——
-    连接器内部虽然缓存了，但缓存是"10 分钟后失效"的，失效那一刻就会连打
-    三次。所以这里按账号命名空间分组，每个实例一次。
-
-    ## 为什么吞异常
-
-    备注只是标题的优先级最高项，不是主功能。任何采集失败都退化成"这个渠道
-    没有好友名"，调用方继续用 ``subjects.display_name`` 或前端回退。
-    """
-    names: dict[str, dict[str, tuple[str | None, str | None]]] = {}
-    for window in windows:
-        channel, kind, peer_id = window_target(window)
-        namespace = str(window.title or "").split(":", 1)[0]
-        if kind != "private" or not peer_id or namespace in names:
-            continue
-        from ling.capabilities.channels import connector_for_namespace
-
-        connector = connector_for_namespace(request.app, channel, namespace)
-        fetch = getattr(connector, "fetch_friend_names", None)
-        if fetch is None:
-            # 这个渠道没有采集能力（web 窗口 / 测试桩 / QQ 官方未实现）。
-            # 记一个空表，后面的窗口不再重复找连接器。
-            names[namespace] = {}
-            continue
-        try:
-            fetched = await fetch()
-        except Exception:  # noqa: BLE001 - 采集是尽力而为，标题退回 null
-            fetched = {}
-        names[namespace] = fetched if isinstance(fetched, dict) else {}
-    return names
-
-
-async def _friend_names_by_window(
-    request: Request, windows: Sequence[Window]
-) -> dict[str, tuple[str, str]]:
-    """私聊窗口 id → 好友备注和渠道昵称。"""
-    table = await _friend_names_by_instance(request, windows)
-    out: dict[str, tuple[str, str]] = {}
+) -> tuple[dict[str, tuple[str, str]], dict[str, ContactAvailability]]:
+    """用每个实例的一份好友表查昵称和联系状态。"""
+    tables: dict[int, dict[str, tuple[str | None, str | None]] | None] = {}
+    names: dict[str, tuple[str, str]] = {}
+    contacts: dict[str, ContactAvailability] = {}
     for window in windows:
         _, kind, peer_id = window_target(window)
         if kind != "private" or not peer_id:
             continue
-        namespace = str(window.title or "").split(":", 1)[0]
-        remark, nickname = table.get(namespace, {}).get(peer_id, (None, None))
-        out[window.id] = ((remark or "").strip()[:128], (nickname or "").strip()[:128])
-    return out
-
-
-async def _display_names(
-    request: Request, conversation: ConversationService, windows: Sequence[Window]
-) -> dict[str, str | None]:
-    """没有会话别名时，使用群名或私聊对端的显示名。"""
-    unnamed = [window for window in windows if not window.display_name_override]
-    private_names = await _friend_names_by_window(request, unnamed)
-    names = await conversation.peer_display_names(unnamed, private_names)
-    names.update(await _group_display_names(request, unnamed))
-    return names
-
-
-async def _friend_availability(
-    request: Request, windows: Sequence[Window]
-) -> dict[str, str]:
-    """私聊窗口 id → 不可用原因（``friend_deleted``）。**只在能确认时才给**。
-
-    ## 判据是"整表拿到了，里面没有这个人"
-
-    OneBot v11 没有 ``friend_decrease`` 这类事件（NapCat 也不推），所以"对方
-    把我删了"只能**读侧比对**：``get_friend_list`` 是全量好友表，对端不在表里
-    就是已删。
-
-    这里有三条不能省的守卫，缺任何一条都会把正常好友误标成已删：
-
-    1. **采集失败 ≠ 没有好友**。``fetch_friend_names`` 拿不到时返回空字典
-       （超时、实现不支持、NapCat 刚重启都会这样）。空字典直接判"全删了"
-       会让整个私聊列表一次全灰。所以**空表一律不判**；
-    2. **这个人本来就没有名字**。备注和昵称都为空的行连接器不会收进字典
-       （见 ``_clean_name`` 那段），所以集合里查不到也可能是"有条目但无名"。
-       因此只对**曾经采集到过名字**的渠道做判定——见下面的历史缓存；
-    3. **一个实例只问一次**：``fetch_friend_names`` 是整表接口，多个私聊窗口
-       共用同一账号时逐窗口调会连打三次。
-
-    ## 为什么不写回数据库
-
-    这是"平台此刻的状态"，而平台随时会变（加回来了、改备注了）。
-    写回库就把一次瞬时采集固化成事实，还要额外处理失效。**群的**状态不同
-    ——机器人被踢之后没有"再查一次"的接口能自愈，所以那条必须落库。
-    """
-    from ling.capabilities.channels import connector_for_namespace
-
-    by_instance: dict[tuple[str, str], list[Window]] = {}
-    for window in windows:
-        channel, kind, peer_id = window_target(window)
-        if kind != "private" or not peer_id:
-            continue
-        namespace = str(window.title or "").split(":", 1)[0]
-        by_instance.setdefault((channel, namespace), []).append(window)
-    if not by_instance:
-        return {}
-
-    out: dict[str, str] = {}
-    for (channel, namespace), group in by_instance.items():
-        connector = connector_for_namespace(request.app, channel, namespace)
+        connector = _window_connector(request, window)
         fetch = getattr(connector, "fetch_friend_names", None)
         if fetch is None:
             continue
-        try:
-            table = await fetch()
-        except Exception:  # noqa: BLE001 - 采集是尽力而为，不能影响读侧
+        instance = id(connector)
+        if instance not in tables:
+            try:
+                fetched = await fetch()
+            except Exception:  # noqa: BLE001 - 平台故障时仍然列出会话
+                fetched = None
+            tables[instance] = fetched if isinstance(fetched, dict) else None
+        table = tables[instance]
+        if table is None:
             continue
-        if not isinstance(table, dict) or not table:
-            # 守卫 1：空表只说明"没拿到"，不说明"都删了"。
-            continue
-        for window in group:
-            _channel, _kind, peer_id = window_target(window)
-            if peer_id and str(peer_id) not in table:
-                out[window.id] = ContactAvailability.friend_deleted.value
-    return out
+        if peer_id in table:
+            remark, nickname = table[peer_id]
+            names[window.id] = ((remark or "").strip()[:128], (nickname or "").strip()[:128])
+        else:
+            was_friend = getattr(connector, "was_friend", None)
+            if was_friend is not None and was_friend(peer_id):
+                contacts[window.id] = ContactAvailability.friend_deleted
+    return names, contacts
 
 
-async def _contact_availability(
-    request: Request, windows: Sequence[Window]
-) -> dict[str, str]:
-    """窗口 id → 联系不可用原因（只含有问题的那些）。
-
-    ## 两个来源，一条记录
-
-    - **群**：``windows.contact_unavailable_reason``。机器人被踢/退群时
-      ``notice.group_decrease`` 会推 ``kick_me``，内核写进这一列
-      （见 ``kernel/inbound_intake.py::_process_contact_status``）。没有读取侧
-      兜底：v11 的 ``get_group_list`` 由各实现自定义，且"查不到"分不清是
-      "退群了"还是"这次没采到"，拿它判会误伤整列。
-    - **私聊**：读侧现查好友表，见 :func:`_friend_availability`。
-
-    群优先：一条窗口同时是"群"和"好友"在结构上不可能（``window_target``
-    只会给出一个 kind），写成先到先得只是为了让"两个来源都返回了同一个
-    窗口 id"这种情况有一个确定答案。
-    """
-    out: dict[str, str] = {
-        window.id: str(window.contact_unavailable_reason)
+async def _session_records(
+    request: Request, conversation: ConversationService, windows: Sequence[Window]
+) -> list[SessionRecord]:
+    private_names, contacts = await _friend_details(request, windows)
+    unnamed = [window for window in windows if not window.display_name_override]
+    names = await conversation.peer_display_names(unnamed, private_names)
+    names.update(await _group_display_names(request, unnamed))
+    familiarity = await conversation.familiarities(windows)
+    return [
+        conversation.to_session_record(
+            window,
+            display_name=names.get(window.id),
+            familiarity=familiarity.get(str(window.subject_id)),
+            contact_unavailable=contacts.get(window.id),
+        )
         for window in windows
-        if getattr(window, "contact_unavailable_reason", None)
-    }
-    for window_id, reason in (await _friend_availability(request, windows)).items():
-        out.setdefault(window_id, reason)
-    return out
+    ]
 
 
 async def _session_record(
-    request: Request,
-    conversation: ConversationService,
-    window: Window,
-    *,
-    familiarity: dict[str, float] | None = None,
+    request: Request, conversation: ConversationService, window: Window
 ) -> SessionRecord:
-    names = await _display_names(request, conversation, [window])
-    if familiarity is None:
-        familiarity = await conversation.familiarities([window])
-    return conversation.to_session_record(
-        window,
-        display_name=names.get(window.id),
-        familiarity=familiarity.get(str(window.subject_id)),
-    )
+    return (await _session_records(request, conversation, [window]))[0]
 
 
 @router.get("/sessions", response_model=SessionListOut)
 async def list_sessions(
     request: Request, auth: CurrentAuth, conversation: ConversationDep
 ) -> SessionListOut:
-    """会话列表按置顶分组，再按"最近收到消息"倒序。
-
-    顺序由 `sort_windows_for_display` 定，接口层不自己写排序规则——三个入口
-    （这里、默认会话兜底、将来的移动端）必须共享同一份顺序。
-
-    好感度**一次 IN 查询**批量取回（`familiarities`），不是逐窗口查：
-    关系页那次卡死就是 n²，这里不能再犯。它现在只用于展示与排序输入的旁证，
-    定序的主键是 `updated_at`（见 `sort_windows_for_display` 的 docstring）。
-    """
-    # **先取行，再查好感度，最后排序**——顺序不能反。
-    #
-    # `list_windows` 的排序键是"置顶 → 好感度 → 最近活跃"，而好感度要按
-    # 窗口的 subject_id 集合去查，于是存在一个**循环依赖**：
-    #
-    #     排序需要 familiarity → familiarity 需要窗口列表 → 列表已排好序
-    #
-    # 此前的写法是先 `list_windows()`（此时没传 familiarity，中间那个键
-    # 全体相等，退化成按 updated_at 排）**再**查 `familiarities()` ——
-    # 好感度只进了返回值用于展示，**从未参与排序**。用户以为"按好感度排"，
-    # 实际一直是按最近活跃排；而代码两件事都做了，只是顺序错了，看不出异常。
-    #
-    # 所以拆两步：先取未排的行 → 查 familiarity → 用同一个纯函数排一次。
+    """按置顶、手动顺序和最近收到的消息列出会话。"""
     windows = await conversation.list_windows(auth.user.subject_id)
     if not windows:
         # Do not commit another dependency's work or hold the lock for network I/O.
@@ -315,24 +193,7 @@ async def list_sessions(
                 auth.user.subject_id
             )
         windows = [window]
-    familiarity = await conversation.familiarities(windows)
-    windows = sort_windows_for_display(windows, familiarity)
-    names = await _display_names(request, conversation, windows)
-    # 平台侧联系状态：群里是"我们还在不在"（只能从事件学到，已落库），
-    # 私聊是"对方还删没删我们"（`get_friend_list` 现查）。两次采集都挂在读侧，
-    # 与群名同理——入站是最不能慢的一条路。
-    contacts = await _contact_availability(request, windows)
-    return SessionListOut(
-        sessions=[
-            conversation.to_session_record(
-                w,
-                display_name=names.get(w.id),
-                familiarity=familiarity.get(str(w.subject_id)),
-                contact_unavailable=contacts.get(w.id),
-            )
-            for w in windows
-        ]
-    )
+    return SessionListOut(sessions=await _session_records(request, conversation, windows))
 
 
 class PinSessionBody(BaseModel):
@@ -390,10 +251,7 @@ async def pin_session(
             pinned=body.pinned,
             operator=auth.user.role in {"owner", "admin"},
         )
-    familiarity = await conversation.familiarities([window])
-    return await _session_record(
-        request, conversation, window, familiarity=familiarity
-    )
+    return await _session_record(request, conversation, window)
 
 
 @router.post("/sessions", response_model=SessionRecord, status_code=201)

@@ -1,23 +1,4 @@
-"""会话置灰：群被退/被踢、好友已删时，那一行要"还在、但看得出来不在了"。
-
-## 这一层要守住什么
-
-用户原话：「把已退出或者已不在的群聊，或者已删除的好友置灰处理」。拆开是
-三条互不替代的断言：
-
-1. **判定**：`notice.group_decrease` 里只有"我们不在这个群了"才产生状态事件；
-   别人退群、被踢与我们的窗口无关，不能把正常群灰掉（`test_..._only_for_self`）。
-2. **持久化**：事件只来一次，所以必须落库；且**绝不动 `updated_at`**——
-   它是列表排序键，改它会让刚被踢的群跳到最前面。
-3. **呈现**：`GET /v1/sessions` 要带出 `contact_unavailable`，且**仍然可点**
-   （前端只降透明度，条目本身不隐藏）。
-
-## 为什么"好友已删"不在这条链路里
-
-OneBot v11 没有 `friend_decrease` 通知（NapCat 也不推），所以好友那一侧
-只能读侧比对 `get_friend_list`。那条路径的关键风险是**采集失败被当成
-"全都删了"**，本文件用"空表不判"与"有一条已删"两条用例分别钉住两侧。
-"""
+"""OneBot 群成员通知和好友表在会话列表中的显示。"""
 
 from __future__ import annotations
 
@@ -35,7 +16,7 @@ from ling.infra.db import session_scope
 from ling.infra.models import Window
 from ling.kernel import inbound_intake
 from ling.ports.channel import ChannelError, ChannelErrorKind
-from tests.integration.conftest import logged_in  # noqa: F401 - fixture
+from tests.integration.conftest import TestEnv, logged_in  # noqa: F401 - fixture
 
 pytestmark = pytest.mark.w0_web
 
@@ -77,9 +58,8 @@ def test_connector_maps_kick_me_to_contact_status_event() -> None:
     assert event.availability is ContactAvailability.kicked
     assert event.window_ref == f"{CFG.instance_id}:group:{GROUP}"
     assert event.target_ref == GROUP
-    # 去重键带群号与子类型：平台重投同一条不能产生第二条日志。
     assert event.external_event_id == (
-        f"{CFG.instance_id}:group_decrease:{GROUP}:kick_me"
+        f"{SELF_ID}:group_decrease:{GROUP}:kick_me:1700000000.0"
     )
 
 
@@ -144,11 +124,7 @@ def _kick_event(reference: str) -> ContactStatusEvent:
 
 
 async def test_contact_status_is_persisted_without_touching_activity(logged_in) -> None:  # noqa: F811
-    """写入 `contact_unavailable_*`，**且 `updated_at` 一动不动**。
-
-    后半句是本用例真正的价值：`updated_at` 是列表排序键，若被写成"现在"，
-    这个刚被踢的群会跳到列表最前面——用户最不需要看到的那条。
-    """
+    """成员变动保留原有的会话更新时间。"""
     window_id = await _make_group_window(logged_in)
     async with session_scope() as session:
         before = (await session.get(Window, window_id)).updated_at
@@ -171,8 +147,9 @@ async def test_contact_status_is_idempotent(logged_in) -> None:  # noqa: F811
     window_id = await _make_group_window(logged_in)
     reference = f"{CFG.instance_id}:group:{GROUP}"
 
-    first = await inbound_intake._process_contact_status(_kick_event(reference))
-    second = await inbound_intake._process_contact_status(_kick_event(reference))
+    event = _kick_event(reference)
+    first = await inbound_intake._process_contact_status(event)
+    second = await inbound_intake._process_contact_status(event)
 
     assert first["accepted"] is True and not first.get("duplicate")
     assert second.get("duplicate") is True
@@ -225,63 +202,91 @@ async def test_list_exposes_contact_unavailable(logged_in) -> None:  # noqa: F81
 
     assert by_id[grey_id]["contact_unavailable"] == ContactAvailability.kicked.value
     assert by_id[web_id]["contact_unavailable"] is None
+    result = await logged_in.client.get(f"/v1/sessions/{grey_id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["contact_unavailable"] == "kicked"
 
 
-async def test_friend_list_missing_peer_marks_friend_deleted() -> None:
-    """好友表里查不到对端 → `friend_deleted`；空表（采集失败）不判。
+async def test_rejoin_clears_old_status_and_next_kick_is_applied(logged_in: TestEnv) -> None:  # noqa: F811
+    connector = OneBotV11Connector(CFG)
+    window_id = await _make_group_window(logged_in)
+    kick = _decrease(sub_type="kick_me", user_id=SELF_ID)
+    join = {**kick, "notice_type": "group_increase", "sub_type": "invite", "time": kick["time"] + 2}
+    stale_kick = {**kick, "time": kick["time"] + 1}
+    second_kick = {**kick, "time": kick["time"] + 3}
 
-    这两半缺一不可：只测"查不到就标"，去掉"空表不判"的守卫后本用例仍绿；
-    只测"空表不判"，实现完全不做判定也绿。所以两条必须一起跑。
-    """
-    from ling.api.routes.sessions import _friend_availability
+    async def notice(payload: dict) -> dict:
+        return await inbound_intake.process_inbound_payload(
+            logged_in.app, connector, payload, trusted_instance_key=("onebot", "default")
+        )
 
-    class _Connector:
-        def __init__(self, table: dict[str, tuple[str | None, str | None]]) -> None:
-            self.table = table
+    async def status() -> str | None:
+        result = await logged_in.client.get(f"/v1/sessions/{window_id}")
+        assert result.status_code == 200, result.text
+        return result.json()["contact_unavailable"]
 
-        async def fetch_friend_names(self):
-            return self.table
+    assert (await notice(kick))["window_matched"] is True
+    assert await status() == "kicked"
+    assert (await notice({**join, "user_id": 30004}))["accepted"] is False
+    assert await status() == "kicked"
+    assert (await notice(join))["window_matched"] is True
+    assert await status() is None
+    assert (await notice(stale_kick))["window_matched"] is False
+    assert await status() is None
+    assert (await notice(second_kick))["window_matched"] is True
+    assert await status() == "kicked"
 
-    class _App:
-        def __init__(self, connector: _Connector) -> None:
-            self.state = type("S", (), {})()
-        # 连接器查找走 `connector_for_namespace(app, ...)`，由下面 patch 掉。
 
-    window = Window(
-        id="win_private",
-        actor_id="actor",
-        subject_id="subj_peer",
-        title=f"{CFG.instance_id}:private:{PEER}",
-        channel="onebot",
-        visibility="subject_private",
-        connector_window_ref=f"{CFG.instance_id}:private:{PEER}",
-        origin_status="known",
-        origin_scope="onebot",
-        origin_instance_id=CFG.instance_id,
-    )
+async def test_friend_status_uses_one_snapshot_per_connector(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    connector = OneBotV11Connector(CFG)
+    logged_in.app.state.onebot_connector = connector
+    connector.friend_names_ttl = 0
+    connector.friend_names_miss_ttl = 0
+    response: list[dict] | None = [{"user_id": int(PEER), "nickname": "", "remark": ""}]
+    requests = 0
 
-    import ling.capabilities.channels as channels
+    async def peer_list(action: str, params: dict) -> list[dict]:
+        nonlocal requests
+        assert action == "get_friend_list"
+        requests += 1
+        if response is None:
+            raise ChannelError(ChannelErrorKind.unreachable, "连接失败")
+        return response
 
-    original = channels.connector_for_namespace
-    try:
-        class _R:
-            def __init__(self) -> None:
-                self.app = object()
+    monkeypatch.setattr(connector, "_call", peer_list)
+    async with session_scope() as session:
+        service = ConversationService(session)
+        friend = await service.create_window(
+            subject_id=logged_in.subject_id,
+            title=f"{CFG.instance_id}:private:{PEER}",
+            channel="onebot",
+        )
+        friend.display_name_override = "好友别名"
+        temporary = await service.create_window(
+            subject_id=logged_in.subject_id,
+            title=f"{CFG.instance_id}:private:20004",
+            channel="onebot",
+        )
+        friend_id, temporary_id = friend.id, temporary.id
 
-        async def run(table: dict[str, tuple[str | None, str | None]]) -> dict[str, str]:
-            channels.connector_for_namespace = lambda *a, **k: _Connector(table)  # type: ignore[assignment]
-            return await _friend_availability(_R(), [window])
+    async def unavailable() -> tuple[str | None, str | None]:
+        result = await logged_in.client.get("/v1/sessions")
+        assert result.status_code == 200, result.text
+        rows = {row["session_id"]: row for row in result.json()["sessions"]}
+        assert rows[friend_id]["display_name"] == "好友别名"
+        return rows[friend_id]["contact_unavailable"], rows[temporary_id]["contact_unavailable"]
 
-        # 1) 表里没有这个人 → 已删
-        assert await run({"100200300": (None, "别人")}) == {
-            "win_private": ContactAvailability.friend_deleted.value
-        }
-        # 2) 空表 = 采集失败，**不判**（否则一次超时会把整列私聊灰掉）
-        assert await run({}) == {}
-        # 3) 表里有这个人 → 正常
-        assert await run({PEER: (None, "阿岚")}) == {}
-    finally:
-        channels.connector_for_namespace = original  # type: ignore[assignment]
+    assert await unavailable() == (None, None)
+    assert connector.was_friend(PEER)
+    assert requests == 1
+    response = None
+    assert await unavailable() == (None, None)
+    response = []
+    assert await unavailable() == ("friend_deleted", None)
+    response = [{"user_id": int(PEER), "nickname": "阿岚"}]
+    assert await unavailable() == (None, None)
 
 
 async def test_contact_status_event_is_not_a_message(logged_in) -> None:  # noqa: F811

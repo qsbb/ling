@@ -290,7 +290,7 @@ class Window(Base, TimestampMixin):
     # 学到（见 connectors/onebot/connector.py 的 ``_contact_change_from_notice``），
     # 那条事件来一次就过去了，不存下来就永远不知道。好友那边虽然有
     # ``get_friend_list`` 可查，读侧也只在**确认成功**时才覆盖，见
-    # ``api/routes/sessions.py::_friend_availability``。
+    # ``api/routes/sessions.py::_friend_details``。
     #
     # 为什么是字符串而不是布尔：要区分"主动退出"和"被踢"——它们对"能不能
     # 再加回去"的含义不同，且日志要说得清。取值见 ``ContactAvailability``
@@ -304,8 +304,7 @@ class Window(Base, TimestampMixin):
     def contact_unavailable(self) -> bool:
         """平台侧联系已经不在了（群被退/被踢、好友已删）。
 
-        只读这一个派生量，不再判断 ``at`` 是否为空：两者由同一个写入点写、
-        同一个写入点清，分开判只会多一种"有原因没时间"的畸形状态。
+        重新入群时，原因清空，时间留作最近一条成员变动的记录。
         """
         return self.contact_unavailable_reason is not None
 

@@ -1,4 +1,16 @@
 {
+  "$defs": {
+    "ContactAvailability": {
+      "description": "平台侧这个联系还在不在。\n\n## 为什么要有\"原因\"而不是一个 ``unavailable: bool``\n\n三种不在的情况对用户的含义不同，界面上是一行灰字，但**排障时**要能区分：\n\n- ``left``：机器人自己**主动退出**了群（``group_decrease`` + ``leave``）；\n- ``kicked``：机器人被**踢出**群（``kick_me``）；群可能还在，只是我们进不去；\n- ``friend_deleted``：对方**删了好友**（``get_friend_list`` 里查不到）。\n\n``kicked`` 和 ``left`` 在界面上的处置一样（都读不到新消息了），但把\"被踢\"\n记成\"自己退的\"是错误归属——与撤回路径里 ``self_recall`` 单列的理由相同。\n\n## 为什么是字符串常量而不是布尔\n\n布尔值只能回答\"在不在\"，答不出\"为什么\"。而\"为什么\"是这条信息唯一能\n帮上忙的地方：用户看到灰掉的一行，第一个问题永远是\"我怎么不在了\"。",
+      "enum": [
+        "left",
+        "kicked",
+        "friend_deleted"
+      ],
+      "title": "ContactAvailability",
+      "type": "string"
+    }
+  },
   "$id": "https://ling.local/contracts/v1/SessionRecord.schema.json",
   "additionalProperties": false,
   "description": "会话窗口的权威记录（不是浏览器缓存）。",
@@ -18,6 +30,17 @@
       "default": "web",
       "title": "Channel",
       "type": "string"
+    },
+    "contact_unavailable": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContactAvailability"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "created_at": {
       "format": "date-time",
