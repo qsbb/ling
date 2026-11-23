@@ -860,98 +860,6 @@
   flex-wrap: wrap;
 }
 
-.connector-instance-policy {
-  display: grid;
-  gap: 10px;
-  min-width: 0;
-  margin-top: 6px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-}
-
-.connector-instance-policy h4 {
-  margin: 0;
-  font-size: 14px;
-}
-
-.connector-instance-policy__fields {
-  display: grid;
-  min-width: 0;
-}
-
-.connector-instance-policy__row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, min(16rem, 44%));
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  padding: 9px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.connector-instance-policy__current {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
-.connector-instance-policy__current label {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.connector-instance-policy__current output {
-  color: var(--ink-soft);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.connector-instance-policy__row select {
-  width: 100%;
-  min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--paper-raised);
-  color: var(--ink);
-  font: inherit;
-}
-
-.connector-instance-policy__preview {
-  display: grid;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--line);
-  min-width: 0;
-}
-
-.connector-instance-policy__preview ul {
-  display: grid;
-  gap: 5px;
-  margin: 0;
-  padding-left: 20px;
-  overflow-wrap: anywhere;
-  font-size: 12.5px;
-}
-
-.connector-instance-policy__preview p,
-.connector-instance-policy > p {
-  margin: 0;
-  color: var(--ink-soft);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.connector-instance-policy__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.connector-instance-policy__error {
-  color: var(--danger) !important;
-}
-
 .connector-instances__rename {
   display: flex;
   align-items: center;
@@ -1013,21 +921,6 @@
   }
 
   .connector-instances__toolbar .button {
-    flex: 1 1 auto;
-  }
-
-  .connector-instance-policy__row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 6px;
-  }
-
-  .connector-instance-policy__row select,
-  .connector-instance-policy__actions .button {
-    min-height: 44px;
-    font-size: 16px;
-  }
-
-  .connector-instance-policy__actions .button {
     flex: 1 1 auto;
   }
 }
