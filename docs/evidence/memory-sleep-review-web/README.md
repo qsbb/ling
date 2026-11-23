@@ -66,6 +66,25 @@ A clients/web-console/src/sleep-review.browser.test.tsx
 
 用 `<details>` 而不是受控 state：展开与否是纯展示层的事，不该跟着重新取数重置。
 
+### 3b. 能读到原话，就要能走到它出现的地方
+
+只给原话文本，用户没法确认这句话属于哪次对话——两条来自不同窗口的记忆在界面上
+长得一样。所以每条原话末尾带一个「查看来源会话」入口，指向 `item.window_id`。
+
+- **沿用既有路由**：`window_id` 就是会话 id（服务端
+  `SessionRecord.session_id = window.id`），所以目标是既有的 `/s/{id}`。
+  不新增端点、不自己拼鉴权，授权由聊天页原本那一套负责。
+- **用 `navigate` 而不是裸 `<a href>`**：和聊天页内部切会话是同一个动作
+  （`useChat` 也用 `navigate(routePath({ name: 'chat', sessionId }))`），
+  否则会出现"点链接整页刷新、点会话列表软跳转"两种行为。地址仍由
+  `sourceSessionHref` 生成，复制出来的链接可用。
+- **入口挂在原话上，不挂在摘要上**：原话才是用户要核对的那句话。契约里原话
+  不单独带窗口（与记忆同源），所以两条路径同指一个会话；挂在原话上更贴近
+  "我在核对这一句"，展开区里也不再重复放第二个指向同一处的链接。
+- **没有原话就不给入口**：只凭一条摘要跳进会话，用户到了那边也找不到对应的
+  句子，等于把找不到的目标伪装成可核对。`review_status=empty`（服务端重验后
+  条目消失）与 `nights=[]` 同样不给入口，走原流程。
+
 ### 4. 四种分支各说各的话
 
 | 分支 | 界面 |
@@ -114,13 +133,26 @@ pytest tests/integration/test_memory_sleep_review.py -x -q
 | `skipped` 的 tone 改为 `warn` | **2 条红**（分区用例 + 文案用例） |
 | 错误分支短路，落到空状态 | **1 条红**（"不降级成空状态"） |
 | `reason` 改成总是显示 | **2 条红**（"只在提供额外信息时显示" + "计数只说一次"） |
+| 所有原话都指向第一个窗口 | **1 条红**（"各指向自己的窗口"）——见下 |
+| 无原话分支也渲染入口 | **2 条红**（"不渲染空的原话区" + "没有原话时不渲染来源入口"） |
+
+第一条变异值得记一笔：**最初的版本没抓到它**。当时断言是"整页里出现过
+`win_garden` 和 `win_bridge`"，而变异体让两条原话都指向 `win_garden` 时，
+`win_bridge` 仍出现在行容器的 `data-window-id` 上，于是照样通过。改成按**行**
+切开断言后，同一个变异立刻红。这是"断言能证明什么取决于错误实现会给什么值"
+的又一个实例。
 
 每次变异后都用 `sha256sum` 核对文件已逐字节恢复。
 
-### 浏览器验收（`src/sleep-review.browser.test.tsx`，7 条，真 Chromium）
+### 浏览器验收（`src/sleep-review.browser.test.tsx`，9 条，真 Chromium）
 
 只 mock `/v1` 网络层，验的是"界面遇到这份契约数据会长成什么样"。
-覆盖 A 准备 / B 可读 / C `skipped+ready` / D 空 / E 失败 / F 原话不可再用 / G 入口。
+覆盖 A 准备 / B 可读 / C `skipped+ready` / D 空 / E 失败 / F 原话不可再用 /
+G 入口 / H 来源会话 / I 没有原话就没有入口。
+
+H 是这一轮新增的关键一条：两条记忆的 `window_id` 不同（`win_mem_garden` /
+`win_mem_bridge`），分别展开原话、点入口，断言 **URL 与页面上的消息都属于
+各自那个会话**——只断言"URL 变了"证明不了到的是正确的那个。
 
 截图（同目录，1366×900）：
 
@@ -134,6 +166,9 @@ pytest tests/integration/test_memory_sleep_review.py -x -q
 | `E-failed.png` | 读取失败 |
 | `F-original-gone.png` | `review_status=empty`（原话已不可用） |
 | `G-navigation.png` | 分区入口与深链 |
+| `H-source-garden.png` | 第一条原话 → 阳台的花（`win_mem_garden`） |
+| `H-source-bridge.png` | 第二条原话 → 城西的石桥（`win_mem_bridge`） |
+| `I-no-original-no-entry.png` | 没有原话 → 不给来源入口 |
 
 ### 全量回归
 
@@ -153,6 +188,9 @@ Test Files  45 passed (45)
 - **"重新读取时来源消失"只在数据层模拟**：我在 mock 里直接给 `review_status=empty`
   的响应，**没有**走真实后端做"撤回一条记忆 → 再读 → 它消失"的链路。
 - **移动端未验**。截图都是 1366 宽；375 窄屏没有跑。
+- **来源会话只跳到会话，不定位到那一轮**。`turn_id` 在契约里有，但聊天页没有
+  轮次锚点，所以入口落在 `/s/{window_id}`，用户到会话里需要自己往上找。
+  要做"滚到那一句"得先给聊天页加锚点，超出这一轮范围。
 - `item.text` 服务端已截到 240 字，界面不再二次截断，也没有为超长文本做
   "展开全文"——契约里没有全文可给。
 - 首页入口与列表分支的合流没有做：那是另一个会话的范围，本分支只提供分区入口。
