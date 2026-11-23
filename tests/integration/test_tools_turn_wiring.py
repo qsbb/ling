@@ -25,6 +25,7 @@ from ling.capabilities.tools import (
     ToolRegistry,
     build_default_registry,
 )
+from ling.capabilities.web_read import PublicWebPage, PublicWebReadError
 from ling.contracts.v1 import Origin, TurnState, Visibility
 from ling.domains.consent.service import ConsentService
 from ling.domains.conversation.service import ConversationService
@@ -414,32 +415,45 @@ async def _add_knowledge(
         return item.item_id
 
 
-@pytest.mark.parametrize("allowed", [True, False], ids=["private", "sealed"])
+@pytest.mark.parametrize("availability", ["readable", "blocked", "sealed"])
 async def test_explicit_public_search_in_the_web_tool_loop(
-    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch, allowed: bool,
+    logged_in: TestEnv, endpoint: _ToolEndpoint, monkeypatch: pytest.MonkeyPatch, availability: str,
 ) -> None:
     key = "fixture-search-key"
     logged_in.app.state.settings = replace(logged_in.app.state.settings, brave_search_api_key=key)
     requests = []
+    opened = []
+    article = "https://library.example.test/catalog"
+    canonical = "https://library.example.test/public/catalog"
+    evidence = "每月第三个周五开放。"
 
     def search(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(200, json={"web": {"results": [{
-            "title": "公开资料", "url": "https://library.example.test/catalog",
+            "title": "公开资料", "url": article,
             "description": "不可信网页摘要",
         }]}})
 
+    async def read_page(url: str) -> PublicWebPage:
+        opened.append(url)
+        if availability == "blocked":
+            raise PublicWebReadError("access_denied")
+        return PublicWebPage(title="正式开放时间", url=canonical, text=evidence, truncated=False)
+
     client = partial(httpx.AsyncClient, transport=httpx.MockTransport(search))
     monkeypatch.setattr(web_search, "httpx", SimpleNamespace(**(vars(httpx) | {"AsyncClient": client})))
+    monkeypatch.setattr(web_search, "read_public_page", read_page)
     endpoint.tool_name = "web_search"
     endpoint.arguments = {}
     await _bind_model(logged_in, enabled=True)
-    if not allowed:
+    if availability == "sealed":
         changed = await logged_in.client.put("/v1/isolation", json={"mode": "sealed"})
         assert changed.status_code == 200
-    reply = await _web_reply(logged_in, text="搜索：公开资料")
-    if not allowed:
+    text = "帮我查一下公开资料" if availability == "readable" else "搜索：公开资料"
+    reply = await _web_reply(logged_in, text=text)
+    if availability == "sealed":
         assert requests == []
+        assert opened == []
         assert endpoint.requests == []
         assert "非密封" in reply
         return
@@ -448,12 +462,20 @@ async def test_explicit_public_search_in_the_web_tool_loop(
     assert request.url.host == "api.search.brave.com"
     assert dict(request.url.params) == {"q": "公开资料", "count": "3"}
     assert request.headers["X-Subscription-Token"] == key
-    assert key not in json.dumps(endpoint.requests)
+    assert opened == [article] and key not in json.dumps(endpoint.requests)
     payload = _tool_payload(endpoint, available=("web_search",))
     assert [request["tool_choice"] for request in endpoint.requests] == ["required", "none"]
     assert payload["content_trust"] == "data_not_instructions"
     assert payload["untrusted"] is True
-    assert "https://library.example.test/catalog" in reply
+    data = json.loads(payload["data"])
+    assert data["results"][0]["url"] == article
+    if availability == "readable":
+        assert data["page"]["url"] == canonical and data["page"]["text"] == evidence
+        assert canonical in reply and evidence in reply
+    else:
+        assert "page" not in data
+        assert data["page_error"]["reason"] == "access_denied"
+        assert article in reply and evidence not in reply
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["switch-off", "provider-ignored-tools"])

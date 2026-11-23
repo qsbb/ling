@@ -90,6 +90,8 @@ HISTORY_TOKEN_BUDGET = 20000
 RECENT_HISTORY_MESSAGES = 40
 NEARBY_HISTORY_MESSAGES = 4
 _GREETING_CONTINUITY = timedelta(minutes=5)
+# 窗口短记忆已有两小时的闲置期限。近期原文也在连续发言的空档处停止。
+_HISTORY_CONTINUITY = timedelta(hours=2)
 # 滚动摘要本身的预算
 SUMMARY_TOKEN_BUDGET = 400
 
@@ -1531,7 +1533,8 @@ class ContextCompiler:
         cap_hit = False
         focus_limited = False
         truncated = 0
-        greeting_since = datetime.now(UTC) - _GREETING_CONTINUITY
+        newer_at = datetime.now(UTC)
+        greeting_since = newer_at - _GREETING_CONTINUITY
         while history_scope != "opening":
             page = await self._conversation.messages_for_prompt(
                 window_id,
@@ -1547,11 +1550,15 @@ class ContextCompiler:
             fetched.extend(newest_first)
             for msg in newest_first:
                 if current_turn_id and msg.turn_id == current_turn_id:
-                    greeting_since = msg.created_at - _GREETING_CONTINUITY
+                    newer_at = msg.created_at
+                    greeting_since = newer_at - _GREETING_CONTINUITY
                     continue
-                if history_scope == "greeting" and msg.created_at < greeting_since:
-                    focus_limited = True
-                    break
+                if not wants_earlier:
+                    since = greeting_since if history_scope == "greeting" else newer_at - _HISTORY_CONTINUITY
+                    if msg.created_at < since:
+                        compiled_meta["history_boundary"] = "idle_gap"
+                        focus_limited = True
+                        break
                 if not wants_earlier and len(usable) == recent_limit:
                     # 近期条数边界落在一问一答之间时，从后一轮开始。
                     oldest = usable[-1]
@@ -1570,6 +1577,7 @@ class ContextCompiler:
                     break
                 usable.append(msg)
                 used_tokens += cost
+                newer_at = msg.created_at
                 if (
                     not wants_earlier and msg.role == "user" and msg.retracted_at is None
                     and (not is_group or msg.sender_subject_id == subject_id)

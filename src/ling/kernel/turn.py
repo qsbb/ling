@@ -2039,6 +2039,7 @@ class TurnCoordinator:
             lanes = [item.lane for item in annotated]
             context = {
                 "history_scope": compiled.meta.get("history_scope"),
+                "history_boundary": compiled.meta.get("history_boundary"),
                 "history_messages": lanes.count("history"),
                 "summary_included": "summary" in lanes,
                 "quote_included": "quote" in lanes,
