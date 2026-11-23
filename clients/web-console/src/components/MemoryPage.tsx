@@ -95,6 +95,16 @@ export function coreOriginLabel(originKind: string): string {
 /** 列表单次条数：契约只允许 1..200。给三个常用档位，不做「下一页」。 */
 export const LIMIT_OPTIONS = [50, 100, 200] as const;
 
+/**
+ * 搜索防抖：搜索走后端（服务端会查第一页之外的旧条目），所以每敲一个字
+ * 发一次请求会把慢响应排成队。250ms 是「打字停顿就出结果」与「一次连续
+ * 输入只发一条」之间的取值。
+ */
+export const SEARCH_DEBOUNCE_MS = 250;
+
+/** 搜索词上限，与 `GET /v1/memory` 的 `q` 约束一致（超出服务端 422）。 */
+export const SEARCH_MAX_LENGTH = 200;
+
 /* ==================================================================== 时间 */
 
 function pad2(value: number): string {
@@ -1074,8 +1084,17 @@ export interface MemoryListSectionProps {
   /** 来源筛选：null = 全部来源。 */
   source?: MemoryImportSourceFilter | null;
   onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
-  /** 已加载的累计条数（按来源翻页时 = offset）；翻页按钮据此取下一页。 */
-  loadedCount?: number;
+  /**
+   * 搜索词。这里发的是**服务端搜索**（`q`）：它能找到第一页之外的旧条目，
+   * 而不是只在已加载的那一批里筛。
+   */
+  search?: string;
+  onSearchChange?: (search: string) => void;
+  /**
+   * 已取回的累计条数现在只有一处来源（`state.data.memories.length`）。
+   * 这里曾经另传一个 `loadedCount`，第一页就把它和 `total` 相减，
+   * 得出「已取回 1 条 / 还有 137 条」——比命中总数多一条。同一个量只能有一个出口。
+   */
   onLoadMore?: () => void;
   loadingMore?: boolean;
   importPanelOpen?: boolean;
@@ -1099,6 +1118,15 @@ function historyStatus(row: MemoryRecord): string | null {
   if (row.retracted) return '已撤回';
   if (row.archived_at) return '已归档';
   return null;
+}
+
+/**
+ * 空态标题。清理进行中时列表本来就会是空的，说「没有现行记忆」会让人以为
+ * 记忆真的没了——那正是清理期间最不该给出的暗示。
+ */
+function emptyHeading(data: MemoryListResponse, include: MemoryInclude | null): string {
+  if (data.extraction?.state === 'purging') return '记忆正在清理';
+  return include ? '当前范围内没有条目' : '没有现行记忆';
 }
 
 function libraryEmptyNote(data: MemoryListResponse): string {
@@ -1342,10 +1370,10 @@ function MemoryInspector({
 export function MemoryListSection({
   state, include, flags, onFlagsChange, limit, onLimitChange, filters,
   onFiltersChange, handlers, onReload, source, onSourceChange = () => {},
-  loadedCount = 0, onLoadMore = () => {}, loadingMore = false, importPanelOpen = false,
+  search = '', onSearchChange = () => {},
+  onLoadMore = () => {}, loadingMore = false, importPanelOpen = false,
   onToggleImport = () => {}, onCloseImport = () => {},
 }: MemoryListSectionProps): React.ReactElement {
-  const [query, setQuery] = useState('');
   const [scope, setScope] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showFilters, setShowFilters] = useState(false);
@@ -1353,19 +1381,43 @@ export function MemoryListSection({
   const searchRef = useRef<HTMLInputElement>(null);
   const rowElement = useRef<HTMLButtonElement | null>(null);
   const restoreFocus = useRef(false);
+  /*
+    Chromium 给 `type=search` 画一个原生清除按钮（右侧 ×）：它只改 DOM 值，
+    **不触发 change**。不接住的话，输入框看着空了、列表还停在搜索结果上。
+    自带按钮比自画的少一个控件，所以留着原生那个，只在 search 事件上同步状态。
+  */
+  const onSearchChangeRef = useRef(onSearchChange);
+  onSearchChangeRef.current = onSearchChange;
+  useEffect(() => {
+    const input = searchRef.current;
+    if (!input) return undefined;
+    // 用 ref 取回调：父组件每次渲染都会给新函数，进依赖会让监听每次重挂。
+    const sync = () => { onSearchChangeRef.current(input.value); setSelectedId(null); };
+    input.addEventListener('search', sync);
+    return () => input.removeEventListener('search', sync);
+  }, []);
   const data = state.status === 'ok' ? state.data : null;
   const fetched = data?.memories ?? [];
-  const filtered = sortByCreatedDesc(searchLoadedMemories(
+  const trimmedSearch = search.trim();
+  /*
+    服务端已经按 `q` 查过（含第一页之外的旧条目），所以这里**不再**对正文做
+    第二次词匹配——那会把服务端命中的经历摘要（`text` 未必含词，命中在摘要里）
+    又筛掉一批，出现「服务端说命中 3 条、列表只剩 1 条」。本地只做属于视图的
+    收窄：类型、时间、可见范围。
+  */
+  const filtered = sortByCreatedDesc(
     filterMemories(fetched, filters).filter((row) => !scope || row.visibility === scope),
-    query,
-  ));
+  );
   const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : filtered[0];
   const mobileInspectorOpen = Boolean(selectedId && selected);
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
   const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
   const activeFilterCount = Number(filters.range !== 'all') + Number(Boolean(scope))
     + Number(flags.retracted) + Number(flags.archived) + Number(limit !== LIMIT_OPTIONS[0]);
-  const filteredByUser = Boolean(query.trim() || scope || filters.kind !== 'all' || filters.range !== 'all');
+  const narrowedByView = Boolean(scope || filters.kind !== 'all' || filters.range !== 'all');
+  /** 服务端命中口径下的总数；没有搜索词与来源时就是整库总数。 */
+  const matchTotal = data?.total ?? 0;
+  const canPage = Boolean(trimmedSearch || source);
 
   useEffect(() => {
     if (selectedId) headingRef.current?.focus();
@@ -1383,7 +1435,7 @@ export function MemoryListSection({
   };
 
   const clearDiscovery = () => {
-    setQuery('');
+    onSearchChange('');
     setScope('');
     onFiltersChange(DEFAULT_FILTERS);
     setSelectedId(null);
@@ -1391,8 +1443,12 @@ export function MemoryListSection({
   };
 
   const selectedFromHistory = (id: string) => {
+    /*
+      链接到不在这批里的条目时，把视图收窄撤掉——否则用户点进来看到的还是
+      「这批里没有」。**不撤搜索词**：服务端搜索是用户明确要的查询，它本来就
+      能覆盖第一页之外；撤掉反而让用户丢失已经找到的那批。
+    */
     if (!filtered.some((row) => row.memory_id === id)) {
-      setQuery('');
       setScope('');
       onFiltersChange(DEFAULT_FILTERS);
     }
@@ -1434,8 +1490,25 @@ export function MemoryListSection({
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" width="18" height="18">
               <circle cx="10.5" cy="10.5" r="6" /><path d="m15 15 5 5" strokeLinecap="round" />
             </svg>
-            <input ref={searchRef} type="search" value={query} onChange={(event) => { setQuery(event.target.value); setSelectedId(null); }}
-              aria-label="搜索已加载的记忆" placeholder="搜索已加载的记忆" />
+            <input
+              ref={searchRef}
+              type="search"
+              value={search}
+              maxLength={SEARCH_MAX_LENGTH}
+              data-testid="mem-search"
+              onChange={(event) => { onSearchChange(event.target.value); setSelectedId(null); }}
+              onKeyDown={(event) => {
+                // `type=search` 的 Esc 在 Chromium 里只清 DOM 值，不发 change；
+                // 于是输入框看起来空了、列表还停在搜索结果。这里显式接管。
+                if (event.key === 'Escape' && search) {
+                  event.preventDefault();
+                  onSearchChange('');
+                  setSelectedId(null);
+                }
+              }}
+              aria-label="搜索记忆库"
+              placeholder="搜索记忆库"
+            />
           </label>
           <button
             type="button" className="button button--small mem-index__filter" aria-expanded={showFilters} aria-controls="mem-discovery-filters"
@@ -1503,32 +1576,67 @@ export function MemoryListSection({
         {data ? (
           <>
             <div className="mem-index__count" role="status" data-testid="mem-list-count">
-              <span>已加载 {fetched.length} 条{filteredByUser ? ` · 匹配 ${filtered.length} 条` : ''}</span>
+              <span>
+                {trimmedSearch
+                  ? `匹配 ${matchTotal} 条 · 已取回 ${fetched.length} 条`
+                  : `已加载 ${fetched.length} 条${narrowedByView ? ` · 命中 ${matchTotal} 条` : ''}`}
+                {narrowedByView ? (
+                  <> · 当前筛选 {filtered.length} 条</>
+                ) : null}
+              </span>
               <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
             </div>
             {data.has_more ? (
               <p className="mem-index__boundary" data-testid="mem-limit-notice">
-                还有 {Math.max(0, data.total - (source ? loadedCount : fetched.length))} 条未加载。搜索仅限本批。
-                {source ? (
+                {/*
+                  口径必须和上面「已取回」那一行一致：都是这批已经拿到的条数。
+                  两处各用一个来源时，第一页就会显示「已取回 1 条 / 还有 137 条」，
+                  加起来比命中总数还多一条。
+                */}
+                还有 {Math.max(0, data.total - fetched.length)} 条未取回。
+                {canPage ? (
                   <> <button type="button" className="mem-text-button" data-testid="mem-load-more"
                     disabled={loadingMore} onClick={onLoadMore}>
                     {loadingMore ? '正在加载…' : '加载更早的记忆'}
                   </button></>
                 ) : limit < 200 ? (
                   <> <button type="button" className="mem-text-button" onClick={() => { onLimitChange(200); setSelectedId(null); }}>加载最近 200 条</button></>
-                ) : ' 接口最多返回 200 条，无法继续加载。'}
+                ) : ' 接口单次最多返回 200 条；输入搜索词可以继续往更早的记录里找。'}
               </p>
             ) : null}
             {fetched.length === 0 ? (
-              <div className="mem-index__empty" data-testid="mem-list-empty">
-                <strong>{include ? '当前范围内没有条目' : '没有现行记忆'}</strong>
-                <p>{include ? '可以调整历史记录和加载范围。' : libraryEmptyNote(data)}</p>
-                <button type="button" className="mem-text-button" onClick={() => setShowFilters(true)}>查看筛选选项</button>
-              </div>
+              trimmedSearch ? (
+                /* 搜了但没有命中：这和"库里本来就空"是两件事，不能共用一句话。 */
+                <div className="mem-index__empty" data-testid="mem-search-empty">
+                  {/*
+                    清理进行中时服务端一律返回空列表，这时候说"没有匹配这个词"
+                    是错的：不是词没命中，是数据暂时读不到。标题也要跟着换。
+                  */}
+                  <strong>
+                    {data.extraction?.state === 'purging'
+                      ? '记忆正在清理'
+                      : `没有匹配「${trimmedSearch}」的记忆`}
+                  </strong>
+                  <p>
+                    {data.extraction?.state === 'purging'
+                      ? '记忆正在清理，清理完成后才能查看。'
+                      : source
+                        ? `当前只看${sourceLabel(source)}。换个词，或把来源放宽到全部来源。`
+                        : '换个词试试；多个词用空格分开，每个词都要出现。'}
+                  </p>
+                  <button type="button" className="mem-text-button" onClick={clearDiscovery}>清除搜索</button>
+                </div>
+              ) : (
+                <div className="mem-index__empty" data-testid="mem-list-empty">
+                  <strong>{emptyHeading(data, include)}</strong>
+                  <p>{include ? '可以调整历史记录和加载范围。' : libraryEmptyNote(data)}</p>
+                  <button type="button" className="mem-text-button" onClick={() => setShowFilters(true)}>查看筛选选项</button>
+                </div>
+              )
             ) : filtered.length === 0 ? (
               <div className="mem-index__empty" data-testid="mem-filter-empty">
-                <strong>这批记忆里没有匹配项</strong>
-                <p>试试短一点的关键词，或放宽筛选。</p>
+                <strong>{trimmedSearch ? `匹配「${trimmedSearch}」的 ${matchTotal} 条都落在当前筛选之外` : '这批记忆里没有匹配项'}</strong>
+                <p>试试放宽类型、时间或可见范围。</p>
                 <button type="button" className="mem-text-button" onClick={clearDiscovery}>清除搜索和筛选</button>
               </div>
             ) : (
@@ -1896,6 +2004,9 @@ export interface MemoryContentBodyProps {
   onDismissNotice: () => void;
   source?: MemoryImportSourceFilter | null;
   onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
+  /** 服务端搜索词（`q`）。容器持有它，因为它决定取数。 */
+  search?: string;
+  onSearchChange?: (search: string) => void;
   onLoadMore?: () => void;
   loadingMore?: boolean;
   importPanelOpen?: boolean;
@@ -1927,6 +2038,8 @@ export function MemoryContentBody({
   onDismissNotice,
   source = null,
   onSourceChange = () => {},
+  search = '',
+  onSearchChange = () => {},
   onLoadMore = () => {},
   loadingMore = false,
   importPanelOpen = false,
@@ -1958,7 +2071,8 @@ export function MemoryContentBody({
           onReload={handlers.reloadList}
           source={source}
           onSourceChange={onSourceChange}
-          loadedCount={list.data?.memories.length ?? 0}
+          search={search}
+          onSearchChange={onSearchChange}
           onLoadMore={onLoadMore}
           loadingMore={loadingMore}
           importPanelOpen={importPanelOpen}
@@ -1993,14 +2107,17 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const [limit, setLimit] = useState<number>(50);
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_FILTERS);
   const [source, setSource] = useState<MemoryImportSourceFilter | null>(null);
+  const [search, setSearch] = useState('');
   const [importOpen, setImportOpen] = useState(false);
   const [listBusy, setListBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [forget, dispatchForget] = useReducer(forgetReducer, INITIAL_FORGET);
 
   const include = includeMode(flags);
-  const latestQuery = useRef({ limit, include, source });
-  latestQuery.current = { limit, include, source };
+  /** 真正发给服务端的搜索词：空白串不发（服务端也把空白当普通列表）。 */
+  const query = search.trim();
+  const latestQuery = useRef({ limit, include, source, q: query });
+  latestQuery.current = { limit, include, source, q: query };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
   // 翻页要读"此刻已取回多少条"，但 `loadMore` 不想因此每次列表变化就换身份
@@ -2008,6 +2125,14 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const listRef = useRef(list);
   listRef.current = list;
   const listBusyRef = useRef(false);
+  /*
+    当前这批数据是**哪个查询**取回来的。
+    服务端只回显 `offset`、不回显 `q`（见 read_library），所以不能拿
+    `data.q` 判断"这批还算不算当前查询的"——那样每次搜索都会把列表打回
+    loading。唯一可靠的事实是发起请求时用的那组条件，记在这里。
+  */
+  const listQueryRef = useRef<{ limit: number; include: MemoryInclude | null;
+    source: MemoryImportSourceFilter | null; q: string } | null>(null);
 
   const loadCore = useCallback(async () => {
     const requestId = ++coreRequest.current;
@@ -2023,19 +2148,22 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   }, []);
 
   /**
-   * 取第一页。换了来源就从 `offset=0` 重来——来源变了，"已加载多少条"
-   * 说的已经是另一个集合，接着往后续会拼出两段不相干的列表。
+   * 取第一页。换了来源或搜索词就从 `offset=0` 重来——查询条件变了，
+   * "已加载多少条"说的已经是另一个集合，接着往后续会拼出两段不相干的列表。
    */
   const loadList = useCallback(async () => {
     const requestId = ++listRequest.current;
     const query = latestQuery.current;
     listBusyRef.current = true;
     setListBusy(true);
-    setList((current) => current.data?.limit === query.limit && current.data.include === query.include
-      && (current.data.source ?? null) === query.source ? current : loadingSection<MemoryListResponse>());
+    const loaded = listQueryRef.current;
+    setList((current) => current.data && loaded && loaded.limit === query.limit
+      && loaded.include === query.include && loaded.source === query.source && loaded.q === query.q
+      ? current : loadingSection<MemoryListResponse>());
     try {
       const data = await api.listMemories(query);
       if (requestId !== listRequest.current) return;
+      listQueryRef.current = query;
       setList({ status: 'ok', data, error: null });
     } catch (cause) {
       if (requestId !== listRequest.current) return;
@@ -2050,17 +2178,21 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   }, []);
 
   /**
-   * 按来源翻到下一页：`offset` 用**当前已经取回的条数**，不另外记账。
+   * 翻到下一页：`offset` 用**当前已经取回的条数**，不另外记账。
    *
-   * 另外记一个计数器会让"刷新后接着翻"与"来源一变重来"两件事互相打架：
-   * 计数器忘了归零，就会从旧来源的长度继续取，跳掉一整页。
+   * 另外记一个计数器会让"刷新后接着翻"与"条件一变重来"两件事互相打架：
+   * 计数器忘了归零，就会从旧集合的长度继续取，跳掉一整页。
+   *
+   * 搜索与来源都能翻页（服务端两种都支持 `offset`），所以判据是"这批结果
+   * 是不是当前查询条件下的那一批"，而不只是"有没有来源"。
    */
   const loadMore = useCallback(async () => {
     const query = latestQuery.current;
     const current = listRef.current.data;
-    if (!query.source || !current?.has_more || listBusyRef.current
-      || current.source !== query.source || current.limit !== query.limit
-      || current.include !== query.include) return;
+    const loaded = listQueryRef.current;
+    if ((!query.q && !query.source) || !current?.has_more || listBusyRef.current
+      || !loaded || loaded.source !== query.source || loaded.limit !== query.limit
+      || loaded.include !== query.include || loaded.q !== query.q) return;
     const offset = current.memories.length;
     const requestId = ++listRequest.current;
     listBusyRef.current = true;
@@ -2068,6 +2200,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     try {
       const next = await api.listMemories({ ...query, offset });
       if (requestId !== listRequest.current) return;
+      listQueryRef.current = query;
       setList((state) => state.data ? {
         status: 'ok',
         data: {
@@ -2092,9 +2225,28 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     if (tab === 'core') void loadCore();
   }, [loadCore, tab]);
 
+  /*
+    搜索词走后端，所以要防抖：每敲一个字发一次请求，输入慢的机器上会排起
+    一队迟到的响应，最后落地的可能不是最新的那次。间隔 250ms——短到打字停顿
+    就出结果，长到一次连续输入只发一条。清空搜索**不等**防抖：用户明确要求
+    回到普通列表，立刻发。
+  */
   useEffect(() => {
-    if (tab === 'content') void loadList();
-  }, [loadList, limit, include, source, tab]);
+    if (tab !== 'content') return undefined;
+    if (!query) {
+      void loadList();
+      return undefined;
+    }
+    const timer = setTimeout(() => void loadList(), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [loadList, query, limit, include, source, tab]);
+
+  // 改搜索词时立刻把旧结果从"可继续翻"的状态里摘出来，避免用户在防抖窗口里
+  // 点「加载更早」把上一批的下一页拼进新查询。
+  useEffect(() => {
+    listBusyRef.current = false;
+    setListBusy(false);
+  }, [query]);
 
 
   const handlers: MemoryHandlers = useMemo(
@@ -2219,6 +2371,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       onDismissNotice={() => setNotice(null)}
       source={source}
       onSourceChange={setSource}
+      search={search}
+      onSearchChange={setSearch}
       onLoadMore={() => void loadMore()}
       loadingMore={listBusy}
       importPanelOpen={importOpen}

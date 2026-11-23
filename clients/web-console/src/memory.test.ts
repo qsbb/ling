@@ -207,6 +207,12 @@ function renderList(
       onFiltersChange: props.onFiltersChange ?? (() => undefined),
       handlers: props.handlers ?? HANDLERS,
       onReload: props.onReload ?? (() => undefined),
+      source: props.source ?? null,
+      onSourceChange: props.onSourceChange ?? (() => undefined),
+      search: props.search ?? '',
+      onSearchChange: props.onSearchChange ?? (() => undefined),
+      onLoadMore: props.onLoadMore ?? (() => undefined),
+      loadingMore: props.loadingMore ?? false,
     }),
   );
 }
@@ -320,7 +326,9 @@ describe('记忆页整体渲染', () => {
 
   it('首屏可以搜索本批、没有假分页', () => {
     expect(html).toContain('正在读取记忆列表');
-    expect(html).toContain('搜索已加载的记忆');
+    // 搜索走服务端（`q`），所以文案不再限定「已加载的」——它能找到第一页之外的旧条目。
+    expect(html).toContain('搜索记忆库');
+    expect(html).not.toContain('搜索已加载的记忆');
     expect(html).not.toContain('下一页');
     expect(html).not.toContain('上一页');
     expect(html).not.toContain('page=2');
@@ -521,6 +529,78 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
     expect(html).not.toContain('可能是条目被撤回或归档了');
   });
 
+  it('搜索无结果与「库里本来就空」是两个空态，不能共用一句「没有现行记忆」', () => {
+    const searched = renderList({
+      state: ok(listResponse([], { offset: 0, total: 0 })),
+      search: '纸风车',
+    });
+    expect(searched).toContain('data-testid="mem-search-empty"');
+    expect(searched).toContain('没有匹配「纸风车」的记忆');
+    // 反向：不能把"这一个词没命中"说成"整个记忆库没有记忆"。
+    expect(searched).not.toContain('没有现行记忆');
+    expect(searched).not.toContain('data-testid="mem-list-empty"');
+
+    const empty = renderList({ state: ok(listResponse([])), search: '' });
+    expect(empty).toContain('data-testid="mem-list-empty"');
+    expect(empty).toContain('没有现行记忆');
+    expect(empty).not.toContain('data-testid="mem-search-empty"');
+  });
+
+  it('清理进行中按 extraction.state=purging 说明状态，而不是「没有匹配」', () => {
+    const html = renderList({
+      state: ok(listResponse([], {
+        offset: 0, total: 0,
+        extraction: { state: 'purging', at: '2026-11-09T05:00:00+00:00' },
+      })),
+      search: '散步',
+    });
+    expect(html).toContain('记忆正在清理，清理完成后才能查看');
+    // 标题也必须说"正在清理"，不能反过来告诉用户"没有现行记忆"。
+    expect(html).toContain('<strong>记忆正在清理</strong>');
+    expect(html).not.toContain('没有现行记忆');
+  });
+
+  it('清理中的普通空态也不说「没有现行记忆」', () => {
+    const html = renderList({
+      state: ok(listResponse([], { extraction: { state: 'purging', at: null } })),
+      search: '',
+    });
+    expect(html).toContain('<strong>记忆正在清理</strong>');
+    expect(html).toContain('记忆正在清理。');
+    expect(html).not.toContain('没有现行记忆');
+  });
+
+  it('搜索有命中时，计数同时给出「匹配总数」与「已取回」，不只说已加载', () => {
+    const html = renderList({
+      state: ok(listResponse([MEM_A], { offset: 0, total: 137, has_more: true })),
+      search: '杭州',
+    });
+    expect(html).toContain('匹配 137 条');
+    expect(html).toContain('已取回 1 条');
+    expect(html).toContain('还有 136 条未取回');
+    expect(html).not.toContain('搜索仅限本批');
+  });
+
+  it('有搜索词时就提供真实的翻页入口（服务端接受带 q 的 offset）', () => {
+    const html = renderList({
+      state: ok(listResponse([MEM_A], { offset: 0, total: 137, has_more: true })),
+      search: '杭州',
+    });
+    expect(html).toContain('data-testid="mem-load-more"');
+    expect(html).toContain('加载更早的记忆');
+  });
+
+  it('搜索命中全被本地筛选挡住时，说清命中在哪、别让人以为没搜到', () => {
+    const html = renderList({
+      state: ok(listResponse([MEM_C_ARCHIVED], { offset: 0, total: 3 })),
+      search: '雪',
+      filters: { kind: 'assertion', range: 'all' },
+    });
+    expect(html).toContain('data-testid="mem-filter-empty"');
+    expect(html).toContain('匹配「雪」的 3 条都落在当前筛选之外');
+    expect(html).not.toContain('data-testid="mem-search-empty"');
+  });
+
   it('失败态显示原因、重试与作用范围，不显示空态文案', () => {
     const html = renderList({
       state: {
@@ -567,9 +647,13 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
     const data = listResponse([MEM_A], { total: 260, has_more: true, limit: 200 });
     const html = renderList({ state: ok(data), limit: 200 });
     expect(html).toContain('data-testid="mem-limit-notice"');
-    expect(html).toContain('还有 259 条未加载');
-    expect(html).toContain('接口最多返回 200 条');
+    expect(html).toContain('还有 259 条未取回');
+    expect(html).toContain('接口单次最多返回 200 条');
+    // 没有搜索词时翻页仍不可用（服务端只在有 `q` 或 `source` 时接受 `offset`），
+    // 但入口改成"去搜索"，而不是把这条路彻底堵死。
     expect(html).not.toContain('加载最近 200 条');
+    expect(html).toContain('输入搜索词可以继续往更早的记录里找');
+    expect(html).not.toContain('data-testid="mem-load-more"');
     expect(html).not.toContain('下一页');
   });
 
@@ -582,9 +666,10 @@ describe('记忆列表：空态 / 失败 / 截断', () => {
 
   it('批次没取全且还能扩大时，提供真实的 200 条加载入口', () => {
     const html = renderList({ state: ok(listResponse([MEM_A], { total: 80, has_more: true })) });
-    expect(html).toContain('还有 79 条未加载');
-    expect(html).toContain('搜索仅限本批');
+    expect(html).toContain('还有 79 条未取回');
+    // 有搜索词之后才能继续往后翻；没有搜索词时给的是「先扩大这一批」。
     expect(html).toContain('加载最近 200 条');
+    expect(html).not.toContain('搜索仅限本批');
   });
 
   it('历史筛选按原有两个独立开关展示', () => {
@@ -705,7 +790,7 @@ describe('前端筛选（kind / 时间）', () => {
 
   it('筛选只作用于已取回的数据：界面明说已取回 X 条 / 筛选后 Y 条', () => {
     const html = renderList({ state: ok(listResponse([MEM_A, MEM_C_ARCHIVED])) });
-    expect(html).toContain('搜索已加载的记忆');
+    expect(html).toContain('搜索记忆库');
     expect(html).toContain('已加载 2 条');
   });
 
