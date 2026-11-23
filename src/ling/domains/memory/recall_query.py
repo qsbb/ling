@@ -31,9 +31,24 @@ _EARLIER_CONVERSATION = re.compile(
     r"(?:聊|说|提|谈|讨论|那个)|(?:最早|一开始)(?:我们)?(?:聊|说|谈)"
 )
 
+_WHERE = r"(?:哪(?:里|儿|个地方)?|何处|什么地方)"
+_WORKPLACE = rf"(?:{_WHERE}|哪(?:家|个)(?:公司|单位|机构))"
+_CURRENT_FACT_QUESTION = re.compile(
+    r"(?:你(?:还)?记得)?我(?:现在|目前|当前|如今)?"
+    rf"(?:(?P<lives_in>(?:住在?|定居在?){_WHERE}|在{_WHERE}(?:居住|定居))"
+    rf"|(?P<works_at>在{_WORKPLACE}(?:上班|工作|任职)|任职[在于]?{_WORKPLACE}))"
+    r"(?:吗|呢)?"
+)
+
 
 def _plain(text: str) -> str:
     return normalize("NFKC", text).strip().casefold().rstrip(" \t\r\n.!?。~")
+
+
+def current_fact_slot(text: str) -> str | None:
+    """Recognize standalone questions about the speaker's own current facts."""
+    match = _CURRENT_FACT_QUESTION.fullmatch(_plain(text))
+    return match.lastgroup if match else None
 
 
 def opens_new_topic(text: str) -> bool:
