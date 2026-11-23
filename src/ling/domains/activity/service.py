@@ -174,6 +174,7 @@ class ActivityService:
         completion_evidence: str | None = None,
         checkpoint: dict | None = None,
         evidence_kind: EvidenceKind | str | None = None,
+        now: datetime | None = None,
     ) -> ActivityView:
         """状态迁移。
 
@@ -193,11 +194,12 @@ class ActivityService:
                 "标记 completed 必须提供完成证据（completion_evidence）："
                 "计划不等于完成，不能仅凭自称就标记做完"
             )
+        moment = now or utcnow()
         row.state = to_state
         if to_state == "running" and row.started_at is None:
-            row.started_at = utcnow()
+            row.started_at = moment
         if to_state in {"completed", "failed", "cancelled"}:
-            row.ended_at = utcnow()
+            row.ended_at = moment
         if completion_evidence:
             row.completion_evidence = encode_completion_evidence(
                 self._resolve_evidence_kind(row, evidence_kind),
@@ -205,7 +207,7 @@ class ActivityService:
             )[:1000]
         if checkpoint is not None:
             row.checkpoint = dict(checkpoint)
-        row.updated_at = utcnow()
+        row.updated_at = moment
         await self._session.flush()
         return self._view(row)
 

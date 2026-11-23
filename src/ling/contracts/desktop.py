@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 from pydantic import (
     UUID4,
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -28,6 +29,7 @@ CompanionIssue = Literal[
 ]
 TaskReason = CompanionIssue | Literal[
     "owner_paused", "owner_cancelled", "pairing_changed", "queue_expired",
+    "authorization_expired", "authorization_revoked",
 ]
 
 
@@ -72,6 +74,26 @@ class CreateDesktopTask(DesktopModel):
     text: NoteText
 
 
+class AuthorizeDesktopActivity(CreateDesktopTask):
+    start_at: AwareDatetime
+    end_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def check_time(self) -> AuthorizeDesktopActivity:
+        if self.end_at <= self.start_at:
+            raise ValueError("授权结束时间应晚于开始时间")
+        return self
+
+
+class DesktopActivityGrant(AuthorizeDesktopActivity):
+    decision: Literal["pending", "rest", "queued", "expired", "revoked"] = "pending"
+    task_id: UUID4 | None = None
+
+
+class DesktopActivityStatus(DesktopModel):
+    grant: DesktopActivityGrant | None
+
+
 class DesktopTask(DesktopModel):
     id: UUID4
     kind: Literal["notepad_write"] = "notepad_write"
@@ -82,6 +104,8 @@ class DesktopTask(DesktopModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    source: Literal["manual", "life"] = "manual"
+    source_segment_id: str | None = None
 
 
 class DesktopDevice(DesktopModel):
