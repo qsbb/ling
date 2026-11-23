@@ -3779,6 +3779,7 @@ async def _advance_timeline_boundaries(
     """
     from ling.domains.activity.service import ActivityService
     from ling.domains.agenda.timeline import boundary_view
+    from ling.domains.desktop.service import advance_grant
     from ling.domains.presence.service import (
         SCENE_REFRESH_REASON_SEGMENT,
         SCENE_REFRESH_REASON_SLEEP,
@@ -3788,6 +3789,13 @@ async def _advance_timeline_boundaries(
     activity = ActivityService(session, actor_id=actor_id)
     presence = PresenceService(session, actor_id=actor_id)
     view = await boundary_view(session, actor_id=actor_id, now=now)
+    leaf = view.active_leaf
+    if view.sleep is not None or (leaf is not None and leaf.kind == "rest"):
+        await advance_grant(session, actor_id=actor_id, now=now, rest=True)
+    elif view.commitment is None and leaf is not None and leaf.kind in {"free", "hobby", "writing", "write"}:
+        await advance_grant(
+            session, actor_id=actor_id, now=now, writing_slot=(leaf.segment_id, leaf.end_at),
+        )
     actions: list[str] = []
 
     current = await activity.current()

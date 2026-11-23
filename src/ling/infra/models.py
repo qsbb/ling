@@ -799,6 +799,7 @@ class DesktopDeviceRow(Base):
     paused: Mapped[bool] = mapped_column(Boolean, server_default=sa.true())
     ready: Mapped[bool] = mapped_column(Boolean, server_default=sa.false())
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activity_grant: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
 
 
 class DesktopTaskRow(Base):
@@ -826,6 +827,9 @@ class DesktopTaskRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(16), server_default="manual")
+    source_segment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authorized_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class LiveViewerRow(Base):
