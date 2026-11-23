@@ -2236,3 +2236,53 @@ export interface ImageUpdateSubmissionAck {
   expected_current_commit: string;
   created_at: string;
 }
+
+/* ------------------------------------------------ 夜间回顾（契约 SleepReviewsOut.schema.json） */
+
+/**
+ * 一条原话。服务端读取时**重新验过来源**，所以这里拿到的都是此刻仍然成立的证据。
+ * `truncated` 为真表示原话被服务端截断，界面上必须说清"这不是全文"。
+ */
+export interface SleepReviewSource {
+  speaker: string;
+  text: string;
+  truncated: boolean;
+}
+
+/** 一条可回顾的记忆：`text` 是记忆本身，`original` 是它当时的原话。 */
+export interface SleepReviewItem {
+  memory_id: string;
+  text: string;
+  window_id: string;
+  turn_id: string;
+  original: SleepReviewSource[];
+}
+
+/**
+ * 整理结果（`consolidation_state`）。**与回顾是否可读无关**：
+ * `skipped` 是"这晚没有达到合并条件的记忆"，不是失败。
+ */
+export type ConsolidationState = 'ok' | 'skipped' | 'failed';
+
+/**
+ * 回顾范围（`review_status`）。
+ * - `ready`：有可阅读条目；
+ * - `empty`：整理出了回顾范围，但此刻没有可阅读条目（来源已撤回/纠正/过期/失权）；
+ * - `unavailable`：旧版本记录，或这一次没有生成来源索引。
+ */
+export type SleepReviewStatus = 'ready' | 'empty' | 'unavailable';
+
+export interface SleepReviewNight {
+  sleep_date: string;
+  consolidation_state: ConsolidationState;
+  reason: string;
+  groups_merged: number;
+  rows_archived: number;
+  review_status: SleepReviewStatus;
+  items: SleepReviewItem[];
+}
+
+export interface SleepReviewsResponse {
+  schema_version: string;
+  nights: SleepReviewNight[];
+}

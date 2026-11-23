@@ -891,3 +891,212 @@
   .mem-index__count { gap: 2px 6px; }
   .mem-kinds button { padding-inline: 8px; }
 }
+
+/* --------------------------------------------------------------- 夜间回顾
+ *
+ * 一屏的读法：日期是分组标题 → 整理维度说"她做了什么"（中性）→ 回顾维度
+ * 说"有没有能读的" → 条目本身。`skipped` 不带警示色，它和 `ok` 一样是
+ * 正常结果，只是这一晚没有可合并的东西。
+ */
+
+.sleep {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.sleep__loading {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 13px;
+}
+
+.sleep__error,
+.sleep__empty {
+  gap: 8px;
+}
+
+.sleep__error-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.sleep__error-reason {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.sleep__error-hint {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+}
+
+/* 失败态里"重试"是唯一的可操作项，不给它可见的边界就只剩一行灰字。 */
+.sleep__error .ghost-button {
+  align-self: flex-start;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-soft);
+  padding: 5px 12px;
+}
+
+.sleep__error .ghost-button:hover {
+  border-color: var(--ink-faint);
+  color: var(--ink);
+}
+
+.sleep__empty p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.sleep__empty-hint {
+  color: var(--ink-faint) !important;
+  font-size: 12.5px !important;
+  line-height: 1.7;
+}
+
+/* 一晚 */
+
+.sleep-night {
+  gap: 10px;
+  padding: 16px 18px;
+}
+
+.sleep-night__head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sleep-night__date {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 整理维度：默认中性。只有 failed 才换颜色——skipped 是正常结果。 */
+.sleep-night__state {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.sleep-night__state-label {
+  font-weight: 600;
+}
+
+.sleep-night__state-detail {
+  color: var(--ink-faint);
+}
+
+.sleep-night__state--warn .sleep-night__state-label {
+  color: var(--warn, #9d6a2f);
+}
+
+.sleep-night__reason {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+}
+
+.sleep-night__note {
+  margin: 0;
+  border-left: 2px solid var(--line-strong);
+  padding: 2px 0 2px 10px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+/* 条目 */
+
+.sleep-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.sleep-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sleep-row__text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.sleep-row__summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-faint);
+  width: fit-content;
+}
+
+.sleep-row__summary:hover {
+  color: var(--ink-soft);
+}
+
+.sleep-row__no-original {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.sleep-originals {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0 0 0 10px;
+  border-left: 2px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sleep-original {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.sleep-original__speaker {
+  flex: none;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.sleep-original__text {
+  margin: 0;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.sleep-original__clip {
+  margin-left: 4px;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
