@@ -158,6 +158,95 @@ async def test_library_shows_saved_experience_without_changing_legacy_api(logged
     assert foreign_episode not in {row["memory_id"] for row in merged["memories"]}
 
 
+async def test_library_search_pages_over_facts_and_experiences(logged_in: TestEnv) -> None:
+    subject = logged_in.subject_id
+    old = await _create_memory(logged_in, "ＡＩ 和杭州的旧记忆")
+    other_fact = await _create_memory(logged_in, "杭州 ＡＩ 的另一条")
+    episode = await _seed_episode(subject, "和 ai 一起聊到杭州")
+    newest = await _create_memory(logged_in, "今天买了橘子")
+    await _create_memory(logged_in, "只提到杭州")
+    other_subject = await _other_subject()
+    await _seed_memory_for(other_subject, "ＡＩ和杭州的身份隔离对照")
+    await _seed_episode(other_subject, "杭州 ai 的身份隔离对照")
+    same_time = datetime(2026, 11, 1, tzinfo=UTC)
+    async with session_scope() as session:
+        await session.execute(update(MemoryRow).where(
+            MemoryRow.id.in_([old, other_fact]),
+        ).values(created_at=same_time))
+        await session.execute(update(MemoryEpisode).where(
+            MemoryEpisode.id == episode,
+        ).values(created_at=same_time))
+        await session.execute(update(Subject).where(
+            Subject.id == other_subject,
+        ).values(merged_into=subject))
+
+    first_page = await logged_in.client.get("/v1/memory", params={"view": "library", "limit": 2})
+    assert newest in {row["memory_id"] for row in first_page.json()["memories"]}
+    assert old not in {row["memory_id"] for row in first_page.json()["memories"]}
+    params = {"view": "library", "q": "杭州  ＡＩ", "limit": 1}
+    seen = []
+    for offset in range(4):
+        searched = await logged_in.client.get("/v1/memory", params={**params, "offset": offset})
+        assert searched.status_code == 200, searched.text
+        page = searched.json()
+        assert page["offset"] == offset
+        assert page["total"] == 3 and page["has_more"] is (offset < 2)
+        seen.extend(row["memory_id"] for row in page["memories"])
+    assert seen == sorted([old, other_fact, episode], reverse=True)
+
+
+async def test_library_search_respects_status_source_and_literal_text(logged_in: TestEnv) -> None:
+    matching = await _create_memory(logged_in, "进度100%_甲/乙")
+    archived = await _create_memory(logged_in, "归档进度100%_甲/乙")
+    retracted = await _create_memory(logged_in, "撤回进度100%_甲/乙")
+    await _create_memory(logged_in, "进度100abcx甲/乙")
+    episode = await _seed_episode(logged_in.subject_id, "尝试进度100%_甲/乙")
+    await _archive(archived)
+    async with session_scope() as session:
+        await session.execute(update(MemoryRow).where(
+            MemoryRow.id == retracted,
+        ).values(retracted=True))
+        await session.execute(update(MemoryRow).where(
+            MemoryRow.id == matching,
+        ).values(import_source={"source": "astrbot_memory_companion"}))
+
+    async def ids(**fields: str):
+        params = {"view": "library", "q": "100％＿甲/乙", **fields}
+        response = await logged_in.client.get("/v1/memory", params=params)
+        assert response.status_code == 200, response.text
+        return {row["memory_id"] for row in response.json()["memories"]}
+
+    assert await ids() == {matching, episode}
+    assert await ids(include="archived") == {matching, archived, episode}
+    assert await ids(include="retracted") == {matching, retracted, episode}
+    assert await ids(source="astrbot_memory_companion") == {matching}
+    assert await ids(q="无匹配") == set()
+
+
+async def test_library_search_blocks_reads_while_purging(logged_in: TestEnv) -> None:
+    await _create_memory(logged_in, "关于茶的一条记录")
+    params = {"view": "library", "q": "关于茶"}
+    assert (await logged_in.client.get("/v1/memory", params=params)).json()["total"] == 1
+    assert (await logged_in.client.post("/v1/memory/forget")).status_code == 200
+    page = (await logged_in.client.get("/v1/memory", params=params)).json()
+    assert page["extraction"]["state"] == "purging"
+    assert page["memories"] == [] and page["total"] == 0 and page["has_more"] is False
+
+
+async def test_library_search_empty_query_preserves_list_and_checks_input(logged_in: TestEnv) -> None:
+    await _create_memory(logged_in, "普通记录")
+    base = await logged_in.client.get("/v1/memory", params={"view": "library"})
+    blank = await logged_in.client.get("/v1/memory", params={"view": "library", "q": "　 "})
+    assert base.json() == blank.json()
+    for params in (
+        {"q": "普通"},
+        {"view": "library", "q": "x" * 201},
+        {"view": "library", "q": "\x00"},
+    ):
+        invalid = await logged_in.client.get("/v1/memory", params=params)
+        assert invalid.status_code == 422 and invalid.json()["error"]["field"] == "q"
+
+
 async def test_library_empty_state_uses_actual_extraction_job(logged_in: TestEnv) -> None:
     async def library() -> dict:
         response = await logged_in.client.get("/v1/memory", params={"view": "library"})

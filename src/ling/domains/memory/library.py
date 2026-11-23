@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from unicodedata import normalize
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, literal, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.purge import has_open_purge
@@ -60,13 +61,16 @@ def _episode_record(row: MemoryEpisode) -> dict[str, Any]:
 async def read_library(
     session: AsyncSession, subject_id: str, *,
     limit: int, include: str | None, source: str | None = None, offset: int = 0,
+    query: str = "",
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "memories": [], "limit": limit, "include": include, "total": 0, "has_more": False,
         "extraction": None,
     }
     if source is not None:
-        result.update(source=source, offset=offset)
+        result.update(source=source)
+    if source is not None or query:
+        result.update(offset=offset)
     if await has_open_purge(session, subject_id=subject_id):
         result["extraction"] = {"state": "purging", "at": None}
         return result
@@ -81,21 +85,49 @@ async def read_library(
         memory_query = memory_query.where(MemoryRow.archived_at.is_(None))
         episode_query = episode_query.where(MemoryEpisode.archived_at.is_(None))
 
-    memories = (await session.scalars(memory_query.order_by(
-        MemoryRow.created_at.desc(), MemoryRow.id.desc(),
-    ).offset(offset).limit(limit))).all()
-    page = [
-        {**memory_record(row), "can_edit": True, "record_type": "memory"}
-        for row in memories
-    ]
-    total = await session.scalar(select(func.count()).select_from(memory_query.subquery())) or 0
-    if source is None:
-        episodes = await session.scalars(episode_query.order_by(
-            MemoryEpisode.created_at.desc(), MemoryEpisode.id.desc(),
-        ).limit(limit))
-        page.extend(_episode_record(row) for row in episodes)
-        page.sort(key=lambda r: (r["created_at"] or "", r["memory_id"]), reverse=True)
-        total += await session.scalar(select(func.count()).select_from(episode_query.subquery())) or 0
+    if query:
+        terms = tuple(dict.fromkeys(normalize("NFKC", query).split()))
+        memory_text = func.normalize(MemoryRow.text, literal_column("NFKC"))
+        episode_text = func.normalize(MemoryEpisode.summary, literal_column("NFKC"))
+        memory_query = memory_query.where(
+            *(memory_text.icontains(term, autoescape=True) for term in terms),
+        )
+        episode_query = episode_query.where(
+            *(episode_text.icontains(term, autoescape=True) for term in terms),
+        )
+
+    memory_keys = memory_query.with_only_columns(
+        MemoryRow.id, MemoryRow.created_at, literal("memory").label("record_type"),
+    )
+    episode_keys = episode_query.with_only_columns(
+        MemoryEpisode.id, MemoryEpisode.created_at, literal("experience").label("record_type"),
+    )
+    matches = (
+        memory_keys.union_all(episode_keys) if source is None else memory_keys
+    ).cte("library_matches")
+    page_keys = select(matches).order_by(
+        matches.c.created_at.desc(), matches.c.id.desc(), matches.c.record_type.desc(),
+    ).offset(offset).limit(limit).subquery()
+    counts = select(func.count().label("total")).select_from(matches).subquery()
+
+    # Page and count use one snapshot. Only the selected keys load full records.
+    rows = (await session.execute(
+        select(MemoryRow, MemoryEpisode, counts.c.total)
+        .select_from(counts)
+        .outerjoin(page_keys, true())
+        .outerjoin(MemoryRow, and_(page_keys.c.record_type == "memory", MemoryRow.id == page_keys.c.id))
+        .outerjoin(MemoryEpisode, and_(
+            page_keys.c.record_type == "experience", MemoryEpisode.id == page_keys.c.id,
+        ))
+        .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
+    )).all()
+    total = rows[0][2]
+    page = []
+    for memory, episode, _ in rows:
+        if memory is not None:
+            page.append({**memory_record(memory), "can_edit": True, "record_type": "memory"})
+        elif episode is not None:
+            page.append(_episode_record(episode))
 
     latest = (await session.execute(
         select(OutboxEvent.state, OutboxEvent.attempts, OutboxEvent.created_at, OutboxEvent.processed_at)
@@ -113,6 +145,6 @@ async def read_library(
             "at": _iso(processed_at or created_at),
         }
     return {
-        **result, "memories": page[:limit], "total": total,
+        **result, "memories": page, "total": total,
         "has_more": total > offset + limit, "extraction": extraction,
     }
