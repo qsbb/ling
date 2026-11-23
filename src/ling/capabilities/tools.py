@@ -514,44 +514,12 @@ def _memory_source_tool(
     return handler
 
 
-async def _recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
-    from ling.domains.memory.service import MemoryService, render_evidence
-    from ling.infra.db import session_scope
-    from ling.infra.models import Window
-    from ling.kernel.audience import AudienceSnapshot, visibility_set
-    from ling.settings.service import published_memory_policy
-
-    slot = args.get("slot")
-    if slot != "works_at" and slot != "lives_in":
-        raise ValueError("事实类型应为 works_at 或 lives_in。")
-    empty = "没有查到可用的当前记录。"
-    async with session_scope() as session:
-        window = await session.get(Window, audience.window_id)
-        if window is None or window.archived or window.visibility != audience.window_visibility:
-            return empty
-        if not audience.is_group and window.subject_id != audience.subject_id:
-            return empty
-        current = await AudienceSnapshot.freeze(
-            session, subject_id=audience.subject_id,
-            window_id=window.id, window_visibility=window.visibility,
-        )
-        policy = await published_memory_policy(session)
-        if not current.allows_long_term_memory() or policy.max_injected_memories <= 0:
-            return empty
-        result = await MemoryService(session, policy=policy).recall(
-            subject_id=audience.subject_id, query=slot, fact_slot=slot, limit=1,
-            visibility_allow=visibility_set(audience) & visibility_set(current),
-            trace_window_id=window.id, audience=current,
-        )
-    return render_evidence(result.hits) or empty
-
-
 def build_default_registry(
     *,
     allow_irreversible: bool = False,
     include_recall: bool = True,
     knowledge_audience: AudienceSnapshot | None = None,
-    include_current_facts: bool = False,
+    current_fact_lookup: ToolHandler | None = None,
     memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
@@ -631,7 +599,7 @@ def build_default_registry(
             ),
             partial(_search_knowledge, audience=knowledge_audience),
         )
-        if include_current_facts:
+        if current_fact_lookup is not None:
             registry.register(
                 ToolSpec(
                     tool_id=MEMORY_CURRENT_FACT_TOOL_ID,
@@ -655,7 +623,7 @@ def build_default_registry(
                         "additionalProperties": False,
                     },
                 ),
-                partial(_recall_current_fact, audience=knowledge_audience),
+                current_fact_lookup,
             )
         if memory_sources:
             registry.register(

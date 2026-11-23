@@ -20,6 +20,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from sqlalchemy import delete, select, update
@@ -107,6 +108,7 @@ from ling.kernel.marker_stream import (
     strip_all_markers,
     strip_bracket_tags,
 )
+from ling.kernel.memory_tools import recall_current_fact
 from ling.kernel.stream_log import StreamLog
 from ling.kernel.visibility import is_group_visibility
 from ling.logging_setup import emit_event
@@ -3225,7 +3227,10 @@ class TurnCoordinator:
                     media_callback = self._watch_videos
             registry = build_default_registry(
                 knowledge_audience=audience,
-                include_current_facts=config.memory.max_injected_memories > 0,
+                current_fact_lookup=(
+                    partial(recall_current_fact, audience=audience)
+                    if audience is not None and config.memory.max_injected_memories > 0 else None
+                ),
                 memory_sources=memory_sources,
                 media_window_id=window_id,
                 watch_video=media_callback,
