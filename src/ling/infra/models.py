@@ -788,6 +788,46 @@ class LiveSessionRow(Base):
     runtime: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class DesktopDeviceRow(Base):
+    """One operator-paired Windows companion for an actor."""
+
+    __tablename__ = "desktop_devices"
+
+    actor_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(64))
+    token_hash: Mapped[str | None] = mapped_column(String(64))
+    paused: Mapped[bool] = mapped_column(Boolean, server_default=sa.true())
+    ready: Mapped[bool] = mapped_column(Boolean, server_default=sa.false())
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DesktopTaskRow(Base):
+    """Persist a single attempt plus the steps actually reported by the companion."""
+
+    __tablename__ = "desktop_tasks"
+    __table_args__ = (
+        Index("ix_desktop_tasks_history", "actor_id", "created_at"),
+        Index(
+            "uq_desktop_tasks_active_actor", "actor_id", unique=True,
+            postgresql_where=text("state IN ('queued', 'running')"),
+        ),
+    )
+
+    actor_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("desktop_devices.actor_id"), primary_key=True,
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    text: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(16))
+    step: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(32))
+    lease_hash: Mapped[str | None] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class LiveViewerRow(Base):
     """An explicitly saved, room-scoped public note."""
 

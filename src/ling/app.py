@@ -470,6 +470,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth,
         backup_restore,
         chat,
+        desktop,
         health,
         manage,
         media,
@@ -521,6 +522,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sessions.router, prefix="/v1")
     app.include_router(window_policy_routes.router, prefix="/v1")
     app.include_router(chat.router, prefix="/v1")
+    app.include_router(desktop.router, prefix="/v1")
     from ling.api.routes import live, transcriptions
     app.include_router(live.router, prefix="/v1")
     app.include_router(memory_import.router, prefix="/v1")

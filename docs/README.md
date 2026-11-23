@@ -17,6 +17,7 @@
 | 搭建开发环境、跑测试、提交变更 | [贡献指南](../CONTRIBUTING.md) |
 | 接入 HTTP API、核对数据结构 | [Web API](API-WEB-V1.md) · [v1 契约及示例](../contracts/examples/README.md) |
 | 修改 Web 或移动端 | [Web 控制台](../clients/web-console/README.md) · [Flutter 客户端](../clients/mobile/README.md) |
+| 配对 Windows 电脑、提交并验收记事本任务 | [Windows 桌面任务](WINDOWS-DESKTOP.md) |
 | 理解架构取舍与运行规则 | [架构决策](adr/README.md) · [身份与多用户](IDENTITY-MULTIUSER-DESIGN.md) · [主动性](AUTONOMY-DESIGN.md) · [群聊轮询](GROUP-POLLING-DESIGN.md) |
 | 跑浏览器验收 | [浏览器 E2E](../tests/e2e/README.md) |
 

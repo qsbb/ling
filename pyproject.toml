@@ -84,6 +84,7 @@ stage = ["simpleobsws>=1.4.3,<2", "pyvts>=0.3.3,<0.4", "aiofiles>=24,<27", "file
 [project.scripts]
 ling-api = "ling.__main__:main"
 ling-stage = "connectors.stage.__main__:main"
+ling-desktop = "connectors.desktop.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
