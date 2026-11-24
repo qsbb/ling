@@ -1963,12 +1963,14 @@ def _is_historical(hit: object) -> bool:
 def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
     """Give the character context, with only the distinctions that change its use."""
     groups: dict[str, list] = {
-        "mention": [], "episode": [], "tone": [], "uncertain": [], "history": [],
+        "mention": [], "episode": [], "tone": [], "uncertain": [], "history": [], "shared": [],
     }
     for hit in hits:
         # 历史事实单独成组：它们**现在不成立**，只能用于回答"以前怎样"，
         # 混进 mention 会让角色拿旧住址当现状说。
-        if _is_historical(hit):
+        if getattr(hit, "kind", None) == "shared_arrangement":
+            groups["shared"].append(hit)
+        elif _is_historical(hit):
             groups["history"].append(hit)
         elif getattr(hit, "kind", None) == "episode" and hit.origin != Origin.model_inference:
             groups["episode"].append(hit)
@@ -1983,6 +1985,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
         "tone": "熟悉的线索（可以影响回应方式）",
         "uncertain": "模糊的印象（有需要再确认）",
         "history": "以前的情况（不代表现在）",
+        "shared": "本群共同约定",
     }
     blocks = [
         "聊到相关的事时，先把有把握的大意自然接进对话，细节拿不准就直说。"

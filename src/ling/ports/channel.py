@@ -214,6 +214,21 @@ class RecallRequest:
     is_group: bool = False
 
 
+@dataclass(frozen=True)
+class GroupHistoryAccess:
+    """Original message IDs visible to every recipient of this group reply."""
+
+    window_id: str
+    source_ids: frozenset[str]
+
+
+@runtime_checkable
+class GroupHistoryProvider(Protocol):
+    async def whole_group_history(self, window_ref: str) -> frozenset[str] | None:
+        """Return verified platform message IDs or unknown for this exact group audience."""
+        ...
+
+
 @runtime_checkable
 class ChannelConnector(Protocol):
     connector_id: str

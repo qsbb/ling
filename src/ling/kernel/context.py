@@ -67,6 +67,7 @@ from ling.kernel.prompt_zones import (
 from ling.kernel.prompt_zones import (
     SACRIFICE_ORDER as _SACRIFICE_ORDER,
 )
+from ling.ports.channel import GroupHistoryAccess
 from ling.ports.config import EffectiveConfig, MemoryPolicy
 from ling.ports.model import ChatMessageIn
 
@@ -488,10 +489,12 @@ class ContextCompiler:
         # 只有连接器自己知道。之前没这个参数，`_supports_poke` 从来没人赋值，
         # 于是 `getattr(self, "_supports_poke", True)` 恒为 True。
         channel_capabilities: CapabilityDescriptor | None = None,
+        group_history: GroupHistoryAccess | None = None,
         voice_help: str = "",
     ) -> None:
         self._session = session
         self._channel_capabilities = channel_capabilities
+        self._group_history = group_history
         self._voice_help = voice_help
         self._actor_id = actor_id
         self._persona_id = persona_id
@@ -828,6 +831,8 @@ class ContextCompiler:
             window_id=window_id,
             window_visibility=window_row.visibility,
         )
+        if snapshot.is_group and self._group_history and self._group_history.window_id == window_id:
+            snapshot = replace(snapshot, whole_group_source_ids=self._group_history.source_ids)
         compiled_meta["audience"] = snapshot.describe()
         evidence_index = len(contributions)
 
@@ -1669,6 +1674,22 @@ class ContextCompiler:
                 trace_window_id=window_id,
                 audience=snapshot,
             )
+            if self._memory_policy.shared_events == "enabled" and snapshot.whole_group_source_ids:
+                from ling.domains.memory.shared_events import recall_arrangements
+
+                try:
+                    async with self._session.begin_nested():
+                        shared_hits = await recall_arrangements(
+                            self._session, window_id=window_id, query=user_text,
+                            whole_group_source_ids=snapshot.whole_group_source_ids,
+                            retention_days=self._memory_policy.max_retention_days,
+                            limit=max_injected_memories,
+                            reply_message_id=quoted.message_id if quoted else None,
+                        )
+                    compiled_meta["shared_memory_candidate_ids"] = [hit.memory_id for hit in shared_hits]
+                    recall.hits = [*shared_hits, *recall.hits]
+                except SQLAlchemyError as exc:
+                    logger.info("共享事项检索不可用 error=%s", type(exc).__name__)
         base_evidence_budget = max(_MIN_MEMORY_TOKEN_BUDGET, max_injected_memories * _MEMORY_TOKENS_PER_ITEM)
         evidence_budget = min(DEFAULT_BUDGETS["evidence"], int(base_evidence_budget * min(1.0, _SCALE)))
         original_text = {message.message_id: message.text for message in fetched}

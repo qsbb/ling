@@ -1574,8 +1574,9 @@ def _memory_policy(raw: object) -> MemoryPolicy:
     """从修订 payload 读出记忆策略。缺键 → 默认值（行为与抽取前一致）。"""
     data = raw if isinstance(raw, dict) else {}
     defaults = MemoryPolicy()
+    mode = data.get("shared_events")
     return MemoryPolicy(
-        relative_score_floor=_clamp(
+        shared_events=mode if mode in ("off", "shadow", "enabled") else defaults.shared_events,        relative_score_floor=_clamp(
             "relative_score_floor",
             data.get("relative_score_floor"),
             defaults.relative_score_floor,
@@ -1605,18 +1606,19 @@ def _memory_policy(raw: object) -> MemoryPolicy:
     )
 
 
-def _policy_to_dict(policy: MemoryPolicy) -> dict[str, float | int]:
+def _policy_to_dict(policy: MemoryPolicy) -> dict[str, float | int | str]:
     return {
         "relative_score_floor": policy.relative_score_floor,
         "rerank_top_n": policy.rerank_top_n,
         "recency_half_life_days": policy.recency_half_life_days,
         "max_retention_days": policy.max_retention_days,
         "max_injected_memories": policy.max_injected_memories,
+        **({"shared_events": policy.shared_events} if policy.shared_events != "off" else {}),
     }
 
 
 def _merge_memory(current: object, patch: dict) -> dict:
-    return _merge_fields(current, patch, _MEMORY_BOUNDS)
+    return _merge_fields(current, patch, _MEMORY_BOUNDS, frozenset({"shared_events"}))
 
 
 async def published_memory_policy(session: AsyncSession) -> MemoryPolicy:

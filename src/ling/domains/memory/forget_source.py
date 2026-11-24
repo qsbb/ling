@@ -18,6 +18,8 @@ from ling.infra.models import (
     OutboxEvent,
     PromptSnapshot,
     RelationshipEvent,
+    SharedArrangement,
+    SharedArrangementEvidence,
     Subject,
     Window,
     WindowContext,
@@ -60,7 +62,15 @@ async def forget_source(
     await session.execute(update(Message).where(
         Message.window_id == source.window_id, Message.turn_id == turn_id,
     ).values(memory_hidden_at=utcnow()))
-    event_condition = OutboxEvent.payload["turn_id"].as_string() == turn_id
+    await session.execute(delete(SharedArrangement).where(
+        SharedArrangement.id.in_(select(SharedArrangementEvidence.arrangement_id).where(
+            SharedArrangementEvidence.message_id == source.id,
+        )),
+    ))
+    event_condition = or_(
+        OutboxEvent.payload["turn_id"].as_string() == turn_id,
+        OutboxEvent.payload["message_id"].as_string() == source.id,
+    )
     await session.execute(update(OutboxEvent).where(
         event_condition, OutboxEvent.topic.in_(PURGEABLE_TOPICS),
     ).values(

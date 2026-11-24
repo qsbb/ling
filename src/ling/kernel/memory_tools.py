@@ -35,3 +35,40 @@ async def recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapsho
     if result.strategy == "fact_conflict":
         return "记录中有相互冲突的本人陈述，请询问哪一条现在有效。"
     return render_evidence(result.hits) or empty
+
+
+async def recall_shared_arrangement(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+    """Search only the original messages eligible for this whole group reply."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from ling.domains.memory.shared_events import recall_arrangements
+
+    empty = "未找到本群可用的共同约定。"
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip() or len(query) > 160:
+        raise ValueError("请提供要补查的约定或问题。")
+    if not audience.is_group or not audience.allows_long_term_memory() or not audience.whole_group_source_ids:
+        return empty
+    try:
+        async with session_scope() as session:
+            window = await session.get(Window, audience.window_id)
+            if window is None or window.archived or window.visibility != audience.window_visibility:
+                return empty
+            current = await AudienceSnapshot.freeze(
+                session, subject_id=audience.subject_id,
+                window_id=window.id, window_visibility=window.visibility,
+            )
+            policy = await published_memory_policy(session)
+            if (
+                policy.shared_events != "enabled" or not current.allows_long_term_memory()
+                or policy.max_injected_memories <= 0
+            ):
+                return empty
+            hits = await recall_arrangements(
+                session, window_id=window.id, query=query,
+                whole_group_source_ids=audience.whole_group_source_ids,
+                retention_days=policy.max_retention_days, limit=1,
+            )
+    except SQLAlchemyError:
+        return empty
+    return render_evidence(hits) or empty

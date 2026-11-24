@@ -108,11 +108,12 @@ from ling.kernel.marker_stream import (
     strip_all_markers,
     strip_bracket_tags,
 )
-from ling.kernel.memory_tools import recall_current_fact
+from ling.kernel.memory_tools import recall_current_fact, recall_shared_arrangement
 from ling.kernel.stream_log import StreamLog
 from ling.kernel.visibility import is_group_visibility
 from ling.logging_setup import emit_event
 from ling.models.router import ModelRouter
+from ling.ports.channel import GroupHistoryAccess
 from ling.ports.config import EffectiveConfig
 from ling.ports.model import (
     ChatMessageIn,
@@ -844,6 +845,7 @@ class TurnCoordinator:
         # 上下文用它给"正在回的这条"也标上 `[msg_id:…]`。
         current_message_platform_id: str | None = None,
         reply_reference: ReplyReference | None = None,
+        group_history: GroupHistoryAccess | None = None,
     ) -> asyncio.Queue[TurnStreamEvent | None]:
         queue: asyncio.Queue[TurnStreamEvent | None] = asyncio.Queue()
         token = StopToken()
@@ -864,6 +866,7 @@ class TurnCoordinator:
                 sender_name=sender_name,
                 current_message_platform_id=current_message_platform_id,
                 reply_reference=reply_reference,
+                group_history=group_history,
             ),
             name=f"turn:{turn_id}",
         )
@@ -908,6 +911,7 @@ class TurnCoordinator:
         sender_name: str | None = None,
         current_message_platform_id: str | None = None,
         reply_reference: ReplyReference | None = None,
+        group_history: GroupHistoryAccess | None = None,
     ) -> None:
         delivered = ""
         target_label: str | None = None
@@ -1059,6 +1063,7 @@ class TurnCoordinator:
                     secret_reader=self._secret_reader,
                     # 渠道能力决定提示词能列哪些动作（见 `run_turn` 的说明）。
                     channel_capabilities=channel_capabilities,
+                    group_history=group_history,
                     voice_help=voice_help(config.dialogue.voice_willingness) if prepared else "",
                 ).compile(
                     subject_id=subject_id,
@@ -3231,6 +3236,12 @@ class TurnCoordinator:
                 current_fact_lookup=(
                     partial(recall_current_fact, audience=audience)
                     if audience is not None and config.memory.max_injected_memories > 0 else None
+                ),
+                shared_arrangement_lookup=(
+                    partial(recall_shared_arrangement, audience=audience)
+                    if audience is not None and audience.whole_group_source_ids
+                    and config.memory.shared_events == "enabled" and config.memory.max_injected_memories > 0
+                    else None
                 ),
                 memory_sources=memory_sources,
                 media_window_id=window_id,

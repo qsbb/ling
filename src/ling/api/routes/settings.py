@@ -6,6 +6,7 @@ import hashlib
 import io
 import time
 import wave
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, File, Request, Response, UploadFile
@@ -139,6 +140,7 @@ class MemoryPolicyIn(BaseModel):
     """④ 记忆与学习 的策略。范围校验两处：这里拒掉明显非法的输入，
     读取时再夹一次（库里可能有旧修订或手工改过的值）。"""
 
+    shared_events: Literal["off", "shadow", "enabled"] | None = None
     relative_score_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     rerank_top_n: int | None = Field(default=None, ge=1, le=100)
     recency_half_life_days: float | None = Field(default=None, gt=0, le=3650)
@@ -428,6 +430,10 @@ async def get_config(auth: CurrentAuth, config: ConfigDep) -> dict:
             "recency_half_life_days": effective.memory.recency_half_life_days,
             "max_retention_days": effective.memory.max_retention_days,
             "max_injected_memories": effective.memory.max_injected_memories,
+            **(
+                {"shared_events": effective.memory.shared_events}
+                if effective.memory.shared_events != "off" else {}
+            ),
         },
         "life": {
             "scene_ttl_minutes": effective.life.scene_ttl_minutes,
