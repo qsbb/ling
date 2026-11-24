@@ -1165,6 +1165,18 @@ class OutboxEvent(Base):
     )
 
 
+class MemorySourceForgetMarker(Base):
+    """Content-free record that survives clearing the original transcript."""
+
+    __tablename__ = "memory_source_forget_markers"
+
+    message_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(String(64))
+    window_id: Mapped[str] = mapped_column(String(64))
+    turn_id: Mapped[str] = mapped_column(String(64))
+    forgotten_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class MemoryPurgeTombstone(Base):
     """一次记忆真删请求的墓碑。**不含任何正文**。
 

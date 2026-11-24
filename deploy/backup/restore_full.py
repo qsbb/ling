@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -308,7 +309,76 @@ def wait_for(check, message: str, *, seconds: int = 90) -> None:
     raise BackupError(message)
 
 
-def prepare_database(stage: Path, image: str, volume: str, postgres: dict[str, str], name: str) -> None:
+def collect_memory_privacy(stack: Stack) -> dict[str, Any]:
+    """Read content-free source markers after the original writers have stopped."""
+    def query(sql: str) -> str:
+        return stack.run(
+            "exec", "-T", "db", "psql", "-U", "ling", "-d", "ling", "-At",
+            "-v", "ON_ERROR_STOP=1", "-c", sql,
+        ).strip()
+
+    available = query("""
+        SELECT to_regclass('memory_source_forget_markers') IS NOT NULL,
+               EXISTS(SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'messages'
+                        AND column_name = 'memory_hidden_at'),
+               EXISTS(SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'subjects'
+                        AND column_name = 'forget_generation')
+    """)
+    has_markers, has_message_flags, has_generations = available.split("|")
+    sources = []
+    if has_markers == "t":
+        sources = json.loads(query("""
+            SELECT COALESCE(json_agg(marker), '[]') FROM memory_source_forget_markers AS marker
+        """))
+    elif has_message_flags == "t":
+        sources = json.loads(query("""
+            SELECT COALESCE(json_agg(json_build_object(
+                'message_id', id, 'subject_id', sender_subject_id, 'window_id', window_id,
+                'turn_id', turn_id, 'forgotten_at', memory_hidden_at
+            )), '[]') FROM messages
+            WHERE role = 'user' AND sender_subject_id IS NOT NULL AND turn_id IS NOT NULL
+              AND memory_hidden_at IS NOT NULL
+        """))
+    generations = {}
+    if has_generations == "t":
+        generations = json.loads(query("""
+            SELECT COALESCE(json_object_agg(id, forget_generation), '{}')
+            FROM subjects WHERE forget_generation > 0
+        """))
+    return {"sources": sources, "generations": generations}
+
+
+def replay_memory_privacy(
+    container: str, stage: Path, image: str, postgres: dict[str, str], state: dict[str, Any],
+) -> None:
+    if not any(state.values()):
+        return
+    compatible = docker(
+        "exec", container, "psql", "-U", "ling", "-d", "ling", "-At",
+        "-v", "ON_ERROR_STOP=1", "-c", "SELECT to_regclass('memory_source_forget_markers') IS NOT NULL",
+    ).strip()
+    if compatible != "t":
+        raise BackupError("备份版本无法重放现有遗忘记录，恢复已停止")
+    from urllib.parse import quote
+
+    request = stage / "memory-privacy.json"
+    write_private(request, json.dumps(state).encode("utf-8"))
+    password = quote(postgres["POSTGRES_PASSWORD"], safe="")
+    docker(
+        "run", "--rm", "-i", "--pull", "never", "--network", f"container:{container}",
+        "-e", "LING_DATABASE_URL", "--entrypoint", "python", image,
+        "-m", "ling.domains.memory.restore_privacy",
+        source=request, values={"LING_DATABASE_URL": f"postgresql+asyncpg://ling:{password}@127.0.0.1/ling"},
+        timeout=180,
+    )
+
+
+def prepare_database(
+    stage: Path, image: str, volume: str, postgres: dict[str, str], name: str, *,
+    before_stop: Callable[[str], None] | None = None,
+) -> None:
     docker(
         "run", "-d", "--name", name, "--pull", "never", "--network", "none",
         "--mount", f"type=volume,src={volume},dst={DB_PATH}",
@@ -326,6 +396,8 @@ def prepare_database(stage: Path, image: str, volume: str, postgres: dict[str, s
             "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error",
             source=stage / "database.dump",
         )
+        if before_stop is not None:
+            before_stop(name)
     finally:
         try:
             docker("stop", "-t", "60", name, timeout=70)
@@ -455,13 +527,30 @@ def restore_snapshot(stack: Stack, snapshot: Path) -> dict[str, Any]:
             write_private(restore_root / "previous.env", before)
         created = []
         switched = False
+
+        def preserve_privacy(container: str) -> None:
+            nonlocal switched
+            if fresh:
+                return
+            if "db" not in original:
+                raise BackupError("无法读取当前数据库的遗忘记录")
+            switched = True
+            writers = [service for service in ("worker", "api") if service in original]
+            if writers:
+                stack.run("stop", *writers, timeout=120)
+            privacy = collect_memory_privacy(stack)
+            replay_image = original.get("api", {}).get("Image", tags["api"])
+            replay_memory_privacy(container, stage, replay_image, postgres, privacy)
+
         try:
             for key, volume in volumes.items():
                 docker("volume", "create", "--label", f"com.docker.compose.project={project}",
                        "--label", f"com.docker.compose.volume={key}", volume)
                 created.append(volume)
-            prepare_database(stage, tags["db"], volumes["db-data"], postgres,
-                             f"{project}-restore-{preparation_id}")
+            prepare_database(
+                stage, tags["db"], volumes["db-data"], postgres,
+                f"{project}-restore-{preparation_id}", before_stop=preserve_privacy,
+            )
             docker("run", "--rm", "-i", "--pull", "never", "--network", "none",
                    "--mount", f"type=volume,src={volumes['app-data']},dst=/data",
                    "--entrypoint", "python", tags["api"], "-c", UNPACK, source=stage / "data.tar")
