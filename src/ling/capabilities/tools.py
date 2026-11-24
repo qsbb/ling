@@ -520,6 +520,7 @@ def build_default_registry(
     include_recall: bool = True,
     knowledge_audience: AudienceSnapshot | None = None,
     current_fact_lookup: ToolHandler | None = None,
+    shared_arrangement_lookup: ToolHandler | None = None,
     memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
@@ -624,6 +625,25 @@ def build_default_registry(
                     },
                 ),
                 current_fact_lookup,
+            )
+        if shared_arrangement_lookup is not None:
+            registry.register(
+                ToolSpec(
+                    tool_id="memory.shared_arrangement",
+                    version="1.0.0",
+                    description="补查本群有来源的共同约定，可问原始安排、现在的安排或是否完成。",
+                    risk=ToolRisk.read_only,
+                    requires_confirmation=False,
+                    reversible=True,
+                    model_callable=True,
+                    input_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 160}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                ),
+                shared_arrangement_lookup,
             )
         if memory_sources:
             registry.register(

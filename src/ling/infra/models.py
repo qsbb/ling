@@ -1745,6 +1745,40 @@ class MemoryEpisode(Base, TimestampMixin):
     )
 
 
+class SharedArrangement(Base):
+    __tablename__ = "shared_arrangements"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_id: Mapped[str] = mapped_column(ForeignKey("windows.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SharedArrangementEvidence(Base):
+    __tablename__ = "shared_arrangement_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "(action IN ('proposed', 'rescheduled') AND scheduled_time IS NOT NULL AND place IS NOT NULL)"
+            " OR (action IN ('confirmed', 'cancelled', 'completed') AND scheduled_time IS NULL AND place IS NULL)",
+            name="ck_shared_arrangement_contribution",
+        ),
+    )
+
+    message_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    arrangement_id: Mapped[str] = mapped_column(
+        ForeignKey("shared_arrangements.id", ondelete="CASCADE"), index=True,
+    )
+    previous_id: Mapped[str | None] = mapped_column(String(64))
+    subject_id: Mapped[str] = mapped_column(String(64), index=True)
+    connector_instance: Mapped[str] = mapped_column(String(64))
+    account_ref: Mapped[str] = mapped_column(String(128))
+    turn_id: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))
+    scheduled_time: Mapped[str | None] = mapped_column(String(32))
+    place: Mapped[str | None] = mapped_column(String(48))
+    sequence: Mapped[int] = mapped_column(Integer)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SelfExperienceRow(Base, TimestampMixin):
     """角色**自己**的经历（"今天做了什么"）。
 

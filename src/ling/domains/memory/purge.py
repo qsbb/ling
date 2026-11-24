@@ -128,6 +128,8 @@ from ling.infra.models import (
     OutboxEvent,
     PromptSnapshot,
     RelationshipEvent,
+    SharedArrangement,
+    SharedArrangementEvidence,
     Subject,
     Window,
     utcnow,
@@ -140,7 +142,7 @@ logger = logging.getLogger("ling.domains.memory.purge")
 #: 只列"会写入用户记忆"的那几个：把别人的 topic（日程、梦、投递）也一并
 #: 取消等于"忘了我"顺手停掉了她的生活——那不是用户要的。
 PURGEABLE_TOPICS: frozenset[str] = frozenset(
-    {"memory.extract", "memory.archive", "relationship.update"}
+    {"memory.extract", "memory.archive", "memory.shared_arrangement", "relationship.update"}
 )
 
 #: 墓碑状态机。`pending → running → done | failed`，终态不可再转移。
@@ -385,6 +387,12 @@ async def purge_subject(
             delete(MemoryEpisode).where(MemoryEpisode.subject_id == subject_id)
         )
         result.episodes_deleted = int(getattr(episodes, "rowcount", 0) or 0)
+
+        await session.execute(delete(SharedArrangement).where(
+            SharedArrangement.id.in_(select(SharedArrangementEvidence.arrangement_id).where(
+                SharedArrangementEvidence.subject_id == subject_id,
+            )),
+        ))
 
         # 3) 核心记忆（`core_memories`：称呼/边界/禁忌正文）与意识条目
         #    （`awareness_items`：跨会话事实投影，第三人称转述）。两者都是

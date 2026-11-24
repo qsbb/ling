@@ -35,11 +35,13 @@ from ling.contracts.v1 import InteractionEnvelope
 from ling.domains.conversation.service import (
     PLATFORM_MESSAGE_ID_SCOPE,
     ConversationService,
+    MessageView,
     ReplyReference,
 )
 from ling.domains.identity.service import IdentityService
 from ling.domains.media.service import MediaEvidenceError, MediaEvidenceService
-from ling.infra.models import Message, Turn, Window
+from ling.infra.models import IdempotencyKey, Message, Turn, Window
+from ling.infra.security import new_id
 from ling.kernel.autonomy import (
     AutonomyTurnService,
     _looks_urgent,
@@ -51,6 +53,7 @@ from ling.kernel.decision import DecisionContext, classify_text
 from ling.kernel.turn import describe_turn_failure
 from ling.kernel.visibility import is_group_window_ref
 from ling.logging_setup import emit_event
+from ling.ports.channel import GroupHistoryAccess, GroupHistoryProvider
 
 if TYPE_CHECKING:
     from ling.config import Settings
@@ -560,6 +563,11 @@ class InboundBridge:
                 window.id, envelope.reply_to
             )
             reply_reference = ReplyReference(envelope.reply_to, quoted)
+        quoted_id = (
+            reply_reference.message.message_id
+            if reply_reference and reply_reference.message and reply_reference.message.role == "user"
+            else None
+        )
         replied_to_actor = bool(
             reply_reference and reply_reference.message and reply_reference.message.role == "actor"
         )
@@ -750,6 +758,7 @@ class InboundBridge:
             )
             # 同上：这条也可能被撤回。映射不属于"回复"，属于"消息存在过"。
             await self._remember_platform_message_id(observed_row.message_id, envelope)
+            await self._enqueue_shared_arrangement(observed_row, envelope, subject_id, text, quoted_id)
             await self._session.commit()
             # ``reason`` 只写**理由**，不写动作。
             #
@@ -797,6 +806,7 @@ class InboundBridge:
                 attention_state="seen",
             )
             await self._remember_platform_message_id(msg.message_id, envelope)
+            await self._enqueue_shared_arrangement(msg, envelope, subject_id, text, quoted_id)
             await self._record_followup(
                 decision, subject_id=subject_id, window_id=window.id, message_id=msg.message_id
             )
@@ -902,6 +912,7 @@ class InboundBridge:
         # 而 `messages` 表只有本地 id。映射写进 `idempotency_keys`
         # （scope=platform_msgid，key=本地消息 id）——不新增表、不改迁移。
         await self._remember_platform_message_id(user_row.message_id, envelope)
+        await self._enqueue_shared_arrangement(user_row, envelope, subject_id, text, quoted_id)
         await self._record_followup(
             decision,
             subject_id=subject_id,
@@ -935,6 +946,7 @@ class InboundBridge:
             sender_name=envelope.sender_name,
             current_message_platform_id=self._platform_message_id(envelope),
             reply_reference=reply_reference,
+            group_history=await self._group_history_access(window, envelope.window_ref),
         )
         reply_text = turn_result.text
         if turn_result.deferred and not turn_result.timed_out:
@@ -1137,6 +1149,69 @@ class InboundBridge:
                 if found:
                     return str(found)
         return _event_message_id_hint(envelope.external_event_id)
+
+    async def _group_history_access(self, window: Window, window_ref: str) -> GroupHistoryAccess | None:
+        if (
+            window.visibility != "group_scope"
+            or self._runtime_snapshot is None
+            or self._runtime_snapshot.config.memory.shared_events != "enabled"
+            or not isinstance(self._connector, GroupHistoryProvider)
+        ):
+            return None
+        try:
+            async with asyncio.timeout(0.5):
+                platform_ids = await self._connector.whole_group_history(window_ref)
+            if not platform_ids or len(platform_ids) > 2000:
+                return None
+            async with self._session.begin_nested():
+                source_ids = await self._session.scalars(
+                    select(Message.id).join(IdempotencyKey, IdempotencyKey.key == Message.id).where(
+                        Message.window_id == window.id, IdempotencyKey.scope == PLATFORM_MESSAGE_ID_SCOPE,
+                        IdempotencyKey.result_ref.in_(platform_ids),
+                    )
+                )
+                return GroupHistoryAccess(window.id, frozenset(source_ids))
+        except Exception as exc:  # noqa: BLE001 - unavailable proof suppresses shared recall
+            logger.info("群历史可见性核验未完成 error=%s", type(exc).__name__)
+            return None
+
+
+    async def _enqueue_shared_arrangement(
+        self, message: MessageView, envelope: InteractionEnvelope, subject_id: str,
+        text: str, quoted_id: str | None,
+    ) -> None:
+        if (
+            self._runtime_snapshot is None
+            or self._runtime_snapshot.config.memory.shared_events == "off"
+            or not is_group_window_ref(envelope.window_ref)
+            or not envelope.account_ref
+            or (envelope.reply_to and not quoted_id)
+        ):
+            return
+
+        from dataclasses import asdict
+
+        from ling.domains.memory.purge import current_generation
+        from ling.domains.memory.shared_events import read_contribution
+        from ling.infra.models import OutboxEvent
+
+        contribution = read_contribution(text, linked=quoted_id is not None)
+        if contribution is None:
+            return
+        self._session.add(OutboxEvent(
+            id=new_id("obx"), topic="memory.shared_arrangement", subject_id=subject_id,
+            forget_generation=await current_generation(self._session, subject_id),
+            payload={
+                "subject_id": subject_id,
+                "message_id": message.message_id,
+                "turn_id": message.turn_id,
+                "previous_id": quoted_id,
+                "connector_instance": envelope.connector_instance,
+                "account_ref": envelope.account_ref,
+                "contribution": asdict(contribution),
+            },
+        ))
+
 
     async def _remember_platform_message_id(
         self, message_id: str, envelope: InteractionEnvelope
@@ -1869,6 +1944,7 @@ class InboundBridge:
         # 不能从库里读——库里那一列是旁路同步的结果，可能还没写进去。
         sender_name: str | None = None,
         reply_reference: ReplyReference | None = None,
+        group_history: GroupHistoryAccess | None = None,
     ) -> TurnResult:
         """跑一轮，返回 ``TurnResult``（正文/状态/表达方式/失败原因/为什么没交付）。
 
@@ -1901,6 +1977,7 @@ class InboundBridge:
             sender_name=sender_name,
             current_message_platform_id=current_message_platform_id,
             reply_reference=reply_reference,
+            **({"group_history": group_history} if group_history is not None else {}),
         )
         reply_text = ""
         partial_text = ""

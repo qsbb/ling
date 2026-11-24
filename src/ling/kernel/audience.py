@@ -47,6 +47,7 @@ class AudienceSnapshot:
     revision: int
     cross_device_granted: bool
     frozen_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    whole_group_source_ids: frozenset[str] = frozenset()
 
     @property
     def is_group(self) -> bool:

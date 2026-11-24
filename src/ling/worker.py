@@ -448,6 +448,24 @@ async def wait_for_schema(*, attempts: int = 60, interval: float = 2.0) -> bool:
     return False
 
 
+@handler("memory.shared_arrangement")
+async def handle_shared_arrangement(payload: dict) -> None:
+    from ling.domains.memory.shared_events import Contribution, record_contribution
+    from ling.settings.service import published_memory_policy
+
+    if payload.get("purged"):
+        return
+    async with session_scope() as session:
+        if (await published_memory_policy(session)).shared_events == "off":
+            return
+        await record_contribution(
+            session,
+            message_id=payload["message_id"], previous_id=payload.get("previous_id"),
+            subject_id=payload["subject_id"], connector_instance=payload["connector_instance"],
+            account_ref=payload["account_ref"], contribution=Contribution(**payload["contribution"]),
+        )
+
+
 @handler("memory.extract")
 async def handle_memory_extract(payload: dict) -> None:
     """从一轮已完成对话中提取记忆（设计文档 §8.1 memory.extract 职责）。

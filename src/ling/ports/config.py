@@ -126,6 +126,7 @@ class MemoryPolicy:
     max_retention_days: int = 3650
     # 每轮自动带入的旧记忆上限。0 关闭自动召回。
     max_injected_memories: int = 3
+    shared_events: Literal["off", "shadow", "enabled"] = "off"
 
 
 @dataclass(frozen=True)
