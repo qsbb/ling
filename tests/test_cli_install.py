@@ -2866,23 +2866,10 @@ def psql_calls(ws: Workspace) -> list[str]:
     return [line for line in ws.calls() if " exec -T db psql " in line]
 
 
-# 重试窗口的长度**不**决定被测语义，只需要"有限"。但"窗口里到底能试几次"若
-# 由**真实**耗时决定，就会随机器负载漂移——那正是这批用例 flaky 的来源，所以
-# 重试节奏必须可控。
-#
-# 做法（只动测试）：`db_query_with_retry` 里唯一的等待点是
-# ``time.sleep(min(DB_READY_POLL_INTERVAL, ...))``，把它 patch 成 no-op。但
-# ``ling.py`` 是 ``run_install`` 用 ``sys.executable`` 起的**独立子进程**，进程内
-# ``monkeypatch`` 够不到它；因此用一个一次性的 ``sitecustomize`` 经 ``PYTHONPATH``
-# **只注入给这一次子进程**。补丁按 ``co_filename`` + 函数名严格限定在
-# ``db_query_with_retry`` 内（别的函数、别的模块——包括 docker stub——行为不变）。
-#
-# 只把 sleep 变 no-op 还不够：循环的终止条件是 ``deadline - time.monotonic()``，
-# 不睡就会**空转**到真实窗口结束（既慢又不确定）。所以循环内的 ``monotonic``
-# 一并换成"进入循环时的真实时刻 + 已睡掉的虚拟时长"：逻辑节奏与生产完全一致
-# （仍是 min(2s, 剩余)），只是等待不花真实时间。重试**次数/顺序/结论**全部由
-# 真实代码决定，被替换的只有"秒"这个单位。
-_DB_CLOCK_SITECUSTOMIZE = r'''"""仅测试用：db 重试循环的 sleep 不真睡（虚拟时钟）。"""
+# 安装器在独立子进程里运行。用临时 sitecustomize 让 start_db 的截止时间和
+# db_query_with_retry 的重试共用从 0 开始的虚拟时钟。只有重试等待推进时钟，
+# 安装器仍按原有逻辑计算剩余时间和尝试次数。
+_DB_CLOCK_SITECUSTOMIZE = r'''"""为安装器的数据库探测提供测试时钟。"""
 import os
 import sys
 import time
@@ -2890,34 +2877,27 @@ import time
 _target = os.environ["LING_TEST_DB_CLOCK_TARGET"]
 _real_monotonic = time.monotonic
 _real_sleep = time.sleep
-_base: list[float] = []          # 进入循环时的真实时刻（首次问时间时锁定）
-_elapsed = [0.0]                 # 循环内已"睡掉"的虚拟时长
+_elapsed = [0.0]
 
 
-def _in_db_retry() -> bool:
-    """只看**紧邻的调用方**：必须是 ling.py 里的 ``db_query_with_retry``。
-
-    按 ``co_filename`` 精确匹配：docker stub（同一个解释器、同样的
-    PYTHONPATH）以及 ling.py 的其它函数都不受影响。
-    """
+def _in_db_clock() -> bool:
+    """按文件与函数匹配设置截止时间和执行重试的调用点。"""
     try:
         frame = sys._getframe(2)
     except ValueError:
         return False
     code = frame.f_code
-    return code.co_name == "db_query_with_retry" and code.co_filename == _target
+    return code.co_filename == _target and code.co_name in ("start_db", "db_query_with_retry")
 
 
 def _monotonic() -> float:
-    if not _in_db_retry():
-        return _real_monotonic()
-    if not _base:
-        _base.append(_real_monotonic())
-    return _base[0] + _elapsed[0]
+    if _in_db_clock():
+        return _elapsed[0]
+    return _real_monotonic()
 
 
 def _sleep(seconds: float) -> None:
-    if _in_db_retry():
+    if _in_db_clock():
         _elapsed[0] += max(0.0, float(seconds))
         return None
     return _real_sleep(seconds)
@@ -2930,7 +2910,7 @@ time.sleep = _sleep
 # sitecustomize 放**源码树之外**（临时目录）：测试不在仓库里留生成物。
 _DB_CLOCK_DIR: list[Path] = []
 
-# 供 sitecustomize 精确匹配"哪一个文件里的 db_query_with_retry"。
+# 供 sitecustomize 精确匹配安装器的源码文件。
 LING_PY_STR = str(LING_PY.resolve())
 
 
