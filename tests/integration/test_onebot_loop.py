@@ -470,7 +470,9 @@ async def test_group_mention_keeps_rendered_name_when_member_lookup_has_no_name(
                 **event, message="@x你好", raw_message="[CQ:at,qq=10001]你好",
             ))
         assert reply.json()["delivered"] is True, reply.text
-        assert any("说：「@x你好」" in record.getMessage() for record in caplog.records)
+        inbound = [record for record in caplog.records if getattr(record, "event_name", "") == "inbound_received"]
+        assert any("发来文字消息" in record.getMessage() for record in inbound)
+        assert all("@x你好" not in record.getMessage() for record in inbound)
         plain = await _post(logged_in, _event_body(
             **event, message_id=778, message="@x你好", raw_message="@x你好",
         ))
