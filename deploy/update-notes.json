@@ -124,6 +124,16 @@
         "直播进入左侧独立导航，设置中可管理外部插件，Windows 伴生端支持记事本试跑与限时授权"
       ],
       "url": "https://github.com/qsbb/ling/releases/tag/v0.0.16"
+    },
+    "0.0.17": {
+      "summary": "直接导入 AstrBot 原生记忆，改进会话排序与直播间设置",
+      "items": [
+        "选择 Memory Companion 导出的 JSONL，按已绑定的 QQ 自动匹配私聊记忆来源",
+        "会话按最近收到的消息更新排序，退群或好友删除时置灰并保留历史入口",
+        "可在直播工作台直接改连接参数，保存后出现在接入器的平台列表中",
+        "精简角色页与接入器实例详情，恢复备份时提前识别截断的镜像归档"
+      ],
+      "url": "https://github.com/qsbb/ling/releases/tag/v0.0.17"
     }
   }
 }
