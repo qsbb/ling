@@ -364,6 +364,9 @@ async def purge_subject(
                 )
             ).scalars()
         )
+        memory_ids.extend(await session.scalars(
+            select(MemoryEpisode.id).where(MemoryEpisode.subject_id == subject_id)
+        ))
         if memory_ids:
             embeddings = await session.execute(
                 delete(MemoryEmbeddingRow).where(

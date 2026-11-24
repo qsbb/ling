@@ -23,6 +23,7 @@ async def recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapsho
         current = await AudienceSnapshot.freeze(
             session, subject_id=audience.subject_id,
             window_id=window.id, window_visibility=window.visibility,
+            whole_group_source_ids=audience.whole_group_source_ids,
         )
         policy = await published_memory_policy(session)
         if not current.allows_long_term_memory() or policy.max_injected_memories <= 0:
