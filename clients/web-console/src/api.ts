@@ -1467,6 +1467,10 @@ export const api = {
     });
   },
 
+  forgetMemorySource(memoryId: string): Promise<{ memory_id: string; forgotten: boolean }> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/forget`, { method: 'POST' });
+  },
+
   /** 撤回一条记忆：必填理由；重复撤回幂等。 */
   retractMemory(memoryId: string, reason: string): Promise<{ memory_id: string; retracted: boolean }> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/retract`, jsonInit('POST', { reason }));

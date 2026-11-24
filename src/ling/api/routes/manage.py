@@ -292,6 +292,20 @@ async def supersede_memory(
     return {"memory_id": new_id_value, "supersedes": memory_id}
 
 
+@router.post("/memory/{memory_id}/forget")
+async def forget_memory_source(
+    memory_id: str, auth: CurrentAuth, session: DbSession,
+) -> dict:
+    from ling.domains.memory.forget_source import forget_source
+
+    if not await forget_source(session, subject_id=auth.user.subject_id, memory_id=memory_id):
+        raise LingError(ErrorCode.not_found, "没有找到可遗忘的原始发言", status_code=404)
+    audit_event(
+        "memory_source_forgotten", actor=auth.user.id, target_type="memory", target_id=memory_id,
+    )
+    return {"memory_id": memory_id, "forgotten": True}
+
+
 @router.post("/memory/forget")
 async def forget_all(auth: CurrentAuth, session: DbSession) -> dict:
     """**真删**这个账号的记忆：请求阶段（同步）+ 清理阶段（后台）。

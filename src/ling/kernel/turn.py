@@ -2940,6 +2940,7 @@ class TurnCoordinator:
                 window_id=window_id,
                 window_visibility=window_row.visibility,
                 user_text=user_text,
+                turn_id=turn_id,
             )
         except Exception:  # noqa: BLE001 - 派生失败不影响已完成的回复
             pass

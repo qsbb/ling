@@ -530,7 +530,7 @@ async def handle_memory_extract(payload: dict) -> None:
             sources = list(await session.scalars(select(Message).where(
                 Message.turn_id == turn_id, Message.window_id == window_id, Message.role == "user",
                 sender_match, Message.text == user_text,
-                Message.retracted_at.is_(None),
+                Message.retracted_at.is_(None), Message.memory_hidden_at.is_(None),
             ).limit(2)))
             if len(sources) != 1:
                 logger.info("memory.extract 需要唯一有效的原始用户消息 turn=%s", turn_id)
@@ -561,7 +561,7 @@ async def handle_memory_extract(payload: dict) -> None:
         await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
         if source is not None:
             source = await session.get(Message, source.id, populate_existing=True, with_for_update=True)
-            if source is None or source.retracted_at is not None:
+            if source is None or source.retracted_at is not None or source.memory_hidden_at is not None:
                 return
         if not await claim_still_valid(session):
             logger.info(
@@ -569,21 +569,14 @@ async def handle_memory_extract(payload: dict) -> None:
             )
             return
 
-        # 情节记忆：这一轮发生了什么（长期可检索，承接"上次那个事"）
-        summary_parts = []
+        # The long-term index keeps the user's account of the conversation.
+        # Ling's previous reply remains available from the retained transcript on
+        # explicit source lookup, where it is labeled as her own speech.
         if user_text.strip():
-            summary_parts.append(f"用户：{user_text.strip()[:500]}")
-        if actor_text.strip():
-            summary_parts.append(f"ling：{actor_text.strip()[:500]}")
-        if summary_parts:
-            # Episode 的 origin 必须如实反映"这是一轮对话的记录"，
-            # 不能标成 user_statement —— 它同时包含**角色自己说的话**，
-            # 而角色的话未经证实。标成用户陈述会让"角色编的内容"随
-            # "用户亲口说过的经历"一起进入可直接表述的证据组。
             await service.record_episode(
                 subject_id=subject_id,
                 window_id=window_id,
-                summary="\n".join(summary_parts),
+                summary=f"用户：{user_text.strip()[:500]}",
                 source_event_ids=source_ids,
                 source_message_id=source.id if source else None,
                 occurred_at=source.created_at if source else None,
@@ -677,6 +670,19 @@ async def handle_relationship_update(payload: dict) -> None:
 
     kind = _classify(user_text)
     async with session_scope() as session:
+        from sqlalchemy import select
+
+        from ling.domains.memory.purge import claim_still_valid
+        from ling.infra.models import Message, Subject
+
+        await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+        if not await claim_still_valid(session) or await session.scalar(
+            select(Message.id).where(
+                Message.turn_id == turn_id, Message.role == "user",
+                Message.memory_hidden_at.is_not(None),
+            ).limit(1)
+        ):
+            return
         if kind is not None:
             await RelationshipService(session).record_event(
                 subject_id=subject_id,

@@ -267,3 +267,61 @@ async def test_linked_fact_keeps_two_periods_and_retry_keeps_newer_state(
             visibility_allow={Visibility.subject_private},
         )
         assert result.hits == []
+
+
+async def test_forget_source_removes_old_prompt_material_and_allows_new_evidence(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling import worker
+    from ling.domains.conversation.service import ConversationService
+    from ling.kernel.context import ContextCompiler
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", None)
+    client = logged_in.client
+    window = (await client.post("/v1/sessions", json={"title": "定向遗忘"})).json()["session_id"]
+    address = "青竹小巷"
+    interest = "银河积木"
+
+    async def learn(utterance: str) -> dict:
+        await _send(client, window, utterance)
+        async with session_scope() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.topic == "memory.extract")
+                .order_by(OutboxEvent.created_at.desc()).limit(1)
+            )
+            payload = dict(event.payload)
+        await worker.handle_memory_extract(payload)
+        return payload
+
+    original = await learn(f"我住在{address}")
+    await learn(f"我喜欢{interest}")
+    async with session_scope() as session:
+        before = await ContextCompiler(session).compile(
+            subject_id=logged_in.subject_id, window_id=window, user_text="我现在住在哪里？",
+        )
+        before_text = "\n".join(message.content for message in before.messages)
+        assert address in before_text and interest in before_text
+        row = await session.scalar(select(MemoryRow).where(MemoryRow.value == address))
+        await ConversationService(session).save_summary(
+            window, summary=f"旧摘要包含{address}", through_sequence=2, message_count=2,
+        )
+        target_id = row.id
+
+    response = await client.post(f"/v1/memory/{target_id}/forget")
+    assert response.status_code == 200, response.text
+    await worker.handle_memory_extract(original)
+    async with session_scope() as session:
+        after = await ContextCompiler(session).compile(
+            subject_id=logged_in.subject_id, window_id=window, user_text="我现在住在哪里？",
+        )
+        after_text = "\n".join(message.content for message in after.messages)
+        assert address not in after_text and interest in after_text
+        assert not await session.scalar(select(MemoryRow.id).where(MemoryRow.value == address))
+        assert await session.scalar(select(MemoryRow.id).where(MemoryRow.value == interest))
+    found = (await client.get("/v1/memory", params={"view": "library", "q": address})).json()
+    assert address not in str(found)
+
+    await learn(f"我住在{address}")
+    async with session_scope() as session:
+        relearned = await session.scalar(select(MemoryRow).where(MemoryRow.value == address))
+        assert relearned and relearned.id != target_id and relearned.turn_id != original["turn_id"]

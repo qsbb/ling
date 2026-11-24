@@ -595,6 +595,7 @@ class Message(Base):
     #
     # `recalled_at` 只有平台回执 == recalled 时才写；`uncertain` 只写
     # `recall_attempted_at`——把"试过"当成"成了"会让一次超时被永久记成功。
+    memory_hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recalled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

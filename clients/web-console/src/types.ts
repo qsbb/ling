@@ -386,6 +386,11 @@ export interface MemoryRecord {
   supersedes: string | null;
   superseded_by: string | null;
   source_event_ids: string[];
+  source_message_id?: string;
+  source_window_id?: string;
+  source_account?: string | null;
+  source_role?: 'self_report' | 'user_correction' | 'conversation';
+  valid_from?: string | null;
   valid_until: string | null;
   created_at: string | null;
   archived_at: string | null;
