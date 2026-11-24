@@ -545,15 +545,17 @@ async def handle_memory_extract(payload: dict) -> None:
                 sender_match = or_(
                     sender_match, and_(Message.sender_subject_id.is_(None), Message.role == "user"),
                 )
-            sources = list(await session.scalars(select(Message).where(
+            sources = select(Message).where(
                 Message.turn_id == turn_id, Message.window_id == window_id, Message.role == "user",
-                sender_match, Message.text == user_text,
-                Message.retracted_at.is_(None), Message.memory_hidden_at.is_(None),
-            ).limit(2)))
-            if len(sources) != 1:
+                sender_match, Message.retracted_at.is_(None), Message.memory_hidden_at.is_(None),
+            )
+            matches = list(await session.scalars(sources.limit(2)))
+            if len(matches) > 1:
+                matches = list(await session.scalars(sources.where(Message.text == user_text).limit(2)))
+            if len(matches) != 1:
                 logger.info("memory.extract 需要唯一有效的原始用户消息 turn=%s", turn_id)
                 return
-            source = sources[0]
+            source = matches[0]
             source_ids.append(f"message:{source.id}")
 
         # 断言记忆：**模型提炼 + 代码闸门**。
@@ -604,7 +606,8 @@ async def handle_memory_extract(payload: dict) -> None:
                 turn_id=turn_id,
             )
 
-        gated = gate(candidates, user_text=user_text, is_group=is_group)
+        source_text = source.text if source else user_text
+        gated = gate(candidates, user_text=source_text, is_group=is_group)
         if gated.rejected:
             # 拒绝原因要可查：不然"为什么这条没记住"无从排查
             logger.info(
@@ -631,7 +634,7 @@ async def handle_memory_extract(payload: dict) -> None:
                 source_account=payload.get("source_account"),
                 source_message_id=source.id if source else None,
                 occurred_at=source.created_at if source else None,
-                fact_operation=fact_operation(cand, user_text),
+                fact_operation=fact_operation(cand, source_text),
             )
             # 实体关联：把"养了一只宠物""家人是妈""在做 X 项目"这类
             # 可被反复提到的对象建成实体，供"沿关系定位"用。
@@ -2428,6 +2431,7 @@ async def handle_embedding_backfill(payload: dict) -> None:
     from sqlalchemy import select
 
     from ling.domains.memory.providers import build_embedding
+    from ling.domains.memory.service import active_source, store_embeddings
     from ling.infra.models import MemoryEmbeddingRow, MemoryEpisode, MemoryRow
     from ling.ports.embedding import EmbeddingError
 
@@ -2454,21 +2458,26 @@ async def handle_embedding_backfill(payload: dict) -> None:
         )
         # 断言用 text，情节用 summary——与召回侧保持一致，
         # 否则补出来的向量和查询向量的语义空间对不上。
-        targets: list[tuple[str, str]] = [
-            (row.id, row.text or "")
+        targets: list[tuple[MemoryRow | MemoryEpisode, str]] = [
+            (row, row.text or "")
             for row in (
                 await session.execute(
-                    select(MemoryRow).order_by(MemoryRow.created_at).limit(batch * 4)
+                    select(MemoryRow).where(
+                        MemoryRow.retracted.is_(False), MemoryRow.archived_at.is_(None),
+                        active_source(MemoryRow),
+                    ).order_by(MemoryRow.created_at).limit(batch * 4)
                 )
             ).scalars()
             if row.id not in existing_ids
         ]
         if len(targets) < batch:
             targets += [
-                (row.id, row.summary or "")
+                (row, row.summary or "")
                 for row in (
                     await session.execute(
-                        select(MemoryEpisode).order_by(MemoryEpisode.created_at).limit(batch * 4)
+                        select(MemoryEpisode).where(
+                            MemoryEpisode.archived_at.is_(None), active_source(MemoryEpisode),
+                        ).order_by(MemoryEpisode.created_at).limit(batch * 4)
                     )
                 ).scalars()
                 if row.id not in existing_ids
@@ -2477,16 +2486,13 @@ async def handle_embedding_backfill(payload: dict) -> None:
         if not targets:
             return
         try:
-            vectors = await embedder.embed([text for _id, text in targets])
+            vectors = await embedder.embed([text for _row, text in targets])
         except EmbeddingError as exc:
             logger.info("向量补算失败（可重试）: %s", exc)
             return
-        dim = len(vectors[0]) if vectors else 0
-        for (mid, _text), vec in zip(targets, vectors, strict=False):
-            session.add(
-                MemoryEmbeddingRow(memory_id=mid, model_id=model_id, dim=dim, vector=vec)
-            )
-            done += 1
+        done = len(await store_embeddings(
+            session, model_id=model_id, rows=[row for row, _text in targets], vectors=vectors,
+        ))
     if done:
         logger.info("向量补算：写入 %d 条", done)
 
@@ -4257,10 +4263,9 @@ async def handle_window_summary(payload: dict) -> None:
     3. **重写后长度不能明显缩水**。模型很容易把十条压成一句"聊了聊近况"，
        那等于悄悄丢信息；缩到 40% 以下就不采纳。
     """
-    from sqlalchemy import select
+    from sqlalchemy import select, update
 
-    from ling.domains.conversation.service import ConversationService
-    from ling.infra.models import WindowContext
+    from ling.infra.models import WindowContext, utcnow
     from ling.infra.security import SecretBox
     from ling.settings.service import ConfigService
 
@@ -4308,15 +4313,14 @@ async def handle_window_summary(payload: dict) -> None:
             )
             return
 
-        await ConversationService(
-            session, actor_id=settings.actor_id, persona_id=settings.persona_id
-        ).save_summary(
-            window_id,
-            summary=rewritten,
-            # **原样传回**：只换措辞，不动覆盖范围
-            through_sequence=int(ctx.summary_through_sequence or 0),
-            message_count=int(ctx.summary_message_count or 0),
+        saved = await session.scalar(
+            update(WindowContext).where(
+                WindowContext.id == ctx.id,
+                WindowContext.updated_at == ctx.updated_at,
+            ).values(summary=rewritten[:8000], updated_at=utcnow()).returning(WindowContext.id)
         )
+        if saved is None:
+            return
         logger.info("window.summary 已重写 window=%s（%d -> %d 字）", window_id, len(original), len(rewritten))
 
 

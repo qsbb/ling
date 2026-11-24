@@ -102,6 +102,52 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
     return or_(model.source_message_id.is_(None), active)
 
 
+async def store_embeddings(
+    session: AsyncSession, *, model_id: str,
+    rows: list[MemoryRow | MemoryEpisode], vectors: list[list[float]],
+) -> dict[str, list[float]]:
+    """Recheck the authoritative source after the asynchronous model call."""
+    from sqlalchemy.dialects.postgresql import insert
+
+    from ling.domains.memory.purge import open_purge_subjects
+    from ling.infra.models import MemoryEmbeddingRow
+
+    if not rows or not vectors:
+        return {}
+    owners = sorted({row.subject_id for row in rows})
+    await session.execute(
+        select(Subject.id).where(Subject.id.in_(owners)).order_by(Subject.id).with_for_update()
+    )
+    purging = await open_purge_subjects(session, subject_ids=owners)
+    eligible: set[str] = set()
+    for model in (MemoryRow, MemoryEpisode):
+        candidates = {
+            row.id: row.text if isinstance(row, MemoryRow) else row.summary
+            for row in rows if isinstance(row, model) and row.subject_id not in purging
+        }
+        if not candidates:
+            continue
+        content = model.text if model is MemoryRow else model.summary
+        query = select(model.id, content).where(
+            model.id.in_(candidates), model.archived_at.is_(None), active_source(model),
+        )
+        if model is MemoryRow:
+            query = query.where(model.retracted.is_(False))
+        eligible.update(
+            memory_id for memory_id, current_text in (await session.execute(query)).all()
+            if candidates[memory_id] == current_text
+        )
+    accepted = {
+        row.id: vec for row, vec in zip(rows, vectors, strict=False) if row.id in eligible
+    }
+    if accepted:
+        await session.execute(insert(MemoryEmbeddingRow).values([
+            {"memory_id": memory_id, "model_id": model_id, "dim": len(vec), "vector": vec}
+            for memory_id, vec in accepted.items()
+        ]).on_conflict_do_nothing())
+    return accepted
+
+
 class MemoryAudience(Protocol):
     @property
     def subject_id(self) -> str: ...
@@ -116,6 +162,9 @@ class MemoryAudience(Protocol):
     def is_group(self) -> bool: ...
 
     def allows_long_term_memory(self) -> bool: ...
+    @property
+    def whole_group_source_ids(self) -> frozenset[str]: ...
+
     def memory_row_visible(self, row: MemoryRow) -> bool: ...
     def episode_visible(self, episode: MemoryEpisode) -> bool: ...
     def memory_row_predicate(self) -> ColumnElement[bool]: ...
@@ -123,6 +172,7 @@ class MemoryAudience(Protocol):
     @classmethod
     async def freeze(
         cls, session: AsyncSession, *, subject_id: str, window_id: str, window_visibility: str,
+        whole_group_source_ids: frozenset[str] = frozenset(),
     ) -> MemoryAudience: ...
 
 
@@ -1117,6 +1167,7 @@ class MemoryService:
         audience = await audience.freeze(
             self._session, subject_id=audience.subject_id,
             window_id=window.id, window_visibility=window.visibility,
+            whole_group_source_ids=audience.whole_group_source_ids,
         )
         if not audience.allows_long_term_memory() or await open_purge_subjects(
             self._session, subject_ids=[audience.subject_id]
@@ -1623,14 +1674,7 @@ class MemoryService:
             embedded = await self._embedder.embed([get_text(r) for r in missing])  # type: ignore[union-attr]
         except EmbeddingError:
             return
-        dim = len(embedded[0]) if embedded else 0
-        for row, vec in zip(missing, embedded, strict=False):
-            self._session.add(
-                MemoryEmbeddingRow(
-                    memory_id=row.id, model_id=model_id, dim=dim, vector=vec
-                )
-            )
-        await self._session.flush()
+        await store_embeddings(self._session, model_id=model_id, rows=missing, vectors=embedded)
 
     async def _load_vectors(self, rows: list) -> dict[str, list[float]]:
         from sqlalchemy import select as sa_select
@@ -1681,18 +1725,9 @@ class MemoryService:
             except EmbeddingError:
                 # 补不齐就用已有的：部分语义路也好过完全没有
                 return existing
-            dim = len(embedded[0]) if embedded else 0
-            for row, vec in zip(missing, embedded, strict=False):
-                existing[row.id] = vec
-                self._session.add(
-                    MemoryEmbeddingRow(
-                        memory_id=row.id,
-                        model_id=model_id,
-                        dim=dim,
-                        vector=vec,
-                    )
-                )
-            await self._session.flush()
+            existing.update(await store_embeddings(
+                self._session, model_id=model_id, rows=missing, vectors=embedded,
+            ))
         return existing
 
     async def _rerank_hits(self, query: str, hits: list) -> list:

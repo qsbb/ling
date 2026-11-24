@@ -78,6 +78,8 @@ class AudienceSnapshot:
             return False
         if row.visibility not in self._allowed_visibilities():
             return False
+        if not self._group_source_eligible(row.source_visibility, row.source_message_id):
+            return False
         return self._source_allowed(
             source_visibility=getattr(row, "source_visibility", "subject_private"),
             source_window_id=getattr(row, "source_window_id", None),
@@ -87,6 +89,8 @@ class AudienceSnapshot:
         if not self.allows_long_term_memory():
             return False
         if episode.visibility not in self._allowed_visibilities():
+            return False
+        if not self._group_source_eligible(episode.source_visibility, episode.source_message_id):
             return False
         return self._source_allowed(
             source_visibility=getattr(episode, "source_visibility", "subject_private"),
@@ -99,7 +103,19 @@ class AudienceSnapshot:
         eligible = source.in_(self._allowed_sources())
         if not self.is_group:
             return eligible
-        return eligible & or_(source != "group_scope", MemoryRow.source_window_id == self.window_id)
+        return eligible & or_(
+            source != "group_scope",
+            (MemoryRow.source_window_id == self.window_id) & or_(
+                MemoryRow.source_message_id.is_(None),
+                MemoryRow.source_message_id.in_(self.whole_group_source_ids),
+            ),
+        )
+
+    def _group_source_eligible(self, visibility: str, source_id: str | None) -> bool:
+        return (
+            not self.is_group or visibility != "group_scope" or source_id is None
+            or source_id in self.whole_group_source_ids
+        )
 
     def _allowed_visibilities(self) -> set[str]:
         # 委托到唯一权威实现，避免规则漂移
@@ -134,6 +150,7 @@ class AudienceSnapshot:
         subject_id: str,
         window_id: str,
         window_visibility: str,
+        whole_group_source_ids: frozenset[str] = frozenset(),
     ) -> AudienceSnapshot:
         policy = await AwarenessService(session).policy(subject_id)
         consent = ConsentService(session)
@@ -145,6 +162,7 @@ class AudienceSnapshot:
             mode=policy.mode,
             revision=policy.revision,
             cross_device_granted=cross_device,
+            whole_group_source_ids=whole_group_source_ids,
         )
 
     def describe(self) -> dict[str, object]:
