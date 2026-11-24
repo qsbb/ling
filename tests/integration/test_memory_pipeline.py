@@ -307,8 +307,12 @@ async def test_forget_source_removes_old_prompt_material_and_allows_new_evidence
         )
         target_id = row.id
 
+    evidence = await client.get(f"/v1/memory/{target_id}/source")
+    assert evidence.status_code == 200 and evidence.json()["text"] == f"我住在{address}"
+
     response = await client.post(f"/v1/memory/{target_id}/forget")
     assert response.status_code == 200, response.text
+    assert (await client.get(f"/v1/memory/{target_id}/source")).status_code == 404
     await worker.handle_memory_extract(original)
     async with session_scope() as session:
         after = await ContextCompiler(session).compile(

@@ -610,6 +610,7 @@ export function canRetryForget(state: ForgetState): boolean {
  */
 export interface MemoryHandlers {
   forgetSource(memoryId: string): Promise<void>;
+  readSource(memoryId: string): Promise<{ text: string; created_at: string }>;
   retract(memoryId: string, reason: string): Promise<void>;
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
@@ -1184,6 +1185,25 @@ function MemoryInspector({
   const [newText, setNewText] = useState(row.text);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ExplainedError | null>(null);
+  const [source, setSource] = useState<{ text: string; created_at: string } | null>(null);
+  const [sourceError, setSourceError] = useState<ExplainedError | null>(null);
+  const [sourcePending, setSourcePending] = useState(false);
+
+  const toggleSource = async () => {
+    if (source) {
+      setSource(null);
+      return;
+    }
+    setSourcePending(true);
+    setSourceError(null);
+    try {
+      setSource(await handlers.readSource(row.memory_id));
+    } catch (cause) {
+      setSourceError(explainError(cause));
+    } finally {
+      setSourcePending(false);
+    }
+  };
   const status = historyStatus(row);
   const relative = formatRelativeTime(row.created_at);
   const formRef = useRef<HTMLTextAreaElement>(null);
@@ -1334,6 +1354,21 @@ function MemoryInspector({
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
+        {row.source_message_id && ['subject_private', 'window_private'].includes(row.visibility) ? (
+          <>
+            <button type="button" className="mem-text-button" aria-expanded={Boolean(source)}
+              disabled={sourcePending || pending} onClick={() => void toggleSource()}>
+              {sourcePending ? '读取中…' : source ? '收起原话' : '查看原话'}
+            </button>
+            {source ? (
+              <blockquote data-testid="mem-original-message">
+                <p>{source.text}</p>
+                <time dateTime={source.created_at}>{formatAbsoluteTime(source.created_at)}</time>
+              </blockquote>
+            ) : null}
+            <InlineError error={sourceError} resource="list" />
+          </>
+        ) : null}
       </section>
       {row.import_source ? (
         <section className="mem-inspector__section" aria-label="在 AstrBot 里的时间" data-testid="mem-import-times">
@@ -2314,6 +2349,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
 
   const handlers: MemoryHandlers = useMemo(
     () => ({
+      readSource: api.readMemorySource,
       async forgetSource(memoryId) {
         await api.forgetMemorySource(memoryId);
         setNotice({ tone: 'ok', text: '已遗忘该次发言生成的记忆。' });

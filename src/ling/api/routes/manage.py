@@ -292,6 +292,43 @@ async def supersede_memory(
     return {"memory_id": new_id_value, "supersedes": memory_id}
 
 
+@router.get("/memory/{memory_id}/source")
+async def read_memory_source(memory_id: str, auth: CurrentAuth, session: DbSession) -> dict:
+    """Open a retained private source under its current owner and window."""
+    from ling.domains.memory.purge import has_open_purge
+    from ling.infra.models import MemoryEpisode, MemoryRow, Message, Window
+
+    missing = LingError(ErrorCode.not_found, "原始发言不可用", status_code=404)
+    subject_id = auth.user.subject_id
+    assertion = await session.get(MemoryRow, memory_id)
+    episode = await session.get(MemoryEpisode, memory_id) if assertion is None else None
+    record = assertion or episode
+    if record is None or record.subject_id != subject_id or not record.source_message_id:
+        raise missing
+    if record.source_visibility not in {"subject_private", "window_private"}:
+        raise missing
+    if await has_open_purge(session, subject_id=subject_id):
+        raise missing
+    window_id = assertion.source_window_id if assertion else episode.window_id
+    source = await session.get(Message, record.source_message_id)
+    if (
+        source is None or source.window_id != window_id or source.role != "user"
+        or source.sender_subject_id not in (None, subject_id) or source.retracted_at is not None
+        or source.memory_hidden_at is not None
+    ):
+        raise missing
+    window = await session.get(Window, source.window_id)
+    if (
+        window is None or window.subject_id != subject_id
+        or window.visibility not in {"subject_private", "window_private"}
+    ):
+        raise missing
+    return {
+        "message_id": source.id, "window_id": window.id,
+        "created_at": source.created_at.isoformat(), "text": source.text,
+    }
+
+
 @router.post("/memory/{memory_id}/forget")
 async def forget_memory_source(
     memory_id: str, auth: CurrentAuth, session: DbSession,

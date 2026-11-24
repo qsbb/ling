@@ -1449,6 +1449,10 @@ export const api = {
     });
   },
 
+  readMemorySource(memoryId: string): Promise<{ text: string; created_at: string }> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/source`);
+  },
+
   forgetMemorySource(memoryId: string): Promise<{ memory_id: string; forgotten: boolean }> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/forget`, { method: 'POST' });
   },
