@@ -42,7 +42,6 @@ import type {
   ActivityResponse,
   GoalsResponse,
   ProactiveResponse,
-  TimelineResponse,
   LifeTimelineOut,
   OutlineJobOut,
   SubjectsResponse,
@@ -65,6 +64,8 @@ import type {
   MemoryInclude,
   MemoryImportCommit,
   MemoryImportPreview,
+  MemoryImportSourceChoices,
+  MemoryImportSourcePair,
   MemoryListResponse,
   MemoryImportSourceFilter,
   LogQuery,
@@ -84,6 +85,20 @@ import type { DesktopActivityStatus, DesktopStatus, DesktopTask } from './deskto
 
 /** 两个导入端点的请求格式：文件原始字节，NDJSON。 */
 export const IMPORT_CONTENT_TYPE = 'application/x-ndjson';
+
+interface MemoryImportOptions {
+  signal?: AbortSignal;
+  source?: MemoryImportSourcePair;
+}
+
+function memoryImportHeaders(source?: MemoryImportSourcePair): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': IMPORT_CONTENT_TYPE };
+  if (source) {
+    headers['X-Ling-Import-Owner-QQ'] = source.owner_qq;
+    headers['X-Ling-Import-Bot-QQ'] = source.bot_qq;
+  }
+  return headers;
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -1426,10 +1441,12 @@ export const api = {
    * 所以这里既不读成文本、也不做转码——`body: file` 就是原文；换成
    * `file.text()` 会让摘要对不上，确认时必然 `preview_invalid`。
    */
-  previewMemoryImport(file: File, signal?: AbortSignal): Promise<MemoryImportPreview> {
-    return request<MemoryImportPreview>('/v1/memory/import/preview', {
+  previewMemoryImport(
+    file: File, { signal, source }: MemoryImportOptions = {},
+  ): Promise<MemoryImportPreview | MemoryImportSourceChoices> {
+    return request<MemoryImportPreview | MemoryImportSourceChoices>('/v1/memory/import/preview', {
       method: 'POST',
-      headers: { 'Content-Type': IMPORT_CONTENT_TYPE },
+      headers: memoryImportHeaders(source),
       body: file,
       ...(signal ? { signal } : {}),
     });
@@ -1441,10 +1458,10 @@ export const api = {
    * 回包里 `imported` 可能与预览的 `accepted` 不同（确认时又到期的、并发
    * 已写入的都算重复），页面以这个值为准。
    */
-  commitMemoryImport(file: File, token: string, signal?: AbortSignal): Promise<MemoryImportCommit> {
+  commitMemoryImport(file: File, token: string, { signal, source }: MemoryImportOptions = {}): Promise<MemoryImportCommit> {
     return request<MemoryImportCommit>('/v1/memory/import/commit', {
       method: 'POST',
-      headers: { 'Content-Type': IMPORT_CONTENT_TYPE, 'X-Ling-Import-Token': token },
+      headers: { ...memoryImportHeaders(source), 'X-Ling-Import-Token': token },
       body: file,
       ...(signal ? { signal } : {}),
     });
@@ -1660,10 +1677,6 @@ export const api = {
       jsonInit('POST', {}),
     );
   },
-  timeline(limit = 50): Promise<TimelineResponse> {
-    return request<TimelineResponse>(`/v1/actor/timeline?limit=${limit}`);
-  },
-
   /* ------------------------------------------------------------ 运行日志
    *
    * 只读**本进程**的环形缓冲（`GET /v1/logs`）：没有分页、没有游标、

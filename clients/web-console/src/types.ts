@@ -35,6 +35,16 @@ export interface SessionRecord {
    * 旧服务端没有这个字段，所以可选：缺失按"未置顶"处理，不报错。
    */
   pinned?: boolean;
+  /**
+   * 平台侧这个联系还在不在；`null`/缺失 = 还在或未知。
+   *
+   * 三种原因都要区分，因为它们对用户说的话不一样：「我自己退的」
+   * 和「被踢出来」在排障时是两件事。前端据此整行置灰但**保留可点**
+   * ——旧记录还要能翻，只是不该让人以为还能收到新消息。
+   *
+   * 旧服务端没有这个字段，所以可选。
+   */
+  contact_unavailable?: 'left' | 'kicked' | 'friend_deleted' | null;
 }
 
 export interface ChatMessage {
@@ -437,6 +447,15 @@ export interface MemoryListResponse {
 }
 
 /* ------------------------------------------------ 从 AstrBot 导入（契约见同名文档） */
+
+export interface MemoryImportSourcePair {
+  owner_qq: string;
+  bot_qq: string;
+}
+
+export interface MemoryImportSourceChoices {
+  sources: MemoryImportSourcePair[];
+}
 
 /** 服务端确定的目标：`qq` 是本人，`bot_qq` 是导出的旧 Bot。 */
 export interface MemoryImportDestination {
@@ -1138,21 +1157,6 @@ export interface PersonaListResponse {
   active_persona_id?: string | null;
   active_id?: string | null;
   total?: number;
-}
-
-export interface TimelineEvent {
-  id: string;
-  type: string;
-  origin: string;
-  visibility: string;
-  revision: number;
-  occurred_at: string | null;
-  window_id: string | null;
-  summary: string;
-}
-
-export interface TimelineResponse {
-  events: TimelineEvent[];
 }
 
 /* ---------------------------------------------------------------- SSE */

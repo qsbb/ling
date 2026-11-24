@@ -27,6 +27,7 @@ import type {
   MemoryImportPreview,
   MemoryImportSample,
   MemoryImportSkipReason,
+  MemoryImportSourcePair,
 } from '../types';
 import { AlertIcon, CheckIcon, CloseIcon } from './Icons';
 import '../memory-import.css';
@@ -102,13 +103,13 @@ export function zeroAcceptedHint(
   if (!dominant) {
     return {
       headline: '这份文件里没有可导入的记忆',
-      next: '确认导出脚本用的是本人的 QQ 和旧 Bot 的 QQ，再重新导出一份迁移文件。',
+      next: '核对文件是否包含你和旧 Bot 的私聊长期记忆。',
     };
   }
   if (dominant.reason === 'outside_private_pair') {
     return {
       headline: '文件里的记录不属于你与这个旧 Bot 的私聊',
-      next: '核对自然人设置里的本人 QQ 绑定，再用本人的 QQ 重新导出迁移文件。',
+      next: '核对「关系」里的本人 QQ 绑定，以及预览中的旧 Bot。',
     };
   }
   if (dominant.reason === 'retention_expired' || dominant.reason === 'expired') {
@@ -131,7 +132,7 @@ export function zeroAcceptedHint(
   }
   return {
     headline: '这批记录都不满足导入条件',
-    next: '重新导出迁移文件，或换一份文件再试。',
+    next: '展开「重复与跳过」查看原因。',
   };
 }
 
@@ -173,18 +174,18 @@ export function importErrorCopy(error: ImportError): ImportErrorCopy {
     case 'destination_unavailable':
       return { reason: '目标记忆库暂不可用', hint: '稍后重新预览。', needsRepreview: true, needsAnotherFile: false };
     case 'invalid_encoding':
-      return { reason: '文件不是 UTF-8 编码', hint: '用导出脚本重新生成，不要手工另存。', needsRepreview: false, needsAnotherFile: true };
-    case 'astrbot_native_archive':
-      return {
-        reason: '这是 AstrBot 原生导出',
-        hint: '用插件的 SQLite 备份生成 Ling 迁移文件，再选择生成的 .jsonl。',
-        needsRepreview: false,
-        needsAnotherFile: true,
-      };
+      return { reason: '文件编码无法读取', hint: '请选择原始导出的 UTF-8 文件。', needsRepreview: false, needsAnotherFile: true };
     case 'unsupported_archive':
-      return { reason: '不是导出脚本生成的迁移文件', hint: '请选择转换脚本产出的 .jsonl。', needsRepreview: false, needsAnotherFile: true };
+      return { reason: '文件格式不支持', hint: '请选择 AstrBot 导出的 .jsonl 或 Ling 迁移文件。', needsRepreview: false, needsAnotherFile: true };
+    case 'astrbot_source_unmatched':
+      return {
+        reason: '没有匹配到本人 QQ 的私聊',
+        hint: '核对文件里的私聊账号，以及「关系」里绑定的本人 QQ。',
+        needsRepreview: true,
+        needsAnotherFile: false,
+      };
     case 'invalid_source_pair':
-      return { reason: '旧 Bot 和你的 QQ 相同', hint: '导出时两个 QQ 号必须不同。', needsRepreview: false, needsAnotherFile: true };
+      return { reason: '请核对两个 QQ 号', hint: '你的 QQ 和旧 Bot 的 QQ 必须是两个不同的号码。', needsRepreview: false, needsAnotherFile: true };
     case 'content_type_required':
       return { reason: '上传格式不匹配', hint: '刷新页面后重新选择文件。', needsRepreview: false, needsAnotherFile: false };
     default:
@@ -235,12 +236,18 @@ export function fileSizeText(file: Pick<File, 'size'>): string {
 
 /* ==================================================================== 状态机 */
 
+type ImportSelection = {
+  file: File;
+  source?: MemoryImportSourcePair;
+  choices?: MemoryImportSourcePair[];
+};
+
 export type ImportStep =
   | { name: 'pick' }
-  | { name: 'previewing'; file: File }
-  | { name: 'preview'; file: File; preview: MemoryImportPreview }
-  | { name: 'committing'; file: File; preview: MemoryImportPreview }
-  | { name: 'done'; file: File; preview: MemoryImportPreview; result: MemoryImportCommit };
+  | { name: 'source'; file: File; sources: MemoryImportSourcePair[] }
+  | { name: 'previewing'; selection: ImportSelection }
+  | { name: 'preview' | 'committing'; selection: ImportSelection; preview: MemoryImportPreview }
+  | { name: 'done'; preview: MemoryImportPreview; result: MemoryImportCommit };
 
 export interface MemoryImportPanelProps {
   /** 确认成功后的回调：让记忆库刷新，避免列表停在导入前的批次。 */
@@ -254,8 +261,7 @@ export interface MemoryImportPanelProps {
 /**
  * 导入面板本体。
  *
- * 打开就显示"选文件"，因为**入口本身就是这一步**——先给一个空白页让人再点
- * 一次"开始"，只是多一层。选完立刻预览，中间不设"下一步"。
+ * 原生导出用已绑定的 QQ 匹配来源。多组匹配时由用户选一组。
  */
 export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: MemoryImportPanelProps): React.ReactElement {
   const [step, setStep] = useState<ImportStep>({ name: 'pick' });
@@ -263,7 +269,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
-  const lastFile = useRef<File | null>(null);
+  const lastSelection = useRef<ImportSelection | null>(null);
   const alive = useRef(true);
   /**
    * 同一时刻只允许一份导入请求在飞。
@@ -284,22 +290,24 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
     };
   }, []);
 
-  const runPreview = useCallback(async (file: File) => {
+  const runPreview = useCallback(async (selection: ImportSelection) => {
     if (inFlight.current) return;
     inFlight.current = true;
     previewAbort.current?.abort();
     const controller = new AbortController();
     previewAbort.current = controller;
-    lastFile.current = file;
+    const { file, source } = selection;
+    lastSelection.current = selection;
     setError(null);
-    setStep({ name: 'previewing', file });
+    setStep({ name: 'previewing', selection });
     try {
-      const preview = await api.previewMemoryImport(file, controller.signal);
+      const preview = await api.previewMemoryImport(file, { signal: controller.signal, source });
       if (!alive.current || controller.signal.aborted) return;
-      setStep({ name: 'preview', file, preview });
+      setStep('sources' in preview
+        ? { name: 'source', file, sources: preview.sources }
+        : { name: 'preview', selection, preview });
     } catch (cause) {
       if (!alive.current || controller.signal.aborted) return;
-      // 失败时**保留文件**：回 pick 但记住 lastFile，让「重新预览」一步可用。
       setStep({ name: 'pick' });
       setError(explainImportError(cause));
     } finally {
@@ -308,20 +316,23 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
     }
   }, []);
 
-  const runCommit = useCallback(async (file: File, preview: MemoryImportPreview) => {
+  const runCommit = useCallback(async (selection: ImportSelection, preview: MemoryImportPreview) => {
     if (!preview.confirmation_token || inFlight.current) return;
     inFlight.current = true;
     setError(null);
-    setStep({ name: 'committing', file, preview });
+    setStep({ name: 'committing', selection, preview });
     try {
-      const result = await api.commitMemoryImport(file, preview.confirmation_token);
+      const { qq, bot_qq } = preview.destination;
+      const result = await api.commitMemoryImport(selection.file, preview.confirmation_token, {
+        source: { owner_qq: qq, bot_qq },
+      });
       if (!alive.current) return;
-      setStep({ name: 'done', file, preview, result });
+      setStep({ name: 'done', preview, result });
       titleRef.current?.focus();
       onCommitted();
     } catch (cause) {
       if (!alive.current) return;
-      setStep({ name: 'preview', file, preview });
+      setStep({ name: 'preview', selection, preview });
       setError(explainImportError(cause));
     } finally {
       inFlight.current = false;
@@ -330,12 +341,12 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
 
   const pickFile = (file: File | null | undefined) => {
     if (!file) return;
-    void runPreview(file);
+    void runPreview({ file });
   };
 
   const reset = () => {
     previewAbort.current?.abort();
-    lastFile.current = null;
+    lastSelection.current = null;
     setError(null);
     setStep({ name: 'pick' });
     if (inputRef.current) inputRef.current.value = '';
@@ -343,6 +354,8 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
 
   const copy = error ? importErrorCopy(error) : null;
   const busy = step.name === 'previewing' || step.name === 'committing';
+  const canPreview = step.name === 'preview' || step.name === 'committing';
+  const choices = canPreview ? step.selection.choices : undefined;
 
   return (
     <section className="import-panel" aria-labelledby="import-panel-title" data-testid="import-panel">
@@ -364,20 +377,33 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
           onPick={pickFile}
           error={error}
           copy={copy}
-          retainedFile={lastFile.current}
-          onRepreview={() => (lastFile.current ? void runPreview(lastFile.current) : reset())}
+          retainedFile={lastSelection.current?.file ?? null}
+          onRepreview={() => (lastSelection.current ? void runPreview(lastSelection.current) : reset())}
         />
       ) : null}
 
-      {step.name === 'preview' || step.name === 'committing' ? (
-        <PreviewStage
+      {step.name === 'source' ? (
+        <NativeSourceStage
           file={step.file}
+          sources={step.sources}
+          onPreview={(source) => void runPreview({ file: step.file, source, choices: step.sources })}
+          onChooseAnother={reset}
+        />
+      ) : null}
+
+      {canPreview ? (
+        <PreviewStage
+          file={step.selection.file}
           preview={step.preview}
           busy={step.name === 'committing'}
           error={error}
           copy={copy}
-          onConfirm={() => void runCommit(step.file, step.preview)}
-          onRepreview={() => void runPreview(step.file)}
+          onConfirm={() => void runCommit(step.selection, step.preview)}
+          onRepreview={() => void runPreview(step.selection)}
+          onEditSource={choices ? () => {
+            setError(null);
+            setStep({ name: 'source', file: step.selection.file, sources: choices });
+          } : undefined}
           onChooseAnother={reset}
         />
       ) : null}
@@ -407,7 +433,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
  */
 function BusyState({ step }: { step: ImportStep }): React.ReactElement | null {
   if (step.name !== 'previewing' && step.name !== 'committing') return null;
-  const size = fileSizeText(step.file);
+  const size = fileSizeText(step.selection.file);
   return (
     <div className="import-panel__busy" role="status" data-testid="import-busy" aria-live="polite">
       <span className="spinner" aria-hidden="true" />
@@ -438,6 +464,28 @@ export function retainedFileState(busy: boolean, copy: ImportErrorCopy | null): 
   if (copy.needsAnotherFile) return '这份文件用不了';
   if (copy.needsRepreview) return '需要重新预览';
   return '这次没成功，可以重试';
+}
+
+function ImportErrorNotice({ error, copy }: {
+  error: ExplainedError | null;
+  copy: ImportErrorCopy | null;
+}): React.ReactElement | null {
+  if (!error || !copy) return null;
+  return (
+    <div className="import-error" role="alert" data-testid="import-error" data-error-detail={error.detail ?? error.code}>
+      <AlertIcon size={14} />
+      <div>
+        <strong>{copy.reason}</strong>
+        {copy.hint ? (
+          <p>
+            {copy.hint}
+            {copy.needsAnotherFile ? <a href={IMPORT_GUIDE_URL} target="_blank" rel="noreferrer">迁移指南</a> : null}
+          </p>
+        ) : null}
+        {error.traceId ? <p className="import-error__trace">trace：{error.traceId}</p> : null}
+      </div>
+    </div>
+  );
 }
 
 function PickStage({
@@ -490,26 +538,10 @@ function PickStage({
           }}
         />
         <span className="import-drop__title">选择迁移文件</span>
-        <span className="import-drop__meta">.jsonl，由导出脚本生成</span>
+        <span className="import-drop__meta">.jsonl，支持 AstrBot 原生导出</span>
       </label>
 
-      {error && copy ? (
-        <div className="import-error" role="alert" data-testid="import-error" data-error-detail={error.detail ?? error.code}>
-          <AlertIcon size={14} />
-          <div>
-            <strong>{copy.reason}</strong>
-            {copy.hint ? (
-              <p>
-                {copy.hint}
-                {copy.needsAnotherFile ? (
-                  <a href={IMPORT_GUIDE_URL} target="_blank" rel="noreferrer">迁移指南</a>
-                ) : null}
-              </p>
-            ) : null}
-            {error.traceId ? <p className="import-error__trace">trace：{error.traceId}</p> : null}
-          </div>
-        </div>
-      ) : null}
+      <ImportErrorNotice error={error} copy={copy} />
 
       {retainedFile ? (
         <div className="import-retained" data-testid="import-retained">
@@ -537,6 +569,40 @@ function PickStage({
         </div>
       ) : null}
     </>
+  );
+}
+
+function NativeSourceStage({ file, sources, onPreview, onChooseAnother }: {
+  file: File;
+  sources: MemoryImportSourcePair[];
+  onPreview: (source: MemoryImportSourcePair) => void;
+  onChooseAnother: () => void;
+}): React.ReactElement {
+  return (
+    <form className="import-source-form" onSubmit={(event) => {
+      event.preventDefault();
+      const choice = new FormData(event.currentTarget).get('source');
+      const selected = sources.find(({ owner_qq, bot_qq }) => `${owner_qq}:${bot_qq}` === choice);
+      if (selected) onPreview(selected);
+    }}>
+      <p className="import-source-file">
+        <strong>{file.name}</strong>
+        <span>{fileSizeText(file)}</span>
+      </p>
+      <label className="field">
+        <span className="field__label">QQ 私聊来源</span>
+        <select className="field__input" name="source" required defaultValue="">
+          <option value="" disabled>选择一组私聊</option>
+          {sources.map(({ owner_qq, bot_qq }) => (
+            <option key={`${owner_qq}:${bot_qq}`} value={`${owner_qq}:${bot_qq}`}>{owner_qq} → {bot_qq}（旧 Bot）</option>
+          ))}
+        </select>
+      </label>
+      <div className="import-actions">
+        <button type="submit" className="button">预览导入</button>
+        <button type="button" className="ghost-button" onClick={onChooseAnother}>换个文件</button>
+      </div>
+    </form>
   );
 }
 
@@ -635,6 +701,7 @@ function PreviewStage({
   onConfirm,
   onRepreview,
   onChooseAnother,
+  onEditSource,
 }: {
   file: File;
   preview: MemoryImportPreview;
@@ -644,6 +711,7 @@ function PreviewStage({
   onConfirm: () => void;
   onRepreview: () => void;
   onChooseAnother: () => void;
+  onEditSource?: () => void;
 }): React.ReactElement {
   const empty = preview.accepted === 0;
   const zeroHint = empty ? zeroAcceptedHint(preview) : null;
@@ -662,7 +730,7 @@ function PreviewStage({
           {preview.accepted}
         </span>
         <span className="import-count-block__unit">条可导入</span>
-        <span className="import-count-block__total">文件共 {preview.total} 条</span>
+        <span className="import-count-block__total">共 {preview.total} 条记忆记录</span>
       </div>
 
       {empty && zeroHint ? (
@@ -676,16 +744,7 @@ function PreviewStage({
 
       <SkipBlock preview={preview} open={empty} />
 
-      {error && copy ? (
-        <div className="import-error" role="alert" data-testid="import-error" data-error-detail={error.detail ?? error.code}>
-          <AlertIcon size={14} />
-          <div>
-            <strong>{copy.reason}</strong>
-            {copy.hint ? <p>{copy.hint}</p> : null}
-            {error.traceId ? <p className="import-error__trace">trace：{error.traceId}</p> : null}
-          </div>
-        </div>
-      ) : null}
+      <ImportErrorNotice error={error} copy={copy} />
 
       <div className="import-actions">
         {copy?.needsRepreview ? (
@@ -725,6 +784,11 @@ function PreviewStage({
             </button>
           </>
         )}
+        {onEditSource ? (
+          <button type="button" className="ghost-button" disabled={busy} onClick={onEditSource}>
+            修改来源 QQ
+          </button>
+        ) : null}
       </div>
 
       {preview.expires_at && !copy?.needsRepreview ? (

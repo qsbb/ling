@@ -280,6 +280,34 @@ class Window(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # 平台侧这个联系还在不在（迁移 0090）。``NULL`` = 不知道。
+    #
+    # 为什么不是 ``archived``：归档是**用户**说"这个对话我收起来了"，
+    # 联系状态是**平台**说"这个群/这个人不在了"。两者的处置也不同——
+    # 归档不显示，不在的联系仍要显示（用户得能翻旧记录，像 QQ/微信那样）。
+    #
+    # 为什么必须落库而不是每次现查：群状态只能从 ``notice.group_decrease``
+    # 学到（见 connectors/onebot/connector.py 的 ``_contact_change_from_notice``），
+    # 那条事件来一次就过去了，不存下来就永远不知道。好友那边虽然有
+    # ``get_friend_list`` 可查，读侧也只在**确认成功**时才覆盖，见
+    # ``api/routes/sessions.py::_friend_details``。
+    #
+    # 为什么是字符串而不是布尔：要区分"主动退出"和"被踢"——它们对"能不能
+    # 再加回去"的含义不同，且日志要说得清。取值见 ``ContactAvailability``
+    # 契约枚举，库里存它的值，空串表示"不知道"（不放空串，用 NULL）。
+    contact_unavailable_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    contact_unavailable_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def contact_unavailable(self) -> bool:
+        """平台侧联系已经不在了（群被退/被踢、好友已删）。
+
+        重新入群时，原因清空，时间留作最近一条成员变动的记录。
+        """
+        return self.contact_unavailable_reason is not None
+
     @property
     def platform_reference(self) -> str:
         """平台窗口使用独立引用，历史窗口继续使用原来的标题。"""

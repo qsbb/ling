@@ -181,6 +181,85 @@ describe('会话行：主行只读名称/群聊/近期活动', () => {
   });
 });
 
+describe('不在的联系：整行置灰但还能点开', () => {
+  const gone = [
+    session({
+      session_id: 'left',
+      title: 'onebot-default:group:100200401',
+      display_name: '退掉的群',
+      channel: 'onebot-default',
+      peer_id: '100200401',
+      contact_unavailable: 'left',
+    }),
+    session({
+      session_id: 'kicked',
+      title: 'onebot-default:group:100200402',
+      display_name: '被踢的群',
+      channel: 'onebot-default',
+      peer_id: '100200402',
+      contact_unavailable: 'kicked',
+    }),
+    session({
+      session_id: 'deleted',
+      title: 'onebot-default:private:100200301',
+      display_name: '阿岚',
+      channel: 'onebot-default',
+      peer_id: '100200301',
+      contact_unavailable: 'friend_deleted',
+    }),
+    session({ session_id: 'ok', title: '还在的群', display_name: '还在的群', channel: 'web' }),
+  ];
+
+  it('徽标换成状态词，三种原因分开说', () => {
+    const rows = buildSessionRows(gone, null, 'owner');
+    // 徽标位本来是「群/私聊」，不在之后换成具体原因——用户的第一反应
+    // 永远是「我怎么不在了」，这个位置就得回答它。
+    expect(rows.map((row) => row.badge)).toEqual(['已退群', '被移出', '已删友', '网页']);
+    expect(rows.map((row) => row.unavailable)).toEqual([true, true, true, false]);
+  });
+
+  it('渲染成灰行，但**条目仍可点**（不设 disabled、不隐藏）', () => {
+    const html = renderToStaticMarkup(
+      <SessionSidebar
+        sessions={gone}
+        currentId={null}
+        open={false}
+        user={{ id: 'u', username: 'o', role: 'owner', subject_id: 's', display_name: '主人' }}
+        onClose={() => undefined}
+        onSelect={() => undefined}
+        onCreate={() => undefined}
+        onRename={async () => true}
+        onPin={async () => undefined}
+        onMove={async () => undefined}
+        onNavigateSettings={() => undefined}
+        onNavigatePersona={() => undefined}
+        onLogout={() => undefined}
+      />,
+    );
+    // 只有不在的那三条带灰行类；还在的那条不带——反例：把类无条件加上，
+    // 这条会红。
+    expect(countOf(html, 'session--unavailable')).toBe(3);
+    // 灰不等于消失：四条都渲染出来了，且都能点。
+    expect(countOf(html, 'class="session__main"')).toBe(4);
+    expect(html).toContain('退掉的群');
+    // 正常的会话也照样在列表里，且不带灰行类（上一条已断言只有 3 条带）。
+    expect(html).toContain('还在的群');
+    expect(html).not.toContain('disabled');
+    // 徽标样式跟着换成"不在"，别让「已退群」顶着群聊那块暖色底。
+    expect(countOf(html, 'data-kind="unavailable"')).toBe(3);
+  });
+
+  it('未知原因也置灰（认得出不可用比认得出是哪种更重要）', () => {
+    const rows = buildSessionRows(
+      [session({ session_id: 'x', title: 'x', contact_unavailable: 'brand_new_reason' as never })],
+      null,
+      'owner',
+    );
+    expect(rows[0]?.unavailable).toBe(true);
+    expect(rows[0]?.badge).toBe('不在');
+  });
+});
+
 describe('消息行：主行只留状态与时间', () => {
   it('模型名与入口都在详情折叠区，不在主行', () => {
     const html = renderMessages({

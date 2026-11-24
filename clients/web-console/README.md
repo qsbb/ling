@@ -56,7 +56,7 @@ LING_WEB_DIST=$PWD/clients/web-console/dist python -m ling
 - **401**：任何接口返回 401 时回到登录表单，URL 保留；登录成功后回到原会话并从服务端重读。
 - **设置页**：职责绑定编辑、保存草稿、发布、回滚、供应商连接检查；
   密钥输入框永不回填，只显示服务端返回的后四位与指纹。
-- **角色页**：`GET/PUT /v1/persona` 与 `GET /v1/actor/timeline`。
+- **角色页**：`GET/PUT /v1/persona`（人格设定）。
 
 ## 布局
 

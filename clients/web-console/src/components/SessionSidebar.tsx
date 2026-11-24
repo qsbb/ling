@@ -24,7 +24,9 @@ export type DialogueKind = 'group' | 'private' | 'channel' | 'web';
 
 /** 会话列表与标题栏只需要这几项；`display_name`/`channel`/`peer_id` 旧服务端没有。 */
 export type SessionLike = Pick<SessionRecord, 'session_id' | 'title' | 'window_id' | 'subject_id'> &
-  Partial<Pick<SessionRecord, 'display_name' | 'channel' | 'peer_id'>>;
+  Partial<
+    Pick<SessionRecord, 'display_name' | 'channel' | 'peer_id' | 'contact_unavailable'>
+  >;
 
 export interface ChannelRef {
   /** 原始键，展示时作为副标题（完整、不截断，交给 CSS 省略）。 */
@@ -160,9 +162,37 @@ export interface SessionRow {
   heading: SessionHeading;
   active: boolean;
   renamable: boolean;
+  /** 平台侧联系已不在（群被退/被踢、好友已删）。整行置灰但仍可点开。 */
+  unavailable: boolean;
+  /** 徽标位置要显示的短标签；正常会话是「群」「私聊」，不可用时换成状态词。 */
+  badge: string;
   /** 同一分组（置顶 / 非置顶）里的上下邻居，用于排序项是否可用。 */
   previous: SessionRecord | null;
   next: SessionRecord | null;
+}
+
+/**
+ * 「不在」的三种原因 → 徽标上的短词。
+ *
+ * 为什么换掉徽标而不是只在悬停里说：一条灰掉的会话如果不写明原因，
+ * 用户的第一反应永远是「我怎么不在了」。徽标位本来就是「这条是什么」，
+ * 而「曾经是群、现在不在了」比单纯一个「群」更该占这个位置。
+ *
+ * 三个词都是**两个汉字**，与「群」「私聊」占同样宽度——置灰是排版手段，
+ * 不该让列表的列宽跟着跳。
+ */
+const UNAVAILABLE_LABEL: Record<string, string> = {
+  left: '已退群',
+  kicked: '被移出',
+  friend_deleted: '已删友',
+};
+
+export function unavailableLabel(session: SessionLike): string | null {
+  const reason = session.contact_unavailable;
+  if (!reason) return null;
+  // 未知取值（新服务端加了第四种原因、这里还没更新）也要置灰：
+  // 「我们收到了一个不可用状态」比「认得出是哪种」更重要。
+  return UNAVAILABLE_LABEL[reason] ?? '不在';
 }
 
 /**
@@ -194,11 +224,14 @@ export function buildSessionRows(
     const next = ordered[index + 1] ?? null;
     const sameGroup = (neighbor: SessionRecord | null) =>
       neighbor !== null && Boolean(neighbor.pinned) === Boolean(session.pinned);
+    const unavailable = unavailableLabel(session);
     return {
       session,
       heading: describeSession(session),
       active: session.session_id === currentId,
       renamable: canRenameSession(session, role),
+      unavailable: unavailable !== null,
+      badge: unavailable ?? describeSession(session).badge,
       previous: canReorder && sameGroup(previous) ? previous : null,
       next: canReorder && sameGroup(next) ? next : null,
     };
@@ -352,7 +385,7 @@ export function SessionSidebar({
           {rows.length === 0 ? (
             <p className="sidebar__empty">还没有会话</p>
           ) : (
-            rows.map(({ session, heading, active, renamable, previous, next }) => {
+            rows.map(({ session, heading, active, renamable, unavailable, badge, previous, next }) => {
               const editing = editingId === session.session_id;
               const menuOpen = menu.openId === session.session_id;
               const detailOpen = detailId === session.session_id;
@@ -361,8 +394,8 @@ export function SessionSidebar({
                   key={session.session_id}
                   ref={menuOpen ? menu.rootRef : undefined}
                   className={`session ${active ? 'session--active' : ''} ${
-                    menuOpen ? 'session--menu-open' : ''
-                  }`}
+                    unavailable ? 'session--unavailable' : ''
+                  } ${menuOpen ? 'session--menu-open' : ''}`}
                   data-session-id={session.session_id}
                   data-kind={heading.kind}
                 >
@@ -424,8 +457,13 @@ export function SessionSidebar({
                               <PinIcon filled />
                             </span>
                           ) : null}
-                          <span className="session__channel" data-kind={heading.kind}>
-                            {heading.badge}
+                          <span
+                            className="session__channel"
+                            // 置灰的会话把徽标换成状态词，样式也跟着换成"不在"，
+                            // 免得「已退群」还带着群聊那块暖色底看起来像在用的群。
+                            data-kind={unavailable ? 'unavailable' : heading.kind}
+                          >
+                            {badge}
                           </span>
                         </span>
                         {/* 主行只读"名称 + 群/私聊 + 近期活动"。外部键按需展开，

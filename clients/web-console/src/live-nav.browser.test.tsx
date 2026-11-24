@@ -11,10 +11,10 @@
  *    `{session: null, planned_connector_id: null, navigation_visible: false}`、
  *    接入器列表为空时，左栏**仍然**有「直播」，点它进工作台——
  *    而不是先看到一个空荡荡的左栏、连入口都没有。
- * 2. **空态可操作**：工作台说清三步，并且「去添加直播间」真的把地址换成
- *    `/settings/connectors`（不是只画一个按钮）。
- * 3. **平台接入里没有重复的「管理直播」**：`自定义接入器` 展开后只有刷新，
- *    往返靠工作台里那个「接入设置」——所以这里同时验工作台 → 接入设置能走通。
+ * 2. **空态可操作**：工作台说清三步，并且「添加直播间」**在本页打开设置弹窗**
+ *    （不是把人送去另一个页面，也不是只画一个按钮）。
+ * 3. **直播间与 OneBot / QQ 官方机器人同级**：三者都在「平台」列表里，点开能改
+ *    连接参数；旧的「自定义接入器」折叠块已整体搬走，不再有第二个入口。
  * 4. **普通用户**：`role: 'member'` 时左栏没有「直播」；直接开 `/live` 也给可见的
  *    「由所有者管理」，不是白屏。两条同时成立才算权限落在同一条线上。
  *
@@ -99,16 +99,60 @@ const MEMBER = {
  * 在这里连它会把一整个测试夹具模块拉进浏览器 bundle，出问题时报的是
  * 「body 是空的」，很难指到真正原因。这里只需要页面判断所有权的那几个字段。
  *
- * `can_edit: true` 是关键：`ConnectorsPage` 只在它是 `true` 时渲染
- * `LiveConnectors`，也就是「管理直播」原来所在的那一栏。给 `false`，
- * 这一栏整块不出现，用例就会把「没渲染」误当成「按钮被删了」。
+ * `can_edit: true` 是关键：`ConnectorsPage` 只在它是 `true` 时把「直播间」放进
+ * 左栏「平台」列表（与 OneBot / QQ 官方机器人同级）。给 `false`，这一项整块不出现，
+ * 用例就会把「没渲染」误当成「这一项被删了」。
  */
 function CONNECTORS_VIEW(): unknown {
+  const activation = (scope: string) => ({
+    scope,
+    state: 'active',
+    generation: 1,
+    active_generation: 1,
+    candidate_generation: null,
+    active_revision_id: 'crev_0',
+    candidate_revision_id: null,
+    last_revision_id: 'crev_0',
+    last_state: 'active',
+    started_at: null,
+    activated_at: null,
+    error_code: null,
+    error_safe: null,
+    ack_count: 1,
+    expected_count: 1,
+  });
+  /*
+   * OneBot / QQ 官方机器人这两项**必须有**。
+   *
+   * 「直播间与它们同级」这个断言只有在三者同时存在时才有区分力：如果这里给空
+   * 数组，那么无论「直播间」放在哪里，`connector-platform-onebot` 都找不到，
+   * 失败信息看起来像"同级没做到"，其实是夹具里根本没有那两项。
+   * 字段列表给空数组即可——这条用例验的是**导航**，不是字段渲染。
+   */
+  const platform = (id: string, label: string) => ({
+    id,
+    label,
+    configured: false,
+    enabled: false,
+    status: 'not_configured',
+    status_reason: `${id}_not_configured`,
+    status_message: '还没配置',
+    guidance: '',
+    editable: true,
+    storage: 'db',
+    generation: 1,
+    activation: activation(id),
+    fields: [],
+    runtime: { connections: null, received: null },
+  });
   return {
     schema_version: 'v2',
     as_of: '2026-11-10T02:00:00+00:00',
     can_edit: true,
-    connectors: [],
+    connectors: [
+      platform('onebot', 'OneBot'),
+      platform('qqbot', 'QQ 官方机器人'),
+    ],
     access: {
       id: 'access',
       generation: 1,
@@ -122,10 +166,17 @@ function CONNECTORS_VIEW(): unknown {
 /** 「新实例」：一个直播间都没有，什么场次都没有，`navigation_visible` 因此为 false。 */
 const EMPTY_CURRENT = { session: null, planned_connector_id: null, navigation_visible: false };
 
+interface PutCall {
+  path: string;
+  body: Record<string, unknown>;
+}
+
 interface Harness {
   page: Page;
   /** 访问过的 pathname（按顺序）。 */
   visited: string[];
+  /** 直播间设置发出去的 PUT（按调用顺序）。 */
+  puts: PutCall[];
 }
 
 async function open(
@@ -142,6 +193,7 @@ async function open(
   contexts.push(context);
   const page = await context.newPage();
   const visited: string[] = [];
+  const puts: PutCall[] = [];
 
   // 每次导航都记一笔：断言「点了之后真的换了页」靠它，比读 UI 更直接。
   page.on('framenavigated', (frame) => {
@@ -157,6 +209,7 @@ async function open(
   const user = options.user ?? OWNER;
   const current = options.current === undefined ? EMPTY_CURRENT : options.current;
   const connectors = options.connectors ?? [];
+  let saved: Record<string, unknown> | null = null;
 
   await page.route('**/v1/**', async (route) => {
     const request = route.request();
@@ -177,19 +230,56 @@ async function open(
       return;
     }
     if (pathname === '/v1/settings/custom-connectors') {
-      await route.fulfill(json({ connectors }));
+      await route.fulfill(json({ connectors: saved ? [...connectors, saved] : connectors }));
+      return;
+    }
+    if (method === 'PUT' && pathname.startsWith('/v1/settings/custom-connectors/')) {
+      const id = decodeURIComponent(pathname.split('/').pop() ?? '');
+      const body = request.postDataJSON() as Record<string, unknown>;
+      puts.push({ path: pathname, body });
+      saved = {
+        id,
+        display_name: String(body.display_name ?? ''),
+        enabled: body.enabled !== false,
+        feature: null,
+        account_prefix: `custom:${id}:`,
+        event_path: `/v1/custom/${id}/events`,
+        room_id: String(body.room_id ?? ''),
+        source_ips: String(body.source_ips ?? ''),
+        token_set: Boolean(body.token),
+        signing_secret_set: Boolean(body.signing_secret),
+        stage_token_set: body.stage_token === undefined
+          ? Boolean(saved?.stage_token_set) : Boolean(body.stage_token),
+        public_topic: '',
+        max_minutes: 30,
+        obs_control: body.obs_control === true,
+        autonomous_window: null,
+        autonomous_state: null,
+        live_plan: {
+          role: 'host', public_topic: '', host_name: '', companion_auto_reply: false,
+          max_minutes: 30, autonomous_window: null,
+        },
+        has_plan: false,
+        plan_pending: false,
+        authorized_scene: null,
+        stage_observation: null,
+        last_received_at: null,
+      };
+      await route.fulfill(json(saved));
       return;
     }
     // 实例列表（该页并行读）：空列表是合法状态，页面显示「还没有实例」。
+    // 键是 `items` 而不是 `instances`——`ConnectorInstancesResponse` 就是这么定的，
+    // 给错键会让 `result.items` 变 undefined，整棵树在 `nextSelectedId` 里崩掉，
+    // 于是所有断言都变成「找不到 main」，看起来像整页没渲染。
     if (pathname.endsWith('/instances')) {
-      await route.fulfill(json({ instances: [] }));
+      await route.fulfill(json({ items: [] }));
       return;
     }
     /*
      * 接入器页的完整视图。**必须给对形状**：`ConnectorsPage` 读
-     * `body.can_edit` 决定渲不渲染 `LiveConnectors`（`can_edit === true` 才渲染），
-     * 而这一栏正是「管理直播」重复入口原来所在的地方。回 `{}` 会让它判成非所有者，
-     * 那一栏根本不出现——于是这条用例测的就不再是「按钮被删了」，
+     * `body.can_edit` 决定要不要在左栏「平台」里列出「直播间」。回 `{}` 会让它判成
+     * 非所有者，那一项根本不出现——于是这条用例测的就不再是「同级了没有」，
      * 而是「整块没渲染」，两者在结果上看起来一样。
      */
     if (pathname === '/v1/settings/connectors') {
@@ -220,7 +310,7 @@ async function open(
   // 执行完之前就到了，`#root` 里还是空的——后续断言会拿到「body 是空的」，
   // 看起来像整棵树没起来。Vite dev 下模块加载是若干次请求，等网络静下来才对。
   await page.goto(`${baseUrl}${path}`, { waitUntil: 'networkidle' });
-  return { page, visited };
+  return { page, visited, puts };
 }
 
 
@@ -270,50 +360,110 @@ describe('直播入口与工作台（真浏览器）', () => {
     await visible(empty);
     expect(await empty.locator('li').count()).toBe(3);
 
-    // 4. 「去添加直播间」把地址换到接入设置——不是只画个按钮。
+    // 4. 「添加直播间」在本页打开设置弹窗——不是把人送去另一个页面。
     await page.locator('[data-testid="live-empty-setup"]').click();
-    await url(page, /^\/settings\/connectors$/);
+    await visible(page.locator('[data-testid="live-room-settings"]'));
+    // 正向配对：弹窗里真的是那个表单，而不是一个空壳。
+    expect(await page.locator('[data-testid="live-room-form"]').count()).toBe(1);
+    await url(page, /^\/live$/);
   }, TIMEOUT);
 
-  it('平台接入里不再有重复的「管理直播」，且工作台的「接入设置」能回去', async (ctx) => {
+  it('直播间与 OneBot / QQ 官方机器人同级，工作台的设置弹窗能改连接参数', async (ctx) => {
     if (skip(ctx)) return;
     const { page } = await open('/settings/connectors');
 
-    // 展开「自定义接入器」折叠区（原先「管理直播」就在这一栏里）。
-    const details = page.locator('details.live-connector');
     // 先等这一页真的画出内容：`ConnectorsPage` 首帧是 loading，
-    // 直接找 `details` 会把「还没渲染」误读成「这一栏没了」。
-    {
-      const { writeFileSync } = await import('node:fs');
-      await page.waitForTimeout(2000);
-      writeFileSync('/tmp/diag3.json', JSON.stringify({
-        url: page.url(),
-        main: await page.locator('main').count(),
-        body: (await page.locator('body').innerText()).slice(0, 400),
-        html: (await page.content()).slice(0, 200),
-      }, null, 2));
-    }
+    // 直接找平台按钮会把「还没渲染」误读成「这一项没了」。
     await visible(page.locator('main'));
-    await visible(details);
-    expect(await details.count()).toBe(1);
-    await details.locator('summary').click();
-    // 展开后**要等接入选择框真的出现**：折叠区打开时才去拉实例列表，
-    // 立刻断言会拿到展开前的那一帧（`select` 数 0），失败信息看起来像
-    // 「这一栏没了」，其实是还没渲染。
-    await expect
-      .poll(() => details.locator('select').count(), { timeout: 15_000 })
-      .toBeGreaterThan(0);
+    const live = page.locator('[data-testid="connector-platform-live"]');
+    await visible(live);
 
-    // 重复入口已移除；正向配对：这一栏本身、接入选择框与刷新仍然在。
-    await gone(details.getByRole('button', { name: '管理直播' }));
-    expect(await details.getByRole('button', { name: /刷新/ }).count()).toBe(1);
-    expect(await details.getByRole('button', { name: '保存接入器' }).count()).toBe(1);
+    // 正向配对：另外两项照旧在。三条同时成立才算「同级」，而不是「只剩这一项」。
+    await visible(page.locator('[data-testid="connector-platform-onebot"]'));
+    await visible(page.locator('[data-testid="connector-platform-qqbot"]'));
 
-    // 从工作台往回走的那条路仍然通（往返的另一半）。
+    // 旧的「自定义接入器」折叠块已经整体搬走，不再有第二个入口。
+    await gone(page.locator('details.live-connector'));
+
+    // 点开直播间：右侧是新建表单（还没有任何直播间），不是一句「请先去别处添加」。
+    await live.click();
+    await visible(page.locator('[data-testid="live-rooms-panel"]'));
+    expect(await page.getByRole('button', { name: '保存直播间' }).count()).toBe(1);
+
+    // 工作台里同一个表单：页头「直播间设置」打开弹窗。
     await page.goto(`${baseUrl}/live`, { waitUntil: 'networkidle' });
     await visible(page.locator('[data-testid="live-page"]'));
-    await page.getByRole('button', { name: '接入设置' }).click();
-    await url(page, /^\/settings\/connectors$/);
+    await page.locator('[data-testid="live-room-settings-open"]').click();
+    await visible(page.locator('[data-testid="live-room-settings"]'));
+    expect(await page.locator('[data-testid="live-room-form"]').count()).toBe(1);
+  }, TIMEOUT);
+
+  it('在直播间设置里填参数能存进去：请求体正确，保存后留在原地看到新值', async (ctx) => {
+    if (skip(ctx)) return;
+    const { page, puts } = await open('/live');
+    await visible(page.locator('[data-testid="live-page"]'));
+
+    await page.locator('[data-testid="live-room-settings-open"]').click();
+    const dialog = page.locator('[data-testid="live-room-settings"]');
+    await visible(dialog);
+
+    // 新建：填一个房间，填舞台令牌。保存后服务端返回的就是这一份。
+    await dialog.locator('input[name="id"]').fill('room1');
+    await dialog.locator('input[name="display_name"]').fill('主房间');
+    await dialog.locator('input[name="room_id"]').fill('100200300');
+    await dialog.locator('input[name="stage_token"]').fill('stage-token-0123456789');
+    await dialog.getByRole('button', { name: '保存直播间' }).click();
+
+    // 1. 请求落在新建那条路径上，字段名与值都对得上。
+    await expect.poll(() => puts.length, { timeout: 15_000 }).toBe(1);
+    expect(puts[0]?.path).toBe('/v1/settings/custom-connectors/room1');
+    expect(puts[0]?.body).toMatchObject({
+      display_name: '主房间',
+      room_id: '100200300',
+      enabled: true,
+      stage_token: 'stage-token-0123456789',
+    });
+
+    await visible(dialog);
+    await visible(dialog.locator('[role="status"]'));
+    const room = dialog.getByRole('combobox', { name: '直播间', exact: true });
+    const input = (name: string) => dialog.locator(`input[name="${name}"]`);
+    expect(await room.inputValue()).toBe('room1');
+    expect(await input('id').evaluate((element) => (element as HTMLInputElement).readOnly)).toBe(true);
+    expect(await input('room_id').evaluate((element) => (element as HTMLInputElement).readOnly)).toBe(true);
+    expect(await input('display_name').inputValue()).toBe('主房间');
+    expect(await input('stage_token').inputValue()).toBe('');
+    expect(await input('stage_token').getAttribute('placeholder')).toBe('已配置');
+
+    const save = dialog.getByRole('button', { name: '保存直播间' });
+    await save.scrollIntoViewIfNeeded();
+    const viewport = page.viewportSize();
+    const saveBox = await save.boundingBox();
+    expect(viewport).not.toBeNull();
+    expect(saveBox).not.toBeNull();
+    if (saveBox && viewport) {
+      expect(saveBox.y).toBeGreaterThanOrEqual(0);
+      expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(viewport.height);
+    }
+    expect(await save.isEnabled()).toBe(true);
+
+    await input('stage_token').fill('new-stage-token-123456');
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[1]?.body.stage_token).toBe('new-stage-token-123456');
+    expect(await input('stage_token').inputValue()).toBe('');
+    await input('clear_stage_token').check();
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[2]?.body.stage_token).toBe('');
+    expect(await input('clear_stage_token').count()).toBe(0);
+    expect(await input('stage_token').inputValue()).toBe('');
+
+    await save.click();
+    await visible(dialog.locator('[role="status"]'));
+    expect(puts[3]?.body).not.toHaveProperty('stage_token');
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click();
+    expect(await page.locator('.live-room-select select').inputValue()).toBe('room1');
   }, TIMEOUT);
 
   it('状态接口失效时入口不消失，也不白屏', async (ctx) => {

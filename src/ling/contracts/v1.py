@@ -390,6 +390,31 @@ class RecallKind(StrEnum):
     friend = "friend"
 
 
+class ContactAvailability(StrEnum):
+    """平台侧这个联系还在不在。
+
+    ## 为什么要有"原因"而不是一个 ``unavailable: bool``
+
+    三种不在的情况对用户的含义不同，界面上是一行灰字，但**排障时**要能区分：
+
+    - ``left``：机器人自己**主动退出**了群（``group_decrease`` + ``leave``）；
+    - ``kicked``：机器人被**踢出**群（``kick_me``）；群可能还在，只是我们进不去；
+    - ``friend_deleted``：对方**删了好友**（``get_friend_list`` 里查不到）。
+
+    ``kicked`` 和 ``left`` 在界面上的处置一样（都读不到新消息了），但把"被踢"
+    记成"自己退的"是错误归属——与撤回路径里 ``self_recall`` 单列的理由相同。
+
+    ## 为什么是字符串常量而不是布尔
+
+    布尔值只能回答"在不在"，答不出"为什么"。而"为什么"是这条信息唯一能
+    帮上忙的地方：用户看到灰掉的一行，第一个问题永远是"我怎么不在了"。
+    """
+
+    left = "left"
+    kicked = "kicked"
+    friend_deleted = "friend_deleted"
+
+
 class RecallEvent(StrictModel):
     """**一条撤回通知**——不是一条消息，也不该变成一条消息。
 
@@ -425,6 +450,25 @@ class RecallEvent(StrictModel):
     sender_name: str | None = None
     # 是不是她自己发的消息被撤回
     self_recall: bool = False
+    trace_id: IdStr | None = None
+
+
+class ContactStatusEvent(StrictModel):
+    """机器人自己的群成员变动。入群时 ``availability`` 为空。"""
+
+    schema_version: Literal["v1"] = SCHEMA_VERSION
+    connector_instance: IdStr
+    external_event_id: IdStr
+    # 会话引用（``onebot-x:group:100…``）：与信封的 ``window_ref`` 同一套坐标，
+    # 因为窗口就是按它找回的。
+    window_ref: IdStr
+    # 平台侧目标 id（群号）。排障时要能在 QQ 里对上。
+    target_ref: IdStr | None = None
+    availability: ContactAvailability | None
+    user_ref: IdStr | None = None
+    # 操作者（踢人的管理员）；主动退群时与 ``user_ref`` 相同，平台不给时为空。
+    operator_ref: IdStr | None = None
+    occurred_at: datetime | None = None
     trace_id: IdStr | None = None
 
 
@@ -806,10 +850,14 @@ class SessionRecord(StrictModel):
     pinned: bool = False
     # 这个会话对端的好感度（``relationship_states.familiarity``，0~1）。
     #
-    # 排序的第二关键字（降序）。**查不到就是 ``null``，不是 0**：
-    # 0 是"关系还没建立"，``null`` 是"我们根本不知道这个人"——把未知写成 0
-    # 会让一个从没聊过的人排到"聊过但还生疏"的人后面，而这两者本不该比较。
+    # 用于在会话列表显示好感度。
     familiarity: float | None = None
+    # 平台侧联系是否已经不在了（群被退/被踢、好友已删）；``None`` = 还在或未知。
+    #
+    # 前端据此**整行置灰但保留可点**：用户要能翻旧记录，只是不该以为还能
+    # 收到新消息。三个取值见 :class:`ContactAvailability`——不合并成一个布尔，
+    # 因为"我自己退的"和"被踢出来"在排障时是两件事。
+    contact_unavailable: ContactAvailability | None = None
 
 
 class ChatMessage(StrictModel):
@@ -2059,6 +2107,8 @@ __all__ = [
     "AudienceRule",
     "CapabilityDescriptor",
     "ChatMessage",
+    "ContactAvailability",
+    "ContactStatusEvent",
     "ContextContribution",
     "DayIntentSummary",
     "DeliveryReceipt",

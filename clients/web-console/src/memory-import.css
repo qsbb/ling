@@ -115,6 +115,12 @@
   overflow-wrap: anywhere;
 }
 
+.import-source-form {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
 /* --------------------------------------------------------------- 选文件 */
 
 .import-drop {

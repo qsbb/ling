@@ -1,0 +1,22 @@
+/* 「直播间」在平台接入页的卡片，与直播工作台的设置弹窗共用的排版。 */
+.live-room { display: grid; gap: 0.9rem; min-width: 0; }
+.live-room__head { display: flex; align-items: end; flex-wrap: wrap; gap: 0.5rem 0.75rem; }
+.live-room__head > label { display: grid; gap: 0.3rem; min-width: min(100%, 16rem); font-size: 0.9rem; }
+.live-room__form {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+}
+.live-room__form > label,
+.live-room__form > div > label { display: grid; gap: 0.25rem; min-width: 0; font-size: 0.9rem; }
+.live-room__form input:not([type='checkbox']),
+.live-room__form select { width: 100%; min-width: 0; }
+.live-room__form .live-room__check { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; }
+.live-room__checks,
+.live-room__actions { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.live-room__status { display: flex; align-items: center; flex-wrap: wrap; gap: 0.35rem 1rem; font-size: 0.85rem; color: var(--ink-soft); }
+.live-room__status code { overflow-wrap: anywhere; }
+.live-room__note { margin: 0; color: var(--ink-soft); font-size: 0.85rem; }
+.live-room__error { margin: 0; color: var(--danger); overflow-wrap: anywhere; }
+.live-room-dialog { width: min(calc(100% - 2rem), 34rem); }
+.live-room-dialog .live-room__actions { justify-content: flex-end; }

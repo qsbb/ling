@@ -40,6 +40,7 @@ import type {
 /** 无新数据多久算超时（服务端会先给 provider_timeout，这里只兜底网络静默）。 */
 const STREAM_IDLE_MS = 45_000;
 const POLL_MS = 2_000;
+const SESSION_LIST_POLL_MS = 5_000;
 /** 一页历史条数。与后端 `list_messages` 的上限（500）留出余量。 */
 const PAGE_SIZE = 100;
 const STOP_FALLBACK_MS = 5_000;
@@ -723,6 +724,23 @@ export function useChat(
       cancelled = true;
     };
   }, [routeSessionId, loadMessages, loadRecallProposals, loadSessions, commitLive]);
+
+  useEffect(() => {
+    if (!currentId) return;
+    let cancelled = false;
+    let timer: number;
+    async function refreshList() {
+      if (document.visibilityState === 'visible') {
+        await loadSessions(() => !cancelled).catch(() => undefined);
+      }
+      if (!cancelled) timer = window.setTimeout(refreshList, SESSION_LIST_POLL_MS);
+    }
+    timer = window.setTimeout(refreshList, SESSION_LIST_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentId, loadSessions]);
 
   useEffect(
     () => () => {

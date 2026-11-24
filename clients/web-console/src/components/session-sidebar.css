@@ -14,6 +14,37 @@
   position: relative;
 }
 
+/* -------------------------------------------------------------------------
+   平台侧联系已不在（群被退/被踢、好友已删）。
+
+   处置是**整行降透明度**，但**仍然可点**：用户要能翻旧记录，像 QQ/微信
+   那样"灰着还能点开看历史"。所以这里只动颜色，不动 pointer-events、
+   不动 cursor、不隐藏条目——一条点不开的灰行看起来像 bug。
+
+   为什么用 opacity 而不是逐个属性改色：标题、时间、条数、徽标四个地方
+   各自有自己的颜色变量，逐个改要同步维护四份；整行降透明度只需要一处，
+   且天然保持它们之间的相对层次（标题仍比时间重）。
+   ---------------------------------------------------------------------- */
+
+.session--unavailable .session__main,
+.session--unavailable .session__more {
+  opacity: 0.42;
+}
+
+/* 悬停/选中时抬回来一点：用户正在看这一条，它不该继续"退到后面"。 */
+.session--unavailable .session__main:hover,
+.session--unavailable.session--active .session__main {
+  opacity: 0.62;
+}
+
+/* 徽标位换成状态词（已退群 / 被移出 / 已删友）。
+   用中性灰而不是群聊的暖色：暖色读起来像"这个群还在聊"。 */
+.session__channel[data-kind='unavailable'] {
+  color: var(--ink-faint);
+  border-color: var(--line-strong);
+  background: transparent;
+}
+
 /* 菜单开着时把整条抬到相邻条目之上，避免被后一条盖住。 */
 .session--menu-open {
   z-index: 5;

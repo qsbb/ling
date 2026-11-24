@@ -34,7 +34,7 @@ from ling.kernel.visibility import group_id_from_window_ref, is_group_window_ref
 from ling.ports.channel import ChannelConnector
 
 if TYPE_CHECKING:
-    from ling.contracts.v1 import InteractionEnvelope
+    from ling.contracts.v1 import ContactStatusEvent, InteractionEnvelope
     from ling.kernel.bridge import BridgeResult
 
 logger = logging.getLogger("ling.kernel.inbound")
@@ -185,15 +185,19 @@ async def process_inbound_payload(app: object, connector: ChannelConnector, payl
     # **撤回通知不是一条消息**：它有自己的类型，走自己的处理路径。
     # 放在白名单/去重/决策之前一点点，但仍然走完整的去重与日志——
     # 早退会把"重复撤回只记一条日志"这件事交给调用方，那是错的。
-    from ling.contracts.v1 import RecallEvent
+    from ling.contracts.v1 import ContactStatusEvent, RecallEvent
 
     if isinstance(envelope, RecallEvent):
         return await _process_recall(
             app, envelope, trusted_instance_key=trusted_instance_key
         )
-
     state = app.state  # type: ignore[attr-defined]
     settings = state.settings
+    if isinstance(envelope, ContactStatusEvent):
+        return await _process_contact_status(
+            envelope, actor_id=settings.actor_id, trusted_instance_key=trusted_instance_key,
+        )
+
     # 群 id 从窗口引用里取（`window:group:<id>`），没有就是私聊。
     scene = str(getattr(envelope, "window_ref", "") or "")
     # 群号提取走**唯一实现**（`kernel/visibility.py` 的 `group_id_from_window_ref`）。
@@ -500,6 +504,70 @@ async def _process_recall(
         "recalled": outcome.status == "retracted",
         "after_seen": bool(outcome.after_seen),
         "reason": outcome.status,
+    }
+
+
+async def _process_contact_status(
+    event: ContactStatusEvent,
+    *,
+    actor_id: str = "actor_ling",
+    trusted_instance_key: tuple[str, str] | None = None,
+) -> dict:
+    """记录机器人自己的群成员变动。认领与状态更新共用一个事务。"""
+    from ling.audit import behavior_event
+    from ling.domains.conversation.service import ConversationService
+
+    connector_instance = event.connector_instance
+    event_scope = _connector_event_scope(connector_instance, trusted_instance_key)
+
+    try:
+        async with session_scope() as session:
+            conversation = ConversationService(session, actor_id=actor_id)
+            claimed = await conversation.claim_event(scope=event_scope, key=event.external_event_id)
+            if claimed is not None:
+                return {"accepted": True, "duplicate": True, "reason": "重复的联系状态通知"}
+            updated = await conversation.set_contact_availability(
+                window_ref=event.window_ref,
+                reason=event.availability,
+                trusted_instance_key=trusted_instance_key,
+                occurred_at=event.occurred_at,
+            )
+    except Exception as exc:  # noqa: BLE001 - 事务回滚后允许平台重投
+        logger.warning("联系状态处理失败（%s）", type(exc).__name__)
+        return {"accepted": False, "reason": "联系状态处理失败，可重投"}
+
+    reason = event.availability.value if event.availability is not None else None
+    if not updated:
+        message = "群成员状态通知未更新会话"
+    elif reason is None:
+        message = "我已重新加入这个群"
+    else:
+        message = "我退出了这个群" if reason == "left" else "我被移出了这个群"
+
+    behavior_event(
+        "contact_available" if reason is None else "contact_unavailable",
+        message,
+        attributes={
+            "connector": connector_instance,
+            "availability": reason,
+            "window_ref": str(event.window_ref or ""),
+            # 目标与操作者只给 id，不给正文——这里从来没有可读文本。
+            "target_ref": str(event.target_ref or ""),
+            "user_ref": str(event.user_ref or ""),
+            "operator_ref": str(event.operator_ref or ""),
+            "window_matched": updated,
+        },
+    )
+    logger.info(
+        "联系状态 processed: availability=%s window=%s matched=%s",
+        reason,
+        event.window_ref,
+        updated,
+    )
+    return {
+        "accepted": True,
+        "availability": reason,
+        "window_matched": updated,
     }
 
 

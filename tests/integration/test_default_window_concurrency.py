@@ -151,14 +151,14 @@ async def test_first_window_is_committed_before_display_name_lookup(logged_in, m
 
     display_started = asyncio.Event()
     finish_display = asyncio.Event()
-    original = sessions._display_names
+    original = sessions._group_display_names
 
     async def delayed_display(*args, **kwargs):
         display_started.set()
         await finish_display.wait()
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(sessions, "_display_names", delayed_display)
+    monkeypatch.setattr(sessions, "_group_display_names", delayed_display)
     request = asyncio.create_task(logged_in.client.get("/v1/sessions"))
     try:
         await asyncio.wait_for(display_started.wait(), 5)

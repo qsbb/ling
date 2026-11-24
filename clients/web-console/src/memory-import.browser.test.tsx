@@ -101,6 +101,7 @@ interface MockOptions {
   commitBody?: Record<string, unknown>;
   commitError?: { detail: string; status: number; code: string; message: string };
   previewError?: { detail: string; status: number; code: string; message: string };
+  sourceChoices?: Array<{ owner_qq: string; bot_qq: string }>;
   morePages?: boolean;
   waitForPage?: (offset: number) => Promise<void>;
 }
@@ -116,6 +117,7 @@ async function open(options: MockOptions = {}) {
   const reads: URL[] = [];
   const imports: {
     path: string; contentType: string | null; token: string | null; bytes: number; digest: string;
+    ownerQq: string | null; botQq: string | null;
   }[] = [];
 
   await context.route('**/v1/**', async (route) => {
@@ -128,6 +130,8 @@ async function open(options: MockOptions = {}) {
         path,
         contentType: request.headers()['content-type'] ?? null,
         token: request.headers()['x-ling-import-token'] ?? null,
+        ownerQq: request.headers()['x-ling-import-owner-qq'] ?? null,
+        botQq: request.headers()['x-ling-import-bot-qq'] ?? null,
         bytes: body?.length ?? 0,
         /*
          * 摘要而非"字节数相同"：两次请求同样大小、内容不同也算不同文件。
@@ -139,6 +143,9 @@ async function open(options: MockOptions = {}) {
         if (options.previewError) {
           const e = options.previewError;
           return route.fulfill(apiError(e.code, e.message, e.status, e.detail));
+        }
+        if (options.sourceChoices && !request.headers()['x-ling-import-bot-qq']) {
+          return route.fulfill(json({ sources: options.sourceChoices }));
         }
         return route.fulfill(json(preview(options.previewBody)));
       }
@@ -254,29 +261,38 @@ describe('导入旧记忆', () => {
     expect(firstImport?.bytes).toBe(FILE.buffer.length);
   }, CASE_TIMEOUT);
 
-  it('识别 AstrBot 原生导出并引导生成可导入的文件', async () => {
-    const { page, imports } = await open({
-      mobile: true,
-      previewError: {
-        code: 'invalid_request', status: 422, detail: 'astrbot_native_archive',
-        message: '请用 AstrBot 插件的 SQLite 备份生成 Ling 迁移文件',
-      },
-    });
+  it('原生导出自动预览，确认沿用服务端识别的来源和原始文件', async () => {
+    const { page, imports } = await open({ mobile: true });
     await previewFile(page, {
-      name: 'memory-companion-20261121-013110.jsonl',
+      name: 'memory-companion-export.jsonl',
       mimeType: 'text/plain',
       buffer: Buffer.from('{"record_type":"header","format":"astrbot-memory-jsonl","version":1}\n'),
     });
-    const error = page.getByTestId('import-error');
-    expect(await error.innerText()).toContain('AstrBot 原生导出');
-    expect(await error.innerText()).toContain('SQLite 备份');
-    expect(await error.getByRole('link', { name: '迁移指南' }).getAttribute('href'))
-      .toContain('/docs/ASTRBOT-MEMORY-IMPORT.md');
-    expect(await page.getByRole('button', { name: '再试一次' }).count()).toBe(0);
-    const chooser = page.waitForEvent('filechooser');
-    await page.getByRole('button', { name: '换个文件' }).click();
-    expect(await chooser).toBeDefined();
-    expect(imports).toHaveLength(1);
+    await page.getByTestId('import-confirm').click();
+    expect(await page.getByTestId('import-result').innerText()).toContain('5');
+    expect(imports).toHaveLength(2);
+    expect(imports[0]).toMatchObject({ ownerQq: null, botQq: null });
+    expect(imports[1]).toMatchObject({
+      ownerQq: DESTINATION.qq, botQq: DESTINATION.bot_qq, digest: imports[0]?.digest,
+      token: '1700000000.deadbeef',
+    });
+  }, CASE_TIMEOUT);
+
+  it('多组匹配时从档案中的来源选择一组', async () => {
+    const { page, imports } = await open({
+      mobile: true,
+      sourceChoices: [
+        { owner_qq: DESTINATION.qq, bot_qq: '200300401' },
+        { owner_qq: DESTINATION.qq, bot_qq: DESTINATION.bot_qq },
+      ],
+    });
+    await previewFile(page);
+    const source = page.getByRole('combobox', { name: 'QQ 私聊来源' });
+    await source.selectOption({ label: `${DESTINATION.qq} → ${DESTINATION.bot_qq}（旧 Bot）` });
+    await page.getByRole('button', { name: '预览导入' }).click();
+    expect(await page.getByTestId('import-accepted-value').innerText()).toBe('5');
+    expect(imports).toHaveLength(2);
+    expect(imports[1]).toMatchObject({ ownerQq: DESTINATION.qq, botQq: DESTINATION.bot_qq, digest: imports[0]?.digest });
   }, CASE_TIMEOUT);
 
   it('413 指向反代上传配置，并保留已选文件以便重试', async () => {
@@ -728,7 +744,7 @@ describe('导入旧记忆', () => {
   it('解析报错给出可执行的下一步，且能换文件', async () => {
     for (const [detail, expectText] of [
       ['invalid_encoding', 'UTF-8'],
-      ['unsupported_archive', '转换脚本'],
+      ['unsupported_archive', 'AstrBot 导出的 .jsonl'],
     ] as const) {
       const { page, imports } = await open({
         previewError: { code: 'invalid_request', status: 422, detail, message: '读不了这份文件' },

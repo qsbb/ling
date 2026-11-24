@@ -9,16 +9,24 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import Table, bindparam, delete, func, literal, or_, select, text
+from sqlalchemy import Table, and_, bindparam, delete, func, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
-from ling.contracts.v1 import ChatMessage, ErrorCode, Origin, SessionRecord, TurnState
+from ling.contracts.v1 import (
+    ChatMessage,
+    ContactAvailability,
+    ErrorCode,
+    Origin,
+    SessionRecord,
+    TurnState,
+)
 from ling.infra.models import (
     ActorAccount,
     DeliveryReceiptRow,
@@ -33,6 +41,8 @@ from ling.infra.models import (
     utcnow,
 )
 from ling.infra.security import new_id
+
+logger = logging.getLogger("ling.conversation")
 
 DEFAULT_WINDOW_TITLE = "新的对话"
 MAX_TITLE_LEN = 60
@@ -107,74 +117,12 @@ def split_window_ref(ref: str) -> tuple[str, str, str] | None:
     return instance, kind, target
 
 
-def sort_windows_for_display(
-    windows: Sequence[Window], familiarity: dict[str, float]
-) -> list[Window]:
-    """先按置顶分组，再按手动顺序、置顶时刻、好感度和最近活跃排序。
-
-    ## 排序键缺失值
-
-    - ``pinned_at is None``（未置顶）→ 排在所有置顶之后；
-    - ``manual_order is None`` → 排在本组手动排序的窗口之后；
-    - ``familiarity`` 不在字典里 → 视为 ``-inf``（排在所有已知好感度之后）；
-    - ``updated_at`` 缺失 → 视为最旧。
-
-    为什么"未知好感度"排最后而不是按 0 算：0 是"认识但还不熟"，
-    未知是"我们根本没有这个人的关系记录"。把未知当 0，会让一个刚被拉进群、
-    从没单独说过话的人**排在聊过几次的人前面**（因为后者可能是 0.1）。
-    用户要的是"按好感度排"，不是"按有没有记录排"。
-
-    ## 为什么要有 `id` 兜底
-
-    `list.sort` 是稳定的，但"稳定"依赖输入顺序（PG 不保证无 ORDER BY 的
-    返回顺序）。同一时刻置顶的两个会话，如果不给最后一级键，顺序会在两次
-    请求之间跳动——前端做局部更新时看起来像在乱抖。所以最后按 ``id`` 定序。
-    """
-    import math
-
-    def key(window: Window) -> tuple[int, float, float, float, float, str]:
-        pinned = getattr(window, "pinned_at", None)
-        manual_order = getattr(window, "manual_order", None)
-        fam = familiarity.get(str(window.subject_id or ""))
-        return (
-            # 置顶的排 0（更靠前）；未置顶 1。
-            0 if pinned is not None else 1,
-            manual_order if manual_order is not None else float("inf"),
-            # 置顶时刻越晚越靠前；未置顶时这一位全等，交给好感度决定。
-            -_timestamp(pinned) if pinned is not None else 0.0,
-            # 好感度越大越靠前；未知给 -inf。
-            -(fam if fam is not None and not math.isnan(fam) else float("-inf")),
-            # 最后一级：最近活跃倒序。用负时间戳让"越新越靠前"。
-            -_timestamp(getattr(window, "updated_at", None)),
-            str(window.id),
-        )
-
-    return sorted(windows, key=key)
-
-
-def _timestamp(value: object) -> float:
-    """datetime → 秒（无时区按 UTC）。缺失返回 0.0（= 最旧）。"""
-    if not isinstance(value, datetime):
-        return 0.0
-    moment = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    return moment.timestamp()
-
-
 def window_target(window: Window) -> tuple[str, str, str | None]:
-    """(渠道, 会话类型, 平台对端 id)。
-
-    为什么从 ``title`` 里拆：渠道窗口的 title **就是**平台窗口标识
-    （见 ``bridge._ensure_window``），投递侧（worker、proactive dispatch）
-    也一直这么用。除此之外没有任何一处存着群号/对端 QQ，所以这里就地解析，
-    不为"界面上显示个副标题"去加一列。
-
-    web 窗口一律返回空：那里的 title 是用户起的会话名，可能恰好长成
-    ``a:group:b``，把它当群号显示出来只会误导人。
-    """
+    """从平台引用解析渠道、会话类型和平台对端 ID。"""
     channel = str(getattr(window, "channel", "") or "web")
     if channel == "web":
         return "web", "", None
-    parts = split_window_ref(str(getattr(window, "title", "") or ""))
+    parts = split_window_ref(window.platform_reference)
     if parts is None:
         return channel, "", None
     _instance, kind, target = parts
@@ -378,40 +326,26 @@ class ConversationService:
         subject_id: str,
         *,
         include_archived: bool = False,
-        familiarity: dict[str, float] | None = None,
     ) -> list[Window]:
-        """这个用户的会话列表，**已按展示顺序排好**。
-
-        ## 排序（用户原话：「置顶 + 其他按照好感度」）
-
-        置顶与未置顶分别使用手动顺序。没有指定顺序的窗口按置顶时刻、
-        好感度和最近活跃排序。
-
-        ## 为什么排序放在这里，而不是接口层
-
-        三个调用方（``/v1/sessions``、默认会话兜底、将来的移动端）都要同一份
-        顺序。放在接口层就等于"谁忘了排谁就不对"，而且这种不一致不会报错。
-
-        ## `familiarity` 为什么由调用方传进来
-
-        好感度在**关系域**（``relationship_states``）。本域为了排个序去读另一
-        个域的表，会让"会话域"悄悄依赖"关系域"的表结构。所以接口层批量查一次
-        传进来（**一次 IN 查询，不是 N+1**）；没传就按"都不知道"排（第 2 条
-        关键字全体相等，退化成按 ``updated_at``）。
-
-        ## 为什么用 Python 排而不是 SQL 的 ORDER BY
-
-        置顶/好感度/活跃三个键里，中间那个是**调用方传进来的字典**（不在
-        `windows` 表里）。要在 SQL 里排就得 join `relationship_states`——那是
-        跨域 join，还会让"没有关系行"的窗口因为 INNER JOIN 消失（或要写
-        LEFT JOIN + COALESCE 的 NULL 语义）。单个用户几十个窗口，内存排序
-        既便宜又不容易写错 NULL 的位置。
-        """
+        """按置顶、手动顺序与最近入站消息列出会话。"""
+        last_received_at = (
+            select(Message.created_at)
+            .where(Message.window_id == Window.id, Message.role == "user")
+            .order_by(Message.sequence.desc(), Message.created_at.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
         stmt = select(Window).where(Window.subject_id == subject_id)
         if not include_archived:
             stmt = stmt.where(Window.archived.is_(False))
-        rows = list((await self._session.execute(stmt)).scalars())
-        return sort_windows_for_display(rows, familiarity or {})
+        return list(await self._session.scalars(stmt.order_by(
+            Window.pinned_at.is_(None),
+            Window.manual_order.asc().nulls_last(),
+            Window.pinned_at.desc().nulls_last(),
+            last_received_at.desc().nulls_last(),
+            Window.created_at.desc(),
+            Window.id,
+        )))
 
     async def set_window_pinned(
         self, window_id: str, *, subject_id: str, pinned: bool, operator: bool = False
@@ -420,11 +354,7 @@ class ConversationService:
 
         归属校验走 ``get_window``：跨用户一律 404，不泄露"这个 id 存在"。
 
-        ## 置顶**不动** `updated_at`
-
-        置顶不是"有新消息"。改 `updated_at` 会让这个会话跳到"最近活跃"的
-        位置，而它其实安静了一星期——列表看起来像自己乱动了。同理取消置顶
-        也不改：会话应该回到它按好感度/活跃度本该在的位置，而不是"刚刚活跃过"。
+        置顶和取消置顶保留原来的 `updated_at`。
         """
         await self._lock_window_order(subject_id)
         window = await self.get_window(window_id, subject_id=subject_id)
@@ -475,7 +405,7 @@ class ConversationService:
 
         group = [
             candidate
-            for candidate in sort_windows_for_display(windows, await self.familiarities(windows))
+            for candidate in windows
             if (candidate.pinned_at is None) == (window.pinned_at is None)
         ]
         group.remove(window)
@@ -499,6 +429,52 @@ class ConversationService:
         if window is None or window.subject_id != subject_id:
             raise not_found("会话不存在")
         return window
+
+    async def set_contact_availability(
+        self,
+        *,
+        window_ref: str,
+        reason: ContactAvailability | None,
+        trusted_instance_key: tuple[str, str] | None = None,
+        occurred_at: datetime | None = None,
+    ) -> bool:
+        """更新匹配群会话的成员状态，入群时清空原因并保留事件时间。"""
+        reference_match = or_(
+            Window.connector_window_ref == window_ref,
+            and_(Window.connector_window_ref.is_(None), Window.title == window_ref),
+        )
+        stmt = select(Window).where(
+            Window.actor_id == self._actor_id, Window.channel == "onebot", reference_match,
+        )
+        matches = stmt
+        if trusted_instance_key is not None:
+            matches = stmt.where(
+                Window.origin_status == "known",
+                Window.origin_scope == trusted_instance_key[0],
+                Window.origin_instance_id == trusted_instance_key[1],
+            )
+        windows = list(await self._session.scalars(matches.limit(2)))
+        if trusted_instance_key is not None and not windows:
+            windows = list(await self._session.scalars(stmt.limit(2)))
+            if len(windows) != 1 or windows[0].origin_status != "unknown":
+                return False
+        if len(windows) != 1:
+            return False
+        observed_at = occurred_at or utcnow()
+        updated = await self._session.scalar(
+            _WINDOWS_TABLE.update()
+            .where(
+                Window.id == windows[0].id,
+                or_(Window.contact_unavailable_at.is_(None), Window.contact_unavailable_at <= observed_at),
+            )
+            .values(
+                contact_unavailable_reason=reason,
+                contact_unavailable_at=observed_at,
+                updated_at=Window.updated_at,
+            )
+            .returning(Window.id)
+        )
+        return updated is not None
 
     async def get_window_for_turn(self, window_id: str, *, subject_id: str) -> Window:
         """轮次用的窗口读取：**群窗口对所有成员开放**，私聊仍严格校验归属。
@@ -624,6 +600,7 @@ class ConversationService:
         *,
         display_name: str | None = None,
         familiarity: float | None = None,
+        contact_unavailable: ContactAvailability | None = None,
     ) -> SessionRecord:
         """窗口 → 契约记录。
 
@@ -631,8 +608,11 @@ class ConversationService:
         那是外呼（OneBot ``get_group_info``），不属于本域职责，本域也不该
         为了一个标题去认识连接器。采集不到就传 ``None``，前端按
         ``channel`` + ``peer_id`` 自己回退成「群 100…」。
+
+        群成员状态取自窗口，好友状态由调用方从平台读取。
         """
         channel, _kind, peer_id = window_target(window)
+        reason = window.contact_unavailable_reason or contact_unavailable
         return SessionRecord(
             session_id=window.id,
             actor_id=window.actor_id,
@@ -649,6 +629,7 @@ class ConversationService:
             group_reply_max_parts=window.group_reply_max_parts,
             pinned=getattr(window, "pinned_at", None) is not None,
             familiarity=familiarity,
+            contact_unavailable=ContactAvailability(reason) if reason else None,
         )
 
     async def peer_display_names(

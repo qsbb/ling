@@ -5,7 +5,8 @@ import {
   BILIBILI_LIVE_CENTER, liveRoomUrl, liveStatus, stopLabel,
   type CurrentLive, type LiveConnector, type LivePlan, type LiveRole, type LiveSession, type LiveViewer,
 } from '../live';
-import { CheckIcon, RefreshIcon, StopIcon } from './Icons';
+import { CheckIcon, RefreshIcon, SettingsIcon, StopIcon } from './Icons';
+import { LiveRoomSettingsDialog } from './LiveRooms';
 
 interface LivePageProps {
   current: CurrentLive | null;
@@ -239,6 +240,8 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
   const [actionError, setActionError] = useState('');
   const [feedback, setFeedback] = useState('');
   const [busy, setBusy] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsId, setSettingsId] = useState('');
   const run = current?.session ?? null;
   const active = !!run && run.state !== 'ended';
   const connectorId = active ? run.connector_id
@@ -312,6 +315,15 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
         </div>
         <div className="live-actions">
           {room ? <a className="button button--small" href={room} target="_blank" rel="noreferrer">查看房间</a> : null}
+          {/*
+            直播间设置就在工作台上：改的是"这个房间怎么接进来"（房间号、令牌、
+            OBS 控制）。它和本场计划分开——计划是这一场的东西，连接参数是房间的
+            东西，混在一个表单里会让人以为改计划等于换房间。
+          */}
+          <button type="button" className="button button--small" data-testid="live-room-settings-open"
+            onClick={() => { setSettingsId(connectorId ?? ''); setSettingsOpen(true); }}>
+            <SettingsIcon /> 直播间设置
+          </button>
           <button type="button" className="button button--small" onClick={() => onGo('/settings/connectors')}>接入设置</button>
         </div>
       </header>
@@ -357,22 +369,21 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
             /*
              * 新实例的第一次进入：一个直播间都没有。这里不再只写一句
              * 「请先在接入设置添加直播间」就结束——那句话把第一次配置变成了
-             * 一次离开，人得自己找回来。给一个能直接过去的入口，并且把
-             * 「配完什么才算能开播」按顺序说清（添加入口 → 舞台令牌 →
-             * 回本页填计划 → 开始），这样即使左栏入口先于配置出现，
-             * 落地页也是同一条路径的起点而不是死胡同。
+             * 一次离开，人得自己找回来。现在设置就在本页（页头「直播间设置」
+             * 与下面这个按钮打开同一个弹窗），所以第一次配置是**留在原地**走完的：
+             * 填房间 → 填舞台令牌 → 回本页填计划 → 开始。
              */
             <div className="live-empty" data-testid="live-empty">
-              <p className="live-note">还没有配置直播间。按顺序走完三步，回到本页就能开播：</p>
+              <p className="live-note">还没有直播间。按顺序走完三步，留在这里就能开播：</p>
               <ol className="live-empty__steps">
-                <li>在接入设置里添加直播间（自定义 HTTP 或 B 站直播）。</li>
-                <li>给接入器填「舞台令牌」，让直播电脑上的 OBS 连上这里。</li>
-                <li>回到本页选直播间、填本场计划，再开始直播。</li>
+                <li>点下面的「添加直播间」，填房间号和显示名。</li>
+                <li>填「舞台令牌」，让直播电脑上的 OBS 连上这里。</li>
+                <li>选直播间、填本场计划，再开始直播。</li>
               </ol>
               <div className="live-actions">
                 <button type="button" className="button button--primary button--small"
-                  data-testid="live-empty-setup" onClick={() => onGo('/settings/connectors')}>
-                  去添加直播间
+                  data-testid="live-empty-setup" onClick={() => { setSettingsId(''); setSettingsOpen(true); }}>
+                  添加直播间
                 </button>
               </div>
             </div>
@@ -398,6 +409,21 @@ export function LivePage({ current, statusError, refresh, onGo, onStop }: LivePa
         {show ? <RunStatus run={show} connector={connector} reachable={!statusError} refresh={refreshAll} /> : null}
       </>}
       {show && (show.state === 'ended' || show.played_count > 0) ? <ShowRecords key={show.id} run={show} onGo={onGo} /> : null}
+      {settingsOpen ? <LiveRoomSettingsDialog
+        connectors={connectors ?? []}
+        selectedId={settingsId}
+        onSelect={setSettingsId}
+        onClose={() => setSettingsOpen(false)}
+        onSaved={(saved) => {
+          setConnectors((rooms) => rooms?.some((room) => room.id === saved.id)
+            ? rooms.map((room) => room.id === saved.id ? saved : room)
+            : [...(rooms ?? []), saved]);
+          setSettingsId(saved.id);
+          setSelected(saved.id);
+          setFeedback('直播间设置已保存');
+          refreshAll();
+        }}
+      /> : null}
     </article>
   );
 }
