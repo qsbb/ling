@@ -1613,7 +1613,7 @@ class MemoryRow(Base, TimestampMixin):
         # 幂等键用**稳定槽位**而不是文本：
         # 文本会随提取规则/模板变化，规则升级后同一轮会重复长出记忆。
         # slot 是提取器的语义槽位（如 name / likes / lives_in），与措辞无关。
-        UniqueConstraint("turn_id", "slot", name="uq_memories_turn_slot"),
+        UniqueConstraint("turn_id", "slot", "fact_phase", name="uq_memories_turn_slot_phase"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1624,6 +1624,7 @@ class MemoryRow(Base, TimestampMixin):
     visibility: Mapped[str] = mapped_column(String(32))
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     import_source: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     # 来源窗口与来源可见范围：跨受众过滤必须能判断"这是哪个群说的"
     # 没有这两列就只能按 visibility 粗过滤，"群 A 的内容进群 B" 拦不住。
@@ -1645,6 +1646,7 @@ class MemoryRow(Base, TimestampMixin):
     # 槽位的**值**本身（不含模板文字）。压缩级联要把同槽位的多条并成一条，
     # 靠解析 text 反推值既脆弱又容易错，所以直接存。
     value: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fact_phase: Mapped[str] = mapped_column(String(16), default="current", server_default="current")
     # 产生时的可见范围（subject_private / window_private / group_scope / public）
     source_visibility: Mapped[str] = mapped_column(
         String(32), default="subject_private", index=True, server_default="subject_private"
@@ -1705,6 +1707,7 @@ class MemoryEpisode(Base, TimestampMixin):
     origin: Mapped[str] = mapped_column(String(32))
     visibility: Mapped[str] = mapped_column(String(32))
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     consent_revision: Mapped[int] = mapped_column(Integer, default=0)
     # 情节也会归档（不物理删除：source_event_ids 与后续断言引用它）

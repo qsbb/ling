@@ -31,6 +31,7 @@ from ling.infra.models import (
     MemoryRetrievalLog,
     MemoryRow,
     Message,
+    Subject,
     Turn,
     User,
     Window,
@@ -61,6 +62,7 @@ class MemoryHit:
     valid_until: datetime | None
     turn_id: str | None = None
     source_window_id: str | None = None
+    fact_slot: str | None = None
 
 
 @dataclass
@@ -83,7 +85,20 @@ def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
         valid_until=row.valid_until,
         turn_id=row.turn_id if row.origin == Origin.user_statement.value else None,
         source_window_id=row.source_window_id,
+        fact_slot=row.slot if row.source_message_id else None,
     )
+
+
+def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement[bool]:
+    """A linked source must still belong to its original window and be available."""
+    window_id = model.source_window_id if model is MemoryRow else model.window_id
+    active = select(Message.id).where(
+        Message.id == model.source_message_id,
+        Message.window_id == window_id,
+        Message.role == "user",
+        Message.retracted_at.is_(None),
+    ).exists()
+    return or_(model.source_message_id.is_(None), active)
 
 
 class MemoryAudience(Protocol):
@@ -506,10 +521,13 @@ class MemoryService:
         subject_id: str,
         source_window_id: str | None = None,
         source_account: str | None = None,
+        source_message_id: str | None = None,
         source_visibility: str = "subject_private",
         turn_id: str | None = None,
         slot: str | None = None,
         value: str | None = None,
+        fact_operation: Literal["assert", "change", "correct", "historical"] = "change",
+        occurred_at: datetime | None = None,
     ) -> str | None:
         """接受一条记忆候选。无证据或来源是模型推测时拒绝写入长期记忆。"""
         if not proposal.source_event_ids:
@@ -517,36 +535,51 @@ class MemoryService:
         if proposal.origin is Origin.model_inference:
             # 模型推测可以进 Episode 的草稿区，但不能作为可检索事实
             return None
-        # 单值槽位：新值生效即关闭旧值（双时间轴的事实侧）。
-        # 保留旧行（不删）以便回答"以前住哪"——这正是 valid_until 的意义。
-        # superseded_by 指向新行，链可追溯。
-        if slot and is_single_value(slot) and proposal.kind == "assertion":
-            await self._close_previous_values(
-                subject_id=subject_id,
-                slot=slot,
-                new_value=(value or proposal.text.strip()),
+        if slot and (turn_id or is_single_value(slot)):
+            # The subject lock serializes changes, repeated claims and concurrent correction.
+            await self._session.execute(
+                select(Subject.id).where(Subject.id == subject_id).with_for_update()
             )
-
+        phase = "historical" if fact_operation == "historical" else "current"
         if turn_id and slot:
-            # 幂等：按 (turn_id, slot) 判重，与文本无关。
-            # 这样提取规则换措辞、换模板都不会重复长出记忆。
-            existing = (
-                await self._session.execute(
-                    select(MemoryRow).where(
-                        MemoryRow.turn_id == turn_id,
-                        MemoryRow.slot == slot,
-                    )
+            existing = await self._session.scalar(
+                select(MemoryRow.id).where(
+                    MemoryRow.turn_id == turn_id, MemoryRow.slot == slot, MemoryRow.fact_phase == phase,
                 )
-            ).scalar_one_or_none()
+            )
             if existing is not None:
-                # 规则升级后同一槽位的新措辞可以更新既有条目，
-                # 而不是新增一条（保持"一条事实一条记录"）。
-                if existing.text != proposal.text.strip():
-                    existing.text = proposal.text.strip()
-                    await self._session.flush()
-                return existing.id
+                return existing
+
+        recorded_at = utcnow()
+        effective_at = occurred_at or recorded_at
+        new_id_value = new_id("mem")
+        valid_until = proposal.valid_until
+        previous: list[MemoryRow] = []
+        if slot and is_single_value(slot) and proposal.kind == "assertion" and phase == "current":
+            previous, following_at = await self._fact_neighbors(
+                subject_id=subject_id, slot=slot, effective_at=effective_at,
+                source_window_id=source_window_id, source_visibility=source_visibility,
+                visibility=proposal.visibility.value,
+            )
+            if following_at is not None:
+                valid_until = min(valid_until, following_at) if valid_until else following_at
+        if fact_operation == "historical":
+            valid_until = min(valid_until, effective_at) if valid_until else effective_at
+        different = [
+            item for item in previous
+            if (item.value or item.text).strip() != (value or proposal.text).strip()
+        ]
+        if fact_operation in {"change", "correct"}:
+            for item in different:
+                item.superseded_by = new_id_value
+                if fact_operation == "correct":
+                    item.retracted = True
+                    item.retracted_at = recorded_at
+                    item.retract_reason = "user_correction"
+                else:
+                    item.valid_until = effective_at
         row = MemoryRow(
-            id=new_id("mem"),
+            id=new_id_value,
             subject_id=subject_id,
             kind=proposal.kind,
             text=proposal.text.strip(),
@@ -554,15 +587,18 @@ class MemoryService:
             visibility=proposal.visibility.value,
             confidence=proposal.confidence,
             source_event_ids=list(proposal.source_event_ids),
-            valid_from=utcnow(),
-            valid_until=proposal.valid_until,
+            valid_from=None if fact_operation == "historical" else effective_at,
+            valid_until=valid_until,
+            supersedes=different[0].id if different and fact_operation in {"change", "correct"} else None,
             consent_revision=0,
             retracted=False,
             source_window_id=source_window_id,
             source_account=source_account,
+            source_message_id=source_message_id,
             source_visibility=source_visibility,
             turn_id=turn_id,
             slot=slot,
+            fact_phase=phase,
             value=(value or None),
             # 保留期**在写入时按当时的已发布策略盖章**。不盖的话，
             # 列默认值 365 会把策略默认 3650 永远压住（设置里的 3650
@@ -598,6 +634,7 @@ class MemoryService:
         window_id: str,
         summary: str,
         source_event_ids: list[str],
+        source_message_id: str | None = None,
         origin: Origin = Origin.user_statement,
         visibility: Visibility = Visibility.subject_private,
         occurred_at: datetime | None = None,
@@ -627,6 +664,7 @@ class MemoryService:
             origin=origin.value,
             visibility=visibility.value,
             source_event_ids=list(source_event_ids),
+            source_message_id=source_message_id,
             occurred_at=occurred_at or utcnow(),
             consent_revision=0,
             source_visibility=source_visibility or visibility.value,
@@ -683,13 +721,15 @@ class MemoryService:
 
         allowed = {v.value for v in visibility_allow}
         if fact_slot is not None:
-            current = await self._current_fact(
+            current = await self._current_facts(
                 fact_slot, subjects=subjects, allowed=allowed, now=now,
                 audience=audience, source_filter=source_filter,
             )
             result.strategy = "current_fact"
-            if current is not None:
-                result.hits = [_assertion_hit(current, 1.0 / (RRF_K + 1))]
+            if len(current) > 1:
+                result.strategy = "fact_conflict"
+            elif current:
+                result.hits = [_assertion_hit(current[0], 1.0 / (RRF_K + 1))]
             return await self._finish_recall(result, query, trace_window_id)
 
         explicit_recall = bool(_EXPLICIT_RECALL.search(query)) or wants_history(query) or (
@@ -701,6 +741,8 @@ class MemoryService:
             MemoryRow.subject_id.in_(subjects),
             MemoryRow.retracted.is_(False),
             MemoryRow.archived_at.is_(None),
+            active_source(MemoryRow),
+            or_(MemoryRow.valid_from.is_(None), MemoryRow.valid_from <= now),
         )
         fetched_rows = list(
             (await self._session.execute(
@@ -885,6 +927,7 @@ class MemoryService:
                     select(MemoryEpisode).where(
                         MemoryEpisode.subject_id.in_(list(subjects)),
                         MemoryEpisode.archived_at.is_(None),
+                        active_source(MemoryEpisode),
                     )
                 )
             ).scalars()
@@ -978,7 +1021,7 @@ class MemoryService:
         result.hits = scored[:limit]
         return await self._finish_recall(result, query, trace_window_id)
 
-    async def _current_fact(
+    async def _current_facts(
         self,
         slot: str,
         *,
@@ -987,10 +1030,10 @@ class MemoryService:
         now: datetime,
         audience: MemoryAudience | None,
         source_filter: Callable[[MemoryRow | MemoryEpisode], bool] | None,
-    ) -> MemoryRow | None:
+    ) -> list[MemoryRow]:
         """Find one current, sourced fact without the recency or lexical cutoffs."""
         if audience is not None and not audience.allows_long_term_memory():
-            return None
+            return []
         scoped = select(MemoryRow).where(
             MemoryRow.subject_id.in_(subjects),
             MemoryRow.kind == "assertion",
@@ -1017,6 +1060,7 @@ class MemoryService:
                 MemoryRow.retracted.is_(False),
                 MemoryRow.archived_at.is_(None),
                 MemoryRow.source_event_ids[0].as_string().is_not(None),
+                active_source(MemoryRow),
                 or_(MemoryRow.valid_from.is_(None), MemoryRow.valid_from <= now),
                 or_(MemoryRow.valid_until.is_(None), MemoryRow.valid_until > now),
                 self._retained_memory(now),
@@ -1027,11 +1071,17 @@ class MemoryService:
                 MemoryRow.id.asc(),
             ).limit(_CURRENT_FACT_CANDIDATE_LIMIT)
         )
-        return next((
+        eligible = [
             row for row in candidates
             if (audience is None or audience.memory_row_visible(row))
             and (source_filter is None or source_filter(row))
-        ), None)
+        ]
+        if not eligible or not eligible[0].source_message_id:
+            return eligible[:1]
+        distinct = {
+            (row.value or row.text).strip(): row for row in eligible if row.source_message_id
+        }
+        return list(distinct.values())
 
     async def _finish_recall(
         self, result: RecallResult, query: str, trace_window_id: str | None,
@@ -1138,8 +1188,12 @@ class MemoryService:
 
     async def supersede(self, old_id: str, new_text: str, *, reason: str) -> str | None:
         """用户纠正：旧记忆失效，新记忆建立 supersede 链。"""
-        old = await self._session.get(MemoryRow, old_id)
-        if old is None:
+        owner = await self._session.scalar(select(MemoryRow.subject_id).where(MemoryRow.id == old_id))
+        if owner is None:
+            return None
+        await self._session.execute(select(Subject.id).where(Subject.id == owner).with_for_update())
+        old = await self._session.get(MemoryRow, old_id, populate_existing=True, with_for_update=True)
+        if old is None or old.retracted:
             return None
         new_id_value = new_id("mem")
         new_row = MemoryRow(
@@ -1153,10 +1207,12 @@ class MemoryService:
             source_event_ids=list(old.source_event_ids or []),
             source_window_id=old.source_window_id,
             source_account=old.source_account,
+            source_message_id=old.source_message_id,
             source_visibility=old.source_visibility,
             import_source=old.import_source,
             slot=old.slot,
-            valid_from=utcnow(),
+            fact_phase=old.fact_phase,
+            valid_from=old.valid_from if old.fact_phase == "historical" else utcnow(),
             valid_until=old.valid_until,
             consent_revision=int(old.consent_revision or 0) + 1,
             retracted=False,
@@ -1170,43 +1226,36 @@ class MemoryService:
         await self.retract(old.id, reason=reason, superseded_by=new_id_value)
         return new_id_value
 
-    async def _close_previous_values(
-        self, *, subject_id: str, slot: str, new_value: str
-    ) -> int:
-        """把同槽位仍有效的旧值关闭（valid_until=now）。
-
-        只动 ``valid_until``，**不删行**：旧值必须留下，
-        否则"你以前住哪"永远答不出来
-        （参照 Graphiti/Zep 的双时间轴：事实有效期与系统记录时间分开）。
-        """
-        now = datetime.now(UTC)
-        rows = list(
-            (
-                await self._session.execute(
-                    select(MemoryRow).where(
-                        MemoryRow.subject_id == subject_id,
-                        MemoryRow.slot == slot,
-                        MemoryRow.archived_at.is_(None),
-                        MemoryRow.retracted.is_(False),
-                        or_(
-                            MemoryRow.valid_until.is_(None),
-                            MemoryRow.valid_until > now,
-                        ),
-                    )
-                )
-            ).scalars()
-        )
-        closed = 0
-        for row in rows:
-            # 值相同就是重复写入，不算改口，不关闭
-            if (row.value or "").strip() == new_value.strip():
-                continue
-            if (row.text or "").strip() == new_value.strip():
-                continue
-            row.valid_until = now
-            closed += 1
-        await self._session.flush()
-        return closed
+    async def _fact_neighbors(
+        self, *, subject_id: str, slot: str, effective_at: datetime,
+        source_window_id: str | None, source_visibility: str, visibility: str,
+    ) -> tuple[list[MemoryRow], datetime | None]:
+        """Find revisions in the same audience scope for an event-time update."""
+        conditions = [
+            MemoryRow.subject_id == subject_id,
+            MemoryRow.slot == slot,
+            MemoryRow.fact_phase == "current",
+            MemoryRow.kind == "assertion",
+            MemoryRow.archived_at.is_(None),
+            MemoryRow.retracted.is_(False),
+            MemoryRow.visibility == visibility,
+            MemoryRow.source_visibility == source_visibility,
+        ]
+        if source_visibility in {"group_scope", "window_private"}:
+            conditions.append(MemoryRow.source_window_id == source_window_id)
+        start = func.coalesce(MemoryRow.valid_from, MemoryRow.created_at)
+        previous = list(await self._session.scalars(
+            select(MemoryRow).where(
+                *conditions, start <= effective_at,
+                or_(MemoryRow.valid_until.is_(None), MemoryRow.valid_until > effective_at),
+            ).order_by(start.desc(), MemoryRow.id)
+        ))
+        following = await self._session.scalar(select(func.min(start)).where(
+            *conditions,
+            start > effective_at,
+            MemoryRow.valid_until.is_(None),
+        ))
+        return previous, following
 
     @staticmethod
     def importance(
@@ -1270,6 +1319,7 @@ class MemoryService:
                         ),
                         MemoryRow.archived_at.is_(None),
                         MemoryRow.retracted.is_(False),
+                        MemoryRow.source_message_id.is_(None),
                         MemoryRow.value.is_not(None),
                         MemoryRow.slot.is_not(None),
                         MemoryRow.created_at < cutoff,
@@ -1801,7 +1851,7 @@ class MemoryService:
         """
         if include not in {"active", "retracted", "archived", "all"}:
             raise ValueError(f"未知 include: {include}")
-        conditions: list = [MemoryRow.subject_id == subject_id]
+        conditions: list = [MemoryRow.subject_id == subject_id, active_source(MemoryRow)]
         if include in {"active", "archived"}:
             conditions.append(MemoryRow.retracted.is_(False))
         if include in {"active", "retracted"}:

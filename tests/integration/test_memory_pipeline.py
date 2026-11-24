@@ -216,3 +216,54 @@ async def test_worker_handles_missing_fields_gracefully() -> None:
 
     await handle_memory_extract({"subject_id": "s"})
     await handle_memory_extract({})
+
+
+async def test_linked_fact_keeps_two_periods_and_retry_keeps_newer_state(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling import worker
+    from ling.contracts.v1 import Visibility
+    from ling.domains.memory.service import MemoryService
+    from ling.infra.models import Message
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", None)
+    session_id = (
+        await logged_in.client.post("/v1/sessions", json={"title": "时间依据"})
+    ).json()["session_id"]
+    first = "以前住杭州，现在住苏州"
+    second = "我搬到宁波"
+    for utterance in (first, second):
+        await _send(logged_in.client, session_id, utterance)
+    async with session_scope() as session:
+        events = list(await session.scalars(
+            select(OutboxEvent).where(OutboxEvent.topic == "memory.extract")
+        ))
+        payloads = {row.payload["user_text"]: row.payload for row in events}
+    for utterance in (first, second, first):
+        await worker.handle_memory_extract(payloads[utterance])
+
+    async with session_scope() as session:
+        rows = list(await session.scalars(select(MemoryRow).where(MemoryRow.slot == "lives_in")))
+        by_value = {row.value: row for row in rows}
+        assert len(rows) == 3 and set(by_value) == {"杭州", "苏州", "宁波"}
+        assert by_value["杭州"].fact_phase == "historical"
+        assert by_value["苏州"].valid_until == by_value["宁波"].valid_from
+        assert by_value["宁波"].valid_until is None
+        for row in rows:
+            message = await session.get(Message, row.source_message_id)
+            assert message is not None and message.sender_subject_id == logged_in.subject_id
+            assert f"message:{message.id}" in row.source_event_ids
+        result = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="lives_in", fact_slot="lives_in",
+            visibility_allow={Visibility.subject_private},
+        )
+        assert [hit.memory_id for hit in result.hits] == [by_value["宁波"].id]
+        message = await session.get(Message, by_value["宁波"].source_message_id)
+        message.retracted_at = message.created_at
+
+    async with session_scope() as session:
+        result = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="lives_in", fact_slot="lives_in",
+            visibility_allow={Visibility.subject_private},
+        )
+        assert result.hits == []

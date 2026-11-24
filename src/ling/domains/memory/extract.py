@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 # 允许的槽位。与契约 Skill/Assertion 的稳定标识对应，**不含文本**，
 # 这样换措辞、换模型都不影响去重（文本作键的老问题已修过一次）。
@@ -81,7 +82,23 @@ _CLAUSE_SPLIT = re.compile(r"[，,。.！!？?；;\n]+")
 _OTHERS_MARKERS = ("他说", "她说", "他们", "她们", "我朋友", "我同事", "我室友", "我同学")
 _KINSHIP_MARKERS = ("我爸", "我妈", "我哥", "我姐", "我弟", "我妹", "我爷", "我奶", "我姥")
 # 这些槽位默认指"用户自己的"，亲属语境下不成立
-_SELF_POSSESSION_SLOTS = {"has_pet", "lives_in", "works_at"}
+_KINSHIP_SELF_SLOTS = ALLOWED_SLOTS - {"family", "important_date"}
+_QUOTED_TEXT = re.compile(r'「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"')
+_CORRECTION = re.compile(r"(?:刚才|上次|之前|前面)?(?:我)?说错了|更正一下|纠正一下")
+_CHANGE = re.compile(r"搬(?:了|家|到)|换(?:了|工作|到)|改(?:了|名|成)|现在(?:住|在|叫)|已经不")
+_PAST = re.compile(r"^(?:我)?(?:以前|曾经|过去|原来)")
+FactOperation = Literal["assert", "change", "correct", "historical"]
+
+
+def fact_operation(candidate: Candidate, user_text: str) -> FactOperation:
+    clause = _value_clause(candidate.value, user_text).strip()
+    if _PAST.match(clause):
+        return "historical"
+    if _CORRECTION.search(user_text):
+        return "correct"
+    if _CHANGE.search(clause):
+        return "change"
+    return "assert"
 
 # 角色扮演 / 台词标记：引号内的台词不是关于用户的事实。
 _ROLEPLAY_PATTERN = re.compile(r"[「『\"'][^」』\"']{4,}[」』\"']")
@@ -146,6 +163,7 @@ def build_prompt(*, user_text: str, actor_text: str, is_group: bool = False) -> 
         "- 只写长期有效的事实与偏好；一次性的状态（今天很累）不要写\n"
         "- 未兑现的计划（打算去、准备做）不要写\n"
         "- 别人的信息写 attribution=third_party，不要算成用户本人\n"
+        "- 区分以前和现在。同一句有两个时期的事实时，按原文各列一项\n"
         "- 引号里的台词、角色扮演不算事实\n"
         "- 没有可提炼的就输出 []\n"
         "\n"
@@ -189,7 +207,7 @@ def parse_candidates(raw: str) -> list[Candidate]:
                 slot=slot,
                 value=value[:MAX_VALUE_CHARS],
                 confidence=max(0.0, min(1.0, confidence)),
-                attribution=attribution if attribution in {"user", "third_party", "bot"} else "user",
+                attribution=attribution,
                 reason=str(item.get("reason") or "")[:120],
             )
         )
@@ -278,7 +296,7 @@ def _reject_reason(cand: Candidate, *, user_text: str, is_group: bool) -> str | 
     if cand.attribution == "bot":
         # 第 2 条：Bot 自己生成的内容不能变成用户事实
         return "来源是 Bot 自身输出，不能写成用户事实"
-    if cand.attribution == "third_party":
+    if cand.attribution != "user":
         # 第 5 条：他人信息不进当前用户档案（保留候选但拒绝入库）
         return "归属他人，不写入当前用户档案"
     # 值必须**有据可依**地来自原话：防模型凭空补全。
@@ -287,14 +305,16 @@ def _reject_reason(cand: Candidate, *, user_text: str, is_group: bool) -> str | 
     # 用最长公共子序列占比判断：改写仍高度相关，编造则几乎无重叠。
     if cand.value and not _grounded(cand.value, user_text):
         return "值与原话重叠过低（疑似模型臆造）"
-    if _ROLEPLAY_PATTERN.search(cand.value):
+    if _ROLEPLAY_PATTERN.search(cand.value) or any(
+        cand.value in quote.group() for quote in _QUOTED_TEXT.finditer(user_text)
+    ):
         return "引号内台词/角色扮演不算事实"
     # 第 5 条：他人信息不进当前用户档案。
     # 只在**含该值的那一句**里看，避免整句连坐；同时区分他人与亲属。
     _clause = _value_clause(cand.value, user_text)
     if any(m in _clause for m in _OTHERS_MARKERS):
         return "原话是他人情况，不写成用户事实"
-    if cand.slot in _SELF_POSSESSION_SLOTS and any(
+    if cand.slot in _KINSHIP_SELF_SLOTS and any(
         m in _clause for m in _KINSHIP_MARKERS
     ):
         return "原话是家人情况，不写成用户自己的事实"
@@ -330,7 +350,8 @@ _FALLBACK_PATTERNS = (
         "dislikes",
         r"我(?:不喜欢|不爱吃|不吃|不碰|受不了|讨厌)\s*([^\s，。,.！!？?]{1,20})",
     ),
-    ("lives_in", r"我住在\s*([^\s，。,.！!？?]{1,20})"),
+    ("lives_in", r"(?:我(?:以前|曾经|现在|一直)?|以前|曾经|现在|一直)住(?:在)?\s*([^\s，。,.！!？?；;]{1,20})"),
+    ("lives_in", r"(?:我(?:已经)?|现在|我现在)搬到\s*([^\s，。,.！!？?；;]{1,20})"),
     ("works_at", r"我在\s*([^\s，。,.！!？?]{1,20})\s*(?:工作|上班|上学|读书)"),
     # 去掉数量词："养了只猫" → "猫"；"养了两只狗" → "狗"
     ("has_pet", r"我养了?\s*(?:[一二两三几\d]*\s*[只条匹])?\s*([^\s，。,.！!？?]{1,12})"),
@@ -345,12 +366,13 @@ def fallback_candidates(user_text: str) -> list[Candidate]:
     """
     out: list[Candidate] = []
     for slot, pattern in _FALLBACK_PATTERNS:
-        match = re.search(pattern, user_text)
-        if not match:
-            continue
-        out.append(Candidate(slot=slot, value=match.group(1)[:MAX_VALUE_CHARS], confidence=0.6))
-        if len(out) >= MAX_CANDIDATES:
-            break
+        for match in re.finditer(pattern, user_text):
+            value = match.group(1)
+            if slot == "lives_in":
+                value = value.removesuffix("了")
+            out.append(Candidate(slot=slot, value=value, confidence=0.6))
+            if len(out) >= MAX_CANDIDATES:
+                return out
     return out
 
 

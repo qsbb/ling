@@ -357,3 +357,13 @@ def test_colleague_not_recorded() -> None:
         user_text="我同事在腾讯上班",
     )
     assert result.accepted == []
+
+
+def test_relative_and_direct_preferences_use_different_grounds() -> None:
+    candidate = Candidate(slot="likes", value="猫")
+    reported = gate([candidate], user_text="我妹妹喜欢猫")
+    confirmed = gate([candidate], user_text="我喜欢猫")
+    invalid_role = parse_candidates('[{"slot":"likes","value":"猫","attribution":"guess"}]')
+    assert not reported.accepted
+    assert confirmed.accepted == [candidate]
+    assert not gate(invalid_role, user_text="我喜欢猫").accepted

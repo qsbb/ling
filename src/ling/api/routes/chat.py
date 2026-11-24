@@ -976,6 +976,7 @@ async def send_transcribed_turn(
         # 她仍然算"看见过"。没有这个字段，两种情况在外面完全一样。
         handled_as="replied" if decision.respond else "ignored",
         handled_reason=decision.reason,
+        sender_subject_id=auth.user.subject_id,
     )
 
     # 她说"稍后再提"时落一条意图；来源固定为这条消息。

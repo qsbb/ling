@@ -10,6 +10,7 @@ from sqlalchemy import and_, func, literal, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.purge import has_open_purge
+from ling.domains.memory.service import active_source
 from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent
 
 
@@ -33,6 +34,13 @@ def memory_record(row: MemoryRow) -> dict[str, Any]:
         "valid_until": _iso(row.valid_until),
         "created_at": _iso(row.created_at),
         "archived_at": _iso(row.archived_at),
+        **({
+            "source_message_id": row.source_message_id,
+            "source_window_id": row.source_window_id,
+            "source_account": row.source_account,
+            "source_role": "user_correction" if row.supersedes and not row.turn_id else "self_report",
+            "valid_from": _iso(row.valid_from),
+        } if row.source_message_id is not None else {}),
         **({"import_source": row.import_source} if row.import_source is not None else {}),
     }
 
@@ -55,6 +63,12 @@ def _episode_record(row: MemoryEpisode) -> dict[str, Any]:
         "archived_at": _iso(row.archived_at),
         "can_edit": False,
         "record_type": "experience",
+        **({
+            "source_message_id": row.source_message_id,
+            "source_window_id": row.window_id,
+            "source_role": "conversation",
+            "valid_from": _iso(row.occurred_at),
+        } if row.source_message_id is not None else {}),
     }
 
 
@@ -75,8 +89,8 @@ async def read_library(
         result["extraction"] = {"state": "purging", "at": None}
         return result
 
-    memory_query = select(MemoryRow).where(MemoryRow.subject_id == subject_id)
-    episode_query = select(MemoryEpisode).where(MemoryEpisode.subject_id == subject_id)
+    memory_query = select(MemoryRow).where(MemoryRow.subject_id == subject_id, active_source(MemoryRow))
+    episode_query = select(MemoryEpisode).where(MemoryEpisode.subject_id == subject_id, active_source(MemoryEpisode))
     if source is not None:
         memory_query = memory_query.where(MemoryRow.import_source["source"].as_string() == source)
     if include not in {"retracted", "all"}:
