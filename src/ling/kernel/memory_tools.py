@@ -32,4 +32,6 @@ async def recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapsho
             visibility_allow=visibility_set(audience) & visibility_set(current),
             trace_window_id=window.id, audience=current,
         )
+    if result.strategy == "fact_conflict":
+        return "记录中有相互冲突的本人陈述，请询问哪一条现在有效。"
     return render_evidence(result.hits) or empty

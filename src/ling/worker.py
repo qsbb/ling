@@ -463,8 +463,11 @@ async def handle_memory_extract(payload: dict) -> None:
     需要更强的语义提取时，把本函数换成调用 memory.extract 模型即可，
     接口与准入规则不变。
     """
+    from sqlalchemy import and_, or_, select
+
     from ling.contracts.v1 import Origin, Visibility
     from ling.domains.memory.service import MemoryService
+    from ling.infra.models import Message, Subject, Turn, Window
 
     subject_id = payload.get("subject_id")
     window_id = payload.get("window_id")
@@ -493,7 +496,7 @@ async def handle_memory_extract(payload: dict) -> None:
     # 反过来漏判才是那次事故的形态。
     is_group = is_group_visibility(source_visibility) or bool(payload.get("is_group"))
     if not (subject_id and window_id and turn_id):
-        logger.warning("memory.extract 缺少必要字段，跳过: %s", payload)
+        logger.warning("memory.extract 缺少必要字段，跳过")
         return
 
     async with session_scope() as session:
@@ -514,6 +517,26 @@ async def handle_memory_extract(payload: dict) -> None:
 
         service = MemoryService(session, policy=await published_memory_policy(session))
         source_ids = [f"turn:{turn_id}"]
+        source = None
+        if await session.get(Turn, turn_id) is not None:
+            window = await session.get(Window, window_id)
+            if window is None or window.visibility != source_visibility:
+                return
+            sender_match = Message.sender_subject_id == subject_id
+            if not is_group and window.subject_id == subject_id:
+                sender_match = or_(
+                    sender_match, and_(Message.sender_subject_id.is_(None), Message.role == "user"),
+                )
+            sources = list(await session.scalars(select(Message).where(
+                Message.turn_id == turn_id, Message.window_id == window_id, Message.role == "user",
+                sender_match, Message.text == user_text,
+                Message.retracted_at.is_(None),
+            ).limit(2)))
+            if len(sources) != 1:
+                logger.info("memory.extract 需要唯一有效的原始用户消息 turn=%s", turn_id)
+                return
+            source = sources[0]
+            source_ids.append(f"message:{source.id}")
 
         # 断言记忆：**模型提炼 + 代码闸门**。
         # 旧实现只匹配「我叫/我喜欢/我住在」三个正则，参照稿明确记录过这条路线的
@@ -525,9 +548,7 @@ async def handle_memory_extract(payload: dict) -> None:
         # 事务里了，它会被一起提交。表现是"删完记忆之后库里又多了一条情节"。
         # 顺序调过来之后，两道栅栏之间**没有任何写入**，作废才是真的作废。
         from ling.contracts.v1 import MemoryProposal
-        from ling.domains.memory.extract import (
-            gate,
-        )
+        from ling.domains.memory.extract import fact_operation, gate
 
         candidates = await _extract_candidates(
             user_text=user_text,
@@ -537,6 +558,11 @@ async def handle_memory_extract(payload: dict) -> None:
         # **第二次栅栏**：模型提炼是慢操作（可能几十秒）。前面那次检查之后
         # 用户完全可能已经点了删除——不在这里再确认一次，提炼结果就会在
         # 删除之后写回去，等于删除失败。这是"边删边写"最真实的窗口。
+        await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+        if source is not None:
+            source = await session.get(Message, source.id, populate_existing=True, with_for_update=True)
+            if source is None or source.retracted_at is not None:
+                return
         if not await claim_still_valid(session):
             logger.info(
                 "memory.extract 作废：模型提炼期间发生过遗忘请求 turn=%s", turn_id
@@ -559,6 +585,8 @@ async def handle_memory_extract(payload: dict) -> None:
                 window_id=window_id,
                 summary="\n".join(summary_parts),
                 source_event_ids=source_ids,
+                source_message_id=source.id if source else None,
+                occurred_at=source.created_at if source else None,
                 origin=Origin.external_observation,
                 visibility=Visibility(source_visibility),
                 source_visibility=source_visibility,
@@ -569,10 +597,7 @@ async def handle_memory_extract(payload: dict) -> None:
         if gated.rejected:
             # 拒绝原因要可查：不然"为什么这条没记住"无从排查
             logger.info(
-                "memory.extract 闸门拒绝 %d 条 turn=%s: %s",
-                len(gated.rejected),
-                turn_id,
-                "; ".join(f"{c.slot}={c.value}←{r}" for c, r in gated.rejected[:4]),
+                "memory.extract 闸门拒绝 %d 条 turn=%s", len(gated.rejected), turn_id,
             )
         for cand in gated.accepted:
             await service.propose(
@@ -593,6 +618,9 @@ async def handle_memory_extract(payload: dict) -> None:
                 value=cand.value,
                 # 记录产生这条记忆的渠道账号：同一人多个号合并后要能无损拆回
                 source_account=payload.get("source_account"),
+                source_message_id=source.id if source else None,
+                occurred_at=source.created_at if source else None,
+                fact_operation=fact_operation(cand, user_text),
             )
             # 实体关联：把"养了一只宠物""家人是妈""在做 X 项目"这类
             # 可被反复提到的对象建成实体，供"沿关系定位"用。

@@ -33,6 +33,7 @@ from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
 from ling.domains.memory.recall_query import (
     asks_for_earlier_conversation,
+    current_fact_slot,
     needs_recent_topic,
     opens_new_topic,
     should_skip_automatic_recall,
@@ -1662,6 +1663,7 @@ class ContextCompiler:
                 subject_id=subject_id,
                 query=query,
                 include_history=wants_history(user_text),
+                fact_slot=current_fact_slot(user_text),
                 visibility_allow=allowed,
                 limit=_MEMORY_SHORTLIST,
                 trace_window_id=window_id,
@@ -1678,6 +1680,8 @@ class ContextCompiler:
             recall.hits, window_id=window_id, budget=evidence_budget,
             max_items=max_injected_memories, history_roles=history_roles,
         )
+        if recall.strategy == "fact_conflict":
+            evidence_text = "现有的本人陈述互相冲突。请询问对方哪一条目前有效。"
         if recall.hits:
             with contextlib.suppress(Exception):
                 await self._memory.mark_recalled([h.memory_id for h in recall.hits])

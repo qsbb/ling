@@ -1,6 +1,7 @@
 """对话上下文的自动召回准入。"""
 
 import re
+from typing import Literal
 from unicodedata import normalize
 
 _GREETINGS = frozenset({
@@ -53,3 +54,12 @@ def should_skip_automatic_recall(text: str) -> bool:
 def needs_recent_topic(text: str) -> bool:
     plain = normalize("NFKC", text).strip().rstrip(".!?。~")
     return _TOPIC_FOLLOWUP.fullmatch(plain) is not None
+
+def current_fact_slot(text: str) -> Literal["works_at", "lives_in"] | None:
+    """Recognize direct questions about the speaker's current state."""
+    text = _plain(text)
+    if re.fullmatch(r"(?:你还记得)?我(?:现在|目前)?住(?:在)?哪(?:儿|里|个城市)?吗?", text):
+        return "lives_in"
+    if re.fullmatch(r"(?:你还记得)?我(?:现在|目前)?(?:在)?哪(?:儿|里|家公司)?(?:上班|工作)吗?", text):
+        return "works_at"
+    return None
