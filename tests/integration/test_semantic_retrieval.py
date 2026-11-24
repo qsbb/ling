@@ -402,7 +402,7 @@ async def test_recall_order_is_stable_when_sql_rows_are_reversed(
         await session.execute(
             update(MemoryRow)
             .where(MemoryRow.id.in_(list(ids.values())))
-            .values(created_at=fixed_created, updated_at=fixed_created)
+                .values(created_at=fixed_created, updated_at=fixed_created, valid_from=fixed_created)
         )
         await session.execute(
             update(MemoryRow)

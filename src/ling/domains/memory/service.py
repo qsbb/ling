@@ -21,12 +21,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
-from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
+from sqlalchemy import ColumnElement, case, delete, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
+    MemoryEmbeddingRow,
     MemoryEpisode,
     MemoryRetrievalLog,
     MemoryRow,
@@ -594,12 +595,23 @@ class MemoryService:
         phase = "historical" if fact_operation == "historical" else "current"
         if turn_id and slot:
             existing = await self._session.scalar(
-                select(MemoryRow.id).where(
+                select(MemoryRow).where(
                     MemoryRow.turn_id == turn_id, MemoryRow.slot == slot, MemoryRow.fact_phase == phase,
                 )
             )
             if existing is not None:
-                return existing
+                replacement = proposal.text.strip()
+                if (
+                    existing.subject_id == subject_id
+                    and existing.source_message_id is None and source_message_id is None
+                    and not existing.retracted and existing.archived_at is None
+                    and existing.text != replacement
+                ):
+                    existing.text = replacement
+                    await self._session.execute(
+                        delete(MemoryEmbeddingRow).where(MemoryEmbeddingRow.memory_id == existing.id)
+                    )
+                return existing.id
 
         recorded_at = utcnow()
         effective_at = occurred_at or recorded_at

@@ -19,8 +19,8 @@
 
 from __future__ import annotations
 
+import ast
 import pathlib
-import re
 
 from ling.capabilities.tools import build_default_registry
 
@@ -110,23 +110,19 @@ def test_turn_coordinator_never_deletes_memory() -> None:
 
 
 def test_only_the_manage_route_can_request_a_purge() -> None:
-    """`request_purge` 的调用方只能是后台管理路由。
-
-    这条防的是"从别的入口（连接器、工具、定时任务）顺手发起真删"。
-    目前它只有两个合法调用方：
-
-    - `api/routes/manage.py` 的 `POST /v1/memory/forget`（用户点的）；
-    - 测试与文档。
-    """
-    callers: list[str] = []
+    """线上真删只从管理端发起，停机恢复可重放已受理请求。"""
+    callers: set[str] = set()
     for path in SRC.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        # 只找**调用**：排除 `async def request_purge(` 这个定义本身，
-        # 也排除 `from ... import request_purge` 这种不带括号的导入。
-        if re.search(r"(?<![\w.])(?<!def )request_purge\s*\(", text):
-            callers.append(str(path.relative_to(SRC)))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(
+            isinstance(node, ast.Call)
+            and ((isinstance(node.func, ast.Name) and node.func.id == "request_purge")
+                 or (isinstance(node.func, ast.Attribute) and node.func.attr == "request_purge"))
+            for node in ast.walk(tree)
+        ):
+            callers.add(str(path.relative_to(SRC)))
 
-    assert callers == ["api/routes/manage.py"], (
-        f"request_purge 的调用方是 {callers}，预期只有 api/routes/manage.py。\n"
-        "真删的发起入口必须唯一：多一个入口就多一条没人审过的删除路径。"
-    )
+    assert callers == {
+        "api/routes/manage.py",
+        "domains/memory/restore_privacy.py",
+    }

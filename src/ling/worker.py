@@ -6608,6 +6608,7 @@ OUTBOX_TOPICS: frozenset[str] = frozenset({
     # 它与 `memory.purge.sweep` 互补：一条保证"请求必然触发立即清理"，
     # 一条保证"投递失败/清理失败也迟早会被捡起来"。
     "memory.purge",
+    "memory.shared_arrangement",
     "relationship.update",
     "schedule.outline",
     "schedule.refine",

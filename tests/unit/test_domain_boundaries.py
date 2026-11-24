@@ -174,6 +174,9 @@ ALLOWED: dict[tuple[str, str], str] = {
         "同一个人时，问 A 也该想起 B 说过的话。账号合并是 identity 域的权威"
         "关系，记忆行本身不搬动（那是有损操作），只读组内 subject_id 集合。"
     ),
+    ("memory/shared_events.py", "ling.domains.identity.service"): (
+        "群约定通过身份服务核对来源账号当前仍属于原贡献者。只读公开服务。"
+    ),
     ("proactive/dispatch.py", "ling.domains.conversation.service"): (
         "deliver_to_web=True 时把主动消息落成会话里的一条她的消息，走 "
         "ConversationService.add_message（带 origin=simulated）。这是主动域"
