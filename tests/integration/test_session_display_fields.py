@@ -386,7 +386,7 @@ async def test_deferred_reason_is_only_the_reason(
 
     assert body["decision"] == "deferred_attention", body
     assert body["reason"] == "群里的普通消息", body
-    assert _received(caplog) == ["QQ 群里小不点说：「今晚吃啥」 · 先放着，等她刷到"]
+    assert _received(caplog) == ["QQ 群里小不点发来文字消息 · 先放着，等她刷到"]
 
 
 async def test_each_plain_group_message_has_its_own_outcome(
@@ -415,8 +415,8 @@ async def test_each_plain_group_message_has_its_own_outcome(
             )
 
     assert _received(caplog) == [
-        f"QQ 群里小不点说：「随便说说 {index}」 · 先放着，等她刷到" for index in range(3)
-    ]
+        "QQ 群里小不点发来文字消息 · 先放着，等她刷到"
+    ] * 3
     assert not _behavior(caplog, "inbound_handled")
 
 

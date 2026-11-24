@@ -596,15 +596,14 @@ def _log_inbound_behavior(
     else:
         scene = "群聊" if is_group else "私聊"
 
-    preview = clip(envelope.display_text or next(
-        (p.text for p in envelope.parts if p.text and p.text.strip()), None
-    ), 60)
-    if not preview:
-        media_types = {"image", "audio", "video"}
-        media = next((p.modality for p in envelope.parts if p.modality in media_types), envelope.modality)
-        preview = f"[{media}]" if media in media_types else (
-            "[media]" if envelope.media_refs else "（没有文字）"
-        )
+    media_types = {"image", "audio", "video"}
+    media = next((p.modality for p in envelope.parts if p.modality in media_types), envelope.modality)
+    if any(part.text and part.text.strip() for part in envelope.parts):
+        message_kind = "文字消息"
+    elif media in media_types:
+        message_kind = f"[{media}]"
+    else:
+        message_kind = "[media]" if envelope.media_refs else "空消息"
     if not result.accepted and result.media_evidence_ids:
         outcome, status = "media_recorded", "已登记媒体"
     elif not result.accepted:
@@ -627,7 +626,7 @@ def _log_inbound_behavior(
     with logging_context(turn_id=result.turn_id, session_id=result.window_id):
         behavior_event(
             "inbound_received",
-            f"{scene}里{clip(envelope.sender_name, 48) or '有人'}说：「{preview}」 · {status}",
+            f"{scene}里{clip(envelope.sender_name, 48) or '有人'}发来{message_kind} · {status}",
             outcome=outcome,
             attributes={
                 "scene": scene,

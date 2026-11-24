@@ -34,7 +34,7 @@ def test_image_keeps_scene_and_deferred_action(platform, window, group, scene) -
     )
     _log_inbound_behavior(envelope, result, is_group=group, platform=platform)
     entry, = recent_logs(kind="behavior")
-    assert entry.message == f"{scene}里夜落星河说：「[image]」 · 先放着，等她刷到"
+    assert entry.message == f"{scene}里夜落星河发来[image] · 先放着，等她刷到"
     assert entry.event_name == "inbound_received"
     assert entry.session_id == "win_1"
     assert entry.turn_id == "turn_1"
@@ -51,15 +51,16 @@ def test_image_keeps_scene_and_deferred_action(platform, window, group, scene) -
 def test_delivery_summary(accepted, decision, delivered, sent, total, status) -> None:
     envelope = InteractionEnvelope(
         connector_instance="onebot-test", external_event_id="evt_2", window_ref="onebot:user:1",
-        parts=[InputPart(modality=Modality.text, text="在吗")],
+        parts=[InputPart(modality=Modality.text, text="黑曜石地址保密样本")],
     )
     _log_inbound_behavior(envelope, BridgeResult(
         accepted=accepted, decision=decision, reason="api_key=dummy-private-value",
         delivered=delivered, parts_sent=sent, parts_total=total,
     ), is_group=False)
     entry, = recent_logs(kind="behavior")
-    assert entry.message == f"QQ 私聊里有人说：「在吗」 · {status}"
+    assert entry.message == f"QQ 私聊里有人发来文字消息 · {status}"
     detail = entry.attributes["attributes"]
+    assert "黑曜石地址保密样本" not in entry.message
     assert detail["delivered"] is delivered
     assert detail["parts_sent"] == sent
     assert "dummy-private-value" not in detail["reason"]

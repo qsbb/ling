@@ -320,7 +320,7 @@ async def test_model_error_reproduces_production_logs(
     no_text = [line for line in bridge if line == "轮次结束但没有可交付文本"]
     assert no_text, bridge
     record, = _inbound_behavior_records(caplog)
-    assert record.getMessage() == "QQ 私聊里Co说：「111」 · 决定回复，未送达"
+    assert record.getMessage() == "QQ 私聊里Co发来文字消息 · 决定回复，未送达"
     details = record.attributes["attributes"]
     assert details["reason"] == body["reason"]
     assert details["delivered"] is False
