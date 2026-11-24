@@ -609,6 +609,7 @@ export function canRetryForget(state: ForgetState): boolean {
  * 失败时抛错（展示组件就近显示），成功时由容器刷新对应分段并给出提示。
  */
 export interface MemoryHandlers {
+  forgetSource(memoryId: string): Promise<void>;
   retract(memoryId: string, reason: string): Promise<void>;
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
@@ -1178,7 +1179,7 @@ function MemoryInspector({
   onChanged: () => void;
   handlers: MemoryHandlers;
 }): React.ReactElement {
-  const [mode, setMode] = useState<'retract' | 'supersede' | null>(null);
+  const [mode, setMode] = useState<'retract' | 'supersede' | 'forget' | null>(null);
   const [reason, setReason] = useState('');
   const [newText, setNewText] = useState(row.text);
   const [pending, setPending] = useState(false);
@@ -1198,14 +1199,18 @@ function MemoryInspector({
     setError(null);
   };
 
-  const valid = mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim());
+  const forgetting = mode === 'forget';
+  const canForget = Boolean(row.source_message_id && row.can_edit !== false);
+  const actionLabel = forgetting ? '遗忘这次发言的记忆' : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
+  const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
 
   const submit = async () => {
-    if (!mode || !valid || pending || status) return;
+    if (!mode || !valid || pending || (status && !forgetting)) return;
     setPending(true);
     setError(null);
     try {
-      if (mode === 'retract') await handlers.retract(row.memory_id, reason.trim());
+      if (forgetting) await handlers.forgetSource(row.memory_id);
+      else if (mode === 'retract') await handlers.retract(row.memory_id, reason.trim());
       else await handlers.supersede(row.memory_id, newText.trim(), reason.trim() || '用户纠正');
       updateMode(null);
       onChanged();
@@ -1243,8 +1248,9 @@ function MemoryInspector({
           {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
         <p className="mem-inspector__text">{row.text}</p>
-        {!status && row.can_edit !== false ? (
+        {(!status && row.can_edit !== false) || canForget ? (
           <div className="mem-inspector__actions">
+            {!status && row.can_edit !== false ? <>
             <button
               type="button" className="button button--small button--primary"
               aria-expanded={mode === 'supersede'} disabled={pending}
@@ -1255,20 +1261,28 @@ function MemoryInspector({
               aria-expanded={mode === 'retract'} disabled={pending}
               onClick={() => updateMode(mode === 'retract' ? null : 'retract')}
             >撤回…</button>
+            </> : null}
+            {canForget ? (
+              <button type="button" className="button button--small mem-action--danger"
+                aria-expanded={forgetting} disabled={pending}
+                onClick={() => updateMode(forgetting ? null : 'forget')}>遗忘…</button>
+            ) : null}
           </div>
         ) : null}
       </div>
 
-      {mode && !status ? (
+      {mode && (!status || forgetting) ? (
         <form
           className="mem-confirm mem-confirm--item"
-          aria-label={mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
+          aria-label={actionLabel}
           onSubmit={(event) => { event.preventDefault(); void submit(); }}
         >
           <p className="mem-confirm__title">
-            <AlertIcon size={14} /> {mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆'}
+            <AlertIcon size={14} /> {actionLabel}
           </p>
-          {mode === 'retract' ? (
+          {forgetting ? (
+            <p className="mem-confirm__body">删除这次发言生成的记忆和关联情节。这一轮仍保留在聊天记录中，Ling 后续不会用它作为对话上下文。</p>
+          ) : mode === 'retract' ? (
             <>
               <p className="mem-confirm__body">撤回后不再参与召回，但不会删除。可在历史记录中查看。</p>
               <label className="mem-field">
@@ -1294,8 +1308,8 @@ function MemoryInspector({
           )}
           <InlineError error={error} resource="list" />
           <div className="mem-confirm__actions">
-            <button type="submit" className={`button button--small ${mode === 'retract' ? 'mem-action--danger' : 'button--primary'}`} disabled={!valid || pending}>
-              {pending ? '提交中…' : mode === 'retract' ? '确认撤回' : '确认纠正'}
+            <button type="submit" className={`button button--small ${mode === 'supersede' ? 'button--primary' : 'mem-action--danger'}`} disabled={!valid || pending}>
+              {pending ? '提交中…' : forgetting ? '确认遗忘' : mode === 'retract' ? '确认撤回' : '确认纠正'}
             </button>
             <button type="button" className="button button--small" disabled={pending} onClick={() => updateMode(null)}>取消</button>
           </div>
@@ -1305,7 +1319,8 @@ function MemoryInspector({
       <section className="mem-inspector__section" aria-label="来源与可见范围">
         <h4>来源与可见范围</h4>
         <dl className="mem-facts">
-          <div><dt>来源</dt><dd>{originLabel(row.origin)}</dd></div>
+          <div><dt>来源</dt><dd>{row.source_role === 'self_report' ? '本人自述' : row.source_role === 'user_correction' ? '本人纠正' : row.source_role === 'conversation' ? '对话记录' : originLabel(row.origin)}</dd></div>
+          {row.valid_from ? <div><dt>有效期自</dt><dd>{formatAbsoluteTime(row.valid_from)}</dd></div> : null}
           {row.import_source ? (
             <div className="mem-facts__wide" data-testid="mem-import-source">
               <dt>来自 AstrBot</dt>
@@ -2299,6 +2314,11 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
 
   const handlers: MemoryHandlers = useMemo(
     () => ({
+      async forgetSource(memoryId) {
+        await api.forgetMemorySource(memoryId);
+        setNotice({ tone: 'ok', text: '已遗忘该次发言生成的记忆。' });
+        await loadList();
+      },
       async retract(memoryId, reason) {
         await api.retractMemory(memoryId, reason);
         setNotice({

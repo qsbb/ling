@@ -85,7 +85,7 @@ _KINSHIP_MARKERS = ("我爸", "我妈", "我哥", "我姐", "我弟", "我妹", 
 _KINSHIP_SELF_SLOTS = ALLOWED_SLOTS - {"family", "important_date"}
 _QUOTED_TEXT = re.compile(r'「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"')
 _CORRECTION = re.compile(r"(?:刚才|上次|之前|前面)?(?:我)?说错了|更正一下|纠正一下")
-_CHANGE = re.compile(r"搬(?:了|家|到)|换(?:了|工作|到)|改(?:了|名|成)|现在(?:住|在|叫)|已经不")
+_CHANGE = re.compile(r"搬(?:了|家|到)|换(?:了|工作|到)|改(?:了|名|成)|现在(?:我)?(?:住|在|叫|搬)|已经不")
 _PAST = re.compile(r"^(?:我)?(?:以前|曾经|过去|原来)")
 FactOperation = Literal["assert", "change", "correct", "historical"]
 

@@ -149,6 +149,7 @@ class AwarenessService:
         source_visibility: str,
         ttl_days: int = DEFAULT_TTL_DAYS,
         policy_revision: int = 1,
+        source_event_ids: list[str] | None = None,
     ) -> str | None:
         """写入一条意识条目。
 
@@ -173,6 +174,7 @@ class AwarenessService:
             source_visibility=source_visibility,
             origin="user_statement",
             policy_revision=policy_revision,
+            source_event_ids=source_event_ids or [],
             created_at=utcnow(),
             expires_at=utcnow() + timedelta(days=max(1, ttl_days)),
         )
@@ -318,6 +320,7 @@ class AwarenessService:
         window_id: str,
         window_visibility: str,
         user_text: str,
+        turn_id: str | None = None,
     ) -> list[str]:
         """从一轮用户输入派生意识条目。
 
@@ -346,6 +349,7 @@ class AwarenessService:
                 source_window_id=window_id,
                 source_visibility=window_visibility,
                 policy_revision=policy.revision,
+                source_event_ids=[f"turn:{turn_id}"] if turn_id else [],
             )
             if item_id:
                 created.append(item_id)

@@ -76,7 +76,7 @@ def visible_to_model():
     三处各写一遍必然漂——而漂的后果是某一条路径把撤回的消息又捞回去，
     而且**只在特定入口**出现，最难查。
     """
-    return or_(
+    return Message.memory_hidden_at.is_(None) & or_(
         Message.retracted_at.is_(None),
         Message.retracted_after_seen.is_(True),
     )
@@ -864,7 +864,10 @@ class ConversationService:
             select(Message).where(Message.id == message_id, Message.window_id == window_id)
             .with_for_update()
         )
-        if row is None or row.retracted_at is not None or row.role != "user":
+        if (
+            row is None or row.retracted_at is not None
+            or row.memory_hidden_at is not None or row.role != "user"
+        ):
             raise not_found("原消息已删除或撤回")
         for key in ("text", "turn_id", "handled_as", "handled_reason", "attention_state", "sender_subject_id"):
             if key in kwargs:

@@ -96,6 +96,7 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
         Message.id == model.source_message_id,
         Message.window_id == window_id,
         Message.role == "user",
+        Message.memory_hidden_at.is_(None),
         Message.retracted_at.is_(None),
     ).exists()
     return or_(model.source_message_id.is_(None), active)
@@ -1156,6 +1157,7 @@ class MemoryService:
             Message.turn_id == turn.id,
             Message.state == TurnState.completed.value,
             Message.retracted_at.is_(None),
+            Message.memory_hidden_at.is_(None),
             Message.recalled_at.is_(None),
             Message.text != "",
             or_(*speakers),
