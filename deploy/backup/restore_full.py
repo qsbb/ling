@@ -356,7 +356,14 @@ def restore_snapshot(stack: Stack, snapshot: Path) -> dict[str, Any]:
         stage = Path(directory)
         manifest = unpack_snapshot(snapshot, stage)
         archived_app, postgres = read_archived_settings(stage)
-        docker("image", "load", "-i", str(stage / "images.tar"))
+        image_archive = stage / "images.tar"
+        try:
+            with tarfile.open(image_archive) as archive:
+                if not any(member.isfile() for member in archive.getmembers()):
+                    raise BackupError("备份镜像归档中没有文件")
+        except (EOFError, OSError, tarfile.TarError) as exc:
+            raise BackupError("备份镜像归档已损坏或不完整") from exc
+        docker("image", "load", "-i", str(image_archive))
         images = manifest["images"]
         tags = {service: image_tag(image) for service, image in images.items()}
         for service in SERVICES:

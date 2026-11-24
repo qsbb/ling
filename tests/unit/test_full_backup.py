@@ -1,6 +1,9 @@
 """Verify backup member integrity before the Docker runtime is involved."""
 
+import hashlib
 import json
+import tarfile
+from io import BytesIO
 from zipfile import ZipFile
 
 import pytest
@@ -71,6 +74,59 @@ def test_missing_env_checks_project_before_loading_archive(monkeypatch, tmp_path
 
     assert calls == [("ps", "-aq", "--filter", "label=com.docker.compose.project=fixture")]
     assert not stack.group.env_file.exists()
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_restore_checks_image_archive_before_loading(monkeypatch, tmp_path, truncated):
+    image_bytes = BytesIO()
+    with tarfile.open(fileobj=image_bytes, mode="w") as archive:
+        for name, data in (("manifest.json", b"[]"), ("layer.tar", b"fixture image layer")):
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, BytesIO(data))
+
+    images = image_bytes.getvalue()
+    if truncated:
+        with tarfile.open(fileobj=BytesIO(images)) as archive:
+            images = images[:archive.getmember("layer.tar").offset_data]
+
+    members = dict.fromkeys(FILES, b"fixture")
+    members["images.tar"] = images
+    members["settings.json"] = json.dumps({
+        "app": {},
+        "postgres": {"POSTGRES_PASSWORD": "fixture", "PGDATA": "/var/lib/postgresql/data/pgdata"},
+    }).encode()
+    manifest = {
+        "format": FORMAT,
+        "files": {name: hashlib.sha256(data).hexdigest() for name, data in members.items()},
+        "images": dict.fromkeys(("api", "db", "worker"), "sha256:" + "b" * 64),
+        "version": "1.2.3",
+        "commit": "fixture",
+        "migration": "0001",
+        "created_at": "2026-01-01T12:00:00Z",
+    }
+    bundle = tmp_path / "fixture.ling-backup"
+    with ZipFile(bundle, "w") as zip_archive:
+        zip_archive.writestr("manifest.json", json.dumps(manifest))
+        for name, data in members.items():
+            zip_archive.writestr(name, data)
+
+    env = tmp_path / ".env"
+    env.write_text("LING_PORT=6520\n")
+    stack = Stack(ComposeGroup("fixture", (), env))
+    calls = []
+
+    def docker(*args):
+        calls.append(args[:2])
+        raise BackupError("到达镜像加载")
+
+    monkeypatch.setattr(restore_full, "docker", docker)
+    message = "备份镜像归档已损坏或不完整" if truncated else "到达镜像加载"
+    with pytest.raises(BackupError, match=message):
+        restore_snapshot(stack, bundle)
+
+    assert calls == ([] if truncated else [("image", "load")])
+    assert env.read_text() == "LING_PORT=6520\n"
 
 
 @pytest.mark.parametrize(
