@@ -505,3 +505,179 @@
   background: var(--accent-soft);
   border-style: solid;
 }
+
+/* --------------------------------------------------------------- A 版布局
+ *
+ * 星图视图不再用「列表 + 右侧详情」的左右分栏，而是：
+ * 左月令环 / 右宽时间轴，详情全宽贴在下面。列表视图维持原来的双栏。
+ */
+
+@media (min-width: 761px) {
+  .mem-workspace.mem-workspace--stars {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mem-workspace--stars {
+    gap: 8px;
+  }
+  .mem-workspace--stars .mem-workspace__detail {
+    grid-column: 1;
+    position: static;
+  }
+}
+
+.mem-star-atlas {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  padding: 0 14px 6px;
+}
+
+.mem-star-rail {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 10px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--paper) 60%, var(--paper-raised));
+}
+
+.mem-star-rail .mem-wheel { width: 150px; max-width: 100%; margin: 0 auto; }
+.mem-star-rail .mem-wheel__svg { width: 146px; }
+.mem-star-rail__hint { margin: 0; color: var(--ink-faint); font-size: 9.5px; line-height: 1.5; }
+
+.mem-star-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-raised);
+}
+
+.mem-star-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  padding: 0 1px 1px;
+}
+.mem-star-title { color: var(--ink-soft); font-size: 11px; letter-spacing: .02em; }
+.mem-star-main .mem-star-viewport { max-height: 300px; }
+
+/* 底部详情：左正文 / 右显微镜，内部滚动，不再占右侧栏 */
+.mem-workspace--stars .mem-inspector {
+  display: grid;
+  grid-template-columns: minmax(0, 1.06fr) minmax(280px, .94fr);
+  grid-template-rows: auto auto 1fr;
+  column-gap: 22px;
+  max-height: 300px;
+  padding: 13px 18px 10px;
+  overflow: auto;
+}
+.mem-workspace--stars .mem-inspector__head { grid-column: 1 / -1; }
+.mem-workspace--stars .mem-inspector__story {
+  grid-column: 1;
+  padding: 9px 0 8px;
+}
+.mem-workspace--stars .mem-inspector__text {
+  margin: 7px 0 9px;
+  font-size: clamp(16px, 1.45vw, 19px);
+  line-height: 1.6;
+}
+.mem-workspace--stars .mem-inspector__actions { gap: 6px; }
+.mem-workspace--stars .mem-inspector__section,
+.mem-workspace--stars .mem-confirm,
+.mem-workspace--stars .mem-inspector__technical { grid-column: 1; }
+.mem-workspace--stars .mem-inspector__section { padding: 9px 0 5px; }
+.mem-workspace--stars .mem-micro {
+  grid-column: 2;
+  grid-row: 2 / span 3;
+  min-width: 0;
+  max-height: 286px;
+  overflow: auto;
+  border-top: 0;
+  border-left: 1px solid var(--line);
+  padding: 8px 0 6px 18px;
+}
+.mem-workspace--stars .mem-micro__links { padding-top: 7px; }
+.mem-workspace--stars .mem-inspector--empty {
+  display: flex;
+  min-height: 120px;
+  align-items: center;
+  justify-content: center;
+}
+
+@media (max-width: 760px) {
+  .mem-star-atlas {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 9px;
+    padding: 0 10px 10px;
+  }
+  .mem-star-rail {
+    display: grid;
+    grid-template-columns: 102px minmax(0, 1fr);
+    gap: 2px 8px;
+    align-items: center;
+    padding: 5px 7px;
+  }
+  .mem-star-rail__hint { grid-column: 2; align-self: center; }
+  .mem-star-rail .mem-wheel { grid-column: 1; grid-row: 1; width: 94px; margin: 0; }
+  .mem-star-rail .mem-wheel__svg { width: 90px; }
+  .mem-star-rail .mem-wheel__head { display: none; }
+  .mem-star-rail .mem-wheel__caption { margin-top: 1px; }
+  .mem-star-main { padding: 8px; }
+  .mem-star-title { font-size: 10.5px; }
+  .mem-star-main .mem-star-viewport { max-height: max(340px, 58vh); }
+  .mem-workspace--stars .mem-inspector {
+    display: block;
+    max-height: none;
+    padding: 13px 14px 16px;
+  }
+  .mem-workspace--stars .mem-micro {
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    padding: 9px 0 4px;
+  }
+}
+
+@media (max-width: 370px) {
+  .mem-star-rail { grid-template-columns: 92px minmax(0, 1fr); }
+  .mem-star-rail .mem-wheel { width: 86px; }
+  .mem-star-rail .mem-wheel__svg { width: 82px; }
+}
+
+@media (max-width: 760px) {
+  .mem-star-title { display: none; }
+  .mem-star-toolbar { padding-bottom: 2px; }
+}
+@media (max-width: 370px) {
+  .mem-star-rail__hint,
+  .mem-star-legend { display: none; }
+  .mem-star-rail { padding: 3px 6px; }
+  .mem-star-main { gap: 5px; }
+  .mem-star-toolbar { padding: 0; }
+}
+
+@media (max-width: 370px) {
+  /* 320 下 tabs 原本折成两行，把星图整体推下首屏；记忆页改为单行横向滚动。 */
+  .mem .mem-tabs.mem-tabs {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0;
+    min-height: 45px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .mem .mem-tabs::-webkit-scrollbar { display: none; }
+  .mem .mem-tab { flex: none; padding-inline: 10px; }
+  .mem-star-rail .mem-wheel__caption { display: none; }
+  .mem-star-rail { padding-bottom: 2px; }
+}

@@ -21,3 +21,14 @@ shared root /Users/lingxi/project/ling at baseline had unrelated untracked files
 ?? docs/context-research-20261122-round2/
 ?? docs/evidence/ling-context-attention-research-20261122/
 Those files were not touched. Development used the isolated worktree /tmp/ling-memory-star-map.
+
+A layout (2026-11-26):
+workspace: star view single column; rail left; timeline right; detail full width below
+desktop: detail title top < 1000px; detail width >= workspace width
+375: rail above timeline; wheel 94px; first card visible
+320: rail above timeline; wheel 86px; tabs single row and height > 30px
+frontend: 56 files, 1406 passed, 1 skipped
+typecheck: exit 0
+build: exit 0 (existing >500kB chunk warning)
+git diff --check: exit 0
+U+FFFD: none

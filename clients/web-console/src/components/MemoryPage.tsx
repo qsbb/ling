@@ -1742,23 +1742,29 @@ export function MemoryListSection({
               </div>
             ) : view === 'stars' && chartModel ? (
               <div className="mem-star-atlas">
-                <div className="mem-star-toolbar">
+                <aside className="mem-star-rail" aria-label="月令环">
                   <MonthWheel monthCounts={chartModel.monthCounts}
                     crossYearMonths={chartModel.crossYearMonths}
                     sameYearMonths={chartModel.sameYearMonths}
                     monthYears={chartModel.monthYears}
                     activeMonth={activeMonth} onSelectMonth={selectMonth} />
-                  <div className="mem-star-legend" aria-label="星图连线依据">
-                    <span className="mem-star-legend__correction">纠正链</span>
-                    <span className="mem-star-legend__source">同源事件</span>
-                    <span className="mem-star-legend__cross">跨年同月</span>
-                    <span className="mem-star-legend__same">同年同月</span>
+                  <p className="mem-star-rail__hint">同月只表示日期关系，不表示同一件事。</p>
+                </aside>
+                <div className="mem-star-main">
+                  <div className="mem-star-toolbar">
+                    <span className="mem-star-title">发生时间 · 2024—2026</span>
+                    <div className="mem-star-legend" aria-label="星图连线依据">
+                      <span className="mem-star-legend__correction">纠正链</span>
+                      <span className="mem-star-legend__source">同源事件</span>
+                      <span className="mem-star-legend__cross">跨年同月</span>
+                      <span className="mem-star-legend__same">同年同月</span>
+                    </div>
                   </div>
-                </div>
-                <div className="mem-star-viewport" role="region" aria-label="记忆星图" tabIndex={0} ref={starViewport}>
-                  <MemoryStarMapCanvas model={chartModel} selectedId={selected?.memory_id ?? null}
-                    activeMonth={activeMonth} kindText={kindLabel} originText={originLabel} statusText={historyStatus}
-                    onSelectMemory={(id, nodeMonth, trigger) => { setMonth(nodeMonth); selectRow(id, trigger); }} />
+                  <div className="mem-star-viewport" role="region" aria-label="记忆星图" tabIndex={0} ref={starViewport}>
+                    <MemoryStarMapCanvas model={chartModel} selectedId={selected?.memory_id ?? null}
+                      activeMonth={activeMonth} kindText={kindLabel} originText={originLabel} statusText={historyStatus}
+                      onSelectMemory={(id, nodeMonth, trigger) => { setMonth(nodeMonth); selectRow(id, trigger); }} />
+                  </div>
                 </div>
               </div>
             ) : (

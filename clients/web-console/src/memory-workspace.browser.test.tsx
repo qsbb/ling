@@ -814,6 +814,19 @@ describe('记忆工作区：独立浏览器验收', () => {
     });
     const canvas = page.getByTestId('mem-star-canvas');
     await visible(canvas);
+    /* A 版结构：月令环在左、时间轴在右、详情全宽在下方，且首屏能看到详情标题。 */
+    const rail = page.locator('.mem-star-rail');
+    const main = page.locator('.mem-star-main');
+    const railBox = await rail.boundingBox();
+    const mainBox = await main.boundingBox();
+    expect(railBox && mainBox).toBeTruthy();
+    expect(railBox!.x + railBox!.width).toBeLessThanOrEqual(mainBox!.x + 1);
+    expect(Math.abs(railBox!.y - mainBox!.y)).toBeLessThanOrEqual(1);
+    const detailBox = await detail(page).boundingBox();
+    const workspaceBox = await page.locator('[data-testid="mem-list"]').boundingBox();
+    expect(detailBox!.y).toBeGreaterThanOrEqual(mainBox!.y + mainBox!.height - 1);
+    expect(detailBox!.width).toBeGreaterThanOrEqual(workspaceBox!.width - 1);
+    expect(await detailHeading(page).evaluate((node) => node.getBoundingClientRect().top)).toBeLessThan(1000);
     const card = (id: string) => canvas.locator(`[data-memory-id="${id}"]`);
     const x = async (id: string) => card(id).evaluate((element) => (element.parentElement as HTMLElement).offsetLeft);
 
@@ -921,6 +934,16 @@ describe('记忆工作区：独立浏览器验收', () => {
       const canvas = page.getByTestId('mem-star-canvas');
       await visible(canvas);
       await notWiderThanViewport(page, width);
+      const tabs = page.locator('.mem-tabs');
+      expect(await tabs.locator('.mem-tab').count()).toBe(5);
+      expect(await tabs.evaluate((node) => node.getBoundingClientRect().height)).toBeGreaterThan(30);
+      const rail = page.locator('.mem-star-rail');
+      const main = page.locator('.mem-star-main');
+      const railBox = await rail.boundingBox();
+      const mainBox = await main.boundingBox();
+      expect(railBox && mainBox).toBeTruthy();
+      expect(railBox!.y + railBox!.height).toBeLessThanOrEqual(mainBox!.y + 1);
+      expect(await rail.getByText('十二月令环', { exact: true }).count()).toBeLessThanOrEqual(1);
       const viewport = page.getByRole('region', { name: '记忆星图' });
       const scroll = await viewport.evaluate((element) => ({
         client: element.clientWidth,
