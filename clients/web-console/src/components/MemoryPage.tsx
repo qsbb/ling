@@ -29,6 +29,10 @@ import type {
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { MemoryImportPanel } from './MemoryImport';
+import {
+  buildStarChartModel, connectedStarEntries, MemoryMicroscopeBeats, MemoryStarMapCanvas, MonthWheel,
+  STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
+} from './MemoryStarMap';
 import { SleepReviewSection } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
@@ -1109,6 +1113,8 @@ export interface MemoryListSectionProps {
   importPanelOpen?: boolean;
   onToggleImport?: () => void;
   onCloseImport?: () => void;
+  /** 进入页面时的视图；产品默认星图，测试或嵌入场景可以指定列表。 */
+  defaultView?: 'stars' | 'list';
 }
 
 /** 来源筛选的显示文案。`null` 是"不筛"，不是某一类来源。 */
@@ -1164,6 +1170,8 @@ export function searchLoadedMemories(rows: MemoryRecord[], query: string): Memor
 function MemoryInspector({
   row,
   loaded,
+  chartModel,
+  backLabel,
   headingRef,
   onBack,
   onSelect,
@@ -1172,6 +1180,8 @@ function MemoryInspector({
 }: {
   row: MemoryRecord;
   loaded: MemoryRecord[];
+  chartModel: StarChartModel | null;
+  backLabel: string;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onBack: () => void;
   onSelect: (id: string) => void;
@@ -1185,6 +1195,8 @@ function MemoryInspector({
   const [error, setError] = useState<ExplainedError | null>(null);
   const status = historyStatus(row);
   const relative = formatRelativeTime(row.created_at);
+  const star = chartModel?.nodeMap[row.memory_id];
+  const occurredAt = row.import_source?.occurred_at ?? null;
   const formRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -1230,7 +1242,7 @@ function MemoryInspector({
   return (
     <article className="mem-inspector" aria-labelledby="mem-detail-title" data-testid="mem-inspector">
       <button type="button" className="ghost-button mem-inspector__back" disabled={pending} onClick={onBack}>
-        <ArrowLeftIcon size={15} /> 回到列表
+        <ArrowLeftIcon size={15} /> {backLabel}
       </button>
       <header className="mem-inspector__head">
         <h3 id="mem-detail-title" ref={headingRef} tabIndex={-1}>记忆详情</h3>
@@ -1258,6 +1270,11 @@ function MemoryInspector({
           </div>
         ) : null}
       </div>
+
+      {star ? (
+        <MemoryMicroscopeBeats row={row} beats={star.beats}
+          connectedEntries={connectedStarEntries(chartModel, row.memory_id)} onSelectMemory={onSelect} />
+      ) : null}
 
       {mode && !status ? (
         <form
@@ -1316,6 +1333,14 @@ function MemoryInspector({
             </div>
           ) : null}
           <div><dt>可见范围</dt><dd>{visibilityLabel(row.visibility)}</dd></div>
+          {row.import_source ? (
+            <div>
+              <dt>发生时间</dt>
+              <dd>{occurredAt
+                ? <time dateTime={occurredAt}>{formatAbsoluteTime(occurredAt)}</time>
+                : <span>未记录<small> · 原记录没有发生时间</small></span>}</dd>
+            </div>
+          ) : null}
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
@@ -1381,13 +1406,16 @@ export function MemoryListSection({
   onFiltersChange, handlers, onReload, source, onSourceChange = () => {},
   search = '', onSearchChange = () => {},
   onLoadMore = () => {}, loadingMore = false, importPanelOpen = false,
-  onToggleImport = () => {}, onCloseImport = () => {},
+  onToggleImport = () => {}, onCloseImport = () => {}, defaultView = 'stars',
 }: MemoryListSectionProps): React.ReactElement {
   const [scope, setScope] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [view, setView] = useState<'stars' | 'list'>(defaultView);
+  const [month, setMonth] = useState<number | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const starViewport = useRef<HTMLDivElement>(null);
   const rowElement = useRef<HTMLButtonElement | null>(null);
   const restoreFocus = useRef(false);
   /*
@@ -1406,7 +1434,7 @@ export function MemoryListSection({
     return () => input.removeEventListener('search', sync);
   }, []);
   const data = state.status === 'ok' ? state.data : null;
-  const fetched = data?.memories ?? [];
+  const fetched = useMemo(() => data?.memories ?? [], [data]);
   const trimmedSearch = search.trim();
   /*
     服务端已经按 `q` 查过（含第一页之外的旧条目），所以这里**不再**对正文做
@@ -1414,10 +1442,23 @@ export function MemoryListSection({
     又筛掉一批，出现「服务端说命中 3 条、列表只剩 1 条」。本地只做属于视图的
     收窄：类型、时间、可见范围。
   */
-  const filtered = sortByCreatedDesc(
+  const filtered = useMemo(() => sortByCreatedDesc(
     filterMemories(fetched, filters).filter((row) => !scope || row.visibility === scope),
-  );
-  const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : filtered[0];
+  ), [fetched, filters, scope]);
+  /*
+    星图模型与详情里的微观分镜共用同一份投影。列表视图也保留它：从列表点开
+    一条记忆时，来源、时间、纠正链和同源事件仍然要能读。
+  */
+  const chartModel = useMemo(() => filtered.length
+    ? buildStarChartModel(filtered, kindLabel, originLabel, visibilityLabel)
+    : null, [filtered]);
+  const activeMonth = month !== null && chartModel?.monthCounts[month] ? month : null;
+  /*
+    列表沿用「默认读第一条」；星图默认预览时间最早的一条，并把它滚进视野。
+    这不是把 selectedId 设上——窄屏只有用户主动点卡片时才进入阅读态。
+  */
+  const defaultRow = view === 'stars' ? (chartModel?.nodes[0]?.row ?? filtered[0]) : filtered[0];
+  const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : defaultRow;
   const mobileInspectorOpen = Boolean(selectedId && selected);
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
   const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
@@ -1443,6 +1484,45 @@ export function MemoryListSection({
     setSelectedId(null);
   };
 
+  const revealStar = (node: StarNode) => {
+    const viewport = starViewport.current;
+    if (!viewport) return;
+    viewport.scrollTo({
+      left: Math.max(0, node.xPx + (STAR_CARD_W - viewport.clientWidth) / 2),
+      top: Math.max(0, node.yPx + (STAR_CARD_H - viewport.clientHeight) / 2),
+    });
+  };
+
+  const selectRow = (id: string, trigger: HTMLButtonElement) => {
+    rowElement.current = trigger;
+    if (selectedId === id) headingRef.current?.focus();
+    else setSelectedId(id);
+  };
+
+  const selectMonth = (next: number | null) => {
+    setMonth(next);
+    if (next === null) return;
+    const node = chartModel?.nodes.find((item) => item.month === next);
+    if (node) revealStar(node);
+  };
+
+  useEffect(() => {
+    if (view !== 'stars' || selectedId) return undefined;
+    const node = chartModel?.nodes[0];
+    if (!node) return undefined;
+    const frame = requestAnimationFrame(() => revealStar(node));
+    return () => cancelAnimationFrame(frame);
+  }, [view, chartModel, selectedId]);
+
+  const switchView = (next: 'stars' | 'list') => {
+    setView(next);
+    if (next !== 'stars' || !selectedId) return;
+    const node = chartModel?.nodeMap[selectedId];
+    if (!node) return;
+    // 等星图真正挂载后再滚到选中的卡片，否则 viewport 还是 null。
+    requestAnimationFrame(() => revealStar(node));
+  };
+
   const clearDiscovery = () => {
     onSearchChange('');
     setScope('');
@@ -1461,6 +1541,11 @@ export function MemoryListSection({
       setScope('');
       onFiltersChange(DEFAULT_FILTERS);
     }
+    const node = chartModel?.nodeMap[id];
+    if (node) {
+      setMonth(node.month);
+      revealStar(node);
+    }
     setSelectedId(id);
   };
 
@@ -1470,7 +1555,7 @@ export function MemoryListSection({
        窄屏下详情栏平时不显示；导入面板也挂在这一栏，所以只要面板开着就进
        「阅读态」——否则手机上点得到入口、却看不到面板。
       */
-      className={`mem-workspace${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
+      className={`mem-workspace${view === 'stars' ? ' mem-workspace--stars' : ''}${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
       aria-label="长期记忆库"
       data-testid="mem-list"
     >
@@ -1478,6 +1563,10 @@ export function MemoryListSection({
         <header className="mem-index__head">
           <h2>长期记忆</h2>
           <div className="mem-index__head-actions">
+            <div className="mem-view-switch" role="group" aria-label="记忆视图">
+              <button type="button" aria-pressed={view === 'stars'} onClick={() => switchView('stars')}>星图</button>
+              <button type="button" aria-pressed={view === 'list'} onClick={() => switchView('list')}>列表</button>
+            </div>
             <button
               type="button"
               className="button button--small"
@@ -1592,8 +1681,11 @@ export function MemoryListSection({
                 {narrowedByView ? (
                   <> · 当前筛选 {filtered.length} 条</>
                 ) : null}
+                {view === 'stars' && chartModel?.unknownDateCount
+                  ? <> · {chartModel.unknownDateCount} 条发生日期未知</>
+                  : null}
               </span>
-              <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
+              <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'}{view === 'list' ? ' · 按记下时间' : ' · 按发生 / 记下时间'}</span>
             </div>
             {data.has_more ? (
               <p className="mem-index__boundary" data-testid="mem-limit-notice">
@@ -1648,6 +1740,27 @@ export function MemoryListSection({
                 <p>试试放宽类型、时间或可见范围。</p>
                 <button type="button" className="mem-text-button" onClick={clearDiscovery}>清除搜索和筛选</button>
               </div>
+            ) : view === 'stars' && chartModel ? (
+              <div className="mem-star-atlas">
+                <div className="mem-star-toolbar">
+                  <MonthWheel monthCounts={chartModel.monthCounts}
+                    crossYearMonths={chartModel.crossYearMonths}
+                    sameYearMonths={chartModel.sameYearMonths}
+                    monthYears={chartModel.monthYears}
+                    activeMonth={activeMonth} onSelectMonth={selectMonth} />
+                  <div className="mem-star-legend" aria-label="星图连线依据">
+                    <span className="mem-star-legend__correction">纠正链</span>
+                    <span className="mem-star-legend__source">同源事件</span>
+                    <span className="mem-star-legend__cross">跨年同月</span>
+                    <span className="mem-star-legend__same">同年同月</span>
+                  </div>
+                </div>
+                <div className="mem-star-viewport" role="region" aria-label="记忆星图" tabIndex={0} ref={starViewport}>
+                  <MemoryStarMapCanvas model={chartModel} selectedId={selected?.memory_id ?? null}
+                    activeMonth={activeMonth} kindText={kindLabel} originText={originLabel} statusText={historyStatus}
+                    onSelectMemory={(id, nodeMonth, trigger) => { setMonth(nodeMonth); selectRow(id, trigger); }} />
+                </div>
+              </div>
             ) : (
               <ul className="mem-index__rows" aria-label="记忆列表" data-testid="mem-results">
                 {filtered.map((row) => {
@@ -1655,11 +1768,7 @@ export function MemoryListSection({
                   return (
                     <li key={row.memory_id}>
                       <button type="button" className="mem-record" aria-current={selected?.memory_id === row.memory_id ? 'true' : undefined}
-                        onClick={(event) => {
-                          rowElement.current = event.currentTarget;
-                          if (selectedId === row.memory_id) headingRef.current?.focus();
-                          else setSelectedId(row.memory_id);
-                        }}>
+                        onClick={(event) => selectRow(row.memory_id, event.currentTarget)}>
                         <span className="mem-record__top"><span>{kindLabel(row.kind)}</span>
                           <time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time></span>
                         <span className="mem-record__preview">{row.text}</span>
@@ -1680,13 +1789,14 @@ export function MemoryListSection({
 
       <div className="mem-workspace__detail">
         {selected && !importPanelOpen ? (
-          <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched}
+          <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} chartModel={chartModel}
+            backLabel={view === 'stars' ? '回到星图' : '回到列表'}
             headingRef={headingRef} handlers={handlers} onBack={goBack}
             onSelect={selectedFromHistory} onChanged={goBack} />
         ) : data && !importPanelOpen ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
-            <strong>在列表中选择一条记忆</strong>
+            <strong>选择一条记忆</strong>
             <p>查看完整内容、来源和可见范围。</p>
           </div>
         ) : null}
