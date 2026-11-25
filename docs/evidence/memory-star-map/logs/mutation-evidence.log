@@ -1,0 +1,55 @@
+$ vitest run src/memory-workspace.browser.test.tsx -t '星图：连续时间轴'
+
+ RUN  v3.2.7 /private/tmp/ling-memory-star-map-mut/clients/web-console
+
+stderr | src/memory-workspace.browser.test.tsx > 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-memory-workspace-vite-ddkh5v/deps/react-dom_client.js?v=497fd3f1 as it exceeds the max of 500KB.
+
+ ❯ src/memory-workspace.browser.test.tsx (17 tests | 1 failed | 16 skipped) 1069ms
+   ↓ 记忆工作区：独立浏览器验收 > 搜索走服务端：能找到第一页之外的旧条目，计数与翻页如实反映命中量
+   ↓ 记忆工作区：独立浏览器验收 > 命中数超过一页时能继续往后翻，翻页沿用同一搜索结果
+   ↓ 记忆工作区：独立浏览器验收 > 快速改查询时，先发那条的慢响应不能覆盖后发的结果
+   ↓ 记忆工作区：独立浏览器验收 > 原生清除按钮清空输入后，列表同步回到普通列表（不是只在 DOM 里清掉）
+   ↓ 记忆工作区：独立浏览器验收 > 反证：服务端不认 q 时，第一页之外的那条搜不到
+   ↓ 记忆工作区：独立浏览器验收 > 四个分区是可导航的独立目的地，核心只在进入该分区后读取
+   ↓ 记忆工作区：独立浏览器验收 > 学习设置发布每轮带入的旧记忆条数并回显零值
+   ↓ 记忆工作区：独立浏览器验收 > 纠正：打开和取消不写入，确认后只提交目标记录
+   ↓ 记忆工作区：独立浏览器验收 > 撤回：打开和取消不写入，确认后只提交目标记录
+   ↓ 记忆工作区：独立浏览器验收 > 桌面用键盘从搜索进入搜索结果并打开匹配记忆
+   ↓ 记忆工作区：独立浏览器验收 > 375 CSS px 触屏能打开详情并回到仍然可用的列表
+   ↓ 记忆工作区：独立浏览器验收 > 切换历史筛选时，晚到只含撤回记录的响应不能覆盖已经显示的归档结果
+   ↓ 记忆工作区：独立浏览器验收 > 记忆库读取失败有提示，不阻塞其他分区
+   ↓ 记忆工作区：独立浏览器验收 > 核心记忆读取失败有提示，不阻塞其他分区
+   ↓ 记忆工作区：独立浏览器验收 > 学习设置读取失败有提示，不阻塞其他分区
+   × 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情 965ms
+     → expected +0 to be 1 // Object.is equality
+   ↓ 记忆工作区：独立浏览器验收 > 星图 375 / 320：画布内部平移、详情可读、返回把焦点还给卡片
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/memory-workspace.browser.test.tsx > 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情
+AssertionError: expected +0 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ src/memory-workspace.browser.test.tsx:826:70
+    824| 
+    825|     // ② 依据各自成线：共享具体事件与纠正链各一条；同地点/同旧会话不连线。
+    826|     expect(await canvas.locator('path[data-kind="source"]').count()).t…
+       |                                                                      ^
+    827|     expect(await canvas.locator('path[data-kind="correction"]').count(…
+    828|     expect(await canvas.locator('path[data-kind="source"][data-from="s…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 16 skipped (17)
+   Start at  13:40:25
+   Duration  1.36s (transform 26ms, setup 0ms, collect 149ms, tests 1.07s, environment 0ms, prepare 28ms)
+
+[ELIFECYCLE] Test failed. See above for more details.

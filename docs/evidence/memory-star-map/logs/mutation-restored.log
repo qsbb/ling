@@ -1,0 +1,32 @@
+--- mutation 1 restore ---
+$ vitest run src/memory-workspace.browser.test.tsx -t '星图：连续时间轴'
+
+ RUN  v3.2.7 /private/tmp/ling-memory-star-map-mut/clients/web-console
+
+stderr | src/memory-workspace.browser.test.tsx > 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-memory-workspace-vite-Fqp1oV/deps/react-dom_client.js?v=f5f9ac61 as it exceeds the max of 500KB.
+
+ ✓ src/memory-workspace.browser.test.tsx (17 tests | 16 skipped) 2083ms
+   ✓ 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情  1981ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 16 skipped (17)
+   Start at  13:40:02
+   Duration  2.38s (transform 23ms, setup 0ms, collect 148ms, tests 2.08s, environment 0ms, prepare 34ms)
+
+--- mutation 2 restore ---
+$ vitest run src/memory-workspace.browser.test.tsx -t '星图：连续时间轴'
+
+ RUN  v3.2.7 /private/tmp/ling-memory-star-map-mut/clients/web-console
+
+stderr | src/memory-workspace.browser.test.tsx > 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情
+[BABEL] Note: The code generator has deoptimised the styling of /var/folders/21/f7x9vt9d3_377d_4pxvqmdbr0000gn/T/ling-memory-workspace-vite-Y1AIDB/deps/react-dom_client.js?v=1e2c8d64 as it exceeds the max of 500KB.
+
+ ✓ src/memory-workspace.browser.test.tsx (17 tests | 16 skipped) 1992ms
+   ✓ 记忆工作区：独立浏览器验收 > 星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情  1895ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 16 skipped (17)
+   Start at  13:40:47
+   Duration  2.28s (transform 24ms, setup 0ms, collect 149ms, tests 1.99s, environment 0ms, prepare 31ms)
+

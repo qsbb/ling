@@ -1,0 +1,21 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.15, pytest-8.4.2, pluggy-1.7.0
+rootdir: /private/tmp/ling-memory-star-map
+configfile: pyproject.toml
+plugins: xdist-3.8.0, asyncio-0.26.0, anyio-4.16.0
+asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 195 items
+
+tests/unit/test_memory_extract.py ...................................    [ 17%]
+tests/unit/test_memory_providers.py .................                    [ 26%]
+tests/unit/test_memory_purge.py .............                            [ 33%]
+tests/unit/test_memory_purge_gaps.py ..........                          [ 38%]
+tests/unit/test_memory_purge_no_chat_path.py ....                        [ 40%]
+tests/unit/test_memory_retention_policy.py .......                       [ 44%]
+tests/integration/test_memory_api_contract.py .......................... [ 57%]
+.......................................................                  [ 85%]
+tests/integration/test_memory_pipeline.py .......                        [ 89%]
+tests/integration/test_memory_purge_flow.py ..............               [ 96%]
+tests/integration/test_memory_purge_races.py .......                     [100%]
+
+============================= 195 passed in 51.74s =============================

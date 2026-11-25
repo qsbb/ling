@@ -1,0 +1,23 @@
+baseline origin/main e0449c18ded699102cd610262ad3e849f4a48fc4
+baseline key file sha256 (origin/main)
+1bcca26e1bf22459d62e3660e35d661dd78afad8958d97fd1715798a1ed01f4f  clients/web-console/src/components/MemoryPage.tsx
+9c47eee8aa35790ab60f7de9f52567edf1676f88446824d4038ded19febef8b2  clients/web-console/src/memory.css
+1ed75ca7a80c2faceb1e8dff6e62472cddbf86468fb9a5179bd41196db7f08ba  clients/web-console/src/types.ts
+0d76cf8f02099ee4c2917f292080a1f66770321156765d1c8355ac61db86c022  clients/web-console/src/api.ts
+296d74d2d37e98eb5fd5b5b23b32672560d86a89c6de00750533806503fa44e8  clients/web-console/package.json
+
+baseline frontend: 56 files, 1397 passed, 1 skipped
+final frontend:    56 files, 1406 passed, 1 skipped
+final typecheck:   exit 0
+final build:       exit 0 (only existing >500 kB chunk warning)
+pytest:            195 passed in 51.74s (isolated PostgreSQL ling_test, lock held)
+git diff --check:  exit 0, no output
+U+FFFD scan:       no matches in clients/web-console/src or docs/evidence/memory-star-map
+frontend lint:     repository has no lint script and no ESLint dependency; typecheck/build used instead
+
+shared root /Users/lingxi/project/ling at baseline had unrelated untracked files:
+?? cj.txt
+?? docs/context-research-20261122-lead-94040/
+?? docs/context-research-20261122-round2/
+?? docs/evidence/ling-context-attention-research-20261122/
+Those files were not touched. Development used the isolated worktree /tmp/ling-memory-star-map.

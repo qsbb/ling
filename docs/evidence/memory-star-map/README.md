@@ -28,12 +28,12 @@
 
 | 检查 | 结果 | 日志 |
 | --- | --- | --- |
-| 前端全量 `pnpm test` | 56 files，1406 passed / 1 skipped | `/tmp/ling-star-logs/final-vitest-2.log` |
-| 类型检查 `pnpm typecheck` | 通过 | `/tmp/ling-star-logs/final-typecheck.log` |
-| 生产构建 `pnpm build` | 通过（仅有既有 chunk >500kB 警告） | `/tmp/ling-star-logs/final-build-2.log` |
-| 相关 pytest（持锁，PostgreSQL `ling_test`） | 195 passed | `/tmp/ling-star-logs/pytest-memory.log` |
-| `git diff --check` | 无输出 | 本次运行 |
-| U+FFFD 检查 | 无命中 | 本次运行 |
+| 前端全量 `pnpm test` | 56 files，1406 passed / 1 skipped | [`logs/final-vitest.log`](logs/final-vitest.log) |
+| 类型检查 `pnpm typecheck` | 通过 | [`logs/final-typecheck.log`](logs/final-typecheck.log) |
+| 生产构建 `pnpm build` | 通过（仅有既有 chunk >500kB 警告） | [`logs/final-build.log`](logs/final-build.log) |
+| 相关 pytest（持锁，PostgreSQL `ling_test`） | 195 passed | [`logs/pytest-memory.log`](logs/pytest-memory.log) |
+| `git diff --check` | 无输出 | [`logs/checks.txt`](logs/checks.txt) |
+| U+FFFD 检查 | 无命中 | [`logs/checks.txt`](logs/checks.txt) |
 
 仓库没有配置前端 lint 脚本或 ESLint 依赖，本次没有用未安装的工具冒充 lint；类型检查与构建是前端可执行的静态检查。
 
@@ -47,10 +47,10 @@
 
 在独立副本 `/tmp/ling-memory-star-map-mut` 做两次变异，每次都跑同一条浏览器用例：
 
-1. 把星图分支条件改成 `view === 'stars' && chartModel && false`，断开正式接线 → 用例在等待 `mem-star-canvas` 时失败（`/tmp/ling-star-logs/mut1-wiring.log`）。
-2. 删掉同源事件 `pushEdge`，去掉关键依据检查 → 用例在 `path[data-kind="source"]` 计数处失败，期望 1、实际 0（`/tmp/ling-star-logs/mut2-evidence.log`）。
+1. 把星图分支条件改成 `view === 'stars' && chartModel && false`，断开正式接线 → 用例在等待 `mem-star-canvas` 时失败（[`logs/mutation-wiring.log`](logs/mutation-wiring.log)）。
+2. 删掉同源事件 `pushEdge`，去掉关键依据检查 → 用例在 `path[data-kind="source"]` 计数处失败，期望 1、实际 0（[`logs/mutation-evidence.log`](logs/mutation-evidence.log)）。
 
-两次都从原件恢复，`shasum -a 256` 与工作区一致，再跑同一用例通过（`mut1-restored.log`、`mut2-restored.log`）。原始工作区没有用于变异。
+两次都从原件恢复，`shasum -a 256` 与工作区一致，再跑同一用例通过（[`logs/mutation-restored.log`](logs/mutation-restored.log)）。原始工作区没有用于变异。
 
 ## 未覆盖
 
