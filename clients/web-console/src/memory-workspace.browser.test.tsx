@@ -16,6 +16,7 @@ import react from '@vitejs/plugin-react';
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import type { MemoryRecord } from './types';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const WAIT = 8_000;
@@ -105,6 +106,7 @@ const error = (code: string, message: string, status: number) => json({
 interface MockOptions {
   start?: Tab;
   mobile?: boolean;
+  memories?: MemoryRecord[];
   largeBatch?: boolean;
   fail?: typeof LIST | typeof CORE | typeof CONFIG;
   /**
@@ -138,7 +140,7 @@ async function openWorkspace(options: MockOptions = {}) {
   let releaseSettled!: () => void;
   const settledDone = new Promise<void>(resolve => { releaseSettled = resolve; });
   const writes: { method: string; path: string; body: unknown }[] = [];
-  let rows = [FAVORITE, WALK, RETRACTED, ARCHIVED];
+  let rows = options.memories ?? [FAVORITE, WALK, RETRACTED, ARCHIVED];
   if (options.largeBatch) {
     rows.push(...Array.from({ length: 202 }, (_, i) => memory(`mem_sample_${i}`, `批次样本 ${i + 1}`)), OUTSIDE_BATCH);
   }
@@ -622,13 +624,72 @@ describe('记忆工作区：独立浏览器验收', () => {
     await visible(detailHeading(page));
     await visible(detail(page).getByText(FAVORITE.text, { exact: true }).filter({ visible: true }).first());
     await notWiderThanMobileViewport(page);
-    const back = page.getByRole('button', { name: '回到列表', exact: true });
+    const back = page.getByRole('button', { name: '回到星图', exact: true });
     await back.tap();
     await hidden(back);
     await visible(row(page, WALK));
     await row(page, WALK).tap();
     await visible(detail(page).getByText(WALK.text, { exact: true }).filter({ visible: true }).first());
     await notWiderThanMobileViewport(page);
+  }, CASE_TIMEOUT);
+
+  it('从记忆库响应绘制星图，月份弧线和证据连线独立，详情沿原有入口跳转', async () => {
+    const first: MemoryRecord = {
+      ...memory('star_first', '在河畔展馆领取画册'), kind: 'episode',
+      created_at: '2025-05-10T12:00:00Z', source_event_ids: ['evt_drawings'],
+    };
+    const continuation: MemoryRecord = {
+      ...memory('star_next', '同一回领取了展览明信片'), kind: 'episode',
+      created_at: '2026-06-10T12:00:00Z', source_event_ids: ['evt_drawings'],
+    };
+    const independent: MemoryRecord = {
+      ...memory('star_other', '河畔展馆五月调整开放时间'), created_at: '2026-05-10T12:00:00Z',
+    };
+    const { page, reads } = await openWorkspace({ memories: [continuation, independent, first] });
+    const canvas = page.getByTestId('mem-star-canvas');
+    await visible(canvas);
+    const x = async (item: MemoryRecord) => row(page, item).evaluate(button => button.parentElement!.offsetLeft);
+    expect(await x(independent) - await x(first)).toBeGreaterThan(4 * (await x(continuation) - await x(independent)));
+    expect(await canvas.locator('path[data-reason]').count()).toBe(1);
+    await page.getByTestId('mem-month-wheel').getByRole('button', { name: /5月（2 条/ }).click();
+    expect(await canvas.locator('[data-month="5"].mem-star-arc--lunar-active').count()).toBe(1);
+    const lunarLabel = canvas.getByText(/5月跨年共振/);
+    await visible(lunarLabel);
+    expect(await lunarLabel.evaluate((label) => {
+      const a = label.getBoundingClientRect();
+      return Array.from(label.closest('.mem-star-canvas')!.querySelectorAll('.mem-star-node')).every((node) => {
+        const b = node.getBoundingClientRect();
+        return a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top;
+      });
+    })).toBe(true);
+    expect(await row(page, continuation).getAttribute('class')).not.toContain('mem-star-node--month');
+    await row(page, first).click();
+    const microscope = detail(page).getByTestId('mem-microscope');
+    await visible(microscope);
+    const open = microscope.getByRole('button', { name: /全景分镜/ });
+    await open.click();
+    const theater = page.getByRole('dialog', { name: '记忆全景分镜' });
+    expect(await theater.innerText()).toContain(first.text);
+    expect(await theater.innerText()).toContain('evt_drawings');
+    await page.keyboard.press('Escape');
+    await hidden(theater);
+    expect(await open.evaluate(button => document.activeElement === button)).toBe(true);
+    await microscope.getByRole('button', { name: /同源事件.*明信片/ }).click();
+    await visible(detail(page).getByText(continuation.text, { exact: true }).filter({ visible: true }).first());
+    await page.getByRole('button', { name: '列表', exact: true }).click();
+    await hidden(canvas);
+    await visible(row(page, first));
+    const listed = await results(page).getByRole('button').allTextContents();
+    expect(listed).toEqual([
+      expect.stringContaining(continuation.text), expect.stringContaining(independent.text), expect.stringContaining(first.text),
+    ]);
+    await search(page).fill('明信片');
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('q'), { timeout: WAIT }).toBe('明信片');
+    await hidden(row(page, first));
+    await page.getByRole('button', { name: '星图', exact: true }).click();
+    await visible(canvas);
+    await visible(row(page, continuation));
+    await hidden(row(page, independent));
   }, CASE_TIMEOUT);
 
   it('切换历史筛选时，晚到只含撤回记录的响应不能覆盖已经显示的归档结果', async () => {

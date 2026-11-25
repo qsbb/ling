@@ -29,6 +29,10 @@ import type {
 } from '../types';
 import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { MemoryImportPanel } from './MemoryImport';
+import {
+  buildStarChartModel, connectedStarEntries, MemoryMicroscopeBeats, MemoryStarMapCanvas, MonthWheel,
+  STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
+} from './MemoryStarMap';
 import { SleepReviewSection } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
@@ -1166,6 +1170,8 @@ export function searchLoadedMemories(rows: MemoryRecord[], query: string): Memor
 function MemoryInspector({
   row,
   loaded,
+  starModel,
+  backLabel,
   headingRef,
   onBack,
   onSelect,
@@ -1174,6 +1180,8 @@ function MemoryInspector({
 }: {
   row: MemoryRecord;
   loaded: MemoryRecord[];
+  starModel: StarChartModel | null;
+  backLabel: string;
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onBack: () => void;
   onSelect: (id: string) => void;
@@ -1188,6 +1196,7 @@ function MemoryInspector({
   const [source, setSource] = useState<{ text: string; created_at: string } | null>(null);
   const [sourceError, setSourceError] = useState<ExplainedError | null>(null);
   const [sourcePending, setSourcePending] = useState(false);
+  const star = starModel?.nodeMap[row.memory_id];
 
   const toggleSource = async () => {
     if (source) {
@@ -1255,7 +1264,7 @@ function MemoryInspector({
   return (
     <article className="mem-inspector" aria-labelledby="mem-detail-title" data-testid="mem-inspector">
       <button type="button" className="ghost-button mem-inspector__back" disabled={pending} onClick={onBack}>
-        <ArrowLeftIcon size={15} /> 回到列表
+        <ArrowLeftIcon size={15} /> {backLabel}
       </button>
       <header className="mem-inspector__head">
         <h3 id="mem-detail-title" ref={headingRef} tabIndex={-1}>记忆详情</h3>
@@ -1334,6 +1343,11 @@ function MemoryInspector({
             <button type="button" className="button button--small" disabled={pending} onClick={() => updateMode(null)}>取消</button>
           </div>
         </form>
+      ) : null}
+
+      {starModel && star ? (
+        <MemoryMicroscopeBeats row={row} beats={star.beats}
+          connectedEntries={connectedStarEntries(starModel, row.memory_id)} onSelectMemory={onSelect} />
       ) : null}
 
       <section className="mem-inspector__section" aria-label="来源与可见范围">
@@ -1436,8 +1450,11 @@ export function MemoryListSection({
   const [scope, setScope] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [view, setView] = useState<'stars' | 'list'>('stars');
+  const [month, setMonth] = useState<number | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const starViewport = useRef<HTMLDivElement>(null);
   const rowElement = useRef<HTMLButtonElement | null>(null);
   const restoreFocus = useRef(false);
   /*
@@ -1456,7 +1473,7 @@ export function MemoryListSection({
     return () => input.removeEventListener('search', sync);
   }, []);
   const data = state.status === 'ok' ? state.data : null;
-  const fetched = data?.memories ?? [];
+  const fetched = useMemo(() => data?.memories ?? [], [data]);
   const trimmedSearch = search.trim();
   /*
     服务端已经按 `q` 查过（含第一页之外的旧条目），所以这里**不再**对正文做
@@ -1464,9 +1481,13 @@ export function MemoryListSection({
     又筛掉一批，出现「服务端说命中 3 条、列表只剩 1 条」。本地只做属于视图的
     收窄：类型、时间、可见范围。
   */
-  const filtered = sortByCreatedDesc(
+  const filtered = useMemo(() => sortByCreatedDesc(
     filterMemories(fetched, filters).filter((row) => !scope || row.visibility === scope),
-  );
+  ), [fetched, filters, scope]);
+  const starModel = useMemo(() => view === 'stars' && filtered.length
+    ? buildStarChartModel(filtered, kindLabel, originLabel, visibilityLabel)
+    : null, [filtered, view]);
+  const activeMonth = month !== null && starModel?.monthCounts[month] ? month : null;
   const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : filtered[0];
   const mobileInspectorOpen = Boolean(selectedId && selected);
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
@@ -1493,6 +1514,28 @@ export function MemoryListSection({
     setSelectedId(null);
   };
 
+  const selectRow = (id: string, trigger: HTMLButtonElement) => {
+    rowElement.current = trigger;
+    if (selectedId === id) headingRef.current?.focus();
+    else setSelectedId(id);
+  };
+
+  const revealStar = (node: StarNode) => {
+    const viewport = starViewport.current;
+    if (!viewport) return;
+    viewport.scrollTo({
+      left: node.xPx + (STAR_CARD_W - viewport.clientWidth) / 2,
+      top: node.yPx + (STAR_CARD_H - viewport.clientHeight) / 2,
+    });
+  };
+
+  const selectMonth = (next: number | null) => {
+    setMonth(next);
+    if (next === null) return;
+    const node = starModel?.nodes.find((item) => item.month === next);
+    if (node) revealStar(node);
+  };
+
   const clearDiscovery = () => {
     onSearchChange('');
     setScope('');
@@ -1511,6 +1554,11 @@ export function MemoryListSection({
       setScope('');
       onFiltersChange(DEFAULT_FILTERS);
     }
+    const node = starModel?.nodeMap[id];
+    if (node) {
+      setMonth(node.month);
+      revealStar(node);
+    }
     setSelectedId(id);
   };
 
@@ -1520,7 +1568,7 @@ export function MemoryListSection({
        窄屏下详情栏平时不显示；导入面板也挂在这一栏，所以只要面板开着就进
        「阅读态」——否则手机上点得到入口、却看不到面板。
       */
-      className={`mem-workspace${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
+      className={`mem-workspace${view === 'stars' ? ' mem-workspace--stars' : ''}${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
       aria-label="长期记忆库"
       data-testid="mem-list"
     >
@@ -1528,6 +1576,10 @@ export function MemoryListSection({
         <header className="mem-index__head">
           <h2>长期记忆</h2>
           <div className="mem-index__head-actions">
+            <div className="mem-view-switch" role="group" aria-label="记忆视图">
+              <button type="button" aria-pressed={view === 'stars'} onClick={() => setView('stars')}>星图</button>
+              <button type="button" aria-pressed={view === 'list'} onClick={() => setView('list')}>列表</button>
+            </div>
             <button
               type="button"
               className="button button--small"
@@ -1643,7 +1695,7 @@ export function MemoryListSection({
                   <> · 当前筛选 {filtered.length} 条</>
                 ) : null}
               </span>
-              <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'} · 按记下时间</span>
+              <span>{source ? sourceLabel(source) : include ? '包含历史' : '仅现行条目'}{view === 'list' ? ' · 按记下时间' : ''}</span>
             </div>
             {data.has_more ? (
               <p className="mem-index__boundary" data-testid="mem-limit-notice">
@@ -1698,6 +1750,22 @@ export function MemoryListSection({
                 <p>试试放宽类型、时间或可见范围。</p>
                 <button type="button" className="mem-text-button" onClick={clearDiscovery}>清除搜索和筛选</button>
               </div>
+            ) : starModel ? (
+              <div className="mem-star-atlas">
+                <div className="mem-star-toolbar">
+                  <MonthWheel monthCounts={starModel.monthCounts} recurringMonths={starModel.recurringMonths}
+                    activeMonth={activeMonth} onSelectMonth={selectMonth} />
+                  <div className="mem-star-legend" aria-label="星图连线">
+                    <span className="mem-star-legend__source">来源或纠正</span>
+                    <span className="mem-star-legend__month">同月共振</span>
+                  </div>
+                </div>
+                <div className="mem-star-viewport" role="region" aria-label="记忆星图" tabIndex={0} ref={starViewport}>
+                  <MemoryStarMapCanvas model={starModel} selectedId={selected?.memory_id ?? null}
+                    activeMonth={activeMonth} kindText={kindLabel} originText={originLabel} statusText={historyStatus}
+                    onSelectMemory={(id, nodeMonth, trigger) => { setMonth(nodeMonth); selectRow(id, trigger); }} />
+                </div>
+              </div>
             ) : (
               <ul className="mem-index__rows" aria-label="记忆列表" data-testid="mem-results">
                 {filtered.map((row) => {
@@ -1705,11 +1773,7 @@ export function MemoryListSection({
                   return (
                     <li key={row.memory_id}>
                       <button type="button" className="mem-record" aria-current={selected?.memory_id === row.memory_id ? 'true' : undefined}
-                        onClick={(event) => {
-                          rowElement.current = event.currentTarget;
-                          if (selectedId === row.memory_id) headingRef.current?.focus();
-                          else setSelectedId(row.memory_id);
-                        }}>
+                        onClick={(event) => selectRow(row.memory_id, event.currentTarget)}>
                         <span className="mem-record__top"><span>{kindLabel(row.kind)}</span>
                           <time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time></span>
                         <span className="mem-record__preview">{row.text}</span>
@@ -1730,13 +1794,14 @@ export function MemoryListSection({
 
       <div className="mem-workspace__detail">
         {selected && !importPanelOpen ? (
-          <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched}
+          <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} starModel={starModel}
+            backLabel={view === 'stars' ? '回到星图' : '回到列表'}
             headingRef={headingRef} handlers={handlers} onBack={goBack}
             onSelect={selectedFromHistory} onChanged={goBack} />
         ) : data && !importPanelOpen ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
-            <strong>在列表中选择一条记忆</strong>
+            <strong>选择一条记忆</strong>
             <p>查看完整内容、来源和可见范围。</p>
           </div>
         ) : null}

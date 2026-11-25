@@ -444,7 +444,7 @@ describe('导入旧记忆', () => {
       occurred_at: null, created_at: STAMP, updated_at: STAMP, valid_from: null, valid_to: null,
     })];
     const { page } = await open({ memories: rows });
-    await page.getByTestId('mem-results').locator('button.mem-record').first().click();
+    await page.getByTestId('mem-results').getByRole('button', { name: /不吃香菜/ }).click();
     await page.getByTestId('mem-import-source').waitFor();
     expect(await page.getByTestId('mem-import-source').innerText()).toContain('来自 AstrBot');
     const times = await page.getByTestId('mem-import-times').innerText();

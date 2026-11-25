@@ -748,15 +748,16 @@ describe('记忆列表行：时间 / 来源 / 置信度 / 墓碑标记', () => {
     expect(html).toContain('turn:1');
   });
 
-  it('同一时间轴按记下时间排列，不按类型重排', () => {
+  it('默认星图按时间从早到晚布置卡片并容纳未分类类型', () => {
     const rows = [
       { ...MEM_A, memory_id: 'p', kind: 'procedure', created_at: '2026-06-04T00:00:00Z', text: '先看日程再看记忆' },
       { ...MEM_A, memory_id: 'e', kind: 'episode', created_at: '2026-10-04T00:00:00Z', text: '昨天去了湖边' },
       { ...MEM_A, memory_id: 'x', kind: 'mystery', created_at: '2026-09-04T00:00:00Z', text: '神秘类型' },
     ];
     const html = renderList({ state: ok(listResponse(rows)) });
-    expect(html.indexOf('昨天去了湖边')).toBeLessThan(html.indexOf('神秘类型'));
-    expect(html.indexOf('神秘类型')).toBeLessThan(html.indexOf('先看日程再看记忆'));
+    expect(html).toContain('data-testid="mem-star-canvas"');
+    expect(html.indexOf('先看日程再看记忆')).toBeLessThan(html.indexOf('神秘类型'));
+    expect(html.indexOf('神秘类型')).toBeLessThan(html.indexOf('昨天去了湖边'));
     expect(html).toContain('mystery');
   });
 
