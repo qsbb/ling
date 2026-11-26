@@ -310,6 +310,28 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         )
         assert row.id not in {hit.memory_id for hit in recalled.hits}
 
+        # 正例：同源历史群窗口可以召回，证明不是把群记忆一刀切禁掉。
+        same_source = await AudienceSnapshot.freeze(
+            session, subject_id=logged_in.subject_id,
+            window_id=row.source_window_id, window_visibility="group_scope",
+        )
+        same_recalled = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="蓝封画册",
+            visibility_allow={Visibility.group_scope}, audience=same_source,
+        )
+        assert row.id in {hit.memory_id for hit in same_recalled.hits}
+
+        # 私聊窗口也不能读到群记忆。
+        private = await AudienceSnapshot.freeze(
+            session, subject_id=logged_in.subject_id,
+            window_id="win_private", window_visibility="subject_private",
+        )
+        private_recalled = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="蓝封画册",
+            visibility_allow={Visibility.subject_private}, audience=private,
+        )
+        assert row.id not in {hit.memory_id for hit in private_recalled.hits}
+
 
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
     await _bind(logged_in)
