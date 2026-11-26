@@ -217,6 +217,9 @@ function renderList(
       onReload: props.onReload ?? (() => undefined),
       source: props.source ?? null,
       onSourceChange: props.onSourceChange ?? (() => undefined),
+      objectId: props.objectId ?? null,
+      objects: props.objects ?? [],
+      onObjectChange: props.onObjectChange ?? (() => undefined),
       search: props.search ?? '',
       onSearchChange: props.onSearchChange ?? (() => undefined),
       onLoadMore: props.onLoadMore ?? (() => undefined),
@@ -795,6 +798,20 @@ describe('前端筛选（kind / 时间）', () => {
     const noTime = { ...MEM_A, memory_id: 'no_time', created_at: null };
     expect(filterMemories([noTime], { kind: 'all', range: '7d' }, now)).toEqual([]);
     expect(filterMemories([noTime], { kind: 'all', range: 'all' }, now)).toEqual([noTime]);
+  });
+
+  it('按对象看显示活动对象、对象计数与清除入口', () => {
+    const html = renderList({
+      objectId: 'ent_group_1',
+      objects: [
+        { entity_id: 'self', name: '她自己', kind: 'self', aliases: [], count: 2 },
+        { entity_id: 'ent_group_1', name: '群 300400500', kind: 'group', aliases: [], count: 1 },
+      ],
+    });
+    expect(html).toContain('data-testid="mem-object-active"');
+    expect(html).toContain('按对象看 · 群 300400500');
+    expect(html).toContain('群 300400500 · 1 条');
+    expect(html).toContain('清除');
   });
 
   it('会话筛选把群聊和私聊分开，群聊不冒充仅本人', () => {
