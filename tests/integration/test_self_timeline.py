@@ -257,6 +257,10 @@ async def test_self_library_checks_activity_evidence_and_viewer(logged_in: TestE
     owner_activities = (await logged_in.client.get("/v1/activity")).json()["history"]
     assert any(row["activity_id"] == private for row in owner_activities)
     public_record = actual[f"activity:{public}"]
+    owner_dashboard = (await logged_in.client.get("/v1/dashboard")).json()["sections"]["timeline"]
+    assert {item["experience_id"] for item in owner_dashboard["data"]["items"]} == {
+        private_record_id, public_record["memory_id"],
+    }
     assert public_record["origin"] == "simulated"
     assert public_record["occurred_at"] == event_time.isoformat()
     assert public_record["created_at"] != public_record["occurred_at"]
@@ -273,6 +277,10 @@ async def test_self_library_checks_activity_evidence_and_viewer(logged_in: TestE
     assert member_response.status_code == 200, member_response.text
     assert member_response.json()["memories"] == [public_record]
     assert (await logged_in.client.get(f"{path}/{private_record_id}/activity-source")).status_code == 404
+    member_dashboard = (await logged_in.client.get("/v1/dashboard")).json()["sections"]["timeline"]
+    assert [item["experience_id"] for item in member_dashboard["data"]["items"]] == [
+        public_record["memory_id"],
+    ]
     member_activities = (await logged_in.client.get("/v1/activity")).json()["history"]
     assert public in {row["activity_id"] for row in member_activities}
     assert private not in {row["activity_id"] for row in member_activities}

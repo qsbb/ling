@@ -102,7 +102,7 @@ async def _seeded_experience(
     """写一条"按新链路"产生的经历：活动 + 派生行都带证据种类。"""
     async with session_scope() as session:
         svc = ActivityService(session, actor_id=ACTOR)
-        act = await svc.propose(kind="reading")
+        act = await svc.propose(kind="reading", visibility="actor_private")
         await svc.transition(act.activity_id, "running")
         await svc.transition(
             act.activity_id,

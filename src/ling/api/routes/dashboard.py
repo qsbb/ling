@@ -37,7 +37,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -74,6 +74,7 @@ from ling.domains.fallback import (
     read_within_budget,
 )
 from ling.domains.goals.service import GoalsService
+from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import MemoryService
 from ling.domains.phone.service import PhoneService, ScheduleNow, schedule_dependency
@@ -181,6 +182,7 @@ async def get_dashboard(
 ) -> dict:
     actor_id = settings.actor_id
     subject_id = auth.user.subject_id
+    allow_actor_private = auth.user.role == "owner"
     # "今天"按**用户配置的本地时区**算，而不是 UTC 或服务器时区：
     # 响应顶层的 `timezone` 已经是这个值，日程的日界必须与它一致，
     # 否则东八区 00:00-08:00 的"今天"会退回前一天。
@@ -195,7 +197,9 @@ async def get_dashboard(
     )
 
     async def activity() -> dict:
-        current = await ActivityService(session, actor_id=actor_id).current()
+        current = await ActivityService(session, actor_id=actor_id).current(
+            visibility=None if allow_actor_private else "public",
+        )
         if current is None:
             return _section(SECTION_EMPTY)
         return _section(
@@ -490,12 +494,13 @@ async def get_dashboard(
         return _section(SECTION_OK if items else SECTION_EMPTY, data.model_dump(mode="json"))
 
     async def timeline() -> dict:
-        """近期生活：已发生的事件，带来源。
-
-        不是"她最近的念头"——内部推理不能当角色经历展示。
-        """
+        """Use the same evidence and reader checks as the memory library."""
+        if await has_open_purge(session, subject_id=subject_id):
+            return _section(SECTION_EMPTY)
         service = SelfTimelineService(session, actor_id=actor_id)
-        events = await service.recent(days=3, limit=5)
+        events = await service.library_records(
+            allow_actor_private=allow_actor_private, since=datetime.now(UTC) - timedelta(days=3),
+        )
         if not events:
             return _section(SECTION_EMPTY)
         return _section(
@@ -503,13 +508,13 @@ async def get_dashboard(
             {
                 "items": [
                     {
-                        "experience_id": e.experience_id,
+                        "experience_id": e.id,
                         "kind": e.kind,
                         "summary": e.summary,
                         "origin": e.origin,
                         "occurred_at": e.occurred_at.isoformat(),
                     }
-                    for e in events
+                    for e, _ in events[:5]
                 ]
             },
         )

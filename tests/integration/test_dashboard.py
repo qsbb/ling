@@ -58,7 +58,7 @@ async def test_one_broken_section_does_not_break_the_page(logged_in, monkeypatch
     """某一块查询炸了，其它块照常返回，整页不变成错误页。"""
     from ling.domains.activity.service import ActivityService
 
-    async def boom(self):  # noqa: ANN001
+    async def boom(self, *, visibility=None):  # noqa: ANN001
         raise RuntimeError("模拟数据库抖动")
 
     monkeypatch.setattr(ActivityService, "current", boom)
