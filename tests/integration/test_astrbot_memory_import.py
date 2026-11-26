@@ -359,6 +359,44 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     assert empty_group["total"] == 0
 
 
+async def test_group_import_reuses_an_existing_current_group_window(logged_in: TestEnv) -> None:
+    """If the connector already has this group window, historical memories bind to it."""
+    await _bind(logged_in)
+    live_id = "win_live_group_reuse"
+    async with session_scope() as session:
+        session.add(Window(
+            id=live_id, actor_id="actor_ling", persona_id="persona_ling",
+            subject_id=logged_in.subject_id, title="读书群",
+            channel="onebot", visibility="group_scope",
+            connector_window_ref=f"onebot-default:group:{GROUP_ID}",
+            origin_status="unknown", message_count=0,
+        ))
+
+    data = _archive(_group_record("window-reuse", group_name="读书群"))
+    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert report["accepted"] == 1
+    headers = {**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
+    commit = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    assert commit.status_code == 200, commit.text
+
+    async with session_scope() as session:
+        row = (await session.execute(
+            select(MemoryRow).where(MemoryRow.import_source["record_id"].as_string() == "window-reuse")
+        )).scalar_one()
+        assert row.source_window_id == live_id
+        audience = await AudienceSnapshot.freeze(
+            session, subject_id=logged_in.subject_id,
+            window_id=live_id, window_visibility="group_scope",
+        )
+        recalled = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="蓝封画册",
+            visibility_allow={Visibility.group_scope}, audience=audience,
+        )
+        assert row.id in {hit.memory_id for hit in recalled.hits}
+
+
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     other_bot = "200300401"
