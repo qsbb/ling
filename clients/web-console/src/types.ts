@@ -435,6 +435,18 @@ export interface MemoryImportSource {
  */
 export type MemoryImportSourceFilter = 'astrbot_memory_companion';
 
+export interface MemoryObject {
+  entity_id: string;
+  name: string;
+  kind: string;
+  aliases: string[];
+  count: number;
+}
+
+export interface MemoryObjectList {
+  objects: MemoryObject[];
+}
+
 export interface MemoryListResponse {
   memories: MemoryRecord[];
   /** 单次返回上限（1..200，默认 50）。 */

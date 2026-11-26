@@ -24,6 +24,7 @@ import type {
   MemoryImportSourceFilter,
   MemoryInclude,
   MemoryListResponse,
+  MemoryObject,
   MemoryRecord,
   SleepReviewsResponse,
 } from '../types';
@@ -1109,6 +1110,10 @@ export interface MemoryListSectionProps {
   /** 来源筛选：null = 全部来源。 */
   source?: MemoryImportSourceFilter | null;
   onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
+  /** 按对象看：null = 全部对象；self = 本人视角。 */
+  objectId?: string | null;
+  objects?: MemoryObject[];
+  onObjectChange?: (objectId: string | null) => void;
   /**
    * 搜索词。这里发的是**服务端搜索**（`q`）：它能找到第一页之外的旧条目，
    * 而不是只在已加载的那一批里筛。
@@ -1464,6 +1469,7 @@ function MemoryInspector({
 export function MemoryListSection({
   state, include, flags, onFlagsChange, limit, onLimitChange, filters,
   onFiltersChange, handlers, onReload, source, onSourceChange = () => {},
+  objectId = null, objects = [], onObjectChange = () => {},
   search = '', onSearchChange = () => {},
   onLoadMore = () => {}, loadingMore = false, importPanelOpen = false,
   onToggleImport = () => {}, onCloseImport = () => {}, defaultView = 'stars',
@@ -1528,9 +1534,11 @@ export function MemoryListSection({
   const mobileInspectorOpen = Boolean(selectedId && selected);
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
   const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
-  const activeFilterCount = Number(filters.range !== 'all') + Number((filters.originScope ?? 'all') !== 'all') + Number(Boolean(scope))
+  const activeObject = objects.find((item) => item.entity_id === objectId) ?? null;
+  const activeFilterCount = Number(filters.range !== 'all') + Number((filters.originScope ?? 'all') !== 'all')
+    + Number(Boolean(scope)) + Number(Boolean(objectId))
     + Number(flags.retracted) + Number(flags.archived) + Number(limit !== LIMIT_OPTIONS[0]);
-  const narrowedByView = Boolean(scope || filters.kind !== 'all' || filters.range !== 'all' || (filters.originScope ?? 'all') !== 'all');
+  const narrowedByView = Boolean(scope || objectId || filters.kind !== 'all' || filters.range !== 'all' || (filters.originScope ?? 'all') !== 'all');
   /** 服务端命中口径下的总数；没有搜索词与来源时就是整库总数。 */
   const matchTotal = data?.total ?? 0;
   const canPage = Boolean(trimmedSearch || source);
@@ -1606,6 +1614,7 @@ export function MemoryListSection({
     onSearchChange('');
     setScope('');
     onFiltersChange(DEFAULT_FILTERS);
+    onObjectChange(null);
     setSelectedId(null);
     searchRef.current?.focus();
   };
@@ -1698,8 +1707,27 @@ export function MemoryListSection({
               onClick={() => { onFiltersChange({ ...filters, kind: value }); setSelectedId(null); }}>{label}</button>
           ))}
         </div>
+        {activeObject ? (
+          <div className="mem-object-active" data-testid="mem-object-active">
+            <span>按对象看 · {activeObject.name}</span>
+            <button type="button" onClick={() => { onObjectChange(null); setSelectedId(null); }}>清除</button>
+          </div>
+        ) : null}
         <div className="mem-facet-panel" id="mem-discovery-filters" hidden={!showFilters}>
           <div className="mem-facet-panel__fields">
+            <label className="mem-field mem-field--wide"><span>按对象看</span>
+              <select value={objectId ?? ''} onChange={(event) => {
+                onObjectChange(event.target.value || null);
+                setSelectedId(null);
+              }}>
+                <option value="">全部对象</option>
+                {objects.map((item) => (
+                  <option key={item.entity_id} value={item.entity_id}>
+                    {item.kind === 'self' ? '她自己' : `${item.name} · ${item.count} 条`}
+                  </option>
+                ))}
+              </select>
+            </label>
             <label className="mem-field"><span>记下时间</span>
               <select value={filters.range} onChange={(event) => {
                 const value = event.target.value;
@@ -2239,6 +2267,9 @@ export interface MemoryContentBodyProps {
   onDismissNotice: () => void;
   source?: MemoryImportSourceFilter | null;
   onSourceChange?: (source: MemoryImportSourceFilter | null) => void;
+  objectId?: string | null;
+  objects?: MemoryObject[];
+  onObjectChange?: (objectId: string | null) => void;
   /** 服务端搜索词（`q`）。容器持有它，因为它决定取数。 */
   search?: string;
   onSearchChange?: (search: string) => void;
@@ -2275,6 +2306,9 @@ export function MemoryContentBody({
   onDismissNotice,
   source = null,
   onSourceChange = () => {},
+  objectId = null,
+  objects = [],
+  onObjectChange = () => {},
   search = '',
   onSearchChange = () => {},
   onLoadMore = () => {},
@@ -2308,6 +2342,9 @@ export function MemoryContentBody({
           onReload={handlers.reloadList}
           source={source}
           onSourceChange={onSourceChange}
+          objectId={objectId}
+          objects={objects}
+          onObjectChange={onObjectChange}
           search={search}
           onSearchChange={onSearchChange}
           onLoadMore={onLoadMore}
@@ -2348,6 +2385,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const [limit, setLimit] = useState<number>(50);
   const [filters, setFilters] = useState<MemoryFilters>(DEFAULT_FILTERS);
   const [source, setSource] = useState<MemoryImportSourceFilter | null>(null);
+  const [objectId, setObjectId] = useState<string | null>(null);
+  const [objects, setObjects] = useState<MemoryObject[]>([]);
   const [search, setSearch] = useState('');
   const [importOpen, setImportOpen] = useState(false);
   const [listBusy, setListBusy] = useState(false);
@@ -2357,8 +2396,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const include = includeMode(flags);
   /** 真正发给服务端的搜索词：空白串不发（服务端也把空白当普通列表）。 */
   const query = search.trim();
-  const latestQuery = useRef({ limit, include, source, q: query });
-  latestQuery.current = { limit, include, source, q: query };
+  const latestQuery = useRef({ limit, include, source, objectId, q: query });
+  latestQuery.current = { limit, include, source, objectId, q: query };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
   const reviewRequest = useRef(0);
@@ -2374,7 +2413,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     loading。唯一可靠的事实是发起请求时用的那组条件，记在这里。
   */
   const listQueryRef = useRef<{ limit: number; include: MemoryInclude | null;
-    source: MemoryImportSourceFilter | null; q: string } | null>(null);
+    source: MemoryImportSourceFilter | null; objectId: string | null; q: string } | null>(null);
 
   const loadCore = useCallback(async () => {
     const requestId = ++coreRequest.current;
@@ -2400,7 +2439,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     setListBusy(true);
     const loaded = listQueryRef.current;
     setList((current) => current.data && loaded && loaded.limit === query.limit
-      && loaded.include === query.include && loaded.source === query.source && loaded.q === query.q
+      && loaded.include === query.include && loaded.source === query.source
+      && loaded.objectId === query.objectId && loaded.q === query.q
       ? current : loadingSection<MemoryListResponse>());
     try {
       const data = await api.listMemories(query);
@@ -2432,9 +2472,9 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     const query = latestQuery.current;
     const current = listRef.current.data;
     const loaded = listQueryRef.current;
-    if ((!query.q && !query.source) || !current?.has_more || listBusyRef.current
+    if ((!query.q && !query.source && !query.objectId) || !current?.has_more || listBusyRef.current
       || !loaded || loaded.source !== query.source || loaded.limit !== query.limit
-      || loaded.include !== query.include || loaded.q !== query.q) return;
+      || loaded.include !== query.include || loaded.objectId !== query.objectId || loaded.q !== query.q) return;
     const offset = current.memories.length;
     const requestId = ++listRequest.current;
     listBusyRef.current = true;
@@ -2481,7 +2521,16 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     }
     const timer = setTimeout(() => void loadList(), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [loadList, query, limit, include, source, tab]);
+  }, [loadList, query, limit, include, source, objectId, tab]);
+
+  useEffect(() => {
+    if (tab !== 'content') return undefined;
+    let cancelled = false;
+    api.listMemoryObjects()
+      .then((data) => { if (!cancelled) setObjects(data.objects); })
+      .catch(() => { if (!cancelled) setObjects([]); });
+    return () => { cancelled = true; };
+  }, [tab, list.data]);
 
   // 改搜索词时立刻把旧结果从"可继续翻"的状态里摘出来，避免用户在防抖窗口里
   // 点「加载更早」把上一批的下一页拼进新查询。
@@ -2650,6 +2699,9 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       onDismissNotice={() => setNotice(null)}
       source={source}
       onSourceChange={setSource}
+      objectId={objectId}
+      objects={objects}
+      onObjectChange={setObjectId}
       search={search}
       onSearchChange={setSearch}
       onLoadMore={() => void loadMore()}

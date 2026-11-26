@@ -1137,3 +1137,26 @@
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+
+.mem-field--wide { grid-column: 1 / -1; }
+.mem-object-active {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--mem-lunar) 35%, var(--line));
+  border-radius: 6px;
+  background: var(--mem-lunar-soft);
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+.mem-object-active button {
+  border: 0;
+  background: transparent;
+  color: var(--mem-lunar);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}

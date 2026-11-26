@@ -68,6 +68,7 @@ import type {
   MemoryImportSourcePair,
   MemoryListResponse,
   MemoryImportSourceFilter,
+  MemoryObjectList,
   LogQuery,
   LogsResponse,
   RecallProposal,
@@ -1416,6 +1417,8 @@ export const api = {
       limit?: number;
       include?: MemoryInclude | null;
       source?: MemoryImportSourceFilter | null;
+      /** 按对象看：self 或实体 id；不传 = 全部对象。 */
+      objectId?: string | null;
       /** 服务端搜索词；空白串与不传等价。 */
       q?: string | null;
       offset?: number;
@@ -1426,12 +1429,22 @@ export const api = {
     query.set('view', 'library');
     if (options.include) query.set('include', options.include);
     if (options.source) query.set('source', options.source);
+    if (options.objectId) query.set('object_id', options.objectId);
     const search = (options.q ?? '').trim();
     if (search) query.set('q', search);
-    if (search || options.source) query.set('offset', String(options.offset ?? 0));
+    if (search || options.source || options.objectId) query.set('offset', String(options.offset ?? 0));
     return request<MemoryListResponse>(`/v1/memory?${query.toString()}`, {
       ...(options.signal ? { signal: options.signal } : {}),
     });
+  },
+
+  /**
+   * 记忆对象目录（按对象看）。
+   *
+   * 只返回至少一条现行记忆的对象；`self` 是本人视角的汇总项。
+   */
+  listMemoryObjects(signal?: AbortSignal): Promise<MemoryObjectList> {
+    return request<MemoryObjectList>('/v1/memory/objects', { cache: 'no-store', ...(signal ? { signal } : {}) });
   },
 
   /**
