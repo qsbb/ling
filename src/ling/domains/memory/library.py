@@ -16,6 +16,8 @@ from ling.domains.memory.service import active_source
 from ling.infra.models import (
     ActivityRow,
     CoreMemoryRow,
+    EntityRow,
+    MemoryEntityRow,
     MemoryEpisode,
     MemoryRow,
     OutboxEvent,
@@ -211,6 +213,22 @@ async def read_library(
         CoreMemoryRow.subject_id == subject_id, CoreMemoryRow.active.is_(True),
         CoreMemoryRow.source_memory_id.in_(record_ids),
     ))) if record_ids else set()
+    speakers: dict[str, list[dict[str, str]]] = {}
+    live_ids = [memory.id for memory, _, _ in rows
+                if memory is not None and not memory.retracted and memory.archived_at is None]
+    if live_ids:
+        speaker_rows = await session.execute(select(
+            MemoryEntityRow.memory_id, MemoryEntityRow.entity_id,
+            MemoryEntityRow.source_reference, MemoryEntityRow.source_label,
+        ).join(EntityRow, EntityRow.id == MemoryEntityRow.entity_id).where(
+            EntityRow.subject_id == subject_id, MemoryEntityRow.memory_id.in_(live_ids),
+            MemoryEntityRow.record_type == "memory", MemoryEntityRow.role == "speaker",
+            MemoryEntityRow.source_reference.is_not(None), MemoryEntityRow.source_label.is_not(None),
+        ).order_by(MemoryEntityRow.source_label, MemoryEntityRow.entity_id))
+        for link in speaker_rows:
+            speakers.setdefault(link.memory_id, []).append({
+                "entity_id": link.entity_id, "name": link.source_label, "source_event_id": link.source_reference,
+            })
     page = []
     for memory, episode, _ in rows:
         if memory is not None:
@@ -218,6 +236,7 @@ async def read_library(
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
                 "source_visibility": memory.source_visibility,
                 **({"pinned": True} if memory.id in pins else {}),
+                **({"archive_speakers": speakers[memory.id]} if memory.id in speakers else {}),
             })
         elif episode is not None:
             page.append(_episode_record(episode))

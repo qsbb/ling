@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from sqlalchemy import and_, func, literal, select
+from sqlalchemy import and_, func, literal, or_, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.entities import EntityService, ObjectKind, RecordType
@@ -13,7 +14,7 @@ from ling.infra.models import EntityRow, MemoryEntityRow, MemoryEpisode, MemoryR
 
 
 def linked_record_ids(subject_id: str, object_id: str, record_type: RecordType):
-    return (
+    query = (
         select(MemoryEntityRow.memory_id)
         .join(EntityRow, EntityRow.id == MemoryEntityRow.entity_id)
         .where(
@@ -21,6 +22,13 @@ def linked_record_ids(subject_id: str, object_id: str, record_type: RecordType):
             MemoryEntityRow.record_type == record_type,
         )
     )
+    if record_type == "memory":
+        active_speaker_link = select(MemoryRow.id).where(
+            MemoryRow.id == MemoryEntityRow.memory_id, MemoryRow.retracted.is_(False),
+            MemoryRow.archived_at.is_(None),
+        ).correlate(MemoryEntityRow).exists()
+        query = query.where(or_(MemoryEntityRow.role != "speaker", active_speaker_link))
+    return query
 
 
 def _usable_records(model: type[MemoryRow] | type[MemoryEpisode], subject_id: str):
@@ -43,9 +51,14 @@ async def list_memory_objects(
         )
     ).cte("object_records")
     linked_records = func.count()
+    speaker_labels = func.array_agg(aggregate_order_by(
+        MemoryEntityRow.source_label, records.c.created_at.desc(), records.c.id.desc(),
+    )).filter(
+        MemoryEntityRow.role == "speaker", MemoryEntityRow.source_label.is_not(None),
+    ).label("speaker_labels")
     rows = (await session.execute(
         select(
-            EntityRow.id, EntityRow.name, EntityRow.kind, EntityRow.aliases,
+            EntityRow.id, EntityRow.name, EntityRow.kind, EntityRow.aliases, speaker_labels,
             linked_records.label("count"), func.max(records.c.created_at).label("last_recorded_at"),
         )
         .select_from(EntityRow)
@@ -58,17 +71,17 @@ async def list_memory_objects(
         .group_by(EntityRow.id)
         .order_by(linked_records.desc(), EntityRow.name, EntityRow.id)
     )).all()
-    objects = [
-        {
+    objects = []
+    for row in rows:
+        labels = list(dict.fromkeys(row.speaker_labels or []))
+        objects.append({
             "entity_id": row.id,
-            "name": row.name,
+            "name": labels[0] if labels else row.name,
             "kind": row.kind,
-            "aliases": row.aliases or [],
+            "aliases": labels[1:] if labels else row.aliases or [],
             "count": int(row.count),
             "last_recorded_at": row.last_recorded_at.isoformat(),
-        }
-        for row in rows
-    ]
+        })
     self_records = await SelfTimelineService(session, actor_id=actor_id).library_records(
         allow_actor_private=allow_actor_private,
     )

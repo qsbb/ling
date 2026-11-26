@@ -1269,6 +1269,7 @@ function MemoryInspector({
   headingRef,
   onBack,
   onSelect,
+  onSelectObject,
   onChanged,
   handlers,
   objects,
@@ -1280,6 +1281,7 @@ function MemoryInspector({
   headingRef: React.RefObject<HTMLHeadingElement | null>;
   onBack: () => void;
   onSelect: (id: string) => void;
+  onSelectObject: (id: string) => void;
   onChanged: () => void;
   handlers: MemoryHandlers;
   objects: MemoryObject[];
@@ -1512,6 +1514,21 @@ function MemoryInspector({
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
+        {row.archive_speakers?.length ? (
+          <details className="mem-inspector__section" data-testid="mem-archive-speakers">
+            <summary>原发言者</summary>
+            <ul>
+              {row.archive_speakers.map((speaker) => (
+                <li key={speaker.entity_id}>
+                  <button type="button" className="mem-text-button" onClick={() => onSelectObject(speaker.entity_id)}>
+                    {speaker.name}
+                  </button>
+                  {' · '}<code>{speaker.source_event_id}</code>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
         {row.record_type === 'self_experience' && handlers.readActivitySource ? (
           <>
             <button type="button" className="mem-text-button" aria-expanded={Boolean(activitySource)}
@@ -2090,7 +2107,8 @@ export function MemoryListSection({
           <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} chartModel={chartModel}
             backLabel={view === 'stars' ? '回到星图' : '回到列表'}
             headingRef={headingRef} handlers={handlers} objects={objects} onBack={goBack}
-            onSelect={selectedFromHistory} onChanged={goBack} />
+            onSelect={selectedFromHistory} onChanged={goBack}
+            onSelectObject={(id) => { goBack(); onObjectChange(id); setSelectedId(null); }} />
         ) : data && !importPanelOpen && (view === 'list' || detailOpen) ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>

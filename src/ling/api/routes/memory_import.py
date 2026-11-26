@@ -199,8 +199,8 @@ async def preview(
             load_signing_root_key(settings),
             user_id=auth.user.id, target=target, digest=archive.digest,
             reviewed_at=int(reviewed_at.timestamp()), expires=int(expires.timestamp()), retention_days=retention,
-        ) if result.accepted else None,
-        expires_at=expires if result.accepted else None,
+        ) if result.accepted or result.counts.speaker_links else None,
+        expires_at=expires if result.accepted or result.counts.speaker_links else None,
     )
 
 
@@ -242,7 +242,7 @@ async def commit(
             ErrorCode.internal, "导入未完成，可以重试", status_code=500, retriable=True,
         ) from None
 
-    if result.accepted:
+    if result.accepted or result.counts.speaker_links:
         audit_event(
             "memory_imported", actor=auth.user.id, target_type="subject",
             target_id=target.destination.subject_id,
@@ -250,6 +250,7 @@ async def commit(
                 "imported": result.accepted,
                 "duplicates": result.counts.duplicates,
                 "skipped": result.counts.skipped,
+                "speaker_links": result.counts.speaker_links,
             },
         )
     response.headers["Cache-Control"] = "no-store"

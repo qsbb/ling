@@ -77,6 +77,45 @@ def _record(row: sqlite3.Row) -> dict:
     return record
 
 
+def _timeline_evidence(db: sqlite3.Connection, record: dict):
+    """Carry only cited speaker attribution from the snapshot."""
+    refs = record["source_event_ids"]
+    if not refs:
+        return
+    peer = record["group_id"] or record["subject_id"]
+    for start in range(0, len(refs), 800):
+        batch = refs[start:start + 800]
+        ids = ", ".join("?" for _ in batch)
+        for event in db.execute(f"""
+            SELECT id, event_type, scope, session_id, subject_id, object_id, metadata
+            FROM timeline
+            WHERE id IN ({ids}) AND event_type = 'user_message'
+              AND scope = ? AND session_id = ? AND object_id = ?
+        """, (*batch, record["scope"], record["session_id"], peer)):
+            try:
+                metadata = json.loads(event["metadata"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            name = metadata.get("sender_name")
+            if (
+                metadata.get("owner_bot_id") != record["owner_bot_id"]
+                or metadata.get("platform") != record["platform"]
+                or not isinstance(name, str) or not 2 <= len(name.strip()) <= 64
+                or name.strip() not in record["content"]
+            ):
+                continue
+            data = dict(event)
+            data["metadata"] = {
+                field: metadata[field] for field in (
+                    "sender_name", "owner_bot_id", "platform", "participant_user_id",
+                    "source_group_id", "source_state", "retracted_at", "forgotten_at", "deleted_at",
+                ) if field in metadata
+            }
+            yield {"record_type": "timeline", "data": data}
+
+
 def convert(
     snapshot: Path, output: Path, *, bot_qq: str, owner_qq: str, offset: int = 0, limit: int | None = None,
     include_group: bool = False,
@@ -95,6 +134,8 @@ def convert(
     }
     with closing(sqlite3.connect(f"{snapshot.as_uri()}?mode=ro&immutable=1", uri=True)) as db:
         db.row_factory = sqlite3.Row
+        timeline_columns = {column["name"] for column in db.execute("PRAGMA table_info(timeline)")}
+        has_timeline = {"id", "event_type", "scope", "session_id", "subject_id", "object_id", "metadata"} <= timeline_columns
         cursor = db.execute(_SELECT, {
             "bot_qq": bot_qq, "owner_qq": owner_qq,
             "offset": offset, "limit": -1 if limit is None else limit + 1,
@@ -110,7 +151,11 @@ def convert(
                 for row in cursor:
                     if count == limit:
                         return count, True
-                    write(_record(row))
+                    record = _record(row)
+                    write(record)
+                    if has_timeline:
+                        for evidence in _timeline_evidence(db, record):
+                            write(evidence)
                     count += 1
                 return count, False
             except BaseException:

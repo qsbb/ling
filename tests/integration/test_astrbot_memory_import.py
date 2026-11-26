@@ -501,6 +501,64 @@ async def test_native_legacy_group_visibility_is_preserved_without_sensitivity(l
     }
 
 
+async def test_existing_archive_summary_can_add_its_cited_speaker(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    source_session = f"default:GroupMessage:{GROUP_ID}"
+    summary = _native_entry(
+        "group-with-speaker", scope="group", group_id=GROUP_ID, session_id=source_session,
+        subject={"kind": "bot", "id": BOT_QQ}, object={"kind": "group", "id": GROUP_ID},
+        visibility="group_public", content="槐序在读书群里提到新书",
+        metadata={"owner_bot_id": BOT_QQ, "source_event_ids": ["event-speaker"]},
+    )
+    timeline = {"record_type": "timeline", "data": {
+        "id": "event-speaker", "event_type": "user_message", "scope": "group",
+        "session_id": source_session, "subject_id": "100200501", "object_id": GROUP_ID,
+        "content": "原始发言正文不应入库",
+        "metadata": {"owner_bot_id": BOT_QQ, "platform": "aiocqhttp", "sender_name": "槐序"},
+    }}
+    client = logged_in.client
+    preview_path = PREFIX + "/preview?include_group=true"
+    commit_path = PREFIX + "/commit?include_group=true"
+
+    async def preview(data: bytes) -> dict:
+        response = await client.post(preview_path, content=data, headers=NATIVE_HEADERS)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    async def commit(data: bytes, report: dict) -> dict:
+        response = await client.post(commit_path, content=data, headers={
+            **NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"],
+        })
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    old_export = _native_archive(summary)
+    old_preview = await preview(old_export)
+    assert (old_preview["accepted"], old_preview["speaker_links"]) == (1, 0)
+    assert (await commit(old_export, old_preview))["imported"] == 1
+    full_export = _native_archive(summary, timeline)
+    review = await preview(full_export)
+    assert (review["accepted"], review["duplicates"], review["speaker_links"]) == (0, 1, 1)
+    before = (await client.get("/v1/memory/objects")).json()["objects"]
+    assert not any(item["kind"] == "person" for item in before)
+    receipt = await commit(full_export, review)
+    assert (receipt["imported"], receipt["speaker_links"]) == (0, 1)
+    people = [item for item in (await client.get("/v1/memory/objects")).json()["objects"]
+              if item["kind"] == "person"]
+    assert [(item["name"], item["count"]) for item in people] == [("槐序", 1)]
+    listing = await client.get("/v1/memory", params={
+        "view": "library", "object_id": people[0]["entity_id"], "conversation_scope": "group",
+    })
+    row, = listing.json()["memories"]
+    assert row["archive_speakers"] == [{
+        "entity_id": people[0]["entity_id"], "name": "槐序", "source_event_id": "event-speaker",
+    }]
+    assert "原始发言正文不应入库" not in listing.text
+    assert (await preview(full_export))["speaker_links"] == 0
+    async with session_scope() as session:
+        assert await session.scalar(select(func.count()).select_from(Message)) == 0
+
+
 async def test_forgetting_imported_source_blocks_archive_reupload_and_restore(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     env = logged_in

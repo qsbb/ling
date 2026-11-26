@@ -1448,6 +1448,8 @@ class MemoryEntityRow(Base):
     entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     record_type: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="memory")
     role: Mapped[str] = mapped_column(String(24), default="about", server_default="about")
+    source_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MemoryEmbeddingRow(Base):

@@ -727,7 +727,8 @@ function PreviewStage({
   onChooseAnother: () => void;
   onEditSource?: () => void;
 }): React.ReactElement {
-  const empty = preview.accepted === 0;
+  const speakerLinks = preview.speaker_links ?? 0;
+  const empty = preview.accepted === 0 && speakerLinks === 0;
   const zeroHint = empty ? zeroAcceptedHint(preview) : null;
   const size = fileSizeText(file);
   return (
@@ -753,6 +754,8 @@ function PreviewStage({
         </p>
       ) : null}
 
+      {speakerLinks > 0 ? <p className="import-scope-counts">可补充 {speakerLinks} 条有来源的人物关联</p> : null}
+
       {empty && zeroHint ? (
         <div className="import-zero" data-testid="import-zero">
           <strong>{zeroHint.headline}</strong>
@@ -760,7 +763,7 @@ function PreviewStage({
         </div>
       ) : null}
 
-      {empty ? null : <SampleList samples={preview.sample} />}
+      {preview.accepted > 0 ? <SampleList samples={preview.sample} /> : null}
 
       <SkipBlock preview={preview} open={empty} />
 
@@ -799,7 +802,7 @@ function PreviewStage({
               disabled={busy || !preview.confirmation_token}
               onClick={onConfirm}
             >
-              {busy ? '正在导入…' : `导入这 ${preview.accepted} 条`}
+              {busy ? '正在导入…' : preview.accepted > 0 ? `导入这 ${preview.accepted} 条` : '补充人物关联'}
             </button>
             <button type="button" className="ghost-button" disabled={busy} onClick={onRepreview}>
               重新预览
@@ -878,7 +881,10 @@ function ResultStage({
         </details>
       ) : null}
 
-      {result.imported === 0 ? (
+      {(result.speaker_links ?? 0) > 0 ? (
+        <p className="import-scope-counts">已补充 {result.speaker_links} 条有来源的人物关联</p>
+      ) : null}
+      {result.imported === 0 && !result.speaker_links ? (
         <p className="import-zero" data-testid="import-zero-result">
           这次没有新增条目。{result.skipped > 0 ? '可展开查看跳过原因。' : result.duplicates > 0 ? '这些记录已经在库里了。' : null}
         </p>

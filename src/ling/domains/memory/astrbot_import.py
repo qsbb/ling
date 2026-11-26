@@ -14,14 +14,26 @@ from itertools import islice
 from typing import Annotated, BinaryIO, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import Column, MetaData, String, Table, func, select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import Column, MetaData, String, Table, any_, bindparam, func, select
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
 from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
-from ling.infra.models import MemoryEntityRow, MemoryImportForgetMarker, MemoryRow, Window
+from ling.domains.memory.archive_speakers import (
+    SPEAKER_SOURCES,
+    store_timeline_sources,
+    timeline_sources,
+)
+from ling.infra.models import (
+    EntityRow,
+    MemoryEntityRow,
+    MemoryImportForgetMarker,
+    MemoryRow,
+    Window,
+)
+from ling.infra.security import new_id
 
 PREVIEW_LIMIT = 12
 RECORD_BATCH_SIZE = 128
@@ -213,6 +225,7 @@ class Archive:
     source: SourcePair
     records: Iterator[ArchiveRecord | None]
     digest: str
+    file: BinaryIO
 
 
 def _decode(line: bytes) -> str:
@@ -295,11 +308,12 @@ def _records(file: BinaryIO, *, native: bool) -> Iterator[ArchiveRecord | None]:
             continue
         record = _decode(line)
         try:
-            if not native:
-                yield ArchiveRecord.model_validate_json(record, strict=True)
-                continue
             entry = json.loads(record)
             record_type = entry.get("record_type") if isinstance(entry, dict) else None
+            if not native:
+                if record_type != "timeline":
+                    yield ArchiveRecord.model_validate_json(record, strict=True)
+                continue
             if record_type in _ASTRBOT_NON_MEMORY_TYPES:
                 continue
             data = entry.get("data") if record_type == "memory" else None
@@ -354,7 +368,7 @@ def open_archive(
         raise ArchiveError("preview_invalid")
     if source.bot_qq == source.owner_qq:
         raise ArchiveError("invalid_source_pair")
-    return Archive(source, _records(file, native=native), digest)
+    return Archive(source, _records(file, native=native), digest, file)
 
 
 class Destination(BaseModel):
@@ -381,7 +395,7 @@ def sign_confirmation(
     reviewed_at: int, expires: int, retention_days: int,
 ) -> str:
     payload = json.dumps([
-        "ling:astrbot-memory-import:v5", user_id, target.destination.subject_id,
+        "ling:astrbot-memory-import:v6", user_id, target.destination.subject_id,
         target.destination.qq, target.destination.bot_qq,
         target.binding_id, target.binding_revision, target.forget_generation,
         target.actor_id, target.persona_id, target.instance_id, target.include_group,
@@ -426,6 +440,7 @@ class ImportCounts(BaseModel):
     skip_reasons: dict[SkipReason, int]
     scope_counts: dict[str, int] = Field(default_factory=dict)
     scope_skip_reasons: dict[str, dict[SkipReason, int]] = Field(default_factory=dict)
+    speaker_links: int = 0
 
 
 class ImportSample(BaseModel):
@@ -476,12 +491,13 @@ async def process_archive(
     skip_reasons: Counter[SkipReason] = Counter()
     scope_skip_reasons: dict[str, Counter[SkipReason]] = {}
     sample: list[ImportSample] = []
-    total = duplicates = accepted = 0
+    total = duplicates = accepted = speaker_links = 0
     accepted_scopes: Counter[str] = Counter()
     if write:
         await lock_archive_account(session, archive.source.owner_qq)
     else:
         await session.execute(CreateTable(_PREVIEW_IDS))
+    has_speakers = await _stage_speaker_sources(session, archive, target)
     while batch := await run_in_threadpool(list, islice(archive.records, RECORD_BATCH_SIZE)):
         total += len(batch)
         candidates: dict[str, ArchiveRecord] = {}
@@ -522,6 +538,8 @@ async def process_archive(
             accepted += inserted
             accepted_scopes.update(inserted_scopes)
             duplicates += len(candidates) - inserted
+            if has_speakers:
+                speaker_links += await _speaker_links(session, archive.source, target, candidates, write=True)
             continue
 
         # The transaction's temporary index deduplicates across batches without retaining all IDs in the API process.
@@ -539,6 +557,11 @@ async def process_archive(
         accepted += len(fresh) - len(existing)
         for memory_id in fresh - existing:
             accepted_scopes[candidates[memory_id].scope] += 1
+        if has_speakers:
+            speaker_links += await _speaker_links(
+                session, archive.source, target, {mid: candidates[mid] for mid in fresh},
+                existing_ids=existing,
+            )
         if len(sample) < PREVIEW_LIMIT:
             for memory_id, record in candidates.items():
                 if memory_id in fresh and memory_id not in existing:
@@ -553,10 +576,116 @@ async def process_archive(
             skip_reasons=dict(skip_reasons),
             scope_counts=dict(accepted_scopes),
             scope_skip_reasons={scope: dict(reasons) for scope, reasons in scope_skip_reasons.items()},
+            speaker_links=speaker_links,
         ),
         accepted=accepted,
         sample=sample,
     )
+
+
+async def _stage_speaker_sources(session: AsyncSession, archive: Archive, target: ImportTarget) -> bool:
+    iterator = timeline_sources(
+        archive.file, bot_qq=archive.source.bot_qq, owner_qq=archive.source.owner_qq,
+        include_group=target.include_group, max_record_bytes=MAX_RECORD_BYTES,
+    )
+    try:
+        batch = await run_in_threadpool(list, islice(iterator, 1000))
+        if not batch:
+            return False
+        await session.execute(CreateTable(SPEAKER_SOURCES))
+        statement = store_timeline_sources()
+        while batch:
+            await session.execute(statement, batch)
+            batch = await run_in_threadpool(list, islice(iterator, 1000))
+        return True
+    finally:
+        iterator.close()
+
+
+async def _speaker_links(
+    session: AsyncSession, source: SourcePair, target: ImportTarget,
+    candidates: dict[str, ArchiveRecord], *, write: bool = False,
+    existing_ids: set[str] | None = None,
+) -> int:
+    summaries = {mid: r for mid, r in candidates.items() if r.is_summary and r.source_event_ids}
+    if not summaries:
+        return 0
+    owner = target.destination.subject_id
+    existing = set(summaries) if write else summaries.keys() & (existing_ids or set())
+    prefix = f"astrbot:{source.bot_qq}:{source.owner_qq}:event:"
+    if existing:
+        rows = (await session.execute(select(
+            MemoryRow.id, MemoryRow.text, MemoryRow.source_event_ids, MemoryRow.import_source,
+            MemoryRow.visibility, MemoryRow.source_visibility,
+        ).where(
+            MemoryRow.id.in_(existing), MemoryRow.subject_id == owner,
+            MemoryRow.retracted.is_(False), MemoryRow.archived_at.is_(None),
+            MemoryRow.supersedes.is_(None),
+            MemoryRow.source_account == f"{target.instance_id}:{source.owner_qq}",
+        ))).all()
+        allowed = {
+            row.id for row in rows
+            if row.text == summaries[row.id].content
+            and row.import_source and row.import_source.get("source") == SOURCE
+            and row.import_source.get("session_id") == summaries[row.id].session_id
+            and row.import_source.get("scope") == summaries[row.id].scope
+            and row.import_source.get("platform") == summaries[row.id].platform
+            and row.visibility == row.source_visibility == (
+                Visibility.group_scope if summaries[row.id].is_group else Visibility.subject_private
+            )
+            and all(prefix + ref in row.source_event_ids for ref in summaries[row.id].source_event_ids)
+        }
+        summaries = {mid: r for mid, r in summaries.items() if mid not in existing or mid in allowed}
+    references = sorted({ref for record in summaries.values() for ref in record.source_event_ids if ref.isprintable()})
+    if not references:
+        return 0
+    timeline = SPEAKER_SOURCES.c
+    params = bindparam("source_ids", value=references, type_=ARRAY(String))
+    evidence = {
+        row.id: row for row in (await session.execute(select(SPEAKER_SOURCES).where(
+            timeline.id == any_(params), timeline.ambiguous.is_(False), timeline.account.is_not(None),
+        ))).all()
+    }
+    links = {}
+    for mid, record in summaries.items():
+        for ref in record.source_event_ids:
+            observation = evidence.get(ref)
+            if observation is None or (
+                (observation.scope, observation.session_id, observation.platform)
+                != (record.scope, record.session_id, record.platform)
+            ) or observation.label not in record.content:
+                continue
+            identity = "\x1f".join((
+                source.bot_qq, target.instance_id, record.platform, record.session_id, observation.account,
+            ))
+            key = "archive_speaker:" + hashlib.sha256(identity.encode()).hexdigest()
+            links.setdefault((mid, key), observation)
+    if not links:
+        return 0
+    keys = list({key for _, key in links})
+    if write:
+        await session.execute(insert(EntityRow).on_conflict_do_nothing(
+            constraint="uq_entities_subject_source",
+        ), [
+            {"id": new_id("ent"), "subject_id": owner, "source_key": key, "kind": "person", "name": ""}
+            for key in keys
+        ])
+    entity_ids = dict((await session.execute(select(EntityRow.source_key, EntityRow.id).where(
+        EntityRow.subject_id == owner, EntityRow.source_key == any_(bindparam("keys", keys, type_=ARRAY(String))),
+    ))).all())
+    if write:
+        stmt = insert(MemoryEntityRow).on_conflict_do_nothing().returning(MemoryEntityRow.memory_id)
+        created = await session.scalars(stmt, [
+            {"memory_id": mid, "entity_id": entity_ids[key], "role": "speaker",
+             "source_reference": observation.id, "source_label": observation.label}
+            for (mid, key), observation in links.items()
+        ])
+        return len(list(created))
+    existing_links = set((await session.execute(select(MemoryEntityRow.memory_id, MemoryEntityRow.entity_id).where(
+        MemoryEntityRow.memory_id.in_(summaries), MemoryEntityRow.record_type == "memory",
+        MemoryEntityRow.entity_id == any_(bindparam("entity_ids", list(entity_ids.values()), type_=ARRAY(String))),
+    ))).all())
+    return sum((mid, entity_ids.get(key)) not in existing_links for mid, key in links)
 
 
 def _sample(record: ArchiveRecord) -> ImportSample:

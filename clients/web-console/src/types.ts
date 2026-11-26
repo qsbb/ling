@@ -411,6 +411,7 @@ export interface MemoryRecord {
   record_type?: 'memory' | 'experience' | 'self_experience';
   /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
   import_source?: MemoryImportSource;
+  archive_speakers?: { entity_id: string; name: string; source_event_id: string }[];
 }
 
 /**
@@ -543,6 +544,7 @@ export interface MemoryImportCounts {
   imported?: number;
   duplicates: number;
   skipped: number;
+  speaker_links?: number;
   skip_reasons: Partial<Record<MemoryImportSkipReason, number>>;
   /** 按私聊/群聊分项；旧后端没有这个字段。 */
   scope_counts?: Partial<Record<'private' | 'group', number>>;
@@ -553,9 +555,9 @@ export interface MemoryImportPreview extends MemoryImportCounts {
   destination: MemoryImportDestination;
   accepted: number;
   sample: MemoryImportSample[];
-  /** 没有可导入条目时为 null。 */
+  /** 没有可导入条目或可补人物关联时为 null。 */
   confirmation_token: string | null;
-  /** 没有可导入条目时为 null。 */
+  /** 没有确认令牌时为 null。 */
   expires_at: string | null;
 }
 
