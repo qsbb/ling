@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import Origin, Visibility
+from ling.infra.models import User, utcnow
 
 
 @dataclass(frozen=True)
@@ -202,23 +204,32 @@ class SelfViewBuilder:
         try:
             from ling.domains.memory.self_timeline import SelfTimelineService
 
+            owner = await self._session.scalar(select(User.id).where(
+                User.subject_id == self._subject_id, User.role == "owner", User.disabled.is_(False),
+            ).limit(1))
             experiences = await SelfTimelineService(
                 self._session, actor_id=self._actor_id
-            ).recent(days=1, limit=3)
+            ).library_records(allow_actor_private=owner is not None, since=utcnow() - timedelta(days=1))
         except Exception:  # noqa: BLE001
             view.dropped.append(("self_timeline", "读取失败"))
             return
-        if not experiences:
-            return
-        text = "、".join(e.summary for e in experiences)
-        view.fragments.append(
-            SelfFragment(
-                text=f"你今天做过的事：{text}（模拟生活，不是真实身体经历）",
-                source="self_timeline",
-                origin=Origin.simulated,
-                visibility=Visibility.actor_private,
+        for experience, activity in experiences[:3]:
+            origin = Origin.user_statement if activity.origin == "user_stated" else Origin(activity.origin)
+            label = {
+                Origin.tool_receipt: "有实际工具回执的动作",
+                Origin.simulated: "模拟生活经历",
+                Origin.user_statement: "经用户确认的经历",
+            }.get(origin, "有证据的角色活动")
+            visibility = (
+                Visibility.public if experience.visibility == activity.visibility == "public"
+                else Visibility.actor_private
             )
-        )
+            view.fragments.append(SelfFragment(
+                text=f"{label}：{experience.summary}",
+                source="self_timeline",
+                origin=origin,
+                visibility=visibility,
+            ))
 
 
 __all__ = ["SelfFragment", "SelfView", "SelfViewBuilder"]

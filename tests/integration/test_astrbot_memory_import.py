@@ -340,11 +340,12 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         ))
         await session.flush()
     objects = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
-    assert objects[0]["kind"] == "self" and objects[0]["count"] == 3
+    assert objects[0]["kind"] == "self" and objects[0]["count"] == 0
     own_library = (await logged_in.client.get(
         "/v1/memory?view=library&object_id=self"
     )).json()
-    assert own_library["total"] == 3
+    assert own_library["total"] == 0
+    assert (await logged_in.client.get("/v1/memory?view=library")).json()["total"] == 3
     assert not any(item["entity_id"] == "ent_without_memory_link" for item in objects)
     group_object = next(item for item in objects if item["kind"] == "group")
     assert group_object["count"] == 1 and group_object["name"] == f"新的读书群 · {GROUP_ID}"
@@ -353,6 +354,9 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     )).json()
     assert [item["visibility"] for item in only_group["memories"]] == ["group_scope"]
     assert only_group["total"] == 1
+    scoped = f"/v1/memory?view=library&object_id={group_object['entity_id']}&q=蓝封画册"
+    assert (await logged_in.client.get(scoped + "&conversation_scope=group")).json()["total"] == 1
+    assert (await logged_in.client.get(scoped + "&conversation_scope=private")).json()["total"] == 0
 
     # 历史群窗口不能冒充当前群受众：另一个群窗口不能召回这条记忆。
     async with session_scope() as session:
@@ -463,10 +467,6 @@ async def test_group_private_sensitivity_is_rejected_before_import(logged_in: Te
     assert await _row_counts() == before
 
 
-async def test_group_import_reuses_unverified_window_without_granting_live_recall(logged_in: TestEnv) -> None:
-    """An existing but unverified group window is not history visibility proof."""
-    await _bind(logged_in)
-    live_id = "win_live_group_reuse"
 async def test_forgetting_imported_source_blocks_archive_reupload_and_restore(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     env = logged_in
@@ -579,6 +579,10 @@ async def test_archive_provenance_survives_account_split(logged_in: TestEnv) -> 
     assert preview_after.json()["skip_reasons"] == {"forgotten": 1}
 
 
+async def test_group_import_reuses_unverified_window_without_granting_live_recall(logged_in: TestEnv) -> None:
+    """An existing but unverified group window is not history visibility proof."""
+    await _bind(logged_in)
+    live_id = "win_live_group_reuse"
     async with session_scope() as session:
         session.add(Window(
             id=live_id, actor_id="actor_ling", persona_id="persona_ling",

@@ -389,13 +389,16 @@ export interface MemoryRecord {
   source_message_id?: string;
   source_window_id?: string;
   source_account?: string | null;
+  source_visibility?: string;
   source_role?: 'self_report' | 'user_correction' | 'conversation';
+  observed_at?: string | null;
+  occurred_at?: string | null;
   valid_from?: string | null;
   valid_until: string | null;
   created_at: string | null;
   archived_at: string | null;
   can_edit?: boolean;
-  record_type?: 'memory' | 'experience';
+  record_type?: 'memory' | 'experience' | 'self_experience';
   /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
   import_source?: MemoryImportSource;
 }
@@ -533,10 +536,10 @@ export interface MemoryImportCounts {
   skip_reasons: Partial<Record<MemoryImportSkipReason, number>>;
   /** 按私聊/群聊分项；旧后端没有这个字段。 */
   scope_counts?: Partial<Record<'private' | 'group', number>>;
+  scope_skip_reasons?: Partial<Record<'private' | 'group' | 'unknown', Partial<Record<MemoryImportSkipReason, number>>>>;
 }
 
 export interface MemoryImportPreview extends MemoryImportCounts {
-  scope_skip_reasons?: Partial<Record<'private' | 'group' | 'unknown', Partial<Record<MemoryImportSkipReason, number>>>>;
   destination: MemoryImportDestination;
   accepted: number;
   sample: MemoryImportSample[];

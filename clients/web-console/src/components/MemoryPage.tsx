@@ -33,7 +33,7 @@ import type {
 import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { MemoryImportPanel } from './MemoryImport';
 import {
-  buildStarChartModel, connectedStarEntries, MemoryMicroscopeBeats, MemoryStarMapCanvas, MonthWheel,
+  buildStarChartModel, connectedStarEntries, memoryOccurredAt, MemoryMicroscopeBeats, MemoryStarMapCanvas, MonthWheel,
   starAffinity, STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
 } from './MemoryStarMap';
 import { MemoryFocusLens } from './MemoryFocusLens';
@@ -219,8 +219,10 @@ export function filterMemories(
     if (filters.kind !== 'all' && row.kind !== filters.kind) return false;
     const originScope = filters.originScope ?? 'all';
     if (originScope !== 'all') {
+      if (row.record_type === 'self_experience') return false;
       const session = row.import_source?.session_id ?? '';
-      const isGroup = row.visibility === 'group_scope' || /groupmessage/i.test(session);
+      const isGroup = row.source_visibility === 'group_scope' || row.visibility === 'group_scope'
+        || /groupmessage/i.test(session);
       if (originScope === 'group' && !isGroup) return false;
       if (originScope === 'private' && isGroup) return false;
     }
@@ -1304,7 +1306,7 @@ function MemoryInspector({
   const status = historyStatus(row);
   const relative = formatRelativeTime(row.created_at);
   const star = chartModel?.nodeMap[row.memory_id];
-  const occurredAt = row.import_source?.occurred_at ?? null;
+  const occurredAt = memoryOccurredAt(row);
   const formRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -1319,8 +1321,10 @@ function MemoryInspector({
   };
 
   const forgetting = mode === 'forget';
-  const canForget = Boolean(row.source_message_id);
-  const actionLabel = forgetting ? '遗忘这次发言的记忆' : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
+  const imported = row.import_source?.source === 'astrbot_memory_companion';
+  const canForget = Boolean(row.source_message_id || imported);
+  const actionLabel = forgetting ? (imported ? '遗忘这条导入记忆' : '遗忘这次发言的记忆')
+    : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
   const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
 
   const submit = async () => {
@@ -1390,7 +1394,8 @@ function MemoryInspector({
         ) : null}
       </div>
 
-      {!status && (row.source_message_id || row.import_source || row.source_event_ids.length) ? (
+      {!status && row.record_type !== 'self_experience'
+        && (row.source_message_id || row.import_source || row.source_event_ids.length) ? (
         <ObjectAnnotationForm row={row} objects={objects}
           onSave={(input) => handlers.annotateObject(row.memory_id, input)} />
       ) : null}
@@ -1410,7 +1415,9 @@ function MemoryInspector({
             <AlertIcon size={14} /> {actionLabel}
           </p>
           {forgetting ? (
-            <p className="mem-confirm__body">删除这次发言生成的记忆和关联情节。这一轮仍保留在聊天记录中，Ling 后续不会用它作为对话上下文。</p>
+            <p className="mem-confirm__body">{imported
+              ? '删除该来源的记忆与对象关联。再次导入同一份历史时会跳过这条来源。'
+              : '删除这次发言生成的记忆和关联情节。这一轮仍保留在聊天记录中，Ling 后续不会用它作为对话上下文。'}</p>
           ) : mode === 'retract' ? (
             <>
               <p className="mem-confirm__body">撤回后不再参与召回，但不会删除。可在历史记录中查看。</p>
@@ -1450,6 +1457,7 @@ function MemoryInspector({
         <dl className="mem-facts">
           <div><dt>来源</dt><dd>{row.source_role === 'self_report' ? '本人自述' : row.source_role === 'user_correction' ? '本人纠正' : row.source_role === 'conversation' ? '对话记录' : originLabel(row.origin)}</dd></div>
           {row.valid_from ? <div><dt>有效期自</dt><dd>{formatAbsoluteTime(row.valid_from)}</dd></div> : null}
+          {row.observed_at ? <div><dt>发言时间</dt><dd>{formatAbsoluteTime(row.observed_at)}</dd></div> : null}
           {row.import_source ? (
             <div className="mem-facts__wide" data-testid="mem-import-source">
               <dt>来自 AstrBot</dt>
@@ -1460,7 +1468,7 @@ function MemoryInspector({
             </div>
           ) : null}
           <div><dt>可见范围</dt><dd>{visibilityLabel(row.visibility)}</dd></div>
-          {row.import_source ? (
+          {row.import_source || occurredAt ? (
             <div>
               <dt>发生时间</dt>
               <dd>{occurredAt
@@ -1618,7 +1626,7 @@ export function MemoryListSection({
   const narrowedByView = Boolean(scope || objectId || filters.kind !== 'all' || filters.range !== 'all' || (filters.originScope ?? 'all') !== 'all');
   /** 服务端命中口径下的总数；没有搜索词与来源时就是整库总数。 */
   const matchTotal = data?.total ?? 0;
-  const canPage = Boolean(trimmedSearch || source);
+  const canPage = Boolean(trimmedSearch || source || objectId || (filters.originScope && filters.originScope !== 'all'));
 
   useEffect(() => {
     const query = window.matchMedia('(min-width: 761px)');
@@ -2484,8 +2492,10 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const include = includeMode(flags);
   /** 真正发给服务端的搜索词：空白串不发（服务端也把空白当普通列表）。 */
   const query = search.trim();
-  const latestQuery = useRef({ limit, include, source, objectId, q: query });
-  latestQuery.current = { limit, include, source, objectId, q: query };
+  const conversationScope = filters.originScope === 'group' || filters.originScope === 'private'
+    ? filters.originScope : null;
+  const latestQuery = useRef({ limit, include, source, objectId, conversationScope, q: query });
+  latestQuery.current = { limit, include, source, objectId, conversationScope, q: query };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
   const reviewRequest = useRef(0);
@@ -2500,8 +2510,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     `data.q` 判断"这批还算不算当前查询的"——那样每次搜索都会把列表打回
     loading。唯一可靠的事实是发起请求时用的那组条件，记在这里。
   */
-  const listQueryRef = useRef<{ limit: number; include: MemoryInclude | null;
-    source: MemoryImportSourceFilter | null; objectId: string | null; q: string } | null>(null);
+  const listQueryRef = useRef<typeof latestQuery.current | null>(null);
 
   const loadCore = useCallback(async () => {
     const requestId = ++coreRequest.current;
@@ -2528,7 +2537,8 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     const loaded = listQueryRef.current;
     setList((current) => current.data && loaded && loaded.limit === query.limit
       && loaded.include === query.include && loaded.source === query.source
-      && loaded.objectId === query.objectId && loaded.q === query.q
+      && loaded.objectId === query.objectId && loaded.conversationScope === query.conversationScope
+      && loaded.q === query.q
       ? current : loadingSection<MemoryListResponse>());
     try {
       const data = await api.listMemories(query);
@@ -2560,9 +2570,11 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     const query = latestQuery.current;
     const current = listRef.current.data;
     const loaded = listQueryRef.current;
-    if ((!query.q && !query.source && !query.objectId) || !current?.has_more || listBusyRef.current
+    if ((!query.q && !query.source && !query.objectId && !query.conversationScope)
+      || !current?.has_more || listBusyRef.current
       || !loaded || loaded.source !== query.source || loaded.limit !== query.limit
-      || loaded.include !== query.include || loaded.objectId !== query.objectId || loaded.q !== query.q) return;
+      || loaded.include !== query.include || loaded.objectId !== query.objectId
+      || loaded.conversationScope !== query.conversationScope || loaded.q !== query.q) return;
     const offset = current.memories.length;
     const requestId = ++listRequest.current;
     listBusyRef.current = true;
@@ -2609,7 +2621,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     }
     const timer = setTimeout(() => void loadList(), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [loadList, query, limit, include, source, objectId, tab]);
+  }, [loadList, query, limit, include, source, objectId, conversationScope, tab]);
 
   useEffect(() => {
     if (tab !== 'content') return undefined;
@@ -2667,7 +2679,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
       },
       async forgetSource(memoryId) {
         await api.forgetMemorySource(memoryId);
-        setNotice({ tone: 'ok', text: '已遗忘该次发言生成的记忆。' });
+        setNotice({ tone: 'ok', text: '已遗忘该来源的记忆及其关联。' });
         await loadList();
       },
       async retract(memoryId, reason) {

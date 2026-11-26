@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.entities import EntityService, ObjectKind, RecordType
 from ling.domains.memory.purge import has_open_purge
+from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import active_source
 from ling.infra.models import EntityRow, MemoryEntityRow, MemoryEpisode, MemoryRow, Message, Subject
 
@@ -29,7 +30,9 @@ def _usable_records(model: type[MemoryRow] | type[MemoryEpisode], subject_id: st
     return query.where(MemoryRow.retracted.is_(False)) if model is MemoryRow else query
 
 
-async def list_memory_objects(session: AsyncSession, subject_id: str) -> list[dict]:
+async def list_memory_objects(
+    session: AsyncSession, subject_id: str, *, actor_id: str, allow_actor_private: bool,
+) -> list[dict]:
     if await has_open_purge(session, subject_id=subject_id):
         return []
     records = _usable_records(MemoryRow, subject_id).with_only_columns(
@@ -66,9 +69,11 @@ async def list_memory_objects(session: AsyncSession, subject_id: str) -> list[di
         }
         for row in rows
     ]
-    self_count = int(await session.scalar(select(func.count()).select_from(records)) or 0)
+    self_records = await SelfTimelineService(session, actor_id=actor_id).library_records(
+        allow_actor_private=allow_actor_private,
+    )
     return [{
-        "entity_id": "self", "name": "她自己", "kind": "self", "aliases": [], "count": self_count,
+        "entity_id": "self", "name": "她自己", "kind": "self", "aliases": [], "count": len(self_records),
     }, *objects]
 
 

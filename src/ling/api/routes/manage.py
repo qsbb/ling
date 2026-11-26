@@ -106,6 +106,7 @@ class MemoryObjectAnnotation(BaseModel):
 async def list_memory(
     auth: CurrentAuth,
     session: DbSession,
+    settings: SettingsDep,
     # `limit` 的范围只在端点判定，OpenAPI 刻意**不**写 minimum/maximum
     # （见 docs/API-WEB-V1.md §10）：加进 schema 会改变契约口径。
     limit: Annotated[
@@ -125,6 +126,7 @@ async def list_memory(
     view: Literal["library"] | None = None,
     source: Literal["astrbot_memory_companion"] | None = None,
     object_id: Annotated[str | None, Query(max_length=64)] = None,
+    conversation_scope: Literal["private", "group"] | None = None,
     offset: Annotated[int, Query(ge=0, le=2_147_483_647)] = 0,
     q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> dict:
@@ -154,16 +156,16 @@ async def list_memory(
             ErrorCode.invalid_request, "请在记忆库视图中输入有效的搜索内容",
             status_code=422, field="q",
         )
-    if (source is not None and view != "library") or (object_id and view != "library") or (
-        offset and source is None and not query and object_id is None
-    ):
+    paged = bool(source or query or object_id or conversation_scope)
+    if (paged and view != "library") or (offset and not paged):
         raise LingError(
             ErrorCode.invalid_request, "请在记忆库视图中按搜索内容、来源或对象翻页", status_code=422,
         )
     if view == "library":
         return await read_library(
             session, auth.user.subject_id, limit=limit, include=include, source=source,
-            offset=offset, query=query, object_id=object_id,
+            offset=offset, query=query, object_id=object_id, conversation_scope=conversation_scope,
+            actor_id=settings.actor_id, allow_actor_private=auth.user.role == "owner",
         )
 
     effective = include or "active"
@@ -182,11 +184,14 @@ async def list_memory(
 
 
 @router.get("/memory/objects")
-async def memory_objects(auth: CurrentAuth, session: DbSession) -> dict:
+async def memory_objects(auth: CurrentAuth, session: DbSession, settings: SettingsDep) -> dict:
     """按对象浏览记忆时用的对象目录；只含至少一条现行记忆的对象。"""
     from ling.domains.memory.objects import list_memory_objects
 
-    return {"objects": await list_memory_objects(session, auth.user.subject_id)}
+    return {"objects": await list_memory_objects(
+        session, auth.user.subject_id, actor_id=settings.actor_id,
+        allow_actor_private=auth.user.role == "owner",
+    )}
 
 
 @router.post("/memory/{memory_id}/objects")

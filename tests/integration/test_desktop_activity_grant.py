@@ -155,7 +155,12 @@ async def test_life_worker_spends_one_grant_and_records_only_verified_activity(
             assert fact.state == "completed" and fact.kind == "writing"
             assert fact.completion_evidence.startswith("kind=observed;")
             assert fact.checkpoint == {"desktop_task_id": request_id}
+    library = await owner.get("/v1/memory", params={"view": "library", "object_id": "self"})
+    assert library.status_code == 200, library.text
+    receipts = [row for row in library.json()["memories"] if row["origin"] == "tool_receipt"]
+    assert len(receipts) == (1 if outcome == "verified" else 0)
     if outcome == "verified":
+        assert f"activity:{facts[0].id}" in receipts[0]["source_event_ids"]
         response = await owner.get("/v1/life/timeline", params={"date": DAY.isoformat()})
         assert response.status_code == 200, response.text
         matching = [fact for fact in response.json()["facts"] if fact["activity_id"] == facts[0].id]

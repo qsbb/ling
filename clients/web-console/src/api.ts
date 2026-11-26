@@ -1421,6 +1421,7 @@ export const api = {
       source?: MemoryImportSourceFilter | null;
       /** 按对象看：self 或实体 id；不传 = 全部对象。 */
       objectId?: string | null;
+      conversationScope?: 'private' | 'group' | null;
       /** 服务端搜索词；空白串与不传等价。 */
       q?: string | null;
       offset?: number;
@@ -1432,9 +1433,12 @@ export const api = {
     if (options.include) query.set('include', options.include);
     if (options.source) query.set('source', options.source);
     if (options.objectId) query.set('object_id', options.objectId);
+    if (options.conversationScope) query.set('conversation_scope', options.conversationScope);
     const search = (options.q ?? '').trim();
     if (search) query.set('q', search);
-    if (search || options.source || options.objectId) query.set('offset', String(options.offset ?? 0));
+    if (search || options.source || options.objectId || options.conversationScope) {
+      query.set('offset', String(options.offset ?? 0));
+    }
     return request<MemoryListResponse>(`/v1/memory?${query.toString()}`, {
       ...(options.signal ? { signal: options.signal } : {}),
     });

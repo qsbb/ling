@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import select
 
@@ -34,6 +36,7 @@ async def _completed_activity(
     record: bool = True,
     origin: str = "simulated",
     evidence_kind: str | None = None,
+    visibility: str = "actor_private",
 ) -> str:
     """造一个已完成的活动；``record=True`` 时按生产链路派生经历。
 
@@ -46,7 +49,7 @@ async def _completed_activity(
     """
     async with session_scope() as session:
         svc = ActivityService(session, actor_id=ACTOR)
-        act = await svc.propose(kind="reading", origin=origin)
+        act = await svc.propose(kind="reading", origin=origin, visibility=visibility)
         await svc.transition(act.activity_id, "running")
         await svc.transition(
             act.activity_id,
@@ -205,6 +208,67 @@ async def test_injected_in_private_chat(logged_in: TestEnv) -> None:
     assert "self_timeline" in view.sources()
     text = view.render()
     assert "模拟" in text, "自我经历没有标明是模拟生活"
+
+
+async def test_self_library_checks_activity_evidence_and_viewer(logged_in: TestEnv) -> None:
+    from ling.domains.identity.service import IdentityService
+
+    private = await _completed_activity(
+        logged_in, origin="tool_receipt", evidence="文件新建后已回读",
+    )
+    public = await _completed_activity(
+        logged_in, visibility="public", evidence="翻过了模拟书的末页",
+    )
+    revoked = await _completed_activity(
+        logged_in, visibility="public", evidence="待失效的练习",
+    )
+    await _completed_activity(logged_in, visibility="subject_private", evidence="私聊促成的经历")
+    await _completed_activity(
+        logged_in, visibility="public", evidence_kind="clock_only", evidence="计划时段结束",
+    )
+    event_time = datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)
+    async with session_scope() as session:
+        revoked_row = await session.get_one(ActivityRow, revoked)
+        revoked_row.completion_evidence = None
+        public_experience = await session.scalar(
+            select(SelfExperienceRow).where(SelfExperienceRow.dedupe_key == dedupe_key_for(public))
+        )
+        public_experience.occurred_at = event_time
+        activity = await ActivityService(session, actor_id=ACTOR).propose(kind="future", visibility="public")
+        assert await SelfTimelineService(session, actor_id=ACTOR).record_completed_activity(
+            activity.activity_id,
+        ) is None
+        await IdentityService(session).create_user(
+            username="memory-viewer", password="viewer-password", role="member",
+        )
+
+    path = "/v1/memory"
+    params = {"view": "library", "object_id": "self"}
+    owner_response = await logged_in.client.get(path, params=params)
+    assert owner_response.status_code == 200, owner_response.text
+    owner = owner_response.json()
+    assert owner["total"] == 2
+    actual = {next(tag for tag in row["source_event_ids"] if tag.startswith("activity:")): row
+              for row in owner["memories"]}
+    assert actual[f"activity:{private}"]["origin"] == "tool_receipt"
+    public_record = actual[f"activity:{public}"]
+    assert public_record["origin"] == "simulated"
+    assert public_record["occurred_at"] == event_time.isoformat()
+    assert public_record["created_at"] != public_record["occurred_at"]
+    assert (await logged_in.client.get(path, params={**params, "q": "末页"})).json()["total"] == 1
+    assert (await logged_in.client.get(
+        path, params={**params, "conversation_scope": "private"},
+    )).json()["total"] == 0
+
+    login = await logged_in.client.post(
+        "/v1/auth/login", json={"username": "memory-viewer", "password": "viewer-password"},
+    )
+    assert login.status_code == 200, login.text
+    member_response = await logged_in.client.get(path, params=params)
+    assert member_response.status_code == 200, member_response.text
+    assert member_response.json()["memories"] == [public_record]
+    objects = (await logged_in.client.get(path + "/objects")).json()["objects"]
+    assert next(row for row in objects if row["entity_id"] == "self")["count"] == 1
 
 
 async def test_not_injected_in_group(logged_in: TestEnv) -> None:

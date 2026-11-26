@@ -23,18 +23,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.evidence import (
     activity_evidence_kind,
+    activity_ids_of_experience,
     experience_evidence_kind,
     experience_source_event_ids,
     fact_eligible_experiences,
     is_fact_eligible,
     parse_completion_evidence,
 )
-from ling.infra.models import ActivityRow, SelfExperienceRow, utcnow
+from ling.infra.models import (
+    ActivityRow,
+    DesktopTaskRow,
+    Message,
+    SelfExperienceRow,
+    Window,
+    utcnow,
+)
 from ling.infra.security import new_id
 
 # 自我经历的可见范围默认 = 角色私有。
@@ -111,7 +119,7 @@ class SelfTimelineService:
             ),
             dedupe_key=key,
             origin=str(row.origin),
-            visibility=DEFAULT_VISIBILITY,
+            visibility="public" if row.visibility == "public" else DEFAULT_VISIBILITY,
             occurred_at=row.ended_at or utcnow(),
         )
         self._session.add(created)
@@ -203,6 +211,73 @@ class SelfTimelineService:
         )
         eligible = await fact_eligible_experiences(self._session, rows, limit=limit)
         return [self._view(r) for r in eligible]
+
+    async def library_records(
+        self, *, allow_actor_private: bool, since: datetime | None = None,
+    ) -> list[tuple[SelfExperienceRow, ActivityRow]]:
+        """Check the current activity before exposing a self-experience."""
+        allowed = {"public", "actor_private"} if allow_actor_private else {"public"}
+        visible_activity = ActivityRow.visibility.in_(allowed)
+        if allow_actor_private:
+            # Older desktop receipts inherited the activity default. Recover
+            # only the actor's own verified life task with a matching receipt.
+            verified_task = select(DesktopTaskRow.id).where(
+                DesktopTaskRow.actor_id == ActivityRow.actor_id,
+                DesktopTaskRow.id == ActivityRow.checkpoint["desktop_task_id"].as_string(),
+                DesktopTaskRow.state == "succeeded",
+                DesktopTaskRow.step == "verified",
+                DesktopTaskRow.source == "life",
+            ).exists()
+            visible_activity = or_(visible_activity, and_(
+                ActivityRow.origin == "tool_receipt", ActivityRow.visibility == "subject_private",
+                verified_task,
+            ))
+        query = (
+            select(SelfExperienceRow, ActivityRow)
+            .join(ActivityRow, SelfExperienceRow.dedupe_key == func.concat("activity:", ActivityRow.id))
+            .where(
+                SelfExperienceRow.actor_id == self._actor_id,
+                ActivityRow.actor_id == self._actor_id,
+                SelfExperienceRow.archived_at.is_(None),
+                SelfExperienceRow.visibility.in_(allowed),
+                visible_activity,
+            )
+            .order_by(SelfExperienceRow.occurred_at.desc(), SelfExperienceRow.id.desc())
+        )
+        if since is not None:
+            query = query.where(SelfExperienceRow.occurred_at >= since)
+        rows = (await self._session.execute(query)).all()
+        candidates = [
+            (experience, activity)
+            for experience, activity in rows
+            if activity_ids_of_experience(experience) == [activity.id]
+            and is_fact_eligible(experience)
+            and is_fact_eligible(activity)
+            and experience_evidence_kind(experience) == activity_evidence_kind(activity)
+            and experience.origin == activity.origin
+            and experience.summary == self._summarize(activity)
+        ]
+        message_ids = {
+            activity.id: {
+                value.removeprefix("message:") for value in activity.source_event_ids or []
+                if isinstance(value, str) and value.startswith("message:")
+            }
+            for _, activity in candidates
+        }
+        referenced = set().union(*message_ids.values())
+        if not referenced:
+            return candidates
+        public_ids = set(await self._session.scalars(
+            select(Message.id).join(Window, Window.id == Message.window_id).where(
+                Message.id.in_(referenced), Window.visibility == "public",
+                Message.memory_hidden_at.is_(None), Message.retracted_at.is_(None),
+                Message.recalled_at.is_(None),
+            )
+        ))
+        return [
+            (experience, activity) for experience, activity in candidates
+            if message_ids[activity.id] <= public_ids
+        ]
 
     # ---------------------------------------------------------- 内部
 

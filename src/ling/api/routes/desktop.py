@@ -37,6 +37,7 @@ from ling.contracts.v1 import ErrorCode
 from ling.domains.activity.service import ActivityService
 from ling.domains.desktop import service as tasks
 from ling.domains.desktop.service import QUEUE_TTL
+from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.infra.models import DesktopDeviceRow, DesktopTaskRow, utcnow
 from ling.infra.security import hash_token, new_token
 
@@ -57,12 +58,15 @@ async def _record_verified_activity(session: DbSession, task: DesktopTaskRow) ->
     sources = [f"desktop_task:{task.id}"]
     if task.source_segment_id:
         sources.append(f"schedule_segment:{task.source_segment_id}")
-    activity = await service.propose(kind="writing", origin="tool_receipt", source_event_ids=sources)
+    activity = await service.propose(
+        kind="writing", origin="tool_receipt", visibility="actor_private", source_event_ids=sources,
+    )
     await service.transition(activity.activity_id, "running", now=task.started_at)
     await service.transition(
         activity.activity_id, "completed", completion_evidence="Windows 记事本回读与任务文本一致",
         checkpoint={"desktop_task_id": task.id}, now=task.finished_at,
     )
+    await SelfTimelineService(session, actor_id=task.actor_id).record_completed_activity(activity.activity_id)
 
 
 async def _status(

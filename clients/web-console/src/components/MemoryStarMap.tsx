@@ -3,7 +3,7 @@
  * 并用十二月令环连接同月记录、用事件显微镜拆解单条记忆的来龙去脉。
  *
  * 时间口径是这个文件最重要的一条边界：
- * - `import_source.occurred_at` 才是「事情发生」；
+ * - 已核验的 `occurred_at` 是事情发生的时间。
  * - `created_at` 只说明「这条记忆被记下」；
  * - 导入条目缺 `occurred_at` 时**不拿记下时间顶替**，放进「发生日期未知」列。
  * 星图横轴按实际时间间隔连续排布，不改成等宽月份表格。
@@ -36,7 +36,7 @@ export interface StarNode {
   year: number | null;
   /** 用来排横轴的时间；未知发生日期的导入条目为 null。 */
   timestamp: number | null;
-  /** 发生时间原值，只来自 `import_source.occurred_at`。 */
+  /** 本地活动或原始导入记录提供的发生时间。 */
   occurredAt: string | null;
   /** 记下时间原值，只来自 `created_at`。 */
   recordedAt: string | null;
@@ -189,8 +189,12 @@ function splitSentences(text: string): string[] {
   return parts.length > 0 ? parts : [text];
 }
 
+export function memoryOccurredAt(row: MemoryRecord): string | null {
+  return row.occurred_at ?? row.import_source?.occurred_at ?? null;
+}
+
 function dateStamp(row: MemoryRecord): { occurred: Date | null; recorded: Date | null; kind: StarDateKind; timestamp: number | null } {
-  const occurred = parseRecordDate(row.import_source?.occurred_at);
+  const occurred = parseRecordDate(memoryOccurredAt(row));
   const recorded = parseRecordDate(row.created_at);
   if (occurred) {
     return { occurred, recorded, kind: '发生', timestamp: occurred.getTime() };
@@ -212,7 +216,7 @@ export function buildMemoryMicroBeats(
   visibilityText: (visibility: string) => string,
 ): StarBeat[] {
   const beats: StarBeat[] = [];
-  const occurredIso = row.import_source?.occurred_at ?? null;
+  const occurredIso = memoryOccurredAt(row);
   const occurred = parseRecordDate(occurredIso);
   const recordedIso = row.created_at ?? row.import_source?.created_at ?? null;
   const recorded = parseRecordDate(recordedIso);
@@ -410,7 +414,7 @@ export function buildStarChartModel(
       month,
       year,
       timestamp: item.timestamp,
-      occurredAt: item.row.import_source?.occurred_at ?? null,
+      occurredAt: memoryOccurredAt(item.row),
       recordedAt: item.row.created_at ?? null,
       dateKind: item.kind,
     });
@@ -1186,8 +1190,8 @@ export function MemoryMicroscopeBeats({
             <header className="mem-theater__head">
               <div>
                 <div className="mem-theater__meta">
-                  {row.import_source?.occurred_at
-                    ? `发生 ${formatShortDate(row.import_source.occurred_at)} · 记下 ${formatShortDate(row.created_at)}`
+                  {memoryOccurredAt(row)
+                    ? `发生 ${formatShortDate(memoryOccurredAt(row))} · 记下 ${formatShortDate(row.created_at)}`
                     : row.import_source
                       ? `发生日期未记录 · 记下 ${formatShortDate(row.created_at)}`
                       : `记下 ${formatShortDate(row.created_at)}`} · {beats.length} 幕全景分镜

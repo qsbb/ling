@@ -1,6 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MemoryRecord } from '../types';
-import type { StarAffinity, StarChartModel } from './MemoryStarMap';
+import { memoryOccurredAt, type StarAffinity, type StarChartModel } from './MemoryStarMap';
 
 export interface MemoryFocusLensProps {
   model: StarChartModel;
@@ -99,7 +99,7 @@ export function MemoryFocusLens({
       </div>
       <h3 className="mem-lens__title">{row.text}</h3>
       <p className="mem-lens__when">
-        {row.import_source?.occurred_at ? `发生 ${formatShort(row.import_source.occurred_at)}` : '发生日期未知'}
+        {memoryOccurredAt(row) ? `发生 ${formatShort(memoryOccurredAt(row))}` : '发生日期未知'}
         {' · '}记下 {formatShort(row.created_at)}
       </p>
 

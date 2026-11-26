@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from unicodedata import normalize
 
 from sqlalchemy import and_, func, literal, literal_column, or_, select, true
@@ -11,8 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
+from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import active_source
-from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent
+from ling.infra.models import ActivityRow, MemoryEpisode, MemoryRow, OutboxEvent, SelfExperienceRow
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -53,6 +54,7 @@ def _episode_record(row: MemoryEpisode) -> dict[str, Any]:
         "text": row.summary,
         "origin": row.origin,
         "visibility": row.visibility,
+        "source_visibility": row.source_visibility,
         "confidence": None,
         "retracted": False,
         "retract_reason": None,
@@ -68,15 +70,41 @@ def _episode_record(row: MemoryEpisode) -> dict[str, Any]:
             "source_message_id": row.source_message_id,
             "source_window_id": row.window_id,
             "source_role": "conversation",
-            "valid_from": _iso(row.occurred_at),
+            "observed_at": _iso(row.occurred_at),
         } if row.source_message_id is not None else {}),
+    }
+
+
+def _self_experience_record(row: SelfExperienceRow, activity: ActivityRow) -> dict[str, Any]:
+    return {
+        "memory_id": row.id,
+        "kind": "episode",
+        "text": row.summary,
+        "origin": "user_statement" if activity.origin == "user_stated" else activity.origin,
+        "visibility": (
+            "public" if row.visibility == activity.visibility == "public" else "actor_private"
+        ),
+        "confidence": None,
+        "retracted": False,
+        "retract_reason": None,
+        "supersedes": None,
+        "superseded_by": None,
+        "source_event_ids": row.source_event_ids or [],
+        "valid_until": None,
+        "created_at": _iso(row.created_at),
+        "archived_at": None,
+        "can_edit": False,
+        "record_type": "self_experience",
+        "occurred_at": _iso(row.occurred_at),
     }
 
 
 async def read_library(
     session: AsyncSession, subject_id: str, *,
+    actor_id: str, allow_actor_private: bool,
     limit: int, include: str | None, source: str | None = None, offset: int = 0,
     query: str = "", object_id: str | None = None,
+    conversation_scope: Literal["private", "group"] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "memories": [], "limit": limit, "include": include, "total": 0, "has_more": False,
@@ -84,11 +112,32 @@ async def read_library(
     }
     if source is not None:
         result.update(source=source)
-    if source is not None or query or object_id:
+    if source is not None or query or object_id or conversation_scope:
         result.update(offset=offset)
     if await has_open_purge(session, subject_id=subject_id):
         result["extraction"] = {"state": "purging", "at": None}
         return result
+
+    if object_id == "self":
+        if source is not None or conversation_scope is not None:
+            return result
+        records = await SelfTimelineService(session, actor_id=actor_id).library_records(
+            allow_actor_private=allow_actor_private,
+        )
+        terms = normalize("NFKC", query).casefold().split()
+        matches = [
+            (row, activity) for row, activity in records
+            if all(term in normalize("NFKC", row.summary).casefold() for term in terms)
+        ]
+        return {
+            **result,
+            "total": len(matches),
+            "has_more": len(matches) > offset + limit,
+            "memories": [
+                _self_experience_record(row, activity)
+                for row, activity in matches[offset:offset + limit]
+            ],
+        }
 
     memory_query = select(MemoryRow).where(MemoryRow.subject_id == subject_id, active_source(MemoryRow))
     episode_query = select(MemoryEpisode).where(MemoryEpisode.subject_id == subject_id, active_source(MemoryEpisode))
@@ -99,7 +148,13 @@ async def read_library(
     if include not in {"archived", "all"}:
         memory_query = memory_query.where(MemoryRow.archived_at.is_(None))
         episode_query = episode_query.where(MemoryEpisode.archived_at.is_(None))
-    if object_id and object_id != "self":
+    if conversation_scope is not None:
+        group = "group_scope"
+        memory_group = or_(MemoryRow.source_visibility == group, MemoryRow.visibility == group)
+        episode_group = or_(MemoryEpisode.source_visibility == group, MemoryEpisode.visibility == group)
+        memory_query = memory_query.where(memory_group if conversation_scope == "group" else ~memory_group)
+        episode_query = episode_query.where(episode_group if conversation_scope == "group" else ~episode_group)
+    if object_id:
         memory_query = memory_query.where(
             MemoryRow.id.in_(linked_record_ids(subject_id, object_id, "memory")),
         )
@@ -147,7 +202,10 @@ async def read_library(
     page = []
     for memory, episode, _ in rows:
         if memory is not None:
-            page.append({**memory_record(memory), "can_edit": True, "record_type": "memory"})
+            page.append({
+                **memory_record(memory), "can_edit": True, "record_type": "memory",
+                "source_visibility": memory.source_visibility,
+            })
         elif episode is not None:
             page.append(_episode_record(episode))
 
