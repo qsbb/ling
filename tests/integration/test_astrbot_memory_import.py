@@ -467,6 +467,40 @@ async def test_group_private_sensitivity_is_rejected_before_import(logged_in: Te
     assert await _row_counts() == before
 
 
+async def test_native_legacy_group_visibility_is_preserved_without_sensitivity(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    group = {
+        "scope": "group", "group_id": GROUP_ID, "visibility": "group_public",
+        "session_id": f"default:GroupMessage:{GROUP_ID}",
+        "subject": {"kind": "bot", "id": BOT_QQ},
+        "object": {"kind": "group", "id": GROUP_ID},
+    }
+    data = _native_archive(
+        _native_entry("legacy-public-group", **group),
+        _native_entry("legacy-private-group", **group, sensitivity="private"),
+        _native_entry("legacy-unscoped-group", **{**group, "visibility": "private_pair"}),
+        _native_entry("legacy-private-pair"),
+    )
+    private = await logged_in.client.post(PREFIX + "/preview", content=data, headers=NATIVE_HEADERS)
+    assert private.status_code == 200 and private.json()["scope_counts"] == {"private": 1}
+    preview = await logged_in.client.post(
+        PREFIX + "/preview?include_group=true", content=data, headers=NATIVE_HEADERS,
+    )
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert report["scope_counts"] == {"private": 1, "group": 1}
+    assert report["scope_skip_reasons"]["group"] == {"restricted": 1, "outside_private_pair": 1}
+    response = await logged_in.client.post(
+        PREFIX + "/commit?include_group=true", content=data,
+        headers={**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]},
+    )
+    assert response.status_code == 200, response.text
+    listing = (await logged_in.client.get("/v1/memory?view=library")).json()["memories"]
+    assert {row["import_source"]["record_id"]: row["visibility"] for row in listing} == {
+        "legacy-public-group": "group_scope", "legacy-private-pair": "subject_private",
+    }
+
+
 async def test_forgetting_imported_source_blocks_archive_reupload_and_restore(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     env = logged_in

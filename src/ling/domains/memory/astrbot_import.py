@@ -255,6 +255,14 @@ def _native_memory(data: dict) -> ArchiveRecord | None:
     message_ids = _reference_ids([data.get("message_id")]) + _reference_ids(
         metadata.get("source_message_ids")
     )
+    sensitivity = data.get("sensitivity") or metadata.get("sensitivity") or "private"
+    if (
+        "sensitivity" not in data and "sensitivity" not in metadata
+        and data.get("scope") == "group" and data.get("visibility") == "group_public"
+    ):
+        # Legacy portable exports can declare group visibility without a
+        # second sensitivity field. Preserve the explicit group scope.
+        sensitivity = "internal"
     record.update(
         subject_kind=subject.get("kind"),
         subject_id=subject.get("id"),
@@ -266,7 +274,7 @@ def _native_memory(data: dict) -> ArchiveRecord | None:
         # Match the plugin's defaults when portable exports omit these fields.
         validity_status=data.get("validity_status") or metadata.get("validity_status")
         or ("archived" if data.get("lifecycle") == "archived" else "active"),
-        sensitivity=data.get("sensitivity") or metadata.get("sensitivity") or "private",
+        sensitivity=sensitivity,
         valid_from=data.get("valid_from") or metadata.get("valid_from") or None,
         valid_to=data.get("valid_to") or metadata.get("valid_to") or None,
         occurred_at=data.get("occurred_at") or None,
