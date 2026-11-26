@@ -125,7 +125,7 @@ async def _onebot_namespaces(session: DbSession, settings: Settings) -> set[str]
 
 async def _resolve_target(
     session: DbSession, auth: AuthContext, source: importer.SourcePair, onebot_namespaces: set[str],
-    *, lock: bool = False,
+    settings: Settings, *, lock: bool = False,
 ) -> importer.ImportTarget:
     subject, binding = await IdentityService(session).resolve_proven_login_binding(
         subject_id=auth.user.subject_id,
@@ -143,6 +143,9 @@ async def _resolve_target(
         binding_id=binding.id,
         binding_revision=binding.updated_at.isoformat(),
         forget_generation=subject.forget_generation,
+        actor_id=settings.actor_id,
+        persona_id=settings.persona_id,
+        instance_id=sorted(onebot_namespaces)[0] if onebot_namespaces else DEFAULT_INSTANCE_ID,
     )
 
 
@@ -171,7 +174,7 @@ async def preview(
                         return SourceChoicesOut(sources=choices)
                     source = choices[0]
             archive = importer.open_archive(file, digest=digest, header=header, source=source)
-            target = await _resolve_target(session, auth, archive.source, namespaces)
+            target = await _resolve_target(session, auth, archive.source, namespaces, settings)
             reviewed_at = utcnow().replace(microsecond=0)
             retention = MemoryService(session, policy=(await config.effective()).memory).write_retention_days()
             result = await importer.process_archive(
@@ -209,7 +212,8 @@ async def commit(
             source = _requested_source(request) if isinstance(header, importer.AstrBotNativeHeader) else None
             archive = importer.open_archive(file, digest=digest, header=header, source=source)
             target = await _resolve_target(
-                session, auth, archive.source, await _onebot_namespaces(session, settings), lock=True,
+                session, auth, archive.source, await _onebot_namespaces(session, settings),
+                settings, lock=True,
             )
             retention = MemoryService(session, policy=(await config.effective()).memory).write_retention_days()
             reviewed_at = importer.check_confirmation(

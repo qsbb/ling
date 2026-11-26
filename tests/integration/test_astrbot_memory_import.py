@@ -23,12 +23,13 @@ from ling.domains.identity.service import IdentityService
 from ling.domains.memory import astrbot_import as importer
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
-from ling.infra.models import ActorAccount, MemoryRow, OutboxEvent, Subject
+from ling.infra.models import ActorAccount, MemoryRow, OutboxEvent, Subject, Window
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
 OWNER_QQ = "100200300"
 BOT_QQ = "200300400"
+GROUP_ID = "300400500"
 PREFIX = "/v1/memory/import"
 HEADERS = {"Content-Type": "application/x-ndjson"}
 NATIVE_HEADERS = {
@@ -70,6 +71,18 @@ def _record(source_id: str = "memo-original", **changes: object) -> dict:
         "source_message_ids": ["old-message"],
         **changes,
     }
+
+
+def _group_record(source_id: str = "group-memo", **changes: object) -> dict:
+    fields = {
+        "subject_kind": "bot", "subject_id": BOT_QQ,
+        "object_kind": "group", "object_id": GROUP_ID,
+        "scope": "group", "session_id": f"onebot-default:GroupMessage:{GROUP_ID}",
+        "group_id": GROUP_ID, "visibility": "group_public", "sensitivity": "internal",
+        "content": "读书群约定周五借出蓝封画册",
+    }
+    fields.update(changes)
+    return _record(source_id, **fields)
 
 
 def _archive(*records: dict) -> bytes:
@@ -225,6 +238,47 @@ async def test_native_export_previews_and_imports_only_the_selected_private_pair
     assert (repeat.json()["accepted"], repeat.json()["duplicates"]) == (0, 1)
 
 
+async def test_group_export_imports_with_group_scope_and_window(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    data = _archive(
+        _group_record(),
+        _group_record("wrong-group", group_id="300400501", object_id="300400501"),
+        _group_record("wrong-bot", subject_id="200300401", owner_bot_id="200300401"),
+        _record("private-memo"),
+    )
+    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert report["accepted"] == 2
+    assert report["scope_counts"] == {"private": 1, "group": 1}
+    assert {sample["scope"] for sample in report["sample"]} == {"private", "group"}
+    assert report["skip_reasons"]["outside_private_pair"] == 2
+
+    headers = {**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
+    commit = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["imported"] == 2
+
+    async with session_scope() as session:
+        row = (await session.execute(
+            select(MemoryRow).where(MemoryRow.import_source["record_id"].as_string() == "group-memo")
+        )).scalar_one()
+        assert row.visibility == "group_scope"
+        assert row.source_visibility == "group_scope"
+        assert row.source_window_id
+        window = await session.get_one(Window, row.source_window_id)
+        assert window.visibility == "group_scope"
+        assert window.connector_window_ref == f"onebot-default:group:{GROUP_ID}"
+        assert window.subject_id == logged_in.subject_id
+        assert window.origin_status == "unknown"
+
+    library = (await logged_in.client.get("/v1/memory?view=library&source=astrbot_memory_companion")).json()
+    group_row = next(item for item in library["memories"] if item["import_source"]["record_id"] == "group-memo")
+    assert group_row["visibility"] == "group_scope"
+    assert group_row["import_source"]["scope"] == "group"
+    assert group_row["import_source"]["group_id"] == GROUP_ID
+
+
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     other_bot = "200300401"
@@ -249,6 +303,26 @@ async def test_native_export_offers_choices_for_multiple_proven_private_sources(
     report = response.json()
     assert report["destination"]["bot_qq"] == other_bot
     assert [row["source_id"] for row in report["sample"]] == ["second"]
+
+
+async def test_converter_group_scope_is_opt_in(logged_in: TestEnv, tmp_path: Path) -> None:
+    snapshot = tmp_path / "memory_companion.db"
+    _sqlite_snapshot(
+        snapshot,
+        _record(session_id=f"default:FriendMessage:{OWNER_QQ}"),
+        _group_record("group-summary"),
+    )
+    private_path = tmp_path / "private.jsonl"
+    assert convert(snapshot, private_path, bot_qq=BOT_QQ, owner_qq=OWNER_QQ) == (1, False)
+    assert "群聊".encode() not in private_path.read_bytes() and "蓝封画册".encode() not in private_path.read_bytes()
+    all_path = tmp_path / "all.jsonl"
+    assert convert(
+        snapshot, all_path, bot_qq=BOT_QQ, owner_qq=OWNER_QQ, include_group=True,
+    ) == (2, False)
+    rows = [json.loads(line) for line in all_path.read_text().splitlines()[1:]]
+    assert {row["scope"] for row in rows} == {"private", "group"}
+    group = next(row for row in rows if row["scope"] == "group")
+    assert group["group_id"] == GROUP_ID and group["visibility"] == "group_public"
 
 
 async def test_converted_snapshot_reaches_library_and_private_recall(

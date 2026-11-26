@@ -10,15 +10,8 @@ from contextlib import closing
 from pathlib import Path
 
 _QQ = re.compile(r"[1-9][0-9]{4,19}", re.ASCII)
-_SELECT = """
-    SELECT id, memory_type, subject_kind, subject_id, object_kind, object_id, scope,
-           session_id, platform, group_id, owner_bot_id, visibility, sayability,
-           reality_level, lifecycle, sensitivity, review_status, validity_status,
-           content, confidence, created_at, updated_at, occurred_at, valid_from,
-           valid_to, message_id, metadata
-      FROM memories
-     WHERE platform IN ('aiocqhttp', 'onebot', 'qq')
-       AND instr(session_id, ':') > 1
+_PRIVATE_MATCH = """
+       instr(session_id, ':') > 1
        AND lower(substr(session_id, instr(session_id, ':'))) IN (
             ':friendmessage:' || :owner_qq,
             ':privatemessage:' || :owner_qq,
@@ -29,6 +22,27 @@ _SELECT = """
        AND owner_bot_id = :bot_qq AND subject_kind = 'user' AND subject_id = :owner_qq
        AND ((object_kind = 'bot' AND object_id = :bot_qq)
           OR (object_kind = 'user' AND object_id = :owner_qq))
+"""
+_GROUP_MATCH = """
+       instr(session_id, ':') > 1
+       AND lower(substr(session_id, instr(session_id, ':'))) IN (
+            ':groupmessage:' || group_id,
+            ':group:' || group_id
+       )
+       AND scope = 'group' AND group_id <> '' AND visibility = 'group_public'
+       AND owner_bot_id = :bot_qq AND subject_kind = 'bot' AND subject_id = :bot_qq
+       AND object_kind = 'group' AND object_id = group_id
+"""
+_SELECT = f"""
+    SELECT id, memory_type, subject_kind, subject_id, object_kind, object_id, scope,
+           session_id, platform, group_id, owner_bot_id, visibility, sayability,
+           reality_level, lifecycle, sensitivity, review_status, validity_status,
+           content, confidence, created_at, updated_at, occurred_at, valid_from,
+           valid_to, message_id, metadata
+      FROM memories
+     WHERE platform IN ('aiocqhttp', 'onebot', 'qq')
+       AND (({_PRIVATE_MATCH})
+            OR (:include_group = 1 AND ({_GROUP_MATCH})))
      ORDER BY id
      LIMIT :limit OFFSET :offset
 """
@@ -65,6 +79,7 @@ def _record(row: sqlite3.Row) -> dict:
 
 def convert(
     snapshot: Path, output: Path, *, bot_qq: str, owner_qq: str, offset: int = 0, limit: int | None = None,
+    include_group: bool = False,
 ) -> tuple[int, bool]:
     if not _QQ.fullmatch(bot_qq) or not _QQ.fullmatch(owner_qq) or bot_qq == owner_qq:
         raise ValueError("请填写两个不同的 QQ 号，分别对应旧 Bot 和你本人")
@@ -81,7 +96,9 @@ def convert(
     with closing(sqlite3.connect(f"{snapshot.as_uri()}?mode=ro&immutable=1", uri=True)) as db:
         db.row_factory = sqlite3.Row
         cursor = db.execute(_SELECT, {
-            "bot_qq": bot_qq, "owner_qq": owner_qq, "offset": offset, "limit": -1 if limit is None else limit + 1,
+            "bot_qq": bot_qq, "owner_qq": owner_qq,
+            "offset": offset, "limit": -1 if limit is None else limit + 1,
+            "include_group": 1 if include_group else 0,
         })
         with output.open("xb") as handle:
             try:
@@ -110,17 +127,21 @@ def main() -> None:
     parser.add_argument("--owner-qq", required=True, help="本人的 QQ 号")
     parser.add_argument("--offset", type=int, default=0, help="同一份备份中从第几条之后开始")
     parser.add_argument("--limit", type=int, help="可选：最多处理多少条，默认导出所有匹配记录")
+    parser.add_argument(
+        "--include-group", action="store_true",
+        help="同时导出 Bot 在群里的共同记忆（默认只导私聊）",
+    )
     args = parser.parse_args()
     try:
         count, more = convert(
             args.snapshot, args.output, bot_qq=args.bot_qq, owner_qq=args.owner_qq,
-            offset=args.offset, limit=args.limit,
+            offset=args.offset, limit=args.limit, include_group=args.include_group,
         )
     except sqlite3.Error:
         parser.exit(1, "转换失败：请核对 SQLite 备份和 Memory Companion 的表结构。\n")
     except (OSError, ValueError) as exc:
         parser.exit(1, f"转换失败：{exc}\n")
-    print(f"已生成 {args.output}，包含 {count} 条匹配私聊记录。")
+    print(f"已生成 {args.output}，包含 {count} 条匹配记录（{'私聊+群聊' if args.include_group else '仅私聊'}）。")
     if more:
         print(f"还有记录，用同一份备份和 --offset {args.offset + count} 输出下一份文件。")
 

@@ -20,7 +20,7 @@ from sqlalchemy.schema import CreateTable
 from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
-from ling.infra.models import MemoryRow
+from ling.infra.models import MemoryRow, Window
 
 PREVIEW_LIMIT = 12
 RECORD_BATCH_SIZE = 128
@@ -40,6 +40,7 @@ _SUMMARY_TYPES = {"conversation_summary", "daily_digest", "memory_decay_summary"
 _STATEMENT_TYPES = {"manual_memory", "explicit_memory", "user_profile", "user_preference"}
 _QQ_PLATFORMS = {"aiocqhttp", "onebot", "qq"}
 _PRIVATE_SESSIONS = {"friendmessage", "privatemessage", "friend", "private"}
+_GROUP_SESSIONS = {"groupmessage", "group", "groupchat"}
 _ASTRBOT_NON_MEMORY_TYPES = ("identity", "relationship", "timeline", "acl_rule", "acl_policy")
 QQ = Annotated[str, Field(pattern=r"^[1-9][0-9]{4,19}$")]
 Reference = Annotated[str, Field(min_length=1, max_length=200)]
@@ -116,13 +117,21 @@ class ArchiveRecord(BaseModel):
     def is_summary(self) -> bool:
         return self.memory_type in _SUMMARY_TYPES
 
-    def belongs_to(self, source: SourcePair) -> bool:
+    def _session(self) -> tuple[str, str, str]:
         instance, _, session = self.session_id.partition(":")
-        session_kind, _, qq = session.partition(":")
+        session_kind, _, peer = session.partition(":")
+        return instance, session_kind.lower(), peer
+
+    @property
+    def is_group(self) -> bool:
+        return self.scope == "group"
+
+    def belongs_to_private(self, source: SourcePair) -> bool:
+        instance, session_kind, qq = self._session()
         return (
             self.platform in _QQ_PLATFORMS
             and bool(instance)
-            and session_kind.lower() in _PRIVATE_SESSIONS
+            and session_kind in _PRIVATE_SESSIONS
             and qq == source.owner_qq
             and self.scope == "private"
             and not self.group_id
@@ -134,6 +143,31 @@ class ArchiveRecord(BaseModel):
             }
             and self.owner_bot_id == source.bot_qq
         )
+
+    def belongs_to_group(self, source: SourcePair) -> bool:
+        """群聊历史：Bot 在群里看到/总结的共同经历。
+
+        只接受 Bot 自己作为 subject、群作为 object 的群摘要；群成员个人资料
+        不以群聊身份混入。来源窗口稍后由导入器绑定到内部群窗口。
+        """
+        instance, session_kind, peer = self._session()
+        return (
+            self.platform in _QQ_PLATFORMS
+            and bool(instance)
+            and session_kind in _GROUP_SESSIONS
+            and peer == self.group_id
+            and bool(self.group_id)
+            and self.scope == "group"
+            and self.visibility in {"group_public", "group_scope"}
+            and self.subject_kind == "bot"
+            and self.subject_id == source.bot_qq
+            and self.object_kind == "group"
+            and self.object_id == self.group_id
+            and self.owner_bot_id == source.bot_qq
+        )
+
+    def belongs_to(self, source: SourcePair) -> bool:
+        return self.belongs_to_private(source) or self.belongs_to_group(source)
 
     def skip_reason(
         self, source: SourcePair, *, reviewed_at: datetime, now: datetime, retention_cutoff: datetime,
@@ -307,6 +341,10 @@ class ImportTarget:
     binding_id: str
     binding_revision: str
     forget_generation: int
+    actor_id: str = "actor_ling"
+    persona_id: str = "persona_ling"
+    # 历史群没有现成的平台实例，按导入端默认 OneBot 实例建历史群窗口。
+    instance_id: str = "onebot-default"
 
 
 def sign_confirmation(
@@ -356,6 +394,7 @@ class ImportCounts(BaseModel):
     duplicates: int
     skipped: int
     skip_reasons: dict[SkipReason, int]
+    scope_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ImportSample(BaseModel):
@@ -365,6 +404,7 @@ class ImportSample(BaseModel):
     occurred_at: datetime | None
     created_at: datetime
     valid_until: datetime | None
+    scope: Literal["private", "group"] = "private"
 
 
 @dataclass(frozen=True)
@@ -394,6 +434,7 @@ async def process_archive(
     skip_reasons: Counter[SkipReason] = Counter()
     sample: list[ImportSample] = []
     total = duplicates = accepted = 0
+    accepted_scopes: Counter[str] = Counter()
     if not write:
         await session.execute(CreateTable(_PREVIEW_IDS))
     while batch := await run_in_threadpool(list, islice(archive.records, RECORD_BATCH_SIZE)):
@@ -416,11 +457,12 @@ async def process_archive(
         if not candidates:
             continue
         if write:
-            inserted = await _insert_memories(
+            inserted, inserted_scopes = await _insert_memories(
                 session, source=archive.source, target=target, candidates=candidates,
                 retention_days=retention_days,
             )
             accepted += inserted
+            accepted_scopes.update(inserted_scopes)
             duplicates += len(candidates) - inserted
             continue
 
@@ -437,6 +479,8 @@ async def process_archive(
         ))
         duplicates += len(existing)
         accepted += len(fresh) - len(existing)
+        for memory_id in fresh - existing:
+            accepted_scopes[candidates[memory_id].scope] += 1
         if len(sample) < PREVIEW_LIMIT:
             for memory_id, record in candidates.items():
                 if memory_id in fresh and memory_id not in existing:
@@ -449,6 +493,7 @@ async def process_archive(
             duplicates=duplicates,
             skipped=sum(skip_reasons.values()),
             skip_reasons=dict(skip_reasons),
+            scope_counts=dict(accepted_scopes),
         ),
         accepted=accepted,
         sample=sample,
@@ -463,7 +508,51 @@ def _sample(record: ArchiveRecord) -> ImportSample:
         occurred_at=record.occurred_at,
         created_at=record.created_at,
         valid_until=record.valid_to,
+        scope="group" if record.is_group else "private",
     )
+
+
+async def _ensure_group_window(
+    session: AsyncSession,
+    *,
+    target: ImportTarget,
+    record: ArchiveRecord,
+) -> str:
+    """历史群窗口：以导入端默认实例 + 群号建，来源未知，不冒充已核验。
+
+    这个窗口用于给群记忆一个可追溯的 `source_window_id`。它不会被当成
+    已证明的群受众；群回复是否可用仍由现有 audience/window 检查决定。
+    """
+    ref = f"{target.instance_id}:group:{record.group_id}"
+    existing = await session.scalar(
+        select(Window).where(
+            Window.actor_id == target.actor_id,
+            Window.connector_window_ref == ref,
+        ).limit(1)
+    )
+    if existing is not None:
+        return existing.id
+    window_id = "win_as_" + hashlib.sha256(
+        f"{target.actor_id}:{ref}".encode()
+    ).hexdigest()[:24]
+    cached = await session.get(Window, window_id)
+    if cached is not None:
+        return cached.id
+    window = Window(
+        id=window_id,
+        actor_id=target.actor_id,
+        persona_id=target.persona_id,
+        subject_id=target.destination.subject_id,
+        title=ref[:128],
+        channel="onebot",
+        visibility="group_scope",
+        connector_window_ref=ref,
+        origin_status="unknown",
+        message_count=0,
+    )
+    session.add(window)
+    await session.flush()
+    return window.id
 
 
 async def _insert_memories(
@@ -473,18 +562,27 @@ async def _insert_memories(
     target: ImportTarget,
     candidates: dict[str, ArchiveRecord],
     retention_days: int,
-) -> int:
+) -> tuple[int, Counter[str]]:
     rows = []
     ref = f"astrbot:{source.bot_qq}:{source.owner_qq}"
+    group_windows: dict[str, str] = {}
+    for record in candidates.values():
+        if record.is_group and record.group_id not in group_windows:
+            group_windows[record.group_id] = await _ensure_group_window(
+                session, target=target, record=record,
+            )
     for memory_id, record in candidates.items():
+        is_group = record.is_group
+        visibility = Visibility.group_scope.value if is_group else Visibility.subject_private.value
         rows.append({
             "id": memory_id,
             "subject_id": target.destination.subject_id,
             "kind": "episode" if record.is_summary else "assertion",
             "text": record.content,
             "origin": Origin.model_inference.value if record.is_summary else Origin.user_statement.value,
-            "visibility": Visibility.subject_private.value,
-            "source_visibility": Visibility.subject_private.value,
+            "visibility": visibility,
+            "source_visibility": visibility,
+            "source_window_id": group_windows.get(record.group_id) if is_group else None,
             "confidence": record.confidence,
             "source_event_ids": [
                 f"{ref}:memory:{record.id}",
@@ -500,6 +598,8 @@ async def _insert_memories(
                 "source": SOURCE,
                 "record_id": record.id,
                 "memory_type": record.memory_type,
+                "scope": record.scope,
+                "group_id": record.group_id,
                 "platform": record.platform,
                 "session_id": record.session_id,
                 "bot_qq": source.bot_qq,
@@ -512,5 +612,8 @@ async def _insert_memories(
             },
         })
     stmt = insert(MemoryRow).on_conflict_do_nothing(index_elements=[MemoryRow.id]).returning(MemoryRow.id)
-    inserted = await session.scalars(stmt, rows)
-    return len(inserted.all())
+    inserted_ids = list(await session.scalars(stmt, rows))
+    scopes: Counter[str] = Counter()
+    for memory_id in inserted_ids:
+        scopes[candidates[memory_id].scope] += 1
+    return len(inserted_ids), scopes
