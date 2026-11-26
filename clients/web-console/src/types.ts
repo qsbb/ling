@@ -412,6 +412,12 @@ export interface MemoryImportSource {
   memory_type: string;
   platform: string;
   session_id: string;
+  /** 原始会话范围：private / group。旧导入文件没有这个字段。 */
+  scope?: string;
+  /** 群聊导入才有。 */
+  group_id?: string;
+  /** 原始可见范围；群聊应为 group_scope，私聊为 private_pair/subject_private。 */
+  visibility?: string;
   bot_qq: string;
   owner_qq: string;
   occurred_at: string | null;
@@ -478,6 +484,8 @@ export interface MemoryImportSample {
   occurred_at: string | null;
   created_at: string;
   valid_until: string | null;
+  /** 群聊导入预览才有。 */
+  scope?: 'private' | 'group';
 }
 
 /** 跳过原因（闭集，页面文案见 SKIP_REASON_TEXT）。 */
@@ -499,6 +507,8 @@ export interface MemoryImportCounts {
   duplicates: number;
   skipped: number;
   skip_reasons: Partial<Record<MemoryImportSkipReason, number>>;
+  /** 按私聊/群聊分项；旧后端没有这个字段。 */
+  scope_counts?: Partial<Record<'private' | 'group', number>>;
 }
 
 export interface MemoryImportPreview extends MemoryImportCounts {

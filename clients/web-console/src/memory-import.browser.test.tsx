@@ -189,6 +189,9 @@ async function open(options: MockOptions = {}) {
   });
 
   await page.goto(`${baseUrl}/memory`, { waitUntil: 'domcontentloaded' });
+  const listButton = page.getByRole('button', { name: '列表', exact: true });
+  await listButton.waitFor({ state: 'visible' });
+  await listButton.click();
   await page.getByTestId('mem-import-entry').waitFor({ state: 'visible' });
   return { page, reads, imports };
 }

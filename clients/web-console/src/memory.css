@@ -1130,3 +1130,10 @@
   outline-offset: 2px;
   border-radius: 2px;
 }
+
+.import-scope-counts {
+  margin: -4px 0 10px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}

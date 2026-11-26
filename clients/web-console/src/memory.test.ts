@@ -60,6 +60,12 @@ import {
   type TombstoneFlags,
 } from './components/MemoryPage';
 import { CoreMemorySection } from './components/MemoryPage';
+import {
+  buildMemoryMicroBeats,
+  buildStarChartModel,
+  connectedStarEntries,
+  type StarChartModel,
+} from './components/MemoryStarMap';
 import { parseRoute, routePath } from './route';
 import type {
   CoreMemoryItem,
@@ -215,6 +221,7 @@ function renderList(
       onSearchChange: props.onSearchChange ?? (() => undefined),
       onLoadMore: props.onLoadMore ?? (() => undefined),
       loadingMore: props.loadingMore ?? false,
+      defaultView: props.defaultView ?? 'list',
     }),
   );
 }
@@ -788,6 +795,25 @@ describe('前端筛选（kind / 时间）', () => {
     const noTime = { ...MEM_A, memory_id: 'no_time', created_at: null };
     expect(filterMemories([noTime], { kind: 'all', range: '7d' }, now)).toEqual([]);
     expect(filterMemories([noTime], { kind: 'all', range: 'all' }, now)).toEqual([noTime]);
+  });
+
+  it('会话筛选把群聊和私聊分开，群聊不冒充仅本人', () => {
+    const group = {
+      ...MEM_A,
+      memory_id: 'mem_group',
+      visibility: 'group_scope' as const,
+      import_source: {
+        source: 'astrbot_memory_companion', record_id: 'g1', memory_type: 'conversation_summary',
+        platform: 'aiocqhttp', session_id: 'default:GroupMessage:100200300', bot_qq: '10000',
+        owner_qq: '10001', occurred_at: null, created_at: MEM_A.created_at ?? '',
+        updated_at: MEM_A.created_at ?? '', valid_from: null, valid_to: null,
+      },
+    };
+    const privateRow = { ...MEM_A, memory_id: 'mem_private' };
+    const rows = [group, privateRow];
+    expect(filterMemories(rows, { kind: 'all', range: 'all', originScope: 'group' }, now).map((r) => r.memory_id)).toEqual(['mem_group']);
+    expect(filterMemories(rows, { kind: 'all', range: 'all', originScope: 'private' }, now).map((r) => r.memory_id)).toEqual(['mem_private']);
+    expect(filterMemories(rows, { kind: 'all', range: 'all' }, now).map((r) => r.memory_id)).toEqual(['mem_group', 'mem_private']);
   });
 
   it('筛选只作用于已取回的数据：界面明说已取回 X 条 / 筛选后 Y 条', () => {
@@ -1524,5 +1550,195 @@ describe('删除进度：轮询 purge/status，有上限、可卸载', () => {
       vi.resetModules();
       vi.useRealTimers();
     }
+  });
+});
+
+
+/* ------------------------------------------------------------ 记忆星图模型 */
+
+function starMemory(
+  id: string,
+  text: string,
+  created_at: string | null,
+  extra: Partial<MemoryRecord> = {},
+): MemoryRecord {
+  return {
+    ...MEM_A,
+    memory_id: id,
+    text,
+    created_at,
+    source_event_ids: [],
+    ...extra,
+  };
+}
+
+function importedAt(
+  recordId: string,
+  occurredAt: string | null,
+  createdAt: string,
+  sessionId = 'session_same',
+): NonNullable<MemoryRecord['import_source']> {
+  return {
+    source: 'astrbot_memory_companion',
+    record_id: recordId,
+    memory_type: 'event',
+    platform: 'qq',
+    session_id: sessionId,
+    bot_qq: '100200300',
+    owner_qq: '100200301',
+    occurred_at: occurredAt,
+    created_at: createdAt,
+    updated_at: createdAt,
+    valid_from: null,
+    valid_to: null,
+  };
+}
+
+const chart = (rows: MemoryRecord[]): StarChartModel =>
+  buildStarChartModel(rows, kindLabel, originLabel, labelVisibility);
+
+function labelVisibility(value: string): string {
+  return value;
+}
+
+describe('记忆星图模型：时间、月份与依据', () => {
+  it('横轴按实际时间间隔连续排布，不把月份拉成等宽格子', () => {
+    const model = chart([
+      starMemory('a', '一月一日', '2025-01-01T00:00:00Z'),
+      starMemory('b', '一月十一日', '2025-01-11T00:00:00Z'),
+      starMemory('c', '三月二十二日', '2025-03-22T00:00:00Z'),
+    ]);
+    const a = model.nodeMap.a!;
+    const b = model.nodeMap.b!;
+    const c = model.nodeMap.c!;
+    expect(b.xPx - a.xPx).toBeGreaterThan(0);
+    expect(c.xPx - b.xPx).toBeGreaterThan(0);
+    // 10 天对 70 天，比例应接近 1:7；等宽月份会把它们画成一样宽。
+    expect((c.xPx - b.xPx) / (b.xPx - a.xPx)).toBeGreaterThan(6.5);
+    expect((c.xPx - b.xPx) / (b.xPx - a.xPx)).toBeLessThan(7.5);
+  });
+
+  it('年份、轨道与卡片内容来自记录本身', () => {
+    const model = chart([
+      starMemory('ep', '去河边看展', '2025-05-02T10:00:00Z', { kind: 'episode' }),
+      starMemory('as', '她喜欢桂花', '2025-05-03T10:00:00Z', { kind: 'assertion' }),
+      starMemory('pr', '先翻日程再看记忆', '2025-05-04T10:00:00Z', { kind: 'procedure' }),
+      starMemory('ot', '神秘类型', '2025-05-05T10:00:00Z', { kind: 'mystery' }),
+    ]);
+    expect(model.lanes.map((lane) => lane.id)).toEqual(['episode', 'assertion', 'procedure', 'other']);
+    expect(model.nodeMap.ep!.lane).toBe('episode');
+    expect(model.nodeMap.as!.lane).toBe('assertion');
+    expect(model.nodeMap.pr!.lane).toBe('procedure');
+    expect(model.nodeMap.ot!.lane).toBe('other');
+    expect(model.yearTicks.map((tick) => tick.year)).toEqual([2025]);
+    expect(model.nodeMap.ep!.beats[0]?.detail).toContain('2025-05-02');
+    expect(model.nodeMap.ep!.beats[1]?.detail).toBe('去河边看展');
+  });
+
+  it('同年同月与跨年同月分开记录，弧线标签说明是哪种关系', () => {
+    const model = chart([
+      starMemory('j25a', '一月第一件事', '2025-01-05T00:00:00Z'),
+      starMemory('j25b', '一月第二件事', '2025-01-20T00:00:00Z'),
+      starMemory('j26', '次年一月', '2026-01-10T00:00:00Z'),
+    ]);
+    expect(model.sameYearMonths).toContain(1);
+    expect(model.crossYearMonths).toContain(1);
+    expect(model.monthYears[1]).toEqual([2025, 2026]);
+    expect(model.lunarArcs.map((arc) => arc.kind)).toEqual(['same-year', 'cross-year']);
+    expect(model.lunarArcs[0]?.label).toBe('2025·1月同月');
+    expect(model.lunarArcs[1]?.label).toBe('1月跨年 2025→2026');
+  });
+
+  it('导入条目缺发生时间时进入未知列，不拿记下时间顶替', () => {
+    const model = chart([
+      starMemory('dated', '有发生时间', '2026-06-01T00:00:00Z', {
+        import_source: importedAt('r1', '2024-05-10T00:00:00Z', '2026-06-01T00:00:00Z'),
+      }),
+      starMemory('unknown', '只有记下时间', '2026-07-01T00:00:00Z', {
+        import_source: importedAt('r2', null, '2026-07-01T00:00:00Z'),
+      }),
+      starMemory('plain', '普通记忆', '2026-08-01T00:00:00Z'),
+    ]);
+    expect(model.unknownDateCount).toBe(1);
+    expect(model.nodeMap.unknown!.dateKind).toBe('未知');
+    expect(model.nodeMap.unknown!.timestamp).toBeNull();
+    expect(model.nodeMap.unknown!.month).toBeNull();
+    expect(model.nodeMap.unknown!.xPx).toBeGreaterThan(model.nodeMap.plain!.xPx);
+    expect(model.nodeMap.dated!.dateKind).toBe('发生');
+    expect(model.nodeMap.plain!.dateKind).toBe('记下');
+    expect(model.monthCounts[7]).toBeUndefined();
+    expect(model.monthCounts[8]).toBe(1);
+  });
+
+  it('纠正链与共享来源事件各自成线，同地点或同旧会话不算同一事件', () => {
+    const model = chart([
+      starMemory('old', '以前说周三闭馆', '2025-01-01T00:00:00Z', {
+        superseded_by: 'new',
+      }),
+      starMemory('new', '其实周四闭馆', '2025-02-01T00:00:00Z', {
+        supersedes: 'old',
+      }),
+      starMemory('eventA', '同一次展览的见闻', '2025-03-01T00:00:00Z', {
+        source_event_ids: ['evt_shared'],
+      }),
+      starMemory('eventB', '同一次展览的收据', '2025-03-02T00:00:00Z', {
+        source_event_ids: ['evt_shared'],
+      }),
+      starMemory('samePlaceA', '河畔展馆五月换展', '2025-04-01T00:00:00Z', {
+        source_event_ids: ['evt_place_a'],
+        import_source: importedAt('p1', '2025-04-01T00:00:00Z', '2025-04-02T00:00:00Z', 'session_shared'),
+      }),
+      starMemory('samePlaceB', '河畔展馆的咖啡', '2025-04-03T00:00:00Z', {
+        source_event_ids: ['evt_place_b'],
+        import_source: importedAt('p2', '2025-04-03T00:00:00Z', '2025-04-04T00:00:00Z', 'session_shared'),
+      }),
+    ]);
+    const corrections = model.causalEdges.filter((edge) => edge.kind === 'correction');
+    const sources = model.causalEdges.filter((edge) => edge.kind === 'source');
+    expect(corrections).toHaveLength(1);
+    expect(corrections[0]).toMatchObject({ from: 'old', to: 'new', reason: '纠正链' });
+    expect(sources).toHaveLength(1);
+    expect(sources[0]).toMatchObject({ from: 'eventA', to: 'eventB', reason: '同源事件', evidence: 'evt_shared' });
+    expect(model.causalEdges.some((edge) => edge.from === 'samePlaceA' && edge.to === 'samePlaceB')).toBe(false);
+  });
+
+  it('显微镜先区分发生与记下，再讲依据和前后经过', () => {
+    const row = starMemory('imported', '展览上拿到一张明信片', '2026-06-01T00:00:00Z', {
+      import_source: importedAt('r1', '2024-05-10T00:00:00Z', '2026-06-01T00:00:00Z'),
+      supersedes: 'older',
+      source_event_ids: ['evt_show'],
+    });
+    const beats = buildMemoryMicroBeats(row, kindLabel, originLabel, labelVisibility);
+    expect(beats[0]?.kind).toBe('time');
+    expect(beats[0]?.detail).toContain('2024-05-10');
+    expect(beats[0]?.detail).toContain('2026-06-01');
+    expect(beats[1]?.detail).toBe(row.text);
+    expect(beats[2]?.detail).toContain('evt_show');
+    expect(beats[2]?.detail).toContain('r1');
+    expect(beats.at(-1)?.kind).toBe('evolution');
+
+    const unknown = starMemory('u', '不知道哪天发生的', '2026-06-01T00:00:00Z', {
+      import_source: importedAt('r2', null, '2026-06-01T00:00:00Z'),
+    });
+    const unknownBeats = buildMemoryMicroBeats(unknown, kindLabel, originLabel, labelVisibility);
+    expect(unknownBeats[0]?.title).toBe('只有记下时间，没有发生时间');
+    expect(unknownBeats[0]?.detail).toContain('2026-06-01');
+    expect(unknownBeats[0]?.detail).not.toContain('发生于');
+  });
+
+  it('相关跳读只返回可核对的关系，不重复同一条', () => {
+    const model = chart([
+      starMemory('a', '旧说法', '2025-01-01T00:00:00Z', { superseded_by: 'b', source_event_ids: ['evt_1'] }),
+      starMemory('b', '新说法', '2025-02-01T00:00:00Z', { supersedes: 'a' }),
+      starMemory('c', '同月', '2025-01-15T00:00:00Z'),
+      starMemory('d', '同一次对话里的另一条', '2025-03-01T00:00:00Z', { source_event_ids: ['evt_1'] }),
+    ]);
+    const links = connectedStarEntries(model, 'a');
+    expect(links.filter((link) => link.kind === 'correction')).toHaveLength(1);
+    expect(links.filter((link) => link.kind === 'source')).toHaveLength(1);
+    expect(links.every((link) => link.row.memory_id !== 'a')).toBe(true);
+    expect(links.find((link) => link.kind === 'correction')?.reason).toContain('纠正链');
+    expect(links.find((link) => link.kind === 'source')?.reason).toContain('evt_1');
+    expect(links.find((link) => link.kind === 'source')?.row.memory_id).toBe('d');
   });
 });

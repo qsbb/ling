@@ -644,6 +644,7 @@ function SampleList({ samples }: { samples: MemoryImportSample[] }): React.React
             <li key={sample.source_id} data-testid="import-sample">
               <span className="import-sample__kind">
                 {sample.kind === 'episode' ? '经历' : '断言'}
+                {sample.scope === 'group' ? ' · 群聊' : ''}
               </span>
               <p className="import-sample__text">{sample.text}</p>
               {when ? <time dateTime={sample.occurred_at ?? sample.created_at ?? undefined}>{when}</time> : null}
@@ -732,6 +733,12 @@ function PreviewStage({
         <span className="import-count-block__unit">条可导入</span>
         <span className="import-count-block__total">共 {preview.total} 条记忆记录</span>
       </div>
+
+      {preview.scope_counts && (preview.scope_counts.private || preview.scope_counts.group) ? (
+        <p className="import-scope-counts" data-testid="import-scope-counts">
+          私聊 {preview.scope_counts.private ?? 0} 条 · 群聊 {preview.scope_counts.group ?? 0} 条
+        </p>
+      ) : null}
 
       {empty && zeroHint ? (
         <div className="import-zero" data-testid="import-zero">

@@ -8,7 +8,7 @@
  * 6. 长期、核心、学习读取分别失败时，当前分区能解释失败，其他分区仍可读。
  * 只用公开 /v1 契约与约定的可访问名称/test id。mock 不验证真实后端或真实持久化。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import react from '@vitejs/plugin-react';
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import type { MemoryRecord } from './types';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const WAIT = 8_000;
@@ -105,7 +106,11 @@ const error = (code: string, message: string, status: number) => json({
 interface MockOptions {
   start?: Tab;
   mobile?: boolean;
+  viewport?: { width: number; height: number };
+  /** 旧用例默认切到列表；`default` 不切换，用来验证产品默认星图。 */
+  view?: 'stars' | 'list' | 'default';
   largeBatch?: boolean;
+  memories?: MemoryRecord[];
   fail?: typeof LIST | typeof CORE | typeof CONFIG;
   /**
    * 回到「服务端搜索之前」的行为：只按 `limit` 截断，**忽略 `q`/`offset`**。
@@ -121,7 +126,7 @@ interface MockOptions {
 
 async function openWorkspace(options: MockOptions = {}) {
   const context = await browser.newContext({
-    viewport: options.mobile ? { width: 375, height: 760 } : { width: 1366, height: 900 },
+    viewport: options.viewport ?? (options.mobile ? { width: 375, height: 760 } : { width: 1366, height: 900 }),
     hasTouch: options.mobile, isMobile: options.mobile, reducedMotion: 'reduce', serviceWorkers: 'block',
   });
   contexts.push(context);
@@ -138,7 +143,7 @@ async function openWorkspace(options: MockOptions = {}) {
   let releaseSettled!: () => void;
   const settledDone = new Promise<void>(resolve => { releaseSettled = resolve; });
   const writes: { method: string; path: string; body: unknown }[] = [];
-  let rows = [FAVORITE, WALK, RETRACTED, ARCHIVED];
+  let rows: MemoryRecord[] = options.memories ?? [FAVORITE, WALK, RETRACTED, ARCHIVED];
   if (options.largeBatch) {
     rows.push(...Array.from({ length: 202 }, (_, i) => memory(`mem_sample_${i}`, `批次样本 ${i + 1}`)), OUTSIDE_BATCH);
   }
@@ -240,6 +245,13 @@ async function openWorkspace(options: MockOptions = {}) {
     return route.fulfill(error('not_found', `${method} ${path}`, 404));
   });
   await page.goto(`${baseUrl}${TABS[options.start ?? '记忆库']}`, { waitUntil: 'domcontentloaded' });
+  const view = options.view ?? 'list';
+  if ((options.start ?? '记忆库') === '记忆库' && view === 'list') {
+    const listButton = page.getByRole('button', { name: '列表', exact: true });
+    await listButton.waitFor({ state: 'visible' });
+    await listButton.click();
+    await expect.poll(() => listButton.getAttribute('aria-pressed'), { timeout: WAIT }).toBe('true');
+  }
   return { page, reads, writes, heldRequests, heldDone: () => heldSettled, settledDone };
 }
 
@@ -309,14 +321,107 @@ async function tabTo(page: Page, target: Locator, description: string) {
   expect(await target.evaluate(el => el === document.activeElement), description).toBe(true);
 }
 
-async function notWiderThanMobileViewport(page: Page) {
+async function notWiderThanViewport(page: Page, width: number) {
   const widths = await page.evaluate(() => ({
     css: document.documentElement.clientWidth,
     content: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
   }));
-  expect(widths.css, '应使用移动端 CSS 视口，不能靠缩放把桌面页塞进去').toBe(375);
-  expect(widths.content, '页面不应横向溢出').toBeLessThanOrEqual(widths.css + 1);
+  expect(widths.css, '应使用指定的 CSS 视口，不能靠缩放把桌面页塞进去').toBe(width);
+  expect(widths.content, '页面不应横向溢出').toBeLessThanOrEqual(width + 1);
 }
+async function notWiderThanMobileViewport(page: Page) {
+  await notWiderThanViewport(page, 375);
+}
+
+
+/* ------------------------------------------------------- 星图：虚构记忆夹具 */
+
+function importedMemory(
+  id: string,
+  text: string,
+  created: string,
+  occurred: string | null,
+  extra: Partial<MemoryRecord> = {},
+): MemoryRecord {
+  return {
+    ...memory(id, text),
+    created_at: created,
+    import_source: {
+      source: 'astrbot_memory_companion',
+      record_id: `rec_${id}`,
+      memory_type: 'event',
+      platform: 'qq',
+      session_id: 'session_shared',
+      bot_qq: '100200300',
+      owner_qq: '100200301',
+      occurred_at: occurred,
+      created_at: created,
+      updated_at: created,
+      valid_from: null,
+      valid_to: null,
+    },
+    ...extra,
+  };
+}
+
+const STAR_DRAWING = importedMemory(
+  'star_drawings', '在河畔展馆领取展览明信片',
+  '2026-06-01T08:00:00Z', '2024-05-12T10:00:00Z',
+  { kind: 'episode', source_event_ids: ['evt_drawings'] },
+);
+const STAR_POSTER = importedMemory(
+  'star_poster', '两年后又看到同一展览的海报',
+  '2026-06-02T08:00:00Z', '2026-05-18T10:00:00Z',
+  { kind: 'episode', source_event_ids: ['evt_drawings'] },
+);
+const STAR_MAY_A = importedMemory(
+  'star_may_a', '五月喜欢坐在窗边',
+  '2026-06-03T08:00:00Z', '2026-05-02T09:00:00Z',
+  { kind: 'assertion', source_event_ids: ['evt_may_a'] },
+);
+const STAR_MAY_B = importedMemory(
+  'star_may_b', '五月把杯子换成白色',
+  '2026-06-04T08:00:00Z', '2026-05-25T09:00:00Z',
+  { kind: 'assertion', source_event_ids: ['evt_may_b'] },
+);
+const STAR_SAME_PLACE = importedMemory(
+  'star_same_place', '河畔展馆五月调整开放时间',
+  '2026-06-05T08:00:00Z', '2026-05-10T09:00:00Z',
+  { kind: 'assertion', source_event_ids: ['evt_place_only'] },
+);
+const STAR_UNKNOWN = importedMemory(
+  'star_unknown', '小时候做过纸风车',
+  '2026-09-01T08:00:00Z', null,
+  { kind: 'episode', source_event_ids: ['evt_unknown'] },
+);
+const STAR_REGULAR: MemoryRecord = {
+  ...memory('star_regular', '没有发生时间的普通记忆'),
+  created_at: '2026-11-03T10:00:00Z',
+  source_event_ids: ['evt_regular'],
+};
+const STAR_OLD: MemoryRecord = {
+  ...memory('star_old', '以前记成周三闭馆'),
+  created_at: '2025-01-10T10:00:00Z',
+  superseded_by: 'star_new',
+  source_event_ids: ['evt_old'],
+};
+const STAR_NEW: MemoryRecord = {
+  ...memory('star_new', '后来纠正为周四闭馆'),
+  created_at: '2025-02-10T10:00:00Z',
+  supersedes: 'star_old',
+  source_event_ids: ['evt_new'],
+};
+const STAR_DENSE: MemoryRecord[] = Array.from({ length: 12 }, (_, index) => ({
+  ...memory(`star_dense_${index}`, `密集记录 ${index + 1}`),
+  created_at: '2026-05-05T12:00:00Z',
+  source_event_ids: [`evt_dense_${index}`],
+}));
+const STAR_ROWS: MemoryRecord[] = [
+  STAR_DRAWING, STAR_POSTER, STAR_MAY_A, STAR_MAY_B, STAR_SAME_PLACE,
+  STAR_UNKNOWN, STAR_REGULAR, STAR_OLD, STAR_NEW, ...STAR_DENSE,
+];
+
+const SHOTS = fileURLToPath(new URL('../../../docs/evidence/memory-star-map/', import.meta.url));
 
 describe('记忆工作区：独立浏览器验收', () => {
   it('搜索走服务端：能找到第一页之外的旧条目，计数与翻页如实反映命中量', async () => {
@@ -685,6 +790,7 @@ describe('记忆工作区：独立浏览器验收', () => {
       await visible(errorHint);
       if (failure.endpoint !== LIST) {
         await goToTab(page, '记忆库');
+        await page.getByRole('button', { name: '列表', exact: true }).click();
         await visible(row(page, FAVORITE));
         await row(page, FAVORITE).click();
         await visible(detailHeading(page));
@@ -701,4 +807,208 @@ describe('记忆工作区：独立浏览器验收', () => {
       await visible(privacyControl(page));
     }, CASE_TIMEOUT);
   }
+
+  it('星图：连续时间轴、同年/跨年弧线、依据连线、未知发生日期与列表共用详情', async () => {
+    await mkdir(SHOTS, { recursive: true });
+    const { page, reads } = await openWorkspace({
+      memories: STAR_ROWS, view: 'default', viewport: { width: 1440, height: 1000 },
+    });
+    const canvas = page.getByTestId('mem-star-canvas');
+    await visible(canvas);
+    /* A 版结构：月令环在左、时间轴在右、详情全宽在下方，且首屏能看到详情标题。 */
+    const rail = page.locator('.mem-star-rail');
+    const main = page.locator('.mem-star-main');
+    const railBox = await rail.boundingBox();
+    const mainBox = await main.boundingBox();
+    expect(railBox && mainBox).toBeTruthy();
+    expect(railBox!.x + railBox!.width).toBeLessThanOrEqual(mainBox!.x + 1);
+    expect(Math.abs(railBox!.y - mainBox!.y)).toBeLessThanOrEqual(1);
+    // 默认只读图：不弹镜片，也不展开详情；详情是显式深读。
+    await hidden(page.getByTestId('mem-focus-lens'));
+    await hidden(detail(page));
+    const workspaceBox = await page.locator('[data-testid="mem-list"]').boundingBox();
+    expect(workspaceBox!.width).toBeGreaterThan(mainBox!.width);
+    const card = (id: string) => canvas.locator(`[data-memory-id="${id}"]`);
+    const x = async (id: string) => card(id).evaluate((element) => (element.parentElement as HTMLElement).offsetLeft);
+
+    // ⓪ 记忆范围：筛选面板能切全部 / 仅私聊 / 仅群聊。
+    await page.getByRole('button', { name: /^筛选/ }).click();
+    const scopeSelect = page.locator('#mem-discovery-filters select').filter({ has: page.locator('option[value="group"]') });
+    await visible(scopeSelect);
+    expect(await scopeSelect.locator('option').allTextContents()).toEqual(['全部记忆', '仅私聊', '仅群聊']);
+    await scopeSelect.selectOption('group');
+    await visible(page.getByTestId('mem-filter-empty'));
+    await scopeSelect.selectOption('all');
+    await page.getByRole('button', { name: /^筛选/ }).click();
+
+    // ① 横轴连续：2024-05 → 2026-05 的间隔远大于 2026-05 → 2026-11。
+    const longGap = await x('star_poster') - await x('star_drawings');
+    const shortGap = await x('star_regular') - await x('star_poster');
+    expect(longGap).toBeGreaterThan(shortGap * 3.5);
+    expect(longGap).toBeLessThan(shortGap * 5.2);
+
+    // ② 依据各自成线：共享具体事件与纠正链各一条；同地点/同旧会话不连线。
+    expect(await canvas.locator('path[data-kind="source"]').count()).toBe(1);
+    expect(await canvas.locator('path[data-kind="correction"]').count()).toBe(1);
+    expect(await canvas.locator('path[data-kind="source"][data-from="star_same_place"]').count()).toBe(0);
+    expect(await canvas.locator('path[data-kind="correction"][data-from="star_same_place"]').count()).toBe(0);
+    expect(await canvas.locator('path[data-from="star_drawings"][data-to="star_poster"]').count()).toBe(1);
+
+    // ③ 发生日期未知独立成列，不被记下时间顶替。
+    await visible(card('star_unknown'));
+    expect(await card('star_unknown').getAttribute('data-date-kind')).toBe('未知');
+    expect(await x('star_unknown')).toBeGreaterThan(await x('star_regular'));
+    expect(await card('star_drawings').getAttribute('data-date-kind')).toBe('发生');
+    expect(await card('star_regular').getAttribute('data-date-kind')).toBe('记下');
+
+    // ④ 月令环区分同年同月与跨年同月。
+    const wheel = page.getByTestId('mem-month-wheel');
+    await wheel.getByRole('button', { name: /5月（/ }).click();
+    await expect.poll(() => canvas.locator('path[data-month="5"].mem-star-arc--lunar-cross-year').count())
+      .toBeGreaterThan(0);
+    await expect.poll(() => canvas.locator('path[data-month="5"].mem-star-arc--lunar-same-year').count())
+      .toBeGreaterThan(0);
+    await visible(canvas.getByText(/5月跨年 2024→2026/).first());
+    await visible(canvas.getByText(/2026·5月同月/).first());
+    await paint(page);
+    await page.screenshot({ path: join(SHOTS, '1440-star.png'), fullPage: true });
+
+    // ⑤ 放大镜：点卡片后强/中关联保留，弱关联淡出；同地点不误连。
+    await card('star_drawings').click();
+    const lens = page.getByTestId('mem-focus-lens');
+    await visible(lens);
+    expect(await canvas.locator('[data-memory-id="star_poster"].mem-star-node--link-strong').count()).toBe(1);
+    expect(await canvas.locator('[data-memory-id="star_unknown"].mem-star-node--dim').count()).toBe(1);
+    const lensText = await lens.innerText();
+    expect(lensText).toContain('同源事件');
+    expect(lensText).toMatch(/同一天|相邻三天|同月/);
+    const lensBox = await lens.boundingBox();
+    const strongBox = await card('star_poster').boundingBox();
+    const drawingBox = await card('star_drawings').boundingBox();
+    expect(lensBox && strongBox && drawingBox).toBeTruthy();
+    // 镜片贴在选中卡片下方/上方，不能盖住强关联卡片。
+    const overlapsStrong = !(lensBox!.x + lensBox!.width <= strongBox!.x
+      || strongBox!.x + strongBox!.width <= lensBox!.x
+      || lensBox!.y + lensBox!.height <= strongBox!.y
+      || strongBox!.y + strongBox!.height <= lensBox!.y);
+    expect(overlapsStrong).toBe(false);
+    await paint(page);
+    await page.screenshot({ path: join(SHOTS, '1440-star-lens.png'), fullPage: true });
+
+    // ⑥ 关闭镜片恢复全图；再点卡片重新聚焦。
+    await lens.getByRole('button', { name: '收起放大镜' }).click();
+    await hidden(lens);
+    expect(await canvas.locator('.mem-star-node--dim').count()).toBe(0);
+    await card('star_drawings').click();
+    await visible(lens);
+    expect(await canvas.locator('.mem-star-node--dim').count()).toBeGreaterThan(0);
+
+    // ⑦ 点“看完整详情”进入既有详情、来源与分镜。
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
+    const inspector = detail(page);
+    await visible(detailHeading(page));
+    const detailText = await inspector.innerText();
+    expect(detailText).toContain(STAR_DRAWING.text);
+    expect(detailText).toContain('2024-05-12');
+    expect(detailText).toContain('2026-06-01');
+    expect(detailText).toContain('发生时间');
+    expect(detailText).toContain('记下时间');
+    const micro = inspector.getByTestId('mem-microscope');
+    await visible(micro);
+    await micro.getByRole('button', { name: /全景分镜/ }).click();
+    const theater = page.getByRole('dialog', { name: '记忆全景分镜' });
+    await visible(theater);
+    const theaterText = await theater.innerText();
+    expect(theaterText).toContain(STAR_DRAWING.text);
+    expect(theaterText).toContain('evt_drawings');
+    await paint(page);
+    await page.screenshot({ path: join(SHOTS, '1440-theater.png'), fullPage: true });
+    const theaterOpen = micro.getByRole('button', { name: /全景分镜/ });
+    await page.keyboard.press('Escape');
+    await hidden(theater);
+    expect(await theaterOpen.evaluate((button) => document.activeElement === button)).toBe(true);
+
+    // ⑥ 详情内的关联跳读仍走既有路径，只换详情、不依赖星图镜片。
+    await inspector.getByTestId('mem-microscope').getByRole('button', { name: /同源事件.*两年后又看到/ }).click();
+    await visible(inspector.getByText(STAR_POSTER.text, { exact: true }).filter({ visible: true }).first());
+    // 纠正链要从旧说法那条进入，不能拿海报的详情去找纠正按钮。
+    await card('star_old').click();
+    await visible(lens);
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
+    await visible(inspector.getByText(STAR_OLD.text, { exact: true }).filter({ visible: true }).first());
+    await inspector.getByTestId('mem-microscope').getByRole('button', { name: /纠正链.*周四闭馆/ }).click();
+    await visible(inspector.getByText(STAR_NEW.text, { exact: true }).filter({ visible: true }).first());
+
+    // ⑦ 星图点卡片先换镜片，不偷换详情；详情入口仍保留编辑能力。
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
+    await visible(inspector.getByRole('button', { name: '纠正…', exact: true }));
+    await inspector.getByRole('button', { name: '纠正…', exact: true }).click();
+    await visible(inspector.getByRole('form', { name: '纠正这条记忆' }));
+    await inspector.getByRole('button', { name: '取消', exact: true }).click();
+    expect(await inspector.getByRole('button', { name: /^遗忘/ }).count()).toBe(0);
+
+    // ⑧ 搜索走服务端，星图与列表共享同一批结果；切回列表仍保留选中详情。
+    await search(page).fill('纸风车');
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('q'), { timeout: WAIT }).toBe('纸风车');
+    await visible(card('star_unknown'));
+    await hidden(card('star_drawings'));
+    await page.getByRole('button', { name: '列表', exact: true }).click();
+    await visible(row(page, STAR_UNKNOWN));
+    await hidden(row(page, STAR_DRAWING));
+    await page.getByRole('button', { name: '星图', exact: true }).click();
+    await visible(card('star_unknown'));
+
+    // ⑨ 本地筛选只收窄视图，不重发搜索；清除后回到全量星图。
+    await search(page).fill('');
+    await visible(card('star_drawings'));
+    await page.getByRole('button', { name: '事实与线索', exact: true }).click();
+    await hidden(card('star_drawings'));
+    await visible(card('star_may_a'));
+    await page.getByRole('button', { name: '全部', exact: true }).click();
+    await visible(card('star_drawings'));
+  }, 90_000);
+
+  it('星图 375 / 320：画布内部平移、详情可读、返回把焦点还给卡片', async () => {
+    await mkdir(SHOTS, { recursive: true });
+    for (const width of [375, 320] as const) {
+      const { page } = await openWorkspace({
+        memories: STAR_ROWS, view: 'stars', mobile: true,
+        viewport: { width, height: 760 },
+      });
+      const canvas = page.getByTestId('mem-star-canvas');
+      await visible(canvas);
+      await notWiderThanViewport(page, width);
+      const tabs = page.locator('.mem-tabs');
+      expect(await tabs.locator('.mem-tab').count()).toBe(5);
+      expect(await tabs.evaluate((node) => node.getBoundingClientRect().height)).toBeGreaterThan(30);
+      const rail = page.locator('.mem-star-rail');
+      const main = page.locator('.mem-star-main');
+      const railBox = await rail.boundingBox();
+      const mainBox = await main.boundingBox();
+      expect(railBox && mainBox).toBeTruthy();
+      expect(railBox!.y + railBox!.height).toBeLessThanOrEqual(mainBox!.y + 1);
+      expect(await rail.getByText('十二月令环', { exact: true }).count()).toBeLessThanOrEqual(1);
+      const viewport = page.getByRole('region', { name: '记忆星图' });
+      const scroll = await viewport.evaluate((element) => ({
+        client: element.clientWidth,
+        content: element.scrollWidth,
+      }));
+      expect(scroll.content).toBeGreaterThan(scroll.client);
+      await paint(page);
+      await page.screenshot({ path: join(SHOTS, `${width}-star.png`), fullPage: true });
+
+      const card = page.locator('[data-memory-id="star_drawings"]');
+      await card.click();
+      await visible(detailHeading(page));
+      await visible(detail(page).getByText(STAR_DRAWING.text, { exact: true }).filter({ visible: true }).first());
+      await notWiderThanViewport(page, width);
+      await paint(page);
+      await page.screenshot({ path: join(SHOTS, `${width}-detail.png`), fullPage: true });
+      const back = page.getByRole('button', { name: '回到星图', exact: true });
+      await back.tap();
+      await hidden(back);
+      await visible(canvas);
+      expect(await card.evaluate((element) => document.activeElement === element)).toBe(true);
+    }
+  }, 90_000);
 });
