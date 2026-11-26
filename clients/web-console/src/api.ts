@@ -91,6 +91,7 @@ export const IMPORT_CONTENT_TYPE = 'application/x-ndjson';
 interface MemoryImportOptions {
   signal?: AbortSignal;
   source?: MemoryImportSourcePair;
+  includeGroup?: boolean;
 }
 
 function memoryImportHeaders(source?: MemoryImportSourcePair): Record<string, string> {
@@ -1460,9 +1461,10 @@ export const api = {
    * `file.text()` 会让摘要对不上，确认时必然 `preview_invalid`。
    */
   previewMemoryImport(
-    file: File, { signal, source }: MemoryImportOptions = {},
+    file: File, { signal, source, includeGroup }: MemoryImportOptions = {},
   ): Promise<MemoryImportPreview | MemoryImportSourceChoices> {
-    return request<MemoryImportPreview | MemoryImportSourceChoices>('/v1/memory/import/preview', {
+    const path = '/v1/memory/import/preview' + (includeGroup ? '?include_group=true' : '');
+    return request<MemoryImportPreview | MemoryImportSourceChoices>(path, {
       method: 'POST',
       headers: memoryImportHeaders(source),
       body: file,
@@ -1476,8 +1478,9 @@ export const api = {
    * 回包里 `imported` 可能与预览的 `accepted` 不同（确认时又到期的、并发
    * 已写入的都算重复），页面以这个值为准。
    */
-  commitMemoryImport(file: File, token: string, { signal, source }: MemoryImportOptions = {}): Promise<MemoryImportCommit> {
-    return request<MemoryImportCommit>('/v1/memory/import/commit', {
+  commitMemoryImport(file: File, token: string, { signal, source, includeGroup }: MemoryImportOptions = {}): Promise<MemoryImportCommit> {
+    const path = '/v1/memory/import/commit' + (includeGroup ? '?include_group=true' : '');
+    return request<MemoryImportCommit>(path, {
       method: 'POST',
       headers: { ...memoryImportHeaders(source), 'X-Ling-Import-Token': token },
       body: file,

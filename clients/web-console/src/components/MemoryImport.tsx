@@ -45,6 +45,8 @@ export const SKIP_REASON_TEXT: Record<MemoryImportSkipReason, string> = {
   not_yet_valid: '尚未到生效时间',
   expired: '已超过原有效期',
   retention_expired: '已超过 Ling 的保留期',
+  group_not_selected: '群聊尚未加入预览',
+  forgotten: '这条来源已遗忘',
 };
 
 /** 固定顺序：从"这份文件本身有问题"到"时间与保留期"，读起来是一条因果链。 */
@@ -58,6 +60,8 @@ export const SKIP_REASON_ORDER: MemoryImportSkipReason[] = [
   'not_yet_valid',
   'expired',
   'retention_expired',
+  'group_not_selected',
+  'forgotten',
 ];
 
 /** 只列非零项，且保持固定顺序。 */
@@ -240,11 +244,12 @@ type ImportSelection = {
   file: File;
   source?: MemoryImportSourcePair;
   choices?: MemoryImportSourcePair[];
+  includeGroup?: boolean;
 };
 
 export type ImportStep =
   | { name: 'pick' }
-  | { name: 'source'; file: File; sources: MemoryImportSourcePair[] }
+  | { name: 'source'; selection: ImportSelection; sources: MemoryImportSourcePair[] }
   | { name: 'previewing'; selection: ImportSelection }
   | { name: 'preview' | 'committing'; selection: ImportSelection; preview: MemoryImportPreview }
   | { name: 'done'; preview: MemoryImportPreview; result: MemoryImportCommit };
@@ -296,15 +301,15 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
     previewAbort.current?.abort();
     const controller = new AbortController();
     previewAbort.current = controller;
-    const { file, source } = selection;
+    const { file, source, includeGroup } = selection;
     lastSelection.current = selection;
     setError(null);
     setStep({ name: 'previewing', selection });
     try {
-      const preview = await api.previewMemoryImport(file, { signal: controller.signal, source });
+      const preview = await api.previewMemoryImport(file, { signal: controller.signal, source, includeGroup });
       if (!alive.current || controller.signal.aborted) return;
       setStep('sources' in preview
-        ? { name: 'source', file, sources: preview.sources }
+        ? { name: 'source', selection, sources: preview.sources }
         : { name: 'preview', selection, preview });
     } catch (cause) {
       if (!alive.current || controller.signal.aborted) return;
@@ -325,6 +330,7 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
       const { qq, bot_qq } = preview.destination;
       const result = await api.commitMemoryImport(selection.file, preview.confirmation_token, {
         source: { owner_qq: qq, bot_qq },
+        includeGroup: selection.includeGroup,
       });
       if (!alive.current) return;
       setStep({ name: 'done', preview, result });
@@ -384,9 +390,9 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
 
       {step.name === 'source' ? (
         <NativeSourceStage
-          file={step.file}
+          file={step.selection.file}
           sources={step.sources}
-          onPreview={(source) => void runPreview({ file: step.file, source, choices: step.sources })}
+          onPreview={(source) => void runPreview({ ...step.selection, source, choices: step.sources })}
           onChooseAnother={reset}
         />
       ) : null}
@@ -400,9 +406,12 @@ export function MemoryImportPanel({ onCommitted, onViewImported, onClose }: Memo
           copy={copy}
           onConfirm={() => void runCommit(step.selection, step.preview)}
           onRepreview={() => void runPreview(step.selection)}
+          onIncludeGroup={step.preview.skip_reasons.group_not_selected
+            ? () => void runPreview({ ...step.selection, includeGroup: true })
+            : undefined}
           onEditSource={choices ? () => {
             setError(null);
-            setStep({ name: 'source', file: step.selection.file, sources: choices });
+            setStep({ name: 'source', selection: step.selection, sources: choices });
           } : undefined}
           onChooseAnother={reset}
         />
@@ -647,7 +656,9 @@ function SampleList({ samples }: { samples: MemoryImportSample[] }): React.React
                 {sample.scope === 'group' ? ' · 群聊' : ''}
               </span>
               <p className="import-sample__text">{sample.text}</p>
-              {when ? <time dateTime={sample.occurred_at ?? sample.created_at ?? undefined}>{when}</time> : null}
+              {when ? <time dateTime={sample.occurred_at ?? sample.created_at ?? undefined}>
+                {sample.occurred_at ? '发生 ' : '记下 '}{when}
+              </time> : null}
             </li>
           );
         })}
@@ -701,6 +712,7 @@ function PreviewStage({
   copy,
   onConfirm,
   onRepreview,
+  onIncludeGroup,
   onChooseAnother,
   onEditSource,
 }: {
@@ -711,6 +723,7 @@ function PreviewStage({
   copy: ImportErrorCopy | null;
   onConfirm: () => void;
   onRepreview: () => void;
+  onIncludeGroup?: () => void;
   onChooseAnother: () => void;
   onEditSource?: () => void;
 }): React.ReactElement {
@@ -754,6 +767,11 @@ function PreviewStage({
       <ImportErrorNotice error={error} copy={copy} />
 
       <div className="import-actions">
+        {onIncludeGroup ? (
+          <button type="button" className="ghost-button" disabled={busy} onClick={onIncludeGroup}>
+            将群聊加入预览
+          </button>
+        ) : null}
         {copy?.needsRepreview ? (
           <>
             <button type="button" className="button" disabled={busy} onClick={onRepreview}>

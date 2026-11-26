@@ -98,6 +98,7 @@ interface MockOptions {
   mobile?: boolean;
   memories?: ReturnType<typeof memory>[];
   previewBody?: Record<string, unknown>;
+  groupPreviewBody?: Record<string, unknown>;
   commitBody?: Record<string, unknown>;
   commitError?: { detail: string; status: number; code: string; message: string };
   previewError?: { detail: string; status: number; code: string; message: string };
@@ -117,7 +118,7 @@ async function open(options: MockOptions = {}) {
   const reads: URL[] = [];
   const imports: {
     path: string; contentType: string | null; token: string | null; bytes: number; digest: string;
-    ownerQq: string | null; botQq: string | null;
+    ownerQq: string | null; botQq: string | null; includeGroup: boolean;
   }[] = [];
 
   await context.route('**/v1/**', async (route) => {
@@ -125,9 +126,11 @@ async function open(options: MockOptions = {}) {
     const url = new URL(request.url());
     const path = url.pathname;
     if (request.method() === 'POST' && path.startsWith('/v1/memory/import/')) {
+      const includeGroup = url.searchParams.get('include_group') === 'true';
       const body = request.postDataBuffer();
       imports.push({
         path,
+        includeGroup,
         contentType: request.headers()['content-type'] ?? null,
         token: request.headers()['x-ling-import-token'] ?? null,
         ownerQq: request.headers()['x-ling-import-owner-qq'] ?? null,
@@ -147,7 +150,8 @@ async function open(options: MockOptions = {}) {
         if (options.sourceChoices && !request.headers()['x-ling-import-bot-qq']) {
           return route.fulfill(json({ sources: options.sourceChoices }));
         }
-        return route.fulfill(json(preview(options.previewBody)));
+        return route.fulfill(json(preview(includeGroup && options.groupPreviewBody
+          ? options.groupPreviewBody : options.previewBody)));
       }
       if (options.commitError) {
         const e = options.commitError;
@@ -247,6 +251,22 @@ async function previewFile(page: Page, file: UploadFile | string = FILE) {
 }
 
 describe('导入旧记忆', () => {
+  it('群聊经单独预览后才随同一份文件提交', async () => {
+    const { page, imports } = await open({
+      previewBody: { total: 2, accepted: 1, skipped: 1, skip_reasons: { group_not_selected: 1 } },
+      groupPreviewBody: { total: 2, accepted: 2, scope_counts: { private: 1, group: 1 },
+        confirmation_token: 'group-token' },
+      commitBody: { imported: 2 },
+    });
+    await previewFile(page);
+    await page.getByRole('button', { name: '将群聊加入预览' }).click();
+    expect(await page.getByTestId('import-scope-counts').innerText()).toContain('群聊 1 条');
+    await page.getByTestId('import-confirm').click();
+    await expect.poll(() => imports.map(call => call.includeGroup), { timeout: WAIT }).toEqual([false, true, true]);
+    expect(new Set(imports.map(call => call.digest)).size).toBe(1);
+    expect(imports.at(-1)?.token).toBe('group-token');
+  }, CASE_TIMEOUT);
+
   it('A1/B1/B2/B3/B4：空库也有入口，预览先讲清目标、来源与可导入条数', async () => {
     const { page, imports } = await open({ memories: [] });
     expect(await page.getByTestId('mem-import-entry').isVisible()).toBe(true);

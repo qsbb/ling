@@ -840,6 +840,13 @@ class IdentityService:
         previous = getattr(source, "merged_into", None)
         if not previous:
             return {"source_id": source_id, "restored_memories": 0}
+        locked = await self._session.scalars(
+            select(Subject).where(Subject.id.in_((source_id, previous)))
+            .order_by(Subject.id).with_for_update().execution_options(populate_existing=True)
+        )
+        locked.all()
+        if source.merged_into != previous:
+            raise ValueError("身份归属已变化，请刷新后重试")
 
         accounts = (
             await self._session.execute(

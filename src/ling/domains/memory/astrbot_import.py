@@ -14,14 +14,14 @@ from itertools import islice
 from typing import Annotated, BinaryIO, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import Column, MetaData, String, Table, select
+from sqlalchemy import Column, MetaData, String, Table, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
 from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
-from ling.infra.models import MemoryEntityRow, MemoryRow, Window
+from ling.infra.models import MemoryEntityRow, MemoryImportForgetMarker, MemoryRow, Window
 
 PREVIEW_LIMIT = 12
 RECORD_BATCH_SIZE = 128
@@ -49,6 +49,7 @@ Label = Annotated[str, Field(max_length=80)]
 SkipReason = Literal[
     "invalid_record", "outside_private_pair", "unsupported_memory", "inactive",
     "not_reviewed", "restricted", "not_yet_valid", "expired", "retention_expired",
+    "group_not_selected", "forgotten",
 ]
 
 
@@ -364,6 +365,7 @@ class ImportTarget:
     actor_id: str
     persona_id: str
     instance_id: str
+    include_group: bool = False
 
 
 def sign_confirmation(
@@ -371,10 +373,10 @@ def sign_confirmation(
     reviewed_at: int, expires: int, retention_days: int,
 ) -> str:
     payload = json.dumps([
-        "ling:astrbot-memory-import:v4", user_id, target.destination.subject_id,
+        "ling:astrbot-memory-import:v5", user_id, target.destination.subject_id,
         target.destination.qq, target.destination.bot_qq,
         target.binding_id, target.binding_revision, target.forget_generation,
-        target.actor_id, target.persona_id, target.instance_id,
+        target.actor_id, target.persona_id, target.instance_id, target.include_group,
         digest, reviewed_at, expires, retention_days,
     ], separators=(",", ":")).encode()
     signature = hmac.digest(root_key, payload, "sha256").hex()
@@ -415,6 +417,7 @@ class ImportCounts(BaseModel):
     skipped: int
     skip_reasons: dict[SkipReason, int]
     scope_counts: dict[str, int] = Field(default_factory=dict)
+    scope_skip_reasons: dict[str, dict[SkipReason, int]] = Field(default_factory=dict)
 
 
 class ImportSample(BaseModel):
@@ -439,6 +442,17 @@ def _memory_id(subject_id: str, source: SourcePair, source_id: str) -> str:
     return "mem_as_" + hashlib.sha256(key.encode()).hexdigest()[:56]
 
 
+def _import_key(source: SourcePair, source_id: str) -> str:
+    return hashlib.sha256(f"astrbot:{source.bot_qq}:{source.owner_qq}:{source_id}".encode()).hexdigest()
+
+
+async def lock_archive_account(session: AsyncSession, owner_qq: str) -> None:
+    """Serialize writes to the same verified archive owner, including after account splits."""
+    await session.execute(select(func.pg_advisory_xact_lock(
+        func.hashtextextended(f"ling:astrbot-memory:{owner_qq}", 0),
+    )))
+
+
 async def process_archive(
     session: AsyncSession,
     *,
@@ -452,10 +466,13 @@ async def process_archive(
     cutoff = now - timedelta(days=retention_days)
     review_time = reviewed_at or now
     skip_reasons: Counter[SkipReason] = Counter()
+    scope_skip_reasons: dict[str, Counter[SkipReason]] = {}
     sample: list[ImportSample] = []
     total = duplicates = accepted = 0
     accepted_scopes: Counter[str] = Counter()
-    if not write:
+    if write:
+        await lock_archive_account(session, archive.source.owner_qq)
+    else:
         await session.execute(CreateTable(_PREVIEW_IDS))
     while batch := await run_in_threadpool(list, islice(archive.records, RECORD_BATCH_SIZE)):
         total += len(batch)
@@ -464,8 +481,12 @@ async def process_archive(
             reason = "invalid_record" if record is None else record.skip_reason(
                 archive.source, now=now, reviewed_at=review_time, retention_cutoff=cutoff,
             )
+            if reason is None and record is not None and record.is_group and not target.include_group:
+                reason = "group_not_selected"
             if reason is not None:
                 skip_reasons[reason] += 1
+                scope = record.scope if record is not None and record.scope in {"private", "group"} else "unknown"
+                scope_skip_reasons.setdefault(scope, Counter())[reason] += 1
                 continue
             assert record is not None
             memory_id = _memory_id(target.destination.subject_id, archive.source, record.id)
@@ -474,6 +495,15 @@ async def process_archive(
                 continue
             candidates[memory_id] = record
 
+        keys = {_import_key(archive.source, record.id): memory_id for memory_id, record in candidates.items()}
+        if keys:
+            forgotten = await session.scalars(select(MemoryImportForgetMarker.source_key).where(
+                MemoryImportForgetMarker.source_key.in_(keys),
+            ))
+            for key in forgotten:
+                record = candidates.pop(keys[key])
+                skip_reasons["forgotten"] += 1
+                scope_skip_reasons.setdefault(record.scope, Counter())["forgotten"] += 1
         if not candidates:
             continue
         if write:
@@ -514,6 +544,7 @@ async def process_archive(
             skipped=sum(skip_reasons.values()),
             skip_reasons=dict(skip_reasons),
             scope_counts=dict(accepted_scopes),
+            scope_skip_reasons={scope: dict(reasons) for scope, reasons in scope_skip_reasons.items()},
         ),
         accepted=accepted,
         sample=sample,
@@ -616,6 +647,7 @@ async def _insert_memories(
             "text": record.content,
             "origin": Origin.model_inference.value if record.is_summary else Origin.user_statement.value,
             "visibility": visibility,
+            "source_account": f"{target.instance_id}:{source.owner_qq}",
             "source_visibility": visibility,
             "source_window_id": group_windows.get(record.group_id) if is_group else None,
             "confidence": record.confidence,
@@ -629,6 +661,7 @@ async def _insert_memories(
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "retention_days": retention_days,
+            "import_key": _import_key(source, record.id),
             "import_source": {
                 "source": SOURCE,
                 "record_id": record.id,
@@ -636,6 +669,7 @@ async def _insert_memories(
                 "scope": record.scope,
                 "group_id": record.group_id,
                 "group_name": record.group_name,
+                "visibility": record.visibility,
                 "platform": record.platform,
                 "session_id": record.session_id,
                 "bot_qq": source.bot_qq,

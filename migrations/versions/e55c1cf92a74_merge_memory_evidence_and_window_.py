@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-
 revision: str = 'e55c1cf92a74'
 down_revision: tuple[str, str] | None = ('0090_window_contact_unavailable', '0093_memory_forget_markers')
 branch_labels: str | Sequence[str] | None = None

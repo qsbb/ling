@@ -324,9 +324,10 @@ def collect_memory_privacy(stack: Stack) -> dict[str, Any]:
                         AND column_name = 'memory_hidden_at'),
                EXISTS(SELECT 1 FROM information_schema.columns
                       WHERE table_schema = 'public' AND table_name = 'subjects'
-                        AND column_name = 'forget_generation')
+                        AND column_name = 'forget_generation'),
+               to_regclass('memory_import_forget_markers') IS NOT NULL
     """)
-    has_markers, has_message_flags, has_generations = available.split("|")
+    has_markers, has_message_flags, has_generations, has_import_markers = available.split("|")
     sources = []
     if has_markers == "t":
         sources = json.loads(query("""
@@ -347,7 +348,14 @@ def collect_memory_privacy(stack: Stack) -> dict[str, Any]:
             SELECT COALESCE(json_object_agg(id, forget_generation), '{}')
             FROM subjects WHERE forget_generation > 0
         """))
-    return {"sources": sources, "generations": generations}
+    state = {"sources": sources, "generations": generations}
+    if has_import_markers == "t":
+        imports = json.loads(query("""
+            SELECT COALESCE(json_agg(marker), '[]') FROM memory_import_forget_markers AS marker
+        """))
+        if imports:
+            state["imports"] = imports
+    return state
 
 
 def replay_memory_privacy(
@@ -355,9 +363,12 @@ def replay_memory_privacy(
 ) -> None:
     if not any(state.values()):
         return
+    check_tables = "SELECT to_regclass('memory_source_forget_markers') IS NOT NULL"
+    if state.get("imports"):
+        check_tables += " AND to_regclass('memory_import_forget_markers') IS NOT NULL"
     compatible = docker(
         "exec", container, "psql", "-U", "ling", "-d", "ling", "-At",
-        "-v", "ON_ERROR_STOP=1", "-c", "SELECT to_regclass('memory_source_forget_markers') IS NOT NULL",
+        "-v", "ON_ERROR_STOP=1", "-c", check_tables,
     ).strip()
     if compatible != "t":
         raise BackupError("备份版本无法重放现有遗忘记录，恢复已停止")

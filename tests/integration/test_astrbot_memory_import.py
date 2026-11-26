@@ -22,6 +22,7 @@ from ling.contracts.v1 import Visibility
 from ling.domains.identity.service import IdentityService
 from ling.domains.memory import astrbot_import as importer
 from ling.domains.memory.entities import EntityService
+from ling.domains.memory.restore_privacy import ForgetState, ForgottenImport, replay_forgetting
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
 from ling.infra.models import (
@@ -258,7 +259,11 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         _group_record("wrong-bot", subject_id="200300401", owner_bot_id="200300401"),
         _record("private-memo"),
     )
-    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    private_preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert private_preview.status_code == 200, private_preview.text
+    assert private_preview.json()["scope_counts"] == {"private": 1}
+    assert private_preview.json()["scope_skip_reasons"]["group"]["group_not_selected"] == 1
+    preview = await logged_in.client.post(PREFIX + "/preview?include_group=true", content=data, headers=HEADERS)
     assert preview.status_code == 200, preview.text
     report = preview.json()
     assert report["accepted"] == 2
@@ -267,7 +272,9 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     assert report["skip_reasons"]["outside_private_pair"] == 2
 
     headers = {**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
-    commit = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    mismatched_scope = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    assert mismatched_scope.status_code == 409
+    commit = await logged_in.client.post(PREFIX + "/commit?include_group=true", content=data, headers=headers)
     assert commit.status_code == 200, commit.text
     assert commit.json()["imported"] == 2
 
@@ -445,7 +452,7 @@ async def test_group_private_sensitivity_is_rejected_before_import(logged_in: Te
     )
     before = await _row_counts()
 
-    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    preview = await logged_in.client.post(PREFIX + "/preview?include_group=true", content=data, headers=HEADERS)
 
     assert preview.status_code == 200, preview.text
     report = preview.json()
@@ -460,6 +467,118 @@ async def test_group_import_reuses_unverified_window_without_granting_live_recal
     """An existing but unverified group window is not history visibility proof."""
     await _bind(logged_in)
     live_id = "win_live_group_reuse"
+async def test_forgetting_imported_source_blocks_archive_reupload_and_restore(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    env = logged_in
+    data = _archive(
+        _group_record("forget-archive", content="桐影画册留在原群"),
+        _record("keep-archive", content="保留无关的青色笔筒"),
+    )
+    preview_path = PREFIX + "/preview?include_group=true"
+    commit_path = PREFIX + "/commit?include_group=true"
+    report = (await env.client.post(preview_path, content=data, headers=HEADERS)).json()
+    assert report["accepted"] == 2
+    imported = await env.client.post(
+        commit_path, content=data, headers={**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]},
+    )
+    assert imported.status_code == 200 and imported.json()["imported"] == 2
+    library_url = "/v1/memory?view=library&source=astrbot_memory_companion"
+    initial = (await env.client.get(library_url)).json()["memories"]
+    original = next(row for row in initial if row["import_source"]["record_id"] == "forget-archive")
+    memory_id = original["memory_id"]
+    label = await env.client.post(f"/v1/memory/{memory_id}/objects", json={"kind": "item", "name": "桐影画册"})
+    assert label.status_code == 200, label.text
+    object_id = label.json()["entity_id"]
+    assert (await env.client.get(library_url + f"&object_id={object_id}")).json()["total"] == 1
+    corrected = await env.client.post(
+        f"/v1/memory/{memory_id}/supersede", json={"text": "桐影画册已经带回原群"},
+    )
+    assert corrected.status_code == 200, corrected.text
+    corrected_id = corrected.json()["memory_id"]
+    async with session_scope() as session:
+        before = await session.get_one(MemoryRow, memory_id)
+        key = before.import_key
+    assert key is not None
+
+    forgotten = await env.client.post(f"/v1/memory/{corrected_id}/forget")
+    assert forgotten.status_code == 200, forgotten.text
+    visible = (await env.client.get(library_url + "&include=all")).json()["memories"]
+    assert [row["import_source"]["record_id"] for row in visible] == ["keep-archive"]
+    assert not any(item["entity_id"] == object_id for item in (await env.client.get(
+        "/v1/memory/objects"
+    )).json()["objects"])
+    again = (await env.client.post(preview_path, content=data, headers=HEADERS)).json()
+    assert (again["accepted"], again["duplicates"], again["skip_reasons"]) == (0, 1, {"forgotten": 1})
+
+    # Simulate restoring rows from a backup made before the forget operation.
+    from ling.infra.models import MemoryImportForgetMarker, utcnow
+
+    async with session_scope() as session:
+        marker = await session.get_one(MemoryImportForgetMarker, key)
+        state = ForgetState(imports=[ForgottenImport(
+            source_key=key, subject_id=env.subject_id, forgotten_at=marker.forgotten_at,
+        )])
+        await session.delete(marker)
+        session.add(MemoryRow(
+            id=memory_id, subject_id=env.subject_id, kind="episode", text=original["text"],
+            origin=original["origin"], visibility=original["visibility"],
+            import_source=original["import_source"], import_key=key, created_at=utcnow(),
+        ))
+        await session.flush()
+        await replay_forgetting(session, state)
+        assert await session.get(MemoryRow, memory_id) is None
+        assert await session.get(MemoryImportForgetMarker, key) is not None
+
+
+async def test_archive_provenance_survives_account_split(logged_in: TestEnv) -> None:
+    """A former owner loses management access, and a forgotten source stays absent."""
+    env = logged_in
+    split_id = "sub_split_archive"
+    async with session_scope() as session:
+        session.add(Subject(id=split_id, display_name="拆分账号"))
+        await session.flush()
+        identity = IdentityService(session)
+        await identity.bind_account(
+            subject_id=split_id, connector_instance="onebot-default", external_account_id=OWNER_QQ,
+            proof="admin",
+        )
+        await identity.merge_subjects(split_id, env.subject_id)
+    data = _archive(_record("split-keep"), _record("split-forget"))
+    preview = await env.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert preview.status_code == 200 and preview.json()["accepted"] == 2
+    committed = await env.client.post(
+        PREFIX + "/commit", content=data,
+        headers={**HEADERS, "X-Ling-Import-Token": preview.json()["confirmation_token"]},
+    )
+    assert committed.status_code == 200 and committed.json()["imported"] == 2
+    path = "/v1/memory?view=library&source=astrbot_memory_companion"
+    rows = {row["import_source"]["record_id"]: row["memory_id"]
+            for row in (await env.client.get(path)).json()["memories"]}
+    kept_id = rows["split-keep"]
+    forgotten = await env.client.post(f"/v1/memory/{rows['split-forget']}/forget")
+    assert forgotten.status_code == 200, forgotten.text
+    split = await env.client.post(f"/v1/accounts/subjects/{split_id}/unmerge")
+    assert split.status_code == 200, split.text
+    assert split.json()["restored_memories"] == 1
+    assert (await env.client.get(path)).json()["total"] == 0
+    assert (await env.client.post(f"/v1/memory/{kept_id}/forget")).status_code == 404
+
+    async with session_scope() as session:
+        kept = await session.get_one(MemoryRow, kept_id)
+        assert kept.subject_id == split_id
+        await IdentityService(session).create_user(
+            username="split-owner", password="split-password", role="owner", subject_id=split_id,
+        )
+    login = await env.client.post(
+        "/v1/auth/login", json={"username": "split-owner", "password": "split-password"},
+    )
+    assert login.status_code == 200, login.text
+    assert (await env.client.get(path)).json()["memories"][0]["memory_id"] == kept_id
+    preview_after = await env.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    assert preview_after.status_code == 200, preview_after.text
+    assert preview_after.json()["skip_reasons"] == {"forgotten": 1}
+
+
     async with session_scope() as session:
         session.add(Window(
             id=live_id, actor_id="actor_ling", persona_id="persona_ling",
@@ -470,12 +589,12 @@ async def test_group_import_reuses_unverified_window_without_granting_live_recal
         ))
 
     data = _archive(_group_record("window-reuse", group_name="读书群"))
-    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    preview = await logged_in.client.post(PREFIX + "/preview?include_group=true", content=data, headers=HEADERS)
     assert preview.status_code == 200, preview.text
     report = preview.json()
     assert report["accepted"] == 1
     headers = {**NATIVE_HEADERS, "X-Ling-Import-Token": report["confirmation_token"]}
-    commit = await logged_in.client.post(PREFIX + "/commit", content=data, headers=headers)
+    commit = await logged_in.client.post(PREFIX + "/commit?include_group=true", content=data, headers=headers)
     assert commit.status_code == 200, commit.text
 
     async with session_scope() as session:

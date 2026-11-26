@@ -27,8 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
+    ActorAccount,
     MemoryEmbeddingRow,
     MemoryEpisode,
+    MemoryImportForgetMarker,
     MemoryRetrievalLog,
     MemoryRow,
     Message,
@@ -100,7 +102,27 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
         Message.memory_hidden_at.is_(None),
         Message.retracted_at.is_(None),
     ).exists()
-    return or_(model.source_message_id.is_(None), active)
+    eligible = or_(model.source_message_id.is_(None), active)
+    if model is MemoryRow:
+        forgotten_import = select(MemoryImportForgetMarker.source_key).where(
+            MemoryImportForgetMarker.source_key == MemoryRow.import_key,
+        ).exists()
+        owner_has_login = select(User.id).where(User.subject_id == Subject.id).correlate(Subject).exists()
+        verified_import = select(ActorAccount.id).join(
+            Subject, Subject.id == ActorAccount.subject_id,
+        ).where(
+            ActorAccount.revoked_at.is_(None),
+            ActorAccount.proof.in_(("proven", "admin")),
+            ActorAccount.external_account_id == MemoryRow.import_source["owner_qq"].as_string(),
+            func.concat(ActorAccount.connector_instance, ":", ActorAccount.external_account_id)
+            == MemoryRow.source_account,
+            or_(
+                Subject.id == MemoryRow.subject_id,
+                (Subject.merged_into == MemoryRow.subject_id) & ~owner_has_login,
+            ),
+        ).correlate(MemoryRow).exists()
+        eligible = eligible & or_(MemoryRow.import_key.is_(None), ~forgotten_import & verified_import)
+    return eligible
 
 
 async def store_embeddings(
@@ -1246,9 +1268,19 @@ class MemoryService:
 
     # ---------------------------------------------------------- 纠正与遗忘
 
-    async def retract(self, memory_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
+    async def retract(
+        self, memory_id: str, *, reason: str, superseded_by: str | None = None,
+        subject_id: str | None = None,
+    ) -> bool:
         """撤回一条记忆。立即失效（检索会跳过），保留证据链。"""
-        row = await self._session.get(MemoryRow, memory_id)
+        if subject_id is None:
+            row = await self._session.get(MemoryRow, memory_id)
+        else:
+            await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+            row = await self._session.scalar(select(MemoryRow).where(
+                MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id,
+                or_(MemoryRow.import_key.is_(None), active_source(MemoryRow)),
+            ).with_for_update().execution_options(populate_existing=True))
         if row is None:
             return False
         row.retracted = True
@@ -1258,13 +1290,23 @@ class MemoryService:
         await self._session.flush()
         return True
 
-    async def supersede(self, old_id: str, new_text: str, *, reason: str) -> str | None:
+    async def supersede(
+        self, old_id: str, new_text: str, *, reason: str, subject_id: str | None = None,
+    ) -> str | None:
         """用户纠正：旧记忆失效，新记忆建立 supersede 链。"""
-        owner = await self._session.scalar(select(MemoryRow.subject_id).where(MemoryRow.id == old_id))
-        if owner is None:
+        from ling.domains.memory.astrbot_import import lock_archive_account
+
+        anchor = (await self._session.execute(select(
+            MemoryRow.subject_id, MemoryRow.import_key, MemoryRow.import_source,
+        ).where(MemoryRow.id == old_id))).one_or_none()
+        if anchor is None or (subject_id is not None and anchor.subject_id != subject_id):
             return None
-        await self._session.execute(select(Subject.id).where(Subject.id == owner).with_for_update())
-        old = await self._session.get(MemoryRow, old_id, populate_existing=True, with_for_update=True)
+        await self._session.execute(select(Subject.id).where(Subject.id == anchor.subject_id).with_for_update())
+        if anchor.import_key and anchor.import_source:
+            await lock_archive_account(self._session, anchor.import_source["owner_qq"])
+        old = await self._session.scalar(select(MemoryRow).where(
+            MemoryRow.id == old_id, MemoryRow.subject_id == anchor.subject_id, active_source(MemoryRow),
+        ).with_for_update().execution_options(populate_existing=True))
         if old is None or old.retracted:
             return None
         new_id_value = new_id("mem")
@@ -1282,6 +1324,7 @@ class MemoryService:
             source_message_id=old.source_message_id,
             source_visibility=old.source_visibility,
             import_source=old.import_source,
+            import_key=old.import_key,
             slot=old.slot,
             fact_phase=old.fact_phase,
             valid_from=old.valid_from if old.fact_phase == "historical" else utcnow(),

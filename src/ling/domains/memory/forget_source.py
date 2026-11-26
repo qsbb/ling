@@ -6,7 +6,9 @@ from sqlalchemy import and_, case, cast, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.memory.astrbot_import import lock_archive_account
 from ling.domains.memory.purge import PURGEABLE_TOPICS
+from ling.domains.memory.service import active_source
 from ling.infra.models import (
     AwarenessItemRow,
     EntityRow,
@@ -14,6 +16,7 @@ from ling.infra.models import (
     MemoryEmbeddingRow,
     MemoryEntityRow,
     MemoryEpisode,
+    MemoryImportForgetMarker,
     MemoryRetrievalLog,
     MemoryRow,
     MemorySourceForgetMarker,
@@ -37,7 +40,17 @@ async def forget_source(
     await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
     target = await session.scalar(select(MemoryRow).where(
         MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id,
-    ).with_for_update())
+    ))
+    if target is not None and target.import_key:
+        await lock_archive_account(session, target.import_source["owner_qq"])
+        if await session.scalar(select(MemoryRow.id).where(
+            MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id, active_source(MemoryRow),
+        )) is None:
+            return False
+        await apply_import_forget(
+            session, source_key=target.import_key, subject_id=subject_id, forgotten_at=utcnow(),
+        )
+        return True
     episode = None
     if target is None:
         episode = await session.scalar(select(MemoryEpisode).where(
@@ -59,6 +72,21 @@ async def forget_source(
         window_id=source.window_id, turn_id=source.turn_id, forgotten_at=utcnow(),
     )
     return True
+
+
+async def apply_import_forget(
+    session: AsyncSession, *, source_key: str, subject_id: str, forgotten_at: datetime,
+) -> None:
+    """Remove an archive record and its corrections, including newly restored copies."""
+    await session.execute(insert(MemoryImportForgetMarker).values(
+        source_key=source_key, subject_id=subject_id, forgotten_at=forgotten_at,
+    ).on_conflict_do_nothing(index_elements=[MemoryImportForgetMarker.source_key]))
+    rows = (await session.execute(delete(MemoryRow).where(
+        MemoryRow.import_key == source_key,
+    ).returning(MemoryRow.id, MemoryRow.subject_id))).all()
+    await _delete_memory_derivatives(session, [row.id for row in rows], [])
+    for owner_id in {row.subject_id for row in rows}:
+        await _clear_window_derivatives(session, owner_id)
 
 
 async def apply_source_forget(
@@ -108,21 +136,7 @@ async def apply_source_forget(
         payload={"purged": True}, last_error="memory_source_forgotten",
     ))
 
-    affected_links = or_(
-        and_(MemoryEntityRow.record_type == "memory", MemoryEntityRow.memory_id.in_(assertion_ids)),
-        and_(MemoryEntityRow.record_type == "experience", MemoryEntityRow.memory_id.in_(episode_ids)),
-    )
-    entity_ids = list(await session.scalars(
-        delete(MemoryEntityRow).where(affected_links).returning(MemoryEntityRow.entity_id)
-    ))
-    if entity_ids:
-        await session.execute(delete(EntityRow).where(
-            EntityRow.id.in_(entity_ids),
-            ~select(MemoryEntityRow.entity_id).where(MemoryEntityRow.entity_id == EntityRow.id).exists(),
-        ))
-    await session.execute(delete(MemoryEmbeddingRow).where(
-        MemoryEmbeddingRow.memory_id.in_([*assertion_ids, *episode_ids]),
-    ))
+    await _delete_memory_derivatives(session, assertion_ids, episode_ids)
     await session.execute(delete(MemoryRow).where(MemoryRow.id.in_(assertion_ids)))
     await session.execute(delete(MemoryEpisode).where(MemoryEpisode.id.in_(episode_ids)))
     await session.execute(update(RelationshipEvent).where(
@@ -135,6 +149,34 @@ async def apply_source_forget(
 
     # These stores currently retain whole-window aggregates, with no per-claim
     # provenance. Clear the affected subject's cached copies and the source window.
+    await _clear_window_derivatives(session, subject_id, window_id)
+
+
+async def _delete_memory_derivatives(
+    session: AsyncSession, memory_ids: list[str], episode_ids: list[str],
+) -> None:
+    if not memory_ids and not episode_ids:
+        return
+    links = or_(
+        and_(MemoryEntityRow.record_type == "memory", MemoryEntityRow.memory_id.in_(memory_ids)),
+        and_(MemoryEntityRow.record_type == "experience", MemoryEntityRow.memory_id.in_(episode_ids)),
+    )
+    entity_ids = list(await session.scalars(
+        delete(MemoryEntityRow).where(links).returning(MemoryEntityRow.entity_id)
+    ))
+    if entity_ids:
+        await session.execute(delete(EntityRow).where(
+            EntityRow.id.in_(entity_ids),
+            ~select(MemoryEntityRow.entity_id).where(MemoryEntityRow.entity_id == EntityRow.id).exists(),
+        ))
+    await session.execute(delete(MemoryEmbeddingRow).where(
+        MemoryEmbeddingRow.memory_id.in_([*memory_ids, *episode_ids]),
+    ))
+
+
+async def _clear_window_derivatives(
+    session: AsyncSession, subject_id: str, window_id: str | None = None,
+) -> None:
     windows = select(Window.id).where(or_(Window.subject_id == subject_id, Window.id == window_id))
     await session.execute(delete(WindowContext).where(WindowContext.window_id.in_(windows)))
     await session.execute(delete(PromptSnapshot).where(PromptSnapshot.window_id.in_(windows)))

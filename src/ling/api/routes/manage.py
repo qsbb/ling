@@ -291,8 +291,7 @@ async def retract_memory(
     # reason 的必填/长度由 MemoryRetract 的 pydantic 约束保证（含 body 整体
     # 缺失），错误形状由 create_app 的前缀处理器统一；这里不再重复校验。
     reason = body.reason
-    await _own_memory_or_404(session, memory_id, auth.user.subject_id)
-    ok = await MemoryService(session).retract(memory_id, reason=reason)
+    ok = await MemoryService(session).retract(memory_id, reason=reason, subject_id=auth.user.subject_id)
     if not ok:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)
     # 撤回是"数据不再被使用"的动作，必须可追溯。只记 ID 与原因码，不记内容。
@@ -317,7 +316,7 @@ async def supersede_memory(
     await _own_memory_or_404(session, memory_id, auth.user.subject_id)
     # 纠正出来的新行沿用旧行的保留期，再被当前策略上限压一次（见 service.supersede）。
     new_id_value = await MemoryService(session, policy=(await config.effective()).memory).supersede(
-        memory_id, body.text, reason=body.reason
+        memory_id, body.text, reason=body.reason, subject_id=auth.user.subject_id,
     )
     if new_id_value is None:
         raise LingError(ErrorCode.not_found, "记忆不存在", status_code=404)

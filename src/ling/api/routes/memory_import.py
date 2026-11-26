@@ -125,7 +125,7 @@ async def _onebot_namespaces(session: DbSession, settings: Settings) -> set[str]
 
 async def _resolve_target(
     session: DbSession, auth: AuthContext, source: importer.SourcePair, onebot_namespaces: set[str],
-    settings: Settings, *, persona_id: str, lock: bool = False,
+    settings: Settings, *, persona_id: str, include_group: bool, lock: bool = False,
 ) -> importer.ImportTarget:
     subject, binding = await IdentityService(session).resolve_proven_login_binding(
         subject_id=auth.user.subject_id,
@@ -146,12 +146,14 @@ async def _resolve_target(
         actor_id=settings.actor_id,
         persona_id=persona_id,
         instance_id=binding.connector_instance,
+        include_group=include_group,
     )
 
 
 @router.post("/preview", response_model=PreviewOut | SourceChoicesOut, openapi_extra=_FILE_BODY)
 async def preview(
     request: Request, response: Response, auth: OwnerImport, session: DbSession, config: ConfigDep,
+    include_group: bool = False,
 ) -> PreviewOut | SourceChoicesOut:
     settings: Settings = request.app.state.settings
     response.headers["Cache-Control"] = "no-store"
@@ -177,6 +179,7 @@ async def preview(
             effective = await config.effective()
             target = await _resolve_target(
                 session, auth, archive.source, namespaces, settings, persona_id=effective.persona_id,
+                include_group=include_group,
             )
             reviewed_at = utcnow().replace(microsecond=0)
             retention = MemoryService(session, policy=effective.memory).write_retention_days()
@@ -205,6 +208,7 @@ async def preview(
 async def commit(
     request: Request, response: Response, auth: OwnerImport, session: DbSession, config: ConfigDep,
     token: Annotated[str, Header(alias="X-Ling-Import-Token")] = "",
+    include_group: bool = False,
 ) -> CommitOut:
     settings: Settings = request.app.state.settings
     submitted_at = utcnow()
@@ -217,7 +221,7 @@ async def commit(
             effective = await config.effective()
             target = await _resolve_target(
                 session, auth, archive.source, await _onebot_namespaces(session, settings),
-                settings, persona_id=effective.persona_id, lock=True,
+                settings, persona_id=effective.persona_id, include_group=include_group, lock=True,
             )
             retention = MemoryService(session, policy=effective.memory).write_retention_days()
             reviewed_at = importer.check_confirmation(

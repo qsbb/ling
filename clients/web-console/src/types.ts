@@ -520,7 +520,9 @@ export type MemoryImportSkipReason =
   | 'restricted'
   | 'not_yet_valid'
   | 'expired'
-  | 'retention_expired';
+  | 'retention_expired'
+  | 'group_not_selected'
+  | 'forgotten';
 
 export interface MemoryImportCounts {
   total: number;
@@ -534,6 +536,7 @@ export interface MemoryImportCounts {
 }
 
 export interface MemoryImportPreview extends MemoryImportCounts {
+  scope_skip_reasons?: Partial<Record<'private' | 'group' | 'unknown', Partial<Record<MemoryImportSkipReason, number>>>>;
   destination: MemoryImportDestination;
   accepted: number;
   sample: MemoryImportSample[];

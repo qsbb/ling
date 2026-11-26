@@ -9,7 +9,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.domains.memory.forget_source import apply_source_forget
+from ling.domains.memory.forget_source import apply_import_forget, apply_source_forget
 from ling.domains.memory.purge import purge_subject, request_purge
 from ling.infra.models import MemorySourceForgetMarker, Message, Subject
 
@@ -24,10 +24,19 @@ class ForgottenSource(BaseModel):
     forgotten_at: AwareDatetime
 
 
+class ForgottenImport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    subject_id: str = Field(min_length=1, max_length=64)
+    forgotten_at: AwareDatetime
+
+
 class ForgetState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sources: list[ForgottenSource] = Field(default_factory=list)
+    imports: list[ForgottenImport] = Field(default_factory=list)
     generations: dict[str, int] = Field(default_factory=dict)
 
 
@@ -54,6 +63,9 @@ async def replay_forgetting(session: AsyncSession, state: ForgetState) -> None:
         if saved is not None and (source is None or source.memory_hidden_at is not None):
             continue
         await apply_source_forget(session, **marker.model_dump())
+
+    for marker in state.imports:
+        await apply_import_forget(session, **marker.model_dump())
 
 
 async def _run(state: ForgetState) -> None:
