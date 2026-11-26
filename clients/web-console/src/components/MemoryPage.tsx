@@ -1719,6 +1719,7 @@ export function MemoryListSection({
               <select value={objectId ?? ''} onChange={(event) => {
                 onObjectChange(event.target.value || null);
                 setSelectedId(null);
+                setShowFilters(false);
               }}>
                 <option value="">全部对象</option>
                 {objects.map((item) => (
