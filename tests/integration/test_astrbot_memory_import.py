@@ -23,7 +23,7 @@ from ling.domains.identity.service import IdentityService
 from ling.domains.memory import astrbot_import as importer
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
-from ling.infra.models import ActorAccount, MemoryRow, OutboxEvent, Subject, Window
+from ling.infra.models import ActorAccount, EntityRow, MemoryEntityRow, MemoryRow, OutboxEvent, Subject, Window
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -277,6 +277,25 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     assert group_row["visibility"] == "group_scope"
     assert group_row["import_source"]["scope"] == "group"
     assert group_row["import_source"]["group_id"] == GROUP_ID
+
+    async with session_scope() as session:
+        entity = (await session.execute(
+            select(EntityRow).where(EntityRow.subject_id == logged_in.subject_id, EntityRow.kind == "group")
+        )).scalar_one()
+        assert entity.name == f"群 {GROUP_ID}"
+        links = list(await session.scalars(
+            select(MemoryEntityRow.memory_id).where(MemoryEntityRow.entity_id == entity.id)
+        ))
+        assert len(links) == 1
+    objects = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
+    assert objects[0]["kind"] == "self" and objects[0]["count"] == 2
+    group_object = next(item for item in objects if item["kind"] == "group")
+    assert group_object["count"] == 1 and group_object["name"] == f"群 {GROUP_ID}"
+    only_group = (await logged_in.client.get(
+        f"/v1/memory?view=library&object_id={group_object['entity_id']}"
+    )).json()
+    assert [item["visibility"] for item in only_group["memories"]] == ["group_scope"]
+    assert only_group["total"] == 1
 
 
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:

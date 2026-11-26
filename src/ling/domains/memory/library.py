@@ -6,12 +6,12 @@ from datetime import datetime
 from typing import Any
 from unicodedata import normalize
 
-from sqlalchemy import and_, func, literal, literal_column, or_, select, true
+from sqlalchemy import and_, false, func, literal, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.service import active_source
-from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent
+from ling.infra.models import MemoryEntityRow, MemoryEpisode, MemoryRow, OutboxEvent
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -75,7 +75,7 @@ def _episode_record(row: MemoryEpisode) -> dict[str, Any]:
 async def read_library(
     session: AsyncSession, subject_id: str, *,
     limit: int, include: str | None, source: str | None = None, offset: int = 0,
-    query: str = "",
+    query: str = "", object_id: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "memories": [], "limit": limit, "include": include, "total": 0, "has_more": False,
@@ -83,7 +83,7 @@ async def read_library(
     }
     if source is not None:
         result.update(source=source)
-    if source is not None or query:
+    if source is not None or query or object_id:
         result.update(offset=offset)
     if await has_open_purge(session, subject_id=subject_id):
         result["extraction"] = {"state": "purging", "at": None}
@@ -98,6 +98,13 @@ async def read_library(
     if include not in {"archived", "all"}:
         memory_query = memory_query.where(MemoryRow.archived_at.is_(None))
         episode_query = episode_query.where(MemoryEpisode.archived_at.is_(None))
+    if object_id and object_id != "self":
+        entity_memory_ids = select(MemoryEntityRow.memory_id).where(
+            MemoryEntityRow.entity_id == object_id,
+        )
+        memory_query = memory_query.where(MemoryRow.id.in_(entity_memory_ids))
+        # Experiences do not carry MemoryEntityRow links; an object view is memory-only.
+        episode_query = episode_query.where(false())
 
     if query:
         terms = tuple(dict.fromkeys(normalize("NFKC", query).split()))

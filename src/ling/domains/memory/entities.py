@@ -30,7 +30,7 @@ KINSHIP_ALIASES: dict[str, str] = {
     "兄长": "哥", "弟弟": "弟", "姐姐": "姐", "妹妹": "妹",
 }
 
-ENTITY_KINDS = {"person", "place", "project", "pet", "org", "other"}
+ENTITY_KINDS = {"person", "place", "project", "pet", "org", "group", "work", "topic", "other"}
 
 
 @dataclass

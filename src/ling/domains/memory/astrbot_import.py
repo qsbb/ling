@@ -20,7 +20,7 @@ from sqlalchemy.schema import CreateTable
 from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
-from ling.infra.models import MemoryRow, Window
+from ling.infra.models import EntityRow, MemoryEntityRow, MemoryRow, Window
 
 PREVIEW_LIMIT = 12
 RECORD_BATCH_SIZE = 128
@@ -565,12 +565,26 @@ async def _insert_memories(
 ) -> tuple[int, Counter[str]]:
     rows = []
     ref = f"astrbot:{source.bot_qq}:{source.owner_qq}"
+    from ling.domains.memory.entities import EntityService
+
+    entity_service = EntityService(session)
     group_windows: dict[str, str] = {}
+    group_entities: dict[str, str] = {}
     for record in candidates.values():
-        if record.is_group and record.group_id not in group_windows:
+        if not record.is_group:
+            continue
+        if record.group_id not in group_windows:
             group_windows[record.group_id] = await _ensure_group_window(
                 session, target=target, record=record,
             )
+        if record.group_id not in group_entities:
+            entity = await entity_service.upsert(
+                subject_id=target.destination.subject_id,
+                name=f"群 {record.group_id}",
+                kind="group",
+                aliases=[record.group_id, record.session_id],
+            )
+            group_entities[record.group_id] = entity.id
     for memory_id, record in candidates.items():
         is_group = record.is_group
         visibility = Visibility.group_scope.value if is_group else Visibility.subject_private.value
@@ -614,6 +628,19 @@ async def _insert_memories(
     stmt = insert(MemoryRow).on_conflict_do_nothing(index_elements=[MemoryRow.id]).returning(MemoryRow.id)
     inserted_ids = list(await session.scalars(stmt, rows))
     scopes: Counter[str] = Counter()
+    links = []
     for memory_id in inserted_ids:
-        scopes[candidates[memory_id].scope] += 1
+        record = candidates[memory_id]
+        scopes[record.scope] += 1
+        if record.is_group and record.group_id in group_entities:
+            links.append({
+                "memory_id": memory_id,
+                "entity_id": group_entities[record.group_id],
+                "role": "with",
+            })
+    if links:
+        await session.execute(
+            insert(MemoryEntityRow).on_conflict_do_nothing(),
+            links,
+        )
     return len(inserted_ids), scopes

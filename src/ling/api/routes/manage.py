@@ -117,6 +117,7 @@ async def list_memory(
     ] = None,
     view: Literal["library"] | None = None,
     source: Literal["astrbot_memory_companion"] | None = None,
+    object_id: Annotated[str | None, Query(max_length=64)] = None,
     offset: Annotated[int, Query(ge=0, le=2_147_483_647)] = 0,
     q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> dict:
@@ -146,14 +147,16 @@ async def list_memory(
             ErrorCode.invalid_request, "请在记忆库视图中输入有效的搜索内容",
             status_code=422, field="q",
         )
-    if (source is not None and view != "library") or (offset and source is None and not query):
+    if (source is not None and view != "library") or (object_id and view != "library") or (
+        offset and source is None and not query and object_id is None
+    ):
         raise LingError(
-            ErrorCode.invalid_request, "请在记忆库视图中按搜索内容或导入来源翻页", status_code=422,
+            ErrorCode.invalid_request, "请在记忆库视图中按搜索内容、来源或对象翻页", status_code=422,
         )
     if view == "library":
         return await read_library(
             session, auth.user.subject_id, limit=limit, include=include, source=source,
-            offset=offset, query=query,
+            offset=offset, query=query, object_id=object_id,
         )
 
     effective = include or "active"
@@ -169,6 +172,14 @@ async def list_memory(
         "include": include,
         "note": "默认只含未撤回且未归档的记忆；墓碑用 ?include=retracted|archived|all 取回",
     }
+
+
+@router.get("/memory/objects")
+async def memory_objects(auth: CurrentAuth, session: DbSession) -> dict:
+    """按对象浏览记忆时用的对象目录；只含至少一条现行记忆的对象。"""
+    from ling.domains.memory.objects import list_memory_objects
+
+    return {"objects": await list_memory_objects(session, auth.user.subject_id)}
 
 
 @router.get("/memory/sleep-review")
