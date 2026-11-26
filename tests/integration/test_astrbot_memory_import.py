@@ -24,6 +24,7 @@ from ling.domains.memory import astrbot_import as importer
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
 from ling.infra.models import ActorAccount, EntityRow, MemoryEntityRow, MemoryRow, OutboxEvent, Subject, Window
+from ling.kernel.audience import AudienceSnapshot
 from tests.integration.conftest import TestEnv
 
 pytestmark = pytest.mark.w0_web
@@ -296,6 +297,18 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     )).json()
     assert [item["visibility"] for item in only_group["memories"]] == ["group_scope"]
     assert only_group["total"] == 1
+
+    # 历史群窗口不能冒充当前群受众：另一个群窗口不能召回这条记忆。
+    async with session_scope() as session:
+        audience = await AudienceSnapshot.freeze(
+            session, subject_id=logged_in.subject_id,
+            window_id="win_live_other_group", window_visibility="group_scope",
+        )
+        recalled = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="蓝封画册",
+            visibility_allow={Visibility.group_scope}, audience=audience,
+        )
+        assert row.id not in {hit.memory_id for hit in recalled.hits}
 
 
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
