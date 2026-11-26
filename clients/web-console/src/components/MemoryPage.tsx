@@ -25,6 +25,8 @@ import type {
   MemoryInclude,
   MemoryListResponse,
   MemoryObject,
+  MemoryObjectAnnotation,
+  MemoryObjectKind,
   MemoryRecord,
   SleepReviewsResponse,
 } from '../types';
@@ -47,6 +49,12 @@ const BROWSE_KINDS = [
   { value: 'episode', label: '经历' },
   { value: 'procedure', label: '做法' },
 ] as const;
+
+const OBJECT_KIND_LABELS: Record<MemoryObjectKind, string> = {
+  person: '人物', group: '群体', place: '地点', item: '物件', work: '作品',
+  pet: '宠物', topic: '话题', project: '项目', org: '组织',
+};
+const OBJECT_KINDS = Object.keys(OBJECT_KIND_LABELS) as MemoryObjectKind[];
 
 export function kindLabel(kind: string): string {
   return BROWSE_KINDS.find((item) => item.value === kind)?.label ?? (kind || '未分类');
@@ -626,6 +634,7 @@ export function canRetryForget(state: ForgetState): boolean {
 export interface MemoryHandlers {
   forgetSource(memoryId: string): Promise<void>;
   readSource(memoryId: string): Promise<{ text: string; created_at: string }>;
+  annotateObject(memoryId: string, input: MemoryObjectAnnotation): Promise<void>;
   retract(memoryId: string, reason: string): Promise<void>;
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
@@ -1184,6 +1193,67 @@ export function searchLoadedMemories(rows: MemoryRecord[], query: string): Memor
   });
 }
 
+function ObjectAnnotationForm({
+  row, objects, onSave,
+}: {
+  row: MemoryRecord;
+  objects: MemoryObject[];
+  onSave: (input: MemoryObjectAnnotation) => Promise<void>;
+}): React.ReactElement {
+  const [name, setName] = useState('');
+  const [kind, setKind] = useState<MemoryObjectKind>('person');
+  const [objectId, setObjectId] = useState('');
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<ExplainedError | null>(null);
+  const normalized = name.trim();
+  const matches = objects.filter((object) => object.kind === kind && object.name === normalized);
+  const valid = normalized.length >= 2 && row.text.includes(normalized);
+  const submit = async () => {
+    if (pending || !valid) return;
+    setPending(true);
+    setError(null);
+    try {
+      await onSave({ kind, name: normalized, ...(objectId ? { object_id: objectId } : {}) });
+      setName('');
+      setObjectId('');
+    } catch (cause) {
+      setError(explainError(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <details className="mem-inspector__section mem-object-annotation">
+      <summary>标记对象</summary>
+      <form className="mem-confirm mem-confirm--item" aria-label="标记记忆对象"
+        onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+        <label className="mem-field"><span>对象名称</span>
+          <input value={name} maxLength={64} required placeholder="从这条记忆里摘取名称"
+            onChange={(event) => { setName(event.target.value); setObjectId(''); }} disabled={pending} />
+        </label>
+        <label className="mem-field"><span>对象类型</span>
+          <select value={kind} onChange={(event) => { setKind(event.target.value as MemoryObjectKind); setObjectId(''); }}
+            disabled={pending}>
+            {OBJECT_KINDS.map((value) => <option key={value} value={value}>{OBJECT_KIND_LABELS[value]}</option>)}
+          </select>
+        </label>
+        {matches.length ? (
+          <label className="mem-field"><span>关联到</span>
+            <select value={objectId} onChange={(event) => setObjectId(event.target.value)} disabled={pending}>
+              <option value="">新对象</option>
+              {matches.map((object) => <option key={object.entity_id} value={object.entity_id}>
+                {object.name} · {formatAbsoluteTime(object.last_recorded_at)}
+              </option>)}
+            </select>
+          </label>
+        ) : null}
+        {error ? <p role="alert">{error.reason}</p> : null}
+        <button type="submit" className="button button--small" disabled={pending || !valid}>保存对象</button>
+      </form>
+    </details>
+  );
+}
+
 function MemoryInspector({
   row,
   loaded,
@@ -1194,6 +1264,7 @@ function MemoryInspector({
   onSelect,
   onChanged,
   handlers,
+  objects,
 }: {
   row: MemoryRecord;
   loaded: MemoryRecord[];
@@ -1204,6 +1275,7 @@ function MemoryInspector({
   onSelect: (id: string) => void;
   onChanged: () => void;
   handlers: MemoryHandlers;
+  objects: MemoryObject[];
 }): React.ReactElement {
   const [mode, setMode] = useState<'retract' | 'supersede' | 'forget' | null>(null);
   const [reason, setReason] = useState('');
@@ -1247,7 +1319,7 @@ function MemoryInspector({
   };
 
   const forgetting = mode === 'forget';
-  const canForget = Boolean(row.source_message_id && row.can_edit !== false);
+  const canForget = Boolean(row.source_message_id);
   const actionLabel = forgetting ? '遗忘这次发言的记忆' : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
   const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
 
@@ -1317,6 +1389,11 @@ function MemoryInspector({
           </div>
         ) : null}
       </div>
+
+      {!status && (row.source_message_id || row.import_source || row.source_event_ids.length) ? (
+        <ObjectAnnotationForm row={row} objects={objects}
+          onSave={(input) => handlers.annotateObject(row.memory_id, input)} />
+      ) : null}
 
       {star ? (
         <MemoryMicroscopeBeats row={row} beats={star.beats}
@@ -1716,17 +1793,27 @@ export function MemoryListSection({
         <div className="mem-facet-panel" id="mem-discovery-filters" hidden={!showFilters}>
           <div className="mem-facet-panel__fields">
             <label className="mem-field mem-field--wide"><span>按对象看</span>
-              <select value={objectId ?? ''} onChange={(event) => {
+              <select aria-label="按对象看" value={objectId ?? ''} onChange={(event) => {
                 onObjectChange(event.target.value || null);
                 setSelectedId(null);
                 setShowFilters(false);
               }}>
                 <option value="">全部对象</option>
-                {objects.map((item) => (
-                  <option key={item.entity_id} value={item.entity_id}>
-                    {item.kind === 'self' ? '她自己' : `${item.name} · ${item.count} 条`}
-                  </option>
-                ))}
+                {objects.some((item) => item.kind === 'self') ? <option value="self">她自己</option> : null}
+                {[...OBJECT_KINDS, 'other'].map((kind) => {
+                  const choices = objects.filter((item) => item.kind === kind);
+                  if (!choices.length) return null;
+                  const names = new Map<string, number>();
+                  for (const choice of choices) names.set(choice.name, (names.get(choice.name) ?? 0) + 1);
+                  return (
+                    <optgroup key={kind} label={kind === 'other' ? '其他' : OBJECT_KIND_LABELS[kind as MemoryObjectKind]}>
+                      {choices.map((item) => <option key={item.entity_id} value={item.entity_id}>
+                        {item.name} · {item.count} 条{(names.get(item.name) ?? 0) > 1
+                          ? ` · ${formatAbsoluteTime(item.last_recorded_at)}` : ''}
+                      </option>)}
+                    </optgroup>
+                  );
+                })}
               </select>
             </label>
             <label className="mem-field"><span>记下时间</span>
@@ -1933,7 +2020,7 @@ export function MemoryListSection({
         {selected && !importPanelOpen && (view === 'list' || detailOpen) ? (
           <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} chartModel={chartModel}
             backLabel={view === 'stars' ? '回到星图' : '回到列表'}
-            headingRef={headingRef} handlers={handlers} onBack={goBack}
+            headingRef={headingRef} handlers={handlers} objects={objects} onBack={goBack}
             onSelect={selectedFromHistory} onChanged={goBack} />
         ) : data && !importPanelOpen && (view === 'list' || detailOpen) ? (
           <div className="mem-inspector mem-inspector--empty">
@@ -2573,6 +2660,11 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const handlers: MemoryHandlers = useMemo(
     () => ({
       readSource: api.readMemorySource,
+      async annotateObject(memoryId, input) {
+        await api.annotateMemoryObject(memoryId, input);
+        setNotice({ tone: 'ok', text: '已保存对象。' });
+        await loadList();
+      },
       async forgetSource(memoryId) {
         await api.forgetMemorySource(memoryId);
         setNotice({ tone: 'ok', text: '已遗忘该次发言生成的记忆。' });

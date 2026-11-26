@@ -436,12 +436,21 @@ export interface MemoryImportSource {
  */
 export type MemoryImportSourceFilter = 'astrbot_memory_companion';
 
+export type MemoryObjectKind = 'person' | 'group' | 'place' | 'item' | 'work' | 'pet' | 'topic' | 'project' | 'org';
+
+export interface MemoryObjectAnnotation {
+  kind: MemoryObjectKind;
+  name: string;
+  object_id?: string;
+}
+
 export interface MemoryObject {
   entity_id: string;
   name: string;
   kind: string;
   aliases: string[];
   count: number;
+  last_recorded_at?: string;
 }
 
 export interface MemoryObjectList {

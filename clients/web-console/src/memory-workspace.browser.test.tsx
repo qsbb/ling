@@ -16,7 +16,7 @@ import react from '@vitejs/plugin-react';
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request } from 'playwright';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { MemoryRecord } from './types';
+import type { MemoryObject, MemoryRecord } from './types';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const WAIT = 8_000;
@@ -144,6 +144,7 @@ async function openWorkspace(options: MockOptions = {}) {
   const settledDone = new Promise<void>(resolve => { releaseSettled = resolve; });
   const writes: { method: string; path: string; body: unknown }[] = [];
   let rows: MemoryRecord[] = options.memories ?? [FAVORITE, WALK, RETRACTED, ARCHIVED];
+  const labeled = new Map<string, { object: MemoryObject; memoryId: string }>();
   if (options.largeBatch) {
     rows.push(...Array.from({ length: 202 }, (_, i) => memory(`mem_sample_${i}`, `批次样本 ${i + 1}`)), OUTSIDE_BATCH);
   }
@@ -167,17 +168,22 @@ async function openWorkspace(options: MockOptions = {}) {
         case CONFIG: return route.fulfill(json(SETTINGS));
         case '/v1/consents': return route.fulfill(json({ schema_version: 'v1', known_scopes: [], consents: [] }));
         case '/v1/memory/purge/status': return route.fulfill(json({ items: [], note: '' }));
+        case '/v1/memory/objects': return route.fulfill(json({
+          objects: [...labeled.values()].map(({ object }) => object),
+        }));
         case LIST: {
           const limit = Number(url.searchParams.get('limit') ?? 50);
           const include = url.searchParams.get('include');
           const q = url.searchParams.get('q');
           const offset = Number(url.searchParams.get('offset') ?? 0);
+          const objectId = url.searchParams.get('object_id');
           if (!Number.isInteger(limit) || limit < 1 || limit > 200 ||
               (include !== null && !['retracted', 'archived', 'all'].includes(include)) ||
               (q !== null && q.length > 200) || !Number.isInteger(offset) || offset < 0) {
             return route.fulfill(error('invalid_request', '无效的列表参数', 422));
           }
           const filtered = rows.filter(row =>
+            (!objectId || row.memory_id === labeled.get(objectId)?.memoryId) &&
             (!row.retracted || include === 'retracted' || include === 'all') &&
             (!row.archived_at || include === 'archived' || include === 'all'));
           /*
@@ -226,6 +232,19 @@ async function openWorkspace(options: MockOptions = {}) {
     } else {
       const body: unknown = request.postDataJSON();
       writes.push({ method, path, body });
+      if (method === 'POST' && path.endsWith('/objects') && body && typeof body === 'object'
+          && 'kind' in body && typeof body.kind === 'string' && 'name' in body && typeof body.name === 'string') {
+        const target = rows.find(record => path === `${LIST}/${record.memory_id}/objects`);
+        if (!target || !target.text.includes(body.name)) {
+          return route.fulfill(error('invalid_request', '没有原话依据', 422));
+        }
+        const entity_id = 'ent_browser_object';
+        labeled.set(entity_id, {
+          memoryId: target.memory_id,
+          object: { entity_id, kind: body.kind, name: body.name, aliases: [], count: 1, last_recorded_at: STAMP },
+        });
+        return route.fulfill(json({ entity_id }));
+      }
       if (method === 'POST' && path === `${LIST}/${FAVORITE.memory_id}/supersede` &&
           body && typeof body === 'object' && 'text' in body && typeof body.text === 'string' && body.text) {
         const corrected = { ...memory('mem_corrected', body.text), supersedes: FAVORITE.memory_id };
@@ -424,6 +443,35 @@ const STAR_ROWS: MemoryRecord[] = [
 const SHOTS = fileURLToPath(new URL('../../../docs/evidence/memory-star-map/', import.meta.url));
 
 describe('记忆工作区：独立浏览器验收', () => {
+  it('从记忆详情标记物件后按对象浏览，独立保留其余记录', async () => {
+    const record = memory('mem_album', '阿禾把蓝封画册借给她。');
+    const { page, reads, writes } = await openWorkspace({
+      memories: [FAVORITE, record], viewport: { width: 320, height: 760 }, mobile: true,
+    });
+    await row(page, record).click();
+    await detail(page).getByText('标记对象', { exact: true }).click();
+    const form = detail(page).getByRole('form', { name: '标记记忆对象' });
+    await form.getByLabel('对象名称').fill('红封画册');
+    expect(await form.getByRole('button', { name: '保存对象' }).isEnabled()).toBe(false);
+    await form.getByLabel('对象名称').fill('蓝封画册');
+    await form.getByLabel('对象类型').selectOption('item');
+    await form.getByRole('button', { name: '保存对象' }).click();
+    await expect.poll(() => writes).toEqual([{
+      method: 'POST', path: '/v1/memory/mem_album/objects', body: { kind: 'item', name: '蓝封画册' },
+    }]);
+    await detail(page).getByRole('button', { name: '回到列表' }).click();
+    await page.getByRole('button', { name: '筛选', exact: true }).click();
+    const selector = page.getByLabel('按对象看', { exact: true });
+    await expect.poll(() => selector.locator('optgroup[label="物件"] option').count(), { timeout: WAIT }).toBe(1);
+    await selector.selectOption('ent_browser_object');
+    await visible(row(page, record));
+    await expect.poll(() => readsAt(reads, LIST).at(-1)?.searchParams.get('object_id')).toBe('ent_browser_object');
+    await expect.poll(() => row(page, FAVORITE).count()).toBe(0);
+    await notWiderThanViewport(page, 320);
+    await page.getByTestId('mem-object-active').getByRole('button', { name: '清除' }).click();
+    await visible(row(page, FAVORITE));
+  }, CASE_TIMEOUT);
+
   it('搜索走服务端：能找到第一页之外的旧条目，计数与翻页如实反映命中量', async () => {
     const { page, reads } = await openWorkspace({ largeBatch: true });
     await visible(row(page, FAVORITE));

@@ -185,6 +185,7 @@ function toStep(target: 'purging' | 'done' | 'failed' | 'timeout'): ForgetState 
 const HANDLERS: MemoryHandlers = {
   forgetSource: async () => {},
   readSource: async () => ({ text: "", created_at: "" }),
+  annotateObject: async () => undefined,
   retract: async () => undefined,
   supersede: async () => undefined,
   saveCore: async () => undefined,

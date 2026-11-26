@@ -69,6 +69,7 @@ import type {
   MemoryListResponse,
   MemoryImportSourceFilter,
   MemoryObjectList,
+  MemoryObjectAnnotation,
   LogQuery,
   LogsResponse,
   RecallProposal,
@@ -1445,6 +1446,10 @@ export const api = {
    */
   listMemoryObjects(signal?: AbortSignal): Promise<MemoryObjectList> {
     return request<MemoryObjectList>('/v1/memory/objects', { cache: 'no-store', ...(signal ? { signal } : {}) });
+  },
+
+  annotateMemoryObject(memoryId: string, input: MemoryObjectAnnotation): Promise<{ entity_id: string }> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/objects`, jsonInit('POST', input));
   },
 
   /**
