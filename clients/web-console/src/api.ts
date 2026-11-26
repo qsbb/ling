@@ -1501,6 +1501,10 @@ export const api = {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/activity-source`);
   },
 
+  setMemoryPin(memoryId: string, pinned: boolean): Promise<{ memory_id: string; pinned: boolean }> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/pin`, jsonInit('PUT', { pinned }));
+  },
+
   forgetMemorySource(memoryId: string): Promise<{ memory_id: string; forgotten: boolean }> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/forget`, { method: 'POST' });
   },

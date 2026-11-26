@@ -848,7 +848,7 @@ class ContextCompiler:
             core_block = (
                 ""
                 if _sealed
-                else await CoreMemoryService(self._session).render(
+                else await CoreMemoryService(self._session, policy=self._memory_policy).render(
                     subject_id=subject_id,
                     is_group=bool(getattr(snapshot, "is_group", False)),
                 )

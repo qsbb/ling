@@ -639,6 +639,7 @@ export interface MemoryHandlers {
   readSource(memoryId: string): Promise<{ text: string; created_at: string }>;
   readActivitySource?(memoryId: string): Promise<MemoryActivitySource>;
   annotateObject(memoryId: string, input: MemoryObjectAnnotation): Promise<void>;
+  setPin?(memoryId: string, pinned: boolean): Promise<void>;
   retract(memoryId: string, reason: string): Promise<void>;
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
@@ -1057,9 +1058,11 @@ export function CoreMemorySection({
                 <time dateTime={item.updated_at ?? undefined}>{formatAbsoluteTime(item.updated_at)}</time>
               </p>
               <div className="mem-core-item__actions">
-                <button type="button" className="button button--small mem-action" disabled={pending} onClick={() => startEdit(item)}>
-                  <PencilIcon size={13} /> 编辑
-                </button>
+                {item.source_memory_id ? null : (
+                  <button type="button" className="button button--small mem-action" disabled={pending} onClick={() => startEdit(item)}>
+                    <PencilIcon size={13} /> 编辑
+                  </button>
+                )}
                 <button
                   type="button"
                   className="button button--small mem-action mem-action--danger"
@@ -1287,17 +1290,17 @@ function MemoryInspector({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ExplainedError | null>(null);
   const [source, setSource] = useState<{ text: string; created_at: string } | null>(null);
+  const [activitySource, setActivitySource] = useState<MemoryActivitySource | null>(null);
   const [sourceError, setSourceError] = useState<ExplainedError | null>(null);
   const [sourcePending, setSourcePending] = useState(false);
 
-  const [activitySource, setActivitySource] = useState<MemoryActivitySource | null>(null);
   const toggleSource = async () => {
     if (source || activitySource) {
       setSource(null);
+      setActivitySource(null);
       return;
     }
     setSourcePending(true);
-      setActivitySource(null);
     setSourceError(null);
     try {
       if (row.record_type === 'self_experience' && handlers.readActivitySource) {
@@ -1331,6 +1334,9 @@ function MemoryInspector({
   const forgetting = mode === 'forget';
   const imported = row.import_source?.source === 'astrbot_memory_companion';
   const canForget = Boolean(row.source_message_id || imported);
+  const canPin = !status && row.can_edit && row.kind === 'assertion' && row.origin === 'user_statement'
+    && row.visibility === 'subject_private' && (row.source_visibility ?? row.visibility) === 'subject_private'
+    && (!row.valid_until || Date.parse(row.valid_until) > Date.now());
   const actionLabel = forgetting ? (imported ? '遗忘这条导入记忆' : '遗忘这次发言的记忆')
     : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
   const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
@@ -1345,6 +1351,19 @@ function MemoryInspector({
       else await handlers.supersede(row.memory_id, newText.trim(), reason.trim() || '用户纠正');
       updateMode(null);
       onChanged();
+    } catch (cause) {
+      setError(explainError(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const togglePin = async () => {
+    if (!handlers.setPin || pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      await handlers.setPin(row.memory_id, !row.pinned);
     } catch (cause) {
       setError(explainError(cause));
     } finally {
@@ -1379,7 +1398,7 @@ function MemoryInspector({
           {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
         <p className="mem-inspector__text">{row.text}</p>
-        {(!status && row.can_edit !== false) || canForget ? (
+        {(!status && row.can_edit !== false) || canForget || row.pinned ? (
           <div className="mem-inspector__actions">
             {!status && row.can_edit !== false ? <>
             <button
@@ -1393,6 +1412,11 @@ function MemoryInspector({
               onClick={() => updateMode(mode === 'retract' ? null : 'retract')}
             >撤回…</button>
             </> : null}
+            {handlers.setPin && (canPin || row.pinned) ? (
+              <button type="button" className="button button--small" disabled={pending} onClick={() => void togglePin()}>
+                {row.pinned ? '取消固定' : '固定为核心记忆'}
+              </button>
+            ) : null}
             {canForget ? (
               <button type="button" className="button button--small mem-action--danger"
                 aria-expanded={forgetting} disabled={pending}
@@ -1402,6 +1426,7 @@ function MemoryInspector({
         ) : null}
       </div>
 
+      {!mode && error ? <InlineError error={error} resource="list" /> : null}
       {!status && row.record_type !== 'self_experience'
         && (row.source_message_id || row.import_source || row.source_event_ids.length) ? (
         <ObjectAnnotationForm row={row} objects={objects}
@@ -2708,6 +2733,12 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const handlers: MemoryHandlers = useMemo(
     () => ({
       readSource: api.readMemorySource,
+      readActivitySource: api.readMemoryActivitySource,
+      async setPin(memoryId, pinned) {
+        await api.setMemoryPin(memoryId, pinned);
+        setNotice({ tone: 'ok', text: pinned ? '已固定为核心记忆。' : '已取消固定。' });
+        await Promise.all([loadList(), loadCore()]);
+      },
       async annotateObject(memoryId, input) {
         await api.annotateMemoryObject(memoryId, input);
         setNotice({ tone: 'ok', text: '已保存对象。' });
@@ -2733,7 +2764,6 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
           text: '纠正已保存。旧条目退出召回，可在历史记录中查看。',
         });
         await loadList();
-      readActivitySource: api.readMemoryActivitySource,
       },
       async saveCore(input, meta) {
         await api.upsertCoreMemory(input);

@@ -102,6 +102,10 @@ class MemoryObjectAnnotation(BaseModel):
     object_id: str | None = Field(default=None, max_length=64)
 
 
+class MemoryPin(BaseModel):
+    pinned: bool
+
+
 @router.get("/memory")
 async def list_memory(
     auth: CurrentAuth,
@@ -372,10 +376,6 @@ async def read_memory_source(memory_id: str, auth: CurrentAuth, session: DbSessi
     }
 
 
-@router.post("/memory/{memory_id}/forget")
-async def forget_memory_source(
-    memory_id: str, auth: CurrentAuth, session: DbSession,
-) -> dict:
 @router.get("/memory/{memory_id}/activity-source")
 async def read_memory_activity_source(
     memory_id: str, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
@@ -394,6 +394,10 @@ async def read_memory_activity_source(
     return evidence
 
 
+@router.post("/memory/{memory_id}/forget")
+async def forget_memory_source(
+    memory_id: str, auth: CurrentAuth, session: DbSession,
+) -> dict:
     from ling.domains.memory.forget_source import forget_source
 
     if not await forget_source(session, subject_id=auth.user.subject_id, memory_id=memory_id):
@@ -402,6 +406,23 @@ async def read_memory_activity_source(
         "memory_source_forgotten", actor=auth.user.id, target_type="memory", target_id=memory_id,
     )
     return {"memory_id": memory_id, "forgotten": True}
+
+
+@router.put("/memory/{memory_id}/pin")
+async def set_memory_pin(
+    memory_id: str, body: MemoryPin, auth: CurrentAuth, session: DbSession, config: ConfigDep,
+) -> dict:
+    from ling.domains.memory.core import CoreMemoryService
+
+    try:
+        changed = await CoreMemoryService(session, policy=(await config.effective()).memory).set_pin(
+            auth.user.subject_id, memory_id, body.pinned,
+        )
+    except ValueError as exc:
+        raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
+    if not changed:
+        raise LingError(ErrorCode.not_found, "这条记忆无法固定或取消固定", status_code=404)
+    return {"memory_id": memory_id, "pinned": body.pinned}
 
 
 @router.post("/memory/forget")
@@ -1297,13 +1318,14 @@ def _core_memory_dict(
         "priority": view.priority,
         "scope": view.scope,
         "origin_kind": view.origin_kind,
+        **({"source_memory_id": view.source_memory_id} if view.source_memory_id else {}),
         "created_at": created_at.isoformat() if created_at else None,
         "updated_at": updated_at.isoformat() if updated_at else None,
     }
 
 
 @router.get("/core-memory")
-async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
+async def list_core_memory(auth: CurrentAuth, session: DbSession, config: ConfigDep) -> dict:
     """核心记忆：每轮常驻，不依赖检索命中。
 
     用于放边界、禁忌、称呼、重要约定这类"忘了就出事"的内容。
@@ -1313,7 +1335,7 @@ async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
 
     # 响应回显 limit=20，查询就必须真的带上硬 LIMIT：正常写入受 20 条上限
     # 保护，但历史/并发数据可能超限，不然会出现"回显 20 却返回 21 条"。
-    items = await CoreMemoryService(session).list_active(
+    items = await CoreMemoryService(session, policy=(await config.effective()).memory).list_active(
         auth.user.subject_id, limit=MAX_PER_SUBJECT
     )
     # 时间戳只在表里（CoreMemoryRow.created_at/updated_at），CoreMemoryView
@@ -1347,7 +1369,9 @@ async def list_core_memory(auth: CurrentAuth, session: DbSession) -> dict:
 
 
 @router.put("/core-memory")
-async def upsert_core_memory(body: CoreMemoryBody, auth: CurrentAuth, session: DbSession) -> dict:
+async def upsert_core_memory(
+    body: CoreMemoryBody, auth: CurrentAuth, session: DbSession, config: ConfigDep,
+) -> dict:
     """写入或更新核心记忆（同 label 覆盖，避免互相矛盾的重复条目）。"""
     from ling.domains.memory.core import CoreMemoryService
     from ling.infra.models import CoreMemoryRow
@@ -1356,7 +1380,7 @@ async def upsert_core_memory(body: CoreMemoryBody, auth: CurrentAuth, session: D
     # 一次才能刷新优先级/作用域/时间戳。放在注释里而不是 docstring，是为了
     # 不让 OpenAPI description 出现与本轮无关的变化。
     try:
-        view = await CoreMemoryService(session).upsert(
+        view = await CoreMemoryService(session, policy=(await config.effective()).memory).upsert(
             subject_id=auth.user.subject_id,
             label=body.label,
             text=body.text,

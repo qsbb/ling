@@ -12,12 +12,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import CoreMemoryRow, utcnow
+from ling.domains.memory.purge import has_open_purge
+from ling.domains.memory.service import MemoryService, active_source
+from ling.infra.models import CoreMemoryRow, MemoryRow, Subject, utcnow
 from ling.infra.security import new_id
+from ling.ports.config import MemoryPolicy
 
 # 每个 subject 的核心记忆上限。超出时按 priority 取舍，不静默丢弃——
 # 调用方会收到提示，要求先清理再新增。
@@ -35,13 +39,30 @@ class CoreMemoryView:
     origin_kind: str
     scope: str
     active: bool
+    source_memory_id: str | None = None
+
+
+def _pin_source(now: datetime):
+    return and_(
+        MemoryRow.kind == "assertion",
+        MemoryRow.origin == "user_statement",
+        MemoryRow.visibility == "subject_private",
+        MemoryRow.source_visibility == "subject_private",
+        MemoryRow.fact_phase == "current",
+        MemoryRow.retracted.is_(False),
+        MemoryRow.archived_at.is_(None),
+        or_(MemoryRow.valid_from.is_(None), MemoryRow.valid_from <= now),
+        or_(MemoryRow.valid_until.is_(None), MemoryRow.valid_until > now),
+        active_source(MemoryRow),
+    )
 
 
 class CoreMemoryService:
     """核心记忆的唯一写入方。"""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, policy: MemoryPolicy | None = None) -> None:
         self._session = session
+        self._retention = MemoryService(session, policy=policy)
 
     async def upsert(
         self,
@@ -65,6 +86,7 @@ class CoreMemoryService:
             raise ValueError("核心记忆的 label 与 text 都不能为空")
         if scope not in {"private", "group", "global"}:
             raise ValueError(f"未知作用域: {scope}")
+        await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
 
         row = (
             await self._session.execute(
@@ -93,6 +115,8 @@ class CoreMemoryService:
             )
             self._session.add(row)
         else:
+            if row.source_memory_id is not None:
+                raise ValueError("请在原记忆中纠正这条固定记忆")
             row.text = text[:2000]
             row.priority = priority
             row.scope = scope
@@ -100,6 +124,39 @@ class CoreMemoryService:
             row.updated_at = utcnow()
         await self._session.flush()
         return self._view(row)
+
+    async def set_pin(self, subject_id: str, memory_id: str, pinned: bool) -> bool:
+        await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+        if await has_open_purge(self._session, subject_id=subject_id):
+            return False
+        pin = await self._session.scalar(select(CoreMemoryRow).where(
+            CoreMemoryRow.subject_id == subject_id, CoreMemoryRow.source_memory_id == memory_id,
+        ))
+        if not pinned:
+            if pin is not None:
+                await self._session.delete(pin)
+                return True
+            return False
+        now = utcnow()
+        source = await self._session.scalar(select(MemoryRow).where(
+            MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id, _pin_source(now),
+            self._retention._retained_memory(now),
+        ).with_for_update())
+        if source is None:
+            return False
+        if (pin is None or not pin.active) and len(await self.list_active(subject_id)) >= MAX_PER_SUBJECT:
+            raise ValueError(f"核心记忆已达上限 {MAX_PER_SUBJECT} 条")
+        if pin is None:
+            core_id = new_id("core")
+            self._session.add(CoreMemoryRow(
+                id=core_id, subject_id=subject_id, label=core_id, text="",
+                priority=100, origin_kind="derived", scope="private", active=True,
+                source_memory_id=memory_id,
+            ))
+        else:
+            pin.active = True
+        await self._session.flush()
+        return True
 
     async def list_active(
         self, subject_id: str, *, limit: int | None = None
@@ -113,22 +170,28 @@ class CoreMemoryService:
         用户在后台点了"删除"之后，下一轮回复里还会照常出现"她怕黑"——
         那比检索命中更难解释。
         """
-        from ling.domains.memory.purge import has_open_purge
-
         if await has_open_purge(self._session, subject_id=subject_id):
             return []
+        now = utcnow()
         stmt = (
-            select(CoreMemoryRow)
+            select(CoreMemoryRow, MemoryRow)
+            .outerjoin(MemoryRow, MemoryRow.id == CoreMemoryRow.source_memory_id)
             .where(
                 CoreMemoryRow.subject_id == subject_id,
                 CoreMemoryRow.active.is_(True),
+                or_(
+                    CoreMemoryRow.source_memory_id.is_(None),
+                    and_(
+                        MemoryRow.subject_id == subject_id, _pin_source(now), self._retention._retained_memory(now),
+                    ),
+                ),
             )
             .order_by(CoreMemoryRow.priority, CoreMemoryRow.label)
         )
         if limit is not None:
             stmt = stmt.limit(limit)
-        rows = (await self._session.execute(stmt)).scalars()
-        return [self._view(r) for r in rows]
+        rows = (await self._session.execute(stmt)).all()
+        return [self._view(row, source) for row, source in rows]
 
     async def render(
         self, *, subject_id: str, is_group: bool = False, budget: int = DEFAULT_CHAR_BUDGET
@@ -162,6 +225,7 @@ class CoreMemoryService:
         )
 
     async def deactivate(self, core_id: str, subject_id: str) -> bool:
+        await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
         row = await self._session.get(CoreMemoryRow, core_id)
         if row is None or row.subject_id != subject_id:
             return False
@@ -171,15 +235,16 @@ class CoreMemoryService:
         return True
 
     @staticmethod
-    def _view(row: CoreMemoryRow) -> CoreMemoryView:
+    def _view(row: CoreMemoryRow, source: MemoryRow | None = None) -> CoreMemoryView:
         return CoreMemoryView(
             core_id=row.id,
-            label=row.label,
-            text=row.text,
+            label="固定记忆" if source is not None else row.label,
+            text=source.text if source is not None else row.text,
             priority=int(row.priority or 100),
             origin_kind=row.origin_kind,
             scope=row.scope,
             active=bool(row.active),
+            source_memory_id=row.source_memory_id,
         )
 
 

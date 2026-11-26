@@ -1511,6 +1511,10 @@ class CoreMemoryRow(Base, TimestampMixin):
     # 归属作用域：private 只在该 subject 的私聊；group 在群里也生效
     scope: Mapped[str] = mapped_column(String(24), default="private", server_default="private")
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True, server_default="true")
+    source_memory_id: Mapped[str | None] = mapped_column(
+        ForeignKey("memories.id", name="fk_core_memories_source_memory", ondelete="CASCADE"),
+        nullable=True, unique=True,
+    )
 
 
 # ------------------------------------------------------------------ 跨实例协调（多进程部署）

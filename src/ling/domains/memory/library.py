@@ -13,7 +13,14 @@ from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import active_source
-from ling.infra.models import ActivityRow, MemoryEpisode, MemoryRow, OutboxEvent, SelfExperienceRow
+from ling.infra.models import (
+    ActivityRow,
+    CoreMemoryRow,
+    MemoryEpisode,
+    MemoryRow,
+    OutboxEvent,
+    SelfExperienceRow,
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -199,12 +206,18 @@ async def read_library(
         .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
     )).all()
     total = rows[0][2]
+    record_ids = [memory.id for memory, _, _ in rows if memory is not None]
+    pins = set(await session.scalars(select(CoreMemoryRow.source_memory_id).where(
+        CoreMemoryRow.subject_id == subject_id, CoreMemoryRow.active.is_(True),
+        CoreMemoryRow.source_memory_id.in_(record_ids),
+    ))) if record_ids else set()
     page = []
     for memory, episode, _ in rows:
         if memory is not None:
             page.append({
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
                 "source_visibility": memory.source_visibility,
+                **({"pinned": True} if memory.id in pins else {}),
             })
         elif episode is not None:
             page.append(_episode_record(episode))

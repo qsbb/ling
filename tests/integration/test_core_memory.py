@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from ling.domains.memory.core import MAX_PER_SUBJECT, CoreMemoryService
 from ling.infra.db import session_scope
+from ling.infra.models import CoreMemoryRow, MemoryRow
 from ling.kernel.context import ContextCompiler
 from tests.integration.conftest import TestEnv
 
@@ -64,6 +65,54 @@ async def test_core_memory_is_distinct_from_recalled_history(logged_in: TestEnv)
     window_id = await _window(logged_in)
     blob = await _compile(logged_in, window_id)
     assert "和对方相处时记住这些：\n- [称呼] 叫他阿澄" in blob
+
+
+async def test_pin_keeps_original_scope_and_lifetime(logged_in: TestEnv) -> None:
+    from ling.domains.conversation.service import ConversationService
+
+    env = logged_in
+    source_window = await _window(env)
+    test_window = await _window(env)
+    phrase = "称呼我为纸舟"
+    async with session_scope() as session:
+        source = await ConversationService(session).add_message(
+            source_window, role="user", text=phrase, turn_id="turn_pin_anchor", sender_subject_id=env.subject_id,
+        )
+        session.add_all([
+            MemoryRow(
+                id="mem_pin_anchor", subject_id=env.subject_id, kind="assertion", text=phrase,
+                origin="user_statement", visibility="subject_private",
+                source_message_id=source.message_id, source_window_id=source_window, turn_id="turn_pin_anchor",
+                source_event_ids=["turn:turn_pin_anchor"],
+            ),
+            MemoryRow(
+                id="mem_group_pin_denied", subject_id=env.subject_id, kind="assertion", text="群内写下的安排",
+                origin="user_statement", visibility="group_scope", source_visibility="group_scope",
+                source_event_ids=["evt:group-pin-denied"],
+            ),
+        ])
+        await CoreMemoryService(session).upsert(subject_id=env.subject_id, label="对照", text="保留独立边界")
+
+    path = "/v1/memory/mem_pin_anchor/pin"
+    assert (await env.client.put("/v1/memory/mem_group_pin_denied/pin", json={"pinned": True})).status_code == 404
+    assert phrase not in await _compile(env, test_window, "早上好")
+    for _ in range(2):
+        response = await env.client.put(path, json={"pinned": True})
+        assert response.status_code == 200, response.text
+    core_items = (await env.client.get("/v1/core-memory")).json()["items"]
+    linked, = [item for item in core_items if item.get("source_memory_id") == "mem_pin_anchor"]
+    assert linked["text"] == phrase and linked["scope"] == "private"
+    assert f"[固定记忆] {phrase}" in await _compile(env, test_window, "早上好")
+    assert (await env.client.put(path, json={"pinned": False})).status_code == 200
+    assert phrase not in await _compile(env, test_window, "早上好")
+    assert (await env.client.put(path, json={"pinned": True})).status_code == 200
+    assert (await env.client.post("/v1/memory/mem_pin_anchor/forget")).status_code == 200
+    prompt = await _compile(env, test_window, "早上好")
+    assert phrase not in prompt and "保留独立边界" in prompt
+    async with session_scope() as session:
+        assert await session.scalar(select(CoreMemoryRow.id).where(
+            CoreMemoryRow.source_memory_id == "mem_pin_anchor",
+        )) is None
 
 
 async def test_private_core_memory_hidden_in_group(logged_in: TestEnv) -> None:

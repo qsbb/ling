@@ -407,6 +407,7 @@ export interface MemoryRecord {
   created_at: string | null;
   archived_at: string | null;
   can_edit?: boolean;
+  pinned?: boolean;
   record_type?: 'memory' | 'experience' | 'self_experience';
   /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
   import_source?: MemoryImportSource;
@@ -564,6 +565,7 @@ export interface MemoryImportCommit extends MemoryImportCounts {
 }
 
 export interface CoreMemoryItem {
+  source_memory_id?: string;
   core_id: string;
   label: string;
   text: string;
