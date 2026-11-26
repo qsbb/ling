@@ -14,7 +14,7 @@ from datetime import UTC, datetime, time
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.error_handlers import PublicValidationError
@@ -37,6 +37,7 @@ from ling.domains.consent.service import KNOWN_SCOPES, ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.goals.service import GoalsService
 from ling.domains.knowledge.service import KnowledgeService
+from ling.domains.memory.entities import ObjectKind
 from ling.domains.memory.service import MemoryService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
@@ -93,6 +94,12 @@ class MemoryRetract(BaseModel):
 class MemorySupersede(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     reason: str = Field(default="用户纠正", max_length=500)
+
+
+class MemoryObjectAnnotation(BaseModel):
+    kind: ObjectKind
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=64)]
+    object_id: str | None = Field(default=None, max_length=64)
 
 
 @router.get("/memory")
@@ -180,6 +187,27 @@ async def memory_objects(auth: CurrentAuth, session: DbSession) -> dict:
     from ling.domains.memory.objects import list_memory_objects
 
     return {"objects": await list_memory_objects(session, auth.user.subject_id)}
+
+
+@router.post("/memory/{memory_id}/objects")
+async def annotate_memory_object(
+    memory_id: str, body: MemoryObjectAnnotation, auth: OwnerWrite, session: DbSession,
+) -> dict:
+    from ling.domains.memory.objects import ObjectAnnotationError
+    from ling.domains.memory.objects import annotate_memory_object as annotate
+
+    try:
+        object_id = await annotate(
+            session, subject_id=auth.user.subject_id, memory_id=memory_id,
+            kind=body.kind, name=body.name, object_id=body.object_id,
+        )
+    except ObjectAnnotationError as exc:
+        if str(exc) == "literal_required":
+            raise LingError(
+                ErrorCode.invalid_request, "请输入记忆依据中出现的完整名称", status_code=422,
+            ) from None
+        raise LingError(ErrorCode.not_found, "记忆或对象不可用", status_code=404) from None
+    return {"entity_id": object_id}
 
 
 @router.get("/memory/sleep-review")

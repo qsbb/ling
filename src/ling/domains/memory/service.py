@@ -894,13 +894,16 @@ class MemoryService:
         # 字面可能完全不重叠，但沿实体关系能找到相关记忆。
         rank_entity: dict[str, int] = {}
         _entity_hit_ids: set[str] = set()
+        episode_entity_ids: set[str] = set()
         try:
             from ling.domains.memory.entities import EntityService
 
             _svc = EntityService(self._session)
             _entities = await _svc.resolve(subject_id=subject_id, text=query)
             if _entities:
-                _related = await _svc.related_memory_ids([e.id for e in _entities])
+                entity_ids = [e.id for e in _entities]
+                _related = await _svc.related_memory_ids(entity_ids)
+                episode_entity_ids = await _svc.related_memory_ids(entity_ids, record_type="experience")
                 if _related:
                     # 只在**已授权候选集**里标实体命中：关联不能绕过权限过滤。
                     # 命中的作为独立一路参与 RRF，让"沿关系找到"的记忆有额外支持。
@@ -1018,6 +1021,7 @@ class MemoryService:
         ep_pool = [
             ep for ep in episode_candidates
             if _word_match(ep.summary, topics, explicit=explicit_recall)
+            or ep.id in episode_entity_ids
             or ep_vector_scores.get(ep.id, 0.0) >= _MIN_SEMANTIC_SIMILARITY
         ]
         # 情节查询没有 ORDER BY；先把池子按 id 定序，后面同分同置信度时
@@ -1034,6 +1038,7 @@ class MemoryService:
             [ep for ep in ep_pool if ep_vector_scores.get(ep.id, 0.0) >= _MIN_SEMANTIC_SIMILARITY],
             key=lambda ep: -ep_vector_scores[ep.id],
         )
+        rank_ep_entity = _rank_map([ep for ep in ep_pool if ep.id in episode_entity_ids], key=lambda _ep: 0)
 
         for ep in ep_pool:
             # 也与断言用同一套 RRF + 归一化，否则两者分数尺度差上百倍，
@@ -1044,6 +1049,8 @@ class MemoryService:
             ]
             if ep.id in rank_ep_vector:
                 ep_terms.append(1.0 / (RRF_K + rank_ep_vector[ep.id]))
+            if ep.id in rank_ep_entity:
+                ep_terms.append(1.0 / (RRF_K + rank_ep_entity[ep.id]))
             present = [t for t in ep_terms if t > 0]
             fused = sum(present) / len(present) if present else 0.0
             scored.append(

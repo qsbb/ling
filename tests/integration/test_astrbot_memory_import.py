@@ -302,6 +302,7 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
 
         renamed = await EntityService(session).upsert_group(
             subject_id=logged_in.subject_id, group_id=GROUP_ID,
+            window_id=row.source_window_id,
             display_name="新的读书群", aliases=["读书群"],
         )
         assert renamed.id == entity.id

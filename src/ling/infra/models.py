@@ -1405,12 +1405,17 @@ class EntityRow(Base, TimestampMixin):
 
     __tablename__ = "entities"
     __table_args__ = (
-        UniqueConstraint("subject_id", "name", name="uq_entities_subject_name"),
+        UniqueConstraint("subject_id", "source_key", name="uq_entities_subject_source"),
+        Index(
+            "uq_entities_legacy_name", "subject_id", "name", unique=True,
+            postgresql_where=sa.text("source_key IS NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
     name: Mapped[str] = mapped_column(String(64))
+    source_key: Mapped[str | None] = mapped_column(String(96), nullable=True)
     kind: Mapped[str] = mapped_column(String(24), default="other", server_default="other")
     # 同一实体的其他叫法（小写归一化后比对）
     aliases: Mapped[list] = mapped_column(JSON, default=list, server_default=sa.text("'[]'::json"))
@@ -1426,10 +1431,12 @@ class MemoryEntityRow(Base):
     __tablename__ = "memory_entities"
     __table_args__ = (
         Index("ix_memory_entities_entity", "entity_id"),
+        CheckConstraint("record_type IN ('memory', 'experience')", name="ck_memory_entities_record_type"),
     )
 
     memory_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    record_type: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="memory")
     role: Mapped[str] = mapped_column(String(24), default="about", server_default="about")
 
 

@@ -6,12 +6,13 @@ from datetime import datetime
 from typing import Any
 from unicodedata import normalize
 
-from sqlalchemy import and_, false, func, literal, literal_column, or_, select, true
+from sqlalchemy import and_, func, literal, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.service import active_source
-from ling.infra.models import MemoryEntityRow, MemoryEpisode, MemoryRow, OutboxEvent
+from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -99,12 +100,12 @@ async def read_library(
         memory_query = memory_query.where(MemoryRow.archived_at.is_(None))
         episode_query = episode_query.where(MemoryEpisode.archived_at.is_(None))
     if object_id and object_id != "self":
-        entity_memory_ids = select(MemoryEntityRow.memory_id).where(
-            MemoryEntityRow.entity_id == object_id,
+        memory_query = memory_query.where(
+            MemoryRow.id.in_(linked_record_ids(subject_id, object_id, "memory")),
         )
-        memory_query = memory_query.where(MemoryRow.id.in_(entity_memory_ids))
-        # Experiences do not carry MemoryEntityRow links; an object view is memory-only.
-        episode_query = episode_query.where(false())
+        episode_query = episode_query.where(
+            MemoryEpisode.id.in_(linked_record_ids(subject_id, object_id, "experience")),
+        )
 
     if query:
         terms = tuple(dict.fromkeys(normalize("NFKC", query).split()))

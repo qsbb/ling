@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import case, cast, delete, or_, select, update
+from sqlalchemy import and_, case, cast, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,11 +38,18 @@ async def forget_source(
     target = await session.scalar(select(MemoryRow).where(
         MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id,
     ).with_for_update())
-    if target is None or not target.source_message_id:
+    episode = None
+    if target is None:
+        episode = await session.scalar(select(MemoryEpisode).where(
+            MemoryEpisode.id == memory_id, MemoryEpisode.subject_id == subject_id,
+        ).with_for_update())
+    record = target or episode
+    if record is None or not record.source_message_id:
         return False
-    source = await session.get(Message, target.source_message_id, with_for_update=True)
+    window_id = target.source_window_id if target else episode.window_id
+    source = await session.get(Message, record.source_message_id, with_for_update=True)
     if (
-        source is None or source.role != "user" or source.window_id != target.source_window_id
+        source is None or source.role != "user" or source.window_id != window_id
         or source.sender_subject_id != subject_id or not source.turn_id
     ):
         return False
@@ -101,10 +108,13 @@ async def apply_source_forget(
         payload={"purged": True}, last_error="memory_source_forgotten",
     ))
 
-    entity_ids = list(await session.scalars(select(MemoryEntityRow.entity_id).where(
-        MemoryEntityRow.memory_id.in_(assertion_ids),
-    )))
-    await session.execute(delete(MemoryEntityRow).where(MemoryEntityRow.memory_id.in_(assertion_ids)))
+    affected_links = or_(
+        and_(MemoryEntityRow.record_type == "memory", MemoryEntityRow.memory_id.in_(assertion_ids)),
+        and_(MemoryEntityRow.record_type == "experience", MemoryEntityRow.memory_id.in_(episode_ids)),
+    )
+    entity_ids = list(await session.scalars(
+        delete(MemoryEntityRow).where(affected_links).returning(MemoryEntityRow.entity_id)
+    ))
     if entity_ids:
         await session.execute(delete(EntityRow).where(
             EntityRow.id.in_(entity_ids),

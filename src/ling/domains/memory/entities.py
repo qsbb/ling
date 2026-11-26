@@ -12,13 +12,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, get_args
+from unicodedata import normalize
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import EntityRow, MemoryEntityRow
+from ling.infra.models import EntityRow, MemoryEntityRow, MemoryEpisode, MemoryRow, Window
 from ling.infra.security import new_id
+
+if TYPE_CHECKING:
+    from ling.domains.memory.extract import ObjectMention
 
 # 常见别名归并：同一实体不同叫法映射到一个规范名。
 # 只收高频、无歧义的；宁可少归并，也不要把两个不同的人合成一个。
@@ -30,7 +37,10 @@ KINSHIP_ALIASES: dict[str, str] = {
     "兄长": "哥", "弟弟": "弟", "姐姐": "姐", "妹妹": "妹",
 }
 
-ENTITY_KINDS = {"person", "place", "project", "pet", "org", "group", "work", "topic", "other"}
+ObjectKind = Literal["person", "group", "place", "item", "work", "pet", "topic", "project", "org"]
+RecordType = Literal["memory", "experience"]
+OBJECT_KINDS = frozenset(get_args(ObjectKind))
+ENTITY_KINDS = OBJECT_KINDS | {"other"}
 
 
 @dataclass
@@ -89,50 +99,106 @@ class EntityService:
         self,
         *,
         subject_id: str,
+        window_id: str,
         group_id: str,
         display_name: str = "",
         aliases: list[str] | None = None,
     ) -> EntityRow:
-        """群对象以群号为身份；改名只更新显示名，不生成第二个对象。"""
-        rows = list(
-            (await self._session.execute(
-                select(EntityRow).where(
-                    EntityRow.subject_id == subject_id,
-                    EntityRow.kind == "group",
+        """Use the resolved group window as identity, including its connector instance."""
+        source_key = f"group:{window_id}"
+        target = await self._session.scalar(
+            select(EntityRow).where(EntityRow.subject_id == subject_id, EntityRow.source_key == source_key)
+        )
+        if target is None:
+            legacy = (
+                select(MemoryRow.source_window_id)
+                .join(MemoryEntityRow, MemoryEntityRow.memory_id == MemoryRow.id)
+                .where(
+                    MemoryEntityRow.entity_id == EntityRow.id,
+                    MemoryEntityRow.record_type == "memory",
+                    MemoryRow.subject_id == subject_id,
                 )
-            )).scalars()
-        )
-        target = next(
-            (
-                row for row in rows
-                if row.name == f"群 {group_id}"
-                or row.name.endswith(f" · {group_id}")
-                or group_id in (row.aliases or [])
-            ),
-            None,
-        )
+            )
+            # Reuse previous imports when their links identify one exact group.
+            # The same QQ number on a different instance is a separate object.
+            target = await self._session.scalar(select(EntityRow).where(
+                EntityRow.subject_id == subject_id,
+                EntityRow.source_key.is_(None),
+                EntityRow.kind == "group",
+                legacy.where(MemoryRow.source_window_id == window_id).exists(),
+                ~legacy.where(MemoryRow.source_window_id.is_distinct_from(window_id)).exists(),
+            ).order_by(EntityRow.id).limit(1))
         label = (display_name or "").strip()
-        name = f"{label[:44]} · {group_id}" if label else f"群 {group_id}"
+        name = (f"{label[:44]} · {group_id}" if label else f"群 {group_id}")[:64]
         merged = {
             canonical_name(value)
             for value in [label, group_id, *(aliases or [])]
             if canonical_name(value)
         }
         if target is None:
-            return await self.upsert(
-                subject_id=subject_id, name=name, kind="group", aliases=sorted(merged),
+            target = await self._upsert_scoped(
+                subject_id=subject_id, source_key=source_key, name=name, kind="group",
             )
-        target.name = name
+        if label:
+            target.name = name
         target.aliases = sorted(set(target.aliases or []) | merged)
         await self._session.flush()
         return target
+
+    async def evidence_label(
+        self, *, subject_id: str, memory_id: str, record_type: RecordType, name: str, kind: str,
+    ) -> EntityRow:
+        """Keep a name anchored to this record until identity is explicitly linked."""
+        key = normalize("NFKC", name).casefold()
+        fingerprint = hashlib.sha256(f"{record_type}:{memory_id}:{kind}:{key}".encode()).hexdigest()
+        return await self._upsert_scoped(
+            subject_id=subject_id, source_key=f"label:{fingerprint}", name=name, kind=kind,
+        )
+
+    async def index_episode(
+        self, episode: MemoryEpisode, *, source_text: str, window: Window, mentions: list[ObjectMention],
+    ) -> None:
+        if episode.archived_at is not None or episode.source_message_id is None:
+            return
+        for mention in dict.fromkeys(mentions):
+            if mention.name not in source_text or mention.name not in episode.summary:
+                continue
+            entity = await self.evidence_label(
+                subject_id=episode.subject_id, memory_id=episode.id, record_type="experience",
+                name=mention.name, kind=mention.kind,
+            )
+            await self.link(
+                memory_id=episode.id, entity_id=entity.id, role="mentioned", record_type="experience",
+            )
+        ref = window.connector_window_ref or ""
+        parts = ref.rsplit(":", 2)
+        if episode.source_visibility == "group_scope" and len(parts) == 3 and parts[1] == "group":
+            entity = await self.upsert_group(
+                subject_id=episode.subject_id, window_id=window.id,
+                group_id=parts[2], display_name=window.title if window.title != ref else "",
+            )
+            await self.link(
+                memory_id=episode.id, entity_id=entity.id, role="with", record_type="experience",
+            )
+
+    async def _upsert_scoped(
+        self, *, subject_id: str, source_key: str, name: str, kind: str,
+    ) -> EntityRow:
+        await self._session.execute(
+            insert(EntityRow).values(
+                id=new_id("ent"), subject_id=subject_id, source_key=source_key, name=name, kind=kind,
+            ).on_conflict_do_nothing(constraint="uq_entities_subject_source")
+        )
+        return (await self._session.scalars(select(EntityRow).where(
+            EntityRow.subject_id == subject_id, EntityRow.source_key == source_key,
+        ))).one()
 
     async def _find(self, subject_id: str, canonical: str) -> EntityRow | None:
         """按规范名或别名找已有实体。"""
         rows = list(
             (
                 await self._session.execute(
-                    select(EntityRow).where(EntityRow.subject_id == subject_id)
+                    select(EntityRow).where(EntityRow.subject_id == subject_id, EntityRow.source_key.is_(None))
                 )
             ).scalars()
         )
@@ -169,24 +235,25 @@ class EntityService:
         return out
 
     async def link(
-        self, *, memory_id: str, entity_id: str, role: str = "about"
+        self, *, memory_id: str, entity_id: str, role: str = "about", record_type: RecordType = "memory",
     ) -> bool:
-        existing = await self._session.get(MemoryEntityRow, (memory_id, entity_id))
-        if existing is not None:
-            return False
-        self._session.add(
-            MemoryEntityRow(memory_id=memory_id, entity_id=entity_id, role=role)
+        new_link = await self._session.scalar(
+            insert(MemoryEntityRow).values(
+                memory_id=memory_id, entity_id=entity_id, record_type=record_type, role=role,
+            ).on_conflict_do_nothing().returning(MemoryEntityRow.entity_id)
         )
-        await self._session.flush()
-        return True
+        return new_link is not None
 
-    async def related_memory_ids(self, entity_ids: list[str]) -> set[str]:
+    async def related_memory_ids(
+        self, entity_ids: list[str], *, record_type: RecordType = "memory",
+    ) -> set[str]:
         if not entity_ids:
             return set()
         rows = (
             await self._session.execute(
                 select(MemoryEntityRow.memory_id).where(
-                    MemoryEntityRow.entity_id.in_(entity_ids)
+                    MemoryEntityRow.entity_id.in_(entity_ids),
+                    MemoryEntityRow.record_type == record_type,
                 )
             )
         ).scalars()
@@ -196,6 +263,7 @@ class EntityService:
 __all__ = [
     "ENTITY_KINDS",
     "KINSHIP_ALIASES",
+    "OBJECT_KINDS",
     "EntityRef",
     "EntityService",
     "canonical_name",

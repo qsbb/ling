@@ -36,6 +36,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ling.domains.memory.entities import OBJECT_KINDS
+
 # 允许的槽位。与契约 Skill/Assertion 的稳定标识对应，**不含文本**，
 # 这样换措辞、换模型都不影响去重（文本作键的老问题已修过一次）。
 ALLOWED_SLOTS = {
@@ -123,6 +125,12 @@ class Candidate:
         return SLOT_TEMPLATES.get(self.slot, "用户提到 {0}").format(self.value)
 
 
+@dataclass(frozen=True)
+class ObjectMention:
+    name: str
+    kind: str
+
+
 SLOT_TEMPLATES = {
     "name": "用户的名字是 {0}",
     "likes": "用户喜欢 {0}",
@@ -165,6 +173,10 @@ def build_prompt(*, user_text: str, actor_text: str, is_group: bool = False) -> 
         "- 别人的信息写 attribution=third_party，不要算成用户本人\n"
         "- 区分以前和现在。同一句有两个时期的事实时，按原文各列一项\n"
         "- 引号里的台词、角色扮演不算事实\n"
+        "- 具体谈到的对象可另列 {\"object\": \"原话中的名称\", \"kind\": \"类型\"}，最多 6 个。"
+        "类型为 person、group、place、item、work、pet、topic、project、org。"
+        "只从用户说的话逐字摘名称，跳过泛称、代词和不确定的分类。"
+        "这些名称只用于找到这段发言。听说、假设和计划都要保留原话表达。\n"
         "- 没有可提炼的就输出 []\n"
         "\n"
         f"用户说：{user_text[:1200]}\n"
@@ -174,7 +186,7 @@ def build_prompt(*, user_text: str, actor_text: str, is_group: bool = False) -> 
     )
 
 
-def parse_candidates(raw: str) -> list[Candidate]:
+def parse_candidates(raw: str) -> list[Candidate | ObjectMention]:
     """解析模型输出。容错：截取第一个 JSON 数组，忽略多余文字。"""
     if not raw:
         return []
@@ -189,9 +201,16 @@ def parse_candidates(raw: str) -> list[Candidate]:
         return []
     if not isinstance(data, list):
         return []
-    out: list[Candidate] = []
+    out: list[Candidate | ObjectMention] = []
     for item in data[: MAX_CANDIDATES * 2]:
         if not isinstance(item, dict):
+            continue
+        if "object" in item:
+            name, kind = item["object"], item.get("kind")
+            if isinstance(name, str) and isinstance(kind, str) and kind in OBJECT_KINDS:
+                name = name.strip()
+                if 2 <= len(name) <= 64 and name.isprintable():
+                    out.append(ObjectMention(name, kind))
             continue
         slot = str(item.get("slot") or "").strip()
         value = str(item.get("value") or "").strip()

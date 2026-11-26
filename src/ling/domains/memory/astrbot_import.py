@@ -600,6 +600,7 @@ async def _insert_memories(
         if record.group_id not in group_entities:
             entity = await entity_service.upsert_group(
                 subject_id=target.destination.subject_id,
+                window_id=group_windows[record.group_id],
                 group_id=record.group_id,
                 display_name=record.group_name,
                 aliases=[record.group_name, record.group_id, record.session_id],

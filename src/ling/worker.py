@@ -219,38 +219,26 @@ _SLOT_ENTITY_KIND = {
 
 
 async def _link_entity_for(
-    session, *, subject_id: str, slot: str | None, value: str | None  # noqa: ANN001
+    session, *, memory_id: str, subject_id: str, slot: str, value: str, source_text: str,  # noqa: ANN001
 ) -> None:
-    """按槽位为断言建立实体关联（失败不影响记忆写入）。"""
-    kind = _SLOT_ENTITY_KIND.get(str(slot or ""))
-    if not kind or not (value or "").strip():
+    """Attach a fact's label to the exact record returned by propose."""
+    kind = _SLOT_ENTITY_KIND.get(slot)
+    if not kind or not value or value not in source_text:
         return
-    try:
-        from ling.domains.memory.entities import EntityService
+    from ling.domains.memory.entities import EntityService
+    from ling.infra.models import MemoryRow
 
-        entities = EntityService(session)
-        row = await entities.upsert(subject_id=subject_id, name=str(value), kind=kind)
-        # memory_id 由 propose 返回，但这里已在同一事务里，直接查最新一条
-        from sqlalchemy import select as sa_select
-
-        from ling.infra.models import MemoryRow
-
-        memory = (
-            await session.execute(
-                sa_select(MemoryRow)
-                .where(
-                    MemoryRow.subject_id == subject_id,
-                    MemoryRow.slot == slot,
-                    MemoryRow.archived_at.is_(None),
-                )
-                .order_by(MemoryRow.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if memory is not None:
-            await entities.link(memory_id=memory.id, entity_id=row.id)
-    except Exception as exc:  # noqa: BLE001 - 实体关联失败不影响记忆本身
-        logger.info("实体关联失败（不影响记忆写入）: %s", type(exc).__name__)
+    memory = await session.get(MemoryRow, memory_id)
+    if (
+        memory is None or memory.subject_id != subject_id or memory.source_message_id is None
+        or memory.archived_at is not None or memory.retracted or memory.value != value
+    ):
+        return
+    entities = EntityService(session)
+    entity = await entities.evidence_label(
+        subject_id=subject_id, memory_id=memory.id, record_type="memory", name=value, kind=kind,
+    )
+    await entities.link(memory_id=memory.id, entity_id=entity.id)
 
 
 async def _extract_candidates(
@@ -536,6 +524,7 @@ async def handle_memory_extract(payload: dict) -> None:
         service = MemoryService(session, policy=await published_memory_policy(session))
         source_ids = [f"turn:{turn_id}"]
         source = None
+        window = None
         if await session.get(Turn, turn_id) is not None:
             window = await session.get(Window, window_id)
             if window is None or window.visibility != source_visibility:
@@ -568,10 +557,18 @@ async def handle_memory_extract(payload: dict) -> None:
         # 事务里了，它会被一起提交。表现是"删完记忆之后库里又多了一条情节"。
         # 顺序调过来之后，两道栅栏之间**没有任何写入**，作废才是真的作废。
         from ling.contracts.v1 import MemoryProposal
-        from ling.domains.memory.extract import fact_operation, gate
+        from ling.domains.memory.entities import EntityService
+        from ling.domains.memory.extract import (
+            MAX_CANDIDATES,
+            Candidate,
+            ObjectMention,
+            fact_operation,
+            gate,
+        )
+        from ling.infra.models import MemoryEpisode
 
         candidates = await _extract_candidates(
-            user_text=user_text,
+            user_text=source.text if source is not None else user_text,
             actor_text=actor_text,
             is_group=is_group,
         )
@@ -592,11 +589,12 @@ async def handle_memory_extract(payload: dict) -> None:
         # The long-term index keeps the user's account of the conversation.
         # Ling's previous reply remains available from the retained transcript on
         # explicit source lookup, where it is labeled as her own speech.
-        if user_text.strip():
-            await service.record_episode(
+        source_text = source.text if source is not None else user_text
+        if source_text.strip():
+            episode_id = await service.record_episode(
                 subject_id=subject_id,
                 window_id=window_id,
-                summary=f"用户：{user_text.strip()[:500]}",
+                summary=f"用户：{source_text.strip()[:500]}",
                 source_event_ids=source_ids,
                 source_message_id=source.id if source else None,
                 occurred_at=source.created_at if source else None,
@@ -605,16 +603,25 @@ async def handle_memory_extract(payload: dict) -> None:
                 source_visibility=source_visibility,
                 turn_id=turn_id,
             )
+            if source is not None and window is not None:
+                episode = await session.get_one(MemoryEpisode, episode_id)
+                if episode.source_message_id == source.id and episode.subject_id == subject_id:
+                    mentions = [item for item in candidates if isinstance(item, ObjectMention)]
+                    await EntityService(session).index_episode(
+                        episode, source_text=source_text, window=window, mentions=mentions[:MAX_CANDIDATES],
+                    )
 
-        source_text = source.text if source else user_text
-        gated = gate(candidates, user_text=source_text, is_group=is_group)
+        gated = gate(
+            [item for item in candidates if isinstance(item, Candidate)],
+            user_text=source_text, is_group=is_group,
+        )
         if gated.rejected:
             # 拒绝原因要可查：不然"为什么这条没记住"无从排查
             logger.info(
                 "memory.extract 闸门拒绝 %d 条 turn=%s", len(gated.rejected), turn_id,
             )
         for cand in gated.accepted:
-            await service.propose(
+            memory_id = await service.propose(
                 MemoryProposal(
                     proposal_id=f"auto:{turn_id}:{cand.slot}",
                     kind="assertion",
@@ -636,12 +643,11 @@ async def handle_memory_extract(payload: dict) -> None:
                 occurred_at=source.created_at if source else None,
                 fact_operation=fact_operation(cand, source_text),
             )
-            # 实体关联：把"养了一只宠物""家人是妈""在做 X 项目"这类
-            # 可被反复提到的对象建成实体，供"沿关系定位"用。
-            # 槽位→实体类型是确定性映射，不依赖模型输出格式。
-            await _link_entity_for(
-                session, subject_id=subject_id, slot=cand.slot, value=cand.value
-            )
+            if memory_id is not None:
+                await _link_entity_for(
+                    session, memory_id=memory_id, subject_id=subject_id, slot=cand.slot,
+                    value=cand.value, source_text=source_text,
+                )
     logger.info("memory.extract 完成 turn=%s", turn_id)
 
 
