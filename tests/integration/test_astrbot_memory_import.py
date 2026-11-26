@@ -346,6 +346,18 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         )
         assert row.id not in {hit.memory_id for hit in private_recalled.hits}
 
+    # 撤回后对象计数与列表同口径：群对象不再有现行记忆，就不该继续出现。
+    retract = await logged_in.client.post(
+        f"/v1/memory/{group_row['memory_id']}/retract", json={"reason": "测试撤回"},
+    )
+    assert retract.status_code == 200, retract.text
+    after = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
+    assert not any(item["entity_id"] == group_object["entity_id"] and item["count"] for item in after)
+    empty_group = (await logged_in.client.get(
+        f"/v1/memory?view=library&object_id={group_object['entity_id']}"
+    )).json()
+    assert empty_group["total"] == 0
+
 
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
     await _bind(logged_in)
