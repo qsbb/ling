@@ -21,6 +21,7 @@ from ling.api.routes import memory_import
 from ling.contracts.v1 import Visibility
 from ling.domains.identity.service import IdentityService
 from ling.domains.memory import astrbot_import as importer
+from ling.domains.memory.entities import EntityService
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
 from ling.infra.models import ActorAccount, EntityRow, MemoryEntityRow, MemoryRow, OutboxEvent, Subject, Window
@@ -288,10 +289,23 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
             select(MemoryEntityRow.memory_id).where(MemoryEntityRow.entity_id == entity.id)
         ))
         assert len(links) == 1
+
+        renamed = await EntityService(session).upsert_group(
+            subject_id=logged_in.subject_id, group_id=GROUP_ID,
+            display_name="新的读书群", aliases=["读书群"],
+        )
+        assert renamed.id == entity.id
+        assert renamed.name == f"新的读书群 · {GROUP_ID}"
+        assert "读书群" in renamed.aliases
+        assert int(await session.scalar(
+            select(func.count()).select_from(EntityRow).where(
+                EntityRow.subject_id == logged_in.subject_id, EntityRow.kind == "group",
+            )
+        ) or 0) == 1
     objects = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
     assert objects[0]["kind"] == "self" and objects[0]["count"] == 2
     group_object = next(item for item in objects if item["kind"] == "group")
-    assert group_object["count"] == 1 and group_object["name"] == f"读书群 · {GROUP_ID}"
+    assert group_object["count"] == 1 and group_object["name"] == f"新的读书群 · {GROUP_ID}"
     only_group = (await logged_in.client.get(
         f"/v1/memory?view=library&object_id={group_object['entity_id']}"
     )).json()

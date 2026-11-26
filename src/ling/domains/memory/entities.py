@@ -85,6 +85,48 @@ class EntityService:
         await self._session.flush()
         return row
 
+    async def upsert_group(
+        self,
+        *,
+        subject_id: str,
+        group_id: str,
+        display_name: str = "",
+        aliases: list[str] | None = None,
+    ) -> EntityRow:
+        """群对象以群号为身份；改名只更新显示名，不生成第二个对象。"""
+        rows = list(
+            (await self._session.execute(
+                select(EntityRow).where(
+                    EntityRow.subject_id == subject_id,
+                    EntityRow.kind == "group",
+                )
+            )).scalars()
+        )
+        target = next(
+            (
+                row for row in rows
+                if row.name == f"群 {group_id}"
+                or row.name.endswith(f" · {group_id}")
+                or group_id in (row.aliases or [])
+            ),
+            None,
+        )
+        label = (display_name or "").strip()
+        name = f"{label[:44]} · {group_id}" if label else f"群 {group_id}"
+        merged = {
+            canonical_name(value)
+            for value in [label, group_id, *(aliases or [])]
+            if canonical_name(value)
+        }
+        if target is None:
+            return await self.upsert(
+                subject_id=subject_id, name=name, kind="group", aliases=sorted(merged),
+            )
+        target.name = name
+        target.aliases = sorted(set(target.aliases or []) | merged)
+        await self._session.flush()
+        return target
+
     async def _find(self, subject_id: str, canonical: str) -> EntityRow | None:
         """按规范名或别名找已有实体。"""
         rows = list(

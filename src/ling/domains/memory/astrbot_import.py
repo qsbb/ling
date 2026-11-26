@@ -597,10 +597,10 @@ async def _insert_memories(
             label = (record.group_name or "").strip()
             # 同名群不能合成一个对象；带上群号保持稳定与可读。
             name = f"{label[:44]} · {record.group_id}" if label else f"群 {record.group_id}"
-            entity = await entity_service.upsert(
+            entity = await entity_service.upsert_group(
                 subject_id=target.destination.subject_id,
-                name=name,
-                kind="group",
+                group_id=record.group_id,
+                display_name=record.group_name,
                 aliases=[record.group_name, record.group_id, record.session_id],
             )
             group_entities[record.group_id] = entity.id
