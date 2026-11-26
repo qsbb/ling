@@ -416,6 +416,7 @@ export interface MemoryImportSource {
   scope?: string;
   /** 群聊导入才有。 */
   group_id?: string;
+  group_name?: string;
   /** 原始可见范围；群聊应为 group_scope，私聊为 private_pair/subject_private。 */
   visibility?: string;
   bot_qq: string;

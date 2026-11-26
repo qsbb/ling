@@ -242,7 +242,7 @@ async def test_native_export_previews_and_imports_only_the_selected_private_pair
 async def test_group_export_imports_with_group_scope_and_window(logged_in: TestEnv) -> None:
     await _bind(logged_in)
     data = _archive(
-        _group_record(),
+        _group_record("group-memo", group_name="读书群"),
         _group_record("wrong-group", group_id="300400501", object_id="300400501"),
         _group_record("wrong-bot", subject_id="200300401", owner_bot_id="200300401"),
         _record("private-memo"),
@@ -283,7 +283,7 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         entity = (await session.execute(
             select(EntityRow).where(EntityRow.subject_id == logged_in.subject_id, EntityRow.kind == "group")
         )).scalar_one()
-        assert entity.name == f"群 {GROUP_ID}"
+        assert entity.name == f"读书群 · {GROUP_ID}"
         links = list(await session.scalars(
             select(MemoryEntityRow.memory_id).where(MemoryEntityRow.entity_id == entity.id)
         ))
@@ -291,7 +291,7 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     objects = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
     assert objects[0]["kind"] == "self" and objects[0]["count"] == 2
     group_object = next(item for item in objects if item["kind"] == "group")
-    assert group_object["count"] == 1 and group_object["name"] == f"群 {GROUP_ID}"
+    assert group_object["count"] == 1 and group_object["name"] == f"读书群 · {GROUP_ID}"
     only_group = (await logged_in.client.get(
         f"/v1/memory?view=library&object_id={group_object['entity_id']}"
     )).json()

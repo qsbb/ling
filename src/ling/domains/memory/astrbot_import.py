@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -88,6 +89,7 @@ class ArchiveRecord(BaseModel):
     session_id: Reference
     platform: Label
     group_id: Annotated[str, Field(max_length=160)]
+    group_name: Label = ""
     owner_bot_id: Annotated[str, Field(max_length=160)]
     visibility: Label
     sayability: Label
@@ -223,6 +225,19 @@ def _reference_ids(value: object) -> list[str]:
     ))
 
 
+_GROUP_NAME_RE = re.compile(r"\bName:\s*(.*?)(?=\s+(?:Avatar|Owner ID|Admin IDs|Member)\b|$)", re.S)
+
+
+def _group_name(value: object) -> str:
+    """Read the human group name from Memory Companion's object.name, if present."""
+    if not isinstance(value, str):
+        return ""
+    match = _GROUP_NAME_RE.search(value)
+    if match is None:
+        return ""
+    return " ".join(match.group(1).split())[:80]
+
+
 def _native_memory(data: dict) -> ArchiveRecord | None:
     subject, target = data.get("subject"), data.get("object")
     if not isinstance(subject, dict) or not isinstance(target, dict):
@@ -240,6 +255,7 @@ def _native_memory(data: dict) -> ArchiveRecord | None:
         subject_id=subject.get("id"),
         object_kind=target.get("kind"),
         object_id=target.get("id"),
+        group_name=_group_name(target.get("name")) if target.get("kind") == "group" else "",
         owner_bot_id=data.get("owner_bot_id") or metadata.get("owner_bot_id")
         or (target.get("id") if target.get("kind") == "bot" else ""),
         # Match the plugin's defaults when portable exports omit these fields.
@@ -578,11 +594,14 @@ async def _insert_memories(
                 session, target=target, record=record,
             )
         if record.group_id not in group_entities:
+            label = (record.group_name or "").strip()
+            # 同名群不能合成一个对象；带上群号保持稳定与可读。
+            name = f"{label[:44]} · {record.group_id}" if label else f"群 {record.group_id}"
             entity = await entity_service.upsert(
                 subject_id=target.destination.subject_id,
-                name=f"群 {record.group_id}",
+                name=name,
                 kind="group",
-                aliases=[record.group_id, record.session_id],
+                aliases=[record.group_name, record.group_id, record.session_id],
             )
             group_entities[record.group_id] = entity.id
     for memory_id, record in candidates.items():
@@ -614,6 +633,7 @@ async def _insert_memories(
                 "memory_type": record.memory_type,
                 "scope": record.scope,
                 "group_id": record.group_id,
+                "group_name": record.group_name,
                 "platform": record.platform,
                 "session_id": record.session_id,
                 "bot_qq": source.bot_qq,
