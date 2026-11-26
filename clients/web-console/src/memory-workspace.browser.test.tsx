@@ -790,6 +790,7 @@ describe('记忆工作区：独立浏览器验收', () => {
       await visible(errorHint);
       if (failure.endpoint !== LIST) {
         await goToTab(page, '记忆库');
+        await page.getByRole('button', { name: '列表', exact: true }).click();
         await visible(row(page, FAVORITE));
         await row(page, FAVORITE).click();
         await visible(detailHeading(page));
@@ -822,13 +823,23 @@ describe('记忆工作区：独立浏览器验收', () => {
     expect(railBox && mainBox).toBeTruthy();
     expect(railBox!.x + railBox!.width).toBeLessThanOrEqual(mainBox!.x + 1);
     expect(Math.abs(railBox!.y - mainBox!.y)).toBeLessThanOrEqual(1);
-    const detailBox = await detail(page).boundingBox();
+    // 默认只读图：不弹镜片，也不展开详情；详情是显式深读。
+    await hidden(page.getByTestId('mem-focus-lens'));
+    await hidden(detail(page));
     const workspaceBox = await page.locator('[data-testid="mem-list"]').boundingBox();
-    expect(detailBox!.y).toBeGreaterThanOrEqual(mainBox!.y + mainBox!.height - 1);
-    expect(detailBox!.width).toBeGreaterThanOrEqual(workspaceBox!.width - 1);
-    expect(await detailHeading(page).evaluate((node) => node.getBoundingClientRect().top)).toBeLessThan(1000);
+    expect(workspaceBox!.width).toBeGreaterThan(mainBox!.width);
     const card = (id: string) => canvas.locator(`[data-memory-id="${id}"]`);
     const x = async (id: string) => card(id).evaluate((element) => (element.parentElement as HTMLElement).offsetLeft);
+
+    // ⓪ 记忆范围：筛选面板能切全部 / 仅私聊 / 仅群聊。
+    await page.getByRole('button', { name: /^筛选/ }).click();
+    const scopeSelect = page.locator('#mem-discovery-filters select').filter({ has: page.locator('option[value="group"]') });
+    await visible(scopeSelect);
+    expect(await scopeSelect.locator('option').allTextContents()).toEqual(['全部记忆', '仅私聊', '仅群聊']);
+    await scopeSelect.selectOption('group');
+    await visible(page.getByTestId('mem-filter-empty'));
+    await scopeSelect.selectOption('all');
+    await page.getByRole('button', { name: /^筛选/ }).click();
 
     // ① 横轴连续：2024-05 → 2026-05 的间隔远大于 2026-05 → 2026-11。
     const longGap = await x('star_poster') - await x('star_drawings');
@@ -862,8 +873,38 @@ describe('记忆工作区：独立浏览器验收', () => {
     await paint(page);
     await page.screenshot({ path: join(SHOTS, '1440-star.png'), fullPage: true });
 
-    // ⑤ 点卡片读完整记忆，再展开图谱依据与分镜。
+    // ⑤ 放大镜：点卡片后强/中关联保留，弱关联淡出；同地点不误连。
     await card('star_drawings').click();
+    const lens = page.getByTestId('mem-focus-lens');
+    await visible(lens);
+    expect(await canvas.locator('[data-memory-id="star_poster"].mem-star-node--link-strong').count()).toBe(1);
+    expect(await canvas.locator('[data-memory-id="star_unknown"].mem-star-node--dim').count()).toBe(1);
+    const lensText = await lens.innerText();
+    expect(lensText).toContain('同源事件');
+    expect(lensText).toMatch(/同一天|相邻三天|同月/);
+    const lensBox = await lens.boundingBox();
+    const strongBox = await card('star_poster').boundingBox();
+    const drawingBox = await card('star_drawings').boundingBox();
+    expect(lensBox && strongBox && drawingBox).toBeTruthy();
+    // 镜片贴在选中卡片下方/上方，不能盖住强关联卡片。
+    const overlapsStrong = !(lensBox!.x + lensBox!.width <= strongBox!.x
+      || strongBox!.x + strongBox!.width <= lensBox!.x
+      || lensBox!.y + lensBox!.height <= strongBox!.y
+      || strongBox!.y + strongBox!.height <= lensBox!.y);
+    expect(overlapsStrong).toBe(false);
+    await paint(page);
+    await page.screenshot({ path: join(SHOTS, '1440-star-lens.png'), fullPage: true });
+
+    // ⑥ 关闭镜片恢复全图；再点卡片重新聚焦。
+    await lens.getByRole('button', { name: '收起放大镜' }).click();
+    await hidden(lens);
+    expect(await canvas.locator('.mem-star-node--dim').count()).toBe(0);
+    await card('star_drawings').click();
+    await visible(lens);
+    expect(await canvas.locator('.mem-star-node--dim').count()).toBeGreaterThan(0);
+
+    // ⑦ 点“看完整详情”进入既有详情、来源与分镜。
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
     const inspector = detail(page);
     await visible(detailHeading(page));
     const detailText = await inspector.innerText();
@@ -887,16 +928,19 @@ describe('记忆工作区：独立浏览器验收', () => {
     await hidden(theater);
     expect(await theaterOpen.evaluate((button) => document.activeElement === button)).toBe(true);
 
-    // ⑥ 同源事件与纠正链都能跳读；跳读目标是当前已加载的记录。
-    await micro.getByRole('button', { name: /同源事件.*两年后又看到/ }).click();
+    // ⑥ 详情内的关联跳读仍走既有路径，只换详情、不依赖星图镜片。
+    await inspector.getByTestId('mem-microscope').getByRole('button', { name: /同源事件.*两年后又看到/ }).click();
     await visible(inspector.getByText(STAR_POSTER.text, { exact: true }).filter({ visible: true }).first());
+    // 纠正链要从旧说法那条进入，不能拿海报的详情去找纠正按钮。
     await card('star_old').click();
+    await visible(lens);
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
     await visible(inspector.getByText(STAR_OLD.text, { exact: true }).filter({ visible: true }).first());
     await inspector.getByTestId('mem-microscope').getByRole('button', { name: /纠正链.*周四闭馆/ }).click();
     await visible(inspector.getByText(STAR_NEW.text, { exact: true }).filter({ visible: true }).first());
 
-    // ⑦ 既有编辑入口仍在：只露出当前分支支持的纠正/撤回，不伪造单条遗忘。
-    await card('star_drawings').click();
+    // ⑦ 星图点卡片先换镜片，不偷换详情；详情入口仍保留编辑能力。
+    await lens.getByRole('button', { name: /看完整详情/ }).click();
     await visible(inspector.getByRole('button', { name: '纠正…', exact: true }));
     await inspector.getByRole('button', { name: '纠正…', exact: true }).click();
     await visible(inspector.getByRole('form', { name: '纠正这条记忆' }));

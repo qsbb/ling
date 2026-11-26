@@ -31,8 +31,9 @@ import { AlertIcon, ArrowLeftIcon, PencilIcon, RefreshIcon } from './Icons';
 import { MemoryImportPanel } from './MemoryImport';
 import {
   buildStarChartModel, connectedStarEntries, MemoryMicroscopeBeats, MemoryStarMapCanvas, MonthWheel,
-  STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
+  starAffinity, STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
 } from './MemoryStarMap';
+import { MemoryFocusLens } from './MemoryFocusLens';
 import { SleepReviewSection } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
@@ -185,9 +186,11 @@ export interface MemoryFilters {
   kind: 'all' | 'episode' | 'assertion' | 'procedure';
   /** 时间范围：只看 created_at 落在最近 N 天内的条目。 */
   range: 'all' | '7d' | '30d';
+  /** 会话范围：全部 / 私聊 / 群聊。群聊摘要也属于“所有记忆”。 */
+  originScope?: 'all' | 'private' | 'group';
 }
 
-export const DEFAULT_FILTERS: MemoryFilters = { kind: 'all', range: 'all' };
+export const DEFAULT_FILTERS: MemoryFilters = { kind: 'all', range: 'all', originScope: 'all' };
 
 /**
  * 前端筛选（kind / 时间范围）。
@@ -205,6 +208,13 @@ export function filterMemories(
   const cutoff = days === null ? null : now.getTime() - days * 86_400_000;
   return rows.filter((row) => {
     if (filters.kind !== 'all' && row.kind !== filters.kind) return false;
+    const originScope = filters.originScope ?? 'all';
+    if (originScope !== 'all') {
+      const session = row.import_source?.session_id ?? '';
+      const isGroup = row.visibility === 'group_scope' || /groupmessage/i.test(session);
+      if (originScope === 'group' && !isGroup) return false;
+      if (originScope === 'private' && isGroup) return false;
+    }
     if (cutoff === null) return true;
     const created = parseIso(row.created_at);
     return created !== null && created.getTime() >= cutoff;
@@ -1413,10 +1423,13 @@ export function MemoryListSection({
   const [showFilters, setShowFilters] = useState(false);
   const [view, setView] = useState<'stars' | 'list'>(defaultView);
   const [month, setMonth] = useState<number | null>(null);
+  /* 星图里点卡片先开镜片；详情要显式“看完整详情”，避免同屏两层详情。 */
+  const [detailOpen, setDetailOpen] = useState(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const starViewport = useRef<HTMLDivElement>(null);
   const rowElement = useRef<HTMLButtonElement | null>(null);
+  const wideForLens = useRef(true);
   const restoreFocus = useRef(false);
   /*
     Chromium 给 `type=search` 画一个原生清除按钮（右侧 ×）：它只改 DOM 值，
@@ -1459,15 +1472,26 @@ export function MemoryListSection({
   */
   const defaultRow = view === 'stars' ? (chartModel?.nodes[0]?.row ?? filtered[0]) : filtered[0];
   const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : defaultRow;
+  /* 只有用户主动点过卡片才进放大镜；默认预览不弹，避免首屏被面板压住。 */
+  const focusRow = selectedId && wideForLens.current ? selected : null;
+  const affinity = focusRow && chartModel ? starAffinity(chartModel, focusRow.memory_id) : null;
   const mobileInspectorOpen = Boolean(selectedId && selected);
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
   const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
-  const activeFilterCount = Number(filters.range !== 'all') + Number(Boolean(scope))
+  const activeFilterCount = Number(filters.range !== 'all') + Number((filters.originScope ?? 'all') !== 'all') + Number(Boolean(scope))
     + Number(flags.retracted) + Number(flags.archived) + Number(limit !== LIMIT_OPTIONS[0]);
-  const narrowedByView = Boolean(scope || filters.kind !== 'all' || filters.range !== 'all');
+  const narrowedByView = Boolean(scope || filters.kind !== 'all' || filters.range !== 'all' || (filters.originScope ?? 'all') !== 'all');
   /** 服务端命中口径下的总数；没有搜索词与来源时就是整库总数。 */
   const matchTotal = data?.total ?? 0;
   const canPage = Boolean(trimmedSearch || source);
+
+  useEffect(() => {
+    const query = window.matchMedia('(min-width: 761px)');
+    const sync = () => { wideForLens.current = query.matches; };
+    sync();
+    query.addEventListener('change', sync);
+    return () => query.removeEventListener('change', sync);
+  }, []);
 
   useEffect(() => {
     if (selectedId) headingRef.current?.focus();
@@ -1482,6 +1506,7 @@ export function MemoryListSection({
   const goBack = () => {
     restoreFocus.current = true;
     setSelectedId(null);
+    setDetailOpen(false);
   };
 
   const revealStar = (node: StarNode) => {
@@ -1490,13 +1515,17 @@ export function MemoryListSection({
     viewport.scrollTo({
       left: Math.max(0, node.xPx + (STAR_CARD_W - viewport.clientWidth) / 2),
       top: Math.max(0, node.yPx + (STAR_CARD_H - viewport.clientHeight) / 2),
+      behavior: 'auto',
     });
   };
 
   const selectRow = (id: string, trigger: HTMLButtonElement) => {
     rowElement.current = trigger;
     if (selectedId === id) headingRef.current?.focus();
-    else setSelectedId(id);
+    else {
+      setSelectedId(id);
+      setDetailOpen(!wideForLens.current);
+    }
   };
 
   const selectMonth = (next: number | null) => {
@@ -1628,6 +1657,17 @@ export function MemoryListSection({
                 setSelectedId(null);
               }}>
                 <option value="all">全部时间</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
+              </select>
+            </label>
+            <label className="mem-field"><span>会话</span>
+              <select value={filters.originScope ?? 'all'} onChange={(event) => {
+                const value = event.target.value;
+                onFiltersChange({ ...filters, originScope: value === 'private' || value === 'group' ? value : 'all' });
+                setSelectedId(null);
+              }}>
+                <option value="all">全部记忆</option>
+                <option value="private">仅私聊</option>
+                <option value="group">仅群聊</option>
               </select>
             </label>
             <label className="mem-field"><span>可见范围</span>
@@ -1762,8 +1802,25 @@ export function MemoryListSection({
                   </div>
                   <div className="mem-star-viewport" role="region" aria-label="记忆星图" tabIndex={0} ref={starViewport}>
                     <MemoryStarMapCanvas model={chartModel} selectedId={selected?.memory_id ?? null}
-                      activeMonth={activeMonth} kindText={kindLabel} originText={originLabel} statusText={historyStatus}
-                      onSelectMemory={(id, nodeMonth, trigger) => { setMonth(nodeMonth); selectRow(id, trigger); }} />
+                      activeMonth={activeMonth} focusMode={Boolean(focusRow)} kindText={kindLabel}
+                      originText={originLabel} statusText={historyStatus}
+                      onSelectMemory={(id, nodeMonth, trigger) => {
+                        setMonth(nodeMonth);
+                        selectRow(id, trigger);
+                        const node = chartModel.nodeMap[id];
+                        if (node) requestAnimationFrame(() => revealStar(node));
+                      }}
+                      focusOverlay={focusRow && affinity ? (
+                        <MemoryFocusLens key={focusRow.memory_id} model={chartModel} affinity={affinity} row={focusRow}
+                          kindText={kindLabel} originText={originLabel} statusText={historyStatus}
+                          onSelectMemory={(id) => {
+                            const node = chartModel.nodeMap[id];
+                            if (node) { setMonth(node.month); revealStar(node); }
+                            setSelectedId(id);
+                          }}
+                          onOpenDetail={() => setDetailOpen(true)}
+                          onClose={goBack} />
+                      ) : null} />
                   </div>
                 </div>
               </div>
@@ -1794,12 +1851,12 @@ export function MemoryListSection({
       </div>
 
       <div className="mem-workspace__detail">
-        {selected && !importPanelOpen ? (
+        {selected && !importPanelOpen && (view === 'list' || detailOpen) ? (
           <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} chartModel={chartModel}
             backLabel={view === 'stars' ? '回到星图' : '回到列表'}
             headingRef={headingRef} handlers={handlers} onBack={goBack}
             onSelect={selectedFromHistory} onChanged={goBack} />
-        ) : data && !importPanelOpen ? (
+        ) : data && !importPanelOpen && (view === 'list' || detailOpen) ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
             <strong>选择一条记忆</strong>

@@ -72,6 +72,24 @@ export interface StarLunarArc {
   toYear: number;
 }
 
+export type StarAffinityLevel = 'strong' | 'medium' | 'weak';
+
+export interface StarAffinityLink {
+  id: string;
+  level: StarAffinityLevel;
+  /** 为什么算相关：同源事件 / 纠正链 / 同月。 */
+  reason: string;
+  /** 连线依据，详情和镜片里直接显示。 */
+  evidence: string;
+  kind: StarCausalKind | StarMonthArcKind;
+}
+
+export interface StarAffinity {
+  selectedId: string;
+  links: StarAffinityLink[];
+  counts: { strong: number; medium: number; weak: number };
+}
+
 export interface StarYearTick {
   year: number;
   xPx: number;
@@ -149,6 +167,13 @@ function formatClock(iso: string | null | undefined): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '时刻未知';
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function sessionScope(row: MemoryRecord): '群聊' | '私聊' | null {
+  const session = row.import_source?.session_id ?? '';
+  if (row.visibility === 'group_scope' || /groupmessage/i.test(session)) return '群聊';
+  if (row.visibility === 'window_private' || /friendmessage|privatemessage/i.test(session)) return '私聊';
+  return null;
 }
 
 function laneOfKind(kind: string): StarLaneId {
@@ -771,6 +796,10 @@ export interface MemoryStarMapCanvasProps {
   selectedId: string | null;
   activeMonth: number | null;
   onSelectMemory: (id: string, month: number | null, trigger: HTMLButtonElement) => void;
+  /** 放大镜模式：选中后只保留强/中关联，其余淡出。 */
+  focusMode?: boolean;
+  /** 放大镜面板，挂在 canvas 坐标里，跟着卡片走。 */
+  focusOverlay?: React.ReactNode;
   kindText: (kind: string) => string;
   originText: (origin: string) => string;
   statusText: (row: MemoryRecord) => string | null;
@@ -781,6 +810,8 @@ export function MemoryStarMapCanvas({
   selectedId,
   activeMonth,
   onSelectMemory,
+  focusMode = false,
+  focusOverlay,
   kindText,
   originText,
   statusText,
@@ -797,6 +828,8 @@ export function MemoryStarMapCanvas({
     });
     return set;
   }, [model.causalEdges, selectedId]);
+
+  const affinity = useMemo(() => (focusMode ? starAffinity(model, selectedId) : null), [focusMode, model, selectedId]);
 
   const monthHitIds = useMemo(() => {
     const set = new Set<string>();
@@ -869,11 +902,12 @@ export function MemoryStarMapCanvas({
           const mx = (x1 + x2) / 2;
           const my = (y1 + y2) / 2 + (idx % 2 === 0 ? -42 : 34);
           const isAct = selectedId !== null && (edge.from === selectedId || edge.to === selectedId);
+          const isDim = focusMode && !isAct;
           return (
             <path
               key={`c-${edge.from}-${edge.to}`}
               d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`}
-              className={`mem-star-arc mem-star-arc--${edge.kind}${isAct ? ' mem-star-arc--active' : ''}`}
+              className={`mem-star-arc mem-star-arc--${edge.kind}${isAct ? ' mem-star-arc--active' : ''}${isDim ? ' mem-star-arc--dim' : ''}`}
               data-reason={edge.reason}
               data-kind={edge.kind}
               data-evidence={edge.evidence}
@@ -888,11 +922,13 @@ export function MemoryStarMapCanvas({
           if (!curve) return null;
           const { x1, y1, x2, y2, mx, my } = curve;
           const isAct = activeMonth === arc.month;
+          const isFocusLink = Boolean(affinity && affinity.links.some((link) => link.id === arc.to || link.id === arc.from));
+          const isDim = focusMode && !isFocusLink;
           return (
             <path
               key={`m-${arc.month}-${arc.from}-${arc.to}`}
               d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`}
-              className={`mem-star-arc mem-star-arc--lunar mem-star-arc--lunar-${arc.kind}${isAct ? ' mem-star-arc--lunar-active' : ''}`}
+              className={`mem-star-arc mem-star-arc--lunar mem-star-arc--lunar-${arc.kind}${isAct ? ' mem-star-arc--lunar-active' : ''}${isFocusLink ? ' mem-star-arc--focus' : ''}${isDim ? ' mem-star-arc--dim' : ''}`}
               data-month={arc.month}
               data-kind={arc.kind}
               data-from={arc.from}
@@ -919,6 +955,8 @@ export function MemoryStarMapCanvas({
           const isSel = selectedId === id;
           const isMonthHit = monthHitIds.has(id);
           const isNb = causalNeighborIds.has(id);
+          const link = affinity?.links.find((item) => item.id === id);
+          const isDim = Boolean(focusMode && selectedId && !isSel && !link);
           const status = statusText(node.row);
           const cls = [
             'mem-star-node',
@@ -926,6 +964,8 @@ export function MemoryStarMapCanvas({
             isSel ? 'mem-star-node--selected' : '',
             !isSel && isMonthHit ? 'mem-star-node--month' : '',
             !isSel && !isMonthHit && isNb ? 'mem-star-node--neighbor' : '',
+            link ? `mem-star-node--link-${link.level}` : '',
+            isDim ? 'mem-star-node--dim' : '',
           ].filter(Boolean).join(' ');
           const dateLabel = node.dateKind === '未知'
             ? '发生未知'
@@ -947,6 +987,7 @@ export function MemoryStarMapCanvas({
                 data-memory-id={id}
                 data-date-kind={node.dateKind}
                 data-unknown-date={node.dateKind === '未知' ? 'true' : undefined}
+                data-affinity-kind={link?.kind}
                 aria-current={isSel ? 'true' : undefined}
                 aria-label={`${dateTitle}，${kindText(node.row.kind)}，${node.row.text}`}
                 title={dateTitle}
@@ -959,13 +1000,14 @@ export function MemoryStarMapCanvas({
                 <span className="mem-star-node__title">{node.row.text}</span>
                 <span className="mem-star-node__foot">
                   <span title={status ? originText(node.row.origin) : undefined}>{status ?? originText(node.row.origin)}</span>
-                  <span className="mem-star-node__beats">{node.beats.length}幕 ↗</span>
+                  <span className="mem-star-node__beats">{sessionScope(node.row) ? `${sessionScope(node.row)} · ` : ''}{node.beats.length}幕 ↗</span>
                 </span>
               </button>
             </li>
           );
         })}
       </ul>
+      {focusOverlay}
     </div>
   );
 }
@@ -977,6 +1019,58 @@ export interface MemoryMicroscopeBeatsProps {
   beats: StarBeat[];
   connectedEntries: Array<{ row: MemoryRecord; reason: string; kind: StarConnectionKind }>;
   onSelectMemory: (id: string) => void;
+}
+
+/**
+ * 选中一条记忆时的关联度。
+ *
+ * 强：共享具体来源事件，或纠正链两端；这两类关系有可核对依据。
+ * 中：同月；只说明日期关系，不说明同一件事。
+ * 弱：其余全部。同地点、同主题、同群都不升级为强关联。
+ *
+ * 只返回直接相邻的关系，不做多跳扩散——两跳之外的“相关”没有足够依据。
+ */
+function dayDistance(a: StarNode, b: StarNode): number | null {
+  if (a.timestamp === null || b.timestamp === null) return null;
+  return Math.abs(a.timestamp - b.timestamp) / DAY_MS;
+}
+
+export function starAffinity(model: StarChartModel, selectedId: string | null): StarAffinity | null {
+  if (!selectedId || !Object.hasOwn(model.nodeMap, selectedId)) return null;
+  const links: StarAffinityLink[] = [];
+  const seen = new Set<string>();
+  const add = (otherId: string, level: StarAffinityLevel, reason: string, evidence: string, kind: StarAffinityLink['kind']) => {
+    if (otherId === selectedId || seen.has(otherId) || !Object.hasOwn(model.nodeMap, otherId)) return;
+    seen.add(otherId);
+    links.push({ id: otherId, level, reason, evidence, kind });
+  };
+
+  for (const edge of model.causalEdges) {
+    if (edge.from === selectedId) add(edge.to, 'strong', edge.reason, edge.evidence, edge.kind);
+    if (edge.to === selectedId) add(edge.from, 'strong', edge.reason, edge.evidence, edge.kind);
+  }
+  const selectedNode = model.nodeMap[selectedId];
+  const nearby: Array<{ id: string; days: number; label: string; kind: StarLunarArc['kind'] }> = [];
+  for (const arc of model.lunarArcs) {
+    const otherId = arc.from === selectedId ? arc.to : arc.to === selectedId ? arc.from : null;
+    if (!otherId) continue;
+    const other = model.nodeMap[otherId];
+    const days = selectedNode && other ? dayDistance(selectedNode, other) : null;
+    if (days === null) continue;
+    // 同月不等于同一天。整月几十条全连会失去区分度：同日全部保留，相邻三天只取最近两条。
+    if (days < 1) add(otherId, 'medium', '同一天', arc.label, arc.kind);
+    else if (days <= 3) nearby.push({ id: otherId, days, label: arc.label, kind: arc.kind });
+  }
+  nearby.sort((a, b) => a.days - b.days).slice(0, 2)
+    .forEach((item) => add(item.id, 'medium', '相邻三天', item.label, item.kind));
+
+  const counts = { strong: 0, medium: 0, weak: 0 };
+  for (const node of model.nodes) {
+    if (node.row.memory_id === selectedId) continue;
+    const link = links.find((item) => item.id === node.row.memory_id);
+    counts[link ? link.level : 'weak'] += 1;
+  }
+  return { selectedId, links, counts };
 }
 
 export function connectedStarEntries(model: StarChartModel, selectedId: string): MemoryMicroscopeBeatsProps['connectedEntries'] {

@@ -795,6 +795,25 @@ describe('前端筛选（kind / 时间）', () => {
     expect(filterMemories([noTime], { kind: 'all', range: 'all' }, now)).toEqual([noTime]);
   });
 
+  it('会话筛选把群聊和私聊分开，群聊不冒充仅本人', () => {
+    const group = {
+      ...MEM_A,
+      memory_id: 'mem_group',
+      visibility: 'group_scope' as const,
+      import_source: {
+        source: 'astrbot_memory_companion', record_id: 'g1', memory_type: 'conversation_summary',
+        platform: 'aiocqhttp', session_id: 'default:GroupMessage:100200300', bot_qq: '10000',
+        owner_qq: '10001', occurred_at: null, created_at: MEM_A.created_at ?? '',
+        updated_at: MEM_A.created_at ?? '', valid_from: null, valid_to: null,
+      },
+    };
+    const privateRow = { ...MEM_A, memory_id: 'mem_private' };
+    const rows = [group, privateRow];
+    expect(filterMemories(rows, { kind: 'all', range: 'all', originScope: 'group' }, now).map((r) => r.memory_id)).toEqual(['mem_group']);
+    expect(filterMemories(rows, { kind: 'all', range: 'all', originScope: 'private' }, now).map((r) => r.memory_id)).toEqual(['mem_private']);
+    expect(filterMemories(rows, { kind: 'all', range: 'all' }, now).map((r) => r.memory_id)).toEqual(['mem_group', 'mem_private']);
+  });
+
   it('筛选只作用于已取回的数据：界面明说已取回 X 条 / 筛选后 Y 条', () => {
     const html = renderList({ state: ok(listResponse([MEM_A, MEM_C_ARCHIVED])) });
     expect(html).toContain('搜索记忆库');

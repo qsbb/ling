@@ -9,6 +9,25 @@
 - 卡片、年份、记录间隔和跳转沿用原设计的读法。记录间隔只写「本批可见记录之间相隔 N 天」，不暗示这段时间没有记忆。
 - 详情先读完整正文，再展开时间、依据、前后经过和相关连线。
 
+## 放大镜与关联度
+
+星图默认只读图。用户点卡片后：
+
+- 左侧/下方出现镜片（桌面右侧浮层，不占布局），列出强/中关联；
+- 同源事件 / 纠正链 = 强，实线；同一天 / 相邻三天 = 中，虚线；
+- 其余卡片淡出到 20%，仍可点；
+- 同地点、同主题、同群不自动算强关联；
+- 镜片标题两行、关联最多 2 条、原文默认折叠；点“看完整详情”才进入既有详情、纠正、撤回。
+
+真实 118 条数据里共享事件 0、纠正链 0，所以强关联为 0；这是数据事实，不用同月硬造强关联。
+
+## 记忆范围
+
+- 前端新增“会话：全部 / 仅私聊 / 仅群聊”，并显示卡片是私聊还是群聊。
+- 群聊记忆应保留 `group_scope`，不能写成“仅本人”。
+- 当前后端导入器只接受私聊：398 条私聊样本预览出 118 accepted；群聊全部 `outside_private_pair`。群聊的前端能力已就绪，等后端扩展。
+- 详见 [`MEMORY-SCOPE-AND-BACKEND.md`](MEMORY-SCOPE-AND-BACKEND.md) 与 [`BACKEND-MEMORY-ALL-SCOPES.md`](BACKEND-MEMORY-ALL-SCOPES.md)。
+
 ## 布局
 
 星图视图采用 A「全景长卷」：左侧固定月令环，右侧宽时间轴，详情不再占右侧栏，而是全宽贴在星图下方。列表视图仍保持原来的索引 + 右侧详情双栏。
@@ -37,7 +56,7 @@
 
 | 检查 | 结果 | 日志 |
 | --- | --- | --- |
-| 前端全量 `pnpm test` | 56 files，1406 passed / 1 skipped | [`logs/final-vitest.log`](logs/final-vitest.log) |
+| 前端全量 `pnpm test` | 56 files，1407 passed / 1 skipped | [`logs/final-vitest.log`](logs/final-vitest.log) |
 | 类型检查 `pnpm typecheck` | 通过 | [`logs/final-typecheck.log`](logs/final-typecheck.log) |
 | 生产构建 `pnpm build` | 通过（仅有既有 chunk >500kB 警告） | [`logs/final-build.log`](logs/final-build.log) |
 | 相关 pytest（持锁，PostgreSQL `ling_test`） | 195 passed | [`logs/pytest-memory.log`](logs/pytest-memory.log) |
@@ -48,7 +67,8 @@
 
 真实 Chromium 用例覆盖：A 版结构（月令环在左、时间轴在右、详情在下方且整宽）、跨年同月、同年同月、纠正链、同源事件、同地点但无关联、发生日期与记下日期不同、发生日期未知、密集记录、服务端搜索、本地筛选、切回列表、打开全景分镜、既有纠正入口、375/320px 内部平移与返回焦点；320 另断言 tabs 仍是可见的单行导航。截图：
 
-- [1440 星图](1440-star.png) · [1440 全景分镜](1440-theater.png)
+- [1440 星图](1440-star.png) · [1440 全景分镜](1440-theater.png) · [1440 放大镜](1440-star-lens.png)
+- [真实库默认](real-library-default.png) · [真实库放大镜](real-library-lens.png)
 - [375 星图](375-star.png) · [375 详情](375-detail.png)
 - [320 星图](320-star.png) · [320 详情](320-detail.png)
 

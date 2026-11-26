@@ -32,3 +32,12 @@ typecheck: exit 0
 build: exit 0 (existing >500kB chunk warning)
 git diff --check: exit 0
 U+FFFD: none
+
+Memory scope + lens (2026-11-26):
+frontend: 56 files, 1407 passed, 1 skipped
+typecheck: exit 0
+build: exit 0
+real export: 45,347 memories; private_pair 516; group_public 41,360; stable private 398, group 30,159
+private preview: 398 total, 118 accepted, 266 outside_private_pair, 13 invalid_record, 1 unsupported_memory
+real imported: 118 memories (all episode), 0 shared event, 0 correction
+group import: not available in current backend (outside_private_pair); frontend scope filter ready
