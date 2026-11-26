@@ -125,7 +125,7 @@ async def _onebot_namespaces(session: DbSession, settings: Settings) -> set[str]
 
 async def _resolve_target(
     session: DbSession, auth: AuthContext, source: importer.SourcePair, onebot_namespaces: set[str],
-    settings: Settings, *, lock: bool = False,
+    settings: Settings, *, persona_id: str, lock: bool = False,
 ) -> importer.ImportTarget:
     subject, binding = await IdentityService(session).resolve_proven_login_binding(
         subject_id=auth.user.subject_id,
@@ -144,8 +144,8 @@ async def _resolve_target(
         binding_revision=binding.updated_at.isoformat(),
         forget_generation=subject.forget_generation,
         actor_id=settings.actor_id,
-        persona_id=settings.persona_id,
-        instance_id=sorted(onebot_namespaces)[0] if onebot_namespaces else DEFAULT_INSTANCE_ID,
+        persona_id=persona_id,
+        instance_id=binding.connector_instance,
     )
 
 
@@ -174,9 +174,12 @@ async def preview(
                         return SourceChoicesOut(sources=choices)
                     source = choices[0]
             archive = importer.open_archive(file, digest=digest, header=header, source=source)
-            target = await _resolve_target(session, auth, archive.source, namespaces, settings)
+            effective = await config.effective()
+            target = await _resolve_target(
+                session, auth, archive.source, namespaces, settings, persona_id=effective.persona_id,
+            )
             reviewed_at = utcnow().replace(microsecond=0)
-            retention = MemoryService(session, policy=(await config.effective()).memory).write_retention_days()
+            retention = MemoryService(session, policy=effective.memory).write_retention_days()
             result = await importer.process_archive(
                 session, archive=archive, target=target, now=reviewed_at, retention_days=retention,
             )
@@ -211,11 +214,12 @@ async def commit(
         async with _uploaded_archive(request, settings) as (file, digest, header):
             source = _requested_source(request) if isinstance(header, importer.AstrBotNativeHeader) else None
             archive = importer.open_archive(file, digest=digest, header=header, source=source)
+            effective = await config.effective()
             target = await _resolve_target(
                 session, auth, archive.source, await _onebot_namespaces(session, settings),
-                settings, lock=True,
+                settings, persona_id=effective.persona_id, lock=True,
             )
-            retention = MemoryService(session, policy=(await config.effective()).memory).write_retention_days()
+            retention = MemoryService(session, policy=effective.memory).write_retention_days()
             reviewed_at = importer.check_confirmation(
                 load_signing_root_key(settings),
                 token=token, user_id=auth.user.id, target=target, digest=archive.digest,

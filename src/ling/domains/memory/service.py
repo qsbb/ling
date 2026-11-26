@@ -807,6 +807,8 @@ class MemoryService:
             active_source(MemoryRow),
             or_(MemoryRow.valid_from.is_(None), MemoryRow.valid_from <= now),
         )
+        if audience is not None:
+            base = base.where(audience.memory_row_predicate())
         fetched_rows = list(
             (await self._session.execute(
                 base.order_by(MemoryRow.updated_at.desc(), MemoryRow.id.asc())
@@ -825,8 +827,6 @@ class MemoryService:
                 self._retained_memory(now),
                 or_(*matches),
             )
-            if audience is not None:
-                older = older.where(audience.memory_row_predicate())
             if not include_history:
                 older = older.where(or_(MemoryRow.valid_until.is_(None), MemoryRow.valid_until > now))
             fetched_rows.extend(

@@ -105,16 +105,16 @@ class AudienceSnapshot:
             return eligible
         return eligible & or_(
             source != "group_scope",
-            (MemoryRow.source_window_id == self.window_id) & or_(
-                MemoryRow.source_message_id.is_(None),
-                MemoryRow.source_message_id.in_(self.whole_group_source_ids),
-            ),
+            (MemoryRow.source_window_id == self.window_id)
+            & MemoryRow.source_message_id.is_not(None)
+            & MemoryRow.source_message_id.in_(self.whole_group_source_ids),
         )
 
     def _group_source_eligible(self, visibility: str, source_id: str | None) -> bool:
         return (
-            not self.is_group or visibility != "group_scope" or source_id is None
-            or source_id in self.whole_group_source_ids
+            not self.is_group
+            or visibility != "group_scope"
+            or (source_id is not None and source_id in self.whole_group_source_ids)
         )
 
     def _allowed_visibilities(self) -> set[str]:

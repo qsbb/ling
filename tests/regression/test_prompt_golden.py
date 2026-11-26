@@ -17,9 +17,10 @@ from ling.domains.conversation.service import ConversationService
 from ling.domains.media import service as media
 from ling.domains.media.video import short_ref_for
 from ling.infra.db import session_scope
-from ling.infra.models import MediaEvidenceRow, MemoryRow, Persona, Window
+from ling.infra.models import MediaEvidenceRow, MemoryRow, Message, Persona, Window, WindowContext
 from ling.kernel import env_facts, turn
 from ling.kernel.context import ContextCompiler
+from ling.ports.channel import GroupHistoryAccess
 from ling.ports.model import ChatMessageIn, ModelChunk, ModelRequest, ToolCall
 from tests.integration.conftest import TestEnv, read_sse
 from tests.regression.chat_fixture import (
@@ -82,11 +83,13 @@ def project_messages(messages: list[ChatMessageIn]) -> list[PromptMessage]:
 
 
 async def compile_prompt(
-    env: TestEnv, window_id: str, *, group: bool = False
+    env: TestEnv, window_id: str, *, group: bool = False,
+    group_history: GroupHistoryAccess | None = None,
 ) -> list[PromptMessage]:
     async with session_scope() as session:
         compiled = await ContextCompiler(
-            session, actor_id=env.settings.actor_id, persona_id=env.settings.persona_id
+            session, actor_id=env.settings.actor_id, persona_id=env.settings.persona_id,
+            group_history=group_history,
         ).compile(
             subject_id=env.subject_id,
             window_id=window_id,
@@ -105,12 +108,20 @@ def text_of(messages: list[PromptMessage]) -> str:
 async def test_prompt_audiences(prompt_env: TestEnv, group: bool) -> None:
     private = await new_window(prompt_env, "测试私聊")
     group_id = await new_window(prompt_env, "测试群")
+    group_source_message = "msg_prompt_group_source"
     async with session_scope() as session:
         window = await session.get(Window, group_id)
         window.visibility = "group_scope"
-        for window_id, visibility, text in (
-            (private, "subject_private", PRIVATE),
-            (group_id, "group_scope", GROUP),
+        session.add(Message(
+            id=group_source_message, window_id=group_id, role="user", text="原始样本植物记录",
+            sequence=1, state="completed", origin="user_statement",
+        ))
+        session.add(WindowContext(
+            id="ctx_prompt_group_source", window_id=group_id, summary_through_sequence=1,
+        ))
+        for window_id, visibility, text, source_message_id in (
+            (private, "subject_private", PRIVATE, None),
+            (group_id, "group_scope", GROUP, group_source_message),
         ):
             session.add(
                 MemoryRow(
@@ -122,14 +133,21 @@ async def test_prompt_audiences(prompt_env: TestEnv, group: bool) -> None:
                     visibility=visibility,
                     source_visibility=visibility,
                     source_window_id=window_id,
+                    source_message_id=source_message_id,
                     source_event_ids=["evt_wp00_sample"],
                     confidence=0.9,
                 )
             )
 
-    messages = await compile_prompt(prompt_env, group_id if group else private, group=group)
+    group_history = (
+        GroupHistoryAccess(group_id, frozenset({group_source_message})) if group else None
+    )
+    messages = await compile_prompt(
+        prompt_env, group_id if group else private, group=group, group_history=group_history,
+    )
     text = text_of(messages)
     assert INPUT in text
+    assert "原始样本植物记录" not in text
     assert (GROUP if group else PRIVATE) in text
     assert (PRIVATE if group else GROUP) not in text
     snapshot("prompt-group-window" if group else "prompt-web-private", messages)

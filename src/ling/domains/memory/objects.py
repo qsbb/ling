@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.service import active_source
-from ling.infra.models import EntityRow, MemoryEntityRow, MemoryRow
+from ling.infra.models import EntityRow, MemoryEntityRow, MemoryEpisode, MemoryRow
 
 
 async def list_memory_objects(session: AsyncSession, subject_id: str) -> list[dict]:
@@ -43,7 +43,7 @@ async def list_memory_objects(session: AsyncSession, subject_id: str) -> list[di
         }
         for row in rows
     ]
-    self_count = int(await session.scalar(
+    self_memory_count = int(await session.scalar(
         select(func.count()).select_from(MemoryRow).where(
             MemoryRow.subject_id == subject_id,
             active_source(MemoryRow),
@@ -51,6 +51,14 @@ async def list_memory_objects(session: AsyncSession, subject_id: str) -> list[di
             MemoryRow.archived_at.is_(None),
         )
     ) or 0)
+    self_episode_count = int(await session.scalar(
+        select(func.count()).select_from(MemoryEpisode).where(
+            MemoryEpisode.subject_id == subject_id,
+            active_source(MemoryEpisode),
+            MemoryEpisode.archived_at.is_(None),
+        )
+    ) or 0)
+    self_count = self_memory_count + self_episode_count
     return [{
         "entity_id": "self", "name": "她自己", "kind": "self", "aliases": [], "count": self_count,
     }, *objects]

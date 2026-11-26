@@ -15,9 +15,10 @@ from ling.domains.conversation.service import ConversationService
 from ling.domains.memory import providers
 from ling.domains.memory.service import RECALL_CANDIDATE_LIMIT, MemoryService
 from ling.infra.db import session_scope
-from ling.infra.models import MemoryRetrievalLog, MemoryRow, Window
+from ling.infra.models import MemoryRetrievalLog, MemoryRow, Message, Window
 from ling.kernel.audience import AudienceSnapshot, visibility_set
 from ling.kernel.context import ContextCompiler, estimate_tokens
+from ling.ports.channel import GroupHistoryAccess
 from ling.ports.config import MemoryPolicy
 from tests.integration.conftest import TestEnv
 from tests.integration.test_tools_turn_wiring import (
@@ -74,9 +75,15 @@ async def _window(
 async def _recall_slot(
     session: AsyncSession, env: TestEnv, window_id: str, slot: Literal["works_at", "lives_in"],
     visibility: Visibility = Visibility.subject_private,
+    group_history: GroupHistoryAccess | None = None,
 ) -> list[str]:
     audience = await AudienceSnapshot.freeze(
         session, subject_id=env.subject_id, window_id=window_id, window_visibility=visibility.value,
+        whole_group_source_ids=(
+            group_history.source_ids
+            if group_history is not None and group_history.window_id == window_id
+            else frozenset()
+        ),
     )
     result = await MemoryService(session).recall(
         subject_id=env.subject_id, query=slot, fact_slot=slot, audience=audience,
@@ -170,6 +177,9 @@ async def test_current_slot_filters_audience_and_time_before_the_candidate_cap(
     group_c = await _window(logged_in, visibility=Visibility.group_scope)
     private = await _window(logged_in)
     group = {"visibility": "group_scope", "source_visibility": "group_scope"}
+    group_source_message = "msg_group_work_source"
+    other_source_message = "msg_group_c_work_source"
+    same_source = {"source_window_id": group_a, "source_message_id": group_source_message}
     old = datetime.now(UTC) - timedelta(days=400)
     past = datetime.now(UTC) - timedelta(days=1)
     future = datetime.now(UTC) + timedelta(days=1)
@@ -178,7 +188,8 @@ async def test_current_slot_filters_audience_and_time_before_the_candidate_cap(
             _fact(logged_in, "private_work", WORK_TEXT, slot="works_at"),
             _fact(
                 logged_in, "group_work", "用户在栖木档案馆工作", slot="works_at",
-                created_at=old, updated_at=old, source_window_id=group_a, **group,
+                created_at=old, updated_at=old, source_window_id=group_a,
+                source_message_id=group_source_message, **group,
             ),
             _fact(
                 logged_in, "group_decoy", "栖木档案馆附近上班路线攻略", slot="ongoing_project",
@@ -191,21 +202,35 @@ async def test_current_slot_filters_audience_and_time_before_the_candidate_cap(
                 slot="works_at", **scope, **group,
             )
             for key, scope in [
-                ("other_window", {"source_window_id": group_c}),
-                ("past", {"source_window_id": group_a, "valid_from": past, "valid_until": past}),
-                ("future", {"source_window_id": group_a, "valid_from": future}),
-                ("expired", {"source_window_id": group_a, "created_at": past, "retention_days": 1}),
+                ("other_window", {"source_window_id": group_c, "source_message_id": other_source_message}),
+                ("past", {**same_source, "valid_from": past, "valid_until": past}),
+                ("future", {**same_source, "valid_from": future}),
+                ("expired", {**same_source, "created_at": past, "retention_days": 1}),
             ]
             for i in range(40)
         ])
+        session.add(Message(
+            id=group_source_message, window_id=group_a, role="user", text="我在栖木档案馆工作",
+            sequence=1, state="completed", origin="user_statement",
+        ))
+        session.add(Message(
+            id=other_source_message, window_id=group_c, role="user", text="有人在松影园区上班",
+            sequence=1, state="completed", origin="user_statement",
+        ))
 
     async with session_scope() as session:
-        for window, visibility, expected in [
-            (group_a, Visibility.group_scope, ["group_work"]),
-            (group_b, Visibility.group_scope, []),
-            (private, Visibility.subject_private, ["private_work"]),
+        for window, visibility, expected, group_history in [
+            (
+                group_a, Visibility.group_scope, ["group_work"],
+                GroupHistoryAccess(group_a, frozenset({group_source_message, other_source_message})),
+            ),
+            (group_a, Visibility.group_scope, [], None),
+            (group_b, Visibility.group_scope, [], None),
+            (private, Visibility.subject_private, ["private_work"], None),
         ]:
-            assert await _recall_slot(session, logged_in, window, "works_at", visibility) == expected
+            assert await _recall_slot(
+                session, logged_in, window, "works_at", visibility, group_history,
+            ) == expected
 
 
 async def test_correction_answers_current_fact_and_keeps_the_authorized_original(

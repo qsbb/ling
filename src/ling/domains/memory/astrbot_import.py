@@ -21,7 +21,7 @@ from sqlalchemy.schema import CreateTable
 from starlette.concurrency import run_in_threadpool
 
 from ling.contracts.v1 import Origin, Visibility
-from ling.infra.models import EntityRow, MemoryEntityRow, MemoryRow, Window
+from ling.infra.models import MemoryEntityRow, MemoryRow, Window
 
 PREVIEW_LIMIT = 12
 RECORD_BATCH_SIZE = 128
@@ -182,12 +182,16 @@ class ArchiveRecord(BaseModel):
             return "not_reviewed"
         if (
             self.sensitivity not in {"private", "internal", "public"}
+            or (self.is_group and self.sensitivity == "private")
             or self.sayability not in {"direct", "indirect"}
         ):
             return "restricted"
         if self.lifecycle != "stable_memory" or not (
             (self.is_summary and self.reality_level in {"llm_summary", "imported_summary"})
-            or (self.memory_type in _STATEMENT_TYPES and self.reality_level == "real_user_fact")
+            or (
+                not self.is_group and self.memory_type in _STATEMENT_TYPES
+                and self.reality_level == "real_user_fact"
+            )
         ):
             return "unsupported_memory"
         if self.created_at > reviewed_at or (
@@ -357,10 +361,9 @@ class ImportTarget:
     binding_id: str
     binding_revision: str
     forget_generation: int
-    actor_id: str = "actor_ling"
-    persona_id: str = "persona_ling"
-    # 历史群没有现成的平台实例，按导入端默认 OneBot 实例建历史群窗口。
-    instance_id: str = "onebot-default"
+    actor_id: str
+    persona_id: str
+    instance_id: str
 
 
 def sign_confirmation(
@@ -368,9 +371,10 @@ def sign_confirmation(
     reviewed_at: int, expires: int, retention_days: int,
 ) -> str:
     payload = json.dumps([
-        "ling:astrbot-memory-import:v3", user_id, target.destination.subject_id,
+        "ling:astrbot-memory-import:v4", user_id, target.destination.subject_id,
         target.destination.qq, target.destination.bot_qq,
         target.binding_id, target.binding_revision, target.forget_generation,
+        target.actor_id, target.persona_id, target.instance_id,
         digest, reviewed_at, expires, retention_days,
     ], separators=(",", ":")).encode()
     signature = hmac.digest(root_key, payload, "sha256").hex()
@@ -594,9 +598,6 @@ async def _insert_memories(
                 session, target=target, record=record,
             )
         if record.group_id not in group_entities:
-            label = (record.group_name or "").strip()
-            # 同名群不能合成一个对象；带上群号保持稳定与可读。
-            name = f"{label[:44]} · {record.group_id}" if label else f"群 {record.group_id}"
             entity = await entity_service.upsert_group(
                 subject_id=target.destination.subject_id,
                 group_id=record.group_id,

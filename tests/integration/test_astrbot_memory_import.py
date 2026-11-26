@@ -24,7 +24,17 @@ from ling.domains.memory import astrbot_import as importer
 from ling.domains.memory.entities import EntityService
 from ling.domains.memory.service import MemoryService, render_evidence
 from ling.infra.db import session_scope
-from ling.infra.models import ActorAccount, EntityRow, MemoryEntityRow, MemoryRow, OutboxEvent, Subject, Window
+from ling.infra.models import (
+    ActorAccount,
+    EntityRow,
+    MemoryEntityRow,
+    MemoryEpisode,
+    MemoryRow,
+    Message,
+    OutboxEvent,
+    Subject,
+    Window,
+)
 from ling.kernel.audience import AudienceSnapshot
 from tests.integration.conftest import TestEnv
 
@@ -302,8 +312,32 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
                 EntityRow.subject_id == logged_in.subject_id, EntityRow.kind == "group",
             )
         ) or 0) == 1
+        session.add(EntityRow(
+            id="ent_without_memory_link",
+            subject_id=logged_in.subject_id,
+            name="未关联人物",
+            kind="person",
+            aliases=[],
+        ))
+        session.add(MemoryEpisode(
+            id="episode-without-entity-link",
+            subject_id=logged_in.subject_id,
+            window_id="win_private",
+            summary="Ling 上周完成了一次练习",
+            origin="user_statement",
+            visibility="subject_private",
+            source_visibility="subject_private",
+            source_event_ids=["turn:episode-without-entity-link"],
+            occurred_at=datetime.now(UTC) - timedelta(days=7),
+        ))
+        await session.flush()
     objects = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
-    assert objects[0]["kind"] == "self" and objects[0]["count"] == 2
+    assert objects[0]["kind"] == "self" and objects[0]["count"] == 3
+    own_library = (await logged_in.client.get(
+        "/v1/memory?view=library&object_id=self"
+    )).json()
+    assert own_library["total"] == 3
+    assert not any(item["entity_id"] == "ent_without_memory_link" for item in objects)
     group_object = next(item for item in objects if item["kind"] == "group")
     assert group_object["count"] == 1 and group_object["name"] == f"新的读书群 · {GROUP_ID}"
     only_group = (await logged_in.client.get(
@@ -324,16 +358,59 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
         )
         assert row.id not in {hit.memory_id for hit in recalled.hits}
 
-        # 正例：同源历史群窗口可以召回，证明不是把群记忆一刀切禁掉。
-        same_source = await AudienceSnapshot.freeze(
+        # A matching historical window ID alone does not prove the current group
+        # can see an imported record whose source has no message ID.
+        same_source_unproven = await AudienceSnapshot.freeze(
             session, subject_id=logged_in.subject_id,
             window_id=row.source_window_id, window_visibility="group_scope",
         )
-        same_recalled = await MemoryService(session).recall(
+        same_recalled_unproven = await MemoryService(session).recall(
             subject_id=logged_in.subject_id, query="蓝封画册",
-            visibility_allow={Visibility.group_scope}, audience=same_source,
+            visibility_allow={Visibility.group_scope}, audience=same_source_unproven,
         )
-        assert row.id in {hit.memory_id for hit in same_recalled.hits}
+        assert row.source_message_id is None
+        assert row.id not in {hit.memory_id for hit in same_recalled_unproven.hits}
+
+        # A current-group message in the frozen whole-audience source set remains
+        # a positive recall path even when it shares the group's window.
+        live_message_id = "live-group-message"
+        session.add(Message(
+            id=live_message_id,
+            window_id=row.source_window_id,
+            role="user",
+            sender_subject_id=logged_in.subject_id,
+            text="刚才在群里确认蓝封画册周五归还",
+            sequence=1,
+            state="completed",
+            origin="user_statement",
+        ))
+        live_row = MemoryRow(
+            id="live-group-memory",
+            subject_id=logged_in.subject_id,
+            kind="assertion",
+            text="刚才在群里确认蓝封画册周五归还",
+            origin="user_statement",
+            visibility="group_scope",
+            source_visibility="group_scope",
+            source_window_id=row.source_window_id,
+            source_message_id=live_message_id,
+            source_event_ids=[f"message:{live_message_id}"],
+            confidence=1.0,
+        )
+        session.add(live_row)
+        await session.flush()
+        proven_current_group = await AudienceSnapshot.freeze(
+            session, subject_id=logged_in.subject_id,
+            window_id=row.source_window_id, window_visibility="group_scope",
+            whole_group_source_ids=frozenset({live_message_id}),
+        )
+        live_recalled = await MemoryService(session).recall(
+            subject_id=logged_in.subject_id, query="蓝封画册周五归还",
+            visibility_allow={Visibility.group_scope}, audience=proven_current_group,
+        )
+        live_ids = {hit.memory_id for hit in live_recalled.hits}
+        assert live_row.id in live_ids
+        assert row.id not in live_ids
 
         # 私聊窗口也不能读到群记忆。
         private = await AudienceSnapshot.freeze(
@@ -352,15 +429,34 @@ async def test_group_export_imports_with_group_scope_and_window(logged_in: TestE
     )
     assert retract.status_code == 200, retract.text
     after = (await logged_in.client.get("/v1/memory/objects")).json()["objects"]
-    assert not any(item["entity_id"] == group_object["entity_id"] and item["count"] for item in after)
+    assert not any(item["entity_id"] == group_object["entity_id"] for item in after)
     empty_group = (await logged_in.client.get(
         f"/v1/memory?view=library&object_id={group_object['entity_id']}"
     )).json()
     assert empty_group["total"] == 0
 
 
-async def test_group_import_reuses_an_existing_current_group_window(logged_in: TestEnv) -> None:
-    """If the connector already has this group window, historical memories bind to it."""
+async def test_group_private_sensitivity_is_rejected_before_import(logged_in: TestEnv) -> None:
+    await _bind(logged_in)
+    data = _archive(
+        _group_record("private-group-memo", sensitivity="private"),
+        _record("private-direct-memo", sensitivity="private"),
+    )
+    before = await _row_counts()
+
+    preview = await logged_in.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+
+    assert preview.status_code == 200, preview.text
+    report = preview.json()
+    assert report["accepted"] == 1
+    assert report["scope_counts"] == {"private": 1}
+    assert report["skipped"] == 1
+    assert report["skip_reasons"] == {"restricted": 1}
+    assert await _row_counts() == before
+
+
+async def test_group_import_reuses_unverified_window_without_granting_live_recall(logged_in: TestEnv) -> None:
+    """An existing but unverified group window is not history visibility proof."""
     await _bind(logged_in)
     live_id = "win_live_group_reuse"
     async with session_scope() as session:
@@ -394,7 +490,8 @@ async def test_group_import_reuses_an_existing_current_group_window(logged_in: T
             subject_id=logged_in.subject_id, query="蓝封画册",
             visibility_allow={Visibility.group_scope}, audience=audience,
         )
-        assert row.id in {hit.memory_id for hit in recalled.hits}
+        assert row.source_message_id is None
+        assert row.id not in {hit.memory_id for hit in recalled.hits}
 
 
 async def test_native_export_offers_choices_for_multiple_proven_private_sources(logged_in: TestEnv) -> None:
@@ -697,7 +794,10 @@ async def test_requires_owner_origin_and_current_proven_binding(web_env: TestEnv
 def test_confirmation_binds_authenticated_actor_target_generation_and_expiry() -> None:
     now = datetime.now(UTC)
     dest = importer.Destination(subject_id="subject-a", display_name="展示名", qq=OWNER_QQ, bot_qq=BOT_QQ)
-    target = importer.ImportTarget(dest, "binding-id", "binding-revision", 0)
+    target = importer.ImportTarget(
+        dest, "binding-id", "binding-revision", 0,
+        actor_id="actor-test", persona_id="persona-test", instance_id="onebot-test",
+    )
     inputs = {"user_id": "user-a", "target": target, "digest": "record-digest", "retention_days": 3650}
     deadline = now + timedelta(minutes=5)
     token = importer.sign_confirmation(
@@ -708,6 +808,8 @@ def test_confirmation_binds_authenticated_actor_target_generation_and_expiry() -
         {"user_id": "user-b"},
         {"target": replace(target, destination=dest.model_copy(update={"subject_id": "subject-b"}))},
         {"target": replace(target, forget_generation=1)},
+        {"target": replace(target, persona_id="persona-replaced")},
+        {"target": replace(target, instance_id="onebot-other")},
         {"retention_days": 365},
         {"now": deadline},
     ]

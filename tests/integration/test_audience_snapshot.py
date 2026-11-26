@@ -24,9 +24,10 @@ from ling.contracts.v1 import Origin, Visibility
 from ling.domains.awareness.service import AwarenessService
 from ling.domains.memory.service import MemoryService
 from ling.infra.db import session_scope
-from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent, Window
+from ling.infra.models import MemoryEpisode, MemoryRow, Message, OutboxEvent, Window
 from ling.kernel.audience import AudienceSnapshot, visibility_set
 from ling.kernel.context import ContextCompiler
+from ling.ports.channel import GroupHistoryAccess
 from ling.worker import handle_memory_extract
 from tests.integration.conftest import TestEnv
 
@@ -75,13 +76,19 @@ async def test_group_memory_does_not_leak_to_another_group(logged_in: TestEnv) -
     """群 A 的记忆（哪怕 visibility=group_scope）不得进群 B。"""
     group_a = await _window(logged_in, visibility="group_scope", title="群A")
     group_b = await _window(logged_in, visibility="group_scope", title="群B")
+    source_message_id = "source-a"
 
     async with session_scope() as session:
+        session.add(Message(
+            id=source_message_id, window_id=group_a, role="user", text="团子",
+            sequence=1, state="completed", origin="user_statement",
+        ))
         await MemoryService(session).record_episode(
             subject_id=logged_in.subject_id,
             window_id=group_a,
             summary="群A 里聊到了团子这只猫",
             source_event_ids=["evt_a"],
+            source_message_id=source_message_id,
             origin=Origin.user_statement,
             visibility=Visibility.group_scope,
             source_visibility="group_scope",
@@ -101,16 +108,33 @@ async def test_group_memory_does_not_leak_to_another_group(logged_in: TestEnv) -
         f"群 A 的记忆泄漏到群 B（snapshot={snap_b.describe()}）"
     )
 
-    # 群 A 自己能读到
+    # 同窗但缺少全群可见的消息证明时也不能读历史。
     async with session_scope() as session:
-        compiled_a = await ContextCompiler(session).compile(
+        compiled_a_unproven = await ContextCompiler(session).compile(
             subject_id=logged_in.subject_id,
             window_id=group_a,
             user_text="团子",
             is_group=True,
         )
-    system_a = "\n".join(m.content for m in compiled_a.messages if m.role == "system")
-    assert "群A 里聊到了团子" in system_a, "群 A 自己应能召回"
+    system_a_unproven = "\n".join(m.content for m in compiled_a_unproven.messages if m.role == "system")
+    assert "群A 里聊到了团子" not in system_a_unproven
+
+    # The same current-group source enters only when the adapter proves it is
+    # visible to the whole reply audience.
+    async with session_scope() as session:
+        compiled_a_proven = await ContextCompiler(
+            session,
+            group_history=GroupHistoryAccess(
+                window_id=group_a, source_ids=frozenset({source_message_id}),
+            ),
+        ).compile(
+            subject_id=logged_in.subject_id,
+            window_id=group_a,
+            user_text="团子",
+            is_group=True,
+        )
+    system_a_proven = "\n".join(m.content for m in compiled_a_proven.messages if m.role == "system")
+    assert "群A 里聊到了团子" in system_a_proven, "通过受众证明的同群来源应可召回"
 
 
 # ------------------------------------------------------------------ 群 → 私聊
