@@ -55,6 +55,14 @@ def dedupe_key_for(activity_id: str) -> str:
     return f"activity:{activity_id}"
 
 
+def _public_activity_messages(actor_id: str):
+    return select(Message).join(Window, Window.id == Message.window_id).where(
+        Window.visibility == "public", Window.actor_id == actor_id,
+        Message.state == "completed", Message.memory_hidden_at.is_(None),
+        Message.retracted_at.is_(None), Message.recalled_at.is_(None),
+    )
+
+
 @dataclass(frozen=True)
 class ExperienceView:
     experience_id: str
@@ -214,20 +222,22 @@ class SelfTimelineService:
 
     async def library_records(
         self, *, allow_actor_private: bool, since: datetime | None = None,
+        experience_id: str | None = None,
     ) -> list[tuple[SelfExperienceRow, ActivityRow]]:
         """Check the current activity before exposing a self-experience."""
         allowed = {"public", "actor_private"} if allow_actor_private else {"public"}
+        receipt_id = ActivityRow.checkpoint["desktop_task_id"].as_string()
+        verified_task = select(DesktopTaskRow.id).where(
+            DesktopTaskRow.actor_id == ActivityRow.actor_id,
+            DesktopTaskRow.id == receipt_id,
+            DesktopTaskRow.state == "succeeded",
+            DesktopTaskRow.step == "verified",
+            DesktopTaskRow.source == "life",
+        ).exists()
         visible_activity = ActivityRow.visibility.in_(allowed)
         if allow_actor_private:
             # Older desktop receipts inherited the activity default. Recover
             # only the actor's own verified life task with a matching receipt.
-            verified_task = select(DesktopTaskRow.id).where(
-                DesktopTaskRow.actor_id == ActivityRow.actor_id,
-                DesktopTaskRow.id == ActivityRow.checkpoint["desktop_task_id"].as_string(),
-                DesktopTaskRow.state == "succeeded",
-                DesktopTaskRow.step == "verified",
-                DesktopTaskRow.source == "life",
-            ).exists()
             visible_activity = or_(visible_activity, and_(
                 ActivityRow.origin == "tool_receipt", ActivityRow.visibility == "subject_private",
                 verified_task,
@@ -241,11 +251,14 @@ class SelfTimelineService:
                 SelfExperienceRow.archived_at.is_(None),
                 SelfExperienceRow.visibility.in_(allowed),
                 visible_activity,
+                or_(ActivityRow.origin != "tool_receipt", receipt_id.is_(None), verified_task),
             )
             .order_by(SelfExperienceRow.occurred_at.desc(), SelfExperienceRow.id.desc())
         )
         if since is not None:
             query = query.where(SelfExperienceRow.occurred_at >= since)
+        if experience_id is not None:
+            query = query.where(SelfExperienceRow.id == experience_id)
         rows = (await self._session.execute(query)).all()
         candidates = [
             (experience, activity)
@@ -268,16 +281,51 @@ class SelfTimelineService:
         if not referenced:
             return candidates
         public_ids = set(await self._session.scalars(
-            select(Message.id).join(Window, Window.id == Message.window_id).where(
-                Message.id.in_(referenced), Window.visibility == "public",
-                Message.memory_hidden_at.is_(None), Message.retracted_at.is_(None),
-                Message.recalled_at.is_(None),
-            )
+            _public_activity_messages(self._actor_id).where(Message.id.in_(referenced)).with_only_columns(Message.id)
         ))
         return [
             (experience, activity) for experience, activity in candidates
             if message_ids[activity.id] <= public_ids
         ]
+
+    async def library_source(self, experience_id: str, *, allow_actor_private: bool) -> dict | None:
+        records = await self.library_records(
+            experience_id=experience_id, allow_actor_private=allow_actor_private,
+        )
+        if not records:
+            return None
+        _, activity = records[0]
+        _, evidence = parse_completion_evidence(activity.completion_evidence)
+        source = {
+            "activity_id": activity.id,
+            "evidence": evidence,
+            "evidence_kind": activity_evidence_kind(activity).value,
+            "completed_at": activity.ended_at.isoformat() if activity.ended_at else None,
+            "observations": [],
+        }
+        references = [
+            value.removeprefix("message:") for value in activity.source_event_ids or []
+            if isinstance(value, str) and value.startswith("message:")
+        ]
+        if references:
+            messages = await self._session.scalars(
+                _public_activity_messages(self._actor_id)
+                .where(Message.id.in_(references)).order_by(Message.created_at)
+            )
+            observed = list(messages)
+            if {message.id for message in observed} != set(references):
+                return None
+            source["observations"] = [
+                {"message_id": message.id, "observed_at": message.created_at.isoformat()}
+                for message in observed
+            ]
+        task_id = (activity.checkpoint or {}).get("desktop_task_id")
+        if activity.origin == "tool_receipt" and isinstance(task_id, str):
+            receipt = await self._session.get(DesktopTaskRow, (self._actor_id, task_id))
+            if receipt is None or receipt.state != "succeeded" or receipt.step != "verified" or receipt.source != "life":
+                return None
+            source["desktop_receipt_id"] = receipt.id
+        return source
 
     # ---------------------------------------------------------- 内部
 

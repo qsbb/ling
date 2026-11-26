@@ -374,6 +374,15 @@ export type MemoryInclude = 'retracted' | 'archived' | 'all';
  * **没有单条详情端点**：详情只能从列表里这一份数据渲染，别再造一个
  * `GET /v1/memory/{id}` 的假设。
  */
+export interface MemoryActivitySource {
+  activity_id: string;
+  evidence: string;
+  evidence_kind: 'observed' | 'user_confirmed';
+  completed_at: string | null;
+  observations: { message_id: string; observed_at: string }[];
+  desktop_receipt_id?: string;
+}
+
 export interface MemoryRecord {
   memory_id: string;
   kind: string;

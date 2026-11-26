@@ -251,6 +251,11 @@ async def test_self_library_checks_activity_evidence_and_viewer(logged_in: TestE
     actual = {next(tag for tag in row["source_event_ids"] if tag.startswith("activity:")): row
               for row in owner["memories"]}
     assert actual[f"activity:{private}"]["origin"] == "tool_receipt"
+    private_record_id = actual[f"activity:{private}"]["memory_id"]
+    evidence = await logged_in.client.get(f"{path}/{private_record_id}/activity-source")
+    assert evidence.status_code == 200 and evidence.json()["activity_id"] == private
+    owner_activities = (await logged_in.client.get("/v1/activity")).json()["history"]
+    assert any(row["activity_id"] == private for row in owner_activities)
     public_record = actual[f"activity:{public}"]
     assert public_record["origin"] == "simulated"
     assert public_record["occurred_at"] == event_time.isoformat()
@@ -267,6 +272,12 @@ async def test_self_library_checks_activity_evidence_and_viewer(logged_in: TestE
     member_response = await logged_in.client.get(path, params=params)
     assert member_response.status_code == 200, member_response.text
     assert member_response.json()["memories"] == [public_record]
+    assert (await logged_in.client.get(f"{path}/{private_record_id}/activity-source")).status_code == 404
+    member_activities = (await logged_in.client.get("/v1/activity")).json()["history"]
+    assert public in {row["activity_id"] for row in member_activities}
+    assert private not in {row["activity_id"] for row in member_activities}
+    denial = await logged_in.client.post(f"/v1/activity/{private}/transition", json={"to_state": "running"})
+    assert denial.status_code == 403
     objects = (await logged_in.client.get(path + "/objects")).json()["objects"]
     assert next(row for row in objects if row["entity_id"] == "self")["count"] == 1
 

@@ -236,28 +236,28 @@ class ActivityService:
         await self._session.flush()
         return self._view(row)
 
-    async def current(self) -> ActivityView | None:
+    async def current(self, *, visibility: str | None = None) -> ActivityView | None:
+        query = select(ActivityRow).where(
+            ActivityRow.actor_id == self._actor_id,
+            ActivityRow.state.in_(["running", "paused"]),
+        )
+        if visibility is not None:
+            query = query.where(ActivityRow.visibility == visibility)
         row = (
             await self._session.execute(
-                select(ActivityRow)
-                .where(
-                    ActivityRow.actor_id == self._actor_id,
-                    ActivityRow.state.in_(["running", "paused"]),
-                )
-                .order_by(ActivityRow.updated_at.desc())
-                .limit(1)
+                query.order_by(ActivityRow.updated_at.desc()).limit(1)
             )
         ).scalar_one_or_none()
         return self._view(row) if row else None
 
-    async def history(self, limit: int = 20) -> list[ActivityView]:
+    async def history(self, limit: int = 20, *, visibility: str | None = None) -> list[ActivityView]:
+        query = select(ActivityRow).where(ActivityRow.actor_id == self._actor_id)
+        if visibility is not None:
+            query = query.where(ActivityRow.visibility == visibility)
         rows = list(
             (
                 await self._session.execute(
-                    select(ActivityRow)
-                    .where(ActivityRow.actor_id == self._actor_id)
-                    .order_by(ActivityRow.updated_at.desc())
-                    .limit(limit)
+                    query.order_by(ActivityRow.updated_at.desc()).limit(limit)
                 )
             ).scalars()
         )

@@ -161,6 +161,11 @@ async def test_life_worker_spends_one_grant_and_records_only_verified_activity(
     assert len(receipts) == (1 if outcome == "verified" else 0)
     if outcome == "verified":
         assert f"activity:{facts[0].id}" in receipts[0]["source_event_ids"]
+        source = await owner.get(f"/v1/memory/{receipts[0]['memory_id']}/activity-source")
+        assert source.status_code == 200, source.text
+        assert source.json()["desktop_receipt_id"] == request_id
+        assert source.json()["evidence_kind"] == "observed"
+        assert source.json()["completed_at"] == clock.isoformat()
         response = await owner.get("/v1/life/timeline", params={"date": DAY.isoformat()})
         assert response.status_code == 200, response.text
         matching = [fact for fact in response.json()["facts"] if fact["activity_id"] == facts[0].id]

@@ -21,6 +21,7 @@ import type {
   CoreMemoryInput,
   CoreMemoryItem,
   CoreMemoryListResponse,
+  MemoryActivitySource,
   MemoryImportSourceFilter,
   MemoryInclude,
   MemoryListResponse,
@@ -636,6 +637,7 @@ export function canRetryForget(state: ForgetState): boolean {
 export interface MemoryHandlers {
   forgetSource(memoryId: string): Promise<void>;
   readSource(memoryId: string): Promise<{ text: string; created_at: string }>;
+  readActivitySource?(memoryId: string): Promise<MemoryActivitySource>;
   annotateObject(memoryId: string, input: MemoryObjectAnnotation): Promise<void>;
   retract(memoryId: string, reason: string): Promise<void>;
   supersede(memoryId: string, text: string, reason: string): Promise<void>;
@@ -1288,15 +1290,21 @@ function MemoryInspector({
   const [sourceError, setSourceError] = useState<ExplainedError | null>(null);
   const [sourcePending, setSourcePending] = useState(false);
 
+  const [activitySource, setActivitySource] = useState<MemoryActivitySource | null>(null);
   const toggleSource = async () => {
-    if (source) {
+    if (source || activitySource) {
       setSource(null);
       return;
     }
     setSourcePending(true);
+      setActivitySource(null);
     setSourceError(null);
     try {
-      setSource(await handlers.readSource(row.memory_id));
+      if (row.record_type === 'self_experience' && handlers.readActivitySource) {
+        setActivitySource(await handlers.readActivitySource(row.memory_id));
+      } else {
+        setSource(await handlers.readSource(row.memory_id));
+      }
     } catch (cause) {
       setSourceError(explainError(cause));
     } finally {
@@ -1479,7 +1487,35 @@ function MemoryInspector({
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
-        {row.source_message_id && ['subject_private', 'window_private'].includes(row.visibility) ? (
+        {row.record_type === 'self_experience' && handlers.readActivitySource ? (
+          <>
+            <button type="button" className="mem-text-button" aria-expanded={Boolean(activitySource)}
+              disabled={sourcePending} onClick={() => void toggleSource()}>
+              {sourcePending ? '读取中…' : activitySource ? '收起活动依据' : '查看活动依据'}
+            </button>
+            {activitySource ? (
+              <blockquote data-testid="mem-activity-source">
+                <p>{activitySource.evidence}</p>
+                <dl className="mem-facts">
+                  <div><dt>活动</dt><dd><code>{activitySource.activity_id}</code></dd></div>
+                  {activitySource.completed_at ? (
+                    <div><dt>完成时间</dt><dd>{formatAbsoluteTime(activitySource.completed_at)}</dd></div>
+                  ) : null}
+                  {activitySource.desktop_receipt_id ? (
+                    <div><dt>桌面回执</dt><dd><code>{activitySource.desktop_receipt_id}</code></dd></div>
+                  ) : null}
+                  {activitySource.observations.map(observation => (
+                    <div key={observation.message_id}>
+                      <dt>发言时间</dt>
+                      <dd>{formatAbsoluteTime(observation.observed_at)} <code>{observation.message_id}</code></dd>
+                    </div>
+                  ))}
+                </dl>
+              </blockquote>
+            ) : null}
+            <InlineError error={sourceError} resource="list" />
+          </>
+        ) : row.source_message_id && ['subject_private', 'window_private'].includes(row.visibility) ? (
           <>
             <button type="button" className="mem-text-button" aria-expanded={Boolean(source)}
               disabled={sourcePending || pending} onClick={() => void toggleSource()}>
@@ -2697,6 +2733,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
           text: '纠正已保存。旧条目退出召回，可在历史记录中查看。',
         });
         await loadList();
+      readActivitySource: api.readMemoryActivitySource,
       },
       async saveCore(input, meta) {
         await api.upsertCoreMemory(input);

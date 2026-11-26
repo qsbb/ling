@@ -376,6 +376,24 @@ async def read_memory_source(memory_id: str, auth: CurrentAuth, session: DbSessi
 async def forget_memory_source(
     memory_id: str, auth: CurrentAuth, session: DbSession,
 ) -> dict:
+@router.get("/memory/{memory_id}/activity-source")
+async def read_memory_activity_source(
+    memory_id: str, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
+) -> dict:
+    from ling.domains.memory.purge import has_open_purge
+    from ling.domains.memory.self_timeline import SelfTimelineService
+
+    missing = LingError(ErrorCode.not_found, "活动依据不可用", status_code=404)
+    if await has_open_purge(session, subject_id=auth.user.subject_id):
+        raise missing
+    evidence = await SelfTimelineService(session, actor_id=settings.actor_id).library_source(
+        memory_id, allow_actor_private=auth.user.role == "owner",
+    )
+    if evidence is None:
+        raise missing
+    return evidence
+
+
     from ling.domains.memory.forget_source import forget_source
 
     if not await forget_source(session, subject_id=auth.user.subject_id, memory_id=memory_id):
@@ -600,8 +618,9 @@ async def list_places(auth: CurrentAuth, session: DbSession, settings: SettingsD
 @router.get("/activity")
 async def list_activity(auth: CurrentAuth, session: DbSession, settings: SettingsDep) -> dict:
     service = ActivityService(session, actor_id=_actor_id(settings))
-    current = await service.current()
-    history = await service.history(limit=10)
+    visibility = None if auth.user.role == "owner" else "public"
+    current = await service.current(visibility=visibility)
+    history = await service.history(limit=10, visibility=visibility)
     return {
         "current": _activity_dict(current) if current else None,
         "history": [_activity_dict(a) for a in history],
@@ -619,7 +638,7 @@ class ActivityTransition(BaseModel):
 async def transition_activity(
     activity_id: str,
     body: ActivityTransition,
-    auth: CurrentAuth,
+    auth: OwnerWrite,
     session: DbSession,
     settings: SettingsDep,
 ) -> dict:

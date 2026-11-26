@@ -61,6 +61,7 @@ import type {
   UpdateRequest,
   CoreMemoryInput,
   CoreMemoryListResponse,
+  MemoryActivitySource,
   MemoryInclude,
   MemoryImportCommit,
   MemoryImportPreview,
@@ -1494,6 +1495,10 @@ export const api = {
 
   readMemorySource(memoryId: string): Promise<{ text: string; created_at: string }> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/source`);
+  },
+
+  readMemoryActivitySource(memoryId: string): Promise<MemoryActivitySource> {
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/activity-source`);
   },
 
   forgetMemorySource(memoryId: string): Promise<{ memory_id: string; forgotten: boolean }> {
