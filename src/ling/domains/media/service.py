@@ -27,11 +27,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.consent.service import ConsentService, ConsentView
-from ling.infra.models import MediaEvidenceRow, Window, utcnow
+from ling.infra.models import ConsentRule, MediaEvidenceRow, Message, Turn, Window, utcnow
 from ling.infra.security import new_id
 
 # 入站媒体能否被描述，取决于这个授权。默认关闭。
@@ -42,6 +42,28 @@ KINDS = frozenset({"image", "audio", "video", "emoji"})
 # 描述来源。只有 human 的描述可以作为事实。
 ORIGIN_HUMAN = "human"
 ORIGIN_MODEL = "model_inference"
+
+
+def readable_media_evidence(*, now: datetime):
+    """Apply current consent and known source status before using a media description."""
+    source = MediaEvidenceRow.source_event_id
+    owner = select(Window.subject_id).where(
+        Window.id == MediaEvidenceRow.window_id,
+    ).correlate(MediaEvidenceRow).scalar_subquery()
+    grant = select(ConsentRule.id).where(
+        or_(ConsentRule.subject_id == MediaEvidenceRow.subject_id, ConsentRule.subject_id == owner),
+        ConsentRule.scope == INBOUND_SCOPE, ConsentRule.granted.is_(True),
+        or_(ConsentRule.valid_until.is_(None), ConsentRule.valid_until > now),
+        ConsentRule.revision == MediaEvidenceRow.consent_revision,
+    ).correlate(MediaEvidenceRow).exists()
+    hidden_source = select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
+        Message.window_id == MediaEvidenceRow.window_id, Message.role == "user",
+        Message.sender_subject_id == MediaEvidenceRow.subject_id,
+        or_(func.concat("message:", Message.id) == source, Turn.client_turn_id == source),
+        or_(Message.memory_hidden_at.is_not(None), Message.retracted_at.is_not(None)),
+    ).correlate(MediaEvidenceRow).exists()
+    return grant & ~hidden_source
+
 
 # 素材来源
 ORIGIN_UPLOAD = "user_upload"
@@ -203,7 +225,7 @@ class MediaEvidenceService:
                 continue
             seen.add(subject)
             consent = await service.get(subject, INBOUND_SCOPE)
-            if consent.granted:
+            if consent.granted and (consent.valid_until is None or consent.valid_until > utcnow()):
                 return consent
         return None
 
@@ -366,6 +388,8 @@ class MediaEvidenceService:
                         MediaEvidenceRow.actor_id == self._actor_id,
                         MediaEvidenceRow.window_id == window_id,
                         MediaEvidenceRow.description.is_not(None),
+                        or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
+                        readable_media_evidence(now=utcnow()),
                     )
                     .order_by(MediaEvidenceRow.created_at.desc())
                     .limit(limit)
@@ -392,6 +416,8 @@ class MediaEvidenceService:
                         MediaEvidenceRow.window_id == window_id,
                         MediaEvidenceRow.kind == "video",
                         MediaEvidenceRow.description.is_(None),
+                        or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
+                        readable_media_evidence(now=utcnow()),
                     )
                     .order_by(MediaEvidenceRow.created_at)
                     .limit(limit)
@@ -453,6 +479,7 @@ class MediaEvidenceService:
                     select(MediaEvidenceRow).where(
                         MediaEvidenceRow.actor_id == self._actor_id,
                         MediaEvidenceRow.window_id == window_id,
+                        readable_media_evidence(now=utcnow()),
                     )
                 )
             )

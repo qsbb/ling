@@ -102,7 +102,7 @@ class AudienceSnapshot:
         source = MemoryRow.source_visibility
         eligible = source.in_(self._allowed_sources())
         if not self.is_group:
-            return eligible
+            return eligible & or_(source != "window_private", MemoryRow.source_window_id == self.window_id)
         return eligible & or_(
             source != "group_scope",
             (MemoryRow.source_window_id == self.window_id)
@@ -134,7 +134,7 @@ class AudienceSnapshot:
         - 其他来源（私聊/窗口级）：只在私聊窗口可用；群聊里绝不出现
         """
         return source_visibility in self._allowed_sources() and (
-            source_visibility != "group_scope" or source_window_id == self.window_id
+            source_visibility not in {"group_scope", "window_private"} or source_window_id == self.window_id
         )
 
     def _allowed_sources(self) -> set[str]:
