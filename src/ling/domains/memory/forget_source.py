@@ -120,9 +120,12 @@ async def forget_from_conversation(
     if len(matches) != 1:
         return None
     source = matches[0]
+    source_turn = source.turn_id
+    if source_turn is None:
+        return None
     await apply_source_forget(
         session, subject_id=subject_id, message_id=source.id,
-        window_id=window_id, turn_id=source.turn_id, forgotten_at=now,
+        window_id=window_id, turn_id=source_turn, forgotten_at=now,
     )
     return source.id
 
@@ -136,7 +139,10 @@ async def forget_source(
         MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id,
     ))
     if target is not None and target.import_key:
-        await lock_archive_account(session, target.import_source["owner_qq"])
+        owner_qq = (target.import_source or {}).get("owner_qq")
+        if not isinstance(owner_qq, str) or not owner_qq:
+            return False
+        await lock_archive_account(session, owner_qq)
         if await session.scalar(select(MemoryRow.id).where(
             MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id, active_source(MemoryRow),
         )) is None:
@@ -174,7 +180,7 @@ async def forget_source(
         return True
     if not record.source_message_id:
         return False
-    window_id = target.source_window_id if target else episode.window_id
+    window_id = record.source_window_id if isinstance(record, MemoryRow) else record.window_id
     source = await session.get(Message, record.source_message_id, with_for_update=True)
     if (
         source is None or source.role != "user" or source.window_id != window_id

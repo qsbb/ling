@@ -113,7 +113,7 @@ def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
 
 def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement[bool]:
     """A linked source must still belong to its original window and be available."""
-    window_id = model.source_window_id if model is MemoryRow else model.window_id
+    window_id = model.source_window_id if issubclass(model, MemoryRow) else model.window_id
     active = select(Message.id).where(
         Message.id == model.source_message_id,
         Message.window_id == window_id,
@@ -185,14 +185,13 @@ async def store_embeddings(
     )
     purging = await open_purge_subjects(session, subject_ids=owners)
     eligible: set[str] = set()
-    for model in (MemoryRow, MemoryEpisode):
+    for model, content in ((MemoryRow, MemoryRow.text), (MemoryEpisode, MemoryEpisode.summary)):
         candidates = {
             row.id: row.text if isinstance(row, MemoryRow) else row.summary
             for row in rows if isinstance(row, model) and row.subject_id not in purging
         }
         if not candidates:
             continue
-        content = model.text if model is MemoryRow else model.summary
         query = select(model.id, content).where(
             model.id.in_(candidates), model.archived_at.is_(None), active_source(model),
         )
@@ -1010,7 +1009,7 @@ class MemoryService:
                 query_text = query.casefold()
                 query_terms = _topic_tokens(query)
                 procedure_matches = {
-                    row.id for row in procedures if (title := titles.get(row.value)) and (
+                    row.id for row in procedures if row.value is not None and (title := titles.get(row.value)) and (
                         title.casefold() in query_text or len(_topic_tokens(title) & query_terms) >= 2
                     )
                 }
@@ -1326,6 +1325,7 @@ class MemoryService:
             return []
 
         now = utcnow()
+        assertion: MemoryRow | None = None
         if hit.kind == "episode":
             episode = await self._session.get(MemoryEpisode, hit.memory_id)
             if (
@@ -1355,7 +1355,7 @@ class MemoryService:
         if turn is None or turn.window_id != window.id or turn.state != TurnState.completed.value:
             return []
         speakers = [Message.role == "user"]
-        if hit.kind == "impression":
+        if hit.kind == "impression" and assertion is not None:
             speakers = [and_(Message.id == assertion.value, completed_actor_message())]
         elif hit.kind == "episode":
             speakers.append((Message.role == "actor") & (Message.attempt == turn.attempt))

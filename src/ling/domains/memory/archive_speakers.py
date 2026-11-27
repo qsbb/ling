@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Generator
 from typing import BinaryIO
 
 from sqlalchemy import Boolean, Column, MetaData, String, Table, and_, not_, or_
@@ -26,7 +26,7 @@ _QQ = re.compile(r"[1-9][0-9]{4,19}")
 
 def timeline_sources(
     file: BinaryIO, *, bot_qq: str, owner_qq: str, include_group: bool, max_record_bytes: int,
-) -> Iterator[dict[str, str | None]]:
+) -> Generator[dict[str, str | None], None, None]:
     """Stream source IDs and minimal attribution. The original body is never indexed."""
     start = file.tell()
     try:
@@ -50,7 +50,7 @@ def timeline_sources(
             scope, source_session = data.get("scope"), data.get("session_id")
             meta = data.get("metadata")
             account = data.get("subject_id")
-            valid = (
+            if not (
                 data.get("event_type") == "user_message"
                 and isinstance(meta, dict)
                 and isinstance(account, str) and bool(_QQ.fullmatch(account))
@@ -61,8 +61,7 @@ def timeline_sources(
                 and meta.get("source_state") in (None, "current")
                 and data.get("source_state") in (None, "current")
                 and not any(meta.get(key) or data.get(key) for key in ("retracted_at", "forgotten_at", "deleted_at"))
-            )
-            if not valid:
+            ):
                 yield dict(id=ref, scope=None, session_id=None, platform=None, account=None, label=None)
                 continue
             peer = source_session.rsplit(":", 1)[-1]

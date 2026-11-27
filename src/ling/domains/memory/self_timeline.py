@@ -22,8 +22,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.evidence import (
@@ -234,7 +235,7 @@ class SelfTimelineService:
             DesktopTaskRow.step == "verified",
             DesktopTaskRow.source == "life",
         ).exists()
-        visible_activity = ActivityRow.visibility.in_(allowed)
+        visible_activity: ColumnElement[bool] = ActivityRow.visibility.in_(allowed)
         if allow_actor_private:
             # Older desktop receipts inherited the activity default. Recover
             # only the actor's own verified life task with a matching receipt.
@@ -296,7 +297,7 @@ class SelfTimelineService:
             return None
         _, activity = records[0]
         _, evidence = parse_completion_evidence(activity.completion_evidence)
-        source = {
+        source: dict[str, Any] = {
             "activity_id": activity.id,
             "evidence": evidence,
             "evidence_kind": activity_evidence_kind(activity).value,

@@ -64,8 +64,8 @@ async def replay_forgetting(session: AsyncSession, state: ForgetState) -> None:
             continue
         await apply_source_forget(session, **marker.model_dump())
 
-    for marker in state.imports:
-        await apply_import_forget(session, **marker.model_dump())
+    for imported in state.imports:
+        await apply_import_forget(session, **imported.model_dump())
 
 
 async def _run(state: ForgetState) -> None:

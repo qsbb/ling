@@ -225,18 +225,18 @@ async def read_library(
         records = await SelfTimelineService(session, actor_id=actor_id).library_records(
             allow_actor_private=allow_actor_private,
         )
-        terms = normalize("NFKC", query).casefold().split()
-        matches = [
+        self_terms = normalize("NFKC", query).casefold().split()
+        self_matches = [
             (row, activity) for row, activity in records
-            if all(term in normalize("NFKC", row.summary).casefold() for term in terms)
+            if all(term in normalize("NFKC", row.summary).casefold() for term in self_terms)
         ]
         return {
             **result,
-            "total": len(matches),
-            "has_more": len(matches) > offset + limit,
+            "total": len(self_matches),
+            "has_more": len(self_matches) > offset + limit,
             "memories": [
                 _self_experience_record(row, activity)
-                for row, activity in matches[offset:offset + limit]
+                for row, activity in self_matches[offset:offset + limit]
             ],
         }
 

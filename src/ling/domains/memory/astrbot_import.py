@@ -11,10 +11,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
-from typing import Annotated, BinaryIO, Literal
+from typing import Annotated, Any, BinaryIO, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import Column, MetaData, String, Table, any_, bindparam, func, select
+from sqlalchemy import Column, MetaData, Row, String, Table, any_, bindparam, func, select
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
@@ -531,10 +531,11 @@ async def process_archive(
         if not candidates:
             continue
         # Account splits keep the memory ID but change its owning subject.
-        existing = (await session.execute(select(MemoryRow.import_key, MemoryRow.id).where(
+        existing_rows = (await session.execute(select(MemoryRow.import_key, MemoryRow.id).where(
             MemoryRow.subject_id == target.destination.subject_id, MemoryRow.import_key.in_(keys),
-        ).order_by(MemoryRow.id.desc()))).all()
-        for source_key, existing_id in dict(existing).items():
+        ).order_by(MemoryRow.id.desc()))).tuples().all()
+        existing_by_key = {key: row_id for key, row_id in existing_rows if key is not None}
+        for source_key, existing_id in existing_by_key.items():
             incoming_id = keys[source_key]
             if existing_id != incoming_id and incoming_id in candidates:
                 candidates[existing_id] = candidates.pop(incoming_id)
@@ -654,7 +655,7 @@ async def _speaker_links(
             timeline.id == any_(params), timeline.ambiguous.is_(False), timeline.account.is_not(None),
         ))).all()
     }
-    links = {}
+    links: dict[tuple[str, str], Row[Any]] = {}
     for mid, record in summaries.items():
         for ref in record.source_event_ids:
             observation = evidence.get(ref)
@@ -678,9 +679,10 @@ async def _speaker_links(
             {"id": new_id("ent"), "subject_id": owner, "source_key": key, "kind": "person", "name": ""}
             for key in keys
         ])
-    entity_ids = dict((await session.execute(select(EntityRow.source_key, EntityRow.id).where(
+    entity_rows = (await session.execute(select(EntityRow.source_key, EntityRow.id).where(
         EntityRow.subject_id == owner, EntityRow.source_key == any_(bindparam("keys", keys, type_=ARRAY(String))),
-    ))).all())
+    ))).tuples().all()
+    entity_ids = {key: entity_id for key, entity_id in entity_rows if key is not None}
     if write:
         stmt = insert(MemoryEntityRow).on_conflict_do_nothing().returning(MemoryEntityRow.memory_id)
         created = await session.scalars(stmt, [
@@ -689,10 +691,11 @@ async def _speaker_links(
             for (mid, key), observation in links.items()
         ])
         return len(list(created))
-    existing_links = set((await session.execute(select(MemoryEntityRow.memory_id, MemoryEntityRow.entity_id).where(
+    joined_links = (await session.execute(select(MemoryEntityRow.memory_id, MemoryEntityRow.entity_id).where(
         MemoryEntityRow.memory_id.in_(summaries), MemoryEntityRow.record_type == "memory",
         MemoryEntityRow.entity_id == any_(bindparam("entity_ids", list(entity_ids.values()), type_=ARRAY(String))),
-    ))).all())
+    ))).tuples().all()
+    existing_links = {(memory_id, entity_id) for memory_id, entity_id in joined_links}
     return sum((mid, entity_ids.get(key)) not in existing_links for mid, key in links)
 
 

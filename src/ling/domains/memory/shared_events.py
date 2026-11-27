@@ -90,6 +90,7 @@ async def record_contribution(
         return
     if await open_purge_subjects(session, subject_ids=[subject_id]):
         return
+    arrangement: SharedArrangement | None
     if contribution.action == "proposed":
         arrangement = SharedArrangement(id=message_id, window_id=source.window_id, created_at=source.created_at)
         session.add(arrangement)

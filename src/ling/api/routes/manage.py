@@ -413,7 +413,7 @@ async def read_memory_source(
         raise missing
     if record.source_visibility not in {"subject_private", "window_private"}:
         raise missing
-    window_id = assertion.source_window_id if assertion else episode.window_id
+    window_id = record.source_window_id if isinstance(record, MemoryRow) else record.window_id
     source = await session.get(Message, record.source_message_id)
     if (
         source is None or source.window_id != window_id or source.role != "user"

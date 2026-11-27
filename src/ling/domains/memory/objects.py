@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,7 +61,7 @@ async def list_memory_objects(
     rows = (await session.execute(
         select(
             EntityRow.id, EntityRow.name, EntityRow.kind, EntityRow.aliases, speaker_labels,
-            linked_records.label("count"), func.max(records.c.created_at).label("last_recorded_at"),
+            linked_records.label("record_count"), func.max(records.c.created_at).label("last_recorded_at"),
         )
         .select_from(EntityRow)
         .join(MemoryEntityRow, MemoryEntityRow.entity_id == EntityRow.id)
@@ -79,7 +81,7 @@ async def list_memory_objects(
             "name": labels[0] if labels else row.name,
             "kind": row.kind,
             "aliases": labels[1:] if labels else row.aliases or [],
-            "count": int(row.count),
+            "count": int(row.record_count),
             "last_recorded_at": row.last_recorded_at.isoformat(),
         })
     self_records = await SelfTimelineService(session, actor_id=actor_id).library_records(
@@ -126,6 +128,7 @@ async def annotate_memory_object(
             raise ObjectAnnotationError("literal_required")
 
     entities = EntityService(session)
+    entity: EntityRow | None
     if object_id is None:
         entity = await entities.evidence_label(
             subject_id=subject_id, memory_id=memory_id, record_type=record_type, name=name, kind=kind,
@@ -143,7 +146,7 @@ async def annotate_memory_object(
             (MemoryEpisode, "experience", MemoryEpisode.window_id),
         ):
             related = _usable_records(model, subject_id).where(
-                model.id.in_(linked_record_ids(subject_id, object_id, linked_type)),
+                model.id.in_(linked_record_ids(subject_id, object_id, cast(RecordType, linked_type))),
                 model.visibility == record.visibility, model.source_visibility == record.source_visibility,
             )
             if record.source_visibility in {"group_scope", "window_private"}:

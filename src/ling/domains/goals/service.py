@@ -9,10 +9,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import ColumnElement, delete, func, or_, select
+from sqlalchemy import ColumnElement, SQLColumnExpression, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import not_found
@@ -39,7 +39,7 @@ def conversation_commitment() -> ColumnElement[bool]:
     return func.coalesce(CommitmentRow.source_event_ids[0].as_string().startswith("message:"), False)
 
 
-def _after_latest_memory_forget(subject_id: str | ColumnElement[str]) -> ColumnElement[bool]:
+def _after_latest_memory_forget(subject_id: str | SQLColumnExpression[str]) -> ColumnElement[bool]:
     forgotten = select(MemoryPurgeTombstone.id).where(
         MemoryPurgeTombstone.subject_id == subject_id,
         MemoryPurgeTombstone.requested_at >= Message.created_at,
@@ -81,6 +81,7 @@ COMMITMENT_MEMORY_STATUS = {
 
 
 def commitment_due_local(row: CommitmentRow) -> datetime:
+    zone: tzinfo
     try:
         zone = ZoneInfo(row.timezone)
     except (ValueError, ZoneInfoNotFoundError):

@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy import ColumnElement, SQLColumnExpression, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import KnowledgeItem
@@ -26,7 +26,7 @@ DEFAULT_TTL_HOURS = 24
 PROCEDURE_SOURCE_SLOT = "knowledge_procedure"
 
 
-def knowledge_visible_to(subject_id: str | ColumnElement[str] | None) -> ColumnElement[bool]:
+def knowledge_visible_to(subject_id: str | SQLColumnExpression[str] | None) -> ColumnElement[bool]:
     from ling.domains.memory.purge import open_purge_exists
 
     # Ownerless sourced records retain the legacy shared knowledge scope.
@@ -45,7 +45,7 @@ def current_knowledge(now: datetime) -> ColumnElement[bool]:
 
 
 def procedure_source_available(
-    subject_id: str | ColumnElement[str], now: datetime,
+    subject_id: str | SQLColumnExpression[str], now: datetime,
 ) -> ColumnElement[bool]:
     return (
         knowledge_visible_to(subject_id) & current_knowledge(now)
