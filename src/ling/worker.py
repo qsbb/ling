@@ -472,7 +472,8 @@ async def handle_memory_extract(payload: dict) -> None:
     from sqlalchemy import and_, or_, select
 
     from ling.contracts.v1 import Origin, Visibility
-    from ling.domains.memory.service import MemoryService
+    from ling.domains.conversation.service import completed_actor_message
+    from ling.domains.memory.service import ACTOR_IMPRESSION_SLOT, MemoryService
     from ling.infra.models import Message, Subject, Turn, Window
 
     subject_id = payload.get("subject_id")
@@ -562,6 +563,7 @@ async def handle_memory_extract(payload: dict) -> None:
             MAX_CANDIDATES,
             Candidate,
             ObjectMention,
+            expressed_impression,
             fact_operation,
             gate,
         )
@@ -610,6 +612,27 @@ async def handle_memory_extract(payload: dict) -> None:
                     await EntityService(session).index_episode(
                         episode, source_text=source_text, window=window, mentions=mentions[:MAX_CANDIDATES],
                     )
+
+        if source is not None and not is_group and source_visibility in {"subject_private", "window_private"}:
+            replies = list(await session.scalars(select(Message).where(
+                Message.turn_id == turn_id, Message.window_id == window_id, completed_actor_message(),
+            ).limit(2).with_for_update()))
+            if len(replies) == 1 and (impression := expressed_impression(replies[0].text)) is not None:
+                reply = replies[0]
+                await service.propose(
+                    MemoryProposal(
+                        proposal_id=f"auto:{turn_id}:{ACTOR_IMPRESSION_SLOT}",
+                        kind="episode",
+                        text=impression,
+                        origin=Origin.external_observation,
+                        source_event_ids=[*source_ids, f"message:{reply.id}"],
+                        visibility=Visibility.window_private,
+                        confidence=1.0,
+                    ),
+                    subject_id=subject_id, source_window_id=window_id, source_visibility="window_private",
+                    source_account=payload.get("source_account"), source_message_id=source.id,
+                    turn_id=turn_id, slot=ACTOR_IMPRESSION_SLOT, value=reply.id, occurred_at=reply.created_at,
+                )
 
         gated = gate(
             [item for item in candidates if isinstance(item, Candidate)],

@@ -21,10 +21,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
-from sqlalchemy import ColumnElement, case, delete, func, literal, or_, select, update
+from sqlalchemy import ColumnElement, and_, case, delete, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
+from ling.domains.conversation.service import completed_actor_message
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, procedure_source_available
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
@@ -48,6 +49,7 @@ from ling.ports.config import EffectiveConfig, MemoryPolicy
 logger = logging.getLogger("ling.domains.memory")
 
 MAX_RETENTION_DAYS = 3650
+ACTOR_IMPRESSION_SLOT = "actor_impression"
 
 # "没有重排模型 → rerank_top_n 不生效"这句话每个进程只喊一次
 # （MemoryService 每轮都会构造，不限次会被这句日志淹没）。
@@ -78,9 +80,14 @@ class RecallResult:
 
 
 def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
+    kind = row.kind
+    if row.slot == ACTOR_IMPRESSION_SLOT:
+        kind = "impression"
+    elif kind == "procedure" and row.slot != PROCEDURE_SOURCE_SLOT:
+        kind = "procedure_note"
     return MemoryHit(
         memory_id=row.id,
-        kind="procedure_note" if row.kind == "procedure" and row.slot != PROCEDURE_SOURCE_SLOT else row.kind,
+        kind=kind,
         text=row.text,
         origin=Origin(row.origin),
         visibility=Visibility(row.visibility),
@@ -88,7 +95,7 @@ def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
         source_event_ids=list(row.source_event_ids or []),
         score=round(score, 6),
         valid_until=row.valid_until,
-        turn_id=row.turn_id if row.origin == Origin.user_statement.value else None,
+        turn_id=row.turn_id if row.origin == Origin.user_statement.value or kind == "impression" else None,
         source_window_id=row.source_window_id,
         fact_slot=row.slot if row.source_message_id else None,
     )
@@ -106,6 +113,16 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
     ).exists()
     eligible = or_(model.source_message_id.is_(None), active)
     if model is MemoryRow:
+        original_reply = select(Message.id).where(
+            Message.id == MemoryRow.value,
+            Message.window_id == MemoryRow.source_window_id,
+            Message.turn_id == MemoryRow.turn_id,
+            completed_actor_message(),
+        ).correlate(MemoryRow).exists()
+        eligible = eligible & or_(
+            MemoryRow.slot.is_distinct_from(ACTOR_IMPRESSION_SLOT),
+            and_(MemoryRow.source_message_id.is_not(None), original_reply),
+        )
         current_document = select(KnowledgeItem.id).where(
             KnowledgeItem.id == MemoryRow.value,
             KnowledgeItem.claim == MemoryRow.text,
@@ -1258,7 +1275,10 @@ class MemoryService:
                 or assertion.turn_id != hit.turn_id or assertion.source_window_id != window.id
                 or assertion.retracted or assertion.archived_at is not None
                 or self._retention_expired(assertion, now) or not audience.memory_row_visible(assertion)
-                or assertion.origin != Origin.user_statement.value
+                or (
+                    assertion.origin != Origin.user_statement.value
+                    and assertion.slot != ACTOR_IMPRESSION_SLOT
+                )
                 or f"turn:{hit.turn_id}" not in (assertion.source_event_ids or [])
             ):
                 return []
@@ -1267,7 +1287,9 @@ class MemoryService:
         if turn is None or turn.window_id != window.id or turn.state != TurnState.completed.value:
             return []
         speakers = [Message.role == "user"]
-        if hit.kind == "episode":
+        if hit.kind == "impression":
+            speakers = [and_(Message.id == assertion.value, completed_actor_message())]
+        elif hit.kind == "episode":
             speakers.append((Message.role == "actor") & (Message.attempt == turn.attempt))
         stmt = select(Message).where(
             Message.window_id == window.id,
@@ -1332,7 +1354,7 @@ class MemoryService:
         old = await self._session.scalar(select(MemoryRow).where(
             MemoryRow.id == old_id, MemoryRow.subject_id == anchor.subject_id, active_source(MemoryRow),
         ).with_for_update().execution_options(populate_existing=True))
-        if old is None or old.retracted or old.slot == PROCEDURE_SOURCE_SLOT:
+        if old is None or old.retracted or old.slot in {PROCEDURE_SOURCE_SLOT, ACTOR_IMPRESSION_SLOT}:
             return None
         new_id_value = new_id("mem")
         new_row = MemoryRow(
@@ -2085,7 +2107,7 @@ def _is_historical(hit: object) -> bool:
 def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
     """Give the character context, with only the distinctions that change its use."""
     groups: dict[str, list] = {
-        "mention": [], "episode": [], "procedure": [], "procedure_note": [],
+        "mention": [], "episode": [], "procedure": [], "procedure_note": [], "impression": [],
         "tone": [], "uncertain": [], "history": [], "shared": [],
     }
     for hit in hits:
@@ -2095,7 +2117,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
             groups["shared"].append(hit)
         elif _is_historical(hit):
             groups["history"].append(hit)
-        elif getattr(hit, "kind", None) in {"procedure", "procedure_note"}:
+        elif getattr(hit, "kind", None) in {"procedure", "procedure_note", "impression"}:
             groups[hit.kind].append(hit)
         elif getattr(hit, "kind", None) == "episode" and hit.origin != Origin.model_inference:
             groups["episode"].append(hit)
@@ -2109,6 +2131,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
         "episode": "曾经聊过的话（按署名理解）",
         "procedure": "有资料依据的做法",
         "procedure_note": "记录的做法（执行情况未知）",
+        "impression": "你当时表达的感受（主观感受）",
         "tone": "熟悉的线索（可以影响回应方式）",
         "uncertain": "模糊的印象（有需要再确认）",
         "history": "以前的情况（不代表现在）",

@@ -15,7 +15,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from sqlalchemy import Table, and_, bindparam, delete, func, literal, or_, select, text
+from sqlalchemy import (
+    ColumnElement,
+    Table,
+    and_,
+    bindparam,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found
@@ -89,6 +100,24 @@ def visible_to_model():
     return Message.memory_hidden_at.is_(None) & or_(
         Message.retracted_at.is_(None),
         Message.retracted_after_seen.is_(True),
+    )
+
+
+def completed_actor_message() -> ColumnElement[bool]:
+    # Use the retained final reply from the completed attempt.
+    current_attempt = select(Turn.id).where(
+        Turn.id == Message.turn_id,
+        Turn.window_id == Message.window_id,
+        Turn.attempt == Message.attempt,
+        Turn.state == TurnState.completed.value,
+    ).correlate(Message).exists()
+    return and_(
+        Message.role == "actor",
+        Message.state == TurnState.completed.value,
+        Message.memory_hidden_at.is_(None),
+        Message.retracted_at.is_(None),
+        Message.recalled_at.is_(None),
+        current_attempt,
     )
 
 

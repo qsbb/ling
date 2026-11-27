@@ -36,12 +36,12 @@ from ling.contracts.v1 import (
 from ling.domains.activity.service import ActivityService, InvalidTransition
 from ling.domains.affect.service import AffectService
 from ling.domains.consent.service import KNOWN_SCOPES, ConsentService
-from ling.domains.conversation.service import ConversationService
+from ling.domains.conversation.service import ConversationService, completed_actor_message
 from ling.domains.goals.service import GoalsService
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, KnowledgeService
 from ling.domains.memory.entities import ObjectKind
 from ling.domains.memory.library import LibraryKind, memory_record, read_library
-from ling.domains.memory.service import MemoryService
+from ling.domains.memory.service import ACTOR_IMPRESSION_SLOT, MemoryService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
 from ling.domains.world.service import WorldService
@@ -398,6 +398,16 @@ async def read_memory_source(memory_id: str, auth: CurrentAuth, session: DbSessi
         or window.visibility not in {"subject_private", "window_private"}
     ):
         raise missing
+    if assertion is not None and assertion.slot == ACTOR_IMPRESSION_SLOT:
+        if assertion.retracted or assertion.archived_at is not None:
+            raise missing
+        reply = await session.scalar(select(Message).where(
+            Message.id == assertion.value, Message.window_id == window.id,
+            Message.turn_id == source.turn_id, completed_actor_message(),
+        ))
+        if reply is None:
+            raise missing
+        source = reply
     return {
         "message_id": source.id, "window_id": window.id,
         "created_at": source.created_at.isoformat(), "text": source.text,

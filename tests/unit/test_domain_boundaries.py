@@ -174,6 +174,9 @@ ALLOWED: dict[tuple[str, str], str] = {
         "同一个人时，问 A 也该想起 B 说过的话。账号合并是 identity 域的权威"
         "关系，记忆行本身不搬动（那是有损操作），只读组内 subject_id 集合。"
     ),
+    ("memory/service.py", "ling.domains.conversation.service"): (
+        "角色感受引用对话域中的已完成回复，读取时核对当前轮次与撤回状态。"
+    ),
     ("memory/service.py", "ling.domains.knowledge.service"): (
         "做法检索复用知识域对资料归属和时效的判据。"
     ),

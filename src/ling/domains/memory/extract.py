@@ -395,6 +395,23 @@ def fallback_candidates(user_text: str) -> list[Candidate]:
     return out
 
 
+_ACTOR_IMPRESSION = re.compile(
+    r"(?:^|[，,])\s*我(?:当时|刚才|现在|在这里|在这边)?"
+    r"(?:觉得|感到|感觉|有(?:一点|点|些)|很|挺)"
+)
+
+
+def expressed_impression(text: str) -> str | None:
+    # Keep one literal first-person reflection from the delivered reply.
+    if any(char in text for char in '「」『』“”"'):
+        return None
+    for part in re.split(r"(?<=[。！？!?])|\n+", text):
+        sentence = part.strip()
+        if 4 <= len(sentence) <= 240 and not sentence.endswith(("?", "？")) and _ACTOR_IMPRESSION.search(sentence):
+            return sentence
+    return None
+
+
 __all__ = [
     "ALLOWED_SLOTS",
     "Candidate",

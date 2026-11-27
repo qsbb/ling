@@ -17,7 +17,7 @@ from ling.domains.knowledge.service import (
 from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.self_timeline import SelfTimelineService
-from ling.domains.memory.service import active_source
+from ling.domains.memory.service import ACTOR_IMPRESSION_SLOT, active_source
 from ling.infra.models import (
     ActivityRow,
     CoreMemoryRow,
@@ -31,7 +31,7 @@ from ling.infra.models import (
     utcnow,
 )
 
-LibraryKind = Literal["episode", "assertion", "procedure", "knowledge"]
+LibraryKind = Literal["episode", "assertion", "procedure", "knowledge", "impression"]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -39,9 +39,10 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def memory_record(row: MemoryRow) -> dict[str, Any]:
+    impression = row.slot == ACTOR_IMPRESSION_SLOT
     return {
         "memory_id": row.id,
-        "kind": row.kind,
+        "kind": "impression" if impression else row.kind,
         "text": row.text,
         "origin": row.origin,
         "visibility": row.visibility,
@@ -55,10 +56,14 @@ def memory_record(row: MemoryRow) -> dict[str, Any]:
         "created_at": _iso(row.created_at),
         "archived_at": _iso(row.archived_at),
         **({
-            "source_message_id": row.source_message_id,
+            "source_message_id": row.value if impression else row.source_message_id,
             "source_window_id": row.source_window_id,
             "source_account": row.source_account,
-            "source_role": "user_correction" if row.supersedes and not row.turn_id else "self_report",
+            "source_role": (
+                "actor_impression" if impression else
+                "user_correction" if row.supersedes and not row.turn_id else "self_report"
+            ),
+            **({"observed_at": _iso(row.valid_from)} if impression else {}),
             "valid_from": _iso(row.valid_from),
         } if row.source_message_id is not None else {}),
         **({"import_source": row.import_source} if row.import_source is not None else {}),
@@ -216,9 +221,13 @@ async def read_library(
         )
 
     queries = []
-    if kind in {None, "episode", "assertion", "procedure"}:
-        if kind:
-            memory_query = memory_query.where(MemoryRow.kind == kind)
+    if kind in {None, "episode", "assertion", "procedure", "impression"}:
+        if kind == "impression":
+            memory_query = memory_query.where(MemoryRow.slot == ACTOR_IMPRESSION_SLOT)
+        elif kind:
+            memory_query = memory_query.where(
+                MemoryRow.kind == kind, MemoryRow.slot.is_distinct_from(ACTOR_IMPRESSION_SLOT),
+            )
         queries.append(memory_query.with_only_columns(
             MemoryRow.id, MemoryRow.created_at, literal("memory").label("record_type"),
         ))
@@ -284,7 +293,7 @@ async def read_library(
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
                 "source_visibility": memory.source_visibility,
                 **({"pinned": True} if memory.id in pins else {}),
-                **({"can_correct": False} if memory.slot == PROCEDURE_SOURCE_SLOT else {}),
+                **({"can_correct": False} if memory.slot in {PROCEDURE_SOURCE_SLOT, ACTOR_IMPRESSION_SLOT} else {}),
                 **({"archive_speakers": speakers[memory.id]} if memory.id in speakers else {}),
             })
         elif episode is not None:
