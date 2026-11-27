@@ -110,7 +110,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy import ColumnElement, SQLColumnExpression, delete, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from ling.infra.models import (
@@ -147,6 +147,7 @@ PURGEABLE_TOPICS: frozenset[str] = frozenset(
 
 #: 墓碑状态机。`pending → running → done | failed`，终态不可再转移。
 PURGE_STATES: tuple[str, ...] = ("pending", "running", "done", "failed")
+OPEN_PURGE_STATES = ("pending", "running", "failed")
 
 
 @dataclass(frozen=True)
@@ -772,7 +773,7 @@ async def pending_tombstones(session: AsyncSession, *, limit: int = 20) -> list[
     rows = (
         await session.execute(
             select(MemoryPurgeTombstone.id)
-            .where(MemoryPurgeTombstone.state.in_(("pending", "running", "failed")))
+            .where(MemoryPurgeTombstone.state.in_(OPEN_PURGE_STATES))
             .order_by(MemoryPurgeTombstone.requested_at)
             .limit(limit)
         )
@@ -801,17 +802,17 @@ async def pending_tombstones(session: AsyncSession, *, limit: int = 20) -> list[
 # 等于用一次清理失败换一次泄漏。宁可多黑一段时间。
 
 
+def open_purge_exists(subject_id: str | SQLColumnExpression[str | None]) -> ColumnElement[bool]:
+    """检查指定主体，或按候选来源主体关联未完成的墓碑。"""
+    return select(MemoryPurgeTombstone.id).where(
+        MemoryPurgeTombstone.subject_id == subject_id,
+        MemoryPurgeTombstone.state.in_(OPEN_PURGE_STATES),
+    ).correlate_except(MemoryPurgeTombstone).exists()
+
+
 async def has_open_purge(session: AsyncSession, *, subject_id: str) -> bool:
-    """该主体是否有**未清理完**的墓碑（有就一律不返回任何记忆）。"""
-    count = await session.scalar(
-        select(func.count())
-        .select_from(MemoryPurgeTombstone)
-        .where(
-            MemoryPurgeTombstone.subject_id == subject_id,
-            MemoryPurgeTombstone.state.in_(("pending", "running", "failed")),
-        )
-    )
-    return bool(count)
+    """该主体是否有未清理完的墓碑。"""
+    return bool(await session.scalar(select(open_purge_exists(subject_id))))
 
 
 async def open_purge_subjects(
@@ -825,7 +826,7 @@ async def open_purge_subjects(
             select(MemoryPurgeTombstone.subject_id)
             .where(
                 MemoryPurgeTombstone.subject_id.in_(subject_ids),
-                MemoryPurgeTombstone.state.in_(("pending", "running", "failed")),
+                MemoryPurgeTombstone.state.in_(OPEN_PURGE_STATES),
             )
             .distinct()
         )
@@ -852,6 +853,7 @@ __all__ = [
     "current_generation",
     "guard_write",
     "has_open_purge",
+    "open_purge_exists",
     "list_tombstones",
     "now_utc",
     "open_purge_subjects",

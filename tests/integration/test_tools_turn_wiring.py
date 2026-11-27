@@ -714,6 +714,53 @@ async def test_web_knowledge_search_returns_current_scoped_results(
     )
 
 
+async def test_pending_purge_hides_private_knowledge_from_prompt_tool_and_list(
+    logged_in: TestEnv, endpoint: _ToolEndpoint,
+) -> None:
+    private_claim = "私有目录标记 P-803。"
+    public_claim = "公共目录标记 C-404。"
+    public_id = await _add_knowledge(public_claim)
+    body = {"topic": "orchidcatalog", "claim": private_claim, "source_kind": "user_statement"}
+    client = logged_in.client
+    created = await client.post("/v1/knowledge", json=body)
+    assert created.status_code == 200, created.text
+    private_id = created.json()["item_id"]
+    endpoint.tool_name = "knowledge_search"
+    endpoint.arguments = {"query": "orchidcatalog"}
+    await _bind_model(logged_in, enabled=True)
+
+    async def visible_knowledge() -> tuple[set[str], set[str], set[str]]:
+        endpoint.requests.clear()
+        assert await _web_reply(logged_in, text="请帮我核对 orchidcatalog 的馆藏说明。")
+        payload = _tool_payload(endpoint)
+        prompt = json.dumps(endpoint.requests[0]["messages"], ensure_ascii=False)
+        claims = {claim for claim in (private_claim, public_claim) if claim in prompt}
+        tool_ids = {item["item_id"] for item in json.loads(payload["data"])["items"]}
+        listed = await client.get("/v1/knowledge")
+        assert listed.status_code == 200, listed.text
+        return claims, tool_ids, {item["item_id"] for item in listed.json()["items"]}
+
+    assert await visible_knowledge() == (
+        {private_claim, public_claim}, {private_id, public_id}, {private_id, public_id},
+    )
+    forgotten = await client.post("/v1/memory/forget")
+    assert forgotten.status_code == 200 and forgotten.json()["state"] == "pending"
+    async with session_scope() as session:
+        assert await session.get(KnowledgeItem, private_id) is not None
+    assert await visible_knowledge() == ({public_claim}, {public_id}, {public_id})
+
+    await worker.handle_memory_purge({"tombstone_id": forgotten.json()["tombstone_id"]})
+    async with session_scope() as session:
+        assert await session.get(KnowledgeItem, private_id) is None
+    new = await client.post("/v1/knowledge", json=body)
+    assert new.status_code == 200, new.text
+    new_id = new.json()["item_id"]
+    assert new_id != private_id
+    assert await visible_knowledge() == (
+        {private_claim, public_claim}, {new_id, public_id}, {new_id, public_id},
+    )
+
+
 @pytest.mark.parametrize("same_window", [True, False])
 async def test_web_memory_source_is_bound_to_visible_history(
     logged_in: TestEnv, endpoint: _ToolEndpoint, same_window: bool,

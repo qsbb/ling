@@ -27,12 +27,17 @@ PROCEDURE_SOURCE_SLOT = "knowledge_procedure"
 
 
 def knowledge_visible_to(subject_id: str | ColumnElement[str] | None) -> ColumnElement[bool]:
+    from ling.domains.memory.purge import open_purge_exists
+
     # Ownerless sourced records retain the legacy shared knowledge scope.
     shared = KnowledgeItem.owner_subject_id.is_(None) & KnowledgeItem.source_kind.in_(
         ("verified_source", "external_observation")
     )
     scope = shared if subject_id is None else or_(shared, KnowledgeItem.owner_subject_id == subject_id)
-    return scope & KnowledgeItem.visibility.in_(("public", "subject_private"))
+    return (
+        scope & KnowledgeItem.visibility.in_(("public", "subject_private"))
+        & ~open_purge_exists(KnowledgeItem.owner_subject_id)
+    )
 
 
 def current_knowledge(now: datetime) -> ColumnElement[bool]:

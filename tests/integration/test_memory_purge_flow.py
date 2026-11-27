@@ -578,6 +578,70 @@ async def test_list_and_recall_are_empty_between_request_and_purge(
     assert core["items"] == []
 
 
+async def test_pending_purge_hides_media_from_prompt_and_description_reads(logged_in: TestEnv) -> None:
+    from ling.domains.consent.service import ConsentService
+    from ling.domains.media.service import INBOUND_SCOPE, MediaEvidenceError, MediaEvidenceService
+    from ling.infra.models import MediaEvidenceRow
+    from ling.kernel.context import ContextCompiler
+    from ling.worker import handle_memory_purge
+
+    env = logged_in
+    subject_id = env.subject_id
+    control_subject = "test-other-authorized-speaker"
+    private_text, control_text = "旧素材是松鼠灯。", "独立素材是蒲公英灯。"
+    window = await env.client.post("/v1/sessions", json={"title": "素材清理等待"})
+    assert window.status_code == 201, window.text
+    window_id = window.json()["session_id"]
+    async with session_scope() as session:
+        service = MediaEvidenceService(session, actor_id=env.settings.actor_id)
+
+        async def describe(subject: str, description: str) -> str:
+            await ConsentService(session).grant(subject_id=subject, scope=INBOUND_SCOPE)
+            item = await service.record(
+                subject_id=subject, window_id=window_id, media_ref=f"fixture/{subject}.mp4", kind="video",
+            )
+            await service.describe(item.evidence_id, window_id=window_id, description=description)
+            return item.evidence_id
+
+        target_id = await describe(subject_id, private_text)
+        control_id = await describe(control_subject, control_text)
+
+    async def read_prompt() -> str:
+        async with session_scope() as session:
+            result = await ContextCompiler(session).compile(
+                subject_id=subject_id, window_id=window_id, user_text="刚才的视频是什么内容？",
+            )
+        return "\n".join(message.content for message in result.messages)
+
+    before = await read_prompt()
+    assert private_text in before and control_text in before
+    source_url = f"/v1/memory/{target_id}/source"
+    source = await env.client.get(source_url)
+    assert source.status_code == 200 and source.json()["text"] == private_text
+
+    response = await env.client.post("/v1/memory/forget")
+    assert response.status_code == 200 and response.json()["state"] == "pending"
+    assert (await env.client.get(source_url)).status_code == 404
+    async with session_scope() as session:
+        assert await session.get(MediaEvidenceRow, target_id) is not None
+        service = MediaEvidenceService(session, actor_id=env.settings.actor_id)
+        assert await service.get(target_id, window_id=window_id) is None
+        assert await service.get(control_id, window_id=window_id) is not None
+        with pytest.raises(MediaEvidenceError):
+            await service.ensure_description_authorized(target_id, window_id=window_id)
+        assert (await service.ensure_description_authorized(
+            control_id, window_id=window_id,
+        )).description == control_text
+    during = await read_prompt()
+    assert private_text not in during and control_text in during
+
+    await handle_memory_purge({"tombstone_id": response.json()["tombstone_id"]})
+    async with session_scope() as session:
+        assert await session.get(MediaEvidenceRow, target_id) is None
+    after = await read_prompt()
+    assert private_text not in after and control_text in after
+
+
 async def test_forget_is_idempotent_across_two_requests(logged_in: TestEnv) -> None:
     """连点两次：代次递增，两次都能收敛到 done，且计数不翻倍。"""
     from ling.worker import handle_memory_purge

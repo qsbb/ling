@@ -65,13 +65,16 @@ def readable_media_evidence(*, now: datetime) -> ColumnElement[bool]:
 
 
 def hidden_media_source() -> ColumnElement[bool]:
+    from ling.domains.memory.purge import open_purge_exists
+
     source = MediaEvidenceRow.source_event_id
-    return select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
+    hidden_message = select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
         Message.window_id == MediaEvidenceRow.window_id, Message.role == "user",
         Message.sender_subject_id == MediaEvidenceRow.subject_id,
         or_(func.concat("message:", Message.id) == source, Turn.client_turn_id == source),
         or_(Message.memory_hidden_at.is_not(None), Message.retracted_at.is_not(None)),
     ).correlate(MediaEvidenceRow).exists()
+    return hidden_message | open_purge_exists(MediaEvidenceRow.subject_id)
 
 
 def material_library_scope(*, actor_id: str, subject_id: str, now: datetime) -> ColumnElement[bool]:
@@ -367,6 +370,7 @@ class MediaEvidenceService:
             MediaEvidenceRow.kind == "video",
             or_(MediaEvidenceRow.description.is_(None), MediaEvidenceRow.describe_failed_at.is_(None)),
             or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
+            ~hidden_media_source(),
         ))
         return list(ids)
 
@@ -376,12 +380,13 @@ class MediaEvidenceService:
         返回 ``None`` 而不是抛错，是为了不给"这个 id 在别的窗口存不存在"
         留探测口。
         """
-        row = await self._load(evidence_id)
-        if row is None or row.window_id != window_id:
-            return None
-        if _expired(row):
-            return None
-        return _view(row)
+        now = utcnow()
+        row = await self._session.scalar(select(MediaEvidenceRow).where(
+            MediaEvidenceRow.id == evidence_id, MediaEvidenceRow.actor_id == self._actor_id,
+            MediaEvidenceRow.window_id == window_id, ~hidden_media_source(),
+            or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > now),
+        ))
+        return _view(row) if row is not None else None
 
     async def library_material(self, evidence_id: str, *, subject_id: str) -> EvidenceView | None:
         row = await self._session.scalar(select(MediaEvidenceRow).where(
