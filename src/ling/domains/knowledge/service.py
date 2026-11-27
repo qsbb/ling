@@ -26,7 +26,7 @@ DEFAULT_TTL_HOURS = 24
 PROCEDURE_SOURCE_SLOT = "knowledge_procedure"
 
 
-def knowledge_visible_to(subject_id: str | SQLColumnExpression[str] | None) -> ColumnElement[bool]:
+def knowledge_visible_to(subject_id: str | SQLColumnExpression[str | None] | None) -> ColumnElement[bool]:
     from ling.domains.memory.purge import open_purge_exists
 
     # Ownerless sourced records retain the legacy shared knowledge scope.

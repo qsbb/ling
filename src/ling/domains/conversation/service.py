@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
@@ -38,6 +38,7 @@ from ling.contracts.v1 import (
     SessionRecord,
     TurnState,
 )
+from ling.domains.conversation.context_sources import context_sources_available
 from ling.infra.models import (
     ActorAccount,
     DeliveryReceiptRow,
@@ -83,7 +84,7 @@ SEEN_ATTENTION_STATES: frozenset[str] = frozenset({"seen"})
 NOT_SEEN_HANDLED_AS: frozenset[str] = frozenset({"missed"})
 
 
-def visible_to_model():
+def visible_to_model(*, group_sources: Collection[str] = ()) -> ColumnElement[bool]:
     """**能进模型上下文的消息**的 SQL 条件（唯一判据，三处共用）。
 
     两种撤回的落点全在这里：
@@ -97,7 +98,9 @@ def visible_to_model():
     三处各写一遍必然漂——而漂的后果是某一条路径把撤回的消息又捞回去，
     而且**只在特定入口**出现，最难查。
     """
-    return Message.memory_hidden_at.is_(None) & or_(
+    return Message.memory_hidden_at.is_(None) & context_sources_available(
+        Message, group_sources=group_sources,
+    ) & or_(
         Message.retracted_at.is_(None),
         Message.retracted_after_seen.is_(True),
     )
@@ -117,6 +120,7 @@ def completed_actor_message() -> ColumnElement[bool]:
         Message.memory_hidden_at.is_(None),
         Message.retracted_at.is_(None),
         Message.recalled_at.is_(None),
+        context_sources_available(Message),
         current_attempt,
     )
 
@@ -219,6 +223,7 @@ class MessageView:
     audio_asset_id: str | None = None
     speech_state: str = "none"
     speech_delivery_state: str | None = None
+    context_sources: tuple[str, ...] = ()
 
     def to_contract(self, *, operator: bool = False) -> ChatMessage:
         return ChatMessage(
@@ -835,6 +840,7 @@ class ConversationService:
         handled_reason: str | None = None,
         attention_state: str | None = None,
         sender_subject_id: str | None = None,
+        context_sources: Sequence[str] = (),
     ) -> MessageView:
         seq = sequence if sequence is not None else await self.next_sequence(window_id)
         row = Message(
@@ -853,6 +859,7 @@ class ConversationService:
             handled_reason=handled_reason,
             attention_state=attention_state,
             sender_subject_id=sender_subject_id,
+            context_sources=list(context_sources) or None,
             seen_at=utcnow() if attention_state == "seen" else None,
         )
         self._session.add(row)
@@ -1364,6 +1371,7 @@ class ConversationService:
         limit: int = 200,
         after_sequence: int = 0,
         before_sequence: int | None = None,
+        group_sources: Collection[str] = (),
     ) -> list[MessageView]:
         """取**尚未摘要过**的已完成消息作为模型上下文。
 
@@ -1397,7 +1405,7 @@ class ConversationService:
             #
             # 放在 SQL 条件里而不是取回来再过滤：Python 里过滤等于
             # "读出来了但没发出去"，调用方拿到的 `dropped` 会把它算进摘要。
-            visible_to_model(),
+            visible_to_model(group_sources=group_sources),
         ]
         if after_sequence > 0:
             conditions.append(Message.sequence > after_sequence)
@@ -1463,6 +1471,7 @@ class ConversationService:
             retracted_after_seen=row.retracted_after_seen,
             recalled_at=getattr(row, "recalled_at", None),
             recall_state=getattr(row, "recall_state", None),
+            context_sources=tuple(row.context_sources or ()),
         )
 
     # ---------------------------------------------------------- 窗口短记忆
@@ -1507,6 +1516,7 @@ class ConversationService:
         summary: str,
         through_sequence: int,
         message_count: int,
+        context_sources: Sequence[str] = (),
     ) -> None:
         """保存滚动摘要。调用方保证 ``through_sequence`` 之前的内容已被压缩。"""
         row = (
@@ -1520,11 +1530,12 @@ class ConversationService:
         row.summary = summary[:8000]
         row.summary_through_sequence = max(0, through_sequence)
         row.summary_message_count = max(0, message_count)
+        row.context_sources = list(context_sources) or None
         row.updated_at = utcnow()
         await self._session.flush()
 
     async def read_window_context(
-        self, window_id: str, *, expired_ok: bool = False
+        self, window_id: str, *, expired_ok: bool = False, group_sources: Collection[str] = (),
     ) -> WindowContext | None:
         """读取窗口短记忆行。过期即视为不存在（不返回陈旧指代）。
 
@@ -1539,7 +1550,10 @@ class ConversationService:
         """
         row = (
             await self._session.execute(
-                select(WindowContext).where(WindowContext.window_id == window_id)
+                select(WindowContext).where(
+                    WindowContext.window_id == window_id,
+                    context_sources_available(WindowContext, group_sources=group_sources),
+                )
             )
         ).scalar_one_or_none()
         if row is None:

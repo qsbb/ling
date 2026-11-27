@@ -1300,6 +1300,7 @@ class TurnCoordinator:
                     external_tool_defs=external_tool_defs,
                     audience=audience,
                     memory_sources=compiled.memory_sources,
+                    context_sources=compiled.context_sources,
                 )
                 tool_ledger.turn_id = turn_id
                 if not tool_ledger.explicit_guidance:
@@ -1812,6 +1813,11 @@ class TurnCoordinator:
                     # 不会出现"旧谎话 + 新真话"拼接的情况。
                     must_rewrite = bool(skipped) and bool(delivered.strip())
                     if observation.strip():
+                        evidence_ids = watch_result.get("evidence_ids")
+                        if isinstance(evidence_ids, list):
+                            compiled.context_sources.update(
+                                f"media:{key}" for key in evidence_ids if isinstance(key, str)
+                            )
                         # **看到了**：用观察**替换**这一段正文，不追加。
                         #
                         # 理由与 `must_rewrite` 同一条（D2：写"看了"时手里一个字
@@ -1876,6 +1882,7 @@ class TurnCoordinator:
                     replyable_ids=replyable_ids,
                     expression_env=expression_env,
                     raw_chars=raw_chars,
+                    context_sources=sorted(compiled.context_sources),
                 )
         except asyncio.CancelledError:
             # 进程关闭或超时强制取消：尽力落库
@@ -2604,6 +2611,7 @@ class TurnCoordinator:
         # 库里写着 `failed`，而用户看到的是一条"她说等会儿"的正常轮次。
         handled_as: str | None = None,
         voice_state: _VoiceTurn | None = None,
+        context_sources: Sequence[str] = (),
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -2781,6 +2789,7 @@ class TurnCoordinator:
                 error_code=code,
                 model_label=target_label,
                 attempt=attempt,
+                context_sources=context_sources,
             )
         if actor_message is not None and chose_voice:
             row = cast(Message, await conversation.session.get(Message, actor_message.message_id))
@@ -3158,6 +3167,7 @@ class TurnCoordinator:
         profile: str,
         audience: AudienceSnapshot | None = None,
         memory_sources: dict[str, MemoryHit] | None = None,
+        context_sources: set[str] | None = None,
         window_id: str | None = None,
         user_text: str = "",
         attempt: int = 1,
@@ -3234,11 +3244,11 @@ class TurnCoordinator:
             registry = build_default_registry(
                 knowledge_audience=audience,
                 current_fact_lookup=(
-                    partial(recall_current_fact, audience=audience)
+                    partial(recall_current_fact, audience=audience, context_sources=context_sources)
                     if audience is not None and config.memory.max_injected_memories > 0 else None
                 ),
                 shared_arrangement_lookup=(
-                    partial(recall_shared_arrangement, audience=audience)
+                    partial(recall_shared_arrangement, audience=audience, context_sources=context_sources)
                     if audience is not None and audience.whole_group_source_ids
                     and config.memory.shared_events == "enabled" and config.memory.max_injected_memories > 0
                     else None
@@ -3246,6 +3256,7 @@ class TurnCoordinator:
                 memory_sources=memory_sources,
                 media_window_id=window_id,
                 watch_video=media_callback,
+                context_sources=context_sources,
             )
             if search_requested:
                 if explicit_search is None:

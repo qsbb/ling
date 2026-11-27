@@ -424,7 +424,9 @@ _KNOWLEDGE_QUERY_CHARS = 200
 _MEDIA_REF_CHARS = 16
 
 
-async def _search_knowledge(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+async def _search_knowledge(
+    args: dict[str, Any], *, audience: AudienceSnapshot, context_sources: set[str] | None = None,
+) -> str:
     from sqlalchemy.exc import SQLAlchemyError
 
     from ling.domains.knowledge.service import KnowledgeService
@@ -457,12 +459,15 @@ async def _search_knowledge(args: dict[str, Any], *, audience: AudienceSnapshot)
             truncated = True
             break
         items.append(item)
+        if context_sources is not None:
+            context_sources.add(f"knowledge:{match.item_id}")
         truncated |= len(match.claim) > _KNOWLEDGE_CLAIM_CHARS
     return json.dumps({"items": items, "truncated": truncated}, ensure_ascii=False)
 
 
 async def _watch_video(
-    args: dict[str, Any], *, window_id: str, watch_video: WatchVideo
+    args: dict[str, Any], *, window_id: str, watch_video: WatchVideo,
+    context_sources: set[str] | None = None,
 ) -> str:
     ref = args["ref"].strip()
     if not ref or len(ref) > _MEDIA_REF_CHARS:
@@ -472,6 +477,9 @@ async def _watch_video(
     if not observation:
         reason = str(result.get("skipped") or "视频没有成功读取").strip()
         raise RuntimeError(reason[:300])
+    evidence_ids = result.get("evidence_ids")
+    if context_sources is not None and isinstance(evidence_ids, list):
+        context_sources.update(f"media:{key}" for key in evidence_ids if isinstance(key, str))
     return json.dumps(
         {"ref": ref, "observation": observation, "reads": int(cast(int, result.get("reads") or 0))},
         ensure_ascii=False,
@@ -524,6 +532,7 @@ def build_default_registry(
     memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
+    context_sources: set[str] | None = None,
 ) -> ToolRegistry:
     """默认工具集：只读/诊断 + 撤回（不可逆，需确认）。
 
@@ -598,7 +607,7 @@ def build_default_registry(
                     "required": ["query"],
                 },
             ),
-            partial(_search_knowledge, audience=knowledge_audience),
+            partial(_search_knowledge, audience=knowledge_audience, context_sources=context_sources),
         )
         if current_fact_lookup is not None:
             registry.register(
@@ -701,7 +710,10 @@ def build_default_registry(
                     "required": ["ref"],
                 },
             ),
-            partial(_watch_video, window_id=media_window_id, watch_video=watch_video),
+            partial(
+                _watch_video, window_id=media_window_id, watch_video=watch_video,
+                context_sources=context_sources,
+            ),
         )
     registry.register(
         ToolSpec(

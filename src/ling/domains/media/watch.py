@@ -106,6 +106,7 @@ class WatchOutcome:
     denied_kind: str | None = None
     refs: list[str] = field(default_factory=list)
     reads: int = 0
+    evidence_ids: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -122,6 +123,7 @@ class WatchOutcome:
             "skipped": self.skipped,
             "denied_kind": self.denied_kind,
             "reads": self.reads,
+            "evidence_ids": self.evidence_ids,
         }
 
 
@@ -327,6 +329,7 @@ class VideoWatchService:
                 break
             if evidence.description:
                 lines.append(f"- {ref}（之前看过的）：{evidence.description}")
+                outcome.evidence_ids.append(evidence_id)
                 _log_viewed(ref, "上次已经看过，用已有描述", cached=True)
                 continue
 
@@ -378,6 +381,7 @@ class VideoWatchService:
             elapsed = time.perf_counter() - started
             outcome.reads += 1
             lines.append(f"- {ref}：{read.text}")
+            outcome.evidence_ids.append(evidence_id)
             detail = _describe_read(read, elapsed)
             _log_viewed(ref, detail, cached=read.cached)
             if read.fallback_reason:

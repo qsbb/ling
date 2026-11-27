@@ -454,6 +454,7 @@ class CompiledContext:
     contributions: list[ContextContribution] = field(default_factory=list)
     memory_ids: list[str] = field(default_factory=list)
     memory_sources: dict[str, MemoryHit] = field(default_factory=dict)
+    context_sources: set[str] = field(default_factory=set)
     filtered_memories: int = 0
     meta: dict[str, object] = field(default_factory=dict)
     # 这条提示里**真的渲染出来**的消息 id：`{模型看到的 token: 原始平台 id}`。
@@ -1205,7 +1206,14 @@ class ContextCompiler:
         # "本窗口正在聊"这段短记忆。按 TTL 把整行当不存在，会让**闲置两小时**
         # 的窗口连摘要一起丢掉，并且下一轮用空的 prev_summary 覆盖旧摘要
         # （见 `_window_topic_live` 的说明）。所以过期判断搬到这里，只作用于短记忆。
-        ctx = await self._conversation.read_window_context(window_id, expired_ok=True)
+        group_memory_sources = (
+            snapshot.whole_group_source_ids
+            if self._memory_policy.shared_events == "enabled" and snapshot.allows_long_term_memory()
+            else frozenset()
+        )
+        ctx = await self._conversation.read_window_context(
+            window_id, expired_ok=True, group_sources=group_memory_sources,
+        )
         self._window_ctx_cache = ctx
         if (
             ctx is not None
@@ -1562,6 +1570,7 @@ class ContextCompiler:
                 limit=page_size,
                 after_sequence=through,
                 before_sequence=cursor,
+                group_sources=group_memory_sources,
             )
             if not page:
                 break
@@ -2044,11 +2053,30 @@ class ContextCompiler:
         # 收尾校验用的映射：token → 原始平台 id。**当前这句也在里面**——
         # 她最常引用的就是"正在回的这条"。只放在 `reply_ids` 一处：
         # 同一事实写两份（meta 再抄一份）迟早会不一致。
+        context_sources = {
+            f"{contribution.lane}:{ref}"
+            for contribution in contributions
+            if contribution.lane in {"knowledge", "media"}
+            for ref in contribution.source_event_ids
+        }
+        for hit in selected:
+            for ref in hit.source_event_ids:
+                if ref.startswith("message:") and hit.visibility == Visibility.group_scope:
+                    context_sources.add(f"shared:{ref.removeprefix('message:')}")
+                elif ref.startswith(("message:", "knowledge:", "media:")):
+                    context_sources.add(ref)
+        context_sources.update(ref for msg in usable for ref in msg.context_sources)
+        if quoted is not None:
+            context_sources.update(quoted.context_sources)
+            context_sources.add(f"message:{quoted.message_id}")
+        if wants_earlier and window_ctx is not None and window_ctx.summary:
+            context_sources.update(window_ctx.context_sources or ())
         return CompiledContext(
             messages=[ChatMessageIn(role=m.role, content=m.content) for m in annotated],
             contributions=contributions,
             memory_ids=selected_ids,
             memory_sources=memory_sources,
+            context_sources=context_sources,
             filtered_memories=recall.filtered_out,
             meta=compiled_meta,
             snapshot=snapshot,
@@ -2212,11 +2240,14 @@ class ContextCompiler:
         if through is None:
             through = max((m.sequence for m in dropped), default=0)
         prev_count = int(getattr(window_ctx, "summary_message_count", 0) or 0) if window_ctx else 0
+        sources = set(getattr(window_ctx, "context_sources", None) or ())
+        sources.update(ref for message in dropped for ref in getattr(message, "context_sources", ()))
         await self._conversation.save_summary(
             window_id,
             summary=merged,
             through_sequence=through,
             message_count=prev_count + len(dropped),
+            context_sources=sorted(sources),
         )
 
     @staticmethod

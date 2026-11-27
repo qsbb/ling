@@ -36,7 +36,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.engine.default import DefaultExecutionContext
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -596,6 +596,7 @@ class Message(Base):
     # `recalled_at` 只有平台回执 == recalled 时才写；`uncertain` 只写
     # `recall_attempted_at`——把"试过"当成"成了"会让一次超时被永久记成功。
     memory_hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    context_sources: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     recalled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -622,6 +623,7 @@ class WindowContext(Base):
     # --- 分层上下文（设计文档 §6.2：短时窗口上下文 + 滚动摘要）---
     # 已滚出原文窗口的早期对话摘要。由 Conversation 域维护，不是长期记忆。
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_sources: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     # 摘要覆盖到哪条消息 sequence（含）。用于增量摘要与失效判断。
     summary_through_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 摘要生成时依据的消息条数，便于解释"摘要了什么"

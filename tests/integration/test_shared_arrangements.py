@@ -128,6 +128,26 @@ async def test_shared_arrangement_uses_linked_sources_and_whole_group_access(
         assert all(old_place not in message.content and new_place not in message.content
                    for message in compiled.annotated if message.lane in {"summary", "history"})
 
+    used_sources = (await compile("现在约在哪？")).context_sources
+    reply_text = "之前回过的约定有白桦木门。"
+    control_text = "普通群回复还提到了风筝。"
+    async with session_scope() as session:
+        conversation = ConversationService(session)
+        await conversation.add_message(
+            window_id, role="actor", text=reply_text, context_sources=sorted(used_sources),
+        )
+        await conversation.add_message(window_id, role="actor", text=control_text)
+    for mode, proof, visible in (
+        ("enabled", source_ids, True),
+        ("enabled", frozenset(), False),
+        ("enabled", source_ids - {proposal.message_id}, False),
+        ("off", source_ids, False),
+    ):
+        compiled = await compile("最早我们聊了什么？", mode=mode, ids=proof)
+        history = "\n".join(message.content for message in compiled.annotated if message.lane == "history")
+        assert control_text in history
+        assert (reply_text in history) == visible
+
     private = (await env.client.post("/v1/sessions", json={"title": "安排询问"})).json()["session_id"]
     for compiled in (
         await compile("现在约在哪？", window=private, who=env.subject_id),

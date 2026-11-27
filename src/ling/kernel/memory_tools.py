@@ -9,7 +9,9 @@ from ling.kernel.audience import AudienceSnapshot, visibility_set
 from ling.settings.service import published_memory_policy
 
 
-async def recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+async def recall_current_fact(
+    args: dict[str, Any], *, audience: AudienceSnapshot, context_sources: set[str] | None = None,
+) -> str:
     slot = args.get("slot")
     if slot != "works_at" and slot != "lives_in":
         raise ValueError("事实类型应为 works_at 或 lives_in。")
@@ -35,10 +37,16 @@ async def recall_current_fact(args: dict[str, Any], *, audience: AudienceSnapsho
         )
     if result.strategy == "fact_conflict":
         return "记录中有相互冲突的本人陈述，请询问哪一条现在有效。"
+    if context_sources is not None:
+        context_sources.update(
+            ref for hit in result.hits for ref in hit.source_event_ids if ref.startswith("message:")
+        )
     return render_evidence(result.hits) or empty
 
 
-async def recall_shared_arrangement(args: dict[str, Any], *, audience: AudienceSnapshot) -> str:
+async def recall_shared_arrangement(
+    args: dict[str, Any], *, audience: AudienceSnapshot, context_sources: set[str] | None = None,
+) -> str:
     """Search only the original messages eligible for this whole group reply."""
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -72,4 +80,9 @@ async def recall_shared_arrangement(args: dict[str, Any], *, audience: AudienceS
             )
     except SQLAlchemyError:
         return empty
+    if context_sources is not None:
+        context_sources.update(
+            f"shared:{ref.removeprefix('message:')}"
+            for hit in hits for ref in hit.source_event_ids if ref.startswith("message:")
+        )
     return render_evidence(hits) or empty

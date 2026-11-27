@@ -4296,6 +4296,7 @@ async def handle_window_summary(payload: dict) -> None:
     """
     from sqlalchemy import select, update
 
+    from ling.domains.conversation.context_sources import context_sources_available
     from ling.infra.models import WindowContext, utcnow
     from ling.infra.security import SecretBox
     from ling.settings.service import ConfigService
@@ -4313,7 +4314,9 @@ async def handle_window_summary(payload: dict) -> None:
     async with session_scope() as session:
         ctx = (
             await session.execute(
-                select(WindowContext).where(WindowContext.window_id == window_id)
+                select(WindowContext).where(
+                    WindowContext.window_id == window_id, context_sources_available(WindowContext),
+                )
             )
         ).scalar_one_or_none()
         original = (ctx.summary or "") if ctx is not None else ""
@@ -4348,6 +4351,7 @@ async def handle_window_summary(payload: dict) -> None:
             update(WindowContext).where(
                 WindowContext.id == ctx.id,
                 WindowContext.updated_at == ctx.updated_at,
+                context_sources_available(WindowContext),
             ).values(summary=rewritten[:8000], updated_at=utcnow()).returning(WindowContext.id)
         )
         if saved is None:
