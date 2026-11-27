@@ -210,15 +210,21 @@ async def _evaluate_turn_decision(
     )
 
 
-async def _forward(
-    queue: asyncio.Queue[TurnStreamEvent | None], *, started: bytes
-) -> AsyncIterator[bytes]:
-    yield started
+async def _turn_events(queue: asyncio.Queue[TurnStreamEvent | None]) -> AsyncIterator[TurnStreamEvent]:
     while True:
         item = await queue.get()
         if item is None:
             return
-        yield _sse(item.event, item.data)
+        yield item
+
+
+def _includes_turn_text(item: TurnStreamEvent) -> bool:
+    if item.event == "delta":
+        return bool(item.data.get("text"))
+    if item.event not in {"turn.completed", "turn.stopped"}:
+        return False
+    message = item.data.get("message")
+    return isinstance(message, dict) and bool(message.get("text"))
 
 
 async def _refresh_config_if_stale(request: Request) -> None:
@@ -1111,10 +1117,10 @@ async def send_transcribed_turn(
     async def _guarded() -> AsyncIterator[bytes]:
         produced = False
         started_at = time.perf_counter()
-        async for chunk in _forward(queue, started=started):
-            if b"event: delta" in chunk:
-                produced = True
-            yield chunk
+        yield started
+        async for item in _turn_events(queue):
+            produced = produced or _includes_turn_text(item)
+            yield _sse(item.event, item.data)
         if produced:
             _mark_group_turn(request, window.visibility, window.id)
         # 流结束 = 这一轮结束。与 connector 路径用同一个事件名，
@@ -1381,10 +1387,10 @@ async def retry_turn(
 
     async def _guarded() -> AsyncIterator[bytes]:
         produced = False
-        async for chunk in _forward(queue, started=started):
-            if b"event: delta" in chunk:
-                produced = True
-            yield chunk
+        yield started
+        async for item in _turn_events(queue):
+            produced = produced or _includes_turn_text(item)
+            yield _sse(item.event, item.data)
         if produced:
             _mark_group_turn(request, window.visibility, window.id)
 

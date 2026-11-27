@@ -228,8 +228,14 @@ async def get_dashboard(
         )
 
     async def proactive() -> dict:
+        from ling.infra.models import ProactiveOpportunity, utcnow
+        from ling.kernel.continuity_sharing import share_evidence
+
+        async def source_visible(row: ProactiveOpportunity) -> bool:
+            return await share_evidence(session, row, now=utcnow()) is not None
+
         service = ProactivityService(session, actor_id=actor_id)
-        pending = await service.pending(subject_id)
+        pending = await service.pending(subject_id, source_visible=source_visible)
 
         # **不能写死 delivery_enabled**：原来写死 False，于是门控永远说
         # "当前渠道不支持主动投递"，无论渠道配得多完整都不可能主动联系。

@@ -31,6 +31,15 @@ from ling.domains.conversation.service import (
 )
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
+from ling.domains.memory.experience import (
+    OriginalSearch,
+    asks_for_earliest,
+    asks_for_originals,
+    fact_query,
+    render_experience,
+    search_facts,
+    search_originals,
+)
 from ling.domains.memory.recall_query import (
     asks_for_earlier_conversation,
     current_fact_slot,
@@ -453,6 +462,7 @@ class CompiledContext:
     # 单独给一份而不是塞进 messages：``ChatMessageIn`` 是供应商端口的
     # 入参类型，多带字段要么被供应商拒、要么在适配器里被丢掉。
     annotated: list[CompiledMessage] = field(default_factory=list)
+    experience: OriginalSearch | None = None
 
     def summary(self) -> dict[str, object]:
         return {
@@ -1165,8 +1175,16 @@ class ContextCompiler:
         except Exception as exc:  # noqa: BLE001 - 自我投影失败不阻断对话
             compiled_meta["self_view_error"] = type(exc).__name__
 
-        # 关系：只给"姿态"，绝不注入熟悉度/信任度数值，也不注入他人任何内容
+        from ling.domains.relationship.preferences import (
+            blocks_topic,
+            preference_scope,
+            preferences,
+        )
+
+        topic_boundaries: list[str] = []
+        # 关系使用当前对象和窗口的证据。
         try:
+            from ling.domains.relationship.continuity import latest_understanding
             from ling.domains.relationship.service import RelationshipService
 
             rel_service = RelationshipService(self._session, actor_id=self._actor_id)
@@ -1176,16 +1194,45 @@ class ContextCompiler:
                 # 群聊只说"认识"，既不暴露数值也不暴露私聊里约定的边界
                 text = "你在群聊里。对说话的人保持普通礼貌，不要提及私下关系细节。"
             else:
-                boundaries = "；".join(rel_view.boundaries[:5])
                 text = f"你和这个人：{hint}。"
-                if boundaries:
-                    text += f"需要守住的边界：{boundaries}。"
+                topic_boundaries = [label for label in rel_view.boundaries if isinstance(label, str)]
+            rules = await preferences(
+                self._session, actor_id=self._actor_id, subject_id=subject_id,
+                scope=preference_scope(window_row), active_only=True,
+            )
+            topic_boundaries += [rule.text for rule in rules if rule.kind == "boundary"]
+            if topic_boundaries:
+                text += "请避开这些话题或行为，不要在回复里复述边界文字。"
+                text += "；".join(topic_boundaries[:5]) + "。"
+            if snapshot.allows_long_term_memory() and not is_group:
+                understanding = await latest_understanding(
+                    self._session, subject_id=subject_id, window=window_row,
+                )
+                if understanding:
+                    kind, note = understanding
+                    label = "用户后来的解释" if kind == "clarification" else "你当时的主观理解，仍待确认"
+                    text += f"\n{label}：{note}"
+            if snapshot.allows_long_term_memory() and not low_information and history_scope != "opening":
+                active_expressions = [rule for rule in rules if rule.kind == "expression"]
+                # An explicit approval plus public publishing permission authorizes a new use
+                # of this user's own expression in its source group, even without history access.
+                may_publish = is_group and bool(active_expressions) and await self._consent.is_active(
+                    subject_id, "public_publish",
+                )
+                expressions = [
+                    rule.text for rule in active_expressions if (
+                        not is_group or may_publish
+                        or rule.source_message_id in snapshot.whole_group_source_ids
+                    )
+                ]
+                if expressions:
+                    text += "\n适合这个对象和窗口的表达（聊到对应话题时可以沿用）：" + "；".join(expressions[:4])
             contributions.append(
                 ContextContribution(
                     lane="relationship",
                     text=text,
                     origin=Origin.user_statement,
-                    visibility=Visibility.subject_private,
+                    visibility=Visibility.group_scope if is_group else Visibility.subject_private,
                     token_budget=DEFAULT_BUDGETS["relationship"],
                 )
             )
@@ -1280,38 +1327,53 @@ class ContextCompiler:
         except Exception as exc:  # noqa: BLE001 - 意识不可用不应阻断对话
             compiled_meta["awareness_error"] = f"{type(exc).__name__}: {exc}"[:200]
 
-        # 跨端交接胶囊：只在**私聊**场景注入。
-        # 胶囊承载的是本人私聊间的话题，群聊里出现就是跨受众泄漏（设计文档 §4.2）。
+        # 经过窗口、来源与授权核验的交接胶囊。
         try:
             capsule = None
-            if history_scope in {"recent", "earlier"} and snapshot.allows_handoff_capsule():
+            if history_scope in {"recent", "earlier"} and snapshot.allows_long_term_memory():
                 from ling.kernel.handoff import HandoffService
 
                 capsule = await HandoffService(
                     self._session, actor_id=self._actor_id
-                ).read(subject_id=subject_id, current_window_id=window_id)
-            if capsule is not None and (capsule.recent_topic or capsule.open_questions):
-                parts = ["你在另一个对话窗口里刚和这个人聊过："]
+                ).read(
+                    subject_id=subject_id, current_window_id=window_id,
+                    user_text=user_text, validate_window=True,
+                )
+            if capsule is not None and (capsule.recent_topic or capsule.open_questions) and not blocks_topic(
+                capsule.recent_topic or "", topic_boundaries,
+            ):
+                parts = ["当事人授权在本群续接的这一句：" if is_group else "这个人刚在另一个对话窗口说过："]
                 if capsule.recent_topic:
                     parts.append(f"话题：{capsule.recent_topic}")
                 if capsule.open_questions:
                     parts.append("还没答的问题：" + "；".join(capsule.open_questions[:3]))
                 parts.append(
-                    f"（还有约 {capsule.remaining_seconds // 60} 分钟失效；"
-                    "只在私聊端之间可用，不要把这些内容带进群聊）"
+                    f"（还有约 {capsule.remaining_seconds // 60} 分钟失效。只沿用核验过的这一段。）"
                 )
                 contributions.append(
                     ContextContribution(
                         lane="short_memory",
                         text="\n".join(parts),
                         origin=Origin.user_statement,
-                        visibility=Visibility.subject_private,
+                        visibility=Visibility.group_scope if is_group else Visibility.subject_private,
                         valid_until=capsule.expires_at,
                         token_budget=DEFAULT_BUDGETS["short_memory"],
                     )
                 )
         except Exception:  # noqa: BLE001 - 胶囊不可用时静默跳过
             pass
+
+        if snapshot.allows_long_term_memory() and not is_group and not low_information and history_scope != "opening":
+            from ling.kernel.continuity_sharing import share_context
+
+            continuity = await share_context(
+                self._session, window=window_row, subject_id=subject_id, text=user_text,
+            )
+            if continuity:
+                contributions.append(ContextContribution(
+                    lane="short_memory", text=continuity, origin=Origin.external_observation,
+                    visibility=Visibility.subject_private, token_budget=DEFAULT_BUDGETS["short_memory"],
+                ))
 
         if extra_contributions:
             contributions.extend(extra_contributions)
@@ -1640,6 +1702,7 @@ class ContextCompiler:
             compiled_meta["history_cap_hit"] = True
 
         allowed = visibility_set(snapshot)
+        query = user_text
         max_injected_memories = self._memory_policy.max_injected_memories
         if not snapshot.allows_long_term_memory():
             recall = RecallResult()
@@ -1653,7 +1716,6 @@ class ContextCompiler:
             recall = RecallResult()
             compiled_meta["memory_recall_skipped"] = "topic_change"
         else:
-            query = user_text
             if needs_recent_topic(user_text):
                 for message in reversed(usable):
                     if (
@@ -1690,6 +1752,7 @@ class ContextCompiler:
                     recall.hits = [*shared_hits, *recall.hits]
                 except SQLAlchemyError as exc:
                     logger.info("共享事项检索不可用 error=%s", type(exc).__name__)
+        recall.hits = [hit for hit in recall.hits if not blocks_topic(hit.text, topic_boundaries)]
         base_evidence_budget = max(_MIN_MEMORY_TOKEN_BUDGET, max_injected_memories * _MEMORY_TOKENS_PER_ITEM)
         evidence_budget = min(DEFAULT_BUDGETS["evidence"], int(base_evidence_budget * min(1.0, _SCALE)))
         original_text = {message.message_id: message.text for message in fetched}
@@ -1720,6 +1783,57 @@ class ContextCompiler:
                     token_budget=evidence_budget,
                 ),
             )
+        experience = None
+        explicit_facts = fact_query(user_text)
+        if asks_for_originals(user_text) or explicit_facts:
+            if not snapshot.allows_long_term_memory() or max_injected_memories <= 0:
+                compiled_meta["experience_recall"] = "not_visible"
+            elif not low_information and history_scope != "opening":
+                if explicit_facts:
+                    slot, mode = explicit_facts
+                    experience = await search_facts(
+                        self._session, window=window_row, subject_id=subject_id, slot=slot, mode=mode,
+                        retention_days=self._memory_policy.max_retention_days,
+                        group_source_ids=snapshot.whole_group_source_ids,
+                    )
+                else:
+                    experience = await search_originals(
+                        self._session, window=window_row, subject_id=subject_id, query=query,
+                        earliest=asks_for_earliest(user_text), retention_days=self._memory_policy.max_retention_days,
+                        group_source_ids=snapshot.whole_group_source_ids, current_turn_id=current_turn_id,
+                    )
+                if topic_boundaries:
+                    visible_items = [
+                        item for item in experience.items if not blocks_topic(item["text"], topic_boundaries)
+                    ]
+                    first_withheld = experience.first_message_id is not None and not any(
+                        item.get("message_id") == experience.first_message_id for item in visible_items
+                    )
+                    if first_withheld or (experience.items and not visible_items):
+                        experience = replace(experience, state="not_visible", items=[], first_message_id=None)
+                    else:
+                        experience = replace(experience, items=visible_items)
+                compiled_meta["experience_recall"] = experience.state
+                sources = [
+                    f"message:{item['message_id']}" for item in experience.items if "message_id" in item
+                ]
+                if explicit_facts or experience.first_message_id is not None or experience.state == "no_match":
+                    # For specific recall questions, use the scoped lookup as the
+                    # authority instead of mixing it with general memory summaries.
+                    contributions = [
+                        contribution for contribution in contributions if contribution.lane != "evidence"
+                    ]
+                    selected = []
+                    memory_sources = {}
+                contributions.append(ContextContribution(
+                    lane="evidence",
+                    text="核对结果。保留说话人和时间顺序，按问题区分原话与有效事实。\n"
+                    + render_experience(experience),
+                    origin=Origin.external_observation,
+                    visibility=Visibility.group_scope if is_group else Visibility.subject_private,
+                    source_event_ids=sources,
+                    token_budget=DEFAULT_BUDGETS["evidence"],
+                ))
 
         # 车道预算执行：按字符近似 token（中文 1 字≈1 token，英文≈4 字符/token）。
         # 超预算的车道截断并保留省略标记，而不是让提示无限增长。
@@ -1767,6 +1881,16 @@ class ContextCompiler:
         # 少算它们等于给自己开一道后门（原实现就是在这之前跑的，
         # 于是 capabilities 两段永远不进总预算，注释却写着"要参与"）。
         contributions = _apply_total_budget(contributions, compiled_meta)
+        if experience is not None and experience.items:
+            experience_refs = {
+                f"message:{item['message_id']}" for item in experience.items if "message_id" in item
+            }
+            injected = {
+                source for contribution in contributions if contribution.lane == "evidence"
+                for source in contribution.source_event_ids
+            }
+            compiled_meta["experience_recall"] = "injected" if experience_refs & injected else "not_injected"
+            compiled_meta["experience_source_ids"] = sorted(experience_refs & injected)
         if not any(c.lane == "evidence" for c in contributions):
             selected = []
             memory_sources = {}
@@ -1777,6 +1901,14 @@ class ContextCompiler:
         if selected_ids:
             with contextlib.suppress(Exception):
                 await self._memory.reinforce(selected_ids)
+
+        # A same-window fact lookup already checked when the statement was valid.
+        # Keep old turns (including any verbatim reply) out of this focused answer.
+        focused_fact = (
+            explicit_facts is not None and compiled_meta.get("experience_recall") == "injected"
+            and reply_reference is None
+        )
+        prompt_history = [] if focused_fact else usable
 
         # 每条消息在装配的**这一刻**就打上语义块标签（见 ``CompiledMessage``）。
         # `messages` 由这份标注生成，不是另拼一遍——两次拼装迟早会不一致，
@@ -1792,7 +1924,7 @@ class ContextCompiler:
         ]
 
         # 早期对话摘要放在最近原文之前。
-        if wants_earlier and window_ctx is not None and window_ctx.summary:
+        if not focused_fact and wants_earlier and window_ctx is not None and window_ctx.summary:
             annotated.append(
                 CompiledMessage(
                     role="system",
@@ -1812,7 +1944,7 @@ class ContextCompiler:
         # 私聊不需要——那里只有一个"你"。
         speaker_names: dict[str, str] = {}
         if is_group:
-            named_messages = [*usable, quoted] if quoted is not None else usable
+            named_messages = [*prompt_history, quoted] if quoted is not None else prompt_history
             wanted = {
                 m.sender_subject_id for m in named_messages if m.sender_subject_id
             }
@@ -1849,13 +1981,13 @@ class ContextCompiler:
             history_marks,
             reply_ids,
             current_mark,
-        ) = await self._message_id_marks(usable, current_message_platform_id)
+        ) = await self._message_id_marks(prompt_history, current_message_platform_id)
         quote_mark = None
         if reply_reference is not None and quoted is not None and quoted.role == "user":
             quote_mark = message_id_token(reply_reference.platform_id)
             reply_ids[quote_mark] = reply_reference.platform_id
 
-        for msg in usable:
+        for msg in prompt_history:
             if quoted is not None and msg.message_id == quoted.message_id:
                 continue
             role = "user" if msg.role == "user" else "assistant"
@@ -2025,6 +2157,7 @@ class ContextCompiler:
             snapshot=snapshot,
             annotated=annotated,
             reply_ids=dict(reply_ids),
+            experience=experience,
         )
 
     async def _has_replyable_ids(self, window_id: str) -> bool:

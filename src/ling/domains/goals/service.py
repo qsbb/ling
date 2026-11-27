@@ -56,6 +56,7 @@ class CommitmentView:
     # `due_commitments()` 只取 `active`——承诺一旦到期就永久失效。
     # 这个值在库里一直存着（`CommitmentRow.window_id`），只是没被读出来。
     window_id: str | None = None
+    source_event_ids: tuple[str, ...] = ()
 
 
 class GoalsService:
@@ -232,6 +233,8 @@ class GoalsService:
             row.state = "undeliverable"
         elif delivery_state == "failed":
             row.state = "missed"
+        elif delivery_state == "uncertain":
+            row.state = "uncertain"
         row.updated_at = utcnow()
         await self._session.flush()
         return self._commitment_view(row)
@@ -322,4 +325,5 @@ class GoalsService:
             delivery_state=row.delivery_state,
             cancel_reason=row.cancel_reason,
             window_id=row.window_id,
+            source_event_ids=tuple(row.source_event_ids or []),
         )

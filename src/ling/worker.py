@@ -51,6 +51,8 @@ from ling.kernel.visibility import (
 from ling.ports.channel import ChannelConnector
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from ling.domains.media.assets import GeneratedMediaService
     from ling.domains.speech.orchestration import SpeechOrchestrator
     from ling.infra.models import Window
@@ -536,6 +538,7 @@ async def handle_memory_extract(payload: dict) -> None:
         service = MemoryService(session, policy=await published_memory_policy(session))
         source_ids = [f"turn:{turn_id}"]
         source = None
+        window = None
         if await session.get(Turn, turn_id) is not None:
             window = await session.get(Window, window_id)
             if window is None or window.visibility != source_visibility:
@@ -592,6 +595,13 @@ async def handle_memory_extract(payload: dict) -> None:
         # The long-term index keeps the user's account of the conversation.
         # Ling's previous reply remains available from the retained transcript on
         # explicit source lookup, where it is labeled as her own speech.
+        previous = None
+        if source is not None and window is not None:
+            from ling.domains.memory.experience import preceding_message
+
+            previous = await preceding_message(
+                session, window=window, subject_id=subject_id, source=source,
+            )
         if user_text.strip():
             await service.record_episode(
                 subject_id=subject_id,
@@ -599,6 +609,7 @@ async def handle_memory_extract(payload: dict) -> None:
                 summary=f"用户：{user_text.strip()[:500]}",
                 source_event_ids=source_ids,
                 source_message_id=source.id if source else None,
+                previous_message_id=previous.id if previous else None,
                 occurred_at=source.created_at if source else None,
                 origin=Origin.external_observation,
                 visibility=Visibility(source_visibility),
@@ -635,6 +646,7 @@ async def handle_memory_extract(payload: dict) -> None:
                 source_message_id=source.id if source else None,
                 occurred_at=source.created_at if source else None,
                 fact_operation=fact_operation(cand, source_text),
+                previous_message_id=previous.id if previous else None,
             )
             # 实体关联：把"养了一只宠物""家人是妈""在做 X 项目"这类
             # 可被反复提到的对象建成实体，供"沿关系定位"用。
@@ -664,6 +676,7 @@ async def handle_relationship_update(payload: dict) -> None:
 
     from ling.contracts.v1 import Origin
     from ling.domains.affect.service import AffectService
+    from ling.domains.relationship.continuity import interaction_kind
     from ling.domains.relationship.service import RelationshipService
 
     subject_id = payload.get("subject_id")
@@ -689,7 +702,6 @@ async def handle_relationship_update(payload: dict) -> None:
             return "disclosure"
         return None
 
-    kind = _classify(user_text)
     async with session_scope() as session:
         from sqlalchemy import select
 
@@ -704,14 +716,21 @@ async def handle_relationship_update(payload: dict) -> None:
             ).limit(1)
         ):
             return
+        source = await session.scalar(select(Message).where(
+            Message.turn_id == turn_id, Message.role == "user", Message.sender_subject_id == subject_id,
+            Message.retracted_at.is_(None), Message.memory_hidden_at.is_(None),
+        ).order_by(Message.sequence.desc()).limit(1))
+        special = interaction_kind(source.text) if source is not None else None
+        kind = special or _classify(user_text)
         if kind is not None:
             await RelationshipService(session).record_event(
                 subject_id=subject_id,
                 kind=kind,
                 origin=Origin.user_statement,
-                source_event_ids=[f"turn:{turn_id}"],
+                source_event_ids=[f"message:{source.id}", f"turn:{turn_id}"] if source is not None else [f"turn:{turn_id}"],
                 note=user_text[:200],
                 turn_id=turn_id,
+                occurred_at=source.created_at if source is not None else None,
             )
             # 情绪跟随互动类型微调（幅度小、可衰减）
             # 窗口局部情绪：带具体原因，绝不跨窗口（ADR-0004 修正）。
@@ -825,7 +844,8 @@ async def handle_commitment_dispatch(payload: dict) -> None:
     from ling.domains.goals.service import GoalsService
 
     async with session_scope() as session:
-        goals = GoalsService(session)
+        actor_id = get_settings().actor_id
+        goals = GoalsService(session, actor_id=actor_id)
         due = await goals.due_commitments()
         if not due:
             return
@@ -841,6 +861,38 @@ async def handle_commitment_dispatch(payload: dict) -> None:
         delivery = DeliveryService(session)
         dispatched = 0
         for commitment in due:
+            from ling.domains.consent.service import ConsentService
+            from ling.domains.conversation.service import ConversationService
+            from ling.infra.models import CommitmentRow, Message, Window
+
+            row = await session.get(CommitmentRow, commitment.commitment_id, with_for_update=True, populate_existing=True)
+            if row is None or row.state != "active":
+                continue
+            source_refs = [ref.removeprefix("message:") for ref in commitment.source_event_ids if ref.startswith("message:")]
+            route_window = await session.get(Window, commitment.window_id) if commitment.window_id else None
+            if source_refs:
+                source = await session.get(Message, source_refs[-1])
+                if (
+                    route_window is None or route_window.archived or route_window.subject_id != commitment.subject_id
+                    or route_window.actor_id != actor_id or route_window.visibility != "subject_private"
+                    or source is None or source.window_id != route_window.id or source.role != "user"
+                    or source.sender_subject_id != commitment.subject_id or source.retracted_at is not None
+                    or source.memory_hidden_at is not None
+                ):
+                    await goals.mark_delivery(commitment.commitment_id, operation_id=None, delivery_state="unsupported")
+                    continue
+                if route_window.channel == "web":
+                    from ling.contracts.v1 import Origin
+
+                    await ConversationService(session, actor_id=actor_id).add_message(
+                        route_window.id, role="actor", text=commitment.text, origin=Origin.simulated,
+                    )
+                    await goals.mark_delivery(commitment.commitment_id, operation_id=None, delivery_state="delivered")
+                    dispatched += 1
+                    continue
+                if not await ConsentService(session).is_active(commitment.subject_id, "proactive_contact"):
+                    await goals.mark_delivery(commitment.commitment_id, operation_id=None, delivery_state="unsupported")
+                    continue
             # 会话定位**从承诺行自己取**，不依赖调度方传参。
             #
             # 原来这里只读 `payload["proactive_window_ref"]`，而调度方
@@ -853,12 +905,25 @@ async def handle_commitment_dispatch(payload: dict) -> None:
             # 找不到可用会话时才回落到"这个人最近的同渠道私聊窗口"。
             # payload 里的显式值仍优先：它是运维手工补投的逃生口，
             # 也保证既有手工投递用法不改变语义。
-            window_ref = str(payload.get("proactive_window_ref") or "")
+            window_ref = route_window.platform_reference if source_refs and route_window is not None else (
+                str(payload.get("proactive_window_ref") or "")
+            )
             if not window_ref:
                 window_ref = await _commitment_window_ref(
                     session, commitment=commitment, connector=None
                 )
-            connector = await _group_reply_connector("", window_ref) if window_ref else None
+            instance = route_window.trusted_instance_key if source_refs and route_window else None
+            if instance and route_window is not None and window_ref:
+                from ling.domains.identity.service import IdentityService
+
+                if await IdentityService(session).owns_private_window(route_window, commitment.subject_id):
+                    connector = await _group_reply_connector(instance[0], window_ref, instance_key=instance)
+                else:
+                    connector = None
+            elif source_refs:
+                connector = None
+            else:
+                connector = await _group_reply_connector("", window_ref) if window_ref else None
             if connector is None:
                 await goals.mark_delivery(
                     commitment.commitment_id,
@@ -880,9 +945,13 @@ async def handle_commitment_dispatch(payload: dict) -> None:
                         text=commitment.text,
                         is_group=is_group_window_ref(window_ref),
                     ),
-                    actor_id=get_settings().actor_id,
+                    actor_id=actor_id,
                     subject_id=commitment.subject_id,
                     require_proactive=True,
+                    payload_extra={
+                        "source": "commitment", "commitment_id": commitment.commitment_id,
+                        **({"target_instance_id": instance[1]} if instance else {}),
+                    },
                 )
             except ChannelError as exc:
                 # 不确定 ≠ 失败：结果未知只能等对账，不能当成功也不能盲目重发
@@ -900,7 +969,11 @@ async def handle_commitment_dispatch(payload: dict) -> None:
             # uncertain 要等对账）。判据集中在 DeliveryOutcome.delivered，
             # 不在这里另写一种拼法。
             _delivered = outcome.delivered
-            state = "sent" if _delivered else "failed"
+            state = "sent" if _delivered else (
+                str(outcome.receipt.state) if outcome.receipt is not None else str(outcome.state)
+            )
+            if state not in {"sent", "delivered", "failed", "uncertain", "unsupported"}:
+                state = "failed"
             await goals.mark_delivery(
                 commitment.commitment_id,
                 operation_id=outcome.operation_id,
@@ -2184,6 +2257,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
     """
     from ling.domains.proactive.dispatch import dispatch_pending
     from ling.infra.security import SecretBox
+    from ling.kernel.continuity_sharing import share_decision
     from ling.settings.service import ConfigService
 
     settings = get_settings()
@@ -2315,6 +2389,7 @@ async def handle_proactive_dispatch(payload: dict) -> None:
             subject_timezone=instance_timezone,
             subject_timezones=await timezone_by_subject(session),
             voice_dispatch=deliver_voice,
+            review_share=lambda row, moment: share_decision(session, row, now=moment),
         )
     if stats.get("skipped"):
         # 门控跳过要写清**为什么**：勿扰时段、日限额、没有会话…
@@ -2881,6 +2956,11 @@ async def _reply_in_group_window(  # noqa: ANN001
         sent += 1
     if sent < len(parts):
         return False, f"达到群聊回复条数上限，已发 {sent}/{len(parts)} 段"
+    from ling.domains.conversation.service import ConversationService
+
+    await ConversationService(session, actor_id=settings.actor_id).confirm_reply_delivery(
+        turn.id, window_id=window.id,
+    )
     return True, ""
 
 
@@ -3308,6 +3388,9 @@ async def handle_delivery_reconcile(payload: dict) -> None:  # noqa: ARG001
     **绝不因为对账失败就重发**：查不到 ≠ 没发出去。
     """
     from ling.domains.goals.delivery_reconcile import reconcile_deliveries
+    from ling.domains.goals.service import GoalsService
+    from ling.domains.proactive.dispatch import settle_reconciled_opportunity
+    from ling.infra.models import CommitmentRow, DeliveryReceiptRow, Operation
 
     await recover_dangling_turns()
 
@@ -3318,8 +3401,26 @@ async def handle_delivery_reconcile(payload: dict) -> None:  # noqa: ARG001
             logger.warning("对账连接器构造失败（%s）：%s", channel, type(exc).__name__)
             return None
 
+    async def _connector_for_target(channel: str, window_ref: str, instance_id: str) -> ChannelConnector | None:
+        return await _group_reply_connector(channel, window_ref, instance_key=(channel, instance_id))
+
+    async def _settle_outcome(session: AsyncSession, operation: Operation, receipt: DeliveryReceiptRow) -> None:
+        if operation.payload.get("source") == "proactive":
+            await settle_reconciled_opportunity(session, operation, receipt)
+        elif operation.payload.get("source") == "commitment":
+            row = await session.scalar(select(CommitmentRow).where(
+                CommitmentRow.id == operation.payload.get("commitment_id"),
+                CommitmentRow.actor_id == operation.actor_id, CommitmentRow.subject_id == operation.subject_id,
+                CommitmentRow.delivery_operation_id == operation.id, CommitmentRow.state == "uncertain",
+            ).with_for_update().execution_options(populate_existing=True))
+            if row is not None:
+                await GoalsService(session, actor_id=row.actor_id).mark_delivery(
+                    row.id, operation_id=operation.id, delivery_state=receipt.state,
+                )
+
     report = await reconcile_deliveries(
         connector_for=lambda _channel: None, connector_for_window=_connector_for,
+        connector_for_target=_connector_for_target, settle_outcome=_settle_outcome,
     )
     if not report.touched:
         return
@@ -3592,13 +3693,16 @@ async def handle_proactive_collect(payload: dict) -> None:
     在 `ProactivityService.gate` 与 `DeliveryService` 里，这里不重复实现。
     """
     from ling.domains.proactive.service import ProactivityService
+    from ling.kernel.continuity_sharing import activity_candidates
 
     actor_id = get_settings().actor_id
+    now = utcnow()
     async with session_scope() as session:
-        result = await ProactivityService(
-            session, actor_id=actor_id
-        ).collect_candidates()
-        await ProactivityService(session, actor_id=actor_id).expire_stale()
+        service = ProactivityService(session, actor_id=actor_id)
+        result = await service.collect_candidates(
+            now=now, additional=await activity_candidates(session, actor_id=actor_id, now=now),
+        )
+        await service.expire_stale(now)
     if result["created"] or result["skipped_duplicate"]:
         logger.info(
             "主动候选：新增 %d 条、去重跳过 %d 条",
@@ -3907,10 +4011,7 @@ async def handle_life_plan(payload: dict) -> None:
 
 # ---------------------------------------------------------------- 新时间轴的段边界（阶段 2）
 #
-# 设计 §3：`life.tick` 只在到期边界或事件有动作。**新时间轴（`day_plans`）**的
-# 边界由段决定，不再用"旧 agenda_plans 的计划时段已结束"当时钟证据：
-# 计划结束只允许 `paused` / `cancelled` + `needs_review` 原因码，
-# **绝不**自动 `completed`（完成必须有 observed / user_confirmed 证据）。
+# 新时间轴分别记录段内模拟动作和完成结果。只走到时段结束的活动仍暂停待复核。
 #
 # 旧 clock-only 路径只对旧 `agenda_plans` 的活动生效（它自己的证据闸
 # `ling.domains.evidence` 也仍然兜底）；新时间轴的段整条不走那条路。
@@ -3937,10 +4038,9 @@ async def _advance_timeline_boundaries(
 ) -> list[str]:
     """把新时间轴的段边界推进一格（幂等；返回人读的短标签，仅供日志）。
 
-    顺序固定，任何一步都**不写完成**：
+    各时段沿用同一个时钟：
 
-    1. 活动来源段已不再覆盖 ``now``（结束 / 被改版 / 被取消）→
-       ``running → paused``、``proposed → cancelled``，原因码 ``needs_review``；
+    1. 来源段结束时结算已有的段内模拟动作，取消的段单独收尾，剩下的段交给复核；
     2. 覆盖 ``now`` 的睡眠锚点 → 暂停仍在跑的模拟活动、场景 ``rest``；
        **不创建睡眠活动**（睡眠锚点只是预计休息，不是"她睡着了"）；
     3. 覆盖 ``now`` 的叶段 → 按 ``schedule_segment_id`` **唯一去重**起活动，
@@ -3963,17 +4063,20 @@ async def _advance_timeline_boundaries(
     actions: list[str] = []
 
     current = await activity.current()
-    # ① 来源段已经结束（含 superseded/cancelled 的段）：软收尾，绝不 completed。
-    # 只对"还在跑/还没开始"的活动动手：已经 paused 的不重复写（幂等）。
+    # ① 来源段结束或取消，先结算，再推进下一段。
     if (
         current is not None
         and current.schedule_segment_id
-        and current.state in {"running", "proposed"}
+        and current.state in {"running", "proposed", "paused"}
     ):
         if not view.covers_segment(current.schedule_segment_id):
-            ended = await activity.end_schedule_window(current.schedule_segment_id)
-            actions.append(f"end:{current.schedule_segment_id}:{ended.action}")
-            current = await activity.current()
+            settled = await activity.advance_simulation(current.schedule_segment_id, now=now, active=False)
+            if settled is None and current.state != "paused":
+                ended = await activity.end_schedule_window(current.schedule_segment_id, now=now)
+                settled = ended.action
+            if settled:
+                actions.append(f"end:{current.schedule_segment_id}:{settled}")
+                current = await activity.current()
     elif (
         current is not None
         and current.schedule_segment_id is None
@@ -3982,7 +4085,7 @@ async def _advance_timeline_boundaries(
         and current.state == "running"
         and await _plan_window_ended(session, current.plan_id, now=now)
     ):
-        await activity.transition(current.activity_id, "paused")
+        await activity.transition(current.activity_id, "paused", now=now)
         actions.append(f"end_legacy:{current.activity_id}")
         current = await activity.current()
 
@@ -3993,7 +4096,7 @@ async def _advance_timeline_boundaries(
             and current.state == "running"
             and current.origin == "simulated"
         ):
-            await activity.transition(current.activity_id, "paused")
+            await activity.transition(current.activity_id, "paused", now=now)
             actions.append(f"sleep_pause:{current.activity_id}")
             current = await activity.current()
         scene = await presence.scene(now=now)
@@ -4023,7 +4126,12 @@ async def _advance_timeline_boundaries(
                 f"schedule_segment:{segment.segment_id}",
                 f"plan:{segment.plan_id}",
             ],
+            now=now,
         )
+        if started.action == "existing":
+            progressed = await activity.advance_simulation(segment.segment_id, now=now, active=True)
+            if progressed:
+                actions.append(f"{progressed}:{segment.segment_id}")
         if started.action in {"created", "resumed"}:
             actions.append(f"{started.action}:{segment.segment_id}")
         if started.activity.state != "running":
@@ -4085,8 +4193,7 @@ async def handle_life_tick(payload: dict) -> None:
     两条路径**互斥**（按数据判定，不看开关）：
 
     - **新时间轴已接管**（`day_plans` 有行）→ 交给
-      :func:`_advance_timeline_boundaries`：按段边界开/停活动，计划时段结束
-      只暂停/取消 + `needs_review`，**绝不 completed**；
+      :func:`_advance_timeline_boundaries`，按段推进活动。有段内模拟动作时可结算模拟结果；
     - 否则走旧 `agenda_plans` 路径（下面这段逻辑保持不变）：醒着且有到点的
       计划 → 开模拟活动；该歇了 → 暂停；旧计划时段结束 → 旧的 clock-only
       收尾（它的证据种类仍是 `clock_only`，事实读侧（`ling.domains.evidence`）

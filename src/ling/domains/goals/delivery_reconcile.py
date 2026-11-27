@@ -39,12 +39,14 @@ from sqlalchemy import select
 from ling.capabilities.delivery import DeliveryService, group_reply_budget, reconcile_due
 from ling.contracts.v1 import OperationState
 from ling.infra.db import session_scope
-from ling.infra.models import Message, Operation, Window
+from ling.infra.models import DeliveryReceiptRow, Message, Operation, Window
 from ling.kernel.visibility import is_group_window_ref
 
 if TYPE_CHECKING:
     # 只在注解里用：`ling.ports.channel` 是这个模块的下游依赖，
     # 运行时导入没有意义（本模块的函数体里按需导入它）。
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from ling.ports.channel import ChannelConnector
 
 logger = logging.getLogger("ling.domains.goals.delivery_reconcile")
@@ -85,9 +87,9 @@ async def _pause(seconds: float) -> None:
         await asyncio.sleep(seconds)
 
 
-async def _due_uncertain() -> list[tuple[str, str, str | None]]:
-    """取出这一轮该对账的 uncertain 投递：`[(operation_id, channel, instance)]`。"""
-    rows: list[tuple[str, str, str | None]] = []
+async def _due_uncertain() -> list[tuple[str, str, str, str | None]]:
+    """取出到期的投递及发送时的渠道定位。"""
+    rows: list[tuple[str, str, str, str | None]] = []
     async with session_scope() as session:
         result = await session.execute(
             select(Operation)
@@ -107,7 +109,8 @@ async def _due_uncertain() -> list[tuple[str, str, str | None]]:
                 (
                     operation.id,
                     str(payload.get("channel") or ""),
-                    payload.get("instance"),
+                    str(payload.get("window_ref") or payload.get("instance") or ""),
+                    payload.get("target_instance_id"),
                 )
             )
             if len(rows) >= RECONCILE_BATCH:
@@ -198,6 +201,8 @@ async def reconcile_deliveries(
     # 原来写成 `object`，等于把"它到底是什么"丢给了调用处。
     connector_for: Callable[[str], Awaitable[ChannelConnector] | ChannelConnector | None],
     connector_for_window: Callable[[str, str], Awaitable[ChannelConnector | None]] | None = None,
+    connector_for_target: Callable[[str, str, str], Awaitable[ChannelConnector | None]] | None = None,
+    settle_outcome: Callable[[AsyncSession, Operation, DeliveryReceiptRow], Awaitable[None]] | None = None,
     limit: int = RECONCILE_BATCH,
     pause: Callable[[float], Awaitable[None]] | None = None,
     now: datetime | None = None,
@@ -215,10 +220,11 @@ async def reconcile_deliveries(
     moment = now or datetime.now(UTC)
 
     # ---------------------------------------------------------------- 1) 对账
-    for operation_id, channel, _instance in await _due_uncertain():
-        connector = await _resolve(
-            connector_for, channel, connector_for_window, str(_instance or "")
-        )
+    for operation_id, channel, window_ref, instance_id in await _due_uncertain():
+        if instance_id is not None and connector_for_target is not None:
+            connector = await connector_for_target(channel, window_ref, instance_id)
+        else:
+            connector = await _resolve(connector_for, channel, connector_for_window, window_ref)
         if connector is None:
             continue
         report.scanned += 1
@@ -227,6 +233,11 @@ async def reconcile_deliveries(
                 outcome = await DeliveryService(session).reconcile(
                     connector, operation_id
                 )
+                if (settle_outcome is not None and outcome.receipt is not None
+                        and outcome.state in {OperationState.succeeded, OperationState.failed}):
+                    operation = await session.get(Operation, operation_id)
+                    if operation is not None:
+                        await settle_outcome(session, operation, outcome.receipt)
         except Exception as exc:  # noqa: BLE001 - 单条失败不能吞掉整轮
             logger.warning(
                 "对账失败（保持 uncertain）：op=%s %s", operation_id, type(exc).__name__

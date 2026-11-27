@@ -19,8 +19,10 @@ from ling.infra.models import (
     MemorySourceForgetMarker,
     Message,
     OutboxEvent,
+    ProactiveOpportunity,
     PromptSnapshot,
     RelationshipEvent,
+    RelationshipPreference,
     SharedArrangement,
     SharedArrangementEvidence,
     Subject,
@@ -35,21 +37,35 @@ async def forget_source(
 ) -> bool:
     """Remove one source cluster. Independent messages remain eligible for learning."""
     await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
-    target = await session.scalar(select(MemoryRow).where(
+    assertion = await session.scalar(select(MemoryRow).where(
         MemoryRow.id == memory_id, MemoryRow.subject_id == subject_id,
     ).with_for_update())
+    episode = await session.scalar(select(MemoryEpisode).where(
+        MemoryEpisode.id == memory_id, MemoryEpisode.subject_id == subject_id,
+    ).with_for_update()) if assertion is None else None
+    target = assertion or episode
     if target is None or not target.source_message_id:
         return False
     source = await session.get(Message, target.source_message_id, with_for_update=True)
-    if (
-        source is None or source.role != "user" or source.window_id != target.source_window_id
-        or source.sender_subject_id != subject_id or not source.turn_id
-    ):
+    window_id = target.source_window_id if isinstance(target, MemoryRow) else target.window_id
+    window = await session.get(Window, window_id) if window_id is not None else None
+    if window is None or source is None or source.window_id != window.id:
+        return False
+    own_spoken = source.role == "user" and (
+        source.sender_subject_id == subject_id
+        or (source.sender_subject_id is None and window.subject_id == subject_id
+            and window.visibility in {"window_private", "subject_private"})
+    )
+    own_reply = (
+        source.role == "actor" and assertion is not None and assertion.slot == "pinned_message"
+        and window.subject_id == subject_id and window.visibility in {"subject_private", "window_private"}
+    )
+    if not (own_spoken or own_reply):
         return False
 
     await apply_source_forget(
         session, subject_id=subject_id, message_id=source.id,
-        window_id=source.window_id, turn_id=source.turn_id, forgotten_at=utcnow(),
+        window_id=source.window_id, turn_id=source.turn_id or source.id, forgotten_at=utcnow(),
     )
     return True
 
@@ -80,7 +96,7 @@ async def apply_source_forget(
     )))
 
     await session.execute(update(Message).where(
-        Message.window_id == window_id, Message.turn_id == turn_id,
+        Message.window_id == window_id, or_(Message.turn_id == turn_id, Message.id == message_id),
     ).values(memory_hidden_at=forgotten_at))
     await session.execute(delete(SharedArrangement).where(
         SharedArrangement.id.in_(select(SharedArrangementEvidence.arrangement_id).where(
@@ -115,6 +131,21 @@ async def apply_source_forget(
     ))
     await session.execute(delete(MemoryRow).where(MemoryRow.id.in_(assertion_ids)))
     await session.execute(delete(MemoryEpisode).where(MemoryEpisode.id.in_(episode_ids)))
+    await session.execute(delete(RelationshipPreference).where(
+        RelationshipPreference.subject_id == subject_id, RelationshipPreference.source_message_id == message_id,
+    ))
+    await session.execute(update(ProactiveOpportunity).where(
+        ProactiveOpportunity.subject_id == subject_id,
+        or_(
+            ProactiveOpportunity.related_memory_id.in_(assertion_ids),
+            ProactiveOpportunity.related_memory_id.in_(select(MemoryRow.id).join(
+                MemoryEpisode, MemoryEpisode.source_message_id == MemoryRow.source_message_id,
+            ).where(
+                MemoryRow.subject_id == subject_id, MemoryEpisode.previous_message_id == message_id,
+            )),
+        ),
+        ProactiveOpportunity.state.in_(("candidate", "drafting", "bound_candidate")),
+    ).values(state="rejected", rejected_reason="共同经历已不可用", draft_text=None))
     await session.execute(update(RelationshipEvent).where(
         RelationshipEvent.subject_id == subject_id, RelationshipEvent.turn_id == turn_id,
     ).values(note=None))

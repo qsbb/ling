@@ -78,8 +78,11 @@ from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from ling.domains.proactive.service import ShareDecision
 from ling.infra.models import (
+    DeliveryReceiptRow,
     IdempotencyKey,
+    Operation,
     ProactiveDraftBinding,
     ProactiveOpportunity,
     Window,
@@ -278,6 +281,12 @@ async def _claim_opportunity(
 ) -> str:
     """Atomically reserve one opportunity before any external send begins."""
     key = str(opportunity.id)
+    current = await session.scalar(select(ProactiveOpportunity).where(
+        ProactiveOpportunity.id == key,
+    ).with_for_update().execution_options(populate_existing=True))
+    if current is None or current.state not in {"candidate", "bound_candidate", "dispatching"}:
+        return "skipped"
+    opportunity = current
     claim = await session.scalar(
         select(IdempotencyKey).where(
             IdempotencyKey.scope == PROACTIVE_DISPATCH_SCOPE,
@@ -522,7 +531,9 @@ async def _bound_delivery_target_allowed_in_session(
     return True
 
 
-async def _release_pre_send_claim(session: AsyncSession, *, opportunity_id: str) -> None:
+async def _release_pre_send_claim(
+    session: AsyncSession, *, opportunity_id: str, reason: str = "草稿对应的目标暂不可用",
+) -> None:
     """Release a claim only while no external delivery has begun."""
     opportunity = await session.scalar(
         select(ProactiveOpportunity).where(ProactiveOpportunity.id == opportunity_id)
@@ -536,10 +547,18 @@ async def _release_pre_send_claim(session: AsyncSession, *, opportunity_id: str)
             and claim.result_ref == _DISPATCH_IN_PROGRESS):
         await session.delete(claim)
         await _release_daily_quota(session, opportunity_id=opportunity_id)
-        opportunity.state = "bound_candidate"
+        is_bound = await session.get(ProactiveDraftBinding, opportunity_id) is not None
+        opportunity.state = "bound_candidate" if is_bound else "candidate"
         opportunity.last_gate_allowed = False
-        opportunity.last_gate_reasons = ["草稿对应的目标暂不可用"]
+        opportunity.last_gate_reasons = [reason]
+        opportunity.last_gate_at = utcnow()
     await session.commit()
+
+
+class _ShareBlocked(Exception):
+    def __init__(self, *, reason: str, terminal: bool = False) -> None:
+        super().__init__(reason)
+        self.terminal = terminal
 
 
 class _SendProbe:
@@ -554,8 +573,11 @@ class _SendProbe:
     只代理 `deliver` 真正用到的两个方法，其余属性（`connector_id` 等）透传。
     """
 
-    def __init__(self, inner: object) -> None:
+    def __init__(
+        self, inner: object, *, before_send: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._inner = inner
+        self._before_send = before_send
         # 平台是否真的被调用过。进了 send 就算：它可能已经在平台侧生效。
         self.send_attempted = False
         # 平台回执。None = 没拿到回执（不是"拿到了空回执"）。
@@ -569,6 +591,8 @@ class _SendProbe:
         return self._inner.capabilities()  # type: ignore[attr-defined]
 
     async def send(self, message: object) -> object:
+        if self._before_send is not None:
+            await self._before_send()
         self.send_attempted = True
         self.operation_id = getattr(message, "operation_id", None)
         receipt = await self._inner.send(message)  # type: ignore[attr-defined]
@@ -626,6 +650,7 @@ async def dispatch_pending(
     connector_for_window: Callable[..., Awaitable[ChannelConnector | None]] | None = None,
     voice_dispatch: Callable[[ProactiveOpportunity, Window, object | None], Awaitable[str]]
     | None = None,
+    review_share: Callable[[ProactiveOpportunity, datetime], Awaitable[ShareDecision | None]] | None = None,
 ) -> dict[str, int | str]:
     """把有草稿的候选真的发出去。
 
@@ -722,6 +747,51 @@ async def dispatch_pending(
 
     sent = rejected = 0
     failed = uncertain = recovered_uncertain
+
+    async def continuity_gate(row: ProactiveOpportunity, target: Window | None) -> None:
+        checked = now or utcnow()
+        if row.target_window_id is not None:
+            from ling.settings.user_preferences import load_user_timezone
+
+            current = await config_reader.effective()  # type: ignore[attr-defined]
+            if not current.dialogue.proactive_delivery_enabled:
+                raise _ShareBlocked(reason="主动投递已关闭")
+            timezone, _source = await load_user_timezone(
+                session, subject_id=row.subject_id, env=subject_timezone,
+            )
+            gate = await ProactivityService(session, actor_id=actor_id, policy=current.dialogue).gate(
+                subject_id=row.subject_id, now=checked, subject_timezone=timezone, channel_can_proactive=True,
+            )
+            if not gate.allowed:
+                raise _ShareBlocked(reason="；".join(gate.reasons))
+            current_target = await session.get(Window, row.target_window_id, populate_existing=True)
+            if target is None or current_target is None:
+                raise _ShareBlocked(reason="原会话目标已不可用", terminal=True)
+            if current_target.archived or current_target.subject_id != row.subject_id:
+                raise _ShareBlocked(reason="原会话目标已不可用", terminal=True)
+        if row.expires_at <= checked:
+            raise _ShareBlocked(reason="机会已过期（时效性）", terminal=True)
+        if review_share is None and row.target_window_id is not None:
+            raise _ShareBlocked(reason="共同经历暂时无法复核")
+        decision = await review_share(row, checked) if review_share is not None else None
+        if decision is not None:
+            raise _ShareBlocked(reason=decision.reason, terminal=decision.terminal)
+
+    async def settle_blocked(row: ProactiveOpportunity, block: _ShareBlocked) -> None:
+        nonlocal rejected
+        if not block.terminal:
+            await _release_pre_send_claim(session, opportunity_id=row.id, reason=str(block))
+            return
+        row.last_gate_allowed = False
+        row.last_gate_reasons = [str(block)]
+        row.last_gate_at = now or utcnow()
+        if row.related_memory_id:
+            row.draft_text = None
+        await settle(
+            row, state="expired" if row.expires_at <= (now or utcnow()) else "rejected", reason=str(block),
+        )
+        rejected += 1
+
     async def reserve(row: ProactiveOpportunity) -> bool:
         nonlocal failed, uncertain
         checked_at = now or utcnow()
@@ -785,7 +855,31 @@ async def dispatch_pending(
         selected = connector
         window_ref = None
         selected_window: Window | None = None
-        if binding is not None:
+        if row.target_window_id is not None:
+            target = await session.get(Window, row.target_window_id, populate_existing=True)
+            if target is None or target.archived or target.visibility != "subject_private":
+                if await reserve(row):
+                    await settle_blocked(row, _ShareBlocked(reason="原会话目标已不可用", terminal=True))
+                continue
+            if target.channel == "web":
+                bound_web_window, selected = target, None
+            else:
+                selected_window = target
+                window_ref = target.platform_reference
+                instance = target.trusted_instance_key
+                if instance is None or not window_ref:
+                    continue
+                if connector_for_window is not None:
+                    selected = await connector_for_window(str(target.channel), window_ref, instance_key=instance)
+                if (
+                    selected is None or selected.instance_id != window_ref.split(":", 1)[0]
+                    or selected.connector_id != instance[0] or getattr(selected, "_ling_instance_key", instance) != instance
+                    or not selected.capabilities().supports_proactive
+                ):
+                    row.last_gate_allowed = False
+                    row.last_gate_reasons = ["原会话渠道暂不支持主动投递"]
+                    continue
+        elif binding is not None:
             bound = await _bound_delivery_target(
                 session, opportunity=row, binding=binding, config_reader=config_reader,
                 deliver_to_web=deliver_to_web, connector_for_window=connector_for_window,
@@ -884,13 +978,18 @@ async def dispatch_pending(
                 continue
             if not await reserve(row):
                 continue
+            try:
+                await continuity_gate(row, window)
+            except _ShareBlocked as block:
+                await settle_blocked(row, block)
+                continue
             if binding is not None and not await bound_delivery_target_allowed(
                 session, opportunity_id=row.id, window_id=window.id, config_reader=config_reader,
                 channel="web", expected_target=selected_target_fingerprint or "",
             ):
                 await _release_pre_send_claim(session, opportunity_id=row.id)
                 continue
-            await _append_web_message(
+            await _append_conversation_message(
                 session,
                 window_id=window.id,
                 text=str(row.draft_text),
@@ -966,7 +1065,13 @@ async def dispatch_pending(
             await _release_pre_send_claim(session, opportunity_id=row.id)
             continue
         delivery = DeliveryService(session)
-        probe = _SendProbe(selected)
+
+        async def before_send(
+            selected_row: ProactiveOpportunity = row, target: Window | None = selected_window,
+        ) -> None:
+            await continuity_gate(selected_row, target)
+
+        probe = _SendProbe(selected, before_send=before_send)
         try:
             # 每次投递各自一个 SAVEPOINT。
             #
@@ -988,8 +1093,16 @@ async def dispatch_pending(
                     require_proactive=True,
                     # 记下"这条 operation 属于哪个机会"。异常路径下 deliver
                     # 不会把 operation 交回来，事后只能靠 payload 反查。
-                    payload_extra={"opportunity_id": row.id, "source": "proactive"},
+                    payload_extra={
+                        "opportunity_id": row.id, "source": "proactive",
+                        **({"target_window_id": row.target_window_id} if row.target_window_id else {}),
+                        **({"target_instance_id": selected_window.trusted_instance_key[1]}
+                           if selected_window is not None and selected_window.trusted_instance_key else {}),
+                    },
                 )
+        except _ShareBlocked as block:
+            await settle_blocked(row, block)
+            continue
         except asyncio.CancelledError:
             await settle(
                 row,
@@ -1040,6 +1153,10 @@ async def dispatch_pending(
         )
 
         if outcome.delivered:
+            if row.related_memory_id is not None and selected_window is not None:
+                await _append_conversation_message(
+                    session, window_id=selected_window.id, text=str(row.draft_text), opportunity_id=row.id,
+                )
             await settle(
                 row,
                 state="sent",
@@ -1072,7 +1189,43 @@ async def dispatch_pending(
     }
 
 
-async def _append_web_message(
+async def settle_reconciled_opportunity(
+    session: AsyncSession, operation: Operation, receipt: DeliveryReceiptRow,
+) -> None:
+    """Apply a terminal platform receipt to the original opportunity once."""
+    from ling.domains.proactive.service import ProactivityService
+
+    data = operation.payload
+    row = await session.scalar(select(ProactiveOpportunity).where(
+        ProactiveOpportunity.id == data.get("opportunity_id"),
+        ProactiveOpportunity.actor_id == operation.actor_id,
+        ProactiveOpportunity.subject_id == operation.subject_id,
+        ProactiveOpportunity.delivery_operation_id == operation.id,
+        ProactiveOpportunity.state == "uncertain",
+    ).with_for_update().execution_options(populate_existing=True))
+    if row is None:
+        return
+    state = "sent" if receipt.state in {"sent", "delivered"} else "failed"
+    if state == "sent":
+        row.rejected_reason = None
+        if row.related_memory_id is not None and row.draft_text and row.target_window_id == data.get("target_window_id"):
+            window = await session.get(Window, row.target_window_id, populate_existing=True) if row.target_window_id else None
+            if (
+                window is not None and window.actor_id == row.actor_id and window.subject_id == row.subject_id
+                and window.visibility == "subject_private" and window.platform_reference == data.get("window_ref")
+                and window.channel == receipt.channel
+            ):
+                await _append_conversation_message(
+                    session, window_id=window.id, text=row.draft_text, opportunity_id=row.id,
+                )
+    await ProactivityService(session, actor_id=row.actor_id).mark(
+        row.id, state=state, reason=receipt.detail if state == "failed" else None, delivery_state=receipt.state,
+    )
+    await _settle_daily_quota(session, opportunity_id=row.id, delivery_state=state)
+    await _set_claim_result(session, opportunity_id=row.id, state=state)
+
+
+async def _append_conversation_message(
     session: AsyncSession, *, window_id: str, text: str, opportunity_id: str
 ) -> None:
     """把主动消息落成会话里的一条她的消息。

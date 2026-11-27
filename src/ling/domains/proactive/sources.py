@@ -67,6 +67,11 @@ class Candidate:
     # 是否期待对方回应。默认按原因码推导：
     # 用户要求的提醒期待回应，生活分享不期待（不能因为没人回就追问）
     reply_expected: bool = False
+    related_memory_id: str | None = None
+    target_window_id: str | None = None
+    source_consent_revision: int | None = None
+    source_target_fingerprint: str | None = None
+    draft_text: str | None = None
 
 
 def dedupe_key_for(candidate: Candidate) -> str:
@@ -89,7 +94,6 @@ class CausalSource:
         out: list[Candidate] = []
         out.extend(await self._commitments_due(now))
         out.extend(await self._intents_due(now))
-        out.extend(await self._activities_done(now))
         return out
 
     async def _intents_due(self, now: datetime) -> list[Candidate]:
@@ -142,6 +146,9 @@ class CausalSource:
         due = await goals.due_commitments()
         out: list[Candidate] = []
         for commitment in due:
+            if any(ref.startswith("message:") for ref in commitment.source_event_ids):
+                # Chat reminders are delivered by commitment.dispatch.
+                continue
             out.append(
                 Candidate(
                     subject_id=commitment.subject_id,
@@ -154,20 +161,6 @@ class CausalSource:
                 )
             )
         return out
-
-    async def _activities_done(self, now: datetime) -> list[Candidate]:
-        """刚完成且有证据的模拟活动。
-
-        **必须有完成证据**——没有证据的"我做完了"是编造经历。
-        而且只在与某人有关的窗口里生成（活动本身不带 subject，
-        这里保守地不按活动生成主动联系，避免变成"汇报生活"）。
-        """
-        # 保守起见：暂不从活动生成主动候选。
-        # 理由：活动是角色自己的生活，主动汇报容易变成自言自语式打扰；
-        # 等有了真实的"共处会话"再按会话主体生成。
-        _ = now
-        return []
-
 
 __all__ = [
     "REASON_ACTIVITY_DONE",

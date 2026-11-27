@@ -1,5 +1,52 @@
 {
   "$defs": {
+    "MemoryRecallDiagnostic": {
+      "additionalProperties": false,
+      "properties": {
+        "expression": {
+          "anyOf": [
+            {
+              "enum": [
+                "quoted",
+                "no_literal_match"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expression"
+        },
+        "source_message_ids": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Source Message Ids",
+          "type": "array"
+        },
+        "state": {
+          "enum": [
+            "not_extracted",
+            "not_visible",
+            "no_match",
+            "not_injected",
+            "injected",
+            "used_source"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "MemoryRecallDiagnostic",
+      "type": "object"
+    },
     "PromptBlock": {
       "description": "快照里一段内容的语义块。由**编译器在装配时标注**，不是事后猜的。\n\n``key`` 是闭集：新车道没写进映射表时落到 ``other``，不会静默算进别的组。",
       "enum": [
@@ -312,6 +359,17 @@
       ],
       "default": null,
       "title": "Expires At"
+    },
+    "memory_recall": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryRecallDiagnostic"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "message_id": {
       "maxLength": 128,

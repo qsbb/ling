@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import LingError, not_found, unauthorized
 from ling.contracts.v1 import ErrorCode
-from ling.infra.models import ActorAccount, AuthSession, Subject, User, utcnow
+from ling.infra.models import ActorAccount, AuthSession, Subject, User, Window, utcnow
 from ling.infra.security import (
     DUMMY_PASSWORD_HASH,
     hash_password,
@@ -1124,6 +1124,19 @@ class IdentityService:
         # 跟随合并指针：账号仍挂在原来的 subject 上，但**解析结果**必须是
         # 合并后的那个人——否则合并之后两个号还是两个人。
         return await self.canonical_subject(row.subject_id)
+
+    async def owns_private_window(self, window: Window, subject_id: str) -> bool:
+        """Verify the current owner of a proven private platform window."""
+        if window.visibility != "subject_private" or window.subject_id != subject_id or window.archived:
+            return False
+        instance = window.trusted_instance_key
+        if instance is None or instance[0] != window.channel:
+            return False
+        # The route has a stable instance ID. The account binding uses the namespace in the platform ref.
+        namespace, sep, account = window.platform_reference.rpartition(":private:")
+        if not sep or not namespace or not account:
+            return False
+        return await self.resolve_account(namespace, account) == subject_id
 
     async def resolve_proven_login_binding(
         self,

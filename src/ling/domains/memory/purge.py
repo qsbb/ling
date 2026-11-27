@@ -117,6 +117,7 @@ from ling.infra.models import (
     AwarenessItemRow,
     CoreMemoryRow,
     EntityRow,
+    HandoffCapsuleRow,
     KnowledgeItem,
     MediaEvidenceRow,
     MemoryEmbeddingRow,
@@ -126,8 +127,10 @@ from ling.infra.models import (
     MemoryRetrievalLog,
     MemoryRow,
     OutboxEvent,
+    ProactiveOpportunity,
     PromptSnapshot,
     RelationshipEvent,
+    RelationshipPreference,
     SharedArrangement,
     SharedArrangementEvidence,
     Subject,
@@ -396,6 +399,18 @@ async def purge_subject(
                 SharedArrangementEvidence.subject_id == subject_id,
             )),
         ))
+        await session.execute(delete(RelationshipPreference).where(
+            RelationshipPreference.subject_id == subject_id,
+            RelationshipPreference.kind == "expression",
+        ))
+        await session.execute(delete(HandoffCapsuleRow).where(
+            HandoffCapsuleRow.subject_id == subject_id, HandoffCapsuleRow.source_message_id.is_not(None),
+        ))
+        await session.execute(update(ProactiveOpportunity).where(
+            ProactiveOpportunity.subject_id == subject_id,
+            ProactiveOpportunity.related_memory_id.is_not(None),
+            ProactiveOpportunity.state.in_(("candidate", "drafting", "bound_candidate")),
+        ).values(state="rejected", rejected_reason="共同经历已不可用", draft_text=None))
 
         # 3) 核心记忆（`core_memories`：称呼/边界/禁忌正文）与意识条目
         #    （`awareness_items`：跨会话事实投影，第三人称转述）。两者都是

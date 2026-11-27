@@ -106,9 +106,10 @@ async def record_contribution(
             return
         if previous.sequence >= source.sequence:
             return
-        arrangement = await session.get(SharedArrangement, previous.arrangement_id, with_for_update=True)
-        if arrangement is None or arrangement.window_id != source.window_id:
+        earlier_arrangement = await session.get(SharedArrangement, previous.arrangement_id, with_for_update=True)
+        if earlier_arrangement is None or earlier_arrangement.window_id != source.window_id:
             return
+        arrangement = earlier_arrangement
         root = await session.get(SharedArrangementEvidence, arrangement.id)
         if root is None or (contribution.action == "confirmed" and root.subject_id == subject_id):
             return

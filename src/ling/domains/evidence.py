@@ -138,6 +138,7 @@ class EvidenceKind(StrEnum):
     """完成证据的种类。值写进 ``completion_evidence`` 前缀，是机器契约。"""
 
     clock_only = "clock_only"
+    simulated_outcome = "simulated_outcome"
     observed = "observed"
     user_confirmed = "user_confirmed"
 

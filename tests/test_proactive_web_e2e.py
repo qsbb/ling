@@ -174,6 +174,7 @@ async def test_due_commitment_collects_drafts_and_dispatches_to_web(
     monkeypatch.setattr(proactive_module, "datetime", _FrozenDateTime)
     monkeypatch.setattr(draft_module, "utcnow", lambda: FROZEN_NOW)
     monkeypatch.setattr(dispatch_module, "utcnow", lambda: FROZEN_NOW)
+    monkeypatch.setattr(worker, "utcnow", lambda: FROZEN_NOW)
     test_settings = replace(env.settings, user_timezone="Asia/Shanghai")
     monkeypatch.setattr(worker, "get_settings", lambda: test_settings)
     monkeypatch.setattr(worker, "proactive_connector", lambda: None, raising=False)

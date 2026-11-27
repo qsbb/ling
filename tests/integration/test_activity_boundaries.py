@@ -2,8 +2,8 @@
 
 守设计 §3 的可程序化验收：
 
-1. 跑一天 tick 后 ``activities`` 只出现 ``proposed`` / ``running`` / ``paused`` /
-   ``cancelled``——**没有 completed**，``self_experiences`` 计数不变；
+1. 段内有模拟动作的活动结算为模拟结果，仅经过时钟边界的活动暂停，
+   ``self_experiences`` 计数不变；
 2. 到段边界由 ``schedule_segment_id`` **唯一去重**起活动：重启/重复 tick
    不会为同一段再开一个；
 3. 睡眠锚点只暂停 + 场景 ``rest``，**不创建睡眠活动**；
@@ -226,10 +226,10 @@ async def _tick(monkeypatch: pytest.MonkeyPatch, minute: int) -> None:
 # ---------------------------------------------------------------- 跑一天
 
 
-async def test_full_day_never_completes_anything(
+async def test_full_day_only_completes_activities_with_simulated_progress(
     web_env: TestEnv, monkeypatch: pytest.MonkeyPatch  # noqa: ARG001
 ) -> None:
-    """跑一整天 tick：没有 completed，也没有一条自我经历。"""
+    """段内有过推进才结算模拟结果，单次 tick 的短段依旧暂停。"""
     await _seed_routine()
     ids = await _seed_day()
 
@@ -237,10 +237,16 @@ async def test_full_day_never_completes_anything(
         await _tick(monkeypatch, minute)
 
     activities = await _activities()
-    states = {str(item.state) for item in activities}
-    assert "completed" not in states, f"计划时段结束被写成了完成: {states}"
-    assert states <= {"proposed", "running", "paused", "cancelled"}, states
-    assert await _count(SelfExperienceRow) == 0, "计划不是事实：不该派生自我经历"
+    by_segment = {item.schedule_segment_id: item for item in activities}
+    for key in ("work", "reading"):
+        row = by_segment[ids[key]]
+        assert row.state == "completed" and row.simulation_observed_at is not None
+        assert row.completion_evidence.startswith("kind=simulated_outcome;")
+    for key in ("breakfast", "lunch"):
+        row = by_segment[ids[key]]
+        assert row.state == "paused" and row.completion_evidence is None
+        assert row.simulation_observed_at is None
+    assert await _count(SelfExperienceRow) == 0, "模拟结果不该写入真实经历"
 
     # 每一段最多一条活动，且都挂在真实叶段上（睡眠锚点不产生活动）
     leaf_ids = {

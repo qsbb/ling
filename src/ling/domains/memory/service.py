@@ -92,13 +92,20 @@ def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
 
 def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement[bool]:
     """A linked source must still belong to its original window and be available."""
-    window_id = model.source_window_id if model is MemoryRow else model.window_id
+    window_id = MemoryRow.source_window_id if model is MemoryRow else MemoryEpisode.window_id
+    speaker = Message.role == "user"
+    if model is MemoryRow:
+        # A pin can refer to an actual actor reply as well as a user's statement.
+        speaker = or_(
+            speaker, (MemoryRow.slot == "pinned_message") & (Message.role == "actor"),
+        )
     active = select(Message.id).where(
         Message.id == model.source_message_id,
         Message.window_id == window_id,
-        Message.role == "user",
+        speaker,
         Message.memory_hidden_at.is_(None),
         Message.retracted_at.is_(None),
+        Message.recalled_at.is_(None),
     ).exists()
     return or_(model.source_message_id.is_(None), active)
 
@@ -128,7 +135,7 @@ async def store_embeddings(
         }
         if not candidates:
             continue
-        content = model.text if model is MemoryRow else model.summary
+        content = MemoryRow.text if model is MemoryRow else MemoryEpisode.summary
         query = select(model.id, content).where(
             model.id.in_(candidates), model.archived_at.is_(None), active_source(model),
         )
@@ -580,6 +587,7 @@ class MemoryService:
         value: str | None = None,
         fact_operation: Literal["assert", "change", "correct", "historical"] = "change",
         occurred_at: datetime | None = None,
+        previous_message_id: str | None = None,
     ) -> str | None:
         """接受一条记忆候选。无证据或来源是模型推测时拒绝写入长期记忆。"""
         if not proposal.source_event_ids:
@@ -618,14 +626,43 @@ class MemoryService:
         new_id_value = new_id("mem")
         valid_until = proposal.valid_until
         previous: list[MemoryRow] = []
+        following: MemoryRow | None = None
         if slot and is_single_value(slot) and proposal.kind == "assertion" and phase == "current":
-            previous, following_at = await self._fact_neighbors(
+            previous, following = await self._fact_neighbors(
                 subject_id=subject_id, slot=slot, effective_at=effective_at,
                 source_window_id=source_window_id, source_visibility=source_visibility,
                 visibility=proposal.visibility.value,
             )
-            if following_at is not None:
-                valid_until = min(valid_until, following_at) if valid_until else following_at
+        if slot == "likes" and proposal.kind == "assertion" and source_message_id is not None:
+            # Likes are multi-valued. An explicit revision refers to one prior
+            # statement in this window. Other preferences retain their validity.
+            scoped = select(MemoryRow).where(
+                MemoryRow.subject_id == subject_id, MemoryRow.slot == slot, MemoryRow.kind == "assertion",
+                MemoryRow.fact_phase == "current", MemoryRow.source_window_id == source_window_id,
+                MemoryRow.source_visibility == source_visibility, MemoryRow.visibility == proposal.visibility.value,
+                MemoryRow.retracted.is_(False), MemoryRow.archived_at.is_(None), active_source(MemoryRow),
+            )
+            if previous_message_id and fact_operation in {"change", "correct"}:
+                previous = list(await self._session.scalars(
+                    scoped.where(MemoryRow.source_message_id == previous_message_id),
+                ))
+            following = await self._session.scalar(
+                scoped.join(MemoryEpisode, MemoryEpisode.source_message_id == MemoryRow.source_message_id)
+                .where(
+                    MemoryEpisode.previous_message_id == source_message_id,
+                    MemoryEpisode.subject_id == subject_id, MemoryEpisode.window_id == source_window_id,
+                    MemoryRow.valid_from > effective_at, MemoryRow.fact_operation.in_(("change", "correct")),
+                ).order_by(MemoryRow.valid_from, MemoryRow.id).limit(1)
+            )
+        if following is not None:
+            following_at = following.valid_from or following.created_at
+            valid_until = min(valid_until, following_at) if valid_until else following_at
+        retroactive_correction = bool(
+            following is not None and following.fact_operation == "correct"
+            and (following.value or following.text).strip() != (value or proposal.text).strip()
+        )
+        if following is not None and not following.supersedes:
+            following.supersedes = new_id_value
         if fact_operation == "historical":
             valid_until = min(valid_until, effective_at) if valid_until else effective_at
         different = [
@@ -653,8 +690,11 @@ class MemoryService:
             valid_from=None if fact_operation == "historical" else effective_at,
             valid_until=valid_until,
             supersedes=different[0].id if different and fact_operation in {"change", "correct"} else None,
+            superseded_by=following.id if following is not None else None,
             consent_revision=0,
-            retracted=False,
+            retracted=retroactive_correction,
+            retracted_at=recorded_at if retroactive_correction else None,
+            retract_reason="user_correction" if retroactive_correction else None,
             source_window_id=source_window_id,
             source_account=source_account,
             source_message_id=source_message_id,
@@ -662,6 +702,7 @@ class MemoryService:
             turn_id=turn_id,
             slot=slot,
             fact_phase=phase,
+            fact_operation=fact_operation,
             value=(value or None),
             # 保留期**在写入时按当时的已发布策略盖章**。不盖的话，
             # 列默认值 365 会把策略默认 3650 永远压住（设置里的 3650
@@ -698,6 +739,7 @@ class MemoryService:
         summary: str,
         source_event_ids: list[str],
         source_message_id: str | None = None,
+        previous_message_id: str | None = None,
         origin: Origin = Origin.user_statement,
         visibility: Visibility = Visibility.subject_private,
         occurred_at: datetime | None = None,
@@ -728,6 +770,7 @@ class MemoryService:
             visibility=visibility.value,
             source_event_ids=list(source_event_ids),
             source_message_id=source_message_id,
+            previous_message_id=previous_message_id,
             occurred_at=occurred_at or utcnow(),
             consent_revision=0,
             source_visibility=source_visibility or visibility.value,
@@ -1212,9 +1255,11 @@ class MemoryService:
         turn = await self._session.get(Turn, hit.turn_id)
         if turn is None or turn.window_id != window.id or turn.state != TurnState.completed.value:
             return []
+        from ling.domains.memory.experience import actor_delivered
+
         speakers = [Message.role == "user"]
         if hit.kind == "episode":
-            speakers.append((Message.role == "actor") & (Message.attempt == turn.attempt))
+            speakers.append(actor_delivered(window) & (Message.attempt == turn.attempt))
         stmt = select(Message).where(
             Message.window_id == window.id,
             Message.turn_id == turn.id,
@@ -1251,7 +1296,10 @@ class MemoryService:
         await self._session.flush()
         return True
 
-    async def supersede(self, old_id: str, new_text: str, *, reason: str) -> str | None:
+    async def supersede(
+        self, old_id: str, new_text: str, *, reason: str,
+        correction_message_id: str | None = None,
+    ) -> str | None:
         """用户纠正：旧记忆失效，新记忆建立 supersede 链。"""
         owner = await self._session.scalar(select(MemoryRow.subject_id).where(MemoryRow.id == old_id))
         if owner is None:
@@ -1261,6 +1309,9 @@ class MemoryService:
         if old is None or old.retracted:
             return None
         new_id_value = new_id("mem")
+        source_ids = list(old.source_event_ids or [])
+        if correction_message_id:
+            source_ids.append(f"message:{correction_message_id}")
         new_row = MemoryRow(
             id=new_id_value,
             subject_id=old.subject_id,
@@ -1269,7 +1320,7 @@ class MemoryService:
             origin=Origin.user_statement.value,
             visibility=old.visibility,
             confidence=min(1.0, float(old.confidence) + 0.1),
-            source_event_ids=list(old.source_event_ids or []),
+            source_event_ids=source_ids,
             source_window_id=old.source_window_id,
             source_account=old.source_account,
             source_message_id=old.source_message_id,
@@ -1277,6 +1328,7 @@ class MemoryService:
             import_source=old.import_source,
             slot=old.slot,
             fact_phase=old.fact_phase,
+            fact_operation="correct",
             valid_from=old.valid_from if old.fact_phase == "historical" else utcnow(),
             valid_until=old.valid_until,
             consent_revision=int(old.consent_revision or 0) + 1,
@@ -1294,7 +1346,7 @@ class MemoryService:
     async def _fact_neighbors(
         self, *, subject_id: str, slot: str, effective_at: datetime,
         source_window_id: str | None, source_visibility: str, visibility: str,
-    ) -> tuple[list[MemoryRow], datetime | None]:
+    ) -> tuple[list[MemoryRow], MemoryRow | None]:
         """Find revisions in the same audience scope for an event-time update."""
         conditions = [
             MemoryRow.subject_id == subject_id,
@@ -1315,11 +1367,10 @@ class MemoryService:
                 or_(MemoryRow.valid_until.is_(None), MemoryRow.valid_until > effective_at),
             ).order_by(start.desc(), MemoryRow.id)
         ))
-        following = await self._session.scalar(select(func.min(start)).where(
-            *conditions,
-            start > effective_at,
-            MemoryRow.valid_until.is_(None),
-        ))
+        following = await self._session.scalar(
+            select(MemoryRow).where(*conditions, start > effective_at)
+            .order_by(start, MemoryRow.id).limit(1)
+        )
         return previous, following
 
     @staticmethod

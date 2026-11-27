@@ -1074,6 +1074,15 @@ class SleepReviewItem(StrictModel):
     original: list[SleepReviewSource]
 
 
+class LifeReviewEntry(StrictModel):
+    kind: Literal["activity", "dream", "plan", "impression", "clarification", "intention"]
+    source_id: IdStr
+    text: str
+    status: str
+    at: datetime | None = None
+    window_id: IdStr | None = None
+
+
 class SleepReviewNight(StrictModel):
     sleep_date: date
     consolidation_state: Literal["ok", "skipped", "failed"]
@@ -1082,6 +1091,7 @@ class SleepReviewNight(StrictModel):
     rows_archived: int
     review_status: Literal["ready", "empty", "unavailable"]
     items: list[SleepReviewItem]
+    life: list[LifeReviewEntry] = Field(default_factory=list)
 
 
 class SleepReviewsOut(StrictModel):
@@ -1469,6 +1479,12 @@ class PromptToolResult(StrictModel):
     tokens: int = Field(ge=0)
 
 
+class MemoryRecallDiagnostic(StrictModel):
+    state: Literal["not_extracted", "not_visible", "no_match", "not_injected", "injected", "used_source"]
+    source_message_ids: list[IdStr] = Field(default_factory=list)
+    expression: Literal["quoted", "no_literal_match"] | None = None
+
+
 class PromptSnapshotOut(StrictModel):
     """`GET /v1/messages/{message_id}/prompt` 的响应。
 
@@ -1494,6 +1510,7 @@ class PromptSnapshotOut(StrictModel):
     sections: list[PromptSnapshotSection] = Field(default_factory=list)
     tool_transcript: list[PromptToolResult] = Field(default_factory=list)
     tool_transcript_truncated: bool = False
+    memory_recall: MemoryRecallDiagnostic | None = None
     # 给人看的一句状态说明（expired / unavailable 时解释原因，纯文本）
     note: str | None = None
 

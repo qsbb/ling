@@ -89,6 +89,16 @@ from ling.domains.media.video import (
     finalize_reply_text,
     parse_watch_markers,
 )
+from ling.domains.memory.experience import (
+    active_message,
+    fact_query,
+    needs_direct_original,
+    original_answer,
+    search_facts,
+    single_preference_answer,
+    user_in,
+)
+from ling.domains.memory.purge import has_open_purge
 from ling.domains.persona.service import PersonaIdSnapshot, PersonaSnapshot
 from ling.infra.db import session_scope
 from ling.infra.models import (
@@ -97,6 +107,7 @@ from ling.infra.models import (
     Message,
     OutboxEvent,
     PromptSnapshot,
+    Window,
     utcnow,
 )
 from ling.kernel.arbiter import AcquireResult, SpeakerArbiter
@@ -107,8 +118,13 @@ from ling.kernel.marker_stream import (
     stream_safe_brackets,
     strip_all_markers,
     strip_bracket_tags,
+    strip_context_bracket_tags,
 )
-from ling.kernel.memory_tools import recall_current_fact, recall_shared_arrangement
+from ling.kernel.memory_tools import (
+    recall_current_fact,
+    recall_experience,
+    recall_shared_arrangement,
+)
 from ling.kernel.stream_log import StreamLog
 from ling.kernel.visibility import is_group_visibility
 from ling.logging_setup import emit_event
@@ -926,6 +942,7 @@ class TurnCoordinator:
         voice_probe_text = ""
         voice_probe_done = False
         voice_probe_selected = False
+        guarded_stream = False
         # 本轮上下文里渲染给她的 `[msg_id:…]` → 原始平台 id。
         # 初始为 None（= "还没编译，无从校验"）：编译前就失败的路径不该
         # 因为"引用校验不可用"而误删她本来合法的引用。
@@ -1023,6 +1040,35 @@ class TurnCoordinator:
                 # 省略"（或反过来）的可能，而那种不一致不会报错，只会让输出
                 # 看起来莫名其妙。
                 is_group_window = is_group_visibility(window.visibility)
+                from ling.domains.relationship.continuity import (
+                    reply_boundaries,
+                    respect_boundaries,
+                )
+
+                guarded_stream = window.channel == "web" and bool(
+                    await reply_boundaries(session, window=window, subject_id=subject_id)
+                )
+                if window.channel == "web" and not is_group_window:
+                    from ling.kernel.continuity_commands import execute_command, read_command
+
+                    participant_command = read_command(user_text)
+                    if participant_command is not None and participant_command.kind in {
+                        "boundary", "pause", "pause_today", "resume", "reminder",
+                    }:
+                        source = await session.scalar(select(Message).where(
+                            Message.window_id == window.id, Message.turn_id == turn_id, Message.role == "user",
+                        ).order_by(Message.sequence.desc()).limit(1))
+                        if source is not None:
+                            delivered = await execute_command(
+                                session, command=participant_command, window=window, subject_id=subject_id,
+                                source=source, quoted_id=None, config=config,
+                            )
+                            await self._finalize(
+                                conversation=conversation, persona_id=persona_id, window_id=window_id,
+                                subject_id=subject_id, turn_id=turn_id, delivered=delivered, target_label=None,
+                                stopped=False, error=None, queue=queue, attempt=attempt, floor_held=held_by_me,
+                            )
+                            return
                 from ling.capabilities.voice_reply import VoiceReplyService, voice_help
                 from ling.config import get_settings
                 from ling.infra.security import SecretBox
@@ -1269,6 +1315,76 @@ class TurnCoordinator:
                     )
                     return
 
+                lookup = compiled.experience
+                preference = fact_query(user_text) if lookup is not None else None
+                if lookup is not None and reply_reference is None and (
+                    needs_direct_original(lookup, user_text)
+                    or (preference and single_preference_answer(lookup, user_text))
+                ):
+                    if not held_by_me:
+                        held_by_me = await self._wait_for_floor(window_id=window_id, turn_id=turn_id, token=token)
+                        floor.held = held_by_me
+                    if held_by_me and not token.stopped:
+                        current = await AudienceSnapshot.freeze(
+                            session, subject_id=subject_id, window_id=window_id,
+                            window_visibility=window.visibility,
+                            whole_group_source_ids=audience.whole_group_source_ids if audience else frozenset(),
+                        )
+                        visible = current.allows_long_term_memory()
+                        source_ids = []
+                        state = "no_match"
+                        if preference:
+                            slot, mode = preference
+                            fresh = await search_facts(
+                                session, window=window, subject_id=subject_id, slot=slot, mode=mode,
+                                retention_days=config.memory.max_retention_days,
+                                group_source_ids=current.whole_group_source_ids,
+                            ) if visible else None
+                            answer = single_preference_answer(fresh, user_text) if fresh is not None else None
+                            boundaries = await reply_boundaries(session, window=window, subject_id=subject_id)
+                            if fresh is not None and answer and respect_boundaries(answer, boundaries) == answer:
+                                delivered = answer
+                                source_ids = [f"message:{fresh.items[0]['message_id']}"]
+                            else:
+                                delivered = "我暂时没找到一条能确认这个偏好的记录。"
+                                state = "not_visible" if not visible or (fresh and fresh.state == "not_visible") else "no_match"
+                        elif lookup.first_message_id is None:
+                            delivered = original_answer(None)
+                        else:
+                            source_query = select(Message.text).join(Window).where(
+                                Message.id == lookup.first_message_id, Message.window_id == window_id,
+                                Window.visibility == window.visibility, Window.archived.is_(False),
+                                active_message(), user_in(window, subject_id),
+                            )
+                            if not is_group_window:
+                                source_query = source_query.where(Window.subject_id == subject_id)
+                            original = None
+                            if visible and not await has_open_purge(session, subject_id=subject_id):
+                                original = await session.scalar(source_query.with_for_update(of=Message))
+                            boundaries = await reply_boundaries(session, window=window, subject_id=subject_id)
+                            if original is not None and respect_boundaries(original, boundaries) != original:
+                                original = None
+                            delivered = original_answer(original)
+                            if original is not None:
+                                source_ids = [f"message:{lookup.first_message_id}"]
+                            state = "not_visible"
+                        await self._capture_prompt_snapshot(
+                            window_id=window_id, turn_id=turn_id, compiled=compiled, messages=[],
+                            config=config, profile=profile, attempt=attempt,
+                            direct_recall={
+                                "experience_recall": "used_source" if source_ids else state,
+                                "experience_source_ids": source_ids,
+                            },
+                        )
+                    await self._finalize(
+                        conversation=conversation, persona_id=persona_id, window_id=window_id,
+                        subject_id=subject_id, turn_id=turn_id,
+                        delivered="" if token.stopped else delivered, target_label=None,
+                        stopped=token.stopped, error=None, queue=queue, attempt=attempt, user_text=user_text,
+                        floor_held=held_by_me, source_account=source_account, literal_reply=True,
+                    )
+                    return
+
                 # 「查看本次提示词」：在**调模型之前**把真正要发出去的那份
                 # messages 存一份快照（独立事务、best-effort）。
                 #
@@ -1296,6 +1412,7 @@ class TurnCoordinator:
                     profile=profile,
                     window_id=window_id,
                     user_text=user_text,
+                    turn_id=turn_id,
                     attempt=attempt,
                     external_tool_defs=external_tool_defs,
                     audience=audience,
@@ -1501,8 +1618,8 @@ class TurnCoordinator:
                     self._cancels.set_partial(
                         turn_id,
                         ""
-                        if voice_state or voice_probe_selected or voice_probe_text
-                        else delivered,
+                        if voice_state or voice_probe_selected or voice_probe_text or guarded_stream
+                        else strip_context_bracket_tags(delivered),
                     )
 
                     # 没有发言权就不对外输出（注意：原先照样推 delta，
@@ -1532,8 +1649,8 @@ class TurnCoordinator:
                                         # 补齐时也要剥**两种**标记：这段是
                                         # 排队期间累积的原文。
                                         "caught_up": ""
-                                        if voice_state or voice_probe_selected
-                                        else strip_bracket_tags(strip_all_markers(delivered)),
+                                        if voice_state or voice_probe_selected or guarded_stream
+                                        else strip_bracket_tags(strip_all_markers(stream_safe_brackets(delivered)[0])),
                                         "note": "排到发言权，补齐排队期间产生的文字",
                                     },
                                 )
@@ -1561,7 +1678,7 @@ class TurnCoordinator:
                         return ""
 
                     visible = _visible(delta)
-                    if voice_state or voice_probe_selected:
+                    if voice_state or voice_probe_selected or guarded_stream:
                         visible = ""
                     if self._stream_log is not None:
                         self._stream_log.append(
@@ -1838,7 +1955,7 @@ class TurnCoordinator:
                             turn_id=turn_id,
                             token=token,
                             queue=queue,
-                            held_by_me=held_by_me and voice_state is None,
+                            held_by_me=held_by_me and voice_state is None and not guarded_stream,
                         )
                     elif skipped and (not delivered.strip() or withheld or must_rewrite):
                         delivered = await self._follow_up_after_watch(
@@ -1851,7 +1968,7 @@ class TurnCoordinator:
                             turn_id=turn_id,
                             token=token,
                             queue=queue,
-                            held_by_me=held_by_me and voice_state is None,
+                            held_by_me=held_by_me and voice_state is None and not guarded_stream,
                         )
                     # 正文非空时：观察已经写进证据，下一轮上下文会自动带上
                     # （context.py 的描述块），**不再额外发一条消息**。
@@ -1930,7 +2047,8 @@ class TurnCoordinator:
                     data={
                         "turn_id": turn_id,
                         "state": TurnState.failed.value,
-                        "text": "" if voice_state or voice_probe_selected else delivered,
+                        "text": "" if voice_state or voice_probe_selected or guarded_stream
+                        else strip_context_bracket_tags(delivered),
                         "error": {
                             "code": ErrorCode.internal.value,
                             "message": "服务端内部错误，请重试",
@@ -2012,6 +2130,7 @@ class TurnCoordinator:
         config: EffectiveConfig,
         profile: str,
         attempt: int,
+        direct_recall: dict[str, object] | None = None,
     ) -> None:
         """存一份"这次回复看到的上下文"（best-effort，**绝不阻塞出话**）。
 
@@ -2024,7 +2143,7 @@ class TurnCoordinator:
         块标签，也不能把没发出去的东西记成她看到的**。
         """
         try:
-            annotated = list(getattr(compiled, "annotated", None) or [])
+            annotated = [] if direct_recall is not None else list(getattr(compiled, "annotated", None) or [])
             if len(annotated) != len(messages):
                 from ling.kernel.context import CompiledMessage
 
@@ -2055,10 +2174,13 @@ class TurnCoordinator:
                 "automatic_memories": len(compiled.memory_ids) if "evidence" in lanes else 0,
                 "memory_recall_skipped": compiled.meta.get("memory_recall_skipped"),
             }
-            payload, truncated = build_prompt_snapshot_payload(
-                annotated, model=_snapshot_model_info(config, profile), attempt=attempt,
-                context=context,
-            )
+            for key in ("experience_recall", "experience_source_ids"):
+                if key in compiled.meta:
+                    context[key] = compiled.meta[key]
+            if direct_recall is not None:
+                context = {**direct_recall, "experience_direct_reply": True}
+            model = None if direct_recall is not None else _snapshot_model_info(config, profile)
+            payload, truncated = build_prompt_snapshot_payload(annotated, model=model, attempt=attempt, context=context)
             emit_event(
                 logger,
                 logging.INFO,
@@ -2144,6 +2266,28 @@ class TurnCoordinator:
                     and row.payload.get("attempt", attempt) == attempt
                 ):
                     row.message_id = message_id
+                    context = row.payload.get("context")
+                    if isinstance(context, dict) and context.get("experience_recall") == "injected":
+                        ids = [
+                            ref.removeprefix("message:")
+                            for ref in context.get("experience_source_ids", [])
+                            if isinstance(ref, str) and ref.startswith("message:")
+                        ]
+                        texts = await conversation.session.scalars(select(Message.text).where(
+                            Message.id.in_(ids), Message.window_id == row.window_id,
+                            Message.role == "user", Message.retracted_at.is_(None),
+                            Message.memory_hidden_at.is_(None),
+                        ))
+                        reply = await conversation.session.get(Message, message_id)
+                        has_quote = bool(reply and any(
+                            len(text.strip()) >= 6 and text.strip() in reply.text for text in texts
+                        ))
+                        payload = {**row.payload, "context": {
+                            **context, "experience_expression": "quoted" if has_quote else "no_literal_match",
+                        }}
+                        if _snapshot_size(payload) <= PROMPT_SNAPSHOT_MAX_BYTES:
+                            row.payload = payload
+                            row.size_bytes = _snapshot_size(payload)
         except Exception as exc:  # noqa: BLE001 - 回填失败只少一个入口
             logger.info(
                 "提示词快照回填 message_id 失败（不影响回复） turn=%s "
@@ -2427,8 +2571,11 @@ class TurnCoordinator:
                 text += chunk.delta
                 hold += chunk.delta
                 # 同一个过滤器：这条补生成的正文里也可能出现撤回标记。
+                ready_bracket, hold_bracket = stream_safe_brackets(hold)
                 ready, hold = stream_safe_all(hold)
-                visible = strip_all_markers(ready)
+                if len(hold_bracket) > len(hold):
+                    ready, hold = ready_bracket, hold_bracket
+                visible = strip_bracket_tags(strip_all_markers(ready))
                 if visible and held_by_me:
                     await queue.put(
                         TurnStreamEvent(
@@ -2604,6 +2751,7 @@ class TurnCoordinator:
         # 库里写着 `failed`，而用户看到的是一条"她说等会儿"的正常轮次。
         handled_as: str | None = None,
         voice_state: _VoiceTurn | None = None,
+        literal_reply: bool = False,
     ) -> None:
         if error is not None:
             state = TurnState.failed
@@ -2647,25 +2795,37 @@ class TurnCoordinator:
         # 半截标记（``<<看视频 m3``）是模型被打断、或流式最后一段留下的残片：
         # 它是说明书的碎片，落库后历史渲染里会露出来，外发更糟。这里用的
         # `finalize_reply_text` = 剥完整标记 + 去半截尾巴，幂等，重复调用无害。
-        delivered = finalize_reply_text(delivered)
+        if not literal_reply:
+            delivered = finalize_reply_text(delivered)
 
         # 「撤回」标记：**先落提议，再剥正文**。
         #
         # 顺序不能反。剥掉标记之后正文里就没有"她想撤哪一条"的信息了，
         # 那之后再想落提议只能靠猜。所以先解析、先把待确认项写下来，
         # 再把标记从要发出去的正文里去掉（用户不该看到这行说明书）。
-        recall_proposals = await self._collect_recall_proposals(
-            conversation=conversation,
-            window_id=window_id,
-            turn_id=turn_id,
-            text=delivered,
-        )
-        delivered = finalize_recall_text(delivered)
+        recall_proposals = []
+        if not literal_reply:
+            recall_proposals = await self._collect_recall_proposals(
+                conversation=conversation,
+                window_id=window_id,
+                turn_id=turn_id,
+                text=delivered,
+            )
+            delivered = finalize_recall_text(delivered)
+            without_context_tags = strip_context_bracket_tags(delivered)
+            if without_context_tags != delivered:
+                delivered = without_context_tags.strip()
+        if delivered:
+            from ling.domains.relationship.continuity import reply_boundaries, respect_boundaries
+
+            reply_window = await conversation.get_window_for_turn(window_id, subject_id=subject_id)
+            boundaries = await reply_boundaries(conversation.session, window=reply_window, subject_id=subject_id)
+            delivered = respect_boundaries(delivered, boundaries)
 
         actor_message: MessageView | None = None
         from ling.capabilities.expression_choice import parse_speak_choice
 
-        choice = parse_speak_choice(delivered)
+        choice = parse_speak_choice("" if literal_reply else delivered)
         chose_voice = choice.explicit and choice.speak
         if choice.explicit:
             delivered = "" if choice.rejected else choice.text
@@ -2675,7 +2835,7 @@ class TurnCoordinator:
         segments: list[str] = [delivered] if delivered else []
         expression = None
         dropped_quote: str | None = None
-        if delivered:
+        if delivered and not literal_reply:
             from ling.capabilities.chunking import plan_parts
             from ling.capabilities.followup import strip_service_tail
 
@@ -2777,7 +2937,7 @@ class TurnCoordinator:
                 text=delivered,
                 turn_id=turn_id,
                 state=state,
-                origin=Origin.model_inference,
+                origin=Origin.tool_receipt if literal_reply else Origin.model_inference,
                 error_code=code,
                 model_label=target_label,
                 attempt=attempt,
@@ -2940,6 +3100,32 @@ class TurnCoordinator:
             window_row = await conversation.get_window_for_turn(
                 window_id, subject_id=subject_id
             )
+            if window_row.channel == "web" and floor_held and user_text.strip():
+                from ling.domains.relationship.continuity import note_impression
+                from ling.domains.relationship.preferences import note_expression
+                from ling.kernel.continuity_sharing import (
+                    acknowledge_share,
+                    note_natural_continuation,
+                )
+
+                source = await conversation.session.scalar(select(Message).where(
+                    Message.window_id == window_id, Message.turn_id == turn_id, Message.role == "user",
+                    Message.memory_hidden_at.is_(None), Message.retracted_at.is_(None),
+                ).order_by(Message.sequence.desc()).limit(1))
+                if source is not None:
+                    await note_expression(
+                        conversation.session, window=window_row, subject_id=subject_id, source=source, text=user_text,
+                    )
+                    await acknowledge_share(
+                        conversation.session, window=window_row, subject_id=subject_id, source=source,
+                        quoted_platform_id=None,
+                    )
+                await note_impression(
+                    conversation.session, window=window_row, subject_id=subject_id, turn_id=turn_id, reply=delivered,
+                )
+                await note_natural_continuation(
+                    conversation.session, window=window_row, subject_id=subject_id, turn_id=turn_id, reply=delivered,
+                )
             await AwarenessService(conversation.session).derive_from_turn(
                 subject_id=subject_id,
                 window_id=window_id,
@@ -3160,6 +3346,7 @@ class TurnCoordinator:
         memory_sources: dict[str, MemoryHit] | None = None,
         window_id: str | None = None,
         user_text: str = "",
+        turn_id: str | None = None,
         attempt: int = 1,
         external_tool_defs: Sequence[tuple[ToolSpec, ToolHandler]] = (),
     ) -> _ToolLedger:
@@ -3226,6 +3413,8 @@ class TurnCoordinator:
         explicit_tool_id = ""
         external_tool_ids: set[str] = set()
         if registry is None:
+            from ling.domains.memory.experience import asks_for_originals
+
             media_callback = self._watch_video
             if media_callback is None and window_id:
                 video_binding = config.resolve_profile(VIDEO_PROFILE)
@@ -3242,6 +3431,12 @@ class TurnCoordinator:
                     if audience is not None and audience.whole_group_source_ids
                     and config.memory.shared_events == "enabled" and config.memory.max_injected_memories > 0
                     else None
+                ),
+                experience_lookup=(
+                    partial(recall_experience, audience=audience, current_turn_id=turn_id)
+                    if audience is not None and audience.allows_long_term_memory()
+                    and (asks_for_originals(user_text) or fact_query(user_text))
+                    and config.memory.max_injected_memories > 0 else None
                 ),
                 memory_sources=memory_sources,
                 media_window_id=window_id,

@@ -591,7 +591,10 @@ async def _load_facts(
         select(ActivityRow)
         .where(
             ActivityRow.actor_id == actor_id,
-            ActivityRow.state.in_(FACT_STATES),
+            or_(
+                ActivityRow.state.in_(FACT_STATES),
+                and_(ActivityRow.state == "cancelled", ActivityRow.schedule_segment_id.is_not(None)),
+            ),
             activity_start < window_end,
             reaches_window,
         )

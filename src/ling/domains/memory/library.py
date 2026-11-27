@@ -42,6 +42,7 @@ def memory_record(row: MemoryRow) -> dict[str, Any]:
             "valid_from": _iso(row.valid_from),
         } if row.source_message_id is not None else {}),
         **({"import_source": row.import_source} if row.import_source is not None else {}),
+        **({"pinned": True} if row.slot == "pinned_message" else {}),
     }
 
 

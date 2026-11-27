@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import (
     DeliveryReceiptRow,
+    Message,
     Operation,
     ProactiveDraftBinding,
     ProactiveOpportunity,
@@ -20,6 +21,15 @@ _SAFE_TERMINAL_REASONS = frozenset({
     "投递认领已超时，平台可能已收到",
     "投递结果不确定，禁止自动重发",
     "草稿表达控制无效",
+    "已在对话中分享",
+    "用户撤销了这次分享",
+    "用户已暂停主动分享",
+    "用户已设定话题边界",
+    "主动联系授权已失效",
+    "共同经历已不可用",
+    "原会话目标已不可用",
+    "用户正在对话，稍后复核",
+    "上次分享尚无回应，稍后复核",
 })
 
 
@@ -83,12 +93,27 @@ async def recent_opportunities(
     result = []
     for row in rows:
         receipt = receipts.get(row.id)
+        acknowledgement = None
+        if row.acknowledged_message_id is not None:
+            message = await session.get(Message, row.acknowledged_message_id)
+            if (
+                message is not None and message.role == "user" and message.sender_subject_id == row.subject_id
+                and message.window_id == row.target_window_id
+                and message.retracted_at is None and message.memory_hidden_at is None
+            ):
+                acknowledgement = row.acknowledgement
         result.append({
             "opportunity_id": row.id,
             "kind": row.kind,
             "reason": row.reason,
             "reason_code": row.reason_code,
             "has_source": row.source_event_id is not None,
+            **({
+                "activity_id": (row.source_event_id or "").removeprefix("activity:"),
+                "related_memory_id": row.related_memory_id,
+                "target_window_id": row.target_window_id,
+                "acknowledgement": acknowledgement,
+            } if row.related_memory_id else {}),
             "state": "candidate" if row.state in {"drafting", "bound_candidate"} else row.state,
             "draft_state": draft_states.get(row.id),
             "draft_origin": (
@@ -106,7 +131,8 @@ async def recent_opportunities(
             # and settlement are committed. It has no separate platform receipt.
             "web_saved": row.state == "sent" and row.rejected_reason == "web",
             "terminal_reason": (
-                row.rejected_reason if row.rejected_reason in _SAFE_TERMINAL_REASONS else None
+                row.rejected_reason if row.rejected_reason in _SAFE_TERMINAL_REASONS
+                else None
             ),
             "receipt": (
                 {"state": receipt.state, "channel": receipt.channel,
