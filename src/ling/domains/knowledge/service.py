@@ -11,8 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import KnowledgeItem
@@ -22,6 +23,29 @@ if TYPE_CHECKING:
     from ling.kernel.audience import AudienceSnapshot
 
 DEFAULT_TTL_HOURS = 24
+PROCEDURE_SOURCE_SLOT = "knowledge_procedure"
+
+
+def knowledge_visible_to(subject_id: str | ColumnElement[str] | None) -> ColumnElement[bool]:
+    # Ownerless sourced records retain the legacy shared knowledge scope.
+    shared = KnowledgeItem.owner_subject_id.is_(None) & KnowledgeItem.source_kind.in_(
+        ("verified_source", "external_observation")
+    )
+    scope = shared if subject_id is None else or_(shared, KnowledgeItem.owner_subject_id == subject_id)
+    return scope & KnowledgeItem.visibility.in_(("public", "subject_private"))
+
+
+def current_knowledge(now: datetime) -> ColumnElement[bool]:
+    return or_(KnowledgeItem.valid_until.is_(None), KnowledgeItem.valid_until > now)
+
+
+def procedure_source_available(
+    subject_id: str | ColumnElement[str], now: datetime,
+) -> ColumnElement[bool]:
+    return (
+        knowledge_visible_to(subject_id) & current_knowledge(now)
+        & (KnowledgeItem.source_kind == "verified_source") & KnowledgeItem.source_url.is_not(None)
+    )
 
 
 @dataclass(frozen=True)
@@ -81,6 +105,14 @@ class KnowledgeService:
     ) -> KnowledgeView:
         if source_kind not in {"verified_source", "external_observation", "user_statement"}:
             raise ValueError("知识来源必须是已核验来源、外部观察或用户陈述")
+        if source_url:
+            try:
+                parsed = urlsplit(source_url)
+                valid_url = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+            except ValueError:
+                valid_url = False
+            if not valid_url or len(source_url) > 1000:
+                raise ValueError("知识来源 URL 必须是有效的 HTTP 或 HTTPS 地址")
         if not source_url and source_kind == "verified_source":
             raise ValueError("verified_source 必须提供来源 URL")
         now = datetime.now(UTC)
@@ -107,7 +139,10 @@ class KnowledgeService:
             (
                 await self._session.execute(
                     select(KnowledgeItem)
-                    .where(KnowledgeItem.topic.ilike(f"%{topic}%"))
+                    .where(
+                        KnowledgeItem.topic.icontains(topic, autoescape=True),
+                        knowledge_visible_to(None), current_knowledge(now),
+                    )
                     .order_by(KnowledgeItem.observed_at.desc())
                     .limit(limit * 3)
                 )
@@ -142,22 +177,8 @@ class KnowledgeService:
             for t in terms[:8]
         ]
         stmt = select(KnowledgeItem).where(
-            or_(*conditions),
-            or_(KnowledgeItem.valid_until.is_(None), KnowledgeItem.valid_until > now),
-            KnowledgeItem.visibility.in_(("public", "subject_private")),
+            or_(*conditions), current_knowledge(now), knowledge_visible_to(subject_id),
         )
-        # 归属过滤：公共条目（owner 为 NULL）人人可读；
-        # 私有条目只能被它的 owner 读到。缺这一层的话，
-        # source_kind=user_statement 的条目会跨用户泄漏。
-        if subject_id is not None:
-            stmt = stmt.where(
-                or_(
-                    KnowledgeItem.owner_subject_id.is_(None),
-                    KnowledgeItem.owner_subject_id == subject_id,
-                )
-            )
-        else:
-            stmt = stmt.where(KnowledgeItem.owner_subject_id.is_(None))
         rows = list(
             (
                 await self._session.execute(
@@ -179,12 +200,20 @@ class KnowledgeService:
             query, limit=limit, subject_id=None if audience.is_group else audience.subject_id
         )
 
-    async def list_all(self, limit: int = 50) -> list[KnowledgeView]:
+    async def procedure_source(self, *, item_id: str, subject_id: str) -> KnowledgeView | None:
+        now = datetime.now(UTC)
+        row = await self._session.scalar(select(KnowledgeItem).where(
+            KnowledgeItem.id == item_id, procedure_source_available(subject_id, now),
+        ).with_for_update())
+        return self._view(row, now) if row is not None else None
+
+    async def list_all(self, limit: int = 50, *, subject_id: str | None = None) -> list[KnowledgeView]:
         now = datetime.now(UTC)
         rows = list(
             (
                 await self._session.execute(
                     select(KnowledgeItem)
+                    .where(knowledge_visible_to(subject_id))
                     .order_by(KnowledgeItem.observed_at.desc())
                     .limit(limit)
                 )

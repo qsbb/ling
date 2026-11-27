@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, time
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from sqlalchemy import select
 
 from ling.api.deps import ConfigDep, CurrentAuth, DbSession, SettingsDep
 from ling.api.error_handlers import PublicValidationError
@@ -36,8 +38,9 @@ from ling.domains.affect.service import AffectService
 from ling.domains.consent.service import KNOWN_SCOPES, ConsentService
 from ling.domains.conversation.service import ConversationService
 from ling.domains.goals.service import GoalsService
-from ling.domains.knowledge.service import KnowledgeService
+from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, KnowledgeService
 from ling.domains.memory.entities import ObjectKind
+from ling.domains.memory.library import LibraryKind, memory_record, read_library
 from ling.domains.memory.service import MemoryService
 from ling.domains.proactive.service import ProactivityService
 from ling.domains.relationship.service import RelationshipService
@@ -131,6 +134,7 @@ async def list_memory(
     source: Literal["astrbot_memory_companion"] | None = None,
     object_id: Annotated[str | None, Query(max_length=64)] = None,
     conversation_scope: Literal["private", "group"] | None = None,
+    kind: LibraryKind | None = None,
     offset: Annotated[int, Query(ge=0, le=2_147_483_647)] = 0,
     q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> dict:
@@ -152,15 +156,13 @@ async def list_memory(
             "include 只能是 retracted、archived 或 all",
             status_code=422,
         )
-    from ling.domains.memory.library import memory_record, read_library
-
     query = (q or "").strip()
     if "\x00" in query or (query and view != "library"):
         raise LingError(
             ErrorCode.invalid_request, "请在记忆库视图中输入有效的搜索内容",
             status_code=422, field="q",
         )
-    paged = bool(source or query or object_id or conversation_scope)
+    paged = bool(source or query or object_id or conversation_scope or kind)
     if (paged and view != "library") or (offset and not paged):
         raise LingError(
             ErrorCode.invalid_request, "请在记忆库视图中按搜索内容、来源或对象翻页", status_code=422,
@@ -168,7 +170,7 @@ async def list_memory(
     if view == "library":
         return await read_library(
             session, auth.user.subject_id, limit=limit, include=include, source=source,
-            offset=offset, query=query, object_id=object_id, conversation_scope=conversation_scope,
+            offset=offset, query=query, object_id=object_id, conversation_scope=conversation_scope, kind=kind,
             actor_id=settings.actor_id, allow_actor_private=auth.user.role == "owner",
         )
 
@@ -253,6 +255,29 @@ async def create_memory(
             status_code=422,
             detail=str(exc),
         ) from exc
+    subject_id = auth.user.subject_id
+    document_id = None
+    document_valid_until = None
+    if body.kind == "procedure" and (origin is Origin.verified_source or any(
+        item.startswith("knowledge:") for item in body.source_event_ids
+    )):
+        from ling.domains.memory.purge import has_open_purge
+        from ling.infra.models import Subject
+
+        await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+        if (
+            len(body.source_event_ids) != 1 or not body.source_event_ids[0].startswith("knowledge:")
+            or visibility is not Visibility.subject_private
+            or await has_open_purge(session, subject_id=subject_id)
+        ):
+            raise LingError(ErrorCode.invalid_request, "请引用一份可用资料作为做法依据", status_code=422)
+        document_id = body.source_event_ids[0].removeprefix("knowledge:")
+        evidence = await KnowledgeService(session).procedure_source(item_id=document_id, subject_id=subject_id)
+        if evidence is None or body.text.strip() != evidence.claim:
+            raise LingError(ErrorCode.invalid_request, "请保留可用资料中的做法原文", status_code=422)
+        origin = Origin.verified_source
+        document_valid_until = evidence.valid_until
+
     proposal = MemoryProposal(
         proposal_id="mp_manual",
         kind=body.kind,  # type: ignore[arg-type]
@@ -261,11 +286,14 @@ async def create_memory(
         source_event_ids=body.source_event_ids,
         visibility=visibility,
         confidence=body.confidence,
+        valid_until=document_valid_until,
     )
     # 手工写入也要按已发布策略盖保留期（写侧统一在 MemoryService.propose 里盖章）；
     # 不传 policy 的话这条记忆会落回列默认 365，与设置里的 max_retention_days 无关。
+    source_key = hashlib.sha256(f"{subject_id}:{document_id}".encode()).hexdigest() if document_id else None
     memory_id = await MemoryService(session, policy=(await config.effective()).memory).propose(
-        proposal, subject_id=auth.user.subject_id
+        proposal, subject_id=subject_id, slot=PROCEDURE_SOURCE_SLOT if document_id else None,
+        value=document_id, turn_id=source_key,
     )
     if memory_id is None:
         raise LingError(
@@ -1018,7 +1046,7 @@ class KnowledgeCreate(BaseModel):
 
 @router.get("/knowledge")
 async def list_knowledge(auth: CurrentAuth, session: DbSession, limit: int = 50) -> dict:
-    items = await KnowledgeService(session).list_all(limit=limit)
+    items = await KnowledgeService(session).list_all(limit=limit, subject_id=auth.user.subject_id)
     return {
         "items": [
             {
@@ -1047,6 +1075,7 @@ async def add_knowledge(body: KnowledgeCreate, auth: CurrentAuth, session: DbSes
             source_kind=body.source_kind,
             confidence=body.confidence,
             ttl_hours=body.ttl_hours,
+            owner_subject_id=auth.user.subject_id,
         )
     except ValueError as exc:
         raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc

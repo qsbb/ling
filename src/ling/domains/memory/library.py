@@ -6,9 +6,14 @@ from datetime import datetime
 from typing import Any, Literal
 from unicodedata import normalize
 
-from sqlalchemy import and_, func, literal, literal_column, or_, select, true
+from sqlalchemy import and_, func, literal, literal_column, or_, select, true, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.knowledge.service import (
+    PROCEDURE_SOURCE_SLOT,
+    current_knowledge,
+    knowledge_visible_to,
+)
 from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.self_timeline import SelfTimelineService
@@ -17,12 +22,16 @@ from ling.infra.models import (
     ActivityRow,
     CoreMemoryRow,
     EntityRow,
+    KnowledgeItem,
     MemoryEntityRow,
     MemoryEpisode,
     MemoryRow,
     OutboxEvent,
     SelfExperienceRow,
+    utcnow,
 )
+
+LibraryKind = Literal["episode", "assertion", "procedure", "knowledge"]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -108,12 +117,36 @@ def _self_experience_record(row: SelfExperienceRow, activity: ActivityRow) -> di
     }
 
 
+def _knowledge_record(row: KnowledgeItem) -> dict[str, Any]:
+    return {
+        "memory_id": row.id,
+        "kind": "knowledge",
+        "text": row.claim,
+        "origin": row.source_kind,
+        "visibility": "public" if row.owner_subject_id is None else "subject_private",
+        "confidence": row.confidence,
+        "retracted": False,
+        "retract_reason": None,
+        "supersedes": None,
+        "superseded_by": None,
+        "source_event_ids": [f"knowledge:{row.id}"],
+        "created_at": _iso(row.created_at),
+        "observed_at": _iso(row.observed_at),
+        "valid_until": _iso(row.valid_until),
+        "archived_at": None,
+        "can_edit": False,
+        "record_type": "knowledge",
+        "source_url": row.source_url,
+    }
+
+
 async def read_library(
     session: AsyncSession, subject_id: str, *,
     actor_id: str, allow_actor_private: bool,
     limit: int, include: str | None, source: str | None = None, offset: int = 0,
     query: str = "", object_id: str | None = None,
     conversation_scope: Literal["private", "group"] | None = None,
+    kind: LibraryKind | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "memories": [], "limit": limit, "include": include, "total": 0, "has_more": False,
@@ -121,14 +154,14 @@ async def read_library(
     }
     if source is not None:
         result.update(source=source)
-    if source is not None or query or object_id or conversation_scope:
+    if source is not None or query or object_id or conversation_scope or kind:
         result.update(offset=offset)
     if await has_open_purge(session, subject_id=subject_id):
         result["extraction"] = {"state": "purging", "at": None}
         return result
 
     if object_id == "self":
-        if source is not None or conversation_scope is not None:
+        if source is not None or conversation_scope is not None or kind not in {None, "episode"}:
             return result
         records = await SelfTimelineService(session, actor_id=actor_id).library_records(
             allow_actor_private=allow_actor_private,
@@ -171,8 +204,8 @@ async def read_library(
             MemoryEpisode.id.in_(linked_record_ids(subject_id, object_id, "experience")),
         )
 
-    if query:
-        terms = tuple(dict.fromkeys(normalize("NFKC", query).split()))
+    terms = tuple(dict.fromkeys(normalize("NFKC", query).split()))
+    if terms:
         memory_text = func.normalize(MemoryRow.text, literal_column("NFKC"))
         episode_text = func.normalize(MemoryEpisode.summary, literal_column("NFKC"))
         memory_query = memory_query.where(
@@ -182,15 +215,29 @@ async def read_library(
             *(episode_text.icontains(term, autoescape=True) for term in terms),
         )
 
-    memory_keys = memory_query.with_only_columns(
-        MemoryRow.id, MemoryRow.created_at, literal("memory").label("record_type"),
-    )
-    episode_keys = episode_query.with_only_columns(
-        MemoryEpisode.id, MemoryEpisode.created_at, literal("experience").label("record_type"),
-    )
-    matches = (
-        memory_keys.union_all(episode_keys) if source is None else memory_keys
-    ).cte("library_matches")
+    queries = []
+    if kind in {None, "episode", "assertion", "procedure"}:
+        if kind:
+            memory_query = memory_query.where(MemoryRow.kind == kind)
+        queries.append(memory_query.with_only_columns(
+            MemoryRow.id, MemoryRow.created_at, literal("memory").label("record_type"),
+        ))
+    if source is None and kind in {None, "episode"}:
+        queries.append(episode_query.with_only_columns(
+            MemoryEpisode.id, MemoryEpisode.created_at, literal("experience").label("record_type"),
+        ))
+    if source is None and not object_id and conversation_scope != "group" and kind in {None, "knowledge"}:
+        topic = func.normalize(KnowledgeItem.topic, literal_column("NFKC"))
+        claim = func.normalize(KnowledgeItem.claim, literal_column("NFKC"))
+        queries.append(select(
+            KnowledgeItem.id, KnowledgeItem.created_at, literal("knowledge").label("record_type"),
+        ).where(
+            knowledge_visible_to(subject_id), current_knowledge(utcnow()),
+            *(or_(topic.icontains(term, autoescape=True), claim.icontains(term, autoescape=True)) for term in terms),
+        ))
+    if not queries:
+        return result
+    matches = union_all(*queries).cte("library_matches")
     page_keys = select(matches).order_by(
         matches.c.created_at.desc(), matches.c.id.desc(), matches.c.record_type.desc(),
     ).offset(offset).limit(limit).subquery()
@@ -198,23 +245,24 @@ async def read_library(
 
     # Page and count use one snapshot. Only the selected keys load full records.
     rows = (await session.execute(
-        select(MemoryRow, MemoryEpisode, counts.c.total)
+        select(MemoryRow, MemoryEpisode, KnowledgeItem, counts.c.total)
         .select_from(counts)
         .outerjoin(page_keys, true())
         .outerjoin(MemoryRow, and_(page_keys.c.record_type == "memory", MemoryRow.id == page_keys.c.id))
         .outerjoin(MemoryEpisode, and_(
             page_keys.c.record_type == "experience", MemoryEpisode.id == page_keys.c.id,
         ))
+        .outerjoin(KnowledgeItem, and_(page_keys.c.record_type == "knowledge", KnowledgeItem.id == page_keys.c.id))
         .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
     )).all()
-    total = rows[0][2]
-    record_ids = [memory.id for memory, _, _ in rows if memory is not None]
+    total = rows[0][-1]
+    record_ids = [memory.id for memory, *_ in rows if memory is not None]
     pins = set(await session.scalars(select(CoreMemoryRow.source_memory_id).where(
         CoreMemoryRow.subject_id == subject_id, CoreMemoryRow.active.is_(True),
         CoreMemoryRow.source_memory_id.in_(record_ids),
     ))) if record_ids else set()
     speakers: dict[str, list[dict[str, str]]] = {}
-    live_ids = [memory.id for memory, _, _ in rows
+    live_ids = [memory.id for memory, *_ in rows
                 if memory is not None and not memory.retracted and memory.archived_at is None]
     if live_ids:
         speaker_rows = await session.execute(select(
@@ -230,16 +278,19 @@ async def read_library(
                 "entity_id": link.entity_id, "name": link.source_label, "source_event_id": link.source_reference,
             })
     page = []
-    for memory, episode, _ in rows:
+    for memory, episode, knowledge, _ in rows:
         if memory is not None:
             page.append({
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
                 "source_visibility": memory.source_visibility,
                 **({"pinned": True} if memory.id in pins else {}),
+                **({"can_correct": False} if memory.slot == PROCEDURE_SOURCE_SLOT else {}),
                 **({"archive_speakers": speakers[memory.id]} if memory.id in speakers else {}),
             })
         elif episode is not None:
             page.append(_episode_record(episode))
+        elif knowledge is not None:
+            page.append(_knowledge_record(knowledge))
 
     latest = (await session.execute(
         select(OutboxEvent.state, OutboxEvent.attempts, OutboxEvent.created_at, OutboxEvent.processed_at)

@@ -25,9 +25,11 @@ from sqlalchemy import ColumnElement, case, delete, func, literal, or_, select, 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
+from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, procedure_source_available
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
     ActorAccount,
+    KnowledgeItem,
     MemoryEmbeddingRow,
     MemoryEpisode,
     MemoryImportForgetMarker,
@@ -78,7 +80,7 @@ class RecallResult:
 def _assertion_hit(row: MemoryRow, score: float) -> MemoryHit:
     return MemoryHit(
         memory_id=row.id,
-        kind=row.kind,
+        kind="procedure_note" if row.kind == "procedure" and row.slot != PROCEDURE_SOURCE_SLOT else row.kind,
         text=row.text,
         origin=Origin(row.origin),
         visibility=Visibility(row.visibility),
@@ -104,6 +106,12 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
     ).exists()
     eligible = or_(model.source_message_id.is_(None), active)
     if model is MemoryRow:
+        current_document = select(KnowledgeItem.id).where(
+            KnowledgeItem.id == MemoryRow.value,
+            KnowledgeItem.claim == MemoryRow.text,
+            procedure_source_available(MemoryRow.subject_id, utcnow()),
+        ).correlate(MemoryRow).exists()
+        eligible = eligible & or_(MemoryRow.slot.is_distinct_from(PROCEDURE_SOURCE_SLOT), current_document)
         forgotten_import = select(MemoryImportForgetMarker.source_key).where(
             MemoryImportForgetMarker.source_key == MemoryRow.import_key,
         ).exists()
@@ -1324,7 +1332,7 @@ class MemoryService:
         old = await self._session.scalar(select(MemoryRow).where(
             MemoryRow.id == old_id, MemoryRow.subject_id == anchor.subject_id, active_source(MemoryRow),
         ).with_for_update().execution_options(populate_existing=True))
-        if old is None or old.retracted:
+        if old is None or old.retracted or old.slot == PROCEDURE_SOURCE_SLOT:
             return None
         new_id_value = new_id("mem")
         new_row = MemoryRow(
@@ -2077,7 +2085,8 @@ def _is_historical(hit: object) -> bool:
 def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
     """Give the character context, with only the distinctions that change its use."""
     groups: dict[str, list] = {
-        "mention": [], "episode": [], "tone": [], "uncertain": [], "history": [], "shared": [],
+        "mention": [], "episode": [], "procedure": [], "procedure_note": [],
+        "tone": [], "uncertain": [], "history": [], "shared": [],
     }
     for hit in hits:
         # 历史事实单独成组：它们**现在不成立**，只能用于回答"以前怎样"，
@@ -2086,6 +2095,8 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
             groups["shared"].append(hit)
         elif _is_historical(hit):
             groups["history"].append(hit)
+        elif getattr(hit, "kind", None) in {"procedure", "procedure_note"}:
+            groups[hit.kind].append(hit)
         elif getattr(hit, "kind", None) == "episode" and hit.origin != Origin.model_inference:
             groups["episode"].append(hit)
         else:
@@ -2096,6 +2107,8 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
     labels = {
         "mention": "记得的事",
         "episode": "曾经聊过的话（按署名理解）",
+        "procedure": "有资料依据的做法",
+        "procedure_note": "记录的做法（执行情况未知）",
         "tone": "熟悉的线索（可以影响回应方式）",
         "uncertain": "模糊的印象（有需要再确认）",
         "history": "以前的情况（不代表现在）",

@@ -174,6 +174,12 @@ ALLOWED: dict[tuple[str, str], str] = {
         "同一个人时，问 A 也该想起 B 说过的话。账号合并是 identity 域的权威"
         "关系，记忆行本身不搬动（那是有损操作），只读组内 subject_id 集合。"
     ),
+    ("memory/service.py", "ling.domains.knowledge.service"): (
+        "做法检索复用知识域对资料归属和时效的判据。"
+    ),
+    ("memory/library.py", "ling.domains.knowledge.service"): (
+        "记忆库只读投影复用知识域的来源归属和时效判据。"
+    ),
     ("identity/service.py", "ling.domains.memory.service"): (
         "身份拆分由身份域锁住两端。记忆域在同一事务内按来源账号归还记忆和对象证据，"
         "身份域只读取归位条数。"
