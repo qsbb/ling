@@ -106,7 +106,7 @@ def visible_to_model(*, group_sources: Collection[str] = ()) -> ColumnElement[bo
     )
 
 
-def completed_actor_message() -> ColumnElement[bool]:
+def completed_actor_message(*, group_sources: Collection[str] = ()) -> ColumnElement[bool]:
     # Use the retained final reply from the completed attempt.
     current_attempt = select(Turn.id).where(
         Turn.id == Message.turn_id,
@@ -120,7 +120,7 @@ def completed_actor_message() -> ColumnElement[bool]:
         Message.memory_hidden_at.is_(None),
         Message.retracted_at.is_(None),
         Message.recalled_at.is_(None),
-        context_sources_available(Message),
+        context_sources_available(Message, group_sources=group_sources),
         current_attempt,
     )
 

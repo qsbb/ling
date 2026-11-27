@@ -1302,7 +1302,7 @@ class MemoryService:
         return result
 
     async def read_source(
-        self, hit: MemoryHit, *, audience: MemoryAudience
+        self, hit: MemoryHit, *, audience: MemoryAudience, context_sources: set[str] | None = None,
     ) -> list[dict[str, str | bool]]:
         """Look up the retained original for a hit already shown this turn."""
         from ling.domains.memory.purge import open_purge_subjects
@@ -1354,11 +1354,12 @@ class MemoryService:
         turn = await self._session.get(Turn, hit.turn_id)
         if turn is None or turn.window_id != window.id or turn.state != TurnState.completed.value:
             return []
+        actor_source = completed_actor_message(group_sources=audience.whole_group_source_ids)
         speakers = [Message.role == "user"]
         if hit.kind == "impression" and assertion is not None:
-            speakers = [and_(Message.id == assertion.value, completed_actor_message())]
+            speakers = [and_(Message.id == assertion.value, actor_source)]
         elif hit.kind == "episode":
-            speakers.append((Message.role == "actor") & (Message.attempt == turn.attempt))
+            speakers.append(actor_source)
         stmt = select(Message).where(
             Message.window_id == window.id,
             Message.turn_id == turn.id,
@@ -1371,7 +1372,12 @@ class MemoryService:
         )
         if audience.is_group:
             stmt = stmt.where(or_(Message.role == "actor", Message.sender_subject_id == audience.subject_id))
-        rows = await self._session.scalars(stmt.order_by(Message.sequence).limit(2))
+        rows = (await self._session.scalars(stmt.order_by(Message.sequence).limit(2))).all()
+        if context_sources is not None:
+            source_kind = "shared" if audience.is_group else "message"
+            for row in rows:
+                context_sources.add(f"{source_kind}:{row.id}")
+                context_sources.update(row.context_sources or ())
         return [
             {
                 "speaker": "用户" if row.role == "user" else "Ling",

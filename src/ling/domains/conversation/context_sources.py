@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 
-from sqlalchemy import ColumnElement, case, func, select
+from sqlalchemy import ColumnElement, case, func, or_, select
 from sqlalchemy.orm import aliased
 
 from ling.infra.models import (
@@ -20,9 +20,10 @@ from ling.infra.models import (
 def context_sources_available(
     owner: type[Message] | type[WindowContext], *, group_sources: Collection[str] = (),
 ) -> ColumnElement[bool]:
-    from ling.domains.knowledge.service import knowledge_visible_to
+    from ling.domains.knowledge.service import current_knowledge, knowledge_visible_to
     from ling.domains.media.service import readable_media_evidence
 
+    now = utcnow()
     refs = func.unnest(owner.context_sources).table_valued("ref").render_derived(name="context_source")
     kind = func.split_part(refs.c.ref, ":", 1)
     source_id = func.split_part(refs.c.ref, ":", 2)
@@ -36,10 +37,12 @@ def context_sources_available(
         message.retracted_at.is_(None), message.recalled_at.is_(None), ~forgotten,
     ).correlate(refs).exists()
     media_available = select(MediaEvidenceRow.id).where(
-        MediaEvidenceRow.id == source_id, readable_media_evidence(now=utcnow()),
+        MediaEvidenceRow.id == source_id, readable_media_evidence(now=now),
+        or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > now),
     ).correlate(refs).exists()
     knowledge_available = select(KnowledgeItem.id).where(
         KnowledgeItem.id == source_id, knowledge_visible_to(KnowledgeItem.owner_subject_id),
+        current_knowledge(now),
     ).correlate(refs).exists()
     valid = case(
         (kind == "message", message_available),

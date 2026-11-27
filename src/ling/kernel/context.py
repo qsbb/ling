@@ -29,6 +29,7 @@ from ling.domains.conversation.service import (
     ConversationService,
     MessageView,
     ReplyReference,
+    visible_to_model,
 )
 from ling.domains.deferred.markers import defer_marker_prefix
 from ling.domains.deferred.state import MAX_DELAY_SECONDS
@@ -1342,30 +1343,26 @@ class ContextCompiler:
         # 不算历史——历史自己有 `HISTORY_TOKEN_BUDGET`）。
         # 早期版本读了一个还没赋值的属性，于是提示永远是 None——测试
         # 只测 helper 时看不出来，是接线错了。
-        _recent_actor: list[str] = []
+        recent_actor: list[tuple[str, list[str] | None]] = []
         try:
             from ling.infra.models import Message as _Message
 
             _rows = (
                 await self._session.execute(
-                    select(_Message.text)
+                    select(_Message.text, _Message.context_sources)
                     .where(
                         _Message.window_id == window_id,
                         _Message.role == "actor",
-                        # 这里**不按 `retracted_at` 过滤**：数的是"她自己说了
-                        # 几遍同一句话"。她自己撤回过一句，那句话仍然是她说过的
-                        # （重复提醒是给她的自省，不是对外引用）。
-                        # 撤回真正要拦的是**对方**那一条进上下文，见
-                        # `messages_for_prompt`。
+                        visible_to_model(group_sources=group_memory_sources),
                     )
                     .order_by(_Message.sequence.desc())
                     .limit(5)
                 )
-            ).all()
-            _recent_actor = [r[0] for r in reversed(_rows) if r[0]]
+            ).tuples().all()
+            recent_actor = [(text, refs) for text, refs in reversed(_rows) if text]
         except Exception:  # noqa: BLE001 - 查不到就不提示，不影响主流程
-            _recent_actor = []
-        _hint = repetition_hint(_recent_actor)
+            recent_actor = []
+        _hint = repetition_hint([text for text, _ in recent_actor])
         if _hint:
             contributions.append(
                 ContextContribution(
@@ -1377,6 +1374,7 @@ class ContextCompiler:
                     text=_hint,
                     origin=Origin.verified_source,
                     visibility=Visibility.subject_private,
+                    source_event_ids=sorted({ref for _, refs in recent_actor for ref in refs or ()}),
                     token_budget=DEFAULT_BUDGETS["constraints"],
                 )
             )
@@ -2059,13 +2057,21 @@ class ContextCompiler:
             if contribution.lane in {"knowledge", "media"}
             for ref in contribution.source_event_ids
         }
+        context_sources.update(
+            ref for contribution in contributions if contribution.lane == "capabilities"
+            for ref in contribution.source_event_ids
+            if ref.startswith(("message:", "shared:", "knowledge:", "media:"))
+        )
         for hit in selected:
             for ref in hit.source_event_ids:
                 if ref.startswith("message:") and hit.visibility == Visibility.group_scope:
                     context_sources.add(f"shared:{ref.removeprefix('message:')}")
                 elif ref.startswith(("message:", "knowledge:", "media:")):
                     context_sources.add(ref)
-        context_sources.update(ref for msg in usable for ref in msg.context_sources)
+        for message in usable:
+            context_sources.update(message.context_sources)
+            if message.role == "user" and message.retracted_at is None:
+                context_sources.add(f"message:{message.message_id}")
         if quoted is not None:
             context_sources.update(quoted.context_sources)
             context_sources.add(f"message:{quoted.message_id}")
@@ -2241,7 +2247,10 @@ class ContextCompiler:
             through = max((m.sequence for m in dropped), default=0)
         prev_count = int(getattr(window_ctx, "summary_message_count", 0) or 0) if window_ctx else 0
         sources = set(getattr(window_ctx, "context_sources", None) or ())
-        sources.update(ref for message in dropped for ref in getattr(message, "context_sources", ()))
+        for message in dropped:
+            sources.update(message.context_sources)
+            if message.role == "user" and message.retracted_at is None:
+                sources.add(f"message:{message.message_id}")
         await self._conversation.save_summary(
             window_id,
             summary=merged,

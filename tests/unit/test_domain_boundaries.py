@@ -105,6 +105,12 @@ class Violation:
 
 
 ALLOWED: dict[tuple[str, str], str] = {
+    ("conversation/context_sources.py", "ling.domains.knowledge.service"): (
+        "对话历史复用知识域的可见性和时效判据，以便屏蔽引用了失效资料的答复及摘要。"
+    ),
+    ("conversation/context_sources.py", "ling.domains.media.service"): (
+        "对话历史复用媒体域的授权和来源判据，以便屏蔽引用了失效素材的答复及摘要。"
+    ),
     ("speech/asr_runtime.py", "ling.domains.conversation.service"): (
         "识别完成后更新已登记源消息的转写，再复用 ConversationService 的消息与轮次接口。"
     ),

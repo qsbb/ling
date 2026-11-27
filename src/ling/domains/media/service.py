@@ -31,6 +31,7 @@ from sqlalchemy import ColumnElement, and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.consent.service import ConsentService, ConsentView
+from ling.infra.memory_privacy import open_purge_exists
 from ling.infra.models import ConsentRule, MediaEvidenceRow, Message, Turn, Window, utcnow
 from ling.infra.security import new_id
 
@@ -66,8 +67,6 @@ def readable_media_evidence(*, now: datetime) -> ColumnElement[bool]:
 
 
 def hidden_media_source() -> ColumnElement[bool]:
-    from ling.domains.memory.purge import open_purge_exists
-
     source = MediaEvidenceRow.source_event_id
     hidden_message = select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
         Message.window_id == MediaEvidenceRow.window_id, Message.role == "user",

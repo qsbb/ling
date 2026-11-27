@@ -487,7 +487,7 @@ async def _watch_video(
 
 
 def _memory_source_tool(
-    audience: AudienceSnapshot, sources: dict[str, MemoryHit]
+    audience: AudienceSnapshot, sources: dict[str, MemoryHit], *, context_sources: set[str] | None = None,
 ) -> ToolHandler:
     available = dict(sources)
     used = False
@@ -504,7 +504,7 @@ def _memory_source_tool(
         used = True
         async with session_scope() as session:
             service = MemoryService(session, policy=await published_memory_policy(session))
-            messages = await service.read_source(hit, audience=audience)
+            messages = await service.read_source(hit, audience=audience, context_sources=context_sources)
         # Keep the entire JSON result inside the tool output budget, including escapes.
         while messages:
             data = json.dumps({"messages": messages}, ensure_ascii=False)
@@ -679,7 +679,9 @@ def build_default_registry(
                         "additionalProperties": False,
                     },
                 ),
-                _memory_source_tool(knowledge_audience, memory_sources),
+                _memory_source_tool(
+                    knowledge_audience, memory_sources, context_sources=context_sources,
+                ),
             )
     if media_window_id and watch_video is not None:
         registry.register(

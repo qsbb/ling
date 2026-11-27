@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import ColumnElement, SQLColumnExpression, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.infra.memory_privacy import open_purge_exists
 from ling.infra.models import KnowledgeItem
 from ling.infra.security import new_id
 
@@ -27,8 +28,6 @@ PROCEDURE_SOURCE_SLOT = "knowledge_procedure"
 
 
 def knowledge_visible_to(subject_id: str | SQLColumnExpression[str | None] | None) -> ColumnElement[bool]:
-    from ling.domains.memory.purge import open_purge_exists
-
     # Ownerless sourced records retain the legacy shared knowledge scope.
     shared = KnowledgeItem.owner_subject_id.is_(None) & KnowledgeItem.source_kind.in_(
         ("verified_source", "external_observation")
