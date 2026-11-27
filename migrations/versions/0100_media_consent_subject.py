@@ -14,9 +14,9 @@ def upgrade() -> None:
     op.execute("""
         UPDATE media_evidence AS evidence
         SET consent_subject_id = evidence.subject_id
-        FROM windows AS window
-        WHERE evidence.window_id = window.id
-          AND evidence.subject_id = window.subject_id
+        FROM windows AS source_window
+        WHERE evidence.window_id = source_window.id
+          AND evidence.subject_id = source_window.subject_id
           AND evidence.consent_revision > 0
     """)
 
