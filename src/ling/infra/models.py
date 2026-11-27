@@ -573,6 +573,7 @@ class Message(Base):
     )
     recall_state: Mapped[str | None] = mapped_column(String(24), nullable=True)
     recall_receipt_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     recall_attempted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -670,11 +671,18 @@ class HandoffCapsuleRow(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     subject_id: Mapped[str] = mapped_column(String(64), index=True)
     source_window_id: Mapped[str] = mapped_column(String(64))
+    source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE", name="fk_handoff_source_message"),
+    )
+    target_window_id: Mapped[str | None] = mapped_column(
+        ForeignKey("windows.id", ondelete="CASCADE", name="fk_handoff_target_window"),
+    )
     recent_topic: Mapped[str | None] = mapped_column(Text, nullable=True)
     open_questions: Mapped[list] = mapped_column(JSON, default=list)
     short_quote: Mapped[str | None] = mapped_column(Text, nullable=True)
     visibility: Mapped[str] = mapped_column(String(32), default="subject_private")
     consent_revision: Mapped[int] = mapped_column(Integer, default=0)
+    publish_consent_revision: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -1571,6 +1579,8 @@ class UserPreferenceRow(Base, TimestampMixin):
     # 为空 = 没设过，读侧按 ``frames`` 处理（见 settings/user_preferences.py）。
     # **用户偏好**，不是模型配置：换个模型不该把"我怎么看视频"重置掉。
     video_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    share_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa.false())
+    share_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AwarenessItemRow(Base):
@@ -1660,6 +1670,7 @@ class MemoryRow(Base, TimestampMixin):
     # 靠解析 text 反推值既脆弱又容易错，所以直接存。
     value: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fact_phase: Mapped[str] = mapped_column(String(16), default="current", server_default="current")
+    fact_operation: Mapped[str] = mapped_column(String(16), default="assert", server_default="assert")
     # 产生时的可见范围（subject_private / window_private / group_scope / public）
     source_visibility: Mapped[str] = mapped_column(
         String(32), default="subject_private", index=True, server_default="subject_private"
@@ -1721,6 +1732,9 @@ class MemoryEpisode(Base, TimestampMixin):
     visibility: Mapped[str] = mapped_column(String(32))
     source_event_ids: Mapped[list] = mapped_column(JSON, default=list)
     source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    previous_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL", name="fk_memory_episodes_previous_message"), index=True,
+    )
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     consent_revision: Mapped[int] = mapped_column(Integer, default=0)
     # 情节也会归档（不物理删除：source_event_ids 与后续断言引用它）
@@ -1861,6 +1875,27 @@ class RelationshipState(Base, TimestampMixin):
     )
 
 
+class RelationshipPreference(Base, TimestampMixin):
+    """A participant's topic boundary or an expression awaiting their approval."""
+
+    __tablename__ = "relationship_preferences"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "subject_id", "scope", "kind", "key", name="uq_relationship_preference"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    subject_id: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[str] = mapped_column(String(64))  # private or one group window ID
+    kind: Mapped[str] = mapped_column(String(16))  # boundary | expression
+    key: Mapped[str] = mapped_column(String(160))
+    text: Mapped[str] = mapped_column(String(160))
+    state: Mapped[str] = mapped_column(String(16))  # pending | active | disabled
+    source_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE", name="fk_relationship_preference_source"),
+    )
+
+
 class AffectState(Base):
     """短时情绪：强度 + 衰减。可以影响用词，不能放宽权限。
 
@@ -1990,6 +2025,8 @@ class ActivityRow(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completion_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    simulation_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    simulation_action: Mapped[str | None] = mapped_column(String(120))
     # 来源计划（可空：临时起意没有计划）
     plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # simulated（模拟生活）/ tool_receipt（真实回执）/ user_stated
@@ -2110,6 +2147,14 @@ class ProactiveOpportunity(Base):
     # 没有来源的机会不是"关心"，是随机打扰。
     # 纯"到八点了"只能触发检查，不能生成问候内容。
     source_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    related_memory_id: Mapped[str | None] = mapped_column(String(64))
+    target_window_id: Mapped[str | None] = mapped_column(String(64))
+    source_consent_revision: Mapped[int | None] = mapped_column(Integer)
+    source_target_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    acknowledged_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL", name="fk_proactive_acknowledged_message"),
+    )
+    acknowledgement: Mapped[str | None] = mapped_column(String(16))
     # 同源同类型只允许一条：避免同一件事反复生成候选
     # 唯一性由上面的 `ux_proactive_dedupe` 偏索引保证（NULL 不去重）
     dedupe_key: Mapped[str | None] = mapped_column(String(192), nullable=True)
@@ -3462,6 +3507,7 @@ class MemoryConsolidationRow(Base):
     groups_merged: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     rows_archived: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     review_memory_ids: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    review_bedtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
