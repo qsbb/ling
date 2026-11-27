@@ -63,6 +63,7 @@ import type {
   CoreMemoryListResponse,
   MemoryActivitySource,
   MemoryInclude,
+  MemoryLibraryKind,
   MemoryImportCommit,
   MemoryImportPreview,
   MemoryImportSourceChoices,
@@ -1423,6 +1424,7 @@ export const api = {
       /** 按对象看：self 或实体 id；不传 = 全部对象。 */
       objectId?: string | null;
       conversationScope?: 'private' | 'group' | null;
+      kind?: MemoryLibraryKind | null;
       /** 服务端搜索词；空白串与不传等价。 */
       q?: string | null;
       offset?: number;
@@ -1435,9 +1437,10 @@ export const api = {
     if (options.source) query.set('source', options.source);
     if (options.objectId) query.set('object_id', options.objectId);
     if (options.conversationScope) query.set('conversation_scope', options.conversationScope);
+    if (options.kind) query.set('kind', options.kind);
     const search = (options.q ?? '').trim();
     if (search) query.set('q', search);
-    if (search || options.source || options.objectId || options.conversationScope) {
+    if (search || options.source || options.objectId || options.conversationScope || options.kind) {
       query.set('offset', String(options.offset ?? 0));
     }
     return request<MemoryListResponse>(`/v1/memory?${query.toString()}`, {
@@ -1494,7 +1497,7 @@ export const api = {
   },
 
   readMemorySource(memoryId: string): Promise<{ text: string; created_at: string }> {
-    return request(`/v1/memory/${encodeURIComponent(memoryId)}/source`);
+    return request(`/v1/memory/${encodeURIComponent(memoryId)}/source`, { cache: 'no-store' });
   },
 
   readMemoryActivitySource(memoryId: string): Promise<MemoryActivitySource> {

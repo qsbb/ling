@@ -858,19 +858,22 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 | --- | --- | --- | --- |
 | `limit` | `50` | 整数 `1..200` | 单次最多返回条数，记忆库搜索可从指定位置开始读取 |
 | `include` | 不传（`null`） | `retracted` / `archived` / `all` | 显式取回墓碑；其它值 `422 invalid_request` |
-| `view` | 不传 | `library` | Web 记忆库使用的附加视图；不传时仍只读当前账号的原有记忆条目 |
+| `view` | 不传 | `library` | Web 记忆库使用的附加视图。省略时读取原有记忆条目 |
+| `kind` | 不传 | `assertion` / `episode` / `procedure` / `knowledge` / `plan` / `impression` / `material` | 在 `view=library` 中按类型筛选后分页 |
 
-`view=library` 把已记下的对话经历与提炼条目一起按时间列出。经历记录是只读的，
-以 `record_type: "experience"` 区分，`confidence` 为 `null`。列表与写操作仍限于当前账号
-对应的自然人；其他身份的存量不会仅因账号合并就出现在这里。
+`view=library` 按记录时间列出对话经历、提炼结果和可见资料。经历的 `record_type` 为
+`experience`，角色活动为 `self_experience`。感受沿原发言显示作者和发言时间。
+知识和有资料依据的做法可返回 `source_url`。承诺记录返回 `plan_state` 和 `due_at`，
+区分待履行、到期、取消和提醒投递。素材仅在来源窗口和登记时的授权均可核对时显示。
+列表与写操作按当前账号对应的自然人授权。
 `extraction` 是最近一次提炼任务的状态与时间，无任务时为 `null`；`done` 只表示任务结束，
 是否有现行内容以列表为准。
 
 默认可见集**只含现行记忆**：`retracted=false` **且** `archived_at IS NULL`。
 已撤回（`retracted=true`）与已归档（`archived_at` 非空）的行只是**默认不可见**，
 数据仍在库里，供证据链与审计追溯——本契约**不删除、不改写**任何行。
-`valid_until` 已过期的行仍会返回：本次只收窄墓碑可见性，不改变“有效期”
-在召回链路上的既有语义。
+旧记忆条目仍可显示 `valid_until` 已过的事实供核对。依赖资料或素材的记录按当前来源
+状态筛选，来源失效后退出记忆库。
 
 `include` 的语义是“在默认集合上追加哪一类墓碑”，不是“只查哪一类”：
 
@@ -916,7 +919,11 @@ requests 目录，**不**访问 registry、**不**改 `status.json`。它是只�
 
 使用 `GET /v1/memory?view=library&q=杭州%20散步&limit=50&offset=0`，服务端会在当前自然人的可见范围内查询记忆正文和经历摘要。搜索词按空白分隔，每个词都需出现。搜索忽略大小写和全半角差异，`%` 与 `_` 作为普通字符匹配。`q` 最长 200 字符，空白按普通列表处理。
 
-`source=astrbot_memory_companion` 可与搜索或原有来源浏览一起使用。来源筛选仅返回相应的导入条目。非零 `offset` 用于有搜索词或来源的记忆库请求。搜索分页使用全体命中记录的共同顺序 `created_at DESC, memory_id DESC`。
+`source=astrbot_memory_companion` 仅返回相应的导入条目。来源、对象、会话范围、类型和搜索词可叠加。非零 `offset` 需要至少一项筛选条件。分页使用 `created_at DESC, memory_id DESC` 顺序。
+
+`GET /v1/memory/{memory_id}/source` 在每次访问时重验来源。适用记录可读取原发言或获准的素材描述。
+保留外部资料出处的做法通过 `POST /v1/memory` 引用一条 `knowledge:<id>`，并使用资料中的原文。
+记录为私人范围，资料过期或失效后退出召回。
 
 搜索与按来源浏览响应仍包含 `memories`、`total`、`limit`、`has_more`、`include`、`extraction`，并回传 `offset`。指定来源时回传 `source`。`total` 是当前过滤下的完整命中数，`has_more` 依据该数和当前页位置。清理进行中返回空列表。改查询或筛选时，客户端从 `offset=0` 开始。
 

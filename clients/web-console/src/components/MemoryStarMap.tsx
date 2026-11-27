@@ -122,10 +122,10 @@ export const STAR_CARD_W = 138;
 export const STAR_CARD_H = 82;
 
 const LANE_LABELS: Record<StarLaneId, string> = {
-  episode: '经历',
-  assertion: '事实与线索',
+  episode: '经历与感受',
+  assertion: '事实与知识',
   procedure: '做法',
-  other: '未分类',
+  other: '计划与素材',
 };
 
 const DAY_MS = 86_400_000;
@@ -177,8 +177,9 @@ function sessionScope(row: MemoryRecord): '群聊' | '私聊' | null {
 }
 
 function laneOfKind(kind: string): StarLaneId {
-  if (kind === 'episode' || kind === 'assertion' || kind === 'procedure') return kind;
-  return 'other';
+  if (kind === 'episode' || kind === 'impression') return 'episode';
+  if (kind === 'assertion' || kind === 'knowledge') return 'assertion';
+  return kind === 'procedure' ? 'procedure' : 'other';
 }
 
 function splitSentences(text: string): string[] {

@@ -364,6 +364,9 @@ export interface MemoryPolicy {
 
 /** 契约里 `kind` 是 episode / assertion / procedure 三选一（`contracts/v1`）。 */
 export type MemoryKind = 'episode' | 'assertion' | 'procedure';
+export type MemoryLibraryKind = MemoryKind | 'knowledge' | 'plan' | 'impression' | 'material';
+export type MemoryPlanState = 'pending' | 'overdue' | 'reminder_delivered' | 'missed'
+  | 'undeliverable' | 'cancelled' | 'unconfirmed';
 
 /** `GET /v1/memory` 的 include 取值；不传（null）= 只看现行记忆。 */
 export type MemoryInclude = 'retracted' | 'archived' | 'all';
@@ -399,7 +402,9 @@ export interface MemoryRecord {
   source_window_id?: string;
   source_account?: string | null;
   source_visibility?: string;
-  source_role?: 'self_report' | 'user_correction' | 'conversation';
+  source_role?: 'self_report' | 'user_correction' | 'conversation' | 'actor_impression'
+    | 'actor_commitment' | 'media_description';
+  source_url?: string | null;
   observed_at?: string | null;
   occurred_at?: string | null;
   valid_from?: string | null;
@@ -407,8 +412,11 @@ export interface MemoryRecord {
   created_at: string | null;
   archived_at: string | null;
   can_edit?: boolean;
+  can_correct?: boolean;
   pinned?: boolean;
-  record_type?: 'memory' | 'experience' | 'self_experience';
+  due_at?: string | null;
+  plan_state?: MemoryPlanState;
+  record_type?: 'memory' | 'experience' | 'self_experience' | 'knowledge' | 'commitment' | 'material';
   /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
   import_source?: MemoryImportSource;
   archive_speakers?: { entity_id: string; name: string; source_event_id: string }[];

@@ -67,8 +67,7 @@ def memory_record(row: MemoryRow) -> dict[str, Any]:
                 "actor_impression" if impression else
                 "user_correction" if row.supersedes and not row.turn_id else "self_report"
             ),
-            **({"observed_at": _iso(row.valid_from)} if impression else {}),
-            "valid_from": _iso(row.valid_from),
+            **({"observed_at": _iso(row.valid_from)} if impression else {"valid_from": _iso(row.valid_from)}),
         } if row.source_message_id is not None else {}),
         **({"import_source": row.import_source} if row.import_source is not None else {}),
     }
@@ -291,7 +290,7 @@ async def read_library(
         queries.append(episode_query.with_only_columns(
             MemoryEpisode.id, MemoryEpisode.created_at, literal("experience").label("record_type"),
         ))
-    if source is None and not object_id and conversation_scope != "group" and kind in {None, "knowledge"}:
+    if source is None and not object_id and conversation_scope is None and kind in {None, "knowledge"}:
         topic = func.normalize(KnowledgeItem.topic, literal_column("NFKC"))
         claim = func.normalize(KnowledgeItem.claim, literal_column("NFKC"))
         queries.append(select(
@@ -333,7 +332,10 @@ async def read_library(
         .outerjoin(MemoryEpisode, and_(
             page_keys.c.record_type == "experience", MemoryEpisode.id == page_keys.c.id,
         ))
-        .outerjoin(KnowledgeItem, and_(page_keys.c.record_type == "knowledge", KnowledgeItem.id == page_keys.c.id))
+        .outerjoin(KnowledgeItem, or_(
+            and_(page_keys.c.record_type == "knowledge", KnowledgeItem.id == page_keys.c.id),
+            and_(MemoryRow.slot == PROCEDURE_SOURCE_SLOT, KnowledgeItem.id == MemoryRow.value),
+        ))
         .outerjoin(CommitmentRow, and_(page_keys.c.record_type == "commitment", CommitmentRow.id == page_keys.c.id))
         .outerjoin(MediaEvidenceRow, and_(page_keys.c.record_type == "material", MediaEvidenceRow.id == page_keys.c.id))
         .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
@@ -367,6 +369,7 @@ async def read_library(
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
                 "source_visibility": memory.source_visibility,
                 **({"pinned": True} if memory.id in pins else {}),
+                **({"source_url": knowledge.source_url} if knowledge is not None else {}),
                 **({"can_correct": False} if memory.slot in {PROCEDURE_SOURCE_SLOT, ACTOR_IMPRESSION_SLOT} else {}),
                 **({"archive_speakers": speakers[memory.id]} if memory.id in speakers else {}),
             })

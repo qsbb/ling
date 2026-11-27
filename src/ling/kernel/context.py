@@ -1723,7 +1723,7 @@ class ContextCompiler:
         if knowledge_index is not None:
             represented = {
                 source_id.removeprefix("knowledge:")
-                for hit in selected if hit.kind == "procedure"
+                for hit in selected if hit.kind == "procedure" and len(hit.text) <= 240
                 for source_id in hit.source_event_ids if source_id.startswith("knowledge:")
             }
             if represented:

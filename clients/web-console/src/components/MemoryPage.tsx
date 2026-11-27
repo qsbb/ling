@@ -1,6 +1,6 @@
 /**
  * 记忆页：先找记录，再查看来源、可见范围与纠正历史。
- * 浏览器只搜索已经加载的一批（最多 200 条），不调用对话召回，也无单条详情 API。
+ * 正文搜索和类型筛选由记忆库 API 处理，详情可按权限打开对应依据。
  * 核心记忆、学习设置和永久清理互相独立，后台清理不随页内切换而取消。
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
@@ -24,10 +24,12 @@ import type {
   MemoryActivitySource,
   MemoryImportSourceFilter,
   MemoryInclude,
+  MemoryLibraryKind,
   MemoryListResponse,
   MemoryObject,
   MemoryObjectAnnotation,
   MemoryObjectKind,
+  MemoryPlanState,
   MemoryRecord,
   SleepReviewsResponse,
 } from '../types';
@@ -48,8 +50,22 @@ const BROWSE_KINDS = [
   { value: 'all', label: '全部' },
   { value: 'assertion', label: '事实与线索' },
   { value: 'episode', label: '经历' },
+  { value: 'knowledge', label: '知识' },
   { value: 'procedure', label: '做法' },
+  { value: 'plan', label: '计划' },
+  { value: 'impression', label: '感受' },
+  { value: 'material', label: '素材' },
 ] as const;
+
+const PLAN_STATE_TEXT: Record<MemoryPlanState, string> = {
+  pending: '待履行', overdue: '已到期，履行待核实', reminder_delivered: '提醒已送达，履行待核实',
+  missed: '提醒未送达', undeliverable: '提醒无法送达', cancelled: '已取消', unconfirmed: '履行待核实',
+};
+
+const SOURCE_ROLE_TEXT: Record<NonNullable<MemoryRecord['source_role']>, string> = {
+  self_report: '本人自述', user_correction: '本人纠正', conversation: '对话记录',
+  actor_impression: '她当时的表达', actor_commitment: '她的承诺原话', media_description: '有授权的素材描述',
+};
 
 const OBJECT_KIND_LABELS: Record<MemoryObjectKind, string> = {
   person: '人物', group: '群体', place: '地点', item: '物件', work: '作品',
@@ -193,7 +209,7 @@ export function includeMode(flags: TombstoneFlags): MemoryInclude | null {
 
 export interface MemoryFilters {
   /** 只看某一类；`all` = 不分段筛选（分段仍然显示）。 */
-  kind: 'all' | 'episode' | 'assertion' | 'procedure';
+  kind: 'all' | MemoryLibraryKind;
   /** 时间范围：只看 created_at 落在最近 N 天内的条目。 */
   range: 'all' | '7d' | '30d';
   /** 会话范围：全部 / 私聊 / 群聊。群聊摘要也属于“所有记忆”。 */
@@ -203,10 +219,7 @@ export interface MemoryFilters {
 export const DEFAULT_FILTERS: MemoryFilters = { kind: 'all', range: 'all', originScope: 'all' };
 
 /**
- * 前端筛选（kind / 时间范围）。
- *
- * **后端没有这两个参数**，所以这里只过滤「已经取回的这一批」，界面会明说
- * 「筛选后 X 条 / 已取回 Y 条」。`created_at` 为空的旧数据无法判断时间范围，
+ * 时间范围只过滤当前已取回的记录，类型和会话范围由服务器先筛选。`created_at` 为空的旧数据无法判断时间范围，
  * 只在「全部时间」下显示，不在时间范围里冒充。
  */
 export function filterMemories(
@@ -220,7 +233,7 @@ export function filterMemories(
     if (filters.kind !== 'all' && row.kind !== filters.kind) return false;
     const originScope = filters.originScope ?? 'all';
     if (originScope !== 'all') {
-      if (row.record_type === 'self_experience') return false;
+      if (row.record_type === 'self_experience' || row.record_type === 'knowledge') return false;
       const session = row.import_source?.session_id ?? '';
       const isGroup = row.source_visibility === 'group_scope' || row.visibility === 'group_scope'
         || /groupmessage/i.test(session);
@@ -1336,6 +1349,11 @@ function MemoryInspector({
   const forgetting = mode === 'forget';
   const imported = row.import_source?.source === 'astrbot_memory_companion';
   const canForget = Boolean(row.source_message_id || imported);
+  const sourceLabel = row.record_type === 'material' ? '素材依据' : '原话';
+  const hasSource = row.record_type === 'material'
+    || (row.source_message_id && ['subject_private', 'window_private'].includes(row.visibility));
+  const documentUrl = /^https?:\/\//i.test(row.source_url ?? '') ? row.source_url : null;
+  const canAnnotate = row.record_type == null || row.record_type === 'memory' || row.record_type === 'experience';
   const canPin = !status && row.can_edit && row.kind === 'assertion' && row.origin === 'user_statement'
     && row.visibility === 'subject_private' && (row.source_visibility ?? row.visibility) === 'subject_private'
     && (!row.valid_until || Date.parse(row.valid_until) > Date.now());
@@ -1403,11 +1421,11 @@ function MemoryInspector({
         {(!status && row.can_edit !== false) || canForget || row.pinned ? (
           <div className="mem-inspector__actions">
             {!status && row.can_edit !== false ? <>
-            <button
+            {row.can_correct !== false ? <button
               type="button" className="button button--small button--primary"
               aria-expanded={mode === 'supersede'} disabled={pending}
               onClick={() => updateMode(mode === 'supersede' ? null : 'supersede')}
-            ><PencilIcon size={14} /> 纠正…</button>
+            ><PencilIcon size={14} /> 纠正…</button> : null}
             <button
               type="button" className="button button--small mem-action--danger"
               aria-expanded={mode === 'retract'} disabled={pending}
@@ -1429,7 +1447,7 @@ function MemoryInspector({
       </div>
 
       {!mode && error ? <InlineError error={error} resource="list" /> : null}
-      {!status && row.record_type !== 'self_experience'
+      {!status && canAnnotate
         && (row.source_message_id || row.import_source || row.source_event_ids.length) ? (
         <ObjectAnnotationForm row={row} objects={objects}
           onSave={(input) => handlers.annotateObject(row.memory_id, input)} />
@@ -1490,9 +1508,14 @@ function MemoryInspector({
       <section className="mem-inspector__section" aria-label="来源与可见范围">
         <h4>来源与可见范围</h4>
         <dl className="mem-facts">
-          <div><dt>来源</dt><dd>{row.source_role === 'self_report' ? '本人自述' : row.source_role === 'user_correction' ? '本人纠正' : row.source_role === 'conversation' ? '对话记录' : originLabel(row.origin)}</dd></div>
+          <div><dt>来源</dt><dd>{row.source_role ? SOURCE_ROLE_TEXT[row.source_role] : originLabel(row.origin)}</dd></div>
+          {row.plan_state ? <div><dt>承诺状态</dt><dd>{PLAN_STATE_TEXT[row.plan_state]}</dd></div> : null}
+          {row.due_at ? <div><dt>履行期限</dt><dd>{formatAbsoluteTime(row.due_at)}</dd></div> : null}
           {row.valid_from ? <div><dt>有效期自</dt><dd>{formatAbsoluteTime(row.valid_from)}</dd></div> : null}
-          {row.observed_at ? <div><dt>发言时间</dt><dd>{formatAbsoluteTime(row.observed_at)}</dd></div> : null}
+          {row.observed_at ? <div>
+            <dt>{row.kind === 'knowledge' ? '查阅时间' : row.kind === 'material' ? '收到时间' : '发言时间'}</dt>
+            <dd>{formatAbsoluteTime(row.observed_at)}</dd>
+          </div> : null}
           {row.import_source ? (
             <div className="mem-facts__wide" data-testid="mem-import-source">
               <dt>来自 AstrBot</dt>
@@ -1514,6 +1537,7 @@ function MemoryInspector({
           <div><dt>记下时间</dt><dd><time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time>{relative ? <small> {relative}</small> : null}</dd></div>
           <div><dt>有效期至</dt><dd>{row.valid_until ? formatAbsoluteTime(row.valid_until) : '未设置'}</dd></div>
         </dl>
+        {documentUrl ? <a className="mem-text-button" href={documentUrl} target="_blank" rel="noreferrer">查看来源资料</a> : null}
         {row.archive_speakers?.length ? (
           <details className="mem-inspector__section" data-testid="mem-archive-speakers">
             <summary>原发言者</summary>
@@ -1557,11 +1581,11 @@ function MemoryInspector({
             ) : null}
             <InlineError error={sourceError} resource="list" />
           </>
-        ) : row.source_message_id && ['subject_private', 'window_private'].includes(row.visibility) ? (
+        ) : hasSource ? (
           <>
             <button type="button" className="mem-text-button" aria-expanded={Boolean(source)}
               disabled={sourcePending || pending} onClick={() => void toggleSource()}>
-              {sourcePending ? '读取中…' : source ? '收起原话' : '查看原话'}
+              {sourcePending ? '读取中…' : (source ? '收起' : '查看') + sourceLabel}
             </button>
             {source ? (
               <blockquote data-testid="mem-original-message">
@@ -1704,7 +1728,8 @@ export function MemoryListSection({
   const narrowedByView = Boolean(scope || objectId || filters.kind !== 'all' || filters.range !== 'all' || (filters.originScope ?? 'all') !== 'all');
   /** 服务端命中口径下的总数；没有搜索词与来源时就是整库总数。 */
   const matchTotal = data?.total ?? 0;
-  const canPage = Boolean(trimmedSearch || source || objectId || (filters.originScope && filters.originScope !== 'all'));
+  const canPage = Boolean(trimmedSearch || source || objectId || filters.kind !== 'all'
+    || (filters.originScope && filters.originScope !== 'all'));
 
   useEffect(() => {
     const query = window.matchMedia('(min-width: 761px)');
@@ -2573,8 +2598,9 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
   const query = search.trim();
   const conversationScope = filters.originScope === 'group' || filters.originScope === 'private'
     ? filters.originScope : null;
-  const latestQuery = useRef({ limit, include, source, objectId, conversationScope, q: query });
-  latestQuery.current = { limit, include, source, objectId, conversationScope, q: query };
+  const kind = filters.kind === 'all' ? null : filters.kind;
+  const latestQuery = useRef({ limit, include, source, objectId, conversationScope, kind, q: query });
+  latestQuery.current = { limit, include, source, objectId, conversationScope, kind, q: query };
   const coreRequest = useRef(0);
   const listRequest = useRef(0);
   const reviewRequest = useRef(0);
@@ -2617,7 +2643,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     setList((current) => current.data && loaded && loaded.limit === query.limit
       && loaded.include === query.include && loaded.source === query.source
       && loaded.objectId === query.objectId && loaded.conversationScope === query.conversationScope
-      && loaded.q === query.q
+      && loaded.kind === query.kind && loaded.q === query.q
       ? current : loadingSection<MemoryListResponse>());
     try {
       const data = await api.listMemories(query);
@@ -2649,11 +2675,11 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     const query = latestQuery.current;
     const current = listRef.current.data;
     const loaded = listQueryRef.current;
-    if ((!query.q && !query.source && !query.objectId && !query.conversationScope)
+    if ((!query.q && !query.source && !query.objectId && !query.conversationScope && !query.kind)
       || !current?.has_more || listBusyRef.current
       || !loaded || loaded.source !== query.source || loaded.limit !== query.limit
       || loaded.include !== query.include || loaded.objectId !== query.objectId
-      || loaded.conversationScope !== query.conversationScope || loaded.q !== query.q) return;
+      || loaded.conversationScope !== query.conversationScope || loaded.kind !== query.kind || loaded.q !== query.q) return;
     const offset = current.memories.length;
     const requestId = ++listRequest.current;
     listBusyRef.current = true;
@@ -2700,7 +2726,7 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
     }
     const timer = setTimeout(() => void loadList(), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [loadList, query, limit, include, source, objectId, conversationScope, tab]);
+  }, [loadList, query, limit, include, source, objectId, conversationScope, kind, tab]);
 
   useEffect(() => {
     if (tab !== 'content') return undefined;

@@ -415,6 +415,7 @@ async function openFromNav(page, mobile = false) {
   await nav.getByTestId('nav-memory').click();
   await page.waitForURL(`${webBase}/memory`);
   await tabLinks(page).getByRole('link', exact('记忆库')).waitFor({ state: 'visible' });
+  await page.getByRole('button', exact('列表')).click();
 }
 
 async function switchTab(page, name, tab = null) {
@@ -435,7 +436,9 @@ async function expectRows(page, texts) {
 async function selectMemory(page, text) {
   await memoryButton(page, text).click();
   const detail = inspector(page);
-  await detail.getByText(text, { exact: true }).waitFor({ state: 'visible' });
+  const story = detail.locator('.mem-inspector__text');
+  await story.waitFor({ state: 'visible' });
+  assert(await story.textContent() === text, '详情正文与选中记忆不符');
   return detail;
 }
 
@@ -545,7 +548,8 @@ async function exerciseHistory(page, ids) {
   await selectMemory(page, SEED.procedure);
   await detail.getByText('已被纠正', { exact: true }).waitFor({ state: 'visible' });
   await detail.getByRole('button', exact('纠正后的条目')).click();
-  await detail.getByText(SEED.corrected, { exact: true }).waitFor({ state: 'visible' });
+  await waitUntil(async () => (await detail.locator('.mem-inspector__text').textContent()) === SEED.corrected,
+    '纠正链跳转到新条目正文');
   const history = (await apiJson('/v1/memory?include=all')).memories;
   const old = history.find((row) => row.memory_id === ids.procedure);
   const next = history.find((row) => row.memory_id === replacement.memory_id);
@@ -608,6 +612,50 @@ async function exerciseRealErrors(page) {
   await page.goto(`${webBase}/memory?tab=core`, { waitUntil: 'domcontentloaded' });
   await kept.waitFor({ state: 'visible' });
   ok('real-403：真账号闸不给重试、可点到账号设置，复位后恢复');
+}
+
+async function exerciseTypedLibrary(errors) {
+  const claim = 'E2E：展馆的样张需要从短边对齐';
+  const url = 'https://example.invalid/paper-guide';
+  const { item_id: id } = await apiJson('/v1/knowledge', jsonWrite('POST', {
+    topic: 'E2E 样张手册', claim, source_url: url, source_kind: 'verified_source',
+  }));
+  await apiJson('/v1/memory', jsonWrite('POST', {
+    kind: 'procedure', text: claim, origin: 'verified_source', visibility: 'subject_private',
+    source_event_ids: ['knowledge:' + id],
+  }));
+  for (const width of [1440, 375, 320]) {
+    const context = await browser.newContext({ viewport: { width, height: 900 } });
+    try {
+      const page = await context.newPage();
+      capturePageErrors(page, errors);
+      await loginUi(page);
+      await page.goto(webBase + '/memory', { waitUntil: 'domcontentloaded' });
+      await page.getByRole('button', exact('列表')).click();
+      const types = page.getByRole('group', { name: '记忆类型' });
+      for (const [label, kind] of [['知识', 'knowledge'], ['做法', 'procedure']]) {
+        const [response] = await Promise.all([
+          page.waitForResponse((res) => {
+            const requestUrl = new URL(res.url());
+            return requestUrl.pathname === '/v1/memory' && requestUrl.searchParams.get('kind') === kind;
+          }),
+          types.getByRole('button', exact(label)).click(),
+        ]);
+        assert(response.ok(), '服务器未接受类型筛选');
+        await expectRows(page, [claim]);
+        const detail = await selectMemory(page, claim);
+        assert(await detail.getByRole('link', exact('查看来源资料')).getAttribute('href') === url, '来源资料不正确');
+        const dimensions = await page.evaluate(() => [document.documentElement.scrollWidth, innerWidth]);
+        assert(dimensions[0] <= dimensions[1], '类型详情在 ' + width + 'px 出现横向溢出');
+        if (kind === 'procedure') await shot(page, 'memory-types-' + width);
+        const back = detail.getByRole('button', exact('回到列表'));
+        if (await back.isVisible()) await back.click();
+      }
+      ok(width + 'px 类型筛选、服务端请求、资料回查和详情布局');
+    } finally {
+      await context.close();
+    }
+  }
 }
 
 async function exerciseMobile(errors) {
@@ -813,6 +861,7 @@ try {
   await exerciseMobile(errors);
   await exerciseForget(page);
   await exerciseSettings(page);
+  await exerciseTypedLibrary(errors);
   assert(errors.length === 0, `桌面或手机有未捕获的 JS 错误：${errors.join(' | ')}`);
   ok('桌面与手机没有未捕获的页面错误');
 } catch (error) {
