@@ -214,6 +214,36 @@ async def test_describe_is_refused_after_owner_revokes(logged_in: TestEnv) -> No
             )
 
 
+async def test_description_cannot_switch_to_a_different_subject_with_same_revision(
+    logged_in: TestEnv,  # noqa: F811
+) -> None:
+    window_id = await _window(logged_in)
+    assert await _grant(SPEAKER) == await _grant(OWNER)
+    async with session_scope() as session:
+        service = MediaEvidenceService(session, actor_id=ACTOR)
+        for subject, label in ((SPEAKER, "发言人的素材"), (OWNER, "主人的素材")):
+            row = await service.record(
+                subject_id=subject, window_id=window_id,
+                media_ref=f"fixture/{subject}.png", consent_subjects=(OWNER,),
+            )
+            await service.describe(row.evidence_id, window_id=window_id, description=label)
+        before = await service.described_in_window(window_id=window_id)
+        assert {item.description for item in before} == {"发言人的素材", "主人的素材"}
+
+    async with session_scope() as session:
+        await ConsentService(session).revoke(subject_id=SPEAKER, scope=INBOUND_SCOPE)
+        service = MediaEvidenceService(session, actor_id=ACTOR)
+        after = await service.described_in_window(window_id=window_id)
+        assert [item.description for item in after] == ["主人的素材"]
+        delegated = await service.record(
+            subject_id=SPEAKER, window_id=window_id,
+            media_ref="fixture/new.png", consent_subjects=(OWNER,),
+        )
+        await service.describe(delegated.evidence_id, window_id=window_id, description="主人授权的另一张")
+        visible = await service.described_in_window(window_id=window_id)
+        assert {item.description for item in visible} == {"主人授权的另一张", "主人的素材"}
+
+
 # ------------------------------------------------------------------ 日志降噪
 
 
