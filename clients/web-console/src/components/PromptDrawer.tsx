@@ -381,13 +381,31 @@ export function PromptSnapshotBody({
   return (
     <div className="prompt-drawer__snapshot" data-testid="prompt-snapshot">
       <PromptSummary snapshot={snapshot} />
+      {snapshot.memory_recall ? (
+        <details>
+          <summary>原话回查</summary>
+          <p>{({
+            not_extracted: '相关对话尚未提炼',
+            not_visible: '当前窗口无法查看这段证据',
+            no_match: '可见记录中没有命中',
+            not_injected: '命中的证据未进入本轮上下文',
+            injected: '证据已进入本轮上下文',
+            used_source: '回复直接采用了来源记录',
+          })[snapshot.memory_recall.state]}</p>
+          {snapshot.memory_recall.expression ? <p>{snapshot.memory_recall.expression === 'quoted'
+            ? '生成的回复引用了原话' : '生成的回复未逐字引用原话'}</p> : null}
+          {snapshot.memory_recall.source_message_ids.length
+            ? <p>消息来源 <code>{snapshot.memory_recall.source_message_ids.join('、')}</code></p>
+            : null}
+        </details>
+      ) : null}
       {snapshot.truncated ? (
         <p className="prompt-drawer__truncated" data-testid="prompt-truncated">
           这次内容太长，只保留了开头和最后几条
         </p>
       ) : null}
       {!Array.isArray(snapshot.sections) || snapshot.sections.length === 0 ? (
-        <p className="prompt-drawer__empty-section">这次没有注入任何内容</p>
+        <p className="prompt-drawer__empty-section">{snapshot.note ?? '这次没有注入任何内容'}</p>
       ) : (
         snapshot.sections.map((section, index) => {
           const key = promptSectionKey(index, section);

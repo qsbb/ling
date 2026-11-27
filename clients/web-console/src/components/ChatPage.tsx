@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { api } from '../api';
 import { formatDuration } from '../format';
 import type { UserInfo } from '../types';
 import { useChat, type UiMessage } from '../useChat';
@@ -508,6 +509,7 @@ export function ChatPage({
               canViewVoiceTranscript={user.role === 'owner' || user.role === 'admin'}
               promptOpenKey={promptOpenKey}
               onOpenPrompt={togglePrompt}
+              onPinMessage={session && !session.archived ? (id) => api.pinMemoryMessage(session.session_id, id) : undefined}
               recallProposals={chat.recallProposals}
               recallUnavailable={chat.recallProposalsUnavailable}
               onReloadRecall={chat.reloadRecallProposals}

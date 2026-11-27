@@ -30,6 +30,7 @@ function outcome(record: ProactiveRecord): string {
     case 'uncertain': return '发送结果不确定';
     case 'rejected': return '已跳过';
     case 'expired': return '机会已过期';
+    case 'continued': return '已在对话中分享';
     default: return '发送结果未知';
   }
 }
@@ -49,7 +50,11 @@ export function ProactiveHistory({ records }: { records: ProactiveRecord[] }) {
             </div>
             <p>来源：{record.has_source ? (SOURCES[record.reason_code ?? ''] ?? '已关联来源') : '未记录'}</p>
             <p>缘由：{record.reason}</p>
-            {record.draft_origin === 'unknown' ? <p>草稿来源：未记录</p> : null}
+            {record.draft_origin === 'unknown' && !record.activity_id ? <p>草稿来源：未记录</p> : null}
+            {record.related_memory_id ? <p>关联记忆 <code>{record.related_memory_id}</code></p> : null}
+            {record.acknowledgement ? <p>{({
+              received: '用户确认已收到', misunderstood: '用户说明自己理解不同', agreed: '用户明确认可',
+            })[record.acknowledgement]}</p> : null}
             {record.draft_state === 'uncertain' ? <p>开场白生成结果暂未确认</p> : null}
             <p>
               上次检查：{record.gate.allowed === null ? '没有记录' : record.gate.allowed ? '允许继续' : '暂缓'}

@@ -291,6 +291,23 @@ export function SleepReviewNightCard({
           ))}
         </ol>
       ) : null}
+      {night.life?.length ? (
+        <ol className="sleep-rows" aria-label="生活回顾">
+          {night.life.map((item) => (
+            <li className="sleep-row" key={item.source_id}>
+              <small>{({
+                activity: item.status === 'simulated_outcome' ? '模拟活动已完成' : '有来源的活动',
+                dream: '梦境', plan: '取消的安排', impression: 'Ling 当时的感受',
+                clarification: '用户后来的解释', intention: '还想做的事',
+              })[item.kind]}</small>
+              <p className="sleep-row__text">{item.text}</p>
+              {item.window_id ? (
+                <a className="sleep-original__open" href={sourceSessionHref(item.window_id)}>查看来源会话</a>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
     </article>
   );
 }

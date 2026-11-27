@@ -435,7 +435,7 @@ async function expectRows(page, texts) {
 async function selectMemory(page, text) {
   await memoryButton(page, text).click();
   const detail = inspector(page);
-  await detail.getByText(text, { exact: true }).waitFor({ state: 'visible' });
+  await detail.locator('.mem-inspector__text').and(detail.getByText(text, { exact: true })).waitFor();
   return detail;
 }
 
@@ -545,7 +545,7 @@ async function exerciseHistory(page, ids) {
   await selectMemory(page, SEED.procedure);
   await detail.getByText('已被纠正', { exact: true }).waitFor({ state: 'visible' });
   await detail.getByRole('button', exact('纠正后的条目')).click();
-  await detail.getByText(SEED.corrected, { exact: true }).waitFor({ state: 'visible' });
+  await detail.locator('.mem-inspector__text').and(detail.getByText(SEED.corrected, { exact: true })).waitFor();
   const history = (await apiJson('/v1/memory?include=all')).memories;
   const old = history.find((row) => row.memory_id === ids.procedure);
   const next = history.find((row) => row.memory_id === replacement.memory_id);
@@ -623,13 +623,40 @@ async function exerciseMobile(errors) {
     await shot(page, 'memory-mobile-list');
     const detail = await selectMemory(page, SEED.corrected);
     await shot(page, 'memory-mobile-inspector');
-    await detail.getByRole('button', exact('回到列表')).click();
+    await detail.getByRole('button', exact('回到星图')).click();
     await memoryButton(page, SEED.corrected).waitFor({ state: 'visible' });
     await detail.waitFor({ state: 'hidden' });
     ok('375px 手机：从导航抽屉读真实列表，打开详情再返回');
   } finally {
     await context.close();
   }
+}
+
+async function exerciseContinuityControls(page) {
+  await page.getByTestId('sidenav').getByTestId('nav-life').click();
+  await page.waitForURL(`${webBase}/life`);
+  await page.getByText('更多生活记录', { exact: true }).click();
+  const controls = page.getByRole('region', { name: '联系与表达设置' });
+  const resource = '/v1/relationship/preferences';
+  await browserResponse(page, 'PUT', `${resource}/pause`, () =>
+    controls.getByRole('button', { name: '暂停主动分享' }).click());
+  assert((await apiJson(resource)).share_pause.paused, '未保存主动分享暂停');
+  await browserResponse(page, 'PUT', `${resource}/pause`, () =>
+    controls.getByRole('button', { name: '恢复主动分享' }).click());
+  assert(!(await apiJson(resource)).share_pause.paused, '未保存主动分享恢复');
+
+  const topic = '测试用青桐街旧约';
+  await controls.getByLabel('不希望提起的话题').fill(topic);
+  const created = await browserResponse(page, 'POST', `${resource}/boundary`, () =>
+    controls.getByRole('button', { name: '添加边界' }).click());
+  const { id } = await created.json();
+  const row = controls.getByRole('listitem').filter({ hasText: topic });
+  await browserResponse(page, 'PATCH', `${resource}/${id}`, () =>
+    row.getByRole('button', { name: '停用', exact: true }).click());
+  const preferences = (await apiJson(resource)).preferences;
+  assert(preferences.some((item) => item.id === id && item.state === 'disabled'), '未保存边界停用');
+  await shot(page, 'life-continuity-controls');
+  ok('生活记录：在真实浏览器暂停并恢复分享，添加和停用话题边界');
 }
 
 // API 读不到只能证明被代次栅栏隐藏；直接确认隔离库的行数才能区分软隐藏和真删。
@@ -813,6 +840,7 @@ try {
   await exerciseMobile(errors);
   await exerciseForget(page);
   await exerciseSettings(page);
+  await exerciseContinuityControls(page);
   assert(errors.length === 0, `桌面或手机有未捕获的 JS 错误：${errors.join(' | ')}`);
   ok('桌面与手机没有未捕获的页面错误');
 } catch (error) {

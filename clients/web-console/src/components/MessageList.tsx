@@ -107,6 +107,7 @@ interface MessageListProps {
   promptOpenKey?: string | null;
   /** 点击入口。第二个参数是入口元素本身，关闭抽屉后要把焦点还给它。 */
   onOpenPrompt?: (message: UiMessage, trigger: HTMLElement) => void;
+  onPinMessage?: (messageId: string) => Promise<unknown>;
   /**
    * 她提议撤回、还没处理完的（按 `message_id` 挂到对应消息下面）。
    *
@@ -486,6 +487,7 @@ function MessageDetails({
   promptOpen,
   clock,
   onOpenPrompt,
+  onPinMessage,
 }: {
   message: UiMessage;
   align: 'start' | 'end';
@@ -493,7 +495,9 @@ function MessageDetails({
   promptOpen: boolean;
   clock: string;
   onOpenPrompt: ((message: UiMessage, trigger: HTMLElement) => void) | undefined;
+  onPinMessage?: (messageId: string) => Promise<unknown>;
 }) {
+  const [pinState, setPinState] = useState<'idle' | 'pending' | 'saved' | 'failed'>('idle');
   const hasPrompt = message.role === 'actor' && promptEnabled && onOpenPrompt !== undefined;
   /*
    * 只放**主行没有**的事实。时间在主行（读历史时"什么时候说的"是阅读本身
@@ -506,18 +510,20 @@ function MessageDetails({
   ];
   const facts = candidates.filter((item): item is Fact => item !== null);
 
-  if (!hasPrompt && facts.length === 0) return null;
+  const pinnable = onPinMessage && message.messageId && message.state === 'completed' && message.text.trim();
+  const hasDetails = hasPrompt || facts.length > 0;
+  if (!hasDetails && !pinnable) return null;
 
   return (
     <details
       className={`message__details${align === 'end' ? ' message__details--own' : ''}`}
-      data-testid="message-details"
+      data-testid={hasDetails ? 'message-details' : 'message-actions'}
     >
       {/*
         summary 只写「详情」。原来写成「详情 · 她这次看到了什么」，展开后下面
         又是一个同名按钮——同一句话在同一块里出现两次。
       */}
-      <summary className="message__details-summary">详情</summary>
+      <summary className="message__details-summary">{hasDetails ? '详情' : '操作'}</summary>
       {facts.length > 0 ? (
         <dl className="message__facts">
           {facts.map((fact) => (
@@ -541,6 +547,24 @@ function MessageDetails({
           {PROMPT_ENTRY_LABEL}
         </button>
       ) : null}
+      {pinnable ? (
+        <>
+          <button type="button" className="message__prompt" disabled={pinState === 'pending' || pinState === 'saved'}
+            onClick={async () => {
+              if (!onPinMessage || !message.messageId) return;
+              setPinState('pending');
+              try {
+                await onPinMessage(message.messageId);
+                setPinState('saved');
+              } catch {
+                setPinState('failed');
+              }
+            }}>
+            {pinState === 'saved' ? '已固定到记忆库' : pinState === 'pending' ? '正在固定…' : '记住这条'}
+          </button>
+          {pinState === 'failed' ? <span role="alert">这条消息暂时无法固定。</span> : null}
+        </>
+      ) : null}
     </details>
   );
 }
@@ -562,6 +586,7 @@ export function MessageList({
   canViewVoiceTranscript = false,
   promptOpenKey = null,
   onOpenPrompt,
+  onPinMessage,
   recallProposals = [],
   recallUnavailable = false,
   onReloadRecall,
@@ -847,6 +872,7 @@ export function MessageList({
                 promptOpen={promptOpenKey === message.key}
                 clock={clock}
                 onOpenPrompt={onOpenPrompt}
+                onPinMessage={variant === 'group' ? undefined : onPinMessage}
               />
               {row.silence ? <SilenceNote note={row.silence} /> : null}
             </div>
