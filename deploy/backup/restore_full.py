@@ -25,7 +25,12 @@ from zipfile import BadZipFile, ZipFile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
-from deploy.cli.ling import CONTAINER_VERSION_PROBE, ComposeGroup, InstallLock, LingError  # noqa: E402
+from deploy.cli.ling import (  # noqa: E402
+    CONTAINER_VERSION_PROBE,
+    ComposeGroup,
+    InstallLock,
+    LingError,
+)
 
 from ling.backup_restore import (  # noqa: E402
     FORMAT,
