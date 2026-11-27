@@ -830,9 +830,7 @@ class IdentityService:
         主体是 target，新记忆记在 target 名下，但 `source_account` 一直写着
         "是哪个号说的"。按它归位，拆开之后两边都不串。
         """
-        from sqlalchemy import update
-
-        from ling.infra.models import ActorAccount, MemoryRow, Subject
+        from ling.domains.memory.service import restore_account_memories
 
         source = await self._session.get(Subject, source_id)
         if source is None:
@@ -860,17 +858,7 @@ class IdentityService:
             f"{a.connector_instance}:{a.external_account_id}" for a in accounts
         ]
 
-        restored = 0
-        if labels:
-            result = await self._session.execute(
-                update(MemoryRow)
-                .where(
-                    MemoryRow.subject_id != source_id,
-                    MemoryRow.source_account.in_(labels),
-                )
-                .values(subject_id=source_id)
-            )
-            restored = int(getattr(result, "rowcount", 0) or 0)
+        restored = await restore_account_memories(self._session, subject_id=source_id, source_accounts=labels)
 
         source.merged_into = None
         await self._session.flush()

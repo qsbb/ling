@@ -530,6 +530,14 @@ async def process_archive(
                 scope_skip_reasons.setdefault(record.scope, Counter())["forgotten"] += 1
         if not candidates:
             continue
+        # Account splits keep the memory ID but change its owning subject.
+        existing = (await session.execute(select(MemoryRow.import_key, MemoryRow.id).where(
+            MemoryRow.subject_id == target.destination.subject_id, MemoryRow.import_key.in_(keys),
+        ).order_by(MemoryRow.id.desc()))).all()
+        for source_key, existing_id in dict(existing).items():
+            incoming_id = keys[source_key]
+            if existing_id != incoming_id and incoming_id in candidates:
+                candidates[existing_id] = candidates.pop(incoming_id)
         if write:
             inserted, inserted_scopes = await _insert_memories(
                 session, source=archive.source, target=target, candidates=candidates,

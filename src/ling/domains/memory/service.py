@@ -503,6 +503,23 @@ def _rerank_batch(hits: list, top_n: int) -> tuple[list, list]:
     return head, tail
 
 
+async def restore_account_memories(
+    session: AsyncSession, *, subject_id: str, source_accounts: list[str],
+) -> int:
+    """Return memories and their proven object links in the identity split transaction."""
+    if not source_accounts:
+        return 0
+    from ling.domains.memory.entities import EntityService
+
+    moved_ids = list(await session.scalars(
+        update(MemoryRow).where(
+            MemoryRow.subject_id != subject_id, MemoryRow.source_account.in_(source_accounts),
+        ).values(subject_id=subject_id).returning(MemoryRow.id)
+    ))
+    await EntityService(session).rehome_memory_objects(subject_id=subject_id, memory_ids=moved_ids)
+    return len(moved_ids)
+
+
 class MemoryService:
     def __init__(
         self,

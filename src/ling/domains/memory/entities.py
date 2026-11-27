@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, get_args
 from unicodedata import normalize
 
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import String, any_, delete, literal, select
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.infra.models import EntityRow, MemoryEntityRow, MemoryEpisode, MemoryRow, Window
@@ -180,6 +180,55 @@ class EntityService:
             await self.link(
                 memory_id=episode.id, entity_id=entity.id, role="with", record_type="experience",
             )
+
+    async def rehome_memory_objects(self, *, subject_id: str, memory_ids: list[str]) -> None:
+        """Carry the moved records' evidence without inheriting the old owner's aliases."""
+        if not memory_ids:
+            return
+        selected = MemoryEntityRow.memory_id == any_(literal(memory_ids, type_=ARRAY(String)))
+        rows = (await self._session.execute(
+            select(MemoryEntityRow, EntityRow, MemoryRow.source_window_id, MemoryRow.import_source)
+            .join(EntityRow, EntityRow.id == MemoryEntityRow.entity_id)
+            .join(MemoryRow, MemoryRow.id == MemoryEntityRow.memory_id)
+            .where(selected, MemoryEntityRow.record_type == "memory", EntityRow.subject_id != subject_id)
+            .order_by(MemoryRow.created_at.desc(), MemoryRow.id)
+        )).all()
+        targets: dict[str, str] = {}
+        links = []
+        old_entities = set()
+        for link, entity, window_id, source in rows:
+            key = entity.source_key
+            if key is None:
+                continue
+            group_id = (source or {}).get("group_id")
+            if key.startswith("group:"):
+                if not group_id or not window_id or key != f"group:{window_id}":
+                    continue
+                if key not in targets:
+                    group = await self.upsert_group(
+                        subject_id=subject_id, window_id=window_id, group_id=group_id,
+                        display_name=source.get("group_name") or "",
+                    )
+                    targets[key] = group.id
+            elif key.startswith(("archive_speaker:", "label:")):
+                if key not in targets:
+                    scoped = await self._upsert_scoped(
+                        subject_id=subject_id, source_key=key, kind=entity.kind, name=entity.name,
+                    )
+                    targets[key] = scoped.id
+            else:
+                continue
+            links.append({
+                "memory_id": link.memory_id, "entity_id": targets[key], "role": link.role,
+                "source_reference": link.source_reference, "source_label": link.source_label,
+            })
+            old_entities.add(link.entity_id)
+        if links:
+            await self._session.execute(insert(MemoryEntityRow).on_conflict_do_nothing(), links)
+            await self._session.execute(delete(MemoryEntityRow).where(
+                selected, MemoryEntityRow.record_type == "memory",
+                MemoryEntityRow.entity_id == any_(literal(list(old_entities), type_=ARRAY(String))),
+            ))
 
     async def _upsert_scoped(
         self, *, subject_id: str, source_key: str, name: str, kind: str,

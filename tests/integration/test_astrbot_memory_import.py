@@ -635,14 +635,26 @@ async def test_archive_provenance_survives_account_split(logged_in: TestEnv) -> 
             proof="admin",
         )
         await identity.merge_subjects(split_id, env.subject_id)
-    data = _archive(_record("split-keep"), _record("split-forget"))
-    preview = await env.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
-    assert preview.status_code == 200 and preview.json()["accepted"] == 2
+    group = _group_record(
+        "split-group", content="青禾在读书群借出蓝封画册",
+        group_name="读书群", source_event_ids=["split-speaker"],
+    )
+    timeline = {"record_type": "timeline", "data": {
+        "id": "split-speaker", "event_type": "user_message", "scope": "group",
+        "session_id": group["session_id"], "subject_id": "100200501", "object_id": GROUP_ID,
+        "metadata": {"owner_bot_id": BOT_QQ, "platform": group["platform"], "sender_name": "青禾"},
+    }}
+    data = _archive(_record("split-keep"), _record("split-forget"), group, timeline)
+    preview = await env.client.post(PREFIX + "/preview?include_group=true", content=data, headers=HEADERS)
+    assert preview.status_code == 200 and preview.json()["accepted"] == 3
     committed = await env.client.post(
-        PREFIX + "/commit", content=data,
+        PREFIX + "/commit?include_group=true", content=data,
         headers={**HEADERS, "X-Ling-Import-Token": preview.json()["confirmation_token"]},
     )
-    assert committed.status_code == 200 and committed.json()["imported"] == 2
+    assert committed.status_code == 200 and committed.json()["imported"] == 3
+    assert committed.json()["speaker_links"] == 1
+    original_objects = (await env.client.get("/v1/memory/objects")).json()["objects"]
+    assert {obj["kind"] for obj in original_objects} == {"self", "person", "group"}
     path = "/v1/memory?view=library&source=astrbot_memory_companion"
     rows = {row["import_source"]["record_id"]: row["memory_id"]
             for row in (await env.client.get(path)).json()["memories"]}
@@ -651,8 +663,9 @@ async def test_archive_provenance_survives_account_split(logged_in: TestEnv) -> 
     assert forgotten.status_code == 200, forgotten.text
     split = await env.client.post(f"/v1/accounts/subjects/{split_id}/unmerge")
     assert split.status_code == 200, split.text
-    assert split.json()["restored_memories"] == 1
+    assert split.json()["restored_memories"] == 2
     assert (await env.client.get(path)).json()["total"] == 0
+    assert {obj["kind"] for obj in (await env.client.get("/v1/memory/objects")).json()["objects"]} == {"self"}
     assert (await env.client.post(f"/v1/memory/{kept_id}/forget")).status_code == 404
 
     async with session_scope() as session:
@@ -665,10 +678,26 @@ async def test_archive_provenance_survives_account_split(logged_in: TestEnv) -> 
         "/v1/auth/login", json={"username": "split-owner", "password": "split-password"},
     )
     assert login.status_code == 200, login.text
-    assert (await env.client.get(path)).json()["memories"][0]["memory_id"] == kept_id
-    preview_after = await env.client.post(PREFIX + "/preview", content=data, headers=HEADERS)
+    kept_after = (await env.client.get(path)).json()["memories"]
+    assert {row["memory_id"] for row in kept_after} == {kept_id, rows["split-group"]}
+    split_objects = (await env.client.get("/v1/memory/objects")).json()["objects"]
+    person, = [obj for obj in split_objects if obj["kind"] == "person"]
+    group_object, = [obj for obj in split_objects if obj["kind"] == "group"]
+    assert person["name"] == "青禾"
+    assert group_object["name"].startswith("读书群")
+    for obj in (person, group_object):
+        response = await env.client.get(path + "&object_id=" + obj["entity_id"])
+        assert response.status_code == 200
+        person_record, = response.json()["memories"]
+        assert person_record["memory_id"] == rows["split-group"]
+        assert person_record["archive_speakers"] == [{
+            "entity_id": person["entity_id"], "name": "青禾", "source_event_id": "split-speaker",
+        }]
+    preview_after = await env.client.post(PREFIX + "/preview?include_group=true", content=data, headers=HEADERS)
     assert preview_after.status_code == 200, preview_after.text
     assert preview_after.json()["skip_reasons"] == {"forgotten": 1}
+    assert (preview_after.json()["accepted"], preview_after.json()["duplicates"]) == (0, 2)
+    assert preview_after.json()["speaker_links"] == 0
 
 
 async def test_group_import_reuses_unverified_window_without_granting_live_recall(logged_in: TestEnv) -> None:
