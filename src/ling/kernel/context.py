@@ -1681,6 +1681,18 @@ class ContextCompiler:
                 trace_window_id=window_id,
                 audience=snapshot,
             )
+            if not snapshot.is_group and recall.strategy not in {"current_fact", "fact_conflict", "purge_pending"}:
+                try:
+                    async with self._session.begin_nested():
+                        plans = await self._memory.recall_plans(
+                            query, actor_id=self._actor_id, subject_id=subject_id,
+                            window_id=window_id, limit=max_injected_memories,
+                        )
+                    if plans:
+                        compiled_meta["plan_candidate_ids"] = [hit.memory_id for hit in plans]
+                        recall.hits = [*plans, *recall.hits]
+                except SQLAlchemyError as exc:
+                    logger.info("承诺检索不可用 error=%s", type(exc).__name__)
             if self._memory_policy.shared_events == "enabled" and snapshot.whole_group_source_ids:
                 from ling.domains.memory.shared_events import recall_arrangements
 

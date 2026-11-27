@@ -809,7 +809,9 @@ async def _commitment_window_ref(
     window_id = getattr(commitment, "window_id", None)
 
     if window_id:
-        stmt = select(Window).where(Window.id == window_id, Window.archived.is_(False))
+        stmt = select(Window).where(
+            Window.id == window_id, Window.subject_id == subject_id, Window.archived.is_(False),
+        )
         if channel:
             stmt = stmt.where(Window.channel == channel)
         row = (await session.execute(stmt)).scalars().first()  # type: ignore[attr-defined]
@@ -817,7 +819,7 @@ async def _commitment_window_ref(
         if row is not None and not is_group_visibility(row.visibility) and row.title:
             return str(row.title)
 
-    if not subject_id:
+    if not subject_id or getattr(commitment, "conversation_source", False):
         return ""
     # 与 `domains/proactive/dispatch.py::_target_window_ref` 同一条选窗规则：
     # 最近活跃的同渠道私聊窗口。这里复制查询而不是 import 那个私有函数——
@@ -882,7 +884,7 @@ async def handle_commitment_dispatch(payload: dict) -> None:
             # 找不到可用会话时才回落到"这个人最近的同渠道私聊窗口"。
             # payload 里的显式值仍优先：它是运维手工补投的逃生口，
             # 也保证既有手工投递用法不改变语义。
-            window_ref = str(payload.get("proactive_window_ref") or "")
+            window_ref = "" if commitment.conversation_source else str(payload.get("proactive_window_ref") or "")
             if not window_ref:
                 window_ref = await _commitment_window_ref(
                     session, commitment=commitment, connector=None

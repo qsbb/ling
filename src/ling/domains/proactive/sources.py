@@ -142,6 +142,9 @@ class CausalSource:
         due = await goals.due_commitments()
         out: list[Candidate] = []
         for commitment in due:
+            if commitment.conversation_source:
+                # The dedicated dispatcher keeps this reminder in its original conversation.
+                continue
             out.append(
                 Candidate(
                     subject_id=commitment.subject_id,

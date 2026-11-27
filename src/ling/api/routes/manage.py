@@ -37,7 +37,7 @@ from ling.domains.activity.service import ActivityService, InvalidTransition
 from ling.domains.affect.service import AffectService
 from ling.domains.consent.service import KNOWN_SCOPES, ConsentService
 from ling.domains.conversation.service import ConversationService, completed_actor_message
-from ling.domains.goals.service import GoalsService
+from ling.domains.goals.service import GoalsService, commitment_source_available
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, KnowledgeService
 from ling.domains.memory.entities import ObjectKind
 from ling.domains.memory.library import LibraryKind, memory_record, read_library
@@ -368,21 +368,40 @@ async def supersede_memory(
 
 
 @router.get("/memory/{memory_id}/source")
-async def read_memory_source(memory_id: str, auth: CurrentAuth, session: DbSession) -> dict:
+async def read_memory_source(
+    memory_id: str, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
+) -> dict:
     """Open a retained private source under its current owner and window."""
     from ling.domains.memory.purge import has_open_purge
-    from ling.infra.models import MemoryEpisode, MemoryRow, Message, Window
+    from ling.infra.models import CommitmentRow, MemoryEpisode, MemoryRow, Message, Window
 
     missing = LingError(ErrorCode.not_found, "原始发言不可用", status_code=404)
     subject_id = auth.user.subject_id
     assertion = await session.get(MemoryRow, memory_id)
     episode = await session.get(MemoryEpisode, memory_id) if assertion is None else None
+    if await has_open_purge(session, subject_id=subject_id):
+        raise missing
     record = assertion or episode
-    if record is None or record.subject_id != subject_id or not record.source_message_id:
+    if record is None:
+        plan = await session.scalar(select(CommitmentRow).where(
+            CommitmentRow.id == memory_id, CommitmentRow.actor_id == settings.actor_id,
+            CommitmentRow.subject_id == subject_id, commitment_source_available(),
+        ))
+        if plan is None:
+            raise missing
+        reply = await session.scalar(select(Message).where(
+            Message.id == plan.source_event_ids[0].removeprefix("message:"),
+            Message.window_id == plan.window_id, completed_actor_message(),
+        ))
+        if reply is None:
+            raise missing
+        return {
+            "message_id": reply.id, "window_id": reply.window_id,
+            "created_at": reply.created_at.isoformat(), "text": reply.text,
+        }
+    if record.subject_id != subject_id or not record.source_message_id:
         raise missing
     if record.source_visibility not in {"subject_private", "window_private"}:
-        raise missing
-    if await has_open_purge(session, subject_id=subject_id):
         raise missing
     window_id = assertion.source_window_id if assertion else episode.window_id
     source = await session.get(Message, record.source_message_id)
@@ -851,6 +870,7 @@ async def cancel_commitment(
     body: CommitmentCancelBody,
     auth: CurrentAuth,
     session: DbSession,
+    settings: SettingsDep,
 ) -> dict:
     """取消承诺（终态，不可再改期）。
 
@@ -858,7 +878,9 @@ async def cancel_commitment(
     但原实现没有任何路径能到达它——用户撤回不了自己的承诺。
     """
     try:
-        view = await GoalsService(session).cancel(commitment_id, reason=body.reason)
+        view = await GoalsService(session, actor_id=settings.actor_id).cancel(
+            commitment_id, subject_id=auth.user.subject_id, reason=body.reason,
+        )
     except KeyError as exc:
         raise LingError(ErrorCode.not_found, str(exc), status_code=404) from exc
     except ValueError as exc:

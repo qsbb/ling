@@ -10,12 +10,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import not_found
-from ling.infra.models import CommitmentRow, GoalRow, Window, utcnow
+from ling.domains.conversation.service import completed_actor_message
+from ling.infra.models import (
+    CommitmentRow,
+    GoalRow,
+    MemoryPurgeTombstone,
+    Message,
+    Subject,
+    Window,
+    utcnow,
+)
 from ling.infra.security import new_id
 
 COMMITMENT_STATES = {"active", "delivered", "missed", "cancelled", "undeliverable"}
@@ -23,6 +33,74 @@ COMMITMENT_STATES = {"active", "delivered", "missed", "cancelled", "undeliverabl
 # ``undeliverable`` 是已经结束的失败/撤回——它们都是事实，需要可查，
 # 但不属于"还欠着对方的事"，默认可见集不能把它们算进来。
 PENDING_COMMITMENT_STATES = ("active",)
+
+
+def conversation_commitment() -> ColumnElement[bool]:
+    return func.coalesce(CommitmentRow.source_event_ids[0].as_string().startswith("message:"), False)
+
+
+def _after_latest_memory_forget(subject_id: str | ColumnElement[str]) -> ColumnElement[bool]:
+    forgotten = select(MemoryPurgeTombstone.id).where(
+        MemoryPurgeTombstone.subject_id == subject_id,
+        MemoryPurgeTombstone.requested_at >= Message.created_at,
+    ).correlate(Message, CommitmentRow).exists()
+    return ~forgotten
+
+
+def commitment_source_available() -> ColumnElement[bool]:
+    return select(Message.id).join(Window, Window.id == Message.window_id).where(
+        CommitmentRow.source_event_ids[0].as_string() == func.concat("message:", Message.id),
+        func.btrim(Message.text, " \n\r\t") == CommitmentRow.text,
+        Message.window_id == CommitmentRow.window_id,
+        Window.subject_id == CommitmentRow.subject_id,
+        Window.actor_id == CommitmentRow.actor_id,
+        Window.visibility.in_(("subject_private", "window_private")),
+        completed_actor_message(), _after_latest_memory_forget(CommitmentRow.subject_id),
+    ).correlate(CommitmentRow).exists()
+
+
+def readable_commitment() -> ColumnElement[bool]:
+    return or_(~conversation_commitment(), commitment_source_available())
+
+
+def commitment_memory_state(row: CommitmentRow, now: datetime) -> str:
+    if row.state == "active":
+        return "overdue" if row.due_at <= now else "pending"
+    if row.state == "delivered" and row.delivery_operation_id and row.delivery_state in {"sent", "delivered"}:
+        return "reminder_delivered"
+    if row.state in {"cancelled", "missed", "undeliverable"}:
+        return row.state
+    return "unconfirmed"
+
+
+COMMITMENT_MEMORY_STATUS = {
+    "pending": "待履行", "overdue": "已到期，履行待核实",
+    "reminder_delivered": "提醒已送达，履行待核实", "cancelled": "已取消",
+    "missed": "提醒未送达", "undeliverable": "提醒无法送达", "unconfirmed": "履行待核实",
+}
+
+
+def commitment_due_local(row: CommitmentRow) -> datetime:
+    try:
+        zone = ZoneInfo(row.timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        zone = UTC
+    return row.due_at.astimezone(zone)
+
+
+async def forget_conversation_commitments(
+    session: AsyncSession, *, subject_id: str, window_id: str | None = None, turn_id: str | None = None,
+) -> None:
+    targets = delete(CommitmentRow).where(CommitmentRow.subject_id == subject_id, conversation_commitment())
+    if turn_id is not None:
+        turn_sources = select(func.concat("message:", Message.id)).where(
+            Message.window_id == window_id, Message.turn_id == turn_id,
+        )
+        targets = targets.where(
+            CommitmentRow.window_id == window_id,
+            CommitmentRow.source_event_ids[0].as_string().in_(turn_sources),
+        )
+    await session.execute(targets)
 
 
 @dataclass(frozen=True)
@@ -56,6 +134,7 @@ class CommitmentView:
     # `due_commitments()` 只取 `active`——承诺一旦到期就永久失效。
     # 这个值在库里一直存着（`CommitmentRow.window_id`），只是没被读出来。
     window_id: str | None = None
+    conversation_source: bool = False
 
 
 class GoalsService:
@@ -156,6 +235,24 @@ class GoalsService:
             await self._ensure_deliverable_window(
                 window_id=window_id, subject_id=subject_id
             )
+        sources = list(source_event_ids or [])
+        if any(ref.startswith("message:") for ref in sources):
+            from ling.domains.memory.service import has_open_purge
+
+            await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+            if len(sources) != 1 or not sources[0].startswith("message:") or not window_id:
+                raise ValueError("请选择原始会话中的一条承诺发言")
+            source = await self._session.scalar(select(Message).join(Window, Window.id == Message.window_id).where(
+                Message.id == sources[0].removeprefix("message:"), Message.window_id == window_id,
+                Window.visibility.in_(("window_private", "subject_private")), completed_actor_message(),
+                _after_latest_memory_forget(subject_id),
+            ).with_for_update(of=Message))
+            if (
+                source is None or not text.strip() or source.text.strip() != text.strip()
+                or await has_open_purge(self._session, subject_id=subject_id)
+            ):
+                raise ValueError("承诺需与可用的原始发言一致")
+
         row = CommitmentRow(
             id=new_id("cmt"),
             actor_id=self._actor_id,
@@ -165,7 +262,7 @@ class GoalsService:
             due_at=due_at,
             timezone=timezone,
             state="active",
-            source_event_ids=list(source_event_ids or []),
+            source_event_ids=sources,
         )
         self._session.add(row)
         await self._session.flush()
@@ -188,7 +285,9 @@ class GoalsService:
         await self._session.flush()
         return self._commitment_view(row)
 
-    async def cancel(self, commitment_id: str, *, reason: str | None = None) -> CommitmentView:
+    async def cancel(
+        self, commitment_id: str, *, reason: str | None = None, subject_id: str | None = None,
+    ) -> CommitmentView:
         """取消承诺（终态）。
 
         ``COMMITMENT_STATES`` 里声明了 ``cancelled``，``reschedule`` 也检查
@@ -198,8 +297,8 @@ class GoalsService:
         取消保留记录（不删除）：承诺是"我说过要做的事"，
         撤回本身也是事实，需要可解释。
         """
-        row = await self._session.get(CommitmentRow, commitment_id)
-        if row is None or row.actor_id != self._actor_id:
+        row = await self._session.get(CommitmentRow, commitment_id, with_for_update=True)
+        if row is None or row.actor_id != self._actor_id or (subject_id is not None and subject_id != row.subject_id):
             raise KeyError(f"承诺不存在: {commitment_id}")
         if row.state == "delivered":
             raise ValueError("已履行的承诺不能取消")
@@ -247,6 +346,7 @@ class GoalsService:
                         CommitmentRow.actor_id == self._actor_id,
                         CommitmentRow.state == "active",
                         CommitmentRow.due_at <= cutoff,
+                        readable_commitment(),
                     )
                     .order_by(CommitmentRow.due_at)
                 )
@@ -284,7 +384,7 @@ class GoalsService:
             raise ValueError(
                 f"未知承诺状态: {state}（可选: {', '.join(sorted(COMMITMENT_STATES))}, all）"
             )
-        stmt = select(CommitmentRow).where(CommitmentRow.actor_id == self._actor_id)
+        stmt = select(CommitmentRow).where(CommitmentRow.actor_id == self._actor_id, readable_commitment())
         if subject_id:
             stmt = stmt.where(CommitmentRow.subject_id == subject_id)
         if state is None:
@@ -322,4 +422,5 @@ class GoalsService:
             delivery_state=row.delivery_state,
             cancel_reason=row.cancel_reason,
             window_id=row.window_id,
+            conversation_source=bool(row.source_event_ids and row.source_event_ids[0].startswith("message:")),
         )

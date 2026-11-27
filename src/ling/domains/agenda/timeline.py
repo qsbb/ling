@@ -1034,6 +1034,8 @@ async def load_commitment_anchors(
     每条锚点都带可追溯的 ``source_id``（``commitment:<id>`` /
     ``agenda_plan:<id>``）：冲突清单与段的 ``source_event_ids`` 要能指回来源。
     """
+    from ling.domains.goals.service import readable_commitment
+
     anchors: list[Anchor] = []
     pad = timedelta(minutes=COMMITMENT_PROTECTIVE_MINUTES)
     rows = (
@@ -1043,6 +1045,7 @@ async def load_commitment_anchors(
                 CommitmentRow.state == "active",
                 CommitmentRow.due_at >= window_start - pad,
                 CommitmentRow.due_at < window_end + pad,
+                readable_commitment(),
             )
         )
     ).scalars()
@@ -1053,7 +1056,10 @@ async def load_commitment_anchors(
                 kind=COMMITMENT_ANCHOR,
                 start_at=due,
                 end_at=due + pad,
-                title=f"约定：{_short(str(row.text), 40)}",
+                title=(
+                    "私人约定" if row.source_event_ids and row.source_event_ids[0].startswith("message:")
+                    else f"约定：{_short(str(row.text), 40)}"
+                ),
                 protective=True,
                 source_id=f"commitment:{row.id}",
             )

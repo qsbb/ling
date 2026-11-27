@@ -174,6 +174,27 @@ ALLOWED: dict[tuple[str, str], str] = {
         "同一个人时，问 A 也该想起 B 说过的话。账号合并是 identity 域的权威"
         "关系，记忆行本身不搬动（那是有损操作），只读组内 subject_id 集合。"
     ),
+    ("agenda/timeline.py", "ling.domains.goals.service"): (
+        "日程只读承诺域的有效来源判据，撤回后的承诺不再占据安排。"
+    ),
+    ("goals/service.py", "ling.domains.conversation.service"): (
+        "对话承诺只读取当前完成的原回复，并核对发言窗口和准确正文。"
+    ),
+    ("goals/service.py", "ling.domains.memory.service"): (
+        "只读整库遗忘挂起状态，依据失效时停止登记承诺。"
+    ),
+    ("memory/forget_source.py", "ling.domains.goals.service"): (
+        "由承诺域删除引用被遗忘轮次发言的承诺，保留无关提醒。"
+    ),
+    ("memory/purge.py", "ling.domains.goals.service"): (
+        "由承诺域移除当前用户的对话承诺，保留独立创建的提醒。"
+    ),
+    ("memory/service.py", "ling.domains.goals.service"): (
+        "复用承诺域的证据校验并区分到期、提醒送达与实际履行。"
+    ),
+    ("memory/library.py", "ling.domains.goals.service"): (
+        "记忆库只读承诺域的来源判据与状态，区分待履行和送达结果。"
+    ),
     ("memory/service.py", "ling.domains.conversation.service"): (
         "角色感受引用对话域中的已完成回复，读取时核对当前轮次与撤回状态。"
     ),

@@ -456,6 +456,9 @@ async def purge_subject(
         result.details["knowledge_items_deleted"] = int(
             getattr(knowledge, "rowcount", 0) or 0
         )
+        from ling.domains.goals.service import forget_conversation_commitments
+
+        await forget_conversation_commitments(session, subject_id=subject_id)
 
         # 4.8) 提示词快照。**这一处是最容易漏、也最严重的**：
         #      `prompt_snapshots.payload` 存的是**整份实际发给模型的 messages**，

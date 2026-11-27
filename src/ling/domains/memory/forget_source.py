@@ -8,11 +8,13 @@ from sqlalchemy import and_, case, cast, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.goals.service import commitment_source_available, forget_conversation_commitments
 from ling.domains.memory.astrbot_import import lock_archive_account
 from ling.domains.memory.purge import PURGEABLE_TOPICS
 from ling.domains.memory.service import active_source
 from ling.infra.models import (
     AwarenessItemRow,
+    CommitmentRow,
     EntityRow,
     HandoffCapsuleRow,
     MemoryEmbeddingRow,
@@ -149,7 +151,28 @@ async def forget_source(
             MemoryEpisode.id == memory_id, MemoryEpisode.subject_id == subject_id,
         ).with_for_update())
     record = target or episode
-    if record is None or not record.source_message_id:
+    if record is None:
+        plan = await session.scalar(select(CommitmentRow).where(
+            CommitmentRow.id == memory_id, CommitmentRow.subject_id == subject_id, commitment_source_available(),
+        ))
+        if plan is None:
+            return False
+        reply = await session.get(Message, plan.source_event_ids[0].removeprefix("message:"))
+        if reply is None or reply.window_id != plan.window_id or not reply.turn_id:
+            return False
+        anchors = list(await session.scalars(select(Message).where(
+            Message.turn_id == reply.turn_id, Message.window_id == reply.window_id, Message.role == "user",
+            Message.sender_subject_id == subject_id, Message.retracted_at.is_(None),
+            Message.memory_hidden_at.is_(None),
+        ).limit(2).with_for_update()))
+        if len(anchors) != 1:
+            return False
+        await apply_source_forget(
+            session, subject_id=subject_id, message_id=anchors[0].id,
+            window_id=reply.window_id, turn_id=reply.turn_id, forgotten_at=utcnow(),
+        )
+        return True
+    if not record.source_message_id:
         return False
     window_id = target.source_window_id if target else episode.window_id
     source = await session.get(Message, record.source_message_id, with_for_update=True)
@@ -192,6 +215,7 @@ async def apply_source_forget(
             turn_id=turn_id, forgotten_at=forgotten_at,
         ).on_conflict_do_nothing(index_elements=[MemorySourceForgetMarker.message_id])
     )
+    await forget_conversation_commitments(session, subject_id=subject_id, window_id=window_id, turn_id=turn_id)
     refs = array([f"turn:{turn_id}", f"message:{message_id}"])
     assertion_ids = list(await session.scalars(select(MemoryRow.id).where(
         MemoryRow.subject_id == subject_id,

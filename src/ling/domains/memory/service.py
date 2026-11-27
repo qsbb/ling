@@ -26,10 +26,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
 from ling.domains.conversation.service import completed_actor_message
+from ling.domains.goals.service import (
+    COMMITMENT_MEMORY_STATUS,
+    commitment_due_local,
+    commitment_memory_state,
+    commitment_source_available,
+)
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, procedure_source_available
+from ling.domains.memory.purge import has_open_purge as has_open_purge
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
     ActorAccount,
+    CommitmentRow,
     KnowledgeItem,
     MemoryEmbeddingRow,
     MemoryEpisode,
@@ -1236,6 +1244,38 @@ class MemoryService:
         }
         return list(distinct.values())
 
+    async def recall_plans(
+        self, query: str, *, actor_id: str, subject_id: str, window_id: str, limit: int,
+    ) -> list[MemoryHit]:
+        if not re.search(r"计划|打算|答应|承诺|约定|待办|到期|做完|要做|完成|\\b(?:plan|promise)\\b", query, re.I):
+            return []
+        terms = sorted(_topic_tokens(query), key=lambda term: (-len(term), term))[:_KEYWORD_QUERY_TERMS]
+        if not terms:
+            return []
+        conditions = [CommitmentRow.text.icontains(term, autoescape=True) for term in terms]
+        relevance: ColumnElement[int] = literal(0)
+        for condition in conditions:
+            relevance += case((condition, 1), else_=0)
+        now = utcnow()
+        rows = await self._session.scalars(select(CommitmentRow).where(
+            CommitmentRow.actor_id == actor_id,
+            CommitmentRow.subject_id == subject_id,
+            CommitmentRow.window_id == window_id,
+            commitment_source_available(),
+            or_(*conditions),
+        ).order_by(relevance.desc(), CommitmentRow.created_at.desc(), CommitmentRow.id).limit(limit))
+        return [
+            MemoryHit(
+                memory_id=row.id, kind="plan", origin=Origin.external_observation,
+                text=f"{row.text}（{COMMITMENT_MEMORY_STATUS[commitment_memory_state(row, now)]}，"
+                     f"期限 {commitment_due_local(row).isoformat(timespec='minutes')}）",
+                visibility=Visibility.window_private, confidence=1.0, score=0.0, valid_until=None,
+                source_event_ids=[*row.source_event_ids, f"commitment:{row.id}"],
+                source_window_id=row.window_id,
+            )
+            for row in rows
+        ]
+
     async def _finish_recall(
         self, result: RecallResult, query: str, trace_window_id: str | None,
     ) -> RecallResult:
@@ -2127,7 +2167,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
     """Give the character context, with only the distinctions that change its use."""
     groups: dict[str, list] = {
         "mention": [], "episode": [], "procedure": [], "procedure_note": [], "impression": [],
-        "tone": [], "uncertain": [], "history": [], "shared": [],
+        "plan": [], "tone": [], "uncertain": [], "history": [], "shared": [],
     }
     for hit in hits:
         # 历史事实单独成组：它们**现在不成立**，只能用于回答"以前怎样"，
@@ -2136,7 +2176,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
             groups["shared"].append(hit)
         elif _is_historical(hit):
             groups["history"].append(hit)
-        elif getattr(hit, "kind", None) in {"procedure", "procedure_note", "impression"}:
+        elif getattr(hit, "kind", None) in {"procedure", "procedure_note", "impression", "plan"}:
             groups[hit.kind].append(hit)
         elif getattr(hit, "kind", None) == "episode" and hit.origin != Origin.model_inference:
             groups["episode"].append(hit)
@@ -2151,6 +2191,7 @@ def render_evidence(hits: list, *, refs: dict[str, str] | None = None) -> str:
         "procedure": "有资料依据的做法",
         "procedure_note": "记录的做法（执行情况未知）",
         "impression": "你当时表达的感受（主观感受）",
+        "plan": "登记过的承诺（提醒状态与履行结果分别说明）",
         "tone": "熟悉的线索（可以影响回应方式）",
         "uncertain": "模糊的印象（有需要再确认）",
         "history": "以前的情况（不代表现在）",

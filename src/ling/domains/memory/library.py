@@ -9,6 +9,7 @@ from unicodedata import normalize
 from sqlalchemy import and_, func, literal, literal_column, or_, select, true, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.goals.service import commitment_memory_state, commitment_source_available
 from ling.domains.knowledge.service import (
     PROCEDURE_SOURCE_SLOT,
     current_knowledge,
@@ -20,6 +21,7 @@ from ling.domains.memory.self_timeline import SelfTimelineService
 from ling.domains.memory.service import ACTOR_IMPRESSION_SLOT, active_source
 from ling.infra.models import (
     ActivityRow,
+    CommitmentRow,
     CoreMemoryRow,
     EntityRow,
     KnowledgeItem,
@@ -31,7 +33,7 @@ from ling.infra.models import (
     utcnow,
 )
 
-LibraryKind = Literal["episode", "assertion", "procedure", "knowledge", "impression"]
+LibraryKind = Literal["episode", "assertion", "procedure", "knowledge", "impression", "plan"]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -119,6 +121,32 @@ def _self_experience_record(row: SelfExperienceRow, activity: ActivityRow) -> di
         "can_edit": False,
         "record_type": "self_experience",
         "occurred_at": _iso(row.occurred_at),
+    }
+
+
+def _commitment_record(row: CommitmentRow, now: datetime) -> dict[str, Any]:
+    return {
+        "memory_id": row.id,
+        "kind": "plan",
+        "text": row.text,
+        "origin": "external_observation",
+        "visibility": "window_private",
+        "confidence": None,
+        "retracted": False,
+        "retract_reason": None,
+        "supersedes": None,
+        "superseded_by": None,
+        "source_event_ids": [*row.source_event_ids, f"commitment:{row.id}"],
+        "source_role": "actor_commitment",
+        "source_message_id": row.source_event_ids[0].removeprefix("message:"),
+        "source_window_id": row.window_id,
+        "created_at": _iso(row.created_at),
+        "due_at": _iso(row.due_at),
+        "plan_state": commitment_memory_state(row, now),
+        "valid_until": None,
+        "archived_at": None,
+        "can_edit": False,
+        "record_type": "commitment",
     }
 
 
@@ -220,6 +248,7 @@ async def read_library(
             *(episode_text.icontains(term, autoescape=True) for term in terms),
         )
 
+    now = utcnow()
     queries = []
     if kind in {None, "episode", "assertion", "procedure", "impression"}:
         if kind == "impression":
@@ -241,8 +270,16 @@ async def read_library(
         queries.append(select(
             KnowledgeItem.id, KnowledgeItem.created_at, literal("knowledge").label("record_type"),
         ).where(
-            knowledge_visible_to(subject_id), current_knowledge(utcnow()),
+            knowledge_visible_to(subject_id), current_knowledge(now),
             *(or_(topic.icontains(term, autoescape=True), claim.icontains(term, autoescape=True)) for term in terms),
+        ))
+    if source is None and not object_id and conversation_scope != "group" and kind in {None, "plan"}:
+        commitment_text = func.normalize(CommitmentRow.text, literal_column("NFKC"))
+        queries.append(select(
+            CommitmentRow.id, CommitmentRow.created_at, literal("commitment").label("record_type"),
+        ).where(
+            CommitmentRow.actor_id == actor_id, CommitmentRow.subject_id == subject_id, commitment_source_available(),
+            *(commitment_text.icontains(term, autoescape=True) for term in terms),
         ))
     if not queries:
         return result
@@ -254,7 +291,7 @@ async def read_library(
 
     # Page and count use one snapshot. Only the selected keys load full records.
     rows = (await session.execute(
-        select(MemoryRow, MemoryEpisode, KnowledgeItem, counts.c.total)
+        select(MemoryRow, MemoryEpisode, KnowledgeItem, CommitmentRow, counts.c.total)
         .select_from(counts)
         .outerjoin(page_keys, true())
         .outerjoin(MemoryRow, and_(page_keys.c.record_type == "memory", MemoryRow.id == page_keys.c.id))
@@ -262,6 +299,7 @@ async def read_library(
             page_keys.c.record_type == "experience", MemoryEpisode.id == page_keys.c.id,
         ))
         .outerjoin(KnowledgeItem, and_(page_keys.c.record_type == "knowledge", KnowledgeItem.id == page_keys.c.id))
+        .outerjoin(CommitmentRow, and_(page_keys.c.record_type == "commitment", CommitmentRow.id == page_keys.c.id))
         .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
     )).all()
     total = rows[0][-1]
@@ -287,7 +325,7 @@ async def read_library(
                 "entity_id": link.entity_id, "name": link.source_label, "source_event_id": link.source_reference,
             })
     page = []
-    for memory, episode, knowledge, _ in rows:
+    for memory, episode, knowledge, commitment, _ in rows:
         if memory is not None:
             page.append({
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
@@ -300,6 +338,8 @@ async def read_library(
             page.append(_episode_record(episode))
         elif knowledge is not None:
             page.append(_knowledge_record(knowledge))
+        elif commitment is not None:
+            page.append(_commitment_record(commitment, now))
 
     latest = (await session.execute(
         select(OutboxEvent.state, OutboxEvent.attempts, OutboxEvent.created_at, OutboxEvent.processed_at)
