@@ -243,6 +243,10 @@ _RECALL_FILLER = re.compile(
     r"\b(?:the|is|are|what|when|where|how|do|you|my|did|about)\b",
     re.IGNORECASE,
 )
+_PROCEDURE_QUERY = re.compile(
+    r"做法|步骤|手册|工序|流程|规则|指南|通常.*(?:怎么|如何|哪)|\b(?:procedure|instructions|steps)\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_RECALL = re.compile(r"记得|提过|说过|原文|原话|上次|那家公司|名字是什么|叫什么名字")
 _QUERY_CLAUSES = re.compile(r"[^\n，,。.!！;；?？]+[?？]?")
 _QUESTION_CUE = re.compile(r"[?？]|哪|什么|怎样|怎么|如何|几号|几点|多少|\b(?:what|where|when|who|how)\b", re.I)
@@ -979,11 +983,26 @@ class MemoryService:
         except Exception:  # noqa: BLE001 - 实体路故障不影响其他路
             rank_entity = {}
 
+        procedure_matches: set[str] = set()
+        if _PROCEDURE_QUERY.search(query):
+            procedures = [row for row in candidates if row.slot == PROCEDURE_SOURCE_SLOT and row.value]
+            if procedures:
+                titles = dict((await self._session.execute(select(
+                    KnowledgeItem.id, KnowledgeItem.topic,
+                ).where(KnowledgeItem.id.in_([row.value for row in procedures])))).tuples().all())
+                query_text = query.casefold()
+                query_terms = _topic_tokens(query)
+                procedure_matches = {
+                    row.id for row in procedures if (title := titles.get(row.value)) and (
+                        title.casefold() in query_text or len(_topic_tokens(title) & query_terms) >= 2
+                    )
+                }
+
         vector_scores = await self._vector_scores(query, candidates) if self._embedder else {}
         ordered = [
             row for row in candidates
             if _word_match(row.text, topics, explicit=explicit_recall)
-            or row.id in _entity_hit_ids
+            or row.id in _entity_hit_ids or row.id in procedure_matches
             or vector_scores.get(row.id, 0.0) >= _MIN_SEMANTIC_SIMILARITY
         ]
 
