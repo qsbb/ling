@@ -51,6 +51,7 @@ from ling.domains.media.describe import (
     MediaReadError,
 )
 from ling.domains.media.service import (
+    DESCRIPTION_DENIED,
     MediaEvidenceError,
     MediaEvidenceService,
 )
@@ -316,14 +317,13 @@ class VideoWatchService:
         lines: list[str] = []
         for evidence_id in resolved[:MAX_READS_PER_REPLY]:
             ref = short_ref_for(evidence_id)
-            try:
-                evidence = await self._service.ensure_description_authorized(
-                    evidence_id, window_id=window_id
-                )
-            except MediaEvidenceError as exc:
-                outcome.skipped = str(exc)
+            evidence = await self._service.get(
+                evidence_id, window_id=window_id, require_authorization=True,
+            )
+            if evidence is None:
+                outcome.skipped = DESCRIPTION_DENIED
                 outcome.denied_kind = DENIED_ERROR
-                _log_skipped(ref, str(exc))
+                _log_skipped(ref, DESCRIPTION_DENIED)
                 break
             if evidence.description:
                 lines.append(f"- {ref}（之前看过的）：{evidence.description}")

@@ -283,7 +283,9 @@ class _FakeService:
     def __init__(self, videos: list[EvidenceView]) -> None:
         self._videos = videos
 
-    async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> EvidenceView:
+    async def get(
+        self, evidence_id: str, *, window_id: str, require_authorization: bool = False,
+    ) -> EvidenceView:
         return next(video for video in self._videos if video.evidence_id == evidence_id)
 
     async def video_reference_ids(self, *, window_id: str) -> list[str]:

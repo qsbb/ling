@@ -629,9 +629,7 @@ async def test_pending_purge_hides_media_from_prompt_and_description_reads(logge
         assert await service.get(control_id, window_id=window_id) is not None
         with pytest.raises(MediaEvidenceError):
             await service.ensure_description_authorized(target_id, window_id=window_id)
-        assert (await service.ensure_description_authorized(
-            control_id, window_id=window_id,
-        )).description == control_text
+        await service.ensure_description_authorized(control_id, window_id=window_id)
     during = await read_prompt()
     assert private_text not in during and control_text in during
 

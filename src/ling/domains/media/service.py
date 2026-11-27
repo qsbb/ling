@@ -36,6 +36,7 @@ from ling.infra.security import new_id
 
 # 入站媒体能否被描述，取决于这个授权。默认关闭。
 INBOUND_SCOPE = "media.inbound"
+DESCRIPTION_DENIED = f"授权已撤销或无法核对，不能描述（scope={INBOUND_SCOPE}）"
 
 KINDS = frozenset({"image", "audio", "video", "emoji"})
 
@@ -308,11 +309,10 @@ class MediaEvidenceService:
 
     async def ensure_description_authorized(
         self, evidence_id: str, *, window_id: str
-    ) -> EvidenceView:
-        """确认当前入站授权后返回证据视图。"""
+    ) -> None:
+        """确认素材当前仍有入站授权。"""
         row = await self._require(evidence_id, window_id)
         await self._description_consent(row, window_id)
-        return _view(row)
 
     async def _description_consent(
         self, row: MediaEvidenceRow, window_id: str,
@@ -333,7 +333,7 @@ class MediaEvidenceService:
             grant = await self._granted_consent([row.subject_id, owner])
             if grant:
                 return grant
-        raise MediaEvidenceError(f"授权已撤销或无法核对，不能描述（scope={INBOUND_SCOPE}）")
+        raise MediaEvidenceError(DESCRIPTION_DENIED)
 
     async def mark_describe_failed(
         self, evidence_id: str, *, window_id: str, reason: str
@@ -374,18 +374,20 @@ class MediaEvidenceService:
         ))
         return list(ids)
 
-    async def get(self, evidence_id: str, *, window_id: str) -> EvidenceView | None:
-        """按窗口读取。窗口不匹配或已过期都返回 ``None``。
+    async def get(
+        self, evidence_id: str, *, window_id: str, require_authorization: bool = False,
+    ) -> EvidenceView | None:
+        """按窗口、安全保留期及来源状态读取证据。
 
-        返回 ``None`` 而不是抛错，是为了不给"这个 id 在别的窗口存不存在"
-        留探测口。
+        显式使用缓存描述时要求当前授权，以同一条查询过滤并读取正文。
         """
         now = utcnow()
+        available = readable_media_evidence(now=now) if require_authorization else ~hidden_media_source()
         row = await self._session.scalar(select(MediaEvidenceRow).where(
             MediaEvidenceRow.id == evidence_id, MediaEvidenceRow.actor_id == self._actor_id,
-            MediaEvidenceRow.window_id == window_id, ~hidden_media_source(),
+            MediaEvidenceRow.window_id == window_id, available,
             or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > now),
-        ))
+        ).execution_options(populate_existing=True))
         return _view(row) if row is not None else None
 
     async def library_material(self, evidence_id: str, *, subject_id: str) -> EvidenceView | None:
