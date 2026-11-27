@@ -77,7 +77,8 @@ async def _grant(granted: bool = True) -> None:
     async with session_scope() as session:
         svc = ConsentService(session)
         if granted:
-            await svc.grant(subject_id=SUBJECT, scope=INBOUND_SCOPE)
+            if not await svc.is_active(SUBJECT, INBOUND_SCOPE):
+                await svc.grant(subject_id=SUBJECT, scope=INBOUND_SCOPE)
         else:
             await svc.revoke(subject_id=SUBJECT, scope=INBOUND_SCOPE)
 

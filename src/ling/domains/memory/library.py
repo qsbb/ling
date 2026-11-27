@@ -15,6 +15,7 @@ from ling.domains.knowledge.service import (
     current_knowledge,
     knowledge_visible_to,
 )
+from ling.domains.media.service import material_library_scope
 from ling.domains.memory.objects import linked_record_ids
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.self_timeline import SelfTimelineService
@@ -25,6 +26,7 @@ from ling.infra.models import (
     CoreMemoryRow,
     EntityRow,
     KnowledgeItem,
+    MediaEvidenceRow,
     MemoryEntityRow,
     MemoryEpisode,
     MemoryRow,
@@ -33,7 +35,7 @@ from ling.infra.models import (
     utcnow,
 )
 
-LibraryKind = Literal["episode", "assertion", "procedure", "knowledge", "impression", "plan"]
+LibraryKind = Literal["episode", "assertion", "procedure", "knowledge", "impression", "plan", "material"]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -147,6 +149,31 @@ def _commitment_record(row: CommitmentRow, now: datetime) -> dict[str, Any]:
         "archived_at": None,
         "can_edit": False,
         "record_type": "commitment",
+    }
+
+
+def _material_record(row: MediaEvidenceRow) -> dict[str, Any]:
+    return {
+        "memory_id": row.id,
+        "kind": "material",
+        "text": row.description,
+        "origin": "model_inference" if row.description_origin == "model_inference" else "external_observation",
+        "visibility": "window_private",
+        "confidence": None,
+        "retracted": False,
+        "retract_reason": None,
+        "supersedes": None,
+        "superseded_by": None,
+        "source_event_ids": [f"media:{row.id}", *([row.source_event_id] if row.source_event_id else [])],
+        "source_window_id": row.window_id,
+        "source_role": "media_description",
+        "observed_at": _iso(row.created_at),
+        "created_at": _iso(row.created_at),
+        "valid_until": _iso(row.expires_at),
+        "archived_at": None,
+        "can_edit": False,
+        "record_type": "material",
+        "media_kind": row.kind,
     }
 
 
@@ -281,6 +308,14 @@ async def read_library(
             CommitmentRow.actor_id == actor_id, CommitmentRow.subject_id == subject_id, commitment_source_available(),
             *(commitment_text.icontains(term, autoescape=True) for term in terms),
         ))
+    if source is None and not object_id and conversation_scope != "group" and kind in {None, "material"}:
+        description = func.normalize(MediaEvidenceRow.description, literal_column("NFKC"))
+        queries.append(select(
+            MediaEvidenceRow.id, MediaEvidenceRow.created_at, literal("material").label("record_type"),
+        ).where(
+            material_library_scope(actor_id=actor_id, subject_id=subject_id, now=now),
+            *(description.icontains(term, autoescape=True) for term in terms),
+        ))
     if not queries:
         return result
     matches = union_all(*queries).cte("library_matches")
@@ -291,7 +326,7 @@ async def read_library(
 
     # Page and count use one snapshot. Only the selected keys load full records.
     rows = (await session.execute(
-        select(MemoryRow, MemoryEpisode, KnowledgeItem, CommitmentRow, counts.c.total)
+        select(MemoryRow, MemoryEpisode, KnowledgeItem, CommitmentRow, MediaEvidenceRow, counts.c.total)
         .select_from(counts)
         .outerjoin(page_keys, true())
         .outerjoin(MemoryRow, and_(page_keys.c.record_type == "memory", MemoryRow.id == page_keys.c.id))
@@ -300,6 +335,7 @@ async def read_library(
         ))
         .outerjoin(KnowledgeItem, and_(page_keys.c.record_type == "knowledge", KnowledgeItem.id == page_keys.c.id))
         .outerjoin(CommitmentRow, and_(page_keys.c.record_type == "commitment", CommitmentRow.id == page_keys.c.id))
+        .outerjoin(MediaEvidenceRow, and_(page_keys.c.record_type == "material", MediaEvidenceRow.id == page_keys.c.id))
         .order_by(page_keys.c.created_at.desc(), page_keys.c.id.desc(), page_keys.c.record_type.desc())
     )).all()
     total = rows[0][-1]
@@ -325,7 +361,7 @@ async def read_library(
                 "entity_id": link.entity_id, "name": link.source_label, "source_event_id": link.source_reference,
             })
     page = []
-    for memory, episode, knowledge, commitment, _ in rows:
+    for memory, episode, knowledge, commitment, material, _ in rows:
         if memory is not None:
             page.append({
                 **memory_record(memory), "can_edit": True, "record_type": "memory",
@@ -340,6 +376,8 @@ async def read_library(
             page.append(_knowledge_record(knowledge))
         elif commitment is not None:
             page.append(_commitment_record(commitment, now))
+        elif material is not None:
+            page.append(_material_record(material))
 
     latest = (await session.execute(
         select(OutboxEvent.state, OutboxEvent.attempts, OutboxEvent.created_at, OutboxEvent.processed_at)

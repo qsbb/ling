@@ -1522,6 +1522,9 @@ async def test_media_describer_never_switches_profile_by_kind() -> None:
             yield ModelChunk(done=True), StreamOutcome(text="一段视频")
 
     class _Svc:
+        async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> None:
+            assert (evidence_id, window_id) == ("media_1", "win_1")
+
         async def describe(self, evidence_id, *, window_id, description, description_origin):  # noqa: ANN001, ARG002
             return SimpleNamespace(description=description)
 

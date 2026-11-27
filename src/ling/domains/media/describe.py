@@ -220,6 +220,10 @@ class MediaDescriber:
         模型侧**永远**不标终态：密钥配错一次不该把队列里所有证据标死，
         否则修好密钥后它们已不在 ``pending()`` 里，再也不会重试。
         """
+        try:
+            await self._service.ensure_description_authorized(evidence.evidence_id, window_id=evidence.window_id)
+        except MediaEvidenceError as exc:
+            raise MediaDescribeError(str(exc), retriable=False, terminal=True, source=SOURCE_BUSINESS) from exc
         if evidence.description is not None:
             return evidence.description
 
@@ -244,6 +248,10 @@ class MediaDescriber:
 
         # 职责**不按 kind 自动切换**：视频要由调用方显式指定 VIDEO_PROFILE
         # （见该常量的注释——"她想看才看"，逐条自动描述会白烧 token）。
+        try:
+            await self._service.ensure_description_authorized(evidence.evidence_id, window_id=evidence.window_id)
+        except MediaEvidenceError as exc:
+            raise MediaDescribeError(str(exc), retriable=False, terminal=True, source=SOURCE_BUSINESS) from exc
         text = await self._ask_vision(data, mime)
         if not text.strip():
             # 空回复等于没看到。留空，不写占位符，下一轮再试。

@@ -388,7 +388,17 @@ async def read_memory_source(
             CommitmentRow.subject_id == subject_id, commitment_source_available(),
         ))
         if plan is None:
-            raise missing
+            from ling.domains.media.service import MediaEvidenceService
+
+            material = await MediaEvidenceService(session, actor_id=settings.actor_id).library_material(
+                memory_id, subject_id=subject_id,
+            )
+            if material is None or material.created_at is None:
+                raise missing
+            return {
+                "message_id": material.evidence_id, "window_id": material.window_id,
+                "created_at": material.created_at.isoformat(), "text": material.description,
+            }
         reply = await session.scalar(select(Message).where(
             Message.id == plan.source_event_ids[0].removeprefix("message:"),
             Message.window_id == plan.window_id, completed_actor_message(),

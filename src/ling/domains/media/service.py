@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import ColumnElement, and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.consent.service import ConsentService, ConsentView
@@ -42,27 +42,50 @@ KINDS = frozenset({"image", "audio", "video", "emoji"})
 # 描述来源。只有 human 的描述可以作为事实。
 ORIGIN_HUMAN = "human"
 ORIGIN_MODEL = "model_inference"
+SEDIMENT_SLOT = "media_watched"
 
 
-def readable_media_evidence(*, now: datetime):
-    """Apply current consent and known source status before using a media description."""
-    source = MediaEvidenceRow.source_event_id
+def readable_media_evidence(*, now: datetime) -> ColumnElement[bool]:
     owner = select(Window.subject_id).where(
         Window.id == MediaEvidenceRow.window_id,
     ).correlate(MediaEvidenceRow).scalar_subquery()
+    authorizer = func.coalesce(
+        MediaEvidenceRow.consent_subject_id,
+        case((owner == MediaEvidenceRow.subject_id, MediaEvidenceRow.subject_id), else_=None),
+    )
     grant = select(ConsentRule.id).where(
+        ConsentRule.subject_id == authorizer,
         or_(ConsentRule.subject_id == MediaEvidenceRow.subject_id, ConsentRule.subject_id == owner),
-        ConsentRule.scope == INBOUND_SCOPE, ConsentRule.granted.is_(True),
+        ConsentRule.scope == INBOUND_SCOPE,
+        ConsentRule.granted.is_(True),
         or_(ConsentRule.valid_until.is_(None), ConsentRule.valid_until > now),
         ConsentRule.revision == MediaEvidenceRow.consent_revision,
     ).correlate(MediaEvidenceRow).exists()
-    hidden_source = select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
+    return grant & ~hidden_media_source()
+
+
+def hidden_media_source() -> ColumnElement[bool]:
+    source = MediaEvidenceRow.source_event_id
+    return select(Message.id).outerjoin(Turn, Turn.id == Message.turn_id).where(
         Message.window_id == MediaEvidenceRow.window_id, Message.role == "user",
         Message.sender_subject_id == MediaEvidenceRow.subject_id,
         or_(func.concat("message:", Message.id) == source, Turn.client_turn_id == source),
         or_(Message.memory_hidden_at.is_not(None), Message.retracted_at.is_not(None)),
     ).correlate(MediaEvidenceRow).exists()
-    return grant & ~hidden_source
+
+
+def material_library_scope(*, actor_id: str, subject_id: str, now: datetime) -> ColumnElement[bool]:
+    owned_window = select(Window.id).where(
+        Window.id == MediaEvidenceRow.window_id,
+        Window.actor_id == actor_id, Window.subject_id == subject_id,
+        Window.visibility.in_(("subject_private", "window_private")),
+    ).correlate(MediaEvidenceRow).exists()
+    return and_(
+        MediaEvidenceRow.actor_id == actor_id, MediaEvidenceRow.subject_id == subject_id,
+        MediaEvidenceRow.description.is_not(None), MediaEvidenceRow.describe_failed_at.is_(None),
+        or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > now),
+        owned_window, readable_media_evidence(now=now),
+    )
 
 
 # 素材来源
@@ -171,12 +194,13 @@ class MediaEvidenceService:
         if subject_id is None:
             raise MediaEvidenceError("入站媒体必须带上传者 subject_id")
 
-        consent = await self._granted_consent([subject_id, *(consent_subjects or ())])
-        if consent is None:
+        grant = await self._granted_consent([subject_id, *(consent_subjects or ())])
+        if grant is None:
             raise MediaEvidenceError(
                 f"未授权描述入站媒体（授权记录 scope={INBOUND_SCOPE}）"
             )
 
+        consent_subject_id, consent = grant
         # 渠道一条消息可能有多张图。附件引用只参与去重，不属于来源事件 ID。
         identity = source_event_id or media_ref
         if dedupe_by_ref and source_event_id:
@@ -187,7 +211,15 @@ class MediaEvidenceService:
         # 描述任务按窗口取待办永远取不到，而且跨窗口引用了别人的证据。
         existing = await self._by_dedupe(key, window_id=window_id)
         if existing is not None:
-            return _view(existing)
+            if source_event_id or (
+                existing.consent_subject_id == consent_subject_id and existing.consent_revision == consent.revision
+            ):
+                return _view(existing)
+            # A new upload can carry a new grant. Replay of a known platform event keeps its original grant.
+            key = dedupe_key_for(f"{identity}:grant:{consent_subject_id}:{consent.revision}")
+            existing = await self._by_dedupe(key, window_id=window_id)
+            if existing is not None:
+                return _view(existing)
 
         row = MediaEvidenceRow(
             id=new_id("media"),
@@ -198,6 +230,7 @@ class MediaEvidenceService:
             media_ref=media_ref,
             origin=origin,
             visibility=visibility,
+            consent_subject_id=consent_subject_id,
             consent_revision=consent.revision,
             description=None,
             description_origin=None,
@@ -211,7 +244,7 @@ class MediaEvidenceService:
 
     # ------------------------------------------------------------ 授权判据
 
-    async def _granted_consent(self, subjects: Sequence[str | None]) -> ConsentView | None:
+    async def _granted_consent(self, subjects: Sequence[str | None]) -> tuple[str, ConsentView] | None:
         """这些主体里**第一个**已授权的授权记录；一个都没有就返回 ``None``。
 
         顺序即优先级：发言人本人（最具体）在前，会话主人在后。返回整条
@@ -226,7 +259,7 @@ class MediaEvidenceService:
             seen.add(subject)
             consent = await service.get(subject, INBOUND_SCOPE)
             if consent.granted and (consent.valid_until is None or consent.valid_until > utcnow()):
-                return consent
+                return subject, consent
         return None
 
     async def _window_owner(self, window_id: str) -> str | None:
@@ -253,7 +286,7 @@ class MediaEvidenceService:
         主人授权过的群图仍然会在描述这一步被拒——等于没修。
         """
         row = await self._require(evidence_id, window_id)
-        consent = await self._description_consent(row, window_id)
+        consent_subject_id, consent = await self._description_consent(row, window_id)
 
         text = description.strip()
         if not text:
@@ -261,7 +294,7 @@ class MediaEvidenceService:
 
         row.description = text[:4000]
         row.description_origin = description_origin
-        # 撤权后再授权时，以当前修订为准
+        row.consent_subject_id = consent_subject_id
         row.consent_revision = consent.revision
         # 描述成功 = 之前那个"引用不可用"的终态不再成立（比如文件后来补上了）
         row.describe_failed_at = None
@@ -278,19 +311,25 @@ class MediaEvidenceService:
         await self._description_consent(row, window_id)
 
     async def _description_consent(
-        self, row: MediaEvidenceRow, window_id: str
-    ) -> ConsentView:
+        self, row: MediaEvidenceRow, window_id: str,
+    ) -> tuple[str, ConsentView]:
         if row.subject_id is None:
             raise MediaEvidenceError("证据没有上传者，无法校验授权")
-
-        consent = await self._granted_consent(
-            [row.subject_id, await self._window_owner(window_id)]
-        )
-        if consent is None:
-            raise MediaEvidenceError(
-                f"授权已撤销，不能再描述（scope={INBOUND_SCOPE}）"
-            )
-        return consent
+        hidden = await self._session.scalar(select(MediaEvidenceRow.id).where(
+            MediaEvidenceRow.id == row.id, hidden_media_source(),
+        ))
+        owner = await self._window_owner(window_id)
+        authorizer = row.consent_subject_id or (row.subject_id if row.subject_id == owner else None)
+        if hidden is None and authorizer is not None and authorizer in {row.subject_id, owner}:
+            grant = await self._granted_consent([authorizer])
+            if grant and grant[1].revision == row.consent_revision:
+                return grant
+        if hidden is None and row.consent_revision == 0 and row.description is None:
+            # Older, never-described rows may receive their first grant during an explicit read.
+            grant = await self._granted_consent([row.subject_id, owner])
+            if grant:
+                return grant
+        raise MediaEvidenceError(f"授权已撤销或无法核对，不能描述（scope={INBOUND_SCOPE}）")
 
     async def mark_describe_failed(
         self, evidence_id: str, *, window_id: str, reason: str
@@ -332,6 +371,13 @@ class MediaEvidenceService:
             return None
         return _view(row)
 
+    async def library_material(self, evidence_id: str, *, subject_id: str) -> EvidenceView | None:
+        row = await self._session.scalar(select(MediaEvidenceRow).where(
+            MediaEvidenceRow.id == evidence_id,
+            material_library_scope(actor_id=self._actor_id, subject_id=subject_id, now=utcnow()),
+        ))
+        return _view(row) if row is not None else None
+
     async def pending(
         self,
         *,
@@ -353,7 +399,8 @@ class MediaEvidenceService:
             MediaEvidenceRow.actor_id == self._actor_id,
             MediaEvidenceRow.window_id == window_id,
             MediaEvidenceRow.description.is_(None),
-            MediaEvidenceRow.describe_failed_at.is_(None),
+            MediaEvidenceRow.describe_failed_at.is_(None), readable_media_evidence(now=utcnow()),
+            or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
         ]
         if exclude_kinds:
             conditions.append(MediaEvidenceRow.kind.not_in(list(exclude_kinds)))
@@ -388,6 +435,7 @@ class MediaEvidenceService:
                         MediaEvidenceRow.actor_id == self._actor_id,
                         MediaEvidenceRow.window_id == window_id,
                         MediaEvidenceRow.description.is_not(None),
+                        MediaEvidenceRow.describe_failed_at.is_(None),
                         or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
                         readable_media_evidence(now=utcnow()),
                     )
@@ -444,7 +492,8 @@ class MediaEvidenceService:
         conditions = [
             MediaEvidenceRow.actor_id == self._actor_id,
             MediaEvidenceRow.description.is_(None),
-            MediaEvidenceRow.describe_failed_at.is_(None),
+            MediaEvidenceRow.describe_failed_at.is_(None), readable_media_evidence(now=utcnow()),
+            or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
         ]
         if exclude_kinds:
             conditions.append(MediaEvidenceRow.kind.not_in(list(exclude_kinds)))
@@ -479,6 +528,7 @@ class MediaEvidenceService:
                     select(MediaEvidenceRow).where(
                         MediaEvidenceRow.actor_id == self._actor_id,
                         MediaEvidenceRow.window_id == window_id,
+                        MediaEvidenceRow.describe_failed_at.is_(None),
                         readable_media_evidence(now=utcnow()),
                     )
                 )

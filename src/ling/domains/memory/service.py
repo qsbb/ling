@@ -33,12 +33,14 @@ from ling.domains.goals.service import (
     commitment_source_available,
 )
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, procedure_source_available
+from ling.domains.media.service import SEDIMENT_SLOT, readable_media_evidence
 from ling.domains.memory.purge import has_open_purge as has_open_purge
 from ling.domains.memory.recall_query import needs_recent_topic
 from ling.infra.models import (
     ActorAccount,
     CommitmentRow,
     KnowledgeItem,
+    MediaEvidenceRow,
     MemoryEmbeddingRow,
     MemoryEpisode,
     MemoryImportForgetMarker,
@@ -137,6 +139,13 @@ def active_source(model: type[MemoryRow] | type[MemoryEpisode]) -> ColumnElement
             procedure_source_available(MemoryRow.subject_id, utcnow()),
         ).correlate(MemoryRow).exists()
         eligible = eligible & or_(MemoryRow.slot.is_distinct_from(PROCEDURE_SOURCE_SLOT), current_document)
+        current_material = select(MediaEvidenceRow.id).where(
+            MediaEvidenceRow.id == MemoryRow.value,
+            MediaEvidenceRow.window_id == MemoryRow.source_window_id,
+            MediaEvidenceRow.subject_id == MemoryRow.subject_id,
+            readable_media_evidence(now=utcnow()), MediaEvidenceRow.describe_failed_at.is_(None),
+        ).correlate(MemoryRow).exists()
+        eligible = eligible & or_(MemoryRow.slot.is_distinct_from(SEDIMENT_SLOT), current_material)
         forgotten_import = select(MemoryImportForgetMarker.source_key).where(
             MemoryImportForgetMarker.source_key == MemoryRow.import_key,
         ).exists()

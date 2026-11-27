@@ -2321,7 +2321,8 @@ class MediaEvidenceRow(Base, TimestampMixin):
     visibility: Mapped[str] = mapped_column(
         String(32), default="window_private", server_default="window_private"
     )
-    # 记录这条证据时生效的授权修订。撤权后据此失效。
+    # 保留授权主体与修订，避免两个人恰好采用相同版本号。
+    consent_subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     consent_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 看见了什么/推断出什么。**可能是猜的**，看 origin。
     description: Mapped[str | None] = mapped_column(Text, nullable=True)

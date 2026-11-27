@@ -51,12 +51,10 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ling.domains.media.service import SEDIMENT_SLOT, readable_media_evidence
 from ling.infra.models import MediaEvidenceRow
 
 logger = logging.getLogger("ling.domains.media.sediment")
-
-#: 沉降用的槽位名。固定值让它可被检索（"看过什么"是一类，不是每视频一个槽）。
-SEDIMENT_SLOT = "media_watched"
 
 #: 只沉降这么久之内看过的：太老的视频再翻出来说"我看过那个"会显得莫名其妙，
 #: 而且与记忆保留期是两套语义（这条是她自己的经历，不是用户的事实）。
@@ -137,6 +135,7 @@ async def sediment_expired_evidence(
                 select(MediaEvidenceRow).where(
                     MediaEvidenceRow.actor_id == actor_id,
                     MediaEvidenceRow.description.is_not(None),
+                    readable_media_evidence(now=moment), MediaEvidenceRow.describe_failed_at.is_(None),
                     # **她真的看过**：模型推断出来的不能变成她记得的事。
                     # 这一条与 `fact_eligible=False` 是同一条铁律。
                     or_(

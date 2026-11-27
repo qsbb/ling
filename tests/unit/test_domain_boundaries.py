@@ -198,6 +198,12 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("memory/service.py", "ling.domains.conversation.service"): (
         "角色感受引用对话域中的已完成回复，读取时核对当前轮次与撤回状态。"
     ),
+    ("memory/service.py", "ling.domains.media.service"): (
+        "素材整理衍生的情节沿用媒体域的授权主体与版本判据。"
+    ),
+    ("memory/library.py", "ling.domains.media.service"): (
+        "记忆库只读取当前媒体授权允许的素材摘要及其可信来源。"
+    ),
     ("memory/service.py", "ling.domains.knowledge.service"): (
         "做法检索复用知识域对资料归属和时效的判据。"
     ),

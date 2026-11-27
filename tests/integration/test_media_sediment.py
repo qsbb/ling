@@ -69,6 +69,12 @@ async def _add_evidence(
         None if expires_in_days is None else NOW + timedelta(days=expires_in_days)
     )
     async with session_scope() as session:
+        from ling.domains.consent.service import ConsentService
+
+        consents = ConsentService(session)
+        consent = await consents.get(subject_id, "media.inbound")
+        if not own_asset and not consent.granted:
+            consent = await consents.grant(subject_id=subject_id, scope="media.inbound")
         session.add(
             MediaEvidenceRow(
                 id=evidence_id,
@@ -81,6 +87,8 @@ async def _add_evidence(
                 visibility="window_private",
                 description=description,
                 description_origin=description_origin,
+                consent_subject_id=None if own_asset else subject_id,
+                consent_revision=consent.revision,
                 source_event_id=source_event_id,
                 dedupe_key=f"key_{evidence_id}",
                 expires_at=expires,
