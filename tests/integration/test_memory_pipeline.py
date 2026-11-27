@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from ling.infra.db import session_scope
-from ling.infra.models import MemoryEpisode, MemoryRow, OutboxEvent
+from ling.infra.models import MemoryEpisode, MemoryRow, Message, OutboxEvent
 from tests.integration.conftest import TestEnv, read_sse
 
 pytestmark = pytest.mark.w0_web
@@ -329,3 +329,53 @@ async def test_forget_source_removes_old_prompt_material_and_allows_new_evidence
     async with session_scope() as session:
         relearned = await session.scalar(select(MemoryRow).where(MemoryRow.value == address))
         assert relearned and relearned.id != target_id and relearned.turn_id != original["turn_id"]
+
+
+async def test_private_forget_command_requires_one_source_and_is_not_remembered(
+    logged_in: TestEnv, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ling import worker
+    from ling.kernel.context import ContextCompiler
+
+    monkeypatch.setattr(worker, "_MEMORY_ROUTER", None)
+    env = logged_in
+    first, second = [
+        (await env.client.post("/v1/sessions", json={"title": title})).json()["session_id"]
+        for title in ("住址记录", "另一个私聊")
+    ]
+    target, control = "我住在浅水湾石桥", "我喜欢纸飞机"
+
+    async def send(window: str, text: str) -> tuple[str, str]:
+        events = await _send(env.client, window, text)
+        event, last = events[-1]
+        assert event == "turn.completed"
+        return last["turn_id"], last["message"]["text"]
+
+    target_turn, _ = await send(first, target)
+    await send(first, control)
+    other_turn, _ = await send(second, target)
+    await worker.drain_outbox(only_topic="memory.extract")
+
+    async def exists(turn_id: str) -> bool:
+        async with session_scope() as session:
+            return bool(await session.scalar(select(MemoryEpisode.id).where(MemoryEpisode.turn_id == turn_id)))
+
+    assert await exists(target_turn) and await exists(other_turn)
+    _, clarify = await send(first, "忘掉那个。")
+    assert "请引用" in clarify
+    assert await exists(target_turn)
+    command, confirmation = await send(first, f"请忘掉我在这段对话里说过的『{target}』这条记忆。")
+    assert "已遗忘" in confirmation
+    assert not await exists(target_turn)
+    assert await exists(other_turn)
+    async with session_scope() as session:
+        assert not await session.scalar(select(OutboxEvent.id).where(
+            OutboxEvent.payload["turn_id"].as_string() == command,
+        ))
+        command_message = await session.scalar(select(Message).where(Message.turn_id == command, Message.role == "user"))
+        assert command_message is not None and command_message.memory_hidden_at is not None
+        prompt = await ContextCompiler(session).compile(
+            subject_id=env.subject_id, window_id=first, user_text="刚才聊了什么？",
+        )
+        assert not any(target in item.content for item in prompt.messages)
+        assert any(control in item.content for item in prompt.messages)

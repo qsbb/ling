@@ -1,5 +1,7 @@
 """Forget a sourced memory and the material derived from its conversation turn."""
 
+import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import and_, case, cast, delete, or_, select, update
@@ -31,6 +33,96 @@ from ling.infra.models import (
     WindowContext,
     utcnow,
 )
+
+_FORGET_COMMAND = re.compile(r"(?:请)?(?:帮我)?忘(?:掉|记)(?P<target>[^\r\n]{1,240})")
+_QUOTED_SOURCE = re.compile(
+    r"(?:我(?:在这段对话里|在这里|刚才)?说过的)?"
+    r"(?:『([^』]+)』|「([^」]+)」|“([^”]+)”)"
+    r"(?:这(?:句|条)(?:话|记忆)?)?"
+)
+_FACT_TARGETS = {
+    "住址": "lives_in", "地址": "lives_in", "我住哪": "lives_in", "住在哪里": "lives_in",
+    "工作地点": "works_at", "工作单位": "works_at",
+}
+FORGET_CLARIFICATION = "请引用要忘掉的那句原话，或在记忆库里选中一条记忆。"
+
+
+@dataclass(frozen=True)
+class ForgetRequest:
+    quote: str | None = None
+    slot: str | None = None
+
+
+def parse_forget_request(text: str) -> ForgetRequest | None:
+    """Recognize a standalone command. Only a quoted source or a named fact can delete."""
+    match = _FORGET_COMMAND.fullmatch(text.strip().rstrip("。！!"))
+    if match is None or "\x00" in text:
+        return None
+    target = match["target"].strip()
+    if target.endswith(("?", "？", "吗", "么")):
+        return None
+    if quoted := _QUOTED_SOURCE.fullmatch(target):
+        phrase = next(part.strip() for part in quoted.groups() if part is not None)
+        if len(phrase) >= 2:
+            return ForgetRequest(quote=phrase)
+    return ForgetRequest(slot=_FACT_TARGETS.get(target.removeprefix("我的")))
+
+
+async def forget_from_conversation(
+    session: AsyncSession, *, request: ForgetRequest,
+    subject_id: str, window_id: str, turn_id: str,
+) -> str | None:
+    """Remove exactly one earlier source in the caller's private conversation."""
+    window = await session.get(Window, window_id)
+    if (
+        window is None or window.subject_id != subject_id or window.archived
+        or window.visibility not in {"subject_private", "window_private"}
+    ):
+        return None
+    await session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
+    now = utcnow()
+    command = await session.scalar(select(Message).where(
+        Message.turn_id == turn_id, Message.window_id == window_id,
+        Message.role == "user", Message.sender_subject_id == subject_id,
+        Message.retracted_at.is_(None),
+    ).order_by(Message.sequence.desc()).limit(1).with_for_update())
+    if command is None or command.memory_hidden_at is not None:
+        return None
+    command.memory_hidden_at = now
+    if request.quote is None and request.slot is None:
+        return None
+
+    facts = select(MemoryRow.id).where(
+        MemoryRow.source_message_id == Message.id, MemoryRow.subject_id == subject_id,
+        MemoryRow.source_window_id == window_id,
+        MemoryRow.retracted.is_(False), MemoryRow.archived_at.is_(None),
+    )
+    sources = select(Message).where(
+        Message.window_id == window_id, Message.role == "user",
+        Message.sender_subject_id == subject_id, Message.turn_id.is_not(None),
+        Message.sequence < command.sequence, Message.retracted_at.is_(None),
+        Message.memory_hidden_at.is_(None),
+    )
+    if request.quote is not None:
+        episode = select(MemoryEpisode.id).where(
+            MemoryEpisode.source_message_id == Message.id,
+            MemoryEpisode.subject_id == subject_id, MemoryEpisode.window_id == window_id,
+            MemoryEpisode.archived_at.is_(None),
+        )
+        sources = sources.where(
+            Message.text.contains(request.quote, autoescape=True), or_(facts.exists(), episode.exists()),
+        )
+    else:
+        sources = sources.where(facts.where(MemoryRow.slot == request.slot).exists())
+    matches = (await session.scalars(sources.limit(2).with_for_update(of=Message))).all()
+    if len(matches) != 1:
+        return None
+    source = matches[0]
+    await apply_source_forget(
+        session, subject_id=subject_id, message_id=source.id,
+        window_id=window_id, turn_id=source.turn_id, forgotten_at=now,
+    )
+    return source.id
 
 
 async def forget_source(

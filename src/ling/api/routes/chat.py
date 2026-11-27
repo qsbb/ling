@@ -37,7 +37,13 @@ from ling.api.deps import (
 )
 from ling.api.error_handlers import PublicValidationError
 from ling.api.errors import LingError, not_found
+from ling.audit import audit_event
 from ling.contracts.v1 import ErrorCode, MediaReadJobOut, TurnState
+from ling.domains.memory.forget_source import (
+    FORGET_CLARIFICATION,
+    forget_from_conversation,
+    parse_forget_request,
+)
 from ling.infra.models import Window
 from ling.kernel.autonomy import TurnChoice
 from ling.kernel.decision import TurnDecision
@@ -953,16 +959,20 @@ async def send_transcribed_turn(
 
     # --- 接话决策：确定性硬规则优先，模型只在弹性区间参与 ---
     # 设计文档 §6.1 候选：回答/澄清/沉默/延后；§1 第 7 条：确定性代码最终裁决。
-    decision = await _evaluate_turn_decision(
-        request,
-        window,
-        text,
-        auth.user.subject_id,
-        decision_config,
-        config_session=conversation.session,
-        actor_id=settings.actor_id,
-        persona_id=persona_id,
-    )
+    forget = parse_forget_request(text) if window.visibility in {"subject_private", "window_private"} else None
+    if forget is None:
+        decision = await _evaluate_turn_decision(
+            request,
+            window,
+            text,
+            auth.user.subject_id,
+            decision_config,
+            config_session=conversation.session,
+            actor_id=settings.actor_id,
+            persona_id=persona_id,
+        )
+    else:
+        decision = TurnChoice(respond=True, reason="处理定向遗忘请求")
 
     turn = await conversation.create_turn(
         window.id, client_turn_id=body.client_turn_id, config_revision=effective.revision
@@ -978,6 +988,41 @@ async def send_transcribed_turn(
         handled_reason=decision.reason,
         sender_subject_id=auth.user.subject_id,
     )
+
+    if forget is not None:
+        forgotten = await forget_from_conversation(
+            conversation.session, request=forget, subject_id=auth.user.subject_id,
+            window_id=window.id, turn_id=turn.id,
+        )
+        reply = await conversation.add_message(
+            window.id, role="actor", turn_id=turn.id,
+            text="已遗忘这句发言衍生的记忆。" if forgotten else FORGET_CLARIFICATION,
+        )
+        await conversation.set_turn_state(turn.id, TurnState.completed)
+        await record_conversation_attempt_snapshot(
+            conversation.session, turn_id=turn.id, attempt=int(turn.attempt or 1), snapshot=snapshot,
+        )
+        await conversation.session.commit()
+        if forgotten:
+            audit_event(
+                "memory_source_forgotten", actor=auth.user.id,
+                target_type="message", target_id=forgotten,
+            )
+
+        async def forget_response() -> AsyncIterator[bytes]:
+            yield _sse("turn.started", {
+                "turn_id": turn.id, "state": TurnState.streaming.value,
+                "user_message": user_msg.to_contract().model_dump(mode="json"),
+                "test_mode": effective.test_mode, "decision": "reply",
+                "config_revision": effective.revision,
+            })
+            yield _sse("turn.completed", {
+                "turn_id": turn.id, "state": TurnState.completed.value,
+                "model_label": None, "decision": "reply",
+                "message": reply.to_contract().model_dump(mode="json"),
+            })
+
+        return StreamingResponse(forget_response(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     # 她说"稍后再提"时落一条意图；来源固定为这条消息。
     if getattr(decision, "followup", None) is not None:
