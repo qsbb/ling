@@ -40,7 +40,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,7 +51,6 @@ from ling.domains.media.describe import (
     MediaReadError,
 )
 from ling.domains.media.service import (
-    EvidenceView,
     MediaEvidenceError,
     MediaEvidenceService,
 )
@@ -292,33 +291,20 @@ class VideoWatchService:
             await slot_mod.release(self._session, handle)  # type: ignore[arg-type]
             await self._session.commit()
 
-    async def videos_in_window(self, window_id: str, *, limit: int = 20) -> list[EvidenceView]:
-        """窗口内所有视频（看过与没看过的都要）——短号解析要用全集。"""
-        unseen = await self._service.undescribed_videos(window_id=window_id, limit=limit)
-        seen = await self._service.described_in_window(window_id=window_id, limit=limit)
-        videos = [item for item in (*unseen, *seen) if item.kind == "video"]
-        # 去重（同一 id 同时出现在两个查询里的情况）
-        unique: dict[str, EvidenceView] = {}
-        for item in videos:
-            unique.setdefault(item.evidence_id, item)
-        return list(unique.values())
-
     async def watch(
         self, *, window_id: str, refs: list[str], mode: str = "frames"
     ) -> WatchOutcome:
         """按短号读视频。**永不抛**：所有失败都变成 ``skipped`` + 一行行为日志。"""
         outcome = WatchOutcome(refs=list(refs))
-        videos = await self.videos_in_window(window_id)
+        video_ids = await self._service.video_reference_ids(window_id=window_id)
         # 先看撞车：**撞车不读**（可能读错人），也不能"取第一条凑合"。
-        # video.py's list[object] signatures preserve these EvidenceView instances.
-        video_refs = cast(list[object], videos)
-        collisions = ambiguous_refs(refs, video_refs)
+        collisions = ambiguous_refs(refs, video_ids)
         if collisions:
             outcome.skipped = f"短号撞车（{collisions[0]}），无法确定是哪一条"
             outcome.denied_kind = DENIED_MISSING
             _log_skipped(collisions[0], "短号撞车，无法确定是哪一条视频")
             return outcome
-        resolved = cast(list[EvidenceView], resolve_watch_refs(refs, video_refs))
+        resolved = resolve_watch_refs(refs, video_ids)
         if not resolved:
             # 短号对不上：可能是幻觉、也可能是别的窗口的视频、或者已过期。
             # **静默退化**（不报错、不追问），只留一行日志便于排查。
@@ -328,19 +314,18 @@ class VideoWatchService:
             return outcome
 
         lines: list[str] = []
-        for evidence in resolved[:MAX_READS_PER_REPLY]:
-            ref = short_ref_for(evidence.evidence_id)
+        for evidence_id in resolved[:MAX_READS_PER_REPLY]:
+            ref = short_ref_for(evidence_id)
+            try:
+                evidence = await self._service.ensure_description_authorized(
+                    evidence_id, window_id=window_id
+                )
+            except MediaEvidenceError as exc:
+                outcome.skipped = str(exc)
+                outcome.denied_kind = DENIED_ERROR
+                _log_skipped(ref, str(exc))
+                break
             if evidence.description:
-                # 同一条证据只读一次：有描述就直接用，不再调模型。
-                try:
-                    await self._service.ensure_description_authorized(
-                        evidence.evidence_id, window_id=window_id
-                    )
-                except MediaEvidenceError as exc:
-                    outcome.skipped = str(exc)
-                    outcome.denied_kind = DENIED_ERROR
-                    _log_skipped(ref, str(exc))
-                    break
                 lines.append(f"- {ref}（之前看过的）：{evidence.description}")
                 _log_viewed(ref, "上次已经看过，用已有描述", cached=True)
                 continue

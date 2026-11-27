@@ -305,10 +305,11 @@ class MediaEvidenceService:
 
     async def ensure_description_authorized(
         self, evidence_id: str, *, window_id: str
-    ) -> None:
-        """确认当前证据仍有入站媒体授权，不修改证据。"""
+    ) -> EvidenceView:
+        """确认当前入站授权后返回证据视图。"""
         row = await self._require(evidence_id, window_id)
         await self._description_consent(row, window_id)
+        return _view(row)
 
     async def _description_consent(
         self, row: MediaEvidenceRow, window_id: str,
@@ -357,6 +358,17 @@ class MediaEvidenceService:
         return _view(row)
 
     # ---------------------------------------------------------------- 读取
+
+    async def video_reference_ids(self, *, window_id: str) -> list[str]:
+        """显式短号查询的候选只含本窗口有效期内的视频 ID。"""
+        ids = await self._session.scalars(select(MediaEvidenceRow.id).where(
+            MediaEvidenceRow.actor_id == self._actor_id,
+            MediaEvidenceRow.window_id == window_id,
+            MediaEvidenceRow.kind == "video",
+            or_(MediaEvidenceRow.description.is_(None), MediaEvidenceRow.describe_failed_at.is_(None)),
+            or_(MediaEvidenceRow.expires_at.is_(None), MediaEvidenceRow.expires_at > utcnow()),
+        ))
+        return list(ids)
 
     async def get(self, evidence_id: str, *, window_id: str) -> EvidenceView | None:
         """按窗口读取。窗口不匹配或已过期都返回 ``None``。

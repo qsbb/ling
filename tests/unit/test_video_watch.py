@@ -283,14 +283,11 @@ class _FakeService:
     def __init__(self, videos: list[EvidenceView]) -> None:
         self._videos = videos
 
-    async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> None:
-        return None
+    async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> EvidenceView:
+        return next(video for video in self._videos if video.evidence_id == evidence_id)
 
-    async def undescribed_videos(self, *, window_id: str, limit: int = 5):  # noqa: ANN001, ANN201
-        return [v for v in self._videos if v.description is None]
-
-    async def described_in_window(self, *, window_id: str, limit: int = 5):  # noqa: ANN001, ANN201
-        return [v for v in self._videos if v.description is not None]
+    async def video_reference_ids(self, *, window_id: str) -> list[str]:
+        return [video.evidence_id for video in self._videos]
 
 
 async def _watch(videos: list[EvidenceView], refs: list[str], *, mode: str = "frames", quota_denial=None):  # noqa: ANN001, ANN202

@@ -164,33 +164,33 @@ def finalize_reply_text(text: str) -> str:
     return drop_partial_marker(strip_watch_markers(text)).rstrip(" \t")
 
 
-def ref_hits(refs: list[str], videos: list[object]) -> dict[str, list[object]]:
+def ref_hits[T](refs: list[str], videos: list[T]) -> dict[str, list[T]]:
     """短号 → 命中的视频列表（0 / 1 / ≥2 由调用方区分）。
 
     **撞车（≥2）不能"取第一条"**：那既多烧一次视频模型调用，又可能读了
     另一个人发的视频——"她看到了别人看不到的东西"比"没看成"糟得多。
     """
-    wanted = {ref.lower() for ref in refs}
-    hits: dict[str, list[object]] = {ref: [] for ref in wanted}
+    hits: dict[str, list[T]] = {ref.lower(): [] for ref in refs}
     if not hits:
         return {}
     for video in videos:
-        ref = short_ref_for(str(getattr(video, "evidence_id", "")))
+        evidence_id = video if isinstance(video, str) else str(getattr(video, "evidence_id", ""))
+        ref = short_ref_for(evidence_id)
         if ref in hits:
             hits[ref].append(video)
     return hits
 
 
-def resolve_watch_refs(refs: list[str], videos: list[object]) -> list[object]:
+def resolve_watch_refs[T](refs: list[str], videos: list[T]) -> list[T]:
     """只返回**唯一命中**的那些证据（撞车与不存在的都不返回）。"""
-    resolved: list[object] = []
+    resolved: list[T] = []
     for found in ref_hits(refs, videos).values():
         if len(found) == 1:
             resolved.append(found[0])
     return resolved
 
 
-def ambiguous_refs(refs: list[str], videos: list[object]) -> list[str]:
+def ambiguous_refs[T](refs: list[str], videos: list[T]) -> list[str]:
     """命中了 ≥2 条的短号（撞车）。"""
     return [ref for ref, found in ref_hits(refs, videos).items() if len(found) > 1]
 

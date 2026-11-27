@@ -347,11 +347,11 @@ async def test_many_reads_in_one_window_are_not_rate_limited(
         def __init__(self, videos: list[EvidenceView]) -> None:
             self._videos = videos
 
-        async def undescribed_videos(self, *, window_id: str, limit: int = 5):  # noqa: ANN001, ANN201
-            return [v for v in self._videos if v.description is None]
+        async def ensure_description_authorized(self, evidence_id: str, *, window_id: str) -> EvidenceView:
+            return next(video for video in self._videos if video.evidence_id == evidence_id)
 
-        async def described_in_window(self, *, window_id: str, limit: int = 5):  # noqa: ANN001, ANN201
-            return [v for v in self._videos if v.description is not None]
+        async def video_reference_ids(self, *, window_id: str) -> list[str]:
+            return [video.evidence_id for video in self._videos]
 
     def _video(evidence_id: str) -> EvidenceView:
         return EvidenceView(
