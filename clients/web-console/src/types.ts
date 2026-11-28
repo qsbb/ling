@@ -166,6 +166,12 @@ export interface PromptSnapshotOut {
     tokens: number;
   }>;
   tool_transcript_truncated?: boolean;
+  note?: string | null;
+  memory_recall?: {
+    state: 'not_extracted' | 'not_visible' | 'no_match' | 'not_injected' | 'injected' | 'used_source';
+    source_message_ids: string[];
+    expression: 'quoted' | 'no_literal_match' | null;
+  } | null;
 }
 
 export interface UserInfo {
@@ -420,6 +426,25 @@ export interface MemoryRecord {
   /** 从 AstrBot 导入的条目才有；字段见 docs/ASTRBOT-MEMORY-IMPORT.md。 */
   import_source?: MemoryImportSource;
   archive_speakers?: { entity_id: string; name: string; source_event_id: string }[];
+}
+
+export interface MemorySourceEvidence {
+  message_id?: string;
+  window_id?: string;
+  commitment_id?: string;
+  role: 'user' | 'actor' | 'commitment';
+  text: string;
+  created_at: string;
+  state?: string;
+}
+
+export interface ConversationMemorySource {
+  text: string;
+  created_at: string;
+  message_id?: string;
+  window_id?: string;
+  role?: 'user' | 'actor';
+  context?: MemorySourceEvidence[];
 }
 
 /**
@@ -1505,6 +1530,29 @@ export interface ProactiveRecord {
   web_saved: boolean;
   terminal_reason: string | null;
   receipt: { state: string; channel: string; observed_at: string } | null;
+  activity_id?: string | null;
+  related_memory_id?: string | null;
+  target_window_id?: string | null;
+  acknowledgement?: 'received' | 'misunderstood' | 'agreed' | null;
+}
+
+export interface SharePause {
+  paused: boolean;
+  until: string | null;
+}
+
+export interface RelationshipPreference {
+  id: string;
+  kind: 'boundary' | 'expression';
+  scope: string;
+  text: string;
+  state: 'pending' | 'active' | 'disabled';
+  source_message_id: string | null;
+}
+
+export interface RelationshipPreferences {
+  share_pause: SharePause;
+  preferences: RelationshipPreference[];
 }
 
 export interface ProactiveResponse {
@@ -1513,6 +1561,7 @@ export interface ProactiveResponse {
   recent?: ProactiveRecord[];
   gate: boolean;
   gate_reasons: string[];
+  share_pause?: SharePause;
   /** 主动发送是否真的实现了。false 时候选只会过期，不会变成消息。 */
   delivery_implemented?: boolean;
   /** 开场白生成是否实现。 */
@@ -2375,6 +2424,14 @@ export interface SleepReviewNight {
   rows_archived: number;
   review_status: SleepReviewStatus;
   items: SleepReviewItem[];
+  life?: Array<{
+    kind: 'activity' | 'dream' | 'plan' | 'impression' | 'clarification' | 'intention';
+    source_id: string;
+    text: string;
+    status: string;
+    at: string | null;
+    window_id: string | null;
+  }>;
 }
 
 export interface SleepReviewsResponse {

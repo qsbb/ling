@@ -62,6 +62,7 @@ import type {
   CoreMemoryInput,
   CoreMemoryListResponse,
   MemoryActivitySource,
+  ConversationMemorySource,
   MemoryInclude,
   MemoryLibraryKind,
   MemoryImportCommit,
@@ -76,6 +77,9 @@ import type {
   LogsResponse,
   RecallProposal,
   RecallResult,
+  RelationshipPreference,
+  RelationshipPreferences,
+  SharePause,
   SleepReviewsResponse,
   VoiceReferenceUpload,
   ExternalPlugin,
@@ -1211,6 +1215,10 @@ export const api = {
   proactive(): Promise<ProactiveResponse> {
     return request<ProactiveResponse>('/v1/proactive');
   },
+
+  cancelProactiveShare(id: string): Promise<{ opportunity_id: string; state: string }> {
+    return request(`/v1/proactive/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  },
   /**
    * 一天的**只读**生活时间轴（`GET /v1/life/timeline`）。
    *
@@ -1496,7 +1504,11 @@ export const api = {
     });
   },
 
-  readMemorySource(memoryId: string): Promise<{ text: string; created_at: string }> {
+  pinMemoryMessage(windowId: string, messageId: string): Promise<{ memory_id: string; pinned: boolean }> {
+    return request('/v1/memory/pin', jsonInit('POST', { window_id: windowId, message_id: messageId }));
+  },
+
+  readMemorySource(memoryId: string): Promise<ConversationMemorySource> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/source`, { cache: 'no-store' });
   },
 
@@ -1506,6 +1518,22 @@ export const api = {
 
   setMemoryPin(memoryId: string, pinned: boolean): Promise<{ memory_id: string; pinned: boolean }> {
     return request(`/v1/memory/${encodeURIComponent(memoryId)}/pin`, jsonInit('PUT', { pinned }));
+  },
+
+  relationshipPreferences(): Promise<RelationshipPreferences> {
+    return request('/v1/relationship/preferences');
+  },
+
+  setSharePause(paused: boolean): Promise<SharePause> {
+    return request('/v1/relationship/preferences/pause', jsonInit('PUT', { paused }));
+  },
+
+  addTopicBoundary(text: string): Promise<RelationshipPreference> {
+    return request('/v1/relationship/preferences/boundary', jsonInit('POST', { text }));
+  },
+
+  editRelationshipPreference(id: string, state: 'active' | 'disabled', text?: string): Promise<RelationshipPreference> {
+    return request(`/v1/relationship/preferences/${encodeURIComponent(id)}`, jsonInit('PATCH', { state, text }));
   },
 
   forgetMemorySource(memoryId: string): Promise<{ memory_id: string; forgotten: boolean }> {

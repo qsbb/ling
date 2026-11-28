@@ -30,6 +30,7 @@ import type {
   MemoryObjectAnnotation,
   MemoryObjectKind,
   MemoryPlanState,
+  ConversationMemorySource,
   MemoryRecord,
   SleepReviewsResponse,
 } from '../types';
@@ -40,7 +41,7 @@ import {
   starAffinity, STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
 } from './MemoryStarMap';
 import { MemoryFocusLens } from './MemoryFocusLens';
-import { SleepReviewSection } from './SleepReview';
+import { SleepReviewSection, sourceSessionHref } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
 
@@ -649,7 +650,7 @@ export function canRetryForget(state: ForgetState): boolean {
  */
 export interface MemoryHandlers {
   forgetSource(memoryId: string): Promise<void>;
-  readSource(memoryId: string): Promise<{ text: string; created_at: string }>;
+  readSource(memoryId: string): Promise<ConversationMemorySource>;
   readActivitySource?(memoryId: string): Promise<MemoryActivitySource>;
   annotateObject(memoryId: string, input: MemoryObjectAnnotation): Promise<void>;
   setPin?(memoryId: string, pinned: boolean): Promise<void>;
@@ -1304,7 +1305,7 @@ function MemoryInspector({
   const [newText, setNewText] = useState(row.text);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ExplainedError | null>(null);
-  const [source, setSource] = useState<{ text: string; created_at: string } | null>(null);
+  const [source, setSource] = useState<ConversationMemorySource | null>(null);
   const [activitySource, setActivitySource] = useState<MemoryActivitySource | null>(null);
   const [sourceError, setSourceError] = useState<ExplainedError | null>(null);
   const [sourcePending, setSourcePending] = useState(false);
@@ -1359,6 +1360,7 @@ function MemoryInspector({
     && (!row.valid_until || Date.parse(row.valid_until) > Date.now());
   const actionLabel = forgetting ? (imported ? '遗忘这条导入记忆' : '遗忘这次发言的记忆')
     : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
+  const relatedEvidence = source?.context?.filter((item) => item.message_id !== source.message_id) ?? [];
   const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
 
   const submit = async () => {
@@ -1414,6 +1416,7 @@ function MemoryInspector({
       <div className="mem-inspector__story">
         <div className="mem-inspector__tags">
           <span className="mem-badge">{kindLabel(row.kind)}</span>
+          {row.pinned ? <span className="mem-badge">手动固定</span> : null}
           {row.origin === 'model_inference' ? <span className="mem-badge mem-badge--warn">推测，不是事实</span> : null}
           {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
@@ -1588,10 +1591,28 @@ function MemoryInspector({
               {sourcePending ? '读取中…' : (source ? '收起' : '查看') + sourceLabel}
             </button>
             {source ? (
-              <blockquote data-testid="mem-original-message">
-                <p>{source.text}</p>
-                <time dateTime={source.created_at}>{formatAbsoluteTime(source.created_at)}</time>
-              </blockquote>
+              <>
+                <blockquote data-testid="mem-original-message">
+                  <p>{source.text}</p>
+                  <time dateTime={source.created_at}>{formatAbsoluteTime(source.created_at)}</time>
+                </blockquote>
+                {source.window_id ? <a className="mem-text-button" href={sourceSessionHref(source.window_id)}>打开来源会话</a> : null}
+                {relatedEvidence.length ? (
+                  <ol className="mem-change-list" aria-label="相关对话与承诺">
+                    {relatedEvidence.map((item) => (
+                      <li key={item.message_id ?? item.commitment_id}>
+                        <small>{item.role === 'actor' ? 'Ling 已发出的回复' : item.role === 'user' ? '用户原话' : '承诺'}</small>
+                        <time dateTime={item.created_at}> · {formatAbsoluteTime(item.created_at)}</time>
+                        <p>{item.text}</p>
+                        {item.state ? <small>{({
+                          active: '待履行', delivered: '已履行', missed: '已错过',
+                          cancelled: '已取消', undeliverable: '无法送达', uncertain: '结果不确定',
+                        } as Record<string, string>)[item.state] ?? item.state}</small> : null}
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+              </>
             ) : null}
             <InlineError error={sourceError} resource="list" />
           </>

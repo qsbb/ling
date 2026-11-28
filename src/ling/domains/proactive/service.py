@@ -8,15 +8,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta, tzinfo
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ling.infra.models import ProactiveDraftBinding, ProactiveOpportunity, utcnow
+from ling.infra.models import ProactiveDraftBinding, ProactiveOpportunity, Subject, utcnow
 from ling.infra.security import new_id
 from ling.ports.config import DialoguePolicy
+
+if TYPE_CHECKING:
+    from ling.domains.proactive.sources import Candidate
 
 # 联系负担：每 24 小时最多主动发起次数（产品初值，可由用户调低）
 DEFAULT_DAILY_LIMIT = 2
@@ -45,6 +50,12 @@ class OpportunityView:
 class GateDecision:
     allowed: bool
     reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ShareDecision:
+    reason: str
+    terminal: bool = False
 
 
 def _resolve_timezone(name: str | None) -> tzinfo:
@@ -98,6 +109,11 @@ class ProactivityService:
         visibility: str = "subject_private",
         reply_expected: bool = False,
         channel_hint: str | None = None,
+        related_memory_id: str | None = None,
+        target_window_id: str | None = None,
+        source_consent_revision: int | None = None,
+        source_target_fingerprint: str | None = None,
+        draft_text: str | None = None,
     ) -> OpportunityView | None:
         """登记一个主动机会。``dedupe_key`` 已存在时返回 None（不重复登记）。"""
         if dedupe_key:
@@ -118,7 +134,8 @@ class ProactivityService:
             kind=kind,
             reason=reason[:1000],
             state="candidate",
-            expires_at=(best_until or now) + timedelta(minutes=max(1, ttl_minutes)),
+            expires_at=best_until if related_memory_id and best_until else
+            (best_until or now) + timedelta(minutes=max(1, ttl_minutes)),
             created_at=now,
             source_event_id=source_event_id,
             dedupe_key=dedupe_key,
@@ -128,6 +145,11 @@ class ProactivityService:
             visibility=visibility,
             reply_expected=reply_expected,
             channel_hint=channel_hint,
+            related_memory_id=related_memory_id,
+            target_window_id=target_window_id,
+            source_consent_revision=source_consent_revision,
+            source_target_fingerprint=source_target_fingerprint,
+            draft_text=draft_text,
         )
         self._session.add(row)
         await self._session.flush()
@@ -249,7 +271,7 @@ class ProactivityService:
         所以这两列是**审计线索**，不是外键——读的一方必须容忍查不到 operation
         （见 `ling.domains.proactive.dispatch` 的「已知限制」）。
         """
-        allowed = {"candidate", "sent", "rejected", "expired", "failed", "uncertain"}
+        allowed = {"candidate", "sent", "rejected", "expired", "failed", "uncertain", "continued"}
         if state not in allowed:
             raise ValueError(f"未知机会状态: {state}")
         row = await self._session.get(ProactiveOpportunity, opportunity_id)
@@ -291,7 +313,9 @@ class ProactivityService:
         row.output_modality = output_modality
         await self._session.flush()
 
-    async def collect_candidates(self, *, now: datetime | None = None) -> dict:
+    async def collect_candidates(
+        self, *, now: datetime | None = None, additional: Sequence[Candidate] = (),
+    ) -> dict:
         """从可追溯事件收集主动候选。**只登记，不发送。**
 
         这里没有 "shadow" 参数：收集这一步本来就只有一种行为——把候选
@@ -307,6 +331,7 @@ class ProactivityService:
         now = now or utcnow()
         source = CausalSource(self._session, actor_id=self._actor_id)
         candidates = await source.collect(now=now)
+        candidates.extend(additional)
 
         created = 0
         skipped_duplicate = 0
@@ -316,6 +341,21 @@ class ProactivityService:
                 # 还没到该说的时候：不登记，避免占着候选位
                 skipped_not_due += 1
                 continue
+            if candidate.related_memory_id:
+                await self._session.execute(select(Subject.id).where(
+                    Subject.id == candidate.subject_id,
+                ).with_for_update())
+                queued = await self._session.scalar(select(ProactiveOpportunity.id).where(
+                    ProactiveOpportunity.actor_id == self._actor_id,
+                    ProactiveOpportunity.subject_id == candidate.subject_id,
+                    ProactiveOpportunity.related_memory_id == candidate.related_memory_id,
+                    ProactiveOpportunity.target_window_id == candidate.target_window_id,
+                    ProactiveOpportunity.state.in_(("candidate", "dispatching")),
+                    ProactiveOpportunity.expires_at > now,
+                ).limit(1))
+                if queued is not None:
+                    skipped_duplicate += 1
+                    continue
             row = await self.propose(
                 subject_id=candidate.subject_id,
                 kind=candidate.reason_code,
@@ -328,6 +368,11 @@ class ProactivityService:
                 visibility=candidate.visibility,
                 reply_expected=candidate.reply_expected,
                 channel_hint=candidate.channel_hint,
+                related_memory_id=candidate.related_memory_id,
+                target_window_id=candidate.target_window_id,
+                source_consent_revision=candidate.source_consent_revision,
+                source_target_fingerprint=candidate.source_target_fingerprint,
+                draft_text=candidate.draft_text,
             )
             if row is None:
                 skipped_duplicate += 1
@@ -358,7 +403,10 @@ class ProactivityService:
         await self._session.flush()
         return len(rows)
 
-    async def pending(self, subject_id: str | None = None) -> list[OpportunityView]:
+    async def pending(
+        self, subject_id: str | None = None,
+        *, source_visible: Callable[[ProactiveOpportunity], Awaitable[bool]] | None = None,
+    ) -> list[OpportunityView]:
         stmt = select(ProactiveOpportunity, ProactiveDraftBinding.state).outerjoin(
             ProactiveDraftBinding, ProactiveDraftBinding.opportunity_id == ProactiveOpportunity.id
         ).where(
@@ -368,7 +416,14 @@ class ProactivityService:
         if subject_id:
             stmt = stmt.where(ProactiveOpportunity.subject_id == subject_id)
         rows = (await self._session.execute(stmt)).all()
-        return [self._view(row, draft_state=state) for row, state in rows]
+        pending = []
+        for row, state in rows:
+            if row.related_memory_id and (
+                row.expires_at <= utcnow() or source_visible is None or not await source_visible(row)
+            ):
+                continue
+            pending.append(self._view(row, draft_state=state))
+        return pending
 
     @staticmethod
     def _view(row: ProactiveOpportunity, *, draft_state: str | None = None) -> OpportunityView:

@@ -94,10 +94,15 @@ FactOperation = Literal["assert", "change", "correct", "historical"]
 
 def fact_operation(candidate: Candidate, user_text: str) -> FactOperation:
     clause = _value_clause(candidate.value, user_text).strip()
-    if _PAST.match(clause):
-        return "historical"
     if _CORRECTION.search(user_text):
         return "correct"
+    if _PAST.match(clause):
+        return "historical"
+    if candidate.slot == "likes":
+        if re.search(r"(?:改成|现在更)喜欢", clause):
+            return "change"
+        if "喜欢的是" in clause:
+            return "correct"
     if _CHANGE.search(clause):
         return "change"
     return "assert"
@@ -363,7 +368,7 @@ def _reject_reason(cand: Candidate, *, user_text: str, is_group: bool) -> str | 
 
 _FALLBACK_PATTERNS = (
     ("name", r"我(?:的名字)?叫\s*([^\s，。,.！!？?]{1,20})"),
-    ("likes", r"我(?:很)?喜欢\s*([^\s，。,.！!？?]{1,20})"),
+    ("likes", r"(?:我(?:其实|真的|很|更)?喜欢(?:的是)?|(?:改成|现在更)喜欢)\s*([^\s，。,.！!？?；;]{1,20})"),
     # 「不吃 / 不碰 / 受不了 / 讨厌」都是长期忌口或偏好，不只是"不喜欢"
     (
         "dislikes",

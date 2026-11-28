@@ -540,6 +540,25 @@ async def get_message_prompt(
             ),
         )
 
+    raw_context = payload.get("context")
+    memory_recall = None
+    note = None
+    if isinstance(raw_context, dict):
+        from ling.contracts.v1 import MemoryRecallDiagnostic
+
+        recall_state = raw_context.get("experience_recall")
+        if recall_state in {"not_extracted", "not_visible", "no_match", "not_injected", "injected", "used_source"}:
+            sources = raw_context.get("experience_source_ids", [])
+            memory_recall = MemoryRecallDiagnostic.model_validate({
+                "state": recall_state,
+                "source_message_ids": [
+                    source.removeprefix("message:") for source in sources
+                    if isinstance(source, str) and source.startswith("message:")
+                ] if isinstance(sources, list) else [],
+                "expression": raw_context.get("experience_expression"),
+            })
+        if raw_context.get("experience_direct_reply") is True:
+            note = "这条回复来自记忆回查，本轮没有调用生成模型。"
     return PromptSnapshotOut(
         state=PromptSnapshotState.available,
         message_id=message_id,
@@ -553,5 +572,7 @@ async def get_message_prompt(
         sections=_snapshot_sections(payload),
         tool_transcript=_snapshot_tool_results(payload),
         tool_transcript_truncated=bool(payload.get("tool_transcript_truncated")),
+        memory_recall=memory_recall,
+        note=note,
     )
 

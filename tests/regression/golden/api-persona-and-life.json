@@ -489,7 +489,11 @@
           "terminal_reason": "null",
           "web_saved": "boolean"
         }
-      ]
+      ],
+      "share_pause": {
+        "paused": "boolean",
+        "until": "null"
+      }
     },
     "media_type": "application/json",
     "operation": "GET /v1/proactive",

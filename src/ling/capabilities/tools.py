@@ -529,6 +529,7 @@ def build_default_registry(
     knowledge_audience: AudienceSnapshot | None = None,
     current_fact_lookup: ToolHandler | None = None,
     shared_arrangement_lookup: ToolHandler | None = None,
+    experience_lookup: ToolHandler | None = None,
     memory_sources: dict[str, MemoryHit] | None = None,
     media_window_id: str | None = None,
     watch_video: WatchVideo | None = None,
@@ -682,6 +683,31 @@ def build_default_registry(
                 _memory_source_tool(
                     knowledge_audience, memory_sources, context_sources=context_sources,
                 ),
+            )
+        if experience_lookup is not None:
+            registry.register(
+                ToolSpec(
+                    tool_id="memory.experience",
+                    version="1.0.0",
+                    description="按当前说话人、话题和日期补查原话，或按时间核对有来源的事实。",
+                    risk=ToolRisk.read_only,
+                    requires_confirmation=False,
+                    reversible=True,
+                    model_callable=True,
+                    model_result_chars=1_200,
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "minLength": 1, "maxLength": 160},
+                            "mode": {"type": "string", "enum": ["originals", "past", "current"]},
+                            "slot": {"type": "string", "enum": ["likes", "works_at", "lives_in"]},
+                            "date": {"type": "string", "description": "要核对的 UTC 日期 YYYY-MM-DD"},
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                ),
+                experience_lookup,
             )
     if media_window_id and watch_video is not None:
         registry.register(

@@ -1364,6 +1364,19 @@ class ConversationService:
         )).all()
         return self._to_view(rows[0]) if len(rows) == 1 else None
 
+    async def confirm_reply_delivery(self, turn_id: str, *, window_id: str) -> None:
+        """Stamp the completed reply only after its full platform delivery is confirmed."""
+        from sqlalchemy import update
+
+        turn = await self._session.get(Turn, turn_id, populate_existing=True)
+        if turn is None or turn.window_id != window_id or turn.state != TurnState.completed.value:
+            return
+        await self._session.execute(update(Message).where(
+            Message.window_id == window_id, Message.turn_id == turn_id,
+            Message.role == "actor", Message.attempt == turn.attempt,
+            Message.state == TurnState.completed.value, Message.delivery_confirmed_at.is_(None),
+        ).values(delivery_confirmed_at=utcnow()))
+
     async def messages_for_prompt(
         self,
         window_id: str,

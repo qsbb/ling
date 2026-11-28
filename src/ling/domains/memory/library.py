@@ -70,6 +70,7 @@ def memory_record(row: MemoryRow) -> dict[str, Any]:
             **({"observed_at": _iso(row.valid_from)} if impression else {"valid_from": _iso(row.valid_from)}),
         } if row.source_message_id is not None else {}),
         **({"import_source": row.import_source} if row.import_source is not None else {}),
+        **({"pinned": True} if row.slot == "pinned_message" else {}),
     }
 
 
@@ -126,6 +127,9 @@ def _self_experience_record(row: SelfExperienceRow, activity: ActivityRow) -> di
 
 
 def _commitment_record(row: CommitmentRow, now: datetime) -> dict[str, Any]:
+    from ling.domains.goals.service import commitment_source_ref
+
+    source = commitment_source_ref(row.source_event_ids)
     return {
         "memory_id": row.id,
         "kind": "plan",
@@ -139,7 +143,7 @@ def _commitment_record(row: CommitmentRow, now: datetime) -> dict[str, Any]:
         "superseded_by": None,
         "source_event_ids": [*row.source_event_ids, f"commitment:{row.id}"],
         "source_role": "actor_commitment",
-        "source_message_id": row.source_event_ids[0].removeprefix("message:"),
+        "source_message_id": source.removeprefix("message:") if source else None,
         "source_window_id": row.window_id,
         "created_at": _iso(row.created_at),
         "due_at": _iso(row.due_at),

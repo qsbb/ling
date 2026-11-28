@@ -38,7 +38,7 @@ from ling.domains.evidence import (
     evidence_kind_from_origin,
     parse_completion_evidence,
 )
-from ling.infra.models import ActivityRow, utcnow
+from ling.infra.models import ActivityRow, ScheduleSegmentRow, utcnow
 from ling.infra.security import new_id
 
 VALID_STATES = {"proposed", "running", "paused", "completed", "failed", "cancelled"}
@@ -194,16 +194,23 @@ class ActivityService:
                 "标记 completed 必须提供完成证据（completion_evidence）："
                 "计划不等于完成，不能仅凭自称就标记做完"
             )
+        kind = self._resolve_evidence_kind(row, evidence_kind) if completion_evidence else None
+        if kind is EvidenceKind.simulated_outcome and (
+            to_state != "completed" or row.origin != "simulated" or row.started_at is None
+        ):
+            raise InvalidTransition("只有已经开始的模拟活动可取得模拟完成结果")
         moment = now or utcnow()
         row.state = to_state
         if to_state == "running" and row.started_at is None:
             row.started_at = moment
         if to_state in {"completed", "failed", "cancelled"}:
             row.ended_at = moment
-        if completion_evidence:
+        if completion_evidence and kind is not None:
+            if kind is EvidenceKind.simulated_outcome and row.simulation_observed_at is None:
+                row.simulation_observed_at = moment
+                row.simulation_action = completion_evidence[:120]
             row.completion_evidence = encode_completion_evidence(
-                self._resolve_evidence_kind(row, evidence_kind),
-                completion_evidence,
+                kind, completion_evidence,
             )[:1000]
         if checkpoint is not None:
             row.checkpoint = dict(checkpoint)
@@ -245,7 +252,9 @@ class ActivityService:
             query = query.where(ActivityRow.visibility == visibility)
         row = (
             await self._session.execute(
-                query.order_by(ActivityRow.updated_at.desc()).limit(1)
+                query.order_by(
+                    (ActivityRow.state == "running").desc(), ActivityRow.updated_at.desc(),
+                ).limit(1)
             )
         ).scalar_one_or_none()
         return self._view(row) if row else None
@@ -326,6 +335,7 @@ class ActivityService:
         origin: str = "simulated",
         source_event_ids: list[str] | None = None,
         resume: bool = True,
+        now: datetime | None = None,
     ) -> SegmentStart:
         """到段边界起活动：**按 ``schedule_segment_id`` 唯一去重**。
 
@@ -348,7 +358,7 @@ class ActivityService:
                     and existing.state == "paused"
                     and existing.origin == "simulated"
                 ):
-                    resumed = await self.transition(existing.activity_id, "running")
+                    resumed = await self.transition(existing.activity_id, "running", now=now)
                     return SegmentStart("resumed", resumed)
                 return SegmentStart("existing", existing)
             proposed = await self.propose(
@@ -359,11 +369,54 @@ class ActivityService:
                 source_event_ids=source_event_ids,
                 schedule_segment_id=segment_id,
             )
-            running = await self.transition(proposed.activity_id, "running")
+            running = await self.transition(proposed.activity_id, "running", now=now)
             return SegmentStart("created", running)
 
+    async def advance_simulation(
+        self, segment_id: str, *, now: datetime, active: bool,
+    ) -> str | None:
+        """Persist a simulated action during a live segment and settle it at the boundary."""
+        async with _SegmentLock(self._session, segment_id):
+            segment = await self._session.get(
+                ScheduleSegmentRow, segment_id, with_for_update=True, populate_existing=True,
+            )
+            if segment is None or segment.actor_id != self._actor_id:
+                return None
+            view = await self.activity_for_segment(segment_id)
+            if view is None or view.origin != "simulated" or view.state not in {"running", "paused"}:
+                return None
+            row = await self._session.get(ActivityRow, view.activity_id, with_for_update=True, populate_existing=True)
+            if row is None:
+                return None
+            if segment.status != "current":
+                await self.transition(
+                    view.activity_id, "cancelled", now=now,
+                    checkpoint={**view.checkpoint, "reason_code": f"segment_{segment.status}"},
+                )
+                return "cancelled"
+            if active and view.state == "running" and segment.start_at <= now < segment.end_at:
+                if view.started_at is not None and view.started_at < now and row.simulation_observed_at is None:
+                    row.simulation_observed_at = now
+                    row.simulation_action = segment.title
+                    await self._session.flush()
+                    return "progressed"
+                return None
+            if (
+                view.state == "running" and row.simulation_action and row.simulation_observed_at is not None
+                and segment.start_at <= row.simulation_observed_at < segment.end_at <= now
+            ):
+                await self.transition(
+                    view.activity_id, "completed",
+                    completion_evidence=f"模拟生活中已进行「{row.simulation_action}」",
+                    evidence_kind=EvidenceKind.simulated_outcome,
+                    checkpoint={**view.checkpoint, "reason_code": "simulation_completed"},
+                    now=segment.end_at,
+                )
+                return "completed"
+            return None
+
     async def end_schedule_window(
-        self, segment_id: str, *, detail: str = "计划时段已结束"
+        self, segment_id: str, *, detail: str = "计划时段已结束", now: datetime | None = None,
     ) -> SegmentWindowEnd:
         """计划时段结束：``running → paused``、``proposed → cancelled``。
 
@@ -381,6 +434,7 @@ class ActivityService:
             paused = await self.transition(
                 view.activity_id,
                 "paused",
+                now=now,
                 checkpoint={
                     **dict(view.checkpoint or {}),
                     "reason_code": SEGMENT_END_REVIEW,
@@ -390,7 +444,7 @@ class ActivityService:
             )
             return SegmentWindowEnd("paused", SEGMENT_END_REVIEW, paused)
         if view.state == "proposed":
-            cancelled = await self.transition(view.activity_id, "cancelled")
+            cancelled = await self.transition(view.activity_id, "cancelled", now=now)
             return SegmentWindowEnd("cancelled", SEGMENT_END_REVIEW, cancelled)
         # paused / 终态：边界已处理过，不重复写（幂等）。
         return SegmentWindowEnd("noop", SEGMENT_END_REVIEW, view)

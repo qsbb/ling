@@ -39,6 +39,7 @@ __all__ = [
     "PENDING_MARKER_RE",
     "strip_all_markers",
     "strip_bracket_tags",
+    "strip_context_bracket_tags",
     "stream_safe_all",
     "stream_safe_brackets",
 ]
@@ -107,45 +108,20 @@ def strip_all_markers(text: str) -> str:
 #: 所以 `[` 之后**只要还可能是某个标签的前缀**就继续扣；一旦出现任何不可能的字
 #: （`[1]`、`[链接]`、`[CQ:`），立刻判定"这不是标签"并**原样放出**。
 #:
-#: ## 这份前缀表从哪来
-#:
-#: 与解析器认的三个关键字同源：`expression_choice._MARKER` 认 `at|quote|poke`。
-#: 改解析器而漏改这里，后果是"流式先漏出标记、落库时才消失"——**用户可见**，
-#: 所以 `tests/unit/test_expression_stream_filter.py` 里有一条守卫测试把两边
-#: 对齐（从解析器自己的正则里取关键字，而不是在这份表里再抄一遍）。
-_BRACKET_PREFIXES: tuple[str, ...] = (
-    "[a",
-    "[at",
-    "[at:",
-    "[q",
-    "[qu",
-    "[quo",
-    "[quot",
-    "[quote",
-    "[quote:",
-    "[p",
-    "[po",
-    "[pok",
-    "[poke",
-    "[poke:",
-)
+_CONTEXT_BRACKET_KEYWORDS = ("msg_id", "recall")
+_ACTION_BRACKET_KEYWORDS = ("at", "quote", "poke")
+_BRACKET_ALTERNATIVES = "|".join((*_ACTION_BRACKET_KEYWORDS, *_CONTEXT_BRACKET_KEYWORDS))
+_BRACKET_PREFIXES: tuple[str, ...] = tuple(f"[{keyword}:" for keyword in _ACTION_BRACKET_KEYWORDS)
+_CONTEXT_BRACKET_PREFIXES = tuple(f"[{keyword}:" for keyword in _CONTEXT_BRACKET_KEYWORDS)
 
 #: 已闭合的完整方括号标签（**只用于"该不该剥"的形状判定**）。
 #:
 #: 合法性与目标校验仍归 `parse_expression`。这里刻意**宽松**（`IGNORECASE`、
 #: 参数不校验形状）：`[at:abc]`、`[AT:123]` 正是最该被挡住的说明书，流式出口
 #: 的任务只是"别把说明书推给用户"。**两件事不要在这里合并。**
-_BRACKET_CLOSED_RE = re.compile(r"\[(?:at|quote|poke)\s*:[^\]\n]*\]", re.IGNORECASE)
-
-#: **仍在关键字区**：`[` + 关键字的一部分 + 可选空格/冒号，然后**就结束了**。
-#:
-#: 匹配 `[`、`[a`、`[at`、`[at `、`[at :`、`[quo`、`[poke:`……
-#: **不匹配** `[abc`——那是 `[a` 后面接 `bc`，而 `[at` 写完必须是空格/冒号
-#: 或结尾。这条反向断言是"普通正文不许丢 `[`"的落地：`[abc] 是参考` 这样的
-#: 正文不能被当成"还在写标签"永久扣住。
-_BRACKET_KEYWORD_TAIL_RE = re.compile(
-    r"\[(?:a|at|q|qu|quo|quot|quote|p|po|pok|poke)[ \t]*:?[ \t]*$",
-    re.IGNORECASE,
+_BRACKET_CLOSED_RE = re.compile(rf"\[(?:{_BRACKET_ALTERNATIVES})\s*:[^\]\n]*\]", re.IGNORECASE)
+_CONTEXT_BRACKET_RE = re.compile(
+    rf"\[(?:{'|'.join(_CONTEXT_BRACKET_KEYWORDS)})[ \t]*:[^\]\n]*(?:\]|$)", re.IGNORECASE
 )
 
 #: **已进入参数区**：关键字与冒号都写完，参数还在一个字一个字到。
@@ -156,7 +132,9 @@ _BRACKET_KEYWORD_TAIL_RE = re.compile(
 #:
 #: ``{0,80}`` 封顶与解析器候选式同源：不封顶的话一个永远不闭合的 `[at:` + 长文
 #: 会被**永久扣住**（暂扣尾巴只在闭合时释放），那是把正文吞掉的另一种方式。
-_BRACKET_ARGS_TAIL_RE = re.compile(r"\[(?:at|quote|poke)[ \t]*:[^\]\n]{0,80}$", re.IGNORECASE)
+_BRACKET_ARGS_TAIL_RE = re.compile(
+    rf"\[(?:{_BRACKET_ALTERNATIVES})[ \t]*:[^\]\n]{{0,80}}$", re.IGNORECASE
+)
 
 
 def _is_pending_bracket_tail(tail: str) -> bool:
@@ -173,9 +151,8 @@ def _is_pending_bracket_tail(tail: str) -> bool:
 
     两条显式断言的结果:**是标签中间**才扣，否则调用方原样放行。
     """
-    if any(prefix.startswith(tail) for prefix in _BRACKET_PREFIXES):
-        return True
-    if _BRACKET_KEYWORD_TAIL_RE.match(tail):
+    keyword_tail = tail.lower().rstrip(" \t")
+    if any(prefix.startswith(keyword_tail) for prefix in (*_BRACKET_PREFIXES, *_CONTEXT_BRACKET_PREFIXES)):
         return True
     return _BRACKET_ARGS_TAIL_RE.match(tail) is not None
 
@@ -220,7 +197,7 @@ def stream_safe_brackets(text: str) -> tuple[str, str]:
 
 
 def strip_bracket_tags(text: str) -> str:
-    """剥掉方括号动作标签（`[at:…]` / `[quote:…]` / `[poke:…]`）。流式出口用。
+    """剥掉方括号动作标签和上下文注记。流式出口用。
 
     ## 为什么流式出口**必须**剥它
 
@@ -243,3 +220,8 @@ def strip_bracket_tags(text: str) -> str:
     if not text or "[" not in text:
         return text
     return _BRACKET_CLOSED_RE.sub("", text)
+
+
+def strip_context_bracket_tags(text: str) -> str:
+    """Remove copied prompt annotations while leaving action tags for the parser."""
+    return _CONTEXT_BRACKET_RE.sub("", text)

@@ -496,6 +496,7 @@ export function isLiveNow(fact: LifeTimelineFact, now: Date): boolean {
  */
 export function factStateLabel(fact: LifeTimelineFact, now: Date): string {
   if (fact.state === 'running') return isLiveNow(fact, now) ? '进行中' : '记录在此停下';
+  if (fact.state === 'cancelled') return '已取消';
   return evidenceLabel(fact.evidence_kind);
 }
 
@@ -505,6 +506,8 @@ export function evidenceLabel(evidenceKind: string): string {
       return '时间到了';
     case 'observed':
       return '做过';
+    case 'simulated_outcome':
+      return '模拟活动已完成';
     case 'user_confirmed':
       return '做过（你确认过）';
     default:

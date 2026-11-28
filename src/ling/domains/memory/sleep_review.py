@@ -9,6 +9,7 @@ from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import (
+    LifeReviewEntry,
     Origin,
     SleepReviewItem,
     SleepReviewNight,
@@ -17,10 +18,24 @@ from ling.contracts.v1 import (
     TurnState,
     Visibility,
 )
+from ling.domains.evidence import EvidenceKind, parse_completion_evidence
 from ling.domains.memory.consolidate import recent_consolidations
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.service import MemoryAudience, MemoryHit, MemoryService
-from ling.infra.models import MemoryRow, Message, Turn, Window, utcnow
+from ling.infra.models import (
+    ActivityRow,
+    DreamReportRow,
+    IntentRow,
+    MemoryConsolidationRow,
+    MemoryRow,
+    Message,
+    RelationshipEvent,
+    ScheduleSegmentRow,
+    SleepSettlementRow,
+    Turn,
+    Window,
+    utcnow,
+)
 from ling.ports.config import MemoryPolicy
 
 _MAX_ITEMS = 5
@@ -77,7 +92,7 @@ async def capture_review_ids(
 
 async def read_sleep_reviews(
     session: AsyncSession, *, actor_id: str, subject_id: str, policy: MemoryPolicy,
-    audience_type: type[MemoryAudience],
+    audience_type: type[MemoryAudience], include_life: bool = False,
 ) -> SleepReviewsOut:
     nights = await recent_consolidations(session, actor_id=actor_id, subject_id=subject_id)
     if await has_open_purge(session, subject_id=subject_id):
@@ -123,5 +138,81 @@ async def read_sleep_reviews(
             "rows_archived": night.rows_archived,
             "review_status": status,
             "items": items,
+            "life": await _night_life(session, night, audience_type=audience_type) if include_life else [],
         }))
     return SleepReviewsOut(nights=entries)
+
+
+async def _night_life(
+    session: AsyncSession, night: MemoryConsolidationRow, *, audience_type: type[MemoryAudience],
+) -> list[LifeReviewEntry]:
+    end = night.review_bedtime
+    if end is None:
+        settled = await session.get(SleepSettlementRow, (night.actor_id, night.sleep_date))
+        end = settled.bed_at if settled is not None else None
+    entries: list[LifeReviewEntry] = []
+    dream = await session.scalar(select(DreamReportRow).where(
+        DreamReportRow.actor_id == night.actor_id, DreamReportRow.sleep_date == night.sleep_date,
+        DreamReportRow.status == "ready",
+    ))
+    if dream is not None and (dream.narrative or dream.title):
+        entries.append(LifeReviewEntry(
+            kind="dream", source_id=dream.id, text=(dream.narrative or dream.title or "")[:300], status="simulated",
+        ))
+    if end is None:
+        return entries
+
+    start = end - timedelta(days=1)
+    activity_rows = await session.scalars(select(ActivityRow).where(
+        ActivityRow.actor_id == night.actor_id,
+        ActivityRow.ended_at >= start, ActivityRow.ended_at < end,
+        ActivityRow.visibility.in_(("public", "subject_private", "actor_private")),
+    ).order_by(ActivityRow.ended_at.desc(), ActivityRow.id).limit(12))
+    for activity in activity_rows:
+        evidence, details = parse_completion_evidence(activity.completion_evidence)
+        if activity.state == "completed" and evidence is not EvidenceKind.clock_only:
+            entries.append(LifeReviewEntry(
+                kind="activity", source_id=activity.id, text=details, status=evidence.value, at=activity.ended_at,
+            ))
+        elif activity.state == "cancelled" and activity.schedule_segment_id:
+            segment = await session.get(ScheduleSegmentRow, activity.schedule_segment_id)
+            if segment is not None and segment.actor_id == night.actor_id:
+                entries.append(LifeReviewEntry(
+                    kind="plan", source_id=segment.id, text=segment.title, status="cancelled", at=activity.ended_at,
+                ))
+    statements = await session.execute(select(RelationshipEvent, Message).join(
+        Message, RelationshipEvent.source_event_ids[0].as_string() == ("message:" + Message.id),
+    ).join(Window, Window.id == Message.window_id).where(
+        RelationshipEvent.actor_id == night.actor_id, RelationshipEvent.subject_id == night.subject_id,
+        RelationshipEvent.kind.in_(("impression", "clarification")), RelationshipEvent.note.is_not(None),
+        Window.actor_id == night.actor_id, Window.subject_id == night.subject_id,
+        Window.visibility == _PRIVATE, Window.archived.is_(False), Message.created_at >= start,
+        Message.created_at < end, Message.memory_hidden_at.is_(None), Message.retracted_at.is_(None),
+        or_(
+            (RelationshipEvent.kind == "impression") & (Message.role == "actor"),
+            (RelationshipEvent.kind == "clarification") & (Message.role == "user")
+            & (Message.sender_subject_id == night.subject_id),
+        ),
+        Message.recalled_at.is_(None),
+    ).order_by(Message.created_at.desc(), Message.id).limit(4))
+    for event, message in statements:
+        kind: Literal["impression", "clarification"] = "impression" if event.kind == "impression" else "clarification"
+        audience = await audience_type.freeze(
+            session, subject_id=night.subject_id, window_id=message.window_id, window_visibility=_PRIVATE,
+        )
+        if event.note and audience.allows_long_term_memory():
+            entries.append(LifeReviewEntry(
+                kind=kind, source_id=message.id, window_id=message.window_id,
+                text=event.note, status=event.origin, at=message.created_at,
+            ))
+    intentions = await session.scalars(select(IntentRow).where(
+        IntentRow.actor_id == night.actor_id, IntentRow.subject_id.is_(None),
+        IntentRow.visibility.in_(("actor_private", "public")), IntentRow.state == "open",
+        IntentRow.created_at >= start, IntentRow.created_at < end,
+        IntentRow.source_kind == "self",
+    ).order_by(IntentRow.created_at.desc(), IntentRow.id).limit(3))
+    entries.extend(LifeReviewEntry(
+        kind="intention", source_id=intent.id, text=intent.goal[:240],
+        status="open", at=intent.created_at,
+    ) for intent in intentions)
+    return entries

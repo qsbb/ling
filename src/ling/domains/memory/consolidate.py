@@ -145,6 +145,7 @@ async def consolidate_night(
         from ling.domains.memory.sleep_review import capture_review_ids
 
         # 索引与归档在同一事务提交。索引异常时让 outbox 正常重试。
+        row.review_bedtime = review_bedtime
         row.review_memory_ids = await capture_review_ids(
             session, actor_id=actor_id, subject_id=subject_id, bedtime=review_bedtime, now=moment,
         )

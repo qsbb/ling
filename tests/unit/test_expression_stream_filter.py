@@ -28,6 +28,7 @@ from ling.kernel.marker_stream import (
     stream_safe_brackets,
     strip_all_markers,
     strip_bracket_tags,
+    strip_context_bracket_tags,
 )
 
 
@@ -138,6 +139,14 @@ def test_complete_tag_is_stripped_not_released() -> None:
     assert "at" not in visible or "[at" not in visible, visible
     assert "[at" not in visible, f"标签被放出去了：{visible!r}"
     assert "你好" in visible or "你好" in hold, f"正文丢了：{visible!r} / {hold!r}"
+
+
+@pytest.mark.parametrize("marker", ["[msg_id:100200300]", "[recall:r123456]"])
+def test_copied_context_annotation_is_removed_from_stream_and_reply(marker: str) -> None:
+    text = f"[1] {marker}你好[quote:100200300]"
+    assert _stream(list(text)) == ("[1] 你好", "")
+    assert strip_context_bracket_tags(text) == "[1] 你好[quote:100200300]"
+    assert strip_context_bracket_tags(f"你好{marker[:-1]}") == "你好"
 
 
 # ---------------------------------------------------------------- 3. 只扣可能的前缀

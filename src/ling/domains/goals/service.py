@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import ColumnElement, SQLColumnExpression, delete, func, or_, select
+from sqlalchemy import ColumnElement, SQLColumnExpression, and_, case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.api.errors import not_found
@@ -35,8 +36,28 @@ COMMITMENT_STATES = {"active", "delivered", "missed", "cancelled", "undeliverabl
 PENDING_COMMITMENT_STATES = ("active",)
 
 
+def commitment_source_ref(source_event_ids: Sequence[str]) -> str | None:
+    if not source_event_ids:
+        return None
+    first = source_event_ids[0]
+    if first.startswith("message:"):
+        return first
+    if first.startswith("turn:") and len(source_event_ids) > 1 and source_event_ids[1].startswith("message:"):
+        return source_event_ids[1]
+    return None
+
+
+def _commitment_source_ref_sql() -> ColumnElement[str | None]:
+    first = CommitmentRow.source_event_ids[0].as_string()
+    second = CommitmentRow.source_event_ids[1].as_string()
+    return case(
+        (first.startswith("message:"), first),
+        (first.startswith("turn:") & second.startswith("message:"), second),
+    )
+
+
 def conversation_commitment() -> ColumnElement[bool]:
-    return func.coalesce(CommitmentRow.source_event_ids[0].as_string().startswith("message:"), False)
+    return _commitment_source_ref_sql().is_not(None)
 
 
 def _after_latest_memory_forget(subject_id: str | SQLColumnExpression[str]) -> ColumnElement[bool]:
@@ -48,15 +69,34 @@ def _after_latest_memory_forget(subject_id: str | SQLColumnExpression[str]) -> C
 
 
 def commitment_source_available() -> ColumnElement[bool]:
-    return select(Message.id).join(Window, Window.id == Message.window_id).where(
-        CommitmentRow.source_event_ids[0].as_string() == func.concat("message:", Message.id),
+    first = CommitmentRow.source_event_ids[0].as_string()
+    actor_origin = and_(
+        first.startswith("message:"),
         func.btrim(Message.text, " \n\r\t") == CommitmentRow.text,
+        completed_actor_message(),
+    )
+    user_origin = and_(
+        Message.turn_id.is_not(None), first == func.concat("turn:", Message.turn_id),
+        _user_commitment_source(CommitmentRow.subject_id),
+    )
+    return select(Message.id).join(Window, Window.id == Message.window_id).where(
+        _commitment_source_ref_sql() == func.concat("message:", Message.id),
         Message.window_id == CommitmentRow.window_id,
         Window.subject_id == CommitmentRow.subject_id,
         Window.actor_id == CommitmentRow.actor_id,
         Window.visibility.in_(("subject_private", "window_private")),
-        completed_actor_message(), _after_latest_memory_forget(CommitmentRow.subject_id),
+        Window.archived.is_(False),
+        or_(actor_origin, user_origin), _after_latest_memory_forget(CommitmentRow.subject_id),
     ).correlate(CommitmentRow).exists()
+
+
+def _user_commitment_source(subject_id: str | SQLColumnExpression[str]) -> ColumnElement[bool]:
+    return and_(
+        Message.role == "user", Message.sender_subject_id == subject_id,
+        Message.state == "completed", Message.text != "",
+        Message.retracted_at.is_(None), Message.memory_hidden_at.is_(None),
+        Message.recalled_at.is_(None),
+    )
 
 
 def readable_commitment() -> ColumnElement[bool]:
@@ -99,7 +139,7 @@ async def forget_conversation_commitments(
         )
         targets = targets.where(
             CommitmentRow.window_id == window_id,
-            CommitmentRow.source_event_ids[0].as_string().in_(turn_sources),
+            _commitment_source_ref_sql().in_(turn_sources),
         )
     await session.execute(targets)
 
@@ -226,6 +266,7 @@ class GoalsService:
         timezone: str = "Asia/Shanghai",
         window_id: str | None = None,
         source_event_ids: list[str] | None = None,
+        user_message_id: str | None = None,
     ) -> CommitmentView:
         if due_at.tzinfo is None:
             raise ValueError("承诺到期时间必须带时区")
@@ -237,22 +278,35 @@ class GoalsService:
                 window_id=window_id, subject_id=subject_id
             )
         sources = list(source_event_ids or [])
-        if any(ref.startswith("message:") for ref in sources):
+        if user_message_id is not None or any(ref.startswith("message:") for ref in sources):
             from ling.domains.memory.service import has_open_purge
 
             await self._session.execute(select(Subject.id).where(Subject.id == subject_id).with_for_update())
-            if len(sources) != 1 or not sources[0].startswith("message:") or not window_id:
+            if not window_id:
                 raise ValueError("请选择原始会话中的一条承诺发言")
-            source = await self._session.scalar(select(Message).join(Window, Window.id == Message.window_id).where(
-                Message.id == sources[0].removeprefix("message:"), Message.window_id == window_id,
-                Window.visibility.in_(("window_private", "subject_private")), completed_actor_message(),
+            query = select(Message).join(Window, Window.id == Message.window_id).where(
+                Message.window_id == window_id, Window.subject_id == subject_id,
+                Window.visibility.in_(("window_private", "subject_private")), Window.archived.is_(False),
                 _after_latest_memory_forget(subject_id),
-            ).with_for_update(of=Message))
+            )
+            if user_message_id is not None:
+                query = query.where(
+                    Message.id == user_message_id, Message.turn_id.is_not(None),
+                    _user_commitment_source(subject_id),
+                )
+            else:
+                if len(sources) != 1 or not sources[0].startswith("message:"):
+                    raise ValueError("请选择原始会话中的一条承诺发言")
+                query = query.where(Message.id == sources[0].removeprefix("message:"), completed_actor_message())
+            source = await self._session.scalar(query.with_for_update(of=Message))
             if (
-                source is None or not text.strip() or source.text.strip() != text.strip()
+                source is None or not text.strip()
+                or (user_message_id is None and source.text.strip() != text.strip())
                 or await has_open_purge(self._session, subject_id=subject_id)
             ):
                 raise ValueError("承诺需与可用的原始发言一致")
+            if user_message_id is not None:
+                sources = [f"turn:{source.turn_id}", f"message:{source.id}"]
 
         row = CommitmentRow(
             id=new_id("cmt"),
@@ -332,6 +386,8 @@ class GoalsService:
             row.state = "undeliverable"
         elif delivery_state == "failed":
             row.state = "missed"
+        elif delivery_state == "uncertain":
+            row.state = "uncertain"
         row.updated_at = utcnow()
         await self._session.flush()
         return self._commitment_view(row)
@@ -423,5 +479,5 @@ class GoalsService:
             delivery_state=row.delivery_state,
             cancel_reason=row.cancel_reason,
             window_id=row.window_id,
-            conversation_source=bool(row.source_event_ids and row.source_event_ids[0].startswith("message:")),
+            conversation_source=commitment_source_ref(row.source_event_ids or ()) is not None,
         )

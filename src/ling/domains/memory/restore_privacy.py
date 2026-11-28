@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.domains.memory.forget_source import apply_import_forget, apply_source_forget
 from ling.domains.memory.purge import purge_subject, request_purge
-from ling.infra.models import MemorySourceForgetMarker, Message, Subject
+from ling.infra.models import MemorySourceForgetMarker, Message, Subject, Window
 
 
 class ForgottenSource(BaseModel):
@@ -55,11 +55,17 @@ async def replay_forgetting(session: AsyncSession, state: ForgetState) -> None:
     for marker in state.sources:
         saved = await session.get(MemorySourceForgetMarker, marker.message_id)
         source = await session.get(Message, marker.message_id)
-        if source is not None and (
-            source.role != "user" or source.sender_subject_id != marker.subject_id
-            or source.window_id != marker.window_id or source.turn_id != marker.turn_id
-        ):
-            raise ValueError("restored_memory_source_identity_mismatch")
+        if source is not None:
+            window = await session.get(Window, source.window_id)
+            private = (
+                window is not None and window.subject_id == marker.subject_id
+                and window.visibility in {"subject_private", "window_private"}
+            )
+            owner = (
+                source.role == "user" and source.sender_subject_id == marker.subject_id
+            ) or (private and source.role in {"user", "actor"} and source.sender_subject_id is None)
+            if not owner or source.window_id != marker.window_id or (source.turn_id or source.id) != marker.turn_id:
+                raise ValueError("restored_memory_source_identity_mismatch")
         if saved is not None and (source is None or source.memory_hidden_at is not None):
             continue
         await apply_source_forget(session, **marker.model_dump())

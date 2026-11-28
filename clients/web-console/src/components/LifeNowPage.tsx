@@ -11,6 +11,7 @@ import { activityKind, LifeDay } from './LifeDay';
 import { AlertIcon, ArrowLeftIcon, RefreshIcon, SettingsIcon } from './Icons';
 import { ProactiveDraft } from './ProactiveDraft';
 import { ProactiveHistory } from './ProactiveHistory';
+import { ContinuityControls } from './ContinuityControls';
 import '../life-day.css';
 
 const ACTIVITY_STATES: Record<string, string> = {
@@ -21,6 +22,7 @@ const ACTIVITY_STATES: Record<string, string> = {
 function LifeRecords({ activity }: { activity: ActivityResponse | null }) {
   const [records, setRecords] = useState<{ goals: GoalsResponse; proactive: ProactiveResponse } | null>(null);
   const [error, setError] = useState<ExplainedError | null>(null);
+  const [cancelling, setCancelling] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -66,6 +68,7 @@ function LifeRecords({ activity }: { activity: ActivityResponse | null }) {
       {proactive ? (
         <>
           <h2 className="life-section">主动联系</h2>
+          <ContinuityControls onChanged={load} />
           {!proactive.gate && proactive.gate_reasons.length > 0 ? (
             <p className="page__hint">{proactive.gate_reasons.join('；')}</p>
           ) : null}
@@ -80,6 +83,20 @@ function LifeRecords({ activity }: { activity: ActivityResponse | null }) {
                     <span className="life-list__main"><ProactiveDraft item={item} /></span>
                     <span className="life-list__meta">
                       {item.reason}<br />{item.kind} · 到 {formatSessionTime(item.expires_at)}
+                      {proactive.recent?.some((record) => record.opportunity_id === item.opportunity_id && record.activity_id) ? (
+                        <button type="button" className="button button--small" disabled={cancelling !== null}
+                          onClick={async () => {
+                            setCancelling(item.opportunity_id);
+                            try {
+                              await api.cancelProactiveShare(item.opportunity_id);
+                              await load();
+                            } catch (cause) {
+                              setError(explainError(cause));
+                            } finally {
+                              setCancelling(null);
+                            }
+                          }}>撤销分享</button>
+                      ) : null}
                     </span>
                   </li>
                 ))}

@@ -86,3 +86,59 @@ async def recall_shared_arrangement(
             for hit in hits for ref in hit.source_event_ids if ref.startswith("message:")
         )
     return render_evidence(hits) or empty
+
+
+async def recall_experience(
+    args: dict[str, Any], *, audience: AudienceSnapshot, current_turn_id: str | None = None,
+) -> str:
+    """Look up a topic or time within the authenticated speaker's current window."""
+    from datetime import UTC, datetime, timedelta
+
+    from ling.domains.memory.experience import (
+        asks_for_earliest,
+        render_experience,
+        search_facts,
+        search_originals,
+    )
+
+    query = args.get("query", "")
+    mode = args.get("mode", "originals")
+    if not isinstance(query, str) or not query.strip() or len(query) > 160:
+        raise ValueError("请输入要核对的话题。")
+    if mode not in {"originals", "past", "current"}:
+        raise ValueError("选择原话、过去的事实或当前事实。")
+    at = None
+    if raw_date := args.get("date"):
+        if not isinstance(raw_date, str) or len(raw_date) != 10:
+            raise ValueError("日期格式为 YYYY-MM-DD。")
+        at = datetime.fromisoformat(raw_date).replace(tzinfo=UTC)
+    if not audience.allows_long_term_memory():
+        return "当前窗口没有可用的原话证据。"
+    async with session_scope() as session:
+        window = await session.get(Window, audience.window_id)
+        if window is None or window.archived or window.visibility != audience.window_visibility:
+            return "当前窗口没有可用的原话证据。"
+        current = await AudienceSnapshot.freeze(
+            session, subject_id=audience.subject_id, window_id=window.id,
+            window_visibility=window.visibility, whole_group_source_ids=audience.whole_group_source_ids,
+        )
+        policy = await published_memory_policy(session)
+        if not current.allows_long_term_memory() or policy.max_injected_memories <= 0:
+            return "当前窗口没有可用的原话证据。"
+        if mode == "originals":
+            result = await search_originals(
+                session, window=window, subject_id=audience.subject_id, query=query,
+                retention_days=policy.max_retention_days, group_source_ids=current.whole_group_source_ids,
+                since=at, before=at + timedelta(days=1) if at else None,
+                earliest=asks_for_earliest(query), current_turn_id=current_turn_id,
+            )
+        else:
+            slot = args.get("slot")
+            if slot not in {"likes", "works_at", "lives_in"}:
+                raise ValueError("请指定要回查的事实类型。")
+            result = await search_facts(
+                session, window=window, subject_id=audience.subject_id, slot=slot, mode=mode,
+                retention_days=policy.max_retention_days, group_source_ids=current.whole_group_source_ids,
+                at=at,
+            )
+    return render_experience(result)

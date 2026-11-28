@@ -108,6 +108,7 @@
       "created_at": "string",
       "dropped_items": "integer",
       "expires_at": "string",
+      "memory_recall": "null",
       "message_id": "string",
       "model": {
         "config_revision": "integer",
@@ -195,6 +196,7 @@
       "created_at": "null",
       "dropped_items": "integer",
       "expires_at": "null",
+      "memory_recall": "null",
       "message_id": "string",
       "model": "null",
       "note": "string",

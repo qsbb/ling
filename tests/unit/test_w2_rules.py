@@ -402,11 +402,34 @@ def test_relationship_event_effects_cover_known_kinds() -> None:
         "repair",
         "boundary",
         "disclosure",
+        "impression",
+        "clarification",
+        "apology",
+        "fulfillment",
+        "breach",
     }
 
 
 def test_origin_enum_has_six_sources() -> None:
     assert len(list(Origin)) == 6
+
+
+def test_verbatim_recall_distinguishes_history_from_another_request() -> None:
+    from ling.domains.memory.experience import OriginalSearch, needs_direct_original
+
+    no_match = OriginalSearch("no_match", [])
+    assert needs_direct_original(no_match, "我上次讲旧书店的原话是什么？")
+    assert not needs_direct_original(no_match, "昨天我说过什么")
+    assert not needs_direct_original(no_match, "这段原文能翻译吗？")
+    assert not needs_direct_original(no_match, "你最初说的原话是什么？")
+
+
+def test_preference_lookup_requires_a_question_about_the_user() -> None:
+    from ling.domains.memory.experience import fact_query
+
+    assert fact_query("你记得我现在喜欢的是哪条街吗？") == ("likes", "current")
+    assert fact_query("我以前喜欢的是哪条街？") == ("likes", "past")
+    assert fact_query("你现在喜欢的是哪条街？") is None
 
 
 # ------------------------------------------------------------------ 发言仲裁

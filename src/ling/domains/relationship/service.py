@@ -26,6 +26,11 @@ EVENT_EFFECTS: dict[str, tuple[float, float]] = {
     "repair": (0.01, 0.03),
     "boundary": (0.0, 0.0),
     "disclosure": (0.02, 0.03),
+    "impression": (0.0, 0.0),
+    "clarification": (0.0, 0.0),
+    "apology": (0.0, 0.01),
+    "fulfillment": (0.01, 0.03),
+    "breach": (0.0, -0.06),
 }
 
 AMBIGUOUS_ORIGINS = {Origin.model_inference}
@@ -100,6 +105,7 @@ class RelationshipService:
         weight: float = 1.0,
         apply_to_projection: bool = True,
         turn_id: str | None = None,
+        occurred_at: datetime | None = None,
     ) -> RelationshipEvent:
         """记录互动事件。
 
@@ -133,7 +139,7 @@ class RelationshipService:
             origin=origin.value,
             source_event_ids=list(source_event_ids),
             note=note,
-            occurred_at=utcnow(),
+            occurred_at=occurred_at or utcnow(),
             turn_id=turn_id,
         )
         self._session.add(row)

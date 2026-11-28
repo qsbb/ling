@@ -37,7 +37,11 @@ from ling.domains.activity.service import ActivityService, InvalidTransition
 from ling.domains.affect.service import AffectService
 from ling.domains.consent.service import KNOWN_SCOPES, ConsentService
 from ling.domains.conversation.service import ConversationService, completed_actor_message
-from ling.domains.goals.service import GoalsService, commitment_source_available
+from ling.domains.goals.service import (
+    GoalsService,
+    commitment_source_available,
+    commitment_source_ref,
+)
 from ling.domains.knowledge.service import PROCEDURE_SOURCE_SLOT, KnowledgeService
 from ling.domains.memory.entities import ObjectKind
 from ling.domains.memory.library import LibraryKind, memory_record, read_library
@@ -107,6 +111,32 @@ class MemoryObjectAnnotation(BaseModel):
 
 class MemoryPin(BaseModel):
     pinned: bool
+
+
+class ConversationMemoryPin(BaseModel):
+    window_id: str = Field(min_length=1, max_length=64)
+    message_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/memory/pin")
+async def pin_conversation_message(
+    body: ConversationMemoryPin, auth: CurrentAuth, session: DbSession,
+    config: ConfigDep, settings: SettingsDep,
+) -> dict:
+    from ling.domains.memory.experience import pin_message
+    from ling.infra.models import Window
+
+    subject_id = auth.user.subject_id
+    window = await session.get(Window, body.window_id)
+    if window is None or window.actor_id != _actor_id(settings) or window.subject_id != subject_id:
+        raise LingError(ErrorCode.not_found, "原始发言不可用", status_code=404)
+    memory_id = await pin_message(
+        session, subject_id=subject_id, window=window, message_id=body.message_id,
+        service=MemoryService(session, policy=(await config.effective()).memory),
+    )
+    if memory_id is None:
+        raise LingError(ErrorCode.not_found, "原始发言不可用", status_code=404)
+    return {"memory_id": memory_id, "pinned": True}
 
 
 @router.get("/memory")
@@ -231,6 +261,7 @@ async def sleep_review(auth: CurrentAuth, session: DbSession, settings: Settings
     return await read_sleep_reviews(
         session, actor_id=settings.actor_id, subject_id=auth.user.subject_id,
         policy=await published_memory_policy(session), audience_type=AudienceSnapshot,
+        include_life=auth.user.role == "owner",
     )
 
 
@@ -372,8 +403,21 @@ async def read_memory_source(
     memory_id: str, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
 ) -> dict:
     """Open a retained private source under its current owner and window."""
+    from datetime import timedelta
+
+    from sqlalchemy import or_, select
+
+    from ling.domains.memory.experience import (
+        PINNED_SLOT,
+        active_message,
+        actor_delivered,
+        evidence_items,
+        related_evidence,
+        user_in,
+    )
     from ling.domains.memory.purge import has_open_purge
-    from ling.infra.models import CommitmentRow, MemoryEpisode, MemoryRow, Message, Window
+    from ling.infra.models import CommitmentRow, MemoryEpisode, MemoryRow, Message, Window, utcnow
+    from ling.settings.service import published_memory_policy
 
     missing = LingError(ErrorCode.not_found, "原始发言不可用", status_code=404)
     subject_id = auth.user.subject_id
@@ -399,35 +443,44 @@ async def read_memory_source(
                 "message_id": material.evidence_id, "window_id": material.window_id,
                 "created_at": material.created_at.isoformat(), "text": material.description,
             }
-        reply = await session.scalar(select(Message).where(
-            Message.id == plan.source_event_ids[0].removeprefix("message:"),
-            Message.window_id == plan.window_id, completed_actor_message(),
+        source_ref = commitment_source_ref(plan.source_event_ids)
+        if source_ref is None:
+            raise missing
+        statement = await session.scalar(select(Message).where(
+            Message.id == source_ref.removeprefix("message:"), Message.window_id == plan.window_id,
+            active_message(),
+            or_(completed_actor_message(), (Message.role == "user") & (Message.sender_subject_id == subject_id)),
         ))
-        if reply is None:
+        if statement is None:
             raise missing
         return {
-            "message_id": reply.id, "window_id": reply.window_id,
-            "created_at": reply.created_at.isoformat(), "text": reply.text,
+            "message_id": statement.id, "window_id": statement.window_id,
+            "created_at": statement.created_at.isoformat(), "text": statement.text, "role": statement.role,
         }
     if record.subject_id != subject_id or not record.source_message_id:
         raise missing
     if record.source_visibility not in {"subject_private", "window_private"}:
         raise missing
     window_id = record.source_window_id if isinstance(record, MemoryRow) else record.window_id
-    source = await session.get(Message, record.source_message_id)
+    window = await session.get(Window, window_id) if window_id else None
+    impression = assertion is not None and assertion.slot == ACTOR_IMPRESSION_SLOT
     if (
-        source is None or source.window_id != window_id or source.role != "user"
-        or source.sender_subject_id not in (None, subject_id) or source.retracted_at is not None
-        or source.memory_hidden_at is not None
-    ):
-        raise missing
-    window = await session.get(Window, source.window_id)
-    if (
-        window is None or window.subject_id != subject_id
+        window is None or window.archived or window.subject_id != subject_id
+        or window.actor_id != settings.actor_id
         or window.visibility not in {"subject_private", "window_private"}
+        or (window.visibility != record.source_visibility and not impression)
     ):
         raise missing
-    if assertion is not None and assertion.slot == ACTOR_IMPRESSION_SLOT:
+    eligibility = user_in(window, subject_id)
+    if assertion is not None and assertion.slot == PINNED_SLOT:
+        eligibility = or_(eligibility, actor_delivered(window))
+    source = await session.scalar(select(Message).where(
+        Message.id == record.source_message_id, Message.window_id == window.id,
+        active_message(), eligibility,
+    ))
+    if source is None:
+        raise missing
+    if impression and assertion is not None:
         if assertion.retracted or assertion.archived_at is not None:
             raise missing
         reply = await session.scalar(select(Message).where(
@@ -437,9 +490,15 @@ async def read_memory_source(
         if reply is None:
             raise missing
         source = reply
+    policy = await published_memory_policy(session)
+    rows, commitments = await related_evidence(
+        session, subject_id=subject_id, window=window, anchor=source,
+        cutoff=utcnow() - timedelta(days=policy.max_retention_days),
+    )
     return {
         "message_id": source.id, "window_id": window.id,
         "created_at": source.created_at.isoformat(), "text": source.text,
+        "role": source.role, "context": evidence_items(rows, commitments),
     }
 
 
@@ -870,6 +929,111 @@ async def create_commitment(
 # ------------------------------------------------------------------ 主动性
 
 
+class SharePauseBody(BaseModel):
+    paused: bool
+    until: datetime | None = None
+
+
+class TopicBoundaryBody(BaseModel):
+    text: str = Field(min_length=2, max_length=160)
+
+
+class RelationshipPreferenceEdit(BaseModel):
+    state: Literal["active", "disabled"]
+    text: str | None = Field(default=None, min_length=2, max_length=160)
+
+
+@router.get("/relationship/preferences")
+async def relationship_preferences(auth: CurrentAuth, session: DbSession, settings: SettingsDep) -> dict:
+    from ling.domains.relationship.preferences import preference_record, preferences, share_pause
+
+    subject_id = auth.user.subject_id
+    pause = await share_pause(session, subject_id)
+    rules = await preferences(session, actor_id=_actor_id(settings), subject_id=subject_id)
+    return {
+        "share_pause": {"paused": pause.paused, "until": pause.until},
+        "preferences": [preference_record(row) for row in rules],
+    }
+
+
+@router.put("/relationship/preferences/pause")
+async def change_share_pause(body: SharePauseBody, auth: CurrentAuth, session: DbSession) -> dict:
+    from ling.domains.relationship.preferences import set_share_pause
+
+    if body.until is not None and (
+        not body.paused or body.until.tzinfo is None or body.until <= datetime.now(UTC)
+    ):
+        raise LingError(ErrorCode.invalid_request, "暂停截止时间必须是带时区的未来时间", status_code=422)
+    pause = await set_share_pause(
+        session, auth.user.subject_id, paused=body.paused, until=body.until,
+    )
+    return {"paused": pause.paused, "until": pause.until}
+
+
+@router.delete("/proactive/{opportunity_id}")
+async def cancel_proactive_share(
+    opportunity_id: str, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
+) -> dict:
+    from ling.infra.models import ProactiveOpportunity
+
+    row = await session.get(ProactiveOpportunity, opportunity_id, with_for_update=True, populate_existing=True)
+    if row is None or row.subject_id != auth.user.subject_id or row.actor_id != _actor_id(settings) or not row.related_memory_id:
+        raise LingError(ErrorCode.not_found, "没有找到这项分享", status_code=404)
+    if row.state not in {"candidate", "drafting", "bound_candidate"}:
+        if row.state == "rejected" and row.rejected_reason == "用户撤销了这次分享":
+            return {"opportunity_id": row.id, "state": "rejected"}
+        raise LingError(ErrorCode.conflict, "这项分享已经进入处理或结算", status_code=409)
+    row.state = "rejected"
+    row.rejected_reason = "用户撤销了这次分享"
+    row.draft_text = None
+    return {"opportunity_id": row.id, "state": row.state}
+
+
+@router.post("/relationship/preferences/boundary")
+async def add_topic_boundary(
+    body: TopicBoundaryBody, auth: CurrentAuth, session: DbSession, settings: SettingsDep,
+) -> dict:
+    from ling.domains.relationship.preferences import preference_record, save_preference
+
+    try:
+        row = await save_preference(
+            session, actor_id=_actor_id(settings), subject_id=auth.user.subject_id,
+            scope="private", kind="boundary", text=body.text.strip(), state="active",
+        )
+    except ValueError as exc:
+        raise LingError(ErrorCode.invalid_request, str(exc), status_code=422) from exc
+    await RelationshipService(session, actor_id=_actor_id(settings)).record_event(
+        subject_id=auth.user.subject_id, kind="boundary", origin=Origin.user_statement,
+        source_event_ids=[f"preference:{row.id}"], apply_to_projection=False,
+    )
+    return preference_record(row)
+
+
+@router.patch("/relationship/preferences/{preference_id}")
+async def edit_relationship_preference(
+    preference_id: str, body: RelationshipPreferenceEdit,
+    auth: CurrentAuth, session: DbSession, settings: SettingsDep,
+) -> dict:
+    from ling.domains.relationship.preferences import normalize_key, preference_record
+    from ling.infra.models import Message, RelationshipPreference
+
+    row = await session.get(RelationshipPreference, preference_id, with_for_update=True)
+    if row is None or row.subject_id != auth.user.subject_id or row.actor_id != _actor_id(settings):
+        raise LingError(ErrorCode.not_found, "关系设置不可用", status_code=404)
+    if row.source_message_id is not None:
+        source = await session.get(Message, row.source_message_id)
+        if source is None or source.memory_hidden_at is not None or source.retracted_at is not None:
+            raise LingError(ErrorCode.not_found, "关系设置不可用", status_code=404)
+    if body.text is not None:
+        replacement = body.text.strip()
+        if len(normalize_key(replacement)) < 2:
+            raise LingError(ErrorCode.invalid_request, "请输入具体的话题或表达", status_code=422)
+        row.text = replacement
+    row.state = body.state
+    await session.flush()
+    return preference_record(row)
+
+
 class CommitmentCancelBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
@@ -913,6 +1077,9 @@ async def list_proactive(
 ) -> dict:
     from ling.api.deps import authorize_message_view
     from ling.domains.proactive.history import recent_opportunities
+    from ling.domains.relationship.preferences import share_pause
+    from ling.infra.models import ProactiveOpportunity, utcnow
+    from ling.kernel.continuity_sharing import share_evidence
 
     operator = authorize_message_view(auth, view)
     service = ProactivityService(session, actor_id=_actor_id(settings))
@@ -920,7 +1087,10 @@ async def list_proactive(
         effective_dialogue = (await config.effective()).dialogue
     except Exception:  # noqa: BLE001 - 读不到配置就按"未开启"报，不假装已开
         effective_dialogue = None
-    pending = await service.pending(auth.user.subject_id)
+    async def source_visible(row: ProactiveOpportunity) -> bool:
+        return await share_evidence(session, row, now=utcnow()) is not None
+
+    pending = await service.pending(auth.user.subject_id, source_visible=source_visible)
     recent = await recent_opportunities(
         session,
         actor_id=_actor_id(settings),
@@ -955,6 +1125,7 @@ async def list_proactive(
     subject_timezone = await effective_user_timezone(
         session, subject_id=auth.user.subject_id, env=settings.user_timezone
     )
+    pause = await share_pause(session, auth.user.subject_id)
     gate = await service.gate(
         subject_id=auth.user.subject_id,
         quiet_start=time(_qs // 60, _qs % 60) if _qs is not None else None,
@@ -967,6 +1138,7 @@ async def list_proactive(
         channel_can_proactive=_connector is not None,
         channel_proactive_reason=_why_not,
         subject_timezone=subject_timezone,
+        user_opted_out=pause.paused,
     )
     return {
         "pending": [
@@ -988,6 +1160,7 @@ async def list_proactive(
         "recent": recent,
         "gate": gate.allowed,
         "gate_reasons": gate.reasons,
+        "share_pause": {"paused": pause.paused, "until": pause.until},
         # **诚实标记**：候选会被收集，但目前没有任何代码把它变成消息。
         # 没有这个字段时，gate 一旦放行（渠道能力探测通过），界面就会
         # 看起来"允许主动联系"，而实际什么都发不出去——那是假的完整感。
@@ -1251,7 +1424,9 @@ async def read_handoff(
     from ling.kernel.handoff import HandoffService
 
     service = HandoffService(session, actor_id=_actor_id(settings))
-    view = await service.read(subject_id=auth.user.subject_id, current_window_id=current_window_id)
+    view = await service.read(
+        subject_id=auth.user.subject_id, current_window_id=current_window_id, validate_window=True,
+    )
     if view is None:
         return {
             "capsule": None,
@@ -1297,7 +1472,9 @@ async def revoke_handoff(
 ) -> dict:
     from ling.kernel.handoff import HandoffService
 
-    ok = await HandoffService(session, actor_id=_actor_id(settings)).revoke(capsule_id)
+    ok = await HandoffService(session, actor_id=_actor_id(settings)).revoke(
+        capsule_id, subject_id=auth.user.subject_id,
+    )
     if not ok:
         raise LingError(ErrorCode.not_found, "交接胶囊不存在", status_code=404)
     return {"capsule_id": capsule_id, "revoked": True}

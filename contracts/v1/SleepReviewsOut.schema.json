@@ -1,5 +1,71 @@
 {
   "$defs": {
+    "LifeReviewEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "At"
+        },
+        "kind": {
+          "enum": [
+            "activity",
+            "dream",
+            "plan",
+            "impression",
+            "clarification",
+            "intention"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "source_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "window_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window Id"
+        }
+      },
+      "required": [
+        "kind",
+        "source_id",
+        "text",
+        "status"
+      ],
+      "title": "LifeReviewEntry",
+      "type": "object"
+    },
     "SleepReviewItem": {
       "additionalProperties": false,
       "properties": {
@@ -58,6 +124,13 @@
             "$ref": "#/$defs/SleepReviewItem"
           },
           "title": "Items",
+          "type": "array"
+        },
+        "life": {
+          "items": {
+            "$ref": "#/$defs/LifeReviewEntry"
+          },
+          "title": "Life",
           "type": "array"
         },
         "reason": {

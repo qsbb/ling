@@ -542,6 +542,9 @@ class InboundBridge:
             part.text or "" for part in envelope.parts if part.modality.value == "text"
         ).strip()
         display_text = (envelope.display_text or text).strip()
+        from ling.kernel.continuity_commands import read_command
+
+        command = read_command(text) if window.channel in {"onebot", "qqbot"} else None
         # 连接器插入的媒体标记留在上下文里。判断用户写没写正文时只看可读文字。
         readable = _MEDIA_MARKERS.sub("", text).strip()
 
@@ -758,6 +761,8 @@ class InboundBridge:
             )
             # 同上：这条也可能被撤回。映射不属于"回复"，属于"消息存在过"。
             await self._remember_platform_message_id(observed_row.message_id, envelope)
+            if command is None:
+                await self._note_continuity_input(window, observed_row, envelope, subject_id, readable)
             await self._enqueue_shared_arrangement(observed_row, envelope, subject_id, text, quoted_id)
             await self._session.commit()
             # ``reason`` 只写**理由**，不写动作。
@@ -789,7 +794,7 @@ class InboundBridge:
             channel_mentioned=envelope.mentions_actor,
             replied_to_actor=replied_to_actor,
         )
-        if not decision.respond:
+        if not decision.respond and (command is None or is_group):
             # **沉默不等于没看见。** 消息必须落库，否则她不会记得有人
             # 跟她说过话，而"她选择不回"和"她根本没收到"也再也分不开。
             conversation = ConversationService(
@@ -806,6 +811,8 @@ class InboundBridge:
                 attention_state="seen",
             )
             await self._remember_platform_message_id(msg.message_id, envelope)
+            if command is None:
+                await self._note_continuity_input(window, msg, envelope, subject_id, readable)
             await self._enqueue_shared_arrangement(msg, envelope, subject_id, text, quoted_id)
             await self._record_followup(
                 decision, subject_id=subject_id, window_id=window.id, message_id=msg.message_id
@@ -912,6 +919,8 @@ class InboundBridge:
         # 而 `messages` 表只有本地 id。映射写进 `idempotency_keys`
         # （scope=platform_msgid，key=本地消息 id）——不新增表、不改迁移。
         await self._remember_platform_message_id(user_row.message_id, envelope)
+        if command is None:
+            await self._note_continuity_input(window, user_row, envelope, subject_id, readable)
         await self._enqueue_shared_arrangement(user_row, envelope, subject_id, text, quoted_id)
         await self._record_followup(
             decision,
@@ -927,11 +936,29 @@ class InboundBridge:
             attempt=int(turn.attempt or 1),
             snapshot=runtime_snapshot,
         )
+        control_reply = None
+        if command is not None:
+            from ling.contracts.v1 import Origin, TurnState
+            from ling.kernel.continuity_commands import execute_command
+
+            command_source = await self._session.get(Message, user_row.message_id)
+            if command_source is not None:
+                control_reply = await execute_command(
+                    self._session, command=command, window=window, subject_id=subject_id,
+                    source=command_source, quoted_id=reply_reference.message.message_id
+                    if reply_reference and reply_reference.message else None,
+                    config=effective,
+                )
+                await conversation.add_message(
+                    window.id, role="actor", text=control_reply,
+                    turn_id=turn.id, attempt=turn.attempt, origin=Origin.tool_receipt,
+                )
+                await conversation.set_turn_state(turn.id, TurnState.completed)
         # 轮次任务用自己的会话，必须先提交，否则后台看不到 turn 行
         await self._session.commit()
 
         # 5) 跑轮次，收集最终文本
-        turn_result = await self._run_turn(
+        turn_result = TurnResult(text=control_reply, state="completed") if control_reply else await self._run_turn(
             window_id=window.id,
             subject_id=subject_id,
             turn_id=turn.id,
@@ -1107,7 +1134,19 @@ class InboundBridge:
         # 情况则必须说清楚发了几段，否则"她只说了半句"永远查不出来。
         reason = describe_delivery(delivery)
         handled_as = "replied" if delivered else "failed"
-        if not delivered:
+        if delivered:
+            await conversation.confirm_reply_delivery(turn.id, window_id=window.id)
+            if command is None and window.channel in {"onebot", "qqbot"}:
+                from ling.domains.relationship.continuity import note_impression
+                from ling.kernel.continuity_sharing import note_natural_continuation
+
+                await note_impression(
+                    self._session, window=window, subject_id=subject_id, turn_id=turn.id, reply=reply_text,
+                )
+                await note_natural_continuation(
+                    self._session, window=window, subject_id=subject_id, turn_id=turn.id, reply=reply_text,
+                )
+        else:
             # 消息处置结果按**投递事实**改写：`turn._finalize` 记的是"生成了
             # 正文"，而"生成成功"不等于"对方收到了"。两处都记同一件事时，
             # 以更晚、更接近投递末端的那一处为准。
@@ -1132,6 +1171,30 @@ class InboundBridge:
         )
 
     # ------------------------------------------------------------ 内部
+
+    async def _note_continuity_input(
+        self, window: Window, view: MessageView, envelope: InteractionEnvelope, subject_id: str, text: str,
+    ) -> None:
+        if window.channel not in {"onebot", "qqbot"}:
+            return
+        from ling.domains.relationship.preferences import note_expression
+        from ling.kernel.continuity_sharing import acknowledge_share
+        from ling.kernel.handoff import HandoffService
+
+        message = await self._session.get(Message, view.message_id)
+        if message is None or message.memory_hidden_at is not None or message.retracted_at is not None:
+            return
+        await note_expression(self._session, window=window, subject_id=subject_id, source=message, text=text)
+        await acknowledge_share(
+            self._session, window=window, subject_id=subject_id, source=message,
+            quoted_platform_id=envelope.reply_to,
+        )
+        if await IdentityService(self._session).resolve_account(
+            envelope.connector_instance, envelope.account_ref or "",
+        ) == subject_id:
+            await HandoffService(self._session, actor_id=self._actor_id).capture(
+                subject_id=subject_id, source_window=window, message=message,
+            )
 
     # ------------------------------------------------------------ 消息 id
 
@@ -1356,10 +1419,13 @@ class InboundBridge:
                 "is_group": is_group,
             },
         )
-        if not delivered:
-            conversation = ConversationService(
-                self._session, actor_id=self._actor_id, persona_id=self._persona_id
-            )
+        conversation = ConversationService(
+            self._session, actor_id=self._actor_id, persona_id=self._persona_id,
+        )
+        if delivered:
+            await conversation.confirm_reply_delivery(turn.id, window_id=window.id)
+            await conversation.correct_handled_for_turn(turn.id, outcome="replied")
+        else:
             await conversation.correct_handled_for_turn(
                 turn.id, outcome="failed", reason=reason
             )
