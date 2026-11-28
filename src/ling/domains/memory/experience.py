@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from ling.contracts.v1 import MemoryProposal, Origin, Visibility
-from ling.domains.conversation.context_sources import context_sources_available
+from ling.domains.conversation.service import context_sources_available
 from ling.domains.goals.service import readable_commitment
 from ling.domains.memory.purge import has_open_purge
 from ling.domains.memory.recall_query import (

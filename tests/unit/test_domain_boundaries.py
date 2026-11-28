@@ -201,8 +201,14 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("memory/library.py", "ling.domains.goals.service"): (
         "记忆库只读承诺域的来源判据与状态，区分待履行和送达结果。"
     ),
+    ("memory/experience.py", "ling.domains.goals.service"): (
+        "经历回查沿用承诺域的只读来源判据，只返回仍有有效依据的历史承诺。"
+    ),
+    ("memory/experience.py", "ling.domains.conversation.service"): (
+        "经历回查只读取可信的历史回复，复用对话域对原回复所引用来源的授权判据。"
+    ),
     ("memory/service.py", "ling.domains.conversation.service"): (
-        "角色感受引用对话域中的已完成回复，读取时核对当前轮次与撤回状态。"
+        "角色感受和固定回复复用对话域的只读判据，核对轮次、撤回和所引用来源。"
     ),
     ("memory/service.py", "ling.domains.media.service"): (
         "素材整理衍生的情节沿用媒体域的授权主体与版本判据。"

@@ -38,7 +38,9 @@ from ling.contracts.v1 import (
     SessionRecord,
     TurnState,
 )
-from ling.domains.conversation.context_sources import context_sources_available
+from ling.domains.conversation.context_sources import (
+    context_sources_available as context_sources_available,
+)
 from ling.infra.models import (
     ActorAccount,
     DeliveryReceiptRow,

@@ -25,8 +25,7 @@ from sqlalchemy import ColumnElement, and_, case, delete, func, literal, or_, se
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ling.contracts.v1 import MemoryProposal, Origin, TurnState, Visibility
-from ling.domains.conversation.context_sources import context_sources_available
-from ling.domains.conversation.service import completed_actor_message
+from ling.domains.conversation.service import completed_actor_message, context_sources_available
 from ling.domains.goals.service import (
     COMMITMENT_MEMORY_STATUS,
     commitment_due_local,
