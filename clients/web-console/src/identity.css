@@ -590,8 +590,17 @@
     justify-content: flex-start;
   }
 
-  .person-row__actions .button {
+  .person-row__actions .button,
+  .identity-search .button,
+  .identity-orphans__row .button,
+  .identity-more .button,
+  .identity-detail .button,
+  .identity-page .back-link {
     min-height: 44px;
+    min-width: 44px;
+  }
+
+  .person-row__actions .button {
     flex: 1 1 auto;
   }
 

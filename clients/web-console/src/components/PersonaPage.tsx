@@ -307,7 +307,7 @@ export function PersonaPage({ onBack }: PersonaPageProps) {
         <PersonaSettings />
       </PageTabPanel>
       <PageTabPanel tab="dialogue" current={tab}>
-        <DialoguePage onBack={() => openTab('persona')} backLabel="返回角色设定" />
+        <DialoguePage embedded onBack={() => openTab('persona')} backLabel="返回角色设定" />
       </PageTabPanel>
     </section>
   );
@@ -810,13 +810,10 @@ function PersonaSettings() {
 
   return (
     <div className="domain-body" data-testid="persona-list">
-      <div className="page__head">
-        <div>
-          <h2 className="page__title">人格设定</h2>
-          <p className="page__subtitle">
-            管理人格角色设定。多套人格可以并存，同一时间只有一套生效；切换时整套替换。
-          </p>
-        </div>
+      <div className="persona-list__bar">
+        <p className="page__subtitle persona-list__subtitle">
+          多套人格可并存，同一时间只有一套生效；切换时整套替换。
+        </p>
         <div className="persona-list__actions">
           <button
             type="button"

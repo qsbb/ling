@@ -599,6 +599,48 @@ it('1920：生活页在主栏内居中，状态标题保持单行', async (ctx) 
   await assertNoHorizontalOverflow(page, 'life 1920', ['page']);
 }, TIMEOUT);
 
+it('分享状态读取失败时保留投递历史，并区分暂停和可用状态', async (ctx) => {
+  if (skip(ctx)) return;
+  const page = await openRoute('/life', { width: 375, height: 812 }, 'life-presence');
+  let sharePauseFromHistory: { paused: boolean; until: null } | undefined;
+  await page.route('**/v1/proactive', (route) => route.fulfill(json({
+    gate: false, gate_reasons: [], pending: [],
+    share_pause: sharePauseFromHistory,
+    recent: [{
+      opportunity_id: 'preview-history', state: 'sent', reason: '合成旧记录',
+      has_source: true, reason_code: 'activity_done', created_at: NOW,
+      receipt: { state: 'delivered', channel: 'fake', observed_at: NOW },
+    }],
+  })));
+  let paused: boolean | undefined;
+  await page.route('**/v1/relationship/preferences', (route) => route.fulfill(
+    paused === undefined
+      ? json({ error: { code: 'offline', message: 'fixture unavailable' } }, 503)
+      : json({ share_pause: { paused, until: null }, preferences: [] }),
+  ));
+  const status = page.getByTestId('life-share-status');
+  const toggle = page.getByTestId('life-share-toggle');
+  await page.reload();
+  await page.getByTestId('life-delivery-outcomes').getByText('确认送达', { exact: true }).waitFor();
+  expect(await status.innerText()).toBe('分享状态暂不可用');
+  expect(await toggle.count()).toBe(0);
+
+  sharePauseFromHistory = { paused: true, until: null };
+  await page.reload();
+  expect(await status.innerText()).toBe('主动分享已暂停');
+  expect(await toggle.count()).toBe(0);
+
+  paused = true;
+  await page.reload();
+  expect(await status.innerText()).toBe('主动分享已暂停');
+  expect(await toggle.innerText()).toBe('恢复主动分享');
+
+  paused = false;
+  await page.reload();
+  expect(await status.innerText()).toBe('主动分享未暂停');
+  expect(await toggle.innerText()).toBe('暂停主动分享');
+}, TIMEOUT);
+
   it(
     '此刻首屏默认收起完整安排；生活节奏保留 query，并支持刷新和前进后退',
     async (ctx) => {

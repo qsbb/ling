@@ -200,15 +200,6 @@ export function VoiceSettings({
             );
           })}
         </div>
-      </section>
-
-      {/* ---------------------------------------------------------- 音色 */}
-      <section className="voice-form__block" data-testid="voice-voice">
-        <h2 className="voice-form__title">她用谁的声音</h2>
-        <p className="voice-form__intro">
-          三家音色参数各管各的：同一个名字在三家是不同的值，页面不会替你翻译，也不会跨家预填。
-          不选就等于不使用音色。
-        </p>
         {/* 这一档现在存不进去时**必须说出来**：控件能点、值却到不了后端，
             比没有这个控件更糟（用户会以为改好了）。 */}
         {WILLINGNESS_PERSISTS ? null : (

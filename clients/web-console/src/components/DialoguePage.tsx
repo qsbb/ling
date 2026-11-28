@@ -46,6 +46,8 @@ interface DialoguePageProps {
    * 本页挂在 `/persona?tab=dialogue` 里，宿主会传「返回角色设定」。
    */
   backLabel?: string;
+  /** 嵌入外层页签容器时隐藏重复的返回入口与大标题。 */
+  embedded?: boolean;
 }
 
 const FIELDS: PolicyField[] = [
@@ -128,7 +130,7 @@ interface VoiceState {
   error: ExplainedError | null;
 }
 
-export function DialoguePage({ onBack, backLabel }: DialoguePageProps) {
+export function DialoguePage({ onBack, backLabel, embedded = false }: DialoguePageProps) {
   const [voice, setVoice] = useState<VoiceState>({
     loaded: false,
     // 默认 `natural`：与后端 `DialoguePolicy.voice_willingness` 的默认值一致。
@@ -255,6 +257,7 @@ export function DialoguePage({ onBack, backLabel }: DialoguePageProps) {
       fields={FIELDS}
       section="dialogue"
       onBack={onBack}
+      embedded={embedded}
       {...(backLabel ? { backLabel } : {})}
       // 语音的字段要不要进请求体，由这里决定；它必须看见面板的最新值。
       beforeSave={beforeSave}

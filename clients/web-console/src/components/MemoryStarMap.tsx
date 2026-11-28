@@ -118,8 +118,8 @@ export interface StarChartModel {
   timeline: { start: number; end: number } | null;
 }
 
-export const STAR_CARD_W = 138;
-export const STAR_CARD_H = 82;
+export const STAR_CARD_W = 160;
+export const STAR_CARD_H = 86;
 
 const LANE_LABELS: Record<StarLaneId, string> = {
   episode: '经历与感受',
@@ -338,14 +338,16 @@ export function buildStarChartModel(
   const minTs = validTs.length > 0 ? Math.min(...validTs) : 0;
   const maxTs = validTs.length > 0 ? Math.max(...validTs) : 1;
   const span = Math.max(1, maxTs - minTs);
-  const hasUnknown = unknown.length > 0;
-  const unknownColumn = hasUnknown ? 190 : 0;
-  const canvasWidth = Math.max(720, Math.min(1280, 440 + Math.min(rows.length, 200) * 30 + unknownColumn));
+  const unknownColumn = unknown.length ? STAR_CARD_W + 32 : 0;
+  const spanDays = span / 86_400_000;
+  const spanWidth = spanDays > 120 ? Math.min(1800, 760 + Math.round(spanDays * 1.35)) : 760;
+  const countWidth = rows.length * 64;
+  const canvasWidth = Math.min(2200, Math.max(spanWidth, countWidth) + unknownColumn);
   const xStart = 96;
-  const rightPad = STAR_CARD_W + 14;
+  const rightPad = STAR_CARD_W + 18;
   const xEnd = canvasWidth - rightPad - unknownColumn;
   const unknownX = canvasWidth - rightPad;
-  const xRange = Math.max(200, xEnd - xStart);
+  const xRange = Math.max(240, xEnd - xStart);
 
   const laneIds: StarLaneId[] = ['episode', 'assertion', 'procedure'];
   if (rows.some((r) => laneOfKind(r.kind) === 'other')) laneIds.push('other');
@@ -634,10 +636,6 @@ export function MonthWheel({
 
   return (
     <div className="mem-wheel" data-testid="mem-month-wheel">
-      <div className="mem-wheel__head">
-        <span>十二月令环</span>
-        <span className="mem-wheel__hint">跨年 / 同年</span>
-      </div>
       <svg className="mem-wheel__svg" viewBox="-88 -88 176 176" role="group" aria-label="按月份查看同月记录">
         <circle cx={0} cy={0} r={56} fill="none" stroke="var(--line-strong)" strokeWidth={1} />
         <circle cx={0} cy={0} r={20} fill="none" stroke="var(--line)" strokeDasharray="2 3" />
@@ -722,22 +720,37 @@ export function MonthWheel({
           );
         })}
       </svg>
-      <p className="mem-wheel__caption">
+      <div className="mem-wheel__info">
+        <div className="mem-wheel__head">
+          <span>十二月令环</span>
+          <span className="mem-wheel__hint">跨年 / 同年</span>
+        </div>
+        <p className="mem-wheel__caption">
+          {activeMonth ? (
+            <>
+              <strong>{MONTH_SEASONS[activeMonth] ?? `${activeMonth}月`}</strong>
+              <span>
+                {isCrossYear
+                  ? ` · ${activeYears.join('/')} 跨年 · ${activeCount} 条`
+                  : isSameYear
+                    ? ` · 同年同月 · ${activeCount} 条`
+                    : ` · ${activeCount} 条`}
+              </span>
+            </>
+          ) : (
+            '点击有记录的月份查看同月呼应'
+          )}
+        </p>
         {activeMonth ? (
-          <>
-            <strong>{MONTH_SEASONS[activeMonth] ?? `${activeMonth}月`}</strong>
-            <span>
-              {isCrossYear
-                ? ` · ${activeYears.join('/')} 跨年 · ${activeCount} 条`
-                : isSameYear
-                  ? ` · 同年同月 · ${activeCount} 条`
-                  : ` · ${activeCount} 条`}
-            </span>
-          </>
-        ) : (
-          '全年'
-        )}
-      </p>
+          <button
+            type="button"
+            className="mem-wheel__reset"
+            onClick={() => onSelectMonth(null)}
+          >
+            回到全年
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -971,6 +984,9 @@ export function MemoryStarMapCanvas({
             !isSel && !isMonthHit && isNb ? 'mem-star-node--neighbor' : '',
             link ? `mem-star-node--link-${link.level}` : '',
             isDim ? 'mem-star-node--dim' : '',
+            node.row.pinned ? 'mem-star-node--pinned' : '',
+            status ? 'mem-star-node--tombstone' : '',
+            node.row.origin === 'model_inference' ? 'mem-star-node--inferred' : '',
           ].filter(Boolean).join(' ');
           const dateLabel = node.dateKind === '未知'
             ? '发生未知'
@@ -1000,7 +1016,9 @@ export function MemoryStarMapCanvas({
               >
                 <span className="mem-star-node__top">
                   <span className="mem-star-node__mo">{dateLabel}</span>
-                  <span>{kindText(node.row.kind)}</span>
+                  <span className="mem-star-node__kind">
+                    {node.row.pinned ? '固定' : kindText(node.row.kind)}
+                  </span>
                 </span>
                 <span className="mem-star-node__title">{node.row.text}</span>
                 <span className="mem-star-node__foot">
@@ -1112,6 +1130,23 @@ export function MemoryMicroscopeBeats({
 
   return (
     <div className="mem-micro" data-testid="mem-microscope">
+      {connectedEntries.length > 0 ? (
+        <div className="mem-micro__links">
+          <div className="mem-micro__links-title">星图关联（{connectedEntries.length}）</div>
+          {connectedEntries.map((item) => (
+            <button
+              key={`${item.kind}-${item.row.memory_id}`}
+              type="button"
+              className={`mem-micro__jump mem-micro__jump--${item.kind}`}
+              onClick={() => onSelectMemory(item.row.memory_id)}
+            >
+              <span className="mem-micro__jump-reason">{item.reason}</span>
+              <span className="mem-micro__jump-text">{item.row.text}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
       <div className="mem-micro__head">
         <span className="mem-micro__kicker">事件微切片 · 第 {safeIdx + 1}/{beats.length} 幕</span>
         <div className="mem-micro__actions">
@@ -1161,23 +1196,6 @@ export function MemoryMicroscopeBeats({
           );
         })}
       </ol>
-
-      {connectedEntries.length > 0 ? (
-        <div className="mem-micro__links">
-          <div className="mem-micro__links-title">相关连线</div>
-          {connectedEntries.map((item) => (
-            <button
-              key={`${item.kind}-${item.row.memory_id}`}
-              type="button"
-              className={`mem-micro__jump mem-micro__jump--${item.kind}`}
-              onClick={() => onSelectMemory(item.row.memory_id)}
-            >
-              <span className="mem-micro__jump-reason">{item.reason}</span>
-              <span className="mem-micro__jump-text">{item.row.text}</span>
-            </button>
-          ))}
-        </div>
-      ) : null}
 
         <dialog
           ref={theaterRef}

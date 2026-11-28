@@ -22,14 +22,14 @@ function PreferenceRow({
         <small> · {item.kind === 'boundary' ? '话题边界' : '表达习惯'}</small>
         <small> · {item.scope === 'private' ? '私聊' : '来源群聊'}</small>
         {editing ? (
-          <form onSubmit={(event) => {
+          <form className="life-controls__edit-form" onSubmit={(event) => {
             event.preventDefault();
             onSave(item.state === 'disabled' ? 'disabled' : 'active', text.trim());
             setEditing(false);
           }}>
-            <input aria-label="修改内容" value={text} maxLength={160} required disabled={busy}
+            <input className="life-controls__input" aria-label="修改内容" value={text} maxLength={160} required disabled={busy}
               onChange={(event) => setText(event.target.value)} />
-            <button className="button button--small" type="submit" disabled={busy || text.trim().length < 2}>保存</button>
+            <button className="button button--small button--primary" type="submit" disabled={busy || text.trim().length < 2}>保存</button>
           </form>
         ) : null}
       </div>
@@ -50,7 +50,13 @@ function PreferenceRow({
   );
 }
 
-export function ContinuityControls({ onChanged }: { onChanged: () => Promise<void> }) {
+export function ContinuityControls({
+  onChanged,
+  syncVersion = 0,
+}: {
+  onChanged: () => Promise<void>;
+  syncVersion?: number;
+}) {
   const [data, setData] = useState<RelationshipPreferences | null>(null);
   const [text, setText] = useState('');
   const [error, setError] = useState('');
@@ -59,7 +65,7 @@ export function ContinuityControls({ onChanged }: { onChanged: () => Promise<voi
   const reload = () => api.relationshipPreferences().then(setData);
   useEffect(() => {
     void reload().catch((cause) => setError(explainError(cause).reason));
-  }, []);
+  }, [syncVersion]);
 
   const run = async (write: () => Promise<unknown>) => {
     setBusy(true);
@@ -75,26 +81,40 @@ export function ContinuityControls({ onChanged }: { onChanged: () => Promise<voi
   };
 
   return (
-    <section aria-label="联系与表达设置">
-      <h3>联系与表达</h3>
-      {error ? <p role="alert">{error}</p> : null}
+    <section className="life-controls" aria-label="联系与表达设置">
+      <div className="life-controls__head">
+        <h3>联系与表达</h3>
+        <span className="life-controls__rule">原有定时提醒按各自规则执行，不受主动分享开关影响。</span>
+      </div>
+      {error ? <p className="life-controls__error" role="alert">{error}</p> : null}
       {data ? (
         <>
-          <button type="button" className="button button--small" disabled={busy}
-            onClick={() => void run(() => api.setSharePause(!data.share_pause.paused))}>
-            {data.share_pause.paused ? '恢复主动分享' : '暂停主动分享'}
-          </button>
-          {data.share_pause.paused && data.share_pause.until ? (
-            <small> 暂停至 {formatSessionTime(data.share_pause.until)}</small>
-          ) : null}
-          <form onSubmit={(event) => {
+          <div className="life-controls__pause">
+            <button
+              type="button"
+              className={`button button--small${data.share_pause.paused ? ' button--primary' : ''}`}
+              disabled={busy}
+              onClick={() => void run(() => api.setSharePause(!data.share_pause.paused))}
+            >
+              {data.share_pause.paused ? '恢复主动分享' : '暂停主动分享'}
+            </button>
+            <span className="life-controls__status">
+              {data.share_pause.paused
+                ? `已暂停主动分享${data.share_pause.until ? `（至 ${formatSessionTime(data.share_pause.until)}）` : ''}`
+                : '当前允许按节奏主动分享'}
+            </span>
+          </div>
+          <form className="life-controls__form" onSubmit={(event) => {
             event.preventDefault();
             const value = text.trim();
             if (value.length < 2) return;
             void run(async () => { await api.addTopicBoundary(value); setText(''); });
           }}>
-            <label>不希望提起的话题 <input value={text} maxLength={160} disabled={busy}
-              onChange={(event) => setText(event.target.value)} /></label>
+            <label className="life-controls__field">
+              <span>不希望提起的话题</span>
+              <input className="life-controls__input" value={text} maxLength={160} placeholder="例如：最近别提某段旧事" disabled={busy}
+                onChange={(event) => setText(event.target.value)} />
+            </label>
             <button type="submit" className="button button--small" disabled={busy || text.trim().length < 2}>添加边界</button>
           </form>
           {data.preferences.length ? (

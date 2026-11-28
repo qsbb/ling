@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { ProactiveHistory } from './components/ProactiveHistory';
+import { classifyProactiveOutcome, ProactiveHistory } from './components/ProactiveHistory';
 import { ProactiveDraft } from './components/ProactiveDraft';
 import type { ProactiveOpportunity, ProactiveRecord } from './types';
 
@@ -12,6 +12,19 @@ const base: ProactiveRecord = {
 };
 
 describe('主动联系记录', () => {
+  it('区分排队、尝试发送、已发送、回执和会话内的分享', () => {
+    const receipt = { channel: 'fake', observed_at: base.created_at };
+    expect(classifyProactiveOutcome({ ...base, state: 'dispatching', receipt: { ...receipt, state: 'queued' } }))
+      .toEqual({ tone: 'pending', badge: '等待投递' });
+    expect(classifyProactiveOutcome({ ...base, state: 'dispatching' }))
+      .toEqual({ tone: 'pending', badge: '投递中' });
+    expect(classifyProactiveOutcome({ ...base, state: 'sent', receipt: { ...receipt, state: 'sent' } }))
+      .toEqual({ tone: 'sent_unconfirmed', badge: '已发送待确认' });
+    expect(classifyProactiveOutcome({ ...base, state: 'sent', receipt: { ...receipt, state: 'delivered' } }).badge)
+      .toBe('确认送达');
+    expect(classifyProactiveOutcome({ ...base, state: 'continued' }).badge).toBe('已在对话中分享');
+  });
+
   it('区分检查、等待和真实成功或失败回执', () => {
     const html = renderToStaticMarkup(<ProactiveHistory records={[
       base,

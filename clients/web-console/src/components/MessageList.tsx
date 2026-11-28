@@ -5,7 +5,7 @@ import { usePersonaName } from '../personaName';
 import type { RecallProposalView } from '../recall';
 import type { LiveTurn, UiMessage } from '../useChat';
 import type { TurnView } from '../types';
-import { AlertIcon, CheckIcon, RefreshIcon, StopIcon } from './Icons';
+import { AlertIcon, CheckIcon, PinIcon, RefreshIcon, StopIcon } from './Icons';
 import { PROMPT_DRAWER_ID, PROMPT_ENTRY_LABEL } from './PromptDrawer';
 import { RecallCard, RecallUnavailableCard } from './RecallCard';
 import { VoicePlayer, type VoiceMessageView } from './VoicePlayer';
@@ -473,6 +473,47 @@ function MediaTokens({
   );
 }
 
+function MessagePinButton({
+  message,
+  onPinMessage,
+}: {
+  message: UiMessage;
+  onPinMessage?: (messageId: string) => Promise<unknown>;
+}) {
+  const [pinState, setPinState] = useState<'idle' | 'pending' | 'saved' | 'failed'>('idle');
+  const pinnable = Boolean(onPinMessage && message.messageId && message.state === 'completed' && message.text.trim());
+  if (!pinnable) return null;
+
+  return (
+    <span className="message__pin-wrap">
+      <button
+        type="button"
+        className={`message__pin${pinState === 'saved' ? ' message__pin--saved' : ''}`}
+        data-testid="message-pin"
+        disabled={pinState === 'pending' || pinState === 'saved'}
+        onClick={async () => {
+          if (!onPinMessage || !message.messageId) return;
+          setPinState('pending');
+          try {
+            await onPinMessage(message.messageId);
+            setPinState('saved');
+          } catch {
+            setPinState('failed');
+          }
+        }}
+      >
+        {pinState === 'saved' ? <CheckIcon size={12} /> : <PinIcon size={12} />}
+        <span>
+          {pinState === 'saved' ? '已固定到记忆库' : pinState === 'pending' ? '正在固定…' : '记住这条'}
+        </span>
+      </button>
+      {pinState === 'failed' ? (
+        <span className="message__pin-error" role="alert">这条消息暂时无法固定。</span>
+      ) : null}
+    </span>
+  );
+}
+
 /**
  * 一条消息的详情：模型、尝试次数、时间、以及「她这次看到了什么」。
  *
@@ -487,7 +528,6 @@ function MessageDetails({
   promptOpen,
   clock,
   onOpenPrompt,
-  onPinMessage,
 }: {
   message: UiMessage;
   align: 'start' | 'end';
@@ -495,9 +535,7 @@ function MessageDetails({
   promptOpen: boolean;
   clock: string;
   onOpenPrompt: ((message: UiMessage, trigger: HTMLElement) => void) | undefined;
-  onPinMessage?: (messageId: string) => Promise<unknown>;
 }) {
-  const [pinState, setPinState] = useState<'idle' | 'pending' | 'saved' | 'failed'>('idle');
   const hasPrompt = message.role === 'actor' && promptEnabled && onOpenPrompt !== undefined;
   /*
    * 只放**主行没有**的事实。时间在主行（读历史时"什么时候说的"是阅读本身
@@ -510,20 +548,18 @@ function MessageDetails({
   ];
   const facts = candidates.filter((item): item is Fact => item !== null);
 
-  const pinnable = onPinMessage && message.messageId && message.state === 'completed' && message.text.trim();
-  const hasDetails = hasPrompt || facts.length > 0;
-  if (!hasDetails && !pinnable) return null;
+  if (!hasPrompt && facts.length === 0) return null;
 
   return (
     <details
       className={`message__details${align === 'end' ? ' message__details--own' : ''}`}
-      data-testid={hasDetails ? 'message-details' : 'message-actions'}
+      data-testid="message-details"
     >
       {/*
         summary 只写「详情」。原来写成「详情 · 她这次看到了什么」，展开后下面
         又是一个同名按钮——同一句话在同一块里出现两次。
       */}
-      <summary className="message__details-summary">{hasDetails ? '详情' : '操作'}</summary>
+      <summary className="message__details-summary">详情</summary>
       {facts.length > 0 ? (
         <dl className="message__facts">
           {facts.map((fact) => (
@@ -546,24 +582,6 @@ function MessageDetails({
         >
           {PROMPT_ENTRY_LABEL}
         </button>
-      ) : null}
-      {pinnable ? (
-        <>
-          <button type="button" className="message__prompt" disabled={pinState === 'pending' || pinState === 'saved'}
-            onClick={async () => {
-              if (!onPinMessage || !message.messageId) return;
-              setPinState('pending');
-              try {
-                await onPinMessage(message.messageId);
-                setPinState('saved');
-              } catch {
-                setPinState('failed');
-              }
-            }}>
-            {pinState === 'saved' ? '已固定到记忆库' : pinState === 'pending' ? '正在固定…' : '记住这条'}
-          </button>
-          {pinState === 'failed' ? <span role="alert">这条消息暂时无法固定。</span> : null}
-        </>
       ) : null}
     </details>
   );
@@ -860,20 +878,25 @@ export function MessageList({
                   <span className={`state state--${message.state}`}>{inboundState}</span>
                 ) : null}
               </div>
-              {/*
-                详情折叠：模型、尝试次数、精确时间，以及「她这次看到了什么」。
-                没有 turn_id / 已经被归档的消息**也要能点**——服务端 404 时
-                抽屉里给「这次没有记录」，不在入口上提前猜。
-              */}
-              <MessageDetails
-                message={message}
-                align={row.own ? 'end' : 'start'}
-                promptEnabled={promptEnabled}
-                promptOpen={promptOpenKey === message.key}
-                clock={clock}
-                onOpenPrompt={onOpenPrompt}
-                onPinMessage={variant === 'group' ? undefined : onPinMessage}
-              />
+              <div className={`message__actions-row${row.own ? ' message__actions-row--own' : ''}`}>
+                <MessagePinButton
+                  message={message}
+                  onPinMessage={variant === 'group' ? undefined : onPinMessage}
+                />
+                {/*
+                  详情折叠：模型、尝试次数、精确时间，以及「她这次看到了什么」。
+                  没有 turn_id / 已经被归档的消息**也要能点**——服务端 404 时
+                  抽屉里给「这次没有记录」，不在入口上提前猜。
+                */}
+                <MessageDetails
+                  message={message}
+                  align={row.own ? 'end' : 'start'}
+                  promptEnabled={promptEnabled}
+                  promptOpen={promptOpenKey === message.key}
+                  clock={clock}
+                  onOpenPrompt={onOpenPrompt}
+                />
+              </div>
               {row.silence ? <SilenceNote note={row.silence} /> : null}
             </div>
           </li>

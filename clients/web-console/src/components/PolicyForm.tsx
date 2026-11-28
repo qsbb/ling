@@ -39,6 +39,8 @@ interface PolicyFormProps {
   onBack: () => void;
   /** 返回按钮文案。记忆页把它当 tab 用，写「返回设置」会指错地方。 */
   backLabel?: string;
+  /** 嵌入领域页标签页时隐藏重复的顶层返回按钮与主标题。 */
+  embedded?: boolean;
   /**
    * 发布成功后的提示。默认文案声称「下一轮对话起生效」——
    * **只有确认运行时真的读取这一段配置时才能用默认值**。
@@ -174,6 +176,7 @@ export function PolicyForm({
   section,
   onBack,
   backLabel = '返回设置',
+  embedded = false,
   publishedMessage = '已发布。新策略会在下一轮对话起生效。',
   sections,
   beforeSave,
@@ -292,12 +295,16 @@ export function PolicyForm({
   const disabled = saving || busy;
 
   return (
-    <section className="page">
-      <button type="button" className="back-link" onClick={onBack}>
-        <ArrowLeftIcon /> {backLabel}
-      </button>
+    <section className={embedded ? 'page page--embedded' : 'page'}>
+      {embedded ? null : (
+        <>
+          <button type="button" className="back-link" onClick={onBack}>
+            <ArrowLeftIcon /> {backLabel}
+          </button>
 
-      <h1 className="page__title">{title}</h1>
+          <h1 className="page__title">{title}</h1>
+        </>
+      )}
       <p className="page__hint">{hint}</p>
 
       {loading ? <p className="page__hint">加载中…</p> : null}

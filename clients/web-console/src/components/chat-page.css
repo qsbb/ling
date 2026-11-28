@@ -211,7 +211,67 @@
   background: transparent;
 }
 
-/* ------------------------------------------------------------ 消息详情 */
+/* ------------------------------------------------------------ 消息操作与详情 */
+
+.message__actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px 10px;
+  margin-top: 3px;
+  max-width: 100%;
+}
+
+.message__actions-row:empty {
+  display: none;
+}
+
+.message__actions-row--own {
+  justify-content: flex-end;
+  align-self: flex-end;
+}
+
+.message__pin-wrap {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.message__pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.message__pin:hover:not(:disabled) {
+  background: var(--paper-sunken);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.message__pin--saved,
+.message__pin--saved:disabled {
+  border-color: #c2d2bc;
+  background: var(--ok-soft);
+  color: var(--ok);
+  opacity: 1;
+  cursor: default;
+}
+
+.message__pin-error {
+  font-size: 11px;
+  color: var(--danger);
+}
 
 /*
    模型名、尝试次数这些"事后核对"的信息收进折叠区。主行只留时间与
@@ -221,7 +281,7 @@
    `<summary>` 用箭头自绘，避免不同浏览器的高度不一致。
 */
 .message__details {
-  margin: 3px 0 0;
+  margin: 0;
   font-size: 11px;
   color: var(--ink-faint);
   max-width: 100%;
@@ -503,6 +563,37 @@
     font-size: 16px;
   }
 
+  .chat-titlebar__actions .ghost-button,
+  .chat-titlebar__meta-toggle {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-titlebar__meta-toggle {
+    padding: 10px 6px;
+    margin: -10px -6px;
+  }
+
+  .message__pin,
+  .message__details-summary,
+  .message__prompt,
+  .messages__edge-button {
+    min-height: 44px;
+    min-width: 44px;
+    padding-inline: 10px;
+  }
+
+  .composer__tool,
+  .composer__panel-close {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .session-settings {
     padding: 8px;
   }
@@ -516,11 +607,6 @@
 @media (max-width: 560px) {
   .composer__panel {
     margin-bottom: 6px;
-  }
-
-  .composer__tool {
-    width: 30px;
-    height: 30px;
   }
 }
 

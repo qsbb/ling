@@ -294,6 +294,14 @@ async function visible(locator: Locator) {
 async function hidden(locator: Locator) {
   await locator.waitFor({ state: 'hidden', timeout: WAIT });
 }
+async function expectReadableWheelCaption(wheel: Locator) {
+  const caption = wheel.locator('.mem-wheel__caption');
+  await visible(caption);
+  const lines = await caption.evaluate((element) => {
+    return element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight);
+  });
+  expect(lines, '月令环说明应在三行内读完').toBeLessThanOrEqual(3.1);
+}
 async function current(page: Page, name: Tab) {
   await expect.poll(() => `${new URL(page.url()).pathname}${new URL(page.url()).search}`, { timeout: WAIT })
     .toBe(TABS[name]);
@@ -912,6 +920,7 @@ describe('记忆工作区：独立浏览器验收', () => {
     // ④ 月令环区分同年同月与跨年同月。
     const wheel = page.getByTestId('mem-month-wheel');
     await wheel.getByRole('button', { name: /5月（/ }).click();
+    await expectReadableWheelCaption(wheel);
     await expect.poll(() => canvas.locator('path[data-month="5"].mem-star-arc--lunar-cross-year').count())
       .toBeGreaterThan(0);
     await expect.poll(() => canvas.locator('path[data-month="5"].mem-star-arc--lunar-same-year').count())
@@ -1036,6 +1045,7 @@ describe('记忆工作区：独立浏览器验收', () => {
       expect(railBox && mainBox).toBeTruthy();
       expect(railBox!.y + railBox!.height).toBeLessThanOrEqual(mainBox!.y + 1);
       expect(await rail.getByText('十二月令环', { exact: true }).count()).toBeLessThanOrEqual(1);
+      await expectReadableWheelCaption(page.getByTestId('mem-month-wheel'));
       const viewport = page.getByRole('region', { name: '记忆星图' });
       const scroll = await viewport.evaluate((element) => ({
         client: element.clientWidth,

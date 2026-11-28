@@ -672,6 +672,18 @@ async function exerciseMobile(errors) {
     await memoryButton(page, SEED.corrected).waitFor({ state: 'visible' });
     await detail.waitFor({ state: 'hidden' });
     ok('375px 手机：从导航抽屉读真实列表，打开详情再返回');
+
+    await page.getByRole('button', exact('星图')).tap();
+    const node = page.getByTestId('mem-star-canvas').getByRole('button').filter({ hasText: SEED.corrected });
+    await node.waitFor({ state: 'visible' });
+    await shot(page, 'memory-mobile-stars');
+    await node.tap();
+    await detail.locator('.mem-inspector__text').and(detail.getByText(SEED.corrected, { exact: true })).waitFor();
+    await shot(page, 'memory-mobile-star-detail');
+    await detail.getByRole('button', exact('回到星图')).tap();
+    await node.waitFor({ state: 'visible' });
+    assert(await node.evaluate((element) => document.activeElement === element), '星图未恢复卡片焦点');
+    ok('375px 手机：打开真实星图条目的详情，返回后恢复卡片焦点');
   } finally {
     await context.close();
   }
@@ -779,7 +791,7 @@ async function exerciseSettings(page) {
   await page.goto(`${webBase}/settings/memory`, { waitUntil: 'domcontentloaded' });
   await page.waitForURL(`${webBase}/memory?tab=settings`);
   await field.waitFor({ state: 'visible' });
-  await page.getByRole('button', exact('返回记忆内容')).click();
+  await switchTab(page, '记忆库');
   await page.waitForURL(`${webBase}/memory`);
   await page.getByTestId('mem-list-empty').waitFor({ state: 'visible' });
   ok('学习设置：真实配置、分区和深链、旧路径重定向，以及返回记忆库');

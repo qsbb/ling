@@ -355,6 +355,22 @@
  * 只覆盖列数，**不重写 `grid-template-columns` 以外的任何网格属性**，
  * 尤其不要把桌面端的列数塞进这里（那会让窄屏变成 12 列细条）。
  */
+@media (max-width: 900px) {
+  .page .back-link,
+  .domain-tabpanel .button,
+  .domain-tabpanel .back-link,
+  .voice-form__choice,
+  .voice-form__upload-error .button {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .domain-tab {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
 @media (max-width: 760px) {
   .settings-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -369,6 +385,7 @@
      卡内的小按钮不缩水。 */
   .settings-card .button {
     min-height: 44px;
+    min-width: 44px;
   }
 }
 

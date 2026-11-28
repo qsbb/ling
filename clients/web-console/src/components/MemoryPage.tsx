@@ -3,7 +3,7 @@
  * 正文搜索和类型筛选由记忆库 API 处理，详情可按权限打开对应依据。
  * 核心记忆、学习设置和永久清理互相独立，后台清理不随页内切换而取消。
  */
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   api,
   type ForgetAcceptedResponse,
@@ -41,7 +41,7 @@ import {
   starAffinity, STAR_CARD_H, STAR_CARD_W, type StarChartModel, type StarNode,
 } from './MemoryStarMap';
 import { MemoryFocusLens } from './MemoryFocusLens';
-import { SleepReviewSection, sourceSessionHref } from './SleepReview';
+import { openSourceSession, SleepReviewSection, sourceSessionHref } from './SleepReview';
 import { PolicyForm, type PolicyField } from './PolicyForm';
 import '../memory.css';
 
@@ -655,7 +655,7 @@ export interface MemoryHandlers {
   annotateObject(memoryId: string, input: MemoryObjectAnnotation): Promise<void>;
   setPin?(memoryId: string, pinned: boolean): Promise<void>;
   retract(memoryId: string, reason: string): Promise<void>;
-  supersede(memoryId: string, text: string, reason: string): Promise<void>;
+  supersede(memoryId: string, text: string, reason: string): Promise<string | void>;
   saveCore(input: CoreMemoryInput, meta: { overwrote: boolean }): Promise<void>;
   deleteCore(item: CoreMemoryItem): Promise<void>;
   /**
@@ -1275,6 +1275,35 @@ function ObjectAnnotationForm({
   );
 }
 
+function sourceErrorCopy(error: ExplainedError): { title: string; detail: string; retryable: boolean } {
+  if (error.code === 'not_found') {
+    return {
+      title: '无法查看原话',
+      detail: '来源发言已撤回、所属会话已归档，或已超出保留期限。',
+      retryable: false,
+    };
+  }
+  if (error.code === 'forbidden') {
+    return {
+      title: '无权查看原话',
+      detail: '当前账号没有查看该来源会话的权限。',
+      retryable: false,
+    };
+  }
+  if (error.code === 'unauthorized') {
+    return {
+      title: '登录状态已失效',
+      detail: '重新登录后再尝试查看来源原话。',
+      retryable: false,
+    };
+  }
+  return {
+    title: '暂时读不到原话',
+    detail: error.reason || '请稍后再试。',
+    retryable: error.retriable,
+  };
+}
+
 function MemoryInspector({
   row,
   loaded,
@@ -1284,6 +1313,7 @@ function MemoryInspector({
   onBack,
   onSelect,
   onSelectObject,
+  onLoadHistoryAndSelect,
   onChanged,
   handlers,
   objects,
@@ -1296,7 +1326,8 @@ function MemoryInspector({
   onBack: () => void;
   onSelect: (id: string) => void;
   onSelectObject: (id: string) => void;
-  onChanged: () => void;
+  onLoadHistoryAndSelect: (id: string) => void;
+  onChanged: (nextSelectedId?: string | null) => void;
   handlers: MemoryHandlers;
   objects: MemoryObject[];
 }): React.ReactElement {
@@ -1360,6 +1391,7 @@ function MemoryInspector({
     && (!row.valid_until || Date.parse(row.valid_until) > Date.now());
   const actionLabel = forgetting ? (imported ? '遗忘这条导入记忆' : '遗忘这次发言的记忆')
     : mode === 'retract' ? '撤回这条记忆' : '纠正这条记忆';
+  const isRestrictedSource = Boolean(row.source_message_id && !hasSource);
   const relatedEvidence = source?.context?.filter((item) => item.message_id !== source.message_id) ?? [];
   const valid = forgetting || (mode === 'retract' ? Boolean(reason.trim()) : Boolean(newText.trim() && newText.trim() !== row.text.trim()));
 
@@ -1368,11 +1400,17 @@ function MemoryInspector({
     setPending(true);
     setError(null);
     try {
-      if (forgetting) await handlers.forgetSource(row.memory_id);
-      else if (mode === 'retract') await handlers.retract(row.memory_id, reason.trim());
-      else await handlers.supersede(row.memory_id, newText.trim(), reason.trim() || '用户纠正');
+      let nextId: string | null = null;
+      if (forgetting) {
+        await handlers.forgetSource(row.memory_id);
+      } else if (mode === 'retract') {
+        await handlers.retract(row.memory_id, reason.trim());
+      } else {
+        const created = await handlers.supersede(row.memory_id, newText.trim(), reason.trim() || '用户纠正');
+        if (typeof created === 'string' && created) nextId = created;
+      }
       updateMode(null);
-      onChanged();
+      onChanged(nextId);
     } catch (cause) {
       setError(explainError(cause));
     } finally {
@@ -1394,15 +1432,23 @@ function MemoryInspector({
   };
 
   const changeLink = (id: string, label: string) => (
-    <li key={id}>
+    <li key={id} className="mem-change-item">
       {loaded.some((item) => item.memory_id === id) ? (
         <button type="button" className="mem-text-button" disabled={pending} onClick={() => onSelect(id)}>{label}</button>
       ) : (
-        <>{label} <span className="mem-muted">· 不在本批</span></>
+        <>
+          <span>{label} <span className="mem-muted">· 不在本批</span></span>
+          <button type="button" className="mem-text-button mem-change-load" disabled={pending}
+            onClick={() => onLoadHistoryAndSelect(id)}>
+            载入历史查看
+          </button>
+        </>
       )}
       <code>{id}</code>
     </li>
   );
+
+  const srcErr = sourceError ? sourceErrorCopy(sourceError) : null;
 
   return (
     <article className="mem-inspector" aria-labelledby="mem-detail-title" data-testid="mem-inspector">
@@ -1411,12 +1457,16 @@ function MemoryInspector({
       </button>
       <header className="mem-inspector__head">
         <h3 id="mem-detail-title" ref={headingRef} tabIndex={-1}>记忆详情</h3>
-        {status ? <span className="mem-badge mem-badge--tombstone">历史记录 · 只读</span> : null}
+        {status ? (
+          <span className="mem-badge mem-badge--tombstone">历史记录 · 只读</span>
+        ) : (
+          <span className="mem-badge mem-badge--ok">现行有效</span>
+        )}
       </header>
       <div className="mem-inspector__story">
         <div className="mem-inspector__tags">
           <span className="mem-badge">{kindLabel(row.kind)}</span>
-          {row.pinned ? <span className="mem-badge">手动固定</span> : null}
+          {row.pinned ? <span className="mem-badge mem-badge--pinned">手动固定</span> : null}
           {row.origin === 'model_inference' ? <span className="mem-badge mem-badge--warn">推测，不是事实</span> : null}
           {status ? <span className="mem-badge mem-badge--tombstone">{status}</span> : null}
         </div>
@@ -1456,11 +1506,6 @@ function MemoryInspector({
           onSave={(input) => handlers.annotateObject(row.memory_id, input)} />
       ) : null}
 
-      {star ? (
-        <MemoryMicroscopeBeats row={row} beats={star.beats}
-          connectedEntries={connectedStarEntries(chartModel, row.memory_id)} onSelectMemory={onSelect} />
-      ) : null}
-
       {mode && (!status || forgetting) ? (
         <form
           className="mem-confirm mem-confirm--item"
@@ -1488,7 +1533,7 @@ function MemoryInspector({
               <p className="mem-confirm__body">用新条目替代旧说法。可见范围和来源保留，旧条目退出召回。</p>
               <label className="mem-field">
                 <span>新的说法</span>
-                <textarea ref={formRef} value={newText} rows={4} maxLength={4000} required disabled={pending}
+                <textarea ref={formRef} value={newText} rows={3} maxLength={4000} required disabled={pending}
                   onChange={(event) => setNewText(event.target.value)} />
               </label>
               <label className="mem-field">
@@ -1509,7 +1554,7 @@ function MemoryInspector({
       ) : null}
 
       <section className="mem-inspector__section" aria-label="来源与可见范围">
-        <h4>来源与可见范围</h4>
+        <h4>来源与状态</h4>
         <dl className="mem-facts">
           <div><dt>来源</dt><dd>{row.source_role ? SOURCE_ROLE_TEXT[row.source_role] : originLabel(row.origin)}</dd></div>
           {row.plan_state ? <div><dt>承诺状态</dt><dd>{PLAN_STATE_TEXT[row.plan_state]}</dd></div> : null}
@@ -1585,27 +1630,38 @@ function MemoryInspector({
             <InlineError error={sourceError} resource="list" />
           </>
         ) : hasSource ? (
-          <>
-            <button type="button" className="mem-text-button" aria-expanded={Boolean(source)}
-              disabled={sourcePending || pending} onClick={() => void toggleSource()}>
-              {sourcePending ? '读取中…' : (source ? '收起' : '查看') + sourceLabel}
-            </button>
+          <div className="mem-source-box">
+            <div className="mem-source-box__bar">
+              <button type="button" className="button button--small mem-source-toggle" aria-expanded={Boolean(source)}
+                disabled={sourcePending || pending} onClick={() => void toggleSource()}>
+                {sourcePending ? '读取中…' : (source ? '收起' : '查看') + sourceLabel}
+              </button>
+              {source?.window_id ? (
+                <a className="mem-text-button mem-source-link" href={sourceSessionHref(source.window_id)}
+                  onClick={(event) => {
+                    if (!source.window_id || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    event.preventDefault();
+                    openSourceSession(source.window_id);
+                  }}>
+                  打开来源会话
+                </a>
+              ) : null}
+            </div>
             {source ? (
               <>
-                <blockquote data-testid="mem-original-message">
+                <blockquote className="mem-quote" data-testid="mem-original-message">
                   <p>{source.text}</p>
                   <time dateTime={source.created_at}>{formatAbsoluteTime(source.created_at)}</time>
                 </blockquote>
-                {source.window_id ? <a className="mem-text-button" href={sourceSessionHref(source.window_id)}>打开来源会话</a> : null}
                 {relatedEvidence.length ? (
-                  <ol className="mem-change-list" aria-label="相关对话与承诺">
+                  <ol className="mem-change-list mem-evidence-list" aria-label="相关对话与承诺">
                     {relatedEvidence.map((item) => (
                       <li key={item.message_id ?? item.commitment_id}>
                         <small>{item.role === 'actor' ? 'Ling 已发出的回复' : item.role === 'user' ? '用户原话' : '承诺'}</small>
                         <time dateTime={item.created_at}> · {formatAbsoluteTime(item.created_at)}</time>
                         <p>{item.text}</p>
                         {item.state ? <small>{({
-                          active: '待履行', delivered: '已履行', missed: '已错过',
+                          active: '待履行', delivered: '提醒已送达', missed: '提醒未送达',
                           cancelled: '已取消', undeliverable: '无法送达', uncertain: '结果不确定',
                         } as Record<string, string>)[item.state] ?? item.state}</small> : null}
                       </li>
@@ -1614,10 +1670,47 @@ function MemoryInspector({
                 ) : null}
               </>
             ) : null}
-            <InlineError error={sourceError} resource="list" />
-          </>
+            {srcErr ? (
+              <div className="mem-source-error" role="alert" data-testid="mem-source-error" data-error-code={sourceError?.code}>
+                <AlertIcon size={14} />
+                <div>
+                  <strong>{srcErr.title}</strong>
+                  <p>{srcErr.detail}</p>
+                </div>
+                {srcErr.retryable ? (
+                  <button type="button" className="button button--small" disabled={sourcePending} onClick={() => void toggleSource()}>
+                    重试
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : isRestrictedSource ? (
+          <p className="mem-source-note" data-testid="mem-source-restricted">
+            来源原话仅限本人私聊或当前窗口回查；当前条目的可见范围为「{visibilityLabel(row.visibility)}」，无法直接打开原话。
+          </p>
         ) : null}
       </section>
+
+      {row.retract_reason || row.archived_at || row.supersedes || row.superseded_by ? (
+        <section className="mem-inspector__section" aria-label="变更记录">
+          <h4>更正与变更记录</h4>
+          {row.retract_reason ? <p className="mem-change-reason">撤回理由：{row.retract_reason}</p> : null}
+          {row.archived_at ? <p className="mem-change-reason">归档于 {formatAbsoluteTime(row.archived_at)}</p> : null}
+          {row.superseded_by || row.supersedes ? (
+            <ul className="mem-change-list">
+              {row.superseded_by ? changeLink(row.superseded_by, '纠正后的条目') : null}
+              {row.supersedes ? changeLink(row.supersedes, '纠正前的条目') : null}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
+
+      {chartModel && star ? (
+        <MemoryMicroscopeBeats row={row} beats={star.beats}
+          connectedEntries={connectedStarEntries(chartModel, row.memory_id)} onSelectMemory={onSelect} />
+      ) : null}
+
       {row.import_source ? (
         <section className="mem-inspector__section" aria-label="在 AstrBot 里的时间" data-testid="mem-import-times">
           <h4>在 AstrBot 里的时间</h4>
@@ -1649,19 +1742,9 @@ function MemoryInspector({
           </dl>
         </section>
       ) : null}
-      {row.retract_reason || row.archived_at || row.supersedes || row.superseded_by ? (
-        <section className="mem-inspector__section" aria-label="变更记录">
-          <h4>变更记录</h4>
-          {row.retract_reason ? <p>撤回理由：{row.retract_reason}</p> : null}
-          {row.archived_at ? <p>归档于 {formatAbsoluteTime(row.archived_at)}</p> : null}
-          <ul className="mem-change-list">
-            {row.superseded_by ? changeLink(row.superseded_by, '纠正后的条目') : null}
-            {row.supersedes ? changeLink(row.supersedes, '纠正前的条目') : null}
-          </ul>
-        </section>
-      ) : null}
+
       <details className="mem-inspector__technical">
-        <summary>记录编号与来源事件</summary>
+        <summary>技术字段（记录编号与来源事件）</summary>
         <dl className="mem-facts">
           <div><dt>记忆编号</dt><dd><code>{row.memory_id}</code></dd></div>
           {row.confidence === null ? null : (
@@ -1684,17 +1767,20 @@ export function MemoryListSection({
 }: MemoryListSectionProps): React.ReactElement {
   const [scope, setScope] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [surface, setSurface] = useState<'browse' | 'lens' | 'detail'>('browse');
+  const [pendingTargetId, setPendingTargetId] = useState<string | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [view, setView] = useState<'stars' | 'list'>(defaultView);
   const [month, setMonth] = useState<number | null>(null);
-  /* 星图里点卡片先开镜片；详情要显式“看完整详情”，避免同屏两层详情。 */
-  const [detailOpen, setDetailOpen] = useState(false);
+  const sectionRef = useRef<HTMLElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const starViewport = useRef<HTMLDivElement>(null);
+  const listRowsRef = useRef<HTMLUListElement>(null);
   const rowElement = useRef<HTMLButtonElement | null>(null);
-  const wideForLens = useRef(true);
+  const [wideForLens, setWideForLens] = useState(true);
   const restoreFocus = useRef(false);
+  const scrollRestoreRef = useRef<{ pageTop: number; starLeft: number; starTop: number; listTop: number } | null>(null);
   /*
     Chromium 给 `type=search` 画一个原生清除按钮（右侧 ×）：它只改 DOM 值，
     **不触发 change**。不接住的话，输入框看着空了、列表还停在搜索结果上。
@@ -1706,7 +1792,11 @@ export function MemoryListSection({
     const input = searchRef.current;
     if (!input) return undefined;
     // 用 ref 取回调：父组件每次渲染都会给新函数，进依赖会让监听每次重挂。
-    const sync = () => { onSearchChangeRef.current(input.value); setSelectedId(null); };
+    const sync = () => {
+      onSearchChangeRef.current(input.value);
+      setSelectedId(null);
+      setSurface('browse');
+    };
     input.addEventListener('search', sync);
     return () => input.removeEventListener('search', sync);
   }, []);
@@ -1736,10 +1826,12 @@ export function MemoryListSection({
   */
   const defaultRow = view === 'stars' ? (chartModel?.nodes[0]?.row ?? filtered[0]) : filtered[0];
   const selected = selectedId ? filtered.find((row) => row.memory_id === selectedId) : defaultRow;
-  /* 只有用户主动点过卡片才进放大镜；默认预览不弹，避免首屏被面板压住。 */
-  const focusRow = selectedId && wideForLens.current ? selected : null;
+  /* 桌面先看放大镜，展开完整详情后仍保留图上的关联。 */
+  const hasSelection = Boolean(selectedId && selected);
+  const focusRow = view === 'stars' && wideForLens && surface !== 'browse' && hasSelection ? selected : null;
   const affinity = focusRow && chartModel ? starAffinity(chartModel, focusRow.memory_id) : null;
-  const mobileInspectorOpen = Boolean(selectedId && selected);
+  const detailOpen = hasSelection && (surface === 'detail' || (surface === 'lens' && !wideForLens));
+  const showInspector = view === 'list' || detailOpen;
   const matchingScopeOptions = [...new Set(fetched.map((row) => row.visibility).filter(Boolean))];
   const scopes = Object.keys(VISIBILITY_LABEL).concat(matchingScopeOptions.filter((value) => !(value in VISIBILITY_LABEL)));
   const activeObject = objects.find((item) => item.entity_id === objectId) ?? null;
@@ -1754,26 +1846,80 @@ export function MemoryListSection({
 
   useEffect(() => {
     const query = window.matchMedia('(min-width: 761px)');
-    const sync = () => { wideForLens.current = query.matches; };
+    const sync = () => setWideForLens(query.matches);
     sync();
     query.addEventListener('change', sync);
     return () => query.removeEventListener('change', sync);
   }, []);
 
   useEffect(() => {
-    if (selectedId) headingRef.current?.focus();
-    else if (restoreFocus.current) {
-      restoreFocus.current = false;
-      const element = rowElement.current;
-      if (element?.isConnected) element.focus();
-      else searchRef.current?.focus();
+    if (!pendingTargetId) return;
+    if (filtered.some((row) => row.memory_id === pendingTargetId)) {
+      setSelectedId(pendingTargetId);
+      setSurface('detail');
+      setPendingTargetId(null);
     }
-  }, [selectedId]);
+  }, [filtered, pendingTargetId]);
+
+  useLayoutEffect(() => {
+    if (detailOpen) {
+      headingRef.current?.focus();
+    } else if (surface === 'browse' && restoreFocus.current) {
+      restoreFocus.current = false;
+      const saved = scrollRestoreRef.current;
+      scrollRestoreRef.current = null;
+      if (saved) {
+        const pageEl = sectionRef.current?.closest('.page');
+        if (pageEl) pageEl.scrollTop = saved.pageTop;
+        if (starViewport.current) {
+          starViewport.current.scrollLeft = saved.starLeft;
+          starViewport.current.scrollTop = saved.starTop;
+        }
+        if (listRowsRef.current) listRowsRef.current.scrollTop = saved.listTop;
+      }
+      const origin = rowElement.current;
+      const card = selectedId && sectionRef.current?.querySelector<HTMLButtonElement>(
+        `button[data-memory-id="${CSS.escape(selectedId)}"]`,
+      );
+      (origin?.isConnected ? origin : card || searchRef.current)?.focus({ preventScroll: true });
+    }
+  }, [detailOpen, surface, selectedId]);
+
+  const captureScroll = () => {
+    const pageEl = sectionRef.current?.closest('.page');
+    scrollRestoreRef.current = {
+      pageTop: pageEl?.scrollTop ?? 0,
+      starLeft: starViewport.current?.scrollLeft ?? 0,
+      starTop: starViewport.current?.scrollTop ?? 0,
+      listTop: listRowsRef.current?.scrollTop ?? 0,
+    };
+  };
 
   const goBack = () => {
     restoreFocus.current = true;
-    setSelectedId(null);
-    setDetailOpen(false);
+    setSurface('browse');
+  };
+
+  const afterMutation = (nextId?: string | null) => {
+    if (nextId) {
+      setSelectedId(nextId);
+      setPendingTargetId(nextId);
+    } else {
+      restoreFocus.current = true;
+      setSurface('browse');
+      setSelectedId(null);
+    }
+  };
+
+  const selectRow = (id: string, trigger: HTMLButtonElement) => {
+    captureScroll();
+    rowElement.current = trigger;
+    if (selectedId === id && surface === 'detail') {
+      headingRef.current?.focus();
+    } else {
+      setSelectedId(id);
+      setSurface(view === 'stars' && wideForLens ? 'lens' : 'detail');
+    }
   };
 
   const revealStar = (node: StarNode) => {
@@ -1784,15 +1930,6 @@ export function MemoryListSection({
       top: Math.max(0, node.yPx + (STAR_CARD_H - viewport.clientHeight) / 2),
       behavior: 'auto',
     });
-  };
-
-  const selectRow = (id: string, trigger: HTMLButtonElement) => {
-    rowElement.current = trigger;
-    if (selectedId === id) headingRef.current?.focus();
-    else {
-      setSelectedId(id);
-      setDetailOpen(!wideForLens.current);
-    }
   };
 
   const selectMonth = (next: number | null) => {
@@ -1812,6 +1949,7 @@ export function MemoryListSection({
 
   const switchView = (next: 'stars' | 'list') => {
     setView(next);
+    setSurface('browse');
     if (next !== 'stars' || !selectedId) return;
     const node = chartModel?.nodeMap[selectedId];
     if (!node) return;
@@ -1825,6 +1963,7 @@ export function MemoryListSection({
     onFiltersChange(DEFAULT_FILTERS);
     onObjectChange(null);
     setSelectedId(null);
+    setSurface('browse');
     searchRef.current?.focus();
   };
 
@@ -1844,15 +1983,26 @@ export function MemoryListSection({
       revealStar(node);
     }
     setSelectedId(id);
+    setSurface('detail');
+  };
+
+  const loadHistoryAndSelect = (id: string) => {
+    setScope('');
+    onFiltersChange(DEFAULT_FILTERS);
+    if (!flags.retracted || !flags.archived) {
+      onFlagsChange({ retracted: true, archived: true });
+    }
+    setPendingTargetId(id);
   };
 
   return (
     <section
+      ref={sectionRef}
       /*
        窄屏下详情栏平时不显示；导入面板也挂在这一栏，所以只要面板开着就进
        「阅读态」——否则手机上点得到入口、却看不到面板。
       */
-      className={`mem-workspace${view === 'stars' ? ' mem-workspace--stars' : ''}${mobileInspectorOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
+      className={`mem-workspace${view === 'stars' ? ' mem-workspace--stars' : ''}${detailOpen || importPanelOpen ? ' mem-workspace--reading' : ''}`}
       aria-label="长期记忆库"
       data-testid="mem-list"
     >
@@ -2090,7 +2240,7 @@ export function MemoryListSection({
                 </aside>
                 <div className="mem-star-main">
                   <div className="mem-star-toolbar">
-                    <span className="mem-star-title">发生时间 · 2024—2026</span>
+                    <span className="mem-star-title">发生与记下时间</span>
                     <div className="mem-star-legend" aria-label="星图连线依据">
                       <span className="mem-star-legend__correction">纠正链</span>
                       <span className="mem-star-legend__source">同源事件</span>
@@ -2106,7 +2256,7 @@ export function MemoryListSection({
                         setMonth(nodeMonth);
                         selectRow(id, trigger);
                         const node = chartModel.nodeMap[id];
-                        if (node) requestAnimationFrame(() => revealStar(node));
+                        if (node && wideForLens) requestAnimationFrame(() => revealStar(node));
                       }}
                       focusOverlay={focusRow && affinity ? (
                         <MemoryFocusLens key={focusRow.memory_id} model={chartModel} affinity={affinity} row={focusRow}
@@ -2116,25 +2266,26 @@ export function MemoryListSection({
                             if (node) { setMonth(node.month); revealStar(node); }
                             setSelectedId(id);
                           }}
-                          onOpenDetail={() => setDetailOpen(true)}
+                          onOpenDetail={() => setSurface('detail')}
                           onClose={goBack} />
                       ) : null} />
                   </div>
                 </div>
               </div>
             ) : (
-              <ul className="mem-index__rows" aria-label="记忆列表" data-testid="mem-results">
+              <ul className="mem-index__rows" ref={listRowsRef} aria-label="记忆列表" data-testid="mem-results">
                 {filtered.map((row) => {
                   const status = historyStatus(row);
                   return (
                     <li key={row.memory_id}>
-                      <button type="button" className="mem-record" aria-current={selected?.memory_id === row.memory_id ? 'true' : undefined}
+                      <button type="button" className="mem-record" data-memory-id={row.memory_id} aria-current={selected?.memory_id === row.memory_id ? 'true' : undefined}
                         onClick={(event) => selectRow(row.memory_id, event.currentTarget)}>
                         <span className="mem-record__top"><span>{kindLabel(row.kind)}</span>
                           <time dateTime={row.created_at ?? undefined}>{formatAbsoluteTime(row.created_at)}</time></span>
                         <span className="mem-record__preview">{row.text}</span>
                         <span className="mem-record__meta">
                           <span>{originLabel(row.origin)}</span><span>{visibilityLabel(row.visibility)}</span>
+                          {row.pinned ? <span className="mem-record__status mem-record__status--pinned">固定</span> : null}
                           {row.import_source ? <span className="mem-record__status">AstrBot</span> : null}
                           {status ? <span className="mem-record__status">{status}</span> : null}
                         </span>
@@ -2148,14 +2299,15 @@ export function MemoryListSection({
         ) : null}
       </div>
 
-      <div className="mem-workspace__detail">
-        {selected && !importPanelOpen && (view === 'list' || detailOpen) ? (
+      <div className="mem-workspace__detail" hidden={!showInspector && !importPanelOpen}>
+        {selected && !importPanelOpen && showInspector ? (
           <MemoryInspector key={selected.memory_id} row={selected} loaded={fetched} chartModel={chartModel}
             backLabel={view === 'stars' ? '回到星图' : '回到列表'}
             headingRef={headingRef} handlers={handlers} objects={objects} onBack={goBack}
-            onSelect={selectedFromHistory} onChanged={goBack}
+            onSelect={selectedFromHistory} onLoadHistoryAndSelect={loadHistoryAndSelect}
+            onChanged={afterMutation}
             onSelectObject={(id) => { goBack(); onObjectChange(id); setSelectedId(null); }} />
-        ) : data && !importPanelOpen && (view === 'list' || detailOpen) ? (
+        ) : data && !importPanelOpen && showInspector ? (
           <div className="mem-inspector mem-inspector--empty">
             <span className="mem-inspector__placeholder" aria-hidden="true">◇</span>
             <strong>选择一条记忆</strong>
@@ -2575,13 +2727,13 @@ export function MemoryContentBody({
           onCloseImport={onCloseImport}
         />
       </div>
-      <div hidden={tab !== 'review'}>
+      <div hidden={tab !== 'review'} className="mem-tab-narrow">
         <SleepReviewSection state={review} onReload={onReloadReview} />
       </div>
-      <div hidden={tab !== 'core'}>
+      <div hidden={tab !== 'core'} className="mem-tab-narrow">
         <CoreMemorySection state={core} handlers={handlers} onReload={handlers.reloadCore} />
       </div>
-      <div hidden={tab !== 'privacy'} className="mem-privacy">
+      <div hidden={tab !== 'privacy'} className="mem-privacy mem-tab-narrow">
         <section className="panel mem-privacy__intro" aria-labelledby="mem-privacy-title">
           <h2 id="mem-privacy-title">隐私与清理</h2>
           <dl className="mem-facts">
@@ -2823,12 +2975,13 @@ export function MemoryContent({ tab = 'content' }: { tab?: MemoryTab }): React.R
         await loadList();
       },
       async supersede(memoryId, text, reason) {
-        await api.supersedeMemory(memoryId, text, reason);
+        const result = await api.supersedeMemory(memoryId, text, reason);
         setNotice({
           tone: 'ok',
           text: '纠正已保存。旧条目退出召回，可在历史记录中查看。',
         });
         await loadList();
+        return result?.memory_id;
       },
       async saveCore(input, meta) {
         await api.upsertCoreMemory(input);
@@ -3035,37 +3188,42 @@ export interface MemorySettingsTabProps {
 
 export function MemorySettingsTab({ onBack }: MemorySettingsTabProps): React.ReactElement {
   return (
-    <div className="mem-settings" data-testid="mem-settings">
-      <div className="mem-policy-status" role="status" data-testid="mem-policy-status">
-        <p className="mem-policy-status__title">调参前请先读这段</p>
-        <p>{MEMORY_POLICY_STATUS}</p>
-        <ul className="mem-policy-status__list">
-          <li>
-            <code>relative_score_floor</code> 召回相关性下限
-          </li>
-          <li>
-            <code>rerank_top_n</code> 精排头部条数
-          </li>
-          <li>
-            <code>recency_half_life_days</code> 时间衰减半衰期
-          </li>
-          <li>
-            <code>max_retention_days</code> 最长保留天数
-          </li>
-        </ul>
-        <p className="mem-policy-status__foot">
-          参数来源是 <code>GET /v1/settings/config</code> 的 <code>memory</code> 段，
-          保存走草稿 + 发布（与设置页的模型配置同一套修订机制）。
-        </p>
-      </div>
+    <div className="mem-settings mem-tab-narrow" data-testid="mem-settings">
+      <details className="mem-policy-status" data-testid="mem-policy-status">
+        <summary className="mem-policy-status__summary">
+          <span>生效时机与参数说明（已接线，下一轮对话起生效）</span>
+        </summary>
+        <div className="mem-policy-status__body" role="status">
+          <p>{MEMORY_POLICY_STATUS}</p>
+          <ul className="mem-policy-status__list">
+            <li>
+              <code>relative_score_floor</code> 召回相关性下限
+            </li>
+            <li>
+              <code>rerank_top_n</code> 精排头部条数
+            </li>
+            <li>
+              <code>recency_half_life_days</code> 时间衰减半衰期
+            </li>
+            <li>
+              <code>max_retention_days</code> 最长保留天数
+            </li>
+          </ul>
+          <p className="mem-policy-status__foot">
+            参数来源是 <code>GET /v1/settings/config</code> 的 <code>memory</code> 段，
+            保存走草稿 + 发布（与设置页的模型配置同一套修订机制）。
+          </p>
+        </div>
+      </details>
 
       <PolicyForm
         title="记忆与学习"
-        hint="改的是「她记住/学会什么」。参数会存成草稿再发布，改错了可以回滚；发布后下一轮对话起生效，生效时机与上面那两点例外仍然成立。"
+        hint="修改后先保存为草稿并发布，下一轮对话与下一次后台整理生效，出错可回滚。"
         fields={POLICY_FIELDS}
         section="memory"
         onBack={onBack}
         backLabel="返回记忆内容"
+        embedded
         publishedMessage={MEMORY_POLICY_PUBLISHED_MESSAGE}
       />
     </div>

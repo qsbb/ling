@@ -5,6 +5,19 @@
    `button` 的背景，需要显式抹掉。没有任何 `styles.css` 的规则被改动。
    ========================================================================= */
 
+.persona-list__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+
+.persona-list__subtitle {
+  margin: 0;
+  flex: 1 1 240px;
+}
+
 .persona-list__actions {
   display: flex;
   align-items: center;
@@ -358,4 +371,28 @@
 .button--danger:hover:not(:disabled) {
   background: #873a30;
   border-color: #873a30;
+}
+
+@media (max-width: 900px) {
+  .persona-card__kebab {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .persona-card__menu-item,
+  .persona-list__actions .button,
+  .persona-dialog__actions .button,
+  .persona-empty__action,
+  .scenario__reset,
+  .persona-dialogue-option {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .persona-card__menu-item {
+    padding: 10px 12px;
+    font-size: 13.5px;
+  }
 }

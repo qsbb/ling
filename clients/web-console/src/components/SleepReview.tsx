@@ -126,6 +126,41 @@ export function speakerLabel(speaker: string): string {
   return speaker;
 }
 
+export interface SleepLifeKindMeta {
+  label: string;
+  tone: 'simulated' | 'activity' | 'plan' | 'dream' | 'clarification' | 'impression' | 'intention';
+}
+
+export function sleepLifeKindMeta(
+  kind: NonNullable<SleepReviewNight['life']>[number]['kind'],
+  status?: string | null,
+): SleepLifeKindMeta {
+  switch (kind) {
+    case 'activity':
+      return status === 'simulated_outcome'
+        ? { label: '模拟完成', tone: 'simulated' }
+        : { label: '活动记录', tone: 'activity' };
+    case 'plan':
+      return { label: '已取消计划', tone: 'plan' };
+    case 'dream':
+      return { label: '梦境', tone: 'dream' };
+    case 'clarification':
+      return { label: '用户澄清', tone: 'clarification' };
+    case 'impression':
+      return { label: '当时感受', tone: 'impression' };
+    case 'intention':
+      return { label: '还想做的事', tone: 'intention' };
+  }
+}
+
+function formatLifeTime(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 /* ==================================================================== 原话 */
 
 /**
@@ -280,33 +315,64 @@ export function SleepReviewNightCard({
       ) : null}
 
       {night.items.length > 0 ? (
-        <ol className="sleep-rows" data-testid="sleep-items">
-          {night.items.map((item, index) => (
-            <SleepReviewRow
-              key={item.memory_id}
-              item={item}
-              index={index}
-              onOpenSource={onOpenSource}
-            />
-          ))}
-        </ol>
+        <div className="sleep-group">
+          {night.life?.length ? <h3 className="sleep-section-title">整理后的记忆</h3> : null}
+          <ol className="sleep-rows" data-testid="sleep-items">
+            {night.items.map((item, index) => (
+              <SleepReviewRow
+                key={item.memory_id}
+                item={item}
+                index={index}
+                onOpenSource={onOpenSource}
+              />
+            ))}
+          </ol>
+        </div>
       ) : null}
       {night.life?.length ? (
-        <ol className="sleep-rows" aria-label="生活回顾">
-          {night.life.map((item) => (
-            <li className="sleep-row" key={item.source_id}>
-              <small>{({
-                activity: item.status === 'simulated_outcome' ? '模拟活动已完成' : '有来源的活动',
-                dream: '梦境', plan: '取消的安排', impression: 'Ling 当时的感受',
-                clarification: '用户后来的解释', intention: '还想做的事',
-              })[item.kind]}</small>
-              <p className="sleep-row__text">{item.text}</p>
-              {item.window_id ? (
-                <a className="sleep-original__open" href={sourceSessionHref(item.window_id)}>查看来源会话</a>
-              ) : null}
-            </li>
-          ))}
-        </ol>
+        <div className="sleep-group">
+          <h3 className="sleep-section-title">当晚生活与反思</h3>
+          <ol className="sleep-rows sleep-life-rows" aria-label="生活回顾" data-testid="sleep-life-items">
+            {night.life.map((item) => {
+              const kindMeta = sleepLifeKindMeta(item.kind, item.status);
+              const atLabel = formatLifeTime(item.at);
+              const missingDialogueSource = !item.window_id
+                && (item.kind === 'clarification' || item.kind === 'impression' || item.kind === 'intention');
+              return (
+                <li
+                  className={`sleep-row sleep-life-row sleep-life-row--${kindMeta.tone}`}
+                  key={item.source_id}
+                  data-life-kind={kindMeta.tone}
+                >
+                  <div className="sleep-life-row__head">
+                    <span className={`sleep-life-badge sleep-life-badge--${kindMeta.tone}`}>
+                      {kindMeta.label}
+                    </span>
+                    {atLabel ? <time className="sleep-life-time" dateTime={item.at ?? undefined}>{atLabel}</time> : null}
+                  </div>
+                  <p className="sleep-row__text">{item.text}</p>
+                  {item.window_id ? (
+                    <a
+                      className="sleep-original__open sleep-life-row__link"
+                      href={sourceSessionHref(item.window_id)}
+                      data-testid="sleep-life-open-source"
+                      data-window-id={item.window_id}
+                      onClick={(event) => {
+                        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                        event.preventDefault();
+                        onOpenSource(item.window_id!);
+                      }}
+                    >
+                      查看来源会话
+                    </a>
+                  ) : missingDialogueSource ? (
+                    <p className="sleep-row__no-original">来源会话已不可用，记录内容仍可阅读。</p>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ol>
+        </div>
       ) : null}
     </article>
   );

@@ -3,12 +3,9 @@ import { formatSessionTime } from '../format';
 import type { SessionRecord, UserInfo } from '../types';
 import {
   CloseIcon,
-  LogoutIcon,
   PencilIcon,
-  PersonaIcon,
   PinIcon,
   PlusIcon,
-  SettingsIcon,
 } from './Icons';
 import './session-sidebar.css';
 
@@ -249,9 +246,9 @@ interface SessionSidebarProps {
   onRename: (sessionId: string, title: string) => Promise<boolean>;
   onPin: (sessionId: string, pinned: boolean) => Promise<void>;
   onMove: (sessionId: string, anchorId: string, before: boolean) => Promise<void>;
-  onNavigateSettings: () => void;
-  onNavigatePersona: () => void;
-  onLogout: () => void;
+  onNavigateSettings?: () => void;
+  onNavigatePersona?: () => void;
+  onLogout?: () => void;
 }
 
 /** 菜单在同一时刻只能开一个：开着 A 点 B 是"换到 B"，不是两个都开。 */
@@ -305,9 +302,6 @@ export function SessionSidebar({
   onRename,
   onPin,
   onMove,
-  onNavigateSettings,
-  onNavigatePersona,
-  onLogout,
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
@@ -590,17 +584,6 @@ export function SessionSidebar({
           <div className="sidebar__user">
             <span className="sidebar__user-name">{user.display_name || user.username}</span>
             <span className="sidebar__user-role">{user.role}</span>
-          </div>
-          <div className="sidebar__nav">
-            <button type="button" className="sidebar__nav-item" onClick={onNavigateSettings}>
-              <SettingsIcon /> 设置
-            </button>
-            <button type="button" className="sidebar__nav-item" onClick={onNavigatePersona}>
-              <PersonaIcon /> 角色
-            </button>
-            <button type="button" className="sidebar__nav-item" onClick={onLogout}>
-              <LogoutIcon /> 退出
-            </button>
           </div>
         </div>
       </aside>

@@ -179,3 +179,344 @@
 /* 首屏只报"留下几条"，内容在完整安排里（避免同一条活动出现两次）。 */
 .life-happened-count { margin: 14px 0 0 76px; color: #969184; font-size: 13px; }
 @media (max-width: 460px) { .life-happened-count { margin-left: 66px; } }
+
+/* ------------------------------------------------ 主动分享状态、边界与投递结果 */
+
+.life-proactive-card {
+  margin: 24px 5px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.life-proactive-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.life-proactive-card__title-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.life-proactive-card__title-group h2 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.life-proactive-card__rule,
+.life-proactive-card__gate {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ink-soft);
+}
+
+.life-proactive-card__gate {
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.life-proactive-card__block {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.life-proactive-card__block h3 {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.life-proactive-preview {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.life-proactive-preview__item {
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.life-proactive-preview__item--delivered { border-left-color: var(--ok); }
+.life-proactive-preview__item--sent_unconfirmed { border-left-color: #2c647f; }
+.life-proactive-preview__item--uncertain { border-left-color: var(--warn); }
+.life-proactive-preview__item--failed { border-left-color: var(--danger); }
+
+.life-proactive-preview__top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  font-size: 13px;
+}
+
+.life-proactive-preview__top strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.life-proactive-preview__top time {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.life-proactive-preview__reason {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.life-proactive-preview__draft,
+.life-proactive-preview__meta {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.life-proactive-card__foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
+.life-proactive-card__more {
+  color: var(--accent);
+}
+
+.proactive-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper-raised);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.proactive-badge--delivered {
+  border-color: #c2d2bc;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.proactive-badge--sent_unconfirmed {
+  border-color: #b7ccd7;
+  background: #edf3f6;
+  color: #2c647f;
+}
+
+.proactive-badge--uncertain {
+  border-color: #e0c48d;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.proactive-badge--failed {
+  border-color: #d8b4ac;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.proactive-badge--pending {
+  border-color: var(--line-strong);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+}
+
+.proactive-history {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-raised);
+}
+
+.proactive-history > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.proactive-history__list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.proactive-history__item {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--paper);
+}
+
+.proactive-history__item--delivered { border-left-color: var(--ok); }
+.proactive-history__item--sent_unconfirmed { border-left-color: #2c647f; }
+.proactive-history__item--uncertain { border-left-color: var(--warn); }
+.proactive-history__item--failed { border-left-color: var(--danger); }
+
+.proactive-history__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 5px;
+}
+
+.proactive-history__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.proactive-history__heading time {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.proactive-history__item p {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.life-controls {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.life-controls__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.life-controls__head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.life-controls__rule {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.life-controls__pause {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.life-controls__status {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.life-controls__form,
+.life-controls__edit-form {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.life-controls__field {
+  flex: 1 1 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.life-controls__input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.life-controls__error {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--danger);
+}
+
+@media (max-width: 900px) {
+  .life-page__header .button,
+  .life-rhythm-link,
+  .life-full-schedule > summary,
+  .life-proactive-card .button,
+  .life-proactive-card .ghost-button,
+  .life-controls .button,
+  .life-controls__input,
+  .proactive-history > summary {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .life-proactive-preview__top time {
+    margin-left: 0;
+  }
+}
